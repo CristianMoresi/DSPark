@@ -1,0 +1,48 @@
+# Build artifacts
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.a
+*.so
+*.dylib
+*.pdb
+*.ilk
+*.exp
+*.idb
+
+# IDE
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln
+*.vcxproj*
+.idea/
+*.swp
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Temp
+*.tmp
+*.log
+*.rsp
+build_log.txt
+
+# Tests
+tests/
+
+# DSParkLab build output
+DSParkLab/*.exe
+DSParkLab/imgui.ini
+
+# Internal docs
+AUDIT_REPORT.md
+
+# Claude Code
+CLAUDE.md

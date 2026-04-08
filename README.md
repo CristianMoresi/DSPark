@@ -1,8 +1,8 @@
 # DSPark
 
-**DSP** + **Ark** + **The Spark** — The ark of DSP. The spark that ignites your audio project.
+**DSP** + **Ark** + **The Spark**
 
-**A professional, header-only audio DSP framework in pure C++20. Zero external dependencies.**
+**A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
 **v1.0** — 72 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
 
@@ -78,8 +78,6 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 
 ### Effects (30 processors)
 
-| Processor | Description |
-|-----------|-------------|
 | `Equalizer<T>` | Multi-band parametric EQ with **linear-phase** (FFT) and IIR modes |
 | `Compressor<T>` | Modular: 3 detectors (Peak/RMS/TruePeak), 2 topologies (FF/FB), 4 characters (Clean/Opto/FET/Varimu), upward/downward modes. Adaptive auto-makeup gain. External sidechain. |
 | `Limiter<T>` | ISP true-peak brickwall limiter with adaptive release |
@@ -113,8 +111,6 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 
 ### Core (33 building blocks)
 
-| Module | Description |
-|--------|-------------|
 | `StateVariableFilter<T>` | TPT SVF: 8 modes (LP/HP/BP/Notch/AP/Bell/Shelf), simultaneous multi-output |
 | `LadderFilter<T>` | Moog-style 4-pole TPT filter, 6 modes, drive, self-oscillation |
 | `Biquad<T>` | TDF-II biquad with 9 coefficient types |
@@ -146,8 +142,6 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 
 ### Analysis (5 analyzers)
 
-| Module | Description |
-|--------|-------------|
 | `LevelFollower<T>` | Peak and RMS envelope follower |
 | `SpectrumAnalyzer<T>` | Real-time FFT spectrum with peak hold |
 | `LoudnessMeter<T>` | EBU R128 LUFS (momentary, short-term, integrated) |
@@ -156,16 +150,12 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 
 ### I/O (3 file handlers)
 
-| Module | Description |
-|--------|-------------|
 | `WavFile` | Read/write WAV (PCM 8/16/24/32-bit, float 32/64-bit) |
 | `Mp3File` | MPEG-1 Layer III codec — read (CBR/VBR) + write (CBR encoder, 32-320 kbps) |
 | `AudioFile` | Abstract base class for custom format implementations |
 
 ### Music (1 module)
 
-| Module | Description |
-|--------|-------------|
 | `HarmonyConstants` | Constexpr musical harmony toolkit: 61 scales (bitmask representation), 15 chord recipes with inversions, MIDI/note conversion, key-aware naming (sharp/flat), diatonic chord generation. Fully `constexpr`/`consteval` — generates static tables at compile time. |
 
 ---
@@ -187,7 +177,8 @@ Requires a C++20 compiler. Tested with MSVC 19.50+, and compatible with GCC 12+,
 ```cpp
 #include "DSPark/DSPark.h"
 
-int main() {
+int main() 
+{
     dspark::WavFile input, output;
     input.openRead("input.wav");
     auto info = input.getInfo();
@@ -205,11 +196,14 @@ int main() {
     lim.setCeiling(-1.0f);
 
     output.openWrite("output.wav", info);
-    while (input.readSamples(buffer.toView())) {
+
+    while (input.readSamples(buffer.toView())) 
+    {
         comp.processBlock(buffer.toView());
         lim.processBlock(buffer.toView());
         output.writeSamples(buffer.toView());
     }
+
     output.close();
 }
 ```
@@ -237,7 +231,8 @@ svf.prepare(spec);
 svf.setCutoff(2000.0f);
 svf.setResonance(0.7f);
 
-for (int i = 0; i < numSamples; ++i) {
+for (int i = 0; i < numSamples; ++i) 
+{
     svf.setCutoff(lfo.getNextSample() * 2000 + 500);  // Modulate per sample
     auto [lp, hp, bp] = svf.processMultiOutput(input[i], 0);
     output[i] = lp;  // Or hp, bp, or any combination
@@ -287,8 +282,6 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 
 ## Platform Support
 
-| Platform | Status | Notes |
-|----------|--------|-------|
 | Windows (MSVC) | Tested | C++20, /W4, zero warnings |
 | Linux (GCC) | Compatible | C++20, -Wall -Wextra |
 | macOS (Clang) | Compatible | C++20, -Wall -Wextra |

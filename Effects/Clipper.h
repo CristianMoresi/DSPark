@@ -111,6 +111,7 @@ public:
         if (oversampler_) oversampler_->reset();
         for (int ch = 0; ch < kMaxChannels; ++ch)
             slewPrev_[ch] = T(0);
+        gainReductionDb_.store(T(0), std::memory_order_relaxed);
     }
 
     // -- Processing -------------------------------------------------------------
@@ -237,6 +238,12 @@ public:
         return oversampler_ ? oversampler_->getLatency() : 0;
     }
 
+    /** @brief Returns the current gain reduction in dB (for metering). */
+    [[nodiscard]] T getGainReductionDb() const noexcept
+    {
+        return gainReductionDb_.load(std::memory_order_relaxed);
+    }
+
 protected:
     static constexpr int kMaxStages = 4;
     static constexpr int kMaxChannels = 16;
@@ -266,12 +273,16 @@ protected:
                            ? std::pow(totalGainLin, T(1) / static_cast<T>(numStages))
                            : totalGainLin;
 
+        T peakIn  = T(0);
+        T peakOut = T(0);
+
         for (int ch = 0; ch < nCh; ++ch)
         {
             T* data = buffer.getChannel(ch);
             for (int i = 0; i < nS; ++i)
             {
                 T sample = data[i];
+                T driven = sample * totalGainLin;
 
                 for (int s = 0; s < numStages; ++s)
                 {
@@ -289,8 +300,22 @@ protected:
                 }
                 slewPrev_[ch] = sample;
 
+                peakIn  = std::max(peakIn,  std::abs(driven));
+                peakOut = std::max(peakOut, std::abs(sample));
+
                 data[i] = sample;
             }
+        }
+
+        // Gain reduction metering
+        if (peakIn > T(1e-6))
+        {
+            auto ratio = std::min(peakOut / peakIn, T(1));
+            gainReductionDb_.store(gainToDecibels(ratio, T(-100)), std::memory_order_relaxed);
+        }
+        else
+        {
+            gainReductionDb_.store(T(0), std::memory_order_relaxed);
         }
     }
 
@@ -348,6 +373,9 @@ protected:
 
     // Per-channel slew state
     T slewPrev_[kMaxChannels] {};
+
+    // Gain reduction tracking
+    std::atomic<T> gainReductionDb_ { T(0) };
 };
 
 } // namespace dspark

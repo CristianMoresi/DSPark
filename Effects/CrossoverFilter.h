@@ -70,7 +70,10 @@ public:
     enum class FilterMode
     {
         MinimumPhase, ///< IIR biquads with allpass phase correction (zero latency).
-        LinearPhase   ///< FFT-based magnitude-only (block-size latency, zero phase distortion).
+        LinearPhase   ///< FFT-based magnitude-only (block-size latency, zero
+                      ///< phase distortion). M5a note: strictly *zero-phase*,
+                      ///< so transients get pre-ringing (same caveat as
+                      ///< Equalizer::FilterMode::LinearPhase).
     };
 
     // -- Lifecycle -----------------------------------------------------------

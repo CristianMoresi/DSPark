@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <memory>
 #include <vector>
 
 namespace dspark {
@@ -85,7 +86,8 @@ public:
 
         updatePreDelay();
 
-        // Re-apply IR if one was already loaded
+        // Re-apply IR if one was already loaded. applyIR() rebuilds the bank
+        // on this (GUI) thread and publishes it atomically.
         if (!irStorage_.empty())
             applyIR();
     }
@@ -95,18 +97,25 @@ public:
      *
      * Flow: pushDry -> pre-delay -> convolve -> mixWet.
      *
+     * Thread-safety (A10 fix): the ConvolverBank is published atomically by
+     * loadIR/applyIR. We snapshot the current bank once at the top of the
+     * block into a local shared_ptr, so even if the GUI thread publishes a
+     * replacement mid-block, the audio thread keeps using a stable bank
+     * until the block completes. No resize of a live vector, no torn reads.
+     *
      * @param buffer Audio data to process in-place.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        if (!loaded_.load(std::memory_order_acquire)) return;
+        auto bank = std::atomic_load_explicit(&bank_, std::memory_order_acquire);
+        if (!bank || bank->convolvers.empty()) return;
 
-        const int nCh = std::min(buffer.getNumChannels(), static_cast<int>(convolvers_.size()));
+        const int nCh = std::min(buffer.getNumChannels(),
+                                 static_cast<int>(bank->convolvers.size()));
         const int nS  = buffer.getNumSamples();
 
         mixer_.pushDry(buffer);
 
-        // Apply pre-delay + convolution per channel
         int preDelSamp = preDelaySamples_.load(std::memory_order_relaxed);
         T mixVal = mix_.load(std::memory_order_relaxed);
 
@@ -124,7 +133,7 @@ public:
                 }
             }
 
-            convolvers_[ch].processInPlace(data, nS);
+            bank->convolvers[static_cast<size_t>(ch)].processInPlace(data, nS);
         }
 
         mixer_.mixWet(buffer, mixVal);
@@ -133,9 +142,10 @@ public:
     /** @brief Resets all internal state (convolvers, pre-delay, mixer). */
     void reset() noexcept
     {
-        loaded_.store(false, std::memory_order_relaxed);
-        for (auto& conv : convolvers_)
-            conv.reset();
+        // Drop the bank atomically. Any in-flight processBlock already holds
+        // its own shared_ptr and will finish cleanly on its snapshot.
+        std::atomic_store_explicit(&bank_,
+            std::shared_ptr<ConvolverBank>{}, std::memory_order_release);
         for (auto& rb : preDelayBuffers_)
             rb.reset();
         mixer_.reset();
@@ -230,17 +240,29 @@ public:
     // -- Level 3: Expert API ----------------------------------------------------
 
     /**
-     * @brief Direct access to a channel's Convolver.
+     * @brief Direct access to a channel's Convolver (GUI thread only).
+     *
+     * NOTE: after A10 thread-safety refactor, the live convolver bank is
+     * published atomically and may be replaced by a future loadIR() call.
+     * This accessor returns a reference into the currently-published bank
+     * and MUST NOT be used from the audio thread.
+     *
      * @param channel Channel index.
-     * @return Reference to the Convolver for this channel.
      */
-    Convolver<T>& getConvolver(int channel = 0) { return convolvers_[channel]; }
+    Convolver<T>& getConvolver(int channel = 0)
+    {
+        auto bank = std::atomic_load_explicit(&bank_, std::memory_order_acquire);
+        return bank->convolvers[static_cast<size_t>(channel)];
+    }
 
     /** @brief Direct access to the DryWetMixer. */
     DryWetMixer<T>& getMixer() { return mixer_; }
 
     /** @brief Returns true if an IR has been loaded and applied. */
-    [[nodiscard]] bool isLoaded() const noexcept { return loaded_.load(std::memory_order_acquire); }
+    [[nodiscard]] bool isLoaded() const noexcept
+    {
+        return static_cast<bool>(std::atomic_load_explicit(&bank_, std::memory_order_acquire));
+    }
 
     /** @brief Returns the current mix value. */
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
@@ -251,7 +273,9 @@ public:
     /** @brief Returns the convolution latency in samples. */
     [[nodiscard]] int getLatency() const noexcept
     {
-        return loaded_.load(std::memory_order_acquire) && !convolvers_.empty() ? convolvers_[0].getLatency() : 0;
+        auto bank = std::atomic_load_explicit(&bank_, std::memory_order_acquire);
+        return (bank && !bank->convolvers.empty())
+               ? bank->convolvers.front().getLatency() : 0;
     }
 
 protected:
@@ -273,7 +297,11 @@ protected:
         while (fftBlock < blockSize) fftBlock <<= 1;
 
         int numCh = spec_.numChannels;
-        convolvers_.resize(numCh);
+
+        // Build the new bank in a local shared_ptr. The old bank (if any)
+        // stays live until the last audio-thread snapshot releases it.
+        auto newBank = std::make_shared<ConvolverBank>();
+        newBank->convolvers.resize(static_cast<size_t>(numCh));
 
         for (int ch = 0; ch < numCh; ++ch)
         {
@@ -281,6 +309,8 @@ protected:
             int irCh = (ch < irChannels_) ? ch : 0;
             const T* irData = irStorage_.data()
                             + static_cast<size_t>(irCh) * static_cast<size_t>(irLength_);
+
+            auto& conv = newBank->convolvers[static_cast<size_t>(ch)];
 
             // Resample IR if sample rates differ
             if (std::abs(irSampleRate_ - spec_.sampleRate) > 1.0)
@@ -294,31 +324,39 @@ protected:
                 int produced = resampler.processBlock(irData, irLength_,
                                                       resampled.data());
 
-                convolvers_[ch].prepare(fftBlock, resampled.data(), produced);
+                conv.prepare(fftBlock, resampled.data(), produced);
             }
             else
             {
-                convolvers_[ch].prepare(fftBlock, irData, irLength_);
+                conv.prepare(fftBlock, irData, irLength_);
             }
         }
 
-        loaded_.store(true, std::memory_order_release);
+        // Atomic release-store: any subsequent acquire-load in processBlock
+        // will observe the fully-constructed bank.
+        std::atomic_store_explicit(&bank_, newBank, std::memory_order_release);
     }
+
+    // Holds the current convolver set. Published by applyIR() via atomic
+    // shared_ptr store; audio thread snapshots it at the top of processBlock.
+    struct ConvolverBank
+    {
+        std::vector<Convolver<T>> convolvers;
+    };
 
     AudioSpec spec_ {};
     std::atomic<T> mix_ { T(0.3) };
     std::atomic<T> preDelayMs_ { T(0) };
     std::atomic<int> preDelaySamples_ { 0 };
-    std::atomic<bool> loaded_ { false };
 
-    // IR storage
+    // IR storage (GUI-thread only — rebuild source of truth)
     std::vector<T> irStorage_;
     int irLength_ = 0;
     int irChannels_ = 0;
     double irSampleRate_ = 0;
 
-    // Processing
-    std::vector<Convolver<T>> convolvers_;
+    // Processing (audio-thread visible state)
+    std::shared_ptr<ConvolverBank> bank_ {};  // atomic load/store via free fns
     std::vector<RingBuffer<T>> preDelayBuffers_;
     DryWetMixer<T> mixer_;
 };

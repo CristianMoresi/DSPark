@@ -96,12 +96,19 @@ public:
      *
      * @param enabled True to enable bass mono.
      * @param cutoffHz Frequency below which signal is collapsed to mono (default: 100 Hz).
+     *
+     * @note Must be called from a single thread (typically GUI). The
+     *       coefficient is published with release/acquire ordering so the
+     *       audio thread sees a consistent value, but two concurrent
+     *       writers would race on the cutoff write.
      */
     void setBassMono(bool enabled, double cutoffHz = 100.0) noexcept
     {
-        bassMonoEnabled_.store(enabled, std::memory_order_relaxed);
         bassMonoCutoff_ = cutoffHz;
+        // Write the coefficient **before** the enable flag so the audio
+        // thread cannot observe `enabled=true` with a stale coefficient.
         updateBassMonoCoeff();
+        bassMonoEnabled_.store(enabled, std::memory_order_release);
     }
 
     /**
@@ -119,11 +126,13 @@ public:
         // Apply width to side signal
         side *= width_.load(std::memory_order_relaxed);
 
-        // Bass mono: filter the side signal to remove lows
-        if (bassMonoEnabled_.load(std::memory_order_relaxed))
+        // Bass mono: filter the side signal to remove lows.
+        // Acquire ordering pairs with the release store in setBassMono
+        // so that `bassMonoCoeff_` is visible when the flag reads true.
+        if (bassMonoEnabled_.load(std::memory_order_acquire))
         {
             // 1-pole highpass on side signal
-            T filteredSide = side - bassMonoState_ ;
+            T filteredSide = side - bassMonoState_;
             bassMonoState_ += bassMonoCoeff_ * filteredSide;
             side = filteredSide;
         }

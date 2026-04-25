@@ -34,7 +34,6 @@
  * @endcode
  */
 
-#include "../Core/Biquad.h"
 #include "../Core/Oscillator.h"
 #include "../Core/DryWetMixer.h"
 #include "../Core/AudioSpec.h"
@@ -45,6 +44,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <numbers>
 
 namespace dspark {
 
@@ -82,7 +82,10 @@ public:
         lfo_.setWaveform(lfoWaveform_);
 
         for (auto& stage : stages_)
-            stage.reset();
+        {
+            stage.xPrev.fill(T(0));
+            stage.yPrev.fill(T(0));
+        }
         for (auto& fb : fbState_)
             fb = T(0);
     }
@@ -107,6 +110,8 @@ public:
 
         const T logMin = std::log(minF);
         const T logMax = std::log(maxF);
+        const T fsInv = T(1) / static_cast<T>(spec_.sampleRate);
+        constexpr T kPi = static_cast<T>(std::numbers::pi);
 
         for (int i = 0; i < nS; ++i)
         {
@@ -120,13 +125,17 @@ public:
             T nyquist = static_cast<T>(spec_.sampleRate) * T(0.499);
             cutoff = std::min(cutoff, nyquist);
 
-            // Update allpass coefficients for all active stages
-            auto coeffs = BiquadCoeffs<T>::makeAllPass(spec_.sampleRate,
-                                                        static_cast<double>(cutoff),
-                                                        0.707);
-
-            for (int s = 0; s < stagesVal; ++s)
-                stages_[s].setCoeffs(coeffs);
+            // First-order allpass coefficient derived from the bilinear
+            // transform:  c = (tan(π·fc/fs) − 1) / (tan(π·fc/fs) + 1)
+            // Maps fc ∈ (0, fs/2) to c ∈ (−1, 1), with c = 0 at fc = fs/4.
+            // Transfer function: H(z) = (c + z⁻¹) / (1 + c·z⁻¹).
+            //
+            // This replaces the previous biquad all-pass (a9 optimisation):
+            // 2 mul + 2 add per sample/ch instead of 5 mul + 4 add, matching
+            // the classic analog phaser topology (MXR Phase 90, Small Stone)
+            // which chains single-pole stages rather than second-order ones.
+            T tanVal = std::tan(kPi * cutoff * fsInv);
+            T c = (tanVal - T(1)) / (tanVal + T(1));
 
             // Process each channel
             for (int ch = 0; ch < nCh; ++ch)
@@ -136,9 +145,15 @@ public:
                 // Add feedback
                 sample += fbState_[ch] * fbVal;
 
-                // Pass through allpass chain
+                // First-order allpass chain: y[n] = c·x[n] + x[n-1] - c·y[n-1]
                 for (int s = 0; s < stagesVal; ++s)
-                    sample = stages_[s].processSample(sample, ch);
+                {
+                    auto& st = stages_[s];
+                    T y = c * sample + st.xPrev[ch] - c * st.yPrev[ch];
+                    st.xPrev[ch] = sample;
+                    st.yPrev[ch] = y;
+                    sample = y;
+                }
 
                 fbState_[ch] = sample;
                 buffer.getChannel(ch)[i] = sample;
@@ -152,7 +167,10 @@ public:
     void reset() noexcept
     {
         for (auto& stage : stages_)
-            stage.reset();
+        {
+            stage.xPrev.fill(T(0));
+            stage.yPrev.fill(T(0));
+        }
         for (auto& fb : fbState_)
             fb = T(0);
         lfo_.reset();
@@ -283,8 +301,16 @@ protected:
     std::atomic<int> numStages_ { 4 };
     typename Oscillator<T>::Waveform lfoWaveform_ = Oscillator<T>::Waveform::Sine;
 
+    // First-order allpass stage (per-channel state, shared coefficient computed per sample).
+    // Direct-form with two state variables per channel: xPrev and yPrev.
+    struct FirstOrderAllpass
+    {
+        std::array<T, kMaxChannels> xPrev {};
+        std::array<T, kMaxChannels> yPrev {};
+    };
+
     // Processing
-    std::array<Biquad<T, kMaxChannels>, kMaxStages> stages_ {};
+    std::array<FirstOrderAllpass, kMaxStages> stages_ {};
     std::array<T, kMaxChannels> fbState_ {};
     Oscillator<T> lfo_;
     DryWetMixer<T> mixer_;

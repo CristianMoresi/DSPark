@@ -169,7 +169,7 @@ public:
      * @param buffer Stereo buffer.
      * @param pan    -1.0 (left) to +1.0 (right).
      */
-    void applyCombinedBinaural(AudioBufferView<T> buffer, float /*pan*/)
+    void applyCombinedBinaural(AudioBufferView<T> buffer, float pan)
     {
         assert(buffer.getNumChannels() >= 2);
 
@@ -177,11 +177,24 @@ public:
         T* R = buffer.getChannel(1);
         const int n = buffer.getNumSamples();
 
+        // A12 optimisation: set the ITD target once per block, not once per
+        // sample. The Delay has its own critically-damped smoother that
+        // handles the per-sample interpolation — re-targeting it on every
+        // sample was both redundant and slower than letting the smoother run.
+        // Cross-feeding still reads the sample-rate smoothed pan so the
+        // amplitude law remains click-free.
+        T itdMax = T(binauralMaxITD_.load(std::memory_order_relaxed));
+        T panTarget = static_cast<T>(pan);
+        T delayLms = itdMax * std::max(T(0), panTarget);
+        T delayRms = itdMax * std::max(T(0), -panTarget);
+        delayL_.setDelayMs(delayLms);
+        delayR_.setDelayMs(delayRms);
+
         for (int i = 0; i < n; ++i)
         {
             T p = static_cast<T>(panSmoother_.getNextValue());
 
-            // Cross-feeding based on pan position
+            // Cross-feeding based on pan position (uses sample-rate smoothed p)
             if (p < T(0))
             {
                 L[i] += R[i] * (-p);
@@ -192,13 +205,6 @@ public:
                 R[i] += L[i] * p;
                 L[i] *= (T(1) - p);
             }
-
-            // ITD delays computed per-sample from smoothed pan
-            T itdMax = T(binauralMaxITD_.load(std::memory_order_relaxed));
-            T delayLms = itdMax * std::max(T(0), p);
-            T delayRms = itdMax * std::max(T(0), -p);
-            delayL_.setDelayMs(delayLms);
-            delayR_.setDelayMs(delayRms);
 
             L[i] = delayL_.processSample(0, L[i]);  // ch=0 on mono delay
             delayL_.advanceWriteIndex();
@@ -287,20 +293,28 @@ public:
 
     /**
      * @brief Spectral (frequency-dependent) panning via high-shelf filter.
+     *
+     * Pan is smoothed via panSmoother_ to avoid zipper noise on automation.
+     * Shelf coefficients are refreshed every kRefresh samples (~333µs @48kHz)
+     * to keep per-sample cost low while remaining sonically continuous.
      */
     void applySpectral(AudioBufferView<T> buffer, float pan)
     {
         assert(buffer.getNumChannels() >= 2);
         pan = std::clamp(pan, -1.0f, 1.0f);
+        panSmoother_.setTargetValue(pan);
 
-        updateSpectralFilters(static_cast<T>(pan));
-
-        // Process L and R through their respective filters
         const int n = buffer.getNumSamples();
         T* L = buffer.getChannel(0);
         T* R = buffer.getChannel(1);
+
+        constexpr int kRefresh = 16;
         for (int i = 0; i < n; ++i)
         {
+            float p = panSmoother_.getNextValue();
+            if ((i & (kRefresh - 1)) == 0)
+                updateSpectralFilters(static_cast<T>(p));
+
             L[i] = spectralL_.processSample(L[i], 0);
             R[i] = spectralR_.processSample(R[i], 0);
         }

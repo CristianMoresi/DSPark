@@ -221,23 +221,34 @@ public:
 
     // -- Wet buffer processing -----------------------------------------------
 
+    // M3: both overloads share the same memcpy implementation. The mutable
+    // overload forwards to a shared helper rather than duplicating the loop.
     void pushDryToWet(AudioBufferView<const SampleType> dry) noexcept
     {
-        const int nCh = std::min(dry.getNumChannels(), wetBuffer_.getNumChannels());
-        const int nS  = std::min(dry.getNumSamples(), wetBuffer_.getNumSamples());
-        for (int ch = 0; ch < nCh; ++ch)
-            std::memcpy(wetBuffer_.getChannel(ch), dry.getChannel(ch),
-                       static_cast<std::size_t>(nS) * sizeof(SampleType));
+        pushDryToWetImpl(
+            [&](int ch) { return dry.getChannel(ch); },
+            dry.getNumChannels(), dry.getNumSamples());
     }
 
     void pushDryToWet(AudioBufferView<SampleType> dry) noexcept
     {
-        const int nCh = std::min(dry.getNumChannels(), wetBuffer_.getNumChannels());
-        const int nS  = std::min(dry.getNumSamples(), wetBuffer_.getNumSamples());
-        for (int ch = 0; ch < nCh; ++ch)
-            std::memcpy(wetBuffer_.getChannel(ch), dry.getChannel(ch),
-                       static_cast<std::size_t>(nS) * sizeof(SampleType));
+        pushDryToWetImpl(
+            [&](int ch) { return dry.getChannel(ch); },
+            dry.getNumChannels(), dry.getNumSamples());
     }
+
+private:
+    template <typename ChannelFn>
+    void pushDryToWetImpl(ChannelFn&& getCh, int dryCh, int drySamples) noexcept
+    {
+        const int nCh = std::min(dryCh, wetBuffer_.getNumChannels());
+        const int nS  = std::min(drySamples, wetBuffer_.getNumSamples());
+        for (int ch = 0; ch < nCh; ++ch)
+            std::memcpy(wetBuffer_.getChannel(ch), getCh(ch),
+                        static_cast<std::size_t>(nS) * sizeof(SampleType));
+    }
+
+public:
 
     void processWet(SampleType delayMs, SampleType feedback = 0,
                     SampleType lpHz = 0, SampleType hpHz = 0) noexcept

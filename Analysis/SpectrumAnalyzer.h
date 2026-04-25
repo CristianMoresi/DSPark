@@ -306,6 +306,24 @@ private:
         auto& dbOut   = (wb == 0) ? magnitudesDbA_   : magnitudesDbB_;
         auto& peakOut = (wb == 0) ? peakHoldDbA_     : peakHoldDbB_;
 
+        // M9 fix: peak-hold buffers alternate writes (A one hop, B the next).
+        // If we leave each buffer to evolve independently the reader sees two
+        // diverging histories (flicker) and the effective decay rate is
+        // halved. Seed the active buffer from the other one at the start of
+        // every hop so both agree on a single, monotonically-updated state.
+        if (peakHoldEnabled_)
+        {
+            const auto& peakIn = (wb == 0) ? peakHoldDbB_ : peakHoldDbA_;
+            std::copy(peakIn.begin(), peakIn.end(), peakOut.begin());
+        }
+
+        // Precompute the per-FFT peak-hold decay once (same for every bin).
+        // The previous code divided by (sampleRate * 2) which produces half
+        // the requested dB/s rate. Correct expression: dBPerSecond * hopSeconds
+        // with hop ≈ fftSize samples (no overlap in this analyzer).
+        const T peakDecayDb = peakDecayRate_ * static_cast<T>(fftSize_)
+                            / static_cast<T>(sampleRate_);
+
         for (int k = 0; k < numBins_; ++k)
         {
             T re = freqBuffer_[static_cast<size_t>(2 * k)];
@@ -332,9 +350,7 @@ private:
                     peak = dB;
                 else
                 {
-                    T decay = peakDecayRate_ * static_cast<T>(fftSize_)
-                            / static_cast<T>(sampleRate_ * 2.0); // per-FFT decay
-                    peak -= decay;
+                    peak -= peakDecayDb;
                     if (peak < floorDb_) peak = floorDb_;
                 }
             }

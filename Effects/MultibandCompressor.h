@@ -87,8 +87,18 @@ public:
         const int nS  = buffer.getNumSamples();
         const int nb  = crossover_.getNumBands();
 
+        // Build truncated views for this block (A11 fix).
+        //
+        // bandBuffers_ are sized to spec.maxBlockSize, but a given block may
+        // be smaller (the host is allowed to call with any nS ≤ maxBlockSize).
+        // Passing the full-capacity view would cause the crossover and each
+        // compressor to process stale samples beyond nS, corrupting state and
+        // burning CPU on data the host will not read. Truncating to nS keeps
+        // processing and the envelope detector tied to the actual block size.
+        for (int b = 0; b < nb; ++b)
+            views_[b] = bandBuffers_[b].toView().getSubView(0, nS);
+
         // Split into bands
-        updateViews();
         crossover_.processBlock(buffer, views_.data(), nb);
 
         // Compress each band independently

@@ -84,7 +84,11 @@ public:
     void prepare(double sampleRate) noexcept
     {
         sampleRate_ = sampleRate;
-        updateCoefficients();
+        // Sync cached values (including cachedRangeLinear_) before reset() —
+        // reset() seeds gateGain_ from cachedRangeLinear_, so it must be set
+        // to the user-configured range, not the default.
+        syncParams();
+        paramsDirty_.store(false, std::memory_order_relaxed);
         reset();
     }
 
@@ -98,14 +102,14 @@ public:
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
         DenormalGuard guard;
-        syncParams();
+        syncParamsIfDirty();
 
         const int nCh = buffer.getNumChannels();
         const int nS = buffer.getNumSamples();
         if (nCh >= 2)
-            processStereo(buffer.getChannel(0), buffer.getChannel(1), nS);
+            processStereoInternal(buffer.getChannel(0), buffer.getChannel(1), nS);
         else if (nCh == 1)
-            process(buffer.getChannel(0), nS);
+            processInternal(buffer.getChannel(0), nS);
     }
 
     /**
@@ -120,7 +124,7 @@ public:
     void processBlock(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
     {
         DenormalGuard guard;
-        syncParams();
+        syncParamsIfDirty();
         const int nCh = audio.getNumChannels();
         const int nS  = audio.getNumSamples();
         const int scCh = sidechain.getNumChannels();
@@ -150,30 +154,41 @@ public:
      * @brief Sets the opening threshold.
      * @param dB Threshold in dB (e.g., -40 dB).
      */
-    void setThreshold(T dB) noexcept { threshold_.store(dB, std::memory_order_relaxed); }
+    void setThreshold(T dB) noexcept
+    {
+        threshold_.store(dB, std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_relaxed);
+    }
 
     /**
      * @brief Sets the hysteresis amount.
      * @param dB Hysteresis in dB (default: 4 dB).
      */
-    void setHysteresis(T dB) noexcept { hysteresis_.store(std::max(dB, T(0)), std::memory_order_relaxed); }
+    void setHysteresis(T dB) noexcept
+    {
+        hysteresis_.store(std::max(dB, T(0)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_relaxed);
+    }
 
     /** @brief Sets the attack time in milliseconds. */
     void setAttack(T ms) noexcept
     {
         attackMs_.store(std::max(ms, T(0.01)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_relaxed);
     }
 
     /** @brief Sets the hold time in milliseconds. */
     void setHold(T ms) noexcept
     {
         holdMs_.store(std::max(ms, T(0)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_relaxed);
     }
 
     /** @brief Sets the release time in milliseconds. */
     void setRelease(T ms) noexcept
     {
         releaseMs_.store(std::max(ms, T(0.01)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_relaxed);
     }
 
     /**
@@ -183,10 +198,15 @@ public:
     void setRange(T dB) noexcept
     {
         rangeDb_.store(std::min(dB, T(0)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_relaxed);
     }
 
     /** @brief Enables duck mode (inverted gate). */
-    void setDuckMode(bool enabled) noexcept { duckMode_.store(enabled, std::memory_order_relaxed); }
+    void setDuckMode(bool enabled) noexcept
+    {
+        duckMode_.store(enabled, std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_relaxed);
+    }
 
     /**
      * @brief Sets the gate mode.
@@ -195,7 +215,11 @@ public:
      * - **Frequency** (Gatelope-style): Gate narrows bandpass instead of
      *   reducing amplitude. Treble closes before bass. More transparent.
      */
-    void setGateMode(GateMode mode) noexcept { gateMode_.store(mode, std::memory_order_relaxed); }
+    void setGateMode(GateMode mode) noexcept
+    {
+        gateMode_.store(mode, std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_relaxed);
+    }
 
     /**
      * @brief Enables zero-crossing adaptive hold.
@@ -204,7 +228,11 @@ public:
      * estimated fundamental period (based on zero-crossing rate).
      * Prevents cutting off in the middle of a waveform cycle.
      */
-    void setAdaptiveHold(bool enabled) noexcept { adaptiveHold_.store(enabled, std::memory_order_relaxed); }
+    void setAdaptiveHold(bool enabled) noexcept
+    {
+        adaptiveHold_.store(enabled, std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_relaxed);
+    }
 
     /**
      * @brief Enables the sidechain high-pass filter.
@@ -215,17 +243,26 @@ public:
     {
         scHpfEnabled_.store(enabled, std::memory_order_relaxed);
         scHpfFreq_.store(static_cast<T>(cutoffHz), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_relaxed);
     }
 
     // -- Processing ---------------------------------------------------------------
 
     /**
      * @brief Processes a single mono sample.
+     *
+     * Checks the parameter-dirty flag on each call; a single atomic-exchange
+     * has no measurable cost compared to recomputing envelope coefficients
+     * or (previously) silently ignoring parameter changes from non-audio
+     * threads. For tight per-sample loops over long buffers, prefer the
+     * `process(T*, int)` block overload, which syncs once per block.
+     *
      * @param input Input sample.
      * @return Gated output sample.
      */
     [[nodiscard]] T processSample(T input) noexcept
     {
+        syncParamsIfDirty();
         return processSampleInternal(input, input);
     }
 
@@ -237,6 +274,7 @@ public:
      */
     [[nodiscard]] T processSampleWithSidechain(T input, T sidechain) noexcept
     {
+        syncParamsIfDirty();
         return processSampleInternal(input, sidechain);
     }
 
@@ -247,15 +285,8 @@ public:
      */
     void processStereo(T& left, T& right) noexcept
     {
-        // Linked detection
-        T level = std::max(std::abs(left), std::abs(right));
-        T levelDb = gainToDecibels(level);
-
-        updateStateMachine(levelDb);
-
-        T gain = getCurrentGain();
-        left  *= gain;
-        right *= gain;
+        syncParamsIfDirty();
+        processStereoInternalSample(left, right);
     }
 
     /**
@@ -265,8 +296,8 @@ public:
      */
     void process(T* data, int numSamples) noexcept
     {
-        for (int i = 0; i < numSamples; ++i)
-            data[i] = processSample(data[i]);
+        syncParamsIfDirty();
+        processInternal(data, numSamples);
     }
 
     /**
@@ -277,8 +308,8 @@ public:
      */
     void processStereo(T* left, T* right, int numSamples) noexcept
     {
-        for (int i = 0; i < numSamples; ++i)
-            processStereo(left[i], right[i]);
+        syncParamsIfDirty();
+        processStereoInternal(left, right, numSamples);
     }
 
     // -- State queries ------------------------------------------------------------
@@ -317,6 +348,44 @@ public:
 
 protected:
     static constexpr int kMaxChannels = 2;
+
+    /// Sync atomic params only if a setter flagged them dirty. A6 fix:
+    /// per-sample entry points no longer silently ignore parameter changes
+    /// made from non-audio threads, while the common fast path (nothing
+    /// changed) costs a single relaxed atomic exchange.
+    void syncParamsIfDirty() noexcept
+    {
+        if (paramsDirty_.exchange(false, std::memory_order_relaxed))
+            syncParams();
+    }
+
+    /// Internal mono block: assumes syncParamsIfDirty() has already run.
+    void processInternal(T* data, int numSamples) noexcept
+    {
+        for (int i = 0; i < numSamples; ++i)
+            data[i] = processSampleInternal(data[i], data[i]);
+    }
+
+    /// Internal stereo-sample: assumes syncParamsIfDirty() has already run.
+    void processStereoInternalSample(T& left, T& right) noexcept
+    {
+        // Linked detection
+        T level = std::max(std::abs(left), std::abs(right));
+        T levelDb = gainToDecibels(level);
+
+        updateStateMachine(levelDb);
+
+        T gain = getCurrentGain();
+        left  *= gain;
+        right *= gain;
+    }
+
+    /// Internal stereo block: assumes syncParamsIfDirty() has already run.
+    void processStereoInternal(T* left, T* right, int numSamples) noexcept
+    {
+        for (int i = 0; i < numSamples; ++i)
+            processStereoInternalSample(left[i], right[i]);
+    }
 
     /// Sync atomic params to audio-thread cached values
     void syncParams() noexcept
@@ -502,6 +571,11 @@ protected:
     std::atomic<bool> duckMode_ { false };
     std::atomic<GateMode> gateMode_ { GateMode::Amplitude };
     std::atomic<bool> adaptiveHold_ { false };
+
+    // A6: dirty flag set by every setter, consumed by syncParamsIfDirty().
+    // Starts true so the first call to any process* API initialises cached
+    // values from the atomic defaults (prepare() also calls syncParams()).
+    std::atomic<bool> paramsDirty_ { true };
 
     // Sidechain HPF
     std::atomic<bool> scHpfEnabled_ { false };

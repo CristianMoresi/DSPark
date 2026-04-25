@@ -603,7 +603,6 @@
  * | **IR**            | Impulse Response — acoustic fingerprint of a space or device.   |
  * | **Denormal**      | Tiny float values that cause CPU spikes in IIR filters.         |
  * | **PolyBLEP**      | Polynomial Band-Limited Step — anti-aliasing for oscillators.   |
- * | **HRTF**          | Head-Related Transfer Function — 3D audio positioning.          |
  * | **M/S**           | Mid/Side encoding. Mid = (L+R)/2, Side = (L-R)/2.              |
  * | **Allpass**       | Filter that changes phase without affecting magnitude.           |
  *

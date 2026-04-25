@@ -309,6 +309,13 @@ private:
 
     /// Cubic-interpolated sinc table lookup for a single tap.
     /// Uses Catmull-Rom interpolation between 4 adjacent phases for sub-phase accuracy.
+    ///
+    /// M7d2: At the table edges `p0 = max(p1-1, 0)` collapses with `p1`
+    /// (and `p3` with `p2` on the upper end), degrading Catmull-Rom to a
+    /// 3-point stencil. The sinc table is not periodic, so we cannot wrap
+    /// around; the audible impact is confined to one output sample at the
+    /// very edge of an offline conversion and is below the noise floor
+    /// in streaming use. Kept as-is by design.
     [[nodiscard]] T sincLookup(double exactPhase, int tap) const noexcept
     {
         int p1 = static_cast<int>(exactPhase);

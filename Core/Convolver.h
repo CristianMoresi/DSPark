@@ -203,6 +203,12 @@ public:
      * @param spec     Audio environment specification.
      * @param irData   Impulse response samples.
      * @param irLength Number of IR samples.
+     *
+     * @note M7d1: If `spec.maxBlockSize` is not already a power of two the
+     *       effective FFT block rounds up silently (e.g. 300 → 512),
+     *       doubling the effective latency. Use `getBlockSize()` after
+     *       prepare to inspect the resolved value, or pre-set
+     *       `maxBlockSize` to a power of two.
      */
     void prepare(const AudioSpec& spec, const T* irData, int irLength)
     {

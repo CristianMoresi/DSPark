@@ -49,6 +49,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/Biquad.h"
+#include "../Core/DenormalGuard.h"
 #include "../Core/FFT.h"
 
 #include <array>
@@ -78,6 +79,13 @@ public:
     {
         MinimumPhase, ///< IIR biquads (zero latency, phase shift). Default.
         LinearPhase   ///< FFT-based (block-size latency, zero phase distortion).
+                      ///< M5a note: the current implementation is strictly
+                      ///< *zero-phase* (impulse symmetric around n=0 with
+                      ///< halfFft latency), not linear-phase. Zero-phase
+                      ///< filters exhibit pre-ringing on transients — this is
+                      ///< inherent, not a bug. A true linear-phase redesign
+                      ///< (symmetric FIR with N/2 delay in the time domain)
+                      ///< is on the roadmap.
     };
 
     virtual ~Equalizer() = default;
@@ -156,6 +164,10 @@ public:
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
+        // M5b: high-Q biquads can slip into denormals during long silences;
+        // flush them to zero for the duration of the block.
+        DenormalGuard guard;
+
         if (filterMode_ == FilterMode::LinearPhase && lpFft_)
         {
             processLinearPhase(buffer);

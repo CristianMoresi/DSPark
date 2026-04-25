@@ -156,10 +156,16 @@ public:
                     T lfoVal;
                     if (nCh >= 2 && ch > 0 && spreadVal > T(0))
                     {
-                        // Per-channel LFO phase offset for true stereo decorrelation
-                        T phaseOffset = static_cast<T>(ch) * spreadVal * pi<T>
-                                      / static_cast<T>(std::max(nCh, 1));
-                        lfoVal = std::sin(voicePhases[v] * twoPi<T> + phaseOffset);
+                        // Per-channel LFO phase offset for true stereo
+                        // decorrelation. M5c fix: previously hardcoded to sine,
+                        // which left triangle/saw/square voices with a sine on
+                        // ch > 0 — shape mismatch between channels. Evaluate
+                        // the currently-selected waveform at the offset phase.
+                        T phaseOffset01 = static_cast<T>(ch) * spreadVal
+                                        / (T(2) * static_cast<T>(std::max(nCh, 1)));
+                        T offPhase = voicePhases[v] + phaseOffset01;
+                        offPhase -= std::floor(offPhase);  // wrap to [0, 1)
+                        lfoVal = evalLfoAtPhase(lfoWaveform_, offPhase);
                     }
                     else
                     {
@@ -308,6 +314,27 @@ protected:
             T phase = static_cast<T>(v) / static_cast<T>(nv);
             lfos_[v].setPhase(phase);
         }
+    }
+
+    // M5c helper: evaluate an LFO waveform at an explicit normalised phase
+    // without advancing any state. Aliasing correction (PolyBLEP, integrated
+    // triangle) is skipped on purpose — LFO rates (< 20 Hz) are far below the
+    // audio band so band-limiting brings no audible benefit and would need
+    // per-voice state we don't want to duplicate here.
+    static T evalLfoAtPhase(typename Oscillator<T>::Waveform wf, T phase) noexcept
+    {
+        switch (wf)
+        {
+            case Oscillator<T>::Waveform::Sine:
+                return std::sin(phase * twoPi<T>);
+            case Oscillator<T>::Waveform::Saw:
+                return T(2) * phase - T(1);
+            case Oscillator<T>::Waveform::Square:
+                return (phase < T(0.5)) ? T(1) : T(-1);
+            case Oscillator<T>::Waveform::Triangle:
+                return T(4) * std::abs(phase - T(0.5)) - T(1);
+        }
+        return T(0);
     }
 
     AudioSpec spec_ {};

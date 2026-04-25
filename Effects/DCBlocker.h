@@ -87,6 +87,8 @@ public:
         updateBiquadCoeffs(static_cast<float>(cutoffHz));
         for (auto& stage : biquadStages_)
             stage.reset();
+
+        lastCutoff_ = static_cast<T>(cutoffHz);
     }
 
     /** @brief Prepares from AudioSpec (unified API). */
@@ -139,6 +141,7 @@ public:
         R_ = static_cast<T>(std::exp(-std::numbers::pi * 2.0
                                      * cutoffHz / sampleRate));
         updateBiquadCoeffs(static_cast<float>(cutoffHz));
+        lastCutoff_ = static_cast<T>(cutoffHz);
     }
 
     /**
@@ -154,8 +157,14 @@ public:
 
         if (order_ <= 1)
         {
-            R_ = static_cast<T>(std::exp(-std::numbers::pi * 2.0
-                                         * static_cast<double>(cutoff) / sampleRate_));
+            // Recompute R_ only when cutoff actually changed. exp() in the
+            // steady-state path is pure waste otherwise.
+            if (cutoff != lastCutoff_)
+            {
+                R_ = static_cast<T>(std::exp(-std::numbers::pi * 2.0
+                                             * static_cast<double>(cutoff) / sampleRate_));
+                lastCutoff_ = cutoff;
+            }
             const int nCh = std::min(buffer.getNumChannels(), numChannels_);
             const int nS = buffer.getNumSamples();
             for (int ch = 0; ch < nCh; ++ch)
@@ -167,7 +176,13 @@ public:
         }
         else
         {
-            updateBiquadCoeffs(static_cast<float>(cutoff));
+            // Same optimisation for the biquad cascade: only rebuild
+            // coefficients when cutoff changed.
+            if (cutoff != lastCutoff_)
+            {
+                updateBiquadCoeffs(static_cast<float>(cutoff));
+                lastCutoff_ = cutoff;
+            }
             const int nCh = std::min(buffer.getNumChannels(),
                                      std::min(numChannels_, kMaxChannels));
             const int nS = buffer.getNumSamples();
@@ -293,6 +308,7 @@ protected:
     int order_ = 1;
     T R_ = T(0.995);
     std::atomic<T> cutoffHz_ { T(5) };
+    T lastCutoff_ = T(-1); ///< Cached cutoff used to skip coefficient recompute (sentinel -1 forces first update)
 
     // 1-pole state (order 1)
     std::vector<T> xPrev_;

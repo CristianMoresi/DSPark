@@ -176,6 +176,12 @@ public:
      *
      * The callback receives interleaved complex data [re0, im0, re1, im1, ...]
      * with numBins complex bins (fftSize/2 + 1). Modify in-place.
+     *
+     * @note M10: `setCallback` must be called from a **single thread** at a
+     *       time. The double-buffer swap is lock-free versus the audio
+     *       thread, but two concurrent writers could race on the same slot
+     *       (`std::function::operator=` is not atomic). If you cannot
+     *       guarantee this externally, wrap your calls in a mutex.
      */
     void setCallback(SpectralCallback cb)
     {

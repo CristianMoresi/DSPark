@@ -254,6 +254,33 @@ private:
             ImGui::PopID();
         }
 
+        // --- Gain reduction meter (if processor exposes it) -------------------
+        if (sel->gainReductionDbFn)
+        {
+            ImGui::Separator();
+            ImGui::Text("Gain Reduction");
+
+            float gr = sel->gainReductionDbFn();           // Positive value = attenuation in dB
+            if (gr < 0.0f) gr = 0.0f;
+            if (gr > 24.0f) gr = 24.0f;
+
+            float norm = gr / 24.0f;                       // 0..24 dB -> 0..1
+
+            char lbl[32];
+            std::snprintf(lbl, sizeof(lbl), "-%.1f dB", gr);
+
+            // Color gradient: green (idle) -> yellow (light) -> red (heavy)
+            ImVec4 col = norm < 0.25f ? ImVec4(0.2f, 0.8f, 0.2f, 1)
+                       : norm < 0.6f  ? ImVec4(0.9f, 0.8f, 0.2f, 1)
+                                      : ImVec4(1.0f, 0.3f, 0.2f, 1);
+
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, col);
+            ImGui::ProgressBar(norm, ImVec2(-1, 18), lbl);
+            ImGui::PopStyleColor();
+
+            ImGui::TextDisabled("0 dB                                                  -24 dB");
+        }
+
         ImGui::EndChild();
     }
 

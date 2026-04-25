@@ -63,12 +63,16 @@ public:
     /**
      * @brief Sets the crossfade position.
      *
+     * Thread-safe: only publishes the new position atomically. The gain pair
+     * (gainA_, gainB_) is recomputed lazily by the audio-thread hot path on
+     * next use — avoids torn-pair reads that would break the constant-power
+     * invariant (gainA² + gainB² = 1) during concurrent updates.
+     *
      * @param position Blend position: 0.0 = 100% A, 1.0 = 100% B.
      */
     void setPosition(T position) noexcept
     {
         position_.store(std::clamp(position, T(0), T(1)), std::memory_order_relaxed);
-        updateGains();
     }
 
     /**
@@ -79,12 +83,17 @@ public:
     /**
      * @brief Crossfades between two samples.
      *
+     * NOTE: no longer `const` — the call refreshes the cached gain pair when
+     * the atomic position changes, which is a state mutation. Only callable
+     * from a single (audio) thread.
+     *
      * @param a First input sample (dry / scene A).
      * @param b Second input sample (wet / scene B).
      * @return Blended output.
      */
-    [[nodiscard]] T process(T a, T b) const noexcept
+    [[nodiscard]] T process(T a, T b) noexcept
     {
+        refreshGainsFromAtomics();
         return a * gainA_ + b * gainB_;
     }
 
@@ -97,10 +106,13 @@ public:
      * @param numSamples Number of samples.
      */
     void process(const T* inputA, const T* inputB, T* output,
-                 int numSamples) const noexcept
+                 int numSamples) noexcept
     {
+        refreshGainsFromAtomics();
+        const T gA = gainA_;
+        const T gB = gainB_;
         for (int i = 0; i < numSamples; ++i)
-            output[i] = inputA[i] * gainA_ + inputB[i] * gainB_;
+            output[i] = inputA[i] * gA + inputB[i] * gB;
     }
 
     /**
@@ -116,12 +128,22 @@ public:
                           const T* positions, T* output,
                           int numSamples) noexcept
     {
+        Curve curv = curve_.load(std::memory_order_relaxed);
         for (int i = 0; i < numSamples; ++i)
         {
-            position_ = std::clamp(positions[i], T(0), T(1));
-            updateGains();
-            output[i] = inputA[i] * gainA_ + inputB[i] * gainB_;
+            T pos = std::clamp(positions[i], T(0), T(1));
+            // Recompute locally — no shared state writes.
+            T gA, gB;
+            computeGains(curv, pos, gA, gB);
+            output[i] = inputA[i] * gA + inputB[i] * gB;
         }
+        // Publish the last position so subsequent static-position calls see a
+        // consistent value with the automation's endpoint.
+        position_.store(std::clamp(positions[numSamples - 1], T(0), T(1)),
+                        std::memory_order_relaxed);
+        lastPos_    = position_.load(std::memory_order_relaxed);
+        lastCurve_  = curv;
+        computeGains(curv, lastPos_, gainA_, gainB_);
     }
 
     /**
@@ -135,38 +157,56 @@ public:
     [[nodiscard]] T getGainB() const noexcept { return gainB_; }
 
 protected:
-    void updateGains() noexcept
+    static void computeGains(Curve curve, T pos, T& gA, T& gB) noexcept
     {
-        T pos = position_.load(std::memory_order_relaxed);
-        switch (curve_.load(std::memory_order_relaxed))
+        switch (curve)
         {
             case Curve::Linear:
-                gainA_ = T(1) - pos;
-                gainB_ = pos;
+                gA = T(1) - pos;
+                gB = pos;
                 break;
 
             case Curve::EqualPower:
             {
                 constexpr T halfPi = pi<T> / T(2);
-                gainA_ = std::cos(pos * halfPi);
-                gainB_ = std::sin(pos * halfPi);
+                gA = std::cos(pos * halfPi);
+                gB = std::sin(pos * halfPi);
                 break;
             }
 
             case Curve::SCurve:
             {
                 T t = pos * pos * (T(3) - T(2) * pos);
-                gainA_ = T(1) - t;
-                gainB_ = t;
+                gA = T(1) - t;
+                gB = t;
                 break;
             }
         }
     }
 
+    /// Audio-thread-only: refreshes gainA_/gainB_ if atomic position or curve
+    /// has changed since the last call. Cheap branch for the common no-change
+    /// case; cos/sin only on actual automation.
+    void refreshGainsFromAtomics() noexcept
+    {
+        T pos = position_.load(std::memory_order_relaxed);
+        Curve curv = curve_.load(std::memory_order_relaxed);
+        if (pos != lastPos_ || curv != lastCurve_)
+        {
+            computeGains(curv, pos, gainA_, gainB_);
+            lastPos_   = pos;
+            lastCurve_ = curv;
+        }
+    }
+
     std::atomic<Curve> curve_ { Curve::EqualPower };
     std::atomic<T> position_ { T(0) };
+    // Audio-thread-owned cache: written only by refreshGainsFromAtomics() /
+    // processAutomated(), never by the GUI setters.
     T gainA_ = T(1);
     T gainB_ = T(0);
+    T lastPos_ = T(-1);  // sentinel: first process() call always recomputes
+    Curve lastCurve_ = Curve::EqualPower;
 };
 
 } // namespace dspark

@@ -120,7 +120,18 @@ public:
                 T ratioSqrt = std::sqrt(std::max(instantRate, T(0.01)) / effectiveRate);
                 T adjustedDepth = depth / ratioSqrt;
 
-                T deviation = adjustedDepth * static_cast<T>(sampleRate_) /
+                // Convert depth (semitones) to peak delay-line deviation in samples.
+                //
+                // A semitone is a factor of 2^(1/12). A phase-modulated signal
+                // x(t − d(t)) where d(t) = D·sin(ωt) produces an instantaneous
+                // pitch shift of (1 − ω·D·cos(ωt)). Setting the peak shift equal
+                // to semitones·ln(2)/12 gives:
+                //     D = (semitones · ln(2) · fs) / (ω · 12)
+                // Without the ln(2) factor the actual peak deviation would be
+                // 1/ln(2) ≈ 1.4427× larger than requested — i.e. setDepth(1)
+                // would produce ~1.44 semitones instead of 1.
+                constexpr T kLn2 = static_cast<T>(std::numbers::ln2_v<double>);
+                T deviation = adjustedDepth * kLn2 * static_cast<T>(sampleRate_) /
                               (kTwoPi * std::max(instantRate, T(0.01)) * T(12));
                 T centre = deviation + T(4);
 

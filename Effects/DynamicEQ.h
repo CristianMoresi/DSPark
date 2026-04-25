@@ -114,6 +114,15 @@ public:
             lookaheadBuf_[ch].prepare(maxLaSamples);
         updateLookahead();
 
+        // 1 ms one-pole coefficient-smoother. The per-sample gainDb is
+        // continuous, but bandFilter_ coefficients refresh every
+        // kCoefRefreshInterval samples (C5 optimisation). The 1 ms smoother
+        // keeps the filter-response path continuous and removes zipper
+        // artefacts that would otherwise appear between refreshes.
+        if (sampleRate_ > 0)
+            coefSmoothCoeff_ = static_cast<T>(
+                1.0 - std::exp(-1.0 / (sampleRate_ * 0.001)));
+
         // Reset per-band state
         for (int b = 0; b < MaxBands; ++b)
         {
@@ -125,6 +134,7 @@ public:
             }
             bandDetector_[b].reset();
             bandFilter_[b].reset();
+            smoothedLinkedGainDb_[b] = T(0);
             updateBandCoefficients(b);
         }
     }
@@ -213,6 +223,7 @@ public:
             bandDetector_[b].reset();
             bandFilter_[b].reset();
             bandGainDb_[b] = T(0);
+            smoothedLinkedGainDb_[b] = T(0);
         }
         for (int ch = 0; ch < kMaxChannels; ++ch)
             lookaheadBuf_[ch].reset();
@@ -232,30 +243,36 @@ private:
         const int nb   = numBands_.load(std::memory_order_relaxed);
         const int laSamples = lookaheadSamples_.load(std::memory_order_relaxed);
 
+        // Coefficient refresh interval: the dynamic peak-EQ biquad rebuilds
+        // its coefficients every kCoefRefreshInterval samples instead of per
+        // sample. At 48 kHz, 16 samples = 333 µs — far below perceptual
+        // thresholds — and the 1 ms smoother on smoothedLinkedGainDb_ keeps
+        // the coefficient path continuous. Net cost: ~16× fewer makePeak()
+        // calls (trig + exp) in the hot loop.
+        constexpr int kCoefRefreshInterval = 16;
+        const T coefSmooth = coefSmoothCoeff_;
+
         for (int i = 0; i < nS; ++i)
         {
-            for (int ch = 0; ch < nCh; ++ch)
+            // Stage 1: per-band detection, per-channel envelope, stereo-linked
+            // smoothed gainDb, and coefficient refresh at the chosen interval.
+            //
+            // Stereo-linking the gainDb (max magnitude across channels) is the
+            // pro-industry default (Waves F6, FabFilter Pro-Q 3, TDR Nova, Ozone
+            // Dynamic EQ): it preserves sensitivity to whichever channel has
+            // more signal while keeping the filter response identical across
+            // channels — which preserves the stereo image.
+            for (int b = 0; b < nb; ++b)
             {
-                int sc = std::min(ch, scCh - 1);
-                T scSample = sidechain.getChannel(sc)[i];
+                if (!configs_[b].enabled) continue;
 
-                // Read audio (with lookahead delay if enabled)
-                T audioSample;
-                if (laSamples > 0)
-                {
-                    lookaheadBuf_[ch].push(audio.getChannel(ch)[i]);
-                    audioSample = lookaheadBuf_[ch].read(laSamples);
-                }
-                else
-                {
-                    audioSample = audio.getChannel(ch)[i];
-                }
+                T linkedMag = T(0);
+                T signedLinked = T(0);
 
-                // Apply each band's dynamic processing
-                T output = audioSample;
-                for (int b = 0; b < nb; ++b)
+                for (int ch = 0; ch < nCh; ++ch)
                 {
-                    if (!configs_[b].enabled) continue;
+                    int sc = std::min(ch, scCh - 1);
+                    T scSample = sidechain.getChannel(sc)[i];
 
                     // Detect: bandpass filter on sidechain → envelope
                     T detected = bandDetector_[b].processSample(scSample, ch);
@@ -268,28 +285,64 @@ private:
 
                     T levelDb = gainToDecibels(env);
 
-                    // Compute dynamic gain
+                    // Per-channel dynamic gain
                     T dynGainDb = computeBandGain(b, levelDb);
 
-                    // Track for metering (use channel 0)
-                    if (ch == 0) bandGainDb_[b] = dynGainDb;
+                    // Link via max magnitude across channels
+                    T mag = std::abs(dynGainDb);
+                    if (mag > linkedMag)
+                    {
+                        linkedMag = mag;
+                        signedLinked = dynGainDb;
+                    }
+                }
 
-                    // Apply as parametric peak EQ at this band's frequency
-                    if (std::abs(dynGainDb) > T(0.01))
+                // 1 ms one-pole smoother on the linked gainDb → fed to coefs
+                T& smoothed = smoothedLinkedGainDb_[b];
+                smoothed += coefSmooth * (signedLinked - smoothed);
+
+                // Metering uses the smoothed, linked value
+                bandGainDb_[b] = smoothed;
+
+                // Refresh peak-EQ coefficients only every N samples
+                if ((i & (kCoefRefreshInterval - 1)) == 0)
+                {
+                    if (std::abs(smoothed) > T(0.01))
                     {
                         auto coeffs = BiquadCoeffs<T>::makePeak(
                             sampleRate_,
                             static_cast<double>(configs_[b].frequency),
                             static_cast<double>(configs_[b].q),
-                            static_cast<double>(dynGainDb));
+                            static_cast<double>(smoothed));
                         bandFilter_[b].setCoeffs(coeffs);
                     }
                     else
                     {
-                        // Near-unity: bypass this band's filter
+                        // Near-unity: flat biquad (bypass)
                         bandFilter_[b].setCoeffs(BiquadCoeffs<T>{});
                     }
+                }
+            }
 
+            // Stage 2: apply (now stationary within the refresh interval)
+            // filter per-channel. Filter state itself remains per-channel.
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T audioSample;
+                if (laSamples > 0)
+                {
+                    lookaheadBuf_[ch].push(audio.getChannel(ch)[i]);
+                    audioSample = lookaheadBuf_[ch].read(laSamples);
+                }
+                else
+                {
+                    audioSample = audio.getChannel(ch)[i];
+                }
+
+                T output = audioSample;
+                for (int b = 0; b < nb; ++b)
+                {
+                    if (!configs_[b].enabled) continue;
                     output = bandFilter_[b].processSample(output, ch);
                 }
 
@@ -383,6 +436,8 @@ private:
     std::array<T, MaxBands> bandGainDb_ {};
     std::array<T, MaxBands> bandAttackCoeff_ {};
     std::array<T, MaxBands> bandReleaseCoeff_ {};
+    std::array<T, MaxBands> smoothedLinkedGainDb_ {};   ///< 1 ms-smoothed linked gainDb (C5: fed to refreshed coeffs)
+    T coefSmoothCoeff_ = T(0);                         ///< 1 ms one-pole coefficient for the smoother above
 
     // Oversampling
     int oversamplingFactor_ = 1;

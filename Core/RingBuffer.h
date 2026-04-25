@@ -121,9 +121,16 @@ public:
      *
      * @param delaySamples Delay in samples (0 to capacity-1).
      * @return The delayed sample.
+     *
+     * @note In debug builds an assertion fires if `delaySamples >= capacity_`.
+     *       The bit-mask wrap would otherwise silently return a stale sample
+     *       from the "other side" of the ring, which is rarely what the
+     *       caller intended (M1).
      */
     [[nodiscard]] T read(int delaySamples) const noexcept
     {
+        assert(delaySamples >= 0 && delaySamples < capacity_
+               && "RingBuffer::read: delaySamples out of range (0..capacity-1)");
         int idx = (writePos_ - 1 - delaySamples) & mask_;
         return buffer_[static_cast<size_t>(idx)];
     }
@@ -134,12 +141,26 @@ public:
      * @param delaySamples Fractional delay in samples (e.g., 10.7).
      * @param method Interpolation method (default: Cubic).
      * @return The interpolated sample.
+     *
+     * @note 4-point interpolators (Cubic/Hermite/Lagrange) read samples at
+     *       `intDelay - 1 ... intDelay + 2`. For `delaySamples < 1` this
+     *       reaches into a "future" sample which does not exist yet and is
+     *       returned as whatever stale value sat there before — usually
+     *       zero in a fresh buffer, but potentially old audio after reuse.
+     *       Callers that need very short delays must either use Linear
+     *       interpolation or guarantee `delaySamples >= 1`. Asserted in
+     *       debug (M2).
      */
     [[nodiscard]] T readInterpolated(T delaySamples,
                                      InterpMethod method = InterpMethod::Cubic) const noexcept
     {
         int intDelay = static_cast<int>(delaySamples);
         T frac = delaySamples - static_cast<T>(intDelay);
+        assert(delaySamples >= T(0)
+               && static_cast<int>(delaySamples) + 2 < capacity_
+               && "RingBuffer::readInterpolated: delaySamples out of range");
+        assert((method == InterpMethod::Linear || delaySamples >= T(1))
+               && "RingBuffer::readInterpolated: 4-point interpolators need delaySamples >= 1");
 
         switch (method)
         {

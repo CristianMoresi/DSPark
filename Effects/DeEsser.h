@@ -70,17 +70,21 @@ public:
         sampleRate_ = spec.sampleRate;
         numChannels_ = spec.numChannels;
 
-        // Attack ~0.5 ms, release ~20 ms
-        attackCoeff_ = static_cast<T>(
-            1.0 - std::exp(-1.0 / (sampleRate_ * 0.0005)));
-        releaseCoeff_ = static_cast<T>(
-            1.0 - std::exp(-1.0 / (sampleRate_ * 0.020)));
+        // Envelope attack/release (configurable via setAttack/setRelease;
+        // defaults match the previous hardcoded 0.5 ms / 20 ms values).
+        updateEnvelopeCoeffs();
+
+        // 1 ms one-pole smoother on grDb so the 16-sample coefficient refresh
+        // does not introduce zipper artefacts in the bell filter.
+        coefSmoothCoeff_ = static_cast<T>(
+            1.0 - std::exp(-1.0 / (sampleRate_ * 0.001)));
 
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
             detector_[ch].reset();
             reduction_[ch].reset();
             envelope_[ch] = T(0);
+            smoothedGrDb_[ch] = T(0);
             derivShift_[ch].fill(T(0));
         }
 
@@ -111,11 +115,25 @@ public:
         for (int ch = 0; ch < numCh; ++ch)
             detector_[ch].setCoeffs(bpCoeffs);
 
+        // Envelope coefficients are cached in attackCoeff_/releaseCoeff_.
+        // If setAttack/setRelease changed them, refresh.
+        if (envCoefsDirty_.exchange(false, std::memory_order_relaxed))
+            updateEnvelopeCoeffs();
+
         T maxGr = T(0);
+
+        // Coefficient refresh interval: the dynamic bell filter rebuilds its
+        // coefficients every kCoefRefreshInterval samples instead of per sample.
+        // At 48 kHz, 16 samples = 333 µs — far below perceptual thresholds
+        // while the 1 ms smoother on grDb keeps the parameter path continuous.
+        // Net cost reduction: ~16× fewer trig/sqrt/pow calls.
+        constexpr int kCoefRefreshInterval = 16;
+        const T coefSmooth = coefSmoothCoeff_;
 
         for (int ch = 0; ch < numCh; ++ch)
         {
             T* data = buffer.getChannel(ch);
+            T& smoothedGr = smoothedGrDb_[ch];
 
             for (int i = 0; i < numSamples; ++i)
             {
@@ -159,12 +177,21 @@ public:
                 if (overDb > T(0))
                     grDb = -std::min(overDb, maxRed);
 
-                // Apply reduction via dynamic bell filter
-                auto peakCoeffs = BiquadCoeffs<T>::makePeak(
-                    sampleRate_, static_cast<double>(freq),
-                    static_cast<double>(bw),
-                    static_cast<double>(grDb < T(-0.1) ? grDb : T(0)));
-                reduction_[ch].setCoeffs(peakCoeffs);
+                // Smooth grDb with a 1 ms one-pole so the bell filter coefficient
+                // path is continuous between refreshes.
+                T targetGr = (grDb < T(-0.1)) ? grDb : T(0);
+                smoothedGr += coefSmooth * (targetGr - smoothedGr);
+
+                // Refresh bell filter coefficients only every N samples.
+                if ((i & (kCoefRefreshInterval - 1)) == 0)
+                {
+                    auto peakCoeffs = BiquadCoeffs<T>::makePeak(
+                        sampleRate_, static_cast<double>(freq),
+                        static_cast<double>(bw),
+                        static_cast<double>(smoothedGr));
+                    reduction_[ch].setCoeffs(peakCoeffs);
+                }
+
                 data[i] = reduction_[ch].processSample(data[i], 0);
 
                 if (-grDb > maxGr)
@@ -183,10 +210,42 @@ public:
             detector_[ch].reset();
             reduction_[ch].reset();
             envelope_[ch] = T(0);
+            smoothedGrDb_[ch] = T(0);
             derivShift_[ch].fill(T(0));
         }
         gainReduction_.store(T(0), std::memory_order_relaxed);
     }
+
+    /**
+     * @brief Sets the envelope attack time in milliseconds.
+     *
+     * Faster attack reacts sooner to sibilance but can sound grainy;
+     * slower attack lets some sibilance through but is more transparent.
+     *
+     * @param ms Attack time (default: 0.5 ms, range: 0.1 – 20 ms).
+     */
+    void setAttack(T ms) noexcept
+    {
+        attackMs_.store(std::clamp(ms, T(0.1), T(20)), std::memory_order_relaxed);
+        envCoefsDirty_.store(true, std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Sets the envelope release time in milliseconds.
+     *
+     * Faster release lets non-sibilant content through sooner; slower release
+     * produces smoother, more transparent reduction but can affect adjacent syllables.
+     *
+     * @param ms Release time (default: 20 ms, range: 1 – 500 ms).
+     */
+    void setRelease(T ms) noexcept
+    {
+        releaseMs_.store(std::clamp(ms, T(1), T(500)), std::memory_order_relaxed);
+        envCoefsDirty_.store(true, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] T getAttack() const noexcept { return attackMs_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getRelease() const noexcept { return releaseMs_.load(std::memory_order_relaxed); }
 
     /**
      * @brief Sets the centre frequency of the sibilance band.
@@ -251,6 +310,16 @@ private:
             d.setCoeffs(c);
     }
 
+    /** @brief Refreshes envelope attack/release coefficients from the atomic ms values. */
+    void updateEnvelopeCoeffs() noexcept
+    {
+        if (sampleRate_ <= 0) return;
+        const double atkSec = static_cast<double>(attackMs_.load(std::memory_order_relaxed)) * 0.001;
+        const double relSec = static_cast<double>(releaseMs_.load(std::memory_order_relaxed)) * 0.001;
+        attackCoeff_ = static_cast<T>(1.0 - std::exp(-1.0 / (sampleRate_ * std::max(atkSec, 1e-6))));
+        releaseCoeff_ = static_cast<T>(1.0 - std::exp(-1.0 / (sampleRate_ * std::max(relSec, 1e-6))));
+    }
+
     static constexpr int kMaxChannels = 2;
     static constexpr int kDerivLen = 8;  ///< Shift register length for derivative detection
 
@@ -262,15 +331,20 @@ private:
     std::atomic<T> bandwidth_ { T(2) };       // Q value
     std::atomic<T> threshold_ { T(-20) };
     std::atomic<T> maxReduction_ { T(12) };
+    std::atomic<T> attackMs_ { T(0.5) };      // Configurable attack time
+    std::atomic<T> releaseMs_ { T(20) };      // Configurable release time
     std::atomic<DetectionMode> detectionMode_ { DetectionMode::Bandpass };
+    std::atomic<bool> envCoefsDirty_ { false };
 
     T attackCoeff_ = T(0);
     T releaseCoeff_ = T(0);
+    T coefSmoothCoeff_ = T(0);   ///< 1 ms one-pole coefficient for smoothing grDb between refreshes
     std::atomic<T> gainReduction_ { T(0) };
 
     Biquad<T, 1> detector_[kMaxChannels]{};
     Biquad<T, 1> reduction_[kMaxChannels]{};
     T envelope_[kMaxChannels]{};
+    T smoothedGrDb_[kMaxChannels]{};   ///< Smoothed grDb fed to refreshed coefficients
 
     // Derivative detection shift registers
     std::array<std::array<T, kDerivLen>, kMaxChannels> derivShift_ {};

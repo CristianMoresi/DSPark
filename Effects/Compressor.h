@@ -606,7 +606,7 @@ protected:
         switch (detType)
         {
             case DetectorType::Peak:
-                level = std::abs(sample);
+                // Already computed above as the default.
                 break;
 
             case DetectorType::Rms:

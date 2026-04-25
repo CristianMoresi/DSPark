@@ -47,6 +47,11 @@ public:
     std::function<void()>                                resetFn;
     std::function<void(int, float)>                      setParamFn;
 
+    // Optional metering getter — returns gain reduction in dB (positive value
+    // means the processor is attenuating the signal by that amount).
+    // Leave empty if the processor does not expose gain reduction.
+    std::function<float()> gainReductionDbFn;
+
     // --- Builder helpers ---
 
     void addSlider(const char* n, float mn, float mx, float def,

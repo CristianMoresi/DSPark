@@ -26,8 +26,10 @@
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/Phasor.h"
+#include "../Core/Smoothers.h"
 
 #include <algorithm>
 #include <atomic>
@@ -69,6 +71,11 @@ public:
             phasors_[ch].setFrequency(rateVal);
         }
 
+        // M8: depth smoother prevents zipper on automation. ~5 ms ramp is
+        // short enough to track fast gestures but long enough to mask steps.
+        depthSmoother_.reset(sampleRate_, kDepthRampMs,
+                             static_cast<float>(depth_.load(std::memory_order_relaxed)));
+
         // Stereo: offset R channel by 0.5 (180 degrees)
         if (stereo_.load(std::memory_order_relaxed) && numChannels_ >= 2)
             phasors_[1].setPhase(T(0.5));
@@ -80,15 +87,22 @@ public:
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
+        // M8: FTZ/DAZ on denormals for the multiplications (keeps CPU
+        // from degrading when the input tail goes to near-zero).
+        DenormalGuard guard;
+
         int numCh = std::min(buffer.getNumChannels(), numChannels_);
         int numSamples = buffer.getNumSamples();
 
-        T depthVal = depth_.load(std::memory_order_relaxed);
+        depthSmoother_.setTargetValue(static_cast<float>(
+            depth_.load(std::memory_order_relaxed)));
         bool stereoVal = stereo_.load(std::memory_order_relaxed);
         auto shapeVal = shape_.load(std::memory_order_relaxed);
 
         for (int i = 0; i < numSamples; ++i)
         {
+            T depthVal = static_cast<T>(depthSmoother_.getNextValue());
+
             // Advance phasors once per sample frame
             T phases[kMaxChannels];
             int numPhasors = stereoVal ? std::min(numCh, kMaxChannels) : 1;
@@ -181,6 +195,7 @@ private:
     }
 
     static constexpr int kMaxChannels = 2;
+    static constexpr float kDepthRampMs = 5.0f;
 
     double sampleRate_ = 44100.0;
     int numChannels_ = 2;
@@ -189,6 +204,7 @@ private:
     std::atomic<Shape> shape_ { Shape::Sine };
     std::atomic<bool> stereo_ { false };
 
+    Smoothers::LinearSmoother depthSmoother_;
     Phasor<T> phasors_[kMaxChannels]{};
 };
 

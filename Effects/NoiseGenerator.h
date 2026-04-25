@@ -87,6 +87,15 @@ public:
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
+        // M7b fix: setType() never touches the generator state directly. If a
+        // type change is pending, apply it here on the audio thread before the
+        // inner loop — no torn reads on the internal filter state.
+        if (typeDirty_.exchange(false, std::memory_order_acquire))
+        {
+            for (auto& gen : generators_)
+                applyNoiseType(*gen);
+        }
+
         int numCh = std::min(buffer.getNumChannels(), numChannels_);
         int numSamples = buffer.getNumSamples();
 
@@ -110,13 +119,17 @@ public:
 
     /**
      * @brief Sets the noise type.
+     *
+     * Thread-safe: only publishes the request — the audio thread picks it up
+     * at the top of the next processBlock and reconfigures the generators
+     * there, so the filter state is never mutated mid-read.
+     *
      * @param type White, Pink, or Brown.
      */
     void setType(Type type) noexcept
     {
-        type_ = type;
-        for (auto& gen : generators_)
-            applyNoiseType(*gen);
+        type_.store(type, std::memory_order_relaxed);
+        typeDirty_.store(true, std::memory_order_release);
     }
 
     /**
@@ -138,7 +151,7 @@ public:
     }
 
     /** @brief Returns the current noise type. */
-    [[nodiscard]] Type getType() const noexcept { return type_; }
+    [[nodiscard]] Type getType() const noexcept { return type_.load(std::memory_order_relaxed); }
 
     /** @brief Returns the current gain in linear. */
     [[nodiscard]] T getGain() const noexcept { return gain_.load(std::memory_order_relaxed); }
@@ -146,7 +159,7 @@ public:
 private:
     void applyNoiseType(AnalogRandom::Generator<T>& gen) noexcept
     {
-        switch (type_)
+        switch (type_.load(std::memory_order_relaxed))
         {
             case Type::White:
                 gen.setNoiseType(AnalogRandom::NoiseType::White);
@@ -163,7 +176,8 @@ private:
     double sampleRate_ = 44100.0;
     int numChannels_ = 2;
     std::atomic<T> gain_ { T(1) };
-    Type type_ = Type::White;
+    std::atomic<Type> type_ { Type::White };
+    std::atomic<bool> typeDirty_ { false };   // set by setType, drained by processBlock
 
     std::vector<std::unique_ptr<AnalogRandom::Generator<T>>> generators_;
 };

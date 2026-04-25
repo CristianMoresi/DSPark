@@ -182,7 +182,14 @@ public:
      */
     void setCutoff(T hz) noexcept
     {
-        cutoff_ = std::clamp(hz, T(20), static_cast<T>(spec_.sampleRate) * T(0.499));
+        // M7d0: before prepare() is called spec_.sampleRate is 0. In that
+        // case `clamp(hz, 20, 0)` would hit `lo > hi`, which is UB per
+        // cppreference. Store the requested value verbatim and let
+        // updateCoefficients() clamp once the sample rate is known.
+        if (spec_.sampleRate > 0.0)
+            cutoff_ = std::clamp(hz, T(20), static_cast<T>(spec_.sampleRate) * T(0.499));
+        else
+            cutoff_ = std::max(hz, T(0));
         updateCoefficients();
     }
 
@@ -260,8 +267,14 @@ private:
     void updateCoefficients() noexcept
     {
         if (spec_.sampleRate > 0)
+        {
+            // M7d0: apply the Nyquist clamp here so that setCutoff values
+            // stored before prepare() get normalised once we know the SR.
+            cutoff_ = std::clamp(cutoff_, T(20),
+                                 static_cast<T>(spec_.sampleRate) * T(0.499));
             g_ = static_cast<T>(std::tan(pi<double> * static_cast<double>(cutoff_)
                                          / spec_.sampleRate));
+        }
         updateBellR();
     }
 

@@ -41,6 +41,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <type_traits>
 
@@ -538,6 +539,13 @@ public:
         preFilter_.reset();
         postFilter_.reset();
         dcBlocker_.reset();
+        // One-shot DC blocker coefficients — depend only on sampleRate.
+        dcBlocker_.setCoeffs(BiquadCoeffs<SampleType>::makeDcBlocker(spec.sampleRate));
+        // Invalidate cached filter-parameter values so the first process()
+        // block recomputes coefficients from the smoother's initial state.
+        lastPreHpFreq_    = -1.0f;
+        lastPostTiltFreq_ = -1.0f;
+        lastPostTiltGain_ = std::numeric_limits<float>::quiet_NaN();
         dryWetMixer_.prepare(spec);
         if (oversampler_)
             oversampler_->prepare(spec);
@@ -557,6 +565,12 @@ public:
 
         leftDrift_.prepare(sr);
         rightDrift_.prepare(sr);
+        // Decorrelate L/R drift so the emulated analogue drift produces
+        // stereo width instead of a mono-modulated signal. The two seeds
+        // are arbitrary large primes separated by enough bits to avoid
+        // splitmix64 collisions in the first few samples.
+        leftDrift_.reseed(0x9E3779B97F4A7C15ULL);
+        rightDrift_.reseed(0xBF58476D1CE4E5B9ULL);
 
         reset();
 
@@ -611,12 +625,40 @@ public:
         // Capture dry signal for mix
         dryWetMixer_.pushDry(buffer);
 
-        // Pre-filter (high-pass to remove low-end before saturation)
+        // Pre-filter (high-pass to remove low-end before saturation).
+        //
+        // C1+A1 fix (v2 — forensic): process in sub-blocks of kCoefRefresh
+        // samples. Within each sub-block we advance the smoother by the
+        // exact chunk size (so the effective ramp time matches the user's
+        // configuration, not blockSize × config) and rebuild the biquad
+        // coefficients only when the smoothed value actually changed.
+        //
+        // The previous revision called getNextValue() ONCE per block, which
+        // advanced the smoother by a single sample → effective ramp time
+        // ballooned by a factor of blockSize (~256×) and users perceived
+        // the pre-filter as "stuck" relative to the control. That caused
+        // the regressions reported after Phase 2 (pre-HP locked at a
+        // stale freq → audible as a static aggressive filter).
         {
-            auto c = BiquadCoeffs<SampleType>::makeHighPass(
-                         spec_.sampleRate, static_cast<double>(preHpSmoother_.getTargetValue()));
-            preFilter_.setCoeffs(c);
-            preFilter_.processBlock(buffer);
+            const int numSamples = buffer.getNumSamples();
+            constexpr int kCoefRefresh = 16;
+            for (int i = 0; i < numSamples; i += kCoefRefresh)
+            {
+                const int chunk = std::min(kCoefRefresh, numSamples - i);
+                float curFreq = lastPreHpFreq_;
+                for (int k = 0; k < chunk; ++k)
+                    curFreq = preHpSmoother_.getNextValue();
+
+                if (curFreq != lastPreHpFreq_)
+                {
+                    auto c = BiquadCoeffs<SampleType>::makeHighPass(
+                                 spec_.sampleRate, static_cast<double>(curFreq));
+                    preFilter_.setCoeffs(c);
+                    lastPreHpFreq_ = curFreq;
+                }
+                auto subView = buffer.getSubView(i, chunk);
+                preFilter_.processBlock(subView);
+            }
         }
 
         // Mid/Side encode if needed
@@ -642,24 +684,47 @@ public:
 
         if (isMidSide) MidSide<SampleType>::decode(buffer);
 
-        // Post-filter (tilt EQ)
+        // Post-filter (tilt EQ). Same sub-block strategy as the pre-filter:
+        // advance the smoothers by the exact sub-block size, rebuild the
+        // peak-EQ coefficients only when freq or gain actually changed.
+        // makePeak() is one of the most expensive BiquadCoeffs factories
+        // (tan + exp + sqrt), so gating it on a scalar compare is a clear
+        // win for the steady-state path.
         {
-            auto tiltGainDb = postTiltGainSmoother_.getTargetValue();
-            auto c = BiquadCoeffs<SampleType>::makePeak(
-                         spec_.sampleRate,
-                         static_cast<double>(postTiltFreqSmoother_.getTargetValue()),
-                         0.707,
-                         static_cast<double>(tiltGainDb));
-            postFilter_.setCoeffs(c);
-            postFilter_.processBlock(buffer);
+            const int numSamples = buffer.getNumSamples();
+            constexpr int kCoefRefresh = 16;
+            for (int i = 0; i < numSamples; i += kCoefRefresh)
+            {
+                const int chunk = std::min(kCoefRefresh, numSamples - i);
+                float curFreq = lastPostTiltFreq_;
+                float curGain = lastPostTiltGain_;
+                for (int k = 0; k < chunk; ++k)
+                {
+                    curFreq = postTiltFreqSmoother_.getNextValue();
+                    curGain = postTiltGainSmoother_.getNextValue();
+                }
+
+                if (curFreq != lastPostTiltFreq_ || curGain != lastPostTiltGain_)
+                {
+                    auto c = BiquadCoeffs<SampleType>::makePeak(
+                                 spec_.sampleRate,
+                                 static_cast<double>(curFreq),
+                                 0.707,
+                                 static_cast<double>(curGain));
+                    postFilter_.setCoeffs(c);
+                    lastPostTiltFreq_ = curFreq;
+                    lastPostTiltGain_ = curGain;
+                }
+                auto subView = buffer.getSubView(i, chunk);
+                postFilter_.processBlock(subView);
+            }
         }
 
-        // DC blocker
+        // DC blocker. Coefficients depend only on sampleRate (constant after
+        // prepare), so the one-time setCoeffs now lives in prepare() and the
+        // hot path just processes the block.
         if (dcBlockingEnabled_)
-        {
-            dcBlocker_.setCoeffs(BiquadCoeffs<SampleType>::makeDcBlocker(spec_.sampleRate));
             dcBlocker_.processBlock(buffer);
-        }
 
         // Output gain
         applyOutputGain(buffer);
@@ -971,11 +1036,16 @@ protected:
                 SampleType dry = sample;
 
                 // Slew-dependent saturation (HardVacuum-style):
-                // High-frequency content (large deltas) gets more drive
+                // High-frequency content (large deltas) gets more drive.
+                // A3: use tanh(|delta|) instead of sin(|delta|) — sin folds
+                // back (negative response) for |delta| > π/2 which inverts
+                // the intended monotonic transient-boost behaviour and can
+                // produce loud artifacts on very hot transients. tanh is
+                // bounded in [0,1), monotonic, and saturates gracefully.
                 if (slewAmt > SampleType(0))
                 {
                     SampleType delta = sample - prevSlewSample_[ch];
-                    sample += std::sin(std::abs(delta)) * slewAmt * sample;
+                    sample += std::tanh(std::abs(delta)) * slewAmt * sample;
                     prevSlewSample_[ch] = dry;
                 }
 
@@ -990,11 +1060,17 @@ protected:
                 }
 
                 // Adaptive blend (PurestDrive-style):
-                // Saturation intensity follows input amplitude
+                // Saturation intensity follows input amplitude, not drive.
+                // A4: previous formula `avg * driveGainS` pinned `apply` to 1
+                // permanently at even moderate drive (e.g. 6 dB on avg=0.5 → 1),
+                // producing "always saturated" behaviour irrespective of input.
+                // Correct behaviour is: quiet passages stay mostly dry, loud
+                // passages blend in more saturated signal. Drive influence is
+                // already baked into `wet` via the primary saturator.
                 if (adaptive)
                 {
                     SampleType avg = (std::abs(prevBlendSample_[ch]) + std::abs(dry)) * SampleType(0.5);
-                    SampleType apply = std::clamp(avg * driveGainS, SampleType(0), SampleType(1));
+                    SampleType apply = std::clamp(avg, SampleType(0), SampleType(1));
                     wet = dry * (SampleType(1) - apply) + wet * apply;
                     prevBlendSample_[ch] = dry;
                 }
@@ -1098,6 +1174,14 @@ protected:
     // Slew-dependent saturation (HardVacuum-style)
     std::atomic<SampleType> slewSensitivity_ { SampleType(0) };
     std::array<SampleType, kMaxCh> prevSlewSample_ {};
+
+    // C1+A1 cache: last filter-parameter values that were pushed into the
+    // biquad coefficient factories. Compared on every block; setCoeffs and
+    // the underlying makeHighPass/makePeak call are skipped when unchanged.
+    // Sentinel values (-1 Hz, NaN) guarantee a rebuild on the first block.
+    float lastPreHpFreq_    = -1.0f;
+    float lastPostTiltFreq_ = -1.0f;
+    float lastPostTiltGain_ = std::numeric_limits<float>::quiet_NaN();
 };
 
 } // namespace dspark

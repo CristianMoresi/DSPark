@@ -117,7 +117,9 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <utility>
+#include <vector>
 
 namespace dspark {
 
@@ -190,11 +192,12 @@ public:
             buf.prepare(maxOutDiff);
 
         // Initialize smooth random LFOs
+        T rate = modRate_.load(std::memory_order_relaxed);
         for (int i = 0; i < kFDNSize; ++i)
         {
-            modLFOA_[i].prepare(sr, modRate_ * (T(0.7) + T(0.05) * static_cast<T>(i)),
+            modLFOA_[i].prepare(sr, rate * (T(0.7) + T(0.05) * static_cast<T>(i)),
                                 static_cast<uint32_t>(i * 7919 + 1));
-            modLFOB_[i].prepare(sr, modRate_ * (T(1.8) + T(0.11) * static_cast<T>(i)),
+            modLFOB_[i].prepare(sr, rate * (T(1.8) + T(0.11) * static_cast<T>(i)),
                                 static_cast<uint32_t>(i * 6271 + 31337));
         }
 
@@ -208,7 +211,13 @@ public:
         noiseState_ = 1;
         noiseLP_ = T(0);
 
-        applyPreset(type_);
+        applyPreset(type_.load(std::memory_order_relaxed));
+        // Clear pending flags — prepare() has already applied whatever the
+        // caller configured before prepare, so no drain is needed on the first
+        // processBlock.
+        presetDirty_.store(false, std::memory_order_relaxed);
+        paramsDirty_.store(false, std::memory_order_relaxed);
+        toneDirty_.store(false, std::memory_order_relaxed);
         reset();
     }
 
@@ -219,14 +228,102 @@ public:
         const int nS  = buffer.getNumSamples();
         if (nCh == 0 || nS == 0) return;
 
+        // C2/C3: drain deferred parameter changes on the audio thread. All
+        // mutations of non-atomic topology arrays (fdnDelayLens_, diffCoeffs_,
+        // …) happen here, never from GUI-thread setters. acquire-ordered loads
+        // synchronize with the release-stores in setType/setXxx.
+        if (presetDirty_.exchange(false, std::memory_order_acquire))
+        {
+            Type t = type_.load(std::memory_order_relaxed);
+            applyPreset(t);
+            // C3 fix: wipe all delay buffers and filter state — topology just
+            // changed, so old state is stale and can spike the output.
+            reset();
+            // The preset-rebuild already ran updateDelayLengths /
+            // updateDiffCoeffs / updateModulation, so consume paramsDirty_
+            // without doing the work twice.
+            paramsDirty_.store(false, std::memory_order_relaxed);
+        }
+        else if (paramsDirty_.exchange(false, std::memory_order_acquire))
+        {
+            // Non-topology parameter change: refresh coefficient arrays but
+            // DO NOT wipe delay buffers (would click on every knob tweak).
+            if (spec_.sampleRate > 0)
+            {
+                updateDelayLengths();  // also runs updateDecayParams
+                updateDiffCoeffs();
+                updateModulation();
+
+                T md = modDepth_.load(std::memory_order_relaxed);
+                modDepthA_.store(md * T(30), std::memory_order_relaxed);
+                modDepthB_.store(md * T(15), std::memory_order_relaxed);
+
+                T hd = highDecayMult_.load(std::memory_order_relaxed);
+                T damp = std::clamp((T(1) - hd) / T(0.9), T(0), T(1));
+                damping_.store(damp, std::memory_order_relaxed);
+            }
+        }
+
+        if (toneDirty_.exchange(false, std::memory_order_acquire))
+        {
+            T hpHz = toneLowCutHz_.load(std::memory_order_relaxed);
+            T lpHz = toneHighCutHz_.load(std::memory_order_relaxed);
+            if (hpHz <= T(0) || spec_.sampleRate <= 0)
+            {
+                toneHPActive_ = false;
+            }
+            else
+            {
+                toneHPActive_ = true;
+                toneHPBiquad_.setCoeffs(BiquadCoeffs<T>::makeHighPass(
+                    spec_.sampleRate,
+                    static_cast<double>(std::clamp(hpHz, T(20), T(500)))));
+            }
+            if (lpHz <= T(0) || spec_.sampleRate <= 0)
+            {
+                toneLPActive_ = false;
+            }
+            else
+            {
+                toneLPActive_ = true;
+                toneLPBiquad_.setCoeffs(BiquadCoeffs<T>::makeLowPass(
+                    spec_.sampleRate,
+                    static_cast<double>(std::clamp(lpHz, T(2000), T(16000)))));
+            }
+        }
+
         mixer_.pushDry(buffer);
 
         for (int i = 0; i < nS; ++i)
         {
-            T monoIn = T(0);
-            for (int ch = 0; ch < nCh; ++ch)
-                monoIn += buffer.getChannel(ch)[i];
-            monoIn /= static_cast<T>(nCh);
+            // A5 partial fix: naive (L+R)/2 cancels pure-side inputs (L = -R),
+            // leaving the reverb silent for side-encoded material. Full M/S
+            // dual-FDN redesign is out of scope; this minimum-impact guard
+            // falls back to max-magnitude whenever the mono sum collapses to
+            // near-zero relative to the input envelope. For ordinary stereo
+            // signals the branch is never taken and behaviour is unchanged.
+            T monoIn;
+            if (nCh >= 2)
+            {
+                T L = buffer.getChannel(0)[i];
+                T R = buffer.getChannel(1)[i];
+                T sum = L + R;
+                T env = std::abs(L) + std::abs(R);
+                if (std::abs(sum) < T(1e-5) * env)
+                {
+                    // Pure (or near-pure) side: inject the louder channel to
+                    // excite the FDN. Not phase-accurate, but prevents silence.
+                    monoIn = (std::abs(L) >= std::abs(R)) ? L : R;
+                }
+                else
+                {
+                    monoIn = sum * T(0.5);
+                }
+            }
+            else
+            {
+                monoIn = buffer.getChannel(0)[i];
+            }
 
             auto [outL, outR] = processSampleInternal(monoIn);
 
@@ -285,12 +382,20 @@ public:
     // Level 1: Simple API
     // =========================================================================
 
-    void setType(Type type) { type_ = type; applyPreset(type); }
+    void setType(Type type) noexcept
+    {
+        // C2 fix: don't touch non-atomic state from GUI thread. Publish the
+        // new type and raise the preset-dirty flag; the audio thread will
+        // run applyPreset() + reset() at the top of its next processBlock.
+        type_.store(type, std::memory_order_relaxed);
+        presetDirty_.store(true, std::memory_order_release);
+    }
 
     void setDecay(T seconds) noexcept
     {
-        decayTime_ = std::clamp(seconds, T(0.1), T(30));
-        updateDecayParams();
+        decayTime_.store(std::clamp(seconds, T(0.1), T(30)),
+                         std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     void setMix(T dryWet) noexcept { mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed); }
@@ -299,7 +404,11 @@ public:
     // Level 2: Intermediate API
     // =========================================================================
 
-    void setSize(T size) { size_ = std::clamp(size, T(0.01), T(1)); updateDelayLengths(); }
+    void setSize(T size) noexcept
+    {
+        size_.store(std::clamp(size, T(0.01), T(1)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
+    }
 
     /**
      * @brief Sets high-frequency damping (0 = bright, 1 = dark).
@@ -309,31 +418,36 @@ public:
      */
     void setDamping(T amount) noexcept
     {
-        damping_ = std::clamp(amount, T(0), T(1));
-        highDecayMult_ = T(1) - damping_ * T(0.9);
-        updateDecayParams();
+        T clamped = std::clamp(amount, T(0), T(1));
+        damping_.store(clamped, std::memory_order_relaxed);
+        highDecayMult_.store(T(1) - clamped * T(0.9), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     void setPreDelay(T ms) noexcept
     {
-        preDelayMs_ = std::clamp(ms, T(0), T(200));
+        T clamped = std::clamp(ms, T(0), T(200));
+        preDelayMs_.store(clamped, std::memory_order_relaxed);
+        // preDelaySamples_ is already atomic and only consumed in the audio
+        // loop; storing it from any thread is safe and cheap.
         if (spec_.sampleRate > 0)
             preDelaySamples_.store(static_cast<int>(
-                static_cast<T>(spec_.sampleRate) * preDelayMs_ / T(1000)),
+                static_cast<T>(spec_.sampleRate) * clamped / T(1000)),
                 std::memory_order_relaxed);
     }
 
     void setDiffusion(T amount) noexcept
     {
-        diffusion_ = std::clamp(amount, T(0), T(1));
-        updateDiffCoeffs();
+        diffusion_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     void setModulation(T amount) noexcept
     {
-        modDepth_ = std::clamp(amount, T(0), T(1));
-        modDepthA_.store(modDepth_ * T(30), std::memory_order_relaxed);
-        modDepthB_.store(modDepth_ * T(15), std::memory_order_relaxed);
+        T clamped = std::clamp(amount, T(0), T(1));
+        modDepth_.store(clamped, std::memory_order_relaxed);
+        modDepthA_.store(clamped * T(30), std::memory_order_relaxed);
+        modDepthB_.store(clamped * T(15), std::memory_order_relaxed);
     }
 
     /**
@@ -351,10 +465,11 @@ public:
 
     void setErToLateDelay(T ms) noexcept
     {
-        erToLateMs_ = std::clamp(ms, T(0), T(200));
+        T clamped = std::clamp(ms, T(0), T(200));
+        erToLateMs_.store(clamped, std::memory_order_relaxed);
         if (spec_.sampleRate > 0)
             erToLateSamples_.store(static_cast<int>(
-                static_cast<T>(spec_.sampleRate) * erToLateMs_ / T(1000)),
+                static_cast<T>(spec_.sampleRate) * clamped / T(1000)),
                 std::memory_order_relaxed);
     }
 
@@ -373,9 +488,10 @@ public:
      */
     void setHighDecayMultiplier(T mult) noexcept
     {
-        highDecayMult_ = std::clamp(mult, T(0.05), T(1));
-        damping_ = (T(1) - highDecayMult_) / T(0.9);
-        updateDecayParams();
+        T clamped = std::clamp(mult, T(0.05), T(1));
+        highDecayMult_.store(clamped, std::memory_order_relaxed);
+        damping_.store((T(1) - clamped) / T(0.9), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     /**
@@ -390,8 +506,9 @@ public:
      */
     void setBassDecayMultiplier(T mult) noexcept
     {
-        bassDecayMult_ = std::clamp(mult, T(0.3), T(3));
-        updateDecayParams();
+        bassDecayMult_.store(std::clamp(mult, T(0.3), T(3)),
+                             std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     /**
@@ -400,7 +517,8 @@ public:
      */
     void setHighCrossover(T hz) noexcept
     {
-        highCrossover_ = std::clamp(hz, T(1000), T(16000));
+        highCrossover_.store(std::clamp(hz, T(1000), T(16000)),
+                             std::memory_order_relaxed);
     }
 
     /**
@@ -409,10 +527,9 @@ public:
      */
     void setBassCrossover(T hz) noexcept
     {
-        bassCrossover_ = std::clamp(hz, T(50), T(500));
-        if (spec_.sampleRate > 0)
-            bassLPCoeff_ = T(1) - std::exp(T(-6.283185307179586) * bassCrossover_
-                                            / static_cast<T>(spec_.sampleRate));
+        bassCrossover_.store(std::clamp(hz, T(50), T(500)),
+                             std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     // =========================================================================
@@ -431,8 +548,8 @@ public:
 
     void setModRate(T hz) noexcept
     {
-        modRate_ = std::clamp(hz, T(0.1), T(5));
-        updateModulation();
+        modRate_.store(std::clamp(hz, T(0.1), T(5)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     /**
@@ -441,10 +558,9 @@ public:
      */
     void setToneLowCut(T hz) noexcept
     {
-        if (hz <= T(0) || spec_.sampleRate <= 0) { toneHPActive_ = false; return; }
-        toneHPActive_ = true;
-        toneHPBiquad_.setCoeffs(BiquadCoeffs<T>::makeHighPass(
-            spec_.sampleRate, static_cast<double>(std::clamp(hz, T(20), T(500)))));
+        // Queue target; audio thread rebuilds the biquad inside processBlock.
+        toneLowCutHz_.store(hz, std::memory_order_relaxed);
+        toneDirty_.store(true, std::memory_order_release);
     }
 
     /**
@@ -453,24 +569,22 @@ public:
      */
     void setToneHighCut(T hz) noexcept
     {
-        if (hz <= T(0) || spec_.sampleRate <= 0) { toneLPActive_ = false; return; }
-        toneLPActive_ = true;
-        toneLPBiquad_.setCoeffs(BiquadCoeffs<T>::makeLowPass(
-            spec_.sampleRate, static_cast<double>(std::clamp(hz, T(2000), T(16000)))));
+        toneHighCutHz_.store(hz, std::memory_order_relaxed);
+        toneDirty_.store(true, std::memory_order_release);
     }
 
     // =========================================================================
     // Getters
     // =========================================================================
 
-    [[nodiscard]] Type getType() const noexcept { return type_; }
-    [[nodiscard]] T getDecay() const noexcept { return decayTime_; }
+    [[nodiscard]] Type getType() const noexcept { return type_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getDecay() const noexcept { return decayTime_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
-    [[nodiscard]] T getHighDecayMultiplier() const noexcept { return highDecayMult_; }
-    [[nodiscard]] T getBassDecayMultiplier() const noexcept { return bassDecayMult_; }
+    [[nodiscard]] T getHighDecayMultiplier() const noexcept { return highDecayMult_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getBassDecayMultiplier() const noexcept { return bassDecayMult_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
-    [[nodiscard]] T getHighCrossover() const noexcept { return highCrossover_; }
-    [[nodiscard]] T getBassCrossover() const noexcept { return bassCrossover_; }
+    [[nodiscard]] T getHighCrossover() const noexcept { return highCrossover_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getBassCrossover() const noexcept { return bassCrossover_.load(std::memory_order_relaxed); }
 
 protected:
     // --- Constants -----------------------------------------------------------
@@ -706,26 +820,41 @@ protected:
     DryWetMixer<T> mixer_;
 
     // --- Parameters ----------------------------------------------------------
+    //
+    // Thread-safety model (C2/C3 fix):
+    //  - All GUI-thread setters mutate ONLY atomic shadow fields below and set
+    //    `paramsDirty_` (or `presetDirty_` for setType).
+    //  - The audio thread drains the dirty flags at the top of `processBlock()`
+    //    and calls the update helpers there — so every non-atomic array that
+    //    participates in the audio path (fdnDelayLens_, diffCoeffs_, …) is
+    //    mutated exclusively from the audio thread. No races, no torn reads.
 
-    Type type_           = Type::Room;
-    T decayTime_         = T(1);
-    T size_              = T(0.5);
-    T damping_           = T(0.5);
-    T diffusion_         = T(0.7);
-    T modDepth_          = T(0.1);
-    T modRate_           = T(1);
-    T preDelayMs_        = T(0);
-    T erToLateMs_        = T(0);
+    std::atomic<Type> type_      { Type::Room };
+    std::atomic<T> decayTime_    { T(1) };
+    std::atomic<T> size_         { T(0.5) };
+    std::atomic<T> damping_      { T(0.5) };
+    std::atomic<T> diffusion_    { T(0.7) };
+    std::atomic<T> modDepth_     { T(0.1) };
+    std::atomic<T> modRate_      { T(1) };
+    std::atomic<T> preDelayMs_   { T(0) };
+    std::atomic<T> erToLateMs_   { T(0) };
     std::atomic<T> mix_          { T(0.3) };
-    std::atomic<T> earlyLevel_  { T(1) };
-    std::atomic<T> lateLevel_   { T(1) };
-    std::atomic<T> width_       { T(1) };     // Stereo width: 0=mono, 1=natural, 2=wide
+    std::atomic<T> earlyLevel_   { T(1) };
+    std::atomic<T> lateLevel_    { T(1) };
+    std::atomic<T> width_        { T(1) };     // Stereo width: 0=mono, 1=natural, 2=wide
 
     // Frequency-dependent decay parameters
-    T highDecayMult_     = T(0.5);   // HF T60 multiplier (0.05-1.0)
-    T bassDecayMult_     = T(1.2);   // bass T60 multiplier (0.3-3.0)
-    T highCrossover_     = T(5000);  // Hz
-    T bassCrossover_     = T(200);   // Hz
+    std::atomic<T> highDecayMult_ { T(0.5) };   // HF T60 multiplier (0.05-1.0)
+    std::atomic<T> bassDecayMult_ { T(1.2) };   // bass T60 multiplier (0.3-3.0)
+    std::atomic<T> highCrossover_ { T(5000) };  // Hz
+    std::atomic<T> bassCrossover_ { T(200) };   // Hz
+
+    // Deferred-apply flags (audio thread drains these at top of processBlock)
+    std::atomic<bool> presetDirty_ { false };  // setType() → rebuild topology + reset
+    std::atomic<bool> paramsDirty_ { false };  // any other setter → refresh coeffs
+    std::atomic<bool> toneDirty_   { false };  // tone EQ cutoff changes
+    std::atomic<T> toneLowCutHz_  { T(-1) };   // <0 = off, queued value for audio thread
+    std::atomic<T> toneHighCutHz_ { T(-1) };
 
     // --- Computed coefficients ------------------------------------------------
 
@@ -1068,12 +1197,15 @@ protected:
      */
     void updateDecayParams() noexcept
     {
-        if (spec_.sampleRate <= 0 || decayTime_ <= T(0)) return;
+        T decay = decayTime_.load(std::memory_order_relaxed);
+        if (spec_.sampleRate <= 0 || decay <= T(0)) return;
 
         T sr = static_cast<T>(spec_.sampleRate);
-        T t60Mid  = decayTime_;
-        T t60High = decayTime_ * highDecayMult_;
-        T t60Bass = decayTime_ * bassDecayMult_;
+        T hdMult = highDecayMult_.load(std::memory_order_relaxed);
+        T bdMult = bassDecayMult_.load(std::memory_order_relaxed);
+        T t60Mid  = decay;
+        T t60High = decay * hdMult;
+        T t60Bass = decay * bdMult;
 
         t60High = std::max(t60High, T(0.05));
         t60Bass = std::max(t60Bass, T(0.05));
@@ -1104,14 +1236,16 @@ protected:
         }
 
         // Bass crossover filter coefficient
-        bassLPCoeff_ = T(1) - std::exp(T(-6.283185307179586) * bassCrossover_ / sr);
+        T bassCut = bassCrossover_.load(std::memory_order_relaxed);
+        bassLPCoeff_ = T(1) - std::exp(T(-6.283185307179586) * bassCut / sr);
     }
 
     void updateDelayLengths()
     {
         double sr = spec_.sampleRate;
         // Nonlinear size mapping: size=0 -> 0.35, size=1 -> 1.0
-        double sz = 0.35 + 0.65 * static_cast<double>(size_);
+        double sz = 0.35 + 0.65 * static_cast<double>(
+            size_.load(std::memory_order_relaxed));
 
         for (int d = 0; d < kFDNSize; ++d)
         {
@@ -1159,22 +1293,24 @@ protected:
 
     void updateDiffCoeffs() noexcept
     {
+        T diff = diffusion_.load(std::memory_order_relaxed);
         for (int d = 0; d < kDiffStages; ++d)
-            diffCoeffs_[d] = static_cast<T>(kDiffBaseCoeffs_[d]) * diffusion_;
-        outDiffCoeff_ = T(0.45) * diffusion_;
-        fbAPCoeff_ = T(0.3) + T(0.4) * diffusion_;  // Dattorro range 0.3-0.7
+            diffCoeffs_[d] = static_cast<T>(kDiffBaseCoeffs_[d]) * diff;
+        outDiffCoeff_ = T(0.45) * diff;
+        fbAPCoeff_ = T(0.3) + T(0.4) * diff;  // Dattorro range 0.3-0.7
         // Feedback IIR smoothing: higher diffusion = more smoothing
-        fbSmooth_ = T(0.1) + T(0.25) * diffusion_;   // range 0.1-0.35
+        fbSmooth_ = T(0.1) + T(0.25) * diff;   // range 0.1-0.35
     }
 
     void updateModulation() noexcept
     {
         if (spec_.sampleRate <= 0) return;
+        T rate = modRate_.load(std::memory_order_relaxed);
         for (int i = 0; i < kFDNSize; ++i)
         {
-            modLFOA_[i].setRate(modRate_ * (T(0.7) + T(0.05) * static_cast<T>(i)),
+            modLFOA_[i].setRate(rate * (T(0.7) + T(0.05) * static_cast<T>(i)),
                                 spec_.sampleRate);
-            modLFOB_[i].setRate(modRate_ * (T(1.8) + T(0.11) * static_cast<T>(i)),
+            modLFOB_[i].setRate(rate * (T(1.8) + T(0.11) * static_cast<T>(i)),
                                 spec_.sampleRate);
         }
         // Noise depth: 40% of LFO depth (breaks periodic patterns)
@@ -1224,9 +1360,40 @@ protected:
         }
     }
 
+    // Sieve of Eratosthenes up to kPrimeTableMax, computed once the first
+    // time `nearestPrime` is called. Keeps parameter-update calls cheap
+    // (previously O(sqrt(n)) per lookup × ~20 calls per update). For
+    // `n >= kPrimeTableMax` we fall back to the original trial division —
+    // that branch is only reached at extreme sample rates / reverb sizes (M4).
+    static constexpr int kPrimeTableMax = 131072;  // 2^17 — covers up to ~2.7 s @48kHz
+
+    static const std::vector<uint8_t>& getPrimeSieve() noexcept
+    {
+        static const std::vector<uint8_t> sieve = []
+        {
+            std::vector<uint8_t> s(static_cast<size_t>(kPrimeTableMax), 1);
+            s[0] = 0;
+            s[1] = 0;
+            for (int i = 2; i * i < kPrimeTableMax; ++i)
+                if (s[static_cast<size_t>(i)])
+                    for (int j = i * i; j < kPrimeTableMax; j += i)
+                        s[static_cast<size_t>(j)] = 0;
+            return s;
+        }();
+        return sieve;
+    }
+
     static int nearestPrime(int n) noexcept
     {
         if (n <= 2) return 2;
+        if (n < kPrimeTableMax)
+        {
+            const auto& sieve = getPrimeSieve();
+            while (n < kPrimeTableMax && !sieve[static_cast<size_t>(n)])
+                ++n;
+            if (n < kPrimeTableMax) return n;
+            // fall through to trial division for values at/above the table
+        }
         if (n % 2 == 0) ++n;
         while (true)
         {
@@ -1240,90 +1407,102 @@ protected:
 
     // --- Preset application --------------------------------------------------
 
+    // Small helper: atomic-store all preset params in one go. Keeps the big
+    // preset switch readable and avoids repeating `.store(..., mo_relaxed)`.
+    struct PresetValues {
+        T size, decay, hdMult, bdMult, hxover, bxover;
+        T diff, modDepth, modRate, earlyLvl, lateLvl, erToLate;
+        bool toneLP, toneHP;
+    };
+
+    void commitPreset(const PresetValues& p) noexcept
+    {
+        size_.store(p.size, std::memory_order_relaxed);
+        decayTime_.store(p.decay, std::memory_order_relaxed);
+        highDecayMult_.store(p.hdMult, std::memory_order_relaxed);
+        bassDecayMult_.store(p.bdMult, std::memory_order_relaxed);
+        highCrossover_.store(p.hxover, std::memory_order_relaxed);
+        bassCrossover_.store(p.bxover, std::memory_order_relaxed);
+        diffusion_.store(p.diff, std::memory_order_relaxed);
+        modDepth_.store(p.modDepth, std::memory_order_relaxed);
+        modRate_.store(p.modRate, std::memory_order_relaxed);
+        earlyLevel_.store(p.earlyLvl, std::memory_order_relaxed);
+        lateLevel_.store(p.lateLvl, std::memory_order_relaxed);
+        erToLateMs_.store(p.erToLate, std::memory_order_relaxed);
+        toneLPActive_ = p.toneLP;
+        toneHPActive_ = p.toneHP;
+    }
+
     void applyPreset(Type type)
     {
         switch (type)
         {
             case Type::Room:
-                size_ = T(0.22); decayTime_ = T(0.5);
-                highDecayMult_ = T(0.40); bassDecayMult_ = T(1.1);
-                highCrossover_ = T(5000); bassCrossover_ = T(250);
-                diffusion_ = T(0.72); modDepth_ = T(0.14); modRate_ = T(1.2);
-                earlyLevel_.store(T(1), std::memory_order_relaxed); lateLevel_.store(T(0.8), std::memory_order_relaxed); erToLateMs_ = T(0);
-                toneLPActive_ = false; toneHPActive_ = false;
+                commitPreset({T(0.22), T(0.5),  T(0.40), T(1.1),
+                              T(5000), T(250),  T(0.72), T(0.14), T(1.2),
+                              T(1),    T(0.8),  T(0),    false,   false});
                 break;
 
             case Type::Hall:
-                size_ = T(0.68); decayTime_ = T(2.2);
-                highDecayMult_ = T(0.32); bassDecayMult_ = T(1.3);
-                highCrossover_ = T(4500); bassCrossover_ = T(200);
-                diffusion_ = T(0.84); modDepth_ = T(0.22); modRate_ = T(0.55);
-                earlyLevel_.store(T(0.7), std::memory_order_relaxed); lateLevel_.store(T(1), std::memory_order_relaxed); erToLateMs_ = T(15);
-                toneLPActive_ = false; toneHPActive_ = false;
+                commitPreset({T(0.68), T(2.2),  T(0.32), T(1.3),
+                              T(4500), T(200),  T(0.84), T(0.22), T(0.55),
+                              T(0.7),  T(1),    T(15),   false,   false});
                 break;
 
             case Type::Chamber:
-                size_ = T(0.38); decayTime_ = T(1.2);
-                highDecayMult_ = T(0.38); bassDecayMult_ = T(1.1);
-                highCrossover_ = T(5000); bassCrossover_ = T(250);
-                diffusion_ = T(0.78); modDepth_ = T(0.18); modRate_ = T(0.8);
-                earlyLevel_.store(T(0.9), std::memory_order_relaxed); lateLevel_.store(T(0.9), std::memory_order_relaxed); erToLateMs_ = T(8);
-                toneLPActive_ = false; toneHPActive_ = false;
+                commitPreset({T(0.38), T(1.2),  T(0.38), T(1.1),
+                              T(5000), T(250),  T(0.78), T(0.18), T(0.8),
+                              T(0.9),  T(0.9),  T(8),    false,   false});
                 break;
 
             case Type::Plate:
-                size_ = T(0.14); decayTime_ = T(1.5);
-                highDecayMult_ = T(0.55); bassDecayMult_ = T(0.8);
-                highCrossover_ = T(7000); bassCrossover_ = T(150);
-                diffusion_ = T(0.94); modDepth_ = T(0.32); modRate_ = T(1.4);
-                earlyLevel_.store(T(0), std::memory_order_relaxed); lateLevel_.store(T(1), std::memory_order_relaxed); erToLateMs_ = T(0);
+                commitPreset({T(0.14), T(1.5),  T(0.55), T(0.8),
+                              T(7000), T(150),  T(0.94), T(0.32), T(1.4),
+                              T(0),    T(1),    T(0),    false,   false});
                 numERTaps_ = 0;
-                toneLPActive_ = false; toneHPActive_ = false;
                 break;
 
             case Type::Spring:
-                size_ = T(0.11); decayTime_ = T(0.9);
-                highDecayMult_ = T(0.28); bassDecayMult_ = T(1.0);
-                highCrossover_ = T(4000); bassCrossover_ = T(200);
-                diffusion_ = T(0.38); modDepth_ = T(0.08); modRate_ = T(0.35);
-                earlyLevel_.store(T(0.5), std::memory_order_relaxed); lateLevel_.store(T(1), std::memory_order_relaxed); erToLateMs_ = T(0);
-                toneLPActive_ = false; toneHPActive_ = false;
+                commitPreset({T(0.11), T(0.9),  T(0.28), T(1.0),
+                              T(4000), T(200),  T(0.38), T(0.08), T(0.35),
+                              T(0.5),  T(1),    T(0),    false,   false});
                 break;
 
             case Type::Cathedral:
-                size_ = T(0.98); decayTime_ = T(5.0);
-                highDecayMult_ = T(0.24); bassDecayMult_ = T(1.5);
-                highCrossover_ = T(3500); bassCrossover_ = T(150);
-                diffusion_ = T(0.91); modDepth_ = T(0.18); modRate_ = T(0.35);
-                earlyLevel_.store(T(0.5), std::memory_order_relaxed); lateLevel_.store(T(1), std::memory_order_relaxed); erToLateMs_ = T(25);
-                toneLPActive_ = false; toneHPActive_ = false;
+                commitPreset({T(0.98), T(5.0),  T(0.24), T(1.5),
+                              T(3500), T(150),  T(0.91), T(0.18), T(0.35),
+                              T(0.5),  T(1),    T(25),   false,   false});
                 break;
         }
 
         // Sync damping_ from highDecayMult_
-        damping_ = (T(1) - highDecayMult_) / T(0.9);
-        damping_ = std::clamp(damping_, T(0), T(1));
+        T hd = highDecayMult_.load(std::memory_order_relaxed);
+        T damp = std::clamp((T(1) - hd) / T(0.9), T(0), T(1));
+        damping_.store(damp, std::memory_order_relaxed);
 
         updateDiffCoeffs();
-        modDepthA_.store(modDepth_ * T(30), std::memory_order_relaxed);
-        modDepthB_.store(modDepth_ * T(15), std::memory_order_relaxed);
+        T md = modDepth_.load(std::memory_order_relaxed);
+        modDepthA_.store(md * T(30), std::memory_order_relaxed);
+        modDepthB_.store(md * T(15), std::memory_order_relaxed);
 
         if (spec_.sampleRate > 0)
         {
             updateDelayLengths(); // also calls updateDecayParams()
             updateModulation();
 
+            T er = erToLateMs_.load(std::memory_order_relaxed);
             erToLateSamples_.store(static_cast<int>(
-                static_cast<T>(spec_.sampleRate) * erToLateMs_ / T(1000)),
+                static_cast<T>(spec_.sampleRate) * er / T(1000)),
                 std::memory_order_relaxed);
 
+            T rate = modRate_.load(std::memory_order_relaxed);
             for (int i = 0; i < kFDNSize; ++i)
             {
                 modLFOA_[i].prepare(spec_.sampleRate,
-                    modRate_ * (T(0.7) + T(0.05) * static_cast<T>(i)),
+                    rate * (T(0.7) + T(0.05) * static_cast<T>(i)),
                     static_cast<uint32_t>(i * 7919 + 1));
                 modLFOB_[i].prepare(spec_.sampleRate,
-                    modRate_ * (T(1.8) + T(0.11) * static_cast<T>(i)),
+                    rate * (T(1.8) + T(0.11) * static_cast<T>(i)),
                     static_cast<uint32_t>(i * 6271 + 31337));
             }
 

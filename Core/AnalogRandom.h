@@ -460,8 +460,11 @@ template <typename Real = float> class Generator
             m_currentValue = m_targetValue;
         }
         // Denormal kill: small additive epsilon to avoid denormals.
+        // Apply to the internal state as well as the returned sample so
+        // recursive feedback (smoother) cannot accumulate a denormal tail.
         constexpr Real denormEps = static_cast<Real>(1e-25);
-        return m_currentValue + denormEps;
+        m_currentValue += denormEps;
+        return m_currentValue;
     }
     /**
      * @brief Get the current (last returned) value.

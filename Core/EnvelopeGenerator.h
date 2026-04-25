@@ -112,6 +112,14 @@ public:
      * Higher values = more exponential (snappy attack, slow tail).
      * Lower values = more linear.
      *
+     * **Calibration note:** the envelope uses an "asymptotic overshoot"
+     * topology (`current += rate · (target ± overshoot − current)`). With
+     * the default `curvature = 3`, the stage reaches ~95 % of the target
+     * in roughly **half** the programmed time. If you need "a 100 ms
+     * attack hitting ~95 % at 100 ms" (ADSR convention in many plugins),
+     * use `curvature ≈ 1.5` and tune to taste, or read the asymptotic
+     * behaviour as a feature. Kept at 3 by default for musical snap.
+     *
      * @param curve Curvature factor (default: 3.0, range: 0.1 to 10.0).
      */
     void setCurvature(T curve) noexcept

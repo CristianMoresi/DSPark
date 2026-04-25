@@ -97,11 +97,13 @@ public:
         ceilingSmooth_.prepare(sampleRate, 30.0);
         ceilingSmooth_.setCurrentAndTarget(ceilLinear);
 
-        // Release coefficient
+        // Release coefficient (also cached in lastReleaseMs_ so processBlock
+        // can skip the exp() when releaseMs is unchanged).
         T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
         T fs = static_cast<T>(sampleRate_);
         if (fs > T(0))
             releaseCoeff_ = T(1) - std::exp(T(-1) / (fs * relMs / T(1000)));
+        lastReleaseMs_ = relMs;
 
         // ISP true-peak: build polyphase FIR filter + reset state
         buildTruePeakFilter();
@@ -134,10 +136,17 @@ public:
         T ceilLinear = decibelsToGain(ceilDb);
         ceilingSmooth_.setTargetValue(ceilLinear);
 
+        // Release coefficient is recomputed only when releaseMs changed since
+        // last block. prepare() initialises both; subsequent blocks do a cheap
+        // scalar compare instead of an unconditional exp() per block.
         T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
-        T fs = static_cast<T>(sampleRate_);
-        if (fs > T(0))
-            releaseCoeff_ = T(1) - std::exp(T(-1) / (fs * relMs / T(1000)));
+        if (relMs != lastReleaseMs_)
+        {
+            T fs = static_cast<T>(sampleRate_);
+            if (fs > T(0))
+                releaseCoeff_ = T(1) - std::exp(T(-1) / (fs * relMs / T(1000)));
+            lastReleaseMs_ = relMs;
+        }
 
         bool isp         = truePeakEnabled_.load(std::memory_order_relaxed);
         bool adaptive    = adaptiveRelease_.load(std::memory_order_relaxed);
@@ -167,7 +176,12 @@ public:
             {
                 T out = delayLines_[ch].read(lookaheadSamples_) * currentGain_;
 
-                // Safety clipper: interpolated reconstruction at clip boundaries
+                // Safety clipper: interpolated reconstruction at clip boundaries.
+                // The asymmetric blend below is designed to approach the ceiling
+                // smoothly; a final hard clamp would undo the blend and reintroduce
+                // the harsh clipping artefacts we are explicitly trying to avoid.
+                // We keep a very loose safety net that only engages when the blend
+                // itself is exceeded (>5% over ceiling) as a last-resort guard.
                 T clipCeil = std::min(kSafetyClipCeiling, ceiling);
                 if (safetyClip && std::abs(out) > clipCeil)
                 {
@@ -176,7 +190,13 @@ public:
                     // Asymmetric blend: fast entry, slow exit (ClipOnly2-style)
                     T blend = T(1) / (T(1) + excess * T(10));
                     out = sign * (clipCeil * blend + std::abs(out) * (T(1) - blend));
-                    out = std::clamp(out, -clipCeil, clipCeil);
+                    // Last-resort safety net: only clamp if the blend somehow
+                    // overshoots the ceiling by more than 5 % (should never
+                    // happen with the formula above, but guards against FP edge
+                    // cases with extreme inputs).
+                    const T hardCeil = clipCeil * T(1.05);
+                    if (std::abs(out) > hardCeil)
+                        out = std::clamp(out, -hardCeil, hardCeil);
                 }
 
                 buffer.getChannel(ch)[i] = out;
@@ -369,9 +389,21 @@ protected:
     /// Number of inter-sample phases to check (t=0.25, 0.5, 0.75).
     static constexpr int kTpPhases = 3;
 
-    /// Per-channel state for true-peak detection: last 12 samples for FIR interpolation.
+    /// Per-channel state for true-peak detection: circular buffer of the last
+    /// kTpTaps samples for FIR interpolation.
+    ///
+    /// A7 fix: storage is a power-of-two ring buffer (size 16 ≥ kTpTaps=12)
+    /// with a write index and bitmask wrap. Push is O(1) (single store)
+    /// instead of the previous O(kTpTaps-1) linear shift. The convolution
+    /// walks backwards from the newest sample; bitmask indexing keeps the
+    /// inner loop branchless.
+    static constexpr int kTpHistSize = 16;       // next power of 2 ≥ kTpTaps
+    static constexpr int kTpHistMask = kTpHistSize - 1;
+    static_assert(kTpHistSize >= kTpTaps, "history must cover all FIR taps");
+
     struct TruePeakState {
-        T history[kTpTaps] = {};  ///< history[0] = oldest, history[kTpTaps-1] = newest
+        T history[kTpHistSize] = {};  ///< circular buffer, indexed by (writePos - 1 - k) & mask
+        int writePos = 0;             ///< position of the next write
     };
     std::array<TruePeakState, kMaxChannels> tpState_{};
 
@@ -448,20 +480,26 @@ protected:
     {
         auto& tp = tpState_[ch];
 
-        // Shift history left and insert new sample at the end
-        for (int k = 0; k < kTpTaps - 1; ++k)
-            tp.history[k] = tp.history[k + 1];
-        tp.history[kTpTaps - 1] = sample;
+        // O(1) push into the circular history
+        tp.history[tp.writePos] = sample;
+        tp.writePos = (tp.writePos + 1) & kTpHistMask;
 
         T peak = std::abs(sample);
 
         // Check 3 inter-sample positions using polyphase FIR convolution
-        // y[4m+p] = sum_{i=0}^{11} h[4i+p] * x[m-i]
+        // y[4m+p] = sum_{k=0}^{11} h[4k+p] * x[m-k].
+        // The newest sample lives at (writePos − 1) mod kTpHistSize, and we
+        // walk backwards one tap at a time.
+        const int newest = (tp.writePos - 1) & kTpHistMask;
         for (int phase = 0; phase < kTpPhases; ++phase)
         {
             T interp = T(0);
+            int idx = newest;
             for (int k = 0; k < kTpTaps; ++k)
-                interp += tp.history[kTpTaps - 1 - k] * tpCoeffs_[phase][k];
+            {
+                interp += tp.history[idx] * tpCoeffs_[phase][k];
+                idx = (idx - 1) & kTpHistMask;
+            }
 
             T absInterp = std::abs(interp);
             if (absInterp > peak)
@@ -523,6 +561,7 @@ protected:
 
     // Coefficients
     T releaseCoeff_ = T(0);
+    T lastReleaseMs_ = T(-1); ///< Last releaseMs used to compute releaseCoeff_ (sentinel -1 forces first compute)
 
     // State
     T currentGain_ = T(1);

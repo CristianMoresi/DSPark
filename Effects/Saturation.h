@@ -88,13 +88,19 @@ public:
     }
 };
 
-// -- Tube (triode model: Koren 1996 simplified + grid current) ---------------
-// Reference: Norman Koren, "Improved vacuum-tube models for SPICE", 1996.
-// Models asymmetric transfer characteristic of 12AX7-style triode:
-//   - Positive half: plate current follows 3/2 power law (Ip ~ Vgk^1.5)
-//   - Negative half: softer clipping (grid conduction region)
-//   - Bias point shifts harmonic content (character parameter)
-//   - Drive controls the input gain before the nonlinearity
+// -- Tube (12AX7-style asymmetric triode model) -----------------------------
+// Bug-fix: previous implementation used `1 - exp(-x^1.5)` which is bounded in
+// [0, 1] and never approaches identity for small inputs — meaning every signal
+// was heavily attenuated even at unity drive (e.g. input 0.5 -> 0.193, ~8 dB
+// loss before any "saturation" was intended).
+//
+// The replacement uses a tanh-based asymmetric saturator that:
+//   - Is essentially transparent for small inputs (linear gain ≈ 1)
+//   - Soft-saturates only as |x| approaches and exceeds 1 (0 dBFS)
+//   - Negative half is slightly more compressed than positive — this
+//     asymmetry generates the predominant 2nd-harmonic content that gives
+//     single-ended triodes their characteristic "warmth"
+//   - `character` (0..1) controls how pronounced that asymmetry is
 template <typename T>
 class TubeAlgorithm final : public SaturationAlgorithm<T>
 {
@@ -103,46 +109,14 @@ public:
     void reset() noexcept override {}
     T processSample(T sample, T drive, T character, int) noexcept override
     {
-        // Bias point: shifts the operating point on the tube curve
-        // character 0 = class A (symmetric), 1 = pushed toward cutoff (more even harmonics)
-        T bias = T(-0.2) - character * T(0.3);  // Typical grid bias: -0.2V to -0.5V
+        T x = sample * drive;
 
-        T x = sample * drive + bias;
+        // Negative-half compression multiplier: 1.15 (subtle) to 1.65 (strong)
+        T asym = T(1.15) + character * T(0.5);
 
-        // Koren-inspired transfer function:
-        // For x > 0 (plate conduction): soft 3/2 power law
-        // For x < 0 (approaching cutoff): asymptotic compression
-        T output;
-        if (x > T(0))
-        {
-            // Plate conduction: Ip ~ (Vgk + Vpk/mu)^(3/2)
-            // Simplified: out = sign(x) * (1 - exp(-|x|^1.5))
-            T xAbs = std::min(x, T(10));
-            T powered = xAbs * std::sqrt(xAbs); // x^1.5
-            output = T(1) - std::exp(-powered);
-        }
-        else
-        {
-            // Cutoff region: gradual, asymmetric — weaker clipping
-            T xAbs = std::min(-x, T(10));
-            T powered = xAbs * std::sqrt(xAbs) * T(0.6); // Softer on negative
-            output = -(T(1) - std::exp(-powered)) * T(0.8); // Asymmetric amplitude
-        }
-
-        // Remove DC from bias
-        T biasOut;
-        if (bias > T(0))
-        {
-            T bAbs = std::min(bias, T(10));
-            biasOut = T(1) - std::exp(-bAbs * std::sqrt(bAbs));
-        }
-        else
-        {
-            T bAbs = std::min(-bias, T(10));
-            biasOut = -(T(1) - std::exp(-bAbs * std::sqrt(bAbs) * T(0.6))) * T(0.8);
-        }
-
-        return output - biasOut;
+        // Asymmetric tanh: positive half gets standard curve, negative half
+        // gets pre-multiplied input so it saturates earlier.
+        return (x >= T(0)) ? fastTanh(x) : fastTanh(x * asym);
     }
 };
 
@@ -312,9 +286,16 @@ public:
         //   Ms = saturation magnetisation (controls output level)
         //   a  = shape parameter (controls curve width)
         //   c  = inter-domain coupling (controls hysteresis width)
-        T Ms = T(1);
-        T a  = T(0.8) + (T(1) - character) * T(0.4); // character widens hysteresis
-        T c  = T(0.7) + character * T(0.25);
+        //
+        // Bug-fix: previous Ms=1 with a in [0.8, 1.2] gave a linear gain of
+        // Ms/(3a) ≈ 0.28..0.42 — every signal was attenuated 7..11 dB before
+        // any saturation behaviour was meant to occur. The relationship
+        // Ms = 3*a keeps the linear gain at unity regardless of `character`,
+        // while smaller `a` (higher character) makes the saturation knee
+        // come in sooner.
+        T a  = T(1.0) - character * T(0.25);   // 1.0 (clean) .. 0.75 (harder)
+        T Ms = T(3) * a;                        // unity linear gain
+        T c  = T(0.6) + character * T(0.2);     // 0.6 .. 0.8 hysteresis width
 
         T H = filtered * drive;  // Applied field
         T dH = H - lastH_[ch];
@@ -375,11 +356,21 @@ public:
     }
     T processSample(T sample, T drive, T character, int ch) noexcept override
     {
+        // Output-transformer behaviour: low frequencies hit core saturation
+        // first (iron permeability is highest at LF); high frequencies pass
+        // largely unaffected. The asymmetry between bands is what makes a
+        // transformer sound different from a wide-band tanh.
+        //
+        // Bug-fix: previous version used drive*2 / drive*0.5 — at unity drive
+        // (0 dB) the lows were already pushed through tanh with 6 dB of extra
+        // gain, producing audible distortion on every mastered file. The
+        // factors below keep the LF-bias-toward-saturation character but at
+        // a fraction of the original aggression.
         T low  = lpFilters_[ch].processSample(sample, 0);
         T high = sample - low;
         T bias = character * T(0.2);
-        T satLow  = fastTanh((low  + bias) * drive * T(2))   - fastTanh(bias);
-        T satHigh = fastTanh((high + bias) * drive * T(0.5)) - fastTanh(bias);
+        T satLow  = fastTanh((low  + bias) * drive * T(1.3)) - fastTanh(bias);
+        T satHigh = fastTanh((high + bias) * drive * T(0.7)) - fastTanh(bias);
         return satLow + satHigh;
     }
 };
@@ -454,10 +445,16 @@ public:
     }
     T processSample(T sample, T drive, T character, int ch) noexcept override
     {
-        T gainComp = T(1) / std::sqrt(std::max(drive * T(0.5), T(0.01)));
-        T tubeOut  = tube_.processSample(sample, drive * T(0.5), character, ch);
-        T tapeOut  = tape_.processSample(tubeOut * gainComp, drive * T(0.6), character, ch);
-        return       xfmr_.processSample(tapeOut * gainComp, drive * T(0.8), character, ch);
+        // Bug-fix: previous version multiplied the output of each stage by
+        // gainComp = 1/sqrt(drive*0.5). For drive=1 (=0 dB) this was 1.414×
+        // applied TWICE (≈ 2× total), and for low drive it grew unbounded
+        // (drive=0.1 → 4.47×) — the inverse of what makeup gain should do.
+        // The cascade is now drive-distributed only: each stage sees a
+        // fraction of the total drive so the chain doesn't compound into
+        // destructive distortion at unity drive.
+        T tubeOut  = tube_.processSample(sample,  drive * T(0.5), character, ch);
+        T tapeOut  = tape_.processSample(tubeOut, drive * T(0.6), character, ch);
+        return       xfmr_.processSample(tapeOut, drive * T(0.8), character, ch);
     }
 };
 
@@ -948,11 +945,52 @@ protected:
         bool useSlew = slewSensitivity_.load(std::memory_order_relaxed) > SampleType(0);
         bool useAdaptive = adaptiveBlend_.load(std::memory_order_relaxed);
 
+        // Capture peak input BEFORE saturation (for GR metering).
+        // We compare peakOut with peakIn * driveGain — the peak that would have
+        // come out if the saturator were perfectly linear. The difference
+        // measures how much the saturator clipped/compressed the driven signal.
+        SampleType peakInOriginal = SampleType(0);
+        {
+            const int nCh = buffer.getNumChannels();
+            const int nS  = buffer.getNumSamples();
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                const SampleType* d = buffer.getChannel(ch);
+                for (int i = 0; i < nS; ++i)
+                    peakInOriginal = std::max(peakInOriginal, std::abs(d[i]));
+            }
+        }
+
         // Slew and adaptive blend require per-sample processing
         if (driftIntensity < 0.01f && !useSlew && !useAdaptive)
             processWithoutDrift(buffer, primary, secondary, xfading, driveGain, character);
         else
             processWithDrift(buffer, primary, secondary, xfading);
+
+        // Capture peak output AFTER saturation, then compute GR.
+        SampleType peakOut = SampleType(0);
+        {
+            const int nCh = buffer.getNumChannels();
+            const int nS  = buffer.getNumSamples();
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                const SampleType* d = buffer.getChannel(ch);
+                for (int i = 0; i < nS; ++i)
+                    peakOut = std::max(peakOut, std::abs(d[i]));
+            }
+        }
+
+        SampleType peakInDriven = peakInOriginal * driveGain;
+        if (peakInDriven > SampleType(1e-6))
+        {
+            SampleType ratio = std::min(peakOut / peakInDriven, SampleType(1));
+            gainReductionDb_.store(gainToDecibels(ratio, SampleType(-100)),
+                                   std::memory_order_relaxed);
+        }
+        else
+        {
+            gainReductionDb_.store(SampleType(0), std::memory_order_relaxed);
+        }
 
         // Complete crossfade
         if (xfading && !crossfader_.isSmoothing())
@@ -1011,8 +1049,8 @@ protected:
         const int nCh = buffer.getNumChannels();
         const int nS  = buffer.getNumSamples();
 
-        SampleType peakIn  = SampleType(0);
-        SampleType peakOut = SampleType(0);
+        // GR metering moved to processSaturation() so it covers both drift /
+        // non-drift paths and uses the correct peak-driven reference.
 
         auto slewAmt  = slewSensitivity_.load(std::memory_order_relaxed);
         bool adaptive = adaptiveBlend_.load(std::memory_order_relaxed);
@@ -1075,9 +1113,6 @@ protected:
                     prevBlendSample_[ch] = dry;
                 }
 
-                peakIn  = std::max(peakIn, std::abs(dry));
-                peakOut = std::max(peakOut, std::abs(wet));
-
                 // Respect processing mode for M/S
                 if ((procMode_ == ProcessingMode::MidOnly && ch == 1) ||
                     (procMode_ == ProcessingMode::SideOnly && ch == 0))
@@ -1087,16 +1122,7 @@ protected:
             }
         }
 
-        // Gain reduction metering
-        if (peakIn > SampleType(1e-6))
-        {
-            auto ratio = std::min(peakOut / peakIn, SampleType(1));
-            gainReductionDb_.store(gainToDecibels(ratio, SampleType(-100)), std::memory_order_relaxed);
-        }
-        else
-        {
-            gainReductionDb_.store(SampleType(0), std::memory_order_relaxed);
-        }
+        // GR metering moved to processSaturation() — see comment there.
     }
 
     void applyOutputGain(AudioBufferView<SampleType> buffer)

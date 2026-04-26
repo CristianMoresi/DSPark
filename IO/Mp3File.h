@@ -64,6 +64,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>   // [DEBUG] for crash log, remove later
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -84,22 +85,38 @@ public:
 
     bool openRead(const char* path) override
     {
+        // [DEBUG] crash-log instrumentation, remove later
+        auto LOG = [](const char* fmt, auto... args) {
+            if (std::FILE* f = std::fopen("dsparklab_crash.log", "a")) {
+                std::fprintf(f, fmt, args...);
+                std::fputc('\n', f);
+                std::fclose(f);
+            }
+        };
+        LOG("[Mp3File] openRead enter");
+
         close();
+        LOG("[Mp3File] after close()");
 
         std::ifstream in(path, std::ios::binary | std::ios::ate);
-        if (!in.is_open()) return false;
+        if (!in.is_open()) { LOG("[Mp3File] ifstream open FAILED"); return false; }
+        LOG("[Mp3File] ifstream open OK");
 
         auto fileSize = static_cast<size_t>(in.tellg());
-        if (fileSize < 10) return false;
+        LOG("[Mp3File] fileSize=%zu", fileSize);
+        if (fileSize < 10) { LOG("[Mp3File] fileSize too small"); return false; }
         constexpr size_t kMaxMp3FileSize = 256 * 1024 * 1024;  // 256 MB
-        if (fileSize > kMaxMp3FileSize) return false;
+        if (fileSize > kMaxMp3FileSize) { LOG("[Mp3File] fileSize too big"); return false; }
         in.seekg(0, std::ios::beg);
 
         fileData_.resize(fileSize);
+        LOG("[Mp3File] fileData_ resized");
         in.read(reinterpret_cast<char*>(fileData_.data()),
                 static_cast<std::streamsize>(fileSize));
+        LOG("[Mp3File] read() done, gcount=%lld", (long long)in.gcount());
         if (static_cast<size_t>(in.gcount()) != fileSize)
         {
+            LOG("[Mp3File] gcount != fileSize -> bail");
             fileData_.clear();
             return false;
         }
@@ -108,24 +125,32 @@ public:
         // Skip ID3v2 tag if present
         filePos_ = 0;
         skipID3v2();
+        LOG("[Mp3File] skipID3v2 done, filePos_=%zu", filePos_);
 
         // First pass: count frames to determine total samples
         if (!scanFrames())
         {
+            LOG("[Mp3File] scanFrames FAILED");
             fileData_.clear();
             return false;
         }
+        LOG("[Mp3File] scanFrames OK: frames=%zu sr=%.0f ch=%d numSamples=%lld",
+            frameOffsets_.size(), info_.sampleRate, info_.numChannels,
+            (long long)info_.numSamples);
 
         // Pre-decode all frames into the output buffer
         if (!decodeAll())
         {
+            LOG("[Mp3File] decodeAll FAILED");
             fileData_.clear();
             decodedSamples_.clear();
             return false;
         }
+        LOG("[Mp3File] decodeAll OK");
 
         fileData_.clear(); // Free raw data after decode
         isOpen_ = true;
+        LOG("[Mp3File] openRead done");
         return true;
     }
 
@@ -2204,9 +2229,29 @@ private:
                     const GranuleChannel& gc, const FrameHeader& hdr,
                     double xr[576]) const
     {
+        // PERFORMANCE: pre-compute pow(i, 4/3) for i in [0, 8191] once.
+        // Huffman-decoded `is` values for MPEG-1 Layer III stay in this range
+        // (after pretab/range expansion). Avoids ~2300 std::pow calls per frame.
+        static const std::array<double, 8192> kPow43 = [] {
+            std::array<double, 8192> t{};
+            for (int i = 0; i < 8192; ++i)
+                t[i] = std::pow(static_cast<double>(i), 4.0 / 3.0);
+            return t;
+        }();
+
+        // Helper: signed pow43 with safety clamp.
+        // kPow43 has static storage duration — referenced directly, not
+        // captured (MSVC C3495: "lambda capture must have automatic storage").
+        auto pow43 = [](int v) -> double {
+            int a = (v < 0) ? -v : v;
+            if (a >= 8192) a = 8191;
+            return (v < 0) ? -kPow43[a] : kPow43[a];
+        };
+
         BandTable bands = getBandTable(hdr.sampleRate);
 
-        double globalGainFactor = std::pow(2.0, (static_cast<double>(gc.global_gain) - 210.0) / 4.0);
+        // exp2() instead of pow(2.0, x) — ~3× faster on MSVC.
+        double globalGainFactor = std::exp2((static_cast<double>(gc.global_gain) - 210.0) / 4.0);
         double scalefacMult = (gc.scalefac_scale) ? 1.0 : 0.5;
 
         if (gc.window_switching && gc.block_type == 2)
@@ -2219,15 +2264,11 @@ private:
                 {
                     int start = bands.longBands[sfb];
                     int end   = bands.longBands[sfb + 1];
-                    double sfPow = std::pow(2.0, -scalefacMult *
+                    double sfPow = std::exp2(-scalefacMult *
                         (scalefac[sfb] + gc.preflag * kPretab[sfb]));
+                    double mult = globalGainFactor * sfPow;
                     for (int i = start; i < end && i < 576; ++i)
-                    {
-                        double v = static_cast<double>(is[i]);
-                        double sign = (v < 0) ? -1.0 : 1.0;
-                        xr[i] = sign * globalGainFactor * sfPow *
-                                 std::pow(std::abs(v), 4.0 / 3.0);
-                    }
+                        xr[i] = mult * pow43(is[i]);
                 }
 
                 // Short bands
@@ -2236,19 +2277,17 @@ private:
                     int width = bands.shortBands[sfb + 1] - bands.shortBands[sfb];
                     for (int win = 0; win < 3; ++win)
                     {
-                        double sbGain = std::pow(2.0, -2.0 * gc.subblock_gain[win]);
+                        double sbGain = std::exp2(-2.0 * gc.subblock_gain[win]);
                         int sfIdx = sfb * 3 + win - 1;
                         if (sfIdx < 0) sfIdx = 0;
-                        double sfPow = std::pow(2.0, -scalefacMult * scalefac[sfIdx]);
+                        double sfPow = std::exp2(-scalefacMult * scalefac[sfIdx]);
+                        double mult = globalGainFactor * sbGain * sfPow;
 
                         for (int k = 0; k < width; ++k)
                         {
                             int i = longEnd + (sfb - 3) * 3 * width + win * width + k;
                             if (i >= 576) break;
-                            double v = static_cast<double>(is[i]);
-                            double sign = (v < 0) ? -1.0 : 1.0;
-                            xr[i] = sign * globalGainFactor * sbGain * sfPow *
-                                     std::pow(std::abs(v), 4.0 / 3.0);
+                            xr[i] = mult * pow43(is[i]);
                         }
                     }
                 }
@@ -2261,17 +2300,15 @@ private:
                     int width = bands.shortBands[sfb + 1] - bands.shortBands[sfb];
                     for (int win = 0; win < 3; ++win)
                     {
-                        double sbGain = std::pow(2.0, -2.0 * gc.subblock_gain[win]);
-                        double sfPow = std::pow(2.0, -scalefacMult * scalefac[sfb * 3 + win]);
+                        double sbGain = std::exp2(-2.0 * gc.subblock_gain[win]);
+                        double sfPow = std::exp2(-scalefacMult * scalefac[sfb * 3 + win]);
+                        double mult = globalGainFactor * sbGain * sfPow;
 
                         for (int k = 0; k < width; ++k)
                         {
                             int i = sfb * width * 3 + win * width + k;
                             if (i >= 576) break;
-                            double v = static_cast<double>(is[i]);
-                            double sign = (v < 0) ? -1.0 : 1.0;
-                            xr[i] = sign * globalGainFactor * sbGain * sfPow *
-                                     std::pow(std::abs(v), 4.0 / 3.0);
+                            xr[i] = mult * pow43(is[i]);
                         }
                     }
                 }
@@ -2284,15 +2321,11 @@ private:
             {
                 int start = bands.longBands[sfb];
                 int end   = bands.longBands[sfb + 1];
-                double sfPow = std::pow(2.0, -scalefacMult *
+                double sfPow = std::exp2(-scalefacMult *
                     (scalefac[sfb] + gc.preflag * kPretab[sfb]));
+                double mult = globalGainFactor * sfPow;
                 for (int i = start; i < end && i < 576; ++i)
-                {
-                    double v = static_cast<double>(is[i]);
-                    double sign = (v < 0) ? -1.0 : 1.0;
-                    xr[i] = sign * globalGainFactor * sfPow *
-                             std::pow(std::abs(v), 4.0 / 3.0);
-                }
+                    xr[i] = mult * pow43(is[i]);
             }
         }
     }
@@ -2609,31 +2642,49 @@ private:
     }
 
     // 36-point IMDCT
+    // PERFORMANCE: cosines are CONSTANTS that depend only on (k,n), not on input
+    // audio. Pre-compute once in a LUT instead of recomputing 648 cosines per call.
     static void imdct36(const double in[18], double out[36])
     {
+        static const auto kCos = [] {
+            std::array<std::array<double, 18>, 36> t{};
+            constexpr double kPi = 3.14159265358979323846;
+            for (int k = 0; k < 36; ++k)
+                for (int n = 0; n < 18; ++n)
+                    t[k][n] = std::cos(kPi / 72.0 *
+                                       (2.0 * k + 1.0 + 18.0) *
+                                       (2.0 * n + 1.0));
+            return t;
+        }();
+
         for (int k = 0; k < 36; ++k)
         {
             double sum = 0.0;
             for (int n = 0; n < 18; ++n)
-            {
-                static constexpr double kPi = 3.14159265358979323846;
-                sum += in[n] * std::cos(kPi / 72.0 * (2.0 * k + 1.0 + 18.0) * (2.0 * n + 1.0));
-            }
+                sum += in[n] * kCos[k][n];
             out[k] = sum;
         }
     }
 
-    // 12-point IMDCT
+    // 12-point IMDCT (same LUT optimisation)
     static void imdct12(const double in[6], double out[12])
     {
+        static const auto kCos = [] {
+            std::array<std::array<double, 6>, 12> t{};
+            constexpr double kPi = 3.14159265358979323846;
+            for (int k = 0; k < 12; ++k)
+                for (int n = 0; n < 6; ++n)
+                    t[k][n] = std::cos(kPi / 24.0 *
+                                       (2.0 * k + 1.0 + 6.0) *
+                                       (2.0 * n + 1.0));
+            return t;
+        }();
+
         for (int k = 0; k < 12; ++k)
         {
             double sum = 0.0;
             for (int n = 0; n < 6; ++n)
-            {
-                static constexpr double kPi = 3.14159265358979323846;
-                sum += in[n] * std::cos(kPi / 24.0 * (2.0 * k + 1.0 + 6.0) * (2.0 * n + 1.0));
-            }
+                sum += in[n] * kCos[k][n];
             out[k] = sum;
         }
     }
@@ -2674,6 +2725,20 @@ private:
 
     void synthesize(const double input[576], int ch, float pcm[576])
     {
+        // PERFORMANCE: pre-compute the 64×32 matrixing cosines ONCE.
+        // Previous version called std::cos() 2048 times per time-slot × 18 slots
+        // × 2 channels × ~13k frames ~= 1 billion cosines per 5-min file.
+        static const auto kMatrixCos = [] {
+            std::array<std::array<double, 32>, 64> t{};
+            constexpr double kPi = 3.14159265358979323846;
+            for (int i = 0; i < 64; ++i)
+                for (int k = 0; k < 32; ++k)
+                    t[i][k] = std::cos(kPi / 64.0 *
+                                       (16.0 + static_cast<double>(i)) *
+                                       (2.0 * static_cast<double>(k) + 1.0));
+            return t;
+        }();
+
         ChannelState& state = channelState_[ch];
 
         // Process 18 samples per subband (= 18 blocks of 32 subbands)
@@ -2684,35 +2749,32 @@ private:
             for (int sb = 0; sb < 32; ++sb)
                 S[sb] = input[sb * 18 + ss];
 
-            // Matrixing: 64 values from 32 subbands via DCT
+            // Matrixing: 64 values from 32 subbands via DCT (LUT)
             double V[64];
             for (int i = 0; i < 64; ++i)
             {
                 double sum = 0.0;
+                const auto& row = kMatrixCos[i];
                 for (int k = 0; k < 32; ++k)
-                {
-                    static constexpr double kPi = 3.14159265358979323846;
-                    sum += S[k] * std::cos(kPi / 64.0 * (16.0 + static_cast<double>(i)) *
-                                           (2.0 * static_cast<double>(k) + 1.0));
-                }
+                    sum += S[k] * row[k];
                 V[i] = sum;
             }
 
-            // Shift synthesis buffer
-            state.synthOffset = (state.synthOffset - 64 + 1024) % 1024;
+            // Shift synthesis buffer (1024 = 2^10 → use bitmask, not %)
+            state.synthOffset = (state.synthOffset - 64) & 1023;
 
-            // Store V into synthesis buffer
+            // Store V into synthesis buffer (bitmask)
             for (int i = 0; i < 64; ++i)
-                state.synthBuf[(state.synthOffset + i) % 1024] = V[i];
+                state.synthBuf[(state.synthOffset + i) & 1023] = V[i];
 
-            // Build 512 U values and window
+            // Build 512 U values and window (bitmask)
             double U[512];
             for (int i = 0; i < 8; ++i)
             {
                 for (int j = 0; j < 32; ++j)
                 {
-                    U[i * 64 + j]      = state.synthBuf[(state.synthOffset + i * 128 + j) % 1024];
-                    U[i * 64 + 32 + j] = state.synthBuf[(state.synthOffset + i * 128 + 96 + j) % 1024];
+                    U[i * 64 + j]      = state.synthBuf[(state.synthOffset + i * 128 + j) & 1023];
+                    U[i * 64 + 32 + j] = state.synthBuf[(state.synthOffset + i * 128 + 96 + j) & 1023];
                 }
             }
 
@@ -3321,12 +3383,24 @@ private:
 
     bool decodeAll()
     {
+        // [DEBUG] crash-log instrumentation, remove later
+        auto LOG = [](const char* fmt, auto... args) {
+            if (std::FILE* f = std::fopen("dsparklab_crash.log", "a")) {
+                std::fprintf(f, fmt, args...);
+                std::fputc('\n', f);
+                std::fclose(f);
+            }
+        };
+
         int nch = info_.numChannels;
         int64_t totalSamples = info_.numSamples;
+        LOG("[Mp3File] decodeAll enter: nch=%d totalSamples=%lld",
+            nch, (long long)totalSamples);
 
         decodedSamples_.resize(nch);
         for (int ch = 0; ch < nch; ++ch)
             decodedSamples_[ch].resize(static_cast<size_t>(totalSamples), 0.0f);
+        LOG("[Mp3File] decodeAll: output buffers allocated");
 
         // Reset channel state
         for (int ch = 0; ch < kChannelsMax; ++ch)
@@ -3341,8 +3415,14 @@ private:
 
         int64_t sampleIdx = 0;
 
-        for (size_t frameIdx = 0; frameIdx < frameOffsets_.size(); ++frameIdx)
+        const size_t totalFrames = frameOffsets_.size();
+        for (size_t frameIdx = 0; frameIdx < totalFrames; ++frameIdx)
         {
+            // [DEBUG] log progress every 500 frames
+            if ((frameIdx % 500) == 0)
+                LOG("[Mp3File] decodeAll progress: frame %zu/%zu",
+                    frameIdx, totalFrames);
+
             size_t frameStart = frameOffsets_[frameIdx];
 
             FrameHeader hdr {};
@@ -3501,6 +3581,7 @@ private:
             }
         }
 
+        LOG("[Mp3File] decodeAll: loop done, sampleIdx=%lld", (long long)sampleIdx);
         return true;
     }
 };

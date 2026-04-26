@@ -118,6 +118,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
         if (msg.message == WM_QUIT)
             break;
 
+        // Drive the async file-load state machine each frame
+        engine.update();
+
         // ImGui frame
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();

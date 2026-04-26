@@ -60,7 +60,11 @@ private:
 
     void drawTransport(AudioEngine& engine)
     {
-        // Open file
+        const bool loading = engine.isLoading();
+
+        // Open file (disabled while a decode is in flight to avoid stacking
+        // up multiple worker threads back-to-back)
+        ImGui::BeginDisabled(loading);
         if (ImGui::Button("Open File"))
         {
             char path[MAX_PATH] = {};
@@ -73,16 +77,19 @@ private:
             if (GetOpenFileNameA(&ofn))
                 engine.loadFile(path);
         }
+        ImGui::EndDisabled();
 
         ImGui::SameLine();
 
-        // Play/Pause/Stop
+        // Play/Pause/Stop — also disabled while loading (no file ready yet)
+        ImGui::BeginDisabled(loading);
         bool playing = engine.isPlaying();
         if (ImGui::Button(playing ? "Pause" : "Play"))
             engine.togglePlay();
         ImGui::SameLine();
         if (ImGui::Button("Stop"))
             engine.stop();
+        ImGui::EndDisabled();
 
         ImGui::SameLine();
         bool loop = engine.isLooping();
@@ -106,8 +113,17 @@ private:
                       static_cast<int>(dur) / 60, static_cast<int>(dur) % 60);
         ImGui::Text("%s", timeBuf);
 
-        // Second row: file info + bypass
-        if (engine.hasFile())
+        // Second row: file info / loading badge + bypass
+        if (loading)
+        {
+            // Animated ellipsis so the user can see the worker is still alive
+            const int dots = static_cast<int>(ImGui::GetTime() * 2.0) % 4;
+            const char* dotStrs[4] = { "", ".", "..", "..." };
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                               "Loading%s", dotStrs[dots]);
+            ImGui::SameLine();
+        }
+        else if (engine.hasFile())
         {
             ImGui::TextDisabled("%.0f Hz  |  %dch", engine.getSampleRate(), engine.getChannels());
             ImGui::SameLine();
@@ -260,7 +276,9 @@ private:
             ImGui::Separator();
             ImGui::Text("Gain Reduction");
 
-            float gr = sel->gainReductionDbFn();           // Positive value = attenuation in dB
+            // DSP convention: processors return negative values (e.g. -6.0 = 6 dB of GR).
+            // Flip sign for display so the meter shows the magnitude of attenuation.
+            float gr = -sel->gainReductionDbFn();
             if (gr < 0.0f) gr = 0.0f;
             if (gr > 24.0f) gr = 24.0f;
 

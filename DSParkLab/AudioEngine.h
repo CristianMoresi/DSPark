@@ -11,8 +11,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace dsplab {
@@ -24,6 +26,11 @@ public:
 
     ~AudioEngine()
     {
+        // Wait for any in-flight load before tearing down the device — the
+        // worker thread still holds references to staging buffers owned by
+        // this object.
+        if (loadThread_.joinable()) loadThread_.join();
+
         if (deviceInit_)
         {
             ma_device_uninit(&device_);
@@ -32,76 +39,70 @@ public:
     }
 
     // --- File loading -------------------------------------------------------
+    //
+    // Async load architecture:
+    //
+    //  GUI thread → loadFile(path) → spawns worker → returns immediately.
+    //  Worker thread → opens file, fully decodes into staging buffers,
+    //                  then sets loadState_ to Ready or Failed.
+    //  GUI thread → calls update() each frame; if state == Ready, swap
+    //               staging into active buffers and re-init the audio
+    //               device. While loading, fileSamples_ is held at 0 so
+    //               the audio callback outputs silence.
+    //
+    // The motivation: MP3 decode of a 5-minute file takes seconds even
+    // with the LUT-optimised decoder; doing that synchronously on the GUI
+    // thread froze the entire UI during open. Async load keeps the
+    // interface responsive and frees us to display a "loading" indicator.
 
+    enum class LoadState : int
+    {
+        Idle    = 0,
+        Loading = 1,
+        Ready   = 2,
+        Failed  = 3
+    };
+
+    /// Begins loading a file. Returns immediately; check isLoading() and
+    /// call update() each frame to detect completion.
+    /// Subsequent calls cancel-by-waiting for the prior load.
     bool loadFile(const char* path)
     {
+        // Drain any prior load before we mutate staging buffers.
+        if (loadThread_.joinable()) loadThread_.join();
+
         stop();
+        // Force callback to silence while we tear down and reinit.
+        fileSamples_ = 0;
 
-        std::string p(path);
-        std::string ext;
-        if (auto dot = p.rfind('.'); dot != std::string::npos)
-            ext = p.substr(dot);
-        for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-        bool ok = false;
-
-        if (ext == ".wav")
-        {
-            dspark::WavFile wav;
-            if (wav.openRead(path))
-            {
-                fileInfo_ = wav.getInfo();
-                fileBuffer_.resize(fileInfo_.numChannels,
-                                   static_cast<int>(fileInfo_.numSamples));
-                wav.readSamples(fileBuffer_.toView());
-                wav.close();
-                ok = true;
-            }
-        }
-        else if (ext == ".mp3")
-        {
-            dspark::Mp3File mp3;
-            if (mp3.openRead(path))
-            {
-                fileInfo_ = mp3.getInfo();
-                fileBuffer_.resize(fileInfo_.numChannels,
-                                   static_cast<int>(fileInfo_.numSamples));
-                mp3.readSamples(fileBuffer_.toView());
-                mp3.close();
-                ok = true;
-            }
-        }
-
-        if (!ok) return false;
-
-        filePath_ = path;
-        position_.store(0);
-        fileSampleRate_ = fileInfo_.sampleRate;
-        fileChannels_   = fileInfo_.numChannels;
-        fileSamples_    = static_cast<int>(fileInfo_.numSamples);
-
-        // Prepare work buffer and processors
-        spec_ = { fileSampleRate_, kBlockSize, std::min(fileChannels_, 2) };
-        workBuffer_.resize(spec_.numChannels, kBlockSize);
-
-        // Prepare analysis
-        spectrum_.prepare(fileSampleRate_, 4096);
-        meter_.prepare(spec_);
-        meter_.setAttackMs(5.0f);
-        meter_.setReleaseMs(100.0f);
-
-        // Prepare all effects for this spec and apply UI defaults
-        if (effects_)
-            for (auto& e : *effects_)
-            {
-                e.prepare(spec_);
-                e.applyAllDefaults();
-            }
-
-        // (Re)init audio device at file's sample rate
-        initDevice();
-
+        loadState_.store(static_cast<int>(LoadState::Loading));
+        std::string pathCopy(path);
+        loadThread_ = std::thread([this, pathCopy] { doLoadAsync(pathCopy); });
         return true;
+    }
+
+    /// Must be called every frame from the GUI thread. Finalises any
+    /// completed background load (swaps in decoded buffers, re-initialises
+    /// the audio device, prepares the effect chain).
+    void update()
+    {
+        auto state = static_cast<LoadState>(loadState_.load());
+        if (state == LoadState::Ready)
+        {
+            if (loadThread_.joinable()) loadThread_.join();
+            finalizeLoad();
+            loadState_.store(static_cast<int>(LoadState::Idle));
+        }
+        else if (state == LoadState::Failed)
+        {
+            if (loadThread_.joinable()) loadThread_.join();
+            loadState_.store(static_cast<int>(LoadState::Idle));
+        }
+    }
+
+    [[nodiscard]] bool isLoading() const
+    {
+        return loadState_.load() == static_cast<int>(LoadState::Loading);
     }
 
     // --- Transport ----------------------------------------------------------
@@ -171,6 +172,99 @@ public:
 
 private:
     static constexpr int kBlockSize = 512;
+
+    // --- Async load worker ---------------------------------------------------
+
+    void doLoadAsync(const std::string& path)
+    {
+        // Detect extension
+        std::string ext;
+        if (auto dot = path.rfind('.'); dot != std::string::npos)
+            ext = path.substr(dot);
+        for (auto& c : ext)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        bool ok = false;
+
+        if (ext == ".wav")
+        {
+            dspark::WavFile wav;
+            if (wav.openRead(path.c_str()))
+            {
+                stagingInfo_ = wav.getInfo();
+                stagingBuffer_.resize(stagingInfo_.numChannels,
+                                      static_cast<int>(stagingInfo_.numSamples));
+                wav.readSamples(stagingBuffer_.toView());
+                wav.close();
+                ok = true;
+            }
+        }
+        else if (ext == ".mp3")
+        {
+            dspark::Mp3File mp3;
+            if (mp3.openRead(path.c_str()))
+            {
+                stagingInfo_ = mp3.getInfo();
+                stagingBuffer_.resize(stagingInfo_.numChannels,
+                                      static_cast<int>(stagingInfo_.numSamples));
+                mp3.readSamples(stagingBuffer_.toView());
+                mp3.close();
+                ok = true;
+            }
+        }
+
+        if (ok)
+        {
+            stagingPath_ = path;
+            loadState_.store(static_cast<int>(LoadState::Ready));
+        }
+        else
+        {
+            loadState_.store(static_cast<int>(LoadState::Failed));
+        }
+    }
+
+    // Swap staging buffers into active state and bring up the audio device.
+    // Runs on the GUI thread (the worker has already finished). The audio
+    // callback was kept silent throughout (fileSamples_ == 0), so swapping
+    // here is race-free.
+    void finalizeLoad()
+    {
+        fileInfo_ = stagingInfo_;
+        // Move staging buffer into the active fileBuffer_. AudioBuffer is
+        // assumed to support move-assignment (and even if it falls back to
+        // copy, the callback is silent so nothing observes the transient).
+        fileBuffer_ = std::move(stagingBuffer_);
+        stagingBuffer_ = {};  // reset to a clean empty buffer
+        filePath_ = stagingPath_;
+
+        position_.store(0);
+        fileSampleRate_ = fileInfo_.sampleRate;
+        fileChannels_   = fileInfo_.numChannels;
+
+        spec_ = { fileSampleRate_, kBlockSize, std::min(fileChannels_, 2) };
+        workBuffer_.resize(spec_.numChannels, kBlockSize);
+
+        spectrum_.prepare(fileSampleRate_, 4096);
+        meter_.prepare(spec_);
+        meter_.setAttackMs(5.0f);
+        meter_.setReleaseMs(100.0f);
+
+        if (effects_)
+        {
+            for (auto& e : *effects_)
+            {
+                e.prepare(spec_);
+                e.applyAllDefaults();
+            }
+        }
+
+        initDevice();
+
+        // Publish sample count *after* every other state is in place so the
+        // audio callback only "sees" the new file once everything is ready.
+        fileSamples_ = static_cast<int>(fileInfo_.numSamples);
+    }
 
     // --- Audio callback (runs on audio thread) ------------------------------
 
@@ -332,6 +426,13 @@ private:
     // miniaudio
     ma_device device_ {};
     bool      deviceInit_ = false;
+
+    // Async load (worker thread + staging)
+    std::thread                loadThread_;
+    std::atomic<int>           loadState_ { 0 };  // LoadState as int (atomic-friendly)
+    dspark::AudioBuffer<float> stagingBuffer_;
+    dspark::AudioFileInfo      stagingInfo_ {};
+    std::string                stagingPath_;
 };
 
 } // namespace dsplab

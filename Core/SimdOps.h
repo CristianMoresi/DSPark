@@ -7,35 +7,11 @@
  * @file SimdOps.h
  * @brief SIMD-accelerated buffer operations for real-time audio processing.
  *
- * Provides low-level vectorized primitives that underpin AudioBuffer, FIRFilter,
- * Gain, and any hot path that operates on contiguous sample arrays. Each
- * function has three tiers of implementation:
- *
- * 1. **AVX** (x86-64 with __AVX__) -- 8 floats / 4 doubles per iteration.
- * 2. **SSE2** (all x86-64)          -- 4 floats / 2 doubles per iteration.
- * 3. **NEON** (AArch64)             -- 4 floats per iteration (double: scalar).
- * 4. **Scalar fallback**            -- any platform, any type.
- *
- * All functions use unaligned loads (_loadu) for safety. The compiler may
- * promote to aligned loads when it can prove alignment (AudioBuffer channels
- * are 32-byte aligned).
- *
- * Dependencies: C++20 standard library only (<cmath>, <cstdint>, <type_traits>).
- *
- * @code
- *   float buf[512], src[512];
- *   dspark::simd::applyGain(buf, 0.5f, 512);          // buf[i] *= 0.5
- *   dspark::simd::addWithGain(buf, src, 0.8f, 512);   // buf[i] += src[i] * 0.8
- *   float peak = dspark::simd::peakLevel(buf, 512);    // max |buf[i]|
- *   float dot  = dspark::simd::dotProduct(buf, src, 512);
- * @endcode
+ * Optimized with FMA (Fused Multiply-Add) detection and Strict Aliasing
+ * declarations (__restrict) for aggressive compiler unrolling.
  */
 
 // --- Platform SIMD detection ------------------------------------------------
-// x86-64: SSE2 is guaranteed by the AMD64 specification.
-// ARM64:  NEON is guaranteed by the AArch64 specification.
-// Both are unconditionally available -- no runtime feature check needed.
-
 #if defined(_M_AMD64) || defined(_M_X64) || defined(__x86_64__) || defined(__amd64__)
     #define DSPARK_SIMD_SSE2 1
     #include <emmintrin.h>           // SSE2
@@ -43,9 +19,22 @@
         #define DSPARK_SIMD_AVX 1
         #include <immintrin.h>       // AVX
     #endif
+    // Detect FMA3 support
+    #if defined(__FMA__) || defined(__AVX2__)
+        #define DSPARK_SIMD_FMA 1
+    #endif
 #elif defined(__aarch64__) || defined(_M_ARM64)
     #define DSPARK_SIMD_NEON 1
     #include <arm_neon.h>
+#endif
+
+// --- Restrict Macro for Pointer Aliasing Optimization -----------------------
+#if defined(_MSC_VER)
+    #define DSPARK_RESTRICT __restrict
+#elif defined(__GNUC__) || defined(__clang__)
+    #define DSPARK_RESTRICT __restrict__
+#else
+    #define DSPARK_RESTRICT
 #endif
 
 #include <cmath>
@@ -61,17 +50,8 @@ namespace simd {
 
 /**
  * @brief Adds source samples scaled by a gain factor into a destination buffer.
- *
- * Computes `dst[i] += src[i] * gain` for `count` samples. Uses SIMD
- * intrinsics (AVX/SSE2/NEON) for `float`; falls back to scalar for `double`
- * or unsupported platforms.
- *
- * @param dst   Destination buffer (read + write).
- * @param src   Source buffer (read-only).
- * @param gain  Scaling factor applied to source samples.
- * @param count Number of samples to process.
  */
-inline void addWithGain(float* dst, const float* src, float gain, int count) noexcept
+inline void addWithGain(float* DSPARK_RESTRICT dst, const float* DSPARK_RESTRICT src, float gain, int count) noexcept
 {
 #if defined(DSPARK_SIMD_AVX)
     const __m256 vGain = _mm256_set1_ps(gain);
@@ -80,11 +60,14 @@ inline void addWithGain(float* dst, const float* src, float gain, int count) noe
     {
         __m256 vDst = _mm256_loadu_ps(dst + i);
         __m256 vSrc = _mm256_loadu_ps(src + i);
-        _mm256_storeu_ps(dst + i, _mm256_add_ps(vDst, _mm256_mul_ps(vSrc, vGain)));
+        
+        #if defined(DSPARK_SIMD_FMA)
+            _mm256_storeu_ps(dst + i, _mm256_fmadd_ps(vSrc, vGain, vDst));
+        #else
+            _mm256_storeu_ps(dst + i, _mm256_add_ps(vDst, _mm256_mul_ps(vSrc, vGain)));
+        #endif
     }
-    // Remainder
-    for (; i < count; ++i)
-        dst[i] += src[i] * gain;
+    for (; i < count; ++i) dst[i] += src[i] * gain;
 
 #elif defined(DSPARK_SIMD_SSE2)
     const __m128 vGain = _mm_set1_ps(gain);
@@ -93,10 +76,14 @@ inline void addWithGain(float* dst, const float* src, float gain, int count) noe
     {
         __m128 vDst = _mm_loadu_ps(dst + i);
         __m128 vSrc = _mm_loadu_ps(src + i);
-        _mm_storeu_ps(dst + i, _mm_add_ps(vDst, _mm_mul_ps(vSrc, vGain)));
+        
+        #if defined(DSPARK_SIMD_FMA)
+            _mm_storeu_ps(dst + i, _mm_fmadd_ps(vSrc, vGain, vDst));
+        #else
+            _mm_storeu_ps(dst + i, _mm_add_ps(vDst, _mm_mul_ps(vSrc, vGain)));
+        #endif
     }
-    for (; i < count; ++i)
-        dst[i] += src[i] * gain;
+    for (; i < count; ++i) dst[i] += src[i] * gain;
 
 #elif defined(DSPARK_SIMD_NEON)
     const float32x4_t vGain = vdupq_n_f32(gain);
@@ -105,19 +92,17 @@ inline void addWithGain(float* dst, const float* src, float gain, int count) noe
     {
         float32x4_t vDst = vld1q_f32(dst + i);
         float32x4_t vSrc = vld1q_f32(src + i);
-        vst1q_f32(dst + i, vmlaq_f32(vDst, vSrc, vGain));
+        vst1q_f32(dst + i, vmlaq_f32(vDst, vSrc, vGain)); // vmlaq is native FMA
     }
-    for (; i < count; ++i)
-        dst[i] += src[i] * gain;
+    for (; i < count; ++i) dst[i] += src[i] * gain;
 
 #else
-    for (int i = 0; i < count; ++i)
-        dst[i] += src[i] * gain;
+    for (int i = 0; i < count; ++i) dst[i] += src[i] * gain;
 #endif
 }
 
-/** @brief Double overload -- SSE2 processes 2 doubles at a time; scalar on NEON/other. */
-inline void addWithGain(double* dst, const double* src, double gain, int count) noexcept
+/** @brief Double overload */
+inline void addWithGain(double* DSPARK_RESTRICT dst, const double* DSPARK_RESTRICT src, double gain, int count) noexcept
 {
 #if defined(DSPARK_SIMD_SSE2)
     const __m128d vGain = _mm_set1_pd(gain);
@@ -126,13 +111,16 @@ inline void addWithGain(double* dst, const double* src, double gain, int count) 
     {
         __m128d vDst = _mm_loadu_pd(dst + i);
         __m128d vSrc = _mm_loadu_pd(src + i);
-        _mm_storeu_pd(dst + i, _mm_add_pd(vDst, _mm_mul_pd(vSrc, vGain)));
+        
+        #if defined(DSPARK_SIMD_FMA)
+            _mm_storeu_pd(dst + i, _mm_fmadd_pd(vSrc, vGain, vDst));
+        #else
+            _mm_storeu_pd(dst + i, _mm_add_pd(vDst, _mm_mul_pd(vSrc, vGain)));
+        #endif
     }
-    for (; i < count; ++i)
-        dst[i] += src[i] * gain;
+    for (; i < count; ++i) dst[i] += src[i] * gain;
 #else
-    for (int i = 0; i < count; ++i)
-        dst[i] += src[i] * gain;
+    for (int i = 0; i < count; ++i) dst[i] += src[i] * gain;
 #endif
 }
 
@@ -142,14 +130,8 @@ inline void addWithGain(double* dst, const double* src, double gain, int count) 
 
 /**
  * @brief Multiplies all samples in a buffer by a gain factor.
- *
- * Computes `data[i] *= gain` for `count` samples.
- *
- * @param data  Buffer to scale in-place.
- * @param gain  Scaling factor.
- * @param count Number of samples.
  */
-inline void applyGain(float* data, float gain, int count) noexcept
+inline void applyGain(float* DSPARK_RESTRICT data, float gain, int count) noexcept
 {
 #if defined(DSPARK_SIMD_AVX)
     const __m256 vGain = _mm256_set1_ps(gain);
@@ -159,8 +141,7 @@ inline void applyGain(float* data, float gain, int count) noexcept
         __m256 v = _mm256_loadu_ps(data + i);
         _mm256_storeu_ps(data + i, _mm256_mul_ps(v, vGain));
     }
-    for (; i < count; ++i)
-        data[i] *= gain;
+    for (; i < count; ++i) data[i] *= gain;
 
 #elif defined(DSPARK_SIMD_SSE2)
     const __m128 vGain = _mm_set1_ps(gain);
@@ -170,8 +151,7 @@ inline void applyGain(float* data, float gain, int count) noexcept
         __m128 v = _mm_loadu_ps(data + i);
         _mm_storeu_ps(data + i, _mm_mul_ps(v, vGain));
     }
-    for (; i < count; ++i)
-        data[i] *= gain;
+    for (; i < count; ++i) data[i] *= gain;
 
 #elif defined(DSPARK_SIMD_NEON)
     const float32x4_t vGain = vdupq_n_f32(gain);
@@ -181,17 +161,15 @@ inline void applyGain(float* data, float gain, int count) noexcept
         float32x4_t v = vld1q_f32(data + i);
         vst1q_f32(data + i, vmulq_f32(v, vGain));
     }
-    for (; i < count; ++i)
-        data[i] *= gain;
+    for (; i < count; ++i) data[i] *= gain;
 
 #else
-    for (int i = 0; i < count; ++i)
-        data[i] *= gain;
+    for (int i = 0; i < count; ++i) data[i] *= gain;
 #endif
 }
 
 /** @brief Double overload. */
-inline void applyGain(double* data, double gain, int count) noexcept
+inline void applyGain(double* DSPARK_RESTRICT data, double gain, int count) noexcept
 {
 #if defined(DSPARK_SIMD_SSE2)
     const __m128d vGain = _mm_set1_pd(gain);
@@ -201,11 +179,9 @@ inline void applyGain(double* data, double gain, int count) noexcept
         __m128d v = _mm_loadu_pd(data + i);
         _mm_storeu_pd(data + i, _mm_mul_pd(v, vGain));
     }
-    for (; i < count; ++i)
-        data[i] *= gain;
+    for (; i < count; ++i) data[i] *= gain;
 #else
-    for (int i = 0; i < count; ++i)
-        data[i] *= gain;
+    for (int i = 0; i < count; ++i) data[i] *= gain;
 #endif
 }
 
@@ -215,17 +191,10 @@ inline void applyGain(double* data, double gain, int count) noexcept
 
 /**
  * @brief Returns the peak absolute sample value in a buffer.
- *
- * Computes `max(|data[i]|)` over all `count` samples.
- *
- * @param data  Buffer to scan.
- * @param count Number of samples.
- * @return Peak magnitude (>= 0).
  */
-inline float peakLevel(const float* data, int count) noexcept
+inline float peakLevel(const float* DSPARK_RESTRICT data, int count) noexcept
 {
 #if defined(DSPARK_SIMD_AVX)
-    // Mask to clear sign bit: abs via bitwise AND
     const __m256 absMask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     __m256 vMax = _mm256_setzero_ps();
     int i = 0;
@@ -235,14 +204,13 @@ inline float peakLevel(const float* data, int count) noexcept
         v = _mm256_and_ps(v, absMask);
         vMax = _mm256_max_ps(vMax, v);
     }
-    // Horizontal max: reduce 8 -> 4 -> scalar
     __m128 hi = _mm256_extractf128_ps(vMax, 1);
     __m128 lo = _mm256_castps256_ps128(vMax);
     __m128 m4 = _mm_max_ps(lo, hi);
     __m128 m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
     __m128 m1 = _mm_max_ss(m2, _mm_shuffle_ps(m2, m2, 1));
     float peak = _mm_cvtss_f32(m1);
-    // Remainder
+    
     for (; i < count; ++i)
     {
         float a = data[i] < 0.0f ? -data[i] : data[i];
@@ -251,7 +219,6 @@ inline float peakLevel(const float* data, int count) noexcept
     return peak;
 
 #elif defined(DSPARK_SIMD_SSE2)
-    // Mask to clear sign bit: abs via bitwise AND
     const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
     __m128 vMax = _mm_setzero_ps();
     int i = 0;
@@ -261,12 +228,11 @@ inline float peakLevel(const float* data, int count) noexcept
         v = _mm_and_ps(v, absMask);
         vMax = _mm_max_ps(vMax, v);
     }
-    // Horizontal max of 4 lanes
-    __m128 shuf = _mm_movehl_ps(vMax, vMax);         // [2,3,2,3]
-    __m128 maxPair = _mm_max_ps(vMax, shuf);          // max(0,2), max(1,3)
+    __m128 shuf = _mm_movehl_ps(vMax, vMax);
+    __m128 maxPair = _mm_max_ps(vMax, shuf);
     __m128 maxSingle = _mm_max_ss(maxPair, _mm_shuffle_ps(maxPair, maxPair, 1));
     float peak = _mm_cvtss_f32(maxSingle);
-    // Remainder
+    
     for (; i < count; ++i)
     {
         float a = data[i] < 0.0f ? -data[i] : data[i];
@@ -284,6 +250,7 @@ inline float peakLevel(const float* data, int count) noexcept
         vMax = vmaxq_f32(vMax, v);
     }
     float peak = vmaxvq_f32(vMax);
+    
     for (; i < count; ++i)
     {
         float a = data[i] < 0.0f ? -data[i] : data[i];
@@ -303,10 +270,9 @@ inline float peakLevel(const float* data, int count) noexcept
 }
 
 /** @brief Double overload. */
-inline double peakLevel(const double* data, int count) noexcept
+inline double peakLevel(const double* DSPARK_RESTRICT data, int count) noexcept
 {
 #if defined(DSPARK_SIMD_SSE2)
-    // SSE2 double: 2 at a time
     const __m128d absMask = _mm_castsi128_pd(_mm_set_epi64x(
         static_cast<int64_t>(0x7FFFFFFFFFFFFFFF),
         static_cast<int64_t>(0x7FFFFFFFFFFFFFFF)));
@@ -318,10 +284,10 @@ inline double peakLevel(const double* data, int count) noexcept
         v = _mm_and_pd(v, absMask);
         vMax = _mm_max_pd(vMax, v);
     }
-    // Horizontal max of 2 lanes
     __m128d hi = _mm_unpackhi_pd(vMax, vMax);
     __m128d maxVal = _mm_max_sd(vMax, hi);
     double peak = _mm_cvtsd_f64(maxVal);
+    
     for (; i < count; ++i)
     {
         double a = data[i] < 0.0 ? -data[i] : data[i];
@@ -344,17 +310,9 @@ inline double peakLevel(const double* data, int count) noexcept
 // ============================================================================
 
 /**
- * @brief Computes the dot product of two float arrays.
- *
- * Returns `sum(a[i] * b[i])` for `i` in `[0, count)`. Central to FIR
- * convolution where it computes the weighted sum of delayed samples.
- *
- * @param a     First array.
- * @param b     Second array.
- * @param count Number of elements.
- * @return Dot product.
+ * @brief Computes the dot product of two arrays.
  */
-inline float dotProduct(const float* a, const float* b, int count) noexcept
+inline float dotProduct(const float* DSPARK_RESTRICT a, const float* DSPARK_RESTRICT b, int count) noexcept
 {
 #if defined(DSPARK_SIMD_AVX)
     __m256 vSum = _mm256_setzero_ps();
@@ -363,9 +321,13 @@ inline float dotProduct(const float* a, const float* b, int count) noexcept
     {
         __m256 va = _mm256_loadu_ps(a + i);
         __m256 vb = _mm256_loadu_ps(b + i);
-        vSum = _mm256_add_ps(vSum, _mm256_mul_ps(va, vb));
+        
+        #if defined(DSPARK_SIMD_FMA)
+            vSum = _mm256_fmadd_ps(va, vb, vSum);
+        #else
+            vSum = _mm256_add_ps(vSum, _mm256_mul_ps(va, vb));
+        #endif
     }
-    // Reduce 8 -> scalar
     __m128 hi = _mm256_extractf128_ps(vSum, 1);
     __m128 lo = _mm256_castps256_ps128(vSum);
     __m128 sum4 = _mm_add_ps(lo, hi);
@@ -373,8 +335,8 @@ inline float dotProduct(const float* a, const float* b, int count) noexcept
     __m128 sum2 = _mm_add_ps(sum4, shuf);
     __m128 sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 1));
     float sum = _mm_cvtss_f32(sum1);
-    for (; i < count; ++i)
-        sum += a[i] * b[i];
+    
+    for (; i < count; ++i) sum += a[i] * b[i];
     return sum;
 
 #elif defined(DSPARK_SIMD_SSE2)
@@ -384,14 +346,18 @@ inline float dotProduct(const float* a, const float* b, int count) noexcept
     {
         __m128 va = _mm_loadu_ps(a + i);
         __m128 vb = _mm_loadu_ps(b + i);
-        vSum = _mm_add_ps(vSum, _mm_mul_ps(va, vb));
+        
+        #if defined(DSPARK_SIMD_FMA)
+            vSum = _mm_fmadd_ps(va, vb, vSum);
+        #else
+            vSum = _mm_add_ps(vSum, _mm_mul_ps(va, vb));
+        #endif
     }
-    // Horizontal sum
     alignas(16) float tmp[4];
     _mm_store_ps(tmp, vSum);
     float sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
-    for (; i < count; ++i)
-        sum += a[i] * b[i];
+    
+    for (; i < count; ++i) sum += a[i] * b[i];
     return sum;
 
 #elif defined(DSPARK_SIMD_NEON)
@@ -404,20 +370,19 @@ inline float dotProduct(const float* a, const float* b, int count) noexcept
         vSum = vmlaq_f32(vSum, va, vb);
     }
     float sum = vaddvq_f32(vSum);
-    for (; i < count; ++i)
-        sum += a[i] * b[i];
+    
+    for (; i < count; ++i) sum += a[i] * b[i];
     return sum;
 
 #else
     float sum = 0.0f;
-    for (int i = 0; i < count; ++i)
-        sum += a[i] * b[i];
+    for (int i = 0; i < count; ++i) sum += a[i] * b[i];
     return sum;
 #endif
 }
 
 /** @brief Double overload. */
-inline double dotProduct(const double* a, const double* b, int count) noexcept
+inline double dotProduct(const double* DSPARK_RESTRICT a, const double* DSPARK_RESTRICT b, int count) noexcept
 {
 #if defined(DSPARK_SIMD_SSE2)
     __m128d vSum = _mm_setzero_pd();
@@ -426,19 +391,22 @@ inline double dotProduct(const double* a, const double* b, int count) noexcept
     {
         __m128d va = _mm_loadu_pd(a + i);
         __m128d vb = _mm_loadu_pd(b + i);
-        vSum = _mm_add_pd(vSum, _mm_mul_pd(va, vb));
+        
+        #if defined(DSPARK_SIMD_FMA)
+            vSum = _mm_fmadd_pd(va, vb, vSum);
+        #else
+            vSum = _mm_add_pd(vSum, _mm_mul_pd(va, vb));
+        #endif
     }
-    // Horizontal sum of 2 lanes
     __m128d hi = _mm_unpackhi_pd(vSum, vSum);
     __m128d s = _mm_add_sd(vSum, hi);
     double sum = _mm_cvtsd_f64(s);
-    for (; i < count; ++i)
-        sum += a[i] * b[i];
+    
+    for (; i < count; ++i) sum += a[i] * b[i];
     return sum;
 #else
     double sum = 0.0;
-    for (int i = 0; i < count; ++i)
-        sum += a[i] * b[i];
+    for (int i = 0; i < count; ++i) sum += a[i] * b[i];
     return sum;
 #endif
 }
@@ -449,14 +417,8 @@ inline double dotProduct(const double* a, const double* b, int count) noexcept
 
 /**
  * @brief Adds source samples into a destination buffer (no scaling).
- *
- * Computes `dst[i] += src[i]` for `count` samples.
- *
- * @param dst   Destination buffer (read + write).
- * @param src   Source buffer (read-only).
- * @param count Number of samples.
  */
-inline void add(float* dst, const float* src, int count) noexcept
+inline void add(float* DSPARK_RESTRICT dst, const float* DSPARK_RESTRICT src, int count) noexcept
 {
 #if defined(DSPARK_SIMD_AVX)
     int i = 0;
@@ -466,8 +428,7 @@ inline void add(float* dst, const float* src, int count) noexcept
         __m256 vSrc = _mm256_loadu_ps(src + i);
         _mm256_storeu_ps(dst + i, _mm256_add_ps(vDst, vSrc));
     }
-    for (; i < count; ++i)
-        dst[i] += src[i];
+    for (; i < count; ++i) dst[i] += src[i];
 
 #elif defined(DSPARK_SIMD_SSE2)
     int i = 0;
@@ -477,8 +438,7 @@ inline void add(float* dst, const float* src, int count) noexcept
         __m128 vSrc = _mm_loadu_ps(src + i);
         _mm_storeu_ps(dst + i, _mm_add_ps(vDst, vSrc));
     }
-    for (; i < count; ++i)
-        dst[i] += src[i];
+    for (; i < count; ++i) dst[i] += src[i];
 
 #elif defined(DSPARK_SIMD_NEON)
     int i = 0;
@@ -488,17 +448,15 @@ inline void add(float* dst, const float* src, int count) noexcept
         float32x4_t vSrc = vld1q_f32(src + i);
         vst1q_f32(dst + i, vaddq_f32(vDst, vSrc));
     }
-    for (; i < count; ++i)
-        dst[i] += src[i];
+    for (; i < count; ++i) dst[i] += src[i];
 
 #else
-    for (int i = 0; i < count; ++i)
-        dst[i] += src[i];
+    for (int i = 0; i < count; ++i) dst[i] += src[i];
 #endif
 }
 
 /** @brief Double overload. */
-inline void add(double* dst, const double* src, int count) noexcept
+inline void add(double* DSPARK_RESTRICT dst, const double* DSPARK_RESTRICT src, int count) noexcept
 {
 #if defined(DSPARK_SIMD_SSE2)
     int i = 0;
@@ -508,11 +466,9 @@ inline void add(double* dst, const double* src, int count) noexcept
         __m128d vSrc = _mm_loadu_pd(src + i);
         _mm_storeu_pd(dst + i, _mm_add_pd(vDst, vSrc));
     }
-    for (; i < count; ++i)
-        dst[i] += src[i];
+    for (; i < count; ++i) dst[i] += src[i];
 #else
-    for (int i = 0; i < count; ++i)
-        dst[i] += src[i];
+    for (int i = 0; i < count; ++i) dst[i] += src[i];
 #endif
 }
 
@@ -520,51 +476,38 @@ inline void add(double* dst, const double* src, int count) noexcept
 // Template dispatchers
 // ============================================================================
 
-/**
- * @brief Template wrapper that dispatches to the float or double overload.
- * @tparam T Sample type (float or double).
- */
 template <typename T>
-void addWithGainT(T* dst, const T* src, T gain, int count) noexcept
+void addWithGainT(T* DSPARK_RESTRICT dst, const T* DSPARK_RESTRICT src, T gain, int count) noexcept
 {
-    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
-                  "SimdOps: only float and double are supported");
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
     addWithGain(dst, src, gain, count);
 }
 
-/** @brief Template wrapper for applyGain. */
 template <typename T>
-void applyGainT(T* data, T gain, int count) noexcept
+void applyGainT(T* DSPARK_RESTRICT data, T gain, int count) noexcept
 {
-    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
-                  "SimdOps: only float and double are supported");
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
     applyGain(data, gain, count);
 }
 
-/** @brief Template wrapper for peakLevel. */
 template <typename T>
-T peakLevelT(const T* data, int count) noexcept
+T peakLevelT(const T* DSPARK_RESTRICT data, int count) noexcept
 {
-    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
-                  "SimdOps: only float and double are supported");
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
     return peakLevel(data, count);
 }
 
-/** @brief Template wrapper for dotProduct. */
 template <typename T>
-T dotProductT(const T* a, const T* b, int count) noexcept
+T dotProductT(const T* DSPARK_RESTRICT a, const T* DSPARK_RESTRICT b, int count) noexcept
 {
-    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
-                  "SimdOps: only float and double are supported");
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
     return dotProduct(a, b, count);
 }
 
-/** @brief Template wrapper for add. */
 template <typename T>
-void addT(T* dst, const T* src, int count) noexcept
+void addT(T* DSPARK_RESTRICT dst, const T* DSPARK_RESTRICT src, int count) noexcept
 {
-    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
-                  "SimdOps: only float and double are supported");
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
     add(dst, src, count);
 }
 

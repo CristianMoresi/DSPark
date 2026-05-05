@@ -3,98 +3,101 @@
 
 #pragma once
 
-/**
- * @file DenormalGuard.h
- * @brief RAII guard to disable denormalised floating-point numbers.
- *
- * Denormals (subnormal floats) cause massive CPU spikes in IIR filters,
- * feedback loops, and any recursive DSP algorithm. This guard sets the
- * processor to flush denormals to zero on construction and restores the
- * previous state on destruction.
- *
- * Platform support:
- * - **x86/x64 (SSE):** Sets FTZ + DAZ bits via `_mm_setcsr` / `_mm_getcsr`.
- * - **ARM (NEON):** Sets FZ bit via inline assembly or intrinsic.
- * - **Other / WASM:** No-op (WebAssembly has no denormals by spec).
- *
- * Dependencies: none.
- *
- * @code
- *   void processBlock(float* data, int numSamples)
- *   {
- *       dspark::DenormalGuard guard;  // denormals disabled for this scope
- *
- *       for (int i = 0; i < numSamples; ++i)
- *           data[i] = myIIRFilter.processSample(data[i]);
- *
- *   }  // original FP state restored here
- * @endcode
- */
-
 #include <cstdint>
 
-#if defined(_MSC_VER) || defined(__SSE__)
+// Correct architecture detection
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    #define DSPARK_ARCH_X86 1
     #include <immintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    #define DSPARK_ARCH_ARM64 1
+#elif defined(__arm__) || defined(_M_ARM)
+    #define DSPARK_ARCH_ARM32 1
 #endif
 
 namespace dspark {
 
 /**
  * @class DenormalGuard
- * @brief RAII scope guard that disables denormalised floating-point numbers.
+ * @brief RAII scope guard to disable denormalised (subnormal) floating-point numbers.
  *
- * Create an instance at the top of your audio callback or processing
- * function. Denormals are flushed to zero for the lifetime of the object.
+ * Denormals cause severe performance penalties (CPU spikes) in modern processors 
+ * during recursive DSP calculations (e.g., IIR filters, delays, reverbs) when signals
+ * decay towards zero. This guard configures the CPU to flush denormals to zero (FTZ) 
+ * and treat denormal inputs as zero (DAZ) for the lifetime of the object, completely
+ * preventing performance degradation without affecting audible sound quality.
+ *
+ * @note This uses hardware-level intrinsic registers and executes in a few clock cycles.
+ * The previous floating-point state is strictly restored upon destruction, ensuring
+ * host DAW stability.
+ *
+ * **Architecture Support:**
+ * - x86/x64: Sets FTZ (bit 15) and DAZ (bit 6) via `_mm_setcsr`.
+ * - ARM/AArch64 (GCC/Clang): Sets FZ (bit 24) via inline assembly.
+ * - WebAssembly / Unknown: Safe no-op.
+ *
+ * @code
+ * void processBlock(float* data, int numSamples) noexcept
+ * {
+ * dspark::DenormalGuard guard; // Denormals disabled for this scope
+ *
+ * for (int i = 0; i < numSamples; ++i)
+ * data[i] = filter_.processSample(data[i]);
+ * } // Original FP state is automatically restored here
+ * @endcode
  */
 class DenormalGuard
 {
 public:
     /**
-     * @brief Saves current FP state and enables flush-to-zero.
-     *
-     * On x86: sets FTZ (bit 15) and DAZ (bit 6) in the MXCSR register.
-     * On ARM: sets FZ bit in the FPCR register.
+     * @brief Constructs the guard, saving the current FPU state and enabling FTZ/DAZ.
      */
     DenormalGuard() noexcept
     {
-#if defined(_MSC_VER) || defined(__SSE__)
+#if defined(DSPARK_ARCH_X86)
         previousState_ = _mm_getcsr();
-        _mm_setcsr(static_cast<unsigned int>(previousState_) | 0x8040u); // FTZ (bit 15) | DAZ (bit 6)
-#elif defined(__aarch64__)
+        // 0x8040u = FTZ (bit 15) | DAZ (bit 6)
+        _mm_setcsr(static_cast<unsigned int>(previousState_) | 0x8040u);
+
+#elif defined(DSPARK_ARCH_ARM64) && (defined(__GNUC__) || defined(__clang__))
         unsigned long long fpcr;
         __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
         previousState_ = fpcr;
         fpcr |= (1ULL << 24); // FZ bit
         __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr));
-#elif defined(__arm__)
+
+#elif defined(DSPARK_ARCH_ARM32) && (defined(__GNUC__) || defined(__clang__))
         unsigned int fpscr;
         __asm__ __volatile__("vmrs %0, fpscr" : "=r"(fpscr));
         previousState_ = fpscr;
         fpscr |= (1u << 24); // FZ bit
         __asm__ __volatile__("vmsr fpscr, %0" : : "r"(fpscr));
+
 #else
-        // WASM, other: denormals don't exist or can't be controlled
+        // Fallback for WASM, MSVC on ARM (no inline asm support), or unsupported archs.
         previousState_ = 0;
 #endif
     }
 
     /**
-     * @brief Restores the FP state that was active before construction.
+     * @brief Destructs the guard, restoring the exact FPU state captured during construction.
      */
     ~DenormalGuard() noexcept
     {
-#if defined(_MSC_VER) || defined(__SSE__)
+#if defined(DSPARK_ARCH_X86)
         _mm_setcsr(static_cast<unsigned int>(previousState_));
-#elif defined(__aarch64__)
+
+#elif defined(DSPARK_ARCH_ARM64) && (defined(__GNUC__) || defined(__clang__))
         unsigned long long fpcr = static_cast<unsigned long long>(previousState_);
         __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr));
-#elif defined(__arm__)
-        { unsigned int fpscr = static_cast<unsigned int>(previousState_);
-        __asm__ __volatile__("vmsr fpscr, %0" : : "r"(fpscr)); }
+
+#elif defined(DSPARK_ARCH_ARM32) && (defined(__GNUC__) || defined(__clang__))
+        unsigned int fpscr = static_cast<unsigned int>(previousState_);
+        __asm__ __volatile__("vmsr fpscr, %0" : : "r"(fpscr));
 #endif
     }
 
-    // Non-copyable, non-movable (RAII scope guard)
+    // Delete copy and move semantics strictly
     DenormalGuard(const DenormalGuard&) = delete;
     DenormalGuard& operator=(const DenormalGuard&) = delete;
     DenormalGuard(DenormalGuard&&) = delete;
@@ -105,3 +108,7 @@ private:
 };
 
 } // namespace dspark
+
+#undef DSPARK_ARCH_X86
+#undef DSPARK_ARCH_ARM64
+#undef DSPARK_ARCH_ARM32

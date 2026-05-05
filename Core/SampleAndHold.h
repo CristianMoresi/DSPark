@@ -8,31 +8,12 @@
  * @brief Sample-and-hold processor for stepped modulation and bit-crushing.
  *
  * Captures an input sample and holds it for a configurable number of samples
- * or until an external trigger fires. This is useful for:
- * - **Bit-crushing effects:** Reduce effective sample rate by holding samples.
- * - **Stepped modulation:** Create staircase waveforms from smooth signals.
- * - **Triggered S&H:** Classic synth module triggered by an LFO or clock.
+ * or until an external trigger fires. This introduces deliberate spectral imaging
+ * (aliasing) due to its Zero-Order Hold (ZOH) nature, making it ideal for 
+ * creative bit-crushing and classic stepped LFO synthesis.
  *
- * Dependencies: DspMath.h (for FloatType concept).
- *
- * @code
- *   // Reduce effective sample rate to 1/4 (downsampling effect)
- *   dspark::SampleAndHold<float> sh;
- *   sh.setHoldSamples(4);
- *
- *   for (int i = 0; i < numSamples; ++i)
- *       output[i] = sh.process(input[i]);
- *
- *   // Trigger-based S&H (classic synth module)
- *   dspark::SampleAndHold<float> sh;
- *   sh.setMode(dspark::SampleAndHold<float>::Mode::Trigger);
- *   for (int i = 0; i < numSamples; ++i)
- *   {
- *       bool trigger = lfoOutput[i] > 0.0f && prevLfo <= 0.0f;  // zero-crossing
- *       output[i] = sh.process(input[i], trigger);
- *       prevLfo = lfoOutput[i];
- *   }
- * @endcode
+ * @note This is an effect/modulator, not a band-limited Sample Rate Converter (SRC).
+ * * Dependencies: DspMath.h (for FloatType concept).
  */
 
 #include "DspMath.h"
@@ -41,34 +22,33 @@ namespace dspark {
 
 /**
  * @class SampleAndHold
- * @brief Holds a sample value for N samples or until triggered.
+ * @brief Holds a sample value for N samples or until externally triggered.
  *
- * @tparam T Sample type (float or double).
+ * @tparam T Sample type (must satisfy FloatType concept).
  */
 template <FloatType T>
 class SampleAndHold
 {
 public:
-    /** @brief Operating mode. */
+    /** @brief Defines the capture behavior of the processor. */
     enum class Mode
     {
-        Counter, ///< Hold for a fixed number of samples (default).
-        Trigger  ///< Hold until an external trigger fires.
+        Counter, ///< Holds for a fixed number of samples automatically (Decimation).
+        Trigger  ///< Holds indefinitely until an external trigger signal fires.
     };
 
     /**
      * @brief Sets the operating mode.
-     * @param mode Counter or Trigger mode.
+     * @param mode Mode::Counter or Mode::Trigger.
      */
     void setMode(Mode mode) noexcept { mode_ = mode; }
 
     /**
-     * @brief Sets the number of samples to hold in Counter mode.
+     * @brief Sets the hold duration for Counter mode in samples.
+     * * A value of 1 passes the signal transparently. A value of N reduces
+     * the effective sample rate by a factor of N.
      *
-     * A value of 1 means no hold (pass-through). A value of 4 means the
-     * effective sample rate is reduced to 1/4.
-     *
-     * @param numSamples Hold period in samples (minimum 1).
+     * @param numSamples Hold period in samples. Clamped to a minimum of 1.
      */
     void setHoldSamples(int numSamples) noexcept
     {
@@ -76,26 +56,29 @@ public:
     }
 
     /**
-     * @brief Sets the hold period by effective sample rate.
+     * @brief Sets the hold period based on a target effective sample rate.
      *
-     * @param targetRate The desired effective sample rate in Hz.
-     * @param actualRate The actual sample rate in Hz.
+     * @param targetRate The desired effective sample rate in Hz. Must be > 0.
+     * @param actualRate The current system sample rate in Hz.
      */
     void setHoldRate(double targetRate, double actualRate) noexcept
     {
-        int period = static_cast<int>(actualRate / targetRate);
-        setHoldSamples(period);
+        if (targetRate <= 0.0 || actualRate <= 0.0) 
+        {
+            setHoldSamples(1);
+            return;
+        }
+        setHoldSamples(static_cast<int>(actualRate / targetRate));
     }
 
     /**
-     * @brief Processes one sample.
+     * @brief Processes a single sample.
+     * * @warning For optimal performance on blocks, use processBlock() instead,
+     * as this scalar method contains internal branching based on the Mode.
      *
-     * In Counter mode, captures a new sample every `holdPeriod` samples.
-     * In Trigger mode, captures only when `trigger` is true.
-     *
-     * @param input The input sample.
-     * @param trigger External trigger (only used in Trigger mode).
-     * @return The held (output) sample.
+     * @param input The audio or modulation input sample.
+     * @param trigger External trigger state (ignored in Counter mode).
+     * @return The currently held output sample.
      */
     [[nodiscard]] T process(T input, bool trigger = false) noexcept
     {
@@ -108,39 +91,94 @@ public:
                 counter_ = 0;
             }
         }
-        else // Trigger mode
+        else // Mode::Trigger
         {
             if (trigger)
+            {
                 heldValue_ = input;
+            }
         }
-
         return heldValue_;
     }
 
     /**
-     * @brief Processes a block of samples in-place.
-     * @param data Audio buffer (modified in-place).
-     * @param numSamples Number of samples.
+     * @brief Processes a block of samples in-place (Counter mode optimized).
+     * * If the processor is in Trigger mode, calling this method will simply 
+     * fill the buffer with the last held value. For Trigger mode processing,
+     * use the overloaded processBlock with the trigger buffer.
+     *
+     * @param data Audio buffer to process in-place.
+     * @param numSamples Number of samples in the buffer.
      */
     void processBlock(T* data, int numSamples) noexcept
     {
-        for (int i = 0; i < numSamples; ++i)
-            data[i] = process(data[i]);
+        if (mode_ == Mode::Counter)
+        {
+            // Branch hoisted out of the hot loop
+            for (int i = 0; i < numSamples; ++i)
+            {
+                ++counter_;
+                if (counter_ >= holdPeriod_)
+                {
+                    heldValue_ = data[i];
+                    counter_ = 0;
+                }
+                data[i] = heldValue_;
+            }
+        }
+        else
+        {
+            // In trigger mode with no triggers provided, it holds indefinitely.
+            for (int i = 0; i < numSamples; ++i)
+            {
+                data[i] = heldValue_;
+            }
+        }
     }
 
     /**
-     * @brief Returns the currently held value.
+     * @brief Processes a block of samples in-place using an external trigger buffer.
+     * * Only relevant when Mode is set to Trigger. If Mode is Counter, the 
+     * triggers buffer is safely ignored.
+     *
+     * @param data Audio buffer to process in-place.
+     * @param triggers Array of boolean triggers (must be size of numSamples).
+     * @param numSamples Number of samples in the buffer.
+     */
+    void processBlock(T* data, const bool* triggers, int numSamples) noexcept
+    {
+        if (mode_ == Mode::Trigger)
+        {
+            // Branch hoisted out of the hot loop
+            for (int i = 0; i < numSamples; ++i)
+            {
+                if (triggers[i])
+                {
+                    heldValue_ = data[i];
+                }
+                data[i] = heldValue_;
+            }
+        }
+        else
+        {
+            processBlock(data, numSamples);
+        }
+    }
+
+    /**
+     * @brief Retrieves the current held value without advancing the state.
+     * @return The held sample value.
      */
     [[nodiscard]] T getHeldValue() const noexcept { return heldValue_; }
 
     /**
-     * @brief Resets the held value and counter.
-     * @param initialValue Value to hold after reset (default: 0).
+     * @brief Resets the processor state and sets an initial output value.
+     * * @param initialValue Value to output until the next capture triggers.
      */
     void reset(T initialValue = T(0)) noexcept
     {
         heldValue_ = initialValue;
-        counter_ = holdPeriod_; // will capture on next sample
+        counter_ = 0; // Fixed: ensures initialValue is outputted before next capture
     }
 
 private:

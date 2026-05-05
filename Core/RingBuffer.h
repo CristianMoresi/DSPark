@@ -7,28 +7,17 @@
  * @file RingBuffer.h
  * @brief Circular buffer with interpolated reads for audio delay lines.
  *
- * Provides a power-of-two circular buffer optimised for audio use. Supports
- * integer and fractional-sample reads with multiple interpolation methods.
- * This is the foundation for delay lines, comb filters, lookahead limiters,
- * chorus effects, and any processor that needs past-sample access.
+ * Provides a power-of-two circular buffer optimized for strict real-time audio use.
+ * Completely lock-free and allocation-free in the processing path. Data storage 
+ * is aligned to 32 bytes to guarantee safe SIMD auto-vectorization.
  *
  * Features:
- * - Power-of-two capacity (bitwise wrap — no modulo)
- * - Single-sample push / read interface
- * - Integer and fractional delay reads
- * - Multiple interpolation modes (linear, cubic, Hermite, Lagrange)
- * - Block push for efficient buffer filling
+ * - 32-byte memory alignment (AVX ready)
+ * - Zero branching in hot paths via compile-time template selection
+ * - Safe pre-initialization state to prevent segfaults
+ * - Multiple interpolation modes (Linear, Cubic, Hermite, Lagrange)
  *
  * Dependencies: DspMath.h, Interpolation.h.
- *
- * @code
- *   dspark::RingBuffer<float> ring;
- *   ring.prepare(65536);  // 64k samples max delay
- *
- *   // In audio callback:
- *   ring.push(inputSample);
- *   float delayed = ring.readInterpolated(delayInSamples);  // fractional OK
- * @endcode
  */
 
 #include "DspMath.h"
@@ -36,36 +25,43 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cstring>
-#include <vector>
+#include <cstdlib>
+#include <memory>
 
 namespace dspark {
 
 /**
+ * @brief Interpolation method for fractional-sample reads.
+ */
+enum class InterpMethod
+{
+    Linear,   ///< 2-point linear (fast, lower quality)
+    Cubic,    ///< 4-point Catmull-Rom (good balance)
+    Hermite,  ///< 4-point Hermite (smooth transients, best for modulated delay)
+    Lagrange  ///< 4-point Lagrange (highest accuracy, static delay)
+};
+
+/**
  * @class RingBuffer
- * @brief Power-of-two circular buffer with interpolated read access.
+ * @brief Power-of-two circular buffer with compile-time interpolated read access.
  *
- * @tparam T Sample type (float or double).
+ * @tparam T Sample type (float or double). Requires FloatType concept.
  */
 template <FloatType T>
 class RingBuffer
 {
 public:
-    /**
-     * @brief Interpolation method for fractional-sample reads.
-     */
-    enum class InterpMethod
+    RingBuffer() noexcept 
     {
-        Linear,   ///< 2-point linear (fast, lower quality)
-        Cubic,    ///< 4-point Catmull-Rom (good balance)
-        Hermite,  ///< 4-point Hermite (smooth transients)
-        Lagrange  ///< 4-point Lagrange (highest accuracy)
-    };
+        // Safe default state prevents crashes if used before prepare()
+        prepare(64); 
+    }
 
     /**
      * @brief Allocates the ring buffer with the given capacity.
      *
-     * Capacity is rounded up to the next power of two.
+     * Capacity is rounded up to the next power of two. Memory is aligned to 
+     * 32 bytes for SIMD safety. Not thread-safe against concurrent process() calls.
      *
      * @param maxSamples Maximum number of samples to store.
      */
@@ -73,22 +69,35 @@ public:
     {
         assert(maxSamples > 0);
 
-        // Round up to next power of two
         capacity_ = 1;
         while (capacity_ < maxSamples)
             capacity_ <<= 1;
 
         mask_ = capacity_ - 1;
-        buffer_.assign(static_cast<size_t>(capacity_), T(0));
-        writePos_ = 0;
+
+        // Ensure 32-byte alignment for SIMD operations
+        size_t bytes = static_cast<size_t>(capacity_) * sizeof(T);
+        
+        // Custom deleter for aligned allocation
+        buffer_.reset(static_cast<T*>(
+            #if defined(_MSC_VER)
+                _aligned_malloc(bytes, 32)
+            #else
+                std::aligned_alloc(32, bytes)
+            #endif
+        ));
+
+        reset();
     }
 
     /**
      * @brief Clears the buffer to zero without deallocating.
+     * Safe to call from the audio thread.
      */
     void reset() noexcept
     {
-        std::fill(buffer_.begin(), buffer_.end(), T(0));
+        if (buffer_)
+            std::fill_n(buffer_.get(), capacity_, T(0));
         writePos_ = 0;
     }
 
@@ -96,9 +105,9 @@ public:
      * @brief Pushes a single sample into the buffer.
      * @param sample The sample to write.
      */
-    void push(T sample) noexcept
+    inline void push(T sample) noexcept
     {
-        buffer_[static_cast<size_t>(writePos_)] = sample;
+        buffer_[writePos_] = sample;
         writePos_ = (writePos_ + 1) & mask_;
     }
 
@@ -114,117 +123,84 @@ public:
     }
 
     /**
-     * @brief Reads a sample at an integer delay (in samples).
+     * @brief Reads a sample at an integer delay.
      *
      * A delay of 0 returns the most recently pushed sample.
-     * A delay of 1 returns the sample before that, etc.
      *
      * @param delaySamples Delay in samples (0 to capacity-1).
      * @return The delayed sample.
-     *
-     * @note In debug builds an assertion fires if `delaySamples >= capacity_`.
-     *       The bit-mask wrap would otherwise silently return a stale sample
-     *       from the "other side" of the ring, which is rarely what the
-     *       caller intended (M1).
      */
-    [[nodiscard]] T read(int delaySamples) const noexcept
+    [[nodiscard]] inline T read(int delaySamples) const noexcept
     {
-        assert(delaySamples >= 0 && delaySamples < capacity_
-               && "RingBuffer::read: delaySamples out of range (0..capacity-1)");
+        assert(delaySamples >= 0 && delaySamples < capacity_ 
+               && "RingBuffer::read: delay out of range");
+        
         int idx = (writePos_ - 1 - delaySamples) & mask_;
-        return buffer_[static_cast<size_t>(idx)];
+        return buffer_[idx];
     }
 
     /**
-     * @brief Reads a sample at a fractional delay with interpolation.
+     * @brief Reads a sample at a fractional delay using the specified interpolation.
      *
-     * @param delaySamples Fractional delay in samples (e.g., 10.7).
-     * @param method Interpolation method (default: Cubic).
+     * Uses compile-time template selection to eliminate branching in the audio thread.
+     * * @tparam Method Interpolation method to use.
+     * @param delaySamples Fractional delay in samples.
      * @return The interpolated sample.
      *
-     * @note 4-point interpolators (Cubic/Hermite/Lagrange) read samples at
-     *       `intDelay - 1 ... intDelay + 2`. For `delaySamples < 1` this
-     *       reaches into a "future" sample which does not exist yet and is
-     *       returned as whatever stale value sat there before — usually
-     *       zero in a fresh buffer, but potentially old audio after reuse.
-     *       Callers that need very short delays must either use Linear
-     *       interpolation or guarantee `delaySamples >= 1`. Asserted in
-     *       debug (M2).
+     * @note 4-point interpolators require delaySamples >= 1.0 to avoid reading 
+     * future/unwritten samples. Modulating below 1.0 will cause audio artifacts.
      */
-    [[nodiscard]] T readInterpolated(T delaySamples,
-                                     InterpMethod method = InterpMethod::Cubic) const noexcept
+    template <InterpMethod Method = InterpMethod::Cubic>
+    [[nodiscard]] inline T readInterpolated(T delaySamples) const noexcept
     {
         int intDelay = static_cast<int>(delaySamples);
         T frac = delaySamples - static_cast<T>(intDelay);
-        assert(delaySamples >= T(0)
-               && static_cast<int>(delaySamples) + 2 < capacity_
-               && "RingBuffer::readInterpolated: delaySamples out of range");
-        assert((method == InterpMethod::Linear || delaySamples >= T(1))
-               && "RingBuffer::readInterpolated: 4-point interpolators need delaySamples >= 1");
+        
+        assert(delaySamples >= T(0) && intDelay + 2 < capacity_);
 
-        switch (method)
+        if constexpr (Method == InterpMethod::Linear)
         {
-            case InterpMethod::Linear:
-            {
-                T s0 = read(intDelay);
-                T s1 = read(intDelay + 1);
-                return s0 + frac * (s1 - s0);
-            }
-
-            case InterpMethod::Cubic:
-            {
-                T s[4];
-                s[0] = read(intDelay - 1);
-                s[1] = read(intDelay);
-                s[2] = read(intDelay + 1);
-                s[3] = read(intDelay + 2);
-                return interpolateCubic(s, 4, T(1) + frac);
-            }
-
-            case InterpMethod::Hermite:
-            {
-                T s[4];
-                s[0] = read(intDelay - 1);
-                s[1] = read(intDelay);
-                s[2] = read(intDelay + 1);
-                s[3] = read(intDelay + 2);
-                return interpolateHermite(s, 4, T(1) + frac);
-            }
-
-            case InterpMethod::Lagrange:
-            {
-                T s[4];
-                s[0] = read(intDelay - 1);
-                s[1] = read(intDelay);
-                s[2] = read(intDelay + 1);
-                s[3] = read(intDelay + 2);
-                return interpolateLagrange(s, 4, T(1) + frac);
-            }
+            T s0 = read(intDelay);
+            T s1 = read(intDelay + 1);
+            return s0 + frac * (s1 - s0);
         }
+        else
+        {
+            assert(delaySamples >= T(1) && "4-point interpolators require delay >= 1.0");
 
-        return read(intDelay); // fallback
+            T s[4];
+            // Optimized contiguous logical read
+            s[0] = read(intDelay - 1);
+            s[1] = read(intDelay);
+            s[2] = read(intDelay + 1);
+            s[3] = read(intDelay + 2);
+
+            // frac is strictly passed, NOT T(1) + frac
+            if constexpr (Method == InterpMethod::Cubic)
+                return interpolateCubic(s, 4, frac);
+            else if constexpr (Method == InterpMethod::Hermite)
+                return interpolateHermite(s, 4, frac);
+            else if constexpr (Method == InterpMethod::Lagrange)
+                return interpolateLagrange(s, 4, frac);
+        }
     }
 
-    /**
-     * @brief Returns the buffer capacity (power of two).
-     */
     [[nodiscard]] int getCapacity() const noexcept { return capacity_; }
-
-    /**
-     * @brief Returns direct access to the internal buffer.
-     *
-     * Use with care — the write position is not exposed. Intended for
-     * advanced use cases like FFT analysis of the buffer contents.
-     */
-    [[nodiscard]] const T* data() const noexcept { return buffer_.data(); }
-
-    /**
-     * @brief Returns the current write position.
-     */
+    [[nodiscard]] const T* data() const noexcept { return buffer_.get(); }
     [[nodiscard]] int getWritePosition() const noexcept { return writePos_; }
 
 private:
-    std::vector<T> buffer_;
+    struct AlignedDeleter {
+        void operator()(T* ptr) const {
+            #if defined(_MSC_VER)
+                _aligned_free(ptr);
+            #else
+                std::free(ptr);
+            #endif
+        }
+    };
+
+    std::unique_ptr<T[], AlignedDeleter> buffer_;
     int capacity_ = 0;
     int mask_ = 0;
     int writePos_ = 0;

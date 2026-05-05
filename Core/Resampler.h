@@ -11,32 +11,16 @@
  * with configurable quality. Uses windowed-sinc interpolation — the same method
  * used in professional DAWs and mastering tools.
  *
+ * Optimized for CPU cache and SIMD autovectorization using double-buffered delay lines.
+ * Zero allocations in the audio thread when properly initialized.
+ *
  * Two modes:
  *
  * - **Offline (batch)**: Convert an entire buffer at once. Best for file processing.
  * - **Streaming**: Process chunks incrementally. Best for real-time applications
- *   where audio arrives in blocks.
+ * where audio arrives in blocks.
  *
- * Quality levels:
- *
- * | Quality  | Sinc points | Stop-band | Use case                    |
- * |----------|-------------|-----------|------------------------------|
- * | Draft    | 8           | ~60 dB    | Preview, non-critical        |
- * | Normal   | 32          | ~90 dB    | General-purpose              |
- * | High     | 64          | ~120 dB   | Mastering, archival          |
- * | Ultra    | 128         | ~140 dB   | Maximum quality (slow)       |
- *
- * Dependencies: DspMath.h, WindowFunctions.h.
- *
- * @code
- *   // Offline: convert a 44100 Hz file to 48000 Hz
- *   dspark::Resampler<float> resampler;
- *   resampler.prepare(44100.0, 48000.0, dspark::Resampler<float>::Quality::High);
- *
- *   auto output = resampler.process(inputData, inputLength);
- *   // output.data() contains the resampled audio
- *   // output.size() is the new length
- * @endcode
+ * Dependencies: AudioBuffer.h, DspMath.h, WindowFunctions.h.
  */
 
 #include "AudioBuffer.h"
@@ -53,7 +37,7 @@ namespace dspark {
 
 /**
  * @class Resampler
- * @brief Windowed-sinc sample rate converter.
+ * @brief Windowed-sinc sample rate converter optimized for real-time DSP.
  *
  * @tparam T Sample type (float or double).
  */
@@ -63,14 +47,16 @@ class Resampler
 public:
     enum class Quality
     {
-        Draft,   ///< 8-point sinc, fast
-        Normal,  ///< 32-point sinc, balanced
-        High,    ///< 64-point sinc, high quality
-        Ultra    ///< 128-point sinc, maximum quality
+        Draft,   ///< 8-point sinc, fast (~60 dB stop-band)
+        Normal,  ///< 32-point sinc, balanced (~90 dB stop-band)
+        High,    ///< 64-point sinc, high quality (~120 dB stop-band)
+        Ultra    ///< 128-point sinc, maximum quality (~140 dB stop-band)
     };
 
     /**
      * @brief Prepares the resampler for a given rate conversion.
+     *
+     * Allocates internal buffers. MUST be called outside the audio thread.
      *
      * @param sourceRate      Source sample rate in Hz.
      * @param targetRate      Target sample rate in Hz.
@@ -85,24 +71,39 @@ public:
 
         sincPoints_ = qualityToSincPoints(quality);
 
-        // Build the sinc table (oversampled for sub-sample accuracy)
         buildSincTable();
-
-        // Clear state
         reset();
     }
 
-    /** @brief Resets the internal state (delay lines, all channels). */
+    /**
+     * @brief Prepares the resampler using AudioSpec (unified API).
+     *
+     * Pre-allocates multi-channel states. MUST be called outside the audio thread.
+     *
+     * @param spec       Audio environment (sampleRate, numChannels used).
+     * @param targetRate Target sample rate in Hz.
+     * @param quality    Interpolation quality (default: Normal).
+     */
+    void prepare(const AudioSpec& spec, double targetRate,
+                 Quality quality = Quality::Normal)
+    {
+        prepare(spec.sampleRate, targetRate, quality);
+        ensureChannelStates(spec.numChannels);
+    }
+
+    /** * @brief Resets the internal state (delay lines, all channels) to zero. 
+     * Thread-safe to call from audio thread if no allocation is triggered.
+     */
     void reset() noexcept
     {
-        history_.assign(static_cast<size_t>(sincPoints_), T(0));
-        historyPos_ = 0;
+        history_.assign(static_cast<size_t>(sincPoints_ * 2), T(0));
+        writePos_ = 0;
         fractionalPos_ = 0.0;
 
         for (auto& cs : channelStates_)
         {
             std::fill(cs.history.begin(), cs.history.end(), T(0));
-            cs.historyPos = 0;
+            cs.writePos = 0;
             cs.fractionalPos = 0.0;
         }
     }
@@ -116,39 +117,33 @@ public:
      */
     [[nodiscard]] std::vector<T> process(const T* input, int inputLength)
     {
-        // Calculate expected output length
         auto outputLength = static_cast<int>(
             std::ceil(static_cast<double>(inputLength) * ratio_));
 
         std::vector<T> output(static_cast<size_t>(outputLength));
+        const int halfSinc = sincPoints_ / 2;
 
-        int outIdx = 0;
-        double srcPos = 0.0;
-
-        while (outIdx < outputLength && srcPos < static_cast<double>(inputLength))
+        for (int outIdx = 0; outIdx < outputLength; ++outIdx)
         {
+            // Calculate absolute source position to avoid float drift accumulation
+            double srcPos = static_cast<double>(outIdx) / ratio_;
+            if (srcPos >= inputLength) break;
+
             int intPos = static_cast<int>(srcPos);
             double frac = srcPos - static_cast<double>(intPos);
 
-            output[static_cast<size_t>(outIdx)] = interpolate(input, inputLength, intPos, frac);
-
-            srcPos += 1.0 / ratio_;
-            ++outIdx;
+            output[static_cast<size_t>(outIdx)] = interpolateOffline(input, inputLength, intPos, frac, halfSinc);
         }
 
-        output.resize(static_cast<size_t>(outIdx));
         return output;
     }
 
     /**
-     * @brief Resamples a block of audio in streaming mode.
-     *
-     * Call this repeatedly with incoming audio blocks. The output buffer must
-     * be pre-allocated with at least `getMaxOutputSamples(inputLength)` elements.
+     * @brief Resamples a block of audio in single-channel streaming mode.
      *
      * @param input       Input audio samples.
      * @param inputLength Number of input samples.
-     * @param output      Output buffer (pre-allocated).
+     * @param output      Output buffer (must hold at least getMaxOutputSamples()).
      * @return Number of output samples produced.
      */
     int processBlock(const T* input, int inputLength, T* output) noexcept
@@ -157,14 +152,13 @@ public:
 
         for (int i = 0; i < inputLength; ++i)
         {
-            pushSample(input[i]);
+            pushSampleSingle(input[i]);
 
             while (fractionalPos_ < 1.0)
             {
-                output[outIdx++] = interpolateFromHistory(fractionalPos_);
+                output[outIdx++] = interpolateFromHistory(history_.data(), writePos_, fractionalPos_);
                 fractionalPos_ += 1.0 / ratio_;
             }
-
             fractionalPos_ -= 1.0;
         }
 
@@ -172,70 +166,12 @@ public:
     }
 
     /**
-     * @brief Returns the maximum number of output samples for a given input length.
-     *
-     * Use this to pre-allocate the output buffer for processBlock().
-     *
-     * @param inputLength Number of input samples.
-     * @return Maximum possible output samples.
-     */
-    [[nodiscard]] int getMaxOutputSamples(int inputLength) const noexcept
-    {
-        return static_cast<int>(
-            std::ceil(static_cast<double>(inputLength) * ratio_)) + 2;
-    }
-
-    /** @brief Returns the conversion ratio (targetRate / sourceRate). */
-    [[nodiscard]] double getRatio() const noexcept { return ratio_; }
-
-    /**
-     * @brief Returns the latency in output samples introduced by the sinc filter.
-     *
-     * The windowed-sinc interpolator has a group delay of sincPoints/2 samples
-     * at the source rate. This returns the equivalent in output samples.
-     */
-    [[nodiscard]] int getLatency() const noexcept
-    {
-        return static_cast<int>(std::round(static_cast<double>(sincPoints_ / 2) * ratio_));
-    }
-
-    /**
-     * @brief Calculates the output length for a given input length.
-     * @param inputLength Number of input samples.
-     * @return Expected number of output samples.
-     */
-    [[nodiscard]] int getOutputLength(int inputLength) const noexcept
-    {
-        return static_cast<int>(
-            std::round(static_cast<double>(inputLength) * ratio_));
-    }
-
-    /**
-     * @brief Prepares the resampler using AudioSpec (unified API).
-     *
-     * Uses spec.sampleRate as the source rate and pre-allocates per-channel
-     * state for spec.numChannels, enabling multi-channel processBlock().
-     *
-     * @param spec       Audio environment (sampleRate, numChannels used).
-     * @param targetRate Target sample rate in Hz.
-     * @param quality    Interpolation quality (default: Normal).
-     */
-    void prepare(const AudioSpec& spec, double targetRate,
-                 Quality quality = Quality::Normal)
-    {
-        prepare(spec.sampleRate, targetRate, quality);
-        ensureChannelStates(spec.numChannels);
-    }
-
-    /**
      * @brief Resamples multi-channel audio using AudioBufferView (streaming).
      *
-     * Each channel is processed independently with its own delay line state.
-     * The output view must have at least `getMaxOutputSamples(input.getNumSamples())`
-     * samples per channel.
+     * Processes each channel sequentially with its independent state.
      *
-     * @param input  Input audio buffer.
-     * @param output Output audio buffer (pre-allocated).
+     * @param input  Input audio buffer view.
+     * @param output Output audio buffer view (pre-allocated).
      * @return Number of output samples produced per channel.
      */
     int processBlock(AudioBufferView<T> input, AudioBufferView<T> output) noexcept
@@ -243,7 +179,8 @@ public:
         int numCh = std::min(input.getNumChannels(), output.getNumChannels());
         int inLen = input.getNumSamples();
 
-        ensureChannelStates(numCh);
+        assert(static_cast<int>(channelStates_.size()) >= numCh && 
+               "Resampler channels not allocated! Call prepare(spec...) first.");
 
         int outCount = 0;
         for (int ch = 0; ch < numCh; ++ch)
@@ -256,7 +193,29 @@ public:
         return outCount;
     }
 
+    /**
+     * @brief Returns the maximum number of output samples for a given input length.
+     * @param inputLength Number of input samples.
+     * @return Maximum possible output samples.
+     */
+    [[nodiscard]] int getMaxOutputSamples(int inputLength) const noexcept
+    {
+        return static_cast<int>(
+            std::ceil(static_cast<double>(inputLength) * ratio_)) + 2;
+    }
+
+    /** @brief Returns the conversion ratio (targetRate / sourceRate). */
+    [[nodiscard]] double getRatio() const noexcept { return ratio_; }
+
+    /** @brief Returns the latency in output samples introduced by the sinc filter. */
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        return static_cast<int>(std::round(static_cast<double>(sincPoints_ / 2) * ratio_));
+    }
+
 private:
+    static constexpr int kOversample = 256;
+
     static int qualityToSincPoints(Quality q) noexcept
     {
         switch (q)
@@ -271,10 +230,6 @@ private:
 
     void buildSincTable()
     {
-        // Oversampled sinc table for sub-sample interpolation
-        // sincTable_[phase * sincPoints_ + tap]
-        constexpr int kOversample = 256;
-        tableSize_ = kOversample;
         sincTable_.resize(static_cast<size_t>(kOversample * sincPoints_));
 
         std::vector<T> kaiserWin(static_cast<size_t>(sincPoints_));
@@ -283,8 +238,8 @@ private:
         const int halfSinc = sincPoints_ / 2;
         constexpr double kPi = std::numbers::pi;
 
-        // Cutoff: use the lower of the two rates to prevent aliasing
-        double cutoff = (ratio_ < 1.0) ? ratio_ : 1.0;
+        // Apply 0.95 margin on downsampling to prevent transition-band aliasing.
+        double cutoff = (ratio_ < 1.0) ? (ratio_ * 0.95) : 1.0;
 
         for (int phase = 0; phase < kOversample; ++phase)
         {
@@ -301,85 +256,114 @@ private:
                     sincVal = static_cast<T>(cutoff * std::sin(kPi * x) / (kPi * x));
 
                 sincVal *= kaiserWin[static_cast<size_t>(tap)];
-
                 sincTable_[static_cast<size_t>(phase * sincPoints_ + tap)] = sincVal;
             }
         }
     }
 
-    /// Cubic-interpolated sinc table lookup for a single tap.
-    /// Uses Catmull-Rom interpolation between 4 adjacent phases for sub-phase accuracy.
-    ///
-    /// M7d2: At the table edges `p0 = max(p1-1, 0)` collapses with `p1`
-    /// (and `p3` with `p2` on the upper end), degrading Catmull-Rom to a
-    /// 3-point stencil. The sinc table is not periodic, so we cannot wrap
-    /// around; the audible impact is confined to one output sample at the
-    /// very edge of an offline conversion and is below the noise floor
-    /// in streaming use. Kept as-is by design.
-    [[nodiscard]] T sincLookup(double exactPhase, int tap) const noexcept
+    /**
+     * @brief Offline interpolation with boundary checks.
+     */
+    T interpolateOffline(const T* data, int length, int intPos, double frac, int halfSinc) const noexcept
     {
+        double exactPhase = frac * static_cast<double>(kOversample);
         int p1 = static_cast<int>(exactPhase);
         double pf = exactPhase - static_cast<double>(p1);
 
         int p0 = std::max(p1 - 1, 0);
-        int p2 = std::min(p1 + 1, tableSize_ - 1);
-        int p3 = std::min(p1 + 2, tableSize_ - 1);
-        p1 = std::clamp(p1, 0, tableSize_ - 1);
+        int p2 = std::min(p1 + 1, kOversample - 1);
+        int p3 = std::min(p1 + 2, kOversample - 1);
+        p1 = std::clamp(p1, 0, kOversample - 1);
 
-        T y0 = sincTable_[static_cast<size_t>(p0 * sincPoints_ + tap)];
-        T y1 = sincTable_[static_cast<size_t>(p1 * sincPoints_ + tap)];
-        T y2 = sincTable_[static_cast<size_t>(p2 * sincPoints_ + tap)];
-        T y3 = sincTable_[static_cast<size_t>(p3 * sincPoints_ + tap)];
+        size_t offset0 = static_cast<size_t>(p0 * sincPoints_);
+        size_t offset1 = static_cast<size_t>(p1 * sincPoints_);
+        size_t offset2 = static_cast<size_t>(p2 * sincPoints_);
+        size_t offset3 = static_cast<size_t>(p3 * sincPoints_);
 
         T t = static_cast<T>(pf);
-        T a1 = T(0.5) * (y2 - y0);
-        T a2 = y0 - T(2.5) * y1 + T(2) * y2 - T(0.5) * y3;
-        T a3 = T(0.5) * (y3 - y0) + T(1.5) * (y1 - y2);
-
-        return y1 + t * (a1 + t * (a2 + t * a3));
-    }
-
-    T interpolate(const T* data, int length, int intPos, double frac) const noexcept
-    {
-        const int halfSinc = sincPoints_ / 2;
-        double exactPhase = frac * tableSize_;
-
         T result = T(0);
+
         for (int tap = 0; tap < sincPoints_; ++tap)
         {
             int srcIdx = intPos + tap - halfSinc;
             T sample = (srcIdx >= 0 && srcIdx < length) ? data[srcIdx] : T(0);
-            result += sample * sincLookup(exactPhase, tap);
+
+            T y0 = sincTable_[offset0 + tap];
+            T y1 = sincTable_[offset1 + tap];
+            T y2 = sincTable_[offset2 + tap];
+            T y3 = sincTable_[offset3 + tap];
+
+            T a1 = T(0.5) * (y2 - y0);
+            T a2 = y0 - T(2.5) * y1 + T(2) * y2 - T(0.5) * y3;
+            T a3 = T(0.5) * (y3 - y0) + T(1.5) * (y1 - y2);
+
+            T sincVal = y1 + t * (a1 + t * (a2 + t * a3));
+            result += sample * sincVal;
         }
 
         return result;
     }
 
-    void pushSample(T sample) noexcept
+    /**
+     * @brief Pushes a sample into the global single-channel history buffer.
+     * Uses double-buffering trick to eliminate modulo in read path.
+     */
+    void pushSampleSingle(T sample) noexcept
     {
-        history_[static_cast<size_t>(historyPos_)] = sample;
-        historyPos_ = (historyPos_ + 1) % sincPoints_;
+        history_[static_cast<size_t>(writePos_)] = sample;
+        history_[static_cast<size_t>(writePos_ + sincPoints_)] = sample;
+        writePos_++;
+        if (writePos_ >= sincPoints_) writePos_ = 0;
     }
 
-    T interpolateFromHistory(double frac) const noexcept
+    /**
+     * @brief High-performance contiguous memory interpolator.
+     * Relies on the double-buffered history allowing linear SIMD loading.
+     */
+    T interpolateFromHistory(const T* historyPtr, int readPos, double frac) const noexcept
     {
-        double exactPhase = frac * tableSize_;
+        double exactPhase = frac * static_cast<double>(kOversample);
+        int p1 = static_cast<int>(exactPhase);
+        double pf = exactPhase - static_cast<double>(p1);
 
+        int p0 = std::max(p1 - 1, 0);
+        int p2 = std::min(p1 + 1, kOversample - 1);
+        int p3 = std::min(p1 + 2, kOversample - 1);
+        p1 = std::clamp(p1, 0, kOversample - 1);
+
+        size_t offset0 = static_cast<size_t>(p0 * sincPoints_);
+        size_t offset1 = static_cast<size_t>(p1 * sincPoints_);
+        size_t offset2 = static_cast<size_t>(p2 * sincPoints_);
+        size_t offset3 = static_cast<size_t>(p3 * sincPoints_);
+
+        T t = static_cast<T>(pf);
         T result = T(0);
+
+        // Linear memory read from 'readPos'. No modulo required.
+        const T* h_ptr = &historyPtr[readPos];
+
         for (int tap = 0; tap < sincPoints_; ++tap)
         {
-            int idx = (historyPos_ - sincPoints_ + tap + sincPoints_) % sincPoints_;
-            result += history_[static_cast<size_t>(idx)] * sincLookup(exactPhase, tap);
+            T y0 = sincTable_[offset0 + tap];
+            T y1 = sincTable_[offset1 + tap];
+            T y2 = sincTable_[offset2 + tap];
+            T y3 = sincTable_[offset3 + tap];
+
+            T a1 = T(0.5) * (y2 - y0);
+            T a2 = y0 - T(2.5) * y1 + T(2) * y2 - T(0.5) * y3;
+            T a3 = T(0.5) * (y3 - y0) + T(1.5) * (y1 - y2);
+
+            T sincVal = y1 + t * (a1 + t * (a2 + t * a3));
+            result += h_ptr[tap] * sincVal;
         }
 
         return result;
     }
 
-    /// Per-channel state for multi-channel streaming.
     struct ChannelState
     {
         std::vector<T> history;
-        int historyPos = 0;
+        int writePos = 0;
         double fractionalPos = 0.0;
     };
 
@@ -392,8 +376,9 @@ private:
             {
                 if (cs.history.empty())
                 {
-                    cs.history.assign(static_cast<size_t>(sincPoints_), T(0));
-                    cs.historyPos = 0;
+                    // Allocate double size to support modulo-free SIMD convolution
+                    cs.history.assign(static_cast<size_t>(sincPoints_ * 2), T(0));
+                    cs.writePos = 0;
                     cs.fractionalPos = 0.0;
                 }
             }
@@ -407,19 +392,16 @@ private:
 
         for (int i = 0; i < inputLength; ++i)
         {
-            state.history[static_cast<size_t>(state.historyPos)] = input[i];
-            state.historyPos = (state.historyPos + 1) % sincPoints_;
+            state.history[static_cast<size_t>(state.writePos)] = input[i];
+            state.history[static_cast<size_t>(state.writePos + sincPoints_)] = input[i];
+            state.writePos++;
+            
+            if (state.writePos >= sincPoints_) 
+                state.writePos = 0;
 
             while (state.fractionalPos < 1.0)
             {
-                double exactPhase = state.fractionalPos * tableSize_;
-                T result = T(0);
-                for (int tap = 0; tap < sincPoints_; ++tap)
-                {
-                    int idx = (state.historyPos - sincPoints_ + tap + sincPoints_) % sincPoints_;
-                    result += state.history[static_cast<size_t>(idx)] * sincLookup(exactPhase, tap);
-                }
-                output[outIdx++] = result;
+                output[outIdx++] = interpolateFromHistory(state.history.data(), state.writePos, state.fractionalPos);
                 state.fractionalPos += 1.0 / ratio_;
             }
 
@@ -435,11 +417,10 @@ private:
     double fractionalPos_ = 0.0;
 
     int sincPoints_ = 32;
-    int tableSize_ = 256;
 
     std::vector<T> sincTable_;
     std::vector<T> history_;
-    int historyPos_ = 0;
+    int writePos_ = 0;
 
     std::vector<ChannelState> channelStates_;
 };

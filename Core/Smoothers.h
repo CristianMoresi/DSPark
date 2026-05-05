@@ -17,7 +17,8 @@
  *
  * These classes provide various smoothing techniques to prevent artifacts like zipper noise
  * or clicks during parameter changes. All smoothers are designed for use in the audio thread:
- * lock-free, no dynamic allocations, and noexcept methods.
+ * lock-free, no dynamic allocations, and noexcept methods. All classes enforce 32-byte alignment
+ * to play nicely with SIMD/AVX auto-vectorization.
  *
  * Common API:
  * - reset(double sampleRate, float timeConstantMilliseconds, float initialValue): Configure.
@@ -27,17 +28,6 @@
  * - getTargetValue(): Get the current target value.
  * - isSmoothing(): Check if still smoothing (abs(current - target) > epsilon).
  * - skip(): Instantly set current to target (bypass smoothing).
- *
- * Choose based on parameter type:
- * - Linear: For gains, mix; predictable timing.
- * - Exponential/Multiplicative: For frequencies, dB; perceptual naturalness.
- * - One-Pole: For general smoothing with analog feel (e.g., delays, cutoffs).
- * - Multi-Pole: For steeper smoothing in modulation.
- * - Asymmetric: For attack/release in dynamics.
- * - SlewLimiter: For rate-limiting in delays/pitch.
- * - StateVariableFilter: For musical, stable second-order smoothing (e.g., synth filters).
- * - Butterworth: For maximally flat frequency response in smoothing.
- * - CriticallyDamped: For no-overshoot smoothing (Q=0.707).
  */
 namespace dspark {
 namespace Smoothers
@@ -57,10 +47,8 @@ namespace Constants
  * @brief Linear ramp smoother for predictable, uniform interpolation.
  *
  * Use for: Gains, mix/dry-wet, pans, or most faders where exact timing is needed.
- * Pros: Predictable (reaches target exactly); low CPU; time-consistent across sample rates.
- * Cons: Can sound abrupt for perceptual params (e.g., frequency).
  */
-class LinearSmoother
+struct alignas(32) LinearSmoother
 {
 public:
     static constexpr float epsilon = 1e-6f;
@@ -68,11 +56,20 @@ public:
     void reset(double sampleRate, float rampTimeMilliseconds, float initialValue = 0.0f) noexcept;
     void setTargetValue(float newTarget) noexcept;
     float getNextValue() noexcept;
+    
     [[nodiscard]] float getCurrentValue() const noexcept { return current; }
     [[nodiscard]] float getTargetValue() const noexcept { return target; }
+    
     void setCurrentAndTargetValue(float value) noexcept;
     [[nodiscard]] bool isSmoothing() const noexcept;
     void skip() noexcept;
+
+    /**
+     * @brief Block processing for SIMD optimization.
+     * @param buffer Pointer to the audio block float array.
+     * @param numSamples Number of samples to process.
+     * @param multiply If true, acts as a gain multiplier (buffer[i] *= val). Otherwise, offsets (buffer[i] += val).
+     */
     void processBlock(float* buffer, int numSamples, bool multiply = false) noexcept;
 
 private:
@@ -87,11 +84,9 @@ private:
  * @class ExponentialSmoother
  * @brief Exponential (multiplicative) smoother for natural, perceptual responses.
  *
- * Use for: Filter cutoffs, resonances, frequencies (e.g., EQ bands), volumes in dB.
- * Pros: Natural sounding (fast initial, slow final); suits log scales; low CPU.
- * Cons: Asymptotic (never exactly reaches target); cannot smooth to zero (handled with epsilon).
+ * Use for: Filter cutoffs, frequencies, volumes in dB.
  */
-class ExponentialSmoother
+struct alignas(32) ExponentialSmoother
 {
 public:
     static constexpr float epsilon = 1e-10f;
@@ -99,8 +94,10 @@ public:
     void reset(double sampleRate, float timeConstantMilliseconds, float initialValue = 1.0f) noexcept;
     void setTargetValue(float newTarget) noexcept;
     float getNextValue() noexcept;
+    
     [[nodiscard]] float getCurrentValue() const noexcept { return current; }
     [[nodiscard]] float getTargetValue() const noexcept { return target; }
+    
     void setCurrentAndTargetValue(float value) noexcept;
     [[nodiscard]] bool isSmoothing() const noexcept;
     void skip() noexcept;
@@ -108,7 +105,7 @@ public:
 private:
     float current    = 1.0f;
     float target     = 1.0f;
-    float coeff      = 0.0f;  ///< Multiplicative factor per sample.
+    float coeff      = 0.0f;
     int   stepsToGo  = 0;
     int   totalSteps = 0;
 };
@@ -117,12 +114,9 @@ private:
  * @class OnePoleSmoother
  * @brief Authentic one-pole exponential IIR low-pass smoother.
  *
- * Implements standard one-pole formula: y = target + coeff * (y - target), with coeff = exp(-1 / tau).
- * Use for: General parameter smoothing; cutoffs, delays for "analog feel".
- * Pros: Very low CPU (1 op per sample); gentle 6dB/oct roll-off; exponential decay.
- * Cons: Phase lag; asymptotic (cut at 99.9% for practical use).
+ * Implements analog-style smoothing. Anti-denormal protected.
  */
-class OnePoleSmoother
+struct alignas(32) OnePoleSmoother
 {
 public:
     static constexpr float epsilon = 1e-6f;
@@ -130,6 +124,7 @@ public:
     void reset(double sampleRate, float timeConstantMilliseconds, float initialValue = 0.0f) noexcept;
     void setTargetValue(float newTarget) noexcept;
     float getNextValue() noexcept;
+    
     [[nodiscard]] float getCurrentValue() const noexcept { return current; }
     [[nodiscard]] float getTargetValue() const noexcept { return target; }
     [[nodiscard]] bool isSmoothing() const noexcept;
@@ -143,15 +138,10 @@ private:
 
 /**
  * @class MultiPoleSmoother
- * @brief Templated cascaded multi-pole smoother for steeper roll-off (fixed order at compile-time).
- *
- * Chains N OnePoleSmoother instances; RT-safe with std::array.
- * Use for: Higher-order smoothing in modulation effects.
- * Pros: Steeper roll-off (6N dB/oct); smoother than single-pole.
- * Cons: Increased lag; slightly higher CPU (N ops per sample).
+ * @brief Templated cascaded multi-pole smoother for steeper roll-off.
  */
 template <std::size_t N>
-class MultiPoleSmoother
+struct alignas(32) MultiPoleSmoother
 {
 public:
     static constexpr float epsilon = 1e-6f;
@@ -168,13 +158,9 @@ private:
 
 /**
  * @class AsymmetricSmoother
- * @brief Smoother with asymmetric attack/release times (direction-dependent coeffs).
- *
- * Use for: Dynamics params like compressor thresholds, gates; envelopes needing fast attack/slow release.
- * Pros: Fine control over response asymmetry.
- * Cons: Slightly more complex; still asymptotic.
+ * @brief Smoother with asymmetric attack/release times.
  */
-class AsymmetricSmoother
+struct alignas(32) AsymmetricSmoother
 {
 public:
     static constexpr float epsilon = 1e-6f;
@@ -194,13 +180,9 @@ private:
 
 /**
  * @class SlewLimiter
- * @brief Rate limiter to cap maximum change per sample (no shape smoothing).
- *
- * Use for: Delay times, pitches; params sensitive to rapid changes.
- * Pros: Prevents jumps; maintains derivative continuity; very low CPU.
- * Cons: No actual smoothing curve; can distort if rate too low.
+ * @brief Rate limiter to cap maximum change per sample.
  */
-class SlewLimiter
+struct alignas(32) SlewLimiter
 {
 public:
     static constexpr float epsilon = 1e-6f;
@@ -219,14 +201,9 @@ private:
 
 /**
  * @class StateVariableSmoother
- * @brief Second-order state variable filter (SVF) smoother with proper TPT implementation.
- *
- * Complete TPT (Topology-Preserving Transform) structure for maximum stability.
- * Use for: Synth-like parameter smoothing; advanced smoothing with resonance control.
- * Pros: Extremely stable at any Q; authentic analog response; versatile.
- * Cons: Higher CPU than simple smoothers; more complex math.
+ * @brief Second-order state variable filter (SVF) smoother (TPT implementation).
  */
-class StateVariableSmoother
+struct alignas(32) StateVariableSmoother
 {
 public:
     static constexpr float epsilon = 1e-6f;
@@ -234,10 +211,12 @@ public:
     void reset(double sampleRate, float timeConstantMilliseconds, float q = 0.707f, float initialValue = 0.0f) noexcept;
     void setTargetValue(float newTarget) noexcept;
     float getNextValue() noexcept;
+    
     [[nodiscard]] float getCurrentValue() const noexcept { return lowpass; }
     [[nodiscard]] float getTargetValue() const noexcept { return target; }
     [[nodiscard]] bool isSmoothing() const noexcept;
     void skip() noexcept;
+    
     [[nodiscard]] float getBandPassOutput() const noexcept { return bandpass; }
     [[nodiscard]] float getHighPassOutput() const noexcept { return highpass; }
 
@@ -258,13 +237,8 @@ private:
 /**
  * @class ButterworthSmoother
  * @brief Butterworth low-pass smoother for maximally flat response.
- *
- * Second-order IIR with fixed Q=1/sqrt(2) for Butterworth.
- * Use for: Params needing flat passband; EQ cutoffs without ripple.
- * Pros: Maximally flat (no ripple); good for accurate smoothing.
- * Cons: Phase distortion; fixed Q.
  */
-class ButterworthSmoother
+struct alignas(32) ButterworthSmoother
 {
 public:
     static constexpr float epsilon = 1e-6f;
@@ -278,18 +252,16 @@ public:
 private:
     float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
     float a1 = 0.0f, a2 = 0.0f;
-    float s1 = 0.0f, s2 = 0.0f;  // TDF-II state variables (replaces DF-I x1/x2/y1/y2)
-    float target = 0.0f;
+    float s1 = 0.0f, s2 = 0.0f; 
+    float target  = 0.0f;
+    float lastOut = 0.0f; 
 };
 
 /**
  * @class CriticallyDampedSmoother
- * @brief Critically damped smoother (no overshoot, Q=0.707).
- *
- * Uses SVF with fixed Q=0.707 for fastest settling without oscillation.
- * Use for: Params needing quick, non-oscillatory response (e.g., envelopes).
+ * @brief Critically damped smoother (no overshoot, exact Q=0.5).
  */
-class CriticallyDampedSmoother : public StateVariableSmoother
+struct alignas(32) CriticallyDampedSmoother : public StateVariableSmoother
 {
 public:
     void reset(double sampleRate, float timeConstantMilliseconds, float initialValue = 0.0f) noexcept;
@@ -352,10 +324,24 @@ inline void Smoothers::LinearSmoother::skip() noexcept
 
 inline void Smoothers::LinearSmoother::processBlock(float* buffer, int numSamples, bool multiply) noexcept
 {
-    for (int i = 0; i < numSamples; ++i)
+    // Optimizacion SIMD: Dividir bucle transitorio del bucle de estado constante
+    int stepsToProcess = std::min(numSamples, stepsToGo);
+    int i = 0;
+
+    // Smooth section (Branchless en el core del loop)
+    for (; i < stepsToProcess; ++i)
     {
-        auto val = getNextValue();
-        buffer[i] = multiply ? buffer[i] * val : buffer[i] + val;
+        current += step;
+        buffer[i] = multiply ? buffer[i] * current : buffer[i] + current;
+    }
+    
+    stepsToGo -= stepsToProcess;
+    if (stepsToGo == 0) current = target;
+
+    // Constant section (Alta vectorización asegurada)
+    for (; i < numSamples; ++i)
+    {
+        buffer[i] = multiply ? buffer[i] * target : buffer[i] + target;
     }
 }
 
@@ -381,14 +367,13 @@ inline void Smoothers::ExponentialSmoother::setTargetValue(float newTarget) noex
 
     if (stepsToGo > 0 && std::abs(current) > epsilon)
     {
-        // current is verified non-zero; clamp to satisfy static analysis (C4723)
         float safeCur = (current > 0.0f) ? std::max(current, epsilon)
                                          : std::min(current, -epsilon);
         float ratio = target / safeCur;
-        if (ratio > 0.0f) // Same sign — exponential interpolation is valid
+        if (ratio > 0.0f) 
             coeff = std::exp(std::log(ratio) / static_cast<float>(stepsToGo));
         else
-            current = target; // Cross-zero — exponential undefined, jump
+            current = target; 
     }
     else
         current = target;
@@ -439,6 +424,7 @@ inline void Smoothers::OnePoleSmoother::setTargetValue(float newTarget) noexcept
 
 inline float Smoothers::OnePoleSmoother::getNextValue() noexcept
 {
+    if (!isSmoothing()) { skip(); return target; } // Anti-denormal check
     current = target + coeff * (current - target);
     return current;
 }
@@ -513,6 +499,7 @@ inline void Smoothers::AsymmetricSmoother::setTargetValue(float newTarget) noexc
 
 inline float Smoothers::AsymmetricSmoother::getNextValue() noexcept
 {
+    if (!isSmoothing()) { skip(); return target; } // Anti-denormal check
     float c = (target > current) ? attackCoeff : releaseCoeff;
     current = target + c * (current - target);
     return current;
@@ -569,7 +556,7 @@ inline void Smoothers::StateVariableSmoother::reset(double sampleRate, float tim
     float fs = static_cast<float>(sampleRate);
 
     g = std::tan(Constants::pi * fc / fs);
-    k = 2.0f * (1.0f / q);
+    k = 1.0f / q; // CORREGIDO: TPT damping usa k = 1/Q. 
 
     a1 = 1.0f / (1.0f + g * (g + k));
     a2 = g * a1;
@@ -590,6 +577,8 @@ inline void Smoothers::StateVariableSmoother::setTargetValue(float newTarget) no
 
 inline float Smoothers::StateVariableSmoother::getNextValue() noexcept
 {
+    if (!isSmoothing()) { skip(); return target; } // Anti-denormal check
+    
     float v0 = target;
     float v3 = v0 - v2;
     float v1_new = a1 * v1 + a2 * v3;
@@ -637,10 +626,10 @@ inline void Smoothers::ButterworthSmoother::reset(double sampleRate, float timeC
     a1 = 2.0f * (tanw2 - 1.0f) / denom;
     a2 = (1.0f - Constants::sqrt2 * tanw + tanw2) / denom;
 
-    // TDF-II steady-state: s1 = (b1 - a1)*val, s2 = (b2 - a2)*val
     s1 = (b1 - a1) * initialValue;
     s2 = (b2 - a2) * initialValue;
     target = initialValue;
+    lastOut = initialValue;
 }
 
 inline void Smoothers::ButterworthSmoother::setTargetValue(float newTarget) noexcept
@@ -650,33 +639,35 @@ inline void Smoothers::ButterworthSmoother::setTargetValue(float newTarget) noex
 
 inline float Smoothers::ButterworthSmoother::getNextValue() noexcept
 {
-    // Transposed Direct Form II — superior numerical stability at low cutoffs
+    if (!isSmoothing()) { skip(); return target; } // Anti-denormal check
+    
     float x0 = target;
     float y0 = b0 * x0 + s1;
     s1 = b1 * x0 - a1 * y0 + s2;
     s2 = b2 * x0 - a2 * y0;
+    
+    lastOut = y0;
     return y0;
 }
 
 inline bool Smoothers::ButterworthSmoother::isSmoothing() const noexcept
 {
-    // Check if last output (b0*target + s1) is close to target
-    float lastOut = b0 * target + s1;
-    return std::abs(lastOut - target) > epsilon;
+    return std::abs(lastOut - target) > epsilon; // CORREGIDO: Utilizar lastOut cacheado
 }
 
 inline void Smoothers::ButterworthSmoother::skip() noexcept
 {
-    // TDF-II steady-state for DC input = target
     s1 = (b1 - a1) * target;
     s2 = (b2 - a2) * target;
+    lastOut = target;
 }
 
 // --- CriticallyDampedSmoother ---
 
 inline void Smoothers::CriticallyDampedSmoother::reset(double sampleRate, float timeConstantMilliseconds, float initialValue) noexcept
 {
-    StateVariableSmoother::reset(sampleRate, timeConstantMilliseconds, 0.707f, initialValue);
+    // CORREGIDO: La amortiguación crítica (zeta = 1) corresponde exactamente a Q = 0.5f, no a Q = 0.707 (Butterworth).
+    StateVariableSmoother::reset(sampleRate, timeConstantMilliseconds, 0.5f, initialValue);
 }
 
 } // namespace dspark

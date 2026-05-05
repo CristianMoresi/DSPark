@@ -5,26 +5,17 @@
 
 /**
  * @file Crossfade.h
- * @brief Crossfade between two audio signals with selectable curve.
+ * @brief Crossfade between two audio signals with selectable curve and artifact-free parameter smoothing.
  *
- * Provides three crossfade curves for smooth transitions between audio sources.
- * Useful for preset morphing, scene transitions, A/B comparison, and layer mixing.
+ * Provides highly optimized crossfade curves for audio transitions. Designed for zero-allocation
+ * real-time contexts, featuring automatic block-level parameter smoothing to prevent zipper noise.
  *
  * Curves:
- * - **Linear:** Constant sum (A * (1-t) + B * t). Simple but has a -6 dB dip at centre.
- * - **EqualPower:** Constant power (A * cos(t*pi/2) + B * sin(t*pi/2)). No level dip.
- * - **SCurve:** Smooth S-curve (smoothstep). Starts and ends slowly, fast in the middle.
+ * - **Linear:** Constant sum (A * (1-t) + B * t). Fast, but exhibits a -6 dB power dip at the center for uncorrelated signals.
+ * - **EqualPower:** Constant energy (A^2 + B^2 = 1). Utilizes hardware-accelerated SQRT approximation. Perfect for uncorrelated audio.
+ * - **SCurve:** Smoothstep S-curve. Provides a perceptually smoother transition speed, though it shares the -6 dB center dip of the Linear curve.
  *
- * Dependencies: DspMath.h.
- *
- * @code
- *   dspark::Crossfade<float> xfade;
- *   xfade.setCurve(dspark::Crossfade<float>::Curve::EqualPower);
- *   xfade.setPosition(0.5f);  // 50% blend
- *
- *   for (int i = 0; i < numSamples; ++i)
- *       output[i] = xfade.process(inputA[i], inputB[i]);
- * @endcode
+ * Dependencies: DspMath.h, <cassert>
  */
 
 #include "../Core/DspMath.h"
@@ -32,43 +23,52 @@
 #include <atomic>
 #include <cmath>
 #include <numbers>
+#include <algorithm>
+#include <cassert>
 
 namespace dspark {
 
 /**
  * @class Crossfade
- * @brief Crossfades between two signals with configurable curve.
+ * @brief Artifact-free, SIMD-friendly crossfader for two audio signals.
  *
- * @tparam T Sample type (float or double).
+ * Marked as final to explicitly prohibit inheritance and avoid vtable overhead,
+ * adhering to the framework's zero virtual dispatch policy in DSP nodes.
+ *
+ * @tparam T Sample type (float or double). Requires std::is_floating_point_v<T>.
  */
 template <FloatType T>
-class Crossfade
+class Crossfade final
 {
 public:
-    virtual ~Crossfade() = default;
-    /** @brief Crossfade curve type. */
+    /** @brief Defines the amplitude response of the crossfade transition. */
     enum class Curve
     {
-        Linear,     ///< Linear interpolation (constant sum).
-        EqualPower, ///< Equal-power crossfade (constant energy).
-        SCurve      ///< Smooth S-curve (smoothstep).
+        Linear,     ///< Linear interpolation. Constant amplitude, drops power at center.
+        EqualPower, ///< Equal power interpolation (hardware SQRT). Constant power, no volume drop.
+        SCurve      ///< Smoothstep interpolation. Slower progression at extremes.
     };
 
-    /**
-     * @brief Sets the crossfade curve.
-     * @param curve Curve type.
-     */
-    void setCurve(Curve curve) noexcept { curve_.store(curve, std::memory_order_relaxed); }
+    Crossfade() = default;
+    ~Crossfade() = default;
 
     /**
-     * @brief Sets the crossfade position.
+     * @brief Sets the crossfade curve type.
+     * Thread-safe. Can be called from the GUI thread.
+     * @param curve The desired crossfade curve.
+     */
+    void setCurve(Curve curve) noexcept 
+    { 
+        curve_.store(curve, std::memory_order_relaxed); 
+    }
+
+    /**
+     * @brief Sets the target crossfade blend position.
      *
-     * Thread-safe: only publishes the new position atomically. The gain pair
-     * (gainA_, gainB_) is recomputed lazily by the audio-thread hot path on
-     * next use — avoids torn-pair reads that would break the constant-power
-     * invariant (gainA² + gainB² = 1) during concurrent updates.
+     * Thread-safe. Updates are smoothed automatically over the next processed audio block
+     * to eliminate zipper noise and clicks.
      *
-     * @param position Blend position: 0.0 = 100% A, 1.0 = 100% B.
+     * @param position Target blend: 0.0 = 100% A, 1.0 = 100% B. Automatically clamped [0, 1].
      */
     void setPosition(T position) noexcept
     {
@@ -76,88 +76,128 @@ public:
     }
 
     /**
-     * @brief Returns the current position.
+     * @brief Retrieves the last requested position.
+     * @return Current requested blend position [0, 1].
      */
-    [[nodiscard]] T getPosition() const noexcept { return position_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getPosition() const noexcept 
+    { 
+        return position_.load(std::memory_order_relaxed); 
+    }
 
     /**
-     * @brief Crossfades between two samples.
+     * @brief Crossfades between two individual samples.
      *
-     * NOTE: no longer `const` — the call refreshes the cached gain pair when
-     * the atomic position changes, which is a state mutation. Only callable
-     * from a single (audio) thread.
+     * @warning This method updates internal gain states immediately. It does NOT provide 
+     * parameter smoothing. Use the block-based `process` for artifact-free parameter changes.
+     * Must only be called from the audio thread.
      *
-     * @param a First input sample (dry / scene A).
-     * @param b Second input sample (wet / scene B).
-     * @return Blended output.
+     * @param a Input sample A (Dry/Left).
+     * @param b Input sample B (Wet/Right).
+     * @return Blended output sample.
      */
-    [[nodiscard]] T process(T a, T b) noexcept
+    [[nodiscard]] inline T process(T a, T b) noexcept
     {
         refreshGainsFromAtomics();
         return a * gainA_ + b * gainB_;
     }
 
     /**
-     * @brief Crossfades two buffers into an output buffer.
+     * @brief Crossfades two audio buffers into an output buffer with automatic parameter smoothing.
      *
-     * @param inputA First input buffer.
-     * @param inputB Second input buffer.
-     * @param output Output buffer.
-     * @param numSamples Number of samples.
+     * If the parameter has changed since the last block, this method automatically applies a linear 
+     * ramp to the gains across the block to prevent zipper noise. Otherwise, it executes a highly 
+     * optimized, autovectorization-friendly static gain loop.
+     *
+     * @param inputA Pointer to the first input buffer array. Must not be null.
+     * @param inputB Pointer to the second input buffer array. Must not be null.
+     * @param output Pointer to the output buffer array. Must not be null.
+     * @param numSamples Number of samples to process. Must be > 0.
      */
-    void process(const T* inputA, const T* inputB, T* output,
-                 int numSamples) noexcept
+    void process(const T* inputA, const T* inputB, T* output, int numSamples) noexcept
     {
+        assert(inputA != nullptr && inputB != nullptr && output != nullptr);
+        assert(numSamples > 0);
+
+        const T oldGainA = gainA_;
+        const T oldGainB = gainB_;
+
         refreshGainsFromAtomics();
-        const T gA = gainA_;
-        const T gB = gainB_;
-        for (int i = 0; i < numSamples; ++i)
-            output[i] = inputA[i] * gA + inputB[i] * gB;
+
+        if (oldGainA == gainA_ && oldGainB == gainB_)
+        {
+            // Hot-path: No parameter change. Ideal for SIMD autovectorization.
+            const T gA = gainA_;
+            const T gB = gainB_;
+            for (int i = 0; i < numSamples; ++i)
+                output[i] = inputA[i] * gA + inputB[i] * gB;
+        }
+        else
+        {
+            // Parameter change detected: Apply linear block smoothing (De-zippering)
+            const T invSamples = T(1) / static_cast<T>(numSamples);
+            const T stepA = (gainA_ - oldGainA) * invSamples;
+            const T stepB = (gainB_ - oldGainB) * invSamples;
+
+            T currentA = oldGainA;
+            T currentB = oldGainB;
+
+            for (int i = 0; i < numSamples; ++i)
+            {
+                currentA += stepA;
+                currentB += stepB;
+                output[i] = inputA[i] * currentA + inputB[i] * currentB;
+            }
+        }
     }
 
     /**
-     * @brief Crossfades with per-sample position automation.
+     * @brief Processes crossfading using a per-sample automation buffer.
      *
-     * @param inputA First input buffer.
-     * @param inputB Second input buffer.
-     * @param positions Per-sample position values (0 to 1).
-     * @param output Output buffer.
-     * @param numSamples Number of samples.
+     * Extremely CPU intensive if used with heavy curves. EqualPower uses hardware SQRT 
+     * to maintain real-time viability under per-sample automation.
+     *
+     * @param inputA Pointer to the first input buffer.
+     * @param inputB Pointer to the second input buffer.
+     * @param positions Array of target positions [0, 1] per sample.
+     * @param output Pointer to the output buffer.
+     * @param numSamples Number of samples to process.
      */
     void processAutomated(const T* inputA, const T* inputB,
-                          const T* positions, T* output,
-                          int numSamples) noexcept
+                          const T* positions, T* output, int numSamples) noexcept
     {
+        assert(inputA && inputB && positions && output);
+        assert(numSamples > 0);
+
         Curve curv = curve_.load(std::memory_order_relaxed);
+        T gA, gB;
+
         for (int i = 0; i < numSamples; ++i)
         {
             T pos = std::clamp(positions[i], T(0), T(1));
-            // Recompute locally — no shared state writes.
-            T gA, gB;
             computeGains(curv, pos, gA, gB);
             output[i] = inputA[i] * gA + inputB[i] * gB;
         }
-        // Publish the last position so subsequent static-position calls see a
-        // consistent value with the automation's endpoint.
-        position_.store(std::clamp(positions[numSamples - 1], T(0), T(1)),
-                        std::memory_order_relaxed);
-        lastPos_    = position_.load(std::memory_order_relaxed);
-        lastCurve_  = curv;
-        computeGains(curv, lastPos_, gainA_, gainB_);
+
+        // Update internal state to match the end of the automation block.
+        // NOTE: We DO NOT write back to the atomic position_ to avoid Data Races 
+        // with the GUI thread. We only update the audio-thread local cache.
+        lastPos_ = std::clamp(positions[numSamples - 1], T(0), T(1));
+        lastCurve_ = curv;
+        gainA_ = gA;
+        gainB_ = gB;
     }
 
-    /**
-     * @brief Returns the current gain for signal A.
-     */
+    /** @brief Gets the current internal gain multiplier for signal A. */
     [[nodiscard]] T getGainA() const noexcept { return gainA_; }
 
-    /**
-     * @brief Returns the current gain for signal B.
-     */
+    /** @brief Gets the current internal gain multiplier for signal B. */
     [[nodiscard]] T getGainB() const noexcept { return gainB_; }
 
-protected:
-    static void computeGains(Curve curve, T pos, T& gA, T& gB) noexcept
+private:
+    /**
+     * @brief Computes raw gain values based on the requested curve and position.
+     */
+    static inline void computeGains(Curve curve, T pos, T& gA, T& gB) noexcept
     {
         switch (curve)
         {
@@ -167,12 +207,12 @@ protected:
                 break;
 
             case Curve::EqualPower:
-            {
-                constexpr T halfPi = pi<T> / T(2);
-                gA = std::cos(pos * halfPi);
-                gB = std::sin(pos * halfPi);
+                // SIMD Optimization: Replaced std::cos/sin with hardware-accelerated std::sqrt.
+                // sqrt(1-x)^2 + sqrt(x)^2 = (1-x) + x = 1.0 (Constant Power).
+                // Avoids heavy trigonometric penalties while maintaining identical energetic response.
+                gA = std::sqrt(T(1) - pos);
+                gB = std::sqrt(pos);
                 break;
-            }
 
             case Curve::SCurve:
             {
@@ -184,13 +224,14 @@ protected:
         }
     }
 
-    /// Audio-thread-only: refreshes gainA_/gainB_ if atomic position or curve
-    /// has changed since the last call. Cheap branch for the common no-change
-    /// case; cos/sin only on actual automation.
-    void refreshGainsFromAtomics() noexcept
+    /**
+     * @brief Syncs GUI-driven atomic changes into the audio thread cache.
+     */
+    inline void refreshGainsFromAtomics() noexcept
     {
         T pos = position_.load(std::memory_order_relaxed);
         Curve curv = curve_.load(std::memory_order_relaxed);
+        
         if (pos != lastPos_ || curv != lastCurve_)
         {
             computeGains(curv, pos, gainA_, gainB_);
@@ -199,13 +240,14 @@ protected:
         }
     }
 
+    // Communication: GUI -> Audio Thread
     std::atomic<Curve> curve_ { Curve::EqualPower };
     std::atomic<T> position_ { T(0) };
-    // Audio-thread-owned cache: written only by refreshGainsFromAtomics() /
-    // processAutomated(), never by the GUI setters.
+    
+    // Audio Thread Local State (Cache)
     T gainA_ = T(1);
     T gainB_ = T(0);
-    T lastPos_ = T(-1);  // sentinel: first process() call always recomputes
+    T lastPos_ = T(-1);  // Sentinel to force initial compute
     Curve lastCurve_ = Curve::EqualPower;
 };
 

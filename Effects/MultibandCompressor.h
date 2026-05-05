@@ -9,35 +9,20 @@
  *
  * Splits the signal into 2–12 frequency bands using a Linkwitz-Riley crossover,
  * compresses each band independently, then sums the bands back together.
- * Each band's compressor is fully configurable with all Compressor features
- * (threshold, ratio, attack, release, knee, character, etc.).
+ * Includes safety bounds and phase-alignment awareness.
  *
  * Dependencies: CrossoverFilter.h, Compressor.h, AudioBuffer.h.
- *
- * @code
- *   dspark::MultibandCompressor<float> mbc;
- *   mbc.setNumBands(3);
- *   mbc.setCrossoverFrequency(0, 200.0f);
- *   mbc.setCrossoverFrequency(1, 2000.0f);
- *   mbc.prepare(spec);
- *
- *   // Configure per-band compression
- *   mbc.getBandCompressor(0).setThreshold(-20.0f);  // low band
- *   mbc.getBandCompressor(0).setRatio(4.0f);
- *   mbc.getBandCompressor(1).setThreshold(-15.0f);  // mid band
- *   mbc.getBandCompressor(2).setThreshold(-10.0f);  // high band
- *
- *   mbc.processBlock(buffer);
- * @endcode
  */
 
 #include "CrossoverFilter.h"
 #include "Compressor.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/DspMath.h"
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 
 namespace dspark {
 
@@ -54,6 +39,10 @@ class MultibandCompressor
 public:
     // -- Lifecycle -----------------------------------------------------------
 
+    /**
+     * @brief Prepares the multiband compressor and internal buffers for processing.
+     * @param spec The audio specification (sample rate, max block size, channels).
+     */
     void prepare(const AudioSpec& spec)
     {
         spec_ = spec;
@@ -68,16 +57,13 @@ public:
             compressors_[b].prepare(spec);
         }
 
-        // Build views array
         updateViews();
-
         prepared_ = true;
     }
 
     /**
      * @brief Processes audio through the multi-band compressor.
-     *
-     * Splits → compresses each band → sums back into the buffer.
+     * @param buffer In/Out audio buffer view.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
@@ -87,53 +73,78 @@ public:
         const int nS  = buffer.getNumSamples();
         const int nb  = crossover_.getNumBands();
 
-        // Build truncated views for this block (A11 fix).
-        //
-        // bandBuffers_ are sized to spec.maxBlockSize, but a given block may
-        // be smaller (the host is allowed to call with any nS ≤ maxBlockSize).
-        // Passing the full-capacity view would cause the crossover and each
-        // compressor to process stale samples beyond nS, corrupting state and
-        // burning CPU on data the host will not read. Truncating to nS keeps
-        // processing and the envelope detector tied to the actual block size.
+        // 1. Truncate views to actual block size (A11 fix)
         for (int b = 0; b < nb; ++b)
             views_[b] = bandBuffers_[b].toView().getSubView(0, nS);
 
-        // Split into bands
+        // 2. Split into bands
         crossover_.processBlock(buffer, views_.data(), nb);
 
-        // Compress each band independently
+        // 3. Compress each band independently
+        // Note: If Compressor<T> introduces Lookahead, delay compensation 
+        // per band MUST be applied here before summing to avoid phase cancellation.
         for (int b = 0; b < nb; ++b)
             compressors_[b].processBlock(views_[b]);
 
-        // Sum bands back into output buffer
+        // 4. Sum bands back into output buffer (Optimized for SIMD)
         for (int ch = 0; ch < nCh; ++ch)
         {
-            T* out = buffer.getChannel(ch);
-            // Start with band 0
-            const T* src0 = bandBuffers_[0].getChannel(ch);
+            T* const __restrict out = buffer.getChannel(ch);
+            const T* const __restrict src0 = bandBuffers_[0].getChannel(ch);
+            
+            // Base copy (band 0)
             std::copy(src0, src0 + nS, out);
 
-            // Add remaining bands
+            // Accumulate remaining active bands
             for (int b = 1; b < nb; ++b)
             {
-                const T* src = bandBuffers_[b].getChannel(ch);
+                const T* const __restrict src = bandBuffers_[b].getChannel(ch);
+                
+                // Explicit auto-vectorization hint pattern
+                #pragma omp simd
                 for (int i = 0; i < nS; ++i)
+                {
                     out[i] += src[i];
+                }
             }
         }
     }
 
     // -- Configuration -------------------------------------------------------
 
-    void setNumBands(int n) noexcept { crossover_.setNumBands(n); }
+    /**
+     * @brief Sets the number of active frequency bands.
+     * @warning Must not be called concurrently with processBlock() unless external locking is used.
+     * @param n Number of bands (clamped between 1 and MaxBands).
+     */
+    void setNumBands(int n) noexcept 
+    { 
+        crossover_.setNumBands(std::clamp(n, 1, MaxBands)); 
+    }
 
+    /**
+     * @brief Sets the crossover frequency for a specific split point.
+     * @param index Split point index (0 is between band 0 and 1).
+     * @param freqHz Target frequency in Hertz.
+     */
     void setCrossoverFrequency(int index, T freqHz) noexcept
     {
         crossover_.setCrossoverFrequency(index, freqHz);
     }
 
-    void setOrder(int order) noexcept { crossover_.setOrder(order); }
+    /**
+     * @brief Sets the filter order for the Linkwitz-Riley crossover (e.g., 2, 4, 8).
+     * @param order Filter order (even numbers typically).
+     */
+    void setOrder(int order) noexcept 
+    { 
+        crossover_.setOrder(order); 
+    }
 
+    /**
+     * @brief Sets the phase/processing mode of the crossover (e.g., IIR, FIR).
+     * @param mode Selected filter mode from the CrossoverFilter enum.
+     */
     void setCrossoverMode(typename CrossoverFilter<T, MaxBands>::FilterMode mode) noexcept
     {
         crossover_.setFilterMode(mode);
@@ -143,38 +154,68 @@ public:
 
     /**
      * @brief Direct access to a band's compressor for full configuration.
-     * @param band Band index (0 to numBands-1).
+     * @param band Band index. Clamped safely to valid range in release mode.
+     * @return Reference to the requested Compressor.
      */
     [[nodiscard]] Compressor<T>& getBandCompressor(int band) noexcept
     {
-        return compressors_[band];
+        assert(band >= 0 && band < MaxBands);
+        int safeBand = std::clamp(band, 0, MaxBands - 1);
+        return compressors_[safeBand];
     }
 
+    /**
+     * @brief Direct constant access to a band's compressor for state queries.
+     * @param band Band index. Clamped safely to valid range in release mode.
+     * @return Const reference to the requested Compressor.
+     */
     [[nodiscard]] const Compressor<T>& getBandCompressor(int band) const noexcept
     {
-        return compressors_[band];
+        assert(band >= 0 && band < MaxBands);
+        int safeBand = std::clamp(band, 0, MaxBands - 1);
+        return compressors_[safeBand];
     }
 
     // -- Convenience per-band setters ----------------------------------------
 
+    /**
+     * @brief Sets the threshold for a specific band.
+     * @param band Target band index.
+     * @param dB Threshold in decibels.
+     */
     void setBandThreshold(int band, T dB) noexcept
     {
         if (band >= 0 && band < MaxBands)
             compressors_[band].setThreshold(dB);
     }
 
+    /**
+     * @brief Sets the ratio for a specific band.
+     * @param band Target band index.
+     * @param ratio Compression ratio (e.g., 4.0 for 4:1).
+     */
     void setBandRatio(int band, T ratio) noexcept
     {
         if (band >= 0 && band < MaxBands)
             compressors_[band].setRatio(ratio);
     }
 
+    /**
+     * @brief Sets the attack time for a specific band.
+     * @param band Target band index.
+     * @param ms Attack time in milliseconds.
+     */
     void setBandAttack(int band, T ms) noexcept
     {
         if (band >= 0 && band < MaxBands)
             compressors_[band].setAttack(ms);
     }
 
+    /**
+     * @brief Sets the release time for a specific band.
+     * @param band Target band index.
+     * @param ms Release time in milliseconds.
+     */
     void setBandRelease(int band, T ms) noexcept
     {
         if (band >= 0 && band < MaxBands)
@@ -183,16 +224,29 @@ public:
 
     // -- Queries -------------------------------------------------------------
 
+    /**
+     * @brief Gets the current gain reduction applied to a specific band.
+     * @param band Target band index.
+     * @return Gain reduction in decibels (typically <= 0.0).
+     */
     [[nodiscard]] T getBandGainReductionDb(int band) const noexcept
     {
         if (band < 0 || band >= MaxBands) return T(0);
         return compressors_[band].getGainReductionDb();
     }
 
+    /** @brief Returns the current number of active bands. */
     [[nodiscard]] int getNumBands() const noexcept { return crossover_.getNumBands(); }
-    [[nodiscard]] int getLatency() const noexcept { return crossover_.getLatency(); }
+    
+    /** @brief Returns the total latency of the multi-band system. */
+    [[nodiscard]] int getLatency() const noexcept 
+    { 
+        // Note: If compressors have variable lookahead, maximum latency among 
+        // active bands + crossover latency should be returned here.
+        return crossover_.getLatency(); 
+    }
 
-    /** @brief Resets all internal state. */
+    /** @brief Resets all internal states (envelopes, delay lines, etc.). */
     void reset() noexcept
     {
         crossover_.reset();

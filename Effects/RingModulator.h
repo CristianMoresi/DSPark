@@ -9,7 +9,8 @@
  *
  * Produces sum and difference frequencies by multiplying the input signal
  * with a sine wave carrier. Classic effect for metallic, bell-like, or
- * robotic tones. Includes a dry/wet mix control.
+ * robotic tones. Includes a dry/wet mix control and parameter smoothing
+ * to prevent zipper noise during real-time automation.
  *
  * Dependencies: Phasor.h, DspMath.h, AudioSpec.h, AudioBuffer.h.
  *
@@ -30,6 +31,7 @@
 #include "../Core/Phasor.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <numbers>
@@ -38,11 +40,11 @@ namespace dspark {
 
 /**
  * @class RingModulator
- * @brief Signal × carrier ring modulation with mix control.
+ * @brief Signal × carrier ring modulation with mix control and zero-latency smoothing.
  *
- * Uses a single shared carrier oscillator for all channels (coherent
- * modulation). The carrier is a pure sine — for richer timbres, chain
- * with a WaveshapeTable on the carrier or use multiple instances.
+ * Uses a single shared carrier oscillator for all channels ensuring phase
+ * coherence. Optimized for SIMD vectorization and CPU cache locality via
+ * internal chunk-based processing.
  *
  * @tparam T Sample type (float or double).
  */
@@ -50,71 +52,134 @@ template <FloatType T>
 class RingModulator
 {
 public:
-    /** @brief Modulation mode. */
+    /** @brief Modulation mathematical mode. */
     enum class Mode
     {
         Classic,        ///< Standard multiplication (sum & difference frequencies).
-        GeometricMean   ///< Geometric-mean mode: sqrt(|in|*|carrier|) * sign — more musical.
+        GeometricMean   ///< Geometric-mean mode: sqrt(|in|*|carrier|) * sign — richer, more musical.
     };
 
+    /**
+     * @brief Prepares the modulator for audio processing.
+     * @param spec Audio specification including sample rate and channels.
+     */
     void prepare(const AudioSpec& spec)
     {
         phasor_.prepare(spec.sampleRate);
-        phasor_.setFrequency(frequency_.load(std::memory_order_relaxed));
+        
+        T initialFreq = frequency_.load(std::memory_order_relaxed);
+        T initialMix = mix_.load(std::memory_order_relaxed);
+        
+        phasor_.setFrequency(initialFreq);
+        currentFreq_ = initialFreq;
+        currentMix_ = initialMix;
         numChannels_ = spec.numChannels;
+        sampleRate_ = static_cast<T>(spec.sampleRate);
     }
 
+    /**
+     * @brief Processes a block of audio in-place.
+     * @param buffer View of the audio buffer to process.
+     */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        int numCh = std::min(buffer.getNumChannels(), numChannels_);
-        int numSamples = buffer.getNumSamples();
+        const int numCh = std::min(buffer.getNumChannels(), numChannels_);
+        const int numSamples = buffer.getNumSamples();
+        if (numSamples <= 0 || numCh <= 0) return;
 
-        T freq = frequency_.load(std::memory_order_relaxed);
-        T mixVal = mix_.load(std::memory_order_relaxed);
-        T soarVal = soar_.load(std::memory_order_relaxed);
-        auto modeVal = mode_.load(std::memory_order_relaxed);
+        // Fetch targets for smoothing
+        const T targetFreq = frequency_.load(std::memory_order_relaxed);
+        const T targetMix = mix_.load(std::memory_order_relaxed);
+        const T soarVal = soar_.load(std::memory_order_relaxed);
+        const auto modeVal = mode_.load(std::memory_order_relaxed);
 
-        phasor_.setFrequency(freq);
+        // Calculate smoothing steps
+        const T invSamples = T(1) / static_cast<T>(numSamples);
+        const T freqStep = (targetFreq - currentFreq_) * invSamples;
+        const T mixStep = (targetMix - currentMix_) * invSamples;
 
-        for (int i = 0; i < numSamples; ++i)
+        // Process in L1-cache friendly chunks to allow outer channel loop
+        constexpr int CHUNK_SIZE = 64;
+        std::array<T, CHUNK_SIZE> carrierChunk;
+        std::array<T, CHUNK_SIZE> mixChunk;
+
+        const T twoPi = T(2) * static_cast<T>(std::numbers::pi);
+
+        for (int start = 0; start < numSamples; start += CHUNK_SIZE)
         {
-            T phase = phasor_.advance();
-            T carrier = std::sin(phase * T(2) * static_cast<T>(std::numbers::pi));
+            const int chunkLen = std::min(CHUNK_SIZE, numSamples - start);
 
-            for (int ch = 0; ch < numCh; ++ch)
+            // 1. Precalculate shared carrier and mix block
+            for (int i = 0; i < chunkLen; ++i)
             {
-                T* data = buffer.getChannel(ch);
-                T dry = data[i];
-                T wet;
+                currentFreq_ += freqStep;
+                currentMix_ += mixStep;
+                
+                phasor_.setFrequency(currentFreq_);
+                T phase = phasor_.advance();
+                
+                carrierChunk[i] = std::sin(phase * twoPi);
+                mixChunk[i] = currentMix_;
+            }
 
-                if (modeVal == Mode::GeometricMean)
+            // 2. Process channels with hoisted branches and SIMD-friendly loops
+            if (modeVal == Mode::GeometricMean)
+            {
+                for (int ch = 0; ch < numCh; ++ch)
                 {
-                    // Geometric-mean ring mod: sqrt(|in| * |carrier|) with 4-quadrant sign
-                    T absIn = std::abs(dry);
-                    T absCarrier = std::abs(carrier);
-                    T gm = std::sqrt(absIn * absCarrier + soarVal);
-                    T sign = ((dry >= T(0)) == (carrier >= T(0))) ? T(1) : T(-1);
-                    wet = gm * sign;
-                }
-                else
-                {
-                    wet = dry * carrier;
-                }
+                    T* data = buffer.getChannel(ch) + start;
 
-                data[i] = dry + (wet - dry) * mixVal;
+                    for (int i = 0; i < chunkLen; ++i)
+                    {
+                        const T dry = data[i];
+                        const T carrier = carrierChunk[i];
+                        
+                        const T absIn = std::abs(dry);
+                        const T absCarrier = std::abs(carrier);
+                        
+                        // Scaled soarVal prevents DC offset when input is zero
+                        const T gm = std::sqrt(absIn * absCarrier + soarVal * absIn);
+                        
+                        // Ultra-fast sign evaluation without branching
+                        const T wet = gm * std::copysign(T(1), dry * carrier);
+                        
+                        data[i] = dry + (wet - dry) * mixChunk[i];
+                    }
+                }
+            }
+            else // Mode::Classic
+            {
+                for (int ch = 0; ch < numCh; ++ch)
+                {
+                    T* data = buffer.getChannel(ch) + start;
+
+                    for (int i = 0; i < chunkLen; ++i)
+                    {
+                        const T dry = data[i];
+                        const T wet = dry * carrierChunk[i];
+                        data[i] = dry + (wet - dry) * mixChunk[i];
+                    }
+                }
             }
         }
     }
 
+    /** @brief Resets the internal phase of the carrier oscillator. */
     void reset() noexcept { phasor_.reset(); }
 
-    /** @brief Sets the carrier frequency. */
+    /**
+     * @brief Sets the target carrier frequency. Modulated smoothly.
+     * @param hz Frequency in Hertz.
+     */
     void setFrequency(T hz) noexcept
     {
         frequency_.store(hz, std::memory_order_relaxed);
     }
 
-    /** @brief Sets the dry/wet mix. */
+    /**
+     * @brief Sets the target dry/wet mix. Modulated smoothly.
+     * @param mix Mix value from 0.0 (100% dry) to 1.0 (100% wet).
+     */
     void setMix(T mix) noexcept
     {
         mix_.store(std::clamp(mix, T(0), T(1)), std::memory_order_relaxed);
@@ -122,19 +187,18 @@ public:
 
     /**
      * @brief Sets the modulation mode.
-     *
-     * - **Classic**: Standard multiplication.
-     * - **GeometricMean**: sqrt(|input|*|carrier|) with 4-quadrant sign.
-     *   Produces more musical, less harsh ring modulation.
+     * @param m The chosen structural mode (Classic or GeometricMean).
      */
-    void setMode(Mode m) noexcept { mode_.store(m, std::memory_order_relaxed); }
+    void setMode(Mode m) noexcept 
+    { 
+        mode_.store(m, std::memory_order_relaxed); 
+    }
 
     /**
-     * @brief Sets the soar threshold for geometric-mean mode.
+     * @brief Sets the soar threshold for Geometric Mean mode.
      *
-     * Added to the product under the sqrt to prevent the output from
-     * dropping to zero when either input or carrier crosses zero.
-     * Higher values = smoother, more sustained output.
+     * Prevents cross-zero dropouts. The value is internally scaled by the 
+     * input amplitude to prevent static DC offsets during silence.
      *
      * @param amount 0 = strict geometric mean, 0.01 = subtle, 0.1 = strong.
      */
@@ -149,11 +213,17 @@ public:
 
 private:
     int numChannels_ = 2;
+    T sampleRate_ = T(44400);
+
+    // Atomic targets for lock-free UI/Thread communication
     std::atomic<T> frequency_ { T(440) };
     std::atomic<T> mix_ { T(1) };
     std::atomic<Mode> mode_ { Mode::Classic };
     std::atomic<T> soar_ { T(0) };
 
+    // DSP State (Internal audio-thread only, no atomics required)
+    T currentFreq_ { T(440) };
+    T currentMix_ { T(1) };
     Phasor<T> phasor_;
 };
 

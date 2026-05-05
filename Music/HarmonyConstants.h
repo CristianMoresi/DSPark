@@ -7,26 +7,16 @@
  * @file HarmonyConstants.h
  * @brief Comprehensive musical harmony calculations — scales, chords, MIDI, theory.
  *
- * A complete constexpr toolkit for working with musical scales and chords.
- * Fully functional at compile-time (`constexpr` / `consteval`) — can generate
- * static data tables for audio plugins, tuners, and musical analysis.
- *
- * Features:
- * - 61 common musical scales (bitmask representation, relative to C).
- * - 15 standard chord recipes with inversions.
- * - Context-aware note naming (sharp/flat by key).
- * - Scale transposition and diatonic chord generation.
- * - MIDI note conversion and octave helpers.
+ * A complete, strictly constexpr toolkit for working with musical scales and chords.
+ * Fully functional at compile-time (`constexpr` / `consteval`) to guarantee zero-overhead
+ * runtime execution and generate static data tables for audio plugins and musical analysis.
+ * 
+ * Complies with DSPark strict real-time constraints:
+ * - Zero allocations (no std::string, no std::vector).
+ * - Cache-friendly bitmask operations (O(1) lookups and bitwise rotations).
+ * - SIMD/Thread-safe (completely stateless and immutable).
  *
  * Dependencies: C++20 standard library only.
- *
- * @code
- *   using namespace dspark::harmony;
- *   auto major = allScales[0];                    // Ionian (Major)
- *   auto inD = scaleAtRoot(major.mask, 2);        // D Major
- *   auto name = noteName(69, 0);                  // "A" (MIDI 69 = A4)
- *   auto chord = chordAtRootMidi(allChords[0], 60); // C Major triad
- * @endcode
  */
 
 #include <array>
@@ -47,12 +37,13 @@ namespace harmony
      * @brief A 12-bit bitmask representing the 12 pitch-classes of the chromatic scale.
      *
      * Bits 0..11 correspond to semitones above the root (0=C, 1=C#/Db, ..., 11=B).
+     * Fits perfectly in CPU registers for extremely fast subset/superset evaluations.
      */
     using NoteSet = std::uint16_t;
 
     /**
      * @typedef Degree
-     * @brief Integer index used to select a degree inside standard diatonic representations.
+     * @brief Integer index used to select a degree inside standard diatonic representations (0-based).
      */
     using Degree = int;
 
@@ -64,8 +55,8 @@ namespace harmony
      * @enum ChordTag
      * @brief Bitmask flags describing chord "families" compatible with a scale.
      *
-     * Use these flags to filter scales by which chord types are naturally available
-     * inside them (e.g., MajorTriad, Dominant7...).
+     * Used to filter scales by which chord types are naturally available
+     * inside them without needing to compute intervals dynamically.
      */
     enum class ChordTag : std::uint16_t
     {
@@ -92,8 +83,11 @@ namespace harmony
      * @brief Bitwise OR operator for ChordTag flags.
      * @return Combination of both flags.
      */
-    [[nodiscard]] constexpr ChordTag operator|(ChordTag lhs, ChordTag rhs) noexcept;
-
+    [[nodiscard]] constexpr ChordTag operator|(ChordTag lhs, ChordTag rhs) noexcept
+    {
+        using U = std::underlying_type_t<ChordTag>;
+        return static_cast<ChordTag>(static_cast<U>(lhs) | static_cast<U>(rhs));
+    }
 
     //==============================================================================
     // 2. SCALE DESCRIPTOR
@@ -101,7 +95,7 @@ namespace harmony
 
     /**
      * @struct Scale
-     * @brief Descriptor holding the name, pitch mask and chord tags for a scale.
+     * @brief Descriptor holding the name, pitch mask and chord tags for a musical scale.
      */
     struct Scale
     {
@@ -110,234 +104,13 @@ namespace harmony
         ChordTag         tags; ///< Flags describing chord families present in the scale.
     };
 
-
     //==============================================================================
-    // 3. HELPER: BUILD A NOTESET
+    // 3. INTERNAL HELPERS & MASK GENERATION
     //==============================================================================
 
     /**
      * @brief Build a NoteSet from 12 boolean flags (b0 = C, b1 = C#/Db, ... b11 = B).
-     * @details `consteval` so it can be used in compile-time tables.
      */
-    [[nodiscard]] consteval NoteSet makeMask(
-        bool b0, bool b1, bool b2, bool b3,
-        bool b4, bool b5, bool b6, bool b7,
-        bool b8, bool b9, bool b10, bool b11) noexcept;
-
-    /**
-     * @brief Build a NoteSet from a list of semitone degrees (values may be >=12 or negative).
-     * @details Degree values are taken modulo 12 so inputs like 14 -> 2 are accepted.
-     * Negative degrees are ignored.
-     * @param degrees Initializer list of semitone distances (0..n).
-     */
-    [[nodiscard]] consteval NoteSet makeMask(std::initializer_list<int> degrees) noexcept;
-
-
-    //==============================================================================
-    // 4. DATABASE OF SCALES
-    //==============================================================================
-
-    // allScales: defined below after makeMask is available.
-
-
-    //==============================================================================
-    // 5. CONTEXT-AWARE NOTE NAMES
-    //==============================================================================
-
-    // sharpNames, flatNames, useSharpsForRoot: defined below.
-
-    /**
-     * @brief Returns a human-readable note name for the given MIDI note (0..127)
-     * and a root (0..11) used to choose sharp/flat presentation.
-     */
-    [[nodiscard]] constexpr std::string_view noteName(int midi, int root = 0) noexcept;
-
-    /**
-     * @brief Parse a simple note name (no octave) into a pitch-class 0..11.
-     * @return std::optional<int> containing 0..11 on success, std::nullopt on failure.
-     */
-    [[nodiscard]] constexpr std::optional<int> parseNote(std::string_view s) noexcept;
-
-
-    //==============================================================================
-    // 6. TRANSPOSE A SCALE
-    //==============================================================================
-
-    /**
-     * @brief Circularly rotate a NoteSet so it becomes rooted at `root` (0..11).
-     * @param base NoteSet defined with root = C.
-     * @param root Desired root as semitone offset from C.
-     */
-    [[nodiscard]] constexpr NoteSet
-    scaleAtRoot(NoteSet base, int root) noexcept;
-
-
-    //==============================================================================
-    // 7. CHORD DESCRIPTOR
-    //==============================================================================
-
-    /**
-     * @struct Chord
-     * @brief A chord "recipe": name + intervals (root,3,5,7,9,11,13).
-     *
-     * Interval slots use -1 to indicate 'not present'. Intervals are measured in semitones
-     * from the chord root (e.g., Major: 0,4,7,-1,-1,-1,-1).
-     */
-    struct Chord
-    {
-        std::string_view   name;
-        std::array<int, 7> intervals; ///< -1 means the extension is absent
-    };
-
-    // allChords: defined below after Chord struct.
-
-
-    //==============================================================================
-    // 8. BUILD A CHORD AT A SPECIFIC ROOT (MIDI)
-    //==============================================================================
-
-    /**
-     * @brief Build MIDI note numbers for a chord recipe located at rootMidi.
-     * @param c Chord definition to use.
-     * @param rootMidi MIDI note for chord root (0..127 typical).
-     * @param inversion Which chord tone to place in bass (0=root position).
-     * @return Array of 7 ints: valid MIDI numbers for present tones, unused slots = -1.
-     */
-    [[nodiscard]] constexpr std::array<int, 7>
-    chordAtRootMidi(const Chord& c, int rootMidi, int inversion = 0) noexcept;
-
-
-    //==============================================================================
-    // 9. REVERSE LOOKUP
-    //==============================================================================
-
-    /**
-     * @brief Return up to 16 pointers to scales that fully contain `chordMask`.
-     * @details Remaining entries are nullptr.
-     */
-    [[nodiscard]] constexpr std::array<const Scale*, 16>
-    scalesForChordMask(NoteSet chordMask) noexcept;
-
-    /**
-     * @brief Convenience wrapper: find scales that can contain the notes of a Chord.
-     */
-    [[nodiscard]] constexpr std::array<const Scale*, 16>
-    scalesForChord(const Chord& chord) noexcept;
-
-
-    //==============================================================================
-    // 10. DIATONIC CHORD GENERATION
-    //==============================================================================
-
-    /**
-     * @brief Internal helpers for diatonic chord generation.
-     * @note These helpers are intended for library-internal use.
-     */
-    namespace detail
-    {
-        /**
-         * @brief Extract the scale's active degrees (in semitones) and expand them so
-         * there are always 7 ascending values to operate on.
-         *
-         * Example: for a pentatonic {0,2,4,7,9} this returns {0,2,4,7,9,12,14}
-         * so that stacking thirds (which wraps across the octave) works correctly.
-         */
-        [[nodiscard]] constexpr std::array<int, 7>
-        activeDegrees(NoteSet mask) noexcept;
-
-        /**
-         * @brief Interval in semitones between deg[degIdx] and the degree `skip` steps above it
-         * when deg[] contains strictly ascending values (possibly >11 when expanded).
-         */
-        [[nodiscard]] constexpr int interval(
-            const std::array<int, 7>& deg, int degIdx, int skip) noexcept;
-
-        /**
-         * @brief Safe small string copy used only for compile-time-friendly name building.
-         * @note dst must have room for src.size()+1 bytes (including null terminator).
-         */
-        constexpr void copy(char* dst, std::string_view src, std::size_t dstCapacity) noexcept;
-    }
-
-    /**
-     * @enum ChordLevel
-     * @brief Which chord extensions to generate when building diatonic chords.
-     */
-    enum class ChordLevel : std::uint8_t
-    {
-        TriadsOnly   = 0, ///< Generate triads only.
-        Triads7      = 1, ///< Generate up to 7th chords.
-        Triads79     = 2, ///< Up to 9ths.
-        Triads7911   = 3, ///< Up to 11ths.
-        Triads791113 = 4  ///< Up to 13ths.
-    };
-
-    /**
-     * @struct DiatonicChord
-     * @brief Result container for a chord generated from a scale degree.
-     *
-     * name: small NUL-terminated char buffer. view() returns a string_view pointing to the buffer.
-     */
-    struct DiatonicChord
-    {
-        std::array<char, 16> name;      ///< NUL-terminated buffer (will contain small strings like "m7", "maj7"...)
-        std::array<int, 7>   intervals; ///< Intervals in semitones for R-3-5-7-9-11-13 (-1 = absent)
-
-        /**
-         * @brief Safely obtain a string_view of the internal name buffer.
-         */
-        [[nodiscard]] constexpr std::string_view view() const noexcept;
-    };
-
-    /**
-     * @brief Generate diatonic chords for a given scale and scale-degree.
-     * @param sc Scale to generate from (database scales assume root=C).
-     * @param degree Starting degree inside the scale (0..6 corresponds to scale degrees when expanded).
-     * @param level Complexity level describing which extensions to include.
-     * @return Array of up to 7 DiatonicChord objects. Unused entries will be default-initialized.
-     */
-    [[nodiscard]] constexpr std::array<DiatonicChord, 7>
-    diatonicChords(const Scale& sc, Degree degree, ChordLevel level) noexcept;
-
-    /**
-     * @brief Convert a DiatonicChord's interval recipe into MIDI notes given a root MIDI note.
-     * @return Array of 7 ints with MIDI notes or -1 for unused positions.
-     */
-    [[nodiscard]] constexpr std::array<int, 7>
-    diatonicChordToMidi(const DiatonicChord& c, int rootMidi) noexcept;
-
-
-    //==============================================================================
-    // 11–12. OCTAVE HELPERS
-    //==============================================================================
-
-    /**
-     * @brief Parse a note string with optional octave (e.g. "C#4"). Returns pitch-class (0..11).
-     * @note If parsing fails this returns 0 (C). Consider using parseNote() directly for error handling.
-     */
-    [[nodiscard]] constexpr int parseNoteWithOctave(std::string_view note) noexcept;
-
-    /**
-     * @brief Extract octave number from a note string like "C#5". Defaults to 4 if not present.
-     */
-    [[nodiscard]] constexpr int getOctaveFromNote(std::string_view note) noexcept;
-
-    /**
-     * @brief Transpose a MIDI note by a number of full octaves (positive or negative).
-     */
-    [[nodiscard]] constexpr int transposeByOctaves(int midi, int octaveDelta) noexcept;
-
-
-    /*------------------------------------------------------------
-     * DEFINITIONS
-     *-----------------------------------------------------------*/
-
-    [[nodiscard]] constexpr ChordTag operator|(ChordTag lhs, ChordTag rhs) noexcept
-    {
-        using U = std::underlying_type_t<ChordTag>;
-        return static_cast<ChordTag>(static_cast<U>(lhs) | static_cast<U>(rhs));
-    }
-
     [[nodiscard]] consteval NoteSet makeMask(
         bool b0, bool b1, bool b2, bool b3,
         bool b4, bool b5, bool b6, bool b7,
@@ -351,14 +124,72 @@ namespace harmony
                (static_cast<NoteSet>(b10) << 10) | (static_cast<NoteSet>(b11) << 11);
     }
 
+    /**
+     * @brief Build a NoteSet from a list of semitone degrees.
+     * @details Degree values are taken modulo 12. Negative degrees are ignored.
+     */
     [[nodiscard]] consteval NoteSet makeMask(std::initializer_list<int> degrees) noexcept
     {
         NoteSet m = 0;
-        for (int d : degrees)
-            if (d >= 0)
-                m |= static_cast<NoteSet>(1u << (d % 12));
+        for (int d : degrees) {
+            if (d >= 0) { m |= static_cast<NoteSet>(1u << (d % 12)); }
+        }
         return m & 0x0FFFu;
     }
+
+    namespace detail
+    {
+        /**
+         * @brief Safe small string copy used only for compile-time-friendly name building.
+         */
+        constexpr void copy(char* dst, std::string_view src, std::size_t dstCapacity) noexcept
+        {
+            std::size_t toCopy = src.size();
+            if (toCopy + 1u > dstCapacity) { toCopy = (dstCapacity > 0) ? dstCapacity - 1u : 0u; }
+            for (std::size_t i = 0; i < toCopy; ++i) { dst[i] = src[i]; }
+            if (dstCapacity > 0) { dst[toCopy] = '\0'; }
+        }
+
+        /**
+         * @brief Extract active scale degrees and expand them sequentially across the octave.
+         */
+        [[nodiscard]] constexpr std::array<int, 7> activeDegrees(NoteSet mask) noexcept
+        {
+            std::array<int, 12> temp{};
+            int tcount = 0;
+            for (int i = 0; i < 12; ++i) {
+                if (mask & (1u << i)) temp[tcount++] = i;
+            }
+
+            std::array<int, 7> out{};
+            if (tcount == 0) {
+                for (int i = 0; i < 7; ++i) out[i] = i;
+                return out;
+            }
+
+            for (int i = 0; i < 7; ++i) {
+                int idx = i % tcount;
+                int octave = i / tcount;
+                out[i] = temp[idx] + octave * 12;
+            }
+            return out;
+        }
+
+        /**
+         * @brief Calculate semitone interval skipping 'skip' degrees in the scale.
+         */
+        [[nodiscard]] constexpr int interval(const std::array<int, 7>& deg, int degIdx, int skip) noexcept
+        {
+            int a = deg[degIdx];
+            int b = deg[(degIdx + skip) % 7];
+            while (b <= a) { b += 12; }
+            return b - a;
+        }
+    } // namespace detail
+
+    //==============================================================================
+    // 4. DATABASE OF SCALES & CONSTANTS
+    //==============================================================================
 
     inline constexpr std::array<Scale, 61> allScales = [](){
         std::array<Scale, 61> scales{};
@@ -388,7 +219,7 @@ namespace harmony
         scales[17] = {"DorianSharp4",    makeMask({0,2,3,6,7,9,10}), ChordTag::MinorTriad};
         scales[18] = {"PhrygianDominant",makeMask({0,1,4,5,7,8,10}), ChordTag::MajorTriad | ChordTag::Dominant7};
         scales[19] = {"LydianSharp2",    makeMask({0,3,4,6,7,9,11}), ChordTag::MajorTriad | ChordTag::Major7};
-        scales[20] = {"UltraLocrian",    makeMask({0,1,3,4,6,8,9}), ChordTag::DiminishedTriad | ChordTag::Dim7};
+        scales[20] = {"UltraLocrian",    makeMask({0,1,3,4,6,8,9}),  ChordTag::DiminishedTriad | ChordTag::Dim7};
 
         // Harmonic-major modes
         scales[21] = {"HarmonicMajor",     makeMask({0,2,4,5,7,8,11}), ChordTag::MajorTriad | ChordTag::AugmentedTriad}; 
@@ -397,48 +228,48 @@ namespace harmony
         scales[24] = {"LydianMinor",       makeMask({0,2,4,6,7,8,10}), ChordTag::MinorTriad | ChordTag::Minor7};
         scales[25] = {"Mixolydianb9",      makeMask({0,1,4,5,7,8,10}), ChordTag::MajorTriad | ChordTag::Dominant7};
         scales[26] = {"LydianAugmented2",  makeMask({0,3,4,6,7,9,11}), ChordTag::MajorTriad | ChordTag::Major7};
-        scales[27] = {"LocrianDiminished", makeMask({0,1,3,4,6,7,9}), ChordTag::DiminishedTriad | ChordTag::Dim7}; 
+        scales[27] = {"LocrianDiminished", makeMask({0,1,3,4,6,7,9}),  ChordTag::DiminishedTriad | ChordTag::Dim7}; 
 
         // Double-harmonic family
         scales[28] = {"DoubleHarmonic",    makeMask({0,1,4,5,7,8,11}), ChordTag::MajorTriad};
         scales[29] = {"HungarianMinor",    makeMask({0,2,3,6,7,8,11}), ChordTag::MinorTriad};
         scales[30] = {"Byzantine",         makeMask({0,1,4,5,7,8,11}), ChordTag::MajorTriad};
         scales[31] = {"Ionian b5",         makeMask({0,2,4,5,6,9,11}), ChordTag::MajorTriad | ChordTag::DiminishedTriad};
-        scales[32] = {"Lydian #6",         makeMask({0,2,4,6,7,10,11}), ChordTag::MajorTriad | ChordTag::Major7};
+        scales[32] = {"Lydian #6",         makeMask({0,2,4,6,7,10,11}),ChordTag::MajorTriad | ChordTag::Major7};
         
         // Pentatonics
-        scales[33] = {"MajorPentatonic",   makeMask({0,2,4,7,9}), ChordTag::MajorTriad};
-        scales[34] = {"MinorPentatonic",   makeMask({0,3,5,7,10}), ChordTag::MinorTriad};
-        scales[35] = {"EgyptianPentatonic",makeMask({0,2,5,7,10}), ChordTag::MajorTriad};
-        scales[36] = {"Hirajoshi",         makeMask({0,2,3,7,8}), ChordTag::MinorTriad};
-        scales[37] = {"InSen",             makeMask({0,1,5,7,10}), ChordTag::MinorTriad};
-        scales[38] = {"Yo",                makeMask({0,4,5,7,11}), ChordTag::MajorTriad};
+        scales[33] = {"MajorPentatonic",   makeMask({0,2,4,7,9}),      ChordTag::MajorTriad};
+        scales[34] = {"MinorPentatonic",   makeMask({0,3,5,7,10}),     ChordTag::MinorTriad};
+        scales[35] = {"EgyptianPentatonic",makeMask({0,2,5,7,10}),     ChordTag::MajorTriad};
+        scales[36] = {"Hirajoshi",         makeMask({0,2,3,7,8}),      ChordTag::MinorTriad};
+        scales[37] = {"InSen",             makeMask({0,1,5,7,10}),     ChordTag::MinorTriad};
+        scales[38] = {"Yo",                makeMask({0,4,5,7,11}),     ChordTag::MajorTriad};
 
         // Symmetrical / exotic
-        scales[39] = {"WholeTone",         makeMask({0,2,4,6,8,10}), ChordTag::AugmentedTriad};
-        scales[40] = {"Chromatic",         makeMask({0,1,2,3,4,5,6,7,8,9,10,11}), ChordTag::All};
-        scales[41] = {"Diminished",        makeMask({0,2,3,5,6,8,9,11}), ChordTag::MinorTriad | ChordTag::DiminishedTriad | ChordTag::HalfDim7 | ChordTag::Dim7};
-        scales[42] = {"Diminished2",       makeMask({0,1,3,4,6,7,9,10}), ChordTag::MinorTriad | ChordTag::DiminishedTriad | ChordTag::HalfDim7 | ChordTag::Dim7};
-        scales[43] = {"Augmented",         makeMask({0,3,4,7,8,11}), ChordTag::AugmentedTriad};
+        scales[39] = {"WholeTone",         makeMask({0,2,4,6,8,10}),               ChordTag::AugmentedTriad};
+        scales[40] = {"Chromatic",         makeMask({0,1,2,3,4,5,6,7,8,9,10,11}),  ChordTag::All};
+        scales[41] = {"Diminished",        makeMask({0,2,3,5,6,8,9,11}),           ChordTag::MinorTriad | ChordTag::DiminishedTriad | ChordTag::HalfDim7 | ChordTag::Dim7};
+        scales[42] = {"Diminished2",       makeMask({0,1,3,4,6,7,9,10}),           ChordTag::MinorTriad | ChordTag::DiminishedTriad | ChordTag::HalfDim7 | ChordTag::Dim7};
+        scales[43] = {"Augmented",         makeMask({0,3,4,7,8,11}),               ChordTag::AugmentedTriad};
 
-        // Additional Scales (some are enharmonic equivalents of others)
-        scales[44] = {"Algerian",          makeMask({0,2,3,6,7,8,11}), ChordTag::MinorTriad};
-        scales[45] = {"Arabian",           makeMask({0,2,4,5,6,8,10}), ChordTag::MajorTriad};
-        scales[46] = {"Balinese",          makeMask({0,1,3,7,8}), ChordTag::MinorTriad};
-        scales[47] = {"Chinese",           makeMask({0,4,6,7,11}), ChordTag::MajorTriad};
-        scales[48] = {"Gypsy",             makeMask({0,1,4,5,7,8,10}), ChordTag::MajorTriad | ChordTag::Dominant7};
-        scales[49] = {"Hindu",             makeMask({0,2,4,5,7,9,10}), ChordTag::MajorTriad | ChordTag::Dominant7};
-        scales[50] = {"Hungarian",         makeMask({0,2,3,6,7,8,11}), ChordTag::MinorTriad};
-        scales[51] = {"Japanese",          makeMask({0,1,5,7,8}), ChordTag::MinorTriad};
-        scales[52] = {"Javanese",          makeMask({0,1,3,5,7,10}), ChordTag::MajorTriad};
-        scales[53] = {"Mongolian",         makeMask({0,2,4,7,9}), ChordTag::MajorTriad};
-        scales[54] = {"Neapolitan",        makeMask({0,1,3,5,7,8,11}), ChordTag::MinorTriad};
-        scales[55] = {"Oriental",          makeMask({0,1,4,5,6,9,10}), ChordTag::MajorTriad};
-        scales[56] = {"Persian",           makeMask({0,1,4,5,6,8,11}), ChordTag::MajorTriad};
-        scales[57] = {"Prometheus",        makeMask({0,2,4,6,9,10}), ChordTag::MajorTriad};
+        // Additional Scales
+        scales[44] = {"Algerian",          makeMask({0,2,3,6,7,8,11}),   ChordTag::MinorTriad};
+        scales[45] = {"Arabian",           makeMask({0,2,4,5,6,8,10}),   ChordTag::MajorTriad};
+        scales[46] = {"Balinese",          makeMask({0,1,3,7,8}),        ChordTag::MinorTriad};
+        scales[47] = {"Chinese",           makeMask({0,4,6,7,11}),       ChordTag::MajorTriad};
+        scales[48] = {"Gypsy",             makeMask({0,1,4,5,7,8,10}),   ChordTag::MajorTriad | ChordTag::Dominant7};
+        scales[49] = {"Hindu",             makeMask({0,2,4,5,7,9,10}),   ChordTag::MajorTriad | ChordTag::Dominant7};
+        scales[50] = {"Hungarian",         makeMask({0,2,3,6,7,8,11}),   ChordTag::MinorTriad};
+        scales[51] = {"Japanese",          makeMask({0,1,5,7,8}),        ChordTag::MinorTriad};
+        scales[52] = {"Javanese",          makeMask({0,1,3,5,7,10}),     ChordTag::MajorTriad};
+        scales[53] = {"Mongolian",         makeMask({0,2,4,7,9}),        ChordTag::MajorTriad};
+        scales[54] = {"Neapolitan",        makeMask({0,1,3,5,7,8,11}),   ChordTag::MinorTriad};
+        scales[55] = {"Oriental",          makeMask({0,1,4,5,6,9,10}),   ChordTag::MajorTriad};
+        scales[56] = {"Persian",           makeMask({0,1,4,5,6,8,11}),   ChordTag::MajorTriad};
+        scales[57] = {"Prometheus",        makeMask({0,2,4,6,9,10}),     ChordTag::MajorTriad};
         scales[58] = {"Spanish",           makeMask({0,1,3,4,5,7,8,10}), ChordTag::DiminishedTriad};
-        scales[59] = {"Tritone",           makeMask({0,1,4,6,7,10}), ChordTag::Dominant7};
-        scales[60] = {"Ukrainian",         makeMask({0,2,3,6,7,9,10}), ChordTag::MinorTriad};
+        scales[59] = {"Tritone",           makeMask({0,1,4,6,7,10}),     ChordTag::Dominant7};
+        scales[60] = {"Ukrainian",         makeMask({0,2,3,6,7,9,10}),   ChordTag::MinorTriad};
 
         return scales;
     }();
@@ -449,21 +280,34 @@ namespace harmony
     inline constexpr std::array<std::string_view, 12> flatNames{
         "C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"
     };
-
     inline constexpr std::array<bool,12> useSharpsForRoot{
         1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0
     };
 
-    [[nodiscard]] constexpr std::string_view noteName(int midi, int root) noexcept
+    //==============================================================================
+    // 5. CONTEXT-AWARE NOTE NAMES & PARSING
+    //==============================================================================
+
+    /**
+     * @brief Returns a human-readable note name for the given MIDI note (0..127).
+     * @param midi The MIDI note number.
+     * @param root The pitch-class of the key root (0..11) to decide enharmonic spelling.
+     * @return std::string_view pointing to a static note name (e.g., "C#", "Db").
+     */
+    [[nodiscard]] constexpr std::string_view noteName(int midi, int root = 0) noexcept
     {
         int idx = (midi % 12 + 12) % 12;
         int r   = (root % 12 + 12) % 12;
         return useSharpsForRoot[r] ? sharpNames[idx] : flatNames[idx];
     }
 
+    /**
+     * @brief Parse a simple note name (no octave) into a pitch-class (0..11).
+     * @param s String containing note name (e.g., "C#", "Bb", "Fb").
+     * @return Pitch-class 0..11 on success, std::nullopt on failure.
+     */
     [[nodiscard]] constexpr std::optional<int> parseNote(std::string_view s) noexcept
     {
-        // Added a few enharmonic variants (E#, Fb, B#, Cb) for convenience.
         constexpr std::array<std::pair<std::string_view,int>, 28> lut{{
             {"C",0}, {"B#",0},
             {"C#",1}, {"Db",1},
@@ -475,24 +319,47 @@ namespace harmony
             {"B",11}, {"Cb",11}
         }};
 
-        for (const auto& [name,val] : lut)
+        for (const auto& [name,val] : lut) {
             if (name.size() == s.size() &&
                 std::equal(name.begin(), name.end(), s.begin(),
-                           [](char a, char b){ return (a|32) == (b|32); }))
+                           [](char a, char b){ return (a|32) == (b|32); })) {
                 return val;
+            }
+        }
         return std::nullopt;
     }
 
-    [[nodiscard]] constexpr NoteSet
-    scaleAtRoot(NoteSet base, int root) noexcept
+    //==============================================================================
+    // 6. TRANSPOSE A SCALE
+    //==============================================================================
+
+    /**
+     * @brief Circularly rotate a NoteSet so it becomes rooted at a specific key.
+     * @param base NoteSet defined with root = C.
+     * @param root Desired root as semitone offset from C (0..11).
+     * @return New bitmask representing the transposed scale.
+     */
+    [[nodiscard]] constexpr NoteSet scaleAtRoot(NoteSet base, int root) noexcept
     {
         root = (root % 12 + 12) % 12;
-        // Perform circular shift on the 12-bit mask. Use a larger integer to avoid UB
-        // during intermediate shifts and mask back to 12 bits.
         std::uint32_t b = static_cast<std::uint32_t>(base) & 0x0FFFu;
         std::uint32_t res = ((b << root) | (b >> (12 - root))) & 0x0FFFu;
         return static_cast<NoteSet>(res);
     }
+
+    //==============================================================================
+    // 7. CHORD DESCRIPTOR
+    //==============================================================================
+
+    /**
+     * @struct Chord
+     * @brief A chord "recipe" defining the required intervals relative to its root.
+     */
+    struct Chord
+    {
+        std::string_view   name;
+        std::array<int, 7> intervals; ///< Intervals in semitones from root. -1 = not present.
+    };
 
     inline constexpr std::array<Chord, 15> allChords{{
         {"Major",      {0, 4, 7, -1, -1, -1, -1}},
@@ -512,14 +379,24 @@ namespace harmony
         {"Major13",    {0, 4, 7, 11, 14, 17, 21}}
     }};
 
+    //==============================================================================
+    // 8. CHORD GENERATION & REVERSE LOOKUP
+    //==============================================================================
+
+    /**
+     * @brief Build MIDI note numbers for a chord recipe located at a specific root.
+     * @param c Chord definition to use.
+     * @param rootMidi MIDI note for chord root (0..127 typical).
+     * @param inversion Which chord tone to place in bass (0=root position, 1=first inversion...).
+     * @return Array of 7 ints: valid MIDI numbers for present tones, unused slots = -1.
+     */
     [[nodiscard]] constexpr std::array<int, 7>
-    chordAtRootMidi(const Chord& c, int rootMidi, int inversion) noexcept
+    chordAtRootMidi(const Chord& c, int rootMidi, int inversion = 0) noexcept
     {
         std::array<int, 7> notes{};
         int count = 0;
 
-        for (int i = 0; i < 7; ++i)
-        {
+        for (int i = 0; i < 7; ++i) {
             const int deg = c.intervals[i];
             if (deg < 0) break;
             notes[count++] = rootMidi + deg;
@@ -527,100 +404,100 @@ namespace harmony
 
         if (count == 0) return { -1,-1,-1,-1,-1,-1,-1 };
 
-        if (count > 0)
-        {
+        if (count > 0) {
             inversion = (inversion >= 0) ? (inversion % count) : 0;
-            for (int i = 0; i < inversion; ++i) notes[i] += 12;
+            for (int i = 0; i < inversion; ++i) { notes[i] += 12; }
             std::sort(notes.begin(), notes.begin() + count);
         }
 
-        for (int i = count; i < 7; ++i) notes[i] = -1;
+        for (int i = count; i < 7; ++i) { notes[i] = -1; }
         return notes;
     }
 
+    /**
+     * @brief Reverse lookup: find up to 16 scales that fully contain `chordMask`.
+     * @param chordMask A NoteSet representing the notes of the chord.
+     * @return Array of pointers to compatible scales. Remaining entries are nullptr.
+     */
     [[nodiscard]] constexpr std::array<const Scale*, 16>
     scalesForChordMask(NoteSet chordMask) noexcept
     {
         std::array<const Scale*, 16> out{};
         std::size_t idx = 0;
-        for (const auto& s : allScales)
-            if (((s.mask & chordMask) == chordMask) && idx < out.size())
+        for (const auto& s : allScales) {
+            if (((s.mask & chordMask) == chordMask) && idx < out.size()) {
                 out[idx++] = &s;
-        // remaining entries are zero-initialized (nullptr)
+            }
+        }
         return out;
     }
 
+    /**
+     * @brief Reverse lookup wrapper: find scales that can contain a specific Chord recipe.
+     * @param chord The Chord recipe object.
+     * @return Array of pointers to compatible scales.
+     */
     [[nodiscard]] constexpr std::array<const Scale*, 16>
     scalesForChord(const Chord& chord) noexcept
     {
         NoteSet chordMask = 0;
-        for (int d : chord.intervals)
-            if (d >= 0) chordMask |= static_cast<NoteSet>(1u << (d % 12));
+        for (int d : chord.intervals) {
+            if (d >= 0) { chordMask |= static_cast<NoteSet>(1u << (d % 12)); }
+        }
         return scalesForChordMask(chordMask);
     }
 
-    namespace detail
+    //==============================================================================
+    // 9. DIATONIC CHORD GENERATION
+    //==============================================================================
+
+    /**
+     * @enum ChordLevel
+     * @brief Complexity level describing which extensions to generate for diatonic chords.
+     */
+    enum class ChordLevel : std::uint8_t
     {
-        [[nodiscard]] constexpr std::array<int, 7>
-        activeDegrees(NoteSet mask) noexcept
+        TriadsOnly   = 0, ///< Generate base triads only (R-3-5).
+        Triads7      = 1, ///< Generate up to 7th chords.
+        Triads79     = 2, ///< Up to 9ths.
+        Triads7911   = 3, ///< Up to 11ths.
+        Triads791113 = 4  ///< Up to 13ths.
+    };
+
+    /**
+     * @struct DiatonicChord
+     * @brief Contains the structure and generated symbol name of a diatonic chord.
+     */
+    struct DiatonicChord
+    {
+        std::array<char, 16> name;      ///< NUL-terminated buffer ("m7", "maj7"...). Zero alloc.
+        std::array<int, 7>   intervals; ///< Intervals in semitones (R-3-5-7-9-11-13). -1 = absent.
+
+        /**
+         * @brief Safely obtain a string_view of the internal name buffer.
+         * @return A std::string_view tightly bound to the null-terminated string length.
+         */
+        [[nodiscard]] constexpr std::string_view view() const noexcept
         {
-            // Collect active degrees in ascending order within the octave.
-            std::array<int, 12> temp{};
-            int tcount = 0;
-            for (int i = 0; i < 12; ++i)
-                if (mask & (1u << i)) temp[tcount++] = i;
-
-            std::array<int, 7> out{};
-            if (tcount == 0)
-            {
-                // empty scale -> return default ascending zero-filled values
-                for (int i = 0; i < 7; ++i) out[i] = i;
-                return out;
-            }
-
-            // Fill out[] by repeating the pattern across octaves so that values are strictly
-            // ascending and usable for "stacking thirds" operations.
-            for (int i = 0; i < 7; ++i)
-            {
-                int idx = i % tcount;
-                int octave = i / tcount;
-                out[i] = temp[idx] + octave * 12;
-            }
-            return out;
+            std::size_t len = 0;
+            while (len < name.size() && name[len] != '\0') { ++len; }
+            return std::string_view(name.data(), len);
         }
+    };
 
-        [[nodiscard]] constexpr int interval(
-            const std::array<int, 7>& deg, int degIdx, int skip) noexcept
-        {
-            // deg is expected to contain strictly non-decreasing ascending values (possibly >11)
-            int a = deg[degIdx];
-            int b = deg[(degIdx + skip) % 7];
-            // If b is not strictly > a (edge cases), normalize by adding 12 until it's above.
-            while (b <= a) b += 12;
-            return b - a;
-        }
-
-        constexpr void copy(char* dst, std::string_view src, std::size_t dstCapacity) noexcept
-        {
-            // Safe copy that will not overflow the destination if dstCapacity is respected by caller.
-            std::size_t toCopy = src.size();
-            if (toCopy + 1u > dstCapacity) toCopy = (dstCapacity > 0) ? dstCapacity - 1u : 0u;
-            for (std::size_t i = 0; i < toCopy; ++i) dst[i] = src[i];
-            if (dstCapacity > 0) dst[toCopy] = '\0';
-        }
-    } // namespace detail
-
-
-    [[nodiscard]] constexpr std::array<DiatonicChord, 7>
-    diatonicChords(const Scale& sc, Degree degree, ChordLevel level) noexcept
+    /**
+     * @brief Generates the diatonic chord built upon a specific degree of a scale.
+     * @param sc Scale definition (assumes root=C internally).
+     * @param degree The 0-based degree index inside the scale (0..6).
+     * @param level Which chord extensions to include.
+     * @return A DiatonicChord object with the dynamically evaluated intervals and symbol.
+     */
+    [[nodiscard]] constexpr DiatonicChord
+    diatonicChord(const Scale& sc, Degree degree, ChordLevel level) noexcept
     {
         const auto deg = detail::activeDegrees(sc.mask);
-        if (degree < 0 || degree >= 7) return {};
+        if (degree < 0 || degree >= 7) return {}; // Invalid input protection
 
-        std::array<DiatonicChord, 7> out{};
-        std::size_t idx = 0;
-
-        // Compute stack-of-thirds intervals (third,fifth,7th,9th,11th,13th) relative to the degree.
         const int third      = detail::interval(deg, degree, 2);
         const int fifth      = detail::interval(deg, degree, 4);
         const int seventh    = detail::interval(deg, degree, 6);
@@ -628,19 +505,17 @@ namespace harmony
         const int eleventh   = detail::interval(deg, degree, 3);
         const int thirteenth = detail::interval(deg, degree, 5);
 
-        auto push = [&](std::string_view baseName, ChordLevel lvl)
-        {
-            DiatonicChord c{};
-            // Fill intervals: R-3-5-7-9-11-13 (use -1 for absent)
-            c.intervals = {0, third, fifth,
-                           (lvl >= ChordLevel::Triads7)      ? seventh    : -1,
-                           (lvl >= ChordLevel::Triads79)     ? ninth      : -1,
-                           (lvl >= ChordLevel::Triads7911)   ? eleventh   : -1,
-                           (lvl >= ChordLevel::Triads791113) ? thirteenth : -1};
+        DiatonicChord c{};
+        c.intervals = {0, third, fifth,
+                       (level >= ChordLevel::Triads7)      ? seventh    : -1,
+                       (level >= ChordLevel::Triads79)     ? ninth      : -1,
+                       (level >= ChordLevel::Triads7911)   ? eleventh   : -1,
+                       (level >= ChordLevel::Triads791113) ? thirteenth : -1};
 
-            char buf[20]{};
+        auto buildName = [&](std::string_view baseName, ChordLevel lvl)
+        {
+            char buf[16]{}; // Match struct array size
             std::size_t pos = 0;
-            // safe copy helper
             detail::copy(buf + pos, baseName, sizeof(buf) - pos);
             pos += baseName.size();
 
@@ -649,10 +524,8 @@ namespace harmony
             if (lvl >= ChordLevel::Triads791113) { detail::copy(buf + pos, "(13)", sizeof(buf) - pos);  pos += 4; }
 
             detail::copy(c.name.data(), std::string_view(buf, pos), c.name.size());
-            out[idx++] = c;
         };
 
-        /* Determine base triad quality */
         std::string_view base;
         if      (third == 4 && fifth == 7) base = "M";
         else if (third == 3 && fifth == 7) base = "m";
@@ -660,7 +533,6 @@ namespace harmony
         else if (third == 4 && fifth == 8) base = "aug";
         else                               base = "?";
 
-        /* Determine 7th chord symbol */
         std::string_view name7;
         if      (base == "dim" && seventh == 10) name7 = "m7b5";
         else if (base == "dim" && seventh == 9)  name7 = "dim7";
@@ -673,51 +545,87 @@ namespace harmony
 
         switch (level)
         {
-            case ChordLevel::TriadsOnly:   push(base,  ChordLevel::TriadsOnly); break;
-            case ChordLevel::Triads7:      push(name7, ChordLevel::Triads7);    break;
-            case ChordLevel::Triads79:     push(name7, ChordLevel::Triads79);   break;
-            case ChordLevel::Triads7911:   push(name7, ChordLevel::Triads7911); break;
-            case ChordLevel::Triads791113: push(name7, ChordLevel::Triads791113); break;
+            case ChordLevel::TriadsOnly:   buildName(base,  ChordLevel::TriadsOnly);   break;
+            case ChordLevel::Triads7:      buildName(name7, ChordLevel::Triads7);      break;
+            case ChordLevel::Triads79:     buildName(name7, ChordLevel::Triads79);     break;
+            case ChordLevel::Triads7911:   buildName(name7, ChordLevel::Triads7911);   break;
+            case ChordLevel::Triads791113: buildName(name7, ChordLevel::Triads791113); break;
         }
-        return out;
+        
+        return c;
     }
 
+    /**
+     * @brief Convert a DiatonicChord's interval recipe into absolute MIDI notes.
+     * @param c The DiatonicChord object.
+     * @param rootMidi The MIDI note assigned as the root of the generated chord.
+     * @return Array of 7 ints with valid MIDI notes, -1 for absent positions.
+     */
     [[nodiscard]] constexpr std::array<int, 7>
     diatonicChordToMidi(const DiatonicChord& c, int rootMidi) noexcept
     {
         std::array<int, 7> notes{};
-        for (std::size_t i = 0; i < 7; ++i)
+        for (std::size_t i = 0; i < 7; ++i) {
             notes[i] = (c.intervals[i] >= 0) ? rootMidi + c.intervals[i] : -1;
+        }
         return notes;
     }
 
-    [[nodiscard]] constexpr int parseNoteWithOctave(std::string_view note) noexcept
+    //==============================================================================
+    // 10. OCTAVE & NOTE HELPERS
+    //==============================================================================
+
+    /**
+     * @brief Parse a note string containing an optional octave (e.g. "C#4", "C-1").
+     * @param note String representation of the note.
+     * @return Pitch-class (0..11) on success, or std::nullopt if format is invalid.
+     */
+    [[nodiscard]] constexpr std::optional<int> parseNoteWithOctave(std::string_view note) noexcept
     {
         std::size_t len = note.size();
-        while (len > 0 && note[len - 1] >= '0' && note[len - 1] <= '9')
-            --len;
+        while (len > 0 && note[len - 1] >= '0' && note[len - 1] <= '9') { --len; }
+        if (len > 0 && note[len - 1] == '-') { --len; }
 
-        std::string_view base = note.substr(0, len);
-        if (auto pc = parseNote(base)) return *pc;
-        return 0;
+        std::string_view baseNote = note.substr(0, len);
+        return parseNote(baseNote);
     }
 
+    /**
+     * @brief Extract octave number from a note string. Supports negative octaves.
+     * @param note String representation of the note (e.g. "C#5", "C-1").
+     * @return Valid octave integer. Defaults to 4 if not present.
+     */
     [[nodiscard]] constexpr int getOctaveFromNote(std::string_view note) noexcept
     {
+        if (note.empty()) return 4;
         std::size_t len = note.size();
-        int oct = 4;
-        while (len && note[len - 1] >= '0' && note[len - 1] <= '9')
+        
+        while (len > 0 && note[len - 1] >= '0' && note[len - 1] <= '9') { --len; }
+        
+        bool isNegative = false;
+        if (len > 0 && note[len - 1] == '-') {
+            isNegative = true;
             --len;
-        if (len < note.size())
-        {
-            int parsed = 0;
-            for (std::size_t i = len; i < note.size(); ++i)
-                parsed = parsed * 10 + (note[i] - '0');
-            oct = parsed;
         }
-        return oct;
+
+        if (len < note.size() && !(isNegative && len + 1 == note.size())) {
+            int parsed = 0;
+            std::size_t start = isNegative ? len + 1 : len;
+            for (std::size_t i = start; i < note.size(); ++i) {
+                parsed = parsed * 10 + (note[i] - '0');
+            }
+            return isNegative ? -parsed : parsed;
+        }
+        
+        return 4; 
     }
 
+    /**
+     * @brief Transpose a MIDI note by a discrete number of full octaves.
+     * @param midi Original MIDI note number.
+     * @param octaveDelta Number of octaves to transpose (can be negative).
+     * @return New MIDI note number.
+     */
     [[nodiscard]] constexpr int transposeByOctaves(int midi, int octaveDelta) noexcept
     {
         return midi + octaveDelta * 12;

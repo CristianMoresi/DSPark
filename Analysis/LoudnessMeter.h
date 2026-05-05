@@ -5,37 +5,7 @@
 
 /**
  * @file LoudnessMeter.h
- * @brief EBU R128 / ITU-R BS.1770 loudness meter.
- *
- * Implements the international standard for loudness measurement used in
- * broadcast, streaming, and mastering. Measures loudness in LUFS (Loudness
- * Units relative to Full Scale) with three time scales.
- *
- * Measurements:
- * - **Momentary:** 400 ms sliding window (fast response for level tracking)
- * - **Short-term:** 3 second sliding window (medium-term loudness)
- * - **Integrated:** Entire programme with gating (overall loudness)
- *
- * The signal chain is: K-weighting filter → mean square → gating → LUFS.
- *
- * K-weighting consists of two cascaded biquad filters:
- * 1. Pre-filter (high shelf at ~1681 Hz, +3.9997 dB) — models head diffraction
- * 2. RLB (revised low-frequency B-weighting) high-pass at ~38.1 Hz
- *
- * Dependencies: DspMath.h.
- *
- * @code
- *   dspark::LoudnessMeter<float> meter;
- *   meter.prepare(48000.0, 2);  // 48 kHz, stereo
- *
- *   // In audio callback:
- *   meter.process(leftData, rightData, numSamples);
- *
- *   // Read loudness:
- *   float momentary = meter.getMomentaryLUFS();
- *   float shortTerm = meter.getShortTermLUFS();
- *   float integrated = meter.getIntegratedLUFS();
- * @endcode
+ * @brief Thread-safe EBU R128 / ITU-R BS.1770 loudness meter.
  */
 
 #include "../Core/DspMath.h"
@@ -43,15 +13,23 @@
 #include "../Core/AudioBuffer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <numbers>
-#include <vector>
+#include <array>
 
 namespace dspark {
 
 /**
  * @class LoudnessMeter
- * @brief EBU R128 loudness meter with momentary, short-term, and integrated measurements.
+ * @brief Real-time safe EBU R128 loudness meter.
+ *
+ * Implements Momentary (400ms), Short-Term (3s), and Integrated (gated) measurements.
+ * Utilizes a constant-memory histogram for infinite integrated loudness tracking
+ * without memory allocation or O(N) CPU scaling, ensuring strict RT compliance.
+ *
+ * All readout methods (`getMomentaryLUFS`, etc.) are lock-free and thread-safe
+ * to be called from GUI threads while the audio thread is processing.
  *
  * @tparam T Sample type (float or double).
  */
@@ -60,50 +38,34 @@ class LoudnessMeter
 {
 public:
     /**
-     * @brief Prepares the loudness meter.
-     *
-     * @param sampleRate Sample rate in Hz (must be 44100 or 48000 for standard compliance).
-     * @param numChannels Number of channels (1 = mono, 2 = stereo).
+     * @brief Prepares the meter and pre-calculates filter coefficients.
+     * @param sampleRate Sample rate in Hz (must be > 0).
+     * @param numChannels Number of channels (currently up to 2 supported).
      */
     void prepare(double sampleRate, int numChannels = 2)
     {
+        if (sampleRate <= 0.0) return;
+        
         sampleRate_ = sampleRate;
-        numChannels_ = std::min(numChannels, kMaxChannels);
+        numChannels_ = std::clamp(numChannels, 1, kMaxChannels);
 
-        // Compute K-weighting filter coefficients for this sample rate
         computeKWeighting(sampleRate);
 
-        // Calculate block sizes for 100ms measurement blocks
-        // (EBU R128 specifies 400ms with 75% overlap = 100ms hop)
-        blockSamples_ = static_cast<int>(sampleRate * 0.1); // 100 ms
-        momentaryBlocks_ = 4;  // 4 * 100ms = 400ms
-        shortTermBlocks_ = 30; // 30 * 100ms = 3s
-
-        // Allocate ring buffer for block powers
-        blockPowers_.assign(static_cast<size_t>(shortTermBlocks_), T(0));
-        blockWritePos_ = 0;
-        currentBlockPower_ = T(0);
-        currentBlockSamples_ = 0;
-
-        // Integrated loudness gating — pre-allocate for up to 2 hours at 100ms blocks
-        constexpr size_t kMaxBlocks = 72000; // 2h at 100ms per block
-        allBlockPowers_.assign(kMaxBlocks, T(0));
-        allBlockCount_ = 0;
-        gatedPowerSum_ = 0.0;
-        gatedBlockCount_ = 0;
-
+        // 100 ms block length
+        blockSamples_ = static_cast<int>(sampleRate * 0.1);
+        
         reset();
     }
 
-    /** @brief Prepares from AudioSpec (unified API). */
+    /** @brief Unified API preparation. */
     void prepare(const AudioSpec& spec)
     {
         prepare(spec.sampleRate, spec.numChannels);
     }
 
     /**
-     * @brief Processes an AudioBufferView (unified API, read-only).
-     * @param buffer Audio buffer.
+     * @brief Processes an interleaved or non-interleaved buffer (Read-only).
+     * @param buffer AudioBufferView to analyze.
      */
     void processBlock(AudioBufferView<const T> buffer) noexcept
     {
@@ -116,143 +78,114 @@ public:
     }
 
     /**
-     * @brief Processes mono audio.
-     * @param data Audio samples.
-     * @param numSamples Number of samples.
+     * @brief Processes a mono block of samples.
+     * @param data Pointer to mono audio data.
+     * @param numSamples Number of samples to process.
      */
     void process(const T* data, int numSamples) noexcept
     {
         for (int i = 0; i < numSamples; ++i)
         {
-            T filtered = applyKWeighting(data[i], 0);
+            double filtered = applyKWeighting(static_cast<double>(data[i]), 0);
             currentBlockPower_ += filtered * filtered;
-            ++currentBlockSamples_;
-
-            if (currentBlockSamples_ >= blockSamples_)
+            
+            if (++currentBlockSamples_ >= blockSamples_)
                 commitBlock();
         }
     }
 
     /**
-     * @brief Processes stereo audio.
-     * @param left Left channel samples.
-     * @param right Right channel samples.
+     * @brief Processes a stereo block of samples.
+     * @param left Pointer to left channel data.
+     * @param right Pointer to right channel data.
      * @param numSamples Number of samples per channel.
      */
     void process(const T* left, const T* right, int numSamples) noexcept
     {
         for (int i = 0; i < numSamples; ++i)
         {
-            T filtL = applyKWeighting(left[i], 0);
-            T filtR = applyKWeighting(right[i], 1);
+            double filtL = applyKWeighting(static_cast<double>(left[i]), 0);
+            double filtR = applyKWeighting(static_cast<double>(right[i]), 1);
 
-            // Sum of per-channel mean-square (ITU-R BS.1770-4: sum, not average)
-            T power = filtL * filtL + filtR * filtR;
-            currentBlockPower_ += power;
-            ++currentBlockSamples_;
-
-            if (currentBlockSamples_ >= blockSamples_)
+            currentBlockPower_ += (filtL * filtL + filtR * filtR);
+            
+            if (++currentBlockSamples_ >= blockSamples_)
                 commitBlock();
         }
     }
 
-    // -- Loudness readouts --------------------------------------------------------
-
     /**
-     * @brief Returns the momentary loudness (400 ms window).
-     * @return Loudness in LUFS.
+     * @brief Reads the Momentary loudness (400 ms window).
+     * @return Loudness in LUFS (minimum -100.0).
      */
     [[nodiscard]] T getMomentaryLUFS() const noexcept
     {
-        T sum = T(0);
-        int count = 0;
-        for (int i = 0; i < momentaryBlocks_; ++i)
-        {
-            int idx = (blockWritePos_ - 1 - i + static_cast<int>(blockPowers_.size()))
-                      % static_cast<int>(blockPowers_.size());
-            sum += blockPowers_[static_cast<size_t>(idx)];
-            ++count;
-        }
-
-        if (count == 0) return T(-100);
-        T meanPower = sum / static_cast<T>(count);
-        return powerToLUFS(meanPower);
+        return calculateLUFSFromBlocks(4);
     }
 
     /**
-     * @brief Returns the short-term loudness (3 second window).
-     * @return Loudness in LUFS.
+     * @brief Reads the Short-term loudness (3 second window).
+     * @return Loudness in LUFS (minimum -100.0).
      */
     [[nodiscard]] T getShortTermLUFS() const noexcept
     {
-        T sum = T(0);
-        int count = std::min(shortTermBlocks_, static_cast<int>(blockPowers_.size()));
-        for (int i = 0; i < count; ++i)
-        {
-            int idx = (blockWritePos_ - 1 - i + static_cast<int>(blockPowers_.size()))
-                      % static_cast<int>(blockPowers_.size());
-            sum += blockPowers_[static_cast<size_t>(idx)];
-        }
-
-        if (count == 0) return T(-100);
-        T meanPower = sum / static_cast<T>(count);
-        return powerToLUFS(meanPower);
+        return calculateLUFSFromBlocks(30);
     }
 
     /**
-     * @brief Returns the integrated loudness (entire programme with gating).
-     *
-     * Uses the two-pass gating algorithm specified by EBU R128:
-     * 1. Absolute gate at -70 LUFS
-     * 2. Relative gate at -10 LU below ungated mean
-     *
-     * @return Integrated loudness in LUFS.
+     * @brief Computes the Integrated loudness using standard two-pass gating.
+     * @note Executed in O(1) time thanks to the histogram implementation. Safe for RT thread.
+     * @return Loudness in LUFS (minimum -100.0).
      */
     [[nodiscard]] T getIntegratedLUFS() const noexcept
     {
-        if (allBlockCount_ == 0) return T(-100);
+        // Pass 1: Absolute Gate (-70 LUFS)
+        double sumPowerUngated = 0.0;
+        uint32_t countUngated = 0;
 
-        // Pass 1: absolute gate at -70 LUFS
-        T absGatePower = lufsTopower(T(-70));
-        double sum1 = 0.0;
-        int count1 = 0;
-
-        for (int b = 0; b < allBlockCount_; ++b)
+        for (int i = 0; i < kNumBins; ++i)
         {
-            T p = allBlockPowers_[static_cast<size_t>(b)];
-            if (p > absGatePower)
+            uint32_t binCount = histogram_[i].load(std::memory_order_relaxed);
+            if (binCount > 0)
             {
-                sum1 += static_cast<double>(p);
-                ++count1;
+                double binPower = lufsToPower(kMinHistogramLUFS + static_cast<double>(i) * kBinWidth);
+                sumPowerUngated += binPower * binCount;
+                countUngated += binCount;
             }
         }
 
-        if (count1 == 0) return T(-100);
+        if (countUngated == 0) return T(-100);
 
-        // Pass 2: relative gate at ungatedMean - 10 LU
-        T ungatedMean = static_cast<T>(sum1 / count1);
-        T relGateLUFS = powerToLUFS(ungatedMean) - T(10);
-        T relGatePower = lufsTopower(relGateLUFS);
+        double meanPowerUngated = sumPowerUngated / countUngated;
+        double ungatedLUFS = powerToLUFS(meanPowerUngated);
 
-        double sum2 = 0.0;
-        int count2 = 0;
+        // Pass 2: Relative Gate (-10 LU below ungated mean)
+        double relativeGateLUFS = ungatedLUFS - 10.0;
+        int relativeGateBin = static_cast<int>(std::floor((relativeGateLUFS - kMinHistogramLUFS) / kBinWidth));
+        relativeGateBin = std::clamp(relativeGateBin, 0, kNumBins - 1);
 
-        for (int b = 0; b < allBlockCount_; ++b)
+        double sumPowerGated = 0.0;
+        uint32_t countGated = 0;
+
+        for (int i = relativeGateBin; i < kNumBins; ++i)
         {
-            T p = allBlockPowers_[static_cast<size_t>(b)];
-            if (p > relGatePower)
+            uint32_t binCount = histogram_[i].load(std::memory_order_relaxed);
+            if (binCount > 0)
             {
-                sum2 += static_cast<double>(p);
-                ++count2;
+                double binPower = lufsToPower(kMinHistogramLUFS + static_cast<double>(i) * kBinWidth);
+                sumPowerGated += binPower * binCount;
+                countGated += binCount;
             }
         }
 
-        if (count2 == 0) return T(-100);
-        return powerToLUFS(static_cast<T>(sum2 / count2));
+        if (countGated == 0) return T(-100);
+
+        return static_cast<T>(powerToLUFS(sumPowerGated / countGated));
     }
 
     /**
-     * @brief Resets the meter state.
+     * @brief Clears all measurements and resets filters.
+     * Lock-free, but may tear slightly if audio thread is simultaneously writing.
      */
     void reset() noexcept
     {
@@ -262,135 +195,139 @@ public:
             rlbState_[ch] = {};
         }
 
-        std::fill(blockPowers_.begin(), blockPowers_.end(), T(0));
-        blockWritePos_ = 0;
-        currentBlockPower_ = T(0);
+        for (auto& power : blockPowers_)
+            power.store(0.0, std::memory_order_relaxed);
+
+        for (auto& bin : histogram_)
+            bin.store(0, std::memory_order_relaxed);
+
+        blockWritePos_.store(0, std::memory_order_relaxed);
+        currentBlockPower_ = 0.0;
         currentBlockSamples_ = 0;
-        allBlockCount_ = 0;
-        gatedPowerSum_ = 0.0;
-        gatedBlockCount_ = 0;
     }
 
 private:
-    static constexpr int kMaxChannels = 8;
+    static constexpr int kMaxChannels = 2; // Expandable to 8 with proper spatial weighting
+    
+    // Histogram specs: -70 LUFS to +30 LUFS with 0.1 resolution = 1000 bins
+    static constexpr double kMinHistogramLUFS = -70.0;
+    static constexpr double kMaxHistogramLUFS = 30.0;
+    static constexpr double kBinWidth = 0.1;
+    static constexpr int kNumBins = 1000;
 
-    // K-weighting biquad state
-    struct BiquadState
-    {
-        T z1 = T(0), z2 = T(0);
-    };
-
-    // K-weighting biquad coefficients
-    struct BiquadCoeff
-    {
-        T b0 = T(1), b1 = T(0), b2 = T(0);
-        T a1 = T(0), a2 = T(0);
-    };
+    // Filters state (Forced to double to prevent DF2T precision issues)
+    struct BiquadState { double z1 = 0.0, z2 = 0.0; };
+    struct BiquadCoeff { double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0; };
 
     void computeKWeighting(double sr)
     {
-        // Stage 1: Pre-filter (high shelf)
-        // ITU-R BS.1770-4 coefficients derived analytically
-        double fc = 1681.97;
-        double G = 3.99984;  // dB
-        double Q = 0.7071067811865476;
-
+        // Exact equations derived from ITU-R BS.1770-4
+        double fc = 1681.97, G = 3.99984, Q = 0.70710678;
         double A = std::pow(10.0, G / 40.0);
         double w0 = 2.0 * std::numbers::pi * fc / sr;
-        double cosw0 = std::cos(w0);
-        double sinw0 = std::sin(w0);
-        double alpha = sinw0 / (2.0 * Q);
+        double alpha = std::sin(w0) / (2.0 * Q);
 
-        double a0 = (A + 1.0) - (A - 1.0) * cosw0 + 2.0 * std::sqrt(A) * alpha;
-        pre_.b0 = static_cast<T>(( A * ((A + 1.0) + (A - 1.0) * cosw0 + 2.0 * std::sqrt(A) * alpha)) / a0);
-        pre_.b1 = static_cast<T>((-2.0 * A * ((A - 1.0) + (A + 1.0) * cosw0)) / a0);
-        pre_.b2 = static_cast<T>(( A * ((A + 1.0) + (A - 1.0) * cosw0 - 2.0 * std::sqrt(A) * alpha)) / a0);
-        pre_.a1 = static_cast<T>(( 2.0 * ((A - 1.0) - (A + 1.0) * cosw0)) / a0);
-        pre_.a2 = static_cast<T>(((A + 1.0) - (A - 1.0) * cosw0 - 2.0 * std::sqrt(A) * alpha) / a0);
+        double a0 = (A + 1.0) - (A - 1.0) * std::cos(w0) + 2.0 * std::sqrt(A) * alpha;
+        pre_.b0 = (A * ((A + 1.0) + (A - 1.0) * std::cos(w0) + 2.0 * std::sqrt(A) * alpha)) / a0;
+        pre_.b1 = (-2.0 * A * ((A - 1.0) + (A + 1.0) * std::cos(w0))) / a0;
+        pre_.b2 = (A * ((A + 1.0) + (A - 1.0) * std::cos(w0) - 2.0 * std::sqrt(A) * alpha)) / a0;
+        pre_.a1 = (2.0 * ((A - 1.0) - (A + 1.0) * std::cos(w0))) / a0;
+        pre_.a2 = (((A + 1.0) - (A - 1.0) * std::cos(w0) - 2.0 * std::sqrt(A) * alpha)) / a0;
 
-        // Stage 2: RLB high-pass
-        double fc2 = 38.13547087602444;
-        double Q2 = 0.5003270373238773;
-
+        double fc2 = 38.13547, Q2 = 0.500327;
         double w02 = 2.0 * std::numbers::pi * fc2 / sr;
-        double cosw02 = std::cos(w02);
-        double sinw02 = std::sin(w02);
-        double alpha2 = sinw02 / (2.0 * Q2);
+        double alpha2 = std::sin(w02) / (2.0 * Q2);
 
         double a02 = 1.0 + alpha2;
-        rlb_.b0 = static_cast<T>((1.0 + cosw02) / 2.0 / a02);
-        rlb_.b1 = static_cast<T>(-(1.0 + cosw02) / a02);
-        rlb_.b2 = static_cast<T>((1.0 + cosw02) / 2.0 / a02);
-        rlb_.a1 = static_cast<T>(-2.0 * cosw02 / a02);
-        rlb_.a2 = static_cast<T>((1.0 - alpha2) / a02);
+        rlb_.b0 = (1.0 + std::cos(w02)) / 2.0 / a02;
+        rlb_.b1 = -(1.0 + std::cos(w02)) / a02;
+        rlb_.b2 = (1.0 + std::cos(w02)) / 2.0 / a02;
+        rlb_.a1 = -2.0 * std::cos(w02) / a02;
+        rlb_.a2 = (1.0 - alpha2) / a02;
     }
 
-    T applyBiquad(T input, const BiquadCoeff& c, BiquadState& s) noexcept
+    double applyBiquad(double input, const BiquadCoeff& c, BiquadState& s) noexcept
     {
-        T output = c.b0 * input + s.z1;
+        // Adding 1e-18 protects against denormal numbers (Flush-To-Zero fallback)
+        double output = c.b0 * input + s.z1;
         s.z1 = c.b1 * input - c.a1 * output + s.z2;
-        s.z2 = c.b2 * input - c.a2 * output;
+        s.z2 = c.b2 * input - c.a2 * output + 1e-18; 
         return output;
     }
 
-    T applyKWeighting(T input, int channel) noexcept
+    double applyKWeighting(double input, int channel) noexcept
     {
-        T x = applyBiquad(input, pre_, preState_[channel]);
+        double x = applyBiquad(input, pre_, preState_[channel]);
         return applyBiquad(x, rlb_, rlbState_[channel]);
     }
 
     void commitBlock() noexcept
     {
-        T meanPower = currentBlockPower_ / static_cast<T>(currentBlockSamples_);
+        double meanPower = currentBlockPower_ / currentBlockSamples_;
 
-        blockPowers_[static_cast<size_t>(blockWritePos_)] = meanPower;
-        blockWritePos_ = (blockWritePos_ + 1) % static_cast<int>(blockPowers_.size());
+        // Update sliding window ring buffer
+        int currentPos = blockWritePos_.load(std::memory_order_relaxed);
+        blockPowers_[currentPos].store(meanPower, std::memory_order_relaxed);
+        
+        int nextPos = (currentPos + 1) % 30; // 30 blocks = 3s max window
+        blockWritePos_.store(nextPos, std::memory_order_release);
 
-        // Store for integrated loudness (pre-allocated, no RT heap alloc)
-        if (allBlockCount_ < static_cast<int>(allBlockPowers_.size()))
+        // Update histogram if block passes absolute gate
+        double lufs = powerToLUFS(meanPower);
+        if (lufs >= kMinHistogramLUFS)
         {
-            allBlockPowers_[static_cast<size_t>(allBlockCount_)] = meanPower;
-            ++allBlockCount_;
+            int binIndex = static_cast<int>(std::round((lufs - kMinHistogramLUFS) / kBinWidth));
+            binIndex = std::clamp(binIndex, 0, kNumBins - 1);
+            
+            // Atomically increment the bin
+            histogram_[binIndex].fetch_add(1, std::memory_order_relaxed);
         }
-        // After buffer full, stop accumulating new blocks for integrated loudness.
-        // The 2-hour window is sufficient for all practical broadcast use cases.
 
-        currentBlockPower_ = T(0);
+        currentBlockPower_ = 0.0;
         currentBlockSamples_ = 0;
     }
 
-    [[nodiscard]] static T powerToLUFS(T meanPower) noexcept
+    T calculateLUFSFromBlocks(int numBlocks) const noexcept
     {
-        if (meanPower <= T(0)) return T(-100);
-        return T(-0.691) + T(10) * std::log10(meanPower);
+        double sum = 0.0;
+        int currentPos = blockWritePos_.load(std::memory_order_acquire);
+        
+        for (int i = 0; i < numBlocks; ++i)
+        {
+            int idx = (currentPos - 1 - i + 30) % 30;
+            sum += blockPowers_[idx].load(std::memory_order_relaxed);
+        }
+
+        return static_cast<T>(powerToLUFS(sum / numBlocks));
     }
 
-    [[nodiscard]] static T lufsTopower(T lufs) noexcept
+    [[nodiscard]] static double powerToLUFS(double meanPower) noexcept
     {
-        return std::pow(T(10), (lufs + T(0.691)) / T(10));
+        if (meanPower <= 1e-10) return -100.0; // Prevent log10(0)
+        return -0.691 + 10.0 * std::log10(meanPower);
+    }
+
+    [[nodiscard]] static double lufsToPower(double lufs) noexcept
+    {
+        return std::pow(10.0, (lufs + 0.691) / 10.0);
     }
 
     double sampleRate_ = 48000.0;
     int numChannels_ = 2;
 
-    // K-weighting filters
     BiquadCoeff pre_, rlb_;
     BiquadState preState_[kMaxChannels], rlbState_[kMaxChannels];
 
-    // Block measurement
-    int blockSamples_ = 4800;      // 100 ms at 48 kHz
-    int momentaryBlocks_ = 4;       // 400 ms
-    int shortTermBlocks_ = 30;      // 3 s
-    std::vector<T> blockPowers_;
-    int blockWritePos_ = 0;
-    T currentBlockPower_ = T(0);
+    int blockSamples_ = 4800;
+    double currentBlockPower_ = 0.0;
     int currentBlockSamples_ = 0;
 
-    // Integrated loudness (pre-allocated, no RT heap allocation)
-    std::vector<T> allBlockPowers_;
-    int allBlockCount_ = 0;
-    double gatedPowerSum_ = 0.0;
-    int gatedBlockCount_ = 0;
+    // Concurrency-safe components
+    std::array<std::atomic<double>, 30> blockPowers_; 
+    std::atomic<int> blockWritePos_{0};
+    
+    // O(1) Histogram for Integrated Loudness
+    std::array<std::atomic<uint32_t>, kNumBins> histogram_;
 };
 
 } // namespace dspark

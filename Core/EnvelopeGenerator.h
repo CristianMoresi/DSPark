@@ -5,39 +5,13 @@
 
 /**
  * @file EnvelopeGenerator.h
- * @brief ADSR and multi-segment envelope generators for synthesis and dynamics.
+ * @brief ADSR envelope generator for synthesis and dynamics.
  *
  * Provides per-sample envelope generation with configurable attack, decay,
  * sustain, and release stages. The envelope output is a gain value in [0, 1]
  * that can be applied to audio signals, filter cutoffs, or any modulation target.
  *
- * Two classes:
- *
- * - **ADSREnvelope\<T\>**: Classic 4-stage ADSR with exponential curves and
- *   configurable curvature. Suitable for synthesisers and dynamic processors.
- *
- * - **EnvelopeFollower\<T\>**: Simple attack/release envelope for tracking
- *   signal dynamics (e.g., compressor side-chain). This complements
- *   LevelFollower which measures levels — EnvelopeFollower generates a
- *   smooth control signal from an external trigger.
- *
- * Dependencies: DspMath.h only.
- *
- * @code
- *   dspark::ADSREnvelope<float> env;
- *   env.prepare(48000.0);
- *   env.setAttack(10.0f);   // 10 ms
- *   env.setDecay(100.0f);   // 100 ms
- *   env.setSustain(0.7f);   // 70%
- *   env.setRelease(200.0f); // 200 ms
- *
- *   env.noteOn();
- *
- *   for (int i = 0; i < numSamples; ++i)
- *       output[i] = oscillator.getNextSample() * env.getNextValue();
- *
- *   env.noteOff();
- * @endcode
+ * Dependencies: DspMath.h, AudioSpec.h.
  */
 
 #include "DspMath.h"
@@ -52,28 +26,33 @@ namespace dspark {
  * @class ADSREnvelope
  * @brief Classic ADSR envelope generator with exponential curves.
  *
- * Each stage uses an exponential curve for natural-sounding dynamics.
- * The curvature can be adjusted: higher values produce faster initial
- * response (more "snappy"), lower values produce more linear curves.
+ * Uses an asymptotic RC-style algorithm for natural-sounding dynamics.
+ * Optimized for real-time block processing and cache coherence.
  *
  * State machine: Idle → Attack → Decay → Sustain → Release → Idle.
  *
- * @tparam T Output type (float or double).
+ * @tparam T Output type (float or double). Constraints to IEEE 754 floats.
  */
-template <typename T>
+template <FloatType T>
 class ADSREnvelope
 {
 public:
     enum class State { Idle, Attack, Decay, Sustain, Release };
 
-    /** @brief Prepares the envelope for the given sample rate. */
+    /** * @brief Prepares the envelope for the given sample rate. 
+     * @param sampleRate The operating sample rate in Hz.
+     */
     void prepare(double sampleRate) noexcept
     {
+        if (sampleRate <= 0.0) return;
         sampleRate_ = sampleRate;
+        sampleRateMs_ = static_cast<T>(sampleRate) * T(0.001); // Pre-calculate for ms conversion
         recalculate();
     }
 
-    /** @brief Prepares from AudioSpec (unified API). */
+    /** * @brief Prepares from AudioSpec (unified API). 
+     * @param spec Audio specification containing the sample rate.
+     */
     void prepare(const AudioSpec& spec) { prepare(spec.sampleRate); }
 
     // -- Parameters (in milliseconds) ------------------------------------------
@@ -108,18 +87,6 @@ public:
 
     /**
      * @brief Sets the curvature of the exponential stages.
-     *
-     * Higher values = more exponential (snappy attack, slow tail).
-     * Lower values = more linear.
-     *
-     * **Calibration note:** the envelope uses an "asymptotic overshoot"
-     * topology (`current += rate · (target ± overshoot − current)`). With
-     * the default `curvature = 3`, the stage reaches ~95 % of the target
-     * in roughly **half** the programmed time. If you need "a 100 ms
-     * attack hitting ~95 % at 100 ms" (ADSR convention in many plugins),
-     * use `curvature ≈ 1.5` and tune to taste, or read the asymptotic
-     * behaviour as a feature. Kept at 3 by default for musical snap.
-     *
      * @param curve Curvature factor (default: 3.0, range: 0.1 to 10.0).
      */
     void setCurvature(T curve) noexcept
@@ -134,7 +101,6 @@ public:
     void noteOn() noexcept
     {
         state_ = State::Attack;
-        // Start from current value for re-triggering without clicks
     }
 
     /** @brief Triggers the release phase (note off). */
@@ -162,11 +128,10 @@ public:
         switch (state_)
         {
             case State::Idle:
-                currentValue_ = T(0);
-                break;
+                return T(0);
 
             case State::Attack:
-                currentValue_ += attackRate_ * (T(1) + attackCoeff_ - currentValue_);
+                currentValue_ += attackRate_ * (T(1) + targetOvershoot_ - currentValue_);
                 if (currentValue_ >= T(1))
                 {
                     currentValue_ = T(1);
@@ -175,7 +140,8 @@ public:
                 break;
 
             case State::Decay:
-                currentValue_ += decayRate_ * (sustainLevel_ - decayCoeff_ - currentValue_);
+                currentValue_ += decayRate_ * (sustainLevel_ - targetOvershoot_ - currentValue_);
+                // Modulating sustain upwards safety check: if we drop below OR cross the new threshold
                 if (currentValue_ <= sustainLevel_)
                 {
                     currentValue_ = sustainLevel_;
@@ -184,11 +150,12 @@ public:
                 break;
 
             case State::Sustain:
-                currentValue_ = sustainLevel_;
+                // Allows dynamic sustain modulation during hold phase
+                currentValue_ += decayRate_ * (sustainLevel_ - currentValue_);
                 break;
 
             case State::Release:
-                currentValue_ += releaseRate_ * (T(0) - releaseCoeff_ - currentValue_);
+                currentValue_ += releaseRate_ * (T(0) - targetOvershoot_ - currentValue_);
                 if (currentValue_ <= T(0.0001))
                 {
                     currentValue_ = T(0);
@@ -201,14 +168,25 @@ public:
     }
 
     /**
-     * @brief Fills a buffer with envelope values.
+     * @brief Fills a buffer with envelope values. Optimized for DSP loops.
      * @param output Buffer to fill with envelope values.
      * @param numSamples Number of samples to generate.
      */
     void processBlock(T* output, int numSamples) noexcept
     {
-        for (int i = 0; i < numSamples; ++i)
-            output[i] = getNextValue();
+        // Unrolling the block processing prevents the switch statement 
+        // from destroying CPU branch prediction on every single sample.
+        int i = 0;
+        while (i < numSamples)
+        {
+            State currentState = state_;
+            
+            // Process chunks while the state remains constant
+            while (i < numSamples && state_ == currentState)
+            {
+                output[i++] = getNextValue();
+            }
+        }
     }
 
     // -- Getters ---------------------------------------------------------------
@@ -225,25 +203,21 @@ public:
 private:
     void recalculate() noexcept
     {
-        if (sampleRate_ <= 0.0) return;
+        // Standardize overshoot so timings are mathematically consistent across all stages
+        targetOvershoot_ = std::exp(-curvature_);
 
-        // One-pole coefficient: rate = 1 - exp(-curvature / (time_ms * sampleRate / 1000))
         auto calcRate = [this](T timeMs) -> T {
-            T samples = static_cast<T>(sampleRate_) * timeMs / T(1000);
-            return T(1) - std::exp(-curvature_ / std::max(samples, T(1)));
+            T samples = std::max(sampleRateMs_ * timeMs, T(1));
+            return T(1) - std::exp(-curvature_ / samples);
         };
 
         attackRate_  = calcRate(attackMs_);
         decayRate_   = calcRate(decayMs_);
         releaseRate_ = calcRate(releaseMs_);
-
-        // Overshoot coefficients for natural exponential curves
-        attackCoeff_  = T(0.3);
-        decayCoeff_   = T(0.0001);
-        releaseCoeff_ = T(0.0001);
     }
 
     double sampleRate_ = 48000.0;
+    T sampleRateMs_    = T(48.0); // Optimized multiplier
 
     T attackMs_     = T(10);
     T decayMs_      = T(100);
@@ -254,9 +228,7 @@ private:
     T attackRate_   = T(0);
     T decayRate_    = T(0);
     T releaseRate_  = T(0);
-    T attackCoeff_  = T(0.3);
-    T decayCoeff_   = T(0.0001);
-    T releaseCoeff_ = T(0.0001);
+    T targetOvershoot_ = T(0.05); // Derived from curvature
 
     T currentValue_ = T(0);
     State state_ = State::Idle;

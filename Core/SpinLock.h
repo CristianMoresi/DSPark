@@ -50,37 +50,50 @@ namespace dspark {
 
 /**
  * @class SpinLock
- * @brief A minimal, real-time safe spin lock.
+ * @brief A minimal, real-time safe spin lock utilizing C++20 TTAS optimization.
  *
- * - `lock()` busy-waits until the lock is acquired (suitable for RT threads
- *   when the protected section is guaranteed to be very short).
- * - `tryLock()` attempts a single acquire without waiting — ideal for the
- *   audio thread where blocking must be avoided.
- * - `unlock()` releases the lock.
- *
- * Use `ScopedLock` for RAII locking and `ScopedTryLock` for non-blocking attempts.
+ * Fulfills the C++ BasicLockable requirements.
+ * - `lock()` busy-waits using a Test-and-Test-and-Set (TTAS) pattern to avoid cache thrashing.
+ * - `tryLock()` attempts a single acquire without waiting — mandatory for the audio thread.
+ * - `unlock()` releases the lock safely.
  */
 class SpinLock
 {
 public:
-    SpinLock() = default;
+    /** @brief Constructs an unlocked SpinLock. */
+    SpinLock() noexcept = default;
 
     SpinLock(const SpinLock&)            = delete;
     SpinLock& operator=(const SpinLock&) = delete;
 
     /**
      * @brief Acquires the lock, spinning until successful.
+     * 
+     * Employs a C++20 TTAS (Test-and-Test-and-Set) loop. It reads the flag 
+     * with memory_order_relaxed to keep the cache line in a shared state, 
+     * avoiding bus traffic until the lock appears free.
+     * 
      * @note Call only when the lock holder is guaranteed to release quickly.
      */
     void lock() noexcept
     {
-        while (flag_.test_and_set(std::memory_order_acquire))
-            DSPARK_SPIN_PAUSE(); // Hint CPU to yield resources during spin
+        for (;;) 
+        {
+            // Attempt to grab the lock
+            if (!flag_.test_and_set(std::memory_order_acquire)) {
+                return;
+            }
+            
+            // Spin on a relaxed read to prevent cache line bouncing (C++20 feature)
+            while (flag_.test(std::memory_order_relaxed)) {
+                DSPARK_SPIN_PAUSE(); // Hint CPU to yield resources during spin
+            }
+        }
     }
 
     /**
      * @brief Attempts to acquire the lock without waiting.
-     * @return true if the lock was acquired, false if it was already held.
+     * @return true if the lock was successfully acquired, false if it was already held.
      */
     [[nodiscard]] bool tryLock() noexcept
     {
@@ -88,7 +101,7 @@ public:
     }
 
     /**
-     * @brief Releases the lock.
+     * @brief Releases the lock, restoring it to the clear state.
      */
     void unlock() noexcept
     {
@@ -104,7 +117,13 @@ public:
     class ScopedLock
     {
     public:
+        /**
+         * @brief Constructs the guard and blocks until the lock is acquired.
+         * @param spinLock The SpinLock to manage.
+         */
         explicit ScopedLock(SpinLock& spinLock) noexcept : lock_(spinLock) { lock_.lock(); }
+        
+        /** @brief Destructs the guard and releases the lock. */
         ~ScopedLock() noexcept { lock_.unlock(); }
 
         ScopedLock(const ScopedLock&)            = delete;
@@ -118,17 +137,26 @@ public:
      * @class ScopedTryLock
      * @brief RAII wrapper that *tries* to acquire the lock without blocking.
      *
-     * Check `isLocked()` before accessing the protected resource.
+     * Check `isLocked()` before accessing the protected resource. Essential for
+     * reading shared data safely within the real-time audio thread.
      */
     class ScopedTryLock
     {
     public:
+        /**
+         * @brief Constructs the guard and attempts a single lock acquisition.
+         * @param spinLock The SpinLock to attempt to manage.
+         */
         explicit ScopedTryLock(SpinLock& spinLock) noexcept
             : lock_(spinLock), acquired_(spinLock.tryLock()) {}
 
+        /** @brief Destructs the guard and releases the lock ONLY if it was successfully acquired. */
         ~ScopedTryLock() noexcept { if (acquired_) lock_.unlock(); }
 
-        /** @brief Returns true if the lock was successfully acquired. */
+        /**
+         * @brief Queries whether the lock acquisition was successful.
+         * @return true if the lock is held by this guard, false otherwise.
+         */
         [[nodiscard]] bool isLocked() const noexcept { return acquired_; }
 
         ScopedTryLock(const ScopedTryLock&)            = delete;
@@ -140,7 +168,9 @@ public:
     };
 
 private:
-    std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+    // C++20 default initialization correctly sets the atomic_flag to the clear state.
+    // ATOMIC_FLAG_INIT is deprecated in C++20 and removed in C++26.
+    std::atomic_flag flag_{};
 };
 
 } // namespace dspark

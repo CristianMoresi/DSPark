@@ -1,0 +1,88 @@
+# =============================================================================
+# DSPark — gitignore
+# =============================================================================
+
+# -- Private (never published) ------------------------------------------------
+.claude/
+CLAUDE.md
+tests/
+
+# -- Compiled binaries --------------------------------------------------------
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.lai
+*.la
+*.exp
+
+# -- Compiled object files / debug info ---------------------------------------
+*.o
+*.obj
+*.pdb
+*.idb
+*.ilk
+*.tlog
+*.iobj
+*.ipdb
+*.map
+*.gch
+*.pch
+
+# -- MSVC / Visual Studio build output ----------------------------------------
+[Dd]ebug/
+[Rr]elease/
+[Xx]64/
+[Xx]86/
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+
+# -- CMake / Ninja ------------------------------------------------------------
+build/
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+Makefile
+*.cbp
+
+# -- DSParkLab runtime artefacts ---------------------------------------------
+DSParkLab/imgui.ini
+DSParkLab/build_log.txt
+
+# -- Diagnostic / log files ---------------------------------------------------
+*.log
+
+# -- IDEs ---------------------------------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.code-workspace
+
+# -- Backup / swap / editor temp files ---------------------------------------
+*~
+*.bak
+*.swp
+*.swo
+*.orig
+*.rej
+
+# -- OS metadata --------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/

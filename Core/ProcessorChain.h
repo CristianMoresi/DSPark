@@ -11,28 +11,9 @@
  * and reset as a single unit. Uses `std::tuple` internally — all dispatch
  * is resolved at compile time with zero runtime overhead.
  *
- * Each processor in the chain must satisfy the AudioProcessor concept
- * (i.e., have `prepare(AudioSpec)`, `processBlock(AudioBufferView<T>)`, and `reset()`).
+ * Each processor in the chain should satisfy the framework's AudioProcessor concept.
  *
  * Dependencies: ProcessorTraits.h, AudioSpec.h, AudioBuffer.h.
- *
- * @code
- *   // Build a chain: highpass → compressor → gain
- *   dspark::ProcessorChain<float,
- *       dspark::FilterEngine<float>,
- *       dspark::Compressor<float>,
- *       dspark::Gain<float>> chain;
- *
- *   // Configure
- *   chain.prepare(spec);
- *   chain.get<0>().setHighPass(80.0f);
- *   chain.get<1>().setThreshold(-20.0f);
- *   chain.get<1>().setRatio(4.0f);
- *   chain.get<2>().setGainDb(-3.0f);
- *
- *   // In audio callback — processes all three in order:
- *   chain.processBlock(buffer);
- * @endcode
  */
 
 #include "ProcessorTraits.h"
@@ -40,6 +21,8 @@
 #include <cstddef>
 #include <tuple>
 #include <utility>
+#include <array>
+#include <atomic>
 
 namespace dspark {
 
@@ -50,12 +33,14 @@ namespace dspark {
  * Processors are stored in a `std::tuple` and invoked in order.
  * Access individual processors via `get<Index>()` to configure parameters.
  *
- * @tparam T           Sample type (float or double).
- * @tparam Processors  Processor types (must each satisfy AudioProcessor<P, T>).
+ * @tparam T          Sample type (float or double).
+ * @tparam Processors Processor types. Must be greater than 0.
  */
 template <typename T, typename... Processors>
 class ProcessorChain
 {
+    static_assert(sizeof...(Processors) > 0, "ProcessorChain requires at least one processor.");
+
 public:
     /**
      * @brief Prepares all processors in order.
@@ -78,7 +63,7 @@ public:
     }
 
     /**
-     * @brief Resets all processors.
+     * @brief Resets the internal state of all processors (e.g., clearing delay lines).
      */
     void reset() noexcept
     {
@@ -92,24 +77,24 @@ public:
      *
      * @tparam Index Zero-based index into the chain.
      * @return Reference to the processor.
-     *
-     * @code
-     *   chain.get<0>().setThreshold(-20.0f);
-     *   chain.get<1>().setGainDb(-3.0f);
-     * @endcode
      */
     template <std::size_t Index>
     [[nodiscard]] auto& get() noexcept
     {
+        static_assert(Index < sizeof...(Processors), "Processor index out of bounds.");
         return std::get<Index>(processors_);
     }
 
     /**
      * @brief Const access to the processor at the given index.
+     *
+     * @tparam Index Zero-based index into the chain.
+     * @return Const reference to the processor.
      */
     template <std::size_t Index>
     [[nodiscard]] const auto& get() const noexcept
     {
+        static_assert(Index < sizeof...(Processors), "Processor index out of bounds.");
         return std::get<Index>(processors_);
     }
 
@@ -121,8 +106,12 @@ public:
         return sizeof...(Processors);
     }
 
-    /// @brief Returns the total latency in samples across all processors.
-    /// Only sums from processors that provide a getLatency() method.
+    /**
+     * @brief Returns the total latency in samples across all processors.
+     *
+     * Evaluated at compile-time via requires expressions. Only sums from
+     * processors that provide a `getLatency()` method.
+     */
     [[nodiscard]] int getLatency() const noexcept
     {
         return getLatencyImpl(std::index_sequence_for<Processors...>{});
@@ -131,10 +120,12 @@ public:
     // -- Bypass control ------------------------------------------------------
 
     /**
-     * @brief Bypasses or enables a processor at the given index.
+     * @brief Thread-safe toggle to bypass or enable a processor.
      *
-     * A bypassed processor's processBlock() is skipped entirely —
-     * audio passes through unchanged at that slot.
+     * @warning This is a hard bypass. Toggling this during live playback will cause
+     * audio clicks/pops and phase discontinuities if the processor introduces latency.
+     * For real-time clickless bypass, prefer using dry/wet controls within the 
+     * specific processor itself.
      *
      * @tparam Index Zero-based index into the chain.
      * @param bypassed True to bypass, false to enable.
@@ -143,17 +134,17 @@ public:
     void setBypassed(bool bypassed) noexcept
     {
         static_assert(Index < sizeof...(Processors), "Index out of range");
-        bypassed_[Index] = bypassed;
+        bypassed_[Index].store(bypassed, std::memory_order_relaxed);
     }
 
     /**
-     * @brief Returns whether a processor at the given index is bypassed.
+     * @brief Thread-safe read of the bypass state of a processor.
      */
     template <std::size_t Index>
     [[nodiscard]] bool isBypassed() const noexcept
     {
         static_assert(Index < sizeof...(Processors), "Index out of range");
-        return bypassed_[Index];
+        return bypassed_[Index].load(std::memory_order_relaxed);
     }
 
 private:
@@ -175,11 +166,12 @@ private:
     template <std::size_t... Is>
     void processBlockImpl(AudioBufferView<T> buffer, std::index_sequence<Is...>) noexcept
     {
-        ((!bypassed_[Is] ? std::get<Is>(processors_).processBlock(buffer) : (void)0), ...);
+        // Uses memory_order_relaxed as we only care about the state, no memory synchronization needed
+        ((!bypassed_[Is].load(std::memory_order_relaxed) ? std::get<Is>(processors_).processBlock(buffer) : (void)0), ...);
     }
 
     std::tuple<Processors...> processors_;
-    std::array<bool, sizeof...(Processors)> bypassed_ {};
+    std::array<std::atomic<bool>, sizeof...(Processors)> bypassed_ {};
 };
 
 } // namespace dspark

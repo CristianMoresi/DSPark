@@ -7,47 +7,23 @@
  * @file PitchDetector.h
  * @brief Real-time monophonic pitch detection using the YIN algorithm.
  *
- * Implements the YIN autocorrelation method (de Cheveigné & Kawahara, 2002)
- * with cumulative mean normalized difference and parabolic interpolation.
- * Suitable for tuners, pitch correction, and musical analysis.
- *
- * The detector operates on a ring buffer — push samples in with pushSamples()
- * and query the current detected pitch at any time. Detection runs
- * automatically when enough samples have been accumulated.
- *
- * Dependencies: C++20 standard library only.
- *
- * @code
- *   dspark::PitchDetector<float> detector;
- *   detector.prepare(48000.0);
- *
- *   // In audio callback:
- *   detector.pushSamples(input, blockSize);
- *
- *   // Query results (can be called from any thread):
- *   float freq = detector.getFrequencyHz();
- *   float conf = detector.getConfidence();
- *   int note   = detector.getMidiNote();       // 69 = A4
- *   float cent = detector.getCentsOffset();    // -50..+50
- * @endcode
+ * Implements the YIN autocorrelation method (de Cheveigné & Kawahara, 2002).
+ * Refactored for DSPark: Uses mirrored-buffer technique for 100% contiguous
+ * memory reads, enabling flawless auto-vectorization (SIMD) on hot paths.
+ * Fully lock-free and thread-safe for UI/Audio thread communication.
  */
 
+#include <atomic>
 #include <algorithm>
 #include <cmath>
-#include <cstring>
+#include <span>
 #include <vector>
 
 namespace dspark {
 
 /**
  * @class PitchDetector
- * @brief YIN-based monophonic pitch detector with parabolic interpolation.
- *
- * YIN steps:
- * 1. Compute the difference function d(τ).
- * 2. Compute the cumulative mean normalized difference d'(τ).
- * 3. Find the first dip below a threshold in d'(τ).
- * 4. Refine with parabolic interpolation for sub-sample accuracy.
+ * @brief Thread-safe, SIMD-optimized YIN pitch detector.
  *
  * @tparam T Sample type (float or double).
  */
@@ -56,133 +32,156 @@ class PitchDetector
 {
 public:
     /**
-     * @brief Prepares the detector for a given sample rate.
+     * @brief Prepares the detector and allocates internal structures.
+     * * Must be called before audio processing begins. Zero allocations
+     * happen after this point.
      *
-     * @param sampleRate  Sample rate in Hz.
-     * @param windowSize  Analysis window size (default: 2048 — covers ~24 Hz min).
+     * @param sampleRate The system sample rate in Hz.
+     * @param windowSize Analysis window size. Must be even (default: 2048).
+     * @param hopSize    Number of samples between detections (overlap). Lower is smoother.
      */
-    void prepare(double sampleRate, int windowSize = 2048)
+    void prepare(double sampleRate, int windowSize = 2048, int hopSize = 512)
     {
         sampleRate_ = sampleRate;
         windowSize_ = windowSize;
         halfWindow_ = windowSize / 2;
+        hopSize_    = std::clamp(hopSize, 1, windowSize);
 
-        buffer_.assign(static_cast<size_t>(windowSize), T(0));
-        yinBuffer_.resize(static_cast<size_t>(halfWindow_));
+        // Mirrored buffer technique: size is 2x windowSize.
+        // Guarantees continuous memory layout for SIMD without modulo operations.
+        buffer_.assign(static_cast<size_t>(windowSize_ * 2), T(0));
+        yinBuffer_.assign(static_cast<size_t>(halfWindow_), T(0));
 
         writePos_ = 0;
-        samplesAccumulated_ = 0;
+        samplesSinceLastDetect_ = 0;
 
-        frequency_ = T(0);
-        confidence_ = T(0);
+        frequency_.store(T(0), std::memory_order_relaxed);
+        confidence_.store(T(0), std::memory_order_relaxed);
     }
 
     /**
-     * @brief Pushes audio samples into the detector.
+     * @brief Pushes audio samples into the analysis buffer.
+     * * Automatically triggers pitch detection when the hop size is reached.
+     * 100% safe to run in the real-time audio thread (no locks, no allocations).
      *
-     * When enough samples have been accumulated (windowSize), a full
-     * YIN analysis is performed automatically.
-     *
-     * @param samples  Input audio data (mono).
-     * @param numSamples Number of samples.
+     * @param samples Span of input audio data (mono).
      */
-    void pushSamples(const T* samples, int numSamples) noexcept
+    void pushSamples(std::span<const T> samples) noexcept
     {
-        for (int i = 0; i < numSamples; ++i)
+        for (const T sample : samples)
         {
-            buffer_[static_cast<size_t>(writePos_)] = samples[i];
-            writePos_ = (writePos_ + 1) % windowSize_;
-            ++samplesAccumulated_;
+            // Write into mirrored buffer
+            buffer_[static_cast<size_t>(writePos_)] = sample;
+            buffer_[static_cast<size_t>(writePos_ + windowSize_)] = sample;
 
-            if (samplesAccumulated_ >= windowSize_)
+            writePos_++;
+            if (writePos_ >= windowSize_)
+            {
+                writePos_ = 0;
+            }
+
+            samplesSinceLastDetect_++;
+            if (samplesSinceLastDetect_ >= hopSize_)
             {
                 detect();
-                samplesAccumulated_ = 0;
+                samplesSinceLastDetect_ = 0;
             }
         }
     }
 
-    /** @brief Returns the detected fundamental frequency in Hz (0 if unvoiced). */
-    [[nodiscard]] T getFrequencyHz() const noexcept { return frequency_; }
+    /** @brief Returns the detected frequency in Hz safely from any thread. */
+    [[nodiscard]] T getFrequencyHz() const noexcept 
+    { 
+        return frequency_.load(std::memory_order_relaxed); 
+    }
 
-    /** @brief Returns detection confidence (0 = no pitch, 1 = very confident). */
-    [[nodiscard]] T getConfidence() const noexcept { return confidence_; }
+    /** @brief Returns the detection confidence [0.0 - 1.0] safely from any thread. */
+    [[nodiscard]] T getConfidence() const noexcept 
+    { 
+        return confidence_.load(std::memory_order_relaxed); 
+    }
 
-    /**
-     * @brief Returns the closest MIDI note number (69 = A4 = 440 Hz).
-     * @return MIDI note, or -1 if no pitch detected.
-     */
+    /** @brief Returns nearest MIDI note (69 = A4), or -1 if unvoiced. */
     [[nodiscard]] int getMidiNote() const noexcept
     {
-        if (frequency_ <= T(0)) return -1;
-        return static_cast<int>(std::round(
-            T(69) + T(12) * std::log2(frequency_ / T(440))));
+        const T freq = getFrequencyHz();
+        if (freq <= T(0)) return -1;
+        return static_cast<int>(std::round(T(69) + T(12) * std::log2(freq / T(440))));
     }
 
-    /**
-     * @brief Returns the offset in cents from the nearest MIDI note.
-     * @return Cents offset in [-50, +50], or 0 if no pitch.
-     */
+    /** @brief Returns cent offset from the nearest MIDI note [-50, +50]. */
     [[nodiscard]] T getCentsOffset() const noexcept
     {
-        if (frequency_ <= T(0)) return T(0);
-        T midiExact = T(69) + T(12) * std::log2(frequency_ / T(440));
-        T nearest = std::round(midiExact);
-        return (midiExact - nearest) * T(100);
+        const T freq = getFrequencyHz();
+        if (freq <= T(0)) return T(0);
+        T midiExact = T(69) + T(12) * std::log2(freq / T(440));
+        return (midiExact - std::round(midiExact)) * T(100);
     }
 
-    /**
-     * @brief Sets the YIN threshold.
-     *
-     * Lower values = more selective (fewer false positives, may miss quiet notes).
-     * Higher values = more sensitive (catches quieter notes, more false positives).
-     *
-     * @param threshold Typical range: 0.05 – 0.20 (default: 0.10).
-     */
+    /** @brief Sets sensitivity threshold (0.01 - 0.5). Lower is stricter. */
     void setThreshold(T threshold) noexcept
     {
         threshold_ = std::clamp(threshold, T(0.01), T(0.5));
     }
 
-    /** @brief Resets the detector state. */
+    /** @brief Resets state buffers. Not thread-safe with pushSamples(). */
     void reset() noexcept
     {
         std::fill(buffer_.begin(), buffer_.end(), T(0));
         writePos_ = 0;
-        samplesAccumulated_ = 0;
-        frequency_ = T(0);
-        confidence_ = T(0);
+        samplesSinceLastDetect_ = 0;
+        frequency_.store(T(0), std::memory_order_relaxed);
+        confidence_.store(T(0), std::memory_order_relaxed);
     }
 
 private:
-    /// Runs the full YIN pitch detection on the current buffer.
     void detect() noexcept
     {
-        // Check for silence — avoid false detections on zero-energy input
+        // Obtain a perfectly contiguous block of memory representing the current window.
+        // writePos_ points to the oldest sample in the mirrored buffer.
+        const T* currentWindow = &buffer_[static_cast<size_t>(writePos_)];
+
+        // Silence check / Energy calculation on contiguous memory
         T energy = T(0);
-        for (int i = 0; i < windowSize_; ++i)
-            energy += readBuffer(i) * readBuffer(i);
+        for (int i = 0; i < windowSize_; ++i) {
+            energy += currentWindow[i] * currentWindow[i];
+        }
+
         if (energy < T(1e-10))
         {
-            frequency_ = T(0);
-            confidence_ = T(0);
+            frequency_.store(T(0), std::memory_order_relaxed);
+            confidence_.store(T(0), std::memory_order_relaxed);
             return;
         }
 
-        // Step 1 + 2: Difference function + CMND
-        computeCMND();
+        // CMND Computation - now highly SIMD vectorizable
+        yinBuffer_[0] = T(1);
+        T runningSum = T(0);
 
-        // Step 3: Absolute threshold — find the first dip below threshold
+        for (int tau = 1; tau < halfWindow_; ++tau)
+        {
+            T sum = T(0);
+            
+            // Inner hot-loop: No modulo, pure contiguous memory arrays
+            for (int j = 0; j < halfWindow_; ++j)
+            {
+                T diff = currentWindow[j] - currentWindow[j + tau];
+                sum += diff * diff;
+            }
+
+            runningSum += sum;
+            yinBuffer_[static_cast<size_t>(tau)] = 
+                (runningSum > T(0)) ? sum * static_cast<T>(tau) / runningSum : T(0);
+        }
+
+        // Search for dip below threshold
         int tauEstimate = -1;
-
         for (int tau = 2; tau < halfWindow_; ++tau)
         {
             if (yinBuffer_[static_cast<size_t>(tau)] < threshold_)
             {
-                // Find the local minimum in this valley
-                while (tau + 1 < halfWindow_ &&
-                       yinBuffer_[static_cast<size_t>(tau + 1)] <
-                           yinBuffer_[static_cast<size_t>(tau)])
+                while (tau + 1 < halfWindow_ && 
+                       yinBuffer_[static_cast<size_t>(tau + 1)] < yinBuffer_[static_cast<size_t>(tau)])
                 {
                     ++tau;
                 }
@@ -193,56 +192,19 @@ private:
 
         if (tauEstimate < 0)
         {
-            // No pitch found
-            frequency_ = T(0);
-            confidence_ = T(0);
+            frequency_.store(T(0), std::memory_order_relaxed);
+            confidence_.store(T(0), std::memory_order_relaxed);
             return;
         }
 
-        // Step 4: Parabolic interpolation for sub-sample accuracy
+        // Sub-sample precision
         T betterTau = parabolicInterp(tauEstimate);
+        T finalConfidence = std::clamp(T(1) - yinBuffer_[static_cast<size_t>(tauEstimate)], T(0), T(1));
 
-        frequency_ = static_cast<T>(sampleRate_) / betterTau;
-        confidence_ = T(1) - yinBuffer_[static_cast<size_t>(tauEstimate)];
-        confidence_ = std::clamp(confidence_, T(0), T(1));
+        frequency_.store(static_cast<T>(sampleRate_) / betterTau, std::memory_order_relaxed);
+        confidence_.store(finalConfidence, std::memory_order_relaxed);
     }
 
-    /**
-     * @brief Computes the cumulative mean normalized difference function.
-     *
-     * Combines steps 1 and 2 of YIN for efficiency:
-     * d(τ) = Σ (x[n] - x[n+τ])²
-     * d'(τ) = d(τ) / ((1/τ) Σ d(j) for j=1..τ)
-     */
-    void computeCMND() noexcept
-    {
-        yinBuffer_[0] = T(1);
-
-        T runningSum = T(0);
-
-        for (int tau = 1; tau < halfWindow_; ++tau)
-        {
-            T sum = T(0);
-            for (int j = 0; j < halfWindow_; ++j)
-            {
-                T diff = readBuffer(j) - readBuffer(j + tau);
-                sum += diff * diff;
-            }
-
-            runningSum += sum;
-            yinBuffer_[static_cast<size_t>(tau)] =
-                (runningSum > T(0)) ? sum * static_cast<T>(tau) / runningSum : T(0);
-        }
-    }
-
-    /// Reads from the circular buffer (linearized from writePos).
-    [[nodiscard]] T readBuffer(int index) const noexcept
-    {
-        int pos = (writePos_ - windowSize_ + index + windowSize_) % windowSize_;
-        return buffer_[static_cast<size_t>(pos)];
-    }
-
-    /// Parabolic interpolation around a YIN minimum for sub-sample tau.
     [[nodiscard]] T parabolicInterp(int tau) const noexcept
     {
         if (tau < 1 || tau >= halfWindow_ - 1)
@@ -252,22 +214,31 @@ private:
         T s1 = yinBuffer_[static_cast<size_t>(tau)];
         T s2 = yinBuffer_[static_cast<size_t>(tau + 1)];
 
-        T adjustment = (s0 - s2) / (T(2) * (s0 - T(2) * s1 + s2));
+        T denom = s0 - T(2) * s1 + s2;
+        
+        // Prevent Divide by Zero on flat local minimums
+        if (std::abs(denom) < T(1e-12))
+            return static_cast<T>(tau);
+
+        T adjustment = (s0 - s2) / (T(2) * denom);
         return static_cast<T>(tau) + adjustment;
     }
 
     double sampleRate_ = 44100.0;
     int windowSize_ = 2048;
     int halfWindow_ = 1024;
+    int hopSize_ = 512;
     int writePos_ = 0;
-    int samplesAccumulated_ = 0;
-
+    int samplesSinceLastDetect_ = 0;
     T threshold_ = T(0.10);
-    T frequency_ = T(0);
-    T confidence_ = T(0);
 
-    std::vector<T> buffer_;
-    std::vector<T> yinBuffer_;
+    // Thread-safe outputs
+    std::atomic<T> frequency_{T(0)};
+    std::atomic<T> confidence_{T(0)};
+
+    // Mirrored buffer for 100% SIMD-friendly contiguous memory
+    std::vector<T> buffer_;     // Size: 2 * windowSize_
+    std::vector<T> yinBuffer_;  // Size: halfWindow_
 };
 
 } // namespace dspark

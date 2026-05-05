@@ -5,31 +5,32 @@
 
 /**
  * @file DryWetMixer.h
- * @brief Real-time safe dry/wet mixer for effect processors.
+ * @brief Real-time safe dry/wet mixer with parameter smoothing and mix laws.
  *
- * Captures a copy of the dry (unprocessed) signal before the effect runs,
- * then blends it with the wet (processed) signal using a mix proportion.
+ * Captures a copy of the dry (unprocessed) signal before an effect runs,
+ * then blends it with the wet (processed) signal. Includes block-level 
+ * parameter smoothing to prevent zipper noise during DAW automation, and 
+ * supports both Linear and Equal Power mixing laws.
+ *
+ * @note If your effect introduces algorithmic latency (e.g., FIR filters), 
+ * ensure the dry signal is delayed (Latency Compensation) before calling pushDry() 
+ * to prevent phase cancellation (comb filtering).
  *
  * Dependencies: AudioBuffer.h, AudioSpec.h.
  *
- * Usage pattern:
- * 1. In `prepare()`: call `prepare(spec)` to allocate the internal dry buffer.
- * 2. At the start of `process()`: call `pushDry(buffer)` to snapshot the input.
- * 3. Apply your effect to the buffer in-place.
- * 4. At the end of `process()`: call `mixWet(buffer, mix)` to blend dry + wet.
- *
  * @code
- *   dspark::DryWetMixer<float> mixer;
+ * dspark::DryWetMixer<float> mixer;
  *
- *   void prepare(const dspark::AudioSpec& spec) {
- *       mixer.prepare(spec);
- *   }
+ * void prepare(const dspark::AudioSpec& spec) {
+ * mixer.prepare(spec);
+ * mixer.setMixRule(dspark::DryWetMixer<float>::MixRule::EqualPower);
+ * }
  *
- *   void process(dspark::AudioBufferView<float> buffer) {
- *       mixer.pushDry(buffer);
- *       applyEffect(buffer);       // Modifies buffer in-place (now wet)
- *       mixer.mixWet(buffer, 0.5f); // 50% dry, 50% wet
- *   }
+ * void process(dspark::AudioBufferView<float> buffer) {
+ * mixer.pushDry(buffer);
+ * applyEffect(buffer);       // Modifies buffer in-place (now wet)
+ * mixer.mixWet(buffer, 0.5f); // Smoothly transitions to 50% wet
+ * }
  * @endcode
  */
 
@@ -37,13 +38,22 @@
 #include "AudioSpec.h"
 
 #include <algorithm>
-#include <cstring>
+#include <cmath>
+
+// Optional: Define a restrict macro if DSPark doesn't already have one.
+#if defined(__clang__) || defined(__GNUC__)
+    #define DSPARK_RESTRICT __restrict__
+#elif defined(_MSC_VER)
+    #define DSPARK_RESTRICT __restrict
+#else
+    #define DSPARK_RESTRICT
+#endif
 
 namespace dspark {
 
 /**
  * @class DryWetMixer
- * @brief Pre-allocated dry/wet blender for real-time audio effects.
+ * @brief Pre-allocated, SIMD-friendly dry/wet blender for real-time audio.
  *
  * @tparam T           Sample type (float or double).
  * @tparam MaxChannels Maximum number of channels (compile-time bound).
@@ -52,108 +62,149 @@ template <typename T, int MaxChannels = 16>
 class DryWetMixer
 {
 public:
+    /** @brief Defines the mathematical curve used for mixing. */
+    enum class MixRule {
+        /** Linear crossfade. Best for highly correlated signals (EQ, saturation). */
+        Linear,
+        /** Constant power crossfade. Best for uncorrelated signals (Reverb, Delay). */
+        EqualPower 
+    };
+
     /**
      * @brief Allocates the internal dry buffer for the given audio spec.
-     *
-     * Must be called before any processing. Only allocates if the current
-     * buffer is too small.
-     *
      * @param spec Audio environment specification.
      */
     void prepare(const AudioSpec& spec)
     {
         dryBuffer_.resize(spec.numChannels, spec.maxBlockSize);
+        reset();
     }
 
-    /** @brief Resets the internal dry buffer to silence. */
+    /** @brief Resets the internal buffer and smoothing states to zero. */
     void reset() noexcept
     {
         dryBuffer_.clear();
+        currentMix_ = T(-1); // Forces immediate jump on first use
+    }
+
+    /**
+     * @brief Sets the mathematical curve to use during the mix phase.
+     * @param rule The chosen MixRule (Linear or EqualPower).
+     */
+    void setMixRule(MixRule rule) noexcept
+    {
+        mixRule_ = rule;
     }
 
     /**
      * @brief Captures a snapshot of the dry (unprocessed) signal.
      *
-     * Call this *before* applying the effect to the buffer. The view may
-     * have fewer samples than the internal buffer's capacity — only the
-     * actual sample count is copied.
-     *
-     * @param input The unprocessed audio buffer (read-only).
+     * @param input The unprocessed audio buffer. Accepts const or mutable views 
+     * implicitly, provided the View template converts appropriately.
      */
     void pushDry(const AudioBufferView<const T>& input) noexcept
     {
+        if (dryBuffer_.getNumSamples() == 0) return; // Prevent ops if unprepared
+
         const int chCount  = std::min(input.getNumChannels(), dryBuffer_.getNumChannels());
-        const int nSamples = std::min(input.getNumSamples(),  dryBuffer_.getNumSamples());
-        const auto bytes   = static_cast<std::size_t>(nSamples) * sizeof(T);
+        const int nSamples = std::min(input.getNumSamples(), dryBuffer_.getNumSamples());
 
         for (int ch = 0; ch < chCount; ++ch)
-            std::memcpy(dryBuffer_.getChannel(ch), input.getChannel(ch), bytes);
-
-        capturedSamples_ = nSamples;
-    }
-
-    /** @brief Overload accepting a mutable view (auto-converts to const). */
-    void pushDry(const AudioBufferView<T>& input) noexcept
-    {
-        const int chCount  = std::min(input.getNumChannels(), dryBuffer_.getNumChannels());
-        const int nSamples = std::min(input.getNumSamples(),  dryBuffer_.getNumSamples());
-        const auto bytes   = static_cast<std::size_t>(nSamples) * sizeof(T);
-
-        for (int ch = 0; ch < chCount; ++ch)
-            std::memcpy(dryBuffer_.getChannel(ch), input.getChannel(ch), bytes);
+        {
+            const T* DSPARK_RESTRICT src = input.getChannel(ch);
+            T* DSPARK_RESTRICT dst       = dryBuffer_.getChannel(ch);
+            std::copy_n(src, nSamples, dst);
+        }
 
         capturedSamples_ = nSamples;
     }
 
     /**
-     * @brief Blends the stored dry signal with the current (wet) buffer.
+     * @brief Blends the stored dry signal with the current (wet) buffer in-place.
      *
-     * Applies a linear crossfade:
-     *   output = dry * (1 - mix) + wet * mix
+     * Automatically applies sample-accurate linear interpolation to the mix 
+     * proportion to prevent zipper noise when the parameter changes.
      *
-     * @param wetBuffer     The processed buffer (modified in-place to the blended result).
-     * @param mixProportion Mix amount: 0.0 = fully dry, 1.0 = fully wet.
+     * @param wetBuffer     The processed buffer (modified in-place).
+     * @param targetMix     Target mix amount: 0.0 = fully dry, 1.0 = fully wet.
      */
-    void mixWet(AudioBufferView<T> wetBuffer, T mixProportion) noexcept
+    void mixWet(AudioBufferView<T> wetBuffer, T targetMix) noexcept
     {
-        const T wet = std::clamp(mixProportion, T(0), T(1));
-        const T dry = T(1) - wet;
+        // Handle invalid floating point inputs (NaN) safely
+        if (std::isnan(targetMix)) targetMix = T(0);
+        targetMix = std::clamp(targetMix, T(0), T(1));
 
         const int chCount  = std::min(wetBuffer.getNumChannels(), dryBuffer_.getNumChannels());
         const int nSamples = std::min(wetBuffer.getNumSamples(), capturedSamples_);
 
+        if (nSamples == 0 || chCount == 0) return;
+
+        // Initialize smoothing state on first run
+        if (currentMix_ < T(0)) currentMix_ = targetMix;
+
+        const bool needsSmoothing = std::abs(currentMix_ - targetMix) > T(1e-5);
+        const T mixStep = needsSmoothing ? (targetMix - currentMix_) / T(nSamples) : T(0);
+
         for (int ch = 0; ch < chCount; ++ch)
         {
-            T*       wetData = wetBuffer.getChannel(ch);
-            const T* dryData = dryBuffer_.getChannel(ch);
+            T* DSPARK_RESTRICT wetData       = wetBuffer.getChannel(ch);
+            const T* DSPARK_RESTRICT dryData = dryBuffer_.getChannel(ch);
+            
+            // Local copy of mix value so every channel starts at the same smoothed origin
+            T mixVal = currentMix_; 
 
-            for (int i = 0; i < nSamples; ++i)
-                wetData[i] = dryData[i] * dry + wetData[i] * wet;
+            if (mixRule_ == MixRule::EqualPower)
+            {
+                for (int i = 0; i < nSamples; ++i)
+                {
+                    // Fast constant-power approximation using square root
+                    const T w = std::sqrt(mixVal);
+                    const T d = std::sqrt(T(1) - mixVal);
+                    wetData[i] = dryData[i] * d + wetData[i] * w;
+                    
+                    if (needsSmoothing) mixVal += mixStep;
+                }
+            }
+            else // MixRule::Linear
+            {
+                for (int i = 0; i < nSamples; ++i)
+                {
+                    const T w = mixVal;
+                    const T d = T(1) - w;
+                    wetData[i] = dryData[i] * d + wetData[i] * w;
+                    
+                    if (needsSmoothing) mixVal += mixStep;
+                }
+            }
         }
+
+        // Update the persistent state after the block is processed
+        if (needsSmoothing) currentMix_ = targetMix;
     }
 
     /**
-     * @brief Returns a pointer to the dry channel data for the given channel.
-     *
-     * Valid only after pushDry() has been called.
-     *
+     * @brief Retrieves a read-only pointer to the captured dry channel data.
      * @param ch Channel index (0-based).
-     * @return Pointer to the dry samples for this channel (read-only).
+     * @return Pointer to dry samples, or nullptr if out of bounds.
      */
     [[nodiscard]] const T* getDryChannel(int ch) const noexcept
     {
+        if (ch < 0 || ch >= dryBuffer_.getNumChannels()) return nullptr;
         return dryBuffer_.getChannel(ch);
     }
 
-    /** @brief Returns the number of channels in the dry buffer. */
+    /** @brief Returns the internal capacity of channels in the dry buffer. */
     [[nodiscard]] int getDryNumChannels() const noexcept { return dryBuffer_.getNumChannels(); }
 
-    /** @brief Returns the number of samples captured in the last pushDry() call. */
+    /** @brief Returns the number of samples valid from the last pushDry() call. */
     [[nodiscard]] int getDryCapturedSamples() const noexcept { return capturedSamples_; }
 
 private:
     AudioBuffer<T, MaxChannels> dryBuffer_;
     int capturedSamples_ = 0;
+    
+    MixRule mixRule_ = MixRule::Linear;
+    T currentMix_    = T(-1); // Internal state for parameter smoothing
 };
 
 } // namespace dspark

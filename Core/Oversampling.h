@@ -5,45 +5,19 @@
 
 /**
  * @file Oversampling.h
- * @brief Real-time oversampling with FIR half-band anti-aliasing filters.
+ * @brief Real-time oversampling using Polyphase Half-Band FIR filters.
  *
- * Reduces aliasing in nonlinear processes (saturation, waveshaping, distortion)
- * by upsampling the signal, processing at a higher rate, then downsampling with
- * high-quality anti-aliasing filters.
+ * Provides CPU-efficient upsampling and downsampling to reduce aliasing in nonlinear 
+ * processing. This implementation uses a polyphase decomposition of Kaiser-windowed 
+ * symmetric half-band filters. 
  *
- * Uses cascaded FIR half-band filters designed with the Kaiser window method.
- * Each 2x stage uses a symmetric half-band FIR whose even-indexed coefficients
- * (except the center tap) are exactly zero, enabling efficient computation at
- * roughly N/4 multiply-accumulates per sample instead of N (half-band zeros +
- * linear-phase symmetry folding combined).
+ * By exploiting the polyphase structure, zero-stuffing and discarding samples are 
+ * avoided entirely. The process is block-based and linear in memory, allowing 
+ * modern compilers to auto-vectorize (SIMD) the convolution loops natively. All
+ * in-place operations are memory-safe and optimized for CPU cache.
  *
- * Four quality presets control stopband rejection:
- *
- * | Quality   | Taps/stage | Rejection | Passband* | Latency (4x) |
- * |-----------|------------|-----------|-----------|--------------|
- * | Low       | 31         | ~-40 dB   | ~0.88 Ny  | ~23 samples  |
- * | Medium    | 63         | ~-60 dB   | ~0.92 Ny  | ~47 samples  |
- * | High      | 127        | ~-80 dB   | ~0.96 Ny  | ~95 samples  |
- * | Maximum   | 255        | ~-100 dB  | ~0.97 Ny  | ~191 samples |
- *
- * (*) Passband = fraction of original Nyquist preserved within 0.1 dB.
- *
- * Factor must be a power of two (1, 2, 4, 8, 16).
- *
- * Dependencies: AudioBuffer.h, FIRFilter.h (for FIRDesign + Kaiser window), AudioSpec.h.
- *
- * @code
- *   dspark::Oversampling<float> os(4);  // 4x oversampling, High quality (-80 dB)
- *   os.prepare(spec);
- *
- *   // In process():
- *   auto upView = os.upsample(buffer);
- *   applyDistortion(upView);            // process at 4x sample rate
- *   os.downsample(buffer);
- *
- *   // Mastering-grade quality:
- *   dspark::Oversampling<float> os(4, dspark::Oversampling<float>::Quality::Maximum);
- * @endcode
+ * @note Memory is strictly pre-allocated in `prepare()`. No allocations occur 
+ * during the `process()` thread.
  */
 
 #include "AudioBuffer.h"
@@ -60,51 +34,45 @@ namespace dspark {
 
 /**
  * @class Oversampling
- * @brief Power-of-two oversampling with cascaded FIR half-band anti-aliasing.
+ * @brief Power-of-two oversampling processor with polyphase anti-aliasing.
  *
  * @tparam T           Sample type (float or double).
- * @tparam MaxChannels Maximum number of channels.
+ * @tparam MaxChannels Maximum number of channels supported.
  */
 template <typename T, int MaxChannels = 16>
 class Oversampling
 {
 public:
     /**
-     * @brief Quality presets controlling anti-aliasing filter order and rejection.
-     *
-     * Higher quality uses more FIR taps per stage, giving steeper rolloff and
-     * deeper stopband rejection at the cost of more CPU and latency.
+     * @brief Quality presets defining the steepness and rejection of the anti-aliasing filter.
      */
     enum class Quality
     {
-        Low,      ///< 31 taps/stage, ~-40 dB. Fast preview, low CPU.
-        Medium,   ///< 63 taps/stage, ~-60 dB. Good balance for most uses.
-        High,     ///< 127 taps/stage, ~-80 dB. Professional quality (default).
-        Maximum   ///< 255 taps/stage, ~-100 dB. Mastering grade.
+        Low,      ///< 31 taps/stage, ~-40 dB stopband. For fast previewing.
+        Medium,   ///< 63 taps/stage, ~-60 dB stopband. General purpose.
+        High,     ///< 127 taps/stage, ~-80 dB stopband. Professional standard.
+        Maximum   ///< 255 taps/stage, ~-100 dB stopband. Mastering grade.
     };
 
     /**
-     * @brief Constructs an oversampling processor.
-     * @param factor  Oversampling factor (power of two: 1, 2, 4, 8, 16).
-     * @param quality Anti-aliasing filter quality preset.
+     * @brief Constructs the oversampling engine.
+     * @param factor  Oversampling factor. Must be a power of two (1, 2, 4, 8, 16).
+     * @param quality Filter quality preset. Default is High (-80 dB).
+     * @pre factor >= 1 and is a power of 2.
      */
     explicit Oversampling(int factor = 2, Quality quality = Quality::High)
         : factor_(factor), quality_(quality)
     {
-        assert(factor >= 1 && (factor & (factor - 1)) == 0);
+        assert(factor >= 1 && (factor & (factor - 1)) == 0 && "Factor must be a power of 2");
         numStages_ = 0;
         int f = factor;
         while (f > 1) { ++numStages_; f >>= 1; }
     }
 
     /**
-     * @brief Prepares internal buffers and designs anti-aliasing filters.
-     *
-     * Allocates the oversampled buffer and computes FIR half-band coefficients
-     * for each 2x stage using Kaiser-windowed sinc design. All memory allocation
-     * happens here — process functions are allocation-free.
-     *
-     * @param spec Audio spec at the base (non-oversampled) rate.
+     * @brief Pre-allocates buffers and computes FIR filter coefficients.
+     * @param spec The audio specification at the base (1x) sample rate.
+     * @post The processor is ready to handle up to `spec.maxBlockSize` base samples.
      */
     void prepare(const AudioSpec& spec)
     {
@@ -116,68 +84,50 @@ public:
 
         for (int stage = 0; stage < numStages_; ++stage)
         {
-            upFilters_[stage].design(taps, beta, spec.numChannels);
-            downFilters_[stage].design(taps, beta, spec.numChannels);
+            // The max block size entering a stage is baseSize * 2^stage
+            int stageMaxSamples = spec.maxBlockSize * (1 << stage);
+            filters_[stage].design(taps, beta, spec.numChannels, stageMaxSamples);
         }
 
         reset();
     }
 
-    /** @brief Resets all filter states and clears the oversampled buffer. */
+    /**
+     * @brief Flushes all internal delay lines and history buffers.
+     * Call this when resetting the transport or to clear audio tails.
+     */
     void reset() noexcept
     {
         upBuffer_.clear();
-        for (int i = 0; i < kMaxStages; ++i)
-        {
-            upFilters_[i].reset();
-            downFilters_[i].reset();
-        }
+        for (int i = 0; i < numStages_; ++i)
+            filters_[i].reset();
     }
 
-    /** @brief Returns the oversampling factor. */
+    /** @brief Returns the current oversampling factor. */
     [[nodiscard]] int getFactor() const noexcept { return factor_; }
-
+    
     /** @brief Returns the current quality preset. */
     [[nodiscard]] Quality getQuality() const noexcept { return quality_; }
 
     /**
-     * @brief Returns the total latency in base-rate samples.
-     *
-     * Each stage contributes (numTaps - 1) / 2 samples of group delay at its
-     * oversampled rate, for both the upsample and downsample filters. The total
-     * is accumulated at the maximum oversampled rate and then divided back to
-     * base-rate samples.
-     *
-     * Formula: latency = (numTaps - 1) * (1 - 1 / 2^numStages) base samples.
+     * @brief Calculates the exact group delay latency of the oversampling chain.
+     * @return Latency in samples at the BASE (1x) sample rate.
      */
     [[nodiscard]] int getLatency() const noexcept
     {
         if (numStages_ == 0) return 0;
-
         const int halfOrder = (tapsForQuality(quality_) - 1) / 2;
-
-        // Accumulate delay at the maximum oversampled rate, then convert to base.
-        // Stage k operates at 2^(k+1) * base rate. Each filter (up + down) adds
-        // halfOrder samples at that rate = halfOrder * (factor / 2^(k+1)) at max rate.
         int totalAtMaxRate = 0;
         for (int stage = 0; stage < numStages_; ++stage)
-        {
-            int rateRatio = factor_ / (1 << (stage + 1));
-            totalAtMaxRate += 2 * halfOrder * rateRatio;
-        }
-
-        // Convert to base-rate samples (ceiling for safe compensation)
+            totalAtMaxRate += 2 * halfOrder * (factor_ / (1 << (stage + 1)));
+        
         return (totalAtMaxRate + factor_ - 1) / factor_;
     }
 
     /**
-     * @brief Upsamples the input buffer into the internal oversampled buffer.
-     *
-     * For each 2x stage: zero-stuffs between samples (with 2x gain compensation)
-     * and applies the FIR half-band anti-imaging filter.
-     *
-     * @param input Base-rate audio buffer.
-     * @return View to the oversampled buffer (factor * input samples).
+     * @brief Upsamples the input base-rate signal into the internal high-rate buffer.
+     * @param input View of the base-rate audio buffer.
+     * @return A view of the internal oversampled buffer (length = input.samples * factor).
      */
     [[nodiscard]] AudioBufferView<T> upsample(AudioBufferView<const T> input) noexcept
     {
@@ -187,98 +137,27 @@ public:
         if (numStages_ == 0)
         {
             for (int ch = 0; ch < nCh; ++ch)
-                std::memcpy(upBuffer_.getChannel(ch), input.getChannel(ch),
-                           static_cast<std::size_t>(nS) * sizeof(T));
+                std::memcpy(upBuffer_.getChannel(ch), input.getChannel(ch), static_cast<std::size_t>(nS) * sizeof(T));
             return upBuffer_.toView().getSubView(0, nS);
         }
 
-        // Stage 0: zero-stuff from input
-        for (int ch = 0; ch < nCh; ++ch)
-        {
-            const T* src = input.getChannel(ch);
-            T* dst = upBuffer_.getChannel(ch);
-            for (int i = 0; i < nS; ++i)
-            {
-                dst[i * 2]     = src[i] * T(2); // Gain compensation for zero-stuffing
-                dst[i * 2 + 1] = T(0);
-            }
-        }
+        // Stage 0: Read directly from input view
+        filters_[0].processUpsample(input, upBuffer_.toView(), nCh, nS);
 
+        // Subsequent stages: in-place upsampling inside upBuffer_
         int currentLen = nS * 2;
-        filterBlock(upFilters_[0], nCh, currentLen);
-
-        // Additional stages: zero-stuff in-place (work backwards to avoid overwrite)
         for (int stage = 1; stage < numStages_; ++stage)
         {
-            for (int ch = 0; ch < nCh; ++ch)
-            {
-                T* data = upBuffer_.getChannel(ch);
-                for (int i = currentLen - 1; i >= 0; --i)
-                {
-                    data[i * 2]     = data[i] * T(2);
-                    data[i * 2 + 1] = T(0);
-                }
-            }
+            filters_[stage].processUpsampleInPlace(upBuffer_.toView(), nCh, currentLen);
             currentLen *= 2;
-            filterBlock(upFilters_[stage], nCh, currentLen);
-        }
-
-        return upBuffer_.toView().getSubView(0, nS * factor_);
-    }
-
-    /** @brief Overload accepting a mutable input view. */
-    [[nodiscard]] AudioBufferView<T> upsample(AudioBufferView<T> input) noexcept
-    {
-        const int nCh = std::min(input.getNumChannels(), upBuffer_.getNumChannels());
-        const int nS  = input.getNumSamples();
-
-        if (numStages_ == 0)
-        {
-            for (int ch = 0; ch < nCh; ++ch)
-                std::memcpy(upBuffer_.getChannel(ch), input.getChannel(ch),
-                           static_cast<std::size_t>(nS) * sizeof(T));
-            return upBuffer_.toView().getSubView(0, nS);
-        }
-
-        for (int ch = 0; ch < nCh; ++ch)
-        {
-            const T* src = input.getChannel(ch);
-            T* dst = upBuffer_.getChannel(ch);
-            for (int i = 0; i < nS; ++i)
-            {
-                dst[i * 2]     = src[i] * T(2);
-                dst[i * 2 + 1] = T(0);
-            }
-        }
-
-        int currentLen = nS * 2;
-        filterBlock(upFilters_[0], nCh, currentLen);
-
-        for (int stage = 1; stage < numStages_; ++stage)
-        {
-            for (int ch = 0; ch < nCh; ++ch)
-            {
-                T* data = upBuffer_.getChannel(ch);
-                for (int i = currentLen - 1; i >= 0; --i)
-                {
-                    data[i * 2]     = data[i] * T(2);
-                    data[i * 2 + 1] = T(0);
-                }
-            }
-            currentLen *= 2;
-            filterBlock(upFilters_[stage], nCh, currentLen);
         }
 
         return upBuffer_.toView().getSubView(0, nS * factor_);
     }
 
     /**
-     * @brief Downsamples the internal oversampled buffer back to the output.
-     *
-     * Applies the FIR half-band anti-aliasing filter then decimates at each stage,
-     * processed in reverse order from the highest rate down to the base rate.
-     *
-     * @param output Base-rate audio buffer to write the downsampled result.
+     * @brief Downsamples the internal high-rate buffer back to base-rate.
+     * @param output Buffer view where the base-rate samples will be written.
      */
     void downsample(AudioBufferView<T> output) noexcept
     {
@@ -288,184 +167,264 @@ public:
         if (numStages_ == 0)
         {
             for (int ch = 0; ch < nCh; ++ch)
-                std::memcpy(output.getChannel(ch), upBuffer_.getChannel(ch),
-                           static_cast<std::size_t>(nS) * sizeof(T));
+                std::memcpy(output.getChannel(ch), upBuffer_.getChannel(ch), static_cast<std::size_t>(nS) * sizeof(T));
             return;
         }
 
         int currentLen = nS * factor_;
 
-        // Apply stages in reverse (highest rate first)
-        for (int stage = numStages_ - 1; stage >= 0; --stage)
+        for (int stage = numStages_ - 1; stage > 0; --stage)
         {
-            filterBlock(downFilters_[stage], nCh, currentLen);
-
-            // Decimate by 2
-            int newLen = currentLen / 2;
-            for (int ch = 0; ch < nCh; ++ch)
-            {
-                T* data = upBuffer_.getChannel(ch);
-                for (int i = 0; i < newLen; ++i)
-                    data[i] = data[i * 2];
-            }
-            currentLen = newLen;
+            filters_[stage].processDownsampleInPlace(upBuffer_.toView(), nCh, currentLen);
+            currentLen /= 2;
         }
 
-        for (int ch = 0; ch < nCh; ++ch)
-            std::memcpy(output.getChannel(ch), upBuffer_.getChannel(ch),
-                       static_cast<std::size_t>(nS) * sizeof(T));
-    }
-
-    /** @brief Returns a mutable view to the oversampled buffer (after upsample). */
-    [[nodiscard]] AudioBufferView<T> getOversampledView(int baseSamples) noexcept
-    {
-        return upBuffer_.toView().getSubView(0, baseSamples * factor_);
+        // Stage 0: Write directly to final output
+        filters_[0].processDownsample(upBuffer_.toView(), output, nCh, currentLen);
     }
 
 private:
-    static constexpr int kMaxStages = 4; // Up to 16x
+    static constexpr int kMaxStages = 4;
 
     // ========================================================================
-    // HalfBandFIR — Symmetric half-band FIR with zero-skip + symmetry folding
+    // Polyphase Block Half-Band FIR
     // ========================================================================
-    //
-    // Exploits two mathematical properties of half-band FIR filters:
-    //
-    // 1. Linear-phase symmetry:  h[center-k] = h[center+k]
-    //    -> Fold symmetric delay line pairs before multiplying.
-    //
-    // 2. Half-band zeros:  h[center +/- 2k] = 0 for all k >= 1
-    //    (because sinc(0.5 * pi * 2k) = sin(k*pi) = 0)
-    //    -> Only odd-offset coefficients are non-zero; skip even offsets.
-    //
-    // Combined: ~N/4 MACs per sample instead of N (4x speedup).
-    // ========================================================================
-
-    struct HalfBandFIR
+    /**
+     * @struct PolyphaseHalfBand
+     * @brief Inner 2x oversampling engine utilizing polyphase half-band decomposition.
+     */
+    struct PolyphaseHalfBand
     {
-        std::vector<T> oddCoeffs;  // Unique non-zero coefficients: h[center+1], h[center+3], ...
-        T centerCoeff = T(0);     // Center tap (approximately 0.5 for half-band)
-        int numTaps = 0;
-        int halfOrder = 0;        // (numTaps - 1) / 2
-        int numOddCoeffs = 0;
+        std::vector<T> evenTaps; 
+        T centerTap = T(0);
+        int halfOrder = 0;
+        int delaySamples = 0;
 
-        struct ChannelState
-        {
-            std::vector<T> delayLine;
-            int writePos = 0;
+        /**
+         * @brief State tracking per channel, optimizing memory alignment for SIMD.
+         */
+        struct ChannelState {
+            std::vector<T> history;    ///< Contiguous block history for even samples (FIR).
+            std::vector<T> oddHistory; ///< Contiguous block history for odd samples (Pure Delay).
         };
-        std::vector<ChannelState> channels;
+        std::vector<ChannelState> upChannels;
+        std::vector<ChannelState> downChannels;
 
-        void design(int taps, T beta, int numChannels)
+        /**
+         * @brief Designs the half-band filter and allocates history buffers.
+         * @param taps Total filter length.
+         * @param beta Kaiser window beta parameter.
+         * @param numChannels Number of audio channels.
+         * @param maxBlockSamples Maximum number of base samples to process in one call.
+         */
+        void design(int taps, T beta, int numChannels, int maxBlockSamples)
         {
-            numTaps = taps;
             halfOrder = (taps - 1) / 2;
+            delaySamples = halfOrder / 2;
 
-            // Design half-band lowpass: cutoff at 0.25 * sampleRate (half-Nyquist).
-            // Using canonical sampleRate=1.0 since half-band coefficients are rate-independent.
             auto fullCoeffs = FIRDesign<T>::lowPass(1.0, 0.25, taps, beta);
+            centerTap = fullCoeffs[static_cast<std::size_t>(halfOrder)];
 
-            centerCoeff = fullCoeffs[static_cast<std::size_t>(halfOrder)];
-
-            // Extract unique non-zero odd-offset coefficients.
-            // By symmetry h[center-k] == h[center+k], so store only one side.
-            oddCoeffs.clear();
-            for (int k = 1; k <= halfOrder; k += 2)
-                oddCoeffs.push_back(fullCoeffs[static_cast<std::size_t>(halfOrder + k)]);
-
-            numOddCoeffs = static_cast<int>(oddCoeffs.size());
-
-            channels.resize(static_cast<std::size_t>(numChannels));
-            for (auto& ch : channels)
+            evenTaps.clear();
+            for (int i = 0; i <= halfOrder; i += 2)
             {
-                ch.delayLine.assign(static_cast<std::size_t>(numTaps), T(0));
-                ch.writePos = 0;
+                if (i != halfOrder)
+                    evenTaps.push_back(fullCoeffs[static_cast<std::size_t>(i)]);
+            }
+
+            // Allocate histories with enough padding for contiguous shifting
+            int historySize = static_cast<int>(evenTaps.size()) + maxBlockSamples;
+            int oddHistorySize = delaySamples + maxBlockSamples;
+            
+            upChannels.resize(static_cast<std::size_t>(numChannels));
+            downChannels.resize(static_cast<std::size_t>(numChannels));
+            
+            for (int ch = 0; ch < numChannels; ++ch)
+            {
+                upChannels[ch].history.assign(historySize, T(0));
+                upChannels[ch].oddHistory.assign(oddHistorySize, T(0)); // Unused in upsample but kept for symmetry if needed
+                
+                downChannels[ch].history.assign(historySize, T(0));
+                downChannels[ch].oddHistory.assign(oddHistorySize, T(0));
             }
         }
 
+        /**
+         * @brief Clears the history buffers to prevent audio clicks on transport reset.
+         */
         void reset() noexcept
         {
-            for (auto& ch : channels)
-            {
-                std::fill(ch.delayLine.begin(), ch.delayLine.end(), T(0));
-                ch.writePos = 0;
+            for (auto& ch : upChannels) {
+                std::fill(ch.history.begin(), ch.history.end(), T(0));
+                std::fill(ch.oddHistory.begin(), ch.oddHistory.end(), T(0));
+            }
+            for (auto& ch : downChannels) {
+                std::fill(ch.history.begin(), ch.history.end(), T(0));
+                std::fill(ch.oddHistory.begin(), ch.oddHistory.end(), T(0));
             }
         }
 
-        T processSample(T input, int channel) noexcept
+        void processUpsample(AudioBufferView<const T> input, AudioBufferView<T> output, int nCh, int nS) noexcept
         {
-            auto& state = channels[static_cast<std::size_t>(channel)];
-            auto& dl = state.delayLine;
-
-            // Push sample into ring buffer
-            dl[static_cast<std::size_t>(state.writePos)] = input;
-            if (++state.writePos >= numTaps) state.writePos = 0;
-
-            // Read center of the delay line (halfOrder samples back)
-            int centerPos = state.writePos - 1 - halfOrder;
-            if (centerPos < 0) centerPos += numTaps;
-
-            T output = centerCoeff * dl[static_cast<std::size_t>(centerPos)];
-
-            // Symmetric non-zero taps: k = 1, 3, 5, ...
-            for (int i = 0; i < numOddCoeffs; ++i)
+            const int numTaps = static_cast<int>(evenTaps.size());
+            
+            for (int ch = 0; ch < nCh; ++ch)
             {
-                int k = i * 2 + 1;
+                const T* src = input.getChannel(ch);
+                T* dst = output.getChannel(ch);
+                auto& hist = upChannels[ch].history;
 
-                int posLeft = centerPos - k;
-                if (posLeft < 0) posLeft += numTaps;
+                std::memmove(hist.data(), hist.data() + nS, numTaps * sizeof(T));
+                std::memcpy(hist.data() + numTaps, src, nS * sizeof(T));
 
-                int posRight = centerPos + k;
-                if (posRight >= numTaps) posRight -= numTaps;
+                // Hint for compiler auto-vectorization
+                T* __restrict dstR = dst;
+                const T* __restrict histR = hist.data();
+                const T* __restrict tapsR = evenTaps.data();
 
-                output += oddCoeffs[static_cast<std::size_t>(i)]
-                        * (dl[static_cast<std::size_t>(posLeft)]
-                         + dl[static_cast<std::size_t>(posRight)]);
+                for (int i = 0; i < nS; ++i)
+                {
+                    T sum = T(0);
+                    // This inner loop will now safely auto-vectorize
+                    for (int k = 0; k < numTaps; ++k)
+                        sum += tapsR[k] * histR[i + k];
+                    
+                    dstR[i * 2] = sum * T(2); 
+                    dstR[i * 2 + 1] = histR[i + numTaps - delaySamples] * centerTap * T(2);
+                }
             }
+        }
 
-            return output;
+        void processUpsampleInPlace(AudioBufferView<T> buffer, int nCh, int currentLen) noexcept
+        {
+            const int numTaps = static_cast<int>(evenTaps.size());
+            
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* data = buffer.getChannel(ch); 
+                auto& hist = upChannels[ch].history;
+
+                std::memmove(hist.data(), hist.data() + currentLen, numTaps * sizeof(T));
+                std::memcpy(hist.data() + numTaps, data, currentLen * sizeof(T));
+
+                T* __restrict dataR = data;
+                const T* __restrict histR = hist.data();
+                const T* __restrict tapsR = evenTaps.data();
+
+                for (int i = 0; i < currentLen; ++i)
+                {
+                    T sum = T(0);
+                    for (int k = 0; k < numTaps; ++k)
+                        sum += tapsR[k] * histR[i + k];
+                    
+                    dataR[i * 2] = sum * T(2); 
+                    dataR[i * 2 + 1] = histR[i + numTaps - delaySamples] * centerTap * T(2);
+                }
+            }
+        }
+
+        void processDownsample(AudioBufferView<const T> input, AudioBufferView<T> output, int nCh, int currentLen) noexcept
+        {
+            int outLen = currentLen / 2;
+            const int numTaps = static_cast<int>(evenTaps.size());
+
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                const T* src = input.getChannel(ch);
+                T* dst = output.getChannel(ch);
+                auto& hist = downChannels[ch].history;
+                auto& oddHist = downChannels[ch].oddHistory;
+
+                // 1. Shift and populate histories BEFORE calculating to avoid read/write aliasing
+                std::memmove(hist.data(), hist.data() + outLen, numTaps * sizeof(T));
+                std::memmove(oddHist.data(), oddHist.data() + outLen, delaySamples * sizeof(T));
+                
+                for (int i = 0; i < outLen; ++i)
+                {
+                    hist[numTaps + i] = src[i * 2];         // Even samples
+                    oddHist[delaySamples + i] = src[i * 2 + 1]; // Odd samples
+                }
+
+                T* __restrict dstR = dst;
+                const T* __restrict histR = hist.data();
+                const T* __restrict oddR = oddHist.data();
+                const T* __restrict tapsR = evenTaps.data();
+
+                // 2. Compute FIR (Now perfectly safe and SIMD-friendly)
+                for (int i = 0; i < outLen; ++i)
+                {
+                    T sum = oddR[i] * centerTap; 
+                    
+                    for (int k = 0; k < numTaps; ++k)
+                        sum += tapsR[k] * histR[i + k];
+                        
+                    dstR[i] = sum;
+                }
+            }
+        }
+        
+        void processDownsampleInPlace(AudioBufferView<T> buffer, int nCh, int currentLen) noexcept
+        {
+            int outLen = currentLen / 2;
+            const int numTaps = static_cast<int>(evenTaps.size());
+
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* data = buffer.getChannel(ch);
+                auto& hist = downChannels[ch].history;
+                auto& oddHist = downChannels[ch].oddHistory;
+
+                // 1. Extract from working buffer before overwriting
+                std::memmove(hist.data(), hist.data() + outLen, numTaps * sizeof(T));
+                std::memmove(oddHist.data(), oddHist.data() + outLen, delaySamples * sizeof(T));
+                
+                for (int i = 0; i < outLen; ++i)
+                {
+                    hist[numTaps + i] = data[i * 2];
+                    oddHist[delaySamples + i] = data[i * 2 + 1];
+                }
+
+                T* __restrict dataR = data;
+                const T* __restrict histR = hist.data();
+                const T* __restrict oddR = oddHist.data();
+                const T* __restrict tapsR = evenTaps.data();
+
+                // 2. Compute and overwrite
+                for (int i = 0; i < outLen; ++i)
+                {
+                    T sum = oddR[i] * centerTap; 
+                    
+                    for (int k = 0; k < numTaps; ++k)
+                        sum += tapsR[k] * histR[i + k];
+                        
+                    dataR[i] = sum; 
+                }
+            }
         }
     };
-
-    // ========================================================================
-    // Quality preset tables
-    // ========================================================================
 
     static constexpr int tapsForQuality(Quality q) noexcept
     {
         switch (q)
         {
-            case Quality::Low:     return 31;   // halfOrder = 15
-            case Quality::Medium:  return 63;   // halfOrder = 31
-            case Quality::High:    return 127;  // halfOrder = 63
-            case Quality::Maximum: return 255;  // halfOrder = 127
+            case Quality::Low:     return 31; 
+            case Quality::Medium:  return 63; 
+            case Quality::High:    return 127;
+            case Quality::Maximum: return 255;
         }
         return 127;
     }
 
     static constexpr T betaForQuality(Quality q) noexcept
     {
-        // Kaiser beta from FIRDesign::estimateKaiserBeta():
-        //   A > 50 dB:  beta = 0.1102 * (A - 8.7)
-        //   21 <= A <= 50: beta = 0.5842*(A-21)^0.4 + 0.07886*(A-21)
         switch (q)
         {
-            case Quality::Low:     return T(3.395);   // A ~ 40 dB
-            case Quality::Medium:  return T(5.653);   // A ~ 60 dB
-            case Quality::High:    return T(7.857);   // A ~ 80 dB
-            case Quality::Maximum: return T(10.056);  // A ~ 100 dB
+            case Quality::Low:     return T(3.395);
+            case Quality::Medium:  return T(5.653);
+            case Quality::High:    return T(7.857);
+            case Quality::Maximum: return T(10.056);
         }
         return T(7.857);
-    }
-
-    void filterBlock(HalfBandFIR& filter, int nCh, int nS) noexcept
-    {
-        for (int ch = 0; ch < nCh; ++ch)
-        {
-            T* data = upBuffer_.getChannel(ch);
-            for (int i = 0; i < nS; ++i)
-                data[i] = filter.processSample(data[i], ch);
-        }
     }
 
     int factor_;
@@ -474,8 +433,7 @@ private:
     AudioSpec baseSpec_ {};
     AudioBuffer<T, MaxChannels> upBuffer_;
 
-    std::array<HalfBandFIR, kMaxStages> upFilters_;
-    std::array<HalfBandFIR, kMaxStages> downFilters_;
+    std::array<PolyphaseHalfBand, kMaxStages> filters_;
 };
 
 } // namespace dspark

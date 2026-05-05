@@ -192,11 +192,10 @@ private:
             if (wav.openRead(path.c_str()))
             {
                 stagingInfo_ = wav.getInfo();
-                stagingBuffer_.resize(stagingInfo_.numChannels,
+                stagingBuffer_.resize(static_cast<int>(stagingInfo_.numChannels),
                                       static_cast<int>(stagingInfo_.numSamples));
-                wav.readSamples(stagingBuffer_.toView());
+                ok = wav.readSamples(stagingBuffer_.toView());
                 wav.close();
-                ok = true;
             }
         }
         else if (ext == ".mp3")
@@ -205,11 +204,10 @@ private:
             if (mp3.openRead(path.c_str()))
             {
                 stagingInfo_ = mp3.getInfo();
-                stagingBuffer_.resize(stagingInfo_.numChannels,
+                stagingBuffer_.resize(static_cast<int>(stagingInfo_.numChannels),
                                       static_cast<int>(stagingInfo_.numSamples));
-                mp3.readSamples(stagingBuffer_.toView());
+                ok = mp3.readSamples(stagingBuffer_.toView());
                 mp3.close();
-                ok = true;
             }
         }
 

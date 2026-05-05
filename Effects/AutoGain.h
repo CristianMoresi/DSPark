@@ -12,27 +12,13 @@
  * louder signals sound "better", enabling honest A/B testing.
  *
  * Usage pattern (sandwich):
- * ```
+ * @code
  *   autoGain.pushReference(buffer);   // measure input level
  *   myEffect.processBlock(buffer);    // apply your processing
  *   autoGain.compensate(buffer);      // adjust output to match input level
- * ```
- *
- * The compensation gain is smoothed to avoid pumping. A configurable maximum
- * compensation prevents runaway gain on silence.
+ * @endcode
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h.
- *
- * @code
- *   dspark::AutoGain<float> autoGain;
- *   autoGain.prepare(spec);
- *   autoGain.setMaxCompensation(12.0f);  // ±12 dB max
- *
- *   // In audio callback:
- *   autoGain.pushReference(buffer);
- *   compressor.processBlock(buffer);
- *   autoGain.compensate(buffer);
- * @endcode
  */
 
 #include "../Core/AudioBuffer.h"
@@ -42,40 +28,38 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <limits>
+#include <type_traits>
 
 namespace dspark {
 
 /**
  * @class AutoGain
- * @brief Measures pre-processing level and compensates post-processing output.
+ * @brief Block-adaptive automatic gain compensation with SIMD-friendly linear interpolation.
  *
- * @tparam T Sample type (float or double).
+ * @tparam T Sample type (float or double). Must be lock-free atomic compatible if modified concurrently.
  */
 template <FloatType T>
 class AutoGain
 {
+    // Ensure the atomic type won't trigger a hidden mutex lock in the audio thread
+    static_assert(std::atomic<T>::is_always_lock_free, 
+        "AutoGain requires a lock-free float type for thread safety in the audio path.");
+
 public:
     /**
      * @brief Prepares the auto-gain processor.
-     * @param spec Audio environment specification.
+     * @param spec Audio environment specification containing sample rate and channels.
      */
-    void prepare(const AudioSpec& spec)
+    void prepare(const AudioSpec& spec) noexcept
     {
         sampleRate_ = spec.sampleRate;
         numChannels_ = spec.numChannels;
-
-        // Default smoothing: ~100 ms
-        smoothCoeff_ = static_cast<T>(
-            1.0 - std::exp(-1.0 / (sampleRate_ * 0.100)));
-
         reset();
     }
 
     /**
-     * @brief Snapshots the input level (call BEFORE processing).
-     *
-     * Computes the RMS level of the buffer and stores it as the reference.
-     *
+     * @brief Snapshots the input level. Must be called BEFORE processing.
      * @param buffer Input audio (read-only measurement).
      */
     void pushReference(AudioBufferView<T> buffer) noexcept
@@ -84,103 +68,128 @@ public:
     }
 
     /**
-     * @brief Measures output level and applies gain compensation (call AFTER processing).
-     *
-     * Computes the difference between input and output levels and applies
-     * a smoothed gain correction to the buffer.
-     *
+     * @brief Measures output level and applies smoothed gain compensation. 
+     * Must be called AFTER processing.
      * @param buffer Processed audio (modified in-place).
      */
     void compensate(AudioBufferView<T> buffer) noexcept
     {
-        T outLevelDb = measureRmsDb(buffer);
+        const int numCh = std::min(buffer.getNumChannels(), numChannels_);
+        const int numSamples = buffer.getNumSamples();
 
-        // Target compensation: make output match input level
+        if (numSamples == 0 || numCh == 0) return;
+
+        T outLevelDb = measureRmsDb(buffer);
         T targetDb = refLevelDb_ - outLevelDb;
 
-        // Clamp to safety limits
-        T maxComp = maxCompensation_.load(std::memory_order_relaxed);
-        targetDb = std::clamp(targetDb, -maxComp, maxComp);
-
-        // If both ref and output are silence, no compensation
-        if (refLevelDb_ < T(-90) && outLevelDb < T(-90))
+        // Safety: Prevent NaN propagation if both levels are -Inf
+        if (std::isnan(targetDb)) 
             targetDb = T(0);
 
-        // Smooth the compensation to avoid pumping
-        compensationDb_ += smoothCoeff_ * (targetDb - compensationDb_);
+        // Clamp to safety limits
+        const T maxComp = maxCompensation_.load(std::memory_order_relaxed);
+        targetDb = std::clamp(targetDb, -maxComp, maxComp);
 
-        // Apply
-        T gain = decibelsToGain(compensationDb_);
+        // Silence bypass (-90 dB threshold)
+        if (refLevelDb_ < SILENCE_THRESH_DB && outLevelDb < SILENCE_THRESH_DB)
+            targetDb = T(0);
 
-        int numCh = std::min(buffer.getNumChannels(), numChannels_);
-        int numSamples = buffer.getNumSamples();
+        // Calculate analytical end-state of the one-pole filter for the current block size:
+        // alpha = exp(-N / (Fs * tau))
+        const T alpha = std::exp(static_cast<T>(-numSamples) / (sampleRate_ * smoothTimeSecs_));
+        const T endCompensationDb = targetDb + (compensationDb_ - targetDb) * alpha;
 
+        // Convert dB to linear gain for interpolation
+        const T startGain = decibelsToGain(compensationDb_);
+        const T endGain = decibelsToGain(endCompensationDb);
+        const T gainStep = (endGain - startGain) / static_cast<T>(numSamples);
+
+        // Apply linearly interpolated gain.
+        // This loop structure guarantees no loop-carried dependencies, enabling strict SIMD vectorization.
         for (int ch = 0; ch < numCh; ++ch)
         {
             T* data = buffer.getChannel(ch);
             for (int i = 0; i < numSamples; ++i)
-                data[i] *= gain;
+            {
+                data[i] *= (startGain + static_cast<T>(i) * gainStep);
+            }
         }
+
+        // Update internal state for the next block
+        compensationDb_ = endCompensationDb;
     }
 
-    /** @brief Resets internal state. */
+    /**
+     * @brief Hard resets the internal state to avoid feedback loops or stale measurements.
+     */
     void reset() noexcept
     {
-        refLevelDb_ = T(-100);
+        refLevelDb_ = SILENCE_THRESH_DB;
         compensationDb_ = T(0);
     }
 
-    /** @brief Returns the current compensation in dB (for metering). */
+    /** 
+     * @brief Returns the current internal compensation in dB. Useful for UI metering. 
+     * @return Current gain offset in decibels.
+     */
     [[nodiscard]] T getCompensationDb() const noexcept { return compensationDb_; }
 
     /**
-     * @brief Sets the maximum allowed compensation in dB.
-     * @param dB Max gain change (positive value, applies symmetrically). Default: 12.
+     * @brief Thread-safe assignment of the maximum allowed compensation limit.
+     * @param dB Max gain change in decibels (absolute value used symmetrically).
      */
-    void setMaxCompensation(T dB) noexcept { maxCompensation_.store(std::abs(dB), std::memory_order_relaxed); }
+    void setMaxCompensation(T dB) noexcept 
+    { 
+        maxCompensation_.store(std::abs(dB), std::memory_order_relaxed); 
+    }
 
     /**
-     * @brief Sets the smoothing time for gain changes.
-     * @param ms Smoothing time in milliseconds (default: 100).
+     * @brief Sets the smoothing time constant.
+     * @param ms Smoothing time in milliseconds.
      */
     void setSmoothingTime(T ms) noexcept
     {
-        double seconds = static_cast<double>(ms) * 0.001;
-        smoothCoeff_ = static_cast<T>(
-            1.0 - std::exp(-1.0 / (sampleRate_ * seconds)));
+        smoothTimeSecs_ = std::max<T>(ms * T(0.001), T(0.001)); // Prevent division by zero
     }
 
 private:
-    /// Measures RMS level in dB across all channels.
+    /**
+     * @brief Calculates the global RMS level across all active channels.
+     * @param buffer Read-only audio view.
+     * @return RMS level in decibels.
+     */
     [[nodiscard]] T measureRmsDb(AudioBufferView<T> buffer) const noexcept
     {
-        int numCh = std::min(buffer.getNumChannels(), numChannels_);
-        int numSamples = buffer.getNumSamples();
-
-        if (numSamples == 0) return T(-100);
+        const int numCh = std::min(buffer.getNumChannels(), numChannels_);
+        const int numSamples = buffer.getNumSamples();
 
         T sumSq = T(0);
-        int totalSamples = 0;
+        const int totalSamples = numSamples * numCh;
 
         for (int ch = 0; ch < numCh; ++ch)
         {
             const T* data = buffer.getChannel(ch);
             for (int i = 0; i < numSamples; ++i)
+            {
                 sumSq += data[i] * data[i];
-            totalSamples += numSamples;
+            }
         }
 
-        T rms = std::sqrt(sumSq / static_cast<T>(totalSamples));
-        return gainToDecibels(rms);
+        // Apply a strict epsilon floor (approx -150dB) to avoid std::sqrt(0) and gainToDecibels(0) -> -Inf
+        T meanSq = std::max<T>(sumSq / static_cast<T>(totalSamples), T(1e-15));
+        return gainToDecibels(std::sqrt(meanSq));
     }
 
-    double sampleRate_ = 44100.0;
-    int numChannels_ = 2;
+    static constexpr T SILENCE_THRESH_DB = T(-90);   ///< Threshold below which audio is considered dead silence.
 
-    T refLevelDb_ = T(-100);
-    T compensationDb_ = T(0);
-    std::atomic<T> maxCompensation_ { T(12) };
-    T smoothCoeff_ = T(0.01);
+    double sampleRate_ = 44100.0;                    ///< Current system sample rate.
+    int numChannels_ = 2;                            ///< Expected number of processing channels.
+
+    T smoothTimeSecs_ = T(0.100);                    ///< Smoothing time constant in seconds.
+    T refLevelDb_ = SILENCE_THRESH_DB;               ///< Snapshot of input level.
+    T compensationDb_ = T(0);                        ///< Current applied compensation state.
+
+    std::atomic<T> maxCompensation_{ T(12) };        ///< Lock-free UI bound for max +/- dB change.
 };
 
 } // namespace dspark

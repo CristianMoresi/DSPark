@@ -7,46 +7,38 @@
  * @file FrequencyShifter.h
  * @brief Frequency shifting (not pitch shifting) using Hilbert transform.
  *
- * Shifts all frequency components by a fixed amount in Hz. Unlike pitch
- * shifting, this does NOT preserve harmonic relationships — a 100 Hz
- * fundamental with 200 Hz harmonic shifted by +50 Hz becomes 150 Hz and
- * 250 Hz. This produces the characteristic "barber pole" effect.
+ * Shifts all frequency components by a fixed amount in Hz using Single Sideband 
+ * (SSB) modulation. Unlike pitch shifting, this does NOT preserve harmonic 
+ * relationships.
  *
- * Implementation: Hilbert transformer produces an analytic signal (I + jQ),
- * which is multiplied by a complex exponential e^(j·2π·f·t) to shift
- * all frequencies. The real part of the result is the shifted signal.
+ * Implementation: 
+ * Applies a Hilbert transform to extract the analytic signal (I + jQ).
+ * The complex signal is modulated by a quadrature oscillator e^(j·2π·f·t).
+ * To ensure phase coherency when mixing Dry/Wet, the "Dry" signal is taken 
+ * directly from the real branch of the Hilbert transformer, avoiding comb-filtering.
  *
- * Dependencies: Hilbert.h, Phasor.h, DspMath.h, AudioSpec.h, AudioBuffer.h.
- *
- * @code
- *   dspark::FrequencyShifter<float> shifter;
- *   shifter.prepare(spec);
- *   shifter.setShift(5.0f);   // shift up 5 Hz (barber pole phaser)
- *
- *   // In audio callback:
- *   shifter.processBlock(buffer);
- * @endcode
+ * Dependencies: DspMath.h, Hilbert.h, AudioSpec.h, AudioBuffer.h.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/DspMath.h"
 #include "../Core/Hilbert.h"
-#include "../Core/Phasor.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <numbers>
+#include <vector>
 
 namespace dspark {
 
 /**
  * @class FrequencyShifter
- * @brief Constant-Hz frequency shift via Hilbert + complex modulation.
+ * @brief Constant-Hz frequency shift optimized via Quadrature Oscillator.
  *
- * Each channel has its own Hilbert transformer (independent allpass state).
- * The carrier oscillator is shared across channels.
+ * Uses a recursive rotation matrix to generate the complex carrier, avoiding 
+ * expensive per-sample trigonometric calls. Supports arbitrary channel counts.
  *
  * @tparam T Sample type (float or double).
  */
@@ -55,63 +47,97 @@ class FrequencyShifter
 {
 public:
     /**
-     * @brief Prepares the frequency shifter.
-     * @param spec Audio environment specification.
+     * @brief Prepares the frequency shifter state and allocates internal buffers.
+     * @param spec Audio environment specification (sample rate, num channels).
      */
     void prepare(const AudioSpec& spec)
     {
+        sampleRate_ = spec.sampleRate;
         numChannels_ = spec.numChannels;
-        phasor_.prepare(spec.sampleRate);
-        phasor_.setFrequency(shift_.load(std::memory_order_relaxed));
-
-        for (int ch = 0; ch < numChannels_ && ch < kMaxChannels; ++ch)
-            hilberts_[ch].prepare(spec.sampleRate);
+        
+        // Zero-allocations on audio thread: allocate all Hilberts during prepare.
+        hilberts_.resize(numChannels_);
+        for (auto& h : hilberts_) {
+            h.prepare(spec.sampleRate);
+        }
+        
+        reset();
     }
 
     /**
-     * @brief Processes audio in-place (applies frequency shift).
-     * @param buffer Audio data.
+     * @brief Processes audio in-place applying the frequency shift.
+     * @param buffer Audio data view.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        int numCh = std::min(buffer.getNumChannels(),
-                             std::min(numChannels_, kMaxChannels));
-        int numSamples = buffer.getNumSamples();
+        const int numCh = std::min(buffer.getNumChannels(), numChannels_);
+        const int numSamples = buffer.getNumSamples();
+        if (numSamples == 0 || numCh == 0) return;
 
-        constexpr T kTwoPi = static_cast<T>(2.0 * std::numbers::pi);
-        T mixVal = mix_.load(std::memory_order_relaxed);
+        const T mixVal = mix_.load(std::memory_order_relaxed);
+        const T shiftHz = shift_.load(std::memory_order_relaxed);
 
-        phasor_.setFrequency(shift_.load(std::memory_order_relaxed));
+        // 1. Compute rotation matrix coefficients once per block
+        const double w = (shiftHz * 2.0 * std::numbers::pi) / sampleRate_;
+        const T cos_w = static_cast<T>(std::cos(w));
+        const T sin_w = static_cast<T>(std::sin(w));
 
-        for (int i = 0; i < numSamples; ++i)
+        // Cache the starting phase components for this block
+        const T startCos = static_cast<T>(std::cos(phase_));
+        const T startSin = static_cast<T>(std::sin(phase_));
+
+        // 2. Process planar channels to maximize cache locality
+        for (int ch = 0; ch < numCh; ++ch)
         {
-            T phase = phasor_.advance();
-            T cosPhase = std::cos(phase * kTwoPi);
-            T sinPhase = std::sin(phase * kTwoPi);
+            T* data = buffer.getChannel(ch);
+            auto& hilbert = hilberts_[ch];
 
-            for (int ch = 0; ch < numCh; ++ch)
+            // Local quadrature oscillator state
+            T u = startCos;
+            T v = startSin;
+
+            for (int i = 0; i < numSamples; ++i)
             {
-                T* data = buffer.getChannel(ch);
-                auto h = hilberts_[ch].process(data[i]);
+                // Hilbert processing (I + jQ)
+                auto h = hilbert.process(data[i]);
 
-                T shifted = h.real * cosPhase - h.imag * sinPhase;
+                // Modulate analytic signal: real part of (I+jQ) * (u+jv)
+                T shifted = h.real * u - h.imag * v;
 
-                data[i] = data[i] + (shifted - data[i]) * mixVal;
+                // Mix correctly: Use h.real as the phase-aligned dry signal
+                data[i] = h.real + (shifted - h.real) * mixVal;
+
+                // Advance quadrature oscillator: rotation matrix
+                T next_u = u * cos_w - v * sin_w;
+                T next_v = u * sin_w + v * cos_w;
+                u = next_u;
+                v = next_v;
             }
+        }
+
+        // 3. Advance absolute phase once per block to prevent float drift
+        phase_ += w * numSamples;
+        
+        // Wrap phase precisely
+        constexpr double kTwoPi = 2.0 * std::numbers::pi;
+        phase_ = std::fmod(phase_, kTwoPi);
+        if (phase_ < 0.0) phase_ += kTwoPi;
+    }
+
+    /** 
+     * @brief Resets internal filter states and phase accumulator. 
+     */
+    void reset() noexcept
+    {
+        phase_ = 0.0;
+        for (auto& h : hilberts_) {
+            h.reset();
         }
     }
 
-    /** @brief Resets internal state. */
-    void reset() noexcept
-    {
-        phasor_.reset();
-        for (auto& h : hilberts_)
-            h.reset();
-    }
-
     /**
-     * @brief Sets the frequency shift amount.
-     * @param hz Shift in Hz (-1000 to +1000 typical). Negative = down.
+     * @brief Sets the frequency shift amount in Hz.
+     * @param hz Shift in Hz (Negative shifts frequencies down).
      */
     void setShift(T hz) noexcept
     {
@@ -120,25 +146,30 @@ public:
 
     /**
      * @brief Sets the dry/wet mix.
-     * @param mix 0.0 = fully dry, 1.0 = fully wet.
+     * @param mix Range [0.0, 1.0]. 0.0 = pure dry (phase-aligned), 1.0 = fully shifted.
      */
     void setMix(T mix) noexcept
     {
         mix_.store(std::clamp(mix, T(0), T(1)), std::memory_order_relaxed);
     }
 
+    /** @return The current frequency shift amount in Hz. */
     [[nodiscard]] T getShift() const noexcept { return shift_.load(std::memory_order_relaxed); }
+    
+    /** @return The current dry/wet mix ratio. */
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
 
 private:
-    static constexpr int kMaxChannels = 2;
+    double sampleRate_ = 44100.0;
+    int numChannels_ = 0;
+    
+    // Using double for phase accumulation to prevent drift over long sessions
+    double phase_ = 0.0; 
 
-    int numChannels_ = 2;
-    std::atomic<T> shift_ { T(0) };
-    std::atomic<T> mix_ { T(1) };
+    std::atomic<T> shift_{ T(0) };
+    std::atomic<T> mix_{ T(1) };
 
-    Phasor<T> phasor_;
-    Hilbert<T> hilberts_[kMaxChannels]{};
+    std::vector<Hilbert<T>> hilberts_;
 };
 
 } // namespace dspark

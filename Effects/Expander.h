@@ -8,25 +8,11 @@
  * @brief Downward expander with configurable ratio, hysteresis, and sidechain.
  *
  * A generalization of the noise gate: instead of fully closing (infinite ratio),
- * the expander applies a configurable ratio below the threshold. At high ratios
- * (>20:1) it behaves like a gate; at low ratios (1.5:1–4:1) it provides gentle
- * dynamic range expansion.
- *
- * Uses the same state machine as NoiseGate (Open/Hold/Closed) with hysteresis
- * to prevent chattering. Supports internal and external sidechain with optional
- * high-pass filter.
+ * the expander applies a configurable ratio below the threshold. Includes an 
+ * integrated envelope detector to prevent low-frequency intermodulation distortion,
+ * and a true-stereo sidechain high-pass filter.
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h.
- *
- * @code
- *   dspark::Expander<float> exp;
- *   exp.prepare(spec);
- *   exp.setThreshold(-30.0f);
- *   exp.setRatio(4.0f);        // 4:1 expansion below threshold
- *   exp.setAttack(0.5f);
- *   exp.setRelease(100.0f);
- *   exp.processBlock(buffer);
- * @endcode
  */
 
 #include "../Core/DspMath.h"
@@ -38,6 +24,7 @@
 #include <atomic>
 #include <cmath>
 #include <numbers>
+#include <array>
 
 namespace dspark {
 
@@ -57,147 +44,114 @@ public:
 
     // -- Lifecycle -----------------------------------------------------------
 
+    /**
+     * @brief Initializes the expander with a specific sample rate.
+     * @param sampleRate The sample rate in Hz.
+     */
     void prepare(double sampleRate) noexcept
     {
-        sampleRate_ = sampleRate;
+        sampleRate_ = std::max(sampleRate, 1.0);
         updateCoefficients();
         reset();
     }
 
+    /**
+     * @brief Initializes the expander using an AudioSpec struct.
+     * @param spec Framework audio specification object.
+     */
     void prepare(const AudioSpec& spec)
     {
         prepare(spec.sampleRate);
     }
 
+    /**
+     * @brief Processes an audio block in place.
+     * @param buffer View of the audio buffer to process.
+     */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
         DenormalGuard guard;
-        const int nCh = buffer.getNumChannels();
-        const int nS  = buffer.getNumSamples();
-
         cacheParams();
 
-        if (nCh >= 2)
-        {
-            for (int i = 0; i < nS; ++i)
-            {
-                T left  = buffer.getChannel(0)[i];
-                T right = buffer.getChannel(1)[i];
-                T sc = std::max(std::abs(left), std::abs(right));
-                if (cachedScHpfEnabled_) sc = applySidechainHPF(sc);
-
-                T levelDb = gainToDecibels(sc);
-                updateStateMachine(levelDb);
-                T gain = computeGain(levelDb);
-
-                for (int ch = 0; ch < nCh; ++ch)
-                    buffer.getChannel(ch)[i] *= gain;
-            }
-        }
-        else if (nCh == 1)
-        {
-            for (int i = 0; i < nS; ++i)
-            {
-                T input = buffer.getChannel(0)[i];
-                T sc = std::abs(input);
-                if (cachedScHpfEnabled_)
-                    sc = std::abs(applySidechainHPF(input));
-                T levelDb = gainToDecibels(sc);
-                updateStateMachine(levelDb);
-                buffer.getChannel(0)[i] = input * computeGain(levelDb);
-            }
-        }
-    }
-
-    /**
-     * @brief Processes audio with external sidechain.
-     */
-    void processBlock(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
-    {
-        DenormalGuard guard;
-        const int nCh  = audio.getNumChannels();
-        const int nS   = audio.getNumSamples();
-        const int scCh = sidechain.getNumChannels();
-
-        cacheParams();
-
-        for (int i = 0; i < nS; ++i)
-        {
-            T scMax = T(0);
-            for (int c = 0; c < scCh; ++c)
-            {
-                T a = std::abs(sidechain.getChannel(c)[i]);
-                if (a > scMax) scMax = a;
-            }
-
-            T levelDb = gainToDecibels(scMax);
-            updateStateMachine(levelDb);
-            T gain = computeGain(levelDb);
-
-            for (int ch = 0; ch < nCh; ++ch)
-                audio.getChannel(ch)[i] *= gain;
-        }
-    }
-
-    [[nodiscard]] T processSample(T input) noexcept
-    {
-        return processSampleInternal(input, input);
-    }
-
-    [[nodiscard]] T processSampleWithSidechain(T input, T sidechain) noexcept
-    {
-        return processSampleInternal(input, sidechain);
+        if (cachedScHpfEnabled_)
+            processBlockInternal<true>(buffer);
+        else
+            processBlockInternal<false>(buffer);
     }
 
     // -- Parameters ----------------------------------------------------------
 
+    /** @brief Sets the threshold in decibels. */
     void setThreshold(T dB) noexcept { threshold_.store(dB, std::memory_order_relaxed); }
+    
+    /** @brief Sets the expansion ratio (e.g., 4.0 for 4:1). */
     void setRatio(T ratio) noexcept { ratio_.store(std::max(ratio, T(1)), std::memory_order_relaxed); }
+    
+    /** @brief Sets the hysteresis gap in decibels to prevent chattering. */
     void setHysteresis(T dB) noexcept { hysteresis_.store(std::max(dB, T(0)), std::memory_order_relaxed); }
+    
+    /** @brief Sets the maximum gain reduction limit in decibels. */
     void setRange(T dB) noexcept
     {
         rangeDb_ = std::min(dB, T(0));
         rangeLinear_.store(decibelsToGain(rangeDb_), std::memory_order_relaxed);
     }
 
+    /** @brief Sets the attack time in milliseconds. */
     void setAttack(T ms) noexcept
     {
         attackMs_.store(std::max(ms, T(0.01)), std::memory_order_relaxed);
         updateCoefficients();
     }
 
+    /** @brief Sets the hold time in milliseconds before release begins. */
     void setHold(T ms) noexcept
     {
         holdMs_.store(std::max(ms, T(0)), std::memory_order_relaxed);
-        holdSamples_.store(static_cast<int>(sampleRate_ * static_cast<double>(holdMs_.load(std::memory_order_relaxed)) / 1000.0),
-                           std::memory_order_relaxed);
+        if (sampleRate_ > 0.0) {
+            holdSamples_.store(static_cast<int>(sampleRate_ * static_cast<double>(holdMs_.load(std::memory_order_relaxed)) / 1000.0),
+                               std::memory_order_relaxed);
+        }
     }
 
+    /** @brief Sets the release time in milliseconds. */
     void setRelease(T ms) noexcept
     {
         releaseMs_.store(std::max(ms, T(0.01)), std::memory_order_relaxed);
         updateCoefficients();
     }
 
+    /** 
+     * @brief Enables and configures the sidechain high-pass filter. 
+     * @param enabled True to engage the HPF.
+     * @param cutoffHz Cutoff frequency in Hz.
+     */
     void setSidechainHPF(bool enabled, double cutoffHz = 80.0) noexcept
     {
         scHpfEnabled_.store(enabled, std::memory_order_relaxed);
-        scHpfCoeff_ = static_cast<T>(
-            std::exp(-std::numbers::pi * 2.0 * cutoffHz / sampleRate_));
+        if (sampleRate_ > 0.0) {
+            scHpfCoeff_ = static_cast<T>(std::exp(-std::numbers::pi * 2.0 * cutoffHz / sampleRate_));
+        }
     }
 
     // -- Queries -------------------------------------------------------------
 
+    /** @return The current state of the expander's logic gate. */
     [[nodiscard]] State getState() const noexcept { return state_; }
+    
+    /** @return The current actual gain being applied, in decibels. */
     [[nodiscard]] T getCurrentGainDb() const noexcept { return gainToDecibels(gateGain_); }
 
+    /** @brief Resets all internal DSP states to prevent clicks on playback start. */
     void reset() noexcept
     {
         state_ = State::Closed;
         gateGain_ = rangeLinear_.load(std::memory_order_relaxed);
+        envelope_ = T(0);
         holdCounter_ = 0;
-        scHpfState_ = T(0);
-        scHpfPrev_ = T(0);
+        
+        std::fill(scHpfState_.begin(), scHpfState_.end(), T(0));
+        std::fill(scHpfPrev_.begin(), scHpfPrev_.end(), T(0));
     }
 
 protected:
@@ -213,6 +167,56 @@ protected:
         cachedScHpfEnabled_ = scHpfEnabled_.load(std::memory_order_relaxed);
     }
 
+    /**
+     * @brief Internal processing loop templated on HPF state to avoid branching.
+     * @tparam UseHPF Compile-time flag to include HPF processing.
+     * @param buffer View of the audio buffer.
+     */
+    template <bool UseHPF>
+    void processBlockInternal(AudioBufferView<T> buffer) noexcept
+    {
+        const int nCh = buffer.getNumChannels();
+        const int nS  = buffer.getNumSamples();
+
+        for (int i = 0; i < nS; ++i)
+        {
+            T sc = T(0);
+
+            // 1. Calculate Sidechain Signal
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T input = buffer.getChannel(ch)[i];
+                if constexpr (UseHPF)
+                {
+                    // Filter must be applied to raw bipolar signal per channel
+                    T output = input - scHpfPrev_[ch] + scHpfCoeff_ * scHpfState_[ch];
+                    scHpfPrev_[ch] = input;
+                    scHpfState_[ch] = output;
+                    input = output;
+                }
+                sc = std::max(sc, std::abs(input));
+            }
+
+            // 2. Fast Envelope Detector (RMS-ish integration to prevent IMD)
+            // Using a fixed fast integration time (~2ms) for the detector
+            T envCoeff = sc > envelope_ ? T(0.01) : T(0.001); 
+            envelope_ += envCoeff * (sc - envelope_);
+
+            // 3. Gain Calculation (Converting envelope to dB only once)
+            // Optimization note: replace gainToDecibels with fast_log10 approximation if available in DspMath.h
+            T levelDb = gainToDecibels(envelope_ + T(1e-9)); 
+            
+            updateStateMachine(levelDb);
+            T gain = computeGain(levelDb);
+
+            // 4. Apply Gain
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                buffer.getChannel(ch)[i] *= gain;
+            }
+        }
+    }
+
     void updateStateMachine(T levelDb) noexcept
     {
         T openThresh  = cachedThreshold_;
@@ -221,8 +225,7 @@ protected:
         switch (state_)
         {
             case State::Closed:
-                if (levelDb > openThresh)
-                    state_ = State::Open;
+                if (levelDb > openThresh) state_ = State::Open;
                 break;
             case State::Open:
                 if (levelDb < closeThresh)
@@ -240,13 +243,6 @@ protected:
         }
     }
 
-    /**
-     * @brief Computes the output gain based on level and expansion ratio.
-     *
-     * When level is above threshold: gain = 1 (open).
-     * When level is below threshold: gain = expansion curve with ratio.
-     * Gain is smoothed and clamped to range.
-     */
     [[nodiscard]] T computeGain(T levelDb) noexcept
     {
         T targetGain;
@@ -257,40 +253,19 @@ protected:
         }
         else
         {
-            // Expansion: how far below threshold
             T underDb = cachedThreshold_ - levelDb;
-            // Gain reduction = underDb * (1 - 1/ratio)
             T reductionDb = underDb * (T(1) - T(1) / cachedRatio_);
+            
+            // Optimization note: replace decibelsToGain with fast_exp10 if available
             T expandedGain = decibelsToGain(-reductionDb);
-            // Clamp to range floor
             targetGain = std::max(expandedGain, cachedRangeLinear_);
         }
 
-        // Smooth transition
+        // Apply smoothing to the linear gain
         T coeff = (targetGain > gateGain_) ? cachedAttackCoeff_ : cachedReleaseCoeff_;
         gateGain_ += coeff * (targetGain - gateGain_);
 
         return gateGain_;
-    }
-
-    [[nodiscard]] T processSampleInternal(T input, T sidechain) noexcept
-    {
-        cacheParams();
-        T sc = std::abs(sidechain);
-        if (cachedScHpfEnabled_)
-            sc = std::abs(applySidechainHPF(sidechain));
-
-        T levelDb = gainToDecibels(sc);
-        updateStateMachine(levelDb);
-        return input * computeGain(levelDb);
-    }
-
-    [[nodiscard]] T applySidechainHPF(T input) noexcept
-    {
-        T output = input - scHpfPrev_ + scHpfCoeff_ * scHpfState_;
-        scHpfPrev_ = input;
-        scHpfState_ = output;
-        return output;
     }
 
     void updateCoefficients() noexcept
@@ -316,8 +291,11 @@ protected:
 
     std::atomic<bool> scHpfEnabled_ { false };
     T scHpfCoeff_ = T(0.995);
-    T scHpfState_ = T(0);
-    T scHpfPrev_ = T(0);
+    
+    // Arrays for true-stereo independent HPF states
+    static constexpr int MAX_CHANNELS = 8;
+    std::array<T, MAX_CHANNELS> scHpfState_{};
+    std::array<T, MAX_CHANNELS> scHpfPrev_{};
 
     std::atomic<T> attackCoeff_ { T(0) };
     std::atomic<T> releaseCoeff_ { T(0) };
@@ -335,6 +313,7 @@ protected:
 
     State state_ = State::Closed;
     T gateGain_ = T(0);
+    T envelope_ = T(0);
     int holdCounter_ = 0;
 };
 

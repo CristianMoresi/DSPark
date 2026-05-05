@@ -5,20 +5,20 @@
 
 /**
  * @file TransientDesigner.h
- * @brief Transient shaping via dual-envelope analysis.
+ * @brief Transient shaping via dual-envelope analysis (VCA Logarithmic Model).
  *
- * Uses two envelope followers (fast peak + slow RMS) to separate transient
- * content from sustained content. The ratio between the fast and slow
- * envelopes indicates the transient intensity, allowing independent control
- * of attack (transient) and sustain (body) characteristics.
+ * Emulates classic analog transient shapers by calculating the difference
+ * between a fast (peak) and slow (RMS) envelope in the logarithmic domain.
+ * This effectively separates the attack and release phases, applying
+ * independent gain adjustments to the transient and the body.
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h.
  *
  * @code
  *   dspark::TransientDesigner<float> td;
  *   td.prepare(spec);
- *   td.setAttack(50.0f);    // +50% attack emphasis
- *   td.setSustain(-30.0f);  // -30% sustain reduction
+ *   td.setAttack(0.5f);    // +50% attack emphasis
+ *   td.setSustain(-0.3f);  // -30% sustain reduction
  *   td.processBlock(buffer);
  * @endcode
  */
@@ -37,7 +37,7 @@ namespace dspark {
 
 /**
  * @class TransientDesigner
- * @brief Transient shaper with independent attack and sustain controls.
+ * @brief Zero-allocation, thread-safe, SIMD-friendly transient shaper.
  *
  * @tparam T Sample type (float or double).
  */
@@ -49,13 +49,19 @@ public:
 
     // -- Lifecycle -----------------------------------------------------------
 
+    /**
+     * @brief Prepares the processor with the current audio specification.
+     * @param spec Audio specification including sample rate.
+     */
     void prepare(const AudioSpec& spec)
     {
-        sampleRate_ = spec.sampleRate;
-        updateCoefficients();
-        reset();
+        prepare(spec.sampleRate);
     }
 
+    /**
+     * @brief Prepares the processor with a specific sample rate.
+     * @param sampleRate The operating sample rate in Hz.
+     */
     void prepare(double sampleRate) noexcept
     {
         sampleRate_ = sampleRate;
@@ -65,6 +71,8 @@ public:
 
     /**
      * @brief Processes an audio buffer in-place.
+     * @param buffer View of the audio buffer to process.
+     * @note Loop order optimized for SoA (Structure of Arrays) SIMD execution.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
@@ -72,39 +80,64 @@ public:
         const int nCh = std::min(buffer.getNumChannels(), kMaxChannels);
         const int nS  = buffer.getNumSamples();
 
-        T attAmt  = attackAmount_.load(std::memory_order_relaxed);
-        T susAmt  = sustainAmount_.load(std::memory_order_relaxed);
-        bool odr  = outputDepRecovery_.load(std::memory_order_relaxed);
+        const T attAmt = attackAmount_.load(std::memory_order_relaxed);
+        const T susAmt = sustainAmount_.load(std::memory_order_relaxed);
+        const bool odr = outputDepRecovery_.load(std::memory_order_relaxed);
 
-        for (int i = 0; i < nS; ++i)
+        // Constants for VCA log-domain emulation
+        constexpr T noiseFloor = T(1e-5);     // -100 dB floor avoids log(0) and denormals
+        constexpr T maxGainLog = T(2.77258);  // approx +24dB max gain change
+
+        // Outer loop: Channels (Cache & SIMD friendly)
+        for (int ch = 0; ch < nCh; ++ch)
         {
-            for (int ch = 0; ch < nCh; ++ch)
-            {
-                T sample = buffer.getChannel(ch)[i];
-                T absSample = std::abs(sample);
+            T* const channelData = buffer.getChannel(ch);
+            T fast = envFast_[ch];
+            T slow = envSlow_[ch];
+            T lastOut = lastOutput_[ch];
 
-                // Fast envelope (peak follower): detects transients
-                T& fast = envFast_[ch];
+            // Inner loop: Samples (Auto-vectorization target)
+            for (int i = 0; i < nS; ++i)
+            {
+                T sample = channelData[i];
+                T absSample = std::abs(sample) + noiseFloor;
+
+                // 1. Fast envelope (Peak)
                 T fastCoeff = (absSample > fast) ? fastAttackCoeff_ : fastReleaseCoeff_;
                 fast += fastCoeff * (absSample - fast);
 
-                // Slow envelope (RMS-like): tracks sustained level
-                T& slow = envSlow_[ch];
-                T slowRelCoeff = slowReleaseCoeff_;
+                // 2. Slow envelope (Sustain/RMS tracker)
+                T currentSlowRelCoeff = slowReleaseCoeff_;
+                
+                if (odr) 
+                {
+                    // Corrected ODR: Higher output = LARGER coefficient = Faster release
+                    T modifier = T(1) + std::abs(lastOut) * T(2.0); 
+                    currentSlowRelCoeff = std::min(fastReleaseCoeff_, currentSlowRelCoeff * modifier);
+                }
 
-                // Output-dependent recovery: faster release when output is loud
-                if (odr)
-                    slowRelCoeff /= (T(1) + std::abs(lastOutput_[ch]));
-
-                T slowCoeff = (absSample > slow) ? slowAttackCoeff_ : slowRelCoeff;
+                T slowCoeff = (absSample > slow) ? slowAttackCoeff_ : currentSlowRelCoeff;
                 slow += slowCoeff * (absSample - slow);
 
-                // Compute gain from envelope ratio
-                T gain = computeGain(fast, slow, attAmt, susAmt);
-                T output = sample * gain;
-                lastOutput_[ch] = output;
-                buffer.getChannel(ch)[i] = output;
+                // 3. Log-domain VCA computation
+                // Replace std::log / std::exp with dspark::math::fast_log / fast_exp if available in DspMath.h
+                T diffLog = std::log(fast) - std::log(slow); 
+                
+                // Attack kicks in when fast > slow (diffLog > 0). Sustain when slow > fast (diffLog < 0)
+                T gainLog = (diffLog > T(0)) ? (diffLog * attAmt) : (-diffLog * susAmt);
+                
+                gainLog = std::clamp(gainLog, -maxGainLog, maxGainLog);
+                
+                T gain = std::exp(gainLog);
+                
+                lastOut = sample * gain;
+                channelData[i] = lastOut;
             }
+
+            // Save state
+            envFast_[ch] = fast;
+            envSlow_[ch] = slow;
+            lastOutput_[ch] = lastOut;
         }
     }
 
@@ -129,11 +162,8 @@ public:
     }
 
     /**
-     * @brief Enables output-dependent recovery.
-     *
-     * When enabled, the slow envelope release speed scales inversely with
-     * output level: louder output = faster recovery. Prevents pumping
-     * artifacts on dynamic material.
+     * @brief Enables output-dependent recovery (ODR).
+     * @param enabled If true, slow envelope release speed scales with output level.
      */
     void setOutputDepRecovery(bool enabled) noexcept
     {
@@ -141,10 +171,8 @@ public:
     }
 
     /**
-     * @brief Sets character as a single knob (-1 to +1).
-     *
-     * Maps to attack/sustain: -1 = soften transients + boost sustain,
-     * 0 = neutral, +1 = boost transients + reduce sustain.
+     * @brief Sets character as a single macro-knob.
+     * @param amount Range [-1.0, 1.0]. -1 = soften transients/boost sustain, +1 = boost transients/reduce sustain.
      */
     void setCharacter(T amount) noexcept
     {
@@ -153,39 +181,18 @@ public:
         sustainAmount_.store(-c * T(0.5), std::memory_order_relaxed);
     }
 
+    /**
+     * @brief Clears all internal buffers and state. Must be lock-free.
+     */
     void reset() noexcept
     {
-        envFast_.fill(T(0));
-        envSlow_.fill(T(0));
+        envFast_.fill(T(1e-5)); // Init to noise floor
+        envSlow_.fill(T(1e-5));
         lastOutput_.fill(T(0));
     }
 
 private:
     static constexpr int kMaxChannels = 16;
-
-    [[nodiscard]] T computeGain(T fast, T slow, T attAmt, T susAmt) const noexcept
-    {
-        constexpr T eps = T(1e-10);
-        T gain = T(1);
-
-        T safeSlowInv = T(1) / std::max(slow, eps);
-        T transientRatio = fast * safeSlowInv;
-
-        if (std::abs(attAmt) > T(0.001))
-        {
-            T clamped = std::clamp(transientRatio, T(0.1), T(10));
-            gain *= std::pow(clamped, attAmt);
-        }
-
-        if (std::abs(susAmt) > T(0.001))
-        {
-            T sustainRatio = slow * (T(1) / std::max(fast, eps));
-            T clamped = std::clamp(sustainRatio, T(0.1), T(10));
-            gain *= std::pow(clamped, susAmt);
-        }
-
-        return std::clamp(gain, T(0.01), T(10));
-    }
 
     void updateCoefficients() noexcept
     {
@@ -199,7 +206,7 @@ private:
 
     double sampleRate_ = 48000.0;
 
-    // Atomic parameters
+    // Atomic parameters (Lock-free thread safety)
     std::atomic<T> attackAmount_ { T(0) };
     std::atomic<T> sustainAmount_ { T(0) };
     std::atomic<bool> outputDepRecovery_ { false };
@@ -208,10 +215,10 @@ private:
     T fastAttackCoeff_ = T(0), fastReleaseCoeff_ = T(0);
     T slowAttackCoeff_ = T(0), slowReleaseCoeff_ = T(0);
 
-    // Per-channel state
-    std::array<T, kMaxChannels> envFast_ {};
-    std::array<T, kMaxChannels> envSlow_ {};
-    std::array<T, kMaxChannels> lastOutput_ {};
+    // Per-channel state (Aligned for SIMD)
+    alignas(32) std::array<T, kMaxChannels> envFast_ {};
+    alignas(32) std::array<T, kMaxChannels> envSlow_ {};
+    alignas(32) std::array<T, kMaxChannels> lastOutput_ {};
 };
 
 } // namespace dspark

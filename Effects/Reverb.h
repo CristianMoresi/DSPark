@@ -37,6 +37,7 @@
 #include "../Core/RingBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
+#include "../Core/DspMath.h"
 #include "../Core/Resampler.h"
 #include "../IO/WavFile.h"
 

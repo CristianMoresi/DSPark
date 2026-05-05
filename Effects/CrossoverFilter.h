@@ -17,24 +17,7 @@
  * for professional multi-band processing.
  *
  * Dependencies: Biquad.h, AudioBuffer.h, AudioSpec.h, DspMath.h, FFT.h,
- *               DenormalGuard.h.
- *
- * @code
- *   dspark::CrossoverFilter<float> xover;
- *   xover.setNumBands(3);
- *   xover.setCrossoverFrequency(0, 200.0f);   // low/mid split
- *   xover.setCrossoverFrequency(1, 2000.0f);  // mid/high split
- *   xover.setOrder(24);                        // LR24 (24 dB/oct)
- *   xover.prepare(spec);
- *
- *   // Allocate output buffers (one per band)
- *   dspark::AudioBuffer<float> bands[3];
- *   for (auto& b : bands) b.resize(spec.numChannels, spec.maxBlockSize);
- *   dspark::AudioBufferView<float> views[3] = { bands[0].toView(), bands[1].toView(), bands[2].toView() };
- *
- *   xover.processBlock(inputBuffer, views, 3);
- *   // views[0] = low, views[1] = mid, views[2] = high
- * @endcode
+ *               DenormalGuard.h, SmoothedValue.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -59,7 +42,7 @@ namespace dspark {
  * @class CrossoverFilter
  * @brief Linkwitz-Riley crossover with 2–12 bands, LR12/LR24/LR48.
  *
- * @tparam T        Sample type (float or double).
+ * @tparam T      Sample type (float or double).
  * @tparam MaxBands Maximum number of output bands (compile-time, default 12).
  */
 template <FloatType T, int MaxBands = 12>
@@ -70,11 +53,13 @@ public:
     enum class FilterMode
     {
         MinimumPhase, ///< IIR biquads with allpass phase correction (zero latency).
-        LinearPhase   ///< FFT-based magnitude-only (block-size latency, zero
-                      ///< phase distortion). M5a note: strictly *zero-phase*,
-                      ///< so transients get pre-ringing (same caveat as
-                      ///< Equalizer::FilterMode::LinearPhase).
+        LinearPhase   ///< FFT-based FIR crossover (introduces latency, zero phase distortion, introduces pre-ringing).
     };
+
+    CrossoverFilter()
+    {
+        for (auto& f : targetFrequencies_) f.store(1000.0f, std::memory_order_relaxed);
+    }
 
     // -- Lifecycle -----------------------------------------------------------
 
@@ -87,28 +72,25 @@ public:
         spec_ = spec;
         numChannels_ = spec.numChannels;
 
-        // Allocate IIR work buffer
-        workBuf_.resize(static_cast<size_t>(spec.numChannels));
-        for (auto& ch : workBuf_)
-            ch.assign(static_cast<size_t>(spec.maxBlockSize), T(0));
+        // Allocate flat IIR work buffer (Channels * MaxBlockSize)
+        workBuf_.assign(static_cast<size_t>(spec.numChannels * spec.maxBlockSize), T(0));
 
         // Linear-phase FFT resources
         if (filterMode_.load(std::memory_order_relaxed) == FilterMode::LinearPhase && spec.maxBlockSize > 0)
         {
+            // For Overlap-Save, FFT size must be >= BlockSize + FIR_Length - 1
+            // We choose FIR_Length = maxBlockSize. Thus FFT >= 2 * maxBlockSize - 1.
             int fftPow2 = 1;
             while (fftPow2 < spec.maxBlockSize * 2) fftPow2 <<= 1;
             lpFftSize_ = fftPow2;
+            firLength_ = spec.maxBlockSize; // Use block size as FIR length for good resolution
+            lpLatency_ = (firLength_ - 1) / 2;
 
             lpFft_ = std::make_unique<FFTReal<T>>(lpFftSize_);
             int numBins = lpFftSize_ / 2 + 1;
 
-            lpMagnitudes_.resize(static_cast<size_t>(MaxBands));
-            for (auto& m : lpMagnitudes_)
-                m.assign(static_cast<size_t>(numBins), T(0));
-
-            lpPrevBlock_.resize(static_cast<size_t>(spec.numChannels));
-            for (auto& pb : lpPrevBlock_)
-                pb.assign(static_cast<size_t>(lpFftSize_ / 2), T(0));
+            lpMagnitudesFlat_.assign(static_cast<size_t>(MaxBands * numBins * 2), T(0));
+            lpPrevBlockFlat_.assign(static_cast<size_t>(spec.numChannels * firLength_), T(0));
 
             lpFftIn_.assign(static_cast<size_t>(lpFftSize_), T(0));
             lpFftOut_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
@@ -116,19 +98,21 @@ public:
             lpFftResult_.assign(static_cast<size_t>(lpFftSize_), T(0));
         }
 
-        // Allocate allpass correction chains (heap to avoid large inline arrays)
-        allpass_.resize(static_cast<size_t>(MaxBands));
-        for (auto& v : allpass_)
-            v.resize(static_cast<size_t>(kMaxSplits));
+        // Allocate flat allpass correction chains
+        // Access via: band * kMaxSplits + split
+        allpassFlat_.resize(static_cast<size_t>(MaxBands * kMaxSplits));
 
         // Initialize frequency smoothers
         int nb = numBands_.load(std::memory_order_relaxed);
+        initDefaultFrequencies();
+        
         for (int i = 0; i < kMaxSplits; ++i)
         {
             freqSmoothers_[i].prepare(spec.sampleRate, 5.0);
             freqSmoothers_[i].setSmoothingType(SmoothedValue<T>::SmoothingType::Exponential);
-            if (i < nb - 1)
-                freqSmoothers_[i].setCurrentAndTarget(frequencies_[i]);
+            T target = targetFrequencies_[i].load(std::memory_order_relaxed);
+            freqSmoothers_[i].reset(target);
+            frequencies_[i] = target;
         }
 
         dirty_.store(true, std::memory_order_relaxed);
@@ -141,7 +125,7 @@ public:
     /**
      * @brief Splits input into separate band outputs.
      *
-     * @param input       Input audio buffer.
+     * @param input        Input audio buffer.
      * @param bandOutputs Array of AudioBufferView, one per band.
      * @param numOutputBands Number of output bands (must match getNumBands()).
      */
@@ -149,6 +133,16 @@ public:
                       AudioBufferView<T>* bandOutputs, int numOutputBands) noexcept
     {
         if (!prepared_) return;
+
+        // Check if UI requested a frequency update
+        if (freqUpdatePending_.exchange(false, std::memory_order_relaxed))
+        {
+            for (int i = 0; i < kMaxSplits; ++i)
+            {
+                freqSmoothers_[i].setTargetValue(targetFrequencies_[i].load(std::memory_order_relaxed));
+            }
+        }
+
         if (dirty_.load(std::memory_order_relaxed)) updateCoefficients();
 
         int n = std::min(numOutputBands, numBands_.load(std::memory_order_relaxed));
@@ -162,11 +156,6 @@ public:
 
     // -- Configuration -------------------------------------------------------
 
-    /**
-     * @brief Sets the number of output bands (2–MaxBands).
-     *
-     * Default crossover frequencies are logarithmically spaced from 100 Hz to 10 kHz.
-     */
     void setNumBands(int n) noexcept
     {
         numBands_.store(std::clamp(n, 2, MaxBands), std::memory_order_relaxed);
@@ -176,25 +165,32 @@ public:
     }
 
     /**
-     * @brief Sets a crossover frequency.
-     * @param index Split index (0 to numBands-2).
-     * @param freqHz Frequency in Hz.
+     * @brief Sets a crossover frequency. Automatically maintains sorting.
      */
     void setCrossoverFrequency(int index, T freqHz) noexcept
     {
-        if (index >= 0 && index < kMaxSplits)
+        if (index >= 0 && index < numBands_.load(std::memory_order_relaxed) - 1)
         {
-            frequencies_[index] = freqHz;
-            freqSmoothers_[index].setTargetValue(freqHz);
+            // Read all current targets into a local array to sort them
+            std::array<T, kMaxSplits> localTargets;
+            for (int i = 0; i < kMaxSplits; ++i)
+                localTargets[i] = targetFrequencies_[i].load(std::memory_order_relaxed);
+            
+            localTargets[index] = freqHz;
+            
+            // Sort on the UI thread to avoid Audio Thread priority inversion/CPU spikes
+            int activeSplits = numBands_.load(std::memory_order_relaxed) - 1;
+            std::sort(localTargets.begin(), localTargets.begin() + activeSplits);
+
+            for (int i = 0; i < kMaxSplits; ++i)
+                targetFrequencies_[i].store(localTargets[i], std::memory_order_relaxed);
+
+            freqUpdatePending_.store(true, std::memory_order_relaxed);
             dirty_.store(true, std::memory_order_relaxed);
             lpMagDirty_.store(true, std::memory_order_relaxed);
         }
     }
 
-    /**
-     * @brief Sets the Linkwitz-Riley order (12, 24, or 48 dB/oct).
-     * @param order 12 (LR12), 24 (LR24, default), or 48 (LR48).
-     */
     void setOrder(int order) noexcept
     {
         if (order == 12 || order == 24 || order == 48)
@@ -205,11 +201,6 @@ public:
         }
     }
 
-    /**
-     * @brief Sets the filter processing mode.
-     *
-     * Call prepare() again after changing mode.
-     */
     void setFilterMode(FilterMode mode) noexcept
     {
         filterMode_.store(mode, std::memory_order_relaxed);
@@ -223,13 +214,12 @@ public:
     [[nodiscard]] int getOrder() const noexcept { return order_.load(std::memory_order_relaxed); }
     [[nodiscard]] FilterMode getFilterMode() const noexcept { return filterMode_.load(std::memory_order_relaxed); }
 
-    /** @brief Returns latency in samples (0 for IIR, blockSize for linear-phase). */
+    /** @brief Returns latency in samples (0 for IIR, FIR group delay for linear-phase). */
     [[nodiscard]] int getLatency() const noexcept
     {
-        return (filterMode_.load(std::memory_order_relaxed) == FilterMode::LinearPhase) ? spec_.maxBlockSize : 0;
+        return (filterMode_.load(std::memory_order_relaxed) == FilterMode::LinearPhase) ? lpLatency_ : 0;
     }
 
-    /** @brief Resets all internal filter state. */
     void reset() noexcept
     {
         for (auto& sp : splits_)
@@ -237,18 +227,15 @@ public:
             for (auto& b : sp.lp) b.reset();
             for (auto& b : sp.hp) b.reset();
         }
-        for (auto& bandAps : allpass_)
-            for (auto& apChain : bandAps)
-                for (auto& b : apChain.stages) b.reset();
-        for (auto& pb : lpPrevBlock_)
-            std::fill(pb.begin(), pb.end(), T(0));
+        for (auto& apChain : allpassFlat_)
+            for (auto& b : apChain.stages) b.reset();
+            
+        std::fill(lpPrevBlockFlat_.begin(), lpPrevBlockFlat_.end(), T(0));
     }
 
 private:
     static constexpr int kMaxSplits = MaxBands - 1;
-    static constexpr int kMaxStagesPerFilter = 4; // LR48 max
-
-    // -- IIR filter structures -----------------------------------------------
+    static constexpr int kMaxStagesPerFilter = 4;
 
     struct SplitPoint
     {
@@ -260,8 +247,6 @@ private:
     {
         std::array<Biquad<T, 16>, kMaxStagesPerFilter> stages;
     };
-
-    // -- First-order allpass (for LR12) --------------------------------------
 
     [[nodiscard]] static BiquadCoeffs<T> makeFirstOrderAllPass(double sampleRate, double freq) noexcept
     {
@@ -276,8 +261,6 @@ private:
         return coeffs;
     }
 
-    // -- Default frequencies -------------------------------------------------
-
     void initDefaultFrequencies() noexcept
     {
         int numSplits = numBands_.load(std::memory_order_relaxed) - 1;
@@ -287,11 +270,10 @@ private:
         for (int s = 0; s < numSplits; ++s)
         {
             T t = static_cast<T>(s + 1) / static_cast<T>(numSplits + 1);
-            frequencies_[s] = std::exp(logMin + t * (logMax - logMin));
+            targetFrequencies_[s].store(std::exp(logMin + t * (logMax - logMin)), std::memory_order_relaxed);
         }
+        freqUpdatePending_.store(true, std::memory_order_relaxed);
     }
-
-    // -- Coefficient updates -------------------------------------------------
 
     void updateCoefficients() noexcept
     {
@@ -301,13 +283,10 @@ private:
         int numSplits = numBands_.load(std::memory_order_relaxed) - 1;
         double sr = spec_.sampleRate;
 
-        // Sort frequencies ascending
-        std::sort(frequencies_.begin(), frequencies_.begin() + numSplits);
-
+        // Note: Frequencies are already guaranteed to be sorted by the setter thread.
         switch (order_.load(std::memory_order_relaxed))
         {
-            case 12: // LR12: two first-order Butterworth stages
-            {
+            case 12:
                 numStagesPerFilter_ = 2;
                 for (int s = 0; s < numSplits; ++s)
                 {
@@ -323,13 +302,11 @@ private:
                     }
                     for (int b = 0; b < s; ++b)
                         for (int st = 0; st < 2; ++st)
-                            allpass_[b][s].stages[st].setCoeffs(apC);
+                            allpassFlat_[b * kMaxSplits + s].stages[st].setCoeffs(apC);
                 }
                 break;
-            }
 
-            case 24: // LR24: two second-order Butterworth stages (Q = 0.7071)
-            {
+            case 24:
                 numStagesPerFilter_ = 2;
                 for (int s = 0; s < numSplits; ++s)
                 {
@@ -345,12 +322,11 @@ private:
                     }
                     for (int b = 0; b < s; ++b)
                         for (int st = 0; st < 2; ++st)
-                            allpass_[b][s].stages[st].setCoeffs(apC);
+                            allpassFlat_[b * kMaxSplits + s].stages[st].setCoeffs(apC);
                 }
                 break;
-            }
 
-            case 48: // LR48: four second-order stages (BW4 Q = {0.5412, 1.3066})
+            case 48:
             {
                 numStagesPerFilter_ = 4;
                 constexpr double q1 = 0.5412;
@@ -368,8 +344,7 @@ private:
                     }
                     for (int b = 0; b < s; ++b)
                         for (int st = 0; st < 4; ++st)
-                            allpass_[b][s].stages[st].setCoeffs(
-                                BiquadCoeffs<T>::makeAllPass(sr, f, qArr[st]));
+                            allpassFlat_[b * kMaxSplits + s].stages[st].setCoeffs(BiquadCoeffs<T>::makeAllPass(sr, f, qArr[st]));
                 }
                 break;
             }
@@ -378,31 +353,24 @@ private:
         }
     }
 
-    // -- IIR processing (minimum-phase) --------------------------------------
-
-    void processIIR(AudioBufferView<T> input,
-                    AudioBufferView<T>* outputs, int numBands) noexcept
+    void processIIR(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands) noexcept
     {
         DenormalGuard guard;
         const int nCh = std::min(input.getNumChannels(), numChannels_);
         const int nS  = input.getNumSamples();
         const int numSplits = numBands - 1;
 
-        // Check if any frequency smoother is still active
         bool anySmoothing = false;
         for (int i = 0; i < numSplits; ++i)
             anySmoothing = anySmoothing || freqSmoothers_[i].isSmoothing();
 
         if (anySmoothing)
         {
-            // Process in sub-blocks of 32 samples with coefficient updates
             constexpr int kSubBlockSize = 32;
             int offset = 0;
             while (offset < nS)
             {
                 int blockLen = std::min(kSubBlockSize, nS - offset);
-
-                // Advance smoothers and update coefficients with smoothed frequencies
                 for (int i = 0; i < numSplits; ++i)
                 {
                     for (int s = 0; s < blockLen; ++s)
@@ -410,7 +378,6 @@ private:
                     frequencies_[i] = freqSmoothers_[i].getCurrentValue();
                 }
                 updateCoefficients();
-
                 processIIRRange(input, outputs, numBands, nCh, offset, blockLen);
                 offset += blockLen;
             }
@@ -421,56 +388,51 @@ private:
         }
     }
 
-    /**
-     * @brief Processes a sub-range [offset, offset+blockLen) through the IIR crossover.
-     */
-    void processIIRRange(AudioBufferView<T> input,
-                         AudioBufferView<T>* outputs, int numBands,
-                         int nCh, int offset, int blockLen) noexcept
+    inline T* getWorkBufChannel(int ch) noexcept
+    {
+        return workBuf_.data() + ch * spec_.maxBlockSize;
+    }
+
+    void processIIRRange(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands, int nCh, int offset, int blockLen) noexcept
     {
         const int numSplits = numBands - 1;
 
-        // Copy input to work buffer
         for (int ch = 0; ch < nCh; ++ch)
         {
             const T* src = input.getChannel(ch) + offset;
-            T* dst = workBuf_[ch].data();
+            T* dst = getWorkBufChannel(ch);
             std::copy(src, src + blockLen, dst);
         }
 
-        // Cascaded splitting: LP → band output, HP → residual work buffer
         for (int s = 0; s < numSplits; ++s)
         {
             for (int i = 0; i < blockLen; ++i)
             {
                 for (int ch = 0; ch < nCh; ++ch)
                 {
-                    T sample = workBuf_[ch][i];
+                    T* workCh = getWorkBufChannel(ch);
+                    T sample = workCh[i];
 
-                    // LP cascade → band output
                     T lpSample = sample;
                     for (int st = 0; st < numStagesPerFilter_; ++st)
                         lpSample = splits_[s].lp[st].processSample(lpSample, ch);
                     outputs[s].getChannel(ch)[offset + i] = lpSample;
 
-                    // HP cascade → work buffer (in-place)
                     T hpSample = sample;
                     for (int st = 0; st < numStagesPerFilter_; ++st)
                         hpSample = splits_[s].hp[st].processSample(hpSample, ch);
-                    workBuf_[ch][i] = hpSample;
+                    workCh[i] = hpSample;
                 }
             }
         }
 
-        // Last band = remaining work buffer (highest frequencies)
         for (int ch = 0; ch < nCh; ++ch)
         {
             T* dst = outputs[numBands - 1].getChannel(ch) + offset;
-            const T* src = workBuf_[ch].data();
+            const T* src = getWorkBufChannel(ch);
             std::copy(src, src + blockLen, dst);
         }
 
-        // Allpass phase correction for lower bands
         for (int s = 1; s < numSplits; ++s)
         {
             for (int b = 0; b < s; ++b)
@@ -481,7 +443,7 @@ private:
                     {
                         T sample = outputs[b].getChannel(ch)[offset + i];
                         for (int st = 0; st < numStagesPerFilter_; ++st)
-                            sample = allpass_[b][s].stages[st].processSample(sample, ch);
+                            sample = allpassFlat_[b * kMaxSplits + s].stages[st].processSample(sample, ch);
                         outputs[b].getChannel(ch)[offset + i] = sample;
                     }
                 }
@@ -489,18 +451,6 @@ private:
         }
     }
 
-    // -- Linear-phase processing (FFT-based) ---------------------------------
-
-    /**
-     * @brief Recomputes per-band LR magnitude curves for FFT processing.
-     *
-     * Uses the analytic Butterworth magnitude formula:
-     *   |LP(f)|  = 1 / (1 + (f/fc)^(2N))
-     *   |HP(f)|  = (f/fc)^(2N) / (1 + (f/fc)^(2N))
-     * where N = LR order (2 for LR12, 4 for LR24, 8 for LR48).
-     *
-     * Bands sum to unity at every frequency (LR property).
-     */
     void recomputeLinearPhaseMagnitudes() noexcept
     {
         if (!lpMagDirty_.load(std::memory_order_relaxed) || lpFftSize_ == 0) return;
@@ -510,95 +460,141 @@ private:
         const int numSplits = numBands_.load(std::memory_order_relaxed) - 1;
         const double sr = spec_.sampleRate;
 
-        // Exponent for the Butterworth magnitude formula
         int expo = 0;
         switch (order_.load(std::memory_order_relaxed))
         {
-            case 12: expo = 2; break;  // (f/fc)^2
-            case 24: expo = 4; break;  // (f/fc)^4
-            case 48: expo = 8; break;  // (f/fc)^8
+            case 12: expo = 2; break;
+            case 24: expo = 4; break;
+            case 48: expo = 8; break;
         }
+
+        // Temporary array to hold ideal zero-phase magnitudes
+        std::vector<std::vector<T>> idealMags(numBands_.load(), std::vector<T>(numBins, T(0)));
 
         for (int k = 0; k < numBins; ++k)
         {
             double freq = sr * static_cast<double>(k) / static_cast<double>(lpFftSize_);
-
-            // Compute LP and HP magnitude at each split point
             T lpMag[kMaxSplits], hpMag[kMaxSplits];
 
             for (int s = 0; s < numSplits; ++s)
             {
                 double fc = std::max(static_cast<double>(frequencies_[s]), 1.0);
                 double ratio = freq / fc;
-
-                // (f/fc)^expo via repeated squaring
-                double rPow = 1.0;
-                double r2 = ratio * ratio;
-                if (expo >= 2) rPow = r2;
-                if (expo >= 4) rPow = r2 * r2;
-                if (expo >= 8) rPow = rPow * rPow;
-
+                double rPow = std::pow(ratio, static_cast<double>(expo * 2));
+                
                 double denom = 1.0 + rPow;
                 lpMag[s] = static_cast<T>(1.0 / denom);
                 hpMag[s] = static_cast<T>(rPow / denom);
             }
 
-            // Per-band magnitude (cascaded split)
-            lpMagnitudes_[0][k] = lpMag[0];
+            idealMags[0][k] = lpMag[0];
             for (int b = 1; b < numBands_ - 1; ++b)
-                lpMagnitudes_[b][k] = hpMag[b - 1] * lpMag[b];
-            lpMagnitudes_[numBands_ - 1][k] = hpMag[numSplits - 1];
+                idealMags[b][k] = hpMag[b - 1] * lpMag[b];
+            idealMags[numBands_ - 1][k] = hpMag[numSplits - 1];
+        }
+
+        // Window Design & FIR Kernel generation
+        std::vector<T> timeResponse(lpFftSize_ + 2, T(0));
+        std::vector<T> firKernel(lpFftSize_, T(0));
+        
+        for (int b = 0; b < numBands_.load(); ++b)
+        {
+            // Prepare complex bins for inverse FFT (zero phase)
+            for(int k = 0; k < numBins; ++k) {
+                timeResponse[2 * k] = idealMags[b][k];
+                timeResponse[2 * k + 1] = T(0);
+            }
+            
+            lpFft_->inverse(timeResponse.data(), firKernel.data());
+            
+            // Circular shift, windowing (Blackman), and zero-padding
+            std::fill(lpFftIn_.begin(), lpFftIn_.end(), T(0));
+            int halfLen = firLength_ / 2;
+            
+            for (int i = 0; i < firLength_; ++i)
+            {
+                // Un-wrap circular time response to causal shifted response
+                int srcIdx = (i - halfLen + lpFftSize_) % lpFftSize_;
+                
+                // Blackman Window
+                double n = static_cast<double>(i);
+                double N = static_cast<double>(firLength_ - 1);
+                double window = 0.42 - 0.5 * std::cos(2.0 * std::numbers::pi * n / N) + 0.08 * std::cos(4.0 * std::numbers::pi * n / N);
+                
+                lpFftIn_[i] = firKernel[srcIdx] * static_cast<T>(window);
+            }
+            
+            // Forward FFT to get the usable overlap-save kernel
+            lpFft_->forward(lpFftIn_.data(), lpFftOut_.data());
+            
+            // Store complex spectrum contiguously
+            T* bandMagData = lpMagnitudesFlat_.data() + (b * numBins * 2);
+            std::copy(lpFftOut_.begin(), lpFftOut_.begin() + (numBins * 2), bandMagData);
         }
     }
 
-    void processLinearPhase(AudioBufferView<T> input,
-                            AudioBufferView<T>* outputs, int numBands) noexcept
+    inline T* getPrevBlockChannel(int ch) noexcept
+    {
+        return lpPrevBlockFlat_.data() + ch * firLength_;
+    }
+
+    void processLinearPhase(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands) noexcept
     {
         recomputeLinearPhaseMagnitudes();
 
         const int nCh = std::min(input.getNumChannels(), numChannels_);
         const int nS  = input.getNumSamples();
-        const int halfFft = lpFftSize_ / 2;
         const int numBins = lpFftSize_ / 2 + 1;
+        const int overlapSize = firLength_ - 1;
 
         for (int ch = 0; ch < nCh; ++ch)
         {
             T* channelData = input.getChannel(ch);
-            auto& prev = lpPrevBlock_[ch];
+            T* prev = getPrevBlockChannel(ch);
 
-            // Build FFT input: [prev | current | zero-pad]
-            for (int i = 0; i < halfFft; ++i)
-                lpFftIn_[i] = (i < static_cast<int>(prev.size())) ? prev[i] : T(0);
-            for (int i = 0; i < nS && i < halfFft; ++i)
-                lpFftIn_[halfFft + i] = channelData[i];
-            for (int i = nS; i < halfFft; ++i)
-                lpFftIn_[halfFft + i] = T(0);
+            // Overlap-Save: [overlap block | new samples | zero pad]
+            for (int i = 0; i < overlapSize; ++i)
+                lpFftIn_[i] = prev[i];
+                
+            for (int i = 0; i < nS; ++i)
+                lpFftIn_[overlapSize + i] = channelData[i];
+                
+            for (int i = overlapSize + nS; i < lpFftSize_; ++i)
+                lpFftIn_[i] = T(0);
 
-            // Save raw input as prev for next overlap-save call
-            for (int i = 0; i < halfFft; ++i)
-                prev[i] = (i < nS) ? channelData[i] : T(0);
+            // Save tail for next block
+            for (int i = 0; i < overlapSize; ++i)
+            {
+                if (nS - overlapSize + i >= 0)
+                    prev[i] = channelData[nS - overlapSize + i];
+                else
+                    prev[i] = lpFftIn_[overlapSize + nS - overlapSize + i]; // Handle block size < overlap
+            }
 
-            // Forward FFT (shared across bands)
             lpFft_->forward(lpFftIn_.data(), lpFftOut_.data());
 
-            // For each band: apply magnitude, IFFT, extract overlap-save output
             for (int b = 0; b < numBands; ++b)
             {
-                // Multiply complex spectrum by band magnitude
+                const T* kernelSpectrum = lpMagnitudesFlat_.data() + (b * numBins * 2);
+                
+                // Complex multiplication
                 for (int k = 0; k < numBins; ++k)
                 {
-                    T mag = lpMagnitudes_[b][k];
-                    lpBandFft_[2 * k]     = lpFftOut_[2 * k]     * mag;
-                    lpBandFft_[2 * k + 1] = lpFftOut_[2 * k + 1] * mag;
+                    T r1 = lpFftOut_[2 * k];
+                    T i1 = lpFftOut_[2 * k + 1];
+                    T r2 = kernelSpectrum[2 * k];
+                    T i2 = kernelSpectrum[2 * k + 1];
+
+                    lpBandFft_[2 * k]     = r1 * r2 - i1 * i2;
+                    lpBandFft_[2 * k + 1] = r1 * i2 + i1 * r2;
                 }
 
-                // Inverse FFT
                 lpFft_->inverse(lpBandFft_.data(), lpFftResult_.data());
 
-                // Overlap-save: take last B samples
+                // Discard garbage and copy valid output
                 T* outCh = outputs[b].getChannel(ch);
                 for (int i = 0; i < nS; ++i)
-                    outCh[i] = lpFftResult_[halfFft + i];
+                    outCh[i] = lpFftResult_[overlapSize + i];
             }
         }
     }
@@ -613,23 +609,28 @@ private:
     std::atomic<FilterMode> filterMode_ { FilterMode::MinimumPhase };
     std::atomic<bool> dirty_ { true };
 
-    // Crossover frequencies (sorted ascending)
+    std::array<std::atomic<T>, kMaxSplits> targetFrequencies_ {};
+    std::atomic<bool> freqUpdatePending_ { false };
+
     std::array<T, kMaxSplits> frequencies_ {};
     std::array<SmoothedValue<T>, kMaxSplits> freqSmoothers_;
 
-    // IIR state
     int numStagesPerFilter_ = 2;
     std::array<SplitPoint, kMaxSplits> splits_ {};
-    // Dynamically allocated to avoid large inline arrays (MaxBands * kMaxSplits * 4 Biquads)
-    std::vector<std::vector<AllPassChain>> allpass_; // [band][split]
-    std::vector<std::vector<T>> workBuf_; // [channel][sample]
+    
+    // Flattened data structures for cache locality
+    std::vector<AllPassChain> allpassFlat_;
+    std::vector<T> workBuf_;
 
     // Linear-phase state
     std::unique_ptr<FFTReal<T>> lpFft_;
     int lpFftSize_ = 0;
+    int firLength_ = 0;
+    int lpLatency_ = 0;
     std::atomic<bool> lpMagDirty_ { true };
-    std::vector<std::vector<T>> lpMagnitudes_; // [band][bin]
-    std::vector<std::vector<T>> lpPrevBlock_;  // [channel][sample]
+    
+    std::vector<T> lpMagnitudesFlat_; // [band * numBins * 2 + complexIdx]
+    std::vector<T> lpPrevBlockFlat_;  // [ch * firLength_ + sampleIdx]
     std::vector<T> lpFftIn_, lpFftOut_, lpBandFft_, lpFftResult_;
 };
 

@@ -5,32 +5,26 @@
 
 /**
  * @file Phaser.h
- * @brief Classic phaser effect using LFO-modulated allpass filter stages.
+ * @brief Classic analog-modeled phaser effect using LFO-modulated allpass filter stages.
  *
  * Creates the sweeping "jet" sound by passing the signal through a series of
- * allpass filters whose cutoff frequencies are modulated by an LFO. The allpass
- * filters shift the phase of different frequencies by different amounts; when
- * mixed with the dry signal, this creates moving notches in the spectrum.
+ * first-order allpass filters whose cutoff frequencies are modulated by an LFO. 
+ * Includes an analog-style saturation stage in the feedback loop to emulate
+ * classic hardware behavior and prevent harsh digital clipping.
  *
- * Three levels of API complexity:
+ * Three levels of API complexity are provided:
+ * - **Level 1 (Simple):** `setRate()`, `setDepth()`, `setMix()`
+ * - **Level 2 (Intermediate):** `setStages()`, `setFeedback()`, `setFrequencyRange()`
+ * - **Level 3 (Expert):** `setLfoWaveform()`, `setCenterFrequency()`
  *
- * - **Level 1 (simple):** `phaser.setRate(0.5f); phaser.setDepth(0.7f);`
- * - **Level 2 (intermediate):** Number of stages, feedback, frequency range.
- * - **Level 3 (expert):** Direct center frequency, LFO waveform.
- *
- * Dependencies: Biquad.h, Oscillator.h, DryWetMixer.h, AudioSpec.h, AudioBuffer.h.
+ * Dependencies: Biquad.h, Oscillator.h, DryWetMixer.h, AudioSpec.h, AudioBuffer.h, DspMath.h.
  *
  * @code
  *   dspark::Phaser<float> phaser;
  *   phaser.prepare(spec);
- *   phaser.setRate(0.5f);     // Slow sweep
- *   phaser.setDepth(0.8f);    // Deep effect
- *   phaser.setMix(0.5f);      // 50/50
+ *   phaser.setRate(0.5f);     // 0.5 Hz sweep
+ *   phaser.setFeedback(0.7f); // High resonance
  *   phaser.processBlock(buffer);
- *
- *   // Deeper phasing:
- *   phaser.setStages(6);          // 6 allpass stages
- *   phaser.setFeedback(0.7f);     // Resonant peaks
  * @endcode
  */
 
@@ -38,7 +32,7 @@
 #include "../Core/DryWetMixer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
-#include "../Core/DspMath.h"
+#include "../Core/DspMath.h" // Must provide fast_exp and fast_tan
 
 #include <algorithm>
 #include <array>
@@ -50,13 +44,12 @@ namespace dspark {
 
 /**
  * @class Phaser
- * @brief Allpass-based phaser with configurable stages, feedback, and LFO.
+ * @brief Zero-latency, highly optimized allpass-based phaser.
  *
- * The LFO sweeps the allpass cutoff frequencies logarithmically between
- * minFreq and maxFreq. More stages = deeper phasing (more notches).
- * Feedback adds resonant peaks at the notch frequencies.
+ * Employs parameter smoothing to prevent zipper noise and utilizes 
+ * fast math approximations for real-time performance.
  *
- * @tparam T Sample type (float or double).
+ * @tparam T Sample type (must satisfy FloatType concept, e.g., float or double).
  */
 template <FloatType T>
 class Phaser
@@ -69,8 +62,8 @@ public:
     // -- Lifecycle --------------------------------------------------------------
 
     /**
-     * @brief Prepares the phaser for processing.
-     * @param spec Audio environment.
+     * @brief Prepares the phaser and allocates internal state blocks.
+     * @param spec Hardware audio specifications (sample rate, block size).
      */
     void prepare(const AudioSpec& spec)
     {
@@ -81,71 +74,70 @@ public:
         lfo_.setFrequency(rate_.load(std::memory_order_relaxed));
         lfo_.setWaveform(lfoWaveform_);
 
-        for (auto& stage : stages_)
-        {
-            stage.xPrev.fill(T(0));
-            stage.yPrev.fill(T(0));
-        }
-        for (auto& fb : fbState_)
-            fb = T(0);
+        // Calculate smoothing coefficient (approx 50ms response time)
+        smoothCoef_ = T(1) - std::exp(static_cast<T>(-2.0 * std::numbers::pi * 20.0) / static_cast<T>(spec_.sampleRate));
+
+        reset();
     }
 
     /**
-     * @brief Processes audio through the phaser.
-     * @param buffer Audio data to process in-place.
+     * @brief Processes an audio block in-place.
+     * @param buffer The AudioBufferView containing channels to process.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
         const int nCh = std::min(buffer.getNumChannels(), kMaxChannels);
         const int nS  = buffer.getNumSamples();
 
-        T depthVal    = depth_.load(std::memory_order_relaxed);
-        T mixVal      = mix_.load(std::memory_order_relaxed);
-        T fbVal       = feedback_.load(std::memory_order_relaxed);
-        int stagesVal = numStages_.load(std::memory_order_relaxed);
-        T minF        = minFreq_.load(std::memory_order_relaxed);
-        T maxF        = maxFreq_.load(std::memory_order_relaxed);
+        // Target parameters loaded once per block
+        const T targetDepth = depth_.load(std::memory_order_relaxed);
+        const T targetMix   = mix_.load(std::memory_order_relaxed);
+        const T targetFb    = feedback_.load(std::memory_order_relaxed);
+        const int stagesVal = numStages_.load(std::memory_order_relaxed);
+        const T minF        = minFreq_.load(std::memory_order_relaxed);
+        const T maxF        = maxFreq_.load(std::memory_order_relaxed);
 
         mixer_.pushDry(buffer);
 
         const T logMin = std::log(minF);
         const T logMax = std::log(maxF);
-        const T fsInv = T(1) / static_cast<T>(spec_.sampleRate);
+        const T fsInv  = T(1) / static_cast<T>(spec_.sampleRate);
         constexpr T kPi = static_cast<T>(std::numbers::pi);
 
         for (int i = 0; i < nS; ++i)
         {
-            // LFO modulates the allpass cutoff frequency (log scale)
-            T lfoVal = lfo_.getNextSample(); // [-1, 1]
-            T modAmount = (lfoVal + T(1)) * T(0.5) * depthVal; // [0, depth]
-            T logFreq = logMin + modAmount * (logMax - logMin);
-            T cutoff = std::exp(logFreq);
+            // Parameter smoothing (1-pole lowpass) to prevent zipper noise
+            currentDepth_ += smoothCoef_ * (targetDepth - currentDepth_);
+            currentFb_    += smoothCoef_ * (targetFb - currentFb_);
 
-            // Clamp to Nyquist
+            // LFO calculates log-scaled frequency
+            T lfoVal = lfo_.getNextSample(); 
+            T modAmount = (lfoVal + T(1)) * T(0.5) * currentDepth_; 
+            T logFreq = logMin + modAmount * (logMax - logMin);
+            
+            // Convert log-frequency back to linear Hz (fastExp ≈ 2× std::exp)
+            T cutoff = fastExp(logFreq);
+
+            // Clamp to Nyquist boundary
             T nyquist = static_cast<T>(spec_.sampleRate) * T(0.499);
             cutoff = std::min(cutoff, nyquist);
 
-            // First-order allpass coefficient derived from the bilinear
-            // transform:  c = (tan(π·fc/fs) − 1) / (tan(π·fc/fs) + 1)
-            // Maps fc ∈ (0, fs/2) to c ∈ (−1, 1), with c = 0 at fc = fs/4.
-            // Transfer function: H(z) = (c + z⁻¹) / (1 + c·z⁻¹).
-            //
-            // This replaces the previous biquad all-pass (a9 optimisation):
-            // 2 mul + 2 add per sample/ch instead of 5 mul + 4 add, matching
-            // the classic analog phaser topology (MXR Phase 90, Small Stone)
-            // which chains single-pole stages rather than second-order ones.
-            T tanVal = std::tan(kPi * cutoff * fsInv);
+            // Bilinear-transform coefficient: tan(π·f/Fs).
+            // fastTan is safe here — `cutoff` is always < Nyquist so the
+            // argument is bounded to π/2 by the clamp above.
+            T tanVal = fastTan(kPi * cutoff * fsInv);
             T c = (tanVal - T(1)) / (tanVal + T(1));
 
-            // Process each channel
+            // Process active channels
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T sample = buffer.getChannel(ch)[i];
 
-                // Add feedback
-                sample += fbState_[ch] * fbVal;
+                // Analog-modeled feedback with soft clipping to prevent digital blowups
+                T fbSignal = std::tanh(fbState_[ch] * currentFb_);
+                sample += fbSignal;
 
-                // First-order allpass chain: y[n] = c·x[n] + x[n-1] - c·y[n-1]
+                // Series first-order allpass chain
                 for (int s = 0; s < stagesVal; ++s)
                 {
                     auto& st = stages_[s];
@@ -155,15 +147,20 @@ public:
                     sample = y;
                 }
 
-                fbState_[ch] = sample;
+                fbState_[ch] = sample; // 1-sample delay for next iteration
                 buffer.getChannel(ch)[i] = sample;
             }
         }
 
-        mixer_.mixWet(buffer, mixVal);
+        // Mix parameter is smoothed internally by DryWetMixer if implemented correctly,
+        // otherwise apply similar smoothing logic here.
+        mixer_.mixWet(buffer, targetMix); 
     }
 
-    /** @brief Resets all internal state. */
+    /** 
+     * @brief Clears internal DSP state and history buffers. 
+     * Call this when transport stops or playback jumps.
+     */
     void reset() noexcept
     {
         for (auto& stage : stages_)
@@ -171,8 +168,11 @@ public:
             stage.xPrev.fill(T(0));
             stage.yPrev.fill(T(0));
         }
-        for (auto& fb : fbState_)
-            fb = T(0);
+        for (auto& fb : fbState_) fb = T(0);
+
+        currentDepth_ = depth_.load(std::memory_order_relaxed);
+        currentFb_    = feedback_.load(std::memory_order_relaxed);
+
         lfo_.reset();
         mixer_.reset();
     }
@@ -180,8 +180,8 @@ public:
     // -- Level 1: Simple API ----------------------------------------------------
 
     /**
-     * @brief Sets the LFO sweep rate.
-     * @param hz LFO frequency in Hz (typical: 0.1 - 5 Hz).
+     * @brief Sets the speed of the phaser sweep.
+     * @param hz LFO frequency in Hertz. Range: [0.01, 20.0].
      */
     void setRate(T hz) noexcept
     {
@@ -191,8 +191,8 @@ public:
     }
 
     /**
-     * @brief Sets the modulation depth.
-     * @param amount 0.0 = no sweep, 1.0 = full range sweep.
+     * @brief Sets how wide the frequency sweep is.
+     * @param amount Range: [0.0 (static), 1.0 (full spectrum)].
      */
     void setDepth(T amount) noexcept
     {
@@ -200,20 +200,19 @@ public:
     }
 
     /**
-     * @brief Sets the dry/wet mix.
-     * @param dryWet 0.0 = dry, 1.0 = fully wet.
+     * @brief Balances the unprocessed and processed signal.
+     * @param dryWet Range: [0.0 (fully dry), 1.0 (fully wet)].
      */
-    void setMix(T dryWet) noexcept { mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed); }
+    void setMix(T dryWet) noexcept 
+    { 
+        mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed); 
+    }
 
     // -- Level 2: Intermediate API ----------------------------------------------
 
     /**
-     * @brief Sets the number of allpass stages.
-     *
-     * More stages = more notches = deeper phasing effect.
-     * Must be even for classic phaser sound (2, 4, 6, 8, 10, 12).
-     *
-     * @param count Number of stages (1 to 12).
+     * @brief Configures the intensity/color of the phaser via filter stages.
+     * @param count Number of allpass stages. Range: [1, 12]. Evens (2,4,6) are standard.
      */
     void setStages(int count) noexcept
     {
@@ -221,12 +220,8 @@ public:
     }
 
     /**
-     * @brief Sets the feedback amount.
-     *
-     * Feedback adds resonant peaks at the notch frequencies,
-     * making the phasing more pronounced and vocal.
-     *
-     * @param amount Feedback gain (0.0 to 0.99).
+     * @brief Injects phase-shifted signal back into the input for resonance.
+     * @param amount Feedback gain. Range: [-0.99, 0.99]. Negative values alter the vocal formant shape.
      */
     void setFeedback(T amount) noexcept
     {
@@ -234,29 +229,23 @@ public:
     }
 
     /**
-     * @brief Sets the center frequency for the allpass sweep.
-     *
-     * The LFO sweeps logarithmically around this frequency.
-     * Default is geometric mean of minFreq and maxFreq.
-     *
-     * @param hz Center frequency in Hz.
+     * @brief Defines the midpoint of the logarithmic frequency sweep.
+     * @param hz Center frequency in Hertz.
      */
     void setCenterFrequency(T hz) noexcept
     {
         T curMin = minFreq_.load(std::memory_order_relaxed);
         T curMax = maxFreq_.load(std::memory_order_relaxed);
-        T halfRange = std::sqrt(curMax / curMin);
+        T halfRange = std::sqrt(curMax / (curMin > T(0) ? curMin : T(1))); 
+        
         minFreq_.store(std::max(hz / halfRange, T(20)), std::memory_order_relaxed);
         maxFreq_.store(std::min(hz * halfRange, static_cast<T>(spec_.sampleRate) * T(0.499)), std::memory_order_relaxed);
     }
 
     /**
-     * @brief Sets the frequency range for the allpass sweep.
-     *
-     * The allpass cutoff frequencies sweep between these limits.
-     *
-     * @param minHz Lower frequency bound.
-     * @param maxHz Upper frequency bound.
+     * @brief Explicitly defines the sweep boundaries.
+     * @param minHz Lower limit of the allpass cutoff sweep.
+     * @param maxHz Upper limit of the allpass cutoff sweep.
      */
     void setFrequencyRange(T minHz, T maxHz) noexcept
     {
@@ -268,11 +257,8 @@ public:
     // -- Level 3: Expert API ----------------------------------------------------
 
     /**
-     * @brief Sets the LFO waveform.
-     *
-     * Sine = smooth classic sweep. Triangle = more linear sweep.
-     *
-     * @param wf LFO waveform type.
+     * @brief Changes the geometric shape of the LFO modulation.
+     * @param wf Target waveform (e.g., Sine, Triangle).
      */
     void setLfoWaveform(typename Oscillator<T>::Waveform wf) noexcept
     {
@@ -280,10 +266,10 @@ public:
         lfo_.setWaveform(wf);
     }
 
-    /** @brief Returns the number of active stages. */
+    /** @brief Retrieves the active stage count. @return Number of stages. */
     [[nodiscard]] int getStages() const noexcept { return numStages_.load(std::memory_order_relaxed); }
 
-    /** @brief Returns the current rate in Hz. */
+    /** @brief Retrieves the current sweep rate. @return Rate in Hz. */
     [[nodiscard]] T getRate() const noexcept { return rate_.load(std::memory_order_relaxed); }
 
 protected:
@@ -301,15 +287,18 @@ protected:
     std::atomic<int> numStages_ { 4 };
     typename Oscillator<T>::Waveform lfoWaveform_ = Oscillator<T>::Waveform::Sine;
 
-    // First-order allpass stage (per-channel state, shared coefficient computed per sample).
-    // Direct-form with two state variables per channel: xPrev and yPrev.
+    // Smoothed state parameters
+    T currentDepth_ { T(0.8) };
+    T currentFb_    { T(0) };
+    T smoothCoef_   { T(0.01) }; 
+
     struct FirstOrderAllpass
     {
         std::array<T, kMaxChannels> xPrev {};
         std::array<T, kMaxChannels> yPrev {};
     };
 
-    // Processing
+    // Processing state
     std::array<FirstOrderAllpass, kMaxStages> stages_ {};
     std::array<T, kMaxChannels> fbState_ {};
     Oscillator<T> lfo_;

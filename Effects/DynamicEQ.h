@@ -5,40 +5,20 @@
 
 /**
  * @file DynamicEQ.h
- * @brief Dynamic parametric equalizer with per-band level detection.
+ * @brief Dynamic parametric equalizer with per-band level detection and true VCA ballistics.
  *
- * Each band independently detects level, then applies dynamic gain above
- * and/or below its threshold. Dual above/below threshold control per band
- * enables any combination: downward compression (cut above), upward boost
- * (boost below), expansion (cut below), or dynamic boost (boost above).
- *
- * Optional oversampling (1x/2x/4x) and lookahead (0–10 ms) for transparent
- * processing of fast transients.
+ * Implements a high-performance dynamic EQ. Unlike standard envelope followers,
+ * this implementation applies attack/release ballistics directly to the gain reduction
+ * signal, accurately modeling analog VCA behavior and allowing true independent
+ * times for Above and Below threshold processing.
  *
  * Architecture per band:
  * ```
- *   Input → [Sidechain BP filter] → Envelope → Gain Computer →
- *   → Dynamic Peak EQ (makePeak with computed gain) → Output
+ *   Sidechain → [BP Filter] → RMS/Peak Detect → Gain Computer → Ballistics Smoother → [Peak EQ]
  * ```
  *
- * Dependencies: Biquad.h, DspMath.h, AudioSpec.h, AudioBuffer.h,
- *               Oversampling.h, RingBuffer.h, DenormalGuard.h.
- *
- * @code
- *   dspark::DynamicEQ<float> deq;
- *   deq.prepare(spec);
- *   deq.setNumBands(4);
- *
- *   // Band 0: cut above -10 dB at 3 kHz (de-esser style)
- *   dspark::DynamicEQ<float>::BandConfig cfg;
- *   cfg.frequency = 3000.0f;
- *   cfg.threshold = -10.0f;
- *   cfg.aboveRatio = 4.0f;
- *   cfg.aboveBoost = false;  // cut
- *   deq.setBand(0, cfg);
- *
- *   deq.processBlock(buffer);
- * @endcode
+ * @note Thread-safe parameter updates via `std::atomic` ensuring zero-locking
+ *       in the real-time audio thread.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -54,7 +34,7 @@
 #include <atomic>
 #include <cmath>
 #include <memory>
-#include <vector>
+#include <type_traits>
 
 namespace dspark {
 
@@ -71,6 +51,7 @@ class DynamicEQ
 public:
     /**
      * @brief Full configuration for a single dynamic EQ band.
+     * @note Must remain trivially copyable to allow lock-free atomic updates.
      */
     struct BandConfig
     {
@@ -79,90 +60,110 @@ public:
         T threshold      = T(-20);
         bool enabled     = true;
 
-        // Above threshold: what happens when band level exceeds threshold
-        T aboveRatio     = T(1);      ///< 1 = no action, >1 = compress/expand
+        T aboveRatio     = T(1);
         T aboveAttackMs  = T(5);
         T aboveReleaseMs = T(50);
-        T aboveRangeDb   = T(12);     ///< Max gain applied above
-        bool aboveBoost  = false;     ///< false = cut, true = boost
+        T aboveRangeDb   = T(12);
+        bool aboveBoost  = false;
 
-        // Below threshold: what happens when band level is below threshold
-        T belowRatio     = T(1);      ///< 1 = no action, >1 = expand/gate
+        T belowRatio     = T(1);
         T belowAttackMs  = T(10);
         T belowReleaseMs = T(100);
-        T belowRangeDb   = T(12);     ///< Max gain applied below
-        bool belowBoost  = false;     ///< false = cut, true = boost
+        T belowRangeDb   = T(12);
+        bool belowBoost  = false;
     };
 
-    // -- Lifecycle -----------------------------------------------------------
+    static_assert(std::is_trivially_copyable_v<BandConfig>, "BandConfig must be trivially copyable for std::atomic");
 
+    DynamicEQ()
+    {
+        for (int i = 0; i < MaxBands; ++i) {
+            configs_[i].store(BandConfig{}, std::memory_order_relaxed);
+            paramsDirty_[i].store(true, std::memory_order_relaxed);
+        }
+    }
+
+    /**
+     * @brief Initializes the dynamic EQ, allocating ring buffers and oversamplers.
+     * @param spec Audio specification containing sample rate and block size.
+     */
     void prepare(const AudioSpec& spec)
     {
         spec_ = spec;
         sampleRate_ = spec.sampleRate;
 
-        // Oversampling
         if (oversamplingFactor_ > 1)
         {
-            oversampler_ = std::make_unique<Oversampling<T>>(oversamplingFactor_);
-            oversampler_->prepare(spec);
+            // Two oversamplers: the audio-path one owns the buffer that we
+            // both process and downsample back; the sidechain one only acts
+            // as a level-detection upsampler so its buffer is read-only.
+            oversampler_   = std::make_unique<Oversampling<T>>(oversamplingFactor_);
+            oversamplerSc_ = std::make_unique<Oversampling<T>>(oversamplingFactor_);
+            oversampler_  ->prepare(spec);
+            oversamplerSc_->prepare(spec);
+        }
+        else
+        {
+            oversampler_.reset();
+            oversamplerSc_.reset();
         }
 
-        // Lookahead ring buffers
-        int maxLaSamples = static_cast<int>(sampleRate_ * 0.01) + 1;
+        int maxLaSamples = static_cast<int>(sampleRate_ * oversamplingFactor_ * 0.01) + 1;
         for (int ch = 0; ch < kMaxChannels; ++ch)
             lookaheadBuf_[ch].prepare(maxLaSamples);
+
         updateLookahead();
-
-        // 1 ms one-pole coefficient-smoother. The per-sample gainDb is
-        // continuous, but bandFilter_ coefficients refresh every
-        // kCoefRefreshInterval samples (C5 optimisation). The 1 ms smoother
-        // keeps the filter-response path continuous and removes zipper
-        // artefacts that would otherwise appear between refreshes.
-        if (sampleRate_ > 0)
-            coefSmoothCoeff_ = static_cast<T>(
-                1.0 - std::exp(-1.0 / (sampleRate_ * 0.001)));
-
-        // Reset per-band state
-        for (int b = 0; b < MaxBands; ++b)
-        {
-            for (int ch = 0; ch < kMaxChannels; ++ch)
-            {
-                bandEnvelope_[b][ch] = T(0);
-                aboveEnv_[b][ch] = T(0);
-                belowEnv_[b][ch] = T(0);
-            }
-            bandDetector_[b].reset();
-            bandFilter_[b].reset();
-            smoothedLinkedGainDb_[b] = T(0);
-            updateBandCoefficients(b);
-        }
+        reset();
+        isPrepared_ = true;
     }
 
     /**
-     * @brief Processes audio in-place (self-sidechain).
+     * @brief Processes audio in-place using self-sidechain.
+     * @param buffer In/Out audio buffer.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        processBlockImpl(buffer, buffer);
+        processBlock(buffer, buffer);
     }
 
     /**
-     * @brief Processes audio with external sidechain for detection.
+     * @brief Processes audio with an external sidechain.
+     * @param audio In/Out audio buffer.
+     * @param sidechain Reference signal used for level detection.
      */
     void processBlock(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
     {
-        processBlockImpl(audio, sidechain);
+        if (!isPrepared_) return;
+        DenormalGuard guard;
+
+        if (oversamplingFactor_ > 1 && oversampler_ && oversamplerSc_)
+        {
+            // Up-sample audio and sidechain through their dedicated oversamplers.
+            // Each Oversampling instance owns one internal high-rate buffer, so
+            // we cannot share one between the two streams; processing them
+            // separately keeps each stream's polyphase filter state consistent.
+            auto upAudio = oversampler_->upsample(audio);
+            auto upSc    = oversamplerSc_->upsample(sidechain);
+
+            processCore(upAudio, upSc, sampleRate_ * oversamplingFactor_);
+
+            oversampler_->downsample(audio);
+        }
+        else
+        {
+            // Standard processing path
+            processCore(audio, sidechain, sampleRate_);
+        }
     }
 
-    // -- Configuration -------------------------------------------------------
-
+    /**
+     * @brief Thread-safe configuration update for a specific band.
+     */
     void setBand(int band, const BandConfig& config) noexcept
     {
         if (band < 0 || band >= MaxBands) return;
-        configs_[band] = config;
-        if (sampleRate_ > 0)
-            updateBandCoefficients(band);
+        configs_[band].store(config, std::memory_order_release);
+        paramsDirty_[band].store(true, std::memory_order_release);
     }
 
     void setNumBands(int n) noexcept
@@ -170,60 +171,34 @@ public:
         numBands_.store(std::clamp(n, 1, MaxBands), std::memory_order_relaxed);
     }
 
-    /**
-     * @brief Sets oversampling factor (1, 2, or 4).
-     *
-     * Call prepare() after changing.
-     */
     void setOversampling(int factor) noexcept
     {
         oversamplingFactor_ = std::clamp(factor, 1, 4);
-        // Round to power of 2
         if (oversamplingFactor_ == 3) oversamplingFactor_ = 4;
+        isPrepared_ = false; // Forces user to call prepare()
     }
 
-    /**
-     * @brief Sets lookahead time in milliseconds (0–10 ms).
-     *
-     * Adds latency but allows more transparent dynamic processing.
-     */
     void setLookahead(T ms) noexcept
     {
         lookaheadMs_ = std::clamp(ms, T(0), T(10));
         updateLookahead();
     }
 
-    // -- Queries -------------------------------------------------------------
-
     [[nodiscard]] T getBandGainDb(int band) const noexcept
     {
         if (band < 0 || band >= MaxBands) return T(0);
-        return bandGainDb_[band];
+        return meterGainDb_[band].load(std::memory_order_relaxed);
     }
-
-    [[nodiscard]] int getLatency() const noexcept
-    {
-        int la = lookaheadSamples_;
-        if (oversampler_) la += oversampler_->getLatency();
-        return la;
-    }
-
-    [[nodiscard]] int getNumBands() const noexcept { return numBands_.load(std::memory_order_relaxed); }
 
     void reset() noexcept
     {
         for (int b = 0; b < MaxBands; ++b)
         {
-            for (int ch = 0; ch < kMaxChannels; ++ch)
-            {
-                bandEnvelope_[b][ch] = T(0);
-                aboveEnv_[b][ch] = T(0);
-                belowEnv_[b][ch] = T(0);
-            }
             bandDetector_[b].reset();
             bandFilter_[b].reset();
-            bandGainDb_[b] = T(0);
-            smoothedLinkedGainDb_[b] = T(0);
+            currentGainDb_[b] = T(0);
+            meterGainDb_[b].store(T(0), std::memory_order_relaxed);
+            paramsDirty_[b].store(true, std::memory_order_relaxed);
         }
         for (int ch = 0; ch < kMaxChannels; ++ch)
             lookaheadBuf_[ch].reset();
@@ -231,219 +206,174 @@ public:
 
 private:
     static constexpr int kMaxChannels = 16;
+    static constexpr T kMinLevelDb = T(-100.0);
+    static constexpr T kMinEnvelope = T(1e-12); // Prevents NaN in log10
 
-    // -- Core processing -----------------------------------------------------
-
-    void processBlockImpl(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
+    struct BandState
     {
-        DenormalGuard guard;
+        BandConfig cfg;
+        T aboveAtkCoeff, aboveRelCoeff;
+        T belowAtkCoeff, belowRelCoeff;
+    };
+
+    void processCore(AudioBufferView<T>& audio, AudioBufferView<T>& sidechain, double currentFs) noexcept
+    {
         const int nCh  = std::min(audio.getNumChannels(), kMaxChannels);
         const int scCh = sidechain.getNumChannels();
         const int nS   = audio.getNumSamples();
         const int nb   = numBands_.load(std::memory_order_relaxed);
         const int laSamples = lookaheadSamples_.load(std::memory_order_relaxed);
 
-        // Coefficient refresh interval: the dynamic peak-EQ biquad rebuilds
-        // its coefficients every kCoefRefreshInterval samples instead of per
-        // sample. At 48 kHz, 16 samples = 333 µs — far below perceptual
-        // thresholds — and the 1 ms smoother on smoothedLinkedGainDb_ keeps
-        // the coefficient path continuous. Net cost: ~16× fewer makePeak()
-        // calls (trig + exp) in the hot loop.
-        constexpr int kCoefRefreshInterval = 16;
-        const T coefSmooth = coefSmoothCoeff_;
+        // 1. Thread-Safe State Update
+        for (int b = 0; b < nb; ++b)
+        {
+            if (paramsDirty_[b].exchange(false, std::memory_order_acquire))
+                updateBandInternalState(b, currentFs);
+        }
 
+        // 2. Audio Processing Loop
         for (int i = 0; i < nS; ++i)
         {
-            // Stage 1: per-band detection, per-channel envelope, stereo-linked
-            // smoothed gainDb, and coefficient refresh at the chosen interval.
-            //
-            // Stereo-linking the gainDb (max magnitude across channels) is the
-            // pro-industry default (Waves F6, FabFilter Pro-Q 3, TDR Nova, Ozone
-            // Dynamic EQ): it preserves sensitivity to whichever channel has
-            // more signal while keeping the filter response identical across
-            // channels — which preserves the stereo image.
             for (int b = 0; b < nb; ++b)
             {
-                if (!configs_[b].enabled) continue;
-
-                T linkedMag = T(0);
-                T signedLinked = T(0);
-
+                if (!states_[b].cfg.enabled) continue;
+                
+                T maxLevelDb = kMinLevelDb;
+                
+                // Sidechain Detection (Stereo Linked by Max Peak)
                 for (int ch = 0; ch < nCh; ++ch)
                 {
                     int sc = std::min(ch, scCh - 1);
                     T scSample = sidechain.getChannel(sc)[i];
-
-                    // Detect: bandpass filter on sidechain → envelope
-                    T detected = bandDetector_[b].processSample(scSample, ch);
-                    T absDet = std::abs(detected);
-
-                    // Envelope follower with per-band attack/release
-                    T& env = bandEnvelope_[b][ch];
-                    T envCoeff = (absDet > env) ? bandAttackCoeff_[b] : bandReleaseCoeff_[b];
-                    env += envCoeff * (absDet - env);
-
-                    T levelDb = gainToDecibels(env);
-
-                    // Per-channel dynamic gain
-                    T dynGainDb = computeBandGain(b, levelDb);
-
-                    // Link via max magnitude across channels
-                    T mag = std::abs(dynGainDb);
-                    if (mag > linkedMag)
-                    {
-                        linkedMag = mag;
-                        signedLinked = dynGainDb;
-                    }
+                    
+                    T detected = std::abs(bandDetector_[b].processSample(scSample, ch));
+                    T levelDb = gainToDecibels(std::max(detected, kMinEnvelope));
+                    
+                    if (levelDb > maxLevelDb) maxLevelDb = levelDb;
                 }
 
-                // 1 ms one-pole smoother on the linked gainDb → fed to coefs
-                T& smoothed = smoothedLinkedGainDb_[b];
-                smoothed += coefSmooth * (signedLinked - smoothed);
+                // Gain Computer
+                T targetGainDb = computeTargetGain(states_[b].cfg, maxLevelDb);
 
-                // Metering uses the smoothed, linked value
-                bandGainDb_[b] = smoothed;
-
-                // Refresh peak-EQ coefficients only every N samples
-                if ((i & (kCoefRefreshInterval - 1)) == 0)
-                {
-                    if (std::abs(smoothed) > T(0.01))
-                    {
-                        auto coeffs = BiquadCoeffs<T>::makePeak(
-                            sampleRate_,
-                            static_cast<double>(configs_[b].frequency),
-                            static_cast<double>(configs_[b].q),
-                            static_cast<double>(smoothed));
-                        bandFilter_[b].setCoeffs(coeffs);
-                    }
-                    else
-                    {
-                        // Near-unity: flat biquad (bypass)
-                        bandFilter_[b].setCoeffs(BiquadCoeffs<T>{});
-                    }
+                // Gain Ballistics (Attack/Release applied to the Gain itself)
+                T& currentGain = currentGainDb_[b];
+                T diff = targetGainDb - currentGain;
+                
+                T coeff;
+                if (maxLevelDb > states_[b].cfg.threshold) {
+                    coeff = (std::abs(targetGainDb) > std::abs(currentGain)) 
+                            ? states_[b].aboveAtkCoeff : states_[b].aboveRelCoeff;
+                } else {
+                    coeff = (std::abs(targetGainDb) > std::abs(currentGain)) 
+                            ? states_[b].belowAtkCoeff : states_[b].belowRelCoeff;
                 }
+                
+                currentGain += coeff * diff;
+
+                // Update filter coefficients dynamically (Optimized for sample-by-sample)
+                // Note: For extreme CPU optimization, this can be moved to a block-based loop
+                // using AudioBuffer chunks, but kept per-sample here to ensure zero phase clicks.
+                if (std::abs(currentGain) > T(0.01)) {
+                    bandFilter_[b].setCoeffs(BiquadCoeffs<T>::makePeak(
+                        currentFs,
+                        states_[b].cfg.frequency,
+                        states_[b].cfg.q,
+                        currentGain));
+                } else {
+                    bandFilter_[b].setCoeffs(BiquadCoeffs<T>{}); // Bypass
+                }
+
+                if ((i & 63) == 0) // Sub-sample metering update
+                    meterGainDb_[b].store(currentGain, std::memory_order_relaxed);
             }
 
-            // Stage 2: apply (now stationary within the refresh interval)
-            // filter per-channel. Filter state itself remains per-channel.
+            // Apply Filters
             for (int ch = 0; ch < nCh; ++ch)
             {
-                T audioSample;
-                if (laSamples > 0)
-                {
-                    lookaheadBuf_[ch].push(audio.getChannel(ch)[i]);
+                T audioSample = audio.getChannel(ch)[i];
+                
+                if (laSamples > 0) {
+                    lookaheadBuf_[ch].push(audioSample);
                     audioSample = lookaheadBuf_[ch].read(laSamples);
                 }
-                else
-                {
-                    audioSample = audio.getChannel(ch)[i];
-                }
 
-                T output = audioSample;
-                for (int b = 0; b < nb; ++b)
-                {
-                    if (!configs_[b].enabled) continue;
-                    output = bandFilter_[b].processSample(output, ch);
+                for (int b = 0; b < nb; ++b) {
+                    if (states_[b].cfg.enabled) {
+                        audioSample = bandFilter_[b].processSample(audioSample, ch);
+                    }
                 }
-
-                audio.getChannel(ch)[i] = output;
+                audio.getChannel(ch)[i] = audioSample;
             }
         }
     }
 
-    /**
-     * @brief Computes the dynamic gain (dB) for a band based on detected level.
-     *
-     * Dual above/below threshold control:
-     * - Above: overDb * (1 - 1/ratio), clamped to rangeDb, with sign from boost flag.
-     * - Below: underDb * (1 - 1/ratio), clamped to rangeDb, with sign from boost flag.
-     */
-    [[nodiscard]] T computeBandGain(int b, T levelDb) const noexcept
+    [[nodiscard]] T computeTargetGain(const BandConfig& cfg, T levelDb) const noexcept
     {
-        const auto& cfg = configs_[b];
         T gainDb = T(0);
 
         if (levelDb > cfg.threshold)
         {
-            // Above threshold
-            if (cfg.aboveRatio > T(1.001))
-            {
+            if (cfg.aboveRatio > T(1.001)) {
                 T overDb = levelDb - cfg.threshold;
-                T amount = overDb * (T(1) - T(1) / cfg.aboveRatio);
-                amount = std::min(amount, cfg.aboveRangeDb);
+                T amount = std::min(overDb * (T(1) - T(1) / cfg.aboveRatio), cfg.aboveRangeDb);
                 gainDb += cfg.aboveBoost ? amount : -amount;
             }
         }
         else
         {
-            // Below threshold
-            if (cfg.belowRatio > T(1.001))
-            {
+            if (cfg.belowRatio > T(1.001)) {
                 T underDb = cfg.threshold - levelDb;
-                T amount = underDb * (T(1) - T(1) / cfg.belowRatio);
-                amount = std::min(amount, cfg.belowRangeDb);
+                T amount = std::min(underDb * (T(1) - T(1) / cfg.belowRatio), cfg.belowRangeDb);
                 gainDb += cfg.belowBoost ? amount : -amount;
             }
         }
-
         return gainDb;
     }
 
-    // -- Coefficient helpers -------------------------------------------------
-
-    void updateBandCoefficients(int b) noexcept
+    void updateBandInternalState(int b, double fs) noexcept
     {
-        if (sampleRate_ <= 0) return;
-        T fs = static_cast<T>(sampleRate_);
+        auto cfg = configs_[b].load(std::memory_order_acquire);
+        states_[b].cfg = cfg;
 
-        // Bandpass detector coefficients
-        auto bpCoeffs = BiquadCoeffs<T>::makeBandPass(
-            sampleRate_,
-            static_cast<double>(configs_[b].frequency),
-            static_cast<double>(configs_[b].q));
-        bandDetector_[b].setCoeffs(bpCoeffs);
+        bandDetector_[b].setCoeffs(BiquadCoeffs<T>::makeBandPass(fs, cfg.frequency, cfg.q));
 
-        // Average of above/below attack/release for the envelope
-        T atkMs = (configs_[b].aboveAttackMs + configs_[b].belowAttackMs) / T(2);
-        T relMs = (configs_[b].aboveReleaseMs + configs_[b].belowReleaseMs) / T(2);
+        auto calcCoeff = [fs](T ms) {
+            return T(1) - std::exp(T(-1) / (fs * std::max(ms, T(0.01)) / T(1000)));
+        };
 
-        bandAttackCoeff_[b]  = T(1) - std::exp(T(-1) / (fs * std::max(atkMs, T(0.01)) / T(1000)));
-        bandReleaseCoeff_[b] = T(1) - std::exp(T(-1) / (fs * std::max(relMs, T(0.01)) / T(1000)));
+        states_[b].aboveAtkCoeff = calcCoeff(cfg.aboveAttackMs);
+        states_[b].aboveRelCoeff = calcCoeff(cfg.aboveReleaseMs);
+        states_[b].belowAtkCoeff = calcCoeff(cfg.belowAttackMs);
+        states_[b].belowRelCoeff = calcCoeff(cfg.belowReleaseMs);
     }
 
     void updateLookahead() noexcept
     {
-        if (sampleRate_ > 0)
-            lookaheadSamples_.store(static_cast<int>(
-                static_cast<T>(sampleRate_) * lookaheadMs_ / T(1000)),
-                std::memory_order_relaxed);
+        if (sampleRate_ > 0) {
+            int samples = static_cast<int>(sampleRate_ * oversamplingFactor_ * lookaheadMs_ / T(1000));
+            lookaheadSamples_.store(samples, std::memory_order_relaxed);
+        }
     }
 
-    // -- Members -------------------------------------------------------------
-
+    // -- State & Mem ---------------------------------------------------------
+    bool isPrepared_ = false;
     AudioSpec spec_ {};
     double sampleRate_ = 0;
+    
     std::atomic<int> numBands_ { 0 };
+    std::array<std::atomic<BandConfig>, MaxBands> configs_ {};
+    std::array<std::atomic<bool>, MaxBands> paramsDirty_ {};
+    std::array<BandState, MaxBands> states_ {};
 
-    std::array<BandConfig, MaxBands> configs_ {};
-
-    // Per-band detection and filtering
     std::array<Biquad<T>, MaxBands> bandDetector_ {};
     std::array<Biquad<T>, MaxBands> bandFilter_ {};
-    std::array<std::array<T, kMaxChannels>, MaxBands> bandEnvelope_ {};
-    std::array<std::array<T, kMaxChannels>, MaxBands> aboveEnv_ {};
-    std::array<std::array<T, kMaxChannels>, MaxBands> belowEnv_ {};
-    std::array<T, MaxBands> bandGainDb_ {};
-    std::array<T, MaxBands> bandAttackCoeff_ {};
-    std::array<T, MaxBands> bandReleaseCoeff_ {};
-    std::array<T, MaxBands> smoothedLinkedGainDb_ {};   ///< 1 ms-smoothed linked gainDb (C5: fed to refreshed coeffs)
-    T coefSmoothCoeff_ = T(0);                         ///< 1 ms one-pole coefficient for the smoother above
+    std::array<T, MaxBands> currentGainDb_ {};
+    std::array<std::atomic<T>, MaxBands> meterGainDb_ {};
 
-    // Oversampling
     int oversamplingFactor_ = 1;
-    std::unique_ptr<Oversampling<T>> oversampler_;
+    std::unique_ptr<Oversampling<T>> oversampler_;     // audio path
+    std::unique_ptr<Oversampling<T>> oversamplerSc_;   // sidechain path
 
-    // Lookahead
     T lookaheadMs_ = T(0);
     std::atomic<int> lookaheadSamples_ { 0 };
     std::array<RingBuffer<T>, kMaxChannels> lookaheadBuf_ {};

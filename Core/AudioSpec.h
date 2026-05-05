@@ -13,8 +13,9 @@
  * Dependencies: none.
  *
  * @code
- *   dspark::AudioSpec spec { .sampleRate = 48000.0, .maxBlockSize = 512, .numChannels = 2 };
- *   mySaturator.prepare(spec);
+ * dspark::AudioSpec spec { .sampleRate = 48000.0, .maxBlockSize = 512, .numChannels = 2 };
+ * if (spec.isValid())
+ * mySaturator.prepare(spec);
  * @endcode
  */
 
@@ -24,35 +25,48 @@ namespace dspark {
  * @struct AudioSpec
  * @brief Describes the audio environment for a DSP processor.
  *
- * Passed to `prepare()` before processing begins. All processors must be
- * re-prepared if any of these values change (e.g., sample rate switch in a DAW).
+ * Passed to `prepare()` before processing begins. 
+ * Processors should typically check `if (newSpec == currentSpec)` to avoid 
+ * redundant allocations or state resets when the host triggers multiple prepare calls.
  */
 struct AudioSpec
 {
     /**
-     * @brief Sample rate in Hz (e.g., 44100.0, 48000.0, 96000.0).
-     *
-     * Used for computing filter coefficients, smoother time constants,
-     * delay line lengths, and any time-dependent parameter.
+     * @brief Sample rate in Hz.
+     * * Initialized to 0.0 by default to enforce explicit initialization. 
+     * Processing with an uninitialized sample rate will cause immediate, 
+     * observable failures (NaNs) instead of silent tuning bugs.
      */
-    double sampleRate = 44100.0;
+    double sampleRate = 0.0;
 
     /**
      * @brief Maximum number of samples per processing block.
-     *
-     * Processors use this to pre-allocate internal buffers during `prepare()`.
-     * The actual block size passed to `process()` may be smaller but will
-     * never exceed this value.
+     * * Processors use this to pre-allocate internal buffers. The actual block 
+     * size passed to `process()` may vary but will never exceed this value.
      */
-    int maxBlockSize = 512;
+    int maxBlockSize = 0;
 
     /**
      * @brief Number of audio channels (e.g., 1 = mono, 2 = stereo).
-     *
-     * Processors use this to initialize per-channel state (filter states,
-     * delay lines, envelope followers, etc.).
      */
-    int numChannels = 2;
+    int numChannels = 0;
+
+    /**
+     * @brief Checks if the specification contains valid, processable parameters.
+     * * Use this in assertions at the start of your processor's `prepare()` method.
+     * * @return true if all parameters are strictly positive (> 0), false otherwise.
+     */
+    [[nodiscard]] constexpr bool isValid() const noexcept
+    {
+        return sampleRate > 0.0 && maxBlockSize > 0 && numChannels > 0;
+    }
+
+    /**
+     * @brief Default equality operator (C++20).
+     * * Allows processors to easily diff the incoming specification against 
+     * their cached state to avoid unnecessary re-allocations or filter coefficient recalculations.
+     */
+    constexpr bool operator==(const AudioSpec&) const noexcept = default;
 };
 
 } // namespace dspark

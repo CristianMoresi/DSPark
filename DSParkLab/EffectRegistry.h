@@ -29,27 +29,37 @@ inline EffectSlot makeFilterEngine()
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p](int i, float v) {
+        using Shape = dspark::FilterEngine<float>::Shape;
         switch(i) {
             case 0: {
-                // Type changes use a neutral-ish cutoff; the Frequency slider
-                // then overrides via setFrequency() below.
-                switch(static_cast<int>(v)) {
-                    case 0: p->setLowPass(20000, 0.707f, 12); break;
-                    case 1: p->setHighPass(20, 0.707f, 12); break;
-                    case 2: p->setBandPass(1000, 0.707f); break;
-                    case 3: p->setPeaking(1000, 0, 1.0f); break;
-                    case 4: p->setLowShelf(1000, 0, 1.0f); break;
-                    case 5: p->setHighShelf(1000, 0, 1.0f); break;
-                    case 6: p->setNotch(1000, 0.707f); break;
-                    case 7: p->setAllPass(1000, 0.707f); break;
-                    case 8: p->setTilt(1000, 0); break;
-                }
+                // Switch topology only. setShape() preserves the user's
+                // current Frequency / Resonance / Gain slider values, so
+                // changing the dropdown doesn't reset what they had dialled in.
+                static constexpr Shape kShapes[] = {
+                    Shape::LowPass, Shape::HighPass, Shape::BandPass,
+                    Shape::Peak,    Shape::LowShelf, Shape::HighShelf,
+                    Shape::Notch,   Shape::AllPass,  Shape::Tilt
+                };
+                int idx = std::clamp(static_cast<int>(v), 0,
+                                     static_cast<int>(std::size(kShapes)) - 1);
+                p->setShape(kShapes[idx]);
                 break;
             }
             case 1: p->setFrequency(v); break;
             case 2: p->setResonance(v); break;
             case 3: p->setGain(v); break;
-            case 4: break;
+            case 4: {
+                // Slope only applies to LP / HP — for other shapes setShape()
+                // already pinned numStages_ = 1, so this is a no-op there.
+                int slope = std::clamp(static_cast<int>(v), 6, 48);
+                // Round to the nearest 6 dB/oct step so cascade size matches.
+                slope = (slope / 6) * 6;
+                if (slope < 6) slope = 6;
+                // Re-apply current shape with the new slope. Doesn't disturb
+                // freq/res/gain.
+                p->setShape(p->getShape(), slope);
+                break;
+            }
             case 5: p->setNonlinearity(v); break;
         }
     };
@@ -146,17 +156,16 @@ inline EffectSlot makeStateVariableFilter()
 inline EffectSlot makeDCBlocker()
 {
     auto p = std::make_shared<dspark::DCBlocker<float>>();
-    auto sr = std::make_shared<double>(44100.0);
     EffectSlot s;
     s.name = "DC Blocker"; s.category = "Filters";
     s.addSlider("Cutoff", 1, 100, 5, "Hz");
     s.addSlider("Order", 1, 10, 1, "");
-    s.prepareFn = [p, sr](auto& sp) { p->prepare(sp); *sr = sp.sampleRate; };
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, sr](int i, float v) {
+    s.setParamFn = [p](int i, float v) {
         switch(i) {
-            case 0: p->setCutoff(*sr, static_cast<double>(v)); break;
+            case 0: p->setCutoff(static_cast<float>(v)); break;
             case 1: p->setOrder(static_cast<int>(v)); break;
         }
     };
@@ -427,7 +436,7 @@ inline EffectSlot makeChorus()
     EffectSlot s;
     s.name = "Chorus"; s.category = "Modulation";
     s.addSlider("Rate", 0.1f, 10, 1.5f, "Hz");
-    s.addSlider("Depth", 0, 1, 0.5f, "");
+    s.addSlider("Depth", 0, 20, 5, "ms");          // depth in milliseconds
     s.addSlider("Mix", 0, 1, 0, "");               // Default 0 = dry only (neutral)
     s.addSlider("Voices", 1, 6, 2, "");
     s.addSlider("Feedback", -0.95f, 0.95f, 0, "");
@@ -438,7 +447,7 @@ inline EffectSlot makeChorus()
     s.setParamFn = [p](int i, float v) {
         switch(i) {
             case 0: p->setRate(v); break;
-            case 1: p->setDepth(v); break;
+            case 1: p->setDepthMs(v); break;
             case 2: p->setMix(v); break;
             case 3: p->setVoices(static_cast<int>(v)); break;
             case 4: p->setFeedback(v); break;

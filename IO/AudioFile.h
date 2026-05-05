@@ -8,58 +8,40 @@
  * @brief Abstract interface for reading and writing audio files.
  *
  * Defines a common contract for audio file I/O implementations (WAV, AIFF, etc.).
- * Concrete implementations handle format-specific details while exposing a
- * uniform API for loading audio into AudioBuffer and writing processed audio
- * back to disk.
+ * Focuses on offline processing and buffer preparation.
  *
- * Dependencies: AudioBuffer.h, AudioSpec.h.
- *
- * @code
- *   dspark::WavFile wav;
- *   if (wav.openRead("input.wav"))
- *   {
- *       auto info = wav.getInfo();
- *       dspark::AudioBuffer<float> buffer;
- *       buffer.resize(info.numChannels, info.numSamples);
- *       wav.readSamples(buffer.toView());
- *       wav.close();
- *
- *       // Process buffer...
- *
- *       wav.openWrite("output.wav", info);
- *       wav.writeSamples(buffer.toView());
- *       wav.close();
- *   }
- * @endcode
+ * @warning DANGER: Disk I/O is non-deterministic and blocking. NEVER call any
+ * methods from this class inside the real-time audio thread. Do all file 
+ * operations in a secondary thread or during the initialization phase.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 
 #include <cstdint>
+#include <filesystem>
+#include <algorithm>
+#include <limits>
 
 namespace dspark {
 
 /**
  * @struct AudioFileInfo
  * @brief Metadata describing an audio file's format and dimensions.
- *
- * Returned by AudioFile::getInfo() after opening a file for reading.
- * Also passed to AudioFile::openWrite() to configure the output format.
  */
 struct AudioFileInfo
 {
-    /** @brief Sample rate in Hz (e.g., 44100, 48000, 96000). */
+    /** @brief Sample rate in Hz (e.g., 44100.0, 48000.0, 96000.0). */
     double sampleRate = 44100.0;
 
     /** @brief Number of audio channels (1 = mono, 2 = stereo). */
-    int numChannels = 0;
+    uint32_t numChannels = 0;
 
     /** @brief Total number of sample frames in the file. */
     int64_t numSamples = 0;
 
     /** @brief Bits per sample in the stored format (8, 16, 24, 32, 64). */
-    int bitsPerSample = 16;
+    uint32_t bitsPerSample = 16;
 
     /** @brief True if the file stores floating-point samples (IEEE 754). */
     bool isFloatingPoint = false;
@@ -67,17 +49,22 @@ struct AudioFileInfo
     /**
      * @brief Converts this file info to an AudioSpec for processor preparation.
      *
-     * Uses the full file length as maxBlockSize. For streaming or chunked
-     * processing, create the AudioSpec manually with a smaller block size.
+     * @warning If processing offline in a single block, passing 0 will attempt 
+     * to use the full file length. This can cause massive memory allocations 
+     * for large files.
      *
-     * @return AudioSpec with matching sample rate, channels, and block size.
+     * @param defaultBlockSize Desired block size. If 0, uses the entire file length (offline mode).
+     * @return AudioSpec configured with the file's sample rate and channels.
      */
-    [[nodiscard]] AudioSpec toSpec() const noexcept
+    [[nodiscard]] AudioSpec toSpec(int defaultBlockSize = 0) const noexcept
     {
+        // Clamp to avoid integer overflow if numSamples exceeds 2.14B (INT_MAX)
+        int safeFullLength = static_cast<int>(std::min<int64_t>(numSamples, std::numeric_limits<int>::max()));
+        
         return {
             .sampleRate   = sampleRate,
-            .maxBlockSize = static_cast<int>(numSamples),
-            .numChannels  = numChannels
+            .maxBlockSize = (defaultBlockSize > 0) ? defaultBlockSize : safeFullLength,
+            .numChannels  = static_cast<int>(numChannels)
         };
     }
 };
@@ -86,15 +73,11 @@ struct AudioFileInfo
  * @class AudioFile
  * @brief Abstract base class for audio file readers and writers.
  *
- * Concrete subclasses (WavFile, etc.) implement format-specific parsing
- * and encoding. All sample data is converted to/from the AudioBufferView<float>
- * format (normalised to [-1.0, 1.0]) regardless of the underlying file format.
- *
- * Typical usage flow:
- * 1. Call openRead() or openWrite() to open a file.
- * 2. Query getInfo() for metadata (after openRead).
- * 3. Call readSamples() or writeSamples() to transfer data.
- * 4. Call close() when done (also called by destructor).
+ * Provides a uniform API to transfer audio to/from AudioBufferView objects.
+ * Samples are automatically normalized to the [-1.0, 1.0] float range.
+ * 
+ * @note Reading 32-bit integer PCM files into float buffers will result in a 
+ * loss of the 8 least significant bits due to 24-bit mantissa limitations. 
  */
 class AudioFile
 {
@@ -104,80 +87,65 @@ public:
     /**
      * @brief Opens a file for reading.
      *
-     * After a successful call, getInfo() returns valid metadata and
-     * readSamples() can be used to load audio data.
-     *
-     * @param path File path (platform-dependent, null-terminated).
-     * @return True if the file was opened and the header parsed successfully.
+     * @param path File path using C++20 std::filesystem (handles UTF-8/cross-platform safely).
+     * @return True if opened and header parsed successfully. False otherwise.
      */
-    virtual bool openRead(const char* path) = 0;
+    [[nodiscard]] virtual bool openRead(const std::filesystem::path& path) = 0;
 
     /**
-     * @brief Opens a file for writing.
+     * @brief Opens a file for writing, creating it or overwriting if it exists.
      *
-     * Creates or overwrites the file at the given path. The provided
-     * AudioFileInfo configures the output format (sample rate, channels,
-     * bit depth, etc.).
-     *
-     * @param path File path (platform-dependent, null-terminated).
-     * @param info Desired output format and metadata.
-     * @return True if the file was created and the header written successfully.
+     * @param path File path.
+     * @param info Desired output format metadata.
+     * @return True if created and header written successfully. False otherwise.
      */
-    virtual bool openWrite(const char* path, const AudioFileInfo& info) = 0;
+    [[nodiscard]] virtual bool openWrite(const std::filesystem::path& path, const AudioFileInfo& info) = 0;
 
     /**
-     * @brief Returns metadata about the currently open file.
-     *
-     * Only valid after a successful openRead(). Returns a default-constructed
-     * AudioFileInfo if no file is open.
-     *
-     * @return File metadata (sample rate, channels, sample count, bit depth).
+     * @brief Retrieves metadata of the currently opened file.
+     * @return AudioFileInfo struct. Returns default values if no file is open.
      */
     [[nodiscard]] virtual AudioFileInfo getInfo() const = 0;
 
     /**
-     * @brief Reads all samples from the file into the destination buffer.
+     * @brief Reads all samples from the file into the destination buffer view.
      *
-     * Samples are converted to float and normalised to [-1.0, 1.0].
-     * The buffer must have at least as many channels and samples as
-     * reported by getInfo(). Excess buffer space is left unchanged.
+     * Excess buffer space is left untouched. It is the caller's responsibility 
+     * to ensure the view has adequate capacity.
      *
-     * @param dest Buffer to receive the audio data.
-     * @return True if all samples were read successfully.
+     * @param dest Buffer view to receive the audio data.
+     * @return True if read completely. False if an I/O error occurred.
      */
-    virtual bool readSamples(AudioBufferView<float> dest) = 0;
+    [[nodiscard]] virtual bool readSamples(AudioBufferView<float> dest) = 0;
 
     /**
-     * @brief Reads a range of sample frames from the file.
+     * @brief Reads a specific range of sample frames. Useful for chunked streaming.
      *
-     * @param dest        Buffer to receive the audio data.
-     * @param startFrame  First frame to read (0-based).
-     * @param numFrames   Number of frames to read.
-     * @return True if the requested range was read successfully.
+     * @param dest Buffer view to receive the audio data.
+     * @param startFrame The absolute frame index in the file to start reading from.
+     * @param numFrames The number of frames to read.
+     * @return True if the range was read successfully.
      */
-    virtual bool readSamples(AudioBufferView<float> dest,
-                             int64_t startFrame, int64_t numFrames) = 0;
+    [[nodiscard]] virtual bool readSamples(AudioBufferView<float> dest,
+                                           int64_t startFrame, int64_t numFrames) = 0;
 
     /**
-     * @brief Writes samples from the source buffer to the file.
+     * @brief Writes samples from the view to the file.
      *
-     * Samples are converted from float [-1.0, 1.0] to the file's native
-     * format (PCM integer or floating-point) as configured in openWrite().
+     * Converts float [-1.0, 1.0] back to the native bit-depth defined in openWrite().
      *
-     * @param src Buffer containing the audio data to write.
-     * @return True if all samples were written successfully.
+     * @param src Buffer view containing the data to write.
+     * @return True on success, False if disk is full or an I/O error occurred.
      */
-    virtual bool writeSamples(AudioBufferView<const float> src) = 0;
+    [[nodiscard]] virtual bool writeSamples(AudioBufferView<const float> src) = 0;
 
     /**
-     * @brief Closes the file and releases resources.
-     *
-     * For files opened for writing, this finalises the header (e.g., updates
-     * the RIFF chunk size in WAV files). Safe to call multiple times.
+     * @brief Finalizes file headers and releases system handles.
+     * Safe to call multiple times. Automatically called on destruction.
      */
     virtual void close() = 0;
 
-    /** @brief Returns true if a file is currently open. */
+    /** @brief Checks if a valid file handle is currently open. */
     [[nodiscard]] virtual bool isOpen() const noexcept = 0;
 };
 

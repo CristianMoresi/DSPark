@@ -7,10 +7,6 @@
  * @file AlgorithmicReverb.h
  * @brief World-class 16-line FDN reverb with Jot absorption and Hadamard mixing.
  *
- * Professional reverb engine combining the best techniques from
- * Jot/Chaigne (1991), Dattorro (1997), Griesinger/Lexicon, and
- * Valhalla DSP research.
- *
  * Architecture:
  * ```
  * Input (mono sum)
@@ -67,8 +63,8 @@
  * - **Tone correction EQ**: Biquad high/low cut (12 dB/oct) for tonal shaping
  * - **Early reflections**: 40-tap with progressive frequency absorption
  *   simulating wall absorption — late taps are naturally darker
- * - **Soft saturation**: tanh-based smooth limiter (transparent below ±1,
- *   asymptotically approaches ±2) — more musical than hard clamp
+ * - **Soft saturation**: Fast branchless rational soft-clip (transparent below ±1)
+ *   — more musical than hard clamp, prevents pipeline stalls.
  * - **Allpass interpolation**: in modulated FDN reads, preserves HF over
  *   hundreds of feedback iterations (linear/cubic causes cumulative dulling)
  * - **Stereo width**: M/S width control on late reverb tail
@@ -148,6 +144,15 @@ public:
 
     // -- Lifecycle --------------------------------------------------------------
 
+    /**
+     * @brief Prepares the reverberation engine and allocates required memory.
+     *
+     * Initializes delay lines, filters, and LFOs based on the specified sample rate.
+     * This method avoids memory allocations on the audio thread and must be called
+     * prior to any processing.
+     *
+     * @param spec Audio specification detailing sample rate and maximum block size.
+     */
     void prepare(const AudioSpec& spec)
     {
         spec_ = spec;
@@ -221,6 +226,14 @@ public:
         reset();
     }
 
+    /**
+     * @brief Processes an audio block in-place with zero allocations.
+     *
+     * Applies the complete FDN reverberation algorithm, handling mono, stereo,
+     * and mid/side signal edge cases. Thread-safe and designed for the hot path.
+     *
+     * @param buffer View of the audio buffers (supports mono or stereo).
+     */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
         DenormalGuard guard;
@@ -296,12 +309,6 @@ public:
 
         for (int i = 0; i < nS; ++i)
         {
-            // A5 partial fix: naive (L+R)/2 cancels pure-side inputs (L = -R),
-            // leaving the reverb silent for side-encoded material. Full M/S
-            // dual-FDN redesign is out of scope; this minimum-impact guard
-            // falls back to max-magnitude whenever the mono sum collapses to
-            // near-zero relative to the input envelope. For ordinary stereo
-            // signals the branch is never taken and behaviour is unchanged.
             T monoIn;
             if (nCh >= 2)
             {
@@ -309,11 +316,12 @@ public:
                 T R = buffer.getChannel(1)[i];
                 T sum = L + R;
                 T env = std::abs(L) + std::abs(R);
+                
                 if (std::abs(sum) < T(1e-5) * env)
                 {
-                    // Pure (or near-pure) side: inject the louder channel to
-                    // excite the FDN. Not phase-accurate, but prevents silence.
-                    monoIn = (std::abs(L) >= std::abs(R)) ? L : R;
+                    // Pure side condition: decode the side channel instead of hard-switching
+                    // Preserves phase coherency and prevents toggle distortion.
+                    monoIn = (L - R) * T(0.5);
                 }
                 else
                 {
@@ -341,11 +349,22 @@ public:
         mixer_.mixWet(buffer, mix_.load(std::memory_order_relaxed));
     }
 
+    /**
+     * @brief Processes a single sample and returns a stereo pair.
+     *
+     * @param input The mono input sample to reverberate.
+     * @return std::pair<T, T> A pair containing the {Left, Right} reverberated output.
+     */
     [[nodiscard]] std::pair<T, T> processSample(T input) noexcept
     {
         return processSampleInternal(input);
     }
 
+    /**
+     * @brief Resets all internal delay buffers, filters, and LFO phases.
+     *
+     * Prevents feedback clicks or ringing when transport stops or topology changes.
+     */
     void reset() noexcept
     {
         preDelayBuf_.reset();
@@ -1067,12 +1086,16 @@ protected:
             dcZ_[d] += dcCoeff_ * (val - dcZ_[d]);
             val -= dcZ_[d];
 
-            // --- Soft saturation (transparent below ±1, approaches ±2) ---
-            // More musical than hard clamp: preserves transient shape
-            if (val > T(1))
-                val = T(1) + std::tanh(val - T(1));
-            else if (val < T(-1))
-                val = T(-1) - std::tanh(T(-1) - val);
+            // --- Soft saturation (Branchless fast approximation) ---
+            // Extract the overshoot beyond [-1, 1] without branching
+            T exceed = std::max(T(0), val - T(1)) - std::max(T(0), T(-1) - val);
+            
+            // Limit base value strictly to [-1, 1]
+            val -= exceed; 
+            
+            // Apply fast rational soft-clip: x / (1 + |x|) ONLY to the exceeding portion
+            // Approximates tanh curve infinitely closer to limits without unpredictable CPU branch hits
+            val += exceed / (T(1) + std::abs(exceed));
 
             // --- Pre-write serial allpass (density, Infinity2-style) ---
             val = processAllpass(intAPBufsA_[d], intAPDelaysA_[d],

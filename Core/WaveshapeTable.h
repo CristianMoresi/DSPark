@@ -5,33 +5,19 @@
 
 /**
  * @file WaveshapeTable.h
- * @brief Table-based waveshaping with interpolated lookup.
+ * @brief Table-based waveshaping with Hermite interpolation for high-end audio.
  *
- * Stores a transfer function as a lookup table and applies it to audio
- * signals with interpolated reads. This allows arbitrary waveshaping curves
- * without per-sample math — just a table lookup.
+ * Stores a non-linear transfer function as a lookup table and applies it to audio
+ * signals using 3rd-order Hermite interpolation. This minimizes table-induced 
+ * distortion and quantization noise compared to standard linear interpolation.
  *
- * Use cases:
- * - Custom saturation curves (tube simulation, tape emulation)
- * - Non-linear transfer functions for synthesis
- * - Sigmoid, asymmetric clipping, or any user-defined curve
+ * @note **Thread Safety & Real-Time Constraints:**
+ * The `build...()` and `setOversampling()` methods allocate memory. They MUST ONLY 
+ * be called from the main thread (UI) or during the `prepare()` phase. 
+ * For real-time automation of distortion amount, use the `preGain` parameter in the 
+ * `process()` functions instead of rebuilding the table.
  *
- * Built-in presets:
- * - **Tanh:** Smooth soft clipping
- * - **HardClip:** Sharp digital clipping
- * - **SoftClip:** Cubic soft clipping
- * - **Asymmetric:** Different positive/negative clipping (tube character)
- * - **Sine:** Sine waveshaping (foldback distortion)
- *
- * Dependencies: DspMath.h, Interpolation.h.
- *
- * @code
- *   dspark::WaveshapeTable<float> shaper;
- *   shaper.buildTanh(2.0f);  // tanh with drive = 2
- *
- *   for (int i = 0; i < numSamples; ++i)
- *       output[i] = shaper.process(input[i]);
- * @endcode
+ * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, Oversampling.h.
  */
 
 #include "DspMath.h"
@@ -50,11 +36,7 @@ namespace dspark {
 
 /**
  * @class WaveshapeTable
- * @brief Lookup-table waveshaper with built-in presets.
- *
- * The table maps input range [-1, 1] to output values. Input outside
- * this range is clamped. Interpolation between table entries ensures
- * smooth output even with moderate table sizes.
+ * @brief Zero-latency lookup-table waveshaper with RT-safe gain modulation.
  *
  * @tparam T Sample type (float or double).
  */
@@ -62,37 +44,51 @@ template <FloatType T>
 class WaveshapeTable
 {
 public:
+    /** 
+     * @brief Constructor. Initializes a safe passthrough table to prevent RT crashes. 
+     */
+    WaveshapeTable() 
+    {
+        buildFromFunction([](T x) { return x; }, 4);
+    }
+
     /**
-     * @brief Builds the table from an arbitrary function.
+     * @brief Builds the lookup table from an arbitrary transfer function.
+     * 
+     * @warning Allocates memory. Do not call from the audio thread.
      *
-     * The function receives input in [-1, 1] and should return the shaped output.
-     *
-     * @param func Transfer function: T func(T input).
-     * @param tableSize Number of table entries (default: 4096).
+     * @param func Transfer function mapping [-1, 1] to output.
+     * @param tableSize Number of active table entries (default: 4096).
      */
     void buildFromFunction(std::function<T(T)> func, int tableSize = 4096)
     {
         assert(tableSize >= 4);
         tableSize_ = tableSize;
-        table_.resize(static_cast<size_t>(tableSize));
+        
+        // Allocate tableSize + 3 to accommodate Hermite interpolation padding.
+        // This eliminates conditional branch bounds-checking in the DSP hot-path.
+        table_.resize(static_cast<size_t>(tableSize) + 3);
 
         for (int i = 0; i < tableSize; ++i)
         {
             T x = T(-1) + T(2) * static_cast<T>(i) / static_cast<T>(tableSize - 1);
-            table_[static_cast<size_t>(i)] = func(x);
+            table_[static_cast<size_t>(i + 1)] = func(x); // Offset by 1
         }
+
+        // Pad boundaries for Hermite (mirroring endpoints)
+        table_[0] = table_[1];
+        table_[static_cast<size_t>(tableSize + 1)] = table_[static_cast<size_t>(tableSize)];
+        table_[static_cast<size_t>(tableSize + 2)] = table_[static_cast<size_t>(tableSize)];
     }
 
     /**
-     * @brief Builds a tanh (soft clip) table.
-     * @param drive Drive amount (1.0 = mild, 5.0 = heavy saturation).
+     * @brief Builds a normalized tanh (soft clip) table.
+     * @note Use `preGain` in `process()` to drive the saturation in Real-Time.
      * @param tableSize Table entries (default: 4096).
      */
-    void buildTanh(T drive = T(1), int tableSize = 4096)
+    void buildTanh(int tableSize = 4096)
     {
-        buildFromFunction([drive](T x) -> T {
-            return std::tanh(x * drive);
-        }, tableSize);
+        buildFromFunction([](T x) -> T { return std::tanh(x); }, tableSize);
     }
 
     /**
@@ -121,92 +117,74 @@ public:
     }
 
     /**
-     * @brief Builds an asymmetric clipping table (tube character).
-     *
-     * Positive excursions clip harder than negative, producing even harmonics.
-     *
-     * @param drive Drive amount.
+     * @brief Builds an asymmetric clipping table for even-harmonic generation.
      * @param tableSize Table entries.
      */
-    void buildAsymmetric(T drive = T(2), int tableSize = 4096)
+    void buildAsymmetric(int tableSize = 4096)
     {
-        buildFromFunction([drive](T x) -> T {
-            if (x >= T(0))
-                return std::tanh(x * drive * T(1.2));
-            else
-                return std::tanh(x * drive * T(0.8));
+        buildFromFunction([](T x) -> T {
+            return x >= T(0) ? std::tanh(x * T(1.2)) : std::tanh(x * T(0.8));
         }, tableSize);
     }
 
     /**
-     * @brief Builds a sine waveshaping table (foldback distortion).
-     * @param drive Drive amount (higher = more folding).
-     * @param tableSize Table entries.
-     */
-    void buildSineFold(T drive = T(1), int tableSize = 4096)
-    {
-        buildFromFunction([drive](T x) -> T {
-            return std::sin(x * drive * pi<T>);
-        }, tableSize);
-    }
-
-    /**
-     * @brief Loads a custom table from raw data.
-     *
-     * @param data Pointer to table values.
-     * @param size Number of entries.
-     */
-    void loadTable(const T* data, int size)
-    {
-        assert(size >= 4);
-        tableSize_ = size;
-        table_.assign(data, data + size);
-    }
-
-    /**
-     * @brief Processes a single sample through the waveshaper.
-     *
-     * Input is expected in [-1, 1] range. Values outside this range are clamped.
+     * @brief Processes a single sample through the waveshaper with Hermite interpolation.
      *
      * @param input Input sample.
+     * @param preGain Real-time drive/gain applied before lookup (default 1.0).
+     * @param postGain Real-time makeup gain applied after lookup (default 1.0).
      * @return Shaped output sample.
      */
-    [[nodiscard]] T process(T input) const noexcept
+    [[nodiscard]] inline T process(T input, T preGain = T(1), T postGain = T(1)) const noexcept
     {
-        // Map input [-1, 1] to table index [0, tableSize-1]
-        T clamped = std::clamp(input, T(-1), T(1));
-        T pos = (clamped + T(1)) * T(0.5) * static_cast<T>(tableSize_ - 1);
+        T driven = std::clamp(input * preGain, T(-1), T(1));
+        
+        // Map to index range [0, tableSize - 1]
+        T pos = (driven + T(1)) * T(0.5) * static_cast<T>(tableSize_ - 1);
 
-        // Linear interpolation
-        int idx0 = static_cast<int>(pos);
-        int idx1 = std::min(idx0 + 1, tableSize_ - 1);
-        T frac = pos - static_cast<T>(idx0);
+        // Branchless integer extraction
+        int idx = static_cast<int>(pos);
+        T frac = pos - static_cast<T>(idx);
 
-        return table_[static_cast<size_t>(idx0)]
-             + frac * (table_[static_cast<size_t>(idx1)]
-                      - table_[static_cast<size_t>(idx0)]);
+        // Base index offset by +1 due to left-side padding
+        const T* t = table_.data() + idx + 1;
+
+        // 3rd-order Hermite interpolation for analog-like smoothness
+        T c0 = t[0];
+        T c1 = T(0.5) * (t[1] - t[-1]);
+        T c2 = t[-1] - T(2.5) * t[0] + T(2.0) * t[1] - T(0.5) * t[2];
+        T c3 = T(1.5) * (t[0] - t[1]) + T(0.5) * (t[2] - t[-1]);
+
+        T output = ((c3 * frac + c2) * frac + c1) * frac + c0;
+        
+        return output * postGain;
     }
 
     /**
-     * @brief Processes a buffer in-place.
-     * @param data Audio samples.
-     * @param numSamples Number of samples.
+     * @brief Processes a buffer in-place. SIMD-friendly loop.
+     * 
+     * @param data Audio samples pointer (should ideally be __restrict).
+     * @param numSamples Number of samples to process.
+     * @param preGain Gain to drive into the shaper.
+     * @param postGain Gain to compensate volume output.
      */
-    void process(T* data, int numSamples) const noexcept
+    void process(T* __restrict data, int numSamples, T preGain = T(1), T postGain = T(1)) const noexcept
     {
+        // Cache data locally to assist compiler vectorization
+        const T* const tablePtr = table_.data();
+        const int tSize = tableSize_;
+
         for (int i = 0; i < numSamples; ++i)
-            data[i] = process(data[i]);
+        {
+            data[i] = process(data[i], preGain, postGain);
+        }
     }
 
-    // -- Lifecycle (optional, required for oversampled processBlock) ----------
+    // -- Lifecycle & Oversampling ---------------------------------------------
 
     /**
      * @brief Prepares the waveshaper for oversampled block processing.
-     *
-     * Only needed if using setOversampling() and processBlock().
-     * The simple process(T) and process(T*, int) methods do not require this.
-     *
-     * @param spec Audio spec (sample rate, block size, channels).
+     * @param spec Audio specification.
      */
     void prepare(const AudioSpec& spec)
     {
@@ -216,17 +194,15 @@ public:
     }
 
     /**
-     * @brief Enables oversampling for anti-aliased waveshaping.
-     *
-     * Higher factors reduce aliasing from harmonic generation.
-     * Requires prepare() to have been called.
-     *
-     * @param factor Oversampling factor (1 = off, 2, 4, 8, or 16).
+     * @brief Enables oversampling. 
+     * @warning Allocates memory. Do not call from the audio thread.
+     * @param factor Oversampling factor (1 = off, 2, 4, 8, 16).
      */
     void setOversampling(int factor)
     {
         assert(factor >= 1 && (factor & (factor - 1)) == 0);
         oversamplingFactor_ = factor;
+        
         if (factor > 1)
         {
             oversampler_ = std::make_unique<Oversampling<T>>(factor);
@@ -239,48 +215,41 @@ public:
         }
     }
 
-    /** @brief Returns the current oversampling factor. */
     [[nodiscard]] int getOversamplingFactor() const noexcept { return oversamplingFactor_; }
 
     /**
-     * @brief Processes an audio buffer in-place with optional oversampling.
-     *
-     * Requires prepare() if oversampling is enabled.
-     *
-     * @param buffer Audio buffer to process.
+     * @brief Processes a buffer view with optional oversampling.
+     * @param buffer Audio buffer view.
+     * @param preGain Real-time drive applied per-sample.
+     * @param postGain Real-time makeup gain applied per-sample.
      */
-    void processBlock(AudioBufferView<T> buffer) noexcept
+    void processBlock(AudioBufferView<T>& buffer, T preGain = T(1), T postGain = T(1)) noexcept
     {
         if (oversamplingFactor_ > 1 && oversampler_)
         {
             auto upView = oversampler_->upsample(buffer);
             for (int ch = 0; ch < upView.getNumChannels(); ++ch)
             {
-                T* data = upView.getChannel(ch);
-                for (int i = 0; i < upView.getNumSamples(); ++i)
-                    data[i] = process(data[i]);
+                process(upView.getChannel(ch), upView.getNumSamples(), preGain, postGain);
             }
             oversampler_->downsample(buffer);
         }
         else
         {
             for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
-                process(buffer.getChannel(ch), buffer.getNumSamples());
+            {
+                process(buffer.getChannel(ch), buffer.getNumSamples(), preGain, postGain);
+            }
         }
     }
 
-    /** @brief Resets oversampling filter state. */
     void reset() noexcept
     {
-        if (oversampler_)
-            oversampler_->reset();
+        if (oversampler_) oversampler_->reset();
     }
 
-    /** @brief Returns the table size. */
     [[nodiscard]] int getTableSize() const noexcept { return tableSize_; }
-
-    /** @brief Returns true if the table has been built. */
-    [[nodiscard]] bool isReady() const noexcept { return !table_.empty(); }
+    [[nodiscard]] bool isReady() const noexcept { return tableSize_ > 0; }
 
 private:
     std::vector<T> table_;

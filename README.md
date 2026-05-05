@@ -4,7 +4,7 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.0** — 72 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
+**v1.0** — 73 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
 
 ```cpp
 #include "DSPark/DSPark.h"
@@ -18,7 +18,7 @@ comp.prepare(spec);
 reverb.prepare(spec);
 
 eq.setBand(0, 100.0f, 3.0f);            // Boost bass
-comp.setThreshold(-18.0f);               // Compress
+comp.setThreshold(-18.0f);              // Compress
 comp.setCharacter(dspark::Compressor<float>::Character::FET);  // 1176-style
 reverb.setType(dspark::AlgorithmicReverb<float>::Type::Hall);  // Concert hall
 
@@ -78,8 +78,10 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 
 ### Effects (30 processors)
 
+| Class | Description |
+|---|---|
 | `Equalizer<T>` | Multi-band parametric EQ with **linear-phase** (FFT) and IIR modes |
-| `Compressor<T>` | Modular: 3 detectors (Peak/RMS/TruePeak), 2 topologies (FF/FB), 4 characters (Clean/Opto/FET/Varimu), upward/downward modes. Adaptive auto-makeup gain. External sidechain. |
+| `Compressor<T>` | Modular: 5 detectors (Peak, RMS, TruePeak, SplitPolarity, Hilbert), 2 topologies (FF/FB), 4 characters (Clean/Opto/FET/Varimu), upward/downward modes. Adaptive auto-makeup gain. External sidechain. |
 | `Limiter<T>` | ISP true-peak brickwall limiter with adaptive release |
 | `NoiseGate<T>` | State machine with hysteresis, hold time, duck mode. External sidechain. |
 | `Expander<T>` | Downward expander with threshold, ratio, hold, range |
@@ -89,9 +91,9 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `DeEsser<T>` | Frequency-targeted dynamic reduction for sibilance |
 | `AlgorithmicReverb<T>` | 16-line FDN with Jot (1991) frequency-dependent absorption, Householder feedback mixing, Lexicon-style smooth random + noise modulation, serial allpass per line (Infinity2-style), feedback IIR smoothing (Verbity), allpass-interpolated modulated reads, tanh soft saturation, parallel allpass input diffuser (256 echo paths), Dattorro multi-tap output, output diffusion, M/S stereo width control, progressive ER absorption. 6 presets: Room, Hall, Chamber, Plate, Spring, Cathedral. Full parameter API for custom reverb design. |
 | `Reverb<T>` | Convolution reverb with IR loading, pre-delay, auto-resample |
-| `Saturation<T>` | 10 algorithms: Tube, Tape, Transformer, Wavefolder, Bitcrusher... Adaptive blend, slew-dependent saturation. |
-| `Clipper<T>` | Multi-mode clipper (Hard/Soft/Analog/GoldenRatio), multi-stage, slew limiter, 2x/4x oversampling |
-| `FilterEngine<T>` | Cascaded biquads, 9 shapes, 6-48 dB/oct slopes |
+| `Saturation<T>` | 10 algorithms (Tube, Tape, Transformer, SoftClip, HardClip, Exciter, Wavefolder, Bitcrusher, Downsample, MultiStage). Adaptive blend, slew-dependent saturation, oversampling. |
+| `Clipper<T>` | 4-mode clipper (Hard/Soft/Analog/GoldenRatio), multi-stage, slew limiter, 2x/4x oversampling |
+| `FilterEngine<T>` | Cascaded biquads, 9 shapes, 6–48 dB/oct slopes |
 | `CrossoverFilter<T>` | Linkwitz-Riley crossover (LR12/24/48), IIR + linear-phase modes |
 | `Chorus<T>` | Multi-voice LFO delay, stereo spread, flanger mode |
 | `Phaser<T>` | Allpass chain with LFO modulation, configurable stages |
@@ -100,48 +102,59 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `RingModulator<T>` | Ring modulation with carrier oscillator |
 | `FrequencyShifter<T>` | Single-sideband frequency shift via Hilbert transform |
 | `Delay<T>` | Interpolated delay with feedback, ping-pong, filters |
-| `Panner<T>` | 6 algorithms: equal-power, binaural, mid-pan, side-pan, Haas, spectral |
+| `Panner<T>` | 6 algorithms: equal-power, binaural (ITD), mid-pan, side-pan, Haas, spectral |
 | `Gain<T>` | Smoothed gain with fade, mute, polarity inversion |
 | `AutoGain<T>` | Automatic gain compensation based on loudness measurement |
 | `Crossfade<T>` | Linear, equal-power, S-curve |
 | `StereoWidth<T>` | M/S width control with bass-mono option |
 | `MidSide<T>` | Stereo Mid/Side encoding and decoding |
 | `NoiseGenerator<T>` | White, pink, and brown noise generation |
-| `DCBlocker<T>` | DC offset removal (1-pole or Butterworth order 2-10) |
+| `DCBlocker<T>` | DC offset removal (1-pole or Butterworth order 2–10) |
 
 ### Core (33 building blocks)
 
-| `StateVariableFilter<T>` | TPT SVF: 8 modes (LP/HP/BP/Notch/AP/Bell/Shelf), simultaneous multi-output |
+| Class | Description |
+|---|---|
+| `StateVariableFilter<T>` | TPT SVF: 8 modes (LP/HP/BP/Notch/AP/Bell/LowShelf/HighShelf), simultaneous multi-output |
 | `LadderFilter<T>` | Moog-style 4-pole TPT filter, 6 modes, drive, self-oscillation |
-| `Biquad<T>` | TDF-II biquad with 9 coefficient types |
-| `FFTReal<T>` | Radix-2 FFT with SIMD (SSE2/NEON), real-optimised |
+| `Biquad<T>` | TDF-II biquad with 9 coefficient types and lock-free auto-promote of staged coefficients |
+| `BiquadCoeffs<T>` | Standalone factory for biquad coefficients (LP, HP, BP, Peak, Shelf, Notch, AP, Tilt, DC blocker) |
+| `FFTComplex<T>` / `FFTReal<T>` | Radix-2 FFT with SIMD (SSE3/NEON), real-optimised |
 | `Convolver<T>` | Partitioned overlap-save FFT convolution |
 | `FIRFilter<T>` | FIR engine with windowed-sinc design |
-| `Oversampling<T>` | 2x-16x FIR half-band Kaiser filters (-80 dB+ rejection) |
+| `Oversampling<T>` | 2x–16x FIR half-band Kaiser filters (-80 dB+ rejection) |
 | `Oscillator<T>` | PolyBLEP (sine, saw, square, triangle) |
 | `WavetableOscillator<T>` | Mipmapped wavetable with bandlimited harmonics |
-| `Resampler<T>` | Polyphase windowed-sinc sample rate conversion |
-| `EnvelopeGenerator<T>` | ADSR with exponential curves |
+| `Resampler<T>` | Polyphase windowed-sinc sample-rate conversion |
+| `EnvelopeGenerator<T>` (`ADSREnvelope`) | ADSR with exponential curves |
 | `RingBuffer<T>` | Power-of-two circular buffer with interpolated read |
 | `SmoothedValue<T>` | Parameter smoother (exponential, linear, chase, or disabled) |
-| `Smoothers` | 9 smoothing algorithms (linear, exponential, SVF, Butterworth...) |
+| `Smoothers` | 9 smoothing algorithms (linear, exponential, one-pole, asymmetric, slew, SVF, Butterworth…) |
 | `ProcessorChain<T,...>` | Zero-overhead compile-time processor chain with per-slot bypass |
 | `SpectralProcessor<T>` | STFT-based analysis-modification-synthesis framework |
 | `Dither<T>` | TPDF dithering with noise shaping |
 | `DenormalGuard` | RAII FTZ/DAZ (x86 SSE, ARM, WebAssembly) |
 | `Interpolation` | 5 methods (linear, cubic, Hermite, Lagrange, allpass) |
 | `Hilbert<T>` | Allpass Hilbert transform for analytic signals |
-| `WindowFunctions<T>` | 8 windows (Hann, Hamming, Blackman, Kaiser...) |
+| `WindowFunctions<T>` | 8 windows (Hann, Hamming, Blackman, Kaiser…) |
 | `DryWetMixer<T>` | Parallel dry/wet mixing for effects |
 | `SpinLock` | RT-safe spinlock for thread-safe parameters |
-| `SpscQueue<T>` | Lock-free single-producer/single-consumer queue |
+| `SpscQueue<T>` | Lock-free single-producer / single-consumer queue |
+| `AudioSpec` | Audio environment descriptor (sample rate, block size, channels) |
 | `AudioBuffer<T>` | 32-byte aligned owning buffer (SIMD-ready) |
 | `AudioBufferView<T>` | Non-owning view (what processors receive) |
 | `SimdOps` | SIMD-accelerated buffer operations (SSE2/AVX/NEON with scalar fallback) |
-| + more | DspMath, AudioSpec, Phasor, SampleAndHold, WaveshapeTable, AnalogRandom |
+| `DspMath` | Constants, dB ⇄ gain, fast tanh / exp / pow10, range mapping |
+| `Phasor<T>` | Phase accumulator for LFO and oscillator construction |
+| `SampleAndHold<T>` | Sample-and-hold with configurable hold time |
+| `WaveshapeTable<T>` | LUT-based waveshaping with linear / cubic interpolation |
+| `AnalogRandom` | Analog-flavoured random generators (smooth, noise, jitter) |
+| `ProcessorTraits` | C++20 concepts: `AudioProcessor`, `SampleProcessor`, `GeneratorProcessor` |
 
 ### Analysis (5 analyzers)
 
+| Class | Description |
+|---|---|
 | `LevelFollower<T>` | Peak and RMS envelope follower |
 | `SpectrumAnalyzer<T>` | Real-time FFT spectrum with peak hold |
 | `LoudnessMeter<T>` | EBU R128 LUFS (momentary, short-term, integrated) |
@@ -150,12 +163,16 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 
 ### I/O (3 file handlers)
 
+| Class | Description |
+|---|---|
 | `WavFile` | Read/write WAV (PCM 8/16/24/32-bit, float 32/64-bit) |
-| `Mp3File` | MPEG-1 Layer III codec — read (CBR/VBR) + write (CBR encoder, 32-320 kbps) |
+| `Mp3File` | MPEG-1 Layer III codec — read (CBR/VBR) + write (CBR encoder, 32–320 kbps) |
 | `AudioFile` | Abstract base class for custom format implementations |
 
 ### Music (1 module)
 
+| Class | Description |
+|---|---|
 | `HarmonyConstants` | Constexpr musical harmony toolkit: 61 scales (bitmask representation), 15 chord recipes with inversions, MIDI/note conversion, key-aware naming (sharp/flat), diatonic chord generation. Fully `constexpr`/`consteval` — generates static tables at compile time. |
 
 ---
@@ -177,7 +194,7 @@ Requires a C++20 compiler. Tested with MSVC 19.50+, and compatible with GCC 12+,
 ```cpp
 #include "DSPark/DSPark.h"
 
-int main() 
+int main()
 {
     dspark::WavFile input, output;
     input.openRead("input.wav");
@@ -197,7 +214,7 @@ int main()
 
     output.openWrite("output.wav", info);
 
-    while (input.readSamples(buffer.toView())) 
+    while (input.readSamples(buffer.toView()))
     {
         comp.processBlock(buffer.toView());
         lim.processBlock(buffer.toView());
@@ -231,7 +248,7 @@ svf.prepare(spec);
 svf.setCutoff(2000.0f);
 svf.setResonance(0.7f);
 
-for (int i = 0; i < numSamples; ++i) 
+for (int i = 0; i < numSamples; ++i)
 {
     svf.setCutoff(lfo.getNextSample() * 2000 + 500);  // Modulate per sample
     auto [lp, hp, bp] = svf.processMultiOutput(input[i], 0);
@@ -269,10 +286,12 @@ DSParkLab\DSParkLab.exe
 ```
 
 **Features:**
-- Load WAV/MP3 files with automatic format detection
-- 25 effects organized by category (Filters, Dynamics, Distortion, Modulation, Spatial, Utility)
+
+- Asynchronous WAV/MP3 loading with format auto-detection (audio thread never blocks on I/O)
+- 25 effects organised by category (Filters, Dynamics, Distortion, Modulation, Spatial, Utility)
 - Auto-generated parameter panels (sliders, toggles, combo boxes) from effect descriptors
 - Real-time waveform display, FFT spectrum analyzer, and L/R level meters
+- Gain-reduction metering for compressor, limiter, de-esser, saturation and clipper
 - A/B bypass for instant comparison between original and processed audio
 - Transport controls: play, pause, stop, seek, loop
 
@@ -282,12 +301,14 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 
 ## Platform Support
 
+| Platform | Status | Notes |
+|---|---|---|
 | Windows (MSVC) | Tested | C++20, /W4, zero warnings |
 | Linux (GCC) | Compatible | C++20, -Wall -Wextra |
 | macOS (Clang) | Compatible | C++20, -Wall -Wextra |
 | WebAssembly (Emscripten) | Compatible | Zero syscalls in audio path |
 | iOS / Android | Compatible | ARM NEON denormal flush supported |
-| VST3 Plugins | Use as DSP engine | Pair with JUCE or iPlug2 for wrapper |
+| VST3 plugins | Use as DSP engine | Pair with JUCE or iPlug2 for the wrapper |
 
 ---
 
@@ -295,11 +316,12 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 
 - **C++20**: Concepts (`AudioProcessor`, `SampleProcessor`, `GeneratorProcessor`), designated initializers, `std::numbers`
 - **Zero allocation in audio thread**: All memory pre-allocated in `prepare()`
-- **SIMD inner loops**: SSE2/AVX/NEON-accelerated buffer operations (gain, mix, peak, FIR) with automatic scalar fallback
+- **SIMD inner loops**: SSE2/SSE3/AVX/NEON-accelerated buffer operations and FFT, with automatic scalar fallback
 - **Cache-friendly**: Contiguous memory, 32-byte aligned buffers
-- **Thread-safe setters**: All parameters use `std::atomic` with `memory_order_relaxed` — safe to call from any thread (UI, automation, audio) with zero contention
+- **Thread-safe parameters**: All setters use `std::atomic` with `memory_order_relaxed` — safe to call from any thread (UI, automation, audio) with zero contention
+- **Lock-free coefficient updates**: `Biquad::setCoeffs()` is consumed automatically by `processBlock()` and `processSample()` via a relaxed-load fast path. No external sequencing required.
 - **No virtual dispatch in hot path**: Templates and compile-time polymorphism
-- **Physically-modeled algorithms**: Tube saturation (Koren 1996 triode model), Tape (Chowdhury 2019 hysteresis), FDN reverb (Jot 1991 absorption, Householder mixing, Dattorro 1997 multi-tap output, Lexicon-style modulation, serial allpass density, allpass interpolation, tanh soft saturation)
+- **Physically-modeled algorithms**: Tape (Chowdhury 2019 hysteresis with Langevin function, head bump pre-filter, gap-loss HF rolloff), FDN reverb (Jot 1991 absorption, Householder mixing, Dattorro 1997 multi-tap output, Lexicon-style modulation, serial allpass density, allpass interpolation, tanh soft saturation), TPT state-variable and ladder filters
 - **Full Doxygen documentation**: Every public class and method documented
 
 ---
@@ -310,11 +332,11 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 DSPark/
 ├── DSPark.h                 # Single umbrella include + full documentation
 ├── Core/          (33)      # Building blocks: filters, FFT, oscillators, SIMD, buffers
-├── Effects/       (29)      # Ready-to-use processors: EQ, compressor, reverb...
+├── Effects/       (30)      # Ready-to-use processors: EQ, compressor, reverb...
 ├── Analysis/       (5)      # Metering: LUFS, spectrum, level follower, pitch
 ├── IO/             (3)      # File I/O: WAV read/write, MP3 read/write
 ├── Music/          (1)      # Harmony constants and music theory
-└── DSParkLab/              # Interactive testing app (Win32 + ImGui + miniaudio)
+└── DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)
 ```
 
 ---
@@ -333,8 +355,8 @@ Free to use in commercial and open-source projects. Attribution appreciated.
 
 DSPark was created to provide a truly free, professional-grade DSP toolkit accessible to developers at every level of expertise — from desktop app builders to DSP engineers designing embedded audio systems. It is a genuine open-source alternative to commercial audio frameworks, built from the ground up with no dependencies and no compromises.
 
-- GitHub: [github.com/CristianMoresi](https://github.com/crismoresi)
-- LinkedIn: [linkedin.com/in/cristianmoresi](https://linkedin.com/in/crismoresi)
+- GitHub: [github.com/crismoresi](https://github.com/crismoresi)
+- LinkedIn: [linkedin.com/in/crismoresi](https://linkedin.com/in/crismoresi)
 - Email: dev@cristianmoresi.com
 
 ---

@@ -7,32 +7,19 @@
  * @file WavetableOscillator.h
  * @brief Bandlimited wavetable oscillator with mipmap anti-aliasing.
  *
- * A professional wavetable oscillator that uses mipmapped tables to prevent
- * aliasing at all frequencies. Each mipmap level has fewer harmonics, matching
- * the Nyquist limit for that octave.
+ * A professional grade wavetable oscillator utilizing a flattened 
+ * contiguous memory layout for optimal CPU cache utilization, 
+ * bitwise phase masking, and 3rd-order Hermite interpolation for 
+ * pristine sound quality. 
  *
- * Complements the PolyBLEP Oscillator (which is better for basic waveforms)
- * with support for arbitrary waveforms, wavetable morphing, and complex timbres.
+ * It uses fractional mipmapping to prevent aliasing at all frequencies 
+ * and ensures smooth crossfading during frequency sweeps.
  *
- * Features:
- * - Mipmapped tables (one per octave, auto-selected)
- * - Built-in waveforms: Saw, Square, Triangle, Sine
- * - Custom wavetable loading
- * - Morphing between two wavetables
- * - Phase accumulation via Phasor
- * - Per-sample frequency modulation
+ * @note Setup methods (build*, load*) allocate memory and perform heavy 
+ * mathematical operations (DFT). They MUST NOT be called on the real-time 
+ * audio thread.
  *
- * Dependencies: DspMath.h, Phasor.h.
- *
- * @code
- *   dspark::WavetableOscillator<float> osc;
- *   osc.prepare(48000.0);
- *   osc.buildSaw();
- *   osc.setFrequency(440.0f);
- *
- *   for (int i = 0; i < numSamples; ++i)
- *       output[i] = osc.getSample();
- * @endcode
+ * Dependencies: DspMath.h, AudioSpec.h, Phasor.h.
  */
 
 #include "DspMath.h"
@@ -49,62 +36,71 @@ namespace dspark {
 
 /**
  * @class WavetableOscillator
- * @brief Mipmapped wavetable oscillator for bandlimited synthesis.
+ * @brief Professional mipmapped wavetable oscillator for bandlimited synthesis.
  *
- * @tparam T Sample type (float or double).
+ * @tparam T Sample type (float or double). Must satisfy std::floating_point.
  */
 template <FloatType T>
 class WavetableOscillator
 {
 public:
     static constexpr int kTableSize = 2048;
-    static constexpr int kMaxMipLevels = 12; // Covers 20 Hz to 20 kHz
+    static constexpr int kTableMask = kTableSize - 1; // Used for ultra-fast wrapping
+    static constexpr int kMaxMipLevels = 12;
+
+    WavetableOscillator() = default;
 
     /**
      * @brief Prepares the oscillator for a given sample rate.
-     * @param sampleRate Sample rate in Hz.
+     * @param sampleRate Sample rate in Hz. Must be > 0.
      */
     void prepare(double sampleRate)
     {
+        assert(sampleRate > 0.0);
         sampleRate_ = sampleRate;
         phasor_.prepare(sampleRate);
     }
 
-    /** @brief Prepares from AudioSpec (unified API). */
-    void prepare(const AudioSpec& spec) { prepare(spec.sampleRate); }
+    /** 
+     * @brief Prepares from AudioSpec (unified API). 
+     * @param spec Framework AudioSpec instance containing sample rate.
+     */
+    void prepare(const AudioSpec& spec) 
+    { 
+        prepare(spec.sampleRate); 
+    }
 
-    // -- Built-in waveform generators -------------------------------------------
+    // -- Built-in waveform generators (OFFLINE ONLY) ----------------------------
 
     /**
      * @brief Builds a bandlimited sawtooth wavetable with mipmaps.
+     * @note Allocates memory. Call only during initialization/preparation.
      */
     void buildSaw()
     {
         buildFromHarmonics([](int harmonic) -> T {
-            // Saw: sum of sin(n*x)/n, alternating sign
             return (harmonic % 2 == 0) ? T(-1.0 / harmonic) : T(1.0 / harmonic);
         });
     }
 
     /**
      * @brief Builds a bandlimited square wavetable with mipmaps.
+     * @note Allocates memory. Call only during initialization/preparation.
      */
     void buildSquare()
     {
         buildFromHarmonics([](int harmonic) -> T {
-            // Square: only odd harmonics, amplitude 1/n
-            if (harmonic % 2 == 0) return T(0);
-            return T(1.0 / harmonic);
+            return (harmonic % 2 == 0) ? T(0) : T(1.0 / harmonic);
         });
     }
 
     /**
      * @brief Builds a bandlimited triangle wavetable with mipmaps.
+     * @note Allocates memory. Call only during initialization/preparation.
      */
     void buildTriangle()
     {
         buildFromHarmonics([](int harmonic) -> T {
-            // Triangle: only odd harmonics, amplitude 1/n^2, alternating sign
             if (harmonic % 2 == 0) return T(0);
             T sign = ((harmonic / 2) % 2 == 0) ? T(1) : T(-1);
             return sign / static_cast<T>(harmonic * harmonic);
@@ -112,55 +108,51 @@ public:
     }
 
     /**
-     * @brief Builds a pure sine wavetable (single mipmap level, no aliasing).
+     * @brief Builds a pure sine wavetable. 
+     * Requires only 1 level since it contains only the fundamental.
+     * @note Allocates memory. Call only during initialization/preparation.
      */
     void buildSine()
     {
         numMipLevels_ = 1;
-        mipTables_.resize(1);
-        mipTables_[0].resize(kTableSize);
+        mipData_.assign(kTableSize, T(0)); // Contiguous layout
 
         for (int i = 0; i < kTableSize; ++i)
         {
             T phase = twoPi<T> * static_cast<T>(i) / static_cast<T>(kTableSize);
-            mipTables_[0][static_cast<size_t>(i)] = std::sin(phase);
+            mipData_[static_cast<size_t>(i)] = std::sin(phase);
         }
 
         mipMaxFreq_.assign(1, static_cast<T>(sampleRate_ / 2.0));
     }
 
     /**
-     * @brief Builds mipmapped tables from a harmonic amplitude function.
+     * @brief Builds contiguous mipmapped tables from a harmonic amplitude function.
      *
-     * @param harmonicFunc Function that returns the amplitude for harmonic N
-     *                     (N starts at 1). Return 0 for harmonics to skip.
+     * @tparam HarmonicFunc Callable signature: `T(int harmonic)`
+     * @param harmonicFunc Function returning the amplitude for harmonic N (starts at 1).
+     * @note Allocates memory. Call only during initialization/preparation.
      */
     template <typename HarmonicFunc>
     void buildFromHarmonics(HarmonicFunc harmonicFunc)
     {
-        // Determine max harmonics per mip level
         numMipLevels_ = kMaxMipLevels;
-        mipTables_.resize(static_cast<size_t>(numMipLevels_));
+        mipData_.assign(static_cast<size_t>(numMipLevels_ * kTableSize), T(0));
         mipMaxFreq_.resize(static_cast<size_t>(numMipLevels_));
 
         T nyquist = static_cast<T>(sampleRate_ / 2.0);
+        const int maxTableHarmonics = kTableSize / 2; // Absolute Nyquist limit of the table itself
 
         for (int level = 0; level < numMipLevels_; ++level)
         {
-            // Each level covers one octave
-            // Level 0: lowest frequencies, most harmonics
-            // Level N: highest frequencies, fewest harmonics
             T maxFreqForLevel = nyquist / static_cast<T>(1 << (numMipLevels_ - 1 - level));
             mipMaxFreq_[static_cast<size_t>(level)] = maxFreqForLevel;
 
             int maxHarmonics = static_cast<int>(nyquist / maxFreqForLevel);
-            maxHarmonics = std::max(maxHarmonics, 1);
+            // CRITICAL FIX: Prevent aliasing during table generation
+            maxHarmonics = std::clamp(maxHarmonics, 1, maxTableHarmonics);
 
-            // Generate table by additive synthesis
-            mipTables_[static_cast<size_t>(level)].resize(kTableSize);
-            auto& table = mipTables_[static_cast<size_t>(level)];
-
-            std::fill(table.begin(), table.end(), T(0));
+            size_t offset = static_cast<size_t>(level * kTableSize);
 
             for (int h = 1; h <= maxHarmonics; ++h)
             {
@@ -169,70 +161,52 @@ public:
 
                 for (int i = 0; i < kTableSize; ++i)
                 {
-                    T phase = twoPi<T> * static_cast<T>(h)
-                            * static_cast<T>(i) / static_cast<T>(kTableSize);
-                    table[static_cast<size_t>(i)] += amplitude * std::sin(phase);
+                    T phase = twoPi<T> * static_cast<T>(h) * static_cast<T>(i) / static_cast<T>(kTableSize);
+                    mipData_[offset + static_cast<size_t>(i)] += amplitude * std::sin(phase);
                 }
             }
 
-            // Normalise to [-1, 1]
-            T maxVal = T(0);
-            for (auto& s : table)
-                maxVal = std::max(maxVal, std::abs(s));
-
-            if (maxVal > T(0))
-            {
-                T invMax = T(1) / maxVal;
-                for (auto& s : table)
-                    s *= invMax;
-            }
+            normalizeLevel(offset);
         }
     }
 
     /**
-     * @brief Loads a custom single-cycle wavetable.
+     * @brief Loads and analyzes a custom single-cycle wavetable using DFT.
      *
-     * The input is resampled to kTableSize and mipmaps are generated
-     * by successively halving the harmonic content.
-     *
-     * @param data Wavetable samples (one cycle).
-     * @param size Number of samples in the wavetable.
+     * Performs a Discrete Fourier Transform strictly on the original data length
+     * to avoid low-pass smearing, then reconstructs bandlimited mipmaps.
+     * 
+     * @param data Pointer to wavetable samples.
+     * @param size Number of samples in the input data.
+     * @note Allocates memory. Call only during initialization/preparation.
      */
     void loadWavetable(const T* data, int size)
     {
-        // Resample to kTableSize using linear interpolation
-        std::vector<T> baseTable(kTableSize);
-        for (int i = 0; i < kTableSize; ++i)
-        {
-            T pos = static_cast<T>(i) * static_cast<T>(size) / static_cast<T>(kTableSize);
-            int idx0 = static_cast<int>(pos) % size;
-            int idx1 = (idx0 + 1) % size;
-            T frac = pos - std::floor(pos);
-            baseTable[static_cast<size_t>(i)] = data[idx0] + frac * (data[idx1] - data[idx0]);
-        }
+        if (!data || size <= 0) return;
 
-        // Analyse the base table via DFT to extract harmonic amplitudes and phases
-        const int N = kTableSize;
-        const int maxHarmonics = N / 2;
+        // Perform DFT on raw input data to extract true harmonics without interpolation loss
+        int rawNyquistLimit = size / 2;
+        int targetNyquistLimit = kTableSize / 2;
+        int maxHarmonics = std::min(rawNyquistLimit, targetNyquistLimit);
+
         std::vector<T> cosCoeffs(static_cast<size_t>(maxHarmonics + 1), T(0));
         std::vector<T> sinCoeffs(static_cast<size_t>(maxHarmonics + 1), T(0));
 
         for (int h = 1; h <= maxHarmonics; ++h)
         {
             T sumCos = T(0), sumSin = T(0);
-            for (int i = 0; i < N; ++i)
+            for (int i = 0; i < size; ++i)
             {
-                T phase = twoPi<T> * static_cast<T>(h) * static_cast<T>(i) / static_cast<T>(N);
-                sumCos += baseTable[static_cast<size_t>(i)] * std::cos(phase);
-                sumSin += baseTable[static_cast<size_t>(i)] * std::sin(phase);
+                T phase = twoPi<T> * static_cast<T>(h) * static_cast<T>(i) / static_cast<T>(size);
+                sumCos += data[i] * std::cos(phase);
+                sumSin += data[i] * std::sin(phase);
             }
-            cosCoeffs[static_cast<size_t>(h)] = sumCos * T(2) / static_cast<T>(N);
-            sinCoeffs[static_cast<size_t>(h)] = sumSin * T(2) / static_cast<T>(N);
+            cosCoeffs[static_cast<size_t>(h)] = sumCos * T(2) / static_cast<T>(size);
+            sinCoeffs[static_cast<size_t>(h)] = sumSin * T(2) / static_cast<T>(size);
         }
 
-        // Build mipmapped tables (same octave structure as buildFromHarmonics)
         numMipLevels_ = kMaxMipLevels;
-        mipTables_.resize(static_cast<size_t>(numMipLevels_));
+        mipData_.assign(static_cast<size_t>(numMipLevels_ * kTableSize), T(0));
         mipMaxFreq_.resize(static_cast<size_t>(numMipLevels_));
 
         T nyquist = static_cast<T>(sampleRate_ / 2.0);
@@ -245,10 +219,7 @@ public:
             int maxH = static_cast<int>(nyquist / maxFreqForLevel);
             maxH = std::clamp(maxH, 1, maxHarmonics);
 
-            // Reconstruct table from band-limited harmonics
-            mipTables_[static_cast<size_t>(level)].resize(N);
-            auto& table = mipTables_[static_cast<size_t>(level)];
-            std::fill(table.begin(), table.end(), T(0));
+            size_t offset = static_cast<size_t>(level * kTableSize);
 
             for (int h = 1; h <= maxH; ++h)
             {
@@ -256,33 +227,23 @@ public:
                 T b = sinCoeffs[static_cast<size_t>(h)];
                 if (a == T(0) && b == T(0)) continue;
 
-                for (int i = 0; i < N; ++i)
+                for (int i = 0; i < kTableSize; ++i)
                 {
-                    T phase = twoPi<T> * static_cast<T>(h)
-                            * static_cast<T>(i) / static_cast<T>(N);
-                    table[static_cast<size_t>(i)] += a * std::cos(phase) + b * std::sin(phase);
+                    T phase = twoPi<T> * static_cast<T>(h) * static_cast<T>(i) / static_cast<T>(kTableSize);
+                    mipData_[offset + static_cast<size_t>(i)] += a * std::cos(phase) + b * std::sin(phase);
                 }
             }
 
-            // Normalise to [-1, 1]
-            T maxVal = T(0);
-            for (auto& s : table)
-                maxVal = std::max(maxVal, std::abs(s));
-
-            if (maxVal > T(0))
-            {
-                T invMax = T(1) / maxVal;
-                for (auto& s : table)
-                    s *= invMax;
-            }
+            normalizeLevel(offset);
         }
     }
 
-    // -- Playback -----------------------------------------------------------------
+    // -- Playback (REAL-TIME SAFE) ----------------------------------------------
 
     /**
-     * @brief Sets the oscillation frequency.
+     * @brief Sets the fundamental oscillation frequency.
      * @param frequencyHz Frequency in Hz.
+     * @note Not inherently thread-safe. Synchronization should be managed externally.
      */
     void setFrequency(T frequencyHz) noexcept
     {
@@ -291,15 +252,16 @@ public:
     }
 
     /**
-     * @brief Returns the current frequency.
+     * @brief Returns the current internal frequency.
+     * @return Frequency in Hz.
      */
     [[nodiscard]] T getFrequency() const noexcept { return frequency_; }
 
     /**
-     * @brief Generates the next sample.
-     * @return Output sample.
+     * @brief Generates the next sample using Hermite interpolation.
+     * @return Output sample in [-1.0, 1.0].
      */
-    [[nodiscard]] T getSample() noexcept
+    [[nodiscard]] inline T getSample() noexcept
     {
         T phase = phasor_.advance();
         return readTable(phase);
@@ -307,8 +269,8 @@ public:
 
     /**
      * @brief Generates a block of samples.
-     * @param output Output buffer.
-     * @param numSamples Number of samples to generate.
+     * @param output Pointer to output buffer.
+     * @param numSamples Number of samples to process.
      */
     void processBlock(T* output, int numSamples) noexcept
     {
@@ -317,8 +279,8 @@ public:
     }
 
     /**
-     * @brief Resets the oscillator phase.
-     * @param phase Initial phase (0 to 1).
+     * @brief Hard resets the oscillator phase.
+     * @param phase Initial phase normalized [0.0, 1.0].
      */
     void reset(T phase = T(0)) noexcept
     {
@@ -326,38 +288,62 @@ public:
     }
 
 private:
+
     /**
-     * @brief Reads a sample from a specific mipmap level using linear interpolation.
-     * @param phase Phase in [0, 1).
-     * @param level Mipmap level index.
+     * @brief 3rd Order Polynomial Hermite Interpolation.
+     * Delivers significantly better SNR compared to linear interpolation.
      */
-    [[nodiscard]] T readFromLevel(T phase, int level) const noexcept
+    [[nodiscard]] inline T hermiteInterpolate(T frac, T y0, T y1, T y2, T y3) const noexcept
     {
-        const auto& table = mipTables_[static_cast<size_t>(level)];
-
-        T pos = phase * static_cast<T>(kTableSize);
-        int idx0 = static_cast<int>(pos) % kTableSize;
-        int idx1 = (idx0 + 1) % kTableSize;
-        T frac = pos - std::floor(pos);
-
-        return table[static_cast<size_t>(idx0)]
-             + frac * (table[static_cast<size_t>(idx1)]
-                      - table[static_cast<size_t>(idx0)]);
+        T c0 = y1;
+        T c1 = T(0.5) * (y2 - y0);
+        T c2 = y0 - T(2.5) * y1 + T(2.0) * y2 - T(0.5) * y3;
+        T c3 = T(1.5) * (y1 - y2) + T(0.5) * (y3 - y0);
+        return ((c3 * frac + c2) * frac + c1) * frac + c0;
     }
 
     /**
-     * @brief Selects the appropriate mipmap level and reads with crossfade between levels.
-     *
-     * Uses fractional mipmap selection to linearly interpolate between adjacent
-     * levels, eliminating audible timbre discontinuities when sweeping frequency.
+     * @brief Reads a sample from a specific mipmap level using Hermite interpolation.
+     * Employs bitwise masking for zero-branching index wrapping.
+     * 
+     * @param phase Phase in [0, 1).
+     * @param level Mipmap level index.
+     * @return Interpolated sample.
      */
-    [[nodiscard]] T readTable(T phase) const noexcept
+    [[nodiscard]] inline T readFromLevel(T phase, int level) const noexcept
     {
-        if (mipTables_.empty()) return T(0);
+        T pos = phase * static_cast<T>(kTableSize);
+        int i1 = static_cast<int>(pos); // Fast truncation replacing std::floor
+        T frac = pos - static_cast<T>(i1);
 
-        // Get fractional mipmap level and crossfade between adjacent levels
+        // Bitwise mask wrapping ensures bounds without modulo operator penalty
+        int i0 = (i1 - 1) & kTableMask;
+        i1 = i1 & kTableMask;
+        int i2 = (i1 + 1) & kTableMask;
+        int i3 = (i1 + 2) & kTableMask;
+
+        size_t offset = static_cast<size_t>(level * kTableSize);
+        const T* table = &mipData_[offset];
+
+        return hermiteInterpolate(frac, table[i0], table[i1], table[i2], table[i3]);
+    }
+
+    /**
+     * @brief Reads and crossfades between adjacent mipmaps to prevent timbre stepping.
+     */
+    [[nodiscard]] inline T readTable(T phase) const noexcept
+    {
+        if (mipData_.empty()) return T(0);
+
         T levelF = selectMipLevelFloat();
         int level0 = static_cast<int>(levelF);
+        
+        // Optimize crossfade edge-case
+        if (levelF == static_cast<T>(level0)) 
+        {
+            return readFromLevel(phase, level0);
+        }
+
         int level1 = std::min(level0 + 1, numMipLevels_ - 1);
         T frac = levelF - static_cast<T>(level0);
 
@@ -368,16 +354,12 @@ private:
     }
 
     /**
-     * @brief Selects a fractional mipmap level for the current frequency.
-     *
-     * Returns a floating-point level that includes the fraction between
-     * adjacent levels, enabling smooth crossfade during frequency sweeps.
+     * @brief Calculates fractional mipmap level based on current frequency.
      */
-    [[nodiscard]] T selectMipLevelFloat() const noexcept
+    [[nodiscard]] inline T selectMipLevelFloat() const noexcept
     {
         T absFreq = std::abs(frequency_);
 
-        // Below the lowest level's max frequency — return level 0
         if (numMipLevels_ <= 1 || absFreq <= mipMaxFreq_[0])
             return T(0);
 
@@ -385,10 +367,9 @@ private:
         {
             if (absFreq <= mipMaxFreq_[static_cast<size_t>(i)])
             {
-                // Interpolate between level (i-1) and level i
                 T freqLow  = mipMaxFreq_[static_cast<size_t>(i - 1)];
                 T freqHigh = mipMaxFreq_[static_cast<size_t>(i)];
-                T t = (absFreq - freqLow) / (freqHigh - freqLow + T(1e-10));
+                T t = (absFreq - freqLow) / (freqHigh - freqLow + T(1e-9)); 
                 return static_cast<T>(i - 1) + t;
             }
         }
@@ -397,20 +378,20 @@ private:
     }
 
     /**
-     * @brief Selects the mipmap level for the current frequency (integer).
-     *
-     * Returns the level whose max frequency is just above the current
-     * fundamental — this ensures all harmonics in that table are below Nyquist.
+     * @brief Normalizes a specific level in the flattened vector.
      */
-    [[nodiscard]] int selectMipLevel() const noexcept
+    void normalizeLevel(size_t offset)
     {
-        T absFreq = std::abs(frequency_);
-        for (int i = 0; i < numMipLevels_; ++i)
+        T maxVal = T(0);
+        for (int i = 0; i < kTableSize; ++i)
+            maxVal = std::max(maxVal, std::abs(mipData_[offset + static_cast<size_t>(i)]));
+
+        if (maxVal > T(0))
         {
-            if (absFreq <= mipMaxFreq_[static_cast<size_t>(i)])
-                return i;
+            T invMax = T(1) / maxVal;
+            for (int i = 0; i < kTableSize; ++i)
+                mipData_[offset + static_cast<size_t>(i)] *= invMax;
         }
-        return numMipLevels_ - 1; // Highest level (fewest harmonics)
     }
 
     double sampleRate_ = 48000.0;
@@ -419,7 +400,8 @@ private:
     Phasor<T> phasor_;
 
     int numMipLevels_ = 0;
-    std::vector<std::vector<T>> mipTables_;
+    // Cache-friendly contiguous flat layout (Level0 + Level1 + ...)
+    std::vector<T> mipData_; 
     std::vector<T> mipMaxFreq_;
 };
 

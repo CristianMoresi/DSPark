@@ -3,39 +3,9 @@
 
 #pragma once
 
-/**
- * @file Dither.h
- * @brief TPDF dithering for bit-depth reduction in audio.
- *
- * When converting audio from a higher bit-depth to a lower one (e.g., float → 16-bit,
- * 24-bit → 16-bit), simple truncation introduces correlated quantisation distortion.
- * Dithering adds a carefully shaped noise signal before quantisation, converting
- * the distortion into a constant, low-level noise floor — perceptually far less
- * objectionable.
- *
- * **TPDF (Triangular Probability Density Function)** is the industry standard for
- * audio dithering. It completely eliminates quantisation distortion at the cost of
- * a +4.77 dB noise floor increase (relative to the LSB). No noise shaping is applied
- * here — noise shaping can be added on top if desired.
- *
- * This implementation also supports optional **first-order noise shaping**, which
- * pushes dither noise energy toward higher frequencies where human hearing is less
- * sensitive.
- *
- * Dependencies: C++20 standard library only.
- *
- * @code
- *   // Dither float audio to 16-bit before writing to WAV:
- *   dspark::Dither<float> dither(16);
- *
- *   for (int i = 0; i < numSamples; ++i)
- *       output[i] = dither.processSample(input[i]);
- *   // output[i] is now quantised to 16-bit levels with TPDF dither
- * @endcode
- */
-
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -44,134 +14,168 @@ namespace dspark {
 
 /**
  * @class Dither
- * @brief TPDF dithering processor for bit-depth reduction.
+ * @brief TPDF dithering processor with optional 1st-order noise shaping.
  *
- * @tparam T Sample type (float or double).
+ * Converts high-resolution audio to a lower bit-depth by adding a Triangular 
+ * Probability Density Function (TPDF) noise before quantisation. This eliminates 
+ * correlated quantisation distortion (truncation distortion), trading it for a 
+ * constant, uncorrelated noise floor.
+ *
+ * The optional 1st-order noise shaper applies an error-feedback loop to shift 
+ * the quantisation noise energy into higher frequencies where the human ear is 
+ * less sensitive, while keeping the dither noise itself perfectly flat.
+ *
+ * @note **Thread Safety:** A single instance is NOT safe to be called concurrently 
+ * from multiple threads due to the PRNG state mutation. Use one instance per 
+ * processing thread.
+ *
+ * @tparam T Sample type (`float` or `double`).
  */
 template <typename T>
 class Dither
 {
 public:
     /**
-     * @brief Constructs a dithering processor for the target bit depth.
+     * @brief Constructs a dithering processor.
      *
-     * @param targetBits Target bit depth (8, 16, 24, or 32). Default: 16.
-     * @param noiseShaping Enable first-order noise shaping (default: false).
+     * Automatically seeds the internal PRNG with a globally unique seed to ensure 
+     * uncorrelated noise between multiple instances (e.g., Left and Right channels).
+     *
+     * @param targetBits Target bit depth (min 8). Max is 24 for `float`, 32 for `double`.
+     * @param noiseShaping Enable 1st-order noise shaping.
      */
     explicit Dither(int targetBits = 16, bool noiseShaping = false) noexcept
         : noiseShaping_(noiseShaping)
     {
+        static std::atomic<uint32_t> seedGenerator{ 0x193A6B54u };
+        // Increment by golden ratio to ensure diverse initial states across instances
+        rngState_ = seedGenerator.fetch_add(0x9E3779B9u, std::memory_order_relaxed);
+
         setTargetBitDepth(targetBits);
     }
 
     /**
-     * @brief Sets the target bit depth.
-     *
-     * @param bits Target bit depth (8, 16, 24, or 32).
+     * @brief Sets the target bit depth and recalculates scaling factors.
+     * @param bits Target bit depth. Automatically clamped based on the precision of `T`.
      */
     void setTargetBitDepth(int bits) noexcept
     {
-        targetBits_ = std::clamp(bits, 1, 32);
+        // float (32-bit IEEE 754) only has 24 bits of mantissa precision.
+        constexpr int maxBits = (sizeof(T) == 4) ? 24 : 32;
+        targetBits_ = std::clamp(bits, 8, maxBits);
 
-        // Quantisation step size for the target bit depth
-        // For N bits, there are 2^(N-1) levels in [0, 1], so the step is 1/2^(N-1)
-        quantStep_ = T(1) / static_cast<T>(int64_t(1) << (targetBits_ - 1));
+        // Calculate levels: 2^(N-1)
+        int64_t levels = int64_t(1) << (targetBits_ - 1);
+        
+        quantScale_ = static_cast<T>(levels);
+        quantStep_ = T(1) / quantScale_;
     }
 
-    /** @brief Enables or disables first-order noise shaping. */
+    /** @brief Enables or disables 1st-order noise shaping. */
     void setNoiseShaping(bool enabled) noexcept { noiseShaping_ = enabled; }
 
-    /** @brief Resets the noise shaping state and RNG to a clean state. */
+    /** @brief Resets the noise shaping state. Call this when playback stops or flushes. */
     void reset() noexcept
     {
-        for (auto& e : errorState_) e = T(0);
+        std::fill(errorState_.begin(), errorState_.end(), T(0));
     }
 
     /**
      * @brief Applies TPDF dither and quantises a single sample.
-     *
-     * @param input  Input sample (typically in [-1, 1] float range).
-     * @param channel Channel index for independent noise shaping state (default: 0).
-     * @return Dithered and quantised sample.
+     * @param input Input sample in [-1.0, 1.0].
+     * @param channel Channel index for independent noise shaping history (max 16).
+     * @return Quantised sample.
      */
     [[nodiscard]] T processSample(T input, int channel = 0) noexcept
     {
-        // Generate TPDF noise: sum of two uniform random values → triangular distribution
-        T noise = (nextRandom() + nextRandom()) * quantStep_;
-
-        T toQuantise = input;
-
-        // Apply noise shaping feedback (first-order high-pass)
         if (noiseShaping_ && channel < kMaxChannels)
-        {
-            toQuantise -= errorState_[static_cast<size_t>(channel)];
-        }
-
-        // Add dither
-        T dithered = toQuantise + noise;
-
-        // Quantise: round to nearest quantisation step
-        T quantised = std::round(dithered / quantStep_) * quantStep_;
-
-        // Clamp to valid range
-        quantised = std::clamp(quantised, T(-1), T(1));
-
-        // Update noise shaping error (difference between quantised and original)
-        if (noiseShaping_ && channel < kMaxChannels)
-        {
-            errorState_[static_cast<size_t>(channel)] = quantised - toQuantise;
-        }
-
-        return quantised;
+            return processSampleInternal<true>(input, channel);
+        else
+            return processSampleInternal<false>(input, channel);
     }
 
     /**
      * @brief Applies dithering to an entire audio buffer in-place.
+     * * Optimised to evaluate the noise shaping branch outside the sample loop,
+     * allowing the compiler to pipeline and potentially vectorise the processing.
      *
-     * @param data       Pointer to interleaved or per-channel audio data.
-     * @param numSamples Number of samples per channel.
-     * @param channel    Channel index.
+     * @param data Pointer to audio data.
+     * @param numSamples Number of samples to process.
+     * @param channel Channel index.
      */
     void processBlock(T* data, int numSamples, int channel = 0) noexcept
     {
-        for (int i = 0; i < numSamples; ++i)
-            data[i] = processSample(data[i], channel);
+        if (noiseShaping_ && channel < kMaxChannels)
+        {
+            for (int i = 0; i < numSamples; ++i)
+                data[i] = processSampleInternal<true>(data[i], channel);
+        }
+        else
+        {
+            for (int i = 0; i < numSamples; ++i)
+                data[i] = processSampleInternal<false>(data[i], channel);
+        }
     }
 
-    /** @brief Returns the current target bit depth. */
     [[nodiscard]] int getTargetBitDepth() const noexcept { return targetBits_; }
-
-    /** @brief Returns the quantisation step size. */
     [[nodiscard]] T getQuantisationStep() const noexcept { return quantStep_; }
 
 private:
     static constexpr int kMaxChannels = 16;
 
     /**
-     * @brief Simple, fast PRNG for dither noise generation.
-     *
-     * Uses a 32-bit xorshift. The quality requirement for dither noise is low —
-     * we only need a uniform distribution, not cryptographic randomness.
-     * This is deliberately simpler and faster than AnalogRandom.
-     *
-     * @return Random value in [-0.5, +0.5).
+     * @brief Internal processing template to resolve branching at compile time.
      */
-    [[nodiscard]] T nextRandom() noexcept
+    template <bool ApplyNoiseShaping>
+    [[nodiscard]] inline T processSampleInternal(T input, int channel) noexcept
+    {
+        // 2 LSB Peak-to-Peak TPDF noise
+        T noise = (nextRandom() + nextRandom()) * quantStep_;
+        
+        T preQuantise = input;
+
+        if constexpr (ApplyNoiseShaping)
+        {
+            preQuantise -= errorState_[static_cast<size_t>(channel)];
+        }
+
+        // Add dither to the signal (w[n] = v[n] + d[n])
+        T dithered = preQuantise + noise;
+
+        // Quantise: multiply by scale, round, multiply by step (no slow divisions)
+        T quantised = std::round(dithered * quantScale_) * quantStep_;
+        quantised = std::clamp(quantised, T(-1), T(1));
+
+        if constexpr (ApplyNoiseShaping)
+        {
+            // Error is STRICTLY the quantisation error: e[n] = y[n] - w[n]
+            // This ensures dither remains flat while quantisation noise is shaped.
+            errorState_[static_cast<size_t>(channel)] = quantised - dithered;
+        }
+
+        return quantised;
+    }
+
+    /**
+     * @brief Fast Xorshift32 PRNG.
+     * @return Uniform random value in [-0.5, 0.5).
+     */
+    [[nodiscard]] inline T nextRandom() noexcept
     {
         rngState_ ^= rngState_ << 13;
         rngState_ ^= rngState_ >> 17;
         rngState_ ^= rngState_ << 5;
 
-        // Convert to [-0.5, 0.5) range
         constexpr T scale = T(1) / static_cast<T>(std::numeric_limits<uint32_t>::max());
         return static_cast<T>(rngState_) * scale - T(0.5);
     }
 
     int targetBits_ = 16;
-    T quantStep_ = T(1) / T(32768);  // Default: 16-bit
+    T quantStep_ = T(1) / T(32768);
+    T quantScale_ = T(32768);
     bool noiseShaping_ = false;
-    uint32_t rngState_ = 0x12345678u;
-    std::array<T, kMaxChannels> errorState_ {};
+    uint32_t rngState_;
+    std::array<T, kMaxChannels> errorState_{};
 };
 
 } // namespace dspark

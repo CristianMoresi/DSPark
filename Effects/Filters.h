@@ -11,6 +11,10 @@
  * AllPass) with configurable slopes from 6 to 48 dB/oct via cascaded biquad stages.
  * Parameters are smoothed per-sample to prevent zipper noise.
  *
+ * @warning Biquad filters are not suited for audio-rate cutoff modulation.
+ * Nonlinearity and analog drift use block-rate coefficient updates (chunking)
+ * to maintain CPU stability and prevent severe phase distortion.
+ *
  * Dependencies: Biquad.h, AudioBuffer.h, AudioSpec.h, Smoothers.h, AnalogRandom.h.
  *
  * @code
@@ -19,7 +23,7 @@
  *   filter.setLowPass(2000.0f, 0.707f, 24);  // 2kHz, Butterworth Q, 24dB/oct
  *   filter.processBlock(buffer);
  *
- *   // Real-time parameter changes (smoothed):
+ *   // Real-time parameter changes from UI thread (thread-safe):
  *   filter.setFrequency(4000.0f);
  * @endcode
  */
@@ -43,18 +47,22 @@ namespace dspark {
  * @class FilterEngine
  * @brief Professional multi-mode filter with cascaded biquad stages.
  *
- * Each biquad stage provides 12 dB/oct (2nd order). Cascading N stages
- * gives 12*N dB/oct. For odd-order slopes (6, 18, 30, 42 dB/oct), the
- * last stage uses a 1st-order (6 dB) filter approximation.
+ * Utilizes SIMD-friendly branching and atomic parameter states for thread-safe
+ * real-time manipulation. 
  *
  * @tparam T           Sample type (float or double).
- * @tparam MaxChannels Maximum number of audio channels.
+ * @tparam MaxChannels Maximum number of audio channels allowed.
  */
 template <typename T, int MaxChannels = 16>
 class FilterEngine
 {
 public:
-    virtual ~FilterEngine() = default;
+    // Removed virtual destructor to avoid vptr overhead and maintain cache alignment.
+    ~FilterEngine() = default;
+
+    /**
+     * @brief Supported filter shapes.
+     */
     enum class Shape
     {
         LowPass, HighPass, BandPass, Peak,
@@ -63,6 +71,10 @@ public:
 
     // -- Lifecycle -----------------------------------------------------------
 
+    /**
+     * @brief Initializes the filter engine with the current audio specification.
+     * @param spec The audio specification containing sample rate and block size.
+     */
     void prepare(const AudioSpec& spec)
     {
         spec_ = spec;
@@ -72,6 +84,10 @@ public:
         reset();
     }
 
+    /**
+     * @brief Resets the internal state of all cascaded biquads and smoothers.
+     * Prevents clicks when relocating playback or enabling the effect.
+     */
     void reset() noexcept
     {
         for (auto& stage : stages_) stage.reset();
@@ -84,88 +100,127 @@ public:
 
     /**
      * @brief Configures a low-pass filter.
-     * @param freq Cutoff frequency in Hz.
+     * @param freq Target cutoff frequency in Hz.
      * @param Q    Quality factor (0.707 = Butterworth).
-     * @param slopeDb Slope in dB/oct (6, 12, 18, 24, 30, 36, 42, 48).
+     * @param slopeDb Slope in dB/octave (6, 12, 18, 24, 30, 36, 42, 48).
      */
     void setLowPass(float freq, float Q = 0.707f, int slopeDb = 12)
     {
         shape_ = Shape::LowPass;
         slopeDb_ = slopeDb;
         numStages_ = slopeToStages(slopeDb);
-        freqSmoother_.setTargetValue(freq);
-        resSmoother_.setTargetValue(Q);
+        setFrequency(freq);
+        setResonance(Q);
     }
 
+    /**
+     * @brief Configures a high-pass filter.
+     * @param freq Target cutoff frequency in Hz.
+     * @param Q    Quality factor (0.707 = Butterworth).
+     * @param slopeDb Slope in dB/octave (6, 12, 18, 24, 30, 36, 42, 48).
+     */
     void setHighPass(float freq, float Q = 0.707f, int slopeDb = 12)
     {
         shape_ = Shape::HighPass;
         slopeDb_ = slopeDb;
         numStages_ = slopeToStages(slopeDb);
-        freqSmoother_.setTargetValue(freq);
-        resSmoother_.setTargetValue(Q);
+        setFrequency(freq);
+        setResonance(Q);
     }
 
+    /**
+     * @brief Configures a band-pass filter (fixed 12 dB/oct).
+     * @param freq Target center frequency in Hz.
+     * @param Q    Quality factor (bandwidth control).
+     */
     void setBandPass(float freq, float Q = 0.707f)
     {
         shape_ = Shape::BandPass;
         slopeDb_ = 12;
         numStages_ = 1;
-        freqSmoother_.setTargetValue(freq);
-        resSmoother_.setTargetValue(Q);
+        setFrequency(freq);
+        setResonance(Q);
     }
 
+    /**
+     * @brief Configures a peaking / bell EQ filter.
+     * @param freq Target center frequency in Hz.
+     * @param gainDb Gain in dB to boost or cut.
+     * @param Q    Quality factor.
+     */
     void setPeaking(float freq, float gainDb, float Q = 1.0f)
     {
         shape_ = Shape::Peak;
         slopeDb_ = 12;
         numStages_ = 1;
-        freqSmoother_.setTargetValue(freq);
-        resSmoother_.setTargetValue(Q);
-        gainSmoother_.setTargetValue(gainDb);
+        setFrequency(freq);
+        setResonance(Q);
+        setGain(gainDb);
     }
 
+    /**
+     * @brief Configures a low-shelf EQ filter.
+     * @param freq Target transition frequency in Hz.
+     * @param gainDb Gain in dB to boost or cut.
+     * @param slope Shelf transition slope (1.0 = standard).
+     */
     void setLowShelf(float freq, float gainDb, float slope = 1.0f)
     {
         shape_ = Shape::LowShelf;
         slopeDb_ = 12;
         numStages_ = 1;
-        freqSmoother_.setTargetValue(freq);
-        gainSmoother_.setTargetValue(gainDb);
         shelfSlope_ = slope;
+        setFrequency(freq);
+        setGain(gainDb);
     }
 
+    /**
+     * @brief Configures a high-shelf EQ filter.
+     * @param freq Target transition frequency in Hz.
+     * @param gainDb Gain in dB to boost or cut.
+     * @param slope Shelf transition slope (1.0 = standard).
+     */
     void setHighShelf(float freq, float gainDb, float slope = 1.0f)
     {
         shape_ = Shape::HighShelf;
         slopeDb_ = 12;
         numStages_ = 1;
-        freqSmoother_.setTargetValue(freq);
-        gainSmoother_.setTargetValue(gainDb);
         shelfSlope_ = slope;
+        setFrequency(freq);
+        setGain(gainDb);
     }
 
+    /**
+     * @brief Configures a notch (band-reject) filter.
+     * @param freq Target center frequency in Hz.
+     * @param Q    Quality factor (bandwidth of the cut).
+     */
     void setNotch(float freq, float Q = 10.0f)
     {
         shape_ = Shape::Notch;
         slopeDb_ = 12;
         numStages_ = 1;
-        freqSmoother_.setTargetValue(freq);
-        resSmoother_.setTargetValue(Q);
+        setFrequency(freq);
+        setResonance(Q);
     }
 
+    /**
+     * @brief Configures an all-pass filter (shifts phase, flat frequency response).
+     * @param freq Phase transition center frequency in Hz.
+     * @param Q    Quality factor.
+     */
     void setAllPass(float freq, float Q = 0.707f)
     {
         shape_ = Shape::AllPass;
         slopeDb_ = 12;
         numStages_ = 1;
-        freqSmoother_.setTargetValue(freq);
-        resSmoother_.setTargetValue(Q);
+        setFrequency(freq);
+        setResonance(Q);
     }
 
     /**
-     * @brief Configures a tilt filter (boost highs + cut lows or vice versa).
-     * @param centerFreq Center frequency.
+     * @brief Configures a tilt EQ filter (boost highs/cut lows or vice versa).
+     * @param centerFreq Pivot frequency in Hz.
      * @param gainDb Positive = bright, negative = dark.
      */
     void setTilt(float centerFreq, float gainDb)
@@ -173,32 +228,81 @@ public:
         shape_ = Shape::Tilt;
         slopeDb_ = 12;
         numStages_ = 1;
-        freqSmoother_.setTargetValue(centerFreq);
-        gainSmoother_.setTargetValue(gainDb);
+        setFrequency(centerFreq);
+        setGain(gainDb);
     }
 
-    // -- Real-time parameter changes -----------------------------------------
+    /** @brief Returns the active filter shape. */
+    [[nodiscard]] Shape getShape() const noexcept { return shape_; }
 
-    void setFrequency(float freq) { freqSmoother_.setTargetValue(freq); }
-    void setResonance(float Q)    { resSmoother_.setTargetValue(Q); }
-    void setGain(float dB)        { gainSmoother_.setTargetValue(dB); }
+    /** @brief Returns the active slope in dB/oct (LP/HP only — others = 12). */
+    [[nodiscard]] int getSlopeDb() const noexcept { return slopeDb_; }
 
     /**
-     * @brief Sets the nonlinearity amount (Capacitor2-style).
+     * @brief Switches the filter topology while keeping the current frequency,
+     *        resonance, and gain unchanged.
      *
-     * When > 0, the effective cutoff frequency modulates based on input
-     * amplitude. Loud signals shift the cutoff, producing signal-dependent
-     * filtering similar to analog capacitor nonlinearity.
+     * Useful for UI dropdowns where the user expects the existing slider values
+     * to carry over when they pick a different filter type. For one-shot setup
+     * with explicit parameters, the setLowPass()/setPeaking()/etc. helpers are
+     * still preferred.
      *
+     * @param newShape Target filter shape.
+     * @param slopeDb  Slope in dB/octave (only used by LP/HP, default 12).
+     */
+    void setShape(Shape newShape, int slopeDb = 12) noexcept
+    {
+        shape_ = newShape;
+        slopeDb_ = slopeDb;
+        switch (newShape)
+        {
+            case Shape::LowPass:
+            case Shape::HighPass:
+                numStages_ = slopeToStages(slopeDb);
+                break;
+            default:
+                slopeDb_ = 12;
+                numStages_ = 1;
+                break;
+        }
+    }
+
+    // -- Real-time parameter changes (Thread-safe) ---------------------------
+
+    /**
+     * @brief Sets the target cutoff/center frequency. Thread-safe.
+     * @param freq Frequency in Hz.
+     */
+    void setFrequency(float freq) noexcept { targetFreq_.store(freq, std::memory_order_relaxed); }
+
+    /**
+     * @brief Sets the target resonance/Q. Thread-safe.
+     * @param Q Quality factor.
+     */
+    void setResonance(float Q)    noexcept { targetRes_.store(Q, std::memory_order_relaxed); }
+
+    /**
+     * @brief Sets the target gain in dB. Thread-safe.
+     * @param dB Gain in decibels.
+     */
+    void setGain(float dB)        noexcept { targetGain_.store(dB, std::memory_order_relaxed); }
+
+    /**
+     * @brief Sets the nonlinearity amount. Thread-safe.
      * @param amount 0 = linear (default), 1 = full nonlinearity.
      */
     void setNonlinearity(T amount) noexcept
     {
-        nonlinearity_.store(static_cast<float>(std::clamp(amount, T(0), T(1))), std::memory_order_relaxed);
+        targetNonlinearity_.store(static_cast<float>(std::clamp(amount, T(0), T(1))), std::memory_order_relaxed);
     }
 
     // -- Analog drift --------------------------------------------------------
 
+    /**
+     * @brief Enables analog-style low-frequency modulation of the cutoff.
+     * @param component The analog component profile to simulate.
+     * @param intensity Modulation depth (0.0 to 1.0).
+     */
     void enableAnalogDrift(AnalogRandom::AnalogComponent component, float intensity = 0.5f)
     {
         driftEnabled_ = true;
@@ -207,93 +311,118 @@ public:
         driftGen_.prepare(spec_.sampleRate);
     }
 
-    void disableAnalogDrift() { driftEnabled_ = false; }
+    /**
+     * @brief Disables analog-style drift modulation.
+     */
+    void disableAnalogDrift() noexcept { driftEnabled_ = false; }
 
     // -- Processing ----------------------------------------------------------
 
+    /**
+     * @brief Processes an entire block of audio data.
+     * Internally branches into static, smoothed, or nonlinear processing paths
+     * to optimize CPU usage and allow auto-vectorization when possible.
+     * 
+     * @param buffer View of the audio buffer to process in-place.
+     */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
         DenormalGuard guard;
         const int nCh = std::min(buffer.getNumChannels(), MaxChannels);
         const int nS  = buffer.getNumSamples();
 
-        T nonLin = static_cast<T>(nonlinearity_.load(std::memory_order_relaxed));
-        const bool needSmoothing = freqSmoother_.isSmoothing() || resSmoother_.isSmoothing()
-                                   || gainSmoother_.isSmoothing() || driftEnabled_;
-        // Nonlinearity modulates cutoff per-sample (signal-dependent) — cannot rate-limit.
-        // Drift and smoother-only updates are safe to rate-limit.
-        const bool perSampleCoeffs = nonLin > T(0);
-        constexpr int kCoeffUpdateInterval = 32;
+        // Update smoothers with latest atomic targets
+        freqSmoother_.setTargetValue(targetFreq_.load(std::memory_order_relaxed));
+        resSmoother_.setTargetValue(targetRes_.load(std::memory_order_relaxed));
+        gainSmoother_.setTargetValue(targetGain_.load(std::memory_order_relaxed));
+        T nonLin = static_cast<T>(targetNonlinearity_.load(std::memory_order_relaxed));
 
-        for (int i = 0; i < nS; ++i)
+        const bool needSmoothing = freqSmoother_.isSmoothing() || resSmoother_.isSmoothing() || gainSmoother_.isSmoothing();
+        const bool dynamicPath = needSmoothing || driftEnabled_ || (nonLin > T(0));
+        
+        constexpr int kChunkSize = 16; // Optimized chunk size for Biquad coefficient updates
+
+        if (!dynamicPath)
         {
-            // Advance smoothers every sample to maintain correct timing
-            float freq = freqSmoother_.getNextValue();
-            float res  = resSmoother_.getNextValue();
-            float gain = gainSmoother_.getNextValue();
-
-            // Advance drift generator every sample to keep LFO phase consistent
-            float driftValue = 0.0f;
-            if (driftEnabled_)
-                driftValue = driftGen_.getNextSample() * driftIntensity_;
-
-            if (perSampleCoeffs)
+            // -- Fast Path: SIMD Friendly, Outer Channel Loop --
+            if (nS > 0)
             {
-                // -- Per-sample path: nonlinearity active (signal-dependent) --
-                freq *= (1.0f + driftValue);
+                float f = freqSmoother_.getCurrentValue(); // Value is static
+                float q = resSmoother_.getCurrentValue();
+                float g = gainSmoother_.getCurrentValue();
+                
+                float nyquist = static_cast<float>(spec_.sampleRate) * 0.499f;
+                updateCoefficients(std::clamp(f, 10.0f, nyquist), std::max(q, 0.1f), g);
 
-                // Capacitor2-style nonlinearity: modulate cutoff by signal amplitude
-                T avgAbs = T(0);
                 for (int ch = 0; ch < nCh; ++ch)
-                    avgAbs += std::abs(buffer.getChannel(ch)[i]);
-                avgAbs /= static_cast<T>(nCh);
-
-                T dielectric = std::abs(T(2) - (avgAbs + nonLin) / nonLin);
-                freq *= static_cast<float>(dielectric);
-
-                float nyquist = static_cast<float>(spec_.sampleRate) * 0.499f;
-                freq = std::clamp(freq, 10.0f, nyquist);
-                res  = std::max(res, 0.1f);
-
-                updateCoefficients(freq, res, gain);
+                {
+                    T* channelData = buffer.getChannel(ch);
+                    for (int i = 0; i < nS; ++i)
+                    {
+                        T sample = channelData[i];
+                        for (int s = 0; s < numStages_; ++s)
+                            sample = stages_[s].processSample(sample, ch);
+                        channelData[i] = sample;
+                    }
+                }
             }
-            else if (needSmoothing && (i % kCoeffUpdateInterval == 0))
+        }
+        else
+        {
+            // -- Dynamic Path: Modulated / Smoothed (Chunked updates) --
+            // Processes audio in small chunks to avoid per-sample trigonometric calculations.
+            for (int i = 0; i < nS; ++i)
             {
-                // -- Rate-limited path: smoothing/drift active, no nonlinearity --
-                freq *= (1.0f + driftValue);
+                float freq = freqSmoother_.getNextValue();
+                float res  = resSmoother_.getNextValue();
+                float gain = gainSmoother_.getNextValue();
 
-                float nyquist = static_cast<float>(spec_.sampleRate) * 0.499f;
-                freq = std::clamp(freq, 10.0f, nyquist);
-                res  = std::max(res, 0.1f);
+                // Only calculate trig/coefficients every kChunkSize samples to save CPU
+                if (i % kChunkSize == 0)
+                {
+                    float driftValue = driftEnabled_ ? (driftGen_.getNextSample() * driftIntensity_) : 0.0f;
+                    freq *= (1.0f + driftValue);
 
-                updateCoefficients(freq, res, gain);
-            }
-            else if (!needSmoothing && i == 0)
-            {
-                // -- Static path: no smoothing, no drift, no nonlinearity --
-                // Update once at the start of the block.
-                float nyquist = static_cast<float>(spec_.sampleRate) * 0.499f;
-                freq = std::clamp(freq, 10.0f, nyquist);
-                res  = std::max(res, 0.1f);
+                    if (nonLin > T(0))
+                    {
+                        // Capacitor2-style nonlinearity approximated at chunk level.
+                        // NOTE: True per-sample analog FM requires SVF/TPT filters.
+                        T avgAbs = T(0);
+                        for (int ch = 0; ch < nCh; ++ch)
+                            avgAbs += std::abs(buffer.getChannel(ch)[i]);
+                        avgAbs /= static_cast<T>(nCh);
 
-                updateCoefficients(freq, res, gain);
-            }
+                        T dielectric = std::abs(T(2) - (avgAbs + nonLin) / nonLin);
+                        freq *= static_cast<float>(dielectric);
+                    }
 
-            for (int ch = 0; ch < nCh; ++ch)
-            {
-                T sample = buffer.getChannel(ch)[i];
-                for (int s = 0; s < numStages_; ++s)
-                    sample = stages_[s].processSample(sample, ch);
-                buffer.getChannel(ch)[i] = sample;
+                    float nyquist = static_cast<float>(spec_.sampleRate) * 0.499f;
+                    updateCoefficients(std::clamp(freq, 10.0f, nyquist), std::max(res, 0.1f), gain);
+                }
+                else if (driftEnabled_)
+                {
+                    (void)driftGen_.getNextSample(); // Advance LFO phase to keep sync
+                }
+
+                // Process inner loops
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    T sample = buffer.getChannel(ch)[i];
+                    for (int s = 0; s < numStages_; ++s)
+                        sample = stages_[s].processSample(sample, ch);
+                    buffer.getChannel(ch)[i] = sample;
+                }
             }
         }
     }
 
-    /// @note processSample() applies the filter with current coefficients but does NOT
-    /// advance parameter smoothers or recompute coefficients. For real-time parameter
-    /// changes to take effect per-sample, use processBlock() which handles smoothing.
-    /// This method is a lightweight hot path for use inside other processors that
-    /// manage their own parameter updates externally.
+    /**
+     * @brief Processes a single sample without parameter smoothing or coefficient updates.
+     * @warning Must only be used when parameter changes are managed externally.
+     * @param input Input sample value.
+     * @param channel Index of the audio channel being processed.
+     * @return T Processed sample value.
+     */
     T processSample(T input, int channel) noexcept
     {
         T sample = input;
@@ -303,48 +432,28 @@ public:
     }
 
 protected:
-    // Max biquad stages: order 8 = 4 second-order, or order 7 = 1 first-order + 3 second-order = 4 biquads
     static constexpr int kMaxStages = 4;
-    static constexpr int kMaxOrder = 8; // 48 dB/oct max
+    static constexpr int kMaxOrder = 8; 
 
-    /**
-     * @brief Butterworth cascade descriptor for a given filter order.
-     *
-     * For proper Butterworth response, each cascaded biquad stage needs a
-     * specific Q value derived from the Butterworth polynomial poles.
-     * Odd orders include a first-order (6 dB/oct) stage plus second-order sections.
-     */
     struct ButterworthCascade
     {
         int order = 0;
-        bool hasFirstOrder = false;   ///< True if order is odd (includes a 1st-order stage).
-        int numSecondOrder = 0;       ///< Number of 2nd-order biquad sections.
-        float qValues[kMaxStages] {}; ///< Q for each 2nd-order section.
+        bool hasFirstOrder = false;   
+        int numSecondOrder = 0;       
+        float qValues[kMaxStages] {}; 
     };
 
-    /**
-     * @brief Computes the Butterworth cascade parameters for a given slope.
-     *
-     * Uses a lookup table of exact Q values from the Butterworth polynomial
-     * (source: Zolzer "DAFX", standard Butterworth filter tables).
-     * Order = slopeDb/6 (not slopeDb/12), since each first-order section is 6 dB/oct.
-     *
-     * @param slopeDb Filter slope in dB/oct (6, 12, 18, 24, 30, 36, 42, 48).
-     */
     static ButterworthCascade computeCascade(int slopeDb) noexcept
     {
-        // Butterworth Q values for cascaded second-order sections, indexed by filter order.
-        // For odd orders, the first-order (real pole) stage is handled separately.
         static constexpr float qTable[kMaxOrder + 1][kMaxStages] = {
-            {},                                          // order 0 (unused)
-            {},                                          // order 1 (first-order only, no 2nd-order stages)
-            { 0.7071f },                                 // order 2
-            { 1.0f },                                    // order 3 (+ first-order)
-            { 0.5412f, 1.3066f },                        // order 4
-            { 0.6180f, 1.6180f },                        // order 5 (+ first-order)
-            { 0.5176f, 0.7071f, 1.9319f },               // order 6
-            { 0.5549f, 0.8019f, 2.2470f },               // order 7 (+ first-order)
-            { 0.5098f, 0.6013f, 0.9000f, 2.5628f }      // order 8
+            {}, {}, 
+            { 0.7071f }, 
+            { 1.0f }, 
+            { 0.5412f, 1.3066f }, 
+            { 0.6180f, 1.6180f }, 
+            { 0.5176f, 0.7071f, 1.9319f }, 
+            { 0.5549f, 0.8019f, 2.2470f }, 
+            { 0.5098f, 0.6013f, 0.9000f, 2.5628f }  
         };
 
         ButterworthCascade result {};
@@ -356,13 +465,6 @@ protected:
         return result;
     }
 
-    /**
-     * @brief Computes the total number of biquad stages for a given slope.
-     *
-     * Even order: order/2 second-order stages.
-     * Odd order: 1 first-order stage (as biquad with b2=a2=0) + (order-1)/2 second-order stages.
-     * Total = (order + 1) / 2 using integer division.
-     */
     static int slopeToStages(int slopeDb) noexcept
     {
         int order = std::clamp(slopeDb / 6, 1, kMaxOrder);
@@ -377,27 +479,22 @@ protected:
         auto cascade = computeCascade(slopeDb_);
         int stageIdx = 0;
 
-        // First-order stage for odd-order LP/HP Butterworth cascades
         if (cascade.hasFirstOrder)
         {
             BiquadCoeffs<T> c;
             switch (shape_)
             {
                 case Shape::LowPass:   c = BiquadCoeffs<T>::makeFirstOrderLowPass(sr, f); break;
-                case Shape::HighPass:   c = BiquadCoeffs<T>::makeFirstOrderHighPass(sr, f); break;
-                // Non-LP/HP shapes don't use cascaded slopes — fall through to LP as safe default
+                case Shape::HighPass:  c = BiquadCoeffs<T>::makeFirstOrderHighPass(sr, f); break;
                 default:               c = BiquadCoeffs<T>::makeFirstOrderLowPass(sr, f); break;
             }
             stages_[stageIdx++].setCoeffs(c);
         }
 
-        // Second-order stages with per-stage Butterworth Q values
         for (int s = 0; s < cascade.numSecondOrder; ++s)
         {
             float stageQ = cascade.qValues[s];
 
-            // For resonant/user-Q shapes, use the user's Q instead of Butterworth Q.
-            // Butterworth Q cascade only applies to LP/HP slope cascading.
             if (shape_ == Shape::Peak || shape_ == Shape::BandPass ||
                 shape_ == Shape::Notch || shape_ == Shape::AllPass)
                 stageQ = Q;
@@ -406,14 +503,14 @@ protected:
             switch (shape_)
             {
                 case Shape::LowPass:   c = BiquadCoeffs<T>::makeLowPass(sr, f, stageQ);  break;
-                case Shape::HighPass:   c = BiquadCoeffs<T>::makeHighPass(sr, f, stageQ); break;
-                case Shape::BandPass:   c = BiquadCoeffs<T>::makeBandPass(sr, f, stageQ); break;
-                case Shape::Peak:       c = BiquadCoeffs<T>::makePeak(sr, f, stageQ, gainDb); break;
-                case Shape::LowShelf:   c = BiquadCoeffs<T>::makeLowShelf(sr, f, gainDb, shelfSlope_); break;
-                case Shape::HighShelf:  c = BiquadCoeffs<T>::makeHighShelf(sr, f, gainDb, shelfSlope_); break;
-                case Shape::Notch:      c = BiquadCoeffs<T>::makeNotch(sr, f, stageQ);  break;
-                case Shape::AllPass:    c = BiquadCoeffs<T>::makeAllPass(sr, f, stageQ); break;
-                case Shape::Tilt:       c = BiquadCoeffs<T>::makeTilt(sr, f, gainDb); break;
+                case Shape::HighPass:  c = BiquadCoeffs<T>::makeHighPass(sr, f, stageQ); break;
+                case Shape::BandPass:  c = BiquadCoeffs<T>::makeBandPass(sr, f, stageQ); break;
+                case Shape::Peak:      c = BiquadCoeffs<T>::makePeak(sr, f, stageQ, gainDb); break;
+                case Shape::LowShelf:  c = BiquadCoeffs<T>::makeLowShelf(sr, f, gainDb, shelfSlope_); break;
+                case Shape::HighShelf: c = BiquadCoeffs<T>::makeHighShelf(sr, f, gainDb, shelfSlope_); break;
+                case Shape::Notch:     c = BiquadCoeffs<T>::makeNotch(sr, f, stageQ);  break;
+                case Shape::AllPass:   c = BiquadCoeffs<T>::makeAllPass(sr, f, stageQ); break;
+                case Shape::Tilt:      c = BiquadCoeffs<T>::makeTilt(sr, f, gainDb); break;
             }
             stages_[stageIdx++].setCoeffs(c);
         }
@@ -424,7 +521,7 @@ protected:
     AudioSpec spec_ {};
     Shape shape_ = Shape::LowPass;
     int numStages_ = 1;
-    int slopeDb_ = 12;         ///< Raw slope in dB/oct, needed by updateCoefficients for cascade computation.
+    int slopeDb_ = 12; 
     float shelfSlope_ = 1.0f;
 
     std::array<Biquad<T, MaxChannels>, kMaxStages> stages_ {};
@@ -432,7 +529,11 @@ protected:
     Smoothers::StateVariableSmoother freqSmoother_;
     Smoothers::LinearSmoother resSmoother_, gainSmoother_;
 
-    std::atomic<float> nonlinearity_ { 0.0f };
+    // Atomics for thread-safe UI->Audio communication
+    std::atomic<float> targetFreq_{1000.0f};
+    std::atomic<float> targetRes_{0.707f};
+    std::atomic<float> targetGain_{0.0f};
+    std::atomic<float> targetNonlinearity_{0.0f};
 
     bool driftEnabled_ = false;
     float driftIntensity_ = 0.0f;

@@ -5,35 +5,25 @@
 
 /**
  * @file ProcessorTraits.h
- * @brief C++20 concepts defining the DSP processor contract.
+ * @brief C++20 concepts defining the strictly real-time DSP processor contract.
  *
  * Provides compile-time concepts that formalise what it means to be a
  * DSP processor in this framework. Any class that satisfies these concepts
  * can be used with ProcessorChain and other generic utilities.
  *
- * No virtual functions, no base class inheritance, no runtime overhead.
- * Just compile-time constraints that produce clear error messages.
+ * Architecture Principles Enforced:
+ * - No virtual dispatch (resolved at compile time).
+ * - Real-time safety: All hot-path methods MUST be natively `noexcept`.
+ * - Strict type matching (`std::same_as`) to prevent implicit casting overhead.
+ * - SIMD ready: Generators must support block processing.
  *
- * The three levels of processor:
- *
- * | Concept          | Required methods                                    |
- * |------------------|-----------------------------------------------------|
- * | `AudioProcessor` | `prepare(AudioSpec)`, `processBlock(BufferView)`, `reset()` |
- * | `SampleProcessor`| Above + `processSample(T, int) -> T`                |
- * | `GeneratorProcessor` | `prepare(AudioSpec)`, `reset()`, `getSample() -> T` |
+ * | Concept              | Required methods                                          |
+ * |----------------------|-----------------------------------------------------------|
+ * | `AudioProcessor`     | `prepare(AudioSpec)`, `processBlock(View) noexcept`, `reset() noexcept` |
+ * | `SampleProcessor`    | Above + `processSample(T, int) noexcept -> T`             |
+ * | `GeneratorProcessor` | `prepare(AudioSpec)`, `generateBlock(View) noexcept`, `reset() noexcept`, `getSample() noexcept -> T` |
  *
  * Dependencies: AudioSpec.h, AudioBuffer.h.
- *
- * @code
- *   // At compile time, check that MyFilter satisfies AudioProcessor:
- *   static_assert(dspark::AudioProcessor<MyFilter, float>);
- *
- *   // Use in template constraints:
- *   template <dspark::AudioProcessor<float> P>
- *   void applyEffect(P& proc, dspark::AudioBufferView<float> buf) {
- *       proc.processBlock(buf);
- *   }
- * @endcode
  */
 
 #include "AudioSpec.h"
@@ -45,27 +35,29 @@ namespace dspark {
 
 /**
  * @concept AudioProcessor
- * @brief A type that can prepare, process audio blocks, and reset.
+ * @brief A type that can prepare, process audio blocks, and reset state.
  *
- * This is the primary concept for processors in the framework.
- * Any class with these three methods can be used in a ProcessorChain.
+ * This is the foundational concept for effects and filters.
+ * Processing and resetting must be guaranteed exception-free (`noexcept`) 
+ * to be safely executed within the real-time audio thread.
  *
  * @tparam P Processor type.
  * @tparam T Sample type (float or double).
  */
 template <typename P, typename T>
 concept AudioProcessor = requires(P p, const AudioSpec& spec, AudioBufferView<T> buf) {
-    p.prepare(spec);
-    p.processBlock(buf);
-    p.reset();
+    { p.prepare(spec) };                  // Can throw/allocate (offline phase)
+    { p.processBlock(buf) } noexcept;     // Real-time hot path
+    { p.reset() } noexcept;               // Must be safe to call from audio thread
 };
 
 /**
  * @concept SampleProcessor
- * @brief An AudioProcessor that also supports per-sample processing.
+ * @brief An AudioProcessor that additionally supports scalar per-sample processing.
  *
- * Adds the requirement for a `processSample(T, int) -> T` method,
- * where the int parameter is the channel index.
+ * Useful for feedback loops or non-linear structures where block processing
+ * needs scalar fallbacks. Requires strict type return `std::same_as<T>` to 
+ * avoid implicit type demotion/promotion cycles (e.g., double <-> float).
  *
  * @tparam P Processor type.
  * @tparam T Sample type.
@@ -73,24 +65,25 @@ concept AudioProcessor = requires(P p, const AudioSpec& spec, AudioBufferView<T>
 template <typename P, typename T>
 concept SampleProcessor = AudioProcessor<P, T> &&
     requires(P p, T sample, int channel) {
-        { p.processSample(sample, channel) } -> std::convertible_to<T>;
+        { p.processSample(sample, channel) } noexcept -> std::same_as<T>;
     };
 
 /**
  * @concept GeneratorProcessor
- * @brief A processor that generates audio (oscillator, envelope, noise).
+ * @brief A real-time safe source processor (oscillators, noise, LFOs).
  *
- * Generators produce output rather than transforming input. They have
- * `prepare()` and `reset()` but use `getSample()` instead of `processBlock()`.
+ * Generators produce output to a buffer without requiring input. 
+ * Must support both scalar `getSample()` and SIMD-friendly `generateBlock()`.
  *
  * @tparam P Processor type.
  * @tparam T Sample type.
  */
 template <typename P, typename T>
-concept GeneratorProcessor = requires(P p, const AudioSpec& spec) {
-    p.prepare(spec);
-    p.reset();
-    { p.getSample() } -> std::convertible_to<T>;
+concept GeneratorProcessor = requires(P p, const AudioSpec& spec, AudioBufferView<T> buf) {
+    { p.prepare(spec) };
+    { p.reset() } noexcept;
+    { p.generateBlock(buf) } noexcept;                    // Mandatory for SIMD/Cache optimization
+    { p.getSample() } noexcept -> std::same_as<T>;        // Strict type matching
 };
 
 } // namespace dspark

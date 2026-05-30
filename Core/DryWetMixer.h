@@ -89,6 +89,7 @@ public:
         dryBuffer_.clear();
         if (delayHist_.getNumSamples() > 0) delayHist_.clear();
         histPos_ = 0;
+        capturedSamples_ = 0;  // No valid dry snapshot until the next pushDry().
         currentMix_ = T(-1); // Forces immediate jump on first use
     }
 

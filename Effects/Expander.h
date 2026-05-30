@@ -175,7 +175,10 @@ protected:
     template <bool UseHPF>
     void processBlockInternal(AudioBufferView<T> buffer) noexcept
     {
-        const int nCh = buffer.getNumChannels();
+        // Clamp to the per-channel HPF state arrays (MAX_CHANNELS): an
+        // AudioBufferView is not capped at 16 channels, so an unclamped count would
+        // index scHpfState_/scHpfPrev_ out of bounds for >16-channel buffers.
+        const int nCh = std::min(buffer.getNumChannels(), MAX_CHANNELS);
         const int nS  = buffer.getNumSamples();
 
         for (int i = 0; i < nS; ++i)

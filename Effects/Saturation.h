@@ -913,7 +913,9 @@ protected:
         auto* secondary = next_.load();
         bool  xfading   = secondary != nullptr && crossfader_.isSmoothing();
 
-        const int nCh = buffer.getNumChannels();
+        // Clamp to per-channel state capacity (prevSlewSample_/prevBlendSample_ are
+        // kMaxCh): an AudioBufferView is not capped at kMaxCh channels.
+        const int nCh = std::min(buffer.getNumChannels(), kMaxCh);
         const int nS  = buffer.getNumSamples();
 
         auto driveDbTarget = static_cast<SampleType>(driveSmoother_.getTargetValue());
@@ -1057,7 +1059,9 @@ protected:
     template <typename ExactAlgo>
     void processCore(ExactAlgo* algo, AudioBufferView<SampleType> buffer, bool useDrift)
     {
-        const int nCh = buffer.getNumChannels();
+        // Clamp to per-channel state capacity: the algorithm's per-channel filter
+        // state (preFilters_[ch] etc.) and driftBuffer_ are bounded to kMaxCh.
+        const int nCh = std::min(buffer.getNumChannels(), kMaxCh);
         const int nS  = buffer.getNumSamples();
         auto driftView = driftBuffer_.toView();
 

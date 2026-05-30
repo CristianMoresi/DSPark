@@ -181,8 +181,11 @@ public:
         int numCh = std::min(input.getNumChannels(), output.getNumChannels());
         int inLen = input.getNumSamples();
 
-        assert(static_cast<int>(channelStates_.size()) >= numCh && 
+        assert(static_cast<int>(channelStates_.size()) >= numCh &&
                "Resampler channels not allocated! Call prepare(spec...) first.");
+        // Release-safe: never index channelStates_ past what prepare() allocated
+        // (the assert above flags the missing prepare(spec) in debug builds).
+        numCh = std::min(numCh, static_cast<int>(channelStates_.size()));
 
         int outCount = 0;
         for (int ch = 0; ch < numCh; ++ch)

@@ -211,8 +211,7 @@ private:
          * @brief State tracking per channel, optimizing memory alignment for SIMD.
          */
         struct ChannelState {
-            std::vector<T> history;    ///< Contiguous block history for even samples (FIR).
-            std::vector<T> oddHistory; ///< Contiguous block history for odd samples (Pure Delay).
+            std::vector<T> history;    ///< Contiguous sliding-window history for the FIR convolution.
         };
         std::vector<ChannelState> upChannels;
         std::vector<ChannelState> downChannels;
@@ -278,14 +277,10 @@ private:
          */
         void reset() noexcept
         {
-            for (auto& ch : upChannels) {
+            for (auto& ch : upChannels)
                 std::fill(ch.history.begin(), ch.history.end(), T(0));
-                std::fill(ch.oddHistory.begin(), ch.oddHistory.end(), T(0));
-            }
-            for (auto& ch : downChannels) {
+            for (auto& ch : downChannels)
                 std::fill(ch.history.begin(), ch.history.end(), T(0));
-                std::fill(ch.oddHistory.begin(), ch.oddHistory.end(), T(0));
-            }
         }
 
         void processUpsample(AudioBufferView<const T> input, AudioBufferView<T> output, int nCh, int nS) noexcept
@@ -298,7 +293,7 @@ private:
                 T* dst = output.getChannel(ch);
                 auto& hist = upChannels[ch].history;
 
-                std::memmove(hist.data(), hist.data() + nS, numTaps * sizeof(T));
+                // Append the new block after the fixed numTaps-sample history prefix.
                 std::memcpy(hist.data() + numTaps, src, nS * sizeof(T));
 
                 // Hint for compiler auto-vectorization
@@ -316,6 +311,10 @@ private:
                     dstR[i * 2] = sum * T(2); 
                     dstR[i * 2 + 1] = histR[i + numTaps - delaySamples] * centerTap * T(2);
                 }
+
+                // Save the trailing numTaps input samples for the next block. Using
+                // the current nS keeps this correct under variable block sizes.
+                std::memmove(hist.data(), hist.data() + nS, numTaps * sizeof(T));
             }
         }
 
@@ -328,7 +327,7 @@ private:
                 T* data = buffer.getChannel(ch); 
                 auto& hist = upChannels[ch].history;
 
-                std::memmove(hist.data(), hist.data() + currentLen, numTaps * sizeof(T));
+                // Append the new block after the fixed numTaps-sample history prefix.
                 std::memcpy(hist.data() + numTaps, data, currentLen * sizeof(T));
 
                 T* __restrict dataR = data;
@@ -344,6 +343,10 @@ private:
                     dataR[i * 2] = sum * T(2); 
                     dataR[i * 2 + 1] = histR[i + numTaps - delaySamples] * centerTap * T(2);
                 }
+
+                // Save the trailing numTaps input samples for the next block. Using
+                // the current length keeps this correct under variable block sizes.
+                std::memmove(hist.data(), hist.data() + currentLen, numTaps * sizeof(T));
             }
         }
 

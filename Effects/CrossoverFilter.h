@@ -70,7 +70,9 @@ public:
     void prepare(const AudioSpec& spec)
     {
         spec_ = spec;
-        numChannels_ = spec.numChannels;
+        // Per-split filters are Biquad<T, 16>; clamp so processing more than 16
+        // channels can't index their fixed per-channel state out of bounds.
+        numChannels_ = std::min(static_cast<int>(spec.numChannels), 16);
 
         // Allocate flat IIR work buffer (Channels * MaxBlockSize)
         workBuf_.assign(static_cast<size_t>(spec.numChannels * spec.maxBlockSize), T(0));

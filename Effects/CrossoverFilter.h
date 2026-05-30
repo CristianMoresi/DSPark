@@ -479,8 +479,12 @@ private:
             {
                 double fc = std::max(static_cast<double>(frequencies_[s]), 1.0);
                 double ratio = freq / fc;
-                double rPow = std::pow(ratio, static_cast<double>(expo * 2));
-                
+                // Ideal Linkwitz-Riley magnitude |LP| = 1/(1 + (f/fc)^N) with
+                // N = expo = order/6 (2/4/8 -> 12/24/48 dB/oct). This must match the
+                // IIR path's slope; the exponent was previously expo*2, which made the
+                // linear-phase crossover twice as steep as the selected order.
+                double rPow = std::pow(ratio, static_cast<double>(expo));
+
                 double denom = 1.0 + rPow;
                 lpMag[s] = static_cast<T>(1.0 / denom);
                 hpMag[s] = static_cast<T>(rPow / denom);

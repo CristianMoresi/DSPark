@@ -4,7 +4,7 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.1** — 73 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
+**v1.0** — 73 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
 
 ```cpp
 #include "DSPark/DSPark.h"

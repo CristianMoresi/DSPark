@@ -96,6 +96,12 @@ public:
             lpFftOut_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
             lpBandFft_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
             lpFftResult_.assign(static_cast<size_t>(lpFftSize_), T(0));
+
+            // Pre-allocate recompute scratch so a live crossover/order change never
+            // allocates on the audio thread (recomputeLinearPhaseMagnitudes runs there).
+            lpIdealMagsFlat_.assign(static_cast<size_t>(MaxBands * numBins), T(0));
+            lpTimeResponse_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
+            lpFirKernel_.assign(static_cast<size_t>(lpFftSize_), T(0));
         }
 
         // Allocate flat allpass correction chains
@@ -467,8 +473,9 @@ private:
             case 48: expo = 8; break;
         }
 
-        // Temporary array to hold ideal zero-phase magnitudes
-        std::vector<std::vector<T>> idealMags(numBands_.load(), std::vector<T>(numBins, T(0)));
+        // Ideal zero-phase magnitudes go into the pre-allocated flat scratch
+        // lpIdealMagsFlat_[band * numBins + bin] — no audio-thread allocation.
+        const int nBands = numBands_.load(std::memory_order_relaxed);
 
         for (int k = 0; k < numBins; ++k)
         {
@@ -490,25 +497,22 @@ private:
                 hpMag[s] = static_cast<T>(rPow / denom);
             }
 
-            idealMags[0][k] = lpMag[0];
-            for (int b = 1; b < numBands_ - 1; ++b)
-                idealMags[b][k] = hpMag[b - 1] * lpMag[b];
-            idealMags[numBands_ - 1][k] = hpMag[numSplits - 1];
+            lpIdealMagsFlat_[k] = lpMag[0];                              // band 0 (lowpass)
+            for (int b = 1; b < nBands - 1; ++b)
+                lpIdealMagsFlat_[b * numBins + k] = hpMag[b - 1] * lpMag[b];
+            lpIdealMagsFlat_[(nBands - 1) * numBins + k] = hpMag[numSplits - 1];
         }
 
-        // Window Design & FIR Kernel generation
-        std::vector<T> timeResponse(lpFftSize_ + 2, T(0));
-        std::vector<T> firKernel(lpFftSize_, T(0));
-        
-        for (int b = 0; b < numBands_.load(); ++b)
+        // Window Design & FIR Kernel generation (pre-allocated scratch)
+        for (int b = 0; b < nBands; ++b)
         {
             // Prepare complex bins for inverse FFT (zero phase)
             for(int k = 0; k < numBins; ++k) {
-                timeResponse[2 * k] = idealMags[b][k];
-                timeResponse[2 * k + 1] = T(0);
+                lpTimeResponse_[2 * k] = lpIdealMagsFlat_[b * numBins + k];
+                lpTimeResponse_[2 * k + 1] = T(0);
             }
-            
-            lpFft_->inverse(timeResponse.data(), firKernel.data());
+
+            lpFft_->inverse(lpTimeResponse_.data(), lpFirKernel_.data());
             
             // Circular shift, windowing (Blackman), and zero-padding
             std::fill(lpFftIn_.begin(), lpFftIn_.end(), T(0));
@@ -524,7 +528,7 @@ private:
                 double N = static_cast<double>(firLength_ - 1);
                 double window = 0.42 - 0.5 * std::cos(2.0 * std::numbers::pi * n / N) + 0.08 * std::cos(4.0 * std::numbers::pi * n / N);
                 
-                lpFftIn_[i] = firKernel[srcIdx] * static_cast<T>(window);
+                lpFftIn_[i] = lpFirKernel_[srcIdx] * static_cast<T>(window);
             }
             
             // Forward FFT to get the usable overlap-save kernel
@@ -635,6 +639,9 @@ private:
     std::vector<T> lpMagnitudesFlat_; // [band * numBins * 2 + complexIdx]
     std::vector<T> lpPrevBlockFlat_;  // [ch * firLength_ + sampleIdx]
     std::vector<T> lpFftIn_, lpFftOut_, lpBandFft_, lpFftResult_;
+    std::vector<T> lpIdealMagsFlat_;  // [band * numBins + bin] ideal zero-phase mags (recompute scratch)
+    std::vector<T> lpTimeResponse_;   // IFFT input scratch (lpFftSize_ + 2)
+    std::vector<T> lpFirKernel_;      // IFFT output scratch (lpFftSize_)
 };
 
 } // namespace dspark

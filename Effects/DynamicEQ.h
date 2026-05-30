@@ -407,8 +407,11 @@ private:
     std::array<T, MaxBands> precomputedCos_ {};
     std::array<T, MaxBands> precomputedAlpha_ {};
 
-    std::array<Biquad<T>, MaxBands> bandDetector_ {};
-    std::array<Biquad<T>, MaxBands> bandFilter_ {};
+    // Biquads must span the class's full channel capacity (kMaxChannels); the
+    // default Biquad<T> is only 8 channels, which would index its per-channel state
+    // out of bounds when processing 9..16-channel (surround/immersive) audio.
+    std::array<Biquad<T, kMaxChannels>, MaxBands> bandDetector_ {};
+    std::array<Biquad<T, kMaxChannels>, MaxBands> bandFilter_ {};
     std::array<T, MaxBands> currentGainDb_ {};
     std::array<std::atomic<T>, MaxBands> meterGainDb_ {};
 

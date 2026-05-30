@@ -282,9 +282,14 @@ protected:
     void updatePreDelay() noexcept
     {
         if (spec_.sampleRate > 0)
-            preDelaySamples_.store(static_cast<int>(static_cast<T>(spec_.sampleRate)
-                                                * preDelayMs_.load(std::memory_order_relaxed) / T(1000)),
-                                  std::memory_order_relaxed);
+        {
+            // The pre-delay ring buffers hold 500 ms; clamp so an over-range pre-delay
+            // can't read past the buffer (RingBuffer::read would wrap to a wrong sample).
+            const int maxSamp = static_cast<int>(spec_.sampleRate * 0.5);
+            const int samp = static_cast<int>(static_cast<T>(spec_.sampleRate)
+                                              * preDelayMs_.load(std::memory_order_relaxed) / T(1000));
+            preDelaySamples_.store(std::clamp(samp, 0, maxSamp), std::memory_order_relaxed);
+        }
     }
 
     void applyIR()

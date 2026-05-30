@@ -96,7 +96,8 @@ public:
 
         // Calculate analytical end-state of the one-pole filter for the current block size:
         // alpha = exp(-N / (Fs * tau))
-        const T alpha = std::exp(static_cast<T>(-numSamples) / (sampleRate_ * smoothTimeSecs_));
+        const T alpha = static_cast<T>(std::exp(-static_cast<double>(numSamples)
+                                  / (sampleRate_ * static_cast<double>(smoothTimeSecs_))));
         const T endCompensationDb = targetDb + (compensationDb_ - targetDb) * alpha;
 
         // Convert dB to linear gain for interpolation

@@ -353,8 +353,9 @@ private:
         precomputedCos_[b]   = static_cast<T>(std::cos(w0));
         precomputedAlpha_[b] = static_cast<T>(std::sin(w0) / (2.0 * std::max(static_cast<double>(cfg.q), 0.001)));
 
-        auto calcCoeff = [fs](T ms) {
-            return T(1) - std::exp(T(-1) / (fs * std::max(ms, T(0.01)) / T(1000)));
+        auto calcCoeff = [fs](T ms) -> T {
+            const double tauSec = std::max(static_cast<double>(ms), 0.01) / 1000.0;
+            return static_cast<T>(1.0 - std::exp(-1.0 / (fs * tauSec)));
         };
 
         states_[b].aboveAtkCoeff = calcCoeff(cfg.aboveAttackMs);

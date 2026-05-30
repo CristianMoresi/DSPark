@@ -103,7 +103,6 @@ public:
         allpassFlat_.resize(static_cast<size_t>(MaxBands * kMaxSplits));
 
         // Initialize frequency smoothers
-        int nb = numBands_.load(std::memory_order_relaxed);
         initDefaultFrequencies();
         
         for (int i = 0; i < kMaxSplits; ++i)

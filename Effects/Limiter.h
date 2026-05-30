@@ -81,7 +81,10 @@ public:
         // Allocate for maximum possible lookahead to prevent RT-allocations later
         const int maxLookaheadSamples = static_cast<int>(sampleRate_ * kMaxLookaheadMs / 1000.0) + 1;
         
-        delayLines_.resize(static_cast<size_t>(numChannels));
+        // Use the clamped count: a degenerate numChannels (<= 0, or negative cast
+        // to size_t, or > kMaxChannels) must neither under-allocate — which would
+        // make processBlock index delayLines_ out of bounds — nor over-allocate.
+        delayLines_.resize(static_cast<size_t>(numChannels_));
         for (auto& dl : delayLines_)
             dl.prepare(maxLookaheadSamples * 2); // Double size for safety margin
 

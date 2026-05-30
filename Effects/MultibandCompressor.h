@@ -69,7 +69,10 @@ public:
     {
         if (!prepared_) return;
 
-        const int nCh = buffer.getNumChannels();
+        // Clamp to the per-band buffers' channel count (allocated for spec.numChannels):
+        // a buffer with more channels than prepare() saw would otherwise read the band
+        // buffers out of bounds in the summation loop below.
+        const int nCh = std::min(buffer.getNumChannels(), bandBuffers_[0].getNumChannels());
         const int nS  = buffer.getNumSamples();
         const int nb  = crossover_.getNumBands();
 

@@ -52,6 +52,31 @@ public:
     // Leave empty if the processor does not expose gain reduction.
     std::function<float()> gainReductionDbFn;
 
+    // --- Optional rich-GUI hooks (filled by factories that support them) -------
+
+    // Frequency-response magnitude (dB) for the interactive analyzer/EQ display.
+    // Fills magsDb[0..n) for the given frequencies, derived from the current
+    // parameter values (pure: no processor state needed).
+    std::function<void(const float* freqsHz, float* magsDb, int n,
+                       double sampleRate, const float* paramValues)> magnitudeFn;
+
+    // Optional faint "target" curve drawn behind the live one (e.g. a Dynamic EQ
+    // band's max boost/cut, where the draggable node lives). Same signature.
+    std::function<void(const float* freqsHz, float* magsDb, int n,
+                       double sampleRate, const float* paramValues)> targetMagnitudeFn;
+
+    // Draggable curve nodes (parameter indices; -1 = that axis is fixed).
+    // X drag -> freqParam (log), Y drag -> gainParam, mouse wheel -> qParam.
+    struct CurveNode { int freqParam = -1; int gainParam = -1; int qParam = -1; };
+    std::vector<CurveNode> curveNodes;
+
+    // Impulse-response loader (Convolution Reverb): receives a WAV file path.
+    std::function<void(const char* wavPath)> loadIRFn;
+
+    // Multiband display: fills crossover frequencies (Hz) and per-band gain
+    // reduction (dB, positive = attenuation); returns the active band count.
+    std::function<int(float* crossoverHz, float* bandGrDb, int maxBands)> multibandFn;
+
     // --- Builder helpers ---
 
     void addSlider(const char* n, float mn, float mx, float def,

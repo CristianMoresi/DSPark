@@ -88,6 +88,22 @@ public:
         if (!file_.is_open()) return false;
 
         info_ = info;
+
+        // Validate/normalize the requested format so we never emit a corrupt
+        // header. WAV supports PCM at 8/16/24/32-bit and IEEE float at 32/64-bit.
+        if (info_.numChannels < 1) return false;
+        if (info_.sampleRate <= 0.0) return false;
+        if (info_.isFloatingPoint)
+        {
+            if (info_.bitsPerSample != 32 && info_.bitsPerSample != 64)
+                return false;
+        }
+        else if (info_.bitsPerSample != 8 && info_.bitsPerSample != 16 &&
+                 info_.bitsPerSample != 24 && info_.bitsPerSample != 32)
+        {
+            return false;
+        }
+
         mode_ = Mode::Write;
         totalFramesWritten_ = 0;
 
@@ -281,6 +297,17 @@ private:
             }
         }
 
+        // If 'data' was encountered before 'fmt ' (legal but unusual chunk order),
+        // numSamples could not be derived at that point because the bit depth and
+        // channel count were still unknown. Recompute it now that both chunks have
+        // been parsed, using the stored data-chunk size.
+        if (hasFmt && hasData)
+        {
+            const int bytesPerFrame = (info_.bitsPerSample / 8) * info_.numChannels;
+            if (bytesPerFrame > 0)
+                info_.numSamples = static_cast<int64_t>(dataChunkSize_) / bytesPerFrame;
+        }
+
         return hasFmt && hasData;
     }
 
@@ -466,7 +493,13 @@ private:
                     out[f] = static_cast<float>(val) * (1.0f / 8388608.0f);
                 }
                 else if constexpr (Bits == 32 && std::is_same_v<T, int32_t>) {
-                    int32_t val = ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24);
+                    // Assemble in unsigned to avoid signed overflow UB on the high
+                    // byte (ptr[3] << 24 with the top bit set), then reinterpret.
+                    int32_t val = static_cast<int32_t>(
+                          static_cast<uint32_t>(ptr[0])
+                        | (static_cast<uint32_t>(ptr[1]) << 8)
+                        | (static_cast<uint32_t>(ptr[2]) << 16)
+                        | (static_cast<uint32_t>(ptr[3]) << 24));
                     out[f] = static_cast<float>(val) * (1.0f / 2147483648.0f);
                 }
                 else if constexpr (Bits == 32 && std::is_same_v<T, float>) {

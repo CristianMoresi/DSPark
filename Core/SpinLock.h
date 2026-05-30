@@ -37,12 +37,20 @@
 
 #include <atomic>
 
-#if defined(_MSC_VER) || defined(__SSE2__)
+#if (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))) \
+    || defined(__x86_64__) || defined(__i386__) || defined(__SSE2__)
+  // x86 / x86-64 (any compiler): PAUSE spin hint.
   #include <immintrin.h>
   #define DSPARK_SPIN_PAUSE() _mm_pause()
-#elif defined(__aarch64__) || defined(__ARM_NEON)
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+  // MSVC on ARM64: _mm_pause() does not exist here — use the YIELD intrinsic.
+  #include <intrin.h>
+  #define DSPARK_SPIN_PAUSE() __yield()
+#elif defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
+  // GCC/Clang on ARM: YIELD instruction.
   #define DSPARK_SPIN_PAUSE() __asm__ __volatile__("yield")
 #else
+  // WebAssembly / unknown: safe no-op.
   #define DSPARK_SPIN_PAUSE() ((void)0)
 #endif
 

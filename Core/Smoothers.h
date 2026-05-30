@@ -554,6 +554,9 @@ inline void Smoothers::StateVariableSmoother::reset(double sampleRate, float tim
     const float timeConstantSeconds = timeConstantMilliseconds / 1000.0f;
     float fc = timeConstantSeconds > 1e-9f ? 1.0f / (Constants::twoPi * timeConstantSeconds) : 0.0f;
     float fs = static_cast<float>(sampleRate);
+    // Clamp below Nyquist so tan(pi*fc/fs) stays finite/stable for very small
+    // time constants (otherwise the TPT prewarp blows up near fs/2).
+    fc = std::min(fc, fs * 0.49f);
 
     g = std::tan(Constants::pi * fc / fs);
     k = 1.0f / q; // CORREGIDO: TPT damping usa k = 1/Q. 
@@ -614,6 +617,7 @@ inline void Smoothers::ButterworthSmoother::reset(double sampleRate, float timeC
     const float timeConstantSeconds = timeConstantMilliseconds / 1000.0f;
     float fc = timeConstantSeconds > 1e-9f ? 1.0f / (Constants::twoPi * timeConstantSeconds) : 0.0f;
     float fs = static_cast<float>(sampleRate);
+    fc = std::min(fc, fs * 0.49f); // keep below Nyquist for a stable bilinear prewarp
     float tanw = std::tan(Constants::pi * fc / fs);
     float tanw2 = tanw * tanw;
 

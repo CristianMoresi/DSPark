@@ -142,12 +142,10 @@ public:
         }
         updateRmsWindow();
 
-        mixer_.prepare(spec);
-
-        if (detectorType_.load(std::memory_order_relaxed) == DetectorType::TruePeak)
-        {
-            prepareTruePeakDetector();
-        }
+        // Build the true-peak FIR ALWAYS (cheap, one-time). setDetector() then only
+        // publishes the atomic selection and never rebuilds coefficients at runtime,
+        // so switching to TruePeak can't race the audio thread reading tpCoeffs_.
+        prepareTruePeakDetector();
 
         reset();
     }
@@ -197,9 +195,16 @@ public:
      */
     [[nodiscard]] T processSample(T input, int channel) noexcept
     {
-        T thresh = thresholdSmooth_.getCurrentValue();
-        T ratio  = ratioSmooth_.getCurrentValue();
-        T knee   = kneeSmooth_.getCurrentValue();
+        // Sync atomic parameters into the smoothers here too: processBlock does this
+        // per block, but a processSample-only workflow would otherwise never see
+        // setThreshold()/setRatio()/setKnee() changes (the smoothers stayed frozen).
+        thresholdSmooth_.setTargetValue(threshold_.load(std::memory_order_relaxed));
+        ratioSmooth_.setTargetValue(std::max(ratio_.load(std::memory_order_relaxed), T(1)));
+        kneeSmooth_.setTargetValue(std::max(kneeWidth_.load(std::memory_order_relaxed), T(0)));
+
+        T thresh = thresholdSmooth_.getNextValue();
+        T ratio  = ratioSmooth_.getNextValue();
+        T knee   = kneeSmooth_.getNextValue();
         
         auto detType   = detectorType_.load(std::memory_order_relaxed);
         auto topo      = topology_.load(std::memory_order_relaxed);
@@ -265,7 +270,6 @@ public:
         thresholdSmooth_.skip();
         ratioSmooth_.skip();
         kneeSmooth_.skip();
-        mixer_.reset();
     }
 
     // =========================================================================
@@ -311,9 +315,9 @@ public:
     /** @brief Changes the level detection algorithm (Peak, RMS, TruePeak, Hilbert). */
     void setDetector(DetectorType type) noexcept
     {
+        // Coefficients are built once in prepare(); only publish the selection here
+        // (rebuilding would race the audio thread reading tpCoeffs_/tpState_).
         detectorType_.store(type, std::memory_order_relaxed);
-        if (type == DetectorType::TruePeak && sampleRate_ > 0)
-            prepareTruePeakDetector();
     }
 
     /** @brief Changes signal routing topology (FeedForward or FeedBack). */
@@ -407,9 +411,6 @@ protected:
         // Lookahead breaks causal logic in Feedback mode, so it is strictly disabled
         int activeLookahead = (topo == Topology::FeedBack) ? 0 : lookaheadSamples_;
 
-        // Push dry signal to parallel mixer if required
-        if (mixVal < T(1)) mixer_.pushDry(audio);
-
         for (int i = 0; i < nS; ++i)
         {
             T thresh = thresholdSmooth_.getNextValue();
@@ -466,22 +467,26 @@ protected:
                     input = audio.getChannel(ch)[i];
                 }
 
-                T output = input * outputGain;
-                fbLastOutput_[ch] = output;
-                audio.getChannel(ch)[i] = output;
+                T wet = input * outputGain;
+                fbLastOutput_[ch] = wet; // feedback detector reads the compressed signal
+
+                // Parallel (New York) mix done inline: the dry reference is `input`,
+                // which carries the SAME lookahead delay as the wet, so dry and wet
+                // stay phase-aligned (the previous DryWetMixer captured the UNDELAYED
+                // input and comb-filtered when lookahead + mix<1 were combined).
+                audio.getChannel(ch)[i] = (mixVal < T(1))
+                    ? (input * (T(1) - mixVal) + wet * mixVal)
+                    : wet;
 
                 if (ch == 0 || smoothedGR_Db < blockGR)
                     blockGR = smoothedGR_Db; // Track worst-case GR for metering
             }
 
             gainReductionDb_.store(blockGR, std::memory_order_relaxed);
-            
+
             // Auto-makeup envelope tracks slowly (~300ms)
             autoMakeupEnv_ = blockGR + autoMakeupCoeff_ * (autoMakeupEnv_ - blockGR);
         }
-
-        // Apply wet mix for parallel compression
-        if (mixVal < T(1)) mixer_.mixWet(audio, mixVal);
     }
 
     /** 
@@ -944,7 +949,6 @@ protected:
     std::array<TruePeakState, kMaxChannels> tpState_{}; ///< True-Peak state per channel.
     std::array<std::array<T, kTpTaps>, kTpPhases> tpCoeffs_{}; ///< Cached FIR coefficients.
 
-    DryWetMixer<T> mixer_; ///< Handles parallel compression routing.
     std::atomic<T> gainReductionDb_ { T(0) }; ///< Publicly readable Gain Reduction meter.
 };
 

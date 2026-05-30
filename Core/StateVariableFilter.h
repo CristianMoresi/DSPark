@@ -66,6 +66,15 @@ namespace dspark {
  * @class StateVariableFilter
  * @brief TPT State Variable Filter with simultaneous multi-output.
  *
+ * @note **Threading contract:** this is a modulation-oriented filter (its whole
+ * point is artifact-free per-sample cutoff changes from the audio thread, à la
+ * JUCE's dsp::StateVariableTPTFilter). Parameter setters are therefore intended
+ * to be called from the **audio thread** (or externally synchronised), NOT
+ * concurrently with process() from a different thread. Internal coefficients are
+ * intentionally non-atomic to keep the per-sample modulation path branch-free.
+ * For lock-free cross-thread cutoff control use LadderFilter (atomic) or wrap
+ * this filter with your own parameter queue.
+ *
  * @tparam T Sample type (float or double).
  */
 template <FloatType T>
@@ -123,10 +132,13 @@ public:
         const int nCh = std::min(buffer.getNumChannels(), kMaxChannels);
         const int nS  = buffer.getNumSamples();
 
-        for (int i = 0; i < nS; ++i)
+        // Channel-outer / sample-inner: keeps one channel's state and buffer hot
+        // in cache for the whole inner loop (cache-friendly, matches LadderFilter).
+        for (int ch = 0; ch < nCh; ++ch)
         {
-            for (int ch = 0; ch < nCh; ++ch)
-                buffer.getChannel(ch)[i] = processSample(buffer.getChannel(ch)[i], ch);
+            T* data = buffer.getChannel(ch);
+            for (int i = 0; i < nS; ++i)
+                data[i] = processSample(data[i], ch);
         }
     }
 
@@ -346,9 +358,13 @@ private:
                 //   boost: output = input + (A^2 - 1) * 2*Rbell * BP
                 //   cut:   output = input + (1 - 1/A^2) * 2*Rbell * BP
                 T k = T(2) * Rbell_;
+                // At the centre frequency 2*Rbell*bp == input, so the mix factor
+                // must be (A^2 - 1) to reach gain A^2 (boost) and (1/A^2 - 1) to
+                // reach gain 1/A^2 (cut). The cut term must be NEGATIVE — the old
+                // (1 - 1/A^2) was positive and boosted instead of cutting.
                 return (gainDb_ >= T(0))
                     ? input + (A_ * A_ - T(1)) * k * bp
-                    : input + (T(1) - T(1) / (A_ * A_)) * k * bp;
+                    : input + (T(1) / (A_ * A_) - T(1)) * k * bp;
             }
             case Mode::LowShelf:
             {

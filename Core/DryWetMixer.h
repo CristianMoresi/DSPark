@@ -40,13 +40,16 @@
 #include <algorithm>
 #include <cmath>
 
-// Optional: Define a restrict macro if DSPark doesn't already have one.
-#if defined(__clang__) || defined(__GNUC__)
+// DSPARK_RESTRICT is normally provided by SimdOps.h (pulled in via AudioBuffer.h).
+// Guard against redefinition so this header stays self-contained if included alone.
+#ifndef DSPARK_RESTRICT
+  #if defined(__clang__) || defined(__GNUC__)
     #define DSPARK_RESTRICT __restrict__
-#elif defined(_MSC_VER)
+  #elif defined(_MSC_VER)
     #define DSPARK_RESTRICT __restrict
-#else
+  #else
     #define DSPARK_RESTRICT
+  #endif
 #endif
 
 namespace dspark {
@@ -84,6 +87,8 @@ public:
     void reset() noexcept
     {
         dryBuffer_.clear();
+        if (delayHist_.getNumSamples() > 0) delayHist_.clear();
+        histPos_ = 0;
         currentMix_ = T(-1); // Forces immediate jump on first use
     }
 
@@ -95,6 +100,30 @@ public:
     {
         mixRule_ = rule;
     }
+
+    /**
+     * @brief Delays the captured dry signal to compensate for an effect's
+     *        internal latency (e.g. an oversampler's FIR group delay).
+     *
+     * When the wet path introduces @p samples of delay, the dry copy must be
+     * delayed by the same amount; otherwise blending dry+wet (mix < 1, Delta or
+     * adaptive modes) produces comb filtering. Pass 0 to disable (default).
+     *
+     * @note **NOT Real-Time Safe.** Allocates the internal delay history.
+     *       Call from the setup thread (typically right after prepare()).
+     * @param samples Latency in samples at this mixer's sample rate (>= 0).
+     */
+    void setLatencyCompensation(int samples)
+    {
+        samples = std::max(0, samples);
+        if (samples == latencySamples_) return;
+        latencySamples_ = samples;
+        delayHist_.resize(dryBuffer_.getNumChannels(), samples);
+        histPos_ = 0;
+    }
+
+    /** @brief Returns the configured dry-path latency compensation in samples. */
+    [[nodiscard]] int getLatencyCompensation() const noexcept { return latencySamples_; }
 
     /**
      * @brief Captures a snapshot of the dry (unprocessed) signal.
@@ -109,11 +138,35 @@ public:
         const int chCount  = std::min(input.getNumChannels(), dryBuffer_.getNumChannels());
         const int nSamples = std::min(input.getNumSamples(), dryBuffer_.getNumSamples());
 
-        for (int ch = 0; ch < chCount; ++ch)
+        if (latencySamples_ <= 0)
         {
-            const T* DSPARK_RESTRICT src = input.getChannel(ch);
-            T* DSPARK_RESTRICT dst       = dryBuffer_.getChannel(ch);
-            std::copy_n(src, nSamples, dst);
+            for (int ch = 0; ch < chCount; ++ch)
+            {
+                const T* DSPARK_RESTRICT src = input.getChannel(ch);
+                T* DSPARK_RESTRICT dst       = dryBuffer_.getChannel(ch);
+                std::copy_n(src, nSamples, dst);
+            }
+        }
+        else
+        {
+            // Latency-compensated capture: route the dry through a per-channel
+            // circular delay of exactly latencySamples_ so it stays time-aligned
+            // with a wet path that incurs the same delay.
+            const int D = latencySamples_;
+            for (int ch = 0; ch < chCount; ++ch)
+            {
+                const T* DSPARK_RESTRICT src = input.getChannel(ch);
+                T* DSPARK_RESTRICT dst       = dryBuffer_.getChannel(ch);
+                T* DSPARK_RESTRICT hist      = delayHist_.getChannel(ch);
+                int pos = histPos_;
+                for (int i = 0; i < nSamples; ++i)
+                {
+                    dst[i]    = hist[pos];   // sample written D steps ago
+                    hist[pos] = src[i];
+                    if (++pos == D) pos = 0;
+                }
+            }
+            histPos_ = (histPos_ + nSamples) % D;
         }
 
         capturedSamples_ = nSamples;
@@ -202,7 +255,12 @@ public:
 private:
     AudioBuffer<T, MaxChannels> dryBuffer_;
     int capturedSamples_ = 0;
-    
+
+    // Optional dry-path latency compensation (circular delay). Disabled (0) by default.
+    AudioBuffer<T, MaxChannels> delayHist_;
+    int latencySamples_ = 0;
+    int histPos_        = 0;
+
     MixRule mixRule_ = MixRule::Linear;
     T currentMix_    = T(-1); // Internal state for parameter smoothing
 };

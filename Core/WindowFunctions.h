@@ -253,17 +253,13 @@ struct WindowFunctions
     static void apply(T* signal, const T* window, int size) noexcept
     {
         assert(signal != nullptr && window != nullptr);
-        
-        // CRITICAL: Validate 32-byte alignment in Debug to prevent silent UB
-        assert(reinterpret_cast<std::uintptr_t>(signal) % 32 == 0 && "Signal buffer is not 32-byte aligned!");
-        assert(reinterpret_cast<std::uintptr_t>(window) % 32 == 0 && "Window buffer is not 32-byte aligned!");
 
-        // C++20 hint to force SIMD vectorization
-        auto* __restrict alignedSignal = std::assume_aligned<32>(signal);
-        const auto* __restrict alignedWindow = std::assume_aligned<32>(window);
-
+        // No alignment assumption: std::assume_aligned<32> on a pointer that is
+        // not actually 32-byte aligned is undefined behaviour, and these buffers
+        // come from arbitrary callers (sub-views, vectors -> typically 16-byte).
+        // The simple element-wise loop auto-vectorizes fine without that risk.
         for (int i = 0; i < size; ++i)
-            alignedSignal[i] *= alignedWindow[i];
+            signal[i] *= window[i];
     }
 
     /**
@@ -281,15 +277,12 @@ struct WindowFunctions
     [[nodiscard]] static T coherentGain(const T* window, int size) noexcept
     {
         assert(window != nullptr);
-        assert(reinterpret_cast<std::uintptr_t>(window) % 32 == 0 && "Window buffer is not 32-byte aligned!");
         if (size <= 0) return T(0);
 
-        const auto* __restrict alignedWindow = std::assume_aligned<32>(window);
         T sum = T(0);
-        
         for (int i = 0; i < size; ++i)
-            sum += alignedWindow[i];
-            
+            sum += window[i];
+
         return sum / static_cast<T>(size);
     }
 
@@ -307,15 +300,12 @@ struct WindowFunctions
     [[nodiscard]] static T energyGain(const T* window, int size) noexcept
     {
         assert(window != nullptr);
-        assert(reinterpret_cast<std::uintptr_t>(window) % 32 == 0 && "Window buffer is not 32-byte aligned!");
         if (size <= 0) return T(0);
 
-        const auto* __restrict alignedWindow = std::assume_aligned<32>(window);
         T sumSq = T(0);
-        
         for (int i = 0; i < size; ++i)
-            sumSq += alignedWindow[i] * alignedWindow[i];
-            
+            sumSq += window[i] * window[i];
+
         return std::sqrt(sumSq / static_cast<T>(size));
     }
 

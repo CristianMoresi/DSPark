@@ -24,6 +24,7 @@
 
 #include "DspMath.h"
 #include "AudioSpec.h"
+#include "AudioBuffer.h"
 #include "Phasor.h"
 
 #include <algorithm>
@@ -276,6 +277,22 @@ public:
     {
         for (int i = 0; i < numSamples; ++i)
             output[i] = getSample();
+    }
+
+    /**
+     * @brief Fills every channel of the view with the generated waveform.
+     * Satisfies the GeneratorProcessor concept (mono source → all channels equal).
+     */
+    void generateBlock(AudioBufferView<T> buffer) noexcept
+    {
+        const int nCh = buffer.getNumChannels();
+        const int nS  = buffer.getNumSamples();
+        for (int i = 0; i < nS; ++i)
+        {
+            const T s = getSample();
+            for (int ch = 0; ch < nCh; ++ch)
+                buffer.getChannel(ch)[i] = s;
+        }
     }
 
     /**

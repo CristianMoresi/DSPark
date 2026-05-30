@@ -55,7 +55,7 @@ template <FloatType T>
 class Limiter
 {
 public:
-    virtual ~Limiter() = default;
+    ~Limiter() = default; // non-virtual: leaf class (no virtual dispatch)
 
     // -- Lifecycle --------------------------------------------------------------
 
@@ -71,8 +71,10 @@ public:
     void prepare(double sampleRate, int numChannels = 2, double initialLookaheadMs = 2.0)
     {
         sampleRate_ = sampleRate;
-        numChannels_ = numChannels;
-        
+        // tpState_ is a fixed std::array<…, kMaxChannels>; clamp so true-peak
+        // detection can never index it out of bounds for high channel counts.
+        numChannels_ = std::clamp(numChannels, 1, kMaxChannels);
+
         // Caching inverse sample rate for fast math in hot paths
         invSampleRate_ = T(1) / static_cast<T>(sampleRate_);
 
@@ -145,8 +147,18 @@ public:
                 if (chPeak > peak) peak = chPeak;
             }
 
-            // Phase 2: Gain envelope calculation
-            T targetGain = (peak > ceiling) ? ceiling / peak : T(1);
+            // Phase 2: Peak-hold over the lookahead window, then gain envelope.
+            // The gain reduction for a transient must persist until that transient
+            // reaches the (delayed) output lookaheadSamples_ later; otherwise an
+            // isolated peak would be output after the envelope has already released
+            // and could exceed the ceiling. Holding the detected peak for the
+            // look-ahead duration guarantees the brickwall without an instantaneous
+            // (clicky) attack — the one-pole attack still reaches ~99% over the window.
+            if (peak >= heldPeak_)      { heldPeak_ = peak; peakHoldCounter_ = lookaheadSamples_; }
+            else if (peakHoldCounter_ > 0) { --peakHoldCounter_; }
+            else                          { heldPeak_ = peak; }
+
+            T targetGain = (heldPeak_ > ceiling) ? ceiling / heldPeak_ : T(1);
             smoothGain(targetGain, adaptive, relMs);
 
             // Phase 3: Apply gain and safety clip
@@ -196,6 +208,8 @@ public:
         tpState_ = {};
         currentGain_ = T(1);
         limitingDuration_ = 0;
+        heldPeak_ = T(0);
+        peakHoldCounter_ = 0;
         ceilingSmooth_.skip();
     }
 
@@ -429,6 +443,11 @@ protected:
 
     T currentGain_ = T(1);
     int limitingDuration_ = 0;
+
+    // Look-ahead peak hold (brickwall guarantee): holds the detected peak for
+    // lookaheadSamples_ so the gain stays reduced until the peak is output.
+    T heldPeak_ = T(0);
+    int peakHoldCounter_ = 0;
 
     std::vector<RingBuffer<T>> delayLines_;
 };

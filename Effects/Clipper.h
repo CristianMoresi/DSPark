@@ -83,6 +83,10 @@ public:
             oversampler_.reset();
         }
 
+        // Align the dry copy with the latent (oversampled) wet path so that a
+        // dry/wet blend below 100% does not comb-filter.
+        mixer_.setLatencyCompensation(oversampler_ ? oversampler_->getLatency() : 0);
+
         for (int ch = 0; ch < kMaxChannels; ++ch)
             slewPrev_[ch] = T(0);
     }

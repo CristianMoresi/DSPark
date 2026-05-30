@@ -83,6 +83,10 @@ public:
      * @warning Changing order during playback may result in audio clicks, as filter
      * states are not dynamically crossfaded. Best used during prepare() or silence.
      *
+     * @note Order 1 = 1-pole (6 dB/oct). Orders >= 2 use floor(order/2) cascaded
+     *       Butterworth biquads, so ODD orders behave like the next lower even
+     *       order (e.g. 3 == 2, 5 == 4). Prefer 1 or even values for predictable slopes.
+     *
      * @param order Filter order (1–10).
      */
     void setOrder(int order) noexcept

@@ -470,7 +470,8 @@ namespace harmony
      */
     struct DiatonicChord
     {
-        std::array<char, 16> name;      ///< NUL-terminated buffer ("m7", "maj7"...). Zero alloc.
+        std::array<char, 24> name;      ///< NUL-terminated buffer ("m7", "maj7"...). Zero alloc.
+                                        ///< Sized for the longest symbol "m(maj7)(9)(11)(13)" (18+NUL).
         std::array<int, 7>   intervals; ///< Intervals in semitones (R-3-5-7-9-11-13). -1 = absent.
 
         /**
@@ -514,7 +515,7 @@ namespace harmony
 
         auto buildName = [&](std::string_view baseName, ChordLevel lvl)
         {
-            char buf[16]{}; // Match struct array size
+            char buf[24]{}; // Match DiatonicChord::name capacity (fits longest symbol)
             std::size_t pos = 0;
             detail::copy(buf + pos, baseName, sizeof(buf) - pos);
             pos += baseName.size();

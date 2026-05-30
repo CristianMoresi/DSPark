@@ -98,6 +98,40 @@ public:
     }
 
     /**
+     * @brief Processes a single sample on one channel (Thread-Safe).
+     *
+     * Convenience per-sample entry point mirroring Biquad/StateVariableFilter.
+     * For bulk processing prefer processBlock(), which hoists the coefficient
+     * computation out of the per-sample loop.
+     *
+     * @param input   Input sample.
+     * @param channel Channel index in [0, kMaxChannels).
+     * @return Filtered sample (returns @p input unchanged if @p channel is out of range).
+     */
+    [[nodiscard]] T processSample(T input, int channel) noexcept
+    {
+        if (channel < 0 || channel >= kMaxChannels) return input;
+        DenormalGuard guard;
+
+        const T g     = g_.load(std::memory_order_relaxed);
+        const T res   = resonance_.load(std::memory_order_relaxed);
+        const T drive = drive_.load(std::memory_order_relaxed);
+        const BlockCoeffs c = makeBlockCoeffs(g, res);
+        ChannelState& s = state_[channel];
+
+        switch (mode_.load(std::memory_order_relaxed))
+        {
+            case Mode::LP6:  return processSampleInternal<Mode::LP6>(input, s, c, drive);
+            case Mode::LP12: return processSampleInternal<Mode::LP12>(input, s, c, drive);
+            case Mode::LP18: return processSampleInternal<Mode::LP18>(input, s, c, drive);
+            case Mode::LP24: return processSampleInternal<Mode::LP24>(input, s, c, drive);
+            case Mode::BP12: return processSampleInternal<Mode::BP12>(input, s, c, drive);
+            case Mode::HP24: return processSampleInternal<Mode::HP24>(input, s, c, drive);
+        }
+        return input;
+    }
+
+    /**
      * @brief Clears the internal integrators state.
      * * Should be called when playback stops or continuity is broken to prevent clicks.
      */
@@ -190,17 +224,41 @@ private:
     /**
      * @brief Core block processing routine isolated per mode.
      */
+    /** @brief g/res-derived coefficients, constant for the whole block. */
+    struct BlockCoeffs
+    {
+        T G, G2, G3, G4, ig, k, invFbDen;
+    };
+
+    /** @brief Derives the block-constant coefficients from g and resonance. */
+    [[nodiscard]] static BlockCoeffs makeBlockCoeffs(T g, T res) noexcept
+    {
+        BlockCoeffs c;
+        c.G   = g / (T(1) + g);
+        c.G2  = c.G * c.G;
+        c.G3  = c.G2 * c.G;
+        c.G4  = c.G3 * c.G;
+        c.ig  = T(1) / (T(1) + g);
+        c.k   = res * T(4);                         // k = 4 -> self-oscillation
+        c.invFbDen = T(1) / (T(1) + c.k * c.G4);    // zero-delay loop denominator
+        return c;
+    }
+
     template <Mode FilterMode>
     void processBlockInternal(AudioBufferView<T>& buffer, int nCh, int nS, T g, T res, T drive) noexcept
     {
+        // Precompute the block-constant coefficients ONCE (previously these two
+        // divisions ran for every sample of every channel).
+        const BlockCoeffs c = makeBlockCoeffs(g, res);
+
         for (int ch = 0; ch < nCh; ++ch)
         {
             auto* channelData = buffer.getChannel(ch);
             auto& state = state_[ch];
-            
+
             for (int i = 0; i < nS; ++i)
             {
-                channelData[i] = processSampleInternal<FilterMode>(channelData[i], state, g, res, drive);
+                channelData[i] = processSampleInternal<FilterMode>(channelData[i], state, c, drive);
             }
         }
     }
@@ -211,37 +269,27 @@ private:
      * inlines and eliminates branches inside the audio processing loop.
      */
     template <Mode FilterMode>
-    [[nodiscard]] inline T processSampleInternal(T input, ChannelState& s, T g, T res, T drive) noexcept
+    [[nodiscard]] inline T processSampleInternal(T input, ChannelState& s, const BlockCoeffs& c, T drive) noexcept
     {
-        // TPT integrator coefficients
-        const T G = g / (T(1) + g);
-        const T G2 = G * G;
-        const T G3 = G2 * G;
-        const T G4 = G3 * G;
-        const T ig = T(1) / (T(1) + g);
-
         // Estimate LP24 output from integrators (Zero-Delay logic)
-        T Sest = G3 * ig * s.z[0]
-               + G2 * ig * s.z[1]
-               + G  * ig * s.z[2]
-               +      ig * s.z[3];
-
-        // Resonance feedback coefficient (k = 4 -> self oscillation)
-        const T k = res * T(4);
+        T Sest = c.G3 * c.ig * s.z[0]
+               + c.G2 * c.ig * s.z[1]
+               + c.G  * c.ig * s.z[2]
+               +        c.ig * s.z[3];
 
         // Apply drive to estimated feedback (ZDF non-linear approximation)
         T fbSignal = Sest;
         if (drive > T(1))
             fbSignal = fastTanh(fbSignal * drive) / drive;
 
-        // Resolve zero-delay loop
-        const T u = (input - k * fbSignal) / (T(1) + k * G4);
+        // Resolve zero-delay loop (denominator precomputed once per block)
+        const T u = (input - c.k * fbSignal) * c.invFbDen;
 
         // Process 4 cascading integrators
         T x = u;
         for (int i = 0; i < 4; ++i)
         {
-            T v = (x - s.z[i]) * G;
+            T v = (x - s.z[i]) * c.G;
             T y = v + s.z[i];
             s.z[i] = y + v;
             s.stage[i] = y;

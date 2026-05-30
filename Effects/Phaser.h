@@ -55,7 +55,7 @@ template <FloatType T>
 class Phaser
 {
 public:
-    virtual ~Phaser() = default;
+    ~Phaser() = default; // non-virtual: leaf class (no virtual dispatch)
 
     static constexpr int kMaxStages = 12;
 
@@ -72,7 +72,7 @@ public:
 
         lfo_.prepare(spec.sampleRate);
         lfo_.setFrequency(rate_.load(std::memory_order_relaxed));
-        lfo_.setWaveform(lfoWaveform_);
+        lfo_.setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
 
         // Calculate smoothing coefficient (approx 50ms response time)
         smoothCoef_ = T(1) - std::exp(static_cast<T>(-2.0 * std::numbers::pi * 20.0) / static_cast<T>(spec_.sampleRate));
@@ -96,6 +96,11 @@ public:
         const int stagesVal = numStages_.load(std::memory_order_relaxed);
         const T minF        = minFreq_.load(std::memory_order_relaxed);
         const T maxF        = maxFreq_.load(std::memory_order_relaxed);
+
+        // Apply LFO rate/waveform on the AUDIO thread (the setters only publish
+        // atomics) so the non-atomic Oscillator state is never written concurrently.
+        lfo_.setFrequency(rate_.load(std::memory_order_relaxed));
+        lfo_.setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
 
         mixer_.pushDry(buffer);
 
@@ -186,8 +191,7 @@ public:
     void setRate(T hz) noexcept
     {
         hz = std::clamp(hz, T(0.01), T(20));
-        rate_.store(hz, std::memory_order_relaxed);
-        lfo_.setFrequency(hz);
+        rate_.store(hz, std::memory_order_relaxed); // applied on the audio thread
     }
 
     /**
@@ -262,8 +266,7 @@ public:
      */
     void setLfoWaveform(typename Oscillator<T>::Waveform wf) noexcept
     {
-        lfoWaveform_ = wf;
-        lfo_.setWaveform(wf);
+        lfoWaveform_.store(wf, std::memory_order_relaxed); // applied on the audio thread
     }
 
     /** @brief Retrieves the active stage count. @return Number of stages. */
@@ -285,7 +288,7 @@ protected:
     std::atomic<T> minFreq_  { T(200) };
     std::atomic<T> maxFreq_  { T(6000) };
     std::atomic<int> numStages_ { 4 };
-    typename Oscillator<T>::Waveform lfoWaveform_ = Oscillator<T>::Waveform::Sine;
+    std::atomic<typename Oscillator<T>::Waveform> lfoWaveform_ { Oscillator<T>::Waveform::Sine };
 
     // Smoothed state parameters
     T currentDepth_ { T(0.8) };

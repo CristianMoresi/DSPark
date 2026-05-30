@@ -257,23 +257,11 @@ namespace dspark
                 }
             };
 
-            struct AtomicCheck
-            {
-                AtomicCheck()
-                {
-                    if (!std::atomic<float>::is_always_lock_free)
-                    {
-                        #if defined(_MSC_VER)
-                        #pragma message("WARNING: std::atomic<float> is not guaranteed to be lock-free on this platform.")
-                        #else
-                        #warning "std::atomic<float> is not guaranteed to be lock-free on this platform."
-                        #endif
-                    }
-                }
-            };
-
-            inline AtomicCheck s_atomicCheck;
-        } 
+            // NOTE: lock-free safety is checked at runtime per Generator instance
+            // (checkLockFree() -> m_isSafeToRun). A preprocessor #warning here would
+            // fire on every translation unit unconditionally (the directive ignores
+            // the runtime `if`), so it is intentionally omitted.
+        }
 
         //==============================================================================
         // Public API
@@ -503,7 +491,10 @@ namespace dspark
 
                     if (m_triggerNext.exchange(false, std::memory_order_acquire))
                     {
-                        m_targetValue = currentMin + ((continuousNoise * static_cast<Real>(0.5)) + static_cast<Real>(0.5)) * (currentMax - currentMin);
+                        // Clamp to [-1,1] before mapping, matching generateNewTarget()
+                        // (pink noise can momentarily exceed unity).
+                        const Real cn = std::clamp(continuousNoise, static_cast<Real>(-1), static_cast<Real>(1));
+                        m_targetValue = currentMin + ((cn * static_cast<Real>(0.5)) + static_cast<Real>(0.5)) * (currentMax - currentMin);
                         if (quantStep > 0.0f) m_targetValue = std::round(m_targetValue / quantStep) * quantStep;
                     }
 

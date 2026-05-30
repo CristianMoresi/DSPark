@@ -150,8 +150,8 @@ public:
      */
     void process(const T* input, T* output, int numSamples) noexcept
     {
-        assert(numSamples <= blockSize_);
-
+        // numSamples may exceed blockSize_: the sample loop triggers a partition
+        // transform at each block boundary, so arbitrary lengths are handled.
         for (int i = 0; i < numSamples; ++i)
         {
             inputBuffer_[static_cast<size_t>(blockSize_ + inputPos_)] = input[i];
@@ -160,7 +160,7 @@ public:
             ++inputPos_;
             if (inputPos_ >= blockSize_)
             {
-                processBlock();
+                processPartitionBlock();
                 inputPos_ = 0;
 
                 std::copy_n(outputBuffer_.begin() + blockSize_, static_cast<size_t>(blockSize_),
@@ -186,7 +186,7 @@ public:
             ++inputPos_;
             if (inputPos_ >= blockSize_)
             {
-                processBlock();
+                processPartitionBlock();
                 inputPos_ = 0;
 
                 std::copy_n(outputBuffer_.begin() + blockSize_, static_cast<size_t>(blockSize_),
@@ -253,7 +253,7 @@ private:
      * 3. Multiply-accumulate all IR partitions with corresponding delayed inputs.
      * 4. Inverse FFT to get the output block.
      */
-    void processBlock() noexcept
+    void processPartitionBlock() noexcept
     {
         // Forward FFT of the input buffer [previous block | current block]
         fft_->forward(inputBuffer_.data(), fftInput_.data());
@@ -294,7 +294,7 @@ private:
     /// Processes interleaved [re, im, re, im, ...] data for `bins` complex bins.
     static void complexMulAccum(const T* a, const T* b, T* accum, int bins) noexcept
     {
-#if defined(DSPARK_FFT_SSE2)
+#if defined(DSPARK_FFT_SSE3)   // x86/x64: SSE float path (was a dead DSPARK_FFT_SSE2 typo)
         if constexpr (std::is_same_v<T, float>)
         {
             // Sign mask: negate real positions for (re1*re2 - im1*im2)

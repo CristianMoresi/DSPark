@@ -170,11 +170,15 @@ struct alignas(32) BiquadCoeffs
     [[nodiscard]] static BiquadCoeffs makeLowShelf(double sampleRate, double freq, double gainDb, double slope = 1.0) noexcept
     {
         freq = std::clamp(freq, 1.0, sampleRate * 0.499);
+        // Shelf slope S must stay in (0, 1]: for S > 1 the radicand below goes
+        // negative and std::sqrt yields NaN coefficients that poison the audio.
+        slope = std::clamp(slope, 0.0001, 1.0);
         const double A     = std::pow(10.0, gainDb / 40.0);
         const double w0    = 2.0 * std::numbers::pi * freq / sampleRate;
         const double cosw0 = std::cos(w0);
         const double sinw0 = std::sin(w0);
-        const double alpha = sinw0 / 2.0 * std::sqrt((A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0);
+        const double radicand = (A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0;
+        const double alpha = sinw0 / 2.0 * std::sqrt(std::max(0.0, radicand));
         const double twoSqrtAAlpha = 2.0 * std::sqrt(A) * alpha;
 
         const double a0 = (A + 1.0) + (A - 1.0) * cosw0 + twoSqrtAAlpha;
@@ -197,11 +201,15 @@ struct alignas(32) BiquadCoeffs
     [[nodiscard]] static BiquadCoeffs makeHighShelf(double sampleRate, double freq, double gainDb, double slope = 1.0) noexcept
     {
         freq = std::clamp(freq, 1.0, sampleRate * 0.499);
+        // Shelf slope S must stay in (0, 1]: for S > 1 the radicand below goes
+        // negative and std::sqrt yields NaN coefficients that poison the audio.
+        slope = std::clamp(slope, 0.0001, 1.0);
         const double A     = std::pow(10.0, gainDb / 40.0);
         const double w0    = 2.0 * std::numbers::pi * freq / sampleRate;
         const double cosw0 = std::cos(w0);
         const double sinw0 = std::sin(w0);
-        const double alpha = sinw0 / 2.0 * std::sqrt((A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0);
+        const double radicand = (A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0;
+        const double alpha = sinw0 / 2.0 * std::sqrt(std::max(0.0, radicand));
         const double twoSqrtAAlpha = 2.0 * std::sqrt(A) * alpha;
 
         const double a0 = (A + 1.0) - (A - 1.0) * cosw0 + twoSqrtAAlpha;
@@ -451,10 +459,13 @@ public:
     // (e.g. CrossoverFilter::AllPassChain). Copying is left deleted on
     // purpose: it would imply two threads observing the same staged coefficient
     // dirty flag, which is semantically ambiguous and not needed in practice.
+    // Moves only happen during setup (single-threaded relocation into a
+    // container), so the seqlock counter is simply reset to an even value.
     Biquad(Biquad&& other) noexcept
         : activeCoeffs_(other.activeCoeffs_),
           stagedCoeffs_(other.stagedCoeffs_),
           coeffsDirty_(other.coeffsDirty_.load(std::memory_order_relaxed)),
+          coeffsSeq_(0),
           state_(other.state_)
     {}
 
@@ -465,6 +476,7 @@ public:
         stagedCoeffs_ = other.stagedCoeffs_;
         coeffsDirty_.store(other.coeffsDirty_.load(std::memory_order_relaxed),
                            std::memory_order_relaxed);
+        coeffsSeq_.store(0, std::memory_order_relaxed);
         state_ = other.state_;
         return *this;
     }
@@ -483,7 +495,13 @@ public:
      */
     void setCoeffs(const BiquadCoeffs<T>& c) noexcept
     {
+        // Seqlock publish (single producer). An odd sequence number marks a
+        // write in progress; the audio thread retries its read while odd or if
+        // the counter moved, so a concurrent update can never be observed as a
+        // torn coefficient set (mixing a1 of one filter with a2 of another).
+        coeffsSeq_.fetch_add(1, std::memory_order_acq_rel);   // -> odd
         stagedCoeffs_ = c;
+        coeffsSeq_.fetch_add(1, std::memory_order_release);   // -> even
         coeffsDirty_.store(true, std::memory_order_release);
     }
 
@@ -505,7 +523,17 @@ public:
     {
         if (coeffsDirty_.exchange(false, std::memory_order_acquire))
         {
-            activeCoeffs_ = stagedCoeffs_;
+            // Seqlock read: retry on a torn/in-progress publish. The writer's
+            // critical section is a 5-float copy, so this converges in at most
+            // a couple of iterations even under a busy GUI thread.
+            BiquadCoeffs<T> tmp;
+            unsigned s0, s1;
+            do {
+                s0  = coeffsSeq_.load(std::memory_order_acquire);
+                tmp = stagedCoeffs_;
+                s1  = coeffsSeq_.load(std::memory_order_acquire);
+            } while ((s0 & 1u) != 0u || s0 != s1);
+            activeCoeffs_ = tmp;
             return true;
         }
         return false;
@@ -597,7 +625,8 @@ private:
     BiquadCoeffs<T> activeCoeffs_ {};
     BiquadCoeffs<T> stagedCoeffs_ {};
     std::atomic<bool> coeffsDirty_{false};
-    
+    std::atomic<unsigned> coeffsSeq_{0}; ///< Seqlock counter for tear-free staged publish.
+
     std::array<State, MaxChannels> state_ {};
 };
 

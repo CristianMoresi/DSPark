@@ -21,13 +21,16 @@
 
 #include <cassert>
 
-// Compiler-specific restrict macro to guarantee auto-vectorization in hot paths
-#if defined(__clang__) || defined(__GNUC__)
+// DSPARK_RESTRICT is normally provided by SimdOps.h (via AudioBuffer.h).
+// Guard against redefinition so this header stays self-contained if included alone.
+#ifndef DSPARK_RESTRICT
+  #if defined(__clang__) || defined(__GNUC__)
     #define DSPARK_RESTRICT __restrict__
-#elif defined(_MSC_VER)
+  #elif defined(_MSC_VER)
     #define DSPARK_RESTRICT __restrict
-#else
+  #else
     #define DSPARK_RESTRICT
+  #endif
 #endif
 
 namespace dspark {
@@ -83,7 +86,7 @@ struct MidSide
      *
      * @param buffer Stereo buffer (2 channels). Modified in-place.
      */
-    static void encode(AudioBufferView<T>& buffer) noexcept
+    static void encode(AudioBufferView<T> buffer) noexcept
     {
         assert(buffer.getNumChannels() >= 2);
         
@@ -110,7 +113,7 @@ struct MidSide
      *
      * @param buffer Stereo buffer (2 channels, containing M/S). Modified in-place.
      */
-    static void decode(AudioBufferView<T>& buffer) noexcept
+    static void decode(AudioBufferView<T> buffer) noexcept
     {
         assert(buffer.getNumChannels() >= 2);
 

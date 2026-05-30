@@ -64,8 +64,12 @@ public:
         : factor_(factor), quality_(quality)
     {
         assert(factor >= 1 && (factor & (factor - 1)) == 0 && "Factor must be a power of 2");
+        assert(factor <= (1 << kMaxStages) && "Factor must be <= 16 (kMaxStages stages)");
+        // Clamp for Release safety: only kMaxStages polyphase stages exist, so a
+        // factor above 2^kMaxStages would index filters_ out of bounds.
+        factor_ = std::clamp(factor, 1, 1 << kMaxStages);
         numStages_ = 0;
-        int f = factor;
+        int f = factor_;
         while (f > 1) { ++numStages_; f >>= 1; }
     }
 
@@ -117,11 +121,13 @@ public:
     {
         if (numStages_ == 0) return 0;
         const int halfOrder = (tapsForQuality(quality_) - 1) / 2;
-        int totalAtMaxRate = 0;
-        for (int stage = 0; stage < numStages_; ++stage)
-            totalAtMaxRate += 2 * halfOrder * (factor_ / (1 << (stage + 1)));
-        
-        return (totalAtMaxRate + factor_ - 1) / factor_;
+        // Exact up->down round-trip group delay at the base rate. Each 2x half-band
+        // stage contributes (halfOrder+1) high-rate samples on the way up and the
+        // same on the way down; cascaded over numStages_ and referred to the base
+        // rate this telescopes to 2*(halfOrder+1)*(factor-1)/factor. Verified
+        // sample-exact against an impulse round-trip for factors 2/4/8/16 and all
+        // quality presets. (halfOrder+1 and factor are powers of two -> exact.)
+        return 2 * (halfOrder + 1) * (factor_ - 1) / factor_;
     }
 
     /**
@@ -195,7 +201,8 @@ private:
      */
     struct PolyphaseHalfBand
     {
-        std::vector<T> evenTaps; 
+        std::vector<T> evenTaps;   ///< Even-index polyphase taps (upsample FIR phase).
+        std::vector<T> fullTaps;   ///< Full symmetric half-band (downsample, exact alignment).
         T centerTap = T(0);
         int halfOrder = 0;
         int delaySamples = 0;
@@ -220,32 +227,49 @@ private:
         void design(int taps, T beta, int numChannels, int maxBlockSamples)
         {
             halfOrder = (taps - 1) / 2;
-            delaySamples = halfOrder / 2;
+            // INVARIANT: the polyphase split below collects the array-even taps,
+            // which coincide with the non-zero (odd-from-centre) half-band taps
+            // ONLY when halfOrder is odd. All quality presets (taps 31/63/127/255
+            // → halfOrder 15/31/63/127) satisfy this. If you add a preset, keep
+            // (taps-1)/2 odd or the filter degenerates to silence.
+            assert((halfOrder & 1) == 1 && "half-band polyphase requires odd halfOrder");
+            // Pure-delay alignment for the centre-tap (odd) phase. With the full
+            // even branch (halfOrder+1 taps, group delay (halfOrder)/2 = numTaps/2
+            // base samples) the centre sample must sit numTaps/2 = (halfOrder+1)/2
+            // samples into the window to stay phase-aligned with the even phase.
+            delaySamples = (halfOrder + 1) / 2;
 
             auto fullCoeffs = FIRDesign<T>::lowPass(1.0, 0.25, taps, beta);
             centerTap = fullCoeffs[static_cast<std::size_t>(halfOrder)];
 
+            // Even polyphase branch = ALL even-array-index coefficients of the
+            // symmetric half-band (these are the non-zero off-centre taps, since
+            // the centre sits at the odd index halfOrder). Used by the upsample
+            // FIR phase. (halfOrder is odd, so i never equals halfOrder.)
             evenTaps.clear();
-            for (int i = 0; i <= halfOrder; i += 2)
-            {
-                if (i != halfOrder)
-                    evenTaps.push_back(fullCoeffs[static_cast<std::size_t>(i)]);
-            }
+            for (int i = 0; i < taps; i += 2)
+                evenTaps.push_back(fullCoeffs[static_cast<std::size_t>(i)]);
 
-            // Allocate histories with enough padding for contiguous shifting
-            int historySize = static_cast<int>(evenTaps.size()) + maxBlockSamples;
-            int oddHistorySize = delaySamples + maxBlockSamples;
-            
+            // Full symmetric kernel for the downsampler. Decimation is done as a
+            // single, unambiguous high-rate convolution (filter then pick every
+            // other sample), which keeps every tap aligned to its true high-rate
+            // position — unlike an even/odd polyphase split with independent
+            // delays, which left a 0.5-sample mismatch between the FIR and centre
+            // branches and capped the round-trip SNR.
+            fullTaps.assign(fullCoeffs.begin(), fullCoeffs.end());
+
+            // Up history: base-rate (numTaps + block). Down history: high-rate
+            // ((taps-1) + up to 2*maxBlockSamples high-rate input for this stage).
+            const int upHistorySize   = static_cast<int>(evenTaps.size()) + maxBlockSamples;
+            const int downHistorySize = (taps - 1) + 2 * maxBlockSamples;
+
             upChannels.resize(static_cast<std::size_t>(numChannels));
             downChannels.resize(static_cast<std::size_t>(numChannels));
-            
+
             for (int ch = 0; ch < numChannels; ++ch)
             {
-                upChannels[ch].history.assign(historySize, T(0));
-                upChannels[ch].oddHistory.assign(oddHistorySize, T(0)); // Unused in upsample but kept for symmetry if needed
-                
-                downChannels[ch].history.assign(historySize, T(0));
-                downChannels[ch].oddHistory.assign(oddHistorySize, T(0));
+                upChannels[ch].history.assign(static_cast<std::size_t>(upHistorySize), T(0));
+                downChannels[ch].history.assign(static_cast<std::size_t>(downHistorySize), T(0));
             }
         }
 
@@ -323,82 +347,74 @@ private:
             }
         }
 
+        // Decimating half-band as a single high-rate convolution: filter the
+        // incoming high-rate stream with the full symmetric kernel, then keep one
+        // sample in two. Every tap multiplies its true high-rate neighbour, so the
+        // FIR and centre contributions stay perfectly aligned (no polyphase
+        // 0.5-sample mismatch). The forward form histR[2n+k] exploits kernel
+        // symmetry (h[k]==h[nTaps-1-k]) for clean auto-vectorisation.
+        //
+        // hist layout (per channel, block-size agnostic): hist[0..hLen-1] carries
+        // the previous block's trailing hLen high-rate samples; the new block is
+        // copied to hist[hLen..]. The trailing hLen samples are re-saved afterwards.
         void processDownsample(AudioBufferView<const T> input, AudioBufferView<T> output, int nCh, int currentLen) noexcept
         {
-            int outLen = currentLen / 2;
-            const int numTaps = static_cast<int>(evenTaps.size());
+            const int outLen = currentLen / 2;
+            const int nTaps  = static_cast<int>(fullTaps.size());
+            const int hLen   = nTaps - 1;
 
             for (int ch = 0; ch < nCh; ++ch)
             {
                 const T* src = input.getChannel(ch);
                 T* dst = output.getChannel(ch);
                 auto& hist = downChannels[ch].history;
-                auto& oddHist = downChannels[ch].oddHistory;
 
-                // 1. Shift and populate histories BEFORE calculating to avoid read/write aliasing
-                std::memmove(hist.data(), hist.data() + outLen, numTaps * sizeof(T));
-                std::memmove(oddHist.data(), oddHist.data() + outLen, delaySamples * sizeof(T));
-                
-                for (int i = 0; i < outLen; ++i)
-                {
-                    hist[numTaps + i] = src[i * 2];         // Even samples
-                    oddHist[delaySamples + i] = src[i * 2 + 1]; // Odd samples
-                }
+                std::memcpy(hist.data() + hLen, src, static_cast<std::size_t>(currentLen) * sizeof(T));
 
-                T* __restrict dstR = dst;
+                const T* __restrict h     = fullTaps.data();
                 const T* __restrict histR = hist.data();
-                const T* __restrict oddR = oddHist.data();
-                const T* __restrict tapsR = evenTaps.data();
+                T* __restrict dstR        = dst;
 
-                // 2. Compute FIR (Now perfectly safe and SIMD-friendly)
-                for (int i = 0; i < outLen; ++i)
+                for (int n = 0; n < outLen; ++n)
                 {
-                    T sum = oddR[i] * centerTap; 
-                    
-                    for (int k = 0; k < numTaps; ++k)
-                        sum += tapsR[k] * histR[i + k];
-                        
-                    dstR[i] = sum;
+                    const int base = 2 * n;
+                    T sum = T(0);
+                    for (int k = 0; k < nTaps; ++k)
+                        sum += h[k] * histR[base + k];
+                    dstR[n] = sum;
                 }
+
+                std::memmove(hist.data(), hist.data() + currentLen, static_cast<std::size_t>(hLen) * sizeof(T));
             }
         }
-        
+
         void processDownsampleInPlace(AudioBufferView<T> buffer, int nCh, int currentLen) noexcept
         {
-            int outLen = currentLen / 2;
-            const int numTaps = static_cast<int>(evenTaps.size());
+            const int outLen = currentLen / 2;
+            const int nTaps  = static_cast<int>(fullTaps.size());
+            const int hLen   = nTaps - 1;
 
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* data = buffer.getChannel(ch);
                 auto& hist = downChannels[ch].history;
-                auto& oddHist = downChannels[ch].oddHistory;
 
-                // 1. Extract from working buffer before overwriting
-                std::memmove(hist.data(), hist.data() + outLen, numTaps * sizeof(T));
-                std::memmove(oddHist.data(), oddHist.data() + outLen, delaySamples * sizeof(T));
-                
-                for (int i = 0; i < outLen; ++i)
-                {
-                    hist[numTaps + i] = data[i * 2];
-                    oddHist[delaySamples + i] = data[i * 2 + 1];
-                }
+                std::memcpy(hist.data() + hLen, data, static_cast<std::size_t>(currentLen) * sizeof(T));
 
-                T* __restrict dataR = data;
+                const T* __restrict h     = fullTaps.data();
                 const T* __restrict histR = hist.data();
-                const T* __restrict oddR = oddHist.data();
-                const T* __restrict tapsR = evenTaps.data();
+                T* __restrict dataR       = data;
 
-                // 2. Compute and overwrite
-                for (int i = 0; i < outLen; ++i)
+                for (int n = 0; n < outLen; ++n)
                 {
-                    T sum = oddR[i] * centerTap; 
-                    
-                    for (int k = 0; k < numTaps; ++k)
-                        sum += tapsR[k] * histR[i + k];
-                        
-                    dataR[i] = sum; 
+                    const int base = 2 * n;
+                    T sum = T(0);
+                    for (int k = 0; k < nTaps; ++k)
+                        sum += h[k] * histR[base + k];
+                    dataR[n] = sum;
                 }
+
+                std::memmove(hist.data(), hist.data() + currentLen, static_cast<std::size_t>(hLen) * sizeof(T));
             }
         }
     };

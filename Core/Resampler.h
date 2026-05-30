@@ -65,9 +65,11 @@ public:
     void prepare(double sourceRate, double targetRate,
                  Quality quality = Quality::Normal)
     {
-        sourceRate_ = sourceRate;
-        targetRate_ = targetRate;
-        ratio_ = targetRate / sourceRate;
+        // Guard against non-positive rates (would make ratio_ = inf/NaN and
+        // poison every downstream division).
+        sourceRate_ = std::max(sourceRate, 1.0);
+        targetRate_ = std::max(targetRate, 1.0);
+        ratio_ = targetRate_ / sourceRate_;
 
         sincPoints_ = qualityToSincPoints(quality);
 
@@ -244,6 +246,8 @@ private:
         for (int phase = 0; phase < kOversample; ++phase)
         {
             double frac = static_cast<double>(phase) / static_cast<double>(kOversample);
+            const int base = phase * sincPoints_;
+            double sum = 0.0;
 
             for (int tap = 0; tap < sincPoints_; ++tap)
             {
@@ -256,7 +260,17 @@ private:
                     sincVal = static_cast<T>(cutoff * std::sin(kPi * x) / (kPi * x));
 
                 sincVal *= kaiserWin[static_cast<size_t>(tap)];
-                sincTable_[static_cast<size_t>(phase * sincPoints_ + tap)] = sincVal;
+                sincTable_[static_cast<size_t>(base + tap)] = sincVal;
+                sum += static_cast<double>(sincVal);
+            }
+
+            // Normalise each polyphase branch to unity DC gain so the passband
+            // is flat (otherwise the windowed sinc leaves a small gain ripple).
+            if (std::abs(sum) > 1e-12)
+            {
+                const T inv = static_cast<T>(1.0 / sum);
+                for (int tap = 0; tap < sincPoints_; ++tap)
+                    sincTable_[static_cast<size_t>(base + tap)] *= inv;
             }
         }
     }

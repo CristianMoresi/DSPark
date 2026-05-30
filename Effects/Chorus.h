@@ -44,7 +44,7 @@ template <FloatType T>
 class Chorus
 {
 public:
-    virtual ~Chorus() = default;
+    ~Chorus() = default; // non-virtual: leaf class, no virtual dispatch (framework policy)
 
     static constexpr int kMaxVoices = 4;
     static constexpr int kMaxChannels = 16;
@@ -71,7 +71,7 @@ public:
             for (int v = 0; v < kMaxVoices; ++v)
             {
                 lfos_[ch][v].prepare(spec.sampleRate);
-                lfos_[ch][v].setWaveform(lfoWaveform_);
+                lfos_[ch][v].setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
             }
         }
 
@@ -102,6 +102,18 @@ public:
         bool autoD     = autoDepth_.load(std::memory_order_relaxed);
 
         mixer_.pushDry(buffer);
+
+        // Apply deferred LFO config on the AUDIO thread (setters only publish):
+        // voices change -> recompute phases; waveform change -> reapply.
+        if (lfoPhaseDirty_.exchange(false, std::memory_order_relaxed))
+            updateLfoPhases();
+        if (waveformDirty_.exchange(false, std::memory_order_relaxed))
+        {
+            const auto wf = lfoWaveform_.load(std::memory_order_relaxed);
+            for (int ch = 0; ch < kMaxChannels; ++ch)
+                for (int v = 0; v < kMaxVoices; ++v)
+                    lfos_[ch][v].setWaveform(wf);
+        }
 
         // Check if stereo spread changed (requires phase recalculation)
         T currentSpread = stereoSpread_.load(std::memory_order_relaxed);
@@ -218,7 +230,7 @@ public:
     void setVoices(int count) noexcept
     {
         numVoices_.store(std::clamp(count, 1, kMaxVoices), std::memory_order_relaxed);
-        updateLfoPhases();
+        lfoPhaseDirty_.store(true, std::memory_order_relaxed); // recomputed on audio thread
     }
 
     /**
@@ -253,10 +265,10 @@ public:
      */
     void setModWaveform(typename Oscillator<T>::Waveform wf) noexcept
     {
-        lfoWaveform_ = wf;
-        for (int ch = 0; ch < kMaxChannels; ++ch)
-            for (int v = 0; v < kMaxVoices; ++v)
-                lfos_[ch][v].setWaveform(wf);
+        // Publish only; the audio thread reapplies it (the oscillators are not
+        // thread-safe, so we must not write their state from the control thread).
+        lfoWaveform_.store(wf, std::memory_order_relaxed);
+        waveformDirty_.store(true, std::memory_order_relaxed);
     }
 
 protected:
@@ -300,7 +312,9 @@ protected:
     std::atomic<bool> autoDepth_ { false };
     
     T lastSpread_ { T(0.5) };
-    typename Oscillator<T>::Waveform lfoWaveform_ = Oscillator<T>::Waveform::Sine;
+    std::atomic<typename Oscillator<T>::Waveform> lfoWaveform_ { Oscillator<T>::Waveform::Sine };
+    std::atomic<bool> lfoPhaseDirty_ { false };  // voices changed -> recompute phases (audio thread)
+    std::atomic<bool> waveformDirty_ { false };  // waveform changed -> reapply (audio thread)
 
     // Smoothed internal state variables (Audio thread only)
     T smoothedCenterSamples_ { T(0) };

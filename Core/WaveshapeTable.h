@@ -170,14 +170,8 @@ public:
      */
     void process(T* __restrict data, int numSamples, T preGain = T(1), T postGain = T(1)) const noexcept
     {
-        // Cache data locally to assist compiler vectorization
-        const T* const tablePtr = table_.data();
-        const int tSize = tableSize_;
-
         for (int i = 0; i < numSamples; ++i)
-        {
             data[i] = process(data[i], preGain, postGain);
-        }
     }
 
     // -- Lifecycle & Oversampling ---------------------------------------------
@@ -223,7 +217,7 @@ public:
      * @param preGain Real-time drive applied per-sample.
      * @param postGain Real-time makeup gain applied per-sample.
      */
-    void processBlock(AudioBufferView<T>& buffer, T preGain = T(1), T postGain = T(1)) noexcept
+    void processBlock(AudioBufferView<T> buffer, T preGain = T(1), T postGain = T(1)) noexcept
     {
         if (oversamplingFactor_ > 1 && oversampler_)
         {

@@ -20,7 +20,7 @@ inline EffectSlot makeFilterEngine()
     EffectSlot s;
     s.name = "Filter"; s.category = "Filters";
     s.addChoice("Type", {"LowPass","HighPass","BandPass","Peak","LowShelf","HighShelf","Notch","AllPass","Tilt"}, 0);
-    s.addSlider("Frequency", 20, 20000, 20000, "Hz", true);   // Default at Nyquist-ish = open filter
+    s.addSlider("Frequency", 20, 20000, 1000, "Hz", true);   // Visible mid default so the node isn't hidden at the edge
     s.addSlider("Resonance", 0.1f, 20, 0.707f, "Q", true);
     s.addSlider("Gain", -24, 24, 0, "dB");
     s.addSlider("Slope", 6, 48, 12, "dB/oct");
@@ -63,6 +63,39 @@ inline EffectSlot makeFilterEngine()
             case 5: p->setNonlinearity(v); break;
         }
     };
+    // Interactive response curve. Reconstructs the exact cascade from the public
+    // BiquadCoeffs factories + FilterEngine::cascadeForSlope (single source of truth).
+    s.magnitudeFn = [](const float* f, float* mdb, int n, double sr, const float* v) {
+        using BC = dspark::BiquadCoeffs<float>;
+        using FE = dspark::FilterEngine<float>;
+        const int type = static_cast<int>(v[0]);
+        const float freq = v[1], Q = std::max(0.05f, v[2]), gain = v[3];
+        int slope = std::clamp((static_cast<int>(v[4]) / 6) * 6, 6, 48);
+        BC st[5]; int ns = 0;
+        auto add = [&](BC c){ if (ns < 5) st[ns++] = c; };
+        switch (type) {
+            case 0: case 1: {  // LowPass / HighPass — Butterworth cascade for the slope
+                auto info = FE::cascadeForSlope(slope);
+                const bool lp = (type == 0);
+                if (info.hasFirstOrder) add(lp ? BC::makeFirstOrderLowPass(sr, freq) : BC::makeFirstOrderHighPass(sr, freq));
+                for (int s = 0; s < info.numSecondOrder; ++s) add(lp ? BC::makeLowPass(sr, freq, info.qValues[s]) : BC::makeHighPass(sr, freq, info.qValues[s]));
+                break;
+            }
+            case 2: add(BC::makeBandPass(sr, freq, Q)); break;
+            case 3: add(BC::makePeak(sr, freq, Q, gain)); break;
+            case 4: add(BC::makeLowShelf(sr, freq, gain)); break;
+            case 5: add(BC::makeHighShelf(sr, freq, gain)); break;
+            case 6: add(BC::makeNotch(sr, freq, Q)); break;
+            case 7: add(BC::makeAllPass(sr, freq, Q)); break;
+            case 8: add(BC::makeTilt(sr, freq, gain)); break;
+        }
+        for (int i = 0; i < n; ++i) {
+            double mag = 1.0;
+            for (int s = 0; s < ns; ++s) mag *= st[s].getMagnitude(static_cast<double>(f[i]), sr);
+            mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
+        }
+    };
+    s.curveNodes = { {1, 3, 2} };  // X=freq, Y=gain (Peak/Shelf/Tilt), wheel=Q
     return s;
 }
 
@@ -100,6 +133,18 @@ inline EffectSlot makeEqualizer()
         }
         p->setBand(band, cfg);
     };
+    // Interactive response curve: 4 peaking bands. X=freq, Y=gain, wheel=Q.
+    s.magnitudeFn = [](const float* f, float* mdb, int n, double sr, const float* v) {
+        for (int i = 0; i < n; ++i) {
+            double mag = 1.0;
+            for (int b = 0; b < 4; ++b) {
+                auto c = dspark::BiquadCoeffs<float>::makePeak(sr, v[b*3+0], std::max(0.05f, v[b*3+2]), v[b*3+1]);
+                mag *= c.getMagnitude(static_cast<double>(f[i]), sr);
+            }
+            mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
+        }
+    };
+    s.curveNodes = { {0,1,2}, {3,4,5}, {6,7,8}, {9,10,11} };
     return s;
 }
 
@@ -365,6 +410,12 @@ inline EffectSlot makeDeEsser()
 inline EffectSlot makeSaturation()
 {
     auto p = std::make_shared<dspark::Saturation<float>>();
+    // Oversampling is applied lazily on the audio thread (see processFn): changing
+    // it reallocates the polyphase filters, which is not safe to do concurrently
+    // with process() from the UI thread. osWanted is set by the UI, osApplied is
+    // reconciled inside process() where nothing else touches the processor.
+    auto osWanted  = std::make_shared<std::atomic<int>>(1);
+    auto osApplied = std::make_shared<std::atomic<int>>(1);
     EffectSlot s;
     s.name = "Saturation"; s.category = "Distortion";
     // Algorithm indices MUST match dspark::Saturation<float>::Algorithm enum order.
@@ -379,10 +430,21 @@ inline EffectSlot makeSaturation()
     s.addSlider("Output", -24, 12, 0, "dB");
     s.addToggle("Adaptive Blend", false);
     s.addSlider("Slew Sensitivity", 0, 1, 0, "");
-    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
-    s.processFn = [p](auto b) { p->process(b); };
+    s.addChoice("Oversampling", {"Off","2x","4x","8x","16x"}, 0);  // index 6
+    s.prepareFn = [p, osApplied](auto& sp) {
+        p->setOversampling(osApplied->load(std::memory_order_relaxed));
+        p->prepare(sp);
+    };
+    s.processFn = [p, osWanted, osApplied](auto b) {
+        const int want = osWanted->load(std::memory_order_relaxed);
+        if (want != osApplied->load(std::memory_order_relaxed)) {
+            p->setOversampling(want);   // reallocates — safe here (audio thread, no concurrent process)
+            osApplied->store(want, std::memory_order_relaxed);
+        }
+        p->process(b);
+    };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p](int i, float v) {
+    s.setParamFn = [p, osWanted](int i, float v) {
         switch(i) {
             case 0: p->setAlgorithm(static_cast<typename dspark::Saturation<float>::Algorithm>(static_cast<int>(v))); break;
             case 1: p->setDrive(v); break;
@@ -390,6 +452,7 @@ inline EffectSlot makeSaturation()
             case 3: p->setOutputGain(v); break;
             case 4: p->setAdaptiveBlend(v > 0.5f); break;
             case 5: p->setSlewSensitivity(v); break;
+            case 6: { static constexpr int f[] = {1,2,4,8,16}; osWanted->store(f[std::clamp(static_cast<int>(v),0,4)], std::memory_order_relaxed); break; }
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -399,6 +462,12 @@ inline EffectSlot makeSaturation()
 inline EffectSlot makeClipper()
 {
     auto p = std::make_shared<dspark::Clipper<float>>();
+    // Clipper::setOversampling only stores the factor; the filters are (re)built in
+    // prepare(). We therefore re-prepare on the audio thread when the factor changes
+    // (safe: no concurrent process()), so oversampling is auditionable live.
+    auto spec      = std::make_shared<dspark::AudioSpec>();
+    auto osWanted  = std::make_shared<std::atomic<int>>(1);
+    auto osApplied = std::make_shared<std::atomic<int>>(1);
     EffectSlot s;
     s.name = "Clipper"; s.category = "Distortion";
     s.addChoice("Mode", {"Hard","Soft","Analog","GoldenRatio"}, 0);
@@ -407,11 +476,24 @@ inline EffectSlot makeClipper()
     s.addSlider("Stages", 1, 4, 1, "");
     s.addSlider("Mix", 0, 1, 1, "");
     s.addSlider("Slew Limit", 0, 1, 0, "");
-    s.addChoice("Oversampling", {"2x","4x","8x","16x"}, 0);
-    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
-    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.addChoice("Oversampling", {"Off","2x","4x","8x","16x"}, 0);
+    s.prepareFn = [p, spec, osWanted, osApplied](auto& sp) {
+        *spec = sp;
+        p->setOversampling(osWanted->load(std::memory_order_relaxed));
+        p->prepare(sp);
+        osApplied->store(osWanted->load(std::memory_order_relaxed), std::memory_order_relaxed);
+    };
+    s.processFn = [p, spec, osWanted, osApplied](auto b) {
+        const int want = osWanted->load(std::memory_order_relaxed);
+        if (want != osApplied->load(std::memory_order_relaxed) && spec->sampleRate > 0) {
+            p->setOversampling(want);
+            p->prepare(*spec);          // rebuilds filters — safe here (audio thread)
+            osApplied->store(want, std::memory_order_relaxed);
+        }
+        p->processBlock(b);
+    };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p](int i, float v) {
+    s.setParamFn = [p, osWanted](int i, float v) {
         switch(i) {
             case 0: p->setMode(static_cast<dspark::Clipper<float>::Mode>(static_cast<int>(v))); break;
             case 1: p->setCeiling(v); break;
@@ -419,7 +501,7 @@ inline EffectSlot makeClipper()
             case 3: p->setStages(static_cast<int>(v)); break;
             case 4: p->setMix(v); break;
             case 5: p->setSlewLimit(v); break;
-            case 6: { int factors[] = {2,4,8,16}; p->setOversampling(factors[static_cast<int>(v)]); break; }
+            case 6: { static constexpr int f[] = {1,2,4,8,16}; osWanted->store(f[std::clamp(static_cast<int>(v),0,4)], std::memory_order_relaxed); break; }
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -768,6 +850,223 @@ inline EffectSlot makeNoiseGenerator()
 // MASTER REGISTRY
 // =============================================================================
 
+inline EffectSlot makeDynamicEQ()
+{
+    using DEQ = dspark::DynamicEQ<float>;
+    auto p = std::make_shared<DEQ>();
+
+    // UI mirror: per band [Freq, Q, Threshold, Amount, Ratio, Attack, Release, Below].
+    // Amount is signed: +dB boosts the band when triggered, -dB cuts it. It is the
+    // node's Y axis, so you drag a band UP to boost or DOWN to cut.
+    auto ui = std::make_shared<std::array<std::array<float, 8>, 2>>();
+    (*ui)[0] = {  200.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f };
+    (*ui)[1] = { 3000.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f };
+
+    auto buildCfg = [](const std::array<float, 8>& v) {
+        DEQ::BandConfig c{};
+        c.frequency = v[0];
+        c.q         = std::max(0.1f, v[1]);
+        c.threshold = v[2];
+        c.enabled   = true;
+        const float amount = v[3], ratio = std::max(1.0f, v[4]), atk = v[5], rel = v[6];
+        const bool below = v[7] > 0.5f;       // act when below threshold instead of above
+        const bool boost = amount > 0.0f;     // sign of Amount = boost / cut
+        const float range = std::fabs(amount);
+        c.aboveRatio = 1.0f; c.belowRatio = 1.0f;
+        c.aboveRangeDb = range; c.belowRangeDb = range;
+        c.aboveAttackMs = atk; c.belowAttackMs = atk;
+        c.aboveReleaseMs = rel; c.belowReleaseMs = rel;
+        c.aboveBoost = false; c.belowBoost = false;
+        if (below) { c.belowRatio = ratio; c.belowBoost = boost; }
+        else       { c.aboveRatio = ratio; c.aboveBoost = boost; }
+        return c;
+    };
+
+    EffectSlot s;
+    s.name = "Dynamic EQ"; s.category = "Filters";
+    for (int b = 0; b < 2; ++b)
+    {
+        const char* pfx = (b == 0) ? "B1 " : "B2 ";
+        auto nm = [pfx](const char* n){ static char buf[24]; std::snprintf(buf, sizeof(buf), "%s%s", pfx, n); return buf; };
+        const auto& d = (*ui)[b];
+        s.addSlider(nm("Freq"),      20, 20000, d[0], "Hz", true);
+        s.addSlider(nm("Q"),       0.2f,    10, d[1], "");
+        s.addSlider(nm("Threshold"), -60,    0, d[2], "dB");
+        s.addSlider(nm("Amount"),    -24,   24, d[3], "dB");   // node Y: +boost / -cut
+        s.addSlider(nm("Ratio"),       1,   12, d[4], ":1");
+        s.addSlider(nm("Attack"),   0.1f,  100, d[5], "ms");
+        s.addSlider(nm("Release"),     5,  500, d[6], "ms");
+        s.addToggle(nm("Below Thr"), false);
+    }
+    s.prepareFn = [p, ui, buildCfg](auto& sp) {
+        p->prepare(sp);
+        p->setNumBands(2);
+        p->setBand(0, buildCfg((*ui)[0]));
+        p->setBand(1, buildCfg((*ui)[1]));
+    };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p, ui, buildCfg](int i, float v) {
+        const int band = i / 8, prm = i % 8;
+        if (band < 0 || band >= 2) return;
+        (*ui)[static_cast<std::size_t>(band)][static_cast<std::size_t>(prm)] = v;
+        p->setBand(band, buildCfg((*ui)[static_cast<std::size_t>(band)]));
+    };
+    // The orange curve is LIVE (current applied gain via getBandGainDb): it dips for
+    // a cut and rises for a boost as the audio triggers each band. The draggable
+    // nodes sit at each band's Amount target (X=freq, Y=amount, wheel=Q).
+    s.magnitudeFn = [p](const float* f, float* mdb, int n, double sr, const float* v) {
+        const float g0 = p->getBandGainDb(0);
+        const float g1 = p->getBandGainDb(1);
+        for (int i = 0; i < n; ++i) {
+            auto c0 = dspark::BiquadCoeffs<float>::makePeak(sr, v[0], std::max(0.05f, v[1]), g0);
+            auto c1 = dspark::BiquadCoeffs<float>::makePeak(sr, v[8], std::max(0.05f, v[9]), g1);
+            double mag = static_cast<double>(c0.getMagnitude(static_cast<double>(f[i]), sr))
+                       * static_cast<double>(c1.getMagnitude(static_cast<double>(f[i]), sr));
+            mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
+        }
+    };
+    // Faint target curve = each band's Amount (the ceiling the live curve moves to);
+    // the draggable nodes sit on it.
+    s.targetMagnitudeFn = [](const float* f, float* mdb, int n, double sr, const float* v) {
+        for (int i = 0; i < n; ++i) {
+            auto c0 = dspark::BiquadCoeffs<float>::makePeak(sr, v[0], std::max(0.05f, v[1]), v[3]);
+            auto c1 = dspark::BiquadCoeffs<float>::makePeak(sr, v[8], std::max(0.05f, v[9]), v[11]);
+            double mag = static_cast<double>(c0.getMagnitude(static_cast<double>(f[i]), sr))
+                       * static_cast<double>(c1.getMagnitude(static_cast<double>(f[i]), sr));
+            mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
+        }
+    };
+    s.curveNodes = { {0,3,1}, {8,11,9} };  // X=freq, Y=Amount (drag to boost/cut), wheel=Q
+    return s;
+}
+
+inline EffectSlot makeMultibandCompressor()
+{
+    auto p = std::make_shared<dspark::MultibandCompressor<float>>();
+    auto xover = std::make_shared<std::array<float,2>>(std::array<float,2>{250.0f, 2500.0f});
+    EffectSlot s;
+    s.name = "Multiband Compressor"; s.category = "Dynamics";
+    // 3 bands split by two crossovers; per-band threshold/ratio + shared time constants.
+    s.addSlider("XOver Low", 40, 1000, 250, "Hz", true);   // 0
+    s.addSlider("XOver High", 1000, 16000, 2500, "Hz", true); // 1
+    s.addSlider("Low Thresh", -60, 0, -20, "dB");          // 2
+    s.addSlider("Low Ratio", 1, 20, 3, ":1");              // 3
+    s.addSlider("Mid Thresh", -60, 0, -20, "dB");          // 4
+    s.addSlider("Mid Ratio", 1, 20, 3, ":1");              // 5
+    s.addSlider("High Thresh", -60, 0, -20, "dB");         // 6
+    s.addSlider("High Ratio", 1, 20, 3, ":1");             // 7
+    s.addSlider("Attack", 0.1f, 100, 10, "ms");            // 8
+    s.addSlider("Release", 10, 1000, 120, "ms");           // 9
+    s.prepareFn = [p](auto& sp) {
+        p->prepare(sp);
+        p->setNumBands(3);
+        p->setCrossoverFrequency(0, 250.0f);
+        p->setCrossoverFrequency(1, 2500.0f);
+    };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p, xover](int i, float v) {
+        switch (i) {
+            case 0: p->setCrossoverFrequency(0, v); (*xover)[0] = v; break;
+            case 1: p->setCrossoverFrequency(1, v); (*xover)[1] = v; break;
+            case 2: p->setBandThreshold(0, v); break;
+            case 3: p->setBandRatio(0, v); break;
+            case 4: p->setBandThreshold(1, v); break;
+            case 5: p->setBandRatio(1, v); break;
+            case 6: p->setBandThreshold(2, v); break;
+            case 7: p->setBandRatio(2, v); break;
+            case 8: for (int b = 0; b < 3; ++b) p->setBandAttack(b, v); break;
+            case 9: for (int b = 0; b < 3; ++b) p->setBandRelease(b, v); break;
+        }
+    };
+    s.gainReductionDbFn = [p]() {
+        float gr = 0.0f;
+        for (int b = 0; b < 3; ++b) gr = std::max(gr, static_cast<float>(p->getBandGainReductionDb(b)));
+        return gr;
+    };
+    // Band visualiser: 2 crossover frequencies + live per-band gain reduction.
+    s.multibandFn = [p, xover](float* xHz, float* grDb, int maxBands) -> int {
+        if (maxBands >= 3) {
+            xHz[0] = (*xover)[0]; xHz[1] = (*xover)[1];
+            for (int b = 0; b < 3; ++b) grDb[b] = static_cast<float>(p->getBandGainReductionDb(b));
+        }
+        return 3;
+    };
+    return s;
+}
+
+inline EffectSlot makeConvolutionReverb()
+{
+    auto p = std::make_shared<dspark::Reverb<float>>();
+    auto sr         = std::make_shared<double>(48000.0);
+    auto decayS     = std::make_shared<float>(1.5f);
+    auto fileLoaded = std::make_shared<bool>(false);  // true once a real IR WAV is loaded
+
+    // Builds a synthetic IR (exponentially-decaying white noise) so the slot is
+    // auditionable with no file. Use "Load IR (WAV)" for a real space/cab/plate.
+    // Deterministic LCG + energy normalisation so the wet level tracks the dry.
+    auto regenIR = [p, sr, decayS, fileLoaded]() {
+        const double fs = (*sr > 0.0) ? *sr : 48000.0;
+        const int len = std::max(64, static_cast<int>(fs * static_cast<double>(*decayS)));
+        std::vector<float> ir(static_cast<std::size_t>(len));
+        uint32_t rng = 0x1234567u;
+        const double tau = (fs * static_cast<double>(*decayS)) / 6.9077; // ~ -60 dB over decay
+        double energy = 0.0;
+        for (int n = 0; n < len; ++n) {
+            rng = rng * 1664525u + 1013904223u;
+            const float white = static_cast<float>(static_cast<int32_t>(rng)) * (1.0f / 2147483648.0f);
+            const float env = static_cast<float>(std::exp(-static_cast<double>(n) / tau));
+            const float v = white * env;
+            ir[static_cast<std::size_t>(n)] = v;
+            energy += static_cast<double>(v) * v;
+        }
+        const float norm = (energy > 1e-12) ? static_cast<float>(1.0 / std::sqrt(energy)) : 1.0f;
+        for (auto& v : ir) v *= norm;
+        p->loadIR(ir.data(), len, fs);
+        *fileLoaded = false;
+    };
+
+    EffectSlot s;
+    s.name = "Convolution Reverb"; s.category = "Spatial";
+    s.addSlider("Decay", 0.2f, 6.0f, 1.5f, "s");   // 0 — (re)builds the synthetic IR
+    s.addSlider("Pre-Delay", 0, 100, 10, "ms");    // 1
+    s.addSlider("Mix", 0, 1, 0, "");               // 2 — default dry
+    s.prepareFn = [p, sr, fileLoaded, regenIR](auto& sp) {
+        *sr = sp.sampleRate; p->prepare(sp);
+        if (!*fileLoaded) regenIR();   // keep a user-loaded IR across re-prepares
+    };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p, decayS, regenIR](int i, float v) {
+        switch (i) {
+            case 0: *decayS = v; regenIR(); break;   // switch to synthetic IR (atomic publish — safe live)
+            case 1: p->setPreDelay(v); break;
+            case 2: p->setMix(v); break;
+        }
+    };
+    // Load a real impulse response from a WAV (summed to mono, capped at 10 s).
+    s.loadIRFn = [p, fileLoaded](const char* path) {
+        dspark::WavFile wav;
+        if (!wav.openRead(path)) return;
+        auto info = wav.getInfo();
+        const int ch = std::clamp(static_cast<int>(info.numChannels), 1, 16);
+        int len = static_cast<int>(std::min<int64_t>(info.numSamples, static_cast<int64_t>(info.sampleRate * 10.0)));
+        if (len <= 0) return;
+        dspark::AudioBuffer<float> tmp; tmp.resize(ch, len);
+        if (!wav.readSamples(tmp.toView(), 0, len)) return;
+        std::vector<float> mono(static_cast<std::size_t>(len));
+        for (int i = 0; i < len; ++i) {
+            float acc = 0.0f;
+            for (int c = 0; c < ch; ++c) acc += tmp.getChannel(c)[i];
+            mono[static_cast<std::size_t>(i)] = acc / static_cast<float>(ch);
+        }
+        p->loadIR(mono.data(), len, info.sampleRate);
+        *fileLoaded = true;
+    };
+    return s;
+}
+
 inline std::vector<EffectSlot> createAllEffects()
 {
     return {
@@ -777,6 +1076,7 @@ inline std::vector<EffectSlot> createAllEffects()
         makeLadderFilter(),
         makeStateVariableFilter(),
         makeDCBlocker(),
+        makeDynamicEQ(),
         // Dynamics
         makeCompressor(),
         makeLimiter(),
@@ -784,6 +1084,7 @@ inline std::vector<EffectSlot> createAllEffects()
         makeExpander(),
         makeTransientDesigner(),
         makeDeEsser(),
+        makeMultibandCompressor(),
         // Distortion
         makeSaturation(),
         makeClipper(),
@@ -797,6 +1098,7 @@ inline std::vector<EffectSlot> createAllEffects()
         // Spatial
         makeDelay(),
         makeAlgorithmicReverb(),
+        makeConvolutionReverb(),
         makePanner(),
         makeStereoWidth(),
         // Utility

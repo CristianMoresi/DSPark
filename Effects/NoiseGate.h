@@ -111,11 +111,33 @@ public:
 
         const int nCh = buffer.getNumChannels();
         const int nS = buffer.getNumSamples();
+        if (nCh <= 0 || nS <= 0) return;
 
-        if (nCh >= 2)
-            processStereoInternal(buffer.getChannel(0), buffer.getChannel(1), nS);
-        else if (nCh == 1)
-            processInternal(buffer.getChannel(0), nS);
+        const bool freqMode = (cachedGateMode_ == GateMode::Frequency);
+
+        for (int i = 0; i < nS; ++i)
+        {
+            // Stereo / N-channel linked detection: peak across ALL channels so no
+            // channel is left ungated (previously only the first two were processed).
+            T level = T(0);
+            for (int ch = 0; ch < nCh; ++ch)
+                level = std::max(level, std::abs(buffer.getChannel(ch)[i]));
+
+            if (cachedAdaptiveHold_) updateZeroCrossing(buffer.getChannel(0)[i]);
+
+            T envelope = computeEnvelopeFollower(level);
+            updateStateMachine(envelope);
+            T gain = getCurrentGain();
+
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* d = buffer.getChannel(ch);
+                // Frequency mode keeps per-channel filter state only for the first
+                // kMaxChannels; any extra channels fall back to amplitude gating.
+                d[i] = (freqMode && ch < kMaxChannels) ? applyFrequencyGate(d[i], ch)
+                                                       : d[i] * gain;
+            }
+        }
     }
 
     /**
@@ -132,12 +154,14 @@ public:
         const int nS  = audio.getNumSamples();
         const int scCh = sidechain.getNumChannels();
 
-        T* __restrict outL = std::assume_aligned<32>(audio.getChannel(0));
-        T* __restrict scL = std::assume_aligned<32>(sidechain.getChannel(0));
-        
+        // NOTE: no std::assume_aligned — view pointers are not guaranteed 32-byte
+        // aligned (sub-views / driver buffers), and assuming so is UB. __restrict
+        // still conveys no-aliasing for vectorization.
         // Optimize for common mono/stereo sidechain topologies
         if (nCh == 1 && scCh == 1)
         {
+            T* __restrict outL = audio.getChannel(0);
+            const T* __restrict scL = sidechain.getChannel(0);
             for (int i = 0; i < nS; ++i)
                 outL[i] = processSampleInternal(outL[i], scL[i], 0);
         }
@@ -305,31 +329,6 @@ protected:
     {
         if (paramsDirty_.exchange(false, std::memory_order_relaxed))
             syncParams();
-    }
-
-    void processInternal(T* data, int numSamples) noexcept
-    {
-        T* __restrict ptr = std::assume_aligned<32>(data);
-        for (int i = 0; i < numSamples; ++i)
-            ptr[i] = processSampleInternal(ptr[i], ptr[i], 0);
-    }
-
-    void processStereoInternal(T* left, T* right, int numSamples) noexcept
-    {
-        T* __restrict pL = std::assume_aligned<32>(left);
-        T* __restrict pR = std::assume_aligned<32>(right);
-
-        for (int i = 0; i < numSamples; ++i)
-        {
-            T level = std::max(std::abs(pL[i]), std::abs(pR[i]));
-            T envelope = computeEnvelopeFollower(level);
-            
-            updateStateMachine(envelope);
-            T gain = getCurrentGain();
-            
-            pL[i] *= gain;
-            pR[i] *= gain;
-        }
     }
 
     void syncParams() noexcept

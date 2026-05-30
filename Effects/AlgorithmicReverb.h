@@ -140,7 +140,7 @@ public:
         Cathedral   ///< Large cathedral, immense decay, vast space.
     };
 
-    virtual ~AlgorithmicReverb() = default;
+    ~AlgorithmicReverb() = default; // non-virtual: leaf class (no virtual dispatch)
 
     // -- Lifecycle --------------------------------------------------------------
 
@@ -1253,9 +1253,13 @@ protected:
             absB0_[d] = gMid * (T(1) - damp);   // feedforward
             absA1_[d] = damp;                     // feedback (pole)
 
-            // Bass ratio for independent LF control
+            // Bass ratio for independent LF control. The bass shelf multiplies the
+            // per-line DC loop gain by bassRatio, so cap it so gMid*bassRatio stays
+            // below 1 — otherwise extreme decay + high bass multiplier make the low
+            // end self-sustain (a non-decaying drone) instead of ringing out.
             bassRatio_[d] = gBass / (gMid + T(1e-10));
-            bassRatio_[d] = std::clamp(bassRatio_[d], T(0.1), T(3));
+            const T maxBassRatio = T(0.98) / std::max(gMid, T(1e-6));
+            bassRatio_[d] = std::clamp(bassRatio_[d], T(0.1), std::min(T(3), maxBassRatio));
         }
 
         // Bass crossover filter coefficient

@@ -195,7 +195,11 @@ template <FloatType T>
 [[nodiscard]] inline T wrapPhase(T phase) noexcept
 {
     // floor() correctly handles negative values, preventing branching
-    return phase - twoPi<T> * std::floor(phase * invTwoPi<T>);
+    T wrapped = phase - twoPi<T> * std::floor(phase * invTwoPi<T>);
+    // Guard against floating-point cancellation producing exactly twoPi for
+    // tiny negative inputs: enforce the documented half-open range [0, 2*pi).
+    if (wrapped >= twoPi<T>) wrapped -= twoPi<T>;
+    return wrapped;
 }
 
 } // namespace dspark

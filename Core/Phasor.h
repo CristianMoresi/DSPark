@@ -68,12 +68,10 @@ public:
     [[nodiscard]] T advance() noexcept
     {
         const T current = phase_;
-        phase_ += increment_;
-
-        // Fast path: highly predictable branches, avoids libm std::floor.
-        while (phase_ >= T(1)) phase_ -= T(1);
-        while (phase_ < T(0))  phase_ += T(1);
-
+        // wrapPhase has a fast in-range exit, so the common case (|increment| < 1)
+        // costs one compare — but unlike an unbounded while-loop it can never hang
+        // on a pathological frequency (>> sample rate).
+        phase_ = wrapPhase(phase_ + increment_);
         return current;
     }
 

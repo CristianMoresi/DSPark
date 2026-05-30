@@ -29,12 +29,18 @@
 #endif
 
 // --- Restrict Macro for Pointer Aliasing Optimization -----------------------
-#if defined(_MSC_VER)
+// NOTE: functions taking DSPARK_RESTRICT pointers assume the arguments do NOT
+// alias (no overlapping ranges, dst != src). Passing overlapping/identical
+// buffers is undefined behaviour. Defined idempotently (#ifndef) because a few
+// headers historically declared the same macro.
+#ifndef DSPARK_RESTRICT
+  #if defined(_MSC_VER)
     #define DSPARK_RESTRICT __restrict
-#elif defined(__GNUC__) || defined(__clang__)
+  #elif defined(__GNUC__) || defined(__clang__)
     #define DSPARK_RESTRICT __restrict__
-#else
+  #else
     #define DSPARK_RESTRICT
+  #endif
 #endif
 
 #include <cmath>

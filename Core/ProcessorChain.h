@@ -111,6 +111,11 @@ public:
      *
      * Evaluated at compile-time via requires expressions. Only sums from
      * processors that provide a `getLatency()` method.
+     *
+     * @note Latency is summed over ALL slots regardless of per-slot bypass, so
+     *       the reported value stays constant when toggling bypass at runtime.
+     *       This is deliberate: a fluctuating latency would force the host to
+     *       re-issue plugin delay compensation on every bypass change.
      */
     [[nodiscard]] int getLatency() const noexcept
     {

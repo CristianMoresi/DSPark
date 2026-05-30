@@ -309,13 +309,10 @@ public:
      * @throw std::invalid_argument if size is invalid.
      */
     explicit FFTReal(size_t size)
-        : realSize_(size)
+        : realSize_(validateSize(size))   // validates BEFORE complexFFT_ is built
         , halfSize_(size / 2)
         , complexFFT_(size / 2)
     {
-        if (size < 4 || (size & (size - 1)) != 0)
-            throw std::invalid_argument("FFTReal size must be a power of two >= 4");
-            
         computePostTwiddles();
         workBuffer_.resize(size);
     }
@@ -435,6 +432,15 @@ public:
     }
 
 private:
+    /** @brief Validates the real-FFT size and returns it (used in the init list
+     *  so the FFTReal-specific message fires before the inner FFTComplex). */
+    static size_t validateSize(size_t size)
+    {
+        if (size < 4 || (size & (size - 1)) != 0)
+            throw std::invalid_argument("FFTReal size must be a power of two >= 4");
+        return size;
+    }
+
     void computePostTwiddles()
     {
         postTwiddles_.resize(halfSize_ * 2);

@@ -291,16 +291,20 @@ public:
     void prepare(int maxTaps, int numChannels)
     {
         assert(maxTaps > 0 && numChannels > 0);
-        
+
         maxTaps_ = maxTaps;
         numChannels_ = numChannels;
-        
-        // Ping-pong buffers for thread-safe coefficient updates
-        pingCoeffs_.assign(static_cast<size_t>(maxTaps_), T(0));
-        pongCoeffs_.assign(static_cast<size_t>(maxTaps_), T(0));
-        
-        activeTaps_.store(0, std::memory_order_release);
-        activeCoeffsPtr_.store(pingCoeffs_.data(), std::memory_order_release);
+
+        // SPSC coefficient publication: a shared staging buffer (written by the
+        // control thread under a seqlock) and an audio-thread-private active
+        // buffer (copied once per update, never overwritten mid-block).
+        stagingCoeffs_.assign(static_cast<size_t>(maxTaps_), T(0));
+        activeCoeffs_.assign(static_cast<size_t>(maxTaps_), T(0));
+        stagingTaps_  = 0;
+        activeTaps_   = 0;
+        coeffSeq_.store(0, std::memory_order_release);
+        coeffDirty_.store(false, std::memory_order_release);
+        reportedTaps_.store(0, std::memory_order_release);
 
         // Flattened delay line buffer using the "mirror" technique.
         // Size: numChannels * (maxTaps * 2)
@@ -318,6 +322,9 @@ public:
      * on the inactive buffer. A real-time crossfade is recommended for smooth morphing.
      *
      * @param coeffs Span of coefficients. Size must be <= maxTaps passed to prepare().
+     * @note Thread-safe single-producer publish via a seqlock. The audio thread
+     *       copies the staged set into its private buffer atomically, so neither
+     *       a (ptr, count) mismatch nor a mid-block overwrite can occur.
      */
     void setCoefficients(std::span<const T> coeffs) noexcept
     {
@@ -326,19 +333,15 @@ public:
         const int numTaps = static_cast<int>(coeffs.size());
         if (numTaps == 0 || numTaps > maxTaps_) return;
 
-        // Determine inactive buffer
-        T* inactiveBuffer = (activeCoeffsPtr_.load(std::memory_order_acquire) == pingCoeffs_.data()) 
-                            ? pongCoeffs_.data() 
-                            : pingCoeffs_.data();
-
-        // Write REVERSED coefficients to the inactive buffer for SIMD dot product
-        for (int k = 0; k < numTaps; ++k) {
-            inactiveBuffer[k] = coeffs[numTaps - 1 - k];
-        }
-
-        // Atomically update state
-        activeTaps_.store(numTaps, std::memory_order_release);
-        activeCoeffsPtr_.store(inactiveBuffer, std::memory_order_release);
+        // Seqlock publish: odd sequence = write in progress.
+        coeffSeq_.fetch_add(1, std::memory_order_acq_rel);
+        // Write REVERSED coefficients to the staging buffer for SIMD dot product.
+        for (int k = 0; k < numTaps; ++k)
+            stagingCoeffs_[static_cast<size_t>(k)] = coeffs[static_cast<size_t>(numTaps - 1 - k)];
+        stagingTaps_ = numTaps;
+        coeffSeq_.fetch_add(1, std::memory_order_release); // even = consistent
+        coeffDirty_.store(true, std::memory_order_release);
+        reportedTaps_.store(numTaps, std::memory_order_release);
     }
 
     /** * @brief Resets all delay lines to zero, clearing the filter's memory. 
@@ -356,15 +359,18 @@ public:
      *
      * @param buffer Audio buffer view to process.
      */
-    void processBlock(AudioBufferView<T>& buffer) noexcept
+    void processBlock(AudioBufferView<T> buffer) noexcept
     {
         if (!isPrepared_.load(std::memory_order_acquire)) return;
 
-        // Load state ONCE per block
-        const int currentTaps = activeTaps_.load(std::memory_order_acquire);
+        // Pick up any pending coefficient update once per block (seqlock copy
+        // into the audio-thread-private active buffer).
+        pullCoeffsIfDirty();
+
+        const int currentTaps = activeTaps_;
         if (currentTaps == 0) return; // Bypass if uninitialized
 
-        const T* currentCoeffs = activeCoeffsPtr_.load(std::memory_order_acquire);
+        const T* currentCoeffs = activeCoeffs_.data();
         const int numChannels = std::min(buffer.getNumChannels(), numChannels_);
         const int numSamples  = buffer.getNumSamples();
 
@@ -406,11 +412,15 @@ public:
     {
         if (!isPrepared_.load(std::memory_order_acquire)) return input;
 
-        const int currentTaps = activeTaps_.load(std::memory_order_acquire);
+        // Cheap relaxed check; the seqlock copy only runs when an update landed.
+        if (coeffDirty_.load(std::memory_order_relaxed)) [[unlikely]]
+            pullCoeffsIfDirty();
+
+        const int currentTaps = activeTaps_;
         if (currentTaps == 0) return input;
 
-        const T* currentCoeffs = activeCoeffsPtr_.load(std::memory_order_acquire);
-        
+        const T* currentCoeffs = activeCoeffs_.data();
+
         auto& wp = writePositions_[static_cast<size_t>(channel)];
         const int channelOffset = channel * (maxTaps_ * 2);
         T* dl = delayLineBuffer_.data() + channelOffset;
@@ -429,22 +439,44 @@ public:
     /** * @brief Returns the filter's group delay (latency) in samples. 
      * @return Latency in samples based on currently active taps.
      */
-    [[nodiscard]] int getLatency() const noexcept 
-    { 
-        const int taps = activeTaps_.load(std::memory_order_relaxed);
-        return taps > 0 ? (taps - 1) / 2 : 0; 
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        const int taps = reportedTaps_.load(std::memory_order_relaxed);
+        return taps > 0 ? (taps - 1) / 2 : 0;
     }
 
 private:
+    /** @brief Audio-thread: copy the staged coefficient set into the private
+     *  active buffer if an update was published (seqlock read with retry). */
+    void pullCoeffsIfDirty() noexcept
+    {
+        if (!coeffDirty_.exchange(false, std::memory_order_acquire)) return;
+        unsigned s0, s1;
+        int n;
+        do {
+            s0 = coeffSeq_.load(std::memory_order_acquire);
+            n  = stagingTaps_;
+            for (int k = 0; k < n; ++k)
+                activeCoeffs_[static_cast<size_t>(k)] = stagingCoeffs_[static_cast<size_t>(k)];
+            s1 = coeffSeq_.load(std::memory_order_acquire);
+        } while ((s0 & 1u) != 0u || s0 != s1);
+        activeTaps_ = n;
+    }
+
     int maxTaps_{0};
     int numChannels_{0};
     std::atomic<bool> isPrepared_{false};
-    
-    // Thread-safe coefficient swapping mechanism
-    std::vector<T> pingCoeffs_;
-    std::vector<T> pongCoeffs_;
-    std::atomic<T*> activeCoeffsPtr_{nullptr};
-    std::atomic<int> activeTaps_{0};
+
+    // SPSC seqlock coefficient publication (writer: setCoefficients).
+    std::vector<T> stagingCoeffs_;          ///< Shared staging (reversed coeffs).
+    int stagingTaps_{0};                    ///< Guarded by coeffSeq_.
+    std::atomic<unsigned> coeffSeq_{0};     ///< Seqlock counter (odd = writing).
+    std::atomic<bool> coeffDirty_{false};   ///< Pending-update flag (fast path).
+    std::atomic<int> reportedTaps_{0};      ///< Latest set tap count for getLatency().
+
+    // Audio-thread-private active coefficient set (never overwritten mid-block).
+    std::vector<T> activeCoeffs_;
+    int activeTaps_{0};
 
     // Flattened, cache-contiguous delay lines
     std::vector<T> delayLineBuffer_;

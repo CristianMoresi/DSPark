@@ -4,7 +4,7 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.01** — 73 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
+**v1.1** — 73 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
 
 ```cpp
 #include "DSPark/DSPark.h"
@@ -63,12 +63,12 @@ You never see complexity you don't need. But it's always there when you do.
 
 ### Extensible by Design
 
-Every effect class features virtual destructors and protected internals. Build professional products on top:
+Effect classes expose **protected internals** so you can subclass them directly to reach the delay lines, filters and early reflections inside. They are deliberately **leaf classes with non-virtual destructors** — honouring the zero-virtual-dispatch design — so you extend by direct inheritance and composition rather than polymorphic base-pointer deletion:
 
 ```cpp
 class MyReverb : public dspark::AlgorithmicReverb<float> {
     // Access FDN delay lines, absorption filters, early reflections...
-    // Override presets, add custom processing stages
+    // Add custom processing stages, expose your own presets
 };
 ```
 
@@ -92,7 +92,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `AlgorithmicReverb<T>` | 16-line FDN with Jot (1991) frequency-dependent absorption, Householder feedback mixing, Lexicon-style smooth random + noise modulation, serial allpass per line (Infinity2-style), feedback IIR smoothing (Verbity), allpass-interpolated modulated reads, tanh soft saturation, parallel allpass input diffuser (256 echo paths), Dattorro multi-tap output, output diffusion, M/S stereo width control, progressive ER absorption. 6 presets: Room, Hall, Chamber, Plate, Spring, Cathedral. Full parameter API for custom reverb design. |
 | `Reverb<T>` | Convolution reverb with IR loading, pre-delay, auto-resample |
 | `Saturation<T>` | 10 algorithms (Tube, Tape, Transformer, SoftClip, HardClip, Exciter, Wavefolder, Bitcrusher, Downsample, MultiStage). Adaptive blend, slew-dependent saturation, oversampling. |
-| `Clipper<T>` | 4-mode clipper (Hard/Soft/Analog/GoldenRatio), multi-stage, slew limiter, 2x/4x oversampling |
+| `Clipper<T>` | 4-mode clipper (Hard/Soft/Analog/GoldenRatio), multi-stage, slew limiter, up to 16x oversampling |
 | `FilterEngine<T>` | Cascaded biquads, 9 shapes, 6–48 dB/oct slopes |
 | `CrossoverFilter<T>` | Linkwitz-Riley crossover (LR12/24/48), IIR + linear-phase modes |
 | `Chorus<T>` | Multi-voice LFO delay, stereo spread, flanger mode |
@@ -122,7 +122,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `FFTComplex<T>` / `FFTReal<T>` | Radix-2 FFT with SIMD (SSE3/NEON), real-optimised |
 | `Convolver<T>` | Partitioned overlap-save FFT convolution |
 | `FIRFilter<T>` | FIR engine with windowed-sinc design |
-| `Oversampling<T>` | 2x–16x FIR half-band Kaiser filters (-80 dB+ rejection) |
+| `Oversampling<T>` | 2x–16x polyphase half-band Kaiser filters (-80 dB+ rejection), transparent up/down round-trip, exact reported latency |
 | `Oscillator<T>` | PolyBLEP (sine, saw, square, triangle) |
 | `WavetableOscillator<T>` | Mipmapped wavetable with bandlimited harmonics |
 | `Resampler<T>` | Polyphase windowed-sinc sample-rate conversion |
@@ -135,7 +135,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `Dither<T>` | TPDF dithering with noise shaping |
 | `DenormalGuard` | RAII FTZ/DAZ (x86 SSE, ARM, WebAssembly) |
 | `Interpolation` | 5 methods (linear, cubic, Hermite, Lagrange, allpass) |
-| `Hilbert<T>` | Allpass Hilbert transform for analytic signals |
+| `Hilbert<T>` | FIR (windowed-sinc) Hilbert transform for analytic signals — flat magnitude across the audible band |
 | `WindowFunctions<T>` | 8 windows (Hann, Hamming, Blackman, Kaiser…) |
 | `DryWetMixer<T>` | Parallel dry/wet mixing for effects |
 | `SpinLock` | RT-safe spinlock for thread-safe parameters |
@@ -277,7 +277,7 @@ eq.getMagnitudeForFrequencyArray(freqs.data(), mags.data(), 512);
 
 ## DSParkLab — Interactive Testing App
 
-DSParkLab is an interactive GUI application for real-time testing of every DSPark processor. Load any audio file, enable effects, tweak parameters with sliders, and hear the results instantly.
+DSParkLab is an interactive, plugin-style GUI application for real-time testing of every DSPark processor. Load any audio file, enable effects, shape them on an interactive analyzer or with parameter controls, and hear the results instantly.
 
 ```bash
 # Build (requires MSVC with C++20 support + Windows SDK for D3D11)
@@ -288,12 +288,14 @@ DSParkLab\DSParkLab.exe
 **Features:**
 
 - Asynchronous WAV/MP3 loading with format auto-detection (audio thread never blocks on I/O)
-- 25 effects organised by category (Filters, Dynamics, Distortion, Modulation, Spatial, Utility)
-- Auto-generated parameter panels (sliders, toggles, combo boxes) from effect descriptors
-- Real-time waveform display, FFT spectrum analyzer, and L/R level meters
-- Gain-reduction metering for compressor, limiter, de-esser, saturation and clipper
-- A/B bypass for instant comparison between original and processed audio
-- Transport controls: play, pause, stop, seek, loop
+- 28 effects organised by category (Filters, Dynamics, Distortion, Modulation, Spatial, Utility) — including Dynamic EQ, Multiband Compressor and Convolution Reverb
+- **Interactive analyzer**: log-frequency spectrum behind a live response curve, with **draggable nodes** for the EQ / Filter / Dynamic EQ (drag X = frequency, Y = gain, mouse-wheel = Q)
+- Dynamic EQ draws its **live** per-band reaction in real time; multiband compressor shows crossover bands with per-band gain reduction
+- Auto-generated parameter panels with mouse-wheel-adjustable sliders and combo boxes
+- Live oversampling selection (up to 16x) on Saturation and Clipper for audible anti-alias comparison
+- Convolution Reverb loads real impulse responses (WAV) or builds a synthetic one
+- Per-channel level meters, waveform view, and gain-reduction metering
+- A/B bypass for instant comparison, and transport controls (play, pause, stop, seek, loop)
 
 Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](https://miniaud.io/) (public domain). These dependencies are bundled in `DSParkLab/vendor/` and are only used by the testing app — the DSPark framework itself remains 100% dependency-free.
 
@@ -303,7 +305,7 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 
 | Platform | Status | Notes |
 |---|---|---|
-| Windows (MSVC) | Tested | C++20, /W4, zero warnings |
+| Windows (MSVC) | Tested | C++20, /W4 /WX- (only benign C4324 `alignas` padding notices) |
 | Linux (GCC) | Compatible | C++20, -Wall -Wextra |
 | macOS (Clang) | Compatible | C++20, -Wall -Wextra |
 | WebAssembly (Emscripten) | Compatible | Zero syscalls in audio path |

@@ -233,10 +233,28 @@ public:
     }
 
     /** @brief Returns the active filter shape. */
-    [[nodiscard]] Shape getShape() const noexcept { return shape_; }
+    [[nodiscard]] Shape getShape() const noexcept { return shape_.load(std::memory_order_relaxed); }
 
     /** @brief Returns the active slope in dB/oct (LP/HP only — others = 12). */
-    [[nodiscard]] int getSlopeDb() const noexcept { return slopeDb_; }
+    [[nodiscard]] int getSlopeDb() const noexcept { return slopeDb_.load(std::memory_order_relaxed); }
+
+    /** @brief Per-stage Butterworth cascade layout for an LP/HP slope (for analysis). */
+    struct CascadeInfo { bool hasFirstOrder = false; int numSecondOrder = 0; float qValues[4] = {}; };
+
+    /**
+     * @brief Returns the exact Butterworth cascade (first-order flag + per-stage Q
+     * values) used internally for a given LP/HP slope. Lets callers reproduce the
+     * true cascade magnitude instead of approximating with a single Q.
+     */
+    [[nodiscard]] static CascadeInfo cascadeForSlope(int slopeDb) noexcept
+    {
+        auto c = computeCascade(slopeDb);
+        CascadeInfo info;
+        info.hasFirstOrder  = c.hasFirstOrder;
+        info.numSecondOrder = c.numSecondOrder;
+        for (int i = 0; i < c.numSecondOrder && i < 4; ++i) info.qValues[i] = c.qValues[i];
+        return info;
+    }
 
     /**
      * @brief Switches the filter topology while keeping the current frequency,
@@ -360,7 +378,7 @@ public:
                     for (int i = 0; i < nS; ++i)
                     {
                         T sample = channelData[i];
-                        for (int s = 0; s < numStages_; ++s)
+                        for (int s = 0, ns = numStages_.load(std::memory_order_relaxed); s < ns; ++s)
                             sample = stages_[s].processSample(sample, ch);
                         channelData[i] = sample;
                     }
@@ -408,7 +426,7 @@ public:
                 for (int ch = 0; ch < nCh; ++ch)
                 {
                     T sample = buffer.getChannel(ch)[i];
-                    for (int s = 0; s < numStages_; ++s)
+                    for (int s = 0, ns = numStages_.load(std::memory_order_relaxed); s < ns; ++s)
                         sample = stages_[s].processSample(sample, ch);
                     buffer.getChannel(ch)[i] = sample;
                 }
@@ -426,7 +444,7 @@ public:
     T processSample(T input, int channel) noexcept
     {
         T sample = input;
-        for (int s = 0; s < numStages_; ++s)
+        for (int s = 0, ns = numStages_.load(std::memory_order_relaxed); s < ns; ++s)
             sample = stages_[s].processSample(sample, channel);
         return sample;
     }
@@ -476,13 +494,18 @@ protected:
         double sr = spec_.sampleRate;
         double f  = static_cast<double>(freq);
 
-        auto cascade = computeCascade(slopeDb_);
+        // Snapshot atomic topology once.
+        const Shape sh = shape_.load(std::memory_order_relaxed);
+        const int sdb  = slopeDb_.load(std::memory_order_relaxed);
+        const double ssl = static_cast<double>(shelfSlope_.load(std::memory_order_relaxed));
+
+        auto cascade = computeCascade(sdb);
         int stageIdx = 0;
 
         if (cascade.hasFirstOrder)
         {
             BiquadCoeffs<T> c;
-            switch (shape_)
+            switch (sh)
             {
                 case Shape::LowPass:   c = BiquadCoeffs<T>::makeFirstOrderLowPass(sr, f); break;
                 case Shape::HighPass:  c = BiquadCoeffs<T>::makeFirstOrderHighPass(sr, f); break;
@@ -495,19 +518,19 @@ protected:
         {
             float stageQ = cascade.qValues[s];
 
-            if (shape_ == Shape::Peak || shape_ == Shape::BandPass ||
-                shape_ == Shape::Notch || shape_ == Shape::AllPass)
+            if (sh == Shape::Peak || sh == Shape::BandPass ||
+                sh == Shape::Notch || sh == Shape::AllPass)
                 stageQ = Q;
 
             BiquadCoeffs<T> c;
-            switch (shape_)
+            switch (sh)
             {
                 case Shape::LowPass:   c = BiquadCoeffs<T>::makeLowPass(sr, f, stageQ);  break;
                 case Shape::HighPass:  c = BiquadCoeffs<T>::makeHighPass(sr, f, stageQ); break;
                 case Shape::BandPass:  c = BiquadCoeffs<T>::makeBandPass(sr, f, stageQ); break;
                 case Shape::Peak:      c = BiquadCoeffs<T>::makePeak(sr, f, stageQ, gainDb); break;
-                case Shape::LowShelf:  c = BiquadCoeffs<T>::makeLowShelf(sr, f, gainDb, shelfSlope_); break;
-                case Shape::HighShelf: c = BiquadCoeffs<T>::makeHighShelf(sr, f, gainDb, shelfSlope_); break;
+                case Shape::LowShelf:  c = BiquadCoeffs<T>::makeLowShelf(sr, f, gainDb, ssl); break;
+                case Shape::HighShelf: c = BiquadCoeffs<T>::makeHighShelf(sr, f, gainDb, ssl); break;
                 case Shape::Notch:     c = BiquadCoeffs<T>::makeNotch(sr, f, stageQ);  break;
                 case Shape::AllPass:   c = BiquadCoeffs<T>::makeAllPass(sr, f, stageQ); break;
                 case Shape::Tilt:      c = BiquadCoeffs<T>::makeTilt(sr, f, gainDb); break;
@@ -519,10 +542,13 @@ protected:
     }
 
     AudioSpec spec_ {};
-    Shape shape_ = Shape::LowPass;
-    int numStages_ = 1;
-    int slopeDb_ = 12; 
-    float shelfSlope_ = 1.0f;
+    // Topology state is atomic: setLowPass()/setShape()/... may be called from a
+    // control thread while processBlock() reads these on the audio thread.
+    // (Reads happen once per block, so atomics impose no hot-path cost.)
+    std::atomic<Shape> shape_ { Shape::LowPass };
+    std::atomic<int> numStages_ { 1 };
+    std::atomic<int> slopeDb_ { 12 };
+    std::atomic<float> shelfSlope_ { 1.0f };
 
     std::array<Biquad<T, MaxChannels>, kMaxStages> stages_ {};
 

@@ -38,7 +38,7 @@ template <FloatType T>
 class Expander
 {
 public:
-    virtual ~Expander() = default;
+    ~Expander() = default; // non-virtual: leaf class (no virtual dispatch)
 
     enum class State { Closed, Open, Hold };
 
@@ -292,8 +292,8 @@ protected:
     std::atomic<bool> scHpfEnabled_ { false };
     T scHpfCoeff_ = T(0.995);
     
-    // Arrays for true-stereo independent HPF states
-    static constexpr int MAX_CHANNELS = 8;
+    // Per-channel sidechain HPF state (16 = AudioBufferView channel cap).
+    static constexpr int MAX_CHANNELS = 16;
     std::array<T, MAX_CHANNELS> scHpfState_{};
     std::array<T, MAX_CHANNELS> scHpfPrev_{};
 

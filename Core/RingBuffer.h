@@ -51,11 +51,12 @@ template <FloatType T>
 class RingBuffer
 {
 public:
-    RingBuffer() noexcept 
-    {
-        // Safe default state prevents crashes if used before prepare()
-        prepare(64); 
-    }
+    /**
+     * @brief Constructs an empty ring buffer. No allocation happens until
+     * prepare() is called — honouring the framework's "allocate only in
+     * prepare()" contract. push()/read() are safe no-ops before prepare().
+     */
+    RingBuffer() noexcept = default;
 
     /**
      * @brief Allocates the ring buffer with the given capacity.
@@ -75,9 +76,12 @@ public:
 
         mask_ = capacity_ - 1;
 
-        // Ensure 32-byte alignment for SIMD operations
+        // Ensure 32-byte alignment for SIMD operations. std::aligned_alloc
+        // additionally requires the size to be an integral multiple of the
+        // alignment (UB / nullptr otherwise on POSIX), so round bytes up to 32.
         size_t bytes = static_cast<size_t>(capacity_) * sizeof(T);
-        
+        bytes = (bytes + 31u) & ~static_cast<size_t>(31u);
+
         // Custom deleter for aligned allocation
         buffer_.reset(static_cast<T*>(
             #if defined(_MSC_VER)
@@ -86,6 +90,9 @@ public:
                 std::aligned_alloc(32, bytes)
             #endif
         ));
+
+        // On allocation failure leave the buffer in a safe unprepared state.
+        if (!buffer_) { capacity_ = 0; mask_ = 0; writePos_ = 0; return; }
 
         reset();
     }
@@ -107,6 +114,7 @@ public:
      */
     inline void push(T sample) noexcept
     {
+        if (capacity_ == 0) [[unlikely]] return; // not prepared
         buffer_[writePos_] = sample;
         writePos_ = (writePos_ + 1) & mask_;
     }
@@ -132,9 +140,10 @@ public:
      */
     [[nodiscard]] inline T read(int delaySamples) const noexcept
     {
-        assert(delaySamples >= 0 && delaySamples < capacity_ 
+        if (capacity_ == 0) [[unlikely]] return T(0); // not prepared
+        assert(delaySamples >= 0 && delaySamples < capacity_
                && "RingBuffer::read: delay out of range");
-        
+
         int idx = (writePos_ - 1 - delaySamples) & mask_;
         return buffer_[idx];
     }
@@ -175,13 +184,16 @@ public:
             s[2] = read(intDelay + 1);
             s[3] = read(intDelay + 2);
 
-            // frac is strictly passed, NOT T(1) + frac
-            if constexpr (Method == InterpMethod::Cubic)
-                return interpolateCubic(s, 4, frac);
-            else if constexpr (Method == InterpMethod::Hermite)
-                return interpolateHermite(s, 4, frac);
+            // Interpolate within the s[1]..s[2] interval, so an integer delay
+            // (frac == 0) returns exactly read(intDelay) == s[1]. The 4-point
+            // (y0,y1,y2,y3,frac) overloads do precisely that. (Calling the
+            // buffer+position overloads with `frac` would misread it as an
+            // absolute index and interpolate s[0]..s[1] with a wrapped neighbour,
+            // i.e. a 1-sample delay error.)
+            if constexpr (Method == InterpMethod::Cubic || Method == InterpMethod::Hermite)
+                return interpolateHermite(s[0], s[1], s[2], s[3], frac);
             else if constexpr (Method == InterpMethod::Lagrange)
-                return interpolateLagrange(s, 4, frac);
+                return interpolateLagrange(s[0], s[1], s[2], s[3], frac);
         }
     }
 

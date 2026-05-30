@@ -144,7 +144,7 @@ public:
 template <typename T>
 class WavefolderAlgorithm final : public SaturationAlgorithm<T>
 {
-    static constexpr int kMaxCh = 8;
+    static constexpr int kMaxCh = 16;
     std::array<T, kMaxCh> lastX_ {};
     std::array<T, kMaxCh> lastF_ {};
 
@@ -207,7 +207,7 @@ public:
 template <typename T>
 class TapeAlgorithm final : public SaturationAlgorithm<T>
 {
-    static constexpr int kMaxCh = 8;
+    static constexpr int kMaxCh = 16;
     std::array<Biquad<T, 1>, kMaxCh> preFilters_;  
     std::array<Biquad<T, 1>, kMaxCh> postFilters_; 
     std::array<T, kMaxCh>            M_ {};        
@@ -232,7 +232,7 @@ class TapeAlgorithm final : public SaturationAlgorithm<T>
 public:
     void prepare(const AudioSpec& spec) noexcept override
     {
-        numChannels_ = spec.numChannels;
+        numChannels_ = std::min(spec.numChannels, kMaxCh); // clamp per-channel state
         reset();
     }
     void reset() noexcept override
@@ -297,14 +297,14 @@ public:
 template <typename T>
 class TransformerAlgorithm final : public SaturationAlgorithm<T>
 {
-    static constexpr int kMaxCh = 8;
+    static constexpr int kMaxCh = 16;
     std::array<Biquad<T, 1>, kMaxCh> lpFilters_;
     int numChannels_ = 0;
 
 public:
     void prepare(const AudioSpec& spec) noexcept override
     {
-        numChannels_ = spec.numChannels;
+        numChannels_ = std::min(spec.numChannels, kMaxCh); // clamp per-channel state
         reset();
     }
     void reset() noexcept override
@@ -335,7 +335,7 @@ public:
 template <typename T>
 class DownsampleAlgorithm final : public SaturationAlgorithm<T>
 {
-    static constexpr int kMaxCh = 8;
+    static constexpr int kMaxCh = 16;
     std::array<Biquad<T, 1>, kMaxCh> aaFilters_;
     std::array<T, kMaxCh>            lastSample_ {};
     std::array<int, kMaxCh>          counter_    {};
@@ -345,7 +345,7 @@ class DownsampleAlgorithm final : public SaturationAlgorithm<T>
 public:
     void prepare(const AudioSpec& spec) noexcept override
     {
-        numChannels_ = spec.numChannels;
+        numChannels_ = std::min(spec.numChannels, kMaxCh); // clamp per-channel state
         reset();
     }
     void reset() noexcept override
@@ -507,9 +507,14 @@ public:
         dryWetMixer_.prepare(spec);
         
         if (oversampler_) oversampler_->prepare(spec);
-        
+
         tempBuffer_.resize(spec.numChannels, spec.maxBlockSize * std::max(1, oversamplingFactor_));
         driftBuffer_.resize(spec.numChannels, spec.maxBlockSize * std::max(1, oversamplingFactor_));
+
+        // Keep the dry path aligned with the (latent) oversampled wet path so the
+        // dry/wet, Delta and adaptive-blend mixes do not comb-filter.
+        dryWetMixer_.setLatencyCompensation(
+            (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0);
 
         auto sr = spec.sampleRate;
         driveSmoother_.reset(sr, 20.0f, 0.707f, 0.0f);
@@ -798,6 +803,20 @@ public:
         }
         else
             oversampler_.reset();
+
+        // If prepare() already ran, grow the scratch buffers to hold the
+        // upsampled block and realign the dry path; otherwise prepare() does it.
+        if (prepared_)
+        {
+            const int upBlock = spec_.maxBlockSize * std::max(1, oversamplingFactor_);
+            if (tempBuffer_.getNumSamples() < upBlock)
+                tempBuffer_.resize(spec_.numChannels, upBlock);
+            if (driftBuffer_.getNumSamples() < upBlock)
+                driftBuffer_.resize(spec_.numChannels, upBlock);
+
+            dryWetMixer_.setLatencyCompensation(
+                (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0);
+        }
     }
 
     // -- Thread-Safe Getters (GUI / Metering) --------------------------------
@@ -807,6 +826,16 @@ public:
      * @return Multiplier (1, 2, 4, 8, 16).
      */
     [[nodiscard]] int getOversamplingFactor() const noexcept { return oversamplingFactor_; }
+
+    /**
+     * @brief Reports the processor's algorithmic latency in samples.
+     * @note Equals the oversampler group delay (0 when oversampling is off).
+     *       Report this to the host for plugin delay compensation (PDC).
+     */
+    [[nodiscard]] int getLatencySamples() const noexcept
+    {
+        return (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0;
+    }
 
     /** 
      * @brief Retrieves the currently active underlying algorithm.
@@ -1101,7 +1130,7 @@ protected:
     std::atomic<SampleType> gainReductionDb_ { SampleType(0) };
 
     std::atomic<bool> adaptiveBlend_ { false };
-    static constexpr int kMaxCh = 8;
+    static constexpr int kMaxCh = 16;
     std::array<SampleType, kMaxCh> prevBlendSample_ {};
 
     std::atomic<SampleType> slewSensitivity_ { SampleType(0) };

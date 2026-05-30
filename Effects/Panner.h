@@ -165,12 +165,14 @@ protected:
         T itdMax = T(binauralMaxITD_.load(std::memory_order_relaxed));
         T targetP = static_cast<T>(panTarget);
 
-        // Push the new ITD targets. The contralateral ear (the one further
-        // from the source) gets the delay; the ipsilateral ear has 0 delay.
-        // Delay smooths internally (CriticallyDamped) so per-sample delay-time
-        // changes are glitch-free.
-        delayL_.setDelayMs(itdMax * std::max(T(0), targetP));   // pan>0 ⇒ L delayed
-        delayR_.setDelayMs(itdMax * std::max(T(0), -targetP));  // pan<0 ⇒ R delayed
+        // Push the new ITD targets. A small COMMON base delay is added to both ears
+        // so neither hits the delay line's 3-sample interpolation floor: that floor
+        // used to clamp both ears to 3 for |pan| < ~0.1, killing the ITD cue near
+        // centre (a localization dead-zone). With the base offset the ITD difference
+        // is linear from the centre, and the shared delay is inaudible.
+        const T baseMs = T(4000) / static_cast<T>(sampleRate_); // ~4 samples
+        delayL_.setDelayMs(baseMs + itdMax * std::max(T(0), targetP));   // pan>0 ⇒ L delayed
+        delayR_.setDelayMs(baseMs + itdMax * std::max(T(0), -targetP));  // pan<0 ⇒ R delayed
 
         for (int i = 0; i < n; ++i)
         {
@@ -260,8 +262,11 @@ protected:
         T pT = static_cast<T>(panTarget);
 
         // Smoothed inside Delay — no abrupt pointer jumps even on fast moves.
-        delayL_.setDelayMs(haasMax * std::max(T(0), pT));
-        delayR_.setDelayMs(haasMax * std::max(T(0), -pT));
+        // Common base delay keeps both ears above the 3-sample interpolation floor
+        // so the inter-channel delay is linear from centre (no dead-zone).
+        const T baseMs = T(4000) / static_cast<T>(sampleRate_); // ~4 samples
+        delayL_.setDelayMs(baseMs + haasMax * std::max(T(0), pT));
+        delayR_.setDelayMs(baseMs + haasMax * std::max(T(0), -pT));
 
         T* L = buffer.getChannel(0);
         T* R = buffer.getChannel(1);

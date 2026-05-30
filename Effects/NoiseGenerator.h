@@ -74,7 +74,10 @@ public:
             AnalogRandom::Generator<T> gen;
             gen.prepare(sampleRate_);
             gen.setRange(T(-1), T(1));
-            gen.setRateHz(static_cast<T>(sampleRate_ * 0.5));
+            // A new value EVERY sample (rate == fs): full-bandwidth noise. A lower
+            // rate would sample-and-hold the source, giving a non-flat/imaged
+            // spectrum instead of true white/pink/brown.
+            gen.setRateHz(static_cast<T>(sampleRate_));
             applyNoiseType(gen);
 
             // Decorrelate output across channels

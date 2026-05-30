@@ -72,6 +72,11 @@ public:
         mask_ = fftSize_ - 1;
 
         hopSize_ = (hopSize > 0) ? hopSize : fftSize_ / 2;
+        // The constant-overlap-add (COLA) condition and the WOLA normalization
+        // assume the hop evenly divides the FFT size. Reject non-divisor hops
+        // (they would cause audible amplitude modulation) by falling back to 50%.
+        hopSize_ = std::clamp(hopSize_, 1, fftSize_);
+        if (fftSize_ % hopSize_ != 0) hopSize_ = fftSize_ / 2;
         numBins_ = fftSize_ / 2 + 1;
 
         fft_ = std::make_unique<FFTReal<T>>(fftSize_);
@@ -196,11 +201,9 @@ private:
         // 3. User callback (Inlined directly here)
         processFunc(fftOut_.data(), numBins_);
 
-        // 4. Inverse FFT
+        // 4. Inverse FFT (FFTReal::inverse already applies the 1/N normalization,
+        //    so the analysis→synthesis round-trip is unity before windowing).
         fft_->inverse(fftOut_.data(), fftResult_.data());
-
-        // NOTE: If FFTReal::inverse() does not apply 1/N scaling inherently, 
-        // it must be applied here or folded into wolaNorm_ to avoid distortion.
 
         // 5. Synthesis window & Overlap-Add
         int writePos = outputReadPos_[ch];

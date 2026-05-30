@@ -61,8 +61,16 @@ public:
 
     /**
      * @brief Pushes audio samples into the analysis buffer.
-     * * Automatically triggers pitch detection when the hop size is reached.
-     * 100% safe to run in the real-time audio thread (no locks, no allocations).
+     *
+     * Automatically triggers pitch detection when the hop size is reached.
+     * Lock-free and allocation-free.
+     *
+     * @warning The YIN difference function is **O(windowSize²)** (~1M operations
+     * for the 2048 default). That burst runs synchronously whenever a hop boundary
+     * is crossed, so for large windows it is NOT advisable to call this directly on
+     * a low-latency audio thread — it can blow the callback's deadline. For
+     * real-time use either pick a small window/large hop, or push samples into an
+     * SPSC queue (Core/SpscQueue.h) and run detection on a dedicated worker thread.
      *
      * @param samples Span of input audio data (mono).
      */

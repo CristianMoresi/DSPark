@@ -45,7 +45,7 @@ template <FloatType T>
 class TransientDesigner
 {
 public:
-    virtual ~TransientDesigner() = default;
+    ~TransientDesigner() = default; // non-virtual: leaf class (no virtual dispatch)
 
     // -- Lifecycle -----------------------------------------------------------
 

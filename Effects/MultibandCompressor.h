@@ -80,9 +80,13 @@ public:
         // 2. Split into bands
         crossover_.processBlock(buffer, views_.data(), nb);
 
-        // 3. Compress each band independently
-        // Note: If Compressor<T> introduces Lookahead, delay compensation 
-        // per band MUST be applied here before summing to avoid phase cancellation.
+        // 3. Compress each band independently.
+        // IMPORTANT: bands are summed directly, so every band must share the SAME
+        // latency. Compressors default to 0 lookahead (latency 0) → coherent sum.
+        // If you enable lookahead, set the SAME value on every band via
+        // getBandCompressor(b).setLookahead(); a non-uniform per-band lookahead
+        // would phase-cancel at the crossover regions (this class does not
+        // auto-delay-compensate divergent per-band latencies).
         for (int b = 0; b < nb; ++b)
             compressors_[b].processBlock(views_[b]);
 
@@ -239,11 +243,15 @@ public:
     [[nodiscard]] int getNumBands() const noexcept { return crossover_.getNumBands(); }
     
     /** @brief Returns the total latency of the multi-band system. */
-    [[nodiscard]] int getLatency() const noexcept 
-    { 
-        // Note: If compressors have variable lookahead, maximum latency among 
-        // active bands + crossover latency should be returned here.
-        return crossover_.getLatency(); 
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        // Crossover latency + the largest per-band compressor lookahead (bands are
+        // expected to share the same lookahead; see processBlock()).
+        int maxBand = 0;
+        const int nb = crossover_.getNumBands();
+        for (int b = 0; b < nb && b < MaxBands; ++b)
+            maxBand = std::max(maxBand, compressors_[b].getLatency());
+        return crossover_.getLatency() + maxBand;
     }
 
     /** @brief Resets all internal states (envelopes, delay lines, etc.). */

@@ -109,9 +109,11 @@ public:
             // Complex kernel representation (Real, Imaginary interleaved)
             lpKernel_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
             
+            // Overlap-save needs (M-1) samples of history where M = 2*maxBlockSize
+            // is the FIR kernel length. Size the history buffer accordingly.
             lpPrevBlock_.resize(static_cast<size_t>(spec.numChannels));
             for (auto& pb : lpPrevBlock_)
-                pb.assign(static_cast<size_t>(spec.maxBlockSize), T(0));
+                pb.assign(static_cast<size_t>(spec.maxBlockSize * 2), T(0));
                 
             lpFftIn_.assign(static_cast<size_t>(lpFftSize_), T(0));
             lpFftOut_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
@@ -156,7 +158,7 @@ public:
         const int activeBands = numBands_.load(std::memory_order_relaxed);
         for (int i = 0; i < activeBands; ++i)
         {
-            if (configs_[i].enabled)
+            if (bandEnabled_[i].load(std::memory_order_relaxed))
                 bands_[i].processBlock(buffer);
         }
     }
@@ -175,7 +177,7 @@ public:
         
         for (int i = 0; i < activeBands; ++i)
         {
-            if (configs_[i].enabled)
+            if (bandEnabled_[i].load(std::memory_order_relaxed))
                 sample = bands_[i].processSample(sample, channel);
         }
         return sample;
@@ -235,6 +237,7 @@ public:
         if (index < 0 || index >= MaxBands) return;
 
         configs_[index] = config;
+        bandEnabled_[index].store(config.enabled, std::memory_order_release);
 
         int currentBands = numBands_.load(std::memory_order_relaxed);
         if (index >= currentBands)
@@ -269,6 +272,7 @@ public:
             cfg.enabled   = true;
 
             configs_[i] = cfg;
+            bandEnabled_[i].store(true, std::memory_order_release);
         }
         configDirty_.store(true, std::memory_order_release);
     }
@@ -300,6 +304,7 @@ public:
         if (index >= 0 && index < MaxBands)
         {
             configs_[index].enabled = enabled;
+            bandEnabled_[index].store(enabled, std::memory_order_release);
             configDirty_.store(true, std::memory_order_release);
         }
     }
@@ -364,16 +369,17 @@ public:
         {
             if (!configs_[b].enabled) continue;
 
-            auto coeffs = computeBandCoeffs(configs_[b]);
-            int numStages = (configs_[b].type == BandType::LowPass || configs_[b].type == BandType::HighPass)
-                            ? std::clamp(configs_[b].slope / 12, 1, 4) : 1;
+            // Evaluate the TRUE per-stage cascade (built once per band) — the old
+            // code used a single-Q biquad with `mag *= mag` (which squares the
+            // exponent each step instead of incrementing it).
+            BiquadCoeffs<T> st[5];
+            const int ns = buildBandStages(configs_[b], st);
 
             for (int i = 0; i < numPoints; ++i)
             {
-                T mag = coeffs.getMagnitude(static_cast<double>(frequencies[i]), spec_.sampleRate);
-                for (int s = 1; s < numStages; ++s)
-                    mag *= mag; // Corrected magnitude cascade exponentiation
-                
+                T mag = T(1);
+                for (int s = 0; s < ns; ++s)
+                    mag *= st[s].getMagnitude(static_cast<double>(frequencies[i]), spec_.sampleRate);
                 magnitudes[i] *= mag;
             }
         }
@@ -457,6 +463,39 @@ protected:
     }
 
     /**
+     * @brief Fills `stages` with the ACTUAL biquad cascade for a band (per-stage
+     * Butterworth Q for multi-stage LP/HP, single biquad otherwise) and returns
+     * the stage count. Used for an accurate magnitude response that matches what
+     * the IIR FilterEngine really applies (instead of a single-Q^N approximation).
+     * @param stages Output buffer (capacity >= 5).
+     */
+    [[nodiscard]] int buildBandStages(const BandConfig& cfg, BiquadCoeffs<T>* stages) const noexcept
+    {
+        const double sr = spec_.sampleRate;
+        const double f  = static_cast<double>(cfg.frequency);
+
+        if (cfg.type == BandType::LowPass || cfg.type == BandType::HighPass)
+        {
+            const bool lp = (cfg.type == BandType::LowPass);
+            auto casc = FilterEngine<T>::cascadeForSlope(cfg.slope);
+            int n = 0;
+            if (casc.hasFirstOrder)
+                stages[n++] = lp ? BiquadCoeffs<T>::makeFirstOrderLowPass(sr, f)
+                                 : BiquadCoeffs<T>::makeFirstOrderHighPass(sr, f);
+            for (int s = 0; s < casc.numSecondOrder; ++s)
+            {
+                const double q = static_cast<double>(casc.qValues[s]);
+                stages[n++] = lp ? BiquadCoeffs<T>::makeLowPass(sr, f, q)
+                                 : BiquadCoeffs<T>::makeHighPass(sr, f, q);
+            }
+            return n;
+        }
+
+        stages[0] = computeBandCoeffs(cfg);
+        return 1;
+    }
+
+    /**
      * @brief Mathematically robust Linear Phase kernel computation.
      *
      * Constructs a true zero-phase impulse response by evaluating the H(k)
@@ -472,43 +511,24 @@ protected:
         std::vector<T> mag(numBins, T(1));
         const int activeBands = numBands_.load(std::memory_order_relaxed);
 
-        // 1. Accumulate spectral magnitude of all active filters
+        // 1. Accumulate the TRUE per-stage cascade magnitude of all active bands
+        //    (matches what the IIR FilterEngine applies in MinimumPhase mode, so
+        //    switching modes keeps the same magnitude response).
+        const double sr = spec_.sampleRate;
         for (int b = 0; b < activeBands; ++b)
         {
             if (!configs_[b].enabled) continue;
 
-            auto coeffs = computeBandCoeffs(configs_[b]);
-            int numStages = (configs_[b].type == BandType::LowPass || configs_[b].type == BandType::HighPass)
-                            ? std::clamp(configs_[b].slope / 12, 1, 4) : 1;
+            BiquadCoeffs<T> st[5];
+            const int ns = buildBandStages(configs_[b], st);
 
             for (int k = 0; k < numBins; ++k)
             {
-                T omega = T(2) * static_cast<T>(pi<double>) * static_cast<T>(k) / static_cast<T>(lpFftSize_);
-                
-                T cosW  = std::cos(omega);
-                T cos2W = std::cos(T(2) * omega);
-                T sinW  = std::sin(omega);
-                T sin2W = std::sin(T(2) * omega);
-
-                T numRe = coeffs.b0 + coeffs.b1 * cosW + coeffs.b2 * cos2W;
-                T numIm =           - coeffs.b1 * sinW - coeffs.b2 * sin2W;
-
-                T denRe = T(1) + coeffs.a1 * cosW + coeffs.a2 * cos2W;
-                T denIm =      - coeffs.a1 * sinW - coeffs.a2 * sin2W;
-
-                T numMag2 = numRe * numRe + numIm * numIm;
-                T denMag2 = denRe * denRe + denIm * denIm;
-
-                T biquadMag = (denMag2 > T(1e-30)) ? std::sqrt(numMag2 / denMag2) : T(0);
-
-                if (numStages > 1)
-                {
-                    T m = biquadMag;
-                    for (int s = 1; s < numStages; ++s) m *= biquadMag;
-                    biquadMag = m;
-                }
-
-                mag[k] *= biquadMag;
+                const double freq = sr * static_cast<double>(k) / static_cast<double>(lpFftSize_);
+                T m = T(1);
+                for (int s = 0; s < ns; ++s)
+                    m *= st[s].getMagnitude(freq, sr);
+                mag[k] *= m;
             }
         }
 
@@ -561,26 +581,30 @@ protected:
         // Safety check: block size cannot exceed pre-allocated maxBlockSize
         if (L > spec_.maxBlockSize) return; 
 
+        const int overlapSize = M - 1;  // FIR history overlap-save needs (kernel len - 1)
+
         for (int ch = 0; ch < nCh; ++ch)
         {
             T* channelData = buffer.getChannel(ch);
             auto& prev = lpPrevBlock_[ch];
 
-            // 1. Build overlap-save input: [prev L samples | current L samples | zero-padding]
-            for (int i = 0; i < L; ++i)
+            // 1. Build overlap-save input: [history (overlapSize) | current (L) | zeros].
+            //    The full (M-1)-sample history is required for a length-M FIR;
+            //    the previous code only kept L samples, corrupting the output
+            //    (especially for blocks smaller than maxBlockSize).
+            for (int i = 0; i < overlapSize; ++i)
                 lpFftIn_[i] = prev[i];
-            
             for (int i = 0; i < L; ++i)
-                lpFftIn_[L + i] = channelData[i];
-
-            for (int i = 2 * L; i < N; ++i)
+                lpFftIn_[overlapSize + i] = channelData[i];
+            for (int i = overlapSize + L; i < N; ++i)
                 lpFftIn_[i] = T(0);
 
-            // Save raw current block for NEXT overlap-save cycle (Crucial fix)
-            for (int i = 0; i < L; ++i)
-                prev[i] = channelData[i];
+            // 2. Save the LAST overlapSize samples of [history | current] as the next
+            //    block's history (read from lpFftIn_ before the inverse FFT reuses it).
+            for (int i = 0; i < overlapSize; ++i)
+                prev[i] = lpFftIn_[L + i];
 
-            // 2. Forward FFT
+            // 3. Forward FFT
             lpFft_->forward(lpFftIn_.data(), lpFftOut_.data());
 
             // 3. Complex multiplication: H(k) * X(k)
@@ -614,6 +638,10 @@ protected:
 
     std::array<FilterEngine<T>, MaxBands> bands_ {};
     std::array<BandConfig, MaxBands> configs_ {};
+    // Per-band enable flag read lock-free every block. The full BandConfig is only
+    // read under the configDirty_ acquire gate; `enabled` is toggled often and read
+    // on the hot path, so it gets its own atomic to avoid a torn/unsynchronized read.
+    std::array<std::atomic<bool>, MaxBands> bandEnabled_ {};
 
     std::atomic<bool> softMode_ { false };
     std::atomic<bool> configDirty_ { false };

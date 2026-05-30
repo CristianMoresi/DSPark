@@ -78,7 +78,8 @@ public:
     DynamicEQ()
     {
         for (int i = 0; i < MaxBands; ++i) {
-            configs_[i].store(BandConfig{}, std::memory_order_relaxed);
+            configs_[i] = BandConfig{};
+            configSeq_[i].store(0, std::memory_order_relaxed);
             paramsDirty_[i].store(true, std::memory_order_relaxed);
         }
     }
@@ -162,7 +163,10 @@ public:
     void setBand(int band, const BandConfig& config) noexcept
     {
         if (band < 0 || band >= MaxBands) return;
-        configs_[band].store(config, std::memory_order_release);
+        // Seqlock publish (lock-free, no atomic<BigStruct> mutex).
+        configSeq_[band].fetch_add(1, std::memory_order_acq_rel); // odd
+        configs_[band] = config;
+        configSeq_[band].fetch_add(1, std::memory_order_release); // even
         paramsDirty_[band].store(true, std::memory_order_release);
     }
 
@@ -270,17 +274,16 @@ private:
                 
                 currentGain += coeff * diff;
 
-                // Update filter coefficients dynamically (Optimized for sample-by-sample)
-                // Note: For extreme CPU optimization, this can be moved to a block-based loop
-                // using AudioBuffer chunks, but kept per-sample here to ensure zero phase clicks.
-                if (std::abs(currentGain) > T(0.01)) {
-                    bandFilter_[b].setCoeffs(BiquadCoeffs<T>::makePeak(
-                        currentFs,
-                        states_[b].cfg.frequency,
-                        states_[b].cfg.q,
-                        currentGain));
-                } else {
-                    bandFilter_[b].setCoeffs(BiquadCoeffs<T>{}); // Bypass
+                // Refresh peak coefficients every 16 samples using the precomputed
+                // freq/Q trig (a single pow() per refresh) instead of a full makePeak
+                // (cos+sin+pow) EVERY sample — the gain envelope is slow enough that
+                // a 16-sample granularity is inaudible. (F-059 performance fix.)
+                if ((i & 15) == 0)
+                {
+                    if (std::abs(currentGain) > T(0.01))
+                        updateDynamicPeakCoeffs(b, currentGain);
+                    else
+                        bandFilter_[b].setCoeffs(BiquadCoeffs<T>{}); // Bypass
                 }
 
                 if ((i & 63) == 0) // Sub-sample metering update
@@ -332,10 +335,23 @@ private:
 
     void updateBandInternalState(int b, double fs) noexcept
     {
-        auto cfg = configs_[b].load(std::memory_order_acquire);
+        // Seqlock read of the published config (retry on a torn/in-progress write).
+        BandConfig cfg;
+        unsigned s0, s1;
+        do {
+            s0  = configSeq_[b].load(std::memory_order_acquire);
+            cfg = configs_[b];
+            s1  = configSeq_[b].load(std::memory_order_acquire);
+        } while ((s0 & 1u) != 0u || s0 != s1);
         states_[b].cfg = cfg;
 
         bandDetector_[b].setCoeffs(BiquadCoeffs<T>::makeBandPass(fs, cfg.frequency, cfg.q));
+
+        // Precompute the freq/Q-dependent peak-EQ terms ONCE per parameter change
+        // (cos w0 and alpha), so the per-block dynamic update needs only a pow().
+        const double w0 = 2.0 * 3.14159265358979323846 * static_cast<double>(cfg.frequency) / fs;
+        precomputedCos_[b]   = static_cast<T>(std::cos(w0));
+        precomputedAlpha_[b] = static_cast<T>(std::sin(w0) / (2.0 * std::max(static_cast<double>(cfg.q), 0.001)));
 
         auto calcCoeff = [fs](T ms) {
             return T(1) - std::exp(T(-1) / (fs * std::max(ms, T(0.01)) / T(1000)));
@@ -345,6 +361,23 @@ private:
         states_[b].aboveRelCoeff = calcCoeff(cfg.aboveReleaseMs);
         states_[b].belowAtkCoeff = calcCoeff(cfg.belowAttackMs);
         states_[b].belowRelCoeff = calcCoeff(cfg.belowReleaseMs);
+    }
+
+    /** @brief Fast peak-EQ coefficient update from precomputed cos/alpha + gain. */
+    void updateDynamicPeakCoeffs(int b, T gainDb) noexcept
+    {
+        const T A     = std::pow(T(10), gainDb / T(40));
+        const T cosw  = precomputedCos_[b];
+        const T alpha = precomputedAlpha_[b];
+        const T a0Inv = T(1) / (T(1) + alpha / A);
+
+        BiquadCoeffs<T> c;
+        c.b0 = (T(1) + alpha * A) * a0Inv;
+        c.b1 = (T(-2) * cosw)     * a0Inv;
+        c.b2 = (T(1) - alpha * A) * a0Inv;
+        c.a1 = (T(-2) * cosw)     * a0Inv;
+        c.a2 = (T(1) - alpha / A) * a0Inv;
+        bandFilter_[b].setCoeffs(c);
     }
 
     void updateLookahead() noexcept
@@ -361,9 +394,17 @@ private:
     double sampleRate_ = 0;
     
     std::atomic<int> numBands_ { 0 };
-    std::array<std::atomic<BandConfig>, MaxBands> configs_ {};
+    // BandConfig (~50 bytes) is NOT lock-free as std::atomic, so publish it via a
+    // per-band seqlock instead (single producer = control thread, single consumer
+    // = audio thread). configSeq_ odd = write in progress.
+    std::array<BandConfig, MaxBands> configs_ {};
+    std::array<std::atomic<unsigned>, MaxBands> configSeq_ {};
     std::array<std::atomic<bool>, MaxBands> paramsDirty_ {};
     std::array<BandState, MaxBands> states_ {};
+    // Precomputed freq/Q-dependent peak-EQ trig terms (per band) so the per-block
+    // dynamic gain update needs only a pow(), not cos/sin/pow every sample.
+    std::array<T, MaxBands> precomputedCos_ {};
+    std::array<T, MaxBands> precomputedAlpha_ {};
 
     std::array<Biquad<T>, MaxBands> bandDetector_ {};
     std::array<Biquad<T>, MaxBands> bandFilter_ {};

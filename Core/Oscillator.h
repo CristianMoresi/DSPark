@@ -5,10 +5,12 @@
 
 #include "DspMath.h"
 #include "AudioSpec.h"
+#include "AudioBuffer.h"
 
 #include <cmath>
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 
 namespace dspark {
 
@@ -157,6 +159,26 @@ public:
         for (size_t i = 0; i < numSamples; ++i)
         {
             buffer[i] = getNextSample();
+        }
+    }
+
+    /** @brief Generator contract alias for getNextSample() (GeneratorProcessor). */
+    [[nodiscard]] inline T getSample() noexcept { return getNextSample(); }
+
+    /**
+     * @brief Fills every channel of the view with the generated waveform.
+     * Satisfies the GeneratorProcessor concept. The oscillator is mono, so all
+     * channels receive the same signal.
+     */
+    void generateBlock(AudioBufferView<T> buffer) noexcept
+    {
+        const int nCh = buffer.getNumChannels();
+        const int nS  = buffer.getNumSamples();
+        for (int i = 0; i < nS; ++i)
+        {
+            const T s = getNextSample();
+            for (int ch = 0; ch < nCh; ++ch)
+                buffer.getChannel(ch)[i] = s;
         }
     }
 

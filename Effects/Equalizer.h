@@ -117,7 +117,14 @@ public:
                 
             lpFftIn_.assign(static_cast<size_t>(lpFftSize_), T(0));
             lpFftOut_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
-            
+
+            // Pre-allocate recompute scratch so a live band change never allocates on
+            // the audio thread (recomputeLinearPhaseKernel runs there via processBlock).
+            lpMagScratch_.assign(static_cast<size_t>(lpFftSize_ / 2 + 1), T(1));
+            lpTempFreq_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
+            lpImpulse_.assign(static_cast<size_t>(lpFftSize_), T(0));
+            lpKernelSpace_.assign(static_cast<size_t>(lpFftSize_), T(0));
+
             lpDirty_.store(true, std::memory_order_release);
         }
     }
@@ -507,8 +514,9 @@ protected:
     {
         if (lpFftSize_ == 0) return;
 
-        int numBins = lpFftSize_ / 2 + 1;
-        std::vector<T> mag(numBins, T(1));
+        const int numBins = lpFftSize_ / 2 + 1;
+        T* const mag = lpMagScratch_.data();   // pre-allocated scratch (no audio-thread alloc)
+        std::fill_n(mag, numBins, T(1));
         const int activeBands = numBands_.load(std::memory_order_relaxed);
 
         // 1. Accumulate the TRUE per-stage cascade magnitude of all active bands
@@ -533,18 +541,17 @@ protected:
         }
 
         // 2. Prepare Zero-Phase Frequency buffer (Real = Mag, Imag = 0)
-        std::vector<T> tempFreq(lpFftSize_ + 2, T(0));
+        std::fill(lpTempFreq_.begin(), lpTempFreq_.end(), T(0));
         for (int k = 0; k < numBins; ++k)
-            tempFreq[2 * k] = mag[k];
+            lpTempFreq_[2 * k] = mag[k];
 
         // 3. IFFT to get temporal impulse response (wrapped around t=0)
-        std::vector<T> impulse(lpFftSize_, T(0));
-        lpFft_->inverse(tempFreq.data(), impulse.data());
+        lpFft_->inverse(lpTempFreq_.data(), lpImpulse_.data());
 
         // 4. Shift, Windowing and Zero-pad for Overlap-Save
         const int M = spec_.maxBlockSize * 2; // Desired Kernel length
         const int halfM = M / 2;
-        std::vector<T> kernelSpace(lpFftSize_, T(0)); // Filled with zeros
+        std::fill(lpKernelSpace_.begin(), lpKernelSpace_.end(), T(0)); // zero-pad scratch
 
         for (int i = 0; i < M; ++i)
         {
@@ -559,11 +566,11 @@ protected:
                           - 0.01168 * std::cos(6.0 * pi<double> * t);
                           
             // Scaling by 1/N is required due to FFTReal unscaled inverse
-            kernelSpace[i] = impulse[readIdx] * static_cast<T>(window) / static_cast<T>(lpFftSize_);
+            lpKernelSpace_[i] = lpImpulse_[readIdx] * static_cast<T>(window) / static_cast<T>(lpFftSize_);
         }
 
         // 5. Transform finalized zero-padded causal kernel to frequency domain
-        lpFft_->forward(kernelSpace.data(), lpKernel_.data());
+        lpFft_->forward(lpKernelSpace_.data(), lpKernel_.data());
     }
 
     /**
@@ -656,6 +663,8 @@ protected:
     std::vector<T> lpKernel_;
     std::vector<std::vector<T>> lpPrevBlock_;
     std::vector<T> lpFftIn_, lpFftOut_;
+    // Pre-allocated recompute scratch (no audio-thread allocation on band changes).
+    std::vector<T> lpMagScratch_, lpTempFreq_, lpImpulse_, lpKernelSpace_;
 };
 
 } // namespace dspark

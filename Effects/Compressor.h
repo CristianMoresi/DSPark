@@ -19,7 +19,7 @@
  * - Topologies: FeedForward and vintage FeedBack.
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, SmoothedValue.h,
- *               DryWetMixer.h, RingBuffer.h, Oversampling.h, DenormalGuard.h, Hilbert.h.
+ *               DryWetMixer.h, RingBuffer.h, DenormalGuard.h, Hilbert.h.
  */
 
 #include "../Core/DspMath.h"
@@ -28,7 +28,6 @@
 #include "../Core/SmoothedValue.h"
 #include "../Core/DryWetMixer.h"
 #include "../Core/RingBuffer.h"
-#include "../Core/Oversampling.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/Hilbert.h"
 
@@ -326,14 +325,8 @@ public:
     /** @brief Changes ballistics and envelope behavior character. */
     void setCharacter(Character type) noexcept { character_.store(type, std::memory_order_relaxed); }
 
-    /** @brief Enables oversampling in the detection path (Sidechain only). */
-    void setOversampling(int factor) noexcept
-    {
-        oversamplingFactor_.store(std::clamp(factor, 1, 4), std::memory_order_relaxed);
-    }
-
-    /** 
-     * @brief Toggles the internal sidechain high-pass filter. 
+    /**
+     * @brief Toggles the internal sidechain high-pass filter.
      * @param enabled True to activate HPF.
      * @param cutoffHz Cutoff frequency in Hz (Default: 80Hz).
      */
@@ -899,7 +892,6 @@ protected:
     std::atomic<Topology> topology_ { Topology::FeedForward };      ///< Selected topology.
     std::atomic<Character> character_ { Character::Clean };         ///< Selected ballistics.
     std::atomic<Mode> mode_ { Mode::Downward };                     ///< Selected compression mode.
-    std::atomic<int> oversamplingFactor_ { 1 };                     ///< Detection oversampling scale.
 
     // Internal DSP Coefficients & State
     T attackCoeff_ = T(0);              ///< Calculated exponential attack factor.

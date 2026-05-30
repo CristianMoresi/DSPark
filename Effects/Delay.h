@@ -51,7 +51,10 @@ public:
     void prepare(const AudioSpec& spec, double maxDelaySeconds)
     {
         sampleRate_ = static_cast<SampleType>(spec.sampleRate);
-        numChannels_ = spec.numChannels;
+        // Clamp to the fixed per-channel state arrays (states_/writeIndices_ are
+        // kMaxChannels): maybeUpdateSmoothers()/updateSmootherTargets() iterate
+        // [0, numChannels_) and would otherwise read/write out of bounds.
+        numChannels_ = std::min(static_cast<int>(spec.numChannels), kMaxChannels);
         blockSize_   = spec.maxBlockSize;
 
         int required = static_cast<int>(std::ceil(maxDelaySeconds * spec.sampleRate));

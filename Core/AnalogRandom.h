@@ -32,6 +32,8 @@
 #include <span>
 #include <type_traits>
 
+#include "AnalogConstants.h"
+
 /**
  * @namespace dspark
  * @brief Main namespace for the DSPark framework.
@@ -45,158 +47,8 @@ namespace dspark
     namespace AnalogRandom
     {
         //==============================================================================
-        // Constexpr constants from research studies
-        //==============================================================================
-
-        namespace NoiseConstants
-        {
-            namespace Thermal
-            {
-                constexpr double BOLTZMANN_CONSTANT = 1.380649e-23;
-                constexpr double ROOM_TEMP_KELVIN = 293.15;
-                constexpr double TYPICAL_RESISTANCE = 1000.0;
-                constexpr double NOISE_BANDWIDTH = 20000.0;
-            } 
-
-            namespace Shot
-            {
-                constexpr double ELEMENTARY_CHARGE = 1.602176634e-19;
-                constexpr double TYPICAL_DC_CURRENT = 1.0e-3;
-                constexpr double AUDIO_BANDWIDTH = 20000.0;
-            } 
-
-            namespace Flicker
-            {
-                constexpr double ALPHA_PINK = 1.0;
-                constexpr double ALPHA_BROWN = 2.0;
-                constexpr double SPECTRAL_SLOPE_DB_PER_OCTAVE_PINK = -3.0;
-                constexpr double SPECTRAL_SLOPE_DB_PER_OCTAVE_BROWN = -6.0;
-            } 
-
-            namespace PracticalNoiseFloors
-            {
-                constexpr double NEVE_1073_EIN_DBU = -125.0;
-                constexpr double NEVE_1073_NOISE_LINE_DBU = -83.0;
-                constexpr double API_512C_EIN = -129.0;
-                constexpr double LA_2A_NOISE_DB_BELOW_10DBM = -75.0;
-                constexpr double AMPEX_351_SNR_DB = 55.0;
-                constexpr double STUDER_C37_SNR_DB = 75.0;
-                constexpr double TAPE_NOISE_OFFSET_DB = 8.0; 
-
-                constexpr std::array<double, 7> HUM_FREQUENCIES_HZ{ 50.0, 60.0, 100.0, 120.0, 180.0, 240.0, 300.0 };
-                constexpr std::array<double, 7> HUM_AMPLITUDES_DB{
-                    -60.0, -55.0, -65.0, -70.0, -75.0, -80.0, -85.0
-                };
-            } 
-        } 
-
-        namespace SaturationConstants
-        {
-            namespace General
-            {
-                constexpr double DRIVE_THRESHOLD_DB = -6.0;
-                constexpr double MAX_THD_PERCENTAGE = 0.07;
-            } 
-
-            namespace Tube
-            {
-                constexpr double EVEN_HARMONIC_DOMINANCE_RATIO = 0.7;
-                constexpr std::array<double, 3> TRANSFER_FUNCTION_COEFFS{ 1.0, 0.5, 0.1 };
-            } 
-
-            namespace Tape
-            {
-                constexpr double ODD_HARMONIC_DOMINANCE_RATIO = 0.6;
-                constexpr double SATURATION_THRESHOLD_DB = 0.0;
-                constexpr double HIGH_END_ROLL_OFF_HZ = 10000.0;
-                constexpr double LOW_END_BOOST_DB = 2.0;
-            } 
-        } 
-
-        namespace ComponentConstants
-        {
-            namespace Resistors
-            {
-                constexpr double TOLERANCE_PERCENTAGE_1 = 1.0;
-                constexpr double TOLERANCE_PERCENTAGE_5 = 5.0;
-                constexpr double TOLERANCE_PERCENTAGE_10 = 10.0;
-                constexpr double AGING_DRIFT_RATE_PERCENTAGE_PER_YEAR = 0.5;
-            } 
-
-            namespace Capacitors
-            {
-                constexpr double AGING_RATE_X7R_PERCENT_PER_DECADE_HOUR = -2.5;
-                constexpr double AGING_RATE_Y5V_PERCENT_PER_DECADE_HOUR = -7.0;
-                constexpr double CURIE_POINT_TEMPERATURE_CELSIUS = 125.0;
-            } 
-
-            namespace TransistorsValves
-            {
-                constexpr double GAIN_VARIATION_PERCENTAGE = 5.0;
-                constexpr double TEMPERATURE_SENSITIVITY_FACTOR = 0.1;
-                constexpr double AGING_FACTOR_GAIN_DRIFT = 0.2;
-            } 
-
-            namespace Transformers
-            {
-                constexpr double SATURATION_THRESHOLD_FLUX_DENSITY_TESLAS = 1.5;
-                constexpr double HIGH_FREQUENCY_ROLL_OFF_HZ = 10000.0;
-            } 
-        } 
-
-        namespace EquipmentConstants
-        {
-            namespace TapeMachines
-            {
-                constexpr double WOW_DEPTH_PERCENTAGE = 0.1;
-                constexpr double FLUTTER_DEPTH_PERCENTAGE = 0.15;
-                constexpr double TAPE_HISS_SNR_DB = 55.0;
-                constexpr double TAPE_SATURATION_THRESHOLD_DB = 0.0;
-            } 
-
-            namespace Preamplifiers
-            {
-                constexpr double MAX_MIC_GAIN_DB = 80.0;
-                constexpr double EIN_AT_MAX_GAIN_DBU = -125.0;
-                constexpr double SATURATION_THRESHOLD_DB = -6.0;
-                constexpr double THD_PERCENTAGE = 0.07;
-            } 
-
-            namespace Compressors
-            {
-                constexpr double MAX_GAIN_REDUCTION_DB = 40.0;
-                constexpr double THD_AT_10DBM_PERCENT = 0.35;
-                constexpr double FIXED_ATTACK_TIME_SECONDS = 0.01;
-                constexpr double FIXED_RELEASE_TIME_SECONDS = 0.5;
-            } 
-
-            namespace Equalizers
-            {
-                constexpr std::array<double, 4> FREQUENCY_POINTS_LOW_HZ{ 20.0, 30.0, 60.0, 100.0 };
-                constexpr std::array<double, 3> FREQUENCY_POINTS_HIGH_HZ{ 3000.0, 5000.0, 10000.0 };
-                constexpr double BANDWIDTH_CONTROL_RANGE = 1.0;
-            } 
-
-            namespace Consoles
-            {
-                constexpr double CROSSTALK_LEVEL_DB_AT_1KHZ = -70.0;
-                constexpr double CROSSTALK_FREQUENCY_SLOPE_DB_PER_OCTAVE = 6.0;
-                constexpr double VINTAGE_CROSSTALK_MULTIPLIER = 1.5;
-                constexpr double MODERN_CROSSTALK_MULTIPLIER = 0.5;
-            } 
-        } 
-
-        namespace VariationPercent
-        {
-            constexpr float TapeMachine = 0.1f;
-            constexpr float VacuumTube = 5.0f;
-            constexpr float Transistor = 3.0f;
-            constexpr float Compressor = 1.5f;
-            constexpr float Equalizer = 1.0f;
-        } 
-
-        //==============================================================================
         // PRNG and Internal Details
+        // (Reference constants live in Core/AnalogConstants.h, included above.)
         //==============================================================================
         namespace Detail
         {
@@ -258,7 +110,7 @@ namespace dspark
             };
 
             // NOTE: lock-free safety is checked at runtime per Generator instance
-            // (checkLockFree() -> m_isSafeToRun). A preprocessor #warning here would
+            // (checkLockFree() -> isSafeToRun_). A preprocessor #warning here would
             // fire on every translation unit unconditionally (the directive ignores
             // the runtime `if`), so it is intentionally omitted.
         }
@@ -302,12 +154,12 @@ namespace dspark
                         "AnalogRandom::Generator requires a floating-point Real type.");
 
         public:
-            Generator() noexcept : m_prng(generateUniqueSeed()) 
+            Generator() noexcept : prng_(generateUniqueSeed()) 
             { 
                 checkLockFree(); 
             }
 
-            explicit Generator(std::uint64_t seed) noexcept : m_prng(seed)
+            explicit Generator(std::uint64_t seed) noexcept : prng_(seed)
             {
                 checkLockFree();
             }
@@ -318,54 +170,54 @@ namespace dspark
             // safe because the source object is being moved-from — by contract
             // it is not concurrently observed by any other thread.
             Generator(Generator&& other) noexcept
-                : m_isSafeToRun(other.m_isSafeToRun),
-                  m_prng(other.m_prng),
-                  m_sampleRate(other.m_sampleRate),
-                  m_phaseAccumulator(other.m_phaseAccumulator),
-                  m_triggerNext(other.m_triggerNext.load(std::memory_order_relaxed)),
-                  m_currentValue(other.m_currentValue),
-                  m_targetValue(other.m_targetValue),
-                  m_noiseType(other.m_noiseType.load(std::memory_order_relaxed)),
-                  m_useBpmSync(other.m_useBpmSync.load(std::memory_order_relaxed)),
-                  m_rateHz(other.m_rateHz.load(std::memory_order_relaxed)),
-                  m_bpm(other.m_bpm.load(std::memory_order_relaxed)),
-                  m_bpmDivision(other.m_bpmDivision.load(std::memory_order_relaxed)),
-                  m_min(other.m_min.load(std::memory_order_relaxed)),
-                  m_max(other.m_max.load(std::memory_order_relaxed)),
-                  m_smoothingEnabled(other.m_smoothingEnabled.load(std::memory_order_relaxed)),
-                  m_smoothingCoeff(other.m_smoothingCoeff.load(std::memory_order_relaxed)),
-                  m_quantizationStep(other.m_quantizationStep.load(std::memory_order_relaxed)),
-                  m_pendingSeed(other.m_pendingSeed.load(std::memory_order_relaxed)),
-                  m_brownNoiseState(other.m_brownNoiseState),
-                  m_pinkNoiseOctaves(other.m_pinkNoiseOctaves),
-                  m_denormalFlip(other.m_denormalFlip)
+                : isSafeToRun_(other.isSafeToRun_),
+                  prng_(other.prng_),
+                  sampleRate_(other.sampleRate_),
+                  phaseAccumulator_(other.phaseAccumulator_),
+                  triggerNext_(other.triggerNext_.load(std::memory_order_relaxed)),
+                  currentValue_(other.currentValue_),
+                  targetValue_(other.targetValue_),
+                  noiseType_(other.noiseType_.load(std::memory_order_relaxed)),
+                  useBpmSync_(other.useBpmSync_.load(std::memory_order_relaxed)),
+                  rateHz_(other.rateHz_.load(std::memory_order_relaxed)),
+                  bpm_(other.bpm_.load(std::memory_order_relaxed)),
+                  bpmDivision_(other.bpmDivision_.load(std::memory_order_relaxed)),
+                  min_(other.min_.load(std::memory_order_relaxed)),
+                  max_(other.max_.load(std::memory_order_relaxed)),
+                  smoothingEnabled_(other.smoothingEnabled_.load(std::memory_order_relaxed)),
+                  smoothingCoeff_(other.smoothingCoeff_.load(std::memory_order_relaxed)),
+                  quantizationStep_(other.quantizationStep_.load(std::memory_order_relaxed)),
+                  pendingSeed_(other.pendingSeed_.load(std::memory_order_relaxed)),
+                  brownNoiseState_(other.brownNoiseState_),
+                  pinkNoiseOctaves_(other.pinkNoiseOctaves_),
+                  denormalFlip_(other.denormalFlip_)
             {
             }
 
             Generator& operator=(Generator&& other) noexcept
             {
                 if (this == &other) return *this;
-                m_isSafeToRun       = other.m_isSafeToRun;
-                m_prng              = other.m_prng;
-                m_sampleRate        = other.m_sampleRate;
-                m_phaseAccumulator  = other.m_phaseAccumulator;
-                m_triggerNext.store(other.m_triggerNext.load(std::memory_order_relaxed),       std::memory_order_relaxed);
-                m_currentValue      = other.m_currentValue;
-                m_targetValue       = other.m_targetValue;
-                m_noiseType.store  (other.m_noiseType.load(std::memory_order_relaxed),         std::memory_order_relaxed);
-                m_useBpmSync.store (other.m_useBpmSync.load(std::memory_order_relaxed),        std::memory_order_relaxed);
-                m_rateHz.store     (other.m_rateHz.load(std::memory_order_relaxed),            std::memory_order_relaxed);
-                m_bpm.store        (other.m_bpm.load(std::memory_order_relaxed),               std::memory_order_relaxed);
-                m_bpmDivision.store(other.m_bpmDivision.load(std::memory_order_relaxed),       std::memory_order_relaxed);
-                m_min.store        (other.m_min.load(std::memory_order_relaxed),               std::memory_order_relaxed);
-                m_max.store        (other.m_max.load(std::memory_order_relaxed),               std::memory_order_relaxed);
-                m_smoothingEnabled.store(other.m_smoothingEnabled.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                m_smoothingCoeff.store  (other.m_smoothingCoeff.load(std::memory_order_relaxed),   std::memory_order_relaxed);
-                m_quantizationStep.store(other.m_quantizationStep.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                m_pendingSeed.store(other.m_pendingSeed.load(std::memory_order_relaxed),       std::memory_order_relaxed);
-                m_brownNoiseState   = other.m_brownNoiseState;
-                m_pinkNoiseOctaves  = other.m_pinkNoiseOctaves;
-                m_denormalFlip      = other.m_denormalFlip;
+                isSafeToRun_       = other.isSafeToRun_;
+                prng_              = other.prng_;
+                sampleRate_        = other.sampleRate_;
+                phaseAccumulator_  = other.phaseAccumulator_;
+                triggerNext_.store(other.triggerNext_.load(std::memory_order_relaxed),       std::memory_order_relaxed);
+                currentValue_      = other.currentValue_;
+                targetValue_       = other.targetValue_;
+                noiseType_.store  (other.noiseType_.load(std::memory_order_relaxed),         std::memory_order_relaxed);
+                useBpmSync_.store (other.useBpmSync_.load(std::memory_order_relaxed),        std::memory_order_relaxed);
+                rateHz_.store     (other.rateHz_.load(std::memory_order_relaxed),            std::memory_order_relaxed);
+                bpm_.store        (other.bpm_.load(std::memory_order_relaxed),               std::memory_order_relaxed);
+                bpmDivision_.store(other.bpmDivision_.load(std::memory_order_relaxed),       std::memory_order_relaxed);
+                min_.store        (other.min_.load(std::memory_order_relaxed),               std::memory_order_relaxed);
+                max_.store        (other.max_.load(std::memory_order_relaxed),               std::memory_order_relaxed);
+                smoothingEnabled_.store(other.smoothingEnabled_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                smoothingCoeff_.store  (other.smoothingCoeff_.load(std::memory_order_relaxed),   std::memory_order_relaxed);
+                quantizationStep_.store(other.quantizationStep_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                pendingSeed_.store(other.pendingSeed_.load(std::memory_order_relaxed),       std::memory_order_relaxed);
+                brownNoiseState_   = other.brownNoiseState_;
+                pinkNoiseOctaves_  = other.pinkNoiseOctaves_;
+                denormalFlip_      = other.denormalFlip_;
                 return *this;
             }
 
@@ -381,7 +233,7 @@ namespace dspark
              */
             void prepare(double sampleRate) noexcept
             {
-                if (sampleRate > 0.0) m_sampleRate = sampleRate;
+                if (sampleRate > 0.0) sampleRate_ = sampleRate;
                 reset();
             }
 
@@ -390,12 +242,12 @@ namespace dspark
              */
             void reset() noexcept
             {
-                m_phaseAccumulator = 0.0;
-                m_triggerNext.store(true, std::memory_order_relaxed);
-                m_currentValue = static_cast<Real>(0);
-                m_targetValue = static_cast<Real>(0);
-                m_brownNoiseState = static_cast<Real>(0);
-                m_pinkNoiseOctaves.fill(static_cast<Real>(0));
+                phaseAccumulator_ = 0.0;
+                triggerNext_.store(true, std::memory_order_relaxed);
+                currentValue_ = static_cast<Real>(0);
+                targetValue_ = static_cast<Real>(0);
+                brownNoiseState_ = static_cast<Real>(0);
+                pinkNoiseOctaves_.fill(static_cast<Real>(0));
             }
 
             /**
@@ -405,7 +257,7 @@ namespace dspark
             void reseed(std::uint64_t newSeed) noexcept
             {
                 if (newSeed == 0) newSeed = 1;
-                m_pendingSeed.store(newSeed, std::memory_order_release);
+                pendingSeed_.store(newSeed, std::memory_order_release);
             }
 
             //----------------------------------------------------------------------
@@ -419,38 +271,38 @@ namespace dspark
              */
             [[nodiscard]] Real getNextSample() noexcept
             {
-                if (!m_isSafeToRun) [[unlikely]] return static_cast<Real>(0);
+                if (!isSafeToRun_) [[unlikely]] return static_cast<Real>(0);
 
-                const auto pending = m_pendingSeed.exchange(0, std::memory_order_acq_rel);
+                const auto pending = pendingSeed_.exchange(0, std::memory_order_acq_rel);
                 if (pending != 0)
                 {
-                    m_prng.reseed(pending);
+                    prng_.reseed(pending);
                     reset();
                 }
 
                 const Real continuousNoise = tickContinuousNoise();
                 updatePhase();
 
-                if (m_triggerNext.exchange(false, std::memory_order_acquire))
+                if (triggerNext_.exchange(false, std::memory_order_acquire))
                 {
                     generateNewTarget(continuousNoise);
                 }
 
-                if (m_smoothingEnabled.load(std::memory_order_relaxed))
+                if (smoothingEnabled_.load(std::memory_order_relaxed))
                 {
-                    const Real coeff = m_smoothingCoeff.load(std::memory_order_relaxed);
-                    m_currentValue += coeff * (m_targetValue - m_currentValue);
+                    const Real coeff = smoothingCoeff_.load(std::memory_order_relaxed);
+                    currentValue_ += coeff * (targetValue_ - currentValue_);
                 }
                 else
                 {
-                    m_currentValue = m_targetValue;
+                    currentValue_ = targetValue_;
                 }
 
                 // Professional DC-free denormal mitigation
-                m_denormalFlip = -m_denormalFlip;
-                m_currentValue += m_denormalFlip;
+                denormalFlip_ = -denormalFlip_;
+                currentValue_ += denormalFlip_;
 
-                return m_currentValue;
+                return currentValue_;
             }
 
             /**
@@ -460,28 +312,28 @@ namespace dspark
              */
             void getNextBlock(std::span<Real> outputBuffer) noexcept
             {
-                if (!m_isSafeToRun || outputBuffer.empty()) [[unlikely]] return;
+                if (!isSafeToRun_ || outputBuffer.empty()) [[unlikely]] return;
 
-                const auto pending = m_pendingSeed.exchange(0, std::memory_order_acq_rel);
+                const auto pending = pendingSeed_.exchange(0, std::memory_order_acq_rel);
                 if (pending != 0)
                 {
-                    m_prng.reseed(pending);
+                    prng_.reseed(pending);
                     reset();
                 }
 
                 // Cache atomics to local registers for the block duration
-                const bool smoothing = m_smoothingEnabled.load(std::memory_order_relaxed);
-                const Real coeff = m_smoothingCoeff.load(std::memory_order_relaxed);
-                const NoiseType noiseType = m_noiseType.load(std::memory_order_relaxed);
-                const float quantStep = m_quantizationStep.load(std::memory_order_relaxed);
-                Real currentMin = m_min.load(std::memory_order_relaxed);
-                Real currentMax = m_max.load(std::memory_order_relaxed);
+                const bool smoothing = smoothingEnabled_.load(std::memory_order_relaxed);
+                const Real coeff = smoothingCoeff_.load(std::memory_order_relaxed);
+                const NoiseType noiseType = noiseType_.load(std::memory_order_relaxed);
+                const float quantStep = quantizationStep_.load(std::memory_order_relaxed);
+                Real currentMin = min_.load(std::memory_order_relaxed);
+                Real currentMax = max_.load(std::memory_order_relaxed);
                 
                 if (currentMin > currentMax) std::swap(currentMin, currentMax);
 
                 for (Real& sample : outputBuffer)
                 {
-                    const Real white = static_cast<Real>(m_prng.next_double() * 2.0 - 1.0);
+                    const Real white = static_cast<Real>(prng_.next_double() * 2.0 - 1.0);
                     Real continuousNoise = white;
                     
                     if (noiseType == NoiseType::Pink) continuousNoise = tickPinkNoise(white);
@@ -489,33 +341,33 @@ namespace dspark
 
                     updatePhase();
 
-                    if (m_triggerNext.exchange(false, std::memory_order_acquire))
+                    if (triggerNext_.exchange(false, std::memory_order_acquire))
                     {
                         // Clamp to [-1,1] before mapping, matching generateNewTarget()
                         // (pink noise can momentarily exceed unity).
                         const Real cn = std::clamp(continuousNoise, static_cast<Real>(-1), static_cast<Real>(1));
-                        m_targetValue = currentMin + ((cn * static_cast<Real>(0.5)) + static_cast<Real>(0.5)) * (currentMax - currentMin);
-                        if (quantStep > 0.0f) m_targetValue = std::round(m_targetValue / quantStep) * quantStep;
+                        targetValue_ = currentMin + ((cn * static_cast<Real>(0.5)) + static_cast<Real>(0.5)) * (currentMax - currentMin);
+                        if (quantStep > 0.0f) targetValue_ = std::round(targetValue_ / quantStep) * quantStep;
                     }
 
                     if (smoothing)
                     {
-                        m_currentValue += coeff * (m_targetValue - m_currentValue);
+                        currentValue_ += coeff * (targetValue_ - currentValue_);
                     }
                     else
                     {
-                        m_currentValue = m_targetValue;
+                        currentValue_ = targetValue_;
                     }
 
-                    m_denormalFlip = -m_denormalFlip;
-                    m_currentValue += m_denormalFlip;
+                    denormalFlip_ = -denormalFlip_;
+                    currentValue_ += denormalFlip_;
                     
-                    sample = m_currentValue;
+                    sample = currentValue_;
                 }
             }
 
-            [[nodiscard]] Real getCurrentValue() const noexcept { return m_currentValue; }
-            [[nodiscard]] Real getPhase() const noexcept { return static_cast<Real>(m_phaseAccumulator); }
+            [[nodiscard]] Real getCurrentValue() const noexcept { return currentValue_; }
+            [[nodiscard]] Real getPhase() const noexcept { return static_cast<Real>(phaseAccumulator_); }
 
             //----------------------------------------------------------------------
             // Configuration API
@@ -523,25 +375,25 @@ namespace dspark
 
             void setNoiseType(NoiseType type) noexcept 
             { 
-                m_noiseType.store(type, std::memory_order_relaxed); 
+                noiseType_.store(type, std::memory_order_relaxed); 
             }
 
             void setRateHz(Real rateInHz) noexcept
             {
-                m_useBpmSync.store(false, std::memory_order_relaxed);
-                m_rateHz.store(static_cast<float>(rateInHz), std::memory_order_relaxed);
+                useBpmSync_.store(false, std::memory_order_relaxed);
+                rateHz_.store(static_cast<float>(rateInHz), std::memory_order_relaxed);
             }
 
             void setRateBPM(double bpm, BpmDivision division) noexcept
             {
-                m_bpm.store(static_cast<float>(bpm), std::memory_order_relaxed);
-                m_bpmDivision.store(division, std::memory_order_relaxed);
-                m_useBpmSync.store(true, std::memory_order_relaxed);
+                bpm_.store(static_cast<float>(bpm), std::memory_order_relaxed);
+                bpmDivision_.store(division, std::memory_order_relaxed);
+                useBpmSync_.store(true, std::memory_order_relaxed);
             }
 
             void updateBPM(double newBpm) noexcept 
             { 
-                m_bpm.store(static_cast<float>(newBpm), std::memory_order_relaxed); 
+                bpm_.store(static_cast<float>(newBpm), std::memory_order_relaxed); 
             }
 
             /**
@@ -552,24 +404,24 @@ namespace dspark
             {
                 static_assert(std::is_floating_point_v<T>, "setRange only accepts floating-point types.");
                 if (min > max) std::swap(min, max);
-                m_min.store(static_cast<Real>(min), std::memory_order_relaxed);
-                m_max.store(static_cast<Real>(max), std::memory_order_relaxed);
+                min_.store(static_cast<Real>(min), std::memory_order_relaxed);
+                max_.store(static_cast<Real>(max), std::memory_order_relaxed);
             }
 
             void setSmoothing(bool shouldBeEnabled, Real timeInMs = static_cast<Real>(50.0)) noexcept
             {
-                m_smoothingEnabled.store(shouldBeEnabled, std::memory_order_relaxed);
-                if (m_sampleRate > 0 && timeInMs > static_cast<Real>(0))
+                smoothingEnabled_.store(shouldBeEnabled, std::memory_order_relaxed);
+                if (sampleRate_ > 0 && timeInMs > static_cast<Real>(0))
                 {
-                    const Real coeff = static_cast<Real>(std::exp(-1.0 / (static_cast<double>(m_sampleRate) * (static_cast<double>(timeInMs) / 1000.0))));
-                    m_smoothingCoeff.store(static_cast<float>(1.0 - coeff), std::memory_order_relaxed);
+                    const Real coeff = static_cast<Real>(std::exp(-1.0 / (static_cast<double>(sampleRate_) * (static_cast<double>(timeInMs) / 1000.0))));
+                    smoothingCoeff_.store(static_cast<float>(1.0 - coeff), std::memory_order_relaxed);
                 }
             }
 
             void setQuantization(Real step) noexcept
             {
                 if (std::isnan(step) || step < static_cast<Real>(0)) step = static_cast<Real>(0);
-                m_quantizationStep.store(static_cast<float>(step), std::memory_order_relaxed);
+                quantizationStep_.store(static_cast<float>(step), std::memory_order_relaxed);
             }
 
             void setAnalogDefault(AnalogComponent component) noexcept
@@ -616,8 +468,8 @@ namespace dspark
                 if (imax <= imin) return imin;
                 const Real value = getNextSample();
                 
-                Real minVal = static_cast<Real>(m_min.load(std::memory_order_relaxed));
-                Real maxVal = static_cast<Real>(m_max.load(std::memory_order_relaxed));
+                Real minVal = static_cast<Real>(min_.load(std::memory_order_relaxed));
+                Real maxVal = static_cast<Real>(max_.load(std::memory_order_relaxed));
                 if (minVal > maxVal) std::swap(minVal, maxVal);
                 if (maxVal == minVal) return imin;
 
@@ -634,7 +486,7 @@ namespace dspark
         private:
             void checkLockFree() noexcept
             {
-                m_isSafeToRun = std::atomic<Real>::is_always_lock_free;
+                isSafeToRun_ = std::atomic<Real>::is_always_lock_free;
             }
 
             /**
@@ -642,8 +494,8 @@ namespace dspark
              */
             [[nodiscard]] Real tickContinuousNoise() noexcept
             {
-                const Real white = static_cast<Real>(m_prng.next_double() * 2.0 - 1.0);
-                switch (m_noiseType.load(std::memory_order_relaxed))
+                const Real white = static_cast<Real>(prng_.next_double() * 2.0 - 1.0);
+                switch (noiseType_.load(std::memory_order_relaxed))
                 {
                     case NoiseType::White: return white;
                     case NoiseType::Pink:  return tickPinkNoise(white);
@@ -659,70 +511,70 @@ namespace dspark
             {
                 sampledNoise = std::clamp(sampledNoise, static_cast<Real>(-1), static_cast<Real>(1));
                 
-                Real currentMin = m_min.load(std::memory_order_relaxed);
-                Real currentMax = m_max.load(std::memory_order_relaxed);
+                Real currentMin = min_.load(std::memory_order_relaxed);
+                Real currentMax = max_.load(std::memory_order_relaxed);
                 if (currentMin > currentMax) std::swap(currentMin, currentMax);
 
-                m_targetValue = currentMin + ((sampledNoise * static_cast<Real>(0.5)) + static_cast<Real>(0.5)) * (currentMax - currentMin);
+                targetValue_ = currentMin + ((sampledNoise * static_cast<Real>(0.5)) + static_cast<Real>(0.5)) * (currentMax - currentMin);
 
-                const Real quantStep = static_cast<Real>(m_quantizationStep.load(std::memory_order_relaxed));
+                const Real quantStep = static_cast<Real>(quantizationStep_.load(std::memory_order_relaxed));
                 if (quantStep > static_cast<Real>(0))
                 {
-                    m_targetValue = std::round(m_targetValue / quantStep) * quantStep;
+                    targetValue_ = std::round(targetValue_ / quantStep) * quantStep;
                 }
             }
 
             void updatePhase() noexcept
             {
                 Real rate = static_cast<Real>(0);
-                if (m_useBpmSync.load(std::memory_order_relaxed))
+                if (useBpmSync_.load(std::memory_order_relaxed))
                 {
-                    const float bpm = m_bpm.load(std::memory_order_relaxed);
+                    const float bpm = bpm_.load(std::memory_order_relaxed);
                     if (bpm > 0.0f)
                     {
-                        const double noteLengthInBeats = 4.0 / getBpmDivisionMultiplier(m_bpmDivision.load(std::memory_order_relaxed));
+                        const double noteLengthInBeats = 4.0 / getBpmDivisionMultiplier(bpmDivision_.load(std::memory_order_relaxed));
                         const double periodInSeconds = (60.0 / static_cast<double>(bpm)) * noteLengthInBeats;
                         if (periodInSeconds > 0.0) rate = static_cast<Real>(1.0 / periodInSeconds);
                     }
                 }
                 else
                 {
-                    rate = static_cast<Real>(m_rateHz.load(std::memory_order_relaxed));
+                    rate = static_cast<Real>(rateHz_.load(std::memory_order_relaxed));
                 }
 
                 if (rate <= static_cast<Real>(0)) return;
                 
-                m_phaseAccumulator += static_cast<double>(rate) / m_sampleRate;
-                if (m_phaseAccumulator >= 1.0)
+                phaseAccumulator_ += static_cast<double>(rate) / sampleRate_;
+                if (phaseAccumulator_ >= 1.0)
                 {
-                    m_phaseAccumulator -= 1.0;
-                    m_triggerNext.store(true, std::memory_order_release);
+                    phaseAccumulator_ -= 1.0;
+                    triggerNext_.store(true, std::memory_order_release);
                 }
             }
 
             [[nodiscard]] Real tickPinkNoise(Real white) noexcept
             {
-                Real b0 = m_pinkNoiseOctaves[0];
-                Real b1 = m_pinkNoiseOctaves[1];
-                Real b2 = m_pinkNoiseOctaves[2];
+                Real b0 = pinkNoiseOctaves_[0];
+                Real b1 = pinkNoiseOctaves_[1];
+                Real b2 = pinkNoiseOctaves_[2];
                 
                 b0 = static_cast<Real>(0.99886) * b0 + white * static_cast<Real>(0.0555179);
                 b1 = static_cast<Real>(0.99332) * b1 + white * static_cast<Real>(0.0750759);
                 b2 = static_cast<Real>(0.96900) * b2 + white * static_cast<Real>(0.1538520);
                 
-                m_pinkNoiseOctaves[0] = b0;
-                m_pinkNoiseOctaves[1] = b1;
-                m_pinkNoiseOctaves[2] = b2;
+                pinkNoiseOctaves_[0] = b0;
+                pinkNoiseOctaves_[1] = b1;
+                pinkNoiseOctaves_[2] = b2;
                 
                 return (b0 + b1 + b2 + white * static_cast<Real>(0.1848)) * static_cast<Real>(0.16666666666666666);
             }
 
             [[nodiscard]] Real tickBrownNoise(Real white) noexcept
             {
-                m_brownNoiseState += white * static_cast<Real>(0.02);
-                m_brownNoiseState *= static_cast<Real>(0.995);
-                m_brownNoiseState = std::clamp(m_brownNoiseState, static_cast<Real>(-1.0), static_cast<Real>(1.0));
-                return m_brownNoiseState;
+                brownNoiseState_ += white * static_cast<Real>(0.02);
+                brownNoiseState_ *= static_cast<Real>(0.995);
+                brownNoiseState_ = std::clamp(brownNoiseState_, static_cast<Real>(-1.0), static_cast<Real>(1.0));
+                return brownNoiseState_;
             }
 
             [[nodiscard]] static constexpr double getBpmDivisionMultiplier(BpmDivision division) noexcept
@@ -756,27 +608,27 @@ namespace dspark
                 return seed == 0 ? 1 : seed;
             }
 
-            bool m_isSafeToRun{ false };
-            Detail::Xoshiro256pp m_prng;
-            double m_sampleRate{ 44100.0 };
-            double m_phaseAccumulator{ 0.0 };
-            std::atomic<bool> m_triggerNext{ true };
-            Real m_currentValue{ static_cast<Real>(0) };
-            Real m_targetValue{ static_cast<Real>(0) };
-            std::atomic<NoiseType> m_noiseType{ NoiseType::Pink };
-            std::atomic<bool> m_useBpmSync{ false };
-            std::atomic<float> m_rateHz{ 1.0f };
-            std::atomic<float> m_bpm{ 120.0f };
-            std::atomic<BpmDivision> m_bpmDivision{ BpmDivision::Quarter };
-            std::atomic<float> m_min{ -1.0f };
-            std::atomic<float> m_max{ 1.0f };
-            std::atomic<bool> m_smoothingEnabled{ false };
-            std::atomic<float> m_smoothingCoeff{ 0.0f };
-            std::atomic<float> m_quantizationStep{ 0.0f };
-            std::atomic<std::uint64_t> m_pendingSeed{ 0 };
-            Real m_brownNoiseState{ static_cast<Real>(0) };
-            std::array<Real, 3> m_pinkNoiseOctaves{};
-            Real m_denormalFlip{ static_cast<Real>(1e-18) }; // DC-Free denormal mitigation state
+            bool isSafeToRun_{ false };
+            Detail::Xoshiro256pp prng_;
+            double sampleRate_{ 44100.0 };
+            double phaseAccumulator_{ 0.0 };
+            std::atomic<bool> triggerNext_{ true };
+            Real currentValue_{ static_cast<Real>(0) };
+            Real targetValue_{ static_cast<Real>(0) };
+            std::atomic<NoiseType> noiseType_{ NoiseType::Pink };
+            std::atomic<bool> useBpmSync_{ false };
+            std::atomic<float> rateHz_{ 1.0f };
+            std::atomic<float> bpm_{ 120.0f };
+            std::atomic<BpmDivision> bpmDivision_{ BpmDivision::Quarter };
+            std::atomic<float> min_{ -1.0f };
+            std::atomic<float> max_{ 1.0f };
+            std::atomic<bool> smoothingEnabled_{ false };
+            std::atomic<float> smoothingCoeff_{ 0.0f };
+            std::atomic<float> quantizationStep_{ 0.0f };
+            std::atomic<std::uint64_t> pendingSeed_{ 0 };
+            Real brownNoiseState_{ static_cast<Real>(0) };
+            std::array<Real, 3> pinkNoiseOctaves_{};
+            Real denormalFlip_{ static_cast<Real>(1e-18) }; // DC-Free denormal mitigation state
         }; 
     } // namespace AnalogRandom
 } // namespace dspark

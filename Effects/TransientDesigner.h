@@ -119,16 +119,16 @@ public:
                 T slowCoeff = (absSample > slow) ? slowAttackCoeff_ : currentSlowRelCoeff;
                 slow += slowCoeff * (absSample - slow);
 
-                // 3. Log-domain VCA computation
-                // Replace std::log / std::exp with dspark::math::fast_log / fast_exp if available in DspMath.h
-                T diffLog = std::log(fast) - std::log(slow); 
-                
+                // 3. Log-domain VCA computation (fastLog/fastExp: relative
+                // error < 2e-7 — far below audibility, ~3x faster than libm)
+                T diffLog = fastLog(fast) - fastLog(slow);
+
                 // Attack kicks in when fast > slow (diffLog > 0). Sustain when slow > fast (diffLog < 0)
                 T gainLog = (diffLog > T(0)) ? (diffLog * attAmt) : (-diffLog * susAmt);
-                
+
                 gainLog = std::clamp(gainLog, -maxGainLog, maxGainLog);
-                
-                T gain = std::exp(gainLog);
+
+                T gain = fastExp(gainLog);
                 
                 lastOut = sample * gain;
                 channelData[i] = lastOut;

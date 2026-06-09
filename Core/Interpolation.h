@@ -12,11 +12,15 @@
  * * | Method    | Points | Quality       | CPU Cost | Use case                     |
  * |-----------|--------|---------------|----------|------------------------------|
  * | Linear    | 2      | Low           | Ultra-Low| LFOs, crossfades             |
- * | Hermite   | 4      | Good+         | Low      | Delay lines, wavetables      |
+ * | Hermite   | 4      | Good+         | Low      | Modulated delays (default)   |
  * | Lagrange  | 4      | High          | Low      | Precision resampling         |
  * | Allpass   | 2      | Frequency-dep | Low      | Static fractional delays     |
  *
- * @note For maximum SIMD performance, prefer the overloads that take raw samples 
+ * Hermite is the recommended default for modulated delay lines (chorus,
+ * vibrato, reverb modulation): it is stateless, so fast `frac` changes never
+ * destabilise anything — unlike the recursive Allpass interpolator.
+ *
+ * @note For maximum SIMD performance, prefer the overloads that take raw samples
  * (y0, y1, y2, y3) directly, allowing your container class to handle buffer wrapping.
  */
 
@@ -24,16 +28,6 @@
 #include <cassert>
 
 namespace dspark {
-
-/**
- * @brief Branchless/fast integer wrapping for small out-of-bounds offsets.
- * @internal
- */
-inline int fastWrap(int index, int length) noexcept {
-    while (index >= length) index -= length;
-    while (index < 0) index += length;
-    return index;
-}
 
 /**
  * @brief Linear interpolation between two adjacent samples.

@@ -241,10 +241,8 @@ struct WindowFunctions
     /**
      * @brief Applies a window to a signal buffer in-place.
      *
-     * @note C++20 `std::assume_aligned<32>` is used to guarantee SIMD
-     * vectorization (AVX/AVX2). 
-     * @warning The pointers `signal` and `window` MUST be strictly 32-byte 
-     * aligned. Passing unaligned pointers will result in Undefined Behavior (UB).
+     * No alignment requirements: the element-wise loop auto-vectorizes with
+     * unaligned loads, which run at full speed on all modern CPUs.
      *
      * @param signal Signal buffer to window (modified in-place).
      * @param window Pre-computed window values.
@@ -264,12 +262,10 @@ struct WindowFunctions
 
     /**
      * @brief Computes the coherent gain of a window.
-     * 
-     * Useful for recovering the true amplitude of a peak in a spectral bin 
+     *
+     * Useful for recovering the true amplitude of a peak in a spectral bin
      * after applying a windowing function.
      *
-     * @warning The pointer `window` MUST be strictly 32-byte aligned for SIMD optimization.
-     * 
      * @param window Pre-computed window values.
      * @param size   Number of samples.
      * @return Coherent gain (0.0 to 1.0).
@@ -288,10 +284,8 @@ struct WindowFunctions
 
     /**
      * @brief Computes the energy gain (RMS) of a window.
-     * 
+     *
      * Used for scaling the noise floor accurately when calculating Power Spectral Density (PSD).
-     * 
-     * @warning The pointer `window` MUST be strictly 32-byte aligned for SIMD optimization.
      *
      * @param window Pre-computed window values.
      * @param size   Number of samples.

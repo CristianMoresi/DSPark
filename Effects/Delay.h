@@ -41,6 +41,29 @@ public:
         Asymmetric, SlewLimiter, StateVariable, Butterworth, CriticallyDamped
     };
 
+    /** @brief Feedback path colour. */
+    enum class FeedbackMode
+    {
+        Clean,  ///< Pristine digital regeneration: no per-pass saturation, the
+                ///< decay time matches the feedback gain exactly. A hard
+                ///< safety clamp at +-2.0 guards against runaway (|fb| >= 1).
+        Analog  ///< Tape/BBD-style tanh soft saturation on every pass (default,
+                ///< matches the original DSPark behaviour). Slightly shortens
+                ///< the decay versus the nominal feedback and adds warmth.
+    };
+
+    /** @brief Selects clean or analog feedback regeneration. Thread-safe. */
+    void setFeedbackMode(FeedbackMode mode) noexcept
+    {
+        feedbackMode_.store(mode, std::memory_order_relaxed);
+    }
+
+    /** @brief Returns the active feedback mode. */
+    [[nodiscard]] FeedbackMode getFeedbackMode() const noexcept
+    {
+        return feedbackMode_.load(std::memory_order_relaxed);
+    }
+
     // -- Lifecycle -----------------------------------------------------------
 
     /**
@@ -134,7 +157,11 @@ public:
     {
         samples = std::clamp(samples, SampleType(0), static_cast<SampleType>(maxDelaySamples_ - 1));
         globalDelay_.store(samples, std::memory_order_relaxed);
-        updateSmootherTargets(samples);
+        // Publish/apply pattern: the smoothers are NOT touched here (they are
+        // non-atomic audio-thread state — mutating them from a control thread
+        // raced against advanceSmoother). The audio thread applies the new
+        // target in maybeUpdateSmoothers() at the top of its next process call.
+        delayTargetDirty_.store(true, std::memory_order_release);
     }
 
     /** @brief Sets the delay time in milliseconds. */
@@ -433,6 +460,10 @@ private:
 
     void maybeUpdateSmoothers() noexcept
     {
+        // Audio-thread application point for control-thread publications.
+        if (delayTargetDirty_.exchange(false, std::memory_order_acquire))
+            updateSmootherTargets(globalDelay_.load(std::memory_order_relaxed));
+
         if (!smootherDirty_.load(std::memory_order_relaxed)) return;
         smootherDirty_.store(false, std::memory_order_relaxed);
         float timeMs = smoothingTimeMs_.load(std::memory_order_relaxed);
@@ -538,13 +569,21 @@ private:
         SampleType b = w + a;
         SampleType delayed = ((((a * frac) - b) * frac + c) * frac + y0);
 
-        // Feedback processing with Soft Clipper
+        // Feedback processing
         SampleType fbInput = delayed * fbMult;
         if (fbInput != SampleType(0))
         {
             fbInput = processFbFilters(ch, fbInput, lpC, hpC);
-            // Analog-style soft saturation to prevent clipping explosions
-            fbInput = std::tanh(fbInput); 
+            if (feedbackMode_.load(std::memory_order_relaxed) == FeedbackMode::Analog)
+            {
+                // Analog-style soft saturation to prevent clipping explosions
+                fbInput = std::tanh(fbInput);
+            }
+            else
+            {
+                // Clean mode: exact regeneration; hard safety bound only.
+                fbInput = std::clamp(fbInput, SampleType(-2), SampleType(2));
+            }
         }
         s.lastFeedback = fbInput;
 
@@ -575,8 +614,10 @@ private:
         return out;
     }
 
-    SampleType calcLpCoef(SampleType freq) const noexcept { return std::exp(-twoPi<SampleType> * freq / sampleRate_); }
-    SampleType calcHpCoef(SampleType freq) const noexcept { return std::exp(-twoPi<SampleType> * freq / sampleRate_); }
+    /** @brief One-pole coefficient shared by the feedback LP and HP filters. */
+    SampleType calcOnePoleCoef(SampleType freq) const noexcept { return std::exp(-twoPi<SampleType> * freq / sampleRate_); }
+    SampleType calcLpCoef(SampleType freq) const noexcept { return calcOnePoleCoef(freq); }
+    SampleType calcHpCoef(SampleType freq) const noexcept { return calcOnePoleCoef(freq); }
 
     static int nextPow2(int v) noexcept
     {
@@ -603,6 +644,8 @@ private:
     std::atomic<SmootherType> smootherType_ { SmootherType::Exponential };
     std::atomic<float> smoothingTimeMs_ { 20.0f };
     std::atomic<bool> smootherDirty_ { false };
+    std::atomic<bool> delayTargetDirty_ { false };
+    std::atomic<FeedbackMode> feedbackMode_ { FeedbackMode::Analog };
 
     Smoothers::LinearSmoother mixSmoother_;
 };

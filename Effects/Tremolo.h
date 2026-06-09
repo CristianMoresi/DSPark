@@ -202,7 +202,8 @@ private:
     {
         if constexpr (S == Shape::Sine)
         {
-            return std::sin(phase * T(2) * static_cast<T>(std::numbers::pi));
+            // fastSin: > 100 dB accurate — far beyond audibility for an LFO.
+            return fastSin(phase * twoPi<T>);
         }
         else if constexpr (S == Shape::Triangle)
         {

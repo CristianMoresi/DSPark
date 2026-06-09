@@ -119,9 +119,16 @@ public:
         {
             // Stereo / N-channel linked detection: peak across ALL channels so no
             // channel is left ungated (previously only the first two were processed).
+            // The sidechain HPF runs per channel BEFORE the peak link — it was
+            // silently skipped in this (most common) path before.
             T level = T(0);
             for (int ch = 0; ch < nCh; ++ch)
-                level = std::max(level, std::abs(buffer.getChannel(ch)[i]));
+            {
+                T s = buffer.getChannel(ch)[i];
+                if (cachedScHpfEnabled_)
+                    s = applyScHpf(s, std::min(ch, kMaxScChannels - 1));
+                level = std::max(level, std::abs(s));
+            }
 
             if (cachedAdaptiveHold_) updateZeroCrossing(buffer.getChannel(0)[i]);
 
@@ -172,7 +179,10 @@ public:
                 T scMax = T(0);
                 for (int c = 0; c < scCh; ++c)
                 {
-                    T a = std::abs(sidechain.getChannel(c)[i]);
+                    T s = sidechain.getChannel(c)[i];
+                    if (cachedScHpfEnabled_)
+                        s = applyScHpf(s, std::min(c, kMaxScChannels - 1));
+                    T a = std::abs(s);
                     if (a > scMax) scMax = a;
                 }
 
@@ -306,8 +316,8 @@ public:
         gateGain_ = cachedRangeLinear_;
         envelopeState_ = T(0);
         holdCounter_ = 0;
-        scHpfState_ = T(0);
-        scHpfPrev_ = T(0);
+        scHpfState_.fill(T(0));
+        scHpfPrev_.fill(T(0));
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
             freqLpState_[ch] = T(0);
@@ -479,15 +489,19 @@ protected:
         return hpOut;
     }
 
+    /** @brief Per-channel one-pole sidechain high-pass. */
+    [[nodiscard]] T applyScHpf(T input, int ch) noexcept
+    {
+        T output = input - scHpfPrev_[ch] + scHpfCoeff_ * scHpfState_[ch];
+        scHpfPrev_[ch] = input;
+        scHpfState_[ch] = output;
+        return output;
+    }
+
     [[nodiscard]] T processSampleInternal(T input, T sidechain, int ch) noexcept
     {
         if (cachedScHpfEnabled_)
-        {
-            T output = sidechain - scHpfPrev_ + scHpfCoeff_ * scHpfState_;
-            scHpfPrev_ = sidechain;
-            scHpfState_ = output;
-            sidechain = output;
-        }
+            sidechain = applyScHpf(sidechain, std::min(ch, kMaxScChannels - 1));
 
         T rawLevel = std::abs(sidechain);
         
@@ -533,9 +547,10 @@ protected:
     T cachedNyquist_ = T(24000);
     T cachedFsInvPi2_ = T(0);
 
+    static constexpr int kMaxScChannels = 16;
     T scHpfCoeff_ = T(0.995);
-    T scHpfState_ = T(0);
-    T scHpfPrev_ = T(0);
+    std::array<T, kMaxScChannels> scHpfState_ {};
+    std::array<T, kMaxScChannels> scHpfPrev_ {};
 
     T attackCoeff_ = T(0);
     T releaseCoeff_ = T(0);

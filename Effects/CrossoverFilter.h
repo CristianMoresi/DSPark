@@ -86,7 +86,10 @@ public:
             while (fftPow2 < spec.maxBlockSize * 2) fftPow2 <<= 1;
             lpFftSize_ = fftPow2;
             firLength_ = spec.maxBlockSize; // Use block size as FIR length for good resolution
-            lpLatency_ = (firLength_ - 1) / 2;
+            // The kernel is centred at firLength/2 (the circular shift uses
+            // i - halfLen), so the exact group delay is firLength/2 — the old
+            // (firLength-1)/2 under-reported PDC by one sample for even sizes.
+            lpLatency_ = firLength_ / 2;
 
             lpFft_ = std::make_unique<FFTReal<T>>(lpFftSize_);
             int numBins = lpFftSize_ / 2 + 1;

@@ -5,6 +5,7 @@
 
 #include "DspMath.h"
 #include "DenormalGuard.h" // Essential for IIR stability
+#include "SimdOps.h"       // SIMD dot product for the FIR convolution
 
 #include <array>
 #include <cmath>
@@ -56,18 +57,9 @@ public:
         assert(sampleRate > 0.0);
         sampleRate_ = sampleRate;
 
-        // Ideal Hilbert kernel h[n] = 2/(pi*n) for odd n, 0 for even n, windowed
-        // with a Blackman window to control passband ripple / sideband leakage.
-        constexpr double kPi = 3.14159265358979323846;
-        for (int i = 0; i < kTaps; ++i)
-        {
-            const int n = i - kCenter;
-            double ideal = ((n == 0) || (n % 2 == 0)) ? 0.0 : (2.0 / (kPi * static_cast<double>(n)));
-            double w = 0.42
-                     - 0.5  * std::cos(2.0 * kPi * static_cast<double>(i) / static_cast<double>(kTaps - 1))
-                     + 0.08 * std::cos(4.0 * kPi * static_cast<double>(i) / static_cast<double>(kTaps - 1));
-            kernel_[static_cast<size_t>(i)] = static_cast<T>(ideal * w);
-        }
+        // The FIR kernel does not depend on the sample rate, so it is built
+        // once per process (lazily, thread-safe) instead of on every prepare().
+        (void)reversedKernel();
 
         reset();
         isPrepared_ = true;
@@ -75,28 +67,31 @@ public:
 
     /**
      * @brief Processes one sample, returning the analytic signal {real, imag}.
+     *
+     * Uses a mirrored (double-write) delay line so the convolution window is
+     * one contiguous span, dispatched to the SIMD dot product — an order of
+     * magnitude faster than a wrapped per-tap loop for 191 taps.
+     *
      * @param input Real-valued input sample.
      */
     [[nodiscard]] inline Result process(T input) noexcept
     {
-        delay_[static_cast<size_t>(writePos_)] = input;
+        delay_[static_cast<size_t>(writePos_)]         = input;
+        delay_[static_cast<size_t>(writePos_ + kTaps)] = input;
 
-        // imag = sum_k kernel[k] * x[n-k]  (FIR convolution)
-        T acc = T(0);
-        int idx = writePos_;
-        for (int k = 0; k < kTaps; ++k)
-        {
-            acc += kernel_[static_cast<size_t>(k)] * delay_[static_cast<size_t>(idx)];
-            idx = (idx == 0) ? (kTaps - 1) : (idx - 1);
-        }
+        // Contiguous window of the last kTaps samples, oldest first:
+        // window[j] = x[n - (kTaps - 1 - j)].
+        const T* window = delay_.data() + writePos_ + 1;
 
-        // real = x[n - kCenter] (group-delayed input, aligned with imag)
-        int c = writePos_ - kCenter;
-        if (c < 0) c += kTaps;
-        const T re = delay_[static_cast<size_t>(c)];
+        // imag = sum_k h[k] * x[n-k]: with an oldest-first window this is the
+        // dot product against the REVERSED kernel (precomputed once).
+        const T imag = simd::dotProduct(reversedKernel().data(), window, kTaps);
+
+        // real = x[n - kCenter]: index kTaps-1-kCenter == kCenter (odd length).
+        const T re = window[kCenter];
 
         writePos_ = (writePos_ + 1 == kTaps) ? 0 : (writePos_ + 1);
-        return { re, acc };
+        return { re, imag };
     }
 
     /**
@@ -107,6 +102,7 @@ public:
                       std::span<T> outImag) noexcept
     {
         assert(isPrepared_);
+        assert(outReal.size() >= input.size() && outImag.size() >= input.size());
         DenormalGuard dg;
 
         const size_t numSamples = input.size();
@@ -134,12 +130,37 @@ private:
     static constexpr int kTaps   = 191;
     static constexpr int kCenter = kTaps / 2;
 
+    /** @brief Builds the REVERSED windowed Hilbert kernel once (thread-safe
+     *  C++11 static init). Reversed so the oldest-first mirrored window can be
+     *  convolved with a straight SIMD dot product. */
+    [[nodiscard]] static const std::array<T, kTaps>& reversedKernel() noexcept
+    {
+        static const std::array<T, kTaps> kernel = []
+        {
+            std::array<T, kTaps> k {};
+            constexpr double kPi = 3.14159265358979323846;
+            for (int i = 0; i < kTaps; ++i)
+            {
+                // Ideal Hilbert kernel h[n] = 2/(pi*n) for odd n, 0 for even n,
+                // windowed with Blackman to control ripple / sideband leakage.
+                const int n = i - kCenter;
+                double ideal = ((n == 0) || (n % 2 == 0)) ? 0.0 : (2.0 / (kPi * static_cast<double>(n)));
+                double w = 0.42
+                         - 0.5  * std::cos(2.0 * kPi * static_cast<double>(i) / static_cast<double>(kTaps - 1))
+                         + 0.08 * std::cos(4.0 * kPi * static_cast<double>(i) / static_cast<double>(kTaps - 1));
+                k[static_cast<size_t>(kTaps - 1 - i)] = static_cast<T>(ideal * w);
+            }
+            return k;
+        }();
+        return kernel;
+    }
+
     double sampleRate_ = 0.0;
     bool isPrepared_ = false;
     int writePos_ = 0;
 
-    alignas(32) std::array<T, kTaps> kernel_{};
-    alignas(32) std::array<T, kTaps> delay_{};
+    // Mirrored delay line (double-write) for contiguous SIMD reads.
+    alignas(32) std::array<T, kTaps * 2> delay_{};
 };
 
 } // namespace dspark

@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <memory>
 #include <numbers>
@@ -63,8 +64,8 @@ public:
      * @brief Prepares the clipper for processing, allocating any necessary internal buffers.
      *
      * If oversampling is configured > 1x, this method allocates the oversampling filters.
-     * This function must be called on the audio thread before playback begins, or when
-     * the sample rate changes.
+     * Call it from the main/setup thread before playback begins (never concurrently
+     * with processBlock), and again whenever the sample rate changes.
      *
      * @param spec The current audio environment specifications (sample rate, max block size).
      */
@@ -338,8 +339,13 @@ protected:
         }
         else if constexpr (M == Mode::Analog)
         {
-            T normalized = std::clamp(sample / ceiling, T(-1), T(1));
-            return ceiling * std::sin(normalized * static_cast<T>(std::numbers::pi * 0.5));
+            // Unity-slope sine shaper: sin(x/ceiling) has derivative 1 at the
+            // origin, so quiet material passes at exactly 0 dB like the other
+            // modes (the old pre-scaled form had slope pi/2 — a +3.9 dB jump
+            // when switching modes). The knee spans |x| in [~ceiling*0.5,
+            // ceiling*pi/2] and lands exactly on the ceiling.
+            constexpr T halfPi = static_cast<T>(std::numbers::pi * 0.5);
+            return ceiling * fastSin(std::clamp(sample / ceiling, -halfPi, halfPi));
         }
         else if constexpr (M == Mode::GoldenRatio)
         {

@@ -432,8 +432,13 @@ protected:
             switch (cfg.type)
             {
                 case BandType::Peak:      filter.setPeaking(freq, gain, q); break;
-                case BandType::LowShelf:  filter.setLowShelf(freq, gain, q); break;
-                case BandType::HighShelf: filter.setHighShelf(freq, gain, q); break;
+                // Shelves take a SLOPE (0..1], not a Q: convert with the RBJ
+                // S<->Q relation so the user's Q behaves consistently here and
+                // in the linear-phase kernel (which uses the same conversion).
+                case BandType::LowShelf:  filter.setLowShelf(freq, gain,
+                                              static_cast<float>(shelfSlopeFromQ(q, gain))); break;
+                case BandType::HighShelf: filter.setHighShelf(freq, gain,
+                                              static_cast<float>(shelfSlopeFromQ(q, gain))); break;
                 case BandType::LowPass:   filter.setLowPass(freq, q, cfg.slope); break;
                 case BandType::HighPass:  filter.setHighPass(freq, q, cfg.slope); break;
                 case BandType::Notch:     filter.setNotch(freq, q); break;
@@ -448,6 +453,23 @@ protected:
      * @param cfg Band configuration.
      * @return BiquadCoeffs structure.
      */
+    /**
+     * @brief Converts a user-facing shelf Q into the RBJ shelf slope S.
+     *
+     * RBJ relation: 1/Q^2 = (A + 1/A) * (1/S - 1) + 2 with A = 10^(dB/40).
+     * Q = 0.7071 maps to S = 1 (the standard shelf). Out-of-domain values are
+     * clamped to the stable (0, 1] range that the coefficient factory accepts.
+     */
+    [[nodiscard]] static double shelfSlopeFromQ(double q, double gainDb) noexcept
+    {
+        q = std::max(q, 0.05);
+        const double A = std::pow(10.0, std::abs(gainDb) / 40.0);
+        const double denom = A + 1.0 / A;
+        const double invS = (1.0 / (q * q) - 2.0) / denom + 1.0;
+        if (invS <= 1.0) return 1.0;          // steeper-than-standard requests clamp to S = 1
+        return std::clamp(1.0 / invS, 0.0001, 1.0);
+    }
+
     [[nodiscard]] BiquadCoeffs<T> computeBandCoeffs(const BandConfig& cfg) const noexcept
     {
         double sr = spec_.sampleRate;
@@ -458,8 +480,8 @@ protected:
         switch (cfg.type)
         {
             case BandType::Peak:      return BiquadCoeffs<T>::makePeak(sr, f, q, g);
-            case BandType::LowShelf:  return BiquadCoeffs<T>::makeLowShelf(sr, f, g);
-            case BandType::HighShelf: return BiquadCoeffs<T>::makeHighShelf(sr, f, g);
+            case BandType::LowShelf:  return BiquadCoeffs<T>::makeLowShelf(sr, f, g, shelfSlopeFromQ(q, g));
+            case BandType::HighShelf: return BiquadCoeffs<T>::makeHighShelf(sr, f, g, shelfSlopeFromQ(q, g));
             case BandType::LowPass:   return BiquadCoeffs<T>::makeLowPass(sr, f, q);
             case BandType::HighPass:  return BiquadCoeffs<T>::makeHighPass(sr, f, q);
             case BandType::Notch:     return BiquadCoeffs<T>::makeNotch(sr, f, q);
@@ -557,16 +579,19 @@ protected:
         {
             // Circular read from center 0
             int readIdx = (i - halfM + lpFftSize_) % lpFftSize_;
-            
+
             // Blackman-Harris window formulation
             double t = static_cast<double>(i) / static_cast<double>(M - 1);
-            double window = 0.35875 
-                          - 0.48829 * std::cos(2.0 * pi<double> * t) 
-                          + 0.14128 * std::cos(4.0 * pi<double> * t) 
+            double window = 0.35875
+                          - 0.48829 * std::cos(2.0 * pi<double> * t)
+                          + 0.14128 * std::cos(4.0 * pi<double> * t)
                           - 0.01168 * std::cos(6.0 * pi<double> * t);
-                          
-            // Scaling by 1/N is required due to FFTReal unscaled inverse
-            lpKernelSpace_[i] = lpImpulse_[readIdx] * static_cast<T>(window) / static_cast<T>(lpFftSize_);
+
+            // No extra scaling: FFTReal::inverse already applies the full 1/N
+            // normalisation (verified by exact round-trip). The previous extra
+            // division by lpFftSize_ attenuated the whole linear-phase path by
+            // 20*log10(N) dB — about -60 dB with the default sizes.
+            lpKernelSpace_[i] = lpImpulse_[readIdx] * static_cast<T>(window);
         }
 
         // 5. Transform finalized zero-padded causal kernel to frequency domain

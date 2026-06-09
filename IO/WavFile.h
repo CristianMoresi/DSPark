@@ -349,6 +349,11 @@ private:
 
             file_.seekg(14, std::ios::cur);
 
+            // Skip any extra bytes after the 40 standard EXTENSIBLE bytes so
+            // the chunk walker stays aligned on unusual writers.
+            if (chunkSize > 40)
+                file_.seekg(static_cast<std::streamoff>(chunkSize - 40), std::ios::cur);
+
             if (validBitsPerSample > 0)
                 bitsPerSample = validBitsPerSample;
         }

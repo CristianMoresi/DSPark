@@ -108,6 +108,11 @@ public:
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
+        // Design note: std::atomic<shared_ptr> is not lock-free (the STL uses
+        // an internal spinlock), but the only writer is loadIR() — a rare,
+        // user-initiated event — so contention is effectively zero. A manual
+        // RCU scheme would remove the spinlock at the cost of a real
+        // use-after-free hazard under racing loads; correctness wins here.
         auto bank = bank_.load(std::memory_order_acquire);
         if (!bank || bank->convolvers.empty()) return;
 

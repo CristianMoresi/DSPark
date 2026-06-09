@@ -11,10 +11,12 @@
 #include "../Core/DspMath.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
+#include "../Core/TruePeakDetector.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <numbers>
 #include <array>
 
@@ -84,14 +86,18 @@ public:
      */
     void process(const T* data, int numSamples) noexcept
     {
+        T tpMax = truePeakMax_.load(std::memory_order_relaxed);
         for (int i = 0; i < numSamples; ++i)
         {
+            tpMax = std::max(tpMax, truePeak_.processSample(data[i], 0));
+
             double filtered = applyKWeighting(static_cast<double>(data[i]), 0);
             currentBlockPower_ += filtered * filtered;
-            
+
             if (++currentBlockSamples_ >= blockSamples_)
                 commitBlock();
         }
+        truePeakMax_.store(tpMax, std::memory_order_relaxed);
     }
 
     /**
@@ -102,16 +108,21 @@ public:
      */
     void process(const T* left, const T* right, int numSamples) noexcept
     {
+        T tpMax = truePeakMax_.load(std::memory_order_relaxed);
         for (int i = 0; i < numSamples; ++i)
         {
+            tpMax = std::max(tpMax, truePeak_.processSample(left[i], 0));
+            tpMax = std::max(tpMax, truePeak_.processSample(right[i], 1));
+
             double filtL = applyKWeighting(static_cast<double>(left[i]), 0);
             double filtR = applyKWeighting(static_cast<double>(right[i]), 1);
 
             currentBlockPower_ += (filtL * filtL + filtR * filtR);
-            
+
             if (++currentBlockSamples_ >= blockSamples_)
                 commitBlock();
         }
+        truePeakMax_.store(tpMax, std::memory_order_relaxed);
     }
 
     /**
@@ -184,6 +195,73 @@ public:
     }
 
     /**
+     * @brief Returns the maximum true peak observed since the last reset.
+     * @return True peak in dBTP (ITU-R BS.1770-4, 4x oversampled estimate).
+     */
+    [[nodiscard]] T getTruePeakDb() const noexcept
+    {
+        return gainToDecibels(truePeakMax_.load(std::memory_order_relaxed));
+    }
+
+    /**
+     * @brief Computes the EBU R128 Loudness Range (EBU Tech 3342).
+     *
+     * Short-term (3 s) loudness sampled once per second, gated at -70 LUFS
+     * absolute and -20 LU relative; LRA is the spread between the 10th and
+     * 95th percentiles. O(bins) and real-time safe like the integrated gate.
+     *
+     * @return Loudness range in LU (0 if not enough material yet).
+     */
+    [[nodiscard]] T getLoudnessRange() const noexcept
+    {
+        // Pass 1: relative gate from the mean of absolute-gated ST values.
+        double sumPower = 0.0;
+        uint32_t count = 0;
+        for (int i = 0; i < kNumBins; ++i)
+        {
+            const uint32_t c = lraHistogram_[i].load(std::memory_order_relaxed);
+            if (c > 0)
+            {
+                sumPower += lufsToPower(kMinHistogramLUFS + i * kBinWidth) * c;
+                count += c;
+            }
+        }
+        if (count == 0) return T(0);
+
+        const double relGateLUFS = powerToLUFS(sumPower / count) - 20.0;
+        int gateBin = static_cast<int>(std::floor((relGateLUFS - kMinHistogramLUFS) / kBinWidth));
+        gateBin = std::clamp(gateBin, 0, kNumBins - 1);
+
+        // Pass 2: 10th / 95th percentiles above the relative gate.
+        uint32_t gatedCount = 0;
+        for (int i = gateBin; i < kNumBins; ++i)
+            gatedCount += lraHistogram_[i].load(std::memory_order_relaxed);
+        if (gatedCount == 0) return T(0);
+
+        const auto target10 = static_cast<uint32_t>(0.10 * gatedCount);
+        const auto target95 = static_cast<uint32_t>(0.95 * gatedCount);
+
+        double p10 = kMinHistogramLUFS, p95 = kMaxHistogramLUFS;
+        uint32_t running = 0;
+        bool have10 = false;
+        for (int i = gateBin; i < kNumBins; ++i)
+        {
+            running += lraHistogram_[i].load(std::memory_order_relaxed);
+            if (!have10 && running >= target10)
+            {
+                p10 = kMinHistogramLUFS + i * kBinWidth;
+                have10 = true;
+            }
+            if (running >= target95)
+            {
+                p95 = kMinHistogramLUFS + i * kBinWidth;
+                break;
+            }
+        }
+        return static_cast<T>(std::max(0.0, p95 - p10));
+    }
+
+    /**
      * @brief Clears all measurements and resets filters.
      * Lock-free, but may tear slightly if audio thread is simultaneously writing.
      */
@@ -200,8 +278,14 @@ public:
 
         for (auto& bin : histogram_)
             bin.store(0, std::memory_order_relaxed);
+        for (auto& bin : lraHistogram_)
+            bin.store(0, std::memory_order_relaxed);
+
+        truePeak_.reset();
+        truePeakMax_.store(T(0), std::memory_order_relaxed);
 
         blockWritePos_.store(0, std::memory_order_relaxed);
+        totalCommittedBlocks_ = 0;
         currentBlockPower_ = 0.0;
         currentBlockSamples_ = 0;
     }
@@ -268,19 +352,45 @@ private:
         // Update sliding window ring buffer
         int currentPos = blockWritePos_.load(std::memory_order_relaxed);
         blockPowers_[currentPos].store(meanPower, std::memory_order_relaxed);
-        
+
         int nextPos = (currentPos + 1) % 30; // 30 blocks = 3s max window
         blockWritePos_.store(nextPos, std::memory_order_release);
+        ++totalCommittedBlocks_;
 
-        // Update histogram if block passes absolute gate
-        double lufs = powerToLUFS(meanPower);
-        if (lufs >= kMinHistogramLUFS)
+        // BS.1770-4 integrated gating uses 400 ms blocks with 75% overlap.
+        // With a 100 ms sub-block hop, that is EXACTLY the mean of the last
+        // four sub-blocks committed at every 100 ms step. (Gating raw 100 ms
+        // blocks has higher variance and fails the EBU conformance vectors.)
+        if (totalCommittedBlocks_ >= 4)
         {
-            int binIndex = static_cast<int>(std::round((lufs - kMinHistogramLUFS) / kBinWidth));
-            binIndex = std::clamp(binIndex, 0, kNumBins - 1);
-            
-            // Atomically increment the bin
-            histogram_[binIndex].fetch_add(1, std::memory_order_relaxed);
+            double gating400 = meanPower;
+            for (int back = 1; back < 4; ++back)
+            {
+                int idx = (currentPos - back + 30) % 30;
+                gating400 += blockPowers_[idx].load(std::memory_order_relaxed);
+            }
+            gating400 *= 0.25;
+
+            const double lufs = powerToLUFS(gating400);
+            if (lufs >= kMinHistogramLUFS)
+            {
+                int binIndex = static_cast<int>(std::round((lufs - kMinHistogramLUFS) / kBinWidth));
+                binIndex = std::clamp(binIndex, 0, kNumBins - 1);
+                histogram_[binIndex].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        // EBU Tech 3342 loudness range: short-term (3 s) values sampled every
+        // 1 s (10 sub-blocks), absolute-gated at -70 LUFS into a histogram.
+        if (totalCommittedBlocks_ >= 30 && (totalCommittedBlocks_ % 10) == 0)
+        {
+            const double stLufs = static_cast<double>(calculateLUFSFromBlocks(30));
+            if (stLufs >= kMinHistogramLUFS)
+            {
+                int binIndex = static_cast<int>(std::round((stLufs - kMinHistogramLUFS) / kBinWidth));
+                binIndex = std::clamp(binIndex, 0, kNumBins - 1);
+                lraHistogram_[binIndex].fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
         currentBlockPower_ = 0.0;
@@ -323,11 +433,19 @@ private:
     int currentBlockSamples_ = 0;
 
     // Concurrency-safe components
-    std::array<std::atomic<double>, 30> blockPowers_; 
+    std::array<std::atomic<double>, 30> blockPowers_;
     std::atomic<int> blockWritePos_{0};
-    
+    int64_t totalCommittedBlocks_ = 0;
+
     // O(1) Histogram for Integrated Loudness
     std::array<std::atomic<uint32_t>, kNumBins> histogram_;
+
+    // EBU Tech 3342 loudness-range histogram (short-term values, 1 s hop)
+    std::array<std::atomic<uint32_t>, kNumBins> lraHistogram_;
+
+    // ITU-R BS.1770-4 true-peak (dBTP) tracking
+    TruePeakDetector<T, kMaxChannels> truePeak_;
+    std::atomic<T> truePeakMax_ { T(0) };
 };
 
 } // namespace dspark

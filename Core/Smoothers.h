@@ -85,6 +85,12 @@ private:
  * @brief Exponential (multiplicative) smoother for natural, perceptual responses.
  *
  * Use for: Filter cutoffs, frequencies, volumes in dB.
+ *
+ * @warning Geometric smoothing is only defined for same-sign transitions. If
+ * the new target's sign differs from the current value (ratio <= 0), the
+ * smoother snaps instantly to the target — an audible step. Keep this class
+ * for strictly-positive parameters (Hz, linear gain); use LinearSmoother or
+ * OnePoleSmoother for bipolar values (pan, offsets).
  */
 struct alignas(32) ExponentialSmoother
 {
@@ -630,8 +636,12 @@ inline void Smoothers::ButterworthSmoother::reset(double sampleRate, float timeC
     a1 = 2.0f * (tanw2 - 1.0f) / denom;
     a2 = (1.0f - Constants::sqrt2 * tanw + tanw2) / denom;
 
-    s1 = (b1 - a1) * initialValue;
+    // TDF-II steady state for a constant input/output v requires the s2 term
+    // inside s1: s2* = (b2 - a2)*v and s1* = (b1 - a1)*v + s2*. Without the
+    // + s2 term the first sample of every new ramp overshot to ~2x the value
+    // (an audible click — the opposite of a smoother's job).
     s2 = (b2 - a2) * initialValue;
+    s1 = (b1 - a1) * initialValue + s2;
     target = initialValue;
     lastOut = initialValue;
 }
@@ -661,8 +671,9 @@ inline bool Smoothers::ButterworthSmoother::isSmoothing() const noexcept
 
 inline void Smoothers::ButterworthSmoother::skip() noexcept
 {
-    s1 = (b1 - a1) * target;
+    // Same steady-state form as reset(): s1 must include the settled s2.
     s2 = (b2 - a2) * target;
+    s1 = (b1 - a1) * target + s2;
     lastOut = target;
 }
 

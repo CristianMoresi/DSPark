@@ -81,6 +81,8 @@ public:
     {
         assert(blockSize >= 1 && (blockSize & (blockSize - 1)) == 0);
         assert(irLength > 0);
+        assert(irData != nullptr);
+        if (irData == nullptr || irLength <= 0) return;
 
         blockSize_ = blockSize;
         fftSize_ = blockSize * 2;
@@ -352,7 +354,7 @@ private:
                 float32x4_t p1     = vmulq_f32(a_re, vb);
                 float32x4_t p2     = vmulq_f32(a_im, b_swap);
                 float32x4_t p2_neg = vreinterpretq_f32_u32(
-                    veorq_u32(vreinterpretq_f32_u32(p2), negMask));
+                    veorq_u32(vreinterpretq_u32_f32(p2), negMask));
 
                 vacc = vaddq_f32(vacc, vaddq_f32(p1, p2_neg));
                 vst1q_f32(accum + 2 * k, vacc);

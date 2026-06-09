@@ -80,6 +80,16 @@ public:
     void prepare(const AudioSpec& spec)
     {
         dryBuffer_.resize(spec.numChannels, spec.maxBlockSize);
+
+        // If latency compensation was configured before prepare(), the delay
+        // history was sized with 0 channels — rebuild it now that the channel
+        // count is known (otherwise pushDry would index a 0-channel buffer).
+        if (latencySamples_ > 0)
+        {
+            delayHist_.resize(spec.numChannels, latencySamples_);
+            histPos_ = 0;
+        }
+
         reset();
     }
 
@@ -209,25 +219,45 @@ public:
 
             if (mixRule_ == MixRule::EqualPower)
             {
-                for (int i = 0; i < nSamples; ++i)
+                if (!needsSmoothing)
                 {
-                    // Fast constant-power approximation using square root
+                    // Static mix: hoist both square roots out of the loop —
+                    // the body becomes a single FMA per sample (vectorizable).
                     const T w = std::sqrt(mixVal);
                     const T d = std::sqrt(T(1) - mixVal);
-                    wetData[i] = dryData[i] * d + wetData[i] * w;
-                    
-                    if (needsSmoothing) mixVal += mixStep;
+                    for (int i = 0; i < nSamples; ++i)
+                        wetData[i] = dryData[i] * d + wetData[i] * w;
+                }
+                else
+                {
+                    for (int i = 0; i < nSamples; ++i)
+                    {
+                        // Exact constant-power law: w^2 + d^2 = 1.
+                        const T w = std::sqrt(mixVal);
+                        const T d = std::sqrt(T(1) - mixVal);
+                        wetData[i] = dryData[i] * d + wetData[i] * w;
+                        mixVal += mixStep;
+                    }
                 }
             }
             else // MixRule::Linear
             {
-                for (int i = 0; i < nSamples; ++i)
+                if (!needsSmoothing)
                 {
                     const T w = mixVal;
                     const T d = T(1) - w;
-                    wetData[i] = dryData[i] * d + wetData[i] * w;
-                    
-                    if (needsSmoothing) mixVal += mixStep;
+                    for (int i = 0; i < nSamples; ++i)
+                        wetData[i] = dryData[i] * d + wetData[i] * w;
+                }
+                else
+                {
+                    for (int i = 0; i < nSamples; ++i)
+                    {
+                        const T w = mixVal;
+                        const T d = T(1) - w;
+                        wetData[i] = dryData[i] * d + wetData[i] * w;
+                        mixVal += mixStep;
+                    }
                 }
             }
         }

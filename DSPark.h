@@ -429,6 +429,8 @@
  * | `SampleAndHold<T>`       | Core/SampleAndHold.h      | S&H for bit-crush and stepped modulation          |
  * | `WaveshapeTable<T>`      | Core/WaveshapeTable.h     | Table-lookup waveshaper with presets              |
  * | `Hilbert<T>`             | Core/Hilbert.h            | Allpass Hilbert transform for analytic signals    |
+ * | `TruePeakDetector<T>`    | Core/TruePeakDetector.h   | Shared ITU-R BS.1770-4 inter-sample peak detector |
+ * | `AnalogConstants`        | Core/AnalogConstants.h    | Analog-hardware reference constants (zero runtime cost) |
  * | `SpinLock`               | Core/SpinLock.h           | RT-safe spinlock for thread-safe parameters       |
  * | `SpscQueue<T>`           | Core/SpscQueue.h          | Lock-free single-producer/single-consumer queue   |
  * | `AnalogRandom`           | Core/AnalogRandom.h       | Analog-style noise (white/pink/brown)             |
@@ -614,6 +616,8 @@
 #include "Core/DspMath.h"
 #include "Core/AudioSpec.h"
 #include "Core/AudioBuffer.h"
+#include "Core/AnalogConstants.h"
+#include "Core/TruePeakDetector.h"
 #include "Core/SpinLock.h"
 #include "Core/SpscQueue.h"
 #include "Core/Biquad.h"

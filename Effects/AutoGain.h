@@ -24,6 +24,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/DspMath.h"
+#include "../Core/SimdOps.h"
 
 #include <algorithm>
 #include <atomic>
@@ -168,13 +169,7 @@ private:
         const int totalSamples = numSamples * numCh;
 
         for (int ch = 0; ch < numCh; ++ch)
-        {
-            const T* data = buffer.getChannel(ch);
-            for (int i = 0; i < numSamples; ++i)
-            {
-                sumSq += data[i] * data[i];
-            }
-        }
+            sumSq += simd::sumOfSquares(buffer.getChannel(ch), numSamples);
 
         // Apply a strict epsilon floor (approx -150dB) to avoid std::sqrt(0) and gainToDecibels(0) -> -Inf
         T meanSq = std::max<T>(sumSq / static_cast<T>(totalSamples), T(1e-15));

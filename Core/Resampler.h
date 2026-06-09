@@ -24,8 +24,9 @@
  */
 
 #include "AudioBuffer.h"
+#include "AudioSpec.h"
 #include "DspMath.h"
-#include "WindowFunctions.h"
+#include "SimdOps.h"
 
 #include <algorithm>
 #include <cassert>
@@ -104,7 +105,11 @@ public:
 
         for (auto& cs : channelStates_)
         {
-            std::fill(cs.history.begin(), cs.history.end(), T(0));
+            // assign (not fill): after a re-prepare with a higher quality the
+            // histories must GROW to the new sincPoints_, otherwise the mirror
+            // write at [writePos + sincPoints_] lands past the end of the
+            // allocation (confirmed heap overflow under ASan).
+            cs.history.assign(static_cast<size_t>(sincPoints_ * 2), T(0));
             cs.writePos = 0;
             cs.fractionalPos = 0.0;
         }
@@ -233,38 +238,65 @@ private:
         return 32;
     }
 
+    /** @brief Modified Bessel I0 for the continuous Kaiser window. */
+    [[nodiscard]] static double besselI0(double x) noexcept
+    {
+        double sum = 1.0, term = 1.0;
+        for (int k = 1; k <= 30; ++k)
+        {
+            const double half = x / (2.0 * k);
+            term *= half * half;
+            sum += term;
+            if (term < 1e-15 * sum) break;
+        }
+        return sum;
+    }
+
     void buildSincTable()
     {
-        sincTable_.resize(static_cast<size_t>(kOversample * sincPoints_));
-
-        std::vector<T> kaiserWin(static_cast<size_t>(sincPoints_));
-        WindowFunctions<T>::kaiser(kaiserWin.data(), sincPoints_, T(10), false);
+        // kOversample + 1 phases: the extra phase holds the frac = 1.0 kernel,
+        // so the 2-point phase interpolation in the read path never has to
+        // clamp or wrap (exact at both ends of the fractional range).
+        sincTable_.resize(static_cast<size_t>((kOversample + 1) * sincPoints_));
 
         const int halfSinc = sincPoints_ / 2;
-        constexpr double kPi = std::numbers::pi;
+        constexpr double kPi  = std::numbers::pi;
+        constexpr double beta = 10.0;
+        const double i0Beta = besselI0(beta);
 
         // Apply 0.95 margin on downsampling to prevent transition-band aliasing.
         double cutoff = (ratio_ < 1.0) ? (ratio_ * 0.95) : 1.0;
 
-        for (int phase = 0; phase < kOversample; ++phase)
+        for (int phase = 0; phase <= kOversample; ++phase)
         {
-            double frac = static_cast<double>(phase) / static_cast<double>(kOversample);
+            const double frac = static_cast<double>(phase) / static_cast<double>(kOversample);
             const int base = phase * sincPoints_;
             double sum = 0.0;
 
             for (int tap = 0; tap < sincPoints_; ++tap)
             {
-                double x = (static_cast<double>(tap - halfSinc) + frac) * cutoff;
-                T sincVal;
+                // Tap position relative to the interpolation point intPos + frac.
+                // The MINUS sign is essential: with `+ frac` the kernel samples
+                // at intPos - frac, which time-reverses the sub-sample motion
+                // (audible as heavy zipper distortion).
+                const double t = static_cast<double>(tap - halfSinc) - frac;
+                const double x = t * cutoff;
 
-                if (std::abs(x) < 1e-10)
-                    sincVal = static_cast<T>(cutoff);
-                else
-                    sincVal = static_cast<T>(cutoff * std::sin(kPi * x) / (kPi * x));
+                double sincVal = (std::abs(x) < 1e-10)
+                    ? cutoff
+                    : cutoff * std::sin(kPi * x) / (kPi * x);
 
-                sincVal *= kaiserWin[static_cast<size_t>(tap)];
-                sincTable_[static_cast<size_t>(base + tap)] = sincVal;
-                sum += static_cast<double>(sincVal);
+                // Continuous Kaiser window evaluated at the SAME shifted
+                // position as the sinc (a per-tap fixed window leaves a small
+                // phase-dependent ripple in the passband).
+                const double wx = t / static_cast<double>(halfSinc);
+                const double win = (std::abs(wx) >= 1.0)
+                    ? 0.0
+                    : besselI0(beta * std::sqrt(1.0 - wx * wx)) / i0Beta;
+
+                const double v = sincVal * win;
+                sincTable_[static_cast<size_t>(base + tap)] = static_cast<T>(v);
+                sum += v;
             }
 
             // Normalise each polyphase branch to unity DC gain so the passband
@@ -280,44 +312,41 @@ private:
 
     /**
      * @brief Offline interpolation with boundary checks.
+     *
+     * Linear interpolation between two adjacent table phases: with 256 phases
+     * (plus the explicit frac=1 phase) the phase-quantisation images sit below
+     * -90 dB, and the cost is half of the previous 4-phase cubic blend. The
+     * in-range fast path dispatches both kernels to the SIMD dot product.
      */
     T interpolateOffline(const T* data, int length, int intPos, double frac, int halfSinc) const noexcept
     {
-        double exactPhase = frac * static_cast<double>(kOversample);
-        int p1 = static_cast<int>(exactPhase);
-        double pf = exactPhase - static_cast<double>(p1);
+        const double exactPhase = frac * static_cast<double>(kOversample);
+        int p0 = static_cast<int>(exactPhase);
+        if (p0 > kOversample - 1) p0 = kOversample - 1; // frac is < 1 by contract
+        const T pf = static_cast<T>(exactPhase - static_cast<double>(p0));
 
-        int p0 = std::max(p1 - 1, 0);
-        int p2 = std::min(p1 + 1, kOversample - 1);
-        int p3 = std::min(p1 + 2, kOversample - 1);
-        p1 = std::clamp(p1, 0, kOversample - 1);
+        const T* k0 = sincTable_.data() + static_cast<size_t>(p0) * sincPoints_;
+        const T* k1 = k0 + sincPoints_; // safe: table holds kOversample+1 phases
 
-        size_t offset0 = static_cast<size_t>(p0 * sincPoints_);
-        size_t offset1 = static_cast<size_t>(p1 * sincPoints_);
-        size_t offset2 = static_cast<size_t>(p2 * sincPoints_);
-        size_t offset3 = static_cast<size_t>(p3 * sincPoints_);
-
-        T t = static_cast<T>(pf);
-        T result = T(0);
-
-        for (int tap = 0; tap < sincPoints_; ++tap)
+        const int firstSrc = intPos - halfSinc;
+        if (firstSrc >= 0 && firstSrc + sincPoints_ <= length)
         {
-            int srcIdx = intPos + tap - halfSinc;
-            T sample = (srcIdx >= 0 && srcIdx < length) ? data[srcIdx] : T(0);
-
-            T y0 = sincTable_[offset0 + tap];
-            T y1 = sincTable_[offset1 + tap];
-            T y2 = sincTable_[offset2 + tap];
-            T y3 = sincTable_[offset3 + tap];
-
-            T a1 = T(0.5) * (y2 - y0);
-            T a2 = y0 - T(2.5) * y1 + T(2) * y2 - T(0.5) * y3;
-            T a3 = T(0.5) * (y3 - y0) + T(1.5) * (y1 - y2);
-
-            T sincVal = y1 + t * (a1 + t * (a2 + t * a3));
-            result += sample * sincVal;
+            // Fully in range: two SIMD dot products + one lerp.
+            const T* src = data + firstSrc;
+            const T s0 = simd::dotProduct(k0, src, sincPoints_);
+            const T s1 = simd::dotProduct(k1, src, sincPoints_);
+            return s0 + pf * (s1 - s0);
         }
 
+        // Edge path: zero-pad outside the buffer.
+        T result = T(0);
+        for (int tap = 0; tap < sincPoints_; ++tap)
+        {
+            const int srcIdx = firstSrc + tap;
+            if (srcIdx < 0 || srcIdx >= length) continue;
+            const T kernel = k0[tap] + pf * (k1[tap] - k0[tap]);
+            result += data[srcIdx] * kernel;
+        }
         return result;
     }
 
@@ -335,46 +364,26 @@ private:
 
     /**
      * @brief High-performance contiguous memory interpolator.
-     * Relies on the double-buffered history allowing linear SIMD loading.
+     *
+     * Relies on the double-buffered history allowing linear SIMD loading:
+     * two SIMD dot products against adjacent table phases plus one lerp.
      */
     T interpolateFromHistory(const T* historyPtr, int readPos, double frac) const noexcept
     {
-        double exactPhase = frac * static_cast<double>(kOversample);
-        int p1 = static_cast<int>(exactPhase);
-        double pf = exactPhase - static_cast<double>(p1);
+        const double exactPhase = frac * static_cast<double>(kOversample);
+        int p0 = static_cast<int>(exactPhase);
+        if (p0 > kOversample - 1) p0 = kOversample - 1; // frac is < 1 by contract
+        const T pf = static_cast<T>(exactPhase - static_cast<double>(p0));
 
-        int p0 = std::max(p1 - 1, 0);
-        int p2 = std::min(p1 + 1, kOversample - 1);
-        int p3 = std::min(p1 + 2, kOversample - 1);
-        p1 = std::clamp(p1, 0, kOversample - 1);
-
-        size_t offset0 = static_cast<size_t>(p0 * sincPoints_);
-        size_t offset1 = static_cast<size_t>(p1 * sincPoints_);
-        size_t offset2 = static_cast<size_t>(p2 * sincPoints_);
-        size_t offset3 = static_cast<size_t>(p3 * sincPoints_);
-
-        T t = static_cast<T>(pf);
-        T result = T(0);
+        const T* k0 = sincTable_.data() + static_cast<size_t>(p0) * sincPoints_;
+        const T* k1 = k0 + sincPoints_; // safe: table holds kOversample+1 phases
 
         // Linear memory read from 'readPos'. No modulo required.
         const T* h_ptr = &historyPtr[readPos];
 
-        for (int tap = 0; tap < sincPoints_; ++tap)
-        {
-            T y0 = sincTable_[offset0 + tap];
-            T y1 = sincTable_[offset1 + tap];
-            T y2 = sincTable_[offset2 + tap];
-            T y3 = sincTable_[offset3 + tap];
-
-            T a1 = T(0.5) * (y2 - y0);
-            T a2 = y0 - T(2.5) * y1 + T(2) * y2 - T(0.5) * y3;
-            T a3 = T(0.5) * (y3 - y0) + T(1.5) * (y1 - y2);
-
-            T sincVal = y1 + t * (a1 + t * (a2 + t * a3));
-            result += h_ptr[tap] * sincVal;
-        }
-
-        return result;
+        const T s0 = simd::dotProduct(k0, h_ptr, sincPoints_);
+        const T s1 = simd::dotProduct(k1, h_ptr, sincPoints_);
+        return s0 + pf * (s1 - s0);
     }
 
     struct ChannelState
@@ -387,17 +396,19 @@ private:
     void ensureChannelStates(int numChannels)
     {
         if (static_cast<int>(channelStates_.size()) < numChannels)
-        {
             channelStates_.resize(static_cast<size_t>(numChannels));
-            for (auto& cs : channelStates_)
+
+        // Double size supports the modulo-free mirrored convolution. The size
+        // check is against the CURRENT sincPoints_: quality may have changed
+        // between prepares, and a stale (smaller) history would overflow.
+        const size_t needed = static_cast<size_t>(sincPoints_ * 2);
+        for (auto& cs : channelStates_)
+        {
+            if (cs.history.size() != needed)
             {
-                if (cs.history.empty())
-                {
-                    // Allocate double size to support modulo-free SIMD convolution
-                    cs.history.assign(static_cast<size_t>(sincPoints_ * 2), T(0));
-                    cs.writePos = 0;
-                    cs.fractionalPos = 0.0;
-                }
+                cs.history.assign(needed, T(0));
+                cs.writePos = 0;
+                cs.fractionalPos = 0.0;
             }
         }
     }

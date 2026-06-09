@@ -137,11 +137,13 @@ public:
                 T fmMod = T(0);
                 if (modDepth > T(0)) {
                     T modPhase = modPhasor.advance();
-                    // Note: Replace std::sin with dspark::math::fast_sin for production SIMD
-                    fmMod = std::sin(modPhase * kTwoPi) * modDepth; 
+                    fmMod = fastSin(modPhase * kTwoPi) * modDepth;
                 }
 
-                T instantRate = std::max(effectiveRate * (T(1) + fmMod), T(0.01));
+                // Floor at 0.1 Hz — the SAME minimum the delay-line sizing in
+                // prepare() assumes. A lower floor (0.01) let deep FM request
+                // deviations ~100x the allocated buffer (wrapped garbage audio).
+                T instantRate = std::max(effectiveRate * (T(1) + fmMod), T(0.1));
 
                 // Advance primary phasor manually using the instantaneous FM rate
                 phasor.setFrequency(instantRate);
@@ -157,9 +159,10 @@ public:
                 T deviation = (adjustedDepth * deviationScaler) / instantRate;
                 T centre = deviation + T(4.0); // Offset to prevent delay dropping below 0
 
-                T lfo = std::sin(phase * kTwoPi);
-                T delaySamples = std::max(centre + lfo * deviation, T(1.0));
-                
+                T lfo = fastSin(phase * kTwoPi);
+                T delaySamples = std::clamp(centre + lfo * deviation, T(1.0),
+                                            static_cast<T>(delay.getCapacity() - 4));
+
                 data[i] = delay.readInterpolated(delaySamples);
             }
         }

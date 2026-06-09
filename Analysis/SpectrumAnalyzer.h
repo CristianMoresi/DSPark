@@ -34,6 +34,7 @@
 #include "../Core/WindowFunctions.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -95,14 +96,18 @@ public:
         magnitudesState_.assign(static_cast<size_t>(numBins_), T(0));
         peakState_.assign(static_cast<size_t>(numBins_), T(-100));
 
-        // Double buffers for Thread-Safe Reading
-        outMagnitudesDbA_.assign(static_cast<size_t>(numBins_), T(-100));
-        outMagnitudesDbB_.assign(static_cast<size_t>(numBins_), T(-100));
-        outPeakDbA_.assign(static_cast<size_t>(numBins_), T(-100));
-        outPeakDbB_.assign(static_cast<size_t>(numBins_), T(-100));
+        // Triple buffer for tear-free cross-thread reading
+        for (auto& slot : outSlots_)
+        {
+            slot.magnitudesDb.assign(static_cast<size_t>(numBins_), T(-100));
+            slot.peakDb.assign(static_cast<size_t>(numBins_), T(-100));
+        }
+        writeSlot_ = 0;
+        readSlot_  = 1;
+        pendingSlot_.store(2, std::memory_order_relaxed);
 
-        writeBuffer_.store(0, std::memory_order_relaxed);
         ringWritePos_ = 0;
+        ringMask_ = fftSize_ - 1; // power of two guaranteed by the assert above
         samplesUntilFFT_ = hopSize_;
         newDataReady_.store(false, std::memory_order_relaxed);
     }
@@ -113,12 +118,13 @@ public:
         std::fill(inputRing_.begin(), inputRing_.end(), T(0));
         std::fill(magnitudesState_.begin(), magnitudesState_.end(), T(0));
         std::fill(peakState_.begin(), peakState_.end(), floorDb_);
-        
-        std::fill(outMagnitudesDbA_.begin(), outMagnitudesDbA_.end(), floorDb_);
-        std::fill(outMagnitudesDbB_.begin(), outMagnitudesDbB_.end(), floorDb_);
-        std::fill(outPeakDbA_.begin(), outPeakDbA_.end(), floorDb_);
-        std::fill(outPeakDbB_.begin(), outPeakDbB_.end(), floorDb_);
-        
+
+        for (auto& slot : outSlots_)
+        {
+            std::fill(slot.magnitudesDb.begin(), slot.magnitudesDb.end(), floorDb_);
+            std::fill(slot.peakDb.begin(), slot.peakDb.end(), floorDb_);
+        }
+
         ringWritePos_ = 0;
         samplesUntilFFT_ = hopSize_;
     }
@@ -141,7 +147,7 @@ public:
         for (int i = 0; i < numSamples; ++i)
         {
             inputRing_[static_cast<size_t>(ringWritePos_)] = samples[i];
-            ringWritePos_ = (ringWritePos_ + 1) % fftSize_;
+            ringWritePos_ = (ringWritePos_ + 1) & ringMask_; // pow2 mask, no division
 
             if (--samplesUntilFFT_ <= 0)
             {
@@ -157,8 +163,8 @@ public:
      */
     [[nodiscard]] const T* getMagnitudesDb() const noexcept
     {
-        int readBuf = 1 - writeBuffer_.load(std::memory_order_acquire);
-        return (readBuf == 0) ? outMagnitudesDbA_.data() : outMagnitudesDbB_.data();
+        acquireLatestSlot();
+        return outSlots_[static_cast<size_t>(readSlot_)].magnitudesDb.data();
     }
 
     /**
@@ -167,8 +173,8 @@ public:
      */
     [[nodiscard]] const T* getPeakHoldDb() const noexcept
     {
-        int readBuf = 1 - writeBuffer_.load(std::memory_order_acquire);
-        return (readBuf == 0) ? outPeakDbA_.data() : outPeakDbB_.data();
+        acquireLatestSlot();
+        return outSlots_[static_cast<size_t>(readSlot_)].peakDb.data();
     }
 
     /** @brief Consumes and returns the new data flag. True if updated since last call. */
@@ -197,10 +203,10 @@ private:
 
     void computeSpectrum() noexcept
     {
-        // 1. Copy & Window (Auto-vectorizable)
+        // 1. Copy & Window (Auto-vectorizable; pow2 mask instead of division)
         for (int i = 0; i < fftSize_; ++i)
         {
-            int ringIdx = (ringWritePos_ + i) % fftSize_;
+            int ringIdx = (ringWritePos_ + i) & ringMask_;
             fftBuffer_[static_cast<size_t>(i)] = inputRing_[static_cast<size_t>(ringIdx)] * window_[static_cast<size_t>(i)];
         }
 
@@ -209,47 +215,48 @@ private:
 
         // 3. Magnitude Calculation & Smoothing (SIMD friendly logic)
         const T oneMinusSmooth = T(1) - smoothing_;
-        
+
         for (int k = 0; k < numBins_; ++k)
         {
             T re = freqBuffer_[static_cast<size_t>(2 * k)];
             T im = freqBuffer_[static_cast<size_t>(2 * k + 1)];
             T mag = std::sqrt(re * re + im * im) * invGain_;
-            
-            // Note: Branchless DC/Nyquist handling is better, but this array is small enough.
-            // A more robust SIMD path would pre-multiply index 0 and numBins_-1 after the loop.
-            magnitudesState_[static_cast<size_t>(k)] = 
+
+            // DC and Nyquist carry no mirrored bin, so the single-sided 2x in
+            // invGain_ must be undone HERE, on the fresh magnitude. (Scaling
+            // the smoothed STATE compounded 0.5x every frame and parked those
+            // bins ~9.5 dB low in steady state.)
+            if (k == 0 || k == numBins_ - 1) mag *= T(0.5);
+
+            magnitudesState_[static_cast<size_t>(k)] =
                 smoothing_ * magnitudesState_[static_cast<size_t>(k)] + oneMinusSmooth * mag;
         }
-        
-        // Correct DC and Nyquist Energy
-        magnitudesState_[0] *= T(0.5);
-        magnitudesState_[static_cast<size_t>(numBins_ - 1)] *= T(0.5);
 
         // 4. Time-Domain Peak Decay Calculation (Using real hopSize_)
         const T peakDecayDb = peakDecayRate_ * static_cast<T>(hopSize_) / static_cast<T>(sampleRate_);
 
-        // 5. Select Double Buffer Output
-        int wb = writeBuffer_.load(std::memory_order_relaxed);
-        auto& targetMagDb = (wb == 0) ? outMagnitudesDbA_ : outMagnitudesDbB_;
-        auto& targetPeakDb = (wb == 0) ? outPeakDbA_ : outPeakDbB_;
+        // 5. Write into the writer-owned slot of the triple buffer
+        auto& slot = outSlots_[static_cast<size_t>(writeSlot_)];
 
         // 6. DB Conversion and Peak Hold (SIMD friendly logic)
         for (int k = 0; k < numBins_; ++k)
         {
             T dB = gainToDecibels(magnitudesState_[static_cast<size_t>(k)], floorDb_);
-            targetMagDb[static_cast<size_t>(k)] = dB;
+            slot.magnitudesDb[static_cast<size_t>(k)] = dB;
 
             if (peakHoldEnabled_)
             {
                 T& peak = peakState_[static_cast<size_t>(k)];
                 peak = (dB > peak) ? dB : std::max(floorDb_, peak - peakDecayDb);
-                targetPeakDb[static_cast<size_t>(k)] = peak;
+                slot.peakDb[static_cast<size_t>(k)] = peak;
             }
         }
 
-        // 7. Atomic Swap and Notification
-        writeBuffer_.store(1 - wb, std::memory_order_release);
+        // 7. Publish: swap the finished slot into 'pending' (with the fresh
+        // bit) and adopt whatever slot was there as the next write target.
+        // Wait-free; the reader can never observe a slot mid-write.
+        const int old = pendingSlot_.exchange(writeSlot_ | kFreshBit, std::memory_order_acq_rel);
+        writeSlot_ = old & kSlotMask;
         newDataReady_.store(true, std::memory_order_release);
     }
 
@@ -274,12 +281,39 @@ private:
     std::vector<T> magnitudesState_;
     std::vector<T> peakState_;
 
-    // Thread-safe Double Buffers
-    std::vector<T> outMagnitudesDbA_;
-    std::vector<T> outMagnitudesDbB_;
-    std::vector<T> outPeakDbA_;
-    std::vector<T> outPeakDbB_;
-    std::atomic<int> writeBuffer_{ 0 };
+    // Tear-free triple buffer: writer owns writeSlot_, the reader owns
+    // readSlot_, and pendingSlot_ (atomic, with a freshness bit) carries the
+    // hand-off. Classic wait-free GUI metering scheme.
+    static constexpr int kFreshBit = 4;
+    static constexpr int kSlotMask = 3;
+
+    struct OutSlot
+    {
+        std::vector<T> magnitudesDb;
+        std::vector<T> peakDb;
+    };
+    std::array<OutSlot, 3> outSlots_;
+    int writeSlot_ = 0;                       // writer-thread private
+    mutable int readSlot_ = 1;                // reader-thread private
+    mutable std::atomic<int> pendingSlot_{ 2 };
+
+    /** @brief Reader side: adopt the freshest published slot, if any. */
+    void acquireLatestSlot() const noexcept
+    {
+        int expected = pendingSlot_.load(std::memory_order_acquire);
+        while (expected & kFreshBit)
+        {
+            if (pendingSlot_.compare_exchange_weak(expected, readSlot_,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire))
+            {
+                readSlot_ = expected & kSlotMask;
+                return;
+            }
+        }
+    }
+
+    int ringMask_ = 2047;
 
     T smoothing_ = T(0.8);
     T peakDecayRate_ = T(10);

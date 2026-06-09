@@ -54,24 +54,33 @@ public:
 
     /**
      * @brief Builds the lookup table from an arbitrary transfer function.
-     * 
+     *
      * @warning Allocates memory. Do not call from the audio thread.
      *
-     * @param func Transfer function mapping [-1, 1] to output.
+     * The table spans the input range [-xMax, +xMax]. A range wider than the
+     * nominal [-1, 1] is what makes `preGain` work as a true drive control:
+     * driven samples keep following the curve instead of slamming into a hard
+     * plateau at the table edge.
+     *
+     * @param func Transfer function mapping [-xMax, xMax] to output.
      * @param tableSize Number of active table entries (default: 4096).
+     * @param xMax Half-range of the table input domain (default: 8).
      */
-    void buildFromFunction(std::function<T(T)> func, int tableSize = 4096)
+    void buildFromFunction(std::function<T(T)> func, int tableSize = 4096, T xMax = T(8))
     {
         assert(tableSize >= 4);
+        assert(xMax > T(0));
         tableSize_ = tableSize;
-        
+        xMax_ = std::max(xMax, T(0.001));
+        invRange_ = T(1) / (T(2) * xMax_);
+
         // Allocate tableSize + 3 to accommodate Hermite interpolation padding.
         // This eliminates conditional branch bounds-checking in the DSP hot-path.
         table_.resize(static_cast<size_t>(tableSize) + 3);
 
         for (int i = 0; i < tableSize; ++i)
         {
-            T x = T(-1) + T(2) * static_cast<T>(i) / static_cast<T>(tableSize - 1);
+            T x = -xMax_ + T(2) * xMax_ * static_cast<T>(i) / static_cast<T>(tableSize - 1);
             table_[static_cast<size_t>(i + 1)] = func(x); // Offset by 1
         }
 
@@ -137,10 +146,12 @@ public:
      */
     [[nodiscard]] inline T process(T input, T preGain = T(1), T postGain = T(1)) const noexcept
     {
-        T driven = std::clamp(input * preGain, T(-1), T(1));
-        
+        // The table spans [-xMax, xMax] (default 8), so realistic drive values
+        // keep tracing the curve instead of flattening at the old +-1 boundary.
+        T driven = std::clamp(input * preGain, -xMax_, xMax_);
+
         // Map to index range [0, tableSize - 1]
-        T pos = (driven + T(1)) * T(0.5) * static_cast<T>(tableSize_ - 1);
+        T pos = (driven + xMax_) * invRange_ * static_cast<T>(tableSize_ - 1);
 
         // Branchless integer extraction
         int idx = static_cast<int>(pos);
@@ -245,9 +256,24 @@ public:
     [[nodiscard]] int getTableSize() const noexcept { return tableSize_; }
     [[nodiscard]] bool isReady() const noexcept { return tableSize_ > 0; }
 
+    /** @brief Returns the half-range of the table's input domain. */
+    [[nodiscard]] T getInputRange() const noexcept { return xMax_; }
+
+    /**
+     * @brief Reports the processing latency in samples.
+     * @return The oversampler group delay (0 when oversampling is off).
+     *         Report this to the host for plugin delay compensation.
+     */
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        return (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0;
+    }
+
 private:
     std::vector<T> table_;
     int tableSize_ = 0;
+    T xMax_ = T(8);                 ///< Half-range of the table input domain.
+    T invRange_ = T(1) / T(16);     ///< Precomputed 1 / (2 * xMax).
 
     AudioSpec spec_ {};
     std::unique_ptr<Oversampling<T>> oversampler_;

@@ -166,9 +166,13 @@ public:
                     mipData_[offset + static_cast<size_t>(i)] += amplitude * std::sin(phase);
                 }
             }
-
-            normalizeLevel(offset);
         }
+
+        // Normalise ALL levels with ONE global factor (the peak of the richest
+        // level). Per-level peak normalisation made the level/timbre jump
+        // slightly at every mip crossfade, because the Gibbs overshoot varies
+        // with the harmonic count.
+        normalizeAllLevelsGlobally();
     }
 
     /**
@@ -234,9 +238,11 @@ public:
                     mipData_[offset + static_cast<size_t>(i)] += a * std::cos(phase) + b * std::sin(phase);
                 }
             }
-
-            normalizeLevel(offset);
         }
+
+        // Single global normalisation factor across all mip levels (see
+        // buildFromHarmonics for the rationale).
+        normalizeAllLevelsGlobally();
     }
 
     // -- Playback (REAL-TIME SAFE) ----------------------------------------------
@@ -367,7 +373,13 @@ private:
         T s0 = readFromLevel(phase, level0);
         T s1 = readFromLevel(phase, level1);
 
-        return s0 + frac * (s1 - s0);
+        // Quadratic weighting of the brighter (lower) level: its topmost
+        // harmonics start aliasing as soon as the frequency moves past its
+        // design point, so its weight must die off much faster than linear.
+        // (1-t)^2 keeps the worst-case alias contribution ~12 dB lower than a
+        // linear crossfade at mid-octave while preserving a smooth timbre.
+        const T w0 = (T(1) - frac) * (T(1) - frac);
+        return s1 + w0 * (s0 - s1);
     }
 
     /**
@@ -395,19 +407,24 @@ private:
     }
 
     /**
-     * @brief Normalizes a specific level in the flattened vector.
+     * @brief Normalises every mip level with one shared factor.
+     *
+     * The factor is the global peak across all levels (in practice the
+     * richest level — lower levels are subsets of its harmonics and cannot
+     * exceed it). This preserves the exact relative energy between levels,
+     * so mip crossfades are level- and timbre-continuous.
      */
-    void normalizeLevel(size_t offset)
+    void normalizeAllLevelsGlobally()
     {
         T maxVal = T(0);
-        for (int i = 0; i < kTableSize; ++i)
-            maxVal = std::max(maxVal, std::abs(mipData_[offset + static_cast<size_t>(i)]));
+        for (const T v : mipData_)
+            maxVal = std::max(maxVal, std::abs(v));
 
         if (maxVal > T(0))
         {
-            T invMax = T(1) / maxVal;
-            for (int i = 0; i < kTableSize; ++i)
-                mipData_[offset + static_cast<size_t>(i)] *= invMax;
+            const T invMax = T(1) / maxVal;
+            for (T& v : mipData_)
+                v *= invMax;
         }
     }
 

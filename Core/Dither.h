@@ -50,6 +50,9 @@ public:
         static std::atomic<uint32_t> seedGenerator{ 0x193A6B54u };
         // Increment by golden ratio to ensure diverse initial states across instances
         rngState_ = seedGenerator.fetch_add(0x9E3779B9u, std::memory_order_relaxed);
+        // xorshift32 has a fixed point at 0: if the rolling seed ever lands
+        // there, the dither would fall silent for that instance.
+        if (rngState_ == 0) rngState_ = 1;
 
         setTargetBitDepth(targetBits);
     }

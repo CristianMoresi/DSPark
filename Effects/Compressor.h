@@ -30,6 +30,7 @@
 #include "../Core/RingBuffer.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/Hilbert.h"
+#include "../Core/TruePeakDetector.h"
 
 #include <algorithm>
 #include <array>
@@ -141,11 +142,6 @@ public:
         }
         updateRmsWindow();
 
-        // Build the true-peak FIR ALWAYS (cheap, one-time). setDetector() then only
-        // publishes the atomic selection and never rebuilds coefficients at runtime,
-        // so switching to TruePeak can't race the audio thread reading tpCoeffs_.
-        prepareTruePeakDetector();
-
         reset();
     }
 
@@ -220,7 +216,8 @@ public:
             : detectLevel(sidechain, channel, detType);
 
         T targetGR_Db = computeGain(levelDb, thresh, ratio, knee, charType, modeType);
-        
+        targetGR_Db = applyHoldAndRange(targetGR_Db, channel);
+
         T targetGainLinear = decibelsToGain(targetGR_Db);
         T smoothedGainLinear = applyBallisticsLinear(targetGainLinear, channel, charType, relMs);
         T smoothedGR_Db = gainToDecibels(smoothedGainLinear);
@@ -259,8 +256,10 @@ public:
         for (auto& sum : rmsSums_) sum = T(0);
         for (auto& idx : rmsIndices_) idx = 0;
         for (auto& cnt : rmsRecomputeCounters_) cnt = 0;
-        
-        tpState_ = {};
+
+        truePeak_.reset();
+        holdCounters_.fill(0);
+        heldGrDb_.fill(T(0));
         gainReductionDb_.store(T(0), std::memory_order_relaxed);
         autoMakeupEnv_ = T(0);
         splitPosEnv_.fill(T(0));
@@ -314,9 +313,35 @@ public:
     /** @brief Changes the level detection algorithm (Peak, RMS, TruePeak, Hilbert). */
     void setDetector(DetectorType type) noexcept
     {
-        // Coefficients are built once in prepare(); only publish the selection here
-        // (rebuilding would race the audio thread reading tpCoeffs_/tpState_).
+        // The shared TruePeakDetector builds its coefficients lazily on first
+        // use (thread-safe static), so this is a pure atomic publication.
         detectorType_.store(type, std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Sets the gain-reduction hold time.
+     *
+     * The deepest gain reduction is held for this long before the release
+     * stage may recover — the classic tool against pumping on dense material.
+     *
+     * @param ms Hold time in milliseconds (0 = off, mastering range 0-500).
+     */
+    void setHoldTime(T ms) noexcept
+    {
+        holdMs_.store(std::clamp(ms, T(0), T(500)), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Limits the maximum gain change the compressor may apply.
+     *
+     * Classic "range" control: gain reduction (or upward boost) never exceeds
+     * this many dB regardless of how far the signal passes the threshold.
+     *
+     * @param dB Maximum |gain change| in dB (default 100 = unlimited in practice).
+     */
+    void setRange(T dB) noexcept
+    {
+        rangeDb_.store(std::max(dB, T(0)), std::memory_order_relaxed);
     }
 
     /** @brief Changes signal routing topology (FeedForward or FeedBack). */
@@ -336,14 +361,19 @@ public:
         scHpfFreq_.store(cutoffHz, std::memory_order_relaxed);
     }
 
-    /** 
+    /**
      * @brief Sets the RMS analysis window size in milliseconds.
+     *
+     * Published atomically; the audio thread applies the new window (and
+     * resets the sliding state) at its next block, so no control-thread write
+     * ever races the per-sample RMS accumulators.
+     *
      * @warning Capable up to 500ms maximum based on prepare() pre-allocation.
      */
     void setRmsWindow(T ms) noexcept
     {
-        rmsWindowMs_ = std::max(ms, T(1));
-        updateRmsWindow();
+        rmsWindowMsAtomic_.store(std::max(ms, T(1)), std::memory_order_relaxed);
+        rmsWindowDirty_.store(true, std::memory_order_release);
     }
 
     // =========================================================================
@@ -388,6 +418,13 @@ protected:
         T fs = static_cast<T>(sampleRate_);
         if (fs > T(0)) updateTimeConstants(fs);
         updateHpfCoefficients();
+
+        // Apply a pending RMS window change here, on the audio thread.
+        if (rmsWindowDirty_.exchange(false, std::memory_order_acquire))
+        {
+            rmsWindowMs_ = rmsWindowMsAtomic_.load(std::memory_order_relaxed);
+            updateRmsWindow();
+        }
 
         // Cache enum/bool params locally to prevent atomic stalls inside the tight DSP loop
         auto detType   = detectorType_.load(std::memory_order_relaxed);
@@ -436,7 +473,8 @@ protected:
                 T inputDb = chLevel + sLink * (linkedLevel - chLevel);
 
                 T targetGR_Db = computeGain(inputDb, thresh, ratio, knee, charType, modeType);
-                
+                targetGR_Db = applyHoldAndRange(targetGR_Db, ch);
+
                 // 3. Analog-Modeled Ballistics (Linear Gain Domain)
                 T targetGainLinear = decibelsToGain(targetGR_Db);
                 T smoothedGainLinear = applyBallisticsLinear(targetGainLinear, ch, charType, relMs);
@@ -493,9 +531,44 @@ protected:
         attackCoeff_  = std::exp(T(-1) / (fs * attMs / T(1000)));
         releaseCoeff_ = std::exp(T(-1) / (fs * relMs / T(1000)));
         autoMakeupCoeff_ = std::exp(T(-1) / (fs * T(0.3)));
-        
+
         lookaheadSamples_ = static_cast<int>(fs * std::clamp(
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
+
+        holdSamples_ = static_cast<int>(fs * holdMs_.load(std::memory_order_relaxed) / T(1000));
+    }
+
+    /**
+     * @brief Applies the hold and range stages to the static gain target (dB).
+     *
+     * Hold keeps the deepest recent gain change for holdSamples_ before the
+     * ballistics may relax; range bounds |gain change| to the configured dB.
+     */
+    [[nodiscard]] T applyHoldAndRange(T targetGR_Db, int ch) noexcept
+    {
+        const T range = rangeDb_.load(std::memory_order_relaxed);
+        targetGR_Db = std::clamp(targetGR_Db, -range, range);
+
+        if (holdSamples_ > 0)
+        {
+            T& held = heldGrDb_[ch];
+            int& counter = holdCounters_[ch];
+            if (std::abs(targetGR_Db) >= std::abs(held))
+            {
+                held = targetGR_Db;          // deeper action: re-arm the hold
+                counter = holdSamples_;
+            }
+            else if (counter > 0)
+            {
+                --counter;                   // shallower: freeze at held depth
+                targetGR_Db = held;
+            }
+            else
+            {
+                held = targetGR_Db;          // hold elapsed: track normally
+            }
+        }
+        return targetGR_Db;
     }
 
     // ---- Detectors ----
@@ -529,7 +602,7 @@ protected:
                     sum -= buf[idx];
                     buf[idx] = sq;
                     sum += sq;
-                    idx = (idx + 1) % len;
+                    if (++idx >= len) idx = 0; // branch beats an integer division per sample
 
                     // Periodic full re-summation to prevent floating-point drift
                     if (++recomputeCount >= kRmsRecomputePeriod)
@@ -545,7 +618,7 @@ protected:
             }
 
             case DetectorType::TruePeak:
-                level = detectTruePeakSample(sample, ch);
+                level = truePeak_.processSample(sample, ch);
                 break;
 
             case DetectorType::SplitPolarity:
@@ -769,104 +842,29 @@ protected:
         if (sampleRate_ > 0)
         {
             int requestedSamples = static_cast<int>(sampleRate_ * static_cast<double>(rmsWindowMs_) / 1000.0);
-            
+
             // Limit logical window size to the pre-allocated physical capacity
-            if (!rmsBuffers_[0].empty()) 
+            if (!rmsBuffers_[0].empty())
             {
                 int maxCapacity = static_cast<int>(rmsBuffers_[0].capacity());
                 rmsWindowSamples_ = std::clamp(requestedSamples, 1, maxCapacity);
             }
-            else 
+            else
             {
                 rmsWindowSamples_ = std::max(1, requestedSamples);
             }
 
             for (int ch = 0; ch < kMaxChannels; ++ch)
             {
+                // Clear the window contents too: stale squares from a previous
+                // window length would otherwise be subtracted from the fresh
+                // running sum (transient negative-sum glitch).
+                std::fill(rmsBuffers_[ch].begin(), rmsBuffers_[ch].end(), T(0));
                 rmsSums_[ch] = T(0);
                 rmsIndices_[ch] = 0;
+                rmsRecomputeCounters_[ch] = 0;
             }
         }
-    }
-
-    // ---- True-Peak ITU-R BS.1770-4 ----
-
-    /** @brief Initializes true-peak history buffers and filter taps. */
-    void prepareTruePeakDetector() noexcept
-    {
-        buildTruePeakFilter();
-        tpState_ = {};
-    }
-
-    /** @brief Computes 4x oversampling FIR polyphase coefficients (Kaiser windowed). */
-    void buildTruePeakFilter() noexcept
-    {
-        constexpr int N = kTpTaps * 4;
-        constexpr double M = (N - 1) / 2.0;
-        constexpr double fc = 0.25;
-        constexpr double beta = 8.0;
-        constexpr double pi = std::numbers::pi;
-
-        auto besselI0 = [](double x) -> double {
-            double sum = 1.0, term = 1.0;
-            for (int k = 1; k <= 25; ++k)
-            {
-                double half = x / (2.0 * k);
-                term *= half * half;
-                sum += term;
-                if (term < 1e-15 * sum) break;
-            }
-            return sum;
-        };
-
-        const double i0Beta = besselI0(beta);
-        double h[N];
-        for (int n = 0; n < N; ++n)
-        {
-            double x = static_cast<double>(n) - M;
-            double sincArg = 2.0 * fc * x;
-            double sincVal = (std::abs(sincArg) < 1e-10)
-                ? 1.0
-                : std::sin(pi * sincArg) / (pi * sincArg);
-            double t = x / M;
-            double kaiserVal = (std::abs(t) > 1.0)
-                ? 0.0
-                : besselI0(beta * std::sqrt(1.0 - t * t)) / i0Beta;
-            h[n] = sincVal * kaiserVal;
-        }
-
-        for (int phase = 0; phase < kTpPhases; ++phase)
-        {
-            int p = phase + 1;
-            for (int k = 0; k < kTpTaps; ++k)
-                tpCoeffs_[phase][k] = static_cast<T>(h[4 * k + p]);
-        }
-    }
-
-    /** 
-     * @brief Computes true-peak level via FIR interpolation.
-     * @param sample Current input sample.
-     * @param ch Channel index.
-     * @return Interpolated maximum absolute level.
-     */
-    [[nodiscard]] T detectTruePeakSample(T sample, int ch) noexcept
-    {
-        auto& tp = tpState_[ch];
-        for (int k = 0; k < kTpTaps - 1; ++k)
-            tp.history[k] = tp.history[k + 1];
-        tp.history[kTpTaps - 1] = sample;
-
-        T peak = std::abs(sample);
-        for (int phase = 0; phase < kTpPhases; ++phase)
-        {
-            T interp = T(0);
-            for (int k = 0; k < kTpTaps; ++k)
-                interp += tp.history[kTpTaps - 1 - k] * tpCoeffs_[phase][k];
-            T absInterp = std::abs(interp);
-            if (absInterp > peak)
-                peak = absInterp;
-        }
-        return peak;
     }
 
     // =========================================================================
@@ -925,7 +923,9 @@ protected:
     std::array<T, kMaxChannels> splitNegEnv_ {}; ///< Negative half-wave tracking.
 
     // RMS Detector
-    T rmsWindowMs_ = T(10); ///< Target RMS length in ms.
+    T rmsWindowMs_ = T(10); ///< Active RMS length in ms (audio-thread copy).
+    std::atomic<T> rmsWindowMsAtomic_ { T(10) }; ///< Control-thread published target.
+    std::atomic<bool> rmsWindowDirty_ { false }; ///< Applied at the next block.
     int rmsWindowSamples_ = 0; ///< Active RMS length in samples.
     std::array<std::vector<T>, kMaxChannels> rmsBuffers_; ///< Pre-allocated RMS sliding windows.
     std::array<T, kMaxChannels> rmsSums_ {}; ///< Running sums for RMS.
@@ -933,13 +933,15 @@ protected:
     static constexpr int kRmsRecomputePeriod = 4096; ///< Re-summation interval to halt drift.
     std::array<int, kMaxChannels> rmsRecomputeCounters_ {}; ///< Re-summation counters.
 
-    // True-Peak Detector Filter definitions
-    static constexpr int kTpTaps = 12;    ///< Taps per polyphase branch.
-    static constexpr int kTpPhases = 3;   ///< Polyphase branches for 4x interpolation.
-    
-    struct TruePeakState { T history[kTpTaps] = {}; }; ///< Circular-less history for fast FIR.
-    std::array<TruePeakState, kMaxChannels> tpState_{}; ///< True-Peak state per channel.
-    std::array<std::array<T, kTpTaps>, kTpPhases> tpCoeffs_{}; ///< Cached FIR coefficients.
+    // Shared ITU-R BS.1770-4 true-peak detector (Core/TruePeakDetector.h).
+    TruePeakDetector<T, kMaxChannels> truePeak_;
+
+    // Hold & Range
+    std::atomic<T> holdMs_  { T(0) };   ///< Gain-hold time in ms (0 = off).
+    std::atomic<T> rangeDb_ { T(100) }; ///< Max |gain change| in dB.
+    int holdSamples_ = 0;
+    std::array<int, kMaxChannels> holdCounters_ {};
+    std::array<T, kMaxChannels> heldGrDb_ {};
 
     std::atomic<T> gainReductionDb_ { T(0) }; ///< Publicly readable Gain Reduction meter.
 };

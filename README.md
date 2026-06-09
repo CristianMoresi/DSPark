@@ -4,7 +4,7 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.0** — 73 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
+**v1.1** — 75 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
 
 ```cpp
 #include "DSPark/DSPark.h"
@@ -81,7 +81,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | Class | Description |
 |---|---|
 | `Equalizer<T>` | Multi-band parametric EQ with **linear-phase** (FFT) and IIR modes |
-| `Compressor<T>` | Modular: 5 detectors (Peak, RMS, TruePeak, SplitPolarity, Hilbert), 2 topologies (FF/FB), 4 characters (Clean/Opto/FET/Varimu), upward/downward modes. Adaptive auto-makeup gain. External sidechain. |
+| `Compressor<T>` | Modular: 5 detectors (Peak, RMS, TruePeak, SplitPolarity, Hilbert), 2 topologies (FF/FB), 4 characters (Clean/Opto/FET/Varimu), upward/downward modes. Hold and range controls, adaptive auto-makeup gain, external sidechain. |
 | `Limiter<T>` | ISP true-peak brickwall limiter with adaptive release |
 | `NoiseGate<T>` | State machine with hysteresis, hold time, duck mode. External sidechain. |
 | `Expander<T>` | Downward expander with threshold, ratio, hold, range |
@@ -96,12 +96,12 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `FilterEngine<T>` | Cascaded biquads, 9 shapes, 6–48 dB/oct slopes |
 | `CrossoverFilter<T>` | Linkwitz-Riley crossover (LR12/24/48), IIR + linear-phase modes |
 | `Chorus<T>` | Multi-voice LFO delay, stereo spread, flanger mode |
-| `Phaser<T>` | Allpass chain with LFO modulation, configurable stages |
+| `Phaser<T>` | Allpass chain with LFO modulation, configurable stages, stereo LFO spread |
 | `Tremolo<T>` | Amplitude modulation with configurable LFO |
 | `Vibrato<T>` | Pitch modulation via modulated delay |
 | `RingModulator<T>` | Ring modulation with carrier oscillator |
 | `FrequencyShifter<T>` | Single-sideband frequency shift via Hilbert transform |
-| `Delay<T>` | Interpolated delay with feedback, ping-pong, filters |
+| `Delay<T>` | Interpolated delay with feedback (clean or analog tanh regeneration), ping-pong, filters |
 | `Panner<T>` | 6 algorithms: equal-power, binaural (ITD), mid-pan, side-pan, Haas, spectral |
 | `Gain<T>` | Smoothed gain with fade, mute, polarity inversion |
 | `AutoGain<T>` | Automatic gain compensation based on loudness measurement |
@@ -111,7 +111,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `NoiseGenerator<T>` | White, pink, and brown noise generation |
 | `DCBlocker<T>` | DC offset removal (1-pole or Butterworth order 2–10) |
 
-### Core (33 building blocks)
+### Core (35 building blocks)
 
 | Class | Description |
 |---|---|
@@ -138,17 +138,19 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `Hilbert<T>` | FIR (windowed-sinc) Hilbert transform for analytic signals — flat magnitude across the audible band |
 | `WindowFunctions<T>` | 8 windows (Hann, Hamming, Blackman, Kaiser…) |
 | `DryWetMixer<T>` | Parallel dry/wet mixing for effects |
+| `TruePeakDetector<T>` | Shared ITU-R BS.1770-4 inter-sample peak detector (used by Compressor, Limiter, LoudnessMeter) |
 | `SpinLock` | RT-safe spinlock for thread-safe parameters |
 | `SpscQueue<T>` | Lock-free single-producer / single-consumer queue |
 | `AudioSpec` | Audio environment descriptor (sample rate, block size, channels) |
 | `AudioBuffer<T>` | 32-byte aligned owning buffer (SIMD-ready) |
 | `AudioBufferView<T>` | Non-owning view (what processors receive) |
 | `SimdOps` | SIMD-accelerated buffer operations (SSE2/AVX/NEON with scalar fallback) |
-| `DspMath` | Constants, dB ⇄ gain, fast tanh / exp / pow10, range mapping |
+| `DspMath` | Constants, dB ⇄ gain, fast tanh / tan / sin / cos / exp / log / pow10, range mapping |
 | `Phasor<T>` | Phase accumulator for LFO and oscillator construction |
 | `SampleAndHold<T>` | Sample-and-hold with configurable hold time |
 | `WaveshapeTable<T>` | LUT-based waveshaping with linear / cubic interpolation |
 | `AnalogRandom` | Analog-flavoured random generators (smooth, noise, jitter) |
+| `AnalogConstants` | Reference constants from analog-hardware research (zero runtime cost) |
 | `ProcessorTraits` | C++20 concepts: `AudioProcessor`, `SampleProcessor`, `GeneratorProcessor` |
 
 ### Analysis (5 analyzers)
@@ -157,9 +159,9 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 |---|---|
 | `LevelFollower<T>` | Peak and RMS envelope follower |
 | `SpectrumAnalyzer<T>` | Real-time FFT spectrum with peak hold |
-| `LoudnessMeter<T>` | EBU R128 LUFS (momentary, short-term, integrated) |
+| `LoudnessMeter<T>` | EBU R128: momentary, short-term, integrated (BS.1770-4 gating, 400 ms / 75% overlap), loudness range (LRA) and true peak (dBTP) |
 | `Goertzel<T>` | Single-frequency O(N) magnitude detection |
-| `PitchDetector<T>` | Autocorrelation-based fundamental frequency detection |
+| `PitchDetector<T>` | YIN pitch detection with FFT-accelerated difference function (O(N log N)) |
 
 ### I/O (3 file handlers)
 
@@ -333,13 +335,44 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 ```
 DSPark/
 ├── DSPark.h                 # Single umbrella include + full documentation
-├── Core/          (33)      # Building blocks: filters, FFT, oscillators, SIMD, buffers
+├── Core/          (35)      # Building blocks: filters, FFT, oscillators, SIMD, buffers
 ├── Effects/       (30)      # Ready-to-use processors: EQ, compressor, reverb...
 ├── Analysis/       (5)      # Metering: LUFS, spectrum, level follower, pitch
 ├── IO/             (3)      # File I/O: WAV read/write, MP3 read/write
 ├── Music/          (1)      # Harmony constants and music theory
 └── DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)
 ```
+
+---
+
+## What's New in v1.1
+
+A deep quality and correctness pass over the entire framework:
+
+- **Resampler**: rebuilt polyphase kernel (continuous Kaiser window, exact
+  sub-sample phase) — sine-conversion error improved from audible distortion
+  to **better than -100 dB**; SIMD-accelerated streaming path.
+- **Equalizer**: linear-phase mode level calibration fixed (kernel scaling);
+  shelf bands now map Q to slope consistently in IIR and linear-phase modes.
+- **StereoWidth**: bass-mono crossover rebuilt with an exact complementary
+  one-pole split (previous phase network damaged the stereo image at HF).
+- **LadderFilter**: HP24 now has a true zero at DC at every resonance setting.
+- **Oscillator**: triangle level normalisation corrected (was ~4 dB low).
+- **Clipper**: Analog (sine) mode re-derived with unity small-signal gain.
+- **Limiter**: exact brickwall guarantee (output never exceeds the ceiling),
+  glitch-free live look-ahead changes.
+- **LoudnessMeter**: BS.1770-4-conformant integrated gating (400 ms blocks,
+  75% overlap) plus new loudness range (LRA, EBU Tech 3342) and true peak
+  (dBTP) readouts.
+- **PitchDetector**: YIN difference function now computed via FFT — ~20x
+  faster, real-time friendly at the default window size.
+- **Performance**: register-resident Biquad block processing, multi-accumulator
+  SIMD dot product, SIMD double paths (AVX), an order-of-magnitude faster
+  Hilbert transform, coefficient caching across FilterEngine and the TPT SVF,
+  and new fast math approximations (sin / cos / log) used framework-wide.
+- **Robustness**: release-safe channel clamps across the API surface, ARM/NEON
+  build fix in the Convolver, allocation-safety fixes validated under
+  AddressSanitizer, and a shared ITU-R BS.1770-4 true-peak detector.
 
 ---
 

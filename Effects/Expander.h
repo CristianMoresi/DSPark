@@ -128,10 +128,13 @@ public:
      */
     void setSidechainHPF(bool enabled, double cutoffHz = 80.0) noexcept
     {
+        scHpfFreqHz_.store(static_cast<T>(cutoffHz), std::memory_order_relaxed);
         scHpfEnabled_.store(enabled, std::memory_order_relaxed);
         if (sampleRate_ > 0.0) {
             scHpfCoeff_ = static_cast<T>(std::exp(-std::numbers::pi * 2.0 * cutoffHz / sampleRate_));
         }
+        // If called before prepare(), updateCoefficients() recomputes the
+        // coefficient from scHpfFreqHz_ once the sample rate is known.
     }
 
     // -- Queries -------------------------------------------------------------
@@ -165,6 +168,8 @@ protected:
         cachedReleaseCoeff_ = releaseCoeff_.load(std::memory_order_relaxed);
         cachedHoldSamples_  = holdSamples_.load(std::memory_order_relaxed);
         cachedScHpfEnabled_ = scHpfEnabled_.load(std::memory_order_relaxed);
+        cachedDetAttCoeff_  = detAttCoeff_.load(std::memory_order_relaxed);
+        cachedDetRelCoeff_  = detRelCoeff_.load(std::memory_order_relaxed);
     }
 
     /**
@@ -200,14 +205,15 @@ protected:
                 sc = std::max(sc, std::abs(input));
             }
 
-            // 2. Fast Envelope Detector (RMS-ish integration to prevent IMD)
-            // Using a fixed fast integration time (~2ms) for the detector
-            T envCoeff = sc > envelope_ ? T(0.01) : T(0.001); 
+            // 2. Fast Envelope Detector (RMS-ish integration to prevent IMD).
+            // Coefficients are derived from the sample rate in
+            // updateCoefficients() — fixed per-sample constants made the
+            // detector 4x faster at 192 kHz than at 44.1 kHz.
+            T envCoeff = sc > envelope_ ? cachedDetAttCoeff_ : cachedDetRelCoeff_;
             envelope_ += envCoeff * (sc - envelope_);
 
             // 3. Gain Calculation (Converting envelope to dB only once)
-            // Optimization note: replace gainToDecibels with fast_log10 approximation if available in DspMath.h
-            T levelDb = gainToDecibels(envelope_ + T(1e-9)); 
+            T levelDb = gainToDecibels(envelope_ + T(1e-9));
             
             updateStateMachine(levelDb);
             T gain = computeGain(levelDb);
@@ -279,6 +285,14 @@ protected:
                            std::memory_order_relaxed);
         releaseCoeff_.store(T(1) - std::exp(T(-1) / (fs * releaseMs_.load(std::memory_order_relaxed) / T(1000))),
                             std::memory_order_relaxed);
+
+        // Detector ballistics (~0.5 ms attack, ~5 ms release), sample-rate aware.
+        detAttCoeff_.store(T(1) - std::exp(T(-1) / (fs * T(0.0005))), std::memory_order_relaxed);
+        detRelCoeff_.store(T(1) - std::exp(T(-1) / (fs * T(0.005))),  std::memory_order_relaxed);
+
+        // Recompute the sidechain HPF for the (possibly new) sample rate.
+        scHpfCoeff_ = static_cast<T>(std::exp(-std::numbers::pi * 2.0
+                        * static_cast<double>(scHpfFreqHz_.load(std::memory_order_relaxed)) / sampleRate_));
     }
 
     double sampleRate_ = 48000.0;
@@ -293,6 +307,7 @@ protected:
     std::atomic<T> rangeLinear_ { T(0.0001) };
 
     std::atomic<bool> scHpfEnabled_ { false };
+    std::atomic<T> scHpfFreqHz_ { T(80) };
     T scHpfCoeff_ = T(0.995);
     
     // Per-channel sidechain HPF state (16 = AudioBufferView channel cap).
@@ -302,6 +317,8 @@ protected:
 
     std::atomic<T> attackCoeff_ { T(0) };
     std::atomic<T> releaseCoeff_ { T(0) };
+    std::atomic<T> detAttCoeff_ { T(0.01) };
+    std::atomic<T> detRelCoeff_ { T(0.001) };
     std::atomic<int> holdSamples_ { 0 };
 
     // Cached per-block
@@ -311,6 +328,8 @@ protected:
     T cachedRangeLinear_ = T(0.0001);
     T cachedAttackCoeff_ = T(0);
     T cachedReleaseCoeff_ = T(0);
+    T cachedDetAttCoeff_ = T(0.01);
+    T cachedDetRelCoeff_ = T(0.001);
     int cachedHoldSamples_ = 0;
     bool cachedScHpfEnabled_ = false;
 

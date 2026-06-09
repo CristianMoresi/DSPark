@@ -152,7 +152,14 @@ public:
      */
     void setCutoff(T hz) noexcept
     {
-        cutoff_.store(std::clamp(hz, T(20), static_cast<T>(spec_.sampleRate) * T(0.499)), std::memory_order_relaxed);
+        // Before prepare() the sample rate is 0 and clamp(hz, 20, 0) would be
+        // UB (hi < lo). Store the raw request; updateCoefficients() clamps once
+        // the sample rate is known (same M7d0 guard as StateVariableFilter).
+        if (spec_.sampleRate > 0.0)
+            cutoff_.store(std::clamp(hz, T(20), static_cast<T>(spec_.sampleRate) * T(0.499)),
+                          std::memory_order_relaxed);
+        else
+            cutoff_.store(std::max(hz, T(0)), std::memory_order_relaxed);
         updateCoefficients();
     }
 
@@ -215,7 +222,8 @@ private:
     {
         if (spec_.sampleRate > 0)
         {
-            const T currentCutoff = cutoff_.load(std::memory_order_relaxed);
+            const T currentCutoff = std::clamp(cutoff_.load(std::memory_order_relaxed),
+                                               T(20), static_cast<T>(spec_.sampleRate) * T(0.499));
             const T preWarpedGain = static_cast<T>(std::tan(pi<double> * static_cast<double>(currentCutoff) / spec_.sampleRate));
             g_.store(preWarpedGain, std::memory_order_relaxed);
         }
@@ -302,8 +310,13 @@ private:
         if constexpr (FilterMode == Mode::LP18) return s.stage[2];
         if constexpr (FilterMode == Mode::LP24) return s.stage[3];
         if constexpr (FilterMode == Mode::BP12) return s.stage[0] - s.stage[2];
-        if constexpr (FilterMode == Mode::HP24) return input - T(4)*s.stage[0] + T(6)*s.stage[1] - T(4)*s.stage[2] + s.stage[3];
-        
+        // HP24: apply the binomial (1-L)^4 to `u` (the ladder's true input,
+        // post feedback), NOT to `input`. With resonance, input = u*(1+k) at
+        // DC, so the input-based form leaked DC with gain k/(1+k) — e.g. 67%
+        // of the DC passed straight through a "high-pass" at resonance 0.5.
+        // With u the DC gain is exactly 0 and the resonant peak is preserved.
+        if constexpr (FilterMode == Mode::HP24) return u - T(4)*s.stage[0] + T(6)*s.stage[1] - T(4)*s.stage[2] + s.stage[3];
+
         return s.stage[3]; // Fallback, shouldn't reach here
     }
 };

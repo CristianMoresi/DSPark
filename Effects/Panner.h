@@ -144,15 +144,28 @@ protected:
         const int n = buffer.getNumSamples();
         constexpr T halfPi = pi<T> / T(2);
 
+        if (!panSmoother_.isSmoothing())
+        {
+            // Static pan: hoist the trig out of the loop entirely.
+            const T angle = (static_cast<T>(panSmoother_.getCurrentValue()) * T(0.5) + T(0.5)) * halfPi;
+            const T gL = std::cos(angle);
+            const T gR = std::sin(angle);
+            for (int i = 0; i < n; ++i)
+            {
+                L[i] *= gL;
+                R[i] *= gR;
+            }
+            return;
+        }
+
         for (int i = 0; i < n; ++i)
         {
             T p = static_cast<T>(panSmoother_.getNextValue());
             T angle = (p * T(0.5) + T(0.5)) * halfPi;
-            
-            // Note: std::cos/sin in hot loop. In a production DSPark context, 
-            // replace with a fast polynomial approx: dsp::fast_cos(angle)
-            L[i] *= std::cos(angle); 
-            R[i] *= std::sin(angle);
+
+            // fastSin/fastCos: > 100 dB accurate, several times cheaper than libm.
+            L[i] *= fastCos(angle);
+            R[i] *= fastSin(angle);
         }
     }
 
@@ -218,15 +231,24 @@ protected:
         T* L = buffer.getChannel(0);
         T* R = buffer.getChannel(1);
         const int n = buffer.getNumSamples();
+        constexpr T halfPi = pi<T> / T(2);
 
         for (int i = 0; i < n; ++i)
         {
             T p = static_cast<T>(panSmoother_.getNextValue());
             T mid  = (L[i] + R[i]) * T(0.5);
             T side = (L[i] - R[i]) * T(0.5);
-            
-            L[i] = (mid * (T(1) - p)) + side;
-            R[i] = (mid * (T(1) + p)) - side;
+
+            // Equal-power mid pan: gL^2 + gR^2 == 2 for every position, with
+            // gL == gR == 1 at centre (bit-transparent). A hard pan peaks at
+            // +3 dB instead of the +6 dB of the old constant-voltage law,
+            // keeping headroom predictable while staying mono-compatible.
+            T angle = (p * T(0.5) + T(0.5)) * halfPi;
+            T gL = fastCos(angle) * sqrt2<T>;
+            T gR = fastSin(angle) * sqrt2<T>;
+
+            L[i] = mid * gL + side;
+            R[i] = mid * gR - side;
         }
     }
 

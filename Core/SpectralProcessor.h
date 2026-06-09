@@ -131,33 +131,56 @@ public:
         const int nCh = std::min(buffer.getNumChannels(), static_cast<int>(inputRing_.size()));
         const int nS  = buffer.getNumSamples();
 
-        for (int i = 0; i < nS; ++i)
+        // Chunked processing: run contiguous per-channel copy loops between
+        // hop boundaries instead of nesting channel loops inside a per-sample
+        // loop. Sample-exact equivalent of the per-sample form — pre-hop
+        // output positions are never touched by the new frame (it is written
+        // starting at the hop sample's read position), so reading them before
+        // the hop is identical.
+        int i = 0;
+        while (i < nS)
         {
-            // 1. Push input samples into ring buffer
+            const int chunk = std::min(nS - i, hopSize_ - hopCounter_);
+
+            // 1. Push input chunk into the ring buffers
             for (int ch = 0; ch < nCh; ++ch)
             {
-                inputRing_[ch][inputPos_[ch]] = buffer.getChannel(ch)[i];
-                inputPos_[ch] = (inputPos_[ch] + 1) & mask_; // Bitwise wrap
+                const T* data = buffer.getChannel(ch) + i;
+                auto& ring = inputRing_[ch];
+                int wp = inputPos_[ch];
+                for (int k = 0; k < chunk; ++k)
+                {
+                    ring[static_cast<size_t>(wp)] = data[k];
+                    wp = (wp + 1) & mask_;
+                }
+                inputPos_[ch] = wp;
             }
 
-            ++hopCounter_;
-
-            // 2. Trigger STFT Hop
+            // 2. Trigger STFT hop at the boundary
+            hopCounter_ += chunk;
             if (hopCounter_ >= hopSize_)
             {
                 hopCounter_ = 0;
                 for (int ch = 0; ch < nCh; ++ch)
-                    processHop(ch, std::forward<Func>(processFunc));
+                    processHop(ch, processFunc);
             }
 
-            // 3. Output overlapping samples
+            // 3. Drain the overlap-add accumulator for the chunk
             for (int ch = 0; ch < nCh; ++ch)
             {
-                int& rp = outputReadPos_[ch];
-                buffer.getChannel(ch)[i] = outputAccum_[ch][rp];
-                outputAccum_[ch][rp] = T(0); // Clear after reading
-                rp = (rp + 1) & accumMask_;  // Bitwise wrap
+                T* data = buffer.getChannel(ch) + i;
+                auto& acc = outputAccum_[ch];
+                int rp = outputReadPos_[ch];
+                for (int k = 0; k < chunk; ++k)
+                {
+                    data[k] = acc[static_cast<size_t>(rp)];
+                    acc[static_cast<size_t>(rp)] = T(0); // Clear after reading
+                    rp = (rp + 1) & accumMask_;
+                }
+                outputReadPos_[ch] = rp;
             }
+
+            i += chunk;
         }
     }
 
@@ -183,7 +206,7 @@ private:
      * @brief Processes a single channel STFT overlap-add iteration.
      */
     template <typename Func>
-    void processHop(int ch, Func&& processFunc) noexcept
+    void processHop(int ch, Func& processFunc) noexcept
     {
         // 1. Copy from ring buffer with analysis window
         // Because ring size == fftSize_, oldest sample is exactly at inputPos_

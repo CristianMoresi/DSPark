@@ -306,6 +306,7 @@ public:
         }
 
         mixer_.pushDry(buffer);
+        refreshCachedParams();
 
         for (int i = 0; i < nS; ++i)
         {
@@ -357,6 +358,7 @@ public:
      */
     [[nodiscard]] std::pair<T, T> processSample(T input) noexcept
     {
+        refreshCachedParams();
         return processSampleInternal(input);
     }
 
@@ -957,17 +959,45 @@ protected:
         for (int i = 0; i < kFDNSize; ++i) x[i] -= factor;
     }
 
+    /// Block-cached copies of the atomic parameters: 16 FDN lines reading
+    /// ~10 relaxed atomics per SAMPLE added measurable overhead; one refresh
+    /// per block (refreshCachedParams) is bit-identical for parameters that
+    /// only change at block rate anyway.
+    struct CachedParams
+    {
+        int preDelaySamples = 0;
+        int erToLateSamples = 0;
+        T earlyLevel = T(1);
+        T lateLevel  = T(1);
+        T width      = T(1);
+        T modDepthA  = T(1);
+        T modDepthB  = T(0.5);
+    };
+    CachedParams cachedParams_ {};
+
+    /// Pulls the atomic parameters into the block-local cache (audio thread).
+    void refreshCachedParams() noexcept
+    {
+        cachedParams_.preDelaySamples = preDelaySamples_.load(std::memory_order_relaxed);
+        cachedParams_.erToLateSamples = erToLateSamples_.load(std::memory_order_relaxed);
+        cachedParams_.earlyLevel = earlyLevel_.load(std::memory_order_relaxed);
+        cachedParams_.lateLevel  = lateLevel_.load(std::memory_order_relaxed);
+        cachedParams_.width      = width_.load(std::memory_order_relaxed);
+        cachedParams_.modDepthA  = modDepthA_.load(std::memory_order_relaxed);
+        cachedParams_.modDepthB  = modDepthB_.load(std::memory_order_relaxed);
+    }
+
     /// Core per-sample processing — returns wet {L, R}.
     std::pair<T, T> processSampleInternal(T input) noexcept
     {
-        // Cache atomic params for this sample
-        int preDelSamp = preDelaySamples_.load(std::memory_order_relaxed);
-        int erToLateSamp = erToLateSamples_.load(std::memory_order_relaxed);
-        T earlyLvl = earlyLevel_.load(std::memory_order_relaxed);
-        T lateLvl = lateLevel_.load(std::memory_order_relaxed);
-        T widthVal = width_.load(std::memory_order_relaxed);
-        T modDA = modDepthA_.load(std::memory_order_relaxed);
-        T modDB = modDepthB_.load(std::memory_order_relaxed);
+        // Block-cached params (see refreshCachedParams)
+        const int preDelSamp = cachedParams_.preDelaySamples;
+        const int erToLateSamp = cachedParams_.erToLateSamples;
+        const T earlyLvl = cachedParams_.earlyLevel;
+        const T lateLvl = cachedParams_.lateLevel;
+        const T widthVal = cachedParams_.width;
+        const T modDA = cachedParams_.modDepthA;
+        const T modDB = cachedParams_.modDepthB;
 
         // --- Pre-delay ---
         preDelayBuf_.push(input);

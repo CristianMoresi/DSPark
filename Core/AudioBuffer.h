@@ -61,12 +61,17 @@ public:
      */
     template <typename U>
     AudioBufferView(U* const* channelPtrs, int numChannels, int numSamples) noexcept
-        : numChannels_(numChannels), numSamples_(numSamples)
     {
         static_assert(std::is_convertible_v<U*, T*>, "Pointer type U* must be convertible to T*");
-        assert(numChannels <= MaxViewChannels);
-        
-        for (int ch = 0; ch < numChannels; ++ch)
+        assert(numChannels >= 0 && numChannels <= MaxViewChannels);
+
+        // Release-safe clamp: an out-of-range channel count must never write
+        // past the fixed pointer array (assert-only protection vanishes in
+        // release builds).
+        numChannels_ = std::clamp(numChannels, 0, MaxViewChannels);
+        numSamples_  = numSamples >= 0 ? numSamples : 0;
+
+        for (int ch = 0; ch < numChannels_; ++ch)
             channels_[ch] = channelPtrs[ch];
     }
 
@@ -139,15 +144,19 @@ public:
 
     /**
      * @brief Safely copies samples from a source view into this view.
-     * Utilizes std::copy_n to prevent UB in case of memory aliasing.
-     * * @tparam U Source sample type.
+     *
+     * For same-type trivially-copyable samples the copy goes through
+     * std::memmove, which is guaranteed safe even when the ranges overlap.
+     *
+     * @tparam U Source sample type.
+     * @tparam M Source view channel capacity (any capacity is accepted).
      * @param src Source view to copy from.
      */
-    template <typename U>
-    void copyFrom(const AudioBufferView<U>& src) const noexcept
+    template <typename U, int M>
+    void copyFrom(const AudioBufferView<U, M>& src) const noexcept
     {
         static_assert(!std::is_const_v<T>, "Cannot copy into a const view");
-        
+
         const int chCount  = std::min(numChannels_, src.getNumChannels());
         const int nSamples = std::min(numSamples_, src.getNumSamples());
 
@@ -156,23 +165,30 @@ public:
             T* dst     = channels_[ch];
             const U* s = src.getChannel(ch);
 
-            // std::copy_n handles trivial types by forwarding to memmove safely 
-            // if ranges overlap, preventing UB associated with raw memcpy.
-            std::copy_n(s, nSamples, dst);
+            if constexpr (std::is_same_v<std::remove_const_t<U>, T>)
+            {
+                std::memmove(dst, s, static_cast<std::size_t>(nSamples) * sizeof(T));
+            }
+            else
+            {
+                for (int i = 0; i < nSamples; ++i)
+                    dst[i] = static_cast<T>(s[i]);
+            }
         }
     }
 
     /**
      * @brief Adds samples from a source view into this view with optional gain.
      * @tparam U Source sample type.
+     * @tparam M Source view channel capacity (any capacity is accepted).
      * @param src  Source view.
      * @param gain Scaling factor.
      */
-    template <typename U>
-    void addFrom(const AudioBufferView<U>& src, T gain = T(1)) const noexcept
+    template <typename U, int M>
+    void addFrom(const AudioBufferView<U, M>& src, T gain = T(1)) const noexcept
     {
         static_assert(!std::is_const_v<T>, "Cannot add into a const view");
-        
+
         const int chCount  = std::min(numChannels_, src.getNumChannels());
         const int nSamples = std::min(numSamples_, src.getNumSamples());
 
@@ -220,8 +236,7 @@ public:
     }
 
 private:
-    // Marked mutable to allow const views to correctly expose const pointers
-    mutable std::array<T*, MaxViewChannels> channels_ {};
+    std::array<T*, MaxViewChannels> channels_ {};
     int numChannels_ = 0;
     int numSamples_  = 0;
 };
@@ -289,6 +304,11 @@ public:
     {
         assert(numChannels >= 0 && numChannels <= MaxChannels);
         assert(numSamples >= 0);
+
+        // Release-safe clamps: out-of-range requests must never overflow the
+        // fixed channel-pointer array or produce a negative allocation size.
+        numChannels = std::clamp(numChannels, 0, MaxChannels);
+        if (numSamples < 0) numSamples = 0;
 
         const auto samplesBytes = static_cast<std::size_t>(numSamples) * sizeof(T);
         const auto stride       = alignUp(samplesBytes, kAlignment);

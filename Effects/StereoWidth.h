@@ -108,8 +108,13 @@ public:
         if (bassMono)
         {
             const T coeff = bassMonoCoeff_.load(std::memory_order_relaxed);
-            
-            // SIMD-friendly loop with phase-compensated bass mono crossover
+
+            // Bass-mono crossover: the side channel loses its lows through a
+            // one-pole high-pass; the mid passes UNTOUCHED. A one-pole split is
+            // complementary (LP + HP == 1 exactly), so no phase "compensation"
+            // of the mid is needed — the previously used first-order allpass
+            // rotated the mid by up to 180 degrees at HF, which swapped and
+            // inverted the channels above the transition band.
             for (int i = 0; i < numSamples; ++i)
             {
                 T l = left[i];
@@ -118,18 +123,11 @@ public:
                 T mid  = (l + r) * T(0.5);
                 T side = (l - r) * T(0.5) * currentWidth;
 
-                // Side processing (1-pole High-Pass)
-                T sideHp = side - sideState_;
-                sideState_ += coeff * sideHp + antiDenormal_;
+                // Side processing (1-pole high-pass: side - LP(side))
+                T sideLpIn = side;
+                sideState_ += coeff * (sideLpIn - sideState_) + antiDenormal_;
                 sideState_ -= antiDenormal_; // Denormal flush
-                side = sideHp;
-
-                // Mid processing (1-pole All-Pass for phase alignment)
-                // An All-pass is obtained via Lowpass - Highpass
-                T midHp = mid - midState_;
-                midState_ += coeff * midHp + antiDenormal_;
-                midState_ -= antiDenormal_; 
-                mid = midState_ - midHp; 
+                side = sideLpIn - sideState_;
 
                 left[i]  = mid + side;
                 right[i] = mid - side;
@@ -153,7 +151,6 @@ public:
     void reset() noexcept
     {
         sideState_ = T(0);
-        midState_  = T(0);
     }
 
 protected:
@@ -178,8 +175,7 @@ private:
 
     // Filter states
     T sideState_ = T(0);
-    T midState_  = T(0);
-    
+
     // Anti-denormal DC offset (type generic)
     static constexpr T antiDenormal_ = static_cast<T>(1e-15); 
 };

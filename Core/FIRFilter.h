@@ -83,6 +83,7 @@ public:
                                                  int numTaps, T beta = T(5)) noexcept
     {
         assert(numTaps >= 3 && (numTaps % 2 == 1));
+        numTaps = sanitizeTaps(numTaps);
         return designSinc(cutoffHz / sampleRate, numTaps, beta, false);
     }
 
@@ -101,6 +102,7 @@ public:
                                                   int numTaps, T beta = T(5)) noexcept
     {
         assert(numTaps >= 3 && (numTaps % 2 == 1));
+        numTaps = sanitizeTaps(numTaps);
         return designSinc(cutoffHz / sampleRate, numTaps, beta, true);
     }
 
@@ -122,6 +124,7 @@ public:
     {
         assert(numTaps >= 3 && (numTaps % 2 == 1));
         assert(lowCutoffHz < highCutoffHz);
+        numTaps = sanitizeTaps(numTaps);
 
         auto lp1 = designSinc(highCutoffHz / sampleRate, numTaps, beta, false);
         auto lp2 = designSinc(lowCutoffHz / sampleRate, numTaps, beta, false);
@@ -196,6 +199,15 @@ public:
     }
 
 private:
+    /** @brief Release-safe tap sanitiser: spectral inversion (high-pass /
+     *  band-stop) silently breaks for even tap counts (Type II FIR has a
+     *  forced zero at Nyquist), so force the next odd count >= 3. */
+    [[nodiscard]] static int sanitizeTaps(int numTaps) noexcept
+    {
+        if (numTaps < 3) numTaps = 3;
+        return numTaps | 1;
+    }
+
     /**
      * @brief Core windowed-sinc FIR design.
      *
@@ -316,10 +328,8 @@ public:
 
     /**
      * @brief Sets the filter coefficients asynchronously.
-     * * Reverses coefficients for direct SIMD dot product alignment.
-     * @note Thread-Safe: Writes to the inactive buffer, then atomically swaps pointers.
-     * Rapid successive calls without audio thread consumption may result in data races 
-     * on the inactive buffer. A real-time crossfade is recommended for smooth morphing.
+     *
+     * Coefficients are stored reversed for direct SIMD dot-product alignment.
      *
      * @param coeffs Span of coefficients. Size must be <= maxTaps passed to prepare().
      * @note Thread-safe single-producer publish via a seqlock. The audio thread
@@ -411,6 +421,11 @@ public:
     [[nodiscard]] T processSample(T input, int channel) noexcept
     {
         if (!isPrepared_.load(std::memory_order_acquire)) return input;
+
+        // Release-safe channel bound (processBlock clamps; this entry point
+        // must too, or an out-of-range channel indexes the flat delay line OOB).
+        assert(channel >= 0 && channel < numChannels_);
+        if (channel < 0 || channel >= numChannels_) return input;
 
         // Cheap relaxed check; the seqlock copy only runs when an update landed.
         if (coeffDirty_.load(std::memory_order_relaxed)) [[unlikely]]

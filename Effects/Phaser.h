@@ -74,9 +74,14 @@ public:
         lfo_.setFrequency(rate_.load(std::memory_order_relaxed));
         lfo_.setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
 
-        // Calculate smoothing coefficient (approx 50ms response time)
+        lfoR_.prepare(spec.sampleRate);
+        lfoR_.setFrequency(rate_.load(std::memory_order_relaxed));
+        lfoR_.setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
+
+        // One-pole parameter smoothing at a 20 Hz corner (~8 ms time constant)
         smoothCoef_ = T(1) - std::exp(static_cast<T>(-2.0 * std::numbers::pi * 20.0) / static_cast<T>(spec_.sampleRate));
 
+        prepared_ = true;
         reset();
     }
 
@@ -86,6 +91,8 @@ public:
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
+        if (!prepared_) return; // without prepare(), fsInv below would be 1/0 -> NaN chain
+
         const int nCh = std::min(buffer.getNumChannels(), kMaxChannels);
         const int nS  = buffer.getNumSamples();
 
@@ -96,18 +103,45 @@ public:
         const int stagesVal = numStages_.load(std::memory_order_relaxed);
         const T minF        = minFreq_.load(std::memory_order_relaxed);
         const T maxF        = maxFreq_.load(std::memory_order_relaxed);
+        const T spreadVal   = stereoSpread_.load(std::memory_order_relaxed);
 
         // Apply LFO rate/waveform on the AUDIO thread (the setters only publish
         // atomics) so the non-atomic Oscillator state is never written concurrently.
         lfo_.setFrequency(rate_.load(std::memory_order_relaxed));
         lfo_.setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
+        lfoR_.setFrequency(rate_.load(std::memory_order_relaxed));
+        lfoR_.setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
+
+        // Re-phase the right-channel LFO when the spread changes (audio thread
+        // only — Oscillator state is not thread-safe).
+        if (std::abs(spreadVal - lastSpread_) > T(0.0001))
+        {
+            lastSpread_ = spreadVal;
+            T ph = lfo_.getPhase() + spreadVal * T(0.5);
+            ph -= std::floor(ph);
+            lfoR_.setPhase(ph);
+        }
+        const bool useSpread = (spreadVal > T(0.0001)) && (nCh >= 2);
 
         mixer_.pushDry(buffer);
 
         const T logMin = std::log(minF);
         const T logMax = std::log(maxF);
         const T fsInv  = T(1) / static_cast<T>(spec_.sampleRate);
+        const T nyquist = static_cast<T>(spec_.sampleRate) * T(0.499);
         constexpr T kPi = static_cast<T>(std::numbers::pi);
+
+        auto coeffFromLfo = [&](T lfoVal) noexcept -> T
+        {
+            T modAmount = (lfoVal + T(1)) * T(0.5) * currentDepth_;
+            T logFreq = logMin + modAmount * (logMax - logMin);
+            // Convert log-frequency back to linear Hz (fastExp ≈ 2× std::exp)
+            T cutoff = std::min(fastExp(logFreq), nyquist);
+            // Bilinear-transform coefficient: tan(π·f/Fs). fastTan is safe —
+            // `cutoff` stays below Nyquist thanks to the clamp above.
+            T tanVal = fastTan(kPi * cutoff * fsInv);
+            return (tanVal - T(1)) / (tanVal + T(1));
+        };
 
         for (int i = 0; i < nS; ++i)
         {
@@ -115,31 +149,19 @@ public:
             currentDepth_ += smoothCoef_ * (targetDepth - currentDepth_);
             currentFb_    += smoothCoef_ * (targetFb - currentFb_);
 
-            // LFO calculates log-scaled frequency
-            T lfoVal = lfo_.getNextSample(); 
-            T modAmount = (lfoVal + T(1)) * T(0.5) * currentDepth_; 
-            T logFreq = logMin + modAmount * (logMax - logMin);
-            
-            // Convert log-frequency back to linear Hz (fastExp ≈ 2× std::exp)
-            T cutoff = fastExp(logFreq);
+            const T cL = coeffFromLfo(lfo_.getNextSample());
+            const T lfoRVal = lfoR_.getNextSample(); // keep phase advancing always
+            const T cR = useSpread ? coeffFromLfo(lfoRVal) : cL;
 
-            // Clamp to Nyquist boundary
-            T nyquist = static_cast<T>(spec_.sampleRate) * T(0.499);
-            cutoff = std::min(cutoff, nyquist);
-
-            // Bilinear-transform coefficient: tan(π·f/Fs).
-            // fastTan is safe here — `cutoff` is always < Nyquist so the
-            // argument is bounded to π/2 by the clamp above.
-            T tanVal = fastTan(kPi * cutoff * fsInv);
-            T c = (tanVal - T(1)) / (tanVal + T(1));
-
-            // Process active channels
+            // Process active channels (odd channels follow the spread LFO)
             for (int ch = 0; ch < nCh; ++ch)
             {
+                const T c = (ch & 1) ? cR : cL;
                 T sample = buffer.getChannel(ch)[i];
 
-                // Analog-modeled feedback with soft clipping to prevent digital blowups
-                T fbSignal = std::tanh(fbState_[ch] * currentFb_);
+                // Analog-modeled feedback with soft clipping to prevent digital
+                // blowups. fastTanh: argument bounded by |fb| < 1.
+                T fbSignal = fastTanh(fbState_[ch] * currentFb_);
                 sample += fbSignal;
 
                 // Series first-order allpass chain
@@ -157,9 +179,8 @@ public:
             }
         }
 
-        // Mix parameter is smoothed internally by DryWetMixer if implemented correctly,
-        // otherwise apply similar smoothing logic here.
-        mixer_.mixWet(buffer, targetMix); 
+        // DryWetMixer smooths the mix parameter internally.
+        mixer_.mixWet(buffer, targetMix);
     }
 
     /** 
@@ -179,6 +200,8 @@ public:
         currentFb_    = feedback_.load(std::memory_order_relaxed);
 
         lfo_.reset();
+        lfoR_.reset();
+        lastSpread_ = T(-1); // force re-phase of the spread LFO on next block
         mixer_.reset();
     }
 
@@ -230,6 +253,20 @@ public:
     void setFeedback(T amount) noexcept
     {
         feedback_.store(std::clamp(amount, T(-0.99), T(0.99)), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Sets the stereo phase spread of the sweep LFO.
+     *
+     * Offsets the right channel's LFO phase against the left, like classic
+     * hardware stereo phasers. 0 = mono-coherent sweep (both channels move
+     * together), 1 = fully opposed (180-degree) sweep.
+     *
+     * @param amount Spread amount [0.0, 1.0]. Applied on the audio thread.
+     */
+    void setStereoSpread(T amount) noexcept
+    {
+        stereoSpread_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
     /**
@@ -289,11 +326,14 @@ protected:
     std::atomic<T> maxFreq_  { T(6000) };
     std::atomic<int> numStages_ { 4 };
     std::atomic<typename Oscillator<T>::Waveform> lfoWaveform_ { Oscillator<T>::Waveform::Sine };
+    std::atomic<T> stereoSpread_ { T(0) };
 
     // Smoothed state parameters
+    bool prepared_  { false };
     T currentDepth_ { T(0.8) };
     T currentFb_    { T(0) };
-    T smoothCoef_   { T(0.01) }; 
+    T smoothCoef_   { T(0.01) };
+    T lastSpread_   { T(-1) };
 
     struct FirstOrderAllpass
     {
@@ -305,6 +345,7 @@ protected:
     std::array<FirstOrderAllpass, kMaxStages> stages_ {};
     std::array<T, kMaxChannels> fbState_ {};
     Oscillator<T> lfo_;
+    Oscillator<T> lfoR_;   // right-channel LFO for stereo spread
     DryWetMixer<T> mixer_;
 };
 

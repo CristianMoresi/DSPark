@@ -11,6 +11,9 @@
     #include <immintrin.h>
 #elif defined(__aarch64__) || defined(_M_ARM64)
     #define DSPARK_ARCH_ARM64 1
+    #if defined(_MSC_VER) && !defined(__clang__)
+        #include <intrin.h>   // _ReadStatusReg / _WriteStatusReg (MSVC on ARM64)
+    #endif
 #elif defined(__arm__) || defined(_M_ARM)
     #define DSPARK_ARCH_ARM32 1
 #endif
@@ -66,6 +69,12 @@ public:
         fpcr |= (1ULL << 24); // FZ bit
         __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr));
 
+#elif defined(DSPARK_ARCH_ARM64) && defined(_MSC_VER)
+        // Windows on ARM (MSVC): no inline asm, use the status-register intrinsics.
+        const long long fpcr = _ReadStatusReg(ARM64_FPCR);
+        previousState_ = static_cast<uint64_t>(fpcr);
+        _WriteStatusReg(ARM64_FPCR, fpcr | (1LL << 24)); // FZ bit
+
 #elif defined(DSPARK_ARCH_ARM32) && (defined(__GNUC__) || defined(__clang__))
         unsigned int fpscr;
         __asm__ __volatile__("vmrs %0, fpscr" : "=r"(fpscr));
@@ -90,6 +99,9 @@ public:
 #elif defined(DSPARK_ARCH_ARM64) && (defined(__GNUC__) || defined(__clang__))
         unsigned long long fpcr = static_cast<unsigned long long>(previousState_);
         __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr));
+
+#elif defined(DSPARK_ARCH_ARM64) && defined(_MSC_VER)
+        _WriteStatusReg(ARM64_FPCR, static_cast<long long>(previousState_));
 
 #elif defined(DSPARK_ARCH_ARM32) && (defined(__GNUC__) || defined(__clang__))
         unsigned int fpscr = static_cast<unsigned int>(previousState_);

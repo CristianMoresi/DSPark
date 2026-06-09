@@ -89,7 +89,9 @@ public:
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        const int nCh = std::min(buffer.getNumChannels(), kMaxChannels);
+        // Clamp to the PREPARED channel count: delay lines beyond
+        // spec_.numChannels were never allocated and would read as silence.
+        const int nCh = std::min({ buffer.getNumChannels(), spec_.numChannels, kMaxChannels });
         const int nS  = buffer.getNumSamples();
 
         // 1. Read atomics once per block
@@ -130,6 +132,11 @@ public:
         if (autoD && targetRate > T(0.01))
             targetDepthSamples /= std::sqrt(targetRate);
 
+        // Keep depth <= center - 2 samples: a deeper sweep would flatten
+        // against the 1-sample read floor, squaring off the modulation shape.
+        targetDepthSamples = std::min(targetDepthSamples,
+                                      std::max(T(0), targetCenterSamples - T(2)));
+
         // Update LFO frequencies
         for (int ch = 0; ch < nCh; ++ch)
             for (int v = 0; v < nVoices; ++v)
@@ -155,9 +162,10 @@ public:
                 depthSamples  += (targetDepthSamples - depthSamples) * smoothCoeff;
 
                 T input = channelData[i];
-                
-                // Saturating analog-style feedback to prevent harsh digital clipping
-                T feedbackSig = std::tanh(fbState_[ch] * fbVal);
+
+                // Saturating analog-style feedback to prevent harsh digital clipping.
+                // fastTanh: |argument| < 1 here, where its error is < 0.05%.
+                T feedbackSig = fastTanh(fbState_[ch] * fbVal);
                 ring.push(input + feedbackSig);
 
                 T wetRaw = T(0);

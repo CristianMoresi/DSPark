@@ -35,6 +35,7 @@
 #include "../Core/RingBuffer.h"
 #include "../Core/SmoothedValue.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/TruePeakDetector.h"
 
 #include <algorithm>
 #include <array>
@@ -89,6 +90,7 @@ public:
             dl.prepare(maxLookaheadSamples * 2); // Double size for safety margin
 
         setLookahead(static_cast<T>(initialLookaheadMs));
+        lookaheadCurrent_ = static_cast<T>(lookaheadSamples_);
 
         // Ceiling smoother setup
         T ceilLinear = decibelsToGain(ceilingDb_.load(std::memory_order_relaxed));
@@ -96,10 +98,6 @@ public:
         ceilingSmooth_.reset(ceilLinear);
 
         updateReleaseCoefficient();
-
-        // ISP true-peak setup
-        buildTruePeakFilter();
-        tpState_ = {};
 
         reset();
         prepared_ = true;
@@ -140,13 +138,21 @@ public:
             T ceiling = ceilingSmooth_.getNextValue();
             T peak = T(0);
 
+            // Live-change smoothing of the lookahead read offset: at most one
+            // sample of change per sample, so a setLookahead() during playback
+            // glides (brief micro pitch-shift) instead of clicking.
+            const T lookTarget = static_cast<T>(lookaheadSamples_);
+            if (lookaheadCurrent_ < lookTarget)      lookaheadCurrent_ += T(1);
+            else if (lookaheadCurrent_ > lookTarget) lookaheadCurrent_ -= T(1);
+            const int lookNow = static_cast<int>(lookaheadCurrent_);
+
             // Phase 1: Peak detection and delay line push
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T sample = buffer.getChannel(ch)[i];
                 delayLines_[ch].push(sample);
 
-                T chPeak = isp ? detectTruePeak(sample, ch) : std::abs(sample);
+                T chPeak = isp ? truePeak_.processSample(sample, ch) : std::abs(sample);
                 if (chPeak > peak) peak = chPeak;
             }
 
@@ -164,10 +170,17 @@ public:
             T targetGain = (heldPeak_ > ceiling) ? ceiling / heldPeak_ : T(1);
             smoothGain(targetGain, adaptive, relMs);
 
-            // Phase 3: Apply gain and safety clip
+            // Phase 3: Apply gain, guarantee the ceiling, optional safety clip
             for (int ch = 0; ch < nCh; ++ch)
             {
-                T out = delayLines_[ch].read(lookaheadSamples_) * currentGain_;
+                T out = delayLines_[ch].read(lookNow) * currentGain_;
+
+                // Hard ceiling guarantee: the smoothed attack converges to
+                // ~99% of the target inside the lookahead window, leaving up
+                // to ~0.09 dB of residual overshoot. Clamping that residual is
+                // inaudible (it only ever trims the last 1%) and makes the
+                // brickwall contract exact.
+                out = std::clamp(out, -ceiling, ceiling);
 
                 if (safetyClip)
                 {
@@ -188,31 +201,38 @@ public:
      */
     [[nodiscard]] T processSample(T input, int channel) noexcept
     {
+        if (!prepared_) return input;
+        // Release-safe channel bound (delayLines_ is sized to numChannels_).
+        assert(channel >= 0 && channel < numChannels_);
+        if (channel < 0 || channel >= numChannels_) return input;
+
         syncParameters();
-        
+
         T ceiling = ceilingSmooth_.getNextValue();
         bool isp = truePeakEnabled_.load(std::memory_order_relaxed);
         bool adaptive = adaptiveRelease_.load(std::memory_order_relaxed);
         T relMs = releaseMs_.load(std::memory_order_relaxed);
 
         delayLines_[channel].push(input);
-        T peak = isp ? detectTruePeak(input, channel) : std::abs(input);
-        
+        T peak = isp ? truePeak_.processSample(input, channel) : std::abs(input);
+
         T targetGain = (peak > ceiling) ? ceiling / peak : T(1);
         smoothGain(targetGain, adaptive, relMs);
 
-        return delayLines_[channel].read(lookaheadSamples_) * currentGain_;
+        T out = delayLines_[channel].read(lookaheadSamples_) * currentGain_;
+        return std::clamp(out, -ceiling, ceiling); // exact brickwall contract
     }
 
     /** @brief Resets the internal state (delays, gain reduction). RT-Safe. */
     void reset() noexcept
     {
         for (auto& dl : delayLines_) dl.reset();
-        tpState_ = {};
+        truePeak_.reset();
         currentGain_ = T(1);
         limitingDuration_ = 0;
         heldPeak_ = T(0);
         peakHoldCounter_ = 0;
+        lookaheadCurrent_ = static_cast<T>(lookaheadSamples_);
         ceilingSmooth_.skip();
     }
 
@@ -276,17 +296,8 @@ protected:
     static constexpr int kMaxChannels = 16;
     static constexpr double kMaxLookaheadMs = 10.0;
 
-    static constexpr int kTpTaps = 12;
-    static constexpr int kTpPhases = 3;
-    static constexpr int kTpHistSize = 16; 
-    static constexpr int kTpHistMask = kTpHistSize - 1;
-
-    struct TruePeakState {
-        T history[kTpHistSize] = {}; 
-        int writePos = 0;            
-    };
-    std::array<TruePeakState, kMaxChannels> tpState_{};
-    std::array<std::array<T, kTpTaps>, kTpPhases> tpCoeffs_{};
+    // Shared ITU-R BS.1770-4 true-peak detector (Core/TruePeakDetector.h).
+    TruePeakDetector<T, kMaxChannels> truePeak_;
 
     // Fast-path synchronization for atomic variables
     inline void syncParameters() noexcept
@@ -306,70 +317,6 @@ protected:
     {
         if (sampleRate_ > 0)
             releaseCoeff_ = T(1) - std::exp(T(-1) / (static_cast<T>(sampleRate_) * lastReleaseMs_ / T(1000)));
-    }
-
-    void buildTruePeakFilter() noexcept
-    {
-        // ... (Tu implementación original de buildTruePeakFilter era correcta y óptima) ...
-        constexpr int N = kTpTaps * 4;       
-        constexpr double M = (N - 1) / 2.0;  
-        constexpr double fc = 0.25;          
-        constexpr double beta = 8.0;         
-        constexpr double pi = std::numbers::pi;
-
-        auto besselI0 = [](double x) -> double {
-            double sum = 1.0, term = 1.0;
-            for (int k = 1; k <= 25; ++k) {
-                double half = x / (2.0 * k);
-                term *= half * half;
-                sum += term;
-                if (term < 1e-15 * sum) break;
-            }
-            return sum;
-        };
-
-        const double i0Beta = besselI0(beta);
-        double h[N];
-        
-        for (int n = 0; n < N; ++n) {
-            double x = static_cast<double>(n) - M;
-            double sincArg = 2.0 * fc * x;
-            double sincVal = (std::abs(sincArg) < 1e-10) ? 1.0 : std::sin(pi * sincArg) / (pi * sincArg);
-            double t = x / M;
-            double kaiserVal = (std::abs(t) > 1.0) ? 0.0 : besselI0(beta * std::sqrt(1.0 - t * t)) / i0Beta;
-            h[n] = sincVal * kaiserVal;
-        }
-
-        for (int phase = 0; phase < kTpPhases; ++phase) {
-            int p = phase + 1;
-            for (int k = 0; k < kTpTaps; ++k)
-                tpCoeffs_[phase][k] = static_cast<T>(h[4 * k + p]);
-        }
-    }
-
-    [[nodiscard]] inline T detectTruePeak(T sample, int ch) noexcept
-    {
-        auto& tp = tpState_[ch];
-        tp.history[tp.writePos] = sample;
-        tp.writePos = (tp.writePos + 1) & kTpHistMask;
-
-        T peak = std::abs(sample);
-        const int newest = (tp.writePos - 1) & kTpHistMask;
-        
-        // Manual unrolling recommended if compiler doesn't auto-vectorize
-        for (int phase = 0; phase < kTpPhases; ++phase)
-        {
-            T interp = T(0);
-            int idx = newest;
-            for (int k = 0; k < kTpTaps; ++k)
-            {
-                interp += tp.history[idx] * tpCoeffs_[phase][k];
-                idx = (idx - 1) & kTpHistMask;
-            }
-            T absInterp = std::abs(interp);
-            if (absInterp > peak) peak = absInterp;
-        }
-        return peak;
     }
 
     inline void smoothGain(T targetGain, bool adaptive, T relMs) noexcept
@@ -446,6 +393,7 @@ protected:
 
     T currentGain_ = T(1);
     int limitingDuration_ = 0;
+    T lookaheadCurrent_ = T(96); ///< Smoothed read offset (glides on live changes).
 
     // Look-ahead peak hold (brickwall guarantee): holds the detected peak for
     // lookaheadSamples_ so the gain stays reduced until the peak is output.

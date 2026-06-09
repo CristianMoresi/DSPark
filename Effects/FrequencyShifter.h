@@ -155,9 +155,20 @@ public:
 
     /** @return The current frequency shift amount in Hz. */
     [[nodiscard]] T getShift() const noexcept { return shift_.load(std::memory_order_relaxed); }
-    
+
     /** @return The current dry/wet mix ratio. */
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Reports the processing latency in samples.
+     *
+     * The Hilbert transformer delays BOTH the dry (real branch) and shifted
+     * paths by its FIR group delay; report this for plugin delay compensation.
+     */
+    [[nodiscard]] static constexpr int getLatency() noexcept
+    {
+        return Hilbert<T>::getLatencySamples();
+    }
 
 private:
     double sampleRate_ = 44100.0;

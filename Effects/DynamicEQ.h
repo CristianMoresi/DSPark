@@ -225,6 +225,7 @@ private:
         const int nCh  = std::min(audio.getNumChannels(), kMaxChannels);
         const int scCh = sidechain.getNumChannels();
         const int nS   = audio.getNumSamples();
+        if (scCh <= 0) return; // a 0-channel sidechain would index getChannel(-1)
         const int nb   = numBands_.load(std::memory_order_relaxed);
         const int laSamples = lookaheadSamples_.load(std::memory_order_relaxed);
 

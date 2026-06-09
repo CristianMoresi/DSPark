@@ -92,6 +92,11 @@ public:
     {
         if (current_ == target_) return current_;
 
+        // Relative epsilon: with large magnitudes (e.g. a frequency of 10000)
+        // the float ulp exceeds any fixed threshold, and a purely absolute
+        // epsilon would leave the smoother "smoothing" forever at 1 ulp away.
+        const T eps = epsilon_ * std::max(T(1), std::abs(target_));
+
         switch (type_)
         {
             case SmoothingType::Exponential:
@@ -121,7 +126,7 @@ public:
         }
 
         // Anti-denormal protection & exact arrival
-        if (std::abs(current_ - target_) < epsilon_)
+        if (std::abs(current_ - target_) < eps)
             current_ = target_;
 
         return current_;
@@ -141,42 +146,63 @@ public:
             return;
         }
 
+        // Work on locals: the compiler cannot prove the span does not alias
+        // the members (same T), so member accesses would be re-loaded each
+        // iteration. Locals keep the recursion in registers.
+        T current = current_;
+        const T target = target_;
+
         // Branch pulled OUTSIDE the loop for CPU instruction cache / SIMD efficiency
         switch (type_)
         {
             case SmoothingType::Exponential:
+            {
+                const T coeff = expCoeff_;
                 for (auto& sample : buffer)
                 {
-                    current_ = target_ + expCoeff_ * (current_ - target_);
-                    sample = current_;
+                    current = target + coeff * (current - target);
+                    sample = current;
                 }
                 break;
+            }
 
             case SmoothingType::Linear:
+            {
+                const T rate = linearRate_;
                 for (auto& sample : buffer)
                 {
-                    if (current_ < target_)      current_ = std::min(current_ + linearRate_, target_);
-                    else if (current_ > target_) current_ = std::max(current_ - linearRate_, target_);
-                    sample = current_;
+                    if (current < target)      current = std::min(current + rate, target);
+                    else if (current > target) current = std::max(current - rate, target);
+                    sample = current;
                 }
                 break;
+            }
 
             case SmoothingType::Disabled:
-                current_ = target_;
-                std::fill(buffer.begin(), buffer.end(), target_);
+                current = target;
+                std::fill(buffer.begin(), buffer.end(), target);
                 break;
 
             case SmoothingType::Chase:
+            {
+                T speed = chaseSpeed_;
+                const T multDecay = chaseMultDecay_;
+                const T addDecay  = chaseAddDecay_;
                 for (auto& sample : buffer)
                 {
-                    chaseSpeed_ = std::max(T(350), std::min(T(2500), chaseSpeed_ * chaseMultDecay_ - chaseAddDecay_));
-                    current_ = (current_ * chaseSpeed_ + target_) / (chaseSpeed_ + T(1));
-                    sample = current_;
+                    speed = std::max(T(350), std::min(T(2500), speed * multDecay - addDecay));
+                    current = (current * speed + target) / (speed + T(1));
+                    sample = current;
                 }
+                chaseSpeed_ = speed;
                 break;
+            }
         }
 
-        if (std::abs(current_ - target_) < epsilon_)
+        current_ = current;
+
+        const T eps = epsilon_ * std::max(T(1), std::abs(target_));
+        if (std::abs(current_ - target_) < eps)
             current_ = target_;
     }
 

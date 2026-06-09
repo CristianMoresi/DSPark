@@ -68,10 +68,10 @@ public:
     [[nodiscard]] T advance() noexcept
     {
         const T current = phase_;
-        // wrapPhase has a fast in-range exit, so the common case (|increment| < 1)
+        // wrapUnit has a fast in-range exit, so the common case (|increment| < 1)
         // costs one compare — but unlike an unbounded while-loop it can never hang
         // on a pathological frequency (>> sample rate).
-        phase_ = wrapPhase(phase_ + increment_);
+        phase_ = wrapUnit(phase_ + increment_);
         return current;
     }
 
@@ -91,7 +91,7 @@ public:
         const T modulatedIncrement = static_cast<T>(
             static_cast<double>(frequency_ + fmHz) * invSampleRate_);
 
-        phase_ = wrapPhase(phase_ + modulatedIncrement);
+        phase_ = wrapUnit(phase_ + modulatedIncrement);
 
         return current;
     }
@@ -108,7 +108,7 @@ public:
      */
     void setPhase(T newPhase) noexcept
     {
-        phase_ = wrapPhase(newPhase);
+        phase_ = wrapUnit(newPhase);
     }
 
     /**
@@ -121,7 +121,7 @@ public:
      */
     void hardSync(T fractionalOffset = T(0)) noexcept 
     { 
-        phase_ = wrapPhase(fractionalOffset); 
+        phase_ = wrapUnit(fractionalOffset);
     }
 
     /**
@@ -144,7 +144,7 @@ public:
      */
     void reset(T startPhase = T(0)) noexcept
     {
-        phase_ = wrapPhase(startPhase);
+        phase_ = wrapUnit(startPhase);
     }
 
     /**
@@ -164,13 +164,21 @@ private:
 
     /**
      * @brief Fast fallback for phase wrapping with arbitrary values (e.g., extreme FM).
-     * Replaces std::floor with integer casting.
+     * Replaces std::floor with truncation. Named wrapUnit to avoid confusion
+     * with dspark::wrapPhase, which wraps to [0, 2*pi) instead of [0, 1).
      */
-    static constexpr T wrapPhase(T p) noexcept
+    static T wrapUnit(T p) noexcept
     {
         if (p >= T(0) && p < T(1)) return p; // Fast exit
-        const T wrapped = p - static_cast<int>(p);
-        return wrapped < T(0) ? wrapped + T(1) : wrapped;
+        // std::trunc instead of a cast to int: casting is UB once |p| exceeds
+        // INT_MAX, which extreme FM excursions can reach.
+        T wrapped = p - std::trunc(p);
+        if (wrapped < T(0)) wrapped += T(1);
+        // Guard the contract's half-open range: for tiny negative inputs the
+        // addition above rounds to exactly 1.0 in float, and a table oscillator
+        // indexing phase*N would read one past the end.
+        if (wrapped >= T(1)) wrapped -= T(1);
+        return wrapped;
     }
 
     double sampleRate_ = 48000.0;

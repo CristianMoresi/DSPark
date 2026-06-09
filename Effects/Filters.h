@@ -368,9 +368,22 @@ public:
                 float f = freqSmoother_.getCurrentValue(); // Value is static
                 float q = resSmoother_.getCurrentValue();
                 float g = gainSmoother_.getCurrentValue();
-                
+
                 float nyquist = static_cast<float>(spec_.sampleRate) * 0.499f;
-                updateCoefficients(std::clamp(f, 10.0f, nyquist), std::max(q, 0.1f), g);
+                f = std::clamp(f, 10.0f, nyquist);
+                q = std::max(q, 0.1f);
+
+                // Skip the trig-heavy coefficient rebuild when absolutely
+                // nothing changed since the last block (the common case).
+                const Shape sh = shape_.load(std::memory_order_relaxed);
+                const int sdb  = slopeDb_.load(std::memory_order_relaxed);
+                if (f != lastFreq_ || q != lastQ_ || g != lastGain_ ||
+                    sh != lastShape_ || sdb != lastSlopeDb_)
+                {
+                    updateCoefficients(f, q, g);
+                    lastFreq_ = f; lastQ_ = q; lastGain_ = g;
+                    lastShape_ = sh; lastSlopeDb_ = sdb;
+                }
 
                 for (int ch = 0; ch < nCh; ++ch)
                 {
@@ -403,19 +416,24 @@ public:
 
                     if (nonLin > T(0))
                     {
-                        // Capacitor2-style nonlinearity approximated at chunk level.
-                        // NOTE: True per-sample analog FM requires SVF/TPT filters.
+                        // Signal-dependent cutoff modulation ("dielectric" FM,
+                        // chunk-rate). Reformulated as a bounded depth control:
+                        //   freq *= 1 + depth * 2 * g(level),  g = x/(1+x) in [0,1)
+                        // so depth -> 0 is exactly neutral and depth = 1 sweeps
+                        // up to one octave on loud material. (The previous
+                        // |2-(x+n)/n| form DIVERGED as the knob approached 0.)
                         T avgAbs = T(0);
                         for (int ch = 0; ch < nCh; ++ch)
                             avgAbs += std::abs(buffer.getChannel(ch)[i]);
                         avgAbs /= static_cast<T>(nCh);
 
-                        T dielectric = std::abs(T(2) - (avgAbs + nonLin) / nonLin);
-                        freq *= static_cast<float>(dielectric);
+                        const T bounded = avgAbs / (T(1) + avgAbs);
+                        freq *= static_cast<float>(T(1) + nonLin * T(2) * bounded);
                     }
 
                     float nyquist = static_cast<float>(spec_.sampleRate) * 0.499f;
                     updateCoefficients(std::clamp(freq, 10.0f, nyquist), std::max(res, 0.1f), gain);
+                    lastFreq_ = -1.0f; // invalidate the static-path cache
                 }
                 else if (driftEnabled_)
                 {
@@ -564,6 +582,13 @@ protected:
     bool driftEnabled_ = false;
     float driftIntensity_ = 0.0f;
     AnalogRandom::Generator<float> driftGen_;
+
+    // Static-path coefficient cache (skip rebuilds when nothing changed).
+    float lastFreq_ = -1.0f;
+    float lastQ_ = -1.0f;
+    float lastGain_ = -1e9f;
+    Shape lastShape_ = Shape::LowPass;
+    int lastSlopeDb_ = -1;
 };
 
 } // namespace dspark

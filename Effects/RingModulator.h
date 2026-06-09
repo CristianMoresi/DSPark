@@ -117,8 +117,10 @@ public:
                 
                 phasor_.setFrequency(currentFreq_);
                 T phase = phasor_.advance();
-                
-                carrierChunk[i] = std::sin(phase * twoPi);
+
+                // fastSin: error > 100 dB below the carrier — inaudible even
+                // though the carrier itself is audible in ring modulation.
+                carrierChunk[i] = fastSin(phase * twoPi);
                 mixChunk[i] = currentMix_;
             }
 
@@ -213,7 +215,7 @@ public:
 
 private:
     int numChannels_ = 2;
-    T sampleRate_ = T(44400);
+    T sampleRate_ = T(48000);
 
     // Atomic targets for lock-free UI/Thread communication
     std::atomic<T> frequency_ { T(440) };

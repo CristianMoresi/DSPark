@@ -218,6 +218,7 @@ public:
         T Q = T(0.5) + resonance_ * T(49.5);
         R_ = T(1) / (T(2) * Q);
         updateBellR();
+        updateDerivedCoeffs();
     }
 
     /**
@@ -233,10 +234,15 @@ public:
         R_ = T(1) / (T(2) * q);
         resonance_ = std::clamp((q - T(0.5)) / T(49.5), T(0), T(1));
         updateBellR();
+        updateDerivedCoeffs();
     }
 
     /** @brief Sets the output mode. */
-    void setMode(Mode mode) noexcept { mode_ = mode; }
+    void setMode(Mode mode) noexcept
+    {
+        mode_ = mode;
+        updateDerivedCoeffs();
+    }
 
     /**
      * @brief Sets gain for Bell/Shelf modes (in dB).
@@ -247,6 +253,7 @@ public:
         gainDb_ = dB;
         A_ = std::pow(T(10), std::abs(dB) / T(40)); // sqrt(linear gain)
         updateBellR();
+        updateDerivedCoeffs();
     }
 
     // -- Getters ----------------------------------------------------------------
@@ -275,6 +282,11 @@ protected:
     T A_  = T(1);    // sqrt(gain) for shelving/bell
     Mode mode_ = Mode::LowPass;
 
+    // Cached derived coefficients (recomputed by updateDerivedCoeffs()).
+    T effG_ = T(0);  // possibly shelf-prewarped g
+    T effR_ = T(1);  // mode-effective damping (R_ or Rbell_)
+    T a1_ = T(1), a2_ = T(0), a3_ = T(0);
+
 private:
     void updateCoefficients() noexcept
     {
@@ -288,6 +300,7 @@ private:
                                          / spec_.sampleRate));
         }
         updateBellR();
+        updateDerivedCoeffs();
     }
 
     /** @brief Recomputes Rbell_ from R_, A_, gainDb_ for Bell mode. */
@@ -310,6 +323,34 @@ private:
     }
 
     /**
+     * @brief Recomputes the cached TPT coefficients (a1, a2, a3).
+     *
+     * Called from every setter, so the per-sample path never divides when the
+     * parameters are static. Per-sample modulation still works: setCutoff()
+     * (or any other setter) refreshes the cache at the same cost the old
+     * per-sample computation had.
+     *
+     * Shelf modes pre-warp g by sqrt(A) (Simper's convention) so the
+     * half-gain point of the shelf lands exactly on the nominal frequency.
+     */
+    void updateDerivedCoeffs() noexcept
+    {
+        effR_ = (mode_ == Mode::Bell) ? Rbell_ : R_;
+
+        T gEff = g_;
+        if (mode_ == Mode::LowShelf || mode_ == Mode::HighShelf)
+        {
+            const T sqrtAs = std::sqrt((gainDb_ >= T(0)) ? A_ : T(1) / A_);
+            gEff = (mode_ == Mode::LowShelf) ? g_ / sqrtAs : g_ * sqrtAs;
+        }
+
+        effG_ = gEff;
+        a1_ = T(1) / (T(1) + T(2) * effR_ * gEff + gEff * gEff);
+        a2_ = gEff * a1_;
+        a3_ = gEff * a2_;
+    }
+
+    /**
      * @brief Core TPT SVF processing — produces all 3 outputs.
      *
      * Implements the Zavalishin TPT SVF topology:
@@ -318,27 +359,21 @@ private:
      *   ic1eq = 2*v2 - ic1eq   (trapezoidal update)
      *   ic2eq = 2*v3 - ic2eq
      *
-     * where a1 = 1/(1 + 2R*g + g*g)
+     * where a1 = 1/(1 + 2R*g + g*g). The coefficients come pre-computed from
+     * updateDerivedCoeffs(), so this hot path is division-free.
      */
     [[nodiscard]] MultiOutput processCore(T input, int channel) noexcept
     {
         auto& s = state_[channel];
 
-        // For Bell mode, use gain-adjusted damping (Zavalishin ch. 4)
-        T Reff = (mode_ == Mode::Bell) ? Rbell_ : R_;
-
-        T a1 = T(1) / (T(1) + T(2) * Reff * g_ + g_ * g_);
-        T a2 = g_ * a1;
-        T a3 = g_ * a2;
-
         T v3 = input - s.ic2eq;
-        T v1 = a1 * s.ic1eq + a2 * v3;
-        T v2 = s.ic2eq + a2 * s.ic1eq + a3 * v3;
+        T v1 = a1_ * s.ic1eq + a2_ * v3;
+        T v2 = s.ic2eq + a2_ * s.ic1eq + a3_ * v3;
 
         s.ic1eq = T(2) * v1 - s.ic1eq;
         s.ic2eq = T(2) * v2 - s.ic2eq;
 
-        return { v2, input - T(2) * Reff * v1 - v2, v1 };
+        return { v2, input - T(2) * effR_ * v1 - v2, v1 };
     }
 
     [[nodiscard]] T selectOutput(T input, T lp, T hp, T bp) const noexcept
@@ -368,29 +403,23 @@ private:
             }
             case Mode::LowShelf:
             {
-                // Low shelf (Zavalishin ch. 4): sqrt(A) in the BP term
-                // corrects the transition slope.
-                // Boost: A * LP + sqrt(A) * 2R * BP + HP
-                // Cut:   (1/A) * LP + (1/sqrt(A)) * 2R * BP + HP
-                T sqrtA = std::sqrt(A_);
-                T twoR  = T(2) * R_;
-                if (gainDb_ >= T(0))
-                    return A_ * A_ * lp + sqrtA * twoR * bp + hp;
-                else
-                    return lp / (A_ * A_) + twoR / sqrtA * bp + hp;
+                // Canonical Simper low shelf. With As = A_ (boost) or 1/A_
+                // (cut), where A_ = 10^(|dB|/40) = sqrt(linear gain), and the
+                // pre-warped g from updateDerivedCoeffs():
+                //   out = As^2 * LP + 2R * As * BP + HP
+                // DC gain = As^2 (= linear gain), Nyquist gain = 1, and the
+                // half-gain point sits exactly on the nominal frequency.
+                const T As   = (gainDb_ >= T(0)) ? A_ : T(1) / A_;
+                const T twoR = T(2) * R_;
+                return As * As * lp + As * twoR * bp + hp;
             }
             case Mode::HighShelf:
             {
-                // High shelf (Zavalishin ch. 4): sqrt(A) in the BP term
-                // corrects the transition slope.
-                // Boost: LP + sqrt(A) * 2R * BP + A * HP
-                // Cut:   LP + (1/sqrt(A)) * 2R * BP + (1/A) * HP
-                T sqrtA = std::sqrt(A_);
-                T twoR  = T(2) * R_;
-                if (gainDb_ >= T(0))
-                    return lp + sqrtA * twoR * bp + A_ * A_ * hp;
-                else
-                    return lp + twoR / sqrtA * bp + hp / (A_ * A_);
+                // Canonical Simper high shelf (mirror of the low shelf):
+                //   out = LP + 2R * As * BP + As^2 * HP
+                const T As   = (gainDb_ >= T(0)) ? A_ : T(1) / A_;
+                const T twoR = T(2) * R_;
+                return lp + As * twoR * bp + As * As * hp;
             }
         }
         return lp;

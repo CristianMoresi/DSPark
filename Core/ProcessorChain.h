@@ -40,6 +40,9 @@ template <typename T, typename... Processors>
 class ProcessorChain
 {
     static_assert(sizeof...(Processors) > 0, "ProcessorChain requires at least one processor.");
+    static_assert((AudioProcessor<Processors, T> && ...),
+        "Every ProcessorChain slot must satisfy the dspark::AudioProcessor concept "
+        "(prepare(AudioSpec), processBlock(AudioBufferView<T>) noexcept, reset() noexcept).");
 
 public:
     /**

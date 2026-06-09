@@ -50,10 +50,20 @@ template <typename SampleType> class Saturation;
 
 namespace detail {
 
+/** Numerically stable log(cosh(x)) for the antiderivative anti-aliasing of tanh-based curves. */
+template <typename T>
+inline T logCosh(T x) noexcept
+{
+    T a = std::abs(x);
+    return a + std::log1p(std::exp(T(-2) * a)) - T(0.6931471805599453); // ln 2
+}
+
 template <typename T>
 class SaturationAlgorithm
 {
 public:
+    static constexpr int kAaCh = 16;
+
     virtual ~SaturationAlgorithm() = default;
 
     /** @brief Prepares the algorithm with the current audio specification. */
@@ -67,22 +77,45 @@ public:
 
     /** @brief Identifies the exact algorithm type for CRTP static dispatch. */
     virtual typename Saturation<T>::Algorithm getType() const noexcept = 0;
+
+    /**
+     * @brief Enables 1st-order antiderivative anti-aliasing (ADAA) on the
+     * memoryless curves (Tanh/Tube/HardClip). Combined with oversampling this is
+     * the cleanest known approach (Parker/Zavalishin DAFx-16, Bilbao et al. 2017).
+     * No-op for algorithms that do not implement it. Default off (transparent).
+     */
+    void setAntialias(bool on) noexcept { antialias_.store(on, std::memory_order_relaxed); }
+
+protected:
+    std::atomic<bool> antialias_ { false };
 };
 
 // -- SoftClip (tanh) ---------------------------------------------------------
 template <typename T>
 class TanhAlgorithm final : public SaturationAlgorithm<T>
 {
+    std::array<T, SaturationAlgorithm<T>::kAaCh> prevX_ {};
 public:
-    void prepare(const AudioSpec&) noexcept override {}
-    void reset() noexcept override {}
+    void prepare(const AudioSpec&) noexcept override { reset(); }
+    void reset() noexcept override { prevX_.fill(T(0)); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::SoftClip; }
 
-    inline T processSample(T sample, T drive, T character, int) noexcept
+    inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
         T x    = sample * drive;
         T bias = character * T(0.3);
-        return fastTanh(x + bias) - fastTanh(bias);
+        if (!this->antialias_.load(std::memory_order_relaxed))
+            return fastTanh(x + bias) - fastTanh(bias);
+
+        // ADAA of f(x) = tanh(x+bias) - tanh(bias); antiderivative log(cosh(x+bias)) - tanh(bias)*x.
+        int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
+        T x0 = prevX_[c];
+        prevX_[c] = x;
+        T tb = std::tanh(bias);
+        T dx = x - x0;
+        if (std::abs(dx) > T(1e-5))
+            return (logCosh(x + bias) - logCosh(x0 + bias)) / dx - tb;
+        return std::tanh(T(0.5) * (x + x0) + bias) - tb;
     }
 };
 
@@ -90,16 +123,33 @@ public:
 template <typename T>
 class TubeAlgorithm final : public SaturationAlgorithm<T>
 {
+    std::array<T, SaturationAlgorithm<T>::kAaCh> prevX_ {};
+
+    static inline T f1(T x, T asym) noexcept
+    {
+        return (x >= T(0)) ? logCosh(x) : logCosh(x * asym) / asym;
+    }
 public:
-    void prepare(const AudioSpec&) noexcept override {}
-    void reset() noexcept override {}
+    void prepare(const AudioSpec&) noexcept override { reset(); }
+    void reset() noexcept override { prevX_.fill(T(0)); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Tube; }
 
-    inline T processSample(T sample, T drive, T character, int) noexcept
+    inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
         T x = sample * drive;
         T asym = T(1.15) + character * T(0.5);
-        return (x >= T(0)) ? fastTanh(x) : fastTanh(x * asym);
+        if (!this->antialias_.load(std::memory_order_relaxed))
+            return (x >= T(0)) ? fastTanh(x) : fastTanh(x * asym);
+
+        // ADAA of the asymmetric triode curve; antiderivative is piecewise log(cosh).
+        int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
+        T x0 = prevX_[c];
+        prevX_[c] = x;
+        T dx = x - x0;
+        if (std::abs(dx) > T(1e-5))
+            return (f1(x, asym) - f1(x0, asym)) / dx;
+        T m = T(0.5) * (x + x0);
+        return (m >= T(0)) ? std::tanh(m) : std::tanh(m * asym);
     }
 };
 
@@ -107,17 +157,38 @@ public:
 template <typename T>
 class HardClipAlgorithm final : public SaturationAlgorithm<T>
 {
+    std::array<T, SaturationAlgorithm<T>::kAaCh> prevX_ {};
+
+    /** Antiderivative of clamp(u,-1,1): u²/2 inside, |u|-1/2 outside. */
+    static inline T g(T u) noexcept
+    {
+        T a = std::abs(u);
+        return (a <= T(1)) ? T(0.5) * u * u : a - T(0.5);
+    }
 public:
-    void prepare(const AudioSpec&) noexcept override {}
-    void reset() noexcept override {}
+    void prepare(const AudioSpec&) noexcept override { reset(); }
+    void reset() noexcept override { prevX_.fill(T(0)); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::HardClip; }
 
-    inline T processSample(T sample, T drive, T character, int) noexcept
+    inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
         T bias = character * T(0.3);
-        T x = sample * drive + bias;
-        T clipped = std::clamp(x, T(-1), T(1));
-        return clipped - std::clamp(bias, T(-1), T(1));
+        T cb = std::clamp(bias, T(-1), T(1));
+        T d = sample * drive;
+        if (!this->antialias_.load(std::memory_order_relaxed))
+            return std::clamp(d + bias, T(-1), T(1)) - cb;
+
+        // ADAA of the hard clip; antiderivative is the piecewise quadratic g().
+        int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
+        T d0 = prevX_[c];
+        prevX_[c] = d;
+        T u = d + bias, u0 = d0 + bias;
+        if (u >= T(-1) && u <= T(1) && u0 >= T(-1) && u0 <= T(1))
+            return u - cb;     // linear body (below the clip point): pass through, no averaging (no HF roll-off)
+        T dd = d - d0;
+        if (std::abs(dd) > T(1e-5))
+            return (g(u) - g(u0)) / dd - cb;
+        return std::clamp(T(0.5) * (d + d0) + bias, T(-1), T(1)) - cb;
     }
 };
 
@@ -179,12 +250,28 @@ public:
 template <typename T>
 class BitcrusherAlgorithm final : public SaturationAlgorithm<T>
 {
-    AnalogRandom::Generator<T> ditherGen_;
+    // Per-sample TPDF dither needs a true white PRNG. (The previous
+    // AnalogRandom-based source was a 1 Hz sample-and-hold: two consecutive
+    // reads were almost always identical, so the dither was effectively zero
+    // and the crusher truncated with audible quantisation distortion.)
+    uint32_t rngState_ = 0x9E3779B9u;
     T steps_ = T(1);
     T invSteps_ = T(1);
 
+    [[nodiscard]] inline T nextRandom() noexcept
+    {
+        rngState_ ^= rngState_ << 13;
+        rngState_ ^= rngState_ >> 17;
+        rngState_ ^= rngState_ << 5;
+        constexpr T scale = T(1) / static_cast<T>(0xFFFFFFFFu);
+        return static_cast<T>(rngState_) * scale - T(0.5);
+    }
+
 public:
-    void prepare(const AudioSpec& spec) noexcept override { ditherGen_.prepare(spec.sampleRate); }
+    void prepare(const AudioSpec&) noexcept override
+    {
+        if (rngState_ == 0) rngState_ = 1; // xorshift fixed point guard
+    }
     void reset() noexcept override {}
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Bitcrusher; }
 
@@ -198,7 +285,8 @@ public:
 
     inline T processSample(T sample, T, T, int) noexcept
     {
-        T dither = (ditherGen_.getNextSample() - ditherGen_.getNextSample()) * invSteps_;
+        // True TPDF: difference of two independent uniforms, +-1 LSB peak.
+        T dither = (nextRandom() - nextRandom()) * invSteps_;
         return invSteps_ * std::round((sample + dither) * steps_);
     }
 };
@@ -208,11 +296,13 @@ template <typename T>
 class TapeAlgorithm final : public SaturationAlgorithm<T>
 {
     static constexpr int kMaxCh = 16;
-    std::array<Biquad<T, 1>, kMaxCh> preFilters_;  
-    std::array<Biquad<T, 1>, kMaxCh> postFilters_; 
-    std::array<T, kMaxCh>            M_ {};        
-    std::array<T, kMaxCh>            lastH_ {};    
+    std::array<Biquad<T, 1>, kMaxCh> preFilters_;
+    std::array<Biquad<T, 1>, kMaxCh> postFilters_;
+    std::array<T, kMaxCh>            M_ {};
+    std::array<T, kMaxCh>            lastH_ {};
     int numChannels_ = 0;
+    T lastDrive_ = T(-1);
+    double lastSampleRate_ = 0.0;
 
     static inline T langevin(T x) noexcept
     {
@@ -246,6 +336,12 @@ public:
 
     void update(T drive, T /*character*/, const AudioSpec& spec) noexcept override
     {
+        // Both filters depend only on drive and sample rate; skip the
+        // trig-heavy redesign when neither changed since the last block.
+        if (drive == lastDrive_ && spec.sampleRate == lastSampleRate_) return;
+        lastDrive_ = drive;
+        lastSampleRate_ = spec.sampleRate;
+
         auto driveDb = gainToDecibels(drive, T(-100));
         T bumpGain = T(1.5) + std::min(driveDb * T(0.05), T(3.0));
         auto peakCoeffs = BiquadCoeffs<T>::makePeak(spec.sampleRate, 80.0, 0.6, static_cast<double>(bumpGain));
@@ -300,6 +396,7 @@ class TransformerAlgorithm final : public SaturationAlgorithm<T>
     static constexpr int kMaxCh = 16;
     std::array<Biquad<T, 1>, kMaxCh> lpFilters_;
     int numChannels_ = 0;
+    double lastSampleRate_ = 0.0;
 
 public:
     void prepare(const AudioSpec& spec) noexcept override
@@ -315,6 +412,11 @@ public:
 
     void update(T /*drive*/, T /*character*/, const AudioSpec& spec) noexcept override
     {
+        // The crossover is fixed at 250 Hz: only recompute when the effective
+        // sample rate changes (update() runs every block from the pipeline).
+        if (spec.sampleRate == lastSampleRate_) return;
+        lastSampleRate_ = spec.sampleRate;
+
         auto c = BiquadCoeffs<T>::makeLowPass(spec.sampleRate, 250.0, 0.707);
         for (int ch = 0; ch < numChannels_; ++ch)
             lpFilters_[ch].setCoeffs(c);
@@ -510,6 +612,7 @@ public:
 
         tempBuffer_.resize(spec.numChannels, spec.maxBlockSize * std::max(1, oversamplingFactor_));
         driftBuffer_.resize(spec.numChannels, spec.maxBlockSize * std::max(1, oversamplingFactor_));
+        msKeepBuffer_.resize(1, spec.maxBlockSize * std::max(1, oversamplingFactor_));
 
         // Keep the dry path aligned with the (latent) oversampled wet path so the
         // dry/wet, Delta and adaptive-blend mixes do not comb-filter.
@@ -531,6 +634,11 @@ public:
         rightDrift_.prepare(sr);
         leftDrift_.reseed(0x9E3779B97F4A7C15ULL);
         rightDrift_.reseed(0xBF58476D1CE4E5B9ULL);
+        // Smooth the random drift targets (~100 ms): without smoothing the
+        // generators step once per second, modulating the drive in audible
+        // jumps instead of an analog-style slow wander.
+        leftDrift_.setSmoothing(true, SampleType(100));
+        rightDrift_.setSmoothing(true, SampleType(100));
 
         reset();
         prepared_ = true;
@@ -619,18 +727,55 @@ public:
         const bool isMidSide = (procMode_ == ProcessingMode::MidOnly || procMode_ == ProcessingMode::SideOnly || procMode_ == ProcessingMode::MidSide) && buffer.getNumChannels() == 2;
         if (isMidSide) MidSide<SampleType>::encode(buffer);
 
+        // MidOnly / SideOnly: snapshot the channel that must stay UNPROCESSED
+        // and restore it after the saturation pipeline. The snapshot lives in
+        // the SAME domain the pipeline runs in (oversampled when OS is active),
+        // so the restored channel shares the wet path's half-band round-trip
+        // and group delay — perfectly time-aligned with the processed channel.
+        // (The old in-pipeline routing read the DryWetMixer's base-rate L/R
+        // capture from inside the oversampled loop: wrong domain AND an
+        // out-of-bounds read, caught by AddressSanitizer.)
+        const int keepChannel =
+            (isMidSide && procMode_ == ProcessingMode::MidOnly)  ? 1 :
+            (isMidSide && procMode_ == ProcessingMode::SideOnly) ? 0 : -1;
+
         if (oversamplingFactor_ > 1 && oversampler_)
         {
             auto upView = oversampler_->upsample(buffer);
+
+            const int upSamples = std::min(upView.getNumSamples(), msKeepBuffer_.getNumSamples());
+            if (keepChannel >= 0 && keepChannel < upView.getNumChannels() && upSamples > 0)
+                std::memcpy(msKeepBuffer_.getChannel(0), upView.getChannel(keepChannel),
+                            static_cast<std::size_t>(upSamples) * sizeof(SampleType));
+
             processSaturationPipeline(upView);
+
+            if (keepChannel >= 0 && keepChannel < upView.getNumChannels() && upSamples > 0)
+                std::memcpy(upView.getChannel(keepChannel), msKeepBuffer_.getChannel(0),
+                            static_cast<std::size_t>(upSamples) * sizeof(SampleType));
+
             oversampler_->downsample(buffer);
         }
         else
         {
+            const int baseSamples = std::min(buffer.getNumSamples(), msKeepBuffer_.getNumSamples());
+            if (keepChannel >= 0 && keepChannel < buffer.getNumChannels() && baseSamples > 0)
+                std::memcpy(msKeepBuffer_.getChannel(0), buffer.getChannel(keepChannel),
+                            static_cast<std::size_t>(baseSamples) * sizeof(SampleType));
+
             processSaturationPipeline(buffer);
+
+            if (keepChannel >= 0 && keepChannel < buffer.getNumChannels() && baseSamples > 0)
+                std::memcpy(buffer.getChannel(keepChannel), msKeepBuffer_.getChannel(0),
+                            static_cast<std::size_t>(baseSamples) * sizeof(SampleType));
         }
 
         if (isMidSide) MidSide<SampleType>::decode(buffer);
+
+        // Program-dependent adaptive blend, applied at BASE rate in the L/R
+        // domain where the latency-compensated dry capture is valid.
+        if (adaptiveBlend_.load(std::memory_order_relaxed))
+            applyAdaptiveBlend(buffer);
 
         // Post-filter
         {
@@ -767,6 +912,19 @@ public:
     void setAdaptiveBlend(bool on) noexcept { adaptiveBlend_.store(on, std::memory_order_relaxed); }
 
     /**
+     * @brief Enables antiderivative anti-aliasing (ADAA) on the memoryless curves
+     * (SoftClip / Tube / HardClip), which suppresses the aliasing the nonlinearity
+     * generates. Best combined with oversampling (ADAA + OS is the cleanest, per
+     * Parker/Zavalishin DAFx-16 and Bilbao et al. 2017). Off by default.
+     * @note Thread-Safe.
+     * @note First-order ADAA shifts the wet signal by half a sample. With a
+     * partial dry/wet mix this causes a very slight HF comb (< 0.2 dB below
+     * 10 kHz at 48 kHz) — inherent to the technique and far smaller than the
+     * aliasing it removes.
+     */
+    void setAntialiasing(bool on) noexcept { for (auto& a : pool_) if (a) a->setAntialias(on); }
+
+    /**
      * @brief Sets a derivative-based (slew rate) saturation multiplier.
      * @note Thread-Safe. Uses memory_order_relaxed atomic assignment.
      * @param amount Sensitivity multiplier. Range: [0.0 (off), 1.0 (max)].
@@ -813,6 +971,8 @@ public:
                 tempBuffer_.resize(spec_.numChannels, upBlock);
             if (driftBuffer_.getNumSamples() < upBlock)
                 driftBuffer_.resize(spec_.numChannels, upBlock);
+            if (msKeepBuffer_.getNumSamples() < upBlock)
+                msKeepBuffer_.resize(1, upBlock);
 
             dryWetMixer_.setLatencyCompensation(
                 (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0);
@@ -995,31 +1155,8 @@ protected:
             dispatchSaturator(primary, buffer, useDrift);
         }
 
-        // 4. Adaptive Blend
-        if (adaptiveBlend_.load(std::memory_order_relaxed))
-        {
-            for (int ch = 0; ch < nCh; ++ch) {
-                SampleType* wetData = buffer.getChannel(ch);
-                const SampleType* dryData = dryWetMixer_.getDryChannel(ch);
-                for (int i = 0; i < nS; ++i) {
-                    SampleType dry = dryData[i];
-                    SampleType wet = wetData[i];
-                    SampleType avg = (std::abs(prevBlendSample_[ch]) + std::abs(dry)) * SampleType(0.5);
-                    SampleType apply = std::clamp(avg, SampleType(0), SampleType(1));
-                    wetData[i] = dry * (SampleType(1) - apply) + wet * apply;
-                    prevBlendSample_[ch] = dry;
-                }
-            }
-        }
-
-        // M/S Routing
-        for (int ch = 0; ch < nCh; ++ch) {
-            if ((procMode_ == ProcessingMode::MidOnly && ch == 1) || (procMode_ == ProcessingMode::SideOnly && ch == 0)) {
-                SampleType* wetData = buffer.getChannel(ch);
-                const SampleType* dryData = dryWetMixer_.getDryChannel(ch);
-                std::memcpy(wetData, dryData, static_cast<std::size_t>(nS) * sizeof(SampleType));
-            }
-        }
+        // (Adaptive blend and the MidOnly/SideOnly channel passthrough run at
+        //  BASE rate in process() — see the snapshot/restore logic there.)
 
         // Gain Reduction Tracking
         SampleType peakOut = SampleType(0);
@@ -1034,6 +1171,32 @@ protected:
             gainReductionDb_.store(gainToDecibels(ratio, SampleType(-100)), std::memory_order_relaxed);
         } else {
             gainReductionDb_.store(SampleType(0), std::memory_order_relaxed);
+        }
+    }
+
+    /** @brief Program-dependent dry/wet density blend (base rate, L/R domain).
+     *  The dry reference is the DryWetMixer capture, which carries the same
+     *  latency compensation as the wet path — no comb filtering. */
+    void applyAdaptiveBlend(AudioBufferView<SampleType> buffer) noexcept
+    {
+        const int nCh = std::min({ buffer.getNumChannels(),
+                                   dryWetMixer_.getDryNumChannels(), kMaxCh });
+        const int nS  = std::min(buffer.getNumSamples(),
+                                 dryWetMixer_.getDryCapturedSamples());
+
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            SampleType* wetData = buffer.getChannel(ch);
+            const SampleType* dryData = dryWetMixer_.getDryChannel(ch);
+            for (int i = 0; i < nS; ++i)
+            {
+                SampleType dry = dryData[i];
+                SampleType wet = wetData[i];
+                SampleType avg = (std::abs(prevBlendSample_[ch]) + std::abs(dry)) * SampleType(0.5);
+                SampleType apply = std::clamp(avg, SampleType(0), SampleType(1));
+                wetData[i] = dry * (SampleType(1) - apply) + wet * apply;
+                prevBlendSample_[ch] = dry;
+            }
         }
     }
 
@@ -1127,6 +1290,7 @@ protected:
 
     AudioBuffer<SampleType> tempBuffer_;
     AudioBuffer<SampleType> driftBuffer_;
+    AudioBuffer<SampleType> msKeepBuffer_;  ///< MidOnly/SideOnly channel snapshot.
 
     std::unique_ptr<Oversampling<SampleType>> oversampler_;
     int oversamplingFactor_ = 1;

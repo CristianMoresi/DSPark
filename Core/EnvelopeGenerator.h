@@ -86,12 +86,31 @@ public:
     }
 
     /**
-     * @brief Sets the curvature of the exponential stages.
+     * @brief Sets the curvature of all exponential stages at once.
      * @param curve Curvature factor (default: 3.0, range: 0.1 to 10.0).
      */
     void setCurvature(T curve) noexcept
     {
-        curvature_ = std::clamp(curve, T(0.1), T(10));
+        curve = std::clamp(curve, T(0.1), T(10));
+        attackCurve_ = decayCurve_ = releaseCurve_ = curve;
+        recalculate();
+    }
+
+    /**
+     * @brief Sets independent curvatures per stage.
+     *
+     * Classic analog envelopes shape each stage differently (near-linear
+     * attack, strongly exponential release). Higher values = more curved.
+     *
+     * @param attackCurve  Attack curvature (0.1 to 10.0; low = near-linear).
+     * @param decayCurve   Decay curvature.
+     * @param releaseCurve Release curvature.
+     */
+    void setCurvature(T attackCurve, T decayCurve, T releaseCurve) noexcept
+    {
+        attackCurve_  = std::clamp(attackCurve,  T(0.1), T(10));
+        decayCurve_   = std::clamp(decayCurve,   T(0.1), T(10));
+        releaseCurve_ = std::clamp(releaseCurve, T(0.1), T(10));
         recalculate();
     }
 
@@ -131,7 +150,7 @@ public:
                 return T(0);
 
             case State::Attack:
-                currentValue_ += attackRate_ * (T(1) + targetOvershoot_ - currentValue_);
+                currentValue_ += attackRate_ * (T(1) + attackOvershoot_ - currentValue_);
                 if (currentValue_ >= T(1))
                 {
                     currentValue_ = T(1);
@@ -140,7 +159,7 @@ public:
                 break;
 
             case State::Decay:
-                currentValue_ += decayRate_ * (sustainLevel_ - targetOvershoot_ - currentValue_);
+                currentValue_ += decayRate_ * (sustainLevel_ - decayOvershoot_ - currentValue_);
                 // Modulating sustain upwards safety check: if we drop below OR cross the new threshold
                 if (currentValue_ <= sustainLevel_)
                 {
@@ -155,7 +174,7 @@ public:
                 break;
 
             case State::Release:
-                currentValue_ += releaseRate_ * (T(0) - targetOvershoot_ - currentValue_);
+                currentValue_ += releaseRate_ * (T(0) - releaseOvershoot_ - currentValue_);
                 if (currentValue_ <= T(0.0001))
                 {
                     currentValue_ = T(0);
@@ -203,17 +222,20 @@ public:
 private:
     void recalculate() noexcept
     {
-        // Standardize overshoot so timings are mathematically consistent across all stages
-        targetOvershoot_ = std::exp(-curvature_);
+        // Per-stage overshoot keeps timings mathematically consistent for each
+        // stage's own curvature (overshoot = exp(-curve)).
+        attackOvershoot_  = std::exp(-attackCurve_);
+        decayOvershoot_   = std::exp(-decayCurve_);
+        releaseOvershoot_ = std::exp(-releaseCurve_);
 
-        auto calcRate = [this](T timeMs) -> T {
+        auto calcRate = [this](T timeMs, T curve) -> T {
             T samples = std::max(sampleRateMs_ * timeMs, T(1));
-            return T(1) - std::exp(-curvature_ / samples);
+            return T(1) - std::exp(-curve / samples);
         };
 
-        attackRate_  = calcRate(attackMs_);
-        decayRate_   = calcRate(decayMs_);
-        releaseRate_ = calcRate(releaseMs_);
+        attackRate_  = calcRate(attackMs_,  attackCurve_);
+        decayRate_   = calcRate(decayMs_,   decayCurve_);
+        releaseRate_ = calcRate(releaseMs_, releaseCurve_);
     }
 
     double sampleRate_ = 48000.0;
@@ -223,12 +245,16 @@ private:
     T decayMs_      = T(100);
     T sustainLevel_ = T(0.7);
     T releaseMs_    = T(200);
-    T curvature_    = T(3.0);
+    T attackCurve_  = T(3.0);
+    T decayCurve_   = T(3.0);
+    T releaseCurve_ = T(3.0);
 
     T attackRate_   = T(0);
     T decayRate_    = T(0);
     T releaseRate_  = T(0);
-    T targetOvershoot_ = T(0.05); // Derived from curvature
+    T attackOvershoot_  = T(0.05); // Derived from per-stage curvature
+    T decayOvershoot_   = T(0.05);
+    T releaseOvershoot_ = T(0.05);
 
     T currentValue_ = T(0);
     State state_ = State::Idle;

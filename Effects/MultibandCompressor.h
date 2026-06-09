@@ -102,18 +102,9 @@ public:
             // Base copy (band 0)
             std::copy(src0, src0 + nS, out);
 
-            // Accumulate remaining active bands
+            // Accumulate remaining active bands (SIMD add)
             for (int b = 1; b < nb; ++b)
-            {
-                const T* const __restrict src = bandBuffers_[b].getChannel(ch);
-                
-                // Explicit auto-vectorization hint pattern
-                #pragma omp simd
-                for (int i = 0; i < nS; ++i)
-                {
-                    out[i] += src[i];
-                }
-            }
+                simd::add(out, bandBuffers_[b].getChannel(ch), nS);
         }
     }
 
@@ -122,11 +113,12 @@ public:
     /**
      * @brief Sets the number of active frequency bands.
      * @warning Must not be called concurrently with processBlock() unless external locking is used.
-     * @param n Number of bands (clamped between 1 and MaxBands).
+     * @param n Number of bands (clamped between 2 and MaxBands — a crossover
+     *          needs at least one split point).
      */
-    void setNumBands(int n) noexcept 
-    { 
-        crossover_.setNumBands(std::clamp(n, 1, MaxBands)); 
+    void setNumBands(int n) noexcept
+    {
+        crossover_.setNumBands(std::clamp(n, 2, MaxBands));
     }
 
     /**

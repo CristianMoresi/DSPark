@@ -110,7 +110,23 @@ inline void addWithGain(float* DSPARK_RESTRICT dst, const float* DSPARK_RESTRICT
 /** @brief Double overload */
 inline void addWithGain(double* DSPARK_RESTRICT dst, const double* DSPARK_RESTRICT src, double gain, int count) noexcept
 {
-#if defined(DSPARK_SIMD_SSE2)
+#if defined(DSPARK_SIMD_AVX)
+    const __m256d vGain = _mm256_set1_pd(gain);
+    int i = 0;
+    for (; i + 3 < count; i += 4)
+    {
+        __m256d vDst = _mm256_loadu_pd(dst + i);
+        __m256d vSrc = _mm256_loadu_pd(src + i);
+
+        #if defined(DSPARK_SIMD_FMA)
+            _mm256_storeu_pd(dst + i, _mm256_fmadd_pd(vSrc, vGain, vDst));
+        #else
+            _mm256_storeu_pd(dst + i, _mm256_add_pd(vDst, _mm256_mul_pd(vSrc, vGain)));
+        #endif
+    }
+    for (; i < count; ++i) dst[i] += src[i] * gain;
+
+#elif defined(DSPARK_SIMD_SSE2)
     const __m128d vGain = _mm_set1_pd(gain);
     int i = 0;
     for (; i + 1 < count; i += 2)
@@ -177,7 +193,14 @@ inline void applyGain(float* DSPARK_RESTRICT data, float gain, int count) noexce
 /** @brief Double overload. */
 inline void applyGain(double* DSPARK_RESTRICT data, double gain, int count) noexcept
 {
-#if defined(DSPARK_SIMD_SSE2)
+#if defined(DSPARK_SIMD_AVX)
+    const __m256d vGain = _mm256_set1_pd(gain);
+    int i = 0;
+    for (; i + 3 < count; i += 4)
+        _mm256_storeu_pd(data + i, _mm256_mul_pd(_mm256_loadu_pd(data + i), vGain));
+    for (; i < count; ++i) data[i] *= gain;
+
+#elif defined(DSPARK_SIMD_SSE2)
     const __m128d vGain = _mm_set1_pd(gain);
     int i = 0;
     for (; i + 1 < count; i += 2)
@@ -278,7 +301,25 @@ inline float peakLevel(const float* DSPARK_RESTRICT data, int count) noexcept
 /** @brief Double overload. */
 inline double peakLevel(const double* DSPARK_RESTRICT data, int count) noexcept
 {
-#if defined(DSPARK_SIMD_SSE2)
+#if defined(DSPARK_SIMD_AVX)
+    const __m256d absMask = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7FFFFFFFFFFFFFFFll));
+    __m256d vMax = _mm256_setzero_pd();
+    int i = 0;
+    for (; i + 3 < count; i += 4)
+        vMax = _mm256_max_pd(vMax, _mm256_and_pd(_mm256_loadu_pd(data + i), absMask));
+    __m128d lo = _mm256_castpd256_pd128(vMax);
+    __m128d hi = _mm256_extractf128_pd(vMax, 1);
+    __m128d m2 = _mm_max_pd(lo, hi);
+    double peak = _mm_cvtsd_f64(_mm_max_sd(m2, _mm_unpackhi_pd(m2, m2)));
+
+    for (; i < count; ++i)
+    {
+        double a = data[i] < 0.0 ? -data[i] : data[i];
+        if (a > peak) peak = a;
+    }
+    return peak;
+
+#elif defined(DSPARK_SIMD_SSE2)
     const __m128d absMask = _mm_castsi128_pd(_mm_set_epi64x(
         static_cast<int64_t>(0x7FFFFFFFFFFFFFFF),
         static_cast<int64_t>(0x7FFFFFFFFFFFFFFF)));
@@ -321,19 +362,36 @@ inline double peakLevel(const double* DSPARK_RESTRICT data, int count) noexcept
 inline float dotProduct(const float* DSPARK_RESTRICT a, const float* DSPARK_RESTRICT b, int count) noexcept
 {
 #if defined(DSPARK_SIMD_AVX)
-    __m256 vSum = _mm256_setzero_ps();
+    // Four independent accumulators break the FMA latency chain (4-5 cycles),
+    // letting long FIR kernels run at full multiply throughput (~2-4x faster).
+    __m256 vSum0 = _mm256_setzero_ps();
+    __m256 vSum1 = _mm256_setzero_ps();
+    __m256 vSum2 = _mm256_setzero_ps();
+    __m256 vSum3 = _mm256_setzero_ps();
     int i = 0;
-    for (; i + 7 < count; i += 8)
+    for (; i + 31 < count; i += 32)
     {
-        __m256 va = _mm256_loadu_ps(a + i);
-        __m256 vb = _mm256_loadu_ps(b + i);
-        
         #if defined(DSPARK_SIMD_FMA)
-            vSum = _mm256_fmadd_ps(va, vb, vSum);
+            vSum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      vSum0);
+            vSum1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  vSum1);
+            vSum2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), vSum2);
+            vSum3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), vSum3);
         #else
-            vSum = _mm256_add_ps(vSum, _mm256_mul_ps(va, vb));
+            vSum0 = _mm256_add_ps(vSum0, _mm256_mul_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i)));
+            vSum1 = _mm256_add_ps(vSum1, _mm256_mul_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8)));
+            vSum2 = _mm256_add_ps(vSum2, _mm256_mul_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16)));
+            vSum3 = _mm256_add_ps(vSum3, _mm256_mul_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24)));
         #endif
     }
+    for (; i + 7 < count; i += 8)
+    {
+        #if defined(DSPARK_SIMD_FMA)
+            vSum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), vSum0);
+        #else
+            vSum0 = _mm256_add_ps(vSum0, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+        #endif
+    }
+    __m256 vSum = _mm256_add_ps(_mm256_add_ps(vSum0, vSum1), _mm256_add_ps(vSum2, vSum3));
     __m128 hi = _mm256_extractf128_ps(vSum, 1);
     __m128 lo = _mm256_castps256_ps128(vSum);
     __m128 sum4 = _mm_add_ps(lo, hi);
@@ -341,42 +399,53 @@ inline float dotProduct(const float* DSPARK_RESTRICT a, const float* DSPARK_REST
     __m128 sum2 = _mm_add_ps(sum4, shuf);
     __m128 sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 1));
     float sum = _mm_cvtss_f32(sum1);
-    
+
     for (; i < count; ++i) sum += a[i] * b[i];
     return sum;
 
 #elif defined(DSPARK_SIMD_SSE2)
-    __m128 vSum = _mm_setzero_ps();
+    // Two accumulators hide the add/FMA latency on SSE-class hardware.
+    __m128 vSum0 = _mm_setzero_ps();
+    __m128 vSum1 = _mm_setzero_ps();
     int i = 0;
+    for (; i + 7 < count; i += 8)
+    {
+        #if defined(DSPARK_SIMD_FMA)
+            vSum0 = _mm_fmadd_ps(_mm_loadu_ps(a + i),     _mm_loadu_ps(b + i),     vSum0);
+            vSum1 = _mm_fmadd_ps(_mm_loadu_ps(a + i + 4), _mm_loadu_ps(b + i + 4), vSum1);
+        #else
+            vSum0 = _mm_add_ps(vSum0, _mm_mul_ps(_mm_loadu_ps(a + i),     _mm_loadu_ps(b + i)));
+            vSum1 = _mm_add_ps(vSum1, _mm_mul_ps(_mm_loadu_ps(a + i + 4), _mm_loadu_ps(b + i + 4)));
+        #endif
+    }
     for (; i + 3 < count; i += 4)
     {
-        __m128 va = _mm_loadu_ps(a + i);
-        __m128 vb = _mm_loadu_ps(b + i);
-        
         #if defined(DSPARK_SIMD_FMA)
-            vSum = _mm_fmadd_ps(va, vb, vSum);
+            vSum0 = _mm_fmadd_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i), vSum0);
         #else
-            vSum = _mm_add_ps(vSum, _mm_mul_ps(va, vb));
+            vSum0 = _mm_add_ps(vSum0, _mm_mul_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i)));
         #endif
     }
     alignas(16) float tmp[4];
-    _mm_store_ps(tmp, vSum);
+    _mm_store_ps(tmp, _mm_add_ps(vSum0, vSum1));
     float sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
-    
+
     for (; i < count; ++i) sum += a[i] * b[i];
     return sum;
 
 #elif defined(DSPARK_SIMD_NEON)
-    float32x4_t vSum = vdupq_n_f32(0.0f);
+    float32x4_t vSum0 = vdupq_n_f32(0.0f);
+    float32x4_t vSum1 = vdupq_n_f32(0.0f);
     int i = 0;
-    for (; i + 3 < count; i += 4)
+    for (; i + 7 < count; i += 8)
     {
-        float32x4_t va = vld1q_f32(a + i);
-        float32x4_t vb = vld1q_f32(b + i);
-        vSum = vmlaq_f32(vSum, va, vb);
+        vSum0 = vmlaq_f32(vSum0, vld1q_f32(a + i),     vld1q_f32(b + i));
+        vSum1 = vmlaq_f32(vSum1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
     }
-    float sum = vaddvq_f32(vSum);
-    
+    for (; i + 3 < count; i += 4)
+        vSum0 = vmlaq_f32(vSum0, vld1q_f32(a + i), vld1q_f32(b + i));
+    float sum = vaddvq_f32(vaddq_f32(vSum0, vSum1));
+
     for (; i < count; ++i) sum += a[i] * b[i];
     return sum;
 
@@ -390,24 +459,63 @@ inline float dotProduct(const float* DSPARK_RESTRICT a, const float* DSPARK_REST
 /** @brief Double overload. */
 inline double dotProduct(const double* DSPARK_RESTRICT a, const double* DSPARK_RESTRICT b, int count) noexcept
 {
-#if defined(DSPARK_SIMD_SSE2)
-    __m128d vSum = _mm_setzero_pd();
+#if defined(DSPARK_SIMD_AVX)
+    __m256d vSum0 = _mm256_setzero_pd();
+    __m256d vSum1 = _mm256_setzero_pd();
     int i = 0;
-    for (; i + 1 < count; i += 2)
+    for (; i + 7 < count; i += 8)
     {
-        __m128d va = _mm_loadu_pd(a + i);
-        __m128d vb = _mm_loadu_pd(b + i);
-        
         #if defined(DSPARK_SIMD_FMA)
-            vSum = _mm_fmadd_pd(va, vb, vSum);
+            vSum0 = _mm256_fmadd_pd(_mm256_loadu_pd(a + i),     _mm256_loadu_pd(b + i),     vSum0);
+            vSum1 = _mm256_fmadd_pd(_mm256_loadu_pd(a + i + 4), _mm256_loadu_pd(b + i + 4), vSum1);
         #else
-            vSum = _mm_add_pd(vSum, _mm_mul_pd(va, vb));
+            vSum0 = _mm256_add_pd(vSum0, _mm256_mul_pd(_mm256_loadu_pd(a + i),     _mm256_loadu_pd(b + i)));
+            vSum1 = _mm256_add_pd(vSum1, _mm256_mul_pd(_mm256_loadu_pd(a + i + 4), _mm256_loadu_pd(b + i + 4)));
         #endif
     }
+    for (; i + 3 < count; i += 4)
+    {
+        #if defined(DSPARK_SIMD_FMA)
+            vSum0 = _mm256_fmadd_pd(_mm256_loadu_pd(a + i), _mm256_loadu_pd(b + i), vSum0);
+        #else
+            vSum0 = _mm256_add_pd(vSum0, _mm256_mul_pd(_mm256_loadu_pd(a + i), _mm256_loadu_pd(b + i)));
+        #endif
+    }
+    __m256d vSum = _mm256_add_pd(vSum0, vSum1);
+    __m128d lo = _mm256_castpd256_pd128(vSum);
+    __m128d hi = _mm256_extractf128_pd(vSum, 1);
+    __m128d s2 = _mm_add_pd(lo, hi);
+    double sum = _mm_cvtsd_f64(_mm_add_sd(s2, _mm_unpackhi_pd(s2, s2)));
+
+    for (; i < count; ++i) sum += a[i] * b[i];
+    return sum;
+
+#elif defined(DSPARK_SIMD_SSE2)
+    __m128d vSum0 = _mm_setzero_pd();
+    __m128d vSum1 = _mm_setzero_pd();
+    int i = 0;
+    for (; i + 3 < count; i += 4)
+    {
+        #if defined(DSPARK_SIMD_FMA)
+            vSum0 = _mm_fmadd_pd(_mm_loadu_pd(a + i),     _mm_loadu_pd(b + i),     vSum0);
+            vSum1 = _mm_fmadd_pd(_mm_loadu_pd(a + i + 2), _mm_loadu_pd(b + i + 2), vSum1);
+        #else
+            vSum0 = _mm_add_pd(vSum0, _mm_mul_pd(_mm_loadu_pd(a + i),     _mm_loadu_pd(b + i)));
+            vSum1 = _mm_add_pd(vSum1, _mm_mul_pd(_mm_loadu_pd(a + i + 2), _mm_loadu_pd(b + i + 2)));
+        #endif
+    }
+    for (; i + 1 < count; i += 2)
+    {
+        #if defined(DSPARK_SIMD_FMA)
+            vSum0 = _mm_fmadd_pd(_mm_loadu_pd(a + i), _mm_loadu_pd(b + i), vSum0);
+        #else
+            vSum0 = _mm_add_pd(vSum0, _mm_mul_pd(_mm_loadu_pd(a + i), _mm_loadu_pd(b + i)));
+        #endif
+    }
+    __m128d vSum = _mm_add_pd(vSum0, vSum1);
     __m128d hi = _mm_unpackhi_pd(vSum, vSum);
-    __m128d s = _mm_add_sd(vSum, hi);
-    double sum = _mm_cvtsd_f64(s);
-    
+    double sum = _mm_cvtsd_f64(_mm_add_sd(vSum, hi));
+
     for (; i < count; ++i) sum += a[i] * b[i];
     return sum;
 #else
@@ -464,7 +572,13 @@ inline void add(float* DSPARK_RESTRICT dst, const float* DSPARK_RESTRICT src, in
 /** @brief Double overload. */
 inline void add(double* DSPARK_RESTRICT dst, const double* DSPARK_RESTRICT src, int count) noexcept
 {
-#if defined(DSPARK_SIMD_SSE2)
+#if defined(DSPARK_SIMD_AVX)
+    int i = 0;
+    for (; i + 3 < count; i += 4)
+        _mm256_storeu_pd(dst + i, _mm256_add_pd(_mm256_loadu_pd(dst + i), _mm256_loadu_pd(src + i)));
+    for (; i < count; ++i) dst[i] += src[i];
+
+#elif defined(DSPARK_SIMD_SSE2)
     int i = 0;
     for (; i + 1 < count; i += 2)
     {
@@ -476,6 +590,117 @@ inline void add(double* DSPARK_RESTRICT dst, const double* DSPARK_RESTRICT src, 
 #else
     for (int i = 0; i < count; ++i) dst[i] += src[i];
 #endif
+}
+
+// ============================================================================
+// multiply -- dst[i] = a[i] * b[i]
+// ============================================================================
+
+/** @brief Element-wise product of two buffers into a destination. */
+inline void multiply(float* DSPARK_RESTRICT dst, const float* DSPARK_RESTRICT a, const float* DSPARK_RESTRICT b, int count) noexcept
+{
+#if defined(DSPARK_SIMD_AVX)
+    int i = 0;
+    for (; i + 7 < count; i += 8)
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+    for (; i < count; ++i) dst[i] = a[i] * b[i];
+#elif defined(DSPARK_SIMD_SSE2)
+    int i = 0;
+    for (; i + 3 < count; i += 4)
+        _mm_storeu_ps(dst + i, _mm_mul_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i)));
+    for (; i < count; ++i) dst[i] = a[i] * b[i];
+#elif defined(DSPARK_SIMD_NEON)
+    int i = 0;
+    for (; i + 3 < count; i += 4)
+        vst1q_f32(dst + i, vmulq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
+    for (; i < count; ++i) dst[i] = a[i] * b[i];
+#else
+    for (int i = 0; i < count; ++i) dst[i] = a[i] * b[i];
+#endif
+}
+
+/** @brief Double overload. */
+inline void multiply(double* DSPARK_RESTRICT dst, const double* DSPARK_RESTRICT a, const double* DSPARK_RESTRICT b, int count) noexcept
+{
+#if defined(DSPARK_SIMD_AVX)
+    int i = 0;
+    for (; i + 3 < count; i += 4)
+        _mm256_storeu_pd(dst + i, _mm256_mul_pd(_mm256_loadu_pd(a + i), _mm256_loadu_pd(b + i)));
+    for (; i < count; ++i) dst[i] = a[i] * b[i];
+#elif defined(DSPARK_SIMD_SSE2)
+    int i = 0;
+    for (; i + 1 < count; i += 2)
+        _mm_storeu_pd(dst + i, _mm_mul_pd(_mm_loadu_pd(a + i), _mm_loadu_pd(b + i)));
+    for (; i < count; ++i) dst[i] = a[i] * b[i];
+#else
+    for (int i = 0; i < count; ++i) dst[i] = a[i] * b[i];
+#endif
+}
+
+// ============================================================================
+// copyWithGain -- dst[i] = src[i] * gain
+// ============================================================================
+
+/** @brief Copies a buffer applying a gain factor (out-of-place). */
+inline void copyWithGain(float* DSPARK_RESTRICT dst, const float* DSPARK_RESTRICT src, float gain, int count) noexcept
+{
+#if defined(DSPARK_SIMD_AVX)
+    const __m256 vGain = _mm256_set1_ps(gain);
+    int i = 0;
+    for (; i + 7 < count; i += 8)
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_loadu_ps(src + i), vGain));
+    for (; i < count; ++i) dst[i] = src[i] * gain;
+#elif defined(DSPARK_SIMD_SSE2)
+    const __m128 vGain = _mm_set1_ps(gain);
+    int i = 0;
+    for (; i + 3 < count; i += 4)
+        _mm_storeu_ps(dst + i, _mm_mul_ps(_mm_loadu_ps(src + i), vGain));
+    for (; i < count; ++i) dst[i] = src[i] * gain;
+#elif defined(DSPARK_SIMD_NEON)
+    const float32x4_t vGain = vdupq_n_f32(gain);
+    int i = 0;
+    for (; i + 3 < count; i += 4)
+        vst1q_f32(dst + i, vmulq_f32(vld1q_f32(src + i), vGain));
+    for (; i < count; ++i) dst[i] = src[i] * gain;
+#else
+    for (int i = 0; i < count; ++i) dst[i] = src[i] * gain;
+#endif
+}
+
+/** @brief Double overload. */
+inline void copyWithGain(double* DSPARK_RESTRICT dst, const double* DSPARK_RESTRICT src, double gain, int count) noexcept
+{
+#if defined(DSPARK_SIMD_AVX)
+    const __m256d vGain = _mm256_set1_pd(gain);
+    int i = 0;
+    for (; i + 3 < count; i += 4)
+        _mm256_storeu_pd(dst + i, _mm256_mul_pd(_mm256_loadu_pd(src + i), vGain));
+    for (; i < count; ++i) dst[i] = src[i] * gain;
+#elif defined(DSPARK_SIMD_SSE2)
+    const __m128d vGain = _mm_set1_pd(gain);
+    int i = 0;
+    for (; i + 1 < count; i += 2)
+        _mm_storeu_pd(dst + i, _mm_mul_pd(_mm_loadu_pd(src + i), vGain));
+    for (; i < count; ++i) dst[i] = src[i] * gain;
+#else
+    for (int i = 0; i < count; ++i) dst[i] = src[i] * gain;
+#endif
+}
+
+// ============================================================================
+// sumOfSquares -- sum(data[i]^2)   (RMS / energy metering)
+// ============================================================================
+
+/** @brief Returns the sum of squared samples (energy). */
+inline float sumOfSquares(const float* DSPARK_RESTRICT data, int count) noexcept
+{
+    return dotProduct(data, data, count);
+}
+
+/** @brief Double overload. */
+inline double sumOfSquares(const double* DSPARK_RESTRICT data, int count) noexcept
+{
+    return dotProduct(data, data, count);
 }
 
 // ============================================================================
@@ -515,6 +740,27 @@ void addT(T* DSPARK_RESTRICT dst, const T* DSPARK_RESTRICT src, int count) noexc
 {
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
     add(dst, src, count);
+}
+
+template <typename T>
+void multiplyT(T* DSPARK_RESTRICT dst, const T* DSPARK_RESTRICT a, const T* DSPARK_RESTRICT b, int count) noexcept
+{
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
+    multiply(dst, a, b, count);
+}
+
+template <typename T>
+void copyWithGainT(T* DSPARK_RESTRICT dst, const T* DSPARK_RESTRICT src, T gain, int count) noexcept
+{
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
+    copyWithGain(dst, src, gain, count);
+}
+
+template <typename T>
+T sumOfSquaresT(const T* DSPARK_RESTRICT data, int count) noexcept
+{
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
+    return sumOfSquares(data, count);
 }
 
 } // namespace simd

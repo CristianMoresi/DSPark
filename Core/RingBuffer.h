@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 
 namespace dspark {
@@ -121,13 +122,37 @@ public:
 
     /**
      * @brief Pushes a block of samples into the buffer.
+     *
+     * Copies in at most two contiguous memcpy spans (pre-wrap / post-wrap)
+     * with a single write-position update — several times faster than a
+     * per-sample push loop for block-based delays.
+     *
      * @param samples Source buffer.
      * @param numSamples Number of samples to push.
      */
     void pushBlock(const T* samples, int numSamples) noexcept
     {
-        for (int i = 0; i < numSamples; ++i)
-            push(samples[i]);
+        if (capacity_ == 0 || numSamples <= 0) [[unlikely]] return;
+
+        if (numSamples >= capacity_)
+        {
+            // Only the trailing capacity_ samples survive a full overwrite.
+            samples += numSamples - capacity_;
+            std::memcpy(buffer_.get(), samples, static_cast<size_t>(capacity_) * sizeof(T));
+            writePos_ = 0;
+            return;
+        }
+
+        const int firstSpan = std::min(numSamples, capacity_ - writePos_);
+        std::memcpy(buffer_.get() + writePos_, samples,
+                    static_cast<size_t>(firstSpan) * sizeof(T));
+
+        const int remaining = numSamples - firstSpan;
+        if (remaining > 0)
+            std::memcpy(buffer_.get(), samples + firstSpan,
+                        static_cast<size_t>(remaining) * sizeof(T));
+
+        writePos_ = (writePos_ + numSamples) & mask_;
     }
 
     /**

@@ -1067,6 +1067,173 @@ inline EffectSlot makeConvolutionReverb()
     return s;
 }
 
+// =============================================================================
+// ANALOG (physical models)
+// =============================================================================
+
+inline EffectSlot makeTapeMachine()
+{
+    auto p = std::make_shared<dspark::TapeMachine<float>>();
+    EffectSlot s;
+    s.name = "Tape Machine"; s.category = "Analog";
+    s.addSlider("Drive", -12, 24, 0, "dB");
+    s.addSlider("Bias", 0, 1, 0.5f, "");
+    s.addChoice("Speed", {"7.5 ips","15 ips","30 ips"}, 1);
+    s.addChoice("Standard", {"NAB","CCIR"}, 0);
+    s.addSlider("Loss", 0, 1, 0.5f, "");
+    s.addSlider("Head Bump", 0, 1, 0.5f, "");
+    s.addSlider("Wow/Flutter", 0, 1, 0.15f, "");
+    s.addSlider("Mix", 0, 1, 1, "");
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p](int i, float v) {
+        using TM = dspark::TapeMachine<float>;
+        switch (i) {
+            case 0: p->setDrive(v); break;
+            case 1: p->setBias(v); break;
+            case 2: p->setSpeed(static_cast<TM::Speed>(static_cast<int>(v))); break;
+            case 3: p->setStandard(static_cast<TM::Standard>(static_cast<int>(v))); break;
+            case 4: p->setLossEffects(v); break;
+            case 5: p->setHeadBump(v); break;
+            case 6: p->setWowFlutter(v); break;
+            case 7: p->setMix(v); break;
+        }
+    };
+    return s;
+}
+
+inline EffectSlot makeTubePreamp()
+{
+    auto p = std::make_shared<dspark::TubePreamp<float>>();
+    EffectSlot s;
+    s.name = "Tube Preamp"; s.category = "Analog";
+    s.addSlider("Drive", -12, 36, 0, "dB");
+    s.addChoice("Stages", {"1 (clean)","2 (crunch)","3 (lead)"}, 0);
+    s.addSlider("Treble", 0, 1, 0.5f, "");
+    s.addSlider("Middle", 0, 1, 0.5f, "");
+    s.addSlider("Bass", 0, 1, 0.5f, "");
+    s.addSlider("Sag", 0, 1, 0.3f, "");
+    s.addSlider("Output", -24, 12, 0, "dB");
+    s.addSlider("Mix", 0, 1, 1, "");
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p](int i, float v) {
+        switch (i) {
+            case 0: p->setDrive(v); break;
+            case 1: p->setStages(static_cast<int>(v) + 1); break;
+            case 2: p->setTreble(v); break;
+            case 3: p->setMiddle(v); break;
+            case 4: p->setBass(v); break;
+            case 5: p->setSag(v); break;
+            case 6: p->setOutput(v); break;
+            case 7: p->setMix(v); break;
+        }
+    };
+    return s;
+}
+
+inline EffectSlot makeTransformerModel()
+{
+    auto p = std::make_shared<dspark::TransformerModel<float>>();
+    EffectSlot s;
+    s.name = "Transformer"; s.category = "Analog";
+    s.addSlider("Drive", -12, 24, 0, "dB");
+    s.addSlider("Core Size", 0, 1, 0.5f, "");
+    s.addSlider("Resonance", 0, 1, 0.3f, "");
+    s.addSlider("Mix", 0, 1, 1, "");
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p](int i, float v) {
+        switch (i) {
+            case 0: p->setDrive(v); break;
+            case 1: p->setCoreSize(v); break;
+            case 2: p->setResonance(v); break;
+            case 3: p->setMix(v); break;
+        }
+    };
+    return s;
+}
+
+// =============================================================================
+// PITCH & TEXTURE
+// =============================================================================
+
+inline EffectSlot makePitchShifter()
+{
+    auto p = std::make_shared<dspark::PitchShifter<float>>();
+    EffectSlot s;
+    s.name = "Pitch Shifter"; s.category = "Pitch";
+    s.addSlider("Semitones", -12, 12, 0, "st");
+    s.addSlider("Mix", 0, 1, 1, "");
+    s.addToggle("Transient Preserve", true);
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p](int i, float v) {
+        switch (i) {
+            case 0: p->setSemitones(v); break;
+            case 1: p->setMix(v); break;
+            case 2: p->setTransientPreserve(v > 0.5f); break;
+        }
+    };
+    return s;
+}
+
+inline EffectSlot makeGranularProcessor()
+{
+    auto p = std::make_shared<dspark::GranularProcessor<float>>();
+    EffectSlot s;
+    s.name = "Granular"; s.category = "Pitch";
+    s.addSlider("Grain Size", 10, 500, 80, "ms", true);
+    s.addSlider("Density", 1, 200, 25, "/s", true);
+    s.addSlider("Jitter", 0, 1, 0.3f, "");
+    s.addSlider("Pitch", -24, 24, 0, "st");
+    s.addSlider("Pitch Jitter", 0, 12, 0, "st");
+    s.addSlider("Spread", 0, 1, 0.5f, "");
+    s.addToggle("Freeze", false);
+    s.addSlider("Mix", 0, 1, 1, "");
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p](int i, float v) {
+        switch (i) {
+            case 0: p->setGrainSize(v); break;
+            case 1: p->setDensity(v); break;
+            case 2: p->setJitter(v); break;
+            case 3: p->setPitch(v); break;
+            case 4: p->setPitchJitter(v); break;
+            case 5: p->setSpread(v); break;
+            case 6: p->setFreeze(v > 0.5f); break;
+            case 7: p->setMix(v); break;
+        }
+    };
+    return s;
+}
+
+inline EffectSlot makeSpectralDenoiser()
+{
+    auto p = std::make_shared<dspark::SpectralDenoiser<float>>();
+    EffectSlot s;
+    s.name = "Denoiser"; s.category = "Utility";
+    s.addToggle("Learn Noise", false);
+    s.addSlider("Reduction", 0, 40, 18, "dB");
+    s.addSlider("Threshold", 1, 8, 2, "x");
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p](int i, float v) {
+        switch (i) {
+            case 0: p->setLearning(v > 0.5f); break;
+            case 1: p->setReduction(v); break;
+            case 2: p->setThreshold(v); break;
+        }
+    };
+    return s;
+}
+
 inline std::vector<EffectSlot> createAllEffects()
 {
     return {
@@ -1088,6 +1255,13 @@ inline std::vector<EffectSlot> createAllEffects()
         // Distortion
         makeSaturation(),
         makeClipper(),
+        // Analog (physical models)
+        makeTapeMachine(),
+        makeTubePreamp(),
+        makeTransformerModel(),
+        // Pitch and texture
+        makePitchShifter(),
+        makeGranularProcessor(),
         // Modulation
         makeChorus(),
         makePhaser(),
@@ -1104,6 +1278,7 @@ inline std::vector<EffectSlot> createAllEffects()
         // Utility
         makeGain(),
         makeNoiseGenerator(),
+        makeSpectralDenoiser(),
     };
 }
 

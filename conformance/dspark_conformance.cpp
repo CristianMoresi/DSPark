@@ -595,6 +595,31 @@ void runMetricTests()
         check(std::abs(cents) < 2.0, "metrics", "PitchShifter +7 st frequency exact", d);
     }
     {
+        // WDF diode clipper solves the node equation (vin - v)/R = 2 Is sinh(v/nVt)
+        // to the same answer as an independent bisection — physical-model gate.
+        const double R = 2200.0, Is = 2.52e-9, nVt = 1.752 * 0.02585;
+        dspark::wdf::ResistiveVoltageSource<double> vsrc { R };
+        dspark::wdf::DiodePairRoot<double, decltype(vsrc)> clip { vsrc, Is, nVt };
+        clip.prepare(48000.0);
+
+        double maxErr = 0;
+        for (double vin = -10.0; vin <= 10.0; vin += 0.25)
+        {
+            vsrc.setVoltage(vin);
+            clip.process();
+            double lo = std::min(0.0, vin), hi = std::max(0.0, vin);
+            for (int it = 0; it < 200; ++it)
+            {
+                const double mid = 0.5 * (lo + hi);
+                const double f = (vin - mid) / R - 2.0 * Is * std::sinh(mid / nVt);
+                if (f > 0.0) lo = mid; else hi = mid;
+            }
+            maxErr = std::max(maxErr, std::abs(static_cast<double>(clip.getVoltage()) - 0.5 * (lo + hi)));
+        }
+        char d[64]; std::snprintf(d, sizeof(d), "(max err %.2e V)", maxErr);
+        check(maxErr < 1e-9, "metrics", "WDF diode clipper matches node equation", d);
+    }
+    {
         // FFT round trip exactness.
         dspark::FFTReal<double> fft(2048);
         std::vector<double> t(2048), f(2050), t2(2048);

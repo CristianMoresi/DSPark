@@ -7,6 +7,7 @@
 CLAUDE.md
 tests/
 AUDIT_*.md
+PLAN_*.md
 
 # -- Compiled binaries --------------------------------------------------------
 *.exe
@@ -44,6 +45,7 @@ AUDIT_*.md
 # -- CMake / Ninja ------------------------------------------------------------
 build/
 build-*/
+build_check/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
@@ -55,6 +57,9 @@ Makefile
 # -- DSParkLab runtime artefacts ---------------------------------------------
 DSParkLab/imgui.ini
 DSParkLab/build_log.txt
+
+# -- Generated artefacts -------------------------------------------------------
+dspark_single_header.hpp
 
 # -- Diagnostic / log files ---------------------------------------------------
 *.log

@@ -1,0 +1,191 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build + run the public conformance suite on every platform
+  # ---------------------------------------------------------------------------
+  conformance:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "Windows MSVC x64",   os: windows-latest,   compiler: msvc  }
+          - { name: "Linux GCC x64",      os: ubuntu-latest,    compiler: g++   }
+          - { name: "Linux Clang x64",    os: ubuntu-latest,    compiler: clang++ }
+          - { name: "Linux GCC arm64",    os: ubuntu-24.04-arm, compiler: g++   }
+          - { name: "macOS Clang arm64",  os: macos-latest,     compiler: clang++ }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        if: matrix.compiler == 'msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build (MSVC)
+        if: matrix.compiler == 'msvc'
+        shell: cmd
+        run: cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /I . conformance\dspark_conformance.cpp /Fe:dspark_conformance.exe
+
+      - name: Build (GCC/Clang)
+        if: matrix.compiler != 'msvc'
+        run: ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -I . conformance/dspark_conformance.cpp -o dspark_conformance
+
+      - name: Run conformance suite
+        shell: bash
+        run: ./dspark_conformance*
+
+  # ---------------------------------------------------------------------------
+  # AddressSanitizer + UndefinedBehaviorSanitizer
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: ASan + UBSan (Linux GCC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with sanitizers
+        run: >
+          g++ -std=c++20 -O1 -g -Wall -Wextra
+          -fsanitize=address,undefined -fno-sanitize-recover=all
+          -I . conformance/dspark_conformance.cpp -o dspark_conformance_san
+      - name: Run under sanitizers
+        run: ./dspark_conformance_san
+
+  # ---------------------------------------------------------------------------
+  # WebAssembly (Emscripten) — compile and execute with node
+  # ---------------------------------------------------------------------------
+  wasm:
+    name: WebAssembly (Emscripten)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+      - name: Build
+        run: >
+          em++ -std=c++20 -O2 -I .
+          -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB
+          conformance/dspark_conformance.cpp -o dspark_conformance.js
+      - name: Run with node
+        run: node dspark_conformance.js
+
+  # ---------------------------------------------------------------------------
+  # Embedded profile: -fno-exceptions -fno-rtti, no file IO
+  # ---------------------------------------------------------------------------
+  embedded-profile:
+    name: Embedded profile (no exceptions / no RTTI / no file IO)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile umbrella with embedded flags
+        run: |
+          cat > embedded_check.cpp << 'EOF'
+          #define DSPARK_NO_FILE_IO
+          #include "DSPark.h"
+          int main()
+          {
+              dspark::AudioSpec spec { 48000.0, 256, 2 };
+              dspark::Compressor<float> comp;  comp.prepare(spec);
+              dspark::FilterEngine<float> filt; filt.prepare(spec);
+              dspark::AlgorithmicReverb<float> rev; rev.prepare(spec);
+              dspark::AudioBuffer<float> buf; buf.resize(2, 256);
+              comp.processBlock(buf.toView());
+              filt.processBlock(buf.toView());
+              rev.processBlock(buf.toView());
+              return buf.getChannel(0)[0] == buf.getChannel(0)[0] ? 0 : 1;
+          }
+          EOF
+          g++ -std=c++20 -O2 -Wall -Wextra -fno-exceptions -fno-rtti -I . embedded_check.cpp -o embedded_check
+          ./embedded_check
+
+  # ---------------------------------------------------------------------------
+  # Single-header amalgamation: generate, compile, publish artifact
+  # ---------------------------------------------------------------------------
+  amalgamate:
+    name: Single-header amalgamation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate
+        run: python3 tools/amalgamate.py dspark_single_header.hpp
+      - name: Compile the amalgamated header
+        run: |
+          cat > amalgam_check.cpp << 'EOF'
+          #include "dspark_single_header.hpp"
+          int main()
+          {
+              dspark::AudioSpec spec { 48000.0, 256, 2 };
+              dspark::Equalizer<float> eq; eq.prepare(spec);
+              dspark::AudioBuffer<float> buf; buf.resize(2, 256);
+              eq.processBlock(buf.toView());
+              return 0;
+          }
+          EOF
+          g++ -std=c++20 -O2 -Wall -Wextra amalgam_check.cpp -o amalgam_check
+          ./amalgam_check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dspark_single_header
+          path: dspark_single_header.hpp
+
+  # ---------------------------------------------------------------------------
+  # Examples and benchmarks stay buildable
+  # ---------------------------------------------------------------------------
+  examples:
+    name: Examples + bench (compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build examples
+        run: |
+          for src in examples/*.cpp; do
+            echo "== $src"
+            g++ -std=c++20 -O2 -Wall -Wextra -I . "$src" -o /dev/null -fsyntax-only
+          done
+      - name: Build and smoke-run bench
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -I . bench/dspark_bench.cpp -o dspark_bench
+          ./dspark_bench
+
+  # ---------------------------------------------------------------------------
+  # EBU R128 conformance against the official EBU loudness test set
+  # (downloaded from tech.ebu.ch with caching; never redistributed in-repo)
+  # ---------------------------------------------------------------------------
+  ebu-r128:
+    name: EBU R128 conformance (official test set)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache EBU test set
+        id: cache-ebu
+        uses: actions/cache@v4
+        with:
+          path: ebu-test-set
+          key: ebu-loudness-test-set-v05
+      - name: Download EBU test set
+        if: steps.cache-ebu.outputs.cache-hit != 'true'
+        run: |
+          # tech.ebu.ch sits behind Cloudflare and rejects curl's default
+          # User-Agent with an HTML challenge page, so present a browser UA.
+          curl -L --retry 3 -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" \
+               -o ebu.zip "https://tech.ebu.ch/files/live/sites/tech/files/shared/testmaterial/ebu-loudness-test-setv05.zip"
+          unzip -tq ebu.zip
+          mkdir -p ebu-test-set
+          unzip -q ebu.zip -d ebu-test-set
+      - name: Build conformance suite
+        run: g++ -std=c++20 -O2 -Wall -Wextra -I . conformance/dspark_conformance.cpp -o dspark_conformance
+      - name: Run with EBU vectors
+        run: DSPARK_EBU_TEST_SET=ebu-test-set ./dspark_conformance

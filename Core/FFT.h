@@ -32,12 +32,29 @@
 #endif
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <numbers>
-#include <stdexcept>
 #include <type_traits>
 #include <vector>
+
+// --- Exception policy --------------------------------------------------------
+// By default invalid FFT sizes throw std::invalid_argument. For embedded and
+// plugin builds compiled without exception support, define DSPARK_NO_EXCEPTIONS
+// (auto-detected from -fno-exceptions / /EHs-c-) — invalid sizes then assert in
+// debug and degrade to a safe minimal size in release instead of throwing.
+#if !defined(DSPARK_NO_EXCEPTIONS)
+  #if (defined(__GNUC__) || defined(__clang__)) && !defined(__EXCEPTIONS)
+    #define DSPARK_NO_EXCEPTIONS 1
+  #elif defined(_MSC_VER) && !defined(_CPPUNWIND)
+    #define DSPARK_NO_EXCEPTIONS 1
+  #endif
+#endif
+
+#if !defined(DSPARK_NO_EXCEPTIONS)
+  #include <stdexcept>
+#endif
 
 namespace dspark {
 
@@ -59,14 +76,22 @@ public:
     /**
      * @brief Constructs an FFT processor for the given size.
      * @param size Number of complex samples. Must be a power of two and >= 2.
-     * @throw std::invalid_argument if size is invalid.
+     * @throw std::invalid_argument if size is invalid (with DSPARK_NO_EXCEPTIONS:
+     *        asserts and degrades to the minimal valid size instead).
      */
     explicit FFTComplex(size_t size)
         : size_(size)
     {
         if (size < 2 || (size & (size - 1)) != 0)
+        {
+#if defined(DSPARK_NO_EXCEPTIONS)
+            assert(false && "FFTComplex size must be a power of two >= 2");
+            size_ = 2; // degrade to the minimal valid size
+#else
             throw std::invalid_argument("FFTComplex size must be a power of two >= 2");
-            
+#endif
+        }
+
         computeTwiddles();
         computeBitReversalTable();
     }
@@ -343,7 +368,8 @@ public:
     /**
      * @brief Constructs a real FFT processor.
      * @param size Number of real samples. Must be a power of two and >= 4.
-     * @throw std::invalid_argument if size is invalid.
+     * @throw std::invalid_argument if size is invalid (with DSPARK_NO_EXCEPTIONS:
+     *        asserts and degrades to the minimal valid size instead).
      */
     explicit FFTReal(size_t size)
         : realSize_(validateSize(size))   // validates BEFORE complexFFT_ is built
@@ -470,11 +496,20 @@ public:
 
 private:
     /** @brief Validates the real-FFT size and returns it (used in the init list
-     *  so the FFTReal-specific message fires before the inner FFTComplex). */
+     *  so the FFTReal-specific message fires before the inner FFTComplex).
+     *  Under DSPARK_NO_EXCEPTIONS, invalid sizes assert and degrade to the
+     *  minimal valid size (4) instead of throwing. */
     static size_t validateSize(size_t size)
     {
         if (size < 4 || (size & (size - 1)) != 0)
+        {
+#if defined(DSPARK_NO_EXCEPTIONS)
+            assert(false && "FFTReal size must be a power of two >= 4");
+            return 4;
+#else
             throw std::invalid_argument("FFTReal size must be a power of two >= 4");
+#endif
+        }
         return size;
     }
 

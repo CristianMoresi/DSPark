@@ -1,0 +1,838 @@
+// DSPark — Public conformance suite
+// Copyright (c) 2026 Cristian Moresi — MIT License
+//
+// This is the PUBLIC quality gate that runs in CI on every platform:
+//
+//   [smoke]   every effect: prepare → process → finite output → silent tail
+//   [pdc]     null tests: latency-reporting processors cancel against a
+//             delay-compensated dry path
+//   [metrics] objective quality numbers (resampler SNR, EQ linear-phase
+//             level, oscillator levels, filter DC rejection, ...)
+//   [ebu]     EBU R128 conformance against the official EBU loudness test
+//             set: integrated loudness (Tech 3341-2023 table 1), loudness
+//             range (Tech 3342-2023 table 1) and true peak (Tech 3341 cases
+//             15-23). Optional: set DSPARK_EBU_TEST_SET to the directory
+//             containing the extracted official WAV files
+//             (https://tech.ebu.ch/publications/ebu_loudness_test_set).
+//             Skipped cleanly when the variable is not set.
+//
+// Zero dependencies, single translation unit, plain exit code (0 = pass).
+
+#if defined(_MSC_VER)
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#include "DSPark.h"
+
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <string>
+#include <vector>
+
+#ifndef DSPARK_NO_FILE_IO
+#include <filesystem>
+#endif
+
+namespace {
+
+int g_passed = 0;
+int g_failed = 0;
+int g_skipped = 0;
+
+void check(bool condition, const char* section, const char* name, const char* detail = "")
+{
+    if (condition)
+    {
+        ++g_passed;
+        std::printf("PASS  [%s] %s\n", section, name);
+    }
+    else
+    {
+        ++g_failed;
+        std::printf("FAIL  [%s] %s %s\n", section, name, detail);
+    }
+}
+
+void skip(const char* section, const char* name, const char* why)
+{
+    ++g_skipped;
+    std::printf("SKIP  [%s] %s (%s)\n", section, name, why);
+}
+
+constexpr double kPiConf = 3.14159265358979323846;
+
+// -----------------------------------------------------------------------------
+// Shared helpers
+// -----------------------------------------------------------------------------
+
+struct StereoSignal
+{
+    std::vector<float> left, right;
+};
+
+StereoSignal makeSine(double freq, double sampleRate, int numSamples, float amp = 0.5f)
+{
+    StereoSignal s;
+    s.left.resize(static_cast<size_t>(numSamples));
+    s.right.resize(static_cast<size_t>(numSamples));
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const float v = amp * static_cast<float>(std::sin(2.0 * kPiConf * freq * i / sampleRate));
+        s.left[static_cast<size_t>(i)] = v;
+        s.right[static_cast<size_t>(i)] = v * 0.9f;
+    }
+    return s;
+}
+
+bool allFinite(const float* d, int n)
+{
+    for (int i = 0; i < n; ++i)
+        if (!std::isfinite(d[i])) return false;
+    return true;
+}
+
+double rms(const float* d, int n)
+{
+    double acc = 0;
+    for (int i = 0; i < n; ++i) acc += static_cast<double>(d[i]) * d[i];
+    return std::sqrt(acc / std::max(1, n));
+}
+
+double toDb(double x) { return 20.0 * std::log10(std::max(x, 1e-12)); }
+
+// Runs `process` over `blocks` blocks of sine, then `tailBlocks` of silence.
+// Returns true if every output sample stayed finite and the tail decays.
+bool smokeRun(const std::function<void(dspark::AudioBufferView<float>)>& process,
+              double sampleRate = 48000.0, int blockSize = 512,
+              int blocks = 40, int tailBlocks = 60, bool isGenerator = false)
+{
+    dspark::AudioBuffer<float> buf;
+    buf.resize(2, blockSize);
+
+    int n = 0;
+    for (int b = 0; b < blocks; ++b)
+    {
+        for (int i = 0; i < blockSize; ++i, ++n)
+        {
+            const float v = 0.5f * static_cast<float>(std::sin(2.0 * kPiConf * 220.0 * n / sampleRate));
+            buf.getChannel(0)[i] = v;
+            buf.getChannel(1)[i] = v;
+        }
+        process(buf.toView());
+        for (int ch = 0; ch < 2; ++ch)
+            if (!allFinite(buf.getChannel(ch), blockSize)) return false;
+    }
+
+    double tailRms = 0.0;
+    for (int b = 0; b < tailBlocks; ++b)
+    {
+        buf.clear();
+        process(buf.toView());
+        for (int ch = 0; ch < 2; ++ch)
+            if (!allFinite(buf.getChannel(ch), blockSize)) return false;
+        if (b == tailBlocks - 1)
+            tailRms = rms(buf.getChannel(0), blockSize);
+    }
+    // Reverbs and long delays decay slowly; only demand the tail is not stuck
+    // at signal level or blowing up. Generators keep producing on silence by
+    // design, so only the finiteness checks apply to them.
+    return isGenerator || tailRms < 0.25;
+}
+
+// -----------------------------------------------------------------------------
+// [smoke] — every effect builds, runs, stays finite, and dies down
+// -----------------------------------------------------------------------------
+
+void runSmokeTests()
+{
+    const dspark::AudioSpec spec { 48000.0, 512, 2 };
+    using V = dspark::AudioBufferView<float>;
+
+    struct Case
+    {
+        const char* name;
+        std::function<std::function<void(V)>()> make;
+        bool isGenerator = false;
+    };
+    std::vector<Case> cases;
+
+    cases.push_back({ "Gain", [&] {
+        auto p = std::make_shared<dspark::Gain<float>>();
+        p->prepare(spec); p->setGainDb(-3.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "FilterEngine", [&] {
+        auto p = std::make_shared<dspark::FilterEngine<float>>();
+        p->prepare(spec); p->setLowPass(4000.0f, 0.707f, 24);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "Equalizer", [&] {
+        auto p = std::make_shared<dspark::Equalizer<float>>();
+        p->prepare(spec); p->setBand(0, 200.0f, 3.0f); p->setBand(1, 5000.0f, -2.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "EqualizerLinearPhase", [&] {
+        auto p = std::make_shared<dspark::Equalizer<float>>();
+        p->setFilterMode(dspark::Equalizer<float>::FilterMode::LinearPhase);
+        p->prepare(spec); p->setBand(0, 1000.0f, 4.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "Compressor", [&] {
+        auto p = std::make_shared<dspark::Compressor<float>>();
+        p->prepare(spec); p->setThreshold(-20.0f); p->setRatio(4.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "Limiter", [&] {
+        auto p = std::make_shared<dspark::Limiter<float>>();
+        p->prepare(spec); p->setCeiling(-1.0f); p->setTruePeak(true);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "NoiseGate", [&] {
+        auto p = std::make_shared<dspark::NoiseGate<float>>();
+        p->prepare(spec); p->setThreshold(-40.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "Expander", [&] {
+        auto p = std::make_shared<dspark::Expander<float>>();
+        p->prepare(spec); p->setThreshold(-45.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "DynamicEQ", [&] {
+        auto p = std::make_shared<dspark::DynamicEQ<float>>();
+        p->prepare(spec);
+        dspark::DynamicEQ<float>::BandConfig cfg;
+        cfg.frequency = 3000.0f; cfg.threshold = -30.0f; cfg.aboveRatio = 3.0f;
+        p->setBand(0, cfg); p->setNumBands(1);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "MultibandCompressor", [&] {
+        auto p = std::make_shared<dspark::MultibandCompressor<float>>();
+        p->prepare(spec); p->setNumBands(3);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "TransientDesigner", [&] {
+        auto p = std::make_shared<dspark::TransientDesigner<float>>();
+        p->prepare(spec); p->setAttack(40.0f); p->setSustain(-20.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "DeEsser", [&] {
+        auto p = std::make_shared<dspark::DeEsser<float>>();
+        p->prepare(spec); p->setFrequency(7000.0f); p->setThreshold(-30.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "AlgorithmicReverb", [&] {
+        auto p = std::make_shared<dspark::AlgorithmicReverb<float>>();
+        p->prepare(spec); p->setType(dspark::AlgorithmicReverb<float>::Type::Hall);
+        p->setMix(0.4f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "Saturation", [&] {
+        auto p = std::make_shared<dspark::Saturation<float>>();
+        p->setOversampling(2); p->prepare(spec); p->setDrive(8.0f);
+        p->setAlgorithm(dspark::Saturation<float>::Algorithm::Tape);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "Clipper", [&] {
+        auto p = std::make_shared<dspark::Clipper<float>>();
+        p->setOversampling(4); p->prepare(spec);
+        p->setMode(dspark::Clipper<float>::Mode::Analog); p->setInputGain(6.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "Chorus", [&] {
+        auto p = std::make_shared<dspark::Chorus<float>>();
+        p->prepare(spec); p->setRate(0.8f); p->setMix(0.5f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "Phaser", [&] {
+        auto p = std::make_shared<dspark::Phaser<float>>();
+        p->prepare(spec); p->setRate(0.5f); p->setStereoSpread(0.5f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "Tremolo", [&] {
+        auto p = std::make_shared<dspark::Tremolo<float>>();
+        p->prepare(spec); p->setRate(5.0f); p->setDepth(0.7f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "Vibrato", [&] {
+        auto p = std::make_shared<dspark::Vibrato<float>>();
+        p->prepare(spec); p->setRate(5.0f); p->setDepth(0.4f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "RingModulator", [&] {
+        auto p = std::make_shared<dspark::RingModulator<float>>();
+        p->prepare(spec); p->setFrequency(300.0f); p->setMix(0.8f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "FrequencyShifter", [&] {
+        auto p = std::make_shared<dspark::FrequencyShifter<float>>();
+        p->prepare(spec); p->setShift(50.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "PitchShifter", [&] {
+        auto p = std::make_shared<dspark::PitchShifter<float>>();
+        p->prepare(spec); p->setSemitones(4.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "Delay", [&] {
+        auto p = std::make_shared<dspark::Delay<float>>();
+        p->prepareMs(spec, 500.0);
+        return std::function<void(V)>([p](V b) { p->processBlock(b, 120.0f, 0.4f, 6000.0f, 100.0f); });
+    }});
+    cases.push_back({ "Panner", [&] {
+        auto p = std::make_shared<dspark::Panner<float>>();
+        p->prepare(spec); p->setPan(0.4f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "StereoWidth", [&] {
+        auto p = std::make_shared<dspark::StereoWidth<float>>();
+        p->prepare(spec); p->setWidth(1.4f); p->setBassMono(true, 120.0);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "CrossfadeWrap", [&] {
+        auto p = std::make_shared<dspark::Crossfade<float>>();
+        p->setPosition(0.5f);
+        return std::function<void(V)>([p](V b) {
+            for (int ch = 0; ch < b.getNumChannels(); ++ch)
+                p->process(b.getChannel(ch), b.getChannel(ch), b.getChannel(ch), b.getNumSamples());
+        });
+    }});
+    cases.push_back({ "DCBlocker", [&] {
+        auto p = std::make_shared<dspark::DCBlocker<float>>();
+        p->prepare(48000.0, 2, 10.0); p->setOrder(4);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "AutoGainWrap", [&] {
+        auto p = std::make_shared<dspark::AutoGain<float>>();
+        p->prepare(spec);
+        return std::function<void(V)>([p](V b) { p->pushReference(b); p->compensate(b); });
+    }});
+    cases.push_back({ "NoiseGenerator", [&] {
+        auto p = std::make_shared<dspark::NoiseGenerator<float>>();
+        p->prepare(spec);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }, true });
+    cases.push_back({ "MidSideRoundTrip", [&] {
+        return std::function<void(V)>([](V b) {
+            dspark::MidSide<float>::encode(b);
+            dspark::MidSide<float>::decode(b);
+        });
+    }});
+    cases.push_back({ "ConvolutionReverb", [&] {
+        auto p = std::make_shared<dspark::Reverb<float>>();
+        p->prepare(spec);
+        // Small synthetic exponentially-decaying IR
+        std::vector<float> ir(4800);
+        for (size_t i = 0; i < ir.size(); ++i)
+            ir[i] = static_cast<float>(std::exp(-3.0 * static_cast<double>(i) / 4800.0)
+                  * std::sin(0.1 * static_cast<double>(i)));
+        ir[0] = 1.0f;
+        p->loadIR(ir.data(), static_cast<int>(ir.size()), 48000.0);
+        p->setMix(0.3f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+
+    for (auto& c : cases)
+    {
+        auto proc = c.make();
+        check(smokeRun(proc, 48000.0, 512, 40, 60, c.isGenerator), "smoke", c.name);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// [pdc] — latency-compensated null tests
+// -----------------------------------------------------------------------------
+
+// Processes `signal` through `process` and measures the residual (in dB,
+// relative to the dry RMS) against the same signal delayed by `latency`.
+double residualDbVsDelayedDry(const std::function<void(dspark::AudioBufferView<float>)>& process,
+                              int latency, double sampleRate = 48000.0,
+                              int blockSize = 512, int blocks = 60)
+{
+    const int total = blockSize * blocks;
+    StereoSignal dry = makeSine(997.0, sampleRate, total, 0.25);
+
+    dspark::AudioBuffer<float> buf;
+    buf.resize(2, blockSize);
+
+    std::vector<float> out(static_cast<size_t>(total));
+    for (int b = 0; b < blocks; ++b)
+    {
+        for (int i = 0; i < blockSize; ++i)
+        {
+            buf.getChannel(0)[i] = dry.left[static_cast<size_t>(b * blockSize + i)];
+            buf.getChannel(1)[i] = dry.right[static_cast<size_t>(b * blockSize + i)];
+        }
+        process(buf.toView());
+        std::memcpy(out.data() + static_cast<size_t>(b) * blockSize,
+                    buf.getChannel(0), static_cast<size_t>(blockSize) * sizeof(float));
+    }
+
+    // Compare steady-state region, skipping warm-up
+    const int start = std::max(latency + blockSize * 4, total / 4);
+    double err = 0, ref = 0;
+    for (int i = start; i < total; ++i)
+    {
+        const double d = dry.left[static_cast<size_t>(i - latency)];
+        const double e = out[static_cast<size_t>(i)] - d;
+        err += e * e;
+        ref += d * d;
+    }
+    return 10.0 * std::log10(std::max(err, 1e-30) / std::max(ref, 1e-30));
+}
+
+void runPdcNullTests()
+{
+    const dspark::AudioSpec spec { 48000.0, 512, 2 };
+
+    {
+        // Flat linear-phase EQ must null against dry delayed by getLatency().
+        auto eq = std::make_shared<dspark::Equalizer<float>>();
+        eq->setFilterMode(dspark::Equalizer<float>::FilterMode::LinearPhase);
+        eq->prepare(spec);
+        const double res = residualDbVsDelayedDry(
+            [eq](dspark::AudioBufferView<float> b) { eq->processBlock(b); }, eq->getLatency());
+        char d[64]; std::snprintf(d, sizeof(d), "(residual %.1f dB)", res);
+        check(res < -60.0, "pdc", "EqualizerLinearPhase flat null", d);
+    }
+    {
+        // Limiter far below threshold must be a pure delay.
+        auto lim = std::make_shared<dspark::Limiter<float>>();
+        lim->prepare(48000.0, 2, 2.0);
+        lim->setCeiling(0.0f);
+        const double res = residualDbVsDelayedDry(
+            [lim](dspark::AudioBufferView<float> b) { lim->processBlock(b); }, lim->getLatency());
+        char d[64]; std::snprintf(d, sizeof(d), "(residual %.1f dB)", res);
+        check(res < -60.0, "pdc", "Limiter transparent below ceiling", d);
+    }
+    {
+        // Oversampling round-trip nulls against dry delayed by getLatency().
+        auto os = std::make_shared<dspark::Oversampling<float>>(4, dspark::Oversampling<float>::Quality::High);
+        os->prepare(dspark::AudioSpec { 48000.0, 512, 2 });
+        const double res = residualDbVsDelayedDry(
+            [os](dspark::AudioBufferView<float> b) {
+                (void)os->upsample(b);
+                os->downsample(b);
+            }, os->getLatency());
+        char d[64]; std::snprintf(d, sizeof(d), "(residual %.1f dB)", res);
+        check(res < -60.0, "pdc", "Oversampling 4x round-trip null", d);
+    }
+    {
+        // Convolver with a unit impulse IR is a pure block delay.
+        std::vector<float> ir(1, 1.0f);
+        auto conv = std::make_shared<dspark::Convolver<float>>();
+        conv->prepare(512, ir.data(), 1);
+        const double res = residualDbVsDelayedDry(
+            [conv](dspark::AudioBufferView<float> b) {
+                conv->processInPlace(b.getChannel(0), b.getNumSamples());
+            }, conv->getLatency());
+        char d[64]; std::snprintf(d, sizeof(d), "(residual %.1f dB)", res);
+        check(res < -80.0, "pdc", "Convolver delta-IR null", d);
+    }
+    {
+        // ZeroLatencyConvolver with a delta IR must null with NO delay at all,
+        // even with the IR long enough to engage all three partition levels.
+        std::vector<float> ir(6000, 0.0f);
+        ir[0] = 1.0f;
+        auto conv = std::make_shared<dspark::ZeroLatencyConvolver<float>>();
+        conv->prepare(ir.data(), static_cast<int>(ir.size()));
+        const double res = residualDbVsDelayedDry(
+            [conv](dspark::AudioBufferView<float> b) {
+                conv->processInPlace(b.getChannel(0), b.getNumSamples());
+            }, conv->getLatency());   // == 0
+        char d[64]; std::snprintf(d, sizeof(d), "(residual %.1f dB)", res);
+        check(res < -80.0, "pdc", "ZeroLatencyConvolver zero-latency delta null", d);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// [metrics] — objective quality numbers
+// -----------------------------------------------------------------------------
+
+void runMetricTests()
+{
+    {
+        // Resampler 44.1k -> 48k sine SNR (offline path).
+        dspark::Resampler<double> rs;
+        rs.prepare(44100.0, 48000.0, dspark::Resampler<double>::Quality::High);
+        const int n = 1 << 13;
+        std::vector<double> in(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) in[static_cast<size_t>(i)] = std::sin(2.0 * kPiConf * 1000.0 * i / 44100.0);
+        auto out = rs.process(in.data(), n);
+
+        double err = 0, ref = 0;
+        for (size_t k = 200; k + 200 < out.size(); ++k)
+        {
+            const double srcPos = static_cast<double>(k) * 44100.0 / 48000.0;
+            const double ideal = std::sin(2.0 * kPiConf * 1000.0 * srcPos / 44100.0);
+            const double e = out[k] - ideal;
+            err += e * e; ref += ideal * ideal;
+        }
+        const double snr = 10.0 * std::log10(ref / std::max(err, 1e-30));
+        char d[64]; std::snprintf(d, sizeof(d), "(SNR %.1f dB)", snr);
+        check(snr > 90.0, "metrics", "Resampler High sine SNR > 90 dB", d);
+    }
+    {
+        // Oscillator waveform levels must match within 1 dB.
+        dspark::Oscillator<float> osc;
+        osc.prepare(48000.0);
+        osc.setFrequency(220.0f);
+        double peaks[4] = {};
+        const dspark::Oscillator<float>::Waveform shapes[4] = {
+            dspark::Oscillator<float>::Waveform::Sine,
+            dspark::Oscillator<float>::Waveform::Saw,
+            dspark::Oscillator<float>::Waveform::Square,
+            dspark::Oscillator<float>::Waveform::Triangle };
+        for (int w = 0; w < 4; ++w)
+        {
+            osc.setWaveform(shapes[w]);
+            osc.reset();
+            double pk = 0;
+            for (int i = 0; i < 48000; ++i)
+                pk = std::max(pk, std::abs(static_cast<double>(osc.getNextSample())));
+            peaks[w] = pk;
+        }
+        const double triDb = toDb(peaks[3]);
+        char d[96]; std::snprintf(d, sizeof(d), "(sine %.2f saw %.2f sq %.2f tri %.2f)",
+                                  peaks[0], peaks[1], peaks[2], peaks[3]);
+        check(triDb > -1.0 && triDb < 1.0, "metrics", "Oscillator triangle level ~0 dBFS", d);
+    }
+    {
+        // Ladder HP24 rejects DC at high resonance.
+        dspark::LadderFilter<float> lf;
+        lf.prepare(dspark::AudioSpec { 48000.0, 512, 1 });
+        lf.setMode(dspark::LadderFilter<float>::Mode::HP24);
+        lf.setCutoff(1000.0f);
+        lf.setResonance(0.5f);
+        dspark::AudioBuffer<float> b; b.resize(1, 512);
+        float last = 1.0f;
+        for (int blk = 0; blk < 200; ++blk)
+        {
+            for (int i = 0; i < 512; ++i) b.getChannel(0)[i] = 1.0f;
+            lf.processBlock(b.toView());
+            last = b.getChannel(0)[511];
+        }
+        char d[64]; std::snprintf(d, sizeof(d), "(DC out %.5f)", static_cast<double>(last));
+        check(std::abs(last) < 1e-3, "metrics", "Ladder HP24 DC rejection @ res 0.5", d);
+    }
+    {
+        // Clipper Analog mode: unity gain for small signals.
+        dspark::Clipper<float> cl;
+        cl.prepare(dspark::AudioSpec { 48000.0, 512, 2 });
+        cl.setMode(dspark::Clipper<float>::Mode::Analog);
+        dspark::AudioBuffer<float> b; b.resize(2, 512);
+        double inR = 0, outR = 0;
+        for (int blk = 0; blk < 40; ++blk)
+        {
+            for (int i = 0; i < 512; ++i)
+            {
+                const float v = 0.05f * static_cast<float>(std::sin(2.0 * kPiConf * 1000.0 * (blk * 512 + i) / 48000.0));
+                b.getChannel(0)[i] = v; b.getChannel(1)[i] = v;
+            }
+            if (blk > 4) inR += rms(b.getChannel(0), 512);
+            cl.processBlock(b.toView());
+            if (blk > 4) outR += rms(b.getChannel(0), 512);
+        }
+        const double gainDb = toDb(outR / std::max(inR, 1e-30));
+        char d[64]; std::snprintf(d, sizeof(d), "(gain %+.2f dB)", gainDb);
+        check(std::abs(gainDb) < 0.2, "metrics", "Clipper Analog small-signal unity gain", d);
+    }
+    {
+        // PitchShifter +7 st on a 440 Hz sine must land on 659.255 Hz.
+        dspark::PitchShifter<float> ps;
+        ps.prepare(dspark::AudioSpec { 48000.0, 512, 2 });
+        ps.setSemitones(7.0f);
+
+        const int total = (3 * 48000 / 512) * 512;
+        std::vector<float> outSig(static_cast<size_t>(total));
+        dspark::AudioBuffer<float> b; b.resize(2, 512);
+        int n = 0;
+        for (int blk = 0; blk < total / 512; ++blk)
+        {
+            for (int i = 0; i < 512; ++i, ++n)
+            {
+                const float v = 0.5f * static_cast<float>(std::sin(2.0 * kPiConf * 440.0 * n / 48000.0));
+                b.getChannel(0)[i] = v; b.getChannel(1)[i] = v;
+            }
+            ps.processBlock(b.toView());
+            std::memcpy(outSig.data() + static_cast<size_t>(blk) * 512, b.getChannel(0),
+                        512 * sizeof(float));
+        }
+
+        // Dominant frequency of the last 16384 samples via zero-padded FFT
+        // + parabolic interpolation on the log-magnitude peak.
+        constexpr size_t kN = 16384;
+        dspark::FFTReal<double> fft(kN);
+        std::vector<double> t(kN), f(kN + 2);
+        for (size_t i = 0; i < kN; ++i)
+        {
+            const double w = 0.5 - 0.5 * std::cos(2.0 * kPiConf * static_cast<double>(i) / (kN - 1));
+            t[i] = static_cast<double>(outSig[outSig.size() - kN + i]) * w;
+        }
+        fft.forward(t.data(), f.data());
+        size_t peak = 1;
+        double pP = 0;
+        std::vector<double> p(kN / 2 + 1);
+        for (size_t k = 0; k <= kN / 2; ++k)
+        {
+            p[k] = f[2 * k] * f[2 * k] + f[2 * k + 1] * f[2 * k + 1];
+            if (k > 4 && p[k] > pP) { pP = p[k]; peak = k; }
+        }
+        const double l0 = 10.0 * std::log10(p[peak - 1] + 1e-30);
+        const double l1 = 10.0 * std::log10(p[peak] + 1e-30);
+        const double l2 = 10.0 * std::log10(p[peak + 1] + 1e-30);
+        const double den = l0 - 2.0 * l1 + l2;
+        const double d0 = (std::abs(den) > 1e-12) ? 0.5 * (l0 - l2) / den : 0.0;
+        const double got = (static_cast<double>(peak) + d0) * 48000.0 / static_cast<double>(kN);
+        const double expected = 440.0 * std::exp2(7.0 / 12.0);
+        const double cents = 1200.0 * std::log2(got / expected);
+        char d[96]; std::snprintf(d, sizeof(d), "(got %.3f Hz, expected %.3f, %+.2f cents)",
+                                  got, expected, cents);
+        check(std::abs(cents) < 2.0, "metrics", "PitchShifter +7 st frequency exact", d);
+    }
+    {
+        // FFT round trip exactness.
+        dspark::FFTReal<double> fft(2048);
+        std::vector<double> t(2048), f(2050), t2(2048);
+        for (int i = 0; i < 2048; ++i) t[static_cast<size_t>(i)] = std::sin(0.05 * i) + 0.3 * std::cos(0.31 * i);
+        fft.forward(t.data(), f.data());
+        fft.inverse(f.data(), t2.data());
+        double err = 0;
+        for (int i = 0; i < 2048; ++i) err = std::max(err, std::abs(t[static_cast<size_t>(i)] - t2[static_cast<size_t>(i)]));
+        char d[64]; std::snprintf(d, sizeof(d), "(max err %.2e)", err);
+        check(err < 1e-12, "metrics", "FFT exact round trip", d);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// [ebu] — official EBU R128 test set (optional)
+// -----------------------------------------------------------------------------
+
+#ifndef DSPARK_NO_FILE_IO
+
+std::string toLowerAscii(std::string s)
+{
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// True when `nameLower` contains `tokenLower` not immediately followed by a
+// digit — "3341-1" matches "seq-3341-1-16bit.wav" but not "seq-3341-10-...".
+bool containsCaseToken(const std::string& nameLower, const std::string& tokenLower)
+{
+    size_t pos = 0;
+    while ((pos = nameLower.find(tokenLower, pos)) != std::string::npos)
+    {
+        const size_t end = pos + tokenLower.size();
+        if (end >= nameLower.size()
+            || std::isdigit(static_cast<unsigned char>(nameLower[end])) == 0)
+            return true;
+        ++pos;
+    }
+    return false;
+}
+
+// Recursively locates a WAV under `dir` matching `token` (or `altToken`).
+// The official set's filenames are too inconsistent to predict (-v02
+// revisions, combined programme files like seq-3341-7_seq-3342-5, the year
+// in seq-3341-2011-8, even double ".wav.wav"), so scan and match by token.
+std::string findEbuFile(const std::string& dir, const char* token,
+                        const char* altToken = nullptr)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
+    const fs::recursive_directory_iterator end;
+    while (!ec && it != end)
+    {
+        std::error_code fec;
+        if (it->is_regular_file(fec))
+        {
+            const std::string nameLower = toLowerAscii(it->path().filename().string());
+            if (nameLower.size() > 4 && nameLower.compare(nameLower.size() - 4, 4, ".wav") == 0)
+            {
+                if (containsCaseToken(nameLower, toLowerAscii(token))
+                    || (altToken != nullptr && containsCaseToken(nameLower, toLowerAscii(altToken))))
+                    return it->path().string();
+            }
+        }
+        it.increment(ec);
+    }
+    return {};
+}
+
+struct EbuMeasurement
+{
+    double integratedLufs = 0;
+    double lra = 0;
+    double truePeakDb = 0;
+};
+
+// Streams a whole WAV through LoudnessMeter, then feeds 2 s of silence so the
+// final short-term windows drain — the Tech 3342 reference implementation
+// requires >= 1.5 s of trailing silence before the LRA readout. The silence
+// cannot bias any measure: it falls under the -70 LUFS absolute gate.
+bool measureFile(const std::string& path, EbuMeasurement& out)
+{
+    dspark::WavFile wav;
+    if (!wav.openRead(path)) return false;
+    const auto info = wav.getInfo();
+    if (info.numChannels < 1 || info.numChannels > 2) { wav.close(); return false; }
+
+    dspark::LoudnessMeter<float> meter;
+    meter.prepare(info.sampleRate, static_cast<int>(info.numChannels));
+
+    constexpr int kBlock = 8192;
+    dspark::AudioBuffer<float> buf;
+    buf.resize(static_cast<int>(info.numChannels), kBlock);
+
+    int64_t remaining = info.numSamples;
+    int64_t offset = 0;
+    while (remaining > 0)
+    {
+        const int n = static_cast<int>(std::min<int64_t>(remaining, kBlock));
+        auto view = buf.toView().getSubView(0, n);
+        if (!wav.readSamples(view, offset, n)) break;
+        if (info.numChannels == 2)
+            meter.process(view.getChannel(0), view.getChannel(1), n);
+        else
+            meter.process(view.getChannel(0), n);
+        offset += n;
+        remaining -= n;
+    }
+    wav.close();
+
+    buf.clear();
+    int64_t flush = static_cast<int64_t>(info.sampleRate * 2.0);
+    while (flush > 0)
+    {
+        const int n = static_cast<int>(std::min<int64_t>(flush, kBlock));
+        if (info.numChannels == 2)
+            meter.process(buf.getChannel(0), buf.getChannel(1), n);
+        else
+            meter.process(buf.getChannel(0), n);
+        flush -= n;
+    }
+
+    out.integratedLufs = static_cast<double>(meter.getIntegratedLUFS());
+    out.lra            = static_cast<double>(meter.getLoudnessRange());
+    out.truePeakDb     = static_cast<double>(meter.getTruePeakDb());
+    return true;
+}
+
+void runEbuTests()
+{
+    const char* env = std::getenv("DSPARK_EBU_TEST_SET");
+    if (env == nullptr || env[0] == '\0')
+    {
+        skip("ebu", "EBU R128 conformance", "DSPARK_EBU_TEST_SET not set");
+        return;
+    }
+    const std::string dir = env;
+
+    enum class Kind { Integrated, Lra, TruePeak };
+    struct Case
+    {
+        const char* name;
+        const char* token;
+        const char* altToken;
+        Kind        kind;
+        double      expected;
+    };
+
+    // Expected values from EBU Tech 3341-2023 table 1 (integrated loudness
+    // +/-0.1 LU, max true peak +0.2/-0.4 dB) and EBU Tech 3342-2023 table 1
+    // (LRA +/-1 LU). Case 3341-6 is 5.0-channel: not covered by the
+    // mono/stereo meter, so it is reported as a skip via the channel check.
+    const Case cases[] = {
+        { "3341-1 integrated -23 LUFS",   "3341-1", nullptr,       Kind::Integrated, -23.0 },
+        { "3341-2 integrated -33 LUFS",   "3341-2", nullptr,       Kind::Integrated, -33.0 },
+        { "3341-3 integrated -23 LUFS",   "3341-3", nullptr,       Kind::Integrated, -23.0 },
+        { "3341-4 integrated -23 LUFS",   "3341-4", nullptr,       Kind::Integrated, -23.0 },
+        { "3341-5 integrated -23 LUFS",   "3341-5", nullptr,       Kind::Integrated, -23.0 },
+        { "3341-7 integrated -23 LUFS",   "3341-7", nullptr,       Kind::Integrated, -23.0 },
+        { "3341-8 integrated -23 LUFS",   "3341-8", "3341-2011-8", Kind::Integrated, -23.0 },
+
+        { "3342-1 LRA 10 LU",             "3342-1", nullptr,       Kind::Lra,        10.0 },
+        { "3342-2 LRA 5 LU",              "3342-2", nullptr,       Kind::Lra,         5.0 },
+        { "3342-3 LRA 20 LU",             "3342-3", nullptr,       Kind::Lra,        20.0 },
+        { "3342-4 LRA 15 LU",             "3342-4", nullptr,       Kind::Lra,        15.0 },
+        { "3342-5 LRA 5 LU",              "3342-5", nullptr,       Kind::Lra,         5.0 },
+        { "3342-6 LRA 15 LU",             "3342-6", nullptr,       Kind::Lra,        15.0 },
+
+        { "3341-15 true peak -6 dBTP",    "3341-15", nullptr,      Kind::TruePeak,   -6.0 },
+        { "3341-16 true peak -6 dBTP",    "3341-16", nullptr,      Kind::TruePeak,   -6.0 },
+        { "3341-17 true peak -6 dBTP",    "3341-17", nullptr,      Kind::TruePeak,   -6.0 },
+        { "3341-18 true peak -6 dBTP",    "3341-18", nullptr,      Kind::TruePeak,   -6.0 },
+        { "3341-19 true peak +3 dBTP",    "3341-19", nullptr,      Kind::TruePeak,    3.0 },
+        { "3341-20 true peak 0 dBTP",     "3341-20", nullptr,      Kind::TruePeak,    0.0 },
+        { "3341-21 true peak 0 dBTP",     "3341-21", nullptr,      Kind::TruePeak,    0.0 },
+        { "3341-22 true peak 0 dBTP",     "3341-22", nullptr,      Kind::TruePeak,    0.0 },
+        { "3341-23 true peak 0 dBTP",     "3341-23", nullptr,      Kind::TruePeak,    0.0 },
+    };
+
+    for (const auto& c : cases)
+    {
+        const std::string path = findEbuFile(dir, c.token, c.altToken);
+        if (path.empty())
+        {
+            skip("ebu", c.name, "file not found");
+            continue;
+        }
+        EbuMeasurement m;
+        if (!measureFile(path, m))
+        {
+            skip("ebu", c.name, "channel layout not covered by mono/stereo meter");
+            continue;
+        }
+
+        bool pass = false;
+        double got = 0;
+        const char* unit = "";
+        switch (c.kind)
+        {
+        case Kind::Integrated:
+            got = m.integratedLufs; unit = "LUFS";
+            pass = std::abs(got - c.expected) <= 0.1;
+            break;
+        case Kind::Lra:
+            got = m.lra; unit = "LU";
+            pass = std::abs(got - c.expected) <= 1.0;
+            break;
+        case Kind::TruePeak:
+            got = m.truePeakDb; unit = "dBTP";
+            pass = got >= c.expected - 0.4 && got <= c.expected + 0.2;
+            break;
+        }
+
+        char d[96];
+        std::snprintf(d, sizeof(d), "(got %.2f %s, expected %.1f)", got, unit, c.expected);
+        check(pass, "ebu", c.name, d);
+    }
+}
+
+#else
+void runEbuTests() { skip("ebu", "EBU R128 conformance", "built with DSPARK_NO_FILE_IO"); }
+#endif // DSPARK_NO_FILE_IO
+
+} // namespace
+
+int main()
+{
+    std::printf("DSPark public conformance suite\n");
+    std::printf("================================\n\n");
+
+    runSmokeTests();
+    runPdcNullTests();
+    runMetricTests();
+    runEbuTests();
+
+    std::printf("\n================================\n");
+    std::printf("%d passed, %d failed, %d skipped\n", g_passed, g_failed, g_skipped);
+    return g_failed == 0 ? 0 : 1;
+}

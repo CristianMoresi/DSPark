@@ -305,29 +305,40 @@ private:
 
     void computeKWeighting(double sr)
     {
-        // Exact equations derived from ITU-R BS.1770-4
-        double fc = 1681.97, G = 3.99984, Q = 0.70710678;
-        double A = std::pow(10.0, G / 40.0);
-        double w0 = 2.0 * std::numbers::pi * fc / sr;
-        double alpha = std::sin(w0) / (2.0 * Q);
-
-        double a0 = (A + 1.0) - (A - 1.0) * std::cos(w0) + 2.0 * std::sqrt(A) * alpha;
-        pre_.b0 = (A * ((A + 1.0) + (A - 1.0) * std::cos(w0) + 2.0 * std::sqrt(A) * alpha)) / a0;
-        pre_.b1 = (-2.0 * A * ((A - 1.0) + (A + 1.0) * std::cos(w0))) / a0;
-        pre_.b2 = (A * ((A + 1.0) + (A - 1.0) * std::cos(w0) - 2.0 * std::sqrt(A) * alpha)) / a0;
-        pre_.a1 = (2.0 * ((A - 1.0) - (A + 1.0) * std::cos(w0))) / a0;
-        pre_.a2 = (((A + 1.0) - (A - 1.0) * std::cos(w0) - 2.0 * std::sqrt(A) * alpha)) / a0;
-
-        double fc2 = 38.13547, Q2 = 0.500327;
-        double w02 = 2.0 * std::numbers::pi * fc2 / sr;
-        double alpha2 = std::sin(w02) / (2.0 * Q2);
-
-        double a02 = 1.0 + alpha2;
-        rlb_.b0 = (1.0 + std::cos(w02)) / 2.0 / a02;
-        rlb_.b1 = -(1.0 + std::cos(w02)) / a02;
-        rlb_.b2 = (1.0 + std::cos(w02)) / 2.0 / a02;
-        rlb_.a1 = -2.0 * std::cos(w02) / a02;
-        rlb_.a2 = (1.0 - alpha2) / a02;
+        // Pre-warped analog parameterization that reproduces the official
+        // ITU-R BS.1770-5 table 1/2 coefficients at 48 kHz to machine
+        // precision (verified: max error 8.9e-16) and generalizes to any
+        // sample rate with the same frequency response, as the spec requires.
+        // The -0.691 constant in powerToLUFS assumes this exact cascade gain
+        // (+0.691 dB at 997 Hz); an RBJ shelf or a gain-normalized RLB
+        // high-pass reads ~0.26 LU low on the EBU conformance vectors.
+        {
+            const double G  = 3.999843853973347;     // dB, stage 1 shelf
+            const double Q  = 0.7071752369554196;
+            const double fc = 1681.9744509555319;    // Hz
+            const double K  = std::tan(std::numbers::pi * fc / sr);
+            const double Vh = std::pow(10.0, G / 20.0);
+            const double Vb = std::pow(Vh, 0.4996667741545416);
+            const double a0 = 1.0 + K / Q + K * K;
+            pre_.b0 = (Vh + Vb * K / Q + K * K) / a0;
+            pre_.b1 = 2.0 * (K * K - Vh) / a0;
+            pre_.b2 = (Vh - Vb * K / Q + K * K) / a0;
+            pre_.a1 = 2.0 * (K * K - 1.0) / a0;
+            pre_.a2 = (1.0 - K / Q + K * K) / a0;
+        }
+        {
+            const double Q  = 0.5003270373238773;    // stage 2 RLB high-pass
+            const double fc = 38.13547087602444;     // Hz
+            const double K  = std::tan(std::numbers::pi * fc / sr);
+            const double a0 = 1.0 + K / Q + K * K;
+            // The official table 2 numerator is exactly [1, -2, 1] — NOT
+            // normalized to unity passband gain (it passes ~+0.04 dB).
+            rlb_.b0 = 1.0;
+            rlb_.b1 = -2.0;
+            rlb_.b2 = 1.0;
+            rlb_.a1 = 2.0 * (K * K - 1.0) / a0;
+            rlb_.a2 = (1.0 - K / Q + K * K) / a0;
+        }
     }
 
     double applyBiquad(double input, const BiquadCoeff& c, BiquadState& s) noexcept

@@ -283,6 +283,11 @@ void runSmokeTests()
         p->prepare(spec); p->setDrive(6.0f); p->setWowFlutter(0.3f);
         return std::function<void(V)>([p](V b) { p->processBlock(b); });
     }});
+    cases.push_back({ "TubePreamp", [&] {
+        auto p = std::make_shared<dspark::TubePreamp<float>>();
+        p->prepare(spec); p->setStages(2); p->setDrive(12.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
     cases.push_back({ "Delay", [&] {
         auto p = std::make_shared<dspark::Delay<float>>();
         p->prepareMs(spec, 500.0);
@@ -642,6 +647,75 @@ void runMetricTests()
                       h1, 20.0 * std::log10(h2 / h1 + 1e-12), 20.0 * std::log10(h3 / h1 + 1e-12));
         check(h3 > 3.0 * h2 && h3 / h1 > 0.005 && h3 / h1 < 0.2 && h1 > 0.25,
               "metrics", "TapeMachine odd-dominant tape signature", d);
+    }
+    {
+        // WDF R-type FMV tone stack must match the bilinear transform of the
+        // published symbolic transfer function (Yeh & Smith, DAFx-06) at the
+        // reference setting. Validates the MNA-derived scattering end to end.
+        const double fs = 48000.0;
+        dspark::wdf::ToneStackFMV<double> stack(0.01, 1e10);
+        stack.prepare(fs);
+        const double t = 0.5, l = 0.5, m = 0.5;
+        stack.setControls(t, std::sqrt(l), m);
+
+        const double C1 = 0.25e-9, C2 = 20e-9, C3 = 20e-9;
+        const double R1 = 250e3, R2 = 1e6, R3 = 25e3, R4 = 56e3;
+        constexpr double kRmin = 0.5;
+        const double te = (t * R1 + kRmin) / (R1 + 2.0 * kRmin);
+        const double le = (l * R2 + kRmin) / R2;
+        const double me = (m * R3 + kRmin) / (R3 + 2.0 * kRmin);
+        const double R3sq = R3 * R3;
+
+        const double b1 = te * C1 * R1 + me * C3 * R3 + le * (C1 * R2 + C2 * R2) + (C1 * R3 + C2 * R3);
+        const double b2 = te * (C1 * C2 * R1 * R4 + C1 * C3 * R1 * R4)
+            - me * me * (C1 * C3 * R3sq + C2 * C3 * R3sq)
+            + me * (C1 * C3 * R1 * R3 + C1 * C3 * R3sq + C2 * C3 * R3sq)
+            + le * (C1 * C2 * R1 * R2 + C1 * C2 * R2 * R4 + C1 * C3 * R2 * R4)
+            + le * me * (C1 * C3 * R2 * R3 + C2 * C3 * R2 * R3)
+            + (C1 * C2 * R1 * R3 + C1 * C2 * R3 * R4 + C1 * C3 * R3 * R4);
+        const double b3 = le * me * (C1 * C2 * C3 * R1 * R2 * R3 + C1 * C2 * C3 * R2 * R3 * R4)
+            - me * me * (C1 * C2 * C3 * R1 * R3sq + C1 * C2 * C3 * R3sq * R4)
+            + me * (C1 * C2 * C3 * R1 * R3sq + C1 * C2 * C3 * R3sq * R4)
+            + te * C1 * C2 * C3 * R1 * R3 * R4 - te * me * C1 * C2 * C3 * R1 * R3 * R4
+            + te * le * C1 * C2 * C3 * R1 * R2 * R4;
+        const double a1 = (C1 * R1 + C1 * R3 + C2 * R3 + C2 * R4 + C3 * R4)
+            + me * C3 * R3 + le * (C1 * R2 + C2 * R2);
+        const double a2 = me * (C1 * C3 * R1 * R3 - C2 * C3 * R3 * R4 + C1 * C3 * R3sq + C2 * C3 * R3sq)
+            + le * me * (C1 * C3 * R2 * R3 + C2 * C3 * R2 * R3)
+            - me * me * (C1 * C3 * R3sq + C2 * C3 * R3sq)
+            + le * (C1 * C2 * R2 * R4 + C1 * C2 * R1 * R2 + C1 * C3 * R2 * R4 + C2 * C3 * R2 * R4)
+            + (C1 * C2 * R1 * R4 + C1 * C3 * R1 * R4 + C1 * C2 * R3 * R4
+               + C1 * C2 * R1 * R3 + C1 * C3 * R3 * R4 + C2 * C3 * R3 * R4);
+        const double a3 = le * me * (C1 * C2 * C3 * R1 * R2 * R3 + C1 * C2 * C3 * R2 * R3 * R4)
+            - me * me * (C1 * C2 * C3 * R1 * R3sq + C1 * C2 * C3 * R3sq * R4)
+            + me * (C1 * C2 * C3 * R3sq * R4 + C1 * C2 * C3 * R1 * R3sq
+                    - C1 * C2 * C3 * R1 * R3 * R4)
+            + le * C1 * C2 * C3 * R1 * R2 * R4 + C1 * C2 * C3 * R1 * R3 * R4;
+
+        const double c = 2.0 * fs, c2 = c * c, c3 = c2 * c;
+        double B[4] = { -b1 * c - b2 * c2 - b3 * c3, -b1 * c + b2 * c2 + 3.0 * b3 * c3,
+                         b1 * c + b2 * c2 - 3.0 * b3 * c3, b1 * c - b2 * c2 + b3 * c3 };
+        double A[4] = { -1.0 - a1 * c - a2 * c2 - a3 * c3, -3.0 - a1 * c + a2 * c2 + 3.0 * a3 * c3,
+                        -3.0 + a1 * c + a2 * c2 - 3.0 * a3 * c3, -1.0 + a1 * c - a2 * c2 + a3 * c3 };
+        for (int i = 3; i >= 0; --i) { B[i] /= A[0]; A[i] /= A[0]; }
+
+        double xs[4] = {}, ys[4] = {};
+        uint32_t rng = 0xBEEF5EEDu;
+        double err = 0, pw = 0;
+        for (int i = 0; i < 24000; ++i)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            const double x = static_cast<double>(rng >> 8) / 8388608.0 - 1.0;
+            const double yw = stack.processSample(x);
+            xs[3] = xs[2]; xs[2] = xs[1]; xs[1] = xs[0]; xs[0] = x;
+            const double yr = B[0] * xs[0] + B[1] * xs[1] + B[2] * xs[2] + B[3] * xs[3]
+                            - A[1] * ys[0] - A[2] * ys[1] - A[3] * ys[2];
+            ys[2] = ys[1]; ys[1] = ys[0]; ys[0] = yr;
+            if (i > 2400) { err += (yw - yr) * (yw - yr); pw += yr * yr; }
+        }
+        const double db = 10.0 * std::log10((err + 1e-300) / (pw + 1e-300));
+        char d[64]; std::snprintf(d, sizeof(d), "(residual %.1f dB)", db);
+        check(db < -80.0, "metrics", "WDF R-type FMV stack matches Yeh DAFx-06 TF", d);
     }
     {
         // WDF diode clipper solves the node equation (vin - v)/R = 2 Is sinh(v/nVt)

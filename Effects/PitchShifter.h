@@ -124,6 +124,12 @@ public:
         fftResult_.resize(static_cast<size_t>(fftSize_));
         prevAnalysis_.resize(static_cast<size_t>(fftSize_ + 2));
         prevSynth_.resize(static_cast<size_t>(fftSize_ + 2));
+
+        // Formant preservation scratch (cepstral envelope).
+        cepsTime_.resize(static_cast<size_t>(fftSize_));
+        cepsSpec_.resize(static_cast<size_t>(fftSize_ + 2));
+        envLog_.resize(static_cast<size_t>(numBins_));
+        formantGain_.resize(static_cast<size_t>(numBins_));
         mag_.resize(static_cast<size_t>(numBins_));
         prevMag_.resize(static_cast<size_t>(numBins_));
         rotRe_.resize(static_cast<size_t>(numBins_));
@@ -189,6 +195,20 @@ public:
         transientPreserve_.store(enabled, std::memory_order_relaxed);
     }
 
+    /**
+     * @brief Keeps formants (vocal timbre) in place while pitch moves.
+     *
+     * A cepstral lift extracts the smooth spectral envelope of each frame
+     * (quefrencies below ~1 ms) and the synthesis magnitudes are pre-warped
+     * by env(k*ratio)/env(k), so after the output resampler the envelope
+     * lands back where it started — the classic anti-chipmunk correction.
+     * Costs two extra FFTs per frame. Default off.
+     */
+    void setFormantPreserve(bool enabled) noexcept
+    {
+        formantPreserve_.store(enabled, std::memory_order_relaxed);
+    }
+
     /** @return Current shift in semitones. */
     [[nodiscard]] T getSemitones() const noexcept
     {
@@ -208,6 +228,7 @@ public:
         w.write("semitones", semitones_.load(std::memory_order_relaxed));
         w.write("mix", mix_.load(std::memory_order_relaxed));
         w.write("transient", transientPreserve_.load(std::memory_order_relaxed));
+        w.write("formant", formantPreserve_.load(std::memory_order_relaxed));
         return w.blob();
     }
 
@@ -219,6 +240,7 @@ public:
         setSemitones(static_cast<T>(r.read("semitones", 0.0f)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setTransientPreserve(r.read("transient", true));
+        setFormantPreserve(r.read("formant", false));
         return true;
     }
 
@@ -540,6 +562,24 @@ private:
             spec_[static_cast<size_t>(2 * k + 1)] = re * ri + im * rr;
         }
 
+        // Formant preservation: pre-warp synthesis magnitudes by
+        // env(k*ratio)/env(k) so the output resampler puts the spectral
+        // envelope back where the input had it. The gain table is computed
+        // once on the reference channel and shared, keeping the stereo
+        // image coherent.
+        if (formantPreserve_.load(std::memory_order_relaxed)
+            && std::abs(ratioActive_ - 1.0) > 1e-6)
+        {
+            if (isReference)
+                computeFormantGains();
+            for (int k = 1; k < numBins_ - 1; ++k)
+            {
+                const T g = formantGain_[static_cast<size_t>(k)];
+                spec_[static_cast<size_t>(2 * k)]     *= g;
+                spec_[static_cast<size_t>(2 * k + 1)] *= g;
+            }
+        }
+
         // Anti-alias for upward shifts: the resampler multiplies frequencies
         // by `ratio`, so taper bins that would land above Nyquist.
         if (ratioActive_ > 1.0)
@@ -560,6 +600,68 @@ private:
             std::copy(spec_.begin(), spec_.end(), prevSynth_.begin());
 
         fft_->inverse(spec_.data(), fftResult_.data());
+
+        synthesizeTail(ch);
+    }
+
+    /**
+     * @brief Cepstral envelope of the current synthesis spectrum and the
+     * env(k*ratio)/env(k) pre-warp gains.
+     *
+     * The log magnitude is mirrored to an even sequence, transformed, low-
+     * quefrency liftered (~1 ms keeps formant structure, drops the harmonic
+     * comb) and transformed back into a smooth log envelope.
+     */
+    void computeFormantGains() noexcept
+    {
+        // Even-symmetric log magnitude.
+        for (int k = 0; k < numBins_; ++k)
+        {
+            const T re = spec_[static_cast<size_t>(2 * k)];
+            const T im = spec_[static_cast<size_t>(2 * k + 1)];
+            cepsTime_[static_cast<size_t>(k)] =
+                std::log(std::sqrt(re * re + im * im) + T(1e-9));
+        }
+        for (int k = numBins_; k < fftSize_; ++k)
+            cepsTime_[static_cast<size_t>(k)] =
+                cepsTime_[static_cast<size_t>(fftSize_ - k)];
+
+        fft_->forward(cepsTime_.data(), cepsSpec_.data());
+
+        // Lifter: keep quefrencies below ~1 ms (the smooth envelope), zero
+        // the rest (the harmonic comb). Cepstral index is quefrency in
+        // samples: 1 ms = 0.001 * fs.
+        const int qCut = std::max(8, static_cast<int>(0.001 * sampleRate_));
+        const int keep = std::min(qCut, numBins_ - 1);
+        for (int k = keep + 1; k < numBins_; ++k)
+        {
+            cepsSpec_[static_cast<size_t>(2 * k)]     = T(0);
+            cepsSpec_[static_cast<size_t>(2 * k + 1)] = T(0);
+        }
+
+        fft_->inverse(cepsSpec_.data(), cepsTime_.data());
+        for (int k = 0; k < numBins_; ++k)
+            envLog_[static_cast<size_t>(k)] = cepsTime_[static_cast<size_t>(k)];
+
+        // Gains with linear interpolation at k*ratio, clamped to +-40 dB.
+        for (int k = 0; k < numBins_; ++k)
+        {
+            const double pos = std::min(static_cast<double>(k) * ratioActive_,
+                                        static_cast<double>(numBins_ - 1));
+            const auto i0 = static_cast<int>(pos);
+            const auto frac = static_cast<T>(pos - i0);
+            const T target = envLog_[static_cast<size_t>(i0)]
+                + (envLog_[static_cast<size_t>(std::min(i0 + 1, numBins_ - 1))]
+                   - envLog_[static_cast<size_t>(i0)]) * frac;
+            const T delta = std::clamp(target - envLog_[static_cast<size_t>(k)],
+                                       T(-4.6), T(4.6));
+            formantGain_[static_cast<size_t>(k)] = std::exp(delta);
+        }
+    }
+
+    /** @brief Overlap-add of the already-inverted frame (split for clarity). */
+    void synthesizeTail(int ch) noexcept
+    {
 
         // Overlap-add at the fixed synthesis hop. sqrt-Hann analysis+synthesis
         // with Rs = N/4 overlap-adds to a constant 2.0, hence the 0.5 norm.
@@ -605,6 +707,8 @@ private:
     std::vector<T> fftIn_, spec_, fftResult_;
     std::vector<T> prevAnalysis_, prevSynth_; ///< Reference-channel spectra (re,im).
     std::vector<T> mag_, prevMag_;            ///< Reference-channel magnitudes.
+    std::vector<T> cepsTime_, cepsSpec_;      ///< Formant cepstrum scratch.
+    std::vector<T> envLog_, formantGain_;     ///< Envelope + pre-warp gains.
     std::vector<T> rotRe_, rotIm_;            ///< Per-bin rigid rotation phasor.
     std::vector<int> peakBin_;
     int numPeaks_ = 0;
@@ -626,6 +730,7 @@ private:
     std::atomic<T> semitones_ { T(0) };
     std::atomic<T> mix_ { T(1) };
     std::atomic<bool> transientPreserve_ { true };
+    std::atomic<bool> formantPreserve_ { false };
 };
 
 } // namespace dspark

@@ -1169,6 +1169,7 @@ inline EffectSlot makePitchShifter()
     s.addSlider("Semitones", -12, 12, 0, "st");
     s.addSlider("Mix", 0, 1, 1, "");
     s.addToggle("Transient Preserve", true);
+    s.addToggle("Formant Preserve", false);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -1177,6 +1178,7 @@ inline EffectSlot makePitchShifter()
             case 0: p->setSemitones(v); break;
             case 1: p->setMix(v); break;
             case 2: p->setTransientPreserve(v > 0.5f); break;
+            case 3: p->setFormantPreserve(v > 0.5f); break;
         }
     };
     return s;

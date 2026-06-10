@@ -706,6 +706,7 @@
 #include "Analysis/PitchDetector.h"
 #include "Analysis/PitchFollower.h"
 #include "Analysis/PhaseCorrelation.h"
+#include "Analysis/EnvelopeFollower.h"
 
 // === I/O ====================================================================
 // File I/O uses <fstream>/<filesystem>, which do not exist on bare-metal

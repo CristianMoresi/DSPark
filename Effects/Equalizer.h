@@ -285,9 +285,23 @@ public:
     }
 
     /** @brief Returns the number of active bands. */
-    [[nodiscard]] int getNumBands() const noexcept 
-    { 
-        return numBands_.load(std::memory_order_relaxed); 
+    [[nodiscard]] int getNumBands() const noexcept
+    {
+        return numBands_.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Switches Peak bands to the Orfanidis matched (de-cramped) design.
+     *
+     * Bilinear bells cramp near Nyquist (narrower, response pinned at fs/2);
+     * the matched design prescribes the analog prototype's Nyquist gain so
+     * high bells keep their analog shape — the state-of-the-art digital EQ
+     * behaviour. Off by default for bit-compatibility with previous output.
+     */
+    void setMatchedBells(bool enabled) noexcept
+    {
+        matchedBells_.store(enabled, std::memory_order_relaxed);
+        configDirty_.store(true, std::memory_order_release);
     }
 
     /**
@@ -479,7 +493,10 @@ protected:
 
         switch (cfg.type)
         {
-            case BandType::Peak:      return BiquadCoeffs<T>::makePeak(sr, f, q, g);
+            case BandType::Peak:
+                return matchedBells_.load(std::memory_order_relaxed)
+                    ? BiquadCoeffs<T>::makePeakMatched(sr, f, q, g)
+                    : BiquadCoeffs<T>::makePeak(sr, f, q, g);
             case BandType::LowShelf:  return BiquadCoeffs<T>::makeLowShelf(sr, f, g, shelfSlopeFromQ(q, g));
             case BandType::HighShelf: return BiquadCoeffs<T>::makeHighShelf(sr, f, g, shelfSlopeFromQ(q, g));
             case BandType::LowPass:   return BiquadCoeffs<T>::makeLowPass(sr, f, q);
@@ -677,6 +694,7 @@ protected:
 
     std::atomic<bool> softMode_ { false };
     std::atomic<bool> configDirty_ { false };
+    std::atomic<bool> matchedBells_ { false };
 
     // Linear-phase state
     std::atomic<FilterMode> filterMode_ { FilterMode::MinimumPhase };

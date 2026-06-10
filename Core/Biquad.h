@@ -166,6 +166,79 @@ struct alignas(32) BiquadCoeffs
     }
 
     /**
+     * @brief Peaking filter with prescribed Nyquist gain (Orfanidis design).
+     *
+     * The bilinear (cookbook) peaking filter cramps near Nyquist: high-
+     * frequency bells get narrower and their response is pinned at fs/2,
+     * deviating audibly from the analog prototype above ~fs/6. This design
+     * (Orfanidis, JAES 45(6), 1997) prescribes the digital gain at Nyquist
+     * to equal the ANALOG prototype's gain there, matching the analog bell
+     * shape across the band — the standard "de-cramped" EQ used by
+     * state-of-the-art digital equalizers.
+     *
+     * Falls back to identity for |gain| < 0.01 dB. At low frequencies it
+     * converges to the cookbook response (as it should).
+     *
+     * @param sampleRate Sample rate in Hz.
+     * @param freq       Center frequency in Hz.
+     * @param Q          Quality factor (bandwidth = freq / Q).
+     * @param gainDb     Peak gain in decibels.
+     */
+    [[nodiscard]] static BiquadCoeffs makePeakMatched(double sampleRate, double freq,
+                                                      double Q, double gainDb) noexcept
+    {
+        freq = std::clamp(freq, 1.0, std::max(1.0, sampleRate * 0.495));
+        Q = std::max(Q, 0.001);
+        if (std::abs(gainDb) < 0.01)
+            return { T(1), T(0), T(0), T(0), T(0) };
+
+        const double G0 = 1.0;                                  // reference gain
+        const double G = std::pow(10.0, gainDb / 20.0);         // peak gain
+        const double GB = std::pow(10.0, gainDb / 40.0);        // bandwidth gain (half-dB)
+
+        const double w0 = 2.0 * std::numbers::pi * freq / sampleRate;
+        const double Dw = w0 / Q;
+
+        // Analog prototype gain at the physical Nyquist frequency:
+        // |Ha(jW)|^2 = (G0^2 (W^2-W0^2)^2 + G^2 Dw^2 W^2) /
+        //              (    (W^2-W0^2)^2 +      Dw^2 W^2),  W in rad/s.
+        const double W0 = 2.0 * std::numbers::pi * freq;
+        const double DW = W0 / Q;
+        const double Wn = std::numbers::pi * sampleRate;        // 2*pi*fs/2
+        const double d2 = (Wn * Wn - W0 * W0) * (Wn * Wn - W0 * W0);
+        const double G1 = std::sqrt((G0 * G0 * d2 + G * G * DW * DW * Wn * Wn)
+                                    / (d2 + DW * DW * Wn * Wn));
+
+        // Orfanidis closed-form coefficients.
+        const double G2 = G * G, G02 = G0 * G0, GB2 = GB * GB, G12 = G1 * G1;
+        const double F   = std::abs(G2 - GB2);
+        const double G00 = std::abs(G2 - G02);
+        const double F00 = std::abs(GB2 - G02);
+        const double F01 = std::abs(GB2 - G0 * G1);
+        const double F11 = std::abs(GB2 - G12);
+        const double G01 = std::abs(G2 - G0 * G1);
+        const double G11 = std::abs(G2 - G12);
+
+        const double t0 = std::tan(w0 / 2.0);
+        const double W2 = std::sqrt(G11 / G00) * t0 * t0;
+        const double DWd = (1.0 + std::sqrt(F00 / F11) * W2) * std::tan(Dw / 2.0);
+
+        const double C = F11 * DWd * DWd - 2.0 * W2 * (F01 - std::sqrt(F00 * F11));
+        const double D = 2.0 * W2 * (G01 - std::sqrt(G00 * G11));
+        const double A = std::sqrt(std::max((C + D) / std::max(F, 1e-30), 0.0));
+        const double B = std::sqrt(std::max((G2 * C + GB2 * D) / std::max(F, 1e-30), 0.0));
+
+        const double a0 = 1.0 + W2 + A;
+        return normalise(a0, {
+            T(G1 + G0 * W2 + B),
+            T(-2.0 * (G1 - G0 * W2)),
+            T(G1 + G0 * W2 - B),
+            T(-2.0 * (1.0 - W2)),
+            T(1.0 + W2 - A)
+        });
+    }
+
+    /**
      * @brief Low-shelf filter.
      * @param sampleRate Sample rate in Hz.
      * @param freq       Transition frequency in Hz.

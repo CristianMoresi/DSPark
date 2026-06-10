@@ -108,6 +108,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/Biquad.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -606,6 +607,64 @@ public:
     [[nodiscard]] T getWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getHighCrossover() const noexcept { return highCrossover_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getBassCrossover() const noexcept { return bassCrossover_.load(std::memory_order_relaxed); }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("ARVB"), 1);
+        w.write("type", static_cast<int32_t>(type_.load(std::memory_order_relaxed)));
+        w.write("decay", decayTime_.load(std::memory_order_relaxed));
+        w.write("size", size_.load(std::memory_order_relaxed));
+        w.write("damping", damping_.load(std::memory_order_relaxed));
+        w.write("diffusion", diffusion_.load(std::memory_order_relaxed));
+        w.write("modDepth", modDepth_.load(std::memory_order_relaxed));
+        w.write("modRate", modRate_.load(std::memory_order_relaxed));
+        w.write("preDelay", preDelayMs_.load(std::memory_order_relaxed));
+        w.write("erToLate", erToLateMs_.load(std::memory_order_relaxed));
+        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("width", width_.load(std::memory_order_relaxed));
+        w.write("highDecay", highDecayMult_.load(std::memory_order_relaxed));
+        w.write("bassDecay", bassDecayMult_.load(std::memory_order_relaxed));
+        w.write("highXover", highCrossover_.load(std::memory_order_relaxed));
+        w.write("bassXover", bassCrossover_.load(std::memory_order_relaxed));
+        w.write("earlyDb", static_cast<float>(20.0 * std::log10(std::max(
+            static_cast<double>(earlyLevel_.load(std::memory_order_relaxed)), 1e-6))));
+        w.write("lateDb", static_cast<float>(20.0 * std::log10(std::max(
+            static_cast<double>(lateLevel_.load(std::memory_order_relaxed)), 1e-6))));
+        w.write("toneLowCut", toneLowCutHz_.load(std::memory_order_relaxed));
+        w.write("toneHighCut", toneHighCutHz_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("ARVB")) return false;
+        setType(static_cast<Type>(r.read("type", 0)));
+        setDecay(static_cast<T>(r.read("decay", 1.0f)));
+        setSize(static_cast<T>(r.read("size", 0.5f)));
+        setDamping(static_cast<T>(r.read("damping", 0.5f)));
+        setDiffusion(static_cast<T>(r.read("diffusion", 0.7f)));
+        setModulation(static_cast<T>(r.read("modDepth", 0.1f)));
+        setModRate(static_cast<T>(r.read("modRate", 1.0f)));
+        setPreDelay(static_cast<T>(r.read("preDelay", 0.0f)));
+        setErToLateDelay(static_cast<T>(r.read("erToLate", 0.0f)));
+        setMix(static_cast<T>(r.read("mix", 0.3f)));
+        setWidth(static_cast<T>(r.read("width", 1.0f)));
+        setHighDecayMultiplier(static_cast<T>(r.read("highDecay", 0.5f)));
+        setBassDecayMultiplier(static_cast<T>(r.read("bassDecay", 1.2f)));
+        setHighCrossover(static_cast<T>(r.read("highXover", 5000.0f)));
+        setBassCrossover(static_cast<T>(r.read("bassXover", 200.0f)));
+        setEarlyLevel(static_cast<T>(r.read("earlyDb", 0.0f)));
+        setLateLevel(static_cast<T>(r.read("lateDb", 0.0f)));
+        const float lo = r.read("toneLowCut", -1.0f);
+        const float hi = r.read("toneHighCut", -1.0f);
+        if (lo > 0.0f) setToneLowCut(static_cast<T>(lo));
+        if (hi > 0.0f) setToneHighCut(static_cast<T>(hi));
+        return true;
+    }
 
 protected:
     // --- Constants -----------------------------------------------------------

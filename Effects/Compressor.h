@@ -31,6 +31,7 @@
 #include "../Core/DenormalGuard.h"
 #include "../Core/Hilbert.h"
 #include "../Core/TruePeakDetector.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -394,6 +395,59 @@ public:
 
     /** @brief Returns total processing latency in samples (caused by lookahead). */
     [[nodiscard]] int getLatency() const noexcept { return lookaheadSamples_; }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("COMP"), 1);
+        w.write("threshold", threshold_.load(std::memory_order_relaxed));
+        w.write("ratio", ratio_.load(std::memory_order_relaxed));
+        w.write("attack", attackMs_.load(std::memory_order_relaxed));
+        w.write("release", releaseMs_.load(std::memory_order_relaxed));
+        w.write("knee", kneeWidth_.load(std::memory_order_relaxed));
+        w.write("makeup", makeupGain_.load(std::memory_order_relaxed));
+        w.write("autoMakeup", autoMakeup_.load(std::memory_order_relaxed));
+        w.write("stereoLink", stereoLink_.load(std::memory_order_relaxed));
+        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("lookahead", lookaheadMs_.load(std::memory_order_relaxed));
+        w.write("hold", holdMs_.load(std::memory_order_relaxed));
+        w.write("range", rangeDb_.load(std::memory_order_relaxed));
+        w.write("detector", static_cast<int32_t>(detectorType_.load(std::memory_order_relaxed)));
+        w.write("topology", static_cast<int32_t>(topology_.load(std::memory_order_relaxed)));
+        w.write("character", static_cast<int32_t>(character_.load(std::memory_order_relaxed)));
+        w.write("mode", static_cast<int32_t>(mode_.load(std::memory_order_relaxed)));
+        w.write("scHpf", scHpfEnabled_.load(std::memory_order_relaxed));
+        w.write("scHpfFreq", scHpfFreq_.load(std::memory_order_relaxed));
+        w.write("rmsWindow", rmsWindowMsAtomic_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("COMP")) return false;
+        setThreshold(static_cast<T>(r.read("threshold", -20.0f)));
+        setRatio(static_cast<T>(r.read("ratio", 4.0f)));
+        setAttack(static_cast<T>(r.read("attack", 5.0f)));
+        setRelease(static_cast<T>(r.read("release", 100.0f)));
+        setKnee(static_cast<T>(r.read("knee", 0.0f)));
+        setMakeupGain(static_cast<T>(r.read("makeup", 0.0f)));
+        setAutoMakeup(r.read("autoMakeup", true));
+        setStereoLink(static_cast<T>(r.read("stereoLink", 1.0f)));
+        setMix(static_cast<T>(r.read("mix", 1.0f)));
+        setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
+        setHoldTime(static_cast<T>(r.read("hold", 0.0f)));
+        setRange(static_cast<T>(r.read("range", 100.0f)));
+        setDetector(static_cast<DetectorType>(r.read("detector", 0)));
+        setTopology(static_cast<Topology>(r.read("topology", 0)));
+        setCharacter(static_cast<Character>(r.read("character", 0)));
+        setMode(static_cast<Mode>(r.read("mode", 0)));
+        setSidechainHPF(r.read("scHpf", false), static_cast<T>(r.read("scHpfFreq", 80.0f)));
+        setRmsWindow(static_cast<T>(r.read("rmsWindow", 10.0f)));
+        return true;
+    }
 
 protected:
     static constexpr int kMaxChannels = 16;

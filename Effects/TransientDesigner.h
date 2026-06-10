@@ -27,6 +27,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -189,6 +190,28 @@ public:
         envFast_.fill(T(1e-5)); // Init to noise floor
         envSlow_.fill(T(1e-5));
         lastOutput_.fill(T(0));
+    }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("TDES"), 1);
+        w.write("attack", attackAmount_.load(std::memory_order_relaxed) * 100.0f);   // percent
+        w.write("sustain", sustainAmount_.load(std::memory_order_relaxed) * 100.0f); // percent
+        w.write("outputDep", outputDepRecovery_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("TDES")) return false;
+        setAttack(static_cast<T>(r.read("attack", 0.0f)));
+        setSustain(static_cast<T>(r.read("sustain", 0.0f)));
+        setOutputDepRecovery(r.read("outputDep", false));
+        return true;
     }
 
 private:

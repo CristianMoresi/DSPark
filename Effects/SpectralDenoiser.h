@@ -26,6 +26,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/DspMath.h"
 #include "../Core/SpectralProcessor.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <atomic>
@@ -105,6 +106,26 @@ public:
 
     /** @brief Latency in samples (the STFT pipeline's). */
     [[nodiscard]] int getLatency() const noexcept { return stft_.getLatency(); }
+
+    /** @brief Serializes the parameter state (the learned profile is material-
+     *  dependent content, not a preset, and is intentionally not included). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("DNSE"), 1);
+        w.write("reduction", reduction_.load(std::memory_order_relaxed));
+        w.write("threshold", threshold_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("DNSE")) return false;
+        setReduction(static_cast<T>(r.read("reduction", 18.0f)));
+        setThreshold(static_cast<T>(r.read("threshold", 2.0f)));
+        return true;
+    }
 
     // -- Processing -------------------------------------------------------------------
 

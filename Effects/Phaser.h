@@ -33,6 +33,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/DspMath.h" // Must provide fast_exp and fast_tan
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -311,6 +312,38 @@ public:
 
     /** @brief Retrieves the current sweep rate. @return Rate in Hz. */
     [[nodiscard]] T getRate() const noexcept { return rate_.load(std::memory_order_relaxed); }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("PHSR"), 1);
+        w.write("rate", rate_.load(std::memory_order_relaxed));
+        w.write("depth", depth_.load(std::memory_order_relaxed));
+        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("feedback", feedback_.load(std::memory_order_relaxed));
+        w.write("minFreq", minFreq_.load(std::memory_order_relaxed));
+        w.write("maxFreq", maxFreq_.load(std::memory_order_relaxed));
+        w.write("stages", numStages_.load(std::memory_order_relaxed));
+        w.write("spread", stereoSpread_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("PHSR")) return false;
+        setRate(static_cast<T>(r.read("rate", 0.5f)));
+        setDepth(static_cast<T>(r.read("depth", 0.8f)));
+        setMix(static_cast<T>(r.read("mix", 0.5f)));
+        setFeedback(static_cast<T>(r.read("feedback", 0.0f)));
+        setFrequencyRange(static_cast<T>(r.read("minFreq", 200.0f)),
+                          static_cast<T>(r.read("maxFreq", 6000.0f)));
+        setStages(r.read("stages", 4));
+        setStereoSpread(static_cast<T>(r.read("spread", 0.0f)));
+        return true;
+    }
 
 protected:
     static constexpr int kMaxChannels = 16;

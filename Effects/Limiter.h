@@ -36,6 +36,7 @@
 #include "../Core/SmoothedValue.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/TruePeakDetector.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -291,6 +292,32 @@ public:
     [[nodiscard]] bool isSafetyClipEnabled() const noexcept { return safetyClipEnabled_.load(std::memory_order_relaxed); }
     [[nodiscard]] int getLatency() const noexcept { return lookaheadSamples_; }
     [[nodiscard]] T getGainReductionDb() const noexcept { return gainToDecibels(currentGain_); }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("LIMT"), 1);
+        w.write("ceiling", ceilingDb_.load(std::memory_order_relaxed));
+        w.write("release", releaseMs_.load(std::memory_order_relaxed));
+        w.write("truePeak", truePeakEnabled_.load(std::memory_order_relaxed));
+        w.write("adaptive", adaptiveRelease_.load(std::memory_order_relaxed));
+        w.write("safetyClip", safetyClipEnabled_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("LIMT")) return false;
+        setCeiling(static_cast<T>(r.read("ceiling", -0.3f)));
+        setRelease(static_cast<T>(r.read("release", 100.0f)));
+        setTruePeak(r.read("truePeak", false));
+        setAdaptiveRelease(r.read("adaptive", false));
+        setSafetyClip(r.read("safetyClip", false));
+        return true;
+    }
 
 protected:
     static constexpr int kMaxChannels = 16;

@@ -24,6 +24,7 @@
 #include "../Core/DspMath.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <atomic>
@@ -151,6 +152,28 @@ public:
     void reset() noexcept
     {
         sideState_ = T(0);
+    }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("WIDE"), 1);
+        w.write("width", width_.load(std::memory_order_relaxed));
+        w.write("bassMono", bassMonoEnabled_.load(std::memory_order_relaxed));
+        w.write("bassCutoff", static_cast<float>(bassMonoCutoff_.load(std::memory_order_relaxed)));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("WIDE")) return false;
+        setWidth(static_cast<T>(r.read("width", 1.0f)));
+        setBassMono(r.read("bassMono", false),
+                    static_cast<double>(r.read("bassCutoff", 100.0f)));
+        return true;
     }
 
 protected:

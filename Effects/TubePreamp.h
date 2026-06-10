@@ -46,6 +46,7 @@
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/Oversampling.h"
+#include "../Core/StateBlob.h"
 #include "../Core/WDF.h"
 
 #include <algorithm>
@@ -174,6 +175,37 @@ public:
     [[nodiscard]] T getSupplyVoltage() const noexcept
     {
         return supplyNow_.load(std::memory_order_relaxed);
+    }
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("TUBE"), 1);
+        w.write("drive", driveDb_.load(std::memory_order_relaxed));
+        w.write("treble", treble_.load(std::memory_order_relaxed));
+        w.write("bass", bass_.load(std::memory_order_relaxed));
+        w.write("middle", middle_.load(std::memory_order_relaxed));
+        w.write("sag", sag_.load(std::memory_order_relaxed));
+        w.write("stages", stages_.load(std::memory_order_relaxed));
+        w.write("output", outputDb_.load(std::memory_order_relaxed));
+        w.write("mix", mix_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("TUBE")) return false;
+        setDrive(static_cast<T>(r.read("drive", 0.0f)));
+        setTreble(static_cast<T>(r.read("treble", 0.5f)));
+        setBass(static_cast<T>(r.read("bass", 0.5f)));
+        setMiddle(static_cast<T>(r.read("middle", 0.5f)));
+        setSag(static_cast<T>(r.read("sag", 0.3f)));
+        setStages(r.read("stages", 1));
+        setOutput(static_cast<T>(r.read("output", 0.0f)));
+        setMix(static_cast<T>(r.read("mix", 1.0f)));
+        return true;
     }
 
     // -- Processing -------------------------------------------------------------------

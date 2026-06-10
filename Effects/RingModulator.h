@@ -29,6 +29,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/DspMath.h"
 #include "../Core/Phasor.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -212,6 +213,30 @@ public:
     [[nodiscard]] T getFrequency() const noexcept { return frequency_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
     [[nodiscard]] Mode getMode() const noexcept { return mode_.load(std::memory_order_relaxed); }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("RING"), 1);
+        w.write("frequency", frequency_.load(std::memory_order_relaxed));
+        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("mode", static_cast<int32_t>(mode_.load(std::memory_order_relaxed)));
+        w.write("soar", soar_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("RING")) return false;
+        setFrequency(static_cast<T>(r.read("frequency", 440.0f)));
+        setMix(static_cast<T>(r.read("mix", 1.0f)));
+        setMode(static_cast<Mode>(r.read("mode", 0)));
+        setSoar(static_cast<T>(r.read("soar", 0.0f)));
+        return true;
+    }
 
 private:
     int numChannels_ = 2;

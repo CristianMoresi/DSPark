@@ -28,6 +28,7 @@
 #include "../Core/Oversampling.h"
 #include "../Core/RingBuffer.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -206,6 +207,93 @@ public:
         }
         for (int ch = 0; ch < kMaxChannels; ++ch)
             lookaheadBuf_[ch].reset();
+    }
+
+
+    /** @brief Serializes bands and modes (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("DYEQ"), 1);
+        const int n = numBands_.load(std::memory_order_relaxed);
+        w.write("numBands", n);
+        char key[28];
+        for (int i = 0; i < n; ++i)
+        {
+            const BandConfig& c = configs_[static_cast<size_t>(i)];
+            std::snprintf(key, sizeof(key), "b%d.freq", i);
+            w.write(key, static_cast<float>(c.frequency));
+            std::snprintf(key, sizeof(key), "b%d.q", i);
+            w.write(key, static_cast<float>(c.q));
+            std::snprintf(key, sizeof(key), "b%d.thresh", i);
+            w.write(key, static_cast<float>(c.threshold));
+            std::snprintf(key, sizeof(key), "b%d.on", i);
+            w.write(key, c.enabled);
+            std::snprintf(key, sizeof(key), "b%d.aRatio", i);
+            w.write(key, static_cast<float>(c.aboveRatio));
+            std::snprintf(key, sizeof(key), "b%d.aAtk", i);
+            w.write(key, static_cast<float>(c.aboveAttackMs));
+            std::snprintf(key, sizeof(key), "b%d.aRel", i);
+            w.write(key, static_cast<float>(c.aboveReleaseMs));
+            std::snprintf(key, sizeof(key), "b%d.aRange", i);
+            w.write(key, static_cast<float>(c.aboveRangeDb));
+            std::snprintf(key, sizeof(key), "b%d.aBoost", i);
+            w.write(key, c.aboveBoost);
+            std::snprintf(key, sizeof(key), "b%d.bRatio", i);
+            w.write(key, static_cast<float>(c.belowRatio));
+            std::snprintf(key, sizeof(key), "b%d.bAtk", i);
+            w.write(key, static_cast<float>(c.belowAttackMs));
+            std::snprintf(key, sizeof(key), "b%d.bRel", i);
+            w.write(key, static_cast<float>(c.belowReleaseMs));
+            std::snprintf(key, sizeof(key), "b%d.bRange", i);
+            w.write(key, static_cast<float>(c.belowRangeDb));
+            std::snprintf(key, sizeof(key), "b%d.bBoost", i);
+            w.write(key, c.belowBoost);
+        }
+        return w.blob();
+    }
+
+    /** @brief Restores bands from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("DYEQ")) return false;
+        const int n = std::clamp(r.read("numBands", 0), 0, MaxBands);
+        char key[28];
+        for (int i = 0; i < n; ++i)
+        {
+            BandConfig c;
+            std::snprintf(key, sizeof(key), "b%d.freq", i);
+            c.frequency = static_cast<T>(r.read(key, 1000.0f));
+            std::snprintf(key, sizeof(key), "b%d.q", i);
+            c.q = static_cast<T>(r.read(key, 1.0f));
+            std::snprintf(key, sizeof(key), "b%d.thresh", i);
+            c.threshold = static_cast<T>(r.read(key, -20.0f));
+            std::snprintf(key, sizeof(key), "b%d.on", i);
+            c.enabled = r.read(key, true);
+            std::snprintf(key, sizeof(key), "b%d.aRatio", i);
+            c.aboveRatio = static_cast<T>(r.read(key, 1.0f));
+            std::snprintf(key, sizeof(key), "b%d.aAtk", i);
+            c.aboveAttackMs = static_cast<T>(r.read(key, 5.0f));
+            std::snprintf(key, sizeof(key), "b%d.aRel", i);
+            c.aboveReleaseMs = static_cast<T>(r.read(key, 50.0f));
+            std::snprintf(key, sizeof(key), "b%d.aRange", i);
+            c.aboveRangeDb = static_cast<T>(r.read(key, 12.0f));
+            std::snprintf(key, sizeof(key), "b%d.aBoost", i);
+            c.aboveBoost = r.read(key, false);
+            std::snprintf(key, sizeof(key), "b%d.bRatio", i);
+            c.belowRatio = static_cast<T>(r.read(key, 1.0f));
+            std::snprintf(key, sizeof(key), "b%d.bAtk", i);
+            c.belowAttackMs = static_cast<T>(r.read(key, 10.0f));
+            std::snprintf(key, sizeof(key), "b%d.bRel", i);
+            c.belowReleaseMs = static_cast<T>(r.read(key, 100.0f));
+            std::snprintf(key, sizeof(key), "b%d.bRange", i);
+            c.belowRangeDb = static_cast<T>(r.read(key, 12.0f));
+            std::snprintf(key, sizeof(key), "b%d.bBoost", i);
+            c.belowBoost = r.read(key, false);
+            setBand(i, c);
+        }
+        setNumBands(n);
+        return true;
     }
 
 private:

@@ -27,6 +27,7 @@
 #include "../Core/DenormalGuard.h"
 #include "../Core/FFT.h"
 #include "../Core/SmoothedValue.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -224,6 +225,13 @@ public:
     [[nodiscard]] int getOrder() const noexcept { return order_.load(std::memory_order_relaxed); }
     [[nodiscard]] FilterMode getFilterMode() const noexcept { return filterMode_.load(std::memory_order_relaxed); }
 
+    /** @brief Returns the target frequency of split point `index`. */
+    [[nodiscard]] T getCrossoverFrequency(int index) const noexcept
+    {
+        if (index < 0 || index >= kMaxSplits) return T(0);
+        return targetFrequencies_[static_cast<size_t>(index)].load(std::memory_order_relaxed);
+    }
+
     /** @brief Returns latency in samples (0 for IIR, FIR group delay for linear-phase). */
     [[nodiscard]] int getLatency() const noexcept
     {
@@ -241,6 +249,43 @@ public:
             for (auto& b : apChain.stages) b.reset();
             
         std::fill(lpPrevBlockFlat_.begin(), lpPrevBlockFlat_.end(), T(0));
+    }
+
+
+    /** @brief Serializes the split topology (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("XOVR"), 1);
+        const int n = getNumBands();
+        w.write("numBands", n);
+        w.write("order", getOrder());
+        w.write("mode", static_cast<int32_t>(getFilterMode()));
+        char key[16];
+        for (int i = 0; i < n - 1; ++i)
+        {
+            std::snprintf(key, sizeof(key), "x%d", i);
+            w.write(key, static_cast<float>(getCrossoverFrequency(i)));
+        }
+        return w.blob();
+    }
+
+    /** @brief Restores the split topology from a blob. */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("XOVR")) return false;
+        setNumBands(std::clamp(r.read("numBands", 2), 2, MaxBands));
+        setOrder(r.read("order", 24));
+        setFilterMode(static_cast<FilterMode>(r.read("mode", 0)));
+        const int n = getNumBands();
+        char key[16];
+        for (int i = 0; i < n - 1; ++i)
+        {
+            std::snprintf(key, sizeof(key), "x%d", i);
+            const float f = r.read(key, -1.0f);
+            if (f > 0.0f) setCrossoverFrequency(i, static_cast<T>(f));
+        }
+        return true;
     }
 
 private:

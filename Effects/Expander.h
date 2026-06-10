@@ -19,6 +19,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <atomic>
@@ -139,8 +140,10 @@ public:
 
     // -- Queries -------------------------------------------------------------
 
-    /** @return The current state of the expander's logic gate. */
-    [[nodiscard]] State getState() const noexcept { return state_; }
+    /** @return The current state of the expander's logic gate.
+     *  (Renamed from getState(), which now follows the framework-wide preset
+     *  serialization convention.) */
+    [[nodiscard]] State getGateState() const noexcept { return state_; }
     
     /** @return The current actual gain being applied, in decibels. */
     [[nodiscard]] T getCurrentGainDb() const noexcept { return gainToDecibels(gateGain_); }
@@ -155,6 +158,42 @@ public:
         
         std::fill(scHpfState_.begin(), scHpfState_.end(), T(0));
         std::fill(scHpfPrev_.begin(), scHpfPrev_.end(), T(0));
+    }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("XPND"), 1);
+        w.write("threshold", threshold_.load(std::memory_order_relaxed));
+        w.write("ratio", ratio_.load(std::memory_order_relaxed));
+        w.write("hysteresis", hysteresis_.load(std::memory_order_relaxed));
+        w.write("attack", attackMs_.load(std::memory_order_relaxed));
+        w.write("hold", holdMs_.load(std::memory_order_relaxed));
+        w.write("release", releaseMs_.load(std::memory_order_relaxed));
+        w.write("rangeDb", static_cast<float>(20.0
+            * std::log10(std::max(static_cast<double>(
+                  rangeLinear_.load(std::memory_order_relaxed)), 1e-7))));
+        w.write("scHpf", scHpfEnabled_.load(std::memory_order_relaxed));
+        w.write("scHpfFreq", scHpfFreqHz_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("XPND")) return false;
+        setThreshold(static_cast<T>(r.read("threshold", -40.0f)));
+        setRatio(static_cast<T>(r.read("ratio", 4.0f)));
+        setHysteresis(static_cast<T>(r.read("hysteresis", 4.0f)));
+        setAttack(static_cast<T>(r.read("attack", 0.5f)));
+        setHold(static_cast<T>(r.read("hold", 50.0f)));
+        setRelease(static_cast<T>(r.read("release", 100.0f)));
+        setRange(static_cast<T>(r.read("rangeDb", -80.0f)));
+        setSidechainHPF(r.read("scHpf", false),
+                        static_cast<double>(r.read("scHpfFreq", 80.0f)));
+        return true;
     }
 
 protected:

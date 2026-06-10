@@ -48,6 +48,7 @@
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/Hysteresis.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <atomic>
@@ -133,6 +134,29 @@ public:
 
     /** @brief Zero — the model is all minimum-phase IIR and memoryless NR. */
     [[nodiscard]] static constexpr int getLatency() noexcept { return 0; }
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("XFMR"), 1);
+        w.write("drive", driveDb_.load(std::memory_order_relaxed));
+        w.write("coreSize", coreSize_.load(std::memory_order_relaxed));
+        w.write("resonance", resonance_.load(std::memory_order_relaxed));
+        w.write("mix", mix_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("XFMR")) return false;
+        setDrive(static_cast<T>(r.read("drive", 0.0f)));
+        setCoreSize(static_cast<T>(r.read("coreSize", 0.5f)));
+        setResonance(static_cast<T>(r.read("resonance", 0.3f)));
+        setMix(static_cast<T>(r.read("mix", 1.0f)));
+        return true;
+    }
 
     // -- Processing -------------------------------------------------------------------
 

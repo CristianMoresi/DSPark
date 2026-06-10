@@ -25,6 +25,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/DspMath.h"
 #include "../Core/SimdOps.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <atomic>
@@ -152,6 +153,24 @@ public:
     void setSmoothingTime(T ms) noexcept
     {
         smoothTimeSecs_ = std::max<T>(ms * T(0.001), T(0.001)); // Prevent division by zero
+    }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("AGAN"), 1);
+        w.write("maxComp", maxCompensation_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("AGAN")) return false;
+        setMaxCompensation(static_cast<T>(r.read("maxComp", 12.0f)));
+        return true;
     }
 
 private:

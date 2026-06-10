@@ -19,6 +19,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/SimdOps.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <atomic>
@@ -240,6 +241,30 @@ public:
     void reset() noexcept
     {
         forceSynchronize();
+    }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("GAIN"), 1);
+        w.write("gainLinear", targetGainLinear_.load(std::memory_order_relaxed));
+        w.write("rampMs", static_cast<float>(rampTimeMs_.load(std::memory_order_relaxed)));
+        w.write("muted", muted_.load(std::memory_order_relaxed));
+        w.write("inverted", inverted_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("GAIN")) return false;
+        setGainLinear(static_cast<T>(r.read("gainLinear", 1.0f)));
+        setRampTime(static_cast<double>(r.read("rampMs", 10.0f)));
+        setMuted(r.read("muted", false));
+        setInverted(r.read("inverted", false));
+        return true;
     }
 
 protected:

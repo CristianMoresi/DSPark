@@ -45,6 +45,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -330,6 +331,44 @@ public:
         zeroCrossSamples_ = 0;
         prevSign_ = false;
         estimatedPeriod_ = 0;
+    }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("GATE"), 1);
+        w.write("threshold", threshold_.load(std::memory_order_relaxed));
+        w.write("hysteresis", hysteresis_.load(std::memory_order_relaxed));
+        w.write("attack", attackMs_.load(std::memory_order_relaxed));
+        w.write("hold", holdMs_.load(std::memory_order_relaxed));
+        w.write("release", releaseMs_.load(std::memory_order_relaxed));
+        w.write("range", rangeDb_.load(std::memory_order_relaxed));
+        w.write("duck", duckMode_.load(std::memory_order_relaxed));
+        w.write("gateMode", static_cast<int32_t>(gateMode_.load(std::memory_order_relaxed)));
+        w.write("adaptiveHold", adaptiveHold_.load(std::memory_order_relaxed));
+        w.write("scHpf", scHpfEnabled_.load(std::memory_order_relaxed));
+        w.write("scHpfFreq", scHpfFreq_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("GATE")) return false;
+        setThreshold(static_cast<T>(r.read("threshold", -40.0f)));
+        setHysteresis(static_cast<T>(r.read("hysteresis", 4.0f)));
+        setAttack(static_cast<T>(r.read("attack", 0.5f)));
+        setHold(static_cast<T>(r.read("hold", 50.0f)));
+        setRelease(static_cast<T>(r.read("release", 100.0f)));
+        setRange(static_cast<T>(r.read("range", -80.0f)));
+        setDuckMode(r.read("duck", false));
+        setGateMode(static_cast<GateMode>(r.read("gateMode", 0)));
+        setAdaptiveHold(r.read("adaptiveHold", false));
+        setSidechainHPF(r.read("scHpf", false),
+                        static_cast<double>(r.read("scHpfFreq", 80.0f)));
+        return true;
     }
 
 protected:

@@ -27,6 +27,7 @@
 #include "../Core/Biquad.h"
 #include "../Core/DspMath.h"
 #include "../Core/Smoothers.h"
+#include "../Core/StateBlob.h"
 #include "Delay.h"
 
 #include <algorithm>
@@ -135,6 +136,36 @@ public:
     void setSpectralFrequency(float hz) { spectralFreq_.store(std::clamp(hz, 20.0f, 20000.0f), std::memory_order_relaxed); }
     void setSpectralMaxGain(float dB)   { spectralMaxGain_.store(dB, std::memory_order_relaxed); }
     void setSmoothingTime(float ms)     { smoothingTime_.store(ms, std::memory_order_relaxed); }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("PANR"), 1);
+        w.write("pan", pan_.load(std::memory_order_relaxed));
+        w.write("algorithm", static_cast<int32_t>(algorithm_.load(std::memory_order_relaxed)));
+        w.write("smoothing", smoothingTime_.load(std::memory_order_relaxed));
+        w.write("binauralITD", binauralMaxITD_.load(std::memory_order_relaxed));
+        w.write("haasDelay", haasMaxDelay_.load(std::memory_order_relaxed));
+        w.write("spectralFreq", spectralFreq_.load(std::memory_order_relaxed));
+        w.write("spectralGain", spectralMaxGain_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("PANR")) return false;
+        setPan(static_cast<T>(r.read("pan", 0.0f)));
+        setAlgorithm(static_cast<Algorithm>(r.read("algorithm", 0)));
+        setSmoothingTime(r.read("smoothing", 50.0f));
+        setBinauralMaxITD(r.read("binauralITD", 0.66f));
+        setHaasMaxDelay(r.read("haasDelay", 30.0f));
+        setSpectralFrequency(r.read("spectralFreq", 4000.0f));
+        setSpectralMaxGain(r.read("spectralGain", 6.0f));
+        return true;
+    }
 
 protected:
     void applyEqualPower(AudioBufferView<T> buffer, float /*panTarget*/)

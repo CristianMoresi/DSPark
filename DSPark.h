@@ -430,6 +430,7 @@
  * | `wdf::*`                 | Core/WDF.h                | Wave digital filters: R/L/C, adaptors, NR diode roots |
  * | `Hysteresis<T>`          | Core/Hysteresis.h         | Jiles-Atherton magnetic hysteresis (implicit NR solver) |
  * | `ModulationRouter<T>`    | Core/ModulationRouter.h   | Block-rate modulation routing: sources to parameter setters |
+ * | `StateWriter/StateReader` | Core/StateBlob.h          | Versioned preset blobs + JSON helpers (getState/setState) |
  * | `Resampler<T>`           | Core/Resampler.h          | Polyphase windowed-sinc sample rate converter     |
  * | `WindowFunctions<T>`     | Core/WindowFunctions.h    | 8 window functions (Hann, Kaiser, Blackman...)    |
  * | `Smoothers`              | Core/Smoothers.h          | 9 parameter smoothing algorithms                  |
@@ -646,6 +647,7 @@
 #include "Core/ZeroLatencyConvolver.h"
 #include "Core/WDF.h"
 #include "Core/ModulationRouter.h"
+#include "Core/StateBlob.h"
 #include "Core/Hysteresis.h"
 #include "Core/Resampler.h"
 #include "Core/EnvelopeGenerator.h"

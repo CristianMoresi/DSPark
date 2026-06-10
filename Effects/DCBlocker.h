@@ -18,6 +18,7 @@
 #include "../Core/Biquad.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -238,6 +239,26 @@ public:
         yPrev_.fill(T(0));
         for (auto& stage : biquadStages_)
             stage.reset();
+    }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("DCBL"), 1);
+        w.write("order", order_.load(std::memory_order_relaxed));
+        w.write("cutoff", cutoffHz_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("DCBL")) return false;
+        setOrder(r.read("order", 1));
+        setCutoff(static_cast<T>(r.read("cutoff", 5.0f)));
+        return true;
     }
 
 protected:

@@ -28,6 +28,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/DspMath.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <atomic>
@@ -207,6 +208,26 @@ public:
     [[nodiscard]] T getGain() const noexcept 
     { 
         return gain_.load(std::memory_order_relaxed); 
+    }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("NOIS"), 1);
+        w.write("gain", gain_.load(std::memory_order_relaxed));
+        w.write("type", static_cast<int32_t>(type_.load(std::memory_order_relaxed)));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("NOIS")) return false;
+        setGain(static_cast<T>(r.read("gain", 1.0f)));
+        setType(static_cast<Type>(r.read("type", 0)));
+        return true;
     }
 
 private:

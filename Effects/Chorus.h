@@ -26,6 +26,7 @@
 #include "../Core/DspMath.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -277,6 +278,38 @@ public:
         // thread-safe, so we must not write their state from the control thread).
         lfoWaveform_.store(wf, std::memory_order_relaxed);
         waveformDirty_.store(true, std::memory_order_relaxed);
+    }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("CHOR"), 1);
+        w.write("rate", rate_.load(std::memory_order_relaxed));
+        w.write("depthMs", depthMs_.load(std::memory_order_relaxed));
+        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("feedback", feedback_.load(std::memory_order_relaxed));
+        w.write("centerDelay", centerDelayMs_.load(std::memory_order_relaxed));
+        w.write("spread", stereoSpread_.load(std::memory_order_relaxed));
+        w.write("voices", numVoices_.load(std::memory_order_relaxed));
+        w.write("autoDepth", autoDepth_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("CHOR")) return false;
+        setRate(static_cast<T>(r.read("rate", 1.0f)));
+        setDepthMs(static_cast<T>(r.read("depthMs", 3.5f)));
+        setMix(static_cast<T>(r.read("mix", 0.5f)));
+        setFeedback(static_cast<T>(r.read("feedback", 0.0f)));
+        setCenterDelay(static_cast<T>(r.read("centerDelay", 7.0f)));
+        setStereoSpread(static_cast<T>(r.read("spread", 0.5f)));
+        setVoices(r.read("voices", 2));
+        setAutoDepth(r.read("autoDepth", false));
+        return true;
     }
 
 protected:

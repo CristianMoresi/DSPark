@@ -32,6 +32,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/Biquad.h"
 #include "../Core/DspMath.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -164,6 +165,38 @@ public:
     [[nodiscard]] DetectionMode getDetectionMode() const noexcept { return detectionMode_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getAttack() const noexcept { return attackMs_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getRelease() const noexcept { return releaseMs_.load(std::memory_order_relaxed); }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("DEES"), 1);
+        w.write("frequency", frequency_.load(std::memory_order_relaxed));
+        // bandwidth_ stores Q = 1/(2 sinh(ln2/2 * oct)); serialize back in octaves.
+        w.write("bandwidth", static_cast<float>(std::asinh(1.0 / (2.0 * static_cast<double>(
+            bandwidth_.load(std::memory_order_relaxed)))) / 0.34657359));
+        w.write("threshold", threshold_.load(std::memory_order_relaxed));
+        w.write("reduction", maxReduction_.load(std::memory_order_relaxed));
+        w.write("attack", attackMs_.load(std::memory_order_relaxed));
+        w.write("release", releaseMs_.load(std::memory_order_relaxed));
+        w.write("detection", static_cast<int32_t>(detectionMode_.load(std::memory_order_relaxed)));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("DEES")) return false;
+        setFrequency(static_cast<T>(r.read("frequency", 7000.0f)));
+        setBandwidth(static_cast<T>(r.read("bandwidth", 2.0f)));
+        setThreshold(static_cast<T>(r.read("threshold", -20.0f)));
+        setReduction(static_cast<T>(r.read("reduction", 12.0f)));
+        setAttack(static_cast<T>(r.read("attack", 0.5f)));
+        setRelease(static_cast<T>(r.read("release", 20.0f)));
+        setDetectionMode(static_cast<DetectionMode>(r.read("detection", 0)));
+        return true;
+    }
 
 private:
     template <bool IsDerivative>

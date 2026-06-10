@@ -33,6 +33,7 @@
 #include "../Core/AnalogRandom.h"
 #include "../Core/SpscQueue.h"
 #include "../Core/SpinLock.h"
+#include "../Core/StateBlob.h"
 #include "MidSide.h"
 
 #include <algorithm>
@@ -922,7 +923,11 @@ public:
      * 10 kHz at 48 kHz) — inherent to the technique and far smaller than the
      * aliasing it removes.
      */
-    void setAntialiasing(bool on) noexcept { for (auto& a : pool_) if (a) a->setAntialias(on); }
+    void setAntialiasing(bool on) noexcept
+    {
+        antialiasShadow_.store(on, std::memory_order_relaxed);   // serialization readback
+        for (auto& a : pool_) if (a) a->setAntialias(on);
+    }
 
     /**
      * @brief Sets a derivative-based (slew rate) saturation multiplier.
@@ -1010,6 +1015,60 @@ public:
      * @return Gain reduction in decibels (always <= 0.0).
      */
     [[nodiscard]] SampleType getGainReductionDb() const noexcept { return gainReductionDb_.load(std::memory_order_relaxed); }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        Params p;
+        {
+            SpinLock::ScopedLock guard(paramsLock_);
+            p = lastParams_;
+        }
+        StateWriter w(stateId("SATU"), 1);
+        w.write("algorithm", static_cast<int32_t>(p.algorithm));
+        w.write("procMode", static_cast<int32_t>(p.processingMode));
+        w.write("outMode", static_cast<int32_t>(p.outputMode));
+        w.write("drive", static_cast<float>(p.driveDb));
+        w.write("mix", static_cast<float>(p.mix));
+        w.write("character", static_cast<float>(p.character));
+        w.write("drift", static_cast<float>(p.analogDrift));
+        w.write("preHp", static_cast<float>(p.preFilterHpFreq));
+        w.write("tiltFreq", static_cast<float>(p.postFilterTiltFreq));
+        w.write("tiltGain", static_cast<float>(p.postFilterTiltGain));
+        w.write("outputGain", static_cast<float>(p.outputGain));
+        w.write("dcBlocking", p.dcBlocking);
+        w.write("antialias", antialiasShadow_.load(std::memory_order_relaxed));
+        w.write("adaptiveBlend", adaptiveBlend_.load(std::memory_order_relaxed));
+        w.write("slewSens", slewSensitivity_.load(std::memory_order_relaxed));
+        w.write("oversampling", oversamplingFactor_);
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob. The oversampling factor takes
+     *  effect on the next prepare(), as setOversampling documents. */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("SATU")) return false;
+        setAlgorithm(static_cast<Algorithm>(r.read("algorithm", 0)));
+        setProcessingMode(static_cast<ProcessingMode>(r.read("procMode", 0)));
+        setOutputMode(static_cast<OutputMode>(r.read("outMode", 0)));
+        setDrive(static_cast<SampleType>(r.read("drive", 0.0f)));
+        setMix(static_cast<SampleType>(r.read("mix", 1.0f)));
+        setCharacter(static_cast<SampleType>(r.read("character", 0.0f)));
+        setAnalogDrift(static_cast<SampleType>(r.read("drift", 0.0f)));
+        setPreFilterHpFrequency(static_cast<SampleType>(r.read("preHp", 20.0f)));
+        setPostFilterTilt(static_cast<SampleType>(r.read("tiltFreq", 1000.0f)),
+                          static_cast<SampleType>(r.read("tiltGain", 0.0f)));
+        setOutputGain(static_cast<SampleType>(r.read("outputGain", 0.0f)));
+        setDcBlocking(r.read("dcBlocking", true));
+        setAntialiasing(r.read("antialias", false));
+        setAdaptiveBlend(r.read("adaptiveBlend", false));
+        setSlewSensitivity(static_cast<SampleType>(r.read("slewSens", 0.0f)));
+        setOversampling(r.read("oversampling", 1));
+        return true;
+    }
 
 protected:
     struct Params
@@ -1271,7 +1330,8 @@ protected:
 
     SpscQueue<Params>  paramQueue_;
     Params             lastParams_;
-    SpinLock           paramsLock_;
+    mutable SpinLock   paramsLock_;
+    std::atomic<bool>  antialiasShadow_ { false };  ///< Mirror for getState.
 
     ProcessingMode procMode_   = ProcessingMode::Stereo;
     OutputMode     outputMode_ = OutputMode::Normal;

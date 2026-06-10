@@ -27,6 +27,7 @@
 #include "../Core/DspMath.h"
 #include "../Core/Phasor.h"
 #include "../Core/RingBuffer.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <atomic>
@@ -221,6 +222,30 @@ public:
 
     [[nodiscard]] T getRate() const noexcept { return rate_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getDepth() const noexcept { return depthSemitones_.load(std::memory_order_relaxed); }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("VIBR"), 1);
+        w.write("rate", rate_.load(std::memory_order_relaxed));
+        w.write("depth", depthSemitones_.load(std::memory_order_relaxed));
+        w.write("modRate", modRate_.load(std::memory_order_relaxed));
+        w.write("modDepth", modDepth_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("VIBR")) return false;
+        setRate(static_cast<T>(r.read("rate", 5.0f)));
+        setDepth(static_cast<T>(r.read("depth", 0.5f)));
+        setModRate(static_cast<T>(r.read("modRate", 0.0f)));
+        setModDepth(static_cast<T>(r.read("modDepth", 0.0f)));
+        return true;
+    }
 
 private:
     double sampleRate_ = 44100.0;

@@ -25,7 +25,7 @@
 
 #if defined(_M_AMD64) || defined(_M_X64) || defined(__x86_64__) || defined(__amd64__)
     #define DSPARK_FFT_SSE3 1
-    #include <pmmintrin.h> // Includes SSE3 (_mm_addsub_ps)
+    #include <pmmintrin.h> // SSE3 _mm_addsub_* (guarded below) + SSE2 baseline
 #elif defined(__aarch64__) || defined(_M_ARM64)
     #define DSPARK_FFT_NEON 1
     #include <arm_neon.h>
@@ -134,6 +134,29 @@ public:
     }
 
 private:
+#ifdef DSPARK_FFT_SSE3
+    // _mm_addsub_* is an SSE3 instruction; baseline x86-64 (the Linux/GCC
+    // default) is SSE2 only. MSVC exposes the intrinsic unconditionally; on
+    // other compilers without -msse3 fall back to negate-even-lanes + add,
+    // which is bit-identical (IEEE negation is exact).
+    static inline __m128 addsubPs(__m128 a, __m128 b) noexcept
+    {
+#if defined(__SSE3__) || defined(_MSC_VER)
+        return _mm_addsub_ps(a, b);
+#else
+        return _mm_add_ps(a, _mm_xor_ps(b, _mm_setr_ps(-0.0f, 0.0f, -0.0f, 0.0f)));
+#endif
+    }
+    static inline __m128d addsubPd(__m128d a, __m128d b) noexcept
+    {
+#if defined(__SSE3__) || defined(_MSC_VER)
+        return _mm_addsub_pd(a, b);
+#else
+        return _mm_add_pd(a, _mm_xor_pd(b, _mm_setr_pd(-0.0, 0.0)));
+#endif
+    }
+#endif // DSPARK_FFT_SSE3
+
     void computeTwiddles()
     {
         twiddles_.clear();
@@ -234,9 +257,9 @@ private:
                         __m128 p1    = _mm_mul_ps(w, o_re);
                         __m128 p2    = _mm_mul_ps(w_sw, o_im);
 
-                        // _mm_addsub_ps inherently processes the complex conjugate math:
+                        // addsub processes the complex conjugate math:
                         // Even: p1 - p2 (Real part) | Odd: p1 + p2 (Imaginary part)
-                        __m128 t     = _mm_addsub_ps(p1, p2);
+                        __m128 t     = addsubPs(p1, p2);
 
                         _mm_storeu_ps(&data[eIdx], _mm_add_ps(e, t));
                         _mm_storeu_ps(&data[oIdx], _mm_sub_ps(e, t));
@@ -270,7 +293,7 @@ private:
 
                         __m128d p1 = _mm_mul_pd(w_re, o);                  // [wr*or, wr*oi]
                         __m128d p2 = _mm_mul_pd(w_im, o_sw);               // [wi*oi, wi*or]
-                        __m128d t  = _mm_addsub_pd(p1, p2);                // [Re, Im] of w*o
+                        __m128d t  = addsubPd(p1, p2);                     // [Re, Im] of w*o
 
                         _mm_storeu_pd(&data[eIdx], _mm_add_pd(e, t));
                         _mm_storeu_pd(&data[oIdx], _mm_sub_pd(e, t));

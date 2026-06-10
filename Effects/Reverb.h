@@ -39,6 +39,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/DspMath.h"
 #include "../Core/Resampler.h"
+#include "../Core/StateBlob.h"
 #include "../IO/WavFile.h"
 
 #include <algorithm>
@@ -281,6 +282,27 @@ public:
         auto bank = loadBank();
         return (bank && !bank->convolvers.empty())
                ? bank->convolvers.front().getLatency() : 0;
+    }
+
+
+    /** @brief Serializes the parameter state. The impulse response itself is
+     *  content (load it with loadIR), not a preset parameter. */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("CRVB"), 1);
+        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("preDelay", preDelayMs_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("CRVB")) return false;
+        setMix(static_cast<T>(r.read("mix", 0.3f)));
+        setPreDelay(static_cast<T>(r.read("preDelay", 0.0f)));
+        return true;
     }
 
 protected:

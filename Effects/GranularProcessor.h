@@ -24,6 +24,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -138,6 +139,37 @@ public:
 
     /** @brief Zero: the cloud is parallel to the dry path. */
     [[nodiscard]] static constexpr int getLatency() noexcept { return 0; }
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("GRAN"), 1);
+        w.write("grainMs", grainMs_.load(std::memory_order_relaxed));
+        w.write("density", density_.load(std::memory_order_relaxed));
+        w.write("jitter", jitter_.load(std::memory_order_relaxed));
+        w.write("pitch", pitchSt_.load(std::memory_order_relaxed));
+        w.write("pitchJitter", pitchJitterSt_.load(std::memory_order_relaxed));
+        w.write("spread", spread_.load(std::memory_order_relaxed));
+        w.write("freeze", freeze_.load(std::memory_order_relaxed));
+        w.write("mix", mix_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("GRAN")) return false;
+        setGrainSize(static_cast<T>(r.read("grainMs", 80.0f)));
+        setDensity(static_cast<T>(r.read("density", 25.0f)));
+        setJitter(static_cast<T>(r.read("jitter", 0.3f)));
+        setPitch(static_cast<T>(r.read("pitch", 0.0f)));
+        setPitchJitter(static_cast<T>(r.read("pitchJitter", 0.0f)));
+        setSpread(static_cast<T>(r.read("spread", 0.5f)));
+        setFreeze(r.read("freeze", false));
+        setMix(static_cast<T>(r.read("mix", 1.0f)));
+        return true;
+    }
 
     // -- Processing -------------------------------------------------------------------
 

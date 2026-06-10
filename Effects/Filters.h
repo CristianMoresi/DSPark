@@ -35,6 +35,7 @@
 #include "../Core/Smoothers.h"
 #include "../Core/AnalogRandom.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -465,6 +466,55 @@ public:
         for (int s = 0, ns = numStages_.load(std::memory_order_relaxed); s < ns; ++s)
             sample = stages_[s].processSample(sample, channel);
         return sample;
+    }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("FENG"), 1);
+        w.write("shape", static_cast<int32_t>(shape_.load(std::memory_order_relaxed)));
+        w.write("slope", slopeDb_.load(std::memory_order_relaxed));
+        w.write("shelfSlope", shelfSlope_.load(std::memory_order_relaxed));
+        w.write("freq", targetFreq_.load(std::memory_order_relaxed));
+        w.write("res", targetRes_.load(std::memory_order_relaxed));
+        w.write("gain", targetGain_.load(std::memory_order_relaxed));
+        w.write("nonlin", static_cast<float>(targetNonlinearity_.load(std::memory_order_relaxed)));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("FENG")) return false;
+        const auto shape = static_cast<Shape>(r.read("shape", 0));
+        const float freq = r.read("freq", 1000.0f);
+        const float res = r.read("res", 0.707f);
+        const float gain = r.read("gain", 0.0f);
+        switch (shape)
+        {
+            case Shape::LowShelf:
+                setLowShelf(freq, gain, r.read("shelfSlope", 1.0f));
+                break;
+            case Shape::HighShelf:
+                setHighShelf(freq, gain, r.read("shelfSlope", 1.0f));
+                break;
+            case Shape::Peak:
+                setPeaking(freq, gain, res);
+                break;
+            case Shape::Tilt:
+                setTilt(freq, gain);
+                break;
+            default:
+                setShape(shape, r.read("slope", 12));
+                setFrequency(freq);
+                setResonance(res);
+                setGain(gain);
+                break;
+        }
+        setNonlinearity(static_cast<T>(r.read("nonlin", 0.0f)));
+        return true;
     }
 
 protected:

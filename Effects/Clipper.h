@@ -29,6 +29,7 @@
 #include "../Core/DspMath.h"
 #include "../Core/DryWetMixer.h"
 #include "../Core/Oversampling.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <atomic>
@@ -228,6 +229,37 @@ public:
 
     /** @brief Retrieves the maximum gain reduction applied during the last block (for UI metering). */
     [[nodiscard]] T getGainReductionDb() const noexcept { return gainReductionDb_.load(std::memory_order_relaxed); }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("CLIP"), 1);
+        w.write("mode", static_cast<int32_t>(mode_.load(std::memory_order_relaxed)));
+        w.write("ceiling", ceilingDb_.load(std::memory_order_relaxed));
+        w.write("inputGain", inputGainDb_.load(std::memory_order_relaxed));
+        w.write("stages", stages_.load(std::memory_order_relaxed));
+        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("slewLimit", slewLimitMs_.load(std::memory_order_relaxed));
+        w.write("oversampling", osFactor_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob. Oversampling factor applies on
+     *  the next prepare() as usual. */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("CLIP")) return false;
+        setMode(static_cast<Mode>(r.read("mode", 0)));
+        setCeiling(static_cast<T>(r.read("ceiling", 0.0f)));
+        setInputGain(static_cast<T>(r.read("inputGain", 0.0f)));
+        setStages(r.read("stages", 1));
+        setMix(static_cast<T>(r.read("mix", 1.0f)));
+        setSlewLimit(static_cast<T>(r.read("slewLimit", 0.0f)));
+        setOversampling(r.read("oversampling", 1));
+        return true;
+    }
 
 protected:
     static constexpr int kMaxStages = 4;

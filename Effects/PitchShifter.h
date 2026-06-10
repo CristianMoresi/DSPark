@@ -49,6 +49,7 @@
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/FFT.h"
+#include "../Core/StateBlob.h"
 #include "../Core/WindowFunctions.h"
 
 #include <algorithm>
@@ -199,6 +200,27 @@ public:
 
     /** @brief Reports total latency in samples (STFT frame + resampler margin). */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("PSHF"), 1);
+        w.write("semitones", semitones_.load(std::memory_order_relaxed));
+        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("transient", transientPreserve_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("PSHF")) return false;
+        setSemitones(static_cast<T>(r.read("semitones", 0.0f)));
+        setMix(static_cast<T>(r.read("mix", 1.0f)));
+        setTransientPreserve(r.read("transient", true));
+        return true;
+    }
 
     // -- Processing --------------------------------------------------------------
 

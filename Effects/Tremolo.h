@@ -22,6 +22,7 @@
 #include "../Core/DspMath.h"
 #include "../Core/Phasor.h"
 #include "../Core/Smoothers.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <atomic>
@@ -144,6 +145,30 @@ public:
     [[nodiscard]] T getDepth() const noexcept { return depth_.load(std::memory_order_relaxed); }
     [[nodiscard]] Shape getShape() const noexcept { return shape_.load(std::memory_order_relaxed); }
     [[nodiscard]] bool isStereo() const noexcept { return stereo_.load(std::memory_order_relaxed); }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("TREM"), 1);
+        w.write("rate", rate_.load(std::memory_order_relaxed));
+        w.write("depth", depth_.load(std::memory_order_relaxed));
+        w.write("shape", static_cast<int32_t>(shape_.load(std::memory_order_relaxed)));
+        w.write("stereo", stereo_.load(std::memory_order_relaxed));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("TREM")) return false;
+        setRate(static_cast<T>(r.read("rate", 4.0f)));
+        setDepth(static_cast<T>(r.read("depth", 0.5f)));
+        setShape(static_cast<Shape>(r.read("shape", 0)));
+        setStereo(r.read("stereo", false));
+        return true;
+    }
 
 private:
     static constexpr int kMaxChannels = 2;

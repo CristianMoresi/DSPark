@@ -19,6 +19,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/DspMath.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -254,6 +255,56 @@ public:
     {
         crossover_.reset();
         for (auto& c : compressors_) c.reset();
+    }
+
+
+    /** @brief Serializes crossover topology and per-band compressor states. */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("MBCP"), 1);
+        const int n = crossover_.getNumBands();
+        w.write("numBands", n);
+        w.write("order", crossover_.getOrder());
+        w.write("xoverMode", static_cast<int32_t>(crossover_.getFilterMode()));
+        char key[24];
+        for (int i = 0; i < n - 1; ++i)
+        {
+            std::snprintf(key, sizeof(key), "x%d", i);
+            w.write(key, static_cast<float>(crossover_.getCrossoverFrequency(i)));
+        }
+        for (int i = 0; i < n; ++i)
+        {
+            std::snprintf(key, sizeof(key), "band%d", i);
+            w.write(key, getBandCompressor(i).getState());
+        }
+        return w.blob();
+    }
+
+    /** @brief Restores topology and band compressors from a blob. */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("MBCP")) return false;
+        const int n = std::clamp(r.read("numBands", 3), 1, MaxBands);
+        setNumBands(n);
+        setOrder(r.read("order", 24));
+        setCrossoverMode(static_cast<typename CrossoverFilter<T, MaxBands>::FilterMode>(
+            r.read("xoverMode", 0)));
+        char key[24];
+        for (int i = 0; i < n - 1; ++i)
+        {
+            std::snprintf(key, sizeof(key), "x%d", i);
+            const float f = r.read(key, -1.0f);
+            if (f > 0.0f) setCrossoverFrequency(i, static_cast<T>(f));
+        }
+        for (int i = 0; i < n; ++i)
+        {
+            std::snprintf(key, sizeof(key), "band%d", i);
+            const auto nested = r.readBlob(key);
+            if (!nested.empty())
+                getBandCompressor(i).setState(nested.data(), nested.size());
+        }
+        return true;
     }
 
 private:

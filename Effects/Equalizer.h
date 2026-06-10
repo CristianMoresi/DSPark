@@ -21,6 +21,7 @@
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/FFT.h"
+#include "../Core/StateBlob.h"
 
 #include <array>
 #include <atomic>
@@ -415,6 +416,64 @@ public:
 
     /** @brief Const overload. */
     const FilterEngine<T>& getBandFilter(int index) const { return bands_[index]; }
+
+
+    /** @brief Serializes bands and modes (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("PEQZ"), 1);
+        const int n = numBands_.load(std::memory_order_relaxed);
+        w.write("numBands", n);
+        w.write("matchedBells", matchedBells_.load(std::memory_order_relaxed));
+        char key[24];
+        for (int i = 0; i < n; ++i)
+        {
+            const BandConfig cfg = getBandConfig(i);
+            std::snprintf(key, sizeof(key), "b%d.freq", i);
+            w.write(key, static_cast<float>(cfg.frequency));
+            std::snprintf(key, sizeof(key), "b%d.gain", i);
+            w.write(key, static_cast<float>(cfg.gain));
+            std::snprintf(key, sizeof(key), "b%d.q", i);
+            w.write(key, static_cast<float>(cfg.q));
+            std::snprintf(key, sizeof(key), "b%d.type", i);
+            w.write(key, static_cast<int32_t>(cfg.type));
+            std::snprintf(key, sizeof(key), "b%d.slope", i);
+            w.write(key, cfg.slope);
+            std::snprintf(key, sizeof(key), "b%d.on", i);
+            w.write(key, cfg.enabled);
+        }
+        return w.blob();
+    }
+
+    /** @brief Restores bands from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("PEQZ")) return false;
+        const int n = std::clamp(r.read("numBands", 0), 0, MaxBands);
+        setMatchedBells(r.read("matchedBells", false));
+        char key[24];
+        for (int i = 0; i < n; ++i)
+        {
+            BandConfig cfg;
+            std::snprintf(key, sizeof(key), "b%d.freq", i);
+            cfg.frequency = static_cast<T>(r.read(key, 1000.0f));
+            std::snprintf(key, sizeof(key), "b%d.gain", i);
+            cfg.gain = static_cast<T>(r.read(key, 0.0f));
+            std::snprintf(key, sizeof(key), "b%d.q", i);
+            cfg.q = static_cast<T>(r.read(key, 0.707f));
+            std::snprintf(key, sizeof(key), "b%d.type", i);
+            cfg.type = static_cast<BandType>(r.read(key, 0));
+            std::snprintf(key, sizeof(key), "b%d.slope", i);
+            cfg.slope = r.read(key, 12);
+            std::snprintf(key, sizeof(key), "b%d.on", i);
+            cfg.enabled = r.read(key, true);
+            setBand(i, cfg);
+        }
+        numBands_.store(n, std::memory_order_relaxed);
+        configDirty_.store(true, std::memory_order_release);
+        return true;
+    }
 
 protected:
 

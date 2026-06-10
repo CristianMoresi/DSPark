@@ -22,6 +22,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/DspMath.h"
 #include "../Core/Smoothers.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -186,12 +187,14 @@ public:
     void setFeedbackLpHz(SampleType freq) noexcept
     {
         fbLpCoef_.store((freq > 0) ? calcLpCoef(freq) : SampleType(0), std::memory_order_relaxed);
+        fbLpHzShadow_.store(freq, std::memory_order_relaxed);   // serialization readback
     }
 
     /** @brief Sets the cutoff frequency for the feedback high-pass filter (0 to disable). */
     void setFeedbackHpHz(SampleType freq) noexcept
     {
         fbHpCoef_.store((freq > 0) ? calcHpCoef(freq) : SampleType(0), std::memory_order_relaxed);
+        fbHpHzShadow_.store(freq, std::memory_order_relaxed);   // serialization readback
     }
 
     // -- Sample processing ---------------------------------------------------
@@ -396,6 +399,36 @@ public:
     
     /** @brief Returns maximum capacity in samples. */
     int getMaxDelaySamples() const noexcept { return maxDelaySamples_; }
+
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("DLAY"), 1);
+        w.write("delaySamples", globalDelay_.load(std::memory_order_relaxed));
+        w.write("feedback", feedbackGain_.load(std::memory_order_relaxed));
+        w.write("fbLpHz", fbLpHzShadow_.load(std::memory_order_relaxed));
+        w.write("fbHpHz", fbHpHzShadow_.load(std::memory_order_relaxed));
+        w.write("smoother", static_cast<int32_t>(smootherType_.load(std::memory_order_relaxed)));
+        w.write("smoothingMs", smoothingTimeMs_.load(std::memory_order_relaxed));
+        w.write("fbMode", static_cast<int32_t>(feedbackMode_.load(std::memory_order_relaxed)));
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("DLAY")) return false;
+        setDelaySamples(static_cast<SampleType>(r.read("delaySamples", 0.0f)));
+        setFeedback(static_cast<SampleType>(r.read("feedback", 0.0f)));
+        setFeedbackLpHz(static_cast<SampleType>(r.read("fbLpHz", 0.0f)));
+        setFeedbackHpHz(static_cast<SampleType>(r.read("fbHpHz", 0.0f)));
+        setSmoother(static_cast<SmootherType>(r.read("smoother", 0)));
+        setSmoothingTime(r.read("smoothingMs", 20.0f));
+        setFeedbackMode(static_cast<FeedbackMode>(r.read("fbMode", 1)));
+        return true;
+    }
 
 protected:
     static constexpr int kMaxChannels = 16;
@@ -639,6 +672,8 @@ private:
     std::atomic<SampleType> globalDelay_ { SampleType(0) };
     std::atomic<SampleType> feedbackGain_ { SampleType(0) };
     std::atomic<SampleType> fbLpCoef_ { SampleType(0) };
+    std::atomic<SampleType> fbLpHzShadow_ { SampleType(0) };  ///< Hz mirror for getState.
+    std::atomic<SampleType> fbHpHzShadow_ { SampleType(0) };  ///< Hz mirror for getState.
     std::atomic<SampleType> fbHpCoef_ { SampleType(0) };
 
     std::atomic<SmootherType> smootherType_ { SmootherType::Exponential };

@@ -372,6 +372,7 @@
  * | `Vibrato<T>`             | Effects/Vibrato.h     | Pitch modulation via LFO-driven delay line                          |
  * | `RingModulator<T>`       | Effects/RingModulator.h | Ring modulation (signal × carrier) with mix control               |
  * | `FrequencyShifter<T>`    | Effects/FrequencyShifter.h | Constant-Hz frequency shift via Hilbert transform              |
+ * | `PitchShifter<T>`        | Effects/PitchShifter.h | Phase-vocoder pitch shift ±12 st (identity phase locking)        |
  * | `DeEsser<T>`             | Effects/DeEsser.h     | Split-band de-esser with dynamic sibilance detection                |
  * | `AutoGain<T>`            | Effects/AutoGain.h    | Automatic gain compensation for honest A/B comparison               |
  * | `Clipper<T>`             | Effects/Clipper.h     | Multi-mode clipper (Hard/Soft/Analog/GoldenRatio, oversampling)     |
@@ -391,6 +392,7 @@
  * | `LoudnessMeter<T>`       | Analysis/LoudnessMeter.h  | EBU R128 LUFS metering (momentary/short/integrated) |
  * | `Goertzel<T>`            | Analysis/Goertzel.h       | Single-frequency O(N) magnitude detection    |
  * | `PitchDetector<T>`       | Analysis/PitchDetector.h  | YIN monophonic pitch detection with MIDI/cents output |
+ * | `PitchFollower<T>`       | Analysis/PitchFollower.h  | Gated, octave-safe, glide-smoothed pitch tracking source |
  *
  * @subsection classes_io File I/O
  *
@@ -417,6 +419,7 @@
  * | `FFTReal<T>`             | Core/FFT.h                | Radix-2 FFT with SIMD (SSE2/NEON), real-optimised |
  * | `FIRFilter<T>`           | Core/FIRFilter.h          | FIR filter with windowed-sinc design              |
  * | `Convolver<T>`           | Core/Convolver.h          | Partitioned overlap-save FFT convolution          |
+ * | `ZeroLatencyConvolver<T>`| Core/ZeroLatencyConvolver.h | Gardner non-uniform convolution (zero latency, flat CPU) |
  * | `Resampler<T>`           | Core/Resampler.h          | Polyphase windowed-sinc sample rate converter     |
  * | `WindowFunctions<T>`     | Core/WindowFunctions.h    | 8 window functions (Hann, Kaiser, Blackman...)    |
  * | `Smoothers`              | Core/Smoothers.h          | 9 parameter smoothing algorithms                  |
@@ -630,6 +633,7 @@
 #include "Core/WindowFunctions.h"
 #include "Core/FIRFilter.h"
 #include "Core/Convolver.h"
+#include "Core/ZeroLatencyConvolver.h"
 #include "Core/Resampler.h"
 #include "Core/EnvelopeGenerator.h"
 #include "Core/Dither.h"
@@ -680,6 +684,7 @@
 #include "Effects/DynamicEQ.h"
 #include "Effects/MultibandCompressor.h"
 #include "Effects/Clipper.h"
+#include "Effects/PitchShifter.h"
 
 // === Analysis ===============================================================
 
@@ -688,12 +693,18 @@
 #include "Analysis/LoudnessMeter.h"
 #include "Analysis/Goertzel.h"
 #include "Analysis/PitchDetector.h"
+#include "Analysis/PitchFollower.h"
 
 // === I/O ====================================================================
+// File I/O uses <fstream>/<filesystem>, which do not exist on bare-metal
+// embedded targets. Define DSPARK_NO_FILE_IO to exclude this module — the
+// whole DSP core compiles and runs without it.
 
+#ifndef DSPARK_NO_FILE_IO
 #include "IO/AudioFile.h"
 #include "IO/WavFile.h"
 #include "IO/Mp3File.h"
+#endif
 
 // === Music ==================================================================
 

@@ -704,6 +704,102 @@ inline double sumOfSquares(const double* DSPARK_RESTRICT data, int count) noexce
 }
 
 // ============================================================================
+// complexMulAccum -- accum[k] += a[k] * b[k] over interleaved complex bins
+// ============================================================================
+
+/**
+ * @brief Complex multiply-accumulate over interleaved [re, im, ...] spectra.
+ *
+ * The workhorse of frequency-domain (partitioned) convolution:
+ * `accum += a * b` evaluated as complex numbers, for `bins` complex bins.
+ */
+inline void complexMulAccum(float* DSPARK_RESTRICT accum, const float* DSPARK_RESTRICT a,
+                            const float* DSPARK_RESTRICT b, int bins) noexcept
+{
+#if defined(DSPARK_SIMD_SSE2)
+    // Sign mask: negate real positions for (re1*re2 - im1*im2)
+    const __m128 negMask = _mm_castsi128_ps(_mm_setr_epi32(
+        static_cast<int>(0x80000000u), 0,
+        static_cast<int>(0x80000000u), 0));
+
+    int k = 0;
+    for (; k + 1 < bins; k += 2)
+    {
+        const __m128 va   = _mm_loadu_ps(a + 2 * k);
+        const __m128 vb   = _mm_loadu_ps(b + 2 * k);
+        __m128 vacc       = _mm_loadu_ps(accum + 2 * k);
+
+        const __m128 aRe   = _mm_shuffle_ps(va, va, _MM_SHUFFLE(2, 2, 0, 0));
+        const __m128 aIm   = _mm_shuffle_ps(va, va, _MM_SHUFFLE(3, 3, 1, 1));
+        const __m128 bSwap = _mm_shuffle_ps(vb, vb, _MM_SHUFFLE(2, 3, 0, 1));
+
+        const __m128 p1 = _mm_mul_ps(aRe, vb);
+        const __m128 p2 = _mm_xor_ps(_mm_mul_ps(aIm, bSwap), negMask);
+
+        vacc = _mm_add_ps(vacc, _mm_add_ps(p1, p2));
+        _mm_storeu_ps(accum + 2 * k, vacc);
+    }
+    for (; k < bins; ++k)
+    {
+        const float re1 = a[2 * k], im1 = a[2 * k + 1];
+        const float re2 = b[2 * k], im2 = b[2 * k + 1];
+        accum[2 * k]     += re1 * re2 - im1 * im2;
+        accum[2 * k + 1] += re1 * im2 + im1 * re2;
+    }
+#elif defined(DSPARK_SIMD_NEON)
+    alignas(16) static constexpr uint32_t kNegRe[4] = { 0x80000000u, 0u, 0x80000000u, 0u };
+    const uint32x4_t negMask = vld1q_u32(kNegRe);
+
+    int k = 0;
+    for (; k + 1 < bins; k += 2)
+    {
+        const float32x4_t va   = vld1q_f32(a + 2 * k);
+        const float32x4_t vb   = vld1q_f32(b + 2 * k);
+        float32x4_t vacc       = vld1q_f32(accum + 2 * k);
+
+        const float32x4_t aRe   = vtrn1q_f32(va, va);
+        const float32x4_t aIm   = vtrn2q_f32(va, va);
+        const float32x4_t bSwap = vrev64q_f32(vb);
+
+        const float32x4_t p1 = vmulq_f32(aRe, vb);
+        const float32x4_t p2 = vreinterpretq_f32_u32(
+            veorq_u32(vreinterpretq_u32_f32(vmulq_f32(aIm, bSwap)), negMask));
+
+        vacc = vaddq_f32(vacc, vaddq_f32(p1, p2));
+        vst1q_f32(accum + 2 * k, vacc);
+    }
+    for (; k < bins; ++k)
+    {
+        const float re1 = a[2 * k], im1 = a[2 * k + 1];
+        const float re2 = b[2 * k], im2 = b[2 * k + 1];
+        accum[2 * k]     += re1 * re2 - im1 * im2;
+        accum[2 * k + 1] += re1 * im2 + im1 * re2;
+    }
+#else
+    for (int k = 0; k < bins; ++k)
+    {
+        const float re1 = a[2 * k], im1 = a[2 * k + 1];
+        const float re2 = b[2 * k], im2 = b[2 * k + 1];
+        accum[2 * k]     += re1 * re2 - im1 * im2;
+        accum[2 * k + 1] += re1 * im2 + im1 * re2;
+    }
+#endif
+}
+
+/** @brief Double overload (scalar — double spectra are an offline path). */
+inline void complexMulAccum(double* DSPARK_RESTRICT accum, const double* DSPARK_RESTRICT a,
+                            const double* DSPARK_RESTRICT b, int bins) noexcept
+{
+    for (int k = 0; k < bins; ++k)
+    {
+        const double re1 = a[2 * k], im1 = a[2 * k + 1];
+        const double re2 = b[2 * k], im2 = b[2 * k + 1];
+        accum[2 * k]     += re1 * re2 - im1 * im2;
+        accum[2 * k + 1] += re1 * im2 + im1 * re2;
+    }
+}
+
+// ============================================================================
 // Template dispatchers
 // ============================================================================
 

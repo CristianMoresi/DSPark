@@ -39,6 +39,7 @@
 
 #include "AudioBuffer.h"
 #include "FFT.h"
+#include "SimdOps.h"
 
 #include <algorithm>
 #include <cassert>
@@ -292,94 +293,11 @@ private:
     }
 
     int blockSize_ = 0;
-    /// SIMD-accelerated complex multiply-accumulate: accum += a * b (complex).
-    /// Processes interleaved [re, im, re, im, ...] data for `bins` complex bins.
+    /// Complex multiply-accumulate: accum += a * b over interleaved bins.
+    /// Thin wrapper over the shared SIMD primitive in SimdOps.h.
     static void complexMulAccum(const T* a, const T* b, T* accum, int bins) noexcept
     {
-#if defined(DSPARK_FFT_SSE3)   // x86/x64: SSE float path (was a dead DSPARK_FFT_SSE2 typo)
-        if constexpr (std::is_same_v<T, float>)
-        {
-            // Sign mask: negate real positions for (re1*re2 - im1*im2)
-            __m128 negMask = _mm_castsi128_ps(_mm_setr_epi32(
-                static_cast<int>(0x80000000u), 0,
-                static_cast<int>(0x80000000u), 0));
-
-            int k = 0;
-            for (; k + 1 < bins; k += 2)
-            {
-                __m128 va   = _mm_loadu_ps(a + 2 * k);
-                __m128 vb   = _mm_loadu_ps(b + 2 * k);
-                __m128 vacc = _mm_loadu_ps(accum + 2 * k);
-
-                __m128 a_re   = _mm_shuffle_ps(va, va, _MM_SHUFFLE(2, 2, 0, 0));
-                __m128 a_im   = _mm_shuffle_ps(va, va, _MM_SHUFFLE(3, 3, 1, 1));
-                __m128 b_swap = _mm_shuffle_ps(vb, vb, _MM_SHUFFLE(2, 3, 0, 1));
-
-                __m128 p1     = _mm_mul_ps(a_re, vb);
-                __m128 p2     = _mm_mul_ps(a_im, b_swap);
-                __m128 p2_neg = _mm_xor_ps(p2, negMask);
-
-                vacc = _mm_add_ps(vacc, _mm_add_ps(p1, p2_neg));
-                _mm_storeu_ps(accum + 2 * k, vacc);
-            }
-
-            // Scalar remainder
-            for (; k < bins; ++k)
-            {
-                float re1 = a[2*k], im1 = a[2*k+1];
-                float re2 = b[2*k], im2 = b[2*k+1];
-                accum[2*k]   += re1*re2 - im1*im2;
-                accum[2*k+1] += re1*im2 + im1*re2;
-            }
-        }
-        else
-#elif defined(DSPARK_FFT_NEON)
-        if constexpr (std::is_same_v<T, float>)
-        {
-            alignas(16) static constexpr uint32_t kNegRe[4] =
-                { 0x80000000u, 0u, 0x80000000u, 0u };
-            uint32x4_t negMask = vld1q_u32(kNegRe);
-
-            int k = 0;
-            for (; k + 1 < bins; k += 2)
-            {
-                float32x4_t va   = vld1q_f32(a + 2 * k);
-                float32x4_t vb   = vld1q_f32(b + 2 * k);
-                float32x4_t vacc = vld1q_f32(accum + 2 * k);
-
-                float32x4_t a_re   = vtrn1q_f32(va, va);
-                float32x4_t a_im   = vtrn2q_f32(va, va);
-                float32x4_t b_swap = vrev64q_f32(vb);
-
-                float32x4_t p1     = vmulq_f32(a_re, vb);
-                float32x4_t p2     = vmulq_f32(a_im, b_swap);
-                float32x4_t p2_neg = vreinterpretq_f32_u32(
-                    veorq_u32(vreinterpretq_u32_f32(p2), negMask));
-
-                vacc = vaddq_f32(vacc, vaddq_f32(p1, p2_neg));
-                vst1q_f32(accum + 2 * k, vacc);
-            }
-
-            for (; k < bins; ++k)
-            {
-                float re1 = a[2*k], im1 = a[2*k+1];
-                float re2 = b[2*k], im2 = b[2*k+1];
-                accum[2*k]   += re1*re2 - im1*im2;
-                accum[2*k+1] += re1*im2 + im1*re2;
-            }
-        }
-        else
-#endif
-        // Scalar fallback (double, or non-SIMD platforms)
-        {
-            for (int k = 0; k < bins; ++k)
-            {
-                T re1 = a[2*k], im1 = a[2*k+1];
-                T re2 = b[2*k], im2 = b[2*k+1];
-                accum[2*k]   += re1*re2 - im1*im2;
-                accum[2*k+1] += re1*im2 + im1*re2;
-            }
-        }
+        simd::complexMulAccum(accum, a, b, bins);
     }
 
     int fftSize_ = 0;

@@ -288,6 +288,11 @@ void runSmokeTests()
         p->prepare(spec); p->setStages(2); p->setDrive(12.0f);
         return std::function<void(V)>([p](V b) { p->processBlock(b); });
     }});
+    cases.push_back({ "TransformerModel", [&] {
+        auto p = std::make_shared<dspark::TransformerModel<float>>();
+        p->prepare(spec); p->setDrive(9.0f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
     cases.push_back({ "Delay", [&] {
         auto p = std::make_shared<dspark::Delay<float>>();
         p->prepareMs(spec, 500.0);

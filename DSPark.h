@@ -375,6 +375,7 @@
  * | `PitchShifter<T>`        | Effects/PitchShifter.h | Phase-vocoder pitch shift ±12 st (identity phase locking)        |
  * | `TapeMachine<T>`         | Effects/TapeMachine.h | Physical tape: JA hysteresis, NAB/CCIR EQ, losses, wow/flutter    |
  * | `TubePreamp<T>`          | Effects/TubePreamp.h  | Koren 12AX7 stages, WDF FMV tone stack (R-type), supply sag       |
+ * | `TransformerModel<T>`    | Effects/TransformerModel.h | Audio transformer: flux-domain JA hysteresis, LF bloom, HF bell |
  * | `DeEsser<T>`             | Effects/DeEsser.h     | Split-band de-esser with dynamic sibilance detection                |
  * | `AutoGain<T>`            | Effects/AutoGain.h    | Automatic gain compensation for honest A/B comparison               |
  * | `Clipper<T>`             | Effects/Clipper.h     | Multi-mode clipper (Hard/Soft/Analog/GoldenRatio, oversampling)     |
@@ -693,6 +694,7 @@
 #include "Effects/PitchShifter.h"
 #include "Effects/TapeMachine.h"
 #include "Effects/TubePreamp.h"
+#include "Effects/TransformerModel.h"
 
 // === Analysis ===============================================================
 

@@ -344,7 +344,7 @@ inline void Smoothers::LinearSmoother::processBlock(float* buffer, int numSample
     stepsToGo -= stepsToProcess;
     if (stepsToGo == 0) current = target;
 
-    // Constant section (Alta vectorización asegurada)
+    // Constant section (trivially vectorizable)
     for (; i < numSamples; ++i)
     {
         buffer[i] = multiply ? buffer[i] * target : buffer[i] + target;
@@ -565,7 +565,7 @@ inline void Smoothers::StateVariableSmoother::reset(double sampleRate, float tim
     fc = std::min(fc, fs * 0.49f);
 
     g = std::tan(Constants::pi * fc / fs);
-    k = 1.0f / q; // CORREGIDO: TPT damping usa k = 1/Q. 
+    k = 1.0f / q; // TPT damping uses k = 1/Q.
 
     a1 = 1.0f / (1.0f + g * (g + k));
     a2 = g * a1;
@@ -666,7 +666,7 @@ inline float Smoothers::ButterworthSmoother::getNextValue() noexcept
 
 inline bool Smoothers::ButterworthSmoother::isSmoothing() const noexcept
 {
-    return std::abs(lastOut - target) > epsilon; // CORREGIDO: Utilizar lastOut cacheado
+    return std::abs(lastOut - target) > epsilon; // compare against the cached lastOut
 }
 
 inline void Smoothers::ButterworthSmoother::skip() noexcept
@@ -681,7 +681,8 @@ inline void Smoothers::ButterworthSmoother::skip() noexcept
 
 inline void Smoothers::CriticallyDampedSmoother::reset(double sampleRate, float timeConstantMilliseconds, float initialValue) noexcept
 {
-    // CORREGIDO: La amortiguación crítica (zeta = 1) corresponde exactamente a Q = 0.5f, no a Q = 0.707 (Butterworth).
+    // Critical damping (zeta = 1) corresponds exactly to Q = 0.5, not to the
+    // Butterworth Q = 0.707.
     StateVariableSmoother::reset(sampleRate, timeConstantMilliseconds, 0.5f, initialValue);
 }
 

@@ -856,6 +856,13 @@ private:
         return true;
     }
 
+    // Compile-time proof of table integrity, evaluated under MSVC only: the
+    // O(n^2) prefix checks over the 256-entry tables exceed the default
+    // constexpr step budgets of GCC (-fconstexpr-ops-limit) and Clang
+    // (-fconstexpr-steps), and a drop-in header cannot demand build flags.
+    // The tables are identical constants on every compiler, so the MSVC
+    // evaluation proves their content universally.
+#if defined(_MSC_VER) && !defined(__clang__)
     static_assert(kraftComplete(kHuff01) && kraftComplete(kHuff02) && kraftComplete(kHuff03) &&
                   kraftComplete(kHuff05) && kraftComplete(kHuff06) && kraftComplete(kHuff07) &&
                   kraftComplete(kHuff08) && kraftComplete(kHuff09) && kraftComplete(kHuff10) &&
@@ -881,6 +888,7 @@ private:
     static_assert(prefixFree(kHuff15), "kHuff15 not prefix-free.");
     static_assert(prefixFree(kHuff16), "kHuff16 not prefix-free.");
     static_assert(prefixFree(kHuff24), "kHuff24 not prefix-free.");
+#endif
 
     struct Count1Code { uint8_t len; uint8_t code; uint8_t v, w, x, y; };
 

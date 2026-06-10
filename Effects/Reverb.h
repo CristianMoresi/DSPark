@@ -108,12 +108,12 @@ public:
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        // Design note: std::atomic<shared_ptr> is not lock-free (the STL uses
-        // an internal spinlock), but the only writer is loadIR() — a rare,
-        // user-initiated event — so contention is effectively zero. A manual
-        // RCU scheme would remove the spinlock at the cost of a real
-        // use-after-free hazard under racing loads; correctness wins here.
-        auto bank = bank_.load(std::memory_order_acquire);
+        // Design note: the bank swap is guarded by a one-flag spinlock (see
+        // loadBank()): the only writer is loadIR() — a rare, user-initiated
+        // event — so contention is effectively zero. A manual RCU scheme
+        // would remove the spinlock at the cost of a real use-after-free
+        // hazard under racing loads; correctness wins here.
+        auto bank = loadBank();
         if (!bank || bank->convolvers.empty()) return;
 
         const int nCh = std::min(buffer.getNumChannels(),
@@ -150,7 +150,7 @@ public:
     {
         // Drop the bank atomically. Any in-flight processBlock already holds
         // its own shared_ptr and will finish cleanly on its snapshot.
-        bank_.store(std::shared_ptr<ConvolverBank>{}, std::memory_order_release);
+        storeBank(std::shared_ptr<ConvolverBank>{});
         for (auto& rb : preDelayBuffers_)
             rb.reset();
         mixer_.reset();
@@ -256,7 +256,7 @@ public:
      */
     Convolver<T>& getConvolver(int channel = 0)
     {
-        auto bank = bank_.load(std::memory_order_acquire);
+        auto bank = loadBank();
         return bank->convolvers[static_cast<size_t>(channel)];
     }
 
@@ -266,7 +266,7 @@ public:
     /** @brief Returns true if an IR has been loaded and applied. */
     [[nodiscard]] bool isLoaded() const noexcept
     {
-        return static_cast<bool>(bank_.load(std::memory_order_acquire));
+        return static_cast<bool>(loadBank());
     }
 
     /** @brief Returns the current mix value. */
@@ -278,7 +278,7 @@ public:
     /** @brief Returns the convolution latency in samples. */
     [[nodiscard]] int getLatency() const noexcept
     {
-        auto bank = bank_.load(std::memory_order_acquire);
+        auto bank = loadBank();
         return (bank && !bank->convolvers.empty())
                ? bank->convolvers.front().getLatency() : 0;
     }
@@ -344,7 +344,7 @@ protected:
 
         // Atomic release-store: any subsequent acquire-load in processBlock
         // will observe the fully-constructed bank.
-        bank_.store(newBank, std::memory_order_release);
+        storeBank(newBank);
     }
 
     // Holds the current convolver set. Published by applyIR() via an atomic
@@ -367,8 +367,32 @@ protected:
     int irChannels_ = 0;
     double irSampleRate_ = 0;
 
-    // Processing (audio-thread visible state)
-    std::atomic<std::shared_ptr<ConvolverBank>> bank_;  // C++20 atomic shared_ptr
+    // Processing (audio-thread visible state).
+    //
+    // Portable stand-in for std::atomic<std::shared_ptr>: libc++ (macOS,
+    // Emscripten) does not ship the C++20 specialization. A one-flag
+    // spinlock guards only the pointer copy/swap — nanoseconds on the audio
+    // thread against one UI-initiated store per IR load — preserving the
+    // exact snapshot semantics: an in-flight processBlock keeps its own
+    // shared_ptr alive, and replaced banks destruct on the UI thread
+    // (the swap drops them outside the lock).
+    [[nodiscard]] std::shared_ptr<ConvolverBank> loadBank() const noexcept
+    {
+        while (bankLock_.test_and_set(std::memory_order_acquire)) {}
+        auto copy = bankPtr_;
+        bankLock_.clear(std::memory_order_release);
+        return copy;
+    }
+    void storeBank(std::shared_ptr<ConvolverBank> next) noexcept
+    {
+        while (bankLock_.test_and_set(std::memory_order_acquire)) {}
+        bankPtr_.swap(next);
+        bankLock_.clear(std::memory_order_release);
+        // `next` (the previous bank) destructs here, outside the lock.
+    }
+
+    mutable std::atomic_flag bankLock_ = ATOMIC_FLAG_INIT;
+    std::shared_ptr<ConvolverBank> bankPtr_;
     std::vector<RingBuffer<T>> preDelayBuffers_;
     DryWetMixer<T> mixer_;
 };

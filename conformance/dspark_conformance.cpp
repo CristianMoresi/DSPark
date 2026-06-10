@@ -278,6 +278,11 @@ void runSmokeTests()
         p->prepare(spec); p->setSemitones(4.0f);
         return std::function<void(V)>([p](V b) { p->processBlock(b); });
     }});
+    cases.push_back({ "TapeMachine", [&] {
+        auto p = std::make_shared<dspark::TapeMachine<float>>();
+        p->prepare(spec); p->setDrive(6.0f); p->setWowFlutter(0.3f);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
     cases.push_back({ "Delay", [&] {
         auto p = std::make_shared<dspark::Delay<float>>();
         p->prepareMs(spec, 500.0);
@@ -593,6 +598,50 @@ void runMetricTests()
         char d[96]; std::snprintf(d, sizeof(d), "(got %.3f Hz, expected %.3f, %+.2f cents)",
                                   got, expected, cents);
         check(std::abs(cents) < 2.0, "metrics", "PitchShifter +7 st frequency exact", d);
+    }
+    {
+        // TapeMachine signature: odd-dominant harmonic distortion (H3 >> H2)
+        // growing with drive, at roughly constant fundamental level.
+        dspark::TapeMachine<float> tape;
+        tape.prepare(dspark::AudioSpec { 48000.0, 512, 2 });
+        tape.setDrive(6.0f);
+        tape.setLossEffects(0.0f);
+        tape.setHeadBump(0.0f);
+        tape.setWowFlutter(0.0f);
+
+        const int total = (48000 / 512) * 512;
+        std::vector<float> outSig(static_cast<size_t>(total));
+        dspark::AudioBuffer<float> b; b.resize(2, 512);
+        int n = 0;
+        for (int blk = 0; blk < total / 512; ++blk)
+        {
+            for (int i = 0; i < 512; ++i, ++n)
+            {
+                const float v = 0.5f * static_cast<float>(std::sin(2.0 * kPiConf * 1000.0 * n / 48000.0));
+                b.getChannel(0)[i] = v; b.getChannel(1)[i] = v;
+            }
+            tape.processBlock(b.toView());
+            std::memcpy(outSig.data() + static_cast<size_t>(blk) * 512, b.getChannel(0),
+                        512 * sizeof(float));
+        }
+        auto mag = [&](double freq) {
+            const size_t from = outSig.size() / 2;
+            const size_t cnt = outSig.size() - from;
+            double re = 0, im = 0;
+            for (size_t i = 0; i < cnt; ++i)
+            {
+                const double ph = 2.0 * kPiConf * freq * static_cast<double>(i) / 48000.0;
+                re += static_cast<double>(outSig[from + i]) * std::cos(ph);
+                im += static_cast<double>(outSig[from + i]) * std::sin(ph);
+            }
+            return 2.0 * std::sqrt(re * re + im * im) / static_cast<double>(cnt);
+        };
+        const double h1 = mag(1000.0), h2 = mag(2000.0), h3 = mag(3000.0);
+        char d[96];
+        std::snprintf(d, sizeof(d), "(H1 %.2f, H2 %.1f dB, H3 %.1f dB)",
+                      h1, 20.0 * std::log10(h2 / h1 + 1e-12), 20.0 * std::log10(h3 / h1 + 1e-12));
+        check(h3 > 3.0 * h2 && h3 / h1 > 0.005 && h3 / h1 < 0.2 && h1 > 0.25,
+              "metrics", "TapeMachine odd-dominant tape signature", d);
     }
     {
         // WDF diode clipper solves the node equation (vin - v)/R = 2 Is sinh(v/nVt)

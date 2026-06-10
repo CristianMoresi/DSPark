@@ -373,6 +373,7 @@
  * | `RingModulator<T>`       | Effects/RingModulator.h | Ring modulation (signal × carrier) with mix control               |
  * | `FrequencyShifter<T>`    | Effects/FrequencyShifter.h | Constant-Hz frequency shift via Hilbert transform              |
  * | `PitchShifter<T>`        | Effects/PitchShifter.h | Phase-vocoder pitch shift ±12 st (identity phase locking)        |
+ * | `TapeMachine<T>`         | Effects/TapeMachine.h | Physical tape: JA hysteresis, NAB/CCIR EQ, losses, wow/flutter    |
  * | `DeEsser<T>`             | Effects/DeEsser.h     | Split-band de-esser with dynamic sibilance detection                |
  * | `AutoGain<T>`            | Effects/AutoGain.h    | Automatic gain compensation for honest A/B comparison               |
  * | `Clipper<T>`             | Effects/Clipper.h     | Multi-mode clipper (Hard/Soft/Analog/GoldenRatio, oversampling)     |
@@ -421,6 +422,7 @@
  * | `Convolver<T>`           | Core/Convolver.h          | Partitioned overlap-save FFT convolution          |
  * | `ZeroLatencyConvolver<T>`| Core/ZeroLatencyConvolver.h | Gardner non-uniform convolution (zero latency, flat CPU) |
  * | `wdf::*`                 | Core/WDF.h                | Wave digital filters: R/L/C, adaptors, NR diode roots |
+ * | `Hysteresis<T>`          | Core/Hysteresis.h         | Jiles-Atherton magnetic hysteresis (implicit NR solver) |
  * | `Resampler<T>`           | Core/Resampler.h          | Polyphase windowed-sinc sample rate converter     |
  * | `WindowFunctions<T>`     | Core/WindowFunctions.h    | 8 window functions (Hann, Kaiser, Blackman...)    |
  * | `Smoothers`              | Core/Smoothers.h          | 9 parameter smoothing algorithms                  |
@@ -636,6 +638,7 @@
 #include "Core/Convolver.h"
 #include "Core/ZeroLatencyConvolver.h"
 #include "Core/WDF.h"
+#include "Core/Hysteresis.h"
 #include "Core/Resampler.h"
 #include "Core/EnvelopeGenerator.h"
 #include "Core/Dither.h"
@@ -687,6 +690,7 @@
 #include "Effects/MultibandCompressor.h"
 #include "Effects/Clipper.h"
 #include "Effects/PitchShifter.h"
+#include "Effects/TapeMachine.h"
 
 // === Analysis ===============================================================
 

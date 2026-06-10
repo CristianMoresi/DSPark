@@ -88,11 +88,16 @@ public:
         if (phase_ >= T(1)) phase_ -= T(1);
     }
 
-    /** @brief Hard-resets the oscillator phase and integrator state to zero. */
-    void reset() noexcept 
-    { 
-        phase_ = T(0); 
-        triState_ = T(0);
+    /** @brief Hard-resets the oscillator phase and integrator state.
+     *
+     * The triangle integrator is seeded at the negative steady-state peak
+     * (phase 0 drives the underlying square positive, so the steady cycle
+     * starts at -peak). Seeding at zero made the first half-cycle overshoot
+     * to (1+q)x the nominal level — an audible +4 dB pop on note retrigger. */
+    void reset() noexcept
+    {
+        phase_ = T(0);
+        triState_ = -triExpectedPeak_;
     }
 
     /**
@@ -235,10 +240,12 @@ private:
             T halfPeriodSamples = T(0.5) / phaseInc_;
             T q = std::pow(leakCoeff, halfPeriodSamples);
             T expectedPeak = (T(1) - q) / (T(1) + q);
+            triExpectedPeak_ = expectedPeak;
             triNorm_ = (expectedPeak > T(0.001)) ? T(1) / expectedPeak : T(4);
         }
         else
         {
+            triExpectedPeak_ = T(0.25);
             triNorm_ = T(4);
         }
     }
@@ -249,6 +256,7 @@ private:
     T        phaseInc_   = T(0);
     T        triState_   = T(0);
     T        triNorm_    = T(4);
+    T        triExpectedPeak_ = T(0.25); ///< Steady-state integrator peak (reset seed).
     Waveform waveform_   = Waveform::Sine;
 };
 

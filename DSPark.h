@@ -396,6 +396,7 @@
  * | `Goertzel<T>`            | Analysis/Goertzel.h       | Single-frequency O(N) magnitude detection    |
  * | `PitchDetector<T>`       | Analysis/PitchDetector.h  | YIN monophonic pitch detection with MIDI/cents output |
  * | `PitchFollower<T>`       | Analysis/PitchFollower.h  | Gated, octave-safe, glide-smoothed pitch tracking source |
+ * | `PhaseCorrelation<T>`    | Analysis/PhaseCorrelation.h | Stereo correlation/balance meter + goniometer feed |
  *
  * @subsection classes_io File I/O
  *
@@ -704,6 +705,7 @@
 #include "Analysis/Goertzel.h"
 #include "Analysis/PitchDetector.h"
 #include "Analysis/PitchFollower.h"
+#include "Analysis/PhaseCorrelation.h"
 
 // === I/O ====================================================================
 // File I/O uses <fstream>/<filesystem>, which do not exist on bare-metal
@@ -719,3 +721,4 @@
 // === Music ==================================================================
 
 #include "Music/HarmonyConstants.h"
+#include "Music/ChordDetector.h"

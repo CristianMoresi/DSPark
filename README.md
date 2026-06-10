@@ -4,7 +4,9 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.1** — 75 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
+**v1.2** — 89 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
+
+CI builds and tests every commit on Windows (MSVC), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus AddressSanitizer/UBSan, an exceptions-free embedded profile and a single-header amalgamation. The public conformance suite validates loudness against the official EBU R128 test vectors.
 
 ```cpp
 #include "DSPark/DSPark.h"
@@ -76,7 +78,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 
 ## What's Included
 
-### Effects (30 processors)
+### Effects (36 processors)
 
 | Class | Description |
 |---|---|
@@ -110,8 +112,14 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `MidSide<T>` | Stereo Mid/Side encoding and decoding |
 | `NoiseGenerator<T>` | White, pink, and brown noise generation |
 | `DCBlocker<T>` | DC offset removal (1-pole or Butterworth order 2–10) |
+| `TapeMachine<T>` | Physical tape model: Jiles-Atherton hysteresis at 2x oversampling, NAB/CCIR record/play EQ with exact digital inverses, speed-dependent head-gap/spacing/thickness loss, head bump, common-transport wow & flutter |
+| `TubePreamp<T>` | Koren triode stages (12AX7) solved per sample with Newton-Raphson, exact Fender FMV tone stack as a Wave Digital R-type network, power-supply sag |
+| `TransformerModel<T>` | Audio transformer coloration: flux-domain Jiles-Atherton core (distortion rises as frequency falls — the LF "bloom"), magnetizing-inductance corner, HF resonance bell |
+| `PitchShifter<T>` | Phase vocoder with identity phase locking (Laroche-Dolson), exact tuning, transient phase reset, **formant preservation** (cepstral lift), stereo-coherent |
+| `GranularProcessor<T>` | 64-grain clouds over live input: per-grain pitch/pan/jitter, freeze, equal-power spread |
+| `SpectralDenoiser<T>` | Learnable-noise-profile spectral gating with the standard musical-noise defenses |
 
-### Core (35 building blocks)
+### Core (40 building blocks)
 
 | Class | Description |
 |---|---|
@@ -121,6 +129,11 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `BiquadCoeffs<T>` | Standalone factory for biquad coefficients (LP, HP, BP, Peak, Shelf, Notch, AP, Tilt, DC blocker) |
 | `FFTComplex<T>` / `FFTReal<T>` | Radix-2 FFT with SIMD (SSE3/NEON), real-optimised |
 | `Convolver<T>` | Partitioned overlap-save FFT convolution |
+| `ZeroLatencyConvolver<T>` | Gardner non-uniform partitioning: zero-latency convolution with time-distributed tail FFTs (flat CPU even for second-long IRs) |
+| `wdf::*` (WDF.h) | Wave Digital Filter circuit toolkit: R/L/C leaves, series/parallel adaptors, Newton-Raphson diode roots with analytic seeds, and an R-type adaptor (MNA-derived scattering) for non-adaptable topologies |
+| `Hysteresis<T>` | Jiles-Atherton magnetic hysteresis with implicit trapezoidal Newton-Raphson solver (tape, transformers) |
+| `ModulationRouter<T>` | Block-rate modulation routing: any source callable to any parameter setter, with depth and smoothing |
+| `StateWriter`/`StateReader` | Versioned key/value preset blobs + JSON helpers — every effect implements `getState()`/`setState()` |
 | `FIRFilter<T>` | FIR engine with windowed-sinc design |
 | `Oversampling<T>` | 2x–16x polyphase half-band Kaiser filters (-80 dB+ rejection), transparent up/down round-trip, exact reported latency |
 | `Oscillator<T>` | PolyBLEP (sine, saw, square, triangle) |
@@ -153,15 +166,18 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `AnalogConstants` | Reference constants from analog-hardware research (zero runtime cost) |
 | `ProcessorTraits` | C++20 concepts: `AudioProcessor`, `SampleProcessor`, `GeneratorProcessor` |
 
-### Analysis (5 analyzers)
+### Analysis (8 analyzers)
 
 | Class | Description |
 |---|---|
 | `LevelFollower<T>` | Peak and RMS envelope follower |
+| `EnvelopeFollower<T>` | Public attack/release detector (Peak or RMS law) for sidechains, modulation and metering |
 | `SpectrumAnalyzer<T>` | Real-time FFT spectrum with peak hold |
-| `LoudnessMeter<T>` | EBU R128: momentary, short-term, integrated (BS.1770-4 gating, 400 ms / 75% overlap), loudness range (LRA) and true peak (dBTP) |
+| `LoudnessMeter<T>` | EBU R128: momentary, short-term, integrated, LRA, true peak — **passes the official EBU test vectors** (Tech 3341/3342, BS.1770-5 K-weighting and true-peak interpolator) |
 | `Goertzel<T>` | Single-frequency O(N) magnitude detection |
 | `PitchDetector<T>` | YIN pitch detection with FFT-accelerated difference function (O(N log N)) |
+| `PitchFollower<T>` | Musical pitch tracking source: confidence gating, octave-jump correction, constant-rate semitone glide |
+| `PhaseCorrelation<T>` | Stereo correlation/balance meter with a goniometer (vectorscope) point feed |
 
 ### I/O (3 file handlers)
 
@@ -171,11 +187,12 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `Mp3File` | MPEG-1 Layer III codec — read (CBR/VBR) + write (CBR encoder, 32–320 kbps) |
 | `AudioFile` | Abstract base class for custom format implementations |
 
-### Music (1 module)
+### Music (2 modules)
 
 | Class | Description |
 |---|---|
 | `HarmonyConstants` | Constexpr musical harmony toolkit: 61 scales (bitmask representation), 15 chord recipes with inversions, MIDI/note conversion, key-aware naming (sharp/flat), diatonic chord generation. Fully `constexpr`/`consteval` — generates static tables at compile time. |
+| `ChordDetector<T>` | Real-time chord recognition: per-note Goertzel chroma, template matching over ten chord families, bass-note root disambiguation, confidence-gated hold |
 
 ---
 
@@ -290,7 +307,7 @@ DSParkLab\DSParkLab.exe
 **Features:**
 
 - Asynchronous WAV/MP3 loading with format auto-detection (audio thread never blocks on I/O)
-- 28 effects organised by category (Filters, Dynamics, Distortion, Modulation, Spatial, Utility) — including Dynamic EQ, Multiband Compressor and Convolution Reverb
+- 34 effects organised by category (Filters, Dynamics, Distortion, Analog, Modulation, Pitch, Spatial, Utility) — including the physical tape/tube/transformer models, pitch shifter with formant preservation, granular engine and denoiser
 - **Interactive analyzer**: log-frequency spectrum behind a live response curve, with **draggable nodes** for the EQ / Filter / Dynamic EQ (drag X = frequency, Y = gain, mouse-wheel = Q)
 - Dynamic EQ draws its **live** per-band reaction in real time; multiband compressor shows crossover bands with per-band gain reduction
 - Auto-generated parameter panels with mouse-wheel-adjustable sliders and combo boxes
@@ -335,13 +352,54 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 ```
 DSPark/
 ├── DSPark.h                 # Single umbrella include + full documentation
-├── Core/          (35)      # Building blocks: filters, FFT, oscillators, SIMD, buffers
-├── Effects/       (30)      # Ready-to-use processors: EQ, compressor, reverb...
-├── Analysis/       (5)      # Metering: LUFS, spectrum, level follower, pitch
+├── Core/          (40)      # Building blocks: filters, FFT, WDF, oscillators, SIMD
+├── Effects/       (36)      # Ready-to-use processors: EQ, compressor, reverb, tape...
+├── Analysis/       (8)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation
 ├── IO/             (3)      # File I/O: WAV read/write, MP3 read/write
-├── Music/          (1)      # Harmony constants and music theory
+├── Music/          (2)      # Harmony constants + real-time chord detection
+├── conformance/             # Public conformance suite (runs in CI)
+├── docs/                    # Cookbook and guides
+├── examples/                # WAV processing, channel strip, pitch-tracking EQ, VST3
 └── DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)
 ```
+
+---
+
+## What's New in v1.2
+
+The "world-class or bust" release: new DSP, physical modelling, standards
+conformance and infrastructure.
+
+- **Analog physical models**: `TapeMachine` (Jiles-Atherton hysteresis, exact
+  NAB/CCIR EQ inverses, speed-dependent loss stack, wow/flutter),
+  `TubePreamp` (Koren triodes + the exact Fender tone stack as a WDF R-type
+  network, verified to -94.8 dB against the published symbolic transfer
+  function) and `TransformerModel` (flux-domain core, LF bloom).
+- **Wave Digital Filters** (`Core/WDF.h`): a complete circuit-modelling
+  toolkit verified to machine precision against analytic references.
+- **Pitch tools**: `PitchShifter` (identity phase locking, exact tuning,
+  formant preservation via cepstral lift), `PitchFollower` (musical tracking
+  with gating/glide), `GranularProcessor` and `SpectralDenoiser`.
+- **Zero-latency convolution** (`ZeroLatencyConvolver`): Gardner non-uniform
+  partitioning with time-distributed tail work — null vs direct convolution
+  at -132 dB and flat CPU at any block size.
+- **EBU R128 conformance**: the loudness pipeline passes the official EBU
+  test vectors (integrated, LRA, true peak) after exact BS.1770-5
+  K-weighting and the Annex 2 polyphase true-peak interpolator.
+- **State-of-the-art EQ option**: `BiquadCoeffs::makePeakMatched` implements
+  the Orfanidis prescribed-Nyquist-gain design (de-cramped high bells);
+  `Equalizer::setMatchedBells(true)` switches Peak bands to it.
+- **Band-limited oscillator hard sync** (`setSyncRatio`) with PolyBLEP event
+  bookkeeping, and a public `EnvelopeFollower` and `ModulationRouter`.
+- **Presets everywhere**: every effect implements `getState()`/`setState()`
+  (versioned binary blobs, tolerant restore, JSON helpers, nested multiband
+  states).
+- **Music analysis**: `ChordDetector` (Goertzel chroma + template matching
+  with bass disambiguation) and `PhaseCorrelation` (correlation/goniometer).
+- **Infrastructure**: multi-platform CI (11 jobs), public conformance suite,
+  CMake package, single-header amalgamation, benchmark harness, cookbook
+  (`docs/cookbook.md`), VST3 integration template, and portability fixes for
+  GCC/Clang/libc++/SSE2-baseline uncovered by the first CI runs.
 
 ---
 

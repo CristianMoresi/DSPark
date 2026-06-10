@@ -117,6 +117,19 @@ int main()
         }, kBlock));
     }
     {
+        // FFT baseline for future optimization work (split-radix candidate):
+        // one real 2048-point forward+inverse round trip per "frame".
+        dspark::FFTReal<float> fft(2048);
+        std::vector<float> td(2048), fd(2050);
+        for (int i = 0; i < 2048; ++i)
+            td[static_cast<size_t>(i)] = src.data[static_cast<size_t>(i % kBlock)];
+        printRow("FFTReal 2048 fwd+inv (mono)", medianNsPerFrame([&] {
+            fft.forward(td.data(), fd.data());
+            fft.inverse(fd.data(), td.data());
+            g_sink += td[0];
+        }, 2048));
+    }
+    {
         dspark::FilterEngine<float> fe;
         fe.prepare(spec);
         fe.setLowPass(4000.0f, 0.707f, 24);

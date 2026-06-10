@@ -1,0 +1,34 @@
+# DSPark — Doxygen configuration (API reference for GitHub Pages)
+
+PROJECT_NAME           = "DSPark"
+PROJECT_BRIEF          = "Header-only audio DSP framework in pure C++20 — zero dependencies"
+PROJECT_NUMBER         = 1.2
+
+INPUT                  = DSPark.h Core Effects Analysis IO Music docs/cookbook.md
+USE_MDFILE_AS_MAINPAGE =
+RECURSIVE              = NO
+FILE_PATTERNS          = *.h *.md
+
+OUTPUT_DIRECTORY       = docs/api
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+HTML_OUTPUT            = .
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+HIDE_UNDOC_MEMBERS     = NO
+SOURCE_BROWSER         = YES
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO
+
+PREDEFINED             = DSPARK_FFT_SSE3=0
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+
+ALIASES                =
+MARKDOWN_SUPPORT       = YES
+TOC_INCLUDE_HEADINGS   = 3

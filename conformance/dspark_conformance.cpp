@@ -982,10 +982,417 @@ void runEbuTests()
 void runEbuTests() { skip("ebu", "EBU R128 conformance", "built with DSPARK_NO_FILE_IO"); }
 #endif // DSPARK_NO_FILE_IO
 
+// -----------------------------------------------------------------------------
+// [table] — public per-processor metrics table (KPI K3): THD+N, noise floor,
+// spurious/aliasing floor and latency at documented settings, in Markdown.
+// Run with:  dspark_conformance --metrics docs/metrics.md
+// -----------------------------------------------------------------------------
+
+struct MetricsCase
+{
+    const char* name;
+    const char* settings;   ///< Human-readable settings shown in the table.
+    const char* note;       ///< Caveat for time-based/modulated processors.
+    std::function<void(dspark::AudioBufferView<float>)> process;
+    std::function<int()> latency;   ///< Null when the processor is zero-latency.
+    bool shifted = false;   ///< True when the output spectrum is displaced from
+                            ///< the input (ring mod, shifters): THD+N/spurious
+                            ///< against the input fundamental are meaningless.
+};
+
+/// Magnitude spectrum (Blackman-Harris, 32768-point) of channel 0 after a
+/// warmup long enough to flush every latency/modulation transient.
+struct CapturedSpectrum
+{
+    std::vector<double> mag;   ///< N/2+1 bin magnitudes.
+    double binHz = 1.0;
+    double outRms = 0.0;
+};
+
+CapturedSpectrum captureSpectrum(const std::function<void(dspark::AudioBufferView<float>)>& process,
+                                 double freq, float amp)
+{
+    constexpr int kFft = 32768, kBlock = 512, kWarmBlocks = 80;   // ~0.85 s warmup
+    dspark::AudioBuffer<float> buf;
+    buf.resize(2, kBlock);
+    auto view = buf.toView();
+
+    // Silence purge: processors with long memory (granular rings, reverb
+    // tails) must not carry the PREVIOUS measurement tone into this capture.
+    for (int b = 0; b < 280; ++b)   // ~3 s
+    {
+        for (int i = 0; i < kBlock; ++i)
+        {
+            view.getChannel(0)[i] = 0.0f;
+            view.getChannel(1)[i] = 0.0f;
+        }
+        process(view);
+    }
+
+    std::vector<float> cap;
+    cap.reserve(kFft);
+    int n = 0;
+    const int total = kWarmBlocks * kBlock + kFft;
+    while (n < total)
+    {
+        for (int i = 0; i < kBlock; ++i)
+        {
+            const float s = amp * static_cast<float>(
+                std::sin(2.0 * kPiConf * freq * (n + i) / 48000.0));
+            view.getChannel(0)[i] = s;
+            view.getChannel(1)[i] = s;
+        }
+        process(view);
+        for (int i = 0; i < kBlock && n + i >= kWarmBlocks * kBlock
+                        && static_cast<int>(cap.size()) < kFft; ++i)
+            cap.push_back(view.getChannel(0)[i]);
+        n += kBlock;
+    }
+
+    std::vector<double> win(kFft), t(kFft), f(kFft + 2);
+    dspark::WindowFunctions<double>::blackmanHarris(win.data(), kFft, false);
+    double acc = 0.0;
+    for (int i = 0; i < kFft; ++i)
+    {
+        acc += static_cast<double>(cap[static_cast<size_t>(i)]) * cap[static_cast<size_t>(i)];
+        t[static_cast<size_t>(i)] = static_cast<double>(cap[static_cast<size_t>(i)])
+                                  * win[static_cast<size_t>(i)];
+    }
+    dspark::FFTReal<double> fft(kFft);
+    fft.forward(t.data(), f.data());
+
+    CapturedSpectrum sp;
+    sp.binHz = 48000.0 / kFft;
+    sp.outRms = std::sqrt(acc / kFft);
+    sp.mag.resize(kFft / 2 + 1);
+    for (size_t k = 0; k < sp.mag.size(); ++k)
+        sp.mag[k] = std::sqrt(f[2 * k] * f[2 * k] + f[2 * k + 1] * f[2 * k + 1]);
+    return sp;
+}
+
+/// THD+N (%) relative to the fundamental: spectral energy outside the
+/// fundamental's +-8 bin main lobe, within 20 Hz..20 kHz.
+double thdnPercent(const CapturedSpectrum& sp, double f0)
+{
+    const auto bin0 = static_cast<long>(std::lround(f0 / sp.binHz));
+    const auto lo = static_cast<size_t>(std::max(1.0, 20.0 / sp.binHz));
+    const auto hi = std::min(sp.mag.size() - 1, static_cast<size_t>(20000.0 / sp.binHz));
+    double fund = 0.0, total = 0.0;
+    for (size_t k = lo; k <= hi; ++k)
+    {
+        const double p = sp.mag[k] * sp.mag[k];
+        total += p;
+        if (std::llabs(static_cast<long long>(k) - bin0) <= 8)
+            fund += p;
+    }
+    if (fund <= 0.0) return 100.0;
+    return 100.0 * std::sqrt(std::max(total - fund, 0.0) / fund);
+}
+
+/// Worst spurious component (dB re fundamental peak): the largest bin that is
+/// neither near DC nor within +-8 bins of any harmonic of f0.
+double spuriousDb(const CapturedSpectrum& sp, double f0)
+{
+    const auto hi = std::min(sp.mag.size() - 1, static_cast<size_t>(20000.0 / sp.binHz));
+    const auto bin0 = std::max<long>(1, std::lround(f0 / sp.binHz));
+    double fund = 0.0;
+    for (long k = bin0 - 8; k <= bin0 + 8; ++k)
+        if (k > 0 && static_cast<size_t>(k) <= hi)
+            fund = std::max(fund, sp.mag[static_cast<size_t>(k)]);
+
+    double worst = 0.0;
+    for (size_t k = static_cast<size_t>(std::max(1.0, 30.0 / sp.binHz)); k <= hi; ++k)
+    {
+        const double harm = static_cast<double>(k) / bin0;
+        if (std::abs(harm - std::round(harm)) * bin0 <= 8.0) continue;   // harmonic lobe
+        worst = std::max(worst, sp.mag[k]);
+    }
+    return toDb(worst / std::max(fund, 1e-12));
+}
+
+/// Output RMS (dBFS) with a silent input, after a short warmup.
+double noiseFloorDbfs(const std::function<void(dspark::AudioBufferView<float>)>& process)
+{
+    constexpr int kBlock = 512, kWarm = 24, kMeas = 94;   // ~1 s measured
+    dspark::AudioBuffer<float> buf;
+    buf.resize(2, kBlock);
+    auto view = buf.toView();
+    double acc = 0.0;
+    long count = 0;
+    for (int b = 0; b < kWarm + kMeas; ++b)
+    {
+        for (int i = 0; i < kBlock; ++i)
+        {
+            view.getChannel(0)[i] = 0.0f;
+            view.getChannel(1)[i] = 0.0f;
+        }
+        process(view);
+        if (b >= kWarm)
+            for (int i = 0; i < kBlock; ++i)
+            {
+                acc += static_cast<double>(view.getChannel(0)[i]) * view.getChannel(0)[i];
+                ++count;
+            }
+    }
+    return toDb(std::sqrt(acc / std::max(1L, count)));
+}
+
+std::vector<MetricsCase> buildMetricsCases()
+{
+    const dspark::AudioSpec spec { 48000.0, 512, 2 };
+    using V = dspark::AudioBufferView<float>;
+    std::vector<MetricsCase> cases;
+    auto add = [&](const char* name, const char* settings, const char* note,
+                   std::function<void(V)> process, std::function<int()> latency = nullptr,
+                   bool shifted = false) {
+        cases.push_back({ name, settings, note, std::move(process), std::move(latency), shifted });
+    };
+
+    { auto p = std::make_shared<dspark::Gain<float>>();
+      p->prepare(spec); p->setGainDb(-3.0f);
+      add("Gain", "-3 dB", "", [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::FilterEngine<float>>();
+      p->prepare(spec); p->setLowPass(16000.0f, 0.707f, 24);
+      add("FilterEngine", "LP 16 kHz, 24 dB/oct", "", [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::Equalizer<float>>();
+      p->prepare(spec); p->setBand(0, 500.0f, 3.0f);
+      add("Equalizer (IIR)", "+3 dB bell @ 500 Hz", "",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
+    { auto p = std::make_shared<dspark::Equalizer<float>>();
+      p->setFilterMode(dspark::Equalizer<float>::FilterMode::LinearPhase);
+      p->prepare(spec); p->setBand(0, 500.0f, 3.0f);
+      add("Equalizer (linear phase)", "+3 dB bell @ 500 Hz", "",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
+    { auto p = std::make_shared<dspark::Compressor<float>>();
+      p->prepare(spec); p->setThreshold(-20.0f); p->setRatio(4.0f);
+      add("Compressor", "-20 dB, 4:1", "gain-riding on steady tone",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
+    { auto p = std::make_shared<dspark::Limiter<float>>();
+      p->prepare(spec); p->setCeiling(-1.0f); p->setTruePeak(true);
+      add("Limiter", "-1 dBTP ceiling", "",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
+    { auto p = std::make_shared<dspark::NoiseGate<float>>();
+      p->prepare(spec); p->setThreshold(-60.0f);
+      add("NoiseGate", "-60 dB (open)", "", [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::Expander<float>>();
+      p->prepare(spec); p->setThreshold(-60.0f);
+      add("Expander", "-60 dB (inactive)", "", [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::DynamicEQ<float>>();
+      p->prepare(spec);
+      dspark::DynamicEQ<float>::BandConfig cfg;
+      cfg.frequency = 3000.0f; cfg.threshold = -30.0f; cfg.aboveRatio = 3.0f;
+      p->setBand(0, cfg); p->setNumBands(1);
+      add("DynamicEQ", "3 kHz band, -30 dB, 3:1", "", [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::MultibandCompressor<float>>();
+      p->prepare(spec); p->setNumBands(3);
+      add("MultibandCompressor", "3 bands, defaults", "",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
+    { auto p = std::make_shared<dspark::TransientDesigner<float>>();
+      p->prepare(spec); p->setAttack(20.0f); p->setSustain(0.0f);
+      add("TransientDesigner", "attack +20%", "", [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::DeEsser<float>>();
+      p->prepare(spec); p->setFrequency(7000.0f); p->setThreshold(-30.0f);
+      add("DeEsser", "7 kHz, -30 dB", "", [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::Saturation<float>>();
+      p->setOversampling(2); p->prepare(spec); p->setDrive(0.0f);
+      add("Saturation (SoftClip)", "drive 0 dB, 2x OS", "",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatencySamples(); }); }
+
+    { auto p = std::make_shared<dspark::Clipper<float>>();
+      p->setOversampling(4); p->prepare(spec);
+      p->setMode(dspark::Clipper<float>::Mode::Analog);
+      add("Clipper (Analog)", "0 dB in, 4x OS", "",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
+    { auto p = std::make_shared<dspark::TapeMachine<float>>();
+      p->prepare(spec); p->setDrive(0.0f); p->setWowFlutter(0.0f);
+      add("TapeMachine", "drive 0 dB, wow/flutter off", "",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
+    { auto p = std::make_shared<dspark::TubePreamp<float>>();
+      p->prepare(spec); p->setStages(1); p->setDrive(0.0f);
+      add("TubePreamp", "1 stage, drive 0 dB", "",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
+    { auto p = std::make_shared<dspark::TransformerModel<float>>();
+      p->prepare(spec); p->setDrive(0.0f);
+      add("TransformerModel", "drive 0 dB", "", [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::Chorus<float>>();
+      p->prepare(spec); p->setRate(0.8f); p->setMix(0.5f);
+      add("Chorus", "0.8 Hz, mix 50%", "modulated: sidebands are the effect",
+          [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::Phaser<float>>();
+      p->prepare(spec); p->setRate(0.5f);
+      add("Phaser", "0.5 Hz", "modulated: sidebands are the effect",
+          [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::Tremolo<float>>();
+      p->prepare(spec); p->setRate(5.0f); p->setDepth(0.7f);
+      add("Tremolo", "5 Hz, depth 0.7", "amplitude modulation is the effect",
+          [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::Vibrato<float>>();
+      p->prepare(spec); p->setRate(5.0f); p->setDepth(0.4f);
+      add("Vibrato", "5 Hz, depth 0.4", "FM: spectrum displaced by design",
+          [p](V b){ p->processBlock(b); }, nullptr, true); }
+
+    { auto p = std::make_shared<dspark::RingModulator<float>>();
+      p->prepare(spec); p->setFrequency(300.0f); p->setMix(1.0f);
+      add("RingModulator", "300 Hz carrier", "spectrum displaced by design",
+          [p](V b){ p->processBlock(b); }, nullptr, true); }
+
+    { auto p = std::make_shared<dspark::FrequencyShifter<float>>();
+      p->prepare(spec); p->setShift(50.0f);
+      add("FrequencyShifter", "+50 Hz", "spectrum displaced by design",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }, true); }
+
+    { auto p = std::make_shared<dspark::PitchShifter<float>>();
+      p->prepare(spec); p->setSemitones(4.0f);
+      add("PitchShifter", "+4 st", "spectrum displaced by design",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }, true); }
+
+    { auto p = std::make_shared<dspark::GranularProcessor<float>>();
+      p->prepare(spec); p->setDensity(30.0f);
+      add("GranularProcessor", "density 30/s", "granular texture is the effect",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
+    { auto p = std::make_shared<dspark::SpectralDenoiser<float>>();
+      p->prepare(spec); p->setReduction(12.0f);
+      add("SpectralDenoiser", "reduction 12 dB", "",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
+    { auto p = std::make_shared<dspark::AlgorithmicReverb<float>>();
+      p->prepare(spec); p->setType(dspark::AlgorithmicReverb<float>::Type::Hall);
+      p->setMix(0.4f);
+      add("AlgorithmicReverb", "Hall, mix 40%", "time-based: tail energy",
+          [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::Reverb<float>>();
+      p->prepare(spec);
+      std::vector<float> ir(4800);
+      for (size_t i = 0; i < ir.size(); ++i)
+          ir[i] = static_cast<float>(std::exp(-3.0 * static_cast<double>(i) / 4800.0)
+                * std::sin(0.1 * static_cast<double>(i)));
+      ir[0] = 1.0f;
+      p->loadIR(ir.data(), static_cast<int>(ir.size()), 48000.0);
+      p->setMix(0.3f);
+      add("ConvolutionReverb", "synthetic IR, mix 30%", "time-based: tail energy",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
+    { auto p = std::make_shared<dspark::StereoWidth<float>>();
+      p->prepare(spec); p->setWidth(1.4f); p->setBassMono(true, 120.0);
+      add("StereoWidth", "width 1.4, bass mono 120 Hz", "",
+          [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::Panner<float>>();
+      p->prepare(spec); p->setPan(0.4f);
+      add("Panner", "pan 0.4 R", "", [p](V b){ p->processBlock(b); }); }
+
+    { auto p = std::make_shared<dspark::DCBlocker<float>>();
+      p->prepare(48000.0, 2, 10.0); p->setOrder(4);
+      add("DCBlocker", "10 Hz, order 4", "", [p](V b){ p->processBlock(b); }); }
+
+    return cases;
+}
+
+int runMetricsTable(const char* outPath)
+{
+#ifndef DSPARK_NO_FILE_IO
+    FILE* out = std::fopen(outPath, "w");
+    if (!out)
+    {
+        std::printf("ERROR: cannot open %s for writing\n", outPath);
+        return 1;
+    }
+
+    std::fprintf(out,
+        "# DSPark — Per-Processor Quality Metrics\n\n"
+        "Generated by `dspark_conformance --metrics` (48 kHz, stereo, block 512).\n\n"
+        "- **THD+N**: spectral energy outside the fundamental, 1 kHz tone at -6 dBFS,\n"
+        "  relative to the fundamental, 20 Hz-20 kHz.\n"
+        "- **Noise floor**: output RMS (dBFS) with silent input.\n"
+        "- **Spurious**: worst non-harmonic component (dB re fundamental) with a\n"
+        "  10.1 kHz tone at -6 dBFS — aliasing shows up here.\n"
+        "- **Latency**: as reported by `getLatency()` (samples @ 48 kHz). Validated\n"
+        "  by the PDC null tests in this same suite.\n\n"
+        "| Processor | Settings | Latency | THD+N @1 kHz | Noise floor | Spurious @10.1 kHz | Notes |\n"
+        "|---|---|---:|---:|---:|---:|---|\n");
+
+    // Bin-centred probe frequencies (32768-point FFT @ 48 kHz) minimise leakage.
+    const double bin = 48000.0 / 32768.0;
+    const double f1k = bin * std::round(1000.0 / bin);
+    const double f10k = bin * std::round(10100.0 / bin);
+
+    auto cases = buildMetricsCases();
+    for (auto& c : cases)
+    {
+        // Noise floor FIRST, while the processor state is pristine — granular
+        // and reverb tails from a previous tone are not the effect's noise.
+        const double noise = noiseFloorDbfs(c.process);
+        const int lat = c.latency ? c.latency() : 0;
+
+        char thdnStr[32], spurStr[32];
+        if (c.shifted)
+        {
+            // No fundamental survives at the input frequency: the columns do
+            // not apply (the displacement IS the effect).
+            std::snprintf(thdnStr, sizeof(thdnStr), "n/a");
+            std::snprintf(spurStr, sizeof(spurStr), "n/a");
+        }
+        else
+        {
+            const auto sp1 = captureSpectrum(c.process, f1k, 0.5f);
+            const double thdn = thdnPercent(sp1, f1k);
+            const auto sp10 = captureSpectrum(c.process, f10k, 0.5f);
+            const double spur = spuriousDb(sp10, f10k);
+            if (thdn < 0.001) std::snprintf(thdnStr, sizeof(thdnStr), "<0.001 %%");
+            else              std::snprintf(thdnStr, sizeof(thdnStr), "%.3f %%", thdn);
+            std::snprintf(spurStr, sizeof(spurStr), "%.1f dB", spur);
+        }
+
+        std::fprintf(out, "| %s | %s | %d | %s | %.1f dBFS | %s | %s |\n",
+                     c.name, c.settings, lat, thdnStr, noise, spurStr, c.note);
+        std::printf("TABLE %-26s thdn %-9s noise %.1f dBFS  spur %-9s lat %d\n",
+                    c.name, thdnStr, noise, spurStr, lat);
+    }
+
+    std::fprintf(out,
+        "\nModulated, inharmonic-by-design and time-based processors necessarily show\n"
+        "high \"THD+N\" — for them the column documents the character at the listed\n"
+        "settings rather than a defect. Linear processors read at the measurement's\n"
+        "own floor.\n");
+    std::fclose(out);
+    std::printf("\nMetrics table written to %s\n", outPath);
+    return 0;
+#else
+    (void) outPath;
+    std::printf("metrics table requires file IO (built with DSPARK_NO_FILE_IO)\n");
+    return 1;
+#endif
+}
+
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::strcmp(argv[i], "--metrics") == 0)
+            return runMetricsTable(argv[i + 1]);
+
     std::printf("DSPark public conformance suite\n");
     std::printf("================================\n\n");
 

@@ -8,7 +8,7 @@
 
 **📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
-CI builds and tests every commit on Windows (MSVC), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus AddressSanitizer/UBSan, an exceptions-free embedded profile and a single-header amalgamation. The public conformance suite validates loudness against the official EBU R128 test vectors.
+CI builds and tests every commit on Windows (MSVC), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus AddressSanitizer/UBSan, an exceptions-free embedded profile and a single-header amalgamation. The public conformance suite validates loudness against the official EBU R128 test vectors and generates a [per-processor quality metrics table](docs/metrics.md) (THD+N, noise floor, spurious/aliasing, latency).
 
 ```cpp
 #include "DSPark/DSPark.h"

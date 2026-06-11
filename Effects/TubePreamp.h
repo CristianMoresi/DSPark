@@ -28,9 +28,12 @@
  *   stages and is driven by the first stage's real ~38 kΩ output impedance,
  *   so it loads the tube exactly like the hardware. Controls interact
  *   non-orthogonally — that is the circuit, not a bug.
- * - Output level is calibrated empirically on parameter changes so drive
- *   raises saturation at constant loudness (same convention as
- *   TapeMachine); use setOutput() for static trim.
+ * - Output level: the circuit's program gain at the reference tone setting
+ *   is measured once in prepare() (settled channel, pink-weighted
+ *   multitone) and divided out together with the small-signal drive factor,
+ *   so drive raises saturation at roughly constant loudness; use
+ *   setOutput() for static trim. Gain changes are ramped (~30 ms) to keep
+ *   slider drags click-free.
  *
  * The nonlinear core runs at 2x oversampling. THD signature verified in the
  * suite: single-stage distortion is 2nd-harmonic dominant (asymmetric
@@ -50,6 +53,7 @@
 #include "../Core/WDF.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -95,6 +99,8 @@ public:
                         std::vector<T>(static_cast<size_t>(drySize_), T(0)));
         dryPos_ = 0;
 
+        calibrateReference();
+
         prepared_ = true;
         dirty_.store(true, std::memory_order_relaxed);
         reset();
@@ -104,12 +110,16 @@ public:
     void reset() noexcept
     {
         if (!prepared_) return;
+        const double sagR = static_cast<double>(sag_.load(std::memory_order_relaxed)) * 40e3;
         for (auto& ch : channels_)
-            ch->reset();
+            ch->reset(sagR);
         for (auto& d : dryRing_)
             std::fill(d.begin(), d.end(), T(0));
         dryPos_ = 0;
         if (oversampler_) oversampler_->reset();
+        // Seed the anti-zipper ramps at their targets: no fade-in on start.
+        hScaleSm_ = -1.0;
+        outGainSm_ = -1.0;
     }
 
     // -- Parameters (thread-safe) ---------------------------------------------------
@@ -244,15 +254,38 @@ public:
         {
             auto osView = oversampler_->upsample(buffer);
             const int osN = osView.getNumSamples();
+
+            // Anti-zipper: GEOMETRIC in-block ramps toward the current
+            // targets (~30 ms across blocks), shared by all channels. A flat
+            // per-block step clicked while dragging drive; and since
+            // (hScale, outGain) is a compensation pair spanning orders of
+            // magnitude (outGain ~ 1/drive), linear interpolation transits
+            // through over-gained states — power-law interpolation keeps
+            // the pair on the calibration curve.
+            if (outGainSm_ <= 0.0) outGainSm_ = outGain;
+            if (hScaleSm_ <= 0.0)  hScaleSm_ = hScale_;
+            const double kSm = 1.0 - std::exp(-static_cast<double>(osN) / (0.030 * fs2_));
+            const double outEnd = outGainSm_ * std::pow(outGain / outGainSm_, kSm);
+            const double hEnd   = hScaleSm_ * std::pow(hScale_ / hScaleSm_, kSm);
+            const double outRat = std::pow(outEnd / outGainSm_, 1.0 / static_cast<double>(osN));
+            const double hRat   = std::pow(hEnd / hScaleSm_, 1.0 / static_cast<double>(osN));
+
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* d = osView.getChannel(ch);
                 auto& state = *channels_[static_cast<size_t>(ch)];
+                double g = outGainSm_, h = hScaleSm_;
                 for (int i = 0; i < osN; ++i)
-                    d[i] = static_cast<T>(outGain
-                        * state.processSample(hScale_ * static_cast<double>(d[i]),
+                {
+                    g *= outRat;
+                    h *= hRat;
+                    d[i] = static_cast<T>(g
+                        * state.processSample(h * static_cast<double>(d[i]),
                                               numStagesActive_, sagR_));
+                }
             }
+            outGainSm_ = outEnd;
+            hScaleSm_ = hEnd;
             oversampler_->downsample(buffer);
             supplyNow_.store(static_cast<T>(kBplus - sagR_ * channels_[0]->ipLP),
                              std::memory_order_relaxed);
@@ -406,10 +439,24 @@ private:
             fmv.prepare(fs2In);
         }
 
-        void reset() noexcept
+        /** Settles the DC operating point CONSISTENTLY with the sagged
+         *  supply: fixed point on B+ = kBplus - sagR*(Ip1+Ip2). Settling at
+         *  the stiff kBplus while processSample() immediately applies the
+         *  sag drop produced a ~19 V supply step at sag 0.3 — an audible
+         *  activation thump, and worse: it sat inside the old 10 ms
+         *  calibration window, inflating outSq and burying the whole wet
+         *  path ~20 dB under unity. */
+        void reset(double sagR) noexcept
         {
-            stage1.settleDC(kBplus);
-            stage2.settleDC(kBplus);
+            double bp = kBplus;
+            for (int it = 0; it < 8; ++it)
+            {
+                stage1.settleDC(bp);
+                stage2.settleDC(bp);
+                const double bpNew = kBplus - sagR * (stage1.ip + stage2.ip);
+                if (std::abs(bpNew - bp) < 1e-9) break;
+                bp = bpNew;
+            }
             ipLP = stage1.ip + stage2.ip;
             outHpX = outHpY = 0.0;
             fmv.reset();
@@ -472,27 +519,58 @@ private:
         for (auto& ch : channels_)
             ch->setToneControls(t, b, m);
 
-        // Empirical loudness calibration at -40 dBFS through a scratch
-        // channel (same convention as TapeMachine): drive changes saturation,
-        // not level. The calibration always uses the REFERENCE tone setting
-        // (0.5/0.5/0.5) so turning the tone knobs is fully audible — the
-        // stack's insertion gain is part of the tone, not of the drive.
-        ChannelState cal(fs2_);
-        cal.reset();
-        cal.setToneControls(0.5, 0.5, 0.5);
-        const int n = static_cast<int>(0.010 * fs2_);
-        double inSq = 0.0, outSq = 0.0;
-        for (int i = 0; i < n; ++i)
+        // Loudness: divide out the circuit's program gain at the REFERENCE
+        // tone setting (measured once in prepare on a settled channel) and
+        // the small-signal drive factor — "drive changes saturation, not
+        // level". The tone knobs stay fully audible: their deviation from
+        // the 0.5/0.5/0.5 reference is part of the tone, not of the level.
+        // Cheap by construction (no scratch processing on the audio thread),
+        // so dragging the drive slider cannot starve the callback.
+        mScale_ = 1.0 / std::max(drive * gRef_[static_cast<size_t>(numStagesActive_ - 1)], 1e-9);
+    }
+
+    /**
+     * Measures the per-stage-count program gain of a settled channel at the
+     * reference tone (0.5/0.5/0.5), reference sag voicing and drive 0 dB:
+     * a pink-weighted multitone (one tone per octave, 100..6400 Hz) at
+     * -40 dBFS, 60 ms settle + 50 ms measure. A single 1 kHz tone is the
+     * wrong probe here: the FMV stack's mid scoop makes spot frequencies
+     * unrepresentative of program loudness (the old 1 kHz/10 ms calibration
+     * also measured INSIDE the supply-sag settling step, which buried the
+     * wet path ~20 dB under unity at the Lab defaults).
+     */
+    void calibrateReference() noexcept
+    {
+        constexpr double kRefTones[] = { 100.0, 200.0, 400.0, 800.0, 1600.0, 3200.0, 6400.0 };
+        constexpr double kSagRef = 0.3 * 40e3;
+        const int settle = static_cast<int>(0.060 * fs2_);
+        const int meas   = static_cast<int>(0.050 * fs2_);
+
+        for (int st = 1; st <= 2; ++st)
         {
-            const double x = 0.01 * std::sin(2.0 * std::numbers::pi * 1000.0 * i / fs2_);
-            const double y = cal.processSample(hScale_ * x, numStagesActive_, sagR_);
-            if (i >= n / 2)
+            ChannelState cal(fs2_);
+            cal.setToneControls(0.5, 0.5, 0.5);
+            cal.reset(kSagRef);
+            double inSq = 0.0, outSq = 0.0;
+            for (int i = 0; i < settle + meas; ++i)
             {
-                inSq += x * x;
-                outSq += y * y;
+                double x = 0.0;
+                for (int k = 0; k < 7; ++k)
+                    x += std::sin(2.0 * std::numbers::pi * kRefTones[k] * i / fs2_ + k * 1.7);
+                // Program level (~-15 dBFS RMS), not small-signal: the gain
+                // reference must include the triode's real compression at
+                // musical levels, or high drive settings overshoot loudness.
+                x *= 0.095 / 2.6457513;
+                const double y = cal.processSample(x, st, kSagRef);
+                if (i >= settle)
+                {
+                    inSq += x * x;
+                    outSq += y * y;
+                }
             }
+            gRef_[static_cast<size_t>(st - 1)] =
+                (outSq > 0.0 && inSq > 0.0) ? std::sqrt(outSq / inSq) : 1.0;
         }
-        mScale_ = (outSq > 0.0) ? std::sqrt(inSq / outSq) : 1.0;
     }
 
     // -- Members --------------------------------------------------------------------
@@ -514,6 +592,9 @@ private:
     double mScale_ = 1.0;
     double sagR_ = 0.0;
     int numStagesActive_ = 1;
+    std::array<double, 2> gRef_ { 1.0, 1.0 };   ///< Program gain per stage count (prepare-time).
+    double hScaleSm_ = -1.0;                    ///< Anti-zipper ramp states (-1 = seed on
+    double outGainSm_ = -1.0;                   ///<  first block after prepare/reset).
 
     std::atomic<T> driveDb_ { T(0) };
     std::atomic<T> treble_ { T(0.5) };

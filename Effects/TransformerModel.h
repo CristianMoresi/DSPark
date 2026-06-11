@@ -32,8 +32,11 @@
  *   does: big cores ring lower and take more level before saturating.
  * - **resonance** raises the leakage-inductance/capacitance bell
  *   (Jensen-style), mapped into the audible band near the top octave.
- * - Loudness is calibrated empirically at the reference level (same
- *   convention as TapeMachine/TubePreamp): drive changes iron, not volume.
+ * - Loudness is calibrated empirically at PROGRAM level (100 Hz, -12 dBFS —
+ *   the flux regime music drives the core into; same convention as
+ *   TapeMachine/TubePreamp): drive changes iron, not volume. Gain changes
+ *   are ramped (~50 ms), which matters doubly here because the model
+ *   differentiates its output.
  *
  * Zero latency. The Saturation effect's lightweight Transformer algorithm
  * remains as the cheap alternative; this is the physical one.
@@ -79,7 +82,12 @@ public:
 
         channels_.assign(static_cast<size_t>(numChannels_), {});
         for (auto& ch : channels_)
+        {
             ch.hyst.prepare(sampleRate_);
+            // Unbiased iron: wider loop than biased tape (low reversible c).
+            // Constant material — set once here, not on every recompute().
+            ch.hyst.setParameters(3.5e5, 2.2e4, 1.6e-3, 3.2e4, 0.25);
+        }
 
         prepared_ = true;
         dirty_.store(true, std::memory_order_relaxed);
@@ -100,6 +108,9 @@ public:
             ch.hpX = ch.hpY = 0.0;
             ch.bell = {};
         }
+        // Seed the anti-zipper ramps at their targets: no fade-in on start.
+        hScaleSm_ = -1.0;
+        mScaleSm_ = -1.0;
     }
 
     // -- Parameters (thread-safe) ---------------------------------------------------
@@ -175,13 +186,31 @@ public:
 
         const T mixVal = mix_.load(std::memory_order_relaxed);
 
+        // Anti-zipper: GEOMETRIC in-block ramps toward the recompute()
+        // targets (~50 ms across blocks), shared by all channels. Two
+        // reasons: this model differentiates its output (x 2*fs), so a flat
+        // per-block gain step clicks; and (hScale, mScale) is a calibrated
+        // compensation pair spanning orders of magnitude — interpolating it
+        // LINEARLY passes through wildly over-gained states (+24 dB
+        // measured mid-drag), while power-law interpolation keeps the pair
+        // on the calibration curve m ~ C/h^g throughout the transition.
+        if (hScaleSm_ <= 0.0) { hScaleSm_ = hScale_; mScaleSm_ = mScale_; }
+        const double kSm = 1.0 - std::exp(-static_cast<double>(nS) / (0.050 * sampleRate_));
+        const double hEnd = hScaleSm_ * std::pow(hScale_ / hScaleSm_, kSm);
+        const double mEnd = mScaleSm_ * std::pow(mScale_ / mScaleSm_, kSm);
+        const double hRat = std::pow(hEnd / hScaleSm_, 1.0 / static_cast<double>(nS));
+        const double mRat = std::pow(mEnd / mScaleSm_, 1.0 / static_cast<double>(nS));
+
         for (int ch = 0; ch < nCh; ++ch)
         {
             T* d = buffer.getChannel(ch);
             auto& st = channels_[static_cast<size_t>(ch)];
+            double hSm = hScaleSm_, mSm = mScaleSm_;
 
             for (int i = 0; i < nS; ++i)
             {
+                hSm *= hRat;
+                mSm *= mRat;
                 const double x = static_cast<double>(d[i]);
 
                 // Leaky trapezoidal integrator: winding voltage -> flux.
@@ -189,8 +218,8 @@ public:
                 st.vPrev = x;
 
                 // Core hysteresis on the flux (JA, unbiased-iron parameters).
-                const double m = mScale_ * static_cast<double>(
-                    st.hyst.processSample(static_cast<T>(hScale_ * fluxNew)));
+                const double m = mSm * static_cast<double>(
+                    st.hyst.processSample(static_cast<T>(hSm * fluxNew)));
 
                 // Algebraic inverse of the integrator (flux -> voltage). The
                 // damped feedback pole (rho < 1) tames z = -1: hysteresis
@@ -215,6 +244,8 @@ public:
                 d[i] = d[i] + (wet - d[i]) * mixVal;
             }
         }
+        hScaleSm_ = hEnd;
+        mScaleSm_ = mEnd;
     }
 
 private:
@@ -261,28 +292,29 @@ private:
         halfT_ = 0.5 / sampleRate_;
         invHalfT_ = 2.0 * sampleRate_;
 
-        // Unbiased iron: wider loop than biased tape (low reversible c).
-        for (auto& ch : channels_)
-            ch.hyst.setParameters(3.5e5, 2.2e4, 1.6e-3, 3.2e4, 0.25);
-
         // Flux scale: 0 dBFS at 30 Hz reaches H = 1.1a at nominal drive and
         // nominal core; bigger cores take proportionally more flux.
         const double fluxRef = 1.0 / (2.0 * std::numbers::pi * 30.0);
         const double headroom = 0.6 + 0.8 * size;
         hScale_ = drive * 1.1 * 2.2e4 / (fluxRef * headroom);
 
-        // Small-signal loudness calibration at 1 kHz (empirical, reference
-        // level), same convention as the other physical models.
+        // Loudness calibration at PROGRAM level: 100 Hz at -12 dBFS, the
+        // flux regime music actually drives the core into (flux ~ V/f, so
+        // lows dominate). Calibrating small-signal (the old 0.05 @ 1 kHz)
+        // probed the JA virgin curve, whose susceptibility is an order of
+        // magnitude below the major loop's mean slope — at high drive the
+        // output then came out ~+21 dB over the input (measured x11),
+        // heard as violent level jumps while dragging the drive slider.
         {
             Hysteresis<T> cal;
             cal.prepare(sampleRate_);
             cal.setParameters(3.5e5, 2.2e4, 1.6e-3, 3.2e4, 0.25);
             double flux = 0.0, vPrev = 0.0, mPrev = 0.0, vPrev2 = 0.0;
             double inSq = 0.0, outSq = 0.0;
-            const int n = static_cast<int>(0.02 * sampleRate_);
+            const int n = static_cast<int>(0.04 * sampleRate_);   // 2+2 cycles of 100 Hz
             for (int i = 0; i < n; ++i)
             {
-                const double x = 0.05 * std::sin(2.0 * std::numbers::pi * 1000.0 * i / sampleRate_);
+                const double x = 0.25 * std::sin(2.0 * std::numbers::pi * 100.0 * i / sampleRate_);
                 const double fluxNew = leak_ * flux + halfT_ * (x + vPrev);
                 vPrev = x;
                 const double m = static_cast<double>(
@@ -326,6 +358,8 @@ private:
     double invHalfT_ = 96000.0;
     double hScale_ = 1.0;
     double mScale_ = 1.0;
+    double hScaleSm_ = -1.0;    ///< Anti-zipper ramp states (-1 = seed on
+    double mScaleSm_ = -1.0;    ///<  first block after prepare/reset).
 
     std::atomic<T> driveDb_ { T(0) };
     std::atomic<T> coreSize_ { T(0.5) };

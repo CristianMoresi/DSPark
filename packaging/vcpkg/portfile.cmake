@@ -1,5 +1,5 @@
 # DSPark vcpkg port — submit to microsoft/vcpkg once a release tag exists.
-# Update REF and SHA512 bdc1da86e4c564444682c76ba8b7e160e3053c7bf96aea5395cd54ad11617acee797a42c0a87a3de26c7afdde159d88c4aec2e7bb2eb483bbf21338cbbdbc6dcor the published release archive
+# Update REF and SHA512 for the published release archive
 # (vcpkg hashes the GitHub source tarball of the tag).
 
 vcpkg_from_github(

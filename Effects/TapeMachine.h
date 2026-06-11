@@ -487,6 +487,14 @@ private:
                 }
             }
             mScale_ = (outSq > 0.0) ? std::sqrt(inSq / outSq) : 1.0;
+
+            // Partial loudness link: the per-drive calibration above pins the
+            // reference level EXACTLY, which kills the drive knob (inaudible
+            // below 0 dB where tape stays clean, a pure attenuator above as
+            // compression eats level). A +0.25 dB/dB residual slope keeps it
+            // alive: backing off cleans AND drops slightly, pushing holds
+            // level while the tape density grows.
+            mScale_ *= std::pow(drive, 0.25);
         }
 
         // --- EQ time constants per standard and speed --------------------------

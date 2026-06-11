@@ -101,50 +101,78 @@ inline EffectSlot makeFilterEngine()
 
 inline EffectSlot makeEqualizer()
 {
-    auto p = std::make_shared<dspark::Equalizer<float>>();
+    using EQ = dspark::Equalizer<float>;
+    auto p = std::make_shared<EQ>();
     EffectSlot s;
     s.name = "Equalizer"; s.category = "Filters";
-    s.addSlider("Band 1 Freq", 20, 20000, 100, "Hz", true);
-    s.addSlider("Band 1 Gain", -24, 24, 0, "dB");
-    s.addSlider("Band 1 Q", 0.1f, 10, 1, "");
-    s.addSlider("Band 2 Freq", 20, 20000, 500, "Hz", true);
-    s.addSlider("Band 2 Gain", -24, 24, 0, "dB");
-    s.addSlider("Band 2 Q", 0.1f, 10, 1, "");
-    s.addSlider("Band 3 Freq", 20, 20000, 2000, "Hz", true);
-    s.addSlider("Band 3 Gain", -24, 24, 0, "dB");
-    s.addSlider("Band 3 Q", 0.1f, 10, 1, "");
-    s.addSlider("Band 4 Freq", 20, 20000, 8000, "Hz", true);
-    s.addSlider("Band 4 Gain", -24, 24, 0, "dB");
-    s.addSlider("Band 4 Q", 0.1f, 10, 1, "");
+    // Per band: Freq, Gain, Q, Type, Slope. Type/Slope expose the full
+    // framework BandType set (shelves, cuts, notch, bandpass, tilt) — they
+    // were missing from the registry, leaving the EQ bells-only.
+    static constexpr float kDefFreq[4] = { 100, 500, 2000, 8000 };
+    for (int b = 0; b < 4; ++b)
+    {
+        char nm[24];
+        std::snprintf(nm, sizeof(nm), "Band %d Freq", b + 1);
+        s.addSlider(nm, 20, 20000, kDefFreq[b], "Hz", true);
+        std::snprintf(nm, sizeof(nm), "Band %d Gain", b + 1);
+        s.addSlider(nm, -24, 24, 0, "dB");
+        std::snprintf(nm, sizeof(nm), "Band %d Q", b + 1);
+        s.addSlider(nm, 0.1f, 10, 1, "");
+        std::snprintf(nm, sizeof(nm), "Band %d Type", b + 1);
+        s.addChoice(nm, {"Peak","Low Shelf","High Shelf","Low Cut","High Cut",
+                         "Notch","Band Pass","Tilt"}, 0);
+        std::snprintf(nm, sizeof(nm), "Band %d Slope", b + 1);
+        s.addSlider(nm, 6, 48, 12, "dB/oct");   // cuts (Low/High Cut) only
+    }
+    // Type index -> framework enum. The UI groups cuts after the shelves;
+    // the enum orders LowPass/HighPass there, so the mapping is direct.
+    auto toType = [](float v) {
+        return static_cast<EQ::BandType>(std::clamp(static_cast<int>(v), 0, 7));
+    };
+    auto toSlope = [](float v) {
+        return std::clamp((static_cast<int>(v) / 6) * 6, 6, 48);
+    };
     // Equalizer docs require prepare() BEFORE setNumBands() so bands
     // know the sample rate when auto-spacing frequencies.
     s.prepareFn = [p](auto& sp) { p->prepare(sp); p->setNumBands(4); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p](int i, float v) {
-        int band = i / 3;
-        int param = i % 3;
+    s.setParamFn = [p, toType, toSlope](int i, float v) {
+        int band = i / 5;
+        int param = i % 5;
         if (band >= 4) return;
         auto cfg = p->getBandConfig(band);
         switch(param) {
             case 0: cfg.frequency = v; break;
             case 1: cfg.gain = v; break;
             case 2: cfg.q = v; break;
+            case 3: cfg.type = toType(v); break;
+            case 4: cfg.slope = toSlope(v); break;
         }
         p->setBand(band, cfg);
     };
-    // Interactive response curve: 4 peaking bands. X=freq, Y=gain, wheel=Q.
-    s.magnitudeFn = [](const float* f, float* mdb, int n, double sr, const float* v) {
+    // Interactive response curve drawn from the band's REAL biquad cascade
+    // (buildBandStages), so shelves, cuts at any slope, notch and tilt all
+    // render exactly what the audio path applies. X=freq, Y=gain, wheel=Q.
+    s.magnitudeFn = [p, toType, toSlope](const float* f, float* mdb, int n, double sr, const float* v) {
         for (int i = 0; i < n; ++i) {
             double mag = 1.0;
             for (int b = 0; b < 4; ++b) {
-                auto c = dspark::BiquadCoeffs<float>::makePeak(sr, v[b*3+0], std::max(0.05f, v[b*3+2]), v[b*3+1]);
-                mag *= c.getMagnitude(static_cast<double>(f[i]), sr);
+                EQ::BandConfig cfg;
+                cfg.frequency = v[b*5+0];
+                cfg.gain      = v[b*5+1];
+                cfg.q         = std::max(0.05f, v[b*5+2]);
+                cfg.type      = toType(v[b*5+3]);
+                cfg.slope     = toSlope(v[b*5+4]);
+                dspark::BiquadCoeffs<float> stages[5];
+                const int ns = p->buildBandStages(cfg, stages);
+                for (int k = 0; k < ns; ++k)
+                    mag *= stages[k].getMagnitude(static_cast<double>(f[i]), sr);
             }
             mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
         }
     };
-    s.curveNodes = { {0,1,2}, {3,4,5}, {6,7,8}, {9,10,11} };
+    s.curveNodes = { {0,1,2}, {5,6,7}, {10,11,12}, {15,16,17} };
     return s;
 }
 
@@ -855,18 +883,22 @@ inline EffectSlot makeDynamicEQ()
     using DEQ = dspark::DynamicEQ<float>;
     auto p = std::make_shared<DEQ>();
 
-    // UI mirror: per band [Freq, Q, Threshold, Amount, Ratio, Attack, Release, Below].
-    // Amount is signed: +dB boosts the band when triggered, -dB cuts it. It is the
-    // node's Y axis, so you drag a band UP to boost or DOWN to cut.
-    auto ui = std::make_shared<std::array<std::array<float, 8>, 2>>();
-    (*ui)[0] = {  200.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f };
-    (*ui)[1] = { 3000.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f };
+    // UI mirror: per band [Freq, Q, Threshold, Amount, Ratio, Attack, Release,
+    // Below, Type]. Amount is signed: +dB boosts the band when triggered, -dB
+    // cuts it. It is the node's Y axis, so you drag a band UP to boost or DOWN
+    // to cut. Type selects the dynamic filter shape (Bell / Low Shelf / High
+    // Shelf), matching DynamicEQ::BandShape order.
+    auto ui = std::make_shared<std::array<std::array<float, 9>, 2>>();
+    (*ui)[0] = {  200.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f, 0.0f };
+    (*ui)[1] = { 3000.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f, 0.0f };
 
-    auto buildCfg = [](const std::array<float, 8>& v) {
+    auto buildCfg = [](const std::array<float, 9>& v) {
         DEQ::BandConfig c{};
         c.frequency = v[0];
         c.q         = std::max(0.1f, v[1]);
         c.threshold = v[2];
+        c.shape     = static_cast<DEQ::BandShape>(
+                          std::clamp(static_cast<int>(v[8]), 0, 2));
         c.enabled   = true;
         const float amount = v[3], ratio = std::max(1.0f, v[4]), atk = v[5], rel = v[6];
         const bool below = v[7] > 0.5f;       // act when below threshold instead of above
@@ -880,6 +912,17 @@ inline EffectSlot makeDynamicEQ()
         if (below) { c.belowRatio = ratio; c.belowBoost = boost; }
         else       { c.aboveRatio = ratio; c.aboveBoost = boost; }
         return c;
+    };
+
+    // Shape-aware magnitude of one band at gain g (for both curve overlays).
+    auto bandMag = [](float freq, float q, int shape, float g, double fHz, double sr) {
+        dspark::BiquadCoeffs<float> c;
+        switch (shape) {
+            default: c = dspark::BiquadCoeffs<float>::makePeak(sr, freq, std::max(0.05f, q), g); break;
+            case 1:  c = dspark::BiquadCoeffs<float>::makeLowShelf(sr, freq, g); break;
+            case 2:  c = dspark::BiquadCoeffs<float>::makeHighShelf(sr, freq, g); break;
+        }
+        return static_cast<double>(c.getMagnitude(fHz, sr));
     };
 
     EffectSlot s;
@@ -897,6 +940,7 @@ inline EffectSlot makeDynamicEQ()
         s.addSlider(nm("Attack"),   0.1f,  100, d[5], "ms");
         s.addSlider(nm("Release"),     5,  500, d[6], "ms");
         s.addToggle(nm("Below Thr"), false);
+        s.addChoice(nm("Type"), {"Bell","Low Shelf","High Shelf"}, 0);
     }
     s.prepareFn = [p, ui, buildCfg](auto& sp) {
         p->prepare(sp);
@@ -907,7 +951,7 @@ inline EffectSlot makeDynamicEQ()
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, ui, buildCfg](int i, float v) {
-        const int band = i / 8, prm = i % 8;
+        const int band = i / 9, prm = i % 9;
         if (band < 0 || band >= 2) return;
         (*ui)[static_cast<std::size_t>(band)][static_cast<std::size_t>(prm)] = v;
         p->setBand(band, buildCfg((*ui)[static_cast<std::size_t>(band)]));
@@ -915,29 +959,27 @@ inline EffectSlot makeDynamicEQ()
     // The orange curve is LIVE (current applied gain via getBandGainDb): it dips for
     // a cut and rises for a boost as the audio triggers each band. The draggable
     // nodes sit at each band's Amount target (X=freq, Y=amount, wheel=Q).
-    s.magnitudeFn = [p](const float* f, float* mdb, int n, double sr, const float* v) {
+    s.magnitudeFn = [p, bandMag](const float* f, float* mdb, int n, double sr, const float* v) {
         const float g0 = p->getBandGainDb(0);
         const float g1 = p->getBandGainDb(1);
         for (int i = 0; i < n; ++i) {
-            auto c0 = dspark::BiquadCoeffs<float>::makePeak(sr, v[0], std::max(0.05f, v[1]), g0);
-            auto c1 = dspark::BiquadCoeffs<float>::makePeak(sr, v[8], std::max(0.05f, v[9]), g1);
-            double mag = static_cast<double>(c0.getMagnitude(static_cast<double>(f[i]), sr))
-                       * static_cast<double>(c1.getMagnitude(static_cast<double>(f[i]), sr));
+            const double fHz = static_cast<double>(f[i]);
+            const double mag = bandMag(v[0], v[1], static_cast<int>(v[8]),  g0, fHz, sr)
+                             * bandMag(v[9], v[10], static_cast<int>(v[17]), g1, fHz, sr);
             mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
         }
     };
     // Faint target curve = each band's Amount (the ceiling the live curve moves to);
     // the draggable nodes sit on it.
-    s.targetMagnitudeFn = [](const float* f, float* mdb, int n, double sr, const float* v) {
+    s.targetMagnitudeFn = [bandMag](const float* f, float* mdb, int n, double sr, const float* v) {
         for (int i = 0; i < n; ++i) {
-            auto c0 = dspark::BiquadCoeffs<float>::makePeak(sr, v[0], std::max(0.05f, v[1]), v[3]);
-            auto c1 = dspark::BiquadCoeffs<float>::makePeak(sr, v[8], std::max(0.05f, v[9]), v[11]);
-            double mag = static_cast<double>(c0.getMagnitude(static_cast<double>(f[i]), sr))
-                       * static_cast<double>(c1.getMagnitude(static_cast<double>(f[i]), sr));
+            const double fHz = static_cast<double>(f[i]);
+            const double mag = bandMag(v[0], v[1], static_cast<int>(v[8]),  v[3],  fHz, sr)
+                             * bandMag(v[9], v[10], static_cast<int>(v[17]), v[12], fHz, sr);
             mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
         }
     };
-    s.curveNodes = { {0,3,1}, {8,11,9} };  // X=freq, Y=Amount (drag to boost/cut), wheel=Q
+    s.curveNodes = { {0,3,1}, {9,12,10} };  // X=freq, Y=Amount (drag to boost/cut), wheel=Q
     return s;
 }
 

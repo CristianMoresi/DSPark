@@ -567,11 +567,13 @@ protected:
         return {};
     }
 
+public:
     /**
      * @brief Fills `stages` with the ACTUAL biquad cascade for a band (per-stage
      * Butterworth Q for multi-stage LP/HP, single biquad otherwise) and returns
-     * the stage count. Used for an accurate magnitude response that matches what
-     * the IIR FilterEngine really applies (instead of a single-Q^N approximation).
+     * the stage count. Public analysis API: UIs use it to draw a magnitude
+     * response that matches what the IIR FilterEngine really applies
+     * (instead of a single-Q^N approximation). Requires prepare().
      * @param stages Output buffer (capacity >= 5).
      */
     [[nodiscard]] int buildBandStages(const BandConfig& cfg, BiquadCoeffs<T>* stages) const noexcept
@@ -600,6 +602,7 @@ protected:
         return 1;
     }
 
+protected:
     /**
      * @brief Mathematically robust Linear Phase kernel computation.
      *

@@ -28,12 +28,16 @@
  *   stages and is driven by the first stage's real ~38 kΩ output impedance,
  *   so it loads the tube exactly like the hardware. Controls interact
  *   non-orthogonally — that is the circuit, not a bug.
- * - Output level: the circuit's program gain at the reference tone setting
- *   is measured once in prepare() (settled channel, pink-weighted
- *   multitone) and divided out together with the small-signal drive factor,
- *   so drive raises saturation at roughly constant loudness; use
- *   setOutput() for static trim. Gain changes are ramped (~30 ms) to keep
- *   slider drags click-free.
+ * - Output level: the circuit's program response at the reference tone
+ *   setting is measured once in prepare() (settled channel, pink-weighted
+ *   multitone). A 3-section EQ designed from that measurement flattens the
+ *   FMV stack's fixed ~10 dB mid-scoop envelope — neutral knobs sound
+ *   neutral, the tone controls act relative to flat, and the triode's
+ *   harmonic character is untouched. Loudness divides out the measured
+ *   reference and drive^0.75 (partial link: the knob keeps a +0.25 dB/dB
+ *   residual slope so backing off is audible and high drive holds level
+ *   while density grows). Use setOutput() for static trim; gain changes
+ *   are ramped (~30 ms) so slider drags stay click-free.
  *
  * The nonlinear core runs at 2x oversampling. THD signature verified in the
  * suite: single-stage distortion is 2nd-harmonic dominant (asymmetric
@@ -46,6 +50,7 @@
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/Biquad.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/Oversampling.h"
@@ -460,6 +465,18 @@ private:
             ipLP = stage1.ip + stage2.ip;
             outHpX = outHpY = 0.0;
             fmv.reset();
+            for (auto& set : flatten)
+                for (auto& f : set)
+                    f.reset();
+        }
+
+        /** Installs the reference-flattening EQ for one stage count. */
+        void setFlattenCoeffs(int stageCount,
+                              const std::array<BiquadCoeffs<double>, 3>& c) noexcept
+        {
+            auto& set = flatten[static_cast<size_t>(stageCount - 1)];
+            for (int k = 0; k < 3; ++k)
+                set[static_cast<size_t>(k)].setCoeffs(c[static_cast<size_t>(k)]);
         }
 
         void setToneControls(double t, double b, double m) noexcept
@@ -487,13 +504,25 @@ private:
             outHpX = v;
             outHpY = y;
             // Restore absolute polarity for single-stage use.
-            return (numStages > 1) ? y : -y;
+            double out = (numStages > 1) ? y : -y;
+
+            // Reference-flattening EQ: undoes the FMV stack's fixed envelope
+            // at the neutral tone setting (designed in calibrateReference
+            // from the measured response), so neutral knobs sound neutral
+            // and the tone controls act RELATIVE to flat. The triode's
+            // harmonic character is untouched (this stage is linear).
+            auto& fl = flatten[numStages > 1 ? 1 : 0];
+            out = fl[0].processSample(out, 0);
+            out = fl[1].processSample(out, 0);
+            out = fl[2].processSample(out, 0);
+            return out;
         }
 
         double fs2 = 96000.0;
         TriodeStage stage1, stage2;
         double ipLP = 1.6e-3;
         double outHpX = 0.0, outHpY = 0.0;
+        std::array<std::array<Biquad<double, 1>, 3>, 2> flatten;   ///< Per stage count.
 
         wdf::ToneStackFMV<double> fmv;   ///< Exact Bassman stack (R-type WDF).
     };
@@ -521,23 +550,31 @@ private:
 
         // Loudness: divide out the circuit's program gain at the REFERENCE
         // tone setting (measured once in prepare on a settled channel) and
-        // the small-signal drive factor — "drive changes saturation, not
-        // level". The tone knobs stay fully audible: their deviation from
-        // the 0.5/0.5/0.5 reference is part of the tone, not of the level.
-        // Cheap by construction (no scratch processing on the audio thread),
-        // so dragging the drive slider cannot starve the callback.
-        mScale_ = 1.0 / std::max(drive * gRef_[static_cast<size_t>(numStagesActive_ - 1)], 1e-9);
+        // MOST of the drive factor. The link is partial (drive^0.75, i.e. a
+        // residual +0.25 dB/dB slope): an exact 1/drive link leaves the knob
+        // audibly dead below 0 dB (the circuit is still clean there) and
+        // turns it into a pure attenuator above (compression eats level
+        // faster than the link returns it). With the residual slope, -12 dB
+        // drive sits ~3 dB lower and clean, high drive holds level while the
+        // density grows. The tone knobs stay fully audible: their deviation
+        // from the 0.5/0.5/0.5 reference is part of the tone, not the level.
+        // Cheap by construction (no scratch processing on the audio thread).
+        mScale_ = 1.0 / std::max(std::pow(drive, 0.75)
+                                 * gRef_[static_cast<size_t>(numStagesActive_ - 1)], 1e-9);
     }
 
     /**
-     * Measures the per-stage-count program gain of a settled channel at the
-     * reference tone (0.5/0.5/0.5), reference sag voicing and drive 0 dB:
-     * a pink-weighted multitone (one tone per octave, 100..6400 Hz) at
-     * -40 dBFS, 60 ms settle + 50 ms measure. A single 1 kHz tone is the
-     * wrong probe here: the FMV stack's mid scoop makes spot frequencies
-     * unrepresentative of program loudness (the old 1 kHz/10 ms calibration
-     * also measured INSIDE the supply-sag settling step, which buried the
-     * wet path ~20 dB under unity at the Lab defaults).
+     * Measures the per-stage-count reference response of a settled channel
+     * at the reference tone (0.5/0.5/0.5), reference sag voicing and drive
+     * 0 dB, using a pink-weighted multitone (one tone per octave,
+     * 100..6400 Hz) at program level (~-15 dBFS RMS). From the per-tone
+     * gains it designs a 3-section flattening EQ (low shelf / mid peak /
+     * high shelf) that removes the FMV stack's fixed envelope — the raw
+     * stack at neutral knobs is a ~10 dB mid scoop, far too much colour
+     * for an insert effect — and then computes the loudness reference
+     * gRef WITH the flattener in place. A single 1 kHz tone is the wrong
+     * probe for either job (the old 1 kHz/10 ms calibration also measured
+     * INSIDE the supply-sag settling step, burying the wet path ~20 dB).
      */
     void calibrateReference() noexcept
     {
@@ -545,31 +582,72 @@ private:
         constexpr double kSagRef = 0.3 * 40e3;
         const int settle = static_cast<int>(0.060 * fs2_);
         const int meas   = static_cast<int>(0.050 * fs2_);
+        constexpr double kAmpPerTone = 0.095 / 2.6457513;
 
         for (int st = 1; st <= 2; ++st)
         {
-            ChannelState cal(fs2_);
+            ChannelState cal(fs2_);   // fresh: flattener is passthrough here
             cal.setToneControls(0.5, 0.5, 0.5);
             cal.reset(kSagRef);
-            double inSq = 0.0, outSq = 0.0;
+
+            // Per-tone Goertzel over the measured tail.
+            std::array<double, 7> gs1 {}, gs2 {}, gc {};
+            for (int k = 0; k < 7; ++k)
+                gc[static_cast<size_t>(k)] =
+                    2.0 * std::cos(2.0 * std::numbers::pi * kRefTones[k] / fs2_);
             for (int i = 0; i < settle + meas; ++i)
             {
                 double x = 0.0;
                 for (int k = 0; k < 7; ++k)
                     x += std::sin(2.0 * std::numbers::pi * kRefTones[k] * i / fs2_ + k * 1.7);
-                // Program level (~-15 dBFS RMS), not small-signal: the gain
-                // reference must include the triode's real compression at
-                // musical levels, or high drive settings overshoot loudness.
-                x *= 0.095 / 2.6457513;
+                x *= kAmpPerTone;
                 const double y = cal.processSample(x, st, kSagRef);
                 if (i >= settle)
-                {
-                    inSq += x * x;
-                    outSq += y * y;
-                }
+                    for (int k = 0; k < 7; ++k)
+                    {
+                        auto& s1 = gs1[static_cast<size_t>(k)];
+                        auto& s2 = gs2[static_cast<size_t>(k)];
+                        const double s0 = y + gc[static_cast<size_t>(k)] * s1 - s2;
+                        s2 = s1; s1 = s0;
+                    }
             }
-            gRef_[static_cast<size_t>(st - 1)] =
-                (outSq > 0.0 && inSq > 0.0) ? std::sqrt(outSq / inSq) : 1.0;
+            std::array<double, 7> gainDb {};
+            for (int k = 0; k < 7; ++k)
+            {
+                const double c = gc[static_cast<size_t>(k)] * 0.5;
+                const double s1 = gs1[static_cast<size_t>(k)], s2 = gs2[static_cast<size_t>(k)];
+                const double mag = std::sqrt(std::max(s1 * s1 + s2 * s2 - 2.0 * c * s1 * s2, 0.0))
+                                 * 2.0 / meas;
+                gainDb[static_cast<size_t>(k)] =
+                    20.0 * std::log10(std::max(mag / kAmpPerTone, 1e-9));
+            }
+
+            // Flattening EQ from the band means, relative to the overall mean.
+            double mean = 0.0;
+            for (double g : gainDb) mean += g / 7.0;
+            const double lo = 0.5 * (gainDb[0] + gainDb[1]) - mean;
+            const double mid = (gainDb[2] + gainDb[3] + gainDb[4]) / 3.0 - mean;
+            const double hi = 0.5 * (gainDb[5] + gainDb[6]) - mean;
+
+            std::array<BiquadCoeffs<double>, 3> fc = {
+                BiquadCoeffs<double>::makeLowShelf(fs2_, 180.0, -lo),
+                BiquadCoeffs<double>::makePeak(fs2_, 800.0, 0.55, -mid),
+                BiquadCoeffs<double>::makeHighShelf(fs2_, 4500.0, -hi)
+            };
+            for (auto& ch : channels_)
+                ch->setFlattenCoeffs(st, fc);
+
+            // Loudness reference WITH the flattener folded in analytically.
+            double outSq = 0.0;
+            for (int k = 0; k < 7; ++k)
+            {
+                double corr = 1.0;
+                for (const auto& c : fc)
+                    corr *= c.getMagnitude(kRefTones[k], fs2_);
+                const double g = std::pow(10.0, gainDb[static_cast<size_t>(k)] / 20.0) * corr;
+                outSq += g * g;
+            }
+            gRef_[static_cast<size_t>(st - 1)] = std::sqrt(std::max(outSq / 7.0, 1e-18));
         }
     }
 

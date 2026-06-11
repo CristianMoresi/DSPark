@@ -14,7 +14,7 @@
  *
  * Architecture per band:
  * ```
- *   Sidechain → [BP Filter] → RMS/Peak Detect → Gain Computer → Ballistics Smoother → [Peak EQ]
+ *   Sidechain → [Detector: BP / LP / HP per shape] → Peak Detect → Gain Computer → Ballistics → [Bell / Shelf EQ]
  * ```
  *
  * @note Thread-safe parameter updates via `std::atomic` ensuring zero-locking
@@ -54,11 +54,20 @@ public:
      * @brief Full configuration for a single dynamic EQ band.
      * @note Must remain trivially copyable to allow lock-free atomic updates.
      */
+    /** @brief Shape of the dynamic gain filter (and its detector region). */
+    enum class BandShape
+    {
+        Bell,       ///< Parametric bell; detector is a bandpass at freq/Q.
+        LowShelf,   ///< Dynamic low shelf; detector hears below freq.
+        HighShelf   ///< Dynamic high shelf; detector hears above freq.
+    };
+
     struct BandConfig
     {
         T frequency      = T(1000);
         T q              = T(1.0);
         T threshold      = T(-20);
+        BandShape shape  = BandShape::Bell;
         bool enabled     = true;
 
         T aboveRatio     = T(1);
@@ -226,6 +235,8 @@ public:
             w.write(key, static_cast<float>(c.q));
             std::snprintf(key, sizeof(key), "b%d.thresh", i);
             w.write(key, static_cast<float>(c.threshold));
+            std::snprintf(key, sizeof(key), "b%d.shape", i);
+            w.write(key, static_cast<int>(c.shape));
             std::snprintf(key, sizeof(key), "b%d.on", i);
             w.write(key, c.enabled);
             std::snprintf(key, sizeof(key), "b%d.aRatio", i);
@@ -268,6 +279,8 @@ public:
             c.q = static_cast<T>(r.read(key, 1.0f));
             std::snprintf(key, sizeof(key), "b%d.thresh", i);
             c.threshold = static_cast<T>(r.read(key, -20.0f));
+            std::snprintf(key, sizeof(key), "b%d.shape", i);
+            c.shape = static_cast<BandShape>(std::clamp(r.read(key, 0), 0, 2));
             std::snprintf(key, sizeof(key), "b%d.on", i);
             c.enabled = r.read(key, true);
             std::snprintf(key, sizeof(key), "b%d.aRatio", i);
@@ -363,14 +376,32 @@ private:
                 
                 currentGain += coeff * diff;
 
-                // Refresh peak coefficients every 16 samples using the precomputed
-                // freq/Q trig (a single pow() per refresh) instead of a full makePeak
-                // (cos+sin+pow) EVERY sample — the gain envelope is slow enough that
-                // a 16-sample granularity is inaudible. (F-059 performance fix.)
+                // Refresh gain-filter coefficients every 16 samples — the gain
+                // envelope is slow enough that this granularity is inaudible.
+                // Bells use the precomputed freq/Q trig (a single pow() per
+                // refresh, F-059 performance fix); shelves run their full
+                // design, which at 1/16th rate stays negligible.
                 if ((i & 15) == 0)
                 {
                     if (std::abs(currentGain) > T(0.01))
-                        updateDynamicPeakCoeffs(b, currentGain);
+                    {
+                        switch (states_[b].cfg.shape)
+                        {
+                        case BandShape::Bell:
+                            updateDynamicPeakCoeffs(b, currentGain);
+                            break;
+                        case BandShape::LowShelf:
+                            bandFilter_[b].setCoeffs(BiquadCoeffs<T>::makeLowShelf(
+                                currentFs, static_cast<double>(states_[b].cfg.frequency),
+                                static_cast<double>(currentGain)));
+                            break;
+                        case BandShape::HighShelf:
+                            bandFilter_[b].setCoeffs(BiquadCoeffs<T>::makeHighShelf(
+                                currentFs, static_cast<double>(states_[b].cfg.frequency),
+                                static_cast<double>(currentGain)));
+                            break;
+                        }
+                    }
                     else
                         bandFilter_[b].setCoeffs(BiquadCoeffs<T>{}); // Bypass
                 }
@@ -434,7 +465,20 @@ private:
         } while ((s0 & 1u) != 0u || s0 != s1);
         states_[b].cfg = cfg;
 
-        bandDetector_[b].setCoeffs(BiquadCoeffs<T>::makeBandPass(fs, cfg.frequency, cfg.q));
+        // Detector listens where the gain filter acts: bandpass for bells,
+        // the corresponding half of the spectrum for shelves.
+        switch (cfg.shape)
+        {
+        case BandShape::Bell:
+            bandDetector_[b].setCoeffs(BiquadCoeffs<T>::makeBandPass(fs, cfg.frequency, cfg.q));
+            break;
+        case BandShape::LowShelf:
+            bandDetector_[b].setCoeffs(BiquadCoeffs<T>::makeLowPass(fs, cfg.frequency, T(0.707)));
+            break;
+        case BandShape::HighShelf:
+            bandDetector_[b].setCoeffs(BiquadCoeffs<T>::makeHighPass(fs, cfg.frequency, T(0.707)));
+            break;
+        }
 
         // Precompute the freq/Q-dependent peak-EQ terms ONCE per parameter change
         // (cos w0 and alpha), so the per-block dynamic update needs only a pow().

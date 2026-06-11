@@ -26,9 +26,12 @@ function(dspark_add_plugin TARGET)
         set(ARG_FORMATS VST3)
     endif()
 
+    set(want_clap FALSE)
     foreach(fmt IN LISTS ARG_FORMATS)
-        if(NOT fmt STREQUAL "VST3")
-            message(WARNING "dspark_add_plugin: format ${fmt} not available yet (VST3 only)")
+        if(fmt STREQUAL "CLAP")
+            set(want_clap TRUE)
+        elseif(NOT fmt STREQUAL "VST3")
+            message(WARNING "dspark_add_plugin: format ${fmt} not available yet (VST3/CLAP)")
         endif()
     endforeach()
 
@@ -77,5 +80,15 @@ function(dspark_add_plugin TARGET)
             SUFFIX ".so"
             LIBRARY_OUTPUT_DIRECTORY
                 "${CMAKE_BINARY_DIR}/${TARGET}.vst3/Contents/${arch_dir}")
+    endif()
+
+    # The same binary carries both entry points when the source uses both
+    # macros, so the CLAP "build" is a post-build copy with the right name.
+    if(want_clap)
+        add_custom_command(TARGET ${TARGET} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "$<TARGET_FILE:${TARGET}>"
+                "${CMAKE_BINARY_DIR}/${TARGET}.clap"
+            COMMENT "dspark_add_plugin: ${TARGET}.clap")
     endif()
 endfunction()

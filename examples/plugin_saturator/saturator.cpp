@@ -12,6 +12,7 @@
 // bundle folder layout on every platform.
 
 #include "../../plugin/vst3/DSParkVst3.h"
+#include "../../plugin/clap/DSParkClap.h"
 
 #include "../../Effects/Saturation.h"
 #include "../../Effects/Gain.h"
@@ -69,4 +70,6 @@ private:
     dspark::Gain<float>       gain_;
 };
 
+// One binary, two formats: copy/rename the result as .vst3 AND as .clap.
 DSPARK_VST3_PLUGIN(DSParkSaturator)
+DSPARK_CLAP_PLUGIN(DSParkSaturator)

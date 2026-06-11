@@ -1,11 +1,16 @@
-# A complete VST3 plugin with DSPark alone — no JUCE, no SDK download
+# A complete VST3 + CLAP plugin with DSPark alone — no JUCE, no SDK download
 
-`saturator.cpp` is a finished, loadable VST3 effect (drive / algorithm / mix /
+`saturator.cpp` is a finished, loadable effect (drive / algorithm / mix /
 output around `dspark::Saturation`) written against DSPark's native plugin
 layer. Everything it needs ships in this repository: the format-agnostic
 layer (`plugin/DSParkPlugin.h`), the VST3 backend implementing the COM ABI
-directly (`plugin/vst3/DSParkVst3.h`) and Steinberg's official C API header,
-vendored under its permissive 2025 license (`plugin/vst3/vst3_c_api.h`).
+directly (`plugin/vst3/DSParkVst3.h`, with Steinberg's official C API header
+vendored under its permissive 2025 license) and the CLAP backend
+(`plugin/clap/DSParkClap.h`, with the MIT CLAP headers vendored).
+
+The two `DSPARK_*_PLUGIN` macros at the bottom make ONE binary carry both
+entry points: ship the compiled module as `.vst3` and as `.clap`. Presets
+saved in one format load in the other (shared state container).
 
 ## Build
 

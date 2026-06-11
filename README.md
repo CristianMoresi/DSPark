@@ -66,10 +66,13 @@ cl /std:c++20 /O2 /LD /EHsc /I . mysaturator.cpp /Fe:MySaturator.vst3
 ```
 
 Parameter automation, state save/restore, bypass, latency reporting and bus
-negotiation are handled by the layer; `tools/vst3_smoke_host.cpp` drives the
-result through the full VST3 lifecycle like a DAW would (it runs in CI on
-Windows, Linux and macOS). See `examples/plugin_saturator/`. CLAP and AU
-backends over the same plugin class are on the roadmap.
+negotiation are handled by the layer. Add `DSPARK_CLAP_PLUGIN(MySaturator)`
+and the **same binary is also a CLAP plugin** (copy it as `.clap`) — presets
+are byte-portable between both formats by construction. Two miniature hosts
+(`tools/vst3_smoke_host.cpp`, `tools/clap_smoke_host.cpp`) drive the result
+through each full plugin lifecycle like a DAW would; both run in CI on
+Windows, Linux and macOS. See `examples/plugin_saturator/`. An AU backend
+over the same plugin class is on the roadmap.
 
 ---
 

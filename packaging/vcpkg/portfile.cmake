@@ -5,8 +5,8 @@
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO CristianMoresi/DSPark
-    REF v1.2.0
-    SHA512 0   # placeholder: vcpkg prints the real hash on first install attempt
+    REF v1.2.1
+    SHA512 4fe046334bdfd5408d833ac9389b6e8656504d9e92bb14d6a4508c775843798e0448ed1417e8abd0a72fbdb74d28ab50e8ca18c4e9e813cb0628a01975110561
     HEAD_REF main
 )
 

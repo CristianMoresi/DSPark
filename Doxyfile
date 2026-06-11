@@ -2,10 +2,10 @@
 
 PROJECT_NAME           = "DSPark"
 PROJECT_BRIEF          = "Header-only audio DSP framework in pure C++20 — zero dependencies"
-PROJECT_NUMBER         = 1.2
+PROJECT_NUMBER         = 1.2.1
 
-INPUT                  = DSPark.h Core Effects Analysis IO Music docs/cookbook.md
-USE_MDFILE_AS_MAINPAGE =
+INPUT                  = README.md DSPark.h Core Effects Analysis IO Music docs/cookbook.md
+USE_MDFILE_AS_MAINPAGE = README.md
 RECURSIVE              = NO
 FILE_PATTERNS          = *.h *.md
 

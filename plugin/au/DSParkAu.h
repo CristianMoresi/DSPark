@@ -84,6 +84,30 @@ struct Plugin
 
     std::vector<float> pullL, pullR, dryL, dryR;
 
+    // Property listeners (registered/fired on the host's main thread) and
+    // the user-preset name AU hosts expect through kAudioUnitProperty_PresentPreset.
+    struct Listener
+    {
+        AudioUnitPropertyID id;
+        AudioUnitPropertyListenerProc proc;
+        void* user;
+    };
+    std::vector<Listener> listeners;
+    CFStringRef presetName = nullptr;
+
+    ~Plugin() noexcept
+    {
+        if (presetName != nullptr) CFRelease(presetName);
+    }
+
+    void notifyProperty(AudioUnitPropertyID id, AudioUnitScope scope,
+                        AudioUnitElement element) noexcept
+    {
+        for (const auto& l : listeners)
+            if (l.id == id && l.proc != nullptr)
+                l.proc(l.user, instance, id, scope, element);
+    }
+
     Plugin() noexcept
     {
         for (size_t i = 0; i < kNumParams; ++i)
@@ -211,6 +235,9 @@ struct Plugin
             size = sizeof(AudioUnitConnection); writable = true; break;
         case kAudioUnitProperty_InPlaceProcessing:
             size = sizeof(UInt32); break;
+        case kAudioUnitProperty_PresentPreset:
+        case kAudioUnitProperty_CurrentPreset:
+            size = sizeof(AUPreset); writable = true; break;
         default:
             (void) element;
             return kAudioUnitErr_InvalidProperty;
@@ -347,6 +374,19 @@ struct Plugin
             *static_cast<UInt32*>(outData) = 1;
             *ioSize = sizeof(UInt32);
             return noErr;
+        case kAudioUnitProperty_PresentPreset:
+        case kAudioUnitProperty_CurrentPreset:
+        {
+            if (*ioSize < sizeof(AUPreset)) return kAudioUnitErr_InvalidPropertyValue;
+            auto* preset = static_cast<AUPreset*>(outData);
+            preset->presetNumber = -1;   // user preset
+            preset->presetName = presetName != nullptr
+                ? static_cast<CFStringRef>(CFRetain(presetName))
+                : CFStringCreateWithCString(nullptr, "Untitled",
+                                            kCFStringEncodingUTF8);
+            *ioSize = sizeof(AUPreset);
+            return noErr;
+        }
         case kAudioUnitProperty_ClassInfo:
         {
             if (*ioSize < sizeof(CFPropertyListRef))
@@ -415,7 +455,23 @@ struct Plugin
             if (inData == nullptr || inSize < sizeof(UInt32))
                 return kAudioUnitErr_InvalidPropertyValue;
             maxFrames = *static_cast<const UInt32*>(inData);
+            notifyProperty(id, scope, element);
             return noErr;
+        case kAudioUnitProperty_PresentPreset:
+        case kAudioUnitProperty_CurrentPreset:
+        {
+            if (inData == nullptr || inSize < sizeof(AUPreset))
+                return kAudioUnitErr_InvalidPropertyValue;
+            const auto* preset = static_cast<const AUPreset*>(inData);
+            if (preset->presetNumber >= 0)
+                return kAudioUnitErr_InvalidPropertyValue;   // no factory presets
+            if (presetName != nullptr) CFRelease(presetName);
+            presetName = preset->presetName != nullptr
+                ? static_cast<CFStringRef>(CFRetain(preset->presetName))
+                : nullptr;
+            notifyProperty(id, scope, element);
+            return noErr;
+        }
         case kAudioUnitProperty_BypassEffect:
             if (inData == nullptr || inSize < sizeof(UInt32))
                 return kAudioUnitErr_InvalidPropertyValue;
@@ -671,18 +727,35 @@ struct Component
                             UInt32 frames, AudioBufferList* ioData) noexcept
     { return fromSelf(self)->state->render(ioFlags, timeStamp, busNumber, frames, ioData); }
 
-    static OSStatus sAddPropertyListener(void*, AudioUnitPropertyID,
-                                         AudioUnitPropertyListenerProc, void*) noexcept
-    { return noErr; }
+    static OSStatus sAddPropertyListener(void* self, AudioUnitPropertyID id,
+                                         AudioUnitPropertyListenerProc proc,
+                                         void* user) noexcept
+    {
+        auto* state = fromSelf(self)->state;
+        state->listeners.push_back({ id, proc, user });
+        return noErr;
+    }
 
-    static OSStatus sRemovePropertyListener(void*, AudioUnitPropertyID,
-                                            AudioUnitPropertyListenerProc) noexcept
-    { return noErr; }
+    static OSStatus sRemovePropertyListener(void* self, AudioUnitPropertyID id,
+                                            AudioUnitPropertyListenerProc proc) noexcept
+    {
+        auto& ls = fromSelf(self)->state->listeners;
+        for (size_t i = ls.size(); i > 0; --i)
+            if (ls[i - 1].id == id && ls[i - 1].proc == proc)
+                ls.erase(ls.begin() + static_cast<ptrdiff_t>(i - 1));
+        return noErr;
+    }
 
-    static OSStatus sRemovePropertyListenerWithUserData(void*, AudioUnitPropertyID,
-                                                        AudioUnitPropertyListenerProc,
-                                                        void*) noexcept
-    { return noErr; }
+    static OSStatus sRemovePropertyListenerWithUserData(void* self, AudioUnitPropertyID id,
+                                                        AudioUnitPropertyListenerProc proc,
+                                                        void* user) noexcept
+    {
+        auto& ls = fromSelf(self)->state->listeners;
+        for (size_t i = ls.size(); i > 0; --i)
+            if (ls[i - 1].id == id && ls[i - 1].proc == proc && ls[i - 1].user == user)
+                ls.erase(ls.begin() + static_cast<ptrdiff_t>(i - 1));
+        return noErr;
+    }
 
     static OSStatus sAddRenderNotify(void*, AURenderCallback, void*) noexcept
     { return noErr; }

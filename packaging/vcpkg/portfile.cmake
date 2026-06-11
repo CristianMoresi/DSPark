@@ -1,12 +1,12 @@
 # DSPark vcpkg port — submit to microsoft/vcpkg once a release tag exists.
-# Update REF and SHA512 for the published release archive
+# Update REF and SHA512 bdc1da86e4c564444682c76ba8b7e160e3053c7bf96aea5395cd54ad11617acee797a42c0a87a3de26c7afdde159d88c4aec2e7bb2eb483bbf21338cbbdbc6dcor the published release archive
 # (vcpkg hashes the GitHub source tarball of the tag).
 
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO CristianMoresi/DSPark
-    REF v1.2.1
-    SHA512 4fe046334bdfd5408d833ac9389b6e8656504d9e92bb14d6a4508c775843798e0448ed1417e8abd0a72fbdb74d28ab50e8ca18c4e9e813cb0628a01975110561
+    REF v1.2.2
+    SHA512 bdc1da86e4c564444682c76ba8b7e160e3053c7bf96aea5395cd54ad11617acee797a42c0a87a3de26c7afdde159d88c4aec2e7bb2eb483bbf21338cbbdbc6dc
     HEAD_REF main
 )
 

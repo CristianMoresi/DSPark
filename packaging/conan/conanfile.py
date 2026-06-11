@@ -7,7 +7,7 @@ import os
 
 class DSParkConan(ConanFile):
     name = "dspark"
-    version = "1.2.1"
+    version = "1.2.2"
     description = ("Header-only audio DSP framework in pure C++20 with zero "
                    "external dependencies: filters, dynamics, reverbs, physical "
                    "analog models, pitch tools, EBU R128 metering and more.")

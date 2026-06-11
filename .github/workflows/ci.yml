@@ -66,7 +66,13 @@ jobs:
         if: matrix.compiler != 'msvc'
         shell: bash
         run: |
-          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_saturator/saturator.cpp -o DSParkSaturator.vst3
+          EXTRA=""
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            # The AU macro in the shared translation unit references
+            # AudioToolbox symbols on Apple platforms.
+            EXTRA="-framework AudioToolbox -framework CoreFoundation"
+          fi
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_saturator/saturator.cpp -o DSParkSaturator.vst3 $EXTRA
           ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -I . tools/vst3_smoke_host.cpp -o vst3_smoke_host -ldl
           ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -I . tools/clap_smoke_host.cpp -o clap_smoke_host -ldl
           ./vst3_smoke_host ./DSParkSaturator.vst3

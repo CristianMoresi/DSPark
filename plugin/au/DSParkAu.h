@@ -152,8 +152,8 @@ struct Plugin
         std::memset(&f, 0, sizeof(f));
         f.mSampleRate = sampleRate;
         f.mFormatID = kAudioFormatLinearPCM;
-        f.mFormatFlags = kAudioFormatFlagsNativeFloatPacked
-                       | kAudioFormatFlagIsNonInterleaved;
+        f.mFormatFlags = static_cast<AudioFormatFlags>(kAudioFormatFlagsNativeFloatPacked)
+                       | static_cast<AudioFormatFlags>(kAudioFormatFlagIsNonInterleaved);
         f.mBytesPerPacket = sizeof(float);
         f.mFramesPerPacket = 1;
         f.mBytesPerFrame = sizeof(float);

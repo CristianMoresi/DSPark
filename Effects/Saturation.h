@@ -225,21 +225,34 @@ public:
     void reset() noexcept override
     {
         lastX_.fill(T(0));
-        lastF_.fill(T(-1)); 
+        lastF_.fill(T(-1));
     }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Wavefolder; }
 
+    /**
+     * Folder curve sin(in*drive + bias) - sin(bias): unit small-signal gain
+     * over in*drive and a +-1 ceiling like every other algorithm in the
+     * pool. At neutral drive the curve never reaches the first peak
+     * (|x| <= 1 < pi/2), i.e. gentle tanh-like rounding; folds appear once
+     * in*drive crosses pi/2 and multiply with drive. The previous scaling,
+     * sin(in*drive*2pi), had a 2pi (+16 dB) hidden gain — +56 dB onto small
+     * signals at full drive — and folded fully at -6 dBFS even at neutral
+     * drive. character biases the fold point (asymmetry / even harmonics);
+     * subtracting sin(bias) keeps the resting output DC-free.
+     */
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
-        T x   = sample * drive * twoPi<T> + character * pi<T>;
+        const T bias = character * (pi<T> / T(4));
+        const T x    = sample * drive + bias;
+        const T sb   = std::sin(bias);
         T F_x = -std::cos(x);
         T diff = x - lastX_[ch];
 
         T result;
         if (std::abs(diff) > T(1e-5))
-            result = (F_x - lastF_[ch]) / diff;
+            result = (F_x - lastF_[ch]) / diff - sb;   // exact: mean of sin minus the constant
         else
-            result = std::sin(x);
+            result = std::sin(x) - sb;
 
         lastX_[ch] = x;
         lastF_[ch] = F_x;
@@ -880,6 +893,7 @@ public:
      * - Tube: Controls waveform asymmetry.
      * - Tape: Controls the magnetic coupling (knee hardness and mid-level bloom).
      * - Transformer: Adjusts bias voltage.
+     * - Wavefolder: Biases the fold point (asymmetry, even harmonics).
      * 
      * @note Thread-Safe. Smoothed internally over 20ms.
      * @param c Character amount. Range: [-1.0, 1.0]. 0.0 represents the neutral state.

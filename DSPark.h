@@ -385,7 +385,8 @@
  * | `LadderFilter<T>`        | Core/LadderFilter.h   | Moog-style 4-pole resonant filter (TPT, 6 modes, drive)            |
  * | `StateVariableFilter<T>` | Core/StateVariableFilter.h | TPT SVF: LP/HP/BP/Notch/AP/Bell/Shelf, multi-output, mod-friendly |
  * | `Oversampling<T>`        | Core/Oversampling.h   | 2x-16x oversampling with FIR half-band Kaiser filters (-80 dB+)   |
- * | `Oscillator<T>`          | Core/Oscillator.h     | PolyBLEP oscillator (sine, saw, square, triangle)                   |
+ * | `Oscillator<T>`          | Core/Oscillator.h     | PolyBLEP oscillator (sine, saw, square, triangle; minBLEP hard sync)|
+ * | `MinBlepTable<T>`        | Core/MinBlepTable.h   | Minimum-phase band-limited step residual (cepstral, FFT-built)      |
  * | `WavetableOscillator<T>` | Core/WavetableOscillator.h | Mipmapped wavetable oscillator (bandlimited)                   |
  * | `DryWetMixer<T>`         | Core/DryWetMixer.h    | Dry/wet parallel mix for effects                                    |
  *
@@ -642,6 +643,7 @@
 #include "Core/Oversampling.h"
 #include "Core/FFT.h"
 #include "Core/WindowFunctions.h"
+#include "Core/MinBlepTable.h"
 #include "Core/FIRFilter.h"
 #include "Core/Convolver.h"
 #include "Core/ZeroLatencyConvolver.h"

@@ -6,9 +6,11 @@
 #include "DspMath.h"
 #include "AudioSpec.h"
 #include "AudioBuffer.h"
+#include "MinBlepTable.h"
 
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstddef>
 
@@ -18,11 +20,14 @@ namespace dspark {
  * @class Oscillator
  * @brief Band-limited oscillator featuring PolyBLEP anti-aliasing and analog-modeled integration.
  *
- * This oscillator provides high-quality waveform generation suitable for both 
+ * This oscillator provides high-quality waveform generation suitable for both
  * audio-rate synthesis and low-frequency modulation (LFO). It utilizes PolyBLEP
- * (Polynomial Band-Limited Step) to drastically reduce aliasing artifacts in 
- * discontinuous waveforms (Saw, Square). The Triangle wave is generated via a 
+ * (Polynomial Band-Limited Step) to drastically reduce aliasing artifacts in
+ * discontinuous waveforms (Saw, Square). The Triangle wave is generated via a
  * leaky integrator driven by a PolyBLEP square, providing an analog-style curve.
+ * Under hard sync (setSyncRatio) every discontinuity is instead corrected with
+ * a table minBLEP (MinBlepTable) — a causal minimum-phase kernel whose alias
+ * rejection (~-80 dB) survives the arbitrary jump amplitudes sync creates.
  *
  * @note To guarantee thread-safety in real-time contexts, parameter changes 
  * (e.g., setFrequency) should be applied before calling processBlock() or 
@@ -46,6 +51,9 @@ public:
     {
         assert(sampleRate > 0.0);
         sampleRate_ = sampleRate;
+        // Touch the shared minBLEP table here so its one-time FFT build runs
+        // on the control thread, never inside the audio callback.
+        (void) MinBlepTable<T>::instance();
         updatePhaseInc();
     }
 
@@ -81,10 +89,12 @@ public:
      *
      * The oscillator's frequency becomes the sync MASTER; an internal slave
      * runs at `ratio` times that frequency and is phase-reset every master
-     * cycle — the classic ripping sync timbre. The reset discontinuity is
-     * corrected with a PolyBLEP scaled to the actual jump amplitude, using
-     * the master phase as the band-limiting clock, so the result stays as
-     * clean as the free-running waveforms.
+     * cycle — the classic ripping sync timbre. Every discontinuity (the
+     * slave's own edges and the reset jump, scaled to its actual amplitude)
+     * is corrected with a table minBLEP (see MinBlepTable): a minimum-phase
+     * band-limited step whose correction is fully causal, pushing aliasing
+     * to the windowed-sinc stopband (~-80 dB) instead of the ~-40 dB
+     * envelope of a 2-point polynomial kernel.
      *
      * @param ratio Slave/master frequency ratio. Values <= 1 disable sync.
      */
@@ -117,9 +127,8 @@ public:
         phase_ = T(0);
         triState_ = -triExpectedPeak_;
         slavePhase_ = T(0);
-        pendingSyncJump_ = T(0);
-        pendAmp0_ = pendAmp1_ = T(0);
-        justSynced_ = false;
+        corr_.fill(T(0));
+        corrHead_ = 0;
     }
 
     /**
@@ -233,127 +242,100 @@ private:
         return T(0);
     }
 
-    /** @brief Rising/after half of the 2-point BLEP kernel, t in [0, 1). */
-    static inline T blepAfter(T t) noexcept { return t + t - t * t - T(1); }
-
     /**
-     * @brief One sample of the hard-synced slave with full BLEP correction.
+     * @brief One sample of the hard-synced slave with table-minBLEP correction.
      *
-     * Event bookkeeping: a sync reset both creates a jump of its own and can
-     * abort an upcoming natural slave edge — while a natural edge that lands
-     * just BEFORE the reset still needs its trailing kernel half on the next
-     * sample, where the slave phase (re-seeded by the reset) no longer
-     * encodes it. Those trailing halves are queued explicitly.
+     * The minBLEP kernel is causal (minimum phase): every correction lands at
+     * or after its discontinuity, queued into a small ring buffer. That makes
+     * event handling purely chronological — within one sample interval, a
+     * natural slave edge happens only if it precedes the master reset, and the
+     * reset jump is measured from the slave value at the exact reset instant
+     * (which already includes any earlier edge). Nothing has to be predicted
+     * before an event or un-queued after one, the failure modes that made the
+     * 2-point kernel's bookkeeping delicate.
      */
     [[nodiscard]] T nextSyncSample() noexcept
     {
-        const bool masterBefore = phase_ > T(1) - phaseInc_;
-        const T uSync = masterBefore ? (T(1) - phase_) / phaseInc_ : T(2);
         const bool squareLike =
             waveform_ == Waveform::Square || waveform_ == Waveform::Triangle;
 
-        // --- slave's own edges, gated against the reset --------------------
-        T ownBlep = polyBlep(slavePhase_, slaveInc_);
-        if (ownBlep != T(0))
-        {
-            const bool afterBranch = slavePhase_ < slaveInc_;
-            if (afterBranch)
-            {
-                if (justSynced_) ownBlep = T(0);          // reset artifact
-            }
-            else if ((T(1) - slavePhase_) / slaveInc_ > uSync)
-            {
-                ownBlep = T(0);                            // aborted by reset
-            }
-        }
-
-        T halfBlep = T(0);
-        T half = slavePhase_ + T(0.5);
-        if (half >= T(1)) half -= T(1);
-        if (squareLike)
-        {
-            halfBlep = polyBlep(half, slaveInc_);
-            if (halfBlep != T(0))
-            {
-                const bool afterBranch = half < slaveInc_;
-                if (afterBranch)
-                {
-                    if (justSynced_) halfBlep = T(0);
-                }
-                else if ((T(1) - half) / slaveInc_ > uSync)
-                {
-                    halfBlep = T(0);
-                }
-            }
-        }
-
-        T raw = rawSlaveValue(slavePhase_);
-        if (waveform_ == Waveform::Saw)
-            raw -= ownBlep;
-        else if (squareLike)
-            raw += ownBlep - halfBlep;
-
-        // Queued trailing halves of natural edges that preceded a reset.
-        raw += pendAmp0_ * blepAfter(pendT0_);
-        raw += pendAmp1_ * blepAfter(pendT1_);
-        pendAmp0_ = pendAmp1_ = T(0);
-
-        // --- the reset jump itself, clocked by the master phase -------------
-        const T blep = polyBlep(phase_, phaseInc_);
-        if (blep != T(0))
-        {
-            if (phase_ > T(0.5))   // before the wrap: predict the jump
-            {
-                T atJump = slavePhase_ + uSync * slaveInc_;
-                atJump -= std::floor(atJump);
-                pendingSyncJump_ = rawSlaveValue(atJump) - rawSlaveValue(T(0));
-            }
-            raw -= pendingSyncJump_ * T(0.5) * blep;
-        }
+        // --- emit: raw value plus the pending band-limiting correction ------
+        T raw = rawSlaveValue(slavePhase_) + corr_[static_cast<size_t>(corrHead_)];
+        corr_[static_cast<size_t>(corrHead_)] = T(0);
+        corrHead_ = (corrHead_ + 1) & kCorrMask;   // now the NEXT sample's slot
 
         T out = raw;
         if (waveform_ == Waveform::Triangle)
         {
-            triState_ = slaveInc_ * raw + (T(1) - slaveInc_) * triState_;
+            // Feed the integrator with the duty-compensated square: the synced
+            // square has inherent DC (see updatePhaseInc) and the integrator's
+            // unity DC gain times triNorm_ would turn it into a large offset
+            // (+0.45 measured at ratio 2.7 without compensation).
+            triState_ = slaveInc_ * (raw - syncSquareDc_)
+                      + (T(1) - slaveInc_) * triState_;
             out = triState_ * triNorm_;
         }
 
-        // --- advance; a master wrap re-seeds the slave ----------------------
-        justSynced_ = false;
-        const T slaveOld = slavePhase_;
-        phase_ += phaseInc_;
+        // --- advance both phases; schedule corrections in time order --------
+        const T masterOld = phase_;
+        const T slaveOld  = slavePhase_;
+        phase_      += phaseInc_;
         slavePhase_ += slaveInc_;
-        if (slavePhase_ >= T(1)) slavePhase_ -= T(1);
-        if (phase_ >= T(1))
+
+        const bool masterWrap = phase_ >= T(1);
+        const T alphaSync = masterWrap ? (T(1) - masterOld) / phaseInc_ : T(2);
+
+        // Natural slave edge inside this interval (at most one: slaveInc_ is
+        // clamped to 0.5). It only happens if the reset does not pre-empt it;
+        // on an exact tie the edge wins and the reset jump measures zero.
+        if (waveform_ != Waveform::Sine)
         {
-            // Natural edges that genuinely happened before the reset lose
-            // their trailing kernel half (the re-seeded phase forgets them):
-            // queue it for the next sample.
-            const T alphaSync = uSync;
-            const T alphaWrap = (T(1) - slaveOld) / slaveInc_;
-            if (alphaWrap <= alphaSync && alphaWrap <= T(1))
+            T alphaEdge = T(2), edgeJump = T(0);
+            if (slavePhase_ >= T(1))
             {
-                pendAmp0_ = (waveform_ == Waveform::Saw) ? T(-1) : (squareLike ? T(1) : T(0));
-                pendT0_ = T(1) - alphaWrap;
+                alphaEdge = (T(1) - slaveOld) / slaveInc_;
+                edgeJump  = (waveform_ == Waveform::Saw) ? T(-2) : T(2);
             }
-            if (squareLike)
+            else if (squareLike && slaveOld < T(0.5) && slavePhase_ >= T(0.5))
             {
-                const T halfOld = (slaveOld < T(0.5)) ? (T(0.5) - slaveOld)
-                                                      : (T(1.5) - slaveOld);
-                const T alphaHalf = halfOld / slaveInc_;
-                if (alphaHalf <= alphaSync && alphaHalf <= T(1))
-                {
-                    pendAmp1_ = T(-1);
-                    pendT1_ = T(1) - alphaHalf;
-                }
+                alphaEdge = (T(0.5) - slaveOld) / slaveInc_;
+                edgeJump  = T(-2);
             }
+            if (alphaEdge <= alphaSync && alphaEdge <= T(1))
+                scheduleMinBlep(edgeJump, T(1) - alphaEdge);
+        }
+        if (slavePhase_ >= T(1)) slavePhase_ -= T(1);
+
+        if (masterWrap)
+        {
+            // Slave value the instant before the reset (wrap folded in); the
+            // jump lands on the freshly seeded phase-0 value.
+            T atJump = slaveOld + alphaSync * slaveInc_;
+            atJump -= std::floor(atJump);
+            const T jump = rawSlaveValue(T(0)) - rawSlaveValue(atJump);
+            if (jump != T(0))
+                scheduleMinBlep(jump, T(1) - alphaSync);
 
             phase_ -= T(1);
             slavePhase_ = (phase_ / std::max(phaseInc_, T(1e-12))) * slaveInc_;
             slavePhase_ -= std::floor(slavePhase_);
-            justSynced_ = true;
         }
         return out;
+    }
+
+    /**
+     * @brief Queues the minBLEP residual of one discontinuity into the ring.
+     * @param jump Signed discontinuity amplitude (new value minus old value).
+     * @param frac Sub-sample position of the event before the next output
+     *             sample, in [0, 1): `1 - alpha` of the event inside the
+     *             just-finished interval.
+     */
+    void scheduleMinBlep(T jump, T frac) noexcept
+    {
+        const auto& table = MinBlepTable<T>::instance();
+        for (int j = 0; j < kCorrLen; ++j)
+            corr_[static_cast<size_t>((corrHead_ + j) & kCorrMask)] +=
+                jump * table.residual(static_cast<T>(j) + frac);
     }
 
     /**
@@ -386,6 +368,19 @@ private:
         syncOn_ = syncRatio_ > T(1.001) && phaseInc_ > T(0);
         // Clamp the slave below Nyquist like any oscillator frequency.
         slaveInc_ = std::min(phaseInc_ * syncRatio_, T(0.5));
+
+        // DC of the hard-synced square (feeds the triangle integrator). The
+        // slave always restarts in its +1 half, so its duty cycle is
+        // asymmetric by construction: for an effective ratio r with
+        // fractional part f, the +1 time per master cycle exceeds the -1
+        // time by min(f, 0.5) - max(f - 0.5, 0) slave cycles.
+        syncSquareDc_ = T(0);
+        if (syncOn_ && phaseInc_ > T(0))
+        {
+            const T r = slaveInc_ / phaseInc_;   // effective (clamped) ratio
+            const T f = r - std::floor(r);
+            syncSquareDc_ = (std::min(f, T(0.5)) - std::max(f - T(0.5), T(0))) / r;
+        }
         updateTriNorm();
     }
 
@@ -426,14 +421,17 @@ private:
     Waveform waveform_   = Waveform::Sine;
 
     // Hard sync (slave) state.
+    static constexpr int kCorrLen  = MinBlepTable<T>::kTaps;
+    static constexpr int kCorrMask = kCorrLen - 1;
+    static_assert((kCorrLen & kCorrMask) == 0, "minBLEP ring needs a power-of-two span");
+
     bool     syncOn_     = false;
-    bool     justSynced_ = false;
     T        syncRatio_  = T(0);
     T        slavePhase_ = T(0);
     T        slaveInc_   = T(0);
-    T        pendingSyncJump_ = T(0);
-    T        pendAmp0_ = T(0), pendT0_ = T(0);   ///< Queued trailing edge halves.
-    T        pendAmp1_ = T(0), pendT1_ = T(0);
+    T        syncSquareDc_ = T(0);     ///< Analytic duty-cycle DC of the synced square.
+    std::array<T, kCorrLen> corr_{};   ///< Pending causal minBLEP corrections.
+    int      corrHead_   = 0;          ///< Ring slot of the next output sample.
 };
 
 } // namespace dspark

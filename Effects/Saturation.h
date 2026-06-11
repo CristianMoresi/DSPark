@@ -455,13 +455,25 @@ public:
             lpFilters_[ch].setCoeffs(c);
     }
 
+    /**
+     * Band-dependent saturation THRESHOLDS at unity small-signal gain: core
+     * flux scales like V/f, so lows reach saturation first (harder knee,
+     * tanh(1.4x)/1.4, ceiling 0.71) while highs barely do (tanh(0.85x)/0.85,
+     * ceiling 1.18). A real transformer's linear response is flat — the
+     * previous form left the band factors unnormalised, which was a fixed
+     * +2.3/-3.1 dB shelf tilt at 250 Hz that buried mids and highs (worst in
+     * the MultiStage cascade), and its resting-bias subtraction ignored the
+     * drive scaling, leaking drive-dependent DC.
+     */
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
-        T low  = lpFilters_[ch].processSample(sample, 0);
-        T high = sample - low;
-        T bias = character * T(0.2);
-        T satLow  = fastTanh((low  + bias) * drive * T(1.3)) - fastTanh(bias);
-        T satHigh = fastTanh((high + bias) * drive * T(0.7)) - fastTanh(bias);
+        const T low  = lpFilters_[ch].processSample(sample, 0);
+        const T high = sample - low;
+        const T bias = character * T(0.2);
+        const T kLo  = drive * T(1.4);
+        const T kHi  = drive * T(0.85);
+        const T satLow  = (fastTanh((low  + bias) * kLo) - fastTanh(bias * kLo)) / T(1.4);
+        const T satHigh = (fastTanh((high + bias) * kHi) - fastTanh(bias * kHi)) / T(0.85);
         return satLow + satHigh;
     }
 };
@@ -540,9 +552,9 @@ public:
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
         // Inter-stage makeup undoes each stage's fixed small-signal factor
-        // (1/0.5, 1/0.6) so the cascade is gain-staged: at neutral drive the
-        // chain sits at the Transformer's own response instead of a flat
-        // -15 dB drop, and every stage keeps receiving a healthy level.
+        // (1/0.5, 1/0.6) so the cascade is gain-staged: roughly transparent
+        // at neutral drive instead of a flat -15 dB drop, and every stage
+        // keeps receiving a healthy level.
         T tubeOut  = tube_.processSample(sample,  drive * T(0.5), character, ch) * T(2);
         T tapeOut  = tape_.processSample(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
         return       xfmr_.processSample(tapeOut, drive * T(0.8), character, ch);

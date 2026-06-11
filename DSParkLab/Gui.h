@@ -121,6 +121,8 @@ private:
     void* dragOwner_ = nullptr; // which EffectSlot owns the active drag
     float seekValue_ = 0.0f;    // seek-bar value while the user is dragging it
     bool  seekActive_ = false;  // true while the seek bar is grabbed (defer the seek)
+    float thdTimer_ = 0.0f;     // live THD reading refresh accumulator
+    AudioEngine::ThdReading thdLast_ {};
 
     // --- Frequency / dB mapping helpers ---------------------------------------
 
@@ -646,6 +648,56 @@ private:
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, colR);
         ImGui::ProgressBar(normR, ImVec2(-1, 16), lblR);
         ImGui::PopStyleColor();
+
+        drawThdPanel(engine);
+    }
+
+    // --- Test tone + live THD metering panel ------------------------------------
+
+    void drawThdPanel(AudioEngine& engine)
+    {
+        ImGui::Separator();
+        bool tone = engine.getTestTone();
+        if (ImGui::Checkbox("Test Tone", &tone))
+            engine.setTestTone(tone);
+        if (!engine.isDeviceReady())
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(load a file once to initialise audio)");
+            return;
+        }
+
+        if (tone)
+        {
+            float freq = engine.getTestToneFreq();
+            float db   = engine.getTestToneDb();
+            ImGui::SetNextItemWidth(140);
+            if (ImGui::SliderFloat("Freq", &freq, 20.0f, 20000.0f, "%.0f Hz",
+                                   ImGuiSliderFlags_Logarithmic))
+                engine.setTestToneFreq(freq);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(110);
+            if (ImGui::SliderFloat("Level", &db, -60.0f, 0.0f, "%.1f dB"))
+                engine.setTestToneDb(db);
+
+            // Refresh the reading a few times per second: enough for a live
+            // meter, cheap enough to never matter on the GUI thread.
+            thdTimer_ += ImGui::GetIO().DeltaTime;
+            if (thdTimer_ > 0.25f)
+            {
+                thdTimer_ = 0.0f;
+                thdLast_ = engine.computeThd();
+            }
+            if (thdLast_.valid)
+            {
+                ImGui::Text("THD+N: %s   Fund: %.1f dBFS   RMS: %.1f dBFS",
+                            thdLast_.thdnPercent < 0.001f ? "<0.001 %"
+                                : formatStr(thdLast_.thdnPercent, "%"),
+                            thdLast_.fundDb, thdLast_.rmsDb);
+            }
+            else
+                ImGui::TextDisabled("THD+N: settling...");
+        }
     }
 
     // --- Helpers ---------------------------------------------------------------

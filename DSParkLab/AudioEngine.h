@@ -147,6 +147,87 @@ public:
     void setBypass(bool v) { bypass_.store(v); }
     [[nodiscard]] bool isBypassed() const { return bypass_.load(); }
 
+    // --- Test tone + live THD metering ---------------------------------------
+    //
+    // The tone replaces the file as the source while enabled (the audio
+    // device must already be initialised, i.e. a file was loaded once). The
+    // post-FX output of channel 0 is captured into a ring; computeThd()
+    // estimates THD+N coherently against the generated frequency on the GUI
+    // thread (Hann window + Goertzel at the exact tone frequency).
+
+    void setTestTone(bool on)
+    {
+        if (on && !toneOn_.load()) thdFill_.store(0);
+        toneOn_.store(on);
+    }
+    [[nodiscard]] bool getTestTone() const { return toneOn_.load(); }
+    void setTestToneFreq(float hz) { toneFreq_.store(std::clamp(hz, 20.0f, 20000.0f)); thdFill_.store(0); }
+    [[nodiscard]] float getTestToneFreq() const { return toneFreq_.load(); }
+    void setTestToneDb(float db) { toneDb_.store(std::clamp(db, -60.0f, 0.0f)); thdFill_.store(0); }
+    [[nodiscard]] float getTestToneDb() const { return toneDb_.load(); }
+    [[nodiscard]] bool isDeviceReady() const { return deviceInit_; }
+
+    struct ThdReading
+    {
+        float thdnPercent = 0.0f;
+        float fundDb = -120.0f;   ///< Fundamental level (dBFS amplitude).
+        float rmsDb  = -120.0f;   ///< Total output RMS (dBFS).
+        bool  valid  = false;
+    };
+
+    /// THD+N of the captured post-FX output. GUI thread; allocation-free
+    /// apart from a fixed-size stack copy is avoided by a static buffer.
+    [[nodiscard]] ThdReading computeThd() const
+    {
+        ThdReading r;
+        if (!toneOn_.load() || thdFill_.load() < kThdCap)
+            return r;
+
+        // Snapshot the ring (torn samples at the head are acceptable: the
+        // window spans ~0.7 s, one block of tearing is negligible).
+        static thread_local std::vector<float> snap(kThdCap);
+        const int head = thdHead_.load();
+        for (int i = 0; i < kThdCap; ++i)
+            snap[static_cast<size_t>(i)] = thdRing_[static_cast<size_t>((head + i) % kThdCap)];
+
+        const double fs = (fileSampleRate_ > 0) ? fileSampleRate_ : 48000.0;
+        const double f0 = static_cast<double>(toneFreq_.load());
+        const double w  = 2.0 * 3.14159265358979323846 * f0 / fs;
+        const double cw = 2.0 * std::cos(w);
+
+        double s1 = 0, s2 = 0, winSum = 0, totSq = 0;
+        for (int i = 0; i < kThdCap; ++i)
+        {
+            const double win = 0.5 - 0.5 * std::cos(2.0 * 3.14159265358979323846
+                                                    * i / (kThdCap - 1));
+            const double x = win * static_cast<double>(snap[static_cast<size_t>(i)]);
+            const double s0 = x + cw * s1 - s2;
+            s2 = s1; s1 = s0;
+            winSum += win;
+            totSq  += x * x;
+        }
+        const double re = s1 - s2 * std::cos(w);
+        const double im = s2 * std::sin(w);
+        const double amp = 2.0 * std::sqrt(re * re + im * im) / std::max(winSum, 1.0);
+        const double fundSq = 0.5 * amp * amp;   // coherent tone power
+        // Windowed total power normalised to the same (coherent) scale.
+        double winSqSum = 0;
+        for (int i = 0; i < kThdCap; ++i)
+        {
+            const double win = 0.5 - 0.5 * std::cos(2.0 * 3.14159265358979323846
+                                                    * i / (kThdCap - 1));
+            winSqSum += win * win;
+        }
+        const double totPow = totSq / std::max(winSqSum, 1.0);
+
+        r.fundDb = static_cast<float>(20.0 * std::log10(std::max(amp, 1e-9)));
+        r.rmsDb  = static_cast<float>(10.0 * std::log10(std::max(totPow, 1e-18)));
+        r.thdnPercent = static_cast<float>(
+            100.0 * std::sqrt(std::max(totPow - fundSq, 0.0) / std::max(fundSq, 1e-18)));
+        r.valid = true;
+        return r;
+    }
+
     // --- Visualization data (read from GUI thread) --------------------------
 
     [[nodiscard]] float getPeakL() const { return peakL_.load(); }
@@ -273,6 +354,13 @@ private:
         const int frames = static_cast<int>(frameCount);
         const int outCh  = static_cast<int>(device->playback.channels);
 
+        // Test tone replaces the file source while enabled (transport-agnostic).
+        if (self->toneOn_.load())
+        {
+            self->renderToneBlock(out, frames, outCh);
+            return;
+        }
+
         if (!self->playing_.load() || self->fileSamples_ <= 0)
         {
             std::memset(out, 0, sizeof(float) * frames * outCh);
@@ -363,6 +451,73 @@ private:
             self->peakR_.store(self->peakL_.load());
     }
 
+    /// Generates the test tone, runs it through the effect chain, feeds the
+    /// analysis taps and the THD capture ring, and interleaves to the output.
+    void renderToneBlock(float* out, int frames, int outCh) noexcept
+    {
+        const double fs = (fileSampleRate_ > 0) ? fileSampleRate_ : 48000.0;
+        const double inc = 2.0 * 3.14159265358979323846
+                         * static_cast<double>(toneFreq_.load()) / fs;
+        const float amp = std::pow(10.0f, toneDb_.load() / 20.0f);
+        const int nCh = std::max(1, std::min(fileChannels_, 2));
+
+        int written = 0;
+        while (written < frames)
+        {
+            const int chunk = std::min(frames - written, kBlockSize);
+
+            for (int i = 0; i < chunk; ++i)
+            {
+                const float s = amp * static_cast<float>(std::sin(tonePhase_));
+                tonePhase_ += inc;
+                if (tonePhase_ > 6.28318530717958647692)
+                    tonePhase_ -= 6.28318530717958647692;
+                for (int ch = 0; ch < nCh; ++ch)
+                    workBuffer_.getChannel(ch)[i] = s;
+            }
+
+            if (!bypass_.load() && effects_)
+            {
+                auto view = workBuffer_.toView().getSubView(0, chunk);
+                for (auto& e : *effects_)
+                    e.process(view);
+            }
+
+            spectrum_.pushSamples(workBuffer_.getChannel(0), chunk);
+            auto meterView = workBuffer_.toView().getSubView(0, chunk);
+            meter_.process(meterView);
+
+            // THD capture (post-FX, channel 0).
+            int head = thdHead_.load();
+            for (int i = 0; i < chunk; ++i)
+            {
+                thdRing_[static_cast<size_t>(head)] = workBuffer_.getChannel(0)[i];
+                head = (head + 1) % kThdCap;
+            }
+            thdHead_.store(head);
+            if (thdFill_.load() < kThdCap)
+                thdFill_.store(std::min(kThdCap, thdFill_.load() + chunk));
+
+            for (int i = 0; i < chunk; ++i)
+                for (int c = 0; c < outCh; ++c)
+                    out[(written + i) * outCh + c]
+                        = workBuffer_.getChannel(std::min(c, nCh - 1))[i];
+
+            const int snapN = std::min(chunk, static_cast<int>(waveSnap_[0].size()));
+            for (int i = 0; i < snapN; ++i)
+            {
+                waveSnap_[0][i] = workBuffer_.getChannel(0)[i];
+                waveSnap_[1][i] = workBuffer_.getChannel(nCh > 1 ? 1 : 0)[i];
+            }
+            waveSnapSize_.store(snapN);
+
+            written += chunk;
+        }
+
+        peakL_.store(meter_.getPeakLevel(0));
+        peakR_.store(nCh > 1 ? meter_.getPeakLevel(1) : peakL_.load());
+    }
+
     // --- Device init --------------------------------------------------------
 
     void initDevice()
@@ -410,6 +565,16 @@ private:
     dspark::LevelFollower<float>    meter_;
     std::atomic<float> peakL_ { 0.0f };
     std::atomic<float> peakR_ { 0.0f };
+
+    // Test tone + live THD capture (post-FX channel 0)
+    std::atomic<bool>  toneOn_   { false };
+    std::atomic<float> toneFreq_ { 1000.0f };
+    std::atomic<float> toneDb_   { -12.0f };
+    double             tonePhase_ = 0.0;
+    static constexpr int kThdCap = 32768;
+    std::vector<float> thdRing_  = std::vector<float>(kThdCap, 0.0f);
+    std::atomic<int>   thdHead_  { 0 };
+    std::atomic<int>   thdFill_  { 0 };
 
     // Waveform snapshot
     std::array<std::vector<float>, 2> waveSnap_ = {

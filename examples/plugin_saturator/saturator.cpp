@@ -13,6 +13,7 @@
 
 #include "../../plugin/vst3/DSParkVst3.h"
 #include "../../plugin/clap/DSParkClap.h"
+#include "../../plugin/au/DSParkAu.h"     // self-disables off macOS
 
 #include "../../Effects/Saturation.h"
 #include "../../Effects/Gain.h"
@@ -70,6 +71,9 @@ private:
     dspark::Gain<float>       gain_;
 };
 
-// One binary, two formats: copy/rename the result as .vst3 AND as .clap.
+// One translation unit, three formats. The VST3/CLAP entry points share one
+// binary (ship it as .vst3 and as .clap); the AU build is a macOS bundle
+// whose Info.plist must carry the same 4-char codes (see au/Info.plist).
 DSPARK_VST3_PLUGIN(DSParkSaturator)
 DSPARK_CLAP_PLUGIN(DSParkSaturator)
+DSPARK_AU_PLUGIN(DSParkSaturator, "DSst", "DSpk")

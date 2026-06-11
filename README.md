@@ -33,7 +33,7 @@ reverb.processBlock(buffer);
 
 No build system. No linking. No configuration. Just include and go.
 
-## Build a VST3 plugin — no JUCE required
+## Build VST3 / CLAP / AU plugins — no JUCE required
 
 DSPark ships a native plugin layer: describe your plugin declaratively,
 implement the usual DSPark contract, add one macro — and compile a loadable
@@ -67,12 +67,13 @@ cl /std:c++20 /O2 /LD /EHsc /I . mysaturator.cpp /Fe:MySaturator.vst3
 
 Parameter automation, state save/restore, bypass, latency reporting and bus
 negotiation are handled by the layer. Add `DSPARK_CLAP_PLUGIN(MySaturator)`
-and the **same binary is also a CLAP plugin** (copy it as `.clap`) — presets
-are byte-portable between both formats by construction. Two miniature hosts
-(`tools/vst3_smoke_host.cpp`, `tools/clap_smoke_host.cpp`) drive the result
-through each full plugin lifecycle like a DAW would; both run in CI on
-Windows, Linux and macOS. An AU backend over the same plugin class is on
-the roadmap.
+and the **same binary is also a CLAP plugin** (copy it as `.clap`); add
+`DSPARK_AU_PLUGIN(MySaturator, "Subt", "Manu")` and the same class builds an
+**Audio Unit for Logic Pro** on macOS — validated by Apple's `auval` in this
+repository's CI. Presets are byte-portable across all three formats by
+construction. Two miniature hosts (`tools/vst3_smoke_host.cpp`,
+`tools/clap_smoke_host.cpp`) drive the result through each full plugin
+lifecycle like a DAW would; both run in CI on Windows, Linux and macOS.
 
 **Start here**: the [plugin guide](docs/plugins.md) documents the complete
 contract (required and optional methods, what each maps to per format, the

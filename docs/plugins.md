@@ -2,9 +2,10 @@
 
 DSPark ships a native plugin layer: you write **one ordinary struct** — no
 base class, no SDK download, no JUCE — and format macros turn it into a
-loadable **VST3** and **CLAP** plugin (AU is on the roadmap). This page is
-the complete contract reference: everything the wrappers will detect and
-call, what each piece maps to in every format, and when to use it.
+loadable **VST3**, **CLAP** and **Audio Unit v2** plugin (`auval`-validated
+in CI; AU is what Logic Pro and GarageBand load). This page is the complete
+contract reference: everything the wrappers will detect and call, what each
+piece maps to in every format, and when to use it.
 
 For a copy-paste starting point with every optional method present and
 commented, see [`examples/plugin_template/`](../examples/plugin_template/plugin_template.cpp).
@@ -30,6 +31,7 @@ struct MyPlugin
 
 DSPARK_VST3_PLUGIN(MyPlugin)
 DSPARK_CLAP_PLUGIN(MyPlugin)
+DSPARK_AU_PLUGIN(MyPlugin, "Subt", "Manu")   // unique 4-char codes; macOS bundle
 ```
 
 ```
@@ -44,6 +46,12 @@ One compiled binary carries **both** entry points: ship it as `.vst3` and as
 |---|---|---|---|
 | VST3 | `C:\Program Files\Common Files\VST3` | `/Library/Audio/Plug-Ins/VST3` | `~/.vst3` |
 | CLAP | `C:\Program Files\Common Files\CLAP` (or `%LOCALAPPDATA%\Programs\Common\CLAP`) | `/Library/Audio/Plug-Ins/CLAP` | `~/.clap` |
+| AU | — | `/Library/Audio/Plug-Ins/Components` (`.component` bundle: binary built with `-bundle -framework AudioToolbox`, plus an `Info.plist` whose `AudioComponents` entry carries your 4-char codes — see `examples/plugin_saturator/au/`) | — |
+
+AU presets, latency, tail, bypass and parameters map through the same layer
+(plain values, same hashed ids, same state container — presets stay portable
+across all three formats). Validate with `auval -v aufx Subt Manu`; this
+repository's macOS CI does exactly that on every commit.
 
 ---
 

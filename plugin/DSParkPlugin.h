@@ -235,6 +235,75 @@ concept HasSetState = requires(P p, const uint8_t* d, size_t n) {
 template <typename P>
 concept HasEditor = requires { P::hasEditor; } && P::hasEditor;
 
+// -- PluginBase: the whole contract, visible in one place ----------------------
+
+/**
+ * @brief Optional convenience base that makes EVERY contract method visible
+ * and overridable — the JUCE-style discoverability, without the virtuals.
+ *
+ * ```cpp
+ * struct MyPlugin : dspark::plugin::PluginBase<MyPlugin> { ... };
+ * ```
+ *
+ * Each method below ships a safe default; define the same signature in your
+ * class to replace it (plain C++ shadowing — resolved at compile time, zero
+ * dispatch cost, no `override` keyword involved). Delete nothing, implement
+ * what applies, and your IDE's autocomplete shows you the full menu.
+ *
+ * Inheriting is OPTIONAL: a free-standing struct with the same members works
+ * identically (the wrappers detect capabilities structurally either way).
+ * You must still provide the two identity members yourself — `descriptor`
+ * and `parameters` have no safe default — plus `prepare`, `setParameter`
+ * and `processBlock`.
+ */
+template <typename Derived>
+struct PluginBase
+{
+    /**
+     * Clears processing history (delay lines, envelopes, reverb tails) on
+     * transport jumps. CLAP hosts call this directly; VST3 hosts re-activate
+     * (your `prepare()` runs again) instead.
+     * Default: nothing to clear.
+     */
+    void reset() noexcept {}
+
+    /**
+     * Samples of delay your chain introduces (lookahead limiters,
+     * linear-phase EQ, oversampling, FFT processing). The host shifts other
+     * tracks to compensate — report it accurately or parallel paths phase.
+     * Read after `prepare()`; sum your DSPark effects' `getLatency()`.
+     * Maps to VST3 `getLatencySamples` and the CLAP latency extension.
+     * Default: zero latency.
+     */
+    [[nodiscard]] int getLatency() const noexcept { return 0; }
+
+    /**
+     * How long sound continues after the input stops (reverb decay, delay
+     * feedback). Hosts keep processing you that long instead of cutting the
+     * tail. Maps to VST3 `getTailSamples` and the CLAP tail extension.
+     * Default: no tail.
+     */
+    [[nodiscard]] double getTailSeconds() const noexcept { return 0.0; }
+
+    /**
+     * Extra state BEYOND the parameters (learned profiles, loaded IRs,
+     * editor layout). The wrapper already saves/restores every parameter by
+     * its stable id on its own — most plugins never touch this pair.
+     * DSPark's StateBlob (Core/StateBlob.h) is the natural serializer.
+     * Default: no extra state.
+     */
+    [[nodiscard]] std::vector<uint8_t> getState() const { return {}; }
+
+    /** @copydoc getState — restore side. Return false on a foreign blob. */
+    bool setState(const uint8_t*, size_t) { return false; }
+
+    /**
+     * Custom editor flag — reserved for the WebView editor layer (see
+     * docs/plugins.md). Hosts show their generic parameter UI while false.
+     */
+    static constexpr bool hasEditor = false;
+};
+
 // -- Wrapper-side state serialisation ------------------------------------------
 //
 // Every backend stores plugin state in ONE container format so presets stay

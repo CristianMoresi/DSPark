@@ -59,6 +59,8 @@ jobs:
           vst3_smoke_host.exe DSParkSaturator.vst3
           copy DSParkSaturator.vst3 DSParkSaturator.clap
           clap_smoke_host.exe DSParkSaturator.clap
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_template\plugin_template.cpp /Fe:DSParkTemplate.vst3
+          vst3_smoke_host.exe DSParkTemplate.vst3
 
       - name: Build example plugin (VST3+CLAP) + smoke hosts (GCC/Clang)
         if: matrix.compiler != 'msvc'
@@ -70,6 +72,8 @@ jobs:
           ./vst3_smoke_host ./DSParkSaturator.vst3
           cp DSParkSaturator.vst3 DSParkSaturator.clap
           ./clap_smoke_host ./DSParkSaturator.clap
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_template/plugin_template.cpp -o DSParkTemplate.vst3
+          ./vst3_smoke_host ./DSParkTemplate.vst3
 
       - name: Generate metrics table (KPI K3)
         if: matrix.name == 'Linux GCC x64'

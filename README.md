@@ -71,8 +71,15 @@ and the **same binary is also a CLAP plugin** (copy it as `.clap`) — presets
 are byte-portable between both formats by construction. Two miniature hosts
 (`tools/vst3_smoke_host.cpp`, `tools/clap_smoke_host.cpp`) drive the result
 through each full plugin lifecycle like a DAW would; both run in CI on
-Windows, Linux and macOS. See `examples/plugin_saturator/`. An AU backend
-over the same plugin class is on the roadmap.
+Windows, Linux and macOS. An AU backend over the same plugin class is on
+the roadmap.
+
+**Start here**: the [plugin guide](docs/plugins.md) documents the complete
+contract (required and optional methods, what each maps to per format, the
+threading model, shipping checklists). Inherit
+`dspark::plugin::PluginBase<T>` to see every overridable method with safe
+defaults in one place (`examples/plugin_template/`), or write a
+free-standing struct (`examples/plugin_saturator/`).
 
 ---
 

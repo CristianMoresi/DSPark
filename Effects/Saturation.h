@@ -292,32 +292,45 @@ public:
     }
 };
 
-// -- Tape (hysteresis model + head bump + HF rolloff) ------------------------
+// -- Tape (anhysteretic Langevin magnetisation + head bump + HF rolloff) -----
 template <typename T>
 class TapeAlgorithm final : public SaturationAlgorithm<T>
 {
     static constexpr int kMaxCh = 16;
     std::array<Biquad<T, 1>, kMaxCh> preFilters_;
     std::array<Biquad<T, 1>, kMaxCh> postFilters_;
-    std::array<T, kMaxCh>            M_ {};
-    std::array<T, kMaxCh>            lastH_ {};
+    std::array<T, kMaxCh>            M_ {};   ///< Per-channel NR warm start.
     int numChannels_ = 0;
     T lastDrive_ = T(-1);
     double lastSampleRate_ = 0.0;
 
+    /// Langevin function L(x) = coth(x) - 1/x. The Taylor series keeps float
+    /// precision near zero, where the direct form cancels catastrophically
+    /// (coth(x) and 1/x both ~1/x); the far asymptote avoids sinh overflow.
     static inline T langevin(T x) noexcept
     {
-        T ax = std::abs(x);
-        if (ax < T(0.01)) return x / T(3);
+        const T ax = std::abs(x);
+        if (ax < T(0.5))
+        {
+            const T x2 = x * x;
+            return x * (T(1) / T(3) - x2 * (T(1) / T(45) - x2 * (T(2) / T(945))));
+        }
+        if (ax > T(20)) return std::copysign(T(1), x) - T(1) / x;
         return T(1) / std::tanh(x) - T(1) / x;
     }
 
+    /// dL/dx = 1/x^2 - csch^2(x), with the matching series and asymptote.
     static inline T langevinDeriv(T x) noexcept
     {
-        T ax = std::abs(x);
-        if (ax < T(0.01)) return T(1) / T(3);
-        T csch = T(1) / std::sinh(x);
-        return -csch * csch + T(1) / (x * x);
+        const T ax = std::abs(x);
+        if (ax < T(0.5))
+        {
+            const T x2 = x * x;
+            return T(1) / T(3) - x2 * (T(1) / T(15) - x2 * (T(2) / T(189)));
+        }
+        if (ax > T(20)) return T(1) / (x * x);
+        const T s = std::sinh(x);
+        return T(1) / (x * x) - T(1) / (s * s);
     }
 
 public:
@@ -331,7 +344,6 @@ public:
         for (auto& f : preFilters_)  f.reset();
         for (auto& f : postFilters_) f.reset();
         M_.fill(T(0));
-        lastH_.fill(T(0));
     }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Tape; }
 
@@ -346,7 +358,7 @@ public:
         auto driveDb = gainToDecibels(drive, T(-100));
         T bumpGain = T(1.5) + std::min(driveDb * T(0.05), T(3.0));
         auto peakCoeffs = BiquadCoeffs<T>::makePeak(spec.sampleRate, 80.0, 0.6, static_cast<double>(bumpGain));
-        auto lpFreq = std::max(2000.0, 18000.0 - static_cast<double>(driveDb) * 250.0);
+        auto lpFreq = std::max(6000.0, 19000.0 - static_cast<double>(driveDb) * 200.0);
         auto lpCoeffs = BiquadCoeffs<T>::makeLowPass(spec.sampleRate, lpFreq, 0.55);
 
         for (int ch = 0; ch < numChannels_; ++ch)
@@ -356,37 +368,44 @@ public:
         }
     }
 
+    /**
+     * Tape under correct AC bias magnetises along the ANHYSTERETIC curve
+     * (the bias linearises the loop away) — so the static nonlinearity is
+     * M = Ms * L((H + alpha*M)/a), solved per sample by Newton-Raphson from
+     * the previous sample's M (warm start: 3 iterations are plenty, and
+     * f' = 1 - 3*alpha*L' >= 1 - alpha > 0 has no singularity).
+     *
+     * Scaling: Ms = 3a and out = (1-alpha)*M give exactly unit small-signal
+     * gain over H = in*drive and a +-1 ceiling, matching the contract of
+     * every other algorithm in the pool. The previous formulation stepped M
+     * by dM ~ ManDiff*|dH|/(a+|dH|) — a coercivity of ~1.0 in absolute
+     * full-scale units, i.e. tape with NO bias: signals below ~0 dBFS*drive
+     * fell into a dead zone (measured: -60 dBFS in -> -121 dBFS out, output
+     * ~ input^2), wiping out quiet passages and low-level harmonic detail.
+     */
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
-        T filtered = preFilters_[ch].processSample(sample, 0);
+        const T filtered = preFilters_[ch].processSample(sample, 0);
+        const T H = filtered * drive;
 
-        T a  = T(1.0) - character * T(0.25);
-        T Ms = T(3) * a;
-        T c  = T(0.6) + character * T(0.2);
+        // character (clamped [-1,1] upstream) sets the mean-field coupling:
+        // harder knee and more mid-level bloom as alpha rises.
+        const T alpha = T(0.35) + T(0.15) * character;
+        const T a     = T(1) / (T(3) * (T(1) - alpha));
+        const T Ms    = T(3) * a;
 
-        T H = filtered * drive;
-        T dH = H - lastH_[ch];
-        T He = H + c * M_[ch];
+        T M = M_[ch];
+        for (int it = 0; it < 3; ++it)
+        {
+            const T x  = (H + alpha * M) / a;
+            const T f  = M - Ms * langevin(x);
+            const T fp = T(1) - T(3) * alpha * langevinDeriv(x);
+            M -= f / fp;
+        }
+        M = std::clamp(M, -Ms, Ms);
+        M_[ch] = M;
 
-        T Man = Ms * langevin(He / a);
-        T delta = (dH >= T(0)) ? T(1) : T(-1);
-        T ManDiff = Man - M_[ch];
-        T dManDH = Ms * langevinDeriv(He / a) / a;
-
-        T denominator = T(1) - c * dManDH;
-        if (std::abs(denominator) < T(1e-10))
-            denominator = std::copysign(T(1e-10), denominator);
-
-        T dM;
-        if (delta * ManDiff > T(0))
-            dM = (ManDiff / denominator) * std::abs(dH) / (a + std::abs(dH));
-        else
-            dM = T(0);
-
-        M_[ch] = std::clamp(M_[ch] + dM, -Ms, Ms);
-        lastH_[ch] = H;
-
-        return postFilters_[ch].processSample(M_[ch], 0);
+        return postFilters_[ch].processSample((T(1) - alpha) * M, 0);
     }
 };
 
@@ -507,8 +526,12 @@ public:
 
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
-        T tubeOut  = tube_.processSample(sample,  drive * T(0.5), character, ch);
-        T tapeOut  = tape_.processSample(tubeOut, drive * T(0.6), character, ch);
+        // Inter-stage makeup undoes each stage's fixed small-signal factor
+        // (1/0.5, 1/0.6) so the cascade is gain-staged: at neutral drive the
+        // chain sits at the Transformer's own response instead of a flat
+        // -15 dB drop, and every stage keeps receiving a healthy level.
+        T tubeOut  = tube_.processSample(sample,  drive * T(0.5), character, ch) * T(2);
+        T tapeOut  = tape_.processSample(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
         return       xfmr_.processSample(tapeOut, drive * T(0.8), character, ch);
     }
 };
@@ -544,7 +567,7 @@ public:
     enum class Algorithm
     {
         Tube,        /**< Asymmetric triode emulation. Dominant 2nd harmonic, compresses negative excursions. */
-        Tape,        /**< Magnetic hysteresis model (Langevin function) with dynamic head-bump and HF roll-off. */
+        Tape,        /**< Anhysteretic Langevin magnetisation (tape under AC bias) with dynamic head-bump and HF roll-off. */
         Transformer, /**< Core saturation model. LF saturates before HF. */
         SoftClip,    /**< Symmetric Tanh curve. Odd harmonics only (3rd, 5th, 7th). */
         HardClip,    /**< Digital hard-clipping. Extreme odd harmonics, highly aliasing without oversampling. */
@@ -855,7 +878,7 @@ public:
      * 
      * Behavior varies per algorithm:
      * - Tube: Controls waveform asymmetry.
-     * - Tape: Controls hysteresis width and knee hardness.
+     * - Tape: Controls the magnetic coupling (knee hardness and mid-level bloom).
      * - Transformer: Adjusts bias voltage.
      * 
      * @note Thread-Safe. Smoothed internally over 20ms.

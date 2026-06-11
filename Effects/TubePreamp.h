@@ -33,11 +33,12 @@
  *   multitone). A 3-section EQ designed from that measurement flattens the
  *   FMV stack's fixed ~10 dB mid-scoop envelope — neutral knobs sound
  *   neutral, the tone controls act relative to flat, and the triode's
- *   harmonic character is untouched. Loudness divides out the measured
- *   reference and drive^0.75 (partial link: the knob keeps a +0.25 dB/dB
- *   residual slope so backing off is audible and high drive holds level
- *   while density grows). Use setOutput() for static trim; gain changes
- *   are ramped (~30 ms) so slider drags stay click-free.
+ *   harmonic character is untouched. Loudness divides out the program gain
+ *   MEASURED AT EACH DRIVE (prepare-time sweep LUT, so the link tracks the
+ *   circuit's real compression) plus a +0.25 dB/dB residual slope: backing
+ *   off is audible, pushing raises density at a gently rising level — the
+ *   same contract as TapeMachine/TransformerModel. Use setOutput() for
+ *   static trim; gain changes are ramped (~30 ms) so drags stay click-free.
  *
  * The nonlinear core runs at 2x oversampling. THD signature verified in the
  * suite: single-stage distortion is 2nd-harmonic dominant (asymmetric
@@ -559,8 +560,30 @@ private:
         // density grows. The tone knobs stay fully audible: their deviation
         // from the 0.5/0.5/0.5 reference is part of the tone, not the level.
         // Cheap by construction (no scratch processing on the audio thread).
-        mScale_ = 1.0 / std::max(std::pow(drive, 0.75)
-                                 * gRef_[static_cast<size_t>(numStagesActive_ - 1)], 1e-9);
+        //
+        // The divisor is the circuit's MEASURED program gain at this drive
+        // (prepare-time LUT, log-interpolated) — same contract as
+        // TapeMachine/TransformerModel, whose per-drive scratch calibration
+        // is what kept their knobs healthy. The previous analytic
+        // 1/drive^0.75 broke at high drive: once the triode pins at its
+        // ceiling, output stops growing with drive while the divisor keeps
+        // rising, so the level FELL hard instead of holding.
+        const double driveDbNow = static_cast<double>(driveDb_.load(std::memory_order_relaxed));
+        mScale_ = std::pow(drive, 0.25)
+                / std::max(programGainAt(driveDbNow, numStagesActive_), 1e-9);
+    }
+
+    /** @brief Program gain at a drive setting (log-interpolated prepare LUT). */
+    [[nodiscard]] double programGainAt(double driveDb, int stages) const noexcept
+    {
+        const auto& lut = gProgLut_[static_cast<size_t>(stages - 1)];
+        const double pos = std::clamp((driveDb - kDriveLutMinDb) / kDriveLutStepDb,
+                                      0.0, static_cast<double>(kDriveLutN - 1));
+        const int idx = std::min(static_cast<int>(pos), kDriveLutN - 2);
+        const double frac = pos - static_cast<double>(idx);
+        const double a = std::max(lut[static_cast<size_t>(idx)], 1e-9);
+        const double b = std::max(lut[static_cast<size_t>(idx) + 1], 1e-9);
+        return a * std::pow(b / a, frac);   // gains are smooth in dB
     }
 
     /**
@@ -571,10 +594,12 @@ private:
      * gains it designs a 3-section flattening EQ (low shelf / mid peak /
      * high shelf) that removes the FMV stack's fixed envelope — the raw
      * stack at neutral knobs is a ~10 dB mid scoop, far too much colour
-     * for an insert effect — and then computes the loudness reference
-     * gRef WITH the flattener in place. A single 1 kHz tone is the wrong
-     * probe for either job (the old 1 kHz/10 ms calibration also measured
-     * INSIDE the supply-sag settling step, burying the wet path ~20 dB).
+     * for an insert effect — and then sweeps the drive grid through a
+     * chained scratch channel (flattener installed) to fill the program
+     * gain LUT that recompute() interpolates. A single 1 kHz tone is the
+     * wrong probe for any of this (the old 1 kHz/10 ms calibration also
+     * measured INSIDE the supply-sag settling step, burying the wet path
+     * ~20 dB).
      */
     void calibrateReference() noexcept
     {
@@ -637,17 +662,40 @@ private:
             for (auto& ch : channels_)
                 ch->setFlattenCoeffs(st, fc);
 
-            // Loudness reference WITH the flattener folded in analytically.
-            double outSq = 0.0;
-            for (int k = 0; k < 7; ++k)
+            // Phase 2: program gain vs DRIVE, on a chained scratch channel
+            // with the flattener installed (the chain as it really sounds).
+            // Each grid point gets a re-settle (bias/sag adapt to the new
+            // level) before its measurement window. recompute() interpolates
+            // this LUT, so the loudness link tracks the circuit's actual
+            // compression — the fix for the level falling at high drive.
+            ChannelState sweep(fs2_);
+            sweep.setToneControls(0.5, 0.5, 0.5);
+            sweep.setFlattenCoeffs(st, fc);
+            sweep.reset(kSagRef);
+            const int settle2 = static_cast<int>(0.030 * fs2_);
+            const int meas2   = static_cast<int>(0.030 * fs2_);
+            int t = 0;   // continuous tone phase across the whole sweep
+            for (int kd = 0; kd < kDriveLutN; ++kd)
             {
-                double corr = 1.0;
-                for (const auto& c : fc)
-                    corr *= c.getMagnitude(kRefTones[k], fs2_);
-                const double g = std::pow(10.0, gainDb[static_cast<size_t>(k)] / 20.0) * corr;
-                outSq += g * g;
+                const double d = std::pow(10.0,
+                    (kDriveLutMinDb + kd * kDriveLutStepDb) / 20.0);
+                double inSq = 0.0, outSq = 0.0;
+                for (int i = 0; i < settle2 + meas2; ++i, ++t)
+                {
+                    double x = 0.0;
+                    for (int k = 0; k < 7; ++k)
+                        x += std::sin(2.0 * std::numbers::pi * kRefTones[k] * t / fs2_ + k * 1.7);
+                    x *= kAmpPerTone;
+                    const double y = sweep.processSample(d * x, st, kSagRef);
+                    if (i >= settle2)
+                    {
+                        inSq += x * x;
+                        outSq += y * y;
+                    }
+                }
+                gProgLut_[static_cast<size_t>(st - 1)][static_cast<size_t>(kd)] =
+                    (outSq > 0.0 && inSq > 0.0) ? std::sqrt(outSq / inSq) : 1.0;
             }
-            gRef_[static_cast<size_t>(st - 1)] = std::sqrt(std::max(outSq / 7.0, 1e-18));
         }
     }
 
@@ -666,11 +714,18 @@ private:
     std::vector<std::vector<T>> dryRing_;
     int dryPos_ = 0;
 
+    static constexpr int    kDriveLutN = 13;       ///< -12..+36 dB in 4 dB steps.
+    static constexpr double kDriveLutMinDb = -12.0;
+    static constexpr double kDriveLutStepDb = 4.0;
+
     double hScale_ = 1.0;
     double mScale_ = 1.0;
     double sagR_ = 0.0;
     int numStagesActive_ = 1;
-    std::array<double, 2> gRef_ { 1.0, 1.0 };   ///< Program gain per stage count (prepare-time).
+    /// Program gain vs drive, per stage count (prepare-time sweep).
+    std::array<std::array<double, kDriveLutN>, 2> gProgLut_ {
+        { { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 },
+          { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 } } };
     double hScaleSm_ = -1.0;                    ///< Anti-zipper ramp states (-1 = seed on
     double outGainSm_ = -1.0;                   ///<  first block after prepare/reset).
 

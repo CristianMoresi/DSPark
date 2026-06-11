@@ -4,7 +4,7 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.2.2** — 90 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
+**v1.3.0** — 90+ headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
 
 **📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
@@ -408,11 +408,42 @@ DSPark/
 ├── Analysis/       (8)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation
 ├── IO/             (3)      # File I/O: WAV read/write, MP3 read/write
 ├── Music/          (2)      # Harmony constants + real-time chord detection
+├── plugin/                  # Native plugin layer: VST3, CLAP and AU backends
 ├── conformance/             # Public conformance suite (runs in CI)
-├── docs/                    # Cookbook and guides
-├── examples/                # WAV processing, channel strip, pitch-tracking EQ, VST3
+├── docs/                    # Cookbook, plugin guide, metrics table
+├── examples/                # WAV processing, channel strip, plugins, templates
+├── tools/                   # VST3/CLAP smoke hosts, amalgamator
 └── DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)
 ```
+
+---
+
+## What's New in v1.3.0
+
+**The native plugin layer**: build VST3, CLAP and Audio Unit plugins with
+DSPark alone — no JUCE, no SDK downloads.
+
+- **One class, three formats**: a declarative `Descriptor` + parameter table
+  plus the familiar DSPark contract; `DSPARK_VST3_PLUGIN` /
+  `DSPARK_CLAP_PLUGIN` / `DSPARK_AU_PLUGIN` macros generate the factories,
+  entry points and full ABI glue. One compiled binary serves as `.vst3` and
+  `.clap`; the AU build passes Apple's `auval` in CI.
+- **The hard parts handled**: host parameter automation funnelled into
+  DSPark's atomic smoothed setters, soft bypass, latency/tail reporting, bus
+  negotiation, and a version-tolerant state container shared by all three
+  backends — presets are byte-portable across formats, and stable text ids
+  mean you can reorder parameters between versions without breaking saved
+  sessions.
+- **Discoverable contract**: inherit `dspark::plugin::PluginBase<T>` to see
+  every overridable method with safe defaults (no virtuals, zero dispatch
+  cost), or write a free-standing struct. Full reference in
+  [docs/plugins.md](docs/plugins.md); kitchen-sink template in
+  `examples/plugin_template/`; real effect in `examples/plugin_saturator/`.
+- **Verified like a DAW would**: miniature VST3/CLAP smoke hosts drive the
+  full plugin lifecycle in CI on every platform; `auval -v aufx` gates the
+  AU build on macOS. Field-validated in REAPER (VST3 and CLAP).
+- Steinberg's VST3 C API and the CLAP headers ship vendored under their
+  permissive licenses; AU uses macOS system frameworks. Zero downloads.
 
 ---
 

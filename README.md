@@ -4,7 +4,9 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.2** — 89 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
+**v1.2.1** — 90 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
+
+**📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
 CI builds and tests every commit on Windows (MSVC), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus AddressSanitizer/UBSan, an exceptions-free embedded profile and a single-header amalgamation. The public conformance suite validates loudness against the official EBU R128 test vectors.
 
@@ -343,7 +345,7 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 - **Lock-free coefficient updates**: `Biquad::setCoeffs()` is consumed automatically by `processBlock()` and `processSample()` via a relaxed-load fast path. No external sequencing required.
 - **No virtual dispatch in hot path**: Templates and compile-time polymorphism
 - **Physically-modeled algorithms**: Tape (Chowdhury 2019 hysteresis with Langevin function, head bump pre-filter, gap-loss HF rolloff), FDN reverb (Jot 1991 absorption, Householder mixing, Dattorro 1997 multi-tap output, Lexicon-style modulation, serial allpass density, allpass interpolation, tanh soft saturation), TPT state-variable and ladder filters
-- **Full Doxygen documentation**: Every public class and method documented
+- **Full Doxygen documentation**: Every public class and method documented — browse it at [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)
 
 ---
 
@@ -352,7 +354,7 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 ```
 DSPark/
 ├── DSPark.h                 # Single umbrella include + full documentation
-├── Core/          (40)      # Building blocks: filters, FFT, WDF, oscillators, SIMD
+├── Core/          (41)      # Building blocks: filters, FFT, WDF, oscillators, SIMD
 ├── Effects/       (36)      # Ready-to-use processors: EQ, compressor, reverb, tape...
 ├── Analysis/       (8)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation
 ├── IO/             (3)      # File I/O: WAV read/write, MP3 read/write
@@ -362,6 +364,49 @@ DSPark/
 ├── examples/                # WAV processing, channel strip, pitch-tracking EQ, VST3
 └── DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)
 ```
+
+---
+
+## What's New in v1.2.1
+
+A sound-quality release: every fix below came from systematic listening
+sessions in DSParkLab backed by measurement, and each one is now pinned by a
+permanent contract test (insertion loudness, low-level linearity, spectral
+balance, click-free parameter drags).
+
+- **Hard sync rebuilt on a table minBLEP** (`Core/MinBlepTable.h`, new): a
+  minimum-phase band-limited step built at prepare() time from first
+  principles (windowed BLIT → real cepstrum → causal fold). Alias rejection
+  improves from the 2-point PolyBLEP's -35..-44 dB to **-98..-108 dB**, and
+  the synced triangle loses its inherent DC offset.
+- **Saturation algorithms repaired**: the Tape model was a dead-zone (tape
+  with no AC bias — quiet signals vanished as input²); it is now the correct
+  anhysteretic Langevin curve solved per sample. The Wavefolder carried a
+  hidden 2π (+16 dB) gain factor; the Transformer's band split imposed a
+  fixed ±3 dB shelf tilt that buried mids and highs (worst in the MultiStage
+  cascade, now properly gain-staged). All ten algorithms now honour one
+  contract: unit small-signal gain at neutral drive, ±1 ceiling.
+- **Analog models calibrated at program level**: TubePreamp no longer drops
+  ~20 dB on activation (its calibration measured inside the supply-sag
+  settling transient) and its FMV stack's fixed mid-scoop is flattened by a
+  measured 3-section EQ — neutral knobs now sound neutral, tone controls act
+  relative to flat. TransformerModel no longer explodes +21 dB at high drive
+  (small-signal calibration probed the JA virgin curve instead of the major
+  loop). Gain changes ramp geometrically, so drive drags are click-free even
+  through the transformer's output differentiator.
+- **Drive knobs that feel right**: TapeMachine, TubePreamp and
+  TransformerModel share one loudness contract — the link is measured at
+  each drive setting (the TubePreamp sweeps a prepare-time LUT) with a
+  +0.25 dB/dB residual slope: backing off cleans and drops a touch, pushing
+  adds density at a steady level.
+- **EQ band types**: the `Equalizer` exposes its full type set per band
+  (peak, shelves, cuts with 6-48 dB/oct slope, notch, bandpass, tilt) in
+  DSParkLab again, drawn from the real biquad cascade
+  (`buildBandStages` is now a public analysis API). `DynamicEQ` gains
+  per-band **shapes** (bell / low shelf / high shelf) with shape-aware
+  detectors — a framework-level addition, state-compatible with old presets.
+- **API documentation now published** at
+  [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/).
 
 ---
 

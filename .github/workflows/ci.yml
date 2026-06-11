@@ -49,6 +49,22 @@ jobs:
         shell: bash
         run: ./dspark_conformance*
 
+      - name: Build example VST3 plugin + smoke host (MSVC)
+        if: matrix.compiler == 'msvc'
+        shell: cmd
+        run: |
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_saturator\saturator.cpp /Fe:DSParkSaturator.vst3
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /I . tools\vst3_smoke_host.cpp /Fe:vst3_smoke_host.exe
+          vst3_smoke_host.exe DSParkSaturator.vst3
+
+      - name: Build example VST3 plugin + smoke host (GCC/Clang)
+        if: matrix.compiler != 'msvc'
+        shell: bash
+        run: |
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_saturator/saturator.cpp -o DSParkSaturator.vst3
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -I . tools/vst3_smoke_host.cpp -o vst3_smoke_host -ldl
+          ./vst3_smoke_host ./DSParkSaturator.vst3
+
       - name: Generate metrics table (KPI K3)
         if: matrix.name == 'Linux GCC x64'
         shell: bash

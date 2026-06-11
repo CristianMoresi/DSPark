@@ -33,6 +33,44 @@ reverb.processBlock(buffer);
 
 No build system. No linking. No configuration. Just include and go.
 
+## Build a VST3 plugin — no JUCE required
+
+DSPark ships a native plugin layer: describe your plugin declaratively,
+implement the usual DSPark contract, add one macro — and compile a loadable
+VST3 with nothing but this repository (Steinberg's official C API header is
+vendored under its permissive 2025 license).
+
+```cpp
+#include "plugin/vst3/DSParkVst3.h"
+
+struct MySaturator
+{
+    static constexpr auto descriptor = dspark::plugin::Descriptor {
+        .name = "My Saturator", .vendor = "Me",
+        .productId = "com.me.mysaturator", .version = "1.0.0",
+    };
+    static constexpr auto parameters = dspark::plugin::params(
+        dspark::plugin::param("drive", "Drive", -12.0f, 36.0f, 0.0f, "dB"));
+
+    void prepare(const dspark::AudioSpec& spec)   { sat_.prepare(spec); }
+    void setParameter(int, float v) noexcept      { sat_.setDrive(v); }
+    void processBlock(dspark::AudioBufferView<float> io) noexcept { sat_.processBlock(io); }
+
+    dspark::Saturation<float> sat_;
+};
+DSPARK_VST3_PLUGIN(MySaturator)
+```
+
+```
+cl /std:c++20 /O2 /LD /EHsc /I . mysaturator.cpp /Fe:MySaturator.vst3
+```
+
+Parameter automation, state save/restore, bypass, latency reporting and bus
+negotiation are handled by the layer; `tools/vst3_smoke_host.cpp` drives the
+result through the full VST3 lifecycle like a DAW would (it runs in CI on
+Windows, Linux and macOS). See `examples/plugin_saturator/`. CLAP and AU
+backends over the same plugin class are on the roadmap.
+
 ---
 
 ## Why DSPark

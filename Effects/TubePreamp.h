@@ -117,8 +117,9 @@ public:
     {
         if (!prepared_) return;
         const double sagR = static_cast<double>(sag_.load(std::memory_order_relaxed)) * 40e3;
+        const int stages = stages_.load(std::memory_order_relaxed);
         for (auto& ch : channels_)
-            ch->reset(sagR);
+            ch->reset(sagR, stages);
         for (auto& d : dryRing_)
             std::fill(d.begin(), d.end(), T(0));
         dryPos_ = 0;
@@ -452,18 +453,24 @@ private:
          *  activation thump, and worse: it sat inside the old 10 ms
          *  calibration window, inflating outSq and burying the whole wet
          *  path ~20 dB under unity. */
-        void reset(double sagR) noexcept
+        void reset(double sagR, int numStages) noexcept
         {
+            // Fixed point over the ACTIVE stage count: processSample only
+            // draws current from the stages in use, so seeding ipLP with both
+            // stages' current at 1-stage settings left a ~70 ms sag transient
+            // (audible activation drift, and it polluted the noise floor).
             double bp = kBplus;
+            double iTotal = 0.0;
             for (int it = 0; it < 8; ++it)
             {
                 stage1.settleDC(bp);
                 stage2.settleDC(bp);
-                const double bpNew = kBplus - sagR * (stage1.ip + stage2.ip);
+                iTotal = stage1.ip + (numStages > 1 ? stage2.ip : 0.0);
+                const double bpNew = kBplus - sagR * iTotal;
                 if (std::abs(bpNew - bp) < 1e-9) break;
                 bp = bpNew;
             }
-            ipLP = stage1.ip + stage2.ip;
+            ipLP = iTotal;
             outHpX = outHpY = 0.0;
             fmv.reset();
             for (auto& set : flatten)
@@ -613,7 +620,7 @@ private:
         {
             ChannelState cal(fs2_);   // fresh: flattener is passthrough here
             cal.setToneControls(0.5, 0.5, 0.5);
-            cal.reset(kSagRef);
+            cal.reset(kSagRef, st);
 
             // Per-tone Goertzel over the measured tail.
             std::array<double, 7> gs1 {}, gs2 {}, gc {};
@@ -671,7 +678,7 @@ private:
             ChannelState sweep(fs2_);
             sweep.setToneControls(0.5, 0.5, 0.5);
             sweep.setFlattenCoeffs(st, fc);
-            sweep.reset(kSagRef);
+            sweep.reset(kSagRef, st);
             const int settle2 = static_cast<int>(0.030 * fs2_);
             const int meas2   = static_cast<int>(0.030 * fs2_);
             int t = 0;   // continuous tone phase across the whole sweep

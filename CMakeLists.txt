@@ -9,7 +9,7 @@
 #                             when DSPark is the top-level project).
 
 cmake_minimum_required(VERSION 3.21)
-project(DSPark VERSION 1.1.0 LANGUAGES CXX)
+project(DSPark VERSION 1.4.1 LANGUAGES CXX)
 
 add_library(dspark INTERFACE)
 add_library(dspark::dspark ALIAS dspark)
@@ -54,3 +54,19 @@ install(TARGETS dspark EXPORT dsparkTargets)
 install(EXPORT dsparkTargets
         NAMESPACE dspark::
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dspark)
+
+# Package config, so find_package(dspark CONFIG) works from any install or
+# package manager (vcpkg/Conan). ARCH_INDEPENDENT: header-only.
+include(CMakePackageConfigHelpers)
+configure_package_config_file(cmake/dsparkConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/dsparkConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dspark)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/dsparkConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+    ARCH_INDEPENDENT)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/dsparkConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/dsparkConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dspark)

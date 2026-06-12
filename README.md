@@ -4,7 +4,7 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.4.0** — 90+ headers. One `#include`. Ready to build plugins (with HTML/CSS/JS editors), desktop apps, WebAssembly, mobile, embedded.
+**v1.4.1** — 90+ headers. One `#include`. Ready to build plugins (with HTML/CSS/JS editors), desktop apps, WebAssembly, mobile, embedded.
 
 **📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
@@ -462,6 +462,8 @@ in the host window — no GUI framework, nothing to install.
   toggle-parsing contract bug in both backends, now fixed.
 - Examples: `examples/plugin_webview_editor/` (single-file, draggable SVG
   knobs) and `examples/plugin_webview_files/` (separate-files workflow).
+- **v1.4.1**: complete CMake package config — `find_package(dspark CONFIG)`
+  now works from any install tree or package manager (vcpkg/Conan).
 
 ---
 

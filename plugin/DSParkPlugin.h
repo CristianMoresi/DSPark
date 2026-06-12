@@ -38,33 +38,52 @@
  * ```
  *
  * Capability detection is by C++20 concepts: implement only what applies.
+ * The full optional menu (each one detected structurally, see the concepts
+ * below and docs/plugins.md):
+ *   - reset / getLatency / getTailSeconds / getState / setState
+ *   - processBlock(io, sidechain)      -> a host-routable sidechain bus
+ *   - handleMidiEvent(const MidiEvent&) -> note/CC/pitch-bend input
+ *   - setTransport(const TransportInfo&) -> host tempo & timeline, per block
+ *   - setOfflineRendering(bool)        -> realtime vs bounce quality switch
+ *   - channels (ChannelSupport)        -> mono/stereo bus configurations
+ *   - factoryPresets                   -> host-browsable factory programs
+ *   - sampleAccurateAutomation         -> opt out of sub-block automation
+ *   - hasEditor + editorHtml()         -> the WebView editor layer
+ *
  * State: the wrapper always serialises the parameter table itself (stable
  * text ids hashed to 32 bits, version-tolerant); a user getState/setState
  * blob — e.g. DSPark's StateBlob — rides along as an extra section.
- *
- * The editor story is deliberately deferred: every format shows the host's
- * generic parameter UI in v1. The layer reserves the hook (`hasEditor`)
- * so a future webview-based editor can plug in without API breakage.
  */
 
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
+#include "../Core/DenormalGuard.h"
 
 #include <array>
+#include <concepts>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 namespace dspark::plugin {
 
 // -- Descriptor ---------------------------------------------------------------
 
-/** @brief Plugin category (reflected into each format's class metadata). */
+/** @brief Plugin category (reflected into each format's class metadata).
+ *
+ * `Fx` processes audio in place (optionally keyed by a sidechain or driven
+ * by MIDI — a vocoder, a MIDI-gated effect). `Instrument` GENERATES audio:
+ * it has no main audio input in any format (VST3 instrument class, CLAP
+ * "instrument" feature, AU `aumu` music device) and almost always pairs
+ * with `handleMidiEvent` (see HasMidi). The wrapper clears the output
+ * buffers before calling an instrument's processBlock, so voices ADD into
+ * `io` without reading it. */
 enum class Category
 {
-    Fx,           ///< Audio effect (stereo in -> stereo out).
-    Instrument    ///< Reserved for a future instrument contract (events/voices).
+    Fx,           ///< Audio effect (audio in -> audio out).
+    Instrument    ///< Audio generator (MIDI in -> audio out, no audio input).
 };
 
 /**
@@ -260,19 +279,329 @@ concept HasEditor = requires { P::hasEditor; } && P::hasEditor;
  *                   dspark::AudioBufferView<float> sidechain) noexcept;
  * ```
  *
- * and every format backend grows a second stereo input the host can route
- * into: a VST3 aux bus, a CLAP non-main port, an AU input element — all
- * named "Sidechain". The wrapper guarantees the sidechain view is always
- * valid and frame-aligned with `io` (pre-allocated silence when the host
- * has nothing connected), so the plugin never branches on availability.
- * Treat the sidechain as read-only. Replaces the single-buffer
- * `processBlock` — implement one or the other, not both.
+ * and every format backend grows a second input the host can route into:
+ * a VST3 aux bus, a CLAP non-main port, an AU input element — all named
+ * "Sidechain". The key view always mirrors the main width (mono main,
+ * mono key) and the wrapper guarantees it is valid and frame-aligned with
+ * `io` (pre-allocated silence when the host has nothing connected), so
+ * the plugin never branches on availability. Treat the sidechain as
+ * read-only. Replaces the single-buffer `processBlock` — implement one or
+ * the other, not both.
  */
 template <typename P>
 concept HasSidechain = requires(P p, AudioBufferView<float> io,
                                 AudioBufferView<float> sc) {
     p.processBlock(io, sc);
 };
+
+// -- Transport (host tempo & timeline) ------------------------------------------
+
+/**
+ * @brief Host transport snapshot, delivered once per audio block.
+ *
+ * Implement `void setTransport(const dspark::plugin::TransportInfo&)
+ * noexcept` (see HasTransport) and every backend feeds it from the native
+ * source before each processBlock: the VST3 ProcessContext, the CLAP
+ * transport event, the AU host callbacks. Check the `*Valid` flags — hosts
+ * differ in what they provide (an offline renderer may have no timeline at
+ * all). Fields hold their defaults when the matching flag is false.
+ */
+struct TransportInfo
+{
+    double tempoBpm = 120.0;          ///< Current tempo (when tempoValid).
+    double ppqPosition = 0.0;         ///< Musical position of frame 0, in quarter notes.
+    double barStartPpq = 0.0;         ///< Quarter-note position of the current bar start.
+    int    timeSigNumerator = 4;      ///< e.g. 3 in 3/4 (when timeSigValid).
+    int    timeSigDenominator = 4;    ///< e.g. 4 in 3/4 (when timeSigValid).
+    double loopStartPpq = 0.0;        ///< Cycle start (when loopValid).
+    double loopEndPpq = 0.0;          ///< Cycle end (when loopValid).
+    bool   playing = false;           ///< Transport is rolling.
+    bool   recording = false;         ///< Transport is recording.
+    bool   looping = false;           ///< Cycle/loop mode is engaged.
+    bool   tempoValid = false;        ///< tempoBpm came from the host.
+    bool   positionValid = false;     ///< ppqPosition/barStartPpq came from the host.
+    bool   timeSigValid = false;      ///< Time signature came from the host.
+    bool   loopValid = false;         ///< Loop points came from the host.
+
+    /** @brief Seconds per quarter note at the current tempo. */
+    [[nodiscard]] double secondsPerBeat() const noexcept
+    {
+        return 60.0 / (tempoBpm > 1.0 ? tempoBpm : 120.0);
+    }
+
+    /** @brief Samples per quarter note — the basis for tempo-synced delays/LFOs. */
+    [[nodiscard]] double samplesPerBeat(double sampleRate) const noexcept
+    {
+        return secondsPerBeat() * sampleRate;
+    }
+};
+
+/**
+ * @brief Transport capability: `void setTransport(const TransportInfo&)
+ * noexcept`. Called on the audio thread, before processBlock, whenever the
+ * host supplied transport data for the block (no call means "same as last
+ * block"). This is how tempo-synced delays, LFOs and gates follow the song.
+ */
+template <typename P>
+concept HasTransport = requires(P p, const TransportInfo& t) {
+    p.setTransport(t);
+};
+
+// -- MIDI ------------------------------------------------------------------------
+
+/**
+ * @brief One incoming MIDI-ish event, normalised across formats.
+ *
+ * VST3 delivers notes as native events and pitch bend / CC / pressure
+ * through its controller-mapping scheme; CLAP delivers note events plus raw
+ * MIDI; AU delivers raw MIDI bytes. The wrapper translates ALL of them into
+ * this one struct so the plugin handles a single vocabulary.
+ *
+ * `sampleOffset` is the event's position in frames RELATIVE TO THE NEXT
+ * processBlock call: events are always delivered (in time order) right
+ * before the block that contains them. A simple plugin may ignore the
+ * offset (worst error: one automation quantum); a sample-accurate synth
+ * starts its voice exactly `sampleOffset` frames into the block.
+ */
+struct MidiEvent
+{
+    enum class Type : uint8_t
+    {
+        NoteOn,            ///< note = key, value = velocity 0..1.
+        NoteOff,           ///< note = key, value = release velocity 0..1.
+        PitchBend,         ///< value = bend -1..+1 (note unused).
+        ControlChange,     ///< note = controller number, value = 0..1.
+        ChannelPressure,   ///< value = pressure 0..1 (note unused).
+        PolyPressure       ///< note = key, value = pressure 0..1.
+    };
+
+    Type    type = Type::NoteOn;
+    uint8_t channel = 0;      ///< 0..15.
+    uint8_t note = 0;         ///< Key 0..127, or controller number for CC.
+    float   value = 0.0f;     ///< Velocity / CC / pressure 0..1; bend -1..+1.
+    int     sampleOffset = 0; ///< Frames into the NEXT processBlock call.
+};
+
+/**
+ * @brief MIDI capability: `void handleMidiEvent(const MidiEvent&) noexcept`.
+ * Its presence grows a note/event input in every format (VST3 event bus,
+ * CLAP note port, AU music-device selectors) — which is also why PluginBase
+ * deliberately ships no default for it. Required for Category::Instrument,
+ * optional for MIDI-driven effects. Audio thread; allocation-free.
+ */
+template <typename P>
+concept HasMidi = requires(P p, const MidiEvent& e) {
+    p.handleMidiEvent(e);
+};
+
+// -- Offline rendering ------------------------------------------------------------
+
+/**
+ * @brief Render-mode capability: `void setOfflineRendering(bool) noexcept`.
+ * The host flips it to true for non-realtime bounces (VST3 kOffline setup,
+ * the CLAP render extension, AU OfflineRender) — the moment to switch to
+ * more expensive algorithms (higher oversampling, longer lookahead). Called
+ * outside the audio thread, before processing (re)starts. Default: assume
+ * realtime.
+ */
+template <typename P>
+concept HasOfflineMode = requires(P p, bool offline) {
+    p.setOfflineRendering(offline);
+};
+
+// -- Channel support ----------------------------------------------------------------
+
+/**
+ * @brief Bus widths a plugin offers to the host. The DSPark contract is
+ * channel-agnostic by construction (prepare() receives numChannels and
+ * processBlock honours io.numChannels()), so the DEFAULT is mono+stereo:
+ * the plugin appears on every track type. Declare
+ * `static constexpr auto channels = dspark::plugin::ChannelSupport::...;`
+ * only to restrict it (e.g. StereoOnly for M/S wideners). All buses of an
+ * instance run the same width — a sidechain follows the main pair.
+ */
+enum class ChannelSupport
+{
+    MonoAndStereo,   ///< Negotiates 1->1 or 2->2 with the host (default).
+    StereoOnly,      ///< Strictly 2->2 (inherently stereo DSP).
+    MonoOnly         ///< Strictly 1->1 (rare; metering/utility plugins).
+};
+
+template <typename P>
+concept HasChannelSupport = requires {
+    { P::channels } -> std::convertible_to<ChannelSupport>;
+};
+
+/** @brief The declared channel support of @p P (default: mono+stereo). */
+template <typename P>
+constexpr ChannelSupport channelSupportOf() noexcept
+{
+    if constexpr (HasChannelSupport<P>)
+        return P::channels;
+    else
+        return ChannelSupport::MonoAndStereo;
+}
+
+/** @brief True when @p P accepts a bus width of @p numChannels (1 or 2). */
+template <typename P>
+constexpr bool supportsChannelCount(int numChannels) noexcept
+{
+    constexpr ChannelSupport s = channelSupportOf<P>();
+    if (numChannels == 1) return s != ChannelSupport::StereoOnly;
+    if (numChannels == 2) return s != ChannelSupport::MonoOnly;
+    return false;
+}
+
+/** @brief The width every backend starts in before the host negotiates. */
+template <typename P>
+constexpr int defaultChannelCount() noexcept
+{
+    return channelSupportOf<P>() == ChannelSupport::MonoOnly ? 1 : 2;
+}
+
+// -- Factory presets ----------------------------------------------------------------
+
+/**
+ * @brief One factory preset: a name plus a PLAIN value for every parameter,
+ * in parameter-table order. Build the table with preset()/presets() so the
+ * value count is checked at compile time against the parameter count.
+ */
+template <size_t NumValues>
+struct PresetDef
+{
+    const char* name = "";
+    std::array<float, NumValues> values {};
+};
+
+/** @brief Builds one factory preset: `preset("Warm", 6.0f, 0.8f, ...)` —
+ *  one PLAIN value per parameter, in table order. */
+template <typename... Vs>
+constexpr PresetDef<sizeof...(Vs)> preset(const char* name, Vs... values) noexcept
+{
+    return PresetDef<sizeof...(Vs)> { name, { static_cast<float>(values)... } };
+}
+
+/** @brief Builds the factory preset table (all presets must cover the same
+ *  parameter count — enforced here; matched against the parameter table by
+ *  the backends). Declare as `static constexpr auto factoryPresets = ...`. */
+template <typename First, typename... Rest>
+constexpr std::array<First, 1 + sizeof...(Rest)> presets(First first, Rest... rest) noexcept
+{
+    static_assert((std::is_same_v<First, Rest> && ...),
+                  "every preset must list one value per parameter");
+    return { first, rest... };
+}
+
+/**
+ * @brief Factory-preset capability: a `static constexpr auto factoryPresets`
+ * table built with presets(). The backends publish it natively — a VST3
+ * program list, CLAP preset-load + preset-discovery, AU factory presets —
+ * so the host's own preset browser offers them. No PluginBase default on
+ * purpose: the table's presence changes what hosts display.
+ */
+template <typename P>
+concept HasFactoryPresets = requires {
+    { P::factoryPresets.size() } -> std::convertible_to<size_t>;
+    { P::factoryPresets[0].name } -> std::convertible_to<const char*>;
+    { P::factoryPresets[0].values.size() } -> std::convertible_to<size_t>;
+};
+
+/** @brief Number of factory presets of @p P (0 when none declared). */
+template <typename P>
+constexpr int factoryPresetCountOf() noexcept
+{
+    if constexpr (HasFactoryPresets<P>)
+    {
+        static_assert(P::factoryPresets[0].values.size() == P::parameters.size(),
+                      "factoryPresets must list one PLAIN value per parameter, "
+                      "in parameter-table order");
+        return static_cast<int>(P::factoryPresets.size());
+    }
+    else
+        return 0;
+}
+
+/** @brief Normalized value of parameter @p paramIndex in factory preset
+ *  @p presetIndex (bounds already validated by the caller). */
+template <typename P>
+constexpr double presetNormalized(int presetIndex, size_t paramIndex) noexcept
+{
+    if constexpr (HasFactoryPresets<P>)
+        return toNormalized(P::parameters[paramIndex],
+                            P::factoryPresets[static_cast<size_t>(presetIndex)]
+                                .values[paramIndex]);
+    else
+    {
+        (void) presetIndex;
+        (void) paramIndex;
+        return 0.0;
+    }
+}
+
+// -- Sample-accurate automation -------------------------------------------------------
+
+/**
+ * @brief Sample-accurate opt-out: `static constexpr bool
+ * sampleAccurateAutomation = false;`. By default the wrappers split each
+ * audio block at automation points (snapped to kAutomationQuantum frames)
+ * so fast curves land where the host drew them instead of stepping once
+ * per block. Opt out when your plugin has a high fixed cost per
+ * processBlock CALL and block-rate automation is acceptable.
+ */
+template <typename P>
+concept HasSampleAccurateOptOut = requires {
+    { P::sampleAccurateAutomation } -> std::convertible_to<bool>;
+};
+
+template <typename P>
+constexpr bool sampleAccurateOf() noexcept
+{
+    if constexpr (HasSampleAccurateOptOut<P>)
+        return P::sampleAccurateAutomation;
+    else
+        return true;
+}
+
+/** @brief Sub-block grain: automation/event splits snap to this many frames
+ *  (bounds the per-call overhead; ~0.7 ms at 48 kHz is inaudible). */
+inline constexpr int kAutomationQuantum = 32;
+
+/** @brief Hard cap of timestamped events handled per block; the (very
+ *  unlikely) excess applies at the position of the last captured event. */
+inline constexpr int kMaxBlockEvents = 256;
+
+/**
+ * @brief One timestamped in-block event, normalised across formats: a
+ * parameter point, a bypass point, or a MIDI event. The backends collect
+ * them per block, sort them, and either split processing at quantum
+ * boundaries (sample-accurate mode) or apply them all up front.
+ */
+struct BlockEvent
+{
+    enum class Kind : uint8_t { Param, Bypass, Midi };
+    int32_t  offset = 0;        ///< Frame position within the block.
+    Kind     kind = Kind::Param;
+    uint32_t paramId = 0;       ///< hash32 id (Kind::Param only).
+    double   value = 0.0;       ///< Normalized value / bypass >= 0.5.
+    MidiEvent midi {};          ///< Kind::Midi payload.
+};
+
+/** @brief Stable insertion sort by offset (tiny N, allocation-free —
+ *  audio-thread safe; equal offsets keep arrival order). */
+inline void sortBlockEvents(BlockEvent* events, int count) noexcept
+{
+    for (int i = 1; i < count; ++i)
+    {
+        BlockEvent key = events[i];
+        int j = i - 1;
+        while (j >= 0 && events[j].offset > key.offset)
+        {
+            events[j + 1] = events[j];
+            --j;
+        }
+        events[j + 1] = key;
+    }
+}
 
 // -- Editor contract (used by plugin/webview/DSParkWebViewEditor.h) -------------
 
@@ -422,11 +751,19 @@ concept HasEditorDevFile = requires {
  * and `parameters` have no safe default — plus `prepare`, `setParameter`
  * and `processBlock`.
  *
- * One capability has no default here on purpose: a sidechain input. Define
- * `void processBlock(AudioBufferView<float> io, AudioBufferView<float>
- * sidechain) noexcept` INSTEAD of the single-buffer form and every format
- * grows a host-routable "Sidechain" bus (see the HasSidechain concept) —
- * a base-class default would silently add that bus to every plugin.
+ * Three capabilities have no default here on purpose, because their mere
+ * presence changes what the host sees:
+ *  - a sidechain input: define `void processBlock(AudioBufferView<float> io,
+ *    AudioBufferView<float> sidechain) noexcept` INSTEAD of the
+ *    single-buffer form and every format grows a host-routable "Sidechain"
+ *    bus (see HasSidechain);
+ *  - MIDI input: define `void handleMidiEvent(const MidiEvent&) noexcept`
+ *    and every format grows a note/event input (see HasMidi);
+ *  - factory presets: declare `static constexpr auto factoryPresets =
+ *    presets(...)` and every format publishes a host-browsable program
+ *    list (see HasFactoryPresets).
+ * Channel support is declarative too (`static constexpr auto channels`) and
+ * already defaults to mono+stereo without any member here.
  */
 template <typename Derived>
 struct PluginBase
@@ -468,6 +805,26 @@ struct PluginBase
 
     /** @copydoc getState — restore side. Return false on a foreign blob. */
     bool setState(const uint8_t*, size_t) { return false; }
+
+    /**
+     * Host transport snapshot, delivered on the audio thread before each
+     * processBlock whenever the host supplies timeline data. Read tempoBpm
+     * and ppqPosition (checking the *Valid flags) to sync delays, LFOs and
+     * gates to the song. Maps to the VST3 ProcessContext, the CLAP
+     * transport event and the AU host callbacks.
+     * Default: transport ignored.
+     */
+    void setTransport(const TransportInfo&) noexcept {}
+
+    /**
+     * Render-mode switch: hosts flip it to true for non-realtime bounces —
+     * the moment to raise oversampling or other quality/cost trade-offs.
+     * Called outside the audio thread, before processing (re)starts. Maps
+     * to the VST3 kOffline process mode, the CLAP render extension and the
+     * AU OfflineRender property.
+     * Default: render mode ignored (always the realtime path).
+     */
+    void setOfflineRendering(bool) noexcept {}
 
     /**
      * Custom editor flag. While false, hosts show their generic parameter UI.

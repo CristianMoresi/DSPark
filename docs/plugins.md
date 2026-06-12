@@ -108,7 +108,7 @@ virtual; nothing else is required.**
 | `static constexpr auto parameters` | scan time | The automatable parameter table, built with `params(param(...), toggle(...))`. The **text ids are the stable identity** of each parameter (state + automation): you may reorder/insert parameters freely between versions, but never rename an id. |
 | `void prepare(const AudioSpec&)` | main thread, before audio | Allocate and configure for `sampleRate` / `maxBlockSize` / 2 channels. Maps to VST3 `setActive(true)` (after `setupProcessing`) and CLAP `activate`. May allocate. |
 | `void setParameter(int index, float plain) noexcept` | **any thread** | Receive a plain-range value for `parameters[index]`. Forward to your DSPark setters — they are atomic and smoothed by contract, which is what makes this callable from UI and audio threads alike. Never allocate or lock. |
-| `void processBlock(AudioBufferView<float>) noexcept` | audio thread | In-place stereo processing, exactly like every DSPark effect. Never allocate, lock or block. |
+| `void processBlock(AudioBufferView<float>) noexcept` | audio thread | In-place stereo processing, exactly like every DSPark effect. Never allocate, lock or block. (For a sidechain, implement the two-buffer form INSTEAD — see Optional below.) |
 
 ### Optional — detected automatically
 
@@ -118,6 +118,7 @@ virtual; nothing else is required.**
 | `double getTailSeconds() const` | VST3 `getTailSamples`, CLAP `clap.tail` | sound continues after input stops: reverbs, delays. Hosts keep processing your plugin that long after audio ends instead of cutting the tail. |
 | `void reset() noexcept` | CLAP `reset` | you keep history that should clear on transport jumps (delay lines, envelopes). VST3 has no direct equivalent — hosts re-activate instead, which re-runs `prepare()`. |
 | `std::vector<uint8_t> getState() const` + `bool setState(const uint8_t*, size_t)` | VST3 `IComponent::get/setState`, CLAP `clap.state` (extra section) | you have state **beyond the parameters**: learned noise profiles, loaded IRs, editor layout. The wrapper *always* saves/restores your parameter values by itself — most plugins need neither method. DSPark's `StateBlob` is the natural serializer here. |
+| `void processBlock(AudioBufferView<float> io, AudioBufferView<float> sidechain) noexcept` — *instead of* the single-buffer form | a second stereo input named "Sidechain": VST3 **aux bus**, CLAP **non-main port**, AU **input element** | the detector should follow a host-routed key signal: duckers, externally-keyed gates and de-essers. The shape matches DSPark's own dynamics, so `comp_.processBlock(io, sidechain)` forwards 1:1. The wrapper hands you frame-aligned **silence when nothing is routed** — never branch on availability, and treat the sidechain as read-only. Reference plugin: `examples/plugin_ducker/`. |
 | `static constexpr bool hasEditor` | VST3 `createView`, CLAP `clap.gui` | a custom GUI written in HTML/CSS/JS: pair it with `editorHtml()` (+ optional `editorSize`, `editorResize`, `editorDebug`) and include the WebView editor layer first. While false/absent, hosts show their generic parameter UI — fully usable. See "Custom UIs" below. |
 
 ### What the wrappers handle so you don't have to
@@ -304,9 +305,14 @@ by id.
 **Can I rename a parameter's display name?** Yes — `name` is cosmetic.
 Never change `id`.
 
-**Mono? Sidechain? MIDI?** Not in v1 — stereo effect buses only. The layer
-will grow `Category::Instrument` and bus configs without breaking the
-current contract.
+**Sidechain?** Yes: implement the two-buffer `processBlock(io, sidechain)`
+and every format grows a host-routable "Sidechain" input (the table above;
+`examples/plugin_ducker/` is the reference). The smoke hosts verify the bus
+layout — and, with `--expect-sidechain`, that a hot key actually ducks.
+
+**Mono? MIDI?** Not yet — stereo buses only (main + optional sidechain).
+The layer will grow `Category::Instrument` and more bus configs without
+breaking the current contract.
 
 **Where do the parameter values live?** Wherever your DSPark members keep
 them. The wrapper keeps normalized shadows only for host queries and state;

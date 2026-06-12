@@ -251,6 +251,29 @@ concept HasSetState = requires(P p, const uint8_t* d, size_t n) {
 template <typename P>
 concept HasEditor = requires { P::hasEditor; } && P::hasEditor;
 
+/**
+ * @brief Sidechain capability. Implement the two-buffer process — the same
+ * shape DSPark's own dynamics take:
+ *
+ * ```cpp
+ * void processBlock(dspark::AudioBufferView<float> io,
+ *                   dspark::AudioBufferView<float> sidechain) noexcept;
+ * ```
+ *
+ * and every format backend grows a second stereo input the host can route
+ * into: a VST3 aux bus, a CLAP non-main port, an AU input element — all
+ * named "Sidechain". The wrapper guarantees the sidechain view is always
+ * valid and frame-aligned with `io` (pre-allocated silence when the host
+ * has nothing connected), so the plugin never branches on availability.
+ * Treat the sidechain as read-only. Replaces the single-buffer
+ * `processBlock` — implement one or the other, not both.
+ */
+template <typename P>
+concept HasSidechain = requires(P p, AudioBufferView<float> io,
+                                AudioBufferView<float> sc) {
+    p.processBlock(io, sc);
+};
+
 // -- Editor contract (used by plugin/webview/DSParkWebViewEditor.h) -------------
 
 /** @brief Editor window size in logical pixels (physical = logical x host scale). */
@@ -398,6 +421,12 @@ concept HasEditorDevFile = requires {
  * You must still provide the two identity members yourself — `descriptor`
  * and `parameters` have no safe default — plus `prepare`, `setParameter`
  * and `processBlock`.
+ *
+ * One capability has no default here on purpose: a sidechain input. Define
+ * `void processBlock(AudioBufferView<float> io, AudioBufferView<float>
+ * sidechain) noexcept` INSTEAD of the single-buffer form and every format
+ * grows a host-routable "Sidechain" bus (see the HasSidechain concept) —
+ * a base-class default would silently add that bus to every plugin.
  */
 template <typename Derived>
 struct PluginBase

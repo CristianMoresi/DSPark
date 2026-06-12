@@ -70,6 +70,7 @@ struct Plugin
     std::atomic<bool>   bypass { false };
     float bypassMix = 0.0f;
     std::vector<float> dryL, dryR;
+    std::vector<float> silence;   // stand-in sidechain when not connected
 
 #if defined(DSPARK_PLUGIN_WEBVIEW)
     // --- editor state + UI -> host event queue (single producer: main thread;
@@ -239,6 +240,8 @@ struct Plugin
                                            s->shadow[i].load(std::memory_order_relaxed))));
         s->dryL.assign(maxFrames, 0.0f);
         s->dryR.assign(maxFrames, 0.0f);
+        if constexpr (HasSidechain<P>)
+            s->silence.assign(maxFrames, 0.0f);
         s->bypassMix = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
         if constexpr (HasLatency<P>)
             s->cachedLatency = s->user.getLatency();
@@ -293,7 +296,29 @@ struct Plugin
 
         dspark::AudioBufferView<float> view(out, static_cast<int>(nCh),
                                             static_cast<int>(n));
-        s->user.processBlock(view);
+        if constexpr (HasSidechain<P>)
+        {
+            // Input port 1 is the sidechain; pre-allocated silence stands in
+            // when nothing is routed. Treated as read-only by contract.
+            if (n > s->silence.size()) return CLAP_PROCESS_CONTINUE;
+            float* scPtrs[2] = { s->silence.data(), s->silence.data() };
+            if (process->audio_inputs_count >= 2
+                && process->audio_inputs[1].data32 != nullptr)
+            {
+                const auto& scPort = process->audio_inputs[1];
+                const uint32_t scCh = scPort.channel_count < 2
+                                    ? scPort.channel_count : 2;
+                for (uint32_t ch = 0; ch < scCh; ++ch)
+                    if (scPort.data32[ch] != nullptr)
+                        scPtrs[ch] = scPort.data32[ch];
+                if (scCh == 1 && scPort.data32[0] != nullptr)
+                    scPtrs[1] = scPort.data32[0];   // mono key feeds both ears
+            }
+            dspark::AudioBufferView<float> scView(scPtrs, 2, static_cast<int>(n));
+            s->user.processBlock(view, scView);
+        }
+        else
+            s->user.processBlock(view);
 
         const float target = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
         if (s->bypassMix != target || target > 0.0f)
@@ -341,13 +366,26 @@ struct Plugin
 
     // --- ext: audio ports ---------------------------------------------------------
 
-    static uint32_t sPortCount(const clap_plugin_t*, bool) noexcept { return 1; }
+    static uint32_t sPortCount(const clap_plugin_t*, bool isInput) noexcept
+    {
+        return isInput && HasSidechain<P> ? 2 : 1;
+    }
 
-    static bool sPortGet(const clap_plugin_t*, uint32_t index, bool isInput,
+    static bool sPortGet(const clap_plugin_t* p, uint32_t index, bool isInput,
                          clap_audio_port_info_t* info) noexcept
     {
-        if (index != 0 || info == nullptr) return false;
+        if (info == nullptr || index >= sPortCount(p, isInput)) return false;
         std::memset(info, 0, sizeof(*info));
+        if (index == 1)   // the sidechain: routable, never the main pair
+        {
+            info->id = 2;
+            std::snprintf(info->name, sizeof(info->name), "Sidechain");
+            info->flags = 0;
+            info->channel_count = 2;
+            info->port_type = CLAP_PORT_STEREO;
+            info->in_place_pair = CLAP_INVALID_ID;
+            return true;
+        }
         info->id = isInput ? 0 : 1;
         std::snprintf(info->name, sizeof(info->name), "%s",
                       isInput ? "Input" : "Output");

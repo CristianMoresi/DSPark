@@ -236,11 +236,13 @@ struct Plugin
     float bypassMix = 0.0f;
     int cachedLatency = 0;
 
-    AURenderCallbackStruct inputCallback {};
-    AudioUnit inputConnection = nullptr;
-    UInt32 inputConnectionBus = 0;
+    // Input elements: 0 = main, 1 = sidechain (when the class declares one).
+    static constexpr UInt32 kNumInputElements = HasSidechain<P> ? 2 : 1;
+    AURenderCallbackStruct inputCallback[2] {};
+    AudioUnit inputConnection[2] = { nullptr, nullptr };
+    UInt32 inputConnectionBus[2] = { 0, 0 };
 
-    std::vector<float> pullL, pullR, dryL, dryR;
+    std::vector<float> pullL, pullR, dryL, dryR, scL, scR;
 
     // Property listeners (registered/fired on the host's main thread) and
     // the user-preset name AU hosts expect through kAudioUnitProperty_PresentPreset.
@@ -431,6 +433,11 @@ struct Plugin
         pullR.assign(maxFrames, 0.0f);
         dryL.assign(maxFrames, 0.0f);
         dryR.assign(maxFrames, 0.0f);
+        if constexpr (HasSidechain<P>)
+        {
+            scL.assign(maxFrames, 0.0f);
+            scR.assign(maxFrames, 0.0f);
+        }
         bypassMix = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
         if constexpr (HasLatency<P>)
             cachedLatency = user.getLatency();
@@ -572,7 +579,8 @@ struct Plugin
             return noErr;
         case kAudioUnitProperty_ElementCount:
             if (*ioSize < sizeof(UInt32)) return kAudioUnitErr_InvalidPropertyValue;
-            *static_cast<UInt32*>(outData) = 1;
+            *static_cast<UInt32*>(outData) =
+                scope == kAudioUnitScope_Input ? kNumInputElements : 1;
             *ioSize = sizeof(UInt32);
             return noErr;
         case kAudioUnitProperty_SupportedNumChannels:
@@ -757,7 +765,6 @@ struct Plugin
                          AudioUnitElement element, const void* inData,
                          UInt32 inSize) noexcept
     {
-        (void) element;
         switch (id)
         {
         case kAudioUnitProperty_StreamFormat:
@@ -802,20 +809,22 @@ struct Plugin
                          std::memory_order_relaxed);
             return noErr;
         case kAudioUnitProperty_SetRenderCallback:
-            if (scope != kAudioUnitScope_Input || inData == nullptr
-                || inSize < sizeof(AURenderCallbackStruct))
+            if (scope != kAudioUnitScope_Input || element >= kNumInputElements
+                || inData == nullptr || inSize < sizeof(AURenderCallbackStruct))
                 return kAudioUnitErr_InvalidPropertyValue;
-            inputCallback = *static_cast<const AURenderCallbackStruct*>(inData);
-            inputConnection = nullptr;
+            inputCallback[element] = *static_cast<const AURenderCallbackStruct*>(inData);
+            inputConnection[element] = nullptr;
             return noErr;
         case kAudioUnitProperty_MakeConnection:
         {
             if (inData == nullptr || inSize < sizeof(AudioUnitConnection))
                 return kAudioUnitErr_InvalidPropertyValue;
             const auto* c = static_cast<const AudioUnitConnection*>(inData);
-            inputConnection = c->sourceAudioUnit;
-            inputConnectionBus = c->sourceOutputNumber;
-            inputCallback = {};
+            if (c->destInputNumber >= kNumInputElements)
+                return kAudioUnitErr_InvalidPropertyValue;
+            inputConnection[c->destInputNumber] = c->sourceAudioUnit;
+            inputConnectionBus[c->destInputNumber] = c->sourceOutputNumber;
+            inputCallback[c->destInputNumber] = {};
             return noErr;
         }
         case kAudioUnitProperty_ClassInfo:
@@ -883,44 +892,53 @@ struct Plugin
 
     // --- render ----------------------------------------------------------------------
 
+    /** Pulls one input element through its registered callback or connection
+     *  into @p dst (silence when neither is set). On success @p dst may be
+     *  repointed at buffers the source substituted. */
+    OSStatus pullInput(UInt32 element, float* dst[2],
+                       const AudioTimeStamp* timeStamp, UInt32 frames) noexcept
+    {
+        AudioBufferList list;
+        list.mNumberBuffers = 2;
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            list.mBuffers[ch].mNumberChannels = 1;
+            list.mBuffers[ch].mDataByteSize = frames * sizeof(float);
+            list.mBuffers[ch].mData = dst[ch];
+        }
+        OSStatus status = noErr;
+        AudioUnitRenderActionFlags flags = 0;
+        if (inputCallback[element].inputProc != nullptr)
+            status = inputCallback[element].inputProc(
+                inputCallback[element].inputProcRefCon, &flags, timeStamp,
+                element, frames, &list);
+        else if (inputConnection[element] != nullptr)
+            status = AudioUnitRender(inputConnection[element], &flags, timeStamp,
+                                     inputConnectionBus[element], frames, &list);
+        else
+            for (int ch = 0; ch < 2; ++ch)
+                std::memset(dst[ch], 0, frames * sizeof(float));
+        if (status != noErr) return status;
+        for (UInt32 ch = 0; ch < 2 && ch < list.mNumberBuffers; ++ch)
+            if (list.mBuffers[ch].mData != nullptr)
+                dst[ch] = static_cast<float*>(list.mBuffers[ch].mData);
+        return noErr;
+    }
+
     OSStatus render(AudioUnitRenderActionFlags* ioFlags,
                     const AudioTimeStamp* timeStamp, UInt32 busNumber,
                     UInt32 frames, AudioBufferList* ioData) noexcept
     {
+        (void) busNumber;
         if (ioData == nullptr || frames == 0) return noErr;
         if (!initialized) return kAudioUnitErr_Uninitialized;
         if (frames > maxFrames) return kAudioUnitErr_TooManyFramesToProcess;
 
-        // Pull the input through the registered callback or connection into
-        // our own buffers, then process and write to the host's buffers.
+        // Pull the main input through the registered callback or connection
+        // into our own buffers, then process and write to the host's buffers.
         float* pull[2] = { pullL.data(), pullR.data() };
-        AudioBufferList pullList;
-        pullList.mNumberBuffers = 2;
-        for (int ch = 0; ch < 2; ++ch)
-        {
-            pullList.mBuffers[ch].mNumberChannels = 1;
-            pullList.mBuffers[ch].mDataByteSize = frames * sizeof(float);
-            pullList.mBuffers[ch].mData = pull[ch];
-        }
-
-        OSStatus pullStatus = noErr;
-        AudioUnitRenderActionFlags pullFlags = 0;
-        if (inputCallback.inputProc != nullptr)
-            pullStatus = inputCallback.inputProc(inputCallback.inputProcRefCon,
-                                                 &pullFlags, timeStamp, busNumber,
-                                                 frames, &pullList);
-        else if (inputConnection != nullptr)
-            pullStatus = AudioUnitRender(inputConnection, &pullFlags, timeStamp,
-                                         inputConnectionBus, frames, &pullList);
-        else
-            for (int ch = 0; ch < 2; ++ch)
-                std::memset(pull[ch], 0, frames * sizeof(float));
+        const OSStatus pullStatus = pullInput(0, pull, timeStamp, frames);
         if (pullStatus != noErr) return pullStatus;
-
-        // The callback may have substituted its own pointers.
-        for (UInt32 ch = 0; ch < 2 && ch < pullList.mNumberBuffers; ++ch)
-            if (pullList.mBuffers[ch].mData != nullptr)
-                pull[ch] = static_cast<float*>(pullList.mBuffers[ch].mData);
 
         const UInt32 outCh = ioData->mNumberBuffers < 2 ? ioData->mNumberBuffers : 2;
         float* out[2] = { nullptr, nullptr };
@@ -942,7 +960,23 @@ struct Plugin
 
         dspark::AudioBufferView<float> view(out, static_cast<int>(outCh),
                                             static_cast<int>(frames));
-        user.processBlock(view);
+        if constexpr (HasSidechain<P>)
+        {
+            // Input element 1 is the sidechain; a missing or failing source
+            // must never take the main path down — fall back to silence.
+            float* sc[2] = { scL.data(), scR.data() };
+            if (pullInput(1, sc, timeStamp, frames) != noErr)
+            {
+                sc[0] = scL.data();
+                sc[1] = scR.data();
+                std::memset(sc[0], 0, frames * sizeof(float));
+                std::memset(sc[1], 0, frames * sizeof(float));
+            }
+            dspark::AudioBufferView<float> scView(sc, 2, static_cast<int>(frames));
+            user.processBlock(view, scView);
+        }
+        else
+            user.processBlock(view);
 
         const float target = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
         if (bypassMix != target || target > 0.0f)

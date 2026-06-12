@@ -332,7 +332,10 @@ Parameter automation, state save/restore, soft bypass, latency reporting
 and bus negotiation are handled by the layer. The **same binary** is also a
 CLAP plugin (`DSPARK_CLAP_PLUGIN`) and an Audio Unit for Logic Pro
 (`DSPARK_AU_PLUGIN`, validated by Apple's `auval` in CI); presets are
-byte-portable across all three formats by construction.
+byte-portable across all three formats by construction. Need an external
+key input? Implement the two-buffer `processBlock(io, sidechain)` and all
+three formats grow a host-routable **sidechain bus**
+(`examples/plugin_ducker/` is the reference, functionally verified in CI).
 
 For a custom GUI, write it in **plain HTML/CSS/JS**: the WebView editor
 layer embeds it in the host window on every format and platform — WebView2

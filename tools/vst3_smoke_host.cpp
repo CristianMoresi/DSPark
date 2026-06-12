@@ -110,9 +110,14 @@ int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::printf("usage: vst3_smoke_host <module>\n");
+        std::printf("usage: vst3_smoke_host <module> [--expect-sidechain]\n");
         return 2;
     }
+    // Plugins with the two-buffer processBlock announce a sidechain aux bus;
+    // with the flag the smoke also proves the key signal actually reaches
+    // the detector (a hot sidechain must duck the main output).
+    const bool expectSidechain = argc >= 3
+        && std::strcmp(argv[2], "--expect-sidechain") == 0;
 
     ModuleHandle mod = openModule(argv[1]);
     expect(mod != nullptr, "module loads");
@@ -165,14 +170,28 @@ int main(int argc, char** argv)
     auto* ctrl = static_cast<Steinberg_Vst_IEditController*>(rawCtrl);
 
     // --- buses & parameters ----------------------------------------------------
-    expect(comp->lpVtbl->getBusCount(comp, Steinberg_Vst_MediaTypes_kAudio,
-                                     Steinberg_Vst_BusDirections_kInput) == 1,
-           "one audio input bus");
+    const Steinberg_int32 inBusCount = comp->lpVtbl->getBusCount(
+        comp, Steinberg_Vst_MediaTypes_kAudio, Steinberg_Vst_BusDirections_kInput);
+    expect(inBusCount == (expectSidechain ? 2 : 1),
+           expectSidechain ? "main + sidechain input buses" : "one audio input bus");
     Steinberg_Vst_BusInfo bus {};
     expect(comp->lpVtbl->getBusInfo(comp, Steinberg_Vst_MediaTypes_kAudio,
                                     Steinberg_Vst_BusDirections_kOutput, 0, &bus)
                == Steinberg_kResultOk && bus.channelCount == 2,
            "stereo output bus");
+    if (expectSidechain)
+    {
+        Steinberg_Vst_BusInfo aux {};
+        expect(comp->lpVtbl->getBusInfo(comp, Steinberg_Vst_MediaTypes_kAudio,
+                                        Steinberg_Vst_BusDirections_kInput, 1, &aux)
+                   == Steinberg_kResultOk && aux.channelCount == 2
+                   && aux.busType == Steinberg_Vst_BusTypes_kAux,
+               "sidechain bus is a stereo aux bus");
+        expect(comp->lpVtbl->activateBus(comp, Steinberg_Vst_MediaTypes_kAudio,
+                                         Steinberg_Vst_BusDirections_kInput, 1, 1)
+                   == Steinberg_kResultOk,
+               "sidechain bus activates");
+    }
 
     const Steinberg_int32 numParams = ctrl->lpVtbl->getParameterCount(ctrl);
     expect(numParams >= 1, "has parameters");
@@ -212,12 +231,16 @@ int main(int argc, char** argv)
     expect(proc->lpVtbl->setProcessing(proc, 1) == Steinberg_kResultOk, "setProcessing(true)");
 
     std::vector<float> inL(512), inR(512), outL(512), outR(512);
+    std::vector<float> scL(512, 0.0f), scR(512, 0.0f);
     float* inCh[2]  = { inL.data(), inR.data() };
     float* outCh[2] = { outL.data(), outR.data() };
+    float* scCh[2]  = { scL.data(), scR.data() };
 
-    Steinberg_Vst_AudioBusBuffers inBus {};
-    inBus.numChannels = 2;
-    inBus.Steinberg_Vst_AudioBusBuffers_channelBuffers32 = inCh;
+    Steinberg_Vst_AudioBusBuffers inputBuses[2] {};
+    inputBuses[0].numChannels = 2;
+    inputBuses[0].Steinberg_Vst_AudioBusBuffers_channelBuffers32 = inCh;
+    inputBuses[1].numChannels = 2;
+    inputBuses[1].Steinberg_Vst_AudioBusBuffers_channelBuffers32 = scCh;
     Steinberg_Vst_AudioBusBuffers outBusBuf {};
     outBusBuf.numChannels = 2;
     outBusBuf.Steinberg_Vst_AudioBusBuffers_channelBuffers32 = outCh;
@@ -226,36 +249,60 @@ int main(int argc, char** argv)
     data.processMode = 0;
     data.symbolicSampleSize = Steinberg_Vst_SymbolicSampleSizes_kSample32;
     data.numSamples = 512;
-    data.numInputs = 1;
+    data.numInputs = inBusCount;
     data.numOutputs = 1;
-    data.inputs = &inBus;
+    data.inputs = inputBuses;
     data.outputs = &outBusBuf;
 
-    bool finite = true;
-    double energy = 0.0;
+    // Runs the 1 kHz test tone through `blocks` blocks with the sidechain
+    // fed `scLevel` (0 = silent key) and returns the settled output energy.
     int n = 0;
-    for (int block = 0; block < 40; ++block)
-    {
-        for (int i = 0; i < 512; ++i, ++n)
+    bool finite = true;
+    auto runBlocks = [&](int blocks, float scLevel) -> double {
+        double settled = 0.0;
+        for (int block = 0; block < blocks; ++block)
         {
-            inL[static_cast<size_t>(i)] = 0.25f
-                * std::sin(2.0f * 3.14159265f * 1000.0f * static_cast<float>(n) / 48000.0f);
-            inR[static_cast<size_t>(i)] = inL[static_cast<size_t>(i)];
+            for (int i = 0; i < 512; ++i, ++n)
+            {
+                inL[static_cast<size_t>(i)] = 0.25f
+                    * std::sin(2.0f * 3.14159265f * 1000.0f
+                               * static_cast<float>(n) / 48000.0f);
+                inR[static_cast<size_t>(i)] = inL[static_cast<size_t>(i)];
+                const float key = scLevel
+                    * std::sin(2.0f * 3.14159265f * 200.0f
+                               * static_cast<float>(n) / 48000.0f);
+                scL[static_cast<size_t>(i)] = key;
+                scR[static_cast<size_t>(i)] = key;
+            }
+            if (proc->lpVtbl->process(proc, &data) != Steinberg_kResultOk)
+            {
+                expect(false, "process returns kResultOk");
+                break;
+            }
+            for (int i = 0; i < 512; ++i)
+            {
+                const float v = outL[static_cast<size_t>(i)];
+                if (!std::isfinite(v)) finite = false;
+                if (block >= blocks / 2) settled += static_cast<double>(v) * v;
+            }
         }
-        if (proc->lpVtbl->process(proc, &data) != Steinberg_kResultOk)
-        {
-            expect(false, "process returns kResultOk");
-            break;
-        }
-        for (int i = 0; i < 512; ++i)
-        {
-            const float v = outL[static_cast<size_t>(i)];
-            if (!std::isfinite(v)) finite = false;
-            if (block >= 4) energy += static_cast<double>(v) * v;
-        }
-    }
+        return settled;
+    };
+
+    const double energy = runBlocks(40, 0.0f);
     expect(finite, "output stays finite");
     expect(energy > 1e-6, "output carries signal");
+
+    if (expectSidechain)
+    {
+        // The functional proof: a hot key on the aux bus must duck the main
+        // output well below the silent-key level measured above.
+        const double ducked = runBlocks(40, 0.9f);
+        std::printf("      sidechain: open %.3g -> ducked %.3g\n", energy, ducked);
+        expect(finite, "ducked output stays finite");
+        expect(ducked < energy * 0.5, "hot sidechain ducks the main output");
+        runBlocks(20, 0.0f);   // let the detector release before moving on
+    }
 
     // a parameter poke through the controller while "running"
     Steinberg_Vst_ParameterInfo p0 {};

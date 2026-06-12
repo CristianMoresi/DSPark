@@ -121,9 +121,14 @@ int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::printf("usage: clap_smoke_host <module.clap>\n");
+        std::printf("usage: clap_smoke_host <module.clap> [--expect-sidechain]\n");
         return 2;
     }
+    // Plugins with the two-buffer processBlock announce a sidechain port;
+    // with the flag the smoke also proves the key signal actually reaches
+    // the detector (a hot sidechain must duck the main output).
+    const bool expectSidechain = argc >= 3
+        && std::strcmp(argv[2], "--expect-sidechain") == 0;
 
     ModuleHandle mod = openModule(argv[1]);
     expect(mod != nullptr, "module loads");
@@ -153,12 +158,20 @@ int main(int argc, char** argv)
     const auto* ports = static_cast<const clap_plugin_audio_ports_t*>(
         plugin->get_extension(plugin, CLAP_EXT_AUDIO_PORTS));
     expect(ports != nullptr, "audio-ports extension");
+    const uint32_t expectedInPorts = expectSidechain ? 2u : 1u;
     if (ports)
     {
         clap_audio_port_info_t info {};
-        expect(ports->count(plugin, true) == 1 && ports->get(plugin, 0, true, &info)
-                   && info.channel_count == 2,
-               "stereo input port");
+        expect(ports->count(plugin, true) == expectedInPorts
+                   && ports->get(plugin, 0, true, &info) && info.channel_count == 2,
+               expectSidechain ? "main + sidechain input ports" : "stereo input port");
+        if (expectSidechain)
+        {
+            clap_audio_port_info_t aux {};
+            expect(ports->get(plugin, 1, true, &aux) && aux.channel_count == 2
+                       && (aux.flags & CLAP_AUDIO_PORT_IS_MAIN) == 0,
+                   "sidechain port is stereo and not main");
+        }
     }
 
     const auto* params = static_cast<const clap_plugin_params_t*>(
@@ -190,12 +203,16 @@ int main(int argc, char** argv)
     expect(plugin->start_processing(plugin), "start_processing");
 
     std::vector<float> inL(512), inR(512), outL(512), outR(512);
+    std::vector<float> scL(512, 0.0f), scR(512, 0.0f);
     float* inCh[2]  = { inL.data(), inR.data() };
     float* outCh[2] = { outL.data(), outR.data() };
+    float* scCh[2]  = { scL.data(), scR.data() };
 
-    clap_audio_buffer_t inBuf {};
-    inBuf.data32 = inCh;
-    inBuf.channel_count = 2;
+    clap_audio_buffer_t inBufs[2] {};
+    inBufs[0].data32 = inCh;
+    inBufs[0].channel_count = 2;
+    inBufs[1].data32 = scCh;
+    inBufs[1].channel_count = 2;
     clap_audio_buffer_t outBuf {};
     outBuf.data32 = outCh;
     outBuf.channel_count = 2;
@@ -204,52 +221,76 @@ int main(int argc, char** argv)
     clap_process_t proc {};
     proc.steady_time = -1;
     proc.frames_count = 512;
-    proc.audio_inputs = &inBuf;
+    proc.audio_inputs = inBufs;
     proc.audio_outputs = &outBuf;
-    proc.audio_inputs_count = 1;
+    proc.audio_inputs_count = expectedInPorts;
     proc.audio_outputs_count = 1;
     proc.in_events = &events.iface;
     proc.out_events = &kOutEvents;
 
     bool finite = true;
-    double energy = 0.0;
     int n = 0;
-    for (int block = 0; block < 40; ++block)
-    {
-        for (int i = 0; i < 512; ++i, ++n)
+    // Runs the 1 kHz test tone with the sidechain fed `scLevel` (0 = silent
+    // key); fires the mid-run parameter event only on the first pass.
+    auto runBlocks = [&](int blocks, float scLevel, bool fireEvent) -> double {
+        double settled = 0.0;
+        for (int block = 0; block < blocks; ++block)
         {
-            inL[static_cast<size_t>(i)] = 0.25f
-                * std::sin(2.0f * 3.14159265f * 1000.0f * static_cast<float>(n) / 48000.0f);
-            inR[static_cast<size_t>(i)] = inL[static_cast<size_t>(i)];
-        }
-        if (block == 20)   // live parameter event mid-run
-        {
-            events.event = {};
-            events.event.header.size = sizeof(clap_event_param_value_t);
-            events.event.header.time = 0;
-            events.event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
-            events.event.header.type = CLAP_EVENT_PARAM_VALUE;
-            events.event.param_id = p0.id;
-            events.event.value = 0.5 * (p0.min_value + p0.max_value);
-            events.count = 1;
-        }
-        else
-            events.count = 0;
+            for (int i = 0; i < 512; ++i, ++n)
+            {
+                inL[static_cast<size_t>(i)] = 0.25f
+                    * std::sin(2.0f * 3.14159265f * 1000.0f
+                               * static_cast<float>(n) / 48000.0f);
+                inR[static_cast<size_t>(i)] = inL[static_cast<size_t>(i)];
+                const float key = scLevel
+                    * std::sin(2.0f * 3.14159265f * 200.0f
+                               * static_cast<float>(n) / 48000.0f);
+                scL[static_cast<size_t>(i)] = key;
+                scR[static_cast<size_t>(i)] = key;
+            }
+            if (fireEvent && block == 20)   // live parameter event mid-run
+            {
+                events.event = {};
+                events.event.header.size = sizeof(clap_event_param_value_t);
+                events.event.header.time = 0;
+                events.event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+                events.event.header.type = CLAP_EVENT_PARAM_VALUE;
+                events.event.param_id = p0.id;
+                events.event.value = 0.5 * (p0.min_value + p0.max_value);
+                events.count = 1;
+            }
+            else
+                events.count = 0;
 
-        if (plugin->process(plugin, &proc) != CLAP_PROCESS_CONTINUE)
-        {
-            expect(false, "process returns CONTINUE");
-            break;
+            if (plugin->process(plugin, &proc) != CLAP_PROCESS_CONTINUE)
+            {
+                expect(false, "process returns CONTINUE");
+                break;
+            }
+            for (int i = 0; i < 512; ++i)
+            {
+                const float v = outL[static_cast<size_t>(i)];
+                if (!std::isfinite(v)) finite = false;
+                if (block >= blocks / 2) settled += static_cast<double>(v) * v;
+            }
         }
-        for (int i = 0; i < 512; ++i)
-        {
-            const float v = outL[static_cast<size_t>(i)];
-            if (!std::isfinite(v)) finite = false;
-            if (block >= 4) energy += static_cast<double>(v) * v;
-        }
-    }
+        return settled;
+    };
+
+    const double energy = runBlocks(40, 0.0f, true);
     expect(finite, "output stays finite");
     expect(energy > 1e-6, "output carries signal");
+
+    if (expectSidechain)
+    {
+        // The functional proof: a hot key on the sidechain port must duck
+        // the main output well below the silent-key level measured above.
+        const double ducked = runBlocks(40, 0.9f, false);
+        std::printf("      sidechain: open %.3g -> ducked %.3g\n", energy, ducked);
+        expect(finite, "ducked output stays finite");
+        expect(ducked < energy * 0.5, "hot sidechain ducks the main output");
+        runBlocks(20, 0.0f, false);   // let the detector release
+    }
 
     double mid = 0.0;
     expect(params->get_value(plugin, p0.id, &mid), "get_value");

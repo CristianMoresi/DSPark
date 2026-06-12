@@ -133,6 +133,7 @@ struct Plugin
     std::atomic<bool>   bypass { false };
     float bypassMix = 0.0f;            // audio-thread crossfade state
     std::vector<float> dryL, dryR;     // pre-process copy for the bypass blend
+    std::vector<float> silence;        // stand-in sidechain when not connected
 
     Steinberg_Vst_IComponentHandler* handler = nullptr;
 
@@ -270,24 +271,38 @@ struct Plugin
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sSetIoMode(void*, Steinberg_Vst_IoMode)
     { return Steinberg_kResultOk; }
 
-    static Steinberg_int32 SMTG_STDMETHODCALLTYPE sGetBusCount(void*,
-        Steinberg_Vst_MediaType type, Steinberg_Vst_BusDirection)
+    /// Inputs: main stereo, plus a stereo aux bus when the plugin class
+    /// implements the two-buffer (sidechain) processBlock. Output: stereo.
+    static Steinberg_int32 numInputBuses() noexcept
     {
-        return type == Steinberg_Vst_MediaTypes_kAudio ? 1 : 0;
+        return HasSidechain<P> ? 2 : 1;
+    }
+
+    static Steinberg_int32 SMTG_STDMETHODCALLTYPE sGetBusCount(void*,
+        Steinberg_Vst_MediaType type, Steinberg_Vst_BusDirection dir)
+    {
+        if (type != Steinberg_Vst_MediaTypes_kAudio) return 0;
+        return dir == Steinberg_Vst_BusDirections_kInput ? numInputBuses() : 1;
     }
 
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sGetBusInfo(void*,
         Steinberg_Vst_MediaType type, Steinberg_Vst_BusDirection dir,
         Steinberg_int32 index, Steinberg_Vst_BusInfo* bus)
     {
-        if (type != Steinberg_Vst_MediaTypes_kAudio || index != 0 || bus == nullptr)
+        const Steinberg_int32 count =
+            dir == Steinberg_Vst_BusDirections_kInput ? numInputBuses() : 1;
+        if (type != Steinberg_Vst_MediaTypes_kAudio || bus == nullptr
+            || index < 0 || index >= count)
             return Steinberg_kInvalidArgument;
         bus->mediaType = Steinberg_Vst_MediaTypes_kAudio;
         bus->direction = dir;
         bus->channelCount = 2;
-        bus->busType = Steinberg_Vst_BusTypes_kMain;
+        bus->busType = index == 0 ? Steinberg_Vst_BusTypes_kMain
+                                  : Steinberg_Vst_BusTypes_kAux;
         bus->flags = Steinberg_Vst_BusInfo_BusFlags_kDefaultActive;
-        asciiToString128(dir == Steinberg_Vst_BusDirections_kInput ? "Input" : "Output",
+        asciiToString128(index == 1 ? "Sidechain"
+                         : (dir == Steinberg_Vst_BusDirections_kInput ? "Input"
+                                                                      : "Output"),
                          bus->name);
         return Steinberg_kResultOk;
     }
@@ -314,6 +329,8 @@ struct Plugin
             p->applyAllShadows();
             p->dryL.assign(static_cast<size_t>(maxBlock), 0.0f);
             p->dryR.assign(static_cast<size_t>(maxBlock), 0.0f);
+            if constexpr (HasSidechain<P>)
+                p->silence.assign(static_cast<size_t>(maxBlock), 0.0f);
             p->bypassMix = p->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
             if constexpr (HasLatency<P>)
                 p->cachedLatency = p->user.getLatency();
@@ -378,18 +395,24 @@ struct Plugin
         Steinberg_Vst_SpeakerArrangement* inputs, Steinberg_int32 numIns,
         Steinberg_Vst_SpeakerArrangement* outputs, Steinberg_int32 numOuts)
     {
-        if (numIns == 1 && numOuts == 1 && inputs != nullptr && outputs != nullptr
-            && inputs[0] == Steinberg_Vst_SpeakerArr_kStereo
-            && outputs[0] == Steinberg_Vst_SpeakerArr_kStereo)
-            return Steinberg_kResultTrue;
-        return Steinberg_kResultFalse;   // we stay stereo/stereo
+        if (numIns != numInputBuses() || numOuts != 1
+            || inputs == nullptr || outputs == nullptr
+            || outputs[0] != Steinberg_Vst_SpeakerArr_kStereo)
+            return Steinberg_kResultFalse;   // every bus stays stereo
+        for (Steinberg_int32 i = 0; i < numIns; ++i)
+            if (inputs[i] != Steinberg_Vst_SpeakerArr_kStereo)
+                return Steinberg_kResultFalse;
+        return Steinberg_kResultTrue;
     }
 
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sGetBusArrangement(void*,
-        Steinberg_Vst_BusDirection, Steinberg_int32 index,
+        Steinberg_Vst_BusDirection dir, Steinberg_int32 index,
         Steinberg_Vst_SpeakerArrangement* arr)
     {
-        if (index != 0 || arr == nullptr) return Steinberg_kInvalidArgument;
+        const Steinberg_int32 count =
+            dir == Steinberg_Vst_BusDirections_kInput ? numInputBuses() : 1;
+        if (index < 0 || index >= count || arr == nullptr)
+            return Steinberg_kInvalidArgument;
         *arr = Steinberg_Vst_SpeakerArr_kStereo;
         return Steinberg_kResultOk;
     }
@@ -456,7 +479,32 @@ struct Plugin
         }
 
         dspark::AudioBufferView<float> view(out, nCh, n);
-        p->user.processBlock(view);
+        if constexpr (HasSidechain<P>)
+        {
+            // Aux bus 1 is the sidechain; hand the plugin pre-allocated
+            // silence when the host has nothing routed (same frame count,
+            // no branches user-side). Treated as read-only by contract.
+            if (static_cast<size_t>(n) > p->silence.size())
+                return Steinberg_kResultOk;   // oversize block: pass dry through
+            float* scPtrs[2] = { p->silence.data(), p->silence.data() };
+            if (data->numInputs >= 2 && data->inputs != nullptr
+                && data->inputs[1].Steinberg_Vst_AudioBusBuffers_channelBuffers32
+                       != nullptr)
+            {
+                const auto& scBus = data->inputs[1];
+                float** sc = scBus.Steinberg_Vst_AudioBusBuffers_channelBuffers32;
+                const int scCh = scBus.numChannels < 2 ? scBus.numChannels : 2;
+                for (int ch = 0; ch < scCh; ++ch)
+                    if (sc[ch] != nullptr)
+                        scPtrs[ch] = sc[ch];
+                if (scCh == 1 && sc[0] != nullptr)
+                    scPtrs[1] = sc[0];   // mono key feeds both detector ears
+            }
+            dspark::AudioBufferView<float> scView(scPtrs, 2, n);
+            p->user.processBlock(view, scView);
+        }
+        else
+            p->user.processBlock(view);
 
         // Soft bypass: short linear crossfade toward the dry signal.
         const float target = p->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;

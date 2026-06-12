@@ -246,6 +246,19 @@ struct EditorSize
     int height = 320;
 };
 
+/**
+ * @brief How the host may resize the editor window (JUCE-style choices).
+ * Declare `static constexpr EditorResize editorResize = ...;` in the plugin
+ * class; without it the window is Fixed (or Free if the simpler
+ * `editorResizable = true` shorthand is present).
+ */
+enum class EditorResize
+{
+    Fixed,        ///< The window is exactly editorSize; hosts cannot drag-resize it.
+    Free,         ///< Drag-resizable between 0.5x and 3x the declared size.
+    KeepAspect    ///< Drag-resizable, locked to the declared width:height ratio.
+};
+
 /** @brief `static const char* editorHtml()` — the editor page (HTML/CSS/JS),
  *  usually a raw string literal. Required when `hasEditor` is true. */
 template <typename P>
@@ -260,9 +273,33 @@ concept HasEditorSize = requires {
     { P::editorSize.height } -> std::convertible_to<int>;
 };
 
-/** @brief Optional `static constexpr bool editorResizable = true;` (default false). */
+/** @brief Optional `static constexpr bool editorResizable = true;` — shorthand
+ *  for `editorResize = EditorResize::Free` (default: fixed size). */
 template <typename P>
 concept HasEditorResizable = requires { P::editorResizable; } && P::editorResizable;
+
+/** @brief Optional `static constexpr EditorResize editorResize = ...;` —
+ *  full resize policy; takes precedence over `editorResizable`. */
+template <typename P>
+concept HasEditorResize = requires {
+    { P::editorResize } -> std::convertible_to<EditorResize>;
+};
+
+/** @brief The effective resize policy for plugin class @p P. */
+template <typename P>
+constexpr EditorResize editorResizeOf() noexcept
+{
+    if constexpr (HasEditorResize<P>)
+        return P::editorResize;
+    else if constexpr (HasEditorResizable<P>)
+        return EditorResize::Free;
+    else
+        return EditorResize::Fixed;
+}
+
+/** @brief Resize bounds: hosts may shrink to half and grow to 3x the declared size. */
+inline constexpr double kEditorMinSizeFactor = 0.5;
+inline constexpr double kEditorMaxSizeFactor = 3.0;
 
 /** @brief Optional `static constexpr bool editorDebug = true;` — enables the
  *  browser DevTools in the editor (WebView2; development builds only). */

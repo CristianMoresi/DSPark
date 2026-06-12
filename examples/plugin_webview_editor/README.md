@@ -9,7 +9,7 @@ What it demonstrates:
 
 | Piece | Where |
 |---|---|
-| Declaring an editor | `hasEditor` / `editorSize` / `editorResizable` / `editorHtml()` |
+| Declaring an editor | `hasEditor` / `editorSize` / `editorResize` (Fixed, Free or KeepAspect) / `editorHtml()` |
 | Initial sync | `dspark.onReady(params)` — parameter table + current values |
 | UI -> DSP | `dspark.setParam(id, plainValue)` from drag / wheel / select |
 | Automation gestures | `dspark.beginEdit` / `dspark.endEdit` around drags (host undo) |

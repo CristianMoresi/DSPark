@@ -153,11 +153,25 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    // Report the monitor's content scale exactly like a DPI-aware DAW does,
+    // so HiDPI sizing bugs reproduce here instead of only inside a host.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const float contentScale = static_cast<float>(GetDpiForSystem()) / 96.0f;
+    void* rawScale = nullptr;
+    if (view->lpVtbl->queryInterface(view, Steinberg_IPlugViewContentScaleSupport_iid,
+                                     &rawScale) == Steinberg_kResultOk && rawScale != nullptr)
+    {
+        auto* scaleSupport = static_cast<Steinberg_IPlugViewContentScaleSupport*>(rawScale);
+        scaleSupport->lpVtbl->setContentScaleFactor(scaleSupport, contentScale);
+        scaleSupport->lpVtbl->release(scaleSupport);
+        std::printf("content scale: %.2f\n", contentScale);
+    }
+
     Steinberg_ViewRect rect {};
     view->lpVtbl->getSize(view, &rect);
     const int width  = rect.right - rect.left;
     const int height = rect.bottom - rect.top;
-    std::printf("editor: %d x %d\n", width, height);
+    std::printf("editor: %d x %d (physical)\n", width, height);
 
     WNDCLASSW wc {};
     wc.lpfnWndProc = &wndProc;

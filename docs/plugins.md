@@ -103,7 +103,7 @@ virtual; nothing else is required.**
 | `double getTailSeconds() const` | VST3 `getTailSamples`, CLAP `clap.tail` | sound continues after input stops: reverbs, delays. Hosts keep processing your plugin that long after audio ends instead of cutting the tail. |
 | `void reset() noexcept` | CLAP `reset` | you keep history that should clear on transport jumps (delay lines, envelopes). VST3 has no direct equivalent — hosts re-activate instead, which re-runs `prepare()`. |
 | `std::vector<uint8_t> getState() const` + `bool setState(const uint8_t*, size_t)` | VST3 `IComponent::get/setState`, CLAP `clap.state` (extra section) | you have state **beyond the parameters**: learned noise profiles, loaded IRs, editor layout. The wrapper *always* saves/restores your parameter values by itself — most plugins need neither method. DSPark's `StateBlob` is the natural serializer here. |
-| `static constexpr bool hasEditor` | VST3 `createView`, CLAP `clap.gui` | a custom GUI written in HTML/CSS/JS: pair it with `editorHtml()` (+ optional `editorSize`, `editorResizable`, `editorDebug`) and include the WebView editor layer first. While false/absent, hosts show their generic parameter UI — fully usable. See "Custom UIs" below. |
+| `static constexpr bool hasEditor` | VST3 `createView`, CLAP `clap.gui` | a custom GUI written in HTML/CSS/JS: pair it with `editorHtml()` (+ optional `editorSize`, `editorResize`, `editorDebug`) and include the WebView editor layer first. While false/absent, hosts show their generic parameter UI — fully usable. See "Custom UIs" below. |
 
 ### What the wrappers handle so you don't have to
 
@@ -147,7 +147,8 @@ struct MyPlugin
     // ... descriptor / parameters / prepare / setParameter / processBlock ...
     static constexpr bool hasEditor = true;
     static constexpr dspark::plugin::EditorSize editorSize { 560, 330 };  // logical px
-    static constexpr bool editorResizable = true;     // optional (default false)
+    static constexpr auto editorResize =              // optional (default Fixed)
+        dspark::plugin::EditorResize::KeepAspect;     // Fixed | Free | KeepAspect
     // static constexpr bool editorDebug = true;      // optional: browser DevTools
     static const char* editorHtml() { return R"html(<!doctype html>...)html"; }
 };
@@ -188,6 +189,24 @@ thread; when the host hides the page, the browser throttles the timer by
 itself. All editor callbacks run on the host's main/UI thread and funnel
 into your `setParameter` — atomic and smoothed by contract, so a drag is
 click-free by construction.
+
+### Sizing, resize and HiDPI
+
+`editorSize` is declared in **logical pixels**; the wrapper converts to the
+physical pixels VST3/CLAP negotiate in using the host-reported content
+scale. The page itself never zooms — the web engine already maps CSS pixels
+through the window's DPI — so your CSS works in logical units everywhere.
+On attach the editor fits the box the host actually built (hosts differ in
+call order during HiDPI negotiation), and `EditorResize` picks the policy:
+
+| `editorResize` | Host behaviour |
+|---|---|
+| `Fixed` (default) | the window is exactly `editorSize`; no drag-resize |
+| `Free` | drag-resizable between 0.5x and 3x the declared size |
+| `KeepAspect` | drag-resizable, locked to the declared width:height ratio |
+
+Make the page fluid (flexbox/grid, percentage sizes) and any of the three
+modes looks right; `examples/plugin_webview_editor/` uses `KeepAspect`.
 
 ### Developing a UI
 

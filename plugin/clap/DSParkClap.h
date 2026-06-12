@@ -604,14 +604,13 @@ struct Plugin
 #else
         auto* s = self(p);
         if (scale <= 0.0) return false;
+        // Only the physical-size negotiation changes; the page itself never
+        // zooms (the web engine applies the window DPI to CSS pixels itself).
+        const double previous = s->guiScale;
         s->guiScale = scale;
-        if (!s->guiEditor.created())
-        {
-            const EditorSize logical = editorSizeOf<P>();
-            s->guiWidth  = static_cast<int>(logical.width * scale + 0.5);
-            s->guiHeight = static_cast<int>(logical.height * scale + 0.5);
-        }
-        s->guiEditor.setScale(scale);
+        s->guiWidth  = static_cast<int>(s->guiWidth * (scale / previous) + 0.5);
+        s->guiHeight = static_cast<int>(s->guiHeight * (scale / previous) + 0.5);
+        s->guiEditor.setBounds(s->guiWidth, s->guiHeight);
         return true;
 #endif
     }
@@ -628,18 +627,20 @@ struct Plugin
 
     static bool sGuiCanResize(const clap_plugin_t*) noexcept
     {
-        return HasEditorResizable<P>;
+        return editorResizeOf<P>() != EditorResize::Fixed;
     }
 
     static bool sGuiGetResizeHints(const clap_plugin_t*,
                                    clap_gui_resize_hints_t* hints) noexcept
     {
         if (hints == nullptr) return false;
-        hints->can_resize_horizontally = HasEditorResizable<P>;
-        hints->can_resize_vertically = HasEditorResizable<P>;
-        hints->preserve_aspect_ratio = false;
-        hints->aspect_ratio_width = 1;
-        hints->aspect_ratio_height = 1;
+        constexpr EditorResize mode = editorResizeOf<P>();
+        const EditorSize logical = editorSizeOf<P>();
+        hints->can_resize_horizontally = mode != EditorResize::Fixed;
+        hints->can_resize_vertically = mode != EditorResize::Fixed;
+        hints->preserve_aspect_ratio = mode == EditorResize::KeepAspect;
+        hints->aspect_ratio_width = static_cast<uint32_t>(logical.width);
+        hints->aspect_ratio_height = static_cast<uint32_t>(logical.height);
         return true;
     }
 
@@ -649,17 +650,26 @@ struct Plugin
         auto* s = self(p);
         if (width == nullptr || height == nullptr) return false;
         const EditorSize logical = editorSizeOf<P>();
-        if constexpr (HasEditorResizable<P>)
-        {
-            const auto minW = static_cast<uint32_t>(logical.width * s->guiScale / 2.0);
-            const auto minH = static_cast<uint32_t>(logical.height * s->guiScale / 2.0);
-            if (*width < minW) *width = minW;
-            if (*height < minH) *height = minH;
-        }
-        else
+        constexpr EditorResize mode = editorResizeOf<P>();
+        if constexpr (mode == EditorResize::Fixed)
         {
             *width  = static_cast<uint32_t>(logical.width * s->guiScale + 0.5);
             *height = static_cast<uint32_t>(logical.height * s->guiScale + 0.5);
+        }
+        else
+        {
+            const double minW = logical.width * s->guiScale * kEditorMinSizeFactor;
+            const double maxW = logical.width * s->guiScale * kEditorMaxSizeFactor;
+            const double minH = logical.height * s->guiScale * kEditorMinSizeFactor;
+            const double maxH = logical.height * s->guiScale * kEditorMaxSizeFactor;
+            double w = *width;
+            double h = *height;
+            w = w < minW ? minW : (w > maxW ? maxW : w);
+            h = h < minH ? minH : (h > maxH ? maxH : h);
+            if constexpr (mode == EditorResize::KeepAspect)
+                h = w * logical.height / logical.width;
+            *width  = static_cast<uint32_t>(w + 0.5);
+            *height = static_cast<uint32_t>(h + 0.5);
         }
         return true;
     }
@@ -683,9 +693,16 @@ struct Plugin
         const webview_ui::HostCallbacks callbacks {
             s, &cbGuiSetParam, &cbGuiBeginEdit, &cbGuiEndEdit
         };
-        s->guiEditor.setScale(s->guiScale);
         if (!s->guiEditor.create(window->ptr, s->shadow, callbacks))
             return false;
+        // Fill whatever box the host actually built (call order differs
+        // between hosts); fall back to the negotiated size otherwise.
+        int parentW = 0, parentH = 0;
+        if (s->guiEditor.queryParentSize(parentW, parentH))
+        {
+            s->guiWidth  = parentW;
+            s->guiHeight = parentH;
+        }
         s->guiEditor.setBounds(s->guiWidth, s->guiHeight);
         return true;
     }

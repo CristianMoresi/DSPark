@@ -321,7 +321,6 @@ inline bool parsePostArgs(const char* s, PostArgs& out) noexcept
 inline constexpr const char* kBridgeJs =
     "(function(){'use strict';"
     "if(window.dspark){return;}"
-    "if(window.__dsparkScale){document.documentElement.style.zoom=window.__dsparkScale;}"
     "var ls={},vals={},meta=null,readyCbs=[];"
     "function fire(id,v){var c=ls[id];if(c){for(var i=0;i<c.length;i++){c[i](v);}}}"
     "window.__dsparkRecv=function(m){"
@@ -501,6 +500,7 @@ public:
         if (created_ || parentWindow == nullptr) return false;
         shadows_ = shadows;
         host_ = host;
+        parent_ = parentWindow;
         created_ = createPlatform(parentWindow);
         return created_;
     }
@@ -528,20 +528,19 @@ public:
     }
 
     /**
-     * Applies the host's content scale: the native box is expected in
-     * physical pixels and the page is zoomed to match, so CSS keeps working
-     * in logical units. No-op platforms (macOS) simply never call this.
+     * Reads the CURRENT size of the host window we are embedded in
+     * (physical pixels on Windows). Lets the backends fit the page to
+     * whatever box the host actually created, even when its negotiation
+     * calls arrived in an unexpected order. Returns false where the parent
+     * cannot be queried (then the negotiated size is used as-is).
+     *
+     * Note on DPI: the web engine applies the window's scale factor itself
+     * (CSS pixels are device-independent), so the page never needs zooming —
+     * the wrapper only converts logical <-> physical for host negotiation.
      */
-    void setScale(double scale) noexcept
+    bool queryParentSize(int& width, int& height) const noexcept
     {
-        scale_ = scale > 0.0 ? scale : 1.0;
-        if (created_)
-        {
-            std::string js = "document.documentElement.style.zoom=";
-            appendJsonNumber(js, scale_);
-            js += ";";
-            evalPlatform(js);
-        }
+        return queryParentSizePlatform(width, height);
     }
 
     [[nodiscard]] bool created() const noexcept { return created_; }
@@ -551,8 +550,8 @@ private:
 
     std::atomic<double> const* shadows_ = nullptr;
     HostCallbacks host_ {};
-    bool   created_ = false;
-    double scale_ = 1.0;
+    void* parent_ = nullptr;
+    bool  created_ = false;
 
     static int indexOfId(const char* id) noexcept
     {
@@ -680,13 +679,6 @@ private:
                 handlePost(request.c_str());
                 return std::string {};
             });
-            if (scale_ != 1.0)
-            {
-                std::string preset = "window.__dsparkScale=";
-                appendJsonNumber(preset, scale_);
-                preset += ";";
-                wv_->init(preset);
-            }
             wv_->init(kBridgeJs);
             wv_->set_html(P::editorHtml());
             return true;
@@ -732,6 +724,17 @@ private:
                 ShowWindow(static_cast<HWND>(widget.value()), visible ? SW_SHOW : SW_HIDE);
         }
         catch (...) {}
+    }
+
+    bool queryParentSizePlatform(int& width, int& height) const noexcept
+    {
+        RECT rect {};
+        if (parent_ == nullptr || !GetClientRect(static_cast<HWND>(parent_), &rect))
+            return false;
+        if (rect.right <= 0 || rect.bottom <= 0) return false;
+        width  = static_cast<int>(rect.right);
+        height = static_cast<int>(rect.bottom);
+        return true;
     }
 
     void evalPlatform(const std::string& js) noexcept
@@ -845,6 +848,13 @@ private:
                               static_cast<signed char>(visible ? 0 : 1));
     }
 
+    bool queryParentSizePlatform(int&, int&) const noexcept
+    {
+        // Cocoa views are logical-size and the autoresizing mask follows the
+        // host view, so the negotiated size is already authoritative here.
+        return false;
+    }
+
     void evalPlatform(const std::string& js) noexcept
     {
         if (webView_ != nullptr)
@@ -862,6 +872,7 @@ private:
     void destroyPlatform() noexcept {}
     void setBoundsPlatform(int, int) noexcept {}
     void setVisiblePlatform(bool) noexcept {}
+    bool queryParentSizePlatform(int&, int&) const noexcept { return false; }
     void evalPlatform(const std::string&) noexcept {}
 
 #endif

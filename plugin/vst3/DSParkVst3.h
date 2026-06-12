@@ -850,12 +850,20 @@ struct View
         if (sIsPlatformTypeSupported(self_, type) != Steinberg_kResultTrue
             || parent == nullptr)
             return Steinberg_kResultFalse;
-        view->editor.setScale(view->scale);
         const webview_ui::HostCallbacks callbacks {
             view, &cbSetParam, &cbBeginEdit, &cbEndEdit
         };
         if (!view->editor.create(parent, view->owner->shadow, callbacks))
             return Steinberg_kResultFalse;
+        // Fill the box the host ACTUALLY built — hosts differ in whether
+        // getSize/setContentScaleFactor/attached arrive in spec order, so the
+        // parent's real client size wins over the negotiated one.
+        int parentW = 0, parentH = 0;
+        if (view->editor.queryParentSize(parentW, parentH))
+        {
+            view->width  = parentW;
+            view->height = parentH;
+        }
         view->editor.setBounds(view->width, view->height);
         view->editor.setVisible(true);
         return Steinberg_kResultOk;
@@ -920,7 +928,8 @@ struct View
 
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sCanResize(void*)
     {
-        return HasEditorResizable<P> ? Steinberg_kResultTrue : Steinberg_kResultFalse;
+        return editorResizeOf<P>() != EditorResize::Fixed ? Steinberg_kResultTrue
+                                                          : Steinberg_kResultFalse;
     }
 
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sCheckSizeConstraint(void* self_,
@@ -929,18 +938,31 @@ struct View
         auto* view = fromLens(self_, 0);
         if (rect == nullptr) return Steinberg_kInvalidArgument;
         const EditorSize logical = editorSizeOf<P>();
-        if constexpr (HasEditorResizable<P>)
+        constexpr EditorResize mode = editorResizeOf<P>();
+        if constexpr (mode == EditorResize::Fixed)
         {
-            // Accept anything down to half the declared size (scaled).
-            const auto minW = static_cast<Steinberg_int32>(logical.width * view->scale / 2.0);
-            const auto minH = static_cast<Steinberg_int32>(logical.height * view->scale / 2.0);
-            if (rect->right - rect->left < minW) rect->right = rect->left + minW;
-            if (rect->bottom - rect->top < minH) rect->bottom = rect->top + minH;
+            rect->right  = rect->left + static_cast<Steinberg_int32>(
+                logical.width * view->scale + 0.5);
+            rect->bottom = rect->top + static_cast<Steinberg_int32>(
+                logical.height * view->scale + 0.5);
         }
         else
         {
-            rect->right  = rect->left + static_cast<Steinberg_int32>(logical.width * view->scale);
-            rect->bottom = rect->top + static_cast<Steinberg_int32>(logical.height * view->scale);
+            const double minW = logical.width * view->scale * kEditorMinSizeFactor;
+            const double maxW = logical.width * view->scale * kEditorMaxSizeFactor;
+            const double minH = logical.height * view->scale * kEditorMinSizeFactor;
+            const double maxH = logical.height * view->scale * kEditorMaxSizeFactor;
+            double w = rect->right - rect->left;
+            double h = rect->bottom - rect->top;
+            w = w < minW ? minW : (w > maxW ? maxW : w);
+            h = h < minH ? minH : (h > maxH ? maxH : h);
+            if constexpr (mode == EditorResize::KeepAspect)
+            {
+                // The proposed width drives; height follows the declared ratio.
+                h = w * logical.height / logical.width;
+            }
+            rect->right  = rect->left + static_cast<Steinberg_int32>(w + 0.5);
+            rect->bottom = rect->top + static_cast<Steinberg_int32>(h + 0.5);
         }
         return Steinberg_kResultTrue;
     }
@@ -960,15 +982,20 @@ struct View
     {
         auto* view = fromLens(self_, 1);
         if (factor <= 0.0f) return Steinberg_kInvalidArgument;
+        const double previous = view->scale;
         view->scale = factor;
-        if (!view->editor.created())
+        // Rescale the negotiated physical size (the page itself never zooms:
+        // the web engine applies the window DPI to CSS pixels on its own).
+        view->width  = static_cast<int>(view->width * (view->scale / previous) + 0.5);
+        view->height = static_cast<int>(view->height * (view->scale / previous) + 0.5);
+        if (view->editor.created() && view->frame != nullptr)
         {
-            // Not attached yet: scale the size the host is about to query.
-            const EditorSize logical = editorSizeOf<P>();
-            view->width  = static_cast<int>(logical.width * view->scale + 0.5);
-            view->height = static_cast<int>(logical.height * view->scale + 0.5);
+            // Already on screen (e.g. dragged to another monitor): ask the
+            // host to rebuild the window at the new physical size.
+            Steinberg_ViewRect rect { 0, 0, view->width, view->height };
+            view->frame->lpVtbl->resizeView(view->frame,
+                reinterpret_cast<Steinberg_IPlugView*>(view->lensPtr(0)), &rect);
         }
-        view->editor.setScale(view->scale);
         return Steinberg_kResultOk;
     }
 

@@ -76,7 +76,8 @@ struct DSParkWebSaturator
 
     static constexpr bool hasEditor = true;
     static constexpr dspark::plugin::EditorSize editorSize { 560, 330 };
-    static constexpr bool editorResizable = true;
+    // Resize policy: Fixed (default), Free, or KeepAspect (proportional).
+    static constexpr auto editorResize = dspark::plugin::EditorResize::KeepAspect;
     // static constexpr bool editorDebug = true;   // uncomment for DevTools (F12)
 
     static const char* editorHtml();

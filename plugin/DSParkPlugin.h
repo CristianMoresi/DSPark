@@ -301,10 +301,57 @@ constexpr EditorResize editorResizeOf() noexcept
 inline constexpr double kEditorMinSizeFactor = 0.5;
 inline constexpr double kEditorMaxSizeFactor = 3.0;
 
+/**
+ * @brief Applies the resize policy of @p P to a size the host proposes:
+ * Fixed pins it, Free clamps each axis to the 0.5x..3x window, KeepAspect
+ * fits the declared ratio INSIDE the proposal — never exceeding it on
+ * either axis. That last property is essential: hosts size the plugin area
+ * inside a window the user controls, so answering "larger" on any axis
+ * pushes the plugin outside its own window (clipped bottom in REAPER).
+ */
+template <typename P>
+constexpr void constrainEditorSize(double& width, double& height, double scale) noexcept
+{
+    const EditorSize logical = editorSizeOf<P>();
+    constexpr EditorResize mode = editorResizeOf<P>();
+    if constexpr (mode == EditorResize::Fixed)
+    {
+        width  = logical.width * scale;
+        height = logical.height * scale;
+    }
+    else
+    {
+        const double minW = logical.width * scale * kEditorMinSizeFactor;
+        const double maxW = logical.width * scale * kEditorMaxSizeFactor;
+        const double minH = logical.height * scale * kEditorMinSizeFactor;
+        const double maxH = logical.height * scale * kEditorMaxSizeFactor;
+        width  = width < minW ? minW : (width > maxW ? maxW : width);
+        height = height < minH ? minH : (height > maxH ? maxH : height);
+        if constexpr (mode == EditorResize::KeepAspect)
+        {
+            const double ratio = static_cast<double>(logical.width) / logical.height;
+            double fitW = width;
+            if (height * ratio < fitW) fitW = height * ratio;   // inside-fit
+            fitW   = fitW < minW ? minW : (fitW > maxW ? maxW : fitW);
+            width  = fitW;
+            height = fitW / ratio;
+        }
+    }
+}
+
 /** @brief Optional `static constexpr bool editorDebug = true;` — enables the
  *  browser DevTools in the editor (WebView2; development builds only). */
 template <typename P>
 concept HasEditorDebug = requires { P::editorDebug; } && P::editorDebug;
+
+/** @brief Optional `static const char* editorDevFile()` — absolute path of an
+ *  HTML file to load INSTEAD of editorHtml() while developing: edit the file,
+ *  reopen the editor, no recompile. Falls back to editorHtml() when the file
+ *  is missing, so the same build still works elsewhere. Strip from releases. */
+template <typename P>
+concept HasEditorDevFile = requires {
+    { P::editorDevFile() } -> std::convertible_to<const char*>;
+};
 
 /** @brief The declared (logical) editor size, or the 480x320 default. */
 template <typename P>

@@ -715,6 +715,7 @@ struct View
     int width;                 // current physical size (host units)
     int height;
     double scale = 1.0;
+    bool correctingSize = false;   // re-entrancy guard for resizeView round-trips
     bool editActive[kNumParams == 0 ? 1 : kNumParams] {};
 
     explicit View(Plugin<P>* plugin) noexcept : owner(plugin)
@@ -847,6 +848,9 @@ struct View
                                                               Steinberg_FIDString type)
     {
         auto* view = fromLens(self_, 0);
+        webview_ui::debugLog("vst3 attached(parent=%p type=%s) negotiated=%dx%d scale=%.2f",
+                             parent, type != nullptr ? type : "?",
+                             view->width, view->height, view->scale);
         if (sIsPlatformTypeSupported(self_, type) != Steinberg_kResultTrue
             || parent == nullptr)
             return Steinberg_kResultFalse;
@@ -895,6 +899,7 @@ struct View
         size->top = 0;
         size->right = view->width;
         size->bottom = view->height;
+        webview_ui::debugLog("vst3 getSize -> %dx%d", view->width, view->height);
         return Steinberg_kResultOk;
     }
 
@@ -903,9 +908,31 @@ struct View
     {
         auto* view = fromLens(self_, 0);
         if (newSize == nullptr) return Steinberg_kInvalidArgument;
-        view->width  = newSize->right - newSize->left;
-        view->height = newSize->bottom - newSize->top;
+        const double proposedW = newSize->right - newSize->left;
+        const double proposedH = newSize->bottom - newSize->top;
+        double w = proposedW;
+        double h = proposedH;
+        // Enforce the resize policy HERE, not only in checkSizeConstraint:
+        // some hosts drag-resize freely and only report the result. When the
+        // host overshot, apply the constrained size and ask it to follow.
+        if (!view->correctingSize)
+            constrainEditorSize<P>(w, h, view->scale);
+        webview_ui::debugLog("vst3 onSize %.0fx%.0f -> %.0fx%.0f%s",
+                             proposedW, proposedH, w, h,
+                             view->correctingSize ? " (correction round-trip)" : "");
+        view->width  = static_cast<int>(w + 0.5);
+        view->height = static_cast<int>(h + 0.5);
         view->editor.setBounds(view->width, view->height);
+        if (!view->correctingSize && view->frame != nullptr
+            && (view->width - proposedW > 1.0 || proposedW - view->width > 1.0
+                || view->height - proposedH > 1.0 || proposedH - view->height > 1.0))
+        {
+            view->correctingSize = true;
+            Steinberg_ViewRect corrected { 0, 0, view->width, view->height };
+            view->frame->lpVtbl->resizeView(view->frame,
+                reinterpret_cast<Steinberg_IPlugView*>(view->lensPtr(0)), &corrected);
+            view->correctingSize = false;
+        }
         return Steinberg_kResultOk;
     }
 
@@ -937,33 +964,15 @@ struct View
     {
         auto* view = fromLens(self_, 0);
         if (rect == nullptr) return Steinberg_kInvalidArgument;
-        const EditorSize logical = editorSizeOf<P>();
-        constexpr EditorResize mode = editorResizeOf<P>();
-        if constexpr (mode == EditorResize::Fixed)
-        {
-            rect->right  = rect->left + static_cast<Steinberg_int32>(
-                logical.width * view->scale + 0.5);
-            rect->bottom = rect->top + static_cast<Steinberg_int32>(
-                logical.height * view->scale + 0.5);
-        }
-        else
-        {
-            const double minW = logical.width * view->scale * kEditorMinSizeFactor;
-            const double maxW = logical.width * view->scale * kEditorMaxSizeFactor;
-            const double minH = logical.height * view->scale * kEditorMinSizeFactor;
-            const double maxH = logical.height * view->scale * kEditorMaxSizeFactor;
-            double w = rect->right - rect->left;
-            double h = rect->bottom - rect->top;
-            w = w < minW ? minW : (w > maxW ? maxW : w);
-            h = h < minH ? minH : (h > maxH ? maxH : h);
-            if constexpr (mode == EditorResize::KeepAspect)
-            {
-                // The proposed width drives; height follows the declared ratio.
-                h = w * logical.height / logical.width;
-            }
-            rect->right  = rect->left + static_cast<Steinberg_int32>(w + 0.5);
-            rect->bottom = rect->top + static_cast<Steinberg_int32>(h + 0.5);
-        }
+        const double proposedW = rect->right - rect->left;
+        const double proposedH = rect->bottom - rect->top;
+        double w = proposedW;
+        double h = proposedH;
+        constrainEditorSize<P>(w, h, view->scale);
+        rect->right  = rect->left + static_cast<Steinberg_int32>(w + 0.5);
+        rect->bottom = rect->top + static_cast<Steinberg_int32>(h + 0.5);
+        webview_ui::debugLog("vst3 checkSizeConstraint %.0fx%.0f -> %.0fx%.0f",
+                             proposedW, proposedH, w, h);
         return Steinberg_kResultTrue;
     }
 
@@ -984,6 +993,8 @@ struct View
         if (factor <= 0.0f) return Steinberg_kInvalidArgument;
         const double previous = view->scale;
         view->scale = factor;
+        webview_ui::debugLog("vst3 setContentScaleFactor %.2f (was %.2f)",
+                             view->scale, previous);
         // Rescale the negotiated physical size (the page itself never zooms:
         // the web engine applies the window DPI to CSS pixels on its own).
         view->width  = static_cast<int>(view->width * (view->scale / previous) + 0.5);

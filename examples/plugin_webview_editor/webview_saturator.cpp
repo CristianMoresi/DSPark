@@ -102,6 +102,7 @@ const char* DSParkWebSaturator::editorHtml()
   * { margin:0; padding:0; box-sizing:border-box; user-select:none;
       -webkit-user-select:none; cursor:default; }
   html,body { width:100%; height:100%; overflow:hidden; }
+  html { background:#0c0e12; }   /* letterbox color when the host distorts the ratio */
   body { background:radial-gradient(120% 140% at 50% 0%, var(--bg0), var(--bg1));
          color:var(--text); display:flex; flex-direction:column;
          font:13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }

@@ -82,6 +82,40 @@ struct LoggingHandler
 };
 
 Steinberg_IPlugView* g_view = nullptr;
+DWORD g_windowStyle = 0;
+
+// -- minimal IPlugFrame: honours plugin-requested resizes like a DAW ---------------
+
+struct HostFrame
+{
+    const Steinberg_IPlugFrameVtbl* vtbl;
+    HWND hwnd = nullptr;
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void* self_, const Steinberg_TUID,
+                                                      void** obj)
+    { if (obj) *obj = self_; return Steinberg_kResultOk; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE ar(void*)  { return 100; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE rel(void*) { return 100; }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE resizeView(void* self_,
+        Steinberg_IPlugView*, Steinberg_ViewRect* newSize)
+    {
+        auto* frame = static_cast<HostFrame*>(self_);
+        if (newSize == nullptr || frame->hwnd == nullptr)
+            return Steinberg_kInvalidArgument;
+        std::printf("  host: resizeView %dx%d (plugin-corrected)\n",
+                    newSize->right - newSize->left, newSize->bottom - newSize->top);
+        RECT outer { 0, 0, newSize->right - newSize->left,
+                     newSize->bottom - newSize->top };
+        AdjustWindowRect(&outer, g_windowStyle, FALSE);
+        SetWindowPos(frame->hwnd, nullptr, 0, 0, outer.right - outer.left,
+                     outer.bottom - outer.top, SWP_NOMOVE | SWP_NOZORDER);
+        return Steinberg_kResultOk;
+    }
+
+    inline static const Steinberg_IPlugFrameVtbl kVtbl = { &q, &ar, &rel, &resizeView };
+    HostFrame() : vtbl(&kVtbl) {}
+};
 
 LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -182,6 +216,7 @@ int main(int argc, char** argv)
 
     const DWORD style = view->lpVtbl->canResize(view) == Steinberg_kResultTrue
                       ? WS_OVERLAPPEDWINDOW : (WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX));
+    g_windowStyle = style;
     RECT frame { 0, 0, width, height };
     AdjustWindowRect(&frame, style, FALSE);
     HWND hwnd = CreateWindowW(L"DSParkEditorHost", L"DSPark editor host", style,
@@ -189,6 +224,10 @@ int main(int argc, char** argv)
                               frame.right - frame.left, frame.bottom - frame.top,
                               nullptr, nullptr, wc.hInstance, nullptr);
     if (hwnd == nullptr) { std::printf("FAIL CreateWindow\n"); return 1; }
+
+    HostFrame plugFrame;
+    plugFrame.hwnd = hwnd;
+    view->lpVtbl->setFrame(view, reinterpret_cast<Steinberg_IPlugFrame*>(&plugFrame));
 
     if (view->lpVtbl->attached(view, hwnd, "HWND") != Steinberg_kResultOk)
     {
@@ -204,6 +243,108 @@ int main(int argc, char** argv)
     g_view = view;
 
     ShowWindow(hwnd, SW_SHOW);
+
+    // Self-test: resize the window programmatically and verify the embedded
+    // web widget follows the client area — the exact chain DAW resizes use.
+    auto pumpFor = [](DWORD ms)
+    {
+        const ULONGLONG until = GetTickCount64() + ms;
+        MSG m;
+        while (GetTickCount64() < until)
+        {
+            while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+            Sleep(10);
+        }
+    };
+    pumpFor(1200);
+    auto widgetFillsClient = [hwnd](const char* label) -> bool
+    {
+        RECT client {};
+        GetClientRect(hwnd, &client);
+        HWND widget = GetWindow(hwnd, GW_CHILD);
+        if (widget == nullptr)
+        {
+            std::printf("%s: FAIL (no child widget found)\n", label);
+            return false;
+        }
+        RECT box {};
+        GetWindowRect(widget, &box);
+        MapWindowPoints(HWND_DESKTOP, hwnd, reinterpret_cast<POINT*>(&box), 2);
+        const bool fits = (box.right - box.left) == client.right
+                       && (box.bottom - box.top) == client.bottom;
+        std::printf("%s: %s (widget %ldx%ld in client %ldx%ld)\n", label,
+                    fits ? "PASS" : "FAIL", box.right - box.left,
+                    box.bottom - box.top, client.right, client.bottom);
+        return fits;
+    };
+
+    // Grow 1.4x: the widget must follow the client box.
+    RECT outer {};
+    GetWindowRect(hwnd, &outer);
+    SetWindowPos(hwnd, nullptr, 0, 0, (outer.right - outer.left) * 14 / 10,
+                 (outer.bottom - outer.top) * 14 / 10, SWP_NOMOVE | SWP_NOZORDER);
+    pumpFor(600);
+    bool widgetFollows = widgetFillsClient("resize follow (grow)");
+
+    // Shrink way below the minimum: the plugin must push back through
+    // IPlugFrame::resizeView and the window must settle at its size floor.
+    SetWindowPos(hwnd, nullptr, 0, 0, width * 3 / 10, height * 3 / 10,
+                 SWP_NOMOVE | SWP_NOZORDER);
+    pumpFor(600);
+    RECT clientAfter {};
+    GetClientRect(hwnd, &clientAfter);
+    const bool limitHolds = clientAfter.right >= width * 45 / 100
+                         && clientAfter.bottom >= height * 45 / 100;
+    std::printf("resize limit (shrink to 30%%): %s (settled %ldx%ld, floor ~%dx%d)\n",
+                limitHolds ? "PASS" : "FAIL", clientAfter.right, clientAfter.bottom,
+                width / 2, height / 2);
+    widgetFollows = widgetFillsClient("resize follow (shrink)") && widgetFollows
+                 && limitHolds;
+
+    // Back to the natural size so a human looking at the window sees the
+    // editor as a DAW would first open it.
+    RECT natural { 0, 0, width, height };
+    AdjustWindowRect(&natural, style, FALSE);
+    SetWindowPos(hwnd, nullptr, 0, 0, natural.right - natural.left,
+                 natural.bottom - natural.top, SWP_NOMOVE | SWP_NOZORDER);
+    pumpFor(300);
+
+    // OS frame limits: the exact messages Windows issues while the user
+    // drags the window frame. The editor's top-level subclass must answer
+    // hard min/max tracking sizes and steer WM_SIZING proposals.
+    MINMAXINFO trackInfo {};
+    trackInfo.ptMaxTrackSize = POINT { 10000, 10000 };
+    SendMessageW(hwnd, WM_GETMINMAXINFO, 0, reinterpret_cast<LPARAM>(&trackInfo));
+    const bool minMaxHolds = trackInfo.ptMaxTrackSize.x < 9000
+                          && trackInfo.ptMaxTrackSize.y < 9000
+                          && trackInfo.ptMinTrackSize.x > width / 3
+                          && trackInfo.ptMinTrackSize.y > height / 3;
+    std::printf("frame min/max: %s (track %ldx%ld .. %ldx%ld)\n",
+                minMaxHolds ? "PASS" : "FAIL",
+                trackInfo.ptMinTrackSize.x, trackInfo.ptMinTrackSize.y,
+                trackInfo.ptMaxTrackSize.x, trackInfo.ptMaxTrackSize.y);
+
+    RECT dragBox {};
+    GetWindowRect(hwnd, &dragBox);
+    const LONG dragStartW = dragBox.right - dragBox.left;
+    dragBox.right += 6000;   // a wild rightwards drag
+    SendMessageW(hwnd, WM_SIZING, WMSZ_RIGHT, reinterpret_cast<LPARAM>(&dragBox));
+    const LONG steeredW = dragBox.right - dragBox.left;
+    const LONG steeredH = dragBox.bottom - dragBox.top;
+    // Must actually grow (the height following the ratio), yet cap at max.
+    const bool sizingHolds = steeredW > dragStartW
+                          && steeredW <= trackInfo.ptMaxTrackSize.x + 8
+                          && steeredH <= trackInfo.ptMaxTrackSize.y + 8;
+    std::printf("frame sizing steer: %s (rightward drag %ld -> %ldx%ld, cap %ldx%ld)\n",
+                sizingHolds ? "PASS" : "FAIL", dragStartW, steeredW, steeredH,
+                trackInfo.ptMaxTrackSize.x, trackInfo.ptMaxTrackSize.y);
+
+    widgetFollows = widgetFollows && minMaxHolds && sizingHolds;
+
     if (autoCloseSeconds > 0)
         SetTimer(hwnd, 1, static_cast<UINT>(autoCloseSeconds) * 1000u, nullptr);
 
@@ -222,7 +363,7 @@ int main(int argc, char** argv)
     comp->lpVtbl->terminate(comp);
     const Steinberg_uint32 compRefs = comp->lpVtbl->release(comp);
     std::printf("teardown ok (view refs %u, component refs %u)\n", viewRefs, compRefs);
-    return (viewRefs == 0 && compRefs == 0) ? 0 : 1;
+    return (viewRefs == 0 && compRefs == 0 && widgetFollows) ? 0 : 1;
 }
 
 #endif // _WIN32

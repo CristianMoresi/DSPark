@@ -70,7 +70,9 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -93,6 +95,10 @@
     #if defined(_MSC_VER)
     #pragma warning(pop)
     #endif
+    #include <commctrl.h>      // SetWindowSubclass: follow host resizes reliably
+    #if defined(_MSC_VER)
+    #pragma comment(lib, "comctl32.lib")
+    #endif
     #include <memory>
 #elif defined(__APPLE__)
     #define DSPARK_WEBVIEW_BACKEND 2
@@ -104,6 +110,52 @@
 #endif
 
 namespace dspark::plugin::webview_ui {
+
+// -- diagnostics -------------------------------------------------------------------
+//
+// Set the environment variable DSPARK_WEBVIEW_LOG to any non-empty value and
+// every editor in the process appends its host-interaction trace (attach,
+// size negotiation, parent resizes) to %TEMP%/DSParkWebView.log (or
+// $TMPDIR on POSIX). Costs nothing when the variable is absent.
+
+inline void debugLog(const char* format, ...) noexcept
+{
+    static std::FILE* file = []() -> std::FILE* {
+        char enabled[8] {};
+#if defined(_WIN32)
+        if (GetEnvironmentVariableA("DSPARK_WEBVIEW_LOG", enabled,
+                                    sizeof(enabled)) == 0)
+            return nullptr;
+        char dir[MAX_PATH] {};
+        if (GetEnvironmentVariableA("TEMP", dir, sizeof(dir)) == 0)
+            dir[0] = '\0';
+        char path[MAX_PATH + 32];
+        std::snprintf(path, sizeof(path), "%s%sDSParkWebView.log",
+                      dir, dir[0] != '\0' ? "\\" : "");
+        std::FILE* f = nullptr;
+        fopen_s(&f, path, "a");
+#else
+        const char* env = std::getenv("DSPARK_WEBVIEW_LOG");
+        if (env == nullptr || env[0] == '\0') return nullptr;
+        (void) enabled;
+        const char* dir = std::getenv("TMPDIR");
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/DSParkWebView.log",
+                      dir != nullptr ? dir : "/tmp");
+        std::FILE* f = std::fopen(path, "a");
+#endif
+        if (f != nullptr)
+            std::fprintf(f, "\n== editor session (layer built " __DATE__ " " __TIME__ ") ==\n");
+        return f;
+    }();
+    if (file == nullptr) return;
+    std::va_list args;
+    va_start(args, format);
+    std::vfprintf(file, format, args);
+    va_end(args);
+    std::fputc('\n', file);
+    std::fflush(file);
+}
 
 // -- JSON utilities ---------------------------------------------------------------
 //
@@ -327,6 +379,23 @@ inline constexpr const char* kBridgeJs =
       "if(m.type==='params'){"
         "meta=m.params;"
         "for(var i=0;i<meta.length;i++){vals[meta[i].id]=meta[i].value;}"
+        // KeepAspect editors scale their whole content with the window,
+        // JUCE-style: the page keeps its DESIGN layout and is fitted into
+        // the window by the limiting axis, centered (letterboxed) when the
+        // host lets the user distort the ratio. Nothing can ever clip.
+        "if(m.design&&m.design.keepAspect&&!window.__dsparkFit){"
+          "var dw=m.design.width,dh=m.design.height;"
+          "window.__dsparkFit=function(){"
+            "var z=Math.min(window.innerWidth/dw,window.innerHeight/dh);"
+            "if(!(z>0&&isFinite(z))){z=1;}"
+            "var s=document.body.style;"
+            "s.width=dw+'px';s.height=dh+'px';"
+            "s.position='absolute';s.margin='0';"
+            "s.transformOrigin='0 0';s.transform='scale('+z+')';"
+            "s.left=((window.innerWidth-dw*z)/2)+'px';"
+            "s.top=((window.innerHeight-dh*z)/2)+'px';};"
+          "window.addEventListener('resize',window.__dsparkFit);"
+          "window.__dsparkFit();}"
         "var rc=readyCbs;readyCbs=[];"
         "for(var j=0;j<rc.length;j++){rc[j](meta);}"
         "for(var k=0;k<meta.length;k++){fire(meta[k].id,meta[k].value);}"
@@ -597,6 +666,15 @@ private:
         else if (std::strcmp(msg.op, "ready") == 0)
         {
             sendMeta();
+            // Diagnostic: how the page actually sees the world (DPI bugs
+            // live exactly here). Logged only with DSPARK_WEBVIEW_LOG set.
+            evalPlatform("window.__dsparkPost('metric','innerWidth',window.innerWidth);"
+                         "window.__dsparkPost('metric','innerHeight',window.innerHeight);"
+                         "window.__dsparkPost('metric','dpr',window.devicePixelRatio||1);");
+        }
+        else if (std::strcmp(msg.op, "metric") == 0)
+        {
+            debugLog("page metric %s = %.2f", msg.id, msg.value);
         }
     }
 
@@ -625,7 +703,13 @@ private:
             appendJsonNumber(json, plainOf(i));
             json += '}';
         }
-        json += "]}";
+        json += "],\"design\":{\"width\":";
+        appendJsonNumber(json, editorSizeOf<P>().width);
+        json += ",\"height\":";
+        appendJsonNumber(json, editorSizeOf<P>().height);
+        json += ",\"keepAspect\":";
+        json += editorResizeOf<P>() == EditorResize::KeepAspect ? "true" : "false";
+        json += "}}";
         sendRecv(json);
     }
 
@@ -657,12 +741,49 @@ private:
         else return false;
     }
 
+    /** The page to serve: the dev-file override when declared and readable
+     *  (edit + reopen, no recompile), the embedded editorHtml() otherwise. */
+    static std::string pageHtml()
+    {
+#if !defined(DSPARK_NO_FILE_IO)
+        if constexpr (HasEditorDevFile<P>)
+        {
+            std::FILE* f = nullptr;
+#if defined(_WIN32)
+            fopen_s(&f, P::editorDevFile(), "rb");
+#else
+            f = std::fopen(P::editorDevFile(), "rb");
+#endif
+            if (f != nullptr)
+            {
+                std::string text;
+                char chunk[4096];
+                size_t got = 0;
+                while ((got = std::fread(chunk, 1, sizeof(chunk), f)) > 0)
+                    text.append(chunk, got);
+                std::fclose(f);
+                if (!text.empty())
+                {
+                    debugLog("page: dev file %s (%u bytes)", P::editorDevFile(),
+                             static_cast<unsigned>(text.size()));
+                    return text;
+                }
+            }
+            debugLog("page: dev file %s unreadable; embedded page used",
+                     P::editorDevFile());
+        }
+#endif
+        return P::editorHtml();
+    }
+
     // ==============================================================================
     // Windows — WebView2 through the vendored webview library
     // ==============================================================================
 #if DSPARK_WEBVIEW_BACKEND == 1
 
     std::unique_ptr<webview::webview> wv_;
+    void* root_ = nullptr;               // host top-level window (frame limits)
+    mutable SIZE frameChrome_ { -1, -1 }; // historical-minimum chrome; -1 = unmeasured
     bool comInitialized_ = false;
 
     bool createPlatform(void* parentWindow) noexcept
@@ -680,7 +801,27 @@ private:
                 return std::string {};
             });
             wv_->init(kBridgeJs);
-            wv_->set_html(P::editorHtml());
+            wv_->set_html(pageHtml());
+            // Track the host window directly: several hosts resize their
+            // plugin area without calling the format's size callbacks, so
+            // relying on those alone leaves the page stuck at the old size.
+            SetWindowSubclass(static_cast<HWND>(parentWindow), &onParentMessage,
+                              reinterpret_cast<UINT_PTR>(this),
+                              reinterpret_cast<DWORD_PTR>(this));
+            // And the host's TOP-LEVEL frame: WM_GETMINMAXINFO/WM_SIZING are
+            // the OS-level drag limits — the only ones no host can bypass.
+            // VST3 size negotiation only governs the inner plugin area; the
+            // outer frame belongs to the user, so min/max/aspect must be
+            // enforced where the WINDOW is dragged (see rootGuard for docks).
+            root_ = GetAncestor(static_cast<HWND>(parentWindow), GA_ROOT);
+            if (root_ != nullptr)
+                SetWindowSubclass(static_cast<HWND>(root_), &onRootMessage,
+                                  reinterpret_cast<UINT_PTR>(this),
+                                  reinterpret_cast<DWORD_PTR>(this));
+            RECT parentBox {};
+            GetClientRect(static_cast<HWND>(parentWindow), &parentBox);
+            debugLog("create: parent=%p root=%p client=%ldx%ld", parentWindow,
+                     root_, parentBox.right, parentBox.bottom);
             return true;
         }
         catch (...)   // e.g. WebView2 runtime missing -> host falls back to generic UI
@@ -695,8 +836,189 @@ private:
         }
     }
 
+    static LRESULT CALLBACK onParentMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                            UINT_PTR, DWORD_PTR refData) noexcept
+    {
+        if (msg == WM_SIZE)
+        {
+            debugLog("parent WM_SIZE %dx%d", int(LOWORD(lp)), int(HIWORD(lp)));
+            auto* editor = reinterpret_cast<Editor*>(refData);
+            editor->setBounds(static_cast<int>(LOWORD(lp)), static_cast<int>(HIWORD(lp)));
+        }
+        return DefSubclassProc(hwnd, msg, wp, lp);
+    }
+
+    // --- host frame limits (OS level) ----------------------------------------------
+
+    /** DPI of the plugin area, as a 96-dpi scale factor (multi-monitor safe). */
+    double frameDpiScale() const noexcept
+    {
+        const UINT dpi = parent_ != nullptr ? GetDpiForWindow(static_cast<HWND>(parent_))
+                                            : 96u;
+        return dpi > 0 ? dpi / 96.0 : 1.0;
+    }
+
+    /**
+     * Only steer the top-level frame when the plugin area dominates it (a
+     * floating plugin window). When the editor is docked inside a large host
+     * window, that frame is the DAW's own — hands off.
+     *
+     * The chrome (frame + host bars around the plugin) is tracked as the
+     * HISTORICAL MINIMUM of coherent measurements. That cuts the feedback
+     * loop by construction — dead space the host leaves around the plugin
+     * can only inflate a measurement, never deflate it, so the minimum
+     * converges on the real chrome — while staying re-evaluable (a single
+     * early measurement taken mid-layout cannot poison the limits forever;
+     * that permanent-verdict cache was the previous round's bug).
+     */
+    bool rootGuard(HWND root, SIZE& chrome) const noexcept
+    {
+        if (parent_ == nullptr || root == nullptr) return false;
+        RECT rootBox {}, parentBox {};
+        const bool measured = GetWindowRect(root, &rootBox)
+                           && GetClientRect(static_cast<HWND>(parent_), &parentBox);
+        bool coherent = false;
+        if (measured)
+        {
+            // Threshold separates plugin windows from docked editors: a
+            // REAPER FX-chain window (plugin list beside the editor) sits
+            // near 45-90% plugin area, an editor docked in a DAW main
+            // window stays well under 25%.
+            const double rootArea = double(rootBox.right - rootBox.left)
+                                  * double(rootBox.bottom - rootBox.top);
+            const double parentArea = double(parentBox.right) * double(parentBox.bottom);
+            coherent = rootArea > 0.0 && parentArea > 0.0
+                    && parentArea / rootArea >= 1.0 / 3.0;
+        }
+        if (coherent)
+        {
+            // No tight cap here: legitimate host chrome can be large (the
+            // REAPER FX-chain window keeps its plugin list beside the
+            // editor, ~450px). Underestimating it lets the window shrink
+            // past the point where the plugin minimum still fits — exactly
+            // a clipped editor. The historical minimum below already stops
+            // dead space from inflating these numbers over time.
+            auto clampChrome = [](LONG v) -> LONG {
+                return v < 0 ? 0 : (v > 1024 ? 1024 : v);
+            };
+            const LONG cx = clampChrome((rootBox.right - rootBox.left) - parentBox.right);
+            const LONG cy = clampChrome((rootBox.bottom - rootBox.top) - parentBox.bottom);
+            if (frameChrome_.cx < 0)
+            {
+                frameChrome_ = SIZE { cx, cy };
+                debugLog("frame: steering host window, chrome=%ldx%ld", cx, cy);
+            }
+            else
+            {
+                if (cx < frameChrome_.cx) frameChrome_.cx = cx;
+                if (cy < frameChrome_.cy) frameChrome_.cy = cy;
+            }
+        }
+        // A truly docked editor never produces a coherent (dominant-area)
+        // measurement, so the chrome stays unmeasured and we never steer.
+        if (frameChrome_.cx < 0) return false;
+        chrome = frameChrome_;
+        return true;
+    }
+
+    void applyMinMax(HWND root, MINMAXINFO* info) const noexcept
+    {
+        SIZE chrome {};
+        if (info == nullptr || !rootGuard(root, chrome)) return;
+        const EditorSize logical = editorSizeOf<P>();
+        const double dpi = frameDpiScale();
+        constexpr EditorResize mode = editorResizeOf<P>();
+        const double lo = mode == EditorResize::Fixed ? 1.0 : kEditorMinSizeFactor;
+        const double hi = mode == EditorResize::Fixed ? 1.0 : kEditorMaxSizeFactor;
+        const LONG minW = LONG(logical.width * dpi * lo + 0.5) + chrome.cx;
+        const LONG minH = LONG(logical.height * dpi * lo + 0.5) + chrome.cy;
+        const LONG maxW = LONG(logical.width * dpi * hi + 0.5) + chrome.cx;
+        const LONG maxH = LONG(logical.height * dpi * hi + 0.5) + chrome.cy;
+        if (info->ptMinTrackSize.x < minW) info->ptMinTrackSize.x = minW;
+        if (info->ptMinTrackSize.y < minH) info->ptMinTrackSize.y = minH;
+        if (info->ptMaxTrackSize.x > maxW) info->ptMaxTrackSize.x = maxW;
+        if (info->ptMaxTrackSize.y > maxH) info->ptMaxTrackSize.y = maxH;
+        debugLog("frame minmax: track %ldx%ld .. %ldx%ld (chrome %ldx%ld)",
+                 info->ptMinTrackSize.x, info->ptMinTrackSize.y,
+                 info->ptMaxTrackSize.x, info->ptMaxTrackSize.y,
+                 chrome.cx, chrome.cy);
+    }
+
+    void applySizing(HWND root, int edge, RECT* box) const noexcept
+    {
+        SIZE chrome {};
+        if (box == nullptr || !rootGuard(root, chrome)) return;
+        const EditorSize logical = editorSizeOf<P>();
+        const double dpi = frameDpiScale();
+        constexpr EditorResize mode = editorResizeOf<P>();
+        // Unlike checkSizeConstraint (where the window is already fixed and
+        // the plugin must fit INSIDE it), WM_SIZING reshapes the whole
+        // window — so the dragged axis leads and the other may follow.
+        const double lo = mode == EditorResize::Fixed ? 1.0 : kEditorMinSizeFactor;
+        const double hi = mode == EditorResize::Fixed ? 1.0 : kEditorMaxSizeFactor;
+        const double minW = logical.width * dpi * lo;
+        const double maxW = logical.width * dpi * hi;
+        const double minH = logical.height * dpi * lo;
+        const double maxH = logical.height * dpi * hi;
+        double w = double(box->right - box->left) - chrome.cx;
+        double h = double(box->bottom - box->top) - chrome.cy;
+        w = w < minW ? minW : (w > maxW ? maxW : w);
+        h = h < minH ? minH : (h > maxH ? maxH : h);
+        if constexpr (mode == EditorResize::KeepAspect)
+        {
+            // The dragged edge expresses the user's intent; the bounds above
+            // are ratio-consistent, so the derived axis stays in range.
+            const double ratio = double(logical.width) / logical.height;
+            if (edge == WMSZ_TOP || edge == WMSZ_BOTTOM)
+                w = h * ratio;
+            else
+                h = w / ratio;
+        }
+        const LONG newW = LONG(w + 0.5) + chrome.cx;
+        const LONG newH = LONG(h + 0.5) + chrome.cy;
+        const LONG oldW = box->right - box->left;
+        const LONG oldH = box->bottom - box->top;
+        // Anchor the side opposite to the dragged edge.
+        if (edge == WMSZ_LEFT || edge == WMSZ_TOPLEFT || edge == WMSZ_BOTTOMLEFT)
+            box->left = box->right - newW;
+        else
+            box->right = box->left + newW;
+        if (edge == WMSZ_TOP || edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT)
+            box->top = box->bottom - newH;
+        else
+            box->bottom = box->top + newH;
+        if (newW != oldW || newH != oldH)
+            debugLog("frame sizing(edge %d): %ldx%ld -> %ldx%ld", edge,
+                     oldW, oldH, newW, newH);
+    }
+
+    static LRESULT CALLBACK onRootMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                          UINT_PTR, DWORD_PTR refData) noexcept
+    {
+        const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
+        auto* editor = reinterpret_cast<Editor*>(refData);
+        if (msg == WM_GETMINMAXINFO)
+            editor->applyMinMax(hwnd, reinterpret_cast<MINMAXINFO*>(lp));
+        else if (msg == WM_SIZING)
+        {
+            editor->applySizing(hwnd, static_cast<int>(wp),
+                                reinterpret_cast<RECT*>(lp));
+            return TRUE;
+        }
+        return result;
+    }
+
     void destroyPlatform() noexcept
     {
+        if (parent_ != nullptr)
+            RemoveWindowSubclass(static_cast<HWND>(parent_), &onParentMessage,
+                                 reinterpret_cast<UINT_PTR>(this));
+        if (root_ != nullptr)
+        {
+            RemoveWindowSubclass(static_cast<HWND>(root_), &onRootMessage,
+                                 reinterpret_cast<UINT_PTR>(this));
+            root_ = nullptr;
+        }
         try { wv_.reset(); }
         catch (...) {}
         if (comInitialized_)
@@ -708,6 +1030,20 @@ private:
 
     void setBoundsPlatform(int width, int height) noexcept
     {
+        // The parent's real client box is the single source of truth: hosts
+        // and formats disagree about who announces sizes when, but the web
+        // widget must simply fill whatever the host window currently is.
+        const int requestedW = width;
+        const int requestedH = height;
+        RECT rect {};
+        if (parent_ != nullptr && GetClientRect(static_cast<HWND>(parent_), &rect)
+            && rect.right > 0 && rect.bottom > 0)
+        {
+            width  = static_cast<int>(rect.right);
+            height = static_cast<int>(rect.bottom);
+        }
+        debugLog("setBounds(%d,%d) -> widget %dx%d", requestedW, requestedH,
+                 width, height);
         try
         {
             if (auto widget = wv_->widget(); widget.ok())
@@ -804,7 +1140,7 @@ private:
         og::call<void>(webView_, "setAutoresizingMask:", static_cast<unsigned long>(18));
         og::call<void>(static_cast<og::ObjId>(parentWindow), "addSubview:", webView_);
         og::call<void>(webView_, "loadHTMLString:baseURL:",
-                       og::nsString(P::editorHtml()), static_cast<og::ObjId>(nullptr));
+                       og::nsString(pageHtml().c_str()), static_cast<og::ObjId>(nullptr));
         return true;
     }
 

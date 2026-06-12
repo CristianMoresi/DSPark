@@ -586,6 +586,8 @@ struct Plugin
         s->guiWidth  = static_cast<int>(logical.width * s->guiScale + 0.5);
         s->guiHeight = static_cast<int>(logical.height * s->guiScale + 0.5);
         s->guiActive = true;
+        webview_ui::debugLog("clap gui create %dx%d scale=%.2f",
+                             s->guiWidth, s->guiHeight, s->guiScale);
         return true;
     }
 
@@ -649,28 +651,11 @@ struct Plugin
     {
         auto* s = self(p);
         if (width == nullptr || height == nullptr) return false;
-        const EditorSize logical = editorSizeOf<P>();
-        constexpr EditorResize mode = editorResizeOf<P>();
-        if constexpr (mode == EditorResize::Fixed)
-        {
-            *width  = static_cast<uint32_t>(logical.width * s->guiScale + 0.5);
-            *height = static_cast<uint32_t>(logical.height * s->guiScale + 0.5);
-        }
-        else
-        {
-            const double minW = logical.width * s->guiScale * kEditorMinSizeFactor;
-            const double maxW = logical.width * s->guiScale * kEditorMaxSizeFactor;
-            const double minH = logical.height * s->guiScale * kEditorMinSizeFactor;
-            const double maxH = logical.height * s->guiScale * kEditorMaxSizeFactor;
-            double w = *width;
-            double h = *height;
-            w = w < minW ? minW : (w > maxW ? maxW : w);
-            h = h < minH ? minH : (h > maxH ? maxH : h);
-            if constexpr (mode == EditorResize::KeepAspect)
-                h = w * logical.height / logical.width;
-            *width  = static_cast<uint32_t>(w + 0.5);
-            *height = static_cast<uint32_t>(h + 0.5);
-        }
+        double w = *width;
+        double h = *height;
+        constrainEditorSize<P>(w, h, s->guiScale);
+        *width  = static_cast<uint32_t>(w + 0.5);
+        *height = static_cast<uint32_t>(h + 0.5);
         return true;
     }
 
@@ -679,8 +664,13 @@ struct Plugin
     {
         auto* s = self(p);
         if (!s->guiActive) return false;
-        s->guiWidth  = static_cast<int>(width);
-        s->guiHeight = static_cast<int>(height);
+        // Clamp here too: not every host runs the size through adjust_size.
+        double w = width;
+        double h = height;
+        constrainEditorSize<P>(w, h, s->guiScale);
+        webview_ui::debugLog("clap gui set_size %ux%u -> %.0fx%.0f", width, height, w, h);
+        s->guiWidth  = static_cast<int>(w + 0.5);
+        s->guiHeight = static_cast<int>(h + 0.5);
         s->guiEditor.setBounds(s->guiWidth, s->guiHeight);
         return true;
     }
@@ -690,6 +680,8 @@ struct Plugin
     {
         auto* s = self(p);
         if (window == nullptr || !s->guiActive) return false;
+        webview_ui::debugLog("clap gui set_parent %p negotiated=%dx%d",
+                             window->ptr, s->guiWidth, s->guiHeight);
         const webview_ui::HostCallbacks callbacks {
             s, &cbGuiSetParam, &cbGuiBeginEdit, &cbGuiEndEdit
         };

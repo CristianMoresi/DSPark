@@ -210,10 +210,19 @@ modes looks right; `examples/plugin_webview_editor/` uses `KeepAspect`.
 
 ### Developing a UI
 
+- **Edit without recompiling**: declare
+  `static const char* editorDevFile() { return "C:/dev/myplugin/editor.html"; }`
+  and the editor loads that file from disk on every open (falling back to
+  the embedded `editorHtml()` when missing). Edit, save, reopen the editor —
+  no C++ rebuild. Remove it for release builds.
 - `tools/vst3_editor_host.cpp` opens your editor in a bare native window —
-  the 10-second visual check without a DAW (it also logs
-  begin/perform/endEdit calls live).
+  the 10-second check without a DAW. It reports the monitor content scale
+  like a DPI-aware host, logs begin/perform/endEdit calls live and
+  self-tests the resize chain (grow, shrink-below-minimum, widget fit).
 - Set `editorDebug = true` during development to get the browser DevTools.
+- Set the environment variable `DSPARK_WEBVIEW_LOG=1` to trace every
+  host/editor size negotiation to `%TEMP%/DSParkWebView.log` — invaluable
+  when a host misbehaves.
 - The page is ordinary web content: iterate it in a regular browser with a
   stubbed `window.__dsparkPost`, then paste it into `editorHtml()`.
 

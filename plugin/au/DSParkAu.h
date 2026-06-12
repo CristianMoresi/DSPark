@@ -898,7 +898,15 @@ struct Plugin
     OSStatus pullInput(UInt32 element, float* dst[2],
                        const AudioTimeStamp* timeStamp, UInt32 frames) noexcept
     {
-        AudioBufferList list;
+        // AudioBufferList declares mBuffers[1] (variable length): a stack
+        // instance has storage for ONE AudioBuffer, so writing mBuffers[1]
+        // corrupts the frame. Give the stereo list real storage and lend it
+        // out as AudioBufferList* — the canonical CoreAudio pattern.
+        struct StereoBufferList
+        {
+            UInt32 mNumberBuffers;
+            AudioBuffer mBuffers[2];
+        } list {};
         list.mNumberBuffers = 2;
         for (int ch = 0; ch < 2; ++ch)
         {
@@ -906,15 +914,16 @@ struct Plugin
             list.mBuffers[ch].mDataByteSize = frames * sizeof(float);
             list.mBuffers[ch].mData = dst[ch];
         }
+        auto* abl = reinterpret_cast<AudioBufferList*>(&list);
         OSStatus status = noErr;
         AudioUnitRenderActionFlags flags = 0;
         if (inputCallback[element].inputProc != nullptr)
             status = inputCallback[element].inputProc(
                 inputCallback[element].inputProcRefCon, &flags, timeStamp,
-                element, frames, &list);
+                element, frames, abl);
         else if (inputConnection[element] != nullptr)
             status = AudioUnitRender(inputConnection[element], &flags, timeStamp,
-                                     inputConnectionBus[element], frames, &list);
+                                     inputConnectionBus[element], frames, abl);
         else
             for (int ch = 0; ch < 2; ++ch)
                 std::memset(dst[ch], 0, frames * sizeof(float));

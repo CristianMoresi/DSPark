@@ -19,5 +19,10 @@ vcpkg_cmake_configure(
 vcpkg_cmake_install()
 vcpkg_cmake_config_fixup(PACKAGE_NAME dspark CONFIG_PATH lib/cmake/dspark)
 
-file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug")
+# Header-only: no compiled libraries, and config_fixup moved the cmake files
+# from lib/cmake to share/, so lib/ is left empty (vcpkg rejects empty
+# installed directories).
+file(REMOVE_RECURSE
+    "${CURRENT_PACKAGES_DIR}/debug"
+    "${CURRENT_PACKAGES_DIR}/lib")
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")

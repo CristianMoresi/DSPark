@@ -4,7 +4,7 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.5.0** — 90+ headers of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins with HTML/CSS/JS editors.
+**v1.6.0** — 90+ headers of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins (effects and MIDI instruments) with HTML/CSS/JS editors.
 
 **📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
@@ -438,6 +438,47 @@ DSPark/
 
 ---
 
+## What's New in v1.6.0
+
+**The host contract**: the plugin layer now covers everything a host can
+offer an effect or an instrument — each capability one declarative member,
+each one proven functionally in CI (measured, not just compiled).
+
+- **Instruments & MIDI**: `handleMidiEvent(MidiEvent)` adds a note input to
+  every format (VST3 event bus + `IMidiMapping` for pitch bend / mod /
+  sustain / pressure, CLAP note ports speaking both CLAP and raw-MIDI
+  dialects, AU MusicDevice selectors), and `Category::Instrument` builds a
+  true generator: no audio inputs, an `aumu` Audio Unit, cleared buffers
+  that voices add into. `examples/plugin_synth/` — 8 voices, voice
+  stealing, pitch bend, sample-accurate note starts — passes `auval` and
+  plays a measured 440 Hz in CI.
+- **Host transport**: `setTransport(TransportInfo)` delivers tempo, musical
+  position, time signature, loop points and play state per block, from the
+  VST3 ProcessContext, the CLAP transport event and the AU host callbacks —
+  the basis for tempo-synced delays, LFOs and gates.
+- **Mono everywhere**: every plugin now negotiates mono and stereo by
+  default (`ChannelSupport` restricts it when the DSP is inherently
+  stereo); the sidechain mirrors the main width.
+- **Sample-accurate automation by default**: parameter, bypass and note
+  events ride one time-ordered stream and processing splits at 32-frame
+  boundaries, so fast curves land where the host drew them (declarative
+  opt-out for FFT-heavy plugins).
+- **The professional details**: runtime latency changes notify the host
+  natively in all three formats; `setOfflineRendering(bool)` switches
+  quality for bounces; `factoryPresets` publishes to every host's preset
+  browser (VST3 program list, CLAP preset-load + preset-discovery, AU
+  factory presets); host bypass and the active program now persist in the
+  state container; `process()` runs under DSPark's denormal guard.
+- **Proven by instrumentation**: the new `tools/plugin_probe.cpp` encodes
+  what the wrapper delivers into its output, and the smoke hosts measure it
+  — transport DC, the offline sign flip, an automation step landing on its
+  exact sample, note pitch by zero crossings, the latency-changed
+  notification — on every platform, on every commit. pluginval and
+  clap-validator caught two real state-persistence bugs along the way; both
+  fixed and now regression-covered.
+
+---
+
 ## What's New in v1.5.0
 
 **The editor everywhere**: the WebView editor now runs on all three plugin
@@ -462,45 +503,6 @@ exercised with a real web view in CI.
   `tools/x11_editor_smoke` (Linux, under xvfb) play real hosts in CI —
   factory/attach, a live web view, the JS bridge ready-handshake and clean
   teardown — alongside the existing real-window editor host on Windows.
-
----
-
-## What's New in v1.4.0
-
-**The WebView editor**: custom plugin GUIs in plain HTML/CSS/JS, embedded
-in the host window — no GUI framework, nothing to install.
-
-- **Declare and serve**: `hasEditor = true` + `editorHtml()` (plus optional
-  `editorSize`, `editorResize`, `editorDebug`) and the VST3/CLAP backends
-  embed the platform web engine — WebView2 on Windows, WKWebView on macOS
-  (Linux falls back to the host's generic UI for now). The vendored MIT
-  `webview` library and the BSD-3 WebView2 SDK header keep it
-  zero-download, like the rest of the plugin layer.
-- **The `dspark` JS bridge**: `onReady` hands the page the parameter table
-  with live values; `setParam`/`onParam` move plain values both ways with
-  the same stable text ids as automation and state; `beginEdit`/`endEdit`
-  drive host automation gestures and undo. DSP→UI sync polls the wrapper's
-  atomic shadows — no native timers, no locks, nothing on the audio thread.
-- **Sizing that survives real hosts** (field-validated in REAPER): OS-level
-  frame limits (`WM_GETMINMAXINFO`/`WM_SIZING`), honest VST3/CLAP size
-  negotiation, and proportional content scaling with `Fixed` / `Free` /
-  `KeepAspect` resize policies. HiDPI handled end to end.
-- **A real workflow**: develop the UI as ordinary separate web files and
-  `dspark_add_plugin(... EDITOR_HTML ui/editor.html)` inlines and embeds
-  them at build time; `editorDevFile()` reloads the page from disk while
-  iterating (no recompile); `editorDebug` opens the browser DevTools;
-  `tools/vst3_editor_host` opens any editor in a bare window with a
-  self-testing resize battery. `DSPARK_WEBVIEW_LOG=1` traces every
-  host/editor size negotiation.
-- **Hardened in CI**: `dspark_add_plugin` now also assembles AU
-  `.component` bundles (`FORMATS VST3 CLAP AU`), and every example plugin
-  must pass Tracktion's `pluginval` (strictness 8) and `clap-validator` on
-  Windows, Linux and macOS — the latter immediately caught a real
-  toggle-parsing contract bug in both backends, now fixed.
-- Examples: `examples/plugin_webview_editor/` (single-file, draggable SVG
-  knobs) and `examples/plugin_webview_files/` (separate-files workflow).
-- **v1.4.1**: complete CMake package config — `find_package(dspark CONFIG)`
-  now works from any install tree or package manager (vcpkg/Conan).
 
 ---
 

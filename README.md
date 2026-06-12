@@ -76,9 +76,9 @@ construction. Two miniature hosts (`tools/vst3_smoke_host.cpp`,
 lifecycle like a DAW would; both run in CI on Windows, Linux and macOS.
 
 Want a custom GUI? Write it in **plain HTML/CSS/JS** — the WebView editor
-layer embeds it in the host window (WebView2 on Windows, WKWebView on
-macOS) with a tiny `dspark` JS bridge for parameters and automation
-gestures. Keep the UI as ordinary separate web files and
+layer embeds it in the host window across VST3, CLAP and AU (WebView2 on
+Windows, WKWebView on macOS) with a tiny `dspark` JS bridge for parameters
+and automation gestures. Keep the UI as ordinary separate web files and
 `dspark_add_plugin(... EDITOR_HTML ui/editor.html)` embeds them at build
 time. `examples/plugin_webview_editor/` is a complete plugin with knobs,
 `examples/plugin_webview_files/` shows the separate-files workflow, and
@@ -422,7 +422,7 @@ DSPark/
 ├── conformance/             # Public conformance suite (runs in CI)
 ├── docs/                    # Cookbook, plugin guide, metrics table
 ├── examples/                # WAV processing, channel strip, plugins, templates
-├── tools/                   # VST3/CLAP smoke hosts, editor host, amalgamator
+├── tools/                   # VST3/CLAP/AU-editor smoke hosts, editor host, amalgamator
 └── DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)
 ```
 

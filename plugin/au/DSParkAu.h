@@ -33,7 +33,14 @@
  *   crossfade as the other backends.
  * - Input arrives by pulling the host's render callback (or connection),
  *   the universal aufx pattern auval exercises.
+ * - **Editor**: when plugin/webview/DSParkWebViewEditor.h is included before
+ *   this header and the class declares `hasEditor = true`, the AU publishes
+ *   kAudioUnitProperty_CocoaUI — hosts load a runtime-registered view
+ *   factory from this bundle and get the same WKWebView editor as the
+ *   VST3/CLAP backends; otherwise they show their generic parameter UI.
  */
+
+#define DSPARK_PLUGIN_AU_INCLUDED 1
 
 #if defined(__APPLE__)
 
@@ -41,6 +48,13 @@
 
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreFoundation/CoreFoundation.h>
+
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+#include <AudioToolbox/AudioUnitUtilities.h>   // AUParameterSet, AUEventListenerNotify
+#include <dlfcn.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -59,6 +73,150 @@ inline OSType fourCC(const char* s) noexcept
          | (static_cast<OSType>(static_cast<unsigned char>(s[2])) << 8)
          |  static_cast<OSType>(static_cast<unsigned char>(s[3]));
 }
+
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+
+// -- WebView editor glue (Cocoa view factory) -----------------------------------
+//
+// AUv2 has no IPlugView: the host reads kAudioUnitProperty_CocoaUI, loads the
+// announced bundle, instantiates the named factory class and asks it for an
+// NSView. Both classes here (factory + container view) are registered through
+// the Objective-C runtime on first use — no Objective-C sources, no AppKit
+// link dependency in the plugin. The factory is stateless: it recovers the
+// C++ plugin instance through a PRIVATE property on the AudioUnit handle
+// (IDs >= 64000 are reserved for third parties), so one process-wide class
+// serves every DSPark plugin loaded in the host, whichever binary won the
+// registration race (same policy as the WebView message relay).
+
+/** @brief Private property handing the view factory a way back into C++. */
+inline constexpr AudioUnitPropertyID kDsparkEditorHookProperty = 64537;
+
+/** @brief Payload of kDsparkEditorHookProperty: instance + view constructor.
+ *  The function pointer lives in the SAME binary as the AudioUnit instance,
+ *  so a factory class registered by another DSPark plugin still lands here. */
+struct EditorHook
+{
+    void* context = nullptr;
+    void* (*createView)(void* context, double width, double height) = nullptr;
+};
+
+/** @brief NSSize-compatible POD for the factory selector signature. */
+struct ViewSize
+{
+    double width = 0, height = 0;
+};
+
+/** @brief Back-reference stored in the container view's ivar; the container
+ *  notifies the owning wrapper when the host deallocates it. */
+struct EditorViewSink
+{
+    void (*onDealloc)(void* context) = nullptr;
+    void* context = nullptr;
+};
+
+inline void editorContainerDealloc(void* self, SEL) noexcept
+{
+    // Instances exist only after the class registered, so the lookup cannot
+    // miss; the superclass is resolved from the registered class (NOT from
+    // object_getClass) so a future subclass would not recurse.
+    Class cls = objc_getClass("DSParkAUEditorContainer");
+    if (cls == nullptr) return;
+    if (Ivar ivar = class_getInstanceVariable(cls, "dsparkSink"))
+    {
+        auto* sink = reinterpret_cast<EditorViewSink*>(
+            object_getIvar(static_cast<id>(self), ivar));
+        if (sink != nullptr && sink->onDealloc != nullptr)
+            sink->onDealloc(sink->context);
+    }
+    objc_super super { static_cast<id>(self), class_getSuperclass(cls) };
+    reinterpret_cast<void (*)(objc_super*, SEL)>(&objc_msgSendSuper)(
+        &super, sel_registerName("dealloc"));
+}
+
+/** @brief The NSView subclass hosting the editor. Returns null when AppKit is
+ *  not loaded (a faceless host like auval — which never asks for views). */
+inline Class editorContainerClass() noexcept
+{
+    static Class registered = []() -> Class {
+        Class viewCls = objc_getClass("NSView");
+        if (viewCls == nullptr) return nullptr;
+        Class c = objc_allocateClassPair(viewCls, "DSParkAUEditorContainer", 0);
+        if (c == nullptr)   // another DSPark plugin in this process won the race
+            return objc_getClass("DSParkAUEditorContainer");
+        class_addIvar(c, "dsparkSink", sizeof(void*), alignof(void*) == 8 ? 3 : 2, "^v");
+        class_addMethod(c, sel_registerName("dealloc"),
+                        reinterpret_cast<IMP>(&editorContainerDealloc), "v@:");
+        objc_registerClassPair(c);
+        return c;
+    }();
+    return registered;
+}
+
+inline unsigned int editorFactoryInterfaceVersion(void*, SEL) noexcept
+{
+    return 0;   // AUCocoaUIBase protocol version
+}
+
+inline void* editorFactoryUiView(void*, SEL, void* audioUnit, ViewSize size) noexcept
+{
+    EditorHook hook {};
+    UInt32 ioSize = sizeof(hook);
+    if (audioUnit == nullptr
+        || AudioUnitGetProperty(static_cast<AudioUnit>(audioUnit),
+                                kDsparkEditorHookProperty, kAudioUnitScope_Global,
+                                0, &hook, &ioSize) != noErr
+        || hook.createView == nullptr)
+        return nullptr;
+    return hook.createView(hook.context, size.width, size.height);
+}
+
+/** @brief The AUCocoaUIBase factory class announced through CocoaUI. */
+inline Class editorFactoryClass() noexcept
+{
+    static Class registered = []() -> Class {
+        Class c = objc_allocateClassPair(objc_getClass("NSObject"),
+                                         "DSParkAUCocoaViewFactory", 0);
+        if (c == nullptr)
+            return objc_getClass("DSParkAUCocoaViewFactory");
+        class_addMethod(c, sel_registerName("interfaceVersion"),
+                        reinterpret_cast<IMP>(&editorFactoryInterfaceVersion), "I@:");
+        class_addMethod(c, sel_registerName("uiViewForAudioUnit:withSize:"),
+                        reinterpret_cast<IMP>(&editorFactoryUiView),
+                        "@@:^{ComponentInstanceRecord=}{CGSize=dd}");
+        // Hosts overwhelmingly probe by respondsToSelector; declare the formal
+        // protocol too when some loaded image has registered it.
+        if (Protocol* proto = objc_getProtocol("AUCocoaUIBase"))
+            class_addProtocol(c, proto);
+        objc_registerClassPair(c);
+        return c;
+    }();
+    return registered;
+}
+
+/** @brief CFURL of the bundle this code lives in (caller releases), derived
+ *  from the image path: .../Foo.component/Contents/MacOS/Foo. A bare dylib
+ *  (tests) falls back to its directory. */
+inline CFURLRef copyOwningBundleUrl() noexcept
+{
+    static const int anchor = 0;   // any address inside THIS image
+    Dl_info info {};
+    if (dladdr(&anchor, &info) == 0 || info.dli_fname == nullptr) return nullptr;
+    const char* path = info.dli_fname;
+    const char* marker = nullptr;
+    for (const char* p = std::strstr(path, "/Contents/MacOS/"); p != nullptr;
+         p = std::strstr(p + 1, "/Contents/MacOS/"))
+        marker = p;   // last occurrence wins (nested bundle layouts)
+    size_t length = marker != nullptr ? static_cast<size_t>(marker - path) : 0;
+    if (length == 0)
+        if (const char* slash = std::strrchr(path, '/'))
+            length = static_cast<size_t>(slash - path);
+    if (length == 0) return nullptr;
+    return CFURLCreateFromFileSystemRepresentation(
+        kCFAllocatorDefault, reinterpret_cast<const UInt8*>(path),
+        static_cast<CFIndex>(length), true);
+}
+
+#endif // DSPARK_PLUGIN_WEBVIEW
 
 template <typename P>
 struct Plugin
@@ -95,8 +253,18 @@ struct Plugin
     std::vector<Listener> listeners;
     CFStringRef presetName = nullptr;
 
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+    webview_ui::Editor<P> editor;
+    void* editorContainer = nullptr;   // NSView* the HOST owns; weak here
+    EditorViewSink editorSink {};
+    bool editActive[kNumParams == 0 ? 1 : kNumParams] {};
+#endif
+
     ~Plugin() noexcept
     {
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+        teardownEditor();
+#endif
         if (presetName != nullptr) CFRelease(presetName);
     }
 
@@ -136,6 +304,121 @@ struct Plugin
                 static_cast<float>(toPlain(P::parameters[i],
                                            shadow[i].load(std::memory_order_relaxed))));
     }
+
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+
+    // --- WebView editor (all on the host's main thread) -----------------------------
+
+    static constexpr bool kHasWebEditor =
+        HasEditor<P> && webview_ui::Editor<P>::kAvailable;
+
+    void sendGesture(int index, AudioUnitEventType type) noexcept
+    {
+        AudioUnitEvent event {};
+        event.mEventType = type;
+        event.mArgument.mParameter = AudioUnitParameter {
+            instance, hash32(P::parameters[static_cast<size_t>(index)].id),
+            kAudioUnitScope_Global, 0 };
+        AUEventListenerNotify(nullptr, nullptr, &event);
+    }
+
+    // Editor -> host/DSP bridge. AUParameterSet routes through our own
+    // SetParameter (shadow + user setter) AND notifies host listeners, which
+    // is how AU hosts observe UI edits for automation recording.
+    static void cbSetParam(void* context, int index, double plain) noexcept
+    {
+        auto* self = static_cast<Plugin*>(context);
+        const AudioUnitParameter parameter {
+            self->instance, hash32(P::parameters[static_cast<size_t>(index)].id),
+            kAudioUnitScope_Global, 0 };
+        const bool inGesture = self->editActive[static_cast<size_t>(index)];
+        if (!inGesture)   // edits outside a drag still need a gesture for undo
+            self->sendGesture(index, kAudioUnitEvent_BeginParameterChangeGesture);
+        AUParameterSet(nullptr, nullptr, &parameter,
+                       static_cast<AudioUnitParameterValue>(plain), 0);
+        if (!inGesture)
+            self->sendGesture(index, kAudioUnitEvent_EndParameterChangeGesture);
+    }
+
+    static void cbBeginEdit(void* context, int index) noexcept
+    {
+        auto* self = static_cast<Plugin*>(context);
+        self->editActive[static_cast<size_t>(index)] = true;
+        self->sendGesture(index, kAudioUnitEvent_BeginParameterChangeGesture);
+    }
+
+    static void cbEndEdit(void* context, int index) noexcept
+    {
+        auto* self = static_cast<Plugin*>(context);
+        self->editActive[static_cast<size_t>(index)] = false;
+        self->sendGesture(index, kAudioUnitEvent_EndParameterChangeGesture);
+    }
+
+    static void sOnContainerDealloc(void* context) noexcept
+    {
+        auto* self = static_cast<Plugin*>(context);
+        self->editorContainer = nullptr;   // the host is destroying the view
+        self->editor.destroy();
+    }
+
+    /** Plugin dies first (or the host asks for a fresh view): disconnect the
+     *  container so its later dealloc no longer calls back, then tear down. */
+    void teardownEditor() noexcept
+    {
+        if (editorContainer != nullptr)
+        {
+            Class cls = editorContainerClass();
+            if (Ivar ivar = cls != nullptr
+                    ? class_getInstanceVariable(cls, "dsparkSink") : nullptr)
+                object_setIvar(static_cast<id>(editorContainer), ivar, nullptr);
+            editorContainer = nullptr;
+        }
+        editor.destroy();
+    }
+
+    static void* sCreateEditorView(void* context, double width, double height) noexcept
+    {
+        return static_cast<Plugin*>(context)->createEditorView(width, height);
+    }
+
+    /** Builds the container NSView + embedded web engine. Returns the view
+     *  AUTORELEASED (Cocoa factory convention: the host retains it), or null
+     *  so the host falls back to its generic UI. The host's preferred size is
+     *  advisory (often 0x0); the declared editorSize wins, like the other
+     *  backends. */
+    void* createEditorView(double, double) noexcept
+    {
+        namespace og = webview_ui::objc_glue;
+        teardownEditor();   // hosts may ask again without releasing the first view
+        Class cls = editorContainerClass();
+        if (cls == nullptr) return nullptr;   // AppKit absent: faceless host
+        const EditorSize logical = editorSizeOf<P>();
+        const og::Rect frame { 0.0, 0.0, static_cast<double>(logical.width),
+                               static_cast<double>(logical.height) };
+        og::ObjId view = og::call(og::call(reinterpret_cast<og::ObjId>(cls), "alloc"),
+                                  "initWithFrame:", frame);
+        if (view == nullptr) return nullptr;
+        const webview_ui::HostCallbacks callbacks {
+            this, &cbSetParam, &cbBeginEdit, &cbEndEdit
+        };
+        if (!editor.create(view, shadow, callbacks))
+        {
+            og::call<void>(view, "release");
+            return nullptr;
+        }
+        editorSink = { &sOnContainerDealloc, this };
+        if (Ivar ivar = class_getInstanceVariable(cls, "dsparkSink"))
+            object_setIvar(static_cast<id>(view),
+                           ivar, reinterpret_cast<id>(&editorSink));
+        editorContainer = view;
+        editor.setBounds(logical.width, logical.height);
+        editor.setVisible(true);
+        webview_ui::debugLog("au createEditorView %dx%d container=%p",
+                             logical.width, logical.height, view);
+        return og::call(view, "autorelease");
+    }
+
+#endif // DSPARK_PLUGIN_WEBVIEW
 
     // --- lifecycle ---------------------------------------------------------------
 
@@ -238,6 +521,16 @@ struct Plugin
         case kAudioUnitProperty_PresentPreset:
         case kAudioUnitProperty_CurrentPreset:
             size = sizeof(AUPreset); writable = true; break;
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+        case kAudioUnitProperty_CocoaUI:
+            if constexpr (!kHasWebEditor) return kAudioUnitErr_InvalidProperty;
+            size = sizeof(AudioUnitCocoaViewInfo);
+            break;
+        case kDsparkEditorHookProperty:
+            if constexpr (!kHasWebEditor) return kAudioUnitErr_InvalidProperty;
+            size = sizeof(EditorHook);
+            break;
+#endif
         default:
             (void) element;
             return kAudioUnitErr_InvalidProperty;
@@ -425,6 +718,36 @@ struct Plugin
             *ioSize = sizeof(CFPropertyListRef);
             return noErr;
         }
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+        case kAudioUnitProperty_CocoaUI:
+        {
+            if constexpr (!kHasWebEditor) return kAudioUnitErr_InvalidProperty;
+            if (*ioSize < sizeof(AudioUnitCocoaViewInfo))
+                return kAudioUnitErr_InvalidPropertyValue;
+            Class factory = editorFactoryClass();   // registered before the host
+            CFURLRef url = copyOwningBundleUrl();   // looks the class name up
+            if (factory == nullptr || url == nullptr)
+            {
+                if (url != nullptr) CFRelease(url);
+                return kAudioUnitErr_InvalidProperty;
+            }
+            auto* viewInfo = static_cast<AudioUnitCocoaViewInfo*>(outData);
+            viewInfo->mCocoaAUViewBundleLocation = url;   // caller releases both
+            viewInfo->mCocoaAUViewClass[0] = CFStringCreateWithCString(
+                nullptr, class_getName(factory), kCFStringEncodingUTF8);
+            *ioSize = sizeof(AudioUnitCocoaViewInfo);
+            return noErr;
+        }
+        case kDsparkEditorHookProperty:
+        {
+            if constexpr (!kHasWebEditor) return kAudioUnitErr_InvalidProperty;
+            if (*ioSize < sizeof(EditorHook))
+                return kAudioUnitErr_InvalidPropertyValue;
+            *static_cast<EditorHook*>(outData) = EditorHook { this, &sCreateEditorView };
+            *ioSize = sizeof(EditorHook);
+            return noErr;
+        }
+#endif
         default:
             return kAudioUnitErr_InvalidProperty;
         }

@@ -9,10 +9,11 @@
  * in the host window through the platform web engine.
  *
  * Opt-in and additive: include this header BEFORE the format headers, set
- * `hasEditor = true` and serve your page from `editorHtml()` — the VST3 and
- * CLAP backends then embed it inside the window the host provides (the AU
- * backend keeps the host's generic UI). Nothing else in the plugin class
- * changes; plugins without this header keep building exactly as before.
+ * `hasEditor = true` and serve your page from `editorHtml()` — the VST3,
+ * CLAP and AU backends then embed it inside the window the host provides
+ * (AU through a Cocoa view factory announced via kAudioUnitProperty_CocoaUI).
+ * Nothing else in the plugin class changes; plugins without this header keep
+ * building exactly as before.
  *
  * ```cpp
  * #include "plugin/webview/DSParkWebViewEditor.h"   // FIRST
@@ -60,7 +61,8 @@
  * page — no native timers, no locks, no allocation on the audio thread.
  */
 
-#if defined(DSPARK_PLUGIN_VST3_INCLUDED) || defined(DSPARK_PLUGIN_CLAP_INCLUDED)
+#if defined(DSPARK_PLUGIN_VST3_INCLUDED) || defined(DSPARK_PLUGIN_CLAP_INCLUDED) \
+    || defined(DSPARK_PLUGIN_AU_INCLUDED)
 #error "Include plugin/webview/DSParkWebViewEditor.h BEFORE the plugin format headers"
 #endif
 

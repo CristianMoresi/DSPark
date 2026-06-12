@@ -135,6 +135,13 @@ jobs:
             "$HOME/Library/Audio/Plug-Ins/Components/"
           killall -9 AudioComponentRegistrar 2>/dev/null || true
           auval -v aufx DSwg DSpk
+          # WebView editor through the AU Cocoa contract: factory class, real
+          # WKWebView attach, bridge handshake, both teardown orders.
+          clang++ -std=c++20 -O2 -Wall -Wextra -I . tools/au_editor_smoke.cpp \
+            -framework AudioToolbox -framework CoreFoundation -framework AppKit \
+            -lobjc -o au_editor_smoke
+          ./au_editor_smoke aufx DSst DSpk --expect-no-editor
+          ./au_editor_smoke aufx DSwg DSpk --expect-editor 300x360
 
       - name: Official validators (pluginval + clap-validator)
         if: matrix.name == 'Windows MSVC x64' || matrix.name == 'Linux GCC x64' || matrix.name == 'macOS Clang arm64'

@@ -709,9 +709,13 @@ struct View
 {
     static constexpr size_t kNumParams = Plugin<P>::kNumParams;
 
-    // Two COM lenses, same layout trick as the plugin object.
+    // COM lenses, same layout trick as the plugin object. The timer lens is
+    // Linux-only: it receives the host IRunLoop ticks that drive GTK.
     const Steinberg_IPlugViewVtbl*                    viewVtbl;
     const Steinberg_IPlugViewContentScaleSupportVtbl* scaleVtbl;
+#if defined(__linux__)
+    const Steinberg_Linux_ITimerHandlerVtbl*          timerVtbl;
+#endif
 
     std::atomic<Steinberg_uint32> refs { 1 };
     Plugin<P>* owner;
@@ -722,11 +726,18 @@ struct View
     double scale = 1.0;
     bool correctingSize = false;   // re-entrancy guard for resizeView round-trips
     bool editActive[kNumParams == 0 ? 1 : kNumParams] {};
+#if defined(__linux__)
+    Steinberg_Linux_IRunLoop* runLoop = nullptr;
+    bool timerRegistered = false;
+#endif
 
     explicit View(Plugin<P>* plugin) noexcept : owner(plugin)
     {
         viewVtbl  = &kViewVtbl;
         scaleVtbl = &kScaleVtbl;
+#if defined(__linux__)
+        timerVtbl = &kTimerVtbl;
+#endif
         owner->addRefImpl();
         const EditorSize logical = editorSizeOf<P>();
         width  = logical.width;
@@ -735,11 +746,61 @@ struct View
 
     ~View()
     {
+#if defined(__linux__)
+        releaseRunLoop();
+#endif
         editor.destroy();
         if (frame != nullptr)
             reinterpret_cast<Steinberg_FUnknown*>(frame)->lpVtbl->release(frame);
         owner->releaseImpl();
     }
+
+#if defined(__linux__)
+
+    // --- host run loop: GTK breathes only when pumped from here ---------------------
+
+    void acquireRunLoop() noexcept
+    {
+        if (frame == nullptr || runLoop != nullptr) return;
+        void* loop = nullptr;
+        if (reinterpret_cast<Steinberg_FUnknown*>(frame)->lpVtbl->queryInterface(
+                frame, Steinberg_Linux_IRunLoop_iid, &loop) == Steinberg_kResultOk)
+            runLoop = static_cast<Steinberg_Linux_IRunLoop*>(loop);
+    }
+
+    void startTimer() noexcept
+    {
+        acquireRunLoop();
+        if (runLoop != nullptr && !timerRegistered && editor.created())
+            timerRegistered = runLoop->lpVtbl->registerTimer(runLoop,
+                reinterpret_cast<Steinberg_Linux_ITimerHandler*>(lensPtr(2)),
+                33) == Steinberg_kResultOk;
+    }
+
+    void stopTimer() noexcept
+    {
+        if (runLoop != nullptr && timerRegistered)
+            runLoop->lpVtbl->unregisterTimer(runLoop,
+                reinterpret_cast<Steinberg_Linux_ITimerHandler*>(lensPtr(2)));
+        timerRegistered = false;
+    }
+
+    void releaseRunLoop() noexcept
+    {
+        stopTimer();
+        if (runLoop != nullptr)
+        {
+            reinterpret_cast<Steinberg_FUnknown*>(runLoop)->lpVtbl->release(runLoop);
+            runLoop = nullptr;
+        }
+    }
+
+    static void SMTG_STDMETHODCALLTYPE sOnTimer(void* self_)
+    {
+        fromLens(self_, 2)->editor.pump();
+    }
+
+#endif // __linux__
 
     static View* fromLens(void* iface, int lens) noexcept
     {
@@ -815,6 +876,10 @@ struct View
             *obj = lensPtr(0);
         else if (tuidEqual(iid, Steinberg_IPlugViewContentScaleSupport_iid))
             *obj = lensPtr(1);
+#if defined(__linux__)
+        else if (tuidEqual(iid, Steinberg_Linux_ITimerHandler_iid))
+            *obj = lensPtr(2);
+#endif
         if (*obj == nullptr) return Steinberg_kNoInterface;
         refs.fetch_add(1, std::memory_order_relaxed);
         return Steinberg_kResultOk;
@@ -844,7 +909,7 @@ struct View
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sIsPlatformTypeSupported(void*,
         Steinberg_FIDString type)
     {
-        return (webview_ui::Editor<P>::kAvailable && type != nullptr
+        return (webview_ui::Editor<P>::available() && type != nullptr
                 && std::strcmp(type, platformType()) == 0)
              ? Steinberg_kResultTrue : Steinberg_kResultFalse;
     }
@@ -875,12 +940,27 @@ struct View
         }
         view->editor.setBounds(view->width, view->height);
         view->editor.setVisible(true);
+#if defined(__linux__)
+        // GTK breathes only when pumped from the host's run loop; without a
+        // usable IRunLoop the page would freeze, so fall back to generic UI.
+        view->startTimer();
+        if (!view->timerRegistered)
+        {
+            webview_ui::debugLog("vst3 attached: no usable IRunLoop -> no editor");
+            view->editor.destroy();
+            return Steinberg_kResultFalse;
+        }
+#endif
         return Steinberg_kResultOk;
     }
 
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sRemoved(void* self_)
     {
-        fromLens(self_, 0)->editor.destroy();
+        auto* view = fromLens(self_, 0);
+#if defined(__linux__)
+        view->stopTimer();
+#endif
+        view->editor.destroy();
         return Steinberg_kResultOk;
     }
 
@@ -948,6 +1028,9 @@ struct View
                                                               Steinberg_IPlugFrame* frame)
     {
         auto* view = fromLens(self_, 0);
+#if defined(__linux__)
+        view->releaseRunLoop();   // the run loop belongs to the old frame
+#endif
         if (view->frame != nullptr)
             reinterpret_cast<Steinberg_FUnknown*>(view->frame)
                 ->lpVtbl->release(view->frame);
@@ -955,6 +1038,10 @@ struct View
         if (view->frame != nullptr)
             reinterpret_cast<Steinberg_FUnknown*>(view->frame)
                 ->lpVtbl->addRef(view->frame);
+#if defined(__linux__)
+        if (view->editor.created())
+            view->startTimer();   // frame arrived after attach (rare order)
+#endif
         return Steinberg_kResultOk;
     }
 
@@ -1019,6 +1106,14 @@ struct View
         &sQuery<1>, &sAddRef<1>, &sRelease<1>,
         &sSetContentScaleFactor
     };
+
+#if defined(__linux__)
+    // Defined after the FUnknown thunks: a static member INITIALIZER has no
+    // complete-class context, so every name it uses must be declared above.
+    inline static const Steinberg_Linux_ITimerHandlerVtbl kTimerVtbl = {
+        &sQuery<2>, &sAddRef<2>, &sRelease<2>, &sOnTimer
+    };
+#endif
 };
 
 #endif // DSPARK_PLUGIN_WEBVIEW
@@ -1032,7 +1127,7 @@ Steinberg_IPlugView* SMTG_STDMETHODCALLTYPE Plugin<P>::sCreateView(void* self_,
 #if defined(DSPARK_PLUGIN_WEBVIEW)
     if constexpr (HasEditor<P>)
     {
-        if (webview_ui::Editor<P>::kAvailable && name != nullptr
+        if (webview_ui::Editor<P>::available() && name != nullptr
             && std::strcmp(name, "editor") == 0)
         {
             auto* view = new (std::nothrow) View<P>(fromLens(self_, 2));

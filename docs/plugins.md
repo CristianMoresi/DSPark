@@ -165,7 +165,7 @@ runtime from this very binary — still no Objective-C sources to write):
 |---|---|---|
 | Windows | WebView2 (Edge runtime, ships with Win10/11; vendored MIT `webview` library + BSD-3 SDK header, nothing to install) | exercised in a real window on every change (`tools/vst3_editor_host`) |
 | macOS | WKWebView (system WebKit, loaded at runtime through the Objective-C runtime — no extra SDK; link `-lobjc`) | VST3, CLAP **and AU**; the AU editor contract (factory, real WKWebView, bridge handshake, teardown) runs in CI via `tools/au_editor_smoke` |
-| Linux | — | plugin builds unchanged; hosts show their generic UI (no stable embedding story for WebKitGTK inside a foreign X11 window yet) |
+| Linux | WebKitGTK (GTK3) — resolved entirely through `dlopen` at runtime, embedded with GtkPlug/XEmbed in the host's X11 window; GTK is pumped from the host run loop (VST3 `IRunLoop` / CLAP `timer-support`) | full attach + bridge handshake runs in CI under xvfb via `tools/x11_editor_smoke`; systems without WebKitGTK (or hosts without a run loop) keep the generic UI |
 
 A complete working example — knobs with drag/wheel/double-click, a discrete
 selector, gestures, automation feedback — lives in
@@ -247,9 +247,11 @@ modes looks right; `examples/plugin_webview_editor/` uses `KeepAspect`.
    module through the full lifecycle like a DAW — including the editor
    contract (view creation, platform support, sizing, refcounts) — and exit
    non-zero on any misbehaviour. `tools/vst3_editor_host.cpp` additionally
-   opens the editor in a real window (Windows), and `tools/au_editor_smoke.cpp`
+   opens the editor in a real window (Windows), `tools/au_editor_smoke.cpp`
    drives the AU Cocoa view contract end to end (macOS): factory class, a
-   real WKWebView, the JS bridge handshake and both teardown orders.
+   real WKWebView, the JS bridge handshake and both teardown orders — and
+   `tools/x11_editor_smoke.cpp` does the same for Linux: a real X11 window,
+   an IRunLoop-driven WebKitGTK attach and the bridge handshake under xvfb.
 2. **Official validators**: Tracktion's
    [`pluginval`](https://github.com/Tracktion/pluginval) (strictness 8) and
    [`clap-validator`](https://github.com/free-audio/clap-validator) gate this

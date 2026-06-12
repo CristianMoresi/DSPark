@@ -2,10 +2,10 @@
 //
 // The GUI is plain HTML/CSS/JS embedded in this file and served through
 // DSPark's WebView editor layer: one UI codebase for every format, rendered
-// by the platform web engine (WebView2 on Windows, WKWebView on macOS; on
-// Linux the host's generic editor is used until that path lands). The page
-// talks to the DSP through the injected `dspark` bridge — same stable text
-// ids as state and automation.
+// by the platform web engine (WebView2 on Windows, WKWebView on macOS,
+// WebKitGTK on Linux/X11 — dlopen'd at runtime, generic host UI where it is
+// missing). The page talks to the DSP through the injected `dspark` bridge —
+// same stable text ids as state and automation.
 //
 // Build (Windows):
 //   cl /std:c++20 /O2 /LD /EHsc /I ..\.. webview_saturator.cpp /Fe:DSParkWebSaturator.vst3

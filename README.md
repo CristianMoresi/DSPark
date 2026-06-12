@@ -77,8 +77,8 @@ lifecycle like a DAW would; both run in CI on Windows, Linux and macOS.
 
 Want a custom GUI? Write it in **plain HTML/CSS/JS** — the WebView editor
 layer embeds it in the host window across VST3, CLAP and AU (WebView2 on
-Windows, WKWebView on macOS) with a tiny `dspark` JS bridge for parameters
-and automation gestures. Keep the UI as ordinary separate web files and
+Windows, WKWebView on macOS, WebKitGTK on Linux/X11) with a tiny `dspark`
+JS bridge for parameters and automation gestures. Keep the UI as ordinary separate web files and
 `dspark_add_plugin(... EDITOR_HTML ui/editor.html)` embeds them at build
 time. `examples/plugin_webview_editor/` is a complete plugin with knobs,
 `examples/plugin_webview_files/` shows the separate-files workflow, and

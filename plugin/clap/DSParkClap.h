@@ -43,6 +43,7 @@
 #include "clap/clap.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <new>
 
@@ -79,6 +80,11 @@ struct Plugin
     int    guiWidth = 0, guiHeight = 0;
     bool   guiEditActive[kNumParams == 0 ? 1 : kNumParams] {};
     const clap_host_params_t* hostParams = nullptr;
+#if defined(__linux__)
+    // GTK is driven from the host's run loop: a timer-support tick pumps it.
+    const clap_host_timer_support_t* hostTimer = nullptr;
+    clap_id guiTimerId = CLAP_INVALID_ID;
+#endif
 
     enum : uint8_t { kUiGestureBegin = 0, kUiValue = 1, kUiGestureEnd = 2 };
     struct UiEvent
@@ -318,8 +324,15 @@ struct Plugin
         if (std::strcmp(id, CLAP_EXT_TAIL) == 0)        return &kTail;
 #if defined(DSPARK_PLUGIN_WEBVIEW)
         if constexpr (HasEditor<P>)
-            if (webview_ui::Editor<P>::kAvailable && std::strcmp(id, CLAP_EXT_GUI) == 0)
+        {
+            if (webview_ui::Editor<P>::available() && std::strcmp(id, CLAP_EXT_GUI) == 0)
                 return &kGui;
+#if defined(__linux__)
+            if (webview_ui::Editor<P>::available()
+                && std::strcmp(id, CLAP_EXT_TIMER_SUPPORT) == 0)
+                return &kTimer;
+#endif
+        }
 #endif
         return nullptr;
     }
@@ -577,7 +590,7 @@ struct Plugin
                                    bool isFloating) noexcept
     {
         return !isFloating && api != nullptr && std::strcmp(api, clapWindowApi()) == 0
-            && webview_ui::Editor<P>::kAvailable;
+            && webview_ui::Editor<P>::available();
     }
 
     static bool sGuiGetPreferredApi(const clap_plugin_t*, const char** api,
@@ -586,7 +599,7 @@ struct Plugin
         if (api == nullptr || isFloating == nullptr) return false;
         *api = clapWindowApi();
         *isFloating = false;
-        return webview_ui::Editor<P>::kAvailable;
+        return webview_ui::Editor<P>::available();
     }
 
     static bool sGuiCreate(const clap_plugin_t* p, const char* api,
@@ -594,6 +607,22 @@ struct Plugin
     {
         auto* s = self(p);
         if (!sGuiIsApiSupported(p, api, isFloating)) return false;
+#if defined(__linux__)
+        // GTK breathes only when pumped from the host's run loop; without
+        // timer-support the page would freeze — fall back to generic UI.
+        s->hostTimer = s->host != nullptr
+            ? static_cast<const clap_host_timer_support_t*>(
+                  s->host->get_extension(s->host, CLAP_EXT_TIMER_SUPPORT))
+            : nullptr;
+        if (s->hostTimer == nullptr || s->hostTimer->register_timer == nullptr
+            || !s->hostTimer->register_timer(s->host, 33, &s->guiTimerId))
+        {
+            webview_ui::debugLog("clap gui create: no host timer-support -> no editor");
+            s->hostTimer = nullptr;
+            s->guiTimerId = CLAP_INVALID_ID;
+            return false;
+        }
+#endif
         const EditorSize logical = editorSizeOf<P>();
         s->guiWidth  = static_cast<int>(logical.width * s->guiScale + 0.5);
         s->guiHeight = static_cast<int>(logical.height * s->guiScale + 0.5);
@@ -606,6 +635,12 @@ struct Plugin
     static void sGuiDestroy(const clap_plugin_t* p) noexcept
     {
         auto* s = self(p);
+#if defined(__linux__)
+        if (s->hostTimer != nullptr && s->guiTimerId != CLAP_INVALID_ID)
+            s->hostTimer->unregister_timer(s->host, s->guiTimerId);
+        s->hostTimer = nullptr;
+        s->guiTimerId = CLAP_INVALID_ID;
+#endif
         s->guiEditor.destroy();
         s->guiActive = false;
     }
@@ -692,12 +727,19 @@ struct Plugin
     {
         auto* s = self(p);
         if (window == nullptr || !s->guiActive) return false;
+#if defined(__linux__)
+        // The X11 window id rides the union's dedicated field.
+        void* parentHandle = reinterpret_cast<void*>(
+            static_cast<std::uintptr_t>(window->x11));
+#else
+        void* parentHandle = window->ptr;
+#endif
         webview_ui::debugLog("clap gui set_parent %p negotiated=%dx%d",
-                             window->ptr, s->guiWidth, s->guiHeight);
+                             parentHandle, s->guiWidth, s->guiHeight);
         const webview_ui::HostCallbacks callbacks {
             s, &cbGuiSetParam, &cbGuiBeginEdit, &cbGuiEndEdit
         };
-        if (!s->guiEditor.create(window->ptr, s->shadow, callbacks))
+        if (!s->guiEditor.create(parentHandle, s->shadow, callbacks))
             return false;
         // Fill whatever box the host actually built (call order differs
         // between hosts); fall back to the negotiated size otherwise.
@@ -736,6 +778,19 @@ struct Plugin
         &sGuiAdjustSize, &sGuiSetSize, &sGuiSetParent, &sGuiSetTransient,
         &sGuiSuggestTitle, &sGuiShow, &sGuiHide
     };
+
+#if defined(__linux__)
+
+    // --- ext: timer-support (drives the GTK main context for the editor) -----------
+
+    static void sOnTimer(const clap_plugin_t* p, clap_id) noexcept
+    {
+        self(p)->guiEditor.pump();
+    }
+
+    inline static const clap_plugin_timer_support_t kTimer = { &sOnTimer };
+
+#endif // __linux__
 #endif // DSPARK_PLUGIN_WEBVIEW
 
     // --- descriptor & factory ----------------------------------------------------------

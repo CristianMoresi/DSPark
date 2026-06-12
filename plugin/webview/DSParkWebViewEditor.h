@@ -49,10 +49,13 @@
  * - **macOS** — WKWebView created directly through the Objective-C runtime
  *   (no headers, WebKit.framework loaded at runtime) and added as a subview
  *   of the host's NSView.
- * - **Linux** — not yet wired (no stable cross-host embedding story for
- *   WebKitGTK inside an X11 socket); the editor reports unavailable and
- *   hosts fall back to their generic parameter UI. The same plugin source
- *   builds unchanged.
+ * - **Linux** — WebKitGTK (GTK3) resolved entirely through dlopen at runtime
+ *   (no headers, no link-time dependency), embedded in the host's X11 window
+ *   with GtkPlug/XEmbed — the same route LV2's suil takes. GTK is driven
+ *   from the HOST's run loop through Editor::pump() (VST3 IRunLoop timers /
+ *   CLAP timer-support); a plugin must never spin its own GTK main loop.
+ *   Systems without WebKitGTK (or hosts without a usable run loop) keep the
+ *   host's generic parameter UI — the same plugin binary, unchanged.
  *
  * Threading: every editor call (create/destroy/resize/JS callbacks) runs on
  * the host's main/UI thread. Values flow UI -> DSP through the wrapper's
@@ -82,6 +85,7 @@
 //
 // DSPARK_WEBVIEW_BACKEND: 1 = WebView2 via vendored webview.h (Windows),
 //                         2 = WKWebView via the Objective-C runtime (macOS),
+//                         3 = WebKitGTK via dlopen + GtkPlug/XEmbed (Linux/X11),
 //                         0 = stub (editor reports unavailable).
 
 #if defined(_WIN32) && !defined(DSPARK_NO_EXCEPTIONS) \
@@ -107,6 +111,11 @@
     #include <objc/message.h>
     #include <objc/runtime.h>
     #include <dlfcn.h>
+#elif defined(__linux__)
+    #define DSPARK_WEBVIEW_BACKEND 3
+    #include <dlfcn.h>
+    #include <cstdint>
+    #include <type_traits>
 #else
     #define DSPARK_WEBVIEW_BACKEND 0
 #endif
@@ -528,6 +537,132 @@ inline bool loadWebKit() noexcept
 
 #endif // DSPARK_WEBVIEW_BACKEND == 2
 
+#if DSPARK_WEBVIEW_BACKEND == 3
+
+// -- Linux: WebKitGTK resolved at runtime -------------------------------------------
+//
+// Every entry point comes from ONE dlopen of libwebkit2gtk (GTK3, GLib and
+// JavaScriptCore are its dependencies, so dlsym on that handle resolves them
+// all): no GTK headers, no pkg-config, no link-time dependency — plugins
+// keep building with the plain C++ toolchain and simply report the editor
+// unavailable where WebKitGTK is missing. GTK3 is required for GtkPlug
+// (XEmbed into the host's X11 window); GTK4 removed it, which is why the
+// 4.x webkit2gtk line is used and not webkitgtk-6.0.
+
+namespace gtk_glue {
+
+/** @brief The WebKitGTK/GTK3 surface the editor uses, all dlsym-resolved.
+ *  `ok` is true only when every required symbol was found. */
+struct Api
+{
+    bool ok = false;
+    // GTK3 / GLib / GObject
+    int   (*gtkInitCheck)(int*, char***) = nullptr;
+    void* (*plugNew)(unsigned long) = nullptr;
+    void  (*containerAdd)(void*, void*) = nullptr;
+    void  (*widgetShowAll)(void*) = nullptr;
+    void  (*widgetSetVisible)(void*, int) = nullptr;
+    void  (*widgetDestroy)(void*) = nullptr;
+    void  (*windowSetDefaultSize)(void*, int, int) = nullptr;
+    void  (*windowResize)(void*, int, int) = nullptr;
+    unsigned long (*signalConnectData)(void*, const char*, void (*)(), void*,
+                                       void*, int) = nullptr;
+    void  (*signalHandlerDisconnect)(void*, unsigned long) = nullptr;
+    int   (*mainContextPending)(void*) = nullptr;
+    int   (*mainContextIteration)(void*, int) = nullptr;
+    void  (*gFree)(void*) = nullptr;
+    // WebKit
+    void* (*webViewNew)() = nullptr;
+    void* (*viewGetContentManager)(void*) = nullptr;
+    int   (*contentManagerRegisterHandler)(void*, const char*) = nullptr;
+    void  (*contentManagerUnregisterHandler)(void*, const char*) = nullptr;
+    void* (*userScriptNew)(const char*, int, int, const char* const*,
+                           const char* const*) = nullptr;
+    void  (*contentManagerAddScript)(void*, void*) = nullptr;
+    void  (*userScriptUnref)(void*) = nullptr;
+    void  (*loadHtml)(void*, const char*, const char*) = nullptr;
+    // JS eval: run_javascript exists on every 4.0/4.1 (deprecated since
+    // 2.40); evaluate_javascript replaces it from 2.40 on. Either works.
+    void  (*runJs)(void*, const char*, void*, void*, void*) = nullptr;
+    void  (*evalJs)(void*, const char*, long, const char*, const char*,
+                    void*, void*, void*) = nullptr;
+    void* (*jsResultGetValue)(void*) = nullptr;
+    char* (*jscValueToString)(void*) = nullptr;
+};
+
+inline Api loadApi() noexcept
+{
+    Api api {};
+    void* lib = dlopen("libwebkit2gtk-4.1.so.0", RTLD_LAZY | RTLD_LOCAL);
+    if (lib == nullptr)
+        lib = dlopen("libwebkit2gtk-4.0.so.37", RTLD_LAZY | RTLD_LOCAL);
+    if (lib == nullptr)
+    {
+        debugLog("linux engine: libwebkit2gtk not found (generic UI)");
+        return api;
+    }
+    auto load = [lib](auto& fn, const char* name) {
+        fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dlsym(lib, name));
+    };
+    load(api.gtkInitCheck, "gtk_init_check");
+    load(api.plugNew, "gtk_plug_new");
+    load(api.containerAdd, "gtk_container_add");
+    load(api.widgetShowAll, "gtk_widget_show_all");
+    load(api.widgetSetVisible, "gtk_widget_set_visible");
+    load(api.widgetDestroy, "gtk_widget_destroy");
+    load(api.windowSetDefaultSize, "gtk_window_set_default_size");
+    load(api.windowResize, "gtk_window_resize");
+    load(api.signalConnectData, "g_signal_connect_data");
+    load(api.signalHandlerDisconnect, "g_signal_handler_disconnect");
+    load(api.mainContextPending, "g_main_context_pending");
+    load(api.mainContextIteration, "g_main_context_iteration");
+    load(api.gFree, "g_free");
+    load(api.webViewNew, "webkit_web_view_new");
+    load(api.viewGetContentManager, "webkit_web_view_get_user_content_manager");
+    load(api.contentManagerRegisterHandler,
+         "webkit_user_content_manager_register_script_message_handler");
+    load(api.contentManagerUnregisterHandler,
+         "webkit_user_content_manager_unregister_script_message_handler");
+    load(api.userScriptNew, "webkit_user_script_new");
+    load(api.contentManagerAddScript, "webkit_user_content_manager_add_script");
+    load(api.userScriptUnref, "webkit_user_script_unref");
+    load(api.loadHtml, "webkit_web_view_load_html");
+    load(api.runJs, "webkit_web_view_run_javascript");
+    load(api.evalJs, "webkit_web_view_evaluate_javascript");
+    load(api.jsResultGetValue, "webkit_javascript_result_get_js_value");
+    load(api.jscValueToString, "jsc_value_to_string");
+    api.ok = api.gtkInitCheck != nullptr && api.plugNew != nullptr
+          && api.containerAdd != nullptr && api.widgetShowAll != nullptr
+          && api.widgetSetVisible != nullptr && api.widgetDestroy != nullptr
+          && api.windowSetDefaultSize != nullptr && api.windowResize != nullptr
+          && api.signalConnectData != nullptr
+          && api.signalHandlerDisconnect != nullptr
+          && api.mainContextPending != nullptr
+          && api.mainContextIteration != nullptr && api.gFree != nullptr
+          && api.webViewNew != nullptr && api.viewGetContentManager != nullptr
+          && api.contentManagerRegisterHandler != nullptr
+          && api.contentManagerUnregisterHandler != nullptr
+          && api.userScriptNew != nullptr
+          && api.contentManagerAddScript != nullptr
+          && api.userScriptUnref != nullptr && api.loadHtml != nullptr
+          && (api.runJs != nullptr || api.evalJs != nullptr)
+          && api.jsResultGetValue != nullptr && api.jscValueToString != nullptr;
+    if (!api.ok)
+        debugLog("linux engine: libwebkit2gtk found but symbols missing");
+    return api;
+}
+
+/** @brief Loaded once per process, first use; cheap to call afterwards. */
+inline const Api& api() noexcept
+{
+    static const Api loaded = loadApi();
+    return loaded;
+}
+
+} // namespace gtk_glue
+
+#endif // DSPARK_WEBVIEW_BACKEND == 3
+
 // -- the editor --------------------------------------------------------------------
 
 /**
@@ -551,6 +686,37 @@ public:
 
     /** True when this platform can embed a WebView editor (see file docs). */
     static constexpr bool kAvailable = (DSPARK_WEBVIEW_BACKEND != 0);
+
+    /**
+     * Runtime availability: kAvailable AND the platform engine can actually
+     * run here. On Linux that means WebKitGTK/GTK3 resolved through dlopen
+     * (first call loads it, later calls are free); elsewhere it equals
+     * kAvailable. The format backends gate their editor offer on this, so
+     * hosts on bare systems fall back to their generic UI cleanly.
+     */
+    static bool available() noexcept
+    {
+#if DSPARK_WEBVIEW_BACKEND == 3
+        return gtk_glue::api().ok;
+#else
+        return kAvailable;
+#endif
+    }
+
+    /**
+     * Gives the engine main-loop time from the HOST's run loop. On Linux the
+     * format backends call this at ~30 Hz (VST3 IRunLoop timer / CLAP
+     * timer-support) to iterate the GLib main context — a plugin must never
+     * spin its own GTK loop inside a host. No-op on Windows/macOS, where the
+     * host's native message loop already drives the engine.
+     */
+    void pump() noexcept
+    {
+#if DSPARK_WEBVIEW_BACKEND == 3
+        if (created_)
+            pumpPlatform();
+#endif
+    }
 
     Editor() = default;
     ~Editor() { destroy(); }
@@ -1199,6 +1365,137 @@ private:
             objc_glue::call<void>(webView_, "evaluateJavaScript:completionHandler:",
                                   objc_glue::nsString(js.c_str()),
                                   static_cast<objc_glue::ObjId>(nullptr));
+    }
+
+    // ==============================================================================
+    // Linux — WebKitGTK in a GtkPlug, embedded in the host's X11 window
+    // ==============================================================================
+#elif DSPARK_WEBVIEW_BACKEND == 3
+
+    void* plug_ = nullptr;             // GtkPlug (XEmbed top-level), owns the tree
+    void* webView_ = nullptr;          // WebKitWebView widget (child of the plug)
+    void* contentManager_ = nullptr;   // WebKitUserContentManager (view-owned)
+    unsigned long messageSignal_ = 0;
+
+    static void onScriptMessage(void*, void* jsResult, void* userData) noexcept
+    {
+        auto* self = static_cast<Editor*>(userData);
+        const auto& gtk = gtk_glue::api();
+        void* value = gtk.jsResultGetValue(jsResult);
+        if (value == nullptr) return;
+        char* text = gtk.jscValueToString(value);
+        if (text != nullptr)
+        {
+            self->handlePost(text);
+            gtk.gFree(text);
+        }
+    }
+
+    bool createPlatform(void* parentWindow) noexcept
+    {
+        const auto& gtk = gtk_glue::api();
+        if (!gtk.ok) return false;
+        // Idempotent when the host (or another plugin) initialised GTK; fails
+        // cleanly with no usable display (Wayland-only sessions, headless).
+        if (!gtk.gtkInitCheck(nullptr, nullptr))
+        {
+            debugLog("linux create: gtk_init_check failed (no display)");
+            return false;
+        }
+        plug_ = gtk.plugNew(static_cast<unsigned long>(
+            reinterpret_cast<std::uintptr_t>(parentWindow)));
+        if (plug_ == nullptr) return false;
+        webView_ = gtk.webViewNew();
+        if (webView_ == nullptr)
+        {
+            destroyPlatform();
+            return false;
+        }
+        contentManager_ = gtk.viewGetContentManager(webView_);
+        gtk.contentManagerRegisterHandler(contentManager_, "dspark");
+        messageSignal_ = gtk.signalConnectData(
+            contentManager_, "script-message-received::dspark",
+            reinterpret_cast<void (*)()>(&onScriptMessage), this, nullptr, 0);
+        // The uplink + bridge run at document start, before the page scripts
+        // (WebKitGTK exposes the same window.webkit.messageHandlers namespace
+        // as WKWebView).
+        std::string bootstrap =
+            "window.__dsparkPost=function(){"
+            "window.webkit.messageHandlers.dspark.postMessage("
+            "JSON.stringify(Array.prototype.slice.call(arguments)));};";
+        bootstrap += kBridgeJs;
+        void* script = gtk.userScriptNew(bootstrap.c_str(),
+                                         1 /* INJECT_TOP_FRAME */,
+                                         0 /* INJECT_AT_DOCUMENT_START */,
+                                         nullptr, nullptr);
+        gtk.contentManagerAddScript(contentManager_, script);
+        gtk.userScriptUnref(script);
+        gtk.containerAdd(plug_, webView_);
+        gtk.loadHtml(webView_, pageHtml().c_str(), nullptr);
+        gtk.widgetShowAll(plug_);
+        debugLog("linux create: plug for X11 window %p", parentWindow);
+        pumpPlatform();   // realize + map promptly, before the first host tick
+        return true;
+    }
+
+    void destroyPlatform() noexcept
+    {
+        const auto& gtk = gtk_glue::api();
+        if (!gtk.ok) return;
+        if (contentManager_ != nullptr)
+        {
+            if (messageSignal_ != 0)
+                gtk.signalHandlerDisconnect(contentManager_, messageSignal_);
+            gtk.contentManagerUnregisterHandler(contentManager_, "dspark");
+        }
+        if (plug_ != nullptr)
+            gtk.widgetDestroy(plug_);   // destroys the whole widget tree
+        plug_ = nullptr;
+        webView_ = nullptr;
+        contentManager_ = nullptr;
+        messageSignal_ = 0;
+        pumpPlatform();   // flush the destroy events while we still can
+    }
+
+    void setBoundsPlatform(int width, int height) noexcept
+    {
+        const auto& gtk = gtk_glue::api();
+        if (plug_ == nullptr) return;
+        gtk.windowSetDefaultSize(plug_, width, height);   // pre-map size
+        gtk.windowResize(plug_, width, height);           // post-map size
+        pumpPlatform();
+    }
+
+    void setVisiblePlatform(bool visible) noexcept
+    {
+        if (plug_ != nullptr)
+            gtk_glue::api().widgetSetVisible(plug_, visible ? 1 : 0);
+    }
+
+    bool queryParentSizePlatform(int&, int&) const noexcept
+    {
+        // The plug follows the host window through XEmbed configure events,
+        // so the negotiated size is authoritative here (as on macOS).
+        return false;
+    }
+
+    void evalPlatform(const std::string& js) noexcept
+    {
+        const auto& gtk = gtk_glue::api();
+        if (webView_ == nullptr) return;
+        if (gtk.runJs != nullptr)
+            gtk.runJs(webView_, js.c_str(), nullptr, nullptr, nullptr);
+        else
+            gtk.evalJs(webView_, js.c_str(), -1, nullptr, nullptr,
+                       nullptr, nullptr, nullptr);
+    }
+
+    void pumpPlatform() noexcept
+    {
+        const auto& gtk = gtk_glue::api();
+        if (!gtk.ok) return;
+        while (gtk.mainContextPending(nullptr) != 0)
+            gtk.mainContextIteration(nullptr, 0);
     }
 
     // ==============================================================================

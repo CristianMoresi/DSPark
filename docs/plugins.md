@@ -210,6 +210,16 @@ modes looks right; `examples/plugin_webview_editor/` uses `KeepAspect`.
 
 ### Developing a UI
 
+- **Separate web files, embedded at build time** (the production workflow):
+  keep the interface as ordinary `editor.html` + `editor.css` + `editor.js`
+  and let CMake inline and embed them —
+  ```cmake
+  dspark_add_plugin(MyPlugin SOURCES myplugin.cpp FORMATS VST3 CLAP
+                    EDITOR_HTML ui/editor.html)
+  ```
+  generates `MyPlugin_editor_html.h` (rebuilt whenever any referenced file
+  changes); the plugin returns the generated `kDsparkEditorHtml` from
+  `editorHtml()`. Complete example: `examples/plugin_webview_files/`.
 - **Edit without recompiling**: declare
   `static const char* editorDevFile() { return "C:/dev/myplugin/editor.html"; }`
   and the editor loads that file from disk on every open (falling back to
@@ -236,10 +246,12 @@ modes looks right; `examples/plugin_webview_editor/` uses `KeepAspect`.
    contract (view creation, platform support, sizing, refcounts) — and exit
    non-zero on any misbehaviour. `tools/vst3_editor_host.cpp` additionally
    opens the editor in a real window (Windows).
-2. **Official validators** before release: Steinberg's `validator` (ships
-   with the VST3 SDK), [`clap-validator`](https://github.com/free-audio/clap-validator),
-   and Tracktion's [`pluginval`](https://github.com/Tracktion/pluginval) at
-   strictness 10.
+2. **Official validators**: Tracktion's
+   [`pluginval`](https://github.com/Tracktion/pluginval) (strictness 8) and
+   [`clap-validator`](https://github.com/free-audio/clap-validator) gate this
+   repository's CI on Windows, Linux and macOS — every example plugin passes
+   both on every commit. Steinberg's `validator` (ships with the VST3 SDK)
+   remains a useful extra check before release.
 3. **Real hosts**: Reaper loads both formats; Cubase is the strictest VST3
    host. On macOS, distribution requires code signing + notarization
    (a developer-account step, not a framework one).

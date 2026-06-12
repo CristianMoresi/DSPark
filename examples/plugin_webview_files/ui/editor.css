@@ -1,0 +1,55 @@
+:root {
+  --bg0: #16191f; --bg1: #0c0e12; --line: #2a2f3a;
+  --text: #cfd5e1; --dim: #7d8596; --accent: #ffb454;
+}
+
+* {
+  margin: 0; padding: 0; box-sizing: border-box;
+  user-select: none; -webkit-user-select: none; cursor: default;
+}
+
+html, body { width: 100%; height: 100%; overflow: hidden; }
+html { background: #0c0e12; }   /* letterbox color on distorted host windows */
+
+body {
+  background: radial-gradient(120% 140% at 50% 0%, var(--bg0), var(--bg1));
+  color: var(--text);
+  display: flex; flex-direction: column;
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 14px 18px 10px; border-bottom: 1px solid var(--line);
+}
+header h1 { font-size: 17px; font-weight: 650; letter-spacing: .4px; }
+header .badge {
+  font-size: 9px; color: var(--dim);
+  letter-spacing: 1.1px; text-transform: uppercase;
+}
+
+main { flex: 1; display: flex; align-items: center; justify-content: center; }
+
+.knob {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  cursor: ns-resize; touch-action: none;
+}
+.knob svg { width: 140px; height: 140px; display: block; }
+.knob .track { fill: none; stroke: var(--line); stroke-width: 7; stroke-linecap: round; }
+.knob .val {
+  fill: none; stroke: var(--accent); stroke-width: 7; stroke-linecap: round;
+  filter: drop-shadow(0 0 6px rgba(255, 164, 84, .35));
+}
+.knob .ptr { stroke: var(--text); stroke-width: 3.4; stroke-linecap: round; }
+.knob label {
+  font-size: 11px; letter-spacing: 1.6px;
+  text-transform: uppercase; color: var(--dim);
+}
+.knob output {
+  font-size: 15px; color: var(--accent); font-variant-numeric: tabular-nums;
+}
+
+footer {
+  padding: 6px 16px 10px; font-size: 10px;
+  color: var(--dim); text-align: center;
+}

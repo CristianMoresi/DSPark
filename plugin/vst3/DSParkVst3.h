@@ -591,15 +591,20 @@ struct Plugin
         for (; i < 63 && string[i] != 0; ++i)
             ascii[i] = static_cast<char>(string[i]);
         ascii[i] = '\0';
-        const double plain = std::strtod(ascii, nullptr);
+        const int toggle = parseToggleText(ascii);
         if (id == kBypassParamId)
         {
-            *normalized = plain >= 0.5 ? 1.0 : 0.0;
+            *normalized = toggle >= 0 ? toggle
+                                      : (std::strtod(ascii, nullptr) >= 0.5 ? 1.0 : 0.0);
             return Steinberg_kResultOk;
         }
         const int idx = indexOfParamId(id);
         if (idx < 0) return Steinberg_kInvalidArgument;
-        *normalized = toNormalized(P::parameters[static_cast<size_t>(idx)], plain);
+        const Param& spec = P::parameters[static_cast<size_t>(idx)];
+        if (spec.steps == 1 && toggle >= 0)
+            *normalized = toggle;
+        else
+            *normalized = toNormalized(spec, std::strtod(ascii, nullptr));
         return Steinberg_kResultOk;
     }
 

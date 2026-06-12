@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="editor.css">
+</head>
+<body>
+  <header>
+    <h1>WebGain</h1>
+    <span class="badge">DSPark &middot; separate-files UI</span>
+  </header>
+  <main>
+    <div class="knob" data-param="gain">
+      <svg viewBox="0 0 100 100">
+        <path class="track" d="M 21.7 78.3 A 40 40 0 1 1 78.3 78.3"/>
+        <path class="val"   d="M 21.7 78.3 A 40 40 0 1 1 78.3 78.3"/>
+        <line class="ptr" x1="50" y1="50" x2="50" y2="16"/>
+      </svg>
+      <label>Gain</label>
+      <output>&ndash;</output>
+    </div>
+  </main>
+  <footer>edit ui/*.{html,css,js} and rebuild &mdash; the build embeds them</footer>
+  <script src="editor.js"></script>
+</body>
+</html>

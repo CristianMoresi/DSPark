@@ -151,6 +151,20 @@ constexpr double toPlain(const Param& p, double normalized) noexcept
     return p.minValue + n * (static_cast<double>(p.maxValue) - p.minValue);
 }
 
+/** @brief Case-insensitive "On"/"Off" recognition — the inverse of the toggle
+ *  display below. Returns 1 for On, 0 for Off, -1 for anything else. Hosts
+ *  round-trip displayed strings through text-to-value (automation lanes,
+ *  typed values), so toggles must parse their own output. */
+inline int parseToggleText(const char* text) noexcept
+{
+    auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
+    if (text == nullptr) return -1;
+    if (lower(text[0]) == 'o' && lower(text[1]) == 'n' && text[2] == '\0') return 1;
+    if (lower(text[0]) == 'o' && lower(text[1]) == 'f' && lower(text[2]) == 'f'
+        && text[3] == '\0') return 0;
+    return -1;
+}
+
 /** @brief Formats a plain value for host display ("3.5 dB", "On", "440 Hz"). */
 inline void formatValue(const Param& p, double plain, char* out, int outSize) noexcept
 {

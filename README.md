@@ -78,9 +78,12 @@ lifecycle like a DAW would; both run in CI on Windows, Linux and macOS.
 Want a custom GUI? Write it in **plain HTML/CSS/JS** — the WebView editor
 layer embeds it in the host window (WebView2 on Windows, WKWebView on
 macOS) with a tiny `dspark` JS bridge for parameters and automation
-gestures. No GUI framework, no resource pipeline:
-`examples/plugin_webview_editor/` is a complete plugin with knobs, and
-`tools/vst3_editor_host.cpp` opens any editor without a DAW.
+gestures. Keep the UI as ordinary separate web files and
+`dspark_add_plugin(... EDITOR_HTML ui/editor.html)` embeds them at build
+time. `examples/plugin_webview_editor/` is a complete plugin with knobs,
+`examples/plugin_webview_files/` shows the separate-files workflow, and
+`tools/vst3_editor_host.cpp` opens any editor without a DAW. Every example
+passes Tracktion's `pluginval` and `clap-validator` in CI on every commit.
 
 **Start here**: the [plugin guide](docs/plugins.md) documents the complete
 contract (required and optional methods, what each maps to per format, the

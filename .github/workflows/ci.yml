@@ -66,6 +66,10 @@ jobs:
           copy DSParkWebSaturator.vst3 DSParkWebSaturator.clap
           clap_smoke_host.exe DSParkWebSaturator.clap
           cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /I . tools\vst3_editor_host.cpp /Fe:vst3_editor_host.exe user32.lib
+          cmake -S examples\plugin_webview_files -B build_webgain
+          cmake --build build_webgain --config Release
+          vst3_smoke_host.exe build_webgain\DSParkWebGain.vst3\Contents\x86_64-win\DSParkWebGain.vst3
+          clap_smoke_host.exe build_webgain\DSParkWebGain.clap
 
       - name: Build example plugin (VST3+CLAP) + smoke hosts (GCC/Clang)
         if: matrix.compiler != 'msvc'
@@ -94,6 +98,22 @@ jobs:
           ./vst3_smoke_host ./DSParkWebSaturator.vst3
           cp DSParkWebSaturator.vst3 DSParkWebSaturator.clap
           ./clap_smoke_host ./DSParkWebSaturator.clap
+          # CMake plugin pipeline: separate-files UI embedding + bundle layouts
+          cmake -S examples/plugin_webview_files -B build_webgain \
+                -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+          cmake --build build_webgain
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            WEBGAIN_VST3=build_webgain/DSParkWebGain.vst3/Contents/MacOS/DSParkWebGain
+            WEBGAIN_CLAP=build_webgain/DSParkWebGain.clap/Contents/MacOS/DSParkWebGain
+          elif [[ "$(uname -m)" == "aarch64" ]]; then
+            WEBGAIN_VST3=build_webgain/DSParkWebGain.vst3/Contents/aarch64-linux/DSParkWebGain.so
+            WEBGAIN_CLAP=build_webgain/DSParkWebGain.clap
+          else
+            WEBGAIN_VST3=build_webgain/DSParkWebGain.vst3/Contents/x86_64-linux/DSParkWebGain.so
+            WEBGAIN_CLAP=build_webgain/DSParkWebGain.clap
+          fi
+          ./vst3_smoke_host "$WEBGAIN_VST3"
+          ./clap_smoke_host "$WEBGAIN_CLAP"
 
       - name: AUv2 bundle + auval (macOS)
         if: matrix.name == 'macOS Clang arm64'
@@ -110,6 +130,56 @@ jobs:
           codesign --force -s - "$COMP"
           killall -9 AudioComponentRegistrar 2>/dev/null || true
           auval -v aufx DSst DSpk
+          # And the CMake-built example (.component comes assembled + signed).
+          cp -R build_webgain/DSParkWebGain.component \
+            "$HOME/Library/Audio/Plug-Ins/Components/"
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          auval -v aufx DSwg DSpk
+
+      - name: Official validators (pluginval + clap-validator)
+        if: matrix.name == 'Windows MSVC x64' || matrix.name == 'Linux GCC x64' || matrix.name == 'macOS Clang arm64'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mkdir -p validators
+          case "$RUNNER_OS" in
+            Windows) PV_PAT="*Windows*"; CV_PAT="*windows*" ;;
+            macOS)   PV_PAT="*macOS*";   CV_PAT="*macos*" ;;
+            *)       PV_PAT="*Linux*";   CV_PAT="*ubuntu*"
+                     sudo apt-get update -q && sudo apt-get install -y -q xvfb ;;
+          esac
+          gh release download --repo Tracktion/pluginval --pattern "$PV_PAT" --dir validators
+          gh release download --repo free-audio/clap-validator --pattern "$CV_PAT" --dir validators
+          for a in validators/*.zip validators/*.tar.gz; do
+            [ -e "$a" ] && tar -xf "$a" -C validators
+          done
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            PLUGINVAL=validators/pluginval.exe
+            CLAPVAL=validators/clap-validator.exe
+            VST3S="DSParkSaturator.vst3 DSParkWebSaturator.vst3 build_webgain/DSParkWebGain.vst3"
+            CLAPS="DSParkSaturator.clap DSParkWebSaturator.clap build_webgain/DSParkWebGain.clap"
+            PREFIX=""
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            PLUGINVAL=validators/pluginval.app/Contents/MacOS/pluginval
+            CLAPVAL=validators/clap-validator
+            # Plain-file modules are a Windows/Linux convenience; on macOS
+            # only the CMake-built proper bundles are loadable by validators.
+            VST3S="build_webgain/DSParkWebGain.vst3"
+            CLAPS="build_webgain/DSParkWebGain.clap"
+            PREFIX=""
+          else
+            PLUGINVAL=validators/pluginval
+            CLAPVAL=validators/clap-validator
+            VST3S="build_webgain/DSParkWebGain.vst3"
+            CLAPS="DSParkSaturator.clap DSParkWebSaturator.clap build_webgain/DSParkWebGain.clap"
+            PREFIX="xvfb-run -a"
+          fi
+          for p in $VST3S; do
+            $PREFIX "$PLUGINVAL" --strictness-level 8 --skip-gui-tests --validate "$p"
+          done
+          "$CLAPVAL" validate $CLAPS
 
       - name: Generate metrics table (KPI K3)
         if: matrix.name == 'Linux GCC x64'

@@ -417,8 +417,20 @@ struct Plugin
                                   const char* text, double* out) noexcept
     {
         if (text == nullptr || out == nullptr) return false;
-        *out = std::strtod(text, nullptr);
-        if (id == kBypassParamId) *out = *out >= 0.5 ? 1.0 : 0.0;
+        const int toggle = parseToggleText(text);
+        if (id == kBypassParamId)
+        {
+            *out = toggle >= 0 ? toggle
+                               : (std::strtod(text, nullptr) >= 0.5 ? 1.0 : 0.0);
+            return true;
+        }
+        const int idx = indexOfParamId(id);
+        if (idx < 0) return false;
+        const Param& spec = P::parameters[static_cast<size_t>(idx)];
+        if (spec.steps == 1 && toggle >= 0)
+            *out = toggle != 0 ? spec.maxValue : spec.minValue;
+        else
+            *out = std::strtod(text, nullptr);
         return true;
     }
 

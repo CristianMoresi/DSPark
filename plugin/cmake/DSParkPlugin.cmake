@@ -44,6 +44,10 @@ function(dspark_add_plugin TARGET)
         VISIBILITY_INLINES_HIDDEN ON)
 
     if(WIN32)
+        # System libs the WebView editor layer uses (MSVC auto-links them via
+        # #pragma comment; this covers MinGW/clang). Harmless without an editor.
+        target_link_libraries(${TARGET} PRIVATE
+            advapi32 ole32 shell32 shlwapi user32 version)
         set(arch_dir "x86_64-win")
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
             set(arch_dir "arm64-win")
@@ -53,6 +57,8 @@ function(dspark_add_plugin TARGET)
             LIBRARY_OUTPUT_DIRECTORY
                 "${CMAKE_BINARY_DIR}/${TARGET}.vst3/Contents/${arch_dir}")
     elseif(APPLE)
+        # objc runtime for the WKWebView editor glue; harmless without one.
+        target_link_libraries(${TARGET} PRIVATE objc)
         set_target_properties(${TARGET} PROPERTIES
             SUFFIX ""
             LIBRARY_OUTPUT_DIRECTORY

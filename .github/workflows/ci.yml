@@ -61,6 +61,11 @@ jobs:
           clap_smoke_host.exe DSParkSaturator.clap
           cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_template\plugin_template.cpp /Fe:DSParkTemplate.vst3
           vst3_smoke_host.exe DSParkTemplate.vst3
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_webview_editor\webview_saturator.cpp /Fe:DSParkWebSaturator.vst3
+          vst3_smoke_host.exe DSParkWebSaturator.vst3
+          copy DSParkWebSaturator.vst3 DSParkWebSaturator.clap
+          clap_smoke_host.exe DSParkWebSaturator.clap
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /I . tools\vst3_editor_host.cpp /Fe:vst3_editor_host.exe user32.lib
 
       - name: Build example plugin (VST3+CLAP) + smoke hosts (GCC/Clang)
         if: matrix.compiler != 'msvc'
@@ -80,6 +85,15 @@ jobs:
           ./clap_smoke_host ./DSParkSaturator.clap
           ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_template/plugin_template.cpp -o DSParkTemplate.vst3
           ./vst3_smoke_host ./DSParkTemplate.vst3
+          # WebView editor example: WKWebView objc glue on macOS, stub on Linux
+          WEBVIEW_EXTRA=""
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            WEBVIEW_EXTRA="-lobjc"
+          fi
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_webview_editor/webview_saturator.cpp -o DSParkWebSaturator.vst3 $WEBVIEW_EXTRA
+          ./vst3_smoke_host ./DSParkWebSaturator.vst3
+          cp DSParkWebSaturator.vst3 DSParkWebSaturator.clap
+          ./clap_smoke_host ./DSParkWebSaturator.clap
 
       - name: AUv2 bundle + auval (macOS)
         if: matrix.name == 'macOS Clang arm64'

@@ -75,9 +75,16 @@ construction. Two miniature hosts (`tools/vst3_smoke_host.cpp`,
 `tools/clap_smoke_host.cpp`) drive the result through each full plugin
 lifecycle like a DAW would; both run in CI on Windows, Linux and macOS.
 
+Want a custom GUI? Write it in **plain HTML/CSS/JS** — the WebView editor
+layer embeds it in the host window (WebView2 on Windows, WKWebView on
+macOS) with a tiny `dspark` JS bridge for parameters and automation
+gestures. No GUI framework, no resource pipeline:
+`examples/plugin_webview_editor/` is a complete plugin with knobs, and
+`tools/vst3_editor_host.cpp` opens any editor without a DAW.
+
 **Start here**: the [plugin guide](docs/plugins.md) documents the complete
 contract (required and optional methods, what each maps to per format, the
-threading model, shipping checklists). Inherit
+threading model, the editor layer, shipping checklists). Inherit
 `dspark::plugin::PluginBase<T>` to see every overridable method with safe
 defaults in one place (`examples/plugin_template/`), or write a
 free-standing struct (`examples/plugin_saturator/`).
@@ -408,11 +415,11 @@ DSPark/
 ├── Analysis/       (8)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation
 ├── IO/             (3)      # File I/O: WAV read/write, MP3 read/write
 ├── Music/          (2)      # Harmony constants + real-time chord detection
-├── plugin/                  # Native plugin layer: VST3, CLAP and AU backends
+├── plugin/                  # Native plugin layer: VST3, CLAP, AU + WebView editor
 ├── conformance/             # Public conformance suite (runs in CI)
 ├── docs/                    # Cookbook, plugin guide, metrics table
 ├── examples/                # WAV processing, channel strip, plugins, templates
-├── tools/                   # VST3/CLAP smoke hosts, amalgamator
+├── tools/                   # VST3/CLAP smoke hosts, editor host, amalgamator
 └── DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)
 ```
 

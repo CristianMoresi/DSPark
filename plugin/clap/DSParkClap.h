@@ -29,9 +29,14 @@
  * - The wrapper-owned Bypass uses CLAP_PARAM_IS_BYPASS and the same short
  *   crossfade against the kept dry signal.
  * - Extensions implemented: audio-ports (stereo in/out), params, state,
- *   latency, tail. GUI deliberately absent in v1 (hosts show their generic
- *   editor).
+ *   latency, tail — plus gui when plugin/webview/DSParkWebViewEditor.h is
+ *   included before this header and the class declares `hasEditor = true`
+ *   (otherwise hosts show their generic editor). Editor edits reach the host
+ *   as gesture begin/end plus CLAP_EVENT_PARAM_VALUE through a lock-free
+ *   queue drained by process()/flush(), so automation recording works.
  */
+
+#define DSPARK_PLUGIN_CLAP_INCLUDED 1
 
 #include "../DSParkPlugin.h"
 
@@ -64,6 +69,28 @@ struct Plugin
     std::atomic<bool>   bypass { false };
     float bypassMix = 0.0f;
     std::vector<float> dryL, dryR;
+
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+    // --- editor state + UI -> host event queue (single producer: main thread;
+    // single consumer: process() on audio or flush() on main — never both).
+    webview_ui::Editor<P> guiEditor;
+    bool   guiActive = false;
+    double guiScale = 1.0;
+    int    guiWidth = 0, guiHeight = 0;
+    bool   guiEditActive[kNumParams == 0 ? 1 : kNumParams] {};
+    const clap_host_params_t* hostParams = nullptr;
+
+    enum : uint8_t { kUiGestureBegin = 0, kUiValue = 1, kUiGestureEnd = 2 };
+    struct UiEvent
+    {
+        uint32_t paramId;
+        uint8_t  kind;
+        double   value;
+    };
+    static constexpr uint32_t kUiQueueSize = 256;   // power of two
+    UiEvent uiQueue[kUiQueueSize] {};
+    std::atomic<uint32_t> uiHead { 0 }, uiTail { 0 };
+#endif
 
     explicit Plugin(const clap_host_t* h) noexcept : host(h)
     {
@@ -117,9 +144,78 @@ struct Plugin
                 handleEvent(ev);
     }
 
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+    // --- UI -> host parameter events ---------------------------------------------
+
+    void pushUiEvent(uint32_t paramId, uint8_t kind, double value) noexcept
+    {
+        const uint32_t tail = uiTail.load(std::memory_order_relaxed);
+        const uint32_t next = (tail + 1) & (kUiQueueSize - 1);
+        if (next == uiHead.load(std::memory_order_acquire)) return;   // full: drop
+        uiQueue[tail] = UiEvent { paramId, kind, value };
+        uiTail.store(next, std::memory_order_release);
+    }
+
+    void requestUiFlush() noexcept
+    {
+        // Host schedules process()/flush(), which drains the queue below.
+        if (hostParams != nullptr && host != nullptr)
+            hostParams->request_flush(host);
+    }
+
+    void drainUiEvents(const clap_output_events_t* out) noexcept
+    {
+        if (out == nullptr) return;
+        uint32_t head = uiHead.load(std::memory_order_relaxed);
+        const uint32_t tail = uiTail.load(std::memory_order_acquire);
+        while (head != tail)
+        {
+            const UiEvent& e = uiQueue[head];
+            if (e.kind == kUiValue)
+            {
+                clap_event_param_value_t ev {};
+                ev.header.size = sizeof(ev);
+                ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+                ev.header.type = CLAP_EVENT_PARAM_VALUE;
+                ev.param_id = e.paramId;
+                ev.note_id = -1;
+                ev.port_index = -1;
+                ev.channel = -1;
+                ev.key = -1;
+                ev.value = e.value;
+                out->try_push(out, &ev.header);
+            }
+            else
+            {
+                clap_event_param_gesture_t ev {};
+                ev.header.size = sizeof(ev);
+                ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+                ev.header.type = static_cast<uint16_t>(
+                    e.kind == kUiGestureBegin ? CLAP_EVENT_PARAM_GESTURE_BEGIN
+                                              : CLAP_EVENT_PARAM_GESTURE_END);
+                ev.param_id = e.paramId;
+                out->try_push(out, &ev.header);
+            }
+            head = (head + 1) & (kUiQueueSize - 1);
+        }
+        uiHead.store(head, std::memory_order_release);
+    }
+#endif // DSPARK_PLUGIN_WEBVIEW
+
     // --- clap_plugin_t callbacks ------------------------------------------------
 
-    static bool sInit(const clap_plugin_t*) noexcept { return true; }
+    static bool sInit(const clap_plugin_t* p) noexcept
+    {
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+        auto* s = self(p);
+        if (s->host != nullptr)
+            s->hostParams = static_cast<const clap_host_params_t*>(
+                s->host->get_extension(s->host, CLAP_EXT_PARAMS));
+#else
+        (void) p;
+#endif
+        return true;
+    }
 
     static void sDestroy(const clap_plugin_t* p) noexcept { delete self(p); }
 
@@ -161,6 +257,9 @@ struct Plugin
     {
         auto* s = self(p);
         s->drainEvents(process->in_events);
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+        s->drainUiEvents(process->out_events);
+#endif
 
         const uint32_t n = process->frames_count;
         if (n == 0 || !s->prepared) return CLAP_PROCESS_CONTINUE;
@@ -217,6 +316,11 @@ struct Plugin
         if (std::strcmp(id, CLAP_EXT_STATE) == 0)       return &kState;
         if (std::strcmp(id, CLAP_EXT_LATENCY) == 0)     return &kLatency;
         if (std::strcmp(id, CLAP_EXT_TAIL) == 0)        return &kTail;
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+        if constexpr (HasEditor<P>)
+            if (webview_ui::Editor<P>::kAvailable && std::strcmp(id, CLAP_EXT_GUI) == 0)
+                return &kGui;
+#endif
         return nullptr;
     }
 
@@ -319,9 +423,14 @@ struct Plugin
     }
 
     static void sParamFlush(const clap_plugin_t* p, const clap_input_events_t* in,
-                            const clap_output_events_t*) noexcept
+                            const clap_output_events_t* out) noexcept
     {
         self(p)->drainEvents(in);
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+        self(p)->drainUiEvents(out);
+#else
+        (void) out;
+#endif
     }
 
     inline static const clap_plugin_params_t kParams = {
@@ -388,11 +497,225 @@ struct Plugin
         auto* s = self(p);
         if constexpr (HasTail<P>)
             return static_cast<uint32_t>(s->user.getTailSeconds() * s->sampleRate);
-        (void) s;
-        return 0;
+        else
+        {
+            (void) s;
+            return 0;
+        }
     }
 
     inline static const clap_plugin_tail_t kTail = { &sTailGet };
+
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+    // --- ext: gui (WebView editor layer) ----------------------------------------------
+    //
+    // CLAP hands the parent window AFTER create(), so create() only arms the
+    // state and set_parent() builds the actual web engine. All [main-thread].
+
+    static const char* clapWindowApi() noexcept
+    {
+#if defined(_WIN32)
+        return CLAP_WINDOW_API_WIN32;
+#elif defined(__APPLE__)
+        return CLAP_WINDOW_API_COCOA;
+#else
+        return CLAP_WINDOW_API_X11;
+#endif
+    }
+
+    static void cbGuiSetParam(void* context, int index, double plain) noexcept
+    {
+        auto* s = static_cast<Plugin*>(context);
+        const Param& spec = P::parameters[static_cast<size_t>(index)];
+        const double normalized = toNormalized(spec, plain);
+        s->applyNormalized(index, normalized);
+        const double snapped = toPlain(spec, normalized);
+        const uint32_t id = hash32(spec.id);
+        if (s->guiEditActive[static_cast<size_t>(index)])
+            s->pushUiEvent(id, kUiValue, snapped);
+        else
+        {
+            // Edits outside an explicit gesture still get one (host undo).
+            s->pushUiEvent(id, kUiGestureBegin, 0.0);
+            s->pushUiEvent(id, kUiValue, snapped);
+            s->pushUiEvent(id, kUiGestureEnd, 0.0);
+        }
+        s->requestUiFlush();
+    }
+
+    static void cbGuiBeginEdit(void* context, int index) noexcept
+    {
+        auto* s = static_cast<Plugin*>(context);
+        s->guiEditActive[static_cast<size_t>(index)] = true;
+        s->pushUiEvent(hash32(P::parameters[static_cast<size_t>(index)].id),
+                       kUiGestureBegin, 0.0);
+        s->requestUiFlush();
+    }
+
+    static void cbGuiEndEdit(void* context, int index) noexcept
+    {
+        auto* s = static_cast<Plugin*>(context);
+        s->guiEditActive[static_cast<size_t>(index)] = false;
+        s->pushUiEvent(hash32(P::parameters[static_cast<size_t>(index)].id),
+                       kUiGestureEnd, 0.0);
+        s->requestUiFlush();
+    }
+
+    static bool sGuiIsApiSupported(const clap_plugin_t*, const char* api,
+                                   bool isFloating) noexcept
+    {
+        return !isFloating && api != nullptr && std::strcmp(api, clapWindowApi()) == 0
+            && webview_ui::Editor<P>::kAvailable;
+    }
+
+    static bool sGuiGetPreferredApi(const clap_plugin_t*, const char** api,
+                                    bool* isFloating) noexcept
+    {
+        if (api == nullptr || isFloating == nullptr) return false;
+        *api = clapWindowApi();
+        *isFloating = false;
+        return webview_ui::Editor<P>::kAvailable;
+    }
+
+    static bool sGuiCreate(const clap_plugin_t* p, const char* api,
+                           bool isFloating) noexcept
+    {
+        auto* s = self(p);
+        if (!sGuiIsApiSupported(p, api, isFloating)) return false;
+        const EditorSize logical = editorSizeOf<P>();
+        s->guiWidth  = static_cast<int>(logical.width * s->guiScale + 0.5);
+        s->guiHeight = static_cast<int>(logical.height * s->guiScale + 0.5);
+        s->guiActive = true;
+        return true;
+    }
+
+    static void sGuiDestroy(const clap_plugin_t* p) noexcept
+    {
+        auto* s = self(p);
+        s->guiEditor.destroy();
+        s->guiActive = false;
+    }
+
+    static bool sGuiSetScale(const clap_plugin_t* p, double scale) noexcept
+    {
+#if defined(__APPLE__)
+        (void) p; (void) scale;
+        return false;   // cocoa uses logical sizes; scaling is the OS's job
+#else
+        auto* s = self(p);
+        if (scale <= 0.0) return false;
+        s->guiScale = scale;
+        if (!s->guiEditor.created())
+        {
+            const EditorSize logical = editorSizeOf<P>();
+            s->guiWidth  = static_cast<int>(logical.width * scale + 0.5);
+            s->guiHeight = static_cast<int>(logical.height * scale + 0.5);
+        }
+        s->guiEditor.setScale(scale);
+        return true;
+#endif
+    }
+
+    static bool sGuiGetSize(const clap_plugin_t* p, uint32_t* width,
+                            uint32_t* height) noexcept
+    {
+        auto* s = self(p);
+        if (width == nullptr || height == nullptr || !s->guiActive) return false;
+        *width  = static_cast<uint32_t>(s->guiWidth);
+        *height = static_cast<uint32_t>(s->guiHeight);
+        return true;
+    }
+
+    static bool sGuiCanResize(const clap_plugin_t*) noexcept
+    {
+        return HasEditorResizable<P>;
+    }
+
+    static bool sGuiGetResizeHints(const clap_plugin_t*,
+                                   clap_gui_resize_hints_t* hints) noexcept
+    {
+        if (hints == nullptr) return false;
+        hints->can_resize_horizontally = HasEditorResizable<P>;
+        hints->can_resize_vertically = HasEditorResizable<P>;
+        hints->preserve_aspect_ratio = false;
+        hints->aspect_ratio_width = 1;
+        hints->aspect_ratio_height = 1;
+        return true;
+    }
+
+    static bool sGuiAdjustSize(const clap_plugin_t* p, uint32_t* width,
+                               uint32_t* height) noexcept
+    {
+        auto* s = self(p);
+        if (width == nullptr || height == nullptr) return false;
+        const EditorSize logical = editorSizeOf<P>();
+        if constexpr (HasEditorResizable<P>)
+        {
+            const auto minW = static_cast<uint32_t>(logical.width * s->guiScale / 2.0);
+            const auto minH = static_cast<uint32_t>(logical.height * s->guiScale / 2.0);
+            if (*width < minW) *width = minW;
+            if (*height < minH) *height = minH;
+        }
+        else
+        {
+            *width  = static_cast<uint32_t>(logical.width * s->guiScale + 0.5);
+            *height = static_cast<uint32_t>(logical.height * s->guiScale + 0.5);
+        }
+        return true;
+    }
+
+    static bool sGuiSetSize(const clap_plugin_t* p, uint32_t width,
+                            uint32_t height) noexcept
+    {
+        auto* s = self(p);
+        if (!s->guiActive) return false;
+        s->guiWidth  = static_cast<int>(width);
+        s->guiHeight = static_cast<int>(height);
+        s->guiEditor.setBounds(s->guiWidth, s->guiHeight);
+        return true;
+    }
+
+    static bool sGuiSetParent(const clap_plugin_t* p,
+                              const clap_window_t* window) noexcept
+    {
+        auto* s = self(p);
+        if (window == nullptr || !s->guiActive) return false;
+        const webview_ui::HostCallbacks callbacks {
+            s, &cbGuiSetParam, &cbGuiBeginEdit, &cbGuiEndEdit
+        };
+        s->guiEditor.setScale(s->guiScale);
+        if (!s->guiEditor.create(window->ptr, s->shadow, callbacks))
+            return false;
+        s->guiEditor.setBounds(s->guiWidth, s->guiHeight);
+        return true;
+    }
+
+    static bool sGuiSetTransient(const clap_plugin_t*, const clap_window_t*) noexcept
+    {
+        return false;   // embedded only; no floating window mode
+    }
+
+    static void sGuiSuggestTitle(const clap_plugin_t*, const char*) noexcept {}
+
+    static bool sGuiShow(const clap_plugin_t* p) noexcept
+    {
+        self(p)->guiEditor.setVisible(true);
+        return true;
+    }
+
+    static bool sGuiHide(const clap_plugin_t* p) noexcept
+    {
+        self(p)->guiEditor.setVisible(false);
+        return true;
+    }
+
+    inline static const clap_plugin_gui_t kGui = {
+        &sGuiIsApiSupported, &sGuiGetPreferredApi, &sGuiCreate, &sGuiDestroy,
+        &sGuiSetScale, &sGuiGetSize, &sGuiCanResize, &sGuiGetResizeHints,
+        &sGuiAdjustSize, &sGuiSetSize, &sGuiSetParent, &sGuiSetTransient,
+        &sGuiSuggestTitle, &sGuiShow, &sGuiHide
+    };
+#endif // DSPARK_PLUGIN_WEBVIEW
 
     // --- descriptor & factory ----------------------------------------------------------
 

@@ -37,7 +37,13 @@
  * - **Threading**: setParamNormalized arrives from the UI thread and
  *   process() from the audio thread; both funnel into the user's
  *   setParameter, which DSPark's contract requires to be atomic-based.
+ * - **Editor**: when plugin/webview/DSParkWebViewEditor.h is included before
+ *   this header and the class declares `hasEditor = true`, createView returns
+ *   an IPlugView embedding the WebView editor (with content-scale support);
+ *   otherwise hosts show their generic parameter UI.
  */
+
+#define DSPARK_PLUGIN_VST3_INCLUDED 1
 
 #include "../DSParkPlugin.h"
 
@@ -482,8 +488,11 @@ struct Plugin
             return static_cast<Steinberg_uint32>(
                 p->user.getTailSeconds() * (p->setup.sampleRate > 0 ? p->setup.sampleRate
                                                                     : 48000.0));
-        (void) p;
-        return 0;
+        else
+        {
+            (void) p;
+            return 0;
+        }
     }
 
     inline static const Steinberg_Vst_IAudioProcessorVtbl kProcessorVtbl = {
@@ -648,10 +657,8 @@ struct Plugin
         return Steinberg_kResultOk;
     }
 
-    static Steinberg_IPlugView* SMTG_STDMETHODCALLTYPE sCreateView(void*, Steinberg_FIDString)
-    {
-        return nullptr;   // v1: the host's generic parameter editor
-    }
+    static Steinberg_IPlugView* SMTG_STDMETHODCALLTYPE sCreateView(void* self_,
+                                                                   Steinberg_FIDString name);
 
     inline static const Steinberg_Vst_IEditControllerVtbl kControllerVtbl = {
         &sQuery<2>, &sAddRef<2>, &sRelease<2>,
@@ -678,6 +685,321 @@ struct Plugin
         &sGetProcessContextRequirements
     };
 };
+
+// -- the editor view (WebView editor layer) ---------------------------------------
+//
+// Compiled only when plugin/webview/DSParkWebViewEditor.h was included before
+// this header, and created only for plugin classes that declare an editor.
+// Without either, createView answers nullptr and hosts show their generic UI.
+
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+
+/**
+ * @brief IPlugView (+ IPlugViewContentScaleSupport) hosting the WebView
+ * editor. A standalone COM object: it addRefs the owning plugin for its
+ * lifetime and bridges UI edits to IComponentHandler gestures.
+ */
+template <typename P>
+struct View
+{
+    static constexpr size_t kNumParams = Plugin<P>::kNumParams;
+
+    // Two COM lenses, same layout trick as the plugin object.
+    const Steinberg_IPlugViewVtbl*                    viewVtbl;
+    const Steinberg_IPlugViewContentScaleSupportVtbl* scaleVtbl;
+
+    std::atomic<Steinberg_uint32> refs { 1 };
+    Plugin<P>* owner;
+    Steinberg_IPlugFrame* frame = nullptr;
+    webview_ui::Editor<P> editor;
+    int width;                 // current physical size (host units)
+    int height;
+    double scale = 1.0;
+    bool editActive[kNumParams == 0 ? 1 : kNumParams] {};
+
+    explicit View(Plugin<P>* plugin) noexcept : owner(plugin)
+    {
+        viewVtbl  = &kViewVtbl;
+        scaleVtbl = &kScaleVtbl;
+        owner->addRefImpl();
+        const EditorSize logical = editorSizeOf<P>();
+        width  = logical.width;
+        height = logical.height;
+    }
+
+    ~View()
+    {
+        editor.destroy();
+        if (frame != nullptr)
+            reinterpret_cast<Steinberg_FUnknown*>(frame)->lpVtbl->release(frame);
+        owner->releaseImpl();
+    }
+
+    static View* fromLens(void* iface, int lens) noexcept
+    {
+        return reinterpret_cast<View*>(static_cast<char*>(iface)
+                                       - static_cast<ptrdiff_t>(lens) * sizeof(void*));
+    }
+
+    void* lensPtr(int lens) noexcept
+    {
+        return reinterpret_cast<char*>(this) + static_cast<ptrdiff_t>(lens) * sizeof(void*);
+    }
+
+    static const char* platformType() noexcept
+    {
+#if defined(_WIN32)
+        return Steinberg_kPlatformTypeHWND;
+#elif defined(__APPLE__)
+        return Steinberg_kPlatformTypeNSView;
+#else
+        return Steinberg_kPlatformTypeX11EmbedWindowID;
+#endif
+    }
+
+    // --- editor -> host/DSP bridge ------------------------------------------------
+
+    static void cbSetParam(void* context, int index, double plain) noexcept
+    {
+        auto* view = static_cast<View*>(context);
+        const Param& spec = P::parameters[static_cast<size_t>(index)];
+        const double normalized = toNormalized(spec, plain);
+        view->owner->applyNormalized(index, normalized);
+        if (auto* handler = view->owner->handler)
+        {
+            const Steinberg_Vst_ParamID id = hash32(spec.id);
+            if (view->editActive[static_cast<size_t>(index)])
+                handler->lpVtbl->performEdit(handler, id, normalized);
+            else
+            {
+                // Edits outside an explicit gesture still need one for host undo.
+                handler->lpVtbl->beginEdit(handler, id);
+                handler->lpVtbl->performEdit(handler, id, normalized);
+                handler->lpVtbl->endEdit(handler, id);
+            }
+        }
+    }
+
+    static void cbBeginEdit(void* context, int index) noexcept
+    {
+        auto* view = static_cast<View*>(context);
+        view->editActive[static_cast<size_t>(index)] = true;
+        if (auto* handler = view->owner->handler)
+            handler->lpVtbl->beginEdit(handler,
+                hash32(P::parameters[static_cast<size_t>(index)].id));
+    }
+
+    static void cbEndEdit(void* context, int index) noexcept
+    {
+        auto* view = static_cast<View*>(context);
+        view->editActive[static_cast<size_t>(index)] = false;
+        if (auto* handler = view->owner->handler)
+            handler->lpVtbl->endEdit(handler,
+                hash32(P::parameters[static_cast<size_t>(index)].id));
+    }
+
+    // --- FUnknown -------------------------------------------------------------------
+
+    Steinberg_tresult query(const Steinberg_TUID iid, void** obj) noexcept
+    {
+        if (obj == nullptr) return Steinberg_kInvalidArgument;
+        *obj = nullptr;
+        if (tuidEqual(iid, Steinberg_FUnknown_iid)
+            || tuidEqual(iid, Steinberg_IPlugView_iid))
+            *obj = lensPtr(0);
+        else if (tuidEqual(iid, Steinberg_IPlugViewContentScaleSupport_iid))
+            *obj = lensPtr(1);
+        if (*obj == nullptr) return Steinberg_kNoInterface;
+        refs.fetch_add(1, std::memory_order_relaxed);
+        return Steinberg_kResultOk;
+    }
+
+    template <int Lens>
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sQuery(void* self_,
+                                                           const Steinberg_TUID iid,
+                                                           void** obj)
+    { return fromLens(self_, Lens)->query(iid, obj); }
+
+    template <int Lens>
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE sAddRef(void* self_)
+    { return fromLens(self_, Lens)->refs.fetch_add(1, std::memory_order_relaxed) + 1; }
+
+    template <int Lens>
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE sRelease(void* self_)
+    {
+        auto* view = fromLens(self_, Lens);
+        const Steinberg_uint32 left = view->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (left == 0) delete view;
+        return left;
+    }
+
+    // --- IPlugView --------------------------------------------------------------------
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sIsPlatformTypeSupported(void*,
+        Steinberg_FIDString type)
+    {
+        return (webview_ui::Editor<P>::kAvailable && type != nullptr
+                && std::strcmp(type, platformType()) == 0)
+             ? Steinberg_kResultTrue : Steinberg_kResultFalse;
+    }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sAttached(void* self_, void* parent,
+                                                              Steinberg_FIDString type)
+    {
+        auto* view = fromLens(self_, 0);
+        if (sIsPlatformTypeSupported(self_, type) != Steinberg_kResultTrue
+            || parent == nullptr)
+            return Steinberg_kResultFalse;
+        view->editor.setScale(view->scale);
+        const webview_ui::HostCallbacks callbacks {
+            view, &cbSetParam, &cbBeginEdit, &cbEndEdit
+        };
+        if (!view->editor.create(parent, view->owner->shadow, callbacks))
+            return Steinberg_kResultFalse;
+        view->editor.setBounds(view->width, view->height);
+        view->editor.setVisible(true);
+        return Steinberg_kResultOk;
+    }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sRemoved(void* self_)
+    {
+        fromLens(self_, 0)->editor.destroy();
+        return Steinberg_kResultOk;
+    }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sOnWheel(void*, float)
+    { return Steinberg_kResultFalse; }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sOnKeyDown(void*, Steinberg_char16,
+                                                               Steinberg_int16, Steinberg_int16)
+    { return Steinberg_kResultFalse; }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sOnKeyUp(void*, Steinberg_char16,
+                                                             Steinberg_int16, Steinberg_int16)
+    { return Steinberg_kResultFalse; }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sGetSize(void* self_,
+                                                             Steinberg_ViewRect* size)
+    {
+        auto* view = fromLens(self_, 0);
+        if (size == nullptr) return Steinberg_kInvalidArgument;
+        size->left = 0;
+        size->top = 0;
+        size->right = view->width;
+        size->bottom = view->height;
+        return Steinberg_kResultOk;
+    }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sOnSize(void* self_,
+                                                            Steinberg_ViewRect* newSize)
+    {
+        auto* view = fromLens(self_, 0);
+        if (newSize == nullptr) return Steinberg_kInvalidArgument;
+        view->width  = newSize->right - newSize->left;
+        view->height = newSize->bottom - newSize->top;
+        view->editor.setBounds(view->width, view->height);
+        return Steinberg_kResultOk;
+    }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sOnFocus(void*, Steinberg_TBool)
+    { return Steinberg_kResultOk; }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sSetFrame(void* self_,
+                                                              Steinberg_IPlugFrame* frame)
+    {
+        auto* view = fromLens(self_, 0);
+        if (view->frame != nullptr)
+            reinterpret_cast<Steinberg_FUnknown*>(view->frame)
+                ->lpVtbl->release(view->frame);
+        view->frame = frame;
+        if (view->frame != nullptr)
+            reinterpret_cast<Steinberg_FUnknown*>(view->frame)
+                ->lpVtbl->addRef(view->frame);
+        return Steinberg_kResultOk;
+    }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sCanResize(void*)
+    {
+        return HasEditorResizable<P> ? Steinberg_kResultTrue : Steinberg_kResultFalse;
+    }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sCheckSizeConstraint(void* self_,
+        Steinberg_ViewRect* rect)
+    {
+        auto* view = fromLens(self_, 0);
+        if (rect == nullptr) return Steinberg_kInvalidArgument;
+        const EditorSize logical = editorSizeOf<P>();
+        if constexpr (HasEditorResizable<P>)
+        {
+            // Accept anything down to half the declared size (scaled).
+            const auto minW = static_cast<Steinberg_int32>(logical.width * view->scale / 2.0);
+            const auto minH = static_cast<Steinberg_int32>(logical.height * view->scale / 2.0);
+            if (rect->right - rect->left < minW) rect->right = rect->left + minW;
+            if (rect->bottom - rect->top < minH) rect->bottom = rect->top + minH;
+        }
+        else
+        {
+            rect->right  = rect->left + static_cast<Steinberg_int32>(logical.width * view->scale);
+            rect->bottom = rect->top + static_cast<Steinberg_int32>(logical.height * view->scale);
+        }
+        return Steinberg_kResultTrue;
+    }
+
+    inline static const Steinberg_IPlugViewVtbl kViewVtbl = {
+        &sQuery<0>, &sAddRef<0>, &sRelease<0>,
+        &sIsPlatformTypeSupported, &sAttached, &sRemoved,
+        &sOnWheel, &sOnKeyDown, &sOnKeyUp,
+        &sGetSize, &sOnSize, &sOnFocus,
+        &sSetFrame, &sCanResize, &sCheckSizeConstraint
+    };
+
+    // --- IPlugViewContentScaleSupport ----------------------------------------------
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sSetContentScaleFactor(void* self_,
+        Steinberg_IPlugViewContentScaleSupport_ScaleFactor factor)
+    {
+        auto* view = fromLens(self_, 1);
+        if (factor <= 0.0f) return Steinberg_kInvalidArgument;
+        view->scale = factor;
+        if (!view->editor.created())
+        {
+            // Not attached yet: scale the size the host is about to query.
+            const EditorSize logical = editorSizeOf<P>();
+            view->width  = static_cast<int>(logical.width * view->scale + 0.5);
+            view->height = static_cast<int>(logical.height * view->scale + 0.5);
+        }
+        view->editor.setScale(view->scale);
+        return Steinberg_kResultOk;
+    }
+
+    inline static const Steinberg_IPlugViewContentScaleSupportVtbl kScaleVtbl = {
+        &sQuery<1>, &sAddRef<1>, &sRelease<1>,
+        &sSetContentScaleFactor
+    };
+};
+
+#endif // DSPARK_PLUGIN_WEBVIEW
+
+template <typename P>
+Steinberg_IPlugView* SMTG_STDMETHODCALLTYPE Plugin<P>::sCreateView(void* self_,
+                                                                   Steinberg_FIDString name)
+{
+    (void) self_;
+    (void) name;
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+    if constexpr (HasEditor<P>)
+    {
+        if (webview_ui::Editor<P>::kAvailable && name != nullptr
+            && std::strcmp(name, "editor") == 0)
+        {
+            auto* view = new (std::nothrow) View<P>(fromLens(self_, 2));
+            if (view != nullptr)
+                return reinterpret_cast<Steinberg_IPlugView*>(view->lensPtr(0));
+        }
+    }
+#endif
+    return nullptr;   // no editor: the host shows its generic parameter UI
+}
 
 // -- factory --------------------------------------------------------------------
 

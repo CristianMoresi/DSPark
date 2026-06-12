@@ -284,6 +284,46 @@ int main(int argc, char** argv)
     expect(std::fabs(ctrl->lpVtbl->getParamNormalized(ctrl, p0.id) - 0.8) < 1e-9,
            "state round-trip restores the parameter");
 
+    // --- editor view (WebView editor layer; optional) -------------------------------
+    // Contract-only: create/inspect/release without attaching a real window,
+    // so this also runs on headless CI. A nullptr view is valid (no editor).
+    if (Steinberg_IPlugView* view = ctrl->lpVtbl->createView(ctrl, "editor"))
+    {
+#if defined(_WIN32)
+        const Steinberg_FIDString platformType = "HWND";
+#elif defined(__APPLE__)
+        const Steinberg_FIDString platformType = "NSView";
+#else
+        const Steinberg_FIDString platformType = "X11EmbedWindowID";
+#endif
+        expect(view->lpVtbl->isPlatformTypeSupported(view, platformType)
+                   == Steinberg_kResultTrue,
+               "view supports the native platform type");
+
+        Steinberg_ViewRect rect {};
+        expect(view->lpVtbl->getSize(view, &rect) == Steinberg_kResultOk
+                   && rect.right > rect.left && rect.bottom > rect.top,
+               "view reports a usable size");
+        std::printf("      editor: %d x %d%s\n",
+                    rect.right - rect.left, rect.bottom - rect.top,
+                    view->lpVtbl->canResize(view) == Steinberg_kResultTrue
+                        ? " (resizable)" : "");
+
+        Steinberg_ViewRect constrained = rect;
+        expect(view->lpVtbl->checkSizeConstraint(view, &constrained)
+                   == Steinberg_kResultTrue,
+               "checkSizeConstraint accepts the reported size");
+
+        void* sameView = nullptr;
+        expect(view->lpVtbl->queryInterface(view, Steinberg_IPlugView_iid, &sameView)
+                   == Steinberg_kResultOk && sameView == view,
+               "view queryInterface(IPlugView)");
+        if (sameView != nullptr) view->lpVtbl->release(view);
+        expect(view->lpVtbl->release(view) == 0, "view refcount returns to zero");
+    }
+    else
+        std::printf("      editor: none (host shows its generic UI)\n");
+
     // --- teardown -------------------------------------------------------------------
     expect(proc->lpVtbl->setProcessing(proc, 0) == Steinberg_kResultOk, "setProcessing(false)");
     expect(comp->lpVtbl->setActive(comp, 0) == Steinberg_kResultOk, "setActive(false)");

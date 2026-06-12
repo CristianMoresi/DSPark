@@ -230,10 +230,55 @@ concept HasSetState = requires(P p, const uint8_t* d, size_t n) {
     { p.setState(d, n) } -> std::convertible_to<bool>;
 };
 
-/** @brief Editor hook — v1 backends report "no editor" and hosts show their
- *  generic parameter UI. A webview-based editor layer can claim this later. */
+/** @brief Custom-editor switch. With `hasEditor = false` (or absent) hosts
+ *  show their generic parameter UI. With `hasEditor = true` AND
+ *  plugin/webview/DSParkWebViewEditor.h included BEFORE the format headers,
+ *  the WebView editor layer serves `editorHtml()` inside the host window. */
 template <typename P>
 concept HasEditor = requires { P::hasEditor; } && P::hasEditor;
+
+// -- Editor contract (used by plugin/webview/DSParkWebViewEditor.h) -------------
+
+/** @brief Editor window size in logical pixels (physical = logical x host scale). */
+struct EditorSize
+{
+    int width  = 480;
+    int height = 320;
+};
+
+/** @brief `static const char* editorHtml()` — the editor page (HTML/CSS/JS),
+ *  usually a raw string literal. Required when `hasEditor` is true. */
+template <typename P>
+concept HasEditorHtml = requires {
+    { P::editorHtml() } -> std::convertible_to<const char*>;
+};
+
+/** @brief Optional `static constexpr EditorSize editorSize { w, h };`. */
+template <typename P>
+concept HasEditorSize = requires {
+    { P::editorSize.width } -> std::convertible_to<int>;
+    { P::editorSize.height } -> std::convertible_to<int>;
+};
+
+/** @brief Optional `static constexpr bool editorResizable = true;` (default false). */
+template <typename P>
+concept HasEditorResizable = requires { P::editorResizable; } && P::editorResizable;
+
+/** @brief Optional `static constexpr bool editorDebug = true;` — enables the
+ *  browser DevTools in the editor (WebView2; development builds only). */
+template <typename P>
+concept HasEditorDebug = requires { P::editorDebug; } && P::editorDebug;
+
+/** @brief The declared (logical) editor size, or the 480x320 default. */
+template <typename P>
+constexpr EditorSize editorSizeOf() noexcept
+{
+    if constexpr (HasEditorSize<P>)
+        return EditorSize { static_cast<int>(P::editorSize.width),
+                            static_cast<int>(P::editorSize.height) };
+    else
+        return EditorSize {};
+}
 
 // -- PluginBase: the whole contract, visible in one place ----------------------
 
@@ -298,8 +343,10 @@ struct PluginBase
     bool setState(const uint8_t*, size_t) { return false; }
 
     /**
-     * Custom editor flag — reserved for the WebView editor layer (see
-     * docs/plugins.md). Hosts show their generic parameter UI while false.
+     * Custom editor flag. While false, hosts show their generic parameter UI.
+     * Set it to true, implement `static const char* editorHtml()` and include
+     * plugin/webview/DSParkWebViewEditor.h before the format headers to get a
+     * WebView editor embedded in the host window (see docs/plugins.md).
      */
     static constexpr bool hasEditor = false;
 };

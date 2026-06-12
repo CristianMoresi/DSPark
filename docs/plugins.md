@@ -103,7 +103,7 @@ virtual; nothing else is required.**
 | `double getTailSeconds() const` | VST3 `getTailSamples`, CLAP `clap.tail` | sound continues after input stops: reverbs, delays. Hosts keep processing your plugin that long after audio ends instead of cutting the tail. |
 | `void reset() noexcept` | CLAP `reset` | you keep history that should clear on transport jumps (delay lines, envelopes). VST3 has no direct equivalent — hosts re-activate instead, which re-runs `prepare()`. |
 | `std::vector<uint8_t> getState() const` + `bool setState(const uint8_t*, size_t)` | VST3 `IComponent::get/setState`, CLAP `clap.state` (extra section) | you have state **beyond the parameters**: learned noise profiles, loaded IRs, editor layout. The wrapper *always* saves/restores your parameter values by itself — most plugins need neither method. DSPark's `StateBlob` is the natural serializer here. |
-| `static constexpr bool hasEditor` | reserved | a custom GUI. v1 reports "no editor" and every host shows its generic parameter UI — fully usable. See "Custom UIs" below. |
+| `static constexpr bool hasEditor` | VST3 `createView`, CLAP `clap.gui` | a custom GUI written in HTML/CSS/JS: pair it with `editorHtml()` (+ optional `editorSize`, `editorResizable`, `editorDebug`) and include the WebView editor layer first. While false/absent, hosts show their generic parameter UI — fully usable. See "Custom UIs" below. |
 
 ### What the wrappers handle so you don't have to
 
@@ -130,29 +130,73 @@ virtual; nothing else is required.**
 
 ---
 
-## Custom UIs — the WebView direction
+## Custom UIs — the WebView editor
 
-v1 plugins use the host's generic editor on purpose: it is fully functional
-(sliders, automation, state) and lets the DSP ship without blocking on GUI
-infrastructure.
+Plugins without an editor use the host's generic parameter UI (fully
+functional: sliders, automation, state). To ship a custom GUI, write it in
+**plain HTML/CSS/JS** and let the editor layer embed it in the host window —
+one UI codebase for every format, no C++ GUI framework, no resource files:
 
-The planned editor layer — designed, not yet implemented — is **WebView
-based**: your plugin declares `hasEditor = true` and provides its interface
-as HTML/CSS/JS; the layer embeds the platform web engine (WebView2 on
-Windows, WKWebView on macOS, WebKitGTK on Linux) inside the window each
-format hands us (VST3 `IPlugView`, CLAP `clap.gui` — whose spec already has
-a webview draft extension, so the industry is converging on exactly this),
-plus a small JS bridge:
+```cpp
+#include "plugin/webview/DSParkWebViewEditor.h"   // FIRST: before format headers
+#include "plugin/vst3/DSParkVst3.h"
+#include "plugin/clap/DSParkClap.h"
 
-```js
-dspark.setParam("drive", 6.0);          // UI -> DSP (same stable text ids)
-dspark.onParam("drive", v => { ... });  // DSP/automation -> UI
-dspark.beginEdit("drive"); /* drag */ dspark.endEdit("drive");  // host undo
+struct MyPlugin
+{
+    // ... descriptor / parameters / prepare / setParameter / processBlock ...
+    static constexpr bool hasEditor = true;
+    static constexpr dspark::plugin::EditorSize editorSize { 560, 330 };  // logical px
+    static constexpr bool editorResizable = true;     // optional (default false)
+    // static constexpr bool editorDebug = true;      // optional: browser DevTools
+    static const char* editorHtml() { return R"html(<!doctype html>...)html"; }
+};
 ```
 
-One UI codebase for every format and platform, hot-reloadable during
-development, and no C++ GUI framework to learn. Until it lands, nothing in
-your plugin class changes — the editor is purely additive.
+The wrappers embed the platform web engine inside the window each host hands
+them — VST3 `IPlugView` (with `IPlugViewContentScaleSupport`, so HiDPI hosts
+get a crisp, correctly-sized page) and CLAP `clap.gui`:
+
+| Platform | Engine | Status |
+|---|---|---|
+| Windows | WebView2 (Edge runtime, ships with Win10/11; vendored MIT `webview` library + BSD-3 SDK header, nothing to install) | exercised in a real window on every change (`tools/vst3_editor_host`) |
+| macOS | WKWebView (system WebKit, loaded at runtime through the Objective-C runtime — no extra SDK; link `-lobjc`) | builds in CI; real-host validation pending |
+| Linux | — | plugin builds unchanged; hosts show their generic UI (no stable embedding story for WebKitGTK inside a foreign X11 window yet) |
+| AU | — | Logic shows its generic UI (an AU Cocoa view factory is a future step) |
+
+A complete working example — knobs with drag/wheel/double-click, a discrete
+selector, gestures, automation feedback — lives in
+[`examples/plugin_webview_editor/`](../examples/plugin_webview_editor/webview_saturator.cpp).
+
+### The `dspark` JS bridge
+
+Injected before your page's own scripts. Parameters use the **same stable
+text ids** as state and automation, in **plain** values:
+
+| Call | Direction | Notes |
+|---|---|---|
+| `dspark.onReady(cb)` | native → UI | fires once with the parameter table + current values: `[{id, name, min, max, def, unit, steps, value}, ...]` (replayed if already received) |
+| `dspark.setParam(id, v)` | UI → DSP + host | applied to the DSP immediately and forwarded to the host for automation recording |
+| `dspark.onParam(id, cb)` | DSP → UI | fires on host automation, preset/state restore and your own edits; cached value replays on registration |
+| `dspark.beginEdit(id)` / `dspark.endEdit(id)` | UI → host | automation gesture around a drag (host undo / touch automation); a bare `setParam` outside a gesture gets a one-shot gesture automatically |
+| `dspark.getParam(id)` / `dspark.params` | cached | last seen value / the metadata table |
+
+**How DSP → UI sync works:** the page polls the wrapper's normalized shadow
+atomics at ~30 Hz (started automatically after `onReady`) and dispatches
+only actual changes. No native timers, no locks, nothing on the audio
+thread; when the host hides the page, the browser throttles the timer by
+itself. All editor callbacks run on the host's main/UI thread and funnel
+into your `setParameter` — atomic and smoothed by contract, so a drag is
+click-free by construction.
+
+### Developing a UI
+
+- `tools/vst3_editor_host.cpp` opens your editor in a bare native window —
+  the 10-second visual check without a DAW (it also logs
+  begin/perform/endEdit calls live).
+- Set `editorDebug = true` during development to get the browser DevTools.
+- The page is ordinary web content: iterate it in a regular browser with a
+  stubbed `window.__dsparkPost`, then paste it into `editorHtml()`.
 
 ---
 
@@ -160,8 +204,10 @@ your plugin class changes — the editor is purely additive.
 
 1. **Smoke hosts** (in this repo, run in CI on every platform):
    `tools/vst3_smoke_host.cpp` and `tools/clap_smoke_host.cpp` drive your
-   module through the full lifecycle like a DAW and exit non-zero on any
-   misbehaviour.
+   module through the full lifecycle like a DAW — including the editor
+   contract (view creation, platform support, sizing, refcounts) — and exit
+   non-zero on any misbehaviour. `tools/vst3_editor_host.cpp` additionally
+   opens the editor in a real window (Windows).
 2. **Official validators** before release: Steinberg's `validator` (ships
    with the VST3 SDK), [`clap-validator`](https://github.com/free-audio/clap-validator),
    and Tracktion's [`pluginval`](https://github.com/Tracktion/pluginval) at

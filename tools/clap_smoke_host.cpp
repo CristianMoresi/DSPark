@@ -278,6 +278,43 @@ int main(int argc, char** argv)
     params->get_value(plugin, p0.id, &after);
     expect(std::fabs(after - mid) < 1e-6, "state round-trip restores the parameter");
 
+    // --- gui extension (WebView editor layer; optional) -------------------------------
+    // Contract-only: create/inspect/destroy without set_parent, so no real
+    // window or web engine is needed — this also runs on headless CI.
+    if (const auto* gui = static_cast<const clap_plugin_gui_t*>(
+            plugin->get_extension(plugin, CLAP_EXT_GUI)))
+    {
+#if defined(_WIN32)
+        const char* api = CLAP_WINDOW_API_WIN32;
+#elif defined(__APPLE__)
+        const char* api = CLAP_WINDOW_API_COCOA;
+#else
+        const char* api = CLAP_WINDOW_API_X11;
+#endif
+        expect(gui->is_api_supported(plugin, api, false),
+               "gui supports the native embedded api");
+
+        const char* preferred = nullptr;
+        bool floating = true;
+        expect(gui->get_preferred_api(plugin, &preferred, &floating)
+                   && preferred != nullptr && !floating,
+               "gui prefers a non-floating native api");
+
+        expect(gui->create(plugin, api, false), "gui create");
+        uint32_t width = 0, height = 0;
+        expect(gui->get_size(plugin, &width, &height) && width > 0 && height > 0,
+               "gui reports a usable size");
+        std::printf("      editor: %u x %u%s\n", width, height,
+                    gui->can_resize(plugin) ? " (resizable)" : "");
+
+        uint32_t adjW = width, adjH = height;
+        expect(gui->adjust_size(plugin, &adjW, &adjH) && adjW == width && adjH == height,
+               "adjust_size accepts the reported size");
+        gui->destroy(plugin);
+    }
+    else
+        std::printf("      editor: none (host shows its generic UI)\n");
+
     plugin->stop_processing(plugin);
     plugin->deactivate(plugin);
     plugin->destroy(plugin);

@@ -98,6 +98,7 @@ struct Plugin
 
     std::atomic<double> shadow[kNumParams == 0 ? 1 : kNumParams] {};
     std::atomic<bool>   bypass { false };
+    std::atomic<int>    currentProgram { 0 };   // last factory preset loaded
     float bypassMix = 0.0f;
     std::vector<float> dryL, dryR;
     std::vector<float> silence;   // stand-in sidechain when not connected
@@ -162,6 +163,7 @@ struct Plugin
             if (idx < 0 || idx >= kNumPresets) return;
             for (size_t i = 0; i < kNumParams; ++i)
                 applyNormalized(static_cast<int>(i), presetNormalized<P>(idx, i));
+            currentProgram.store(idx, std::memory_order_relaxed);
         }
         else
             (void) idx;
@@ -992,7 +994,9 @@ struct Plugin
         double norm[kNumParams == 0 ? 1 : kNumParams];
         for (size_t i = 0; i < kNumParams; ++i)
             norm[i] = s->shadow[i].load(std::memory_order_relaxed);
-        const std::vector<uint8_t> blob = buildState(s->user, norm, kNumParams);
+        const std::vector<uint8_t> blob = buildState(
+            s->user, norm, kNumParams,
+            kNumPresets > 0 ? s->currentProgram.load(std::memory_order_relaxed) : -1);
         size_t pos = 0;
         while (pos < blob.size())
         {
@@ -1020,10 +1024,13 @@ struct Plugin
         double norm[kNumParams == 0 ? 1 : kNumParams];
         for (size_t i = 0; i < kNumParams; ++i)
             norm[i] = s->shadow[i].load(std::memory_order_relaxed);
-        if (!applyState(s->user, blob.data(), blob.size(), norm))
+        int program = -1;
+        if (!applyState(s->user, blob.data(), blob.size(), norm, &program))
             return false;
         for (size_t i = 0; i < kNumParams; ++i)
             s->applyNormalized(static_cast<int>(i), norm[i]);
+        if (kNumPresets > 0 && program >= 0 && program < kNumPresets)
+            s->currentProgram.store(program, std::memory_order_relaxed);
         s->refreshLatency();   // restored state may imply a new lookahead
         return true;
     }

@@ -846,9 +846,13 @@ struct PluginBase
 inline constexpr uint32_t kStateMagic   = 0x4453504Bu;   // "DSPK"
 inline constexpr uint32_t kStateVersion = 1u;
 
+/** @brief Reserved entry id persisting the active factory-preset index
+ *  ('PRGM'); never a user parameter. Older builds skip it (unknown id). */
+inline constexpr uint32_t kProgramStateId = 0x5052474Du;
+
 template <typename P>
 inline std::vector<uint8_t> buildState(const P& user, const double* normalized,
-                                       size_t numParams)
+                                       size_t numParams, int programIndex = -1)
 {
     auto push32 = [](std::vector<uint8_t>& v, uint32_t x) {
         v.push_back(static_cast<uint8_t>(x));
@@ -856,19 +860,28 @@ inline std::vector<uint8_t> buildState(const P& user, const double* normalized,
         v.push_back(static_cast<uint8_t>(x >> 16));
         v.push_back(static_cast<uint8_t>(x >> 24));
     };
+    auto pushValue = [&push32](std::vector<uint8_t>& v, double value) {
+        uint64_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value));
+        std::memcpy(&bits, &value, sizeof(bits));
+        push32(v, static_cast<uint32_t>(bits));
+        push32(v, static_cast<uint32_t>(bits >> 32));
+    };
     std::vector<uint8_t> blob;
     push32(blob, kStateMagic);
     push32(blob, kStateVersion);
-    push32(blob, static_cast<uint32_t>(numParams));
+    push32(blob, static_cast<uint32_t>(numParams) + (programIndex >= 0 ? 1u : 0u));
     for (size_t i = 0; i < numParams; ++i)
     {
         push32(blob, hash32(P::parameters[i].id));
-        uint64_t bits = 0;
-        const double v = normalized[i];
-        static_assert(sizeof(bits) == sizeof(v));
-        std::memcpy(&bits, &v, sizeof(bits));
-        push32(blob, static_cast<uint32_t>(bits));
-        push32(blob, static_cast<uint32_t>(bits >> 32));
+        pushValue(blob, normalized[i]);
+    }
+    if (programIndex >= 0)
+    {
+        // The active factory preset rides along as one more entry so hosts
+        // restore the program selection with the session.
+        push32(blob, kProgramStateId);
+        pushValue(blob, static_cast<double>(programIndex));
     }
     if constexpr (HasGetState<P>)
     {
@@ -882,9 +895,12 @@ inline std::vector<uint8_t> buildState(const P& user, const double* normalized,
 }
 
 /** @brief Parses a state blob; fills `normalized` (defaults pre-loaded by the
- *  caller) and forwards the user section. Returns false on a foreign blob. */
+ *  caller), reports a persisted program index through @p programIndex (left
+ *  untouched when absent) and forwards the user section. Returns false on a
+ *  foreign blob. */
 template <typename P>
-inline bool applyState(P& user, const uint8_t* data, size_t size, double* normalized)
+inline bool applyState(P& user, const uint8_t* data, size_t size, double* normalized,
+                       int* programIndex = nullptr)
 {
     auto read32 = [&](size_t& pos, uint32_t& out) {
         if (pos + 4 > size) return false;
@@ -909,6 +925,12 @@ inline bool applyState(P& user, const uint8_t* data, size_t size, double* normal
         const uint64_t bits = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
         double v = 0.0;
         std::memcpy(&v, &bits, sizeof(v));
+        if (id == kProgramStateId)
+        {
+            if (programIndex != nullptr && v >= 0.0)
+                *programIndex = static_cast<int>(v + 0.5);
+            continue;
+        }
         for (size_t k = 0; k < numParams; ++k)
             if (hash32(P::parameters[k].id) == id)
             {

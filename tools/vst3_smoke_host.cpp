@@ -794,6 +794,21 @@ int main(int argc, char** argv)
             expect((handler.restartFlags
                     & Steinberg_Vst_RestartFlags_kParamValuesChanged) != 0,
                    "preset load notifies kParamValuesChanged");
+
+            // The active program must survive a state round-trip (the
+            // pluginval state-restoration test demands it).
+            MemoryStream programState;
+            comp->lpVtbl->getState(comp,
+                reinterpret_cast<Steinberg_IBStream*>(&programState));
+            ctrl->lpVtbl->setParamNormalized(ctrl, programId, 0.0);
+            MemoryStream programRestore;
+            programRestore.bytes = programState.bytes;
+            programRestore.pos = 0;
+            comp->lpVtbl->setState(comp,
+                reinterpret_cast<Steinberg_IBStream*>(&programRestore));
+            expect(std::fabs(ctrl->lpVtbl->getParamNormalized(ctrl, programId) - 1.0)
+                       < 1e-9,
+                   "program selection survives the state round-trip");
             ctrl->lpVtbl->setParamNormalized(ctrl, programId, 0.0);
         }
         data.processContext = nullptr;

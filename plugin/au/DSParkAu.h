@@ -861,7 +861,9 @@ struct Plugin
             double norm[kNumParams == 0 ? 1 : kNumParams];
             for (size_t i = 0; i < kNumParams; ++i)
                 norm[i] = shadow[i].load(std::memory_order_relaxed);
-            const std::vector<uint8_t> blob = buildState(user, norm, kNumParams);
+            const std::vector<uint8_t> blob = buildState(
+                user, norm, kNumParams,
+                kNumPresets > 0 ? currentPresetNumber : -1);
 
             CFMutableDictionaryRef dict = CFDictionaryCreateMutable(
                 nullptr, 0, &kCFTypeDictionaryKeyCallBacks,
@@ -1017,18 +1019,25 @@ struct Plugin
                          std::memory_order_relaxed);
             return noErr;
         case kAudioUnitProperty_SetRenderCallback:
-            if (scope != kAudioUnitScope_Input || element >= kNumInputElements
+        {
+            // Instruments have no input elements yet must still ACCEPT a
+            // render callback (auval and some hosts set one regardless);
+            // it is stored and never pulled.
+            constexpr UInt32 storable = kIsInstrument ? 2 : kNumInputElements;
+            if (scope != kAudioUnitScope_Input || element >= storable
                 || inData == nullptr || inSize < sizeof(AURenderCallbackStruct))
                 return kAudioUnitErr_InvalidPropertyValue;
             inputCallback[element] = *static_cast<const AURenderCallbackStruct*>(inData);
             inputConnection[element] = nullptr;
             return noErr;
+        }
         case kAudioUnitProperty_MakeConnection:
         {
             if (inData == nullptr || inSize < sizeof(AudioUnitConnection))
                 return kAudioUnitErr_InvalidPropertyValue;
             const auto* c = static_cast<const AudioUnitConnection*>(inData);
-            if (c->destInputNumber >= kNumInputElements)
+            constexpr UInt32 storable = kIsInstrument ? 2 : kNumInputElements;
+            if (c->destInputNumber >= storable)
                 return kAudioUnitErr_InvalidPropertyValue;
             inputConnection[c->destInputNumber] = c->sourceAudioUnit;
             inputConnectionBus[c->destInputNumber] = c->sourceOutputNumber;
@@ -1050,12 +1059,16 @@ struct Plugin
             double norm[kNumParams == 0 ? 1 : kNumParams];
             for (size_t i = 0; i < kNumParams; ++i)
                 norm[i] = shadow[i].load(std::memory_order_relaxed);
+            int program = -1;
             if (applyState(user,
                            CFDataGetBytePtr(data),
-                           static_cast<size_t>(CFDataGetLength(data)), norm))
+                           static_cast<size_t>(CFDataGetLength(data)), norm,
+                           &program))
             {
                 for (size_t i = 0; i < kNumParams; ++i)
                     applyNormalized(static_cast<int>(i), norm[i]);
+                if (kNumPresets > 0 && program >= 0 && program < kNumPresets)
+                    currentPresetNumber = program;
                 refreshLatency();   // restored state may imply a new lookahead
             }
             return noErr;

@@ -273,6 +273,17 @@ concept HasEditorSize = requires {
     { P::editorSize.height } -> std::convertible_to<int>;
 };
 
+/** @brief The declared (logical) editor size, or the 480x320 default. */
+template <typename P>
+constexpr EditorSize editorSizeOf() noexcept
+{
+    if constexpr (HasEditorSize<P>)
+        return EditorSize { static_cast<int>(P::editorSize.width),
+                            static_cast<int>(P::editorSize.height) };
+    else
+        return EditorSize {};
+}
+
 /** @brief Optional `static constexpr bool editorResizable = true;` — shorthand
  *  for `editorResize = EditorResize::Free` (default: fixed size). */
 template <typename P>
@@ -352,17 +363,6 @@ template <typename P>
 concept HasEditorDevFile = requires {
     { P::editorDevFile() } -> std::convertible_to<const char*>;
 };
-
-/** @brief The declared (logical) editor size, or the 480x320 default. */
-template <typename P>
-constexpr EditorSize editorSizeOf() noexcept
-{
-    if constexpr (HasEditorSize<P>)
-        return EditorSize { static_cast<int>(P::editorSize.width),
-                            static_cast<int>(P::editorSize.height) };
-    else
-        return EditorSize {};
-}
 
 // -- PluginBase: the whole contract, visible in one place ----------------------
 

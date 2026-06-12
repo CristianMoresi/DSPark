@@ -940,6 +940,9 @@ struct Plugin
             const auto* f = static_cast<const AudioStreamBasicDescription*>(inData);
             if (!acceptableFormat(*f)) return kAudioUnitErr_FormatNotSupported;
             sampleRate = f->mSampleRate;
+            // The negotiated width: every element of the instance follows
+            // (initialize() prepares the plugin at this count).
+            currentChannels = static_cast<int>(f->mChannelsPerFrame);
             return noErr;
         }
         case kAudioUnitProperty_SampleRate:

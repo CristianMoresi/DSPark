@@ -136,8 +136,10 @@ function(dspark_add_plugin TARGET)
             LIBRARY_OUTPUT_DIRECTORY
                 "$<1:${CMAKE_BINARY_DIR}/${TARGET}.vst3/Contents/${arch_dir}>")
     elseif(APPLE)
-        # objc runtime for the WKWebView editor glue; harmless without one.
-        target_link_libraries(${TARGET} PRIVATE objc)
+        # objc runtime for the WKWebView editor glue, and the system audio
+        # frameworks the AU entry points reference; harmless when unused.
+        target_link_libraries(${TARGET} PRIVATE objc
+            "-framework AudioToolbox" "-framework CoreFoundation")
         set_target_properties(${TARGET} PROPERTIES
             SUFFIX ""
             LIBRARY_OUTPUT_DIRECTORY

@@ -153,7 +153,18 @@ jobs:
           gh release download --repo Tracktion/pluginval --pattern "$PV_PAT" --dir validators
           gh release download --repo free-audio/clap-validator --pattern "$CV_PAT" --dir validators
           for a in validators/*.zip validators/*.tar.gz; do
-            [ -e "$a" ] && tar -xf "$a" -C validators
+            [ -e "$a" ] || continue
+            case "$a" in
+              *.zip)
+                # Git Bash ships GNU tar (no zip support); Windows' own
+                # bsdtar handles zips fine. unzip is present elsewhere.
+                if [[ "$RUNNER_OS" == "Windows" ]]; then
+                  /c/Windows/System32/tar.exe -xf "$a" -C validators
+                else
+                  unzip -oq "$a" -d validators
+                fi ;;
+              *.tar.gz) tar -xf "$a" -C validators ;;
+            esac
           done
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             PLUGINVAL=validators/pluginval.exe

@@ -166,15 +166,16 @@ jobs:
               *.tar.gz) tar -xf "$a" -C validators ;;
             esac
           done
+          # Release archives differ in layout per OS; locate the binaries.
+          CLAPVAL=$(find validators -type f \( -name "clap-validator" -o -name "clap-validator.exe" \) | head -1)
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             PLUGINVAL=validators/pluginval.exe
-            CLAPVAL=validators/clap-validator.exe
             VST3S="DSParkSaturator.vst3 DSParkWebSaturator.vst3 build_webgain/DSParkWebGain.vst3"
             CLAPS="DSParkSaturator.clap DSParkWebSaturator.clap build_webgain/DSParkWebGain.clap"
             PREFIX=""
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
             PLUGINVAL=validators/pluginval.app/Contents/MacOS/pluginval
-            CLAPVAL=validators/clap-validator
+            chmod +x "$CLAPVAL"
             # Plain-file modules are a Windows/Linux convenience; on macOS
             # only the CMake-built proper bundles are loadable by validators.
             VST3S="build_webgain/DSParkWebGain.vst3"
@@ -182,7 +183,6 @@ jobs:
             PREFIX=""
           else
             PLUGINVAL=validators/pluginval
-            CLAPVAL=validators/clap-validator
             VST3S="build_webgain/DSParkWebGain.vst3"
             CLAPS="DSParkSaturator.clap DSParkWebSaturator.clap build_webgain/DSParkWebGain.clap"
             PREFIX="xvfb-run -a"

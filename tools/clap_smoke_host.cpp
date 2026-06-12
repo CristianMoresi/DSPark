@@ -709,11 +709,11 @@ int main(int argc, char** argv)
     }
 
     // --- state round-trip ---------------------------------------------------------
-    EventList stateEvents;
+    constexpr uint32_t kBypassId = 0x42595053u;   // 'BYPS', the wrapper's bypass
     events.paramValue(p0.id, 0.5 * (p0.min_value + p0.max_value), 0);
+    events.paramValue(kBypassId, 1.0, 0);   // bypass is state like any parameter
     params->flush(plugin, &events.iface, &kOutEvents);
     events.clear();
-    (void) stateEvents;
     double mid = 0.0;
     params->get_value(plugin, p0.id, &mid);
 
@@ -722,6 +722,7 @@ int main(int argc, char** argv)
            "state save produces a blob");
 
     events.paramValue(p0.id, p0.min_value, 0);
+    events.paramValue(kBypassId, 0.0, 0);
     params->flush(plugin, &events.iface, &kOutEvents);
     events.clear();
 
@@ -731,6 +732,13 @@ int main(int argc, char** argv)
     double after = 0.0;
     params->get_value(plugin, p0.id, &after);
     expect(std::fabs(after - mid) < 1e-6, "state round-trip restores the parameter");
+    double bypassAfter = 0.0;
+    expect(params->get_value(plugin, kBypassId, &bypassAfter)
+               && bypassAfter >= 0.5,
+           "state round-trip restores the bypass (clap-validator demands it)");
+    events.paramValue(kBypassId, 0.0, 0);   // leave the plugin un-bypassed
+    params->flush(plugin, &events.iface, &kOutEvents);
+    events.clear();
 
     // --- gui extension (WebView editor layer; optional) -------------------------------
     // Contract-only: create/inspect/destroy without set_parent, so no real

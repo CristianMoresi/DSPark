@@ -863,7 +863,8 @@ struct Plugin
                 norm[i] = shadow[i].load(std::memory_order_relaxed);
             const std::vector<uint8_t> blob = buildState(
                 user, norm, kNumParams,
-                kNumPresets > 0 ? currentPresetNumber : -1);
+                kNumPresets > 0 ? currentPresetNumber : -1,
+                bypass.load(std::memory_order_relaxed) ? 1 : 0);
 
             CFMutableDictionaryRef dict = CFDictionaryCreateMutable(
                 nullptr, 0, &kCFTypeDictionaryKeyCallBacks,
@@ -1060,15 +1061,18 @@ struct Plugin
             for (size_t i = 0; i < kNumParams; ++i)
                 norm[i] = shadow[i].load(std::memory_order_relaxed);
             int program = -1;
+            int bypassState = -1;
             if (applyState(user,
                            CFDataGetBytePtr(data),
                            static_cast<size_t>(CFDataGetLength(data)), norm,
-                           &program))
+                           &program, &bypassState))
             {
                 for (size_t i = 0; i < kNumParams; ++i)
                     applyNormalized(static_cast<int>(i), norm[i]);
                 if (kNumPresets > 0 && program >= 0 && program < kNumPresets)
                     currentPresetNumber = program;
+                if (bypassState >= 0)
+                    bypass.store(bypassState != 0, std::memory_order_relaxed);
                 refreshLatency();   // restored state may imply a new lookahead
             }
             return noErr;

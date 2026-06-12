@@ -996,7 +996,8 @@ struct Plugin
             norm[i] = s->shadow[i].load(std::memory_order_relaxed);
         const std::vector<uint8_t> blob = buildState(
             s->user, norm, kNumParams,
-            kNumPresets > 0 ? s->currentProgram.load(std::memory_order_relaxed) : -1);
+            kNumPresets > 0 ? s->currentProgram.load(std::memory_order_relaxed) : -1,
+            s->bypass.load(std::memory_order_relaxed) ? 1 : 0);
         size_t pos = 0;
         while (pos < blob.size())
         {
@@ -1025,12 +1026,16 @@ struct Plugin
         for (size_t i = 0; i < kNumParams; ++i)
             norm[i] = s->shadow[i].load(std::memory_order_relaxed);
         int program = -1;
-        if (!applyState(s->user, blob.data(), blob.size(), norm, &program))
+        int bypassState = -1;
+        if (!applyState(s->user, blob.data(), blob.size(), norm, &program,
+                        &bypassState))
             return false;
         for (size_t i = 0; i < kNumParams; ++i)
             s->applyNormalized(static_cast<int>(i), norm[i]);
         if (kNumPresets > 0 && program >= 0 && program < kNumPresets)
             s->currentProgram.store(program, std::memory_order_relaxed);
+        if (bypassState >= 0)
+            s->bypass.store(bypassState != 0, std::memory_order_relaxed);
         s->refreshLatency();   // restored state may imply a new lookahead
         return true;
     }

@@ -850,9 +850,16 @@ inline constexpr uint32_t kStateVersion = 1u;
  *  ('PRGM'); never a user parameter. Older builds skip it (unknown id). */
 inline constexpr uint32_t kProgramStateId = 0x5052474Du;
 
+/** @brief Reserved entry id persisting the host bypass ('BYPS' — the same
+ *  value every backend uses as the bypass ParamID). Hosts treat bypass as
+ *  one more parameter, so it must survive a state round-trip like any
+ *  other. Older builds skip it (unknown id). */
+inline constexpr uint32_t kBypassStateId = 0x42595053u;
+
 template <typename P>
 inline std::vector<uint8_t> buildState(const P& user, const double* normalized,
-                                       size_t numParams, int programIndex = -1)
+                                       size_t numParams, int programIndex = -1,
+                                       int bypassState = -1)
 {
     auto push32 = [](std::vector<uint8_t>& v, uint32_t x) {
         v.push_back(static_cast<uint8_t>(x));
@@ -870,7 +877,8 @@ inline std::vector<uint8_t> buildState(const P& user, const double* normalized,
     std::vector<uint8_t> blob;
     push32(blob, kStateMagic);
     push32(blob, kStateVersion);
-    push32(blob, static_cast<uint32_t>(numParams) + (programIndex >= 0 ? 1u : 0u));
+    push32(blob, static_cast<uint32_t>(numParams) + (programIndex >= 0 ? 1u : 0u)
+                     + (bypassState >= 0 ? 1u : 0u));
     for (size_t i = 0; i < numParams; ++i)
     {
         push32(blob, hash32(P::parameters[i].id));
@@ -882,6 +890,11 @@ inline std::vector<uint8_t> buildState(const P& user, const double* normalized,
         // restore the program selection with the session.
         push32(blob, kProgramStateId);
         pushValue(blob, static_cast<double>(programIndex));
+    }
+    if (bypassState >= 0)
+    {
+        push32(blob, kBypassStateId);
+        pushValue(blob, bypassState > 0 ? 1.0 : 0.0);
     }
     if constexpr (HasGetState<P>)
     {
@@ -895,12 +908,12 @@ inline std::vector<uint8_t> buildState(const P& user, const double* normalized,
 }
 
 /** @brief Parses a state blob; fills `normalized` (defaults pre-loaded by the
- *  caller), reports a persisted program index through @p programIndex (left
- *  untouched when absent) and forwards the user section. Returns false on a
- *  foreign blob. */
+ *  caller), reports a persisted program index / bypass through
+ *  @p programIndex and @p bypassState (left untouched when absent) and
+ *  forwards the user section. Returns false on a foreign blob. */
 template <typename P>
 inline bool applyState(P& user, const uint8_t* data, size_t size, double* normalized,
-                       int* programIndex = nullptr)
+                       int* programIndex = nullptr, int* bypassState = nullptr)
 {
     auto read32 = [&](size_t& pos, uint32_t& out) {
         if (pos + 4 > size) return false;
@@ -929,6 +942,12 @@ inline bool applyState(P& user, const uint8_t* data, size_t size, double* normal
         {
             if (programIndex != nullptr && v >= 0.0)
                 *programIndex = static_cast<int>(v + 0.5);
+            continue;
+        }
+        if (id == kBypassStateId)
+        {
+            if (bypassState != nullptr)
+                *bypassState = v >= 0.5 ? 1 : 0;
             continue;
         }
         for (size_t k = 0; k < numParams; ++k)

@@ -651,12 +651,16 @@ struct Plugin
         for (size_t i = 0; i < kNumParams; ++i)
             norm[i] = p->shadow[i].load(std::memory_order_relaxed);
         int program = -1;
-        if (!applyState(p->user, blob.data(), blob.size(), norm, &program))
+        int bypassState = -1;
+        if (!applyState(p->user, blob.data(), blob.size(), norm, &program,
+                        &bypassState))
             return Steinberg_kResultFalse;
         for (size_t i = 0; i < kNumParams; ++i)
             p->applyNormalized(static_cast<int>(i), norm[i]);
         if (kNumPresets > 0 && program >= 0 && program < kNumPresets)
             p->currentProgram.store(program, std::memory_order_relaxed);
+        if (bypassState >= 0)
+            p->bypass.store(bypassState != 0, std::memory_order_relaxed);
         p->refreshLatency();   // restored state may imply a new lookahead
         return Steinberg_kResultOk;
     }
@@ -671,7 +675,8 @@ struct Plugin
             norm[i] = p->shadow[i].load(std::memory_order_relaxed);
         const std::vector<uint8_t> blob = buildState(
             p->user, norm, kNumParams,
-            kNumPresets > 0 ? p->currentProgram.load(std::memory_order_relaxed) : -1);
+            kNumPresets > 0 ? p->currentProgram.load(std::memory_order_relaxed) : -1,
+            p->bypass.load(std::memory_order_relaxed) ? 1 : 0);
         return streamWrite(state, blob.data(), static_cast<Steinberg_int32>(blob.size()))
              ? Steinberg_kResultOk : Steinberg_kResultFalse;
     }

@@ -4,7 +4,7 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.3.0** — 90+ headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
+**v1.4.0** — 90+ headers. One `#include`. Ready to build plugins (with HTML/CSS/JS editors), desktop apps, WebAssembly, mobile, embedded.
 
 **📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
@@ -425,6 +425,43 @@ DSPark/
 ├── tools/                   # VST3/CLAP smoke hosts, editor host, amalgamator
 └── DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)
 ```
+
+---
+
+## What's New in v1.4.0
+
+**The WebView editor**: custom plugin GUIs in plain HTML/CSS/JS, embedded
+in the host window — no GUI framework, nothing to install.
+
+- **Declare and serve**: `hasEditor = true` + `editorHtml()` (plus optional
+  `editorSize`, `editorResize`, `editorDebug`) and the VST3/CLAP backends
+  embed the platform web engine — WebView2 on Windows, WKWebView on macOS
+  (Linux falls back to the host's generic UI for now). The vendored MIT
+  `webview` library and the BSD-3 WebView2 SDK header keep it
+  zero-download, like the rest of the plugin layer.
+- **The `dspark` JS bridge**: `onReady` hands the page the parameter table
+  with live values; `setParam`/`onParam` move plain values both ways with
+  the same stable text ids as automation and state; `beginEdit`/`endEdit`
+  drive host automation gestures and undo. DSP→UI sync polls the wrapper's
+  atomic shadows — no native timers, no locks, nothing on the audio thread.
+- **Sizing that survives real hosts** (field-validated in REAPER): OS-level
+  frame limits (`WM_GETMINMAXINFO`/`WM_SIZING`), honest VST3/CLAP size
+  negotiation, and JUCE-style proportional content scaling with `Fixed` /
+  `Free` / `KeepAspect` resize policies. HiDPI handled end to end.
+- **A real workflow**: develop the UI as ordinary separate web files and
+  `dspark_add_plugin(... EDITOR_HTML ui/editor.html)` inlines and embeds
+  them at build time; `editorDevFile()` reloads the page from disk while
+  iterating (no recompile); `editorDebug` opens the browser DevTools;
+  `tools/vst3_editor_host` opens any editor in a bare window with a
+  self-testing resize battery. `DSPARK_WEBVIEW_LOG=1` traces every
+  host/editor size negotiation.
+- **Hardened in CI**: `dspark_add_plugin` now also assembles AU
+  `.component` bundles (`FORMATS VST3 CLAP AU`), and every example plugin
+  must pass Tracktion's `pluginval` (strictness 8) and `clap-validator` on
+  Windows, Linux and macOS — the latter immediately caught a real
+  toggle-parsing contract bug in both backends, now fixed.
+- Examples: `examples/plugin_webview_editor/` (single-file, draggable SVG
+  knobs) and `examples/plugin_webview_files/` (separate-files workflow).
 
 ---
 

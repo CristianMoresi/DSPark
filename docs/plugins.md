@@ -7,9 +7,17 @@ in CI; AU is what Logic Pro and GarageBand load). This page is the complete
 contract reference: everything the wrappers will detect and call, what each
 piece maps to in every format, and when to use it.
 
-For a copy-paste starting point with every optional method present and
-commented, see [`examples/plugin_template/`](../examples/plugin_template/plugin_template.cpp).
-For a real effect, see [`examples/plugin_saturator/`](../examples/plugin_saturator/saturator.cpp).
+**The examples, in learning order** — each one is the canonical reference
+for exactly one capability:
+
+| Start here | What it teaches |
+|---|---|
+| [`plugin_saturator/`](../examples/plugin_saturator/saturator.cpp) | the minimum: one effect, one file, three formats |
+| [`plugin_template/`](../examples/plugin_template/plugin_template.cpp) | every optional contract method, present and commented (uses `PluginBase`) |
+| [`plugin_ducker/`](../examples/plugin_ducker/ducker.cpp) | a sidechain input the host can route into |
+| [`plugin_synth/`](../examples/plugin_synth/synth.cpp) | an instrument: MIDI in, voices, no audio input, factory presets |
+| [`plugin_webview_editor/`](../examples/plugin_webview_editor/webview_saturator.cpp) | a custom HTML/CSS/JS GUI in a single file (knobs, gestures) |
+| [`plugin_webview_files/`](../examples/plugin_webview_files/) | the production GUI workflow: separate `ui/` files embedded by CMake |
 
 ---
 
@@ -52,6 +60,41 @@ dspark_add_plugin(MyPlugin SOURCES myplugin.cpp
                   FORMATS VST3 CLAP AU
                   AU_SUBTYPE Subt AU_MANUFACTURER Manu)
 ```
+
+### Your project, from a blank folder
+
+The snippets above run from inside this repository, but a real plugin is
+**your** folder with DSPark inside it (a copy, a git submodule or a
+`FetchContent` checkout — anything that puts the repository tree next to
+your code):
+
+```
+MyPlugin/
+├── DSPark/             <- this repository (only its headers are used)
+├── ui/                 <- your editor page, if you ship a custom GUI
+│   ├── editor.html
+│   ├── editor.css
+│   └── editor.js
+├── myplugin.cpp        <- the whole plugin
+└── CMakeLists.txt
+```
+
+```cmake
+cmake_minimum_required(VERSION 3.21)
+project(MyPlugin CXX)
+include("${CMAKE_CURRENT_SOURCE_DIR}/DSPark/plugin/cmake/DSParkPlugin.cmake")
+dspark_add_plugin(MyPlugin
+    SOURCES     myplugin.cpp
+    FORMATS     VST3 CLAP AU            # AU materialises on macOS, ignored elsewhere
+    EDITOR_HTML ui/editor.html          # omit for the host's generic UI
+    AU_SUBTYPE  Subt AU_MANUFACTURER Manu)
+```
+
+Includes in `myplugin.cpp` then start at the subfolder
+(`#include "DSPark/plugin/vst3/DSParkVst3.h"`), and the one-line compiler
+invocations above work with `/I DSPark` (or `-I DSPark`) instead of `/I .`.
+`cmake -S . -B build && cmake --build build --config Release` produces the
+properly laid-out bundles under `build/`.
 
 One compiled binary carries **every entry point the source declares**: ship
 the same file as `.vst3` and as `.clap`; on macOS the AU `.component`

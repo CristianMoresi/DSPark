@@ -905,7 +905,7 @@ struct Plugin
         struct StereoBufferList
         {
             UInt32 mNumberBuffers;
-            AudioBuffer mBuffers[2];
+            ::AudioBuffer mBuffers[2];   // CoreAudio's, not dspark::AudioBuffer
         } list {};
         list.mNumberBuffers = 2;
         for (int ch = 0; ch < 2; ++ch)

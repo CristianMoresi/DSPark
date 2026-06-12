@@ -4,7 +4,7 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.5.0** — 90+ headers of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and (when you need them) native VST3/CLAP/AU plugins with HTML/CSS/JS editors.
+**v1.5.0** — 90+ headers of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins with HTML/CSS/JS editors.
 
 **📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
@@ -261,7 +261,7 @@ channelStrip.prepare(spec);
 channelStrip.processBlock(buffer);
 ```
 
-### Per-Sample Processing (DSP Engineers)
+### Per-Sample Processing
 
 ```cpp
 dspark::StateVariableFilter<float> svf;
@@ -296,12 +296,12 @@ eq.getMagnitudeForFrequencyArray(freqs.data(), mags.data(), 512);
 
 ---
 
-## Build VST3 / CLAP / AU plugins — no JUCE required
+## Build VST3 / CLAP / AU plugins
 
 DSPark is a DSP framework first, but it ships a complete native plugin
 layer: the same class that processes your audio becomes a loadable plugin
-with nothing but this repository (Steinberg's official C API header is
-vendored under its permissive 2025 license).
+with nothing but this repository — no JUCE, no SDK downloads (Steinberg's
+official C API header is vendored under its permissive 2025 license).
 
 ```cpp
 #include "plugin/vst3/DSParkVst3.h"
@@ -389,7 +389,7 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 | macOS (Clang) | Compatible | C++20, -Wall -Wextra |
 | WebAssembly (Emscripten) | Compatible | Zero syscalls in audio path |
 | iOS / Android | Compatible | ARM NEON denormal flush supported |
-| Plugins (VST3 / CLAP / AU) | Native | Built-in plugin layer with WebView editors — no JUCE required ([guide](docs/plugins.md)) |
+| Plugins (VST3 / CLAP / AU) | Native | Built-in plugin layer with WebView editors ([guide](docs/plugins.md)) |
 
 ---
 

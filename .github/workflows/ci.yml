@@ -61,10 +61,23 @@ jobs:
           clap_smoke_host.exe DSParkSaturator.clap
           cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_template\plugin_template.cpp /Fe:DSParkTemplate.vst3
           vst3_smoke_host.exe DSParkTemplate.vst3
+          copy DSParkTemplate.vst3 DSParkTemplate.clap
+          clap_smoke_host.exe DSParkTemplate.clap
           cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_ducker\ducker.cpp /Fe:DSParkDucker.vst3
           vst3_smoke_host.exe DSParkDucker.vst3 --expect-sidechain
           copy DSParkDucker.vst3 DSParkDucker.clap
           clap_smoke_host.exe DSParkDucker.clap --expect-sidechain
+          rem Host-contract probe: transport, offline, sample-accurate
+          rem automation, MIDI + pitch bend, latency change, mono, presets.
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . tools\plugin_probe.cpp /Fe:DSParkProbe.vst3
+          vst3_smoke_host.exe DSParkProbe.vst3 --probe
+          copy DSParkProbe.vst3 DSParkProbe.clap
+          clap_smoke_host.exe DSParkProbe.clap --probe
+          rem Instrument reference: no audio in, note in, pitch + decay.
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_synth\synth.cpp /Fe:DSParkSynth.vst3
+          vst3_smoke_host.exe DSParkSynth.vst3 --expect-instrument
+          copy DSParkSynth.vst3 DSParkSynth.clap
+          clap_smoke_host.exe DSParkSynth.clap --expect-instrument
           cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_webview_editor\webview_saturator.cpp /Fe:DSParkWebSaturator.vst3
           vst3_smoke_host.exe DSParkWebSaturator.vst3
           copy DSParkWebSaturator.vst3 DSParkWebSaturator.clap
@@ -93,11 +106,25 @@ jobs:
           ./clap_smoke_host ./DSParkSaturator.clap
           ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_template/plugin_template.cpp -o DSParkTemplate.vst3
           ./vst3_smoke_host ./DSParkTemplate.vst3
+          cp DSParkTemplate.vst3 DSParkTemplate.clap
+          ./clap_smoke_host ./DSParkTemplate.clap
           # Sidechain reference plugin: bus layout + functional ducking proof
           ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_ducker/ducker.cpp -o DSParkDucker.vst3 $EXTRA
           ./vst3_smoke_host ./DSParkDucker.vst3 --expect-sidechain
           cp DSParkDucker.vst3 DSParkDucker.clap
           ./clap_smoke_host ./DSParkDucker.clap --expect-sidechain
+          # Host-contract probe: transport, offline render mode,
+          # sample-accurate automation, MIDI + pitch bend, the
+          # latency-changed notification, mono negotiation, presets.
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . tools/plugin_probe.cpp -o DSParkProbe.vst3
+          ./vst3_smoke_host ./DSParkProbe.vst3 --probe
+          cp DSParkProbe.vst3 DSParkProbe.clap
+          ./clap_smoke_host ./DSParkProbe.clap --probe
+          # Instrument reference: no audio in, note in, pitch + decay.
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_synth/synth.cpp -o DSParkSynth.vst3 $EXTRA
+          ./vst3_smoke_host ./DSParkSynth.vst3 --expect-instrument
+          cp DSParkSynth.vst3 DSParkSynth.clap
+          ./clap_smoke_host ./DSParkSynth.clap --expect-instrument
           # WebView editor example: WKWebView objc glue on macOS, stub on Linux
           WEBVIEW_EXTRA=""
           if [[ "$RUNNER_OS" == "macOS" ]]; then
@@ -172,6 +199,19 @@ jobs:
             "$HOME/Library/Audio/Plug-Ins/Components/"
           killall -9 AudioComponentRegistrar 2>/dev/null || true
           auval -v aufx DSwg DSpk
+          # The instrument reference: an aumu music device (no input
+          # elements, MusicDevice MIDI selectors, factory presets).
+          clang++ -std=c++20 -O2 -Wall -Wextra -bundle -I . \
+            examples/plugin_synth/synth.cpp \
+            -framework AudioToolbox -framework CoreFoundation \
+            -o DSParkSynthAU
+          COMP3="$HOME/Library/Audio/Plug-Ins/Components/DSParkSynth.component"
+          mkdir -p "$COMP3/Contents/MacOS"
+          cp DSParkSynthAU "$COMP3/Contents/MacOS/DSParkSynth"
+          cp examples/plugin_synth/au/Info.plist "$COMP3/Contents/Info.plist"
+          codesign --force -s - "$COMP3"
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          auval -v aumu DSsy DSpk
           # WebView editor through the AU Cocoa contract: factory class, real
           # WKWebView attach, bridge handshake, both teardown orders.
           clang++ -std=c++20 -O2 -Wall -Wextra -I . tools/au_editor_smoke.cpp \
@@ -214,8 +254,8 @@ jobs:
           CLAPVAL=$(find validators -type f \( -name "clap-validator" -o -name "clap-validator.exe" \) | head -1)
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             PLUGINVAL=validators/pluginval.exe
-            VST3S="DSParkSaturator.vst3 DSParkWebSaturator.vst3 DSParkDucker.vst3 build_webgain/DSParkWebGain.vst3"
-            CLAPS="DSParkSaturator.clap DSParkWebSaturator.clap DSParkDucker.clap build_webgain/DSParkWebGain.clap"
+            VST3S="DSParkSaturator.vst3 DSParkWebSaturator.vst3 DSParkDucker.vst3 DSParkSynth.vst3 DSParkProbe.vst3 build_webgain/DSParkWebGain.vst3"
+            CLAPS="DSParkSaturator.clap DSParkWebSaturator.clap DSParkDucker.clap DSParkSynth.clap DSParkProbe.clap build_webgain/DSParkWebGain.clap"
             PREFIX=""
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
             PLUGINVAL=validators/pluginval.app/Contents/MacOS/pluginval
@@ -228,7 +268,7 @@ jobs:
           else
             PLUGINVAL=validators/pluginval
             VST3S="build_webgain/DSParkWebGain.vst3"
-            CLAPS="DSParkSaturator.clap DSParkWebSaturator.clap DSParkDucker.clap build_webgain/DSParkWebGain.clap"
+            CLAPS="DSParkSaturator.clap DSParkWebSaturator.clap DSParkDucker.clap DSParkSynth.clap DSParkProbe.clap build_webgain/DSParkWebGain.clap"
             PREFIX="xvfb-run -a"
           fi
           for p in $VST3S; do

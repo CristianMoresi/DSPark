@@ -104,35 +104,52 @@ virtual; nothing else is required.**
 
 | Member | Called from | What it must do |
 |---|---|---|
-| `static constexpr Descriptor descriptor` | scan time | Identity. `productId` derives the VST3 class UID and IS the CLAP id — **never change it after a release** (it orphans saved sessions). `name`, `vendor`, `version`, `url`, `email` feed the hosts' plugin browsers. |
+| `static constexpr Descriptor descriptor` | scan time | Identity. `productId` derives the VST3 class UID and IS the CLAP id — **never change it after a release** (it orphans saved sessions). `name`, `vendor`, `version`, `url`, `email` feed the hosts' plugin browsers. `category` selects effect or **instrument** (see "Instruments & MIDI"). |
 | `static constexpr auto parameters` | scan time | The automatable parameter table, built with `params(param(...), toggle(...))`. The **text ids are the stable identity** of each parameter (state + automation): you may reorder/insert parameters freely between versions, but never rename an id. |
-| `void prepare(const AudioSpec&)` | main thread, before audio | Allocate and configure for `sampleRate` / `maxBlockSize` / 2 channels. Maps to VST3 `setActive(true)` (after `setupProcessing`) and CLAP `activate`. May allocate. |
+| `void prepare(const AudioSpec&)` | main thread, before audio | Allocate and configure for `sampleRate` / `maxBlockSize` / `numChannels` — the channel count is whatever the host negotiated (1 or 2, see `channels` below). Maps to VST3 `setActive(true)` (after `setupProcessing`) and CLAP `activate`. May allocate. |
 | `void setParameter(int index, float plain) noexcept` | **any thread** | Receive a plain-range value for `parameters[index]`. Forward to your DSPark setters — they are atomic and smoothed by contract, which is what makes this callable from UI and audio threads alike. Never allocate or lock. |
-| `void processBlock(AudioBufferView<float>) noexcept` | audio thread | In-place stereo processing, exactly like every DSPark effect. Never allocate, lock or block. (For a sidechain, implement the two-buffer form INSTEAD — see Optional below.) |
+| `void processBlock(AudioBufferView<float>) noexcept` | audio thread | In-place processing at the negotiated width (`io.getNumChannels()`), exactly like every DSPark effect. Never allocate, lock or block. (For a sidechain, implement the two-buffer form INSTEAD — see Optional below.) |
 
 ### Optional — detected automatically
 
 | Member | Maps to | Implement it when... |
 |---|---|---|
-| `int getLatency() const` | VST3 `getLatencySamples`, CLAP `clap.latency` | your chain introduces delay: lookahead limiters, linear-phase EQ, oversampling, FFT processors. Sum your DSPark effects' `getLatency()`/`getLatencySamples()`. The host shifts everything to compensate — report it accurately or your users get phasing. Read after `prepare()`. |
-| `double getTailSeconds() const` | VST3 `getTailSamples`, CLAP `clap.tail` | sound continues after input stops: reverbs, delays. Hosts keep processing your plugin that long after audio ends instead of cutting the tail. |
-| `void reset() noexcept` | CLAP `reset` | you keep history that should clear on transport jumps (delay lines, envelopes). VST3 has no direct equivalent — hosts re-activate instead, which re-runs `prepare()`. |
-| `std::vector<uint8_t> getState() const` + `bool setState(const uint8_t*, size_t)` | VST3 `IComponent::get/setState`, CLAP `clap.state` (extra section) | you have state **beyond the parameters**: learned noise profiles, loaded IRs, editor layout. The wrapper *always* saves/restores your parameter values by itself — most plugins need neither method. DSPark's `StateBlob` is the natural serializer here. |
-| `void processBlock(AudioBufferView<float> io, AudioBufferView<float> sidechain) noexcept` — *instead of* the single-buffer form | a second stereo input named "Sidechain": VST3 **aux bus**, CLAP **non-main port**, AU **input element** | the detector should follow a host-routed key signal: duckers, externally-keyed gates and de-essers. The shape matches DSPark's own dynamics, so `comp_.processBlock(io, sidechain)` forwards 1:1. The wrapper hands you frame-aligned **silence when nothing is routed** — never branch on availability, and treat the sidechain as read-only. Reference plugin: `examples/plugin_ducker/`. |
-| `static constexpr bool hasEditor` | VST3 `createView`, CLAP `clap.gui` | a custom GUI written in HTML/CSS/JS: pair it with `editorHtml()` (+ optional `editorSize`, `editorResize`, `editorDebug`) and include the WebView editor layer first. While false/absent, hosts show their generic parameter UI — fully usable. See "Custom UIs" below. |
+| `int getLatency() const` | VST3 `getLatencySamples`, CLAP `clap.latency`, AU `Latency` | your chain introduces delay: lookahead limiters, linear-phase EQ, oversampling, FFT processors. Sum your DSPark effects' `getLatency()`/`getLatencySamples()`. The host shifts everything to compensate — report it accurately or your users get phasing. Read after `prepare()` **and re-read after parameter changes**: when the value moves at runtime, the wrapper notifies the host on its own (`restartComponent(kLatencyChanged)` / `clap_host_latency` / the AU property listeners). |
+| `double getTailSeconds() const` | VST3 `getTailSamples`, CLAP `clap.tail`, AU `TailTime` | sound continues after input stops: reverbs, delays. Hosts keep processing your plugin that long after audio ends instead of cutting the tail. |
+| `void reset() noexcept` | CLAP `reset`, AU `Reset` | you keep history that should clear on transport jumps (delay lines, envelopes). VST3 has no direct equivalent — hosts re-activate instead, which re-runs `prepare()`. |
+| `std::vector<uint8_t> getState() const` + `bool setState(const uint8_t*, size_t)` | VST3 `IComponent::get/setState`, CLAP `clap.state`, AU `ClassInfo` (extra section) | you have state **beyond the parameters**: learned noise profiles, loaded IRs, editor layout. The wrapper *always* saves/restores your parameter values by itself — most plugins need neither method. DSPark's `StateBlob` is the natural serializer here. |
+| `void processBlock(AudioBufferView<float> io, AudioBufferView<float> sidechain) noexcept` — *instead of* the single-buffer form | a second input named "Sidechain": VST3 **aux bus**, CLAP **non-main port**, AU **input element** | the detector should follow a host-routed key signal: duckers, externally-keyed gates and de-essers. The shape matches DSPark's own dynamics, so `comp_.processBlock(io, sidechain)` forwards 1:1. The key view always mirrors the main width (mono main, mono key) and the wrapper hands you frame-aligned **silence when nothing is routed** — never branch on availability, and treat the sidechain as read-only. Reference plugin: `examples/plugin_ducker/`. |
+| `void setTransport(const TransportInfo&) noexcept` | VST3 `ProcessContext`, CLAP transport event, AU host callbacks | anything in your plugin follows the song: tempo-synced delays, LFOs, gates, arpeggiators. Delivered on the audio thread before each `processBlock` whenever the host supplied timeline data — check the `*Valid` flags. `TransportInfo::samplesPerBeat(sampleRate)` is the conversion you usually want. |
+| `void handleMidiEvent(const MidiEvent&) noexcept` | VST3 event bus + `IMidiMapping` proxies, CLAP note port (CLAP + raw MIDI dialects), AU MusicDevice selectors | notes drive the plugin: instruments, vocoders, MIDI-gated effects. One normalised struct covers note on/off, pitch bend, CC, channel/poly pressure. Events arrive time-ordered right before the block that contains them, with `sampleOffset` for sample-accurate voice starts. Required for `Category::Instrument`. |
+| `void setOfflineRendering(bool) noexcept` | VST3 `kOffline` process mode, CLAP `clap.render`, AU `OfflineRender` | quality should rise when there is no realtime pressure: switch to higher oversampling or longer lookahead during bounces. Called outside the audio thread, before processing (re)starts. |
+| `static constexpr auto channels` (`ChannelSupport`) | VST3 `setBusArrangements`, CLAP `audio-ports-config`, AU `SupportedNumChannels` | **the default is already mono+stereo** — declare it only to restrict: `StereoOnly` for inherently stereo DSP (M/S wideners), `MonoOnly` for metering utilities. All buses of an instance run the same width. |
+| `static constexpr auto factoryPresets` | VST3 program list, CLAP preset-load + preset-discovery, AU factory presets | you ship starting points. Built with `presets(preset("Name", v0, v1, ...))` — one PLAIN value per parameter, in table order, checked at compile time. The host's own preset browser offers them in every format. |
+| `static constexpr bool sampleAccurateAutomation = false` | — | you want to OPT OUT of sub-block automation: by default the wrappers split processing at automation points (32-frame grain) so fast curves land where the host drew them. Opt out only when a high fixed cost per `processBlock` call matters more. |
+| `static constexpr bool hasEditor` | VST3 `createView`, CLAP `clap.gui`, AU `CocoaUI` | a custom GUI written in HTML/CSS/JS: pair it with `editorHtml()` (+ optional `editorSize`, `editorResize`, `editorDebug`) and include the WebView editor layer first. While false/absent, hosts show their generic parameter UI — fully usable. See "Custom UIs" below. |
 
 ### What the wrappers handle so you don't have to
 
 - **Bypass**: a host-integrated bypass parameter (VST3 `kIsBypass`, CLAP
-  `CLAP_PARAM_IS_BYPASS`) with a click-free crossfade against the dry input.
-- **Automation**: parameter event queues are drained and funnelled into
-  `setParameter` (block-rate in v1 — inaudible because DSPark setters smooth
-  internally; sample-accurate slicing is a planned refinement).
+  `CLAP_PARAM_IS_BYPASS`, AU `BypassEffect`) with a click-free crossfade
+  against the dry input (toward silence for an instrument).
+- **Sample-accurate automation**: every timestamped event the host sends —
+  parameter points, bypass, MIDI — lands in one time-ordered stream and
+  processing splits at 32-frame quantum boundaries, so fast automation
+  curves land where they were drawn instead of stepping once per block.
+  DSPark setters still smooth on top. (Opt out per plugin, see above.)
+- **Latency changes**: after parameter motion the wrapper re-reads
+  `getLatency()` and notifies the host through the native channel
+  (`restartComponent(kLatencyChanged)`, `clap_host_latency` on the main
+  thread, the AU `Latency` property listeners) so projects re-compensate.
 - **State container**: versioned, tolerant (unknown parameters are skipped,
   missing ones keep defaults) and **identical across formats** — a preset
-  saved by the VST3 build loads in the CLAP build byte-for-byte.
-- **Buses**: stereo in / stereo out, the right answers to every arrangement
+  saved by the VST3 build loads in the CLAP and AU builds byte-for-byte.
+- **Buses**: mono/stereo negotiation per the declared `ChannelSupport`
+  (default both), instrument layouts without audio inputs, the sidechain
+  following the main width, and the right answers to every arrangement
   negotiation. Value formatting/parsing for host displays. Factory metadata.
+- **Denormals**: `process()`/`render()` run under DSPark's `DenormalGuard`
+  (FTZ/DAZ), so your own DSP is protected even in hosts that don't set it.
 - **Entry points** per platform and format, from the macros.
 
 ### Threading model
@@ -142,7 +159,78 @@ virtual; nothing else is required.**
 | `prepare` | main (host setup) — allocation allowed |
 | `processBlock` | audio — real-time rules apply |
 | `setParameter` | **both** (host automation arrives on audio; generic UI edits arrive on main) — hence the atomic-setter contract |
+| `setTransport` / `handleMidiEvent` | audio — real-time rules apply |
+| `setOfflineRendering` | main (before processing restarts) |
 | `getState`/`setState` | main |
+
+---
+
+## Instruments & MIDI
+
+Set `category = Category::Instrument` in the descriptor and the plugin
+becomes a generator: **no audio input in any format** (VST3 instrument
+class, CLAP `"instrument"` feature, AU `aumu` music device — the AU bundle's
+Info.plist must declare `aumu` too), and the wrapper hands `processBlock` a
+**cleared buffer so voices ADD into it** without reading. An instrument
+must implement `handleMidiEvent` — it has nothing else to react to.
+
+```cpp
+void handleMidiEvent(const dspark::plugin::MidiEvent& ev) noexcept
+{
+    using Type = dspark::plugin::MidiEvent::Type;
+    switch (ev.type)
+    {
+    case Type::NoteOn:    /* ev.note, ev.value = velocity 0..1,
+                             ev.sampleOffset = frames into the next block */
+    case Type::NoteOff:   /* release the matching voice */
+    case Type::PitchBend: /* ev.value = -1..+1 */
+    default: break;
+    }
+}
+```
+
+The wrapper translates every format's native scheme into that one struct:
+VST3 delivers notes as events and pitch bend / mod wheel / sustain /
+channel pressure through its `IMidiMapping` controller scheme (handled
+internally with hidden proxy parameters — you never see them); CLAP
+delivers note events plus raw MIDI; AU delivers raw MIDI bytes through the
+MusicDevice selectors. Events always arrive **time-ordered, right before
+the `processBlock` call that contains them**; `sampleOffset` says how many
+frames into that block the event belongs, so a synth can start its voice
+sample-accurately (or ignore the offset and be at most one automation
+quantum early).
+
+An effect (`Category::Fx`) may also implement `handleMidiEvent` — it keeps
+its audio buses and gains a MIDI input on top (a vocoder, a MIDI-gated
+delay). On macOS that maps to the `aumf` music-effect type: declare `aumf`
+in the AU Info.plist for MIDI effects, `aumu` for instruments.
+
+Reference instrument: `examples/plugin_synth/` — eight voices of
+`Oscillator` + `ADSREnvelope`, voice stealing, pitch bend, factory presets
+and sample-accurate note starts, validated by `auval -v aumu` and both
+smoke hosts in CI.
+
+## Host transport
+
+Implement `setTransport(const TransportInfo&)` and the wrapper feeds you
+the host timeline once per block, before `processBlock`, translated from
+each format's native source (VST3 `ProcessContext` — with the requirement
+flags declared for you —, the CLAP transport event, the AU host callbacks):
+
+```cpp
+void setTransport(const dspark::plugin::TransportInfo& t) noexcept
+{
+    if (t.tempoValid)
+        delaySamples_ = static_cast<int>(t.samplesPerBeat(sampleRate_) * 0.5);
+    playing_ = t.playing;   // e.g. freeze an LFO while stopped
+}
+```
+
+`TransportInfo` carries tempo, musical position (quarter notes), bar start,
+time signature, loop points and the playing/recording/looping states, each
+guarded by a `*Valid` flag — hosts differ in what they provide, so default
+sensibly when a flag is false. No call means "nothing changed since the
+last block".
 
 ---
 
@@ -310,9 +398,25 @@ and every format grows a host-routable "Sidechain" input (the table above;
 `examples/plugin_ducker/` is the reference). The smoke hosts verify the bus
 layout — and, with `--expect-sidechain`, that a hot key actually ducks.
 
-**Mono? MIDI?** Not yet — stereo buses only (main + optional sidechain).
-The layer will grow `Category::Instrument` and more bus configs without
-breaking the current contract.
+**Mono?** Default. Every plugin negotiates 1→1 and 2→2 unless it declares
+`channels = ChannelSupport::StereoOnly`; `prepare` receives the width and
+`io.getNumChannels()` reflects it. The sidechain follows the main width.
+
+**MIDI? Instruments?** Yes: `handleMidiEvent` adds a note input to every
+format, and `Category::Instrument` makes the plugin a generator (no audio
+input; AU type `aumu`). See "Instruments & MIDI" above;
+`examples/plugin_synth/` is the reference, and the smoke hosts prove the
+note path functionally (`--expect-instrument`: pitch and release decay
+measured from the output).
+
+**Does automation step once per block?** No — it splits the block at the
+host's automation points (32-frame grain) by default, and DSPark setters
+smooth on top. Opt out with `sampleAccurateAutomation = false` if your
+plugin has a high fixed cost per `processBlock` call.
+
+**Tempo-synced effects?** Implement `setTransport` and read
+`TransportInfo::samplesPerBeat(sampleRate)` — delivered per block from the
+VST3 ProcessContext / CLAP transport / AU host callbacks.
 
 **Where do the parameter values live?** Wherever your DSPark members keep
 them. The wrapper keeps normalized shadows only for host queries and state;

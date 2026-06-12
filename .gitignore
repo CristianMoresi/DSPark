@@ -46,6 +46,7 @@ PLAN_*.md
 build/
 build-*/
 build_check/
+build_t12/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/

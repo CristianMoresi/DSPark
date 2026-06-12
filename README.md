@@ -4,7 +4,7 @@
 
 **A header-only audio DSP framework in pure C++20. Zero external dependencies.**
 
-**v1.4.1** — 90+ headers. One `#include`. Ready to build plugins (with HTML/CSS/JS editors), desktop apps, WebAssembly, mobile, embedded.
+**v1.5.0** — 90+ headers of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and (when you need them) native VST3/CLAP/AU plugins with HTML/CSS/JS editors.
 
 **📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
@@ -32,65 +32,6 @@ reverb.processBlock(buffer);
 ```
 
 No build system. No linking. No configuration. Just include and go.
-
-## Build VST3 / CLAP / AU plugins — no JUCE required
-
-DSPark ships a native plugin layer: describe your plugin declaratively,
-implement the usual DSPark contract, add one macro — and compile a loadable
-VST3 with nothing but this repository (Steinberg's official C API header is
-vendored under its permissive 2025 license).
-
-```cpp
-#include "plugin/vst3/DSParkVst3.h"
-
-struct MySaturator
-{
-    static constexpr auto descriptor = dspark::plugin::Descriptor {
-        .name = "My Saturator", .vendor = "Me",
-        .productId = "com.me.mysaturator", .version = "1.0.0",
-    };
-    static constexpr auto parameters = dspark::plugin::params(
-        dspark::plugin::param("drive", "Drive", -12.0f, 36.0f, 0.0f, "dB"));
-
-    void prepare(const dspark::AudioSpec& spec)   { sat_.prepare(spec); }
-    void setParameter(int, float v) noexcept      { sat_.setDrive(v); }
-    void processBlock(dspark::AudioBufferView<float> io) noexcept { sat_.processBlock(io); }
-
-    dspark::Saturation<float> sat_;
-};
-DSPARK_VST3_PLUGIN(MySaturator)
-```
-
-```
-cl /std:c++20 /O2 /LD /EHsc /I . mysaturator.cpp /Fe:MySaturator.vst3
-```
-
-Parameter automation, state save/restore, bypass, latency reporting and bus
-negotiation are handled by the layer. Add `DSPARK_CLAP_PLUGIN(MySaturator)`
-and the **same binary is also a CLAP plugin** (copy it as `.clap`); add
-`DSPARK_AU_PLUGIN(MySaturator, "Subt", "Manu")` and the same class builds an
-**Audio Unit for Logic Pro** on macOS — validated by Apple's `auval` in this
-repository's CI. Presets are byte-portable across all three formats by
-construction. Two miniature hosts (`tools/vst3_smoke_host.cpp`,
-`tools/clap_smoke_host.cpp`) drive the result through each full plugin
-lifecycle like a DAW would; both run in CI on Windows, Linux and macOS.
-
-Want a custom GUI? Write it in **plain HTML/CSS/JS** — the WebView editor
-layer embeds it in the host window across VST3, CLAP and AU (WebView2 on
-Windows, WKWebView on macOS, WebKitGTK on Linux/X11) with a tiny `dspark`
-JS bridge for parameters and automation gestures. Keep the UI as ordinary separate web files and
-`dspark_add_plugin(... EDITOR_HTML ui/editor.html)` embeds them at build
-time. `examples/plugin_webview_editor/` is a complete plugin with knobs,
-`examples/plugin_webview_files/` shows the separate-files workflow, and
-`tools/vst3_editor_host.cpp` opens any editor without a DAW. Every example
-passes Tracktion's `pluginval` and `clap-validator` in CI on every commit.
-
-**Start here**: the [plugin guide](docs/plugins.md) documents the complete
-contract (required and optional methods, what each maps to per format, the
-threading model, the editor layer, shipping checklists). Inherit
-`dspark::plugin::PluginBase<T>` to see every overridable method with safe
-defaults in one place (`examples/plugin_template/`), or write a
-free-standing struct (`examples/plugin_saturator/`).
 
 ---
 
@@ -355,6 +296,64 @@ eq.getMagnitudeForFrequencyArray(freqs.data(), mags.data(), 512);
 
 ---
 
+## Build VST3 / CLAP / AU plugins — no JUCE required
+
+DSPark is a DSP framework first, but it ships a complete native plugin
+layer: the same class that processes your audio becomes a loadable plugin
+with nothing but this repository (Steinberg's official C API header is
+vendored under its permissive 2025 license).
+
+```cpp
+#include "plugin/vst3/DSParkVst3.h"
+
+struct MySaturator
+{
+    static constexpr auto descriptor = dspark::plugin::Descriptor {
+        .name = "My Saturator", .vendor = "Me",
+        .productId = "com.me.mysaturator", .version = "1.0.0",
+    };
+    static constexpr auto parameters = dspark::plugin::params(
+        dspark::plugin::param("drive", "Drive", -12.0f, 36.0f, 0.0f, "dB"));
+
+    void prepare(const dspark::AudioSpec& spec)   { sat_.prepare(spec); }
+    void setParameter(int, float v) noexcept      { sat_.setDrive(v); }
+    void processBlock(dspark::AudioBufferView<float> io) noexcept { sat_.processBlock(io); }
+
+    dspark::Saturation<float> sat_;
+};
+DSPARK_VST3_PLUGIN(MySaturator)
+```
+
+```
+cl /std:c++20 /O2 /LD /EHsc /I . mysaturator.cpp /Fe:MySaturator.vst3
+```
+
+Parameter automation, state save/restore, soft bypass, latency reporting
+and bus negotiation are handled by the layer. The **same binary** is also a
+CLAP plugin (`DSPARK_CLAP_PLUGIN`) and an Audio Unit for Logic Pro
+(`DSPARK_AU_PLUGIN`, validated by Apple's `auval` in CI); presets are
+byte-portable across all three formats by construction.
+
+For a custom GUI, write it in **plain HTML/CSS/JS**: the WebView editor
+layer embeds it in the host window on every format and platform — WebView2
+on Windows, WKWebView on macOS, WebKitGTK on Linux/X11 — with a tiny
+`dspark` JS bridge for parameters and automation gestures, and a
+`dspark_add_plugin(... EDITOR_HTML ui/editor.html)` build step that inlines
+ordinary separate web files. Every example plugin passes Tracktion's
+`pluginval` and `clap-validator` in CI, and dedicated editor smoke hosts
+exercise a real web view per platform on every commit.
+
+**Start here**: the [plugin guide](docs/plugins.md) documents the complete
+contract (required and optional methods, what each maps to per format, the
+threading model, the editor layer per platform, shipping checklists).
+Inherit `dspark::plugin::PluginBase<T>` to see every overridable method
+with safe defaults in one place (`examples/plugin_template/`), or write a
+free-standing struct (`examples/plugin_saturator/`); the WebView editor
+examples are `examples/plugin_webview_editor/` (single file) and
+`examples/plugin_webview_files/` (separate web files).
+
+---
+
 ## DSParkLab — Interactive Testing App
 
 DSParkLab is an interactive, plugin-style GUI application for real-time testing of every DSPark processor. Load any audio file, enable effects, shape them on an interactive analyzer or with parameter controls, and hear the results instantly.
@@ -390,7 +389,7 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 | macOS (Clang) | Compatible | C++20, -Wall -Wextra |
 | WebAssembly (Emscripten) | Compatible | Zero syscalls in audio path |
 | iOS / Android | Compatible | ARM NEON denormal flush supported |
-| VST3 plugins | Use as DSP engine | Pair with JUCE or iPlug2 for the wrapper |
+| Plugins (VST3 / CLAP / AU) | Native | Built-in plugin layer with WebView editors — no JUCE required ([guide](docs/plugins.md)) |
 
 ---
 
@@ -425,6 +424,33 @@ DSPark/
 ├── tools/                   # VST3/CLAP/AU-editor smoke hosts, editor host, amalgamator
 └── DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)
 ```
+
+---
+
+## What's New in v1.5.0
+
+**The editor everywhere**: the WebView editor now runs on all three plugin
+formats and all three desktop platforms — and every one of those paths is
+exercised with a real web view in CI.
+
+- **AU editor (macOS)**: the AU backend announces a Cocoa view factory
+  through `kAudioUnitProperty_CocoaUI`, registered at runtime from the
+  plugin binary itself — still no Objective-C sources and no AppKit link.
+  UI edits flow through `AUParameterSet` and proper begin/end parameter
+  gestures, so Logic-style hosts record automation and undo correctly. Both
+  teardown orders (host releases the view first, or disposes the AudioUnit
+  first) are handled and tested.
+- **Linux editor (X11)**: WebKitGTK resolved entirely through `dlopen` at
+  runtime — no headers, no pkg-config, no link-time dependency — embedded
+  in the host window with GtkPlug/XEmbed. GTK is pumped from the HOST's run
+  loop (a VST3 `IRunLoop` timer / CLAP `timer-support`), never a private
+  main loop; systems without WebKitGTK, or hosts without a usable run loop,
+  cleanly keep the host's generic UI (new runtime `Editor::available()`
+  gate).
+- **Proven, not just compiled**: new `tools/au_editor_smoke` (macOS) and
+  `tools/x11_editor_smoke` (Linux, under xvfb) play real hosts in CI —
+  factory/attach, a live web view, the JS bridge ready-handshake and clean
+  teardown — alongside the existing real-window editor host on Windows.
 
 ---
 
@@ -464,35 +490,6 @@ in the host window — no GUI framework, nothing to install.
   knobs) and `examples/plugin_webview_files/` (separate-files workflow).
 - **v1.4.1**: complete CMake package config — `find_package(dspark CONFIG)`
   now works from any install tree or package manager (vcpkg/Conan).
-
----
-
-## What's New in v1.3.0
-
-**The native plugin layer**: build VST3, CLAP and Audio Unit plugins with
-DSPark alone — no JUCE, no SDK downloads.
-
-- **One class, three formats**: a declarative `Descriptor` + parameter table
-  plus the familiar DSPark contract; `DSPARK_VST3_PLUGIN` /
-  `DSPARK_CLAP_PLUGIN` / `DSPARK_AU_PLUGIN` macros generate the factories,
-  entry points and full ABI glue. One compiled binary serves as `.vst3` and
-  `.clap`; the AU build passes Apple's `auval` in CI.
-- **The hard parts handled**: host parameter automation funnelled into
-  DSPark's atomic smoothed setters, soft bypass, latency/tail reporting, bus
-  negotiation, and a version-tolerant state container shared by all three
-  backends — presets are byte-portable across formats, and stable text ids
-  mean you can reorder parameters between versions without breaking saved
-  sessions.
-- **Discoverable contract**: inherit `dspark::plugin::PluginBase<T>` to see
-  every overridable method with safe defaults (no virtuals, zero dispatch
-  cost), or write a free-standing struct. Full reference in
-  [docs/plugins.md](docs/plugins.md); kitchen-sink template in
-  `examples/plugin_template/`; real effect in `examples/plugin_saturator/`.
-- **Verified like a DAW would**: miniature VST3/CLAP smoke hosts drive the
-  full plugin lifecycle in CI on every platform; `auval -v aufx` gates the
-  AU build on macOS. Field-validated in REAPER (VST3 and CLAP).
-- Steinberg's VST3 C API and the CLAP headers ship vendored under their
-  permissive licenses; AU uses macOS system frameworks. Zero downloads.
 
 ---
 

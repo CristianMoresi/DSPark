@@ -35,12 +35,27 @@ DSPARK_AU_PLUGIN(MyPlugin, "Subt", "Manu")   // unique 4-char codes; macOS bundl
 ```
 
 ```
-cl  /std:c++20 /O2 /LD /EHsc /I . myplugin.cpp /Fe:MyPlugin.vst3     (Windows)
-g++ -std=c++20 -O2 -fPIC -shared -I . myplugin.cpp -o MyPlugin.vst3 (Linux)
+cl      /std:c++20 /O2 /LD /EHsc /I . myplugin.cpp /Fe:MyPlugin.vst3      (Windows)
+g++     -std=c++20 -O2 -fPIC -shared -I . myplugin.cpp -o MyPlugin.vst3   (Linux)
+clang++ -std=c++20 -O2 -fPIC -shared -I . myplugin.cpp -o MyPlugin        (macOS;
+        add -framework AudioToolbox -framework CoreFoundation for the AU
+        macro, and -lobjc when the WebView editor layer is included)
 ```
 
-One compiled binary carries **both** entry points: ship it as `.vst3` and as
-`.clap` (same file, two names). Install locations:
+Or skip the per-platform flags entirely — the CMake helper builds the right
+bundle layout, links the right system libraries and embeds the editor files
+on every platform from one line (**the recommended cross-platform path**):
+
+```cmake
+include(plugin/cmake/DSParkPlugin.cmake)
+dspark_add_plugin(MyPlugin SOURCES myplugin.cpp
+                  FORMATS VST3 CLAP AU
+                  AU_SUBTYPE Subt AU_MANUFACTURER Manu)
+```
+
+One compiled binary carries **every entry point the source declares**: ship
+the same file as `.vst3` and as `.clap`; on macOS the AU `.component`
+bundle wraps a copy of that same binary. Install locations:
 
 | Format | Windows | macOS | Linux |
 |---|---|---|---|
@@ -171,6 +186,20 @@ A complete working example — knobs with drag/wheel/double-click, a discrete
 selector, gestures, automation feedback — lives in
 [`examples/plugin_webview_editor/`](../examples/plugin_webview_editor/webview_saturator.cpp).
 
+### Per-platform notes: what you need, what your users need
+
+The editor is an **optional capability at runtime** by design: wherever the
+web engine cannot run, the editor simply isn't offered and hosts fall back
+to their generic parameter UI — the DSP keeps working untouched. Your page
+never needs platform branches; these notes are about toolchains and what to
+tell end users.
+
+| | Building your plugin | What end users need | Worth knowing |
+|---|---|---|---|
+| **Windows** | MSVC: nothing extra (system libs auto-link via `#pragma comment`). MinGW/clang: link `advapi32 comctl32 ole32 shell32 shlwapi user32 version` — `dspark_add_plugin` already does. | The WebView2 (Edge) runtime — preinstalled on Windows 10/11. | On the rare locked-down machine without the runtime, editor creation fails cleanly → generic UI. `editorDebug = true` gives you the Chromium DevTools. |
+| **macOS** | Link `-lobjc`; once the AU macro is in the TU, also `-framework AudioToolbox -framework CoreFoundation`. No Apple GUI headers or Objective-C sources involved. | Nothing — WKWebView ships with macOS. | AU hosts size the window from the view's initial frame (`editorSize`); the `Free`/`KeepAspect` drag negotiation is a VST3/CLAP concept, so on AU the page's proportional fit is what absorbs host-driven resizes. |
+| **Linux** | Nothing — WebKitGTK is resolved with `dlopen` at runtime: no headers, no pkg-config, no link-time dependency. | `libwebkit2gtk-4.1` (or `-4.0`) installed, and an X11 or XWayland session. Debian/Ubuntu: `apt install libwebkit2gtk-4.1-0`. | GTK must breathe from the host's run loop; the wrapper handles it (VST3 `IRunLoop` timer / CLAP `timer-support`). A host offering neither — or a system without WebKitGTK — gets the generic UI instead of a frozen page. |
+
 ### The `dspark` JS bridge
 
 Injected before your page's own scripts. Parameters use the **same stable
@@ -216,7 +245,9 @@ modes looks right; `examples/plugin_webview_editor/` uses `KeepAspect`.
   keep the interface as ordinary `editor.html` + `editor.css` + `editor.js`
   and let CMake inline and embed them —
   ```cmake
-  dspark_add_plugin(MyPlugin SOURCES myplugin.cpp FORMATS VST3 CLAP
+  dspark_add_plugin(MyPlugin SOURCES myplugin.cpp
+                    FORMATS VST3 CLAP AU
+                    AU_SUBTYPE Subt AU_MANUFACTURER Manu
                     EDITOR_HTML ui/editor.html)
   ```
   generates `MyPlugin_editor_html.h` (rebuilt whenever any referenced file
@@ -233,8 +264,9 @@ modes looks right; `examples/plugin_webview_editor/` uses `KeepAspect`.
   self-tests the resize chain (grow, shrink-below-minimum, widget fit).
 - Set `editorDebug = true` during development to get the browser DevTools.
 - Set the environment variable `DSPARK_WEBVIEW_LOG=1` to trace every
-  host/editor size negotiation to `%TEMP%/DSParkWebView.log` — invaluable
-  when a host misbehaves.
+  host/editor interaction (attach, size negotiation, bridge handshake) to
+  `%TEMP%\DSParkWebView.log` on Windows or `$TMPDIR/DSParkWebView.log` on
+  macOS/Linux — invaluable when a host misbehaves.
 - The page is ordinary web content: iterate it in a regular browser with a
   stubbed `window.__dsparkPost`, then paste it into `editorHtml()`.
 

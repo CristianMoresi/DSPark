@@ -1,4 +1,4 @@
-# A complete VST3 + CLAP plugin with DSPark alone — no JUCE, no SDK download
+# A complete VST3 + CLAP plugin with DSPark alone — no SDK download
 
 `saturator.cpp` is a finished, loadable effect (drive / algorithm / mix /
 output around `dspark::Saturation`) written against DSPark's native plugin

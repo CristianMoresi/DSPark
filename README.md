@@ -300,7 +300,7 @@ eq.getMagnitudeForFrequencyArray(freqs.data(), mags.data(), 512);
 
 DSPark is a DSP framework first, but it ships a complete native plugin
 layer: the same class that processes your audio becomes a loadable plugin
-with nothing but this repository — no JUCE, no SDK downloads (Steinberg's
+with nothing but this repository — no external SDK to download (Steinberg's
 official C API header is vendored under its permissive 2025 license).
 
 ```cpp
@@ -472,8 +472,8 @@ in the host window — no GUI framework, nothing to install.
   atomic shadows — no native timers, no locks, nothing on the audio thread.
 - **Sizing that survives real hosts** (field-validated in REAPER): OS-level
   frame limits (`WM_GETMINMAXINFO`/`WM_SIZING`), honest VST3/CLAP size
-  negotiation, and JUCE-style proportional content scaling with `Fixed` /
-  `Free` / `KeepAspect` resize policies. HiDPI handled end to end.
+  negotiation, and proportional content scaling with `Fixed` / `Free` /
+  `KeepAspect` resize policies. HiDPI handled end to end.
 - **A real workflow**: develop the UI as ordinary separate web files and
   `dspark_add_plugin(... EDITOR_HTML ui/editor.html)` inlines and embeds
   them at build time; `editorDevFile()` reloads the page from disk while

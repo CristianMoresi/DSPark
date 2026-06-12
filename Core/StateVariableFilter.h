@@ -67,8 +67,8 @@ namespace dspark {
  * @brief TPT State Variable Filter with simultaneous multi-output.
  *
  * @note **Threading contract:** this is a modulation-oriented filter (its whole
- * point is artifact-free per-sample cutoff changes from the audio thread, à la
- * JUCE's dsp::StateVariableTPTFilter). Parameter setters are therefore intended
+ * point is artifact-free per-sample cutoff changes from the audio
+ * thread). Parameter setters are therefore intended
  * to be called from the **audio thread** (or externally synchronised), NOT
  * concurrently with process() from a different thread. Internal coefficients are
  * intentionally non-atomic to keep the per-sample modulation path branch-free.

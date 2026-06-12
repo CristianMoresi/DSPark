@@ -11,8 +11,8 @@
  * constexpr parameter table) and implements the familiar DSPark contract
  * (`prepare` / `processBlock` plus a `setParameter` switch). The format
  * backends (plugin/vst3/..., later CLAP and AU) translate that single class
- * into each plugin ABI — no JUCE, no external SDK to install, no base class
- * to inherit from.
+ * into each plugin ABI — no external SDK to install, no base class to
+ * inherit from.
  *
  * ```cpp
  * struct MyPlugin
@@ -261,7 +261,7 @@ struct EditorSize
 };
 
 /**
- * @brief How the host may resize the editor window (JUCE-style choices).
+ * @brief How the host may resize the editor window.
  * Declare `static constexpr EditorResize editorResize = ...;` in the plugin
  * class; without it the window is Fixed (or Free if the simpler
  * `editorResizable = true` shorthand is present).
@@ -382,7 +382,7 @@ concept HasEditorDevFile = requires {
 
 /**
  * @brief Optional convenience base that makes EVERY contract method visible
- * and overridable — the JUCE-style discoverability, without the virtuals.
+ * and overridable from one place — IDE-discoverable, without the virtuals.
  *
  * ```cpp
  * struct MyPlugin : dspark::plugin::PluginBase<MyPlugin> { ... };

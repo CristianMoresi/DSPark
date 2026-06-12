@@ -1,4 +1,4 @@
-// DSPark example — a complete VST3 saturator plugin in one file, no JUCE.
+// DSPark example — a complete VST3 saturator plugin in one file.
 //
 // Build (Windows):
 //   cl /std:c++20 /O2 /LD /EHsc /I ..\.. saturator.cpp /Fe:DSParkSaturator.vst3

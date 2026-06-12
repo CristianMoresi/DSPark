@@ -1,7 +1,7 @@
 # Building audio plugins with DSPark
 
 DSPark ships a native plugin layer: you write **one ordinary struct** — no
-base class, no SDK download, no JUCE — and format macros turn it into a
+base class, no SDK download — and format macros turn it into a
 loadable **VST3**, **CLAP** and **Audio Unit v2** plugin (`auval`-validated
 in CI; AU is what Logic Pro and GarageBand load). This page is the complete
 contract reference: everything the wrappers will detect and call, what each
@@ -77,8 +77,8 @@ The base defines the entire optional contract with safe defaults, so every
 overridable method is one Go-to-Definition away and your IDE autocompletes
 the menu — define the same signature in your class to replace a default
 (plain shadowing, resolved at compile time, zero dispatch cost, no
-virtuals). This is the JUCE-style discoverability without the JUCE-style
-machinery. `examples/plugin_template/` uses it.
+virtuals). Full discoverability, with no machinery behind it.
+`examples/plugin_template/` uses it.
 
 ```cpp
 struct MyPlugin : dspark::plugin::PluginBase<MyPlugin>
@@ -134,7 +134,7 @@ virtual; nothing else is required.**
   negotiation. Value formatting/parsing for host displays. Factory metadata.
 - **Entry points** per platform and format, from the macros.
 
-### Threading model (the part JUCE hides)
+### Threading model
 
 | Call | Thread |
 |---|---|

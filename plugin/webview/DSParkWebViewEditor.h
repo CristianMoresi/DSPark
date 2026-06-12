@@ -390,10 +390,10 @@ inline constexpr const char* kBridgeJs =
       "if(m.type==='params'){"
         "meta=m.params;"
         "for(var i=0;i<meta.length;i++){vals[meta[i].id]=meta[i].value;}"
-        // KeepAspect editors scale their whole content with the window,
-        // JUCE-style: the page keeps its DESIGN layout and is fitted into
-        // the window by the limiting axis, centered (letterboxed) when the
-        // host lets the user distort the ratio. Nothing can ever clip.
+        // KeepAspect editors scale their whole content with the window:
+        // the page keeps its DESIGN layout and is fitted into the window
+        // by the limiting axis, centered (letterboxed) when the host lets
+        // the user distort the ratio. Nothing can ever clip.
         "if(m.design&&m.design.keepAspect&&!window.__dsparkFit){"
           "var dw=m.design.width,dh=m.design.height;"
           "window.__dsparkFit=function(){"

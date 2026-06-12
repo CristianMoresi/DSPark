@@ -9,8 +9,8 @@
  *
  * Implements the VST3 COM ABI directly against Steinberg's official C API
  * (vst3_c_api.h, vendored next to this header under Steinberg's permissive
- * 2025 license) — no VST3 C++ SDK to download, no JUCE, no build system
- * beyond your compiler:
+ * 2025 license) — no VST3 C++ SDK to download, no build system beyond your
+ * compiler:
  *
  * ```cpp
  * #include "plugin/vst3/DSParkVst3.h"

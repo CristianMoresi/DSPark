@@ -7,7 +7,17 @@
 // behaved. Companion to tools/vst3_smoke_host.cpp; clap-validator is the
 // recommended final gate.
 //
-//   clap_smoke_host <path-to-module.clap>
+//   clap_smoke_host <module.clap> [--expect-sidechain | --expect-instrument | --probe]
+//
+//   --expect-sidechain   sidechain port present + the key ducks the output
+//   --expect-instrument  no audio inputs, a note port; a note must sound at
+//                        the right pitch and decay
+//   --probe              full host-contract battery against the DSPark probe
+//                        plugin: transport DC, the render extension's offline
+//                        sign flip, sample-accurate automation, note events
+//                        and raw-MIDI pitch bend, the latency-changed
+//                        notification, the mono ports configuration and
+//                        preset-load + preset-discovery
 
 #include "../plugin/clap/clap/clap.h"
 
@@ -39,40 +49,185 @@ void expect(bool ok, const char* what)
     if (!ok) ++g_failures;
 }
 
-// -- minimal host ---------------------------------------------------------------
+/// Same FNV-1a the wrapper uses for its stable parameter ids.
+constexpr uint32_t hash32(const char* s) noexcept
+{
+    uint32_t h = 2166136261u;
+    while (*s != '\0')
+    {
+        h ^= static_cast<uint8_t>(*s++);
+        h *= 16777619u;
+    }
+    return h;
+}
 
-const void* hostGetExtension(const clap_host_t*, const char*) { return nullptr; }
-void hostNoop(const clap_host_t*) {}
+// -- host with the extensions the wrapper may call back into -----------------------
 
-const clap_host_t kHost = {
-    CLAP_VERSION_INIT,
-    nullptr,
-    "DSPark smoke host", "DSPark", "https://github.com/CristianMoresi/DSPark", "1.0",
-    &hostGetExtension, &hostNoop, &hostNoop, &hostNoop
+struct SmokeHost
+{
+    clap_host_t host {};
+    const clap_plugin_t* plugin = nullptr;   // for request_callback dispatch
+    bool latencyChangedSeen = false;
+    bool presetLoadedSeen = false;
+    bool callbackRequested = false;
+
+    static SmokeHost* self(const clap_host_t* h)
+    {
+        return static_cast<SmokeHost*>(h->host_data);
+    }
+
+    static void sLatencyChanged(const clap_host_t* h)
+    {
+        self(h)->latencyChangedSeen = true;
+    }
+    static void sParamsRescan(const clap_host_t*, clap_param_rescan_flags) {}
+    static void sParamsClear(const clap_host_t*, clap_id, clap_param_clear_flags) {}
+    static void sParamsRequestFlush(const clap_host_t*) {}
+    static void sPresetOnError(const clap_host_t*, uint32_t, const char*,
+                               const char*, int32_t, const char*) {}
+    static void sPresetLoaded(const clap_host_t* h, uint32_t, const char*,
+                              const char*)
+    {
+        self(h)->presetLoadedSeen = true;
+    }
+
+    inline static const clap_host_latency_t kLatency = { &sLatencyChanged };
+    inline static const clap_host_params_t kParams = {
+        &sParamsRescan, &sParamsClear, &sParamsRequestFlush
+    };
+    inline static const clap_host_preset_load_t kPresetLoad = {
+        &sPresetOnError, &sPresetLoaded
+    };
+
+    static const void* sGetExtension(const clap_host_t*, const char* id)
+    {
+        if (std::strcmp(id, CLAP_EXT_LATENCY) == 0) return &kLatency;
+        if (std::strcmp(id, CLAP_EXT_PARAMS) == 0) return &kParams;
+        if (std::strcmp(id, CLAP_EXT_PRESET_LOAD) == 0
+            || std::strcmp(id, CLAP_EXT_PRESET_LOAD_COMPAT) == 0)
+            return &kPresetLoad;
+        return nullptr;
+    }
+    static void sRequestRestart(const clap_host_t*) {}
+    static void sRequestProcess(const clap_host_t*) {}
+    static void sRequestCallback(const clap_host_t* h)
+    {
+        // The smoke IS the main thread: dispatch immediately.
+        auto* s = self(h);
+        s->callbackRequested = true;
+        if (s->plugin != nullptr && s->plugin->on_main_thread != nullptr)
+            s->plugin->on_main_thread(s->plugin);
+    }
+
+    SmokeHost()
+    {
+        host.clap_version = CLAP_VERSION_INIT;
+        host.host_data = this;
+        host.name = "DSPark smoke host";
+        host.vendor = "DSPark";
+        host.url = "https://github.com/CristianMoresi/DSPark";
+        host.version = "1.0";
+        host.get_extension = &sGetExtension;
+        host.request_restart = &sRequestRestart;
+        host.request_process = &sRequestProcess;
+        host.request_callback = &sRequestCallback;
+    }
 };
 
-// -- event list with zero or one param event --------------------------------------
+// -- event list over heterogeneous event storage --------------------------------------
 
 struct EventList
 {
     clap_input_events_t iface;
-    clap_event_param_value_t event {};
-    uint32_t count = 0;
+    struct Slot
+    {
+        alignas(8) unsigned char bytes[64];
+    };
+    std::vector<Slot> slots;
 
     static uint32_t sSize(const clap_input_events_t* l)
     {
-        return static_cast<const EventList*>(l->ctx)->count;
+        return static_cast<uint32_t>(static_cast<const EventList*>(l->ctx)->slots.size());
     }
     static const clap_event_header_t* sGet(const clap_input_events_t* l, uint32_t i)
     {
         const auto* self = static_cast<const EventList*>(l->ctx);
-        return (i < self->count) ? &self->event.header : nullptr;
+        return i < self->slots.size()
+             ? reinterpret_cast<const clap_event_header_t*>(self->slots[i].bytes)
+             : nullptr;
     }
     EventList()
     {
         iface.ctx = this;
         iface.size = &sSize;
         iface.get = &sGet;
+    }
+
+    template <typename E>
+    void push(const E& e)
+    {
+        static_assert(sizeof(E) <= sizeof(Slot::bytes));
+        Slot slot {};
+        std::memcpy(slot.bytes, &e, sizeof(E));
+        slots.push_back(slot);
+    }
+    void clear() { slots.clear(); }
+
+    void paramValue(uint32_t paramId, double value, uint32_t time)
+    {
+        clap_event_param_value_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_PARAM_VALUE;
+        ev.param_id = paramId;
+        ev.note_id = -1;
+        ev.port_index = -1;
+        ev.channel = -1;
+        ev.key = -1;
+        ev.value = value;
+        push(ev);
+    }
+    void noteOn(int16_t key, double velocity, uint32_t time)
+    {
+        clap_event_note_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_NOTE_ON;
+        ev.note_id = -1;
+        ev.port_index = 0;
+        ev.channel = 0;
+        ev.key = key;
+        ev.velocity = velocity;
+        push(ev);
+    }
+    void noteOff(int16_t key, uint32_t time)
+    {
+        clap_event_note_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_NOTE_OFF;
+        ev.note_id = -1;
+        ev.port_index = 0;
+        ev.channel = 0;
+        ev.key = key;
+        ev.velocity = 0.0;
+        push(ev);
+    }
+    void midi(uint8_t b0, uint8_t b1, uint8_t b2, uint32_t time)
+    {
+        clap_event_midi_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_MIDI;
+        ev.port_index = 0;
+        ev.data[0] = b0;
+        ev.data[1] = b1;
+        ev.data[2] = b2;
+        push(ev);
     }
 };
 
@@ -115,20 +270,31 @@ struct ByteIStream
     ByteIStream() { iface.ctx = this; iface.read = &sRead; }
 };
 
+/// Zero-crossing pitch estimate over a mono buffer (clean tones only).
+double estimateFrequency(const float* x, int n, double sampleRate)
+{
+    int crossings = 0;
+    for (int i = 1; i < n; ++i)
+        if ((x[i - 1] < 0.0f && x[i] >= 0.0f) || (x[i - 1] >= 0.0f && x[i] < 0.0f))
+            ++crossings;
+    return crossings * sampleRate / (2.0 * n);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::printf("usage: clap_smoke_host <module.clap> [--expect-sidechain]\n");
+        std::printf("usage: clap_smoke_host <module.clap> "
+                    "[--expect-sidechain | --expect-instrument | --probe]\n");
         return 2;
     }
-    // Plugins with the two-buffer processBlock announce a sidechain port;
-    // with the flag the smoke also proves the key signal actually reaches
-    // the detector (a hot sidechain must duck the main output).
     const bool expectSidechain = argc >= 3
         && std::strcmp(argv[2], "--expect-sidechain") == 0;
+    const bool expectInstrument = argc >= 3
+        && std::strcmp(argv[2], "--expect-instrument") == 0;
+    const bool probeMode = argc >= 3 && std::strcmp(argv[2], "--probe") == 0;
 
     ModuleHandle mod = openModule(argv[1]);
     expect(mod != nullptr, "module loads");
@@ -150,27 +316,52 @@ int main(int argc, char** argv)
     expect(desc != nullptr && desc->id != nullptr, "descriptor");
     std::printf("      plugin: %s (%s) by %s\n", desc->name, desc->id, desc->vendor);
 
-    const clap_plugin_t* plugin = factory->create_plugin(factory, &kHost, desc->id);
+    SmokeHost smokeHost;
+    const clap_plugin_t* plugin = factory->create_plugin(factory, &smokeHost.host,
+                                                         desc->id);
     expect(plugin != nullptr, "create_plugin");
     if (!plugin) return 1;
+    smokeHost.plugin = plugin;
     expect(plugin->init(plugin), "plugin init");
 
     const auto* ports = static_cast<const clap_plugin_audio_ports_t*>(
         plugin->get_extension(plugin, CLAP_EXT_AUDIO_PORTS));
     expect(ports != nullptr, "audio-ports extension");
-    const uint32_t expectedInPorts = expectSidechain ? 2u : 1u;
+    const uint32_t expectedInPorts =
+        expectInstrument ? 0u : (expectSidechain ? 2u : 1u);
     if (ports)
     {
-        clap_audio_port_info_t info {};
-        expect(ports->count(plugin, true) == expectedInPorts
-                   && ports->get(plugin, 0, true, &info) && info.channel_count == 2,
-               expectSidechain ? "main + sidechain input ports" : "stereo input port");
+        expect(ports->count(plugin, true) == expectedInPorts,
+               expectInstrument ? "instrument has no audio input ports"
+               : (expectSidechain ? "main + sidechain input ports"
+                                  : "one audio input port"));
+        if (!expectInstrument)
+        {
+            clap_audio_port_info_t info {};
+            expect(ports->get(plugin, 0, true, &info) && info.channel_count == 2,
+                   "stereo input port");
+        }
         if (expectSidechain)
         {
             clap_audio_port_info_t aux {};
             expect(ports->get(plugin, 1, true, &aux) && aux.channel_count == 2
                        && (aux.flags & CLAP_AUDIO_PORT_IS_MAIN) == 0,
                    "sidechain port is stereo and not main");
+        }
+    }
+    if (expectInstrument || probeMode)
+    {
+        const auto* notePorts = static_cast<const clap_plugin_note_ports_t*>(
+            plugin->get_extension(plugin, CLAP_EXT_NOTE_PORTS));
+        expect(notePorts != nullptr && notePorts->count(plugin, true) == 1,
+               "one note input port");
+        if (notePorts != nullptr)
+        {
+            clap_note_port_info_t info {};
+            expect(notePorts->get(plugin, 0, true, &info)
+                       && (info.supported_dialects & CLAP_NOTE_DIALECT_CLAP) != 0
+                       && (info.supported_dialects & CLAP_NOTE_DIALECT_MIDI) != 0,
+                   "note port accepts CLAP and MIDI dialects");
         }
     }
 
@@ -218,15 +409,26 @@ int main(int argc, char** argv)
     outBuf.channel_count = 2;
 
     EventList events;
+    clap_event_transport_t transport {};
+    transport.header.size = sizeof(transport);
+    transport.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+    transport.header.type = CLAP_EVENT_TRANSPORT;
+
     clap_process_t proc {};
     proc.steady_time = -1;
     proc.frames_count = 512;
-    proc.audio_inputs = inBufs;
+    proc.audio_inputs = expectedInPorts > 0 ? inBufs : nullptr;
     proc.audio_outputs = &outBuf;
     proc.audio_inputs_count = expectedInPorts;
     proc.audio_outputs_count = 1;
     proc.in_events = &events.iface;
     proc.out_events = &kOutEvents;
+
+    auto processOnce = [&]() {
+        const bool ok = plugin->process(plugin, &proc) == CLAP_PROCESS_CONTINUE;
+        events.clear();
+        return ok;
+    };
 
     bool finite = true;
     int n = 0;
@@ -249,20 +451,8 @@ int main(int argc, char** argv)
                 scR[static_cast<size_t>(i)] = key;
             }
             if (fireEvent && block == 20)   // live parameter event mid-run
-            {
-                events.event = {};
-                events.event.header.size = sizeof(clap_event_param_value_t);
-                events.event.header.time = 0;
-                events.event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
-                events.event.header.type = CLAP_EVENT_PARAM_VALUE;
-                events.event.param_id = p0.id;
-                events.event.value = 0.5 * (p0.min_value + p0.max_value);
-                events.count = 1;
-            }
-            else
-                events.count = 0;
-
-            if (plugin->process(plugin, &proc) != CLAP_PROCESS_CONTINUE)
+                events.paramValue(p0.id, 0.5 * (p0.min_value + p0.max_value), 0);
+            if (!processOnce())
             {
                 expect(false, "process returns CONTINUE");
                 break;
@@ -277,40 +467,263 @@ int main(int argc, char** argv)
         return settled;
     };
 
-    const double energy = runBlocks(40, 0.0f, true);
-    expect(finite, "output stays finite");
-    expect(energy > 1e-6, "output carries signal");
-
-    if (expectSidechain)
+    if (!expectInstrument)
     {
-        // The functional proof: a hot key on the sidechain port must duck
-        // the main output well below the silent-key level measured above.
-        const double ducked = runBlocks(40, 0.9f, false);
-        std::printf("      sidechain: open %.3g -> ducked %.3g\n", energy, ducked);
-        expect(finite, "ducked output stays finite");
-        expect(ducked < energy * 0.5, "hot sidechain ducks the main output");
-        runBlocks(20, 0.0f, false);   // let the detector release
+        const double energy = runBlocks(40, 0.0f, true);
+        expect(finite, "output stays finite");
+        expect(energy > 1e-6, "output carries signal");
+
+        if (expectSidechain)
+        {
+            // The functional proof: a hot key on the sidechain port must duck
+            // the main output well below the silent-key level measured above.
+            const double ducked = runBlocks(40, 0.9f, false);
+            std::printf("      sidechain: open %.3g -> ducked %.3g\n", energy, ducked);
+            expect(finite, "ducked output stays finite");
+            expect(ducked < energy * 0.5, "hot sidechain ducks the main output");
+            runBlocks(20, 0.0f, false);   // let the detector release
+        }
+
+        double mid = 0.0;
+        expect(params->get_value(plugin, p0.id, &mid), "get_value");
+        expect(std::fabs(mid - 0.5 * (p0.min_value + p0.max_value)) < 1e-6,
+               "parameter event applied");
     }
 
-    double mid = 0.0;
-    expect(params->get_value(plugin, p0.id, &mid), "get_value");
-    expect(std::fabs(mid - 0.5 * (p0.min_value + p0.max_value)) < 1e-6,
-           "parameter event applied");
+    auto fillInput = [&](float value) {
+        for (int i = 0; i < 512; ++i)
+        {
+            inL[static_cast<size_t>(i)] = value;
+            inR[static_cast<size_t>(i)] = value;
+        }
+    };
+    auto outMean = [&]() {
+        double sum = 0.0;
+        for (int i = 0; i < 512; ++i) sum += outL[static_cast<size_t>(i)];
+        return sum / 512.0;
+    };
+
+    if (expectInstrument)
+    {
+        // A note must sound at the right pitch, then decay on release.
+        // Select the sine waveform first for a clean zero-crossing estimate.
+        const auto* paramsExt = params;
+        clap_event_param_value_t wave {};
+        (void) wave;
+        events.paramValue(hash32("wave"), 0.0, 0);   // plain 0 = Sine
+        events.noteOn(69, 1.0, 0);
+        expect(processOnce(), "process with a note on");
+        double noteEnergy = 0.0;
+        std::vector<float> tone;
+        for (int block = 0; block < 8; ++block)
+        {
+            processOnce();
+            for (int i = 0; i < 512; ++i)
+            {
+                noteEnergy += static_cast<double>(outL[static_cast<size_t>(i)])
+                            * outL[static_cast<size_t>(i)];
+                tone.push_back(outL[static_cast<size_t>(i)]);
+            }
+        }
+        expect(noteEnergy > 1e-4, "note produces sound");
+        const double freq = estimateFrequency(tone.data(),
+                                              static_cast<int>(tone.size()), 48000.0);
+        std::printf("      note pitch: %.1f Hz (expected 440)\n", freq);
+        expect(std::fabs(freq - 440.0) < 22.0, "note plays at the right pitch");
+
+        events.noteOff(69, 0);
+        processOnce();
+        for (int block = 0; block < 90; ++block) processOnce();   // ~1 s release
+        double tailEnergy = 0.0;
+        processOnce();
+        for (int i = 0; i < 512; ++i)
+            tailEnergy += static_cast<double>(outL[static_cast<size_t>(i)])
+                        * outL[static_cast<size_t>(i)];
+        expect(tailEnergy < noteEnergy / 100.0, "note decays after note off");
+        (void) paramsExt;
+    }
+
+    if (probeMode)
+    {
+        std::printf("      -- probe: host contract battery --\n");
+        const uint32_t gainId = hash32("gain");
+        const uint32_t lookaheadId = hash32("lookahead");
+
+        // 1) Transport: while playing, the probe outputs DC = tempo/1000.
+        fillInput(0.0f);
+        transport.flags = CLAP_TRANSPORT_HAS_TEMPO | CLAP_TRANSPORT_IS_PLAYING;
+        transport.tempo = 137.5;
+        proc.transport = &transport;
+        processOnce();
+        processOnce();
+        std::printf("      transport DC: %.4f (expected 0.1375)\n", outMean());
+        expect(std::fabs(outMean() - 0.1375) < 1e-3,
+               "transport tempo reaches the plugin (DC = tempo/1000)");
+
+        // 2) Render extension: offline flips the probe's DC sign.
+        const auto* render = static_cast<const clap_plugin_render_t*>(
+            plugin->get_extension(plugin, CLAP_EXT_RENDER));
+        expect(render != nullptr, "render extension present");
+        if (render != nullptr)
+        {
+            expect(!render->has_hard_realtime_requirement(plugin),
+                   "no hard realtime requirement");
+            expect(render->set(plugin, CLAP_RENDER_OFFLINE), "set offline mode");
+            processOnce();
+            processOnce();
+            expect(std::fabs(outMean() + 0.1375) < 1e-3,
+                   "offline render mode reaches the plugin (DC sign flips)");
+            render->set(plugin, CLAP_RENDER_REALTIME);
+        }
+
+        // 3) Sample-accurate automation: a gain step at offset 256 must land
+        //    exactly there. Stop the transport (kept valid) first.
+        transport.flags = CLAP_TRANSPORT_HAS_TEMPO;
+        processOnce();
+        fillInput(1.0f);
+        events.paramValue(gainId, 0.0, 0);
+        processOnce();   // settle at gain 0
+        events.paramValue(gainId, 1.0, 256);
+        processOnce();
+        int stepAt = -1;
+        for (int i = 0; i < 512; ++i)
+            if (outL[static_cast<size_t>(i)] > 0.5f)
+            {
+                stepAt = i;
+                break;
+            }
+        std::printf("      automation step lands at sample %d (expected 256)\n", stepAt);
+        expect(stepAt == 256, "automation step is sample-accurate");
+
+        // 4) Note events: silence the input path, play A4 with an in-block
+        //    offset, check the start position and the pitch.
+        fillInput(0.0f);
+        events.paramValue(gainId, 0.0, 0);
+        events.noteOn(69, 1.0, 256);
+        processOnce();
+        double firstHalf = 0.0, secondHalf = 0.0;
+        for (int i = 0; i < 256; ++i)
+            firstHalf += std::fabs(outL[static_cast<size_t>(i)]);
+        for (int i = 256; i < 512; ++i)
+            secondHalf += std::fabs(outL[static_cast<size_t>(i)]);
+        expect(firstHalf < 1e-6 && secondHalf > 0.1,
+               "note starts at its sample offset");
+        std::vector<float> tone;
+        for (int block = 0; block < 8; ++block)
+        {
+            processOnce();
+            for (int i = 0; i < 512; ++i)
+                tone.push_back(outL[static_cast<size_t>(i)]);
+        }
+        const double freq = estimateFrequency(tone.data(),
+                                              static_cast<int>(tone.size()), 48000.0);
+        std::printf("      note pitch: %.1f Hz (expected 440)\n", freq);
+        expect(std::fabs(freq - 440.0) < 22.0, "note event plays at the right pitch");
+
+        // 5) Raw-MIDI pitch bend: full bend (0xE0 7F 7F) = +2 semitones.
+        events.midi(0xE0, 0x7F, 0x7F, 0);
+        processOnce();
+        tone.clear();
+        for (int block = 0; block < 8; ++block)
+        {
+            processOnce();
+            for (int i = 0; i < 512; ++i)
+                tone.push_back(outL[static_cast<size_t>(i)]);
+        }
+        const double bent = estimateFrequency(tone.data(),
+                                              static_cast<int>(tone.size()), 48000.0);
+        std::printf("      bent pitch: %.1f Hz (expected ~493.9)\n", bent);
+        expect(std::fabs(bent - 493.9) < 25.0, "raw MIDI pitch bend reaches the plugin");
+        events.midi(0xE0, 0x00, 0x40, 0);   // re-center
+        events.noteOff(69, 0);
+        processOnce();
+
+        // 6) Latency change: flipping the lookahead toggle must request a
+        //    main-thread callback and notify clap_host_latency.
+        expect(latency->get(plugin) == 0, "initial latency is 0");
+        smokeHost.latencyChangedSeen = false;
+        events.paramValue(lookaheadId, 1.0, 0);
+        processOnce();
+        expect(smokeHost.callbackRequested, "latency change requests a callback");
+        expect(smokeHost.latencyChangedSeen,
+               "latency change notifies clap_host_latency");
+        expect(latency->get(plugin) == 64, "new latency is reported");
+        events.paramValue(lookaheadId, 0.0, 0);
+        processOnce();
+
+        // 7) Mono ports configuration: select, re-activate, process 1 channel.
+        const auto* portsConfig = static_cast<const clap_plugin_audio_ports_config_t*>(
+            plugin->get_extension(plugin, CLAP_EXT_AUDIO_PORTS_CONFIG));
+        expect(portsConfig != nullptr, "audio-ports-config extension present");
+        if (portsConfig != nullptr)
+        {
+            expect(portsConfig->count(plugin) == 2, "two ports configurations");
+            clap_audio_ports_config_t cfg {};
+            expect(portsConfig->get(plugin, 0, &cfg)
+                       && cfg.main_output_channel_count == 1,
+                   "first configuration is mono");
+            plugin->stop_processing(plugin);
+            plugin->deactivate(plugin);
+            expect(portsConfig->select(plugin, cfg.id), "mono configuration selected");
+            clap_audio_port_info_t monoInfo {};
+            expect(ports->get(plugin, 0, true, &monoInfo)
+                       && monoInfo.channel_count == 1,
+                   "ports report mono after select");
+            expect(plugin->activate(plugin, 48000.0, 32, 512), "re-activate mono");
+            plugin->start_processing(plugin);
+            inBufs[0].channel_count = 1;
+            outBuf.channel_count = 1;
+            fillInput(0.5f);
+            events.paramValue(gainId, 1.0, 0);
+            processOnce();
+            processOnce();
+            expect(std::fabs(outMean() - 0.5) < 1e-3, "mono processing works");
+            plugin->stop_processing(plugin);
+            plugin->deactivate(plugin);
+            portsConfig->select(plugin, 2);   // back to stereo
+            inBufs[0].channel_count = 2;
+            outBuf.channel_count = 2;
+            plugin->activate(plugin, 48000.0, 32, 512);
+            plugin->start_processing(plugin);
+        }
+
+        // 8) Factory presets: preset-load applies, preset-discovery lists.
+        const auto* presetLoad = static_cast<const clap_plugin_preset_load_t*>(
+            plugin->get_extension(plugin, CLAP_EXT_PRESET_LOAD));
+        expect(presetLoad != nullptr, "preset-load extension present");
+        if (presetLoad != nullptr)
+        {
+            smokeHost.presetLoadedSeen = false;
+            expect(presetLoad->from_location(plugin,
+                       CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr, "1"),
+                   "preset loads from the plugin location");
+            double gainNow = 0.0;
+            params->get_value(plugin, gainId, &gainNow);
+            expect(std::fabs(gainNow - 0.5) < 1e-9,
+                   "loading the preset applies its parameter values");
+            expect(smokeHost.presetLoadedSeen, "preset load reports loaded()");
+            presetLoad->from_location(plugin,
+                CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr, "0");
+        }
+        proc.transport = nullptr;
+    }
 
     // --- state round-trip ---------------------------------------------------------
+    EventList stateEvents;
+    events.paramValue(p0.id, 0.5 * (p0.min_value + p0.max_value), 0);
+    params->flush(plugin, &events.iface, &kOutEvents);
+    events.clear();
+    (void) stateEvents;
+    double mid = 0.0;
+    params->get_value(plugin, p0.id, &mid);
+
     ByteOStream saved;
     expect(state->save(plugin, &saved.iface) && !saved.bytes.empty(),
            "state save produces a blob");
 
-    EventList perturb;
-    perturb.event = {};
-    perturb.event.header.size = sizeof(clap_event_param_value_t);
-    perturb.event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
-    perturb.event.header.type = CLAP_EVENT_PARAM_VALUE;
-    perturb.event.param_id = p0.id;
-    perturb.event.value = p0.min_value;
-    perturb.count = 1;
-    params->flush(plugin, &perturb.iface, &kOutEvents);
+    events.paramValue(p0.id, p0.min_value, 0);
+    params->flush(plugin, &events.iface, &kOutEvents);
+    events.clear();
 
     ByteIStream restore;
     restore.bytes = saved.bytes;
@@ -359,6 +772,105 @@ int main(int argc, char** argv)
     plugin->stop_processing(plugin);
     plugin->deactivate(plugin);
     plugin->destroy(plugin);
+
+    // --- preset discovery factory (declared presets are indexable) --------------------
+    if (probeMode)
+    {
+        const auto* discovery = static_cast<const clap_preset_discovery_factory_t*>(
+            entry->get_factory(CLAP_PRESET_DISCOVERY_FACTORY_ID));
+        expect(discovery != nullptr, "preset-discovery factory present");
+        if (discovery != nullptr)
+        {
+            expect(discovery->count(discovery) == 1, "one preset provider");
+            const auto* provDesc = discovery->get_descriptor(discovery, 0);
+            expect(provDesc != nullptr && provDesc->id != nullptr,
+                   "provider descriptor");
+            struct Indexer
+            {
+                clap_preset_discovery_indexer_t iface {};
+                bool locationDeclared = false;
+                int presetsSeen = 0;
+            } indexer;
+            indexer.iface.clap_version = CLAP_VERSION_INIT;
+            indexer.iface.name = "DSPark smoke host";
+            indexer.iface.indexer_data = &indexer;
+            indexer.iface.declare_filetype =
+                [](const clap_preset_discovery_indexer_t*,
+                   const clap_preset_discovery_filetype_t*) { return true; };
+            indexer.iface.declare_location =
+                [](const clap_preset_discovery_indexer_t* idx,
+                   const clap_preset_discovery_location_t* loc) {
+                    auto* self = static_cast<Indexer*>(idx->indexer_data);
+                    self->locationDeclared =
+                        loc->kind == CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN;
+                    return true;
+                };
+            indexer.iface.declare_soundpack =
+                [](const clap_preset_discovery_indexer_t*,
+                   const clap_preset_discovery_soundpack_t*) { return true; };
+            indexer.iface.get_extension =
+                [](const clap_preset_discovery_indexer_t*,
+                   const char*) -> const void* { return nullptr; };
+
+            const auto* provider = discovery->create(discovery, &indexer.iface,
+                                                     provDesc->id);
+            expect(provider != nullptr, "provider creates");
+            if (provider != nullptr)
+            {
+                expect(provider->init(provider), "provider init");
+                expect(indexer.locationDeclared,
+                       "provider declares the plugin location");
+                struct Receiver
+                {
+                    clap_preset_discovery_metadata_receiver_t iface {};
+                    Indexer* indexer = nullptr;
+                } receiver;
+                receiver.indexer = &indexer;
+                receiver.iface.receiver_data = &receiver;
+                receiver.iface.on_error =
+                    [](const clap_preset_discovery_metadata_receiver_t*,
+                       int32_t, const char*) {};
+                receiver.iface.begin_preset =
+                    [](const clap_preset_discovery_metadata_receiver_t* r,
+                       const char*, const char*) {
+                        ++static_cast<Receiver*>(r->receiver_data)
+                              ->indexer->presetsSeen;
+                        return true;
+                    };
+                receiver.iface.add_plugin_id =
+                    [](const clap_preset_discovery_metadata_receiver_t*,
+                       const clap_universal_plugin_id_t*) {};
+                receiver.iface.set_soundpack_id =
+                    [](const clap_preset_discovery_metadata_receiver_t*,
+                       const char*) {};
+                receiver.iface.set_flags =
+                    [](const clap_preset_discovery_metadata_receiver_t*,
+                       uint32_t) {};
+                receiver.iface.add_creator =
+                    [](const clap_preset_discovery_metadata_receiver_t*,
+                       const char*) {};
+                receiver.iface.set_description =
+                    [](const clap_preset_discovery_metadata_receiver_t*,
+                       const char*) {};
+                receiver.iface.set_timestamps =
+                    [](const clap_preset_discovery_metadata_receiver_t*,
+                       clap_timestamp, clap_timestamp) {};
+                receiver.iface.add_feature =
+                    [](const clap_preset_discovery_metadata_receiver_t*,
+                       const char*) {};
+                receiver.iface.add_extra_info =
+                    [](const clap_preset_discovery_metadata_receiver_t*,
+                       const char*, const char*) {};
+                expect(provider->get_metadata(provider,
+                           CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr,
+                           &receiver.iface),
+                       "provider reports metadata");
+                expect(indexer.presetsSeen == 2, "provider lists both presets");
+                provider->destroy(provider);
+            }
+        }
+    }
+
     entry->deinit();
 
     std::printf("\n%s (%d failures)\n", g_failures == 0 ? "SMOKE OK" : "SMOKE FAILED",

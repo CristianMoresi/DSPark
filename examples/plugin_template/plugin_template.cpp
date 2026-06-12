@@ -51,9 +51,20 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     //   param(... ) + steps   discrete N+1 positions (set .steps yourself)
     // =========================================================================
     static constexpr auto parameters = dspark::plugin::params(
-        dspark::plugin::param ("mix",     "Mix",       0.0f,  1.0f, 0.3f, ""),
-        dspark::plugin::param ("ceiling", "Ceiling", -24.0f,  0.0f, -1.0f, "dB"),
-        dspark::plugin::toggle("truepeak","True Peak", true));
+        dspark::plugin::param ("mix",      "Mix",        0.0f,  1.0f, 0.3f, ""),
+        dspark::plugin::param ("ceiling",  "Ceiling",  -24.0f,  0.0f, -1.0f, "dB"),
+        dspark::plugin::toggle("truepeak", "True Peak", true),
+        dspark::plugin::param ("lookahead","Lookahead",  0.5f, 10.0f,  5.0f, "ms"));
+
+    // =========================================================================
+    // OPTIONAL — factoryPresets. One PLAIN value per parameter, in table
+    // order. Every format publishes them natively: a VST3 program list with
+    // a program-change parameter, CLAP preset-load + preset-discovery, AU
+    // factory presets — so the host's own preset browser offers them.
+    // =========================================================================
+    static constexpr auto factoryPresets = dspark::plugin::presets(
+        dspark::plugin::preset("Subtle Glue", 0.2f, -1.0f, 1.0f, 5.0f),
+        dspark::plugin::preset("Big Hall",    0.6f, -3.0f, 1.0f, 8.0f));
 
     // =========================================================================
     // REQUIRED 3/5 — prepare. Main thread, before audio, allocation allowed.
@@ -85,6 +96,7 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
         case 0: reverb_.setMix(value); break;
         case 1: limiter_.setCeiling(value); break;
         case 2: limiter_.setTruePeak(value >= 0.5f); break;
+        case 3: limiter_.setLookahead(value); break;   // changes getLatency()!
         default: break;
         }
     }
@@ -103,12 +115,37 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     // OPTIONAL — getLatency. Implement when your chain delays the signal
     // (lookahead limiter, linear-phase EQ, oversampling, FFT processing).
     // The host shifts every other track to compensate; report it accurately
-    // or your users hear phasing on parallel paths. Read after prepare().
-    // Maps to VST3 getLatencySamples and the CLAP latency extension.
+    // or your users hear phasing on parallel paths. Read after prepare()
+    // AND re-read after parameter changes: when the value moves (the
+    // lookahead knob above), the wrapper notifies the host on its own
+    // (restartComponent(kLatencyChanged) / clap_host_latency / the AU
+    // Latency property listeners) so the project re-compensates.
     // =========================================================================
     [[nodiscard]] int getLatency() const noexcept
     {
         return reverb_.getLatency() + limiter_.getLatency();
+    }
+
+    // =========================================================================
+    // OPTIONAL — setTransport. The host timeline lands here once per block
+    // (audio thread): tempo, musical position, play state, loop points.
+    // This demo only stores it; a tempo-synced delay would derive its time
+    // from transport.samplesPerBeat(sampleRate). Check the *Valid flags —
+    // not every host provides every field.
+    // =========================================================================
+    void setTransport(const dspark::plugin::TransportInfo& transport) noexcept
+    {
+        lastTransport_ = transport;
+    }
+
+    // =========================================================================
+    // OPTIONAL — setOfflineRendering. Hosts flip it for non-realtime
+    // bounces: the moment to raise quality/cost trade-offs (oversampling,
+    // longer lookahead). Called outside the audio thread.
+    // =========================================================================
+    void setOfflineRendering(bool offline) noexcept
+    {
+        offlineRender_ = offline;
     }
 
     // =========================================================================
@@ -186,6 +223,8 @@ private:
     std::vector<float>     ir_;
     double                 sampleRate_ = 48000.0;
     uint32_t               irSeed_ = 0x1234567u;
+    dspark::plugin::TransportInfo lastTransport_ {};
+    bool                   offlineRender_ = false;
 };
 
 DSPARK_VST3_PLUGIN(TemplatePlugin)

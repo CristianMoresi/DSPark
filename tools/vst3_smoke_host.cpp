@@ -6,7 +6,18 @@
 // process (sine blocks, parameter change mid-run) -> state round-trip ->
 // teardown. Exit code 0 means every step behaved.
 //
-//   vst3_smoke_host <path-to-module>
+//   vst3_smoke_host <module> [--expect-sidechain | --expect-instrument | --probe]
+//
+//   --expect-sidechain   the plugin declares an aux input; also proves the
+//                        key reaches the detector (hot key ducks the output)
+//   --expect-instrument  no audio inputs, an event input bus; a note must
+//                        produce sound at the right pitch and then decay
+//   --probe              full host-contract battery against the DSPark probe
+//                        plugin (tools/plugin_probe.cpp): transport DC,
+//                        offline sign flip, sample-accurate automation step,
+//                        note events + IMidiMapping pitch bend, the
+//                        latency-changed notification, mono negotiation and
+//                        the factory-preset program list
 //
 // This is the local first-line gate for plugins built with DSParkVst3.h;
 // run Steinberg's validator and Tracktion's pluginval before shipping.
@@ -39,6 +50,18 @@ void expect(bool ok, const char* what)
 {
     std::printf("%s  %s\n", ok ? "PASS " : "FAIL ", what);
     if (!ok) ++g_failures;
+}
+
+/// Same FNV-1a the wrapper uses for its stable parameter ids.
+constexpr uint32_t hash32(const char* s) noexcept
+{
+    uint32_t h = 2166136261u;
+    while (*s != '\0')
+    {
+        h ^= static_cast<uint8_t>(*s++);
+        h *= 16777619u;
+    }
+    return h;
 }
 
 // -- minimal host-side IBStream over a byte vector ------------------------------
@@ -104,20 +127,202 @@ struct MemoryStream
     MemoryStream() : vtbl(&kVtbl) {}
 };
 
+// -- host-side IComponentHandler (captures restartComponent flags) ----------------
+
+struct HostHandler
+{
+    const Steinberg_Vst_IComponentHandlerVtbl* vtbl;
+    Steinberg_int32 restartFlags = 0;
+    int restartCalls = 0;
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void* self_,
+        const Steinberg_TUID iid, void** o)
+    {
+        if (o == nullptr) return Steinberg_kInvalidArgument;
+        if (std::memcmp(iid, Steinberg_FUnknown_iid, 16) == 0
+            || std::memcmp(iid, Steinberg_Vst_IComponentHandler_iid, 16) == 0)
+        {
+            *o = self_;
+            return Steinberg_kResultOk;
+        }
+        *o = nullptr;
+        return Steinberg_kNoInterface;
+    }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE ar(void*) { return 100; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE rel(void*) { return 100; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE beginEdit(void*, Steinberg_Vst_ParamID)
+    { return Steinberg_kResultOk; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE performEdit(void*,
+        Steinberg_Vst_ParamID, Steinberg_Vst_ParamValue)
+    { return Steinberg_kResultOk; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE endEdit(void*, Steinberg_Vst_ParamID)
+    { return Steinberg_kResultOk; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE restartComponent(void* self_,
+        Steinberg_int32 flags)
+    {
+        auto* h = static_cast<HostHandler*>(self_);
+        h->restartFlags |= flags;
+        ++h->restartCalls;
+        return Steinberg_kResultOk;
+    }
+
+    inline static const Steinberg_Vst_IComponentHandlerVtbl kVtbl = {
+        &q, &ar, &rel, &beginEdit, &performEdit, &endEdit, &restartComponent
+    };
+    HostHandler() : vtbl(&kVtbl) {}
+};
+
+// -- host-side IParamValueQueue / IParameterChanges --------------------------------
+
+struct ParamQueue
+{
+    const Steinberg_Vst_IParamValueQueueVtbl* vtbl;
+    Steinberg_Vst_ParamID id = 0;
+    struct Point { Steinberg_int32 offset; Steinberg_Vst_ParamValue value; };
+    std::vector<Point> points;
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void*, const Steinberg_TUID, void** o)
+    { if (o) *o = nullptr; return Steinberg_kNoInterface; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE ar(void*) { return 100; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE rel(void*) { return 100; }
+    static Steinberg_Vst_ParamID SMTG_STDMETHODCALLTYPE getParameterId(void* self_)
+    { return static_cast<ParamQueue*>(self_)->id; }
+    static Steinberg_int32 SMTG_STDMETHODCALLTYPE getPointCount(void* self_)
+    { return static_cast<Steinberg_int32>(static_cast<ParamQueue*>(self_)->points.size()); }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE getPoint(void* self_,
+        Steinberg_int32 index, Steinberg_int32* offset, Steinberg_Vst_ParamValue* value)
+    {
+        auto* queue = static_cast<ParamQueue*>(self_);
+        if (index < 0 || index >= static_cast<Steinberg_int32>(queue->points.size()))
+            return Steinberg_kInvalidArgument;
+        if (offset) *offset = queue->points[static_cast<size_t>(index)].offset;
+        if (value) *value = queue->points[static_cast<size_t>(index)].value;
+        return Steinberg_kResultOk;
+    }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE addPoint(void*, Steinberg_int32,
+        Steinberg_Vst_ParamValue, Steinberg_int32*)
+    { return Steinberg_kResultFalse; }
+
+    inline static const Steinberg_Vst_IParamValueQueueVtbl kVtbl = {
+        &q, &ar, &rel, &getParameterId, &getPointCount, &getPoint, &addPoint
+    };
+    ParamQueue() : vtbl(&kVtbl) {}
+};
+
+struct ParamChanges
+{
+    const Steinberg_Vst_IParameterChangesVtbl* vtbl;
+    std::vector<ParamQueue> queues;
+
+    void clear() { queues.clear(); }
+    ParamQueue& add(Steinberg_Vst_ParamID id)
+    {
+        queues.emplace_back();
+        queues.back().id = id;
+        return queues.back();
+    }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void*, const Steinberg_TUID, void** o)
+    { if (o) *o = nullptr; return Steinberg_kNoInterface; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE ar(void*) { return 100; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE rel(void*) { return 100; }
+    static Steinberg_int32 SMTG_STDMETHODCALLTYPE getParameterCount(void* self_)
+    { return static_cast<Steinberg_int32>(static_cast<ParamChanges*>(self_)->queues.size()); }
+    static Steinberg_Vst_IParamValueQueue* SMTG_STDMETHODCALLTYPE getParameterData(
+        void* self_, Steinberg_int32 index)
+    {
+        auto* c = static_cast<ParamChanges*>(self_);
+        if (index < 0 || index >= static_cast<Steinberg_int32>(c->queues.size()))
+            return nullptr;
+        return reinterpret_cast<Steinberg_Vst_IParamValueQueue*>(
+            &c->queues[static_cast<size_t>(index)]);
+    }
+    static Steinberg_Vst_IParamValueQueue* SMTG_STDMETHODCALLTYPE addParameterData(
+        void*, const Steinberg_Vst_ParamID*, Steinberg_int32*)
+    { return nullptr; }
+
+    inline static const Steinberg_Vst_IParameterChangesVtbl kVtbl = {
+        &q, &ar, &rel, &getParameterCount, &getParameterData, &addParameterData
+    };
+    ParamChanges() : vtbl(&kVtbl) {}
+};
+
+// -- host-side IEventList -----------------------------------------------------------
+
+struct EventList
+{
+    const Steinberg_Vst_IEventListVtbl* vtbl;
+    std::vector<Steinberg_Vst_Event> events;
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void*, const Steinberg_TUID, void** o)
+    { if (o) *o = nullptr; return Steinberg_kNoInterface; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE ar(void*) { return 100; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE rel(void*) { return 100; }
+    static Steinberg_int32 SMTG_STDMETHODCALLTYPE getEventCount(void* self_)
+    { return static_cast<Steinberg_int32>(static_cast<EventList*>(self_)->events.size()); }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE getEvent(void* self_,
+        Steinberg_int32 index, struct Steinberg_Vst_Event* e)
+    {
+        auto* list = static_cast<EventList*>(self_);
+        if (e == nullptr || index < 0
+            || index >= static_cast<Steinberg_int32>(list->events.size()))
+            return Steinberg_kInvalidArgument;
+        *e = list->events[static_cast<size_t>(index)];
+        return Steinberg_kResultOk;
+    }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE addEvent(void*,
+        struct Steinberg_Vst_Event*)
+    { return Steinberg_kResultFalse; }
+
+    inline static const Steinberg_Vst_IEventListVtbl kVtbl = {
+        &q, &ar, &rel, &getEventCount, &getEvent, &addEvent
+    };
+    EventList() : vtbl(&kVtbl) {}
+
+    void noteOn(Steinberg_int16 pitch, float velocity, Steinberg_int32 offset)
+    {
+        Steinberg_Vst_Event e {};
+        e.type = Steinberg_Vst_Event_EventTypes_kNoteOnEvent;
+        e.sampleOffset = offset;
+        e.Steinberg_Vst_Event_noteOn.pitch = pitch;
+        e.Steinberg_Vst_Event_noteOn.velocity = velocity;
+        events.push_back(e);
+    }
+    void noteOff(Steinberg_int16 pitch, Steinberg_int32 offset)
+    {
+        Steinberg_Vst_Event e {};
+        e.type = Steinberg_Vst_Event_EventTypes_kNoteOffEvent;
+        e.sampleOffset = offset;
+        e.Steinberg_Vst_Event_noteOff.pitch = pitch;
+        events.push_back(e);
+    }
+};
+
+/// Zero-crossing pitch estimate over a mono buffer (clean tones only).
+double estimateFrequency(const float* x, int n, double sampleRate)
+{
+    int crossings = 0;
+    for (int i = 1; i < n; ++i)
+        if ((x[i - 1] < 0.0f && x[i] >= 0.0f) || (x[i - 1] >= 0.0f && x[i] < 0.0f))
+            ++crossings;
+    return crossings * sampleRate / (2.0 * n);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::printf("usage: vst3_smoke_host <module> [--expect-sidechain]\n");
+        std::printf("usage: vst3_smoke_host <module> "
+                    "[--expect-sidechain | --expect-instrument | --probe]\n");
         return 2;
     }
-    // Plugins with the two-buffer processBlock announce a sidechain aux bus;
-    // with the flag the smoke also proves the key signal actually reaches
-    // the detector (a hot sidechain must duck the main output).
     const bool expectSidechain = argc >= 3
         && std::strcmp(argv[2], "--expect-sidechain") == 0;
+    const bool expectInstrument = argc >= 3
+        && std::strcmp(argv[2], "--expect-instrument") == 0;
+    const bool probeMode = argc >= 3 && std::strcmp(argv[2], "--probe") == 0;
 
     ModuleHandle mod = openModule(argv[1]);
     expect(mod != nullptr, "module loads");
@@ -169,11 +374,21 @@ int main(int argc, char** argv)
            "queryInterface(IEditController)");
     auto* ctrl = static_cast<Steinberg_Vst_IEditController*>(rawCtrl);
 
+    HostHandler handler;
+    expect(ctrl->lpVtbl->setComponentHandler(ctrl,
+               reinterpret_cast<Steinberg_Vst_IComponentHandler*>(&handler))
+               == Steinberg_kResultOk,
+           "setComponentHandler");
+
     // --- buses & parameters ----------------------------------------------------
+    const Steinberg_int32 expectedInBuses =
+        expectInstrument ? 0 : (expectSidechain ? 2 : 1);
     const Steinberg_int32 inBusCount = comp->lpVtbl->getBusCount(
         comp, Steinberg_Vst_MediaTypes_kAudio, Steinberg_Vst_BusDirections_kInput);
-    expect(inBusCount == (expectSidechain ? 2 : 1),
-           expectSidechain ? "main + sidechain input buses" : "one audio input bus");
+    expect(inBusCount == expectedInBuses,
+           expectInstrument ? "instrument has no audio input buses"
+           : (expectSidechain ? "main + sidechain input buses"
+                              : "one audio input bus"));
     Steinberg_Vst_BusInfo bus {};
     expect(comp->lpVtbl->getBusInfo(comp, Steinberg_Vst_MediaTypes_kAudio,
                                     Steinberg_Vst_BusDirections_kOutput, 0, &bus)
@@ -191,6 +406,12 @@ int main(int argc, char** argv)
                                          Steinberg_Vst_BusDirections_kInput, 1, 1)
                    == Steinberg_kResultOk,
                "sidechain bus activates");
+    }
+    if (expectInstrument || probeMode)
+    {
+        const Steinberg_int32 eventBuses = comp->lpVtbl->getBusCount(
+            comp, Steinberg_Vst_MediaTypes_kEvent, Steinberg_Vst_BusDirections_kInput);
+        expect(eventBuses == 1, "one MIDI event input bus");
     }
 
     const Steinberg_int32 numParams = ctrl->lpVtbl->getParameterCount(ctrl);
@@ -245,14 +466,29 @@ int main(int argc, char** argv)
     outBusBuf.numChannels = 2;
     outBusBuf.Steinberg_Vst_AudioBusBuffers_channelBuffers32 = outCh;
 
+    ParamChanges changes;
+    EventList events;
+    Steinberg_Vst_ProcessContext context {};
+    context.sampleRate = 48000.0;
+
     Steinberg_Vst_ProcessData data {};
     data.processMode = 0;
     data.symbolicSampleSize = Steinberg_Vst_SymbolicSampleSizes_kSample32;
     data.numSamples = 512;
-    data.numInputs = inBusCount;
+    data.numInputs = expectedInBuses;
     data.numOutputs = 1;
-    data.inputs = inputBuses;
+    data.inputs = expectedInBuses > 0 ? inputBuses : nullptr;
     data.outputs = &outBusBuf;
+    data.inputParameterChanges =
+        reinterpret_cast<Steinberg_Vst_IParameterChanges*>(&changes);
+    data.inputEvents = reinterpret_cast<Steinberg_Vst_IEventList*>(&events);
+
+    auto processOnce = [&]() {
+        const Steinberg_tresult r = proc->lpVtbl->process(proc, &data);
+        changes.clear();
+        events.events.clear();
+        return r == Steinberg_kResultOk;
+    };
 
     // Runs the 1 kHz test tone through `blocks` blocks with the sidechain
     // fed `scLevel` (0 = silent key) and returns the settled output energy.
@@ -274,7 +510,7 @@ int main(int argc, char** argv)
                 scL[static_cast<size_t>(i)] = key;
                 scR[static_cast<size_t>(i)] = key;
             }
-            if (proc->lpVtbl->process(proc, &data) != Steinberg_kResultOk)
+            if (!processOnce())
             {
                 expect(false, "process returns kResultOk");
                 break;
@@ -289,19 +525,279 @@ int main(int argc, char** argv)
         return settled;
     };
 
-    const double energy = runBlocks(40, 0.0f);
-    expect(finite, "output stays finite");
-    expect(energy > 1e-6, "output carries signal");
-
-    if (expectSidechain)
+    if (!expectInstrument)
     {
-        // The functional proof: a hot key on the aux bus must duck the main
-        // output well below the silent-key level measured above.
-        const double ducked = runBlocks(40, 0.9f);
-        std::printf("      sidechain: open %.3g -> ducked %.3g\n", energy, ducked);
-        expect(finite, "ducked output stays finite");
-        expect(ducked < energy * 0.5, "hot sidechain ducks the main output");
-        runBlocks(20, 0.0f);   // let the detector release before moving on
+        const double energy = runBlocks(40, 0.0f);
+        expect(finite, "output stays finite");
+        expect(energy > 1e-6, "output carries signal");
+
+        if (expectSidechain)
+        {
+            // The functional proof: a hot key on the aux bus must duck the
+            // main output well below the silent-key level measured above.
+            const double ducked = runBlocks(40, 0.9f);
+            std::printf("      sidechain: open %.3g -> ducked %.3g\n", energy, ducked);
+            expect(finite, "ducked output stays finite");
+            expect(ducked < energy * 0.5, "hot sidechain ducks the main output");
+            runBlocks(20, 0.0f);   // let the detector release before moving on
+        }
+    }
+
+    auto fillInput = [&](float value) {
+        for (int i = 0; i < 512; ++i)
+        {
+            inL[static_cast<size_t>(i)] = value;
+            inR[static_cast<size_t>(i)] = value;
+        }
+    };
+    auto outMean = [&]() {
+        double sum = 0.0;
+        for (int i = 0; i < 512; ++i) sum += outL[static_cast<size_t>(i)];
+        return sum / 512.0;
+    };
+
+    if (expectInstrument)
+    {
+        // A note must produce sound at the right pitch, then decay on release.
+        // Select the sine waveform first for a clean zero-crossing estimate.
+        ctrl->lpVtbl->setParamNormalized(ctrl, hash32("wave"), 0.0);
+        events.noteOn(69, 1.0f, 0);
+        expect(processOnce(), "process with a note on");
+        double noteEnergy = 0.0;
+        std::vector<float> tone;
+        for (int block = 0; block < 8; ++block)
+        {
+            processOnce();
+            for (int i = 0; i < 512; ++i)
+            {
+                noteEnergy += static_cast<double>(outL[static_cast<size_t>(i)])
+                            * outL[static_cast<size_t>(i)];
+                tone.push_back(outL[static_cast<size_t>(i)]);
+            }
+        }
+        expect(noteEnergy > 1e-4, "note produces sound");
+        const double freq = estimateFrequency(tone.data(),
+                                              static_cast<int>(tone.size()), 48000.0);
+        std::printf("      note pitch: %.1f Hz (expected 440)\n", freq);
+        expect(std::fabs(freq - 440.0) < 22.0, "note plays at the right pitch");
+
+        events.noteOff(69, 0);
+        processOnce();
+        for (int block = 0; block < 90; ++block) processOnce();   // ~1 s release
+        double tailEnergy = 0.0;
+        processOnce();
+        for (int i = 0; i < 512; ++i)
+            tailEnergy += static_cast<double>(outL[static_cast<size_t>(i)])
+                        * outL[static_cast<size_t>(i)];
+        expect(tailEnergy < noteEnergy / 100.0, "note decays after note off");
+    }
+
+    if (probeMode)
+    {
+        std::printf("      -- probe: host contract battery --\n");
+        const Steinberg_Vst_ParamID gainId = hash32("gain");
+        const Steinberg_Vst_ParamID lookaheadId = hash32("lookahead");
+        const Steinberg_Vst_ParamID programId = 0x5052474Du;   // 'PRGM'
+
+        // 1) Transport: while playing, the probe outputs DC = tempo/1000.
+        void* rawReq = nullptr;
+        expect(comp->lpVtbl->queryInterface(comp,
+                   Steinberg_Vst_IProcessContextRequirements_iid, &rawReq)
+                   == Steinberg_kResultOk && rawReq != nullptr,
+               "queryInterface(IProcessContextRequirements)");
+        if (rawReq != nullptr)
+        {
+            auto* req = static_cast<Steinberg_Vst_IProcessContextRequirements*>(rawReq);
+            const Steinberg_uint32 need =
+                req->lpVtbl->getProcessContextRequirements(req);
+            expect((need & Steinberg_Vst_IProcessContextRequirements_Flags_kNeedTempo)
+                       != 0,
+                   "plugin declares it needs the tempo");
+            req->lpVtbl->release(req);
+        }
+        fillInput(0.0f);
+        context.state = Steinberg_Vst_ProcessContext_StatesAndFlags_kPlaying
+                      | Steinberg_Vst_ProcessContext_StatesAndFlags_kTempoValid
+                      | Steinberg_Vst_ProcessContext_StatesAndFlags_kProjectTimeMusicValid;
+        context.tempo = 137.5;
+        data.processContext = &context;
+        processOnce();
+        processOnce();
+        std::printf("      transport DC: %.4f (expected 0.1375)\n", outMean());
+        expect(std::fabs(outMean() - 0.1375) < 1e-3,
+               "transport tempo reaches the plugin (DC = tempo/1000)");
+
+        // 2) Offline mode: the probe flips the DC sign under kOffline.
+        proc->lpVtbl->setProcessing(proc, 0);
+        comp->lpVtbl->setActive(comp, 0);
+        setup.processMode = Steinberg_Vst_ProcessModes_kOffline;
+        expect(proc->lpVtbl->setupProcessing(proc, &setup) == Steinberg_kResultOk,
+               "setupProcessing(kOffline)");
+        comp->lpVtbl->setActive(comp, 1);
+        proc->lpVtbl->setProcessing(proc, 1);
+        processOnce();
+        processOnce();
+        expect(std::fabs(outMean() + 0.1375) < 1e-3,
+               "offline render mode reaches the plugin (DC sign flips)");
+        proc->lpVtbl->setProcessing(proc, 0);
+        comp->lpVtbl->setActive(comp, 0);
+        setup.processMode = 0;
+        proc->lpVtbl->setupProcessing(proc, &setup);
+        comp->lpVtbl->setActive(comp, 1);
+        proc->lpVtbl->setProcessing(proc, 1);
+
+        // 3) Sample-accurate automation: a gain step queued at offset 256
+        //    must land exactly there (256 is on the quantum grid). Stop the
+        //    transport first (kept valid, like a real host) so the probe's
+        //    tempo DC does not ride on top of the step.
+        context.state = Steinberg_Vst_ProcessContext_StatesAndFlags_kTempoValid;
+        processOnce();   // deliver the stopped transport
+        fillInput(1.0f);
+        changes.add(gainId).points.push_back({ 0, 0.0 });
+        processOnce();   // settle at gain 0
+        changes.add(gainId).points.push_back({ 256, 1.0 });
+        processOnce();
+        int stepAt = -1;
+        for (int i = 0; i < 512; ++i)
+            if (outL[static_cast<size_t>(i)] > 0.5f)
+            {
+                stepAt = i;
+                break;
+            }
+        std::printf("      automation step lands at sample %d (expected 256)\n", stepAt);
+        expect(stepAt == 256, "automation step is sample-accurate");
+
+        // 4) MIDI note events: silence the input path, play A4, check pitch
+        //    and the in-block start offset.
+        fillInput(0.0f);
+        changes.add(gainId).points.push_back({ 0, 0.0 });
+        events.noteOn(69, 1.0f, 256);
+        processOnce();
+        double firstHalf = 0.0, secondHalf = 0.0;
+        for (int i = 0; i < 256; ++i)
+            firstHalf += std::fabs(outL[static_cast<size_t>(i)]);
+        for (int i = 256; i < 512; ++i)
+            secondHalf += std::fabs(outL[static_cast<size_t>(i)]);
+        expect(firstHalf < 1e-6 && secondHalf > 0.1,
+               "note starts at its sample offset");
+        std::vector<float> tone;
+        for (int block = 0; block < 8; ++block)
+        {
+            processOnce();
+            for (int i = 0; i < 512; ++i)
+                tone.push_back(outL[static_cast<size_t>(i)]);
+        }
+        const double freq = estimateFrequency(tone.data(),
+                                              static_cast<int>(tone.size()), 48000.0);
+        std::printf("      note pitch: %.1f Hz (expected 440)\n", freq);
+        expect(std::fabs(freq - 440.0) < 22.0, "note event plays at the right pitch");
+
+        // 5) Pitch bend through IMidiMapping: full bend = +2 semitones.
+        void* rawMap = nullptr;
+        expect(ctrl->lpVtbl->queryInterface(ctrl, Steinberg_Vst_IMidiMapping_iid,
+                                            &rawMap) == Steinberg_kResultOk
+                   && rawMap != nullptr,
+               "queryInterface(IMidiMapping)");
+        if (rawMap != nullptr)
+        {
+            auto* map = static_cast<Steinberg_Vst_IMidiMapping*>(rawMap);
+            Steinberg_Vst_ParamID bendId = 0;
+            expect(map->lpVtbl->getMidiControllerAssignment(map, 0, 0,
+                       129 /* kPitchBend */, &bendId) == Steinberg_kResultTrue,
+                   "pitch bend maps to a proxy parameter");
+            map->lpVtbl->release(map);
+            changes.add(bendId).points.push_back({ 0, 1.0 });
+            processOnce();
+            tone.clear();
+            for (int block = 0; block < 8; ++block)
+            {
+                processOnce();
+                for (int i = 0; i < 512; ++i)
+                    tone.push_back(outL[static_cast<size_t>(i)]);
+            }
+            const double bent = estimateFrequency(tone.data(),
+                                                  static_cast<int>(tone.size()),
+                                                  48000.0);
+            std::printf("      bent pitch: %.1f Hz (expected 493.9)\n", bent);
+            expect(std::fabs(bent - 493.9) < 25.0, "pitch bend reaches the plugin");
+            changes.add(bendId).points.push_back({ 0, 0.5 });   // re-center
+        }
+        events.noteOff(69, 0);
+        processOnce();
+
+        // 6) Latency change: flipping the lookahead toggle must notify the
+        //    host and re-report.
+        expect(proc->lpVtbl->getLatencySamples(proc) == 0, "initial latency is 0");
+        handler.restartFlags = 0;
+        ctrl->lpVtbl->setParamNormalized(ctrl, lookaheadId, 1.0);
+        expect((handler.restartFlags
+                & Steinberg_Vst_RestartFlags_kLatencyChanged) != 0,
+               "latency change notifies restartComponent(kLatencyChanged)");
+        expect(proc->lpVtbl->getLatencySamples(proc) == 64,
+               "new latency is reported");
+        ctrl->lpVtbl->setParamNormalized(ctrl, lookaheadId, 0.0);
+
+        // 7) Mono negotiation: 1-in/1-out must be accepted and processed.
+        proc->lpVtbl->setProcessing(proc, 0);
+        comp->lpVtbl->setActive(comp, 0);
+        Steinberg_Vst_SpeakerArrangement monoIn = Steinberg_Vst_SpeakerArr_kMono;
+        Steinberg_Vst_SpeakerArrangement monoOut = Steinberg_Vst_SpeakerArr_kMono;
+        expect(proc->lpVtbl->setBusArrangements(proc, &monoIn, 1, &monoOut, 1)
+                   == Steinberg_kResultTrue,
+               "mono bus arrangement accepted");
+        Steinberg_Vst_BusInfo monoBus {};
+        comp->lpVtbl->getBusInfo(comp, Steinberg_Vst_MediaTypes_kAudio,
+                                 Steinberg_Vst_BusDirections_kOutput, 0, &monoBus);
+        expect(monoBus.channelCount == 1, "bus info reports mono");
+        comp->lpVtbl->setActive(comp, 1);
+        proc->lpVtbl->setProcessing(proc, 1);
+        inputBuses[0].numChannels = 1;
+        outBusBuf.numChannels = 1;
+        fillInput(0.5f);
+        ctrl->lpVtbl->setParamNormalized(ctrl, gainId, 1.0);
+        processOnce();
+        processOnce();
+        expect(std::fabs(outMean() - 0.5) < 1e-3, "mono processing works");
+        proc->lpVtbl->setProcessing(proc, 0);
+        comp->lpVtbl->setActive(comp, 0);
+        Steinberg_Vst_SpeakerArrangement stereoArr = Steinberg_Vst_SpeakerArr_kStereo;
+        proc->lpVtbl->setBusArrangements(proc, &stereoArr, 1, &stereoArr, 1);
+        inputBuses[0].numChannels = 2;
+        outBusBuf.numChannels = 2;
+        comp->lpVtbl->setActive(comp, 1);
+        proc->lpVtbl->setProcessing(proc, 1);
+
+        // 8) Factory presets: program list + program change parameter.
+        void* rawUnit = nullptr;
+        expect(ctrl->lpVtbl->queryInterface(ctrl, Steinberg_Vst_IUnitInfo_iid, &rawUnit)
+                   == Steinberg_kResultOk && rawUnit != nullptr,
+               "queryInterface(IUnitInfo)");
+        if (rawUnit != nullptr)
+        {
+            auto* unit = static_cast<Steinberg_Vst_IUnitInfo*>(rawUnit);
+            expect(unit->lpVtbl->getProgramListCount(unit) == 1,
+                   "one factory program list");
+            Steinberg_Vst_ProgramListInfo listInfo {};
+            expect(unit->lpVtbl->getProgramListInfo(unit, 0, &listInfo)
+                       == Steinberg_kResultOk && listInfo.programCount == 2,
+                   "program list reports two presets");
+            Steinberg_Vst_String128 progName {};
+            expect(unit->lpVtbl->getProgramName(unit, listInfo.id, 1, progName)
+                       == Steinberg_kResultOk && progName[0] == 'H',
+                   "second preset is named Half");
+            unit->lpVtbl->release(unit);
+            handler.restartFlags = 0;
+            ctrl->lpVtbl->setParamNormalized(ctrl, programId, 1.0);
+            expect(std::fabs(ctrl->lpVtbl->getParamNormalized(ctrl, gainId) - 0.5)
+                       < 1e-9,
+                   "loading the preset applies its parameter values");
+            expect((handler.restartFlags
+                    & Steinberg_Vst_RestartFlags_kParamValuesChanged) != 0,
+                   "preset load notifies kParamValuesChanged");
+            ctrl->lpVtbl->setParamNormalized(ctrl, programId, 0.0);
+        }
+        data.processContext = nullptr;
+        context.state = 0;
     }
 
     // a parameter poke through the controller while "running"

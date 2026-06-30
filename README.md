@@ -520,8 +520,8 @@ Free to use in commercial and open-source projects. Attribution appreciated.
 
 DSPark was created to provide a truly free, professional-grade DSP toolkit accessible to developers at every level of expertise — from desktop app builders to DSP engineers designing embedded audio systems. It is a genuine open-source alternative to commercial audio frameworks, built from the ground up with no dependencies and no compromises.
 
-- GitHub: [github.com/crismoresi](https://github.com/crismoresi)
-- LinkedIn: [linkedin.com/in/crismoresi](https://linkedin.com/in/crismoresi)
+- GitHub: [github.com/CristianMoresi](https://github.com/CristianMoresi)
+- LinkedIn: [linkedin.com/in/cristianmoresi](https://www.linkedin.com/in/cristianmoresi/)
 - Email: dev@cristianmoresi.com
 
 ---

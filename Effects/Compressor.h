@@ -67,7 +67,11 @@ public:
         Rms,            ///< Sliding-window Root-Mean-Square. Smoother, responds to average energy.
         TruePeak,       ///< 4x oversampled peak detection (ITU-R BS.1770-4 compliant).
         SplitPolarity,  ///< Asymmetric positive/negative half-wave tracking (ButterComp2 style).
-        Hilbert         ///< Analytic signal magnitude. Instantaneous energy without RMS delay.
+        Hilbert         ///< Analytic-signal magnitude: ripple-free envelope (lowest THD on
+                        ///< sustained material). The 191-tap FIR adds ~95 samples (~2 ms at
+                        ///< 48 kHz) of detection delay that is NOT latency-compensated, so
+                        ///< fast transients are caught late. Prefer Peak/TruePeak for
+                        ///< transient control.
     };
 
     /** @brief Signal routing topology for the detector sidechain. */
@@ -91,6 +95,8 @@ public:
     {
         Downward,  ///< Standard: Reduces dynamic range by attenuating signals above the threshold.
         Upward     ///< Upward: Reduces dynamic range by boosting signals below the threshold.
+                   ///< The boost fades out between 40 and 60 dB below the threshold so pauses
+                   ///< and the noise floor are not amplified; setRange() bounds the boost.
     };
 
     // -- Lifecycle --------------------------------------------------------------
@@ -119,6 +125,10 @@ public:
         ratioSmooth_.reset(std::max(rat, T(1)));
         kneeSmooth_.prepare(sampleRate_, 30.0);
         kneeSmooth_.reset(std::max(knee, T(0)));
+        makeupSmooth_.prepare(sampleRate_, 30.0);
+        makeupSmooth_.reset(makeupGain_.load(std::memory_order_relaxed));
+        mixSmooth_.prepare(sampleRate_, 30.0);
+        mixSmooth_.reset(mix_.load(std::memory_order_relaxed));
 
         // Pre-allocate and initialize per-channel instances
         int maxLaSamples = static_cast<int>(sampleRate_ * 0.01) + 1; 
@@ -185,6 +195,11 @@ public:
      * Bypasses block-level features like stereo linking, parallel mix, and lookahead.
      * Ideal for modular routing, synth voices, or per-sample environments.
      *
+     * @note Shared state (parameter smoothers, auto-makeup envelope) advances
+     *       once per sample FRAME and is driven by channel 0. Multi-channel
+     *       per-sample workflows must therefore include channel 0; other
+     *       channels read the current smoothed values without advancing them.
+     *
      * @param input Audio sample to process.
      * @param channel Index of the audio channel (used for state tracking).
      * @return Compressed output sample.
@@ -197,24 +212,41 @@ public:
         thresholdSmooth_.setTargetValue(threshold_.load(std::memory_order_relaxed));
         ratioSmooth_.setTargetValue(std::max(ratio_.load(std::memory_order_relaxed), T(1)));
         kneeSmooth_.setTargetValue(std::max(kneeWidth_.load(std::memory_order_relaxed), T(0)));
+        makeupSmooth_.setTargetValue(makeupGain_.load(std::memory_order_relaxed));
 
-        T thresh = thresholdSmooth_.getNextValue();
-        T ratio  = ratioSmooth_.getNextValue();
-        T knee   = kneeSmooth_.getNextValue();
-        
+        // Channel 0 advances the shared smoothers; advancing on every call
+        // would scale their time constants with the caller's channel count.
+        const bool advanceShared = (channel == 0);
+        T thresh, ratio, knee, makeupDb;
+        if (advanceShared)
+        {
+            thresh   = thresholdSmooth_.getNextValue();
+            ratio    = ratioSmooth_.getNextValue();
+            knee     = kneeSmooth_.getNextValue();
+            makeupDb = makeupSmooth_.getNextValue();
+        }
+        else
+        {
+            thresh   = thresholdSmooth_.getCurrentValue();
+            ratio    = ratioSmooth_.getCurrentValue();
+            knee     = kneeSmooth_.getCurrentValue();
+            makeupDb = makeupSmooth_.getCurrentValue();
+        }
+
         auto detType   = detectorType_.load(std::memory_order_relaxed);
         auto topo      = topology_.load(std::memory_order_relaxed);
         auto charType  = character_.load(std::memory_order_relaxed);
         auto modeType  = mode_.load(std::memory_order_relaxed);
         bool scHpf     = scHpfEnabled_.load(std::memory_order_relaxed);
         bool autoMkup  = autoMakeup_.load(std::memory_order_relaxed);
-        T relMs        = std::max(releaseMs_.load(std::memory_order_relaxed), T(0.01));
+        T relMs        = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
 
-        T sidechain = scHpf ? applySidechainHPF(input, channel) : input;
-        
-        T levelDb = (topo == Topology::FeedBack)
-            ? detectLevel(fbLastOutput_[channel], channel, detType)
-            : detectLevel(sidechain, channel, detType);
+        // The sidechain filter must process whatever the detector consumes:
+        // in FeedBack that is the previous compressed output, not the input.
+        T detectorIn = (topo == Topology::FeedBack) ? fbLastOutput_[channel] : input;
+        if (scHpf) detectorIn = applySidechainHPF(detectorIn, channel);
+
+        T levelDb = detectLevel(detectorIn, channel, detType);
 
         T targetGR_Db = computeGain(levelDb, thresh, ratio, knee, charType, modeType);
         targetGR_Db = applyHoldAndRange(targetGR_Db, channel);
@@ -223,12 +255,13 @@ public:
         T smoothedGainLinear = applyBallisticsLinear(targetGainLinear, channel, charType, relMs);
         T smoothedGR_Db = gainToDecibels(smoothedGainLinear);
 
-        autoMakeupEnv_ = smoothedGR_Db + autoMakeupCoeff_ * (autoMakeupEnv_ - smoothedGR_Db);
+        if (advanceShared)
+            autoMakeupEnv_ = smoothedGR_Db + autoMakeupCoeff_ * (autoMakeupEnv_ - smoothedGR_Db);
 
-        T makeup = makeupGain_.load(std::memory_order_relaxed);
+        T makeup = makeupDb;
         if (autoMkup && modeType == Mode::Downward)
             makeup += -autoMakeupEnv_;
-            
+
         T outputGain = smoothedGainLinear * decibelsToGain(makeup);
         T output = input * outputGain;
         
@@ -269,6 +302,8 @@ public:
         thresholdSmooth_.skip();
         ratioSmooth_.skip();
         kneeSmooth_.skip();
+        makeupSmooth_.skip();
+        mixSmooth_.skip();
     }
 
     // =========================================================================
@@ -284,8 +319,10 @@ public:
     /** @brief Sets the attack time in milliseconds. */
     void setAttack(T ms) noexcept { attackMs_.store(std::max(ms, T(0.01)), std::memory_order_relaxed); }
 
-    /** @brief Sets the release time in milliseconds. */
-    void setRelease(T ms) noexcept { releaseMs_.store(std::max(ms, T(0.01)), std::memory_order_relaxed); }
+    /** @brief Sets the release time in milliseconds (clamped to >= 1 ms: below
+     *  that the envelope stops smoothing at all and the gain path degenerates
+     *  into a waveshaper). */
+    void setRelease(T ms) noexcept { releaseMs_.store(std::max(ms, T(1)), std::memory_order_relaxed); }
 
     /** @brief Sets knee width in dB (0 = hard knee, >0 = soft knee). */
     void setKnee(T dB) noexcept { kneeWidth_.store(std::max(dB, T(0)), std::memory_order_relaxed); }
@@ -293,7 +330,15 @@ public:
     /** @brief Sets manual static makeup gain in dB. */
     void setMakeupGain(T dB) noexcept { makeupGain_.store(dB, std::memory_order_relaxed); }
 
-    /** @brief Toggles automatic volume compensation tracking. */
+    /**
+     * @brief Toggles adaptive loudness-matching makeup (default: off).
+     *
+     * This is NOT a static makeup: it continuously tracks the smoothed gain
+     * reduction (~300 ms) and compensates it in full, so the average output
+     * level stays matched to the input while transients are still tamed.
+     * Quiet passages are lifted accordingly (macro-dynamics are reduced).
+     * For a fixed offset use setMakeupGain().
+     */
     void setAutoMakeup(bool on) noexcept { autoMakeup_.store(on, std::memory_order_relaxed); }
 
     /** @brief Sets processing mode (Downward or Upward compression). */
@@ -434,7 +479,7 @@ public:
         setRelease(static_cast<T>(r.read("release", 100.0f)));
         setKnee(static_cast<T>(r.read("knee", 0.0f)));
         setMakeupGain(static_cast<T>(r.read("makeup", 0.0f)));
-        setAutoMakeup(r.read("autoMakeup", true));
+        setAutoMakeup(r.read("autoMakeup", false));
         setStereoLink(static_cast<T>(r.read("stereoLink", 1.0f)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
@@ -468,6 +513,8 @@ protected:
         thresholdSmooth_.setTargetValue(threshold_.load(std::memory_order_relaxed));
         ratioSmooth_.setTargetValue(std::max(ratio_.load(std::memory_order_relaxed), T(1)));
         kneeSmooth_.setTargetValue(std::max(kneeWidth_.load(std::memory_order_relaxed), T(0)));
+        makeupSmooth_.setTargetValue(makeupGain_.load(std::memory_order_relaxed));
+        mixSmooth_.setTargetValue(mix_.load(std::memory_order_relaxed));
 
         T fs = static_cast<T>(sampleRate_);
         if (fs > T(0)) updateTimeConstants(fs);
@@ -487,33 +534,35 @@ protected:
         auto modeType  = mode_.load(std::memory_order_relaxed);
         bool scHpf     = scHpfEnabled_.load(std::memory_order_relaxed);
         bool autoMkup  = autoMakeup_.load(std::memory_order_relaxed);
-        T mkupGain     = makeupGain_.load(std::memory_order_relaxed);
         T sLink        = stereoLink_.load(std::memory_order_relaxed);
-        T mixVal       = mix_.load(std::memory_order_relaxed);
-        T relMs        = std::max(releaseMs_.load(std::memory_order_relaxed), T(0.01));
+        T relMs        = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
 
         // Lookahead breaks causal logic in Feedback mode, so it is strictly disabled
         int activeLookahead = (topo == Topology::FeedBack) ? 0 : lookaheadSamples_;
 
         for (int i = 0; i < nS; ++i)
         {
-            T thresh = thresholdSmooth_.getNextValue();
-            T ratio  = ratioSmooth_.getNextValue();
-            T knee   = kneeSmooth_.getNextValue();
+            T thresh   = thresholdSmooth_.getNextValue();
+            T ratio    = ratioSmooth_.getNextValue();
+            T knee     = kneeSmooth_.getNextValue();
+            T mkupGain = makeupSmooth_.getNextValue();
+            T mixVal   = mixSmooth_.getNextValue();
             T linkedLevel = T(-200);
 
             // 1. Detection Path (Per-Channel)
             for (int ch = 0; ch < nCh; ++ch)
             {
                 // Fallback to internal channel if sidechain buffer lacks channels
-                T sample = (scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))[i] 
+                T sample = (scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))[i]
                                       : audio.getChannel(ch)[i];
 
-                if (scHpf) sample = applySidechainHPF(sample, ch);
+                // The sidechain filter must process whatever the detector
+                // consumes: in FeedBack that is the previous compressed
+                // output, not the external key.
+                T detectorIn = (topo == Topology::FeedBack) ? fbLastOutput_[ch] : sample;
+                if (scHpf) detectorIn = applySidechainHPF(detectorIn, ch);
 
-                T levelDb = (topo == Topology::FeedBack) 
-                    ? detectLevel(fbLastOutput_[ch], ch, detType)
-                    : detectLevel(sample, ch, detType);
+                T levelDb = detectLevel(detectorIn, ch, detType);
 
                 channelLevelDb_[ch] = levelDb;
                 if (levelDb > linkedLevel) linkedLevel = levelDb;
@@ -581,10 +630,16 @@ protected:
     void updateTimeConstants(T fs) noexcept
     {
         T attMs = std::max(attackMs_.load(std::memory_order_relaxed), T(0.01));
-        T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(0.01));
+        T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
         attackCoeff_  = std::exp(T(-1) / (fs * attMs / T(1000)));
         releaseCoeff_ = std::exp(T(-1) / (fs * relMs / T(1000)));
         autoMakeupCoeff_ = std::exp(T(-1) / (fs * T(0.3)));
+
+        // SplitPolarity detector ballistics. The time constants reproduce the
+        // original per-sample coefficients (0.6 attack / 0.99 release) at
+        // 44.1 kHz, but are now sample-rate invariant.
+        splitDetAttCoeff_ = std::exp(T(-1) / (fs * T(44.39e-6)));
+        splitDetRelCoeff_ = std::exp(T(-1) / (fs * T(2.2562e-3)));
 
         lookaheadSamples_ = static_cast<int>(fs * std::clamp(
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
@@ -680,8 +735,8 @@ protected:
                 T pos = std::max(sample, T(0));
                 T neg = std::max(-sample, T(0));
 
-                T posCoeff = (pos > splitPosEnv_[ch]) ? T(0.6) : T(0.99);
-                T negCoeff = (neg > splitNegEnv_[ch]) ? T(0.6) : T(0.99);
+                T posCoeff = (pos > splitPosEnv_[ch]) ? splitDetAttCoeff_ : splitDetRelCoeff_;
+                T negCoeff = (neg > splitNegEnv_[ch]) ? splitDetAttCoeff_ : splitDetRelCoeff_;
 
                 splitPosEnv_[ch] = pos + posCoeff * (splitPosEnv_[ch] - pos);
                 splitNegEnv_[ch] = neg + negCoeff * (splitNegEnv_[ch] - neg);
@@ -750,14 +805,19 @@ protected:
 
     /**
      * @brief Upward compression curve calculation.
+     *
+     * The boost fades to zero between 40 and 60 dB below the threshold:
+     * without that guard, pauses and the noise floor (which the detector
+     * reads at its -100 dB floor) would receive the largest boost of all.
      */
     [[nodiscard]] T computeGainUpward(T inputDb, T thresh, T ratio, T knee) const noexcept
     {
         T effectiveRatio = ratio;
+        T boost;
         if (knee <= T(0))
         {
             if (inputDb >= thresh) return T(0);
-            return (thresh - inputDb) * (T(1) - T(1) / effectiveRatio);
+            boost = (thresh - inputDb) * (T(1) - T(1) / effectiveRatio);
         }
         else
         {
@@ -766,11 +826,19 @@ protected:
             T upper = thresh + halfKnee;
 
             if (inputDb >= upper) return T(0);
-            if (inputDb <= lower) return (thresh - inputDb) * (T(1) - T(1) / effectiveRatio);
-
-            T x = upper - inputDb;
-            return (T(1) - T(1) / effectiveRatio) * x * x / (T(2) * knee);
+            if (inputDb <= lower)
+            {
+                boost = (thresh - inputDb) * (T(1) - T(1) / effectiveRatio);
+            }
+            else
+            {
+                T x = upper - inputDb;
+                boost = (T(1) - T(1) / effectiveRatio) * x * x / (T(2) * knee);
+            }
         }
+
+        const T silenceGuard = std::clamp((inputDb - (thresh - T(60))) / T(20), T(0), T(1));
+        return boost * silenceGuard;
     }
 
     // ---- Linear Domain Ballistics ----
@@ -791,9 +859,15 @@ protected:
         T effectiveRelCoeff = releaseCoeff_;
         if (detectorType_.load(std::memory_order_relaxed) == DetectorType::SplitPolarity)
         {
-            // Release speed dynamically reacts to output volume
-            T outputLevel = std::abs(fbLastOutput_[ch]);
-            effectiveRelCoeff = releaseCoeff_ / (T(1) + outputLevel);
+            // Release speed dynamically reacts to output volume: full-scale
+            // output halves the release time constant. Halving tau squares
+            // the one-pole coefficient, so blending between the two valid
+            // endpoints keeps the modulation on the exponential curve
+            // (scaling the coefficient itself would collapse tau to ~one
+            // sample and dump the envelope between waveform peaks).
+            T outputLevel = std::min(std::abs(fbLastOutput_[ch]), T(1));
+            T fastRelCoeff = releaseCoeff_ * releaseCoeff_;
+            effectiveRelCoeff = releaseCoeff_ + outputLevel * (fastRelCoeff - releaseCoeff_);
         }
 
         switch (charType)
@@ -937,8 +1011,8 @@ protected:
     std::atomic<T> makeupGain_ { T(0) };    ///< Static makeup gain in dB.
     std::atomic<T> stereoLink_ { T(1) };    ///< Stereo linking amount (0 to 1).
     std::atomic<T> mix_ { T(1) };           ///< Wet/Dry mix (1 = full wet).
-    std::atomic<T> lookaheadMs_ { T(0) };   ///< Lookahead latency target in ms.
-    std::atomic<bool> autoMakeup_ { true }; ///< Auto-gain compensation toggle.
+    std::atomic<T> lookaheadMs_ { T(0) };    ///< Lookahead latency target in ms.
+    std::atomic<bool> autoMakeup_ { false }; ///< Adaptive loudness-matching makeup toggle.
 
     std::atomic<DetectorType> detectorType_ { DetectorType::Peak }; ///< Selected detection method.
     std::atomic<Topology> topology_ { Topology::FeedForward };      ///< Selected topology.
@@ -954,6 +1028,8 @@ protected:
     SmoothedValue<T> thresholdSmooth_;  ///< De-zippered threshold.
     SmoothedValue<T> ratioSmooth_;      ///< De-zippered ratio.
     SmoothedValue<T> kneeSmooth_;       ///< De-zippered knee.
+    SmoothedValue<T> makeupSmooth_;     ///< De-zippered makeup gain (dB).
+    SmoothedValue<T> mixSmooth_;        ///< De-zippered parallel mix.
 
     std::array<T, kMaxChannels> envState_ {};       ///< Linear gain tracking per channel.
     std::array<T, kMaxChannels> fbLastOutput_ {};   ///< Feedback topology history buffer.
@@ -975,6 +1051,8 @@ protected:
     // Split-Polarity Detector State
     std::array<T, kMaxChannels> splitPosEnv_ {}; ///< Positive half-wave tracking.
     std::array<T, kMaxChannels> splitNegEnv_ {}; ///< Negative half-wave tracking.
+    T splitDetAttCoeff_ = T(0.6);  ///< Detector attack coefficient (sample-rate derived).
+    T splitDetRelCoeff_ = T(0.99); ///< Detector release coefficient (sample-rate derived).
 
     // RMS Detector
     T rmsWindowMs_ = T(10); ///< Active RMS length in ms (audio-thread copy).

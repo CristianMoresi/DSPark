@@ -1,0 +1,3 @@
+# Batch files must stay CRLF: cmd.exe misparses LF-only line endings
+# (with core.autocrlf=input a plain checkout would otherwise break them).
+*.bat text eol=crlf

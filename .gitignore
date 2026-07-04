@@ -93,3 +93,9 @@ Thumbs.db
 ehthumbs.db
 desktop.ini
 $RECYCLE.BIN/
+
+# Scripts
+*.bat
+*.ps1
+*.sh
+*.command

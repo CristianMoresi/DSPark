@@ -8,8 +8,12 @@
  * @brief Modular dynamic range compressor with analog-modeled ballistics and Hilbert detection.
  *
  * Professional compressor with interchangeable detector, topology, and
- * ballistics character. Operates with linear-domain smoothing for authentic
- * analog hardware emulation (Opto, FET, Varimu).
+ * ballistics character. Gain smoothing runs in the log (dB) domain: the
+ * transparent characters use a smoothed branching one-pole (the design
+ * recommended by Giannoulis/Massberg/Reiss, JAES 2012), and the analog
+ * characters (Opto, FET) run a dual-envelope model with compression-history
+ * memory that reproduces the two-stage program-dependent release of the
+ * hardware they are named after.
  *
  * Features:
  * - Zero-allocation audio thread processing.
@@ -81,13 +85,33 @@ public:
         FeedBack      ///< Detector reads compressed output (vintage, self-regulating, colored).
     };
 
-    /** @brief Time-constant behavior and release curve shape. */
+    /**
+     * @brief Time-constant behavior and release curve shape.
+     *
+     * All characters smooth the gain reduction in dB (log domain), so attack
+     * and release knobs read as the t63 time constant of the dB envelope.
+     */
     enum class Character
     {
-        Clean,    ///< Standard linear-domain RC smoothing. Transparent.
-        Opto,     ///< Program-dependent release (slower at higher gain reductions). Emulates LA-2A.
-        FET,      ///< Ultra-fast attack (<0.1ms) with dual-stage release tail. Emulates 1176.
-        Varimu    ///< Program-dependent ratio increasing dynamically with signal level. Emulates Fairchild.
+        Clean,    ///< Smoothed branching one-pole in the log domain (modern transparent
+                  ///< design): constant dB-per-second ballistics, knobs mean what they say.
+
+        Opto,     ///< T4 optical cell model (LA-2A lineage). Dual-envelope release WITH
+                  ///< memory: ~50% recovers in one release time, the rest decays up to
+                  ///< ~35x slower, and the slow tail only builds up after sustained
+                  ///< compression (brief peaks release fast, long squeeze hangs).
+                  ///< Attack has a 5 ms floor: a photocell cannot act faster.
+
+        FET,      ///< 1176 lineage. Always detects in FeedBack topology like the
+                  ///< hardware (the Topology setting is ignored and lookahead is
+                  ///< unavailable while selected). Attack clamps to the hardware range
+                  ///< 0.02-0.8 ms and release to 50-1100 ms; release is two-stage with
+                  ///< a program-dependent slow tail (~t63 at the knob value).
+
+        Varimu    ///< Variable-mu tube lineage (Fairchild). The effective ratio grows
+                  ///< with level above the threshold and the knee has a 10 dB floor
+                  ///< (a remote-cutoff tube cannot produce a hard corner). Log-domain
+                  ///< ballistics with the user's time constants.
     };
 
     /** @brief Processing direction. */
@@ -95,8 +119,9 @@ public:
     {
         Downward,  ///< Standard: Reduces dynamic range by attenuating signals above the threshold.
         Upward     ///< Upward: Reduces dynamic range by boosting signals below the threshold.
-                   ///< The boost fades out between 40 and 60 dB below the threshold so pauses
-                   ///< and the noise floor are not amplified; setRange() bounds the boost.
+                   ///< The boost fades out when the SUSTAINED level (peak-held, falling
+                   ///< 60 dB/s) drops 40 to 60 dB below the threshold, so pauses and the
+                   ///< noise floor are not amplified; setRange() bounds the boost.
     };
 
     // -- Lifecycle --------------------------------------------------------------
@@ -113,6 +138,7 @@ public:
 
         T fs = static_cast<T>(sampleRate_);
         updateTimeConstants(fs);
+        timeConstantsDirty_.store(false, std::memory_order_relaxed);
 
         // Smoothed parameters initialization
         T thresh = threshold_.load(std::memory_order_relaxed);
@@ -239,21 +265,39 @@ public:
         auto modeType  = mode_.load(std::memory_order_relaxed);
         bool scHpf     = scHpfEnabled_.load(std::memory_order_relaxed);
         bool autoMkup  = autoMakeup_.load(std::memory_order_relaxed);
-        T relMs        = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
+
+        if (timeConstantsDirty_.exchange(false, std::memory_order_acquire))
+        {
+            T fs = static_cast<T>(sampleRate_);
+            if (fs > T(0)) updateTimeConstants(fs);
+        }
+
+        // The FET character is a feedback design like the 1176 it models: it
+        // always detects on the compressed output, whatever Topology says.
+        const Topology topoEff = (charType == Character::FET) ? Topology::FeedBack : topo;
 
         // The sidechain filter must process whatever the detector consumes:
         // in FeedBack that is the previous compressed output, not the input.
-        T detectorIn = (topo == Topology::FeedBack) ? fbLastOutput_[channel] : input;
+        T detectorIn = (topoEff == Topology::FeedBack) ? fbLastOutput_[channel] : input;
         if (scHpf) detectorIn = applySidechainHPF(detectorIn, channel);
 
         T levelDb = detectLevel(detectorIn, channel, detType);
 
-        T targetGR_Db = computeGain(levelDb, thresh, ratio, knee, charType, modeType);
+        // Sustained-level guard envelope for Upward mode: instant rise,
+        // constant 60 dB/s fall (peak hold with linear decay).
+        T guardDb = levelDb;
+        if (modeType == Mode::Upward)
+        {
+            T& g = upwardGuardDb_[channel];
+            g = std::max(levelDb, g - upwardGuardDecay_);
+            guardDb = g;
+        }
+
+        T targetGR_Db = computeGain(levelDb, thresh, ratio, knee, charType, modeType, guardDb);
         targetGR_Db = applyHoldAndRange(targetGR_Db, channel);
 
-        T targetGainLinear = decibelsToGain(targetGR_Db);
-        T smoothedGainLinear = applyBallisticsLinear(targetGainLinear, channel, charType, relMs);
-        T smoothedGR_Db = gainToDecibels(smoothedGainLinear);
+        T smoothedGR_Db = applyBallistics(targetGR_Db, channel, charType);
+        T smoothedGainLinear = decibelsToGain(smoothedGR_Db);
 
         if (advanceShared)
             autoMakeupEnv_ = smoothedGR_Db + autoMakeupCoeff_ * (autoMakeupEnv_ - smoothedGR_Db);
@@ -277,7 +321,9 @@ public:
     {
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
-            envState_[ch] = T(1); // Linear gain neutral state is 1.0 (no compression)
+            envFastDb_[ch] = T(0); // 0 dB gain change = neutral
+            envSlowDb_[ch] = T(0);
+            upwardGuardDb_[ch] = T(-200);
             fbLastOutput_[ch] = T(0);
             scHpfState_[ch] = T(0);
             scHpfPrev_[ch] = T(0);
@@ -316,13 +362,33 @@ public:
     /** @brief Sets the compression ratio (1.0 = off, >20.0 = limiting). */
     void setRatio(T ratio) noexcept { ratio_.store(std::max(ratio, T(1)), std::memory_order_relaxed); }
 
-    /** @brief Sets the attack time in milliseconds. */
-    void setAttack(T ms) noexcept { attackMs_.store(std::max(ms, T(0.01)), std::memory_order_relaxed); }
+    /**
+     * @brief Sets the attack time in milliseconds.
+     *
+     * Reads as the t63 time constant of the gain-reduction envelope in dB.
+     * Character models clamp it to their hardware's physical range: Opto
+     * floors it at 5 ms (photocell lag), FET clamps it to 0.02-0.8 ms.
+     */
+    void setAttack(T ms) noexcept
+    {
+        attackMs_.store(std::max(ms, T(0.01)), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
 
-    /** @brief Sets the release time in milliseconds (clamped to >= 1 ms: below
+    /**
+     * @brief Sets the release time in milliseconds (clamped to >= 1 ms: below
      *  that the envelope stops smoothing at all and the gain path degenerates
-     *  into a waveshaper). */
-    void setRelease(T ms) noexcept { releaseMs_.store(std::max(ms, T(1)), std::memory_order_relaxed); }
+     *  into a waveshaper).
+     *
+     * Reads as the t63 time constant of the dB envelope for Clean/Varimu.
+     * For Opto it is the time to ~50% recovery (the slow memory tail extends
+     * up to ~35x longer); for FET it clamps to the 1176 range 50-1100 ms.
+     */
+    void setRelease(T ms) noexcept
+    {
+        releaseMs_.store(std::max(ms, T(1)), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
 
     /** @brief Sets knee width in dB (0 = hard knee, >0 = soft knee). */
     void setKnee(T dB) noexcept { kneeWidth_.store(std::max(dB, T(0)), std::memory_order_relaxed); }
@@ -354,7 +420,11 @@ public:
      * @brief Sets lookahead time in ms (0 = off, max = 10ms). 
      * @warning Automatically disabled internally if topology is set to FeedBack.
      */
-    void setLookahead(T ms) noexcept { lookaheadMs_.store(std::clamp(ms, T(0), T(10)), std::memory_order_relaxed); }
+    void setLookahead(T ms) noexcept
+    {
+        lookaheadMs_.store(std::clamp(ms, T(0), T(10)), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
 
     /** @brief Changes the level detection algorithm (Peak, RMS, TruePeak, Hilbert). */
     void setDetector(DetectorType type) noexcept
@@ -375,6 +445,7 @@ public:
     void setHoldTime(T ms) noexcept
     {
         holdMs_.store(std::clamp(ms, T(0), T(500)), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
     }
 
     /**
@@ -394,7 +465,11 @@ public:
     void setTopology(Topology topo) noexcept { topology_.store(topo, std::memory_order_relaxed); }
 
     /** @brief Changes ballistics and envelope behavior character. */
-    void setCharacter(Character type) noexcept { character_.store(type, std::memory_order_relaxed); }
+    void setCharacter(Character type) noexcept
+    {
+        character_.store(type, std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
 
     /**
      * @brief Toggles the internal sidechain high-pass filter.
@@ -516,8 +591,11 @@ protected:
         makeupSmooth_.setTargetValue(makeupGain_.load(std::memory_order_relaxed));
         mixSmooth_.setTargetValue(mix_.load(std::memory_order_relaxed));
 
-        T fs = static_cast<T>(sampleRate_);
-        if (fs > T(0)) updateTimeConstants(fs);
+        if (timeConstantsDirty_.exchange(false, std::memory_order_acquire))
+        {
+            T fs = static_cast<T>(sampleRate_);
+            if (fs > T(0)) updateTimeConstants(fs);
+        }
         updateHpfCoefficients();
 
         // Apply a pending RMS window change here, on the audio thread.
@@ -535,10 +613,13 @@ protected:
         bool scHpf     = scHpfEnabled_.load(std::memory_order_relaxed);
         bool autoMkup  = autoMakeup_.load(std::memory_order_relaxed);
         T sLink        = stereoLink_.load(std::memory_order_relaxed);
-        T relMs        = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
+
+        // The FET character is a feedback design like the 1176 it models: it
+        // always detects on the compressed output, whatever Topology says.
+        const Topology topoEff = (charType == Character::FET) ? Topology::FeedBack : topo;
 
         // Lookahead breaks causal logic in Feedback mode, so it is strictly disabled
-        int activeLookahead = (topo == Topology::FeedBack) ? 0 : lookaheadSamples_;
+        int activeLookahead = (topoEff == Topology::FeedBack) ? 0 : lookaheadSamples_;
 
         for (int i = 0; i < nS; ++i)
         {
@@ -559,7 +640,7 @@ protected:
                 // The sidechain filter must process whatever the detector
                 // consumes: in FeedBack that is the previous compressed
                 // output, not the external key.
-                T detectorIn = (topo == Topology::FeedBack) ? fbLastOutput_[ch] : sample;
+                T detectorIn = (topoEff == Topology::FeedBack) ? fbLastOutput_[ch] : sample;
                 if (scHpf) detectorIn = applySidechainHPF(detectorIn, ch);
 
                 T levelDb = detectLevel(detectorIn, ch, detType);
@@ -575,13 +656,22 @@ protected:
                 T chLevel = channelLevelDb_[ch];
                 T inputDb = chLevel + sLink * (linkedLevel - chLevel);
 
-                T targetGR_Db = computeGain(inputDb, thresh, ratio, knee, charType, modeType);
+                // Sustained-level guard envelope for Upward mode: instant
+                // rise, constant 60 dB/s fall (peak hold with linear decay).
+                T guardDb = inputDb;
+                if (modeType == Mode::Upward)
+                {
+                    T& g = upwardGuardDb_[ch];
+                    g = std::max(inputDb, g - upwardGuardDecay_);
+                    guardDb = g;
+                }
+
+                T targetGR_Db = computeGain(inputDb, thresh, ratio, knee, charType, modeType, guardDb);
                 targetGR_Db = applyHoldAndRange(targetGR_Db, ch);
 
-                // 3. Analog-Modeled Ballistics (Linear Gain Domain)
-                T targetGainLinear = decibelsToGain(targetGR_Db);
-                T smoothedGainLinear = applyBallisticsLinear(targetGainLinear, ch, charType, relMs);
-                T smoothedGR_Db = gainToDecibels(smoothedGainLinear);
+                // 3. Character ballistics (log domain)
+                T smoothedGR_Db = applyBallistics(targetGR_Db, ch, charType);
+                T smoothedGainLinear = decibelsToGain(smoothedGR_Db);
 
                 // 4. Makeup & Mix
                 T makeup = mkupGain;
@@ -631,15 +721,62 @@ protected:
     {
         T attMs = std::max(attackMs_.load(std::memory_order_relaxed), T(0.01));
         T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
-        attackCoeff_  = std::exp(T(-1) / (fs * attMs / T(1000)));
-        releaseCoeff_ = std::exp(T(-1) / (fs * relMs / T(1000)));
         autoMakeupCoeff_ = std::exp(T(-1) / (fs * T(0.3)));
+
+        // One-pole coefficient for a time constant given in milliseconds.
+        auto tc = [fs](T ms) { return std::exp(T(-1) / (fs * ms / T(1000))); };
+
+        // Character ballistics: time constants of the dB-domain envelopes.
+        switch (character_.load(std::memory_order_relaxed))
+        {
+            case Character::Clean:
+            case Character::Varimu:
+                charAttCoeff_     = tc(attMs);
+                charRelCoeff_     = tc(relMs);
+                charSlowRelCoeff_ = charRelCoeff_;
+                charChargeCoeff_  = charAttCoeff_;
+                charFastWeight_   = T(1); // single envelope
+                break;
+
+            case Character::Opto:
+                // T4 cell: the release knob is the ~50% recovery time. With a
+                // 0.6/0.4 fast/slow split, tau_fast = 0.61 x release puts the
+                // half-recovery point on the knob value while the memory tail
+                // decays ~35x slower, capped at the physical 5 s of the cell
+                // (LA-2A: ~50% in 40-60 ms, then 0.5-5 s). The slow stage
+                // charges over ~4 release times (capped at 2 s), so only
+                // sustained compression builds the long tail.
+                charAttCoeff_     = tc(std::max(attMs, T(5)));
+                charRelCoeff_     = tc(relMs * T(0.61));
+                charSlowRelCoeff_ = tc(std::min(relMs * T(25), T(5000)));
+                charChargeCoeff_  = tc(std::clamp(relMs * T(4), T(100), T(2000)));
+                charFastWeight_   = T(0.6);
+                break;
+
+            case Character::FET:
+            {
+                // 1176: knob ranges are 20-800 us attack and 50-1100 ms
+                // release. With a 0.75/0.25 split the compound release passes
+                // ~t63 at the knob value, and a 150 ms history charge gives
+                // the program-dependent tail.
+                const T rel = std::clamp(relMs, T(50), T(1100));
+                charAttCoeff_     = tc(std::clamp(attMs, T(0.02), T(0.8)));
+                charRelCoeff_     = tc(rel * T(0.7));
+                charSlowRelCoeff_ = tc(rel * T(2.5));
+                charChargeCoeff_  = tc(T(150));
+                charFastWeight_   = T(0.75);
+                break;
+            }
+        }
 
         // SplitPolarity detector ballistics. The time constants reproduce the
         // original per-sample coefficients (0.6 attack / 0.99 release) at
         // 44.1 kHz, but are now sample-rate invariant.
         splitDetAttCoeff_ = std::exp(T(-1) / (fs * T(44.39e-6)));
         splitDetRelCoeff_ = std::exp(T(-1) / (fs * T(2.2562e-3)));
+
+        // Upward silence-guard envelope: 60 dB/s linear decay.
+        upwardGuardDecay_ = T(60) / fs;
 
         lookaheadSamples_ = static_cast<int>(fs * std::clamp(
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
@@ -769,20 +906,29 @@ protected:
      * @param modeType Upward or Downward processing mode.
      * @return Target gain reduction in Decibels.
      */
-    [[nodiscard]] T computeGain(T inputDb, T thresh, T ratio, T knee, Character charType, Mode modeType) const noexcept
+    [[nodiscard]] T computeGain(T inputDb, T thresh, T ratio, T knee, Character charType, Mode modeType,
+                                T guardDb) const noexcept
     {
         if (modeType == Mode::Upward)
-            return computeGainUpward(inputDb, thresh, ratio, knee);
+            return computeGainUpward(inputDb, thresh, ratio, knee, guardDb);
 
         T effectiveRatio = ratio;
-        if (charType == Character::Varimu && inputDb > thresh)
+        T effectiveKnee = knee;
+        if (charType == Character::Varimu)
         {
-            // Ratio increases smoothly depending on depth of compression
-            T excess = inputDb - thresh;
-            effectiveRatio = ratio * (T(1) + excess / T(40));
+            // A remote-cutoff tube bends over its whole bias region: its
+            // transfer cannot form a hard corner, so the knee has a physical
+            // floor, and the effective ratio grows with level above the
+            // threshold (Fairchild-style progressive compression).
+            effectiveKnee = std::max(knee, T(10));
+            if (inputDb > thresh)
+            {
+                T excess = inputDb - thresh;
+                effectiveRatio = ratio * (T(1) + excess / T(40));
+            }
         }
 
-        if (knee <= T(0))
+        if (effectiveKnee <= T(0))
         {
             // Hard knee
             if (inputDb <= thresh) return T(0);
@@ -791,7 +937,7 @@ protected:
         else
         {
             // Soft knee interpolation
-            T halfKnee = knee / T(2);
+            T halfKnee = effectiveKnee / T(2);
             T lower = thresh - halfKnee;
             T upper = thresh + halfKnee;
 
@@ -799,18 +945,21 @@ protected:
             if (inputDb >= upper) return (thresh - inputDb) * (T(1) - T(1) / effectiveRatio);
 
             T x = inputDb - lower;
-            return (T(1) - T(1) / effectiveRatio) * x * x / (T(2) * knee) * T(-1);
+            return (T(1) - T(1) / effectiveRatio) * x * x / (T(2) * effectiveKnee) * T(-1);
         }
     }
 
     /**
      * @brief Upward compression curve calculation.
      *
-     * The boost fades to zero between 40 and 60 dB below the threshold:
-     * without that guard, pauses and the noise floor (which the detector
-     * reads at its -100 dB floor) would receive the largest boost of all.
+     * The boost fades to zero when guardDb falls 40 to 60 dB below the
+     * threshold: without that guard, pauses and the noise floor (which the
+     * detector reads at its -100 dB floor) would receive the largest boost
+     * of all. guardDb is the peak-held sustained level, NOT the instantaneous
+     * one: gating on the instantaneous level would punch boost holes at every
+     * zero crossing of the waveform.
      */
-    [[nodiscard]] T computeGainUpward(T inputDb, T thresh, T ratio, T knee) const noexcept
+    [[nodiscard]] T computeGainUpward(T inputDb, T thresh, T ratio, T knee, T guardDb) const noexcept
     {
         T effectiveRatio = ratio;
         T boost;
@@ -837,103 +986,61 @@ protected:
             }
         }
 
-        const T silenceGuard = std::clamp((inputDb - (thresh - T(60))) / T(20), T(0), T(1));
+        const T silenceGuard = std::clamp((guardDb - (thresh - T(60))) / T(20), T(0), T(1));
         return boost * silenceGuard;
     }
 
-    // ---- Linear Domain Ballistics ----
+    // ---- Ballistics (log domain) ----
 
     /**
-     * @brief Applies hardware-style Attack and Release times in the Linear Amplitude domain.
-     * @param targetGain The instantaneous calculated gain reduction (linear, 0.0 to 1.0).
+     * @brief Smooths the static gain target with the active character's ballistics.
+     *
+     * Operates on the gain change in dB. Clean/Varimu run a smoothed branching
+     * one-pole (attack while the gain moves away from unity, release while it
+     * recovers). Opto/FET blend a fast envelope with a slow one that charges
+     * with compression history, producing the two-stage program-dependent
+     * release of the modeled hardware: brief peaks release fast because the
+     * slow stage never charged, sustained compression leaves a long tail.
+     *
+     * @param targetGrDb Static gain change target in dB (negative = reduction).
      * @param ch Channel index.
      * @param charType Ballistics character style.
-     * @param relMs Release time parameter (used directly for Opto math).
-     * @return The smoothed, envelope-controlled linear gain to apply.
+     * @return The smoothed gain change in dB to apply.
      */
-    [[nodiscard]] T applyBallisticsLinear(T targetGain, int ch, Character charType, T relMs) noexcept
+    [[nodiscard]] T applyBallistics(T targetGrDb, int ch, Character charType) noexcept
     {
-        T& env = envState_[ch]; // Current state (linear gain)
-        T fs = static_cast<T>(sampleRate_);
-
-        T effectiveRelCoeff = releaseCoeff_;
+        // Level-adaptive release for the SplitPolarity detector: full-scale
+        // output halves the release time constant. Halving tau squares the
+        // one-pole coefficient, so blending between the two valid endpoints
+        // keeps the modulation on the exponential curve.
+        T relCoeff = charRelCoeff_;
         if (detectorType_.load(std::memory_order_relaxed) == DetectorType::SplitPolarity)
         {
-            // Release speed dynamically reacts to output volume: full-scale
-            // output halves the release time constant. Halving tau squares
-            // the one-pole coefficient, so blending between the two valid
-            // endpoints keeps the modulation on the exponential curve
-            // (scaling the coefficient itself would collapse tau to ~one
-            // sample and dump the envelope between waveform peaks).
-            T outputLevel = std::min(std::abs(fbLastOutput_[ch]), T(1));
-            T fastRelCoeff = releaseCoeff_ * releaseCoeff_;
-            effectiveRelCoeff = releaseCoeff_ + outputLevel * (fastRelCoeff - releaseCoeff_);
+            const T outputLevel = std::min(std::abs(fbLastOutput_[ch]), T(1));
+            relCoeff += outputLevel * (relCoeff * relCoeff - relCoeff);
         }
 
-        switch (charType)
-        {
-            case Character::Clean:
-            {
-                // Standard digital one-pole filter mapped to linear amplitude
-                T coeff = (targetGain < env) ? attackCoeff_ : effectiveRelCoeff;
-                env = targetGain + coeff * (env - targetGain);
-                break;
-            }
+        // Attack acts while the gain FALLS (louder signal: deeper reduction,
+        // or less upward boost); release acts while it recovers upward. A
+        // magnitude comparison would invert the two in Upward mode and make
+        // the envelope chase the huge boosts of the waveform's zero crossings.
+        T& fast = envFastDb_[ch];
+        const bool engaging = targetGrDb < fast;
+        fast = targetGrDb + (engaging ? charAttCoeff_ : relCoeff) * (fast - targetGrDb);
+        if (std::abs(fast) < T(1e-4)) fast = T(0); // kill the asymptotic dB tail
 
-            case Character::Opto:
-            {
-                T coeff;
-                if (targetGain < env)
-                {
-                    coeff = attackCoeff_;
-                }
-                else
-                {
-                    // Opto Memory Effect: Deep compression yields slower recovery
-                    T grDepth = T(1) - env;
-                    T relMultiplier = T(1) + grDepth * T(0.5);
-                    coeff = std::exp(T(-1) / (fs * (relMs * relMultiplier) / T(1000)));
-                }
-                env = targetGain + coeff * (env - targetGain);
-                break;
-            }
+        if (charFastWeight_ >= T(1)) // Clean / Varimu: single envelope
+            return fast;
 
-            case Character::FET:
-            {
-                if (targetGain < env)
-                {
-                    // Clamp attack to hardware minimums
-                    T attMs = attackMs_.load(std::memory_order_relaxed);
-                    T fetAttackMs = std::max(attMs, T(0.02));
-                    T aCoeff = std::exp(T(-1) / (fs * fetAttackMs / T(1000)));
-                    env = targetGain + aCoeff * (env - targetGain);
-                }
-                else
-                {
-                    // Dual-stage release: Initial snap-back is fast, tail is slow
-                    T fastRel = effectiveRelCoeff;
-                    T slowRel = std::exp(T(-1) / (fs * relMs * T(3) / T(1000)));
-                    T normalizedGR = std::min((T(1) - env) / decibelsToGain(T(-20)), T(1));
-                    T coeff = fastRel + (T(1) - normalizedGR) * (slowRel - fastRel);
-                    env = targetGain + coeff * (env - targetGain);
-                }
-                break;
-            }
+        // Opto / FET memory stage: charges toward the target over the history
+        // time constant and discharges with the slow release, so its level
+        // encodes how long (and how deep) the compressor has been working.
+        T& slow = envSlowDb_[ch];
+        const bool charging = targetGrDb < slow;
+        slow = targetGrDb + (charging ? charChargeCoeff_ : charSlowRelCoeff_) * (slow - targetGrDb);
+        if (std::abs(slow) < T(1e-4)) slow = T(0);
 
-            case Character::Varimu:
-            {
-                // Attack and release are both intrinsically bound to the time constants with non-linear mapping
-                T attMs = attackMs_.load(std::memory_order_relaxed);
-                T coeff;
-                if (targetGain < env)
-                    coeff = std::exp(T(-1) / (fs * attMs * T(1.5) / T(1000)));
-                else
-                    coeff = std::exp(T(-1) / (fs * relMs * T(2) / T(1000)));
-                env = targetGain + coeff * (env - targetGain);
-                break;
-            }
-        }
-        return env;
+        return charFastWeight_ * fast + (T(1) - charFastWeight_) * slow;
     }
 
     // ---- Sidechain HPF ----
@@ -1020,10 +1127,18 @@ protected:
     std::atomic<Mode> mode_ { Mode::Downward };                     ///< Selected compression mode.
 
     // Internal DSP Coefficients & State
-    T attackCoeff_ = T(0);              ///< Calculated exponential attack factor.
-    T releaseCoeff_ = T(0);             ///< Calculated exponential release factor.
     T autoMakeupCoeff_ = T(0.9995);     ///< Auto-makeup tracking factor.
     T autoMakeupEnv_ = T(0);            ///< Smoothed internal auto-makeup envelope.
+
+    // Character ballistics coefficients (dB-domain one-poles, see
+    // updateTimeConstants). charFastWeight_ == 1 selects the single-envelope
+    // path (Clean/Varimu); Opto/FET blend fast and slow memory envelopes.
+    std::atomic<bool> timeConstantsDirty_ { true }; ///< Coefficients need a recompute.
+    T charAttCoeff_     = T(0); ///< Attack coefficient of the fast envelope.
+    T charRelCoeff_     = T(0); ///< Release coefficient (fast stage).
+    T charSlowRelCoeff_ = T(0); ///< Release coefficient of the memory stage.
+    T charChargeCoeff_  = T(0); ///< History charge coefficient of the memory stage.
+    T charFastWeight_   = T(1); ///< Fast/slow blend (1 = single envelope).
 
     SmoothedValue<T> thresholdSmooth_;  ///< De-zippered threshold.
     SmoothedValue<T> ratioSmooth_;      ///< De-zippered ratio.
@@ -1031,7 +1146,10 @@ protected:
     SmoothedValue<T> makeupSmooth_;     ///< De-zippered makeup gain (dB).
     SmoothedValue<T> mixSmooth_;        ///< De-zippered parallel mix.
 
-    std::array<T, kMaxChannels> envState_ {};       ///< Linear gain tracking per channel.
+    std::array<T, kMaxChannels> envFastDb_ {};      ///< Fast gain envelope per channel (dB).
+    std::array<T, kMaxChannels> envSlowDb_ {};      ///< Slow memory envelope per channel (dB).
+    std::array<T, kMaxChannels> upwardGuardDb_ {};  ///< Peak-held sustained level (Upward guard).
+    T upwardGuardDecay_ = T(0.00125);               ///< Guard decay per sample (60 dB/s).
     std::array<T, kMaxChannels> fbLastOutput_ {};   ///< Feedback topology history buffer.
     std::array<T, kMaxChannels> channelLevelDb_ {}; ///< Raw detected level buffer.
 

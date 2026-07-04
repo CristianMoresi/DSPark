@@ -263,8 +263,11 @@ inline EffectSlot makeCompressor()
     s.addToggle("Auto Makeup", false);            // Default off so activating doesn't change level
     s.addSlider("Mix", 0, 1, 1, "");
     // Detector order MUST match dspark::Compressor::DetectorType enum.
-    // Enum: Peak=0, Rms=1, TruePeak=2, SplitPolarity=3
-    s.addChoice("Detector", {"Peak","RMS","TruePeak","SplitPolarity"}, 0);
+    // Enum: Peak=0, Rms=1, TruePeak=2, SplitPolarity=3, Hilbert=4
+    s.addChoice("Detector", {"Peak","RMS","TruePeak","SplitPolarity","Hilbert"}, 0);
+    // Character order MUST match dspark::Compressor::Character enum.
+    // Enum: Clean=0, Opto=1, FET=2, Varimu=3
+    s.addChoice("Character", {"Clean","Opto","FET","Varimu"}, 0);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -279,6 +282,7 @@ inline EffectSlot makeCompressor()
             case 6: p->setAutoMakeup(v > 0.5f); break;
             case 7: p->setMix(v); break;
             case 8: p->setDetector(static_cast<dspark::Compressor<float>::DetectorType>(static_cast<int>(v))); break;
+            case 9: p->setCharacter(static_cast<dspark::Compressor<float>::Character>(static_cast<int>(v))); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

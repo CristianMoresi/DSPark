@@ -260,7 +260,8 @@ inline EffectSlot makeCompressor()
     s.addSlider("Release", 10, 1000, 100, "ms");
     s.addSlider("Knee", 0, 30, 6, "dB");
     s.addSlider("Makeup", -12, 30, 0, "dB");
-    s.addToggle("Auto Makeup", false);            // Default off so activating doesn't change level
+    // Order MUST match dspark::Compressor::AutoMakeupMode (Off=0, Static=1, Adaptive=2).
+    s.addChoice("Auto Makeup", {"Off","Static","Adaptive"}, 0);
     s.addSlider("Mix", 0, 1, 1, "");
     // Detector order MUST match dspark::Compressor::DetectorType enum.
     // Enum: Peak=0, Rms=1, TruePeak=2, SplitPolarity=3, Hilbert=4
@@ -279,7 +280,7 @@ inline EffectSlot makeCompressor()
             case 3: p->setRelease(v); break;
             case 4: p->setKnee(v); break;
             case 5: p->setMakeupGain(v); break;
-            case 6: p->setAutoMakeup(v > 0.5f); break;
+            case 6: p->setAutoMakeup(static_cast<dspark::Compressor<float>::AutoMakeupMode>(static_cast<int>(v))); break;
             case 7: p->setMix(v); break;
             case 8: p->setDetector(static_cast<dspark::Compressor<float>::DetectorType>(static_cast<int>(v))); break;
             case 9: p->setCharacter(static_cast<dspark::Compressor<float>::Character>(static_cast<int>(v))); break;

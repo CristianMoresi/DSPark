@@ -56,6 +56,14 @@ namespace dspark {
  * smoothed to prevent audio artifacts. Processing is strictly allocation-free
  * after the initial prepare() call.
  *
+ * @note The gain path runs at the host rate on purpose: worst-case
+ *       gain-modulation aliasing measures <= -72 dBc (FET character at its
+ *       minimum attack), inaudible on real material. Products that oversample
+ *       a nonlinear section can wrap this compressor in that section like any
+ *       other stage with Core/Oversampling: one resampler for the whole
+ *       section instead of one per module (see docs/cookbook.md,
+ *       "Oversampling a nonlinear section").
+ *
  * @tparam T Floating-point sample type (float or double).
  */
 template <FloatType T>
@@ -72,10 +80,12 @@ public:
         TruePeak,       ///< 4x oversampled peak detection (ITU-R BS.1770-4 compliant).
         SplitPolarity,  ///< Asymmetric positive/negative half-wave tracking (ButterComp2 style).
         Hilbert         ///< Analytic-signal magnitude: ripple-free envelope (lowest THD on
-                        ///< sustained material). The 191-tap FIR adds ~95 samples (~2 ms at
-                        ///< 48 kHz) of detection delay that is NOT latency-compensated, so
-                        ///< fast transients are caught late. Prefer Peak/TruePeak for
-                        ///< transient control.
+                        ///< sustained material). The 191-tap FIR detects ~95 samples late,
+                        ///< so the audio path is delayed by the same amount to stay aligned
+                        ///< with the gain (transients are caught; the delay is reported by
+                        ///< getLatency()). Feedback operation keeps its loop causal, so the
+                        ///< alignment delay is disabled there; processSample() (documented
+                        ///< as lookahead-free) does not apply it either.
     };
 
     /** @brief Signal routing topology for the detector sidechain. */
@@ -124,6 +134,18 @@ public:
                    ///< noise floor are not amplified; setRange() bounds the boost.
     };
 
+    /** @brief Automatic makeup-gain behavior (applies in Downward mode). */
+    enum class AutoMakeupMode
+    {
+        Off,      ///< Manual makeup only (setMakeupGain).
+        Static,   ///< Textbook auto makeup: a constant offset equal to half the static
+                  ///< gain reduction of a 0 dBFS signal, derived from the (smoothed)
+                  ///< threshold/ratio/knee. No program dependence.
+        Adaptive  ///< Loudness matching: tracks the smoothed gain reduction (~300 ms)
+                  ///< and compensates it in full, keeping the average output level
+                  ///< matched to the input (quiet passages are lifted).
+    };
+
     // -- Lifecycle --------------------------------------------------------------
 
     /**
@@ -156,8 +178,11 @@ public:
         mixSmooth_.prepare(sampleRate_, 30.0);
         mixSmooth_.reset(mix_.load(std::memory_order_relaxed));
 
-        // Pre-allocate and initialize per-channel instances
-        int maxLaSamples = static_cast<int>(sampleRate_ * 0.01) + 1; 
+        // Pre-allocate and initialize per-channel instances. Capacity covers
+        // the 10 ms user lookahead plus the Hilbert detector's group delay
+        // (the audio is delayed by it to stay aligned with the envelope).
+        int maxLaSamples = static_cast<int>(sampleRate_ * 0.01) + 1
+                         + Hilbert<T>::getLatencySamples();
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
             if (ch < spec.numChannels)
@@ -264,7 +289,7 @@ public:
         auto charType  = character_.load(std::memory_order_relaxed);
         auto modeType  = mode_.load(std::memory_order_relaxed);
         bool scHpf     = scHpfEnabled_.load(std::memory_order_relaxed);
-        bool autoMkup  = autoMakeup_.load(std::memory_order_relaxed);
+        auto autoMkup  = autoMakeupMode_.load(std::memory_order_relaxed);
 
         if (timeConstantsDirty_.exchange(false, std::memory_order_acquire))
         {
@@ -303,8 +328,14 @@ public:
             autoMakeupEnv_ = smoothedGR_Db + autoMakeupCoeff_ * (autoMakeupEnv_ - smoothedGR_Db);
 
         T makeup = makeupDb;
-        if (autoMkup && modeType == Mode::Downward)
-            makeup += -autoMakeupEnv_;
+        if (modeType == Mode::Downward)
+        {
+            if (autoMkup == AutoMakeupMode::Adaptive)
+                makeup += -autoMakeupEnv_;
+            else if (autoMkup == AutoMakeupMode::Static)
+                makeup += computeGain(T(0), thresh, ratio, knee, charType,
+                                      Mode::Downward, T(0)) * T(-0.5);
+        }
 
         T outputGain = smoothedGainLinear * decibelsToGain(makeup);
         T output = input * outputGain;
@@ -397,15 +428,25 @@ public:
     void setMakeupGain(T dB) noexcept { makeupGain_.store(dB, std::memory_order_relaxed); }
 
     /**
-     * @brief Toggles adaptive loudness-matching makeup (default: off).
+     * @brief Selects the automatic makeup behavior (default: Off).
      *
-     * This is NOT a static makeup: it continuously tracks the smoothed gain
-     * reduction (~300 ms) and compensates it in full, so the average output
-     * level stays matched to the input while transients are still tamed.
-     * Quiet passages are lifted accordingly (macro-dynamics are reduced).
-     * For a fixed offset use setMakeupGain().
+     * Static is the textbook auto makeup: a constant, program-independent
+     * offset of half the static gain reduction of a full-scale signal.
+     * Adaptive is loudness matching: it tracks the smoothed gain reduction
+     * (~300 ms) and compensates it in full, so the average output level
+     * stays matched to the input and quiet passages are lifted accordingly
+     * (macro-dynamics are reduced). For a fixed offset use setMakeupGain().
      */
-    void setAutoMakeup(bool on) noexcept { autoMakeup_.store(on, std::memory_order_relaxed); }
+    void setAutoMakeup(AutoMakeupMode mode) noexcept
+    {
+        autoMakeupMode_.store(mode, std::memory_order_relaxed);
+    }
+
+    /** @brief Convenience overload: true selects Adaptive, false turns auto makeup off. */
+    void setAutoMakeup(bool on) noexcept
+    {
+        setAutoMakeup(on ? AutoMakeupMode::Adaptive : AutoMakeupMode::Off);
+    }
 
     /** @brief Sets processing mode (Downward or Upward compression). */
     void setMode(Mode mode) noexcept { mode_.store(mode, std::memory_order_relaxed); }
@@ -513,8 +554,31 @@ public:
     /** @brief Returns the currently active character. */
     [[nodiscard]] Character getCharacter() const noexcept { return character_.load(std::memory_order_relaxed); }
 
-    /** @brief Returns total processing latency in samples (caused by lookahead). */
-    [[nodiscard]] int getLatency() const noexcept { return lookaheadSamples_; }
+    /**
+     * @brief Returns total processing latency in samples.
+     *
+     * Lookahead plus the Hilbert detector's alignment delay when that
+     * detector is active. Feedback operation (Topology::FeedBack, or the
+     * FET character, which always detects in feedback) disables both, so
+     * latency is 0 there. The plugin layer re-reads this after parameter
+     * changes and re-notifies the host when it moves.
+     */
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        const bool feedback =
+            topology_.load(std::memory_order_relaxed) == Topology::FeedBack
+            || character_.load(std::memory_order_relaxed) == Character::FET;
+        if (feedback) return 0;
+        const int hilbertComp =
+            (detectorType_.load(std::memory_order_relaxed) == DetectorType::Hilbert)
+            ? Hilbert<T>::getLatencySamples() : 0;
+        // Derive the lookahead from the published parameter rather than the
+        // audio-thread cache: hosts re-read the latency right after a setter,
+        // before the next block has consumed the coefficient-update flag.
+        const int lookNow = static_cast<int>(static_cast<T>(sampleRate_) * std::clamp(
+            lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
+        return lookNow + hilbertComp;
+    }
 
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
@@ -527,7 +591,9 @@ public:
         w.write("release", releaseMs_.load(std::memory_order_relaxed));
         w.write("knee", kneeWidth_.load(std::memory_order_relaxed));
         w.write("makeup", makeupGain_.load(std::memory_order_relaxed));
-        w.write("autoMakeup", autoMakeup_.load(std::memory_order_relaxed));
+        const auto amMode = autoMakeupMode_.load(std::memory_order_relaxed);
+        w.write("autoMakeup", amMode != AutoMakeupMode::Off); // legacy bool key
+        w.write("autoMakeupMode", static_cast<int32_t>(amMode));
         w.write("stereoLink", stereoLink_.load(std::memory_order_relaxed));
         w.write("mix", mix_.load(std::memory_order_relaxed));
         w.write("lookahead", lookaheadMs_.load(std::memory_order_relaxed));
@@ -554,7 +620,10 @@ public:
         setRelease(static_cast<T>(r.read("release", 100.0f)));
         setKnee(static_cast<T>(r.read("knee", 0.0f)));
         setMakeupGain(static_cast<T>(r.read("makeup", 0.0f)));
-        setAutoMakeup(r.read("autoMakeup", false));
+        // The mode key wins; legacy blobs only carry the bool (true = Adaptive).
+        const int amLegacy = r.read("autoMakeup", false) ? 2 : 0;
+        setAutoMakeup(static_cast<AutoMakeupMode>(
+            std::clamp(r.read("autoMakeupMode", amLegacy), 0, 2)));
         setStereoLink(static_cast<T>(r.read("stereoLink", 1.0f)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
@@ -611,15 +680,22 @@ protected:
         auto charType  = character_.load(std::memory_order_relaxed);
         auto modeType  = mode_.load(std::memory_order_relaxed);
         bool scHpf     = scHpfEnabled_.load(std::memory_order_relaxed);
-        bool autoMkup  = autoMakeup_.load(std::memory_order_relaxed);
+        auto autoMkup  = autoMakeupMode_.load(std::memory_order_relaxed);
         T sLink        = stereoLink_.load(std::memory_order_relaxed);
 
         // The FET character is a feedback design like the 1176 it models: it
         // always detects on the compressed output, whatever Topology says.
         const Topology topoEff = (charType == Character::FET) ? Topology::FeedBack : topo;
 
-        // Lookahead breaks causal logic in Feedback mode, so it is strictly disabled
-        int activeLookahead = (topoEff == Topology::FeedBack) ? 0 : lookaheadSamples_;
+        // The Hilbert detector reports the envelope kCenter samples late;
+        // delaying the audio by the same amount re-aligns gain and signal.
+        const int hilbertComp = (detType == DetectorType::Hilbert)
+                              ? Hilbert<T>::getLatencySamples() : 0;
+
+        // Lookahead (and the Hilbert alignment delay) break causal logic in
+        // Feedback mode, so both are strictly disabled there.
+        int activeLookahead = (topoEff == Topology::FeedBack) ? 0
+                            : lookaheadSamples_ + hilbertComp;
 
         for (int i = 0; i < nS; ++i)
         {
@@ -629,6 +705,12 @@ protected:
             T mkupGain = makeupSmooth_.getNextValue();
             T mixVal   = mixSmooth_.getNextValue();
             T linkedLevel = T(-200);
+
+            // Static auto makeup follows the smoothed curve parameters, so it
+            // stays click-free through threshold/ratio/knee automation.
+            if (autoMkup == AutoMakeupMode::Static && modeType == Mode::Downward)
+                mkupGain += computeGain(T(0), thresh, ratio, knee, charType,
+                                        Mode::Downward, T(0)) * T(-0.5);
 
             // 1. Detection Path (Per-Channel)
             for (int ch = 0; ch < nCh; ++ch)
@@ -675,7 +757,7 @@ protected:
 
                 // 4. Makeup & Mix
                 T makeup = mkupGain;
-                if (autoMkup && modeType == Mode::Downward)
+                if (autoMkup == AutoMakeupMode::Adaptive && modeType == Mode::Downward)
                     makeup += -autoMakeupEnv_;
 
                 T outputGain = smoothedGainLinear * decibelsToGain(makeup);
@@ -1119,7 +1201,7 @@ protected:
     std::atomic<T> stereoLink_ { T(1) };    ///< Stereo linking amount (0 to 1).
     std::atomic<T> mix_ { T(1) };           ///< Wet/Dry mix (1 = full wet).
     std::atomic<T> lookaheadMs_ { T(0) };    ///< Lookahead latency target in ms.
-    std::atomic<bool> autoMakeup_ { false }; ///< Adaptive loudness-matching makeup toggle.
+    std::atomic<AutoMakeupMode> autoMakeupMode_ { AutoMakeupMode::Off }; ///< Auto-makeup behavior.
 
     std::atomic<DetectorType> detectorType_ { DetectorType::Peak }; ///< Selected detection method.
     std::atomic<Topology> topology_ { Topology::FeedForward };      ///< Selected topology.

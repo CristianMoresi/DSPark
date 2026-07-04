@@ -171,3 +171,36 @@ corr.processBlock(buffer);
 chords.processBlock(buffer);
 // corr.getCorrelation() in [-1, +1]; corr.getGonioPoints(...) -> vectorscope
 ```
+
+## 10. Oversampling a nonlinear section
+
+Oversampling belongs to the product, not to each module: wrap the whole
+nonlinear section once instead of paying one resampler (latency + CPU +
+band-limiting) per effect.
+
+```cpp
+Oversampling<float> os(4);         // factor 1, 2, 4, 8 or 16
+os.prepare(spec);
+
+// Stages inside the section are prepared at the oversampled rate. Time
+// constants are in milliseconds, so their behaviour does not change.
+AudioSpec spec4x { spec.sampleRate * 4, spec.maxBlockSize * 4, spec.numChannels };
+myShaper.prepare(spec4x);          // e.g. a hot custom waveshaper
+comp.prepare(spec4x);
+
+// callback:
+auto up = os.upsample(buffer);     // view at fs * factor
+myShaper.processBlock(up);
+comp.processBlock(up);
+os.downsample(buffer);             // back to host rate, band-limited
+
+// Report os.getLatency() (plus any in-section stage latency, scaled back
+// by the factor) as plugin latency.
+```
+
+Measure before reaching for this: DSPark's own nonlinear stages
+(Saturation, TapeMachine, Clipper) already oversample internally where the
+algorithm needs it, and the Compressor's gain path stays at or below
+-72 dBc of aliasing at 1x even in its worst case (FET character at minimum
+attack). A section like the one above earns its resampler when you drive
+custom waveshaping hard, not for dynamics alone.

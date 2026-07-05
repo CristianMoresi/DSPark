@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -17,7 +17,7 @@
  * 32-byte aligned memory allocation. Ensures SIMD padding is correctly zeroed 
  * to avoid denormal propagation during vectorized over-reads.
  *
- * Dependencies: C++20 standard library (<array>, <bit>, <cstddef>, <cstring>, <new>, <utility>).
+ * Dependencies: SimdOps.h and the C++20 standard library.
  */
 
 #include "SimdOps.h"
@@ -35,7 +35,7 @@
 namespace dspark {
 
 // ============================================================================
-// AudioBufferView — Non-owning view
+// AudioBufferView -- Non-owning view
 // ============================================================================
 
 /**
@@ -77,8 +77,11 @@ public:
 
     /**
      * @brief Converting constructor allowing mutable to const view conversions.
-     * * Enables passing AudioBufferView<float> to functions expecting AudioBufferView<const float>.
-     * * @tparam U Source sample type.
+     *
+     * Enables passing AudioBufferView<float> to functions expecting
+     * AudioBufferView<const float>.
+     *
+     * @tparam U Source sample type.
      * @param other The view to convert from.
      */
     template <typename U>
@@ -134,12 +137,12 @@ public:
     /** @brief Fills the valid sample range of all channels with zeros. */
     void clear() const noexcept
     {
-        if constexpr (!std::is_const_v<T>)
-        {
-            const auto bytes = static_cast<std::size_t>(numSamples_) * sizeof(T);
-            for (int ch = 0; ch < numChannels_; ++ch)
-                std::memset(channels_[ch], 0, bytes);
-        }
+        // A hard error, not a silent no-op: matching applyGain/copyFrom so a
+        // clear() on a read-only view can never be mistaken for a real one.
+        static_assert(!std::is_const_v<T>, "Cannot clear a const view");
+        const auto bytes = static_cast<std::size_t>(numSamples_) * sizeof(T);
+        for (int ch = 0; ch < numChannels_; ++ch)
+            std::memset(channels_[ch], 0, bytes);
     }
 
     /**
@@ -147,6 +150,7 @@ public:
      *
      * For same-type trivially-copyable samples the copy goes through
      * std::memmove, which is guaranteed safe even when the ranges overlap.
+     * Channel count and length are trimmed to the smaller of the two views.
      *
      * @tparam U Source sample type.
      * @tparam M Source view channel capacity (any capacity is accepted).
@@ -179,6 +183,11 @@ public:
 
     /**
      * @brief Adds samples from a source view into this view with optional gain.
+     *
+     * Channel count and length are trimmed to the smaller of the two views.
+     * Unlike copyFrom(), the source must NOT overlap this view: the mix goes
+     * through restrict-qualified SIMD kernels (see SimdOps.h).
+     *
      * @tparam U Source sample type.
      * @tparam M Source view channel capacity (any capacity is accepted).
      * @param src  Source view.
@@ -224,12 +233,16 @@ public:
      * @brief Returns the peak absolute sample value across all channels.
      * @return Peak magnitude (>= 0).
      */
-    [[nodiscard]] T getPeakLevel() const noexcept
+    [[nodiscard]] std::remove_const_t<T> getPeakLevel() const noexcept
     {
-        T peak = T(0);
+        // remove_const keeps the accumulator (and the returned value)
+        // assignable when T is a const sample type: this read-only query
+        // must work on read-only views.
+        using Value = std::remove_const_t<T>;
+        Value peak = Value(0);
         for (int ch = 0; ch < numChannels_; ++ch)
         {
-            const T chPeak = simd::peakLevel(channels_[ch], numSamples_);
+            const Value chPeak = simd::peakLevel(channels_[ch], numSamples_);
             if (chPeak > peak) peak = chPeak;
         }
         return peak;
@@ -241,8 +254,15 @@ private:
     int numSamples_  = 0;
 };
 
+// The view is part of the hot-path calling convention: it must stay cheap to
+// copy by value. Guard the promise made in the file header.
+static_assert(std::is_trivially_copyable_v<AudioBufferView<float>>,
+              "AudioBufferView must remain trivially copyable");
+static_assert(std::is_trivially_copyable_v<AudioBufferView<const float>>,
+              "AudioBufferView must remain trivially copyable");
+
 // ============================================================================
-// AudioBuffer — Owning, SIMD-aligned buffer
+// AudioBuffer -- Owning, SIMD-aligned buffer
 // ============================================================================
 
 /**
@@ -257,6 +277,8 @@ class AudioBuffer
 {
     static constexpr std::size_t kAlignment = 32;
     static_assert(std::has_single_bit(kAlignment), "Alignment must be a power of two");
+    static_assert(std::is_same_v<T, std::remove_cv_t<T>> && std::is_trivially_copyable_v<T>,
+                  "AudioBuffer requires a non-const, trivially copyable sample type");
 
 public:
     AudioBuffer() = default;
@@ -296,6 +318,11 @@ public:
 
     /**
      * @brief Allocates the buffer for the given dimensions.
+     *
+     * Existing contents are NOT preserved: the buffer (including its SIMD
+     * padding) is zeroed after every call. Memory is only re-allocated when
+     * the request exceeds the current capacity; shrinking reuses it. May
+     * throw std::bad_alloc; the buffer stays coherent and reusable after.
      *
      * @param numChannels Number of active channels (must be <= MaxChannels).
      * @param numSamples  Number of audio samples per channel.
@@ -383,6 +410,9 @@ public:
      */
     void clear() noexcept
     {
+        // Degenerate sizes (0 samples or 0 channels) own no storage at all;
+        // memset on a null pointer is undefined even with a zero length.
+        if (rawData_ == nullptr) return;
         for (int ch = 0; ch < numChannels_; ++ch)
             std::memset(channelPtrs_[ch], 0, strideBytes_);
     }
@@ -400,6 +430,11 @@ private:
             ::operator delete(rawData_, std::align_val_t(kAlignment));
             rawData_ = nullptr;
         }
+        // Keep the capacity coherent with the (now absent) allocation. If
+        // resize()'s operator new throws after this call, a stale capacity
+        // would make a later, smaller resize() skip its allocation and build
+        // channel pointers over a null base.
+        allocatedBytes_ = 0;
     }
 
     T* rawData_        = nullptr;

@@ -22,7 +22,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: "Windows MSVC x64",   os: windows-latest,   compiler: msvc  }
+          - { name: "Windows MSVC x64",   os: windows-latest,   compiler: msvc, msvc_arch: x64 }
+          # Native Windows-on-ARM: the one target where MSVC compiles the
+          # NEON kernel paths (its arm64_neon.h, not the GCC/Clang one).
+          - { name: "Windows MSVC arm64", os: windows-11-arm,   compiler: msvc, msvc_arch: arm64 }
           - { name: "Linux GCC x64",      os: ubuntu-latest,    compiler: g++   }
           - { name: "Linux Clang x64",    os: ubuntu-latest,    compiler: clang++ }
           - { name: "Linux GCC arm64",    os: ubuntu-24.04-arm, compiler: g++   }
@@ -34,7 +37,7 @@ jobs:
         if: matrix.compiler == 'msvc'
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: x64
+          arch: ${{ matrix.msvc_arch }}
 
       - name: Build (MSVC)
         if: matrix.compiler == 'msvc'
@@ -49,8 +52,24 @@ jobs:
         shell: bash
         run: ./dspark_conformance*
 
+      # Default x64 builds stay on the SSE2 baseline, so the AVX2/FMA kernel
+      # paths would never execute in CI without a second pass. All GitHub
+      # hosted x64 runners provide AVX2.
+      - name: Build + run conformance on the AVX2/FMA paths (MSVC)
+        if: matrix.name == 'Windows MSVC x64'
+        shell: cmd
+        run: |
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /arch:AVX2 /I . conformance\dspark_conformance.cpp /Fe:dspark_conformance_avx2.exe
+          dspark_conformance_avx2.exe
+
+      - name: Build + run conformance on the AVX2/FMA paths (GCC/Clang)
+        if: matrix.name == 'Linux GCC x64' || matrix.name == 'Linux Clang x64'
+        run: |
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -march=x86-64-v3 -I . conformance/dspark_conformance.cpp -o dspark_conformance_avx2
+          ./dspark_conformance_avx2
+
       - name: Build example plugin (VST3+CLAP) + smoke hosts (MSVC)
-        if: matrix.compiler == 'msvc'
+        if: matrix.name == 'Windows MSVC x64'
         shell: cmd
         run: |
           cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_saturator\saturator.cpp /Fe:DSParkSaturator.vst3
@@ -320,6 +339,15 @@ jobs:
           conformance/dspark_conformance.cpp -o dspark_conformance.js
       - name: Run with node
         run: node dspark_conformance.js
+      # Second pass with Wasm SIMD128: Emscripten lowers the SSE2 intrinsic
+      # paths of SimdOps to v128 when built with -msimd128 -msse2.
+      - name: Build (Wasm SIMD128 through the SSE2 mapping)
+        run: >
+          em++ -std=c++20 -O2 -I . -msimd128 -msse2
+          -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB
+          conformance/dspark_conformance.cpp -o dspark_conformance_simd.js
+      - name: Run with node (SIMD128)
+        run: node dspark_conformance_simd.js
 
   # ---------------------------------------------------------------------------
   # Embedded profile: -fno-exceptions -fno-rtti, no file IO
@@ -398,6 +426,12 @@ jobs:
         run: |
           g++ -std=c++20 -O2 -Wall -Wextra -I . bench/dspark_bench.cpp -o dspark_bench
           ./dspark_bench
+      - name: AVX2-without-FMA build check (FMA gating regression)
+        run: |
+          # -mavx2 alone must build: DSPARK_SIMD_FMA may only engage together
+          # with the fma target feature (or under MSVC, which permits the FMA
+          # intrinsics with /arch:AVX2). GCC hard-errors if this regresses.
+          g++ -std=c++20 -O1 -mavx2 -c -I . conformance/dspark_conformance.cpp -o /dev/null
 
   # ---------------------------------------------------------------------------
   # EBU R128 conformance against the official EBU loudness test set

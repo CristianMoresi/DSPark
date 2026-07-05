@@ -3,6 +3,8 @@
 //
 // This is the PUBLIC quality gate that runs in CI on every platform:
 //
+//   [simd]    every SimdOps kernel against a scalar reference on the SIMD
+//             path that is active for the build (SSE2/AVX/NEON/Wasm/scalar)
 //   [smoke]   every effect: prepare → process → finite output → silent tail
 //   [pdc]     null tests: latency-reporting processors cancel against a
 //             delay-compensated dry path
@@ -31,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -142,6 +145,147 @@ bool smokeRun(const std::function<void(dspark::AudioBufferView<float>)>& process
     // at signal level or blowing up. Generators keep producing on silence by
     // design, so only the finiteness checks apply to them.
     return isGenerator || tailRms < 0.25;
+}
+
+// -----------------------------------------------------------------------------
+// [simd] — every SimdOps kernel against a scalar reference. Counts cover
+// empty, sub-vector, vector-boundary and unrolled-loop sizes, so both the
+// SIMD body and the scalar tail of every kernel run on the active path.
+// -----------------------------------------------------------------------------
+
+template <typename T>
+void checkSimdKernels(bool& elementwise, bool& reductions, bool& cma, bool& ramps)
+{
+    // Deterministic LCG so every platform checks identical data.
+    uint32_t seed = sizeof(T) == 4 ? 0x5EEDC0DEu : 0xC0DE5EEDu;
+    auto next = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<T>(static_cast<int>((seed >> 16) & 0x7FFFu)) / static_cast<T>(16384)
+             - static_cast<T>(1);
+    };
+    const double tolE = sizeof(T) == 4 ? 1e-5 : 1e-13; // element-wise (admits fused FMA)
+    const double tolR = sizeof(T) == 4 ? 5e-4 : 1e-11; // accumulating kernels
+
+    constexpr int kMax = 257;
+    T srcA[kMax + 1], srcB[kMax + 1], dst[kMax + 1], ref[kMax + 1], out[kMax + 1], outRef[kMax + 1];
+
+    for (int count : { 0, 1, 2, 3, 4, 5, 7, 8, 9, 16, 17, 31, 33, 64, 65, 100, 257 })
+    {
+        for (int i = 0; i <= kMax; ++i)
+        {
+            srcA[i] = next(); srcB[i] = next(); dst[i] = next();
+            ref[i] = dst[i];  out[i] = static_cast<T>(77);
+        }
+
+        // Element-wise kernels, chained so one pass covers all of them.
+        dspark::simd::addWithGain(dst, srcA, static_cast<T>(0.7), count);
+        dspark::simd::applyGain(dst, static_cast<T>(0.5), count);
+        dspark::simd::add(dst, srcB, count);
+        for (int i = 0; i < count; ++i)
+            ref[i] = (ref[i] + srcA[i] * static_cast<T>(0.7)) * static_cast<T>(0.5) + srcB[i];
+        for (int i = 0; i < count; ++i)
+            if (std::abs(static_cast<double>(dst[i]) - static_cast<double>(ref[i])) > tolE) elementwise = false;
+        if (dst[count] != ref[count]) elementwise = false; // past-the-end untouched
+
+        dspark::simd::multiply(out, srcA, srcB, count);
+        for (int i = 0; i < count; ++i)
+            if (std::abs(static_cast<double>(out[i])
+                       - static_cast<double>(srcA[i]) * static_cast<double>(srcB[i])) > tolE) elementwise = false;
+        if (out[count] != static_cast<T>(77)) elementwise = false;
+        dspark::simd::copyWithGain(out, srcA, static_cast<T>(-1.25), count);
+        for (int i = 0; i < count; ++i)
+            if (std::abs(static_cast<double>(out[i])
+                       - static_cast<double>(srcA[i]) * -1.25) > tolE) elementwise = false;
+
+        // Reductions. peakLevel is rounding-free, so the match is exact.
+        T refPeak = static_cast<T>(0);
+        double refDot = 0.0, refSos = 0.0;
+        for (int i = 0; i < count; ++i)
+        {
+            const T v = srcA[i] < static_cast<T>(0) ? -srcA[i] : srcA[i];
+            if (v > refPeak) refPeak = v;
+            refDot += static_cast<double>(srcA[i]) * static_cast<double>(srcB[i]);
+            refSos += static_cast<double>(srcA[i]) * static_cast<double>(srcA[i]);
+        }
+        if (dspark::simd::peakLevel(srcA, count) != refPeak) reductions = false;
+        if (std::abs(static_cast<double>(dspark::simd::dotProduct(srcA, srcB, count)) - refDot) > tolR)
+            reductions = false;
+        if (std::abs(static_cast<double>(dspark::simd::sumOfSquares(srcA, count)) - refSos) > tolR)
+            reductions = false;
+
+        // Complex multiply-accumulate over interleaved [re, im] spectra.
+        const int bins = count < 129 ? count : 128;
+        for (int i = 0; i <= kMax; ++i) { dst[i] = next(); ref[i] = dst[i]; }
+        dspark::simd::complexMulAccum(dst, srcA, srcB, bins);
+        for (int k = 0; k < bins; ++k)
+        {
+            const double re = static_cast<double>(ref[2 * k])
+                            + static_cast<double>(srcA[2 * k]) * static_cast<double>(srcB[2 * k])
+                            - static_cast<double>(srcA[2 * k + 1]) * static_cast<double>(srcB[2 * k + 1]);
+            const double im = static_cast<double>(ref[2 * k + 1])
+                            + static_cast<double>(srcA[2 * k]) * static_cast<double>(srcB[2 * k + 1])
+                            + static_cast<double>(srcA[2 * k + 1]) * static_cast<double>(srcB[2 * k]);
+            if (std::abs(static_cast<double>(dst[2 * k]) - re) > tolR)     cma = false;
+            if (std::abs(static_cast<double>(dst[2 * k + 1]) - im) > tolR) cma = false;
+        }
+        if (2 * bins <= kMax && dst[2 * bins] != ref[2 * bins]) cma = false;
+
+        // Linear gain ramps (block-contiguous convention).
+        const T gs = static_cast<T>(0.25), ge = static_cast<T>(1.75);
+        for (int i = 0; i <= kMax; ++i)
+        {
+            dst[i] = next(); ref[i] = dst[i];
+            out[i] = next(); outRef[i] = out[i];
+        }
+        dspark::simd::applyGainRamp(dst, gs, ge, count);
+        dspark::simd::addWithGainRamp(out, srcA, gs, ge, count);
+        if (count > 0)
+        {
+            const T step = (ge - gs) / static_cast<T>(count);
+            for (int i = 0; i < count; ++i)
+            {
+                const T g = gs + step * static_cast<T>(i);
+                ref[i]    *= g;
+                outRef[i] += srcA[i] * g;
+            }
+        }
+        for (int i = 0; i < count; ++i)
+        {
+            if (std::abs(static_cast<double>(dst[i]) - static_cast<double>(ref[i])) > tolR)    ramps = false;
+            if (std::abs(static_cast<double>(out[i]) - static_cast<double>(outRef[i])) > tolR) ramps = false;
+        }
+        if (dst[count] != ref[count] || out[count] != outRef[count]) ramps = false;
+    }
+}
+
+template <typename T>
+bool simdPeakLevelIgnoresNan()
+{
+    const T nan = std::numeric_limits<T>::quiet_NaN();
+    T buf[33];
+    for (int i = 0; i < 33; ++i)
+        buf[i] = static_cast<T>(0.01) * static_cast<T>(i % 7) - static_cast<T>(0.02);
+    buf[4]  = static_cast<T>(-1.5); // true peak, seen BEFORE the first NaN
+    buf[6]  = nan;
+    buf[19] = nan;
+    buf[32] = nan;                  // scalar-tail NaN
+    if (!(dspark::simd::peakLevel(buf, 33) == static_cast<T>(1.5))) return false;
+    buf[0]  = nan;                  // NaN before any finite sample
+    buf[10] = static_cast<T>(2.5);  // a larger peak AFTER a NaN must be seen
+    return dspark::simd::peakLevel(buf, 33) == static_cast<T>(2.5);
+}
+
+void runSimdKernelTests()
+{
+    bool elementwise = true, reductions = true, cma = true, ramps = true;
+    checkSimdKernels<float>(elementwise, reductions, cma, ramps);
+    checkSimdKernels<double>(elementwise, reductions, cma, ramps);
+    check(elementwise, "simd", "element-wise kernels match the scalar reference");
+    check(reductions,  "simd", "reduction kernels match the scalar reference");
+    check(cma,         "simd", "complex multiply-accumulate matches the scalar reference");
+    check(ramps,       "simd", "gain ramp kernels match the scalar reference");
+    check(simdPeakLevelIgnoresNan<float>() && simdPeakLevelIgnoresNan<double>(),
+          "simd", "peakLevel ignores NaN samples");
 }
 
 // -----------------------------------------------------------------------------
@@ -1396,6 +1540,7 @@ int main(int argc, char** argv)
     std::printf("DSPark public conformance suite\n");
     std::printf("================================\n\n");
 
+    runSimdKernelTests();
     runSmokeTests();
     runPdcNullTests();
     runMetricTests();

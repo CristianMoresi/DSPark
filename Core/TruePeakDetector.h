@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -17,12 +17,15 @@
  * (Compressor, Limiter, LoudnessMeter), so the filter design exists in exactly
  * one place.
  *
- * Dependencies: DspMath.h.
+ * Dependencies: DspMath.h, SimdOps.h.
  */
 
 #include "DspMath.h"
+#include "SimdOps.h"
 
+#include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 
 namespace dspark {
@@ -64,26 +67,30 @@ public:
      */
     [[nodiscard]] T processSample(T sample, int channel) noexcept
     {
-        if (channel < 0 || channel >= MaxChannels) channel = 0;
+        assert(channel >= 0 && channel < MaxChannels);
+        // Release-safe clamp to the nearest valid channel. (Redirecting an
+        // out-of-range index to channel 0 would corrupt that channel's
+        // history with a foreign stream.)
+        channel = std::clamp(channel, 0, MaxChannels - 1);
         auto& tp = states_[static_cast<size_t>(channel)];
 
-        tp.history[tp.writePos] = sample;
+        // Mirrored write: every sample lands at writePos and writePos + 16,
+        // so the latest 12-tap window is always contiguous in memory and each
+        // phase collapses to one linear dot product (SIMD) instead of a
+        // masked ring walk per tap.
+        tp.history[static_cast<size_t>(tp.writePos)] = sample;
+        tp.history[static_cast<size_t>(tp.writePos + kHistSize)] = sample;
+        const int newest = tp.writePos;
         tp.writePos = (tp.writePos + 1) & kHistMask;
 
-        const auto& coeffs = phaseCoeffs();
+        // Window holding x[n-11] .. x[n] in forward (oldest-first) order.
+        const T* window = &tp.history[static_cast<size_t>(newest + kHistSize - (kTaps - 1))];
 
         T peak = std::abs(sample);
-        const int newest = (tp.writePos - 1) & kHistMask;
-
         for (int phase = 0; phase < kPhases; ++phase)
         {
-            T interp = T(0);
-            int idx = newest;
-            for (int k = 0; k < kTaps; ++k)
-            {
-                interp += tp.history[idx] * coeffs[static_cast<size_t>(phase)][static_cast<size_t>(k)];
-                idx = (idx - 1) & kHistMask;
-            }
+            const T interp = simd::dotProduct(
+                kReversedCoeffs[static_cast<size_t>(phase)].data(), window, kTaps);
             const T a = std::abs(interp);
             if (a > peak) peak = a;
         }
@@ -96,12 +103,14 @@ public:
 private:
     static constexpr int kTaps     = 12;  ///< Taps per polyphase branch.
     static constexpr int kPhases   = 4;   ///< Interpolation phases (4x oversampling).
-    static constexpr int kHistSize = 16;  ///< Power-of-two history per channel.
+    static constexpr int kHistSize = 16;  ///< Power-of-two ring length per channel.
     static constexpr int kHistMask = kHistSize - 1;
 
     struct State
     {
-        T history[kHistSize] = {};
+        /// Mirrored ring (2x length): sample i is stored at i and i + 16 so
+        /// any 12-sample window ending inside the ring reads contiguously.
+        T history[kHistSize * 2] = {};
         int writePos = 0;
     };
 
@@ -109,40 +118,46 @@ private:
      *
      * Verbatim from the Annex 2 table ("one set of filter coefficients (for
      * the order 48, 4-phase, FIR interpolating) that would satisfy the
-     * requirements"). Each row k of phase p is h[4k+p] of the symmetric
-     * 48-tap low-pass and multiplies x[n-k] (k growing into the past). */
-    [[nodiscard]] static const std::array<std::array<T, kTaps>, kPhases>& phaseCoeffs() noexcept
+     * requirements"). Row k of phase p is h[4k+p] of the symmetric 48-tap
+     * low-pass and multiplies x[n-k] (k growing into the past).
+     *
+     * Stored with each row REVERSED so the convolution runs as a forward
+     * dot product over the oldest-first contiguous window:
+     * sum_j window[j] * row[j] with window[j] = x[n-11+j]. */
+    [[nodiscard]] static constexpr std::array<std::array<T, kTaps>, kPhases>
+    buildReversedPhaseTable() noexcept
     {
-        static const std::array<std::array<T, kTaps>, kPhases> table = []
-        {
-            static constexpr double kAnnex2[kPhases][kTaps] = {
-                {  0.0017089843750,  0.0109863281250, -0.0196533203125,
-                   0.0332031250000, -0.0594482421875,  0.1373291015625,
-                   0.9721679687500, -0.1022949218750,  0.0476074218750,
-                  -0.0266113281250,  0.0148925781250, -0.0083007812500 },
-                { -0.0291748046875,  0.0292968750000, -0.0517578125000,
-                   0.0891113281250, -0.1665039062500,  0.4650878906250,
-                   0.7797851562500, -0.2003173828125,  0.1015625000000,
-                  -0.0582275390625,  0.0330810546875, -0.0189208984375 },
-                { -0.0189208984375,  0.0330810546875, -0.0582275390625,
-                   0.1015625000000, -0.2003173828125,  0.7797851562500,
-                   0.4650878906250, -0.1665039062500,  0.0891113281250,
-                  -0.0517578125000,  0.0292968750000, -0.0291748046875 },
-                { -0.0083007812500,  0.0148925781250, -0.0266113281250,
-                   0.0476074218750, -0.1022949218750,  0.9721679687500,
-                   0.1373291015625, -0.0594482421875,  0.0332031250000,
-                  -0.0196533203125,  0.0109863281250,  0.0017089843750 },
-            };
+        constexpr double kAnnex2[kPhases][kTaps] = {
+            {  0.0017089843750,  0.0109863281250, -0.0196533203125,
+               0.0332031250000, -0.0594482421875,  0.1373291015625,
+               0.9721679687500, -0.1022949218750,  0.0476074218750,
+              -0.0266113281250,  0.0148925781250, -0.0083007812500 },
+            { -0.0291748046875,  0.0292968750000, -0.0517578125000,
+               0.0891113281250, -0.1665039062500,  0.4650878906250,
+               0.7797851562500, -0.2003173828125,  0.1015625000000,
+              -0.0582275390625,  0.0330810546875, -0.0189208984375 },
+            { -0.0189208984375,  0.0330810546875, -0.0582275390625,
+               0.1015625000000, -0.2003173828125,  0.7797851562500,
+               0.4650878906250, -0.1665039062500,  0.0891113281250,
+              -0.0517578125000,  0.0292968750000, -0.0291748046875 },
+            { -0.0083007812500,  0.0148925781250, -0.0266113281250,
+               0.0476074218750, -0.1022949218750,  0.9721679687500,
+               0.1373291015625, -0.0594482421875,  0.0332031250000,
+              -0.0196533203125,  0.0109863281250,  0.0017089843750 },
+        };
 
-            std::array<std::array<T, kTaps>, kPhases> result {};
-            for (int phase = 0; phase < kPhases; ++phase)
-                for (int k = 0; k < kTaps; ++k)
-                    result[static_cast<size_t>(phase)][static_cast<size_t>(k)]
-                        = static_cast<T>(kAnnex2[phase][k]);
-            return result;
-        }();
-        return table;
+        std::array<std::array<T, kTaps>, kPhases> result {};
+        for (int phase = 0; phase < kPhases; ++phase)
+            for (int k = 0; k < kTaps; ++k)
+                result[static_cast<size_t>(phase)][static_cast<size_t>(kTaps - 1 - k)]
+                    = static_cast<T>(kAnnex2[phase][k]);
+        return result;
     }
+
+    /// Compile-time table in read-only storage: no magic-static guard on the
+    /// audio thread, nothing to initialise at run time.
+    static constexpr std::array<std::array<T, kTaps>, kPhases> kReversedCoeffs =
+        buildReversedPhaseTable();
 
     std::array<State, MaxChannels> states_ {};
 };

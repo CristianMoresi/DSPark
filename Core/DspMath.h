@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -17,7 +17,6 @@
 #include <cmath>
 #include <concepts>
 #include <numbers>
-#include <type_traits>
 
 namespace dspark {
 
@@ -41,6 +40,9 @@ template <FloatType T> inline constexpr T twoPi    = T(2) * std::numbers::pi_v<T
 
 /** @brief 1 / (2 * Pi) (0.15915...). Useful for fast phase divisions. */
 template <FloatType T> inline constexpr T invTwoPi = T(1) / twoPi<T>;
+
+/** @brief Pi / 2 (1.57079...). Quarter period; sin/cos phase offset. */
+template <FloatType T> inline constexpr T halfPi   = std::numbers::pi_v<T> / T(2);
 
 /** @brief Square root of 2 (1.41421...). */
 template <FloatType T> inline constexpr T sqrt2    = std::numbers::sqrt2_v<T>;
@@ -129,7 +131,7 @@ template <FloatType T>
     
     const auto x2 = x * x;
     const auto x4 = x2 * x2;
-    // Padé [5,4] approximant: max error < 0.05% for |x| <= 3
+    // Pade [5,4] approximant: max error < 0.05% for |x| <= 3
     return x * (T(945) + T(105) * x2 + x4) / (T(945) + T(420) * x2 + T(15) * x4);
 }
 
@@ -145,7 +147,12 @@ template <FloatType T>
 template <FloatType T>
 [[nodiscard]] inline T fastPow10(T x) noexcept
 {
-    return std::exp2(x * std::numbers::log2e_v<T> * std::numbers::ln10_v<T>);
+    // log2(10) folded into one constant: rounding it once is more accurate
+    // than multiplying log2(e) * ln(10) at runtime, and it saves a multiply
+    // (compilers may not reassociate x * a * b without fast-math).
+    constexpr T kLog2Of10 =
+        static_cast<T>(std::numbers::ln10_v<long double> / std::numbers::ln2_v<long double>);
+    return std::exp2(x * kLog2Of10);
 }
 
 /**
@@ -163,13 +170,13 @@ template <FloatType T>
 }
 
 /**
- * @brief Fast approximation of tan(x) using a Padé [5,4] rational approximant.
+ * @brief Fast approximation of tan(x) using a Pade [5,4] rational approximant.
  *
  * Accurate to better than 0.01% for |x| <= 1.45 and ~0.1% up to the 1.52
  * fallback limit. Outside that range, falls back to std::tan to avoid the
- * singularities at ±π/2 producing absurd results.
+ * singularities at +-pi/2 producing absurd results.
  *
- * Useful for the bilinear-transform `tan(π·f/Fs)` term: with this accuracy a
+ * Useful for the bilinear-transform `tan(pi*f/Fs)` term: with this accuracy a
  * 20 kHz cutoff at 44.1 kHz lands within a fraction of a cent of the target.
  * Roughly 3x faster than std::tan on MSVC.
  *
@@ -179,11 +186,11 @@ template <FloatType T>
 template <FloatType T>
 [[nodiscard]] inline T fastTan(T x) noexcept
 {
-    constexpr T limit = T(1.520);  // ~π/2 - 0.05
+    constexpr T limit = T(1.520);  // ~pi/2 - 0.05
     if (std::abs(x) > limit) return std::tan(x);
     const T x2 = x * x;
     const T x4 = x2 * x2;
-    // Padé [5,4]: tan(x) ≈ x · (945 − 105·x² + x⁴) / (945 − 420·x² + 15·x⁴)
+    // Pade [5,4]: tan(x) ~= x * (945 - 105*x^2 + x^4) / (945 - 420*x^2 + 15*x^4)
     return x * (T(945) - T(105) * x2 + x4) / (T(945) - T(420) * x2 + T(15) * x4);
 }
 
@@ -191,7 +198,7 @@ template <FloatType T>
  * @brief Fast sine approximation (degree-9 odd minimax polynomial).
  *
  * Maximum error ~4e-6 in float (over 100 dB below the signal) and below 1e-7
- * in double — inaudible even for audio-rate synthesis in either precision.
+ * in double: inaudible even for audio-rate synthesis in either precision.
  * About 3-6x faster than std::sin depending on platform. The input is
  * range-reduced internally (two-term Cody-Waite), so any finite argument
  * within a few thousand periods of zero stays accurate.
@@ -210,8 +217,8 @@ template <FloatType T>
 
     // Fold into [-pi/2, pi/2] where the polynomial converges fast:
     // sin(x) = sin(pi - x) for x > pi/2 (and the odd mirror for x < -pi/2).
-    if (x > pi<T> * T(0.5))       x = pi<T> - x;
-    else if (x < -pi<T> * T(0.5)) x = -pi<T> - x;
+    if (x > halfPi<T>)       x = pi<T> - x;
+    else if (x < -halfPi<T>) x = -pi<T> - x;
 
     const T x2 = x * x;
     // Minimax coefficients for sin on [-pi/2, pi/2], max abs error ~6e-8.
@@ -224,22 +231,23 @@ template <FloatType T>
 
 /**
  * @brief Fast cosine approximation. See fastSin() for accuracy notes
- * (float error is ~7e-6 here — half an ulp more from the pi/2 offset).
+ * (float error is ~7e-6 here: half an ulp more from the pi/2 offset).
  * @param x Argument in radians.
  * @return Approximation of cos(x).
  */
 template <FloatType T>
 [[nodiscard]] inline T fastCos(T x) noexcept
 {
-    return fastSin(x + pi<T> * T(0.5));
+    return fastSin(x + halfPi<T>);
 }
 
 /**
  * @brief Fast natural logarithm approximation.
  *
- * Splits the input into exponent and mantissa via std::frexp, then evaluates a
- * degree-5 minimax polynomial for log2 of the mantissa. Relative error is
- * below 2e-7 — ample for envelope/dB work. Roughly 2-4x faster than std::log.
+ * Splits the input into exponent and mantissa via std::frexp, then evaluates
+ * the classic 4-term atanh series (Cephes style) for ln of the mantissa,
+ * centred on [sqrt(0.5), sqrt(2)). Relative error is below 2e-7: ample for
+ * envelope/dB work. Roughly 2-4x faster than std::log.
  *
  * @param x Input value. Must be > 0 (no guard: matches std::log contract).
  * @return Approximation of ln(x).
@@ -261,7 +269,7 @@ template <FloatType T>
                 + s2 * (T(1.0 / 5.0)
                 + s2 *  T(1.0 / 7.0))));
 
-    return lnm + static_cast<T>(e) * T(0.69314718055994530942); // + e·ln2
+    return lnm + static_cast<T>(e) * std::numbers::ln2_v<T>; // + e * ln2
 }
 
 // ============================================================================
@@ -270,9 +278,11 @@ template <FloatType T>
 
 /**
  * @brief Normalises a phase value to the range [0, 2*pi).
- * * Optimized for hot paths. Avoids std::fmod which is blocking and slow.
- * Uses inverse multiplication and flooring, making it heavily SIMD friendly.
- * * @param phase Phase in radians.
+ *
+ * Optimized for hot paths: avoids std::fmod (slow, hostile to vectorisation)
+ * in favour of inverse multiplication and flooring.
+ *
+ * @param phase Phase in radians.
  * @return Phase wrapped safely to [0, 2*pi).
  */
 template <FloatType T>
@@ -280,8 +290,13 @@ template <FloatType T>
 {
     // floor() correctly handles negative values, preventing branching
     T wrapped = phase - twoPi<T> * std::floor(phase * invTwoPi<T>);
-    // Guard against floating-point cancellation producing exactly twoPi for
-    // tiny negative inputs: enforce the documented half-open range [0, 2*pi).
+    // Rounding in the k * twoPi product can land wrapped just outside
+    // [0, 2*pi) on either side: large phases where the product overshoots
+    // the input leave a slightly negative result, and tiny negative phases
+    // can round the sum up to exactly twoPi. Enforce the documented
+    // half-open range. Order matters: the += branch can itself round up to
+    // exactly twoPi, which the second branch then folds to 0.
+    if (wrapped < T(0))      wrapped += twoPi<T>;
     if (wrapped >= twoPi<T>) wrapped -= twoPi<T>;
     return wrapped;
 }

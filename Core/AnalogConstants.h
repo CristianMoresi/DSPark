@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -12,7 +12,13 @@
  * real-world values that the framework's analog-modelling defaults are derived
  * from, and are available for users building their own component models.
  *
- * None of these constants is required by the DSP hot paths — this header is
+ * The constants deliberately live inside the dspark::AnalogRandom namespace:
+ * that is the analog noise/drift subsystem defined in Core/AnalogRandom.h
+ * (Generator, NoiseType, AnalogComponent), and this header supplies the
+ * measured data that subsystem's defaults are calibrated against. Including
+ * either header alone is fine; they reopen the same namespace.
+ *
+ * None of these constants is required by the DSP hot paths: this header is
  * pure reference data with zero runtime cost.
  *
  * Dependencies: C++20 standard library only (<array>).
@@ -31,33 +37,33 @@ namespace NoiseConstants
 {
     namespace Thermal
     {
-        constexpr double BOLTZMANN_CONSTANT = 1.380649e-23;
-        constexpr double ROOM_TEMP_KELVIN = 293.15;
-        constexpr double TYPICAL_RESISTANCE = 1000.0;
-        constexpr double NOISE_BANDWIDTH = 20000.0;
+        constexpr double BOLTZMANN_CONSTANT = 1.380649e-23; // J/K (exact, SI 2019)
+        constexpr double ROOM_TEMP_KELVIN = 293.15;         // 20 degrees C
+        constexpr double TYPICAL_RESISTANCE = 1000.0;       // ohms
+        constexpr double NOISE_BANDWIDTH = 20000.0;         // Hz
     }
 
     namespace Shot
     {
-        constexpr double ELEMENTARY_CHARGE = 1.602176634e-19;
-        constexpr double TYPICAL_DC_CURRENT = 1.0e-3;
-        constexpr double AUDIO_BANDWIDTH = 20000.0;
+        constexpr double ELEMENTARY_CHARGE = 1.602176634e-19; // coulombs (exact, SI 2019)
+        constexpr double TYPICAL_DC_CURRENT = 1.0e-3;         // amperes
+        constexpr double AUDIO_BANDWIDTH = 20000.0;           // Hz
     }
 
     namespace Flicker
     {
-        constexpr double ALPHA_PINK = 1.0;
-        constexpr double ALPHA_BROWN = 2.0;
+        constexpr double ALPHA_PINK = 1.0;  // 1/f^alpha exponent
+        constexpr double ALPHA_BROWN = 2.0; // 1/f^alpha exponent
         constexpr double SPECTRAL_SLOPE_DB_PER_OCTAVE_PINK = -3.0;
         constexpr double SPECTRAL_SLOPE_DB_PER_OCTAVE_BROWN = -6.0;
     }
 
     namespace PracticalNoiseFloors
     {
-        constexpr double NEVE_1073_EIN_DBU = -125.0;
-        constexpr double NEVE_1073_NOISE_LINE_DBU = -83.0;
-        constexpr double API_512C_EIN = -129.0;
-        constexpr double LA_2A_NOISE_DB_BELOW_10DBM = -75.0;
+        constexpr double NEVE_1073_EIN_DBU = -125.0;         // EIN, 200 ohm source, max gain
+        constexpr double NEVE_1073_NOISE_LINE_DBU = -83.0;   // line-amp noise
+        constexpr double API_512C_EIN = -129.0;              // dBu, EIN at max gain
+        constexpr double LA_2A_NOISE_DB_BELOW_10DBM = -75.0; // spec: noise 75 dB below +10 dBm
         constexpr double AMPEX_351_SNR_DB = 55.0;
         constexpr double STUDER_C37_SNR_DB = 75.0;
         constexpr double TAPE_NOISE_OFFSET_DB = 8.0;

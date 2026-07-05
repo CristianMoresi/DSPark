@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -9,7 +9,7 @@
  *
  * A busy-wait mutex built on std::atomic_flag. Designed for protecting very
  * short critical sections (a few assignments) where sleeping would introduce
- * unacceptable latency — typically parameter hand-off between a GUI thread
+ * unacceptable latency: typically parameter hand-off between a GUI thread
  * and the audio thread.
  *
  * Dependencies: C++20 standard library only (<atomic>).
@@ -43,7 +43,7 @@
   #include <immintrin.h>
   #define DSPARK_SPIN_PAUSE() _mm_pause()
 #elif defined(_MSC_VER) && defined(_M_ARM64)
-  // MSVC on ARM64: _mm_pause() does not exist here — use the YIELD intrinsic.
+  // MSVC on ARM64: _mm_pause() does not exist here; use the YIELD intrinsic.
   #include <intrin.h>
   #define DSPARK_SPIN_PAUSE() __yield()
 #elif defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
@@ -58,11 +58,12 @@ namespace dspark {
 
 /**
  * @class SpinLock
- * @brief A minimal, real-time safe spin lock utilizing C++20 TTAS optimization.
+ * @brief A minimal, real-time safe spin lock with a TTAS wait loop.
  *
- * Fulfills the C++ BasicLockable requirements.
+ * Fulfills the standard Lockable requirements (lock / try_lock / unlock), so
+ * it composes with std::lock_guard, std::unique_lock and std::scoped_lock.
  * - `lock()` busy-waits using a Test-and-Test-and-Set (TTAS) pattern to avoid cache thrashing.
- * - `tryLock()` attempts a single acquire without waiting — mandatory for the audio thread.
+ * - `tryLock()` attempts a single acquire without waiting: the right call on the audio thread.
  * - `unlock()` releases the lock safely.
  */
 class SpinLock
@@ -76,23 +77,24 @@ public:
 
     /**
      * @brief Acquires the lock, spinning until successful.
-     * 
-     * Employs a C++20 TTAS (Test-and-Test-and-Set) loop. It reads the flag 
-     * with memory_order_relaxed to keep the cache line in a shared state, 
-     * avoiding bus traffic until the lock appears free.
-     * 
+     *
+     * Employs a TTAS (Test-and-Test-and-Set) loop: after a failed acquire it
+     * re-reads the flag with memory_order_relaxed (C++20 atomic_flag::test),
+     * keeping the cache line in a shared state and avoiding bus traffic
+     * until the lock appears free.
+     *
      * @note Call only when the lock holder is guaranteed to release quickly.
      */
     void lock() noexcept
     {
-        for (;;) 
+        for (;;)
         {
             // Attempt to grab the lock
             if (!flag_.test_and_set(std::memory_order_acquire)) {
                 return;
             }
-            
-            // Spin on a relaxed read to prevent cache line bouncing (C++20 feature)
+
+            // Spin on a relaxed read to prevent cache line bouncing
             while (flag_.test(std::memory_order_relaxed)) {
                 DSPARK_SPIN_PAUSE(); // Hint CPU to yield resources during spin
             }
@@ -107,6 +109,14 @@ public:
     {
         return !flag_.test_and_set(std::memory_order_acquire);
     }
+
+    /**
+     * @brief Standard-library spelling of tryLock().
+     *
+     * Completes the C++ Lockable requirements so the lock works with
+     * std::unique_lock(std::try_to_lock) and multi-lock std::scoped_lock.
+     */
+    [[nodiscard]] bool try_lock() noexcept { return tryLock(); }
 
     /**
      * @brief Releases the lock, restoring it to the clear state.

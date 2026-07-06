@@ -15,9 +15,16 @@ permissions:
   pages: write
   id-token: write
 
+# Serialize Pages deployments and let the in-progress one finish. GitHub's
+# Pages backend rejects a new deployment ("Deployment failed, try again
+# later") when a previous deployment is cancelled mid-flight, so a rapid
+# burst of pushes with cancel-in-progress: true poisons the next deploy.
+# With false, only one deployment runs at a time, queued runs superseded by
+# a newer one are skipped, and the running production deployment always
+# completes. This is GitHub's documented setting for Pages workflows.
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
   build-docs:
@@ -38,19 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url || steps.retry.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        continue-on-error: true
-        uses: actions/deploy-pages@v4
-      # The Pages service fails transiently now and then ("Deployment failed,
-      # try again later"). One spaced retry absorbs that flake without hiding
-      # persistent failures: if both attempts fail, the job stays red.
-      - name: Wait before retrying (transient Pages failure)
-        if: steps.deployment.outcome == 'failure'
-        run: sleep 45
-      - name: Deploy to GitHub Pages (retry)
-        id: retry
-        if: steps.deployment.outcome == 'failure'
         uses: actions/deploy-pages@v4

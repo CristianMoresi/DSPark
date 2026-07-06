@@ -1141,36 +1141,57 @@ protected:
     {
         SpinLock::ScopedLock guard(paramsLock_);
         mutate(lastParams_);
-        paramQueue_.push(lastParams_);
+        if (!paramQueue_.push(lastParams_))
+        {
+            // Queue full (a burst of GUI edits within one audio block).
+            // lastParams_ already holds the complete state, so flag the audio
+            // thread to fetch it directly; without this the newest edit would
+            // silently wait for the NEXT parameter change to become audible.
+            paramsPending_.store(true, std::memory_order_release);
+        }
     }
 
     void handleParameterChanges()
     {
         Params p;
         while (paramQueue_.pop(p))
+            applyParamSnapshot(p);
+
+        // Recover an edit that could not be queued. lastParams_ is always the
+        // newest complete state, so applying it can never move backwards.
+        if (paramsPending_.exchange(false, std::memory_order_acquire))
         {
-            driveSmoother_.setTargetValue(std::clamp(static_cast<float>(p.driveDb), -24.0f, 48.0f));
-            mixSmoother_.setTargetValue(std::clamp(static_cast<float>(p.mix), 0.0f, 1.0f));
-            characterSmoother_.setTargetValue(std::clamp(static_cast<float>(p.character), -1.0f, 1.0f));
-            driftSmoother_.setTargetValue(std::clamp(static_cast<float>(p.analogDrift), 0.0f, 1.0f));
-            outputGainSmoother_.setTargetValue(static_cast<float>(p.outputGain));
+            SpinLock::ScopedTryLock guard(paramsLock_);
+            if (guard.isLocked())
+                applyParamSnapshot(lastParams_);
+            else
+                paramsPending_.store(true, std::memory_order_release); // retry next block
+        }
+    }
 
-            float nyquist = static_cast<float>(spec_.sampleRate) / 2.0f;
-            preHpSmoother_.setTargetValue(std::clamp(static_cast<float>(p.preFilterHpFreq), 10.0f, nyquist));
-            postTiltFreqSmoother_.setTargetValue(std::clamp(static_cast<float>(p.postFilterTiltFreq), 100.0f, nyquist));
-            postTiltGainSmoother_.setTargetValue(std::clamp(static_cast<float>(p.postFilterTiltGain), -12.0f, 12.0f));
+    void applyParamSnapshot(const Params& p)
+    {
+        driveSmoother_.setTargetValue(std::clamp(static_cast<float>(p.driveDb), -24.0f, 48.0f));
+        mixSmoother_.setTargetValue(std::clamp(static_cast<float>(p.mix), 0.0f, 1.0f));
+        characterSmoother_.setTargetValue(std::clamp(static_cast<float>(p.character), -1.0f, 1.0f));
+        driftSmoother_.setTargetValue(std::clamp(static_cast<float>(p.analogDrift), 0.0f, 1.0f));
+        outputGainSmoother_.setTargetValue(static_cast<float>(p.outputGain));
 
-            dcBlockingEnabled_ = p.dcBlocking;
-            procMode_   = p.processingMode;
-            outputMode_ = p.outputMode;
-            currentAlgoType_.store(p.algorithm, std::memory_order_relaxed);
+        float nyquist = static_cast<float>(spec_.sampleRate) / 2.0f;
+        preHpSmoother_.setTargetValue(std::clamp(static_cast<float>(p.preFilterHpFreq), 10.0f, nyquist));
+        postTiltFreqSmoother_.setTargetValue(std::clamp(static_cast<float>(p.postFilterTiltFreq), 100.0f, nyquist));
+        postTiltGainSmoother_.setTargetValue(std::clamp(static_cast<float>(p.postFilterTiltGain), -12.0f, 12.0f));
 
-            auto* requested = pool_[static_cast<int>(p.algorithm)].get();
-            if (active_.load() != requested && next_.load() != requested)
-            {
-                next_.store(requested);
-                crossfader_.setTargetValue(0.0f);
-            }
+        dcBlockingEnabled_ = p.dcBlocking;
+        procMode_   = p.processingMode;
+        outputMode_ = p.outputMode;
+        currentAlgoType_.store(p.algorithm, std::memory_order_relaxed);
+
+        auto* requested = pool_[static_cast<int>(p.algorithm)].get();
+        if (active_.load() != requested && next_.load() != requested)
+        {
+            next_.store(requested);
+            crossfader_.setTargetValue(0.0f);
         }
     }
 
@@ -1380,6 +1401,7 @@ protected:
     SpscQueue<Params>  paramQueue_;
     Params             lastParams_;
     mutable SpinLock   paramsLock_;
+    std::atomic<bool>  paramsPending_ { false }; // set when a full queue dropped a snapshot
     std::atomic<bool>  antialiasShadow_ { false };  ///< Mirror for getState.
 
     ProcessingMode procMode_   = ProcessingMode::Stereo;

@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -7,11 +7,12 @@
  * @file SpscQueue.h
  * @brief Lock-free single-producer, single-consumer (SPSC) bounded queue.
  *
- * Designed for passing parameter snapshots from a control thread (GUI, automation)
- * to the audio thread without locks or allocations at runtime. Features a local 
- * index caching optimization to aggressively minimize CPU cache-line bouncing.
+ * Designed for passing parameter snapshots from a control thread (GUI,
+ * automation) to the audio thread without locks or allocations at runtime.
+ * Features a local index caching optimization to aggressively minimize CPU
+ * cache-line bouncing.
  *
- * Dependencies: C++20 standard library only (<array>, <atomic>, <cstddef>, <new>).
+ * Dependencies: C++20 standard library only (<array>, <atomic>, <cstddef>).
  *
  * @tparam T        Element type. Must be trivially copyable for lock-free safety.
  * @tparam Capacity Maximum number of slots. Must be a power of two for efficient
@@ -21,7 +22,10 @@
  * @code
  *   // GUI thread (producer):
  *   dspark::SpscQueue<Params, 32> queue; // Can hold up to 31 items
- *   queue.push(newParams);
+ *   if (!queue.push(newParams))
+ *   {
+ *       // Queue full: coalesce into shared state, or drop knowingly.
+ *   }
  *
  *   // Audio thread (consumer):
  *   Params p;
@@ -34,14 +38,19 @@
 #include <atomic>
 #include <cstddef>
 #include <type_traits>
-#include <new> // For hardware_destructive_interference_size
 
 namespace dspark {
 
-#ifdef __cpp_lib_hardware_interference_size
-    constexpr std::size_t kCacheLineSize = std::hardware_destructive_interference_size;
+// Cache-line size used for false-sharing padding. Fixed per architecture on
+// purpose: std::hardware_destructive_interference_size may vary with tuning
+// flags (GCC documents this and warns about it), and a header-only library
+// must never let the layout of the same template differ between translation
+// units. 128 on AArch64 covers Apple Silicon's 128-byte lines (over-padding
+// on 64-byte ARM cores is harmless); 64 everywhere else.
+#if defined(__aarch64__) || defined(_M_ARM64)
+    inline constexpr std::size_t kCacheLineSize = 128;
 #else
-    constexpr std::size_t kCacheLineSize = 64; // Safe fallback for older compiler implementations
+    inline constexpr std::size_t kCacheLineSize = 64;
 #endif
 
 template <typename T, std::size_t Capacity = 32>
@@ -68,7 +77,7 @@ public:
      *
      * @note Lock-free, wait-free, allocation-free. Safe to call from any single producer thread.
      */
-    bool push(const T& item) noexcept
+    [[nodiscard]] bool push(const T& item) noexcept
     {
         const auto write = writePos_.load(std::memory_order_relaxed);
         const auto next  = (write + 1) & kMask;
@@ -95,7 +104,7 @@ public:
      *
      * @note Lock-free, wait-free, allocation-free. Safe to call from any single consumer thread.
      */
-    bool pop(T& item) noexcept
+    [[nodiscard]] bool pop(T& item) noexcept
     {
         const auto read = readPos_.load(std::memory_order_relaxed);
 
@@ -128,6 +137,9 @@ public:
 
     /** @brief Returns true if the queue appears empty (approximate). */
     [[nodiscard]] bool empty() const noexcept { return sizeApprox() == 0; }
+
+    /** @brief Usable capacity: one slot is reserved to tell full from empty. */
+    [[nodiscard]] static constexpr std::size_t capacity() noexcept { return Capacity - 1; }
 
 private:
     static constexpr std::size_t kMask = Capacity - 1;

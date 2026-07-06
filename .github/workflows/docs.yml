@@ -45,8 +45,39 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deploy1.outputs.page_url || steps.deploy2.outputs.page_url || steps.deploy3.outputs.page_url }}
     steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
+      # GitHub's Pages publish backend fails intermittently ("Deployment
+      # failed, try again later") on an artifact that is otherwise fine: the
+      # exact same upload succeeds on a later attempt. deploy-pages has no
+      # cross-deployment retry (its error_count only tolerates status-poll
+      # errors, not a terminal "failed" deployment), so each retry has to
+      # create a fresh deployment, i.e. re-run the whole action.
+      #
+      # Up to three spaced attempts. The first two are continue-on-error so a
+      # transient failure falls through to the next; the third is NOT, so if
+      # Pages is genuinely down all three fail and the job goes red. Every
+      # attempt is its own named step, visible in the log.
+      - name: Deploy to GitHub Pages (attempt 1)
+        id: deploy1
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+
+      - name: Wait before attempt 2
+        if: steps.deploy1.outcome == 'failure'
+        run: sleep 30
+
+      - name: Deploy to GitHub Pages (attempt 2)
+        id: deploy2
+        if: steps.deploy1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+
+      - name: Wait before attempt 3
+        if: steps.deploy1.outcome == 'failure' && steps.deploy2.outcome == 'failure'
+        run: sleep 60
+
+      - name: Deploy to GitHub Pages (attempt 3, final)
+        id: deploy3
+        if: steps.deploy1.outcome == 'failure' && steps.deploy2.outcome == 'failure'
         uses: actions/deploy-pages@v4

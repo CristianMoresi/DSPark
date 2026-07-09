@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -17,9 +17,10 @@
  * Form II (TDF-II). Features a lock-free shadow buffering system to allow safe
  * coefficient updates from the GUI thread without tearing or blocking the audio thread.
  *
- * Dependencies: C++20 standard library (<array>, <cmath>, <numbers>, <span>, <atomic>, <cassert>).
+ * Dependencies: C++20 standard library (<algorithm>, <array>, <atomic>, <cassert>, <cmath>, <numbers>, <span>).
  */
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <numbers>
@@ -33,7 +34,7 @@
 namespace dspark {
 
 // ============================================================================
-// BiquadCoeffs — Coefficient storage + factory methods
+// BiquadCoeffs -- Coefficient storage + factory methods
 // ============================================================================
 
 /**
@@ -41,8 +42,13 @@ namespace dspark {
  * @brief Stores normalised biquad coefficients (b0, b1, b2, a1, a2).
  *
  * Coefficients are pre-normalised by a0 in every factory method, so the
- * filter processing loop never needs to divide by a0. Memory is aligned 
+ * filter processing loop never needs to divide by a0. Memory is aligned
  * to 32 bytes to facilitate explicit SIMD vectorisation and CPU cache optimal loads.
+ *
+ * All factory methods clamp frequency, Q and slope to safe ranges, so any
+ * finite parameter combination yields a stable filter. NaN parameters are
+ * not sanitised (they propagate into the coefficients), and the sample rate
+ * is trusted as-is: the framework contract is a valid AudioSpec upstream.
  *
  * @tparam T Coefficient type (float or double).
  */
@@ -108,7 +114,7 @@ struct alignas(32) BiquadCoeffs
      * @brief Band-pass filter (constant 0 dB peak gain).
      *
      * Implements the Audio EQ Cookbook BPF variant with `b0 = alpha`, whose
-     * peak gain at the centre frequency is exactly 0 dB regardless of Q —
+     * peak gain at the centre frequency is exactly 0 dB regardless of Q,
      * the most useful variant for mixing and crossover work.
      *
      * @param sampleRate Sample rate in Hz.
@@ -173,7 +179,7 @@ struct alignas(32) BiquadCoeffs
      * deviating audibly from the analog prototype above ~fs/6. This design
      * (Orfanidis, JAES 45(6), 1997) prescribes the digital gain at Nyquist
      * to equal the ANALOG prototype's gain there, matching the analog bell
-     * shape across the band — the standard "de-cramped" EQ used by
+     * shape across the band: the standard "de-cramped" EQ used by
      * state-of-the-art digital equalizers.
      *
      * Falls back to identity for |gain| < 0.01 dB. At low frequencies it
@@ -421,7 +427,7 @@ struct alignas(32) BiquadCoeffs
      * EQs and channel strips (SSL, Neve, Tonelux Tilt).
      *
      * @param sampleRate Sample rate in Hz.
-     * @param pivotFreq  Pivot frequency in Hz (typically 600–3000 Hz).
+     * @param pivotFreq  Pivot frequency in Hz (typically 600-3000 Hz).
      * @param gainDb     Tilt amount in dB (positive = bright, negative = dark).
      */
     [[nodiscard]] static BiquadCoeffs makeTilt(double sampleRate, double pivotFreq, double gainDb) noexcept
@@ -478,7 +484,8 @@ struct alignas(32) BiquadCoeffs
 
     /**
      * @brief Computes magnitude responses for a batch of frequencies.
-     * * Uses C++20 std::span for bounds-safe array access. Efficient batch 
+     *
+     * Uses C++20 std::span for bounds-safe array access. Efficient batch
      * evaluation for drawing frequency response curves.
      *
      * @param frequencies Span of input frequencies in Hz.
@@ -486,7 +493,7 @@ struct alignas(32) BiquadCoeffs
      * Must be at least as large as the frequencies span.
      * @param sampleRate  Sample rate in Hz.
      */
-    void getMagnitudeForFrequencyArray(std::span<const T> frequencies, 
+    void getMagnitudeForFrequencyArray(std::span<const T> frequencies,
                                        std::span<T> magnitudes,
                                        double sampleRate) const noexcept
     {
@@ -498,7 +505,7 @@ struct alignas(32) BiquadCoeffs
 private:
     /** @brief Normalises all coefficients by a0 (divides b* and a* by a0).
      * Division is performed in double precision to avoid premature truncation
-     * when T is float — coefficients are only cast to T after the division. */
+     * when T is float; coefficients are only cast to T after the division. */
     [[nodiscard]] static BiquadCoeffs normalise(double a0, BiquadCoeffs raw) noexcept
     {
         double invA0 = 1.0 / a0;
@@ -512,16 +519,17 @@ private:
 };
 
 // ============================================================================
-// Biquad — Filter processor with per-channel state
+// Biquad -- Filter processor with per-channel state
 // ============================================================================
 
 /**
  * @class Biquad
- * @brief Biquad filter using Transposed Direct Form II (TDF-II) with Thread-Safe updates.
+ * @brief Biquad filter using Transposed Direct Form II (TDF-II) with thread-safe updates.
  *
- * Implements a lock-free shadow buffering system to prevent torn reads when 
- * coefficients are updated by the UI thread concurrently with the Audio Thread.
- * State structures are cache-aligned to 32 bytes for strict SIMD compliance.
+ * Implements a lock-free shadow buffering system (seqlock) to prevent torn
+ * reads when coefficients are updated by the UI thread concurrently with the
+ * audio thread. Per-channel states are stored compactly so adjacent channels
+ * share cache lines during block processing.
  *
  * @tparam T           Sample type (float or double).
  * @tparam MaxChannels Maximum number of independent filter channels.
@@ -565,7 +573,7 @@ public:
     /**
      * @brief Sets the filter coefficients asynchronously.
      *
-     * Safely updates coefficients without locking. The audio thread will 
+     * Safely updates coefficients without locking. The audio thread will
      * pick up the new coefficients safely on the next process call to avoid
      * torn reads and filter blow-ups.
      *
@@ -579,7 +587,7 @@ public:
         // torn coefficient set (mixing a1 of one filter with a2 of another).
         //
         // Standards note: the reader's struct copy races with this write in the
-        // strict C++ memory model (classic seqlock caveat — the Linux kernel and
+        // strict C++ memory model (classic seqlock caveat; the Linux kernel and
         // mainstream audio frameworks rely on the same pattern). The retry loop
         // discards any value read during a write, and the acquire/release fences
         // order the accesses on every supported compiler/architecture.
@@ -615,7 +623,13 @@ public:
             do {
                 s0  = coeffsSeq_.load(std::memory_order_acquire);
                 tmp = stagedCoeffs_;
-                s1  = coeffsSeq_.load(std::memory_order_acquire);
+                // The fence keeps the copy above from sinking below the
+                // re-read of the counter. A plain acquire load only orders
+                // LATER accesses; without the fence, both the compiler and
+                // weakly-ordered CPUs (ARM) may complete the copy after s1
+                // is read, and a torn copy would pass the s0 == s1 check.
+                std::atomic_thread_fence(std::memory_order_acquire);
+                s1  = coeffsSeq_.load(std::memory_order_relaxed);
             } while ((s0 & 1u) != 0u || s0 != s1);
             activeCoeffs_ = tmp;
             return true;
@@ -623,7 +637,13 @@ public:
         return false;
     }
 
-    /** * @brief Returns the active coefficient set currently in use by the DSP thread.
+    /**
+     * @brief Returns the active coefficient set currently in use by the DSP thread.
+     *
+     * Intended for the thread that owns processing (or single-threaded /
+     * offline use). A GUI thread reading this concurrently with a promotion
+     * may observe a mid-update set; for drawing response curves, keep your
+     * own copy of the coefficients you computed.
      */
     [[nodiscard]] const BiquadCoeffs<T>& getCoeffs() const noexcept { return activeCoeffs_; }
 
@@ -639,13 +659,16 @@ public:
      *
      * Transposed Direct Form II implementation. Self-sufficient: any
      * setCoeffs() update from another thread is picked up here on the very
-     * next sample with virtually zero overhead — the fast-path is a relaxed
+     * next sample with virtually zero overhead; the fast-path is a relaxed
      * load (a plain MOV on x86) compiled into a single branchless check.
      *
      * No external sequencing is required. The caller is free to mix
      * processSample() and processBlock() calls in any order, and concurrent
      * setCoeffs() from the GUI thread always becomes audible deterministically
      * within at most a couple of samples (single sample on x86/ARM).
+     *
+     * @pre channel must be in [0, MaxChannels). Enforced by assert in debug
+     * builds; out-of-range access in release builds is undefined behaviour.
      *
      * @param input   Input sample.
      * @param channel Channel index (0-based).
@@ -657,7 +680,7 @@ public:
 
         // Lock-free fast path: relaxed load is free on every modern CPU.
         // Branch is marked unlikely so the compiler keeps the hot DSP path
-        // straight-line — the dirty flag is only true on the first sample
+        // straight-line; the dirty flag is only true on the first sample
         // of a block where setCoeffs() landed since last process call.
         if (coeffsDirty_.load(std::memory_order_relaxed)) [[unlikely]]
             applyPendingCoeffs();
@@ -681,6 +704,9 @@ public:
      * per-sample dirty-flag check in sight, the compiler keeps b0..a2 and the
      * filter state in registers for the whole block (roughly 1.5-2x faster
      * than routing every sample through processSample()).
+     *
+     * Channels beyond MaxChannels are left untouched (pass-through): only
+     * the first min(numChannels, MaxChannels) channels are filtered.
      *
      * @param buffer Audio buffer to process in-place.
      */
@@ -720,7 +746,11 @@ public:
     }
 
 private:
-    struct alignas(32) State
+    // Kept compact on purpose (no over-alignment): the states are only ever
+    // touched by the processing thread, sequentially per channel, so packing
+    // adjacent channels into the same cache line is strictly better than
+    // padding each one out to its own.
+    struct State
     {
         T z1 = T(0);
         T z2 = T(0);

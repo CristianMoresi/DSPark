@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -8,28 +8,33 @@
  * @brief Real-time safe dry/wet mixer with parameter smoothing and mix laws.
  *
  * Captures a copy of the dry (unprocessed) signal before an effect runs,
- * then blends it with the wet (processed) signal. Includes block-level 
- * parameter smoothing to prevent zipper noise during DAW automation, and 
+ * then blends it with the wet (processed) signal. Includes block-level
+ * parameter smoothing to prevent zipper noise during DAW automation, and
  * supports both Linear and Equal Power mixing laws.
  *
- * @note If your effect introduces algorithmic latency (e.g., FIR filters), 
- * ensure the dry signal is delayed (Latency Compensation) before calling pushDry() 
+ * @note If your effect introduces algorithmic latency (e.g., FIR filters),
+ * ensure the dry signal is delayed (Latency Compensation) before calling pushDry()
  * to prevent phase cancellation (comb filtering).
  *
- * Dependencies: AudioBuffer.h, AudioSpec.h.
+ * Threading: pushDry() / mixWet() belong to the processing thread.
+ * setMixRule() is atomic and callable from any thread. prepare() and
+ * setLatencyCompensation() allocate and belong to the setup thread.
+ *
+ * Dependencies: AudioBuffer.h, AudioSpec.h, C++20 standard library
+ * (<algorithm>, <atomic>, <cmath>).
  *
  * @code
  * dspark::DryWetMixer<float> mixer;
  *
  * void prepare(const dspark::AudioSpec& spec) {
- * mixer.prepare(spec);
- * mixer.setMixRule(dspark::DryWetMixer<float>::MixRule::EqualPower);
+ *     mixer.prepare(spec);
+ *     mixer.setMixRule(dspark::DryWetMixer<float>::MixRule::EqualPower);
  * }
  *
  * void process(dspark::AudioBufferView<float> buffer) {
- * mixer.pushDry(buffer);
- * applyEffect(buffer);       // Modifies buffer in-place (now wet)
- * mixer.mixWet(buffer, 0.5f); // Smoothly transitions to 50% wet
+ *     mixer.pushDry(buffer);
+ *     applyEffect(buffer);        // Modifies buffer in-place (now wet)
+ *     mixer.mixWet(buffer, 0.5f); // Smoothly transitions to 50% wet
  * }
  * @endcode
  */
@@ -38,6 +43,7 @@
 #include "AudioSpec.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 // DSPARK_RESTRICT is normally provided by SimdOps.h (pulled in via AudioBuffer.h).
@@ -70,8 +76,41 @@ public:
         /** Linear crossfade. Best for highly correlated signals (EQ, saturation). */
         Linear,
         /** Constant power crossfade. Best for uncorrelated signals (Reverb, Delay). */
-        EqualPower 
+        EqualPower
     };
+
+    DryWetMixer() noexcept = default;
+
+    // The atomic mix rule makes the implicit move operations vanish. Provide
+    // manual moves so the mixer keeps working inside movable owners; moves
+    // are single-threaded setup-time relocations, so plain relaxed transfers
+    // of the atomic are sufficient. Copying is deleted by the owned buffers.
+    DryWetMixer(DryWetMixer&& other) noexcept
+        : dryBuffer_(std::move(other.dryBuffer_)),
+          capturedSamples_(other.capturedSamples_),
+          delayHist_(std::move(other.delayHist_)),
+          latencySamples_(other.latencySamples_),
+          histPos_(other.histPos_),
+          mixRule_(other.mixRule_.load(std::memory_order_relaxed)),
+          currentMix_(other.currentMix_)
+    {}
+
+    DryWetMixer& operator=(DryWetMixer&& other) noexcept
+    {
+        if (this == &other) return *this;
+        dryBuffer_       = std::move(other.dryBuffer_);
+        capturedSamples_ = other.capturedSamples_;
+        delayHist_       = std::move(other.delayHist_);
+        latencySamples_  = other.latencySamples_;
+        histPos_         = other.histPos_;
+        mixRule_.store(other.mixRule_.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+        currentMix_      = other.currentMix_;
+        return *this;
+    }
+
+    DryWetMixer(const DryWetMixer&)            = delete;
+    DryWetMixer& operator=(const DryWetMixer&) = delete;
 
     /**
      * @brief Allocates the internal dry buffer for the given audio spec.
@@ -82,7 +121,7 @@ public:
         dryBuffer_.resize(spec.numChannels, spec.maxBlockSize);
 
         // If latency compensation was configured before prepare(), the delay
-        // history was sized with 0 channels — rebuild it now that the channel
+        // history was sized with 0 channels; rebuild it now that the channel
         // count is known (otherwise pushDry would index a 0-channel buffer).
         if (latencySamples_ > 0)
         {
@@ -105,11 +144,15 @@ public:
 
     /**
      * @brief Sets the mathematical curve to use during the mix phase.
+     *
+     * Atomic: callable from any thread. mixWet() reads the rule once per
+     * block, so a change lands at the next block boundary.
+     *
      * @param rule The chosen MixRule (Linear or EqualPower).
      */
     void setMixRule(MixRule rule) noexcept
     {
-        mixRule_ = rule;
+        mixRule_.store(rule, std::memory_order_relaxed);
     }
 
     /**
@@ -139,8 +182,12 @@ public:
     /**
      * @brief Captures a snapshot of the dry (unprocessed) signal.
      *
-     * @param input The unprocessed audio buffer. Accepts const or mutable views 
-     * implicitly, provided the View template converts appropriately.
+     * Channels beyond the prepared channel count are ignored; a shorter
+     * input than the prepared block size shortens the valid snapshot (and
+     * therefore the region the next mixWet() call blends).
+     *
+     * @param input The unprocessed audio buffer. Accepts const or mutable
+     * views implicitly (AudioBufferView converts T to const T).
      */
     void pushDry(const AudioBufferView<const T>& input) noexcept
     {
@@ -186,8 +233,13 @@ public:
     /**
      * @brief Blends the stored dry signal with the current (wet) buffer in-place.
      *
-     * Automatically applies sample-accurate linear interpolation to the mix 
+     * Automatically applies sample-accurate linear interpolation to the mix
      * proportion to prevent zipper noise when the parameter changes.
+     *
+     * Only the region covered by the last pushDry() snapshot is blended:
+     * without a captured snapshot (e.g. right after reset()) this is a no-op
+     * and the buffer stays fully wet. Channels beyond the prepared channel
+     * count also pass through untouched.
      *
      * @param wetBuffer     The processed buffer (modified in-place).
      * @param targetMix     Target mix amount: 0.0 = fully dry, 1.0 = fully wet.
@@ -208,23 +260,29 @@ public:
 
         const bool needsSmoothing = std::abs(currentMix_ - targetMix) > T(1e-5);
         const T mixStep = needsSmoothing ? (targetMix - currentMix_) / T(nSamples) : T(0);
+        const MixRule rule = mixRule_.load(std::memory_order_relaxed);
+
+        // Every channel ramps from the same smoothed origin. The ramps below
+        // are indexed (mix0 + mixStep * i) rather than accumulated: one
+        // rounding per sample instead of a drift that grows with the block
+        // (a serial accumulator can overshoot the [0, 1] range on long
+        // blocks), and no loop-carried dependency in the way of the
+        // auto-vectoriser.
+        const T mix0 = currentMix_;
 
         for (int ch = 0; ch < chCount; ++ch)
         {
             T* DSPARK_RESTRICT wetData       = wetBuffer.getChannel(ch);
             const T* DSPARK_RESTRICT dryData = dryBuffer_.getChannel(ch);
-            
-            // Local copy of mix value so every channel starts at the same smoothed origin
-            T mixVal = currentMix_; 
 
-            if (mixRule_ == MixRule::EqualPower)
+            if (rule == MixRule::EqualPower)
             {
                 if (!needsSmoothing)
                 {
-                    // Static mix: hoist both square roots out of the loop —
+                    // Static mix: hoist both square roots out of the loop;
                     // the body becomes a single FMA per sample (vectorizable).
-                    const T w = std::sqrt(mixVal);
-                    const T d = std::sqrt(T(1) - mixVal);
+                    const T w = std::sqrt(mix0);
+                    const T d = std::sqrt(T(1) - mix0);
                     for (int i = 0; i < nSamples; ++i)
                         wetData[i] = dryData[i] * d + wetData[i] * w;
                 }
@@ -232,11 +290,14 @@ public:
                 {
                     for (int i = 0; i < nSamples; ++i)
                     {
-                        // Exact constant-power law: w^2 + d^2 = 1.
-                        const T w = std::sqrt(mixVal);
-                        const T d = std::sqrt(T(1) - mixVal);
+                        // Exact constant-power law: w^2 + d^2 = 1. The max()
+                        // guards keep float rounding at the ramp ends from
+                        // pushing a radicand a few ulp negative, where sqrt()
+                        // would inject NaN into the output.
+                        const T m = mix0 + mixStep * T(i);
+                        const T w = std::sqrt(std::max(T(0), m));
+                        const T d = std::sqrt(std::max(T(0), T(1) - m));
                         wetData[i] = dryData[i] * d + wetData[i] * w;
-                        mixVal += mixStep;
                     }
                 }
             }
@@ -244,7 +305,7 @@ public:
             {
                 if (!needsSmoothing)
                 {
-                    const T w = mixVal;
+                    const T w = mix0;
                     const T d = T(1) - w;
                     for (int i = 0; i < nSamples; ++i)
                         wetData[i] = dryData[i] * d + wetData[i] * w;
@@ -253,10 +314,9 @@ public:
                 {
                     for (int i = 0; i < nSamples; ++i)
                     {
-                        const T w = mixVal;
+                        const T w = mix0 + mixStep * T(i);
                         const T d = T(1) - w;
                         wetData[i] = dryData[i] * d + wetData[i] * w;
-                        mixVal += mixStep;
                     }
                 }
             }
@@ -292,8 +352,8 @@ private:
     int latencySamples_ = 0;
     int histPos_        = 0;
 
-    MixRule mixRule_ = MixRule::Linear;
-    T currentMix_    = T(-1); // Internal state for parameter smoothing
+    std::atomic<MixRule> mixRule_ { MixRule::Linear };
+    T currentMix_ = T(-1); // Internal state for parameter smoothing
 };
 
 } // namespace dspark

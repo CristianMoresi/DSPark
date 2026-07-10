@@ -1,25 +1,25 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
-
-/*
-==============================================================================
-    AnalogRandom.h
-    Author: Cristian Moresi
-    ---------------------------------------------------------------------------
-    Description:
-    Header-only C++20 generator of smooth, analog-style random values for
-    modulation. Supports white, pink, and brown noise types.
-    
-    Features:
-    - True audio-rate analog drift (continuous 1/f and 1/f^2 filtering).
-    - Sample-and-Hold LFO behavior with 1-pole smoothing.
-    - Zero allocations, SIMD/Cache-friendly block processing.
-    - Lock-free thread safety between GUI and Audio threads.
-    - DC-free denormal mitigation.
-==============================================================================
-*/
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
+
+/**
+ * @file AnalogRandom.h
+ * @brief Analog-style random modulation: white/pink/brown drift generators.
+ *
+ * Header-only C++20 generator of smooth, analog-style random values for
+ * modulation. Supports white, pink, and brown noise types.
+ *
+ * Features:
+ * - True audio-rate analog drift (continuous 1/f and 1/f^2 filtering).
+ * - Sample-and-Hold LFO behavior with 1-pole smoothing.
+ * - Zero allocations, cache-friendly block processing.
+ * - Lock-free thread safety between GUI and audio threads.
+ * - DC-free denormal mitigation.
+ *
+ * Dependencies: AnalogConstants.h, C++20 standard library (<algorithm>,
+ * <array>, <atomic>, <chrono>, <cmath>, <cstdint>, <span>, <type_traits>).
+ */
 
 #include <algorithm>
 #include <array>
@@ -27,8 +27,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <limits>
-#include <numeric>
 #include <span>
 #include <type_traits>
 
@@ -38,7 +36,7 @@
  * @namespace dspark
  * @brief Main namespace for the DSPark framework.
  */
-namespace dspark 
+namespace dspark
 {
     /**
      * @namespace AnalogRandom
@@ -90,7 +88,7 @@ namespace dspark
                 [[nodiscard]] double next_double() noexcept
                 {
                     const std::uint64_t x = next();
-                    constexpr double inv2pow53 = 1.0 / 9007199254740992.0; 
+                    constexpr double inv2pow53 = 1.0 / 9007199254740992.0;
                     return static_cast<double>(x >> 11) * inv2pow53;
                 }
 
@@ -147,16 +145,16 @@ namespace dspark
          * @brief Main generator class for analog-style random modulation.
          * @tparam Real Floating point type to represent values (float or double).
          */
-        template <typename Real = float> 
+        template <typename Real = float>
         class Generator
         {
             static_assert(std::is_floating_point_v<Real>,
                         "AnalogRandom::Generator requires a floating-point Real type.");
 
         public:
-            Generator() noexcept : prng_(generateUniqueSeed()) 
-            { 
-                checkLockFree(); 
+            Generator() noexcept : prng_(generateUniqueSeed())
+            {
+                checkLockFree();
             }
 
             explicit Generator(std::uint64_t seed) noexcept : prng_(seed)
@@ -167,7 +165,7 @@ namespace dspark
             // std::atomic members are not move-constructible by default, but we
             // own this Generator's state and need it to be storable in standard
             // containers (e.g. std::vector). The atomic loads/stores below are
-            // safe because the source object is being moved-from — by contract
+            // safe because the source object is being moved-from; by contract
             // it is not concurrently observed by any other thread.
             Generator(Generator&& other) noexcept
                 : isSafeToRun_(other.isSafeToRun_),
@@ -325,17 +323,17 @@ namespace dspark
                 const bool smoothing = smoothingEnabled_.load(std::memory_order_relaxed);
                 const Real coeff = smoothingCoeff_.load(std::memory_order_relaxed);
                 const NoiseType noiseType = noiseType_.load(std::memory_order_relaxed);
-                const float quantStep = quantizationStep_.load(std::memory_order_relaxed);
+                const Real quantStep = quantizationStep_.load(std::memory_order_relaxed);
                 Real currentMin = min_.load(std::memory_order_relaxed);
                 Real currentMax = max_.load(std::memory_order_relaxed);
-                
+
                 if (currentMin > currentMax) std::swap(currentMin, currentMax);
 
                 for (Real& sample : outputBuffer)
                 {
                     const Real white = static_cast<Real>(prng_.next_double() * 2.0 - 1.0);
                     Real continuousNoise = white;
-                    
+
                     if (noiseType == NoiseType::Pink) continuousNoise = tickPinkNoise(white);
                     else if (noiseType == NoiseType::Brown) continuousNoise = tickBrownNoise(white);
 
@@ -347,7 +345,7 @@ namespace dspark
                         // (pink noise can momentarily exceed unity).
                         const Real cn = std::clamp(continuousNoise, static_cast<Real>(-1), static_cast<Real>(1));
                         targetValue_ = currentMin + ((cn * static_cast<Real>(0.5)) + static_cast<Real>(0.5)) * (currentMax - currentMin);
-                        if (quantStep > 0.0f) targetValue_ = std::round(targetValue_ / quantStep) * quantStep;
+                        if (quantStep > static_cast<Real>(0)) targetValue_ = std::round(targetValue_ / quantStep) * quantStep;
                     }
 
                     if (smoothing)
@@ -361,7 +359,7 @@ namespace dspark
 
                     denormalFlip_ = -denormalFlip_;
                     currentValue_ += denormalFlip_;
-                    
+
                     sample = currentValue_;
                 }
             }
@@ -373,9 +371,9 @@ namespace dspark
             // Configuration API
             //----------------------------------------------------------------------
 
-            void setNoiseType(NoiseType type) noexcept 
-            { 
-                noiseType_.store(type, std::memory_order_relaxed); 
+            void setNoiseType(NoiseType type) noexcept
+            {
+                noiseType_.store(type, std::memory_order_relaxed);
             }
 
             void setRateHz(Real rateInHz) noexcept
@@ -391,15 +389,15 @@ namespace dspark
                 useBpmSync_.store(true, std::memory_order_relaxed);
             }
 
-            void updateBPM(double newBpm) noexcept 
-            { 
-                bpm_.store(static_cast<float>(newBpm), std::memory_order_relaxed); 
+            void updateBPM(double newBpm) noexcept
+            {
+                bpm_.store(static_cast<float>(newBpm), std::memory_order_relaxed);
             }
 
             /**
              * @brief Set the output range for values. Safe from tearing.
              */
-            template <typename T> 
+            template <typename T>
             void setRange(T min, T max) noexcept
             {
                 static_assert(std::is_floating_point_v<T>, "setRange only accepts floating-point types.");
@@ -413,15 +411,23 @@ namespace dspark
                 smoothingEnabled_.store(shouldBeEnabled, std::memory_order_relaxed);
                 if (sampleRate_ > 0 && timeInMs > static_cast<Real>(0))
                 {
-                    const Real coeff = static_cast<Real>(std::exp(-1.0 / (static_cast<double>(sampleRate_) * (static_cast<double>(timeInMs) / 1000.0))));
-                    smoothingCoeff_.store(static_cast<float>(1.0 - coeff), std::memory_order_relaxed);
+                    const double coeff = std::exp(-1.0 / (sampleRate_ * (static_cast<double>(timeInMs) / 1000.0)));
+                    smoothingCoeff_.store(static_cast<Real>(1.0 - coeff), std::memory_order_relaxed);
+                }
+                else
+                {
+                    // A zero (or negative) smoothing time means instantaneous.
+                    // Keeping the previous coefficient here (possibly the
+                    // initial 0) would silently freeze the output short of
+                    // every new target while smoothing is enabled.
+                    smoothingCoeff_.store(static_cast<Real>(1), std::memory_order_relaxed);
                 }
             }
 
             void setQuantization(Real step) noexcept
             {
                 if (std::isnan(step) || step < static_cast<Real>(0)) step = static_cast<Real>(0);
-                quantizationStep_.store(static_cast<float>(step), std::memory_order_relaxed);
+                quantizationStep_.store(step, std::memory_order_relaxed);
             }
 
             void setAnalogDefault(AnalogComponent component) noexcept
@@ -461,21 +467,25 @@ namespace dspark
                 }
             }
 
-            template <typename Int> 
+            template <typename Int>
             [[nodiscard]] Int getNextDiscrete(Int imin, Int imax) noexcept
             {
                 static_assert(std::is_integral_v<Int>, "getNextDiscrete requires an integral type.");
                 if (imax <= imin) return imin;
                 const Real value = getNextSample();
-                
-                Real minVal = static_cast<Real>(min_.load(std::memory_order_relaxed));
-                Real maxVal = static_cast<Real>(max_.load(std::memory_order_relaxed));
+
+                Real minVal = min_.load(std::memory_order_relaxed);
+                Real maxVal = max_.load(std::memory_order_relaxed);
                 if (minVal > maxVal) std::swap(minVal, maxVal);
                 if (maxVal == minVal) return imin;
 
                 const double t = static_cast<double>((value - minVal) / (maxVal - minVal));
                 const double mapped = t * static_cast<double>(imax - imin) + static_cast<double>(imin);
-                return static_cast<Int>(std::clamp(std::lround(mapped), static_cast<long>(imin), static_cast<long>(imax)));
+                // llround/long long, not lround/long: on LLP64 platforms
+                // (Windows) long is 32-bit and would truncate 64-bit Int.
+                return static_cast<Int>(std::clamp(std::llround(mapped),
+                                                   static_cast<long long>(imin),
+                                                   static_cast<long long>(imax)));
             }
 
             [[nodiscard]] int getNextDiscreteInt(int imin, int imax) noexcept
@@ -486,7 +496,16 @@ namespace dspark
         private:
             void checkLockFree() noexcept
             {
-                isSafeToRun_ = std::atomic<Real>::is_always_lock_free;
+                // Guard against the atomics this class actually uses. On every
+                // supported platform these are all lock-free; a hypothetical
+                // platform where they are not degrades to silence instead of
+                // risking a blocking atomic on the audio thread.
+                isSafeToRun_ = std::atomic<Real>::is_always_lock_free
+                            && std::atomic<float>::is_always_lock_free
+                            && std::atomic<std::uint64_t>::is_always_lock_free
+                            && std::atomic<NoiseType>::is_always_lock_free
+                            && std::atomic<BpmDivision>::is_always_lock_free
+                            && std::atomic<bool>::is_always_lock_free;
             }
 
             /**
@@ -510,14 +529,14 @@ namespace dspark
             void generateNewTarget(Real sampledNoise) noexcept
             {
                 sampledNoise = std::clamp(sampledNoise, static_cast<Real>(-1), static_cast<Real>(1));
-                
+
                 Real currentMin = min_.load(std::memory_order_relaxed);
                 Real currentMax = max_.load(std::memory_order_relaxed);
                 if (currentMin > currentMax) std::swap(currentMin, currentMax);
 
                 targetValue_ = currentMin + ((sampledNoise * static_cast<Real>(0.5)) + static_cast<Real>(0.5)) * (currentMax - currentMin);
 
-                const Real quantStep = static_cast<Real>(quantizationStep_.load(std::memory_order_relaxed));
+                const Real quantStep = quantizationStep_.load(std::memory_order_relaxed);
                 if (quantStep > static_cast<Real>(0))
                 {
                     targetValue_ = std::round(targetValue_ / quantStep) * quantStep;
@@ -543,11 +562,14 @@ namespace dspark
                 }
 
                 if (rate <= static_cast<Real>(0)) return;
-                
+
                 phaseAccumulator_ += static_cast<double>(rate) / sampleRate_;
                 if (phaseAccumulator_ >= 1.0)
                 {
-                    phaseAccumulator_ -= 1.0;
+                    // floor(), not a single -1.0: with rates at or above the
+                    // sample rate the fixed decrement would let the
+                    // accumulator grow without bound.
+                    phaseAccumulator_ -= std::floor(phaseAccumulator_);
                     triggerNext_.store(true, std::memory_order_release);
                 }
             }
@@ -557,15 +579,15 @@ namespace dspark
                 Real b0 = pinkNoiseOctaves_[0];
                 Real b1 = pinkNoiseOctaves_[1];
                 Real b2 = pinkNoiseOctaves_[2];
-                
+
                 b0 = static_cast<Real>(0.99886) * b0 + white * static_cast<Real>(0.0555179);
                 b1 = static_cast<Real>(0.99332) * b1 + white * static_cast<Real>(0.0750759);
                 b2 = static_cast<Real>(0.96900) * b2 + white * static_cast<Real>(0.1538520);
-                
+
                 pinkNoiseOctaves_[0] = b0;
                 pinkNoiseOctaves_[1] = b1;
                 pinkNoiseOctaves_[2] = b2;
-                
+
                 return (b0 + b1 + b2 + white * static_cast<Real>(0.1848)) * static_cast<Real>(0.16666666666666666);
             }
 
@@ -620,15 +642,18 @@ namespace dspark
             std::atomic<float> rateHz_{ 1.0f };
             std::atomic<float> bpm_{ 120.0f };
             std::atomic<BpmDivision> bpmDivision_{ BpmDivision::Quarter };
-            std::atomic<float> min_{ -1.0f };
-            std::atomic<float> max_{ 1.0f };
+            // Value-domain atomics use Real: with Real = double, storing them
+            // as float would silently round the user's range/quantization.
+            // Time-domain ones (rateHz_, bpm_) stay float on purpose.
+            std::atomic<Real> min_{ static_cast<Real>(-1) };
+            std::atomic<Real> max_{ static_cast<Real>(1) };
             std::atomic<bool> smoothingEnabled_{ false };
-            std::atomic<float> smoothingCoeff_{ 0.0f };
-            std::atomic<float> quantizationStep_{ 0.0f };
+            std::atomic<Real> smoothingCoeff_{ static_cast<Real>(0) };
+            std::atomic<Real> quantizationStep_{ static_cast<Real>(0) };
             std::atomic<std::uint64_t> pendingSeed_{ 0 };
             Real brownNoiseState_{ static_cast<Real>(0) };
             std::array<Real, 3> pinkNoiseOctaves_{};
             Real denormalFlip_{ static_cast<Real>(1e-18) }; // DC-Free denormal mitigation state
-        }; 
+        };
     } // namespace AnalogRandom
 } // namespace dspark

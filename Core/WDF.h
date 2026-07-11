@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -10,19 +10,19 @@
  * Implements the classical WDF toolkit (Fettweis 1986): one-port elements
  * (resistor, capacitor, inductor, resistive voltage source), adapted
  * three-port series/parallel connectors, a polarity inverter, and circuit
- * roots — an ideal voltage source for linear networks and Newton-Raphson
+ * roots -- an ideal voltage source for linear networks and Newton-Raphson
  * nonlinear roots (Shockley diode, antiparallel diode pair).
  *
- * Wave convention: voltage waves with a = v + R·i (incident) and
- * b = v − R·i (reflected), so v = (a+b)/2 and i = (a−b)/(2R). Reactances
+ * Wave convention: voltage waves with a = v + R*i (incident) and
+ * b = v - R*i (reflected), so v = (a+b)/2 and i = (a-b)/(2R). Reactances
  * use the bilinear (trapezoidal) discretization: a WDF network is therefore
  * sample-exact against the bilinear transform of its analog transfer
  * function, which is how this header is verified (RC and RLC against the
  * analytic discrete response; diode clippers against a high-precision
- * trapezoidal reference solve of the circuit ODE — the same integration
+ * trapezoidal reference solve of the circuit ODE -- the same integration
  * SPICE `.tran` uses).
  *
- * Trees are composed statically from references — no virtual dispatch, all
+ * Trees are composed statically from references -- no virtual dispatch, all
  * scattering inlines. Per sample: call `root.process()` after updating
  * source voltages, then read element voltages/currents.
  *
@@ -44,12 +44,12 @@
  * @endcode
  *
  * Beyond series/parallel trees, the header provides an **R-type adaptor**
- * (after K. Werner's thesis): an N-port connector for arbitrary — non
- * series/parallel — topologies. Its scattering matrix is derived numerically
+ * (after K. Werner's thesis): an N-port connector for arbitrary -- non
+ * series/parallel -- topologies. Its scattering matrix is derived numerically
  * from the interconnection network via Modified Nodal Analysis: each port is
  * replaced by its instantaneous Thévenin equivalent (source a_i, resistance
  * R_i), the linear node system is solved once per topology/parameter change,
- * and S = 2M − I where M maps incident waves to port voltages. The up-facing
+ * and S = 2M - I where M maps incident waves to port voltages. The up-facing
  * port is adapted to the Thévenin resistance seen looking into the network,
  * so R-types nest under any root. `ToneStackFMV` builds on it: the exact
  * Fender '59 Bassman treble/bass/middle network (topology and verification
@@ -65,8 +65,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <tuple>
+#include <utility>
 
 namespace dspark {
 namespace wdf {
@@ -380,9 +382,9 @@ namespace detail {
 /**
  * @brief Bisection-safeguarded Newton-Raphson for monotonic wave equations.
  *
- * Solves f(v) = v + i(v)·R_total - a = 0 where i(v) is monotonically
+ * Solves f(v) = v + i(v)*R_total - a = 0 where i(v) is monotonically
  * increasing, so the solution is bracketed by [min(0,a), max(0,a)]. Newton
- * steps that leave the shrinking bracket fall back to bisection — guaranteed
+ * steps that leave the shrinking bracket fall back to bisection -- guaranteed
  * convergence for any drive level, typically 1-3 iterations at audio rates
  * thanks to the previous-sample seed.
  *
@@ -550,7 +552,7 @@ private:
  * of (node+, node-) pairs over a small node graph (-1 = ground reference).
  *
  * On every updatePorts() the scattering matrix is rebuilt from Modified
- * Nodal Analysis with the children's current port resistances — O(nodes³),
+ * Nodal Analysis with the children's current port resistances -- O(nodes^3),
  * a few microseconds for typical circuits, fine for pot automation.
  *
  * @tparam T        Sample type of the wave interface.
@@ -574,6 +576,17 @@ public:
         : children_(children...), portNodes_(portNodes),
           numNodes_(std::clamp(numNodes, 1, kMaxNodes))
     {
+        assert(numNodes >= 1 && numNodes <= kMaxNodes);
+        // Release-safe node sanitising: an out-of-range node index would
+        // stamp the conductance/RHS arrays out of bounds. Clamp into
+        // [-1, numNodes_-1] (-1 = ground); a clamped topology is wrong but
+        // cannot corrupt memory.
+        for (auto& [p, m] : portNodes_)
+        {
+            assert(p >= -1 && p < numNodes_ && m >= -1 && m < numNodes_);
+            p = std::clamp(p, -1, numNodes_ - 1);
+            m = std::clamp(m, -1, numNodes_ - 1);
+        }
     }
 
     void prepare(double sampleRate) noexcept
@@ -780,23 +793,23 @@ private:
  *
  * Topology and component values after Yeh & Smith, "Discretization of the
  * '59 Fender Bassman Tone Stack" (DAFx-06), figure 1: C1 = 250 pF into the
- * treble pot (R1 = 250 kΩ, output at the wiper), R4 = 56 kΩ into the slope
- * node, C2 = C3 = 20 nF from the slope node to the bass rheostat (l·R2,
- * R2 = 1 MΩ) and to the middle pot wiper (R3 = 25 kΩ) respectively. The
+ * treble pot (R1 = 250 k ohm, output at the wiper), R4 = 56 k ohm into the slope
+ * node, C2 = C3 = 20 nF from the slope node to the bass rheostat (l*R2,
+ * R2 = 1 M ohm) and to the middle pot wiper (R3 = 25 k ohm) respectively. The
  * source is modelled with a series output resistance (cathode-follower
  * buffer) and the wiper drives a grid-load resistance.
  *
  * Solved exactly as one 12-port R-type. The suite verifies it sample-exact
  * against the bilinear transform of the paper's symbolic transfer function.
- * Controls are not orthogonal — that interaction is the circuit's character.
+ * Controls are not orthogonal -- that interaction is the circuit's character.
  */
 template <FloatType T>
 class ToneStackFMV
 {
 public:
     /**
-     * @param sourceResistance Driving stage output impedance (default 1 kΩ).
-     * @param loadResistance   Following stage grid load (default 1 MΩ).
+     * @param sourceResistance Driving stage output impedance (default 1 k ohm).
+     * @param loadResistance   Following stage grid load (default 1 M ohm).
      */
     explicit ToneStackFMV(double sourceResistance = 1e3, double loadResistance = 1e6)
         : rOut_(static_cast<T>(sourceResistance)), c1_(T(0.25e-9)),

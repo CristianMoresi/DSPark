@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -7,7 +7,7 @@
  * @file FIRFilter.h
  * @brief FIR (Finite Impulse Response) filter with windowed-sinc coefficient design.
  *
- * FIR filters provide **linear phase** response — they do not distort the phase
+ * FIR filters provide **linear phase** response -- they do not distort the phase
  * of the signal. This makes them essential for:
  * - Mastering-grade equalisation
  * - Linear-phase crossovers
@@ -23,14 +23,18 @@
  * | Latency      | Minimal             | N/2 samples             |
  * | Stability    | Always stable       | Always stable           |
  *
- * For short FIR filters (<= ~256 taps), direct convolution is used via the 
- * FIRFilter class, which features a lock-free Ping-Pong buffer for safe 
- * real-time coefficient updates and strictly aligned memory for SIMD vectorization.
- * * Dependencies: WindowFunctions.h, DspMath.h, SimdOps.h, AudioBuffer.h
+ * For short FIR filters (<= ~256 taps), direct convolution is used via the
+ * FIRFilter class, which features a lock-free ping-pong coefficient publish
+ * for safe real-time updates and SIMD (simd::dotProduct) convolution.
+ *
+ * Coefficient design (FIRDesign) always runs its maths in double precision
+ * and casts to T on return: design is setup-time work, so float builds get
+ * full float accuracy for free.
+ *
+ * Dependencies: WindowFunctions.h, SimdOps.h, AudioBuffer.h.
  */
 
 #include "AudioBuffer.h"
-#include "DspMath.h"
 #include "SimdOps.h"
 #include "WindowFunctions.h"
 
@@ -45,7 +49,7 @@
 namespace dspark {
 
 // ============================================================================
-// FIRDesign — Coefficient design via windowed-sinc method
+// FIRDesign -- Coefficient design via windowed-sinc method
 // ============================================================================
 
 /**
@@ -60,8 +64,8 @@ namespace dspark {
  * More taps = steeper transition but more latency and computation.
  *
  * Rule of thumb for number of taps:
- * - `N ≈ 4 / (transitionWidth / sampleRate)` for a Kaiser window
- * - For a 1 kHz transition band at 48 kHz: N ≈ 4 / (1000/48000) ≈ 192 taps
+ * - `N ~ 4 / (transitionWidth / sampleRate)` for a Kaiser window
+ * - For a 1 kHz transition band at 48 kHz: N ~ 4 / (1000/48000) ~ 192 taps
  * - Always use an **odd** number for symmetric (Type I) FIR filters
  *
  * @tparam T Coefficient type (float or double).
@@ -74,8 +78,8 @@ public:
      * @brief Designs a low-pass FIR filter.
      *
      * @param sampleRate Sample rate in Hz.
-     * @param cutoffHz   Cutoff frequency in Hz (−6 dB point).
-     * @param numTaps    Number of filter taps (must be odd, ≥ 3).
+     * @param cutoffHz   Cutoff frequency in Hz (-6 dB point).
+     * @param numTaps    Number of filter taps (must be odd, >= 3).
      * @param beta       Kaiser window beta (default: 5.0). Higher = more attenuation.
      * @return Vector of filter coefficients.
      */
@@ -94,7 +98,7 @@ public:
      *
      * @param sampleRate Sample rate in Hz.
      * @param cutoffHz   Cutoff frequency in Hz.
-     * @param numTaps    Number of filter taps (must be odd, ≥ 3).
+     * @param numTaps    Number of filter taps (must be odd, >= 3).
      * @param beta       Kaiser window beta.
      * @return Vector of filter coefficients.
      */
@@ -114,7 +118,7 @@ public:
      * @param sampleRate  Sample rate in Hz.
      * @param lowCutoffHz Lower cutoff frequency in Hz.
      * @param highCutoffHz Upper cutoff frequency in Hz.
-     * @param numTaps     Number of filter taps (must be odd, ≥ 3).
+     * @param numTaps     Number of filter taps (must be odd, >= 3).
      * @param beta        Kaiser window beta.
      * @return Vector of filter coefficients.
      */
@@ -141,7 +145,7 @@ public:
      * @param sampleRate  Sample rate in Hz.
      * @param lowCutoffHz Lower cutoff frequency in Hz.
      * @param highCutoffHz Upper cutoff frequency in Hz.
-     * @param numTaps     Number of filter taps (must be odd, ≥ 3).
+     * @param numTaps     Number of filter taps (must be odd, >= 3).
      * @param beta        Kaiser window beta.
      * @return Vector of filter coefficients.
      */
@@ -149,6 +153,13 @@ public:
                                                   double highCutoffHz, int numTaps,
                                                   T beta = T(5)) noexcept
     {
+        assert(numTaps >= 3 && (numTaps % 2 == 1));
+        // Sanitise HERE too: bandPass() sanitises its own copy, so an even
+        // request would return numTaps+1 coefficients while the loops below
+        // still ran over the caller's numTaps -- leaving the last tap
+        // un-negated (a broken, asymmetric filter) in release builds.
+        numTaps = sanitizeTaps(numTaps);
+
         auto bp = bandPass(sampleRate, lowCutoffHz, highCutoffHz, numTaps, beta);
 
         // Spectral inversion: negate all and add 1 to centre tap
@@ -167,14 +178,17 @@ public:
      * to achieve the desired stopband attenuation with a given transition bandwidth.
      *
      * @param sampleRate      Sample rate in Hz.
-     * @param transitionHz    Width of the transition band in Hz.
+     * @param transitionHz    Width of the transition band in Hz. Must be > 0.
      * @param attenuationDb   Desired stopband attenuation in dB (positive value, e.g., 60).
      * @return Estimated number of taps (always odd).
      */
     [[nodiscard]] static int estimateTaps(double sampleRate, double transitionHz,
                                            double attenuationDb) noexcept
     {
-        double normTransition = transitionHz / sampleRate;
+        assert(sampleRate > 0.0 && transitionHz > 0.0);
+        // Release-safe floor: a zero/negative transition width would push the
+        // estimate through ceil(inf) into undefined integer conversion.
+        double normTransition = std::max(transitionHz / sampleRate, 1e-6);
         int n = static_cast<int>(std::ceil((attenuationDb - 7.95) / (14.36 * normTransition)));
         if (n < 3) n = 3;
         if (n % 2 == 0) ++n; // Ensure odd
@@ -209,7 +223,7 @@ private:
     }
 
     /**
-     * @brief Core windowed-sinc FIR design.
+     * @brief Core windowed-sinc FIR design. All maths in double; cast on store.
      *
      * @param normFreq Normalised cutoff frequency (cutoff / sampleRate), range [0, 0.5].
      * @param numTaps  Number of taps (odd).
@@ -220,81 +234,76 @@ private:
     [[nodiscard]] static std::vector<T> designSinc(double normFreq, int numTaps,
                                                     T beta, bool invert) noexcept
     {
-        std::vector<T> coeffs(static_cast<size_t>(numTaps));
-        std::vector<T> window(static_cast<size_t>(numTaps));
+        std::vector<double> design(static_cast<size_t>(numTaps));
+        std::vector<double> window(static_cast<size_t>(numTaps));
 
-        // Generate Kaiser window
-        WindowFunctions<T>::kaiser(window.data(), numTaps, beta, false);
+        // Generate Kaiser window (double engine regardless of T)
+        WindowFunctions<double>::kaiser(window.data(), numTaps,
+                                        static_cast<double>(beta), false);
 
         const int centre = numTaps / 2;
         const double fc = normFreq * 2.0; // Normalised to [0, 1] for sinc
         constexpr double kPi = std::numbers::pi;
 
-        // Compute windowed sinc
+        // Compute windowed sinc and its DC sum in one pass
+        double sum = 0.0;
         for (int i = 0; i < numTaps; ++i)
         {
-            int n = i - centre;
-            if (n == 0)
-            {
-                coeffs[static_cast<size_t>(i)] = static_cast<T>(fc);
-            }
-            else
-            {
-                double x = static_cast<double>(n) * kPi;
-                coeffs[static_cast<size_t>(i)] = static_cast<T>(
-                    std::sin(fc * x) / x);
-            }
-
-            // Apply window
-            coeffs[static_cast<size_t>(i)] *= window[static_cast<size_t>(i)];
+            const int n = i - centre;
+            const double x = static_cast<double>(n) * kPi;
+            const double s = (n == 0) ? fc : std::sin(fc * x) / x;
+            const double c = s * window[static_cast<size_t>(i)];
+            design[static_cast<size_t>(i)] = c;
+            sum += c;
         }
 
         // Normalise for unity gain at DC (low-pass) or Nyquist (high-pass)
-        T sum = T(0);
-        for (auto c : coeffs) sum += c;
-        if (std::abs(sum) > T(1e-10))
+        if (std::abs(sum) > 1e-10)
         {
-            T invSum = T(1) / sum;
-            for (auto& c : coeffs) c *= invSum;
+            const double invSum = 1.0 / sum;
+            for (auto& c : design) c *= invSum;
         }
 
         // Spectral inversion for high-pass
         if (invert)
         {
-            for (auto& c : coeffs) c = -c;
-            coeffs[static_cast<size_t>(centre)] += T(1);
+            for (auto& c : design) c = -c;
+            design[static_cast<size_t>(centre)] += 1.0;
         }
 
+        std::vector<T> coeffs(static_cast<size_t>(numTaps));
+        for (int i = 0; i < numTaps; ++i)
+            coeffs[static_cast<size_t>(i)] = static_cast<T>(design[static_cast<size_t>(i)]);
         return coeffs;
     }
 };
 
 // ============================================================================
-// FIRFilter — FIR filter processor (SIMD direct convolution, Thread-Safe)
+// FIRFilter -- FIR filter processor (SIMD direct convolution, thread-safe)
 // ============================================================================
 
 /**
  * @class FIRFilter
  * @brief FIR filter using direct-form convolution with a mirrored delay line.
  *
- * Optimized for CPU cache and explicit SIMD vectorization.
- * Implements a lock-free Ping-Pong buffer for safe asynchronous coefficient 
- * updates from the UI thread without reallocating memory on the audio thread.
- * * @warning To guarantee 32-byte alignment for AVX/SIMD instructions, the internal 
- * `std::vector` instances should ideally use a custom AlignedAllocator. 
- * Currently relies on the OS default heap alignment and unaligned SIMD loads.
+ * Implements a lock-free coefficient publish (seqlock) for safe asynchronous
+ * updates from the control thread without reallocating memory on the audio
+ * thread; the convolution itself runs through simd::dotProduct.
+ *
+ * @note Buffers use the default heap alignment; the SIMD kernels use
+ *       unaligned loads, which cost the same as aligned on modern CPUs.
  *
  * @tparam T Sample type (float or double).
  */
 template <typename T>
-class alignas(32) FIRFilter
+class FIRFilter
 {
 public:
     FIRFilter() = default;
     ~FIRFilter() = default;
 
     /**
-     * @brief Pre-allocates memory and initializes the delay lines. 
+     * @brief Pre-allocates memory and initializes the delay lines.
      * @note MUST be called offline (e.g., in prepareToPlay) before any processing.
      *
      * @param maxTaps     Maximum number of filter coefficients supported.
@@ -312,7 +321,7 @@ public:
         // buffer (copied once per update, never overwritten mid-block).
         stagingCoeffs_.assign(static_cast<size_t>(maxTaps_), T(0));
         activeCoeffs_.assign(static_cast<size_t>(maxTaps_), T(0));
-        stagingTaps_  = 0;
+        stagingTaps_.store(0, std::memory_order_relaxed);
         activeTaps_   = 0;
         coeffSeq_.store(0, std::memory_order_release);
         coeffDirty_.store(false, std::memory_order_release);
@@ -348,13 +357,14 @@ public:
         // Write REVERSED coefficients to the staging buffer for SIMD dot product.
         for (int k = 0; k < numTaps; ++k)
             stagingCoeffs_[static_cast<size_t>(k)] = coeffs[static_cast<size_t>(numTaps - 1 - k)];
-        stagingTaps_ = numTaps;
+        stagingTaps_.store(numTaps, std::memory_order_relaxed);
         coeffSeq_.fetch_add(1, std::memory_order_release); // even = consistent
         coeffDirty_.store(true, std::memory_order_release);
         reportedTaps_.store(numTaps, std::memory_order_release);
     }
 
-    /** * @brief Resets all delay lines to zero, clearing the filter's memory. 
+    /**
+     * @brief Resets all delay lines to zero, clearing the filter's memory.
      */
     void reset() noexcept
     {
@@ -364,8 +374,9 @@ public:
 
     /**
      * @brief Processes a full audio buffer in-place.
-     * * Standardized to match the rest of the DSPark framework. Loads atomic 
-     * state once per block to avoid intra-block tearing and pipeline stalls.
+     *
+     * Loads atomic state once per block to avoid intra-block tearing and
+     * pipeline stalls.
      *
      * @param buffer Audio buffer view to process.
      */
@@ -411,7 +422,8 @@ public:
 
     /**
      * @brief Processes a single sample through the FIR filter.
-     * * @warning Use `processBlock` instead when possible to avoid atomic load 
+     *
+     * @warning Use `processBlock` instead when possible to avoid atomic load
      * overhead on a per-sample basis.
      *
      * @param input   Input sample.
@@ -451,8 +463,10 @@ public:
         return output;
     }
 
-    /** * @brief Returns the filter's group delay (latency) in samples. 
-     * @return Latency in samples based on currently active taps.
+    /**
+     * @brief Returns the filter's group delay (latency) in samples.
+     * @return Latency based on the most recently PUBLISHED tap count (the
+     *         audio thread may adopt it one block later).
      */
     [[nodiscard]] int getLatency() const noexcept
     {
@@ -470,10 +484,17 @@ private:
         int n;
         do {
             s0 = coeffSeq_.load(std::memory_order_acquire);
-            n  = stagingTaps_;
+            // Defensive clamp: the loop bound must never exceed the buffers
+            // even if this speculative read races a concurrent publish.
+            n = std::min(stagingTaps_.load(std::memory_order_relaxed), maxTaps_);
             for (int k = 0; k < n; ++k)
                 activeCoeffs_[static_cast<size_t>(k)] = stagingCoeffs_[static_cast<size_t>(k)];
-            s1 = coeffSeq_.load(std::memory_order_acquire);
+            // The fence orders the copy above BEFORE the re-read below. A plain
+            // load-acquire is not enough: acquire only orders LATER accesses,
+            // so on weakly-ordered CPUs (ARM) the copy could sink below the
+            // second read and a torn copy would pass the s0 == s1 check.
+            std::atomic_thread_fence(std::memory_order_acquire);
+            s1 = coeffSeq_.load(std::memory_order_relaxed);
         } while ((s0 & 1u) != 0u || s0 != s1);
         activeTaps_ = n;
     }
@@ -484,7 +505,7 @@ private:
 
     // SPSC seqlock coefficient publication (writer: setCoefficients).
     std::vector<T> stagingCoeffs_;          ///< Shared staging (reversed coeffs).
-    int stagingTaps_{0};                    ///< Guarded by coeffSeq_.
+    std::atomic<int> stagingTaps_{0};       ///< Guarded by coeffSeq_ (relaxed slot).
     std::atomic<unsigned> coeffSeq_{0};     ///< Seqlock counter (odd = writing).
     std::atomic<bool> coeffDirty_{false};   ///< Pending-update flag (fast path).
     std::atomic<int> reportedTaps_{0};      ///< Latest set tap count for getLatency().

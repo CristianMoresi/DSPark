@@ -1,28 +1,35 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
 /**
  * @file Oversampling.h
- * @brief Real-time oversampling using Polyphase Half-Band FIR filters.
+ * @brief Power-of-two oversampling with polyphase half-band FIR filters.
  *
- * Provides CPU-efficient upsampling and downsampling to reduce aliasing in nonlinear 
- * processing. This implementation uses a polyphase decomposition of Kaiser-windowed 
- * symmetric half-band filters. 
+ * Cascaded 2x stages built on Kaiser-windowed symmetric half-band filters.
+ * Each upsampling stage runs as a polyphase pair (even-tap FIR phase plus a
+ * pure-delay centre-tap phase), so zero-stuffed buffers are never
+ * materialised. Each decimating stage runs the full symmetric kernel on the
+ * high-rate stream and keeps one sample in two, which keeps every tap aligned
+ * to its true high-rate position. All FIR inner loops run through
+ * simd::dotProduct (SSE2/AVX/NEON with scalar fallback).
  *
- * By exploiting the polyphase structure, zero-stuffing and discarding samples are 
- * avoided entirely. The process is block-based and linear in memory, allowing 
- * modern compilers to auto-vectorize (SIMD) the convolution loops natively. All
- * in-place operations are memory-safe and optimized for CPU cache.
+ * Features:
+ * - Factors 1/2/4/8/16 with four quality presets (31..255 taps per stage).
+ * - Block-based streaming; variable block sizes are supported (the per-stage
+ *   histories are block-size agnostic).
+ * - Exact integer group delay reported by getLatency() for plugin delay
+ *   compensation.
+ * - Zero allocations after prepare(); upsample()/downsample() are noexcept.
  *
- * @note Memory is strictly pre-allocated in `prepare()`. No allocations occur 
- * during the `process()` thread.
+ * Dependencies: AudioBuffer.h, AudioSpec.h, FIRFilter.h, SimdOps.h.
  */
 
 #include "AudioBuffer.h"
 #include "AudioSpec.h"
 #include "FIRFilter.h"
+#include "SimdOps.h"
 
 #include <algorithm>
 #include <array>
@@ -35,6 +42,23 @@ namespace dspark {
 /**
  * @class Oversampling
  * @brief Power-of-two oversampling processor with polyphase anti-aliasing.
+ *
+ * Usage is a paired streaming operation per audio callback:
+ * @code
+ * auto up = os.upsample(block);   // 1. base rate -> high rate
+ * process(up);                    // 2. nonlinear processing at the high rate
+ * os.downsample(block);           // 3. high rate -> base rate, in place
+ * @endcode
+ *
+ * @note upsample() and downsample() form a pair: downsample() consumes the
+ *       high-rate samples the most recent upsample() left in the internal
+ *       buffer, so call them once each per block, with the same block length.
+ *
+ * Threading: prepare() and reset() belong to the setup thread (prepare
+ * allocates). upsample() and downsample() belong to the audio thread and are
+ * noexcept and allocation-free. There are no runtime setters -- factor and
+ * quality are fixed at construction and all filter state is only touched by
+ * the audio thread -- so no cross-thread synchronisation is needed.
  *
  * @tparam T           Sample type (float or double).
  * @tparam MaxChannels Maximum number of channels supported.
@@ -59,18 +83,25 @@ public:
      * @param factor  Oversampling factor. Must be a power of two (1, 2, 4, 8, 16).
      * @param quality Filter quality preset. Default is High (-80 dB).
      * @pre factor >= 1 and is a power of 2.
+     * @note Release builds normalise an invalid factor into range and round it
+     *       down to a power of two (debug builds assert).
      */
     explicit Oversampling(int factor = 2, Quality quality = Quality::High)
-        : factor_(factor), quality_(quality)
+        : quality_(quality)
     {
         assert(factor >= 1 && (factor & (factor - 1)) == 0 && "Factor must be a power of 2");
         assert(factor <= (1 << kMaxStages) && "Factor must be <= 16 (kMaxStages stages)");
-        // Clamp for Release safety: only kMaxStages polyphase stages exist, so a
-        // factor above 2^kMaxStages would index filters_ out of bounds.
-        factor_ = std::clamp(factor, 1, 1 << kMaxStages);
+        // Release-safe normalisation: clamp into [1, 2^kMaxStages], then derive
+        // the stage count and re-derive factor_ = 2^numStages_ so the pair stays
+        // coherent even for a non-power-of-two request. An incoherent pair
+        // (e.g. factor_ = 3 driving one 2x stage) would make downsample() emit
+        // factor_/2 samples per base sample -- overrunning the caller's output
+        // buffer -- and overflow the per-stage histories sized for 2^numStages_.
+        factor = std::clamp(factor, 1, 1 << kMaxStages);
         numStages_ = 0;
-        int f = factor_;
-        while (f > 1) { ++numStages_; f >>= 1; }
+        while ((1 << (numStages_ + 1)) <= factor)
+            ++numStages_;
+        factor_ = 1 << numStages_;
     }
 
     /**
@@ -109,7 +140,7 @@ public:
 
     /** @brief Returns the current oversampling factor. */
     [[nodiscard]] int getFactor() const noexcept { return factor_; }
-    
+
     /** @brief Returns the current quality preset. */
     [[nodiscard]] Quality getQuality() const noexcept { return quality_; }
 
@@ -132,8 +163,13 @@ public:
 
     /**
      * @brief Upsamples the input base-rate signal into the internal high-rate buffer.
-     * @param input View of the base-rate audio buffer.
-     * @return A view of the internal oversampled buffer (length = input.samples * factor).
+     *
+     * @param input View of the base-rate audio buffer. Blocks longer than
+     *        prepare()'s maxBlockSize are truncated (release-safe); channels
+     *        beyond the prepared channel count are ignored.
+     * @return A view of the internal oversampled buffer (length = input samples * factor).
+     * @note Real-time safe. Pair every call with one downsample() of the same
+     *       block length before the next upsample().
      */
     [[nodiscard]] AudioBufferView<T> upsample(AudioBufferView<const T> input) noexcept
     {
@@ -165,7 +201,13 @@ public:
 
     /**
      * @brief Downsamples the internal high-rate buffer back to base-rate.
+     *
+     * Consumes the high-rate samples written by the most recent upsample()
+     * (and modified in place by the caller in between).
+     *
      * @param output Buffer view where the base-rate samples will be written.
+     *        Use the same block length as the paired upsample() input.
+     * @note Real-time safe.
      */
     void downsample(AudioBufferView<T> output) noexcept
     {
@@ -216,7 +258,7 @@ private:
         int delaySamples = 0;
 
         /**
-         * @brief State tracking per channel, optimizing memory alignment for SIMD.
+         * @brief Per-channel FIR state.
          */
         struct ChannelState {
             std::vector<T> history;    ///< Contiguous sliding-window history for the FIR convolution.
@@ -237,7 +279,7 @@ private:
             // INVARIANT: the polyphase split below collects the array-even taps,
             // which coincide with the non-zero (odd-from-centre) half-band taps
             // ONLY when halfOrder is odd. All quality presets (taps 31/63/127/255
-            // → halfOrder 15/31/63/127) satisfy this. If you add a preset, keep
+            // -> halfOrder 15/31/63/127) satisfy this. If you add a preset, keep
             // (taps-1)/2 odd or the filter degenerates to silence.
             assert((halfOrder & 1) == 1 && "half-band polyphase requires odd halfOrder");
             // Pure-delay alignment for the centre-tap (odd) phase. With the full
@@ -260,7 +302,7 @@ private:
             // Full symmetric kernel for the downsampler. Decimation is done as a
             // single, unambiguous high-rate convolution (filter then pick every
             // other sample), which keeps every tap aligned to its true high-rate
-            // position — unlike an even/odd polyphase split with independent
+            // position -- unlike an even/odd polyphase split with independent
             // delays, which left a 0.5-sample mismatch between the FIR and centre
             // branches and capped the round-trip SNR.
             fullTaps.assign(fullCoeffs.begin(), fullCoeffs.end());
@@ -294,7 +336,9 @@ private:
         void processUpsample(AudioBufferView<const T> input, AudioBufferView<T> output, int nCh, int nS) noexcept
         {
             const int numTaps = static_cast<int>(evenTaps.size());
-            
+            const T* taps = evenTaps.data();
+            const T centre2 = centerTap * T(2);
+
             for (int ch = 0; ch < nCh; ++ch)
             {
                 const T* src = input.getChannel(ch);
@@ -302,59 +346,51 @@ private:
                 auto& hist = upChannels[ch].history;
 
                 // Append the new block after the fixed numTaps-sample history prefix.
-                std::memcpy(hist.data() + numTaps, src, nS * sizeof(T));
+                std::memcpy(hist.data() + numTaps, src, static_cast<std::size_t>(nS) * sizeof(T));
 
-                // Hint for compiler auto-vectorization
-                T* __restrict dstR = dst;
-                const T* __restrict histR = hist.data();
-                const T* __restrict tapsR = evenTaps.data();
-
+                const T* histD = hist.data();
                 for (int i = 0; i < nS; ++i)
                 {
-                    T sum = T(0);
-                    // This inner loop will now safely auto-vectorize
-                    for (int k = 0; k < numTaps; ++k)
-                        sum += tapsR[k] * histR[i + k];
-                    
-                    dstR[i * 2] = sum * T(2); 
-                    dstR[i * 2 + 1] = histR[i + numTaps - delaySamples] * centerTap * T(2);
+                    // Even phase: SIMD FIR over the non-zero half-band taps.
+                    dst[i * 2] = simd::dotProductT(taps, histD + i, numTaps) * T(2);
+                    // Odd phase: pure delay through the centre tap.
+                    dst[i * 2 + 1] = histD[i + numTaps - delaySamples] * centre2;
                 }
 
                 // Save the trailing numTaps input samples for the next block. Using
                 // the current nS keeps this correct under variable block sizes.
-                std::memmove(hist.data(), hist.data() + nS, numTaps * sizeof(T));
+                std::memmove(hist.data(), hist.data() + nS, static_cast<std::size_t>(numTaps) * sizeof(T));
             }
         }
 
         void processUpsampleInPlace(AudioBufferView<T> buffer, int nCh, int currentLen) noexcept
         {
             const int numTaps = static_cast<int>(evenTaps.size());
-            
+            const T* taps = evenTaps.data();
+            const T centre2 = centerTap * T(2);
+
             for (int ch = 0; ch < nCh; ++ch)
             {
-                T* data = buffer.getChannel(ch); 
+                T* data = buffer.getChannel(ch);
                 auto& hist = upChannels[ch].history;
 
-                // Append the new block after the fixed numTaps-sample history prefix.
-                std::memcpy(hist.data() + numTaps, data, currentLen * sizeof(T));
+                // Append the new block after the fixed numTaps-sample history
+                // prefix. The FIR below reads only from this copy, which is what
+                // makes the x2 in-place expansion of `data` safe.
+                std::memcpy(hist.data() + numTaps, data, static_cast<std::size_t>(currentLen) * sizeof(T));
 
-                T* __restrict dataR = data;
-                const T* __restrict histR = hist.data();
-                const T* __restrict tapsR = evenTaps.data();
-
+                const T* histD = hist.data();
                 for (int i = 0; i < currentLen; ++i)
                 {
-                    T sum = T(0);
-                    for (int k = 0; k < numTaps; ++k)
-                        sum += tapsR[k] * histR[i + k];
-                    
-                    dataR[i * 2] = sum * T(2); 
-                    dataR[i * 2 + 1] = histR[i + numTaps - delaySamples] * centerTap * T(2);
+                    // Even phase: SIMD FIR over the non-zero half-band taps.
+                    data[i * 2] = simd::dotProductT(taps, histD + i, numTaps) * T(2);
+                    // Odd phase: pure delay through the centre tap.
+                    data[i * 2 + 1] = histD[i + numTaps - delaySamples] * centre2;
                 }
 
                 // Save the trailing numTaps input samples for the next block. Using
                 // the current length keeps this correct under variable block sizes.
-                std::memmove(hist.data(), hist.data() + currentLen, numTaps * sizeof(T));
+                std::memmove(hist.data(), hist.data() + currentLen, static_cast<std::size_t>(numTaps) * sizeof(T));
             }
         }
 
@@ -362,8 +398,8 @@ private:
         // incoming high-rate stream with the full symmetric kernel, then keep one
         // sample in two. Every tap multiplies its true high-rate neighbour, so the
         // FIR and centre contributions stay perfectly aligned (no polyphase
-        // 0.5-sample mismatch). The forward form histR[2n+k] exploits kernel
-        // symmetry (h[k]==h[nTaps-1-k]) for clean auto-vectorisation.
+        // 0.5-sample mismatch). Each output is one contiguous simd::dotProduct
+        // over hist[2n .. 2n+nTaps).
         //
         // hist layout (per channel, block-size agnostic): hist[0..hLen-1] carries
         // the previous block's trailing hLen high-rate samples; the new block is
@@ -373,6 +409,7 @@ private:
             const int outLen = currentLen / 2;
             const int nTaps  = static_cast<int>(fullTaps.size());
             const int hLen   = nTaps - 1;
+            const T* h = fullTaps.data();
 
             for (int ch = 0; ch < nCh; ++ch)
             {
@@ -382,18 +419,9 @@ private:
 
                 std::memcpy(hist.data() + hLen, src, static_cast<std::size_t>(currentLen) * sizeof(T));
 
-                const T* __restrict h     = fullTaps.data();
-                const T* __restrict histR = hist.data();
-                T* __restrict dstR        = dst;
-
+                const T* histD = hist.data();
                 for (int n = 0; n < outLen; ++n)
-                {
-                    const int base = 2 * n;
-                    T sum = T(0);
-                    for (int k = 0; k < nTaps; ++k)
-                        sum += h[k] * histR[base + k];
-                    dstR[n] = sum;
-                }
+                    dst[n] = simd::dotProductT(h, histD + 2 * n, nTaps);
 
                 std::memmove(hist.data(), hist.data() + currentLen, static_cast<std::size_t>(hLen) * sizeof(T));
             }
@@ -404,6 +432,7 @@ private:
             const int outLen = currentLen / 2;
             const int nTaps  = static_cast<int>(fullTaps.size());
             const int hLen   = nTaps - 1;
+            const T* h = fullTaps.data();
 
             for (int ch = 0; ch < nCh; ++ch)
             {
@@ -412,18 +441,9 @@ private:
 
                 std::memcpy(hist.data() + hLen, data, static_cast<std::size_t>(currentLen) * sizeof(T));
 
-                const T* __restrict h     = fullTaps.data();
-                const T* __restrict histR = hist.data();
-                T* __restrict dataR       = data;
-
+                const T* histD = hist.data();
                 for (int n = 0; n < outLen; ++n)
-                {
-                    const int base = 2 * n;
-                    T sum = T(0);
-                    for (int k = 0; k < nTaps; ++k)
-                        sum += h[k] * histR[base + k];
-                    dataR[n] = sum;
-                }
+                    data[n] = simd::dotProductT(h, histD + 2 * n, nTaps);
 
                 std::memmove(hist.data(), hist.data() + currentLen, static_cast<std::size_t>(hLen) * sizeof(T));
             }
@@ -434,8 +454,8 @@ private:
     {
         switch (q)
         {
-            case Quality::Low:     return 31; 
-            case Quality::Medium:  return 63; 
+            case Quality::Low:     return 31;
+            case Quality::Medium:  return 63;
             case Quality::High:    return 127;
             case Quality::Maximum: return 255;
         }

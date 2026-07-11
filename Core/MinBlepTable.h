@@ -1,15 +1,30 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
+
+/**
+ * @file MinBlepTable.h
+ * @brief Shared minimum-phase band-limited step (minBLEP) residual table.
+ *
+ * Built once per process from first principles (no baked-in magic data): a
+ * Blackman-Harris windowed sinc cutting at the base-rate Nyquist is converted
+ * to minimum phase via the real cepstrum, integrated into a step, and stored
+ * as a sub-sample-resolved residual. Oscillator uses it to correct every
+ * hard-sync discontinuity causally (no pre-ring, no look-ahead).
+ *
+ * Dependencies: FFT.h, WindowFunctions.h.
+ */
 
 #include "FFT.h"
 #include "WindowFunctions.h"
 
 #include <array>
-#include <vector>
 #include <cmath>
 #include <cstddef>
+#include <numbers>
+#include <type_traits>
+#include <vector>
 
 namespace dspark {
 
@@ -22,11 +37,11 @@ namespace dspark {
  * variant (Brandt, ICMC 2001) concentrates all of its energy at and after the
  * discontinuity, which has two practical consequences:
  *
- * - **Causal correction** — the residual is zero before the event, so no
+ * - **Causal correction** -- the residual is zero before the event, so no
  *   look-ahead, no pre-ringing, and no kernel halves that must be predicted
  *   or un-queued when events collide (the failure mode that makes 2-point
  *   PolyBLEP hard-sync bookkeeping delicate).
- * - **Long kernel for free** — since nothing precedes the event, the kernel
+ * - **Long kernel for free** -- since nothing precedes the event, the kernel
  *   can be dozens of samples long without adding latency, pushing alias
  *   rejection from the ~-40 dB envelope of a 2-point polynomial kernel to
  *   the stopband of a properly windowed sinc (~-90 dB).
@@ -37,15 +52,17 @@ namespace dspark {
  * into a step, and stored as the residual `minBlepStep(t) - unitStep(t)`
  * at @ref kOversample sub-sample positions per output sample.
  *
- * **Usage** — for a discontinuity of amplitude `jump` occurring `frac`
+ * **Usage** -- for a discontinuity of amplitude `jump` occurring `frac`
  * samples before output sample `n` (`frac` in [0, 1)), add
  * `jump * residual(j + frac)` to output sample `n + j` for
  * `j = 0 .. kTaps - 1`. The naive signal must already contain the raw step.
  *
  * @note instance() builds the table on first call (FFT work and temporary
- * heap allocations). Call it once from a control thread — e.g. inside
- * `prepare()` — never from the audio thread. After construction the table
- * is immutable and lock-free to read from any thread.
+ * heap allocations of ~1.6 MB). Call it once from a control thread -- e.g.
+ * inside `prepare()` -- never from the audio thread. After construction the
+ * table is immutable and lock-free to read from any thread. The build is
+ * noexcept by design: an allocation failure during it terminates (fail-fast;
+ * the only caller path is a noexcept prepare() anyway).
  *
  * @tparam T Sample type (float or double). Table generation always runs in
  *           double precision internally.
@@ -68,7 +85,7 @@ public:
      * @brief Returns the process-wide shared table, building it on first call.
      *
      * Thread-safe (C++11 magic static). The one-time build performs FFTs and
-     * temporary allocations — touch it from `prepare()`, not the audio thread.
+     * temporary allocations -- touch it from `prepare()`, not the audio thread.
      */
     static const MinBlepTable& instance() noexcept
     {
@@ -81,7 +98,7 @@ public:
      *
      * @param t Time since the discontinuity, in samples (fractional). Must be
      *          >= 0; values beyond the table return 0 (the step has settled).
-     * @return `minBlepStep(t) - 1` — starts near -1 right at the event (the
+     * @return `minBlepStep(t) - 1` -- starts near -1 right at the event (the
      *         band-limited transition has barely begun) and decays to exactly
      *         0 at the end of the table.
      */
@@ -104,7 +121,7 @@ private:
     {
         constexpr int    n       = kTableSize;     // 4097 oversampled points
         constexpr size_t fftSize = 65536;          // ~16x n keeps cepstral aliasing low
-        constexpr double pi      = 3.14159265358979323846;
+        constexpr double pi      = std::numbers::pi_v<double>;
 
         // -- 1. Linear-phase BLIT: sinc cutting at the base-rate Nyquist
         //       (zeros every kOversample points), Blackman-Harris windowed

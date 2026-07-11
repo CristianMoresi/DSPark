@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -16,7 +16,7 @@
  * For a 2-second reverb IR at 48 kHz (96000 samples), direct convolution would
  * require ~96000 multiplies per sample. FFT-based convolution needs ~20.
  *
- * Dependencies: FFT.h, AudioBuffer.h.
+ * Dependencies: FFT.h, AudioBuffer.h, AudioSpec.h, SimdOps.h.
  *
  * @code
  *   // Load an impulse response from a WAV file:
@@ -38,14 +38,13 @@
  */
 
 #include "AudioBuffer.h"
+#include "AudioSpec.h"
 #include "FFT.h"
 #include "SimdOps.h"
 
 #include <algorithm>
 #include <cassert>
-#include <cstring>
 #include <memory>
-#include <type_traits>
 #include <vector>
 
 namespace dspark {
@@ -73,27 +72,35 @@ public:
      *
      * This is the only method that allocates memory. Call once during setup.
      *
-     * @param blockSize   Processing block size (must be power of two). Determines
-     *                    latency and FFT size. Typical: 128, 256, 512.
+     * @param blockSize   Processing block size. Should be a power of two >= 2
+     *                    (anything else rounds UP release-safely; check
+     *                    getBlockSize()). Determines latency and FFT size.
+     *                    Typical: 128, 256, 512.
      * @param irData      Pointer to the impulse response samples.
      * @param irLength    Number of samples in the impulse response.
      */
     void prepare(int blockSize, const T* irData, int irLength)
     {
-        assert(blockSize >= 1 && (blockSize & (blockSize - 1)) == 0);
+        assert(blockSize >= 2 && (blockSize & (blockSize - 1)) == 0);
         assert(irLength > 0);
         assert(irData != nullptr);
         if (irData == nullptr || irLength <= 0) return;
 
-        blockSize_ = blockSize;
-        fftSize_ = blockSize * 2;
-        numBins_ = fftSize_ + 2; // N/2+1 complex bins × 2
+        // Release-safe normalisation: the FFT needs a power of two >= 4, so
+        // the block needs a power of two >= 2. Round up (never down: rounding
+        // down would shrink the valid overlap-save region below the block).
+        int bs = 2;
+        while (bs < blockSize) bs <<= 1;
+
+        blockSize_ = bs;
+        fftSize_ = bs * 2;
+        numBins_ = fftSize_ + 2; // (N/2 + 1) complex bins, interleaved = N+2 scalars
 
         // Create FFT processor
         fft_ = std::make_unique<FFTReal<T>>(fftSize_);
 
         // Partition the IR into blocks
-        numPartitions_ = (irLength + blockSize - 1) / blockSize;
+        numPartitions_ = (irLength + bs - 1) / bs;
 
         // Pre-transform each IR partition
         irPartitions_.resize(static_cast<size_t>(numPartitions_));
@@ -101,8 +108,8 @@ public:
 
         for (int p = 0; p < numPartitions_; ++p)
         {
-            int offset = p * blockSize;
-            int remaining = std::min(blockSize, irLength - offset);
+            int offset = p * bs;
+            int remaining = std::min(bs, irLength - offset);
 
             // Zero-pad the block to fftSize
             std::fill(paddedBlock.begin(), paddedBlock.end(), T(0));
@@ -116,8 +123,7 @@ public:
         // Allocate working buffers
         inputBuffer_.assign(static_cast<size_t>(fftSize_), T(0));
         outputBuffer_.assign(static_cast<size_t>(fftSize_), T(0));
-        overlapBuffer_.assign(static_cast<size_t>(blockSize), T(0));
-        fftInput_.assign(static_cast<size_t>(numBins_), T(0));
+        overlapBuffer_.assign(static_cast<size_t>(blockSize_), T(0));
         fftAccum_.assign(static_cast<size_t>(numBins_), T(0));
 
         // Frequency-domain delay line (stores past input FFTs)
@@ -144,23 +150,41 @@ public:
     /**
      * @brief Processes a block of audio through the convolver.
      *
-     * Input and output buffers must have at least `numSamples` elements.
-     * The output contains the convolved result.
+     * `numSamples` may exceed the convolution block size: the run loop fires a
+     * partition transform at every block boundary, so arbitrary lengths are
+     * handled. `input` and `output` may be the SAME buffer (full in-place);
+     * partially overlapping buffers are not supported.
      *
      * @param input      Input audio samples.
      * @param output     Output audio samples (convolved result).
-     * @param numSamples Number of samples to process (must be <= blockSize).
+     * @param numSamples Number of samples to process.
      */
     void process(const T* input, T* output, int numSamples) noexcept
     {
-        // numSamples may exceed blockSize_: the sample loop triggers a partition
-        // transform at each block boundary, so arbitrary lengths are handled.
-        for (int i = 0; i < numSamples; ++i)
+        if (blockSize_ == 0) // not prepared: honest pass-through
         {
-            inputBuffer_[static_cast<size_t>(blockSize_ + inputPos_)] = input[i];
-            output[i] = overlapBuffer_[static_cast<size_t>(inputPos_)];
+            if (output != input)
+                std::copy_n(input, numSamples, output);
+            return;
+        }
 
-            ++inputPos_;
+        // Copy in contiguous runs up to the next block boundary instead of
+        // sample-by-sample (this is the per-channel hot path of Reverb).
+        int i = 0;
+        while (i < numSamples)
+        {
+            const int run = std::min(numSamples - i, blockSize_ - inputPos_);
+
+            // Stage the input run first, then overwrite the caller's samples
+            // with the previous block's result -- this ordering is what makes
+            // full in-place (input == output) legal.
+            std::copy_n(input + i, run,
+                        inputBuffer_.begin() + blockSize_ + inputPos_);
+            std::copy_n(overlapBuffer_.begin() + inputPos_, run, output + i);
+
+            inputPos_ += run;
+            i += run;
+
             if (inputPos_ >= blockSize_)
             {
                 processPartitionBlock();
@@ -180,22 +204,7 @@ public:
      */
     void processInPlace(T* data, int numSamples) noexcept
     {
-        // Simple sample-by-sample overlap-save
-        for (int i = 0; i < numSamples; ++i)
-        {
-            inputBuffer_[static_cast<size_t>(blockSize_ + inputPos_)] = data[i];
-            data[i] = overlapBuffer_[static_cast<size_t>(inputPos_)];
-
-            ++inputPos_;
-            if (inputPos_ >= blockSize_)
-            {
-                processPartitionBlock();
-                inputPos_ = 0;
-
-                std::copy_n(outputBuffer_.begin() + blockSize_, static_cast<size_t>(blockSize_),
-                           overlapBuffer_.begin());
-            }
-        }
+        process(data, data, numSamples);
     }
 
     /**
@@ -207,19 +216,14 @@ public:
      * @param irData   Impulse response samples.
      * @param irLength Number of IR samples.
      *
-     * @note M7d1: If `spec.maxBlockSize` is not already a power of two the
-     *       effective FFT block rounds up silently (e.g. 300 → 512),
-     *       doubling the effective latency. Use `getBlockSize()` after
-     *       prepare to inspect the resolved value, or pre-set
-     *       `maxBlockSize` to a power of two.
+     * @note If `spec.maxBlockSize` is not already a power of two the effective
+     *       FFT block rounds up silently (e.g. 300 -> 512), doubling the
+     *       effective latency. Use `getBlockSize()` after prepare to inspect
+     *       the resolved value, or pre-set `maxBlockSize` to a power of two.
      */
     void prepare(const AudioSpec& spec, const T* irData, int irLength)
     {
-        int bs = spec.maxBlockSize;
-        // Round up to next power of two
-        int fftBlock = 1;
-        while (fftBlock < bs) fftBlock <<= 1;
-        prepare(fftBlock, irData, irLength);
+        prepare(spec.maxBlockSize, irData, irLength);
     }
 
     /**
@@ -251,19 +255,17 @@ private:
      * @brief Processes one complete block through the frequency-domain convolution.
      *
      * Steps:
-     * 1. Forward FFT of the input block (zero-padded to 2*blockSize).
-     * 2. Store in the frequency-domain delay line.
-     * 3. Multiply-accumulate all IR partitions with corresponding delayed inputs.
-     * 4. Inverse FFT to get the output block.
+     * 1. Forward FFT of the input block (zero-padded to 2*blockSize), written
+     *    straight into the frequency-domain delay line slot.
+     * 2. Multiply-accumulate all IR partitions with corresponding delayed inputs.
+     * 3. Inverse FFT to get the output block.
      */
     void processPartitionBlock() noexcept
     {
-        // Forward FFT of the input buffer [previous block | current block]
-        fft_->forward(inputBuffer_.data(), fftInput_.data());
-
-        // Store in frequency-domain delay line
-        std::copy(fftInput_.begin(), fftInput_.end(),
-                 fdlBuffer_[static_cast<size_t>(fdlIndex_)].begin());
+        // Forward FFT of the input buffer [previous block | current block],
+        // directly into this block's FDL slot (no intermediate copy).
+        fft_->forward(inputBuffer_.data(),
+                      fdlBuffer_[static_cast<size_t>(fdlIndex_)].data());
 
         // Complex multiply-accumulate: sum over all partitions
         std::fill(fftAccum_.begin(), fftAccum_.end(), T(0));
@@ -274,10 +276,9 @@ private:
             const auto& irPart = irPartitions_[static_cast<size_t>(p)];
             const auto& fdlPart = fdlBuffer_[static_cast<size_t>(fdlIdx)];
 
-            // Complex multiplication and accumulation (SIMD-accelerated for float)
+            // Complex multiplication and accumulation (SIMD-accelerated)
             int bins = numBins_ / 2;
-            complexMulAccum(fdlPart.data(), irPart.data(),
-                            fftAccum_.data(), bins);
+            simd::complexMulAccum(fftAccum_.data(), fdlPart.data(), irPart.data(), bins);
         }
 
         // Inverse FFT
@@ -293,13 +294,6 @@ private:
     }
 
     int blockSize_ = 0;
-    /// Complex multiply-accumulate: accum += a * b over interleaved bins.
-    /// Thin wrapper over the shared SIMD primitive in SimdOps.h.
-    static void complexMulAccum(const T* a, const T* b, T* accum, int bins) noexcept
-    {
-        simd::complexMulAccum(accum, a, b, bins);
-    }
-
     int fftSize_ = 0;
     int numBins_ = 0;
     int numPartitions_ = 0;
@@ -318,7 +312,6 @@ private:
     std::vector<T> inputBuffer_;
     std::vector<T> outputBuffer_;
     std::vector<T> overlapBuffer_;
-    std::vector<T> fftInput_;
     std::vector<T> fftAccum_;
 };
 

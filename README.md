@@ -438,6 +438,28 @@ DSPark/
 
 ---
 
+## What's New in v1.6.1
+
+**Reverb performance**: an Eco engine for constrained targets and direct
+control over convolution IRs, both prompted by real-world feedback from a
+synthesizer firmware project (issue #2).
+
+- **Eco quality mode**: `AlgorithmicReverb::setQuality(Quality::Eco)` runs a
+  reduced engine (8 FDN lines, control-rate modulation, linear allpass
+  interpolation, leaner output stage) measuring about 3.3x cheaper per
+  block, with the same control set and the same decay calibration. The
+  default `Full` engine is bit-identical to v1.6.0.
+- **IR shaping on the convolution reverb**: `setDecayScale()` rescales the
+  impulse response's own T60 (estimated from its Schroeder decay curve) and
+  trims the now-silent tail, so shorter decays also cut convolution cost
+  roughly in proportion; `setStretch()` resamples the IR tape-speed style
+  for larger or smaller spaces. Both always reshape the IR as loaded and
+  republish atomically, exactly like `loadIR()`.
+- **DSParkLab**: a Quality selector on the Reverb and Decay Scale / Stretch
+  sliders on the Convolution Reverb, for instant A/B.
+
+---
+
 ## What's New in v1.6.0
 
 **The host contract**: the plugin layer now covers everything a host can
@@ -476,33 +498,6 @@ each one proven functionally in CI (measured, not just compiled).
   notification — on every platform, on every commit. pluginval and
   clap-validator caught two real state-persistence bugs along the way; both
   fixed and now regression-covered.
-
----
-
-## What's New in v1.5.0
-
-**The editor everywhere**: the WebView editor now runs on all three plugin
-formats and all three desktop platforms — and every one of those paths is
-exercised with a real web view in CI.
-
-- **AU editor (macOS)**: the AU backend announces a Cocoa view factory
-  through `kAudioUnitProperty_CocoaUI`, registered at runtime from the
-  plugin binary itself — still no Objective-C sources and no AppKit link.
-  UI edits flow through `AUParameterSet` and proper begin/end parameter
-  gestures, so Logic-style hosts record automation and undo correctly. Both
-  teardown orders (host releases the view first, or disposes the AudioUnit
-  first) are handled and tested.
-- **Linux editor (X11)**: WebKitGTK resolved entirely through `dlopen` at
-  runtime — no headers, no pkg-config, no link-time dependency — embedded
-  in the host window with GtkPlug/XEmbed. GTK is pumped from the HOST's run
-  loop (a VST3 `IRunLoop` timer / CLAP `timer-support`), never a private
-  main loop; systems without WebKitGTK, or hosts without a usable run loop,
-  cleanly keep the host's generic UI (new runtime `Editor::available()`
-  gate).
-- **Proven, not just compiled**: new `tools/au_editor_smoke` (macOS) and
-  `tools/x11_editor_smoke` (Linux, under xvfb) play real hosts in CI —
-  factory/attach, a live web view, the JS bridge ready-handshake and clean
-  teardown — alongside the existing real-window editor host on Windows.
 
 ---
 

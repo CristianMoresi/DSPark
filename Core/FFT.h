@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -11,38 +11,41 @@
  * Optimised for power-of-two sizes typical in audio.
  *
  * Performance features:
- * - **SIMD-accelerated butterfly**: SSE3 on x86-64 (float and double), NEON on ARM64.
- * - **Aligned Memory Operations**: Assumes and enforces 16-byte aligned pointers for SIMD.
- * - **Zero Allocations**: All buffers pre-allocated in constructors.
+ * - **SIMD-accelerated butterflies**: SSE on x86-64 (float and double, with an
+ *   SSE3 addsub fast path), NEON on ARM64.
+ * - **Unaligned-safe**: forward()/inverse() accept pointers of any alignment;
+ *   the SIMD paths use unaligned loads/stores, which cost the same as the
+ *   aligned forms on every x86 CPU of the last decade.
+ * - **Dedicated first stage**: the stride-2 stage has a twiddle of exactly 1,
+ *   so it runs as a multiply-free pass.
+ * - **Zero allocations** after construction; forward()/inverse() are noexcept.
  *
- * Minimum x86-64 requirement: SSE3 (any CPU from ~2005 onwards). The first
- * generation of Athlon 64 chips (2003-2004) lacked SSE3 and is not supported.
- *
- * @note To fully leverage the 32-byte alignment goal of the DSPark framework, 
- * ensure the pointers passed to forward()/inverse() are aligned, and consider 
- * using a custom aligned allocator for internal std::vector containers.
+ * Minimum x86-64 requirement: SSE2 (the x86-64 baseline). When SSE3 is
+ * available (any CPU from ~2005 onwards, or -msse3) the butterfly uses the
+ * native addsub instruction; otherwise a bit-identical XOR+add fallback runs.
  */
 
 #if defined(_M_AMD64) || defined(_M_X64) || defined(__x86_64__) || defined(__amd64__)
-    #define DSPARK_FFT_SSE3 1
+    #define DSPARK_FFT_SSE 1
     #include <pmmintrin.h> // SSE3 _mm_addsub_* (guarded below) + SSE2 baseline
 #elif defined(__aarch64__) || defined(_M_ARM64)
     #define DSPARK_FFT_NEON 1
     #include <arm_neon.h>
 #endif
 
-#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <numbers>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 // --- Exception policy --------------------------------------------------------
 // By default invalid FFT sizes throw std::invalid_argument. For embedded and
 // plugin builds compiled without exception support, define DSPARK_NO_EXCEPTIONS
-// (auto-detected from -fno-exceptions / /EHs-c-) — invalid sizes then assert in
+// (auto-detected from -fno-exceptions / /EHs-c-) -- invalid sizes then assert in
 // debug and degrade to a safe minimal size in release instead of throwing.
 #if !defined(DSPARK_NO_EXCEPTIONS)
   #if (defined(__GNUC__) || defined(__clang__)) && !defined(__EXCEPTIONS)
@@ -67,7 +70,8 @@ namespace dspark {
  * @brief In-place Cooley-Tukey radix-2 DIT FFT for complex data.
  *
  * Data layout: interleaved [re0, im0, re1, im1, ...], total 2*N elements.
- * * @tparam T Sample type (float or double).
+ *
+ * @tparam T Sample type (float or double).
  */
 template <typename T>
 class FFTComplex
@@ -134,7 +138,7 @@ public:
     }
 
 private:
-#ifdef DSPARK_FFT_SSE3
+#ifdef DSPARK_FFT_SSE
     // _mm_addsub_* is an SSE3 instruction; baseline x86-64 (the Linux/GCC
     // default) is SSE2 only. MSVC exposes the intrinsic unconditionally; on
     // other compilers without -msse3 fall back to negate-even-lanes + add,
@@ -155,14 +159,18 @@ private:
         return _mm_add_pd(a, _mm_xor_pd(b, _mm_setr_pd(-0.0, 0.0)));
 #endif
     }
-#endif // DSPARK_FFT_SSE3
+#endif // DSPARK_FFT_SSE
 
     void computeTwiddles()
     {
         twiddles_.clear();
+        twiddles_.reserve((size_ - 1) * 2);
         size_t numStages = 0;
         for (size_t s = size_; s > 1; s >>= 1) ++numStages;
 
+        // Stage 1 (stride 2, k = 0) contributes the pair (1, -0). butterflyPass
+        // runs that stage as a dedicated multiply-free loop, but the pair is
+        // still stored so every later stage keeps its natural offset.
         size_t stride = 2;
         for (size_t stage = 0; stage < numStages; ++stage)
         {
@@ -212,8 +220,27 @@ private:
 
     void butterflyPass(T* data, bool isInverse) const noexcept
     {
-        size_t twiddleOffset = 0;
-        size_t stride = 2;
+        // --- Stage 1 (stride 2): twiddle is exactly (1, -0), so t = o. A
+        // dedicated pass removes one complex multiply per butterfly from the
+        // stage with the most butterflies (N/2). Identical for the inverse
+        // (conj(1) == 1). The adjacent add/sub pattern with contiguous loads
+        // auto-vectorises (it is not a reduction).
+        for (size_t group = 0; group < size_; group += 2)
+        {
+            const size_t eIdx = 2 * group;
+            const size_t oIdx = eIdx + 2;
+
+            const T tr = data[oIdx];
+            const T ti = data[oIdx + 1];
+            data[oIdx]     = data[eIdx]     - tr;
+            data[oIdx + 1] = data[eIdx + 1] - ti;
+            data[eIdx]     += tr;
+            data[eIdx + 1] += ti;
+        }
+
+        // --- Remaining stages (stride 4 .. N), with real twiddle multiplies.
+        size_t twiddleOffset = 2; // skip stage 1's stored (1, -0) pair
+        size_t stride = 4;
 
         while (stride <= size_)
         {
@@ -223,8 +250,8 @@ private:
             {
                 size_t k = 0;
 
-                // --- SIMD path: float only, 2 butterflies at a time -----------
-#ifdef DSPARK_FFT_SSE3
+                // --- SIMD path: float, 2 butterflies at a time ----------------
+#ifdef DSPARK_FFT_SSE
                 if constexpr (std::is_same_v<T, float>)
                 {
                     __m128 invTwMask = _mm_setzero_ps();
@@ -240,12 +267,11 @@ private:
                         const size_t eIdx  = 2 * (group + k);
                         const size_t oIdx  = 2 * (group + k + halfStride);
 
-                        // Unaligned loads — `data` and `twiddles_` come from
-                        // std::vector<float> whose data pointer is only
-                        // 4-byte aligned for float. Using _mm_load_ps here
-                        // produced a SIGSEGV on every FFT triggered by
-                        // SpectrumAnalyzer. _mm_loadu_ps is the same speed
-                        // as the aligned form on Sandy-Bridge and newer.
+                        // Unaligned loads -- `data` and `twiddles_` come from
+                        // std::vector<float>, whose data pointer is only
+                        // guaranteed 4-byte aligned for float. Aligned loads
+                        // here would fault; _mm_loadu_ps costs the same as the
+                        // aligned form on Sandy Bridge and newer.
                         __m128 e = _mm_loadu_ps(&data[eIdx]);
                         __m128 o = _mm_loadu_ps(&data[oIdx]);
                         __m128 w = _mm_xor_ps(_mm_loadu_ps(&twiddles_[twIdx]), invTwMask);
@@ -257,7 +283,7 @@ private:
                         __m128 p1    = _mm_mul_ps(w, o_re);
                         __m128 p2    = _mm_mul_ps(w_sw, o_im);
 
-                        // addsub processes the complex conjugate math:
+                        // addsub processes the complex multiply:
                         // Even: p1 - p2 (Real part) | Odd: p1 + p2 (Imaginary part)
                         __m128 t     = addsubPs(p1, p2);
 
@@ -299,15 +325,15 @@ private:
                         _mm_storeu_pd(&data[oIdx], _mm_sub_pd(e, t));
                     }
                 }
-#endif // DSPARK_FFT_SSE3
+#endif // DSPARK_FFT_SSE
 
 #ifdef DSPARK_FFT_NEON
                 if constexpr (std::is_same_v<T, float>)
                 {
-                    static const uint32_t kAddSub[4] = { 0x80000000u, 0, 0x80000000u, 0 };
+                    static constexpr uint32_t kAddSub[4] = { 0x80000000u, 0, 0x80000000u, 0 };
                     const uint32x4_t addsubMask = vld1q_u32(kAddSub);
 
-                    static const uint32_t kInvTw[4] = { 0, 0x80000000u, 0, 0x80000000u };
+                    static constexpr uint32_t kInvTw[4] = { 0, 0x80000000u, 0, 0x80000000u };
                     const uint32x4_t invTwMask = isInverse ? vld1q_u32(kInvTw) : vdupq_n_u32(0);
 
                     for (; k + 1 < halfStride; k += 2)
@@ -376,11 +402,15 @@ private:
  * @brief FFT optimised for real-valued input signals (the common audio case).
  *
  * Uses a half-size complex FFT internally, saving ~50% computation.
- * * **Frequency domain layout**: N+2 elements (interleaved complex).
+ *
+ * **Frequency domain layout**: N+2 elements (interleaved complex).
  * - Bins 0 to N/2 inclusive -> (N/2 + 1) complex values -> (N + 2) floats.
  * - `data[2*k]` = real part of bin k.
  * - `data[2*k+1]` = imaginary part of bin k.
  * - Bin 0 = DC, bin N/2 = Nyquist.
+ *
+ * In-place use is supported: timeData and freqData may point to the same
+ * buffer as long as it holds getFrequencyDomainSize() = N+2 elements.
  *
  * @tparam T Sample type (float or double).
  */
@@ -396,11 +426,11 @@ public:
      */
     explicit FFTReal(size_t size)
         : realSize_(validateSize(size))   // validates BEFORE complexFFT_ is built
-        , halfSize_(size / 2)
-        , complexFFT_(size / 2)
+        , halfSize_(realSize_ / 2)        // derived from the VALIDATED size, so the
+        , complexFFT_(realSize_ / 2)      // trio stays coherent when size degrades
     {
         computePostTwiddles();
-        workBuffer_.resize(size);
+        workBuffer_.resize(realSize_);
     }
 
     /** @brief Returns the number of real input samples (N). */
@@ -420,11 +450,9 @@ public:
     void forward(const T* timeData, T* freqData) noexcept
     {
         T* work = workBuffer_.data();
-        for (size_t i = 0; i < halfSize_; ++i)
-        {
-            work[2 * i]     = timeData[2 * i];
-            work[2 * i + 1] = timeData[2 * i + 1];
-        }
+        // Consecutive (even, odd) sample pairs feed the half-size complex FFT
+        // as (re, im) -- a straight contiguous copy of N elements.
+        std::memcpy(work, timeData, realSize_ * sizeof(T));
 
         complexFFT_.forward(work);
         unpackForward(work, freqData);
@@ -441,11 +469,7 @@ public:
         packInverse(freqData, work);
         complexFFT_.inverse(work);
 
-        for (size_t i = 0; i < halfSize_; ++i)
-        {
-            timeData[2 * i]     = work[2 * i];
-            timeData[2 * i + 1] = work[2 * i + 1];
-        }
+        std::memcpy(timeData, work, realSize_ * sizeof(T));
     }
 
     /**
@@ -631,8 +655,8 @@ private:
     size_t realSize_;
     size_t halfSize_;
     FFTComplex<T> complexFFT_;
-    std::vector<T> postTwiddles_; 
-    std::vector<T> workBuffer_; // Removed mutable. Internal state mutations disqualify const.
+    std::vector<T> postTwiddles_;
+    std::vector<T> workBuffer_;
 };
 
 } // namespace dspark

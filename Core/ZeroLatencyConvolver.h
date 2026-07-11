@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -12,8 +12,8 @@
  * without Input-Output Delay", JAES 43(3), 1995. The IR is split into three
  * regions, each handled by the cheapest method that meets its deadline:
  *
- *   [0, 128)      direct FIR head (SIMD dot product)        — latency 0
- *   [128, 2048)   uniform partitioned FFT, block 128        — result lands
+ *   [0, 128)      direct FIR head (SIMD dot product)        -- latency 0
+ *   [128, 2048)   uniform partitioned FFT, block 128        -- result lands
  *                 exactly when needed (offset == its block latency)
  *   [2048, end)   FFT partitions of 1024, **time-distributed**: each cycle's
  *                 work (FFT + per-partition spectral MACs + IFFT + overlap-
@@ -22,7 +22,7 @@
  *                 a single audio callback
  *
  * The tail partitions start at twice their block size, which is what creates
- * the full block of scheduling slack the time distribution relies on — the
+ * the full block of scheduling slack the time distribution relies on -- the
  * core idea of Gardner's non-uniform scheme.
  *
  * Compared to the uniform Convolver (latency = block size), the price of
@@ -39,7 +39,7 @@
  *   dspark::ZeroLatencyConvolver<float> conv;
  *   conv.prepare(ir.getChannel(0), irLength);
  *
- *   // In the audio callback — any block size, even 1 sample:
+ *   // In the audio callback -- any block size, even 1 sample:
  *   conv.processInPlace(data, numSamples);   // y[0] already includes ir[0]*x[0]
  * @endcode
  */
@@ -202,7 +202,10 @@ public:
             {
                 cyclePos_ += chunk;
                 // Execute this cycle's proportional share of the pending task.
-                runTaskUnits((totalUnits_ * cyclePos_ + kTailBlock - 1) / kTailBlock);
+                // 64-bit product: totalUnits_ grows with the partition count,
+                // and totalUnits_ * cyclePos_ would wrap int for hours-long IRs.
+                runTaskUnits(static_cast<int>(
+                    (static_cast<int64_t>(totalUnits_) * cyclePos_ + kTailBlock - 1) / kTailBlock));
                 if (cyclePos_ >= kTailBlock)
                 {
                     cyclePos_ = 0;   // task is fully drained (quota == total)
@@ -221,7 +224,7 @@ public:
 
     /**
      * @brief Processes channel 0 of a buffer in-place (unified API).
-     * Mono engine — use one instance per channel for multichannel.
+     * Mono engine -- use one instance per channel for multichannel.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
@@ -229,7 +232,7 @@ public:
             processInPlace(buffer.getChannel(0), buffer.getNumSamples());
     }
 
-    /** @brief Zero — that is the point. */
+    /** @brief Zero -- that is the point. */
     [[nodiscard]] static constexpr int getLatency() noexcept { return 0; }
 
     /** @brief Resolved direct-head length in samples. */

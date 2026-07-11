@@ -767,6 +767,7 @@ inline EffectSlot makeAlgorithmicReverb()
     s.addSlider("Late Level", -20, 6, 0, "dB");              // 16
     s.addSlider("Width", 0, 2, 1, "");                        // 17
     s.addSlider("Mix", 0, 1, 0, "");                          // 18 — default 0 = dry only
+    s.addChoice("Quality", {"Full","Eco"}, 0);                // 19 (Eco = reduced engine)
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -791,6 +792,9 @@ inline EffectSlot makeAlgorithmicReverb()
             case 16: p->setLateLevel(v); break;
             case 17: p->setWidth(v); break;
             case 18: p->setMix(v); break;
+            case 19: p->setQuality(v > 0.5f
+                         ? dspark::AlgorithmicReverb<float>::Quality::Eco
+                         : dspark::AlgorithmicReverb<float>::Quality::Full); break;
         }
     };
     return s;
@@ -1082,6 +1086,8 @@ inline EffectSlot makeConvolutionReverb()
     s.addSlider("Decay", 0.2f, 6.0f, 1.5f, "s");   // 0 — (re)builds the synthetic IR
     s.addSlider("Pre-Delay", 0, 100, 10, "ms");    // 1
     s.addSlider("Mix", 0, 1, 0, "");               // 2 — default dry
+    s.addSlider("Decay Scale", 0.25f, 2.0f, 1.0f, "x"); // 3 (reshapes loaded/synthetic IR)
+    s.addSlider("Stretch", 0.5f, 2.0f, 1.0f, "x");      // 4 (tape-speed style)
     s.prepareFn = [p, sr, fileLoaded, regenIR](auto& sp) {
         *sr = sp.sampleRate; p->prepare(sp);
         if (!*fileLoaded) regenIR();   // keep a user-loaded IR across re-prepares
@@ -1093,6 +1099,8 @@ inline EffectSlot makeConvolutionReverb()
             case 0: *decayS = v; regenIR(); break;   // switch to synthetic IR (atomic publish — safe live)
             case 1: p->setPreDelay(v); break;
             case 2: p->setMix(v); break;
+            case 3: p->setDecayScale(v); break;      // IR rebuild, atomic publish (safe live)
+            case 4: p->setStretch(v); break;         // IR rebuild, atomic publish (safe live)
         }
     };
     // Load a real impulse response from a WAV (summed to mono, capped at 10 s).

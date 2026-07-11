@@ -11,10 +11,20 @@
  * pre-delay, and automatic IR management. Supports loading impulse responses
  * from WAV files or from raw sample data.
  *
+ * IR shaping (setDecayScale / setStretch) reshapes the loaded impulse
+ * response without touching the stored original, so the controls are
+ * always relative to the file as loaded:
+ *
+ * - **Decay scale** multiplies the IR's own T60 (estimated from its
+ *   Schroeder decay curve). Values below 1 also trim the now-silent tail,
+ *   which directly reduces convolution CPU cost.
+ * - **Stretch** resamples the IR (tape-speed style): above 1 the space
+ *   gets larger and darker, below 1 smaller and brighter.
+ *
  * Three levels of API complexity:
  *
  * - **Level 1 (simple):** `reverb.loadIR("hall.wav"); reverb.setMix(0.3f);`
- * - **Level 2 (intermediate):** Add pre-delay, different IR sample rate.
+ * - **Level 2 (intermediate):** Pre-delay, IR decay scale / stretch.
  * - **Level 3 (expert):** Direct access to Convolver and DryWetMixer internals.
  *
  * Dependencies: Convolver.h, DryWetMixer.h, RingBuffer.h, AudioSpec.h,
@@ -243,6 +253,64 @@ public:
         updatePreDelay();
     }
 
+    /**
+     * @brief Scales the decay time (T60) of the loaded IR.
+     *
+     * The IR's own decay rate is estimated from its Schroeder backward
+     * energy curve (T20 fit between -5 dB and -25 dB), then an exponential
+     * envelope is applied from the direct-sound peak onward so the shaped
+     * IR decays at `scale` times the original T60. The direct sound and
+     * early part are preserved.
+     *
+     * Values below 1 shorten the tail AND trim the IR where its energy
+     * falls below -100 dB, so the convolution gets proportionally cheaper
+     * (about half the CPU at 0.5 on a typical exponential hall). Values
+     * above 1 lengthen the tail; this also lifts whatever noise floor the
+     * recording has, so moderate boosts (up to 2x) are the useful range.
+     * IRs without a broadly exponential tail (gated/reversed effects) are
+     * left unshaped.
+     *
+     * Setup/UI threads only: rebuilds the convolver bank (allocates) and
+     * publishes it atomically, exactly like loadIR(). Not meant for
+     * per-block automation.
+     *
+     * @param scale T60 multiplier, clamped to [0.25, 2]. 1 = as loaded.
+     */
+    void setDecayScale(T scale)
+    {
+        decayScale_.store(std::clamp(scale, T(0.25), T(2)),
+                          std::memory_order_relaxed);
+        if (spec_.sampleRate > 0 && !irStorage_.empty())
+            applyIR();
+    }
+
+    /**
+     * @brief Stretches the loaded IR in time (tape-speed style).
+     *
+     * The IR is resampled by the given ratio: 2.0 doubles its length
+     * (larger, darker space, roughly an octave down in coloration), 0.5
+     * halves it (smaller, brighter). Decay scale and stretch compose:
+     * effective T60 is approximately original * decayScale * stretch.
+     *
+     * Setup/UI threads only: rebuilds the convolver bank (allocates) and
+     * publishes it atomically, exactly like loadIR().
+     *
+     * @param ratio Time-stretch ratio, clamped to [0.5, 2]. 1 = as loaded.
+     */
+    void setStretch(T ratio)
+    {
+        stretch_.store(std::clamp(ratio, T(0.5), T(2)),
+                       std::memory_order_relaxed);
+        if (spec_.sampleRate > 0 && !irStorage_.empty())
+            applyIR();
+    }
+
+    /** @brief Returns the current IR decay scale. */
+    [[nodiscard]] T getDecayScale() const noexcept { return decayScale_.load(std::memory_order_relaxed); }
+
+    /** @brief Returns the current IR stretch ratio. */
+    [[nodiscard]] T getStretch() const noexcept { return stretch_.load(std::memory_order_relaxed); }
+
     // -- Level 3: Expert API ----------------------------------------------------
 
     /**
@@ -292,6 +360,8 @@ public:
         StateWriter w(stateId("CRVB"), 1);
         w.write("mix", mix_.load(std::memory_order_relaxed));
         w.write("preDelay", preDelayMs_.load(std::memory_order_relaxed));
+        w.write("decayScale", decayScale_.load(std::memory_order_relaxed));
+        w.write("stretch", stretch_.load(std::memory_order_relaxed));
         return w.blob();
     }
 
@@ -302,6 +372,19 @@ public:
         if (!r.isValid() || r.processorId() != stateId("CRVB")) return false;
         setMix(static_cast<T>(r.read("mix", 0.3f)));
         setPreDelay(static_cast<T>(r.read("preDelay", 0.0f)));
+        // Store both shaping values first, then rebuild once (each setter
+        // would otherwise trigger its own IR rebuild).
+        const T ds = std::clamp(static_cast<T>(r.read("decayScale", 1.0f)),
+                                T(0.25), T(2));
+        const T st = std::clamp(static_cast<T>(r.read("stretch", 1.0f)),
+                                T(0.5), T(2));
+        const bool shapeChanged =
+            ds != decayScale_.load(std::memory_order_relaxed)
+            || st != stretch_.load(std::memory_order_relaxed);
+        decayScale_.store(ds, std::memory_order_relaxed);
+        stretch_.store(st, std::memory_order_relaxed);
+        if (shapeChanged && spec_.sampleRate > 0 && !irStorage_.empty())
+            applyIR();
         return true;
     }
 
@@ -335,38 +418,165 @@ protected:
         auto newBank = std::make_shared<ConvolverBank>();
         newBank->convolvers.resize(static_cast<size_t>(numCh));
 
+        // IR shaping controls, always applied to the stored original.
+        // Stretch works by declaring a scaled source rate and letting the
+        // resampling stage do the time-scaling (tape-speed semantics).
+        const double dScale =
+            static_cast<double>(decayScale_.load(std::memory_order_relaxed));
+        const double stretch =
+            static_cast<double>(stretch_.load(std::memory_order_relaxed));
+        const bool doShape = std::abs(dScale - 1.0) > 1e-6;
+        const double effIrRate = irSampleRate_ / std::max(stretch, 0.01);
+
+        std::vector<T> shaped;   // lazy decay-shaped copy of one IR channel
+        int shapedCh = -1;
+
         for (int ch = 0; ch < numCh; ++ch)
         {
             // Pick IR channel: use corresponding channel if available, else mono (ch 0)
             int irCh = (ch < irChannels_) ? ch : 0;
             const T* irData = irStorage_.data()
                             + static_cast<size_t>(irCh) * static_cast<size_t>(irLength_);
+            int irLen = irLength_;
+
+            if (doShape)
+            {
+                if (shapedCh != irCh)
+                {
+                    shaped = shapeDecay(irData, irLength_, dScale);
+                    shapedCh = irCh;
+                }
+                if (!shaped.empty())
+                {
+                    irData = shaped.data();
+                    irLen = static_cast<int>(shaped.size());
+                }
+            }
 
             auto& conv = newBank->convolvers[static_cast<size_t>(ch)];
 
-            // Resample IR if sample rates differ
-            if (std::abs(irSampleRate_ - spec_.sampleRate) > 1.0)
+            // Resample if the (stretch-adjusted) IR rate differs from the engine
+            if (std::abs(effIrRate - spec_.sampleRate) > 1.0)
             {
-                double ratio = spec_.sampleRate / irSampleRate_;
-                int newLen = static_cast<int>(static_cast<double>(irLength_) * ratio) + 1;
-                std::vector<T> resampled(newLen);
+                double ratio = spec_.sampleRate / effIrRate;
+                int newLen = static_cast<int>(static_cast<double>(irLen) * ratio) + 1;
+                std::vector<T> resampled(static_cast<size_t>(newLen));
 
                 Resampler<T> resampler;
-                resampler.prepare(irSampleRate_, spec_.sampleRate);
-                int produced = resampler.processBlock(irData, irLength_,
+                resampler.prepare(effIrRate, spec_.sampleRate);
+                int produced = resampler.processBlock(irData, irLen,
                                                       resampled.data());
 
                 conv.prepare(fftBlock, resampled.data(), produced);
             }
             else
             {
-                conv.prepare(fftBlock, irData, irLength_);
+                conv.prepare(fftBlock, irData, irLen);
             }
         }
 
         // Atomic release-store: any subsequent acquire-load in processBlock
         // will observe the fully-constructed bank.
         storeBank(newBank);
+    }
+
+    /**
+     * @brief Returns a decay-scaled copy of one IR channel (see setDecayScale).
+     *
+     * Estimates the source decay rate from the Schroeder backward-energy
+     * curve (T20 fit: -5 dB to -25 dB crossings of the EDC), then applies
+     * exp(-k * (n - peak)) so the result decays at `factor` times the
+     * original T60. The direct sound (up to the peak) is untouched.
+     * Returns an empty vector when the IR has no measurable exponential
+     * decay (too short, or gated); the caller then uses the original data.
+     */
+    [[nodiscard]] std::vector<T> shapeDecay(const T* ir, int len,
+                                            double factor) const
+    {
+        if (!ir || len < 64) return {};
+
+        // Total energy + direct-sound peak (double accumulation).
+        double total = 0.0;
+        double peakMag = 0.0;
+        int peak = 0;
+        for (int n = 0; n < len; ++n)
+        {
+            const double v = static_cast<double>(ir[n]);
+            total += v * v;
+            const double m = std::abs(v);
+            if (m > peakMag) { peakMag = m; peak = n; }
+        }
+        if (total <= 1e-30 || peakMag <= 0.0) return {};
+
+        // Schroeder EDC crossings at -5 dB and -25 dB (energy ratios).
+        constexpr double r5  = 0.31622776601683794;    // 10^(-5/10)
+        constexpr double r25 = 0.0031622776601683794;  // 10^(-25/10)
+        int t5 = -1, t25 = -1;
+        double tail = total;
+        for (int n = 0; n < len; ++n)
+        {
+            const double ratio = tail / total;
+            if (t5 < 0 && ratio <= r5 && n > peak) t5 = n;
+            if (ratio <= r25 && n > peak) { t25 = n; break; }
+            const double v = static_cast<double>(ir[n]);
+            tail -= v * v;
+        }
+        if (t5 < 0 || t25 < 0 || t25 - t5 < 32) return {};  // no usable slope
+
+        // Amplitude decay rate: the EDC drops 20 dB over (t25 - t5) samples,
+        // so exp(-beta * t) with beta = ln(10) / (t25 - t5).
+        const double beta = 2.302585092994046 / static_cast<double>(t25 - t5);
+        const double k = beta * (1.0 / factor - 1.0);
+
+        std::vector<T> out(static_cast<size_t>(len));
+        const double gStep = std::exp(-k);
+        double g = 1.0;
+        for (int n = 0; n < len; ++n)
+        {
+            out[static_cast<size_t>(n)] = (n <= peak)
+                ? ir[n]
+                : static_cast<T>(static_cast<double>(ir[n]) * g);
+            if (n >= peak) g *= gStep;
+        }
+
+        if (factor < 1.0)
+        {
+            // Trim where the shaped energy falls below -100 dB of its total:
+            // the removed stretch is inaudible, and a shorter IR means fewer
+            // convolution partitions (the CPU saving the shaping is for).
+            double sTotal = 0.0;
+            for (const T v : out) sTotal += static_cast<double>(v) * v;
+            if (sTotal > 1e-30)
+            {
+                double sTail = sTotal;
+                int cut = len;
+                for (int n = 0; n < len; ++n)
+                {
+                    if (sTail / sTotal <= 1e-10) { cut = n; break; }
+                    const double v = static_cast<double>(out[static_cast<size_t>(n)]);
+                    sTail -= v * v;
+                }
+                cut = std::max(cut, 64);
+                if (cut < len) out.resize(static_cast<size_t>(cut));
+            }
+        }
+        else if (factor > 1.0)
+        {
+            // A raised envelope would end in a cliff at the IR boundary:
+            // fade the final stretch (up to 20 ms at 48 kHz) with a raised
+            // cosine so the lengthened tail closes cleanly.
+            const int fade = std::min(len / 8, 960);
+            const int start = len - fade;
+            for (int i = 0; i < fade; ++i)
+            {
+                const double w = 0.5 * (1.0 + std::cos(3.141592653589793
+                                        * static_cast<double>(i + 1)
+                                        / static_cast<double>(fade)));
+                const size_t idx = static_cast<size_t>(start + i);
+                out[idx] = static_cast<T>(static_cast<double>(out[idx]) * w);
+            }
+        }
+        return out;
     }
 
     // Holds the current convolver set. Published by applyIR() via an atomic
@@ -382,6 +592,8 @@ protected:
     std::atomic<T> mix_ { T(0.3) };
     std::atomic<T> preDelayMs_ { T(0) };
     std::atomic<int> preDelaySamples_ { 0 };
+    std::atomic<T> decayScale_ { T(1) };
+    std::atomic<T> stretch_ { T(1) };
 
     // IR storage (GUI-thread only — rebuild source of truth)
     std::vector<T> irStorage_;

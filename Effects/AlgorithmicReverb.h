@@ -68,6 +68,11 @@
  * - **Allpass interpolation**: in modulated FDN reads, preserves HF over
  *   hundreds of feedback iterations (linear/cubic causes cumulative dulling)
  * - **Stereo width**: M/S width control on late reverb tail
+ * - **Eco quality mode** (setQuality): opt-in reduced engine (8 FDN lines,
+ *   control-rate modulation, linear allpass interpolation, no extra output
+ *   taps, single-stage input scatter, 12 early taps) at a fraction of the
+ *   CPU cost, for embedded and other constrained targets. The default Full
+ *   quality path is bit-identical to previous releases.
  *
  * Four levels of API complexity:
  *
@@ -139,6 +144,15 @@ public:
         Plate,      ///< Metal plate, dense shimmer, no early reflections.
         Spring,     ///< Spring reverb, bouncy vintage character.
         Cathedral   ///< Large cathedral, immense decay, vast space.
+    };
+
+    /**
+     * @brief Engine quality / CPU cost trade-off (see setQuality()).
+     */
+    enum class Quality
+    {
+        Full,   ///< Complete 16-line engine. Default; bit-identical to previous releases.
+        Eco     ///< Reduced engine, roughly 3-4x cheaper. For constrained targets.
     };
 
     ~AlgorithmicReverb() = default; // non-virtual: leaf class (no virtual dispatch)
@@ -214,8 +228,16 @@ public:
         // Noise modulation: LP cutoff ~3 Hz, depth scales with modDepth_
         noiseCoeff_ = T(1) - std::exp(T(-6.283185307179586) * T(3)
                                        / static_cast<T>(sr));
+        // Eco quality refreshes the noise LP only once per control interval,
+        // so the coefficient is scaled to keep the same ~3 Hz cutoff.
+        noiseCoeffEco_ = T(1) - std::exp(T(-6.283185307179586) * T(3)
+                                          * T(kEcoCtrlInterval)
+                                          / static_cast<T>(sr));
         noiseState_ = 1;
         noiseLP_ = T(0);
+
+        eco_ = quality_.load(std::memory_order_relaxed) == Quality::Eco;
+        nLines_ = eco_ ? kEcoLines : kFDNSize;
 
         applyPreset(type_.load(std::memory_order_relaxed));
         // Clear pending flags — prepare() has already applied whatever the
@@ -224,6 +246,7 @@ public:
         presetDirty_.store(false, std::memory_order_relaxed);
         paramsDirty_.store(false, std::memory_order_relaxed);
         toneDirty_.store(false, std::memory_order_relaxed);
+        qualityDirty_.store(false, std::memory_order_relaxed);
         reset();
     }
 
@@ -246,6 +269,24 @@ public:
         // mutations of non-atomic topology arrays (fdnDelayLens_, diffCoeffs_,
         // …) happen here, never from GUI-thread setters. acquire-ordered loads
         // synchronize with the release-stores in setType/setXxx.
+        if (qualityDirty_.exchange(false, std::memory_order_acquire))
+        {
+            const bool eco =
+                quality_.load(std::memory_order_relaxed) == Quality::Eco;
+            if (eco != eco_)
+            {
+                eco_ = eco;
+                nLines_ = eco ? kEcoLines : kFDNSize;
+                if (spec_.sampleRate > 0)
+                {
+                    updateDelayLengths();  // re-derives per-line delays + decay
+                    generateERTapsForType(type_.load(std::memory_order_relaxed));
+                }
+                // Engine topology changed: old delay/filter state is stale.
+                reset();
+            }
+        }
+
         if (presetDirty_.exchange(false, std::memory_order_acquire))
         {
             Type t = type_.load(std::memory_order_relaxed);
@@ -391,6 +432,10 @@ public:
         apInterpState_.fill(T(0));
         erLPStateL_.fill(T(0));
         erLPStateR_.fill(T(0));
+        modACache_.fill(T(0));
+        modBCache_.fill(T(0));
+        noiseND_ = T(0);
+        ctrlPhase_ = 0;
 
         for (auto& lfo : modLFOA_) lfo.reset();
         for (auto& lfo : modLFOB_) lfo.reset();
@@ -411,6 +456,41 @@ public:
         // run applyPreset() + reset() at the top of its next processBlock.
         type_.store(type, std::memory_order_relaxed);
         presetDirty_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief Selects the engine quality / CPU cost trade-off.
+     *
+     * Quality::Full (default) runs the complete 16-line engine and is
+     * bit-identical to previous releases. Quality::Eco reduces the engine to
+     * roughly a quarter of the CPU cost for embedded and other constrained
+     * targets, keeping the same control set and decay calibration:
+     *
+     * - 8 FDN lines instead of 16 (alternate base delays keep the full
+     *   29.7-160 ms span, and per-line decay gains keep T60 exact)
+     * - modulation LFOs and noise updated at control rate (every 16 samples;
+     *   steps are orders of magnitude below audibility at reverb mod rates)
+     * - linear interpolation in modulated allpasses (Dattorro-standard)
+     *   instead of 4-point Hermite
+     * - single-stage input scatter (16 unique echo paths instead of 256)
+     * - no extra output taps (multi-tap / allpass taps); output density
+     *   comes from the sign-weighted line sum plus output diffusion
+     * - early reflections capped at 12 taps
+     *
+     * The audible difference is a somewhat lower tail density (most
+     * noticeable on long, exposed cathedral tails); short and mid rooms stay
+     * very close to Full.
+     *
+     * Like setType(), this is an engine-mode switch, not an automation
+     * target: it is applied at the start of the next processBlock() and
+     * clears the reverb state (the running tail is dropped).
+     *
+     * @param q Quality::Full or Quality::Eco.
+     */
+    void setQuality(Quality q) noexcept
+    {
+        quality_.store(q, std::memory_order_relaxed);
+        qualityDirty_.store(true, std::memory_order_release);
     }
 
     void setDecay(T seconds) noexcept
@@ -600,6 +680,7 @@ public:
     // =========================================================================
 
     [[nodiscard]] Type getType() const noexcept { return type_.load(std::memory_order_relaxed); }
+    [[nodiscard]] Quality getQuality() const noexcept { return quality_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getDecay() const noexcept { return decayTime_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getHighDecayMultiplier() const noexcept { return highDecayMult_.load(std::memory_order_relaxed); }
@@ -614,6 +695,7 @@ public:
     {
         StateWriter w(stateId("ARVB"), 1);
         w.write("type", static_cast<int32_t>(type_.load(std::memory_order_relaxed)));
+        w.write("quality", static_cast<int32_t>(quality_.load(std::memory_order_relaxed)));
         w.write("decay", decayTime_.load(std::memory_order_relaxed));
         w.write("size", size_.load(std::memory_order_relaxed));
         w.write("damping", damping_.load(std::memory_order_relaxed));
@@ -643,6 +725,8 @@ public:
         StateReader r(data, size);
         if (!r.isValid() || r.processorId() != stateId("ARVB")) return false;
         setType(static_cast<Type>(r.read("type", 0)));
+        // Older blobs have no "quality" key: default 0 = Full (unchanged sound).
+        setQuality(r.read("quality", 0) == 1 ? Quality::Eco : Quality::Full);
         setDecay(static_cast<T>(r.read("decay", 1.0f)));
         setSize(static_cast<T>(r.read("size", 0.5f)));
         setDamping(static_cast<T>(r.read("damping", 0.5f)));
@@ -675,10 +759,19 @@ protected:
     static constexpr int kNumMultiTaps = 7;
     static constexpr int kOutDiffStages = 2;
 
+    // Eco quality engine reductions (see setQuality)
+    static constexpr int kEcoLines        = 8;   ///< FDN lines in Eco quality
+    static constexpr int kEcoCtrlInterval = 16;  ///< modulation refresh period (samples)
+    static constexpr int kEcoERTaps       = 12;  ///< early-reflection tap cap in Eco
+
     static constexpr T kInputGain = T(1) / T(8);
 
     // Output normalization: 16 main + 7 multi-tap + fbAP taps + intAP taps
     static constexpr T kOutputNorm = T(1) / T(5.0);
+
+    // Eco output normalization: 8 sign-weighted lines only (no extra taps).
+    // Calibrated so the Eco wet tail matches Full loudness (measured RMS).
+    static constexpr T kOutputNormEco = T(0.32);
 
     // Orthogonal stereo output sign vectors (inner product = 0)
     static constexpr int kOutSignL_[kFDNSize] = {
@@ -768,9 +861,19 @@ protected:
             phaseInc_ = rate / static_cast<T>(sr);
         }
 
-        T next() noexcept
+        T next() noexcept { return nextStride(1); }
+
+        /**
+         * @brief Advances the LFO by `stride` samples in one call.
+         *
+         * Used by Eco quality to run modulation at control rate: the phase
+         * advances by stride * phaseInc_ so the effective LFO frequency is
+         * unchanged. Rates are clamped well below 1/stride of the sample
+         * rate, so at most one Hermite target is consumed per call.
+         */
+        T nextStride(int stride) noexcept
         {
-            phase_ += phaseInc_;
+            phase_ += phaseInc_ * static_cast<T>(stride);
             if (phase_ >= T(1))
             {
                 phase_ -= T(1);
@@ -852,6 +955,17 @@ protected:
     T noiseCoeff_ = T(0);
     T noiseDepth_ = T(0);
 
+    // Quality engine state (audio-thread only, derived from quality_ at the
+    // dirty-flag drain). Full: 16 lines, per-sample modulation. Eco: 8 lines,
+    // control-rate modulation refreshed every kEcoCtrlInterval samples.
+    bool eco_   = false;
+    int  nLines_ = kFDNSize;
+    std::array<T, kFDNSize> modACache_ {};   // per-line LFO A value (samples)
+    std::array<T, kFDNSize> modBCache_ {};   // per-line LFO B value (samples)
+    T   noiseND_ = T(0);                     // filtered noise * noiseDepth_
+    int ctrlPhase_ = 0;                      // Eco control-rate phase counter
+    T   noiseCoeffEco_ = T(0);               // noise LP coeff at control rate
+
     // Input diffusion
     std::array<RingBuffer<T>, kDiffStages> diffBufs_;
     std::array<int, kDiffStages> diffDelays_ {};
@@ -929,10 +1043,13 @@ protected:
     std::atomic<T> highCrossover_ { T(5000) };  // Hz
     std::atomic<T> bassCrossover_ { T(200) };   // Hz
 
+    std::atomic<Quality> quality_ { Quality::Full };
+
     // Deferred-apply flags (audio thread drains these at top of processBlock)
     std::atomic<bool> presetDirty_ { false };  // setType() → rebuild topology + reset
     std::atomic<bool> paramsDirty_ { false };  // any other setter → refresh coeffs
     std::atomic<bool> toneDirty_   { false };  // tone EQ cutoff changes
+    std::atomic<bool> qualityDirty_ { false }; // setQuality() -> resize engine + reset
     std::atomic<T> toneLowCutHz_  { T(-1) };   // <0 = off, queued value for audio thread
     std::atomic<T> toneHighCutHz_ { T(-1) };
 
@@ -957,6 +1074,17 @@ protected:
         return noiseLP_;
     }
 
+    /// Control-rate variant (Eco): same generator, coefficient scaled so the
+    /// ~3 Hz cutoff is preserved when called every kEcoCtrlInterval samples.
+    T nextFilteredNoiseEco() noexcept
+    {
+        noiseState_ = noiseState_ * 196314165u + 907633515u;
+        T white = static_cast<T>(static_cast<int32_t>(noiseState_))
+                  / T(2147483648.0);
+        noiseLP_ += noiseCoeffEco_ * (white - noiseLP_);
+        return noiseLP_;
+    }
+
     T processAllpass(RingBuffer<T>& buf, int delay, T coeff, T input) noexcept
     {
         T delayed = buf.read(delay);
@@ -967,11 +1095,16 @@ protected:
     }
 
     T processAllpassModulated(RingBuffer<T>& buf, int baseDelay, T modAmount,
-                              T coeff, T input) noexcept
+                              T coeff, T input, bool linearInterp) noexcept
     {
         T readPos = static_cast<T>(baseDelay) + modAmount;
         readPos = std::max(readPos, T(1));
-        T delayed = buf.readInterpolated(readPos);
+        // Eco quality reads with 2-point linear interpolation (the industry
+        // standard for diffusion allpasses with small excursions); Full keeps
+        // the default 4-point Hermite read.
+        T delayed = linearInterp
+            ? buf.template readInterpolated<InterpMethod::Linear>(readPos)
+            : buf.readInterpolated(readPos);
         T temp = input + coeff * delayed;
         T output = delayed - coeff * temp;
         buf.push(temp);
@@ -1004,18 +1137,39 @@ protected:
     }
 
     /**
+     * @brief In-place Hadamard 8x8 on the first 8 elements (Eco quality).
+     *
+     * 3-stage butterfly, normalized by 1/sqrt(8). Elements 8..15 untouched.
+     */
+    static void hadamard8InPlace(std::array<T, kFDNSize>& x) noexcept
+    {
+        for (int i = 0; i < 8; i += 2)
+        { T a = x[i], b = x[i+1]; x[i] = a + b; x[i+1] = a - b; }
+
+        for (int i = 0; i < 8; i += 4)
+            for (int j = 0; j < 2; ++j)
+            { T a = x[i+j], b = x[i+j+2]; x[i+j] = a + b; x[i+j+2] = a - b; }
+
+        for (int j = 0; j < 4; ++j)
+        { T a = x[j], b = x[j+4]; x[j] = a + b; x[j+4] = a - b; }
+
+        constexpr T norm = T(0.35355339059327373);  // 1/sqrt(8)
+        for (int i = 0; i < 8; ++i) x[i] *= norm;
+    }
+
+    /**
      * @brief In-place Householder reflection for 16 channels.
      *
      * H = I - (2/N) * ones. Each output = input - (2/N) * sum.
      * Provides moderate cross-feeding without locking delays together,
      * as recommended by Signalsmith for FDN feedback mixing.
      */
-    static void householderInPlace(std::array<T, kFDNSize>& x) noexcept
+    static void householderInPlace(std::array<T, kFDNSize>& x, int n) noexcept
     {
         T sum = T(0);
-        for (int i = 0; i < kFDNSize; ++i) sum += x[i];
-        T factor = sum * T(2) / T(kFDNSize);  // 2/N * sum = sum/8
-        for (int i = 0; i < kFDNSize; ++i) x[i] -= factor;
+        for (int i = 0; i < n; ++i) sum += x[i];
+        T factor = sum * T(2) / static_cast<T>(n);
+        for (int i = 0; i < n; ++i) x[i] -= factor;
     }
 
     /// Block-cached copies of the atomic parameters: 16 FDN lines reading
@@ -1071,7 +1225,8 @@ protected:
             T diffPol = (d & 1) ? T(-1) : T(1);
             T diffMod = diffNoise * T(2) * diffPol;  // +/-2 samples excursion
             diffused = processAllpassModulated(diffBufs_[d], diffDelays_[d],
-                                               diffMod, diffCoeffs_[d], diffused);
+                                               diffMod, diffCoeffs_[d], diffused,
+                                               eco_);
         }
 
         // --- Early reflections with progressive absorption ---
@@ -1096,36 +1251,70 @@ protected:
             ? erToLateBuf_.read(erToLateSamp) : diffused;
 
         // --- Parallel allpass diffuser (2-step, 16² = 256 echo paths) ---
-        // Step 1: 16 parallel allpass with different delays create 16 unique IRs
-        std::array<T, kFDNSize> diffCh;
-        for (int d = 0; d < kFDNSize; ++d)
+        // Step 1: parallel allpass with different delays create unique IRs.
+        // Eco: single step, 8 channels (16 echo paths via one Hadamard).
+        const int n = nLines_;
+        std::array<T, kFDNSize> diffCh {};
+        for (int d = 0; d < n; ++d)
             diffCh[d] = processAllpass(parAPBufs_[d], parAPDelays_[d],
                                         parAPCoeff_, fdnInputRaw);
-        hadamardInPlace(diffCh);
-        // Step 2: per-channel delay + Hadamard → 256 unique paths
-        for (int d = 0; d < kFDNSize; ++d)
-            diffuserStep2_[d].push(diffCh[d]);
-        for (int d = 0; d < kFDNSize; ++d)
-            diffCh[d] = diffuserStep2_[d].read(diffuserStep2Delays_[d]);
-        hadamardInPlace(diffCh);
+        if (!eco_)
+        {
+            hadamardInPlace(diffCh);
+            // Step 2: per-channel delay + Hadamard → 256 unique paths
+            for (int d = 0; d < kFDNSize; ++d)
+                diffuserStep2_[d].push(diffCh[d]);
+            for (int d = 0; d < kFDNSize; ++d)
+                diffCh[d] = diffuserStep2_[d].read(diffuserStep2Delays_[d]);
+            hadamardInPlace(diffCh);
+        }
+        else
+        {
+            hadamard8InPlace(diffCh);
+        }
 
         // =================================================================
         // FDN Core
         // =================================================================
 
-        // Read from 16 delay lines with LFO + noise modulated delay
-        std::array<T, kFDNSize> reads;
-        std::array<T, kFDNSize> modBValues;
-        T noise = nextFilteredNoise();
-        for (int d = 0; d < kFDNSize; ++d)
+        // Refresh modulation values. Full: per sample (bit-identical to the
+        // previous inline computation: same LFO call order and arithmetic).
+        // Eco: every kEcoCtrlInterval samples (control rate); at reverb mod
+        // rates (0.1-5 Hz) the position steps are microscopic (< 1e-2 samples)
+        // and far below audibility.
+        if (!eco_)
         {
-            T modA = modLFOA_[d].next() * modDA;
-            T modB = modLFOB_[d].next() * modDB;
-            modBValues[d] = modB;
+            T noise = nextFilteredNoise();
+            noiseND_ = noise * noiseDepth_;
+            for (int d = 0; d < n; ++d)
+            {
+                modACache_[d] = modLFOA_[d].next() * modDA;
+                modBCache_[d] = modLFOB_[d].next() * modDB;
+            }
+        }
+        else
+        {
+            if (ctrlPhase_ == 0)
+            {
+                noiseND_ = nextFilteredNoiseEco() * noiseDepth_;
+                for (int d = 0; d < n; ++d)
+                {
+                    modACache_[d] = modLFOA_[d].nextStride(kEcoCtrlInterval) * modDA;
+                    modBCache_[d] = modLFOB_[d].nextStride(kEcoCtrlInterval) * modDB;
+                }
+            }
+            if (++ctrlPhase_ >= kEcoCtrlInterval) ctrlPhase_ = 0;
+        }
+
+        // Read from the delay lines with LFO + noise modulated delay
+        std::array<T, kFDNSize> reads {};
+        for (int d = 0; d < n; ++d)
+        {
             // Noise with alternating polarity (Progenitor-style)
             T polarity = (d & 1) ? T(-1) : T(1);
-            T noiseMod = noise * noiseDepth_ * polarity;
-            T readPos = static_cast<T>(fdnDelayLens_[d]) + modA + modB + noiseMod;
+            T noiseMod = noiseND_ * polarity;
+            T readPos = static_cast<T>(fdnDelayLens_[d]) + modACache_[d]
+                        + modBCache_[d] + noiseMod;
             readPos = std::max(readPos, T(1));
             // Allpass interpolation: preserves HF over hundreds of feedback
             // iterations (linear/cubic causes cumulative dulling).
@@ -1143,12 +1332,12 @@ protected:
                                        intAPCoeff_, reads[d]);
         }
 
-        // Householder 16x16 mixing (moderate coupling, keeps lines independent)
+        // Householder mixing (moderate coupling, keeps lines independent)
         std::array<T, kFDNSize> mixed = reads;
-        householderInPlace(mixed);
+        householderInPlace(mixed, n);
 
         // Per-line: Jot absorption → bass shelf → feedback allpass → write
-        for (int d = 0; d < kFDNSize; ++d)
+        for (int d = 0; d < n; ++d)
         {
             T val = mixed[d];
 
@@ -1164,11 +1353,12 @@ protected:
 
             // --- Feedback allpass (2 stages, modulated, Dattorro-style) ---
             {
-                T fbMod = modBValues[d] * T(0.3);
+                T fbMod = modBCache_[d] * T(0.3);
                 val = processAllpassModulated(fbAPBufsA_[d], fbAPDelaysA_[d],
-                                              fbMod, fbAPCoeff_, val);
+                                              fbMod, fbAPCoeff_, val, eco_);
                 val = processAllpassModulated(fbAPBufsB_[d], fbAPDelaysB_[d],
-                                              fbMod * T(-0.7), fbAPCoeff_, val);
+                                              fbMod * T(-0.7), fbAPCoeff_, val,
+                                              eco_);
             }
 
             // --- DC blocker (~23 Hz) ---
@@ -1200,14 +1390,18 @@ protected:
 
         // --- Stereo output ---
 
-        // Main: orthogonal sign-weighted from all 16 reads
+        // Main: orthogonal sign-weighted from all line reads (the first 8
+        // sign entries are also mutually orthogonal, so Eco keeps the L/R
+        // decorrelation property)
         T lateL = T(0), lateR = T(0);
-        for (int d = 0; d < kFDNSize; ++d)
+        for (int d = 0; d < n; ++d)
         {
             lateL += reads[d] * static_cast<T>(kOutSignL_[d]);
             lateR += reads[d] * static_cast<T>(kOutSignR_[d]);
         }
 
+        if (!eco_)
+        {
         // Multi-tap: Dattorro-style reads from different delay positions
         for (int t = 0; t < kNumMultiTaps; ++t)
         {
@@ -1252,9 +1446,11 @@ protected:
             lateL += intAPBufsB_[d].read(tapB) * static_cast<T>(kOutSignL_[d]) * T(0.2);
             lateR += intAPBufsA_[d].read(tapA) * static_cast<T>(kOutSignR_[d]) * T(0.2);
         }
+        } // !eco_ (extra output taps)
 
-        lateL *= lateLvl * kOutputNorm;
-        lateR *= lateLvl * kOutputNorm;
+        const T outNorm = eco_ ? kOutputNormEco : kOutputNorm;
+        lateL *= lateLvl * outNorm;
+        lateR *= lateLvl * outNorm;
 
         // --- Output diffusion (L/R decorrelated allpass) ---
         for (int s = 0; s < kOutDiffStages; ++s)
@@ -1365,8 +1561,11 @@ protected:
 
         for (int d = 0; d < kFDNSize; ++d)
         {
+            // Eco (8 lines) picks every other base delay so the active lines
+            // still span the full 29.7-160 ms range (mode density stays even).
+            const int srcIdx = eco_ ? std::min(d * 2, kFDNSize - 1) : d;
             int raw = std::max(1, static_cast<int>(
-                kBaseDelaysMs_[d] * sz * sr / 1000.0));
+                kBaseDelaysMs_[srcIdx] * sz * sr / 1000.0));
             fdnDelayLens_[d] = nearestPrime(raw);
         }
 
@@ -1434,6 +1633,24 @@ protected:
     }
 
     // --- Early reflection generation -----------------------------------------
+
+    /// Regenerates the ER tap set for a reverb type, honouring the Eco cap.
+    /// The taps are re-spread over the type's full min..max window, so a
+    /// reduced count keeps the temporal coverage (and the 1/sqrt(N) gain
+    /// normalization stays correct).
+    void generateERTapsForType(Type type) noexcept
+    {
+        const int cap = eco_ ? kEcoERTaps : kMaxERTaps;
+        switch (type)
+        {
+            case Type::Room:      generateERTaps(1.5, 35.0, std::min(30, cap));   break;
+            case Type::Hall:      generateERTaps(5.0, 110.0, std::min(40, cap));  break;
+            case Type::Chamber:   generateERTaps(3.0, 60.0, std::min(35, cap));   break;
+            case Type::Plate:     numERTaps_ = 0;                                 break;
+            case Type::Spring:    generateERTaps(1.0, 25.0, std::min(15, cap));   break;
+            case Type::Cathedral: generateERTaps(10.0, 160.0, std::min(40, cap)); break;
+        }
+    }
 
     void generateERTaps(double minMs, double maxMs, int numTaps) noexcept
     {
@@ -1622,15 +1839,7 @@ protected:
                     static_cast<uint32_t>(i * 6271 + 31337));
             }
 
-            switch (type)
-            {
-                case Type::Room:      generateERTaps(1.5, 35.0, 30);   break;
-                case Type::Hall:      generateERTaps(5.0, 110.0, 40);  break;
-                case Type::Chamber:   generateERTaps(3.0, 60.0, 35);   break;
-                case Type::Plate:     break;
-                case Type::Spring:    generateERTaps(1.0, 25.0, 15);   break;
-                case Type::Cathedral: generateERTaps(10.0, 160.0, 40); break;
-            }
+            generateERTapsForType(type);
         }
     }
 };

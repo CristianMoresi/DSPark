@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -12,31 +12,30 @@
  * rate-dependent loop losses, following the Jiles-Atherton model
  * (Jiles & Atherton 1986; audio-rate treatment after Chowdhury, DAFx-19):
  *
- *   M_an(Q)  = Ms · L(Q),  L(x) = coth(x) − 1/x,  Q = (H + α·M)/a
+ *   M_an(Q) = Ms * L(Q),   L(x) = coth(x) - 1/x,   Q = (H + alpha*M) / a
  *
- *             (1−c)·δ_M·(M_an − M)
- *   φ1      = ─────────────────────────,   δ = sign(dH/dt)
- *             (1−c)·δ·k − α·(M_an − M)
+ *   phi1  = (1-c) * dltM * (M_an - M) / [ (1-c)*dlt*k - alpha*(M_an - M) ]
+ *           with dlt = sign(dH/dt), dltM the reversal gate
  *
- *   dM      φ1 + c·(Ms/a)·L'(Q)
- *   ──  =   ───────────────────────── · dH/dt
- *   dt      1 − c·α·(Ms/a)·L'(Q)
+ *   dM/dt = [ phi1 + c*(Ms/a)*L'(Q) ] / [ 1 - c*alpha*(Ms/a)*L'(Q) ] * dH/dt
  *
- * δ_M gates the irreversible term so magnetization never moves unphysically
- * against the drive direction at reversal points.
+ * The gate dltM zeroes the irreversible term whenever magnetization would
+ * move unphysically against the drive direction at reversal points.
  *
  * Integration is trapezoidal (matching the WDF/bilinear convention used
  * throughout the framework) solved per sample with a Newton-Raphson
- * iteration on M_n, seeded by an explicit Euler predictor — converges in
+ * iteration on M_n, seeded by an explicit Euler predictor -- converges in
  * 1-3 iterations at audio rates. All internal state is double regardless of
  * T: the model mixes quantities spanning ~9 orders of magnitude.
  *
  * Verified by the test suite on first principles: odd symmetry of the B-H
  * loop, monotone loop area vs the loss parameter k, remanence after field
- * removal, and loop collapse as the reversible fraction c → 1.
+ * removal, and loop collapse as the reversible fraction c -> 1.
  *
  * Mono processor: hold one instance per channel (the framework pattern for
- * stateful per-channel cores, like Hilbert).
+ * stateful per-channel cores, like Hilbert). Threading is owner-managed:
+ * the consuming effect calls setParameters()/processSample() from its own
+ * audio thread (the framework's dirty-flag pattern), so no atomics live here.
  *
  * Dependencies: DspMath.h.
  */
@@ -103,7 +102,7 @@ public:
     /**
      * @brief Small-signal susceptibility dM/dH around the demagnetized state.
      *
-     * The reversible-branch slope c·χ_an/(1 − c·α·χ_an) with χ_an = Ms/(3a).
+     * The reversible-branch slope c*chi_an/(1 - c*alpha*chi_an), chi_an = Ms/(3a).
      * Used by consumers (TapeMachine) for exact small-signal gain makeup.
      */
     [[nodiscard]] double getSmallSignalSusceptibility() const noexcept
@@ -154,7 +153,7 @@ private:
         const double ax = std::abs(x);
         if (ax < 1e-3)
         {
-            // Taylor: L = x/3 − x³/45, L' = 1/3 − x²/15, L'' = −2x/15
+            // Taylor: L = x/3 - x^3/45, L' = 1/3 - x^2/15, L'' = -2x/15
             const double x2 = x * x;
             l   = x * (1.0 / 3.0 - x2 / 45.0);
             lp  = 1.0 / 3.0 - x2 / 15.0;
@@ -162,7 +161,7 @@ private:
         }
         else if (ax > 30.0)
         {
-            // csch² underflows to 0 well before this point.
+            // csch^2 underflows to 0 well before this point.
             l   = (x > 0.0 ? 1.0 : -1.0) - 1.0 / x;
             lp  = 1.0 / (x * x);
             lpp = -2.0 / (x * x * x);
@@ -182,7 +181,7 @@ private:
         }
     }
 
-    /** @brief Evaluates W = dM/dt and ∂W/∂M at (m, h, hDot). */
+    /** @brief Evaluates W = dM/dt and dW/dM at (m, h, hDot). */
     void evaluate(double m, double h, double hDot, double& w, double& dwdm) const noexcept
     {
         if (hDot == 0.0)
@@ -212,12 +211,19 @@ private:
         const double cChiLp = c_ * chi_ * lp;
 
         const double num = phi1 + cChiLp;
-        const double den = 1.0 - alpha_ * cChiLp;
+        // Guard the reversible-branch denominator too: physical JA parameter
+        // sets satisfy c*alpha*Ms/(3a) < 1 so den stays near 1, but an extreme
+        // user set makes it sweep through zero as Q moves, spiking dM/dt (and
+        // wPrev_, which has no physical clamp) by orders of magnitude for a
+        // sample. The M clamp recovers afterwards; this bounds the spike.
+        double den = 1.0 - alpha_ * cChiLp;
+        if (std::abs(den) < 0.01)
+            den = (den >= 0.0) ? 0.01 : -0.01;
         w = hDot * num / den;
 
-        // Analytic ∂W/∂M for the Newton step.
+        // Analytic dW/dM for the Newton step.
         const double alphaOverA = alpha_ / a_;
-        const double dmAn  = ms_ * lp * alphaOverA - 1.0;          // d(M_an − M)/dM
+        const double dmAn  = ms_ * lp * alphaOverA - 1.0;          // d(M_an - M)/dM
         const double dPhi1 = oneMc * deltaM * dmAn * (oneMc * delta * k_) / (d1 * d1);
         const double dLp   = lpp * alphaOverA;
         const double dNum  = dPhi1 + c_ * chi_ * dLp;

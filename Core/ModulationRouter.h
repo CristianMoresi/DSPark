@@ -1,21 +1,21 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
 /**
  * @file ModulationRouter.h
- * @brief Block-rate modulation routing: sources → parameter setters.
+ * @brief Block-rate modulation routing: sources to parameter setters.
  *
  * Generalizes the pitch-tracking-EQ pattern to any parameter without
  * imposing an architecture: a route reads a source (LFO, EnvelopeFollower,
  * PitchFollower, your lambda...), scales it by depth around a base value,
- * smooths it, and applies it through a setter callback — once per block,
+ * smooths it, and applies it through a setter callback -- once per block,
  * which is how DSPark parameters are designed to move (their setters are
  * thread-safe and internally smoothed).
  *
  * Routes are configured at setup time (std::function storage may allocate
- * THERE); `update()` in the audio callback is allocation-free — it only
+ * THERE); `update()` in the audio callback is allocation-free -- it only
  * invokes the stored callables.
  *
  * @code
@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <functional>
 
@@ -41,7 +42,13 @@ namespace dspark {
 
 /**
  * @class ModulationRouter
- * @brief Fixed-capacity source→target router with per-route depth/smoothing.
+ * @brief Fixed-capacity source-to-target router with per-route depth/smoothing.
+ *
+ * Threading: addRoute()/clear() belong to setup threads and must not run
+ * concurrently with update() (same contract as prepare() elsewhere in the
+ * framework). setDepth() is safe from any thread (atomic). update() runs on
+ * the audio thread and is noexcept: the stored callables MUST NOT throw --
+ * DSPark setters never do.
  *
  * @tparam T         Value type (float or double).
  * @tparam MaxRoutes Route capacity (compile-time, no audio-thread allocation).
@@ -55,21 +62,24 @@ public:
      *
      * The applied value is `base + source() * depth`, one-pole smoothed.
      *
-     * @param source   Returns the current modulation value.
+     * @param source   Returns the current modulation value. Must be non-empty.
      * @param target   Receives the smoothed, scaled value (a setter).
+     *                 Must be non-empty.
      * @param depth    Multiplier on the source value.
      * @param base     Constant offset.
      * @param smoothMs One-pole smoothing time (0 = none).
-     * @return Route index, or -1 if the router is full.
+     * @return Route index, or -1 if the router is full or a callable is empty.
      */
     int addRoute(std::function<T()> source, std::function<void(T)> target,
                  T depth = T(1), T base = T(0), T smoothMs = T(20))
     {
-        if (numRoutes_ >= MaxRoutes) return -1;
+        // Empty callables would raise std::bad_function_call inside the
+        // noexcept audio-thread update() -- reject them at the door.
+        if (numRoutes_ >= MaxRoutes || !source || !target) return -1;
         auto& r = routes_[static_cast<size_t>(numRoutes_)];
         r.source = std::move(source);
         r.target = std::move(target);
-        r.depth = depth;
+        r.depth.store(depth, std::memory_order_relaxed);
         r.base = base;
         r.smoothMs = std::max(smoothMs, T(0));
         r.state = T(0);
@@ -77,15 +87,23 @@ public:
         return numRoutes_++;
     }
 
-    /** @brief Changes a route's depth (RT-safe: plain store read by update()). */
+    /** @brief Changes a route's depth. Thread-safe (atomic, relaxed). */
     void setDepth(int route, T depth) noexcept
     {
         if (route >= 0 && route < numRoutes_)
-            routes_[static_cast<size_t>(route)].depth = depth;
+            routes_[static_cast<size_t>(route)].depth.store(depth, std::memory_order_relaxed);
     }
 
-    /** @brief Removes all routes (setup threads only). */
-    void clear() noexcept { numRoutes_ = 0; }
+    /** @brief Removes all routes and releases their captures (setup threads only). */
+    void clear() noexcept
+    {
+        for (int i = 0; i < numRoutes_; ++i)
+        {
+            routes_[static_cast<size_t>(i)].source = nullptr;
+            routes_[static_cast<size_t>(i)].target = nullptr;
+        }
+        numRoutes_ = 0;
+    }
 
     /** @brief Number of configured routes. */
     [[nodiscard]] int getNumRoutes() const noexcept { return numRoutes_; }
@@ -101,7 +119,8 @@ public:
         for (int i = 0; i < numRoutes_; ++i)
         {
             auto& r = routes_[static_cast<size_t>(i)];
-            const T value = r.base + r.source() * r.depth;
+            const T depth = r.depth.load(std::memory_order_relaxed);
+            const T value = r.base + r.source() * depth;
             if (!r.primed || r.smoothMs <= T(0))
             {
                 r.state = value;     // no sweep-in from zero on the first hit
@@ -122,7 +141,7 @@ private:
     {
         std::function<T()> source;
         std::function<void(T)> target;
-        T depth = T(1);
+        std::atomic<T> depth { T(1) };
         T base = T(0);
         T smoothMs = T(20);
         T state = T(0);

@@ -210,6 +210,8 @@ Copy the `DSPark/` folder into your project. Done.
 
 Requires a C++20 compiler. Tested with MSVC 19.50+, and compatible with GCC 12+, Clang 15+, Emscripten 3+.
 
+> **Build with optimizations.** DSPark is header-only: all DSP code compiles inside your translation units and inherits your build flags. A debug build runs the processors 3-7x slower than release, which matters more here than with libraries that ship precompiled binaries. If an effect seems too slow, check your flags first: `-O2`/`-O3` and `-DNDEBUG` on GCC/Clang, `/O2` and `/DNDEBUG` on MSVC.
+
 ### Process a WAV File
 
 ```cpp

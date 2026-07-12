@@ -699,7 +699,7 @@ public:
      * @note **Real-Time Safe.** Can be called safely from the audio thread to prevent clicks 
      * when the transport stops or loops.
      */
-    void reset()
+    void reset() noexcept
     {
         for (auto& algo : pool_)
             if (algo) algo->reset();

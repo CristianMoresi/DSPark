@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -15,13 +15,20 @@
  * - No virtual dispatch (resolved at compile time).
  * - Real-time safety: All hot-path methods MUST be natively `noexcept`.
  * - Strict type matching (`std::same_as`) to prevent implicit casting overhead.
- * - SIMD ready: Generators must support block processing.
+ * - Generators must support block processing as well as per-sample pulls.
  *
  * | Concept              | Required methods                                          |
  * |----------------------|-----------------------------------------------------------|
  * | `AudioProcessor`     | `prepare(AudioSpec)`, `processBlock(View) noexcept`, `reset() noexcept` |
  * | `SampleProcessor`    | Above + `processSample(T, int) noexcept -> T`             |
  * | `GeneratorProcessor` | `prepare(AudioSpec)`, `generateBlock(View) noexcept`, `reset() noexcept`, `getSample() noexcept -> T` |
+ *
+ * Scope note: the contract targets in-place single-buffer inserts and
+ * self-contained generators. Multi-buffer or per-call-parameterised
+ * utilities (Crossfade, CrossoverFilter, MidSide, AutoGain, the Delay
+ * building block, Phasor) intentionally do not model these concepts;
+ * wrap them in a small insert class if you need them inside a
+ * ProcessorChain.
  *
  * Dependencies: AudioSpec.h, AudioBuffer.h.
  */

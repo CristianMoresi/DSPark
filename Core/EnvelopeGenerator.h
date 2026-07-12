@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -26,12 +26,31 @@ namespace dspark {
  * @class ADSREnvelope
  * @brief Classic ADSR envelope generator with exponential curves.
  *
- * Uses an asymptotic RC-style algorithm for natural-sounding dynamics.
- * Optimized for real-time block processing and cache coherence.
+ * Each stage runs an asymptotic RC-style one-pole toward a target that
+ * overshoots the stage endpoint, so the stage completes in finite time with
+ * the exact duration set by its parameter:
  *
- * State machine: Idle → Attack → Decay → Sustain → Release → Idle.
+ * - **Attack**: 0 -> 1 in attackMs (from a retrigger it starts at the
+ *   current value and arrives earlier, click-free legato).
+ * - **Decay**: 1 -> sustain in decayMs for any sustain level (the overshoot
+ *   scales with the stage depth, matching the self-similar RC discharge).
+ * - **Release**: calibrated for full scale -> silence in releaseMs. Like an
+ *   analog RC release (fixed dB-per-second slope), releasing from a lower
+ *   sustain reaches silence proportionally sooner.
  *
- * @tparam T Output type (float or double). Constraints to IEEE 754 floats.
+ * Curvature shapes each stage: high values are strongly exponential, 0.1 is
+ * near-linear. Stage durations stay exact across the whole curvature range.
+ *
+ * State machine: Idle -> Attack -> Decay -> Sustain -> Release -> Idle.
+ * The recursion state is double regardless of T (the framework rule for
+ * recursive state): in float, very long stages stall short of their target
+ * when the per-sample increment rounds to zero.
+ *
+ * Threading is owner-managed: call setters, triggers and processing from the
+ * owning (audio) thread, the pattern of a synth voice. A default-constructed
+ * envelope is functional at 48 kHz; prepare() adapts it to the real rate.
+ *
+ * @tparam T Output type (float or double). Constrained to IEEE 754 floats.
  */
 template <FloatType T>
 class ADSREnvelope
@@ -39,41 +58,44 @@ class ADSREnvelope
 public:
     enum class State { Idle, Attack, Decay, Sustain, Release };
 
-    /** * @brief Prepares the envelope for the given sample rate. 
+    ADSREnvelope() noexcept { recalculate(); }
+
+    /**
+     * @brief Prepares the envelope for the given sample rate.
      * @param sampleRate The operating sample rate in Hz.
      */
     void prepare(double sampleRate) noexcept
     {
         if (sampleRate <= 0.0) return;
         sampleRate_ = sampleRate;
-        sampleRateMs_ = static_cast<T>(sampleRate) * T(0.001); // Pre-calculate for ms conversion
         recalculate();
     }
 
-    /** * @brief Prepares from AudioSpec (unified API). 
+    /**
+     * @brief Prepares from AudioSpec (unified API).
      * @param spec Audio specification containing the sample rate.
      */
-    void prepare(const AudioSpec& spec) { prepare(spec.sampleRate); }
+    void prepare(const AudioSpec& spec) noexcept { prepare(spec.sampleRate); }
 
     // -- Parameters (in milliseconds) ------------------------------------------
 
-    /** @brief Sets attack time in milliseconds. */
+    /** @brief Sets attack time in milliseconds (0 -> 1). */
     void setAttack(T ms) noexcept  { attackMs_ = std::max(ms, T(0.01)); recalculate(); }
 
-    /** @brief Sets decay time in milliseconds. */
+    /** @brief Sets decay time in milliseconds (1 -> sustain). */
     void setDecay(T ms) noexcept   { decayMs_ = std::max(ms, T(0.01)); recalculate(); }
 
     /** @brief Sets sustain level (0.0 to 1.0). */
     void setSustain(T level) noexcept { sustainLevel_ = std::clamp(level, T(0), T(1)); }
 
-    /** @brief Sets release time in milliseconds. */
+    /** @brief Sets release time in milliseconds (full scale -> silence). */
     void setRelease(T ms) noexcept { releaseMs_ = std::max(ms, T(0.01)); recalculate(); }
 
     /**
      * @brief Sets all ADSR parameters at once.
      * @param attackMs  Attack time in ms.
      * @param decayMs   Decay time in ms.
-     * @param sustain   Sustain level (0–1).
+     * @param sustain   Sustain level (0-1).
      * @param releaseMs Release time in ms.
      */
     void setParameters(T attackMs, T decayMs, T sustain, T releaseMs) noexcept
@@ -116,7 +138,7 @@ public:
 
     // -- Trigger ---------------------------------------------------------------
 
-    /** @brief Triggers the attack phase (note on). */
+    /** @brief Triggers the attack phase (note on). Legato: continues from the current value. */
     void noteOn() noexcept
     {
         state_ = State::Attack;
@@ -133,7 +155,7 @@ public:
     void reset() noexcept
     {
         state_ = State::Idle;
-        currentValue_ = T(0);
+        currentValue_ = 0.0;
     }
 
     // -- Processing ------------------------------------------------------------
@@ -150,60 +172,152 @@ public:
                 return T(0);
 
             case State::Attack:
-                currentValue_ += attackRate_ * (T(1) + attackOvershoot_ - currentValue_);
-                if (currentValue_ >= T(1))
+                currentValue_ += attackRate_ * (1.0 + kAttack_ - currentValue_);
+                if (currentValue_ >= 1.0)
                 {
-                    currentValue_ = T(1);
+                    currentValue_ = 1.0;
                     state_ = State::Decay;
                 }
                 break;
 
             case State::Decay:
-                currentValue_ += decayRate_ * (sustainLevel_ - decayOvershoot_ - currentValue_);
-                // Modulating sustain upwards safety check: if we drop below OR cross the new threshold
-                if (currentValue_ <= sustainLevel_)
+            {
+                const double s = static_cast<double>(sustainLevel_);
+                const double prev = currentValue_;
+                currentValue_ += decayRate_ * (s - (1.0 - s) * kDecay_ - currentValue_);
+                if (currentValue_ <= s)
                 {
-                    currentValue_ = sustainLevel_;
+                    // Normal completion (crossed from above): land exactly on s.
+                    // Sustain raised above the current value mid-decay: keep the
+                    // value and let the Sustain chase close the gap click-free.
+                    if (prev >= s)
+                        currentValue_ = s;
                     state_ = State::Sustain;
                 }
                 break;
+            }
 
             case State::Sustain:
-                // Allows dynamic sustain modulation during hold phase
-                currentValue_ += decayRate_ * (sustainLevel_ - currentValue_);
+                // Chases sustain changes at the decay rate (dynamic modulation).
+                currentValue_ += decayRate_ * (static_cast<double>(sustainLevel_) - currentValue_);
                 break;
 
             case State::Release:
-                currentValue_ += releaseRate_ * (T(0) - releaseOvershoot_ - currentValue_);
-                if (currentValue_ <= T(0.0001))
+                currentValue_ += releaseRate_ * (-kRelease_ - currentValue_);
+                if (currentValue_ <= kSilence)
                 {
-                    currentValue_ = T(0);
+                    currentValue_ = 0.0;
                     state_ = State::Idle;
                 }
                 break;
         }
 
-        return currentValue_;
+        return static_cast<T>(currentValue_);
     }
 
     /**
-     * @brief Fills a buffer with envelope values. Optimized for DSP loops.
+     * @brief Fills a buffer with envelope values.
+     *
+     * Runs each stage as a tight loop with its constants hoisted (no state
+     * dispatch per sample). Sample-exact match with getNextValue().
+     *
      * @param output Buffer to fill with envelope values.
      * @param numSamples Number of samples to generate.
      */
     void processBlock(T* output, int numSamples) noexcept
     {
-        // Unrolling the block processing prevents the switch statement 
-        // from destroying CPU branch prediction on every single sample.
+        // Each stage runs as a tight loop on locals (stage constants hoisted,
+        // recursion state in a register): no state dispatch or member traffic
+        // per sample. Arithmetic is sample-exact with getNextValue().
         int i = 0;
         while (i < numSamples)
         {
-            State currentState = state_;
-            
-            // Process chunks while the state remains constant
-            while (i < numSamples && state_ == currentState)
+            switch (state_)
             {
-                output[i++] = getNextValue();
+                case State::Idle:
+                    while (i < numSamples)
+                        output[i++] = T(0);
+                    break;
+
+                case State::Attack:
+                {
+                    const double target = 1.0 + kAttack_;
+                    const double r = attackRate_;
+                    double v = currentValue_;
+                    while (i < numSamples)
+                    {
+                        v += r * (target - v);
+                        if (v >= 1.0)
+                        {
+                            v = 1.0;
+                            state_ = State::Decay;
+                            output[i++] = T(1);
+                            break;
+                        }
+                        output[i++] = static_cast<T>(v);
+                    }
+                    currentValue_ = v;
+                    break;
+                }
+
+                case State::Decay:
+                {
+                    const double s = static_cast<double>(sustainLevel_);
+                    const double target = s - (1.0 - s) * kDecay_;
+                    const double r = decayRate_;
+                    double v = currentValue_;
+                    while (i < numSamples)
+                    {
+                        const double prev = v;
+                        v += r * (target - v);
+                        if (v <= s)
+                        {
+                            if (prev >= s)
+                                v = s;
+                            state_ = State::Sustain;
+                            output[i++] = static_cast<T>(v);
+                            break;
+                        }
+                        output[i++] = static_cast<T>(v);
+                    }
+                    currentValue_ = v;
+                    break;
+                }
+
+                case State::Sustain:
+                {
+                    const double s = static_cast<double>(sustainLevel_);
+                    const double r = decayRate_;
+                    double v = currentValue_;
+                    while (i < numSamples)
+                    {
+                        v += r * (s - v);
+                        output[i++] = static_cast<T>(v);
+                    }
+                    currentValue_ = v;
+                    break;
+                }
+
+                case State::Release:
+                {
+                    const double target = -kRelease_;
+                    const double r = releaseRate_;
+                    double v = currentValue_;
+                    while (i < numSamples)
+                    {
+                        v += r * (target - v);
+                        if (v <= kSilence)
+                        {
+                            v = 0.0;
+                            state_ = State::Idle;
+                            output[i++] = T(0);
+                            break;
+                        }
+                        output[i++] = static_cast<T>(v);
+                    }
+                    currentValue_ = v;
+                    break;
+                }
             }
         }
     }
@@ -211,7 +325,7 @@ public:
     // -- Getters ---------------------------------------------------------------
 
     /** @brief Returns the current envelope value. */
-    [[nodiscard]] T getCurrentValue() const noexcept { return currentValue_; }
+    [[nodiscard]] T getCurrentValue() const noexcept { return static_cast<T>(currentValue_); }
 
     /** @brief Returns the current state. */
     [[nodiscard]] State getState() const noexcept { return state_; }
@@ -220,26 +334,38 @@ public:
     [[nodiscard]] bool isActive() const noexcept { return state_ != State::Idle; }
 
 private:
+    // Release ends when the value falls below this floor (about -80 dB);
+    // the strictly negative release target guarantees it is crossed.
+    static constexpr double kSilence = 1e-4;
+
     void recalculate() noexcept
     {
-        // Per-stage overshoot keeps timings mathematically consistent for each
-        // stage's own curvature (overshoot = exp(-curve)).
-        attackOvershoot_  = std::exp(-attackCurve_);
-        decayOvershoot_   = std::exp(-decayCurve_);
-        releaseOvershoot_ = std::exp(-releaseCurve_);
-
-        auto calcRate = [this](T timeMs, T curve) -> T {
-            T samples = std::max(sampleRateMs_ * timeMs, T(1));
-            return T(1) - std::exp(-curve / samples);
+        // Asymptotic one-pole stage design. With ov = exp(-curve), running the
+        // recursion v += rate * (target - v) for exactly `samples` steps
+        // multiplies the distance to the target by ov. Overshooting the stage
+        // endpoint by k = ov / (1 - ov) OF THE STAGE DEPTH makes the endpoint
+        // land exactly on the last step, for any curvature:
+        //
+        //   endpoint = target + depth_to_target * ov  with  target = end + k*depth
+        //
+        // (A first-order shortcut like target = end + ov breaks the timing
+        // contract: at curve 0.1 the stages run ~7x their parameter, and a
+        // fixed absolute overshoot makes decay/release durations drift with
+        // the sustain level.)
+        auto stage = [this](T timeMs, T curve, double& rate, double& k) noexcept {
+            const double c = static_cast<double>(curve);
+            const double ov = std::exp(-c);
+            k = ov / (1.0 - ov);
+            const double samples = std::max(sampleRate_ * 0.001 * static_cast<double>(timeMs), 1.0);
+            rate = 1.0 - std::exp(-c / samples);
         };
 
-        attackRate_  = calcRate(attackMs_,  attackCurve_);
-        decayRate_   = calcRate(decayMs_,   decayCurve_);
-        releaseRate_ = calcRate(releaseMs_, releaseCurve_);
+        stage(attackMs_,  attackCurve_,  attackRate_,  kAttack_);
+        stage(decayMs_,   decayCurve_,   decayRate_,   kDecay_);
+        stage(releaseMs_, releaseCurve_, releaseRate_, kRelease_);
     }
 
     double sampleRate_ = 48000.0;
-    T sampleRateMs_    = T(48.0); // Optimized multiplier
 
     T attackMs_     = T(10);
     T decayMs_      = T(100);
@@ -249,14 +375,15 @@ private:
     T decayCurve_   = T(3.0);
     T releaseCurve_ = T(3.0);
 
-    T attackRate_   = T(0);
-    T decayRate_    = T(0);
-    T releaseRate_  = T(0);
-    T attackOvershoot_  = T(0.05); // Derived from per-stage curvature
-    T decayOvershoot_   = T(0.05);
-    T releaseOvershoot_ = T(0.05);
+    // Stage coefficients and overshoot fractions (see recalculate()).
+    double attackRate_  = 0.0;
+    double decayRate_   = 0.0;
+    double releaseRate_ = 0.0;
+    double kAttack_     = 0.0;
+    double kDecay_      = 0.0;
+    double kRelease_    = 0.0;
 
-    T currentValue_ = T(0);
+    double currentValue_ = 0.0;
     State state_ = State::Idle;
 };
 

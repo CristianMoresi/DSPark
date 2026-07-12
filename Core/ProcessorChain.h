@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark -- Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi -- MIT License
 
 #pragma once
 
@@ -8,17 +8,20 @@
  * @brief Compile-time processor chain for composing DSP effects.
  *
  * Chains multiple processors together so they are prepared, processed,
- * and reset as a single unit. Uses `std::tuple` internally — all dispatch
+ * and reset as a single unit. Uses `std::tuple` internally -- all dispatch
  * is resolved at compile time with zero runtime overhead.
  *
- * Each processor in the chain should satisfy the framework's AudioProcessor concept.
+ * Each processor in the chain must satisfy the framework's AudioProcessor concept.
  *
  * Dependencies: ProcessorTraits.h, AudioSpec.h, AudioBuffer.h.
  */
 
 #include "ProcessorTraits.h"
+#include "AudioSpec.h"
+#include "AudioBuffer.h"
 
 #include <cstddef>
+#include <concepts>
 #include <tuple>
 #include <utility>
 #include <array>
@@ -112,8 +115,10 @@ public:
     /**
      * @brief Returns the total latency in samples across all processors.
      *
-     * Evaluated at compile-time via requires expressions. Only sums from
-     * processors that provide a `getLatency()` method.
+     * Reporters are detected at compile time via requires expressions and
+     * summed at runtime. Only processors providing a const `getLatency()`
+     * convertible to int contribute; a non-const `getLatency()` is a
+     * compile error rather than a silent zero.
      *
      * @note Latency is summed over ALL slots regardless of per-slot bypass, so
      *       the reported value stays constant when toggling bypass at runtime.
@@ -165,10 +170,21 @@ private:
     template <std::size_t I>
     [[nodiscard]] int getProcessorLatency() const noexcept
     {
-        if constexpr (requires { std::get<I>(processors_).getLatency(); })
-            return std::get<I>(processors_).getLatency();
+        using P = std::tuple_element_t<I, std::tuple<Processors...>>;
+        if constexpr (requires(const P& p) { { p.getLatency() } -> std::convertible_to<int>; })
+        {
+            return static_cast<int>(std::get<I>(processors_).getLatency());
+        }
         else
+        {
+            // A latency reporter that is not callable on a const processor
+            // (or does not return an int-convertible value) would otherwise
+            // be skipped silently, desynchronising host delay compensation.
+            static_assert(!requires(P& p) { p.getLatency(); },
+                "Processor getLatency() must be const and return a value convertible to int "
+                "to be summed by ProcessorChain::getLatency().");
             return 0;
+        }
     }
 
     template <std::size_t... Is>

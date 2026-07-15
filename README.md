@@ -1,8 +1,6 @@
-# DSPark
-
-**DSP** + **Ark** + **The Spark**
-
-**A header-only audio DSP framework in pure C++20. Zero external dependencies.**
+<p align="center">
+  <img src="docs/img/dspark-gh.png" alt="DSPark - A header-only audio DSP framework in pure C++20" width="100%">
+</p>
 
 **v1.6.1** — 90+ headers of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins (effects and MIDI instruments) with HTML/CSS/JS editors.
 

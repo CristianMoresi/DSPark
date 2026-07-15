@@ -5,6 +5,7 @@
 # -- Private (never published) ------------------------------------------------
 .claude/
 CLAUDE.md
+AGENTS.md
 tests/
 AUDIT_*.md
 PLAN_*.md
@@ -61,6 +62,11 @@ DSParkLab/build_log.txt
 
 # -- Generated artefacts -------------------------------------------------------
 dspark_single_header.hpp
+
+# -- Local branding variants --------------------------------------------------
+docs/img/dspark-icon.png
+docs/img/dspark-logo.png
+docs/img/dspark-text.png
 
 # -- Diagnostic / log files ---------------------------------------------------
 *.log

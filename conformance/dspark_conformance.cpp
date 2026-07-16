@@ -299,10 +299,14 @@ void runSimdKernelTests()
 float denormalProbe()
 {
     // FLT_MIN * 0.5 is subnormal under IEEE arithmetic, exactly 0.0f under
-    // FTZ. volatile forces the multiply to run under the current FP mode.
+    // FTZ. Every access is volatile so the multiply cannot be hoisted or
+    // sunk across the guard's control-register writes: optimisers reorder
+    // plain FP ops across asm/intrinsics (the loads pin the inputs after
+    // construction, the store pins the result before destruction).
     volatile float smallest = std::numeric_limits<float>::min();
     volatile float half     = 0.5f;
-    return smallest * half;
+    volatile float result   = smallest * half;
+    return result;
 }
 
 void runCoreGuardTests()

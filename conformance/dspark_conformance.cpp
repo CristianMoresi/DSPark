@@ -5,6 +5,8 @@
 //
 //   [simd]    every SimdOps kernel against a scalar reference on the SIMD
 //             path that is active for the build (SSE2/AVX/NEON/Wasm/scalar)
+//   [core]    DenormalGuard flush + restore semantics on the active target
+//             (real FTZ on x86/ARM, documented no-op on WebAssembly)
 //   [smoke]   every effect: prepare → process → finite output → silent tail
 //   [pdc]     null tests: latency-reporting processors cancel against a
 //             delay-compensated dry path
@@ -286,6 +288,38 @@ void runSimdKernelTests()
     check(ramps,       "simd", "gain ramp kernels match the scalar reference");
     check(simdPeakLevelIgnoresNan<float>() && simdPeakLevelIgnoresNan<double>(),
           "simd", "peakLevel ignores NaN samples");
+}
+
+// -----------------------------------------------------------------------------
+// [core] — DenormalGuard flushes denormal results where the architecture has
+// an FTZ mode, is a transparent no-op where none exists (e.g. WebAssembly),
+// and always restores the previous FP state exactly.
+// -----------------------------------------------------------------------------
+
+float denormalProbe()
+{
+    // FLT_MIN * 0.5 is subnormal under IEEE arithmetic, exactly 0.0f under
+    // FTZ. volatile forces the multiply to run under the current FP mode.
+    volatile float smallest = std::numeric_limits<float>::min();
+    volatile float half     = 0.5f;
+    return smallest * half;
+}
+
+void runCoreGuardTests()
+{
+    const float before = denormalProbe();
+    float inside = -1.0f;
+    {
+        dspark::DenormalGuard guard;
+        inside = denormalProbe();
+    }
+    const float after = denormalProbe();
+
+    if (dspark::DenormalGuard::isActive())
+        check(inside == 0.0f, "core", "DenormalGuard flushes denormal results to zero");
+    else
+        check(inside == before, "core", "DenormalGuard is a transparent no-op on this target");
+    check(after == before, "core", "DenormalGuard restores the previous FP state");
 }
 
 // -----------------------------------------------------------------------------
@@ -1541,6 +1575,7 @@ int main(int argc, char** argv)
     std::printf("================================\n\n");
 
     runSimdKernelTests();
+    runCoreGuardTests();
     runSmokeTests();
     runPdcNullTests();
     runMetricTests();

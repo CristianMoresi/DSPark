@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -8,22 +8,26 @@
  * @brief Table-based waveshaping with Hermite interpolation for high-end audio.
  *
  * Stores a non-linear transfer function as a lookup table and applies it to audio
- * signals using 3rd-order Hermite interpolation. This minimizes table-induced 
+ * signals using 3rd-order Hermite interpolation. This minimizes table-induced
  * distortion and quantization noise compared to standard linear interpolation.
  *
  * @note **Thread Safety & Real-Time Constraints:**
- * The `build...()` and `setOversampling()` methods allocate memory. They MUST ONLY 
- * be called from the main thread (UI) or during the `prepare()` phase. 
- * For real-time automation of distortion amount, use the `preGain` parameter in the 
+ * The `build...()` and `setOversampling()` methods allocate memory. They MUST
+ * ONLY be called from the main thread (UI) or during the `prepare()` phase,
+ * and never while the audio thread is inside a process call (rebuilding the
+ * table concurrently with processing is a data race). For real-time
+ * automation of distortion amount, use the `preGain` parameter in the
  * `process()` functions instead of rebuilding the table.
  *
- * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, Oversampling.h.
+ * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, Oversampling.h,
+ * Interpolation.h.
  */
 
 #include "DspMath.h"
 #include "AudioSpec.h"
 #include "AudioBuffer.h"
 #include "Oversampling.h"
+#include "Interpolation.h"
 
 #include <algorithm>
 #include <cassert>
@@ -70,6 +74,14 @@ public:
     {
         assert(tableSize >= 4);
         assert(xMax > T(0));
+
+        // Release-safe clamps: a tableSize below 4 makes process() compute
+        // negative table positions (out-of-bounds reads), and a huge one
+        // overflows the 32-bit size_t arithmetic on WASM. Invalid xMax
+        // (non-positive or NaN) falls back to the default half-range.
+        tableSize = std::clamp(tableSize, 4, 1 << 20);
+        if (!(xMax > T(0))) xMax = T(8);
+
         tableSize_ = tableSize;
         xMax_ = std::max(xMax, T(0.001));
         invRange_ = T(1) / (T(2) * xMax_);
@@ -148,32 +160,30 @@ public:
     {
         // The table spans [-xMax, xMax] (default 8), so realistic drive values
         // keep tracing the curve instead of flattening at the old +-1 boundary.
-        T driven = std::clamp(input * preGain, -xMax_, xMax_);
+        // min/max are ordered so that a NaN (input or preGain) resolves to the
+        // upper table edge instead of reaching the int cast below (undefined)
+        // and indexing out of bounds: the output stays finite.
+        T driven = std::max(-xMax_, std::min(xMax_, input * preGain));
 
         // Map to index range [0, tableSize - 1]
         T pos = (driven + xMax_) * invRange_ * static_cast<T>(tableSize_ - 1);
 
-        // Branchless integer extraction
         int idx = static_cast<int>(pos);
         T frac = pos - static_cast<T>(idx);
 
         // Base index offset by +1 due to left-side padding
         const T* t = table_.data() + idx + 1;
 
-        // 3rd-order Hermite interpolation for analog-like smoothness
-        T c0 = t[0];
-        T c1 = T(0.5) * (t[1] - t[-1]);
-        T c2 = t[-1] - T(2.5) * t[0] + T(2.0) * t[1] - T(0.5) * t[2];
-        T c3 = T(1.5) * (t[0] - t[1]) + T(0.5) * (t[2] - t[-1]);
-
-        T output = ((c3 * frac + c2) * frac + c1) * frac + c0;
-        
-        return output * postGain;
+        // Catmull-Rom smoothing via the shared Hermite kernel (Interpolation.h)
+        return interpolateHermite(t[-1], t[0], t[1], t[2], frac) * postGain;
     }
 
     /**
-     * @brief Processes a buffer in-place. SIMD-friendly loop.
-     * 
+     * @brief Processes a buffer in-place.
+     *
+     * Tight scalar loop: the data-dependent table gather defeats
+     * autovectorization, so per-sample cost is the process() call inlined.
+     *
      * @param data Audio samples pointer (should ideally be __restrict).
      * @param numSamples Number of samples to process.
      * @param preGain Gain to drive into the shaper.
@@ -206,16 +216,20 @@ public:
     void setOversampling(int factor)
     {
         assert(factor >= 1 && (factor & (factor - 1)) == 0);
-        oversamplingFactor_ = factor;
-        
+
         if (factor > 1)
         {
             oversampler_ = std::make_unique<Oversampling<T>>(factor);
+            // Oversampling normalises invalid factors release-safe (rounds
+            // down to a power of two); mirror the value it actually adopted
+            // so getOversamplingFactor() never lies about the running rate.
+            oversamplingFactor_ = oversampler_->getFactor();
             if (spec_.sampleRate > 0)
                 oversampler_->prepare(spec_);
         }
         else
         {
+            oversamplingFactor_ = 1;
             oversampler_.reset();
         }
     }

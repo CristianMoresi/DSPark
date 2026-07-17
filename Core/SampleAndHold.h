@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -8,15 +8,22 @@
  * @brief Sample-and-hold processor for stepped modulation and bit-crushing.
  *
  * Captures an input sample and holds it for a configurable number of samples
- * or until an external trigger fires. This introduces deliberate spectral imaging
- * (aliasing) due to its Zero-Order Hold (ZOH) nature, making it ideal for 
- * creative bit-crushing and classic stepped LFO synthesis.
+ * or until an external trigger fires. This introduces deliberate spectral
+ * imaging (aliasing) due to its Zero-Order Hold (ZOH) nature, making it ideal
+ * for creative bit-crushing and classic stepped LFO synthesis.
+ *
+ * Threading: owner-managed. Not internally thread-safe: call setters and
+ * process methods from the owning (audio) thread, or synchronise externally.
  *
  * @note This is an effect/modulator, not a band-limited Sample Rate Converter (SRC).
- * * Dependencies: DspMath.h (for FloatType concept).
+ *
+ * Dependencies: DspMath.h (FloatType concept).
  */
 
 #include "DspMath.h"
+
+#include <cmath>
+#include <limits>
 
 namespace dspark {
 
@@ -34,7 +41,7 @@ public:
     enum class Mode
     {
         Counter, ///< Holds for a fixed number of samples automatically (Decimation).
-        Trigger  ///< Holds indefinitely until an external trigger signal fires.
+        Trigger  ///< Holds until an external trigger captures a new value (level-sensitive).
     };
 
     /**
@@ -45,8 +52,11 @@ public:
 
     /**
      * @brief Sets the hold duration for Counter mode in samples.
-     * * A value of 1 passes the signal transparently. A value of N reduces
-     * the effective sample rate by a factor of N.
+     *
+     * A value of 1 passes the signal transparently. A value of N reduces the
+     * effective sample rate by a factor of N. Capture phase: after reset(),
+     * the first capture happens on the Nth call (the initial value is output
+     * for the first N-1 samples), then every N samples.
      *
      * @param numSamples Hold period in samples. Clamped to a minimum of 1.
      */
@@ -58,26 +68,38 @@ public:
     /**
      * @brief Sets the hold period based on a target effective sample rate.
      *
-     * @param targetRate The desired effective sample rate in Hz. Must be > 0.
+     * The period is rounded to the nearest integer (truncating would bias the
+     * effective rate upward) and clamped to a valid range.
+     *
+     * @param targetRate The desired effective sample rate in Hz. Invalid
+     * values (non-positive or NaN, either argument) reset the period to 1.
      * @param actualRate The current system sample rate in Hz.
      */
     void setHoldRate(double targetRate, double actualRate) noexcept
     {
-        if (targetRate <= 0.0 || actualRate <= 0.0) 
+        if (!(targetRate > 0.0) || !(actualRate > 0.0))
         {
             setHoldSamples(1);
             return;
         }
-        setHoldSamples(static_cast<int>(actualRate / targetRate));
+        // Clamp in double before the integer conversion: a huge ratio would
+        // overflow the int cast (undefined behaviour).
+        const double ratio = actualRate / targetRate;
+        constexpr double maxPeriod = static_cast<double>(std::numeric_limits<int>::max());
+        setHoldSamples(ratio >= maxPeriod ? std::numeric_limits<int>::max()
+                                          : static_cast<int>(std::llround(ratio)));
     }
 
     /**
      * @brief Processes a single sample.
-     * * @warning For optimal performance on blocks, use processBlock() instead,
+     *
+     * @warning For optimal performance on blocks, use processBlock() instead,
      * as this scalar method contains internal branching based on the Mode.
      *
      * @param input The audio or modulation input sample.
-     * @param trigger External trigger state (ignored in Counter mode).
+     * @param trigger External trigger state (ignored in Counter mode). The
+     * trigger is level-sensitive: while it stays true, the input is tracked
+     * sample-by-sample; send single-sample pulses for classic S&H capture.
      * @return The currently held output sample.
      */
     [[nodiscard]] T process(T input, bool trigger = false) noexcept
@@ -103,7 +125,8 @@ public:
 
     /**
      * @brief Processes a block of samples in-place (Counter mode optimized).
-     * * If the processor is in Trigger mode, calling this method will simply 
+     *
+     * If the processor is in Trigger mode, calling this method will simply
      * fill the buffer with the last held value. For Trigger mode processing,
      * use the overloaded processBlock with the trigger buffer.
      *
@@ -138,16 +161,19 @@ public:
 
     /**
      * @brief Processes a block of samples in-place using an external trigger buffer.
-     * * Only relevant when Mode is set to Trigger. If Mode is Counter, the 
-     * triggers buffer is safely ignored.
+     *
+     * Only relevant when Mode is set to Trigger (level-sensitive, same
+     * semantics as process()). If Mode is Counter, the triggers buffer is
+     * safely ignored.
      *
      * @param data Audio buffer to process in-place.
-     * @param triggers Array of boolean triggers (must be size of numSamples).
+     * @param triggers Array of boolean triggers, one per sample. A null
+     * pointer is treated as "no triggers" (the current value is held).
      * @param numSamples Number of samples in the buffer.
      */
     void processBlock(T* data, const bool* triggers, int numSamples) noexcept
     {
-        if (mode_ == Mode::Trigger)
+        if (mode_ == Mode::Trigger && triggers != nullptr)
         {
             // Branch hoisted out of the hot loop
             for (int i = 0; i < numSamples; ++i)
@@ -173,12 +199,13 @@ public:
 
     /**
      * @brief Resets the processor state and sets an initial output value.
-     * * @param initialValue Value to output until the next capture triggers.
+     *
+     * @param initialValue Value to output until the next capture triggers.
      */
     void reset(T initialValue = T(0)) noexcept
     {
         heldValue_ = initialValue;
-        counter_ = 0; // Fixed: ensures initialValue is outputted before next capture
+        counter_ = 0; // Ensures initialValue is output before the next capture
     }
 
 private:

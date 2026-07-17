@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -7,15 +7,19 @@
  * @file RingBuffer.h
  * @brief Circular buffer with interpolated reads for audio delay lines.
  *
- * Provides a power-of-two circular buffer optimized for strict real-time audio use.
- * Completely lock-free and allocation-free in the processing path. Data storage 
- * is aligned to 32 bytes to guarantee safe SIMD auto-vectorization.
+ * Provides a power-of-two circular buffer for strict real-time audio use:
+ * lock-free and allocation-free in the processing path. Storage is 32-byte
+ * aligned so callers can run SIMD kernels over data() spans; the class
+ * itself reads and writes scalars.
  *
  * Features:
- * - 32-byte memory alignment (AVX ready)
- * - Zero branching in hot paths via compile-time template selection
- * - Safe pre-initialization state to prevent segfaults
+ * - 32-byte aligned storage
+ * - Interpolation method selected at compile time (no per-sample dispatch)
+ * - Safe pre-initialization state (all methods are no-ops before prepare())
  * - Multiple interpolation modes (Linear, Cubic, Hermite, Lagrange)
+ *
+ * Threading: owner-managed. prepare() is setup-time; push/read/reset belong
+ * to the owning (audio) thread. Not internally thread-safe.
  *
  * Dependencies: DspMath.h, Interpolation.h.
  */
@@ -25,6 +29,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -54,22 +59,30 @@ class RingBuffer
 public:
     /**
      * @brief Constructs an empty ring buffer. No allocation happens until
-     * prepare() is called — honouring the framework's "allocate only in
-     * prepare()" contract. push()/read() are safe no-ops before prepare().
+     * prepare() is called, honouring the framework's "allocate only in
+     * prepare()" contract. All methods are safe no-ops before prepare().
      */
     RingBuffer() noexcept = default;
 
     /**
      * @brief Allocates the ring buffer with the given capacity.
      *
-     * Capacity is rounded up to the next power of two. Memory is aligned to 
-     * 32 bytes for SIMD safety. Not thread-safe against concurrent process() calls.
+     * Capacity is rounded up to the next power of two. Existing content is
+     * cleared. Memory is aligned to 32 bytes. Not thread-safe against
+     * concurrent processing calls.
      *
-     * @param maxSamples Maximum number of samples to store.
+     * @param maxSamples Maximum number of samples to store. Clamped
+     * release-safe to [1, 2^30] (non-positive requests allocate a single
+     * sample; larger ones would overflow the power-of-two round-up).
      */
-    void prepare(int maxSamples)
+    void prepare(int maxSamples) noexcept
     {
         assert(maxSamples > 0);
+
+        // Clamp before the round-up loop: growing the signed capacity past
+        // 2^30 would overflow the shift (undefined) and never terminate.
+        constexpr int kMaxCapacity = 1 << 30;
+        if (maxSamples > kMaxCapacity) maxSamples = kMaxCapacity;
 
         capacity_ = 1;
         while (capacity_ < maxSamples)
@@ -124,7 +137,7 @@ public:
      * @brief Pushes a block of samples into the buffer.
      *
      * Copies in at most two contiguous memcpy spans (pre-wrap / post-wrap)
-     * with a single write-position update — several times faster than a
+     * with a single write-position update, several times faster than a
      * per-sample push loop for block-based delays.
      *
      * @param samples Source buffer.
@@ -176,20 +189,31 @@ public:
     /**
      * @brief Reads a sample at a fractional delay using the specified interpolation.
      *
-     * Uses compile-time template selection to eliminate branching in the audio thread.
-     * * @tparam Method Interpolation method to use.
+     * The interpolation method is selected at compile time (no per-sample
+     * dispatch in the audio thread).
+     *
+     * @tparam Method Interpolation method to use.
      * @param delaySamples Fractional delay in samples.
      * @return The interpolated sample.
      *
-     * @note 4-point interpolators require delaySamples >= 1.0 to avoid reading 
+     * @pre delaySamples must be finite and within [0, capacity - 3) (Linear)
+     * or [1, capacity - 3) (4-point methods, which read one sample earlier
+     * and two later). Violations assert in debug builds; in release the
+     * power-of-two index mask keeps every access in bounds, so out-of-range
+     * delays return wrapped (wrong-position) samples but never corrupt
+     * memory.
+     *
+     * @note 4-point interpolators require delaySamples >= 1.0 to avoid reading
      * future/unwritten samples. Modulating below 1.0 will cause audio artifacts.
      */
     template <InterpMethod Method = InterpMethod::Cubic>
     [[nodiscard]] inline T readInterpolated(T delaySamples) const noexcept
     {
+        if (capacity_ == 0) [[unlikely]] return T(0); // not prepared
+
         int intDelay = static_cast<int>(delaySamples);
         T frac = delaySamples - static_cast<T>(intDelay);
-        
+
         assert(delaySamples >= T(0) && intDelay + 2 < capacity_);
 
         if constexpr (Method == InterpMethod::Linear)

@@ -1,17 +1,36 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
-#include "DspMath.h"
-#include "DenormalGuard.h" // Essential for IIR stability
-#include "SimdOps.h"       // SIMD dot product for the FIR convolution
+/**
+ * @file Hilbert.h
+ * @brief FIR Hilbert transformer producing sample-aligned analytic signals.
+ *
+ * Used by FrequencyShifter (single-sideband shift) and Compressor (analytic
+ * envelope detector). The kernel is sample-rate independent and shared per
+ * process (lazily built, thread-safe); each instance owns only its delay
+ * line.
+ *
+ * Threading: owner-managed. prepare/reset are setup-time; process and
+ * processBlock belong to the owning (audio) thread. Not internally
+ * thread-safe. processBlock installs a DenormalGuard; per-sample callers are
+ * expected to guard their own callback (framework convention) - the FIR
+ * itself cannot generate denormals, but denormal INPUTS would make all
+ * kTaps multiplies slow without one.
+ *
+ * Dependencies: DspMath.h, DenormalGuard.h, SimdOps.h.
+ */
 
+#include "DspMath.h"
+#include "DenormalGuard.h"
+#include "SimdOps.h" // SIMD dot product for the FIR convolution
+
+#include <algorithm>
 #include <array>
-#include <cmath>
-#include <utility>
-#include <span>
 #include <cassert>
+#include <cmath>
+#include <span>
 
 namespace dspark {
 
@@ -25,11 +44,13 @@ namespace dspark {
  * delayed by the FIR group delay (kCenter samples) so the two outputs stay
  * sample-aligned and form a true analytic pair.
  *
- * This FIR design is correct by construction. With the default 191-tap kernel the
- * measured analytic-signal magnitude ripple is < 0.1% above ~1 kHz and < 2.5% down
- * to ~500 Hz. Like every Hilbert transformer it cannot produce exact quadrature at
- * DC, so accuracy still degrades approaching the lowest frequencies — inherent, not
- * a defect (lengthen the kernel for more sub-500 Hz accuracy).
+ * This FIR design is correct by construction. With the default 191-tap kernel
+ * at 48 kHz the measured analytic-signal magnitude ripple is < 0.1% above
+ * ~1 kHz and < 2.5% down to ~500 Hz (the kernel is rate-independent, so these
+ * corner frequencies scale with the sample rate). Like every Hilbert
+ * transformer it cannot produce exact quadrature at DC, and the odd-length
+ * antisymmetric (Type III) design also rolls off approaching Nyquist - both
+ * inherent, not defects (lengthen the kernel for more sub-500 Hz accuracy).
  *
  * @note Introduces a latency of getLatencySamples() = kCenter samples on BOTH
  *       outputs. The real branch is the delayed input, so callers that mix the
@@ -38,7 +59,7 @@ namespace dspark {
  * @tparam T Sample type (float or double).
  */
 template <FloatType T>
-class alignas(32) Hilbert
+class Hilbert
 {
 public:
     struct Result
@@ -50,17 +71,15 @@ public:
     /**
      * @brief Prepares the transformer. The FIR kernel is sample-rate independent;
      *        sampleRate is accepted for API symmetry.
-     * @param sampleRate The system sample rate (must be > 0).
+     * @param sampleRate The system sample rate. Must be > 0 (invalid values,
+     *        including NaN, are ignored).
      */
     void prepare(double sampleRate) noexcept
     {
         assert(sampleRate > 0.0);
+        if (!(sampleRate > 0.0)) return;
+
         sampleRate_ = sampleRate;
-
-        // The FIR kernel does not depend on the sample rate, so it is built
-        // once per process (lazily, thread-safe) instead of on every prepare().
-        (void)reversedKernel();
-
         reset();
         isPrepared_ = true;
     }
@@ -69,8 +88,11 @@ public:
      * @brief Processes one sample, returning the analytic signal {real, imag}.
      *
      * Uses a mirrored (double-write) delay line so the convolution window is
-     * one contiguous span, dispatched to the SIMD dot product — an order of
-     * magnitude faster than a wrapped per-tap loop for 191 taps.
+     * one contiguous span, dispatched to the SIMD dot product - an order of
+     * magnitude faster than a wrapped per-tap loop for 191 taps. (Half of the
+     * kernel taps are exact zeros - the ideal Hilbert kernel vanishes on even
+     * indices - but a contiguous dot product still beats a strided read that
+     * would skip them; same trade-off as the framework's half-band FIRs.)
      *
      * @param input Real-valued input sample.
      */
@@ -84,8 +106,9 @@ public:
         const T* window = delay_.data() + writePos_ + 1;
 
         // imag = sum_k h[k] * x[n-k]: with an oldest-first window this is the
-        // dot product against the REVERSED kernel (precomputed once).
-        const T imag = simd::dotProduct(reversedKernel().data(), window, kTaps);
+        // dot product against the REVERSED kernel. The pointer is cached in a
+        // member so the hot path never touches the magic-static init guard.
+        const T imag = simd::dotProduct(kernelData_, window, kTaps);
 
         // real = x[n - kCenter]: index kTaps-1-kCenter == kCenter (odd length).
         const T re = window[kCenter];
@@ -96,6 +119,9 @@ public:
 
     /**
      * @brief Processes a block of samples. Optimized for CPU cache.
+     *
+     * @pre Both output spans must be at least input.size() long. Violations
+     * assert in debug builds; release builds clamp to the shortest span.
      */
     void processBlock(std::span<const T> input,
                       std::span<T> outReal,
@@ -105,7 +131,8 @@ public:
         assert(outReal.size() >= input.size() && outImag.size() >= input.size());
         DenormalGuard dg;
 
-        const size_t numSamples = input.size();
+        const size_t numSamples =
+            std::min(input.size(), std::min(outReal.size(), outImag.size()));
         for (size_t i = 0; i < numSamples; ++i)
         {
             const auto res = process(input[i]);
@@ -125,14 +152,14 @@ public:
     [[nodiscard]] static constexpr int getLatencySamples() noexcept { return kCenter; }
 
 private:
-    // 191-tap FIR: < 0.1% analytic ripple above ~1 kHz (< 2.5% at 500 Hz),
-    // 95-sample group delay. Odd length keeps a true integer center tap.
+    // 191-tap FIR: < 0.1% analytic ripple above ~1 kHz at 48 kHz (< 2.5% at
+    // 500 Hz), 95-sample group delay. Odd length keeps a true integer center tap.
     static constexpr int kTaps   = 191;
     static constexpr int kCenter = kTaps / 2;
 
-    /** @brief Builds the REVERSED windowed Hilbert kernel once (thread-safe
-     *  C++11 static init). Reversed so the oldest-first mirrored window can be
-     *  convolved with a straight SIMD dot product. */
+    /** @brief Builds the REVERSED windowed Hilbert kernel once per process
+     *  (thread-safe C++11 static init). Reversed so the oldest-first mirrored
+     *  window can be convolved with a straight SIMD dot product. */
     [[nodiscard]] static const std::array<T, kTaps>& reversedKernel() noexcept
     {
         static const std::array<T, kTaps> kernel = []
@@ -159,8 +186,14 @@ private:
     bool isPrepared_ = false;
     int writePos_ = 0;
 
-    // Mirrored delay line (double-write) for contiguous SIMD reads.
-    alignas(32) std::array<T, kTaps * 2> delay_{};
+    // Cached at construction so process() skips the magic-static guard check
+    // (the static outlives every instance; copies stay valid).
+    const T* kernelData_ = reversedKernel().data();
+
+    // Mirrored delay line (double-write) for contiguous SIMD reads. No
+    // over-alignment: the window starts at a variable offset every sample, so
+    // the SIMD dot product uses unaligned loads regardless.
+    std::array<T, kTaps * 2> delay_{};
 };
 
 } // namespace dspark

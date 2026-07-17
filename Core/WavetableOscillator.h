@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -7,30 +7,36 @@
  * @file WavetableOscillator.h
  * @brief Bandlimited wavetable oscillator with mipmap anti-aliasing.
  *
- * A professional grade wavetable oscillator utilizing a flattened 
- * contiguous memory layout for optimal CPU cache utilization, 
- * bitwise phase masking, and 3rd-order Hermite interpolation for 
- * pristine sound quality. 
+ * A wavetable oscillator using a flattened contiguous memory layout for
+ * cache-friendly access, bitwise phase masking, and 3rd-order Hermite
+ * interpolation. Fractional mipmapping with a quadratic crossfade prevents
+ * aliasing at all frequencies and keeps frequency sweeps timbre-continuous.
  *
- * It uses fractional mipmapping to prevent aliasing at all frequencies 
- * and ensures smooth crossfading during frequency sweeps.
+ * Table content is sample-rate independent (each mip level stores a fixed
+ * harmonic count); prepare() re-derives the per-level cutoff frequencies, so
+ * the build and load methods may be called before or after prepare().
  *
- * @note Setup methods (build*, load*) allocate memory and perform heavy 
- * mathematical operations (DFT). They MUST NOT be called on the real-time 
- * audio thread.
+ * @note Setup methods (build*, load*) allocate memory and perform heavy
+ * mathematical operations (a direct DFT: loadWavetable costs
+ * O(size * harmonics)). They MUST NOT be called on the real-time audio
+ * thread, nor while the audio thread is generating.
  *
- * Dependencies: DspMath.h, AudioSpec.h, Phasor.h.
+ * Threading: owner-managed. Setters and generation belong to the owning
+ * (audio) thread; build/load/prepare are setup-time.
+ *
+ * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, Phasor.h,
+ * Interpolation.h.
  */
 
 #include "DspMath.h"
 #include "AudioSpec.h"
 #include "AudioBuffer.h"
 #include "Phasor.h"
+#include "Interpolation.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
-#include <numbers>
 #include <vector>
 
 namespace dspark {
@@ -53,13 +59,21 @@ public:
 
     /**
      * @brief Prepares the oscillator for a given sample rate.
-     * @param sampleRate Sample rate in Hz. Must be > 0.
+     *
+     * Re-derives the mip cutoff frequencies for tables that were already
+     * built, so a rate change after build*() keeps the anti-aliasing exact.
+     *
+     * @param sampleRate Sample rate in Hz. Must be > 0 (invalid values,
+     * including NaN, are ignored).
      */
     void prepare(double sampleRate)
     {
         assert(sampleRate > 0.0);
+        if (!(sampleRate > 0.0)) return;
+
         sampleRate_ = sampleRate;
         phasor_.prepare(sampleRate);
+        updateMipCutoffs();
     }
 
     /** 
@@ -124,7 +138,7 @@ public:
             mipData_[static_cast<size_t>(i)] = std::sin(phase);
         }
 
-        mipMaxFreq_.assign(1, static_cast<T>(sampleRate_ / 2.0));
+        updateMipCutoffs();
     }
 
     /**
@@ -139,18 +153,15 @@ public:
     {
         numMipLevels_ = kMaxMipLevels;
         mipData_.assign(static_cast<size_t>(numMipLevels_ * kTableSize), T(0));
-        mipMaxFreq_.resize(static_cast<size_t>(numMipLevels_));
 
-        T nyquist = static_cast<T>(sampleRate_ / 2.0);
         const int maxTableHarmonics = kTableSize / 2; // Absolute Nyquist limit of the table itself
 
         for (int level = 0; level < numMipLevels_; ++level)
         {
-            T maxFreqForLevel = nyquist / static_cast<T>(1 << (numMipLevels_ - 1 - level));
-            mipMaxFreq_[static_cast<size_t>(level)] = maxFreqForLevel;
-
-            int maxHarmonics = static_cast<int>(nyquist / maxFreqForLevel);
-            // CRITICAL FIX: Prevent aliasing during table generation
+            // Fixed harmonic budget per level (2^(levels-1-level)), computed in
+            // exact integer arithmetic. This is what makes the table content
+            // sample-rate independent: prepare() only re-derives the cutoffs.
+            int maxHarmonics = 1 << (numMipLevels_ - 1 - level);
             maxHarmonics = std::clamp(maxHarmonics, 1, maxTableHarmonics);
 
             size_t offset = static_cast<size_t>(level * kTableSize);
@@ -167,6 +178,8 @@ public:
                 }
             }
         }
+
+        updateMipCutoffs();
 
         // Normalise ALL levels with ONE global factor (the peak of the richest
         // level). Per-level peak normalisation made the level/timbre jump
@@ -189,10 +202,15 @@ public:
     {
         if (!data || size <= 0) return;
 
-        // Perform DFT on raw input data to extract true harmonics without interpolation loss
-        int rawNyquistLimit = size / 2;
+        // Perform DFT on raw input data to extract true harmonics without
+        // interpolation loss. The DC term is discarded (an oscillator should
+        // not reproduce offset), and for even sizes the Nyquist bin is
+        // excluded too: the 2/N single-sided scaling below would count it
+        // twice ((size - 1) / 2 stops one bin short of it).
+        int rawHarmonicLimit = (size - 1) / 2;
         int targetNyquistLimit = kTableSize / 2;
-        int maxHarmonics = std::min(rawNyquistLimit, targetNyquistLimit);
+        int maxHarmonics = std::min(rawHarmonicLimit, targetNyquistLimit);
+        if (maxHarmonics < 1) return; // size < 3: no extractable harmonics
 
         std::vector<T> cosCoeffs(static_cast<size_t>(maxHarmonics + 1), T(0));
         std::vector<T> sinCoeffs(static_cast<size_t>(maxHarmonics + 1), T(0));
@@ -212,16 +230,12 @@ public:
 
         numMipLevels_ = kMaxMipLevels;
         mipData_.assign(static_cast<size_t>(numMipLevels_ * kTableSize), T(0));
-        mipMaxFreq_.resize(static_cast<size_t>(numMipLevels_));
-
-        T nyquist = static_cast<T>(sampleRate_ / 2.0);
 
         for (int level = 0; level < numMipLevels_; ++level)
         {
-            T maxFreqForLevel = nyquist / static_cast<T>(1 << (numMipLevels_ - 1 - level));
-            mipMaxFreq_[static_cast<size_t>(level)] = maxFreqForLevel;
-
-            int maxH = static_cast<int>(nyquist / maxFreqForLevel);
+            // Same exact integer harmonic budget as buildFromHarmonics,
+            // additionally capped by what the source material contains.
+            int maxH = 1 << (numMipLevels_ - 1 - level);
             maxH = std::clamp(maxH, 1, maxHarmonics);
 
             size_t offset = static_cast<size_t>(level * kTableSize);
@@ -240,6 +254,8 @@ public:
             }
         }
 
+        updateMipCutoffs();
+
         // Single global normalisation factor across all mip levels (see
         // buildFromHarmonics for the rationale).
         normalizeAllLevelsGlobally();
@@ -254,6 +270,10 @@ public:
      */
     void setFrequency(T frequencyHz) noexcept
     {
+        // NaN is ignored, mirroring the internal Phasor: otherwise the pitch
+        // would keep the old value while the mip selection went to the
+        // dullest level (inconsistent timbre).
+        if (frequencyHz != frequencyHz) return;
         frequency_ = frequencyHz;
         phasor_.setFrequency(frequencyHz);
     }
@@ -266,7 +286,8 @@ public:
 
     /**
      * @brief Generates the next sample using Hermite interpolation.
-     * @return Output sample in [-1.0, 1.0].
+     * @return Output sample, nominally in [-1.0, 1.0] (tables are peak
+     * normalised; interpolation may overshoot slightly between table points).
      */
     [[nodiscard]] inline T getSample() noexcept
     {
@@ -287,7 +308,7 @@ public:
 
     /**
      * @brief Fills every channel of the view with the generated waveform.
-     * Satisfies the GeneratorProcessor concept (mono source → all channels equal).
+     * Satisfies the GeneratorProcessor concept (mono source, all channels equal).
      */
     void generateBlock(AudioBufferView<T> buffer) noexcept
     {
@@ -313,22 +334,10 @@ public:
 private:
 
     /**
-     * @brief 3rd Order Polynomial Hermite Interpolation.
-     * Delivers significantly better SNR compared to linear interpolation.
-     */
-    [[nodiscard]] inline T hermiteInterpolate(T frac, T y0, T y1, T y2, T y3) const noexcept
-    {
-        T c0 = y1;
-        T c1 = T(0.5) * (y2 - y0);
-        T c2 = y0 - T(2.5) * y1 + T(2.0) * y2 - T(0.5) * y3;
-        T c3 = T(1.5) * (y1 - y2) + T(0.5) * (y3 - y0);
-        return ((c3 * frac + c2) * frac + c1) * frac + c0;
-    }
-
-    /**
-     * @brief Reads a sample from a specific mipmap level using Hermite interpolation.
+     * @brief Reads a sample from a specific mipmap level using Hermite
+     * interpolation (the shared Catmull-Rom kernel from Interpolation.h).
      * Employs bitwise masking for zero-branching index wrapping.
-     * 
+     *
      * @param phase Phase in [0, 1).
      * @param level Mipmap level index.
      * @return Interpolated sample.
@@ -348,7 +357,7 @@ private:
         size_t offset = static_cast<size_t>(level * kTableSize);
         const T* table = &mipData_[offset];
 
-        return hermiteInterpolate(frac, table[i0], table[i1], table[i2], table[i3]);
+        return interpolateHermite(table[i0], table[i1], table[i2], table[i3], frac);
     }
 
     /**
@@ -407,10 +416,26 @@ private:
     }
 
     /**
+     * @brief Derives the per-level cutoff frequencies from the current sample
+     * rate. Level content is rate-independent (fixed harmonic budgets), so
+     * this is all prepare() needs to redo after a rate change.
+     */
+    void updateMipCutoffs()
+    {
+        if (numMipLevels_ <= 0) return;
+        mipMaxFreq_.resize(static_cast<size_t>(numMipLevels_));
+
+        const T nyquist = static_cast<T>(sampleRate_ / 2.0);
+        for (int level = 0; level < numMipLevels_; ++level)
+            mipMaxFreq_[static_cast<size_t>(level)] =
+                nyquist / static_cast<T>(1 << (numMipLevels_ - 1 - level));
+    }
+
+    /**
      * @brief Normalises every mip level with one shared factor.
      *
      * The factor is the global peak across all levels (in practice the
-     * richest level — lower levels are subsets of its harmonics and cannot
+     * richest level: lower levels are subsets of its harmonics and cannot
      * exceed it). This preserves the exact relative energy between levels,
      * so mip crossfades are level- and timbre-continuous.
      */

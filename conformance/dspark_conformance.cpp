@@ -653,6 +653,18 @@ void runPdcNullTests()
         char d[64]; std::snprintf(d, sizeof(d), "(residual %.1f dB)", res);
         check(res < -80.0, "pdc", "ZeroLatencyConvolver zero-latency delta null", d);
     }
+    {
+        // The STFT pipeline (SpectralDenoiser at reduction 0 is an identity
+        // spectral pass) must null against dry delayed by getLatency(). This
+        // pins SpectralProcessor's WOLA frame anchoring and reported latency.
+        auto dn = std::make_shared<dspark::SpectralDenoiser<float>>();
+        dn->prepare(dspark::AudioSpec { 48000.0, 512, 2 });
+        dn->setReduction(0.0f);
+        const double res = residualDbVsDelayedDry(
+            [dn](dspark::AudioBufferView<float> b) { dn->processBlock(b); }, dn->getLatency());
+        char d[64]; std::snprintf(d, sizeof(d), "(residual %.1f dB)", res);
+        check(res < -60.0, "pdc", "SpectralProcessor WOLA identity null", d);
+    }
 }
 
 // -----------------------------------------------------------------------------

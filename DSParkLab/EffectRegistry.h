@@ -195,7 +195,8 @@ inline EffectSlot makeLadderFilter()
         switch(i) {
             case 0: p->setCutoff(v); break;
             case 1: p->setResonance(v); break;
-            case 2: p->setDrive(v); break;
+            // Slider is labelled in dB; the setter takes a linear multiplier.
+            case 2: p->setDrive(std::pow(10.0f, v / 20.0f)); break;
             case 3: p->setMode(static_cast<typename dspark::LadderFilter<float>::Mode>(static_cast<int>(v))); break;
         }
     };

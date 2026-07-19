@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -11,20 +11,24 @@
  * real-time contexts, featuring automatic block-level parameter smoothing to prevent zipper noise.
  *
  * Curves:
- * - **Linear:** Constant sum (A * (1-t) + B * t). Fast, but exhibits a -6 dB power dip at the center for uncorrelated signals.
- * - **EqualPower:** Constant energy (A^2 + B^2 = 1). Utilizes hardware-accelerated SQRT approximation. Perfect for uncorrelated audio.
- * - **SCurve:** Smoothstep S-curve. Provides a perceptually smoother transition speed, though it shares the -6 dB center dip of the Linear curve.
+ * - **Linear:** Constant sum (A * (1-t) + B * t). Fast, but exhibits a -3 dB power dip at the centre for uncorrelated signals.
+ * - **EqualPower:** Constant energy (A^2 + B^2 = 1) via the hardware sqrt instruction. Perfect for uncorrelated audio.
+ * - **SCurve:** Smoothstep S-curve. Provides a perceptually smoother transition speed, though it shares the -3 dB centre power dip of the Linear curve.
  *
- * Dependencies: DspMath.h, <cassert>
+ * Dependencies: Core/DspMath.h.
+ *
+ * Threading: setCurve()/setPosition() are safe from any thread (atomics,
+ * consumed by the processing calls on the audio thread); non-finite positions
+ * are ignored. The processing calls and the gain getters belong to the audio
+ * thread (getters read unsynchronized audio-thread state: metering only).
  */
 
 #include "../Core/DspMath.h"
 
-#include <atomic>
-#include <cmath>
-#include <numbers>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <cmath>
 
 namespace dspark {
 
@@ -55,11 +59,14 @@ public:
     /**
      * @brief Sets the crossfade curve type.
      * Thread-safe. Can be called from the GUI thread.
-     * @param curve The desired crossfade curve.
+     * @param curve The desired crossfade curve. Out-of-range values (a wild
+     *              cast) are clamped into the enum range.
      */
-    void setCurve(Curve curve) noexcept 
-    { 
-        curve_.store(curve, std::memory_order_relaxed); 
+    void setCurve(Curve curve) noexcept
+    {
+        curve = static_cast<Curve>(std::clamp(static_cast<int>(curve), 0,
+                                              static_cast<int>(Curve::SCurve)));
+        curve_.store(curve, std::memory_order_relaxed);
     }
 
     /**
@@ -68,10 +75,12 @@ public:
      * Thread-safe. Updates are smoothed automatically over the next processed audio block
      * to eliminate zipper noise and clicks.
      *
-     * @param position Target blend: 0.0 = 100% A, 1.0 = 100% B. Automatically clamped [0, 1].
+     * @param position Target blend: 0.0 = 100% A, 1.0 = 100% B. Automatically
+     *                 clamped [0, 1]; non-finite values are ignored.
      */
     void setPosition(T position) noexcept
     {
+        if (!std::isfinite(position)) return;
         position_.store(std::clamp(position, T(0), T(1)), std::memory_order_relaxed);
     }
 
@@ -169,19 +178,21 @@ public:
         assert(numSamples > 0);
 
         Curve curv = curve_.load(std::memory_order_relaxed);
-        T gA, gB;
+        T gA = gainA_, gB = gainB_;
 
         for (int i = 0; i < numSamples; ++i)
         {
-            T pos = std::clamp(positions[i], T(0), T(1));
+            // min/max with this argument order also resolves a NaN in the
+            // automation buffer to 0 (100% A) instead of poisoning the output.
+            T pos = std::min(T(1), std::max(T(0), positions[i]));
             computeGains(curv, pos, gA, gB);
             output[i] = inputA[i] * gA + inputB[i] * gB;
         }
 
         // Update internal state to match the end of the automation block.
-        // NOTE: We DO NOT write back to the atomic position_ to avoid Data Races 
+        // NOTE: We DO NOT write back to the atomic position_ to avoid Data Races
         // with the GUI thread. We only update the audio-thread local cache.
-        lastPos_ = std::clamp(positions[numSamples - 1], T(0), T(1));
+        lastPos_ = std::min(T(1), std::max(T(0), positions[numSamples - 1]));
         lastCurve_ = curv;
         gainA_ = gA;
         gainB_ = gB;
@@ -221,6 +232,13 @@ private:
                 gB = t;
                 break;
             }
+
+            default:
+                // Unreachable through the clamped setter; keeps the out
+                // parameters defined if the enum ever grows without a case.
+                gA = T(1) - pos;
+                gB = pos;
+                break;
         }
     }
 

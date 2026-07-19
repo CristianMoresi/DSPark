@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -15,6 +15,14 @@
  * - Fully independent channel write indices for safe interleaved or sequential processing.
  * - Zero-allocation, lock-free, cache-friendly architecture.
  *
+ * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/DspMath.h,
+ * Core/Smoothers.h, Core/StateBlob.h.
+ *
+ * Threading: prepare() belongs to the setup thread. The processing calls and
+ * reset() belong to the audio thread. Parameter setters are safe from any
+ * thread (atomics with a publish/apply handoff consumed at the top of the
+ * next processing call); non-finite setter values are ignored.
+ *
  * @tparam SampleType float or double.
  */
 
@@ -28,7 +36,9 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace dspark {
 
@@ -70,10 +80,14 @@ public:
     /**
      * @brief Prepares the delay structures and allocates memory. Must be called before processing.
      * @param spec The audio specification (sample rate, block size, etc.).
+     *             An invalid spec (non-positive or NaN fields) is ignored.
      * @param maxDelaySeconds The maximum theoretical delay time required.
+     *                        Negative or NaN values are ignored; the capacity
+     *                        is capped at 2^29 samples.
      */
     void prepare(const AudioSpec& spec, double maxDelaySeconds)
     {
+        if (!spec.isValid() || !(maxDelaySeconds >= 0.0)) return;
         sampleRate_ = static_cast<SampleType>(spec.sampleRate);
         // Clamp to the fixed per-channel state arrays (states_/writeIndices_ are
         // kMaxChannels): maybeUpdateSmoothers()/updateSmootherTargets() iterate
@@ -81,12 +95,18 @@ public:
         numChannels_ = std::min(static_cast<int>(spec.numChannels), kMaxChannels);
         blockSize_   = spec.maxBlockSize;
 
-        int required = static_cast<int>(std::ceil(maxDelaySeconds * spec.sampleRate));
-        maxDelaySamples_ = nextPow2(required + blockSize_);
+        // Cap in double BEFORE the int cast: a huge request would otherwise be
+        // undefined behaviour in the cast, and nextPow2 past 2^29 overflows
+        // its shift. 2^29 samples is over 3 hours at 48 kHz.
+        const double capacityD =
+            std::min(std::ceil(maxDelaySeconds * spec.sampleRate) + blockSize_,
+                     536870912.0); // 2^29
+        maxDelaySamples_ = nextPow2(static_cast<int>(capacityD));
         bufferMask_ = maxDelaySamples_ - 1;
 
         delayBuffer_.resize(numChannels_, maxDelaySamples_);
         wetBuffer_.resize(numChannels_, blockSize_);
+        lastWetSamples_ = blockSize_; // full capacity until the first push
 
         float timeMs = smoothingTimeMs_.load(std::memory_order_relaxed);
         for (int ch = 0; ch < std::min(numChannels_, kMaxChannels); ++ch)
@@ -132,34 +152,39 @@ public:
      * @brief Sets the smoothing algorithm used for delay time changes.
      * @param type The desired SmootherType.
      */
-    void setSmoother(SmootherType type) noexcept 
-    { 
-        smootherType_.store(type, std::memory_order_relaxed); 
-        smootherDirty_.store(true, std::memory_order_relaxed); 
+    void setSmoother(SmootherType type) noexcept
+    {
+        smootherType_.store(type, std::memory_order_relaxed);
+        smootherDirty_.store(true, std::memory_order_release);
     }
 
     /**
      * @brief Sets the smoothing transition time.
-     * @param ms Time in milliseconds.
+     * @param ms Time in milliseconds. Non-finite values are ignored.
      */
     void setSmoothingTime(float ms) noexcept
     {
+        if (!std::isfinite(ms)) return;
         smoothingTimeMs_.store(std::max(0.0f, ms), std::memory_order_relaxed);
-        smootherDirty_.store(true, std::memory_order_relaxed);
+        smootherDirty_.store(true, std::memory_order_release);
     }
 
     // -- Parameters ----------------------------------------------------------
 
     /**
      * @brief Sets the delay time in samples.
-     * @param samples Target delay time (can be fractional).
+     * @param samples Target delay time (can be fractional). Non-finite values
+     *                are ignored (a NaN here would poison the read position
+     *                and, through the feedback path, the whole buffer).
      */
     void setDelaySamples(SampleType samples) noexcept
     {
-        samples = std::clamp(samples, SampleType(0), static_cast<SampleType>(maxDelaySamples_ - 1));
+        if (!std::isfinite(samples)) return;
+        samples = std::clamp(samples, SampleType(0),
+                             static_cast<SampleType>(std::max(0, maxDelaySamples_ - 1)));
         globalDelay_.store(samples, std::memory_order_relaxed);
         // Publish/apply pattern: the smoothers are NOT touched here (they are
-        // non-atomic audio-thread state — mutating them from a control thread
+        // non-atomic audio-thread state - mutating them from a control thread
         // raced against advanceSmoother). The audio thread applies the new
         // target in maybeUpdateSmoothers() at the top of its next process call.
         delayTargetDirty_.store(true, std::memory_order_release);
@@ -176,23 +201,30 @@ public:
 
     /**
      * @brief Sets the global feedback amount.
-     * @param gain Feedback gain multiplier [-1.0, 1.0]. Will be saturated internally if exceeded.
+     * @param gain Feedback gain multiplier [-1.0, 1.0]. Will be saturated
+     *             internally if exceeded. Non-finite values are ignored (a NaN
+     *             would recirculate through the delay buffer forever).
      */
     void setFeedback(SampleType gain) noexcept
     {
+        if (!std::isfinite(gain)) return;
         feedbackGain_.store(gain, std::memory_order_relaxed);
     }
 
-    /** @brief Sets the cutoff frequency for the feedback low-pass filter (0 to disable). */
+    /** @brief Sets the cutoff frequency for the feedback low-pass filter
+     *  (0 to disable). Non-finite values are ignored. */
     void setFeedbackLpHz(SampleType freq) noexcept
     {
+        if (!std::isfinite(freq)) return;
         fbLpCoef_.store((freq > 0) ? calcLpCoef(freq) : SampleType(0), std::memory_order_relaxed);
         fbLpHzShadow_.store(freq, std::memory_order_relaxed);   // serialization readback
     }
 
-    /** @brief Sets the cutoff frequency for the feedback high-pass filter (0 to disable). */
+    /** @brief Sets the cutoff frequency for the feedback high-pass filter
+     *  (0 to disable). Non-finite values are ignored. */
     void setFeedbackHpHz(SampleType freq) noexcept
     {
+        if (!std::isfinite(freq)) return;
         fbHpCoef_.store((freq > 0) ? calcHpCoef(freq) : SampleType(0), std::memory_order_relaxed);
         fbHpHzShadow_.store(freq, std::memory_order_relaxed);   // serialization readback
     }
@@ -217,9 +249,9 @@ public:
             
         SampleType out = processSampleInternal(ch, input, delay, s, 
                                                feedbackGain_.load(std::memory_order_relaxed), 
-                                               fbLpCoef_.load(std::memory_order_relaxed), 
+                                               fbLpCoef_.load(std::memory_order_relaxed),
                                                fbHpCoef_.load(std::memory_order_relaxed));
-        advanceWriteIndex(ch);
+        advanceWriteIndexUnchecked(ch);
         return out;
     }
 
@@ -227,6 +259,11 @@ public:
 
     /**
      * @brief Processes a multi-channel block in-place.
+     *
+     * @note The per-call parameters are published to the same state the
+     *       individual setters write, so every call overwrites previously set
+     *       values (including the defaults of the omitted arguments).
+     *
      * @param buffer The audio buffer to process.
      * @param delayMs Delay time in milliseconds.
      * @param feedback Feedback gain multiplier.
@@ -263,7 +300,7 @@ public:
             {
                 SampleType currentDelay = (smoothType == SmootherType::None) ? targetDelay : advanceSmoother(s, smoothType);
                 data[i] = processSampleInternal(ch, data[i], currentDelay, s, fb, lpC, hpC);
-                advanceWriteIndex(ch);
+                advanceWriteIndexUnchecked(ch);
             }
         }
     }
@@ -297,7 +334,7 @@ public:
         {
             SampleType currentDelay = (smoothType == SmootherType::None) ? targetDelay : advanceSmoother(s, smoothType);
             data[i] = processSampleInternal(ch, data[i], currentDelay, s, fb, lpC, hpC);
-            advanceWriteIndex(ch);
+            advanceWriteIndexUnchecked(ch);
         }
     }
 
@@ -315,65 +352,84 @@ public:
         pushDryToWetImpl([&](int ch) { return dry.getChannel(ch); }, dry.getNumChannels(), dry.getNumSamples());
     }
 
-    /** @brief Processes the wet buffer in place with current settings. */
+    /** @brief Processes the wet buffer in place with current settings.
+     *  Processes exactly the samples of the most recent pushDryToWet() call:
+     *  running the full capacity regardless of the pushed length would advance
+     *  the delay line past the real stream on short blocks, skewing every
+     *  subsequent echo's timing. */
     void processWet(SampleType delayMs, SampleType feedback = 0, SampleType lpHz = 0, SampleType hpHz = 0) noexcept
     {
-        processBlock(wetBuffer_.toView(), delayMs, feedback, lpHz, hpHz);
+        processBlock(wetBuffer_.toView().getSubView(0, lastWetSamples_), delayMs, feedback, lpHz, hpHz);
     }
 
     /**
-     * @brief Processes a true ping-pong delay (L feeds R, R feeds L).
+     * @brief Processes a true ping-pong delay (L feeds R, R feeds L) on the
+     *        samples of the most recent pushDryToWet() call.
+     *
+     * The cross-feed obeys the active FeedbackMode exactly like the straight
+     * feedback path: tanh soft saturation in Analog mode, a +-2.0 safety
+     * clamp in Clean mode (without it, |feedback| >= 1 grew without bound).
      */
     void processPingPong(SampleType delayMs, SampleType feedback = 0, SampleType lpHz = 0, SampleType hpHz = 0) noexcept
     {
         if (wetBuffer_.getNumChannels() < 2 || !prepared_.load(std::memory_order_acquire)) return;
-        
+
         setDelayMs(delayMs);
+        setFeedback(feedback);
         setFeedbackLpHz(lpHz);
         setFeedbackHpHz(hpHz);
         maybeUpdateSmoothers();
 
         SampleType* L = wetBuffer_.getChannel(0);
         SampleType* R = wetBuffer_.getChannel(1);
-        const int nS = wetBuffer_.getNumSamples();
+        const int nS = std::min(lastWetSamples_, wetBuffer_.getNumSamples());
 
         const auto smoothType = smootherType_.load(std::memory_order_relaxed);
         const SampleType targetDelay = globalDelay_.load(std::memory_order_relaxed);
+        const SampleType fb  = feedbackGain_.load(std::memory_order_relaxed);
         const SampleType lpC = fbLpCoef_.load(std::memory_order_relaxed);
         const SampleType hpC = fbHpCoef_.load(std::memory_order_relaxed);
+        const bool analogFb  = feedbackMode_.load(std::memory_order_relaxed) == FeedbackMode::Analog;
 
         for (int i = 0; i < nS; ++i)
         {
             auto& sL = states_[0];
             auto& sR = states_[1];
-            
+
             SampleType currentDelay = (smoothType == SmootherType::None) ? targetDelay : advanceSmoother(sL, smoothType);
             advanceSmoother(sR, smoothType); // Keep smoothers in sync
 
-            SampleType inL = L[i] + sR.pingPongFb;
-            SampleType inR = R[i] + sL.pingPongFb;
+            // s.pingPongFb holds what THIS channel receives next sample, i.e.
+            // the OTHER channel's previous output. (The original wiring
+            // consumed each channel's own stored value while storing f(other)
+            // into it: every echo regenerated into its own channel and the
+            // signal never crossed the stereo field at all.)
+            SampleType inL = L[i] + sL.pingPongFb;
+            SampleType inR = R[i] + sR.pingPongFb;
 
             SampleType outL = processSampleInternal(0, inL, currentDelay, sL, SampleType(0), lpC, hpC);
             SampleType outR = processSampleInternal(1, inR, currentDelay, sR, SampleType(0), lpC, hpC);
 
-            sL.pingPongFb = processFbFilters(0, outR * feedback, lpC, hpC);
-            sR.pingPongFb = processFbFilters(1, outL * feedback, lpC, hpC);
+            sR.pingPongFb = saturateFeedback(processFbFilters(1, outL * fb, lpC, hpC), analogFb); // L crosses to R
+            sL.pingPongFb = saturateFeedback(processFbFilters(0, outR * fb, lpC, hpC), analogFb); // R crosses to L
 
             L[i] = outL;
             R[i] = outR;
-            advanceWriteIndex(0);
-            advanceWriteIndex(1);
+            advanceWriteIndexUnchecked(0);
+            advanceWriteIndexUnchecked(1);
         }
     }
 
     /**
      * @brief Mixes the processed wet buffer back into the provided dry buffer.
      * @param dry Buffer containing the dry signal.
-     * @param mix Mix ratio (0.0 = 100% dry, 1.0 = 100% wet).
+     * @param mix Mix ratio (0.0 = 100% dry, 1.0 = 100% wet). A non-finite
+     *            value resolves to 0 (dry).
      */
     void mixWetToDry(AudioBufferView<SampleType> dry, SampleType mix) noexcept
     {
-        mix = std::clamp(mix, SampleType(0), SampleType(1));
+        // min/max with this argument order also resolves NaN to the dry bound.
+        mix = std::min(SampleType(1), std::max(SampleType(0), mix));
         auto st = smootherType_.load(std::memory_order_relaxed);
         if (st != SmootherType::None)
             mixSmoother_.setTargetValue(static_cast<float>(mix));
@@ -381,16 +437,24 @@ public:
         const int nS = std::min(dry.getNumSamples(), wetBuffer_.getNumSamples());
         const int nCh = std::min(dry.getNumChannels(), wetBuffer_.getNumChannels());
 
+        // Sample-outer loop: ONE smoother value per sample, shared by every
+        // channel. Advancing the smoother inside a channel-outer loop ran the
+        // ramp numChannels times too fast and, worse, gave each channel a
+        // different segment of it (channel 1 got the ramp a whole block ahead
+        // of channel 0), audibly tilting the stereo image on every mix change.
+        std::array<SampleType*, kMaxChannels> d {};
+        std::array<const SampleType*, kMaxChannels> w {};
         for (int ch = 0; ch < nCh; ++ch)
         {
-            SampleType* d = dry.getChannel(ch);
-            const SampleType* w = wetBuffer_.getChannel(ch);
-            for (int i = 0; i < nS; ++i)
-            {
-                SampleType m = (st != SmootherType::None) 
-                    ? static_cast<SampleType>(mixSmoother_.getNextValue()) : mix;
-                d[i] = d[i] * (SampleType(1) - m) + w[i] * m;
-            }
+            d[ch] = dry.getChannel(ch);
+            w[ch] = wetBuffer_.getChannel(ch);
+        }
+        for (int i = 0; i < nS; ++i)
+        {
+            const SampleType m = (st != SmootherType::None)
+                ? static_cast<SampleType>(mixSmoother_.getNextValue()) : mix;
+            for (int ch = 0; ch < nCh; ++ch)
+                d[ch][i] = d[ch][i] * (SampleType(1) - m) + w[ch][i] * m;
         }
     }
 
@@ -398,7 +462,7 @@ public:
     AudioBufferView<SampleType> getWetView() noexcept { return wetBuffer_.toView(); }
     
     /** @brief Returns maximum capacity in samples. */
-    int getMaxDelaySamples() const noexcept { return maxDelaySamples_; }
+    [[nodiscard]] int getMaxDelaySamples() const noexcept { return maxDelaySamples_; }
 
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
@@ -424,9 +488,13 @@ public:
         setFeedback(static_cast<SampleType>(r.read("feedback", 0.0f)));
         setFeedbackLpHz(static_cast<SampleType>(r.read("fbLpHz", 0.0f)));
         setFeedbackHpHz(static_cast<SampleType>(r.read("fbHpHz", 0.0f)));
-        setSmoother(static_cast<SmootherType>(r.read("smoother", 0)));
+        // Enum fields clamped so a corrupt/foreign blob cannot install ids
+        // outside the ranges the switches expect.
+        setSmoother(static_cast<SmootherType>(std::clamp(r.read("smoother", 0), 0,
+                    static_cast<int>(SmootherType::CriticallyDamped))));
         setSmoothingTime(r.read("smoothingMs", 20.0f));
-        setFeedbackMode(static_cast<FeedbackMode>(r.read("fbMode", 1)));
+        setFeedbackMode(static_cast<FeedbackMode>(std::clamp(r.read("fbMode", 1), 0,
+                        static_cast<int>(FeedbackMode::Analog))));
         return true;
     }
 
@@ -452,13 +520,28 @@ protected:
     };
 
 public:
-    /** 
-     * @brief Advances the write index for a specific channel. 
-     * @param ch Channel index to advance.
+    /**
+     * @brief Advances the write index for a specific channel.
+     * @param ch Channel index to advance. Out-of-range indices are ignored
+     *           (an unchecked index would write past the index array).
      */
-    void advanceWriteIndex(int ch) noexcept { writeIndices_[ch] = (writeIndices_[ch] + 1) & bufferMask_; }
+    void advanceWriteIndex(int ch) noexcept
+    {
+        if (ch < 0 || ch >= kMaxChannels) return;
+        advanceWriteIndexUnchecked(ch);
+    }
 
 private:
+    /** Internal hot-path variant: every internal caller has already bounded ch. */
+    void advanceWriteIndexUnchecked(int ch) noexcept { writeIndices_[ch] = (writeIndices_[ch] + 1) & bufferMask_; }
+
+    /** The FeedbackMode nonlinearity, shared by the straight and ping-pong
+     *  feedback paths: tanh warmth in Analog, a hard +-2.0 safety bound in
+     *  Clean (exact regeneration below it). */
+    [[nodiscard]] SampleType saturateFeedback(SampleType x, bool analog) const noexcept
+    {
+        return analog ? std::tanh(x) : std::clamp(x, SampleType(-2), SampleType(2));
+    }
 
     template <typename ChannelFn>
     void pushDryToWetImpl(ChannelFn&& getCh, int dryCh, int drySamples) noexcept
@@ -467,6 +550,7 @@ private:
         const int nS  = std::min(drySamples, wetBuffer_.getNumSamples());
         for (int ch = 0; ch < nCh; ++ch)
             std::memcpy(wetBuffer_.getChannel(ch), getCh(ch), static_cast<std::size_t>(nS) * sizeof(SampleType));
+        lastWetSamples_ = nS; // processWet()/processPingPong() run exactly this many
     }
 
     void resetChannelState(ChannelState& s) noexcept
@@ -497,8 +581,10 @@ private:
         if (delayTargetDirty_.exchange(false, std::memory_order_acquire))
             updateSmootherTargets(globalDelay_.load(std::memory_order_relaxed));
 
-        if (!smootherDirty_.load(std::memory_order_relaxed)) return;
-        smootherDirty_.store(false, std::memory_order_relaxed);
+        // exchange (not load+store: a publication between the two would be
+        // lost) with acquire, pairing with the setters' release stores so the
+        // freshly written type/time values are visible here.
+        if (!smootherDirty_.exchange(false, std::memory_order_acquire)) return;
         float timeMs = smoothingTimeMs_.load(std::memory_order_relaxed);
         for (int ch = 0; ch < numChannels_; ++ch)
         {
@@ -568,7 +654,7 @@ private:
         // inside the already-written history we need delaySamples >= 3.
         // Below that, samples idx1 / idx2 leak data ~bufferSize samples old
         // which manifests as audible clicks (notably when a binaural / Haas
-        // panner crosses the centre). 3 samples ≈ 62 µs at 48 kHz —
+        // panner crosses the centre). 3 samples ~ 62 us at 48 kHz -
         // imperceptible and the same on both channels, so spatial cues
         // (centre image, ITD ratios) are preserved.
         constexpr SampleType kMinHermiteDelay = SampleType(3);
@@ -607,16 +693,8 @@ private:
         if (fbInput != SampleType(0))
         {
             fbInput = processFbFilters(ch, fbInput, lpC, hpC);
-            if (feedbackMode_.load(std::memory_order_relaxed) == FeedbackMode::Analog)
-            {
-                // Analog-style soft saturation to prevent clipping explosions
-                fbInput = std::tanh(fbInput);
-            }
-            else
-            {
-                // Clean mode: exact regeneration; hard safety bound only.
-                fbInput = std::clamp(fbInput, SampleType(-2), SampleType(2));
-            }
+            fbInput = saturateFeedback(fbInput,
+                feedbackMode_.load(std::memory_order_relaxed) == FeedbackMode::Analog);
         }
         s.lastFeedback = fbInput;
 
@@ -667,6 +745,7 @@ private:
 
     int maxDelaySamples_ = 0, bufferMask_ = 0;
     int numChannels_ = 0, blockSize_ = 0;
+    int lastWetSamples_ = 0;   ///< Length of the most recent pushDryToWet().
     SampleType sampleRate_ = SampleType(48000);
     
     std::atomic<SampleType> globalDelay_ { SampleType(0) };

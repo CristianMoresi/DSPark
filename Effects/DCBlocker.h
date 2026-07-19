@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -8,10 +8,16 @@
  * @brief Removes DC offset from audio signals with configurable filter order.
  *
  * Order 1 uses a lightweight 1-pole high-pass filter (2 multiplies, 2 additions
- * per sample). Orders 2–10 use cascaded Butterworth biquad high-pass stages
+ * per sample). Orders 2-10 use cascaded Butterworth biquad high-pass stages
  * with predefined Q values for maximally-flat passband response.
  *
- * Dependencies: DspMath.h, Biquad.h, AudioSpec.h, AudioBuffer.h.
+ * Dependencies: Core/DspMath.h, Core/Biquad.h, Core/AudioSpec.h,
+ * Core/AudioBuffer.h, Core/StateBlob.h.
+ *
+ * Threading: prepare() belongs to the setup thread; the processing calls and
+ * reset() to the audio thread. setOrder()/setCutoff() are safe from any
+ * thread (atomics, applied lazily at the top of the next processBlock);
+ * non-finite cutoffs are ignored.
  */
 
 #include "../Core/DspMath.h"
@@ -24,25 +30,27 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <numbers>
+#include <vector>
 
 namespace dspark {
 
 /**
  * @class DCBlocker
- * @brief DC blocking filter with configurable Butterworth order (1–10).
+ * @brief DC blocking filter with configurable Butterworth order (1-10).
  *
- * Designed for strict real-time processing. Zero allocations, cache-friendly
- * memory layout (32-byte aligned), and branchless per-sample inner loops.
- * 
- * @warning Do not modulate the cutoff frequency at audio rates, as updating 
+ * Designed for strict real-time processing: zero allocations and tight scalar
+ * inner loops (the recursive filter state rules out SIMD vectorization).
+ *
+ * @warning Do not modulate the cutoff frequency at audio rates, as updating
  * biquad coefficients triggers trigonometric functions.
  *
- * @tparam T Sample type (float or double). internal state precision should ideally 
+ * @tparam T Sample type (float or double). internal state precision should ideally
  * be double if processing very low cutoffs at extremely high sample rates.
  */
 template <FloatType T>
-class alignas(32) DCBlocker
+class DCBlocker
 {
 public:
     ~DCBlocker() = default; // Non-virtual to avoid vtable injection
@@ -53,12 +61,13 @@ public:
     /**
      * @brief Prepares the DC blocker, resetting internal states and precalculating coefficients.
      *
-     * @param sampleRate Sample rate in Hz.
+     * @param sampleRate Sample rate in Hz. Non-positive or NaN rates are ignored.
      * @param numChannels Number of audio channels (max 16, default: 2).
      * @param cutoffHz    Cutoff frequency in Hz (clamped to min 1 Hz, default: 5.0).
      */
     void prepare(double sampleRate, int numChannels = 2, double cutoffHz = 5.0)
     {
+        if (!(sampleRate > 0.0)) return;
         sampleRate_ = sampleRate;
         numChannels_ = std::clamp(numChannels, 1, kMaxChannels);
         
@@ -76,10 +85,10 @@ public:
     }
 
     /**
-     * @brief Sets the filter order (1–10). Thread-safe.
+     * @brief Sets the filter order (1-10). Thread-safe.
      *
      * - Order 1: efficient 1-pole filter (6 dB/oct).
-     * - Order 2–10: cascaded Butterworth biquad HPFs (12*N dB/oct for even orders).
+     * - Order 2-10: cascaded Butterworth biquad HPFs (12*N dB/oct for even orders).
      * 
      * @warning Changing order during playback may result in audio clicks, as filter
      * states are not dynamically crossfaded. Best used during prepare() or silence.
@@ -88,7 +97,7 @@ public:
      *       Butterworth biquads, so ODD orders behave like the next lower even
      *       order (e.g. 3 == 2, 5 == 4). Prefer 1 or even values for predictable slopes.
      *
-     * @param order Filter order (1–10).
+     * @param order Filter order (1-10).
      */
     void setOrder(int order) noexcept
     {
@@ -103,15 +112,18 @@ public:
 
     /**
      * @brief Requests a cutoff frequency update.
-     * 
-     * Coefficients are recomputed lazily on the next processBlock() call to 
-     * ensure thread safety, but beware that calculating high-order biquads involves 
+     *
+     * Coefficients are recomputed lazily on the next processBlock() call to
+     * ensure thread safety, but beware that calculating high-order biquads involves
      * trigonometric operations.
-     * 
-     * @param hz Cutoff frequency in Hz (clamped to min 1.0).
+     *
+     * @param hz Cutoff frequency in Hz (clamped to min 1.0). Non-finite values
+     *           are ignored (std::max(NaN, 1) returns the NaN, which would
+     *           poison every coefficient on the next rebuild).
      */
     void setCutoff(T hz) noexcept
     {
+        if (!std::isfinite(hz)) return;
         cutoffHz_.store(std::max(hz, T(1)), std::memory_order_relaxed);
     }
 
@@ -119,7 +131,7 @@ public:
      * @brief Processes an AudioBufferView in-place.
      *
      * Checks for parameter updates and applies the appropriate filter topology
-     * across all channels using branchless inner loops for auto-vectorization.
+     * across all channels using tight scalar inner loops.
      *
      * @param buffer Audio buffer to process.
      */
@@ -136,7 +148,7 @@ public:
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* data = buffer.getChannel(ch);
-                // SIMD-friendly loop (no branches)
+                // Tight scalar loop (the recursion rules out SIMD)
                 for (int i = 0; i < nS; ++i)
                 {
                     T input = data[i];
@@ -167,15 +179,18 @@ public:
     /**
      * @brief Processes a block of samples for one channel in-place.
      *
-     * @param channel Channel index.
+     * @param channel Channel index. Out-of-range indices leave the data
+     *                untouched (the per-channel state is bounded to
+     *                kMaxChannels).
      * @param data Audio samples (modified in-place).
      * @param numSamples Number of samples to process.
      */
     void processBlock(int channel, T* data, int numSamples) noexcept
     {
+        if (channel < 0 || channel >= kMaxChannels) return;
         updateCoefficientsIfNeeded();
         const int currentOrder = order_.load(std::memory_order_relaxed);
-        
+
         if (currentOrder <= 1)
         {
             auto ch = static_cast<size_t>(channel);
@@ -207,12 +222,14 @@ public:
      * @note Only use this if external parameter polling is handled manually. 
      * For processing multiple samples, prefer processBlock() to avoid overhead.
      *
-     * @param channel Channel index.
+     * @param channel Channel index. Out-of-range indices return the input
+     *                unprocessed.
      * @param input Input sample.
      * @return Sample with DC offset removed.
      */
     [[nodiscard]] T processSample(int channel, T input) noexcept
     {
+        if (channel < 0 || channel >= kMaxChannels) return input;
         if (order_.load(std::memory_order_relaxed) <= 1)
         {
             auto ch = static_cast<size_t>(channel);
@@ -264,8 +281,14 @@ public:
 protected:
     void updateCoefficientsIfNeeded() noexcept
     {
-        T cutoff = cutoffHz_.load(std::memory_order_relaxed);
-        if (cutoff != lastCutoff_)
+        // The ORDER is part of the design, not just a stage count: each order
+        // has its own Q table row, and a larger order enables stages that may
+        // never have received coefficients. Rebuilding only on cutoff changes
+        // left a live setOrder() running a broken hybrid (old-Q first stage +
+        // identity stages) until the cutoff happened to move.
+        const T cutoff  = cutoffHz_.load(std::memory_order_relaxed);
+        const int order = order_.load(std::memory_order_relaxed);
+        if (cutoff != lastCutoff_ || order != lastOrder_)
         {
             forceUpdateCoefficients(cutoff);
         }
@@ -298,6 +321,7 @@ protected:
         }
 
         lastCutoff_ = cutoff;
+        lastOrder_  = order_.load(std::memory_order_relaxed);
     }
 
     double sampleRate_ = 48000.0;
@@ -306,9 +330,10 @@ protected:
     
     std::atomic<int> order_ { 1 };
     std::atomic<T> cutoffHz_ { T(5) };
-    T lastCutoff_ = T(-1); 
+    T lastCutoff_ = T(-1);
+    int lastOrder_ = -1;
 
-    // Cache-friendly fixed size states (aligned to 32 bytes via class alignment)
+    // Fixed-size per-channel state (scalar loops: no SIMD alignment needed).
     std::array<T, kMaxChannels> xPrev_{};
     std::array<T, kMaxChannels> yPrev_{};
 

@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -9,9 +9,11 @@
  *
  * Applies gain to audio with exponential click-free ramping. Ensures zero artifacts
  * during parameter changes. Thread-safe design ensures control methods can be called
- * from the UI thread while processing runs lock-free in the audio thread.
+ * from the UI thread while processing runs lock-free in the audio thread;
+ * non-finite setter values are ignored.
  *
- * Dependencies: DspMath.h, SmoothedValue.h.
+ * Dependencies: Core/DspMath.h, Core/SmoothedValue.h, Core/AudioSpec.h,
+ * Core/AudioBuffer.h, Core/SimdOps.h, Core/StateBlob.h.
  */
 
 #include "../Core/DspMath.h"
@@ -24,6 +26,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <vector>
 
 namespace dspark {
 
@@ -52,15 +56,17 @@ public:
 
     /**
      * @brief Prepares the gain processor for playback.
-     * @param sampleRate Sample rate in Hz.
+     * @param sampleRate Sample rate in Hz. Non-positive or NaN rates are ignored.
      * @param rampTimeMs Smoothing time in milliseconds (default: 10 ms).
+     *                   Non-finite values are ignored; negatives clamp to 0.
      */
     void prepare(double sampleRate, double rampTimeMs = 10.0)
     {
+        if (!(sampleRate > 0.0) || !std::isfinite(rampTimeMs)) return;
         sampleRate_ = sampleRate;
-        rampTimeMs_.store(rampTimeMs, std::memory_order_relaxed);
-        
-        gainSmooth_.prepare(sampleRate, rampTimeMs);
+        rampTimeMs_.store(std::max(0.0, rampTimeMs), std::memory_order_relaxed);
+
+        gainSmooth_.prepare(sampleRate, rampTimeMs_.load(std::memory_order_relaxed));
         forceSynchronize();
     }
 
@@ -74,19 +80,23 @@ public:
 
     /**
      * @brief Sets the target gain in decibels. (Thread-safe, callable from UI).
-     * @param dB Gain in dB (0 = unity).
+     * @param dB Gain in dB (0 = unity). Non-finite values are ignored.
      */
     void setGainDb(T dB) noexcept
     {
+        if (!std::isfinite(dB)) return;
         targetGainLinear_.store(decibelsToGain(dB), std::memory_order_relaxed);
     }
 
     /**
      * @brief Sets the target gain as a linear multiplier. (Thread-safe, callable from UI).
-     * @param linear Gain multiplier (>= 0).
+     * @param linear Gain multiplier (>= 0). Non-finite values are ignored
+     *               (without the guard, max(0, NaN) resolved to 0, i.e. a
+     *               silent accidental mute).
      */
     void setGainLinear(T linear) noexcept
     {
+        if (!std::isfinite(linear)) return;
         targetGainLinear_.store(std::max(T(0), linear), std::memory_order_relaxed);
     }
 
@@ -102,7 +112,9 @@ public:
         return targetGainLinear_.load(std::memory_order_relaxed);
     }
 
-    /** @brief Returns the current internal smoothed value. */
+    /** @brief Returns the current internal smoothed value.
+     *  @note Exact on the audio thread; from other threads (metering) the
+     *        read is unsynchronized and merely approximate. */
     [[nodiscard]] T getCurrentGain() const noexcept
     {
         return gainSmooth_.getCurrentValue();
@@ -131,15 +143,19 @@ public:
 
     /**
      * @brief Sets the smoothing ramp time. (Thread-safe).
+     *        Non-finite values are ignored; negatives clamp to 0.
      */
     void setRampTime(double rampTimeMs) noexcept
     {
-        rampTimeMs_.store(rampTimeMs, std::memory_order_relaxed);
-        rampTimeChanged_.store(true, std::memory_order_relaxed);
+        if (!std::isfinite(rampTimeMs)) return;
+        rampTimeMs_.store(std::max(0.0, rampTimeMs), std::memory_order_relaxed);
+        rampTimeChanged_.store(true, std::memory_order_release);
     }
 
     /**
      * @brief Processes an AudioBufferView in-place. (Audio Thread only).
+     * @note Channels beyond the 16th pass through unprocessed (the pointer
+     *       scratch is fixed-size).
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
@@ -231,7 +247,7 @@ public:
         }
     }
 
-    /** @brief Skips smoothing — immediately sets current gain to target. */
+    /** @brief Skips smoothing - immediately sets current gain to target. */
     void skipRamp() noexcept
     {
         forceSynchronize();
@@ -274,11 +290,10 @@ protected:
      */
     inline void updateInternalState() noexcept
     {
-        if (rampTimeChanged_.load(std::memory_order_relaxed))
-        {
+        // exchange (not load+store: a publication landing between the two
+        // would be lost) with acquire, pairing with setRampTime's release.
+        if (rampTimeChanged_.exchange(false, std::memory_order_acquire))
             gainSmooth_.setRampTime(sampleRate_, rampTimeMs_.load(std::memory_order_relaxed));
-            rampTimeChanged_.store(false, std::memory_order_relaxed);
-        }
 
         const T baseTarget = muted_.load(std::memory_order_relaxed) ? T(0) 
                              : targetGainLinear_.load(std::memory_order_relaxed);

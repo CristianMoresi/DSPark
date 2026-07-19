@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -12,10 +12,21 @@
  * Parameters are smoothed per-sample to prevent zipper noise.
  *
  * @warning Biquad filters are not suited for audio-rate cutoff modulation.
- * Nonlinearity and analog drift use block-rate coefficient updates (chunking)
- * to maintain CPU stability and prevent severe phase distortion.
+ * Nonlinearity and analog drift update the coefficients at chunk rate
+ * (every 16 samples) to maintain CPU stability and prevent severe phase
+ * distortion.
  *
- * Dependencies: Biquad.h, AudioBuffer.h, AudioSpec.h, Smoothers.h, AnalogRandom.h.
+ * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/Biquad.h,
+ * Core/DspMath.h, Core/Smoothers.h, Core/AnalogRandom.h, Core/DenormalGuard.h,
+ * Core/StateBlob.h.
+ *
+ * Threading: prepare(), enableAnalogDrift() and setState() belong to the setup
+ * thread; processBlock()/processSample()/reset() to the audio thread. The
+ * remaining parameter setters are safe from any thread (relaxed atomics read
+ * once per block); non-finite setter values are ignored. The shape helpers
+ * (setLowPass()/setShape()/...) write several atomics non-atomically as a
+ * group: the audio thread may see the new topology with the previous targets
+ * for one block (smoothed, click-free).
  *
  * @code
  *   dspark::FilterEngine<float> filter;
@@ -41,6 +52,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <vector>
 
 namespace dspark {
 
@@ -75,13 +88,22 @@ public:
     /**
      * @brief Initializes the filter engine with the current audio specification.
      * @param spec The audio specification containing sample rate and block size.
+     *             An invalid spec (non-positive or NaN fields) is ignored.
      */
     void prepare(const AudioSpec& spec)
     {
+        if (!spec.isValid()) return;
         spec_ = spec;
         freqSmoother_.reset(spec.sampleRate, 30.0f, 0.707f, 1000.0f);
         resSmoother_.reset(spec.sampleRate, 20.0f, 0.707f);
         gainSmoother_.reset(spec.sampleRate, 20.0f, 0.0f);
+        // Coefficients depend on the sample rate: force a rebuild on the next
+        // block. (Without this, re-preparing at a new rate with unchanged
+        // parameters kept the OLD rate's coefficients: the cutoff landed at
+        // freq * newRate / oldRate.)
+        lastFreq_ = -1.0f;
+        if (driftEnabled_.load(std::memory_order_relaxed))
+            driftGen_.prepare(spec.sampleRate); // re-sync the drift LFO clock
         reset();
     }
 
@@ -236,7 +258,7 @@ public:
     /** @brief Returns the active filter shape. */
     [[nodiscard]] Shape getShape() const noexcept { return shape_.load(std::memory_order_relaxed); }
 
-    /** @brief Returns the active slope in dB/oct (LP/HP only — others = 12). */
+    /** @brief Returns the active slope in dB/oct (LP/HP only - others = 12). */
     [[nodiscard]] int getSlopeDb() const noexcept { return slopeDb_.load(std::memory_order_relaxed); }
 
     /** @brief Per-stage Butterworth cascade layout for an LP/HP slope (for analysis). */
@@ -246,14 +268,21 @@ public:
      * @brief Returns the exact Butterworth cascade (first-order flag + per-stage Q
      * values) used internally for a given LP/HP slope. Lets callers reproduce the
      * true cascade magnitude instead of approximating with a single Q.
+     *
+     * @param slopeDb Slope in dB/octave (6..48).
+     * @param userQ   The engine's resonance parameter: scales the final stage
+     *                exactly as updateCoefficients() does (neutral at the
+     *                0.707 default, resonant peak above it).
      */
-    [[nodiscard]] static CascadeInfo cascadeForSlope(int slopeDb) noexcept
+    [[nodiscard]] static CascadeInfo cascadeForSlope(int slopeDb, float userQ = 0.707f) noexcept
     {
         auto c = computeCascade(slopeDb);
         CascadeInfo info;
         info.hasFirstOrder  = c.hasFirstOrder;
         info.numSecondOrder = c.numSecondOrder;
         for (int i = 0; i < c.numSecondOrder && i < 4; ++i) info.qValues[i] = c.qValues[i];
+        if (std::isfinite(userQ) && info.numSecondOrder > 0)
+            info.qValues[info.numSecondOrder - 1] *= userQ / 0.707f;
         return info;
     }
 
@@ -266,11 +295,14 @@ public:
      * with explicit parameters, the setLowPass()/setPeaking()/etc. helpers are
      * still preferred.
      *
-     * @param newShape Target filter shape.
+     * @param newShape Target filter shape. Out-of-range values (a wild cast or
+     *                  corrupt state blob) are clamped into the enum range.
      * @param slopeDb  Slope in dB/octave (only used by LP/HP, default 12).
      */
     void setShape(Shape newShape, int slopeDb = 12) noexcept
     {
+        newShape = static_cast<Shape>(std::clamp(static_cast<int>(newShape), 0,
+                                                 static_cast<int>(Shape::Tilt)));
         shape_ = newShape;
         slopeDb_ = slopeDb;
         switch (newShape)
@@ -290,28 +322,48 @@ public:
 
     /**
      * @brief Sets the target cutoff/center frequency. Thread-safe.
-     * @param freq Frequency in Hz.
+     * @param freq Frequency in Hz. Non-finite values are ignored.
      */
-    void setFrequency(float freq) noexcept { targetFreq_.store(freq, std::memory_order_relaxed); }
+    void setFrequency(float freq) noexcept
+    {
+        if (!std::isfinite(freq)) return;
+        targetFreq_.store(freq, std::memory_order_relaxed);
+    }
 
     /**
      * @brief Sets the target resonance/Q. Thread-safe.
-     * @param Q Quality factor.
+     *
+     * For LowPass/HighPass the cascade stays an exact Butterworth at the
+     * default Q (0.707) and larger values scale the final (most resonant)
+     * stage, adding the classic resonant peak at the cutoff. The 6 dB/oct
+     * slope is first-order and has no Q.
+     *
+     * @param Q Quality factor. Non-finite values are ignored.
      */
-    void setResonance(float Q)    noexcept { targetRes_.store(Q, std::memory_order_relaxed); }
+    void setResonance(float Q)    noexcept
+    {
+        if (!std::isfinite(Q)) return;
+        targetRes_.store(Q, std::memory_order_relaxed);
+    }
 
     /**
      * @brief Sets the target gain in dB. Thread-safe.
-     * @param dB Gain in decibels.
+     * @param dB Gain in decibels. Non-finite values are ignored.
      */
-    void setGain(float dB)        noexcept { targetGain_.store(dB, std::memory_order_relaxed); }
+    void setGain(float dB)        noexcept
+    {
+        if (!std::isfinite(dB)) return;
+        targetGain_.store(dB, std::memory_order_relaxed);
+    }
 
     /**
      * @brief Sets the nonlinearity amount. Thread-safe.
      * @param amount 0 = linear (default), 1 = full nonlinearity.
+     *               Non-finite values are ignored.
      */
     void setNonlinearity(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         targetNonlinearity_.store(static_cast<float>(std::clamp(amount, T(0), T(1))), std::memory_order_relaxed);
     }
 
@@ -319,21 +371,26 @@ public:
 
     /**
      * @brief Enables analog-style low-frequency modulation of the cutoff.
+     * @note Setup thread only (it re-prepares the internal generator, which is
+     *       not safe concurrently with processBlock). Call prepare() first so
+     *       the generator receives the real sample rate.
      * @param component The analog component profile to simulate.
-     * @param intensity Modulation depth (0.0 to 1.0).
+     * @param intensity Modulation depth (0.0 to 1.0). Non-finite values are
+     *                  ignored.
      */
     void enableAnalogDrift(AnalogRandom::AnalogComponent component, float intensity = 0.5f)
     {
-        driftEnabled_ = true;
-        driftIntensity_ = intensity;
+        if (!std::isfinite(intensity)) return;
+        driftIntensity_.store(intensity, std::memory_order_relaxed);
         driftGen_.setAnalogDefault(component);
         driftGen_.prepare(spec_.sampleRate);
+        driftEnabled_.store(true, std::memory_order_release);
     }
 
     /**
-     * @brief Disables analog-style drift modulation.
+     * @brief Disables analog-style drift modulation. Thread-safe.
      */
-    void disableAnalogDrift() noexcept { driftEnabled_ = false; }
+    void disableAnalogDrift() noexcept { driftEnabled_.store(false, std::memory_order_relaxed); }
 
     // -- Processing ----------------------------------------------------------
 
@@ -355,9 +412,11 @@ public:
         resSmoother_.setTargetValue(targetRes_.load(std::memory_order_relaxed));
         gainSmoother_.setTargetValue(targetGain_.load(std::memory_order_relaxed));
         T nonLin = static_cast<T>(targetNonlinearity_.load(std::memory_order_relaxed));
+        const bool  drift    = driftEnabled_.load(std::memory_order_relaxed);
+        const float driftInt = driftIntensity_.load(std::memory_order_relaxed);
 
         const bool needSmoothing = freqSmoother_.isSmoothing() || resSmoother_.isSmoothing() || gainSmoother_.isSmoothing();
-        const bool dynamicPath = needSmoothing || driftEnabled_ || (nonLin > T(0));
+        const bool dynamicPath = needSmoothing || drift || (nonLin > T(0));
         
         constexpr int kChunkSize = 16; // Optimized chunk size for Biquad coefficient updates
 
@@ -386,13 +445,14 @@ public:
                     lastShape_ = sh; lastSlopeDb_ = sdb;
                 }
 
+                const int ns = numStages_.load(std::memory_order_relaxed);
                 for (int ch = 0; ch < nCh; ++ch)
                 {
                     T* channelData = buffer.getChannel(ch);
                     for (int i = 0; i < nS; ++i)
                     {
                         T sample = channelData[i];
-                        for (int s = 0, ns = numStages_.load(std::memory_order_relaxed); s < ns; ++s)
+                        for (int s = 0; s < ns; ++s)
                             sample = stages_[s].processSample(sample, ch);
                         channelData[i] = sample;
                     }
@@ -412,7 +472,7 @@ public:
                 // Only calculate trig/coefficients every kChunkSize samples to save CPU
                 if (i % kChunkSize == 0)
                 {
-                    float driftValue = driftEnabled_ ? (driftGen_.getNextSample() * driftIntensity_) : 0.0f;
+                    float driftValue = drift ? (driftGen_.getNextSample() * driftInt) : 0.0f;
                     freq *= (1.0f + driftValue);
 
                     if (nonLin > T(0))
@@ -436,16 +496,17 @@ public:
                     updateCoefficients(std::clamp(freq, 10.0f, nyquist), std::max(res, 0.1f), gain);
                     lastFreq_ = -1.0f; // invalidate the static-path cache
                 }
-                else if (driftEnabled_)
+                else if (drift)
                 {
                     (void)driftGen_.getNextSample(); // Advance LFO phase to keep sync
                 }
 
                 // Process inner loops
+                const int ns = numStages_.load(std::memory_order_relaxed);
                 for (int ch = 0; ch < nCh; ++ch)
                 {
                     T sample = buffer.getChannel(ch)[i];
-                    for (int s = 0, ns = numStages_.load(std::memory_order_relaxed); s < ns; ++s)
+                    for (int s = 0; s < ns; ++s)
                         sample = stages_[s].processSample(sample, ch);
                     buffer.getChannel(ch)[i] = sample;
                 }
@@ -457,13 +518,17 @@ public:
      * @brief Processes a single sample without parameter smoothing or coefficient updates.
      * @warning Must only be used when parameter changes are managed externally.
      * @param input Input sample value.
-     * @param channel Index of the audio channel being processed.
+     * @param channel Index of the audio channel being processed. Out-of-range
+     *                channels return the input unprocessed (the per-channel
+     *                biquad state is bounded to MaxChannels).
      * @return T Processed sample value.
      */
     T processSample(T input, int channel) noexcept
     {
+        if (channel < 0 || channel >= MaxChannels) return input;
         T sample = input;
-        for (int s = 0, ns = numStages_.load(std::memory_order_relaxed); s < ns; ++s)
+        const int ns = numStages_.load(std::memory_order_relaxed);
+        for (int s = 0; s < ns; ++s)
             sample = stages_[s].processSample(sample, channel);
         return sample;
     }
@@ -589,6 +654,18 @@ protected:
             if (sh == Shape::Peak || sh == Shape::BandPass ||
                 sh == Shape::Notch || sh == Shape::AllPass)
                 stageQ = Q;
+            else if ((sh == Shape::LowPass || sh == Shape::HighPass) &&
+                     s == cascade.numSecondOrder - 1)
+            {
+                // The user Q scales the FINAL (most resonant) stage of the
+                // Butterworth cascade: at the 0.707 default the ratio is
+                // exactly 1 (bit-identical Butterworth), larger values add the
+                // classic resonant peak at the cutoff. Before this, the table
+                // silently overrode the user Q for every LP/HP slope, so
+                // setLowPass(f, 5.0f) sounded identical to Butterworth and
+                // setResonance() was dead for LP/HP.
+                stageQ *= Q / 0.707f;
+            }
 
             BiquadCoeffs<T> c;
             switch (sh)
@@ -629,8 +706,11 @@ protected:
     std::atomic<float> targetGain_{0.0f};
     std::atomic<float> targetNonlinearity_{0.0f};
 
-    bool driftEnabled_ = false;
-    float driftIntensity_ = 0.0f;
+    // Atomic: enable/disable may come from a control thread while the audio
+    // thread reads them each block (the generator itself is only reconfigured
+    // from the setup thread, as enableAnalogDrift documents).
+    std::atomic<bool> driftEnabled_ { false };
+    std::atomic<float> driftIntensity_ { 0.0f };
     AnalogRandom::Generator<float> driftGen_;
 
     // Static-path coefficient cache (skip rebuilds when nothing changed).

@@ -75,7 +75,7 @@ inline EffectSlot makeFilterEngine()
         auto add = [&](BC c){ if (ns < 5) st[ns++] = c; };
         switch (type) {
             case 0: case 1: {  // LowPass / HighPass — Butterworth cascade for the slope
-                auto info = FE::cascadeForSlope(slope);
+                auto info = FE::cascadeForSlope(slope, Q);  // user Q scales the final stage, like the engine
                 const bool lp = (type == 0);
                 if (info.hasFirstOrder) add(lp ? BC::makeFirstOrderLowPass(sr, freq) : BC::makeFirstOrderHighPass(sr, freq));
                 for (int s = 0; s < info.numSecondOrder; ++s) add(lp ? BC::makeLowPass(sr, freq, info.qValues[s]) : BC::makeHighPass(sr, freq, info.qValues[s]));

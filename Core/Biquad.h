@@ -422,9 +422,10 @@ struct alignas(32) BiquadCoeffs
     /**
      * @brief Creates a first-order tilt filter.
      *
-     * Tilts the spectrum around a pivot frequency: +gainDb above the pivot,
-     * -gainDb below. A single-knob tonal balance control found in mastering
-     * EQs and channel strips (SSL, Neve, Tonelux Tilt).
+     * Tilts the spectrum around a pivot frequency: -gainDb/2 at DC, unity at
+     * the pivot, +gainDb/2 at Nyquist (total span = gainDb). A single-knob
+     * tonal balance control found in mastering EQs and channel strips
+     * (SSL, Neve, Tonelux Tilt).
      *
      * @param sampleRate Sample rate in Hz.
      * @param pivotFreq  Pivot frequency in Hz (typically 600-3000 Hz).

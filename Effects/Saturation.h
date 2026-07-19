@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -7,18 +7,30 @@
  * @file Saturation.h
  * @brief Professional multi-algorithm saturation processor with analog simulation.
  *
- * This class provides a zero-latency, high-quality saturation pipeline featuring 
- * 10 distinct algorithms ranging from soft clipping to complex magnetic tape and 
- * transformer hysteresis modeling. 
+ * This class provides a high-quality saturation pipeline featuring 10 distinct
+ * algorithms ranging from soft clipping to complex magnetic tape and
+ * transformer modeling. Latency is zero at 1x oversampling; with oversampling
+ * enabled it equals the oversampler group delay (see getLatency()).
  *
  * @details
  * **Architecture & Performance:**
- * - 100% Real-Time Safe: No memory allocations, locks, or blocking calls in the `process` path.
- * - Zero Virtual Dispatch in Hot Path: Algorithm execution is resolved statically per block.
- * - Lock-Free Parameters: All parameter changes are pushed via a Single-Producer/Single-Consumer (SPSC) queue.
- * - SIMD/Cache Friendly: Internal states (drift, slew) are pre-calculated in contiguous arrays.
+ * - Real-Time Safe: no memory allocations or blocking calls in the process
+ *   path (parameter recovery uses a bounded try-lock, never a wait).
+ * - No virtual dispatch in the per-sample hot path: the algorithm is resolved
+ *   statically once per block.
+ * - Lock-free parameters: changes travel as complete snapshots through a
+ *   single-producer/single-consumer queue.
+ * - Per-channel state is bounded to 16 channels; channels beyond the prepared
+ *   spec (or beyond 16) bypass the saturation stage.
  *
- * Dependencies: DSP/Core headers only (C++20 STL).
+ * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/Biquad.h,
+ * Core/DryWetMixer.h, Core/DspMath.h, Core/Oversampling.h, Core/Smoothers.h,
+ * Core/AnalogRandom.h, Core/SpscQueue.h, Core/SpinLock.h, Core/StateBlob.h,
+ * Effects/MidSide.h.
+ *
+ * Threading: prepare(), setOversampling() and setState() belong to the setup
+ * thread; process() and reset() to the audio thread; the remaining setters and
+ * getters may be called from any thread (snapshot queue / relaxed atomics).
  *
  * @tparam SampleType The floating-point precision to use (must be `float` or `double`).
  */
@@ -40,10 +52,12 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <type_traits>
-#include <cstring>
+#include <vector>
 
 namespace dspark {
 
@@ -160,7 +174,7 @@ class HardClipAlgorithm final : public SaturationAlgorithm<T>
 {
     std::array<T, SaturationAlgorithm<T>::kAaCh> prevX_ {};
 
-    /** Antiderivative of clamp(u,-1,1): u²/2 inside, |u|-1/2 outside. */
+    /** Antiderivative of clamp(u,-1,1): u^2/2 inside, |u|-1/2 outside. */
     static inline T g(T u) noexcept
     {
         T a = std::abs(u);
@@ -235,8 +249,8 @@ public:
      * pool. At neutral drive the curve never reaches the first peak
      * (|x| <= 1 < pi/2), i.e. gentle tanh-like rounding; folds appear once
      * in*drive crosses pi/2 and multiply with drive. The previous scaling,
-     * sin(in*drive*2pi), had a 2pi (+16 dB) hidden gain — +56 dB onto small
-     * signals at full drive — and folded fully at -6 dBFS even at neutral
+     * sin(in*drive*2pi), had a 2pi (+16 dB) hidden gain - +56 dB onto small
+     * signals at full drive - and folded fully at -6 dBFS even at neutral
      * drive. character biases the fold point (asymmetry / even harmonics);
      * subtracting sin(bias) keeps the resting output DC-free.
      */
@@ -350,6 +364,11 @@ public:
     void prepare(const AudioSpec& spec) noexcept override
     {
         numChannels_ = std::min(spec.numChannels, kMaxCh); // clamp per-channel state
+        // Invalidate the filter-design cache: a re-prepare can widen the
+        // channel count at an unchanged rate/drive, and the new channels'
+        // filters must still receive coefficients on the next update().
+        lastDrive_ = T(-1);
+        lastSampleRate_ = 0.0;
         reset();
     }
     void reset() noexcept override
@@ -383,7 +402,7 @@ public:
 
     /**
      * Tape under correct AC bias magnetises along the ANHYSTERETIC curve
-     * (the bias linearises the loop away) — so the static nonlinearity is
+     * (the bias linearises the loop away) - so the static nonlinearity is
      * M = Ms * L((H + alpha*M)/a), solved per sample by Newton-Raphson from
      * the previous sample's M (warm start: 3 iterations are plenty, and
      * f' = 1 - 3*alpha*L' >= 1 - alpha > 0 has no singularity).
@@ -391,7 +410,7 @@ public:
      * Scaling: Ms = 3a and out = (1-alpha)*M give exactly unit small-signal
      * gain over H = in*drive and a +-1 ceiling, matching the contract of
      * every other algorithm in the pool. The previous formulation stepped M
-     * by dM ~ ManDiff*|dH|/(a+|dH|) — a coercivity of ~1.0 in absolute
+     * by dM ~ ManDiff*|dH|/(a+|dH|) - a coercivity of ~1.0 in absolute
      * full-scale units, i.e. tape with NO bias: signals below ~0 dBFS*drive
      * fell into a dead zone (measured: -60 dBFS in -> -121 dBFS out, output
      * ~ input^2), wiping out quiet passages and low-level harmonic detail.
@@ -435,6 +454,7 @@ public:
     void prepare(const AudioSpec& spec) noexcept override
     {
         numChannels_ = std::min(spec.numChannels, kMaxCh); // clamp per-channel state
+        lastSampleRate_ = 0.0; // force a redesign so channels added by a re-prepare get coefficients
         reset();
     }
     void reset() noexcept override
@@ -459,7 +479,7 @@ public:
      * Band-dependent saturation THRESHOLDS at unity small-signal gain: core
      * flux scales like V/f, so lows reach saturation first (harder knee,
      * tanh(1.4x)/1.4, ceiling 0.71) while highs barely do (tanh(0.85x)/0.85,
-     * ceiling 1.18). A real transformer's linear response is flat — the
+     * ceiling 1.18). A real transformer's linear response is flat - the
      * previous form left the band factors unnormalised, which was a fixed
      * +2.3/-3.1 dB shelf tilt at 250 Hz that buried mids and highs (worst in
      * the MultiStage cascade), and its resting-bias subtraction ignored the
@@ -525,7 +545,7 @@ public:
     }
 };
 
-// -- MultiStage (Tube → Tape → Transformer cascade) -------------------------
+// -- MultiStage (Tube -> Tape -> Transformer cascade) -------------------------
 template <typename T>
 class MultiStageAlgorithm final : public SaturationAlgorithm<T>
 {
@@ -545,6 +565,10 @@ public:
 
     void update(T drive, T character, const AudioSpec& spec) noexcept override
     {
+        // The stages are private instances (not the pool's), so the owner's
+        // setAntialiasing() never reaches them directly: forward the flag to
+        // the one memoryless stage that implements ADAA.
+        tube_.setAntialias(this->antialias_.load(std::memory_order_relaxed));
         tape_.update(drive * T(0.6), character, spec);
         xfmr_.update(drive * T(0.8), character, spec);
     }
@@ -564,16 +588,21 @@ public:
 } // namespace detail
 
 // ============================================================================
-// Saturation — Public API
+// Saturation - Public API
 // ============================================================================
 
 /**
  * @class Saturation
  * @brief Professional multi-algorithm saturation processor with analog simulation.
  *
- * This class provides a zero-latency, high-quality saturation pipeline featuring 
- * 10 distinct algorithms ranging from soft clipping to complex magnetic tape and 
- * transformer hysteresis modeling. 
+ * This class provides a high-quality saturation pipeline featuring 10 distinct
+ * algorithms ranging from soft clipping to complex magnetic tape and
+ * transformer modeling. Zero latency at 1x; with oversampling enabled the
+ * latency equals the oversampler group delay (see getLatency()).
+ *
+ * Channel handling: the saturation stage processes up to 16 channels and no
+ * more than the prepared spec's channel count; any further channels in the
+ * incoming view pass through the linear stages (filters, gain, mix) only.
  *
  * @tparam SampleType The floating-point precision to use (must be `float` or `double`).
  */
@@ -640,9 +669,12 @@ public:
      * audio processing begins.
      * 
      * @param spec The audio environment specifications (sample rate, max block size, channels).
+     *             An invalid spec (non-positive or NaN fields) is ignored and
+     *             the previous state is kept.
      */
     void prepare(const AudioSpec& spec)
     {
+        if (!spec.isValid()) return;
         spec_ = spec;
         for (auto& algo : pool_)
             if (algo) algo->prepare(spec);
@@ -701,6 +733,16 @@ public:
      */
     void reset() noexcept
     {
+        // Complete any pending algorithm switch instantly: every algorithm's
+        // state is cleared below anyway, and after a reset the most recently
+        // requested algorithm must be the one playing. (Leaving next_ armed
+        // made a later request of that same algorithm a silent no-op.)
+        if (auto* pending = next_.load())
+        {
+            active_.store(pending);
+            next_.store(nullptr);
+        }
+
         for (auto& algo : pool_)
             if (algo) algo->reset();
 
@@ -780,7 +822,7 @@ public:
         // and restore it after the saturation pipeline. The snapshot lives in
         // the SAME domain the pipeline runs in (oversampled when OS is active),
         // so the restored channel shares the wet path's half-band round-trip
-        // and group delay — perfectly time-aligned with the processed channel.
+        // and group delay - perfectly time-aligned with the processed channel.
         // (The old in-pipeline routing read the DryWetMixer's base-rate L/R
         // capture from inside the oversampled loop: wrong domain AND an
         // out-of-bounds read, caught by AddressSanitizer.)
@@ -843,7 +885,10 @@ public:
 
                 if (curFreq != lastPostTiltFreq_ || curGain != lastPostTiltGain_)
                 {
-                    auto c = BiquadCoeffs<SampleType>::makePeak(spec_.sampleRate, static_cast<double>(curFreq), 0.707, static_cast<double>(curGain));
+                    // A genuine tilt shelf, as the setter documents. (This used
+                    // to be makePeak: a bell AT the pivot, which mid-boosted
+                    // instead of brightening/darkening.)
+                    auto c = BiquadCoeffs<SampleType>::makeTilt(spec_.sampleRate, static_cast<double>(curFreq), static_cast<double>(curGain));
                     postFilter_.setCoeffs(c);
                     lastPostTiltFreq_ = curFreq;
                     lastPostTiltGain_ = curGain;
@@ -969,7 +1014,7 @@ public:
      * @note Thread-Safe.
      * @note First-order ADAA shifts the wet signal by half a sample. With a
      * partial dry/wet mix this causes a very slight HF comb (< 0.2 dB below
-     * 10 kHz at 48 kHz) — inherent to the technique and far smaller than the
+     * 10 kHz at 48 kHz) - inherent to the technique and far smaller than the
      * aliasing it removes.
      */
     void setAntialiasing(bool on) noexcept
@@ -981,15 +1026,25 @@ public:
     /**
      * @brief Sets a derivative-based (slew rate) saturation multiplier.
      * @note Thread-Safe. Uses memory_order_relaxed atomic assignment.
+     *       Non-finite values are ignored.
      * @param amount Sensitivity multiplier. Range: [0.0 (off), 1.0 (max)].
      */
-    void setSlewSensitivity(SampleType amount) noexcept { slewSensitivity_.store(std::clamp(amount, SampleType(0), SampleType(1)), std::memory_order_relaxed); }
+    void setSlewSensitivity(SampleType amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        slewSensitivity_.store(std::clamp(amount, SampleType(0), SampleType(1)), std::memory_order_relaxed);
+    }
     
     /**
-     * @brief Configures a post-saturation proportional-Q tilt EQ.
+     * @brief Configures a post-saturation first-order tilt EQ.
+     *
+     * Tilts the spectrum around the pivot: -amountDb/2 at DC, unity at the
+     * pivot, +amountDb/2 at Nyquist (total span = amountDb). Positive values
+     * brighten the signal; negative values darken it.
+     *
      * @note Thread-Safe. Both parameters smoothed internally over 30ms.
      * @param centerHz Pivot frequency in Hertz. Range: [100.0, Nyquist].
-     * @param amountDb Gain at the extremes. Positive values brighten the signal; negative values darken it.
+     * @param amountDb Total tilt span in decibels. Range: [-12.0, 12.0].
      */
     void setPostFilterTilt(SampleType centerHz, SampleType amountDb)
     {
@@ -1051,6 +1106,10 @@ public:
         return (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0;
     }
 
+    /** @brief Alias of getLatencySamples() following the framework-wide latency
+     *  reporting name, so ProcessorChain::getLatency() includes this stage. */
+    [[nodiscard]] int getLatency() const noexcept { return getLatencySamples(); }
+
     /** 
      * @brief Retrieves the currently active underlying algorithm.
      * @note Real-Time Safe reading via relaxed atomics.
@@ -1094,8 +1153,9 @@ public:
         return w.blob();
     }
 
-    /** @brief Restores parameters from a blob. The oversampling factor takes
-     *  effect on the next prepare(), as setOversampling documents. */
+    /** @brief Restores parameters from a blob (setup/UI threads: it forwards
+     *  the stored oversampling factor to setOversampling, which may allocate).
+     *  Out-of-range enum values from foreign or corrupt blobs are clamped. */
     bool setState(const uint8_t* data, size_t size)
     {
         StateReader r(data, size);
@@ -1136,11 +1196,44 @@ protected:
         bool           dcBlocking         = true;
     };
 
+    /** Keeps every snapshot the audio thread can ever see well-formed: NaN/Inf
+     *  from the GUI reverts to the previous value (setter-with-NaN == ignored,
+     *  the framework-wide policy - without this the smoothers and filter
+     *  designs are poisoned permanently), and enum fields are clamped so a
+     *  cast-from-int caller or a corrupt state blob can never index outside
+     *  pool_. Also keeps lastParams_ finite for getState(). */
+    static void sanitizeParams(Params& p, const Params& prev) noexcept
+    {
+        const auto keepFinite = [](SampleType& v, SampleType old) noexcept
+        {
+            if (!std::isfinite(v)) v = old;
+        };
+        keepFinite(p.driveDb,            prev.driveDb);
+        keepFinite(p.mix,                prev.mix);
+        keepFinite(p.character,          prev.character);
+        keepFinite(p.analogDrift,        prev.analogDrift);
+        keepFinite(p.preFilterHpFreq,    prev.preFilterHpFreq);
+        keepFinite(p.postFilterTiltFreq, prev.postFilterTiltFreq);
+        keepFinite(p.postFilterTiltGain, prev.postFilterTiltGain);
+        keepFinite(p.outputGain,         prev.outputGain);
+
+        const auto clampEnum = [](auto& e, int hi) noexcept
+        {
+            using E = std::remove_reference_t<decltype(e)>;
+            e = static_cast<E>(std::clamp(static_cast<int>(e), 0, hi));
+        };
+        clampEnum(p.algorithm,      kNumAlgorithms - 1);
+        clampEnum(p.processingMode, static_cast<int>(ProcessingMode::MidSide));
+        clampEnum(p.outputMode,     static_cast<int>(OutputMode::Delta));
+    }
+
     template <typename Fn>
     void pushParam(Fn&& mutate)
     {
         SpinLock::ScopedLock guard(paramsLock_);
+        const Params prev = lastParams_;
         mutate(lastParams_);
+        sanitizeParams(lastParams_, prev);
         if (!paramQueue_.push(lastParams_))
         {
             // Queue full (a burst of GUI edits within one audio block).
@@ -1187,24 +1280,66 @@ protected:
         outputMode_ = p.outputMode;
         currentAlgoType_.store(p.algorithm, std::memory_order_relaxed);
 
+        // Algorithm switching state machine. The crossfader fades active_ out
+        // towards next_ (1 -> 0); processSaturationPipeline resolves the end
+        // of the fade by its final value (0 = promote next_, 1 = discard it).
         auto* requested = pool_[static_cast<int>(p.algorithm)].get();
-        if (active_.load() != requested && next_.load() != requested)
+        auto* act = active_.load();
+        auto* nxt = next_.load();
+        if (requested == act)
         {
+            // Return to the algorithm still playing: steer any running fade
+            // back to 1 so the pending algorithm is discarded when it lands.
+            // (Ignoring this case made a quick B-then-back-to-A edit complete
+            // the fade to B: the wrong algorithm played forever while
+            // getCurrentAlgorithm() reported A.)
+            if (nxt != nullptr)
+            {
+                crossfader_.setTargetValue(1.0f);
+                if (!crossfader_.isSmoothing())
+                {
+                    // The fade had not moved yet (still at 1): discard now, or
+                    // the un-smoothing crossfader would leave nxt armed and a
+                    // later reset() would wrongly promote it.
+                    nxt->reset();
+                    next_.store(nullptr);
+                }
+            }
+        }
+        else if (requested == nxt)
+        {
+            // Re-request of the incoming algorithm (e.g. after a revert
+            // started): make sure the fade heads towards it again.
+            crossfader_.setTargetValue(0.0f);
+        }
+        else
+        {
+            // New target. It has not been audible for a while, so clear its
+            // state: stale filter/ADAA history would leak an old-signal
+            // transient into the fade-in. If a fade was already running, its
+            // pending algorithm is simply replaced (one fade-weighted step,
+            // bounded like a hard switch; the abandoned one is re-cleared
+            // here whenever it is next requested).
+            requested->reset();
             next_.store(requested);
             crossfader_.setTargetValue(0.0f);
         }
     }
 
     // Data-Oriented Pipeline to eliminate per-sample virtual dispatch
-    void processSaturationPipeline(AudioBufferView<SampleType> buffer)
+    void processSaturationPipeline(AudioBufferView<SampleType> buffer) noexcept
     {
         auto* primary   = active_.load();
         auto* secondary = next_.load();
         bool  xfading   = secondary != nullptr && crossfader_.isSmoothing();
 
-        // Clamp to per-channel state capacity (prevSlewSample_/prevBlendSample_ are
-        // kMaxCh): an AudioBufferView is not capped at kMaxCh channels.
-        const int nCh = std::min(buffer.getNumChannels(), kMaxCh);
+        // Clamp to per-channel state capacity (prevSlewSample_/prevBlendSample_
+        // are kMaxCh) AND to the prepared channel count: driftBuffer_ and
+        // tempBuffer_ only hold spec_.numChannels channels, so a caller view
+        // with more channels used to read/write past them (out of bounds in
+        // release) as soon as drift or an algorithm crossfade was active.
+        // Channels beyond the prepared spec now bypass the saturation stage.
+        const int nCh = std::min({ buffer.getNumChannels(), kMaxCh, spec_.numChannels });
         const int nS  = buffer.getNumSamples();
 
         auto driveDbTarget = static_cast<SampleType>(driveSmoother_.getTargetValue());
@@ -1246,9 +1381,16 @@ protected:
             auto driftView = driftBuffer_.toView();
             for (int i = 0; i < nS; ++i) {
                 auto driftS = driftSmoother_.getNextValue();
+                // Exactly one draw per generator per sample (stereo-identical
+                // to drawing inside the channel loop). Channels beyond the
+                // second share the right generator's value; drawing per
+                // channel instead advanced its clock nCh-1 times per sample,
+                // speeding the wander up with the channel count.
+                const SampleType noiseL = leftDrift_.getNextSample();
+                const SampleType noiseR = (nCh > 1) ? rightDrift_.getNextSample() : SampleType(0);
                 for (int ch = 0; ch < nCh; ++ch) {
-                    SampleType noise = (ch == 0) ? leftDrift_.getNextSample() : rightDrift_.getNextSample();
-                    driftView.getChannel(ch)[i] = SampleType(1) + static_cast<SampleType>(driftS) * noise;
+                    driftView.getChannel(ch)[i] =
+                        SampleType(1) + static_cast<SampleType>(driftS) * (ch == 0 ? noiseL : noiseR);
                 }
             }
         }
@@ -1273,9 +1415,17 @@ protected:
             }
 
             if (!crossfader_.isSmoothing()) {
-                active_.store(secondary);
-                next_.store(nullptr);
-                if (primary) primary->reset();
+                if (crossfader_.getCurrentValue() < 0.5f) {
+                    // Fade ran to 0: the pending algorithm takes over.
+                    active_.store(secondary);
+                    next_.store(nullptr);
+                    if (primary) primary->reset();
+                } else {
+                    // Reverted fade landed back on the active algorithm:
+                    // discard the pending one.
+                    secondary->reset();
+                    next_.store(nullptr);
+                }
                 crossfader_.setCurrentAndTargetValue(1.0f);
             }
         }
@@ -1285,7 +1435,7 @@ protected:
         }
 
         // (Adaptive blend and the MidOnly/SideOnly channel passthrough run at
-        //  BASE rate in process() — see the snapshot/restore logic there.)
+        //  BASE rate in process() - see the snapshot/restore logic there.)
 
         // Gain Reduction Tracking
         SampleType peakOut = SampleType(0);
@@ -1305,7 +1455,7 @@ protected:
 
     /** @brief Program-dependent dry/wet density blend (base rate, L/R domain).
      *  The dry reference is the DryWetMixer capture, which carries the same
-     *  latency compensation as the wet path — no comb filtering. */
+     *  latency compensation as the wet path - no comb filtering. */
     void applyAdaptiveBlend(AudioBufferView<SampleType> buffer) noexcept
     {
         const int nCh = std::min({ buffer.getNumChannels(),
@@ -1330,7 +1480,7 @@ protected:
     }
 
     // Compile-time resolver (Zero virtual dispatch in hot path)
-    void dispatchSaturator(detail::SaturationAlgorithm<SampleType>* baseAlgo, AudioBufferView<SampleType> buffer, bool useDrift)
+    void dispatchSaturator(detail::SaturationAlgorithm<SampleType>* baseAlgo, AudioBufferView<SampleType> buffer, bool useDrift) noexcept
     {
         if (!baseAlgo) return;
         switch (baseAlgo->getType())
@@ -1349,11 +1499,11 @@ protected:
     }
 
     template <typename ExactAlgo>
-    void processCore(ExactAlgo* algo, AudioBufferView<SampleType> buffer, bool useDrift)
+    void processCore(ExactAlgo* algo, AudioBufferView<SampleType> buffer, bool useDrift) noexcept
     {
-        // Clamp to per-channel state capacity: the algorithm's per-channel filter
-        // state (preFilters_[ch] etc.) and driftBuffer_ are bounded to kMaxCh.
-        const int nCh = std::min(buffer.getNumChannels(), kMaxCh);
+        // Same channel clamp as processSaturationPipeline: per-channel algorithm
+        // state is bounded to kMaxCh and driftBuffer_ to spec_.numChannels.
+        const int nCh = std::min({ buffer.getNumChannels(), kMaxCh, spec_.numChannels });
         const int nS  = buffer.getNumSamples();
         auto driftView = driftBuffer_.toView();
 
@@ -1371,7 +1521,7 @@ protected:
         }
     }
 
-    void applyOutputGain(AudioBufferView<SampleType> buffer)
+    void applyOutputGain(AudioBufferView<SampleType> buffer) noexcept
     {
         auto targetGainDb = outputGainSmoother_.getTargetValue();
         if (std::abs(targetGainDb - outputGainSmoother_.getCurrentValue()) < 0.001f)

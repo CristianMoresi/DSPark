@@ -1,24 +1,27 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
 /**
  * @file StereoWidth.h
- * @brief Phase-compensated Stereo width control via Mid/Side processing.
+ * @brief Stereo width control via Mid/Side processing with phase-aligned bass mono.
  *
  * Adjusts the stereo image width from mono to extra-wide using M/S encoding.
- * Includes an audiophile-grade bass-mono feature that collapses low frequencies
- * to mono below a configurable cutoff. 
- * 
- * To guarantee pristine center-image fidelity, a 1-pole All-Pass filter is 
- * applied to the Mid signal to perfectly align its phase response with the 
- * Side signal's High-Pass filter.
+ * Includes a bass-mono feature that collapses low frequencies to mono below a
+ * configurable cutoff: the side channel loses its lows through a one-pole
+ * high-pass whose complementary split needs no phase compensation of the mid.
  *
- * Designed for real-time: branchless inner loops, SIMD-friendly, 
- * atomic lock-free parameters, and internal anti-denormal protection.
+ * Designed for real-time: the pure-width path auto-vectorizes; the bass-mono
+ * path is a tight scalar loop (its recursive filter state rules out SIMD).
+ * Atomic lock-free parameters and internal anti-denormal protection.
  *
- * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h
+ * Dependencies: Core/DspMath.h, Core/AudioSpec.h, Core/AudioBuffer.h,
+ * Core/StateBlob.h.
+ *
+ * Threading: prepare() belongs to the setup thread; the processing calls and
+ * reset() to the audio thread. setWidth()/setBassMono() are safe from any
+ * thread (atomics read once per block); non-finite values are ignored.
  */
 
 #include "../Core/DspMath.h"
@@ -29,7 +32,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <numbers>
+#include <vector>
 
 namespace dspark {
 
@@ -48,10 +53,11 @@ public:
 
     /**
      * @brief Prepares the processor and resets internal states.
-     * @param sampleRate Sample rate in Hz.
+     * @param sampleRate Sample rate in Hz. Non-positive or NaN rates are ignored.
      */
     void prepare(double sampleRate) noexcept
     {
+        if (!(sampleRate > 0.0)) return;
         sampleRate_ = sampleRate;
         updateBassMonoCoeff(bassMonoCutoff_.load(std::memory_order_relaxed));
         reset();
@@ -72,10 +78,13 @@ public:
 
     /**
      * @brief Sets the overall stereo width factor.
-     * @param width 0.0 = Mono, 1.0 = Original, >1.0 = Widened.
+     * @param width 0.0 = Mono, 1.0 = Original, >1.0 = Widened. Non-finite
+     *              values are ignored (without the guard, max(0, NaN)
+     *              resolved to 0: a silent collapse to mono).
      */
     void setWidth(T width) noexcept
     {
+        if (!std::isfinite(width)) return;
         width_.store(std::max(T(0), width), std::memory_order_relaxed);
     }
 
@@ -85,12 +94,18 @@ public:
     /**
      * @brief Toggles Bass Mono and updates the crossover frequency.
      * @param enabled True activates the phase-aligned bass mono crossover.
-     * @param cutoffHz Cutoff frequency in Hz (default: 100.0).
+     * @param cutoffHz Cutoff frequency in Hz (default: 100.0). Non-positive or
+     *                 NaN cutoffs keep the previous crossover (a NaN here
+     *                 poisoned the side filter state permanently); the enabled
+     *                 toggle still applies.
      */
     void setBassMono(bool enabled, double cutoffHz = 100.0) noexcept
     {
-        bassMonoCutoff_.store(cutoffHz, std::memory_order_relaxed);
-        updateBassMonoCoeff(cutoffHz);
+        if (cutoffHz > 0.0 && std::isfinite(cutoffHz))
+        {
+            bassMonoCutoff_.store(cutoffHz, std::memory_order_relaxed);
+            updateBassMonoCoeff(cutoffHz);
+        }
         bassMonoEnabled_.store(enabled, std::memory_order_release);
     }
 
@@ -113,7 +128,7 @@ public:
             // Bass-mono crossover: the side channel loses its lows through a
             // one-pole high-pass; the mid passes UNTOUCHED. A one-pole split is
             // complementary (LP + HP == 1 exactly), so no phase "compensation"
-            // of the mid is needed — the previously used first-order allpass
+            // of the mid is needed - the previously used first-order allpass
             // rotated the mid by up to 180 degrees at HF, which swapped and
             // inverted the channels above the transition band.
             for (int i = 0; i < numSamples; ++i)

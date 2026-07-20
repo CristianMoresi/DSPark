@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -30,15 +30,23 @@
  * - ITU-R BS.1770-4 compliant True-Peak detection.
  * - Topologies: FeedForward and vintage FeedBack.
  *
+ * Threading: prepare()/reset() from a setup thread only (never concurrent
+ * with audio). processBlock()/processSample() from the audio thread that
+ * owns the stream. All setters and getState() are safe from any thread
+ * (atomic publication; the audio thread consumes changes at block/sample
+ * boundaries). Invalid setter values (NaN/Inf, wild enums) are ignored or
+ * clamped, so no control-thread input can poison the audio path.
+ * getGainReductionDb()/getLatency() are metering/host reads (relaxed).
+ *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, SmoothedValue.h,
- *               DryWetMixer.h, RingBuffer.h, DenormalGuard.h, Hilbert.h.
+ *               RingBuffer.h, DenormalGuard.h, Hilbert.h,
+ *               TruePeakDetector.h, StateBlob.h.
  */
 
 #include "../Core/DspMath.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/SmoothedValue.h"
-#include "../Core/DryWetMixer.h"
 #include "../Core/RingBuffer.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/Hilbert.h"
@@ -49,7 +57,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
-#include <memory>
+#include <cstddef>
+#include <cstdint>
 #include <numbers>
 #include <vector>
 
@@ -171,11 +180,16 @@ public:
 
     /**
      * @brief Allocates buffers and initializes internal DSP state.
+     *
+     * An invalid spec (non-positive/NaN sample rate or no channels) is
+     * ignored: the previous prepared state, if any, stays intact.
+     *
      * @warning Must not be called from the audio thread. Allocates memory.
      * @param spec Audio environment specification (sample rate, block size, channels).
      */
     void prepare(const AudioSpec& spec)
     {
+        if (!spec.isValid()) return;
         spec_ = spec;
         sampleRate_ = spec.sampleRate;
 
@@ -204,13 +218,14 @@ public:
         // Pre-allocate and initialize per-channel instances. Capacity covers
         // the 10 ms user lookahead plus the Hilbert detector's group delay
         // (the audio is delayed by it to stay aligned with the envelope).
+        // Every channel slot gets a delay line, not just spec.numChannels:
+        // a view wider than the spec would otherwise read an unprepared ring
+        // (silence) on the extra channels whenever lookahead is active.
         int maxLaSamples = static_cast<int>(sampleRate_ * 0.01) + 1
                          + Hilbert<T>::getLatencySamples();
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
-            if (ch < spec.numChannels)
-                lookaheadBuffers_[ch].prepare(maxLaSamples);
-                
+            lookaheadBuffers_[ch].prepare(maxLaSamples);
             hilbertDetectors_[ch].prepare(sampleRate_);
         }
         
@@ -274,12 +289,18 @@ public:
      *       per-sample workflows must therefore include channel 0; other
      *       channels read the current smoothed values without advancing them.
      *
-     * @param input Audio sample to process.
+     * @param input Audio sample to process. Returned unchanged (with no state
+     *        touched) before prepare() or for a channel outside [0, 16).
      * @param channel Index of the audio channel (used for state tracking).
      * @return Compressed output sample.
      */
     [[nodiscard]] T processSample(T input, int channel) noexcept
     {
+        // Release-safe guards: a wild channel would index every per-channel
+        // state array out of bounds (a negative one is a giant size_t).
+        if (channel < 0 || channel >= kMaxChannels) return input;
+        if (!(sampleRate_ > 0)) return input;
+
         // Sync atomic parameters into the smoothers here too: processBlock does this
         // per block, but a processSample-only workflow would otherwise never see
         // setThreshold()/setRatio()/setKnee() changes (the smoothers stayed frozen).
@@ -317,10 +338,19 @@ public:
         bool scHpf     = scHpfEnabled_.load(std::memory_order_relaxed);
         auto autoMkup  = autoMakeupMode_.load(std::memory_order_relaxed);
 
-        if (timeConstantsDirty_.exchange(false, std::memory_order_acquire))
+        // Cheap relaxed pre-check keeps the per-sample cost to one load when
+        // nothing changed; the exchange claims the flag only when it is set.
+        if (timeConstantsDirty_.load(std::memory_order_relaxed)
+            && timeConstantsDirty_.exchange(false, std::memory_order_acquire))
         {
-            T fs = static_cast<T>(sampleRate_);
-            if (fs > T(0)) updateTimeConstants(fs);
+            updateTimeConstants(static_cast<T>(sampleRate_));
+        }
+        if (channel == 0
+            && rmsWindowDirty_.load(std::memory_order_relaxed)
+            && rmsWindowDirty_.exchange(false, std::memory_order_acquire))
+        {
+            rmsWindowMs_ = rmsWindowMsAtomic_.load(std::memory_order_relaxed);
+            updateRmsWindow();
         }
 
         // The FET character is a feedback design like the 1176 it models: it
@@ -352,6 +382,7 @@ public:
             guardDb = g;
         }
 
+        const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity;
         T smoothedGR_Db;
         if (fbImplicit)
         {
@@ -362,13 +393,13 @@ public:
         {
             const auto law = computeGainFeedback(levelDb, thresh, ratio, knee, charType);
             const T targetGR_Db = applyHoldAndRange(law.target, channel);
-            smoothedGR_Db = applyBallistics(targetGR_Db, channel, law.slope);
+            smoothedGR_Db = applyBallistics(targetGR_Db, channel, splitAdaptive, law.slope);
         }
         else
         {
             T targetGR_Db = computeGain(levelDb, thresh, ratio, knee, charType, modeType, guardDb);
             targetGR_Db = applyHoldAndRange(targetGR_Db, channel);
-            smoothedGR_Db = applyBallistics(targetGR_Db, channel);
+            smoothedGR_Db = applyBallistics(targetGR_Db, channel, splitAdaptive);
         }
         T smoothedGainLinear = decibelsToGain(smoothedGR_Db);
 
@@ -446,12 +477,21 @@ public:
     // Parameter Setters
     // =========================================================================
 
+    // All numeric setters ignore non-finite values (NaN/Inf) and keep the
+    // previous parameter: a poisoned time constant, level or coefficient
+    // would otherwise contaminate the gain path permanently.
+
     /** @brief Sets the compression threshold in dB. */
-    void setThreshold(T dB) noexcept { threshold_.store(dB, std::memory_order_relaxed); }
+    void setThreshold(T dB) noexcept
+    {
+        if (!std::isfinite(dB)) return;
+        threshold_.store(dB, std::memory_order_relaxed);
+    }
 
     /** @brief Sets the compression ratio (1.0 = off, >20.0 = limiting). */
     void setRatio(T ratio) noexcept
     {
+        if (!std::isfinite(ratio)) return;
         ratio_.store(std::max(ratio, T(1)), std::memory_order_relaxed);
         // The feedback attack compensation depends on the loop gain (ratio).
         timeConstantsDirty_.store(true, std::memory_order_release);
@@ -470,6 +510,7 @@ public:
      */
     void setAttack(T ms) noexcept
     {
+        if (!std::isfinite(ms)) return;
         attackMs_.store(std::max(ms, T(0.01)), std::memory_order_relaxed);
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
@@ -485,15 +526,24 @@ public:
      */
     void setRelease(T ms) noexcept
     {
+        if (!std::isfinite(ms)) return;
         releaseMs_.store(std::max(ms, T(1)), std::memory_order_relaxed);
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
 
     /** @brief Sets knee width in dB (0 = hard knee, >0 = soft knee). */
-    void setKnee(T dB) noexcept { kneeWidth_.store(std::max(dB, T(0)), std::memory_order_relaxed); }
+    void setKnee(T dB) noexcept
+    {
+        if (!std::isfinite(dB)) return;
+        kneeWidth_.store(std::max(dB, T(0)), std::memory_order_relaxed);
+    }
 
     /** @brief Sets manual static makeup gain in dB. */
-    void setMakeupGain(T dB) noexcept { makeupGain_.store(dB, std::memory_order_relaxed); }
+    void setMakeupGain(T dB) noexcept
+    {
+        if (!std::isfinite(dB)) return;
+        makeupGain_.store(dB, std::memory_order_relaxed);
+    }
 
     /**
      * @brief Selects the automatic makeup behavior (default: Off).
@@ -507,7 +557,8 @@ public:
      */
     void setAutoMakeup(AutoMakeupMode mode) noexcept
     {
-        autoMakeupMode_.store(mode, std::memory_order_relaxed);
+        autoMakeupMode_.store(clampEnum(mode, AutoMakeupMode::Adaptive),
+                              std::memory_order_relaxed);
     }
 
     /** @brief Convenience overload: true selects Adaptive, false turns auto makeup off. */
@@ -519,23 +570,32 @@ public:
     /** @brief Sets processing mode (Downward or Upward compression). */
     void setMode(Mode mode) noexcept
     {
-        mode_.store(mode, std::memory_order_relaxed);
+        mode_.store(clampEnum(mode, Mode::Upward), std::memory_order_relaxed);
         // Feedback attack compensation only applies to Downward loops.
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
 
     /** @brief Sets stereo linking amount (0.0 = unlinked dual mono, 1.0 = fully linked). */
-    void setStereoLink(T amount) noexcept { stereoLink_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed); }
+    void setStereoLink(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        stereoLink_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
 
     /** @brief Sets dry/wet balance for parallel (New York) compression (1.0 = fully wet). */
-    void setMix(T dryWet) noexcept { mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed); }
+    void setMix(T dryWet) noexcept
+    {
+        if (!std::isfinite(dryWet)) return;
+        mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed);
+    }
 
-    /** 
-     * @brief Sets lookahead time in ms (0 = off, max = 10ms). 
+    /**
+     * @brief Sets lookahead time in ms (0 = off, max = 10ms).
      * @warning Automatically disabled internally if topology is set to FeedBack.
      */
     void setLookahead(T ms) noexcept
     {
+        if (!std::isfinite(ms)) return;
         lookaheadMs_.store(std::clamp(ms, T(0), T(10)), std::memory_order_relaxed);
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
@@ -545,19 +605,20 @@ public:
     {
         // The shared TruePeakDetector builds its coefficients lazily on first
         // use (thread-safe static), so this is a pure atomic publication.
-        detectorType_.store(type, std::memory_order_relaxed);
+        detectorType_.store(clampEnum(type, DetectorType::Hilbert), std::memory_order_relaxed);
     }
 
     /**
      * @brief Sets the gain-reduction hold time.
      *
      * The deepest gain reduction is held for this long before the release
-     * stage may recover — the classic tool against pumping on dense material.
+     * stage may recover, the classic tool against pumping on dense material.
      *
      * @param ms Hold time in milliseconds (0 = off, mastering range 0-500).
      */
     void setHoldTime(T ms) noexcept
     {
+        if (!std::isfinite(ms)) return;
         holdMs_.store(std::clamp(ms, T(0), T(500)), std::memory_order_relaxed);
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
@@ -572,13 +633,14 @@ public:
      */
     void setRange(T dB) noexcept
     {
+        if (!std::isfinite(dB)) return;
         rangeDb_.store(std::max(dB, T(0)), std::memory_order_relaxed);
     }
 
     /** @brief Changes signal routing topology (FeedForward or FeedBack). */
     void setTopology(Topology topo) noexcept
     {
-        topology_.store(topo, std::memory_order_relaxed);
+        topology_.store(clampEnum(topo, Topology::FeedBack), std::memory_order_relaxed);
         // Feedback loops re-derive the attack coefficient (loop speed-up).
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
@@ -586,7 +648,7 @@ public:
     /** @brief Changes ballistics and envelope behavior character. */
     void setCharacter(Character type) noexcept
     {
-        character_.store(type, std::memory_order_relaxed);
+        character_.store(clampEnum(type, Character::Varimu), std::memory_order_relaxed);
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
 
@@ -606,6 +668,7 @@ public:
      */
     void setCharacterColor(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         characterColor_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
@@ -617,13 +680,19 @@ public:
 
     /**
      * @brief Toggles the internal sidechain high-pass filter.
+     *
+     * An invalid cutoff (non-positive or non-finite) keeps the previous
+     * frequency and only applies the toggle: a negative cutoff would make
+     * the one-pole coefficient exceed 1 (an unstable, runaway filter).
+     *
      * @param enabled True to activate HPF.
      * @param cutoffHz Cutoff frequency in Hz (Default: 80Hz).
      */
     void setSidechainHPF(bool enabled, T cutoffHz = T(80)) noexcept
     {
         scHpfEnabled_.store(enabled, std::memory_order_relaxed);
-        scHpfFreq_.store(cutoffHz, std::memory_order_relaxed);
+        if (std::isfinite(cutoffHz) && cutoffHz > T(0))
+            scHpfFreq_.store(cutoffHz, std::memory_order_relaxed);
     }
 
     /**
@@ -633,11 +702,12 @@ public:
      * resets the sliding state) at its next block, so no control-thread write
      * ever races the per-sample RMS accumulators.
      *
-     * @warning Capable up to 500ms maximum based on prepare() pre-allocation.
+     * @warning Clamped to the 1-500 ms range of the prepare() pre-allocation.
      */
     void setRmsWindow(T ms) noexcept
     {
-        rmsWindowMsAtomic_.store(std::max(ms, T(1)), std::memory_order_relaxed);
+        if (!std::isfinite(ms)) return;
+        rmsWindowMsAtomic_.store(std::clamp(ms, T(1), T(500)), std::memory_order_relaxed);
         rmsWindowDirty_.store(true, std::memory_order_release);
     }
 
@@ -746,17 +816,41 @@ public:
 protected:
     static constexpr int kMaxChannels = 16;
 
-    /** 
+    /**
+     * @brief Clamps an enum to its valid [first, last] range.
+     *
+     * Wild values (a cast integer, a corrupted state blob) would otherwise
+     * fall through every switch case: updateTimeConstants() would keep its
+     * zero-initialized coefficients (instant ballistics, i.e. a waveshaper)
+     * and the getters would report an impossible value.
+     */
+    template <typename E>
+    [[nodiscard]] static E clampEnum(E value, E last) noexcept
+    {
+        const int v = std::clamp(static_cast<int>(value), 0, static_cast<int>(last));
+        return static_cast<E>(v);
+    }
+
+    /**
      * @brief Core DSP loop executing sidechain detection, linking, ballistics, and gain application.
+     *
+     * No-op before prepare(). A sidechain view with fewer samples than the
+     * audio view is ignored (the detector falls back to the audio itself)
+     * rather than read out of bounds.
+     *
      * @param audio Buffer to modify.
      * @param sidechain Buffer to read for level detection.
      */
     void processBlockImpl(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
     {
+        if (!(sampleRate_ > 0)) return; // not prepared: leave the audio untouched
         DenormalGuard guard;
         const int nCh  = std::min(audio.getNumChannels(), kMaxChannels);
-        const int scCh = sidechain.getNumChannels();
         const int nS   = audio.getNumSamples();
+        // A short external sidechain would be read past its end; fall back
+        // to the internal key instead (release-safe, documented above).
+        const int scCh = (sidechain.getNumSamples() >= nS)
+                       ? sidechain.getNumChannels() : 0;
 
         // Sync atomic parameters to block-local smoothed state
         thresholdSmooth_.setTargetValue(threshold_.load(std::memory_order_relaxed));
@@ -767,10 +861,7 @@ protected:
         colorSmooth_.setTargetValue(characterColor_.load(std::memory_order_relaxed));
 
         if (timeConstantsDirty_.exchange(false, std::memory_order_acquire))
-        {
-            T fs = static_cast<T>(sampleRate_);
-            if (fs > T(0)) updateTimeConstants(fs);
-        }
+            updateTimeConstants(static_cast<T>(sampleRate_));
         updateHpfCoefficients();
 
         // Apply a pending RMS window change here, on the audio thread.
@@ -808,6 +899,7 @@ protected:
         // delaying the audio by the same amount re-aligns gain and signal.
         const int hilbertComp = (detTypeEff == DetectorType::Hilbert)
                               ? Hilbert<T>::getLatencySamples() : 0;
+        const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity;
 
         // Lookahead (and the Hilbert alignment delay) break causal logic in
         // Feedback mode, so both are strictly disabled there.
@@ -885,13 +977,13 @@ protected:
                     // law plus a per-sample stability floor on the ballistics.
                     const auto law = computeGainFeedback(inputDb, thresh, ratio, knee, charType);
                     const T targetGR_Db = applyHoldAndRange(law.target, ch);
-                    smoothedGR_Db = applyBallistics(targetGR_Db, ch, law.slope);
+                    smoothedGR_Db = applyBallistics(targetGR_Db, ch, splitAdaptive, law.slope);
                 }
                 else
                 {
                     T targetGR_Db = computeGain(inputDb, thresh, ratio, knee, charType, modeType, guardDb);
                     targetGR_Db = applyHoldAndRange(targetGR_Db, ch);
-                    smoothedGR_Db = applyBallistics(targetGR_Db, ch);
+                    smoothedGR_Db = applyBallistics(targetGR_Db, ch, splitAdaptive);
                 }
                 T smoothedGainLinear = decibelsToGain(smoothedGR_Db);
 
@@ -962,8 +1054,12 @@ protected:
         auto tc = [fs](T ms) { return std::exp(T(-1) / (fs * ms / T(1000))); };
 
         // Character ballistics: time constants of the dB-domain envelopes.
+        // The default arm backs up the setter's enum clamp: falling through
+        // with no case would leave the coefficients zero-initialized
+        // (instant ballistics, i.e. a waveshaper).
         switch (character_.load(std::memory_order_relaxed))
         {
+            default:
             case Character::Clean:
             case Character::Varimu:
                 charAttCoeff_     = tc(attMs);
@@ -1103,7 +1199,7 @@ protected:
                 auto& recomputeCount = rmsRecomputeCounters_[ch];
                 int len = rmsWindowSamples_;
 
-                if (len > 0 && len <= static_cast<int>(buf.capacity()))
+                if (len > 0 && len <= static_cast<int>(buf.size()))
                 {
                     sum -= buf[idx];
                     buf[idx] = sq;
@@ -1472,6 +1568,9 @@ protected:
      *
      * @param targetGrDb Static gain change target in dB (negative = reduction).
      * @param ch Channel index.
+     * @param splitAdaptive True when the EFFECTIVE detector is SplitPolarity
+     *        (the callers derive it once per block/sample: it must follow the
+     *        detector actually in use, which the FET character overrides).
      * @param loopSlope Incremental loop gain when driven from a feedback
      *        detector with memory (explicit loop): both coefficients get a
      *        stability floor, which caps the per-sample loop advance at 0.5
@@ -1479,7 +1578,8 @@ protected:
      *        ratio/time combinations. 0 = no loop (default).
      * @return The smoothed gain change in dB to apply.
      */
-    [[nodiscard]] T applyBallistics(T targetGrDb, int ch, T loopSlope = T(0)) noexcept
+    [[nodiscard]] T applyBallistics(T targetGrDb, int ch, bool splitAdaptive,
+                                    T loopSlope = T(0)) noexcept
     {
         // Level-adaptive release for the SplitPolarity detector: full-scale
         // output halves the release time constant. Halving tau squares the
@@ -1487,7 +1587,7 @@ protected:
         // keeps the modulation on the exponential curve.
         T attCoeff = charAttCoeff_;
         T relCoeff = charRelCoeff_;
-        if (detectorType_.load(std::memory_order_relaxed) == DetectorType::SplitPolarity)
+        if (splitAdaptive)
         {
             const T outputLevel = std::min(std::abs(fbLastOutput_[ch]), T(1));
             relCoeff += outputLevel * (relCoeff * relCoeff - relCoeff);
@@ -1530,8 +1630,12 @@ protected:
     /** @brief Updates the normalized DC-blocker / High-pass filter coefficients. */
     void updateHpfCoefficients() noexcept
     {
-        T scFreq = scHpfFreq_.load(std::memory_order_relaxed);
-        scHpfB1_ = static_cast<T>(std::exp(-std::numbers::pi * 2.0 * static_cast<double>(scFreq) / sampleRate_));
+        // The setter rejects invalid cutoffs; the clamp keeps the coefficient
+        // in the stable range even against a hostile in-memory value.
+        const double scFreq = std::clamp(
+            static_cast<double>(scHpfFreq_.load(std::memory_order_relaxed)),
+            1.0, sampleRate_ * 0.45);
+        scHpfB1_ = static_cast<T>(std::exp(-std::numbers::pi * 2.0 * scFreq / sampleRate_));
         scHpfA0_ = (T(1) + scHpfB1_) / T(2); // Normalization to prevent high-frequency boost
     }
 
@@ -1560,11 +1664,14 @@ protected:
         {
             int requestedSamples = static_cast<int>(sampleRate_ * static_cast<double>(rmsWindowMs_) / 1000.0);
 
-            // Limit logical window size to the pre-allocated physical capacity
+            // Limit the logical window to the LIVE element count. capacity()
+            // can exceed size() after a re-prepare to a lower rate, and a
+            // window reaching into the dead tail reads stale squares from the
+            // previous stream (measured: audible gain reduction on silence).
             if (!rmsBuffers_[0].empty())
             {
-                int maxCapacity = static_cast<int>(rmsBuffers_[0].capacity());
-                rmsWindowSamples_ = std::clamp(requestedSamples, 1, maxCapacity);
+                int maxLen = static_cast<int>(rmsBuffers_[0].size());
+                rmsWindowSamples_ = std::clamp(requestedSamples, 1, maxLen);
             }
             else
             {

@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -10,48 +10,48 @@
  * Architecture:
  * ```
  * Input (mono sum)
- *   │
- *   ▼
+ *   |
+ *   v
  * [Pre-delay: 0-200ms]
- *   │
- *   ▼
+ *   |
+ *   v
  * [Input Diffusion: 8 cascaded allpass, 1.0-9.5ms]
- *   │
- *   ├──▶ [Early Reflections: 40 taps with progressive HF absorption, L/R decorrelated]
- *   │
- *   ├──▶ [ER-to-Late gap]
- *   │       │
- *   │       ▼
- *   │    [Parallel Allpass Diffuser: 16 parallel AP + Hadamard → 16 delay + Hadamard]
- *   │    (2-step, 16² = 256 echo paths, each FDN line gets unique dense input)
- *   │       │
- *   │       ▼
- *   │    [FDN Core: 16 delay lines]
- *   │      ├─ Read with dual smooth-random-LFO modulated delay
- *   │      ├─ Hadamard 16×16 butterfly (O(N log N))
- *   │      ├─ Jot absorption filter (1st-order shelving) per line
- *   │      ├─ Bass shelf (1-pole) per line
- *   │      ├─ 2 feedback allpass per line
- *   │      ├─ DC blocker + soft limiter
- *   │      └─ Write back + input injection
- *   │       │
- *   │       ▼
- *   │    [Output: sign-weighted + Dattorro multi-tap]
- *   │       │
- *   │       ▼
- *   │    [Output Diffusion: 2 allpass/channel, L/R decorrelated]
- *   │
- *   ▼
- * [Combine early + late] → [Tone EQ: Biquad LP + HP (12 dB/oct)] → DryWetMixer → Output
+ *   |
+ *   +--> [Early Reflections: 40 taps with progressive HF absorption, L/R decorrelated]
+ *   |
+ *   +--> [ER-to-Late gap]
+ *   |       |
+ *   |       v
+ *   |    [Parallel Allpass Diffuser: 16 parallel AP + Hadamard -> 16 delay + Hadamard]
+ *   |    (2-step, 16^2 = 256 echo paths, each FDN line gets unique dense input)
+ *   |       |
+ *   |       v
+ *   |    [FDN Core: 16 delay lines]
+ *   |      +- Read with dual smooth-random-LFO modulated delay
+ *   |      +- Hadamard 16x16 butterfly (O(N log N))
+ *   |      +- Jot absorption filter (1st-order shelving) per line
+ *   |      +- Bass shelf (1-pole) per line
+ *   |      +- 2 feedback allpass per line
+ *   |      +- DC blocker + soft limiter
+ *   |      +- Write back + input injection
+ *   |       |
+ *   |       v
+ *   |    [Output: sign-weighted + Dattorro multi-tap]
+ *   |       |
+ *   |       v
+ *   |    [Output Diffusion: 2 allpass/channel, L/R decorrelated]
+ *   |
+ *   v
+ * [Combine early + late] -> [Tone EQ: Biquad LP + HP (12 dB/oct)] -> DryWetMixer -> Output
  * ```
  *
  * Key features:
  * - **Jot absorption filter** (Jot 1991): 1st-order shelving IIR per delay line
- *   for smooth frequency-dependent decay — the #1 factor for natural sound.
+ *   for smooth frequency-dependent decay, the #1 factor for natural sound.
  *   Separate bass shelf for independent LF control.
- * - **Hadamard 16×16**: all eigenvalues ±1, zero coloring
+ * - **Hadamard 16x16**: all eigenvalues +/-1, zero coloring
  * - **Parallel allpass diffuser** (Signalsmith-inspired): 16 parallel allpass
- *   + 2-step Hadamard mixing → 256 unique echo paths per input sample.
+ *   + 2-step Hadamard mixing -> 256 unique echo paths per input sample.
  *   Each FDN line receives a different, densely-mixed version of the input.
  * - **Feedback allpass**: 2 regular allpass per delay line for in-loop density
  * - **Output diffusion**: 2 allpass per channel with decorrelated delays,
@@ -62,9 +62,9 @@
  *   delay line positions for true temporal decorrelation
  * - **Tone correction EQ**: Biquad high/low cut (12 dB/oct) for tonal shaping
  * - **Early reflections**: 40-tap with progressive frequency absorption
- *   simulating wall absorption — late taps are naturally darker
- * - **Soft saturation**: Fast branchless rational soft-clip (transparent below ±1)
- *   — more musical than hard clamp, prevents pipeline stalls.
+ *   simulating wall absorption; late taps are naturally darker
+ * - **Soft saturation**: fast branchless rational soft-clip (transparent below
+ *   +/-1), more musical than a hard clamp, prevents pipeline stalls.
  * - **Allpass interpolation**: in modulated FDN reads, preserves HF over
  *   hundreds of feedback iterations (linear/cubic causes cumulative dulling)
  * - **Stereo width**: M/S width control on late reverb tail
@@ -74,6 +74,13 @@
  *   CPU cost, for embedded and other constrained targets. The default Full
  *   quality path is bit-identical to previous releases.
  *
+ * Threading: prepare() belongs to the setup thread (allocates). processBlock(),
+ * processSample() and reset() belong to the audio thread. All setters are
+ * lock-free atomic publications, safe from any thread; topology changes
+ * (type, quality) and coefficient refreshes are drained at the start of the
+ * next processBlock()/processSample() on the audio thread. Non-finite setter
+ * arguments are ignored.
+ *
  * Four levels of API complexity:
  *
  * - **Level 1:** `reverb.setType(Hall);`
@@ -82,15 +89,15 @@
  * - **Level 4:** Inherit and override protected members.
  *
  * References:
- * - Jot & Chaigne (1991) — FDN with frequency-dependent decay (shelving absorption)
- * - Dattorro (1997, JAES) — Multi-tap output, plate topology
- * - Griesinger / Lexicon 480L — Random modulation, Spin/Wander
- * - Sean Costello / Valhalla DSP — Practical FDN design, absorbent allpass
- * - Valimaki et al. (2012, IEEE) — "50 Years of Artificial Reverberation"
- * - Smith (CCRMA) — Hadamard matrices, prime power delay selection
+ * - Jot & Chaigne (1991): FDN with frequency-dependent decay (shelving absorption)
+ * - Dattorro (1997, JAES): multi-tap output, plate topology
+ * - Griesinger / Lexicon 480L: random modulation, Spin/Wander
+ * - Sean Costello / Valhalla DSP: practical FDN design, absorbent allpass
+ * - Valimaki et al. (2012, IEEE): "50 Years of Artificial Reverberation"
+ * - Smith (CCRMA): Hadamard matrices, prime power delay selection
  *
  * Dependencies: RingBuffer.h, DryWetMixer.h, DspMath.h, Biquad.h,
- *               AudioSpec.h, AudioBuffer.h.
+ *               AudioSpec.h, AudioBuffer.h, DenormalGuard.h, StateBlob.h.
  *
  * @code
  *   dspark::AlgorithmicReverb<float> reverb;
@@ -119,6 +126,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -166,13 +174,28 @@ public:
      * This method avoids memory allocations on the audio thread and must be called
      * prior to any processing.
      *
+     * An invalid spec (non-positive or non-finite fields) is a no-op that
+     * keeps the previous state.
+     *
      * @param spec Audio specification detailing sample rate and maximum block size.
      */
     void prepare(const AudioSpec& spec)
     {
+        if (!spec.isValid()) return; // release-safe: keep previous state
+
         spec_ = spec;
         mixer_.prepare(spec);
         double sr = spec.sampleRate;
+
+        // Re-derive the sample counts stored at set-time: after a re-prepare
+        // at a different rate they would keep the OLD rate's sample count
+        // (e.g. a 100 ms pre-delay set at 48 kHz played back as 50 ms at 96 kHz).
+        preDelaySamples_.store(static_cast<int>(
+            static_cast<T>(sr) * preDelayMs_.load(std::memory_order_relaxed) / T(1000)),
+            std::memory_order_relaxed);
+        erToLateSamples_.store(static_cast<int>(
+            static_cast<T>(sr) * erToLateMs_.load(std::memory_order_relaxed) / T(1000)),
+            std::memory_order_relaxed);
 
         preDelayBuf_.prepare(static_cast<int>(sr * 0.2) + 1);
         erBuf_.prepare(static_cast<int>(sr * 0.2) + 1);
@@ -186,11 +209,11 @@ public:
         for (auto& dl : fdnDelays_)
             dl.prepare(maxFDN);
 
-        // Parallel allpass diffuser — step 1 (~20ms max)
+        // Parallel allpass diffuser - step 1 (~20ms max)
         int maxParAP = static_cast<int>(sr * 0.021) + 1;
         for (auto& buf : parAPBufs_) buf.prepare(maxParAP);
 
-        // Multi-channel diffuser — step 2 (~47ms max)
+        // Multi-channel diffuser - step 2 (~47ms max)
         int maxDiffS2 = static_cast<int>(sr * 0.047) + 1;
         for (auto& buf : diffuserStep2_) buf.prepare(maxDiffS2);
 
@@ -240,7 +263,7 @@ public:
         nLines_ = eco_ ? kEcoLines : kFDNSize;
 
         applyPreset(type_.load(std::memory_order_relaxed));
-        // Clear pending flags — prepare() has already applied whatever the
+        // Clear pending flags - prepare() has already applied whatever the
         // caller configured before prepare, so no drain is needed on the first
         // processBlock.
         presetDirty_.store(false, std::memory_order_relaxed);
@@ -265,87 +288,7 @@ public:
         const int nS  = buffer.getNumSamples();
         if (nCh == 0 || nS == 0) return;
 
-        // C2/C3: drain deferred parameter changes on the audio thread. All
-        // mutations of non-atomic topology arrays (fdnDelayLens_, diffCoeffs_,
-        // …) happen here, never from GUI-thread setters. acquire-ordered loads
-        // synchronize with the release-stores in setType/setXxx.
-        if (qualityDirty_.exchange(false, std::memory_order_acquire))
-        {
-            const bool eco =
-                quality_.load(std::memory_order_relaxed) == Quality::Eco;
-            if (eco != eco_)
-            {
-                eco_ = eco;
-                nLines_ = eco ? kEcoLines : kFDNSize;
-                if (spec_.sampleRate > 0)
-                {
-                    updateDelayLengths();  // re-derives per-line delays + decay
-                    generateERTapsForType(type_.load(std::memory_order_relaxed));
-                }
-                // Engine topology changed: old delay/filter state is stale.
-                reset();
-            }
-        }
-
-        if (presetDirty_.exchange(false, std::memory_order_acquire))
-        {
-            Type t = type_.load(std::memory_order_relaxed);
-            applyPreset(t);
-            // C3 fix: wipe all delay buffers and filter state — topology just
-            // changed, so old state is stale and can spike the output.
-            reset();
-            // The preset-rebuild already ran updateDelayLengths /
-            // updateDiffCoeffs / updateModulation, so consume paramsDirty_
-            // without doing the work twice.
-            paramsDirty_.store(false, std::memory_order_relaxed);
-        }
-        else if (paramsDirty_.exchange(false, std::memory_order_acquire))
-        {
-            // Non-topology parameter change: refresh coefficient arrays but
-            // DO NOT wipe delay buffers (would click on every knob tweak).
-            if (spec_.sampleRate > 0)
-            {
-                updateDelayLengths();  // also runs updateDecayParams
-                updateDiffCoeffs();
-                updateModulation();
-
-                T md = modDepth_.load(std::memory_order_relaxed);
-                modDepthA_.store(md * T(30), std::memory_order_relaxed);
-                modDepthB_.store(md * T(15), std::memory_order_relaxed);
-
-                T hd = highDecayMult_.load(std::memory_order_relaxed);
-                T damp = std::clamp((T(1) - hd) / T(0.9), T(0), T(1));
-                damping_.store(damp, std::memory_order_relaxed);
-            }
-        }
-
-        if (toneDirty_.exchange(false, std::memory_order_acquire))
-        {
-            T hpHz = toneLowCutHz_.load(std::memory_order_relaxed);
-            T lpHz = toneHighCutHz_.load(std::memory_order_relaxed);
-            if (hpHz <= T(0) || spec_.sampleRate <= 0)
-            {
-                toneHPActive_ = false;
-            }
-            else
-            {
-                toneHPActive_ = true;
-                toneHPBiquad_.setCoeffs(BiquadCoeffs<T>::makeHighPass(
-                    spec_.sampleRate,
-                    static_cast<double>(std::clamp(hpHz, T(20), T(500)))));
-            }
-            if (lpHz <= T(0) || spec_.sampleRate <= 0)
-            {
-                toneLPActive_ = false;
-            }
-            else
-            {
-                toneLPActive_ = true;
-                toneLPBiquad_.setCoeffs(BiquadCoeffs<T>::makeLowPass(
-                    spec_.sampleRate,
-                    static_cast<double>(std::clamp(lpHz, T(2000), T(16000)))));
-            }
-        }
+        drainPendingChanges();
 
         mixer_.pushDry(buffer);
         refreshCachedParams();
@@ -359,7 +302,7 @@ public:
                 T R = buffer.getChannel(1)[i];
                 T sum = L + R;
                 T env = std::abs(L) + std::abs(R);
-                
+
                 if (std::abs(sum) < T(1e-5) * env)
                 {
                     // Pure side condition: decode the side channel instead of hard-switching
@@ -395,11 +338,16 @@ public:
     /**
      * @brief Processes a single sample and returns a stereo pair.
      *
+     * Pending parameter/preset/quality changes are drained here too (per-sample
+     * streams that never call processBlock() used to keep the old topology
+     * forever: a setType() was published but never applied).
+     *
      * @param input The mono input sample to reverberate.
      * @return std::pair<T, T> A pair containing the {Left, Right} reverberated output.
      */
     [[nodiscard]] std::pair<T, T> processSample(T input) noexcept
     {
+        drainPendingChanges();
         refreshCachedParams();
         return processSampleInternal(input);
     }
@@ -435,6 +383,7 @@ public:
         modACache_.fill(T(0));
         modBCache_.fill(T(0));
         noiseND_ = T(0);
+        noiseLP_ = T(0);
         ctrlPhase_ = 0;
 
         for (auto& lfo : modLFOA_) lfo.reset();
@@ -454,7 +403,10 @@ public:
         // C2 fix: don't touch non-atomic state from GUI thread. Publish the
         // new type and raise the preset-dirty flag; the audio thread will
         // run applyPreset() + reset() at the top of its next processBlock.
-        type_.store(type, std::memory_order_relaxed);
+        // Wild enum values (a corrupted blob, a stray cast) clamp into range.
+        const int t = std::clamp(static_cast<int>(type), 0,
+                                 static_cast<int>(Type::Cathedral));
+        type_.store(static_cast<Type>(t), std::memory_order_relaxed);
         presetDirty_.store(true, std::memory_order_release);
     }
 
@@ -489,18 +441,24 @@ public:
      */
     void setQuality(Quality q) noexcept
     {
-        quality_.store(q, std::memory_order_relaxed);
+        quality_.store(q == Quality::Eco ? Quality::Eco : Quality::Full,
+                       std::memory_order_relaxed);
         qualityDirty_.store(true, std::memory_order_release);
     }
 
     void setDecay(T seconds) noexcept
     {
+        if (!std::isfinite(seconds)) return;
         decayTime_.store(std::clamp(seconds, T(0.1), T(30)),
                          std::memory_order_relaxed);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
-    void setMix(T dryWet) noexcept { mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed); }
+    void setMix(T dryWet) noexcept
+    {
+        if (!std::isfinite(dryWet)) return;
+        mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed);
+    }
 
     // =========================================================================
     // Level 2: Intermediate API
@@ -508,6 +466,7 @@ public:
 
     void setSize(T size) noexcept
     {
+        if (!std::isfinite(size)) return;
         size_.store(std::clamp(size, T(0.01), T(1)), std::memory_order_relaxed);
         paramsDirty_.store(true, std::memory_order_release);
     }
@@ -520,6 +479,7 @@ public:
      */
     void setDamping(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         T clamped = std::clamp(amount, T(0), T(1));
         damping_.store(clamped, std::memory_order_relaxed);
         highDecayMult_.store(T(1) - clamped * T(0.9), std::memory_order_relaxed);
@@ -528,6 +488,7 @@ public:
 
     void setPreDelay(T ms) noexcept
     {
+        if (!std::isfinite(ms)) return;
         T clamped = std::clamp(ms, T(0), T(200));
         preDelayMs_.store(clamped, std::memory_order_relaxed);
         // preDelaySamples_ is already atomic and only consumed in the audio
@@ -540,12 +501,14 @@ public:
 
     void setDiffusion(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         diffusion_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
     void setModulation(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         T clamped = std::clamp(amount, T(0), T(1));
         modDepth_.store(clamped, std::memory_order_relaxed);
         modDepthA_.store(clamped * T(30), std::memory_order_relaxed);
@@ -562,11 +525,13 @@ public:
      */
     void setWidth(T width) noexcept
     {
+        if (!std::isfinite(width)) return;
         width_.store(std::clamp(width, T(0), T(2)), std::memory_order_relaxed);
     }
 
     void setErToLateDelay(T ms) noexcept
     {
+        if (!std::isfinite(ms)) return;
         T clamped = std::clamp(ms, T(0), T(200));
         erToLateMs_.store(clamped, std::memory_order_relaxed);
         if (spec_.sampleRate > 0)
@@ -576,7 +541,7 @@ public:
     }
 
     // =========================================================================
-    // Level 3: Expert API — Frequency-Dependent Decay
+    // Level 3: Expert API - Frequency-Dependent Decay
     // =========================================================================
 
     /**
@@ -590,9 +555,11 @@ public:
      */
     void setHighDecayMultiplier(T mult) noexcept
     {
+        if (!std::isfinite(mult)) return;
         T clamped = std::clamp(mult, T(0.05), T(1));
         highDecayMult_.store(clamped, std::memory_order_relaxed);
-        damping_.store((T(1) - clamped) / T(0.9), std::memory_order_relaxed);
+        damping_.store(std::clamp((T(1) - clamped) / T(0.9), T(0), T(1)),
+                       std::memory_order_relaxed);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
@@ -608,17 +575,27 @@ public:
      */
     void setBassDecayMultiplier(T mult) noexcept
     {
+        if (!std::isfinite(mult)) return;
         bassDecayMult_.store(std::clamp(mult, T(0.3), T(3)),
                              std::memory_order_relaxed);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
     /**
-     * @brief Frequency above which HF decay multiplier applies.
+     * @brief Stores the intended HF decay crossover (informational for now).
+     *
+     * The current absorption stage is a first-order Jot shelf whose DC and
+     * Nyquist gains are both pinned by the decay multipliers, so it has no
+     * free parameter left for a transition frequency: this value is stored,
+     * serialized and reported by the getter, but does NOT affect the sound
+     * of the present engine. Kept for state/preset forward-compatibility
+     * (a higher-order absorption honouring it is the natural upgrade).
+     *
      * @param hz Crossover in Hz (1000 - 16000). Default: 5000.
      */
     void setHighCrossover(T hz) noexcept
     {
+        if (!std::isfinite(hz)) return;
         highCrossover_.store(std::clamp(hz, T(1000), T(16000)),
                              std::memory_order_relaxed);
     }
@@ -629,27 +606,31 @@ public:
      */
     void setBassCrossover(T hz) noexcept
     {
+        if (!std::isfinite(hz)) return;
         bassCrossover_.store(std::clamp(hz, T(50), T(500)),
                              std::memory_order_relaxed);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
     // =========================================================================
-    // Level 3: Expert API — Tone & Levels
+    // Level 3: Expert API - Tone & Levels
     // =========================================================================
 
     void setEarlyLevel(T dB) noexcept
     {
+        if (!std::isfinite(dB)) return;
         earlyLevel_.store(decibelsToGain(std::clamp(dB, T(-60), T(6))), std::memory_order_relaxed);
     }
 
     void setLateLevel(T dB) noexcept
     {
+        if (!std::isfinite(dB)) return;
         lateLevel_.store(decibelsToGain(std::clamp(dB, T(-60), T(6))), std::memory_order_relaxed);
     }
 
     void setModRate(T hz) noexcept
     {
+        if (!std::isfinite(hz)) return;
         modRate_.store(std::clamp(hz, T(0.1), T(5)), std::memory_order_relaxed);
         paramsDirty_.store(true, std::memory_order_release);
     }
@@ -660,6 +641,7 @@ public:
      */
     void setToneLowCut(T hz) noexcept
     {
+        if (!std::isfinite(hz)) return;
         // Queue target; audio thread rebuilds the biquad inside processBlock.
         toneLowCutHz_.store(hz, std::memory_order_relaxed);
         toneDirty_.store(true, std::memory_order_release);
@@ -671,6 +653,7 @@ public:
      */
     void setToneHighCut(T hz) noexcept
     {
+        if (!std::isfinite(hz)) return;
         toneHighCutHz_.store(hz, std::memory_order_relaxed);
         toneDirty_.store(true, std::memory_order_release);
     }
@@ -797,7 +780,7 @@ protected:
         80.4, 89.0, 98.3, 108.7, 119.9, 132.3, 145.7, 160.1
     };
 
-    // Input diffusion allpass delays (ms) — 8 stages (Dattorro-style, ~34ms total)
+    // Input diffusion allpass delays (ms) - 8 stages (Dattorro-style, ~34ms total)
     static constexpr double kDiffDelaysMs_[kDiffStages] = {
         1.03, 1.47, 2.19, 3.13, 4.23, 5.59, 7.19, 9.47
     };
@@ -813,13 +796,13 @@ protected:
     static constexpr double kFbAPRatioA_ = 0.25;  // 25% of FDN delay
     static constexpr double kFbAPRatioB_ = 0.35;  // 35% of FDN delay
 
-    // Parallel allpass diffuser — step 1 delays (ms, per channel, different IRs)
+    // Parallel allpass diffuser - step 1 delays (ms, per channel, different IRs)
     static constexpr double kParAPDelaysMs_[kFDNSize] = {
         5.3, 6.1, 7.1, 7.9, 8.9, 9.7, 10.7, 11.7,
         12.3, 13.3, 14.3, 15.1, 16.1, 17.1, 18.1, 19.1
     };
 
-    // Multi-channel diffuser — step 2 per-channel delays (ms)
+    // Multi-channel diffuser - step 2 per-channel delays (ms)
     static constexpr double kDiffuserStep2Ms_[kFDNSize] = {
         15.7, 17.9, 20.1, 22.3, 24.7, 26.9, 29.3, 31.1,
         33.7, 35.3, 37.1, 39.3, 41.1, 42.9, 44.3, 45.7
@@ -838,7 +821,7 @@ protected:
      *
      * Generates band-limited random values via cubic Hermite (Catmull-Rom)
      * interpolation between xorshift32 random targets. Produces smooth,
-     * non-periodic modulation — the key to Lexicon-quality reverb character.
+     * non-periodic modulation - the key to Lexicon-quality reverb character.
      */
     struct SmoothRandomLFO
     {
@@ -971,12 +954,12 @@ protected:
     std::array<int, kDiffStages> diffDelays_ {};
     std::array<T, kDiffStages> diffCoeffs_ {};
 
-    // Parallel allpass diffuser — step 1 (16 parallel allpass, different delays)
+    // Parallel allpass diffuser - step 1 (16 parallel allpass, different delays)
     std::array<RingBuffer<T>, kFDNSize> parAPBufs_;
     std::array<int, kFDNSize> parAPDelays_ {};
     T parAPCoeff_ = T(0.65);
 
-    // Multi-channel diffuser — step 2 (16 per-channel delay buffers)
+    // Multi-channel diffuser - step 2 (16 per-channel delay buffers)
     std::array<RingBuffer<T>, kFDNSize> diffuserStep2_;
     std::array<int, kFDNSize> diffuserStep2Delays_ {};
 
@@ -1019,8 +1002,8 @@ protected:
     //  - All GUI-thread setters mutate ONLY atomic shadow fields below and set
     //    `paramsDirty_` (or `presetDirty_` for setType).
     //  - The audio thread drains the dirty flags at the top of `processBlock()`
-    //    and calls the update helpers there — so every non-atomic array that
-    //    participates in the audio path (fdnDelayLens_, diffCoeffs_, …) is
+    //    and calls the update helpers there - so every non-atomic array that
+    //    participates in the audio path (fdnDelayLens_, diffCoeffs_, ...) is
     //    mutated exclusively from the audio thread. No races, no torn reads.
 
     std::atomic<Type> type_      { Type::Room };
@@ -1046,8 +1029,8 @@ protected:
     std::atomic<Quality> quality_ { Quality::Full };
 
     // Deferred-apply flags (audio thread drains these at top of processBlock)
-    std::atomic<bool> presetDirty_ { false };  // setType() → rebuild topology + reset
-    std::atomic<bool> paramsDirty_ { false };  // any other setter → refresh coeffs
+    std::atomic<bool> presetDirty_ { false };  // setType() -> rebuild topology + reset
+    std::atomic<bool> paramsDirty_ { false };  // any other setter -> refresh coeffs
     std::atomic<bool> toneDirty_   { false };  // tone EQ cutoff changes
     std::atomic<bool> qualityDirty_ { false }; // setQuality() -> resize engine + reset
     std::atomic<T> toneLowCutHz_  { T(-1) };   // <0 = off, queued value for audio thread
@@ -1188,6 +1171,101 @@ protected:
     };
     CachedParams cachedParams_ {};
 
+    /**
+     * @brief Drains deferred parameter changes on the audio thread.
+     *
+     * C2/C3 model: all mutations of non-atomic topology arrays
+     * (fdnDelayLens_, diffCoeffs_, ...) happen here, never from GUI-thread
+     * setters. The acquire-ordered exchanges synchronize with the
+     * release-stores in setType/setXxx. Called at the top of processBlock()
+     * and processSample(); each flag is pre-checked with a plain load so the
+     * per-sample path pays no RMW when nothing is pending.
+     */
+    void drainPendingChanges() noexcept
+    {
+        if (qualityDirty_.load(std::memory_order_acquire)
+            && qualityDirty_.exchange(false, std::memory_order_acquire))
+        {
+            const bool eco =
+                quality_.load(std::memory_order_relaxed) == Quality::Eco;
+            if (eco != eco_)
+            {
+                eco_ = eco;
+                nLines_ = eco ? kEcoLines : kFDNSize;
+                if (spec_.sampleRate > 0)
+                {
+                    updateDelayLengths();  // re-derives per-line delays + decay
+                    generateERTapsForType(type_.load(std::memory_order_relaxed));
+                }
+                // Engine topology changed: old delay/filter state is stale.
+                reset();
+            }
+        }
+
+        if (presetDirty_.load(std::memory_order_acquire)
+            && presetDirty_.exchange(false, std::memory_order_acquire))
+        {
+            Type t = type_.load(std::memory_order_relaxed);
+            applyPreset(t);
+            // C3 fix: wipe all delay buffers and filter state; topology just
+            // changed, so old state is stale and can spike the output.
+            reset();
+            // The preset-rebuild already ran updateDelayLengths /
+            // updateDiffCoeffs / updateModulation, so consume paramsDirty_
+            // without doing the work twice.
+            paramsDirty_.store(false, std::memory_order_relaxed);
+        }
+        else if (paramsDirty_.load(std::memory_order_acquire)
+                 && paramsDirty_.exchange(false, std::memory_order_acquire))
+        {
+            // Non-topology parameter change: refresh coefficient arrays but
+            // DO NOT wipe delay buffers (would click on every knob tweak).
+            if (spec_.sampleRate > 0)
+            {
+                updateDelayLengths();  // also runs updateDecayParams
+                updateDiffCoeffs();
+                updateModulation();
+
+                T md = modDepth_.load(std::memory_order_relaxed);
+                modDepthA_.store(md * T(30), std::memory_order_relaxed);
+                modDepthB_.store(md * T(15), std::memory_order_relaxed);
+
+                T hd = highDecayMult_.load(std::memory_order_relaxed);
+                T damp = std::clamp((T(1) - hd) / T(0.9), T(0), T(1));
+                damping_.store(damp, std::memory_order_relaxed);
+            }
+        }
+
+        if (toneDirty_.load(std::memory_order_acquire)
+            && toneDirty_.exchange(false, std::memory_order_acquire))
+        {
+            T hpHz = toneLowCutHz_.load(std::memory_order_relaxed);
+            T lpHz = toneHighCutHz_.load(std::memory_order_relaxed);
+            if (hpHz <= T(0) || spec_.sampleRate <= 0)
+            {
+                toneHPActive_ = false;
+            }
+            else
+            {
+                toneHPActive_ = true;
+                toneHPBiquad_.setCoeffs(BiquadCoeffs<T>::makeHighPass(
+                    spec_.sampleRate,
+                    static_cast<double>(std::clamp(hpHz, T(20), T(500)))));
+            }
+            if (lpHz <= T(0) || spec_.sampleRate <= 0)
+            {
+                toneLPActive_ = false;
+            }
+            else
+            {
+                toneLPActive_ = true;
+                toneLPBiquad_.setCoeffs(BiquadCoeffs<T>::makeLowPass(
+                    spec_.sampleRate,
+                    static_cast<double>(std::clamp(lpHz, T(2000), T(16000)))));
+            }
+        }
+    }
+
     /// Pulls the atomic parameters into the block-local cache (audio thread).
     void refreshCachedParams() noexcept
     {
@@ -1200,7 +1278,7 @@ protected:
         cachedParams_.modDepthB  = modDepthB_.load(std::memory_order_relaxed);
     }
 
-    /// Core per-sample processing — returns wet {L, R}.
+    /// Core per-sample processing - returns wet {L, R}.
     std::pair<T, T> processSampleInternal(T input) noexcept
     {
         // Block-cached params (see refreshCachedParams)
@@ -1250,7 +1328,7 @@ protected:
         T fdnInputRaw = (erToLateSamp > 0)
             ? erToLateBuf_.read(erToLateSamp) : diffused;
 
-        // --- Parallel allpass diffuser (2-step, 16² = 256 echo paths) ---
+        // --- Parallel allpass diffuser (2-step, 16^2 = 256 echo paths) ---
         // Step 1: parallel allpass with different delays create unique IRs.
         // Eco: single step, 8 channels (16 echo paths via one Hadamard).
         const int n = nLines_;
@@ -1261,7 +1339,7 @@ protected:
         if (!eco_)
         {
             hadamardInPlace(diffCh);
-            // Step 2: per-channel delay + Hadamard → 256 unique paths
+            // Step 2: per-channel delay + Hadamard -> 256 unique paths
             for (int d = 0; d < kFDNSize; ++d)
                 diffuserStep2_[d].push(diffCh[d]);
             for (int d = 0; d < kFDNSize; ++d)
@@ -1336,7 +1414,7 @@ protected:
         std::array<T, kFDNSize> mixed = reads;
         householderInPlace(mixed, n);
 
-        // Per-line: Jot absorption → bass shelf → feedback allpass → write
+        // Per-line: Jot absorption -> bass shelf -> feedback allpass -> write
         for (int d = 0; d < n; ++d)
         {
             T val = mixed[d];
@@ -1368,10 +1446,10 @@ protected:
             // --- Soft saturation (Branchless fast approximation) ---
             // Extract the overshoot beyond [-1, 1] without branching
             T exceed = std::max(T(0), val - T(1)) - std::max(T(0), T(-1) - val);
-            
+
             // Limit base value strictly to [-1, 1]
-            val -= exceed; 
-            
+            val -= exceed;
+
             // Apply fast rational soft-clip: x / (1 + |x|) ONLY to the exceeding portion
             // Approximates tanh curve infinitely closer to limits without unpredictable CPU branch hits
             val += exceed / (T(1) + std::abs(exceed));
@@ -1540,7 +1618,7 @@ protected:
 
             // Bass ratio for independent LF control. The bass shelf multiplies the
             // per-line DC loop gain by bassRatio, so cap it so gMid*bassRatio stays
-            // below 1 — otherwise extreme decay + high bass multiplier make the low
+            // below 1 - otherwise extreme decay + high bass multiplier make the low
             // end self-sustain (a non-decaying drone) instead of ringing out.
             bassRatio_[d] = gBass / (gMid + T(1e-10));
             const T maxBassRatio = T(0.98) / std::max(gMid, T(1e-6));
@@ -1552,7 +1630,7 @@ protected:
         bassLPCoeff_ = T(1) - std::exp(T(-6.283185307179586) * bassCut / sr);
     }
 
-    void updateDelayLengths()
+    void updateDelayLengths() noexcept
     {
         double sr = spec_.sampleRate;
         // Nonlinear size mapping: size=0 -> 0.35, size=1 -> 1.0
@@ -1593,12 +1671,12 @@ protected:
                 static_cast<int>(kOutDiffDelaysMsR_[s] * sr / 1000.0)));
         }
 
-        // Parallel allpass diffuser — step 1 delays
+        // Parallel allpass diffuser - step 1 delays
         for (int d = 0; d < kFDNSize; ++d)
             parAPDelays_[d] = nearestPrime(std::max(1,
                 static_cast<int>(kParAPDelaysMs_[d] * sr / 1000.0)));
 
-        // Multi-channel diffuser — step 2 delays
+        // Multi-channel diffuser - step 2 delays
         for (int d = 0; d < kFDNSize; ++d)
             diffuserStep2Delays_[d] = nearestPrime(std::max(1,
                 static_cast<int>(kDiffuserStep2Ms_[d] * sr / 1000.0)));
@@ -1695,10 +1773,10 @@ protected:
 
     // Sieve of Eratosthenes up to kPrimeTableMax, computed once the first
     // time `nearestPrime` is called. Keeps parameter-update calls cheap
-    // (previously O(sqrt(n)) per lookup × ~20 calls per update). For
-    // `n >= kPrimeTableMax` we fall back to the original trial division —
+    // (previously O(sqrt(n)) per lookup x ~20 calls per update). For
+    // `n >= kPrimeTableMax` we fall back to the original trial division -
     // that branch is only reached at extreme sample rates / reverb sizes (M4).
-    static constexpr int kPrimeTableMax = 131072;  // 2^17 — covers up to ~2.7 s @48kHz
+    static constexpr int kPrimeTableMax = 131072;  // 2^17 - covers up to ~2.7 s @48kHz
 
     static const std::vector<uint8_t>& getPrimeSieve() noexcept
     {

@@ -255,6 +255,26 @@ public:
         setGain(gainDb);
     }
 
+    /**
+     * @brief Selects the Orfanidis matched (de-cramped) design for Peak bells.
+     *
+     * Bilinear bells cramp near Nyquist; the matched design prescribes the
+     * analog prototype's Nyquist gain so high bells keep their analog shape.
+     * Off by default (bit-compatible with previous output). Thread-safe.
+     * Not serialized by getState()/setState(); owners that persist it must
+     * re-apply it on restore (Equalizer does).
+     */
+    void setMatchedPeak(bool enabled) noexcept
+    {
+        matchedPeak_.store(enabled, std::memory_order_relaxed);
+    }
+
+    /** @brief Returns whether Peak bells use the matched (de-cramped) design. */
+    [[nodiscard]] bool isMatchedPeak() const noexcept
+    {
+        return matchedPeak_.load(std::memory_order_relaxed);
+    }
+
     /** @brief Returns the active filter shape. */
     [[nodiscard]] Shape getShape() const noexcept { return shape_.load(std::memory_order_relaxed); }
 
@@ -437,12 +457,13 @@ public:
                 // nothing changed since the last block (the common case).
                 const Shape sh = shape_.load(std::memory_order_relaxed);
                 const int sdb  = slopeDb_.load(std::memory_order_relaxed);
+                const bool mp  = matchedPeak_.load(std::memory_order_relaxed);
                 if (f != lastFreq_ || q != lastQ_ || g != lastGain_ ||
-                    sh != lastShape_ || sdb != lastSlopeDb_)
+                    sh != lastShape_ || sdb != lastSlopeDb_ || mp != lastMatched_)
                 {
                     updateCoefficients(f, q, g);
                     lastFreq_ = f; lastQ_ = q; lastGain_ = g;
-                    lastShape_ = sh; lastSlopeDb_ = sdb;
+                    lastShape_ = sh; lastSlopeDb_ = sdb; lastMatched_ = mp;
                 }
 
                 const int ns = numStages_.load(std::memory_order_relaxed);
@@ -516,7 +537,9 @@ public:
 
     /**
      * @brief Processes a single sample without parameter smoothing or coefficient updates.
-     * @warning Must only be used when parameter changes are managed externally.
+     * @warning Must only be used when parameter changes are managed externally:
+     *          call applyParametersNow() after changing parameters, or rely on
+     *          processBlock() to consume them (it smooths).
      * @param input Input sample value.
      * @param channel Index of the audio channel being processed. Out-of-range
      *                channels return the input unprocessed (the per-channel
@@ -531,6 +554,37 @@ public:
         for (int s = 0; s < ns; ++s)
             sample = stages_[s].processSample(sample, channel);
         return sample;
+    }
+
+    /**
+     * @brief Applies pending parameter targets immediately and rebuilds the
+     *        coefficients (no smoothing: values jump).
+     *
+     * For per-sample workflows where processBlock() never runs, so the atomic
+     * parameter targets would otherwise never reach the biquad stages.
+     * Owner (audio) thread only, like processSample().
+     */
+    void applyParametersNow() noexcept
+    {
+        freqSmoother_.setTargetValue(targetFreq_.load(std::memory_order_relaxed));
+        resSmoother_.setTargetValue(targetRes_.load(std::memory_order_relaxed));
+        gainSmoother_.setTargetValue(targetGain_.load(std::memory_order_relaxed));
+        freqSmoother_.skip();
+        resSmoother_.skip();
+        gainSmoother_.skip();
+
+        float f = freqSmoother_.getCurrentValue();
+        float q = resSmoother_.getCurrentValue();
+        float g = gainSmoother_.getCurrentValue();
+        const float nyquist = static_cast<float>(spec_.sampleRate) * 0.499f;
+        f = std::clamp(f, 10.0f, nyquist);
+        q = std::max(q, 0.1f);
+
+        updateCoefficients(f, q, g);
+        lastFreq_ = f; lastQ_ = q; lastGain_ = g;
+        lastShape_ = shape_.load(std::memory_order_relaxed);
+        lastSlopeDb_ = slopeDb_.load(std::memory_order_relaxed);
+        lastMatched_ = matchedPeak_.load(std::memory_order_relaxed);
     }
 
 
@@ -673,7 +727,11 @@ protected:
                 case Shape::LowPass:   c = BiquadCoeffs<T>::makeLowPass(sr, f, stageQ);  break;
                 case Shape::HighPass:  c = BiquadCoeffs<T>::makeHighPass(sr, f, stageQ); break;
                 case Shape::BandPass:  c = BiquadCoeffs<T>::makeBandPass(sr, f, stageQ); break;
-                case Shape::Peak:      c = BiquadCoeffs<T>::makePeak(sr, f, stageQ, gainDb); break;
+                case Shape::Peak:
+                    c = matchedPeak_.load(std::memory_order_relaxed)
+                        ? BiquadCoeffs<T>::makePeakMatched(sr, f, stageQ, gainDb)
+                        : BiquadCoeffs<T>::makePeak(sr, f, stageQ, gainDb);
+                    break;
                 case Shape::LowShelf:  c = BiquadCoeffs<T>::makeLowShelf(sr, f, gainDb, ssl); break;
                 case Shape::HighShelf: c = BiquadCoeffs<T>::makeHighShelf(sr, f, gainDb, ssl); break;
                 case Shape::Notch:     c = BiquadCoeffs<T>::makeNotch(sr, f, stageQ);  break;
@@ -694,6 +752,7 @@ protected:
     std::atomic<int> numStages_ { 1 };
     std::atomic<int> slopeDb_ { 12 };
     std::atomic<float> shelfSlope_ { 1.0f };
+    std::atomic<bool> matchedPeak_ { false };
 
     std::array<Biquad<T, MaxChannels>, kMaxStages> stages_ {};
 
@@ -719,6 +778,7 @@ protected:
     float lastGain_ = -1e9f;
     Shape lastShape_ = Shape::LowPass;
     int lastSlopeDb_ = -1;
+    bool lastMatched_ = false;
 };
 
 } // namespace dspark

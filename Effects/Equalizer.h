@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -7,11 +7,21 @@
  * @file Equalizer.h
  * @brief Multi-band parametric equalizer with Minimum and Linear Phase modes.
  *
- * Combines multiple FilterEngine instances into a single processor. Supports up to 
- * MaxBands simultaneous filter bands. Completely thread-safe, lock-free parameter 
- * updates, and zero memory allocations in the audio thread.
+ * Combines multiple FilterEngine instances into a single processor. Supports up
+ * to MaxBands simultaneous filter bands. Lock-free parameter updates and zero
+ * memory allocations in the audio thread (the linear-phase engine, including
+ * its recompute scratch, is fully pre-allocated in prepare()).
  *
- * Dependencies: Filters.h (FilterEngine), FFT.h, Biquad.h, AudioSpec.h, AudioBuffer.h.
+ * Threading: prepare() belongs to the setup thread (allocates; never call it
+ * concurrently with processing). processBlock()/processSample()/reset() belong
+ * to the audio thread. Setters are atomic publications consumed at the next
+ * block (or next processSample() call); band configs follow the single-writer
+ * pattern (one control thread). Non-finite band fields are replaced with the
+ * band's current values. getMagnitudeForFrequencyArray() and getBandConfig()
+ * are unsynchronized analysis/UI reads.
+ *
+ * Dependencies: Filters.h (FilterEngine), AudioSpec.h, AudioBuffer.h,
+ *               Biquad.h, DenormalGuard.h, DspMath.h, FFT.h, StateBlob.h.
  */
 
 #include "Filters.h"
@@ -23,12 +33,15 @@
 #include "../Core/FFT.h"
 #include "../Core/StateBlob.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <vector>
-#include <algorithm>
 
 namespace dspark {
 
@@ -84,57 +97,77 @@ public:
     /**
      * @brief Prepares all bands and allocates necessary resources for processing.
      *
-     * Must be called from the host's prepareToPlay/setup method. 
-     * Performs all memory allocations.
+     * Must be called from the host's prepareToPlay/setup method. Performs all
+     * memory allocations, including the linear-phase engine, so
+     * setFilterMode(LinearPhase) works even when called after prepare().
+     * An invalid spec (non-positive or non-finite fields) is a no-op that
+     * keeps the previous state.
      *
      * @param spec Audio environment (sample rate, max block size, channels).
      */
     void prepare(const AudioSpec& spec)
     {
+        if (!spec.isValid()) return; // release-safe: keep previous state
+
         spec_ = spec;
         for (int i = 0; i < MaxBands; ++i)
             bands_[i].prepare(spec);
 
-        if (filterMode_.load(std::memory_order_relaxed) == FilterMode::LinearPhase && spec.maxBlockSize > 0)
+        // Rebuild the linear-phase engine. lpFft_ gates the LP audio path, so
+        // it is torn down first and re-created last (basic guarantee if an
+        // allocation throws mid-way).
+        lpFft_.reset();
+        lpBlock_ = spec.maxBlockSize;
+
+        // The FFT size is 4x the block size; cap it so the pow2 round-up can
+        // never overflow int with an absurd host block size (LP mode is then
+        // unavailable and getLatency() honestly reports 0).
+        if (lpBlock_ > kLpMaxBlockSize)
         {
-            // Overlap-save requires FFT size N >= L + M - 1
-            // Where L is maxBlockSize, M is impulse response length.
-            // We use M = 2 * L, so N must be >= 3 * L. We round up to next power of 2.
-            int targetFftSize = spec.maxBlockSize * 4;
-            int fftPow2 = 1;
-            while (fftPow2 < targetFftSize) fftPow2 <<= 1;
-            lpFftSize_ = fftPow2;
-
-            lpFft_ = std::make_unique<FFTReal<T>>(lpFftSize_);
-            
-            // Complex kernel representation (Real, Imaginary interleaved)
-            lpKernel_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
-            
-            // Overlap-save needs (M-1) samples of history where M = 2*maxBlockSize
-            // is the FIR kernel length. Size the history buffer accordingly.
-            lpPrevBlock_.resize(static_cast<size_t>(spec.numChannels));
-            for (auto& pb : lpPrevBlock_)
-                pb.assign(static_cast<size_t>(spec.maxBlockSize * 2), T(0));
-                
-            lpFftIn_.assign(static_cast<size_t>(lpFftSize_), T(0));
-            lpFftOut_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
-
-            // Pre-allocate recompute scratch so a live band change never allocates on
-            // the audio thread (recomputeLinearPhaseKernel runs there via processBlock).
-            lpMagScratch_.assign(static_cast<size_t>(lpFftSize_ / 2 + 1), T(1));
-            lpTempFreq_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
-            lpImpulse_.assign(static_cast<size_t>(lpFftSize_), T(0));
-            lpKernelSpace_.assign(static_cast<size_t>(lpFftSize_), T(0));
-
-            lpDirty_.store(true, std::memory_order_release);
+            lpBlock_ = 0;
+            lpFftSize_ = 0;
+            return;
         }
+
+        // Overlap-save requires FFT size N >= L + M - 1
+        // Where L is maxBlockSize, M is impulse response length.
+        // We use M = 2 * L, so N must be >= 3 * L. We round up to next power of 2.
+        int targetFftSize = lpBlock_ * 4;
+        int fftPow2 = 1;
+        while (fftPow2 < targetFftSize) fftPow2 <<= 1;
+        lpFftSize_ = fftPow2;
+
+        // Complex kernel representation (Real, Imaginary interleaved)
+        lpKernel_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
+
+        // Overlap-save needs (M-1) samples of history where M = 2*maxBlockSize
+        // is the FIR kernel length. Size the history buffer accordingly.
+        lpPrevBlock_.resize(static_cast<size_t>(spec.numChannels));
+        for (auto& pb : lpPrevBlock_)
+            pb.assign(static_cast<size_t>(lpBlock_ * 2), T(0));
+
+        lpFftIn_.assign(static_cast<size_t>(lpFftSize_), T(0));
+        lpFftOut_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
+
+        // Pre-allocate recompute scratch so a live band change never allocates on
+        // the audio thread (recomputeLinearPhaseKernel runs there via processBlock).
+        lpMagScratch_.assign(static_cast<size_t>(lpFftSize_ / 2 + 1), T(1));
+        lpTempFreq_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
+        lpImpulse_.assign(static_cast<size_t>(lpFftSize_), T(0));
+        lpKernelSpace_.assign(static_cast<size_t>(lpFftSize_), T(0));
+
+        lpDirty_.store(true, std::memory_order_release);
+        lpFft_ = std::make_unique<FFTReal<T>>(lpFftSize_); // gate opens last
     }
 
     /**
      * @brief Processes an audio buffer in-place.
-     * 
-     * Guarantees zero allocations and uses SIMD-friendly contiguous arrays.
-     * Checks atomic flags lock-free to update DSP state if the host changed parameters.
+     *
+     * Guarantees zero allocations. Checks atomic flags lock-free to update DSP
+     * state if the host changed parameters. In LinearPhase mode a pending band
+     * change recomputes the FIR kernel on this thread (a bounded, allocation-
+     * free spike); switching modes changes getLatency(), so notify the host
+     * and consider reset() to clear the other path's tail.
      *
      * @param buffer Audio data to process.
      */
@@ -154,10 +187,9 @@ public:
         if (currentMode == FilterMode::LinearPhase && lpFft_)
         {
             // If kernel needs recalculation, do it once.
-            // In a production environment, this should ideally be deferred to a background thread.
             if (lpDirty_.exchange(false, std::memory_order_acquire))
                 recomputeLinearPhaseKernel();
-                
+
             processLinearPhase(buffer);
             return;
         }
@@ -174,15 +206,31 @@ public:
     /**
      * @brief Processes a single sample through all enabled bands (IIR mode only).
      *
+     * Pending band changes are consumed here too (applied immediately, without
+     * the block path's parameter smoothing), so per-sample streams that never
+     * call processBlock() still pick up setBand() and friends.
+     *
      * @param input   Input sample.
-     * @param channel Channel index.
+     * @param channel Channel index (out-of-range channels pass through).
      * @return EQ'd output sample.
      */
     [[nodiscard]] T processSample(T input, int channel) noexcept
     {
+        // Plain load first: the exchange RMW is only paid when a publication
+        // is actually pending (this runs per sample).
+        if (configDirty_.load(std::memory_order_acquire)
+            && configDirty_.exchange(false, std::memory_order_acquire))
+        {
+            updateActiveFilters();
+            const int n = numBands_.load(std::memory_order_relaxed);
+            for (int i = 0; i < n; ++i)
+                bands_[i].applyParametersNow();
+            lpDirty_.store(true, std::memory_order_release);
+        }
+
         T sample = input;
         const int activeBands = numBands_.load(std::memory_order_relaxed);
-        
+
         for (int i = 0; i < activeBands; ++i)
         {
             if (bandEnabled_[i].load(std::memory_order_relaxed))
@@ -191,14 +239,14 @@ public:
         return sample;
     }
 
-    /** 
-     * @brief Resets all filter states to zero to prevent ringing on playback start. 
+    /**
+     * @brief Resets all filter states to zero to prevent ringing on playback start.
      */
     void reset() noexcept
     {
         for (int i = 0; i < MaxBands; ++i)
             bands_[i].reset();
-            
+
         for (auto& pb : lpPrevBlock_)
             std::fill(pb.begin(), pb.end(), T(0));
     }
@@ -237,6 +285,11 @@ public:
 
     /**
      * @brief Configures a band with full control over all parameters. Thread-safe.
+     *
+     * Non-finite frequency/gain/Q fields fall back to the band's current
+     * values (they would otherwise poison the serialized state, the analysis
+     * curve, and the linear-phase kernel); wild type/slope values clamp.
+     *
      * @param index  Band index.
      * @param config Complete band configuration.
      */
@@ -244,8 +297,17 @@ public:
     {
         if (index < 0 || index >= MaxBands) return;
 
-        configs_[index] = config;
-        bandEnabled_[index].store(config.enabled, std::memory_order_release);
+        BandConfig cfg = config;
+        const BandConfig& prev = configs_[index];
+        if (!std::isfinite(cfg.frequency)) cfg.frequency = prev.frequency;
+        if (!std::isfinite(cfg.gain))      cfg.gain      = prev.gain;
+        if (!std::isfinite(cfg.q))         cfg.q         = prev.q;
+        cfg.type = static_cast<BandType>(std::clamp(static_cast<int>(cfg.type), 0,
+                                                    static_cast<int>(BandType::Tilt)));
+        cfg.slope = std::clamp(cfg.slope, 6, 48);
+
+        configs_[index] = cfg;
+        bandEnabled_[index].store(cfg.enabled, std::memory_order_release);
 
         int currentBands = numBands_.load(std::memory_order_relaxed);
         if (index >= currentBands)
@@ -296,8 +358,10 @@ public:
      *
      * Bilinear bells cramp near Nyquist (narrower, response pinned at fs/2);
      * the matched design prescribes the analog prototype's Nyquist gain so
-     * high bells keep their analog shape — the state-of-the-art digital EQ
-     * behaviour. Off by default for bit-compatibility with previous output.
+     * high bells keep their analog shape, the state-of-the-art digital EQ
+     * behaviour. Applies to the IIR engines, the linear-phase kernel, and the
+     * analysis curve alike. Off by default for bit-compatibility with
+     * previous output.
      */
     void setMatchedBells(bool enabled) noexcept
     {
@@ -333,29 +397,39 @@ public:
 
     /**
      * @brief Sets the filter processing mode (Minimum Phase or Linear Phase).
+     *
+     * Works before or after prepare() (the linear-phase engine is always
+     * pre-allocated by prepare()). Wild enum values clamp. Switching modes
+     * changes getLatency(): hosts must be notified.
+     *
      * @param mode Filter mode.
      */
     void setFilterMode(FilterMode mode) noexcept
     {
-        filterMode_.store(mode, std::memory_order_release);
-        if (mode == FilterMode::LinearPhase)
+        const int m = std::clamp(static_cast<int>(mode), 0,
+                                 static_cast<int>(FilterMode::LinearPhase));
+        filterMode_.store(static_cast<FilterMode>(m), std::memory_order_release);
+        if (static_cast<FilterMode>(m) == FilterMode::LinearPhase)
             lpDirty_.store(true, std::memory_order_release);
     }
 
     /** @brief Returns the current filter mode. */
-    [[nodiscard]] FilterMode getFilterMode() const noexcept 
-    { 
-        return filterMode_.load(std::memory_order_relaxed); 
+    [[nodiscard]] FilterMode getFilterMode() const noexcept
+    {
+        return filterMode_.load(std::memory_order_relaxed);
     }
 
     /**
      * @brief Returns the latency in samples.
-     * @return 0 for MinimumPhase, maxBlockSize for LinearPhase.
+     *
+     * 0 for MinimumPhase; the prepared max block size for LinearPhase. Reports
+     * 0 when the linear-phase engine is unavailable (not prepared yet), so the
+     * value always matches the path that actually runs.
      */
     [[nodiscard]] int getLatency() const noexcept
     {
-        return (filterMode_.load(std::memory_order_relaxed) == FilterMode::LinearPhase) 
-                ? spec_.maxBlockSize : 0;
+        return (filterMode_.load(std::memory_order_relaxed) == FilterMode::LinearPhase && lpFft_)
+                ? lpBlock_ : 0;
     }
 
     /**
@@ -377,6 +451,10 @@ public:
     /**
      * @brief Computes the combined magnitude response of all enabled bands.
      *
+     * Evaluates the same per-stage cascade the audio path applies (including
+     * soft mode's Q cap and the matched-bell design), so the drawn curve
+     * matches what is heard in both filter modes.
+     *
      * @param frequencies   Array of frequencies in Hz.
      * @param magnitudes    Output array (same size, linear scale).
      * @param numPoints     Number of frequency points.
@@ -391,9 +469,6 @@ public:
         {
             if (!configs_[b].enabled) continue;
 
-            // Evaluate the TRUE per-stage cascade (built once per band) — the old
-            // code used a single-Q biquad with `mag *= mag` (which squares the
-            // exponent each step instead of incrementing it).
             BiquadCoeffs<T> st[5];
             const int ns = buildBandStages(configs_[b], st);
 
@@ -425,6 +500,8 @@ public:
         const int n = numBands_.load(std::memory_order_relaxed);
         w.write("numBands", n);
         w.write("matchedBells", matchedBells_.load(std::memory_order_relaxed));
+        w.write("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)));
+        w.write("softMode", softMode_.load(std::memory_order_relaxed));
         char key[24];
         for (int i = 0; i < n; ++i)
         {
@@ -445,13 +522,17 @@ public:
         return w.blob();
     }
 
-    /** @brief Restores bands from a blob (tolerant; rejects foreign ids). */
+    /** @brief Restores bands and modes from a blob (tolerant; rejects foreign ids). */
     bool setState(const uint8_t* data, size_t size)
     {
         StateReader r(data, size);
         if (!r.isValid() || r.processorId() != stateId("PEQZ")) return false;
         const int n = std::clamp(r.read("numBands", 0), 0, MaxBands);
         setMatchedBells(r.read("matchedBells", false));
+        // Older blobs carry no mode keys: keep the instance's current modes.
+        setFilterMode(static_cast<FilterMode>(
+            r.read("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)))));
+        setSoftMode(r.read("softMode", softMode_.load(std::memory_order_relaxed)));
         char key[24];
         for (int i = 0; i < n; ++i)
         {
@@ -478,12 +559,27 @@ public:
 protected:
 
     /**
+     * @brief The band Q the audio path actually uses (soft mode caps it by gain).
+     */
+    [[nodiscard]] T effectiveQ(const BandConfig& cfg) const noexcept
+    {
+        T q = cfg.q;
+        if (softMode_.load(std::memory_order_relaxed))
+        {
+            const T absGain = std::abs(cfg.gain);
+            const T maxQ = T(1) + T(8) / (absGain + T(1));
+            q = std::min(q, maxQ);
+        }
+        return q;
+    }
+
+    /**
      * @brief Translates BandConfigs into internal FilterEngine parameters safely.
      * Called by processBlock when configDirty_ is true.
      */
     void updateActiveFilters() noexcept
     {
-        bool soft = softMode_.load(std::memory_order_relaxed);
+        const bool matched = matchedBells_.load(std::memory_order_relaxed);
         int activeBands = numBands_.load(std::memory_order_relaxed);
 
         for (int i = 0; i < activeBands; ++i)
@@ -493,15 +589,9 @@ protected:
 
             float freq = static_cast<float>(cfg.frequency);
             float gain = static_cast<float>(cfg.gain);
-            float q    = static_cast<float>(cfg.q);
+            float q    = static_cast<float>(effectiveQ(cfg));
 
-            if (soft)
-            {
-                float absGain = std::abs(gain);
-                float maxQ = 1.0f + 8.0f / (absGain + 1.0f);
-                q = std::min(q, maxQ);
-            }
-
+            filter.setMatchedPeak(matched);
             switch (cfg.type)
             {
                 case BandType::Peak:      filter.setPeaking(freq, gain, q); break;
@@ -522,11 +612,6 @@ protected:
     }
 
     /**
-     * @brief Computes raw biquad coefficients for magnitude analysis.
-     * @param cfg Band configuration.
-     * @return BiquadCoeffs structure.
-     */
-    /**
      * @brief Converts a user-facing shelf Q into the RBJ shelf slope S.
      *
      * RBJ relation: 1/Q^2 = (A + 1/A) * (1/S - 1) + 2 with A = 10^(dB/40).
@@ -543,6 +628,11 @@ protected:
         return std::clamp(1.0 / invS, 0.0001, 1.0);
     }
 
+    /**
+     * @brief Computes single-biquad coefficients for a band (analysis/kernel).
+     * @param cfg Band configuration (its q must already be the effective one).
+     * @return BiquadCoeffs structure.
+     */
     [[nodiscard]] BiquadCoeffs<T> computeBandCoeffs(const BandConfig& cfg) const noexcept
     {
         double sr = spec_.sampleRate;
@@ -572,33 +662,41 @@ public:
      * @brief Fills `stages` with the ACTUAL biquad cascade for a band (per-stage
      * Butterworth Q for multi-stage LP/HP, single biquad otherwise) and returns
      * the stage count. Public analysis API: UIs use it to draw a magnitude
-     * response that matches what the IIR FilterEngine really applies
-     * (instead of a single-Q^N approximation). Requires prepare().
+     * response that matches what the IIR FilterEngine really applies,
+     * including the user's resonance on LP/HP cascades, soft mode's Q cap and
+     * the matched-bell design. Mirrors the engine's own parameter
+     * sanitization (frequency and Q floors). Requires prepare().
      * @param stages Output buffer (capacity >= 5).
      */
     [[nodiscard]] int buildBandStages(const BandConfig& cfg, BiquadCoeffs<T>* stages) const noexcept
     {
         const double sr = spec_.sampleRate;
-        const double f  = static_cast<double>(cfg.frequency);
+        // Mirror the FilterEngine's own clamps so the analysis matches the audio.
+        const double f = std::clamp(static_cast<double>(cfg.frequency), 10.0, sr * 0.499);
+        const T q = std::max(effectiveQ(cfg), T(0.1));
 
         if (cfg.type == BandType::LowPass || cfg.type == BandType::HighPass)
         {
             const bool lp = (cfg.type == BandType::LowPass);
-            auto casc = FilterEngine<T>::cascadeForSlope(cfg.slope);
+            // The user Q scales the final cascade stage exactly like the engine.
+            auto casc = FilterEngine<T>::cascadeForSlope(cfg.slope, static_cast<float>(q));
             int n = 0;
             if (casc.hasFirstOrder)
                 stages[n++] = lp ? BiquadCoeffs<T>::makeFirstOrderLowPass(sr, f)
                                  : BiquadCoeffs<T>::makeFirstOrderHighPass(sr, f);
             for (int s = 0; s < casc.numSecondOrder; ++s)
             {
-                const double q = static_cast<double>(casc.qValues[s]);
-                stages[n++] = lp ? BiquadCoeffs<T>::makeLowPass(sr, f, q)
-                                 : BiquadCoeffs<T>::makeHighPass(sr, f, q);
+                const double stageQ = static_cast<double>(casc.qValues[s]);
+                stages[n++] = lp ? BiquadCoeffs<T>::makeLowPass(sr, f, stageQ)
+                                 : BiquadCoeffs<T>::makeHighPass(sr, f, stageQ);
             }
             return n;
         }
 
-        stages[0] = computeBandCoeffs(cfg);
+        BandConfig eff = cfg;
+        eff.frequency = static_cast<T>(f);
+        eff.q = q;
+        stages[0] = computeBandCoeffs(eff);
         return 1;
     }
 
@@ -607,8 +705,8 @@ protected:
      * @brief Mathematically robust Linear Phase kernel computation.
      *
      * Constructs a true zero-phase impulse response by evaluating the H(k)
-     * magnitude, performing IFFT, shifting by M/2 to make it causal, 
-     * windowing it with Blackman-Harris to reduce truncation artifacts, 
+     * magnitude, performing IFFT, shifting by M/2 to make it causal,
+     * windowing it with Blackman-Harris to reduce truncation artifacts,
      * zero-padding to N, and converting back to FFT for overlap-save.
      */
     void recomputeLinearPhaseKernel() noexcept
@@ -650,7 +748,7 @@ protected:
         lpFft_->inverse(lpTempFreq_.data(), lpImpulse_.data());
 
         // 4. Shift, Windowing and Zero-pad for Overlap-Save
-        const int M = spec_.maxBlockSize * 2; // Desired Kernel length
+        const int M = lpBlock_ * 2; // Desired Kernel length
         const int halfM = M / 2;
         std::fill(lpKernelSpace_.begin(), lpKernelSpace_.end(), T(0)); // zero-pad scratch
 
@@ -669,7 +767,7 @@ protected:
             // No extra scaling: FFTReal::inverse already applies the full 1/N
             // normalisation (verified by exact round-trip). The previous extra
             // division by lpFftSize_ attenuated the whole linear-phase path by
-            // 20*log10(N) dB — about -60 dB with the default sizes.
+            // 20*log10(N) dB - about -60 dB with the default sizes.
             lpKernelSpace_[i] = lpImpulse_[readIdx] * static_cast<T>(window);
         }
 
@@ -678,19 +776,24 @@ protected:
     }
 
     /**
-     * @brief Linear-phase processing via mathematically correct overlap-save FFT convolution.
+     * @brief Linear-phase processing via overlap-save FFT convolution.
+     *
+     * Blocks larger than the prepared max block size pass through unprocessed
+     * (the engine's buffers are sized in prepare(); hosts honour maxBlockSize).
+     *
      * @param buffer Audio buffer.
      */
     void processLinearPhase(AudioBufferView<T> buffer) noexcept
     {
-        // Safety bound check: Prevent out-of-bounds if host pushes dynamic channel counts
+        // Safety bound check: Prevent out-of-bounds if host pushes dynamic channel
+        // counts. Channels beyond the prepared count pass through untouched.
         const int nCh = std::min(buffer.getNumChannels(), static_cast<int>(lpPrevBlock_.size()));
         const int L   = buffer.getNumSamples();
         const int N   = lpFftSize_;
-        const int M   = spec_.maxBlockSize * 2; // Kernel length
+        const int M   = lpBlock_ * 2; // Kernel length
 
         // Safety check: block size cannot exceed pre-allocated maxBlockSize
-        if (L > spec_.maxBlockSize) return; 
+        if (L > lpBlock_) return;
 
         const int overlapSize = M - 1;  // FIR history overlap-save needs (kernel len - 1)
 
@@ -718,7 +821,7 @@ protected:
             // 3. Forward FFT
             lpFft_->forward(lpFftIn_.data(), lpFftOut_.data());
 
-            // 3. Complex multiplication: H(k) * X(k)
+            // 4. Complex multiplication: H(k) * X(k)
             int numBins = N / 2 + 1;
             for (int k = 0; k < numBins; ++k)
             {
@@ -731,18 +834,22 @@ protected:
                 lpFftOut_[2 * k + 1] = realX * imagH + imagX * realH;
             }
 
-            // 4. Inverse FFT
+            // 5. Inverse FFT
             lpFft_->inverse(lpFftOut_.data(), lpFftIn_.data()); // Reusing lpFftIn_ to save memory
 
-            // 5. Overlap-save output extraction: valid data starts at index M - 1
+            // 6. Overlap-save output extraction: valid data starts at index M - 1
             int offset = M - 1;
             for (int i = 0; i < L; ++i)
             {
                 // Assign filtered output back to the channel
-                channelData[i] = lpFftIn_[offset + i]; 
+                channelData[i] = lpFftIn_[offset + i];
             }
         }
     }
+
+    // The pow2 round-up computes lpBlock_ * 4: cap the block size so that can
+    // never overflow int (hosts never get close; LP mode disables above it).
+    static constexpr int kLpMaxBlockSize = 1 << 18;
 
     AudioSpec spec_ {};
     std::atomic<int> numBands_ { 0 };
@@ -764,7 +871,8 @@ protected:
 
     std::unique_ptr<FFTReal<T>> lpFft_;
     int lpFftSize_ = 0;
-    
+    int lpBlock_ = 0; ///< Max block size the LP engine was sized for (= its latency).
+
     std::vector<T> lpKernel_;
     std::vector<std::vector<T>> lpPrevBlock_;
     std::vector<T> lpFftIn_, lpFftOut_;

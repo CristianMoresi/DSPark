@@ -195,11 +195,17 @@ public:
      * @param numOutputBands Number of output bands (must match getNumBands();
      *                       fewer bands re-purpose the first splits only in
      *                       IIR mode and is not a supported configuration).
+     * @return The number of bands actually written THIS block (0 when nothing
+     *         was written: unprepared, degenerate span, or null outputs).
+     *         Callers that sum the bands back together should trust this value
+     *         rather than a separately read getNumBands(): the band count is
+     *         an atomic that a concurrent setNumBands() may move between the
+     *         two reads, and views beyond the returned count are untouched.
      */
-    void processBlock(AudioBufferView<T> input,
-                      AudioBufferView<T>* bandOutputs, int numOutputBands) noexcept
+    int processBlock(AudioBufferView<T> input,
+                     AudioBufferView<T>* bandOutputs, int numOutputBands) noexcept
     {
-        if (!prepared_ || bandOutputs == nullptr) return;
+        if (!prepared_ || bandOutputs == nullptr) return 0;
 
         const FilterMode mode = filterMode_.load(std::memory_order_relaxed);
         const bool lpActive = (mode == FilterMode::LinearPhase) && lpFft_ != nullptr;
@@ -236,14 +242,14 @@ public:
         }
 
         const int n = std::min(numOutputBands, numBands_.load(std::memory_order_relaxed));
-        if (n < 2) return;
+        if (n < 2) return 0;
 
         // Defensive span clamp: never index past the prepared work buffers
         // (fixed maxBlockSize stride) or past any output view.
         int nS = std::min(input.getNumSamples(), spec_.maxBlockSize);
         for (int b = 0; b < n; ++b)
             nS = std::min(nS, bandOutputs[b].getNumSamples());
-        if (nS <= 0) return;
+        if (nS <= 0) return 0;
 
         if (lpActive)
             processLinearPhase(input, bandOutputs, n, nS);
@@ -251,6 +257,7 @@ public:
             processIIR(input, bandOutputs, n, nS);
 
         passExtraChannels(input, bandOutputs, n, nS);
+        return n;
     }
 
     // -- Configuration -------------------------------------------------------

@@ -758,28 +758,30 @@ public:
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
         StateWriter w(stateId("COMP"), 1);
-        w.write("threshold", threshold_.load(std::memory_order_relaxed));
-        w.write("ratio", ratio_.load(std::memory_order_relaxed));
-        w.write("attack", attackMs_.load(std::memory_order_relaxed));
-        w.write("release", releaseMs_.load(std::memory_order_relaxed));
-        w.write("knee", kneeWidth_.load(std::memory_order_relaxed));
-        w.write("makeup", makeupGain_.load(std::memory_order_relaxed));
+        // Explicit float casts: the blob stores float, and with T = double the
+        // unqualified write(key, double) would be ambiguous (float/int32/bool).
+        w.write("threshold", static_cast<float>(threshold_.load(std::memory_order_relaxed)));
+        w.write("ratio", static_cast<float>(ratio_.load(std::memory_order_relaxed)));
+        w.write("attack", static_cast<float>(attackMs_.load(std::memory_order_relaxed)));
+        w.write("release", static_cast<float>(releaseMs_.load(std::memory_order_relaxed)));
+        w.write("knee", static_cast<float>(kneeWidth_.load(std::memory_order_relaxed)));
+        w.write("makeup", static_cast<float>(makeupGain_.load(std::memory_order_relaxed)));
         const auto amMode = autoMakeupMode_.load(std::memory_order_relaxed);
         w.write("autoMakeup", amMode != AutoMakeupMode::Off); // legacy bool key
         w.write("autoMakeupMode", static_cast<int32_t>(amMode));
-        w.write("stereoLink", stereoLink_.load(std::memory_order_relaxed));
-        w.write("mix", mix_.load(std::memory_order_relaxed));
-        w.write("lookahead", lookaheadMs_.load(std::memory_order_relaxed));
-        w.write("hold", holdMs_.load(std::memory_order_relaxed));
-        w.write("range", rangeDb_.load(std::memory_order_relaxed));
+        w.write("stereoLink", static_cast<float>(stereoLink_.load(std::memory_order_relaxed)));
+        w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
+        w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
+        w.write("hold", static_cast<float>(holdMs_.load(std::memory_order_relaxed)));
+        w.write("range", static_cast<float>(rangeDb_.load(std::memory_order_relaxed)));
         w.write("detector", static_cast<int32_t>(detectorType_.load(std::memory_order_relaxed)));
         w.write("topology", static_cast<int32_t>(topology_.load(std::memory_order_relaxed)));
         w.write("character", static_cast<int32_t>(character_.load(std::memory_order_relaxed)));
-        w.write("characterColor", characterColor_.load(std::memory_order_relaxed));
+        w.write("characterColor", static_cast<float>(characterColor_.load(std::memory_order_relaxed)));
         w.write("mode", static_cast<int32_t>(mode_.load(std::memory_order_relaxed)));
         w.write("scHpf", scHpfEnabled_.load(std::memory_order_relaxed));
-        w.write("scHpfFreq", scHpfFreq_.load(std::memory_order_relaxed));
-        w.write("rmsWindow", rmsWindowMsAtomic_.load(std::memory_order_relaxed));
+        w.write("scHpfFreq", static_cast<float>(scHpfFreq_.load(std::memory_order_relaxed)));
+        w.write("rmsWindow", static_cast<float>(rmsWindowMsAtomic_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 

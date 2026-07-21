@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -10,22 +10,30 @@
  * A professional noise gate that attenuates audio below a threshold.
  * Uses a state machine (Open/Hold/Close) with hysteresis to prevent
  * chattering. Includes an internal peak envelope detector for distortion-free
- * low-frequency tracking, and highly optimized processing paths suitable 
- * for heavy SIMD vectorization.
+ * low-frequency tracking. Thresholds are precomputed in the linear domain, so
+ * the per-sample path is branch-light and free of log/pow calls (the envelope
+ * recursion itself is serial and does not vectorize).
  *
  * Features:
- * - State machine: Open → Hold → Close (with hysteresis)
+ * - State machine: Open -> Hold -> Close (with hysteresis)
  * - True envelope peak detection (prevents audio-rate chatter)
  * - Open/close threshold hysteresis
  * - Configurable hold time before closing
  * - Range: -inf to 0 dB (allows partial attenuation)
  * - Sidechain: internal or external with optional HPF
- * - Duck mode (attenuate when above threshold — for ducking music under voice)
+ * - Duck mode (attenuate when above threshold, for ducking music under voice)
  * - Stereo linked detection
  * - Smooth attack/release transitions
- * - Linear-domain math in hot-paths for maximum CPU efficiency
+ * - Adaptive hold (holds at least one estimated signal period)
  *
- * Dependencies: DspMath.h.
+ * Threading: prepare() belongs to the setup thread; processBlock(),
+ * processSample() and reset() belong to the audio thread. All setters are
+ * lock-free atomic publications, safe from any thread; they are consumed at
+ * the start of the next block (or the next processSample() call). Non-finite
+ * setter arguments are ignored.
+ *
+ * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h,
+ *               StateBlob.h.
  *
  * @code
  *   dspark::NoiseGate<float> gate;
@@ -51,8 +59,11 @@
 #include <array>
 #include <atomic>
 #include <cmath>
-#include <memory>
+#include <cstddef>
+#include <cstdint>
 #include <numbers>
+#include <utility>
+#include <vector>
 
 namespace dspark {
 
@@ -85,13 +96,17 @@ public:
 
     /**
      * @brief Prepares the noise gate for processing.
-     * @param sampleRate Operating sample rate in Hz.
+     *
+     * Release-safe: a non-positive or non-finite sample rate makes this call
+     * a no-op (the previous state and rate are kept).
+     *
+     * @param sampleRate Operating sample rate in Hz (must be > 0).
      */
     void prepare(double sampleRate) noexcept
     {
+        if (!(sampleRate > 0.0)) return; // NaN-safe validity gate
         sampleRate_ = sampleRate;
         syncParams();
-        paramsDirty_.store(false, std::memory_order_relaxed);
         reset();
     }
 
@@ -99,11 +114,16 @@ public:
      * @brief Prepares from AudioSpec (unified API).
      * @param spec AudioSpec containing format details.
      */
-    void prepare(const AudioSpec& spec) { prepare(spec.sampleRate); }
+    void prepare(const AudioSpec& spec) noexcept { prepare(spec.sampleRate); }
 
     /**
-     * @brief Processes an AudioBufferView in-place with SIMD hints.
-     * @param buffer Audio buffer (mono or stereo).
+     * @brief Processes an AudioBufferView in-place.
+     *
+     * Detection is linked across ALL channels (peak), so no channel is left
+     * ungated. In Frequency mode, channels beyond kMaxChannels fall back to
+     * amplitude gating (per-channel filter state is kept for the first two).
+     *
+     * @param buffer Audio buffer (mono or multi-channel).
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
@@ -118,20 +138,24 @@ public:
 
         for (int i = 0; i < nS; ++i)
         {
-            // Stereo / N-channel linked detection: peak across ALL channels so no
-            // channel is left ungated (previously only the first two were processed).
-            // The sidechain HPF runs per channel BEFORE the peak link — it was
-            // silently skipped in this (most common) path before.
+            // Stereo / N-channel linked detection: peak across ALL channels.
+            // The sidechain HPF runs per channel BEFORE the peak link; channels
+            // beyond the HPF state array are detected unfiltered (sharing a
+            // filter between channels would corrupt its history).
             T level = T(0);
+            T det0 = T(0);
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T s = buffer.getChannel(ch)[i];
-                if (cachedScHpfEnabled_)
-                    s = applyScHpf(s, std::min(ch, kMaxScChannels - 1));
+                if (cachedScHpfEnabled_ && ch < kMaxScChannels)
+                    s = applyScHpf(s, ch);
+                if (ch == 0) det0 = s;
                 level = std::max(level, std::abs(s));
             }
 
-            if (cachedAdaptiveHold_) updateZeroCrossing(buffer.getChannel(0)[i]);
+            // Zero-crossing runs on the same (filtered) signal the detector
+            // sees, exactly like the per-sample path.
+            if (cachedAdaptiveHold_) updateZeroCrossing(det0);
 
             T envelope = computeEnvelopeFollower(level);
             updateStateMachine(envelope);
@@ -150,6 +174,11 @@ public:
 
     /**
      * @brief Processes audio with an external sidechain signal.
+     *
+     * Detection (including the optional HPF, the adaptive-hold zero-crossing
+     * tracker and Frequency mode) behaves exactly like the internal-key path;
+     * only the level source changes to the sidechain buffer.
+     *
      * @param audio Audio buffer to gate (modified in-place).
      * @param sidechain External sidechain signal (read-only).
      */
@@ -157,15 +186,15 @@ public:
     {
         DenormalGuard guard;
         syncParamsIfDirty();
-        
+
         const int nCh = audio.getNumChannels();
         const int nS  = audio.getNumSamples();
         const int scCh = sidechain.getNumChannels();
+        if (nCh <= 0 || nS <= 0) return;
 
-        // NOTE: no std::assume_aligned — view pointers are not guaranteed 32-byte
+        // NOTE: no std::assume_aligned - view pointers are not guaranteed 32-byte
         // aligned (sub-views / driver buffers), and assuming so is UB. __restrict
-        // still conveys no-aliasing for vectorization.
-        // Optimize for common mono/stereo sidechain topologies
+        // still conveys no-aliasing to the compiler for the mono fast path.
         if (nCh == 1 && scCh == 1)
         {
             T* __restrict outL = audio.getChannel(0);
@@ -175,24 +204,34 @@ public:
         }
         else
         {
+            const bool freqMode = (cachedGateMode_ == GateMode::Frequency);
+
             for (int i = 0; i < nS; ++i)
             {
                 T scMax = T(0);
+                T det0 = T(0);
                 for (int c = 0; c < scCh; ++c)
                 {
                     T s = sidechain.getChannel(c)[i];
-                    if (cachedScHpfEnabled_)
-                        s = applyScHpf(s, std::min(c, kMaxScChannels - 1));
+                    if (cachedScHpfEnabled_ && c < kMaxScChannels)
+                        s = applyScHpf(s, c);
+                    if (c == 0) det0 = s;
                     T a = std::abs(s);
                     if (a > scMax) scMax = a;
                 }
+
+                if (cachedAdaptiveHold_) updateZeroCrossing(det0);
 
                 T envelope = computeEnvelopeFollower(scMax);
                 updateStateMachine(envelope);
                 T gain = getCurrentGain();
 
                 for (int ch = 0; ch < nCh; ++ch)
-                    audio.getChannel(ch)[i] *= gain;
+                {
+                    T* d = audio.getChannel(ch);
+                    d[i] = (freqMode && ch < kMaxChannels) ? applyFrequencyGate(d[i], ch)
+                                                           : d[i] * gain;
+                }
             }
         }
     }
@@ -201,92 +240,111 @@ public:
 
     /**
      * @brief Sets the opening threshold.
-     * @param dB Threshold in decibels.
+     * @param dB Threshold in decibels. Non-finite values are ignored.
      */
     void setThreshold(T dB) noexcept
     {
+        if (!std::isfinite(dB)) return;
         threshold_.store(dB, std::memory_order_relaxed);
-        paramsDirty_.store(true, std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     /**
      * @brief Sets the hysteresis amount (gap between open and close thresholds).
-     * @param dB Hysteresis in decibels.
+     * @param dB Hysteresis in decibels (floored to 0). Non-finite values are ignored.
      */
     void setHysteresis(T dB) noexcept
     {
-        hysteresis_.store(std::max(dB, T(0)), std::memory_order_relaxed);
-        paramsDirty_.store(true, std::memory_order_relaxed);
+        if (!std::isfinite(dB)) return;
+        hysteresis_.store(std::max(T(0), dB), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Sets attack time in milliseconds. */
+    /** @brief Sets attack time in milliseconds. Non-finite values are ignored. */
     void setAttack(T ms) noexcept
     {
-        attackMs_.store(std::max(ms, T(0.01)), std::memory_order_relaxed);
-        paramsDirty_.store(true, std::memory_order_relaxed);
+        if (!std::isfinite(ms)) return;
+        attackMs_.store(std::max(T(0.01), ms), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Sets hold time in milliseconds. */
+    /** @brief Sets hold time in milliseconds. Non-finite values are ignored. */
     void setHold(T ms) noexcept
     {
-        holdMs_.store(std::max(ms, T(0)), std::memory_order_relaxed);
-        paramsDirty_.store(true, std::memory_order_relaxed);
+        if (!std::isfinite(ms)) return;
+        holdMs_.store(std::max(T(0), ms), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Sets release time in milliseconds. */
+    /** @brief Sets release time in milliseconds. Non-finite values are ignored. */
     void setRelease(T ms) noexcept
     {
-        releaseMs_.store(std::max(ms, T(0.01)), std::memory_order_relaxed);
-        paramsDirty_.store(true, std::memory_order_relaxed);
+        if (!std::isfinite(ms)) return;
+        releaseMs_.store(std::max(T(0.01), ms), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     /**
      * @brief Sets maximum attenuation range.
-     * @param dB Range in decibels.
+     * @param dB Range in decibels (capped at 0). Non-finite values are ignored.
      */
     void setRange(T dB) noexcept
     {
-        rangeDb_.store(std::min(dB, T(0)), std::memory_order_relaxed);
-        paramsDirty_.store(true, std::memory_order_relaxed);
+        if (!std::isfinite(dB)) return;
+        rangeDb_.store(std::min(T(0), dB), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     /** @brief Toggles ducking mode (invert gate logic). */
     void setDuckMode(bool enabled) noexcept
     {
         duckMode_.store(enabled, std::memory_order_relaxed);
-        paramsDirty_.store(true, std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Selects the processing mode (Amplitude or Frequency). */
+    /** @brief Selects the processing mode (Amplitude or Frequency; wild enum values clamp). */
     void setGateMode(GateMode mode) noexcept
     {
-        gateMode_.store(mode, std::memory_order_relaxed);
-        paramsDirty_.store(true, std::memory_order_relaxed);
+        const int m = std::clamp(static_cast<int>(mode), 0, static_cast<int>(GateMode::Frequency));
+        gateMode_.store(static_cast<GateMode>(m), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     /** @brief Toggles adaptive hold based on zero-crossing rate. */
     void setAdaptiveHold(bool enabled) noexcept
     {
         adaptiveHold_.store(enabled, std::memory_order_relaxed);
-        paramsDirty_.store(true, std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     /**
      * @brief Configures sidechain High-Pass filter.
+     *
+     * An invalid cutoff (non-finite or non-positive) keeps the previous
+     * frequency and only applies the toggle: a negative cutoff would make the
+     * one-pole coefficient exceed 1 (an unstable, runaway filter).
+     *
      * @param enabled Filter active state.
-     * @param cutoffHz Filter cutoff in Hz.
+     * @param cutoffHz Filter cutoff in Hz (clamped to [1, 0.45 * fs]).
      */
     void setSidechainHPF(bool enabled, double cutoffHz = 80.0) noexcept
     {
         scHpfEnabled_.store(enabled, std::memory_order_relaxed);
-        scHpfFreq_.store(static_cast<T>(cutoffHz), std::memory_order_relaxed);
-        paramsDirty_.store(true, std::memory_order_relaxed);
+        if (std::isfinite(cutoffHz) && cutoffHz > 0.0)
+            scHpfFreq_.store(static_cast<T>(cutoffHz), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     // -- Single Sample Processing -------------------------------------------------
 
     /**
      * @brief Processes a single mono sample.
+     *
+     * Bit-identical to processBlock() for mono streams.
+     *
+     * @note No DenormalGuard here (per-sample hot path); per-sample callers
+     *       are expected to guard their own processing loop.
+     *
      * @param input Source sample.
      * @return Gated output sample.
      */
@@ -376,14 +434,17 @@ protected:
 
     void syncParamsIfDirty() noexcept
     {
-        if (paramsDirty_.exchange(false, std::memory_order_relaxed))
+        // Plain load first: the exchange RMW is only paid when a publication
+        // is actually pending (this runs per sample in the per-sample path).
+        if (paramsDirty_.load(std::memory_order_acquire)
+            && paramsDirty_.exchange(false, std::memory_order_acquire))
             syncParams();
     }
 
     void syncParams() noexcept
     {
         T fs = static_cast<T>(sampleRate_);
-        if (fs <= T(0)) return;
+        if (!(fs > T(0))) return; // NaN-safe (prepare() already gates the rate)
 
         // Cache logical switches to prevent atomic loads in hot path
         cachedDuck_ = duckMode_.load(std::memory_order_relaxed);
@@ -404,17 +465,24 @@ protected:
         releaseCoeff_ = T(1) - std::exp(T(-1) / (fs * relMs / T(1000)));
 
         // Fixed ~2ms release for the detector envelope (prevents bass chattering)
-        detectorReleaseCoeff_ = T(1) - std::exp(T(-1) / (fs * T(0.002))); 
-        
+        detectorReleaseCoeff_ = T(1) - std::exp(T(-1) / (fs * T(0.002)));
+
         // Parameter smoothing coefficient for Frequency Mode (prevents hardcoded 0.001 dependency)
         freqSmoothCoeff_ = T(1) - std::exp(T(-1) / (fs * T(0.02))); // 20ms smoothing
 
+        // Cap the sample count in double before the cast (a cast of an
+        // out-of-int-range double is undefined behaviour).
         T hMs = std::max(holdMs_.load(std::memory_order_relaxed), T(0));
-        holdSamples_ = static_cast<int>(fs * static_cast<double>(hMs) / 1000.0);
+        holdSamples_ = static_cast<int>(std::min(fs * static_cast<double>(hMs) / 1000.0, 1.0e9));
 
-        T scFreq = scHpfFreq_.load(std::memory_order_relaxed);
-        scHpfCoeff_ = static_cast<T>(std::exp(-std::numbers::pi * 2.0 * static_cast<double>(scFreq) / fs));
-        
+        // The setter rejects invalid cutoffs; the clamp keeps the coefficient
+        // in the stable range even against a hostile in-memory value.
+        const double scFreq = std::clamp(
+            static_cast<double>(scHpfFreq_.load(std::memory_order_relaxed)),
+            1.0, sampleRate_ * 0.45);
+        scHpfCoeff_ = static_cast<T>(std::exp(-std::numbers::pi * 2.0 * scFreq / static_cast<double>(fs)));
+        scHpfA0_ = (T(1) + scHpfCoeff_) / T(2); // Normalization to prevent high-frequency boost
+
         cachedNyquist_ = static_cast<T>(fs * 0.5);
         cachedFsInvPi2_ = static_cast<T>(std::numbers::pi * 2.0 / fs);
     }
@@ -428,7 +496,7 @@ protected:
             envelopeState_ = rawLevel; // Instant attack for precise triggering
         else
             envelopeState_ += detectorReleaseCoeff_ * (rawLevel - envelopeState_);
-        
+
         return envelopeState_;
     }
 
@@ -487,7 +555,7 @@ protected:
                 estimatedPeriod_ = (kZeroCrossWindow * 2) / zeroCrossCount_;
             else
                 estimatedPeriod_ = 0;
-            
+
             zeroCrossCount_ = 0;
             zeroCrossSamples_ = 0;
         }
@@ -496,7 +564,7 @@ protected:
     [[nodiscard]] inline T getCurrentGain() noexcept
     {
         T targetGain = (state_ == State::Open || state_ == State::Hold) ? T(1) : cachedRangeLinear_;
-        
+
         // Fast path for established states to avoid unnecessary math
         if (targetGain == gateGain_) return gateGain_;
 
@@ -521,17 +589,17 @@ protected:
 
         T hpCoeff = T(1) - std::min(T(1), freqHpFreq_[ch] * cachedFsInvPi2_);
         T hpOut = hpCoeff * (freqHpState_[ch] + freqLpState_[ch] - freqHpPrev_[ch]);
-        
+
         freqHpPrev_[ch] = freqLpState_[ch];
         freqHpState_[ch] = hpOut;
 
         return hpOut;
     }
 
-    /** @brief Per-channel one-pole sidechain high-pass. */
+    /** @brief Per-channel one-pole sidechain high-pass (unity gain at Nyquist). */
     [[nodiscard]] T applyScHpf(T input, int ch) noexcept
     {
-        T output = input - scHpfPrev_[ch] + scHpfCoeff_ * scHpfState_[ch];
+        T output = scHpfA0_ * (input - scHpfPrev_[ch]) + scHpfCoeff_ * scHpfState_[ch];
         scHpfPrev_[ch] = input;
         scHpfState_[ch] = output;
         return output;
@@ -539,11 +607,11 @@ protected:
 
     [[nodiscard]] T processSampleInternal(T input, T sidechain, int ch) noexcept
     {
-        if (cachedScHpfEnabled_)
-            sidechain = applyScHpf(sidechain, std::min(ch, kMaxScChannels - 1));
+        if (cachedScHpfEnabled_ && ch < kMaxScChannels)
+            sidechain = applyScHpf(sidechain, ch);
 
         T rawLevel = std::abs(sidechain);
-        
+
         if (cachedAdaptiveHold_)
             updateZeroCrossing(sidechain);
 
@@ -552,7 +620,7 @@ protected:
 
         if (cachedGateMode_ == GateMode::Frequency)
         {
-            (void)getCurrentGain(); 
+            (void)getCurrentGain();
             return applyFrequencyGate(input, ch);
         }
 
@@ -574,7 +642,7 @@ protected:
 
     std::atomic<bool> scHpfEnabled_ { false };
     std::atomic<T> scHpfFreq_ { T(80) };
-    
+
     // Cached internal variables
     T cachedThresholdLinear_ = T(0.01);
     T cachedCloseThresholdLinear_ = T(0.0063);
@@ -588,6 +656,7 @@ protected:
 
     static constexpr int kMaxScChannels = 16;
     T scHpfCoeff_ = T(0.995);
+    T scHpfA0_ = T(0.9975);
     std::array<T, kMaxScChannels> scHpfState_ {};
     std::array<T, kMaxScChannels> scHpfPrev_ {};
 

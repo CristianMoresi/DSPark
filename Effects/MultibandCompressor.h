@@ -133,12 +133,12 @@ public:
     }
 
     /**
-     * @brief Sets the filter order for the Linkwitz-Riley crossover (e.g., 2, 4, 8).
-     * @param order Filter order (even numbers typically).
+     * @brief Sets the crossover slope in dB/oct: 12, 24 or 48.
+     * @param order Slope in dB/oct; other values are ignored (see CrossoverFilter::setOrder).
      */
-    void setOrder(int order) noexcept 
-    { 
-        crossover_.setOrder(order); 
+    void setOrder(int order) noexcept
+    {
+        crossover_.setOrder(order);
     }
 
     /**

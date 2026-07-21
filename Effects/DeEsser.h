@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -7,16 +7,22 @@
  * @file DeEsser.h
  * @brief Frequency-selective dynamic processor for sibilance reduction.
  *
- * A split-band de-esser that detects energy in a configurable frequency band
- * and applies dynamic gain reduction. Optimized for zero inner-loop allocations
- * and trigonometric eliminations during dynamic EQ modulation.
+ * A dynamic-EQ style de-esser: a bandpass sidechain detects energy in a
+ * configurable frequency band and a dynamic peak-cut bell applies the gain
+ * reduction at that band. Optimized for zero inner-loop allocations and
+ * trigonometric eliminations during dynamic EQ modulation.
  *
  * Architecture:
  * 1. Bandpass sidechain (Biquad) isolates the sibilant band.
  * 2. Envelope follower (peak with attack/release) tracks maximum stereo sibilance.
  * 3. Fast-math Biquad Peak cut applies gain reduction with precomputed trig terms.
  *
- * Dependencies: Biquad.h, DspMath.h, AudioSpec.h, AudioBuffer.h.
+ * Threading: prepare() belongs to the setup thread; processBlock() and reset()
+ * belong to the audio thread. Setters are lock-free atomic publications, safe
+ * from any thread, consumed at the next processBlock(). Non-finite setter
+ * arguments are ignored.
+ *
+ * Dependencies: Biquad.h, DspMath.h, AudioSpec.h, AudioBuffer.h, StateBlob.h.
  *
  * @code
  *   dspark::DeEsser<float> deesser;
@@ -38,12 +44,19 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
 
 namespace dspark {
 
 /**
  * @class DeEsser
- * @brief Stereo-linked, CPU-optimized split-band de-esser.
+ * @brief Stereo-linked, CPU-optimized dynamic-EQ de-esser.
+ *
+ * Detection is stereo-linked (one shared envelope) to preserve imaging.
+ * Channels beyond the first two are left untouched (pass-through), as is the
+ * whole buffer before prepare().
  *
  * @tparam T Sample type (float or double).
  */
@@ -59,12 +72,16 @@ public:
 
     /**
      * @brief Prepares the de-esser state and filters.
+     *
+     * An invalid spec (non-positive or non-finite fields) is a no-op that
+     * keeps the previous state.
+     *
      * @param spec Audio environment specification.
      */
     void prepare(const AudioSpec& spec)
     {
-        if (spec.sampleRate <= 0.0) return;
-        
+        if (!spec.isValid()) return; // release-safe: keep previous state
+
         sampleRate_ = spec.sampleRate;
         numChannels_ = spec.numChannels;
 
@@ -72,8 +89,8 @@ public:
         coefSmoothCoeff_ = static_cast<T>(1.0 - std::exp(-1.0 / (sampleRate_ * 0.001)));
 
         reset();
-        
-        filterParamsDirty_.store(true, std::memory_order_relaxed);
+
+        filterParamsDirty_.store(true, std::memory_order_release);
         updateFiltersIfDirty();
     }
 
@@ -89,7 +106,7 @@ public:
 
         updateFiltersIfDirty();
 
-        if (envCoefsDirty_.exchange(false, std::memory_order_relaxed))
+        if (envCoefsDirty_.exchange(false, std::memory_order_acquire))
             updateEnvelopeCoeffs();
 
         T thresh = threshold_.load(std::memory_order_relaxed);
@@ -128,35 +145,68 @@ public:
     }
 
     // Setters
+
+    /** @brief Sets the detector attack, clamped to [0.1, 20] ms. Non-finite values are ignored. */
     void setAttack(T ms) noexcept
     {
+        if (!std::isfinite(ms)) return;
         attackMs_.store(std::clamp(ms, T(0.1), T(20)), std::memory_order_relaxed);
-        envCoefsDirty_.store(true, std::memory_order_relaxed);
+        envCoefsDirty_.store(true, std::memory_order_release);
     }
 
+    /** @brief Sets the detector release, clamped to [1, 500] ms. Non-finite values are ignored. */
     void setRelease(T ms) noexcept
     {
+        if (!std::isfinite(ms)) return;
         releaseMs_.store(std::clamp(ms, T(1), T(500)), std::memory_order_relaxed);
-        envCoefsDirty_.store(true, std::memory_order_relaxed);
+        envCoefsDirty_.store(true, std::memory_order_release);
     }
 
+    /**
+     * @brief Sets the sibilance centre frequency in Hz.
+     *
+     * Clamped against the prepared sample rate when the filters rebuild
+     * (effective range [1, 0.499 * fs]). Non-finite values are ignored.
+     */
     void setFrequency(T hz) noexcept
     {
+        if (!std::isfinite(hz)) return;
         frequency_.store(hz, std::memory_order_relaxed);
-        filterParamsDirty_.store(true, std::memory_order_relaxed);
+        filterParamsDirty_.store(true, std::memory_order_release);
     }
 
+    /** @brief Sets the detection/cut bandwidth in octaves (floored at 0.1). Non-finite values are ignored. */
     void setBandwidth(T octaves) noexcept
     {
+        if (!std::isfinite(octaves)) return;
         T bw = std::max(octaves, T(0.1));
         T q = T(1) / (T(2) * std::sinh(T(0.34657359) * bw));
         bandwidth_.store(q, std::memory_order_relaxed);
-        filterParamsDirty_.store(true, std::memory_order_relaxed);
+        filterParamsDirty_.store(true, std::memory_order_release);
     }
 
-    void setThreshold(T db) noexcept { threshold_.store(db, std::memory_order_relaxed); }
-    void setReduction(T db) noexcept { maxReduction_.store(std::abs(db), std::memory_order_relaxed); }
-    void setDetectionMode(DetectionMode mode) noexcept { detectionMode_.store(mode, std::memory_order_relaxed); }
+    /** @brief Sets the detection threshold in dBFS. Non-finite values are ignored. */
+    void setThreshold(T db) noexcept
+    {
+        if (!std::isfinite(db)) return;
+        threshold_.store(db, std::memory_order_relaxed);
+    }
+
+    /** @brief Sets the maximum gain reduction in dB (sign is ignored). Non-finite values are ignored. */
+    void setReduction(T db) noexcept
+    {
+        if (!std::isfinite(db)) return;
+        maxReduction_.store(std::abs(db), std::memory_order_relaxed);
+    }
+
+    /** @brief Sets the detection mode. Out-of-range values are clamped so the getter stays honest. */
+    void setDetectionMode(DetectionMode mode) noexcept
+    {
+        const int v = std::clamp(static_cast<int>(mode),
+                                 static_cast<int>(DetectionMode::Bandpass),
+                                 static_cast<int>(DetectionMode::Derivative));
+        detectionMode_.store(static_cast<DetectionMode>(v), std::memory_order_relaxed);
+    }
 
     // Getters
     [[nodiscard]] T getGainReductionDb() const noexcept { return gainReduction_.load(std::memory_order_relaxed); }
@@ -166,19 +216,29 @@ public:
     [[nodiscard]] T getAttack() const noexcept { return attackMs_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getRelease() const noexcept { return releaseMs_.load(std::memory_order_relaxed); }
 
+    /** @return The detection/cut bandwidth in octaves (inverse of the stored Q). */
+    [[nodiscard]] T getBandwidth() const noexcept
+    {
+        return static_cast<T>(std::asinh(1.0 / (2.0 * static_cast<double>(
+            bandwidth_.load(std::memory_order_relaxed)))) / 0.34657359);
+    }
+
+    /** @return The maximum gain reduction in dB (positive). */
+    [[nodiscard]] T getReduction() const noexcept { return maxReduction_.load(std::memory_order_relaxed); }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
+        // The blob stores float (setState reads float back); the explicit
+        // casts also keep this overload resolvable when T is double.
         StateWriter w(stateId("DEES"), 1);
-        w.write("frequency", frequency_.load(std::memory_order_relaxed));
+        w.write("frequency", static_cast<float>(frequency_.load(std::memory_order_relaxed)));
         // bandwidth_ stores Q = 1/(2 sinh(ln2/2 * oct)); serialize back in octaves.
-        w.write("bandwidth", static_cast<float>(std::asinh(1.0 / (2.0 * static_cast<double>(
-            bandwidth_.load(std::memory_order_relaxed)))) / 0.34657359));
-        w.write("threshold", threshold_.load(std::memory_order_relaxed));
-        w.write("reduction", maxReduction_.load(std::memory_order_relaxed));
-        w.write("attack", attackMs_.load(std::memory_order_relaxed));
-        w.write("release", releaseMs_.load(std::memory_order_relaxed));
+        w.write("bandwidth", static_cast<float>(getBandwidth()));
+        w.write("threshold", static_cast<float>(threshold_.load(std::memory_order_relaxed)));
+        w.write("reduction", static_cast<float>(maxReduction_.load(std::memory_order_relaxed)));
+        w.write("attack", static_cast<float>(attackMs_.load(std::memory_order_relaxed)));
+        w.write("release", static_cast<float>(releaseMs_.load(std::memory_order_relaxed)));
         w.write("detection", static_cast<int32_t>(detectionMode_.load(std::memory_order_relaxed)));
         return w.blob();
     }
@@ -200,7 +260,7 @@ public:
 
 private:
     template <bool IsDerivative>
-    void processInternal(AudioBufferView<T>& buffer, int numCh, int numSamples, 
+    void processInternal(AudioBufferView<T>& buffer, int numCh, int numSamples,
                          T thresh, T maxRed, T coefSmooth, int refreshInterval, T& blockMaxGr) noexcept
     {
         for (int i = 0; i < numSamples; ++i)
@@ -242,14 +302,14 @@ private:
             T envDb = gainToDecibels(envelope_ + T(1e-30));
             T overDb = envDb - thresh;
             T grDb = (overDb > T(0)) ? -std::min(overDb, maxRed) : T(0);
-            
+
             if (-grDb > blockMaxGr) blockMaxGr = -grDb;
 
             // 4. Apply processing per channel
             for (int ch = 0; ch < numCh; ++ch)
             {
                 T& smoothedGr = smoothedGrDb_[ch];
-                smoothedGr += coefSmooth * (grDb - smoothedGr); // Removed targetGr snapping
+                smoothedGr += coefSmooth * (grDb - smoothedGr);
 
                 // Refresh coefficients without trig functions
                 if ((i & (refreshInterval - 1)) == 0)
@@ -263,24 +323,31 @@ private:
         }
     }
 
-    /** 
+    /**
      * @brief Updates Biquad filters if frequency or bandwidth changed.
      * Precomputes trigonometric constants for the inner-loop Peak filter.
      */
     void updateFiltersIfDirty() noexcept
     {
-        if (!filterParamsDirty_.exchange(false, std::memory_order_relaxed))
+        if (!filterParamsDirty_.exchange(false, std::memory_order_acquire))
             return;
 
         T freq = frequency_.load(std::memory_order_relaxed);
         T bw = bandwidth_.load(std::memory_order_relaxed);
 
-        auto c = BiquadCoeffs<T>::makeBandPass(sampleRate_, static_cast<double>(freq), static_cast<double>(bw));
+        // One shared effective frequency for BOTH filters. The bandpass
+        // factory clamps internally, but the precomputed peak terms did not:
+        // beyond Nyquist sin(w0) goes negative, alpha flips sign and the
+        // dynamic bell turns unstable under gain reduction.
+        const double fEff = std::clamp(static_cast<double>(freq), 1.0,
+                                       std::max(1.0, sampleRate_ * 0.499));
+
+        auto c = BiquadCoeffs<T>::makeBandPass(sampleRate_, fEff, static_cast<double>(bw));
         for (int ch = 0; ch < kMaxChannels; ++ch)
             detector_[ch].setCoeffs(c);
 
         // Precompute trig terms for the Peak filter to avoid math in the inner loop
-        double w0 = twoPi<double> * static_cast<double>(freq) / sampleRate_;
+        double w0 = twoPi<double> * fEff / sampleRate_;
         precomputedCos_ = static_cast<T>(std::cos(w0));
         precomputedAlpha_ = static_cast<T>(std::sin(w0) / (2.0 * static_cast<double>(bw)));
     }
@@ -294,7 +361,7 @@ private:
     {
         // A = 10^(gainDb / 40)
         T A = std::pow(T(10), gainDb / T(40));
-        
+
         T b0 = T(1) + precomputedAlpha_ * A;
         T b1 = T(-2) * precomputedCos_;
         T b2 = T(1) - precomputedAlpha_ * A;
@@ -304,7 +371,7 @@ private:
 
         // Normalization
         T a0Inv = T(1) / a0;
-        
+
         BiquadCoeffs<T> coeffs;
         coeffs.b0 = b0 * a0Inv;
         coeffs.b1 = b1 * a0Inv;
@@ -328,7 +395,7 @@ private:
     static constexpr int kDerivLen = 8;
 
     double sampleRate_ = 44100.0;
-    int numChannels_ = 2;
+    int numChannels_ = 0;
 
     std::atomic<T> frequency_ { T(7000) };
     std::atomic<T> bandwidth_ { T(2) };
@@ -337,7 +404,7 @@ private:
     std::atomic<T> attackMs_ { T(0.5) };
     std::atomic<T> releaseMs_ { T(20) };
     std::atomic<DetectionMode> detectionMode_ { DetectionMode::Bandpass };
-    
+
     std::atomic<bool> envCoefsDirty_ { false };
     std::atomic<bool> filterParamsDirty_ { true };
 
@@ -348,7 +415,7 @@ private:
 
     Biquad<T, 1> detector_[kMaxChannels]{};
     Biquad<T, 1> reduction_[kMaxChannels]{};
-    
+
     T envelope_{T(0)}; // Stereo-linked envelope
     T smoothedGrDb_[kMaxChannels]{};
 

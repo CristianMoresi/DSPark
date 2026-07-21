@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -7,13 +7,19 @@
  * @file Tremolo.h
  * @brief Amplitude modulation (tremolo) with configurable LFO and analog-style shaping.
  *
- * Implements a highly optimized, SIMD-friendly amplitude modulator. Features
- * zero-allocation processing, thread-safe parameter handling, and click-free
- * analog-style waveforms (smoothed square wave). 
- * Optional stereo mode creates a 180-degree out-of-phase LFO on the right channel 
+ * Implements a highly optimized amplitude modulator. Features zero-allocation
+ * processing, thread-safe parameter handling, and click-free analog-style
+ * waveforms (smoothed square wave).
+ * Optional stereo mode creates a 180-degree out-of-phase LFO on the right channel
  * for wide auto-pan effects.
  *
- * Dependencies: Phasor.h, DspMath.h, AudioSpec.h, AudioBuffer.h, Smoothers.h
+ * Threading: prepare() belongs to the setup thread; processBlock() and reset()
+ * belong to the audio thread. Setters are lock-free atomic publications, safe
+ * from any thread, consumed at the next processBlock(). Non-finite setter
+ * arguments are ignored.
+ *
+ * Dependencies: Phasor.h, DspMath.h, AudioSpec.h, AudioBuffer.h, Smoothers.h,
+ *               DenormalGuard.h, StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -27,7 +33,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <numbers>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
 
 namespace dspark {
 
@@ -37,7 +45,7 @@ namespace dspark {
  *
  * Designed with a template-dispatch architecture to ensure zero branching
  * inside the inner audio loops, maximizing L1 cache hits and SIMD autovectorization.
- * 
+ *
  * @tparam T Sample type (float or double).
  */
 template <FloatType T>
@@ -53,10 +61,16 @@ public:
 
     /**
      * @brief Prepares the tremolo processor and allocates internal states.
+     *
+     * An invalid spec (non-positive or non-finite fields) is a no-op that
+     * keeps the previous state.
+     *
      * @param spec Audio environment specification (sample rate and max channels).
      */
     void prepare(const AudioSpec& spec)
     {
+        if (!spec.isValid()) return; // release-safe: keep previous state
+
         sampleRate_ = spec.sampleRate;
         numChannels_ = spec.numChannels;
 
@@ -119,21 +133,36 @@ public:
 
     /**
      * @brief Sets the LFO rate. Thread-safe (can be called from UI thread).
-     * @param hz Modulation frequency in Hz.
+     * @param hz Modulation frequency in Hz (floored to 0; audio-rate AM is
+     *           legitimate). Non-finite values are ignored.
      */
-    void setRate(T hz) noexcept { rate_.store(hz, std::memory_order_relaxed); }
+    void setRate(T hz) noexcept
+    {
+        if (!std::isfinite(hz)) return;
+        rate_.store(std::max(T(0), hz), std::memory_order_relaxed);
+    }
 
     /**
      * @brief Sets the modulation depth. Thread-safe.
      * @param depth Range [0.0 (bypass), 1.0 (full amplitude cut)].
+     *              Non-finite values are ignored.
      */
-    void setDepth(T depth) noexcept { depth_.store(std::clamp(depth, T(0), T(1)), std::memory_order_relaxed); }
+    void setDepth(T depth) noexcept
+    {
+        if (!std::isfinite(depth)) return;
+        depth_.store(std::clamp(depth, T(0), T(1)), std::memory_order_relaxed);
+    }
 
     /**
      * @brief Sets the LFO waveform shape. Thread-safe.
-     * @param shape Waveform type (Sine, Triangle, Square).
+     * @param shape Waveform type (Sine, Triangle, Square; wild enum values clamp).
      */
-    void setShape(Shape shape) noexcept { shape_.store(shape, std::memory_order_relaxed); }
+    void setShape(Shape shape) noexcept
+    {
+        const int s = std::clamp(static_cast<int>(shape), 0,
+                                 static_cast<int>(Shape::Square));
+        shape_.store(static_cast<Shape>(s), std::memory_order_relaxed);
+    }
 
     /**
      * @brief Enables auto-pan by offsetting the right channel LFO phase by 180 degrees.
@@ -190,8 +219,8 @@ private:
     Smoothers::LinearSmoother depthSmoother_;
     Phasor<T> phasors_[kMaxChannels]{};
 
-    /** 
-     * @brief Polls atomics and updates local phasor state safely. 
+    /**
+     * @brief Polls atomics and updates local phasor state safely.
      */
     inline void updateInternalState() noexcept
     {
@@ -227,7 +256,7 @@ private:
     {
         if constexpr (S == Shape::Sine)
         {
-            // fastSin: > 100 dB accurate — far beyond audibility for an LFO.
+            // fastSin: > 100 dB accurate - far beyond audibility for an LFO.
             return fastSin(phase * twoPi<T>);
         }
         else if constexpr (S == Shape::Triangle)
@@ -260,7 +289,7 @@ private:
         {
             T depthVal = static_cast<T>(depthSmoother_.getNextValue());
             T phaseL = phasors_[0].advance();
-            
+
             T modL = computeShape<S>(phaseL);
             T gainL = T(1) - depthVal * (T(1) - modL) * T(0.5);
 

@@ -1,18 +1,23 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
 /**
  * @file RingModulator.h
- * @brief Ring modulation — multiplies the signal by an oscillator carrier.
+ * @brief Ring modulation - multiplies the signal by an oscillator carrier.
  *
  * Produces sum and difference frequencies by multiplying the input signal
  * with a sine wave carrier. Classic effect for metallic, bell-like, or
  * robotic tones. Includes a dry/wet mix control and parameter smoothing
  * to prevent zipper noise during real-time automation.
  *
- * Dependencies: Phasor.h, DspMath.h, AudioSpec.h, AudioBuffer.h.
+ * Threading: prepare() belongs to the setup thread; processBlock() and reset()
+ * belong to the audio thread. Setters are lock-free atomic publications, safe
+ * from any thread, consumed at the next processBlock(). Non-finite setter
+ * arguments are ignored.
+ *
+ * Dependencies: Phasor.h, DspMath.h, AudioSpec.h, AudioBuffer.h, StateBlob.h.
  *
  * @code
  *   dspark::RingModulator<float> ring;
@@ -35,17 +40,24 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <numbers>
+#include <vector>
 
 namespace dspark {
 
 /**
  * @class RingModulator
- * @brief Signal × carrier ring modulation with mix control and zero-latency smoothing.
+ * @brief Signal x carrier ring modulation with mix control and zero-latency smoothing.
  *
  * Uses a single shared carrier oscillator for all channels ensuring phase
- * coherence. Optimized for SIMD vectorization and CPU cache locality via
- * internal chunk-based processing.
+ * coherence. The shared carrier is precomputed serially chunk by chunk (the
+ * phase accumulator is recursive); the per-channel apply loops are
+ * branch-free and auto-vectorizable.
+ *
+ * Channels beyond those passed to prepare() are left untouched
+ * (pass-through), as is the whole buffer before prepare().
  *
  * @tparam T Sample type (float or double).
  */
@@ -57,25 +69,31 @@ public:
     enum class Mode
     {
         Classic,        ///< Standard multiplication (sum & difference frequencies).
-        GeometricMean   ///< Geometric-mean mode: sqrt(|in|*|carrier|) * sign — richer, more musical.
+        GeometricMean   ///< Geometric-mean mode: sqrt(|in|*|carrier|) * sign - richer, more musical.
     };
 
     /**
      * @brief Prepares the modulator for audio processing.
+     *
+     * Settles the parameter smoothing state on the published targets. An
+     * invalid spec (non-positive or non-finite fields) is a no-op that keeps
+     * the previous state.
+     *
      * @param spec Audio specification including sample rate and channels.
      */
-    void prepare(const AudioSpec& spec)
+    void prepare(const AudioSpec& spec) noexcept
     {
+        if (!spec.isValid()) return; // release-safe: keep previous state
+
         phasor_.prepare(spec.sampleRate);
-        
-        T initialFreq = frequency_.load(std::memory_order_relaxed);
-        T initialMix = mix_.load(std::memory_order_relaxed);
-        
+
+        const T initialFreq = frequency_.load(std::memory_order_relaxed);
+        const T initialMix = mix_.load(std::memory_order_relaxed);
+
         phasor_.setFrequency(initialFreq);
         currentFreq_ = initialFreq;
         currentMix_ = initialMix;
         numChannels_ = spec.numChannels;
-        sampleRate_ = static_cast<T>(spec.sampleRate);
     }
 
     /**
@@ -115,11 +133,11 @@ public:
             {
                 currentFreq_ += freqStep;
                 currentMix_ += mixStep;
-                
+
                 phasor_.setFrequency(currentFreq_);
                 T phase = phasor_.advance();
 
-                // fastSin: error > 100 dB below the carrier — inaudible even
+                // fastSin: error > 100 dB below the carrier - inaudible even
                 // though the carrier itself is audible in ring modulation.
                 carrierChunk[i] = fastSin(phase * twoPi);
                 mixChunk[i] = currentMix_;
@@ -136,16 +154,16 @@ public:
                     {
                         const T dry = data[i];
                         const T carrier = carrierChunk[i];
-                        
+
                         const T absIn = std::abs(dry);
                         const T absCarrier = std::abs(carrier);
-                        
+
                         // Scaled soarVal prevents DC offset when input is zero
                         const T gm = std::sqrt(absIn * absCarrier + soarVal * absIn);
-                        
+
                         // Ultra-fast sign evaluation without branching
                         const T wet = gm * std::copysign(T(1), dry * carrier);
-                        
+
                         data[i] = dry + (wet - dry) * mixChunk[i];
                     }
                 }
@@ -165,64 +183,89 @@ public:
                 }
             }
         }
+
+        // Land exactly on the published targets: the accumulated ramp ends
+        // within rounding of them, and the next block must start settled
+        // (matches the framework's smoothing convention).
+        currentFreq_ = targetFreq;
+        currentMix_ = targetMix;
     }
 
     /** @brief Resets the internal phase of the carrier oscillator. */
     void reset() noexcept { phasor_.reset(); }
 
     /**
-     * @brief Sets the target carrier frequency. Modulated smoothly.
-     * @param hz Frequency in Hertz.
+     * @brief Sets the target carrier frequency. Smoothed internally.
+     * @param hz Frequency in Hertz. Negative values are legal (identical
+     * spectrum, inverted carrier phase); there is no upper clamp (carriers
+     * beyond Nyquist alias by design). Non-finite values are ignored.
      */
     void setFrequency(T hz) noexcept
     {
+        if (!std::isfinite(hz)) return; // NaN/Inf would poison the smoothed ramp
         frequency_.store(hz, std::memory_order_relaxed);
     }
 
     /**
-     * @brief Sets the target dry/wet mix. Modulated smoothly.
-     * @param mix Mix value from 0.0 (100% dry) to 1.0 (100% wet).
+     * @brief Sets the target dry/wet mix. Smoothed internally.
+     * @param mix Mix value from 0.0 (100% dry) to 1.0 (100% wet), clamped.
+     * Non-finite values are ignored.
      */
     void setMix(T mix) noexcept
     {
+        if (!std::isfinite(mix)) return;
         mix_.store(std::clamp(mix, T(0), T(1)), std::memory_order_relaxed);
     }
 
     /**
      * @brief Sets the modulation mode.
+     *
+     * Applied per block without crossfade (an instantaneous timbre change).
+     * Out-of-range values are clamped so the getter stays honest.
+     *
      * @param m The chosen structural mode (Classic or GeometricMean).
      */
-    void setMode(Mode m) noexcept 
-    { 
-        mode_.store(m, std::memory_order_relaxed); 
+    void setMode(Mode m) noexcept
+    {
+        const int v = std::clamp(static_cast<int>(m),
+                                 static_cast<int>(Mode::Classic),
+                                 static_cast<int>(Mode::GeometricMean));
+        mode_.store(static_cast<Mode>(v), std::memory_order_relaxed);
     }
 
     /**
      * @brief Sets the soar threshold for Geometric Mean mode.
      *
-     * Prevents cross-zero dropouts. The value is internally scaled by the 
-     * input amplitude to prevent static DC offsets during silence.
+     * Prevents cross-zero dropouts. The value is internally scaled by the
+     * input amplitude to prevent static DC offsets during silence. The floor
+     * it puts under the carrier's zero crossings turns the dropout into a
+     * small step there (the audible trade-off of filling the notch). Applied
+     * per block (not smoothed).
      *
      * @param amount 0 = strict geometric mean, 0.01 = subtle, 0.1 = strong.
+     * Floored at 0; non-finite values are ignored.
      */
     void setSoar(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         soar_.store(std::max(amount, T(0)), std::memory_order_relaxed);
     }
 
     [[nodiscard]] T getFrequency() const noexcept { return frequency_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
     [[nodiscard]] Mode getMode() const noexcept { return mode_.load(std::memory_order_relaxed); }
-
+    [[nodiscard]] T getSoar() const noexcept { return soar_.load(std::memory_order_relaxed); }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
+        // The blob stores float (setState reads float back); the explicit
+        // casts also keep this overload resolvable when T is double.
         StateWriter w(stateId("RING"), 1);
-        w.write("frequency", frequency_.load(std::memory_order_relaxed));
-        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("frequency", static_cast<float>(frequency_.load(std::memory_order_relaxed)));
+        w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("mode", static_cast<int32_t>(mode_.load(std::memory_order_relaxed)));
-        w.write("soar", soar_.load(std::memory_order_relaxed));
+        w.write("soar", static_cast<float>(soar_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -239,8 +282,7 @@ public:
     }
 
 private:
-    int numChannels_ = 2;
-    T sampleRate_ = T(48000);
+    int numChannels_ = 0;
 
     // Atomic targets for lock-free UI/Thread communication
     std::atomic<T> frequency_ { T(440) };

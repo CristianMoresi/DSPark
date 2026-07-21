@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -8,7 +8,7 @@
  * @brief Classic analog-modeled phaser effect using LFO-modulated allpass filter stages.
  *
  * Creates the sweeping "jet" sound by passing the signal through a series of
- * first-order allpass filters whose cutoff frequencies are modulated by an LFO. 
+ * first-order allpass filters whose cutoff frequencies are modulated by an LFO.
  * Includes an analog-style saturation stage in the feedback loop to emulate
  * classic hardware behavior and prevent harsh digital clipping.
  *
@@ -17,7 +17,14 @@
  * - **Level 2 (Intermediate):** `setStages()`, `setFeedback()`, `setFrequencyRange()`
  * - **Level 3 (Expert):** `setLfoWaveform()`, `setCenterFrequency()`
  *
- * Dependencies: Biquad.h, Oscillator.h, DryWetMixer.h, AudioSpec.h, AudioBuffer.h, DspMath.h.
+ * Threading: prepare() belongs to the setup thread; processBlock() and reset()
+ * belong to the audio thread. All setters are lock-free atomic publications,
+ * safe from any thread; the LFO rate/waveform/spread are applied on the audio
+ * thread at the next block (the oscillators are not thread-safe). Non-finite
+ * setter arguments are ignored.
+ *
+ * Dependencies: Oscillator.h, DryWetMixer.h, AudioSpec.h, AudioBuffer.h,
+ *               DspMath.h, StateBlob.h.
  *
  * @code
  *   dspark::Phaser<float> phaser;
@@ -32,14 +39,17 @@
 #include "../Core/DryWetMixer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
-#include "../Core/DspMath.h" // Must provide fast_exp and fast_tan
+#include "../Core/DspMath.h" // fastExp, fastTan, fastTanh
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <numbers>
+#include <vector>
 
 namespace dspark {
 
@@ -64,10 +74,16 @@ public:
 
     /**
      * @brief Prepares the phaser and allocates internal state blocks.
+     *
+     * An invalid spec (non-positive or non-finite fields) is a no-op that
+     * keeps the previous state.
+     *
      * @param spec Hardware audio specifications (sample rate, block size).
      */
     void prepare(const AudioSpec& spec)
     {
+        if (!spec.isValid()) return; // release-safe: keep previous state
+
         spec_ = spec;
         mixer_.prepare(spec);
 
@@ -114,7 +130,7 @@ public:
         lfoR_.setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
 
         // Re-phase the right-channel LFO when the spread changes (audio thread
-        // only — Oscillator state is not thread-safe).
+        // only; Oscillator state is not thread-safe).
         if (std::abs(spreadVal - lastSpread_) > T(0.0001))
         {
             lastSpread_ = spreadVal;
@@ -123,6 +139,17 @@ public:
             lfoR_.setPhase(ph);
         }
         const bool useSpread = (spreadVal > T(0.0001)) && (nCh >= 2);
+
+        // Stages activated by a live increase start from cleared state: their
+        // history is from whenever they were last active (arbitrarily old),
+        // and replaying it injects an unrelated step into the chain.
+        if (stagesVal > lastStages_)
+            for (int s = lastStages_; s < stagesVal; ++s)
+            {
+                stages_[s].xPrev.fill(T(0));
+                stages_[s].yPrev.fill(T(0));
+            }
+        lastStages_ = stagesVal;
 
         mixer_.pushDry(buffer);
 
@@ -136,9 +163,9 @@ public:
         {
             T modAmount = (lfoVal + T(1)) * T(0.5) * currentDepth_;
             T logFreq = logMin + modAmount * (logMax - logMin);
-            // Convert log-frequency back to linear Hz (fastExp ≈ 2× std::exp)
+            // Convert log-frequency back to linear Hz (fastExp, ~2x std::exp)
             T cutoff = std::min(fastExp(logFreq), nyquist);
-            // Bilinear-transform coefficient: tan(π·f/Fs). fastTan is safe —
+            // Bilinear-transform coefficient: tan(pi * f / Fs). fastTan is safe:
             // `cutoff` stays below Nyquist thanks to the clamp above.
             T tanVal = fastTan(kPi * cutoff * fsInv);
             return (tanVal - T(1)) / (tanVal + T(1));
@@ -161,7 +188,8 @@ public:
                 T sample = buffer.getChannel(ch)[i];
 
                 // Analog-modeled feedback with soft clipping to prevent digital
-                // blowups. fastTanh: argument bounded by |fb| < 1.
+                // blowups. fastTanh is internally clamped; at typical levels
+                // the argument stays below 1, where its error is < 0.05%.
                 T fbSignal = fastTanh(fbState_[ch] * currentFb_);
                 sample += fbSignal;
 
@@ -211,29 +239,34 @@ public:
     /**
      * @brief Sets the speed of the phaser sweep.
      * @param hz LFO frequency in Hertz. Range: [0.01, 20.0].
+     *           Non-finite values are ignored.
      */
     void setRate(T hz) noexcept
     {
-        hz = std::clamp(hz, T(0.01), T(20));
-        rate_.store(hz, std::memory_order_relaxed); // applied on the audio thread
+        if (!std::isfinite(hz)) return;
+        rate_.store(std::clamp(hz, T(0.01), T(20)), std::memory_order_relaxed); // applied on the audio thread
     }
 
     /**
      * @brief Sets how wide the frequency sweep is.
      * @param amount Range: [0.0 (static), 1.0 (full spectrum)].
+     *               Non-finite values are ignored.
      */
     void setDepth(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         depth_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
     /**
      * @brief Balances the unprocessed and processed signal.
      * @param dryWet Range: [0.0 (fully dry), 1.0 (fully wet)].
+     *               Non-finite values are ignored.
      */
-    void setMix(T dryWet) noexcept 
-    { 
-        mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed); 
+    void setMix(T dryWet) noexcept
+    {
+        if (!std::isfinite(dryWet)) return;
+        mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed);
     }
 
     // -- Level 2: Intermediate API ----------------------------------------------
@@ -249,10 +282,12 @@ public:
 
     /**
      * @brief Injects phase-shifted signal back into the input for resonance.
-     * @param amount Feedback gain. Range: [-0.99, 0.99]. Negative values alter the vocal formant shape.
+     * @param amount Feedback gain. Range: [-0.99, 0.99]. Negative values alter
+     *               the vocal formant shape. Non-finite values are ignored.
      */
     void setFeedback(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         feedback_.store(std::clamp(amount, T(-0.99), T(0.99)), std::memory_order_relaxed);
     }
 
@@ -264,33 +299,48 @@ public:
      * together), 1 = fully opposed (180-degree) sweep.
      *
      * @param amount Spread amount [0.0, 1.0]. Applied on the audio thread.
+     *               Non-finite values are ignored.
      */
     void setStereoSpread(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         stereoSpread_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
     /**
      * @brief Defines the midpoint of the logarithmic frequency sweep.
-     * @param hz Center frequency in Hertz.
+     *
+     * Keeps the current sweep RATIO and recenters it geometrically. Callable
+     * before prepare() (a 20 kHz ceiling stands in for Nyquist until the rate
+     * is known; the per-sample cutoff clamp covers later rate changes anyway).
+     *
+     * @param hz Center frequency in Hertz (non-positive or non-finite values
+     *           are ignored).
      */
     void setCenterFrequency(T hz) noexcept
     {
+        if (!std::isfinite(hz) || !(hz > T(0))) return;
         T curMin = minFreq_.load(std::memory_order_relaxed);
         T curMax = maxFreq_.load(std::memory_order_relaxed);
-        T halfRange = std::sqrt(curMax / (curMin > T(0) ? curMin : T(1))); 
-        
-        minFreq_.store(std::max(hz / halfRange, T(20)), std::memory_order_relaxed);
-        maxFreq_.store(std::min(hz * halfRange, static_cast<T>(spec_.sampleRate) * T(0.499)), std::memory_order_relaxed);
+        T halfRange = std::sqrt(curMax / (curMin > T(0) ? curMin : T(1)));
+
+        const T ceiling = (spec_.sampleRate > 0)
+            ? static_cast<T>(spec_.sampleRate) * T(0.499) : T(20000);
+        const T mn = std::clamp(hz / halfRange, T(20), ceiling - T(1));
+        minFreq_.store(mn, std::memory_order_relaxed);
+        maxFreq_.store(std::clamp(hz * halfRange, mn + T(1), ceiling),
+                       std::memory_order_relaxed);
     }
 
     /**
      * @brief Explicitly defines the sweep boundaries.
      * @param minHz Lower limit of the allpass cutoff sweep.
      * @param maxHz Upper limit of the allpass cutoff sweep.
+     *              Non-finite values are ignored.
      */
     void setFrequencyRange(T minHz, T maxHz) noexcept
     {
+        if (!std::isfinite(minHz) || !std::isfinite(maxHz)) return;
         T mn = std::max(minHz, T(20));
         minFreq_.store(mn, std::memory_order_relaxed);
         maxFreq_.store(std::max(maxHz, mn + T(1)), std::memory_order_relaxed);
@@ -300,11 +350,14 @@ public:
 
     /**
      * @brief Changes the geometric shape of the LFO modulation.
-     * @param wf Target waveform (e.g., Sine, Triangle).
+     * @param wf Target waveform (e.g., Sine, Triangle; wild enum values clamp).
      */
     void setLfoWaveform(typename Oscillator<T>::Waveform wf) noexcept
     {
-        lfoWaveform_.store(wf, std::memory_order_relaxed); // applied on the audio thread
+        const int w = std::clamp(static_cast<int>(wf), 0,
+                                 static_cast<int>(Oscillator<T>::Waveform::Triangle));
+        lfoWaveform_.store(static_cast<typename Oscillator<T>::Waveform>(w),
+                           std::memory_order_relaxed); // applied on the audio thread
     }
 
     /** @brief Retrieves the active stage count. @return Number of stages. */
@@ -326,6 +379,8 @@ public:
         w.write("maxFreq", maxFreq_.load(std::memory_order_relaxed));
         w.write("stages", numStages_.load(std::memory_order_relaxed));
         w.write("spread", stereoSpread_.load(std::memory_order_relaxed));
+        w.write("waveform",
+                static_cast<int32_t>(lfoWaveform_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -342,6 +397,8 @@ public:
                           static_cast<T>(r.read("maxFreq", 6000.0f)));
         setStages(r.read("stages", 4));
         setStereoSpread(static_cast<T>(r.read("spread", 0.0f)));
+        setLfoWaveform(static_cast<typename Oscillator<T>::Waveform>(
+            r.read("waveform", 0)));
         return true;
     }
 
@@ -367,6 +424,7 @@ protected:
     T currentFb_    { T(0) };
     T smoothCoef_   { T(0.01) };
     T lastSpread_   { T(-1) };
+    int lastStages_ { kMaxStages }; // audio-thread: clears newly activated stages
 
     struct FirstOrderAllpass
     {

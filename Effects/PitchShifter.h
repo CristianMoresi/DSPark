@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -25,23 +25,32 @@
  *
  * Architecture (per block, streaming, zero allocation):
  *
- *   input ring → analysis hop Ra (variable, fractional-accumulator exact)
- *     → FFT → peak picking & phase propagation (reference channel)
- *     → per-channel rigid phase rotation per region → IFFT
- *     → overlap-add at fixed synthesis hop Rs = N/4 (exact COLA)
- *     → Catmull-Rom fractional reader at rate `ratio` → output
+ *   input ring -> analysis hop Ra (variable, fractional-accumulator exact)
+ *     -> FFT -> peak picking & phase propagation (reference channel)
+ *     -> per-channel rigid phase rotation per region -> IFFT
+ *     -> overlap-add at fixed synthesis hop Rs = N/4 (exact COLA)
+ *     -> Catmull-Rom fractional reader at rate `ratio` -> output
  *
  * The analysis hop carries a fractional accumulator so the average stretch is
  * exactly Rs/(Rs/ratio) = ratio: tuning is exact for arbitrary ratios, with
  * no cumulative drift. Channels share the reference channel's peak/phase
  * decisions (rigid per-region rotation), which preserves inter-channel phase
- * differences exactly — the stereo image does not wander.
+ * differences exactly - the stereo image does not wander.
  *
- * Latency: fftSize + fftSize/4 samples (reported by getLatency()); the dry
- * path of the mix control is delay-compensated internally.
+ * Latency: 2 * fftSize samples (reported by getLatency(), measured exact at
+ * unity ratio: reader offset fftSize + fftSize/4 behind the write head plus
+ * the fftSize - fftSize/4 window/OLA delay of the analysis-synthesis chain).
+ * The dry path of the mix control is delay-compensated to the same value, so
+ * partial mixes stay comb-free. Channels beyond the prepared count pass
+ * through untouched (and therefore uncompensated).
  *
- * Dependencies: FFT.h, WindowFunctions.h, AudioSpec.h, AudioBuffer.h,
- * DspMath.h, DenormalGuard.h.
+ * Threading model: parameter setters/getters are std::atomic based and safe
+ * from any thread (non-finite values are ignored); prepare() is setup-thread
+ * only (allocates; invalid specs are ignored); reset() belongs to the owner
+ * of the stream; getState()/setState() are setup/UI threads.
+ *
+ * Dependencies: Core/FFT.h, Core/WindowFunctions.h, Core/AudioSpec.h,
+ * Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h, Core/StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -55,6 +64,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <numbers>
@@ -64,7 +74,7 @@ namespace dspark {
 
 /**
  * @class PitchShifter
- * @brief Real-time phase-vocoder pitch shifter (±12 semitones, stereo-linked).
+ * @brief Real-time phase-vocoder pitch shifter (+-12 semitones, stereo-linked).
  *
  * @tparam T Sample type (float or double).
  */
@@ -77,6 +87,11 @@ public:
     /**
      * @brief Allocates all rings and spectral state.
      *
+     * Invalid specs (non-positive/non-finite rate, block size or channel
+     * count) and fftSize values that are not a power of two in [256, 1 << 20]
+     * are ignored: the previous state is kept and an unprepared instance
+     * stays pass-through.
+     *
      * @param spec    Audio environment specification.
      * @param fftSize STFT frame size, power of two (default 2048). Smaller
      *                sizes lower latency and favour transients; larger sizes
@@ -84,8 +99,11 @@ public:
      */
     void prepare(const AudioSpec& spec, int fftSize = 2048)
     {
-        if (spec.sampleRate <= 0.0 || (fftSize & (fftSize - 1)) != 0 || fftSize < 256)
+        if (!spec.isValid() || (fftSize & (fftSize - 1)) != 0
+            || fftSize < 256 || fftSize > (1 << 20))
             return;
+
+        prepared_.store(false, std::memory_order_relaxed);
 
         sampleRate_  = spec.sampleRate;
         numChannels_ = std::max(1, spec.numChannels);
@@ -97,7 +115,13 @@ public:
         accumSize_ = fftSize_ * 4;          // power of two: frame + read margin
         accumMask_ = accumSize_ - 1;
 
-        latency_ = fftSize_ + synthHop_;
+        // The reader trails the write head by readOffset_; the window/OLA
+        // chain adds another fftSize - synthHop_, so the measured wet latency
+        // is readOffset_ + fftSize_ - synthHop_ = 2 * fftSize (exact at unity
+        // ratio). The dry path must delay by the SAME value or partial mixes
+        // comb-filter.
+        readOffset_ = fftSize_ + synthHop_;
+        latency_    = readOffset_ + fftSize_ - synthHop_;
         drySize_ = 1;
         while (drySize_ < latency_ + 1) drySize_ <<= 1;
         dryMask_ = drySize_ - 1;
@@ -136,14 +160,14 @@ public:
         rotIm_.resize(static_cast<size_t>(numBins_));
         peakBin_.resize(static_cast<size_t>(numBins_ / 2 + 2));
 
-        prepared_ = true;
+        prepared_.store(true, std::memory_order_relaxed);
         reset();
     }
 
     /** @brief Clears all signal state (keeps parameters). Safe on the audio thread. */
     void reset() noexcept
     {
-        if (!prepared_) return;
+        if (!prepared_.load(std::memory_order_relaxed)) return;
         for (auto& r : inputRing_) std::fill(r.begin(), r.end(), T(0));
         for (auto& r : dryRing_)   std::fill(r.begin(), r.end(), T(0));
         for (auto& a : accum_)     std::fill(a.begin(), a.end(), T(0));
@@ -154,12 +178,13 @@ public:
         inputPos_ = 0;
         dryPos_ = 0;
         writeHead_ = static_cast<int64_t>(accumSize_);       // keep indices positive
-        readPosInt_ = writeHead_ - latency_;
+        readPosInt_ = writeHead_ - readOffset_;
         readPosFrac_ = 0.0;
 
         stActive_ = std::clamp(static_cast<double>(semitones_.load(std::memory_order_relaxed)),
                                -12.0, 12.0);
         ratioActive_ = std::exp2(stActive_ / 12.0);
+        currentMix_ = mix_.load(std::memory_order_relaxed);
         hopCarry_ = 0.0;
         inputSinceHop_ = 0;
         analysisHop_ = computeAnalysisHop();
@@ -169,23 +194,36 @@ public:
 
     // -- Parameters (thread-safe) -----------------------------------------------
 
-    /** @brief Sets the pitch shift in semitones, clamped to ±12. */
+    /**
+     * @brief Sets the pitch shift in semitones, clamped to +-12.
+     *
+     * The active shift glides toward the target at up to 0.5 semitones per
+     * analysis hop (a few ms at the default frame size), so live changes are
+     * click-free. Non-finite values are ignored.
+     */
     void setSemitones(T st) noexcept
     {
+        if (!std::isfinite(st)) return;
         semitones_.store(std::clamp(st, T(-12), T(12)), std::memory_order_relaxed);
     }
 
-    /** @brief Sets the pitch shift as a frequency ratio, clamped to [0.5, 2]. */
+    /** @brief Sets the pitch shift as a frequency ratio, clamped to [0.5, 2].
+     *  Non-finite values are ignored. */
     void setPitchRatio(T ratio) noexcept
     {
+        if (!std::isfinite(ratio)) return;
         ratio = std::clamp(ratio, T(0.5), T(2));
         semitones_.store(static_cast<T>(12.0 * std::log2(static_cast<double>(ratio))),
                          std::memory_order_relaxed);
     }
 
-    /** @brief Dry/wet mix, [0, 1]. The dry path is latency-compensated. */
+    /** @brief Dry/wet mix, [0, 1]. The dry path is latency-compensated and the
+     *  mix is smoothed linearly over one block (the wet stream is decorrelated
+     *  from the dry, so an unsmoothed step would click). Non-finite values are
+     *  ignored. */
     void setMix(T mix) noexcept
     {
+        if (!std::isfinite(mix)) return;
         mix_.store(std::clamp(mix, T(0), T(1)), std::memory_order_relaxed);
     }
 
@@ -201,7 +239,7 @@ public:
      * A cepstral lift extracts the smooth spectral envelope of each frame
      * (quefrencies below ~1 ms) and the synthesis magnitudes are pre-warped
      * by env(k*ratio)/env(k), so after the output resampler the envelope
-     * lands back where it started — the classic anti-chipmunk correction.
+     * lands back where it started - the classic anti-chipmunk correction.
      * Costs two extra FFTs per frame. Default off.
      */
     void setFormantPreserve(bool enabled) noexcept
@@ -218,15 +256,28 @@ public:
     /** @return Current dry/wet mix. */
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
 
-    /** @brief Reports total latency in samples (STFT frame + resampler margin). */
+    /** @return Whether transient phase reset is enabled. */
+    [[nodiscard]] bool getTransientPreserve() const noexcept
+    {
+        return transientPreserve_.load(std::memory_order_relaxed);
+    }
+
+    /** @return Whether formant preservation is enabled. */
+    [[nodiscard]] bool getFormantPreserve() const noexcept
+    {
+        return formantPreserve_.load(std::memory_order_relaxed);
+    }
+
+    /** @brief Reports total latency in samples (2 * fftSize, measured exact at
+     *  unity ratio; ~85 ms at the default 2048 frame and 48 kHz). */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
         StateWriter w(stateId("PSHF"), 1);
-        w.write("semitones", semitones_.load(std::memory_order_relaxed));
-        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("semitones", static_cast<float>(semitones_.load(std::memory_order_relaxed)));
+        w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("transient", transientPreserve_.load(std::memory_order_relaxed));
         w.write("formant", formantPreserve_.load(std::memory_order_relaxed));
         return w.blob();
@@ -248,16 +299,25 @@ public:
 
     /**
      * @brief Processes audio in-place.
+     *
+     * Pass-through until prepare() succeeds. Channels beyond the prepared
+     * count are left untouched.
+     *
      * @param buffer Audio block; all prepared channels are processed.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        if (!prepared_) return;
+        if (!prepared_.load(std::memory_order_relaxed)) return;
         DenormalGuard guard;
 
         const int nCh = std::min(buffer.getNumChannels(), numChannels_);
         const int nS  = buffer.getNumSamples();
-        const T mixVal = mix_.load(std::memory_order_relaxed);
+
+        // Linear per-block mix ramp with exact landing (settled: step == 0 and
+        // the per-sample value reduces to the constant, bit-identically).
+        const T mixTarget = mix_.load(std::memory_order_relaxed);
+        const T mixStart  = currentMix_;
+        const T mixStep   = (nS > 0) ? (mixTarget - mixStart) / static_cast<T>(nS) : T(0);
 
         int i = 0;
         while (i < nS)
@@ -297,7 +357,10 @@ public:
                     const T wet = readCatmullRom(acc, rp, rf);
                     const int dryIdx = (dp - latency_) & dryMask_;
                     const T drySample = dry[static_cast<size_t>(dryIdx)];
-                    out[k] = drySample + (wet - drySample) * mixVal;
+                    const T mixVal = mixStart + mixStep * static_cast<T>(i + k);
+                    // Two-product blend: exact at both ends (mix 1 emits the
+                    // wet stream bit-exactly, mix 0 the delayed dry).
+                    out[k] = drySample * (T(1) - mixVal) + wet * mixVal;
 
                     rf += ratioActive_;
                     const auto adv = static_cast<int64_t>(rf);
@@ -327,6 +390,8 @@ public:
 
             i += chunk;
         }
+
+        currentMix_ = mixTarget;   // exact landing
     }
 
 private:
@@ -362,7 +427,7 @@ private:
                  + f * (T(3) * (x1 - x2) + x3 - x0)));
     }
 
-    /** @brief One analysis→synthesis frame for all channels. */
+    /** @brief One analysis->synthesis frame for all channels. */
     void processHop(int nCh) noexcept
     {
         // --- glide the active ratio toward the target (max 0.5 st per hop) ----
@@ -451,7 +516,7 @@ private:
             return;
         }
 
-        // --- find spectral peaks (local maxima over ±2 bins, above floor) -----
+        // --- find spectral peaks (local maxima over +-2 bins, above floor) -----
         T maxMag = T(0);
         for (int k = 0; k < numBins_; ++k)
             maxMag = std::max(maxMag, mag_[static_cast<size_t>(k)]);
@@ -685,7 +750,7 @@ private:
     // -- Members -----------------------------------------------------------------
     double sampleRate_ = 48000.0;
     int numChannels_ = 0;
-    bool prepared_ = false;
+    std::atomic<bool> prepared_ { false };
 
     int fftSize_ = 2048;
     int numBins_ = 1025;
@@ -693,9 +758,10 @@ private:
     int ringMask_ = 2047;
     int accumSize_ = 8192;
     int accumMask_ = 8191;
-    int latency_ = 2560;
-    int drySize_ = 4096;
-    int dryMask_ = 4095;
+    int readOffset_ = 2560;   ///< Reader distance behind the write head.
+    int latency_ = 4096;      ///< Measured wet latency (= readOffset_ + N - Rs).
+    int drySize_ = 8192;
+    int dryMask_ = 8191;
 
     std::unique_ptr<FFTReal<T>> fft_;
     std::vector<T> window_;
@@ -726,6 +792,7 @@ private:
     int inputSinceHop_ = 0;
     double onsetEnv_ = 0.0;
     bool firstFrame_ = true;
+    T currentMix_ = T(1);     ///< Audio-thread mix ramp state (exact landing).
 
     std::atomic<T> semitones_ { T(0) };
     std::atomic<T> mix_ { T(1) };

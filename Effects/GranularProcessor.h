@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -11,13 +11,23 @@
  * grains. Each grain reads from a jittered position behind the write head
  * with its own playback rate (pitch), Hann envelope (shared table) and
  * equal-power pan; `freeze` stops capture so the cloud orbits the held
- * buffer — the classic texture/freeze instrument.
+ * buffer - the classic texture/freeze instrument.
  *
  * Spawning uses a fractional accumulator (exact average density), grain
  * parameters are randomized per spawn with deterministic LCG state, and
  * everything is preallocated: zero allocation, zero latency.
  *
- * Dependencies: AudioSpec.h, AudioBuffer.h, DspMath.h, DenormalGuard.h.
+ * Threading model: parameter setters/getters are std::atomic based and safe
+ * from any thread (non-finite values are ignored). prepare() is setup-thread
+ * only (allocates; invalid specs are ignored and an unprepared instance
+ * passes audio through). reset() belongs to the stream owner.
+ * getState()/setState() are setup/UI threads. The dry/wet mix is smoothed
+ * linearly over one block (the grain cloud is decorrelated from the dry
+ * signal, so an unsmoothed step would click). Channels beyond the first two
+ * pass through untouched.
+ *
+ * Dependencies: Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h,
+ * Core/DenormalGuard.h, Core/StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -30,6 +40,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -51,12 +62,21 @@ public:
 
     /**
      * @brief Allocates the capture ring and grain pool.
+     *
+     * Invalid specs (non-positive/non-finite rate, block size or channel
+     * count) are ignored: the previous state is kept and an unprepared
+     * instance stays pass-through. A non-finite bufferSeconds falls back to
+     * the 4 s default.
+     *
      * @param spec          Audio environment specification.
-     * @param bufferSeconds Capture history length (default 4 s).
+     * @param bufferSeconds Capture history length, clamped to [0.5, 16] s
+     *                      (default 4 s).
      */
     void prepare(const AudioSpec& spec, double bufferSeconds = 4.0)
     {
-        if (spec.sampleRate <= 0.0 || spec.numChannels < 1) return;
+        if (!spec.isValid()) return;
+        if (!std::isfinite(bufferSeconds)) bufferSeconds = 4.0;
+        prepared_.store(false, std::memory_order_relaxed);
         sampleRate_ = spec.sampleRate;
         numChannels_ = std::min(spec.numChannels, 2);
 
@@ -72,56 +92,69 @@ public:
             window_[static_cast<size_t>(i)] = static_cast<T>(
                 0.5 - 0.5 * std::cos(2.0 * 3.14159265358979 * i / (kWindowSize - 1)));
 
-        prepared_ = true;
+        prepared_.store(true, std::memory_order_relaxed);
         reset();
     }
 
     /** @brief Kills all grains and clears the capture ring. RT-safe. */
     void reset() noexcept
     {
-        if (!prepared_) return;
+        if (!prepared_.load(std::memory_order_relaxed)) return;
         for (auto& r : ring_) std::fill(r.begin(), r.end(), T(0));
         for (auto& g : grains_) g.active = false;
         writePos_ = 0;
         spawnAcc_ = 0.0;
         rng_ = 0x9E3779B9u;
+        currentMix_ = mix_.load(std::memory_order_relaxed);
     }
 
     // -- Parameters (thread-safe) ---------------------------------------------------
 
-    /** @brief Grain duration in milliseconds [10, 500] (default 80). */
+    /** @brief Grain duration in milliseconds [10, 500] (default 80).
+     *  Non-finite values are ignored. */
     void setGrainSize(T ms) noexcept
     {
+        if (!std::isfinite(ms)) return;
         grainMs_.store(std::clamp(ms, T(10), T(500)), std::memory_order_relaxed);
     }
 
-    /** @brief Grains per second [1, 200] (default 25). */
+    /** @brief Grains per second [1, 200] (default 25). Non-finite values are
+     *  ignored. */
     void setDensity(T perSecond) noexcept
     {
+        if (!std::isfinite(perSecond)) return;
         density_.store(std::clamp(perSecond, T(1), T(200)), std::memory_order_relaxed);
     }
 
-    /** @brief Position jitter [0, 1]: how far back grains may start (default 0.3). */
+    /** @brief Position jitter [0, 1]: how far back grains may start (default 0.3).
+     *  Non-finite values are ignored. */
     void setJitter(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         jitter_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
-    /** @brief Per-grain pitch shift in semitones [-24, +24] (default 0). */
+    /** @brief Per-grain pitch shift in semitones [-24, +24] (default 0).
+     *  Non-finite values are ignored. */
     void setPitch(T semitones) noexcept
     {
+        if (!std::isfinite(semitones)) return;
         pitchSt_.store(std::clamp(semitones, T(-24), T(24)), std::memory_order_relaxed);
     }
 
-    /** @brief Random pitch spread per grain in semitones [0, 12] (default 0). */
+    /** @brief Random pitch spread per grain in semitones [0, 12] (default 0).
+     *  Non-finite values are ignored. */
     void setPitchJitter(T semitones) noexcept
     {
+        if (!std::isfinite(semitones)) return;
         pitchJitterSt_.store(std::clamp(semitones, T(0), T(12)), std::memory_order_relaxed);
     }
 
-    /** @brief Stereo spread of grain panning [0, 1] (default 0.5). */
+    /** @brief Stereo spread of grain panning [0, 1] (default 0.5).
+     *  Non-finite values are ignored. */
     void setSpread(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         spread_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
@@ -131,11 +164,22 @@ public:
         freeze_.store(frozen, std::memory_order_relaxed);
     }
 
-    /** @brief Dry/wet mix [0, 1] (default 1). */
+    /** @brief Dry/wet mix [0, 1] (default 1); smoothed linearly over one
+     *  block. Non-finite values are ignored. */
     void setMix(T mix) noexcept
     {
+        if (!std::isfinite(mix)) return;
         mix_.store(std::clamp(mix, T(0), T(1)), std::memory_order_relaxed);
     }
+
+    [[nodiscard]] T getGrainSize() const noexcept { return grainMs_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getDensity() const noexcept { return density_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getJitter() const noexcept { return jitter_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getPitch() const noexcept { return pitchSt_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getPitchJitter() const noexcept { return pitchJitterSt_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getSpread() const noexcept { return spread_.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool getFreeze() const noexcept { return freeze_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
 
     /** @brief Zero: the cloud is parallel to the dry path. */
     [[nodiscard]] static constexpr int getLatency() noexcept { return 0; }
@@ -144,14 +188,16 @@ public:
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
         StateWriter w(stateId("GRAN"), 1);
-        w.write("grainMs", grainMs_.load(std::memory_order_relaxed));
-        w.write("density", density_.load(std::memory_order_relaxed));
-        w.write("jitter", jitter_.load(std::memory_order_relaxed));
-        w.write("pitch", pitchSt_.load(std::memory_order_relaxed));
-        w.write("pitchJitter", pitchJitterSt_.load(std::memory_order_relaxed));
-        w.write("spread", spread_.load(std::memory_order_relaxed));
+        // Explicit float casts: the blob stores float, and with T = double the
+        // unqualified write(key, double) would be ambiguous (float/int32/bool).
+        w.write("grainMs", static_cast<float>(grainMs_.load(std::memory_order_relaxed)));
+        w.write("density", static_cast<float>(density_.load(std::memory_order_relaxed)));
+        w.write("jitter", static_cast<float>(jitter_.load(std::memory_order_relaxed)));
+        w.write("pitch", static_cast<float>(pitchSt_.load(std::memory_order_relaxed)));
+        w.write("pitchJitter", static_cast<float>(pitchJitterSt_.load(std::memory_order_relaxed)));
+        w.write("spread", static_cast<float>(spread_.load(std::memory_order_relaxed)));
         w.write("freeze", freeze_.load(std::memory_order_relaxed));
-        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -173,10 +219,11 @@ public:
 
     // -- Processing -------------------------------------------------------------------
 
-    /** @brief Processes a block in-place (1 or 2 channels). */
+    /** @brief Processes a block in-place (1 or 2 channels). Pass-through
+     *  until prepare() succeeds. */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        if (!prepared_) return;
+        if (!prepared_.load(std::memory_order_relaxed)) return;
         DenormalGuard guard;
 
         const int nCh = std::min(buffer.getNumChannels(), numChannels_);
@@ -184,7 +231,13 @@ public:
         if (nCh == 0 || nS == 0) return;
 
         const bool frozen = freeze_.load(std::memory_order_relaxed);
-        const T mixVal = mix_.load(std::memory_order_relaxed);
+        // Linear per-block mix ramp with exact landing (settled: step == 0
+        // and the per-sample value reduces to the constant, bit-identically).
+        // The cloud is decorrelated from the dry signal: a hard flip clicked
+        // at 11x the steady-state sample delta.
+        const T mixTarget = mix_.load(std::memory_order_relaxed);
+        const T mixStart  = currentMix_;
+        const T mixStep   = (mixTarget - mixStart) / static_cast<T>(nS);
         const double spawnPerSample =
             static_cast<double>(density_.load(std::memory_order_relaxed)) / sampleRate_;
 
@@ -239,6 +292,7 @@ public:
                     g.active = false;
             }
 
+            const T mixVal = mixStart + mixStep * static_cast<T>(i);
             const T dryL = buffer.getChannel(0)[i];
             buffer.getChannel(0)[i] = dryL + (outL - dryL) * mixVal;
             if (nCh > 1)
@@ -247,6 +301,7 @@ public:
                 buffer.getChannel(1)[i] = dryR + (outR - dryR) * mixVal;
             }
         }
+        currentMix_ = mixTarget;   // exact landing
     }
 
 private:
@@ -312,7 +367,7 @@ private:
     // -- Members --------------------------------------------------------------------
     double sampleRate_ = 48000.0;
     int numChannels_ = 0;
-    bool prepared_ = false;
+    std::atomic<bool> prepared_ { false };
 
     std::array<std::vector<T>, 2> ring_;
     int ringMask_ = 0;
@@ -322,6 +377,7 @@ private:
     std::array<Grain, kMaxGrains> grains_;
     double spawnAcc_ = 0.0;
     uint32_t rng_ = 0x9E3779B9u;
+    T currentMix_ = T(1);   ///< Audio-thread mix ramp state.
 
     std::atomic<T> grainMs_ { T(80) };
     std::atomic<T> density_ { T(25) };

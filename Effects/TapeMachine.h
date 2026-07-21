@@ -34,6 +34,14 @@
  *    hiss generator uses its own RNG stream, so enabling noise never changes
  *    the transport's realisation.
  * 5. **Tape hiss** (optional, default off).
+ * 6. **LF alignment**: the dynamic JA loop gains extra level toward low
+ *    frequencies at programme level (the expansive knee of the loop, worse
+ *    at low bias and with the NAB record boost) - measured +2..+7 dB below
+ *    50 Hz depending on bias. Like a real machine's LF EQ trimmer, the
+ *    calibration also measures the loop gain at 40 Hz and a corrective
+ *    low shelf flattens the response per bias/drive setting; a 2nd-order
+ *    24 Hz high-pass models the AC-coupled playback amplifier (kills DC
+ *    from remanence and subsonics, like the hardware's LF roll-off).
  *
  * The dry path of the mix control is delay-compensated to getLatency(). The
  * mix is applied per block without smoothing: the wet stream is correlated
@@ -117,6 +125,16 @@ public:
         playHF_.assign(static_cast<size_t>(numChannels_), {});
         playLF_.assign(static_cast<size_t>(numChannels_), {});
         headBump_.assign(static_cast<size_t>(numChannels_), {});
+        trimShelf_.assign(static_cast<size_t>(numChannels_), {});
+
+        // AC-coupled playback amplifier: fixed 2nd-order 24 Hz high-pass
+        // (real machines roll off there; also blocks remanence DC).
+        outHp_.assign(static_cast<size_t>(numChannels_), {});
+        {
+            const auto hc = BiquadCoeffs<double>::makeHighPass(sampleRate_, 24.0, 0.707);
+            for (auto& h : outHp_)
+                h = PeakSection { hc.b0, hc.b1, hc.b2, hc.a1, hc.a2, 0.0, 0.0 };
+        }
 
         firState_.assign(static_cast<size_t>(numChannels_),
                          std::vector<T>(static_cast<size_t>(kFirRing), T(0)));
@@ -163,7 +181,11 @@ public:
         for (auto& s : recordLF_) s.clear();
         for (auto& s : playHF_) s.clear();
         for (auto& s : playLF_) s.clear();
-        for (auto& b : headBump_) b = {};
+        for (auto& s : trimShelf_) s.clear();
+        // Clear STATE only: wiping coefficients here used to leave the head
+        // bump at identity until the next parameter change re-ran recompute.
+        for (auto& b : headBump_) b.clear();
+        for (auto& h : outHp_) h.clear();
         firPos_ = 0;
         delayPos_ = 0;
         dryPos_ = 0;
@@ -419,9 +441,14 @@ public:
                       + frac * (T(2) * p0 - T(5) * p1 + T(4) * p2 - p3
                       + frac * (T(3) * (p1 - p2) + p3 - p0)));
 
-                // Playback EQ (exact inverse de-emphasis).
-                w = static_cast<T>(playLF_[static_cast<size_t>(ch)].process(
-                        playHF_[static_cast<size_t>(ch)].process(static_cast<double>(w))));
+                // Playback EQ (exact inverse de-emphasis) + LF alignment trim.
+                w = static_cast<T>(trimShelf_[static_cast<size_t>(ch)].process(
+                        playLF_[static_cast<size_t>(ch)].process(
+                            playHF_[static_cast<size_t>(ch)].process(static_cast<double>(w)))));
+
+                // AC-coupled playback amplifier (2nd-order 24 Hz high-pass:
+                // subsonic/DC roll-off of the real hardware).
+                w = outHp_[static_cast<size_t>(ch)].process(w);
 
                 // Hiss (own RNG stream: enabling it must not change the
                 // transport modulation's realisation).
@@ -464,12 +491,13 @@ private:
         }
     };
 
-    /** @brief Minimal peaking biquad in double (head bump). */
+    /** @brief Minimal biquad in double (head bump, output high-pass). */
     struct PeakSection
     {
         double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
         double z1 = 0.0, z2 = 0.0;
 
+        void clear() noexcept { z1 = 0.0; z2 = 0.0; }
         [[nodiscard]] T process(T x) noexcept
         {
             const double in = static_cast<double>(x);
@@ -503,8 +531,8 @@ private:
     /** @brief Rebuilds everything affected by drive/bias/speed/standard/loss. */
     void recompute() noexcept
     {
-        const double drive = std::pow(10.0, static_cast<double>(
-            driveDb_.load(std::memory_order_relaxed)) / 20.0);
+        const double driveDbV = static_cast<double>(driveDb_.load(std::memory_order_relaxed));
+        const double drive = std::pow(10.0, driveDbV / 20.0);
         const double bias = static_cast<double>(bias_.load(std::memory_order_relaxed));
         const auto speed = static_cast<Speed>(speed_.load(std::memory_order_relaxed));
         const auto standard = static_cast<Standard>(standard_.load(std::memory_order_relaxed));
@@ -522,44 +550,6 @@ private:
         const double cEff = std::clamp(0.35 + 0.6 * bias, 0.05, 0.95);
         for (auto& h : hysteresis_)
             h.setParameters(3.5e5, 2.2e4, 1.6e-3, kEff, cEff);
-
-        // --- drive scaling with operating-level makeup -------------------------
-        // 0 dBFS at nominal drive maps to H = 1.2a: moderate saturation. Tape
-        // gain is inherently level-dependent (the virgin JA curve is expansive
-        // into its knee), so unity can only be defined at one operating point:
-        // we calibrate empirically at -12 dBFS programme level by running a
-        // short 1 kHz burst through a scratch hysteresis instance (~8 ms of
-        // model time, only on parameter changes). Quieter material reads
-        // slightly low, hotter material blooms into compression - like tape.
-        hScale_ = drive * 1.2 * 2.2e4;
-        {
-            constexpr double kCalAmp = 0.25;            // -12 dBFS reference
-            const double fs2 = sampleRate_ * 2.0;
-            const int calN = static_cast<int>(0.008 * fs2);   // 8 ms = 8 cycles
-            calib_.prepare(fs2);
-            calib_.setParameters(3.5e5, 2.2e4, 1.6e-3, kEff, cEff);
-            double inSq = 0.0, outSq = 0.0;
-            for (int i = 0; i < calN; ++i)
-            {
-                const double x = kCalAmp * std::sin(2.0 * std::numbers::pi * 1000.0 * i / fs2);
-                const double m = static_cast<double>(
-                    calib_.processSample(static_cast<T>(hScale_ * x)));
-                if (i >= calN / 2)   // measure once the loop has settled
-                {
-                    inSq += x * x;
-                    outSq += m * m;
-                }
-            }
-            mScale_ = (outSq > 0.0) ? std::sqrt(inSq / outSq) : 1.0;
-
-            // Partial loudness link: the per-drive calibration above pins the
-            // reference level EXACTLY, which kills the drive knob (inaudible
-            // below 0 dB where tape stays clean, a pure attenuator above as
-            // compression eats level). A +0.25 dB/dB residual slope keeps it
-            // alive: backing off cleans AND drops slightly, pushing holds
-            // level while the tape density grows.
-            mScale_ *= std::pow(drive, 0.25);
-        }
 
         // --- EQ time constants per standard and speed --------------------------
         double t2 = 50e-6;                 // HF time constant
@@ -579,6 +569,82 @@ private:
         constexpr double kHiCap = 4.0;     // +12 dB emphasis cap (practical alignment)
         constexpr double kLoBoost = 2.0;   // +6 dB NAB LF record boost
         const double tLo = 3180e-6;
+
+        // --- drive scaling with operating-level makeup -------------------------
+        // 0 dBFS at nominal drive maps to H = 1.2a: moderate saturation. Tape
+        // gain is inherently level-dependent (the virgin JA curve is expansive
+        // into its knee), so unity can only be defined at one operating point:
+        // we calibrate empirically at -12 dBFS programme level by running a
+        // short 1 kHz burst through a scratch hysteresis instance (a few
+        // thousand model samples, only on parameter changes). Quieter material
+        // reads slightly low, hotter material blooms into compression - like
+        // tape.
+        hScale_ = drive * 1.2 * 2.2e4;
+        double g1k = 1.0;
+        {
+            constexpr double kCalAmp = 0.25;            // -12 dBFS reference
+            const double fs2 = sampleRate_ * 2.0;
+            const int calN = static_cast<int>(0.008 * fs2);   // 8 ms = 8 cycles
+            calib_.prepare(fs2);
+            calib_.setParameters(3.5e5, 2.2e4, 1.6e-3, kEff, cEff);
+            double inSq = 0.0, outSq = 0.0;
+            for (int i = 0; i < calN; ++i)
+            {
+                const double x = kCalAmp * std::sin(2.0 * std::numbers::pi * 1000.0 * i / fs2);
+                const double m = static_cast<double>(
+                    calib_.processSample(static_cast<T>(hScale_ * x)));
+                if (i >= calN / 2)   // measure once the loop has settled
+                {
+                    inSq += x * x;
+                    outSq += m * m;
+                }
+            }
+            g1k = (outSq > 0.0 && inSq > 0.0) ? std::sqrt(outSq / inSq) : 1.0;
+            mScale_ = 1.0 / g1k;
+
+            // Partial loudness link: the per-drive calibration above pins the
+            // reference level EXACTLY, which kills the drive knob (inaudible
+            // below 0 dB where tape stays clean, a pure attenuator above as
+            // compression eats level). A +0.25 dB/dB residual slope keeps it
+            // alive: backing off cleans AND drops slightly, pushing holds
+            // level while the tape density grows.
+            mScale_ *= std::pow(drive, 0.25);
+        }
+
+        // --- LF alignment trim (baked) ------------------------------------------
+        // At programme level the dynamic JA loop settles on a history-dependent
+        // branch whose LF gain exceeds its 1 kHz gain (the c/k bias shortcut
+        // keeps the loop's branch memory that a real machine's AC bias erases):
+        // measured +2..+7 dB below 50 Hz depending on bias/drive. Like the LF
+        // EQ trimmer of a real machine's alignment, flatten it with a
+        // first-order low shelf. The correction is baked from measurements of
+        // the real streaming path at 40 Hz vs 1 kHz (bias 0.5 anchor row per
+        // standard, drive axis interpolated, scaled by the loop fraction
+        // 1 - cEff). Residual is < ~0.5 dB typical, up to ~1 dB at extreme
+        // under-bias (left as documented under-bias character). A runtime
+        // measurement cannot do better: the branch depends on the programme
+        // history itself.
+        double trimDc = 1.0;
+        {
+            static constexpr double kDrv[7] = { -12.0, -6.0, 0.0, 6.0, 12.0, 18.0, 24.0 };
+            static constexpr double kExcNab[7]  = { 0.26, 0.81, 1.70, 2.09, 1.43, 0.21, -0.49 };
+            static constexpr double kExcCcir[7] = { 0.05, 0.22, 0.72, 1.51, 1.83, 1.66, 1.72 };
+            const double* exc = useLF ? kExcNab : kExcCcir;
+            double e = exc[6];
+            if (driveDbV <= kDrv[0])
+                e = exc[0];
+            else
+                for (int i = 1; i < 7; ++i)
+                    if (driveDbV <= kDrv[i])
+                    {
+                        const double t = (driveDbV - kDrv[i - 1]) / (kDrv[i] - kDrv[i - 1]);
+                        e = exc[i - 1] + (exc[i] - exc[i - 1]) * t;
+                        break;
+                    }
+            e *= (1.0 - cEff) / 0.35;                       // loop-fraction scaling
+            const double trimDb = std::clamp(-e / 0.75, -6.0, 0.5);
+            trimDc = std::pow(10.0, trimDb / 20.0);
+        }
 
         for (int ch = 0; ch < numChannels_; ++ch)
         {
@@ -602,6 +668,13 @@ private:
             const double qx1 = plf.x1, qy1 = plf.y1;
             plf = useLF ? makeLFShelf(tLo, kLoBoost, sampleRate_, true) : ShelfSection {};
             plf.x1 = qx1; plf.y1 = qy1;
+
+            // LF alignment trim (corner ~70 Hz, DC gain = baked correction).
+            auto& trim = trimShelf_[static_cast<size_t>(ch)];
+            const double tx1 = trim.x1, ty1 = trim.y1;
+            trim = makeLFShelf(1.0 / (2.0 * std::numbers::pi * 70.0), trimDc,
+                               sampleRate_, false);
+            trim.x1 = tx1; trim.y1 = ty1;
         }
 
         // --- loss-effect FIR (63 taps, linear phase) ---------------------------
@@ -717,7 +790,9 @@ private:
     Hysteresis<T> calib_;   ///< Scratch instance for makeup calibration.
 
     std::vector<ShelfSection> recordHF_, recordLF_, playHF_, playLF_;
+    std::vector<ShelfSection> trimShelf_;   ///< Measured LF alignment trim.
     std::vector<PeakSection> headBump_;
+    std::vector<PeakSection> outHp_;        ///< AC-coupling 24 Hz high-pass.
 
     std::vector<T> firTaps_;
     std::vector<std::vector<T>> firState_;

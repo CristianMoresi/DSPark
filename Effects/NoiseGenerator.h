@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -8,10 +8,18 @@
  * @brief Audio noise generator conforming to the AudioProcessor contract.
  *
  * Generates white, pink, or brown noise using AnalogRandom internally.
- * Follows the standard prepare/processBlock/reset pattern. This acts as a 
- * signal generator, completely overwriting the input buffer.
+ * Follows the standard prepare/processBlock/reset pattern. This acts as a
+ * signal generator, completely overwriting the input buffer (channels beyond
+ * the prepared count are left untouched).
  *
- * Dependencies: AnalogRandom.h, DspMath.h, AudioSpec.h, AudioBuffer.h.
+ * Threading: prepare() belongs to the setup thread (allocates). processBlock()
+ * and reset() belong to the audio thread. Setters are lock-free atomic
+ * publications, safe from any thread; a type change is applied at the next
+ * processBlock(). Non-finite gains are ignored (setLevel(-inf) is the
+ * documented silence and maps to gain 0).
+ *
+ * Dependencies: AnalogRandom.h, DspMath.h, AudioSpec.h, AudioBuffer.h,
+ *               StateBlob.h.
  *
  * @code
  *   dspark::NoiseGenerator<float> noise;
@@ -19,7 +27,7 @@
  *   noise.setType(dspark::NoiseGenerator<float>::Type::Pink);
  *   noise.setLevel(-12.0f);
  *
- *   // In audio callback — fills the buffer with noise:
+ *   // In the audio callback, fills the buffer with noise:
  *   noise.processBlock(buffer);
  * @endcode
  */
@@ -32,7 +40,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace dspark {
@@ -47,7 +58,7 @@ namespace dspark {
  *
  * @tparam T Sample type (float or double).
  */
-template <typename T>
+template <FloatType T>
 class NoiseGenerator
 {
 public:
@@ -60,12 +71,18 @@ public:
 
     /**
      * @brief Prepares the noise generator and allocates internal state.
+     *
+     * An invalid spec (non-positive or non-finite fields) is a no-op that
+     * keeps the previous state.
+     *
      * @param spec Audio environment specification containing sample rate and channel count.
      */
     void prepare(const AudioSpec& spec)
     {
-        sampleRate_ = std::max<double>(1.0, spec.sampleRate);
-        int targetChannels = std::max<int>(0, spec.numChannels);
+        if (!spec.isValid()) return; // release-safe: keep previous state
+
+        sampleRate_ = spec.sampleRate;
+        int targetChannels = spec.numChannels;
 
         generators_.clear();
         generators_.reserve(static_cast<size_t>(targetChannels));
@@ -85,14 +102,14 @@ public:
             gen.reseed(static_cast<uint64_t>(ch + 1) * 0x9E3779B97F4A7C15ULL);
             generators_.push_back(std::move(gen));
         }
-        
+
         // Sync smoothing state to prevent ramp-up from zero on first block
         currentGain_ = gain_.load(std::memory_order_relaxed);
     }
 
     /**
      * @brief Fills the buffer with generated noise.
-     * 
+     *
      * Overwrites all existing data in the buffer. Applies smoothed gain changes
      * transparently. Real-time safe (lock-free, zero allocations).
      *
@@ -150,13 +167,21 @@ public:
 
     /**
      * @brief Resets the internal PRNG and filter states.
-     * Useful for determinism when rendering offline.
+     *
+     * Restores the per-channel deterministic seeds too, so an offline render
+     * after reset() reproduces the exact same noise sequence (the generator's
+     * own reset() only clears filter state; the PRNG would otherwise continue
+     * from wherever it was).
      */
     void reset() noexcept
     {
+        int ch = 0;
         for (auto& gen : generators_)
+        {
             gen.reset();
-            
+            gen.reseed(static_cast<uint64_t>(++ch) * 0x9E3779B97F4A7C15ULL);
+        }
+
         currentGain_ = gain_.load(std::memory_order_relaxed);
     }
 
@@ -170,44 +195,51 @@ public:
      */
     void setType(Type type) noexcept
     {
-        type_.store(type, std::memory_order_relaxed);
+        // Wild enum values (a corrupted blob, a stray cast) clamp into range.
+        const int t = std::clamp(static_cast<int>(type), 0,
+                                 static_cast<int>(Type::Brown));
+        type_.store(static_cast<Type>(t), std::memory_order_relaxed);
         typeDirty_.store(true, std::memory_order_release);
     }
 
     /**
      * @brief Sets the output level in decibels. Thread-safe.
-     * @param levelDb Level in dB (0 = unity, -inf = silence).
+     * @param levelDb Level in dB (0 = unity, -inf = silence). NaN and +inf
+     *                are ignored; -inf maps to gain 0 as documented.
      */
     void setLevel(T levelDb) noexcept
     {
-        setGain(decibelsToGain(levelDb));
+        if (std::isnan(levelDb) || levelDb > T(1e6)) return; // rejects +inf too
+        setGain(decibelsToGain(levelDb)); // -inf (<= -100 dB) maps to 0
     }
 
     /**
      * @brief Sets the output level as linear gain. Thread-safe.
      * @param gain Linear gain coefficient (1.0 = unity).
+     *             Non-finite values are ignored.
      */
     void setGain(T gain) noexcept
     {
+        if (!std::isfinite(gain)) return;
         gain_.store(gain, std::memory_order_relaxed);
     }
 
-    /** 
+    /**
      * @brief Retrieves the currently requested noise type.
      * @return The active NoiseGenerator::Type.
      */
-    [[nodiscard]] Type getType() const noexcept 
-    { 
-        return type_.load(std::memory_order_relaxed); 
+    [[nodiscard]] Type getType() const noexcept
+    {
+        return type_.load(std::memory_order_relaxed);
     }
 
-    /** 
+    /**
      * @brief Retrieves the current target gain in linear scale.
      * @return The linear gain coefficient.
      */
-    [[nodiscard]] T getGain() const noexcept 
-    { 
-        return gain_.load(std::memory_order_relaxed); 
+    [[nodiscard]] T getGain() const noexcept
+    {
+        return gain_.load(std::memory_order_relaxed);
     }
 
 
@@ -248,14 +280,14 @@ private:
     }
 
     double sampleRate_ = 44100.0;
-    
+
     // Core parameters (Thread-safe)
     std::atomic<T> gain_ { T(1) };
     std::atomic<Type> type_ { Type::White };
     std::atomic<bool> typeDirty_ { false };
-    
+
     // Internal state (Audio thread only)
-    T currentGain_ { T(1) }; 
+    T currentGain_ { T(1) };
 
     // Value semantics for memory locality. Avoids pointer chasing.
     std::vector<AnalogRandom::Generator<T>> generators_;

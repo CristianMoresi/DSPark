@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -14,11 +14,22 @@
  *
  * Architecture per band:
  * ```
- *   Sidechain → [Detector: BP / LP / HP per shape] → Peak Detect → Gain Computer → Ballistics → [Bell / Shelf EQ]
+ *   Sidechain -> [Detector: BP / LP / HP per shape] -> Peak Detect -> Gain Computer -> Ballistics -> [Bell / Shelf EQ]
  * ```
  *
- * @note Thread-safe parameter updates via `std::atomic` ensuring zero-locking
- *       in the real-time audio thread.
+ * Threading model:
+ * - prepare() / reset() / setOversampling() / getState() / setState(): setup
+ *   or UI threads only, never concurrently with processBlock().
+ * - setBand() (seqlock publish, single producer) / setNumBands() /
+ *   setLookahead(): RT-safe from one control thread; the audio thread applies
+ *   them at the next block. Non-finite band fields keep the previous value.
+ * - getBandGainDb() is an atomic metering read; getLatency() is safe from any
+ *   thread once prepared.
+ * - Lookahead changes take effect immediately and may click (configure
+ *   before playback).
+ *
+ * Dependencies: AudioBuffer.h, AudioSpec.h, Biquad.h, DspMath.h,
+ *               Oversampling.h, RingBuffer.h, DenormalGuard.h, StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -34,8 +45,12 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <type_traits>
+#include <vector>
 
 namespace dspark {
 
@@ -50,10 +65,6 @@ template <FloatType T, int MaxBands = 8>
 class DynamicEQ
 {
 public:
-    /**
-     * @brief Full configuration for a single dynamic EQ band.
-     * @note Must remain trivially copyable to allow lock-free atomic updates.
-     */
     /** @brief Shape of the dynamic gain filter (and its detector region). */
     enum class BandShape
     {
@@ -62,6 +73,10 @@ public:
         HighShelf   ///< Dynamic high shelf; detector hears above freq.
     };
 
+    /**
+     * @brief Full configuration for a single dynamic EQ band.
+     * @note Must remain trivially copyable for the lock-free seqlock publish.
+     */
     struct BandConfig
     {
         T frequency      = T(1000);
@@ -100,6 +115,8 @@ public:
      */
     void prepare(const AudioSpec& spec)
     {
+        if (!spec.isValid()) return; // invalid specs are ignored (state kept)
+        isPrepared_.store(false, std::memory_order_relaxed); // basic guarantee
         spec_ = spec;
         sampleRate_ = spec.sampleRate;
 
@@ -125,7 +142,7 @@ public:
 
         updateLookahead();
         reset();
-        isPrepared_ = true;
+        isPrepared_.store(true, std::memory_order_relaxed);
     }
 
     /**
@@ -144,7 +161,17 @@ public:
      */
     void processBlock(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
     {
-        if (!isPrepared_) return;
+        if (!isPrepared_.load(std::memory_order_relaxed)) return;
+
+        // A sidechain shorter than the audio block would be read past its
+        // end; fall back to self-keying instead of over-reading the caller.
+        if (sidechain.getNumChannels() <= 0 ||
+            sidechain.getNumSamples() < audio.getNumSamples())
+        {
+            if (audio.getNumChannels() <= 0) return;
+            sidechain = audio;
+        }
+
         DenormalGuard guard;
 
         if (oversamplingFactor_ > 1 && oversampler_ && oversamplerSc_)
@@ -169,13 +196,35 @@ public:
 
     /**
      * @brief Thread-safe configuration update for a specific band.
+     *
+     * Fields are sanitized on the way in: non-finite values keep the band's
+     * previously published value (a NaN frequency/Q/time used to poison the
+     * detector or the gain ballistics permanently), wild shape enums are
+     * clamped, and the range fields are floored at 0.
      */
     void setBand(int band, const BandConfig& config) noexcept
     {
         if (band < 0 || band >= MaxBands) return;
+
+        BandConfig c = config;
+        const BandConfig& prev = configs_[static_cast<size_t>(band)];
+        auto keep = [](T v, T fallback) { return std::isfinite(v) ? v : fallback; };
+        c.frequency      = std::max(keep(c.frequency, prev.frequency), T(1));
+        c.q              = keep(c.q, prev.q);
+        c.threshold      = keep(c.threshold, prev.threshold);
+        c.shape          = static_cast<BandShape>(std::clamp(static_cast<int>(c.shape), 0, 2));
+        c.aboveRatio     = keep(c.aboveRatio, prev.aboveRatio);
+        c.aboveAttackMs  = keep(c.aboveAttackMs, prev.aboveAttackMs);
+        c.aboveReleaseMs = keep(c.aboveReleaseMs, prev.aboveReleaseMs);
+        c.aboveRangeDb   = std::max(keep(c.aboveRangeDb, prev.aboveRangeDb), T(0));
+        c.belowRatio     = keep(c.belowRatio, prev.belowRatio);
+        c.belowAttackMs  = keep(c.belowAttackMs, prev.belowAttackMs);
+        c.belowReleaseMs = keep(c.belowReleaseMs, prev.belowReleaseMs);
+        c.belowRangeDb   = std::max(keep(c.belowRangeDb, prev.belowRangeDb), T(0));
+
         // Seqlock publish (lock-free, no atomic<BigStruct> mutex).
         configSeq_[band].fetch_add(1, std::memory_order_acq_rel); // odd
-        configs_[band] = config;
+        configs_[static_cast<size_t>(band)] = c;
         configSeq_[band].fetch_add(1, std::memory_order_release); // even
         paramsDirty_[band].store(true, std::memory_order_release);
     }
@@ -185,17 +234,40 @@ public:
         numBands_.store(std::clamp(n, 1, MaxBands), std::memory_order_relaxed);
     }
 
+    /**
+     * @brief Sets the oversampling factor (1, 2 or 4). Setup threads only:
+     *        this un-prepares the processor and requires a prepare() call.
+     */
     void setOversampling(int factor) noexcept
     {
         oversamplingFactor_ = std::clamp(factor, 1, 4);
         if (oversamplingFactor_ == 3) oversamplingFactor_ = 4;
-        isPrepared_ = false; // Forces user to call prepare()
+        isPrepared_.store(false, std::memory_order_relaxed); // Forces user to call prepare()
     }
 
+    /** @brief Sets the lookahead (0..10 ms). Applied immediately (may click);
+     *         non-finite values are ignored. */
     void setLookahead(T ms) noexcept
     {
+        if (!std::isfinite(ms)) return;
         lookaheadMs_ = std::clamp(ms, T(0), T(10));
         updateLookahead();
+    }
+
+    /**
+     * @brief Total latency in samples at the base rate.
+     *
+     * Lookahead delay plus the oversampler's group delay. Neither was
+     * reported before, so hosts could not compensate (PDC). Safe to call
+     * from the main thread once prepared (the oversampler only changes
+     * inside prepare()).
+     */
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        const int factor = std::max(oversamplingFactor_, 1);
+        const int la = lookaheadSamples_.load(std::memory_order_relaxed) / factor;
+        const int os = oversampler_ ? oversampler_->getLatency() : 0;
+        return la + os;
     }
 
     [[nodiscard]] T getBandGainDb(int band) const noexcept
@@ -376,7 +448,7 @@ private:
                 
                 currentGain += coeff * diff;
 
-                // Refresh gain-filter coefficients every 16 samples — the gain
+                // Refresh gain-filter coefficients every 16 samples - the gain
                 // envelope is slow enough that this granularity is inaudible.
                 // Bells use the precomputed freq/Q trig (a single pow() per
                 // refresh, F-059 performance fix); shelves run their full
@@ -455,14 +527,29 @@ private:
 
     void updateBandInternalState(int b, double fs) noexcept
     {
-        // Seqlock read of the published config (retry on a torn/in-progress write).
+        // Seqlock read of the published config (retry on a torn/in-progress
+        // write). The acquire fence between the copy and the relaxed re-read
+        // is required: an acquire LOAD only orders later accesses, so the
+        // copy could sink below the second read and a torn copy would pass
+        // the s0 == s1 check (same fix as Biquad's and FIRFilter's seqlocks).
         BandConfig cfg;
         unsigned s0, s1;
         do {
             s0  = configSeq_[b].load(std::memory_order_acquire);
-            cfg = configs_[b];
-            s1  = configSeq_[b].load(std::memory_order_acquire);
+            cfg = configs_[static_cast<size_t>(b)];
+            std::atomic_thread_fence(std::memory_order_acquire);
+            s1  = configSeq_[b].load(std::memory_order_relaxed);
         } while ((s0 & 1u) != 0u || s0 != s1);
+
+        // A band re-enabled after being disabled would replay arbitrarily old
+        // filter history and gain state: start it clean.
+        const bool wasEnabled = states_[b].cfg.enabled;
+        if (cfg.enabled && !wasEnabled)
+        {
+            bandDetector_[b].reset();
+            bandFilter_[b].reset();
+            currentGainDb_[b] = T(0);
+        }
         states_[b].cfg = cfg;
 
         // Detector listens where the gain filter acts: bandpass for bells,
@@ -523,10 +610,10 @@ private:
     }
 
     // -- State & Mem ---------------------------------------------------------
-    bool isPrepared_ = false;
+    std::atomic<bool> isPrepared_ { false };
     AudioSpec spec_ {};
     double sampleRate_ = 0;
-    
+
     std::atomic<int> numBands_ { 0 };
     // BandConfig (~50 bytes) is NOT lock-free as std::atomic, so publish it via a
     // per-band seqlock instead (single producer = control thread, single consumer

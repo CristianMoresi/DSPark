@@ -46,9 +46,10 @@
  * ```
  *
  * Key features:
- * - **Jot absorption filter** (Jot 1991): 1st-order shelving IIR per delay line
- *   for smooth frequency-dependent decay, the #1 factor for natural sound.
- *   Separate bass shelf for independent LF control.
+ * - **Jot absorption filter** (Jot 1991): 1st-order pole-zero shelving IIR per
+ *   delay line for smooth frequency-dependent decay, the #1 factor for natural
+ *   sound. DC and Nyquist gains anchor the mid/HF T60 exactly; the transition
+ *   sits at the high crossover. Separate bass shelf for independent LF control.
  * - **Hadamard 16x16**: all eigenvalues +/-1, zero coloring
  * - **Parallel allpass diffuser** (Signalsmith-inspired): 16 parallel allpass
  *   + 2-step Hadamard mixing -> 256 unique echo paths per input sample.
@@ -374,6 +375,7 @@ public:
         for (auto& buf : outDiffBufsR_) buf.reset();
 
         absState_.fill(T(0));
+        absX1_.fill(T(0));
         bassState_.fill(T(0));
         dcZ_.fill(T(0));
         prevFeedback_.fill(T(0));
@@ -582,22 +584,24 @@ public:
     }
 
     /**
-     * @brief Stores the intended HF decay crossover (informational for now).
+     * @brief Frequency where the HF decay transition is centered.
      *
-     * The current absorption stage is a first-order Jot shelf whose DC and
-     * Nyquist gains are both pinned by the decay multipliers, so it has no
-     * free parameter left for a transition frequency: this value is stored,
-     * serialized and reported by the getter, but does NOT affect the sound
-     * of the present engine. Kept for state/preset forward-compatibility
-     * (a higher-order absorption honouring it is the natural upgrade).
+     * The per-line absorption is a first-order pole-zero shelf pinned to the
+     * mid decay at DC and the HF decay at Nyquist (the T60 anchors stay exact
+     * for any crossover); this sets where the transition happens: the decay
+     * midpoint (geometric mean of the mid and HF loop gains) lands at this
+     * frequency. Lower values darken the tail earlier, higher values keep
+     * the damping in the top octaves only.
      *
      * @param hz Crossover in Hz (1000 - 16000). Default: 5000.
+     *           Non-finite values are ignored.
      */
     void setHighCrossover(T hz) noexcept
     {
         if (!std::isfinite(hz)) return;
         highCrossover_.store(std::clamp(hz, T(1000), T(16000)),
                              std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     /**
@@ -893,10 +897,15 @@ protected:
     std::array<RingBuffer<T>, kFDNSize> fdnDelays_;
     std::array<int, kFDNSize> fdnDelayLens_ {};
 
-    // Jot absorption filter state (per line)
-    std::array<T, kFDNSize> absB0_ {};       // feedforward: g_mid * (1 - damp)
-    std::array<T, kFDNSize> absA1_ {};       // feedback: damp coefficient
-    std::array<T, kFDNSize> absState_ {};    // filter state
+    // Jot absorption filter state (per line): first-order pole-zero shelf
+    // H(z) = (b0 + b1 z^-1) / (1 + a1 z^-1), designed so |H(1)| = gMid and
+    // |H(-1)| = gHigh EXACTLY (the T60 calibration anchors) with the
+    // transition midpoint sqrt(gMid * gHigh) placed at highCrossover_.
+    std::array<T, kFDNSize> absB0_ {};       // feedforward x[n]
+    std::array<T, kFDNSize> absB1_ {};       // feedforward x[n-1]
+    std::array<T, kFDNSize> absA1_ {};       // feedback y[n-1] (denominator sign)
+    std::array<T, kFDNSize> absX1_ {};       // x[n-1] state
+    std::array<T, kFDNSize> absState_ {};    // y[n-1] state
 
     // Bass shelf state (per line)
     std::array<T, kFDNSize> bassRatio_ {};   // g_bass / g_mid
@@ -1419,11 +1428,17 @@ protected:
         {
             T val = mixed[d];
 
-            // --- Jot absorption filter (1st-order shelving, Jot 1991) ---
-            // y[n] = b0 * x[n] + a1 * y[n-1]
-            // At DC: gain = g_mid. At Nyquist: gain = g_high.
-            absState_[d] = absB0_[d] * val + absA1_[d] * absState_[d];
-            val = absState_[d];
+            // --- Jot absorption filter (1st-order pole-zero shelf) ---
+            // y[n] = b0*x[n] + b1*x[n-1] - a1*y[n-1]
+            // DC gain = g_mid, Nyquist gain = g_high (exact: T60 anchors),
+            // transition midpoint at the highCrossover_ frequency.
+            {
+                const T y = absB0_[d] * val + absB1_[d] * absX1_[d]
+                            - absA1_[d] * absState_[d];
+                absX1_[d] = val;
+                absState_[d] = y;
+                val = y;
+            }
 
             // --- Bass shelf (independent LF control) ---
             bassState_[d] += bassLPCoeff_ * (val - bassState_[d]);
@@ -1575,11 +1590,14 @@ protected:
      * @brief Computes per-line Jot absorption filter coefficients.
      *
      * Implements Jot/Chaigne (1991): each delay line gets a 1st-order
-     * shelving IIR that produces frequency-dependent decay.
+     * pole-zero shelving IIR that produces frequency-dependent decay.
      *
-     * H(z) = b0 / (1 - a1 * z^-1)
+     * H(z) = (b0 + b1 * z^-1) / (1 + a1 * z^-1)
      *
-     * where |H(1)| = g_mid (decay at DC/mid) and |H(-1)| = g_high (decay at Nyquist).
+     * with |H(1)| = g_mid (decay at DC/mid), |H(-1)| = g_high (decay at
+     * Nyquist), and the transition midpoint sqrt(g_mid * g_high) placed at
+     * the highCrossover_ frequency (shared by all lines so the
+     * frequency-dependent T60 stays coherent across the FDN).
      */
     void updateDecayParams() noexcept
     {
@@ -1596,6 +1614,21 @@ protected:
         t60High = std::max(t60High, T(0.05));
         t60Bass = std::max(t60Bass, T(0.05));
 
+        // Common shelf transition for every line (Jot: a shared shape keeps
+        // the frequency-dependent T60 coherent across lines). Designed via
+        // the bilinear transform of the analog prototype
+        //   Ha(s) = gHigh * (s + w1) / (s + w2),
+        //   w1 = K * sqrt(gMid/gHigh), w2 = K * sqrt(gHigh/gMid),
+        // which pins |H(1)| = gMid and |H(-1)| = gHigh EXACTLY (the T60
+        // anchors, independent of the crossover) and places the geometric
+        // midpoint sqrt(gMid*gHigh) at the crossover frequency.
+        // The clamp keeps tan() below the pole at fs/2 for low sample rates.
+        const double fsD = static_cast<double>(spec_.sampleRate);
+        const double fc = std::clamp(
+            static_cast<double>(highCrossover_.load(std::memory_order_relaxed)),
+            100.0, 0.45 * fsD);
+        const double K = std::tan(3.14159265358979323846 * fc / fsD);
+
         for (int d = 0; d < kFDNSize; ++d)
         {
             // Total loop delay = FDN delay + feedback APs + internal APs
@@ -1608,13 +1641,20 @@ protected:
             T gHigh = std::pow(T(0.001), M / (t60High * sr));
             T gBass = std::pow(T(0.001), M / (t60Bass * sr));
 
-            // Jot damping coefficient: smooth shelving from gMid (DC) to gHigh (Nyquist)
-            T damp = (gMid - gHigh) / (gMid + gHigh + T(1e-10));
-            damp = std::clamp(damp, T(0), T(0.999));
-
-            // Precomputed filter coefficients
-            absB0_[d] = gMid * (T(1) - damp);   // feedforward
-            absA1_[d] = damp;                     // feedback (pole)
+            // Pole-zero shelf coefficients (designed in double):
+            //   H(z) = gHigh * ((1+w1) + (w1-1) z^-1) / ((1+w2) + (w2-1) z^-1)
+            // Unconditionally stable: pole = (1-w2)/(1+w2), |pole| < 1 for w2 > 0.
+            {
+                const double gM = std::max(static_cast<double>(gMid), 1e-12);
+                const double gH = std::clamp(static_cast<double>(gHigh), 1e-12, gM);
+                const double ratio = std::sqrt(gM / gH);
+                const double w1 = K * ratio;
+                const double w2 = K / ratio;
+                const double inv = 1.0 / (1.0 + w2);
+                absB0_[d] = static_cast<T>(gH * (1.0 + w1) * inv);
+                absB1_[d] = static_cast<T>(gH * (w1 - 1.0) * inv);
+                absA1_[d] = static_cast<T>((w2 - 1.0) * inv);
+            }
 
             // Bass ratio for independent LF control. The bass shelf multiplies the
             // per-line DC loop gain by bassRatio, so cap it so gMid*bassRatio stays

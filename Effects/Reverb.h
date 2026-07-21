@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -9,7 +9,9 @@
  *
  * Wraps the Convolver engine into a complete reverb effect with dry/wet mix,
  * pre-delay, and automatic IR management. Supports loading impulse responses
- * from WAV files or from raw sample data.
+ * from WAV files or from raw sample data. The dry path is delay-compensated
+ * against the convolution engine's latency, so dry and wet stay sample-aligned
+ * at any mix setting (getLatency() reports the shared latency to the host).
  *
  * IR shaping (setDecayScale / setStretch) reshapes the loaded impulse
  * response without touching the stored original, so the controls are
@@ -27,13 +29,26 @@
  * - **Level 2 (intermediate):** Pre-delay, IR decay scale / stretch.
  * - **Level 3 (expert):** Direct access to Convolver and DryWetMixer internals.
  *
+ * Threading: prepare() belongs to the setup thread (allocates; never call it
+ * concurrently with processing). processBlock() and reset() belong to the
+ * audio thread. loadIR(), setDecayScale(), setStretch() and setState()
+ * rebuild the convolver bank (they allocate) on the calling GUI/setup thread
+ * and publish it atomically: safe while audio runs, one writer at a time.
+ * setMix()/setPreDelay() are lock-free atomic publications, safe from any
+ * thread. Non-finite setter arguments are ignored. Loading an IR changes
+ * getLatency(): hosts must be notified.
+ *
+ * File loading (loadIR from a path) is excluded when DSPARK_NO_FILE_IO is
+ * defined; the raw-data overload keeps working on embedded targets.
+ *
  * Dependencies: Convolver.h, DryWetMixer.h, RingBuffer.h, AudioSpec.h,
- *               AudioBuffer.h, WavFile.h.
+ *               AudioBuffer.h, DspMath.h, Resampler.h, StateBlob.h,
+ *               WavFile.h (only without DSPARK_NO_FILE_IO).
  *
  * @code
  *   dspark::Reverb<float> reverb;
  *   reverb.prepare(spec);
- *   reverb.loadIR("hall.wav");   // One line — done
+ *   reverb.loadIR("hall.wav");   // One line, done
  *   reverb.setMix(0.3f);         // 30% wet
  *   reverb.processBlock(buffer);
  *
@@ -50,11 +65,15 @@
 #include "../Core/DspMath.h"
 #include "../Core/Resampler.h"
 #include "../Core/StateBlob.h"
+#ifndef DSPARK_NO_FILE_IO
 #include "../IO/WavFile.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -80,19 +99,38 @@ public:
     /**
      * @brief Prepares the reverb for processing.
      *
-     * Allocates internal buffers and sets up dry/wet mixer and pre-delay.
+     * Allocates internal buffers, sets up the dry/wet mixer (including the
+     * dry-path compensation for the convolution latency) and the pre-delay.
      * If an IR was loaded before prepare(), it will be re-applied.
+     * An invalid spec (non-positive or non-finite fields) is a no-op that
+     * keeps the previous state.
      *
      * @param spec Audio environment (sample rate, block size, channels).
      */
     void prepare(const AudioSpec& spec)
     {
+        if (!spec.isValid()) return; // release-safe: keep previous state
+
         spec_ = spec;
+
+        // The convolution engine partitions at the next power of two of the
+        // max block size (>= 2, matching Convolver's own normalisation), and
+        // that is exactly its processing latency. Clamp before the round-up
+        // loop so an absurd block size cannot overflow the shift.
+        const int blockSize = std::clamp(spec.maxBlockSize, 1, 1 << 20);
+        int fftBlock = 2;
+        while (fftBlock < blockSize) fftBlock <<= 1;
+        fftBlockSize_ = fftBlock;
+
+        // Delay the dry path by the same amount so dry and wet stay aligned
+        // at any mix (the wet is late by the convolver latency; without this
+        // the mix comb-filtered against the shifted dry).
         mixer_.prepare(spec);
+        mixer_.setLatencyCompensation(fftBlockSize_);
 
         // Pre-delay ring buffers (one per channel, max 500ms)
         int maxDelaySamples = static_cast<int>(spec.sampleRate * 0.5) + 1;
-        preDelayBuffers_.resize(spec.numChannels);
+        preDelayBuffers_.resize(static_cast<size_t>(spec.numChannels));
         for (auto& rb : preDelayBuffers_)
             rb.prepare(maxDelaySamples);
 
@@ -107,9 +145,12 @@ public:
     /**
      * @brief Processes audio through the reverb.
      *
-     * Flow: pushDry -> pre-delay -> convolve -> mixWet.
+     * Flow: pushDry -> pre-delay -> convolve -> mixWet (with the dry delayed
+     * by the convolution latency so both paths stay aligned). Without a
+     * loaded IR the audio passes through untouched (and getLatency() is 0).
+     * Channels beyond the prepared count pass through untouched.
      *
-     * Thread-safety (A10 fix): the ConvolverBank is published atomically by
+     * Thread-safety: the ConvolverBank is published atomically by
      * loadIR/applyIR. We snapshot the current bank once at the top of the
      * block into a local shared_ptr, so even if the GUI thread publishes a
      * replacement mid-block, the audio thread keeps using a stable bank
@@ -120,8 +161,8 @@ public:
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
         // Design note: the bank swap is guarded by a one-flag spinlock (see
-        // loadBank()): the only writer is loadIR() — a rare, user-initiated
-        // event — so contention is effectively zero. A manual RCU scheme
+        // loadBank()): the only writer is loadIR(), a rare, user-initiated
+        // event, so contention is effectively zero. A manual RCU scheme
         // would remove the spinlock at the cost of a real use-after-free
         // hazard under racing loads; correctness wins here.
         auto bank = loadBank();
@@ -142,7 +183,7 @@ public:
 
             if (preDelSamp > 0)
             {
-                auto& ring = preDelayBuffers_[ch];
+                auto& ring = preDelayBuffers_[static_cast<size_t>(ch)];
                 for (int i = 0; i < nS; ++i)
                 {
                     ring.push(data[i]);
@@ -156,12 +197,20 @@ public:
         mixer_.mixWet(buffer, mixVal);
     }
 
-    /** @brief Resets all internal state (convolvers, pre-delay, mixer). */
+    /**
+     * @brief Resets the DSP state (convolver tails, pre-delay, mixer). RT-Safe.
+     *
+     * The loaded IR stays loaded: resetting used to drop the convolver bank
+     * entirely, silently unloading the reverb (a host reset on stop/start
+     * left it as a dry passthrough until the next loadIR()).
+     */
     void reset() noexcept
     {
-        // Drop the bank atomically. Any in-flight processBlock already holds
-        // its own shared_ptr and will finish cleanly on its snapshot.
-        storeBank(std::shared_ptr<ConvolverBank>{});
+        // Reset the snapshot we can see; if a concurrent load publishes a
+        // replacement bank it arrives freshly zeroed anyway.
+        if (auto bank = loadBank())
+            for (auto& conv : bank->convolvers)
+                conv.reset();
         for (auto& rb : preDelayBuffers_)
             rb.reset();
         mixer_.reset();
@@ -169,12 +218,14 @@ public:
 
     // -- Level 1: Simple API ----------------------------------------------------
 
+#ifndef DSPARK_NO_FILE_IO
     /**
      * @brief Loads an impulse response from a WAV file.
      *
      * The IR is automatically resampled if the WAV sample rate differs from
      * the processing sample rate. Multi-channel IRs are supported (one
      * convolver per channel); mono IRs are duplicated across all channels.
+     * Empty or degenerate files are rejected.
      *
      * @param wavFilePath Path to the WAV file.
      * @return True if the IR was loaded successfully.
@@ -186,6 +237,13 @@ public:
             return false;
 
         auto info = wav.getInfo();
+        if (info.numSamples <= 0 || info.numChannels <= 0
+            || info.numSamples > (static_cast<int64_t>(1) << 30)
+            || !(info.sampleRate > 0))
+        {
+            wav.close();
+            return false;
+        }
 
         AudioBuffer<T> irBuf;
         irBuf.resize(info.numChannels, static_cast<int>(info.numSamples));
@@ -211,12 +269,18 @@ public:
 
         return true;
     }
+#endif // DSPARK_NO_FILE_IO
 
     /**
      * @brief Sets the dry/wet mix.
      * @param dryWet 0.0 = fully dry (no reverb), 1.0 = fully wet.
+     *               Non-finite values are ignored.
      */
-    void setMix(T dryWet) noexcept { mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed); }
+    void setMix(T dryWet) noexcept
+    {
+        if (!std::isfinite(dryWet)) return;
+        mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed);
+    }
 
     // -- Level 2: Intermediate API ----------------------------------------------
 
@@ -224,11 +288,16 @@ public:
      * @brief Loads an IR from raw sample data.
      *
      * @param data         Pointer to mono IR samples.
-     * @param length       Number of samples.
-     * @param irSampleRate Sample rate of the IR data.
+     * @param length       Number of samples (must be > 0).
+     * @param irSampleRate Sample rate of the IR data (must be > 0 and finite).
+     * @return True if the IR was accepted (invalid arguments are rejected).
      */
-    void loadIR(const T* data, int length, double irSampleRate)
+    bool loadIR(const T* data, int length, double irSampleRate)
     {
+        if (data == nullptr || length <= 0
+            || !std::isfinite(irSampleRate) || !(irSampleRate > 0.0))
+            return false;
+
         irChannels_ = 1;
         irLength_ = length;
         irSampleRate_ = irSampleRate;
@@ -237,19 +306,24 @@ public:
 
         if (spec_.sampleRate > 0)
             applyIR();
+
+        return true;
     }
 
     /**
      * @brief Sets the pre-delay time in milliseconds.
      *
      * Pre-delay adds a gap before the reverb tail starts, creating a sense
-     * of room size. Typical values: 0-50 ms.
+     * of room size. Typical values: 0-50 ms. Applied immediately (a live
+     * change may click); intended as a setup control, not for automation.
      *
-     * @param ms Pre-delay in milliseconds (0 = off).
+     * @param ms Pre-delay in milliseconds, clamped to [0, 500] (the ring
+     *           buffer allocation). Non-finite values are ignored.
      */
     void setPreDelay(T ms) noexcept
     {
-        preDelayMs_.store(std::max(ms, T(0)), std::memory_order_relaxed);
+        if (!std::isfinite(ms)) return;
+        preDelayMs_.store(std::clamp(ms, T(0), T(500)), std::memory_order_relaxed);
         updatePreDelay();
     }
 
@@ -272,12 +346,13 @@ public:
      *
      * Setup/UI threads only: rebuilds the convolver bank (allocates) and
      * publishes it atomically, exactly like loadIR(). Not meant for
-     * per-block automation.
+     * per-block automation. Non-finite values are ignored.
      *
      * @param scale T60 multiplier, clamped to [0.25, 2]. 1 = as loaded.
      */
     void setDecayScale(T scale)
     {
+        if (!std::isfinite(scale)) return;
         decayScale_.store(std::clamp(scale, T(0.25), T(2)),
                           std::memory_order_relaxed);
         if (spec_.sampleRate > 0 && !irStorage_.empty())
@@ -293,12 +368,14 @@ public:
      * effective T60 is approximately original * decayScale * stretch.
      *
      * Setup/UI threads only: rebuilds the convolver bank (allocates) and
-     * publishes it atomically, exactly like loadIR().
+     * publishes it atomically, exactly like loadIR(). Non-finite values are
+     * ignored.
      *
      * @param ratio Time-stretch ratio, clamped to [0.5, 2]. 1 = as loaded.
      */
     void setStretch(T ratio)
     {
+        if (!std::isfinite(ratio)) return;
         stretch_.store(std::clamp(ratio, T(0.5), T(2)),
                        std::memory_order_relaxed);
         if (spec_.sampleRate > 0 && !irStorage_.empty())
@@ -316,16 +393,21 @@ public:
     /**
      * @brief Direct access to a channel's Convolver (GUI thread only).
      *
-     * NOTE: after A10 thread-safety refactor, the live convolver bank is
-     * published atomically and may be replaced by a future loadIR() call.
-     * This accessor returns a reference into the currently-published bank
-     * and MUST NOT be used from the audio thread.
+     * NOTE: the live convolver bank is published atomically and may be
+     * replaced by a future loadIR() call. This accessor returns a reference
+     * into the currently-published bank and MUST NOT be used from the audio
+     * thread. Before an IR is loaded (or with an out-of-range channel) it
+     * returns an inert fallback engine instead of dereferencing a null bank.
      *
-     * @param channel Channel index.
+     * @param channel Channel index (clamped into the bank's range).
      */
     Convolver<T>& getConvolver(int channel = 0)
     {
         auto bank = loadBank();
+        if (!bank || bank->convolvers.empty())
+            return fallbackConvolver_;
+        const int n = static_cast<int>(bank->convolvers.size());
+        channel = std::clamp(channel, 0, n - 1);
         return bank->convolvers[static_cast<size_t>(channel)];
     }
 
@@ -344,7 +426,14 @@ public:
     /** @brief Returns the current pre-delay in ms. */
     [[nodiscard]] T getPreDelay() const noexcept { return preDelayMs_.load(std::memory_order_relaxed); }
 
-    /** @brief Returns the convolution latency in samples. */
+    /**
+     * @brief Returns the convolution latency in samples.
+     *
+     * 0 without an IR (the audio passes through untouched); the convolver's
+     * partition latency once an IR is loaded. The dry path is internally
+     * delayed by the same amount, so this is the whole effect's latency.
+     * Hosts must re-read it after loading an IR.
+     */
     [[nodiscard]] int getLatency() const noexcept
     {
         auto bank = loadBank();
@@ -373,11 +462,14 @@ public:
         setMix(static_cast<T>(r.read("mix", 0.3f)));
         setPreDelay(static_cast<T>(r.read("preDelay", 0.0f)));
         // Store both shaping values first, then rebuild once (each setter
-        // would otherwise trigger its own IR rebuild).
-        const T ds = std::clamp(static_cast<T>(r.read("decayScale", 1.0f)),
-                                T(0.25), T(2));
-        const T st = std::clamp(static_cast<T>(r.read("stretch", 1.0f)),
-                                T(0.5), T(2));
+        // would otherwise trigger its own IR rebuild). Non-finite blob values
+        // keep the current settings.
+        T ds = static_cast<T>(r.read("decayScale", 1.0f));
+        T st = static_cast<T>(r.read("stretch", 1.0f));
+        if (!std::isfinite(ds)) ds = decayScale_.load(std::memory_order_relaxed);
+        if (!std::isfinite(st)) st = stretch_.load(std::memory_order_relaxed);
+        ds = std::clamp(ds, T(0.25), T(2));
+        st = std::clamp(st, T(0.5), T(2));
         const bool shapeChanged =
             ds != decayScale_.load(std::memory_order_relaxed)
             || st != stretch_.load(std::memory_order_relaxed);
@@ -404,12 +496,7 @@ protected:
 
     void applyIR()
     {
-        if (irStorage_.empty() || irLength_ <= 0) return;
-
-        int blockSize = spec_.maxBlockSize;
-        // Round up to next power of two for FFT
-        int fftBlock = 1;
-        while (fftBlock < blockSize) fftBlock <<= 1;
+        if (irStorage_.empty() || irLength_ <= 0 || fftBlockSize_ <= 0) return;
 
         int numCh = spec_.numChannels;
 
@@ -458,20 +545,21 @@ protected:
             // Resample if the (stretch-adjusted) IR rate differs from the engine
             if (std::abs(effIrRate - spec_.sampleRate) > 1.0)
             {
-                double ratio = spec_.sampleRate / effIrRate;
-                int newLen = static_cast<int>(static_cast<double>(irLen) * ratio) + 1;
-                std::vector<T> resampled(static_cast<size_t>(newLen));
-
                 Resampler<T> resampler;
                 resampler.prepare(effIrRate, spec_.sampleRate);
+                // Size from the resampler's own bound (INT_MAX-safe): the old
+                // floor(n*ratio)+1 arithmetic could overflow the int cast with
+                // an extreme rate ratio.
+                std::vector<T> resampled(
+                    static_cast<size_t>(resampler.getMaxOutputSamples(irLen)));
                 int produced = resampler.processBlock(irData, irLen,
                                                       resampled.data());
 
-                conv.prepare(fftBlock, resampled.data(), produced);
+                conv.prepare(fftBlockSize_, resampled.data(), produced);
             }
             else
             {
-                conv.prepare(fftBlock, irData, irLen);
+                conv.prepare(fftBlockSize_, irData, irLen);
             }
         }
 
@@ -579,23 +667,23 @@ protected:
         return out;
     }
 
-    // Holds the current convolver set. Published by applyIR() via an atomic
-    // shared_ptr (C++20 std::atomic<shared_ptr>, replacing the deprecated free
-    // std::atomic_*(shared_ptr*) functions). The audio thread snapshots it at the
-    // top of processBlock so an in-flight block keeps a stable bank alive.
+    // Holds the current convolver set. Published by applyIR() and snapshotted
+    // by the audio thread at the top of processBlock, so an in-flight block
+    // keeps a stable bank alive.
     struct ConvolverBank
     {
         std::vector<Convolver<T>> convolvers;
     };
 
     AudioSpec spec_ {};
+    int fftBlockSize_ = 0; ///< Convolver partition size = engine latency (set in prepare()).
     std::atomic<T> mix_ { T(0.3) };
     std::atomic<T> preDelayMs_ { T(0) };
     std::atomic<int> preDelaySamples_ { 0 };
     std::atomic<T> decayScale_ { T(1) };
     std::atomic<T> stretch_ { T(1) };
 
-    // IR storage (GUI-thread only — rebuild source of truth)
+    // IR storage (GUI-thread only: rebuild source of truth)
     std::vector<T> irStorage_;
     int irLength_ = 0;
     int irChannels_ = 0;
@@ -605,8 +693,8 @@ protected:
     //
     // Portable stand-in for std::atomic<std::shared_ptr>: libc++ (macOS,
     // Emscripten) does not ship the C++20 specialization. A one-flag
-    // spinlock guards only the pointer copy/swap — nanoseconds on the audio
-    // thread against one UI-initiated store per IR load — preserving the
+    // spinlock guards only the pointer copy/swap (nanoseconds on the audio
+    // thread against one UI-initiated store per IR load), preserving the
     // exact snapshot semantics: an in-flight processBlock keeps its own
     // shared_ptr alive, and replaced banks destruct on the UI thread
     // (the swap drops them outside the lock).
@@ -629,6 +717,7 @@ protected:
     std::shared_ptr<ConvolverBank> bankPtr_;
     std::vector<RingBuffer<T>> preDelayBuffers_;
     DryWetMixer<T> mixer_;
+    Convolver<T> fallbackConvolver_; ///< Inert engine for getConvolver() with no bank.
 };
 
 } // namespace dspark

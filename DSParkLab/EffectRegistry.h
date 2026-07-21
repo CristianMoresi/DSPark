@@ -124,6 +124,13 @@ inline EffectSlot makeEqualizer()
         std::snprintf(nm, sizeof(nm), "Band %d Slope", b + 1);
         s.addSlider(nm, 6, 48, 12, "dB/oct");   // cuts (Low/High Cut) only
     }
+    // Global controls (indices 20/21, appended so band indices stay stable):
+    // Phase Mode switches the IIR cascade for the FFT overlap-save engine
+    // (adds maxBlockSize of latency, audible as a small delay here), and
+    // Matched Bells selects the Orfanidis de-cramped design for Peak bands
+    // (audible on high-frequency bells; the curve follows).
+    s.addChoice("Phase Mode", {"Minimum","Linear"}, 0);
+    s.addToggle("Matched Bells", false);
     // Type index -> framework enum. The UI groups cuts after the shelves;
     // the enum orders LowPass/HighPass there, so the mapping is direct.
     auto toType = [](float v) {
@@ -138,6 +145,13 @@ inline EffectSlot makeEqualizer()
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, toType, toSlope](int i, float v) {
+        if (i == 20)
+        {
+            p->setFilterMode(static_cast<int>(v) == 1 ? EQ::FilterMode::LinearPhase
+                                                      : EQ::FilterMode::MinimumPhase);
+            return;
+        }
+        if (i == 21) { p->setMatchedBells(v > 0.5f); return; }
         int band = i / 5;
         int param = i % 5;
         if (band >= 4) return;

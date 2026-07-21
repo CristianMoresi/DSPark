@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -12,7 +12,17 @@
  * This effectively separates the attack and release phases, applying
  * independent gain adjustments to the transient and the body.
  *
- * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h.
+ * Threading model:
+ * - prepare() / reset() / getState() / setState(): setup or UI threads only,
+ *   never concurrently with processBlock().
+ * - setAttack / setSustain / setCharacter / setOutputDepRecovery: RT-safe
+ *   atomic publications from any thread (non-finite values are ignored).
+ * - Channels beyond the 16-channel state cap are left untouched.
+ * - Before prepare() the envelope coefficients are zero, which makes
+ *   processBlock() an exact pass-through by construction.
+ *
+ * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h,
+ *               StateBlob.h.
  *
  * @code
  *   dspark::TransientDesigner<float> td;
@@ -33,12 +43,19 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
 
 namespace dspark {
 
 /**
  * @class TransientDesigner
- * @brief Zero-allocation, thread-safe, SIMD-friendly transient shaper.
+ * @brief Zero-allocation, thread-safe transient shaper.
+ *
+ * The per-channel envelope recursion is inherently serial (no SIMD); the
+ * channel-outer loop keeps each channel's state in registers and the data
+ * accesses cache-friendly.
  *
  * @tparam T Sample type (float or double).
  */
@@ -52,19 +69,24 @@ public:
 
     /**
      * @brief Prepares the processor with the current audio specification.
-     * @param spec Audio specification including sample rate.
+     * @param spec Audio specification including sample rate (invalid specs are ignored).
      */
-    void prepare(const AudioSpec& spec)
+    void prepare(const AudioSpec& spec) noexcept
     {
+        if (!spec.isValid()) return;
         prepare(spec.sampleRate);
     }
 
     /**
      * @brief Prepares the processor with a specific sample rate.
-     * @param sampleRate The operating sample rate in Hz.
+     * @param sampleRate The operating sample rate in Hz. Non-finite or
+     *                   non-positive rates are ignored (a NaN rate used to
+     *                   pass the coefficient guard and poison the envelopes
+     *                   permanently).
      */
     void prepare(double sampleRate) noexcept
     {
+        if (!std::isfinite(sampleRate) || sampleRate <= 0.0) return;
         sampleRate_ = sampleRate;
         updateCoefficients();
         reset();
@@ -73,7 +95,6 @@ public:
     /**
      * @brief Processes an audio buffer in-place.
      * @param buffer View of the audio buffer to process.
-     * @note Loop order optimized for SoA (Structure of Arrays) SIMD execution.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
@@ -89,7 +110,7 @@ public:
         constexpr T noiseFloor = T(1e-5);     // -100 dB floor avoids log(0) and denormals
         constexpr T maxGainLog = T(2.77258);  // approx +24dB max gain change
 
-        // Outer loop: Channels (Cache & SIMD friendly)
+        // Outer loop: channels (state stays in registers)
         for (int ch = 0; ch < nCh; ++ch)
         {
             T* const channelData = buffer.getChannel(ch);
@@ -97,7 +118,7 @@ public:
             T slow = envSlow_[ch];
             T lastOut = lastOutput_[ch];
 
-            // Inner loop: Samples (Auto-vectorization target)
+            // Inner loop: serial envelope recursion per sample
             for (int i = 0; i < nS; ++i)
             {
                 T sample = channelData[i];
@@ -109,11 +130,11 @@ public:
 
                 // 2. Slow envelope (Sustain/RMS tracker)
                 T currentSlowRelCoeff = slowReleaseCoeff_;
-                
-                if (odr) 
+
+                if (odr)
                 {
                     // Corrected ODR: Higher output = LARGER coefficient = Faster release
-                    T modifier = T(1) + std::abs(lastOut) * T(2.0); 
+                    T modifier = T(1) + std::abs(lastOut) * T(2.0);
                     currentSlowRelCoeff = std::min(fastReleaseCoeff_, currentSlowRelCoeff * modifier);
                 }
 
@@ -121,7 +142,7 @@ public:
                 slow += slowCoeff * (absSample - slow);
 
                 // 3. Log-domain VCA computation (fastLog/fastExp: relative
-                // error < 2e-7 — far below audibility, ~3x faster than libm)
+                // error < 2e-7 - far below audibility, ~3x faster than libm)
                 T diffLog = fastLog(fast) - fastLog(slow);
 
                 // Attack kicks in when fast > slow (diffLog > 0). Sustain when slow > fast (diffLog < 0)
@@ -130,7 +151,7 @@ public:
                 gainLog = std::clamp(gainLog, -maxGainLog, maxGainLog);
 
                 T gain = fastExp(gainLog);
-                
+
                 lastOut = sample * gain;
                 channelData[i] = lastOut;
             }
@@ -143,6 +164,10 @@ public:
     }
 
     // -- Parameters ----------------------------------------------------------
+    // All setters ignore non-finite values: a NaN amount used to storm the
+    // output for as long as it was published, and under output-dependent
+    // recovery the NaN last-output silently switched the slow envelope to the
+    // fast release, leaving the envelope history diverged after recovery.
 
     /**
      * @brief Sets attack (transient) emphasis.
@@ -150,6 +175,7 @@ public:
      */
     void setAttack(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         attackAmount_.store(std::clamp(amount, T(-100), T(100)) / T(100), std::memory_order_relaxed);
     }
 
@@ -159,6 +185,7 @@ public:
      */
     void setSustain(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         sustainAmount_.store(std::clamp(amount, T(-100), T(100)) / T(100), std::memory_order_relaxed);
     }
 
@@ -172,11 +199,12 @@ public:
     }
 
     /**
-     * @brief Sets character as a single macro-knob.
+     * @brief Sets character as a single macro-knob (overwrites attack AND sustain).
      * @param amount Range [-1.0, 1.0]. -1 = soften transients/boost sustain, +1 = boost transients/reduce sustain.
      */
     void setCharacter(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         T c = std::clamp(amount, T(-1), T(1));
         attackAmount_.store(c, std::memory_order_relaxed);
         sustainAmount_.store(-c * T(0.5), std::memory_order_relaxed);
@@ -197,8 +225,10 @@ public:
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
         StateWriter w(stateId("TDES"), 1);
-        w.write("attack", attackAmount_.load(std::memory_order_relaxed) * 100.0f);   // percent
-        w.write("sustain", sustainAmount_.load(std::memory_order_relaxed) * 100.0f); // percent
+        // static_cast<float>: the blob stores float (percent units), and
+        // StateWriter's overload set is ambiguous for a double argument.
+        w.write("attack", static_cast<float>(attackAmount_.load(std::memory_order_relaxed)) * 100.0f);
+        w.write("sustain", static_cast<float>(sustainAmount_.load(std::memory_order_relaxed)) * 100.0f);
         w.write("outputDep", outputDepRecovery_.load(std::memory_order_relaxed));
         return w.blob();
     }
@@ -219,7 +249,7 @@ private:
 
     void updateCoefficients() noexcept
     {
-        if (sampleRate_ <= 0.0) return;
+        if (!(sampleRate_ > 0.0)) return;
         T fs = static_cast<T>(sampleRate_);
         fastAttackCoeff_  = T(1) - std::exp(T(-1) / (fs * T(0.0001)));
         fastReleaseCoeff_ = T(1) - std::exp(T(-1) / (fs * T(0.005)));
@@ -234,14 +264,15 @@ private:
     std::atomic<T> sustainAmount_ { T(0) };
     std::atomic<bool> outputDepRecovery_ { false };
 
-    // Envelope coefficients
+    // Envelope coefficients (written by prepare/updateCoefficients on the
+    // setup thread, read by the audio thread)
     T fastAttackCoeff_ = T(0), fastReleaseCoeff_ = T(0);
     T slowAttackCoeff_ = T(0), slowReleaseCoeff_ = T(0);
 
-    // Per-channel state (Aligned for SIMD)
-    alignas(32) std::array<T, kMaxChannels> envFast_ {};
-    alignas(32) std::array<T, kMaxChannels> envSlow_ {};
-    alignas(32) std::array<T, kMaxChannels> lastOutput_ {};
+    // Per-channel state (scalar recursion; no SIMD kernel touches these)
+    std::array<T, kMaxChannels> envFast_ {};
+    std::array<T, kMaxChannels> envSlow_ {};
+    std::array<T, kMaxChannels> lastOutput_ {};
 };
 
 } // namespace dspark

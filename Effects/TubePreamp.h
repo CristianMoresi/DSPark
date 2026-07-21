@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -12,31 +12,31 @@
  * - **Triode stages** (1 or 2) solved per sample with Newton-Raphson on the
  *   plate current. The tube follows Koren's improved SPICE model (Koren
  *   1996; published 12AX7 parameters MU=100, EX=1.4, KG1=1060, KP=600,
- *   KVB=300) in a classic common-cathode stage: 300 V supply, 100 kΩ plate
- *   load, 1.5 kΩ cathode resistor with its 22 µF bypass capacitor
- *   integrated trapezoidally — the capacitor state is folded into the
+ *   KVB=300) in a classic common-cathode stage: 300 V supply, 100 k ohm plate
+ *   load, 1.5 k ohm cathode resistor with its 22 uF bypass capacitor
+ *   integrated trapezoidally - the capacitor state is folded into the
  *   Newton equation, so each sample solves the true implicit system. Grid
  *   conduction is approximated by a soft clamp toward +0.7 V (full blocking
  *   distortion needs the input-coupling state and is left for a later pass).
  * - **Supply sag**: the effective B+ droops with smoothed plate current
- *   (one-pole, ~70 ms) times a sag resistance — drive into the stage and
+ *   (one-pole, ~70 ms) times a sag resistance - drive into the stage and
  *   the headroom breathes back, the classic touch response.
  * - **Tone stack**: the full Fender '59 Bassman FMV treble/bass/middle
  *   network, solved exactly as a 12-port WDF R-type adaptor
- *   (wdf::ToneStackFMV — verified sample-exact against the symbolic
+ *   (wdf::ToneStackFMV - verified sample-exact against the symbolic
  *   transfer function of Yeh & Smith, DAFx-06). The stack sits between the
- *   stages and is driven by the first stage's real ~38 kΩ output impedance,
+ *   stages and is driven by the first stage's real ~38 k ohm output impedance,
  *   so it loads the tube exactly like the hardware. Controls interact
- *   non-orthogonally — that is the circuit, not a bug.
+ *   non-orthogonally - that is the circuit, not a bug.
  * - Output level: the circuit's program response at the reference tone
  *   setting is measured once in prepare() (settled channel, pink-weighted
  *   multitone). A 3-section EQ designed from that measurement flattens the
- *   FMV stack's fixed ~10 dB mid-scoop envelope — neutral knobs sound
+ *   FMV stack's fixed ~10 dB mid-scoop envelope - neutral knobs sound
  *   neutral, the tone controls act relative to flat, and the triode's
  *   harmonic character is untouched. Loudness divides out the program gain
  *   MEASURED AT EACH DRIVE (prepare-time sweep LUT, so the link tracks the
  *   circuit's real compression) plus a +0.25 dB/dB residual slope: backing
- *   off is audible, pushing raises density at a gently rising level — the
+ *   off is audible, pushing raises density at a gently rising level - the
  *   same contract as TapeMachine/TransformerModel. Use setOutput() for
  *   static trim; gain changes are ramped (~30 ms) so drags stay click-free.
  *
@@ -45,8 +45,19 @@
  * triode), DC operating point matches an independent high-precision solve
  * of the same circuit equations (the check SPICE would perform).
  *
- * Dependencies: WDF.h, Oversampling.h, AudioSpec.h, AudioBuffer.h,
- * DspMath.h, DenormalGuard.h.
+ * Threading model: parameter setters/getters are std::atomic based and safe
+ * from any thread (non-finite values are ignored; changes are published with
+ * a release store and consumed at the next block). prepare() is setup-thread
+ * only (allocates and runs the reference calibration; invalid specs are
+ * ignored and an unprepared instance passes audio through). reset() belongs
+ * to the stream owner. getState()/setState() are setup/UI threads.
+ * getSupplyVoltage() is a metering-style read. The dry/wet mix is smoothed
+ * linearly over one block. Channels beyond the prepared count pass through
+ * untouched.
+ *
+ * Dependencies: Core/WDF.h, Core/Oversampling.h, Core/Biquad.h,
+ * Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h,
+ * Core/StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -62,6 +73,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <numbers>
@@ -81,10 +93,14 @@ class TubePreamp
 public:
     // -- Lifecycle ---------------------------------------------------------------
 
-    /** @brief Allocates the chain (one circuit instance per channel). */
+    /** @brief Allocates the chain (one circuit instance per channel) and runs
+     *  the reference calibration. Invalid specs (non-positive or non-finite
+     *  rate, block size or channel count) are ignored: the previous state is
+     *  kept and an unprepared instance stays pass-through. */
     void prepare(const AudioSpec& spec)
     {
-        if (spec.sampleRate <= 0.0 || spec.numChannels < 1) return;
+        if (!spec.isValid()) return;
+        prepared_.store(false, std::memory_order_relaxed);
         sampleRate_ = spec.sampleRate;
         fs2_ = 2.0 * sampleRate_;
         numChannels_ = spec.numChannels;
@@ -107,15 +123,15 @@ public:
 
         calibrateReference();
 
-        prepared_ = true;
-        dirty_.store(true, std::memory_order_relaxed);
+        prepared_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
         reset();
     }
 
     /** @brief Re-settles every stage at its DC operating point. RT-safe. */
     void reset() noexcept
     {
-        if (!prepared_) return;
+        if (!prepared_.load(std::memory_order_relaxed)) return;
         const double sagR = static_cast<double>(sag_.load(std::memory_order_relaxed)) * 40e3;
         const int stages = stages_.load(std::memory_order_relaxed);
         for (auto& ch : channels_)
@@ -127,63 +143,83 @@ public:
         // Seed the anti-zipper ramps at their targets: no fade-in on start.
         hScaleSm_ = -1.0;
         outGainSm_ = -1.0;
+        currentMix_ = mix_.load(std::memory_order_relaxed);
     }
 
     // -- Parameters (thread-safe) ---------------------------------------------------
 
-    /** @brief Input drive in dB [-12, +36]; level-compensated. */
+    /** @brief Input drive in dB [-12, +36]; level-compensated. Non-finite
+     *  values are ignored. */
     void setDrive(T db) noexcept
     {
+        if (!std::isfinite(db)) return;
         driveDb_.store(std::clamp(db, T(-12), T(36)), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Treble control of the FMV stack [0, 1]. */
+    /** @brief Treble control of the FMV stack [0, 1]. Non-finite values are ignored. */
     void setTreble(T treble) noexcept
     {
+        if (!std::isfinite(treble)) return;
         treble_.store(std::clamp(treble, T(0), T(1)), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Bass control of the FMV stack [0, 1] (log-taper, like the original). */
+    /** @brief Bass control of the FMV stack [0, 1] (log-taper, like the original).
+     *  Non-finite values are ignored. */
     void setBass(T bass) noexcept
     {
+        if (!std::isfinite(bass)) return;
         bass_.store(std::clamp(bass, T(0), T(1)), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Middle control of the FMV stack [0, 1]. */
+    /** @brief Middle control of the FMV stack [0, 1]. Non-finite values are ignored. */
     void setMiddle(T middle) noexcept
     {
+        if (!std::isfinite(middle)) return;
         middle_.store(std::clamp(middle, T(0), T(1)), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Supply sag depth [0, 1] (0 = stiff supply). */
+    /** @brief Supply sag depth [0, 1] (0 = stiff supply). Non-finite values are ignored. */
     void setSag(T sag) noexcept
     {
+        if (!std::isfinite(sag)) return;
         sag_.store(std::clamp(sag, T(0), T(1)), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
     /** @brief Number of triode stages (1 = clean/edge, 2 = high gain). */
     void setStages(int stages) noexcept
     {
         stages_.store(std::clamp(stages, 1, 2), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Static output trim in dB [-24, +12]. */
+    /** @brief Static output trim in dB [-24, +12]. Non-finite values are ignored. */
     void setOutput(T db) noexcept
     {
+        if (!std::isfinite(db)) return;
         outputDb_.store(std::clamp(db, T(-24), T(12)), std::memory_order_relaxed);
     }
 
-    /** @brief Dry/wet mix [0, 1]; dry is latency-compensated. */
+    /** @brief Dry/wet mix [0, 1]; dry is latency-compensated and the mix is
+     *  smoothed linearly over one block. Non-finite values are ignored. */
     void setMix(T mix) noexcept
     {
+        if (!std::isfinite(mix)) return;
         mix_.store(std::clamp(mix, T(0), T(1)), std::memory_order_relaxed);
     }
+
+    [[nodiscard]] T getDrive() const noexcept { return driveDb_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getTreble() const noexcept { return treble_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getBass() const noexcept { return bass_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getMiddle() const noexcept { return middle_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getSag() const noexcept { return sag_.load(std::memory_order_relaxed); }
+    [[nodiscard]] int getStages() const noexcept { return stages_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getOutput() const noexcept { return outputDb_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
 
     /** @brief Latency in samples (the 2x oversampler only). */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
@@ -198,14 +234,16 @@ public:
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
         StateWriter w(stateId("TUBE"), 1);
-        w.write("drive", driveDb_.load(std::memory_order_relaxed));
-        w.write("treble", treble_.load(std::memory_order_relaxed));
-        w.write("bass", bass_.load(std::memory_order_relaxed));
-        w.write("middle", middle_.load(std::memory_order_relaxed));
-        w.write("sag", sag_.load(std::memory_order_relaxed));
+        // Explicit float casts: the blob stores float, and with T = double the
+        // unqualified write(key, double) would be ambiguous (float/int32/bool).
+        w.write("drive", static_cast<float>(driveDb_.load(std::memory_order_relaxed)));
+        w.write("treble", static_cast<float>(treble_.load(std::memory_order_relaxed)));
+        w.write("bass", static_cast<float>(bass_.load(std::memory_order_relaxed)));
+        w.write("middle", static_cast<float>(middle_.load(std::memory_order_relaxed)));
+        w.write("sag", static_cast<float>(sag_.load(std::memory_order_relaxed)));
         w.write("stages", stages_.load(std::memory_order_relaxed));
-        w.write("output", outputDb_.load(std::memory_order_relaxed));
-        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("output", static_cast<float>(outputDb_.load(std::memory_order_relaxed)));
+        w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -227,20 +265,27 @@ public:
 
     // -- Processing -------------------------------------------------------------------
 
-    /** @brief Processes a block in-place. */
+    /** @brief Processes a block in-place. Pass-through until prepare() succeeds. */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        if (!prepared_) return;
+        if (!prepared_.load(std::memory_order_relaxed)) return;
         DenormalGuard guard;
 
         const int nCh = std::min(buffer.getNumChannels(), numChannels_);
         const int nS = buffer.getNumSamples();
         if (nCh == 0 || nS == 0) return;
 
-        if (dirty_.exchange(false, std::memory_order_relaxed))
+        // Acquire pairs with the setters' release stores so the recompute
+        // always sees the values published before the flag.
+        if (dirty_.load(std::memory_order_relaxed)
+            && dirty_.exchange(false, std::memory_order_acquire))
             recompute();
 
-        const T mixVal = mix_.load(std::memory_order_relaxed);
+        // Linear per-block mix ramp with exact landing (settled: step == 0
+        // and the per-sample value reduces to the constant, bit-identically).
+        const T mixTarget = mix_.load(std::memory_order_relaxed);
+        const T mixStart  = currentMix_;
+        const T mixStep   = (mixTarget - mixStart) / static_cast<T>(nS);
         const double outGain = mScale_
             * std::pow(10.0, static_cast<double>(outputDb_.load(std::memory_order_relaxed)) / 20.0);
 
@@ -267,7 +312,7 @@ public:
             // per-block step clicked while dragging drive; and since
             // (hScale, outGain) is a compensation pair spanning orders of
             // magnitude (outGain ~ 1/drive), linear interpolation transits
-            // through over-gained states — power-law interpolation keeps
+            // through over-gained states - power-law interpolation keeps
             // the pair on the calibration curve.
             if (outGainSm_ <= 0.0) outGainSm_ = outGain;
             if (hScaleSm_ <= 0.0)  hScaleSm_ = hScale_;
@@ -298,7 +343,8 @@ public:
                              std::memory_order_relaxed);
         }
 
-        // Latency-compensated mix.
+        // Latency-compensated mix (ramped: a hard flip on the distorted wet
+        // stream clicked at 1.6x the steady-state sample delta).
         for (int ch = 0; ch < nCh; ++ch)
         {
             T* d = buffer.getChannel(ch);
@@ -307,9 +353,11 @@ public:
             {
                 const int idx = (dryPos_ + i - latency_) & (drySize_ - 1);
                 const T drySample = dry[static_cast<size_t>(idx)];
+                const T mixVal = mixStart + mixStep * static_cast<T>(i);
                 d[i] = drySample + (d[i] - drySample) * mixVal;
             }
         }
+        currentMix_ = mixTarget;   // exact landing
         dryPos_ = (dryPos_ + nS) & (drySize_ - 1);
     }
 
@@ -449,7 +497,7 @@ private:
         /** Settles the DC operating point CONSISTENTLY with the sagged
          *  supply: fixed point on B+ = kBplus - sagR*(Ip1+Ip2). Settling at
          *  the stiff kBplus while processSample() immediately applies the
-         *  sag drop produced a ~19 V supply step at sag 0.3 — an audible
+         *  sag drop produced a ~19 V supply step at sag 0.3 - an audible
          *  activation thump, and worse: it sat inside the old 10 ms
          *  calibration window, inflating outSq and burying the whole wet
          *  path ~20 dB under unity. */
@@ -569,7 +617,7 @@ private:
         // Cheap by construction (no scratch processing on the audio thread).
         //
         // The divisor is the circuit's MEASURED program gain at this drive
-        // (prepare-time LUT, log-interpolated) — same contract as
+        // (prepare-time LUT, log-interpolated) - same contract as
         // TapeMachine/TransformerModel, whose per-drive scratch calibration
         // is what kept their knobs healthy. The previous analytic
         // 1/drive^0.75 broke at high drive: once the triode pins at its
@@ -584,8 +632,11 @@ private:
     [[nodiscard]] double programGainAt(double driveDb, int stages) const noexcept
     {
         const auto& lut = gProgLut_[static_cast<size_t>(stages - 1)];
-        const double pos = std::clamp((driveDb - kDriveLutMinDb) / kDriveLutStepDb,
-                                      0.0, static_cast<double>(kDriveLutN - 1));
+        // Ordered min/max instead of clamp: a NaN input resolves to 0 here
+        // (defence in depth; the setter already rejects non-finite values, and
+        // an unguarded NaN would UB-cast into a wild LUT index).
+        const double pos = std::min(std::max(0.0, (driveDb - kDriveLutMinDb) / kDriveLutStepDb),
+                                    static_cast<double>(kDriveLutN - 1));
         const int idx = std::min(static_cast<int>(pos), kDriveLutN - 2);
         const double frac = pos - static_cast<double>(idx);
         const double a = std::max(lut[static_cast<size_t>(idx)], 1e-9);
@@ -599,9 +650,9 @@ private:
      * 0 dB, using a pink-weighted multitone (one tone per octave,
      * 100..6400 Hz) at program level (~-15 dBFS RMS). From the per-tone
      * gains it designs a 3-section flattening EQ (low shelf / mid peak /
-     * high shelf) that removes the FMV stack's fixed envelope — the raw
+     * high shelf) that removes the FMV stack's fixed envelope - the raw
      * stack at neutral knobs is a ~10 dB mid scoop, far too much colour
-     * for an insert effect — and then sweeps the drive grid through a
+     * for an insert effect - and then sweeps the drive grid through a
      * chained scratch channel (flattener installed) to fill the program
      * gain LUT that recompute() interpolates. A single 1 kHz tone is the
      * wrong probe for any of this (the old 1 kHz/10 ms calibration also
@@ -674,7 +725,7 @@ private:
             // Each grid point gets a re-settle (bias/sag adapt to the new
             // level) before its measurement window. recompute() interpolates
             // this LUT, so the loudness link tracks the circuit's actual
-            // compression — the fix for the level falling at high drive.
+            // compression - the fix for the level falling at high drive.
             ChannelState sweep(fs2_);
             sweep.setToneControls(0.5, 0.5, 0.5);
             sweep.setFlattenCoeffs(st, fc);
@@ -711,7 +762,7 @@ private:
     double fs2_ = 96000.0;
     int numChannels_ = 0;
     int maxBlock_ = 0;
-    bool prepared_ = false;
+    std::atomic<bool> prepared_ { false };
     int latency_ = 0;
     int drySize_ = 1;
 
@@ -735,6 +786,7 @@ private:
           { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 } } };
     double hScaleSm_ = -1.0;                    ///< Anti-zipper ramp states (-1 = seed on
     double outGainSm_ = -1.0;                   ///<  first block after prepare/reset).
+    T currentMix_ = T(1);                       ///< Audio-thread mix ramp state.
 
     std::atomic<T> driveDb_ { T(0) };
     std::atomic<T> treble_ { T(0.5) };

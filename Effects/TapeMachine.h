@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -14,7 +14,7 @@
  * 1. **Record/playback equalization** (NAB or CCIR, speed-dependent time
  *    constants): the signal is HF-emphasized (and LF-boosted for NAB) before
  *    hitting the "tape", and de-emphasized on playback with the exact
- *    digital inverse. The round trip is flat by construction — but the
+ *    digital inverse. The round trip is flat by construction - but the
  *    hysteresis sees the emphasized signal, so highs saturate first at slow
  *    speeds, exactly as on hardware.
  * 2. **Magnetic hysteresis** at 2x oversampling, with `bias` mapping to the
@@ -23,19 +23,36 @@
  *    compensated analytically from the JA susceptibility, so drive changes
  *    saturation, not level.
  * 3. **Playback loss effects** with the physical formulas (Kadis): spacing
- *    loss 54.6·d/λ dB, gap loss sinc(π·g/λ), thickness loss
- *    (1−e^(−4πδ/λ))/(4πδ/λ), with λ = speed/frequency — rendered into a
- *    63-tap linear-phase FIR per speed, plus the speed-dependent head-bump
- *    resonance (45/90/180 Hz at 7.5/15/30 ips).
+ *    loss 54.6*d/lambda dB, gap loss sinc(pi*g/lambda), thickness loss
+ *    (1-e^(-4*pi*delta/lambda))/(4*pi*delta/lambda), with lambda =
+ *    speed/frequency - rendered into a 63-tap linear-phase FIR per speed,
+ *    plus the speed-dependent head-bump resonance (45/90/180 Hz at
+ *    7.5/15/30 ips).
  * 4. **Wow & flutter**: one shared transport modulation (slow drift random
  *    walk + 0.55 Hz wow + 8.3/23 Hz flutter + scrape band) driving a
- *    fractional delay — identical on all channels, like a real capstan.
+ *    fractional delay - identical on all channels, like a real capstan. The
+ *    hiss generator uses its own RNG stream, so enabling noise never changes
+ *    the transport's realisation.
  * 5. **Tape hiss** (optional, default off).
  *
- * The dry path of the mix control is delay-compensated to getLatency().
+ * The dry path of the mix control is delay-compensated to getLatency(). The
+ * mix is applied per block without smoothing: the wet stream is correlated
+ * with and aligned to the dry, so a mix step moves the output by the (small)
+ * timbral difference only - measured below the steady-state sample delta.
+ * Channels beyond the prepared count pass through untouched.
  *
- * Dependencies: Hysteresis.h, Oversampling.h, Biquad.h, SimdOps.h,
- * AudioSpec.h, AudioBuffer.h, DspMath.h, DenormalGuard.h.
+ * Threading model: parameter setters/getters are std::atomic based and safe
+ * from any thread (non-finite values are ignored; parameter changes are
+ * published with a release store and consumed at the next block). prepare()
+ * is setup-thread only (allocates; invalid specs are ignored and an
+ * unprepared instance passes audio through). reset() belongs to the stream
+ * owner. getState()/setState() are setup/UI threads. The recompute on a
+ * parameter change runs a short scratch calibration on the audio thread
+ * (allocation-free, a few hundred samples of model time).
+ *
+ * Dependencies: Core/Hysteresis.h, Core/Oversampling.h, Core/Biquad.h,
+ * Core/SimdOps.h, Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h,
+ * Core/DenormalGuard.h, Core/StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -51,6 +68,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <numbers>
@@ -76,10 +94,13 @@ public:
 
     // -- Lifecycle ---------------------------------------------------------------
 
-    /** @brief Allocates the whole chain. */
+    /** @brief Allocates the whole chain. Invalid specs (non-positive or
+     *  non-finite rate, block size or channel count) are ignored: the previous
+     *  state is kept and an unprepared instance stays pass-through. */
     void prepare(const AudioSpec& spec)
     {
-        if (spec.sampleRate <= 0.0 || spec.numChannels < 1) return;
+        if (!spec.isValid()) return;
+        prepared_.store(false, std::memory_order_relaxed);
         sampleRate_ = spec.sampleRate;
         numChannels_ = spec.numChannels;
         maxBlock_ = std::max(spec.maxBlockSize, 1);
@@ -125,15 +146,15 @@ public:
                         std::vector<T>(static_cast<size_t>(drySize_), T(0)));
         dryPos_ = 0;
 
-        prepared_ = true;
-        dirty_.store(true, std::memory_order_relaxed);
+        prepared_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
         reset();
     }
 
     /** @brief Clears all signal state (keeps parameters). RT-safe. */
     void reset() noexcept
     {
-        if (!prepared_) return;
+        if (!prepared_.load(std::memory_order_relaxed)) return;
         for (auto& h : hysteresis_) h.reset();
         for (auto& f : firState_) std::fill(f.begin(), f.end(), T(0));
         for (auto& d : delayRing_) std::fill(d.begin(), d.end(), T(0));
@@ -152,73 +173,110 @@ public:
         driftState_ = 0.0;
         scrapeLp1_ = scrapeLp2_ = 0.0;
         rng_ = 0x1357feedu;
+        rngNoise_ = 0x2468beefu;
         if (oversampler_) oversampler_->reset();
     }
 
     // -- Parameters (thread-safe) ---------------------------------------------------
 
     /** @brief Input drive in dB [-12, +24]. Level-compensated: more drive means
-     *  more saturation at roughly constant loudness. */
+     *  more saturation at roughly constant loudness. Non-finite values are ignored. */
     void setDrive(T driveDb) noexcept
     {
+        if (!std::isfinite(driveDb)) return;
         driveDb_.store(std::clamp(driveDb, T(-12), T(24)), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
     /** @brief Bias setting [0, 1]; 0.5 is nominal calibration. Low bias widens
-     *  the hysteresis loop (gritty), high bias cleans up toward reversible. */
+     *  the hysteresis loop (gritty), high bias cleans up toward reversible.
+     *  Non-finite values are ignored. */
     void setBias(T bias) noexcept
     {
+        if (!std::isfinite(bias)) return;
         bias_.store(std::clamp(bias, T(0), T(1)), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Tape speed (changes EQ time constants, losses and head bump). */
+    /** @brief Tape speed (changes EQ time constants, losses and head bump).
+     *  Out-of-range values are clamped. */
     void setSpeed(Speed s) noexcept
     {
-        speed_.store(static_cast<int>(s), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        const int v = std::clamp(static_cast<int>(s),
+                                 static_cast<int>(Speed::IPS_7_5),
+                                 static_cast<int>(Speed::IPS_30));
+        speed_.store(v, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Equalization standard (NAB adds the LF time constant). */
+    /** @brief Equalization standard (NAB adds the LF time constant).
+     *  Out-of-range values are clamped. */
     void setStandard(Standard s) noexcept
     {
-        standard_.store(static_cast<int>(s), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        const int v = std::clamp(static_cast<int>(s),
+                                 static_cast<int>(Standard::NAB),
+                                 static_cast<int>(Standard::CCIR));
+        standard_.store(v, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Playback loss intensity [0, 1] (0 bypasses the loss FIR). */
+    /** @brief Playback loss intensity [0, 1] (0 bypasses the loss FIR).
+     *  Non-finite values are ignored. */
     void setLossEffects(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         loss_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Head-bump resonance intensity [0, 1] (~2.5 dB at full). */
+    /** @brief Head-bump resonance intensity [0, 1] (~2.5 dB at full).
+     *  Non-finite values are ignored. */
     void setHeadBump(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         headBumpAmt_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Wow & flutter depth [0, 1] (~0.25% peak pitch deviation at 1). */
+    /** @brief Wow & flutter depth [0, 1] (~0.25% peak pitch deviation at 1).
+     *  Non-finite values are ignored. */
     void setWowFlutter(T amount) noexcept
     {
+        if (!std::isfinite(amount)) return;
         wowFlutter_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
     /** @brief Tape hiss level in dBFS (e.g. -55 for audible vintage hiss);
-     *  values <= -120 disable it (default). */
+     *  values <= -120 disable it (default). Non-finite values are ignored. */
     void setNoise(T dbfs) noexcept
     {
+        if (!std::isfinite(dbfs)) return;
         noiseDb_.store(std::clamp(dbfs, T(-200), T(-20)), std::memory_order_relaxed);
     }
 
-    /** @brief Dry/wet mix [0, 1]; dry is latency-compensated. */
+    /** @brief Dry/wet mix [0, 1]; dry is latency-compensated. Non-finite
+     *  values are ignored. */
     void setMix(T mix) noexcept
     {
+        if (!std::isfinite(mix)) return;
         mix_.store(std::clamp(mix, T(0), T(1)), std::memory_order_relaxed);
     }
+
+    [[nodiscard]] T getDrive() const noexcept { return driveDb_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getBias() const noexcept { return bias_.load(std::memory_order_relaxed); }
+    [[nodiscard]] Speed getSpeed() const noexcept
+    {
+        return static_cast<Speed>(speed_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] Standard getStandard() const noexcept
+    {
+        return static_cast<Standard>(standard_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] T getLossEffects() const noexcept { return loss_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getHeadBump() const noexcept { return headBumpAmt_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getWowFlutter() const noexcept { return wowFlutter_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getNoise() const noexcept { return noiseDb_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
 
     /** @brief Total latency in samples (oversampler + loss FIR + transport delay). */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
@@ -227,15 +285,17 @@ public:
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
         StateWriter w(stateId("TAPE"), 1);
-        w.write("drive", driveDb_.load(std::memory_order_relaxed));
-        w.write("bias", bias_.load(std::memory_order_relaxed));
+        // Explicit float casts: the blob stores float, and with T = double the
+        // unqualified write(key, double) would be ambiguous (float/int32/bool).
+        w.write("drive", static_cast<float>(driveDb_.load(std::memory_order_relaxed)));
+        w.write("bias", static_cast<float>(bias_.load(std::memory_order_relaxed)));
         w.write("speed", speed_.load(std::memory_order_relaxed));
         w.write("standard", standard_.load(std::memory_order_relaxed));
-        w.write("loss", loss_.load(std::memory_order_relaxed));
-        w.write("headBump", headBumpAmt_.load(std::memory_order_relaxed));
-        w.write("wowFlutter", wowFlutter_.load(std::memory_order_relaxed));
-        w.write("noise", noiseDb_.load(std::memory_order_relaxed));
-        w.write("mix", mix_.load(std::memory_order_relaxed));
+        w.write("loss", static_cast<float>(loss_.load(std::memory_order_relaxed)));
+        w.write("headBump", static_cast<float>(headBumpAmt_.load(std::memory_order_relaxed)));
+        w.write("wowFlutter", static_cast<float>(wowFlutter_.load(std::memory_order_relaxed)));
+        w.write("noise", static_cast<float>(noiseDb_.load(std::memory_order_relaxed)));
+        w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -258,17 +318,20 @@ public:
 
     // -- Processing -------------------------------------------------------------------
 
-    /** @brief Processes a block in-place. */
+    /** @brief Processes a block in-place. Pass-through until prepare() succeeds. */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        if (!prepared_) return;
+        if (!prepared_.load(std::memory_order_relaxed)) return;
         DenormalGuard guard;
 
         const int nCh = std::min(buffer.getNumChannels(), numChannels_);
         const int nS = buffer.getNumSamples();
         if (nCh == 0 || nS == 0) return;
 
-        if (dirty_.exchange(false, std::memory_order_relaxed))
+        // Acquire pairs with the setters' release stores so the recompute
+        // always sees the values published before the flag.
+        if (dirty_.load(std::memory_order_relaxed)
+            && dirty_.exchange(false, std::memory_order_acquire))
             recompute();
 
         const T mixVal = mix_.load(std::memory_order_relaxed);
@@ -360,11 +423,12 @@ public:
                 w = static_cast<T>(playLF_[static_cast<size_t>(ch)].process(
                         playHF_[static_cast<size_t>(ch)].process(static_cast<double>(w))));
 
-                // Hiss.
+                // Hiss (own RNG stream: enabling it must not change the
+                // transport modulation's realisation).
                 if (noiseOn)
                 {
-                    rng_ = rng_ * 1664525u + 1013904223u;
-                    const double n1 = static_cast<double>(rng_ >> 8) / 8388608.0 - 1.0;
+                    rngNoise_ = rngNoise_ * 1664525u + 1013904223u;
+                    const double n1 = static_cast<double>(rngNoise_ >> 8) / 8388608.0 - 1.0;
                     w += static_cast<T>(noiseAmp * n1 * 0.35);
                 }
 
@@ -416,7 +480,7 @@ private:
         }
     };
 
-    /** @brief HF emphasis (kHi·s·t + 1)/(s·t + 1) and LF shelf (s·t + kLo)/(s·t + 1)
+    /** @brief HF emphasis (kHi*s*t + 1)/(s*t + 1) and LF shelf (s*t + kLo)/(s*t + 1)
      *  via bilinear transform; `inverse` swaps numerator and denominator. */
     static ShelfSection makeHFShelf(double t, double kHi, double fs, bool inverse) noexcept
     {
@@ -466,7 +530,7 @@ private:
         // we calibrate empirically at -12 dBFS programme level by running a
         // short 1 kHz burst through a scratch hysteresis instance (~8 ms of
         // model time, only on parameter changes). Quieter material reads
-        // slightly low, hotter material blooms into compression — like tape.
+        // slightly low, hotter material blooms into compression - like tape.
         hScale_ = drive * 1.2 * 2.2e4;
         {
             constexpr double kCalAmp = 0.25;            // -12 dBFS reference
@@ -644,7 +708,7 @@ private:
     double sampleRate_ = 48000.0;
     int numChannels_ = 0;
     int maxBlock_ = 0;
-    bool prepared_ = false;
+    std::atomic<bool> prepared_ { false };
     int latency_ = 0;
     int drySize_ = 1;
 
@@ -672,7 +736,8 @@ private:
 
     double modPhaseWow_ = 0.0, modPhaseFlut_ = 0.0, modPhaseFlut2_ = 0.0;
     double driftState_ = 0.0, scrapeLp1_ = 0.0, scrapeLp2_ = 0.0;
-    uint32_t rng_ = 0x1357feedu;
+    uint32_t rng_ = 0x1357feedu;       ///< Transport modulation stream.
+    uint32_t rngNoise_ = 0x2468beefu;  ///< Hiss stream (independent of transport).
 
     std::atomic<T> driveDb_ { T(0) };
     std::atomic<T> bias_ { T(0.5) };

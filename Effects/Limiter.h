@@ -1,32 +1,45 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
 /**
  * @file Limiter.h
- * @brief True-peak brickwall limiter with ISP detection, lookahead, and
- *        adaptive release for mastering.
+ * @brief Brickwall lookahead limiter with optional ISP (true-peak) detection
+ *        and adaptive release for mastering.
  *
- * A professional-grade peak limiter that prevents audio from exceeding a
- * configurable ceiling. It uses a lookahead delay line with a smoothed attack
- * envelope to ensure transparent transient handling without high-frequency
- * clicks. Includes optional ISP (Inter-Sample Peak) detection for broadcast
- * compliance.
+ * A peak limiter that prevents audio from exceeding a configurable ceiling.
+ * It uses a lookahead delay line with a peak hold over the lookahead window
+ * and a smoothed attack envelope, so transients are turned down transparently
+ * instead of being clipped. Optional ISP (Inter-Sample Peak) detection feeds
+ * the sidechain with the ITU-R BS.1770 4x oversampled true-peak estimate,
+ * which greatly reduces inter-sample overs. The exact brickwall guarantee is
+ * in the sample domain (a final clamp at the ceiling); true-peak levels after
+ * that clamp are reduced but not mathematically bounded.
  *
  * @note This class is strictly real-time safe. It performs zero allocations
  *       in the audio thread. The maximum lookahead time dictates the memory
  *       allocated during prepare().
  *
  * Features:
- * - Brickwall limiting (output never exceeds ceiling)
- * - ISP true-peak detection (4x oversampled FIR)
- * - Lookahead with smoothed attack curve (artifact-free)
+ * - Brickwall limiting (sample peaks never exceed the ceiling)
+ * - ISP true-peak detection (4x oversampled FIR sidechain)
+ * - Lookahead peak hold + smoothed attack curve (artifact-free transients)
  * - CPU-optimized adaptive release (avoids std::exp in hot paths)
- * - Real-time safe parameter updates
+ * - Real-time safe parameter updates (lock-free atomics)
  *
- * Dependencies: DspMath.h, RingBuffer.h, SmoothedValue.h, AudioSpec.h,
- *               AudioBuffer.h, DenormalGuard.h.
+ * Threading: prepare() belongs to the setup thread (allocates; never call it
+ * concurrently with processing). processBlock(), processSample() and reset()
+ * belong to the audio thread. All setters are lock-free atomic publications,
+ * safe from any thread; changes are consumed at the next block (or the next
+ * channel-0 sample). Non-finite setter arguments are ignored. getLatency()
+ * derives from the published lookahead parameter, so a host reads the correct
+ * value immediately after setLookahead(). getGainReductionDb() is metering:
+ * an unsynchronized cross-thread read of the live envelope (approximate).
+ *
+ * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, RingBuffer.h,
+ *               SmoothedValue.h, DenormalGuard.h, TruePeakDetector.h,
+ *               StateBlob.h.
  */
 
 #include "../Core/DspMath.h"
@@ -39,17 +52,17 @@
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
-#include <numbers>
 
 namespace dspark {
 
 /**
  * @class Limiter
- * @brief High-performance True-peak brickwall limiter.
+ * @brief High-performance brickwall lookahead limiter.
  *
  * @tparam T Sample type (float or double).
  */
@@ -64,47 +77,77 @@ public:
     /**
      * @brief Allocates memory and prepares the limiter for processing.
      *
+     * Invalid arguments are release-safe: a non-positive or non-finite sample
+     * rate makes this call a no-op (the previous state, if any, is kept).
+     * Configured parameters (ceiling, release, lookahead, toggles) survive
+     * re-preparation.
+     *
      * @warning Must be called from the main/setup thread, NEVER from the audio thread.
      *
-     * @param sampleRate Sample rate in Hz.
-     * @param numChannels Number of channels to process.
-     * @param initialLookaheadMs Lookahead time in ms to start with (default: 2.0 ms).
+     * @param sampleRate Sample rate in Hz (must be > 0).
+     * @param numChannels Number of channels to process (clamped to [1, 16]).
+     * @param initialLookaheadMs Optional lookahead override in ms; any
+     *        non-positive or non-finite value (the default) keeps the current
+     *        lookahead parameter.
      */
-    void prepare(double sampleRate, int numChannels = 2, double initialLookaheadMs = 2.0)
+    void prepare(double sampleRate, int numChannels = 2, double initialLookaheadMs = -1.0)
     {
+        if (!(sampleRate > 0.0)) return; // NaN-safe validity gate: keep previous state
+        prepared_ = false;               // basic guarantee while (re)allocating
+
         sampleRate_ = sampleRate;
-        // tpState_ is a fixed std::array<…, kMaxChannels>; clamp so true-peak
+        // The true-peak detector state is a fixed kMaxChannels array; clamp so
         // detection can never index it out of bounds for high channel counts.
         numChannels_ = std::clamp(numChannels, 1, kMaxChannels);
 
         // Caching inverse sample rate for fast math in hot paths
         invSampleRate_ = T(1) / static_cast<T>(sampleRate_);
 
-        // Allocate for maximum possible lookahead to prevent RT-allocations later
-        const int maxLookaheadSamples = static_cast<int>(sampleRate_ * kMaxLookaheadMs / 1000.0) + 1;
-        
+        // Allocate for maximum possible lookahead to prevent RT-allocations
+        // later. The sample count is capped in double before the cast (a cast
+        // of an out-of-int-range double is undefined behaviour).
+        const double maxLaExact = sampleRate_ * kMaxLookaheadMs / 1000.0;
+        const int maxLookaheadSamples = static_cast<int>(std::min(maxLaExact, 1.0e7)) + 1;
+
         // Use the clamped count: a degenerate numChannels (<= 0, or negative cast
-        // to size_t, or > kMaxChannels) must neither under-allocate — which would
-        // make processBlock index delayLines_ out of bounds — nor over-allocate.
+        // to size_t, or > kMaxChannels) must neither under-allocate (which would
+        // make processBlock index delayLines_ out of bounds) nor over-allocate.
         delayLines_.resize(static_cast<size_t>(numChannels_));
         for (auto& dl : delayLines_)
             dl.prepare(maxLookaheadSamples * 2); // Double size for safety margin
 
-        setLookahead(static_cast<T>(initialLookaheadMs));
+        if (std::isfinite(initialLookaheadMs) && initialLookaheadMs > 0.0)
+            lookaheadMs_.store(std::clamp(static_cast<T>(initialLookaheadMs),
+                                          T(0.5), static_cast<T>(kMaxLookaheadMs)),
+                               std::memory_order_relaxed);
+        (void)lookaheadDirty_.exchange(false, std::memory_order_acquire);
+        applyLookaheadTarget();
         lookaheadCurrent_ = static_cast<T>(lookaheadSamples_);
 
+        // Duration cap for the adaptive-release counter (2 seconds).
+        maxLimitSamples_ = static_cast<int>(std::min(sampleRate_ * 2.0, 1.0e9));
+
         // Ceiling smoother setup
-        T ceilLinear = decibelsToGain(ceilingDb_.load(std::memory_order_relaxed));
+        const T ceilDb = ceilingDb_.load(std::memory_order_relaxed);
+        lastCeilingDb_ = ceilDb;
+        const T ceilLinear = decibelsToGain(ceilDb);
         ceilingSmooth_.prepare(sampleRate, 30.0);
         ceilingSmooth_.reset(ceilLinear);
 
+        lastReleaseMs_ = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
         updateReleaseCoefficient();
 
         reset();
         prepared_ = true;
     }
 
-    /** @brief Prepares from AudioSpec (unified API). */
+    /**
+     * @brief Prepares from AudioSpec (unified API).
+     *
+     * Preserves the configured lookahead parameter (it does NOT reset it to
+     * the constructor default), so a host re-activation keeps the latency the
+     * user dialled in.
+     */
     void prepare(const AudioSpec& spec)
     {
         prepare(spec.sampleRate, spec.numChannels);
@@ -115,24 +158,33 @@ public:
      *
      * RT-Safe: Yes. Lock-free and allocation-free.
      *
+     * The gain envelope is linked: the loudest channel drives the reduction
+     * applied to all channels. Channels beyond the prepared count pass
+     * through untouched (and undelayed).
+     *
      * @param buffer Audio buffer view.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
         if (!prepared_) return;
         DenormalGuard guard;
-        
+
         const int nCh = std::min(buffer.getNumChannels(), numChannels_);
         const int nS = buffer.getNumSamples();
 
+        if (lookaheadDirty_.exchange(false, std::memory_order_acquire))
+            applyLookaheadTarget();
         syncParameters();
 
         const bool isp          = truePeakEnabled_.load(std::memory_order_relaxed);
         const bool adaptive     = adaptiveRelease_.load(std::memory_order_relaxed);
         const bool safetyClip   = safetyClipEnabled_.load(std::memory_order_relaxed);
         const T relMs           = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
+        const T lookTarget      = static_cast<T>(lookaheadSamples_);
 
-        constexpr T kSafetyClipCeiling = T(0.96605); // -0.3 dBFS
+        T* chData[kMaxChannels] = {};
+        for (int ch = 0; ch < nCh; ++ch)
+            chData[ch] = buffer.getChannel(ch);
 
         for (int i = 0; i < nS; ++i)
         {
@@ -142,7 +194,6 @@ public:
             // Live-change smoothing of the lookahead read offset: at most one
             // sample of change per sample, so a setLookahead() during playback
             // glides (brief micro pitch-shift) instead of clicking.
-            const T lookTarget = static_cast<T>(lookaheadSamples_);
             if (lookaheadCurrent_ < lookTarget)      lookaheadCurrent_ += T(1);
             else if (lookaheadCurrent_ > lookTarget) lookaheadCurrent_ -= T(1);
             const int lookNow = static_cast<int>(lookaheadCurrent_);
@@ -150,7 +201,7 @@ public:
             // Phase 1: Peak detection and delay line push
             for (int ch = 0; ch < nCh; ++ch)
             {
-                T sample = buffer.getChannel(ch)[i];
+                T sample = chData[ch][i];
                 delayLines_[ch].push(sample);
 
                 T chPeak = isp ? truePeak_.processSample(sample, ch) : std::abs(sample);
@@ -163,7 +214,7 @@ public:
             // isolated peak would be output after the envelope has already released
             // and could exceed the ceiling. Holding the detected peak for the
             // look-ahead duration guarantees the brickwall without an instantaneous
-            // (clicky) attack — the one-pole attack still reaches ~99% over the window.
+            // (clicky) attack; the one-pole attack still reaches ~99% over the window.
             if (peak >= heldPeak_)      { heldPeak_ = peak; peakHoldCounter_ = lookaheadSamples_; }
             else if (peakHoldCounter_ > 0) { --peakHoldCounter_; }
             else                          { heldPeak_ = peak; }
@@ -190,38 +241,78 @@ public:
                         out = applySafetyClipper(out, clipCeil);
                 }
 
-                buffer.getChannel(ch)[i] = out;
+                chData[ch][i] = out;
             }
         }
     }
 
     /**
-     * @brief Processes a single sample (mono).
-     * @warning For multi-channel linked limiting, prefer processBlock() or manually calculate 
-     * the maximum peak across channels before smoothing gain.
+     * @brief Processes a single sample of one channel.
+     *
+     * The shared state (ceiling smoother, lookahead glide, peak hold decay and
+     * gain envelope) advances on channel 0, so call channel 0 first within
+     * each sample frame. For mono streams (channel 0 only) this path is
+     * bit-identical to processBlock(). Any channel's peak can raise the
+     * shared peak hold, but only channel 0 detects into the envelope; for
+     * properly linked multi-channel limiting prefer processBlock().
+     *
+     * @note No DenormalGuard here (per-sample hot path); per-sample callers
+     *       are expected to guard their own processing loop.
      */
     [[nodiscard]] T processSample(T input, int channel) noexcept
     {
         if (!prepared_) return input;
-        // Release-safe channel bound (delayLines_ is sized to numChannels_).
-        assert(channel >= 0 && channel < numChannels_);
+        // Release-safe channel bound (delayLines_ is sized to numChannels_):
+        // out-of-range channels are an exact pass-through, no state touched.
         if (channel < 0 || channel >= numChannels_) return input;
 
-        syncParameters();
+        const bool isp        = truePeakEnabled_.load(std::memory_order_relaxed);
+        const bool adaptive   = adaptiveRelease_.load(std::memory_order_relaxed);
+        const bool safetyClip = safetyClipEnabled_.load(std::memory_order_relaxed);
 
-        T ceiling = ceilingSmooth_.getNextValue();
-        bool isp = truePeakEnabled_.load(std::memory_order_relaxed);
-        bool adaptive = adaptiveRelease_.load(std::memory_order_relaxed);
-        T relMs = releaseMs_.load(std::memory_order_relaxed);
+        if (channel == 0)
+        {
+            if (lookaheadDirty_.exchange(false, std::memory_order_acquire))
+                applyLookaheadTarget();
+            syncParameters();
+            sampleCeiling_ = ceilingSmooth_.getNextValue();
+
+            const T lookTarget = static_cast<T>(lookaheadSamples_);
+            if (lookaheadCurrent_ < lookTarget)      lookaheadCurrent_ += T(1);
+            else if (lookaheadCurrent_ > lookTarget) lookaheadCurrent_ -= T(1);
+            sampleLookNow_ = static_cast<int>(lookaheadCurrent_);
+        }
+        const T ceiling = sampleCeiling_;
 
         delayLines_[channel].push(input);
-        T peak = isp ? truePeak_.processSample(input, channel) : std::abs(input);
+        const T chPeak = isp ? truePeak_.processSample(input, channel) : std::abs(input);
 
-        T targetGain = (peak > ceiling) ? ceiling / peak : T(1);
-        smoothGain(targetGain, adaptive, relMs);
+        // Shared peak hold: any channel may raise it; the per-frame decay and
+        // the gain envelope advance on channel 0 only.
+        if (chPeak >= heldPeak_)      { heldPeak_ = chPeak; peakHoldCounter_ = lookaheadSamples_; }
+        else if (channel == 0)
+        {
+            if (peakHoldCounter_ > 0) --peakHoldCounter_;
+            else                      heldPeak_ = chPeak;
+        }
 
-        T out = delayLines_[channel].read(lookaheadSamples_) * currentGain_;
-        return std::clamp(out, -ceiling, ceiling); // exact brickwall contract
+        if (channel == 0)
+        {
+            const T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
+            const T targetGain = (heldPeak_ > ceiling) ? ceiling / heldPeak_ : T(1);
+            smoothGain(targetGain, adaptive, relMs);
+        }
+
+        T out = delayLines_[channel].read(sampleLookNow_) * currentGain_;
+        out = std::clamp(out, -ceiling, ceiling); // exact brickwall contract
+
+        if (safetyClip)
+        {
+            const T clipCeil = std::min(kSafetyClipCeiling, ceiling);
+            if (std::abs(out) > clipCeil)
+                out = applySafetyClipper(out, clipCeil);
+        }
+        return out;
     }
 
     /** @brief Resets the internal state (delays, gain reduction). RT-Safe. */
@@ -235,6 +326,8 @@ public:
         peakHoldCounter_ = 0;
         lookaheadCurrent_ = static_cast<T>(lookaheadSamples_);
         ceilingSmooth_.skip();
+        sampleCeiling_ = ceilingSmooth_.getCurrentValue();
+        sampleLookNow_ = lookaheadSamples_;
     }
 
     // -- Level 1: Simple API ----------------------------------------------------
@@ -242,37 +335,43 @@ public:
     /**
      * @brief Sets the absolute output ceiling.
      * @param dB Ceiling in dBFS (e.g., -1.0 for streaming). RT-Safe.
+     *           Non-finite values are ignored.
      */
-    void setCeiling(T dB) noexcept { ceilingDb_.store(dB, std::memory_order_relaxed); }
+    void setCeiling(T dB) noexcept
+    {
+        if (!std::isfinite(dB)) return;
+        ceilingDb_.store(dB, std::memory_order_relaxed);
+    }
 
     // -- Level 2: Intermediate API ----------------------------------------------
 
     /**
      * @brief Sets the base release time.
-     * @param ms Release time in milliseconds. RT-Safe.
+     * @param ms Release time in milliseconds (floored to 1 ms). RT-Safe.
+     *           Non-finite values are ignored.
      */
-    void setRelease(T ms) noexcept { releaseMs_.store(std::max(ms, T(1)), std::memory_order_relaxed); }
+    void setRelease(T ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        releaseMs_.store(std::max(T(1), ms), std::memory_order_relaxed);
+    }
 
     /**
      * @brief Sets the lookahead time dynamically.
-     * 
-     * @note RT-Safe. It only adjusts read pointers up to the max memory allocated
-     *       during prepare(). Max lookahead is clamped to 10ms.
-     * 
-     * @param ms Lookahead in milliseconds (0.5 to 10.0 ms).
+     *
+     * @note RT-Safe (atomic publication from any thread). It only adjusts read
+     *       pointers up to the max memory allocated during prepare(); the read
+     *       offset glides to the new value at one sample per sample. Non-finite
+     *       values are ignored. getLatency() reflects the new value immediately.
+     *
+     * @param ms Lookahead in milliseconds (clamped to 0.5 to 10.0 ms).
      */
     void setLookahead(T ms) noexcept
     {
-        lookaheadMs_ = std::clamp(static_cast<double>(ms), 0.5, kMaxLookaheadMs);
-        if (sampleRate_ > 0)
-        {
-            lookaheadSamples_ = std::max(1, static_cast<int>(sampleRate_ * lookaheadMs_ / 1000.0));
-            
-            // Calculate an attack coefficient that guarantees reaching 99% of target gain
-            // exactly within the lookahead window to prevent transient clipping.
-            // Formula: alpha = 1 - exp(-ln(100) / samples)
-            attackCoeff_ = T(1) - std::exp(T(-4.60517) / static_cast<T>(lookaheadSamples_));
-        }
+        if (!std::isfinite(ms)) return;
+        lookaheadMs_.store(std::clamp(ms, T(0.5), static_cast<T>(kMaxLookaheadMs)),
+                           std::memory_order_relaxed);
+        lookaheadDirty_.store(true, std::memory_order_release);
     }
 
     // -- Level 3: Expert API ----------------------------------------------------
@@ -283,14 +382,34 @@ public:
     /** @brief Enables program-dependent adaptive release. RT-Safe. */
     void setAdaptiveRelease(bool enabled) noexcept { adaptiveRelease_.store(enabled, std::memory_order_relaxed); }
 
-    /** @brief Enables post-limiter asymmetric safety clipper. RT-Safe. */
+    /**
+     * @brief Enables the post-limiter soft-knee safety clipper. RT-Safe.
+     *
+     * Softens the region above -0.3 dBFS up to the ceiling; it only has an
+     * effect when the ceiling is set above -0.3 dBFS (below that, the
+     * brickwall clamp already keeps the output under the clipper threshold).
+     */
     void setSafetyClip(bool enabled) noexcept { safetyClipEnabled_.store(enabled, std::memory_order_relaxed); }
 
     // Getters
     [[nodiscard]] bool isTruePeakEnabled() const noexcept { return truePeakEnabled_.load(std::memory_order_relaxed); }
     [[nodiscard]] bool isAdaptiveReleaseEnabled() const noexcept { return adaptiveRelease_.load(std::memory_order_relaxed); }
     [[nodiscard]] bool isSafetyClipEnabled() const noexcept { return safetyClipEnabled_.load(std::memory_order_relaxed); }
-    [[nodiscard]] int getLatency() const noexcept { return lookaheadSamples_; }
+    [[nodiscard]] T getLookahead() const noexcept { return lookaheadMs_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Reports the processing latency (the lookahead) in samples.
+     *
+     * Derived from the published lookahead parameter, so it is correct
+     * immediately after setLookahead() from any thread (the audio thread may
+     * consume the change one block later; the glide covers the transition).
+     */
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        return lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
+    }
+
+    /** @brief Current gain reduction in dB (metering; unsynchronized read). */
     [[nodiscard]] T getGainReductionDb() const noexcept { return gainToDecibels(currentGain_); }
 
 
@@ -300,6 +419,7 @@ public:
         StateWriter w(stateId("LIMT"), 1);
         w.write("ceiling", ceilingDb_.load(std::memory_order_relaxed));
         w.write("release", releaseMs_.load(std::memory_order_relaxed));
+        w.write("lookahead", lookaheadMs_.load(std::memory_order_relaxed));
         w.write("truePeak", truePeakEnabled_.load(std::memory_order_relaxed));
         w.write("adaptive", adaptiveRelease_.load(std::memory_order_relaxed));
         w.write("safetyClip", safetyClipEnabled_.load(std::memory_order_relaxed));
@@ -313,6 +433,7 @@ public:
         if (!r.isValid() || r.processorId() != stateId("LIMT")) return false;
         setCeiling(static_cast<T>(r.read("ceiling", -0.3f)));
         setRelease(static_cast<T>(r.read("release", 100.0f)));
+        setLookahead(static_cast<T>(r.read("lookahead", 2.0f)));
         setTruePeak(r.read("truePeak", false));
         setAdaptiveRelease(r.read("adaptive", false));
         setSafetyClip(r.read("safetyClip", false));
@@ -322,17 +443,44 @@ public:
 protected:
     static constexpr int kMaxChannels = 16;
     static constexpr double kMaxLookaheadMs = 10.0;
+    static constexpr T kSafetyClipCeiling = T(0.96605); ///< -0.3 dBFS
 
     // Shared ITU-R BS.1770-4 true-peak detector (Core/TruePeakDetector.h).
     TruePeakDetector<T, kMaxChannels> truePeak_;
 
-    // Fast-path synchronization for atomic variables
+    /** Lookahead in samples for a given ms parameter (shared by the audio-side
+     *  recompute and getLatency() so both always agree exactly). The product is
+     *  capped in double before the int cast (out-of-range casts are UB). */
+    [[nodiscard]] int lookaheadSamplesFor(T ms) const noexcept
+    {
+        const double clampedMs = std::clamp(static_cast<double>(ms), 0.5, kMaxLookaheadMs);
+        const double exact = sampleRate_ * clampedMs / 1000.0;
+        return std::max(1, static_cast<int>(std::min(exact, 1.0e7)));
+    }
+
+    /** Consumes the published lookahead parameter (audio/setup thread). */
+    inline void applyLookaheadTarget() noexcept
+    {
+        lookaheadSamples_ = lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
+
+        // Calculate an attack coefficient that guarantees reaching 99% of target gain
+        // exactly within the lookahead window to prevent transient clipping.
+        // Formula: alpha = 1 - exp(-ln(100) / samples)
+        attackCoeff_ = T(1) - std::exp(T(-4.60517) / static_cast<T>(lookaheadSamples_));
+    }
+
+    // Fast-path synchronization for atomic variables. The linear ceiling is
+    // only recomputed when the dB parameter actually changed (skips the pow).
     inline void syncParameters() noexcept
     {
-        T ceilLinear = decibelsToGain(ceilingDb_.load(std::memory_order_relaxed));
-        ceilingSmooth_.setTargetValue(ceilLinear);
+        const T ceilDb = ceilingDb_.load(std::memory_order_relaxed);
+        if (ceilDb != lastCeilingDb_)
+        {
+            lastCeilingDb_ = ceilDb;
+            ceilingSmooth_.setTargetValue(decibelsToGain(ceilDb));
+        }
 
-        T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
+        const T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
         if (relMs != lastReleaseMs_)
         {
             lastReleaseMs_ = relMs;
@@ -352,10 +500,9 @@ protected:
         {
             // Smoothed attack to prevent discontinuous clicks on transients
             currentGain_ += attackCoeff_ * (targetGain - currentGain_);
-            
+
             // Limit duration to max 2 seconds to prevent integer overflow
-            const int maxDuration = static_cast<int>(sampleRate_ * 2.0);
-            if (limitingDuration_ < maxDuration) limitingDuration_++;
+            if (limitingDuration_ < maxLimitSamples_) limitingDuration_++;
         }
         else
         {
@@ -369,7 +516,7 @@ protected:
                     baseFactor = T(1) + std::min(durationMs / T(100), T(2));
                 }
                 T adaptedRelease = relMs * baseFactor;
-                
+
                 // Fast path for exp() approximation: 1 / (1 + fs * tau_seconds)
                 // Avoids brutal CPU spike of std::exp() in the audio thread loop
                 coeff = T(1) / (T(1) + (static_cast<T>(sampleRate_) * adaptedRelease / T(1000)));
@@ -385,17 +532,19 @@ protected:
         }
     }
 
+    /** Symmetric soft-knee clipper for the region above the clip threshold,
+     *  with a hard backstop at 1.05x the threshold. */
     [[nodiscard]] inline T applySafetyClipper(T out, T clipCeil) const noexcept
     {
         T sign = (out >= T(0)) ? T(1) : T(-1);
         T excess = std::abs(out) - clipCeil;
         T blend = T(1) / (T(1) + excess * T(10));
         out = sign * (clipCeil * blend + std::abs(out) * (T(1) - blend));
-        
+
         const T hardCeil = clipCeil * T(1.05);
         if (std::abs(out) > hardCeil)
             out = std::clamp(out, -hardCeil, hardCeil);
-            
+
         return out;
     }
 
@@ -403,20 +552,23 @@ protected:
     double sampleRate_ = 48000.0;
     T invSampleRate_ = T(1.0 / 48000.0);
     int numChannels_ = 2;
-    int lookaheadSamples_ = 96;
-    double lookaheadMs_ = 2.0;
+    int lookaheadSamples_ = 96;      ///< Audio-side lookahead (consumed from lookaheadMs_).
+    int maxLimitSamples_ = 96000;    ///< Adaptive-release duration cap (2 s).
 
     std::atomic<T> ceilingDb_ { T(-0.3) };
     std::atomic<T> releaseMs_ { T(100) };
+    std::atomic<T> lookaheadMs_ { T(2) };
+    std::atomic<bool> lookaheadDirty_ { false };
     std::atomic<bool> truePeakEnabled_ { false };
     std::atomic<bool> adaptiveRelease_ { false };
     std::atomic<bool> safetyClipEnabled_ { false };
 
     SmoothedValue<T> ceilingSmooth_;
+    T lastCeilingDb_ = T(-0.3);      ///< Change detector for the ceiling pow skip.
 
     T releaseCoeff_ = T(0);
-    T attackCoeff_ = T(1); 
-    T lastReleaseMs_ = T(-1); 
+    T attackCoeff_ = T(1);
+    T lastReleaseMs_ = T(-1);
 
     T currentGain_ = T(1);
     int limitingDuration_ = 0;
@@ -426,6 +578,10 @@ protected:
     // lookaheadSamples_ so the gain stays reduced until the peak is output.
     T heldPeak_ = T(0);
     int peakHoldCounter_ = 0;
+
+    // Per-sample path caches (advanced on channel 0, reused by later channels).
+    T sampleCeiling_ = T(0.96605);
+    int sampleLookNow_ = 96;
 
     std::vector<RingBuffer<T>> delayLines_;
 };

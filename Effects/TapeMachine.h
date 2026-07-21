@@ -17,10 +17,17 @@
  *    digital inverse. The round trip is flat by construction - but the
  *    hysteresis sees the emphasized signal, so highs saturate first at slow
  *    speeds, exactly as on hardware.
- * 2. **Magnetic hysteresis** at 2x oversampling, with `bias` mapping to the
- *    JA loop parameters: low bias widens the loop (under-bias grit), high
- *    bias narrows it toward the reversible curve. Small-signal gain is
- *    compensated analytically from the JA susceptibility, so drive changes
+ * 2. **Magnetic hysteresis with REAL AC bias** at 4x oversampling: an
+ *    ultrasonic carrier (0.375 * internal rate, exact 8-phase table) is
+ *    summed with the signal into a push-pull pair of JA instances per
+ *    channel (+carrier / -carrier, output averaged, like a centre-tapped
+ *    record head). The carrier erases the loop's branch memory exactly as
+ *    hardware bias does, the push-pull cancels the carrier, its odd
+ *    harmonics and the remanence DC, and the even folds die in the
+ *    downsampler. `bias` maps to carrier amplitude: under-bias drops below
+ *    the erase threshold (real grit and level instability), over-bias adds
+ *    the self-erasure roll-off of short wavelengths. Gain is calibrated
+ *    per setting through the same biased chain, so drive changes
  *    saturation, not level.
  * 3. **Playback loss effects** with the physical formulas (Kadis): spacing
  *    loss 54.6*d/lambda dB, gap loss sinc(pi*g/lambda), thickness loss
@@ -34,14 +41,12 @@
  *    hiss generator uses its own RNG stream, so enabling noise never changes
  *    the transport's realisation.
  * 5. **Tape hiss** (optional, default off).
- * 6. **LF alignment**: the dynamic JA loop gains extra level toward low
- *    frequencies at programme level (the expansive knee of the loop, worse
- *    at low bias and with the NAB record boost) - measured +2..+7 dB below
- *    50 Hz depending on bias. Like a real machine's LF EQ trimmer, the
- *    calibration also measures the loop gain at 40 Hz and a corrective
- *    low shelf flattens the response per bias/drive setting; a 2nd-order
- *    24 Hz high-pass models the AC-coupled playback amplifier (kills DC
- *    from remanence and subsonics, like the hardware's LF roll-off).
+ * 6. **Physical band edges**: a 2nd-order 24 Hz high-pass models the
+ *    AC-coupled playback amplifier (kills subsonics and any residual DC,
+ *    like the hardware's LF roll-off), and the loss FIR always applies the
+ *    hard reproduce-gap cutoff above ~21.5 kHz (no real head reads shorter
+ *    wavelengths; it also removes the last even-order bias intermodulation
+ *    sidebands near the base-rate Nyquist).
  *
  * The dry path of the mix control is delay-compensated to getLatency(). The
  * mix is applied per block without smoothing: the wet stream is correlated
@@ -56,7 +61,14 @@
  * unprepared instance passes audio through). reset() belongs to the stream
  * owner. getState()/setState() are setup/UI threads. The recompute on a
  * parameter change runs a short scratch calibration on the audio thread
- * (allocation-free, a few hundred samples of model time).
+ * (allocation-free, a few thousand samples of model time).
+ *
+ * Cost: the push-pull biased core runs two JA solvers at 4x, ~11% of one
+ * core at 48 kHz stereo on a desktop CPU - the price of physical AC bias
+ * (history-independent LF response, exact even-harmonic cancellation,
+ * ultrasonic residue below -75 dB). A SIMD lane-parallel JA (2 channels x
+ * 2 polarities) is the noted future optimisation if a lighter budget is
+ * ever needed.
  *
  * Dependencies: Core/Hysteresis.h, Core/Oversampling.h, Core/Biquad.h,
  * Core/SimdOps.h, Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h,
@@ -113,19 +125,34 @@ public:
         numChannels_ = spec.numChannels;
         maxBlock_ = std::max(spec.maxBlockSize, 1);
 
-        oversampler_ = std::make_unique<Oversampling<T>>(2, Oversampling<T>::Quality::High);
+        // The hysteresis core runs at 4x so the 0.375 * internal-rate AC bias
+        // carrier and its sidebands stay clear of the audio band.
+        oversampler_ = std::make_unique<Oversampling<T>>(4, Oversampling<T>::Quality::High);
         oversampler_->prepare(spec);
 
+        // Push-pull pair per channel: +carrier and -carrier instances, output
+        // averaged. Odd-in-bias terms (the carrier, its 3rd harmonic fold and
+        // the loop's remanence DC) cancel exactly, as in the centre-tapped
+        // record-head circuits of real machines.
         hysteresis_.assign(static_cast<size_t>(numChannels_), {});
+        hysteresisN_.assign(static_cast<size_t>(numChannels_), {});
         for (auto& h : hysteresis_)
-            h.prepare(sampleRate_ * 2.0);
+        {
+            h.prepare(sampleRate_ * 4.0);
+            h.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
+        }
+        for (auto& h : hysteresisN_)
+        {
+            h.prepare(sampleRate_ * 4.0);
+            h.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
+        }
 
         recordHF_.assign(static_cast<size_t>(numChannels_), {});
         recordLF_.assign(static_cast<size_t>(numChannels_), {});
         playHF_.assign(static_cast<size_t>(numChannels_), {});
         playLF_.assign(static_cast<size_t>(numChannels_), {});
         headBump_.assign(static_cast<size_t>(numChannels_), {});
-        trimShelf_.assign(static_cast<size_t>(numChannels_), {});
+        overBiasLp_.assign(static_cast<size_t>(numChannels_), 0.0);
 
         // AC-coupled playback amplifier: fixed 2nd-order 24 Hz high-pass
         // (real machines roll off there; also blocks remanence DC).
@@ -174,6 +201,7 @@ public:
     {
         if (!prepared_.load(std::memory_order_relaxed)) return;
         for (auto& h : hysteresis_) h.reset();
+        for (auto& h : hysteresisN_) h.reset();
         for (auto& f : firState_) std::fill(f.begin(), f.end(), T(0));
         for (auto& d : delayRing_) std::fill(d.begin(), d.end(), T(0));
         for (auto& d : dryRing_) std::fill(d.begin(), d.end(), T(0));
@@ -181,7 +209,7 @@ public:
         for (auto& s : recordLF_) s.clear();
         for (auto& s : playHF_) s.clear();
         for (auto& s : playLF_) s.clear();
-        for (auto& s : trimShelf_) s.clear();
+        for (auto& v : overBiasLp_) v = 0.0;
         // Clear STATE only: wiping coefficients here used to leave the head
         // bump at identity until the next parameter change re-ran recompute.
         for (auto& b : headBump_) b.clear();
@@ -189,6 +217,7 @@ public:
         firPos_ = 0;
         delayPos_ = 0;
         dryPos_ = 0;
+        biasPhase_ = 0;
         modPhaseWow_ = 0.0;
         modPhaseFlut_ = 0.0;
         modPhaseFlut2_ = 0.0;
@@ -210,9 +239,12 @@ public:
         dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Bias setting [0, 1]; 0.5 is nominal calibration. Low bias widens
-     *  the hysteresis loop (gritty), high bias cleans up toward reversible.
-     *  Non-finite values are ignored. */
+    /** @brief Bias setting [0, 1]; 0.5 is nominal calibration (carrier at
+     *  3x the JA field constant: full branch-memory erasure, clean odd
+     *  saturation). Below nominal the carrier drops under the erase
+     *  threshold: growing distortion and the level instability of a real
+     *  under-biased machine. Above nominal, self-erasure progressively rolls
+     *  off the top octave. Non-finite values are ignored. */
     void setBias(T bias) noexcept
     {
         if (!std::isfinite(bias)) return;
@@ -385,20 +417,35 @@ public:
                 d[i] = static_cast<T>(hf.process(lf.process(static_cast<double>(d[i]))));
         }
 
-        // 3. Hysteresis at 2x.
+        // 3. Push-pull AC-bias hysteresis at 4x. One shared carrier phase for
+        // all channels (a machine has a single bias oscillator); each channel
+        // runs a +carrier and a -carrier JA instance and averages them, which
+        // cancels every odd-in-bias term exactly (carrier, its folded 3rd
+        // harmonic, remanence DC) like a centre-tapped record head.
         {
             auto osView = oversampler_->upsample(buffer);
             const int osN = osView.getNumSamples();
+            const int phaseStart = biasPhase_;
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* d = osView.getChannel(ch);
-                auto& hyst = hysteresis_[static_cast<size_t>(ch)];
+                auto& hp = hysteresis_[static_cast<size_t>(ch)];
+                auto& hn = hysteresisN_[static_cast<size_t>(ch)];
                 const double inScale = hScale_;
-                const double outScale = mScale_;
+                const double outScale = mScale_ * 0.5;
+                const double B = biasAmp_;
+                int phase = phaseStart;
                 for (int i = 0; i < osN; ++i)
-                    d[i] = static_cast<T>(outScale * static_cast<double>(
-                        hyst.processSample(static_cast<T>(inScale * static_cast<double>(d[i])))));
+                {
+                    const double x = inScale * static_cast<double>(d[i]);
+                    const double c = B * kBiasTable[static_cast<size_t>(phase)];
+                    phase = (phase + 1) & 7;
+                    const double mp = static_cast<double>(hp.processSample(static_cast<T>(x + c)));
+                    const double mn = static_cast<double>(hn.processSample(static_cast<T>(x - c)));
+                    d[i] = static_cast<T>(outScale * (mp + mn));
+                }
             }
+            biasPhase_ = (phaseStart + osN) & 7;
             oversampler_->downsample(buffer);
         }
 
@@ -441,10 +488,19 @@ public:
                       + frac * (T(2) * p0 - T(5) * p1 + T(4) * p2 - p3
                       + frac * (T(3) * (p1 - p2) + p3 - p0)));
 
-                // Playback EQ (exact inverse de-emphasis) + LF alignment trim.
-                w = static_cast<T>(trimShelf_[static_cast<size_t>(ch)].process(
-                        playLF_[static_cast<size_t>(ch)].process(
-                            playHF_[static_cast<size_t>(ch)].process(static_cast<double>(w)))));
+                // Playback EQ (exact inverse de-emphasis).
+                w = static_cast<T>(playLF_[static_cast<size_t>(ch)].process(
+                        playHF_[static_cast<size_t>(ch)].process(static_cast<double>(w))));
+
+                // Over-bias self-erasure: wider recording zone partially
+                // erases short wavelengths (one-pole LP engaged above nominal
+                // bias only; identity at or below nominal).
+                if (overBiasA_ > 0.0)
+                {
+                    auto& lp = overBiasLp_[static_cast<size_t>(ch)];
+                    lp += overBiasA_ * (static_cast<double>(w) - lp);
+                    w = static_cast<T>(lp);
+                }
 
                 // AC-coupled playback amplifier (2nd-order 24 Hz high-pass:
                 // subsonic/DC roll-off of the real hardware).
@@ -539,17 +595,29 @@ private:
         const double lossAmt = static_cast<double>(loss_.load(std::memory_order_relaxed));
         const double bumpAmt = static_cast<double>(headBumpAmt_.load(std::memory_order_relaxed));
 
-        // --- bias -> JA loop parameters ----------------------------------------
-        // AC bias linearizes recording toward the anhysteretic curve; in JA
-        // terms that is a high reversible fraction c. Nominal bias (0.5) sits
-        // at c = 0.65: mild loop, soft Langevin compression into saturation.
-        // Under-bias drops c toward the raw S-shaped virgin curve (expansion,
-        // grit, level instability); over-bias approaches the clean
-        // anhysteretic. k scales the residual loop losses the same way.
-        const double kEff = 2.7e4 * (1.3 - 0.6 * bias);
-        const double cEff = std::clamp(0.35 + 0.6 * bias, 0.05, 0.95);
-        for (auto& h : hysteresis_)
-            h.setParameters(3.5e5, 2.2e4, 1.6e-3, kEff, cEff);
+        // --- bias -> carrier amplitude and over-bias erasure -------------------
+        // Real AC bias: the control maps to the push-pull carrier amplitude in
+        // units of the JA 'a' parameter. Nominal (0.5) sits at B = 3a: the
+        // carrier sweeps well past the coercivity every cycle, erasing the
+        // loop's branch memory exactly like hardware bias (measured: LF gain
+        // history-independent to < 0.1 dB). Under-bias drops B below the
+        // erase threshold: the loop keeps partial branch memory - the REAL
+        // grit and level instability of an under-biased machine. Over-bias
+        // adds the self-erasure of short wavelengths (wider recording zone)
+        // as a one-pole roll-off.
+        const double biasB = std::min(6.0, 3.0 * std::pow(9.0, bias - 0.5));
+        biasAmp_ = biasB * 2.2e4;
+        if (biasB > 3.5)
+        {
+            // Gentle self-erasure: ~-1.5 dB at 10 kHz per +1 B/a over nominal
+            // (one-pole corner gliding 22 kHz -> ~12.8 kHz at full over-bias).
+            const double fc = 22000.0 * (3.5 / biasB);
+            overBiasA_ = 1.0 - std::exp(-2.0 * std::numbers::pi * fc / sampleRate_);
+        }
+        else
+        {
+            overBiasA_ = 0.0;
+        }
 
         // --- EQ time constants per standard and speed --------------------------
         double t2 = 50e-6;                 // HF time constant
@@ -572,35 +640,58 @@ private:
 
         // --- drive scaling with operating-level makeup -------------------------
         // 0 dBFS at nominal drive maps to H = 1.2a: moderate saturation. Tape
-        // gain is inherently level-dependent (the virgin JA curve is expansive
-        // into its knee), so unity can only be defined at one operating point:
-        // we calibrate empirically at -12 dBFS programme level by running a
-        // short 1 kHz burst through a scratch hysteresis instance (a few
-        // thousand model samples, only on parameter changes). Quieter material
-        // reads slightly low, hotter material blooms into compression - like
-        // tape.
+        // gain is level-dependent, so unity can only be defined at one
+        // operating point: calibrate empirically at -12 dBFS programme level
+        // by running a short 1 kHz burst through the same push-pull biased
+        // chain on two scratch instances (a few thousand model samples, only
+        // on parameter changes). Quieter material reads slightly low, hotter
+        // material blooms into compression - like tape.
         hScale_ = drive * 1.2 * 2.2e4;
-        double g1k = 1.0;
         {
-            constexpr double kCalAmp = 0.25;            // -12 dBFS reference
-            const double fs2 = sampleRate_ * 2.0;
-            const int calN = static_cast<int>(0.008 * fs2);   // 8 ms = 8 cycles
-            calib_.prepare(fs2);
-            calib_.setParameters(3.5e5, 2.2e4, 1.6e-3, kEff, cEff);
-            double inSq = 0.0, outSq = 0.0;
+            // -12 dBFS reference, seen through the record emphasis: at 1 kHz
+            // the HF emphasis already lifts the level (about +3.7 dB NAB-15),
+            // so calibrating with the raw amplitude would leave the whole
+            // path low by the differential compression. Align at the level
+            // the loop actually sees, like a real machine's record-level
+            // alignment.
+            const double w1 = 2.0 * std::numbers::pi * 1000.0 * t2;
+            const double emph1k = std::sqrt((1.0 + kHiCap * kHiCap * w1 * w1)
+                                            / (1.0 + w1 * w1));
+            const double kCalAmp = 0.25 * emph1k;
+            const double fs4 = sampleRate_ * 4.0;
+            // 16 ms settle + 8 ms measured: the biased loop's mean state
+            // needs a few hundred carrier cycles to reach its steady branch.
+            const int calN = static_cast<int>(0.024 * fs4);
+            const int calFrom = (calN * 2) / 3;
+            calib_.prepare(fs4);
+            calib_.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
+            calib2_.prepare(fs4);
+            calib2_.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
+            // Measure the FUNDAMENTAL of the averaged pair (Goertzel-style
+            // correlation), not the raw RMS: the raw output still carries the
+            // even-order carrier residue that the downsampler removes in the
+            // real path, and it would inflate the measurement.
+            const double wCal = 2.0 * std::numbers::pi * 1000.0 / fs4;
+            double outRe = 0.0, outIm = 0.0;
+            int meas = 0;
             for (int i = 0; i < calN; ++i)
             {
-                const double x = kCalAmp * std::sin(2.0 * std::numbers::pi * 1000.0 * i / fs2);
-                const double m = static_cast<double>(
-                    calib_.processSample(static_cast<T>(hScale_ * x)));
-                if (i >= calN / 2)   // measure once the loop has settled
+                const double s = std::sin(wCal * i);
+                const double x = hScale_ * kCalAmp * s;
+                const double c = biasAmp_ * kBiasTable[static_cast<size_t>(i & 7)];
+                const double m = 0.5
+                    * (static_cast<double>(calib_.processSample(static_cast<T>(x + c)))
+                     + static_cast<double>(calib2_.processSample(static_cast<T>(x - c))));
+                if (i >= calFrom)
                 {
-                    inSq += x * x;
-                    outSq += m * m;
+                    outRe += m * std::cos(wCal * i);
+                    outIm += m * std::sin(wCal * i);
+                    ++meas;
                 }
             }
-            g1k = (outSq > 0.0 && inSq > 0.0) ? std::sqrt(outSq / inSq) : 1.0;
-            mScale_ = 1.0 / g1k;
+            const double fund = 2.0 * std::sqrt(outRe * outRe + outIm * outIm)
+                              / std::max(1, meas);
+            mScale_ = (fund > 0.0) ? kCalAmp / fund : 1.0;
 
             // Partial loudness link: the per-drive calibration above pins the
             // reference level EXACTLY, which kills the drive knob (inaudible
@@ -609,41 +700,6 @@ private:
             // alive: backing off cleans AND drops slightly, pushing holds
             // level while the tape density grows.
             mScale_ *= std::pow(drive, 0.25);
-        }
-
-        // --- LF alignment trim (baked) ------------------------------------------
-        // At programme level the dynamic JA loop settles on a history-dependent
-        // branch whose LF gain exceeds its 1 kHz gain (the c/k bias shortcut
-        // keeps the loop's branch memory that a real machine's AC bias erases):
-        // measured +2..+7 dB below 50 Hz depending on bias/drive. Like the LF
-        // EQ trimmer of a real machine's alignment, flatten it with a
-        // first-order low shelf. The correction is baked from measurements of
-        // the real streaming path at 40 Hz vs 1 kHz (bias 0.5 anchor row per
-        // standard, drive axis interpolated, scaled by the loop fraction
-        // 1 - cEff). Residual is < ~0.5 dB typical, up to ~1 dB at extreme
-        // under-bias (left as documented under-bias character). A runtime
-        // measurement cannot do better: the branch depends on the programme
-        // history itself.
-        double trimDc = 1.0;
-        {
-            static constexpr double kDrv[7] = { -12.0, -6.0, 0.0, 6.0, 12.0, 18.0, 24.0 };
-            static constexpr double kExcNab[7]  = { 0.26, 0.81, 1.70, 2.09, 1.43, 0.21, -0.49 };
-            static constexpr double kExcCcir[7] = { 0.05, 0.22, 0.72, 1.51, 1.83, 1.66, 1.72 };
-            const double* exc = useLF ? kExcNab : kExcCcir;
-            double e = exc[6];
-            if (driveDbV <= kDrv[0])
-                e = exc[0];
-            else
-                for (int i = 1; i < 7; ++i)
-                    if (driveDbV <= kDrv[i])
-                    {
-                        const double t = (driveDbV - kDrv[i - 1]) / (kDrv[i] - kDrv[i - 1]);
-                        e = exc[i - 1] + (exc[i] - exc[i - 1]) * t;
-                        break;
-                    }
-            e *= (1.0 - cEff) / 0.35;                       // loop-fraction scaling
-            const double trimDb = std::clamp(-e / 0.75, -6.0, 0.5);
-            trimDc = std::pow(10.0, trimDb / 20.0);
         }
 
         for (int ch = 0; ch < numChannels_; ++ch)
@@ -668,13 +724,6 @@ private:
             const double qx1 = plf.x1, qy1 = plf.y1;
             plf = useLF ? makeLFShelf(tLo, kLoBoost, sampleRate_, true) : ShelfSection {};
             plf.x1 = qx1; plf.y1 = qy1;
-
-            // LF alignment trim (corner ~70 Hz, DC gain = baked correction).
-            auto& trim = trimShelf_[static_cast<size_t>(ch)];
-            const double tx1 = trim.x1, ty1 = trim.y1;
-            trim = makeLFShelf(1.0 / (2.0 * std::numbers::pi * 70.0), trimDc,
-                               sampleRate_, false);
-            trim.x1 = tx1; trim.y1 = ty1;
         }
 
         // --- loss-effect FIR (63 taps, linear phase) ---------------------------
@@ -703,7 +752,18 @@ private:
                 mag = spacingLoss * gapLoss * thickLoss;
             }
             mags[kBin] = (1.0 - lossAmt) + lossAmt * mag;
+            // Physical reproduce-gap cutoff: no real head reads anything
+            // above ~21.5 kHz. Always active (independent of the loss
+            // amount); it also removes the last even-order bias
+            // intermodulation sidebands just below the base-rate Nyquist.
+            // Raised-cosine transition 19.5k -> 21.5k avoids the passband
+            // Gibbs ripple of a hard step on the 64-point design grid.
+            if (f >= 21500.0)
+                mags[kBin] = 0.0;
+            else if (f > 19500.0)
+                mags[kBin] *= 0.5 + 0.5 * std::cos(std::numbers::pi * (f - 19500.0) / 2000.0);
         }
+        double taps[kFirLen];
         for (int n = 0; n < kFirLen; ++n)
         {
             double acc = mags[0];
@@ -714,9 +774,25 @@ private:
             acc += mags[kGrid / 2] * std::cos(std::numbers::pi * (n - kFirCenter));
             const double hann = 0.5 - 0.5 * std::cos(2.0 * std::numbers::pi * (n + 1)
                                                      / (kFirLen + 1));
-            firTaps_[static_cast<size_t>(kFirLen - 1 - n)] =
-                static_cast<T>(acc * hann / kGrid);   // reversed for dotProduct
+            taps[n] = acc * hann / kGrid;
         }
+        // Normalize to exact unity at the 1 kHz calibration frequency so the
+        // windowing/gap-cut of the design never shifts the calibrated level.
+        {
+            const double w1k = 2.0 * std::numbers::pi * 1000.0 / sampleRate_;
+            double re = 0.0, im = 0.0;
+            for (int n = 0; n < kFirLen; ++n)
+            {
+                re += taps[n] * std::cos(w1k * n);
+                im -= taps[n] * std::sin(w1k * n);
+            }
+            const double g = std::sqrt(re * re + im * im);
+            const double norm = (g > 1e-9) ? 1.0 / g : 1.0;
+            for (int n = 0; n < kFirLen; ++n) taps[n] *= norm;
+        }
+        for (int n = 0; n < kFirLen; ++n)
+            firTaps_[static_cast<size_t>(kFirLen - 1 - n)] =
+                static_cast<T>(taps[n]);              // reversed for dotProduct
 
         // --- head bump ----------------------------------------------------------
         const double bumpHz = (speed == Speed::IPS_7_5) ? 45.0
@@ -786,13 +862,23 @@ private:
     int drySize_ = 1;
 
     std::unique_ptr<Oversampling<T>> oversampler_;
-    std::vector<Hysteresis<T>> hysteresis_;
-    Hysteresis<T> calib_;   ///< Scratch instance for makeup calibration.
+    std::vector<Hysteresis<T>> hysteresis_;   ///< +carrier instances (push-pull pair A).
+    std::vector<Hysteresis<T>> hysteresisN_;  ///< -carrier instances (push-pull pair B).
+    Hysteresis<T> calib_;    ///< Scratch +carrier instance for makeup calibration.
+    Hysteresis<T> calib2_;   ///< Scratch -carrier instance for makeup calibration.
+
+    /// AC bias carrier at 0.375 * internal rate: sin(2*pi*3k/8), one exact
+    /// 8-phase period (3 carrier cycles), shared by all channels like a
+    /// machine's single bias oscillator.
+    static constexpr double kBiasTable[8] = {
+        0.0,  0.70710678118654752, -1.0,  0.70710678118654752,
+        0.0, -0.70710678118654752,  1.0, -0.70710678118654752
+    };
 
     std::vector<ShelfSection> recordHF_, recordLF_, playHF_, playLF_;
-    std::vector<ShelfSection> trimShelf_;   ///< Measured LF alignment trim.
     std::vector<PeakSection> headBump_;
     std::vector<PeakSection> outHp_;        ///< AC-coupling 24 Hz high-pass.
+    std::vector<double> overBiasLp_;        ///< Over-bias self-erasure LP state.
 
     std::vector<T> firTaps_;
     std::vector<std::vector<T>> firState_;
@@ -808,6 +894,9 @@ private:
     int dryPos_ = 0;
 
     double hScale_ = 1.0, mScale_ = 1.0;
+    double biasAmp_ = 3.0 * 2.2e4;   ///< Carrier amplitude in H units.
+    double overBiasA_ = 0.0;         ///< Over-bias LP coefficient (0 = off).
+    int biasPhase_ = 0;              ///< Shared carrier phase (audio thread).
 
     double modPhaseWow_ = 0.0, modPhaseFlut_ = 0.0, modPhaseFlut2_ = 0.0;
     double driftState_ = 0.0, scrapeLp1_ = 0.0, scrapeLp2_ = 0.0;

@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -13,22 +13,27 @@
  * PitchFollower wraps Analysis/PitchDetector.h with the control logic every
  * pitch-driven effect needs:
  *
- * - **Confidence gating** — readings below the confidence threshold (or
+ * - **Confidence gating** - readings below the confidence threshold (or
  *   outside the configured frequency range) never move the output; the last
  *   reliable pitch is held through consonants and silence.
- * - **Octave-jump correction** — a reading ~1-2 octaves away from the tracked
+ * - **Octave-jump correction** - a reading ~1-2 octaves away from the tracked
  *   pitch is folded back to the closest octave of the current target before
  *   being considered (the classic YIN 2x/0.5x failure on transients).
- * - **Jump confirmation** — a genuinely large interval must persist for three
+ * - **Jump confirmation** - a genuinely large interval must persist for three
  *   consecutive readings before the target moves (one bad frame never jerks
  *   the output).
- * - **Glide in semitone domain** — the public value slews toward the target
+ * - **Glide in semitone domain** - the public value slews toward the target
  *   at a constant rate expressed in milliseconds per octave, so the movement
  *   is musically uniform across the whole range (Hz-domain smoothing is
  *   faster at high pitches and sluggish at low ones).
  *
- * The smoothed output is read lock-free from any thread, so the typical use
- * is: push audio in the callback, read getSmoothedHz() wherever it is needed.
+ * Threading:
+ * - prepare(): setup thread (allocates; not concurrent with processing).
+ * - processBlock() / pushSamples() / reset(): audio thread (stream owner).
+ * - setRange() / setConfidence() / setGlide(): any thread (relaxed atomics;
+ *   non-finite values are ignored).
+ * - getSmoothedHz() / getRawHz() / getConfidence() / isTracking() and the
+ *   parameter getters: any thread, lock-free.
  *
  * @code
  *   follower.prepare(spec);
@@ -50,6 +55,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -72,21 +78,28 @@ public:
     /**
      * @brief Prepares the follower and the wrapped detector.
      *
+     * An invalid spec (non-finite or non-positive fields) is ignored,
+     * keeping the previous state.
+     *
      * @param spec       Audio environment specification.
-     * @param windowSize Detector analysis window (default 2048 — good down to
+     * @param windowSize Detector analysis window (default 2048 - good down to
      *                   ~50 Hz at 48 kHz; updates every windowSize/4 samples).
      */
     void prepare(const AudioSpec& spec, int windowSize = 2048)
     {
-        if (spec.sampleRate <= 0.0) return;
+        if (!spec.isValid()) return;
         sampleRate_ = spec.sampleRate;
         detector_.prepare(spec.sampleRate, windowSize, windowSize / 4);
         monoScratch_.assign(static_cast<size_t>(std::max(spec.maxBlockSize, 1)), T(0));
-        prepared_ = true;
+        prepared_.store(true, std::memory_order_relaxed);
         reset();
     }
 
-    /** @brief Forgets the tracked pitch (parameters are kept). RT-safe. */
+    /**
+     * @brief Forgets the tracked pitch (parameters are kept).
+     * Allocation-free; call from the stream owner (it touches the same
+     * plain tracking state update() writes).
+     */
     void reset() noexcept
     {
         hasTarget_ = false;
@@ -101,9 +114,14 @@ public:
 
     // -- Parameters (thread-safe) ------------------------------------------------
 
-    /** @brief Accepted pitch range in Hz (default 60–1200). */
+    /**
+     * @brief Accepted pitch range in Hz (default 60 to 1200).
+     * Non-finite values are ignored (the old max() passed NaN through and
+     * closed the validity gate forever).
+     */
     void setRange(T minHz, T maxHz) noexcept
     {
+        if (!std::isfinite(minHz) || !std::isfinite(maxHz)) return;
         minHz = std::max(minHz, T(10));
         maxHz = std::max(maxHz, minHz);
         minHz_.store(minHz, std::memory_order_relaxed);
@@ -113,17 +131,32 @@ public:
     /** @brief Confidence threshold [0, 1] below which readings are ignored (default 0.85). */
     void setConfidence(T threshold) noexcept
     {
+        if (!std::isfinite(threshold)) return;
         confidence_.store(std::clamp(threshold, T(0), T(1)), std::memory_order_relaxed);
     }
 
     /**
      * @brief Glide time in milliseconds per octave (default 60).
      * 0 disables smoothing (the output snaps to each accepted reading).
+     * Non-finite values are ignored.
      */
     void setGlide(T msPerOctave) noexcept
     {
+        if (!std::isfinite(msPerOctave)) return;
         glideMs_.store(std::max(msPerOctave, T(0)), std::memory_order_relaxed);
     }
+
+    /** @brief Returns the lower bound of the accepted pitch range in Hz. */
+    [[nodiscard]] T getMinHz() const noexcept { return minHz_.load(std::memory_order_relaxed); }
+
+    /** @brief Returns the upper bound of the accepted pitch range in Hz. */
+    [[nodiscard]] T getMaxHz() const noexcept { return maxHz_.load(std::memory_order_relaxed); }
+
+    /** @brief Returns the confidence gating threshold [0, 1]. */
+    [[nodiscard]] T getConfidenceThreshold() const noexcept { return confidence_.load(std::memory_order_relaxed); }
+
+    /** @brief Returns the glide time in milliseconds per octave. */
+    [[nodiscard]] T getGlide() const noexcept { return glideMs_.load(std::memory_order_relaxed); }
 
     // -- Readout (lock-free, any thread) ------------------------------------------
 
@@ -133,7 +166,7 @@ public:
         return smoothedHz_.load(std::memory_order_relaxed);
     }
 
-    /** @return Last raw detector reading in Hz (ungated — may be garbage). */
+    /** @return Last raw detector reading in Hz (ungated - may be garbage). */
     [[nodiscard]] T getRawHz() const noexcept { return detector_.getFrequencyHz(); }
 
     /** @return Detector confidence of the last raw reading [0, 1]. */
@@ -153,7 +186,7 @@ public:
      */
     void processBlock(AudioBufferView<const T> buffer) noexcept
     {
-        if (!prepared_) return;
+        if (!prepared_.load(std::memory_order_relaxed)) return;
         const int nCh = buffer.getNumChannels();
         const int nS  = buffer.getNumSamples();
         if (nCh <= 0 || nS <= 0) return;
@@ -189,7 +222,7 @@ public:
      */
     void pushSamples(std::span<const T> samples) noexcept
     {
-        if (!prepared_ || samples.empty()) return;
+        if (!prepared_.load(std::memory_order_relaxed) || samples.empty()) return;
         detector_.pushSamples(samples);
         update(static_cast<int>(samples.size()));
     }
@@ -286,7 +319,7 @@ private:
 
     // -- Members --------------------------------------------------------------------
     double sampleRate_ = 48000.0;
-    bool prepared_ = false;
+    std::atomic<bool> prepared_{ false };
 
     PitchDetector<T> detector_;
     std::vector<T> monoScratch_;

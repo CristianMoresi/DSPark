@@ -1,11 +1,28 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
 /**
  * @file LoudnessMeter.h
  * @brief Thread-safe EBU R128 / ITU-R BS.1770 loudness meter.
+ *
+ * Momentary (400 ms), short-term (3 s), integrated (two-pass gated),
+ * loudness range (EBU Tech 3342) and true peak (BS.1770 4x estimate).
+ * Integrated loudness and LRA use constant-memory histograms: no allocation
+ * and O(bins) readout, real-time safe. Verified against the official EBU
+ * Tech 3341/3342 conformance vectors (CI gate).
+ *
+ * Threading:
+ * - prepare() / reset(): setup thread / stream owner (not concurrent with
+ *   the process calls or the readers).
+ * - process() / processBlock(): audio thread (stream owner). No-op before
+ *   prepare().
+ * - All readouts (getMomentaryLUFS, getShortTermLUFS, getIntegratedLUFS,
+ *   getLoudnessRange, getTruePeakDb): any thread, lock-free; values are
+ *   approximate while a block is in flight (metering).
+ *
+ * Dependencies: AudioBuffer.h, AudioSpec.h, DspMath.h, TruePeakDetector.h.
  */
 
 #include "../Core/DspMath.h"
@@ -41,32 +58,44 @@ class LoudnessMeter
 public:
     /**
      * @brief Prepares the meter and pre-calculates filter coefficients.
-     * @param sampleRate Sample rate in Hz (must be > 0).
-     * @param numChannels Number of channels (currently up to 2 supported).
+     *
+     * A non-finite or non-positive sample rate is ignored (conservative
+     * no-op keeping the previous state).
+     *
+     * @param sampleRate Sample rate in Hz (must be > 0 and finite).
+     * @param numChannels Accepted for API symmetry; the channel layout is
+     *                    taken from each processed buffer (up to 2 channels
+     *                    are measured).
      */
-    void prepare(double sampleRate, int numChannels = 2)
+    void prepare(double sampleRate, int numChannels = 2) noexcept
     {
-        if (sampleRate <= 0.0) return;
-        
+        (void)numChannels;
+        if (!std::isfinite(sampleRate) || sampleRate <= 0.0) return;
+
         sampleRate_ = sampleRate;
-        numChannels_ = std::clamp(numChannels, 1, kMaxChannels);
 
         computeKWeighting(sampleRate);
 
-        // 100 ms block length
-        blockSamples_ = static_cast<int>(sampleRate * 0.1);
-        
+        // 100 ms block length (clamped in double before the cast: an absurd
+        // finite rate must not overflow the int conversion)
+        blockSamples_ = static_cast<int>(std::clamp(sampleRate * 0.1, 1.0, 1.0e9));
+
         reset();
+        prepared_.store(true, std::memory_order_relaxed);
     }
 
     /** @brief Unified API preparation. */
-    void prepare(const AudioSpec& spec)
+    void prepare(const AudioSpec& spec) noexcept
     {
         prepare(spec.sampleRate, spec.numChannels);
     }
 
     /**
-     * @brief Processes an interleaved or non-interleaved buffer (Read-only).
+     * @brief Processes a non-interleaved buffer view (read-only).
+     *
+     * The first two channels are measured; additional channels are ignored
+     * (multichannel spatial weighting is not implemented).
+     *
      * @param buffer AudioBufferView to analyze.
      */
     void processBlock(AudioBufferView<const T> buffer) noexcept
@@ -86,6 +115,9 @@ public:
      */
     void process(const T* data, int numSamples) noexcept
     {
+        if (!prepared_.load(std::memory_order_relaxed) || data == nullptr || numSamples <= 0)
+            return;
+
         T tpMax = truePeakMax_.load(std::memory_order_relaxed);
         for (int i = 0; i < numSamples; ++i)
         {
@@ -108,6 +140,10 @@ public:
      */
     void process(const T* left, const T* right, int numSamples) noexcept
     {
+        if (!prepared_.load(std::memory_order_relaxed)
+            || left == nullptr || right == nullptr || numSamples <= 0)
+            return;
+
         T tpMax = truePeakMax_.load(std::memory_order_relaxed);
         for (int i = 0; i < numSamples; ++i)
         {
@@ -145,7 +181,8 @@ public:
 
     /**
      * @brief Computes the Integrated loudness using standard two-pass gating.
-     * @note Executed in O(1) time thanks to the histogram implementation. Safe for RT thread.
+     * @note O(bins) with a constant bin count (no per-block cost growth).
+     *       Safe to call from any thread.
      * @return Loudness in LUFS (minimum -100.0).
      */
     [[nodiscard]] T getIntegratedLUFS() const noexcept
@@ -263,7 +300,10 @@ public:
 
     /**
      * @brief Clears all measurements and resets filters.
-     * Lock-free, but may tear slightly if audio thread is simultaneously writing.
+     *
+     * Call from the stream owner or a setup thread, not concurrently with
+     * the process calls: the accumulators and filter states are plain
+     * writer-owned members.
      */
     void reset() noexcept
     {
@@ -292,7 +332,7 @@ public:
 
 private:
     static constexpr int kMaxChannels = 2; // Expandable to 8 with proper spatial weighting
-    
+
     // Histogram specs: -70 LUFS to +30 LUFS with 0.1 resolution = 1000 bins
     static constexpr double kMinHistogramLUFS = -70.0;
     static constexpr double kMaxHistogramLUFS = 30.0;
@@ -331,7 +371,7 @@ private:
             const double fc = 38.13547087602444;     // Hz
             const double K  = std::tan(std::numbers::pi * fc / sr);
             const double a0 = 1.0 + K / Q + K * K;
-            // The official table 2 numerator is exactly [1, -2, 1] — NOT
+            // The official table 2 numerator is exactly [1, -2, 1] - NOT
             // normalized to unity passband gain (it passes ~+0.04 dB).
             rlb_.b0 = 1.0;
             rlb_.b1 = -2.0;
@@ -346,7 +386,7 @@ private:
         // Adding 1e-18 protects against denormal numbers (Flush-To-Zero fallback)
         double output = c.b0 * input + s.z1;
         s.z1 = c.b1 * input - c.a1 * output + s.z2;
-        s.z2 = c.b2 * input - c.a2 * output + 1e-18; 
+        s.z2 = c.b2 * input - c.a2 * output + 1e-18;
         return output;
     }
 
@@ -358,7 +398,24 @@ private:
 
     void commitBlock() noexcept
     {
-        double meanPower = currentBlockPower_ / currentBlockSamples_;
+        const double meanPower = currentBlockPower_ / currentBlockSamples_;
+        currentBlockPower_ = 0.0;
+        currentBlockSamples_ = 0;
+
+        // A non-finite block (NaN/Inf fed by the caller) would poison the
+        // sliding window and freeze the histograms forever: the K-filter
+        // recursion never drains a NaN. A meter must report the signal as it
+        // is NOW, so drop the block, clear the filter states and resume
+        // measuring clean on the next one.
+        if (!std::isfinite(meanPower))
+        {
+            for (int ch = 0; ch < kMaxChannels; ++ch)
+            {
+                preState_[ch] = {};
+                rlbState_[ch] = {};
+            }
+            return;
+        }
 
         // Update sliding window ring buffer
         int currentPos = blockWritePos_.load(std::memory_order_relaxed);
@@ -403,16 +460,13 @@ private:
                 lraHistogram_[binIndex].fetch_add(1, std::memory_order_relaxed);
             }
         }
-
-        currentBlockPower_ = 0.0;
-        currentBlockSamples_ = 0;
     }
 
     T calculateLUFSFromBlocks(int numBlocks) const noexcept
     {
         double sum = 0.0;
         int currentPos = blockWritePos_.load(std::memory_order_acquire);
-        
+
         for (int i = 0; i < numBlocks; ++i)
         {
             int idx = (currentPos - 1 - i + 30) % 30;
@@ -434,7 +488,7 @@ private:
     }
 
     double sampleRate_ = 48000.0;
-    int numChannels_ = 2;
+    std::atomic<bool> prepared_{ false };
 
     BiquadCoeff pre_, rlb_;
     BiquadState preState_[kMaxChannels], rlbState_[kMaxChannels];

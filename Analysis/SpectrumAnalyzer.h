@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -7,12 +7,28 @@
  * @file SpectrumAnalyzer.h
  * @brief Real-time FFT-based spectrum analyser for audio visualisation.
  *
- * Provides a highly optimised spectrum analyser that handles the complete pipeline:
- * windowing → FFT → magnitude → smoothing → dB conversion.
- * * @note **Performance Warning:** This class performs FFT and transcendental math 
- * synchronously when enough samples are accumulated. For large FFT sizes (>2048) 
- * on tight audio callbacks, consider a lock-free queue architecture where the 
- * GUI thread pulls samples and computes the FFT independently to avoid audio dropouts.
+ * Handles the complete pipeline: windowing -> FFT -> single-sided magnitude
+ * (amplitude-calibrated: a full-scale sine reads 0 dB) -> per-bin exponential
+ * smoothing -> dB conversion -> optional peak hold with dB/s decay.
+ *
+ * @note **Performance:** the FFT and transcendental math run synchronously
+ * inside pushSamples() whenever a hop completes. For large FFT sizes (>2048)
+ * on tight audio callbacks, consider a lock-free queue architecture where the
+ * GUI thread pulls samples and computes the FFT independently.
+ *
+ * Threading:
+ * - prepare() / reset(): setup thread (not concurrent with the audio or
+ *   reader threads; reset() rewrites the reader-visible slots).
+ * - pushSamples(): audio thread (stream owner). No-op before prepare().
+ * - getMagnitudesDb() / getPeakHoldDb() / isNewDataReady(): ONE reader
+ *   thread (GUI). Wait-free triple-buffer hand-off; never blocks the writer.
+ *   The two arrays are acquired independently, so a pair of consecutive
+ *   calls may straddle a frame boundary (benign for metering).
+ * - setSmoothing() / setPeakDecay() / setPeakHoldEnabled() / setFloorDb():
+ *   any thread (relaxed atomics, picked up once per analysis frame).
+ *   Non-finite values are ignored.
+ *
+ * Dependencies: DspMath.h, FFT.h, WindowFunctions.h.
  *
  * @code
  * dspark::SpectrumAnalyzer<float> analyzer;
@@ -23,8 +39,8 @@
  *
  * // In GUI paint (Timer at 60Hz):
  * if (analyzer.isNewDataReady()) {
- * const float* spectrum = analyzer.getMagnitudesDb();
- * // Draw spectrum...
+ *     const float* spectrum = analyzer.getMagnitudesDb();
+ *     // Draw spectrum...
  * }
  * @endcode
  */
@@ -38,18 +54,24 @@
 #include <atomic>
 #include <cassert>
 #include <cmath>
-#include <vector>
+#include <cstddef>
 #include <memory>
+#include <vector>
 
 namespace dspark {
 
 /**
  * @class SpectrumAnalyzer
- * @brief Real-time FFT spectrum analyser with unified state smoothing and SIMD-friendly loops.
+ * @brief Real-time FFT spectrum analyser with per-bin smoothing and peak hold.
+ *
+ * The magnitude smoothing is a per-frame exponential (one analysis frame per
+ * hop = fftSize/2 samples), so its settling TIME depends on fftSize and the
+ * sample rate: frameRate = 2 * sampleRate / fftSize. The peak-hold decay is
+ * specified in dB/second and is rate-invariant.
  *
  * @tparam T Sample type (float or double).
  */
-template <typename T>
+template <FloatType T>
 class SpectrumAnalyzer
 {
 public:
@@ -66,20 +88,39 @@ public:
 
     /**
      * @brief Prepares the analyser and allocates all necessary buffers.
-     * * @param sampleRate Sample rate in Hz.
-     * @param fftSize    FFT size (must be power of two, 256–16384).
+     *
+     * Release-safe: a non-finite or non-positive sample rate is ignored
+     * (conservative no-op); fftSize is clamped to [256, 16384] and rounded
+     * UP to the next power of two; an out-of-range window enum falls back
+     * to Hann. May allocate (setup thread only). If an allocation throws,
+     * the analyser is left unprepared (pushSamples becomes a no-op) rather
+     * than half-configured.
+     *
+     * @param sampleRate Sample rate in Hz.
+     * @param fftSize    FFT size (power of two, 256 to 16384).
      * @param windowType Window function to use (default: Hann).
      */
     void prepare(double sampleRate, int fftSize = 2048, WindowType windowType = WindowType::Hann)
     {
-        assert(fftSize >= 256 && (fftSize & (fftSize - 1)) == 0);
+        assert(fftSize >= 256 && fftSize <= 16384 && (fftSize & (fftSize - 1)) == 0);
+
+        if (!std::isfinite(sampleRate) || sampleRate <= 0.0)
+            return;
+
+        // Release-safe size sanitation (the assert only guards debug builds;
+        // an unvalidated size would make FFTReal throw at stream time).
+        fftSize = std::clamp(fftSize, 256, 16384);
+        int pow2 = 256;
+        while (pow2 < fftSize) pow2 <<= 1;
+        fftSize = pow2;
+
+        fft_.reset(); // gate OFF: pushSamples() is a no-op while rebuilding
 
         sampleRate_ = sampleRate;
         fftSize_ = fftSize;
         numBins_ = fftSize / 2 + 1;
         hopSize_ = fftSize / 2; // 50% overlap
-
-        fft_ = std::make_unique<FFTReal<T>>(fftSize);
+        windowType_ = windowType;
 
         window_.resize(static_cast<size_t>(fftSize));
         generateWindow(windowType);
@@ -93,57 +134,116 @@ public:
         freqBuffer_.resize(static_cast<size_t>(fftSize + 2));
 
         // Unified DSP State
+        const T floorDb = floorDb_.load(std::memory_order_relaxed);
         magnitudesState_.assign(static_cast<size_t>(numBins_), T(0));
-        peakState_.assign(static_cast<size_t>(numBins_), T(-100));
+        peakState_.assign(static_cast<size_t>(numBins_), floorDb);
 
         // Triple buffer for tear-free cross-thread reading
         for (auto& slot : outSlots_)
         {
-            slot.magnitudesDb.assign(static_cast<size_t>(numBins_), T(-100));
-            slot.peakDb.assign(static_cast<size_t>(numBins_), T(-100));
+            slot.magnitudesDb.assign(static_cast<size_t>(numBins_), floorDb);
+            slot.peakDb.assign(static_cast<size_t>(numBins_), floorDb);
         }
         writeSlot_ = 0;
         readSlot_  = 1;
         pendingSlot_.store(2, std::memory_order_relaxed);
 
         ringWritePos_ = 0;
-        ringMask_ = fftSize_ - 1; // power of two guaranteed by the assert above
+        ringMask_ = fftSize_ - 1; // power of two guaranteed by the sanitation
         samplesUntilFFT_ = hopSize_;
         newDataReady_.store(false, std::memory_order_relaxed);
+
+        fft_ = std::make_unique<FFTReal<T>>(static_cast<size_t>(fftSize)); // gate ON, last
     }
 
     /** @brief Resets all internal buffers and state to zero/floor values. */
     void reset() noexcept
     {
+        const T floorDb = floorDb_.load(std::memory_order_relaxed);
         std::fill(inputRing_.begin(), inputRing_.end(), T(0));
         std::fill(magnitudesState_.begin(), magnitudesState_.end(), T(0));
-        std::fill(peakState_.begin(), peakState_.end(), floorDb_);
+        std::fill(peakState_.begin(), peakState_.end(), floorDb);
 
         for (auto& slot : outSlots_)
         {
-            std::fill(slot.magnitudesDb.begin(), slot.magnitudesDb.end(), floorDb_);
-            std::fill(slot.peakDb.begin(), slot.peakDb.end(), floorDb_);
+            std::fill(slot.magnitudesDb.begin(), slot.magnitudesDb.end(), floorDb);
+            std::fill(slot.peakDb.begin(), slot.peakDb.end(), floorDb);
         }
 
         ringWritePos_ = 0;
         samplesUntilFFT_ = hopSize_;
+        newDataReady_.store(false, std::memory_order_relaxed);
     }
 
-    void setSmoothing(T factor) noexcept { smoothing_ = std::clamp(factor, T(0), T(0.99)); }
-    void setPeakDecay(T decayDbPerSecond) noexcept { peakDecayRate_ = decayDbPerSecond; }
-    void setPeakHoldEnabled(bool enabled) noexcept { peakHoldEnabled_ = enabled; }
-    void setFloorDb(T floorDb) noexcept { floorDb_ = floorDb; }
+    /**
+     * @brief Sets the per-frame magnitude smoothing factor.
+     * @param factor 0 = no smoothing, 0.99 = heaviest. Applied once per
+     *               analysis frame (hop), so the settling time scales with
+     *               fftSize / sampleRate. Non-finite values are ignored.
+     */
+    void setSmoothing(T factor) noexcept
+    {
+        if (!std::isfinite(factor)) return;
+        smoothing_.store(std::clamp(factor, T(0), T(0.99)), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Sets the peak-hold decay rate.
+     * @param decayDbPerSecond Decay in dB per second (floored at 0;
+     *                         non-finite values are ignored).
+     */
+    void setPeakDecay(T decayDbPerSecond) noexcept
+    {
+        if (!std::isfinite(decayDbPerSecond)) return;
+        peakDecayRate_.store(std::max(T(0), decayDbPerSecond), std::memory_order_relaxed);
+    }
+
+    /** @brief Enables or disables peak-hold tracking. */
+    void setPeakHoldEnabled(bool enabled) noexcept
+    {
+        peakHoldEnabled_.store(enabled, std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Sets the readout floor in decibels.
+     * @param floorDb Values below this floor are clamped to it (non-finite
+     *                values are ignored).
+     */
+    void setFloorDb(T floorDb) noexcept
+    {
+        if (!std::isfinite(floorDb)) return;
+        floorDb_.store(floorDb, std::memory_order_relaxed);
+    }
+
+    /** @brief Returns the per-frame magnitude smoothing factor. */
+    [[nodiscard]] T getSmoothing() const noexcept { return smoothing_.load(std::memory_order_relaxed); }
+
+    /** @brief Returns the peak-hold decay rate in dB per second. */
+    [[nodiscard]] T getPeakDecay() const noexcept { return peakDecayRate_.load(std::memory_order_relaxed); }
+
+    /** @brief Returns true if peak-hold tracking is enabled. */
+    [[nodiscard]] bool isPeakHoldEnabled() const noexcept { return peakHoldEnabled_.load(std::memory_order_relaxed); }
+
+    /** @brief Returns the readout floor in decibels. */
+    [[nodiscard]] T getFloorDb() const noexcept { return floorDb_.load(std::memory_order_relaxed); }
+
+    /** @brief Returns the window type in use (set at prepare time). */
+    [[nodiscard]] WindowType getWindowType() const noexcept { return windowType_; }
 
     /**
      * @brief Pushes audio samples into the analyser's internal ring buffer.
      *
-     * Computes the FFT synchronously when the internal hop size (50% overlap) is met.
+     * Computes the FFT synchronously when the internal hop size (50% overlap)
+     * is met. No-op before prepare() or with a null/empty input.
      *
      * @param samples Pointer to the continuous audio data.
      * @param numSamples Number of samples to process.
      */
     void pushSamples(const T* samples, int numSamples) noexcept
     {
+        if (fft_ == nullptr || samples == nullptr || numSamples <= 0)
+            return;
+
         for (int i = 0; i < numSamples; ++i)
         {
             inputRing_[static_cast<size_t>(ringWritePos_)] = samples[i];
@@ -159,7 +259,7 @@ public:
 
     /**
      * @brief Returns the current magnitude spectrum in decibels.
-     * @return Pointer to an array of size getNumBins().
+     * @return Pointer to an array of size getNumBins() (0 before prepare()).
      */
     [[nodiscard]] const T* getMagnitudesDb() const noexcept
     {
@@ -169,7 +269,7 @@ public:
 
     /**
      * @brief Returns the peak-hold spectrum in decibels.
-     * @return Pointer to an array of size getNumBins().
+     * @return Pointer to an array of size getNumBins() (0 before prepare()).
      */
     [[nodiscard]] const T* getPeakHoldDb() const noexcept
     {
@@ -183,27 +283,46 @@ public:
         return newDataReady_.exchange(false, std::memory_order_relaxed);
     }
 
+    /** @brief Number of spectrum bins (fftSize/2 + 1); 0 before prepare(). */
     [[nodiscard]] int getNumBins() const noexcept { return numBins_; }
+
+    /** @brief FFT size in samples; 0 before prepare(). */
     [[nodiscard]] int getFFTSize() const noexcept { return fftSize_; }
-    [[nodiscard]] T binToFrequency(int bin) const noexcept { return static_cast<T>(bin) * static_cast<T>(sampleRate_) / static_cast<T>(fftSize_); }
+
+    /** @brief Centre frequency of the given bin in Hz (0 before prepare()). */
+    [[nodiscard]] T binToFrequency(int bin) const noexcept
+    {
+        if (fftSize_ <= 0) return T(0);
+        return static_cast<T>(bin) * static_cast<T>(sampleRate_) / static_cast<T>(fftSize_);
+    }
 
 private:
     void generateWindow(WindowType type)
     {
         switch (type)
         {
-            case WindowType::Hann: WindowFunctions<T>::hann(window_.data(), fftSize_); break;
             case WindowType::Hamming: WindowFunctions<T>::hamming(window_.data(), fftSize_); break;
             case WindowType::Blackman: WindowFunctions<T>::blackman(window_.data(), fftSize_); break;
             case WindowType::BlackmanHarris: WindowFunctions<T>::blackmanHarris(window_.data(), fftSize_); break;
             case WindowType::FlatTop: WindowFunctions<T>::flatTop(window_.data(), fftSize_); break;
             case WindowType::Rectangular: WindowFunctions<T>::rectangular(window_.data(), fftSize_); break;
+            case WindowType::Hann:
+            default: // wild enum value: fall back to Hann (never a zeroed window)
+                WindowFunctions<T>::hann(window_.data(), fftSize_);
+                windowType_ = WindowType::Hann;
+                break;
         }
     }
 
     void computeSpectrum() noexcept
     {
-        // 1. Copy & Window (Auto-vectorizable; pow2 mask instead of division)
+        // Parameters are published atomically; load once per frame.
+        const T smoothing   = smoothing_.load(std::memory_order_relaxed);
+        const T floorDb     = floorDb_.load(std::memory_order_relaxed);
+        const T decayRate   = peakDecayRate_.load(std::memory_order_relaxed);
+        const bool peakHold = peakHoldEnabled_.load(std::memory_order_relaxed);
+
+        // 1. Copy & Window (pow2 mask instead of division)
         for (int i = 0; i < fftSize_; ++i)
         {
             int ringIdx = (ringWritePos_ + i) & ringMask_;
@@ -213,8 +332,8 @@ private:
         // 2. Forward FFT
         fft_->forward(fftBuffer_.data(), freqBuffer_.data());
 
-        // 3. Magnitude Calculation & Smoothing (SIMD friendly logic)
-        const T oneMinusSmooth = T(1) - smoothing_;
+        // 3. Magnitude Calculation & Smoothing
+        const T oneMinusSmooth = T(1) - smoothing;
 
         for (int k = 0; k < numBins_; ++k)
         {
@@ -229,25 +348,29 @@ private:
             if (k == 0 || k == numBins_ - 1) mag *= T(0.5);
 
             magnitudesState_[static_cast<size_t>(k)] =
-                smoothing_ * magnitudesState_[static_cast<size_t>(k)] + oneMinusSmooth * mag;
+                smoothing * magnitudesState_[static_cast<size_t>(k)] + oneMinusSmooth * mag;
         }
 
         // 4. Time-Domain Peak Decay Calculation (Using real hopSize_)
-        const T peakDecayDb = peakDecayRate_ * static_cast<T>(hopSize_) / static_cast<T>(sampleRate_);
+        const T peakDecayDb = decayRate * static_cast<T>(hopSize_) / static_cast<T>(sampleRate_);
 
         // 5. Write into the writer-owned slot of the triple buffer
         auto& slot = outSlots_[static_cast<size_t>(writeSlot_)];
 
-        // 6. DB Conversion and Peak Hold (SIMD friendly logic)
+        // 6. DB Conversion and Peak Hold
         for (int k = 0; k < numBins_; ++k)
         {
-            T dB = gainToDecibels(magnitudesState_[static_cast<size_t>(k)], floorDb_);
+            T dB = gainToDecibels(magnitudesState_[static_cast<size_t>(k)], floorDb);
             slot.magnitudesDb[static_cast<size_t>(k)] = dB;
 
-            if (peakHoldEnabled_)
+            if (peakHold)
             {
+                // Canonical hold law: decay, but never below the live value.
+                // (The old strict-compare branch decayed a full step whenever
+                // dB == peak, so a stationary tone made the peak FLICKER one
+                // decay step below the signal every other frame.)
                 T& peak = peakState_[static_cast<size_t>(k)];
-                peak = (dB > peak) ? dB : std::max(floorDb_, peak - peakDecayDb);
+                peak = std::max(dB, std::max(floorDb, peak - peakDecayDb));
                 slot.peakDb[static_cast<size_t>(k)] = peak;
             }
         }
@@ -261,12 +384,13 @@ private:
     }
 
     double sampleRate_ = 48000.0;
-    int fftSize_ = 2048;
-    int numBins_ = 1025;
+    int fftSize_ = 0;   // 0 = unprepared (getters report honestly)
+    int numBins_ = 0;
     int hopSize_ = 1024;
 
-    std::unique_ptr<FFTReal<T>> fft_;
+    std::unique_ptr<FFTReal<T>> fft_; // doubles as the "prepared" gate
     std::vector<T> window_;
+    WindowType windowType_ = WindowType::Hann;
     T windowGain_ = T(1);
     T invGain_ = T(1);
 
@@ -315,10 +439,10 @@ private:
 
     int ringMask_ = 2047;
 
-    T smoothing_ = T(0.8);
-    T peakDecayRate_ = T(10);
-    T floorDb_ = T(-100);
-    bool peakHoldEnabled_ = false;
+    std::atomic<T> smoothing_     { T(0.8) };
+    std::atomic<T> peakDecayRate_ { T(10) };
+    std::atomic<T> floorDb_       { T(-100) };
+    std::atomic<bool> peakHoldEnabled_ { false };
 
     std::atomic<bool> newDataReady_{ false };
 };

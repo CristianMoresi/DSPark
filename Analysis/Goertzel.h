@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -7,22 +7,28 @@
  * @file Goertzel.h
  * @brief Goertzel algorithm for efficient single-frequency detection.
  *
- * The Goertzel algorithm computes the magnitude and phase at a specific 
- * frequency in O(N) time. It acts as an extremely narrow bandpass filter 
+ * The Goertzel algorithm computes the magnitude and phase at a specific
+ * frequency in O(N) time. It acts as an extremely narrow bandpass filter
  * evaluated over a specific block size (N).
- * * @note Because it uses a rectangular window inherently, if the target frequency 
- * does not align exactly with a harmonic of the window (fs/N), it will suffer 
- * from spectral leakage. For precise offline analysis, consider pre-windowing 
- * your input data (e.g., Hann window).
  *
- * Dependencies: DspMath.h, <cassert>
+ * @note Because it uses a rectangular window inherently, if the target
+ * frequency does not align exactly with a harmonic of the window (fs/N), it
+ * will suffer from spectral leakage. For precise offline analysis, consider
+ * pre-windowing your input data (e.g., Hann window).
+ *
+ * Threading: owner-managed. All methods (prepare, push/process, readouts,
+ * reset) are meant to be called from the thread that owns the stream; no
+ * internal synchronization is provided. Use one instance per thread.
+ *
+ * Dependencies: DspMath.h.
  */
 
 #include "../Core/DspMath.h"
 
+#include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <numbers>
-#include <cassert>
 
 namespace dspark {
 
@@ -30,8 +36,9 @@ namespace dspark {
  * @class Goertzel
  * @brief Single-frequency magnitude detector using the Goertzel algorithm.
  *
- * Designed for continuous streaming or block-based real-time analysis. 
+ * Designed for continuous streaming or block-based real-time analysis.
  * State is unified: you can mix `processBlock` and `pushSample` safely.
+ * Before prepare() the detector is inert and reports zero magnitude.
  *
  * @tparam T Sample type (float or double). Requires dspark::FloatType concept.
  */
@@ -42,9 +49,21 @@ public:
     /**
      * @brief Prepares the detector for a specific frequency.
      *
+     * Release-safe: a non-finite or non-positive sample rate, a non-finite
+     * target frequency or a non-positive block size are ignored (no-op
+     * keeping the previous configuration); the target frequency is clamped
+     * to [0, sampleRate/2].
+     *
      * @param sampleRate Sample rate in Hz. Must be > 0.
-     * @param targetFreqHz The frequency to detect. Must be < sampleRate / 2.
+     * @param targetFreqHz The frequency to detect, in [0, sampleRate/2].
      * @param blockSize Number of samples per analysis window. Must be > 0.
+     *                  With float precision, very long windows (hundreds of
+     *                  thousands of samples) accumulate rounding error in the
+     *                  resonator; prefer double for extreme block sizes.
+     *                  At exact DC and Nyquist the recursion sits on a double
+     *                  pole and its state grows O(N^2), so float precision
+     *                  degrades much sooner there: use double (or a short
+     *                  window) when measuring those two edge frequencies.
      */
     void prepare(double sampleRate, double targetFreqHz, int blockSize) noexcept
     {
@@ -52,42 +71,51 @@ public:
         assert(blockSize > 0 && "Block size must be strictly positive");
         assert(targetFreqHz >= 0.0 && targetFreqHz <= (sampleRate * 0.5) && "Frequency must be within Nyquist limit");
 
+        if (!std::isfinite(sampleRate) || sampleRate <= 0.0
+            || !std::isfinite(targetFreqHz) || blockSize <= 0)
+            return;
+
         sampleRate_ = sampleRate;
-        targetFreq_ = targetFreqHz;
+        targetFreq_ = std::clamp(targetFreqHz, 0.0, sampleRate * 0.5);
         blockSize_ = blockSize;
 
         // Exact target frequency omega calculation (Generalized Goertzel)
         double omega = 2.0 * std::numbers::pi * targetFreq_ / sampleRate_;
-        
+
         coeff_ = static_cast<T>(2.0 * std::cos(omega));
         cosOmega_ = static_cast<T>(std::cos(omega));
         sinOmega_ = static_cast<T>(std::sin(omega));
 
-        // Magnitude normalization factor: 2/N for standard waves, 1/N for DC
-        normalisationFactor_ = (targetFreqHz > 0.001) 
-                                ? static_cast<T>(2.0 / blockSize_) 
-                                : static_cast<T>(1.0 / blockSize_);
+        // Magnitude normalization: 2/N for interior bins, 1/N for DC and for
+        // exact Nyquist (neither has a mirrored bin; the old 2/N at Nyquist
+        // read a full-scale alternating signal 2x / +6 dB high).
+        const bool isDc      = targetFreq_ <= 0.001;
+        const bool isNyquist = targetFreq_ >= sampleRate_ * 0.5 * (1.0 - 1e-12);
+        normalisationFactor_ = (isDc || isNyquist)
+                                ? static_cast<T>(1.0 / blockSize_)
+                                : static_cast<T>(2.0 / blockSize_);
 
         reset();
     }
 
     /**
      * @brief Processes a block of audio samples, updating the internal state.
-     * * This method accumulates samples. To know if a full analysis block has 
-     * been completed, check `isReady()` after processing.
+     *
+     * This method accumulates samples. To know if a full analysis block has
+     * been completed, check `checkNewResultAvailable()` after processing.
      *
      * @param data Pointer to the audio samples.
      * @param numSamples Number of samples in the buffer.
      */
     void processBlock(const T* data, int numSamples) noexcept
     {
-        if (numSamples <= 0) return;
+        if (data == nullptr || numSamples <= 0) return;
 
         // Bring state to local variables for compiler optimization (register allocation)
         T s1 = s1_;
         T s2 = s2_;
         const T coeff = coeff_;
-        
+
         for (int i = 0; i < numSamples; ++i)
         {
             T s0 = data[i] + coeff * s1 - s2;
@@ -133,7 +161,8 @@ public:
 
     /**
      * @brief Manually forces the computation of the result before N samples are reached.
-     * * @warning Evaluating before reaching the configured blockSize will result in 
+     *
+     * @warning Evaluating before reaching the configured blockSize will result in
      * inaccurate magnitude and phase due to incomplete integration and incorrect scaling.
      */
     void forceCompute() noexcept
@@ -148,9 +177,11 @@ public:
 
     /**
      * @brief Checks if a new result has been computed.
-     * * Calling this will return true only once after an analysis block completes,
+     *
+     * Calling this will return true only once after an analysis block completes,
      * resetting the flag internally.
-     * * @return True if new data is available.
+     *
+     * @return True if new data is available.
      */
     [[nodiscard]] bool checkNewResultAvailable() noexcept
     {
@@ -182,16 +213,21 @@ public:
 
     /**
      * @brief Returns the magnitude in decibels.
-     * @return Magnitude in dB (returns lowest bound if magnitude is 0).
+     * @return Magnitude in dB, floored at -100 dB for zero/silence
+     *         (dspark::gainToDecibels floor).
      */
     [[nodiscard]] T getMagnitudeDb() const noexcept
     {
-        // Assuming dspark::gainToDecibels handles 0.0 appropriately
         return gainToDecibels(getMagnitude());
     }
 
     /**
      * @brief Returns the phase angle at the target frequency.
+     *
+     * The phase is referenced to the analysis block boundary: it is
+     * reproducible between blocks when the target frequency is an exact
+     * multiple of sampleRate/blockSize (bin-exact tones).
+     *
      * @return Phase in radians in the range [-pi, pi].
      */
     [[nodiscard]] T getPhase() const noexcept
@@ -205,9 +241,16 @@ public:
      */
     [[nodiscard]] double getTargetFrequency() const noexcept { return targetFreq_; }
 
+    /** @brief Returns the configured sample rate in Hz. */
+    [[nodiscard]] double getSampleRate() const noexcept { return sampleRate_; }
+
+    /** @brief Returns the configured analysis block size in samples. */
+    [[nodiscard]] int getBlockSize() const noexcept { return blockSize_; }
+
     /**
      * @brief Resets the internal IIR state and counters to zero.
-     * * Retains configured sample rate, frequency, and block size.
+     *
+     * Retains configured sample rate, frequency, and block size.
      */
     void reset() noexcept
     {

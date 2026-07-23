@@ -99,9 +99,14 @@ public:
      *
      * @param sampleRate Sample rate in Hz. Non-positive or NaN rates are ignored.
      * @param numChannels Number of audio channels (max 16, default: 2).
-     * @param cutoffHz    Cutoff frequency in Hz (clamped to min 1 Hz, default: 5.0).
+     * @param cutoffHz    Cutoff frequency in Hz (clamped to min 1 Hz). Leave it
+     *                    out (or pass a non-positive value) to KEEP the cutoff
+     *                    currently configured, which is what a host re-activating
+     *                    the plugin wants: re-preparing used to silently drop a
+     *                    setCutoff() back to the 5 Hz default. A freshly built
+     *                    instance still starts at 5 Hz.
      */
-    void prepare(double sampleRate, int numChannels = 2, double cutoffHz = 5.0)
+    void prepare(double sampleRate, int numChannels = 2, double cutoffHz = -1.0)
     {
         if (!(sampleRate > 0.0)) return;
         sampleRate_ = sampleRate;
@@ -110,17 +115,12 @@ public:
         reset();
 
         // Use the thread-safe setter to clamp and initialize safely
-        setCutoff(static_cast<T>(cutoffHz));
+        if (cutoffHz > 0.0)
+            setCutoff(static_cast<T>(cutoffHz));
         forceUpdateCoefficients();
     }
 
-    /**
-     * @brief Prepares from AudioSpec (unified API).
-     *
-     * @note This overload restores the default 5 Hz cutoff, like any other
-     *       two-argument prepare(): re-apply setCutoff() afterwards if the
-     *       instance was running a custom cutoff.
-     */
+    /** @brief Prepares from AudioSpec (unified API); keeps the configured cutoff. */
     void prepare(const AudioSpec& spec)
     {
         prepare(spec.sampleRate, spec.numChannels);

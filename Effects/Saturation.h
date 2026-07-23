@@ -26,7 +26,7 @@
  * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/Biquad.h,
  * Core/DryWetMixer.h, Core/DspMath.h, Core/Oversampling.h, Core/Smoothers.h,
  * Core/AnalogRandom.h, Core/SpscQueue.h, Core/SpinLock.h, Core/StateBlob.h,
- * Effects/MidSide.h.
+ * Effects/DCBlocker.h, Effects/MidSide.h.
  *
  * Threading: prepare(), setOversampling() and setState() belong to the setup
  * thread; process() and reset() to the audio thread; the remaining setters and
@@ -46,6 +46,7 @@
 #include "../Core/SpscQueue.h"
 #include "../Core/SpinLock.h"
 #include "../Core/StateBlob.h"
+#include "DCBlocker.h"
 #include "MidSide.h"
 
 #include <algorithm>
@@ -681,8 +682,12 @@ public:
 
         preFilter_.reset();
         postFilter_.reset();
-        dcBlocker_.reset();
-        dcBlocker_.setCoeffs(BiquadCoeffs<SampleType>::makeDcBlocker(spec.sampleRate));
+        // Order 2 at 5 Hz: the exact design makeDcBlocker() used to hand to a
+        // float biquad, now run in the double core (see DCBlocker.h). Prepared
+        // for the full channel range so it covers every channel the pipeline
+        // touches, not just the first eight.
+        dcBlocker_.setOrder(2);
+        dcBlocker_.prepare(spec.sampleRate, DCBlocker<SampleType>::kMaxChannels, 5.0);
         
         lastPreHpFreq_    = -1.0f;
         lastPostTiltFreq_ = -1.0f;
@@ -1564,7 +1569,12 @@ protected:
                                      outputGainSmoother_, postTiltGainSmoother_;
     Smoothers::LinearSmoother        crossfader_;
 
-    Biquad<SampleType> preFilter_, postFilter_, dcBlocker_;
+    Biquad<SampleType> preFilter_, postFilter_;
+    // A dedicated DCBlocker, not a Biquad: a 5 Hz high-pass keeps its poles
+    // 1e-4 from the unit circle, where a float biquad recursion cannot hold
+    // the zero at DC (it degenerates into an integrator of its own rounding
+    // error above ~96 kHz and sources the very offset it is here to remove).
+    DCBlocker<SampleType> dcBlocker_;
     DryWetMixer<SampleType> dryWetMixer_;
 
     AnalogRandom::Generator<SampleType> leftDrift_, rightDrift_;

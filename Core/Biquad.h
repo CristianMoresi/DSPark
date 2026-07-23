@@ -362,6 +362,16 @@ struct alignas(32) BiquadCoeffs
      * A very low frequency high-pass (default 5 Hz) used to remove DC offset
      * introduced by nonlinear processing (saturation, waveshaping, etc.).
      *
+     * @warning Prefer Effects/DCBlocker.h for actual DC removal. These
+     * coefficients are exact, but running them through Biquad<float> is not:
+     * a 5 Hz high-pass keeps its poles about pi*fc/(Q*fs) from the unit circle,
+     * so the denominator at DC (1 + a1 + a2) is a cancellation of terms of size
+     * 2 that float cannot resolve - it rounds to exactly 0 at 192 kHz and above,
+     * leaving a realised pole ON the unit circle that integrates the recursion's
+     * own rounding error forever. Measured with float state at 5 Hz: a 0.5 DC
+     * input still reads 0.0722 at the output at 192 kHz. DCBlocker runs the same
+     * design in a double core with a structurally exact zero at DC.
+     *
      * @param sampleRate Sample rate in Hz.
      * @param freq       Cut-off frequency in Hz (default: 5 Hz).
      */

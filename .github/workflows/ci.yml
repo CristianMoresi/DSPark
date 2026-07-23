@@ -253,8 +253,15 @@ jobs:
             *)       PV_PAT="*Linux*";   CV_PAT="*ubuntu*"
                      sudo apt-get update -q && sudo apt-get install -y -q xvfb ;;
           esac
-          gh release download --repo Tracktion/pluginval --pattern "$PV_PAT" --dir validators
-          gh release download --repo free-audio/clap-validator --pattern "$CV_PAT" --dir validators
+          # Validator versions are PINNED so a third-party release cannot turn
+          # this gate red on its own. clap-validator's "0.4.1" (2026-07-22) is a
+          # development snapshot (assets are tagged 0.4.1-127-g152b982 and the
+          # files inside them are still named 0.3.2) that also repackaged Linux
+          # and macOS as a zip WRAPPING a tar.gz, which leaves the extraction
+          # below with no binary to find. Moving to it is a deliberate upgrade
+          # with its own findings to work through, not a drift.
+          gh release download v1.0.4 --repo Tracktion/pluginval --pattern "$PV_PAT" --dir validators
+          gh release download 0.3.2 --repo free-audio/clap-validator --pattern "$CV_PAT" --dir validators
           for a in validators/*.zip validators/*.tar.gz; do
             [ -e "$a" ] || continue
             case "$a" in

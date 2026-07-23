@@ -682,10 +682,10 @@ public:
 
         preFilter_.reset();
         postFilter_.reset();
-        // Order 2 at 5 Hz: the exact design makeDcBlocker() used to hand to a
-        // float biquad, now run in the double core (see DCBlocker.h). Prepared
-        // for the full channel range so it covers every channel the pipeline
-        // touches, not just the first eight.
+        // Order 2 at 5 Hz: the same Butterworth design this stage always used,
+        // now run in the double core (see DCBlocker.h). Prepared for the full
+        // channel range so it covers every channel the pipeline touches, not
+        // just the first eight.
         dcBlocker_.setOrder(2);
         dcBlocker_.prepare(spec.sampleRate, DCBlocker<SampleType>::kMaxChannels, 5.0);
         

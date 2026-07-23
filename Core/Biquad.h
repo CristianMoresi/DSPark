@@ -50,6 +50,13 @@ namespace dspark {
  * not sanitised (they propagate into the coefficients), and the sample rate
  * is trusted as-is: the framework contract is a valid AudioSpec upstream.
  *
+ * Usable corner range: the designs below are exact, but a corner far below
+ * the sample rate cannot be REALISED in float. At fc/fs under roughly 1e-4
+ * the denominator evaluated at DC, 1 + a1 + a2, is a cancellation of terms
+ * of size 2 landing on 2.7e-8 (5 Hz at 192 kHz), which float cannot resolve:
+ * the realised poles drift onto the unit circle. Design and run those in
+ * double. For DC removal specifically, use DCBlocker, which is built for it.
+ *
  * @tparam T Coefficient type (float or double).
  */
 template <typename T>
@@ -354,31 +361,6 @@ struct alignas(32) BiquadCoeffs
             T(-2.0 * cosw0),
             T(1.0 - alpha)
         });
-    }
-
-    /**
-     * @brief Creates a DC-blocking high-pass filter.
-     *
-     * A very low frequency high-pass (default 5 Hz) used to remove DC offset
-     * introduced by nonlinear processing (saturation, waveshaping, etc.).
-     *
-     * @warning Prefer Effects/DCBlocker.h for actual DC removal. These
-     * coefficients are exact, but running them through Biquad<float> is not:
-     * a 5 Hz high-pass keeps its poles about pi*fc/(Q*fs) from the unit circle,
-     * so the denominator at DC (1 + a1 + a2) is a cancellation of terms of size
-     * 2 that float cannot resolve - it rounds to exactly 0 at 192 kHz and above,
-     * leaving a realised pole ON the unit circle that integrates the recursion's
-     * own rounding error forever. Measured with float state at 5 Hz: a 0.5 DC
-     * input still reads 0.0722 at the output at 192 kHz. DCBlocker runs the same
-     * design in a double core with a structurally exact zero at DC.
-     *
-     * @param sampleRate Sample rate in Hz.
-     * @param freq       Cut-off frequency in Hz (default: 5 Hz).
-     */
-    [[nodiscard]] static BiquadCoeffs makeDcBlocker(double sampleRate, double freq = 5.0) noexcept
-    {
-        freq = std::clamp(freq, 1.0, std::max(1.0, sampleRate * 0.499));
-        return makeHighPass(sampleRate, freq, 0.7071067811865476);
     }
 
     // -- First-order filter factory methods ------------------------------------

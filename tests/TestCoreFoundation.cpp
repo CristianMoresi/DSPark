@@ -903,8 +903,26 @@ DSPARK_TEST(AudioBuffer_zero_sample_resize_is_safe)
     EXPECT_EQ(buf.getNumChannels(), 0);
 }
 
+// AddressSanitizer replaces the allocator, and its answer to a request it
+// cannot serve is its own, not the platform's: by default it reports an
+// out-of-memory error and takes the process down, and with
+// allocator_may_return_null=1 it returns null straight out of operator new
+// rather than throwing, which the C++ allocation contract does not allow.
+// Either way the case below has nothing left to observe, so it steps aside.
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define DSPARK_TEST_UNDER_ASAN 1
+#  endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#  define DSPARK_TEST_UNDER_ASAN 1
+#endif
+
 DSPARK_TEST(AudioBuffer_recovers_after_failed_allocation)
 {
+#if defined(DSPARK_TEST_UNDER_ASAN)
+    return;
+#else
     // After a throwing resize the buffer must stay coherent: the next, smaller
     // resize has to re-allocate cleanly instead of trusting a stale capacity
     // over a null base pointer.
@@ -937,6 +955,7 @@ DSPARK_TEST(AudioBuffer_recovers_after_failed_allocation)
     buf->resize(2, 64);
     buf->getChannel(1)[63] = 0.25;
     EXPECT_NEAR(buf->toView().getPeakLevel(), 0.25, 0.0);
+#endif
 }
 
 DSPARK_TEST(AudioBuffer_shrink_reuses_allocation)

@@ -101,6 +101,10 @@ public:
      */
     void setFrequency(T freq) noexcept
     {
+        // Reject NaN before clamp: std::clamp(NaN, ...) returns NaN (all
+        // comparisons false), which would poison phaseInc_ and the phase
+        // accumulator forever. Matches Phasor/WavetableOscillator guards.
+        if (freq != freq) return;
         // Clamp frequency to valid bounds [0, Nyquist] to prevent aliasing breakdown
         T nyquist = static_cast<T>(sampleRate_ * 0.5);
         frequency_ = std::clamp(freq, T(0), nyquist);

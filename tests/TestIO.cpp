@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <limits>
 #include <vector>
 
@@ -377,4 +378,276 @@ DSPARK_TEST(AudioFileInfo_toSpec_maps_and_sanitizes)
     // framework processors reject as a no-op
     AudioFileInfo unopened;
     EXPECT_TRUE(!unopened.toSpec().isValid());
+}
+
+// ============================================================================
+// WavFile - robustness against unusual and hostile files
+// ============================================================================
+
+namespace {
+
+void wavLE16(std::ofstream& f, uint16_t v)
+{
+    char b[2] = { char(v & 0xFF), char((v >> 8) & 0xFF) };
+    f.write(b, 2);
+}
+
+void wavLE32(std::ofstream& f, uint32_t v)
+{
+    char b[4] = { char(v & 0xFF), char((v >> 8) & 0xFF),
+                  char((v >> 16) & 0xFF), char((v >> 24) & 0xFF) };
+    f.write(b, 4);
+}
+
+} // namespace
+
+DSPARK_TEST(WavFile_extensible_24in32_reads_exact)
+{
+    // WAVE_FORMAT_EXTENSIBLE, 32-bit container, 24 valid bits: the classic
+    // "24-in-32" layout (valid bits left-justified). The container width
+    // governs the frame stride; decoding by container reproduces the values
+    // exactly. The old reader adopted validBits as the frame size and
+    // mis-strided the whole file into garbage.
+    FileCleanup cleanup { "dspark_test_24in32.wav" };
+
+    const int32_t src[4] = {
+        int32_t(0x40000000),  // +0.5
+        int32_t(0xC0000000),  // -0.5
+        int32_t(0x7FFFFF00),  // ~ +1.0 at 24-bit precision
+        0
+    };
+    {
+        std::ofstream f("dspark_test_24in32.wav", std::ios::binary | std::ios::trunc);
+        const uint32_t dataSize = 4 * 4;
+        f.write("RIFF", 4); wavLE32(f, 4 + 8 + 40 + 8 + dataSize); f.write("WAVE", 4);
+        f.write("fmt ", 4); wavLE32(f, 40);
+        wavLE16(f, 0xFFFE); wavLE16(f, 1); wavLE32(f, 48000); wavLE32(f, 48000 * 4);
+        wavLE16(f, 4); wavLE16(f, 32);
+        wavLE16(f, 22);          // cbSize
+        wavLE16(f, 24);          // validBitsPerSample
+        wavLE32(f, 0);           // channelMask
+        wavLE16(f, 1);           // subformat PCM
+        static const uint8_t guid[14] = { 0,0,0,0, 0x10,0,0x80,0, 0,0xAA,0,0x38,0x9B,0x71 };
+        f.write(reinterpret_cast<const char*>(guid), 14);
+        f.write("data", 4); wavLE32(f, dataSize);
+        for (int32_t s : src) wavLE32(f, uint32_t(s));
+    }
+
+    WavFile r;
+    EXPECT_TRUE(r.openRead("dspark_test_24in32.wav"));
+    auto info = r.getInfo();
+    EXPECT_EQ(info.bitsPerSample, 32);     // container width, not valid bits
+    EXPECT_EQ(int(info.numSamples), 4);    // 16 bytes / 4-byte frames
+
+    AudioBuffer<float> buf;
+    buf.resize(1, 4);
+    EXPECT_TRUE(r.readSamples(buf.toView()));
+    r.close();
+
+    EXPECT_NEAR(buf.getChannel(0)[0],  0.5f, 1e-6f);
+    EXPECT_NEAR(buf.getChannel(0)[1], -0.5f, 1e-6f);
+    EXPECT_NEAR(buf.getChannel(0)[2],  1.0f, 1e-4f);
+    EXPECT_NEAR(buf.getChannel(0)[3],  0.0f, 1e-9f);
+}
+
+DSPARK_TEST(WavFile_invalid_openwrite_preserves_target)
+{
+    // openWrite must validate the requested format BEFORE touching the
+    // destination: the old code opened with ios::trunc first, so a rejected
+    // format destroyed the existing file.
+    FileCleanup cleanup { "dspark_test_precious.wav" };
+
+    {
+        WavFile w;
+        AudioFileInfo gi;
+        gi.sampleRate = 44100.0; gi.numChannels = 1; gi.bitsPerSample = 16;
+        EXPECT_TRUE(w.openWrite("dspark_test_precious.wav", gi));
+        AudioBuffer<float> b; b.resize(1, 100);
+        for (int i = 0; i < 100; ++i) b.getChannel(0)[i] = 0.25f;
+        EXPECT_TRUE(w.writeSamples(std::as_const(b).toView()));
+        w.close();
+    }
+
+    auto sizeOf = [](const char* p) {
+        std::ifstream f(p, std::ios::binary | std::ios::ate);
+        return static_cast<long long>(f.tellg());
+    };
+    const long long before = sizeOf("dspark_test_precious.wav");
+    EXPECT_TRUE(before > 0);
+
+    WavFile w2;
+    AudioFileInfo bad;
+    bad.sampleRate = 44100.0; bad.numChannels = 1; bad.bitsPerSample = 13;
+    EXPECT_TRUE(!w2.openWrite("dspark_test_precious.wav", bad));
+    AudioFileInfo nanRate;
+    nanRate.sampleRate = std::numeric_limits<double>::quiet_NaN();
+    nanRate.numChannels = 1; nanRate.bitsPerSample = 16;
+    EXPECT_TRUE(!w2.openWrite("dspark_test_precious.wav", nanRate));
+    AudioFileInfo tooWide;
+    tooWide.sampleRate = 44100.0; tooWide.numChannels = 1000; tooWide.bitsPerSample = 16;
+    EXPECT_TRUE(!w2.openWrite("dspark_test_precious.wav", tooWide));
+
+    EXPECT_EQ(sizeOf("dspark_test_precious.wav"), before);
+
+    // A valid file still reads back fine afterwards
+    WavFile r;
+    EXPECT_TRUE(r.openRead("dspark_test_precious.wav"));
+    EXPECT_EQ(int(r.getInfo().numSamples), 100);
+    r.close();
+}
+
+DSPARK_TEST(WavFile_unusual_headers_handled)
+{
+    FileCleanup c1 { "dspark_test_pcm64.wav" };
+    FileCleanup c2 { "dspark_test_oddorder.wav" };
+    FileCleanup c3 { "dspark_test_junk.bin" };
+
+    // (a) Integer PCM claiming 64 bits: no such WAV format exists and there
+    // is no decoder branch for it. The old reader accepted the header and
+    // then "read" nothing while reporting success.
+    {
+        std::ofstream f("dspark_test_pcm64.wav", std::ios::binary | std::ios::trunc);
+        const uint32_t dataSize = 8 * 8;
+        f.write("RIFF", 4); wavLE32(f, 4 + 8 + 16 + 8 + dataSize); f.write("WAVE", 4);
+        f.write("fmt ", 4); wavLE32(f, 16);
+        wavLE16(f, 1); wavLE16(f, 1); wavLE32(f, 48000); wavLE32(f, 48000 * 8);
+        wavLE16(f, 8); wavLE16(f, 64);
+        f.write("data", 4); wavLE32(f, dataSize);
+        for (int i = 0; i < 16; ++i) wavLE32(f, 0x11223344u);
+    }
+    {
+        WavFile r;
+        EXPECT_TRUE(!r.openRead("dspark_test_pcm64.wav"));
+    }
+
+    // (b) Odd-sized data chunk BEFORE fmt (legal but unusual): RIFF requires
+    // a pad byte after odd chunks; without skipping it the walker lands one
+    // byte off and never finds fmt, rejecting a legal file.
+    {
+        std::ofstream f("dspark_test_oddorder.wav", std::ios::binary | std::ios::trunc);
+        const uint32_t dataSize = 3;
+        f.write("RIFF", 4); wavLE32(f, 4 + 8 + dataSize + 1 + 8 + 16); f.write("WAVE", 4);
+        f.write("data", 4); wavLE32(f, dataSize);
+        const uint8_t smp[3] = { 128, 255, 0 };
+        f.write(reinterpret_cast<const char*>(smp), 3);
+        f.put(0); // RIFF pad byte
+        f.write("fmt ", 4); wavLE32(f, 16);
+        wavLE16(f, 1); wavLE16(f, 1); wavLE32(f, 48000); wavLE32(f, 48000);
+        wavLE16(f, 1); wavLE16(f, 8);
+    }
+    {
+        WavFile r;
+        EXPECT_TRUE(r.openRead("dspark_test_oddorder.wav"));
+        EXPECT_EQ(int(r.getInfo().numSamples), 3);
+        EXPECT_EQ(r.getInfo().bitsPerSample, 8);
+        AudioBuffer<float> b; b.resize(1, 3);
+        EXPECT_TRUE(r.readSamples(b.toView()));
+        EXPECT_NEAR(b.getChannel(0)[0], 0.0f, 1e-6f);            // 128 -> 0
+        EXPECT_NEAR(b.getChannel(0)[1], 127.0f / 128.0f, 1e-6f); // 255 -> ~+1
+        EXPECT_NEAR(b.getChannel(0)[2], -1.0f, 1e-6f);           // 0 -> -1
+        r.close();
+    }
+
+    // (c) Truncated header (no data chunk): open fails AND getInfo() honours
+    // the interface contract ("default values if no file is open") instead
+    // of leaking the partial parse.
+    {
+        std::ofstream f("dspark_test_junk.bin", std::ios::binary | std::ios::trunc);
+        f.write("RIFF", 4); wavLE32(f, 100); f.write("WAVE", 4);
+        f.write("fmt ", 4); wavLE32(f, 16);
+        wavLE16(f, 1); wavLE16(f, 7); wavLE32(f, 12345); wavLE32(f, 0);
+        wavLE16(f, 0); wavLE16(f, 16);
+    }
+    {
+        WavFile r;
+        EXPECT_TRUE(!r.openRead("dspark_test_junk.bin"));
+        auto info = r.getInfo();
+        EXPECT_EQ(info.numChannels, 0u);
+        EXPECT_NEAR(info.sampleRate, 44100.0, 1e-9);
+    }
+}
+
+DSPARK_TEST(WavFile_narrow_view_write_pads_silence)
+{
+    // Writing a mono view into a stereo file must fill the missing channel
+    // with silence (Mp3File contract). The old writer read src channel 1
+    // out of range: assert in debug, out-of-bounds read (measured segfault)
+    // in release.
+    FileCleanup cleanup { "dspark_test_narrow.wav" };
+
+    {
+        WavFile w;
+        AudioFileInfo si;
+        si.sampleRate = 44100.0; si.numChannels = 2; si.bitsPerSample = 16;
+        EXPECT_TRUE(w.openWrite("dspark_test_narrow.wav", si));
+        AudioBuffer<float> mono; mono.resize(1, 64);
+        for (int i = 0; i < 64; ++i) mono.getChannel(0)[i] = 0.5f;
+        EXPECT_TRUE(w.writeSamples(std::as_const(mono).toView()));
+        w.close();
+    }
+
+    WavFile r;
+    EXPECT_TRUE(r.openRead("dspark_test_narrow.wav"));
+    AudioBuffer<float> b; b.resize(2, 64);
+    EXPECT_TRUE(r.readSamples(b.toView()));
+    r.close();
+    for (int i = 0; i < 64; ++i)
+    {
+        EXPECT_NEAR(b.getChannel(0)[i], 0.5f, 1e-3f);
+        EXPECT_NEAR(b.getChannel(1)[i], 0.0f, 1e-9f);
+    }
+}
+
+DSPARK_TEST(WavFile_8bit_and_int32_roundtrip)
+{
+    // Coverage for the two integer formats the suite never exercised.
+    FileCleanup c1 { "dspark_test_8.wav" };
+    FileCleanup c2 { "dspark_test_i32.wav" };
+
+    constexpr int N = 1024;
+    std::vector<float> expected(N);
+    generateSine(expected.data(), N, 997.0f, 44100.0f, 0.8f);
+
+    // 8-bit unsigned PCM (write scale 127, read scale 1/128 -> ~1% worst case)
+    {
+        WavFile w;
+        AudioFileInfo info;
+        info.sampleRate = 44100.0; info.numChannels = 1; info.bitsPerSample = 8;
+        EXPECT_TRUE(w.openWrite("dspark_test_8.wav", info));
+        AudioBuffer<float> buf; buf.resize(1, N);
+        std::copy(expected.begin(), expected.end(), buf.getChannel(0));
+        EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+        w.close();
+
+        WavFile r;
+        EXPECT_TRUE(r.openRead("dspark_test_8.wav"));
+        EXPECT_EQ(r.getInfo().bitsPerSample, 8);
+        AudioBuffer<float> back; back.resize(1, N);
+        EXPECT_TRUE(r.readSamples(back.toView()));
+        r.close();
+        for (int i = 0; i < N; ++i)
+            EXPECT_NEAR(back.getChannel(0)[i], expected[i], 0.02f);
+    }
+
+    // 32-bit integer PCM (float mantissa limits accuracy to ~2^-24)
+    {
+        WavFile w;
+        AudioFileInfo info;
+        info.sampleRate = 44100.0; info.numChannels = 1; info.bitsPerSample = 32;
+        EXPECT_TRUE(w.openWrite("dspark_test_i32.wav", info));
+        AudioBuffer<float> buf; buf.resize(1, N);
+        std::copy(expected.begin(), expected.end(), buf.getChannel(0));
+        EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+        w.close();
+
+        WavFile r;
+        EXPECT_TRUE(r.openRead("dspark_test_i32.wav"));
+        EXPECT_EQ(r.getInfo().bitsPerSample, 32);
+        EXPECT_TRUE(!r.getInfo().isFloatingPoint);
+        AudioBuffer<float> back; back.resize(1, N);
+        EXPECT_TRUE(r.readSamples(back.toView()));
+        r.close();
+        for (int i = 0; i < N; ++i)
+            EXPECT_NEAR(back.getChannel(0)[i], expected[i], 2e-7f);
+    }
 }

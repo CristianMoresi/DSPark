@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -7,23 +7,35 @@
  * @file WavFile.h
  * @brief High-performance, pure C++ WAV file reader/writer.
  *
- * Provides bit-accurate parsing and encoding of standard and Extensible WAV 
- * files. Optimized for CPU cache locality and auto-vectorization (SIMD) 
- * during interleaving/deinterleaving.
+ * Provides bit-accurate parsing and encoding of standard and Extensible WAV
+ * files with cache-friendly channel-major conversion loops.
  *
  * @details
  * Supports the following formats:
  * - PCM integer: 8-bit unsigned, 16-bit, 24-bit, 32-bit signed
  * - IEEE float: 32-bit and 64-bit floating-point
- * 
+ * - WAVE_FORMAT_EXTENSIBLE wrappers of both, including reduced-precision
+ *   containers (e.g. 24 valid bits stored left-justified in a 32-bit
+ *   container): samples are decoded by container width, which reproduces
+ *   the reduced precision exactly.
+ *
  * Floating-point conversions to integer formats apply correct mathematical
- * rounding to avoid DC offsets and harmonic distortion caused by simple 
- * truncation. Endianness is handled safely via byte-wise reconstruction to 
+ * rounding to avoid DC offsets and harmonic distortion caused by simple
+ * truncation. Endianness is handled safely via byte-wise reconstruction to
  * avoid Undefined Behavior (UB) on non-x86 architectures.
  *
- * @warning File operations allocate memory internally (for chunk buffers) 
- * and block the thread pending disk I/O. NEVER call open, read, or write 
+ * The writer targets classic RIFF/WAVE, whose 32-bit sizes cap a file at
+ * 4 GiB: writeSamples() refuses (returns false) any write that would
+ * overflow that limit instead of silently corrupting the header.
+ *
+ * @warning File operations allocate memory internally (for chunk buffers)
+ * and block the thread pending disk I/O. NEVER call open, read, or write
  * methods from the real-time audio thread.
+ *
+ * Threading: owner-managed. One instance serves one file from one thread at
+ * a time; no internal synchronization (see AudioFile.h).
+ *
+ * Dependencies: IO/AudioFile.h (Core/AudioBuffer.h, Core/AudioSpec.h).
  */
 
 #include "AudioFile.h"
@@ -32,10 +44,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
-#include <vector>
 #include <filesystem>
+#include <fstream>
 #include <type_traits>
+#include <vector>
 
 namespace dspark {
 
@@ -44,7 +56,12 @@ namespace dspark {
  * @brief Complete WAV file reader and writer in pure C++20.
  *
  * Inherits from AudioFile to provide a uniform interface. Handles both
- * standard PCM and IEEE float formats, mono through multi-channel.
+ * standard PCM and IEEE float formats, mono through multi-channel (up to
+ * 64 channels).
+ *
+ * @note Files with more than 2 channels or more than 16 bits per sample are
+ * written as WAVE_FORMAT_EXTENSIBLE, per the Microsoft specification. Plain
+ * PCM/float headers are used otherwise for maximum compatibility.
  */
 class WavFile : public AudioFile
 {
@@ -77,6 +94,11 @@ public:
 
     /**
      * @brief Opens a WAV file for writing, overwriting if it exists.
+     *
+     * The requested format is validated BEFORE the destination is touched:
+     * an unsupported format returns false without creating or truncating
+     * anything on disk.
+     *
      * @param path Platform-independent output path.
      * @param info Configuration for sample rate, bit depth, and channels.
      * @return True if the file was created and the preliminary header written.
@@ -84,26 +106,28 @@ public:
     [[nodiscard]] bool openWrite(const std::filesystem::path& path, const AudioFileInfo& info) override
     {
         close();
-        file_.open(path, std::ios::binary | std::ios::out | std::ios::trunc);
-        if (!file_.is_open()) return false;
 
-        info_ = info;
-
-        // Validate/normalize the requested format so we never emit a corrupt
-        // header. WAV supports PCM at 8/16/24/32-bit and IEEE float at 32/64-bit.
-        if (info_.numChannels < 1) return false;
-        if (info_.sampleRate <= 0.0) return false;
-        if (info_.isFloatingPoint)
+        // Validate/normalize the requested format first so we never emit a
+        // corrupt header AND never destroy an existing file on a doomed
+        // request. WAV supports PCM at 8/16/24/32-bit and IEEE float at
+        // 32/64-bit; the fmt chunk stores the rate as uint32.
+        if (info.numChannels < 1 || info.numChannels > kMaxChannels) return false;
+        if (!(info.sampleRate >= 1.0) || info.sampleRate > 4294967295.0) return false;
+        if (info.isFloatingPoint)
         {
-            if (info_.bitsPerSample != 32 && info_.bitsPerSample != 64)
+            if (info.bitsPerSample != 32 && info.bitsPerSample != 64)
                 return false;
         }
-        else if (info_.bitsPerSample != 8 && info_.bitsPerSample != 16 &&
-                 info_.bitsPerSample != 24 && info_.bitsPerSample != 32)
+        else if (info.bitsPerSample != 8 && info.bitsPerSample != 16 &&
+                 info.bitsPerSample != 24 && info.bitsPerSample != 32)
         {
             return false;
         }
 
+        file_.open(path, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!file_.is_open()) return false;
+
+        info_ = info;
         mode_ = Mode::Write;
         totalFramesWritten_ = 0;
 
@@ -122,6 +146,10 @@ public:
 
     [[nodiscard]] bool readSamples(AudioBufferView<float> dest) override
     {
+        // An open-but-empty file (zero-length data chunk) reads zero frames
+        // successfully; only unopened handles or I/O errors report failure.
+        if (mode_ == Mode::Read && file_.is_open() && info_.numSamples == 0)
+            return true;
         return readSamples(dest, 0, info_.numSamples);
     }
 
@@ -132,7 +160,7 @@ public:
         if (startFrame < 0 || numFrames <= 0) return false;
         if (startFrame + numFrames > info_.numSamples) return false;
 
-        const int frameSize = (info_.bitsPerSample / 8) * info_.numChannels;
+        const int frameSize = static_cast<int>(info_.bitsPerSample / 8 * info_.numChannels);
 
         // Seek to the exact start frame within the 'data' chunk
         auto seekPos = dataChunkOffset_ + static_cast<std::streamoff>(startFrame * frameSize);
@@ -165,8 +193,14 @@ public:
         if (mode_ != Mode::Write || !file_.is_open()) return false;
 
         const int nCh = static_cast<int>(info_.numChannels);
+        const int srcCh = std::min(src.getNumChannels(), nCh);
         const int nS  = src.getNumSamples();
-        const int frameSize = (info_.bitsPerSample / 8) * nCh;
+        const int frameSize = static_cast<int>(info_.bitsPerSample / 8) * nCh;
+
+        // Classic RIFF sizes are 32-bit: refuse a write that would push the
+        // data chunk past what the header can describe (header <= 128 bytes).
+        const int64_t dataAfter = (totalFramesWritten_ + nS) * static_cast<int64_t>(frameSize);
+        if (dataAfter > static_cast<int64_t>(0xFFFFFFFFu) - 128) return false;
 
         int framesRemaining = nS;
         int srcOffset = 0;
@@ -175,7 +209,7 @@ public:
         {
             const int toWrite = std::min(framesRemaining, kChunkFrames);
 
-            interleave(src, ioBuffer_.data(), nCh, toWrite, srcOffset);
+            interleave(src, ioBuffer_.data(), nCh, srcCh, toWrite, srcOffset);
 
             auto rawBytes = static_cast<std::streamsize>(static_cast<int64_t>(toWrite) * frameSize);
             file_.write(reinterpret_cast<const char*>(ioBuffer_.data()), rawBytes);
@@ -191,7 +225,7 @@ public:
 
     void close() override
     {
-        if (!file_.is_open()) { mode_ = Mode::Closed; return; }
+        if (!file_.is_open()) { mode_ = Mode::Closed; info_ = {}; return; }
 
         if (mode_ == Mode::Write)
             finaliseHeader();
@@ -200,6 +234,7 @@ public:
         ioBuffer_.clear();
         ioBuffer_.shrink_to_fit();
         mode_ = Mode::Closed;
+        info_ = {}; // getInfo() contract: defaults once no file is open
     }
 
     [[nodiscard]] bool isOpen() const noexcept override
@@ -214,6 +249,7 @@ private:
     static constexpr uint16_t kFormatIEEEFloat   = 3;
     static constexpr uint16_t kFormatExtensible  = 0xFFFE;
     static constexpr int kChunkFrames            = 8192;
+    static constexpr uint32_t kMaxChannels       = 64;
 
     enum class Mode { Closed, Read, Write };
 
@@ -229,8 +265,8 @@ private:
 
     void resizeIoBuffer()
     {
-        const int bytesPerSample = info_.bitsPerSample / 8;
-        const size_t bytesNeeded = static_cast<size_t>(kChunkFrames * info_.numChannels * bytesPerSample);
+        const size_t bytesNeeded = static_cast<size_t>(kChunkFrames)
+                                 * info_.numChannels * (info_.bitsPerSample / 8);
         if (ioBuffer_.size() < bytesNeeded)
             ioBuffer_.resize(bytesNeeded);
     }
@@ -260,9 +296,16 @@ private:
             if (!readBytes(chunkId, 4)) break;
             if (!readLE32(chunkSize)) break;
 
+            // RIFF chunks are word-aligned: an odd-sized chunk is followed by
+            // one pad byte that is not part of the declared size. All skips
+            // below must account for it (in 64-bit arithmetic, so a corrupt
+            // size near UINT32_MAX cannot wrap the seek to zero).
+            const std::streamoff pad = (chunkSize & 1);
+
             if (std::memcmp(chunkId, "fmt ", 4) == 0)
             {
                 if (!parseFmtChunk(chunkSize)) return false;
+                if (pad) file_.seekg(pad, std::ios::cur);
                 hasFmt = true;
             }
             else if (std::memcmp(chunkId, "data", 4) == 0)
@@ -271,39 +314,32 @@ private:
                 file_.seekg(0, std::ios::end);
                 auto fileEnd = file_.tellg();
                 file_.seekg(currentPos);
-                
+
                 auto remaining = fileEnd - currentPos;
                 if (static_cast<std::streamoff>(chunkSize) > remaining)
                     chunkSize = static_cast<uint32_t>(remaining);
 
                 dataChunkOffset_ = file_.tellg();
                 dataChunkSize_ = chunkSize;
-
-                const int bytesPerFrame = (info_.bitsPerSample / 8) * info_.numChannels;
-                if (bytesPerFrame > 0)
-                    info_.numSamples = static_cast<int64_t>(chunkSize) / bytesPerFrame;
-
                 hasData = true;
 
                 if (!hasFmt)
                 {
-                    file_.seekg(static_cast<std::streamoff>(chunkSize), std::ios::cur);
+                    file_.seekg(static_cast<std::streamoff>(chunkSize) + pad, std::ios::cur);
                 }
             }
             else
             {
-                auto skip = static_cast<std::streamoff>(chunkSize + (chunkSize & 1));
-                file_.seekg(skip, std::ios::cur);
+                file_.seekg(static_cast<std::streamoff>(chunkSize) + pad, std::ios::cur);
             }
         }
 
-        // If 'data' was encountered before 'fmt ' (legal but unusual chunk order),
-        // numSamples could not be derived at that point because the bit depth and
-        // channel count were still unknown. Recompute it now that both chunks have
-        // been parsed, using the stored data-chunk size.
+        // numSamples is derived here rather than inside the 'data' branch: if
+        // 'data' precedes 'fmt ' (legal but unusual chunk order), bit depth
+        // and channel count were still unknown at that point.
         if (hasFmt && hasData)
         {
-            const int bytesPerFrame = (info_.bitsPerSample / 8) * info_.numChannels;
+            const int bytesPerFrame = static_cast<int>(info_.bitsPerSample / 8 * info_.numChannels);
             if (bytesPerFrame > 0)
                 info_.numSamples = static_cast<int64_t>(dataChunkSize_) / bytesPerFrame;
         }
@@ -335,27 +371,31 @@ private:
         {
             uint16_t cbSize = 0;
             readLE16(cbSize);
+            (void)cbSize; // Standard layout assumed; trailing bytes skipped below
 
+            // wValidBitsPerSample tells how many bits are significant, but the
+            // container width (wBitsPerSample) governs the stored layout: valid
+            // bits are left-justified, so decoding by container width yields
+            // the exact same values. Do NOT adopt validBits as the frame size
+            // (that mis-strides real 24-in-32 files). Read it only for sanity.
             uint16_t validBitsPerSample = 0;
             readLE16(validBitsPerSample);
+            if (validBitsPerSample > bitsPerSample) return false;
 
             uint32_t channelMask = 0;
             readLE32(channelMask);
             (void)channelMask;
 
             uint16_t subFormat = 0;
-            readLE16(subFormat);
+            if (!readLE16(subFormat)) return false;
             audioFormat = subFormat;
 
-            file_.seekg(14, std::ios::cur);
+            file_.seekg(14, std::ios::cur); // rest of the 16-byte subformat GUID
 
             // Skip any extra bytes after the 40 standard EXTENSIBLE bytes so
             // the chunk walker stays aligned on unusual writers.
             if (chunkSize > 40)
                 file_.seekg(static_cast<std::streamoff>(chunkSize - 40), std::ios::cur);
-
-            if (validBitsPerSample > 0)
-                bitsPerSample = validBitsPerSample;
         }
         else if (chunkSize > 16)
         {
@@ -364,16 +404,25 @@ private:
         }
 
         info_.sampleRate      = static_cast<double>(sampleRate);
-        info_.numChannels     = static_cast<int>(numChannels);
-        info_.bitsPerSample   = static_cast<int>(bitsPerSample);
+        info_.numChannels     = numChannels;
+        info_.bitsPerSample   = bitsPerSample;
         info_.isFloatingPoint = (audioFormat == kFormatIEEEFloat);
 
         if (audioFormat != kFormatPCM && audioFormat != kFormatIEEEFloat) return false;
-        if (numChannels == 0 || numChannels > 64) return false;
-        if (bitsPerSample != 8 && bitsPerSample != 16 &&
-            bitsPerSample != 24 && bitsPerSample != 32 &&
-            bitsPerSample != 64) return false;
-        if (info_.isFloatingPoint && bitsPerSample != 32 && bitsPerSample != 64) return false;
+        if (sampleRate == 0) return false;
+        if (numChannels == 0 || numChannels > kMaxChannels) return false;
+        if (info_.isFloatingPoint)
+        {
+            if (bitsPerSample != 32 && bitsPerSample != 64) return false;
+        }
+        else if (bitsPerSample != 8 && bitsPerSample != 16 &&
+                 bitsPerSample != 24 && bitsPerSample != 32)
+        {
+            // Integer PCM has no 64-bit variant; without this gate a PCM-64
+            // header would pass validation and then "read" silence (no
+            // decoder branch exists for it).
+            return false;
+        }
 
         return true;
     }
@@ -386,9 +435,12 @@ private:
         const bool extensible = (formatTag == kFormatExtensible);
         const uint32_t fmtChunkSize = extensible ? 40u : 16u;
 
-        const int bytesPerSample = info_.bitsPerSample / 8;
+        const int bytesPerSample = static_cast<int>(info_.bitsPerSample / 8);
         const auto blockAlign = static_cast<uint16_t>(info_.numChannels * bytesPerSample);
-        const auto byteRate = static_cast<uint32_t>(static_cast<int>(info_.sampleRate) * blockAlign);
+        const auto rate = static_cast<uint32_t>(std::llround(info_.sampleRate));
+        const uint64_t byteRate64 = static_cast<uint64_t>(rate) * blockAlign;
+        const auto byteRate = static_cast<uint32_t>(
+            std::min<uint64_t>(byteRate64, 0xFFFFFFFFu));
 
         writeBytes("RIFF", 4);
         writeLE32(0); // Patched on close
@@ -398,7 +450,7 @@ private:
         writeLE32(fmtChunkSize);
         writeLE16(formatTag);
         writeLE16(static_cast<uint16_t>(info_.numChannels));
-        writeLE32(static_cast<uint32_t>(info_.sampleRate));
+        writeLE32(rate);
         writeLE32(byteRate);
         writeLE16(blockAlign);
         writeLE16(static_cast<uint16_t>(info_.bitsPerSample));
@@ -430,8 +482,14 @@ private:
     {
         if (!file_.is_open()) return;
 
-        const int bytesPerSample = info_.bitsPerSample / 8;
-        const auto dataSize = static_cast<uint32_t>(totalFramesWritten_ * info_.numChannels * bytesPerSample);
+        // A transient failure (e.g. one failed writeSamples) leaves sticky
+        // failbits that would turn the header patch into a silent no-op.
+        // Clear them so whatever WAS written gets a consistent header.
+        file_.clear();
+
+        const int bytesPerSample = static_cast<int>(info_.bitsPerSample / 8);
+        const auto dataSize = static_cast<uint32_t>(
+            totalFramesWritten_ * info_.numChannels * bytesPerSample);
 
         file_.seekp(dataChunkSizeOffset_, std::ios::beg);
         writeLE32(dataSize);
@@ -452,7 +510,7 @@ private:
         return kFormatPCM;
     }
 
-    // -- Sample conversion (read: raw → float) ---------------------------------
+    // -- Sample conversion (read: raw to float) --------------------------------
 
     void deinterleave(const uint8_t* raw, AudioBufferView<float>& dest, int nCh, int numFrames, int destOffset) const
     {
@@ -473,9 +531,11 @@ private:
     void deinterleaveImpl(const uint8_t* raw, AudioBufferView<float>& dest, int nCh, int numFrames, int destOffset) const
     {
         const int bytesPerSample = Bits / 8;
-        const int stride = info_.numChannels * bytesPerSample;
+        const int stride = static_cast<int>(info_.numChannels) * bytesPerSample;
 
-        // Optimized Cache-friendly loop: write outer per-channel to maximize L1 hit rates
+        // Channel-major loop: each output channel is written contiguously
+        // (cache-friendly); the byte-wise strided source reads are the cost
+        // of endian-safe decoding.
         for (int ch = 0; ch < nCh; ++ch)
         {
             float* out = dest.getChannel(ch) + destOffset;
@@ -517,37 +577,41 @@ private:
         }
     }
 
-    // -- Sample conversion (write: float → raw) --------------------------------
+    // -- Sample conversion (write: float to raw) --------------------------------
 
-    void interleave(AudioBufferView<const float> src, uint8_t* raw, int nCh, int numFrames, int srcOffset) const
+    void interleave(AudioBufferView<const float> src, uint8_t* raw,
+                    int fileCh, int srcCh, int numFrames, int srcOffset) const
     {
         if (info_.isFloatingPoint) {
-            if (info_.bitsPerSample == 32) interleaveImpl<float, 32>(src, raw, nCh, numFrames, srcOffset);
-            else interleaveImpl<double, 64>(src, raw, nCh, numFrames, srcOffset);
+            if (info_.bitsPerSample == 32) interleaveImpl<float, 32>(src, raw, fileCh, srcCh, numFrames, srcOffset);
+            else interleaveImpl<double, 64>(src, raw, fileCh, srcCh, numFrames, srcOffset);
         } else {
             switch (info_.bitsPerSample) {
-                case 8:  interleaveImpl<uint8_t, 8>(src, raw, nCh, numFrames, srcOffset); break;
-                case 16: interleaveImpl<int16_t, 16>(src, raw, nCh, numFrames, srcOffset); break;
-                case 24: interleaveImpl<int32_t, 24>(src, raw, nCh, numFrames, srcOffset); break;
-                case 32: interleaveImpl<int32_t, 32>(src, raw, nCh, numFrames, srcOffset); break;
+                case 8:  interleaveImpl<uint8_t, 8>(src, raw, fileCh, srcCh, numFrames, srcOffset); break;
+                case 16: interleaveImpl<int16_t, 16>(src, raw, fileCh, srcCh, numFrames, srcOffset); break;
+                case 24: interleaveImpl<int32_t, 24>(src, raw, fileCh, srcCh, numFrames, srcOffset); break;
+                case 32: interleaveImpl<int32_t, 32>(src, raw, fileCh, srcCh, numFrames, srcOffset); break;
             }
         }
     }
 
     template <typename T, int Bits>
-    void interleaveImpl(AudioBufferView<const float> src, uint8_t* raw, int nCh, int numFrames, int srcOffset) const
+    void interleaveImpl(AudioBufferView<const float> src, uint8_t* raw,
+                        int fileCh, int srcCh, int numFrames, int srcOffset) const
     {
         const int bytesPerSample = Bits / 8;
-        
-        // Frame outer loop is required here to write contiguous interleaved data 
+
+        // Frame-major loop is required here to emit contiguous interleaved
+        // data. Channels the source view does not carry are written as
+        // silence (same contract as Mp3File) instead of reading out of range.
         for (int f = 0; f < numFrames; ++f)
         {
-            for (int ch = 0; ch < nCh; ++ch)
+            for (int ch = 0; ch < fileCh; ++ch)
             {
-                float value = src.getChannel(ch)[srcOffset + f];
-                uint8_t* ptr = raw + ((f * nCh + ch) * bytesPerSample);
+                const float value = (ch < srcCh) ? src.getChannel(ch)[srcOffset + f] : 0.0f;
+                uint8_t* ptr = raw + ((f * fileCh + ch) * bytesPerSample);
 
-                // Precise analog rounding & strict clipping bounds logic
+                // Precise rounding & strict clipping bounds
                 if constexpr (Bits == 8) {
                     auto val = static_cast<uint8_t>(std::clamp(std::round(value * 127.0f) + 128.0f, 0.0f, 255.0f));
                     ptr[0] = val;

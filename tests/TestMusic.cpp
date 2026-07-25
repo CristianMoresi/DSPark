@@ -7,6 +7,7 @@
 #include "../Music/ChordDetector.h"
 
 #include <cmath>
+#include <limits>
 #include <string_view>
 
 using namespace dspark;
@@ -355,4 +356,64 @@ DSPARK_TEST(Harmony_parseNote_empty_and_tags)
     EXPECT_TRUE((both & ChordTag::Major7) == ChordTag::Major7);
     EXPECT_TRUE(hasTags(both, ChordTag::MajorTriad));
     EXPECT_TRUE(!hasTags(both, ChordTag::Minor7));
+}
+
+// ============================================================================
+// ChordDetector - invalid inputs and lifecycle
+// ============================================================================
+
+DSPARK_TEST(ChordDetector_invalid_inputs_are_ignored)
+{
+    using CT = ChordDetector<float>::ChordType;
+
+    ChordDetector<float> det;
+    det.prepare(spec(48000.0, 512, 2));
+
+    auto feed = [&](std::initializer_list<double> freqs, int blocks)
+    {
+        auto buf = makeStereoBuffer(512);
+        for (int b = 0; b < blocks; ++b)
+        {
+            for (int i = 0; i < 512; ++i)
+            {
+                const int n = b * 512 + i;
+                double v = 0.0;
+                for (const double f : freqs)
+                    v += std::sin(2.0 * 3.14159265358979 * f * n / 48000.0);
+                buf.ch(0)[i] = static_cast<float>(0.25 * v);
+                buf.ch(1)[i] = buf.ch(0)[i];
+            }
+            det.processBlock(AudioBufferView<const float>(buf.view()));
+        }
+    };
+
+    // Establish C major.
+    feed({ 261.63, 329.63, 392.00 }, 60);
+    EXPECT_EQ(det.getChord().rootPitchClass, 0);
+
+    // A NaN threshold must be ignored: with the old clamp(NaN) pass-through
+    // every confidence comparison went false and the detector froze on the
+    // held chord forever. After the fix it keeps tracking chord changes.
+    det.setConfidenceThreshold(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_NEAR(det.getConfidenceThreshold(), 0.55f, 1e-6f); // honest getter
+
+    // An invalid re-prepare on a hot detector is a conservative no-op.
+    det.prepare(spec(std::numeric_limits<double>::quiet_NaN(), 512, 2));
+    det.prepare(spec(-48000.0, 512, 2));
+
+    // Change to F major: the detector must follow.
+    feed({ 349.23, 440.00, 523.25 }, 60);
+    EXPECT_EQ(det.getChord().rootPitchClass, 5);
+    EXPECT_TRUE(det.getChord().type == CT::Major);
+
+    // reset() drops the held chord.
+    det.reset();
+    EXPECT_EQ(det.getChord().rootPitchClass, -1);
+    EXPECT_TRUE(det.getChord().type == CT::None);
+
+    // Unprepared instance is inert (no crash, empty result).
+    ChordDetector<float> cold;
+    auto buf = makeStereoBuffer(64);
+    cold.processBlock(AudioBufferView<const float>(buf.view()));
+    EXPECT_EQ(cold.getChord().rootPitchClass, -1);
 }

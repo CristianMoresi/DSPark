@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -10,7 +10,7 @@
  * Classic music-information-retrieval pipeline, allocation-free:
  *
  * 1. A mono sum is windowed (Hann) every hop and analyzed with one exact
- *    Goertzel per note over MIDI 36..83 (four octaves) — no FFT-grid
+ *    Goertzel per note over MIDI 36..83 (four octaves) - no FFT-grid
  *    compromise at low pitches.
  * 2. Note energies fold into a 12-bin chroma vector.
  * 3. The chroma is cosine-matched against chord templates (major, minor,
@@ -20,7 +20,13 @@
  *
  * The reading is gated: while confidence is below the threshold the last
  * confident chord is held, so brief transients and silences do not flicker
- * the display. Readout is lock-free from any thread.
+ * the display.
+ *
+ * Threading: prepare() is setup-thread only (allocates). processBlock /
+ * pushSamples and reset() belong to the thread that owns the stream.
+ * setConfidenceThreshold() may be called from any thread, and getChord()
+ * is a lock-free readout safe from any thread (single packed atomic word,
+ * never torn).
  *
  * Dependencies: Goertzel.h, HarmonyConstants.h, AudioSpec.h, AudioBuffer.h,
  * WindowFunctions.h, DspMath.h.
@@ -77,7 +83,9 @@ public:
      */
     void prepare(const AudioSpec& spec, int windowSize = 4096)
     {
-        if (spec.sampleRate <= 0.0) return;
+        // Conservative no-op on invalid specs (NaN rate included): a hot
+        // detector keeps its previous configuration instead of going deaf.
+        if (!spec.isValid()) return;
         sampleRate_ = spec.sampleRate;
         windowSize_ = std::clamp(windowSize, 1024, 16384);
         hopSize_ = windowSize_ / 2;
@@ -96,11 +104,17 @@ public:
             notes_[static_cast<size_t>(n)].prepare(sampleRate_, freq, windowSize_);
         }
 
-        prepared_ = true;
+        prepared_.store(true, std::memory_order_release);
         reset();
     }
 
-    /** @brief Forgets the held chord. RT-safe. */
+    /**
+     * @brief Clears the analysis ring and forgets the held chord.
+     *
+     * Allocation-free, but it rewrites the stream state: call it from the
+     * thread that owns the stream (or while processing is stopped), not
+     * concurrently with processBlock()/pushSamples().
+     */
     void reset() noexcept
     {
         std::fill(ring_.begin(), ring_.end(), T(0));
@@ -109,10 +123,23 @@ public:
         packed_.store(pack(Result {}), std::memory_order_relaxed);
     }
 
-    /** @brief Confidence below which the previous chord is held (default 0.55). */
+    /**
+     * @brief Confidence below which the previous chord is held (default 0.55).
+     *
+     * Callable from any thread. Non-finite values are ignored (a NaN would
+     * make every comparison false and freeze the detector on the held chord
+     * forever).
+     */
     void setConfidenceThreshold(float threshold) noexcept
     {
+        if (!std::isfinite(threshold)) return;
         threshold_.store(std::clamp(threshold, 0.0f, 1.0f), std::memory_order_relaxed);
+    }
+
+    /** @return The current confidence-gating threshold. */
+    [[nodiscard]] float getConfidenceThreshold() const noexcept
+    {
+        return threshold_.load(std::memory_order_relaxed);
     }
 
     // -- Processing -------------------------------------------------------------------
@@ -120,7 +147,7 @@ public:
     /** @brief Feeds a block (channels averaged to mono). */
     void processBlock(AudioBufferView<const T> buffer) noexcept
     {
-        if (!prepared_) return;
+        if (!prepared_.load(std::memory_order_acquire)) return;
         const int nCh = buffer.getNumChannels();
         const int nS = buffer.getNumSamples();
         if (nCh <= 0) return;
@@ -138,7 +165,7 @@ public:
     /** @brief Feeds mono samples directly. */
     void pushSamples(std::span<const T> samples) noexcept
     {
-        if (!prepared_) return;
+        if (!prepared_.load(std::memory_order_acquire)) return;
         for (const T s : samples)
             push(s);
     }
@@ -342,7 +369,7 @@ private:
     double sampleRate_ = 48000.0;
     int windowSize_ = 4096;
     int hopSize_ = 2048;
-    bool prepared_ = false;
+    std::atomic<bool> prepared_ { false };
 
     std::vector<T> ring_, window_, scratch_;
     int writePos_ = 0;

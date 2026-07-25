@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -279,9 +280,48 @@ namespace detail {
 /// levels; a crafted input must not be able to overflow the stack.
 constexpr int kMaxStateJsonDepth = 32;
 
-/** @brief Locale-independent float rendering ("%.9g" with a forced dot). */
+/** @brief Appends a JSON string literal, escaping the characters JSON forbids.
+ *  Keys follow the [A-Za-z0-9._] convention (so this normally emits verbatim),
+ *  but the convention is not enforced on the writer or reader, and untrusted
+ *  blobs can carry arbitrary key bytes; escaping keeps the emitted JSON valid
+ *  and non-injectable in every case. */
+inline void appendStateJsonString(std::string& out, const std::string& s)
+{
+    out += '"';
+    for (const unsigned char c : s)
+    {
+        switch (c)
+        {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20)
+                {
+                    char esc[7];
+                    std::snprintf(esc, sizeof(esc), "\\u%04x", static_cast<unsigned>(c));
+                    out += esc;
+                }
+                else
+                {
+                    out += static_cast<char>(c);
+                }
+                break;
+        }
+    }
+    out += '"';
+}
+
+/** @brief Locale-independent float rendering ("%.9g" with a forced dot).
+ *  Non-finite payloads (NaN/Inf -- e.g. a corrupt blob or a bugged parameter)
+ *  are emitted as JSON-legal 0 so the output always parses and round-trips. */
 inline void appendStateJsonNumber(std::string& out, float v)
 {
+    if (!std::isfinite(v)) { out += '0'; return; }
     char num[48];
     std::snprintf(num, sizeof(num), "%.9g", static_cast<double>(v));
     for (char* c = num; *c != '\0'; ++c)
@@ -362,7 +402,8 @@ inline std::string stateToJsonImpl(const std::vector<uint8_t>& blob, int depth)
     {
         if (!first) out += ',';
         first = false;
-        out += '"' + e.key + "\":";
+        appendStateJsonString(out, e.key);
+        out += ':';
         if (e.type == 0)
         {
             float v = 0.0f;
@@ -403,7 +444,49 @@ inline std::vector<uint8_t> stateFromJsonImpl(const std::string& json, int depth
         if (p >= json.size() || json[p] != '"') return false;
         ++p;
         out.clear();
-        while (p < json.size() && json[p] != '"') out += json[p++];
+        while (p < json.size() && json[p] != '"')
+        {
+            char c = json[p++];
+            if (c == '\\')   // unescape the sequences appendStateJsonString emits
+            {
+                if (p >= json.size()) return false;
+                const char e = json[p++];
+                switch (e)
+                {
+                    case '"':  out += '"';  break;
+                    case '\\': out += '\\'; break;
+                    case '/':  out += '/';  break;
+                    case 'b':  out += '\b'; break;
+                    case 'f':  out += '\f'; break;
+                    case 'n':  out += '\n'; break;
+                    case 'r':  out += '\r'; break;
+                    case 't':  out += '\t'; break;
+                    case 'u':
+                    {
+                        if (p + 4 > json.size()) return false;
+                        unsigned code = 0;
+                        for (int k = 0; k < 4; ++k)
+                        {
+                            const char h = json[p++];
+                            code <<= 4;
+                            if (h >= '0' && h <= '9')      code |= unsigned(h - '0');
+                            else if (h >= 'a' && h <= 'f') code |= unsigned(h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') code |= unsigned(h - 'A' + 10);
+                            else return false;
+                        }
+                        // Keys are ASCII by convention; emit the low byte (control
+                        // chars round-trip, higher planes are out of contract).
+                        out += static_cast<char>(code & 0xFF);
+                        break;
+                    }
+                    default: return false;   // unknown escape -> reject
+                }
+            }
+            else
+            {
+                out += c;
+            }
+        }
         if (p >= json.size()) return false;
         ++p;
         return true;

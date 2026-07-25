@@ -729,14 +729,10 @@ DSPARK_TEST(QA_Convolver_long_IR_energy_conservation)
     constexpr int blockSize = 512;
     constexpr int irLen = 256;
 
-    // Create an IR with known energy: exponential decay
+    // Exponentially decaying IR.
     std::vector<float> ir(irLen);
-    float irEnergy = 0.0f;
     for (int i = 0; i < irLen; ++i)
-    {
         ir[i] = std::exp(-3.0f * float(i) / float(irLen));
-        irEnergy += ir[i] * ir[i];
-    }
 
     Convolver<float> conv;
     conv.prepare(blockSize, ir.data(), irLen);

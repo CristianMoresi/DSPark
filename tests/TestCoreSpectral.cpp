@@ -123,7 +123,7 @@ DSPARK_TEST(FFTReal_silence_is_zero)
     std::vector<float> freq(fft.getFrequencyDomainSize());
     fft.forward(input.data(), freq.data());
 
-    for (int i = 0; i < fft.getFrequencyDomainSize(); ++i)
+    for (size_t i = 0; i < fft.getFrequencyDomainSize(); ++i)
         EXPECT_NEAR(freq[i], 0.0f, 1e-10f);
 }
 

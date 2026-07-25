@@ -666,11 +666,6 @@ DSPARK_TEST(Compressor_upward_boosts_quiet)
     auto tb = makeBuffer(1, 4096);
     generateSine(tb.ch(0), 4096, 440.0f, 48000.0f, 0.03f); // ~-30 dBFS
 
-    // Measure input energy
-    float inEnergy = 0.0f;
-    for (int i = 0; i < 4096; ++i)
-        inEnergy += tb.ch(0)[i] * tb.ch(0)[i];
-
     comp.processBlock(tb.view());
 
     // Output should be louder (upward compression boosts)

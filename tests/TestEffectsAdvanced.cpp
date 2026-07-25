@@ -2142,21 +2142,10 @@ DSPARK_TEST(Reverb_damping_effectiveness)
     tb.fillSilence();
     rev.processBlock(tb.view());
 
-    // Measure low-band energy vs high-band energy using simple sine correlation
-    float lowE = 0, highE = 0;
-    for (int i = 0; i < 4096; ++i)
-    {
-        float v = tb.ch(0)[i];
-        // Low-frequency probe: correlate with 200Hz sine
-        float lowProbe = std::sin(2.0f * 3.14159f * 200.0f * i / 48000.0f);
-        // High-frequency probe: correlate with 8000Hz sine
-        float highProbe = std::sin(2.0f * 3.14159f * 8000.0f * i / 48000.0f);
-        lowE += v * lowProbe * v * lowProbe;
-        highE += v * highProbe * v * highProbe;
-    }
-
-    // With high damping, HF energy should be significantly less than LF
-    // Just verify the reverb has energy and produces output
+    // This case only pins that a heavily damped tail still rings and stays
+    // finite. The spectral tilt damping produces is measured by the T60
+    // per-band cases above, which fit the decay properly rather than
+    // correlating against a pair of probe tones.
     float totalRms = measureRMS(tb.ch(0), 4096);
     EXPECT_GT(totalRms, 1e-6f);
     EXPECT_NO_NAN(tb.ch(0), 4096);

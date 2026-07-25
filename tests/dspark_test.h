@@ -55,6 +55,13 @@ inline int runAll()
 
     for (auto& tc : tests)
     {
+        // Named and flushed before the case runs, so a hard crash (signal,
+        // stack exhaustion, an assertion firing) still identifies the culprit.
+        // CTest buffers this and only prints it when the test fails, so a
+        // green run stays silent.
+        std::cout << "[ " << (passed + failed + 1) << "/" << tests.size() << " ] "
+                  << tc.name << std::endl;
+
         currentTestFailed() = false;
         try
         {

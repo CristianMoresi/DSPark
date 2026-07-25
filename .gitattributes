@@ -1,3 +1,12 @@
+# Normalise text to LF in the repository regardless of the contributor's
+# core.autocrlf setting, so a clone behaves the same on every machine.
+* text=auto
+
 # Batch files must stay CRLF: cmd.exe misparses LF-only line endings
 # (with core.autocrlf=input a plain checkout would otherwise break them).
 *.bat text eol=crlf
+
+# Never touch binaries.
+*.png binary
+*.wav binary
+*.mp3 binary

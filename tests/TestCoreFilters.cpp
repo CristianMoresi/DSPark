@@ -922,7 +922,12 @@ DSPARK_TEST(FIR_seqlock_coefficient_swap_is_atomic)
     for (int i = 0; i < 128; ++i) (void)fir.processSample(1.0f, 0);
 
     std::atomic<bool> stop{false};
-    std::atomic<int> published{0};
+    // 64-bit: the producer spins far faster than the ASan-instrumented consumer
+    // under parallel build load, so a 32-bit counter overflowed to a negative
+    // value (observed -1878489712) and the >2000 liveness check saw a false
+    // failure. int64 cannot wrap in any realistic run; the correctness assertion
+    // (torn == 0) is unchanged.
+    std::atomic<long long> published{0};
     std::thread producer([&] {
         bool useA = false;
         while (!stop.load(std::memory_order_relaxed))

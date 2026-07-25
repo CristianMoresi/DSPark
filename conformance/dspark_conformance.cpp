@@ -762,6 +762,43 @@ void runMetricTests()
         check(snr > 90.0, "metrics", "Resampler High sine SNR > 90 dB", d);
     }
     {
+        // OnsetDetector OA-1 floor: isolated band-limited clicks over silence
+        // must be detected exactly (F = 1.0, zero false positives), +/-25 ms.
+        const double fs = 44100.0;
+        const int n = static_cast<int>(fs * 4.0);
+        std::vector<float> sig(static_cast<size_t>(n), 0.0f);
+        std::vector<int64_t> truth;
+        const double tau = 4.0 * 0.001 * fs;
+        const int clen = static_cast<int>(tau * 6.0);
+        for (int k = 0; k < 6; ++k)
+        {
+            const int64_t at = static_cast<int64_t>(fs * (0.3 + 0.5 * k));
+            truth.push_back(at);
+            for (int m = 0; m < clen; ++m)
+            {
+                const int64_t i = at + m;
+                if (i < n)
+                    sig[static_cast<size_t>(i)] += static_cast<float>(
+                        std::sin(2.0 * kPiConf * 1000.0 * m / fs) * std::exp(-m / tau));
+            }
+        }
+        dspark::OnsetDetector<float> od;
+        od.prepare(dspark::AudioSpec{ fs, 512, 1 }, 2048, 0);
+        float* p = sig.data();
+        dspark::AudioBufferView<float> view(&p, 1, n);
+        auto det = od.detectOffline(view);
+        const int64_t win = static_cast<int64_t>(0.025 * fs);
+        int tp = 0;
+        std::vector<bool> used(det.size(), false);
+        for (int64_t gt : truth)
+            for (size_t j = 0; j < det.size(); ++j)
+                if (!used[j] && std::llabs(det[j] - gt) <= win) { used[j] = true; ++tp; break; }
+        const int fp = static_cast<int>(det.size()) - tp;
+        const int fn = static_cast<int>(truth.size()) - tp;
+        char d[80]; std::snprintf(d, sizeof(d), "(tp=%d fp=%d fn=%d)", tp, fp, fn);
+        check(fp == 0 && fn == 0, "metrics", "OnsetDetector OA-1 clicks/silence F=1.0", d);
+    }
+    {
         // Oscillator waveform levels must match within 1 dB.
         dspark::Oscillator<float> osc;
         osc.prepare(48000.0);

@@ -166,7 +166,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `AnalogConstants` | Reference constants from analog-hardware research (zero runtime cost) |
 | `ProcessorTraits` | C++20 concepts: `AudioProcessor`, `SampleProcessor`, `GeneratorProcessor` |
 
-### Analysis (8 analyzers)
+### Analysis (9 analyzers)
 
 | Class | Description |
 |---|---|
@@ -178,6 +178,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `PitchDetector<T>` | YIN pitch detection with FFT-accelerated difference function (O(N log N)) |
 | `PitchFollower<T>` | Musical pitch tracking source: confidence gating, octave-jump correction, constant-rate semitone glide |
 | `PhaseCorrelation<T>` | Stereo correlation/balance meter with a goniometer (vectorscope) point feed |
+| `OnsetDetector<T>` | Causal SuperFlux onset detection (log-filtered spectral flux, vibrato-suppressing max filter, Boeck-2012 adaptive peak picker); shared front-end for beat tracking |
 
 ### I/O (3 file handlers)
 
@@ -425,7 +426,7 @@ DSPark/
 ├── DSPark.h                 # Single umbrella include + full documentation
 ├── Core/          (41)      # Building blocks: filters, FFT, WDF, oscillators, SIMD
 ├── Effects/       (36)      # Ready-to-use processors: EQ, compressor, reverb, tape...
-├── Analysis/       (8)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation
+├── Analysis/       (9)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation, onset
 ├── IO/             (3)      # File I/O: WAV read/write, MP3 read/write
 ├── Music/          (2)      # Harmony constants + real-time chord detection
 ├── plugin/                  # Native plugin layer: VST3, CLAP, AU + WebView editor

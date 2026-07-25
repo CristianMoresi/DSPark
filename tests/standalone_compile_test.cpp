@@ -97,6 +97,7 @@ void instantiate()
     PitchDetector<T> pd;
     PitchFollower<T> pitchFollow;
     SpectrumAnalyzer<T> sa;
+    OnsetDetector<T> onset;
 
     // -- Music ----------------------------------------------------------------
     ChordDetector<T> chords;
@@ -115,7 +116,7 @@ void instantiate()
     (void)rm; (void)sat; (void)denoiser; (void)sw; (void)tape; (void)xfmr;
     (void)td; (void)tr; (void)tube; (void)vib;
     (void)envFollow; (void)goe; (void)lvl; (void)ldm; (void)phaseCorr;
-    (void)pd; (void)pitchFollow; (void)sa;
+    (void)pd; (void)pitchFollow; (void)sa; (void)onset;
     (void)chords;
 }
 

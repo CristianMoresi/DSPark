@@ -408,6 +408,7 @@
  * | `PitchFollower<T>`       | Analysis/PitchFollower.h  | Gated, octave-safe, glide-smoothed pitch tracking source |
  * | `PhaseCorrelation<T>`    | Analysis/PhaseCorrelation.h | Stereo correlation/balance meter + goniometer feed |
  * | `EnvelopeFollower<T>`    | Analysis/EnvelopeFollower.h | Peak/RMS envelope source with per-channel readouts |
+ * | `OnsetDetector<T>`       | Analysis/OnsetDetector.h  | Causal SuperFlux onset detection (Boeck-2012 picker, shared beat front-end) |
  *
  * @subsection classes_io File I/O
  *
@@ -731,6 +732,7 @@
 #include "Analysis/PitchFollower.h"
 #include "Analysis/PhaseCorrelation.h"
 #include "Analysis/EnvelopeFollower.h"
+#include "Analysis/OnsetDetector.h"
 
 // === I/O ====================================================================
 // File I/O uses <fstream>/<filesystem>, which do not exist on bare-metal

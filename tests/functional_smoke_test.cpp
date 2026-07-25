@@ -191,6 +191,42 @@ int testAll()
         }
     }
 
+    // Analysis readouts do not mutate the buffer, so they sit outside the
+    // in-place Slot loop. Exercise OnsetDetector on sine + a click and confirm
+    // the readouts stay finite and the latency contract holds.
+    try
+    {
+        OnsetDetector<float> onset;
+        onset.prepare(spec);
+        bool sawOnset = false;
+        for (int b = 0; b < 40; ++b)
+        {
+            fillSine(buf, b * kBlockSize);
+            if (b == 20) buf.getChannel(0)[0] += 4.0f; // a transient
+            onset.processBlock(buf.toView());
+            if (onset.onsetDetected()) sawOnset = true;
+            const float st = onset.getOnsetStrength();
+            if (std::isnan(st) || std::isinf(st))
+            {
+                std::printf("FAIL %-18s non-finite strength\n", "OnsetDetector");
+                ++failed; break;
+            }
+        }
+        if (onset.getLatencySamples() != onset.getFftSize() + onset.getHopSize())
+        {
+            std::printf("FAIL %-18s latency != fftSize+hop\n", "OnsetDetector");
+            ++failed;
+        }
+        else
+            std::printf("OK   %-18s (sine + transient, sawOnset=%d)\n",
+                        "OnsetDetector", sawOnset ? 1 : 0);
+    }
+    catch (const std::exception& e)
+    {
+        std::printf("FAIL %-18s exception: %s\n", "OnsetDetector", e.what());
+        ++failed;
+    }
+
     std::printf("\n%d / %zu effects passed\n",
                 static_cast<int>(slots.size()) - failed, slots.size());
     return failed;

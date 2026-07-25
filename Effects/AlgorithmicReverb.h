@@ -1257,7 +1257,7 @@ protected:
             else
             {
                 toneHPActive_ = true;
-                toneHPBiquad_.setCoeffs(BiquadCoeffs<T>::makeHighPass(
+                toneHPBiquad_.setCoeffs(BiquadCoeffs::makeHighPass(
                     spec_.sampleRate,
                     static_cast<double>(std::clamp(hpHz, T(20), T(500)))));
             }
@@ -1268,7 +1268,7 @@ protected:
             else
             {
                 toneLPActive_ = true;
-                toneLPBiquad_.setCoeffs(BiquadCoeffs<T>::makeLowPass(
+                toneLPBiquad_.setCoeffs(BiquadCoeffs::makeLowPass(
                     spec_.sampleRate,
                     static_cast<double>(std::clamp(lpHz, T(2000), T(16000)))));
             }

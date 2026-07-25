@@ -472,10 +472,13 @@ public:
                     T* channelData = buffer.getChannel(ch);
                     for (int i = 0; i < nS; ++i)
                     {
-                        T sample = channelData[i];
+                        // The cascade stays in the biquad core's own precision:
+                        // re-quantising to T between stages would put back part
+                        // of the error the double core exists to remove.
+                        double sample = static_cast<double>(channelData[i]);
                         for (int s = 0; s < ns; ++s)
-                            sample = stages_[s].processSample(sample, ch);
-                        channelData[i] = sample;
+                            sample = stages_[s].processSampleCore(sample, ch);
+                        channelData[i] = static_cast<T>(sample);
                     }
                 }
             }
@@ -526,10 +529,10 @@ public:
                 const int ns = numStages_.load(std::memory_order_relaxed);
                 for (int ch = 0; ch < nCh; ++ch)
                 {
-                    T sample = buffer.getChannel(ch)[i];
+                    double sample = static_cast<double>(buffer.getChannel(ch)[i]);
                     for (int s = 0; s < ns; ++s)
-                        sample = stages_[s].processSample(sample, ch);
-                    buffer.getChannel(ch)[i] = sample;
+                        sample = stages_[s].processSampleCore(sample, ch);
+                    buffer.getChannel(ch)[i] = static_cast<T>(sample);
                 }
             }
         }
@@ -549,11 +552,11 @@ public:
     T processSample(T input, int channel) noexcept
     {
         if (channel < 0 || channel >= MaxChannels) return input;
-        T sample = input;
+        double sample = static_cast<double>(input);
         const int ns = numStages_.load(std::memory_order_relaxed);
         for (int s = 0; s < ns; ++s)
-            sample = stages_[s].processSample(sample, channel);
-        return sample;
+            sample = stages_[s].processSampleCore(sample, channel);
+        return static_cast<T>(sample);
     }
 
     /**
@@ -691,12 +694,12 @@ protected:
 
         if (cascade.hasFirstOrder)
         {
-            BiquadCoeffs<T> c;
+            BiquadCoeffs c;
             switch (sh)
             {
-                case Shape::LowPass:   c = BiquadCoeffs<T>::makeFirstOrderLowPass(sr, f); break;
-                case Shape::HighPass:  c = BiquadCoeffs<T>::makeFirstOrderHighPass(sr, f); break;
-                default:               c = BiquadCoeffs<T>::makeFirstOrderLowPass(sr, f); break;
+                case Shape::LowPass:   c = BiquadCoeffs::makeFirstOrderLowPass(sr, f); break;
+                case Shape::HighPass:  c = BiquadCoeffs::makeFirstOrderHighPass(sr, f); break;
+                default:               c = BiquadCoeffs::makeFirstOrderLowPass(sr, f); break;
             }
             stages_[stageIdx++].setCoeffs(c);
         }
@@ -721,22 +724,22 @@ protected:
                 stageQ *= Q / 0.707f;
             }
 
-            BiquadCoeffs<T> c;
+            BiquadCoeffs c;
             switch (sh)
             {
-                case Shape::LowPass:   c = BiquadCoeffs<T>::makeLowPass(sr, f, stageQ);  break;
-                case Shape::HighPass:  c = BiquadCoeffs<T>::makeHighPass(sr, f, stageQ); break;
-                case Shape::BandPass:  c = BiquadCoeffs<T>::makeBandPass(sr, f, stageQ); break;
+                case Shape::LowPass:   c = BiquadCoeffs::makeLowPass(sr, f, stageQ);  break;
+                case Shape::HighPass:  c = BiquadCoeffs::makeHighPass(sr, f, stageQ); break;
+                case Shape::BandPass:  c = BiquadCoeffs::makeBandPass(sr, f, stageQ); break;
                 case Shape::Peak:
                     c = matchedPeak_.load(std::memory_order_relaxed)
-                        ? BiquadCoeffs<T>::makePeakMatched(sr, f, stageQ, gainDb)
-                        : BiquadCoeffs<T>::makePeak(sr, f, stageQ, gainDb);
+                        ? BiquadCoeffs::makePeakMatched(sr, f, stageQ, gainDb)
+                        : BiquadCoeffs::makePeak(sr, f, stageQ, gainDb);
                     break;
-                case Shape::LowShelf:  c = BiquadCoeffs<T>::makeLowShelf(sr, f, gainDb, ssl); break;
-                case Shape::HighShelf: c = BiquadCoeffs<T>::makeHighShelf(sr, f, gainDb, ssl); break;
-                case Shape::Notch:     c = BiquadCoeffs<T>::makeNotch(sr, f, stageQ);  break;
-                case Shape::AllPass:   c = BiquadCoeffs<T>::makeAllPass(sr, f, stageQ); break;
-                case Shape::Tilt:      c = BiquadCoeffs<T>::makeTilt(sr, f, gainDb); break;
+                case Shape::LowShelf:  c = BiquadCoeffs::makeLowShelf(sr, f, gainDb, ssl); break;
+                case Shape::HighShelf: c = BiquadCoeffs::makeHighShelf(sr, f, gainDb, ssl); break;
+                case Shape::Notch:     c = BiquadCoeffs::makeNotch(sr, f, stageQ);  break;
+                case Shape::AllPass:   c = BiquadCoeffs::makeAllPass(sr, f, stageQ); break;
+                case Shape::Tilt:      c = BiquadCoeffs::makeTilt(sr, f, gainDb); break;
             }
             stages_[stageIdx++].setCoeffs(c);
         }

@@ -390,9 +390,9 @@ public:
 
         auto driveDb = gainToDecibels(drive, T(-100));
         T bumpGain = T(1.5) + std::min(driveDb * T(0.05), T(3.0));
-        auto peakCoeffs = BiquadCoeffs<T>::makePeak(spec.sampleRate, 80.0, 0.6, static_cast<double>(bumpGain));
+        auto peakCoeffs = BiquadCoeffs::makePeak(spec.sampleRate, 80.0, 0.6, static_cast<double>(bumpGain));
         auto lpFreq = std::max(6000.0, 19000.0 - static_cast<double>(driveDb) * 200.0);
-        auto lpCoeffs = BiquadCoeffs<T>::makeLowPass(spec.sampleRate, lpFreq, 0.55);
+        auto lpCoeffs = BiquadCoeffs::makeLowPass(spec.sampleRate, lpFreq, 0.55);
 
         for (int ch = 0; ch < numChannels_; ++ch)
         {
@@ -471,7 +471,7 @@ public:
         if (spec.sampleRate == lastSampleRate_) return;
         lastSampleRate_ = spec.sampleRate;
 
-        auto c = BiquadCoeffs<T>::makeLowPass(spec.sampleRate, 250.0, 0.707);
+        auto c = BiquadCoeffs::makeLowPass(spec.sampleRate, 250.0, 0.707);
         for (int ch = 0; ch < numChannels_; ++ch)
             lpFilters_[ch].setCoeffs(c);
     }
@@ -529,7 +529,7 @@ public:
         T clamped = std::clamp(drive, T(1), T(100));
         reduction_ = std::max(1, static_cast<int>(mapRange(clamped, T(1), T(100), T(1), T(50))));
         
-        auto c = BiquadCoeffs<T>::makeLowPass(spec.sampleRate, spec.sampleRate / (2.5 * reduction_), 0.707);
+        auto c = BiquadCoeffs::makeLowPass(spec.sampleRate, spec.sampleRate / (2.5 * reduction_), 0.707);
         for (int ch = 0; ch < numChannels_; ++ch)
             aaFilters_[ch].setCoeffs(c);
     }
@@ -811,7 +811,7 @@ public:
 
                 if (curFreq != lastPreHpFreq_)
                 {
-                    auto c = BiquadCoeffs<SampleType>::makeHighPass(spec_.sampleRate, static_cast<double>(curFreq));
+                    auto c = BiquadCoeffs::makeHighPass(spec_.sampleRate, static_cast<double>(curFreq));
                     preFilter_.setCoeffs(c);
                     lastPreHpFreq_ = curFreq;
                 }
@@ -893,7 +893,7 @@ public:
                     // A genuine tilt shelf, as the setter documents. (This used
                     // to be makePeak: a bell AT the pivot, which mid-boosted
                     // instead of brightening/darkening.)
-                    auto c = BiquadCoeffs<SampleType>::makeTilt(spec_.sampleRate, static_cast<double>(curFreq), static_cast<double>(curGain));
+                    auto c = BiquadCoeffs::makeTilt(spec_.sampleRate, static_cast<double>(curFreq), static_cast<double>(curGain));
                     postFilter_.setCoeffs(c);
                     lastPostTiltFreq_ = curFreq;
                     lastPostTiltGain_ = curGain;

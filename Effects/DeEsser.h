@@ -342,14 +342,16 @@ private:
         const double fEff = std::clamp(static_cast<double>(freq), 1.0,
                                        std::max(1.0, sampleRate_ * 0.499));
 
-        auto c = BiquadCoeffs<T>::makeBandPass(sampleRate_, fEff, static_cast<double>(bw));
+        auto c = BiquadCoeffs::makeBandPass(sampleRate_, fEff, static_cast<double>(bw));
         for (int ch = 0; ch < kMaxChannels; ++ch)
             detector_[ch].setCoeffs(c);
 
-        // Precompute trig terms for the Peak filter to avoid math in the inner loop
+        // Precompute trig terms for the Peak filter to avoid math in the inner
+        // loop. Double, like the rest of the coefficient path: the design is
+        // only ever as good as the arithmetic that builds it.
         double w0 = twoPi<double> * fEff / sampleRate_;
-        precomputedCos_ = static_cast<T>(std::cos(w0));
-        precomputedAlpha_ = static_cast<T>(std::sin(w0) / (2.0 * static_cast<double>(bw)));
+        precomputedCos_ = std::cos(w0);
+        precomputedAlpha_ = std::sin(w0) / (2.0 * static_cast<double>(bw));
     }
 
     /**
@@ -360,19 +362,19 @@ private:
     void updateDynamicPeakCoeffs(int ch, T gainDb) noexcept
     {
         // A = 10^(gainDb / 40)
-        T A = std::pow(T(10), gainDb / T(40));
+        const double A = std::pow(10.0, static_cast<double>(gainDb) / 40.0);
 
-        T b0 = T(1) + precomputedAlpha_ * A;
-        T b1 = T(-2) * precomputedCos_;
-        T b2 = T(1) - precomputedAlpha_ * A;
-        T a0 = T(1) + precomputedAlpha_ / A;
-        T a1 = T(-2) * precomputedCos_;
-        T a2 = T(1) - precomputedAlpha_ / A;
+        const double b0 = 1.0 + precomputedAlpha_ * A;
+        const double b1 = -2.0 * precomputedCos_;
+        const double b2 = 1.0 - precomputedAlpha_ * A;
+        const double a0 = 1.0 + precomputedAlpha_ / A;
+        const double a1 = -2.0 * precomputedCos_;
+        const double a2 = 1.0 - precomputedAlpha_ / A;
 
         // Normalization
-        T a0Inv = T(1) / a0;
+        const double a0Inv = 1.0 / a0;
 
-        BiquadCoeffs<T> coeffs;
+        BiquadCoeffs coeffs;
         coeffs.b0 = b0 * a0Inv;
         coeffs.b1 = b1 * a0Inv;
         coeffs.b2 = b2 * a0Inv;
@@ -422,8 +424,8 @@ private:
     std::array<std::array<T, kDerivLen>, kMaxChannels> derivShift_ {};
 
     // Precomputed components for fast Biquad Peak modulation
-    T precomputedCos_ = T(0);
-    T precomputedAlpha_ = T(0);
+    double precomputedCos_ = 0.0;
+    double precomputedAlpha_ = 0.0;
 };
 
 } // namespace dspark

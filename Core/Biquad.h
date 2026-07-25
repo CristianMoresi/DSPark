@@ -9,13 +9,42 @@
  *
  * Provides two classes:
  *
- * - **BiquadCoeffs<T>**: Coefficient set with static factory methods for all
+ * - **BiquadCoeffs**: Coefficient set with static factory methods for all
  * standard filter types. Formulas from Robert Bristow-Johnson's "Audio EQ Cookbook".
  * Memory aligned to 32 bytes for SIMD operations.
  *
  * - **Biquad<T, MaxChannels>**: Per-channel filter state using Transposed Direct
  * Form II (TDF-II). Features a lock-free shadow buffering system to allow safe
  * coefficient updates from the GUI thread without tearing or blocking the audio thread.
+ *
+ * Numerical design (why the filter core is double regardless of the sample type):
+ * a biquad whose corner sits far below the sample rate parks its poles a hair
+ * inside the unit circle - 1 - |z| is about pi*fc/(Q*fs), i.e. 5.8e-5 at 10 Hz /
+ * 768 kHz - so the denominator evaluated at DC, 1 + a1 + a2 = (2 - 2*cos w0)/a0,
+ * is a cancellation of terms of size 2 landing on 6.7e-9, far under the float
+ * resolution of the terms it is made of (1.2e-7). Realised in float that sum is
+ * no longer resolvable (measured 5.96e-08 against a true 2.68e-08 at 20 Hz /
+ * 768 kHz, Q = 2.5628), the recursion stops being contractive and its rounding
+ * error is integrated instead of decaying, which turns a high-pass into a DC
+ * SOURCE and, steep enough, into an oscillator. Measured on the float core this
+ * replaces, on a DC-free 1 kHz tone at -6 dBFS through FilterEngine: a 10 Hz
+ * 12 dB/oct corner published -1.46e-01 of sustained DC at 384 kHz with the peak
+ * inflated from 0.5068 to 0.6838 (+2.60 dB), a 20 Hz corner +6.62e-03 at
+ * 768 kHz (peak 0.5130 -> 0.5821, +1.10 dB), and the realised DC gain - the sum
+ * of the impulse response, which must be zero for a high-pass - reached +0.577
+ * at 20 Hz / 768 kHz and -0.962 at 50 Hz / 768 kHz, i.e. the "high-pass" passed
+ * DC at unity. The impulse response says it plainly: 20 Hz at 768 kHz, peak |h|
+ * per half second, 24 dB/oct went 1.0 -> 4.1e-04 -> 4.8e-06 and then STOPPED
+ * decaying (2.7e-06, 1.6e-06, 8.6e-07: a pole on the circle), and 48 dB/oct went
+ * 1.0 -> 1.8e+19 -> 4.2e+37 -> non-finite - an unstable filter, reached from
+ * setHighPass(20, 0.707, 48) at a rate a host hits by oversampling 48 kHz by 16.
+ * In double the same cancellation carries an absolute error of about 2e-16, so
+ * the poles land within 1e-8 (relative) of the design; the same points now decay
+ * 1.0 -> 3.8e-04 -> 5.3e-15 -> 9.7e-26 and 1.0 -> 6.7e-04 -> 5.4e-10 -> 2.0e-15.
+ * Scalar double throughput matches float on x86-64 and ARM64, so coefficients,
+ * history and recursion are all double and only the buffer I/O is T;
+ * processSampleCore() exists so a cascade can keep the intermediate signal in
+ * the core precision instead of re-quantising it to T between stages.
  *
  * Dependencies: C++20 standard library (<algorithm>, <array>, <atomic>, <cassert>, <cmath>, <numbers>, <span>).
  */
@@ -39,7 +68,7 @@ namespace dspark {
 
 /**
  * @struct BiquadCoeffs
- * @brief Stores normalised biquad coefficients (b0, b1, b2, a1, a2).
+ * @brief Stores normalised biquad coefficients (b0, b1, b2, a1, a2), always double.
  *
  * Coefficients are pre-normalised by a0 in every factory method, so the
  * filter processing loop never needs to divide by a0. Memory is aligned
@@ -50,20 +79,18 @@ namespace dspark {
  * not sanitised (they propagate into the coefficients), and the sample rate
  * is trusted as-is: the framework contract is a valid AudioSpec upstream.
  *
- * Usable corner range: the designs below are exact, but a corner far below
- * the sample rate cannot be REALISED in float. At fc/fs under roughly 1e-4
- * the denominator evaluated at DC, 1 + a1 + a2, is a cancellation of terms
- * of size 2 landing on 2.7e-8 (5 Hz at 192 kHz), which float cannot resolve:
- * the realised poles drift onto the unit circle. Design and run those in
- * double. For DC removal specifically, use DCBlocker, which is built for it.
- *
- * @tparam T Coefficient type (float or double).
+ * There is no float instantiation and no coefficient type parameter: a corner
+ * far below the sample rate is exact as a DESIGN but cannot be REALISED in
+ * float (see the @file header for the measurements), and a coefficient set that
+ * cannot be realised is not a coefficient set. One precision, one rule, and the
+ * magnitude response drawn from these numbers is the response the audio path
+ * actually applies. For DC removal specifically, use DCBlocker, which is built
+ * for it.
  */
-template <typename T>
 struct alignas(32) BiquadCoeffs
 {
-    T b0 = T(1), b1 = T(0), b2 = T(0);
-    T a1 = T(0), a2 = T(0);
+    double b0 = 1.0, b1 = 0.0, b2 = 0.0;
+    double a1 = 0.0, a2 = 0.0;
 
     // -- Factory methods (Audio EQ Cookbook) ----------------------------------
 
@@ -83,13 +110,12 @@ struct alignas(32) BiquadCoeffs
         const double alpha = sinw0 / (2.0 * Q);
 
         const double a0 = 1.0 + alpha;
-        return normalise(a0, {
-            T((1.0 - cosw0) / 2.0),
-            T( 1.0 - cosw0),
-            T((1.0 - cosw0) / 2.0),
-            T(-2.0 * cosw0),
-            T( 1.0 - alpha)
-        });
+        return normalise(a0,
+            (1.0 - cosw0) / 2.0,
+             1.0 - cosw0,
+            (1.0 - cosw0) / 2.0,
+            -2.0 * cosw0,
+             1.0 - alpha);
     }
 
     /**
@@ -108,13 +134,12 @@ struct alignas(32) BiquadCoeffs
         const double alpha = sinw0 / (2.0 * Q);
 
         const double a0 = 1.0 + alpha;
-        return normalise(a0, {
-            T( (1.0 + cosw0) / 2.0),
-            T(-(1.0 + cosw0)),
-            T( (1.0 + cosw0) / 2.0),
-            T(-2.0 * cosw0),
-            T( 1.0 - alpha)
-        });
+        return normalise(a0,
+             (1.0 + cosw0) / 2.0,
+            -(1.0 + cosw0),
+             (1.0 + cosw0) / 2.0,
+            -2.0 * cosw0,
+              1.0 - alpha);
     }
 
     /**
@@ -138,13 +163,12 @@ struct alignas(32) BiquadCoeffs
         const double alpha = sinw0 / (2.0 * Q);
 
         const double a0 = 1.0 + alpha;
-        return normalise(a0, {
-            T(alpha),
-            T(0.0),
-            T(-alpha),
-            T(-2.0 * cosw0),
-            T( 1.0 - alpha)
-        });
+        return normalise(a0,
+            alpha,
+            0.0,
+            -alpha,
+            -2.0 * cosw0,
+             1.0 - alpha);
     }
 
     /**
@@ -169,13 +193,12 @@ struct alignas(32) BiquadCoeffs
         const double alpha = sinw0 / (2.0 * Q);
 
         const double a0 = 1.0 + alpha / A;
-        return normalise(a0, {
-            T(1.0 + alpha * A),
-            T(-2.0 * cosw0),
-            T(1.0 - alpha * A),
-            T(-2.0 * cosw0),
-            T(1.0 - alpha / A)
-        });
+        return normalise(a0,
+            1.0 + alpha * A,
+            -2.0 * cosw0,
+            1.0 - alpha * A,
+            -2.0 * cosw0,
+            1.0 - alpha / A);
     }
 
     /**
@@ -203,7 +226,7 @@ struct alignas(32) BiquadCoeffs
         freq = std::clamp(freq, 1.0, std::max(1.0, sampleRate * 0.495));
         Q = std::max(Q, 0.001);
         if (std::abs(gainDb) < 0.01)
-            return { T(1), T(0), T(0), T(0), T(0) };
+            return { 1.0, 0.0, 0.0, 0.0, 0.0 };
 
         const double G0 = 1.0;                                  // reference gain
         const double G = std::pow(10.0, gainDb / 20.0);         // peak gain
@@ -242,13 +265,12 @@ struct alignas(32) BiquadCoeffs
         const double B = std::sqrt(std::max((G2 * C + GB2 * D) / std::max(F, 1e-30), 0.0));
 
         const double a0 = 1.0 + W2 + A;
-        return normalise(a0, {
-            T(G1 + G0 * W2 + B),
-            T(-2.0 * (G1 - G0 * W2)),
-            T(G1 + G0 * W2 - B),
-            T(-2.0 * (1.0 - W2)),
-            T(1.0 + W2 - A)
-        });
+        return normalise(a0,
+            G1 + G0 * W2 + B,
+            -2.0 * (G1 - G0 * W2),
+            G1 + G0 * W2 - B,
+            -2.0 * (1.0 - W2),
+            1.0 + W2 - A);
     }
 
     /**
@@ -273,13 +295,12 @@ struct alignas(32) BiquadCoeffs
         const double twoSqrtAAlpha = 2.0 * std::sqrt(A) * alpha;
 
         const double a0 = (A + 1.0) + (A - 1.0) * cosw0 + twoSqrtAAlpha;
-        return normalise(a0, {
-            T(A * ((A + 1.0) - (A - 1.0) * cosw0 + twoSqrtAAlpha)),
-            T(2.0 * A * ((A - 1.0) - (A + 1.0) * cosw0)),
-            T(A * ((A + 1.0) - (A - 1.0) * cosw0 - twoSqrtAAlpha)),
-            T(-2.0 * ((A - 1.0) + (A + 1.0) * cosw0)),
-            T((A + 1.0) + (A - 1.0) * cosw0 - twoSqrtAAlpha)
-        });
+        return normalise(a0,
+            A * ((A + 1.0) - (A - 1.0) * cosw0 + twoSqrtAAlpha),
+            2.0 * A * ((A - 1.0) - (A + 1.0) * cosw0),
+            A * ((A + 1.0) - (A - 1.0) * cosw0 - twoSqrtAAlpha),
+            -2.0 * ((A - 1.0) + (A + 1.0) * cosw0),
+            (A + 1.0) + (A - 1.0) * cosw0 - twoSqrtAAlpha);
     }
 
     /**
@@ -304,13 +325,12 @@ struct alignas(32) BiquadCoeffs
         const double twoSqrtAAlpha = 2.0 * std::sqrt(A) * alpha;
 
         const double a0 = (A + 1.0) - (A - 1.0) * cosw0 + twoSqrtAAlpha;
-        return normalise(a0, {
-            T(A * ((A + 1.0) + (A - 1.0) * cosw0 + twoSqrtAAlpha)),
-            T(-2.0 * A * ((A - 1.0) + (A + 1.0) * cosw0)),
-            T(A * ((A + 1.0) + (A - 1.0) * cosw0 - twoSqrtAAlpha)),
-            T(2.0 * ((A - 1.0) - (A + 1.0) * cosw0)),
-            T((A + 1.0) - (A - 1.0) * cosw0 - twoSqrtAAlpha)
-        });
+        return normalise(a0,
+            A * ((A + 1.0) + (A - 1.0) * cosw0 + twoSqrtAAlpha),
+            -2.0 * A * ((A - 1.0) + (A + 1.0) * cosw0),
+            A * ((A + 1.0) + (A - 1.0) * cosw0 - twoSqrtAAlpha),
+            2.0 * ((A - 1.0) - (A + 1.0) * cosw0),
+            (A + 1.0) - (A - 1.0) * cosw0 - twoSqrtAAlpha);
     }
 
     /**
@@ -329,13 +349,12 @@ struct alignas(32) BiquadCoeffs
         const double alpha = sinw0 / (2.0 * Q);
 
         const double a0 = 1.0 + alpha;
-        return normalise(a0, {
-            T(1.0),
-            T(-2.0 * cosw0),
-            T(1.0),
-            T(-2.0 * cosw0),
-            T(1.0 - alpha)
-        });
+        return normalise(a0,
+            1.0,
+            -2.0 * cosw0,
+            1.0,
+            -2.0 * cosw0,
+            1.0 - alpha);
     }
 
     /**
@@ -354,13 +373,12 @@ struct alignas(32) BiquadCoeffs
         const double alpha = sinw0 / (2.0 * Q);
 
         const double a0 = 1.0 + alpha;
-        return normalise(a0, {
-            T(1.0 - alpha),
-            T(-2.0 * cosw0),
-            T(1.0 + alpha),
-            T(-2.0 * cosw0),
-            T(1.0 - alpha)
-        });
+        return normalise(a0,
+            1.0 - alpha,
+            -2.0 * cosw0,
+            1.0 + alpha,
+            -2.0 * cosw0,
+            1.0 - alpha);
     }
 
     // -- First-order filter factory methods ------------------------------------
@@ -377,14 +395,14 @@ struct alignas(32) BiquadCoeffs
     [[nodiscard]] static BiquadCoeffs makeFirstOrderLowPass(double sampleRate, double frequency) noexcept
     {
         frequency = std::clamp(frequency, 1.0, std::max(1.0, sampleRate * 0.499));
-        double w = std::tan(std::numbers::pi * frequency / sampleRate);
-        double n = 1.0 / (1.0 + w);
+        const double w = std::tan(std::numbers::pi * frequency / sampleRate);
+        const double n = 1.0 / (1.0 + w);
         BiquadCoeffs c;
-        c.b0 = static_cast<T>(w * n);
-        c.b1 = static_cast<T>(w * n);
-        c.b2 = T(0);
-        c.a1 = static_cast<T>((w - 1.0) * n);
-        c.a2 = T(0);
+        c.b0 = w * n;
+        c.b1 = w * n;
+        c.b2 = 0.0;
+        c.a1 = (w - 1.0) * n;
+        c.a2 = 0.0;
         return c;
     }
 
@@ -400,14 +418,14 @@ struct alignas(32) BiquadCoeffs
     [[nodiscard]] static BiquadCoeffs makeFirstOrderHighPass(double sampleRate, double frequency) noexcept
     {
         frequency = std::clamp(frequency, 1.0, std::max(1.0, sampleRate * 0.499));
-        double w = std::tan(std::numbers::pi * frequency / sampleRate);
-        double n = 1.0 / (1.0 + w);
+        const double w = std::tan(std::numbers::pi * frequency / sampleRate);
+        const double n = 1.0 / (1.0 + w);
         BiquadCoeffs c;
-        c.b0 = static_cast<T>(n);
-        c.b1 = static_cast<T>(-n);
-        c.b2 = T(0);
-        c.a1 = static_cast<T>((w - 1.0) * n);
-        c.a2 = T(0);
+        c.b0 = n;
+        c.b1 = -n;
+        c.b2 = 0.0;
+        c.a1 = (w - 1.0) * n;
+        c.a2 = 0.0;
         return c;
     }
 
@@ -426,21 +444,21 @@ struct alignas(32) BiquadCoeffs
     [[nodiscard]] static BiquadCoeffs makeTilt(double sampleRate, double pivotFreq, double gainDb) noexcept
     {
         pivotFreq = std::clamp(pivotFreq, 1.0, std::max(1.0, sampleRate * 0.499));
-        double g = std::pow(10.0, gainDb / 20.0);
-        double sqrtG = std::sqrt(g);
-        double c = std::tan(std::numbers::pi * pivotFreq / sampleRate);
+        const double g = std::pow(10.0, gainDb / 20.0);
+        const double sqrtG = std::sqrt(g);
+        const double c = std::tan(std::numbers::pi * pivotFreq / sampleRate);
 
         // First-order tilt shelf via bilinear transform:
         //   DC gain = 1/sqrt(g), pivot gain = 1, Nyquist gain = sqrt(g)
         //   Total swing = gainDb (half below pivot, half above).
-        double norm = 1.0 / (1.0 + sqrtG * c);
+        const double norm = 1.0 / (1.0 + sqrtG * c);
 
         BiquadCoeffs coeffs;
-        coeffs.b0 = static_cast<T>((sqrtG + c) * norm);
-        coeffs.b1 = static_cast<T>((c - sqrtG) * norm);
-        coeffs.b2 = T(0);
-        coeffs.a1 = static_cast<T>((sqrtG * c - 1.0) * norm);
-        coeffs.a2 = T(0);
+        coeffs.b0 = (sqrtG + c) * norm;
+        coeffs.b1 = (c - sqrtG) * norm;
+        coeffs.b2 = 0.0;
+        coeffs.a1 = (sqrtG * c - 1.0) * norm;
+        coeffs.a2 = 0.0;
         return coeffs;
     }
 
@@ -450,64 +468,65 @@ struct alignas(32) BiquadCoeffs
      * @brief Evaluates magnitude response |H(f)| at a single frequency.
      *
      * Evaluates the transfer function H(z) = B(z)/A(z) at z = e^(j*2*pi*f/fs).
-     * Essential for drawing EQ curves and filter response plots.
+     * Essential for drawing EQ curves and filter response plots. These are the
+     * same numbers the recursion runs on, so the drawn curve is the realised
+     * response, not a re-derivation of it.
      *
      * @param frequency  Frequency to evaluate in Hz.
      * @param sampleRate Sample rate in Hz.
      * @return Magnitude (linear scale, 1.0 = unity gain).
      */
-    [[nodiscard]] T getMagnitude(double frequency, double sampleRate) const noexcept
+    [[nodiscard]] double getMagnitude(double frequency, double sampleRate) const noexcept
     {
-        double w = 2.0 * std::numbers::pi * frequency / sampleRate;
-        double cosW  = std::cos(w);
-        double cos2W = std::cos(2.0 * w);
-        double sinW  = std::sin(w);
-        double sin2W = std::sin(2.0 * w);
+        const double w = 2.0 * std::numbers::pi * frequency / sampleRate;
+        const double cosW  = std::cos(w);
+        const double cos2W = std::cos(2.0 * w);
+        const double sinW  = std::sin(w);
+        const double sin2W = std::sin(2.0 * w);
 
-        double nRe = static_cast<double>(b0) + static_cast<double>(b1) * cosW + static_cast<double>(b2) * cos2W;
-        double nIm = -static_cast<double>(b1) * sinW - static_cast<double>(b2) * sin2W;
-        double dRe = 1.0 + static_cast<double>(a1) * cosW + static_cast<double>(a2) * cos2W;
-        double dIm = -static_cast<double>(a1) * sinW - static_cast<double>(a2) * sin2W;
+        const double nRe = b0 + b1 * cosW + b2 * cos2W;
+        const double nIm = -b1 * sinW - b2 * sin2W;
+        const double dRe = 1.0 + a1 * cosW + a2 * cos2W;
+        const double dIm = -a1 * sinW - a2 * sin2W;
 
-        double numMag2 = nRe * nRe + nIm * nIm;
-        double denMag2 = dRe * dRe + dIm * dIm;
+        const double numMag2 = nRe * nRe + nIm * nIm;
+        const double denMag2 = dRe * dRe + dIm * dIm;
 
-        return (denMag2 > 1e-30) ? static_cast<T>(std::sqrt(numMag2 / denMag2)) : T(0);
+        return (denMag2 > 1e-30) ? std::sqrt(numMag2 / denMag2) : 0.0;
     }
 
     /**
      * @brief Computes magnitude responses for a batch of frequencies.
      *
      * Uses C++20 std::span for bounds-safe array access. Efficient batch
-     * evaluation for drawing frequency response curves.
+     * evaluation for drawing frequency response curves. Templated on the array
+     * element type so a UI can keep its curve buffers in float.
      *
      * @param frequencies Span of input frequencies in Hz.
      * @param magnitudes  Span where the evaluated magnitudes will be stored.
      * Must be at least as large as the frequencies span.
      * @param sampleRate  Sample rate in Hz.
      */
-    void getMagnitudeForFrequencyArray(std::span<const T> frequencies,
-                                       std::span<T> magnitudes,
+    template <typename U>
+    void getMagnitudeForFrequencyArray(std::span<const U> frequencies,
+                                       std::span<U> magnitudes,
                                        double sampleRate) const noexcept
     {
         assert(magnitudes.size() >= frequencies.size());
         for (size_t i = 0; i < frequencies.size(); ++i)
-            magnitudes[i] = getMagnitude(static_cast<double>(frequencies[i]), sampleRate);
+            magnitudes[i] = static_cast<U>(getMagnitude(static_cast<double>(frequencies[i]), sampleRate));
     }
 
 private:
-    /** @brief Normalises all coefficients by a0 (divides b* and a* by a0).
-     * Division is performed in double precision to avoid premature truncation
-     * when T is float; coefficients are only cast to T after the division. */
-    [[nodiscard]] static BiquadCoeffs normalise(double a0, BiquadCoeffs raw) noexcept
+    /** @brief Normalises a raw coefficient set by a0 (divides b* and a* by a0).
+     * Takes the raw values one by one rather than a BiquadCoeffs by value: the
+     * struct is over-aligned, and passing it through a register-class boundary
+     * is exactly what GCC's -Wpsabi note is about. */
+    [[nodiscard]] static BiquadCoeffs normalise(double a0, double b0r, double b1r, double b2r,
+                                                double a1r, double a2r) noexcept
     {
-        double invA0 = 1.0 / a0;
-        raw.b0 = static_cast<T>(static_cast<double>(raw.b0) * invA0);
-        raw.b1 = static_cast<T>(static_cast<double>(raw.b1) * invA0);
-        raw.b2 = static_cast<T>(static_cast<double>(raw.b2) * invA0);
-        raw.a1 = static_cast<T>(static_cast<double>(raw.a1) * invA0);
-        raw.a2 = static_cast<T>(static_cast<double>(raw.a2) * invA0);
-        return raw;
+        const double invA0 = 1.0 / a0;
+        return { b0r * invA0, b1r * invA0, b2r * invA0, a1r * invA0, a2r * invA0 };
     }
 };
 
@@ -523,6 +542,11 @@ private:
  * reads when coefficients are updated by the UI thread concurrently with the
  * audio thread. Per-channel states are stored compactly so adjacent channels
  * share cache lines during block processing.
+ *
+ * The filter core (coefficients, history and recursion) is always double
+ * precision, independent of the sample type: see the @file header for the
+ * measurements behind that decision. The realised response is therefore
+ * rate-independent down to the corners the designs already supported on paper.
  *
  * @tparam T           Sample type (float or double).
  * @tparam MaxChannels Maximum number of independent filter channels.
@@ -572,7 +596,7 @@ public:
      *
      * @param c New coefficient set.
      */
-    void setCoeffs(const BiquadCoeffs<T>& c) noexcept
+    void setCoeffs(const BiquadCoeffs& c) noexcept
     {
         // Seqlock publish (single producer). An odd sequence number marks a
         // write in progress; the audio thread retries its read while odd or if
@@ -609,9 +633,9 @@ public:
         if (coeffsDirty_.exchange(false, std::memory_order_acquire))
         {
             // Seqlock read: retry on a torn/in-progress publish. The writer's
-            // critical section is a 5-float copy, so this converges in at most
+            // critical section is a 5-double copy, so this converges in at most
             // a couple of iterations even under a busy GUI thread.
-            BiquadCoeffs<T> tmp;
+            BiquadCoeffs tmp;
             unsigned s0, s1;
             do {
                 s0  = coeffsSeq_.load(std::memory_order_acquire);
@@ -638,7 +662,7 @@ public:
      * may observe a mid-update set; for drawing response curves, keep your
      * own copy of the coefficients you computed.
      */
-    [[nodiscard]] const BiquadCoeffs<T>& getCoeffs() const noexcept { return activeCoeffs_; }
+    [[nodiscard]] const BiquadCoeffs& getCoeffs() const noexcept { return activeCoeffs_; }
 
     /** @brief Resets all per-channel filter states to zero to avoid ringing/clicks. */
     void reset() noexcept
@@ -669,6 +693,26 @@ public:
      */
     T processSample(T input, int channel) noexcept
     {
+        return static_cast<T>(processSampleCore(static_cast<double>(input), channel));
+    }
+
+    /**
+     * @brief One recursion step in the core's own precision (double).
+     *
+     * Same filter, same state, no conversion at the boundary: a cascade calls
+     * this to keep the intermediate signal in the core precision instead of
+     * re-quantising it to T between stages (FilterEngine does). Identical
+     * contract to processSample() otherwise, including the lock-free pickup of
+     * pending coefficients.
+     *
+     * @pre channel must be in [0, MaxChannels).
+     *
+     * @param input   Input sample.
+     * @param channel Channel index (0-based).
+     * @return Filtered output sample.
+     */
+    double processSampleCore(double input, int channel) noexcept
+    {
         assert(channel >= 0 && channel < MaxChannels && "Channel index out of bounds");
 
         // Lock-free fast path: relaxed load is free on every modern CPU.
@@ -680,7 +724,7 @@ public:
 
         auto& s = state_[channel];
 
-        const T output = activeCoeffs_.b0 * input + s.z1;
+        const double output = activeCoeffs_.b0 * input + s.z1;
         s.z1 = activeCoeffs_.b1 * input - activeCoeffs_.a1 * output + s.z2;
         s.z2 = activeCoeffs_.b2 * input - activeCoeffs_.a2 * output;
 
@@ -715,22 +759,22 @@ public:
 
         // Block-local coefficient copy: stable for the whole block by design
         // (updates land at the next block boundary), and register-friendly.
-        const BiquadCoeffs<T> c = activeCoeffs_;
+        const BiquadCoeffs c = activeCoeffs_;
 
         for (int ch = 0; ch < numChannels; ++ch)
         {
             T* data = buffer.getChannel(ch);
             auto& s = state_[ch];
-            T z1 = s.z1;
-            T z2 = s.z2;
+            double z1 = s.z1;
+            double z2 = s.z2;
 
             for (int i = 0; i < numSamples; ++i)
             {
-                const T input  = data[i];
-                const T output = c.b0 * input + z1;
+                const double input  = static_cast<double>(data[i]);
+                const double output = c.b0 * input + z1;
                 z1 = c.b1 * input - c.a1 * output + z2;
                 z2 = c.b2 * input - c.a2 * output;
-                data[i] = output;
+                data[i] = static_cast<T>(output);
             }
 
             s.z1 = z1;
@@ -745,12 +789,12 @@ private:
     // padding each one out to its own.
     struct State
     {
-        T z1 = T(0);
-        T z2 = T(0);
+        double z1 = 0.0;
+        double z2 = 0.0;
     };
 
-    BiquadCoeffs<T> activeCoeffs_ {};
-    BiquadCoeffs<T> stagedCoeffs_ {};
+    BiquadCoeffs activeCoeffs_ {};
+    BiquadCoeffs stagedCoeffs_ {};
     std::atomic<bool> coeffsDirty_{false};
     std::atomic<unsigned> coeffsSeq_{0}; ///< Seqlock counter for tear-free staged publish.
 

@@ -345,7 +345,7 @@ protected:
             // floating point, since halving and doubling are exact and all
             // three share the same 1/a0 factor - which is what lets the DC
             // zero be applied structurally in the inner loop.
-            const auto c = BiquadCoeffs<double>::makeHighPass(
+            const auto c = BiquadCoeffs::makeHighPass(
                 sampleRate_, fc, static_cast<double>(qTable[tableIdx][s]));
             assert(c.b1 == -2.0 * c.b0 && c.b2 == c.b0
                    && "RBJ high-pass numerator is no longer b0 * (1, -2, 1)");

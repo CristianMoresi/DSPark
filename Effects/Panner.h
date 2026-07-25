@@ -425,9 +425,9 @@ protected:
         T gainLdB = -targetPan * static_cast<T>(sMaxGain);
         T gainRdB =  targetPan * static_cast<T>(sMaxGain);
 
-        spectralL_.setCoeffs(BiquadCoeffs<T>::makeHighShelf(
+        spectralL_.setCoeffs(BiquadCoeffs::makeHighShelf(
             sampleRate_, static_cast<double>(sFreq), static_cast<double>(gainLdB)));
-        spectralR_.setCoeffs(BiquadCoeffs<T>::makeHighShelf(
+        spectralR_.setCoeffs(BiquadCoeffs::makeHighShelf(
             sampleRate_, static_cast<double>(sFreq), static_cast<double>(gainRdB)));
     }
 

@@ -671,6 +671,73 @@ void runPdcNullTests()
 // [metrics] — objective quality numbers
 // -----------------------------------------------------------------------------
 
+// Low-corner filter realisation. A high-pass has H(1) = 0 exactly, so on a
+// DC-free input the output must stay DC-free and the sum of the impulse
+// response must be zero — at EVERY sample rate, because fc/fs is what decides
+// whether the poles are resolvable. Realised in the sample type instead of the
+// biquad core's double, both collapsed: 10 Hz at 384 kHz published -1.46e-01
+// of sustained DC and a realised DC gain of +2.89e-01, and the 36/48 dB/oct
+// cascades diverged to a non-finite output at 384/768 kHz. See Core/Biquad.h.
+
+/// Mean of the second half of `seconds` of a mono DC-free 1 kHz tone at
+/// -6 dBFS: the sustained mid-file DC a host would meter.
+///
+/// The half-length is rounded up to a multiple of 1536 samples, which is a
+/// whole number of 512-sample blocks AND a whole number of 1 kHz cycles at
+/// 48/96/192/384/768 kHz alike. Without that the leftover part-cycle of the
+/// probe tone lands in the average at up to 3e-04 and buries the quantity
+/// being measured.
+double sustainedDc(const std::function<void(dspark::AudioBufferView<float>)>& process,
+                   double rate, double seconds, bool& finite)
+{
+    constexpr int kBlk = 512;
+    constexpr long kGrain = 1536;
+    dspark::AudioBuffer<float> buf;
+    buf.resize(1, kBlk);
+    auto view = buf.toView();
+    const long half  = kGrain * ((static_cast<long>(rate * seconds * 0.5) + kGrain - 1) / kGrain);
+    const long total = 2 * half;
+    double acc = 0.0;
+    long n = 0;
+    for (long i = 0; i < total; i += kBlk)
+    {
+        for (int k = 0; k < kBlk; ++k)
+            view.getChannel(0)[k] = 0.5f * static_cast<float>(
+                std::sin(2.0 * kPiConf * 1000.0 * static_cast<double>(i + k) / rate));
+        process(view);
+        for (int k = 0; k < kBlk; ++k)
+        {
+            if (!std::isfinite(view.getChannel(0)[k])) finite = false;
+            if (i + k >= half) { acc += static_cast<double>(view.getChannel(0)[k]); ++n; }
+        }
+    }
+    return acc / static_cast<double>(std::max(1L, n));
+}
+
+/// Sum of the impulse response = the realised DC gain (zero for a high-pass).
+double realisedDcGain(const std::function<void(dspark::AudioBufferView<float>)>& process,
+                      double rate, double seconds, bool& finite)
+{
+    constexpr int kBlk = 512;
+    dspark::AudioBuffer<float> buf;
+    buf.resize(1, kBlk);
+    auto view = buf.toView();
+    const long total = static_cast<long>(rate * seconds);
+    double sum = 0.0;
+    for (long i = 0; i < total; i += kBlk)
+    {
+        for (int k = 0; k < kBlk; ++k)
+            view.getChannel(0)[k] = (i + k == 0) ? 1.0f : 0.0f;
+        process(view);
+        for (int k = 0; k < kBlk; ++k)
+        {
+            if (!std::isfinite(view.getChannel(0)[k])) finite = false;
+            sum += static_cast<double>(view.getChannel(0)[k]);
+        }
+    }
+    return sum;
+}
+
 void runMetricTests()
 {
     {
@@ -736,6 +803,65 @@ void runMetricTests()
         }
         char d[64]; std::snprintf(d, sizeof(d), "(DC out %.5f)", static_cast<double>(last));
         check(std::abs(last) < 1e-3, "metrics", "Ladder HP24 DC rejection @ res 0.5", d);
+    }
+    {
+        // Low-corner high-pass realisation across the whole rate range, in the
+        // sample type a host actually instantiates (float). See the note above
+        // sustainedDc() for what these two numbers mean and what they read
+        // before the biquad core moved to double.
+        const double rates[]   = { 48000.0, 96000.0, 192000.0, 384000.0, 768000.0 };
+        const double corners[] = { 10.0, 20.0, 50.0, 120.0 };
+        const int slopes[]     = { 12, 48 };
+
+        double worstDc = 0.0, worstGain = 0.0;
+        double atRate = 0.0, atCorner = 0.0;
+        bool finite = true;
+
+        for (double rate : rates)
+            for (double corner : corners)
+                for (int slope : slopes)
+                {
+                    dspark::FilterEngine<float> fe;
+                    fe.prepare(dspark::AudioSpec { rate, 512, 1 });
+                    fe.setHighPass(static_cast<float>(corner), 0.707f, slope);
+                    fe.applyParametersNow();
+                    auto proc = [&fe](dspark::AudioBufferView<float> v) { fe.processBlock(v); };
+
+                    fe.reset();
+                    const double dc = std::abs(sustainedDc(proc, rate, 3.0, finite));
+                    fe.reset();
+                    const double gain = std::abs(realisedDcGain(proc, rate, 3.0, finite));
+
+                    if (dc > worstDc) { worstDc = dc; atRate = rate; atCorner = corner; }
+                    worstGain = std::max(worstGain, gain);
+                }
+
+        // The Equalizer's HighPass band rides the same engine: one point is
+        // enough to prove the band path does not re-quantise on the way in.
+        double eqDc = 0.0;
+        {
+            dspark::Equalizer<float> eq;
+            eq.prepare(dspark::AudioSpec { 768000.0, 512, 1 });
+            dspark::Equalizer<float>::BandConfig cfg;
+            cfg.frequency = 20.0f;
+            cfg.q         = 0.707f;
+            cfg.slope     = 48;
+            cfg.type      = dspark::Equalizer<float>::BandType::HighPass;
+            eq.setBand(0, cfg);
+            (void)eq.processSample(0.0f, 0);   // publish the band config now
+            eq.reset();
+            auto proc = [&eq](dspark::AudioBufferView<float> v) { eq.processBlock(v); };
+            eqDc = std::abs(sustainedDc(proc, 768000.0, 3.0, finite));
+        }
+
+        char d[160];
+        std::snprintf(d, sizeof(d), "(worst DC %.3e at %.0f Hz / %.0f Hz, worst H(1) %.3e, EQ %.3e)",
+                      worstDc, atCorner, atRate, worstGain, eqDc);
+        check(finite, "metrics", "Low-corner high-pass stays finite 48k..768k", d);
+        check(worstDc < 1e-8 && eqDc < 1e-8, "metrics",
+              "Low-corner high-pass sources no DC 48k..768k", d);
+        check(worstGain < 1e-6, "metrics",
+              "Low-corner high-pass realised DC gain is zero 48k..768k", d);
     }
     {
         // Clipper Analog mode: unity gain for small signals.

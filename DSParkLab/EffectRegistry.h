@@ -66,13 +66,13 @@ inline EffectSlot makeFilterEngine()
     // Interactive response curve. Reconstructs the exact cascade from the public
     // BiquadCoeffs factories + FilterEngine::cascadeForSlope (single source of truth).
     s.magnitudeFn = [](const float* f, float* mdb, int n, double sr, const float* v) {
-        using BC = dspark::BiquadCoeffs<float>;
+        using BC = dspark::BiquadCoeffs;
         using FE = dspark::FilterEngine<float>;
         const int type = static_cast<int>(v[0]);
         const float freq = v[1], Q = std::max(0.05f, v[2]), gain = v[3];
         int slope = std::clamp((static_cast<int>(v[4]) / 6) * 6, 6, 48);
         BC st[5]; int ns = 0;
-        auto add = [&](BC c){ if (ns < 5) st[ns++] = c; };
+        auto add = [&](const BC& c){ if (ns < 5) st[ns++] = c; };
         switch (type) {
             case 0: case 1: {  // LowPass / HighPass — Butterworth cascade for the slope
                 auto info = FE::cascadeForSlope(slope, Q);  // user Q scales the final stage, like the engine
@@ -178,7 +178,7 @@ inline EffectSlot makeEqualizer()
                 cfg.q         = std::max(0.05f, v[b*5+2]);
                 cfg.type      = toType(v[b*5+3]);
                 cfg.slope     = toSlope(v[b*5+4]);
-                dspark::BiquadCoeffs<float> stages[5];
+                dspark::BiquadCoeffs stages[5];
                 const int ns = p->buildBandStages(cfg, stages);
                 for (int k = 0; k < ns; ++k)
                     mag *= stages[k].getMagnitude(static_cast<double>(f[i]), sr);
@@ -943,11 +943,11 @@ inline EffectSlot makeDynamicEQ()
 
     // Shape-aware magnitude of one band at gain g (for both curve overlays).
     auto bandMag = [](float freq, float q, int shape, float g, double fHz, double sr) {
-        dspark::BiquadCoeffs<float> c;
+        dspark::BiquadCoeffs c;
         switch (shape) {
-            default: c = dspark::BiquadCoeffs<float>::makePeak(sr, freq, std::max(0.05f, q), g); break;
-            case 1:  c = dspark::BiquadCoeffs<float>::makeLowShelf(sr, freq, g); break;
-            case 2:  c = dspark::BiquadCoeffs<float>::makeHighShelf(sr, freq, g); break;
+            default: c = dspark::BiquadCoeffs::makePeak(sr, freq, std::max(0.05f, q), g); break;
+            case 1:  c = dspark::BiquadCoeffs::makeLowShelf(sr, freq, g); break;
+            case 2:  c = dspark::BiquadCoeffs::makeHighShelf(sr, freq, g); break;
         }
         return static_cast<double>(c.getMagnitude(fHz, sr));
     };

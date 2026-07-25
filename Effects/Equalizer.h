@@ -469,15 +469,15 @@ public:
         {
             if (!configs_[b].enabled) continue;
 
-            BiquadCoeffs<T> st[5];
+            BiquadCoeffs st[5];
             const int ns = buildBandStages(configs_[b], st);
 
             for (int i = 0; i < numPoints; ++i)
             {
-                T mag = T(1);
+                double mag = 1.0;
                 for (int s = 0; s < ns; ++s)
                     mag *= st[s].getMagnitude(static_cast<double>(frequencies[i]), spec_.sampleRate);
-                magnitudes[i] *= mag;
+                magnitudes[i] = static_cast<T>(static_cast<double>(magnitudes[i]) * mag);
             }
         }
     }
@@ -633,7 +633,7 @@ protected:
      * @param cfg Band configuration (its q must already be the effective one).
      * @return BiquadCoeffs structure.
      */
-    [[nodiscard]] BiquadCoeffs<T> computeBandCoeffs(const BandConfig& cfg) const noexcept
+    [[nodiscard]] BiquadCoeffs computeBandCoeffs(const BandConfig& cfg) const noexcept
     {
         double sr = spec_.sampleRate;
         double f  = static_cast<double>(cfg.frequency);
@@ -644,15 +644,15 @@ protected:
         {
             case BandType::Peak:
                 return matchedBells_.load(std::memory_order_relaxed)
-                    ? BiquadCoeffs<T>::makePeakMatched(sr, f, q, g)
-                    : BiquadCoeffs<T>::makePeak(sr, f, q, g);
-            case BandType::LowShelf:  return BiquadCoeffs<T>::makeLowShelf(sr, f, g, shelfSlopeFromQ(q, g));
-            case BandType::HighShelf: return BiquadCoeffs<T>::makeHighShelf(sr, f, g, shelfSlopeFromQ(q, g));
-            case BandType::LowPass:   return BiquadCoeffs<T>::makeLowPass(sr, f, q);
-            case BandType::HighPass:  return BiquadCoeffs<T>::makeHighPass(sr, f, q);
-            case BandType::Notch:     return BiquadCoeffs<T>::makeNotch(sr, f, q);
-            case BandType::BandPass:  return BiquadCoeffs<T>::makeBandPass(sr, f, q);
-            case BandType::Tilt:      return BiquadCoeffs<T>::makeTilt(sr, f, g);
+                    ? BiquadCoeffs::makePeakMatched(sr, f, q, g)
+                    : BiquadCoeffs::makePeak(sr, f, q, g);
+            case BandType::LowShelf:  return BiquadCoeffs::makeLowShelf(sr, f, g, shelfSlopeFromQ(q, g));
+            case BandType::HighShelf: return BiquadCoeffs::makeHighShelf(sr, f, g, shelfSlopeFromQ(q, g));
+            case BandType::LowPass:   return BiquadCoeffs::makeLowPass(sr, f, q);
+            case BandType::HighPass:  return BiquadCoeffs::makeHighPass(sr, f, q);
+            case BandType::Notch:     return BiquadCoeffs::makeNotch(sr, f, q);
+            case BandType::BandPass:  return BiquadCoeffs::makeBandPass(sr, f, q);
+            case BandType::Tilt:      return BiquadCoeffs::makeTilt(sr, f, g);
         }
         return {};
     }
@@ -668,7 +668,7 @@ public:
      * sanitization (frequency and Q floors). Requires prepare().
      * @param stages Output buffer (capacity >= 5).
      */
-    [[nodiscard]] int buildBandStages(const BandConfig& cfg, BiquadCoeffs<T>* stages) const noexcept
+    [[nodiscard]] int buildBandStages(const BandConfig& cfg, BiquadCoeffs* stages) const noexcept
     {
         const double sr = spec_.sampleRate;
         // Mirror the FilterEngine's own clamps so the analysis matches the audio.
@@ -682,13 +682,13 @@ public:
             auto casc = FilterEngine<T>::cascadeForSlope(cfg.slope, static_cast<float>(q));
             int n = 0;
             if (casc.hasFirstOrder)
-                stages[n++] = lp ? BiquadCoeffs<T>::makeFirstOrderLowPass(sr, f)
-                                 : BiquadCoeffs<T>::makeFirstOrderHighPass(sr, f);
+                stages[n++] = lp ? BiquadCoeffs::makeFirstOrderLowPass(sr, f)
+                                 : BiquadCoeffs::makeFirstOrderHighPass(sr, f);
             for (int s = 0; s < casc.numSecondOrder; ++s)
             {
                 const double stageQ = static_cast<double>(casc.qValues[s]);
-                stages[n++] = lp ? BiquadCoeffs<T>::makeLowPass(sr, f, stageQ)
-                                 : BiquadCoeffs<T>::makeHighPass(sr, f, stageQ);
+                stages[n++] = lp ? BiquadCoeffs::makeLowPass(sr, f, stageQ)
+                                 : BiquadCoeffs::makeHighPass(sr, f, stageQ);
             }
             return n;
         }
@@ -726,16 +726,16 @@ protected:
         {
             if (!configs_[b].enabled) continue;
 
-            BiquadCoeffs<T> st[5];
+            BiquadCoeffs st[5];
             const int ns = buildBandStages(configs_[b], st);
 
             for (int k = 0; k < numBins; ++k)
             {
                 const double freq = sr * static_cast<double>(k) / static_cast<double>(lpFftSize_);
-                T m = T(1);
+                double m = 1.0;
                 for (int s = 0; s < ns; ++s)
                     m *= st[s].getMagnitude(freq, sr);
-                mag[k] *= m;
+                mag[k] = static_cast<T>(static_cast<double>(mag[k]) * m);
             }
         }
 

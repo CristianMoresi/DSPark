@@ -125,8 +125,8 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 |---|---|
 | `StateVariableFilter<T>` | TPT SVF: 8 modes (LP/HP/BP/Notch/AP/Bell/LowShelf/HighShelf), simultaneous multi-output |
 | `LadderFilter<T>` | Moog-style 4-pole TPT filter, 6 modes, drive, self-oscillation |
-| `Biquad<T>` | TDF-II biquad with 9 coefficient types and lock-free auto-promote of staged coefficients |
-| `BiquadCoeffs<T>` | Standalone factory for biquad coefficients (LP, HP, BP, Peak, Shelf, Notch, AP, Tilt, DC blocker) |
+| `Biquad<T>` | TDF-II biquad with 9 coefficient types and lock-free auto-promote of staged coefficients; the filter core is double whatever `T` is, so a corner far below the sample rate keeps its poles where they were designed |
+| `BiquadCoeffs` | Standalone factory for biquad coefficients (LP, HP, BP, Peak, Shelf, Notch, AP, Tilt), always double |
 | `FFTComplex<T>` / `FFTReal<T>` | Radix-2 FFT with SIMD (SSE3/NEON), real-optimised |
 | `Convolver<T>` | Partitioned overlap-save FFT convolution |
 | `ZeroLatencyConvolver<T>` | Gardner non-uniform partitioning: zero-latency convolution with time-distributed tail FFTs (flat CPU even for second-long IRs) |

@@ -107,7 +107,7 @@ int main()
     }
     {
         dspark::Biquad<float> bq;
-        bq.setCoeffs(dspark::BiquadCoeffs<float>::makeLowPass(kRate, 1000.0));
+        bq.setCoeffs(dspark::BiquadCoeffs::makeLowPass(kRate, 1000.0));
         dspark::AudioBuffer<float> mono;
         mono.resize(1, kBlock);
         printRow("Biquad low-pass (mono)", medianNsPerFrame([&] {

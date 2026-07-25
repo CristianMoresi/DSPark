@@ -158,7 +158,7 @@ public:
         // (real machines roll off there; also blocks remanence DC).
         outHp_.assign(static_cast<size_t>(numChannels_), {});
         {
-            const auto hc = BiquadCoeffs<double>::makeHighPass(sampleRate_, 24.0, 0.707);
+            const auto hc = BiquadCoeffs::makeHighPass(sampleRate_, 24.0, 0.707);
             for (auto& h : outHp_)
                 h = PeakSection { hc.b0, hc.b1, hc.b2, hc.a1, hc.a2, 0.0, 0.0 };
         }
@@ -798,7 +798,7 @@ private:
         const double bumpHz = (speed == Speed::IPS_7_5) ? 45.0
                             : (speed == Speed::IPS_15) ? 90.0 : 180.0;
         const double bumpDb = 2.5 * bumpAmt;
-        const auto bc = BiquadCoeffs<double>::makePeak(sampleRate_, bumpHz, 0.9, bumpDb);
+        const auto bc = BiquadCoeffs::makePeak(sampleRate_, bumpHz, 0.9, bumpDb);
         for (auto& b : headBump_)
         {
             const double pz1 = b.z1, pz2 = b.z2;

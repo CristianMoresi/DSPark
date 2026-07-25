@@ -463,19 +463,19 @@ private:
                             updateDynamicPeakCoeffs(b, currentGain);
                             break;
                         case BandShape::LowShelf:
-                            bandFilter_[b].setCoeffs(BiquadCoeffs<T>::makeLowShelf(
+                            bandFilter_[b].setCoeffs(BiquadCoeffs::makeLowShelf(
                                 currentFs, static_cast<double>(states_[b].cfg.frequency),
                                 static_cast<double>(currentGain)));
                             break;
                         case BandShape::HighShelf:
-                            bandFilter_[b].setCoeffs(BiquadCoeffs<T>::makeHighShelf(
+                            bandFilter_[b].setCoeffs(BiquadCoeffs::makeHighShelf(
                                 currentFs, static_cast<double>(states_[b].cfg.frequency),
                                 static_cast<double>(currentGain)));
                             break;
                         }
                     }
                     else
-                        bandFilter_[b].setCoeffs(BiquadCoeffs<T>{}); // Bypass
+                        bandFilter_[b].setCoeffs(BiquadCoeffs{}); // Bypass
                 }
 
                 if ((i & 63) == 0) // Sub-sample metering update
@@ -557,21 +557,23 @@ private:
         switch (cfg.shape)
         {
         case BandShape::Bell:
-            bandDetector_[b].setCoeffs(BiquadCoeffs<T>::makeBandPass(fs, cfg.frequency, cfg.q));
+            bandDetector_[b].setCoeffs(BiquadCoeffs::makeBandPass(fs, cfg.frequency, cfg.q));
             break;
         case BandShape::LowShelf:
-            bandDetector_[b].setCoeffs(BiquadCoeffs<T>::makeLowPass(fs, cfg.frequency, T(0.707)));
+            bandDetector_[b].setCoeffs(BiquadCoeffs::makeLowPass(fs, cfg.frequency, T(0.707)));
             break;
         case BandShape::HighShelf:
-            bandDetector_[b].setCoeffs(BiquadCoeffs<T>::makeHighPass(fs, cfg.frequency, T(0.707)));
+            bandDetector_[b].setCoeffs(BiquadCoeffs::makeHighPass(fs, cfg.frequency, T(0.707)));
             break;
         }
 
         // Precompute the freq/Q-dependent peak-EQ terms ONCE per parameter change
         // (cos w0 and alpha), so the per-block dynamic update needs only a pow().
+        // Double, like the rest of the coefficient path: the design is only
+        // ever as good as the arithmetic that builds it.
         const double w0 = 2.0 * 3.14159265358979323846 * static_cast<double>(cfg.frequency) / fs;
-        precomputedCos_[b]   = static_cast<T>(std::cos(w0));
-        precomputedAlpha_[b] = static_cast<T>(std::sin(w0) / (2.0 * std::max(static_cast<double>(cfg.q), 0.001)));
+        precomputedCos_[b]   = std::cos(w0);
+        precomputedAlpha_[b] = std::sin(w0) / (2.0 * std::max(static_cast<double>(cfg.q), 0.001));
 
         auto calcCoeff = [fs](T ms) -> T {
             const double tauSec = std::max(static_cast<double>(ms), 0.01) / 1000.0;
@@ -587,17 +589,17 @@ private:
     /** @brief Fast peak-EQ coefficient update from precomputed cos/alpha + gain. */
     void updateDynamicPeakCoeffs(int b, T gainDb) noexcept
     {
-        const T A     = std::pow(T(10), gainDb / T(40));
-        const T cosw  = precomputedCos_[b];
-        const T alpha = precomputedAlpha_[b];
-        const T a0Inv = T(1) / (T(1) + alpha / A);
+        const double A     = std::pow(10.0, static_cast<double>(gainDb) / 40.0);
+        const double cosw  = precomputedCos_[b];
+        const double alpha = precomputedAlpha_[b];
+        const double a0Inv = 1.0 / (1.0 + alpha / A);
 
-        BiquadCoeffs<T> c;
-        c.b0 = (T(1) + alpha * A) * a0Inv;
-        c.b1 = (T(-2) * cosw)     * a0Inv;
-        c.b2 = (T(1) - alpha * A) * a0Inv;
-        c.a1 = (T(-2) * cosw)     * a0Inv;
-        c.a2 = (T(1) - alpha / A) * a0Inv;
+        BiquadCoeffs c;
+        c.b0 = (1.0 + alpha * A) * a0Inv;
+        c.b1 = (-2.0 * cosw)     * a0Inv;
+        c.b2 = (1.0 - alpha * A) * a0Inv;
+        c.a1 = (-2.0 * cosw)     * a0Inv;
+        c.a2 = (1.0 - alpha / A) * a0Inv;
         bandFilter_[b].setCoeffs(c);
     }
 
@@ -624,8 +626,8 @@ private:
     std::array<BandState, MaxBands> states_ {};
     // Precomputed freq/Q-dependent peak-EQ trig terms (per band) so the per-block
     // dynamic gain update needs only a pow(), not cos/sin/pow every sample.
-    std::array<T, MaxBands> precomputedCos_ {};
-    std::array<T, MaxBands> precomputedAlpha_ {};
+    std::array<double, MaxBands> precomputedCos_ {};
+    std::array<double, MaxBands> precomputedAlpha_ {};
 
     // Biquads must span the class's full channel capacity (kMaxChannels); the
     // default Biquad<T> is only 8 channels, which would index its per-channel state

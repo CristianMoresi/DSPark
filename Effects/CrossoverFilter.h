@@ -430,17 +430,17 @@ private:
      * the -90 degree point at the mirrored frequency fs/2 - f, so the LR12
      * phase correction was wrong across the whole band.
      */
-    [[nodiscard]] static BiquadCoeffs<T> makeFirstOrderAllPass(double sampleRate, double freq) noexcept
+    [[nodiscard]] static BiquadCoeffs makeFirstOrderAllPass(double sampleRate, double freq) noexcept
     {
         freq = std::clamp(freq, 1.0, std::max(1.0, sampleRate * 0.499));
         const double w = std::tan(std::numbers::pi * freq / sampleRate);
         const double a = (w - 1.0) / (w + 1.0);
-        BiquadCoeffs<T> coeffs;
-        coeffs.b0 = static_cast<T>(a);
-        coeffs.b1 = static_cast<T>(1.0);
-        coeffs.b2 = T(0);
-        coeffs.a1 = static_cast<T>(a);
-        coeffs.a2 = T(0);
+        BiquadCoeffs coeffs;
+        coeffs.b0 = a;
+        coeffs.b1 = 1.0;
+        coeffs.b2 = 0.0;
+        coeffs.a1 = a;
+        coeffs.a2 = 0.0;
         return coeffs;
     }
 
@@ -513,8 +513,8 @@ private:
                 for (int s = 0; s < numSplits; ++s)
                 {
                     double f = clampSplitFreq(static_cast<double>(frequencies_[s]), sr);
-                    auto lpC = BiquadCoeffs<T>::makeFirstOrderLowPass(sr, f);
-                    auto hpC = BiquadCoeffs<T>::makeFirstOrderHighPass(sr, f);
+                    auto lpC = BiquadCoeffs::makeFirstOrderLowPass(sr, f);
+                    auto hpC = BiquadCoeffs::makeFirstOrderHighPass(sr, f);
                     auto apC = makeFirstOrderAllPass(sr, f);
 
                     // LR12 sums flat only with the high branch polarity
@@ -541,9 +541,9 @@ private:
                 for (int s = 0; s < numSplits; ++s)
                 {
                     double f = clampSplitFreq(static_cast<double>(frequencies_[s]), sr);
-                    auto lpC = BiquadCoeffs<T>::makeLowPass(sr, f, 0.7071);
-                    auto hpC = BiquadCoeffs<T>::makeHighPass(sr, f, 0.7071);
-                    auto apC = BiquadCoeffs<T>::makeAllPass(sr, f, 0.7071);
+                    auto lpC = BiquadCoeffs::makeLowPass(sr, f, 0.7071);
+                    auto hpC = BiquadCoeffs::makeHighPass(sr, f, 0.7071);
+                    auto apC = BiquadCoeffs::makeAllPass(sr, f, 0.7071);
 
                     for (int st = 0; st < 2; ++st)
                     {
@@ -569,14 +569,14 @@ private:
 
                     for (int st = 0; st < 4; ++st)
                     {
-                        splits_[s].lp[st].setCoeffs(BiquadCoeffs<T>::makeLowPass(sr, f, qArr[st]));
-                        splits_[s].hp[st].setCoeffs(BiquadCoeffs<T>::makeHighPass(sr, f, qArr[st]));
+                        splits_[s].lp[st].setCoeffs(BiquadCoeffs::makeLowPass(sr, f, qArr[st]));
+                        splits_[s].hp[st].setCoeffs(BiquadCoeffs::makeHighPass(sr, f, qArr[st]));
                     }
                     for (int b = 0; b < s; ++b)
                     {
                         auto& chain = allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)];
-                        chain.stages[0].setCoeffs(BiquadCoeffs<T>::makeAllPass(sr, f, q1));
-                        chain.stages[1].setCoeffs(BiquadCoeffs<T>::makeAllPass(sr, f, q2));
+                        chain.stages[0].setCoeffs(BiquadCoeffs::makeAllPass(sr, f, q1));
+                        chain.stages[1].setCoeffs(BiquadCoeffs::makeAllPass(sr, f, q2));
                     }
                 }
                 break;
@@ -643,17 +643,20 @@ private:
                 for (int ch = 0; ch < nCh; ++ch)
                 {
                     T* workCh = getWorkBufChannel(ch);
-                    T sample = workCh[i];
+                    const double sample = static_cast<double>(workCh[i]);
 
-                    T lpSample = sample;
+                    // The cascade stays in the biquad core's own precision:
+                    // re-quantising to T between stages would put the
+                    // reconstruction error back where the double core removed it.
+                    double lpSample = sample;
                     for (int st = 0; st < numStagesPerFilter_; ++st)
-                        lpSample = splits_[s].lp[st].processSample(lpSample, ch);
-                    outputs[s].getChannel(ch)[offset + i] = lpSample;
+                        lpSample = splits_[s].lp[st].processSampleCore(lpSample, ch);
+                    outputs[s].getChannel(ch)[offset + i] = static_cast<T>(lpSample);
 
-                    T hpSample = sample;
+                    double hpSample = sample;
                     for (int st = 0; st < numStagesPerFilter_; ++st)
-                        hpSample = splits_[s].hp[st].processSample(hpSample, ch);
-                    workCh[i] = hpSample;
+                        hpSample = splits_[s].hp[st].processSampleCore(hpSample, ch);
+                    workCh[i] = static_cast<T>(hpSample);
                 }
             }
         }
@@ -673,10 +676,10 @@ private:
                 {
                     for (int ch = 0; ch < nCh; ++ch)
                     {
-                        T sample = outputs[b].getChannel(ch)[offset + i];
+                        double sample = static_cast<double>(outputs[b].getChannel(ch)[offset + i]);
                         for (int st = 0; st < numStagesAllpass_; ++st)
-                            sample = allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages[st].processSample(sample, ch);
-                        outputs[b].getChannel(ch)[offset + i] = sample;
+                            sample = allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages[st].processSampleCore(sample, ch);
+                        outputs[b].getChannel(ch)[offset + i] = static_cast<T>(sample);
                     }
                 }
             }

@@ -528,7 +528,7 @@ private:
 
         /** Installs the reference-flattening EQ for one stage count. */
         void setFlattenCoeffs(int stageCount,
-                              const std::array<BiquadCoeffs<double>, 3>& c) noexcept
+                              const std::array<BiquadCoeffs, 3>& c) noexcept
         {
             auto& set = flatten[static_cast<size_t>(stageCount - 1)];
             for (int k = 0; k < 3; ++k)
@@ -712,10 +712,10 @@ private:
             const double mid = (gainDb[2] + gainDb[3] + gainDb[4]) / 3.0 - mean;
             const double hi = 0.5 * (gainDb[5] + gainDb[6]) - mean;
 
-            std::array<BiquadCoeffs<double>, 3> fc = {
-                BiquadCoeffs<double>::makeLowShelf(fs2_, 180.0, -lo),
-                BiquadCoeffs<double>::makePeak(fs2_, 800.0, 0.55, -mid),
-                BiquadCoeffs<double>::makeHighShelf(fs2_, 4500.0, -hi)
+            std::array<BiquadCoeffs, 3> fc = {
+                BiquadCoeffs::makeLowShelf(fs2_, 180.0, -lo),
+                BiquadCoeffs::makePeak(fs2_, 800.0, 0.55, -mid),
+                BiquadCoeffs::makeHighShelf(fs2_, 4500.0, -hi)
             };
             for (auto& ch : channels_)
                 ch->setFlattenCoeffs(st, fc);

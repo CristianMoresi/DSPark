@@ -423,7 +423,7 @@
  * | `AudioBufferView<T>`     | Core/AudioBuffer.h        | Non-owning view -- what processors receive        |
  * | `AudioSpec`              | Core/AudioSpec.h          | Audio environment descriptor (rate, block, channels) |
  * | `Biquad<T>`              | Core/Biquad.h             | Single biquad filter with 9 coefficient types     |
- * | `BiquadCoeffs<T>`        | Core/Biquad.h             | Filter coefficient calculator (Audio EQ Cookbook)  |
+ * | `BiquadCoeffs`           | Core/Biquad.h             | Filter coefficient calculator (Audio EQ Cookbook)  |
  * | `FFTReal<T>`             | Core/FFT.h                | Radix-2 FFT with SIMD (SSE2/NEON), real-optimised |
  * | `FIRFilter<T>`           | Core/FIRFilter.h          | FIR filter with windowed-sinc design              |
  * | `Convolver<T>`           | Core/Convolver.h          | Partitioned overlap-save FFT convolution          |

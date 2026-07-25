@@ -380,7 +380,7 @@ private:
         // HF bell: Jensen-style leakage resonance mapped into the top octave.
         const double bellHz = std::min(12000.0 + 6000.0 * res, 0.42 * sampleRate_);
         const double bellDb = 2.5 * res;
-        const auto bc = BiquadCoeffs<double>::makePeak(sampleRate_, bellHz, 0.8, bellDb);
+        const auto bc = BiquadCoeffs::makePeak(sampleRate_, bellHz, 0.8, bellDb);
         for (auto& ch : channels_)
         {
             const double pz1 = ch.bell.z1, pz2 = ch.bell.z2;

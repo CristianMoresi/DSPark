@@ -1175,3 +1175,70 @@ DSPARK_TEST(Oscillator_sync_reengage_is_clean)
         if (a.getNextSample() != b.getNextSample()) ++mismatches;
     EXPECT_EQ(mismatches, 0);
 }
+
+// ===========================================================================
+// M-003 AG-8 audit regression pins (additive; CHANGE-REQUEST recorded in
+// builder-report.002.json). These guard the shipped fixes so the CI suite goes
+// red if any is reverted -- the audit probe (audit_ag8.cpp) is not wired into
+// ctest, so the permanence lives here.
+// ===========================================================================
+
+// D-M003-1: pink noise must measure ~-3 dB/oct across the audio band. The prior
+// 3-of-7-pole filter produced -5 dB/oct; this pins the full Kellett filter.
+DSPARK_TEST(AnalogRandom_pink_slope_is_minus3_dB_per_octave)
+{
+    using dspark::AnalogRandom::Generator;
+    using dspark::AnalogRandom::NoiseType;
+
+    const double fs = 48000.0; const int N = 8192; const int segs = 48;
+    Generator<float> g(12345);
+    g.prepare(fs);
+    g.setNoiseType(NoiseType::Pink);
+    g.setRateHz(static_cast<float>(fs)); // fresh sample every tick -> continuous noise
+    g.setRange(-1.0f, 1.0f);
+    g.setSmoothing(false);
+
+    std::vector<double> psd(static_cast<size_t>(N / 2 + 1), 0.0);
+    std::vector<float> win(static_cast<size_t>(N));
+    WindowFunctions<float>::hann(win.data(), N, true);
+    double wp = 0.0; for (int i = 0; i < N; ++i) wp += double(win[static_cast<size_t>(i)]) * win[static_cast<size_t>(i)];
+    FFTReal<float> fft(static_cast<size_t>(N));
+    std::vector<float> buf(static_cast<size_t>(N)), freq(static_cast<size_t>(N + 2)), mag(static_cast<size_t>(N / 2 + 1));
+    for (int s = 0; s < segs; ++s)
+    {
+        for (int i = 0; i < N; ++i) buf[static_cast<size_t>(i)] = g.getNextSample() * win[static_cast<size_t>(i)];
+        fft.forward(buf.data(), freq.data());
+        fft.computeMagnitudes(freq.data(), mag.data());
+        for (int k = 0; k <= N / 2; ++k) psd[static_cast<size_t>(k)] += double(mag[static_cast<size_t>(k)]) * double(mag[static_cast<size_t>(k)]);
+    }
+    double sx = 0, sy = 0, sxx = 0, sxy = 0; int n = 0;
+    for (int k = 1; k <= N / 2; ++k)
+    {
+        const double f = k * fs / N; if (f < 100.0 || f > 8000.0) continue;
+        const double x = std::log2(f);
+        const double y = 10.0 * std::log10(psd[static_cast<size_t>(k)] / segs / wp + 1e-30);
+        sx += x; sy += y; sxx += x * x; sxy += x * y; ++n;
+    }
+    const double slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    EXPECT_GT(slope, -3.75);
+    EXPECT_LT(slope, -2.25);
+}
+
+// D-M003-2: setFrequency(NaN) must not poison the oscillator (std::clamp(NaN)
+// returns NaN); output stays finite and a valid frequency afterwards recovers.
+DSPARK_TEST(Oscillator_setFrequency_NaN_recovers_finite)
+{
+    Oscillator<float> osc; osc.prepare(48000.0);
+    osc.setWaveform(Oscillator<float>::Waveform::Sine);
+    osc.setFrequency(std::numeric_limits<float>::quiet_NaN());
+
+    bool allFinite = true;
+    for (int i = 0; i < 256; ++i) if (!std::isfinite(osc.getNextSample())) allFinite = false;
+    EXPECT_TRUE(allFinite);
+
+    osc.setFrequency(440.0f); // recovery
+    double energy = 0.0;
+    for (int i = 0; i < 512; ++i) { const float s = osc.getNextSample(); if (!std::isfinite(s)) allFinite = false; energy += double(s) * s; }
+    EXPECT_TRUE(allFinite);
+    EXPECT_GT(energy, 1.0);
+}

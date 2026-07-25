@@ -11,6 +11,7 @@
 #include "../DSPark.h"
 
 #include <clocale>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -348,4 +349,54 @@ DSPARK_TEST(State_json_is_locale_independent)
     StateReader r(back.data(), back.size());
     EXPECT_NEAR(r.read("half", 0.0f), 0.5f, 1e-9f);
     EXPECT_NEAR(r.read("freq", 0.0f), 1234.567f, 1e-3f);
+}
+
+// ===========================================================================
+// M-003 AG-8 audit regression pins (additive; CHANGE-REQUEST recorded in
+// builder-report.002.json). Guard the StateBlob JSON-helper fixes.
+// ===========================================================================
+
+// D-M003-4a: keys needing JSON escaping must produce valid (escaped) JSON and
+// round-trip losslessly (writer escapes, reader unescapes symmetrically).
+DSPARK_TEST(State_json_escapes_hostile_keys_and_roundtrips)
+{
+    StateWriter w(0x4B455931u, 1);
+    w.write("a\"b\\c", 0.5f);          // embedded quote + backslash
+    w.write("ctrl\x01\x1f", 0.25f);    // control characters
+    const auto blob = w.blob();
+
+    const std::string json = stateToJson(blob);
+    EXPECT_TRUE(json.find("\\\"") != std::string::npos);      // escaped quote
+    EXPECT_TRUE(json.find("\\\\") != std::string::npos);      // escaped backslash
+    EXPECT_TRUE(json.find("\\u0001") != std::string::npos);   // escaped control
+    // no raw control byte leaked into the JSON text
+    EXPECT_TRUE(json.find('\x01') == std::string::npos);
+
+    const auto back = stateFromJson(json);
+    EXPECT_TRUE(!back.empty());
+    StateReader r(back.data(), back.size());
+    EXPECT_TRUE(r.isValid());
+    EXPECT_NEAR(r.read("a\"b\\c", 0.0f), 0.5f, 1e-6f);
+    EXPECT_NEAR(r.read("ctrl\x01\x1f", 0.0f), 0.25f, 1e-6f);
+}
+
+// D-M003-4b: a non-finite float payload must render as legal JSON (never bare
+// nan/inf) and still parse back (rendered as 0).
+DSPARK_TEST(State_json_non_finite_float_is_legal)
+{
+    StateWriter w(0x4E414E31u, 1);
+    w.write("bad", std::numeric_limits<float>::quiet_NaN());
+    w.write("big", std::numeric_limits<float>::infinity());
+    w.write("neg", -std::numeric_limits<float>::infinity());
+    const auto blob = w.blob();
+
+    const std::string json = stateToJson(blob);
+    EXPECT_TRUE(json.find("nan") == std::string::npos);
+    EXPECT_TRUE(json.find("inf") == std::string::npos);
+
+    const auto back = stateFromJson(json);
+    EXPECT_TRUE(!back.empty());
+    StateReader r(back.data(), back.size());
+    EXPECT_TRUE(r.isValid());
+    EXPECT_NEAR(r.read("bad", -1.0f), 0.0f, 1e-9f); // non-finite -> 0
 }

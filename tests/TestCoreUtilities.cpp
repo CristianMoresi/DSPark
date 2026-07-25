@@ -1586,3 +1586,39 @@ DSPARK_TEST(ModulationRouter_contracts)
     cap.clear();
     EXPECT_EQ(static_cast<int>(token.use_count()), 1);
 }
+
+// ===========================================================================
+// M-003 AG-8 audit regression pins (additive; CHANGE-REQUEST recorded in
+// builder-report.002.json). Guard the shipped fixes in the CI suite.
+// ===========================================================================
+
+// D-M003-3b: a buffer wider than the 16-channel view default must not silently
+// drop channels through toView() (regression guard: toView now propagates
+// MaxChannels as the view's channel capacity).
+DSPARK_TEST(AudioBuffer_toView_preserves_channels_beyond_default_width)
+{
+    AudioBuffer<float, 32> wide;
+    wide.resize(20, 16);
+    EXPECT_EQ(wide.toView().getNumChannels(), 20);
+    EXPECT_EQ(wide.toView().getNumSamples(), 16);
+    // const overload preserves them too
+    const AudioBuffer<float, 32>& cref = wide;
+    EXPECT_EQ(cref.toView().getNumChannels(), 20);
+}
+
+// D-M003-5: a transient non-finite modulation source must not poison a route;
+// the one-pole holds the last good value (matches DryWetMixer's guard).
+DSPARK_TEST(ModulationRouter_holds_last_value_on_nonfinite_source)
+{
+    ModulationRouter<float, 2> router;
+    float src = 0.3f; float out = -1.0f;
+    router.addRoute([&] { return src; }, [&](float v) { out = v; }, 1.0f, 0.0f, 0.0f);
+    router.update(64, 48000.0);
+    const float good = out;
+    EXPECT_TRUE(std::isfinite(good));
+
+    src = std::numeric_limits<float>::quiet_NaN();
+    router.update(64, 48000.0);
+    EXPECT_TRUE(std::isfinite(out));
+    EXPECT_EQ(out, good); // held, not poisoned
+}

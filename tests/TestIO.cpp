@@ -8,6 +8,7 @@
 #include "../IO/Mp3File.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -650,4 +651,91 @@ DSPARK_TEST(WavFile_8bit_and_int32_roundtrip)
         for (int i = 0; i < N; ++i)
             EXPECT_NEAR(back.getChannel(0)[i], expected[i], 2e-7f);
     }
+}
+
+// ============================================================================
+// Mp3File - part2_3_length budget (ISO 11172-3, 2.4.1.7)
+// ============================================================================
+
+namespace {
+
+// Minimal MSB-first bit packer for hand-crafting an MP3 frame.
+struct Mp3TestBits
+{
+    std::vector<uint8_t> bytes;
+    size_t bitPos = 0;
+    void put(uint32_t val, int n)
+    {
+        for (int i = n - 1; i >= 0; --i)
+        {
+            size_t byteIdx = bitPos >> 3;
+            while (byteIdx >= bytes.size()) bytes.push_back(0);
+            int bitIdx = 7 - int(bitPos & 7);
+            if ((val >> unsigned(i)) & 1u) bytes[byteIdx] |= uint8_t(1u << bitIdx);
+            ++bitPos;
+        }
+    }
+};
+
+} // namespace
+
+DSPARK_TEST(Mp3File_part23_budget_includes_scalefactor_bits)
+{
+    // part2_3_length counts scalefactor bits AND Huffman bits. This frame
+    // carries scalefac_compress=15 (74 scalefactor bits), big_values=0 and
+    // part2_3_length=74: the granule holds NO Huffman data at all, so a
+    // correct decoder produces exact silence. The filler bits after the
+    // scalefactors are valid count1 quads on purpose - a decoder that
+    // budgets part2_3_length AFTER the scalefactors (the old bug) reads 74
+    // bits of them as spurious spectral values and produces audible energy
+    // (measured 2568 total |pcm| across 4 frames before the fix).
+    FileCleanup cleanup { "dspark_test_crafted.mp3" };
+
+    Mp3TestBits b;
+    // Header: MPEG-1 Layer III, no CRC, 64 kbps, 48 kHz, mono
+    b.put(0x7FF, 11); b.put(3, 2); b.put(1, 2); b.put(1, 1);
+    b.put(5, 4); b.put(1, 2); b.put(0, 1); b.put(0, 1);
+    b.put(3, 2); b.put(0, 2); b.put(0, 1); b.put(1, 1); b.put(0, 2);
+    // Side info (mono, 17 bytes)
+    b.put(0, 9); b.put(0, 5); b.put(0, 4);
+    // granule 0: 74 scalefactor bits only
+    b.put(74, 12); b.put(0, 9); b.put(210, 8); b.put(15, 4); b.put(0, 1);
+    b.put(1, 5); b.put(0, 5); b.put(0, 5); b.put(0, 4); b.put(0, 3);
+    b.put(0, 1); b.put(0, 1); b.put(0, 1);
+    // granule 1: fully silent
+    b.put(0, 12); b.put(0, 9); b.put(210, 8); b.put(0, 4); b.put(0, 1);
+    b.put(0, 5); b.put(0, 5); b.put(0, 5); b.put(0, 4); b.put(0, 3);
+    b.put(0, 1); b.put(0, 1); b.put(0, 1);
+    // Main data: 74 zero scalefactor bits, then count1-table-A quads
+    // (code 0111 + sign 0) that must never be read.
+    b.put(0, 32); b.put(0, 32); b.put(0, 10);
+    for (int i = 0; i < 40; ++i) b.put(0b01110, 5);
+
+    std::vector<uint8_t> frame = b.bytes;
+    frame.resize(192, 0); // 144 * 64000 / 48000
+
+    {
+        std::ofstream f("dspark_test_crafted.mp3", std::ios::binary | std::ios::trunc);
+        for (int i = 0; i < 4; ++i)
+            f.write(reinterpret_cast<const char*>(frame.data()),
+                    static_cast<std::streamsize>(frame.size()));
+    }
+
+    Mp3File r;
+    EXPECT_TRUE(r.openRead("dspark_test_crafted.mp3"));
+    auto info = r.getInfo();
+    EXPECT_NEAR(info.sampleRate, 48000.0, 1e-9);
+    EXPECT_EQ(info.numChannels, 1u);
+    EXPECT_EQ(info.bitsPerSample, 32); // delivery format, not "16"
+    EXPECT_TRUE(info.isFloatingPoint);
+
+    AudioBuffer<float> buf;
+    buf.resize(1, static_cast<int>(info.numSamples));
+    EXPECT_TRUE(r.readSamples(buf.toView()));
+    r.close();
+
+    double energy = 0.0;
+    for (int i = 0; i < static_cast<int>(info.numSamples); ++i)
+        energy += std::fabs(double(buf.getChannel(0)[i]));
+    EXPECT_NEAR(energy, 0.0, 1e-12); // exact silence; the old decoder measured 2568
 }

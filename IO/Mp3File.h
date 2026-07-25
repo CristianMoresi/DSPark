@@ -1,11 +1,11 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
 /**
  * @file Mp3File.h
- * @brief Pure C++20 MPEG-1 Layer III (MP3) codec — decoder and encoder.
+ * @brief Pure C++20 MPEG-1 Layer III (MP3) codec - decoder and encoder.
  *
  * Full MP3 codec supporting both reading and writing:
  *
@@ -13,17 +13,27 @@
  * - Sample rates: 32000, 44100, 48000 Hz
  * - Mono and stereo (including joint stereo with M/S and intensity)
  * - CBR and VBR, ID3v2 tag skipping
+ * - getInfo() reports the delivery format (32-bit float); MP3 itself has
+ *   no PCM bit depth
  *
  * **Encoder**: Encodes float audio to MPEG-1 Layer III CBR.
- * - Bitrates: 32–320 kbps (CBR)
- * - Mono and stereo at 32000, 44100, 48000 Hz
- * - Analysis polyphase filterbank + MDCT + Huffman coding
+ * - Bitrates: 32-320 kbps (CBR); AudioFileInfo::bitsPerSample carries the
+ *   requested bitrate in kbps and snaps to the nearest legal value
+ * - Mono and stereo; the sample rate snaps to 32000/44100/48000 Hz
+ * - Analysis polyphase filterbank + MDCT + Huffman coding, rate-controlled
+ *   by a uniform global-gain search (no psychoacoustic model)
  * - Produces standard-compliant MP3 playable by any decoder
  *
- * @warning DECODE-ALL ARCHITECTURE: Because MP3 uses a backward-referencing 
- * Bit Reservoir, random-access streaming is non-trivial. openRead() decodes 
- * the ENTIRE FILE into RAM. This operation takes time and blocks the thread. 
- * NEVER call openRead() from the real-time audio thread.
+ * @warning DECODE-ALL ARCHITECTURE: Because MP3 uses a backward-referencing
+ * Bit Reservoir, random-access streaming is non-trivial. openRead() decodes
+ * the ENTIRE FILE into RAM (input capped at 256 MB). This operation takes
+ * time and blocks the thread. NEVER call openRead() from the real-time
+ * audio thread.
+ *
+ * Threading: owner-managed. One instance serves one file from one thread at
+ * a time; no internal synchronization (see AudioFile.h).
+ *
+ * Dependencies: IO/AudioFile.h (Core/AudioBuffer.h, Core/AudioSpec.h).
  */
 
 #include "AudioFile.h"
@@ -59,7 +69,7 @@ public:
 
         auto fileSize = static_cast<size_t>(in.tellg());
         if (fileSize < 10) return false;
-        
+
         constexpr size_t kMaxMp3FileSize = 256 * 1024 * 1024;  // 256 MB bounds check
         if (fileSize > kMaxMp3FileSize) return false;
         in.seekg(0, std::ios::beg);
@@ -106,7 +116,7 @@ public:
 
         encBitrate_ = info_.bitsPerSample;
         if (encBitrate_ < 32) encBitrate_ = 128;
-        
+
         static constexpr int validBr[] = {32,40,48,56,64,80,96,112,128,160,192,224,256,320};
         int best = 128, bestDist = 999;
         for (int br : validBr) {
@@ -872,7 +882,7 @@ private:
     // One assertion per table: prefixFree() is O(n^2), so a single combined
     // expression over the four 256-entry tables would exceed MSVC's default
     // constexpr step budget. Split, each table evaluates well within the limit
-    // (no /constexpr:steps flag required — this stays a drop-in header).
+    // (no /constexpr:steps flag required - this stays a drop-in header).
     static_assert(prefixFree(kHuff01), "kHuff01 not prefix-free.");
     static_assert(prefixFree(kHuff02), "kHuff02 not prefix-free.");
     static_assert(prefixFree(kHuff03), "kHuff03 not prefix-free.");
@@ -912,7 +922,7 @@ private:
     // Synthesis & IMDCT Tables (ALIGNED FOR SIMD)
     // ========================================================================
 
-    alignas(32) static constexpr double kSynthWindow[512] = {
+    static constexpr double kSynthWindow[512] = {
          0.000000000, -0.000015259, -0.000015259, -0.000015259, -0.000015259, -0.000015259, -0.000015259, -0.000030518,
         -0.000030518, -0.000030518, -0.000030518, -0.000045776, -0.000045776, -0.000061035, -0.000061035, -0.000076294,
         -0.000076294, -0.000091553, -0.000106812, -0.000106812, -0.000122070, -0.000137329, -0.000152588, -0.000167847,
@@ -979,7 +989,7 @@ private:
          0.000030518,  0.000030518,  0.000015259,  0.000015259,  0.000015259,  0.000015259,  0.000015259,  0.000015259,
     };
 
-    alignas(32) static constexpr double kNormalWindow[36] = {
+    static constexpr double kNormalWindow[36] = {
         0.043619387, 0.130526192, 0.216439614, 0.300705800, 0.382683432, 0.461748613,
         0.537299608, 0.608761429, 0.675590208, 0.737277337, 0.793353340, 0.843391446,
         0.887010833, 0.923879533, 0.953716951, 0.976296007, 0.991444861, 0.999048222,
@@ -988,7 +998,7 @@ private:
         0.461748613, 0.382683432, 0.300705800, 0.216439614, 0.130526192, 0.043619387
     };
 
-    alignas(32) static constexpr double kStartWindow[36] = {
+    static constexpr double kStartWindow[36] = {
         0.043619387, 0.130526192, 0.216439614, 0.300705800, 0.382683432, 0.461748613,
         0.537299608, 0.608761429, 0.675590208, 0.737277337, 0.793353340, 0.843391446,
         0.887010833, 0.923879533, 0.953716951, 0.976296007, 0.991444861, 0.999048222,
@@ -997,7 +1007,7 @@ private:
         0.000000000, 0.000000000, 0.000000000, 0.000000000, 0.000000000, 0.000000000
     };
 
-    alignas(32) static constexpr double kStopWindow[36] = {
+    static constexpr double kStopWindow[36] = {
         0.000000000, 0.000000000, 0.000000000, 0.000000000, 0.000000000, 0.000000000,
         0.130526192, 0.382683432, 0.608761429, 0.793353340, 0.923879533, 0.991444861,
         1.000000000, 1.000000000, 1.000000000, 1.000000000, 1.000000000, 1.000000000,
@@ -1006,7 +1016,7 @@ private:
         0.461748613, 0.382683432, 0.300705800, 0.216439614, 0.130526192, 0.043619387
     };
 
-    alignas(32) static constexpr double kShortWindow[12] = {
+    static constexpr double kShortWindow[12] = {
         0.130526192, 0.382683432, 0.608761429, 0.793353340, 0.923879533, 0.991444861,
         0.991444861, 0.923879533, 0.793353340, 0.608761429, 0.382683432, 0.130526192
     };
@@ -1030,9 +1040,9 @@ private:
 
     struct ChannelState
     {
-        alignas(32) double prevBlock[576]    = {}; 
-        alignas(32) double synthBuf[1024]    = {}; 
-        int    synthOffset       = 0;  
+        double prevBlock[576]    = {};
+        double synthBuf[1024]    = {};
+        int    synthOffset       = 0;
     };
 
     std::vector<uint8_t> fileData_;
@@ -1040,7 +1050,7 @@ private:
     AudioFileInfo info_ {};
     bool isOpen_ = false;
 
-    std::vector<size_t> frameOffsets_; 
+    std::vector<size_t> frameOffsets_;
     std::vector<float> decodedSamplesFlat_; // Planar contiguous buffer [channel][sample]
 
     std::vector<uint8_t> reservoir_;
@@ -1053,14 +1063,14 @@ private:
 
     struct EncChannelState
     {
-        alignas(32) double analysisBuf[512] = {};
-        alignas(32) double mdctOverlap[32][18] = {};  
+        double analysisBuf[512] = {};
+        double mdctOverlap[32][18] = {};
     };
 
     std::ofstream outFile_;
     bool isWriting_ = false;
     int encBitrate_ = 128;
-    int encPaddingAccum_ = 0;      
+    int encPaddingAccum_ = 0;
     EncChannelState encState_[kChannelsMax] = {};
     double encInput_[kChannelsMax][kSamplesPerFrame] = {};
     int encInputPos_ = 0;
@@ -1118,7 +1128,8 @@ private:
         info_.sampleRate = static_cast<double>(sampleRate);
         info_.numChannels = channels;
         info_.numSamples = static_cast<int64_t>(frameOffsets_.size()) * kSamplesPerFrame;
-        info_.bitsPerSample = 16; 
+        // MP3 has no PCM bit depth; report the delivery format (32-bit float).
+        info_.bitsPerSample = 32;
         info_.isFloatingPoint = true;
         return true;
     }
@@ -1308,7 +1319,14 @@ private:
         return false;
     }
 
-    void huffmanDecode(BitReader& br, const GranuleChannel& gc, const FrameHeader& hdr, int is[576]) const
+    // part2_3_end is the ABSOLUTE bit position where this granule-channel's
+    // main data ends: part2_3_length counts scalefactor bits AND Huffman bits
+    // (ISO 11172-3, 2.4.1.7), so the caller anchors it BEFORE the
+    // scalefactors. Budgeting it after them (as this decoder once did)
+    // over-reads by the scalefactor bit count and decodes the next granule's
+    // bits as spurious count1 quads.
+    void huffmanDecode(BitReader& br, const GranuleChannel& gc, const FrameHeader& hdr,
+                       int is[576], size_t part2_3_end) const
     {
         std::memset(is, 0, 576 * sizeof(int));
         BandTable bands = getBandTable(hdr.sampleRate);
@@ -1316,7 +1334,7 @@ private:
         int region1Start, region2Start;
         if (gc.window_switching && gc.block_type == 2)
         {
-            region1Start = 36; 
+            region1Start = 36;
             region2Start = kSamplesPerGranule;
         }
         else
@@ -1328,7 +1346,6 @@ private:
         }
 
         int bigValuesEnd = std::min(gc.big_values * 2, 576);
-        size_t part2_3_end = br.getPos() + static_cast<size_t>(gc.part2_3_length);
 
         int idx = 0;
         for (; idx < bigValuesEnd && br.getPos() < part2_3_end; idx += 2)
@@ -1336,7 +1353,9 @@ private:
             int tableIdx = (idx < region1Start) ? gc.table_select[0] :
                            (idx < region2Start) ? gc.table_select[1] : gc.table_select[2];
             int x = 0, y = 0;
-            decodePair(br, tableIdx, x, y);
+            // Cannot fail with the complete (Kraft-verified) tables below;
+            // kept as a formal guard against running out of buffered bits.
+            if (!decodePair(br, tableIdx, x, y)) break;
             if (idx < 576)     is[idx] = x;
             if (idx + 1 < 576) is[idx + 1] = y;
         }
@@ -1402,10 +1421,10 @@ private:
         bitsRead = br.getPos() - startBits;
     }
 
-    void requantize(const int is[576], const int scalefac[39], const GranuleChannel& gc, 
+    void requantize(const int is[576], const int scalefac[39], const GranuleChannel& gc,
                     const FrameHeader& hdr, double xr[576]) const
     {
-        // BUGFIX: Increased size to 8208. Max legal value in table 23 is 8206. 
+        // BUGFIX: Increased size to 8208. Max legal value in table 23 is 8206.
         // 8192 previously caused out-of-bounds reads on peaks.
         static const std::array<double, 8208> kPow43 = [] {
             std::array<double, 8208> t{};
@@ -1500,7 +1519,7 @@ private:
         if (msStereo)
         {
             static constexpr double kInvSqrt2 = 0.7071067811865476;
-            int isEnd = 576; 
+            int isEnd = 576;
             if (iStereo)
             {
                 isEnd = 0;
@@ -2138,7 +2157,7 @@ private:
         int availBytes = frameSize - headerSize - sideInfoSize;
         int availBits = availBytes * 8;
 
-        double subbands[2][32][36] = {}; 
+        double subbands[2][32][36] = {};
         for (int ch = 0; ch < nch; ++ch)
         {
             for (int ts = 0; ts < 36; ++ts)
@@ -2150,8 +2169,8 @@ private:
         }
 
         SideInfo si {};
-        int ix[2][2][576] = {};    
-        double xr[2][2][576] = {}; 
+        int ix[2][2][576] = {};
+        double xr[2][2][576] = {};
 
         for (int gr = 0; gr < 2; ++gr)
         {
@@ -2199,9 +2218,9 @@ private:
                             bestBits = bits; bestGain = mid; gc = tmpGc;
                             std::memcpy(ix[gr][ch], tmpIx, sizeof(tmpIx));
                         }
-                        hi = mid - 1; 
+                        hi = mid - 1;
                     }
-                    else lo = mid + 1; 
+                    else lo = mid + 1;
                 }
                 gc.global_gain = bestGain;
                 gc.part2_3_length = bestBits;
@@ -2213,22 +2232,22 @@ private:
         BitWriter bw;
         bw.init(encFrameBuf_);
 
-        bw.writeBits(0xFFF, 12);       
-        bw.writeBits(1, 1);            
-        bw.writeBits(0b01, 2);         
-        bw.writeBits(1, 1);            
+        bw.writeBits(0xFFF, 12);
+        bw.writeBits(1, 1);
+        bw.writeBits(0b01, 2);
+        bw.writeBits(1, 1);
         bw.writeBits(static_cast<uint32_t>(brIdx), 4);
         bw.writeBits(static_cast<uint32_t>(srIdx), 2);
         bw.writeBits(padding ? 1u : 0u, 1);
-        bw.writeBits(0, 1);            
-        bw.writeBits(nch == 1 ? 3u : 0u, 2); 
-        bw.writeBits(0, 2);            
-        bw.writeBits(0, 1);            
-        bw.writeBits(1, 1);            
-        bw.writeBits(0, 2);            
+        bw.writeBits(0, 1);
+        bw.writeBits(nch == 1 ? 3u : 0u, 2);
+        bw.writeBits(0, 2);
+        bw.writeBits(0, 1);
+        bw.writeBits(1, 1);
+        bw.writeBits(0, 2);
 
-        bw.writeBits(0, 9);            
-        bw.writeBits(0, nch == 1 ? 5 : 3); 
+        bw.writeBits(0, 9);
+        bw.writeBits(0, nch == 1 ? 5 : 3);
 
         for (int ch = 0; ch < nch; ++ch) bw.writeBits(0, 4);
 
@@ -2241,7 +2260,7 @@ private:
                 bw.writeBits(static_cast<uint32_t>(gc.big_values), 9);
                 bw.writeBits(static_cast<uint32_t>(gc.global_gain), 8);
                 bw.writeBits(static_cast<uint32_t>(gc.scalefac_compress), 4);
-                bw.writeBits(0, 1);      
+                bw.writeBits(0, 1);
                 bw.writeBits(static_cast<uint32_t>(gc.table_select[0]), 5);
                 bw.writeBits(static_cast<uint32_t>(gc.table_select[1]), 5);
                 bw.writeBits(static_cast<uint32_t>(gc.table_select[2]), 5);
@@ -2300,8 +2319,10 @@ private:
         {
             size_t frameStart = frameOffsets_[frameIdx];
 
+            // A frame that fails to parse leaves its 1152-sample slot silent
+            // instead of shifting the rest of the file earlier in time.
             FrameHeader hdr {};
-            if (!parseFrameHeader(frameStart, hdr)) continue;
+            if (!parseFrameHeader(frameStart, hdr)) { sampleIdx += kSamplesPerFrame; continue; }
 
             size_t headerSize = 4 + (hdr.crcProtect ? 2 : 0);
 
@@ -2309,7 +2330,7 @@ private:
             siBr.init(fileData_.data() + frameStart + headerSize, static_cast<size_t>(hdr.sideInfoSize));
 
             SideInfo si {};
-            if (!parseSideInfo(siBr, hdr, si)) continue;
+            if (!parseSideInfo(siBr, hdr, si)) { sampleIdx += kSamplesPerFrame; continue; }
 
             size_t mainDataStart = frameStart + headerSize + static_cast<size_t>(hdr.sideInfoSize);
             size_t mainDataSize  = static_cast<size_t>(hdr.frameSize) - headerSize - static_cast<size_t>(hdr.sideInfoSize);
@@ -2373,10 +2394,13 @@ private:
                     size_t posBeforeSf = mainBr.getPos();
                     decodeScalefactors(mainBr, gc, gr, ch, si.scfsi[ch], scalefac[ch], sfBits);
 
+                    // part2_3_length spans scalefactors + Huffman data, so the
+                    // end position anchors at posBeforeSf. huffmanDecode also
+                    // leaves the reader exactly there (resync).
                     int is[576] = {};
-                    huffmanDecode(mainBr, gc, hdr, is);
+                    huffmanDecode(mainBr, gc, hdr, is,
+                                  posBeforeSf + static_cast<size_t>(gc.part2_3_length));
 
-                    mainBr.setPos(posBeforeSf + static_cast<size_t>(gc.part2_3_length));
                     requantize(is, scalefac[ch], gc, hdr, xr[ch]);
 
                     if (gr == 0)

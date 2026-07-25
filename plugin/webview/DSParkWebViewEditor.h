@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -9,7 +9,7 @@
  * in the host window through the platform web engine.
  *
  * Opt-in and additive: include this header BEFORE the format headers, set
- * `hasEditor = true` and serve your page from `editorHtml()` — the VST3,
+ * `hasEditor = true` and serve your page from `editorHtml()` - the VST3,
  * CLAP and AU backends then embed it inside the window the host provides
  * (AU through a Cocoa view factory announced via kAudioUnitProperty_CocoaUI).
  * Nothing else in the plugin class changes; plugins without this header keep
@@ -43,25 +43,25 @@
  * ```
  *
  * Platform engines:
- * - **Windows** — WebView2 (Edge runtime, present on Win10/11) through the
+ * - **Windows** - WebView2 (Edge runtime, present on Win10/11) through the
  *   vendored MIT webview library (webview/webview.h), embedded as a child
  *   window of the host's HWND. Requires exceptions enabled (plugins are).
- * - **macOS** — WKWebView created directly through the Objective-C runtime
+ * - **macOS** - WKWebView created directly through the Objective-C runtime
  *   (no headers, WebKit.framework loaded at runtime) and added as a subview
  *   of the host's NSView.
- * - **Linux** — WebKitGTK (GTK3) resolved entirely through dlopen at runtime
+ * - **Linux** - WebKitGTK (GTK3) resolved entirely through dlopen at runtime
  *   (no headers, no link-time dependency), embedded in the host's X11 window
- *   with GtkPlug/XEmbed — the same route LV2's suil takes. GTK is driven
+ *   with GtkPlug/XEmbed - the same route LV2's suil takes. GTK is driven
  *   from the HOST's run loop through Editor::pump() (VST3 IRunLoop timers /
  *   CLAP timer-support); a plugin must never spin its own GTK main loop.
  *   Systems without WebKitGTK (or hosts without a usable run loop) keep the
- *   host's generic parameter UI — the same plugin binary, unchanged.
+ *   host's generic parameter UI - the same plugin binary, unchanged.
  *
  * Threading: every editor call (create/destroy/resize/JS callbacks) runs on
  * the host's main/UI thread. Values flow UI -> DSP through the wrapper's
  * normalized shadows and the user's atomic `setParameter` (any-thread safe
  * by contract), and DSP -> UI by polling those shadows at ~30 Hz from the
- * page — no native timers, no locks, no allocation on the audio thread.
+ * page - no native timers, no locks, no allocation on the audio thread.
  */
 
 #if defined(DSPARK_PLUGIN_VST3_INCLUDED) || defined(DSPARK_PLUGIN_CLAP_INCLUDED) \
@@ -173,7 +173,7 @@ inline void debugLog(const char* format, ...) noexcept
 // The bridge protocol is small enough that a focused, locale-independent
 // formatter/parser beats dragging in a JSON library: host processes may run
 // with any LC_NUMERIC, where printf writes "6,5" (invalid JSON) and strtod
-// stops at the '.' — both classic plugin bugs.
+// stops at the '.' - both classic plugin bugs.
 
 /** @brief Appends a JSON string literal (quotes included, control chars escaped). */
 inline void appendJsonString(std::string& out, const char* s)
@@ -543,7 +543,7 @@ inline bool loadWebKit() noexcept
 //
 // Every entry point comes from ONE dlopen of libwebkit2gtk (GTK3, GLib and
 // JavaScriptCore are its dependencies, so dlsym on that handle resolves them
-// all): no GTK headers, no pkg-config, no link-time dependency — plugins
+// all): no GTK headers, no pkg-config, no link-time dependency - plugins
 // keep building with the plain C++ toolchain and simply report the editor
 // unavailable where WebKitGTK is missing. GTK3 is required for GtkPlug
 // (XEmbed into the host's X11 window); GTK4 removed it, which is why the
@@ -668,7 +668,7 @@ inline const Api& api() noexcept
 /**
  * @brief One embedded WebView editor instance for plugin class @p P. Owned
  * by the format backends (the VST3 IPlugView object, the CLAP gui
- * extension); plugin authors never touch this class — they only provide
+ * extension); plugin authors never touch this class - they only provide
  * `editorHtml()` and friends.
  *
  * Lifecycle (all on the host's main thread): `create(parent, ...)` builds
@@ -706,7 +706,7 @@ public:
     /**
      * Gives the engine main-loop time from the HOST's run loop. On Linux the
      * format backends call this at ~30 Hz (VST3 IRunLoop timer / CLAP
-     * timer-support) to iterate the GLib main context — a plugin must never
+     * timer-support) to iterate the GLib main context - a plugin must never
      * spin its own GTK loop inside a host. No-op on Windows/macOS, where the
      * host's native message loop already drives the engine.
      */
@@ -772,7 +772,7 @@ public:
      * cannot be queried (then the negotiated size is used as-is).
      *
      * Note on DPI: the web engine applies the window's scale factor itself
-     * (CSS pixels are device-independent), so the page never needs zooming —
+     * (CSS pixels are device-independent), so the page never needs zooming -
      * the wrapper only converts logical <-> physical for host negotiation.
      */
     bool queryParentSize(int& width, int& height) const noexcept
@@ -945,7 +945,7 @@ private:
     }
 
     // ==============================================================================
-    // Windows — WebView2 through the vendored webview library
+    // Windows - WebView2 through the vendored webview library
     // ==============================================================================
 #if DSPARK_WEBVIEW_BACKEND == 1
 
@@ -977,7 +977,7 @@ private:
                               reinterpret_cast<UINT_PTR>(this),
                               reinterpret_cast<DWORD_PTR>(this));
             // And the host's TOP-LEVEL frame: WM_GETMINMAXINFO/WM_SIZING are
-            // the OS-level drag limits — the only ones no host can bypass.
+            // the OS-level drag limits - the only ones no host can bypass.
             // VST3 size negotiation only governs the inner plugin area; the
             // outer frame belongs to the user, so min/max/aspect must be
             // enforced where the WINDOW is dragged (see rootGuard for docks).
@@ -1029,13 +1029,13 @@ private:
     /**
      * Only steer the top-level frame when the plugin area dominates it (a
      * floating plugin window). When the editor is docked inside a large host
-     * window, that frame is the DAW's own — hands off.
+     * window, that frame is the DAW's own - hands off.
      *
      * The chrome (frame + host bars around the plugin) is tracked as the
      * HISTORICAL MINIMUM of coherent measurements. That cuts the feedback
-     * loop by construction — dead space the host leaves around the plugin
+     * loop by construction - dead space the host leaves around the plugin
      * can only inflate a measurement, never deflate it, so the minimum
-     * converges on the real chrome — while staying re-evaluable (a single
+     * converges on the real chrome - while staying re-evaluable (a single
      * early measurement taken mid-layout cannot poison the limits forever;
      * that permanent-verdict cache was the previous round's bug).
      */
@@ -1063,7 +1063,7 @@ private:
             // No tight cap here: legitimate host chrome can be large (the
             // REAPER FX-chain window keeps its plugin list beside the
             // editor, ~450px). Underestimating it lets the window shrink
-            // past the point where the plugin minimum still fits — exactly
+            // past the point where the plugin minimum still fits - exactly
             // a clipped editor. The historical minimum below already stops
             // dead space from inflating these numbers over time.
             auto clampChrome = [](LONG v) -> LONG {
@@ -1121,7 +1121,7 @@ private:
         constexpr EditorResize mode = editorResizeOf<P>();
         // Unlike checkSizeConstraint (where the window is already fixed and
         // the plugin must fit INSIDE it), WM_SIZING reshapes the whole
-        // window — so the dragged axis leads and the other may follow.
+        // window - so the dragged axis leads and the other may follow.
         const double lo = mode == EditorResize::Fixed ? 1.0 : kEditorMinSizeFactor;
         const double hi = mode == EditorResize::Fixed ? 1.0 : kEditorMaxSizeFactor;
         const double minW = logical.width * dpi * lo;
@@ -1251,7 +1251,7 @@ private:
     }
 
     // ==============================================================================
-    // macOS — WKWebView through the Objective-C runtime
+    // macOS - WKWebView through the Objective-C runtime
     // ==============================================================================
 #elif DSPARK_WEBVIEW_BACKEND == 2
 
@@ -1368,7 +1368,7 @@ private:
     }
 
     // ==============================================================================
-    // Linux — WebKitGTK in a GtkPlug, embedded in the host's X11 window
+    // Linux - WebKitGTK in a GtkPlug, embedded in the host's X11 window
     // ==============================================================================
 #elif DSPARK_WEBVIEW_BACKEND == 3
 
@@ -1499,7 +1499,7 @@ private:
     }
 
     // ==============================================================================
-    // Other platforms — stub (hosts fall back to their generic editor)
+    // Other platforms - stub (hosts fall back to their generic editor)
     // ==============================================================================
 #else
 

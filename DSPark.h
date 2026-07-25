@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -8,7 +8,7 @@
  * @brief Single-include umbrella header for the DSPark framework.
  *
  * A complete, standalone audio DSP framework in pure C++20. Zero external
- * dependencies — only the C++ standard library. Works on any platform:
+ * dependencies - only the C++ standard library. Works on any platform:
  * Windows, macOS, Linux, WebAssembly, iOS, Android.
  *
  * ```cpp
@@ -27,9 +27,9 @@
  * @subsection integration_vs Visual Studio (Windows Forms, WPF, Console, etc.)
  *
  * 1. Copy the `DSPark/` folder into your project directory (e.g., `MyApp/libs/DSPark/`).
- * 2. In Visual Studio: Project → Properties → C/C++ → Additional Include Directories →
+ * 2. In Visual Studio: Project -> Properties -> C/C++ -> Additional Include Directories ->
  *    add the **parent** directory of `DSPark/` (e.g., `$(ProjectDir)libs`).
- * 3. Set the C++ standard to C++20: C/C++ → Language → C++ Language Standard → ISO C++20.
+ * 3. Set the C++ standard to C++20: C/C++ -> Language -> C++ Language Standard -> ISO C++20.
  * 4. In your source files:
  *    ```cpp
  *    #include "DSPark/DSPark.h"
@@ -49,7 +49,7 @@
  * ```bash
  * em++ -std=c++20 -O2 -I./libs my_processor.cpp -o processor.js
  * ```
- * The framework uses no platform-specific APIs — it compiles directly with
+ * The framework uses no platform-specific APIs - it compiles directly with
  * Emscripten. Pair with the Web Audio API's AudioWorklet for real-time processing.
  *
  * @subsection integration_vst3 VST3 Plugin (DAW)
@@ -100,24 +100,24 @@
  *
  * Every processor in this framework follows the same three-step pattern:
  *
- * 1. **Create** — Construct the processor (stack or heap, your choice).
- * 2. **Prepare** — Call `prepare(AudioSpec)` once before processing. This is the
+ * 1. **Create** - Construct the processor (stack or heap, your choice).
+ * 2. **Prepare** - Call `prepare(AudioSpec)` once before processing. This is the
  *    only step that may allocate memory. Call again if sample rate or block size changes.
- * 3. **Process** — Call `process()` / `processBlock()` / `processSample()` in your
+ * 3. **Process** - Call `process()` / `processBlock()` / `processSample()` in your
  *    audio callback. These methods are real-time safe (zero allocations, no locks).
  *
  * ```
- * ┌──────────┐     ┌───────────────────┐     ┌────────────────────────────┐
- * │  Create  │ ──> │  prepare(spec)    │ ──> │  process(buffer) [repeat]  │
- * │          │     │  (allocates once) │     │  (real-time safe)          │
- * └──────────┘     └───────────────────┘     └────────────────────────────┘
+ * +----------+     +-------------------+     +----------------------------+
+ * |  Create  | --> |  prepare(spec)    | --> |  process(buffer) [repeat]  |
+ * |          |     |  (allocates once) |     |  (real-time safe)          |
+ * +----------+     +-------------------+     +----------------------------+
  * ```
  *
  * ---
  *
  * @section concepts Key Concepts
  *
- * @subsection concept_spec AudioSpec — Describe Your Audio Environment
+ * @subsection concept_spec AudioSpec - Describe Your Audio Environment
  *
  * Before processing, you tell each processor about your audio setup:
  *
@@ -129,7 +129,7 @@
  * };
  * ```
  *
- * @subsection concept_buffer AudioBuffer / AudioBufferView — Carry Audio Data
+ * @subsection concept_buffer AudioBuffer / AudioBufferView - Carry Audio Data
  *
  * - **AudioBufferView\<T\>**: A lightweight, non-owning wrapper around existing audio
  *   data (e.g., your audio driver's buffers, JUCE's AudioBuffer, or raw float**).
@@ -221,13 +221,16 @@
  *         return 1;
  *     }
  *     auto info = reader.getInfo();
- *     std::printf("Loaded: %d ch, %.0f Hz, %lld samples\n",
- *                 info.numChannels, info.sampleRate, info.numSamples);
+ *     std::printf("Loaded: %u ch, %.0f Hz, %lld samples\n",
+ *                 info.numChannels, info.sampleRate, (long long) info.numSamples);
  *
  *     // 2. Load into buffer
  *     dspark::AudioBuffer<float> buffer;
- *     buffer.resize(info.numChannels, static_cast<int>(info.numSamples));
- *     reader.readSamples(buffer.toView());
+ *     buffer.resize(static_cast<int>(info.numChannels), static_cast<int>(info.numSamples));
+ *     if (!reader.readSamples(buffer.toView())) {
+ *         std::printf("Read error\n");
+ *         return 1;
+ *     }
  *     reader.close();
  *
  *     // 3. Process
@@ -250,7 +253,10 @@
  *         std::printf("Failed to create output.wav\n");
  *         return 1;
  *     }
- *     writer.writeSamples(buffer.toView());
+ *     if (!writer.writeSamples(std::as_const(buffer).toView())) {
+ *         std::printf("Write error\n");
+ *         return 1;
+ *     }
  *     writer.close();
  *
  *     std::printf("Done! Wrote output.wav\n");
@@ -268,12 +274,12 @@
  * int main()
  * {
  *     dspark::WavFile reader;
- *     reader.openRead("input.wav");
+ *     if (!reader.openRead("input.wav")) return 1;
  *     auto info = reader.getInfo();
  *
  *     dspark::AudioBuffer<float> buffer;
- *     buffer.resize(info.numChannels, static_cast<int>(info.numSamples));
- *     reader.readSamples(buffer.toView());
+ *     buffer.resize(static_cast<int>(info.numChannels), static_cast<int>(info.numSamples));
+ *     if (!reader.readSamples(buffer.toView())) return 1;
  *     reader.close();
  *
  *     // Process...
@@ -290,8 +296,8 @@
  *     mp3Info.bitsPerSample = 320;  // Bitrate in kbps for MP3
  *
  *     dspark::Mp3File mp3;
- *     mp3.openWrite("output.mp3", mp3Info);
- *     mp3.writeSamples(buffer.toView());
+ *     if (!mp3.openWrite("output.mp3", mp3Info)) return 1;
+ *     if (!mp3.writeSamples(buffer.toView())) return 1;
  *     mp3.close();
  *
  *     return 0;
@@ -304,16 +310,16 @@
  *
  * ```cpp
  * dspark::WavFile reader, writer;
- * reader.openRead("large_file.wav");
+ * if (!reader.openRead("large_file.wav")) return 1;
  * auto info = reader.getInfo();
  *
- * writer.openWrite("output.wav", info);
+ * if (!writer.openWrite("output.wav", info)) return 1;
  *
  * constexpr int kBlockSize = 4096;
  * dspark::AudioBuffer<float> block;
- * block.resize(info.numChannels, kBlockSize);
+ * block.resize(static_cast<int>(info.numChannels), kBlockSize);
  *
- * dspark::AudioSpec spec { info.sampleRate, kBlockSize, info.numChannels };
+ * dspark::AudioSpec spec = info.toSpec(kBlockSize);
  * dspark::FilterEngine<float> filter;
  * filter.prepare(spec);
  * filter.setLowPass(8000.0f);
@@ -325,9 +331,9 @@
  *     int toRead = static_cast<int>(std::min(remaining, int64_t(kBlockSize)));
  *     auto view = block.toView().getSubView(0, toRead);
  *
- *     reader.readSamples(view, offset, toRead);
+ *     if (!reader.readSamples(view, offset, toRead)) break;
  *     filter.processBlock(view);
- *     writer.writeSamples(view);
+ *     if (!writer.writeSamples(view)) break;
  *
  *     offset += toRead;
  *     remaining -= toRead;
@@ -370,9 +376,9 @@
  * | `NoiseGenerator<T>`      | Effects/NoiseGenerator.h | White/pink/brown noise generator (AudioProcessor contract)        |
  * | `Tremolo<T>`             | Effects/Tremolo.h     | LFO amplitude modulation with stereo auto-pan option                |
  * | `Vibrato<T>`             | Effects/Vibrato.h     | Pitch modulation via LFO-driven delay line                          |
- * | `RingModulator<T>`       | Effects/RingModulator.h | Ring modulation (signal × carrier) with mix control               |
+ * | `RingModulator<T>`       | Effects/RingModulator.h | Ring modulation (signal x carrier) with mix control               |
  * | `FrequencyShifter<T>`    | Effects/FrequencyShifter.h | Constant-Hz frequency shift via Hilbert transform              |
- * | `PitchShifter<T>`        | Effects/PitchShifter.h | Phase-vocoder pitch shift ±12 st (identity phase locking)        |
+ * | `PitchShifter<T>`        | Effects/PitchShifter.h | Phase-vocoder pitch shift +/-12 st (identity phase locking)        |
  * | `TapeMachine<T>`         | Effects/TapeMachine.h | Physical tape: JA hysteresis, NAB/CCIR EQ, losses, wow/flutter    |
  * | `TubePreamp<T>`          | Effects/TubePreamp.h  | Koren 12AX7 stages, WDF FMV tone stack (R-type), supply sag       |
  * | `TransformerModel<T>`    | Effects/TransformerModel.h | Audio transformer: flux-domain JA hysteresis, LF bloom, HF bell |
@@ -401,13 +407,15 @@
  * | `PitchDetector<T>`       | Analysis/PitchDetector.h  | YIN monophonic pitch detection with MIDI/cents output |
  * | `PitchFollower<T>`       | Analysis/PitchFollower.h  | Gated, octave-safe, glide-smoothed pitch tracking source |
  * | `PhaseCorrelation<T>`    | Analysis/PhaseCorrelation.h | Stereo correlation/balance meter + goniometer feed |
+ * | `EnvelopeFollower<T>`    | Analysis/EnvelopeFollower.h | Peak/RMS envelope source with per-channel readouts |
  *
  * @subsection classes_io File I/O
  *
  * | Class                    | Header           | Purpose                                         |
  * |--------------------------|------------------|-------------------------------------------------|
+ * | `AudioFile`              | IO/AudioFile.h   | Abstract reader/writer interface + AudioFileInfo metadata |
  * | `WavFile`                | IO/WavFile.h     | Read/write WAV files (PCM 8/16/24/32, float 32/64) |
- * | `Mp3File`                | IO/Mp3File.h     | MPEG-1 Layer III codec — read (CBR/VBR) + write (CBR encoder) |
+ * | `Mp3File`                | IO/Mp3File.h     | MPEG-1 Layer III codec - read (CBR/VBR) + write (CBR encoder) |
  *
  * @subsection classes_music Music Theory
  *
@@ -459,21 +467,26 @@
  *
  * @section design Design Principles
  *
- * - **Zero external dependencies** — C++20 standard library only.
- * - **Real-time safe** — No allocations, no locks, no syscalls in process().
- * - **Thread-safe** — All parameter setters use `std::atomic` with `memory_order_relaxed`, callable from any thread with zero contention.
- * - **Cache-friendly** — Contiguous memory, 32-byte aligned buffers (SIMD-ready).
- * - **Multiplatform** — Windows, macOS, Linux, WebAssembly, iOS, Android.
- * - **Header-only** — No build system, no compilation, just `#include`.
+ * - **Zero external dependencies** - C++20 standard library only.
+ * - **Real-time safe** - No allocations, no locks, no syscalls in process().
+ * - **Thread-safe** - All parameter setters use `std::atomic` with `memory_order_relaxed`, callable from any thread with zero contention.
+ * - **Cache-friendly** - Contiguous memory, 32-byte aligned buffers (SIMD-ready).
+ * - **Multiplatform** - Windows, macOS, Linux, WebAssembly, iOS, Android.
+ * - **Header-only** - No build system, no compilation, just `#include`.
  *
  * @note All classes live in the `dspark` namespace.
+ *
+ * @note The native plugin layer (VST3 / CLAP / Audio Unit wrappers plus the
+ * WebView editor) lives under `plugin/` and is NOT pulled in by this umbrella:
+ * include `plugin/DSParkPlugin.h` and the format headers explicitly when
+ * building a plugin. See docs/plugins.md.
  *
  * ---
  *
  * @section api_contract API Contract (C++20 Concepts)
  *
  * The framework defines C++20 concepts in `ProcessorTraits.h` that formalise
- * the processor interface. These are compile-time contracts — zero overhead,
+ * the processor interface. These are compile-time contracts - zero overhead,
  * no vtable, clear error messages if you forget a method.
  *
  * ```cpp
@@ -503,14 +516,14 @@
  * }
  * ```
  *
- * @section processor_chain ProcessorChain — Compose Processors at Compile Time
+ * @section processor_chain ProcessorChain - Compose Processors at Compile Time
  *
  * `ProcessorChain` lets you combine multiple processors into a single unit
  * with zero runtime overhead. All dispatch is resolved at compile time via
  * `std::tuple` and fold expressions.
  *
  * ```cpp
- * // Define a chain: high-pass → saturation drive → compressor → output gain
+ * // Define a chain: high-pass -> saturation drive -> compressor -> output gain
  * dspark::ProcessorChain<float,
  *     dspark::FilterEngine<float>,
  *     dspark::Compressor<float>,
@@ -546,13 +559,13 @@
  * dspark::Saturation<float> sat;
  * sat.setOversampling(4);  // 4x oversampling
  * sat.prepare(spec);
- * sat.process(buffer);     // Automatically upsamples → saturates → downsamples
+ * sat.process(buffer);     // Automatically upsamples -> saturates -> downsamples
  *
  * dspark::WaveshapeTable<float> shaper;
  * shaper.buildTanh(3.0f);
  * shaper.prepare(spec);
  * shaper.setOversampling(4);
- * shaper.processBlock(buffer);  // Same: upsample → shape → downsample
+ * shaper.processBlock(buffer);  // Same: upsample -> shape -> downsample
  * ```
  *
  * @section progressive_disclosure Progressive Disclosure API
@@ -597,13 +610,13 @@
  * | **Sample rate**   | Number of audio samples per second (e.g., 44100, 48000 Hz).   |
  * | **dB (decibel)**  | Logarithmic unit for loudness. +6 dB = double amplitude.       |
  * | **dBFS**          | Decibels relative to full scale. 0 dBFS = max digital level.   |
- * | **dBTP**          | Decibels True Peak — accounts for inter-sample peaks.          |
+ * | **dBTP**          | Decibels True Peak - accounts for inter-sample peaks.          |
  * | **Gain**          | Amplitude multiplier. 1.0 = unity (no change).                 |
  * | **Q factor**      | Filter bandwidth. Low Q = wide, high Q = narrow/resonant.      |
  * | **Nyquist**       | Maximum representable frequency = sampleRate / 2.              |
- * | **FFT**           | Fast Fourier Transform — converts time domain to frequency.    |
- * | **Biquad**        | 2nd-order IIR filter — the workhorse of audio EQ.              |
- * | **IIR / FIR**     | Infinite/Finite Impulse Response — two fundamental filter types.|
+ * | **FFT**           | Fast Fourier Transform - converts time domain to frequency.    |
+ * | **Biquad**        | 2nd-order IIR filter - the workhorse of audio EQ.              |
+ * | **IIR / FIR**     | Infinite/Finite Impulse Response - two fundamental filter types.|
  * | **Oversampling**  | Processing at a higher sample rate to reduce aliasing.          |
  * | **Aliasing**      | Distortion from frequencies above Nyquist folding back.        |
  * | **Threshold**     | Level (dB) above which a compressor/limiter begins acting.     |
@@ -613,13 +626,13 @@
  * | **Knee**          | Transition region around threshold. Soft knee = gradual onset.  |
  * | **Makeup gain**   | Gain applied after compression to restore perceived loudness.   |
  * | **Lookahead**     | Delay allowing the processor to "see" transients in advance.    |
- * | **ISP**           | Inter-Sample Peak — peak that occurs between digital samples.   |
- * | **LUFS**          | Loudness Unit Full Scale — perceptual loudness measurement.     |
+ * | **ISP**           | Inter-Sample Peak - peak that occurs between digital samples.   |
+ * | **LUFS**          | Loudness Unit Full Scale - perceptual loudness measurement.     |
  * | **Dry/Wet**       | Unprocessed/processed signal. Mix 50/50 = parallel processing.  |
- * | **LFO**           | Low Frequency Oscillator — modulation source (0.1-20 Hz).      |
- * | **IR**            | Impulse Response — acoustic fingerprint of a space or device.   |
+ * | **LFO**           | Low Frequency Oscillator - modulation source (0.1-20 Hz).      |
+ * | **IR**            | Impulse Response - acoustic fingerprint of a space or device.   |
  * | **Denormal**      | Tiny float values that cause CPU spikes in IIR filters.         |
- * | **PolyBLEP**      | Polynomial Band-Limited Step — anti-aliasing for oscillators.   |
+ * | **PolyBLEP**      | Polynomial Band-Limited Step - anti-aliasing for oscillators.   |
  * | **M/S**           | Mid/Side encoding. Mid = (L+R)/2, Side = (L-R)/2.              |
  * | **Allpass**       | Filter that changes phase without affecting magnitude.           |
  *
@@ -721,7 +734,7 @@
 
 // === I/O ====================================================================
 // File I/O uses <fstream>/<filesystem>, which do not exist on bare-metal
-// embedded targets. Define DSPARK_NO_FILE_IO to exclude this module — the
+// embedded targets. Define DSPARK_NO_FILE_IO to exclude this module - the
 // whole DSP core compiles and runs without it.
 
 #ifndef DSPARK_NO_FILE_IO

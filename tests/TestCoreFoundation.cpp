@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -904,17 +905,28 @@ DSPARK_TEST(AudioBuffer_zero_sample_resize_is_safe)
 
 DSPARK_TEST(AudioBuffer_recovers_after_failed_allocation)
 {
-    // 16 channels of INT_MAX doubles is ~256 GiB of commit: operator new
-    // must throw on any realistic Windows machine without touching pages.
-    // After the throw the buffer must stay coherent: the next, smaller
-    // resize re-allocates cleanly instead of trusting a stale capacity
+    // After a throwing resize the buffer must stay coherent: the next, smaller
+    // resize has to re-allocate cleanly instead of trusting a stale capacity
     // over a null base pointer.
-    AudioBuffer<double> buf;
-    buf.resize(2, 256);
+    //
+    // Provoking that failure portably takes care. The request must be refused
+    // as a RESERVATION, not discovered when the pages are written, because
+    // resize() ends in a full zero-fill. 16 channels of INT_MAX doubles is
+    // 256 GiB: Windows refuses it on commit charge and Linux refuses it on its
+    // overcommit heuristic, but macOS grants the reservation and the zero-fill
+    // that follows then takes the process down - measured as a killed
+    // subprocess on the macOS runner, with no output and no exception.
+    // 16384 channels of INT_MAX doubles is 281 TiB, past the 128 TiB of
+    // address space a 64-bit user process has at all, so operator new has to
+    // fail everywhere before a single page is touched.
+    constexpr int kUnservableChannels = 16384;
+    auto buf = std::make_unique<AudioBuffer<double, kUnservableChannels>>();
+
+    buf->resize(2, 256);
     bool threw = false;
     try
     {
-        buf.resize(16, std::numeric_limits<int>::max());
+        buf->resize(kUnservableChannels, std::numeric_limits<int>::max());
     }
     catch (const std::bad_alloc&)
     {
@@ -922,9 +934,9 @@ DSPARK_TEST(AudioBuffer_recovers_after_failed_allocation)
     }
     EXPECT_TRUE(threw);
 
-    buf.resize(2, 64);
-    buf.getChannel(1)[63] = 0.25;
-    EXPECT_NEAR(buf.toView().getPeakLevel(), 0.25, 0.0);
+    buf->resize(2, 64);
+    buf->getChannel(1)[63] = 0.25;
+    EXPECT_NEAR(buf->toView().getPeakLevel(), 0.25, 0.0);
 }
 
 DSPARK_TEST(AudioBuffer_shrink_reuses_allocation)

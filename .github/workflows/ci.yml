@@ -368,9 +368,13 @@ jobs:
         shell: bash
         run: cmake --build build --config Release --parallel
 
+      # --test-output-size-failed 0: do not truncate the output of a failing
+      # test, so the case the runner died on is always identifiable.
       - name: Test
         shell: bash
-        run: ctest --test-dir build --build-config Release --output-on-failure
+        run: >
+          ctest --test-dir build --build-config Release
+          --output-on-failure --test-output-size-failed 0
 
   # ---------------------------------------------------------------------------
   # AddressSanitizer + UndefinedBehaviorSanitizer

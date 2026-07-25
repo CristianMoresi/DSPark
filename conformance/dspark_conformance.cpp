@@ -277,6 +277,70 @@ bool simdPeakLevelIgnoresNan()
     return dspark::simd::peakLevel(buf, 33) == static_cast<T>(2.5);
 }
 
+// M-002 (AG-2 audit, additive): every kernel at UNALIGNED start offsets. The
+// checkSimdKernels() pass above always starts from a naturally-aligned base, so
+// the SIMD bodies only ever ran aligned loads/stores through unaligned
+// intrinsics. Here the whole kernel (SIMD body + scalar tail) is re-run from
+// byte offsets 1..3 floats / 1..3 doubles into the buffer, against a fresh
+// scalar reference, so the parity claim covers the unaligned edge the FIR delay
+// line and the OLA scratch actually hit at runtime.
+template <typename T>
+bool checkSimdUnaligned()
+{
+    uint32_t seed = sizeof(T) == 4 ? 0xA11A0FF5u : 0x0FF5A11Au;
+    auto next = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<T>(static_cast<int>((seed >> 16) & 0x7FFFu)) / static_cast<T>(16384)
+             - static_cast<T>(1);
+    };
+    const double tolE = sizeof(T) == 4 ? 1e-5 : 1e-13;
+    const double tolR = sizeof(T) == 4 ? 5e-4 : 1e-11;
+    constexpr int kBase = 300;
+    T A[kBase + 8], B[kBase + 8], D[kBase + 8], R[kBase + 8];
+    bool ok = true;
+    for (int off : { 1, 2, 3 })
+        for (int n : { 1, 2, 3, 5, 7, 8, 9, 16, 17, 31, 33, 64, 100, 257 })
+        {
+            for (int i = 0; i < kBase + 8; ++i) { A[i] = next(); B[i] = next(); }
+            // element-wise chain from the offset base.
+            for (int i = 0; i < n; ++i) { D[off + i] = A[off + i]; R[off + i] = A[off + i]; }
+            dspark::simd::addWithGain(D + off, B + off, static_cast<T>(0.7), n);
+            dspark::simd::applyGain(D + off, static_cast<T>(0.5), n);
+            dspark::simd::add(D + off, B + off, n);
+            for (int i = 0; i < n; ++i)
+                R[off + i] = (R[off + i] + B[off + i] * static_cast<T>(0.7)) * static_cast<T>(0.5) + B[off + i];
+            for (int i = 0; i < n; ++i)
+                if (std::abs(static_cast<double>(D[off + i]) - static_cast<double>(R[off + i])) > tolE) ok = false;
+            dspark::simd::multiply(D + off, A + off, B + off, n);
+            for (int i = 0; i < n; ++i)
+                if (std::abs(static_cast<double>(D[off + i]) - static_cast<double>(A[off + i]) * static_cast<double>(B[off + i])) > tolE) ok = false;
+            dspark::simd::copyWithGain(D + off, A + off, static_cast<T>(-1.25), n);
+            for (int i = 0; i < n; ++i)
+                if (std::abs(static_cast<double>(D[off + i]) - static_cast<double>(A[off + i]) * -1.25) > tolE) ok = false;
+            // reductions from the offset base.
+            double refDot = 0.0, refSos = 0.0; T refPeak = static_cast<T>(0);
+            for (int i = 0; i < n; ++i) {
+                refDot += static_cast<double>(A[off + i]) * static_cast<double>(B[off + i]);
+                refSos += static_cast<double>(A[off + i]) * static_cast<double>(A[off + i]);
+                const T v = A[off + i] < static_cast<T>(0) ? -A[off + i] : A[off + i];
+                if (v > refPeak) refPeak = v;
+            }
+            if (dspark::simd::peakLevel(A + off, n) != refPeak) ok = false;
+            if (std::abs(static_cast<double>(dspark::simd::dotProduct(A + off, B + off, n)) - refDot) > tolR) ok = false;
+            if (std::abs(static_cast<double>(dspark::simd::sumOfSquares(A + off, n)) - refSos) > tolR) ok = false;
+            // gain ramp from the offset base.
+            const T gs = static_cast<T>(0.25), ge = static_cast<T>(1.75);
+            for (int i = 0; i < n; ++i) { D[off + i] = A[off + i]; R[off + i] = A[off + i]; }
+            dspark::simd::applyGainRamp(D + off, gs, ge, n);
+            if (n > 0) {
+                const T step = (ge - gs) / static_cast<T>(n);
+                for (int i = 0; i < n; ++i)
+                    if (std::abs(static_cast<double>(D[off + i]) - static_cast<double>(R[off + i] * (gs + step * static_cast<T>(i)))) > tolR) ok = false;
+            }
+        }
+    return ok;
+}
+
 void runSimdKernelTests()
 {
     bool elementwise = true, reductions = true, cma = true, ramps = true;
@@ -288,6 +352,8 @@ void runSimdKernelTests()
     check(ramps,       "simd", "gain ramp kernels match the scalar reference");
     check(simdPeakLevelIgnoresNan<float>() && simdPeakLevelIgnoresNan<double>(),
           "simd", "peakLevel ignores NaN samples");
+    check(checkSimdUnaligned<float>() && checkSimdUnaligned<double>(),
+          "simd", "kernels match the scalar reference at unaligned start offsets");
 }
 
 // -----------------------------------------------------------------------------

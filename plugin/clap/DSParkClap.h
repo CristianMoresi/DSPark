@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -8,7 +8,7 @@
  * @brief Native CLAP backend: the same plugin class, one more macro.
  *
  * CLAP (https://cleveraudio.org, MIT, vendored under plugin/clap/clap/) is a
- * plain-C plugin ABI — the cleanest of the desktop formats. This backend
+ * plain-C plugin ABI - the cleanest of the desktop formats. This backend
  * exposes the exact same user class as the VST3 backend:
  *
  * ```cpp
@@ -56,11 +56,13 @@
 
 #include "clap/clap.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <vector>
 
 namespace dspark::plugin::clap_backend {
 
@@ -80,6 +82,10 @@ struct Plugin
     static_assert(!kIsInstrument || HasMidi<P>,
                   "an Instrument needs handleMidiEvent (see HasMidi): it has "
                   "no audio input to process");
+    static_assert(paramIdsUnique<P>(),
+                  "two parameter ids share a hash32 (or collide with the "
+                  "reserved PRGM/BYPS state ids): automation and state would "
+                  "cross-wire. Rename one id.");
 
     clap_plugin_t plugin {};            // the C-facing object (plugin_data = this)
     const clap_host_t* host = nullptr;
@@ -105,7 +111,7 @@ struct Plugin
 
 #if defined(DSPARK_PLUGIN_WEBVIEW)
     // --- editor state + UI -> host event queue (single producer: main thread;
-    // single consumer: process() on audio or flush() on main — never both).
+    // single consumer: process() on audio or flush() on main - never both).
     webview_ui::Editor<P> guiEditor;
     bool   guiActive = false;
     double guiScale = 1.0;
@@ -143,6 +149,9 @@ struct Plugin
 
     void applyNormalized(int index, double normalized) noexcept
     {
+        // Host values are untrusted doubles: a NaN would pass both range
+        // clamps, poison the shadow and reach the user's setter. Ignore it.
+        if (normalized != normalized) return;
         const auto& spec = P::parameters[static_cast<size_t>(index)];
         shadow[static_cast<size_t>(index)].store(normalized, std::memory_order_relaxed);
         user.setParameter(index, static_cast<float>(toPlain(spec, normalized)));
@@ -517,8 +526,10 @@ struct Plugin
         auto& outPort = process->audio_outputs[0];
         float** out = outPort.data32;
         const uint32_t width = static_cast<uint32_t>(s->currentChannels);
-        const uint32_t nCh = outPort.channel_count < width
-                           ? outPort.channel_count : width;
+        uint32_t nCh = outPort.channel_count < width
+                     ? outPort.channel_count : width;
+        while (nCh > 0 && out[nCh - 1] == nullptr) --nCh;   // degenerate hosts
+        if (nCh < 1) return CLAP_PROCESS_CONTINUE;
 
         const bool haveIn = !kIsInstrument && process->audio_inputs_count >= 1
                          && process->audio_inputs[0].data32 != nullptr;
@@ -958,7 +969,13 @@ struct Plugin
         if (spec.steps == 1 && toggle >= 0)
             *out = toggle != 0 ? spec.maxValue : spec.minValue;
         else
-            *out = std::strtod(text, nullptr);
+        {
+            // min/max ordered so a "nan" string resolves to a bound instead
+            // of passing NaN through to the host.
+            const double v = std::strtod(text, nullptr);
+            *out = std::max(static_cast<double>(spec.minValue),
+                            std::min(static_cast<double>(spec.maxValue), v));
+        }
         return true;
     }
 
@@ -1055,7 +1072,15 @@ struct Plugin
     {
         auto* s = self(p);
         if constexpr (HasTail<P>)
-            return static_cast<uint32_t>(s->user.getTailSeconds() * s->sampleRate);
+        {
+            const double seconds = s->user.getTailSeconds();
+            if (!(seconds > 0.0)) return 0;   // negative/NaN -> no tail
+            const double samples = seconds * s->sampleRate;
+            // CLAP treats anything >= INT32_MAX as an infinite tail; the cap
+            // also avoids the double->uint32 overflow (UB).
+            if (samples >= 4294967295.0) return 0xFFFFFFFFu;
+            return static_cast<uint32_t>(samples);
+        }
         else
         {
             (void) s;
@@ -1143,7 +1168,7 @@ struct Plugin
         if (!sGuiIsApiSupported(p, api, isFloating)) return false;
 #if defined(__linux__)
         // GTK breathes only when pumped from the host's run loop; without
-        // timer-support the page would freeze — fall back to generic UI.
+        // timer-support the page would freeze - fall back to generic UI.
         s->hostTimer = s->host != nullptr
             ? static_cast<const clap_host_timer_support_t*>(
                   s->host->get_extension(s->host, CLAP_EXT_TIMER_SUPPORT))
@@ -1186,7 +1211,7 @@ struct Plugin
         return false;   // cocoa uses logical sizes; scaling is the OS's job
 #else
         auto* s = self(p);
-        if (scale <= 0.0) return false;
+        if (!(scale > 0.0)) return false;   // NaN included
         // Only the physical-size negotiation changes; the page itself never
         // zooms (the web engine applies the window DPI to CSS pixels itself).
         const double previous = s->guiScale;

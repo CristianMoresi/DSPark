@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -9,7 +9,7 @@
  *
  * Implements the VST3 COM ABI directly against Steinberg's official C API
  * (vst3_c_api.h, vendored next to this header under Steinberg's permissive
- * 2025 license) — no VST3 C++ SDK to download, no build system beyond your
+ * 2025 license) - no VST3 C++ SDK to download, no build system beyond your
  * compiler:
  *
  * ```cpp
@@ -82,8 +82,9 @@ inline bool tuidEqual(const Steinberg_TUID a, const Steinberg_TUID b) noexcept
 inline void asciiToString128(const char* src, Steinberg_Vst_String128 dst) noexcept
 {
     int i = 0;
-    for (; i < 127 && src[i] != '\0'; ++i)
-        dst[i] = static_cast<Steinberg_char16>(static_cast<unsigned char>(src[i]));
+    if (src != nullptr)
+        for (; i < 127 && src[i] != '\0'; ++i)
+            dst[i] = static_cast<Steinberg_char16>(static_cast<unsigned char>(src[i]));
     dst[i] = 0;
 }
 
@@ -190,8 +191,12 @@ struct Plugin
     static_assert(!kIsInstrument || HasMidi<P>,
                   "an Instrument needs handleMidiEvent (see HasMidi): it has "
                   "no audio input to process");
+    static_assert(paramIdsUnique<P>(),
+                  "two parameter ids share a hash32 (or collide with the "
+                  "reserved PRGM/BYPS state ids): automation and state would "
+                  "cross-wire. Rename one id.");
 
-    // COM lenses — consecutive vtable pointers; queryInterface returns the
+    // COM lenses - consecutive vtable pointers; queryInterface returns the
     // address of the matching slot. Standard layout is asserted below. The
     // last two lenses surface only for the matching capability.
     const Steinberg_Vst_IComponentVtbl*       componentVtbl;
@@ -217,7 +222,11 @@ struct Plugin
     std::vector<float> dryL, dryR;     // pre-process copy for the bypass blend
     std::vector<float> silence;        // stand-in sidechain when not connected
 
-    Steinberg_Vst_IComponentHandler* handler = nullptr;
+    // Atomic pointer: refreshLatency() reads it from the audio thread while
+    // setComponentHandler writes it from the main thread. Per the VST3
+    // lifecycle the host swaps handlers only while the component is inactive,
+    // so the atomic removes the formally torn read without needing a lock.
+    std::atomic<Steinberg_Vst_IComponentHandler*> handler { nullptr };
 
     Plugin() noexcept
     {
@@ -307,6 +316,9 @@ struct Plugin
 
     void applyNormalized(int index, double normalized) noexcept
     {
+        // Host values are untrusted doubles: a NaN would pass both range
+        // clamps, poison the shadow and reach the user's setter. Ignore it.
+        if (normalized != normalized) return;
         const auto& spec = P::parameters[static_cast<size_t>(index)];
         shadow[static_cast<size_t>(index)].store(normalized, std::memory_order_relaxed);
         user.setParameter(index, static_cast<float>(toPlain(spec, normalized)));
@@ -350,8 +362,9 @@ struct Plugin
                 flags |= Steinberg_Vst_RestartFlags_kLatencyChanged;
             }
         }
-        if (flags != 0 && handler != nullptr)
-            handler->lpVtbl->restartComponent(handler, flags);
+        if (flags != 0)
+            if (auto* h = handler.load(std::memory_order_relaxed); h != nullptr)
+                h->lpVtbl->restartComponent(h, flags);
     }
 
     // --- block event plumbing -------------------------------------------------------
@@ -464,7 +477,7 @@ struct Plugin
 
     /** Applies one event; @p blockStart rebases MIDI offsets onto the next
      *  processBlock call. Returns true when a user parameter changed (the
-     *  latency re-check trigger) — program changes report through
+     *  latency re-check trigger) - program changes report through
      *  @p programChanged instead. */
     bool applyBlockEvent(const BlockEvent& ev, int blockStart,
                          bool& programChanged) noexcept
@@ -528,7 +541,7 @@ struct Plugin
     }
 
     // ==========================================================================
-    // Lens 0 — IComponent (+ IPluginBase)
+    // Lens 0 - IComponent (+ IPluginBase)
     // ==========================================================================
 
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sInitialize(void*, Steinberg_FUnknown*)
@@ -690,7 +703,7 @@ struct Plugin
     };
 
     // ==========================================================================
-    // Lens 1 — IAudioProcessor
+    // Lens 1 - IAudioProcessor
     // ==========================================================================
 
     /// Mono and stereo negotiate per the declared ChannelSupport; every bus
@@ -839,7 +852,9 @@ struct Plugin
         float** out = outBus.Steinberg_Vst_AudioBusBuffers_channelBuffers32;
         if (out == nullptr || outBus.numChannels < 1) return Steinberg_kResultOk;
         const int width = p->currentChannels;
-        const int nCh = outBus.numChannels < width ? outBus.numChannels : width;
+        int nCh = outBus.numChannels < width ? outBus.numChannels : width;
+        while (nCh > 0 && out[nCh - 1] == nullptr) --nCh;   // degenerate hosts
+        if (nCh < 1) return Steinberg_kResultOk;
 
         const bool haveIn = !kIsInstrument
             && data->numInputs >= 1 && data->inputs != nullptr
@@ -971,9 +986,16 @@ struct Plugin
     {
         auto* p = fromLens(self_, 1);
         if constexpr (HasTail<P>)
-            return static_cast<Steinberg_uint32>(
-                p->user.getTailSeconds() * (p->setup.sampleRate > 0 ? p->setup.sampleRate
-                                                                    : 48000.0));
+        {
+            const double seconds = p->user.getTailSeconds();
+            if (!(seconds > 0.0)) return 0;   // negative/NaN -> no tail
+            const double samples = seconds
+                * (p->setup.sampleRate > 0 ? p->setup.sampleRate : 48000.0);
+            // Infinite or absurd tails map to kInfiniteTail instead of a
+            // double->uint32 overflow (UB).
+            if (samples >= 4294967295.0) return 0xFFFFFFFFu;
+            return static_cast<Steinberg_uint32>(samples);
+        }
         else
         {
             (void) p;
@@ -989,7 +1011,7 @@ struct Plugin
     };
 
     // ==========================================================================
-    // Lens 2 — IEditController (+ IPluginBase)
+    // Lens 2 - IEditController (+ IPluginBase)
     // ==========================================================================
 
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sCtrlInitialize(void*, Steinberg_FUnknown*)
@@ -1153,7 +1175,8 @@ struct Plugin
         }
         if (HasMidi<P> && isMidiProxyId(id))
         {
-            *normalized = std::strtod(ascii, nullptr);
+            const double v = std::strtod(ascii, nullptr);
+            *normalized = v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
             return Steinberg_kResultOk;
         }
         const int idx = indexOfParamId(id);
@@ -1251,11 +1274,12 @@ struct Plugin
         Steinberg_Vst_IComponentHandler* handler)
     {
         auto* p = fromLens(self_, 2);
-        if (p->handler != nullptr)
-            reinterpret_cast<Steinberg_FUnknown*>(p->handler)->lpVtbl->release(p->handler);
-        p->handler = handler;
-        if (p->handler != nullptr)
-            reinterpret_cast<Steinberg_FUnknown*>(p->handler)->lpVtbl->addRef(p->handler);
+        auto* old = p->handler.load(std::memory_order_relaxed);
+        if (old != nullptr)
+            reinterpret_cast<Steinberg_FUnknown*>(old)->lpVtbl->release(old);
+        p->handler.store(handler, std::memory_order_relaxed);
+        if (handler != nullptr)
+            reinterpret_cast<Steinberg_FUnknown*>(handler)->lpVtbl->addRef(handler);
         return Steinberg_kResultOk;
     }
 
@@ -1274,7 +1298,7 @@ struct Plugin
     };
 
     // ==========================================================================
-    // Lens 3 — IProcessContextRequirements
+    // Lens 3 - IProcessContextRequirements
     // ==========================================================================
 
     static Steinberg_uint32 SMTG_STDMETHODCALLTYPE sGetProcessContextRequirements(void*)
@@ -1296,7 +1320,7 @@ struct Plugin
     };
 
     // ==========================================================================
-    // Lens 4 — IUnitInfo (factory presets as a program list; surfaced by
+    // Lens 4 - IUnitInfo (factory presets as a program list; surfaced by
     // queryInterface only when the class declares factoryPresets)
     // ==========================================================================
 
@@ -1398,7 +1422,7 @@ struct Plugin
     };
 
     // ==========================================================================
-    // Lens 5 — IMidiMapping (pitch bend / mod / sustain / channel pressure
+    // Lens 5 - IMidiMapping (pitch bend / mod / sustain / channel pressure
     // arrive as proxy-parameter automation; surfaced only for HasMidi)
     // ==========================================================================
 
@@ -1563,7 +1587,7 @@ struct View
         const Param& spec = P::parameters[static_cast<size_t>(index)];
         const double normalized = toNormalized(spec, plain);
         view->owner->applyNormalized(index, normalized);
-        if (auto* handler = view->owner->handler)
+        if (auto* handler = view->owner->handler.load(std::memory_order_relaxed))
         {
             const Steinberg_Vst_ParamID id = hash32(spec.id);
             if (view->editActive[static_cast<size_t>(index)])
@@ -1582,7 +1606,7 @@ struct View
     {
         auto* view = static_cast<View*>(context);
         view->editActive[static_cast<size_t>(index)] = true;
-        if (auto* handler = view->owner->handler)
+        if (auto* handler = view->owner->handler.load(std::memory_order_relaxed))
             handler->lpVtbl->beginEdit(handler,
                 hash32(P::parameters[static_cast<size_t>(index)].id));
     }
@@ -1591,7 +1615,7 @@ struct View
     {
         auto* view = static_cast<View*>(context);
         view->editActive[static_cast<size_t>(index)] = false;
-        if (auto* handler = view->owner->handler)
+        if (auto* handler = view->owner->handler.load(std::memory_order_relaxed))
             handler->lpVtbl->endEdit(handler,
                 hash32(P::parameters[static_cast<size_t>(index)].id));
     }
@@ -1660,7 +1684,7 @@ struct View
         };
         if (!view->editor.create(parent, view->owner->shadow, callbacks))
             return Steinberg_kResultFalse;
-        // Fill the box the host ACTUALLY built — hosts differ in whether
+        // Fill the box the host ACTUALLY built - hosts differ in whether
         // getSize/setContentScaleFactor/attached arrive in spec order, so the
         // parent's real client size wins over the negotiated one.
         int parentW = 0, parentH = 0;
@@ -1813,7 +1837,7 @@ struct View
         Steinberg_IPlugViewContentScaleSupport_ScaleFactor factor)
     {
         auto* view = fromLens(self_, 1);
-        if (factor <= 0.0f) return Steinberg_kInvalidArgument;
+        if (!(factor > 0.0f)) return Steinberg_kInvalidArgument;   // NaN included
         const double previous = view->scale;
         view->scale = factor;
         webview_ui::debugLog("vst3 setContentScaleFactor %.2f (was %.2f)",

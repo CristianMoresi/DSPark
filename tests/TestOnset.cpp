@@ -45,7 +45,7 @@ void addClick(std::vector<float>& buf, int64_t at, double fs,
         const double white = static_cast<double>(s) / static_cast<double>(0xFFFFFFFFu) * 2.0 - 1.0;
         lp = 0.5 * lp + 0.5 * white; // mild band-limit (anti-alias)
         double env = std::exp(-static_cast<double>(n) / tau);
-        if (n < att) env *= 0.5 - 0.5 * std::cos(M_PI * n / att);
+        if (n < att) env *= 0.5 - 0.5 * std::cos(dspark::pi<double> * n / att);
         buf[static_cast<size_t>(i)] += amp * static_cast<float>(lp * env);
     }
 }
@@ -99,7 +99,7 @@ void addHarmonicBed(std::vector<float>& buf, double fs, double f0, float amp)
     {
         double s = 0.0;
         for (int h = 1; h <= 6; ++h)
-            s += std::sin(2.0 * M_PI * f0 * h * i / fs) / h;
+            s += std::sin(dspark::twoPi<double> * f0 * h * i / fs) / h;
         buf[static_cast<size_t>(i)] += amp * static_cast<float>(s * 0.4);
     }
 }
@@ -118,7 +118,7 @@ void addSoftNote(std::vector<float>& buf, int64_t at, double fs, double f0,
         if (n > dur - att) env *= static_cast<double>(dur - n) / std::max(1, att);
         double s = 0.0;
         for (int h = 1; h <= 4; ++h)
-            s += std::sin(2.0 * M_PI * f0 * h * (at + n) / fs) / h;
+            s += std::sin(dspark::twoPi<double> * f0 * h * (at + n) / fs) / h;
         buf[static_cast<size_t>(i)] += amp * static_cast<float>(s * env);
     }
 }
@@ -131,9 +131,9 @@ std::vector<float> makeVibratoTone(int n, double fs, double f0, float amp)
     for (int i = 0; i < n; ++i)
     {
         const double t = i / fs;
-        const double vib = 1.0 + 0.03 * std::sin(2.0 * M_PI * 6.0 * t);   // 6 Hz FM +/-3%
-        const double trem = 0.8 + 0.2 * std::sin(2.0 * M_PI * 5.0 * t);   // 5 Hz AM
-        phase += 2.0 * M_PI * f0 * vib / fs;
+        const double vib = 1.0 + 0.03 * std::sin(dspark::twoPi<double> * 6.0 * t);   // 6 Hz FM +/-3%
+        const double trem = 0.8 + 0.2 * std::sin(dspark::twoPi<double> * 5.0 * t);   // 5 Hz AM
+        phase += dspark::twoPi<double> * f0 * vib / fs;
         out[static_cast<size_t>(i)] = amp * static_cast<float>(std::sin(phase) * trem);
     }
     return out;
@@ -444,7 +444,7 @@ DSPARK_TEST(Onset_double_instantiation)
     const double tau = 4.0 * 0.001 * fs;
     for (int n = 0; n < static_cast<int>(tau * 6); ++n)
         sig[static_cast<size_t>(static_cast<int>(fs * 0.5) + n)] =
-            std::sin(2.0 * M_PI * 1000.0 * n / fs) * std::exp(-n / tau);
+            std::sin(dspark::twoPi<double> * 1000.0 * n / fs) * std::exp(-n / tau);
     double* p = sig.data();
     AudioBufferView<double> view(&p, 1, static_cast<int>(sig.size()));
     auto det = od.detectOffline(view);

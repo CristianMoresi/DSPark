@@ -382,6 +382,13 @@ jobs:
   sanitizers:
     name: ASan + UBSan (Linux GCC)
     runs-on: ubuntu-latest
+    # AudioBuffer_recovers_after_failed_allocation deliberately asks for an
+    # allocation no allocator can serve and requires operator new to throw.
+    # ASan's default is to treat an unservable request as a fatal error and
+    # abort, which is the opposite of what that case is testing, so it is told
+    # to return null and let the throw happen.
+    env:
+      ASAN_OPTIONS: allocator_may_return_null=1
     steps:
       - uses: actions/checkout@v4
       - name: Build with sanitizers

@@ -6,7 +6,7 @@
 
 **📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
-CI builds and tests every commit on Windows (MSVC), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus AddressSanitizer/UBSan, an exceptions-free embedded profile and a single-header amalgamation. The public conformance suite validates loudness against the official EBU R128 test vectors and generates a [per-processor quality metrics table](docs/metrics.md) (THD+N, noise floor, spurious/aliasing, latency).
+CI runs a 630-case test suite and the public conformance suite on every commit across Windows (MSVC, x64 and ARM64), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus AddressSanitizer/UBSan, an exceptions-free embedded profile and a single-header amalgamation. Loudness is validated against the official EBU R128 test vectors, and a [per-processor quality metrics table](docs/metrics.md) (THD+N, noise floor, spurious/aliasing, latency) is generated from the measurements.
 
 ```cpp
 #include "DSPark/DSPark.h"
@@ -395,10 +395,10 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 
 | Platform | Status | Notes |
 |---|---|---|
-| Windows (MSVC) | Tested | C++20, /W4 /WX- (only benign C4324 `alignas` padding notices) |
-| Linux (GCC) | Compatible | C++20, -Wall -Wextra |
-| macOS (Clang) | Compatible | C++20, -Wall -Wextra |
-| WebAssembly (Emscripten) | Compatible | Zero syscalls in audio path |
+| Windows (MSVC) | Tested in CI | x64 and ARM64, C++20, /W4 (only benign C4324 `alignas` padding notices) |
+| Linux (GCC / Clang) | Tested in CI | x64 and ARM64, C++20, -Wall -Wextra |
+| macOS (Clang) | Tested in CI | ARM64, C++20, -Wall -Wextra |
+| WebAssembly (Emscripten) | Tested in CI | Zero syscalls in audio path; scalar and SIMD128 |
 | iOS / Android | Compatible | ARM NEON denormal flush supported |
 | Plugins (VST3 / CLAP / AU) | Native | Built-in plugin layer with WebView editors ([guide](docs/plugins.md)) |
 
@@ -429,6 +429,7 @@ DSPark/
 ├── IO/             (3)      # File I/O: WAV read/write, MP3 read/write
 ├── Music/          (2)      # Harmony constants + real-time chord detection
 ├── plugin/                  # Native plugin layer: VST3, CLAP, AU + WebView editor
+├── tests/                   # Test suite: 630+ cases, zero dependencies
 ├── conformance/             # Public conformance suite (runs in CI)
 ├── docs/                    # Cookbook, plugin guide, metrics table
 ├── examples/                # WAV processing, channel strip, plugins, templates
@@ -524,5 +525,15 @@ DSPark was created to provide a truly free, professional-grade DSP toolkit acces
 ## Contributing
 
 Contributions are welcome. Please open an issue to discuss proposed changes before submitting a pull request.
+
+Building and testing the framework needs only a C++20 compiler and CMake:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow, the conventions the codebase follows, and what CI checks on every commit.
 
 For bug reports, include: compiler version, platform, minimal reproduction code.

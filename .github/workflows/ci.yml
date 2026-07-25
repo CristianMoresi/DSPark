@@ -315,6 +315,64 @@ jobs:
           path: metrics.md
 
   # ---------------------------------------------------------------------------
+  # Build + run the test suite on every platform
+  #
+  # Driven through CMake/CTest rather than a direct compiler invocation: it is
+  # the same path a contributor uses locally, so this job also proves the CMake
+  # integration itself. The suite builds with optimisations but WITHOUT NDEBUG
+  # (see tests/CMakeLists.txt) so the framework's own assertions stay live.
+  # ---------------------------------------------------------------------------
+  tests:
+    name: Tests - ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "Windows MSVC x64",   os: windows-latest,   msvc_arch: x64   }
+          - { name: "Windows MSVC arm64", os: windows-11-arm,   msvc_arch: arm64 }
+          - { name: "Linux GCC x64",      os: ubuntu-latest,    cxx: g++     }
+          - { name: "Linux Clang x64",    os: ubuntu-latest,    cxx: clang++ }
+          - { name: "Linux GCC arm64",    os: ubuntu-24.04-arm, cxx: g++     }
+          - { name: "macOS Clang arm64",  os: macos-latest,     cxx: clang++ }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        if: matrix.msvc_arch != ''
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      # Windows resolves to the Visual Studio generator, which is multi-config:
+      # the target architecture is stated explicitly rather than inherited.
+      - name: Configure (MSVC)
+        if: matrix.msvc_arch != ''
+        shell: bash
+        run: >
+          cmake -S . -B build
+          -A ${{ matrix.msvc_arch == 'arm64' && 'ARM64' || 'x64' }}
+          -DDSPARK_BUILD_TESTS=ON
+          -DDSPARK_BUILD_CONFORMANCE=OFF
+
+      - name: Configure (GCC/Clang)
+        if: matrix.msvc_arch == ''
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DDSPARK_BUILD_TESTS=ON
+          -DDSPARK_BUILD_CONFORMANCE=OFF
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        shell: bash
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+  # ---------------------------------------------------------------------------
   # AddressSanitizer + UndefinedBehaviorSanitizer
   # ---------------------------------------------------------------------------
   sanitizers:
@@ -329,6 +387,18 @@ jobs:
           -I . conformance/dspark_conformance.cpp -o dspark_conformance_san
       - name: Run under sanitizers
         run: ./dspark_conformance_san
+
+      # The suite reaches far more of the framework than the conformance
+      # checks do, so it is where a stray read or an unsigned overflow is
+      # most likely to surface.
+      - name: Build + run the test suite under sanitizers
+        run: |
+          cmake -S . -B build-san \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DDSPARK_BUILD_TESTS=ON -DDSPARK_BUILD_CONFORMANCE=OFF \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all"
+          cmake --build build-san --parallel
+          ctest --test-dir build-san --output-on-failure
 
   # ---------------------------------------------------------------------------
   # WebAssembly (Emscripten) — compile and execute with node

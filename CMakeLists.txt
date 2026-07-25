@@ -7,6 +7,8 @@
 # Options:
 #   DSPARK_BUILD_CONFORMANCE  Build the public conformance suite (default: ON
 #                             when DSPark is the top-level project).
+#   DSPARK_BUILD_TESTS        Build the full test suite (default: ON when
+#                             DSPark is the top-level project).
 
 cmake_minimum_required(VERSION 3.21)
 project(DSPark VERSION 1.6.1 LANGUAGES CXX)
@@ -24,12 +26,17 @@ target_include_directories(dspark INTERFACE
 # ------------------------------------------------------------------------------
 if(PROJECT_IS_TOP_LEVEL)
     option(DSPARK_BUILD_CONFORMANCE "Build the DSPark public conformance suite" ON)
+    option(DSPARK_BUILD_TESTS       "Build the DSPark test suite"               ON)
 else()
     option(DSPARK_BUILD_CONFORMANCE "Build the DSPark public conformance suite" OFF)
+    option(DSPARK_BUILD_TESTS       "Build the DSPark test suite"               OFF)
+endif()
+
+if(DSPARK_BUILD_CONFORMANCE OR DSPARK_BUILD_TESTS)
+    enable_testing()
 endif()
 
 if(DSPARK_BUILD_CONFORMANCE)
-    enable_testing()
     add_executable(dspark_conformance conformance/dspark_conformance.cpp)
     target_link_libraries(dspark_conformance PRIVATE dspark::dspark)
 
@@ -40,6 +47,13 @@ if(DSPARK_BUILD_CONFORMANCE)
     endif()
 
     add_test(NAME conformance COMMAND dspark_conformance)
+endif()
+
+# ------------------------------------------------------------------------------
+# Test suite
+# ------------------------------------------------------------------------------
+if(DSPARK_BUILD_TESTS)
+    add_subdirectory(tests)
 endif()
 
 # ------------------------------------------------------------------------------

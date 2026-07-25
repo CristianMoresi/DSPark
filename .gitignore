@@ -2,11 +2,10 @@
 # DSPark — gitignore
 # =============================================================================
 
-# -- AI agents --
+# -- AI agents / working notes ------------------------------------------------
 .claude/
 CLAUDE.md
 AGENTS.md
-tests/
 AUDIT_*.md
 PLAN_*.md
 
@@ -46,9 +45,9 @@ PLAN_*.md
 # -- CMake / Ninja ------------------------------------------------------------
 build/
 build-*/
-build_check/
-build_t12/
+build_*/
 cmake-build-*/
+out/
 CMakeCache.txt
 CMakeFiles/
 CMakeScripts/
@@ -59,6 +58,13 @@ Makefile
 # -- DSParkLab runtime artefacts ---------------------------------------------
 DSParkLab/imgui.ini
 DSParkLab/build_log.txt
+
+# -- Test suite artefacts -----------------------------------------------------
+# Object directories from ad-hoc multi-arch builds, and the scratch audio files
+# TestIO writes next to the executable (normally deleted, but not after a crash).
+tests/obj*/
+tests/dspark_test_*.wav
+tests/dspark_test*.mp3
 
 # -- Generated artefacts -------------------------------------------------------
 dspark_single_header.hpp

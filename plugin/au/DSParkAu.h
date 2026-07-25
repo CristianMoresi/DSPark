@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -8,7 +8,7 @@
  * @brief Native Audio Unit v2 backend: the same plugin class, for Logic Pro.
  *
  * Implements the AUv2 component ABI directly against Apple's AudioToolbox
- * (system headers — nothing to vendor or download). AUv2 remains the format
+ * (system headers - nothing to vendor or download). AUv2 remains the format
  * desktop hosts load (Logic Pro, GarageBand, MainStage, Reaper/Live on
  * macOS); AUv3's app-extension model is out of scope for a C++ framework.
  *
@@ -51,7 +51,7 @@
  *   DenormalGuard (FTZ/DAZ).
  * - **Editor**: when plugin/webview/DSParkWebViewEditor.h is included before
  *   this header and the class declares `hasEditor = true`, the AU publishes
- *   kAudioUnitProperty_CocoaUI — hosts load a runtime-registered view
+ *   kAudioUnitProperty_CocoaUI - hosts load a runtime-registered view
  *   factory from this bundle and get the same WKWebView editor as the
  *   VST3/CLAP backends; otherwise they show their generic parameter UI.
  */
@@ -97,7 +97,7 @@ inline OSType fourCC(const char* s) noexcept
 // AUv2 has no IPlugView: the host reads kAudioUnitProperty_CocoaUI, loads the
 // announced bundle, instantiates the named factory class and asks it for an
 // NSView. Both classes here (factory + container view) are registered through
-// the Objective-C runtime on first use — no Objective-C sources, no AppKit
+// the Objective-C runtime on first use - no Objective-C sources, no AppKit
 // link dependency in the plugin. The factory is stateless: it recovers the
 // C++ plugin instance through a PRIVATE property on the AudioUnit handle
 // (IDs >= 64000 are reserved for third parties), so one process-wide class
@@ -150,7 +150,7 @@ inline void editorContainerDealloc(void* self, SEL) noexcept
 }
 
 /** @brief The NSView subclass hosting the editor. Returns null when AppKit is
- *  not loaded (a faceless host like auval — which never asks for views). */
+ *  not loaded (a faceless host like auval - which never asks for views). */
 inline Class editorContainerClass() noexcept
 {
     static Class registered = []() -> Class {
@@ -247,6 +247,10 @@ struct Plugin
     static_assert(!kIsInstrument || HasMidi<P>,
                   "an Instrument needs handleMidiEvent (see HasMidi): it has "
                   "no audio input to process");
+    static_assert(paramIdsUnique<P>(),
+                  "two parameter ids share a hash32 (or collide with the "
+                  "reserved PRGM/BYPS state ids): automation and state would "
+                  "cross-wire. Rename one id.");
 
     /** Component type implied by the class: aumu / aumf / aufx. */
     static OSType expectedType() noexcept
@@ -383,6 +387,9 @@ struct Plugin
 
     void applyNormalized(int index, double normalized) noexcept
     {
+        // Host values are untrusted doubles: a NaN would pass both range
+        // clamps, poison the shadow and reach the user's setter. Ignore it.
+        if (normalized != normalized) return;
         const auto& spec = P::parameters[static_cast<size_t>(index)];
         shadow[static_cast<size_t>(index)].store(normalized, std::memory_order_relaxed);
         user.setParameter(index, static_cast<float>(toPlain(spec, normalized)));
@@ -1255,7 +1262,7 @@ struct Plugin
         // AudioBufferList declares mBuffers[1] (variable length): a stack
         // instance has storage for ONE AudioBuffer, so writing mBuffers[1]
         // corrupts the frame. Give the list real storage and lend it out
-        // as AudioBufferList* — the canonical CoreAudio pattern.
+        // as AudioBufferList* - the canonical CoreAudio pattern.
         struct StereoBufferList
         {
             UInt32 mNumberBuffers;
@@ -1378,7 +1385,7 @@ struct Plugin
         }
 
         // Sidechain: input element 1; a missing or failing source must
-        // never take the main path down — fall back to silence.
+        // never take the main path down - fall back to silence.
         float* sc[2] = { nullptr, nullptr };
         if constexpr (HasSidechain<P>)
         {
@@ -1741,7 +1748,7 @@ struct Component
 /**
  * @brief Declares the AUv2 factory for one plugin class. `subtype4` and
  * `manufacturer4` are 4-character codes (unique per plugin / per vendor) that
- * must match the bundle's Info.plist AudioComponents entry — and the
+ * must match the bundle's Info.plist AudioComponents entry - and the
  * `auval -v aufx <subtype4> <manufacturer4>` invocation.
  */
 #define DSPARK_AU_PLUGIN(PluginClass, subtype4, manufacturer4)                        \

@@ -5,9 +5,12 @@
 #include "TestSignals.h"
 
 #include "../DSPark.h" // full umbrella: the concept matrix below touches everything
+#include "../plugin/DSParkPlugin.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <vector>
 
 using namespace dspark;
 using namespace dspark::test;
@@ -220,4 +223,170 @@ DSPARK_TEST(ProcessorTraits_sample_and_generator_contracts)
     EXPECT_TRUE((GeneratorProcessor<Oscillator<float>, float>));
     EXPECT_TRUE((GeneratorProcessor<WavetableOscillator<float>, float>));
     EXPECT_TRUE((GeneratorProcessor<Oscillator<double>, double>));
+}
+
+// ============================================================================
+// Plugin layer (plugin/DSParkPlugin.h) - normalisation, state container
+// ============================================================================
+
+namespace {
+
+struct MiniPlug
+{
+    static constexpr auto descriptor = dspark::plugin::Descriptor {
+        .name = "Mini", .vendor = "T", .url = "", .email = "",
+        .productId = "com.dspark.test.mini", .version = "1.0.0",
+    };
+    static constexpr auto parameters = dspark::plugin::params(
+        dspark::plugin::param("gain", "Gain", -24.0f, 24.0f, 0.0f, "dB"),
+        dspark::plugin::param("mix",  "Mix",    0.0f,  1.0f, 1.0f, ""),
+        dspark::plugin::toggle("on", "On", true));
+
+    std::vector<uint8_t> lastUserBlob;
+    [[nodiscard]] std::vector<uint8_t> getState() const { return { 0xAB, 0xCD }; }
+    bool setState(const uint8_t* d, size_t n)
+    {
+        lastUserBlob.assign(d, d + n);
+        return true;
+    }
+};
+
+} // namespace
+
+DSPARK_TEST(PluginLayer_normalisation_and_hashing)
+{
+    using namespace dspark::plugin;
+
+    // Continuous mapping is exact at the ends and the middle.
+    constexpr Param g = MiniPlug::parameters[0];
+    EXPECT_NEAR(toPlain(g, 0.0), -24.0, 1e-12);
+    EXPECT_NEAR(toPlain(g, 1.0),  24.0, 1e-12);
+    EXPECT_NEAR(toPlain(g, 0.5),   0.0, 1e-12);
+    EXPECT_NEAR(toNormalized(g, 12.0), 0.75, 1e-12);
+
+    // Out-of-range plain values clamp instead of leaving [0,1].
+    EXPECT_NEAR(toNormalized(g, 1000.0), 1.0, 1e-12);
+    EXPECT_NEAR(toNormalized(g, -1000.0), 0.0, 1e-12);
+
+    // Toggles snap to exactly two positions.
+    constexpr Param t = MiniPlug::parameters[2];
+    EXPECT_NEAR(toPlain(t, 0.49), 0.0, 1e-12);
+    EXPECT_NEAR(toPlain(t, 0.51), 1.0, 1e-12);
+
+    // Toggle text round-trip (the clap-validator regression of v1.4.0).
+    EXPECT_EQ(parseToggleText("On"), 1);
+    EXPECT_EQ(parseToggleText("off"), 0);
+    EXPECT_EQ(parseToggleText("0.5"), -1);
+    EXPECT_EQ(parseToggleText(nullptr), -1);
+
+    // Ids hash uniquely and clash with no reserved state id - compile-time.
+    static_assert(paramIdsUnique<MiniPlug>());
+
+    // UIDs derive deterministically from the productId.
+    constexpr auto uidA = makeUid("com.dspark.test.mini", 1);
+    constexpr auto uidB = makeUid("com.dspark.test.mini", 1);
+    constexpr auto uidC = makeUid("com.dspark.test.mini", 2);
+    EXPECT_TRUE(uidA == uidB);
+    EXPECT_TRUE(uidA != uidC);
+}
+
+DSPARK_TEST(PluginLayer_state_roundtrip_and_hostile_blobs)
+{
+    using namespace dspark::plugin;
+
+    MiniPlug plug;
+    double norm[3] = { 0.25, 0.75, 1.0 };
+    auto blob = buildState(plug, norm, 3, 2, 1);
+
+    // Round-trip restores every value, the program index, the bypass and
+    // the user section.
+    MiniPlug back;
+    double restored[3] = { 0.0, 0.0, 0.0 };
+    int program = -1, bypass = -1;
+    EXPECT_TRUE(applyState(back, blob.data(), blob.size(), restored, &program, &bypass));
+    EXPECT_NEAR(restored[0], 0.25, 1e-12);
+    EXPECT_NEAR(restored[1], 0.75, 1e-12);
+    EXPECT_NEAR(restored[2], 1.0, 1e-12);
+    EXPECT_EQ(program, 2);
+    EXPECT_EQ(bypass, 1);
+    EXPECT_EQ(int(back.lastUserBlob.size()), 2);
+
+    // Foreign blob rejected.
+    const uint8_t junk[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    EXPECT_TRUE(!applyState(back, junk, 8, restored));
+
+    // Truncated blob at every prefix: never crashes, only the full one parses.
+    for (size_t cut = 0; cut < blob.size(); ++cut)
+    {
+        MiniPlug victim;
+        double tmp[3] = { 0.5, 0.5, 0.5 };
+        (void) applyState(victim, blob.data(), cut, tmp);
+    }
+
+    // Hostile user-section length (0xFFFFFFFF): the subtraction-form bounds
+    // check must reject it. On 32-bit size_t targets the old addition form
+    // wrapped around and passed a giant out-of-bounds span to setState.
+    {
+        auto evil = blob;
+        const size_t userLenPos = evil.size() - 2 - 4; // [len][2 user bytes]
+        evil[userLenPos]     = 0xFF;
+        evil[userLenPos + 1] = 0xFF;
+        evil[userLenPos + 2] = 0xFF;
+        evil[userLenPos + 3] = 0xFF;
+        MiniPlug victim;
+        double tmp[3] = { 0.5, 0.5, 0.5 };
+        EXPECT_TRUE(applyState(victim, evil.data(), evil.size(), tmp));
+        EXPECT_EQ(int(victim.lastUserBlob.size()), 0); // user section refused
+    }
+
+    // NaN parameter entries keep the default instead of poisoning the shadow.
+    {
+        auto evil = blob;
+        // First entry value starts after magic+version+count+id = 16 bytes.
+        for (int b = 0; b < 8; ++b) evil[16 + size_t(b)] = 0xFF; // a quiet NaN
+        MiniPlug victim;
+        double tmp[3] = { 0.111, 0.222, 0.333 };
+        EXPECT_TRUE(applyState(victim, evil.data(), evil.size(), tmp));
+        EXPECT_NEAR(tmp[0], 0.111, 1e-12); // untouched default
+        EXPECT_NEAR(tmp[1], 0.75, 1e-12);  // later entries still apply
+    }
+}
+
+namespace {
+
+struct FixedPlug
+{
+    static constexpr dspark::plugin::EditorSize editorSize { 400, 300 };
+};
+
+struct AspectPlug
+{
+    static constexpr dspark::plugin::EditorSize editorSize { 400, 300 };
+    static constexpr dspark::plugin::EditorResize editorResize =
+        dspark::plugin::EditorResize::KeepAspect;
+};
+
+} // namespace
+
+DSPARK_TEST(PluginLayer_editor_size_policy)
+{
+    using namespace dspark::plugin;
+
+    double w = 999.0, h = 111.0;
+    constrainEditorSize<FixedPlug>(w, h, 1.0);
+    EXPECT_NEAR(w, 400.0, 1e-9);
+    EXPECT_NEAR(h, 300.0, 1e-9);
+
+    // Inside-fit: never exceed the host proposal on either axis.
+    w = 800.0; h = 300.0;
+    constrainEditorSize<AspectPlug>(w, h, 1.0);
+    EXPECT_NEAR(w, 400.0, 1e-9);   // limited by height * ratio
+    EXPECT_NEAR(h, 300.0, 1e-9);
+    EXPECT_TRUE(w <= 800.0 && h <= 300.0);
+
+    // Clamped to the 0.5x..3x window.
+    w = 10.0; h = 10.0;
+    constrainEditorSize<AspectPlug>(w, h, 1.0);
+    EXPECT_NEAR(w, 200.0, 1e-9);
+    EXPECT_NEAR(h, 150.0, 1e-9);
 }

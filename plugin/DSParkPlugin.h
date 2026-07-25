@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -11,7 +11,7 @@
  * constexpr parameter table) and implements the familiar DSPark contract
  * (`prepare` / `processBlock` plus a `setParameter` switch). The format
  * backends (plugin/vst3/..., later CLAP and AU) translate that single class
- * into each plugin ABI — no external SDK to install, no base class to
+ * into each plugin ABI - no external SDK to install, no base class to
  * inherit from.
  *
  * ```cpp
@@ -52,7 +52,7 @@
  *
  * State: the wrapper always serialises the parameter table itself (stable
  * text ids hashed to 32 bits, version-tolerant); a user getState/setState
- * blob — e.g. DSPark's StateBlob — rides along as an extra section.
+ * blob - e.g. DSPark's StateBlob - rides along as an extra section.
  */
 
 #include "../Core/AudioSpec.h"
@@ -74,7 +74,7 @@ namespace dspark::plugin {
 /** @brief Plugin category (reflected into each format's class metadata).
  *
  * `Fx` processes audio in place (optionally keyed by a sidechain or driven
- * by MIDI — a vocoder, a MIDI-gated effect). `Instrument` GENERATES audio:
+ * by MIDI - a vocoder, a MIDI-gated effect). `Instrument` GENERATES audio:
  * it has no main audio input in any format (VST3 instrument class, CLAP
  * "instrument" feature, AU `aumu` music device) and almost always pairs
  * with `handleMidiEvent` (see HasMidi). The wrapper clears the output
@@ -92,7 +92,7 @@ enum class Category
  *
  * `productId` (reverse-domain string) is the STABLE identity: the format
  * UIDs (VST3 class id, ...) derive from it deterministically. Changing it
- * after a release orphans every saved project — treat it like an ABI.
+ * after a release orphans every saved project - treat it like an ABI.
  */
 struct Descriptor
 {
@@ -170,7 +170,7 @@ constexpr double toPlain(const Param& p, double normalized) noexcept
     return p.minValue + n * (static_cast<double>(p.maxValue) - p.minValue);
 }
 
-/** @brief Case-insensitive "On"/"Off" recognition — the inverse of the toggle
+/** @brief Case-insensitive "On"/"Off" recognition - the inverse of the toggle
  *  display below. Returns 1 for On, 0 for Off, -1 for anything else. Hosts
  *  round-trip displayed strings through text-to-value (automation lanes,
  *  typed values), so toggles must parse their own output. */
@@ -201,7 +201,7 @@ inline void formatValue(const Param& p, double plain, char* out, int outSize) no
 
 // -- Stable hashing (parameter ids, class UIDs) -------------------------------
 
-/** @brief FNV-1a 32-bit over a C string — the per-parameter host id. */
+/** @brief FNV-1a 32-bit over a C string - the per-parameter host id. */
 constexpr uint32_t hash32(const char* s) noexcept
 {
     uint32_t h = 2166136261u;
@@ -223,6 +223,26 @@ constexpr uint64_t hash64(const char* s, uint64_t salt) noexcept
         h *= 1099511628211ull;
     }
     return h;
+}
+
+/**
+ * @brief Compile-time guarantee that every parameter id hashes uniquely and
+ * collides with neither reserved state id ('PRGM', 'BYPS'). A collision would
+ * silently cross-wire automation and state between two parameters, so the
+ * backends refuse to build: `static_assert(paramIdsUnique<MyPlugin>());`.
+ */
+template <typename P>
+constexpr bool paramIdsUnique() noexcept
+{
+    constexpr size_t n = P::parameters.size();
+    for (size_t i = 0; i < n; ++i)
+    {
+        const uint32_t h = hash32(P::parameters[i].id);
+        if (h == 0x5052474Du || h == 0x42595053u) return false; // 'PRGM'/'BYPS'
+        for (size_t j = i + 1; j < n; ++j)
+            if (hash32(P::parameters[j].id) == h) return false;
+    }
+    return true;
 }
 
 /**
@@ -271,7 +291,7 @@ template <typename P>
 concept HasEditor = requires { P::hasEditor; } && P::hasEditor;
 
 /**
- * @brief Sidechain capability. Implement the two-buffer process — the same
+ * @brief Sidechain capability. Implement the two-buffer process - the same
  * shape DSPark's own dynamics take:
  *
  * ```cpp
@@ -280,12 +300,12 @@ concept HasEditor = requires { P::hasEditor; } && P::hasEditor;
  * ```
  *
  * and every format backend grows a second input the host can route into:
- * a VST3 aux bus, a CLAP non-main port, an AU input element — all named
+ * a VST3 aux bus, a CLAP non-main port, an AU input element - all named
  * "Sidechain". The key view always mirrors the main width (mono main,
  * mono key) and the wrapper guarantees it is valid and frame-aligned with
  * `io` (pre-allocated silence when the host has nothing connected), so
  * the plugin never branches on availability. Treat the sidechain as
- * read-only. Replaces the single-buffer `processBlock` — implement one or
+ * read-only. Replaces the single-buffer `processBlock` - implement one or
  * the other, not both.
  */
 template <typename P>
@@ -302,7 +322,7 @@ concept HasSidechain = requires(P p, AudioBufferView<float> io,
  * Implement `void setTransport(const dspark::plugin::TransportInfo&)
  * noexcept` (see HasTransport) and every backend feeds it from the native
  * source before each processBlock: the VST3 ProcessContext, the CLAP
- * transport event, the AU host callbacks. Check the `*Valid` flags — hosts
+ * transport event, the AU host callbacks. Check the `*Valid` flags - hosts
  * differ in what they provide (an offline renderer may have no timeline at
  * all). Fields hold their defaults when the matching flag is false.
  */
@@ -329,7 +349,7 @@ struct TransportInfo
         return 60.0 / (tempoBpm > 1.0 ? tempoBpm : 120.0);
     }
 
-    /** @brief Samples per quarter note — the basis for tempo-synced delays/LFOs. */
+    /** @brief Samples per quarter note - the basis for tempo-synced delays/LFOs. */
     [[nodiscard]] double samplesPerBeat(double sampleRate) const noexcept
     {
         return secondsPerBeat() * sampleRate;
@@ -385,7 +405,7 @@ struct MidiEvent
 /**
  * @brief MIDI capability: `void handleMidiEvent(const MidiEvent&) noexcept`.
  * Its presence grows a note/event input in every format (VST3 event bus,
- * CLAP note port, AU music-device selectors) — which is also why PluginBase
+ * CLAP note port, AU music-device selectors) - which is also why PluginBase
  * deliberately ships no default for it. Required for Category::Instrument,
  * optional for MIDI-driven effects. Audio thread; allocation-free.
  */
@@ -399,7 +419,7 @@ concept HasMidi = requires(P p, const MidiEvent& e) {
 /**
  * @brief Render-mode capability: `void setOfflineRendering(bool) noexcept`.
  * The host flips it to true for non-realtime bounces (VST3 kOffline setup,
- * the CLAP render extension, AU OfflineRender) — the moment to switch to
+ * the CLAP render extension, AU OfflineRender) - the moment to switch to
  * more expensive algorithms (higher oversampling, longer lookahead). Called
  * outside the audio thread, before processing (re)starts. Default: assume
  * realtime.
@@ -418,7 +438,7 @@ concept HasOfflineMode = requires(P p, bool offline) {
  * the plugin appears on every track type. Declare
  * `static constexpr auto channels = dspark::plugin::ChannelSupport::...;`
  * only to restrict it (e.g. StereoOnly for M/S wideners). All buses of an
- * instance run the same width — a sidechain follows the main pair.
+ * instance run the same width - a sidechain follows the main pair.
  */
 enum class ChannelSupport
 {
@@ -473,7 +493,7 @@ struct PresetDef
     std::array<float, NumValues> values {};
 };
 
-/** @brief Builds one factory preset: `preset("Warm", 6.0f, 0.8f, ...)` —
+/** @brief Builds one factory preset: `preset("Warm", 6.0f, 0.8f, ...)` -
  *  one PLAIN value per parameter, in table order. */
 template <typename... Vs>
 constexpr PresetDef<sizeof...(Vs)> preset(const char* name, Vs... values) noexcept
@@ -482,7 +502,7 @@ constexpr PresetDef<sizeof...(Vs)> preset(const char* name, Vs... values) noexce
 }
 
 /** @brief Builds the factory preset table (all presets must cover the same
- *  parameter count — enforced here; matched against the parameter table by
+ *  parameter count - enforced here; matched against the parameter table by
  *  the backends). Declare as `static constexpr auto factoryPresets = ...`. */
 template <typename First, typename... Rest>
 constexpr std::array<First, 1 + sizeof...(Rest)> presets(First first, Rest... rest) noexcept
@@ -494,8 +514,8 @@ constexpr std::array<First, 1 + sizeof...(Rest)> presets(First first, Rest... re
 
 /**
  * @brief Factory-preset capability: a `static constexpr auto factoryPresets`
- * table built with presets(). The backends publish it natively — a VST3
- * program list, CLAP preset-load + preset-discovery, AU factory presets —
+ * table built with presets(). The backends publish it natively - a VST3
+ * program list, CLAP preset-load + preset-discovery, AU factory presets -
  * so the host's own preset browser offers them. No PluginBase default on
  * purpose: the table's presence changes what hosts display.
  */
@@ -586,7 +606,7 @@ struct BlockEvent
     MidiEvent midi {};          ///< Kind::Midi payload.
 };
 
-/** @brief Stable insertion sort by offset (tiny N, allocation-free —
+/** @brief Stable insertion sort by offset (tiny N, allocation-free -
  *  audio-thread safe; equal offsets keep arrival order). */
 inline void sortBlockEvents(BlockEvent* events, int count) noexcept
 {
@@ -625,7 +645,7 @@ enum class EditorResize
     KeepAspect    ///< Drag-resizable, locked to the declared width:height ratio.
 };
 
-/** @brief `static const char* editorHtml()` — the editor page (HTML/CSS/JS),
+/** @brief `static const char* editorHtml()` - the editor page (HTML/CSS/JS),
  *  usually a raw string literal. Required when `hasEditor` is true. */
 template <typename P>
 concept HasEditorHtml = requires {
@@ -650,12 +670,12 @@ constexpr EditorSize editorSizeOf() noexcept
         return EditorSize {};
 }
 
-/** @brief Optional `static constexpr bool editorResizable = true;` — shorthand
+/** @brief Optional `static constexpr bool editorResizable = true;` - shorthand
  *  for `editorResize = EditorResize::Free` (default: fixed size). */
 template <typename P>
 concept HasEditorResizable = requires { P::editorResizable; } && P::editorResizable;
 
-/** @brief Optional `static constexpr EditorResize editorResize = ...;` —
+/** @brief Optional `static constexpr EditorResize editorResize = ...;` -
  *  full resize policy; takes precedence over `editorResizable`. */
 template <typename P>
 concept HasEditorResize = requires {
@@ -681,7 +701,7 @@ inline constexpr double kEditorMaxSizeFactor = 3.0;
 /**
  * @brief Applies the resize policy of @p P to a size the host proposes:
  * Fixed pins it, Free clamps each axis to the 0.5x..3x window, KeepAspect
- * fits the declared ratio INSIDE the proposal — never exceeding it on
+ * fits the declared ratio INSIDE the proposal - never exceeding it on
  * either axis. That last property is essential: hosts size the plugin area
  * inside a window the user controls, so answering "larger" on any axis
  * pushes the plugin outside its own window (clipped bottom in REAPER).
@@ -716,12 +736,12 @@ constexpr void constrainEditorSize(double& width, double& height, double scale) 
     }
 }
 
-/** @brief Optional `static constexpr bool editorDebug = true;` — enables the
+/** @brief Optional `static constexpr bool editorDebug = true;` - enables the
  *  browser DevTools in the editor (WebView2; development builds only). */
 template <typename P>
 concept HasEditorDebug = requires { P::editorDebug; } && P::editorDebug;
 
-/** @brief Optional `static const char* editorDevFile()` — absolute path of an
+/** @brief Optional `static const char* editorDevFile()` - absolute path of an
  *  HTML file to load INSTEAD of editorHtml() while developing: edit the file,
  *  reopen the editor, no recompile. Falls back to editorHtml() when the file
  *  is missing, so the same build still works elsewhere. Strip from releases. */
@@ -734,21 +754,21 @@ concept HasEditorDevFile = requires {
 
 /**
  * @brief Optional convenience base that makes EVERY contract method visible
- * and overridable from one place — IDE-discoverable, without the virtuals.
+ * and overridable from one place - IDE-discoverable, without the virtuals.
  *
  * ```cpp
  * struct MyPlugin : dspark::plugin::PluginBase<MyPlugin> { ... };
  * ```
  *
  * Each method below ships a safe default; define the same signature in your
- * class to replace it (plain C++ shadowing — resolved at compile time, zero
+ * class to replace it (plain C++ shadowing - resolved at compile time, zero
  * dispatch cost, no `override` keyword involved). Delete nothing, implement
  * what applies, and your IDE's autocomplete shows you the full menu.
  *
  * Inheriting is OPTIONAL: a free-standing struct with the same members works
  * identically (the wrappers detect capabilities structurally either way).
- * You must still provide the two identity members yourself — `descriptor`
- * and `parameters` have no safe default — plus `prepare`, `setParameter`
+ * You must still provide the two identity members yourself - `descriptor`
+ * and `parameters` have no safe default - plus `prepare`, `setParameter`
  * and `processBlock`.
  *
  * Three capabilities have no default here on purpose, because their mere
@@ -779,7 +799,7 @@ struct PluginBase
     /**
      * Samples of delay your chain introduces (lookahead limiters,
      * linear-phase EQ, oversampling, FFT processing). The host shifts other
-     * tracks to compensate — report it accurately or parallel paths phase.
+     * tracks to compensate - report it accurately or parallel paths phase.
      * Read after `prepare()`; sum your DSPark effects' `getLatency()`.
      * Maps to VST3 `getLatencySamples` and the CLAP latency extension.
      * Default: zero latency.
@@ -797,13 +817,13 @@ struct PluginBase
     /**
      * Extra state BEYOND the parameters (learned profiles, loaded IRs,
      * editor layout). The wrapper already saves/restores every parameter by
-     * its stable id on its own — most plugins never touch this pair.
+     * its stable id on its own - most plugins never touch this pair.
      * DSPark's StateBlob (Core/StateBlob.h) is the natural serializer.
      * Default: no extra state.
      */
     [[nodiscard]] std::vector<uint8_t> getState() const { return {}; }
 
-    /** @copydoc getState — restore side. Return false on a foreign blob. */
+    /** @copydoc getState - restore side. Return false on a foreign blob. */
     bool setState(const uint8_t*, size_t) { return false; }
 
     /**
@@ -817,7 +837,7 @@ struct PluginBase
     void setTransport(const TransportInfo&) noexcept {}
 
     /**
-     * Render-mode switch: hosts flip it to true for non-realtime bounces —
+     * Render-mode switch: hosts flip it to true for non-realtime bounces -
      * the moment to raise oversampling or other quality/cost trade-offs.
      * Called outside the audio thread, before processing (re)starts. Maps
      * to the VST3 kOffline process mode, the CLAP render extension and the
@@ -840,7 +860,7 @@ struct PluginBase
 // Every backend stores plugin state in ONE container format so presets stay
 // portable across formats and tolerant across versions (same philosophy as
 // Core/StateBlob): a magic/version header, the parameter table keyed by
-// hash32(id) — unknown ids are skipped, missing ids keep defaults — and an
+// hash32(id) - unknown ids are skipped, missing ids keep defaults - and an
 // optional opaque user-state section appended verbatim.
 
 inline constexpr uint32_t kStateMagic   = 0x4453504Bu;   // "DSPK"
@@ -850,7 +870,7 @@ inline constexpr uint32_t kStateVersion = 1u;
  *  ('PRGM'); never a user parameter. Older builds skip it (unknown id). */
 inline constexpr uint32_t kProgramStateId = 0x5052474Du;
 
-/** @brief Reserved entry id persisting the host bypass ('BYPS' — the same
+/** @brief Reserved entry id persisting the host bypass ('BYPS' - the same
  *  value every backend uses as the bypass ParamID). Hosts treat bypass as
  *  one more parameter, so it must survive a state round-trip like any
  *  other. Older builds skip it (unknown id). */
@@ -938,6 +958,10 @@ inline bool applyState(P& user, const uint8_t* data, size_t size, double* normal
         const uint64_t bits = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
         double v = 0.0;
         std::memcpy(&v, &bits, sizeof(v));
+        // A corrupt blob can carry any bit pattern: a NaN would survive both
+        // range checks below (every comparison is false) and poison the
+        // parameter shadow, so non-finite entries keep the default instead.
+        if (v != v) continue;
         if (id == kProgramStateId)
         {
             if (programIndex != nullptr && v >= 0.0)
@@ -960,7 +984,10 @@ inline bool applyState(P& user, const uint8_t* data, size_t size, double* normal
     }
 
     uint32_t userSize = 0;
-    if (read32(pos, userSize) && userSize > 0 && pos + userSize <= size)
+    // Subtraction form: pos <= size is guaranteed after read32, and on
+    // 32-bit size_t targets (WASM) the addition form `pos + userSize` could
+    // wrap around and admit an out-of-bounds user section.
+    if (read32(pos, userSize) && userSize > 0 && userSize <= size - pos)
     {
         if constexpr (HasSetState<P>)
             user.setState(data + pos, userSize);

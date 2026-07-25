@@ -111,3 +111,6 @@ $RECYCLE.BIN/
 *.ps1
 *.sh
 *.command
+
+# Carpeta de coordinacion de Universal Orchestrator (no versionar)
+Universal-Orchestrator/

@@ -368,14 +368,17 @@ public:
 
     // -- View creation -------------------------------------------------------
 
-    /** @brief Returns a non-owning mutable view of this buffer. */
-    [[nodiscard]] AudioBufferView<T> toView() noexcept
+    /** @brief Returns a non-owning mutable view of this buffer.
+     *  The view's channel capacity is propagated from MaxChannels, so a buffer
+     *  wider than the 16-channel view default is never silently truncated (for
+     *  the default MaxChannels==16 this is exactly AudioBufferView<T>). */
+    [[nodiscard]] AudioBufferView<T, MaxChannels> toView() noexcept
     {
         return { channelPtrs_.data(), numChannels_, numSamples_ };
     }
 
     /** @brief Returns a non-owning const view of this buffer. */
-    [[nodiscard]] AudioBufferView<const T> toView() const noexcept
+    [[nodiscard]] AudioBufferView<const T, MaxChannels> toView() const noexcept
     {
         return { channelPtrs_.data(), numChannels_, numSamples_ };
     }
@@ -435,6 +438,16 @@ private:
         // would make a later, smaller resize() skip its allocation and build
         // channel pointers over a null base.
         allocatedBytes_ = 0;
+        // Drop dangling channel views too: if operator new throws in resize()
+        // right after this call, channelPtrs_/numChannels_ would otherwise
+        // still describe the just-freed block, so a caller catching bad_alloc
+        // and calling getChannel()/toView() would read freed memory. Leave the
+        // object as a safely-empty buffer. The success path re-establishes
+        // these fields after a successful allocation.
+        channelPtrs_.fill(nullptr);
+        numChannels_ = 0;
+        numSamples_  = 0;
+        strideBytes_ = 0;
     }
 
     T* rawData_        = nullptr;

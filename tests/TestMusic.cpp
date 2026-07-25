@@ -242,3 +242,117 @@ DSPARK_TEST(ChordDetector_names_chords)
     ChordDetector<float>::getChordName(r, name, 8);
     EXPECT_TRUE(std::string_view(name) == "F#m7");
 }
+
+// ============================================================================
+// Modal families are exact rotations of their parent scale
+// ============================================================================
+
+namespace {
+
+// Rotate a 12-bit pitch mask so the scale degree `deg` semitones above the
+// old root becomes the new root: mode k of a parent scale is the parent mask
+// rotated by its k-th active degree.
+constexpr NoteSet rotateToDegree(NoteSet parent, int deg)
+{
+    unsigned b = parent & 0x0FFFu;
+    return NoteSet(((b >> deg) | (b << (12 - deg))) & 0x0FFFu);
+}
+
+// Collect the active degrees (semitones) of a mask in ascending order.
+constexpr std::array<int, 12> maskDegrees(NoteSet mask)
+{
+    std::array<int, 12> out{};
+    int n = 0;
+    for (int i = 0; i < 12; ++i)
+        if (mask & (1u << i)) out[n++] = i;
+    for (int i = n; i < 12; ++i) out[i] = -1;
+    return out;
+}
+
+} // namespace
+
+DSPARK_TEST(Harmony_modal_families_are_rotations_of_their_parent)
+{
+    // For the four classical 7-note families the database stores the parent
+    // at the family's first slot and its modes in degree order. Every mode
+    // mask must equal the parent rotated to the corresponding degree - this
+    // is the definition of a mode, so it pins all 28 masks at once.
+    struct Family { int parentIdx; const char* name; };
+    constexpr Family families[] = {
+        {0,  "major"},          // 0..6   Ionian .. Locrian
+        {7,  "melodic minor"},  // 7..13
+        {14, "harmonic minor"}, // 14..20
+        {21, "harmonic major"}, // 21..27
+    };
+
+    for (const auto& fam : families)
+    {
+        const NoteSet parent = allScales[size_t(fam.parentIdx)].mask;
+        const auto degrees = maskDegrees(parent);
+        for (int mode = 0; mode < 7; ++mode)
+        {
+            const NoteSet expected = rotateToDegree(parent, degrees[size_t(mode)]);
+            const NoteSet actual   = allScales[size_t(fam.parentIdx + mode)].mask;
+            EXPECT_EQ(int(actual), int(expected));
+        }
+    }
+
+    // The old database failed this for 5 of the 7 harmonic-major modes
+    // (two of them even duplicated PhrygianDominant / LydianSharp2 exactly).
+    // Spot-check that the corrected modes are all DISTINCT masks.
+    for (int i = 21; i <= 27; ++i)
+        for (int j = i + 1; j <= 27; ++j)
+            EXPECT_TRUE(allScales[size_t(i)].mask != allScales[size_t(j)].mask);
+}
+
+DSPARK_TEST(Harmony_known_scale_masks_pinned)
+{
+    // Independent literature values for scales outside the modal families.
+    auto maskOf = [](std::string_view name) -> NoteSet {
+        for (const auto& s : allScales)
+            if (s.name == name) return s.mask;
+        return 0;
+    };
+
+    // Yo (Japanese anhemitonic pentatonic): D E G A B from D = 0,2,5,7,9.
+    // The old table stored {0,4,5,7,11}, which contains two semitone steps
+    // and is not anhemitonic at all.
+    EXPECT_EQ(int(maskOf("Yo")), int(makeMask({0,2,5,7,9})));
+
+    // Hindu = Mixolydian b6 (Slonimsky). The old table duplicated plain
+    // Mixolydian.
+    EXPECT_EQ(int(maskOf("Hindu")), int(makeMask({0,2,4,5,7,8,10})));
+    EXPECT_TRUE(maskOf("Hindu") != maskOf("Mixolydian"));
+
+    // Javanese = Phrygian natural-6 (seven notes).
+    EXPECT_EQ(int(maskOf("Javanese")), int(makeMask({0,1,3,5,7,9,10})));
+}
+
+DSPARK_TEST(Harmony_note_spelling_follows_key_signature)
+{
+    // Sharp keys spell F# (G major has one sharp); flat keys spell Gb.
+    EXPECT_EQ(noteName(66, 7), std::string_view("F#")); // G major context
+    EXPECT_EQ(noteName(66, 1), std::string_view("Gb")); // Db major context
+    // A, E and B major are sharp keys (the old table spelled them flat).
+    EXPECT_EQ(noteName(61, 9),  std::string_view("C#")); // A major
+    EXPECT_EQ(noteName(68, 4),  std::string_view("G#")); // E major
+    EXPECT_EQ(noteName(70, 11), std::string_view("A#")); // B major
+    // Flat keys stay flat.
+    EXPECT_EQ(noteName(63, 10), std::string_view("Eb")); // Bb major
+    EXPECT_EQ(noteName(68, 8),  std::string_view("Ab")); // Ab major
+}
+
+DSPARK_TEST(Harmony_parseNote_empty_and_tags)
+{
+    // parseNote("") must fail: the old lookup table declared 28 entries but
+    // listed 21, so the value-initialized {"",0} tail made "" parse as C.
+    EXPECT_FALSE(parseNote("").has_value());
+    EXPECT_FALSE(parseNote("H").has_value());
+    EXPECT_TRUE(parseNote("bb").has_value());  // case-insensitive Bb
+
+    // ChordTag algebra: & intersects, hasTags tests containment.
+    constexpr ChordTag both = ChordTag::MajorTriad | ChordTag::Major7;
+    EXPECT_TRUE((both & ChordTag::Major7) == ChordTag::Major7);
+    EXPECT_TRUE(hasTags(both, ChordTag::MajorTriad));
+    EXPECT_TRUE(!hasTags(both, ChordTag::Minor7));
+}

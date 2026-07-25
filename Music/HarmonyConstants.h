@@ -1,20 +1,23 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
 /**
  * @file HarmonyConstants.h
- * @brief Comprehensive musical harmony calculations — scales, chords, MIDI, theory.
+ * @brief Comprehensive musical harmony calculations - scales, chords, MIDI, theory.
  *
  * A complete, strictly constexpr toolkit for working with musical scales and chords.
  * Fully functional at compile-time (`constexpr` / `consteval`) to guarantee zero-overhead
  * runtime execution and generate static data tables for audio plugins and musical analysis.
- * 
+ *
  * Complies with DSPark strict real-time constraints:
  * - Zero allocations (no std::string, no std::vector).
  * - Cache-friendly bitmask operations (O(1) lookups and bitwise rotations).
- * - SIMD/Thread-safe (completely stateless and immutable).
+ *
+ * Threading: everything here is stateless, immutable constexpr data and pure
+ * functions - safe to call concurrently from any thread, including the audio
+ * thread.
  *
  * Dependencies: C++20 standard library only.
  */
@@ -53,10 +56,16 @@ namespace harmony
 
     /**
      * @enum ChordTag
-     * @brief Bitmask flags describing chord "families" compatible with a scale.
+     * @brief Bitmask flags describing chord "families" characteristic of a scale.
      *
-     * Used to filter scales by which chord types are naturally available
-     * inside them without needing to compute intervals dynamically.
+     * Used to filter scales by chord type without computing intervals
+     * dynamically.
+     *
+     * @note The tags stored in allScales are REPRESENTATIVE of each scale's
+     * sonority (typically the root-degree triad and seventh), not an
+     * exhaustive list of every chord family constructible inside the scale.
+     * For exhaustive containment queries use scalesForChordMask(), which
+     * derives the answer from the pitch masks themselves.
      */
     enum class ChordTag : std::uint16_t
     {
@@ -87,6 +96,25 @@ namespace harmony
     {
         using U = std::underlying_type_t<ChordTag>;
         return static_cast<ChordTag>(static_cast<U>(lhs) | static_cast<U>(rhs));
+    }
+
+    /**
+     * @brief Bitwise AND operator for ChordTag flags (intersection).
+     * @return Flags present in both operands.
+     */
+    [[nodiscard]] constexpr ChordTag operator&(ChordTag lhs, ChordTag rhs) noexcept
+    {
+        using U = std::underlying_type_t<ChordTag>;
+        return static_cast<ChordTag>(static_cast<U>(lhs) & static_cast<U>(rhs));
+    }
+
+    /**
+     * @brief Tests whether `tags` contains ALL flags in `wanted`.
+     */
+    [[nodiscard]] constexpr bool hasTags(ChordTag tags, ChordTag wanted) noexcept
+    {
+        using U = std::underlying_type_t<ChordTag>;
+        return (static_cast<U>(tags) & static_cast<U>(wanted)) == static_cast<U>(wanted);
     }
 
     //==============================================================================
@@ -221,14 +249,15 @@ namespace harmony
         scales[19] = {"LydianSharp2",    makeMask({0,3,4,6,7,9,11}), ChordTag::MajorTriad | ChordTag::Major7};
         scales[20] = {"UltraLocrian",    makeMask({0,1,3,4,6,8,9}),  ChordTag::DiminishedTriad | ChordTag::Dim7};
 
-        // Harmonic-major modes
-        scales[21] = {"HarmonicMajor",     makeMask({0,2,4,5,7,8,11}), ChordTag::MajorTriad | ChordTag::AugmentedTriad}; 
-        scales[22] = {"Dorianb5",          makeMask({0,2,3,5,6,9,11}), ChordTag::MinorTriad | ChordTag::DiminishedTriad};
-        scales[23] = {"Phrygianb4",        makeMask({0,1,3,4,6,9,10}), ChordTag::MinorTriad}; 
-        scales[24] = {"LydianMinor",       makeMask({0,2,4,6,7,8,10}), ChordTag::MinorTriad | ChordTag::Minor7};
-        scales[25] = {"Mixolydianb9",      makeMask({0,1,4,5,7,8,10}), ChordTag::MajorTriad | ChordTag::Dominant7};
-        scales[26] = {"LydianAugmented2",  makeMask({0,3,4,6,7,9,11}), ChordTag::MajorTriad | ChordTag::Major7};
-        scales[27] = {"LocrianDiminished", makeMask({0,1,3,4,6,7,9}),  ChordTag::DiminishedTriad | ChordTag::Dim7}; 
+        // Harmonic-major modes (each mask is the exact rotation of scales[21];
+        // the mode test derives them by rotation and pins every one)
+        scales[21] = {"HarmonicMajor",     makeMask({0,2,4,5,7,8,11}), ChordTag::MajorTriad | ChordTag::AugmentedTriad};
+        scales[22] = {"Dorianb5",          makeMask({0,2,3,5,6,9,10}), ChordTag::DiminishedTriad | ChordTag::HalfDim7};
+        scales[23] = {"Phrygianb4",        makeMask({0,1,3,4,7,8,10}), ChordTag::MinorTriad | ChordTag::Minor7};
+        scales[24] = {"LydianDiminished",  makeMask({0,2,3,6,7,9,11}), ChordTag::MinorTriad};
+        scales[25] = {"Mixolydianb9",      makeMask({0,1,4,5,7,9,10}), ChordTag::MajorTriad | ChordTag::Dominant7};
+        scales[26] = {"LydianAugmented2",  makeMask({0,3,4,6,8,9,11}), ChordTag::AugmentedTriad | ChordTag::Major7};
+        scales[27] = {"LocrianDiminished", makeMask({0,1,3,5,6,8,9}),  ChordTag::DiminishedTriad | ChordTag::Dim7};
 
         // Double-harmonic family
         scales[28] = {"DoubleHarmonic",    makeMask({0,1,4,5,7,8,11}), ChordTag::MajorTriad};
@@ -236,14 +265,14 @@ namespace harmony
         scales[30] = {"Byzantine",         makeMask({0,1,4,5,7,8,11}), ChordTag::MajorTriad};
         scales[31] = {"Ionian b5",         makeMask({0,2,4,5,6,9,11}), ChordTag::MajorTriad | ChordTag::DiminishedTriad};
         scales[32] = {"Lydian #6",         makeMask({0,2,4,6,7,10,11}),ChordTag::MajorTriad | ChordTag::Major7};
-        
+
         // Pentatonics
         scales[33] = {"MajorPentatonic",   makeMask({0,2,4,7,9}),      ChordTag::MajorTriad};
         scales[34] = {"MinorPentatonic",   makeMask({0,3,5,7,10}),     ChordTag::MinorTriad};
         scales[35] = {"EgyptianPentatonic",makeMask({0,2,5,7,10}),     ChordTag::MajorTriad};
         scales[36] = {"Hirajoshi",         makeMask({0,2,3,7,8}),      ChordTag::MinorTriad};
         scales[37] = {"InSen",             makeMask({0,1,5,7,10}),     ChordTag::MinorTriad};
-        scales[38] = {"Yo",                makeMask({0,4,5,7,11}),     ChordTag::MajorTriad};
+        scales[38] = {"Yo",                makeMask({0,2,5,7,9}),      ChordTag::MajorTriad};
 
         // Symmetrical / exotic
         scales[39] = {"WholeTone",         makeMask({0,2,4,6,8,10}),               ChordTag::AugmentedTriad};
@@ -258,10 +287,10 @@ namespace harmony
         scales[46] = {"Balinese",          makeMask({0,1,3,7,8}),        ChordTag::MinorTriad};
         scales[47] = {"Chinese",           makeMask({0,4,6,7,11}),       ChordTag::MajorTriad};
         scales[48] = {"Gypsy",             makeMask({0,1,4,5,7,8,10}),   ChordTag::MajorTriad | ChordTag::Dominant7};
-        scales[49] = {"Hindu",             makeMask({0,2,4,5,7,9,10}),   ChordTag::MajorTriad | ChordTag::Dominant7};
+        scales[49] = {"Hindu",             makeMask({0,2,4,5,7,8,10}),   ChordTag::MajorTriad | ChordTag::Dominant7};
         scales[50] = {"Hungarian",         makeMask({0,2,3,6,7,8,11}),   ChordTag::MinorTriad};
         scales[51] = {"Japanese",          makeMask({0,1,5,7,8}),        ChordTag::MinorTriad};
-        scales[52] = {"Javanese",          makeMask({0,1,3,5,7,10}),     ChordTag::MajorTriad};
+        scales[52] = {"Javanese",          makeMask({0,1,3,5,7,9,10}),   ChordTag::MinorTriad | ChordTag::Minor7};
         scales[53] = {"Mongolian",         makeMask({0,2,4,7,9}),        ChordTag::MajorTriad};
         scales[54] = {"Neapolitan",        makeMask({0,1,3,5,7,8,11}),   ChordTag::MinorTriad};
         scales[55] = {"Oriental",          makeMask({0,1,4,5,6,9,10}),   ChordTag::MajorTriad};
@@ -280,8 +309,11 @@ namespace harmony
     inline constexpr std::array<std::string_view, 12> flatNames{
         "C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"
     };
+    // Standard key-signature spelling per chromatic root: sharps for C, D, E,
+    // F#, G, A, B (and C# > Db is resolved toward flats, Db being the common
+    // key); flats for Db, Eb, F, Ab, Bb.
     inline constexpr std::array<bool,12> useSharpsForRoot{
-        1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0
+        1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1
     };
 
     //==============================================================================
@@ -308,7 +340,10 @@ namespace harmony
      */
     [[nodiscard]] constexpr std::optional<int> parseNote(std::string_view s) noexcept
     {
-        constexpr std::array<std::pair<std::string_view,int>, 28> lut{{
+        // Exactly 21 entries: a larger array would value-initialize the rest
+        // to {"", 0}, and the empty name would make parseNote("") "succeed"
+        // as pitch-class 0 instead of returning nullopt.
+        constexpr std::array<std::pair<std::string_view,int>, 21> lut{{
             {"C",0}, {"B#",0},
             {"C#",1}, {"Db",1},
             {"D",2}, {"D#",3}, {"Eb",3},
@@ -552,7 +587,7 @@ namespace harmony
             case ChordLevel::Triads7911:   buildName(name7, ChordLevel::Triads7911);   break;
             case ChordLevel::Triads791113: buildName(name7, ChordLevel::Triads791113); break;
         }
-        
+
         return c;
     }
 
@@ -600,9 +635,9 @@ namespace harmony
     {
         if (note.empty()) return 4;
         std::size_t len = note.size();
-        
+
         while (len > 0 && note[len - 1] >= '0' && note[len - 1] <= '9') { --len; }
-        
+
         bool isNegative = false;
         if (len > 0 && note[len - 1] == '-') {
             isNegative = true;
@@ -617,8 +652,8 @@ namespace harmony
             }
             return isNegative ? -parsed : parsed;
         }
-        
-        return 4; 
+
+        return 4;
     }
 
     /**

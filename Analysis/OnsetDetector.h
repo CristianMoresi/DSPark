@@ -22,13 +22,15 @@
  * for the deterministic latency contract below. It is the shared onset
  * front-end consumed by BeatTracker (ADR-009).
  *
- * Latency (ONE definition, D-2). Frame N (default 2048, Hann), hop = fs/200
- * (~220 samples at 44.1 kHz, ~5 ms). The detector reports every onset at a
+ * Latency (ONE definition, D-2). Frame N (default 2048, Hann), hop =
+ * round(fs/200) (221 samples at 44.1 kHz, 240 at 48 kHz; ~5 ms). The detector
+ * reports every onset at a
  * single fixed causal reporting latency
  *
  *     L = fftSize + hop        (getLatencySamples()).
  *
- * At 44.1 kHz with the defaults this is 2048 + 220 = 2268 samples (~51.4 ms).
+ * At 44.1 kHz with the defaults this is 2048 + 221 = 2269 samples (~51.4 ms;
+ * 2048 + 240 = 2288 at 48 kHz).
  * The onsetDetected() latch asserts exactly L samples after the onset's
  * reference sample (the analysis-frame centre that localises the transient).
  * Detection completes internally earlier (~fftSize/2 + hop); events are held
@@ -755,7 +757,7 @@ private:
     double sampleRate_ = 44100.0;
     int fftSize_ = 2048;
     int numBins_ = 1025;
-    int hop_ = 220;
+    int hop_ = 221;
     int numBands_ = 1;
     int muFrames_ = 1;
     int localizationOffset_ = 0;
@@ -809,7 +811,7 @@ private:
     std::atomic<bool> onsetLatched_ { false };
     std::atomic<T> onsetStrength_ { T(0) };
     std::atomic<int64_t> lastOnsetSample_ { -1 };
-    std::atomic<int64_t> latencySamples_ { 2268 };
+    std::atomic<int64_t> latencySamples_ { 2269 };
 };
 
 } // namespace dspark

@@ -121,6 +121,14 @@ public:
             auto& r = routes_[static_cast<size_t>(i)];
             const T depth = r.depth.load(std::memory_order_relaxed);
             const T value = r.base + r.source() * depth;
+            // Defensive: a transiently non-finite source would otherwise poison
+            // r.state permanently (NaN is sticky through the one-pole). Hold the
+            // last good value instead, matching DryWetMixer's isnan guard.
+            if (!std::isfinite(value))
+            {
+                r.target(r.state);
+                continue;
+            }
             if (!r.primed || r.smoothMs <= T(0))
             {
                 r.state = value;     // no sweep-in from zero on the first hit

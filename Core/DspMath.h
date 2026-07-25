@@ -197,9 +197,12 @@ template <FloatType T>
 /**
  * @brief Fast sine approximation (degree-9 odd minimax polynomial).
  *
- * Maximum error ~4e-6 in float (over 100 dB below the signal) and below 1e-7
- * in double: inaudible even for audio-rate synthesis in either precision.
- * About 3-6x faster than std::sin depending on platform. The input is
+ * Maximum error ~4e-6 in either precision (over 110 dB below the signal):
+ * inaudible even for audio-rate synthesis. The degree-9 minimax coefficients
+ * are stored to ~7 significant digits, so the double path is coefficient-
+ * limited to the same ~3.2e-6 as float rather than reaching double's own
+ * resolution (measured M-002, audit_ag2). Use std::sin where sub-ppm accuracy
+ * is required. About 3-6x faster than std::sin depending on platform. The input is
  * range-reduced internally (two-term Cody-Waite), so any finite argument
  * within a few thousand periods of zero stays accurate.
  *
@@ -221,7 +224,9 @@ template <FloatType T>
     else if (x < -halfPi<T>) x = -pi<T> - x;
 
     const T x2 = x * x;
-    // Minimax coefficients for sin on [-pi/2, pi/2], max abs error ~6e-8.
+    // Minimax coefficients for sin on [-pi/2, pi/2]. Stored to ~7 digits, so
+    // the realised max abs error is ~3.2e-6 (coefficient-limited, identical in
+    // float and double; measured M-002).
     return x * (T(0.9999999995)
          + x2 * (T(-0.1666666580)
          + x2 * (T(0.0083333075)

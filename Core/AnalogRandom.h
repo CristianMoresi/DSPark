@@ -607,8 +607,9 @@ namespace dspark
                 pinkNoiseOctaves_[5] = b5;
                 pinkNoiseOctaves_[6] = white * static_cast<Real>(0.115926);
 
-                // Normalisation keeps the peak below unity for white in [-1,1]
-                // (measured peak ~0.83 over 1e6 samples); output RMS ~0.19.
+                // Normalisation keeps the peak below unity for white in [-1,1].
+                // The peak grows with run length; measured worst case ~0.90 over
+                // 2^21 samples (RMS ~0.19), leaving headroom to full scale.
                 return pink * static_cast<Real>(0.11);
             }
 

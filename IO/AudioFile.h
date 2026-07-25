@@ -1,5 +1,5 @@
-// DSPark — Professional Audio DSP Framework
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi - MIT License
 
 #pragma once
 
@@ -7,20 +7,26 @@
  * @file AudioFile.h
  * @brief Abstract interface for reading and writing audio files.
  *
- * Defines a common contract for audio file I/O implementations (WAV, AIFF, etc.).
+ * Defines a common contract for audio file I/O implementations (WAV, MP3, ...).
  * Focuses on offline processing and buffer preparation.
  *
  * @warning DANGER: Disk I/O is non-deterministic and blocking. NEVER call any
- * methods from this class inside the real-time audio thread. Do all file 
+ * methods from this class inside the real-time audio thread. Do all file
  * operations in a secondary thread or during the initialization phase.
+ *
+ * Threading: owner-managed. One instance serves one file from one thread at a
+ * time; no internal synchronization is provided. Concurrent calls on the same
+ * instance (including close() racing a read) are not supported.
+ *
+ * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
-#include <algorithm>
 #include <limits>
 
 namespace dspark {
@@ -40,7 +46,13 @@ struct AudioFileInfo
     /** @brief Total number of sample frames in the file. */
     int64_t numSamples = 0;
 
-    /** @brief Bits per sample in the stored format (8, 16, 24, 32, 64). */
+    /**
+     * @brief Bits per sample in the stored format (8, 16, 24, 32, 64).
+     *
+     * @note Format-specific overload: when writing MP3 (Mp3File::openWrite),
+     * this field carries the target bitrate in kbps instead (e.g., 320).
+     * MP3 has no per-sample bit depth.
+     */
     uint32_t bitsPerSample = 16;
 
     /** @brief True if the file stores floating-point samples (IEEE 754). */
@@ -49,18 +61,29 @@ struct AudioFileInfo
     /**
      * @brief Converts this file info to an AudioSpec for processor preparation.
      *
-     * @warning If processing offline in a single block, passing 0 will attempt 
-     * to use the full file length. This can cause massive memory allocations 
+     * @warning If processing offline in a single block, passing 0 will attempt
+     * to use the full file length. This can cause massive memory allocations
      * for large files.
      *
-     * @param defaultBlockSize Desired block size. If 0, uses the entire file length (offline mode).
+     * @note The spec inherits this struct's dimensions verbatim. If the info
+     * describes an empty or unopened file (numChannels == 0 or numSamples == 0
+     * with no explicit block size), the returned spec fails
+     * AudioSpec::isValid() -- check it before calling prepare(). Framework
+     * processors reject invalid specs as a safe no-op.
+     *
+     * @param defaultBlockSize Desired block size. Values <= 0 select the
+     *        entire file length (offline single-block mode).
      * @return AudioSpec configured with the file's sample rate and channels.
      */
     [[nodiscard]] AudioSpec toSpec(int defaultBlockSize = 0) const noexcept
     {
-        // Clamp to avoid integer overflow if numSamples exceeds 2.14B (INT_MAX)
-        int safeFullLength = static_cast<int>(std::min<int64_t>(numSamples, std::numeric_limits<int>::max()));
-        
+        // Clamp to [0, INT_MAX]: numSamples beyond 2^31-1 frames cannot be a
+        // single block, and a negative count (corrupt info) must not produce
+        // a "valid-looking" negative block size.
+        const int64_t clamped = std::clamp<int64_t>(
+            numSamples, 0, std::numeric_limits<int>::max());
+        const int safeFullLength = static_cast<int>(clamped);
+
         return {
             .sampleRate   = sampleRate,
             .maxBlockSize = (defaultBlockSize > 0) ? defaultBlockSize : safeFullLength,
@@ -74,10 +97,11 @@ struct AudioFileInfo
  * @brief Abstract base class for audio file readers and writers.
  *
  * Provides a uniform API to transfer audio to/from AudioBufferView objects.
- * Samples are automatically normalized to the [-1.0, 1.0] float range.
- * 
- * @note Reading 32-bit integer PCM files into float buffers will result in a 
- * loss of the 8 least significant bits due to 24-bit mantissa limitations. 
+ * Samples are normalized to the [-1.0, 1.0] float range: implementations
+ * convert to/from the stored bit depth transparently.
+ *
+ * @note Reading 32-bit integer PCM files into float buffers will result in a
+ * loss of the 8 least significant bits due to 24-bit mantissa limitations.
  */
 class AudioFile
 {
@@ -87,6 +111,8 @@ public:
     /**
      * @brief Opens a file for reading.
      *
+     * Any previously open file is closed first.
+     *
      * @param path File path using C++20 std::filesystem (handles UTF-8/cross-platform safely).
      * @return True if opened and header parsed successfully. False otherwise.
      */
@@ -94,6 +120,8 @@ public:
 
     /**
      * @brief Opens a file for writing, creating it or overwriting if it exists.
+     *
+     * Any previously open file is closed first.
      *
      * @param path File path.
      * @param info Desired output format metadata.
@@ -108,18 +136,25 @@ public:
     [[nodiscard]] virtual AudioFileInfo getInfo() const = 0;
 
     /**
-     * @brief Reads all samples from the file into the destination buffer view.
+     * @brief Reads samples from the start of the file into the destination view.
      *
-     * Excess buffer space is left untouched. It is the caller's responsibility 
-     * to ensure the view has adequate capacity.
+     * Reads up to min(view length, file length) frames into up to
+     * min(view channels, file channels) channels. Excess buffer space and
+     * channels beyond those present in the file are left untouched.
      *
      * @param dest Buffer view to receive the audio data.
-     * @return True if read completely. False if an I/O error occurred.
+     * @return True if read successfully. False if an I/O error occurred or no
+     *         file is open for reading.
      */
     [[nodiscard]] virtual bool readSamples(AudioBufferView<float> dest) = 0;
 
     /**
      * @brief Reads a specific range of sample frames. Useful for chunked streaming.
+     *
+     * The requested range must lie entirely within the file
+     * (startFrame >= 0, numFrames > 0, startFrame + numFrames <= numSamples);
+     * out-of-range requests return false without reading. As with the
+     * full-file overload, the transfer is clamped to the view's capacity.
      *
      * @param dest Buffer view to receive the audio data.
      * @param startFrame The absolute frame index in the file to start reading from.
@@ -133,6 +168,7 @@ public:
      * @brief Writes samples from the view to the file.
      *
      * Converts float [-1.0, 1.0] back to the native bit-depth defined in openWrite().
+     * May be called repeatedly to append blocks (streaming writes).
      *
      * @param src Buffer view containing the data to write.
      * @return True on success, False if disk is full or an I/O error occurred.
@@ -141,7 +177,11 @@ public:
 
     /**
      * @brief Finalizes file headers and releases system handles.
-     * Safe to call multiple times. Automatically called on destruction.
+     *
+     * Safe to call multiple times. Implementations invoke this from their
+     * destructor, so an open file is always finalized; call it explicitly
+     * when you need the write error-checked (a destructor cannot report
+     * failure) or the file released before the object dies.
      */
     virtual void close() = 0;
 

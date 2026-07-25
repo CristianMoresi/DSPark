@@ -8,7 +8,9 @@
 #include "../IO/Mp3File.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 using namespace dspark;
@@ -330,4 +332,49 @@ DSPARK_TEST(Mp3File_metadata_preserved)
 
         reader.close();
     }
+}
+
+// ============================================================================
+// AudioFileInfo::toSpec - dimension mapping and degenerate inputs
+// ============================================================================
+
+DSPARK_TEST(AudioFileInfo_toSpec_maps_and_sanitizes)
+{
+    // Normal file, explicit block size
+    AudioFileInfo info;
+    info.sampleRate = 48000.0;
+    info.numChannels = 2;
+    info.numSamples = 100000;
+
+    AudioSpec spec = info.toSpec(512);
+    EXPECT_TRUE(spec.isValid());
+    EXPECT_NEAR(spec.sampleRate, 48000.0, 1e-9);
+    EXPECT_EQ(spec.maxBlockSize, 512);
+    EXPECT_EQ(spec.numChannels, 2);
+
+    // Offline mode (no block size) uses the full file length
+    AudioSpec offline = info.toSpec();
+    EXPECT_TRUE(offline.isValid());
+    EXPECT_EQ(offline.maxBlockSize, 100000);
+
+    // Negative block size behaves like "unspecified" (full length)
+    EXPECT_EQ(info.toSpec(-5).maxBlockSize, 100000);
+
+    // Frame counts beyond INT_MAX clamp instead of overflowing the cast
+    AudioFileInfo huge = info;
+    huge.numSamples = int64_t(1) << 40;
+    EXPECT_EQ(huge.toSpec().maxBlockSize, std::numeric_limits<int>::max());
+
+    // Corrupt negative frame count clamps to 0 -> invalid spec, never a
+    // negative block size masquerading as usable
+    AudioFileInfo corrupt = info;
+    corrupt.numSamples = -1234;
+    AudioSpec bad = corrupt.toSpec();
+    EXPECT_EQ(bad.maxBlockSize, 0);
+    EXPECT_TRUE(!bad.isValid());
+
+    // Default-constructed info (unopened file) yields an invalid spec that
+    // framework processors reject as a no-op
+    AudioFileInfo unopened;
+    EXPECT_TRUE(!unopened.toSpec().isValid());
 }

@@ -682,6 +682,79 @@ DSPARK_TEST(Expander_deep_attenuation_below_threshold)
     EXPECT_LT(peakAfter, 0.01f);
 }
 
+// M-004 (AG-3) regression: the downward-expander transfer slope below threshold
+// must be (R-1), not the compressor law (1-1/R). With threshold -20 dB, R=3 and
+// a signal 15 dB under threshold (well above the -60 dB range floor), the
+// correct attenuation is ~(R-1)*15 = 30 dB (gain ~0.032), whereas the old
+// (1-1/R)*15 = 10 dB (gain ~0.32) leaves the output ~20 dB too loud. Every prior
+// Expander test drove the signal deep enough that the range floor clamped both
+// formulas identically, so none of them distinguished the two laws.
+DSPARK_TEST(Expander_downward_slope_is_ratio_minus_one)
+{
+    Expander<float> exp;
+    exp.prepare(44100.0);
+    exp.setThreshold(-20.0f);
+    exp.setRatio(3.0f);
+    exp.setRange(-60.0f);      // floor far below the expected -50..-65 dBFS output
+    exp.setAttack(0.1f);
+    exp.setHold(0.0f);
+    exp.setRelease(5.0f);
+
+    auto tb = makeMonoBuffer(16384);
+    tb.fillSine(440.0f, 44100.0f, 0.017783f); // ~-35 dBFS peak => ~15 dB under thr
+
+    exp.processBlock(tb.view());
+    const float peakAfter = measurePeak(tb.ch(0) + 12288, 4096); // settled tail
+
+    // Fixed (R-1) law lands near 0.0006 (peak-det) .. 0.0003 (rms-det); the old
+    // (1-1/R) law lands near 0.0056. The band below cleanly separates them and
+    // stays above the range floor (~1.8e-5), so it fails on either regression.
+    EXPECT_LT(peakAfter, 0.0018f);
+    EXPECT_GT(peakAfter, 0.00008f);
+}
+
+// M-004 (AG-3) regression: setCrossoverFrequency keeps the split frequencies
+// sorted ascending (the internal sort was reimplemented as an explicit insertion
+// sort to avoid a spurious GCC -O2 -Warray-bounds on the fixed array; this pins
+// that the ordering behaviour is preserved).
+DSPARK_TEST(CrossoverFilter_frequencies_stay_sorted)
+{
+    CrossoverFilter<float, 8> xo;
+    xo.prepare(spec(48000.0, 512, 2));
+    xo.setNumBands(4); // 3 split points, ascending log-spaced defaults
+    // Assign the HIGHEST split index the LOWEST frequency: only a working sort
+    // migrates it to index 0 and keeps the whole set ascending.
+    xo.setCrossoverFrequency(2, 50.0f);
+    const float f0 = xo.getCrossoverFrequency(0);
+    const float f1 = xo.getCrossoverFrequency(1);
+    const float f2 = xo.getCrossoverFrequency(2);
+    EXPECT_NEAR(f0, 50.0f, 1.0f); // 50 Hz sorted down to split 0
+    EXPECT_LT(f0, f1);
+    EXPECT_LT(f1, f2);
+}
+
+// M-004 (RF-009 / ADR-011): DynamicEQ's internal oversampling is transparent -
+// factor 1 = OFF adds zero latency, and enabling 2x/4x reports the added group
+// delay through getLatency() so a host can compensate (PDC). Pins the policy.
+DSPARK_TEST(DynamicEQ_oversampling_is_configurable_and_reported)
+{
+    const AudioSpec sp = spec(48000.0, 512, 2);
+
+    DynamicEQ<float> off;
+    off.setOversampling(1);
+    off.prepare(sp);
+    EXPECT_EQ(off.getLatency(), 0);           // 1x = off => no added latency
+
+    DynamicEQ<float> os2; os2.setOversampling(2); os2.prepare(sp);
+    DynamicEQ<float> os4; os4.setOversampling(4); os4.prepare(sp);
+    EXPECT_GT(os2.getLatency(), 0);           // 2x reports its group delay
+    EXPECT_GT(os4.getLatency(), os2.getLatency()); // 4x reports more than 2x
+
+    // Factor 3 rounds up to 4 (documented; engine is power-of-two).
+    DynamicEQ<float> os3; os3.setOversampling(3); os3.prepare(sp);
+    EXPECT_EQ(os3.getLatency(), os4.getLatency());
+}
+
 // NaN attack/release/ratio used to poison the gain smoother PERMANENTLY (7168
 // non-finite samples measured after recovery), prepare(NaN) passed the old
 // max(NaN, 1.0) guard and stormed, a negative sidechain-HPF cutoff flipped the

@@ -297,9 +297,24 @@ public:
 
             localTargets[static_cast<size_t>(index)] = freqHz;
 
-            // Sort on the UI thread to avoid Audio Thread priority inversion/CPU spikes
-            int activeSplits = numBands_.load(std::memory_order_relaxed) - 1;
-            std::sort(localTargets.begin(), localTargets.begin() + activeSplits);
+            // Sort on the UI thread to avoid Audio Thread priority inversion/CPU
+            // spikes. activeSplits is in [0, kMaxSplits] (numBands_ is clamped to
+            // [2, MaxBands]); an explicit insertion sort over this tiny fixed
+            // array is exact for the <=11 elements and avoids libstdc++'s generic
+            // std::sort, whose internal threshold constant trips a spurious GCC
+            // -O2 -Warray-bounds on the small std::array.
+            const int activeSplits = std::clamp(numBands_.load(std::memory_order_relaxed) - 1, 0, kMaxSplits);
+            for (int i = 1; i < activeSplits; ++i)
+            {
+                const T key = localTargets[static_cast<size_t>(i)];
+                int j = i - 1;
+                while (j >= 0 && localTargets[static_cast<size_t>(j)] > key)
+                {
+                    localTargets[static_cast<size_t>(j + 1)] = localTargets[static_cast<size_t>(j)];
+                    --j;
+                }
+                localTargets[static_cast<size_t>(j + 1)] = key;
+            }
 
             for (int i = 0; i < kMaxSplits; ++i)
                 targetFrequencies_[i].store(localTargets[static_cast<size_t>(i)], std::memory_order_relaxed);

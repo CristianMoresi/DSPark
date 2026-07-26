@@ -403,7 +403,14 @@ protected:
         else
         {
             T underDb = cachedThreshold_ - levelDb;
-            T reductionDb = underDb * (T(1) - T(1) / cachedRatio_);
+            // Downward-expander law: the transfer slope below threshold is the
+            // ratio R (out = thr + R*(in - thr)), so the attenuation applied is
+            // underDb*(R-1). As R -> inf this approaches full closure, i.e. the
+            // gate the class documents itself as a generalization of. (The prior
+            // (1 - 1/R) was the *compressor* law and made the expander ~R too
+            // gentle -- e.g. 5 dB instead of 10 dB of extra attenuation 10 dB
+            // below threshold at R=2, and it could never approach a gate.)
+            T reductionDb = underDb * (cachedRatio_ - T(1));
 
             // Optimization note: replace decibelsToGain with fast_exp10 if available
             T expandedGain = decibelsToGain(-reductionDb);

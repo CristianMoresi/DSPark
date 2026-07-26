@@ -205,6 +205,20 @@ algorithm needs it, and the Compressor's gain path stays at or below
 attack). A section like the one above earns its resampler when you drive
 custom waveshaping hard, not for dynamics alone.
 
+Transparency (RF-009 / ADR-011): every processor that oversamples internally
+exposes the factor via `setOversampling(int)` with **factor = 1 meaning OFF**
+(no internal resampling, zero added latency), supports at least {1, 2, 4}, and
+reports the added latency through `getLatency()` so the host can compensate.
+`DynamicEQ` embeds such a stage and **defaults to 1x (off)**: turn it up to 2x
+or 4x only when a band's detector needs the extra alias suppression, and leave
+it at 1x when you already oversample the whole section (above) to avoid
+cascaded resamplers. Cost scales roughly linearly with the factor; the exact
+per-factor latency is whatever `getLatency()` returns for the active setting.
+The `Compressor` does NOT run an internal audio-path resampler: its optional
+TruePeak mode oversamples only the *detector* (ITU-R BS.1770 inter-sample peak
+measurement), which adds no audio-path latency and cannot cascade, so there is
+no factor to configure there.
+
 ## 11. Hardware compressor recipes
 
 The Compressor's characters are calibrated against the published hardware

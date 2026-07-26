@@ -235,8 +235,23 @@ public:
     }
 
     /**
-     * @brief Sets the oversampling factor (1, 2 or 4). Setup threads only:
-     *        this un-prepares the processor and requires a prepare() call.
+     * @brief Sets the internal oversampling factor (RF-009 / ADR-011).
+     *
+     * Transparency policy: the factor is host-visible, fully configurable and
+     * can be turned OFF.
+     * - Supported factors: {1, 2, 4}. **DEFAULT is 1 = OFF** (no internal
+     *   resampling, zero added latency, no hidden cascaded resampler). 3 rounds
+     *   up to 4 (the underlying Oversampling engine works in powers of two);
+     *   values outside [1,4] are clamped.
+     * - CPU/latency cost per factor (relative to 1x=off): 2x roughly doubles the
+     *   per-band detector+filter work and adds the half-band polyphase group
+     *   delay; 4x roughly quadruples it and adds ~2x that group delay. The exact
+     *   added latency for the active factor is reported by getLatency() so the
+     *   host can apply correct PDC. Prefer 1x and oversample the whole nonlinear
+     *   section once (docs/cookbook.md) when a chain already oversamples.
+     *
+     * @note Setup threads only: this un-prepares the processor and requires a
+     *       prepare() call before the new factor takes effect.
      */
     void setOversampling(int factor) noexcept
     {

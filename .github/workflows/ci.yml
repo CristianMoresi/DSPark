@@ -405,6 +405,44 @@ jobs:
           ctest --test-dir build-san --output-on-failure
 
   # ---------------------------------------------------------------------------
+  # ThreadSanitizer (Linux GCC) — data-race detection for the lock-free code
+  # (SpectrumAnalyzer triple buffer, SpscQueue, atomic parameter handoff). TSan
+  # models the C++11 memory model precisely, so it is the correct oracle for
+  # these paths; it CANNOT be combined with ASan/UBSan, hence a separate build.
+  # (It is unavailable on the local audit sandbox, where the kernel blocks the
+  # personality() syscall TSan needs at startup; it runs normally on the CI
+  # Linux runner.)
+  # ---------------------------------------------------------------------------
+  tsan:
+    name: ThreadSanitizer (Linux GCC)
+    runs-on: ubuntu-latest
+    env:
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with ThreadSanitizer
+        run: >
+          g++ -std=c++20 -O1 -g -Wall -Wextra
+          -fsanitize=thread
+          -I . conformance/dspark_conformance.cpp -o dspark_conformance_tsan
+      - name: Run under ThreadSanitizer
+        run: ./dspark_conformance_tsan
+
+      # The suite exercises the concurrent readouts (SpectrumAnalyzer,
+      # LoudnessMeter, LevelFollower) far more than the conformance checks do,
+      # so it is where a real data race is most likely to surface. Some cases
+      # run slower under TSan instrumentation: raise the ctest timeout rather
+      # than skip anything.
+      - name: Build + run the test suite under ThreadSanitizer
+        run: |
+          cmake -S . -B build-tsan \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DDSPARK_BUILD_TESTS=ON -DDSPARK_BUILD_CONFORMANCE=OFF \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread"
+          cmake --build build-tsan --parallel
+          ctest --test-dir build-tsan --output-on-failure --timeout 1800
+
+  # ---------------------------------------------------------------------------
   # WebAssembly (Emscripten) — compile and execute with node
   # ---------------------------------------------------------------------------
   wasm:

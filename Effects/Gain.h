@@ -264,7 +264,7 @@ public:
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
         StateWriter w(stateId("GAIN"), 1);
-        w.write("gainLinear", targetGainLinear_.load(std::memory_order_relaxed));
+        w.write("gainLinear", static_cast<float>(targetGainLinear_.load(std::memory_order_relaxed)));
         w.write("rampMs", static_cast<float>(rampTimeMs_.load(std::memory_order_relaxed)));
         w.write("muted", muted_.load(std::memory_order_relaxed));
         w.write("inverted", inverted_.load(std::memory_order_relaxed));

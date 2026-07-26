@@ -382,6 +382,52 @@ DSPARK_TEST(State_json_escapes_hostile_keys_and_roundtrips)
 
 // D-M003-4b: a non-finite float payload must render as legal JSON (never bare
 // nan/inf) and still parse back (rendered as 0).
+// M-004 (AG-3) regression: getState() must COMPILE and round-trip for the
+// double specialisation. Limiter/NoiseGate/Gain used to pass an unqualified
+// T=double to StateWriter::write(), which is ambiguous (float/int32/bool) and
+// broke the public getState() for the supported double type; the others cast to
+// float. This pin instantiates getState()/setState() for T=double across every
+// AG-3 dynamics/gain header so the ambiguity cannot silently return.
+DSPARK_TEST(State_roundtrip_dynamics_double)
+{
+    EXPECT_TRUE((roundTrip<Limiter<double>>([](auto& l) {
+        l.setCeiling(-1.2); l.setRelease(60.0); l.setTruePeak(true);
+        l.setAdaptiveRelease(true); l.setLookahead(7.5);
+    })));
+    EXPECT_TRUE((roundTrip<NoiseGate<double>>([](auto& g) {
+        g.setThreshold(-52.0); g.setHold(80.0); g.setDuckMode(true);
+        g.setGateMode(NoiseGate<double>::GateMode::Frequency);
+        g.setSidechainHPF(true, 150.0);
+    })));
+    EXPECT_TRUE((roundTrip<Gain<double>>([](auto& g) {
+        g.setGainDb(-4.5); g.setInverted(true);
+    })));
+    EXPECT_TRUE((roundTrip<Compressor<double>>([](auto& c) {
+        c.setThreshold(-28.5); c.setRatio(3.3); c.setKnee(6.0);
+    })));
+    EXPECT_TRUE((roundTrip<Expander<double>>([](auto& e) {
+        e.setThreshold(-46.0); e.setRatio(2.5); e.setRange(-60.0);
+    })));
+    EXPECT_TRUE((roundTrip<DeEsser<double>>([](auto& d) {
+        d.setFrequency(6200.0); d.setThreshold(-25.0); d.setReduction(9.0);
+    })));
+    EXPECT_TRUE((roundTrip<TransientDesigner<double>>([](auto& t) {
+        t.setAttack(40.0); t.setSustain(-30.0);
+    })));
+    EXPECT_TRUE((roundTrip<AutoGain<double>>([](auto& a) {
+        a.setMaxCompensation(9.0); a.setSmoothingTime(50.0);
+    })));
+    EXPECT_TRUE((roundTrip<DynamicEQ<double>>([](auto& e) {
+        e.setNumBands(3);
+    })));
+    EXPECT_TRUE((roundTrip<CrossoverFilter<double>>([](auto& x) {
+        x.setNumBands(3); x.setOrder(24);
+    })));
+    EXPECT_TRUE((roundTrip<MultibandCompressor<double>>([](auto& m) {
+        m.setNumBands(3);
+    })));
+}
+
 DSPARK_TEST(State_json_non_finite_float_is_legal)
 {
     StateWriter w(0x4E414E31u, 1);

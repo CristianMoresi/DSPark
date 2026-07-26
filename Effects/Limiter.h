@@ -417,9 +417,9 @@ public:
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
         StateWriter w(stateId("LIMT"), 1);
-        w.write("ceiling", ceilingDb_.load(std::memory_order_relaxed));
-        w.write("release", releaseMs_.load(std::memory_order_relaxed));
-        w.write("lookahead", lookaheadMs_.load(std::memory_order_relaxed));
+        w.write("ceiling", static_cast<float>(ceilingDb_.load(std::memory_order_relaxed)));
+        w.write("release", static_cast<float>(releaseMs_.load(std::memory_order_relaxed)));
+        w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
         w.write("truePeak", truePeakEnabled_.load(std::memory_order_relaxed));
         w.write("adaptive", adaptiveRelease_.load(std::memory_order_relaxed));
         w.write("safetyClip", safetyClipEnabled_.load(std::memory_order_relaxed));

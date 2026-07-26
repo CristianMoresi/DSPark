@@ -396,17 +396,17 @@ public:
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
         StateWriter w(stateId("GATE"), 1);
-        w.write("threshold", threshold_.load(std::memory_order_relaxed));
-        w.write("hysteresis", hysteresis_.load(std::memory_order_relaxed));
-        w.write("attack", attackMs_.load(std::memory_order_relaxed));
-        w.write("hold", holdMs_.load(std::memory_order_relaxed));
-        w.write("release", releaseMs_.load(std::memory_order_relaxed));
-        w.write("range", rangeDb_.load(std::memory_order_relaxed));
+        w.write("threshold", static_cast<float>(threshold_.load(std::memory_order_relaxed)));
+        w.write("hysteresis", static_cast<float>(hysteresis_.load(std::memory_order_relaxed)));
+        w.write("attack", static_cast<float>(attackMs_.load(std::memory_order_relaxed)));
+        w.write("hold", static_cast<float>(holdMs_.load(std::memory_order_relaxed)));
+        w.write("release", static_cast<float>(releaseMs_.load(std::memory_order_relaxed)));
+        w.write("range", static_cast<float>(rangeDb_.load(std::memory_order_relaxed)));
         w.write("duck", duckMode_.load(std::memory_order_relaxed));
         w.write("gateMode", static_cast<int32_t>(gateMode_.load(std::memory_order_relaxed)));
         w.write("adaptiveHold", adaptiveHold_.load(std::memory_order_relaxed));
         w.write("scHpf", scHpfEnabled_.load(std::memory_order_relaxed));
-        w.write("scHpfFreq", scHpfFreq_.load(std::memory_order_relaxed));
+        w.write("scHpfFreq", static_cast<float>(scHpfFreq_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 

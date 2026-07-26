@@ -10,8 +10,13 @@
  * Classic music-information-retrieval pipeline, allocation-free:
  *
  * 1. A mono sum is windowed (Hann) every hop and analyzed with one exact
- *    Goertzel per note over MIDI 36..83 (four octaves) - no FFT-grid
- *    compromise at low pitches.
+ *    Goertzel per note over MIDI 36..83 (four octaves): each bin sits exactly
+ *    on its tempered frequency, avoiding the FFT's fixed-grid quantization.
+ *    Frequency RESOLUTION, however, equals an FFT of the same length - the
+ *    Hann main lobe spans ~4*fs/windowSize (~46 Hz at the 4096 default), wider
+ *    than a semitone below ~C3, so adjacent-semitone leakage makes the bottom
+ *    of the range unreliable. Confident detection needs the mid/upper register
+ *    or a larger windowSize (up to 16384) at low pitches.
  * 2. Note energies fold into a 12-bin chroma vector.
  * 3. The chroma is cosine-matched against chord templates (major, minor,
  *    diminished, augmented, sus2, sus4, dom7, maj7, min7, half-dim7) at all

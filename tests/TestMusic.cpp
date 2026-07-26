@@ -417,3 +417,67 @@ DSPARK_TEST(ChordDetector_invalid_inputs_are_ignored)
     cold.processBlock(AudioBufferView<const float>(buf.view()));
     EXPECT_EQ(cold.getChord().rootPitchClass, -1);
 }
+
+// ============================================================================
+// M-008 same-commit regression pin (CHANGE-REQUEST additive-only):
+// locks the RELIABLE-register contract the corrected ChordDetector doc states
+// (mid/upper-register root-position triads detect exactly) and the signal-path
+// NaN/Inf poison-then-recover behaviour measured by the M-008 audit probe.
+// ============================================================================
+
+DSPARK_TEST(ChordDetector_reliable_register_and_signal_poison_recovery)
+{
+    using CT = ChordDetector<float>::ChordType;
+
+    auto midiHz = [](int m){ return 440.0 * std::exp2((m - 69) / 12.0); };
+
+    // Build a fresh detector (default 4096 window) driven by an equal-tempered
+    // sine stack given as MIDI notes, optionally lacing NaN/+Inf into a middle
+    // stretch of blocks; returns the held chord after `blocks` blocks.
+    auto run = [&](std::initializer_list<int> midis, int blocks, bool poison)
+    {
+        ChordDetector<float> det;
+        det.prepare(spec(48000.0, 512, 2));
+        auto b2 = makeStereoBuffer(512);
+        for (int b = 0; b < blocks; ++b)
+        {
+            const bool bad = poison && b >= 20 && b < 28;
+            for (int i = 0; i < 512; ++i)
+            {
+                const int n = b * 512 + i;
+                double v = 0.0;
+                for (int m : midis)
+                    v += std::sin(dspark::twoPi<double> * midiHz(m) * n / 48000.0);
+                float s = static_cast<float>(0.25 * v);
+                if (bad && (i % 37 == 0)) s = std::numeric_limits<float>::quiet_NaN();
+                if (bad && (i % 53 == 0)) s = std::numeric_limits<float>::infinity();
+                b2.ch(0)[i] = s;
+                b2.ch(1)[i] = s;
+            }
+            det.processBlock(AudioBufferView<const float>(b2.view()));
+        }
+        return det.getChord();
+    };
+
+    // Reliable register (>= C4): root-position triads/7ths are exact.
+    const auto cMaj = run({60, 64, 67}, 60, false);            // C4 major
+    EXPECT_EQ(cMaj.rootPitchClass, 0);
+    EXPECT_TRUE(cMaj.type == CT::Major);
+    EXPECT_GT(cMaj.confidence, 0.5f);
+
+    const auto dMin = run({62, 65, 69}, 60, false);            // D4 minor
+    EXPECT_EQ(dMin.rootPitchClass, 2);
+    EXPECT_TRUE(dMin.type == CT::Minor);
+
+    const auto g7 = run({67, 71, 74, 77}, 60, false);          // G4 dominant7
+    EXPECT_EQ(g7.rootPitchClass, 7);
+    EXPECT_TRUE(g7.type == CT::Dominant7);
+
+    // Signal-path poison-then-recover: a run laced with NaN/+Inf samples in the
+    // middle must (a) keep confidence finite and (b) still resolve to the same
+    // chord once the poisoned samples flush out of the analysis window.
+    const auto poisoned = run({60, 64, 67}, 60, true);
+    EXPECT_TRUE(std::isfinite(poisoned.confidence));
+    EXPECT_EQ(poisoned.rootPitchClass, 0);
+    EXPECT_TRUE(poisoned.type == CT::Major);
+}

@@ -27,6 +27,8 @@
 #include <cstdint>
 #include <algorithm>
 #include <optional>
+#include <utility>          // std::pair (parseNote lookup table)
+#include <initializer_list> // std::initializer_list (makeMask overload)
 
 namespace dspark {
 namespace harmony

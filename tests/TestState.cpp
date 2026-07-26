@@ -13,6 +13,7 @@
 #include <clocale>
 #include <limits>
 #include <string>
+#include <memory>
 #include <vector>
 
 using namespace dspark;
@@ -39,6 +40,27 @@ bool roundTrip(Configure&& configure, PrepArgs... prepArgs)
     b.prepare(sp, prepArgs...);
     if (!b.setState(blobA.data(), blobA.size())) return false;
     const auto blobB = b.getState();
+    return blobsEqual(blobA, blobB) && !blobA.empty();
+}
+
+// Heap variant of roundTrip: allocates the two effect instances with
+// make_unique instead of on the stack. Some processors are large as the double
+// specialisation (MultibandCompressor<double> is ~706 KB); two of them on the
+// stack overflow Windows' ~1 MB default thread stack (Linux's 8 MB survives).
+// Behaviourally identical to roundTrip, just off the stack.
+template <typename Effect, typename Configure, typename... PrepArgs>
+bool roundTripHeap(Configure&& configure, PrepArgs... prepArgs)
+{
+    const AudioSpec sp = spec(48000.0, 512, 2);
+    auto a = std::make_unique<Effect>();
+    a->prepare(sp, prepArgs...);
+    configure(*a);
+    const auto blobA = a->getState();
+
+    auto b = std::make_unique<Effect>();
+    b->prepare(sp, prepArgs...);
+    if (!b->setState(blobA.data(), blobA.size())) return false;
+    const auto blobB = b->getState();
     return blobsEqual(blobA, blobB) && !blobA.empty();
 }
 
@@ -390,40 +412,40 @@ DSPARK_TEST(State_json_escapes_hostile_keys_and_roundtrips)
 // AG-3 dynamics/gain header so the ambiguity cannot silently return.
 DSPARK_TEST(State_roundtrip_dynamics_double)
 {
-    EXPECT_TRUE((roundTrip<Limiter<double>>([](auto& l) {
+    EXPECT_TRUE((roundTripHeap<Limiter<double>>([](auto& l) {
         l.setCeiling(-1.2); l.setRelease(60.0); l.setTruePeak(true);
         l.setAdaptiveRelease(true); l.setLookahead(7.5);
     })));
-    EXPECT_TRUE((roundTrip<NoiseGate<double>>([](auto& g) {
+    EXPECT_TRUE((roundTripHeap<NoiseGate<double>>([](auto& g) {
         g.setThreshold(-52.0); g.setHold(80.0); g.setDuckMode(true);
         g.setGateMode(NoiseGate<double>::GateMode::Frequency);
         g.setSidechainHPF(true, 150.0);
     })));
-    EXPECT_TRUE((roundTrip<Gain<double>>([](auto& g) {
+    EXPECT_TRUE((roundTripHeap<Gain<double>>([](auto& g) {
         g.setGainDb(-4.5); g.setInverted(true);
     })));
-    EXPECT_TRUE((roundTrip<Compressor<double>>([](auto& c) {
+    EXPECT_TRUE((roundTripHeap<Compressor<double>>([](auto& c) {
         c.setThreshold(-28.5); c.setRatio(3.3); c.setKnee(6.0);
     })));
-    EXPECT_TRUE((roundTrip<Expander<double>>([](auto& e) {
+    EXPECT_TRUE((roundTripHeap<Expander<double>>([](auto& e) {
         e.setThreshold(-46.0); e.setRatio(2.5); e.setRange(-60.0);
     })));
-    EXPECT_TRUE((roundTrip<DeEsser<double>>([](auto& d) {
+    EXPECT_TRUE((roundTripHeap<DeEsser<double>>([](auto& d) {
         d.setFrequency(6200.0); d.setThreshold(-25.0); d.setReduction(9.0);
     })));
-    EXPECT_TRUE((roundTrip<TransientDesigner<double>>([](auto& t) {
+    EXPECT_TRUE((roundTripHeap<TransientDesigner<double>>([](auto& t) {
         t.setAttack(40.0); t.setSustain(-30.0);
     })));
-    EXPECT_TRUE((roundTrip<AutoGain<double>>([](auto& a) {
+    EXPECT_TRUE((roundTripHeap<AutoGain<double>>([](auto& a) {
         a.setMaxCompensation(9.0); a.setSmoothingTime(50.0);
     })));
-    EXPECT_TRUE((roundTrip<DynamicEQ<double>>([](auto& e) {
+    EXPECT_TRUE((roundTripHeap<DynamicEQ<double>>([](auto& e) {
         e.setNumBands(3);
     })));
-    EXPECT_TRUE((roundTrip<CrossoverFilter<double>>([](auto& x) {
+    EXPECT_TRUE((roundTripHeap<CrossoverFilter<double>>([](auto& x) {
         x.setNumBands(3); x.setOrder(24);
     })));
-    EXPECT_TRUE((roundTrip<MultibandCompressor<double>>([](auto& m) {
+    EXPECT_TRUE((roundTripHeap<MultibandCompressor<double>>([](auto& m) {
         m.setNumBands(3);
     })));
 }

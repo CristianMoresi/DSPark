@@ -284,6 +284,15 @@ public:
      * Bypasses block-level features like stereo linking, parallel mix, and lookahead.
      * Ideal for modular routing, synth voices, or per-sample environments.
      *
+     * @note No DenormalGuard is installed on this per-sample hot path (installing
+     *       and tearing down the FTZ/DAZ guard every sample would dominate its
+     *       cost); per-sample callers are expected to guard their own processing
+     *       loop with a single DenormalGuard, exactly as the block path does once
+     *       per block. This matches Limiter/NoiseGate processSample().
+     * @note getLatency() reports the processBlock() path (lookahead + Hilbert
+     *       alignment). This per-sample path BYPASSES the lookahead delay line,
+     *       so it adds no lookahead latency regardless of setLookahead().
+     *
      * @note Shared state (parameter smoothers, auto-makeup envelope) advances
      *       once per sample FRAME and is driven by channel 0. Multi-channel
      *       per-sample workflows must therefore include channel 0; other

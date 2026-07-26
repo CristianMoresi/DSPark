@@ -333,6 +333,19 @@ public:
         const int nS = buffer.getNumSamples();
         if (nCh == 0 || nS == 0) return;
 
+        // Front-door non-finite guard: a single NaN/Inf input sample would
+        // poison the recursive triode Newton-Raphson / WDF tone stack / supply
+        // sag / output DC-blocker / flatten-EQ state PERMANENTLY (only reset()
+        // clears it, not clean input). Replace bad samples with silence before
+        // they reach any state, so a transient upstream glitch cannot corrupt
+        // the channel for the rest of the stream (M-005 C1).
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* d = buffer.getChannel(ch);
+            for (int i = 0; i < nS; ++i)
+                if (!std::isfinite(d[i])) d[i] = T(0);
+        }
+
         // Acquire pairs with the setters' release stores so the recompute
         // always sees the values published before the flag.
         if (dirty_.load(std::memory_order_relaxed)

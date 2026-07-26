@@ -2468,3 +2468,69 @@ DSPARK_TEST(TransformerModel_survives_nonfinite_input)
     t.processBlock(b2.view());
     EXPECT_NO_NAN(b2.ch(0), 512);
 }
+
+// M-005 C1: a transient NaN/Inf input must not poison TapeMachine forever (the
+// JA/EQ/FIR/transport state otherwise mutes the channel to exact silence until
+// reset()). After a poison block, sustained clean input must produce finite AND
+// non-zero output WITHOUT an intervening reset().
+DSPARK_TEST(TapeMachine_survives_nonfinite_input)
+{
+    TapeMachine<float> t;
+    t.prepare(spec(48000.0, 512, 1));
+    t.setWowFlutter(0.0f);
+    // Poison block: mixed NaN/Inf.
+    auto p = makeBuffer(1, 512);
+    generateSine(p.ch(0), 512, 220.0f, 48000.0f, 0.3f);
+    p.ch(0)[64]  = std::numeric_limits<float>::quiet_NaN();
+    p.ch(0)[192] = std::numeric_limits<float>::infinity();
+    p.ch(0)[300] = -std::numeric_limits<float>::infinity();
+    t.processBlock(p.view());
+    // Sustained clean input (well past the 223-sample latency).
+    double energy = 0.0; bool finite = true;
+    for (int blk = 0; blk < 60; ++blk)
+    {
+        auto b = makeBuffer(1, 512);
+        generateSine(b.ch(0), 512, 220.0f, 48000.0f, 0.3f);
+        t.processBlock(b.view());
+        if (blk >= 55)
+            for (int i = 0; i < 512; ++i)
+            {
+                if (!std::isfinite(b.ch(0)[i])) finite = false;
+                energy += double(b.ch(0)[i]) * double(b.ch(0)[i]);
+            }
+    }
+    EXPECT_TRUE(finite);
+    EXPECT_GT(energy, 1e-3);   // recovered signal, not stuck silence
+}
+
+// M-005 C1: a transient NaN/Inf input must not poison TubePreamp forever (the
+// recursive triode NR / WDF tone / DC-blocker state otherwise emits all-NaN
+// until reset()). After a poison block, clean input must recover to finite,
+// non-zero output WITHOUT an intervening reset().
+DSPARK_TEST(TubePreamp_survives_nonfinite_input)
+{
+    TubePreamp<float> t;
+    t.prepare(spec(48000.0, 512, 1));
+    t.setDrive(6.0f);
+    auto p = makeBuffer(1, 512);
+    generateSine(p.ch(0), 512, 220.0f, 48000.0f, 0.3f);
+    p.ch(0)[64]  = std::numeric_limits<float>::quiet_NaN();
+    p.ch(0)[192] = std::numeric_limits<float>::infinity();
+    p.ch(0)[300] = -std::numeric_limits<float>::infinity();
+    t.processBlock(p.view());
+    double energy = 0.0; bool finite = true;
+    for (int blk = 0; blk < 40; ++blk)
+    {
+        auto b = makeBuffer(1, 512);
+        generateSine(b.ch(0), 512, 220.0f, 48000.0f, 0.3f);
+        t.processBlock(b.view());
+        if (blk >= 35)
+            for (int i = 0; i < 512; ++i)
+            {
+                if (!std::isfinite(b.ch(0)[i])) finite = false;
+                energy += double(b.ch(0)[i]) * double(b.ch(0)[i]);
+            }
+    }
+    EXPECT_TRUE(finite);
+    EXPECT_GT(energy, 1e-3);
+}

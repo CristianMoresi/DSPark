@@ -1708,7 +1708,7 @@ DSPARK_TEST(FrequencyShifter_ssb_rejection_and_finite)
     fsh.setMix(1.0f);
     const int N = 48000;
     std::vector<float> x(static_cast<size_t>(N));
-    for (int i = 0; i < N; ++i) x[static_cast<size_t>(i)] = static_cast<float>(amp * std::sin(2.0 * 3.14159265358979 * f0 * i / fs));
+    for (int i = 0; i < N; ++i) x[static_cast<size_t>(i)] = static_cast<float>(amp * std::sin(twoPi<double> * f0 * i / fs));
     for (int off = 0; off < N; off += 512)
     {
         const int n = std::min(512, N - off);
@@ -1717,7 +1717,7 @@ DSPARK_TEST(FrequencyShifter_ssb_rejection_and_finite)
         fsh.processBlock(v);
     }
     auto goertzel = [&](double f) {
-        const double w = 2.0 * 3.14159265358979 * f / fs, c = 2.0 * std::cos(w);
+        const double w = twoPi<double> * f / fs, c = 2.0 * std::cos(w);
         double s1 = 0, s2 = 0;
         for (int i = 4800; i < N; ++i) { const double s0 = x[static_cast<size_t>(i)] + c * s1 - s2; s2 = s1; s1 = s0; }
         return 2.0 * std::sqrt((s1 - s2 * std::cos(w)) * (s1 - s2 * std::cos(w)) + (s2 * std::sin(w)) * (s2 * std::sin(w))) / (N - 4800);

@@ -229,7 +229,11 @@ is setup-thread only on both - it reallocates and re-calibrates like
 - `TubePreamp` **defaults to 2x**. The triode + WDF tone solve runs `factor`x
   oversampled; 4x roughly doubles the 2x CPU, 1x is the cheapest and adds zero
   latency but lets the grid nonlinearity alias in-band. `getLatency()` reports
-  0 at 1x on both.
+  0 at 1x for TubePreamp (its only latency source is the oversampler). For
+  TapeMachine `getLatency()` at 1x is NOT zero: it still reports the loss-FIR
+  centre + transport delay (127 at 48k); only the oversampler contribution
+  drops to 0. Always query `getLatency()` for the active factor rather than
+  assuming a value.
 
 `Saturation`, `Clipper` and `Core/WaveshapeTable` also expose `setOversampling`
 (all defaulting to 1x=off); `WaveshapeTable` is a memoryless table (no ADAA), so

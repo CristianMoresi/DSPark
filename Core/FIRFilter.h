@@ -290,6 +290,19 @@ private:
  * updates from the control thread without reallocating memory on the audio
  * thread; the convolution itself runs through simd::dotProduct.
  *
+ * Threading / data-race freedom: the SHARED staging coefficient buffer is
+ * std::vector<std::atomic<T>>. The single control-thread producer stores each
+ * word relaxed inside an odd/even seq-counter critical section; the audio
+ * thread loads each word relaxed under the seqlock retry (with an acquire
+ * fence). Because every cross-thread word access goes through std::atomic,
+ * there is no non-atomic concurrent read/write - the handoff is UB-free by the
+ * C++ memory model, not merely tear-free in practice. std::atomic<float/double>
+ * is lock-free and single-word on every supported target, so the publish stays
+ * allocation- and lock-free. The audio thread copies the published set once per
+ * update into its PRIVATE, non-atomic activeCoeffs_ buffer; the per-sample hot
+ * path (simd::dotProduct over activeCoeffs_) therefore runs on plain scalars
+ * and is byte-for-byte the same code as before - no hot-path cost.
+ *
  * @note Buffers use the default heap alignment; the SIMD kernels use
  *       unaligned loads, which cost the same as aligned on modern CPUs.
  *
@@ -318,8 +331,12 @@ public:
 
         // SPSC coefficient publication: a shared staging buffer (written by the
         // control thread under a seqlock) and an audio-thread-private active
-        // buffer (copied once per update, never overwritten mid-block).
-        stagingCoeffs_.assign(static_cast<size_t>(maxTaps_), T(0));
+        // buffer (copied once per update, never overwritten mid-block). The
+        // SHARED staging words are std::atomic<T> so each cross-thread word
+        // access is defined (no data-race UB); the seqlock counter still guards
+        // against reading a half-published set. Allocated here, at setup time.
+        stagingCoeffs_ = std::vector<std::atomic<T>>(static_cast<size_t>(maxTaps_));
+        for (auto& s : stagingCoeffs_) s.store(T(0), std::memory_order_relaxed);
         activeCoeffs_.assign(static_cast<size_t>(maxTaps_), T(0));
         stagingTaps_.store(0, std::memory_order_relaxed);
         activeTaps_   = 0;
@@ -355,8 +372,11 @@ public:
         // Seqlock publish: odd sequence = write in progress.
         coeffSeq_.fetch_add(1, std::memory_order_acq_rel);
         // Write REVERSED coefficients to the staging buffer for SIMD dot product.
+        // Relaxed stores: the acq_rel/release fences on coeffSeq_ below publish
+        // them, so relaxed is sufficient AND makes each word access race-free.
         for (int k = 0; k < numTaps; ++k)
-            stagingCoeffs_[static_cast<size_t>(k)] = coeffs[static_cast<size_t>(numTaps - 1 - k)];
+            stagingCoeffs_[static_cast<size_t>(k)].store(
+                coeffs[static_cast<size_t>(numTaps - 1 - k)], std::memory_order_relaxed);
         stagingTaps_.store(numTaps, std::memory_order_relaxed);
         coeffSeq_.fetch_add(1, std::memory_order_release); // even = consistent
         coeffDirty_.store(true, std::memory_order_release);
@@ -488,7 +508,8 @@ private:
             // even if this speculative read races a concurrent publish.
             n = std::min(stagingTaps_.load(std::memory_order_relaxed), maxTaps_);
             for (int k = 0; k < n; ++k)
-                activeCoeffs_[static_cast<size_t>(k)] = stagingCoeffs_[static_cast<size_t>(k)];
+                activeCoeffs_[static_cast<size_t>(k)] =
+                    stagingCoeffs_[static_cast<size_t>(k)].load(std::memory_order_relaxed);
             // The fence orders the copy above BEFORE the re-read below. A plain
             // load-acquire is not enough: acquire only orders LATER accesses,
             // so on weakly-ordered CPUs (ARM) the copy could sink below the
@@ -504,7 +525,12 @@ private:
     std::atomic<bool> isPrepared_{false};
 
     // SPSC seqlock coefficient publication (writer: setCoefficients).
-    std::vector<T> stagingCoeffs_;          ///< Shared staging (reversed coeffs).
+    // Atomic words: the staging buffer is read by the audio thread while the
+    // control thread writes it, so each word is std::atomic<T> (relaxed) to keep
+    // every concurrent access defined; the seq counter (acq_rel/release) orders
+    // and tear-protects the set. std::atomic<float/double> is lock-free and
+    // one machine word, so this is a plain load/store on every supported target.
+    std::vector<std::atomic<T>> stagingCoeffs_;  ///< Shared staging (reversed coeffs).
     std::atomic<int> stagingTaps_{0};       ///< Guarded by coeffSeq_ (relaxed slot).
     std::atomic<unsigned> coeffSeq_{0};     ///< Seqlock counter (odd = writing).
     std::atomic<bool> coeffDirty_{false};   ///< Pending-update flag (fast path).

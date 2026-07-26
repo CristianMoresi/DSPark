@@ -121,7 +121,14 @@ public:
         T tpMax = truePeakMax_.load(std::memory_order_relaxed);
         for (int i = 0; i < numSamples; ++i)
         {
-            tpMax = std::max(tpMax, truePeak_.processSample(data[i], 0));
+            // Only fold FINITE estimates into the max-hold: a single Inf/NaN
+            // sample would otherwise pin the peak at +Inf forever (std::max
+            // with +Inf latches, and the raw |NaN| leaks through the ring),
+            // leaving getTruePeakDb() stuck at +Inf dBTP until reset() -- the
+            // K-filter / histogram path already self-recovers, so the true
+            // peak must too (same non-finite robustness contract).
+            const T tp0 = truePeak_.processSample(data[i], 0);
+            if (std::isfinite(tp0)) tpMax = std::max(tpMax, tp0);
 
             double filtered = applyKWeighting(static_cast<double>(data[i]), 0);
             currentBlockPower_ += filtered * filtered;
@@ -147,8 +154,12 @@ public:
         T tpMax = truePeakMax_.load(std::memory_order_relaxed);
         for (int i = 0; i < numSamples; ++i)
         {
-            tpMax = std::max(tpMax, truePeak_.processSample(left[i], 0));
-            tpMax = std::max(tpMax, truePeak_.processSample(right[i], 1));
+            // Fold only FINITE true-peak estimates (see the mono path): a lone
+            // Inf/NaN sample must not latch the max-hold at +Inf forever.
+            const T tpL = truePeak_.processSample(left[i], 0);
+            const T tpR = truePeak_.processSample(right[i], 1);
+            if (std::isfinite(tpL)) tpMax = std::max(tpMax, tpL);
+            if (std::isfinite(tpR)) tpMax = std::max(tpMax, tpR);
 
             double filtL = applyKWeighting(static_cast<double>(left[i]), 0);
             double filtR = applyKWeighting(static_cast<double>(right[i]), 1);

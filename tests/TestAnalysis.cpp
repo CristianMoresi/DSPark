@@ -507,6 +507,45 @@ DSPARK_TEST(LoudnessMeter_louder_signal_higher_LUFS)
     EXPECT_GT(lufs2, lufs1); // Louder signal = higher LUFS
 }
 
+// M-007 D-M007-C1 pin: the true-peak max-hold must NOT be permanently poisoned
+// by a single non-finite (Inf/NaN) input sample. The K-filter / histogram path
+// already drops a poisoned block and self-recovers; before the fix std::max()
+// latched +Inf into truePeakMax_ (and the raw |sample| leaked it through the
+// detector ring), so getTruePeakDb() returned +Inf dBTP forever. Now only
+// FINITE per-sample estimates fold into the max-hold, so the reading recovers.
+DSPARK_TEST(LoudnessMeter_true_peak_recovers_after_non_finite_sample)
+{
+    LoudnessMeter<float> meter;
+    meter.prepare(48000.0, 2);
+
+    std::vector<float> L(480), R(480);
+    double ph = 0.0;
+    const double w = twoPi<double> * 997.0 / 48000.0;
+    auto fill = [&](double amp)
+    {
+        for (size_t i = 0; i < L.size(); ++i)
+        { const float s = static_cast<float>(amp * std::sin(ph)); L[i] = s; R[i] = s; ph += w; }
+    };
+
+    // Warm up on a clean -6 dBFS tone: finite, roughly -6 dBTP.
+    for (int b = 0; b < 60; ++b) { fill(std::pow(10.0, -6.0 / 20.0)); meter.process(L.data(), R.data(), 480); }
+    EXPECT_TRUE(std::isfinite(meter.getTruePeakDb()));
+
+    // Inject ONE block carrying a non-finite sample on each channel.
+    fill(std::pow(10.0, -6.0 / 20.0));
+    L[100] = std::numeric_limits<float>::infinity();
+    R[240] = std::numeric_limits<float>::quiet_NaN();
+    meter.process(L.data(), R.data(), 480);
+
+    // Keep metering clean signal: the true-peak readout must be FINITE again
+    // (old header: stuck at +Inf dBTP forever).
+    for (int b = 0; b < 60; ++b) { fill(std::pow(10.0, -6.0 / 20.0)); meter.process(L.data(), R.data(), 480); }
+    const float tp = meter.getTruePeakDb();
+    EXPECT_TRUE(std::isfinite(tp));   // old: +Inf
+    EXPECT_LT(tp, 0.0f);              // a -6 dBFS tone tops out well under 0 dBTP
+    EXPECT_GT(tp, -12.0f);
+}
+
 // ============================================================================
 // Goertzel
 // ============================================================================

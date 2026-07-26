@@ -428,6 +428,9 @@ public:
         const int t = std::clamp(static_cast<int>(type), 0,
                                  static_cast<int>(Type::Cathedral));
         type_.store(static_cast<Type>(t), std::memory_order_relaxed);
+        // A preset load re-establishes the baseline: forget prior overrides so
+        // the preset's own values apply, unless a setter is called AFTER this.
+        userParamMask_.store(0u, std::memory_order_relaxed);
         presetDirty_.store(true, std::memory_order_release);
     }
 
@@ -472,6 +475,7 @@ public:
         if (!std::isfinite(seconds)) return;
         decayTime_.store(std::clamp(seconds, T(0.1), T(30)),
                          std::memory_order_relaxed);
+        markUserParam(kUserDecay);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
@@ -489,6 +493,7 @@ public:
     {
         if (!std::isfinite(size)) return;
         size_.store(std::clamp(size, T(0.01), T(1)), std::memory_order_relaxed);
+        markUserParam(kUserSize);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
@@ -504,6 +509,7 @@ public:
         T clamped = std::clamp(amount, T(0), T(1));
         damping_.store(clamped, std::memory_order_relaxed);
         highDecayMult_.store(T(1) - clamped * T(0.9), std::memory_order_relaxed);
+        markUserParam(kUserDamping);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
@@ -524,6 +530,7 @@ public:
     {
         if (!std::isfinite(amount)) return;
         diffusion_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+        markUserParam(kUserDiffusion);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
@@ -534,6 +541,7 @@ public:
         modDepth_.store(clamped, std::memory_order_relaxed);
         modDepthA_.store(clamped * T(30), std::memory_order_relaxed);
         modDepthB_.store(clamped * T(15), std::memory_order_relaxed);
+        markUserParam(kUserModDepth);
     }
 
     /**
@@ -555,6 +563,7 @@ public:
         if (!std::isfinite(ms)) return;
         T clamped = std::clamp(ms, T(0), T(200));
         erToLateMs_.store(clamped, std::memory_order_relaxed);
+        markUserParam(kUserErToLate);
         if (spec_.sampleRate > 0)
             erToLateSamples_.store(static_cast<int>(
                 static_cast<T>(spec_.sampleRate) * clamped / T(1000)),
@@ -581,6 +590,7 @@ public:
         highDecayMult_.store(clamped, std::memory_order_relaxed);
         damping_.store(std::clamp((T(1) - clamped) / T(0.9), T(0), T(1)),
                        std::memory_order_relaxed);
+        markUserParam(kUserDamping);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
@@ -599,6 +609,7 @@ public:
         if (!std::isfinite(mult)) return;
         bassDecayMult_.store(std::clamp(mult, T(0.3), T(3)),
                              std::memory_order_relaxed);
+        markUserParam(kUserBassDecay);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
@@ -620,6 +631,7 @@ public:
         if (!std::isfinite(hz)) return;
         highCrossover_.store(std::clamp(hz, T(1000), T(16000)),
                              std::memory_order_relaxed);
+        markUserParam(kUserHighXover);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
@@ -632,6 +644,7 @@ public:
         if (!std::isfinite(hz)) return;
         bassCrossover_.store(std::clamp(hz, T(50), T(500)),
                              std::memory_order_relaxed);
+        markUserParam(kUserBassXover);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
@@ -643,18 +656,21 @@ public:
     {
         if (!std::isfinite(dB)) return;
         earlyLevel_.store(decibelsToGain(std::clamp(dB, T(-60), T(6))), std::memory_order_relaxed);
+        markUserParam(kUserEarly);
     }
 
     void setLateLevel(T dB) noexcept
     {
         if (!std::isfinite(dB)) return;
         lateLevel_.store(decibelsToGain(std::clamp(dB, T(-60), T(6))), std::memory_order_relaxed);
+        markUserParam(kUserLate);
     }
 
     void setModRate(T hz) noexcept
     {
         if (!std::isfinite(hz)) return;
         modRate_.store(std::clamp(hz, T(0.1), T(5)), std::memory_order_relaxed);
+        markUserParam(kUserModRate);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
@@ -1059,6 +1075,24 @@ protected:
     // Deferred-apply flags (audio thread drains these at top of processBlock)
     std::atomic<bool> presetDirty_ { false };  // setType() -> rebuild topology + reset
     std::atomic<bool> paramsDirty_ { false };  // any other setter -> refresh coeffs
+
+    // Per-param user-override mask (M-006 D-M006-C1). A preset load (setType)
+    // must not silently discard param setters batched with it before the first
+    // processBlock -- the header's own documented quick-start is
+    // `setType(Hall); setDecay(2.0f);`. setType() clears the mask so the preset
+    // re-establishes the baseline; each param setter marks its bit; commitPreset()
+    // then SKIPS any atomic the user overrode, so a setter issued after setType
+    // always wins regardless of drain timing. RT-safe: release-mark on the UI
+    // thread, acquire-read on the audio thread, one atomic, no locks.
+    enum : uint32_t {
+        kUserDecay = 1u, kUserSize = 2u, kUserDamping = 4u, kUserDiffusion = 8u,
+        kUserBassDecay = 16u, kUserHighXover = 32u, kUserBassXover = 64u,
+        kUserModDepth = 128u, kUserModRate = 256u, kUserEarly = 512u,
+        kUserLate = 1024u, kUserErToLate = 2048u
+    };
+    std::atomic<uint32_t> userParamMask_ { 0u };
+    void markUserParam(uint32_t bit) noexcept
+    { userParamMask_.fetch_or(bit, std::memory_order_release); }
     std::atomic<bool> toneDirty_   { false };  // tone EQ cutoff changes
     std::atomic<bool> qualityDirty_ { false }; // setQuality() -> resize engine + reset
     std::atomic<T> toneLowCutHz_  { T(-1) };   // <0 = off, queued value for audio thread
@@ -1887,18 +1921,22 @@ protected:
 
     void commitPreset(const PresetValues& p) noexcept
     {
-        size_.store(p.size, std::memory_order_relaxed);
-        decayTime_.store(p.decay, std::memory_order_relaxed);
-        highDecayMult_.store(p.hdMult, std::memory_order_relaxed);
-        bassDecayMult_.store(p.bdMult, std::memory_order_relaxed);
-        highCrossover_.store(p.hxover, std::memory_order_relaxed);
-        bassCrossover_.store(p.bxover, std::memory_order_relaxed);
-        diffusion_.store(p.diff, std::memory_order_relaxed);
-        modDepth_.store(p.modDepth, std::memory_order_relaxed);
-        modRate_.store(p.modRate, std::memory_order_relaxed);
-        earlyLevel_.store(p.earlyLvl, std::memory_order_relaxed);
-        lateLevel_.store(p.lateLvl, std::memory_order_relaxed);
-        erToLateMs_.store(p.erToLate, std::memory_order_relaxed);
+        // D-M006-C1: only write the atomics the user did NOT override since the
+        // last setType(). acquire-read pairs with the release-mark in each
+        // setter so a param batched after setType (its bit set) is preserved.
+        const uint32_t m = userParamMask_.load(std::memory_order_acquire);
+        if (!(m & kUserSize))      size_.store(p.size, std::memory_order_relaxed);
+        if (!(m & kUserDecay))     decayTime_.store(p.decay, std::memory_order_relaxed);
+        if (!(m & kUserDamping))   highDecayMult_.store(p.hdMult, std::memory_order_relaxed);
+        if (!(m & kUserBassDecay)) bassDecayMult_.store(p.bdMult, std::memory_order_relaxed);
+        if (!(m & kUserHighXover)) highCrossover_.store(p.hxover, std::memory_order_relaxed);
+        if (!(m & kUserBassXover)) bassCrossover_.store(p.bxover, std::memory_order_relaxed);
+        if (!(m & kUserDiffusion)) diffusion_.store(p.diff, std::memory_order_relaxed);
+        if (!(m & kUserModDepth))  modDepth_.store(p.modDepth, std::memory_order_relaxed);
+        if (!(m & kUserModRate))   modRate_.store(p.modRate, std::memory_order_relaxed);
+        if (!(m & kUserEarly))     earlyLevel_.store(p.earlyLvl, std::memory_order_relaxed);
+        if (!(m & kUserLate))      lateLevel_.store(p.lateLvl, std::memory_order_relaxed);
+        if (!(m & kUserErToLate))  erToLateMs_.store(p.erToLate, std::memory_order_relaxed);
         toneLPActive_ = p.toneLP;
         toneHPActive_ = p.toneHP;
     }

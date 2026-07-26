@@ -1869,3 +1869,84 @@ DSPARK_TEST(AlgoReverb_survives_nonfinite_input)
     EXPECT_TRUE(finite);
     EXPECT_GT(energy, 1e-3);
 }
+
+// ============================================================================
+// M-006 D-M006-C1 (Critic iter-2): AlgorithmicReverb must NOT drop setDecay()
+// when batched with setType() before the first processBlock -- the header's own
+// documented quick-start `setType(Hall); setDecay(d)`. Pre-fix: applyPreset()
+// overwrote decayTime_ with the preset value and force-cleared paramsDirty_, so
+// getDecay() returned 2.2 (Hall) not 2.0 and T60 was pinned regardless of decay.
+// Fixed by a per-param user-override mask. This pin measures T60 (energy-decay)
+// for the documented sequence at 3 decay values and asserts getDecay() returns
+// the user value and T60 tracks it. Revert-check: RED on the pre-fix header.
+// ============================================================================
+static double algoReverbT60Documented(float decaySeconds)
+{
+    using namespace dspark;
+    AlgorithmicReverb<float> r;
+    r.prepare(spec(48000.0, 512, 2));
+    r.setType(AlgorithmicReverb<float>::Type::Hall);  // documented order:
+    r.setDecay(decaySeconds);                         // setType THEN setDecay
+    r.setMix(1.0f);
+    const int N = 48000 * 12;
+    auto blkbuf = makeBuffer(2, 512);
+    double peak = 0.0; int ipeak = 0;
+    std::vector<double> env;
+    env.reserve(static_cast<size_t>(N / 512));
+    for (int blk = 0; blk * 512 < N; ++blk)
+    {
+        for (int i = 0; i < 512; ++i)
+        {
+            const float x = (blk == 0 && i == 0) ? 1.0f : 0.0f;
+            blkbuf.ch(0)[i] = x; blkbuf.ch(1)[i] = x;
+        }
+        r.processBlock(blkbuf.view());
+        double e = 0.0;
+        for (int i = 0; i < 512; ++i)
+            e += double(blkbuf.ch(0)[i]) * blkbuf.ch(0)[i] + double(blkbuf.ch(1)[i]) * blkbuf.ch(1)[i];
+        double rmsv = std::sqrt(e / 512.0);
+        if (rmsv > peak) { peak = rmsv; ipeak = static_cast<int>(env.size()); }
+        env.push_back(rmsv);
+    }
+    const double thr = peak * 0.001; // -60 dB
+    for (size_t i = static_cast<size_t>(ipeak); i < env.size(); ++i)
+        if (env[i] < thr) return double(i * 512) / 48000.0;
+    return 999.0;
+}
+
+DSPARK_TEST(AlgoReverb_decay_tracks_T60_in_documented_setType_then_setDecay)
+{
+    using namespace dspark;
+    // getDecay() must return the user value, not the Hall preset (2.2).
+    AlgorithmicReverb<float> r;
+    r.prepare(spec(48000.0, 512, 2));
+    r.setType(AlgorithmicReverb<float>::Type::Hall);
+    r.setDecay(2.0f);
+    EXPECT_NEAR(r.getDecay(), 2.0f, 1e-4f);
+
+    const double t60_05 = algoReverbT60Documented(0.5f);
+    const double t60_20 = algoReverbT60Documented(2.0f);
+    const double t60_80 = algoReverbT60Documented(8.0f);
+    // decay actually controls the tail: monotone and in a sane band.
+    EXPECT_GT(t60_20, 1.2);
+    EXPECT_LT(t60_20, 2.8);
+    EXPECT_GT(t60_80, 1.6 * t60_20);   // 8 s clearly longer than 2 s
+    EXPECT_LT(t60_05, 0.7 * t60_20);   // 0.5 s clearly shorter than 2 s
+}
+
+// Companion: setSize/setDamping/setDiffusion batched with setType are also
+// preserved (same mask); verify getters return user values, not the preset.
+DSPARK_TEST(AlgoReverb_batched_params_survive_setType)
+{
+    using namespace dspark;
+    AlgorithmicReverb<float> r;
+    r.prepare(spec(48000.0, 512, 2));
+    r.setType(AlgorithmicReverb<float>::Type::Cathedral); // Cathedral hxover 3500
+    r.setHighCrossover(8000.0f);                          // user override
+    r.setDecay(3.0f);                                     // user override
+    auto b = makeBuffer(2, 512);
+    b.fillSine(220.0f, 48000.0f, 0.2f);
+    r.processBlock(b.view());          // drain applies preset + overrides
+    EXPECT_NEAR(r.getDecay(), 3.0f, 1e-4f);
+    EXPECT_NEAR(r.getHighCrossover(), 8000.0f, 1e-3f);
+}

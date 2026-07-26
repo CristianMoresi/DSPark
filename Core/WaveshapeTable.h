@@ -11,6 +11,17 @@
  * signals using 3rd-order Hermite interpolation. This minimizes table-induced
  * distortion and quantization noise compared to standard linear interpolation.
  *
+ * @note **Aliasing (honest scope).** This is a MEMORYLESS nonlinearity: the
+ * curve creates harmonics above Nyquist that fold back as aliasing exactly
+ * like any waveshaper. The Hermite interpolation only reduces the error of
+ * reading BETWEEN table entries (table-interpolation/quantization noise) - it
+ * does NOT and cannot reduce harmonic aliasing, and this class carries no ADAA
+ * (antiderivative anti-aliasing) term. To suppress aliasing, enable the built
+ * in oversampling (setOversampling, RF-009/ADR-011: factor 1 = off, 2/4/8/16;
+ * getLatency() reports the group delay it adds, 0 when off) or oversample the
+ * surrounding chain. A finer table lowers interpolation noise but leaves the
+ * alias floor unchanged.
+ *
  * @note **Thread Safety & Real-Time Constraints:**
  * The `build...()` and `setOversampling()` methods allocate memory. They MUST
  * ONLY be called from the main thread (UI) or during the `prepare()` phase,

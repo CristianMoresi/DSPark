@@ -1691,3 +1691,60 @@ DSPARK_TEST(NoiseGenerator_pink_type)
         energy += tb.ch(0)[i] * tb.ch(0)[i];
     EXPECT_GT(energy, 0.1f);
 }
+
+// ============================================================================
+// M-005 AG-4 audit pins (additive): sideband accuracy + RT denormal hygiene
+// ============================================================================
+
+// FrequencyShifter single-sideband: +shift keeps the wanted sideband and
+// rejects the image and carrier by >30 dB; output stays finite (DenormalGuard
+// on the per-sample Hilbert path, F1).
+DSPARK_TEST(FrequencyShifter_ssb_rejection_and_finite)
+{
+    const double fs = 48000.0, f0 = 2000.0, shift = 300.0, amp = 0.5;
+    FrequencyShifter<float> fsh;
+    fsh.prepare(spec(fs, 512, 1));
+    fsh.setShift(static_cast<float>(shift));
+    fsh.setMix(1.0f);
+    const int N = 48000;
+    std::vector<float> x(static_cast<size_t>(N));
+    for (int i = 0; i < N; ++i) x[static_cast<size_t>(i)] = static_cast<float>(amp * std::sin(2.0 * 3.14159265358979 * f0 * i / fs));
+    for (int off = 0; off < N; off += 512)
+    {
+        const int n = std::min(512, N - off);
+        float* ch[1] = { x.data() + off };
+        AudioBufferView<float> v(ch, 1, n);
+        fsh.processBlock(v);
+    }
+    auto goertzel = [&](double f) {
+        const double w = 2.0 * 3.14159265358979 * f / fs, c = 2.0 * std::cos(w);
+        double s1 = 0, s2 = 0;
+        for (int i = 4800; i < N; ++i) { const double s0 = x[static_cast<size_t>(i)] + c * s1 - s2; s2 = s1; s1 = s0; }
+        return 2.0 * std::sqrt((s1 - s2 * std::cos(w)) * (s1 - s2 * std::cos(w)) + (s2 * std::sin(w)) * (s2 * std::sin(w))) / (N - 4800);
+    };
+    const double wanted = goertzel(f0 + shift), image = goertzel(f0 - shift), carrier = goertzel(f0);
+    EXPECT_LT(20.0 * std::log10(image / wanted), -30.0);
+    EXPECT_LT(20.0 * std::log10(carrier / wanted), -30.0);
+    for (int i = 0; i < N; ++i) EXPECT_TRUE(std::isfinite(x[static_cast<size_t>(i)]));
+}
+
+// RingModulator GeometricMean: the scaled soar term must not inject static DC -
+// a silent input produces exact silence (R2/R3), output finite.
+DSPARK_TEST(RingModulator_geomean_no_dc_leak_on_silence)
+{
+    RingModulator<float> rm;
+    rm.prepare(spec(48000.0, 512, 1));
+    rm.setFrequency(300.0f);
+    rm.setMix(1.0f);
+    rm.setSoar(0.8f);
+    rm.setMode(RingModulator<float>::Mode::GeometricMean);
+    float maxAbs = 0.0f;
+    for (int blk = 0; blk < 94; ++blk)
+    {
+        auto b = makeBuffer(1, 512);
+        std::memset(b.ch(0), 0, sizeof(float) * 512);
+        rm.processBlock(b.view());
+        for (int i = 0; i < 512; ++i) maxAbs = std::max(maxAbs, std::fabs(b.ch(0)[i]));
+    }
+    EXPECT_LT(maxAbs, 1e-9f);
+}

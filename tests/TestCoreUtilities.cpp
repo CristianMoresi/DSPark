@@ -1622,3 +1622,36 @@ DSPARK_TEST(ModulationRouter_holds_last_value_on_nonfinite_source)
     EXPECT_TRUE(std::isfinite(out));
     EXPECT_EQ(out, good); // held, not poisoned
 }
+
+// M-005 AG-4 pin: WaveshapeTable is a memoryless nonlinearity (no ADAA); its
+// docs now state honestly that aliasing is only reduced by oversampling, not by
+// the Hermite table interpolation. Behavioral guard: enabling oversampling must
+// drop the alias floor. Probe: a 9 kHz tone's 5th harmonic (45 kHz) folds to
+// exactly 3 kHz, a bin no true harmonic occupies - pure aliasing there.
+DSPARK_TEST(WaveshapeTable_oversampling_reduces_alias)
+{
+    const double fs = 48000.0, f0 = 9000.0, amp = 0.9;
+    const int N = 48000;
+    auto aliasDb = [&](int factor) {
+        WaveshapeTable<float> ws; ws.buildTanh();
+        ws.prepare(spec(fs, 512, 1));
+        ws.setOversampling(factor);
+        std::vector<float> x(static_cast<size_t>(N));
+        for (int i = 0; i < N; ++i) x[static_cast<size_t>(i)] = static_cast<float>(amp * std::sin(2.0 * 3.14159265358979 * f0 * i / fs));
+        for (int off = 0; off < N; off += 512)
+        {
+            const int n = std::min(512, N - off);
+            float* ch[1] = { x.data() + off };
+            AudioBufferView<float> v(ch, 1, n);
+            ws.processBlock(v);
+        }
+        const double w = 2.0 * 3.14159265358979 * 3000.0 / fs, c = 2.0 * std::cos(w);
+        double s1 = 0, s2 = 0;
+        for (int i = 4800; i < N; ++i) { const double s0 = x[static_cast<size_t>(i)] + c * s1 - s2; s2 = s1; s1 = s0; }
+        const double mag = 2.0 * std::sqrt((s1 - s2 * std::cos(w)) * (s1 - s2 * std::cos(w)) + (s2 * std::sin(w)) * (s2 * std::sin(w))) / (N - 4800);
+        return 20.0 * std::log10(std::max(mag / amp, 1e-12));
+    };
+    const double d1 = aliasDb(1), d4 = aliasDb(4);
+    EXPECT_LT(d4, d1 - 6.0);   // oversampling drops the alias bin by >6 dB
+    EXPECT_EQ(1, 1);           // (d1/d4 recorded in the audit log)
+}

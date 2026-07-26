@@ -32,6 +32,7 @@
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/Phasor.h"
 #include "../Core/StateBlob.h"
@@ -105,6 +106,11 @@ public:
         const int numCh = std::min(buffer.getNumChannels(), numChannels_);
         const int numSamples = buffer.getNumSamples();
         if (numSamples <= 0 || numCh <= 0) return;
+
+        // RT denormal hygiene: consistent with the framework's other audio-path
+        // processors (the GeometricMean sqrt/copysign chain can carry denormal
+        // inputs into the slow path).
+        DenormalGuard guard;
 
         // Fetch targets for smoothing
         const T targetFreq = frequency_.load(std::memory_order_relaxed);

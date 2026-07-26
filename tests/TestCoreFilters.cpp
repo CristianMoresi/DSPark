@@ -1575,3 +1575,21 @@ DSPARK_TEST(EnvelopeFollower_processSample_publishes)
     EXPECT_NEAR(last, 0.5f, 0.01f);
     EXPECT_EQ(ef.getEnvelope(0), last);       // old: readout stuck at 0
 }
+
+// M-005 AG-4 pin: the WDF diode-pair Newton solver must converge (finite,
+// clamped, no hang) at extreme drive - reflected-wave amplitudes to +/-1e6 V.
+DSPARK_TEST(WDF_diode_pair_extreme_drive_converges)
+{
+    const double R = 1000.0, Is = 2.52e-9, nVt = 0.045;
+    wdf::ResistiveVoltageSource<double> vs { R };
+    wdf::DiodePairRoot<double, decltype(vs)> clip { vs, Is, nVt };
+    clip.prepare(48000.0);
+    for (double vin : { -1e6, -1e3, -1.0, 0.0, 1.0, 1e3, 1e6 })
+    {
+        vs.setVoltage(vin);
+        clip.process();
+        const double v = clip.getVoltage();
+        EXPECT_TRUE(std::isfinite(v));
+        EXPECT_LT(std::fabs(v), 5.0);   // diode conduction clamps far below drive
+    }
+}

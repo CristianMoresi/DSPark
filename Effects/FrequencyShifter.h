@@ -28,6 +28,7 @@
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/Hilbert.h"
 #include "../Core/StateBlob.h"
@@ -95,6 +96,12 @@ public:
         const int numCh = std::min(buffer.getNumChannels(), numChannels_);
         const int numSamples = buffer.getNumSamples();
         if (numSamples == 0 || numCh == 0) return;
+
+        // The Hilbert transformer runs per-sample over a 191-tap FIR; denormal
+        // input samples would drop every tap into the x86 slow path. The
+        // framework convention is that per-sample Hilbert callers install their
+        // own guard (see Hilbert.h and Compressor.h).
+        DenormalGuard guard;
 
         const T targetMix = mix_.load(std::memory_order_relaxed);
         const T shiftHz = shift_.load(std::memory_order_relaxed);

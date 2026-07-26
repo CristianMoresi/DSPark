@@ -2376,3 +2376,95 @@ DSPARK_TEST(Clipper_modes_clip_to_ceiling_and_pass_quiet)
         EXPECT_LT(quietDiff, 2e-4f); // unity for quiet material in every mode
     }
 }
+
+// ============================================================================
+// M-005 AG-4 audit pins (additive; RF-009/ADR-011 + nonlinear defect fixes)
+// ============================================================================
+
+// RF-009/ADR-011: TapeMachine gains a configurable oversampling factor incl.
+// 1x, with the added latency reported per factor and persisted in state.
+DSPARK_TEST(TapeMachine_oversampling_configurable_and_reported)
+{
+    TapeMachine<float> t;
+    t.prepare(spec(48000.0, 512, 2));
+    const int base4x = t.getLatency();                 // default factor is 4
+    t.setOversampling(1); const int l1 = t.getLatency();
+    EXPECT_EQ(t.getOversamplingFactor(), 1);
+    t.setOversampling(2); const int l2 = t.getLatency();
+    EXPECT_EQ(t.getOversamplingFactor(), 2);
+    t.setOversampling(4); const int l4 = t.getLatency();
+    EXPECT_EQ(t.getOversamplingFactor(), 4);
+    t.setOversampling(8); const int l8 = t.getLatency();
+    EXPECT_EQ(t.getOversamplingFactor(), 8);
+    EXPECT_EQ(l4, base4x);                              // default unchanged
+    EXPECT_LT(l1, l2); EXPECT_LT(l2, l4); EXPECT_LT(l4, l8);   // monotone in factor
+    EXPECT_EQ(t.getLatencySamples(), t.getLatency());  // RNF-005 alias agrees
+    // Invalid / non-power-of-two factors are ignored (stay at 8).
+    t.setOversampling(3); t.setOversampling(0); t.setOversampling(-4); t.setOversampling(32);
+    EXPECT_EQ(t.getOversamplingFactor(), 8);
+    // State persists the factor.
+    auto blob = t.getState();
+    TapeMachine<float> u; u.prepare(spec(48000.0, 512, 2));
+    EXPECT_TRUE(u.setState(blob.data(), blob.size()));
+    EXPECT_EQ(u.getOversamplingFactor(), 8);
+}
+
+// RF-009/ADR-011: TubePreamp gains a configurable oversampling factor incl.
+// 1x=off (zero added latency), reported per factor and persisted in state.
+DSPARK_TEST(TubePreamp_oversampling_configurable_and_reported)
+{
+    TubePreamp<float> t;
+    t.prepare(spec(48000.0, 512, 2));
+    t.setOversampling(1); const int l1 = t.getLatency();
+    EXPECT_EQ(t.getOversamplingFactor(), 1);
+    EXPECT_EQ(l1, 0);                                   // 1x = off, no added latency
+    t.setOversampling(2); const int l2 = t.getLatency();
+    EXPECT_EQ(t.getOversamplingFactor(), 2);
+    t.setOversampling(4); const int l4 = t.getLatency();
+    EXPECT_EQ(t.getOversamplingFactor(), 4);
+    EXPECT_LT(l1, l2); EXPECT_LT(l2, l4);
+    EXPECT_EQ(t.getLatencySamples(), t.getLatency());
+    t.setOversampling(5); t.setOversampling(0);         // ignored
+    EXPECT_EQ(t.getOversamplingFactor(), 4);
+    auto blob = t.getState();
+    TubePreamp<float> u; u.prepare(spec(48000.0, 512, 2));
+    EXPECT_TRUE(u.setState(blob.data(), blob.size()));
+    EXPECT_EQ(u.getOversamplingFactor(), 4);
+}
+
+// M-005 H1: a transient NaN/Inf field must not poison the Jiles-Atherton core
+// forever - after the bad samples the output recovers to finite, bounded M.
+DSPARK_TEST(Hysteresis_survives_nonfinite_input)
+{
+    Hysteresis<double> h;
+    h.prepare(192000.0);
+    h.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
+    for (int i = 0; i < 500; ++i) (void)h.processSample(2.0e4 * std::sin(0.01 * i));
+    (void)h.processSample(std::numeric_limits<double>::quiet_NaN());
+    (void)h.processSample(std::numeric_limits<double>::infinity());
+    bool finite = true;
+    for (int i = 0; i < 4000; ++i)
+    {
+        const double m = h.processSample(2.0e4 * std::sin(0.01 * i));
+        if (!std::isfinite(m) || std::abs(m) > h.getSaturation() * 1.0000001) finite = false;
+    }
+    EXPECT_TRUE(finite);
+}
+
+// M-005 T1: a NaN/Inf input sample must not poison the transformer channel -
+// a clean block after a poisoned block is fully finite.
+DSPARK_TEST(TransformerModel_survives_nonfinite_input)
+{
+    TransformerModel<float> t;
+    t.prepare(spec(48000.0, 512, 1));
+    t.setDrive(12.0f);
+    auto b1 = makeBuffer(1, 512);
+    generateSine(b1.ch(0), 512, 220.0f, 48000.0f, 0.3f);
+    b1.ch(0)[100] = std::numeric_limits<float>::quiet_NaN();
+    b1.ch(0)[300] = std::numeric_limits<float>::infinity();
+    t.processBlock(b1.view());
+    auto b2 = makeBuffer(1, 512);
+    generateSine(b2.ch(0), 512, 220.0f, 48000.0f, 0.3f);
+    t.processBlock(b2.view());
+    EXPECT_NO_NAN(b2.ch(0), 512);
+}

@@ -254,7 +254,13 @@ public:
             {
                 hSm *= hRat;
                 mSm *= mRat;
-                const double x = static_cast<double>(d[i]);
+                // Non-finite guard: a NaN/Inf input would poison the leaky
+                // integrator (flux/vPrev), the algebraic inverse (vPrev2/mPrev),
+                // the DC-blocker (hpX/hpY) and the bell permanently. Replace the
+                // bad sample with silence (dry too) so a transient glitch cannot
+                // kill the channel for the rest of the stream.
+                double x = static_cast<double>(d[i]);
+                if (!std::isfinite(x)) { x = 0.0; d[i] = T(0); }
 
                 // Leaky trapezoidal integrator: winding voltage -> flux.
                 const double fluxNew = leak_ * st.flux + halfT_ * (x + st.vPrev);

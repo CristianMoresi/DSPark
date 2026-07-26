@@ -40,7 +40,17 @@
  *   same contract as TapeMachine/TransformerModel. Use setOutput() for
  *   static trim; gain changes are ramped (~30 ms) so drags stay click-free.
  *
- * The nonlinear core runs at 2x oversampling. THD signature verified in the
+ * The nonlinear core runs at 2x oversampling by DEFAULT. Per RF-009/ADR-011
+ * the factor is configurable via setOversampling(int) (setup thread only, it
+ * reallocates and re-calibrates like prepare()): 1 = OFF (no internal
+ * resampling, zero added latency, but the triode/grid nonlinearity then
+ * aliases in-band unless you oversample the surrounding chain yourself), 2 =
+ * default (group-delay latency reported by getLatency()/getLatencySamples()),
+ * 4/8 = progressively lower alias floor at ~linearly higher CPU. Cost scales
+ * with the factor: the whole per-sample Newton-Raphson triode + WDF tone
+ * solve runs factor x oversampled samples, so 4x is ~2x the CPU of the 2x
+ * default and 1x is the cheapest. getLatency() always reflects the ACTIVE
+ * factor (0 at 1x) so hosts get correct PDC. THD signature verified in the
  * suite: single-stage distortion is 2nd-harmonic dominant (asymmetric
  * triode), DC operating point matches an independent high-precision solve
  * of the same circuit equations (the check SPICE would perform).
@@ -101,20 +111,31 @@ public:
     {
         if (!spec.isValid()) return;
         prepared_.store(false, std::memory_order_relaxed);
+        spec_ = spec;
         sampleRate_ = spec.sampleRate;
-        fs2_ = 2.0 * sampleRate_;
+        // Internal processing rate = active oversampling factor x base rate
+        // (RF-009/ADR-011: factor is configurable, 1 = off).
+        fs2_ = static_cast<double>(osFactor_) * sampleRate_;
         numChannels_ = spec.numChannels;
         maxBlock_ = std::max(spec.maxBlockSize, 1);
 
-        oversampler_ = std::make_unique<Oversampling<T>>(2, Oversampling<T>::Quality::High);
-        oversampler_->prepare(spec);
+        if (osFactor_ > 1)
+        {
+            oversampler_ = std::make_unique<Oversampling<T>>(
+                osFactor_, Oversampling<T>::Quality::High);
+            oversampler_->prepare(spec);
+        }
+        else
+        {
+            oversampler_.reset();
+        }
 
         channels_.clear();
         channels_.resize(static_cast<size_t>(numChannels_));
         for (auto& ch : channels_)
             ch = std::make_unique<ChannelState>(fs2_);
 
-        latency_ = oversampler_->getLatency();
+        latency_ = oversampler_ ? oversampler_->getLatency() : 0;
         drySize_ = 1;
         while (drySize_ < latency_ + maxBlock_ + 1) drySize_ <<= 1;
         dryRing_.assign(static_cast<size_t>(numChannels_),
@@ -197,6 +218,34 @@ public:
         dirty_.store(true, std::memory_order_release);
     }
 
+    /**
+     * @brief Configures internal oversampling of the nonlinear circuit
+     *  (RF-009/ADR-011 transparency policy). SETUP THREAD ONLY - it reallocates
+     *  the polyphase filters and re-runs the reference calibration exactly like
+     *  prepare(); never call it concurrently with processBlock().
+     *
+     * @param factor Power-of-two multiplier in {1,2,4,8,16}. 1 = OFF (no
+     *  internal resampling, zero added latency; the triode/grid nonlinearity
+     *  then aliases in-band unless the surrounding chain is oversampled). 2 is
+     *  the default. Higher factors lower the alias floor at ~linearly higher
+     *  CPU. Invalid or non-power-of-two values are ignored. getLatency()
+     *  reflects the new factor after this call (0 at 1x).
+     */
+    void setOversampling(int factor)
+    {
+        if (factor < 1 || factor > 16 || (factor & (factor - 1)) != 0) return;
+        if (factor == osFactor_) return;
+        osFactor_ = factor;
+        // Rebuild the whole chain at the new internal rate if already prepared
+        // (fs2_, oversampler, per-channel circuits and calibration all depend
+        // on the factor). Same setup-thread cost as prepare().
+        if (prepared_.load(std::memory_order_relaxed))
+            prepare(spec_);
+    }
+
+    /** @brief Active oversampling factor (1 = off, 2 = default). */
+    [[nodiscard]] int getOversamplingFactor() const noexcept { return osFactor_; }
+
     /** @brief Static output trim in dB [-24, +12]. Non-finite values are ignored. */
     void setOutput(T db) noexcept
     {
@@ -221,8 +270,13 @@ public:
     [[nodiscard]] T getOutput() const noexcept { return outputDb_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
 
-    /** @brief Latency in samples (the 2x oversampler only). */
+    /** @brief Latency in samples the active oversampler adds (0 at 1x = off);
+     *  reflects the current factor for host PDC (RF-009/ADR-011). */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
+
+    /** @brief Alias of getLatency() under the framework-wide latency-reporter
+     *  name (RNF-005), so ProcessorChain::getLatency() includes this stage. */
+    [[nodiscard]] int getLatencySamples() const noexcept { return latency_; }
 
     /** @brief Effective B+ supply voltage of channel 0 (sag meter readout). */
     [[nodiscard]] T getSupplyVoltage() const noexcept
@@ -244,6 +298,7 @@ public:
         w.write("stages", stages_.load(std::memory_order_relaxed));
         w.write("output", static_cast<float>(outputDb_.load(std::memory_order_relaxed)));
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
+        w.write("oversampling", osFactor_);
         return w.blob();
     }
 
@@ -260,6 +315,9 @@ public:
         setStages(r.read("stages", 1));
         setOutput(static_cast<T>(r.read("output", 0.0f)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
+        // Default 2 = the historical fixed factor (blobs written before RF-009
+        // restore the 2x behaviour they were captured with).
+        setOversampling(r.read("oversampling", 2));
         return true;
     }
 
@@ -302,9 +360,11 @@ public:
             }
         }
 
-        // Nonlinear circuit at 2x.
+        // Nonlinear circuit at the active oversampling factor (1x = process the
+        // base-rate buffer in place, no resampling; RF-009/ADR-011).
         {
-            auto osView = oversampler_->upsample(buffer);
+            const bool osOn = (oversampler_ != nullptr);
+            auto osView = osOn ? oversampler_->upsample(buffer) : buffer;
             const int osN = osView.getNumSamples();
 
             // Anti-zipper: GEOMETRIC in-block ramps toward the current
@@ -338,7 +398,7 @@ public:
             }
             outGainSm_ = outEnd;
             hScaleSm_ = hEnd;
-            oversampler_->downsample(buffer);
+            if (osOn) oversampler_->downsample(buffer);
             supplyNow_.store(static_cast<T>(kBplus - sagR_ * channels_[0]->ipLP),
                              std::memory_order_relaxed);
         }
@@ -758,6 +818,7 @@ private:
     }
 
     // -- Members --------------------------------------------------------------------
+    AudioSpec spec_ {};                ///< Last valid spec, for setOversampling re-prepare.
     double sampleRate_ = 48000.0;
     double fs2_ = 96000.0;
     int numChannels_ = 0;
@@ -765,6 +826,7 @@ private:
     std::atomic<bool> prepared_ { false };
     int latency_ = 0;
     int drySize_ = 1;
+    int osFactor_ = 2;                  ///< Oversampling factor (setup thread; 1 = off, 2 default).
 
     std::unique_ptr<Oversampling<T>> oversampler_;
     std::vector<std::unique_ptr<ChannelState>> channels_;

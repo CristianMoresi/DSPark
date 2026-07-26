@@ -117,6 +117,13 @@ public:
      */
     [[nodiscard]] T processSample(T fieldH) noexcept
     {
+        // Non-finite guard: a single NaN/Inf field would poison m_/hPrev_/
+        // hDotPrev_/wPrev_ permanently (the recursive JA state never clears it,
+        // and inf-inf on the next sample becomes a sticky NaN). Ignore the bad
+        // sample and hold the last magnetization, so a transient upstream
+        // glitch cannot kill the core for the rest of the stream.
+        if (!std::isfinite(fieldH)) return static_cast<T>(m_);
+
         const double h = static_cast<double>(fieldH);
         const double hDot = fs2_ * (h - hPrev_) - hDotPrev_;
 

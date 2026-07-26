@@ -17,7 +17,8 @@
  *    digital inverse. The round trip is flat by construction - but the
  *    hysteresis sees the emphasized signal, so highs saturate first at slow
  *    speeds, exactly as on hardware.
- * 2. **Magnetic hysteresis with REAL AC bias** at 4x oversampling: an
+ * 2. **Magnetic hysteresis with REAL AC bias** at 4x oversampling by DEFAULT
+ *    (configurable per RF-009/ADR-011, see setOversampling): an
  *    ultrasonic carrier (0.375 * internal rate, exact 8-phase table) is
  *    summed with the signal into a push-pull pair of JA instances per
  *    channel (+carrier / -carrier, output averaged, like a centre-tapped
@@ -63,12 +64,26 @@
  * parameter change runs a short scratch calibration on the audio thread
  * (allocation-free, a few thousand samples of model time).
  *
- * Cost: the push-pull biased core runs two JA solvers at 4x, ~11% of one
- * core at 48 kHz stereo on a desktop CPU - the price of physical AC bias
- * (history-independent LF response, exact even-harmonic cancellation,
- * ultrasonic residue below -75 dB). A SIMD lane-parallel JA (2 channels x
- * 2 polarities) is the noted future optimisation if a lighter budget is
- * ever needed.
+ * Cost: the push-pull biased core runs two JA solvers at the active
+ * oversampling factor (4x default), ~11% of one core at 48 kHz stereo on a
+ * desktop CPU at 4x - the price of physical AC bias (history-independent LF
+ * response, exact even-harmonic cancellation, ultrasonic residue below
+ * -75 dB). A SIMD lane-parallel JA (2 channels x 2 polarities) is the noted
+ * future optimisation if a lighter budget is ever needed.
+ *
+ * **Oversampling transparency (RF-009/ADR-011).** setOversampling(int)
+ * (setup thread only; it reallocates and re-calibrates like prepare())
+ * selects the internal factor in {1,2,4,8,16}. DEFAULT 4. The AC-bias
+ * carrier is always 0.375 * the internal rate, so the factor sets how far
+ * the carrier sits above the audio band: at 4x/48k it is ultrasonic
+ * (72 kHz) and its even folds die in the downsampler; CPU scales ~linearly
+ * with the factor. factor = 1 means OFF - no internal resampling and zero
+ * added oversampler latency, but then the carrier lands at 0.375 * the base
+ * rate (18 kHz at 48k), i.e. IN-BAND, so 1x is only sensible when the host
+ * runs a high sample rate or the surrounding chain is already oversampled
+ * (the AC-bias model needs ultrasonic headroom). getLatency() always
+ * reflects the active factor (oversampler group delay + loss FIR + transport
+ * delay), so hosts get correct PDC.
  *
  * Dependencies: Core/Hysteresis.h, Core/Oversampling.h, Core/Biquad.h,
  * Core/SimdOps.h, Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h,
@@ -121,14 +136,26 @@ public:
     {
         if (!spec.isValid()) return;
         prepared_.store(false, std::memory_order_relaxed);
+        spec_ = spec;
         sampleRate_ = spec.sampleRate;
         numChannels_ = spec.numChannels;
         maxBlock_ = std::max(spec.maxBlockSize, 1);
 
-        // The hysteresis core runs at 4x so the 0.375 * internal-rate AC bias
-        // carrier and its sidebands stay clear of the audio band.
-        oversampler_ = std::make_unique<Oversampling<T>>(4, Oversampling<T>::Quality::High);
-        oversampler_->prepare(spec);
+        // The hysteresis core runs at the active oversampling factor (4x
+        // default) so the 0.375 * internal-rate AC bias carrier and its
+        // sidebands stay clear of the audio band. factor = 1 = OFF: no
+        // resampling (RF-009/ADR-011); the carrier is then in-band.
+        const double osRate = sampleRate_ * static_cast<double>(osFactor_);
+        if (osFactor_ > 1)
+        {
+            oversampler_ = std::make_unique<Oversampling<T>>(
+                osFactor_, Oversampling<T>::Quality::High);
+            oversampler_->prepare(spec);
+        }
+        else
+        {
+            oversampler_.reset();
+        }
 
         // Push-pull pair per channel: +carrier and -carrier instances, output
         // averaged. Odd-in-bias terms (the carrier, its 3rd harmonic fold and
@@ -138,12 +165,12 @@ public:
         hysteresisN_.assign(static_cast<size_t>(numChannels_), {});
         for (auto& h : hysteresis_)
         {
-            h.prepare(sampleRate_ * 4.0);
+            h.prepare(osRate);
             h.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
         }
         for (auto& h : hysteresisN_)
         {
-            h.prepare(sampleRate_ * 4.0);
+            h.prepare(osRate);
             h.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
         }
 
@@ -184,7 +211,7 @@ public:
         scrapeA1_ = std::exp(-2.0 * std::numbers::pi * 90.0 * dt);
         scrapeA2_ = std::exp(-2.0 * std::numbers::pi * 40.0 * dt);
 
-        latency_ = oversampler_->getLatency() + kFirCenter + delayCenter_;
+        latency_ = (oversampler_ ? oversampler_->getLatency() : 0) + kFirCenter + delayCenter_;
         drySize_ = 1;
         while (drySize_ < latency_ + maxBlock_ + 1) drySize_ <<= 1;
         dryRing_.assign(static_cast<size_t>(numChannels_),
@@ -251,6 +278,31 @@ public:
         bias_.store(std::clamp(bias, T(0), T(1)), std::memory_order_relaxed);
         dirty_.store(true, std::memory_order_release);
     }
+
+    /**
+     * @brief Configures internal oversampling of the biased hysteresis core
+     *  (RF-009/ADR-011 transparency policy). SETUP THREAD ONLY - it reallocates
+     *  the polyphase filters and re-prepares/re-calibrates the whole chain
+     *  exactly like prepare(); never call it concurrently with processBlock().
+     *
+     * @param factor Power-of-two multiplier in {1,2,4,8,16}. DEFAULT 4. 1 = OFF
+     *  (no internal resampling, zero added oversampler latency; the AC-bias
+     *  carrier then lands in-band at 0.375 * the base rate, so 1x is only
+     *  sensible under host/chain oversampling). CPU scales ~linearly with the
+     *  factor. Invalid/non-power-of-two values are ignored. getLatency()
+     *  reflects the new factor after this call.
+     */
+    void setOversampling(int factor)
+    {
+        if (factor < 1 || factor > 16 || (factor & (factor - 1)) != 0) return;
+        if (factor == osFactor_) return;
+        osFactor_ = factor;
+        if (prepared_.load(std::memory_order_relaxed))
+            prepare(spec_);
+    }
+
+    /** @brief Active oversampling factor (1 = off, 4 = default). */
+    [[nodiscard]] int getOversamplingFactor() const noexcept { return osFactor_; }
 
     /** @brief Tape speed (changes EQ time constants, losses and head bump).
      *  Out-of-range values are clamped. */
@@ -332,8 +384,13 @@ public:
     [[nodiscard]] T getNoise() const noexcept { return noiseDb_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
 
-    /** @brief Total latency in samples (oversampler + loss FIR + transport delay). */
+    /** @brief Total latency in samples (active oversampler + loss FIR +
+     *  transport delay); reflects the current factor for host PDC. */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
+
+    /** @brief Alias of getLatency() under the framework-wide latency-reporter
+     *  name (RNF-005), so ProcessorChain::getLatency() includes this stage. */
+    [[nodiscard]] int getLatencySamples() const noexcept { return latency_; }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
@@ -350,6 +407,7 @@ public:
         w.write("wowFlutter", static_cast<float>(wowFlutter_.load(std::memory_order_relaxed)));
         w.write("noise", static_cast<float>(noiseDb_.load(std::memory_order_relaxed)));
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
+        w.write("oversampling", osFactor_);
         return w.blob();
     }
 
@@ -367,6 +425,8 @@ public:
         setWowFlutter(static_cast<T>(r.read("wowFlutter", 0.15f)));
         setNoise(static_cast<T>(r.read("noise", -200.0f)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
+        // Default 4 = the historical fixed factor (older blobs restore 4x).
+        setOversampling(r.read("oversampling", 4));
         return true;
     }
 
@@ -423,7 +483,8 @@ public:
         // cancels every odd-in-bias term exactly (carrier, its folded 3rd
         // harmonic, remanence DC) like a centre-tapped record head.
         {
-            auto osView = oversampler_->upsample(buffer);
+            const bool osOn = (oversampler_ != nullptr);
+            auto osView = osOn ? oversampler_->upsample(buffer) : buffer;
             const int osN = osView.getNumSamples();
             const int phaseStart = biasPhase_;
             for (int ch = 0; ch < nCh; ++ch)
@@ -446,7 +507,7 @@ public:
                 }
             }
             biasPhase_ = (phaseStart + osN) & 7;
-            oversampler_->downsample(buffer);
+            if (osOn) oversampler_->downsample(buffer);
         }
 
         // 4-6. Loss FIR + head bump, transport modulation, playback EQ, noise, mix.
@@ -658,7 +719,8 @@ private:
             const double emph1k = std::sqrt((1.0 + kHiCap * kHiCap * w1 * w1)
                                             / (1.0 + w1 * w1));
             const double kCalAmp = 0.25 * emph1k;
-            const double fs4 = sampleRate_ * 4.0;
+            // Calibrate through the same internal rate the biased chain runs at.
+            const double fs4 = sampleRate_ * static_cast<double>(osFactor_);
             // 16 ms settle + 8 ms measured: the biased loop's mean state
             // needs a few hundred carrier cycles to reach its steady branch.
             const int calN = static_cast<int>(0.024 * fs4);
@@ -854,12 +916,14 @@ private:
     static constexpr int kFirCenter = 31;
     static constexpr int kFirRing = 128;        // double-write mirrored ring
 
+    AudioSpec spec_ {};              ///< Last valid spec, for setOversampling re-prepare.
     double sampleRate_ = 48000.0;
     int numChannels_ = 0;
     int maxBlock_ = 0;
     std::atomic<bool> prepared_ { false };
     int latency_ = 0;
     int drySize_ = 1;
+    int osFactor_ = 4;               ///< Oversampling factor (setup thread; 1 = off, 4 default).
 
     std::unique_ptr<Oversampling<T>> oversampler_;
     std::vector<Hysteresis<T>> hysteresis_;   ///< +carrier instances (push-pull pair A).

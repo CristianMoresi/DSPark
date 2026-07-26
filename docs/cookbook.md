@@ -214,6 +214,27 @@ or 4x only when a band's detector needs the extra alias suppression, and leave
 it at 1x when you already oversample the whole section (above) to avoid
 cascaded resamplers. Cost scales roughly linearly with the factor; the exact
 per-factor latency is whatever `getLatency()` returns for the active setting.
+
+The two nonlinear-modelling stages that generate aliasing *inside* the model
+default to internal oversampling and expose the same control (`setOversampling`
+is setup-thread only on both - it reallocates and re-calibrates like
+`prepare()`):
+
+- `TapeMachine` **defaults to 4x**. The AC-bias carrier sits at 0.375x the
+  internal rate, so 4x/48k puts it ultrasonic (72 kHz) with its even folds
+  killed by the downsampler. CPU scales ~linearly with the factor (4x is the
+  reference cost of physical AC bias). `setOversampling(1)` turns the resampler
+  off (zero added latency) but then drops the carrier in-band (18 kHz at 48k) -
+  use 1x only under a high host rate or an already-oversampled section.
+- `TubePreamp` **defaults to 2x**. The triode + WDF tone solve runs `factor`x
+  oversampled; 4x roughly doubles the 2x CPU, 1x is the cheapest and adds zero
+  latency but lets the grid nonlinearity alias in-band. `getLatency()` reports
+  0 at 1x on both.
+
+`Saturation`, `Clipper` and `Core/WaveshapeTable` also expose `setOversampling`
+(all defaulting to 1x=off); `WaveshapeTable` is a memoryless table (no ADAA), so
+its Hermite interpolation reduces table noise but not aliasing - oversample it
+to suppress alias products.
 The `Compressor` does NOT run an internal audio-path resampler: its optional
 TruePeak mode oversamples only the *detector* (ITU-R BS.1770 inter-sample peak
 measurement), which adds no audio-path latency and cannot cascade, so there is

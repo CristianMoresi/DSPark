@@ -451,3 +451,36 @@ DSPARK_TEST(Panner_no_NaN)
         EXPECT_NO_NAN(tb.ch(1), 2048);
     }
 }
+
+// M-006 AG-5 C1: Panner front-door non-finite guard. The Spectral algorithm's
+// Biquad shelves (and Binaural/Haas delay lines) latch a NaN/Inf input forever;
+// a transient glitch must not poison the panner. Revert-check: removing the
+// guard turns this RED. Same defect class as M-005 C1.
+DSPARK_TEST(Panner_survives_nonfinite_input)
+{
+    Panner<float> pan;
+    pan.prepare(spec(48000.0, 512, 2));
+    pan.setAlgorithm(Panner<float>::Algorithm::Spectral);
+    pan.setPan(0.5f);
+    auto p = makeBuffer(2, 512);
+    p.fillSine(220.0f, 48000.0f, 0.3f);
+    p.ch(0)[64]  = std::numeric_limits<float>::quiet_NaN();
+    p.ch(1)[192] = std::numeric_limits<float>::infinity();
+    pan.processBlock(p.view());
+    double energy = 0.0; bool finite = true;
+    for (int blk = 0; blk < 30; ++blk)
+    {
+        auto b = makeBuffer(2, 512);
+        b.fillSine(220.0f, 48000.0f, 0.3f);
+        pan.processBlock(b.view());
+        if (blk >= 25)
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < 512; ++i)
+                {
+                    if (!std::isfinite(b.ch(c)[i])) finite = false;
+                    energy += double(b.ch(c)[i]) * double(b.ch(c)[i]);
+                }
+    }
+    EXPECT_TRUE(finite);
+    EXPECT_GT(energy, 1e-3);
+}

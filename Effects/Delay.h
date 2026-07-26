@@ -647,6 +647,14 @@ private:
                                             ChannelState& s, SampleType fbMult,
                                             SampleType lpC, SampleType hpC) noexcept
     {
+        // Front-door non-finite guard (M-006 C1): a NaN/Inf input, once written
+        // to the ring and recirculated through the recursive feedback filters
+        // (fbLpZ1/fbHpZ1) and the tanh saturator, poisons the delay line
+        // permanently. Replace it with 0 before it enters any state. No-op on
+        // finite input, so conformance metrics stay byte-identical. Shared by
+        // every entry point (processBlock/Channel/Wet/PingPong/processSample).
+        if (!std::isfinite(input)) input = SampleType(0);
+
         // 4-point Hermite needs read positions at idx0-1, idx0, idx0+1, idx0+2.
         // The write index points to the slot we are about to write THIS sample.
         // Slots writeIdx, writeIdx+1, writeIdx+2 still hold stale data from

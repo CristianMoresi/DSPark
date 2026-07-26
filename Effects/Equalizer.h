@@ -175,6 +175,20 @@ public:
     {
         DenormalGuard guard;
 
+        // Front-door non-finite guard (M-006 C1): the IIR bands (and the FFT
+        // overlap-save history in LinearPhase mode) latch a NaN/Inf input
+        // permanently. Scrub non-finite input to 0 before either path runs.
+        // No-op on finite input, so conformance metrics stay byte-identical.
+        {
+            const int gN = buffer.getNumSamples();
+            for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+            {
+                T* d = buffer.getChannel(ch);
+                for (int i = 0; i < gN; ++i)
+                    if (!std::isfinite(d[i])) d[i] = T(0);
+            }
+        }
+
         // Check if config was updated from the UI thread (Lock-free acquire)
         if (configDirty_.exchange(false, std::memory_order_acquire))
         {

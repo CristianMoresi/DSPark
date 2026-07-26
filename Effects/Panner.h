@@ -128,6 +128,21 @@ public:
     {
         if (buffer.getNumChannels() < 2) return;
 
+        // Front-door non-finite guard (M-006 C1): the Spectral algorithm's
+        // Biquad shelves and the Binaural/Haas delay lines carry recursive state
+        // that a NaN/Inf input would poison permanently. Scrub non-finite input
+        // to 0 before any algorithm runs. No-op on finite input (metrics
+        // byte-identical).
+        {
+            const int gN = buffer.getNumSamples();
+            for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+            {
+                T* d = buffer.getChannel(ch);
+                for (int i = 0; i < gN; ++i)
+                    if (!std::isfinite(d[i])) d[i] = T(0);
+            }
+        }
+
         // Apply control-thread publications (audio-thread application point).
         if (smoothingDirty_.exchange(false, std::memory_order_acquire))
             panSmoother_.reset(sampleRate_,

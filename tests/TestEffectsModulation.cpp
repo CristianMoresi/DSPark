@@ -1748,3 +1748,124 @@ DSPARK_TEST(RingModulator_geomean_no_dc_leak_on_silence)
     }
     EXPECT_LT(maxAbs, 1e-9f);
 }
+
+// ============================================================================
+// M-006 AG-5 C1: front-door non-finite input guards. A transient NaN/Inf input
+// must NOT permanently poison recursive state (feedback filters, allpass, FDN).
+// After a poison block, sustained clean input must recover to finite, non-zero
+// output WITHOUT an intervening reset(). Revert-check: removing the guard turns
+// each of these RED (stuck NaN / silence). Same defect class as M-005 C1.
+// ============================================================================
+DSPARK_TEST(Delay_survives_nonfinite_input)
+{
+    Delay<float> d;
+    d.prepare(spec(48000.0, 512, 2), 1.0);
+    auto p = makeBuffer(2, 512);
+    p.fillSine(220.0f, 48000.0f, 0.3f);
+    p.ch(0)[64]  = std::numeric_limits<float>::quiet_NaN();
+    p.ch(1)[192] = std::numeric_limits<float>::infinity();
+    d.processBlock(p.view(), 50.0f, 0.7f, 5000.0f, 0.0f); // feedback + LP recirculation
+    double energy = 0.0; bool finite = true;
+    for (int blk = 0; blk < 30; ++blk)
+    {
+        auto b = makeBuffer(2, 512);
+        b.fillSine(220.0f, 48000.0f, 0.3f);
+        d.processBlock(b.view(), 50.0f, 0.7f, 5000.0f, 0.0f);
+        if (blk >= 25)
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < 512; ++i)
+                {
+                    if (!std::isfinite(b.ch(c)[i])) finite = false;
+                    energy += double(b.ch(c)[i]) * double(b.ch(c)[i]);
+                }
+    }
+    EXPECT_TRUE(finite);
+    EXPECT_GT(energy, 1e-3);
+}
+
+DSPARK_TEST(Chorus_survives_nonfinite_input)
+{
+    Chorus<float> c;
+    c.prepare(spec(48000.0, 512, 2));
+    c.setFeedback(0.7f);
+    c.setMix(0.5f);
+    auto p = makeBuffer(2, 512);
+    p.fillSine(220.0f, 48000.0f, 0.3f);
+    p.ch(0)[64]  = std::numeric_limits<float>::quiet_NaN();
+    p.ch(1)[192] = -std::numeric_limits<float>::infinity();
+    c.processBlock(p.view());
+    double energy = 0.0; bool finite = true;
+    for (int blk = 0; blk < 30; ++blk)
+    {
+        auto b = makeBuffer(2, 512);
+        b.fillSine(220.0f, 48000.0f, 0.3f);
+        c.processBlock(b.view());
+        if (blk >= 25)
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < 512; ++i)
+                {
+                    if (!std::isfinite(b.ch(ch)[i])) finite = false;
+                    energy += double(b.ch(ch)[i]) * double(b.ch(ch)[i]);
+                }
+    }
+    EXPECT_TRUE(finite);
+    EXPECT_GT(energy, 1e-3);
+}
+
+DSPARK_TEST(Phaser_survives_nonfinite_input)
+{
+    Phaser<float> ph;
+    ph.prepare(spec(48000.0, 512, 2));
+    ph.setFeedback(0.5f);
+    ph.setMix(0.5f);
+    auto p = makeBuffer(2, 512);
+    p.fillSine(220.0f, 48000.0f, 0.3f);
+    p.ch(0)[64]  = std::numeric_limits<float>::infinity();
+    p.ch(1)[192] = std::numeric_limits<float>::quiet_NaN();
+    ph.processBlock(p.view());
+    double energy = 0.0; bool finite = true;
+    for (int blk = 0; blk < 30; ++blk)
+    {
+        auto b = makeBuffer(2, 512);
+        b.fillSine(220.0f, 48000.0f, 0.3f);
+        ph.processBlock(b.view());
+        if (blk >= 25)
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < 512; ++i)
+                {
+                    if (!std::isfinite(b.ch(ch)[i])) finite = false;
+                    energy += double(b.ch(ch)[i]) * double(b.ch(ch)[i]);
+                }
+    }
+    EXPECT_TRUE(finite);
+    EXPECT_GT(energy, 1e-3);
+}
+
+DSPARK_TEST(AlgoReverb_survives_nonfinite_input)
+{
+    AlgorithmicReverb<float> r;
+    r.prepare(spec(48000.0, 512, 2));
+    r.setDecay(2.0f);
+    r.setMix(1.0f);
+    auto p = makeBuffer(2, 512);
+    p.fillSine(220.0f, 48000.0f, 0.3f);
+    p.ch(0)[64]  = std::numeric_limits<float>::quiet_NaN();
+    p.ch(1)[192] = std::numeric_limits<float>::infinity();
+    r.processBlock(p.view());
+    double energy = 0.0; bool finite = true;
+    for (int blk = 0; blk < 60; ++blk)
+    {
+        auto b = makeBuffer(2, 512);
+        b.fillSine(220.0f, 48000.0f, 0.3f);
+        r.processBlock(b.view());
+        if (blk >= 55)
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < 512; ++i)
+                {
+                    if (!std::isfinite(b.ch(ch)[i])) finite = false;
+                    energy += double(b.ch(ch)[i]) * double(b.ch(ch)[i]);
+                }
+    }
+    EXPECT_TRUE(finite);
+    EXPECT_GT(energy, 1e-3);
+}

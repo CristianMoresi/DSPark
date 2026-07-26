@@ -28,7 +28,7 @@
  *   |       v
  *   |    [FDN Core: 16 delay lines]
  *   |      +- Read with dual smooth-random-LFO modulated delay
- *   |      +- Hadamard 16x16 butterfly (O(N log N))
+ *   |      +- Householder 16x16 reflection (I - (2/N)J, lossless) feedback mix
  *   |      +- Jot absorption filter (1st-order shelving) per line
  *   |      +- Bass shelf (1-pole) per line
  *   |      +- 2 feedback allpass per line
@@ -50,9 +50,13 @@
  *   delay line for smooth frequency-dependent decay, the #1 factor for natural
  *   sound. DC and Nyquist gains anchor the mid/HF T60 exactly; the transition
  *   sits at the high crossover. Separate bass shelf for independent LF control.
- * - **Hadamard 16x16**: all eigenvalues +/-1, zero coloring
+ * - **Householder 16x16 FDN feedback** (I - (2/N)J): unitary reflection,
+ *   eigenvalues {-1 once, +1 x15}, |lambda|=1 so it is lossless and
+ *   zero-coloring. (The Hadamard 16x16 below is the input diffuser's mix, not
+ *   the feedback matrix.)
  * - **Parallel allpass diffuser** (Signalsmith-inspired): 16 parallel allpass
- *   + 2-step Hadamard mixing -> 256 unique echo paths per input sample.
+ *   + 2-step Hadamard mixing (all eigenvalues +/-1) -> 256 unique echo paths
+ *   per input sample.
  *   Each FDN line receives a different, densely-mixed version of the input.
  * - **Feedback allpass**: 2 regular allpass per delay line for in-loop density
  * - **Output diffusion**: 2 allpass per channel with decorrelated delays,
@@ -289,6 +293,18 @@ public:
         const int nS  = buffer.getNumSamples();
         if (nCh == 0 || nS == 0) return;
 
+        // Front-door non-finite guard (M-006 C1): the FDN is fully recursive
+        // (fdnDelays_ feed back through Householder/absorption/allpasses) and the
+        // soft-clip does not remove NaN, so a single NaN/Inf input poisons the
+        // tail forever. Scrub non-finite input to 0 before the dry snapshot and
+        // any state. No-op on finite input (metrics byte-identical).
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* d = buffer.getChannel(ch);
+            for (int i = 0; i < nS; ++i)
+                if (!std::isfinite(d[i])) d[i] = T(0);
+        }
+
         drainPendingChanges();
 
         mixer_.pushDry(buffer);
@@ -350,6 +366,9 @@ public:
     {
         drainPendingChanges();
         refreshCachedParams();
+        // Front-door non-finite guard (M-006 C1): mirror processBlock so a
+        // per-sample caller cannot poison the recursive FDN tail forever.
+        if (!std::isfinite(input)) input = T(0);
         return processSampleInternal(input);
     }
 

@@ -2534,3 +2534,131 @@ DSPARK_TEST(TubePreamp_survives_nonfinite_input)
     EXPECT_TRUE(finite);
     EXPECT_GT(energy, 1e-3);
 }
+
+// ============================================================================
+// M-006 AG-5 pins (TestEffectsTone). C1: Equalizer/FilterEngine front-door
+// non-finite guard (recursive biquad cascade poisons forever on NaN/Inf). C2:
+// FilterEngine shelf-slope / Equalizer shelf-band Q change must be audible on
+// the MinimumPhase static fast path -- the rebuild guard used to omit
+// shelfSlope_, silently dropping a shelf Q change in min-phase steady state
+// while LinearPhase and the analysis curve reflected it. Revert-check: removing
+// either fix turns the corresponding pin RED.
+// ============================================================================
+DSPARK_TEST(Equalizer_survives_nonfinite_input)
+{
+    Equalizer<float> eq;
+    eq.prepare(spec(48000.0, 512, 2));
+    eq.setBand(0, 1000.0f, 6.0f, 2.0f);
+    auto p = makeBuffer(2, 512);
+    p.fillSine(220.0f, 48000.0f, 0.3f);
+    p.ch(0)[64]  = std::numeric_limits<float>::quiet_NaN();
+    p.ch(1)[192] = std::numeric_limits<float>::infinity();
+    eq.processBlock(p.view());
+    double energy = 0.0; bool finite = true;
+    for (int blk = 0; blk < 20; ++blk)
+    {
+        auto b = makeBuffer(2, 512);
+        b.fillSine(220.0f, 48000.0f, 0.3f);
+        eq.processBlock(b.view());
+        if (blk >= 15)
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < 512; ++i)
+                {
+                    if (!std::isfinite(b.ch(c)[i])) finite = false;
+                    energy += double(b.ch(c)[i]) * double(b.ch(c)[i]);
+                }
+    }
+    EXPECT_TRUE(finite);
+    EXPECT_GT(energy, 1e-3);
+}
+
+DSPARK_TEST(FilterEngine_survives_nonfinite_input)
+{
+    FilterEngine<float> fe;
+    fe.prepare(spec(48000.0, 512, 1));
+    fe.setPeaking(1000.0f, 6.0f, 2.0f);
+    auto p = makeBuffer(1, 512);
+    generateSine(p.ch(0), 512, 220.0f, 48000.0f, 0.3f);
+    p.ch(0)[64]  = std::numeric_limits<float>::infinity();
+    p.ch(0)[192] = std::numeric_limits<float>::quiet_NaN();
+    fe.processBlock(p.view());
+    double energy = 0.0; bool finite = true;
+    for (int blk = 0; blk < 20; ++blk)
+    {
+        auto b = makeBuffer(1, 512);
+        generateSine(b.ch(0), 512, 220.0f, 48000.0f, 0.3f);
+        fe.processBlock(b.view());
+        if (blk >= 15)
+            for (int i = 0; i < 512; ++i)
+            {
+                if (!std::isfinite(b.ch(0)[i])) finite = false;
+                energy += double(b.ch(0)[i]) * double(b.ch(0)[i]);
+            }
+    }
+    EXPECT_TRUE(finite);
+    EXPECT_GT(energy, 1e-3);
+}
+
+// C2 regression: a shelf-slope-only change (same freq/gain/shape) must alter the
+// MinimumPhase static-path output. The bug: the fast-path rebuild guard omitted
+// shelfSlope_, so once the freq/gain smoothers had settled bit-exact to target
+// (the normal steady state after ~100 ms of no change), a shelf slope/Q-only
+// change was silently dropped -- coefficients were never rebuilt. The LONG
+// pre-settle (kSettle blocks) is essential: with a short settle the smoother is
+// still inching toward target, so f/g differ every block and the rebuild fires
+// regardless, masking the defect. Revert-check: without the fix delta == 0.
+static constexpr int kShelfSettle = 500;   // reach bit-exact smoother settle
+static double feEnergy(dspark::FilterEngine<float>& fe, int nblk)
+{
+    using namespace dspark;
+    double e = 0.0;
+    for (int blk = 0; blk < nblk; ++blk)
+    {
+        auto b = makeBuffer(1, 512);
+        generateSine(b.ch(0), 512, 120.0f, 48000.0f, 0.3f);
+        fe.processBlock(b.view());
+        e = 0.0;
+        for (int i = 0; i < 512; ++i) e += double(b.ch(0)[i]) * double(b.ch(0)[i]);
+    }
+    return e;
+}
+
+DSPARK_TEST(FilterEngine_shelf_slope_change_is_audible)
+{
+    FilterEngine<float> fe;
+    fe.prepare(spec(48000.0, 512, 1));
+    fe.setLowShelf(200.0f, 12.0f, 0.4f);       // settle bit-exact: gentle slope
+    const double gentle = feEnergy(fe, kShelfSettle);
+    fe.setLowShelf(200.0f, 12.0f, 1.6f);       // ONLY the slope changes (same freq/gain)
+    const double steep  = feEnergy(fe, 16);
+    EXPECT_GT(std::abs(steep - gentle), 1e-3 * gentle);
+}
+
+static double eqEnergy(dspark::Equalizer<float>& eq, int nblk)
+{
+    using namespace dspark;
+    double e = 0.0;
+    for (int blk = 0; blk < nblk; ++blk)
+    {
+        auto b = makeBuffer(1, 512);
+        generateSine(b.ch(0), 512, 120.0f, 48000.0f, 0.3f);
+        eq.processBlock(b.view());
+        e = 0.0;
+        for (int i = 0; i < 512; ++i) e += double(b.ch(0)[i]) * double(b.ch(0)[i]);
+    }
+    return e;
+}
+
+DSPARK_TEST(Equalizer_shelf_band_Q_change_is_audible_in_min_phase)
+{
+    Equalizer<float> eq;
+    eq.prepare(spec(48000.0, 512, 1));
+    typename Equalizer<float>::BandConfig cfg;
+    cfg.frequency = 200.0f; cfg.gain = 12.0f;
+    cfg.type = Equalizer<float>::BandType::LowShelf; cfg.enabled = true;
+    cfg.q = 0.3f; eq.setBand(0, cfg);          // settle bit-exact: low Q -> gentle slope
+    const double loQ = eqEnergy(eq, kShelfSettle);
+    cfg.q = 1.2f; eq.setBand(0, cfg);          // ONLY Q changes (same freq/gain/type)
+    const double hiQ = eqEnergy(eq, 16);
+    EXPECT_GT(std::abs(hiQ - loQ), 1e-3 * loQ);
+}

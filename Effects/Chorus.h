@@ -121,6 +121,18 @@ public:
         const int nCh = std::min({ buffer.getNumChannels(), spec_.numChannels, kMaxChannels });
         const int nS  = buffer.getNumSamples();
 
+        // Front-door non-finite guard (M-006 C1): a single NaN/Inf input sample
+        // would recirculate through the recursive fbState_ path (fastTanh passes
+        // NaN) and mute the voice forever. Replace non-finite input with 0 before
+        // it reaches the dry snapshot or any delay/feedback state. No-op on finite
+        // input, so conformance metrics stay byte-identical.
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+        {
+            T* d = buffer.getChannel(ch);
+            for (int i = 0; i < nS; ++i)
+                if (!std::isfinite(d[i])) d[i] = T(0);
+        }
+
         // 1. Read atomics once per block
         T targetRate   = rate_.load(std::memory_order_relaxed);
         T targetDepth  = depthMs_.load(std::memory_order_relaxed);

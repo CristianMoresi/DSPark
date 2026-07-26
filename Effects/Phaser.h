@@ -113,6 +113,18 @@ public:
         const int nCh = std::min(buffer.getNumChannels(), kMaxChannels);
         const int nS  = buffer.getNumSamples();
 
+        // Front-door non-finite guard (M-006 C1): the allpass recursion
+        // (yPrev/xPrev) latches a NaN/Inf input permanently -- even with feedback
+        // off -- so a single glitch would silence the effect forever. Replace
+        // non-finite input with 0 before it reaches the dry snapshot or any
+        // allpass/feedback state. No-op on finite input (metrics byte-identical).
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+        {
+            T* d = buffer.getChannel(ch);
+            for (int i = 0; i < nS; ++i)
+                if (!std::isfinite(d[i])) d[i] = T(0);
+        }
+
         // Target parameters loaded once per block
         const T targetDepth = depth_.load(std::memory_order_relaxed);
         const T targetMix   = mix_.load(std::memory_order_relaxed);

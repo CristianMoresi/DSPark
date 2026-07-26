@@ -696,8 +696,15 @@ protected:
     // spinlock guards only the pointer copy/swap (nanoseconds on the audio
     // thread against one UI-initiated store per IR load), preserving the
     // exact snapshot semantics: an in-flight processBlock keeps its own
-    // shared_ptr alive, and replaced banks destruct on the UI thread
-    // (the swap drops them outside the lock).
+    // shared_ptr alive, so audio never reads a half-freed bank.
+    // HONEST CAVEAT (M-006, known MINOR/backlog): the previous bank is normally
+    // released on the UI thread by storeBank(), BUT in the rare interleaving
+    // where the audio thread had already snapshotted it, storeBank() only drops
+    // to refcount 1 and the FINAL release runs on the audio thread when the
+    // block's local shared_ptr expires -- i.e. an IR hot-swap concurrent with a
+    // block can free the old bank's FFT buffers on the audio thread. This is
+    // load-time only (never in steady state) and does not corrupt audio; a
+    // fully wait-free reclaim (hazard pointer / retire list) is backlogged.
     [[nodiscard]] std::shared_ptr<ConvolverBank> loadBank() const noexcept
     {
         while (bankLock_.test_and_set(std::memory_order_acquire)) {}

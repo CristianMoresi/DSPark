@@ -427,6 +427,16 @@ public:
         const int nCh = std::min(buffer.getNumChannels(), MaxChannels);
         const int nS  = buffer.getNumSamples();
 
+        // Front-door non-finite guard (M-006 C1): the recursive biquad cascade
+        // latches a NaN/Inf input permanently. Scrub non-finite input to 0
+        // before the cascade. No-op on finite input (metrics byte-identical).
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* d = buffer.getChannel(ch);
+            for (int i = 0; i < nS; ++i)
+                if (!std::isfinite(d[i])) d[i] = T(0);
+        }
+
         // Update smoothers with latest atomic targets
         freqSmoother_.setTargetValue(targetFreq_.load(std::memory_order_relaxed));
         resSmoother_.setTargetValue(targetRes_.load(std::memory_order_relaxed));
@@ -458,12 +468,15 @@ public:
                 const Shape sh = shape_.load(std::memory_order_relaxed);
                 const int sdb  = slopeDb_.load(std::memory_order_relaxed);
                 const bool mp  = matchedPeak_.load(std::memory_order_relaxed);
+                const float ssl = shelfSlope_.load(std::memory_order_relaxed);
                 if (f != lastFreq_ || q != lastQ_ || g != lastGain_ ||
-                    sh != lastShape_ || sdb != lastSlopeDb_ || mp != lastMatched_)
+                    sh != lastShape_ || sdb != lastSlopeDb_ || mp != lastMatched_ ||
+                    ssl != lastShelfSlope_)
                 {
                     updateCoefficients(f, q, g);
                     lastFreq_ = f; lastQ_ = q; lastGain_ = g;
                     lastShape_ = sh; lastSlopeDb_ = sdb; lastMatched_ = mp;
+                    lastShelfSlope_ = ssl;
                 }
 
                 const int ns = numStages_.load(std::memory_order_relaxed);
@@ -588,6 +601,7 @@ public:
         lastShape_ = shape_.load(std::memory_order_relaxed);
         lastSlopeDb_ = slopeDb_.load(std::memory_order_relaxed);
         lastMatched_ = matchedPeak_.load(std::memory_order_relaxed);
+        lastShelfSlope_ = shelfSlope_.load(std::memory_order_relaxed);
     }
 
 
@@ -782,6 +796,7 @@ protected:
     Shape lastShape_ = Shape::LowPass;
     int lastSlopeDb_ = -1;
     bool lastMatched_ = false;
+    float lastShelfSlope_ = -1.0f;   ///< Shelf S: a slope-only change must rebuild coeffs.
 };
 
 } // namespace dspark

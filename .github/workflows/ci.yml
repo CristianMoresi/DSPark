@@ -433,20 +433,30 @@ jobs:
       - name: Run under ThreadSanitizer
         run: ./dspark_conformance_tsan
 
-      # What this step actually proves concurrently: the suite's four
+      # What this step actually proves concurrently: the suite's six
       # cross-thread cases (SpinLock contention, SpscQueue producer/consumer,
-      # FIRFilter and Biquad seqlock publication). Every other component runs
-      # single-threaded here, so for those TSan checks execution, not
-      # concurrency - see tests/results/M-002/tsan-ci/handoff-coverage.md in
-      # the audit tree for the full per-handoff statement.
+      # FIRFilter and Biquad seqlock publication, SpectrumAnalyzer triple
+      # buffer, AnalogRandom readout publication - the last two added by
+      # M-008B). Every other component runs single-threaded here, so for
+      # those TSan checks execution, not concurrency - see
+      # tests/results/M-002/tsan-ci/handoff-coverage.md in the audit tree for
+      # the full per-handoff statement.
       #
       # Timeout: per-test wall times are wildly non-uniform under TSan. In
       # run 30712892449 the first 143 cases took ~8.6 min, almost all of it
       # in the two seqlock stress cases (atomic-dense, contended, the exact
       # thing TSan instruments hardest); the 547 cases after them hold no
       # threaded code and ~19x the plain numeric work of the first 143.
-      # 5400 s covers the derived worst case (~35 min) with >2x margin.
-      # Never trim the suite to fit the budget: raise the budget.
+      # 5400 s covers the derived worst case (~35 min) with >2x margin (the
+      # two M-008B concurrency pins are bounded-loop cases far lighter than
+      # the seqlock stress pair). Never trim the suite to fit the budget:
+      # raise the budget.
+      #
+      # ctest -V, not --output-on-failure (D-M002-I4-R3): on success
+      # --output-on-failure suppresses the harness's per-case listing, so a
+      # green log was not self-evidencing. -V surfaces every
+      # "[ i/N ] case_name" line and the final "N tests | N passed" summary,
+      # making the green verdict checkable against the case inventory.
       - name: Build + run the test suite under ThreadSanitizer
         run: |
           cmake -S . -B build-tsan \
@@ -454,7 +464,7 @@ jobs:
             -DDSPARK_BUILD_TESTS=ON -DDSPARK_BUILD_CONFORMANCE=OFF \
             -DCMAKE_CXX_FLAGS="-fsanitize=thread"
           cmake --build build-tsan --parallel
-          ctest --test-dir build-tsan --output-on-failure --timeout 5400
+          ctest --test-dir build-tsan -V --timeout 5400
 
   # ---------------------------------------------------------------------------
   # WebAssembly (Emscripten) — compile and execute with node

@@ -416,6 +416,11 @@ jobs:
   tsan:
     name: ThreadSanitizer (Linux GCC)
     runs-on: ubuntu-latest
+    # Bounds a pathological hang; a healthy full run fits well inside it
+    # (run 30712892449: tests 1-143 of the suite took ~8.6 min, dominated by
+    # the two seqlock stress cases; the remaining 547 cases are
+    # single-threaded and lighter).
+    timeout-minutes: 150
     env:
       TSAN_OPTIONS: halt_on_error=1
     steps:
@@ -428,11 +433,20 @@ jobs:
       - name: Run under ThreadSanitizer
         run: ./dspark_conformance_tsan
 
-      # The suite exercises the concurrent readouts (SpectrumAnalyzer,
-      # LoudnessMeter, LevelFollower) far more than the conformance checks do,
-      # so it is where a real data race is most likely to surface. Some cases
-      # run slower under TSan instrumentation: raise the ctest timeout rather
-      # than skip anything.
+      # What this step actually proves concurrently: the suite's four
+      # cross-thread cases (SpinLock contention, SpscQueue producer/consumer,
+      # FIRFilter and Biquad seqlock publication). Every other component runs
+      # single-threaded here, so for those TSan checks execution, not
+      # concurrency - see tests/results/M-002/tsan-ci/handoff-coverage.md in
+      # the audit tree for the full per-handoff statement.
+      #
+      # Timeout: per-test wall times are wildly non-uniform under TSan. In
+      # run 30712892449 the first 143 cases took ~8.6 min, almost all of it
+      # in the two seqlock stress cases (atomic-dense, contended, the exact
+      # thing TSan instruments hardest); the 547 cases after them hold no
+      # threaded code and ~19x the plain numeric work of the first 143.
+      # 5400 s covers the derived worst case (~35 min) with >2x margin.
+      # Never trim the suite to fit the budget: raise the budget.
       - name: Build + run the test suite under ThreadSanitizer
         run: |
           cmake -S . -B build-tsan \
@@ -440,7 +454,7 @@ jobs:
             -DDSPARK_BUILD_TESTS=ON -DDSPARK_BUILD_CONFORMANCE=OFF \
             -DCMAKE_CXX_FLAGS="-fsanitize=thread"
           cmake --build build-tsan --parallel
-          ctest --test-dir build-tsan --output-on-failure --timeout 1800
+          ctest --test-dir build-tsan --output-on-failure --timeout 5400
 
   # ---------------------------------------------------------------------------
   # WebAssembly (Emscripten) — compile and execute with node

@@ -292,9 +292,12 @@ private:
  *
  * Threading / data-race freedom: the SHARED staging coefficient buffer is
  * std::vector<std::atomic<T>>. The single control-thread producer stores each
- * word relaxed inside an odd/even seq-counter critical section; the audio
- * thread loads each word relaxed under the seqlock retry (with an acquire
- * fence). Because every cross-thread word access goes through std::atomic,
+ * word relaxed inside an odd/even seq-counter critical section, with a release
+ * fence between the odd increment and the word stores; the audio thread loads
+ * each word relaxed under the seqlock retry (with an acquire fence before the
+ * counter re-read). The two fences pair ([atomics.fences]/2): a reader that
+ * observes any mid-publish word is forced to observe the odd counter and
+ * retry. Because every cross-thread word access goes through std::atomic,
  * there is no non-atomic concurrent read/write - the handoff is UB-free by the
  * C++ memory model, not merely tear-free in practice. std::atomic<float/double>
  * is lock-free and single-word on every supported target, so the publish stays
@@ -371,9 +374,19 @@ public:
 
         // Seqlock publish: odd sequence = write in progress.
         coeffSeq_.fetch_add(1, std::memory_order_acq_rel);
+        // Release fence: pairs with the reader's acquire fence via fence-fence
+        // synchronization ([atomics.fences]/2). If the audio thread's copy loop
+        // reads ANY of the relaxed word stores below, that read forces its
+        // post-fence re-read of coeffSeq_ to observe the odd count above, so the
+        // retry loop rejects the torn copy. Without this fence the relaxed data
+        // words are NOT in coeffSeq_'s release sequence and the standard permits
+        // a torn copy to pass validation on weakly ordered targets (Boehm,
+        // "Can Seqlocks Get Along With Programming Language Memory Models?",
+        // MSPC 2012). Control-thread only: zero audio-path cost.
+        std::atomic_thread_fence(std::memory_order_release);
         // Write REVERSED coefficients to the staging buffer for SIMD dot product.
-        // Relaxed stores: the acq_rel/release fences on coeffSeq_ below publish
-        // them, so relaxed is sufficient AND makes each word access race-free.
+        // Relaxed stores: the atomic words make each access race-free; the fence
+        // above plus the seq counter order and publish the set.
         for (int k = 0; k < numTaps; ++k)
             stagingCoeffs_[static_cast<size_t>(k)].store(
                 coeffs[static_cast<size_t>(numTaps - 1 - k)], std::memory_order_relaxed);

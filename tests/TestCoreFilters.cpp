@@ -17,6 +17,7 @@
 #include <complex>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -971,6 +972,48 @@ DSPARK_TEST(FIR_multichannel_isolation)
         peakSilent = std::max(peakSilent, std::abs(fir.processSample(0.0f, 1)));
     }
     EXPECT_EQ(peakSilent, 0.0f);
+}
+
+// Additive coverage for the D-M002-C3 closure (M-002 iteration 3): the seqlock
+// staging words are std::atomic<T>, and that must hold for T = double too.
+// Checks (1) the lock-free precondition of the design (a non-lock-free atomic
+// would take a lock on the audio thread), (2) FIRFilter<double> behaves
+// (DC gain == tap sum exactly characterises the adopted kernel), and (3)
+// re-prepare() is well-formed: std::vector<std::atomic<T>> is move-ASSIGNED a
+// fresh vector, which must steal the buffer without any element copy/move
+// (std::atomic is neither copyable nor movable).
+DSPARK_TEST(FIR_double_instantiation_lockfree_and_reprepare)
+{
+    // Hard RT-safety precondition of the atomic-word seqlock design.
+    EXPECT_TRUE(std::atomic<float>::is_always_lock_free);
+    EXPECT_TRUE(std::atomic<double>::is_always_lock_free);
+
+    // Heap-allocate the <double> object (repo test convention for large ones).
+    auto fir = std::make_unique<FIRFilter<double>>();
+    fir->prepare(127, 2);
+    const auto taps = FIRDesign<double>::lowPass(48000.0, 4000.0, 127);
+    fir->setCoefficients(taps);
+
+    // Convolving long DC 1.0 converges to sum(taps) through the atomic-word
+    // publish + private-active copy path.
+    double dcOut = 0.0;
+    for (int i = 0; i < 400; ++i) dcOut = fir->processSample(1.0, 0);
+    double tapSum = 0.0;
+    for (double t : taps) tapSum += t;
+    EXPECT_NEAR(dcOut, tapSum, 1e-12);
+    EXPECT_EQ(fir->getLatency(), 63);
+
+    // Re-prepare with a different size: exercises the vector<atomic> move
+    // assignment onto an engaged vector and must leave a working filter.
+    fir->prepare(31, 1);
+    const auto taps2 = FIRDesign<double>::lowPass(48000.0, 2000.0, 31);
+    fir->setCoefficients(taps2);
+    double dc2 = 0.0;
+    for (int i = 0; i < 200; ++i) dc2 = fir->processSample(1.0, 0);
+    double sum2 = 0.0;
+    for (double t : taps2) sum2 += t;
+    EXPECT_NEAR(dc2, sum2, 1e-12);
+    EXPECT_EQ(fir->getLatency(), 15);
 }
 
 

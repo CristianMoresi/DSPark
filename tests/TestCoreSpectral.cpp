@@ -1116,12 +1116,37 @@ DSPARK_TEST(ZeroLatencyConvolver_is_zero_latency)
     EXPECT_NEAR(x[1], -0.25f, 1e-6f);
 }
 
+// ThreadSanitizer detection for the wall-clock case below.
+#if defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define DSPARK_TEST_UNDER_TSAN 1
+#  endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#  define DSPARK_TEST_UNDER_TSAN 1
+#endif
+
 DSPARK_TEST(ZeroLatencyConvolver_cpu_is_flat)
 {
     // Acceptance criterion: no per-block spike above 2x the mean. The work
     // pattern is deterministic, so run the same block sequence several times
     // and keep the per-block MINIMUM - that filters OS scheduling noise out
     // of the wall-clock measurement while preserving any algorithmic spike.
+    //
+    // Not meaningful under ThreadSanitizer: this is a single-threaded
+    // wall-clock assertion about the ALGORITHM's work distribution, and the
+    // TSan runtime injects its own work into the timed region (shadow-memory
+    // maintenance and periodic global resets keyed to the memory-access
+    // stream, not to wall time). Because the block sequence here is
+    // deliberately deterministic, that injected work can land on the same
+    // block index in every run, which the min-of-5 filter then cannot
+    // remove: a false spike verdict about TSan, not about the convolver.
+    // The case contributes nothing to race detection (no second thread), so
+    // under TSan it steps aside; it runs fully on all normal builds and
+    // under ASan+UBSan (CI green there, run 30712892449).
+#if defined(DSPARK_TEST_UNDER_TSAN)
+    return;
+#else
     std::vector<float> ir(48000);
     uint32_t rng = 99u;
     for (auto& v : ir)
@@ -1161,4 +1186,5 @@ DSPARK_TEST(ZeroLatencyConvolver_cpu_is_flat)
     }
     mean /= (blocks - start);
     EXPECT_LT(mx / mean, 2.0);
+#endif
 }

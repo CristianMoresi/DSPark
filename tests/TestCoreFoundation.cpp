@@ -913,14 +913,31 @@ DSPARK_TEST(AudioBuffer_zero_sample_resize_is_safe)
 #  if __has_feature(address_sanitizer)
 #    define DSPARK_TEST_UNDER_ASAN 1
 #  endif
+#  if __has_feature(thread_sanitizer)
+#    define DSPARK_TEST_UNDER_TSAN 1
+#  endif
 #endif
 #if defined(__SANITIZE_ADDRESS__)
 #  define DSPARK_TEST_UNDER_ASAN 1
 #endif
+// ThreadSanitizer replaces the allocator the same way and is equally unable
+// to honour the C++ allocation contract: its throwing operator new NEVER
+// throws std::bad_alloc. A request past its 1 TiB allocator ceiling dies
+// with a fatal allocation-size-too-big report (NORETURN, independent of
+// halt_on_error), and allocator_may_return_null=1 merely converts that into
+// a null return which the throwing-new interceptor then turns into an
+// equally fatal out-of-memory report (GCC 13 libsanitizer,
+// tsan/tsan_new_delete.cpp OPERATOR_NEW_BODY, tsan/tsan_mman.cpp
+// user_alloc_internal, sanitizer_common/sanitizer_allocator_report.cpp).
+// CI run 30712892449 aborted the whole TSan suite on exactly this case, so
+// it steps aside under TSan too. It still runs fully on every normal build.
+#if defined(__SANITIZE_THREAD__)
+#  define DSPARK_TEST_UNDER_TSAN 1
+#endif
 
 DSPARK_TEST(AudioBuffer_recovers_after_failed_allocation)
 {
-#if defined(DSPARK_TEST_UNDER_ASAN)
+#if defined(DSPARK_TEST_UNDER_ASAN) || defined(DSPARK_TEST_UNDER_TSAN)
     return;
 #else
     // After a throwing resize the buffer must stay coherent: the next, smaller

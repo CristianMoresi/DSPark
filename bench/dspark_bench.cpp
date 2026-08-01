@@ -117,6 +117,22 @@ int main()
         }, kBlock));
     }
     {
+        // FIRFilter hot path (seqlock coefficient handoff audit, M-002): the
+        // per-sample cost must stay pure dotProduct + one relaxed dirty check.
+        const auto taps = dspark::FIRDesign<float>::lowPass(
+            static_cast<float>(kRate), 4000.0f, 63);
+        dspark::FIRFilter<float> fir;
+        fir.prepare(63, 1);
+        fir.setCoefficients(taps);
+        dspark::AudioBuffer<float> mono;
+        mono.resize(1, kBlock);
+        printRow("FIRFilter 63-tap LP (mono)", medianNsPerFrame([&] {
+            std::memcpy(mono.getChannel(0), src.data.data(), kBlock * sizeof(float));
+            fir.processBlock(mono.toView());
+            g_sink += mono.getChannel(0)[0];
+        }, kBlock));
+    }
+    {
         // FFT baseline for future optimization work (split-radix candidate):
         // one real 2048-point forward+inverse round trip per "frame".
         dspark::FFTReal<float> fft(2048);

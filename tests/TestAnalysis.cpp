@@ -1229,3 +1229,124 @@ DSPARK_TEST(SpectrumAnalyzer_triple_buffer_concurrent_readout_is_tear_free)
     EXPECT_GT(frames.load(std::memory_order_relaxed), 63); // writer liveness
     EXPECT_GT(fresh, 16);                                  // adoption liveness
 }
+
+// M-008B iteration 2 additive pin (CHANGE-REQUEST additive-only, D-M008B-C1):
+// paired-getter returned-pointer LIFETIME. The iteration-1 tear pin above
+// reads only getMagnitudesDb() and so could never reach the defect this pin
+// covers: with the pre-fix code, the pointer returned by one getter outlived
+// the reader's slot ownership -- the next acquisition (by EITHER getter)
+// handed that slot back to the writer, which then mutated the array behind
+// the still-held pointer through documented usage.
+// Reachability argument (AC-008B-6 / ADR-013 6(c)):
+//  - Part 1 is the deterministic public-API defect schedule from the M-008B
+//    Critic probe. Against the pre-fix header (3478aaa) it fails
+//    unconditionally: all 129 bins mutate behind the held pointer (red run
+//    archived in tests/results/M-008B/iter2/pin-red-on-prefix.log; the
+//    Critic/Orchestrator reproductions are spectrum-stale-pointer-probe.log
+//    and orchestrator-verify/critic-C1-stale-recheck.log).
+//  - Part 2 exercises BOTH getters concurrently with the writer while
+//    re-reading through the first getter's held pointer, so CI TSan (the
+//    C++11-aware oracle) now sees this access pattern: pre-fix it is a
+//    plain-word data race TSan reports; the live pre-fix mutation rate was
+//    ~263k observed mutations per 200k frames (critic-checks/
+//    spectrum-live-race-probe.log), far above this pin's zero tolerance.
+// Liveness floors prove real overlap; hard caps fail loudly instead of
+// hanging.
+DSPARK_TEST(SpectrumAnalyzer_paired_getter_held_pointer_never_mutates)
+{
+    // Part 1: deterministic defect schedule (single-threaded, public API).
+    {
+        auto sa = std::make_unique<SpectrumAnalyzer<float>>();
+        sa->prepare(48000.0, 256); // hop = 128 -> one frame per 128 samples
+        sa->setSmoothing(0.0f);
+        sa->setPeakHoldEnabled(true);
+        sa->setFloorDb(-200.0f);
+
+        std::vector<float> block(128);
+        auto pushHop = [&](float amp) {
+            std::fill(block.begin(), block.end(), amp);
+            sa->pushSamples(block.data(), 128);
+        };
+
+        pushHop(0.5f);                          // frame 1 published
+        const float* held = sa->getMagnitudesDb();
+        const int nb = sa->getNumBins();
+        std::vector<float> snap(held, held + nb);
+
+        pushHop(0.01f);                         // frame 2 published (fresh)
+        (void)sa->getPeakHoldDb();              // second acquisition
+        pushHop(0.9f);                          // pre-fix: writer adopts the
+        pushHop(0.7f);                          // surrendered slot and writes it
+
+        int changed = 0;
+        for (int k = 0; k < nb; ++k)
+            if (held[k] != snap[static_cast<size_t>(k)]) ++changed;
+        EXPECT_EQ(changed, 0); // pre-fix: 129/129
+    }
+
+    // Part 2: live paired-getter usage under a concurrent writer.
+    {
+        auto sa = std::make_unique<SpectrumAnalyzer<float>>();
+        sa->prepare(48000.0, 1024);
+        sa->setSmoothing(0.0f);
+        sa->setPeakHoldEnabled(true);
+        sa->setFloorDb(-200.0f);
+        const int nb = sa->getNumBins();
+
+        std::atomic<bool> stop{ false };
+        std::atomic<int> frames{ 0 };
+
+        std::thread audio([&] {
+            std::vector<float> block(512);
+            const float w1 = twoPi<float> * 1500.0f / 48000.0f;
+            long long n = 0;
+            int hop = 0;
+            while (!stop.load(std::memory_order_relaxed))
+            {
+                const float amp = (hop & 1) ? 0.01f : 0.9f; // hop-rate toggle
+                for (int i = 0; i < 512; ++i, ++n)
+                    block[static_cast<size_t>(i)] =
+                        amp * std::sin(w1 * static_cast<float>(n));
+                sa->pushSamples(block.data(), 512);
+                ++hop;
+                frames.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        long long mutationsBehindHeldPtr = 0;
+        int violations = 0;
+        int fresh = 0;
+        long long reads = 0;
+        const long long kMaxReads = 50000000; // hard cap: never hang
+        std::vector<float> snap(static_cast<size_t>(nb));
+
+        while ((frames.load(std::memory_order_relaxed) < 64 || reads < 100000)
+               && reads < kMaxReads)
+        {
+            ++reads;
+            if (sa->isNewDataReady()) ++fresh;
+            const float* m = sa->getMagnitudesDb();          // held pointer
+            for (int k = 0; k < nb; ++k)
+                snap[static_cast<size_t>(k)] = m[k];
+            const float* p = sa->getPeakHoldDb();            // 2nd acquisition
+            if (!std::isfinite(p[32]) || p[32] < -200.0f || p[32] > 20.0f)
+                ++violations;                                // peaks stay sane
+            // Documented straddle: keep reading through the FIRST pointer
+            // after the second acquisition. Pre-fix, the writer mutates the
+            // array behind it; post-fix it is reader-private snapshot
+            // storage and must never change under our feet.
+            for (int r = 0; r < 4; ++r)
+                for (int k = 0; k < nb; ++k)
+                    if (m[k] != snap[static_cast<size_t>(k)])
+                        ++mutationsBehindHeldPtr;
+        }
+
+        stop.store(true, std::memory_order_relaxed);
+        audio.join();
+
+        EXPECT_EQ(mutationsBehindHeldPtr, 0LL);
+        EXPECT_EQ(violations, 0);
+        EXPECT_GT(frames.load(std::memory_order_relaxed), 63); // writer liveness
+        EXPECT_GT(fresh, 16);                                  // adoption liveness
+    }
+}

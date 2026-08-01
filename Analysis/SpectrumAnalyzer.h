@@ -22,8 +22,15 @@
  * - pushSamples(): audio thread (stream owner). No-op before prepare().
  * - getMagnitudesDb() / getPeakHoldDb() / isNewDataReady(): ONE reader
  *   thread (GUI). Wait-free triple-buffer hand-off; never blocks the writer.
- *   The two arrays are acquired independently, so a pair of consecutive
- *   calls may straddle a frame boundary (benign for metering).
+ *   Pointer-validity contract: each getter adopts the freshest published
+ *   frame and copies it into reader-private snapshot storage; the returned
+ *   pointer refers to that snapshot, NEVER into the hand-off slots. Its
+ *   contents are overwritten only by the reader's own next call to the SAME
+ *   getter, and the pointer itself is invalidated only by prepare(). No
+ *   other thread ever writes through a returned pointer, so the reader may
+ *   hold it across frames (the values simply go stale). A consecutive
+ *   getMagnitudesDb()/getPeakHoldDb() pair may represent adjacent analysis
+ *   frames; each snapshot is internally frame-coherent.
  * - setSmoothing() / setPeakDecay() / setPeakHoldEnabled() / setFloorDb():
  *   control thread (ONE non-audio writer, per the framework's SPSC thread
  *   model; single-word relaxed atomics, picked up once per analysis frame).
@@ -139,12 +146,21 @@ public:
         magnitudesState_.assign(static_cast<size_t>(numBins_), T(0));
         peakState_.assign(static_cast<size_t>(numBins_), floorDb);
 
-        // Triple buffer for tear-free cross-thread reading
+        // Triple buffer for tear-free cross-thread reading (relaxed-atomic
+        // words; ordering comes from the pendingSlot_ RMWs, see below).
         for (auto& slot : outSlots_)
         {
-            slot.magnitudesDb.assign(static_cast<size_t>(numBins_), floorDb);
-            slot.peakDb.assign(static_cast<size_t>(numBins_), floorDb);
+            slot.magnitudesDb = std::make_unique<std::atomic<T>[]>(static_cast<size_t>(numBins_));
+            slot.peakDb = std::make_unique<std::atomic<T>[]>(static_cast<size_t>(numBins_));
+            for (int k = 0; k < numBins_; ++k)
+            {
+                slot.magnitudesDb[static_cast<size_t>(k)].store(floorDb, std::memory_order_relaxed);
+                slot.peakDb[static_cast<size_t>(k)].store(floorDb, std::memory_order_relaxed);
+            }
         }
+        // Reader-private snapshot storage backing the getter return pointers.
+        magSnapshot_.assign(static_cast<size_t>(numBins_), floorDb);
+        peakSnapshot_.assign(static_cast<size_t>(numBins_), floorDb);
         writeSlot_ = 0;
         readSlot_  = 1;
         pendingSlot_.store(2, std::memory_order_relaxed);
@@ -167,9 +183,15 @@ public:
 
         for (auto& slot : outSlots_)
         {
-            std::fill(slot.magnitudesDb.begin(), slot.magnitudesDb.end(), floorDb);
-            std::fill(slot.peakDb.begin(), slot.peakDb.end(), floorDb);
+            // numBins_ is 0 before prepare(), so the arrays exist here.
+            for (int k = 0; k < numBins_; ++k)
+            {
+                slot.magnitudesDb[static_cast<size_t>(k)].store(floorDb, std::memory_order_relaxed);
+                slot.peakDb[static_cast<size_t>(k)].store(floorDb, std::memory_order_relaxed);
+            }
         }
+        std::fill(magSnapshot_.begin(), magSnapshot_.end(), floorDb);
+        std::fill(peakSnapshot_.begin(), peakSnapshot_.end(), floorDb);
 
         ringWritePos_ = 0;
         samplesUntilFFT_ = hopSize_;
@@ -260,22 +282,42 @@ public:
 
     /**
      * @brief Returns the current magnitude spectrum in decibels.
+     *
+     * Adopts the freshest published frame (if any) and copies it into
+     * reader-private snapshot storage. The returned pointer refers to that
+     * snapshot: it is overwritten only by the reader's own next call to
+     * THIS getter and invalidated only by prepare(); no other thread ever
+     * writes through it (see the Threading pointer-validity contract).
+     *
      * @return Pointer to an array of size getNumBins() (0 before prepare()).
      */
     [[nodiscard]] const T* getMagnitudesDb() const noexcept
     {
         acquireLatestSlot();
-        return outSlots_[static_cast<size_t>(readSlot_)].magnitudesDb.data();
+        const OutSlot& slot = outSlots_[static_cast<size_t>(readSlot_)];
+        for (int k = 0; k < numBins_; ++k)
+            magSnapshot_[static_cast<size_t>(k)] =
+                slot.magnitudesDb[static_cast<size_t>(k)].load(std::memory_order_relaxed);
+        return magSnapshot_.data();
     }
 
     /**
      * @brief Returns the peak-hold spectrum in decibels.
+     *
+     * Same snapshot semantics as getMagnitudesDb(): the returned pointer
+     * refers to reader-private storage overwritten only by the reader's own
+     * next call to THIS getter and invalidated only by prepare().
+     *
      * @return Pointer to an array of size getNumBins() (0 before prepare()).
      */
     [[nodiscard]] const T* getPeakHoldDb() const noexcept
     {
         acquireLatestSlot();
-        return outSlots_[static_cast<size_t>(readSlot_)].peakDb.data();
+        const OutSlot& slot = outSlots_[static_cast<size_t>(readSlot_)];
+        for (int k = 0; k < numBins_; ++k)
+            peakSnapshot_[static_cast<size_t>(k)] =
+                slot.peakDb[static_cast<size_t>(k)].load(std::memory_order_relaxed);
+        return peakSnapshot_.data();
     }
 
     /** @brief Consumes and returns the new data flag. True if updated since last call. */
@@ -358,11 +400,12 @@ private:
         // 5. Write into the writer-owned slot of the triple buffer
         auto& slot = outSlots_[static_cast<size_t>(writeSlot_)];
 
-        // 6. DB Conversion and Peak Hold
+        // 6. DB Conversion and Peak Hold (relaxed atomic stores: the slot is
+        // writer-owned here, ordering is carried by the publication exchange)
         for (int k = 0; k < numBins_; ++k)
         {
             T dB = gainToDecibels(magnitudesState_[static_cast<size_t>(k)], floorDb);
-            slot.magnitudesDb[static_cast<size_t>(k)] = dB;
+            slot.magnitudesDb[static_cast<size_t>(k)].store(dB, std::memory_order_relaxed);
 
             if (peakHold)
             {
@@ -372,7 +415,7 @@ private:
                 // decay step below the signal every other frame.)
                 T& peak = peakState_[static_cast<size_t>(k)];
                 peak = std::max(dB, std::max(floorDb, peak - peakDecayDb));
-                slot.peakDb[static_cast<size_t>(k)] = peak;
+                slot.peakDb[static_cast<size_t>(k)].store(peak, std::memory_order_relaxed);
             }
         }
 
@@ -410,10 +453,14 @@ private:
     // readSlot_, and pendingSlot_ (atomic, with a freshness bit) carries the
     // hand-off. Classic wait-free GUI metering scheme.
     //
-    // Cross-thread publication derivation (ADR-013 section 6(b)): the slot
-    // arrays are PLAIN words, but a slot is only ever dereferenced by the
-    // thread that currently OWNS it, and ownership moves exclusively through
-    // atomic read-modify-writes on pendingSlot_:
+    // Cross-thread publication derivation (ADR-013 section 6(b)). Two
+    // obligations, BOTH required (M-008B lesson: an ownership argument at
+    // acquisition time is NOT sufficient -- every returned pointer needs a
+    // LIFETIME argument too):
+    //
+    // 1) OWNERSHIP at access time. A slot's words are accessed only by the
+    //    thread that currently owns the slot, and ownership moves
+    //    exclusively through atomic read-modify-writes on pendingSlot_:
     //  - writer: exchange(writeSlot_ | fresh, acq_rel) -- the release half
     //    publishes every write to the finished slot; the acquire half
     //    synchronizes with the reader's release when adopting the slot the
@@ -427,29 +474,60 @@ private:
     // {0, 1, 2}: it holds at prepare() (0/1/2) and every RMW swaps one
     // party's slot with the pending one atomically, so by induction over the
     // serialized modification order of pendingSlot_ no slot is ever owned by
-    // both threads, i.e. no plain word is concurrently accessed (the same
-    // ownership-transfer discipline as Core/SpscQueue.h; per-word atomics
-    // are NOT required for this pattern, unlike the seqlock staging case).
-    // ABA is harmless: a successful CAS is an RMW and therefore reads the
-    // LATEST value in pendingSlot_'s modification order -- if the same slot
-    // index returns, it does so via a writer release-exchange that already
-    // published that slot's newest contents.
-    // Note DRD/Helgrind model pthread happens-before only and cannot see
-    // these RMW edges: they report the slot words as racing even though the
-    // C++ model orders them. The C++11-aware oracle for this structure is
-    // ThreadSanitizer (CI) via the pinned concurrent test.
+    // both threads (the same ownership-transfer discipline as
+    // Core/SpscQueue.h). ABA is harmless: a successful CAS is an RMW and
+    // therefore reads the LATEST value in pendingSlot_'s modification order
+    // -- if the same slot index returns, it does so via a writer
+    // release-exchange that already published that slot's newest contents.
+    //
+    // 2) LIFETIME of returned pointers. Ownership alone does not cover the
+    //    pointers the getters return: a pointer into a slot would outlive
+    //    the reader's ownership as soon as the NEXT acquisition (by either
+    //    getter) handed that slot back to the writer -- the M-008B
+    //    returned-pointer race (D-M008B-C1). Therefore NO pointer into a
+    //    slot ever escapes this class: each getter copies the acquired
+    //    slot into reader-private snapshot storage (magSnapshot_ /
+    //    peakSnapshot_, touched only by the reader) WHILE it owns the slot,
+    //    and returns a pointer to the snapshot. The audio thread cannot
+    //    reach the snapshots, so a held pointer can never be written by
+    //    another thread, regardless of how long the caller keeps it.
+    //
+    // Defence in depth + oracle legibility: the slot words are relaxed
+    // std::atomic<T>. Under (1)+(2) they are never accessed concurrently,
+    // so plain words would be formally correct -- but atomics make any
+    // future lifetime regression read defined (stale) values instead of UB,
+    // and they make the DRD/Helgrind green criterion mechanical: those
+    // oracles model pthread happens-before only and cannot see the RMW
+    // edges, so with plain words they reported the slot arrays as racing
+    // and the verdict rested on a human classification argument (which
+    // M-008B iteration 1 got wrong). With atomic words every residual
+    // oracle frame machine-classifies as a std::atomic op (ADR-013 6(a));
+    // relaxed load/store compiles to plain moves on x86 and ARM. The
+    // C++11-aware oracle for the protocol itself remains ThreadSanitizer
+    // (CI) via the pinned concurrent tests (single-getter tear pin and
+    // paired-getter lifetime pin).
     static constexpr int kFreshBit = 4;
     static constexpr int kSlotMask = 3;
 
+    static_assert(std::atomic<T>::is_always_lock_free,
+                  "SpectrumAnalyzer requires lock-free atomic<T> slot words "
+                  "(audio-thread stores must not lock)");
+
     struct OutSlot
     {
-        std::vector<T> magnitudesDb;
-        std::vector<T> peakDb;
+        std::unique_ptr<std::atomic<T>[]> magnitudesDb;
+        std::unique_ptr<std::atomic<T>[]> peakDb;
     };
     std::array<OutSlot, 3> outSlots_;
     int writeSlot_ = 0;                       // writer-thread private
     mutable int readSlot_ = 1;                // reader-thread private
     mutable std::atomic<int> pendingSlot_{ 2 };
+
+    // Reader-private snapshot storage backing the getter return pointers
+    // (see the lifetime derivation above). Only the reader thread touches
+    // these; contents change only on the reader's own getter calls.
+    mutable std::vector<T> magSnapshot_;
+    mutable std::vector<T> peakSnapshot_;
 
     /** @brief Reader side: adopt the freshest published slot, if any. */
     void acquireLatestSlot() const noexcept

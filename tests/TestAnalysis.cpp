@@ -13,8 +13,11 @@
 #include "../Analysis/PhaseCorrelation.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <thread>
 #include <vector>
 
 using namespace dspark;
@@ -1149,4 +1152,80 @@ DSPARK_TEST(PhaseCorrelation_reset_clears_ring_and_mono_is_dual_mono)
     }
     EXPECT_GT(maxMid, 0.1f);
     EXPECT_LT(maxSide, 1e-6f);
+}
+
+// ============================================================================
+// M-008B: cross-thread publication pins (ADR-013 section 6(c))
+// ============================================================================
+
+// Pin for the SpectrumAnalyzer triple-buffer handoff (audio writer vs GUI
+// reader), the largest un-oracled lock-free structure in the library before
+// M-008B. The writer publishes spectra whose two probe bins ALWAYS carry
+// equal-amplitude tones (1500 Hz -> bin 32 and 18750 Hz -> bin 400 at
+// fs 48 kHz, fftSize 1024), toggling the common amplitude by 24 dB every 8
+// hops with smoothing off. Every coherent frame therefore has
+// |dB[32] - dB[400]| of only a few dB (equal on-bin tones; the amplitude
+// STEP's spectral splatter at 368 bins distance is >30 dB under either
+// tone). A reader that ever observes a slot the writer is concurrently
+// writing mixes a high-level bin 32 with a low-level bin 400 (or vice
+// versa) and trips the 12 dB delta bound.
+// Reachability argument (AC-008B-6): breaking the ownership handoff -- a
+// mutated computeSpectrum() that publishes the finished slot but KEEPS
+// writing into it (no slot adoption) -- makes this exact assertion fail with
+// tens of thousands of violations per run (mutation proof logged in
+// tests/results/M-008B/mutation-pin-proof.log). Liveness
+// is guaranteed by construction: the reader keeps polling until the writer
+// has published at least 64 frames (hard-capped so a starved writer fails
+// loudly instead of hanging), and the fresh-adoption floor proves the
+// handoff actually cycled.
+DSPARK_TEST(SpectrumAnalyzer_triple_buffer_concurrent_readout_is_tear_free)
+{
+    auto sa = std::make_unique<SpectrumAnalyzer<float>>();
+    sa->prepare(48000.0, 1024);
+    sa->setSmoothing(0.0f);
+    sa->setPeakHoldEnabled(false);
+    sa->setFloorDb(-200.0f);
+
+    std::atomic<bool> stop{ false };
+    std::atomic<int> frames{ 0 };
+
+    std::thread audio([&] {
+        std::vector<float> block(512);
+        const float w1 = twoPi<float> * 1500.0f / 48000.0f;
+        const float w2 = twoPi<float> * 18750.0f / 48000.0f;
+        long long n = 0;
+        int hop = 0;
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            const float amp = ((hop / 8) & 1) ? 0.025f : 0.4f; // 24 dB toggle
+            for (int i = 0; i < 512; ++i, ++n)
+                block[static_cast<size_t>(i)] =
+                    amp * (std::sin(w1 * static_cast<float>(n))
+                         + std::sin(w2 * static_cast<float>(n)));
+            sa->pushSamples(block.data(), 512);
+            ++hop;
+            frames.fetch_add(1, std::memory_order_relaxed); // 1 hop = 1 frame
+        }
+    });
+
+    int violations = 0;
+    int fresh = 0;
+    long long reads = 0;
+    const long long kMaxReads = 50000000; // hard cap: never hang, fail loudly
+    while ((frames.load(std::memory_order_relaxed) < 64 || reads < 300000)
+           && reads < kMaxReads)
+    {
+        ++reads;
+        if (sa->isNewDataReady()) ++fresh;
+        const float* m = sa->getMagnitudesDb();
+        const float d = m[32] - m[400];
+        if (std::abs(d) > 12.0f) ++violations;
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    audio.join();
+
+    EXPECT_EQ(violations, 0);
+    EXPECT_GT(frames.load(std::memory_order_relaxed), 63); // writer liveness
+    EXPECT_GT(fresh, 16);                                  // adoption liveness
 }

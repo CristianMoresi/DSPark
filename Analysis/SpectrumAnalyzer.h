@@ -25,7 +25,8 @@
  *   The two arrays are acquired independently, so a pair of consecutive
  *   calls may straddle a frame boundary (benign for metering).
  * - setSmoothing() / setPeakDecay() / setPeakHoldEnabled() / setFloorDb():
- *   any thread (relaxed atomics, picked up once per analysis frame).
+ *   control thread (ONE non-audio writer, per the framework's SPSC thread
+ *   model; single-word relaxed atomics, picked up once per analysis frame).
  *   Non-finite values are ignored.
  *
  * Dependencies: DspMath.h, FFT.h, WindowFunctions.h.
@@ -408,6 +409,35 @@ private:
     // Tear-free triple buffer: writer owns writeSlot_, the reader owns
     // readSlot_, and pendingSlot_ (atomic, with a freshness bit) carries the
     // hand-off. Classic wait-free GUI metering scheme.
+    //
+    // Cross-thread publication derivation (ADR-013 section 6(b)): the slot
+    // arrays are PLAIN words, but a slot is only ever dereferenced by the
+    // thread that currently OWNS it, and ownership moves exclusively through
+    // atomic read-modify-writes on pendingSlot_:
+    //  - writer: exchange(writeSlot_ | fresh, acq_rel) -- the release half
+    //    publishes every write to the finished slot; the acquire half
+    //    synchronizes with the reader's release when adopting the slot the
+    //    reader gave up.
+    //  - reader: compare_exchange(expected, readSlot_, acq_rel, acquire) --
+    //    on success its acquire half reads from the writer's release
+    //    exchange ([atomics.order]/2), so all writes to the adopted slot
+    //    happen-before the reader's reads; its release half publishes that
+    //    the reader is done with the slot it returns.
+    // {writeSlot_, readSlot_, pendingSlot_ & kSlotMask} is a permutation of
+    // {0, 1, 2}: it holds at prepare() (0/1/2) and every RMW swaps one
+    // party's slot with the pending one atomically, so by induction over the
+    // serialized modification order of pendingSlot_ no slot is ever owned by
+    // both threads, i.e. no plain word is concurrently accessed (the same
+    // ownership-transfer discipline as Core/SpscQueue.h; per-word atomics
+    // are NOT required for this pattern, unlike the seqlock staging case).
+    // ABA is harmless: a successful CAS is an RMW and therefore reads the
+    // LATEST value in pendingSlot_'s modification order -- if the same slot
+    // index returns, it does so via a writer release-exchange that already
+    // published that slot's newest contents.
+    // Note DRD/Helgrind model pthread happens-before only and cannot see
+    // these RMW edges: they report the slot words as racing even though the
+    // C++ model orders them. The C++11-aware oracle for this structure is
+    // ThreadSanitizer (CI) via the pinned concurrent test.
     static constexpr int kFreshBit = 4;
     static constexpr int kSlotMask = 3;
 

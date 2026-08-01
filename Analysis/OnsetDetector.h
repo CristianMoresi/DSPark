@@ -51,9 +51,13 @@
  * - processBlock() / pushSamples() / reset(): audio thread (stream owner);
  *   reset() is not concurrent with pushSamples().
  * - onsetDetected() / getOnsetStrength() / getLastOnsetSample() /
- *   getLatencySamples(): any thread, lock-free (published as atomics).
- * - setMethod() / setThreshold() / setAdaptiveWhitening(): any thread (atomic;
- *   non-finite thresholds are ignored).
+ *   getLatencySamples(): any thread, lock-free (published as atomics; the
+ *   words are independent, so a reader overlapping a release may pair a
+ *   fresh reference sample with the previous strength -- benign for
+ *   triggering/metering).
+ * - setMethod() / setThreshold() / setAdaptiveWhitening(): control thread
+ *   (independent single-word relaxed atomics; non-finite thresholds are
+ *   ignored).
  * - detectOffline(): offline convenience (allocates); not an audio-thread call.
  *
  * Embedded/wasm: compiles under -fno-exceptions -fno-rtti (no throw on any

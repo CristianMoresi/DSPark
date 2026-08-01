@@ -1037,3 +1037,25 @@ DSPARK_TEST(AudioBuffer_move_leaves_source_reusable)
     c = std::move(b);       // move assignment releases c's own storage
     EXPECT_NEAR(c.toView().getPeakLevel(), 0.5f, 0.0f);
 }
+
+// ============================================================================
+// M-008B: ADR-013 section 2 lock-free guarantee for every atomic word type
+// used on an audio-visible path in the swept Core/ + Analysis/ headers.
+// A platform where any of these takes a lock would silently violate the
+// allocation/lock-free audio-thread contract; fail loudly here instead.
+// (float/double were already pinned by FIR_double_instantiation_lockfree_
+// and_reprepare; this adds the integer/bool/enum-underlying words:
+// seq counters, dirty flags, indices, packed 64-bit readouts.)
+DSPARK_TEST(M008B_swept_atomic_word_types_are_lock_free)
+{
+    EXPECT_TRUE(std::atomic<bool>::is_always_lock_free);
+    EXPECT_TRUE(std::atomic<int>::is_always_lock_free);
+    EXPECT_TRUE(std::atomic<unsigned>::is_always_lock_free);
+    EXPECT_TRUE(std::atomic<std::size_t>::is_always_lock_free);
+    EXPECT_TRUE(std::atomic<std::uint32_t>::is_always_lock_free);
+    EXPECT_TRUE(std::atomic<std::int64_t>::is_always_lock_free);
+    EXPECT_TRUE(std::atomic<std::uint64_t>::is_always_lock_free);
+    EXPECT_TRUE(std::atomic<float>::is_always_lock_free);
+    EXPECT_TRUE(std::atomic<double>::is_always_lock_free);
+    // std::atomic_flag (SpinLock) is lock-free by definition ([atomics.flag]).
+}

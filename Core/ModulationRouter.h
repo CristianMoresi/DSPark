@@ -44,11 +44,15 @@ namespace dspark {
  * @class ModulationRouter
  * @brief Fixed-capacity source-to-target router with per-route depth/smoothing.
  *
- * Threading: addRoute()/clear() belong to setup threads and must not run
- * concurrently with update() (same contract as prepare() elsewhere in the
- * framework). setDepth() is safe from any thread (atomic). update() runs on
- * the audio thread and is noexcept: the stored callables MUST NOT throw --
- * DSPark setters never do.
+ * Threading (ADR-013 SPSC model): addRoute()/clear() belong to the setup
+ * thread and must not run concurrently with update() or setDepth() (same
+ * contract as prepare() elsewhere in the framework; numRoutes_ is a plain
+ * word published by that setup ordering). setDepth() belongs to the control
+ * thread (ONE non-audio writer; single-word relaxed atomic adopted at the
+ * next update()). update() runs on the audio thread and is noexcept: the
+ * stored callables MUST NOT throw -- DSPark setters never do.
+ * getNumRoutes() reflects setup-time state; read it from the setup/control
+ * side or once configuration is complete.
  *
  * @tparam T         Value type (float or double).
  * @tparam MaxRoutes Route capacity (compile-time, no audio-thread allocation).
@@ -87,7 +91,8 @@ public:
         return numRoutes_++;
     }
 
-    /** @brief Changes a route's depth. Thread-safe (atomic, relaxed). */
+    /** @brief Changes a route's depth. Control thread (relaxed atomic word,
+     *  adopted by the next update()). */
     void setDepth(int route, T depth) noexcept
     {
         if (route >= 0 && route < numRoutes_)

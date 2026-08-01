@@ -16,9 +16,14 @@
  * ensure the dry signal is delayed (Latency Compensation) before calling pushDry()
  * to prevent phase cancellation (comb filtering).
  *
- * Threading: pushDry() / mixWet() belong to the processing thread.
- * setMixRule() is atomic and callable from any thread. prepare() and
- * setLatencyCompensation() allocate and belong to the setup thread.
+ * Threading (ADR-013 SPSC model): pushDry() / mixWet() / reset() belong to
+ * the processing thread (single stream owner), and so do the dry-snapshot
+ * readouts getDryChannel() / getDryCapturedSamples(), which expose plain
+ * processing-thread state. setMixRule() belongs to the control thread (ONE
+ * non-audio writer; single-word relaxed atomic read once per mixWet()).
+ * getMixRule-style readback is not provided; prepare() and
+ * setLatencyCompensation() (and getLatencyCompensation()) allocate/touch
+ * setup state and belong to the setup thread. Moves are setup-time only.
  *
  * Dependencies: AudioBuffer.h, AudioSpec.h, C++20 standard library
  * (<algorithm>, <atomic>, <cmath>).
@@ -145,8 +150,8 @@ public:
     /**
      * @brief Sets the mathematical curve to use during the mix phase.
      *
-     * Atomic: callable from any thread. mixWet() reads the rule once per
-     * block, so a change lands at the next block boundary.
+     * Control thread (single-word relaxed atomic). mixWet() reads the rule
+     * once per block, so a change lands at the next block boundary.
      *
      * @param rule The chosen MixRule (Linear or EqualPower).
      */

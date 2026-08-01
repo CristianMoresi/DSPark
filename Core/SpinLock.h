@@ -14,6 +14,13 @@
  *
  * Dependencies: C++20 standard library only (<atomic>).
  *
+ * Threading (ADR-013): lock()/try_lock()/unlock() are safe from any thread
+ * (mutual exclusion is the primitive's purpose); the acquire/release pair on
+ * the flag publishes the protected data between successive owners. Real-time
+ * constraint (RNF-003): the audio thread must never call the blocking
+ * lock() -- only tryLock()/ScopedTryLock -- so it can never be made to wait
+ * on a control thread. SpinLock is for non-audio-path mutual exclusion.
+ *
  * @warning Do NOT use for long critical sections or high-contention scenarios.
  *          In those cases, prefer std::mutex or a lock-free data structure.
  *

@@ -17,7 +17,8 @@
  *
  * Threading:
  * - prepare() / reset(): setup thread (not concurrent with process()).
- * - setAttackMs() / setReleaseMs() / setRmsWindowMs(): any thread.
+ * - setAttackMs() / setReleaseMs() / setRmsWindowMs(): control thread (ONE
+ *   non-audio writer -- each setter re-derives the shared coefficient words).
  *   Parameters and coefficients are published atomically; process() picks
  *   them up at the next block. A block may observe one changed coefficient
  *   before another (benign for metering). Non-finite values are ignored.

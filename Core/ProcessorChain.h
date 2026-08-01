@@ -36,6 +36,15 @@ namespace dspark {
  * Processors are stored in a `std::tuple` and invoked in order.
  * Access individual processors via `get<Index>()` to configure parameters.
  *
+ * Threading (ADR-013 SPSC model): prepare()/reset() are setup-time (never
+ * concurrent with processing); processBlock() belongs to the audio thread;
+ * setBypassed<I>() belongs to the control thread (one independent relaxed
+ * atomic word per slot, adopted at the next processBlock()); isBypassed<I>()
+ * and getLatency() are lock-free readouts callable from any thread (each
+ * slot's getLatency() must itself be a lock-free readout, as the framework
+ * processors' are). get<I>() returns a reference whose thread contract is
+ * the slot processor's own.
+ *
  * @tparam T          Sample type (float or double).
  * @tparam Processors Processor types. Must be greater than 0.
  */
@@ -133,7 +142,8 @@ public:
     // -- Bypass control ------------------------------------------------------
 
     /**
-     * @brief Thread-safe toggle to bypass or enable a processor.
+     * @brief Toggles bypass for a processor (control thread; the relaxed
+     *        atomic word is adopted by the next processBlock()).
      *
      * @warning This is a hard bypass. Toggling this during live playback will cause
      * audio clicks/pops and phase discontinuities if the processor introduces latency.
@@ -151,7 +161,7 @@ public:
     }
 
     /**
-     * @brief Thread-safe read of the bypass state of a processor.
+     * @brief Reads the bypass state (lock-free readout, any thread).
      */
     template <std::size_t Index>
     [[nodiscard]] bool isBypassed() const noexcept

@@ -548,6 +548,17 @@ private:
  * untouched. Per-channel states are stored compactly so adjacent channels
  * share cache lines during block processing.
  *
+ * Threading (ADR-013 SPSC model):
+ * - setCoeffs(): control thread (ONE non-audio writer; canonical seqlock
+ *   publish).
+ * - processSample() / processSampleCore() / processBlock() /
+ *   applyPendingCoeffs(): audio thread (single stream owner).
+ * - reset(): stream owner only (writes the plain per-channel states).
+ * - getCoeffs(): processing thread or offline only (returns a reference to
+ *   the audio-thread-private active set -- see its own note).
+ * - Move construction/assignment: setup-time only (single-threaded
+ *   relocation).
+ *
  * The filter core (coefficients, history and recursion) is always double
  * precision, independent of the sample type: see the @file header for the
  * measurements behind that decision. The realised response is therefore

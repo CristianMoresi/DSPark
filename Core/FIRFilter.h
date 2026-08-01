@@ -302,9 +302,24 @@ private:
  * C++ memory model, not merely tear-free in practice. std::atomic<float/double>
  * is lock-free and single-word on every supported target, so the publish stays
  * allocation- and lock-free. The audio thread copies the published set once per
- * update into its PRIVATE, non-atomic activeCoeffs_ buffer; the per-sample hot
- * path (simd::dotProduct over activeCoeffs_) therefore runs on plain scalars
- * and is byte-for-byte the same code as before - no hot-path cost.
+ * update into its PRIVATE, non-atomic activeCoeffs_ buffer, so the per-sample
+ * hot path (simd::dotProduct over activeCoeffs_) runs on plain scalars. Cost,
+ * measured against the pre-atomic code: the PER-SAMPLE LOOPS of
+ * processBlock<float/double> are instruction-identical (objdump: 207 == 207
+ * and 200 == 200 insns; only the once-per-update pull copy changed), while
+ * whole-function processSample codegen differs by +3 prologue instructions
+ * from the reshaped cold pull path and measured FASTER (7.06 -> 6.88
+ * ns/sample, g++ -O2); block-level bench deltas are within run-to-run noise
+ * (5.78/5.89/5.95 vs 5.87/5.98/5.79 ns/frame medians, 63-tap mono LP).
+ *
+ * Threading (ADR-013 SPSC model):
+ * - prepare(): setup thread only (allocates; never concurrent with any
+ *   other call).
+ * - setCoefficients(): control thread (ONE non-audio writer; canonical
+ *   seqlock publish).
+ * - processBlock() / processSample(): audio thread (single stream owner).
+ * - reset(): stream owner only (writes the plain delay lines).
+ * - getLatency(): any thread (single-word relaxed atomic readout).
  *
  * @note Buffers use the default heap alignment; the SIMD kernels use
  *       unaligned loads, which cost the same as aligned on modern CPUs.

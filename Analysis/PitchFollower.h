@@ -30,8 +30,10 @@
  * Threading:
  * - prepare(): setup thread (allocates; not concurrent with processing).
  * - processBlock() / pushSamples() / reset(): audio thread (stream owner).
- * - setRange() / setConfidence() / setGlide(): any thread (relaxed atomics;
- *   non-finite values are ignored).
+ * - setRange() / setConfidence() / setGlide(): control thread (ONE
+ *   non-audio writer; independent single-word relaxed atomics -- a torn
+ *   min/max pair from concurrent setRange() calls is prevented by the
+ *   single-writer contract; non-finite values are ignored).
  * - getSmoothedHz() / getRawHz() / getConfidence() / isTracking() and the
  *   parameter getters: any thread, lock-free.
  *

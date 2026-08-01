@@ -24,8 +24,9 @@
  *   processing).
  * - processBlock() / processSample() / reset(): audio thread (stream
  *   owner).
- * - setAttack() / setRelease() / setMode(): any thread (relaxed atomics;
- *   non-finite values are ignored).
+ * - setAttack() / setRelease() / setMode(): control thread (ONE non-audio
+ *   writer -- the time setters re-derive the shared coefficient words;
+ *   relaxed atomics, non-finite values are ignored).
  * - getEnvelope() / getEnvelopeMax() / getEnvelopeDb() and the parameter
  *   getters: any thread, lock-free.
  *

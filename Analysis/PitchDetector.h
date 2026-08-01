@@ -20,7 +20,8 @@
  *   any thread, lock-free. Frequency and confidence are published as two
  *   independent atomics, so a reader may pair a fresh frequency with the
  *   previous confidence for one detection (benign for tracking/metering).
- * - setThreshold(): any thread (atomic; non-finite values are ignored).
+ * - setThreshold(): control thread (single-word relaxed atomic; non-finite
+ *   values are ignored).
  *
  * Dependencies: DspMath.h, FFT.h.
  */

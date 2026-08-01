@@ -14,6 +14,15 @@
  *
  * Dependencies: C++20 standard library only (<array>, <atomic>, <cstddef>).
  *
+ * Threading (ADR-013): exactly ONE producer thread calls push() and exactly
+ * ONE consumer thread calls pop(). sizeApprox()/empty() are approximate
+ * diagnostics, callable from either of those two threads. Construction and
+ * destruction are setup-time (never concurrent with push/pop). The element
+ * buffer is plain storage by design: ownership of each slot transfers
+ * through the acquire/release index pair (writePos_/readPos_), so under the
+ * SPSC contract no slot is ever accessed concurrently -- multi-producer or
+ * multi-consumer use is out of contract and is a data race.
+ *
  * @tparam T        Element type. Must be trivially copyable for lock-free safety.
  * @tparam Capacity Maximum number of slots. Must be a power of two for efficient
  *                  modular arithmetic. Note: Actual usable capacity is (Capacity - 1)

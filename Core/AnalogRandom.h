@@ -14,8 +14,27 @@
  * - True audio-rate analog drift (continuous 1/f and 1/f^2 filtering).
  * - Sample-and-Hold LFO behavior with 1-pole smoothing.
  * - Zero allocations, cache-friendly block processing.
- * - Lock-free thread safety between GUI and audio threads.
+ * - Lock-free cross-thread parameter and readout contract (see Threading).
  * - DC-free denormal mitigation.
+ *
+ * Threading (single-producer/single-consumer model, ADR-013):
+ * - prepare(): setup thread only (never concurrent with generation or
+ *   readers).
+ * - getNextSample() / getNextBlock() / getNextDiscrete*(): audio thread
+ *   (single stream owner). The PRNG and smoothing state are plain members
+ *   owned by this thread.
+ * - reset(): stream owner (it rewrites the plain working state; the audio
+ *   thread also runs it internally when it adopts a reseed()).
+ * - Setters (setNoiseType, setRateHz, setRateBPM, updateBPM, setRange,
+ *   setSmoothing, setQuantization, setAnalogDefault) and reseed(): control
+ *   thread (one non-audio writer). Single independent std::atomic words,
+ *   relaxed stores after validation; reseed() publishes with release and the
+ *   audio thread adopts with an acquire exchange.
+ * - getCurrentValue() / getPhase(): any thread. They load std::atomic
+ *   readout words the generator publishes once per getNextSample() call and
+ *   once per getNextBlock() block (relaxed single-word loads; no multi-word
+ *   invariant exists between them, so no seqlock is required -- ADR-013
+ *   pattern 3, single independent word).
  *
  * Dependencies: AnalogConstants.h, C++20 standard library (<algorithm>,
  * <array>, <atomic>, <chrono>, <cmath>, <cstdint>, <span>, <type_traits>).
@@ -186,6 +205,8 @@ namespace dspark
                   smoothingCoeff_(other.smoothingCoeff_.load(std::memory_order_relaxed)),
                   quantizationStep_(other.quantizationStep_.load(std::memory_order_relaxed)),
                   pendingSeed_(other.pendingSeed_.load(std::memory_order_relaxed)),
+                  publishedValue_(other.publishedValue_.load(std::memory_order_relaxed)),
+                  publishedPhase_(other.publishedPhase_.load(std::memory_order_relaxed)),
                   brownNoiseState_(other.brownNoiseState_),
                   pinkNoiseOctaves_(other.pinkNoiseOctaves_),
                   denormalFlip_(other.denormalFlip_)
@@ -213,6 +234,8 @@ namespace dspark
                 smoothingCoeff_.store  (other.smoothingCoeff_.load(std::memory_order_relaxed),   std::memory_order_relaxed);
                 quantizationStep_.store(other.quantizationStep_.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 pendingSeed_.store(other.pendingSeed_.load(std::memory_order_relaxed),       std::memory_order_relaxed);
+                publishedValue_.store(other.publishedValue_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                publishedPhase_.store(other.publishedPhase_.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 brownNoiseState_   = other.brownNoiseState_;
                 pinkNoiseOctaves_  = other.pinkNoiseOctaves_;
                 denormalFlip_      = other.denormalFlip_;
@@ -246,6 +269,8 @@ namespace dspark
                 targetValue_ = static_cast<Real>(0);
                 brownNoiseState_ = static_cast<Real>(0);
                 pinkNoiseOctaves_.fill(static_cast<Real>(0));
+                publishedValue_.store(static_cast<Real>(0), std::memory_order_relaxed);
+                publishedPhase_.store(static_cast<Real>(0), std::memory_order_relaxed);
             }
 
             /**
@@ -299,6 +324,14 @@ namespace dspark
                 // Professional DC-free denormal mitigation
                 denormalFlip_ = -denormalFlip_;
                 currentValue_ += denormalFlip_;
+
+                // Publish the readout words for getCurrentValue()/getPhase()
+                // (relaxed atomic stores: a plain MOV on x86/ARM64; the
+                // cross-thread read of the previous plain members was a data
+                // race, the D-M002-C3 defect class).
+                publishedValue_.store(currentValue_, std::memory_order_relaxed);
+                publishedPhase_.store(static_cast<Real>(phaseAccumulator_),
+                                      std::memory_order_relaxed);
 
                 return currentValue_;
             }
@@ -362,10 +395,31 @@ namespace dspark
 
                     sample = currentValue_;
                 }
+
+                // Publish the readout words once per block (block-boundary
+                // granularity is the documented readout resolution here; the
+                // per-sample loop above stays free of atomic stores).
+                publishedValue_.store(currentValue_, std::memory_order_relaxed);
+                publishedPhase_.store(static_cast<Real>(phaseAccumulator_),
+                                      std::memory_order_relaxed);
             }
 
-            [[nodiscard]] Real getCurrentValue() const noexcept { return currentValue_; }
-            [[nodiscard]] Real getPhase() const noexcept { return static_cast<Real>(phaseAccumulator_); }
+            /** @brief Last published output value. Lock-free readout, any
+             *  thread (relaxed atomic; updated once per getNextSample() and
+             *  once per getNextBlock() block). */
+            [[nodiscard]] Real getCurrentValue() const noexcept
+            {
+                return publishedValue_.load(std::memory_order_relaxed);
+            }
+
+            /** @brief Last published LFO phase in [0, 1). Lock-free readout,
+             *  any thread (relaxed atomic; same publication points as
+             *  getCurrentValue()). Independent word: it may be one sample
+             *  newer or older than getCurrentValue() (benign for displays). */
+            [[nodiscard]] Real getPhase() const noexcept
+            {
+                return publishedPhase_.load(std::memory_order_relaxed);
+            }
 
             //----------------------------------------------------------------------
             // Configuration API
@@ -673,6 +727,16 @@ namespace dspark
             std::atomic<Real> smoothingCoeff_{ static_cast<Real>(0) };
             std::atomic<Real> quantizationStep_{ static_cast<Real>(0) };
             std::atomic<std::uint64_t> pendingSeed_{ 0 };
+            // Cross-thread READOUT words (ADR-013 pattern 3, single
+            // independent word each): the generator thread publishes them
+            // with relaxed stores (once per getNextSample() call, once per
+            // block in getNextBlock()); getCurrentValue()/getPhase() load
+            // them relaxed from any thread. The plain working members
+            // (currentValue_, phaseAccumulator_) stay audio-thread-private,
+            // so the hot recursion is untouched. No invariant couples the
+            // two words, so no seqlock is required.
+            std::atomic<Real> publishedValue_{ static_cast<Real>(0) };
+            std::atomic<Real> publishedPhase_{ static_cast<Real>(0) };
             Real brownNoiseState_{ static_cast<Real>(0) };
             std::array<Real, 7> pinkNoiseOctaves_{};
             Real denormalFlip_{ static_cast<Real>(1e-18) }; // DC-Free denormal mitigation state

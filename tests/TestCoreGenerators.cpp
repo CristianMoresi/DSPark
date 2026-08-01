@@ -13,8 +13,14 @@
 #include "../Core/WindowFunctions.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <memory>
+#include <span>
+#include <thread>
 #include <vector>
 
 using namespace dspark;
@@ -1241,4 +1247,79 @@ DSPARK_TEST(Oscillator_setFrequency_NaN_recovers_finite)
     for (int i = 0; i < 512; ++i) { const float s = osc.getNextSample(); if (!std::isfinite(s)) allFinite = false; energy += double(s) * s; }
     EXPECT_TRUE(allFinite);
     EXPECT_GT(energy, 1.0);
+}
+
+// ============================================================================
+// M-008B: cross-thread publication pins (ADR-013 section 6(c))
+// ============================================================================
+
+// Pin for the AnalogRandom readout fix: getCurrentValue()/getPhase() must be
+// lock-free atomic readouts, race-free while the audio thread generates and
+// the control thread reseeds and moves parameters.
+// Reachability argument: before the fix (commit 3cb669e) both readouts
+// returned PLAIN members the generator writes on every sample -- this exact
+// three-thread interleaving is a C++ data race that CI ThreadSanitizer
+// reports at the readout locators (locally proven by the DRD red run:
+// conflicting plain-word frames at AnalogRandom.h getNextSample/updatePhase
+// vs getCurrentValue/getPhase; see tests/results/M-008B in the audit tree).
+// The assertions can genuinely fail: a torn or garbage readout violates the
+// finiteness/range/phase bounds, and the liveness floors prove the threads
+// actually overlapped rather than running back-to-back.
+DSPARK_TEST(AnalogRandom_concurrent_readout_is_published_and_bounded)
+{
+    auto gen = std::make_unique<AnalogRandom::Generator<float>>(777u);
+    gen->prepare(48000.0);
+    gen->setNoiseType(AnalogRandom::NoiseType::Pink);
+    gen->setRateHz(500.0f);
+    gen->setSmoothing(true, 2.0f);
+    gen->setRange(-1.0f, 1.0f);
+
+    std::atomic<bool> stop{ false };
+    std::atomic<long long> generated{ 0 };
+
+    std::thread audio([&] {
+        std::array<float, 64> block{};
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            for (int i = 0; i < 64; ++i) (void)gen->getNextSample();
+            gen->getNextBlock(std::span<float>(block.data(), block.size()));
+            generated.fetch_add(128, std::memory_order_relaxed);
+        }
+    });
+    std::thread control([&] {
+        int i = 0;
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            gen->setRange((i & 1) ? -0.5f : -1.0f, (i & 1) ? 0.5f : 1.0f);
+            gen->setQuantization((i & 2) ? 0.05f : 0.0f);
+            if ((i++ & 63) == 0) gen->reseed(static_cast<std::uint64_t>(i) + 5u);
+        }
+    });
+
+    int violations = 0;
+    int distinct = 0;
+    float lastV = 0.0f;
+    long long reads = 0;
+    const long long kMaxReads = 50000000; // hard cap: never hang, fail loudly
+    while ((generated.load(std::memory_order_relaxed) < 4096 || reads < 200000)
+           && reads < kMaxReads)
+    {
+        ++reads;
+        const float v = gen->getCurrentValue();
+        const float p = gen->getPhase();
+        // Published value stays inside the widest configured range (the
+        // smoother converges within [min, max]; the denormal offset is
+        // 1e-18); the published phase is a wrapped accumulator in [0, 1].
+        if (!std::isfinite(v) || std::abs(v) > 1.001f) ++violations;
+        if (!std::isfinite(p) || p < 0.0f || p > 1.0f) ++violations;
+        if (v != lastV) { ++distinct; lastV = v; }
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    audio.join();
+    control.join();
+
+    EXPECT_EQ(violations, 0);
+    EXPECT_GT(distinct, 100);                                     // publication liveness
+    EXPECT_GT(generated.load(std::memory_order_relaxed), 4095LL); // real overlap
 }

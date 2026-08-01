@@ -24,9 +24,11 @@
 
 #include <array>
 #include <string_view>
+#include <cstddef>          // std::size_t (detail::copy, scalesForChordMask...)
 #include <cstdint>
 #include <algorithm>
 #include <optional>
+#include <type_traits>      // std::underlying_type_t (ChordTag operators)
 #include <utility>          // std::pair (parseNote lookup table)
 #include <initializer_list> // std::initializer_list (makeMask overload)
 
@@ -182,6 +184,16 @@ namespace harmony
 
         /**
          * @brief Extract active scale degrees and expand them sequentially across the octave.
+         *
+         * Always returns exactly 7 degrees, whatever the mask cardinality:
+         * - exactly 7 set bits (heptatonic): the 7 degrees in ascending order;
+         * - fewer than 7 (pentatonic/hexatonic): the list WRAPS -- entry
+         *   i >= count repeats entry i % count one octave (+12) higher, so a
+         *   pentatonic yields its 5 degrees plus 2 octave duplicates;
+         * - more than 7 (octatonic, chromatic): TRUNCATED to the lowest 7;
+         *   upper degrees (e.g. the 8th degree of the Diminished scale) are
+         *   unreachable through diatonicChord();
+         * - empty mask: the degenerate chromatic run 0..6.
          */
         [[nodiscard]] constexpr std::array<int, 7> activeDegrees(NoteSet mask) noexcept
         {
@@ -527,8 +539,22 @@ namespace harmony
      * @brief Generates the diatonic chord built upon a specific degree of a scale.
      * @param sc Scale definition (assumes root=C internally).
      * @param degree The 0-based degree index inside the scale (0..6).
+     *               Out-of-range degrees return an empty DiatonicChord.
      * @param level Which chord extensions to include.
      * @return A DiatonicChord object with the dynamically evaluated intervals and symbol.
+     *
+     * @note HEPTATONIC ASSUMPTION: stacking every second entry of
+     * detail::activeDegrees() produces textbook tertian chords only for
+     * 7-note scales, and the generated symbols are verified for those
+     * (M-008 audit: C-major degrees I..vii triads, maj7/7/m7b5 sevenths).
+     * For the 12 NON-heptatonic scales in allScales the call is still safe
+     * and deterministic (no UB, the name is always NUL-terminated), but the
+     * "thirds" are stacked over the wrapped/truncated degree list (see
+     * activeDegrees), may fall outside every triad family, and then carry
+     * the base symbol "?" -- e.g. MajorPentatonic degree 0 yields intervals
+     * {0, 4, 9} (a 9-semitone "fifth") named "?". Callers iterating
+     * allScales should only trust the symbols of scales whose mask has
+     * exactly 7 set bits.
      */
     [[nodiscard]] constexpr DiatonicChord
     diatonicChord(const Scale& sc, Degree degree, ChordLevel level) noexcept

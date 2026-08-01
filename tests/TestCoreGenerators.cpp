@@ -1262,9 +1262,15 @@ DSPARK_TEST(Oscillator_setFrequency_NaN_recovers_finite)
 // reports at the readout locators (locally proven by the DRD red run:
 // conflicting plain-word frames at AnalogRandom.h getNextSample/updatePhase
 // vs getCurrentValue/getPhase; see tests/results/M-008B in the audit tree).
-// The assertions can genuinely fail: a torn or garbage readout violates the
-// finiteness/range/phase bounds, and the liveness floors prove the threads
-// actually overlapped rather than running back-to-back.
+// The primary failure path is the oracle: CI ThreadSanitizer (and the
+// registered DRD harness, proven red pre-fix) reports the pre-fix plain-word
+// reads in this exact interleaving. The bounds assertions are a secondary
+// net scoped to targets and variants where torn or stale readouts are
+// actually producible (weakly-ordered hardware, broken publication
+// variants); on the x86 hosts running this suite an aligned float load does
+// not tear, so pre-fix they would essentially never fire locally. The
+// liveness floors prove the threads actually overlapped rather than running
+// back-to-back.
 DSPARK_TEST(AnalogRandom_concurrent_readout_is_published_and_bounded)
 {
     auto gen = std::make_unique<AnalogRandom::Generator<float>>(777u);

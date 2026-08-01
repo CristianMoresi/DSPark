@@ -540,7 +540,12 @@ private:
  *
  * Implements a lock-free shadow buffering system (seqlock) to prevent torn
  * reads when coefficients are updated by the UI thread concurrently with the
- * audio thread. Per-channel states are stored compactly so adjacent channels
+ * audio thread. The shared staging slot is made of std::atomic<double> words
+ * (relaxed inside the seq-counter critical section, with a writer release /
+ * reader acquire fence pair), so the handoff is data-race free by the C++
+ * memory model, not merely tear-free in practice; the audio thread promotes
+ * into its private, plain activeCoeffs_, so the per-sample recursion is
+ * untouched. Per-channel states are stored compactly so adjacent channels
  * share cache lines during block processing.
  *
  * The filter core (coefficients, history and recursion) is always double
@@ -566,17 +571,18 @@ public:
     // container), so the seqlock counter is simply reset to an even value.
     Biquad(Biquad&& other) noexcept
         : activeCoeffs_(other.activeCoeffs_),
-          stagedCoeffs_(other.stagedCoeffs_),
           coeffsDirty_(other.coeffsDirty_.load(std::memory_order_relaxed)),
           coeffsSeq_(0),
           state_(other.state_)
-    {}
+    {
+        copyStagedRelaxed(other); // Word-wise: the staging words are atomics.
+    }
 
     Biquad& operator=(Biquad&& other) noexcept
     {
         if (this == &other) return *this;
         activeCoeffs_ = other.activeCoeffs_;
-        stagedCoeffs_ = other.stagedCoeffs_;
+        copyStagedRelaxed(other); // Word-wise: the staging words are atomics.
         coeffsDirty_.store(other.coeffsDirty_.load(std::memory_order_relaxed),
                            std::memory_order_relaxed);
         coeffsSeq_.store(0, std::memory_order_relaxed);
@@ -603,13 +609,22 @@ public:
         // the counter moved, so a concurrent update can never be observed as a
         // torn coefficient set (mixing a1 of one filter with a2 of another).
         //
-        // Standards note: the reader's struct copy races with this write in the
-        // strict C++ memory model (classic seqlock caveat; the Linux kernel and
-        // mainstream audio frameworks rely on the same pattern). The retry loop
-        // discards any value read during a write, and the acquire/release fences
-        // order the accesses on every supported compiler/architecture.
+        // Data-race freedom: the staging slot is 5 std::atomic<double> words
+        // stored relaxed inside the critical section, so every cross-thread
+        // word access is defined by the C++ memory model (the previous plain
+        // struct copy was formal UB -- the same defect class CI TSan flagged in
+        // FIRFilter, D-M002-C3). The release fence below pairs with the
+        // reader's acquire fence ([atomics.fences]/2): a reader that observes
+        // any mid-publish word must also observe the odd counter and retry
+        // (Boehm, "Can Seqlocks Get Along With Programming Language Memory
+        // Models?", MSPC 2012). Control-thread only: zero audio-path cost.
         coeffsSeq_.fetch_add(1, std::memory_order_acq_rel);   // -> odd
-        stagedCoeffs_ = c;
+        std::atomic_thread_fence(std::memory_order_release);
+        stagedCoeffs_.b0.store(c.b0, std::memory_order_relaxed);
+        stagedCoeffs_.b1.store(c.b1, std::memory_order_relaxed);
+        stagedCoeffs_.b2.store(c.b2, std::memory_order_relaxed);
+        stagedCoeffs_.a1.store(c.a1, std::memory_order_relaxed);
+        stagedCoeffs_.a2.store(c.a2, std::memory_order_relaxed);
         coeffsSeq_.fetch_add(1, std::memory_order_release);   // -> even
         coeffsDirty_.store(true, std::memory_order_release);
     }
@@ -639,12 +654,20 @@ public:
             unsigned s0, s1;
             do {
                 s0  = coeffsSeq_.load(std::memory_order_acquire);
-                tmp = stagedCoeffs_;
+                // Relaxed word loads: each access is race-free because the
+                // staging words are std::atomic<double>.
+                tmp.b0 = stagedCoeffs_.b0.load(std::memory_order_relaxed);
+                tmp.b1 = stagedCoeffs_.b1.load(std::memory_order_relaxed);
+                tmp.b2 = stagedCoeffs_.b2.load(std::memory_order_relaxed);
+                tmp.a1 = stagedCoeffs_.a1.load(std::memory_order_relaxed);
+                tmp.a2 = stagedCoeffs_.a2.load(std::memory_order_relaxed);
                 // The fence keeps the copy above from sinking below the
                 // re-read of the counter. A plain acquire load only orders
                 // LATER accesses; without the fence, both the compiler and
                 // weakly-ordered CPUs (ARM) may complete the copy after s1
                 // is read, and a torn copy would pass the s0 == s1 check.
+                // It also pairs with the writer's release fence, so a copy
+                // that read any mid-publish word cannot pass validation.
                 std::atomic_thread_fence(std::memory_order_acquire);
                 s1  = coeffsSeq_.load(std::memory_order_relaxed);
             } while ((s0 & 1u) != 0u || s0 != s1);
@@ -793,8 +816,38 @@ private:
         double z2 = 0.0;
     };
 
+    // Shared staging slot for the seqlock publish: written word-by-word by the
+    // control thread inside the odd/even critical section and read word-by-word
+    // by the audio thread's retry loop. Every word is std::atomic<double>
+    // (relaxed) so each cross-thread access is defined by the C++ memory model
+    // (no non-atomic concurrent read/write, i.e. no data-race UB); the seq
+    // counter plus the writer release / reader acquire fence pair order and
+    // tear-protect the 5-word set. std::atomic<double> is lock-free and one
+    // machine word on every supported target, so the publish stays lock- and
+    // allocation-free. Defaults mirror BiquadCoeffs{} (identity filter).
+    struct StagedCoeffs
+    {
+        std::atomic<double> b0{1.0}, b1{0.0}, b2{0.0};
+        std::atomic<double> a1{0.0}, a2{0.0};
+    };
+
+    /** @brief Word-wise relaxed copy of the staging slot (setup-time moves only). */
+    void copyStagedRelaxed(const Biquad& other) noexcept
+    {
+        stagedCoeffs_.b0.store(other.stagedCoeffs_.b0.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        stagedCoeffs_.b1.store(other.stagedCoeffs_.b1.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        stagedCoeffs_.b2.store(other.stagedCoeffs_.b2.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        stagedCoeffs_.a1.store(other.stagedCoeffs_.a1.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        stagedCoeffs_.a2.store(other.stagedCoeffs_.a2.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+    }
+
     BiquadCoeffs activeCoeffs_ {};
-    BiquadCoeffs stagedCoeffs_ {};
+    StagedCoeffs stagedCoeffs_ {};
     std::atomic<bool> coeffsDirty_{false};
     std::atomic<unsigned> coeffsSeq_{0}; ///< Seqlock counter for tear-free staged publish.
 

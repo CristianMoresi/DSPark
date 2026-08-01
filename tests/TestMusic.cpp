@@ -481,3 +481,173 @@ DSPARK_TEST(ChordDetector_reliable_register_and_signal_poison_recovery)
     EXPECT_EQ(poisoned.rootPitchClass, 0);
     EXPECT_TRUE(poisoned.type == CT::Major);
 }
+
+// ============================================================================
+// M-008 iteration 2 additive pins (CHANGE-REQUEST additive-only):
+// rate-aware automatic window (D-M008-C1), documented sharp edges of explicit
+// windows at pro rates (D-M008-C1/C3), diatonicChord heptatonic contract
+// (D-M008-C6). No pre-existing case modified.
+// ============================================================================
+
+namespace {
+
+// Drive a fresh detector with a root-position sine stack at an arbitrary
+// sample rate and window request; returns the held chord. windowSize <= 0
+// selects the automatic (rate-derived) window; windowOut reports the choice.
+dspark::ChordDetector<float>::Result detectAt(std::initializer_list<int> midis,
+                                              double fs, int windowSize,
+                                              int blocks, int* windowOut = nullptr)
+{
+    ChordDetector<float> det;
+    det.prepare(spec(fs, 512, 2), windowSize);
+    if (windowOut != nullptr) *windowOut = det.getWindowSize();
+    auto buf = makeStereoBuffer(512);
+    auto midiHz = [](int m) { return 440.0 * std::exp2((m - 69) / 12.0); };
+    for (int b = 0; b < blocks; ++b)
+    {
+        for (int i = 0; i < 512; ++i)
+        {
+            const long long n = static_cast<long long>(b) * 512 + i;
+            double v = 0.0;
+            for (int m : midis)
+                v += std::sin(dspark::twoPi<double> * midiHz(m)
+                              * static_cast<double>(n) / fs);
+            buf.ch(0)[i] = static_cast<float>(0.25 * v);
+            buf.ch(1)[i] = buf.ch(0)[i];
+        }
+        det.processBlock(AudioBufferView<const float>(buf.view()));
+    }
+    return det.getChord();
+}
+
+} // namespace
+
+DSPARK_TEST(ChordDetector_default_window_tracks_sample_rate)
+{
+    using CT = ChordDetector<float>::ChordType;
+
+    // The automatic default must keep the analysis span ~85 ms so the
+    // reliable register does not collapse at professional rates: with the
+    // old fixed 4096 default, C4 major at 96 kHz read C Maj7 at conf 0.574
+    // (confidently WRONG) and at 192 kHz latched a non-sounding B-Sus4.
+    int w44 = 0, w48 = 0, w96 = 0, w192 = 0;
+
+    const auto c44 = detectAt({60, 64, 67}, 44100.0, 0, 120, &w44);
+    EXPECT_EQ(w44, 4096);
+    EXPECT_EQ(c44.rootPitchClass, 0);
+    EXPECT_TRUE(c44.type == CT::Major);
+    EXPECT_GT(c44.confidence, 0.5f);
+
+    const auto c48 = detectAt({60, 64, 67}, 48000.0, 0, 120, &w48);
+    EXPECT_EQ(w48, 4096);                    // 48 kHz behaviour unchanged
+    EXPECT_EQ(c48.rootPitchClass, 0);
+    EXPECT_TRUE(c48.type == CT::Major);
+    EXPECT_GT(c48.confidence, 0.5f);
+
+    const auto c96 = detectAt({60, 64, 67}, 96000.0, 0, 240, &w96);
+    EXPECT_EQ(w96, 8192);
+    EXPECT_EQ(c96.rootPitchClass, 0);
+    EXPECT_TRUE(c96.type == CT::Major);
+    EXPECT_GT(c96.confidence, 0.5f);
+
+    const auto c192 = detectAt({60, 64, 67}, 192000.0, 0, 480, &w192);
+    EXPECT_EQ(w192, 16384);
+    EXPECT_EQ(c192.rootPitchClass, 0);
+    EXPECT_TRUE(c192.type == CT::Major);
+    EXPECT_GT(c192.confidence, 0.5f);
+
+    // A seventh chord at 96 kHz through the automatic window: G4 dominant 7.
+    const auto g7 = detectAt({67, 71, 74, 77}, 96000.0, 0, 240);
+    EXPECT_EQ(g7.rootPitchClass, 7);
+    EXPECT_TRUE(g7.type == CT::Dominant7);
+
+    // Explicit requests are still honoured verbatim (clamped to 1024..16384).
+    int wExp = 0;
+    (void)detectAt({60, 64, 67}, 96000.0, 4096, 8, &wExp);
+    EXPECT_EQ(wExp, 4096);
+}
+
+DSPARK_TEST(ChordDetector_explicit_window_bounds_are_documented)
+{
+    using CT = ChordDetector<float>::ChordType;
+
+    // Green anchor at a non-48k rate: 96 kHz with an explicit 16384 window
+    // resolves C4 major exactly (measured Major ~0.77, iter-1 Critic and
+    // iter-2 sweep agree).
+    int w = 0;
+    const auto rescued = detectAt({60, 64, 67}, 96000.0, 16384, 240, &w);
+    EXPECT_EQ(w, 16384);
+    EXPECT_EQ(rescued.rootPitchClass, 0);
+    EXPECT_TRUE(rescued.type == CT::Major);
+    EXPECT_GT(rescued.confidence, 0.5f);
+
+    // Documented sharp edge (D-M008-C1): 96 kHz with a forced 4096 window
+    // must NOT be trusted at C4 -- the ~94 Hz main lobe smears adjacent
+    // semitones (measured C Maj7 conf ~0.57). If this ever resolves as a
+    // correct C major, the register documentation is stale: update it.
+    const auto smeared = detectAt({60, 64, 67}, 96000.0, 4096, 240);
+    EXPECT_FALSE(smeared.rootPitchClass == 0 && smeared.type == CT::Major);
+
+    // Documented sharp edge (D-M008-C3): windowSize 1024 at 48 kHz has an
+    // EMPTY reliable register (measured 0/29 roots C3..E5 correct).
+    const auto tiny = detectAt({60, 64, 67}, 48000.0, 1024, 120);
+    EXPECT_FALSE(tiny.rootPitchClass == 0 && tiny.type == CT::Major);
+
+    // Requests below the clamp floor land INTO 1024 (documented), and 1024
+    // IS meaningful at a low rate: 8 kHz spans 128 ms and resolves C4.
+    int wClamp = 0, wLow = 0;
+    (void)detectAt({60, 64, 67}, 48000.0, 512, 8, &wClamp);
+    EXPECT_EQ(wClamp, 1024);
+    const auto low = detectAt({60, 64, 67}, 8000.0, 0, 120, &wLow);
+    EXPECT_EQ(wLow, 1024);
+    EXPECT_EQ(low.rootPitchClass, 0);
+    EXPECT_TRUE(low.type == CT::Major);
+}
+
+DSPARK_TEST(Harmony_diatonicChord_heptatonic_contract)
+{
+    // C major (Ionian): textbook triad quality on every degree.
+    const auto& ionian = allScales[0];
+    const std::string_view triads[7] = { "M", "m", "m", "M", "M", "m", "dim" };
+    const int thirds[7] = { 4, 3, 3, 4, 4, 3, 3 };
+    const int fifths[7] = { 7, 7, 7, 7, 7, 7, 6 };
+    for (int d = 0; d < 7; ++d)
+    {
+        const auto c = diatonicChord(ionian, d, ChordLevel::TriadsOnly);
+        EXPECT_TRUE(c.view() == triads[d]);
+        EXPECT_EQ(c.intervals[0], 0);
+        EXPECT_EQ(c.intervals[1], thirds[d]);
+        EXPECT_EQ(c.intervals[2], fifths[d]);
+    }
+
+    // Sevenths: I maj7, V dominant 7, vii m7b5.
+    EXPECT_TRUE(diatonicChord(ionian, 0, ChordLevel::Triads7).view()
+                == std::string_view("maj7"));
+    EXPECT_TRUE(diatonicChord(ionian, 4, ChordLevel::Triads7).view()
+                == std::string_view("7"));
+    EXPECT_TRUE(diatonicChord(ionian, 6, ChordLevel::Triads7).view()
+                == std::string_view("m7b5"));
+
+    // Invalid degrees return an empty chord.
+    EXPECT_TRUE(diatonicChord(ionian, -1, ChordLevel::TriadsOnly).view().empty());
+    EXPECT_TRUE(diatonicChord(ionian, 7, ChordLevel::TriadsOnly).view().empty());
+
+    // Non-heptatonic scales are documented as musically UNSPECIFIED but must
+    // stay safe: every scale x degree x level yields a NUL-terminated name
+    // inside the buffer and a root interval of 0.
+    for (const auto& sc : allScales)
+        for (int d = 0; d < 7; ++d)
+        {
+            const auto c = diatonicChord(sc, d, ChordLevel::Triads791113);
+            EXPECT_TRUE(c.view().size() < c.name.size());
+            EXPECT_EQ(c.intervals[0], 0);
+        }
+
+    // The documented example of the sharp edge: MajorPentatonic degree 0
+    // stacks {0, 4, 9} (a 9-semitone "fifth") and names it "?".
+    const auto& penta = allScales[33];
+    const auto odd = diatonicChord(penta, 0, ChordLevel::TriadsOnly);
+    EXPECT_EQ(odd.intervals[1], 4);
+    EXPECT_EQ(odd.intervals[2], 9);
+    EXPECT_TRUE(odd.view() == std::string_view("?"));
+}

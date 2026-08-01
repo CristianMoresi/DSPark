@@ -10,13 +10,18 @@
  * Classic music-information-retrieval pipeline, allocation-free:
  *
  * 1. A mono sum is windowed (Hann) every hop and analyzed with one exact
- *    Goertzel per note over MIDI 36..83 (four octaves): each bin sits exactly
- *    on its tempered frequency, avoiding the FFT's fixed-grid quantization.
- *    Frequency RESOLUTION, however, equals an FFT of the same length - the
- *    Hann main lobe spans ~4*fs/windowSize (~46 Hz at the 4096 default), wider
- *    than a semitone below ~C3, so adjacent-semitone leakage makes the bottom
- *    of the range unreliable. Confident detection needs the mid/upper register
- *    or a larger windowSize (up to 16384) at low pitches.
+ *    Goertzel per note over MIDI 36..83 (four octaves, C2..B5): each bin sits
+ *    exactly on its tempered frequency, avoiding the FFT's fixed-grid
+ *    quantization. Frequency RESOLUTION, however, equals an FFT of the same
+ *    length: the Hann main lobe spans ~4*fs/windowSize -- 46.9 Hz at 48 kHz
+ *    with a 4096 window, but 93.8 Hz at 96 kHz and 187.5 Hz at 192 kHz for
+ *    that same window -- so every register bound scales with fs/windowSize
+ *    and is meaningless without its sample rate. By default prepare()
+ *    therefore derives the window from the rate (constant ~85 ms span:
+ *    4096 at 44.1/48 kHz, 8192 at 88.2/96 kHz, 16384 at 176.4/192 kHz),
+ *    which keeps the reliable register at ~F#3..E5 for root-position triads
+ *    from 44.1 to 192 kHz. See prepare() for the measured register table
+ *    and the rules for explicit window sizes.
  * 2. Note energies fold into a 12-bin chroma vector.
  * 3. The chroma is cosine-matched against chord templates (major, minor,
  *    diminished, augmented, sus2, sus4, dom7, maj7, min7, half-dim7) at all
@@ -48,6 +53,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -65,7 +71,7 @@ class ChordDetector
 {
 public:
     /** @brief Recognized chord families. */
-    enum class ChordType : uint8_t
+    enum class ChordType : std::uint8_t
     {
         None = 0, Major, Minor, Diminished, Augmented,
         Sus2, Sus4, Dominant7, Major7, Minor7, HalfDim7
@@ -84,29 +90,89 @@ public:
     /**
      * @brief Prepares the analysis pipeline.
      * @param spec       Audio environment specification.
-     * @param windowSize Analysis window (default 4096: ~85 ms at 48 kHz).
+     * @param windowSize Analysis window in samples. Values <= 0 (the default)
+     *                   select the AUTOMATIC window: the smallest power of
+     *                   two in [1024, 16384] spanning at least 4096/48000 s
+     *                   (~85 ms) at spec.sampleRate -- 4096 at 44.1/48 kHz,
+     *                   8192 at 88.2/96 kHz, 16384 at 176.4/192 kHz.
+     *                   Explicit values are clamped to [1024, 16384].
+     *
+     * REGISTER BOUNDS -- every number below is measured (M-008 audit,
+     * iteration-2 sweep: root-position pure-tone major triads, roots
+     * MIDI 36..84); "reliable" means correct root AND chord type through
+     * the 0.55 confidence gate:
+     *
+     * - Upper bound (every configuration): the analysis bins stop at
+     *   MIDI 83 (B5), so chord tones above B5 are invisible and
+     *   root-position triads with roots above E5 (MIDI 76) are NEVER
+     *   detected.
+     * - Lower bound: adjacent-semitone leakage from the Hann main lobe,
+     *   ~4*fs/windowSize Hz wide. The floor is a property of that RATIO,
+     *   not of the rate alone; measured floors:
+     *     4*fs/N =  46.9 Hz (48k/4096, 96k/8192, 192k/16384) -> F#3..E5
+     *     4*fs/N =  43.1 Hz (44.1k/4096)                     -> E3..E5
+     *     4*fs/N =  93.8 Hz (96k/4096, 192k/8192)            -> F#4..E5
+     *     4*fs/N >= 187.5 Hz (48k/1024, 192k/4096)           -> EMPTY
+     *     4*fs/N =  23.4 Hz (48k/8192, 96k/16384)            -> C2..E5, gaps
+     *     4*fs/N <= 11.7 Hz (44.1k or 48k with 16384)        -> C2..E5
+     * - Below the floor the detector does not merely lose confidence:
+     *   leakage adds phantom adjacent semitones that match a richer
+     *   template and can pass the 0.55 gate, producing a CONFIDENTLY WRONG
+     *   reading (measured: C3 major at 48 kHz/4096 reads C Maj7 at ~0.58;
+     *   C4 major at 96 kHz with a forced 4096 window reads C Maj7 at
+     *   ~0.57). Treat the bounds as hard usage limits, not soft advice.
+     * - The AUTOMATIC window keeps 4*fs/windowSize <= 46.9 Hz for every
+     *   rate up to 192 kHz, so the F#3..E5 register (use ~G3 up as a
+     *   comfortable margin) holds at 44.1, 48, 88.2, 96, 176.4 and
+     *   192 kHz alike. Above 192 kHz the 16384 ceiling widens the lobe
+     *   again (93.8 Hz at 384 kHz: reliable only F#4..E5, and C4 again
+     *   misreads as Maj7).
+     * - Small explicit windows at professional rates have NO reliable
+     *   register: 1024 at 48 kHz detects 0 of 49 swept roots (several
+     *   confidently wrong) because its 187.5 Hz lobe exceeds the semitone
+     *   spacing of every note below the bin ceiling. Explicit 1024/2048
+     *   windows are only meaningful at low rates (1024 spans 128 ms at
+     *   8 kHz and resolves G3/C4 majors exactly); requests below 1024
+     *   clamp INTO 1024 and inherit all of this. Prefer the automatic
+     *   window.
      */
-    void prepare(const AudioSpec& spec, int windowSize = 4096)
+    void prepare(const AudioSpec& spec, int windowSize = 0)
     {
         // Conservative no-op on invalid specs (NaN rate included): a hot
         // detector keeps its previous configuration instead of going deaf.
         if (!spec.isValid()) return;
         sampleRate_ = spec.sampleRate;
-        windowSize_ = std::clamp(windowSize, 1024, 16384);
+        if (windowSize <= 0)
+        {
+            // Automatic: hold the analysis TIME SPAN constant across sample
+            // rates (the span 4096 samples cover at 48 kHz). The Hann main
+            // lobe spans ~4/timeSpan Hz, so a constant span pins the
+            // frequency resolution -- and with it the reliable register --
+            // instead of letting it degrade as fs rises. Rounding up to a
+            // power of two only narrows the lobe further.
+            const double target = sampleRate_ * (4096.0 / 48000.0);
+            int n = 1024;
+            while (n < 16384 && static_cast<double>(n) < target) n *= 2;
+            windowSize_ = n;
+        }
+        else
+        {
+            windowSize_ = std::clamp(windowSize, 1024, 16384);
+        }
         hopSize_ = windowSize_ / 2;
 
-        ring_.assign(static_cast<size_t>(windowSize_), T(0));
+        ring_.assign(static_cast<std::size_t>(windowSize_), T(0));
         writePos_ = 0;
         sinceHop_ = 0;
 
-        window_.resize(static_cast<size_t>(windowSize_));
+        window_.resize(static_cast<std::size_t>(windowSize_));
         WindowFunctions<T>::hann(window_.data(), windowSize_, true);
-        scratch_.resize(static_cast<size_t>(windowSize_));
+        scratch_.resize(static_cast<std::size_t>(windowSize_));
 
         for (int n = 0; n < kNumNotes; ++n)
         {
             const double freq = 440.0 * std::exp2((kFirstMidi + n - 69) / 12.0);
-            notes_[static_cast<size_t>(n)].prepare(sampleRate_, freq, windowSize_);
+            notes_[static_cast<std::size_t>(n)].prepare(sampleRate_, freq, windowSize_);
         }
 
         prepared_.store(true, std::memory_order_release);
@@ -146,6 +212,15 @@ public:
     {
         return threshold_.load(std::memory_order_relaxed);
     }
+
+    /**
+     * @return The analysis window (samples) in effect: the automatic choice
+     *         if prepare() was called with windowSize <= 0, the clamped
+     *         explicit request otherwise (member default 4096 before the
+     *         first successful prepare()). Latency is one full window;
+     *         readings update every windowSize/2 samples.
+     */
+    [[nodiscard]] int getWindowSize() const noexcept { return windowSize_; }
 
     // -- Processing -------------------------------------------------------------------
 
@@ -240,7 +315,7 @@ private:
 
     void push(T sample) noexcept
     {
-        ring_[static_cast<size_t>(writePos_)] = sample;
+        ring_[static_cast<std::size_t>(writePos_)] = sample;
         writePos_ = (writePos_ + 1) % windowSize_;
         if (++sinceHop_ >= hopSize_)
         {
@@ -255,24 +330,24 @@ private:
         for (int i = 0; i < windowSize_; ++i)
         {
             const int idx = (writePos_ + i) % windowSize_;
-            scratch_[static_cast<size_t>(i)] = ring_[static_cast<size_t>(idx)]
-                                             * window_[static_cast<size_t>(i)];
+            scratch_[static_cast<std::size_t>(i)] = ring_[static_cast<std::size_t>(idx)]
+                                             * window_[static_cast<std::size_t>(i)];
         }
 
         // Note energies -> chroma, tracking the lowest sounding note: the
         // bass is the standard root disambiguator (e.g. Dsus4 and Gsus2 are
         // the same pitch-class set; the bass decides which one you played).
         std::array<double, 12> chroma {};
-        std::array<double, static_cast<size_t>(kNumNotes)> noteE {};
+        std::array<double, static_cast<std::size_t>(kNumNotes)> noteE {};
         double total = 0.0, maxNote = 0.0;
         for (int n = 0; n < kNumNotes; ++n)
         {
-            auto& g = notes_[static_cast<size_t>(n)];
+            auto& g = notes_[static_cast<std::size_t>(n)];
             g.reset();
             g.processBlock(scratch_.data(), windowSize_);
             const double e = static_cast<double>(g.getMagnitude());
-            noteE[static_cast<size_t>(n)] = e * e;
-            chroma[static_cast<size_t>((kFirstMidi + n) % 12)] += e * e;
+            noteE[static_cast<std::size_t>(n)] = e * e;
+            chroma[static_cast<std::size_t>((kFirstMidi + n) % 12)] += e * e;
             total += e * e;
             maxNote = std::max(maxNote, e * e);
         }
@@ -281,9 +356,9 @@ private:
         int bassPc = -1;
         for (int n = 0; n < kNumNotes; ++n)
         {
-            const double e = noteE[static_cast<size_t>(n)];
-            const double prev = (n > 0) ? noteE[static_cast<size_t>(n - 1)] : 0.0;
-            const double next = (n + 1 < kNumNotes) ? noteE[static_cast<size_t>(n + 1)] : 0.0;
+            const double e = noteE[static_cast<std::size_t>(n)];
+            const double prev = (n > 0) ? noteE[static_cast<std::size_t>(n - 1)] : 0.0;
+            const double next = (n + 1 < kNumNotes) ? noteE[static_cast<std::size_t>(n + 1)] : 0.0;
             if (e > 0.15 * maxNote && e >= prev && e >= next)
             {
                 bassPc = (kFirstMidi + n) % 12;
@@ -314,7 +389,7 @@ private:
                 double inSum = 0.0;
                 for (int iv = 0; iv < 12; ++iv)
                     if (tpl.mask & (1u << iv))
-                        inSum += chroma[static_cast<size_t>((root + iv) % 12)];
+                        inSum += chroma[static_cast<std::size_t>((root + iv) % 12)];
                 double score = inSum / (norm * std::sqrt(static_cast<double>(tpl.count)));
                 if (root == bassPc)
                     score *= 1.25;   // the bass note names the chord
@@ -353,15 +428,15 @@ private:
     }
 
     // Pack the result into one atomic word (no torn reads cross-thread).
-    [[nodiscard]] static uint64_t pack(const Result& r) noexcept
+    [[nodiscard]] static std::uint64_t pack(const Result& r) noexcept
     {
-        const auto conf = static_cast<uint32_t>(std::clamp(r.confidence, 0.0f, 1.0f) * 65535.0f);
-        return (static_cast<uint64_t>(static_cast<uint8_t>(r.rootPitchClass + 1)) << 24)
-             | (static_cast<uint64_t>(static_cast<uint8_t>(r.type)) << 16)
+        const auto conf = static_cast<std::uint32_t>(std::clamp(r.confidence, 0.0f, 1.0f) * 65535.0f);
+        return (static_cast<std::uint64_t>(static_cast<std::uint8_t>(r.rootPitchClass + 1)) << 24)
+             | (static_cast<std::uint64_t>(static_cast<std::uint8_t>(r.type)) << 16)
              | conf;
     }
 
-    [[nodiscard]] static Result unpack(uint64_t v) noexcept
+    [[nodiscard]] static Result unpack(std::uint64_t v) noexcept
     {
         Result r;
         r.rootPitchClass = static_cast<int>((v >> 24) & 0xFF) - 1;
@@ -380,9 +455,9 @@ private:
     int writePos_ = 0;
     int sinceHop_ = 0;
 
-    std::array<Goertzel<T>, static_cast<size_t>(kNumNotes)> notes_;
+    std::array<Goertzel<T>, static_cast<std::size_t>(kNumNotes)> notes_;
 
-    std::atomic<uint64_t> packed_ { 0 };
+    std::atomic<std::uint64_t> packed_ { 0 };
     std::atomic<float> threshold_ { 0.55f };
 };
 

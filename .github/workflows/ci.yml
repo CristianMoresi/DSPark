@@ -449,10 +449,15 @@ jobs:
       # in the two seqlock stress cases (atomic-dense, contended, the exact
       # thing TSan instruments hardest); the 547 cases that followed them in
       # THAT run held no threaded code and ~19x the plain numeric work of the
-      # first 143. The suite has since grown to 695 cases, five of them from
-      # M-008B (three concurrency pins, a lock-free census, and a
-      # single-threaded exception-safety pin), and one threaded case now sits
-      # past that boundary (the AnalogRandom readout pin). 5400 s still
+      # first 143. The suite has since grown to 694 cases, four of them from
+      # M-008B (three concurrency pins and a lock-free census), and one
+      # threaded case now sits past that boundary (the AnalogRandom readout
+      # pin). A fifth M-008B case, the single-threaded prepare()
+      # exception-safety pin, is no longer part of the suite binary: it
+      # installs replacement allocation functions, which are program-wide, so
+      # it now builds and runs as its own executable (ctest test
+      # alloc_failure) to keep the sanitizers' allocation checks live for the
+      # suite. This step runs it too, at a cost of milliseconds. 5400 s still
       # covers the derived worst case (~35 min) with >2x margin: every
       # M-008B pin is a bounded-loop case far lighter than the seqlock
       # stress pair. Never trim the suite to fit the budget: raise the

@@ -205,7 +205,7 @@ algorithm needs it, and the Compressor's gain path stays at or below
 attack). A section like the one above earns its resampler when you drive
 custom waveshaping hard, not for dynamics alone.
 
-Transparency (RF-009 / ADR-011): every processor that oversamples internally
+Transparency: every processor that oversamples internally
 exposes the factor via `setOversampling(int)` with **factor = 1 meaning OFF**
 (no internal resampling, zero added latency), supports at least {1, 2, 4}, and
 reports the added latency through `getLatency()` so the host can compensate.

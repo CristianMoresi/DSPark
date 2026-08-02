@@ -432,7 +432,7 @@ DSPark/
 ├── plugin/                  # Native plugin layer: VST3, CLAP, AU + WebView editor
 ├── tests/                   # Test suite: 630+ cases, zero dependencies
 ├── conformance/             # Public conformance suite (runs in CI)
-├── docs/                    # Cookbook, plugin guide, metrics table
+├── docs/                    # Cookbook, plugin guide, threading model, metrics
 ├── examples/                # WAV processing, channel strip, plugins, templates
 ├── tools/                   # VST3/CLAP/AU-editor smoke hosts, editor host, amalgamator
 └── DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)

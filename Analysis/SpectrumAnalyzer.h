@@ -105,18 +105,22 @@ public:
      * (conservative no-op); fftSize is clamped to [256, 16384] and rounded
      * UP to the next power of two; an out-of-range window enum falls back
      * to Hann. May allocate (setup thread only; while re-preparing, the old
-     * and the new storage transiently coexist). If an allocation throws,
-     * the analyser is left unprepared (pushSamples is a no-op until a later
-     * prepare() succeeds) and NEVER half-configured: every allocation is
-     * built into locals and committed only after all of them succeed, so a
-     * throw leaves every reader-visible value exactly as it was on entry.
-     * After a throwing FIRST prepare() the analyser is still never-prepared:
-     * the size getters report 0 and the spectrum getters return zero
-     * readable bins (the returned pointer may be null). After a throwing
-     * RE-prepare() the sizes, the storage, the last published frame and any
-     * held snapshot pointers are exactly the ones from before the call --
-     * only the pushSamples gate is off. getNumBins() therefore always
-     * matches the allocated storage, throw or no throw.
+     * and the new storage transiently coexist).
+     *
+     * On exceptions-enabled builds: if an allocation throws, the analyser is
+     * left unprepared (pushSamples is a no-op until a later prepare()
+     * succeeds) and NEVER half-configured: every allocation is built into
+     * locals and committed only after all of them succeed, so a throw leaves
+     * every reader-visible value exactly as it was on entry. After a throwing
+     * FIRST prepare() the analyser is still never-prepared: the size getters
+     * report 0 and the spectrum getters return zero readable bins (the
+     * returned pointer may be null). After a throwing RE-prepare() the sizes,
+     * the storage, the last published frame and any held snapshot pointers are
+     * exactly the ones from before the call -- only the pushSamples gate is
+     * off. getNumBins() therefore always matches the allocated storage, throw
+     * or no throw. (With -fno-exceptions an allocation failure terminates
+     * instead of throwing, as elsewhere in the framework, so none of the
+     * post-throw states above is observable there.)
      *
      * @param sampleRate Sample rate in Hz.
      * @param fftSize    FFT size (power of two, 256 to 16384).

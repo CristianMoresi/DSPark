@@ -419,10 +419,10 @@ DSPARK_TEST(ChordDetector_invalid_inputs_are_ignored)
 }
 
 // ============================================================================
-// M-008 same-commit regression pin (CHANGE-REQUEST additive-only):
+// Regression pin, landed in the same commit as the fix it guards:
 // locks the RELIABLE-register contract the corrected ChordDetector doc states
 // (mid/upper-register root-position triads detect exactly) and the signal-path
-// NaN/Inf poison-then-recover behaviour measured by the M-008 audit probe.
+// NaN/Inf poison-then-recover behaviour measured on the shipped header.
 // ============================================================================
 
 DSPARK_TEST(ChordDetector_reliable_register_and_signal_poison_recovery)
@@ -483,10 +483,10 @@ DSPARK_TEST(ChordDetector_reliable_register_and_signal_poison_recovery)
 }
 
 // ============================================================================
-// M-008 iteration 2 additive pins (CHANGE-REQUEST additive-only):
-// rate-aware automatic window (D-M008-C1), documented sharp edges of explicit
-// windows at pro rates (D-M008-C1/C3), diatonicChord heptatonic contract
-// (D-M008-C6). No pre-existing case modified.
+// Further ChordDetector and Harmony pins:
+// the rate-aware automatic window, the documented sharp edges of explicit
+// windows at professional rates, and the diatonicChord heptatonic contract.
+// Each pins a documented behaviour, not an implementation detail.
 // ============================================================================
 
 namespace {
@@ -572,8 +572,8 @@ DSPARK_TEST(ChordDetector_explicit_window_bounds_are_documented)
     using CT = ChordDetector<float>::ChordType;
 
     // Green anchor at a non-48k rate: 96 kHz with an explicit 16384 window
-    // resolves C4 major exactly (measured Major ~0.77, iter-1 Critic and
-    // iter-2 sweep agree).
+    // resolves C4 major exactly (measured Major confidence ~0.77, confirmed
+    // by an independent register sweep).
     int w = 0;
     const auto rescued = detectAt({60, 64, 67}, 96000.0, 16384, 240, &w);
     EXPECT_EQ(w, 16384);
@@ -581,14 +581,14 @@ DSPARK_TEST(ChordDetector_explicit_window_bounds_are_documented)
     EXPECT_TRUE(rescued.type == CT::Major);
     EXPECT_GT(rescued.confidence, 0.5f);
 
-    // Documented sharp edge (D-M008-C1): 96 kHz with a forced 4096 window
+    // Documented sharp edge: 96 kHz with a forced 4096 window
     // must NOT be trusted at C4 -- the ~94 Hz main lobe smears adjacent
     // semitones (measured C Maj7 conf ~0.57). If this ever resolves as a
     // correct C major, the register documentation is stale: update it.
     const auto smeared = detectAt({60, 64, 67}, 96000.0, 4096, 240);
     EXPECT_FALSE(smeared.rootPitchClass == 0 && smeared.type == CT::Major);
 
-    // Documented sharp edge (D-M008-C3): windowSize 1024 at 48 kHz has an
+    // Documented sharp edge: windowSize 1024 at 48 kHz has an
     // EMPTY reliable register (measured 0/29 roots C3..E5 correct).
     const auto tiny = detectAt({60, 64, 67}, 48000.0, 1024, 120);
     EXPECT_FALSE(tiny.rootPitchClass == 0 && tiny.type == CT::Major);

@@ -277,7 +277,7 @@ bool simdPeakLevelIgnoresNan()
     return dspark::simd::peakLevel(buf, 33) == static_cast<T>(2.5);
 }
 
-// M-002 (AG-2 audit, additive): every kernel at UNALIGNED start offsets. The
+// SIMD alignment coverage: every kernel at UNALIGNED start offsets. The
 // checkSimdKernels() pass above always starts from a naturally-aligned base, so
 // the SIMD bodies only ever ran aligned loads/stores through unaligned
 // intrinsics. Here the whole kernel (SIMD body + scalar tail) is re-run from

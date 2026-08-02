@@ -1,6 +1,6 @@
-// DSPark - OnsetDetector acceptance suite (M-001, criteria OA-1..OA-6).
+// DSPark - OnsetDetector acceptance suite (criteria OA-1..OA-6, below).
 //
-// Synthetic-only corpus (D-6): anti-aliased (windowed-sinc / decaying-sine)
+// Synthetic-only corpus: anti-aliased (windowed-sinc / decaying-sine)
 // clicks, pink/brown noise beds, soft onsets over a harmonic bed, FM/AM
 // vibrato stress. Scoring uses a reimplemented mir_eval-style F-measure
 // (+/-25 ms, one-to-one greedy matching). Numbers are printed so the ctest
@@ -385,7 +385,7 @@ DSPARK_TEST(Onset_OA6_latency_exact)
                   << " (latch-click)=" << (r.latchIndex - clickAt) << "\n";
 
         EXPECT_TRUE(r.latchIndex >= 0);
-        // ONE latency definition (D-2): getLatencySamples() == fftSize + hop,
+        // ONE latency definition: getLatencySamples() == fftSize + hop,
         // and the latch asserts exactly L samples after the onset's reported
         // reference sample -- an exact, block-size-independent contract.
         EXPECT_EQ(probe.getLatencySamples(), L);

@@ -30,19 +30,19 @@ using namespace dspark;
 using namespace dspark::test;
 
 // ============================================================================
-// M-008B iteration 3 additive pin (CHANGE-REQUEST additive-only, D-M008B-C3):
-// exception-safe prepare(). The D-M008B-C1 fix commit updated numBins_ BEFORE
-// the allocations, so a bad_alloc mid-prepare left NEW sizes over OLD storage:
-// the copy-out getters then OOB-wrote the old snapshot vectors and OOB-read
-// the old slot arrays, reset() OOB-wrote the slots, and a throwing FIRST
-// prepare left null slot arrays behind numBins_ = 129 (SEGV) -- all reproduced
-// under ASan in tests/results/M-008B/critic-checks-iter2/
-// attackB-throwing-prepare.log. prepare() now documents commit-after-success:
-// every allocation completes into locals before ANY member is written. This
-// pin provokes a REAL bad_alloc at EVERY allocation index of a re-prepare and
-// of a first prepare (fail-once throwing replacement operator new, the
-// critic-probe technique) and asserts the documented post-throw state plus
-// full recovery on the next successful prepare().
+// Pin for exception-safe SpectrumAnalyzer::prepare(). An earlier version of
+// that header updated numBins_ BEFORE the allocations, so a bad_alloc
+// mid-prepare left NEW sizes over OLD storage: the copy-out getters then
+// OOB-wrote the old snapshot vectors and OOB-read the old slot arrays,
+// reset() OOB-wrote the slots, and a throwing FIRST prepare left null slot
+// arrays behind numBins_ = 129 (SEGV). All four were reproduced under
+// AddressSanitizer. prepare() now documents commit-after-success: every
+// allocation completes into locals before ANY member is written. This
+// pin provokes a REAL bad_alloc at EVERY allocation index of a re-prepare
+// and of a first prepare (fail-once throwing replacement operator new) and
+// asserts the documented post-throw state plus full recovery on the next
+// successful prepare(). Reverting the commit-after-success discipline turns
+// every assertion below red.
 //
 // The replacement operator new/delete below are program-wide by linkage
 // (replaceable allocation functions, [new.delete]) -- which is exactly why
@@ -62,9 +62,9 @@ using namespace dspark::test;
 // assumed: under ASan+UBSan this target is green with this case injecting
 // real bad_allocs, and the executable's own _Znwm/_ZdlPv definitions preempt
 // the sanitizer runtime's (ELF global-scope precedence) in the ASan AND the
-// TSan link -- symbol evidence in tests/results/M-008B/iter3/
-// allocator-precedence.txt. TSan itself cannot be executed on the audit
-// sandbox (ADR-013), so the RUN under TSan is CI's to prove; if the
+// TSan link, confirmed from the linked binaries' symbol tables. Running the
+// suite under ThreadSanitizer is CI's job, so the RUN under TSan is proven
+// there rather than here; if the
 // replacement ever failed to take effect the case would fail loudly on
 // EXPECT_GT(injected, 10) with injected == 0, never pass silently. It
 // therefore runs UNGUARDED under every sanitizer.

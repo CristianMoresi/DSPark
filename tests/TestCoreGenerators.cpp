@@ -1183,13 +1183,13 @@ DSPARK_TEST(Oscillator_sync_reengage_is_clean)
 }
 
 // ===========================================================================
-// M-003 AG-8 audit regression pins (additive; CHANGE-REQUEST recorded in
-// builder-report.002.json). These guard the shipped fixes so the CI suite goes
-// red if any is reverted -- the audit probe (audit_ag8.cpp) is not wired into
-// ctest, so the permanence lives here.
+// Regression pins for the AnalogRandom and Oscillator fixes below. They
+// exist so the CI suite goes red if any of those fixes is reverted: the
+// probes that originally found the defects were throwaway programs, so the
+// permanence lives here, in the suite.
 // ===========================================================================
 
-// D-M003-1: pink noise must measure ~-3 dB/oct across the audio band. The prior
+// Pink noise must measure ~-3 dB/oct across the audio band. The prior
 // 3-of-7-pole filter produced -5 dB/oct; this pins the full Kellett filter.
 DSPARK_TEST(AnalogRandom_pink_slope_is_minus3_dB_per_octave)
 {
@@ -1230,7 +1230,7 @@ DSPARK_TEST(AnalogRandom_pink_slope_is_minus3_dB_per_octave)
     EXPECT_LT(slope, -2.25);
 }
 
-// D-M003-2: setFrequency(NaN) must not poison the oscillator (std::clamp(NaN)
+// setFrequency(NaN) must not poison the oscillator (std::clamp(NaN)
 // returns NaN); output stays finite and a valid frequency afterwards recovers.
 DSPARK_TEST(Oscillator_setFrequency_NaN_recovers_finite)
 {
@@ -1250,7 +1250,7 @@ DSPARK_TEST(Oscillator_setFrequency_NaN_recovers_finite)
 }
 
 // ============================================================================
-// M-008B: cross-thread publication pins (ADR-013 section 6(c))
+// Cross-thread publication pins (concurrent, with a reachability argument)
 // ============================================================================
 
 // Pin for the AnalogRandom readout fix: getCurrentValue()/getPhase() must be
@@ -1261,7 +1261,7 @@ DSPARK_TEST(Oscillator_setFrequency_NaN_recovers_finite)
 // three-thread interleaving is a C++ data race that CI ThreadSanitizer
 // reports at the readout locators (locally proven by the DRD red run:
 // conflicting plain-word frames at AnalogRandom.h getNextSample/updatePhase
-// vs getCurrentValue/getPhase; see tests/results/M-008B in the audit tree).
+// vs getCurrentValue/getPhase, which is exactly this interleaving).
 // The primary failure path is the oracle: CI ThreadSanitizer (and the
 // registered DRD harness, proven red pre-fix) reports the pre-fix plain-word
 // reads in this exact interleaving. The bounds assertions are a secondary

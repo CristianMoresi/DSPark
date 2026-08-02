@@ -117,8 +117,8 @@ int main()
         }, kBlock));
     }
     {
-        // FIRFilter hot path (seqlock coefficient handoff audit, M-002): the
-        // per-sample cost must stay pure dotProduct + one relaxed dirty check.
+        // FIRFilter hot path (seqlock coefficient handoff): the per-sample
+        // cost must stay pure dotProduct + one relaxed dirty check.
         const auto taps = dspark::FIRDesign<float>::lowPass(
             static_cast<float>(kRate), 4000.0f, 63);
         dspark::FIRFilter<float> fir;

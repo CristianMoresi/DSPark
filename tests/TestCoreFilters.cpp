@@ -974,7 +974,7 @@ DSPARK_TEST(FIR_multichannel_isolation)
     EXPECT_EQ(peakSilent, 0.0f);
 }
 
-// Additive coverage for the D-M002-C3 closure (M-002 iteration 3): the seqlock
+// Coverage for the seqlock coefficient handoff at double precision: the
 // staging words are std::atomic<T>, and that must hold for T = double too.
 // Checks (1) the lock-free precondition of the design (a non-lock-free atomic
 // would take a lock on the audio thread), (2) FIRFilter<double> behaves
@@ -1619,8 +1619,8 @@ DSPARK_TEST(EnvelopeFollower_processSample_publishes)
     EXPECT_EQ(ef.getEnvelope(0), last);       // old: readout stuck at 0
 }
 
-// M-005 AG-4 pin: the WDF diode-pair Newton solver must converge (finite,
-// clamped, no hang) at extreme drive - reflected-wave amplitudes to +/-1e6 V.
+// Pin: the WDF diode-pair Newton solver must converge (finite, clamped, no
+// hang) at extreme drive - reflected-wave amplitudes to +/-1e6 V.
 DSPARK_TEST(WDF_diode_pair_extreme_drive_converges)
 {
     const double R = 1000.0, Is = 2.52e-9, nVt = 0.045;

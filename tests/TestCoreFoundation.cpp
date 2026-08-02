@@ -1039,8 +1039,8 @@ DSPARK_TEST(AudioBuffer_move_leaves_source_reusable)
 }
 
 // ============================================================================
-// M-008B: ADR-013 section 2 lock-free guarantee for every atomic word type
-// used on an audio-visible path in the swept Core/ + Analysis/ headers.
+// Lock-free guarantee for every atomic word type used on an audio-visible
+// path in the Core/ and Analysis/ headers that publish across threads.
 // A platform where any of these takes a lock would silently violate the
 // allocation/lock-free audio-thread contract; fail loudly here instead.
 // (float/double were already pinned by FIR_double_instantiation_lockfree_

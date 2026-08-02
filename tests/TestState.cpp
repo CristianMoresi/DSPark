@@ -374,11 +374,11 @@ DSPARK_TEST(State_json_is_locale_independent)
 }
 
 // ===========================================================================
-// M-003 AG-8 audit regression pins (additive; CHANGE-REQUEST recorded in
-// builder-report.002.json). Guard the StateBlob JSON-helper fixes.
+// Regression pins for the StateBlob JSON-helper fixes, so the CI suite goes
+// red if any of them is reverted.
 // ===========================================================================
 
-// D-M003-4a: keys needing JSON escaping must produce valid (escaped) JSON and
+// Keys needing JSON escaping must produce valid (escaped) JSON and
 // round-trip losslessly (writer escapes, reader unescapes symmetrically).
 DSPARK_TEST(State_json_escapes_hostile_keys_and_roundtrips)
 {
@@ -402,14 +402,14 @@ DSPARK_TEST(State_json_escapes_hostile_keys_and_roundtrips)
     EXPECT_NEAR(r.read("ctrl\x01\x1f", 0.0f), 0.25f, 1e-6f);
 }
 
-// D-M003-4b: a non-finite float payload must render as legal JSON (never bare
+// A non-finite float payload must render as legal JSON (never bare
 // nan/inf) and still parse back (rendered as 0).
-// M-004 (AG-3) regression: getState() must COMPILE and round-trip for the
+// Regression: getState() must COMPILE and round-trip for the
 // double specialisation. Limiter/NoiseGate/Gain used to pass an unqualified
 // T=double to StateWriter::write(), which is ambiguous (float/int32/bool) and
 // broke the public getState() for the supported double type; the others cast to
 // float. This pin instantiates getState()/setState() for T=double across every
-// AG-3 dynamics/gain header so the ambiguity cannot silently return.
+// affected dynamics/gain header so the ambiguity cannot silently return.
 DSPARK_TEST(State_roundtrip_dynamics_double)
 {
     EXPECT_TRUE((roundTripHeap<Limiter<double>>([](auto& l) {

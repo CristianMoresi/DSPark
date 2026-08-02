@@ -2378,10 +2378,10 @@ DSPARK_TEST(Clipper_modes_clip_to_ceiling_and_pass_quiet)
 }
 
 // ============================================================================
-// M-005 AG-4 audit pins (additive; RF-009/ADR-011 + nonlinear defect fixes)
+// Oversampling-transparency pins and nonlinear defect regression pins
 // ============================================================================
 
-// RF-009/ADR-011: TapeMachine gains a configurable oversampling factor incl.
+// Transparency: TapeMachine gains a configurable oversampling factor incl.
 // 1x, with the added latency reported per factor and persisted in state.
 DSPARK_TEST(TapeMachine_oversampling_configurable_and_reported)
 {
@@ -2398,7 +2398,7 @@ DSPARK_TEST(TapeMachine_oversampling_configurable_and_reported)
     EXPECT_EQ(t.getOversamplingFactor(), 8);
     EXPECT_EQ(l4, base4x);                              // default unchanged
     EXPECT_LT(l1, l2); EXPECT_LT(l2, l4); EXPECT_LT(l4, l8);   // monotone in factor
-    EXPECT_EQ(t.getLatencySamples(), t.getLatency());  // RNF-005 alias agrees
+    EXPECT_EQ(t.getLatencySamples(), t.getLatency());  // the alias agrees
     // Invalid / non-power-of-two factors are ignored (stay at 8).
     t.setOversampling(3); t.setOversampling(0); t.setOversampling(-4); t.setOversampling(32);
     EXPECT_EQ(t.getOversamplingFactor(), 8);
@@ -2409,7 +2409,7 @@ DSPARK_TEST(TapeMachine_oversampling_configurable_and_reported)
     EXPECT_EQ(u.getOversamplingFactor(), 8);
 }
 
-// RF-009/ADR-011: TubePreamp gains a configurable oversampling factor incl.
+// Transparency: TubePreamp gains a configurable oversampling factor incl.
 // 1x=off (zero added latency), reported per factor and persisted in state.
 DSPARK_TEST(TubePreamp_oversampling_configurable_and_reported)
 {
@@ -2432,7 +2432,7 @@ DSPARK_TEST(TubePreamp_oversampling_configurable_and_reported)
     EXPECT_EQ(u.getOversamplingFactor(), 4);
 }
 
-// M-005 H1: a transient NaN/Inf field must not poison the Jiles-Atherton core
+// A transient NaN/Inf field must not poison the Jiles-Atherton core
 // forever - after the bad samples the output recovers to finite, bounded M.
 DSPARK_TEST(Hysteresis_survives_nonfinite_input)
 {
@@ -2451,7 +2451,7 @@ DSPARK_TEST(Hysteresis_survives_nonfinite_input)
     EXPECT_TRUE(finite);
 }
 
-// M-005 T1: a NaN/Inf input sample must not poison the transformer channel -
+// A NaN/Inf input sample must not poison the transformer channel -
 // a clean block after a poisoned block is fully finite.
 DSPARK_TEST(TransformerModel_survives_nonfinite_input)
 {
@@ -2469,7 +2469,7 @@ DSPARK_TEST(TransformerModel_survives_nonfinite_input)
     EXPECT_NO_NAN(b2.ch(0), 512);
 }
 
-// M-005 C1: a transient NaN/Inf input must not poison TapeMachine forever (the
+// A transient NaN/Inf input must not poison TapeMachine forever (the
 // JA/EQ/FIR/transport state otherwise mutes the channel to exact silence until
 // reset()). After a poison block, sustained clean input must produce finite AND
 // non-zero output WITHOUT an intervening reset().
@@ -2503,7 +2503,7 @@ DSPARK_TEST(TapeMachine_survives_nonfinite_input)
     EXPECT_GT(energy, 1e-3);   // recovered signal, not stuck silence
 }
 
-// M-005 C1: a transient NaN/Inf input must not poison TubePreamp forever (the
+// A transient NaN/Inf input must not poison TubePreamp forever (the
 // recursive triode NR / WDF tone / DC-blocker state otherwise emits all-NaN
 // until reset()). After a poison block, clean input must recover to finite,
 // non-zero output WITHOUT an intervening reset().
@@ -2536,7 +2536,7 @@ DSPARK_TEST(TubePreamp_survives_nonfinite_input)
 }
 
 // ============================================================================
-// M-006 AG-5 pins (TestEffectsTone). C1: Equalizer/FilterEngine front-door
+// Two guards pinned here. C1: Equalizer/FilterEngine front-door
 // non-finite guard (recursive biquad cascade poisons forever on NaN/Inf). C2:
 // FilterEngine shelf-slope / Equalizer shelf-band Q change must be audible on
 // the MinimumPhase static fast path -- the rebuild guard used to omit

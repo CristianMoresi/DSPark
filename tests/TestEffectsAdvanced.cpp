@@ -682,7 +682,7 @@ DSPARK_TEST(Expander_deep_attenuation_below_threshold)
     EXPECT_LT(peakAfter, 0.01f);
 }
 
-// M-004 (AG-3) regression: the downward-expander transfer slope below threshold
+// Regression: the downward-expander transfer slope below threshold
 // must be (R-1), not the compressor law (1-1/R). With threshold -20 dB, R=3 and
 // a signal 15 dB under threshold (well above the -60 dB range floor), the
 // correct attenuation is ~(R-1)*15 = 30 dB (gain ~0.032), whereas the old
@@ -713,7 +713,7 @@ DSPARK_TEST(Expander_downward_slope_is_ratio_minus_one)
     EXPECT_GT(peakAfter, 0.00008f);
 }
 
-// M-004 (AG-3) regression: setCrossoverFrequency keeps the split frequencies
+// Regression: setCrossoverFrequency keeps the split frequencies
 // sorted ascending (the internal sort was reimplemented as an explicit insertion
 // sort to avoid a spurious GCC -O2 -Warray-bounds on the fixed array; this pins
 // that the ordering behaviour is preserved).
@@ -733,8 +733,8 @@ DSPARK_TEST(CrossoverFilter_frequencies_stay_sorted)
     EXPECT_LT(f1, f2);
 }
 
-// M-004 (RF-009 / ADR-011): DynamicEQ's internal oversampling is transparent -
-// factor 1 = OFF adds zero latency, and enabling 2x/4x reports the added group
+// DynamicEQ's internal oversampling is transparent - factor 1 = OFF adds
+// zero latency, and enabling 2x/4x reports the added group
 // delay through getLatency() so a host can compensate (PDC). Pins the policy.
 DSPARK_TEST(DynamicEQ_oversampling_is_configurable_and_reported)
 {

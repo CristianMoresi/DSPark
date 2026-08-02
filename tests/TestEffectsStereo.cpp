@@ -452,10 +452,10 @@ DSPARK_TEST(Panner_no_NaN)
     }
 }
 
-// M-006 AG-5 C1: Panner front-door non-finite guard. The Spectral algorithm's
-// Biquad shelves (and Binaural/Haas delay lines) latch a NaN/Inf input forever;
+// Panner front-door non-finite guard. The Spectral algorithm's Biquad
+// shelves (and Binaural/Haas delay lines) latch a NaN/Inf input forever;
 // a transient glitch must not poison the panner. Revert-check: removing the
-// guard turns this RED. Same defect class as M-005 C1.
+// guard turns this RED. Same class as the TapeMachine/TubePreamp guards.
 DSPARK_TEST(Panner_survives_nonfinite_input)
 {
     Panner<float> pan;

@@ -1693,7 +1693,7 @@ DSPARK_TEST(NoiseGenerator_pink_type)
 }
 
 // ============================================================================
-// M-005 AG-4 audit pins (additive): sideband accuracy + RT denormal hygiene
+// FrequencyShifter pins: sideband accuracy + real-time denormal hygiene
 // ============================================================================
 
 // FrequencyShifter single-sideband: +shift keeps the wanted sideband and
@@ -1750,11 +1750,11 @@ DSPARK_TEST(RingModulator_geomean_no_dc_leak_on_silence)
 }
 
 // ============================================================================
-// M-006 AG-5 C1: front-door non-finite input guards. A transient NaN/Inf input
-// must NOT permanently poison recursive state (feedback filters, allpass, FDN).
+// Front-door non-finite input guards. A transient NaN/Inf input must NOT
+// permanently poison recursive state (feedback filters, allpass, FDN).
 // After a poison block, sustained clean input must recover to finite, non-zero
 // output WITHOUT an intervening reset(). Revert-check: removing the guard turns
-// each of these RED (stuck NaN / silence). Same defect class as M-005 C1.
+// each of these RED (stuck NaN / silence), as for TapeMachine and TubePreamp.
 // ============================================================================
 DSPARK_TEST(Delay_survives_nonfinite_input)
 {
@@ -1871,9 +1871,9 @@ DSPARK_TEST(AlgoReverb_survives_nonfinite_input)
 }
 
 // ============================================================================
-// M-006 D-M006-C1 (Critic iter-2): AlgorithmicReverb must NOT drop setDecay()
-// when batched with setType() before the first processBlock -- the header's own
-// documented quick-start `setType(Hall); setDecay(d)`. Pre-fix: applyPreset()
+// AlgorithmicReverb must NOT drop setDecay() when batched with setType()
+// before the first processBlock -- that is the header's own documented
+// quick-start, `setType(Hall); setDecay(d)`. Pre-fix: applyPreset()
 // overwrote decayTime_ with the preset value and force-cleared paramsDirty_, so
 // getDecay() returned 2.2 (Hall) not 2.0 and T60 was pinned regardless of decay.
 // Fixed by a per-param user-override mask. This pin measures T60 (energy-decay)

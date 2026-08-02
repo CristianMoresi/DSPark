@@ -1588,11 +1588,11 @@ DSPARK_TEST(ModulationRouter_contracts)
 }
 
 // ===========================================================================
-// M-003 AG-8 audit regression pins (additive; CHANGE-REQUEST recorded in
-// builder-report.002.json). Guard the shipped fixes in the CI suite.
+// Regression pins for the AudioBuffer and ModulationRouter fixes below, so
+// the CI suite goes red if either of them is reverted.
 // ===========================================================================
 
-// D-M003-3b: a buffer wider than the 16-channel view default must not silently
+// A buffer wider than the 16-channel view default must not silently
 // drop channels through toView() (regression guard: toView now propagates
 // MaxChannels as the view's channel capacity).
 DSPARK_TEST(AudioBuffer_toView_preserves_channels_beyond_default_width)
@@ -1606,7 +1606,7 @@ DSPARK_TEST(AudioBuffer_toView_preserves_channels_beyond_default_width)
     EXPECT_EQ(cref.toView().getNumChannels(), 20);
 }
 
-// D-M003-5: a transient non-finite modulation source must not poison a route;
+// A transient non-finite modulation source must not poison a route;
 // the one-pole holds the last good value (matches DryWetMixer's guard).
 DSPARK_TEST(ModulationRouter_holds_last_value_on_nonfinite_source)
 {
@@ -1623,8 +1623,8 @@ DSPARK_TEST(ModulationRouter_holds_last_value_on_nonfinite_source)
     EXPECT_EQ(out, good); // held, not poisoned
 }
 
-// M-005 AG-4 pin: WaveshapeTable is a memoryless nonlinearity (no ADAA); its
-// docs now state honestly that aliasing is only reduced by oversampling, not by
+// WaveshapeTable is a memoryless nonlinearity (no ADAA); its docs now state
+// honestly that aliasing is only reduced by oversampling, not by
 // the Hermite table interpolation. Behavioral guard: enabling oversampling must
 // drop the alias floor. Probe: a 9 kHz tone's 5th harmonic (45 kHz) folds to
 // exactly 3 kHz, a bin no true harmonic occupies - pure aliasing there.

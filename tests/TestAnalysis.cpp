@@ -511,8 +511,8 @@ DSPARK_TEST(LoudnessMeter_louder_signal_higher_LUFS)
     EXPECT_GT(lufs2, lufs1); // Louder signal = higher LUFS
 }
 
-// M-007 D-M007-C1 pin: the true-peak max-hold must NOT be permanently poisoned
-// by a single non-finite (Inf/NaN) input sample. The K-filter / histogram path
+// Pin: the true-peak max-hold must NOT be permanently poisoned by a single
+// non-finite (Inf/NaN) input sample. The K-filter / histogram path
 // already drops a poisoned block and self-recovers; before the fix std::max()
 // latched +Inf into truePeakMax_ (and the raw |sample| leaked it through the
 // detector ring), so getTruePeakDb() returned +Inf dBTP forever. Now only
@@ -1156,12 +1156,12 @@ DSPARK_TEST(PhaseCorrelation_reset_clears_ring_and_mono_is_dual_mono)
 }
 
 // ============================================================================
-// M-008B: cross-thread publication pins (ADR-013 section 6(c))
+// Cross-thread publication pins (concurrent, with a reachability argument)
 // ============================================================================
 
 // Pin for the SpectrumAnalyzer triple-buffer handoff (audio writer vs GUI
 // reader), the largest un-oracled lock-free structure in the library before
-// M-008B. The writer publishes spectra whose two probe bins ALWAYS carry
+// this pin. The writer publishes spectra whose two probe bins ALWAYS carry
 // equal-amplitude tones (1500 Hz -> bin 32 and 18750 Hz -> bin 400 at
 // fs 48 kHz, fftSize 1024), toggling the common amplitude by 24 dB every 8
 // hops with smoothing off. Every coherent frame therefore has
@@ -1170,11 +1170,11 @@ DSPARK_TEST(PhaseCorrelation_reset_clears_ring_and_mono_is_dual_mono)
 // tone). A reader that ever observes a slot the writer is concurrently
 // writing mixes a high-level bin 32 with a low-level bin 400 (or vice
 // versa) and trips the 12 dB delta bound.
-// Reachability argument (AC-008B-6): breaking the ownership handoff -- a
-// mutated computeSpectrum() that publishes the finished slot but KEEPS
+// Reachability argument: breaking the ownership handoff -- a mutated
+// computeSpectrum() that publishes the finished slot but KEEPS
 // writing into it (no slot adoption) -- makes this exact assertion fail with
-// tens of thousands of violations per run (mutation proof logged in
-// tests/results/M-008B/mutation-pin-proof.log). Liveness
+// tens of thousands of violations per run, so the pin demonstrably reaches
+// the structure it guards rather than merely running beside it. Liveness
 // is guaranteed by construction: the reader keeps polling until the writer
 // has published at least 64 frames (hard-capped so a starved writer fails
 // loudly instead of hanging), and the fresh-adoption floor proves the
@@ -1231,26 +1231,26 @@ DSPARK_TEST(SpectrumAnalyzer_triple_buffer_concurrent_readout_is_tear_free)
     EXPECT_GT(fresh, 16);                                  // adoption liveness
 }
 
-// M-008B iteration 2 additive pin (CHANGE-REQUEST additive-only, D-M008B-C1):
-// paired-getter returned-pointer LIFETIME. The iteration-1 tear pin above
-// reads only getMagnitudesDb() and so could never reach the defect this pin
-// covers: with the pre-fix code, the pointer returned by one getter outlived
+// Paired-getter returned-pointer LIFETIME. The tear pin above reads only
+// getMagnitudesDb(), so it could never reach the defect this pin covers --
+// that one needs two getters in play at once. With the earlier code, the
+// pointer returned by one getter outlived
 // the reader's slot ownership -- the next acquisition (by EITHER getter)
 // handed that slot back to the writer, which then mutated the array behind
 // the still-held pointer through documented usage.
-// Reachability argument (AC-008B-6 / ADR-013 6(c)):
-//  - Part 1 is the deterministic public-API defect schedule from the M-008B
-//    Critic probe. Against the pre-fix header (3478aaa) it fails
-//    unconditionally: all 129 bins mutate behind the held pointer (red run
-//    archived in tests/results/M-008B/iter2/pin-red-on-prefix.log; the
-//    Critic/Orchestrator reproductions are spectrum-stale-pointer-probe.log
-//    and orchestrator-verify/critic-C1-stale-recheck.log).
+// Reachability argument:
+//  - Part 1 is a deterministic public-API schedule that provokes the
+//    defect on demand. Against the pre-fix header (commit 3478aaa) it
+//    fails unconditionally: all 129 bins mutate behind the held pointer.
+//    Against the fixed header it passes, because each getter now copies
+//    the acquired slot into reader-private storage and returns a pointer
+//    to that copy, which no other thread can reach.
 //  - Part 2 exercises BOTH getters concurrently with the writer while
 //    re-reading through the first getter's held pointer, so CI TSan (the
 //    C++11-aware oracle) now sees this access pattern: pre-fix it is a
 //    plain-word data race TSan reports; the live pre-fix mutation rate was
-//    ~263k observed mutations per 200k frames (critic-checks/
-//    spectrum-live-race-probe.log), far above this pin's zero tolerance.
+//    ~263k observed mutations per 200k frames, measured live against the
+//    pre-fix header -- far above this pin's zero tolerance.
 // Liveness floors prove real overlap; hard caps fail loudly instead of
 // hanging.
 DSPARK_TEST(SpectrumAnalyzer_paired_getter_held_pointer_never_mutates)

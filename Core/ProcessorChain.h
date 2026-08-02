@@ -36,14 +36,14 @@ namespace dspark {
  * Processors are stored in a `std::tuple` and invoked in order.
  * Access individual processors via `get<Index>()` to configure parameters.
  *
- * Threading (ADR-013 SPSC model): prepare()/reset() are setup-time (never
- * concurrent with processing); processBlock() belongs to the audio thread;
- * setBypassed<I>() belongs to the control thread (one independent relaxed
- * atomic word per slot, adopted at the next processBlock()); isBypassed<I>()
- * and getLatency() are lock-free readouts callable from any thread (each
- * slot's getLatency() must itself be a lock-free readout, as the framework
- * processors' are). get<I>() returns a reference whose thread contract is
- * the slot processor's own.
+ * Threading (SPSC model, see docs/threading.md): prepare()/reset() are
+ * setup-time (never concurrent with processing); processBlock() belongs to
+ * the audio thread; setBypassed<I>() belongs to the control thread (one
+ * independent relaxed atomic word per slot, adopted at the next
+ * processBlock()); isBypassed<I>() and getLatency() are lock-free readouts
+ * callable from any thread (each slot's getLatency() must itself be a
+ * lock-free readout, as the framework processors' are). get<I>() returns a
+ * reference whose thread contract is the slot processor's own.
  *
  * @tparam T          Sample type (float or double).
  * @tparam Processors Processor types. Must be greater than 0.

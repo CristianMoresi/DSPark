@@ -312,7 +312,7 @@ private:
  * ns/sample, g++ -O2); block-level bench deltas are within run-to-run noise
  * (5.78/5.89/5.95 vs 5.87/5.98/5.79 ns/frame medians, 63-tap mono LP).
  *
- * Threading (ADR-013 SPSC model):
+ * Threading (SPSC model, see docs/threading.md):
  * - prepare(): setup thread only (allocates; never concurrent with any
  *   other call).
  * - setCoefficients(): control thread (ONE non-audio writer; canonical

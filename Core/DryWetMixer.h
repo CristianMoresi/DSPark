@@ -16,11 +16,11 @@
  * ensure the dry signal is delayed (Latency Compensation) before calling pushDry()
  * to prevent phase cancellation (comb filtering).
  *
- * Threading (ADR-013 SPSC model): pushDry() / mixWet() / reset() belong to
- * the processing thread (single stream owner), and so do the dry-snapshot
- * readouts getDryChannel() / getDryCapturedSamples(), which expose plain
- * processing-thread state. setMixRule() belongs to the control thread (ONE
- * non-audio writer; single-word relaxed atomic read once per mixWet()).
+ * Threading (SPSC model, see docs/threading.md): pushDry() / mixWet() /
+ * reset() belong to the processing thread (single stream owner), and so do
+ * the dry-snapshot readouts getDryChannel() / getDryCapturedSamples(), which
+ * expose plain processing-thread state. setMixRule() belongs to the control
+ * thread (ONE non-audio writer; single relaxed word read once per mixWet()).
  * getMixRule-style readback is not provided; prepare() and
  * setLatencyCompensation() (and getLatencyCompensation()) allocate/touch
  * setup state and belong to the setup thread. Moves are setup-time only.

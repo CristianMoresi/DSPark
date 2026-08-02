@@ -17,7 +17,7 @@
  * - Lock-free cross-thread parameter and readout contract (see Threading).
  * - DC-free denormal mitigation.
  *
- * Threading (single-producer/single-consumer model, ADR-013):
+ * Threading (single-producer/single-consumer model; docs/threading.md):
  * - prepare(): setup thread only (never concurrent with generation or
  *   readers).
  * - getNextSample() / getNextBlock() / getNextDiscrete*(): audio thread
@@ -33,8 +33,8 @@
  * - getCurrentValue() / getPhase(): any thread. They load std::atomic
  *   readout words the generator publishes once per getNextSample() call and
  *   once per getNextBlock() block (relaxed single-word loads; no multi-word
- *   invariant exists between them, so no seqlock is required -- ADR-013
- *   pattern 3, single independent word).
+ *   invariant exists between them, so no seqlock is required -- each is
+ *   a single independent word).
  *
  * Dependencies: AnalogConstants.h, C++20 standard library (<algorithm>,
  * <array>, <atomic>, <chrono>, <cmath>, <cstdint>, <span>, <type_traits>).
@@ -328,7 +328,7 @@ namespace dspark
                 // Publish the readout words for getCurrentValue()/getPhase()
                 // (relaxed atomic stores: a plain MOV on x86/ARM64; the
                 // cross-thread read of the previous plain members was a data
-                // race, the D-M002-C3 defect class).
+                // race -- undefined behaviour, not merely a stale read).
                 publishedValue_.store(currentValue_, std::memory_order_relaxed);
                 publishedPhase_.store(static_cast<Real>(phaseAccumulator_),
                                       std::memory_order_relaxed);
@@ -634,7 +634,7 @@ namespace dspark
                 // "instrumentation-grade" variant): parallel one-pole bank whose
                 // summed response tracks -3 dB/oct across the audio band to
                 // within ~0.5 dB. The previous 3-pole truncation measured ~-5
-                // dB/oct (M-003 audit), violating the documented pink slope.
+                // dB/oct when measured, violating the documented pink slope.
                 Real b0 = pinkNoiseOctaves_[0];
                 Real b1 = pinkNoiseOctaves_[1];
                 Real b2 = pinkNoiseOctaves_[2];
@@ -727,9 +727,9 @@ namespace dspark
             std::atomic<Real> smoothingCoeff_{ static_cast<Real>(0) };
             std::atomic<Real> quantizationStep_{ static_cast<Real>(0) };
             std::atomic<std::uint64_t> pendingSeed_{ 0 };
-            // Cross-thread READOUT words (ADR-013 pattern 3, single
-            // independent word each): the generator thread publishes them
-            // with relaxed stores (once per getNextSample() call, once per
+            // Cross-thread READOUT words (each a single independent
+            // word): the generator thread publishes them with relaxed
+            // stores (once per getNextSample() call, and once per
             // block in getNextBlock()); getCurrentValue()/getPhase() load
             // them relaxed from any thread. The plain working members
             // (currentValue_, phaseAccumulator_) stay audio-thread-private,

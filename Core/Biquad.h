@@ -548,7 +548,7 @@ private:
  * untouched. Per-channel states are stored compactly so adjacent channels
  * share cache lines during block processing.
  *
- * Threading (ADR-013 SPSC model):
+ * Threading (SPSC model, see docs/threading.md):
  * - setCoeffs(): control thread (ONE non-audio writer; canonical seqlock
  *   publish).
  * - processSample() / processSampleCore() / processBlock() /
@@ -624,7 +624,7 @@ public:
         // stored relaxed inside the critical section, so every cross-thread
         // word access is defined by the C++ memory model (the previous plain
         // struct copy was formal UB -- the same defect class CI TSan flagged in
-        // FIRFilter, D-M002-C3). The release fence below pairs with the
+        // FIRFilter). The release fence below pairs with the
         // reader's acquire fence ([atomics.fences]/2): a reader that observes
         // any mid-publish word must also observe the odd counter and retry
         // (Boehm, "Can Seqlocks Get Along With Programming Language Memory

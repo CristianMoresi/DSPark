@@ -12,11 +12,11 @@
  * cutoff and resonance match the analog prototype at the prewarped
  * frequency.
  *
- * Threading (ADR-013 SPSC model): parameter setters belong to the control
- * thread (ONE non-audio writer; independent single-word relaxed atomics --
- * setCutoff() also derives and republishes the g_ word, which is why a
- * single writer is required); getters are lock-free readouts callable from
- * any thread. prepare/reset are setup-time; processBlock/processSample
+ * Threading (SPSC model, see docs/threading.md): parameter setters belong to
+ * the control thread (ONE non-audio writer; independent single-word relaxed
+ * atomics -- setCutoff() also derives and republishes the g_ word, which is
+ * why a single writer is required); getters are lock-free readouts callable
+ * from any thread. prepare/reset are setup-time; processBlock/processSample
  * belong to the owning audio thread. processBlock installs a DenormalGuard;
  * per-sample callers are expected to guard their own callback (framework
  * convention) - resonant tails decay through the denormal range otherwise.

@@ -44,15 +44,15 @@ namespace dspark {
  * @class ModulationRouter
  * @brief Fixed-capacity source-to-target router with per-route depth/smoothing.
  *
- * Threading (ADR-013 SPSC model): addRoute()/clear() belong to the setup
- * thread and must not run concurrently with update() or setDepth() (same
- * contract as prepare() elsewhere in the framework; numRoutes_ is a plain
- * word published by that setup ordering). setDepth() belongs to the control
- * thread (ONE non-audio writer; single-word relaxed atomic adopted at the
- * next update()). update() runs on the audio thread and is noexcept: the
- * stored callables MUST NOT throw -- DSPark setters never do.
- * getNumRoutes() reflects setup-time state; read it from the setup/control
- * side or once configuration is complete.
+ * Threading (SPSC model, see docs/threading.md): addRoute()/clear() belong
+ * to the setup thread and must not run concurrently with update() or
+ * setDepth() (same contract as prepare() elsewhere in the framework;
+ * numRoutes_ is a plain word published by that setup ordering). setDepth()
+ * belongs to the control thread (ONE non-audio writer; single-word relaxed
+ * atomic adopted at the next update()). update() runs on the audio thread
+ * and is noexcept: the stored callables MUST NOT throw -- DSPark setters
+ * never do. getNumRoutes() reflects setup-time state; read it from setup or
+ * from the control side once configuration is complete.
  *
  * @tparam T         Value type (float or double).
  * @tparam MaxRoutes Route capacity (compile-time, no audio-thread allocation).

@@ -146,8 +146,8 @@ public:
         const int numBins = fftSize / 2 + 1;
         const T floorDb = floorDb_.load(std::memory_order_relaxed);
 
-        // --- Allocation phase (D-M008B-C3). EVERYTHING is built into locals
-        // and no member is written until every allocation has succeeded, so
+        // --- Allocation phase. EVERYTHING is built into locals and no
+        // member is written until every allocation has succeeded, so
         // a bad_alloc from any of them leaves the analyser exactly as it was
         // (minus the fft_ gate above): sizes, slots and snapshots stay
         // mutually consistent -- never NEW sizes over OLD storage.
@@ -190,8 +190,8 @@ public:
         // getter/reset() loop bounds trust that invariant). Setup thread
         // only (documented), so plain stores suffice. The "all noexcept"
         // half of that claim is compiler-checked rather than asserted in
-        // prose: a throw BETWEEN two commits is the only way back to the
-        // D-M008B-C3 shape (NEW sizes over OLD storage).
+        // prose: a throw BETWEEN two commits is the only way back to a
+        // half-committed shape (NEW sizes over OLD storage).
         static_assert(std::is_nothrow_move_assignable_v<std::vector<T>> &&
                       std::is_nothrow_move_assignable_v<std::array<OutSlot, 3>> &&
                       std::is_nothrow_move_assignable_v<std::unique_ptr<FFTReal<T>>>,
@@ -245,7 +245,7 @@ public:
         {
             // prepare() commits numBins_ and the slot arrays together (and
             // numBins_ is 0 before the first successful prepare()), so this
-            // loop bound always matches the allocated storage (D-M008B-C3).
+            // loop bound always matches the allocated storage.
             for (int k = 0; k < numBins_; ++k)
             {
                 slot.magnitudesDb[static_cast<size_t>(k)].store(floorDb, std::memory_order_relaxed);
@@ -414,7 +414,7 @@ private:
     /** @brief Fills dst with the requested window; returns the type actually
      *         generated (a wild enum value falls back to Hann). Static and
      *         member-free so prepare() can window into locals before any
-     *         member is committed (D-M008B-C3). */
+     *         member is committed. */
     [[nodiscard]] static WindowType generateWindow(T* dst, int size, WindowType type) noexcept
     {
         switch (type)
@@ -528,10 +528,10 @@ private:
     // readSlot_, and pendingSlot_ (atomic, with a freshness bit) carries the
     // hand-off. Classic wait-free GUI metering scheme.
     //
-    // Cross-thread publication derivation (ADR-013 section 6(b)). Two
-    // obligations, BOTH required (M-008B lesson: an ownership argument at
-    // acquisition time is NOT sufficient -- every returned pointer needs a
-    // LIFETIME argument too):
+    // Cross-thread publication derivation. No local race detector can
+    // certify relaxed atomics, so the argument is made here. Two
+    // obligations, BOTH required: an ownership argument at acquisition
+    // time is NOT sufficient, every returned pointer needs a LIFETIME one.
     //
     // 1) OWNERSHIP at access time. A slot's words are accessed only by the
     //    thread that currently owns the slot, and ownership moves
@@ -558,8 +558,8 @@ private:
     // 2) LIFETIME of returned pointers. Ownership alone does not cover the
     //    pointers the getters return: a pointer into a slot would outlive
     //    the reader's ownership as soon as the NEXT acquisition (by either
-    //    getter) handed that slot back to the writer -- the M-008B
-    //    returned-pointer race (D-M008B-C1). Therefore NO pointer into a
+    //    getter) handed that slot back to the writer, which would then
+    //    overwrite it under the caller's feet. Therefore NO pointer into a
     //    slot ever escapes this class: each getter copies the acquired
     //    slot into reader-private snapshot storage (magSnapshot_ /
     //    peakSnapshot_, touched only by the reader) WHILE it owns the slot,
@@ -575,8 +575,8 @@ private:
     // oracles model pthread happens-before only and cannot see the RMW
     // edges, so with plain words they reported the slot arrays as racing
     // and the verdict rested on a human classification argument (which
-    // M-008B iteration 1 got wrong). With atomic words every residual
-    // oracle frame machine-classifies as a std::atomic op (ADR-013 6(a));
+    // an earlier version of this header got wrong). With atomic words
+    // every residual frame machine-classifies as a std::atomic op;
     // relaxed load/store compiles to plain moves on x86 and ARM. The
     // C++11-aware oracle for the protocol itself remains ThreadSanitizer
     // (CI) via the pinned concurrent tests (single-getter tear pin and

@@ -546,7 +546,7 @@ namespace harmony
      * @note HEPTATONIC ASSUMPTION: stacking every second entry of
      * detail::activeDegrees() produces textbook tertian chords only for
      * 7-note scales, and the generated symbols are verified for those
-     * (M-008 audit: C-major degrees I..vii triads, maj7/7/m7b5 sevenths).
+     * (verified: C-major degrees I..vii triads, maj7/7/m7b5 sevenths).
      * For the 12 NON-heptatonic scales in allScales the call is still safe
      * and deterministic (no UB, the name is always NUL-terminated), but the
      * "thirds" are stacked over the wrapped/truncated degree list (see

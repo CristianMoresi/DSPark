@@ -20,9 +20,9 @@
  * mirrored analysis ring (the same technique as PitchDetector), which gives
  * exact, block-size-independent control over frame timing -- a precondition
  * for the deterministic latency contract below. It is the shared onset
- * front-end consumed by BeatTracker (ADR-009).
+ * front-end consumed by BeatTracker.
  *
- * Latency (ONE definition, D-2). Frame N (default 2048, Hann), hop =
+ * Latency (ONE definition). Frame N (default 2048, Hann), hop =
  * round(fs/200) (221 samples at 44.1 kHz, 240 at 48 kHz; ~5 ms). The detector
  * reports every onset at a
  * single fixed causal reporting latency
@@ -36,11 +36,11 @@
  * Detection completes internally earlier (~fftSize/2 + hop); events are held
  * and released at the fixed offset L so a caller sees one deterministic,
  * block-size-independent latency regardless of where in a frame the onset
- * falls (see OA-6). The adaptive threshold's pre_avg look-back (100 ms) is a
+ * falls. The adaptive threshold's pre_avg look-back (100 ms) is a
  * backward-looking warm-up, NOT part of L: it is history the moving mean needs
  * before its first valid decision and adds zero per-onset reporting latency.
  *
- * Picker defaults (D-2): pre_max = post_max = 30 ms, pre_avg = 100 ms,
+ * Picker defaults: pre_max = post_max = 30 ms, pre_avg = 100 ms,
  * post_avg = 70 ms (offline only), combination width = 30 ms. In the causal
  * streaming path post_avg = 0 and post_max is one hop -- the single-frame
  * confirmation that a candidate is a maximum, which is exactly the +hop term
@@ -177,7 +177,7 @@ public:
         bandPrev_.assign(static_cast<size_t>(numBands_), T(0));
         bandMaxPrev_.assign(static_cast<size_t>(numBands_), T(0));
 
-        // Peak-picker windows in frames (derived from the ms defaults, D-2).
+        // Peak-picker windows in frames (derived from the ms defaults above).
         preMaxFrames_  = msToFrames(30.0);
         postMaxFrames_ = msToFrames(30.0);   // offline; causal uses 1
         preAvgFrames_  = msToFrames(100.0);
@@ -201,8 +201,8 @@ public:
         resetState();
 
         method_.store(Method::SuperFlux, std::memory_order_relaxed);
-        // A conservative default delta tuned against the D-6 synthetic corpus
-        // (OA-1..OA-5). Callers can override per material.
+        // A conservative default delta, tuned against a synthetic corpus of
+        // clicks, soft onsets and noise beds. Callers override per material.
         threshold_.store(kDefaultDelta, std::memory_order_relaxed);
         whitening_.store(false, std::memory_order_relaxed);
 

@@ -97,10 +97,10 @@ public:
      *                   8192 at 88.2/96 kHz, 16384 at 176.4/192 kHz.
      *                   Explicit values are clamped to [1024, 16384].
      *
-     * REGISTER BOUNDS -- every number below is measured (M-008 audit,
-     * iteration-2 sweep: root-position pure-tone major triads, roots
-     * MIDI 36..84); "reliable" means correct root AND chord type through
-     * the 0.55 confidence gate:
+     * REGISTER BOUNDS -- every number below is measured (a sweep of
+     * root-position pure-tone major triads, roots MIDI 36..84);
+     * "reliable" means correct root AND chord type through the 0.55
+     * confidence gate:
      *
      * - Upper bound (every configuration): the analysis bins stop at
      *   MIDI 83 (B5), so chord tones above B5 are invisible and

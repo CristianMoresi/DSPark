@@ -18,7 +18,7 @@
  *    hysteresis sees the emphasized signal, so highs saturate first at slow
  *    speeds, exactly as on hardware.
  * 2. **Magnetic hysteresis with REAL AC bias** at 4x oversampling by DEFAULT
- *    (configurable per RF-009/ADR-011, see setOversampling): an
+ *    (configurable, and switchable off, see setOversampling): an
  *    ultrasonic carrier (0.375 * internal rate, exact 8-phase table) is
  *    summed with the signal into a push-pull pair of JA instances per
  *    channel (+carrier / -carrier, output averaged, like a centre-tapped
@@ -71,9 +71,9 @@
  * -75 dB). A SIMD lane-parallel JA (2 channels x 2 polarities) is the noted
  * future optimisation if a lighter budget is ever needed.
  *
- * **Oversampling transparency (RF-009/ADR-011).** setOversampling(int)
- * (setup thread only; it reallocates and re-calibrates like prepare())
- * selects the internal factor in {1,2,4,8,16}. DEFAULT 4. The AC-bias
+ * **Oversampling transparency.** setOversampling(int) (setup thread only;
+ * it reallocates and re-calibrates like prepare()) selects the internal
+ * oversampling factor in {1,2,4,8,16}; the DEFAULT is 4. The AC-bias
  * carrier is always 0.375 * the internal rate, so the factor sets how far
  * the carrier sits above the audio band: at 4x/48k it is ultrasonic
  * (72 kHz) and its even folds die in the downsampler; CPU scales ~linearly
@@ -144,7 +144,7 @@ public:
         // The hysteresis core runs at the active oversampling factor (4x
         // default) so the 0.375 * internal-rate AC bias carrier and its
         // sidebands stay clear of the audio band. factor = 1 = OFF: no
-        // resampling (RF-009/ADR-011); the carrier is then in-band.
+        // resampling and zero added latency; the carrier is then in-band.
         const double osRate = sampleRate_ * static_cast<double>(osFactor_);
         if (osFactor_ > 1)
         {
@@ -281,7 +281,7 @@ public:
 
     /**
      * @brief Configures internal oversampling of the biased hysteresis core
-     *  (RF-009/ADR-011 transparency policy). SETUP THREAD ONLY - it reallocates
+     *  (visible, tunable and switchable off). SETUP THREAD ONLY - it reallocates
      *  the polyphase filters and re-prepares/re-calibrates the whole chain
      *  exactly like prepare(); never call it concurrently with processBlock().
      *
@@ -389,7 +389,7 @@ public:
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
 
     /** @brief Alias of getLatency() under the framework-wide latency-reporter
-     *  name (RNF-005), so ProcessorChain::getLatency() includes this stage. */
+     *  name, so ProcessorChain::getLatency() includes this stage. */
     [[nodiscard]] int getLatencySamples() const noexcept { return latency_; }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
@@ -448,7 +448,7 @@ public:
         // the JA core mutes to exact silence forever (only reset() clears it,
         // not clean input). Replace bad samples with silence before they reach
         // any state, so a transient upstream glitch cannot mute the channel for
-        // the rest of the stream (M-005 C1).
+        // the rest of the stream.
         for (int ch = 0; ch < nCh; ++ch)
         {
             T* d = buffer.getChannel(ch);

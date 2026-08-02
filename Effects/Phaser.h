@@ -113,8 +113,8 @@ public:
         const int nCh = std::min(buffer.getNumChannels(), kMaxChannels);
         const int nS  = buffer.getNumSamples();
 
-        // Front-door non-finite guard (M-006 C1): the allpass recursion
-        // (yPrev/xPrev) latches a NaN/Inf input permanently -- even with feedback
+        // Front-door non-finite guard: the allpass recursion (yPrev/xPrev)
+        // latches a NaN/Inf input permanently -- even with feedback
         // off -- so a single glitch would silence the effect forever. Replace
         // non-finite input with 0 before it reaches the dry snapshot or any
         // allpass/feedback state. No-op on finite input (metrics byte-identical).

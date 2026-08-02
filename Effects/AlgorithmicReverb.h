@@ -293,8 +293,8 @@ public:
         const int nS  = buffer.getNumSamples();
         if (nCh == 0 || nS == 0) return;
 
-        // Front-door non-finite guard (M-006 C1): the FDN is fully recursive
-        // (fdnDelays_ feed back through Householder/absorption/allpasses) and the
+        // Front-door non-finite guard: the FDN is fully recursive (fdnDelays_
+        // feed back through Householder/absorption/allpasses) and the
         // soft-clip does not remove NaN, so a single NaN/Inf input poisons the
         // tail forever. Scrub non-finite input to 0 before the dry snapshot and
         // any state. No-op on finite input (metrics byte-identical).
@@ -366,8 +366,8 @@ public:
     {
         drainPendingChanges();
         refreshCachedParams();
-        // Front-door non-finite guard (M-006 C1): mirror processBlock so a
-        // per-sample caller cannot poison the recursive FDN tail forever.
+        // Front-door non-finite guard: mirror processBlock so a per-sample
+        // caller cannot poison the recursive FDN tail forever.
         if (!std::isfinite(input)) input = T(0);
         return processSampleInternal(input);
     }
@@ -1076,8 +1076,8 @@ protected:
     std::atomic<bool> presetDirty_ { false };  // setType() -> rebuild topology + reset
     std::atomic<bool> paramsDirty_ { false };  // any other setter -> refresh coeffs
 
-    // Per-param user-override mask (M-006 D-M006-C1). A preset load (setType)
-    // must not silently discard param setters batched with it before the first
+    // Per-param user-override mask. A preset load (setType) must not
+    // silently discard param setters batched with it before the first
     // processBlock -- the header's own documented quick-start is
     // `setType(Hall); setDecay(2.0f);`. setType() clears the mask so the preset
     // re-establishes the baseline; each param setter marks its bit; commitPreset()
@@ -1921,8 +1921,8 @@ protected:
 
     void commitPreset(const PresetValues& p) noexcept
     {
-        // D-M006-C1: only write the atomics the user did NOT override since the
-        // last setType(). acquire-read pairs with the release-mark in each
+        // Only write the atomics the user did NOT override since the last
+        // setType(). The acquire-read pairs with the release-mark in each
         // setter so a param batched after setType (its bit set) is preserved.
         const uint32_t m = userParamMask_.load(std::memory_order_acquire);
         if (!(m & kUserSize))      size_.store(p.size, std::memory_order_relaxed);

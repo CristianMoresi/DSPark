@@ -235,7 +235,7 @@ public:
     }
 
     /**
-     * @brief Sets the internal oversampling factor (RF-009 / ADR-011).
+     * @brief Sets the internal oversampling factor.
      *
      * Transparency policy: the factor is host-visible, fully configurable and
      * can be turned OFF.
@@ -466,7 +466,7 @@ private:
                 // Refresh gain-filter coefficients every 16 samples - the gain
                 // envelope is slow enough that this granularity is inaudible.
                 // Bells use the precomputed freq/Q trig (a single pow() per
-                // refresh, F-059 performance fix); shelves run their full
+                // refresh, which is the point); shelves run their full
                 // design, which at 1/16th rate stays negligible.
                 if ((i & 15) == 0)
                 {

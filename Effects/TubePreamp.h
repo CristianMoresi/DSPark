@@ -40,8 +40,8 @@
  *   same contract as TapeMachine/TransformerModel. Use setOutput() for
  *   static trim; gain changes are ramped (~30 ms) so drags stay click-free.
  *
- * The nonlinear core runs at 2x oversampling by DEFAULT. Per RF-009/ADR-011
- * the factor is configurable via setOversampling(int) (setup thread only, it
+ * The nonlinear core runs at 2x oversampling by DEFAULT, and the factor is
+ * configurable via setOversampling(int) (setup thread only, since it
  * reallocates and re-calibrates like prepare()): 1 = OFF (no internal
  * resampling, zero added latency, but the triode/grid nonlinearity then
  * aliases in-band unless you oversample the surrounding chain yourself), 2 =
@@ -114,7 +114,7 @@ public:
         spec_ = spec;
         sampleRate_ = spec.sampleRate;
         // Internal processing rate = active oversampling factor x base rate
-        // (RF-009/ADR-011: factor is configurable, 1 = off).
+        // (the factor is configurable; 1 = off, no resampling).
         fs2_ = static_cast<double>(osFactor_) * sampleRate_;
         numChannels_ = spec.numChannels;
         maxBlock_ = std::max(spec.maxBlockSize, 1);
@@ -220,7 +220,7 @@ public:
 
     /**
      * @brief Configures internal oversampling of the nonlinear circuit
-     *  (RF-009/ADR-011 transparency policy). SETUP THREAD ONLY - it reallocates
+     *  (visible, tunable and switchable off). SETUP THREAD ONLY - it reallocates
      *  the polyphase filters and re-runs the reference calibration exactly like
      *  prepare(); never call it concurrently with processBlock().
      *
@@ -271,11 +271,11 @@ public:
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
 
     /** @brief Latency in samples the active oversampler adds (0 at 1x = off);
-     *  reflects the current factor for host PDC (RF-009/ADR-011). */
+     *  reflects the current factor, so hosts can compensate (PDC). */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
 
     /** @brief Alias of getLatency() under the framework-wide latency-reporter
-     *  name (RNF-005), so ProcessorChain::getLatency() includes this stage. */
+     *  name, so ProcessorChain::getLatency() includes this stage. */
     [[nodiscard]] int getLatencySamples() const noexcept { return latency_; }
 
     /** @brief Effective B+ supply voltage of channel 0 (sag meter readout). */
@@ -315,8 +315,8 @@ public:
         setStages(r.read("stages", 1));
         setOutput(static_cast<T>(r.read("output", 0.0f)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
-        // Default 2 = the historical fixed factor (blobs written before RF-009
-        // restore the 2x behaviour they were captured with).
+        // Default 2 = the historical fixed factor, so blobs written before
+        // it was configurable restore the 2x behaviour they were captured with.
         setOversampling(r.read("oversampling", 2));
         return true;
     }
@@ -338,7 +338,7 @@ public:
         // sag / output DC-blocker / flatten-EQ state PERMANENTLY (only reset()
         // clears it, not clean input). Replace bad samples with silence before
         // they reach any state, so a transient upstream glitch cannot corrupt
-        // the channel for the rest of the stream (M-005 C1).
+        // the channel for the rest of the stream.
         for (int ch = 0; ch < nCh; ++ch)
         {
             T* d = buffer.getChannel(ch);
@@ -374,7 +374,7 @@ public:
         }
 
         // Nonlinear circuit at the active oversampling factor (1x = process the
-        // base-rate buffer in place, no resampling; RF-009/ADR-011).
+        // base-rate buffer in place, no resampling).
         {
             const bool osOn = (oversampler_ != nullptr);
             auto osView = osOn ? oversampler_->upsample(buffer) : buffer;

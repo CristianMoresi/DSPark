@@ -427,8 +427,8 @@ public:
         const int nCh = std::min(buffer.getNumChannels(), MaxChannels);
         const int nS  = buffer.getNumSamples();
 
-        // Front-door non-finite guard (M-006 C1): the recursive biquad cascade
-        // latches a NaN/Inf input permanently. Scrub non-finite input to 0
+        // Front-door non-finite guard: the recursive biquad cascade latches
+        // a NaN/Inf input permanently. Scrub non-finite input to 0
         // before the cascade. No-op on finite input (metrics byte-identical).
         for (int ch = 0; ch < nCh; ++ch)
         {

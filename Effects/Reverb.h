@@ -697,7 +697,7 @@ protected:
     // thread against one UI-initiated store per IR load), preserving the
     // exact snapshot semantics: an in-flight processBlock keeps its own
     // shared_ptr alive, so audio never reads a half-freed bank.
-    // HONEST CAVEAT (M-006, known MINOR/backlog): the previous bank is normally
+    // HONEST CAVEAT (known, accepted as minor): the previous bank is normally
     // released on the UI thread by storeBank(), BUT in the rare interleaving
     // where the audio thread had already snapshotted it, storeBank() only drops
     // to refcount 1 and the FINAL release runs on the audio thread when the

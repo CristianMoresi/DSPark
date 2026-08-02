@@ -128,8 +128,8 @@ public:
     {
         if (buffer.getNumChannels() < 2) return;
 
-        // Front-door non-finite guard (M-006 C1): the Spectral algorithm's
-        // Biquad shelves and the Binaural/Haas delay lines carry recursive state
+        // Front-door non-finite guard: the Spectral algorithm's Biquad
+        // shelves and the Binaural/Haas delay lines carry recursive state
         // that a NaN/Inf input would poison permanently. Scrub non-finite input
         // to 0 before any algorithm runs. No-op on finite input (metrics
         // byte-identical).

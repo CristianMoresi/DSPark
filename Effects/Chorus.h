@@ -121,8 +121,8 @@ public:
         const int nCh = std::min({ buffer.getNumChannels(), spec_.numChannels, kMaxChannels });
         const int nS  = buffer.getNumSamples();
 
-        // Front-door non-finite guard (M-006 C1): a single NaN/Inf input sample
-        // would recirculate through the recursive fbState_ path (fastTanh passes
+        // Front-door non-finite guard: a single NaN/Inf input sample would
+        // recirculate through the recursive fbState_ path (fastTanh passes
         // NaN) and mute the voice forever. Replace non-finite input with 0 before
         // it reaches the dry snapshot or any delay/feedback state. No-op on finite
         // input, so conformance metrics stay byte-identical.

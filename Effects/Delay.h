@@ -647,8 +647,8 @@ private:
                                             ChannelState& s, SampleType fbMult,
                                             SampleType lpC, SampleType hpC) noexcept
     {
-        // Front-door non-finite guard (M-006 C1): a NaN/Inf input, once written
-        // to the ring and recirculated through the recursive feedback filters
+        // Front-door non-finite guard: a NaN/Inf input, once written to the
+        // ring and recirculated through the recursive feedback filters
         // (fbLpZ1/fbHpZ1) and the tanh saturator, poisons the delay line
         // permanently. Replace it with 0 before it enters any state. No-op on
         // finite input, so conformance metrics stay byte-identical. Shared by

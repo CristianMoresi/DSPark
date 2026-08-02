@@ -18,7 +18,8 @@
  *
  * Threading:
  * - prepare() / reset(): setup thread (not concurrent with the audio or
- *   reader threads; reset() rewrites the reader-visible slots).
+ *   reader threads; reset() rewrites the reader-visible slots AND the
+ *   getter snapshots).
  * - pushSamples(): audio thread (stream owner). No-op before prepare().
  * - getMagnitudesDb() / getPeakHoldDb() / isNewDataReady(): ONE reader
  *   thread (GUI). Wait-free triple-buffer hand-off; never blocks the writer.
@@ -26,11 +27,13 @@
  *   frame and copies it into reader-private snapshot storage; the returned
  *   pointer refers to that snapshot, NEVER into the hand-off slots. Its
  *   contents are overwritten only by the reader's own next call to the SAME
- *   getter, and the pointer itself is invalidated only by prepare(). No
- *   other thread ever writes through a returned pointer, so the reader may
- *   hold it across frames (the values simply go stale). A consecutive
- *   getMagnitudesDb()/getPeakHoldDb() pair may represent adjacent analysis
- *   frames; each snapshot is internally frame-coherent.
+ *   getter or by the setup-only reset()/prepare() (a throwing prepare()
+ *   leaves them untouched), and the pointer itself is invalidated only by a
+ *   SUCCESSFUL prepare(). No other thread ever writes through a returned
+ *   pointer, so the reader may hold it across frames (the values simply go
+ *   stale). A consecutive getMagnitudesDb()/getPeakHoldDb() pair may
+ *   represent adjacent analysis frames; each snapshot is internally
+ *   frame-coherent.
  * - setSmoothing() / setPeakDecay() / setPeakHoldEnabled() / setFloorDb():
  *   control thread (ONE non-audio writer, per the framework's SPSC thread
  *   model; single-word relaxed atomics, picked up once per analysis frame).
@@ -64,6 +67,7 @@
 #include <cmath>
 #include <cstddef>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 namespace dspark {
@@ -100,9 +104,19 @@ public:
      * Release-safe: a non-finite or non-positive sample rate is ignored
      * (conservative no-op); fftSize is clamped to [256, 16384] and rounded
      * UP to the next power of two; an out-of-range window enum falls back
-     * to Hann. May allocate (setup thread only). If an allocation throws,
-     * the analyser is left unprepared (pushSamples becomes a no-op) rather
-     * than half-configured.
+     * to Hann. May allocate (setup thread only; while re-preparing, the old
+     * and the new storage transiently coexist). If an allocation throws,
+     * the analyser is left unprepared (pushSamples is a no-op until a later
+     * prepare() succeeds) and NEVER half-configured: every allocation is
+     * built into locals and committed only after all of them succeed, so a
+     * throw leaves every reader-visible value exactly as it was on entry.
+     * After a throwing FIRST prepare() the analyser is still never-prepared:
+     * the size getters report 0 and the spectrum getters return zero
+     * readable bins (the returned pointer may be null). After a throwing
+     * RE-prepare() the sizes, the storage, the last published frame and any
+     * held snapshot pointers are exactly the ones from before the call --
+     * only the pushSamples gate is off. getNumBins() therefore always
+     * matches the allocated storage, throw or no throw.
      *
      * @param sampleRate Sample rate in Hz.
      * @param fftSize    FFT size (power of two, 256 to 16384).
@@ -123,44 +137,80 @@ public:
         fftSize = pow2;
 
         fft_.reset(); // gate OFF: pushSamples() is a no-op while rebuilding
+                      // (and stays OFF if the allocation phase throws below)
 
-        sampleRate_ = sampleRate;
-        fftSize_ = fftSize;
-        numBins_ = fftSize / 2 + 1;
-        hopSize_ = fftSize / 2; // 50% overlap
-        windowType_ = windowType;
+        const int numBins = fftSize / 2 + 1;
+        const T floorDb = floorDb_.load(std::memory_order_relaxed);
 
-        window_.resize(static_cast<size_t>(fftSize));
-        generateWindow(windowType);
+        // --- Allocation phase (D-M008B-C3). EVERYTHING is built into locals
+        // and no member is written until every allocation has succeeded, so
+        // a bad_alloc from any of them leaves the analyser exactly as it was
+        // (minus the fft_ gate above): sizes, slots and snapshots stay
+        // mutually consistent -- never NEW sizes over OLD storage.
+        std::vector<T> window(static_cast<size_t>(fftSize));
+        const WindowType effectiveWindow = generateWindow(window.data(), fftSize, windowType);
 
-        windowGain_ = WindowFunctions<T>::coherentGain(window_.data(), fftSize);
-        if (windowGain_ < T(0.001)) windowGain_ = T(1);
-        invGain_ = T(2) / (static_cast<T>(fftSize_) * windowGain_);
+        T windowGain = WindowFunctions<T>::coherentGain(window.data(), fftSize);
+        if (windowGain < T(0.001)) windowGain = T(1);
+        const T invGain = T(2) / (static_cast<T>(fftSize) * windowGain);
 
-        inputRing_.assign(static_cast<size_t>(fftSize), T(0));
-        fftBuffer_.resize(static_cast<size_t>(fftSize));
-        freqBuffer_.resize(static_cast<size_t>(fftSize + 2));
+        std::vector<T> inputRing(static_cast<size_t>(fftSize), T(0));
+        std::vector<T> fftBuffer(static_cast<size_t>(fftSize));
+        std::vector<T> freqBuffer(static_cast<size_t>(fftSize + 2));
 
         // Unified DSP State
-        const T floorDb = floorDb_.load(std::memory_order_relaxed);
-        magnitudesState_.assign(static_cast<size_t>(numBins_), T(0));
-        peakState_.assign(static_cast<size_t>(numBins_), floorDb);
+        std::vector<T> magnitudesState(static_cast<size_t>(numBins), T(0));
+        std::vector<T> peakState(static_cast<size_t>(numBins), floorDb);
 
         // Triple buffer for tear-free cross-thread reading (relaxed-atomic
         // words; ordering comes from the pendingSlot_ RMWs, see below).
-        for (auto& slot : outSlots_)
+        std::array<OutSlot, 3> slots;
+        for (auto& slot : slots)
         {
-            slot.magnitudesDb = std::make_unique<std::atomic<T>[]>(static_cast<size_t>(numBins_));
-            slot.peakDb = std::make_unique<std::atomic<T>[]>(static_cast<size_t>(numBins_));
-            for (int k = 0; k < numBins_; ++k)
+            slot.magnitudesDb = std::make_unique<std::atomic<T>[]>(static_cast<size_t>(numBins));
+            slot.peakDb = std::make_unique<std::atomic<T>[]>(static_cast<size_t>(numBins));
+            for (int k = 0; k < numBins; ++k)
             {
                 slot.magnitudesDb[static_cast<size_t>(k)].store(floorDb, std::memory_order_relaxed);
                 slot.peakDb[static_cast<size_t>(k)].store(floorDb, std::memory_order_relaxed);
             }
         }
         // Reader-private snapshot storage backing the getter return pointers.
-        magSnapshot_.assign(static_cast<size_t>(numBins_), floorDb);
-        peakSnapshot_.assign(static_cast<size_t>(numBins_), floorDb);
+        std::vector<T> magSnapshot(static_cast<size_t>(numBins), floorDb);
+        std::vector<T> peakSnapshot(static_cast<size_t>(numBins), floorDb);
+
+        auto fft = std::make_unique<FFTReal<T>>(static_cast<size_t>(fftSize));
+
+        // --- Commit phase: moves and scalar stores only, all noexcept, so
+        // every size below matches its storage on every exit path (the
+        // getter/reset() loop bounds trust that invariant). Setup thread
+        // only (documented), so plain stores suffice. The "all noexcept"
+        // half of that claim is compiler-checked rather than asserted in
+        // prose: a throw BETWEEN two commits is the only way back to the
+        // D-M008B-C3 shape (NEW sizes over OLD storage).
+        static_assert(std::is_nothrow_move_assignable_v<std::vector<T>> &&
+                      std::is_nothrow_move_assignable_v<std::array<OutSlot, 3>> &&
+                      std::is_nothrow_move_assignable_v<std::unique_ptr<FFTReal<T>>>,
+                      "prepare()'s commit phase must be non-throwing");
+
+        sampleRate_ = sampleRate;
+        fftSize_ = fftSize;
+        numBins_ = numBins;
+        hopSize_ = fftSize / 2; // 50% overlap
+        windowType_ = effectiveWindow;
+        window_ = std::move(window);
+        windowGain_ = windowGain;
+        invGain_ = invGain;
+
+        inputRing_ = std::move(inputRing);
+        fftBuffer_ = std::move(fftBuffer);
+        freqBuffer_ = std::move(freqBuffer);
+        magnitudesState_ = std::move(magnitudesState);
+        peakState_ = std::move(peakState);
+
+        outSlots_ = std::move(slots);
+        magSnapshot_ = std::move(magSnapshot);
+        peakSnapshot_ = std::move(peakSnapshot);
         writeSlot_ = 0;
         readSlot_  = 1;
         pendingSlot_.store(2, std::memory_order_relaxed);
@@ -170,10 +220,16 @@ public:
         samplesUntilFFT_ = hopSize_;
         newDataReady_.store(false, std::memory_order_relaxed);
 
-        fft_ = std::make_unique<FFTReal<T>>(static_cast<size_t>(fftSize)); // gate ON, last
+        fft_ = std::move(fft); // gate ON, last
     }
 
-    /** @brief Resets all internal buffers and state to zero/floor values. */
+    /**
+     * @brief Resets all internal buffers and state to zero/floor values.
+     *
+     * Setup thread only. Rewrites the hand-off slots AND the reader-private
+     * snapshots, so values read through a held getter pointer drop to the
+     * floor (see the Threading pointer-validity contract).
+     */
     void reset() noexcept
     {
         const T floorDb = floorDb_.load(std::memory_order_relaxed);
@@ -183,7 +239,9 @@ public:
 
         for (auto& slot : outSlots_)
         {
-            // numBins_ is 0 before prepare(), so the arrays exist here.
+            // prepare() commits numBins_ and the slot arrays together (and
+            // numBins_ is 0 before the first successful prepare()), so this
+            // loop bound always matches the allocated storage (D-M008B-C3).
             for (int k = 0; k < numBins_; ++k)
             {
                 slot.magnitudesDb[static_cast<size_t>(k)].store(floorDb, std::memory_order_relaxed);
@@ -286,10 +344,13 @@ public:
      * Adopts the freshest published frame (if any) and copies it into
      * reader-private snapshot storage. The returned pointer refers to that
      * snapshot: it is overwritten only by the reader's own next call to
-     * THIS getter and invalidated only by prepare(); no other thread ever
-     * writes through it (see the Threading pointer-validity contract).
+     * THIS getter or by the setup-only reset()/prepare(), and invalidated
+     * only by a successful prepare(); no other thread ever writes through
+     * it (see the Threading pointer-validity contract).
      *
-     * @return Pointer to an array of size getNumBins() (0 before prepare()).
+     * @return Pointer to an array of size getNumBins(); the size is 0 before
+     *         the first successful prepare() (a throwing first prepare()
+     *         included) and the pointer may then be null.
      */
     [[nodiscard]] const T* getMagnitudesDb() const noexcept
     {
@@ -306,9 +367,12 @@ public:
      *
      * Same snapshot semantics as getMagnitudesDb(): the returned pointer
      * refers to reader-private storage overwritten only by the reader's own
-     * next call to THIS getter and invalidated only by prepare().
+     * next call to THIS getter or by the setup-only reset()/prepare(), and
+     * invalidated only by a successful prepare().
      *
-     * @return Pointer to an array of size getNumBins() (0 before prepare()).
+     * @return Pointer to an array of size getNumBins(); the size is 0 before
+     *         the first successful prepare() (a throwing first prepare()
+     *         included) and the pointer may then be null.
      */
     [[nodiscard]] const T* getPeakHoldDb() const noexcept
     {
@@ -326,13 +390,16 @@ public:
         return newDataReady_.exchange(false, std::memory_order_relaxed);
     }
 
-    /** @brief Number of spectrum bins (fftSize/2 + 1); 0 before prepare(). */
+    /** @brief Number of spectrum bins (fftSize/2 + 1); 0 before the first
+     *         successful prepare(). Always matches the allocated storage,
+     *         also after a throwing prepare(). */
     [[nodiscard]] int getNumBins() const noexcept { return numBins_; }
 
-    /** @brief FFT size in samples; 0 before prepare(). */
+    /** @brief FFT size in samples; 0 before the first successful prepare(). */
     [[nodiscard]] int getFFTSize() const noexcept { return fftSize_; }
 
-    /** @brief Centre frequency of the given bin in Hz (0 before prepare()). */
+    /** @brief Centre frequency of the given bin in Hz (0 before the first
+     *         successful prepare()). */
     [[nodiscard]] T binToFrequency(int bin) const noexcept
     {
         if (fftSize_ <= 0) return T(0);
@@ -340,21 +407,25 @@ public:
     }
 
 private:
-    void generateWindow(WindowType type)
+    /** @brief Fills dst with the requested window; returns the type actually
+     *         generated (a wild enum value falls back to Hann). Static and
+     *         member-free so prepare() can window into locals before any
+     *         member is committed (D-M008B-C3). */
+    [[nodiscard]] static WindowType generateWindow(T* dst, int size, WindowType type) noexcept
     {
         switch (type)
         {
-            case WindowType::Hamming: WindowFunctions<T>::hamming(window_.data(), fftSize_); break;
-            case WindowType::Blackman: WindowFunctions<T>::blackman(window_.data(), fftSize_); break;
-            case WindowType::BlackmanHarris: WindowFunctions<T>::blackmanHarris(window_.data(), fftSize_); break;
-            case WindowType::FlatTop: WindowFunctions<T>::flatTop(window_.data(), fftSize_); break;
-            case WindowType::Rectangular: WindowFunctions<T>::rectangular(window_.data(), fftSize_); break;
+            case WindowType::Hamming: WindowFunctions<T>::hamming(dst, size); break;
+            case WindowType::Blackman: WindowFunctions<T>::blackman(dst, size); break;
+            case WindowType::BlackmanHarris: WindowFunctions<T>::blackmanHarris(dst, size); break;
+            case WindowType::FlatTop: WindowFunctions<T>::flatTop(dst, size); break;
+            case WindowType::Rectangular: WindowFunctions<T>::rectangular(dst, size); break;
             case WindowType::Hann:
             default: // wild enum value: fall back to Hann (never a zeroed window)
-                WindowFunctions<T>::hann(window_.data(), fftSize_);
-                windowType_ = WindowType::Hann;
-                break;
+                WindowFunctions<T>::hann(dst, size);
+                return WindowType::Hann;
         }
+        return type;
     }
 
     void computeSpectrum() noexcept

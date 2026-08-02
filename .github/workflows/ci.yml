@@ -433,24 +433,30 @@ jobs:
       - name: Run under ThreadSanitizer
         run: ./dspark_conformance_tsan
 
-      # What this step actually proves concurrently: the suite's six
-      # cross-thread cases (SpinLock contention, SpscQueue producer/consumer,
-      # FIRFilter and Biquad seqlock publication, SpectrumAnalyzer triple
-      # buffer, AnalogRandom readout publication - the last two added by
-      # M-008B). Every other component runs single-threaded here, so for
-      # those TSan checks execution, not concurrency - see
+      # What this step actually proves concurrently: the suite's seven
+      # cross-thread cases over six hand-offs (SpinLock contention, SpscQueue
+      # producer/consumer, FIRFilter and Biquad seqlock publication,
+      # SpectrumAnalyzer triple buffer - counted once as a hand-off but
+      # covered by TWO cases, tear-free readout and paired-getter pointer
+      # lifetime -, AnalogRandom readout publication; the last three cases
+      # added by M-008B). Every other component runs single-threaded here, so
+      # for those TSan checks execution, not concurrency - see
       # tests/results/M-002/tsan-ci/handoff-coverage.md in the audit tree for
       # the full per-handoff statement.
       #
       # Timeout: per-test wall times are wildly non-uniform under TSan. In
       # run 30712892449 the first 143 cases took ~8.6 min, almost all of it
       # in the two seqlock stress cases (atomic-dense, contended, the exact
-      # thing TSan instruments hardest); the 547 cases after them hold no
-      # threaded code and ~19x the plain numeric work of the first 143.
-      # 5400 s covers the derived worst case (~35 min) with >2x margin (the
-      # two M-008B concurrency pins are bounded-loop cases far lighter than
-      # the seqlock stress pair). Never trim the suite to fit the budget:
-      # raise the budget.
+      # thing TSan instruments hardest); the 547 cases that followed them in
+      # THAT run held no threaded code and ~19x the plain numeric work of the
+      # first 143. The suite has since grown to 695 cases, five of them from
+      # M-008B (three concurrency pins, a lock-free census, and a
+      # single-threaded exception-safety pin), and one threaded case now sits
+      # past that boundary (the AnalogRandom readout pin). 5400 s still
+      # covers the derived worst case (~35 min) with >2x margin: every
+      # M-008B pin is a bounded-loop case far lighter than the seqlock
+      # stress pair. Never trim the suite to fit the budget: raise the
+      # budget.
       #
       # ctest -V, not --output-on-failure (D-M002-I4-R3): on success
       # --output-on-failure suppresses the harness's per-case listing, so a

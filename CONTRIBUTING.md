@@ -92,8 +92,17 @@ A change is ready when all of it is green.
   can fail to compile elsewhere. Include `<algorithm>`, `<vector>`, `<cmath>`
   and friends explicitly.
 - **No allocation on the audio thread.** Everything is pre-allocated in
-  `prepare()`.
+  `prepare()`. Anything shared between the control thread and the audio thread
+  follows [the threading model](docs/threading.md), which states the contract
+  once so each header only has to say which of its methods belongs where.
 - **No dependencies.** The C++ standard library only.
+- **Comments stand on their own.** A reader has this repository and nothing
+  else, so a comment must not cite a reference code -- an issue number, a
+  ticket tag, a design or planning document id -- that only resolves somewhere
+  they cannot reach. Write the reason out instead; that reason is the valuable
+  half, and it is the half a bare code throws away. Pointing at a commit in
+  this repository is fine. `python3 tools/check_comment_style.py` checks this
+  and runs in CI.
 
 ### Tests
 

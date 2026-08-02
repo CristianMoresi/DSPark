@@ -112,5 +112,5 @@ $RECYCLE.BIN/
 *.sh
 *.command
 
-# Carpeta de coordinacion de Universal Orchestrator (no versionar)
+# Local working notes, never part of the framework
 Universal-Orchestrator/

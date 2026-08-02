@@ -13,6 +13,18 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Comment style: comments and documentation must be self-contained. Cheap,
+  # so it runs first and on every push.
+  # ---------------------------------------------------------------------------
+  comment-style:
+    name: Comment style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for unresolvable reference codes
+        run: python3 tools/check_comment_style.py
+
+  # ---------------------------------------------------------------------------
   # Build + run the public conformance suite on every platform
   # ---------------------------------------------------------------------------
   conformance:
@@ -438,32 +450,32 @@ jobs:
       # producer/consumer, FIRFilter and Biquad seqlock publication,
       # SpectrumAnalyzer triple buffer - counted once as a hand-off but
       # covered by TWO cases, tear-free readout and paired-getter pointer
-      # lifetime -, AnalogRandom readout publication; the last three cases
-      # added by M-008B). Every other component runs single-threaded here, so
-      # for those TSan checks execution, not concurrency - see
-      # tests/results/M-002/tsan-ci/handoff-coverage.md in the audit tree for
-      # the full per-handoff statement.
+      # lifetime -, AnalogRandom readout publication). Every other component
+      # runs single-threaded here, so for those TSan checks execution, not
+      # concurrency. The list above IS the per-hand-off statement: a hand-off
+      # that no threaded case exercises concurrently is unproven, and gets
+      # reported as unproven rather than presented as proven.
       #
       # Timeout: per-test wall times are wildly non-uniform under TSan. In
       # run 30712892449 the first 143 cases took ~8.6 min, almost all of it
       # in the two seqlock stress cases (atomic-dense, contended, the exact
       # thing TSan instruments hardest); the 547 cases that followed them in
       # THAT run held no threaded code and ~19x the plain numeric work of the
-      # first 143. The suite has since grown to 694 cases, four of them from
-      # M-008B (three concurrency pins and a lock-free census), and one
-      # threaded case now sits past that boundary (the AnalogRandom readout
-      # pin). A fifth M-008B case, the single-threaded prepare()
+      # first 143. The suite has since grown to 694 cases, four of them
+      # concurrency-related (three concurrency pins and a lock-free census),
+      # and one threaded case now sits past that boundary (the AnalogRandom
+      # readout pin). A fifth such case, the single-threaded prepare()
       # exception-safety pin, is no longer part of the suite binary: it
       # installs replacement allocation functions, which are program-wide, so
       # it now builds and runs as its own executable (ctest test
       # alloc_failure) to keep the sanitizers' allocation checks live for the
       # suite. This step runs it too, at a cost of milliseconds. 5400 s still
       # covers the derived worst case (~35 min) with >2x margin: every
-      # M-008B pin is a bounded-loop case far lighter than the seqlock
+      # one of them is a bounded-loop case far lighter than the seqlock
       # stress pair. Never trim the suite to fit the budget: raise the
       # budget.
       #
-      # ctest -V, not --output-on-failure (D-M002-I4-R3): on success
+      # ctest -V, not --output-on-failure: on success
       # --output-on-failure suppresses the harness's per-case listing, so a
       # green log was not self-evidencing. -V surfaces every
       # "[ i/N ] case_name" line and the final "N tests | N passed" summary,

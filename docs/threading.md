@@ -99,16 +99,26 @@ seq.fetch_add(1, std::memory_order_release);      // -> even: complete
 dirty.store(true, std::memory_order_release);
 ```
 
-Reader, on the audio thread:
+Reader, on the audio thread. Every line of the comment marked `bounded seqlock
+read` is load-bearing; `tools/verify_threading_doc.py` finds the framework's
+audio-path readers by that marker and checks each one against this shape:
 
 ```cpp
 if (!dirty.exchange(false, std::memory_order_acquire)) return;  // nothing new
-do {
-    s0 = seq.load(std::memory_order_acquire);
-    // relaxed loads of every word into a THREAD-PRIVATE plain copy
+
+// bounded seqlock read: at most kSeqlockMaxAttempts validation attempts
+bool adopted = false;
+for (int attempt = 0; attempt < kSeqlockMaxAttempts; ++attempt)
+{
+    const unsigned s0 = seq.load(std::memory_order_acquire);
+    if ((s0 & 1u) != 0u) continue;   // writer mid-publish: do not copy at all
+    // relaxed loads of every word into a THREAD-PRIVATE plain destination
+    // that is NOT the set the hot path is currently reading
     std::atomic_thread_fence(std::memory_order_acquire);
-    s1 = seq.load(std::memory_order_relaxed);
-} while ((s0 & 1u) != 0u || s0 != s1);   // odd = writer was mid-update
+    if (s0 == seq.load(std::memory_order_relaxed)) { adopted = true; break; }
+}
+if (!adopted) { dirty.store(true, std::memory_order_release); return; }
+// commit the private copy -> active set (plain, audio-thread-private)
 ```
 
 Both fences are mandatory, not decoration. Without them the relaxed data
@@ -118,9 +128,39 @@ mistake. The pairing is the one [atomics.fences]/2 defines; the analysis is
 Boehm, *"Can Seqlocks Get Along With Programming Language Memory Models?"*,
 MSPC 2012.
 
+**The loop is bounded.** A reader that loses `kSeqlockMaxAttempts` attempts
+adopts nothing, keeps the coefficient set it is already using, and re-arms the
+dirty flag, so the update lands on a later call instead of holding the callback
+open. Bounding cannot make a torn set adoptable: the accept test is unchanged,
+and giving up adopts nothing. What it can do is deliver a parameter change one
+block late under sustained contention, which is the trade being made. Without
+the bound the reader's worst case is set by the writer's scheduling rather than
+by its own instruction count: with an 8192-tap FIR published from a control
+thread sharing one CPU with the audio thread -- the ordinary arrangement on the
+single-core embedded and wasm targets -- one `processBlock()` call was measured
+at 5.1 seconds.
+
+Two details of the shape are what make the bound safe rather than merely short.
+The oddness test sits **before** the copy, so meeting a writer mid-publish costs
+one relaxed load instead of a whole coefficient set copied and then discarded;
+that is what keeps three attempts affordable even from `processSample`, where
+"a later call" means the next sample. And the copy goes to a destination the
+hot path is **not** reading, committed only once it validates -- copying
+straight into the live set was safe only while the loop could not exit before
+the copy was valid, and a bounded loop that gave up would leave a torn mixture
+in force.
+
 Note what the reader does after accepting: it works from a **private plain
 copy**, never from the shared words. The per-sample loop is then ordinary
 non-atomic code and runs at the same speed it would with no hand-off at all.
+
+The bound applies to readers **on the audio thread**, and only there.
+Control- and GUI-thread readouts of the same published state keep the unbounded
+retry: they are not real-time, and they have no previously adopted copy to fall
+back on, so "try again" would be a worse answer than a microsecond of spinning.
+A seqlock reachable from both exposes both entry points -- a bounded
+`tryRead(T&)` for the audio path and an unbounded `read()` for the readouts --
+as `Effects/Equalizer.h` and `Effects/DynamicEQ.h` do.
 
 `Core/FIRFilter.h` (runtime-sized coefficient vector) and `Core/Biquad.h`
 (five named coefficients) are the reference implementations. A new hand-off
@@ -176,9 +216,27 @@ the control thread. The critical section is a single shared-pointer copy, so the
 audio thread normally waits nanoseconds; if the control thread is descheduled
 inside it, the audio thread spins for a whole scheduling quantum inside the
 callback, which is a dropout. The method states the trade where it is made, and
-a wait-free reclaim is backlogged. Nothing else in the framework's headers waits
-on the audio path: no other blocking lock, mutex, spin or atomic wait is reached
-from a processing call.
+a wait-free reclaim is backlogged.
+
+Two other things on the audio path repeat work, and neither is a wait. The
+seqlock readers above retry at most `kSeqlockMaxAttempts` times and then give
+up; the worst case is that many copies of one coefficient set -- measured at
+about 5 us for an 8192-tap FIR set, and proportional to the set size -- and it
+is set by DSPark's own instruction count, not by another thread's scheduling.
+`Analysis/SpectrumAnalyzer.h`'s `acquireLatestSlot()` is a lock-free CAS loop
+against a writer that holds nothing, so it cannot be made to wait either. Three
+magic statics are reachable from a processing call (`Core/MinBlepTable.h`,
+`Effects/AlgorithmicReverb.h`'s prime table, `Core/Hilbert.h`); each is forced
+on the setup thread by `prepare()` or at construction, so the guard is already
+resolved when the audio thread arrives.
+
+That list is deliberately a list of named things rather than a sentence about
+everything else. An unqualified negative claim over ninety headers is one no
+reader can check and one commit can silently falsify, so this page does not make
+one: what is claimed here is backed by `tools/verify_threading_doc.py`, which
+enumerates the audio-path multi-word readers positively -- every conforming one
+carries the `bounded seqlock read` marker -- and fails if a seqlock reader
+exists that is neither marked bounded nor listed there as a readout.
 
 ## Verifying a change
 

@@ -28,7 +28,17 @@ Tiers
      also not promise a compile-time guarantee it does not have, and its "most
      do not" must stay true of the headers whose atomic word type is a
      template parameter.
-  E  the seqlock reader snippet must be semantically equal to Core/Biquad.h's.
+  E  the seqlock reader snippet must be semantically equal to Core/Biquad.h's,
+     in the BOUNDED form: a counted loop, the oddness test before the copy, the
+     acquire fence, the unchanged accept test, and a give-up that re-arms.
+  F  every seqlock reader in the framework's headers, enumerated POSITIVELY and
+     classified. An audio-thread reader carries the marker `bounded seqlock
+     read` and is checked against the shape above; anything else must be named
+     in READOUTS below with the reason it is allowed to be unbounded. A grep
+     for loop syntax cannot do this job -- `} while (` matches the four readers
+     that existed when this was written and would miss a `for (;;) { break; }`
+     written next month -- so the tier keys on the accept guard every seqlock
+     reader must contain, and requires each one to say which kind it is.
 """
 
 import re
@@ -310,26 +320,233 @@ else:
         print("  the two sets are equal ({} word types)  OK".format(len(swept)))
     check_numeral(sweep_para[0], r"word types", "word types", len(swept))
 
+MARKER_BOUNDED = "bounded seqlock read"
+ATTEMPT_CONST = "kSeqlockMaxAttempts"
+ATTEMPT_VALUE = "3"
+
+FUNC_DEF = re.compile(
+    r"^\s*(?:\[\[nodiscard\]\]\s*)?(?:static\s+|inline\s+|constexpr\s+|explicit\s+"
+    r"|DSPARK_NOINLINE\s+)*"
+    r"[A-Za-z_][\w:<>,&*\s]*?\b(\w+)\s*\([^;]*\)\s*(?:const\s*)?(?:noexcept\s*)?$")
+
+
+def enclosing_function(lines, index):
+    """(name, first_line, last_line) of the function containing `index`.
+
+    The region returned starts at the function's doc comment, so a marker
+    written above the signature counts, and ends at its closing brace, so a
+    marker belonging to the NEXT function never does."""
+    start = None
+    for i in range(index, -1, -1):
+        m = FUNC_DEF.match(lines[i].rstrip())
+        if m and i + 1 < len(lines) and lines[i + 1].strip().startswith("{"):
+            start, name = i, m.group(1)
+            break
+    if start is None:
+        return None, index, index
+    doc = start
+    while doc > 0 and (lines[doc - 1].lstrip().startswith(("*", "/**", "//", "/*"))):
+        doc -= 1
+    depth, end = 0, start
+    for i in range(start + 1, len(lines)):
+        depth += lines[i].count("{") - lines[i].count("}")
+        if depth <= 0 and "}" in lines[i]:
+            end = i
+            break
+    return name, doc, end
+
+
+def reader_regions(path):
+    """Every seqlock reader in `path`: (name, region text, line number).
+
+    A reader is recognised by the accept guard every one of them must contain --
+    the oddness test on the sequence counter. Loop syntax is deliberately not
+    used: `} while (` matches the readers that existed when this was written and
+    would miss a `for (;;) { ... break; }` written next month."""
+    with open(path, "r", encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    out = []
+    for idx, line in enumerate(lines):
+        if re.search(r"&\s*1u", line):
+            name, first, last = enclosing_function(lines, idx)
+            out.append((name, "\n".join(lines[first:last + 1]), idx + 1, lines,
+                        first, last))
+    return out
+
+
 print("== tier E: seqlock reader snippet vs Core/Biquad.h ==")
+
+# The five properties a bounded reader must have. Each is (label, regex), and
+# the ORDER of the first three inside the text is checked as well: an oddness
+# test after the copy is the defect this shape exists to remove.
+BOUNDED_SHAPE = [
+    ("counted loop over kSeqlockMaxAttempts",
+     r"for\s*\([^)]*<\s*kSeqlockMaxAttempts\s*;"),
+    ("oddness test that skips the copy",
+     r"\(\s*s0\s*&\s*1u\s*\)\s*!=\s*0u\s*\)\s*continue"),
+    ("mandatory acquire fence",
+     r"std::atomic_thread_fence\(std::memory_order_acquire\)"),
+    ("accept test s0 == counter.load(relaxed)",
+     r"s0\s*==\s*\w+\.load\(std::memory_order_relaxed\)"),
+    ("give-up re-arms the dirty flag with release",
+     r"store\(true,\s*std::memory_order_release\)"),
+]
+
+
+REARM = BOUNDED_SHAPE[-1]
+
+
+def check_bounded_shape(text, where, require_rearm=True):
+    """Every property present, and the oddness test before the fence.
+
+    `require_rearm` is off for the split form: a `tryRead()` reports the give-up
+    to its caller instead of re-arming a flag it does not own, and the caller's
+    re-arm is checked at the call sites instead."""
+    pos = {}
+    for label, pattern in BOUNDED_SHAPE:
+        if label == REARM[0] and not require_rearm:
+            continue
+        m = re.search(pattern, text)
+        print("    {:48s} {}".format(label, "OK" if m else "<== MISSING"))
+        if not m:
+            failures.append("{}: {} has no {}".format(where[0], where[1], label))
+        else:
+            pos[label] = m.start()
+    odd = pos.get("oddness test that skips the copy")
+    fence = pos.get("mandatory acquire fence")
+    if odd is not None and fence is not None:
+        ordered = odd < fence
+        print("    {:48s} {}".format("oddness test precedes the copy/fence",
+                                     "OK" if ordered else "<== OUT OF ORDER"))
+        if not ordered:
+            failures.append("{}: {} tests oddness only AFTER copying"
+                            .format(where[0], where[1]))
+    if re.search(r"\bdo\s*\{", text):
+        failures.append("{}: {} still uses a do/while (unbounded) reader"
+                        .format(where[0], where[1]))
+
+
 reader = [b for b in fenced if "dirty.exchange" in b]
 if not reader:
     failures.append("E: reader snippet not found in the page")
 else:
-    snippet = reader[0]
-    if re.search(r"continue\s*;", snippet):
-        failures.append("E: snippet still uses `continue` inside a do-while "
-                        "(jumps to the condition, can accept a torn read)")
-    else:
-        print("  no `continue` inside the do-while  OK")
-    cond = re.search(r"\}\s*while\s*\((.*?)\);", snippet)
-    biq = open("Core/Biquad.h", encoding="utf-8").read()
-    ref = re.search(r"\}\s*while\s*\(\(s0 & 1u\) != 0u \|\| s0 != s1\);", biq)
-    print("  page condition : {}".format(cond.group(1) if cond else "<none>"))
-    print("  Core/Biquad.h has the reference condition: {}".format(bool(ref)))
-    if not cond or "& 1" not in cond.group(1) or "!=" not in cond.group(1):
-        failures.append("E: the loop condition does not test oddness AND equality")
-    if not ref:
-        failures.append("E: Core/Biquad.h no longer carries the reference condition")
+    print("  the page's reader snippet:")
+    check_bounded_shape(reader[0], ("E", "the page's reader snippet"))
+
+BIQUAD = "Core/Biquad.h"
+biq_bounded = [(n, r) for n, r, _, _, _, _ in reader_regions(BIQUAD)
+               if MARKER_BOUNDED in r]
+if not biq_bounded:
+    failures.append("E: Core/Biquad.h no longer carries a reader marked '{}'"
+                    .format(MARKER_BOUNDED))
+else:
+    name, region = biq_bounded[0]
+    print("  the reference implementation, Core/Biquad.h {}():".format(name))
+    check_bounded_shape(region, ("E", "Core/Biquad.h"))
+
+print("== tier F: audio-path seqlock readers, enumerated positively ==")
+
+# Seqlock readers that are allowed to be unbounded, each named with the reason.
+# The direction rule is what makes them safe: their reader is the control or
+# GUI thread, so nothing real-time is waiting. Adding a file here does NOT
+# exempt the rest of it -- entries are (file, function).
+READOUTS = {
+    ("Effects/Equalizer.h", "read"):
+        "control/GUI readout (getBandConfig, getMagnitudeForFrequencyArray); "
+        "no previously adopted copy to keep, not real-time",
+    ("Effects/DynamicEQ.h", "read"):
+        "control/GUI readout (getState); no previously adopted copy to keep, "
+        "not real-time",
+    ("Analysis/SpectrumAnalyzer.h", "snapshotFrame"):
+        "control/GUI readout (getMagnitudesDb, getPeakHoldDb); the audio thread "
+        "is the WRITER here, so this reader is not on the audio path. It is "
+        "bounded anyway, by kSnapshotAttempts, with its own previous-snapshot "
+        "fallback",
+}
+
+seq_headers = sorted(p for p in SOURCES
+                     if p.startswith(FRAMEWORK_DIRS) and p.endswith(".h")
+                     and "atomic_thread_fence" in CODE[p])
+print("  headers with a cross-thread fence (the seqlock population): {}".format(
+    len(seq_headers)))
+
+bounded_sites, readout_sites = [], []
+for path in seq_headers:
+    for name, region, idx, lines, first, last in reader_regions(path):
+        idx -= 1
+        marked = MARKER_BOUNDED in region
+        listed = (path, name) in READOUTS
+        label = "{}:{} {}()".format(path, idx + 1, name)
+        if marked:
+            bounded_sites.append(label)
+            print("  BOUNDED  {}".format(label))
+            selfrearm = re.search(REARM[1], region) is not None
+            check_bounded_shape(region, ("F", label), require_rearm=selfrearm)
+            if ATTEMPT_CONST not in region:
+                failures.append("F: {} is marked bounded but does not reference {}"
+                                .format(label, ATTEMPT_CONST))
+            if not selfrearm:
+                # Split form. The reader hands the give-up back as `false`, so
+                # the re-arm lives at every call site and that is where a
+                # forgotten one would silently drop a parameter update.
+                sites = [i for i, ln in enumerate(lines)
+                         if "." + name + "(" in ln and not (first <= i <= last)]
+                print("    split form: {} call site(s) must re-arm".format(len(sites)))
+                if not sites:
+                    failures.append("F: {} never re-arms and is never called; it "
+                                    "cannot be the audio-path reader it claims to be"
+                                    .format(label))
+                for i in sites:
+                    window = "\n".join(lines[i:i + 15])
+                    ok = re.search(REARM[1], window) is not None
+                    print("      {}:{} {}".format(path, i + 1, "re-arms  OK" if ok
+                                                  else "<== DOES NOT RE-ARM"))
+                    if not ok:
+                        failures.append(
+                            "F: {}:{} calls {}() and does not re-arm its dirty flag "
+                            "with release on the give-up path; the update would be "
+                            "dropped, not deferred".format(path, i + 1, name))
+        elif listed:
+            readout_sites.append(label)
+            print("  READOUT  {}  -- {}".format(label, READOUTS[(path, name)]))
+        else:
+            print("  {}   <== UNCLASSIFIED".format(label))
+            failures.append(
+                "F: {} is a seqlock reader that is neither marked '{}' nor listed "
+                "as a readout. Bound it, or list it with its reason."
+                .format(label, MARKER_BOUNDED))
+
+print("  {} bounded audio-path reader(s), {} listed readout(s)".format(
+    len(bounded_sites), len(readout_sites)))
+if not bounded_sites:
+    failures.append("F: no bounded audio-path reader found at all; the marker "
+                    "or this tier has drifted from the code")
+
+# The attempt bound is one constant, declared per site with one value.
+decls = []
+for path in seq_headers:
+    for m in re.finditer(r"static constexpr int " + ATTEMPT_CONST + r"\s*=\s*(\w+)\s*;",
+                         CODE[path]):
+        decls.append((path, m.group(1)))
+print("  {} declaration(s) of {}: {}".format(len(decls), ATTEMPT_CONST,
+                                             sorted(set(v for _, v in decls))))
+for path, value in decls:
+    if value != ATTEMPT_VALUE:
+        failures.append("F: {} declares {} = {}; every site must agree on {}"
+                        .format(path, ATTEMPT_CONST, value, ATTEMPT_VALUE))
+for label in bounded_sites:
+    host = label.split(":")[0]
+    if host not in [p for p, _ in decls]:
+        failures.append("F: {} is a bounded reader but its header declares no {}"
+                        .format(label, ATTEMPT_CONST))
+
+# The page has to carry the marker too, or nothing sends a reader from the
+# contract to the check that enforces it.
+if MARKER_BOUNDED not in doc:
+    failures.append("F: the page never writes the marker '{}' that this tier "
+                    "enumerates by".format(MARKER_BOUNDED))
+else:
+    print("  the page names the marker '{}'  OK".format(MARKER_BOUNDED))
 
 print("")
 if failures:

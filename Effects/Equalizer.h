@@ -12,13 +12,22 @@
  * memory allocations in the audio thread (the linear-phase engine, including
  * its recompute scratch, is fully pre-allocated in prepare()).
  *
- * Threading: prepare() belongs to the setup thread (allocates; never call it
- * concurrently with processing). processBlock()/processSample()/reset() belong
- * to the audio thread. Setters are atomic publications consumed at the next
- * block (or next processSample() call); band configs follow the single-writer
- * pattern (one control thread). Non-finite band fields are replaced with the
- * band's current values. getMagnitudeForFrequencyArray() and getBandConfig()
- * are unsynchronized analysis/UI reads.
+ * Threading (per method; the model is docs/threading.md):
+ * - Setup thread only, never concurrent with processing: prepare(), setState().
+ * - Audio thread (the one stream owner): processBlock(), processSample(),
+ *   reset().
+ * - Control thread (one writer): setBand(), setNumBands(), setBandEnabled(),
+ *   setFilterMode(), setSoftMode(), setMatchedBells(). Each band is published
+ *   through its own seqlock over std::atomic words, so the audio thread adopts
+ *   a whole band configuration or none of it; a change is consumed at the next
+ *   block (or the next processSample()). Non-finite band fields are replaced
+ *   with the band's current values.
+ * - Any thread: getBandConfig(), getMagnitudeForFrequencyArray(), getState(),
+ *   getNumBands(), getFilterMode(), getSoftMode(), getLatency(). The first two
+ *   read the same seqlock and hand back a private copy, so they never observe a
+ *   half-written band.
+ * - Processing thread only: getBandFilter(), which returns a reference to a
+ *   band's live FilterEngine (its contract, not the equalizer's).
  *
  * Dependencies: Filters.h (FilterEngine), AudioSpec.h, AudioBuffer.h,
  *               Biquad.h, DenormalGuard.h, DspMath.h, FFT.h, StateBlob.h.
@@ -91,6 +100,9 @@ public:
         int slope       = 12;               ///< Slope in dB/oct (LP/HP only: 6-48).
         bool enabled    = true;             ///< False to bypass this band.
     };
+
+    static_assert(std::atomic<T>::is_always_lock_free,
+                  "audio-thread stores must not lock");
 
     // -- Lifecycle --------------------------------------------------------------
 
@@ -312,7 +324,10 @@ public:
         if (index < 0 || index >= MaxBands) return;
 
         BandConfig cfg = config;
-        const BandConfig& prev = configs_[index];
+        // The fallback reads the control thread's own private master, never the
+        // published words: a setter must not race the audio thread to decide
+        // what "the band's current value" is.
+        const BandConfig& prev = masterConfigs_[index];
         if (!std::isfinite(cfg.frequency)) cfg.frequency = prev.frequency;
         if (!std::isfinite(cfg.gain))      cfg.gain      = prev.gain;
         if (!std::isfinite(cfg.q))         cfg.q         = prev.q;
@@ -320,7 +335,8 @@ public:
                                                     static_cast<int>(BandType::Tilt)));
         cfg.slope = std::clamp(cfg.slope, 6, 48);
 
-        configs_[index] = cfg;
+        masterConfigs_[index] = cfg;
+        staged_[index].publish(cfg);
         bandEnabled_[index].store(cfg.enabled, std::memory_order_release);
 
         int currentBands = numBands_.load(std::memory_order_relaxed);
@@ -355,7 +371,8 @@ public:
             cfg.slope     = 12;
             cfg.enabled   = true;
 
-            configs_[i] = cfg;
+            masterConfigs_[i] = cfg;
+            staged_[i].publish(cfg);
             bandEnabled_[i].store(true, std::memory_order_release);
         }
         configDirty_.store(true, std::memory_order_release);
@@ -385,13 +402,18 @@ public:
 
     /**
      * @brief Returns the current configuration of a band.
+     *
+     * Safe from any thread: the band is read through its seqlock into a private
+     * copy, so a configuration being published concurrently is either fully
+     * seen or fully missed, never mixed with the previous one.
+     *
      * @param index Band index.
      * @return Copy of the band's BandConfig.
      */
     [[nodiscard]] BandConfig getBandConfig(int index) const noexcept
     {
         if (index < 0 || index >= MaxBands) return {};
-        return configs_[index]; // Note: Struct copy is safe if mostly read from GUI
+        return staged_[index].read();
     }
 
     /**
@@ -403,7 +425,8 @@ public:
     {
         if (index >= 0 && index < MaxBands)
         {
-            configs_[index].enabled = enabled;
+            masterConfigs_[index].enabled = enabled;
+            staged_[index].publish(masterConfigs_[index]);
             bandEnabled_[index].store(enabled, std::memory_order_release);
             configDirty_.store(true, std::memory_order_release);
         }
@@ -481,10 +504,11 @@ public:
         const int activeBands = numBands_.load(std::memory_order_relaxed);
         for (int b = 0; b < activeBands; ++b)
         {
-            if (!configs_[b].enabled) continue;
+            const BandConfig cfg = staged_[b].read();
+            if (!cfg.enabled) continue;
 
             BiquadCoeffs st[5];
-            const int ns = buildBandStages(configs_[b], st);
+            const int ns = buildBandStages(cfg, st);
 
             for (int i = 0; i < numPoints; ++i)
             {
@@ -589,7 +613,14 @@ protected:
 
     /**
      * @brief Translates BandConfigs into internal FilterEngine parameters safely.
-     * Called by processBlock when configDirty_ is true.
+     *
+     * Audio thread; called by processBlock()/processSample() when configDirty_
+     * is true. Each band is pulled through its seqlock into a plain local, so
+     * the filter is configured from ONE publication. Reading the band by
+     * reference instead would let a concurrent setBand() land between two field
+     * reads and configure a filter with a frequency from one call and a slope
+     * from the next -- measured at ~3% of adoptions before this was a seqlock
+     * (tests/results/M-008C/torn-probe-before.log).
      */
     void updateActiveFilters() noexcept
     {
@@ -599,7 +630,7 @@ protected:
         for (int i = 0; i < activeBands; ++i)
         {
             auto& filter = bands_[i];
-            const auto& cfg = configs_[i]; // Thread-safe copy from atomic boundaries
+            const BandConfig cfg = staged_[i].read();
 
             float freq = static_cast<float>(cfg.frequency);
             float gain = static_cast<float>(cfg.gain);
@@ -738,10 +769,11 @@ protected:
         const double sr = spec_.sampleRate;
         for (int b = 0; b < activeBands; ++b)
         {
-            if (!configs_[b].enabled) continue;
+            const BandConfig cfg = staged_[b].read();
+            if (!cfg.enabled) continue;
 
             BiquadCoeffs st[5];
-            const int ns = buildBandStages(configs_[b], st);
+            const int ns = buildBandStages(cfg, st);
 
             for (int k = 0; k < numBins; ++k)
             {
@@ -869,7 +901,91 @@ protected:
     std::atomic<int> numBands_ { 0 };
 
     std::array<FilterEngine<T>, MaxBands> bands_ {};
-    std::array<BandConfig, MaxBands> configs_ {};
+
+    /**
+     * @brief One band's published configuration: a seqlock over atomic words.
+     *
+     * A BandConfig is a multi-word set with an invariant -- half of one
+     * publication combined with half of the next is not a configuration the
+     * caller ever asked for -- so it uses the canonical seqlock of
+     * docs/threading.md, matching Core/Biquad.h and Core/FIRFilter.h frame for
+     * frame. Every word crossing threads is std::atomic; nothing here is a
+     * plain scalar, and no reader ever holds a reference into this storage.
+     */
+    struct StagedBand
+    {
+        std::atomic<T>    frequency { T(1000) };
+        std::atomic<T>    gain      { T(0) };
+        std::atomic<T>    q         { T(0.707) };
+        std::atomic<int>  type      { static_cast<int>(BandType::Peak) };
+        std::atomic<int>  slope     { 12 };
+        std::atomic<bool> enabled   { true };
+        std::atomic<unsigned> seq   { 0 };
+
+        /**
+         * @brief Publishes a whole band configuration (control thread only).
+         *
+         * An odd sequence number marks a write in progress; a reader that
+         * observes one retries. The release fence is mandatory, not decoration:
+         * an acquire/release counter alone does not order the relaxed word
+         * stores against it, so without the fence a reader could see a
+         * mid-publish word while the counter still looked even
+         * ([atomics.fences]/2; Boehm, "Can Seqlocks Get Along With Programming
+         * Language Memory Models?", MSPC 2012). Control-thread only, so the
+         * audio path pays nothing for it.
+         */
+        void publish(const BandConfig& c) noexcept
+        {
+            seq.fetch_add(1, std::memory_order_acq_rel);   // -> odd
+            std::atomic_thread_fence(std::memory_order_release);
+            frequency.store(c.frequency, std::memory_order_relaxed);
+            gain.store(c.gain, std::memory_order_relaxed);
+            q.store(c.q, std::memory_order_relaxed);
+            type.store(static_cast<int>(c.type), std::memory_order_relaxed);
+            slope.store(c.slope, std::memory_order_relaxed);
+            enabled.store(c.enabled, std::memory_order_relaxed);
+            seq.fetch_add(1, std::memory_order_release);   // -> even
+        }
+
+        /**
+         * @brief Reads the band into a caller-private plain copy (any thread).
+         *
+         * The acquire fence keeps the word copy from sinking below the re-read
+         * of the counter: an acquire LOAD orders only later accesses, so
+         * without the fence a torn copy could pass the s0 == s1 check on a
+         * weakly ordered target or after compiler reordering. It also pairs
+         * with the writer's release fence, so a copy that read any mid-publish
+         * word cannot validate. The writer's critical section is six word
+         * stores, so this converges in at most a couple of iterations.
+         */
+        [[nodiscard]] BandConfig read() const noexcept
+        {
+            BandConfig c;
+            unsigned s0, s1;
+            do {
+                s0 = seq.load(std::memory_order_acquire);
+                c.frequency = frequency.load(std::memory_order_relaxed);
+                c.gain      = gain.load(std::memory_order_relaxed);
+                c.q         = q.load(std::memory_order_relaxed);
+                c.type      = static_cast<BandType>(type.load(std::memory_order_relaxed));
+                c.slope     = slope.load(std::memory_order_relaxed);
+                c.enabled   = enabled.load(std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_acquire);
+                s1 = seq.load(std::memory_order_relaxed);
+            } while ((s0 & 1u) != 0u || s0 != s1);
+            return c;
+        }
+    };
+
+    /// Published band configurations. The ONLY band storage both threads reach.
+    std::array<StagedBand, MaxBands> staged_ {};
+
+    /// Control-thread-private master copy. Never read by the audio thread or by
+    /// any readout: it exists so a setter can fall back to the band's current
+    /// value for a non-finite field without reading published storage. Single
+    /// writer by contract, so it needs no synchronization of its own.
+    std::array<BandConfig, MaxBands> masterConfigs_ {};
+
     // Per-band enable flag read lock-free every block. The full BandConfig is only
     // read under the configDirty_ acquire gate; `enabled` is toggled often and read
     // on the hot path, so it gets its own atomic to avoid a torn/unsynchronized read.

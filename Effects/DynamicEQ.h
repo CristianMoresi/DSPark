@@ -17,12 +17,16 @@
  *   Sidechain -> [Detector: BP / LP / HP per shape] -> Peak Detect -> Gain Computer -> Ballistics -> [Bell / Shelf EQ]
  * ```
  *
- * Threading model:
- * - prepare() / reset() / setOversampling() / getState() / setState(): setup
- *   or UI threads only, never concurrently with processBlock().
- * - setBand() (seqlock publish, single producer) / setNumBands() /
- *   setLookahead(): RT-safe from one control thread; the audio thread applies
- *   them at the next block. Non-finite band fields keep the previous value.
+ * Threading model (per method; the model is docs/threading.md):
+ * - prepare() / reset() / setOversampling() / setState(): setup or UI threads
+ *   only, never concurrently with processBlock().
+ * - setBand() / setNumBands() / setLookahead(): RT-safe from one control
+ *   thread; the audio thread applies them at the next block. Each band is
+ *   published through its own seqlock over std::atomic words, so the audio
+ *   thread adopts a whole band configuration or none of it. Non-finite band
+ *   fields keep the previous value.
+ * - getState() reads the same seqlock into a private copy, so it is safe from
+ *   any thread (it allocates, so keep it off the audio thread).
  * - getBandGainDb() is an atomic metering read; getLatency() is safe from any
  *   thread once prepared.
  * - Lookahead changes take effect immediately and may click (configure
@@ -99,12 +103,14 @@ public:
     };
 
     static_assert(std::is_trivially_copyable_v<BandConfig>, "BandConfig must be trivially copyable for std::atomic");
+    static_assert(std::atomic<T>::is_always_lock_free,
+                  "audio-thread stores must not lock");
 
     DynamicEQ()
     {
         for (int i = 0; i < MaxBands; ++i) {
-            configs_[i] = BandConfig{};
-            configSeq_[i].store(0, std::memory_order_relaxed);
+            masterConfigs_[i] = BandConfig{};
+            staged_[static_cast<size_t>(i)].publish(masterConfigs_[i]);
             paramsDirty_[i].store(true, std::memory_order_relaxed);
         }
     }
@@ -207,7 +213,10 @@ public:
         if (band < 0 || band >= MaxBands) return;
 
         BandConfig c = config;
-        const BandConfig& prev = configs_[static_cast<size_t>(band)];
+        // The fallback reads the control thread's own private master, never the
+        // published words: a setter must not race the audio thread to decide
+        // what "the band's previously published value" is.
+        const BandConfig& prev = masterConfigs_[static_cast<size_t>(band)];
         auto keep = [](T v, T fallback) { return std::isfinite(v) ? v : fallback; };
         c.frequency      = std::max(keep(c.frequency, prev.frequency), T(1));
         c.q              = keep(c.q, prev.q);
@@ -222,10 +231,8 @@ public:
         c.belowReleaseMs = keep(c.belowReleaseMs, prev.belowReleaseMs);
         c.belowRangeDb   = std::max(keep(c.belowRangeDb, prev.belowRangeDb), T(0));
 
-        // Seqlock publish (lock-free, no atomic<BigStruct> mutex).
-        configSeq_[band].fetch_add(1, std::memory_order_acq_rel); // odd
-        configs_[static_cast<size_t>(band)] = c;
-        configSeq_[band].fetch_add(1, std::memory_order_release); // even
+        masterConfigs_[static_cast<size_t>(band)] = c;
+        staged_[static_cast<size_t>(band)].publish(c);
         paramsDirty_[band].store(true, std::memory_order_release);
     }
 
@@ -315,7 +322,10 @@ public:
         char key[28];
         for (int i = 0; i < n; ++i)
         {
-            const BandConfig& c = configs_[static_cast<size_t>(i)];
+            // Seqlock read into a private copy: reading the band by reference
+            // here made getState() a plain cross-thread read of the words
+            // setBand() writes.
+            const BandConfig c = staged_[static_cast<size_t>(i)].read();
             std::snprintf(key, sizeof(key), "b%d.freq", i);
             w.write(key, static_cast<float>(c.frequency));
             std::snprintf(key, sizeof(key), "b%d.q", i);
@@ -542,19 +552,12 @@ private:
 
     void updateBandInternalState(int b, double fs) noexcept
     {
-        // Seqlock read of the published config (retry on a torn/in-progress
-        // write). The acquire fence between the copy and the relaxed re-read
-        // is required: an acquire LOAD only orders later accesses, so the
-        // copy could sink below the second read and a torn copy would pass
-        // the s0 == s1 check (same fix as Biquad's and FIRFilter's seqlocks).
-        BandConfig cfg;
-        unsigned s0, s1;
-        do {
-            s0  = configSeq_[b].load(std::memory_order_acquire);
-            cfg = configs_[static_cast<size_t>(b)];
-            std::atomic_thread_fence(std::memory_order_acquire);
-            s1  = configSeq_[b].load(std::memory_order_relaxed);
-        } while ((s0 & 1u) != 0u || s0 != s1);
+        // Seqlock read of the published config into a thread-private plain
+        // copy. Every word crossing threads is std::atomic (see StagedBand):
+        // copying the struct itself here, even under a correct counter, was a
+        // plain concurrent read of words the control thread writes and so a
+        // data race by the C++ model, not merely a torn-value hazard.
+        const BandConfig cfg = staged_[static_cast<size_t>(b)].read();
 
         // A band re-enabled after being disabled would replay arbitrarily old
         // filter history and gain state: start it clean.
@@ -632,11 +635,118 @@ private:
     double sampleRate_ = 0;
 
     std::atomic<int> numBands_ { 0 };
-    // BandConfig (~50 bytes) is NOT lock-free as std::atomic, so publish it via a
-    // per-band seqlock instead (single producer = control thread, single consumer
-    // = audio thread). configSeq_ odd = write in progress.
-    std::array<BandConfig, MaxBands> configs_ {};
-    std::array<std::atomic<unsigned>, MaxBands> configSeq_ {};
+
+    /**
+     * @brief One band's published configuration: a seqlock over atomic words.
+     *
+     * A BandConfig is a multi-word set with an invariant, so it uses the
+     * canonical seqlock of docs/threading.md, matching Core/Biquad.h and
+     * Core/FIRFilter.h frame for frame. Every word crossing threads is
+     * std::atomic: staging the struct itself, even inside a correct seqlock,
+     * is a plain concurrent read/write and therefore a data race by the C++
+     * memory model regardless of what the counter says.
+     */
+    struct StagedBand
+    {
+        std::atomic<T>    frequency      { T(1000) };
+        std::atomic<T>    q              { T(1.0) };
+        std::atomic<T>    threshold      { T(-20) };
+        std::atomic<int>  shape          { static_cast<int>(BandShape::Bell) };
+        std::atomic<bool> enabled        { true };
+
+        std::atomic<T>    aboveRatio     { T(1) };
+        std::atomic<T>    aboveAttackMs  { T(5) };
+        std::atomic<T>    aboveReleaseMs { T(50) };
+        std::atomic<T>    aboveRangeDb   { T(12) };
+        std::atomic<bool> aboveBoost     { false };
+
+        std::atomic<T>    belowRatio     { T(1) };
+        std::atomic<T>    belowAttackMs  { T(10) };
+        std::atomic<T>    belowReleaseMs { T(100) };
+        std::atomic<T>    belowRangeDb   { T(12) };
+        std::atomic<bool> belowBoost     { false };
+
+        std::atomic<unsigned> seq        { 0 };
+
+        /**
+         * @brief Publishes a whole band configuration (control thread only).
+         *
+         * An odd sequence number marks a write in progress; a reader that
+         * observes one retries. The release fence is mandatory: an
+         * acquire/release counter alone does not order the relaxed word stores
+         * against it, so without it a reader could observe a mid-publish word
+         * while the counter still looked even ([atomics.fences]/2; Boehm, "Can
+         * Seqlocks Get Along With Programming Language Memory Models?", MSPC
+         * 2012). Control-thread only: the audio path pays nothing for it.
+         */
+        void publish(const BandConfig& c) noexcept
+        {
+            seq.fetch_add(1, std::memory_order_acq_rel);   // -> odd
+            std::atomic_thread_fence(std::memory_order_release);
+            frequency.store(c.frequency, std::memory_order_relaxed);
+            q.store(c.q, std::memory_order_relaxed);
+            threshold.store(c.threshold, std::memory_order_relaxed);
+            shape.store(static_cast<int>(c.shape), std::memory_order_relaxed);
+            enabled.store(c.enabled, std::memory_order_relaxed);
+            aboveRatio.store(c.aboveRatio, std::memory_order_relaxed);
+            aboveAttackMs.store(c.aboveAttackMs, std::memory_order_relaxed);
+            aboveReleaseMs.store(c.aboveReleaseMs, std::memory_order_relaxed);
+            aboveRangeDb.store(c.aboveRangeDb, std::memory_order_relaxed);
+            aboveBoost.store(c.aboveBoost, std::memory_order_relaxed);
+            belowRatio.store(c.belowRatio, std::memory_order_relaxed);
+            belowAttackMs.store(c.belowAttackMs, std::memory_order_relaxed);
+            belowReleaseMs.store(c.belowReleaseMs, std::memory_order_relaxed);
+            belowRangeDb.store(c.belowRangeDb, std::memory_order_relaxed);
+            belowBoost.store(c.belowBoost, std::memory_order_relaxed);
+            seq.fetch_add(1, std::memory_order_release);   // -> even
+        }
+
+        /**
+         * @brief Reads the band into a caller-private plain copy (any thread).
+         *
+         * The acquire fence keeps the word copy from sinking below the re-read
+         * of the counter: an acquire LOAD orders only later accesses, so
+         * without the fence a torn copy could pass the s0 == s1 check on a
+         * weakly ordered target or after compiler reordering. It also pairs
+         * with the writer's release fence, so a copy that read any mid-publish
+         * word cannot validate.
+         */
+        [[nodiscard]] BandConfig read() const noexcept
+        {
+            BandConfig c;
+            unsigned s0, s1;
+            do {
+                s0 = seq.load(std::memory_order_acquire);
+                c.frequency      = frequency.load(std::memory_order_relaxed);
+                c.q              = q.load(std::memory_order_relaxed);
+                c.threshold      = threshold.load(std::memory_order_relaxed);
+                c.shape          = static_cast<BandShape>(shape.load(std::memory_order_relaxed));
+                c.enabled        = enabled.load(std::memory_order_relaxed);
+                c.aboveRatio     = aboveRatio.load(std::memory_order_relaxed);
+                c.aboveAttackMs  = aboveAttackMs.load(std::memory_order_relaxed);
+                c.aboveReleaseMs = aboveReleaseMs.load(std::memory_order_relaxed);
+                c.aboveRangeDb   = aboveRangeDb.load(std::memory_order_relaxed);
+                c.aboveBoost     = aboveBoost.load(std::memory_order_relaxed);
+                c.belowRatio     = belowRatio.load(std::memory_order_relaxed);
+                c.belowAttackMs  = belowAttackMs.load(std::memory_order_relaxed);
+                c.belowReleaseMs = belowReleaseMs.load(std::memory_order_relaxed);
+                c.belowRangeDb   = belowRangeDb.load(std::memory_order_relaxed);
+                c.belowBoost     = belowBoost.load(std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_acquire);
+                s1 = seq.load(std::memory_order_relaxed);
+            } while ((s0 & 1u) != 0u || s0 != s1);
+            return c;
+        }
+    };
+
+    /// Published band configurations. The ONLY band storage both threads reach.
+    std::array<StagedBand, MaxBands> staged_ {};
+
+    /// Control-thread-private master copy. Never read by the audio thread or by
+    /// any readout: it exists so a setter can fall back to the band's current
+    /// value for a non-finite field without reading published storage. Single
+    /// writer by contract, so it needs no synchronization of its own.
+    std::array<BandConfig, MaxBands> masterConfigs_ {};
     std::array<std::atomic<bool>, MaxBands> paramsDirty_ {};
     std::array<BandState, MaxBands> states_ {};
     // Precomputed freq/Q-dependent peak-EQ trig terms (per band) so the per-block

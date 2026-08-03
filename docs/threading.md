@@ -167,7 +167,18 @@ processing thread unless its own documentation says otherwise.
 thread never calls its blocking `lock()`; only `tryLock()` / `ScopedTryLock`,
 which cannot be made to wait on a control thread. An audio-thread reader that
 can block on a control-thread writer is priority inversion by construction, and
-the framework does not contain one.
+the framework contains exactly one, named here rather than left to be found.
+
+`Effects/Reverb.h` publishes its impulse-response bank behind a one-flag
+spinlock instead of a lock-free swap. `loadBank()` runs from `processBlock()`
+and spins on the flag `storeBank()` holds while `loadIR()` swaps a bank in from
+the control thread. The critical section is a single shared-pointer copy, so the
+audio thread normally waits nanoseconds; if the control thread is descheduled
+inside it, the audio thread spins for a whole scheduling quantum inside the
+callback, which is a dropout. The method states the trade where it is made, and
+a wait-free reclaim is backlogged. Nothing else in the framework's headers waits
+on the audio path: no other blocking lock, mutex, spin or atomic wait is reached
+from a processing call.
 
 ## Verifying a change
 

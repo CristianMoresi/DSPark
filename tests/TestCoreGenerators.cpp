@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <span>
@@ -1341,7 +1342,15 @@ DSPARK_TEST(AnalogRandom_concurrent_readout_is_published_and_bounded)
         }
     });
     std::thread control([&] {
-        int i = 0;
+        // 64-bit, and it has to be: this thread lives until the reader below
+        // stops, and that is now bounded in WALL TIME (10 s), not in reads.
+        // Measured, not predicted: this loop retires 226 M iterations/s built
+        // with ASan+UBSan at -O2 and 905 M/s optimised, so a 32-bit counter
+        // passes INT_MAX at t = 9.5 s and t = 2.4 s -- inside the deadline,
+        // both of them. That is signed overflow, i.e. undefined behaviour, and
+        // under -fno-sanitize-recover=all it aborts the whole binary instead
+        // of letting this test report its own verdict.
+        long long i = 0;
         while (!stop.load(std::memory_order_relaxed))
         {
             gen->setRange((i & 1) ? -0.5f : -1.0f, (i & 1) ? 0.5f : 1.0f);
@@ -1350,8 +1359,18 @@ DSPARK_TEST(AnalogRandom_concurrent_readout_is_published_and_bounded)
         }
     });
 
-    int violations = 0;
-    int distinct = 0;
+    // 64-bit for the same reason as the control counter above, and here it is
+    // the FAILURE path that needs it: a readout stuck on an out-of-range value
+    // scores 2 violations per read, this loop retires ~1e9 reads inside the
+    // deadline, and an int overflows at 9.3 s -- so the very assertion that
+    // exists to report the failure would abort the binary instead of naming
+    // it. Measured against a generator whose published words are frozen out of
+    // range: as an int it dies on UBSan; as a long long it reports 1.9e9.
+    long long violations = 0;
+    int distinct = 0;   // safe as an int: it only advances on a published
+                        // change, and whichever exit condition is keeping this
+                        // loop alive also caps it (at 100, at 4096 or at
+                        // 200000 -- see the three of them below).
     float lastV = 0.0f;
     long long reads = 0;
     const int kOverlapTarget = 100;

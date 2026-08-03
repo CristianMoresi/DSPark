@@ -393,11 +393,26 @@ public:
     /**
      * @brief Direct access to a channel's Convolver (GUI thread only).
      *
-     * NOTE: the live convolver bank is published atomically and may be
-     * replaced by a future loadIR() call. This accessor returns a reference
-     * into the currently-published bank and MUST NOT be used from the audio
-     * thread. Before an IR is loaded (or with an out-of-range channel) it
-     * returns an inert fallback engine instead of dereferencing a null bank.
+     * Lifetime of the returned reference: valid until YOUR next call to
+     * getConvolver() on this object, or until the object is destroyed. It is
+     * NOT invalidated by a concurrent loadIR() / setDecayScale() / setStretch()
+     * / setState() / prepare(), because this accessor pins the bank it hands a
+     * reference into (see `pinnedBank_`); the publication those calls make
+     * simply is not what you are looking at any more, so what you hold is the
+     * bank as of your call, kept alive for you.
+     *
+     * Getting that wrong is what this accessor used to do: it took a local
+     * snapshot of the bank, returned a reference into it, and let the snapshot
+     * die at the closing brace -- so the next publication freed the storage
+     * under the caller's reference (a heap-use-after-free reachable
+     * single-threaded through this documented usage). Ownership at the moment
+     * of the call is not the same question as how long the result lives.
+     *
+     * Still GUI thread only, and still not for the audio thread: one caller
+     * owns the pin, and the Convolver it hands back is not synchronized with
+     * the audio thread's use of the live bank. Before an IR is loaded (or with
+     * an out-of-range channel) it returns an inert fallback engine instead of
+     * dereferencing a null bank.
      *
      * @param channel Channel index (clamped into the bank's range).
      */
@@ -405,13 +420,28 @@ public:
     {
         auto bank = loadBank();
         if (!bank || bank->convolvers.empty())
+        {
+            pinnedBank_.reset();
             return fallbackConvolver_;
+        }
         const int n = static_cast<int>(bank->convolvers.size());
         channel = std::clamp(channel, 0, n - 1);
-        return bank->convolvers[static_cast<size_t>(channel)];
+        // Pin it: the reference below points INTO this bank, and `bank` itself
+        // dies when this function returns. The pin is what keeps the caller's
+        // reference alive past the next publication.
+        pinnedBank_ = std::move(bank);
+        return pinnedBank_->convolvers[static_cast<size_t>(channel)];
     }
 
-    /** @brief Direct access to the DryWetMixer. */
+    /**
+     * @brief Direct access to the DryWetMixer (processing thread).
+     *
+     * The mixer is live audio-thread state: it carries the dry-signal history
+     * processBlock() writes every block. The reference itself never dangles
+     * (the mixer is a member, so it lives as long as this object), but reading
+     * or mutating it from another thread while audio runs is unsynchronized.
+     * Treat it as belonging to the thread that owns processBlock().
+     */
     DryWetMixer<T>& getMixer() { return mixer_; }
 
     /** @brief Returns true if an IR has been loaded and applied. */
@@ -722,6 +752,11 @@ protected:
 
     mutable std::atomic_flag bankLock_ = ATOMIC_FLAG_INIT;
     std::shared_ptr<ConvolverBank> bankPtr_;
+    /// Keeps alive whatever bank getConvolver() last handed a reference into.
+    /// GUI thread only, like getConvolver() itself; never read by the audio
+    /// thread. Costs one retired bank's memory until the next call, which is
+    /// the price of the accessor returning a reference at all.
+    std::shared_ptr<ConvolverBank> pinnedBank_;
     std::vector<RingBuffer<T>> preDelayBuffers_;
     DryWetMixer<T> mixer_;
     Convolver<T> fallbackConvolver_; ///< Inert engine for getConvolver() with no bank.

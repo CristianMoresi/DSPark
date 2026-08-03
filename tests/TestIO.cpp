@@ -831,3 +831,105 @@ DSPARK_TEST(Mp3File_frame_truncated_before_side_info_is_not_overread)
     EXPECT_NO_NAN(buf.getChannel(0), static_cast<int>(info.numSamples));
     r.close();
 }
+
+// ISO 11172-3 2.4.1.7 orders a big_values pair as hcod, linbits(x), sign(x),
+// linbits(y), sign(y). Reading both escapes before both signs consumes the same
+// number of bits, so nothing looks wrong locally, but it assigns them to the
+// wrong fields whenever y escapes while x is non-zero -- and from there the
+// rest of the granule is garbage.
+//
+// Two frames differ only in the 10-bit linbits field of the single coded pair
+// (x=1, y=15+linbits, Huffman table 22). Because both carry the same
+// global_gain and an all-zero scalefactor set, the ratio of their decoded
+// energies is fixed by the ISO requantisation formula alone and is independent
+// of any filterbank scaling: (1038/15)^(8/3) = 8.05e4. Reading the escape
+// before the sign yields y=526 instead of 1038 and a ratio of 1.3e4.
+DSPARK_TEST(Mp3File_escape_pair_reads_linbits_then_sign)
+{
+    FileCleanup c1 { "dspark_test_esc_hi.mp3" };
+    FileCleanup c2 { "dspark_test_esc_lo.mp3" };
+
+    auto side = [](Mp3TestBits& b) {
+        // granule 0 carries the pair: part2_3_length = 8 + 1 + 10 + 1 = 20 bits
+        b.put(20, 12); b.put(1, 9); b.put(150, 8); b.put(0, 4); b.put(0, 1);
+        b.put(22, 5); b.put(0, 5); b.put(0, 5); b.put(0, 4); b.put(0, 3);
+        b.put(0, 1); b.put(0, 1); b.put(0, 1);
+        // granule 1 silent
+        b.put(0, 12); b.put(0, 9); b.put(210, 8); b.put(0, 4); b.put(0, 1);
+        b.put(0, 5); b.put(0, 5); b.put(0, 5); b.put(0, 4); b.put(0, 3);
+        b.put(0, 1); b.put(0, 1); b.put(0, 1);
+    };
+    // kHuff16 entry for (x=1, y=15) is length 8, code 0x09.
+    auto payload = [](uint32_t linbits) {
+        return [linbits](Mp3TestBits& b) {
+            b.put(0x09, 8);       // hcod (1, 15)
+            b.put(0, 1);          // sign(x) -> x = +1
+            b.put(linbits, 10);   // linbits(y)
+            b.put(0, 1);          // sign(y) -> y = +(15 + linbits)
+        };
+    };
+
+    mp3WriteFile("dspark_test_esc_hi.mp3", mp3CraftFrame(side, payload(1023)), 6);
+    mp3WriteFile("dspark_test_esc_lo.mp3", mp3CraftFrame(side, payload(0)), 6);
+
+    const double eHi = mp3DecodeEnergy("dspark_test_esc_hi.mp3");
+    const double eLo = mp3DecodeEnergy("dspark_test_esc_lo.mp3");
+    EXPECT_GT(eHi, 0.0);
+    EXPECT_GT(eLo, 0.0);
+
+    const double ratio = eHi / eLo;
+    EXPECT_GT(ratio, 4.0e4);   // correct: 8.05e4, escape-before-sign: 1.3e4
+    EXPECT_LT(ratio, 1.6e5);
+}
+
+// scfsi (ISO 11172-3 2.4.2.7): a set scfsi band makes granule 1 REUSE granule
+// 0's scalefactors for that band group instead of re-sending them. Clearing the
+// scalefactor array at the top of the granule threw the inherited values away
+// and requantised those bands with no attenuation at all.
+//
+// The two files below must decode identically: one inherits scalefactor band
+// group 0 through scfsi, the other re-sends the same values explicitly. With
+// scalefac[0]=7 and scalefac_scale=0 the inherited attenuation is 2^-3.5, so
+// losing it makes granule 1 about 128x louder in energy.
+DSPARK_TEST(Mp3File_scfsi_granule1_inherits_granule0_scalefactors)
+{
+    FileCleanup c1 { "dspark_test_scfsi_on.mp3" };
+    FileCleanup c2 { "dspark_test_scfsi_off.mp3" };
+
+    // scalefac_compress = 4 -> slen1 = 3, slen2 = 0: 11 x 3 = 33 scalefactor bits.
+    // Huffman: table 1, pair (1,1) = code 0b000 (3 bits) + two sign bits.
+    auto granuleSide = [](Mp3TestBits& b, int part23) {
+        b.put(uint32_t(part23), 12); b.put(1, 9); b.put(200, 8); b.put(4, 4); b.put(0, 1);
+        b.put(1, 5); b.put(0, 5); b.put(0, 5); b.put(0, 4); b.put(0, 3);
+        b.put(0, 1); b.put(0, 1); b.put(0, 1);
+    };
+    auto scalefactorsFull = [](Mp3TestBits& b) {
+        b.put(7, 3);                                  // sfb 0
+        for (int i = 1; i < 11; ++i) b.put(0, 3);     // sfb 1..10
+    };
+    auto huff = [](Mp3TestBits& b) { b.put(0b000, 3); b.put(0, 1); b.put(0, 1); };
+
+    // scfsi = 0b1000: band group 0 (sfb 0..5) inherited by granule 1.
+    mp3WriteFile("dspark_test_scfsi_on.mp3", mp3CraftFrame(
+        [&](Mp3TestBits& b) { granuleSide(b, 38); granuleSide(b, 20); },
+        [&](Mp3TestBits& b) {
+            scalefactorsFull(b);                            // granule 0
+            huff(b);
+            for (int i = 0; i < 5; ++i) b.put(0, 3);        // granule 1: sfb 6..10 only
+            huff(b);
+        }, 0b1000), 6);
+
+    // Control: no inheritance, granule 1 re-sends the identical scalefactors.
+    mp3WriteFile("dspark_test_scfsi_off.mp3", mp3CraftFrame(
+        [&](Mp3TestBits& b) { granuleSide(b, 38); granuleSide(b, 38); },
+        [&](Mp3TestBits& b) {
+            scalefactorsFull(b); huff(b);
+            scalefactorsFull(b); huff(b);
+        }, 0), 6);
+
+    const double eOn  = mp3DecodeEnergy("dspark_test_scfsi_on.mp3");
+    const double eOff = mp3DecodeEnergy("dspark_test_scfsi_off.mp3");
+    EXPECT_GT(eOn, 0.0);
+    EXPECT_GT(eOff, 0.0);
+    EXPECT_NEAR(eOn / eOff, 1.0, 0.02);   // pre-fix the inheriting file measured ~65x
+}

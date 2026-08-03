@@ -1256,13 +1256,14 @@ private:
 
         if (!decodeHuffSymbol(br, codes, codeCount, x, y)) return false;
 
-        if (linbits > 0)
-        {
-            if (x == 15) x += static_cast<int>(br.readBits(linbits));
-            if (y == 15) y += static_cast<int>(br.readBits(linbits));
-        }
-
+        // ISO 11172-3 2.4.1.7 orders each pair as hcod, then linbits(x),
+        // sign(x), then linbits(y), sign(y). Reading both escapes before both
+        // signs consumes the same number of bits but assigns them to the wrong
+        // fields as soon as an escape meets a non-zero partner, which
+        // desynchronises the rest of the granule.
+        if (linbits > 0 && x == 15) x += static_cast<int>(br.readBits(linbits));
         if (x != 0 && br.readBit()) x = -x;
+        if (linbits > 0 && y == 15) y += static_cast<int>(br.readBits(linbits));
         if (y != 0 && br.readBit()) y = -y;
 
         return true;
@@ -1375,7 +1376,14 @@ private:
     void decodeScalefactors(BitReader& br, const GranuleChannel& gc, int gr, int /*ch*/,
                             int scfsi, int scalefac[39], size_t& bitsRead) const
     {
-        std::memset(scalefac, 0, 39 * sizeof(int));
+        // scfsi (ISO 11172-3 2.4.2.7) lets granule 1 REUSE granule 0's
+        // scalefactors for a band group instead of re-sending them, and the
+        // caller seeds `scalefac` with granule 0's values for exactly that
+        // reason. Clearing the whole array first threw those values away and
+        // requantised the inherited bands with a scalefactor of 0, i.e. with no
+        // attenuation at all. Short blocks never inherit, so they still reset.
+        const bool shortBlock = gc.window_switching && gc.block_type == 2;
+        if (gr == 0 || shortBlock) std::memset(scalefac, 0, 39 * sizeof(int));
         int slen1 = kSlen1[gc.scalefac_compress];
         int slen2 = kSlen2[gc.scalefac_compress];
         size_t startBits = br.getPos();
@@ -1410,12 +1418,10 @@ private:
 
             for (int group = 0; group < 4; ++group)
             {
+                if (gr == 1 && (scfsi & (8 >> group))) continue; // inherited, keep seeded values
                 int slen = (lens[group] == 0) ? slen1 : slen2;
-                if (!(gr == 1 && (scfsi & (8 >> group))))
-                {
-                    for (int sfb = bandStart[group]; sfb < bandEnd[group]; ++sfb)
-                        scalefac[sfb] = static_cast<int>(br.readBits(slen));
-                }
+                for (int sfb = bandStart[group]; sfb < bandEnd[group]; ++sfb)
+                    scalefac[sfb] = static_cast<int>(br.readBits(slen));
             }
         }
         bitsRead = br.getPos() - startBits;
@@ -1633,7 +1639,11 @@ private:
     {
         if (gc.window_switching && gc.block_type == 2 && !gc.mixed_block) return;
         static const AliasCoeffs ac = getAliasCoeffs();
-        int sbLimit = gc.window_switching ? 1 : 31;
+        // Only a MIXED short block restricts alias reduction to the single
+        // long/long boundary it still has. block_type 1 and 3 (start/stop) are
+        // ordinary long blocks and set window_switching too, so keying the
+        // limit off window_switching left 30 of their 31 butterflies undone.
+        int sbLimit = (gc.window_switching && gc.block_type == 2) ? 1 : 31;
 
         for (int sb = 0; sb < sbLimit; ++sb)
         {

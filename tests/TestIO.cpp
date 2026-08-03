@@ -995,3 +995,45 @@ DSPARK_TEST(Mp3File_encoder_output_decodes_back_to_its_input)
     }
     EXPECT_GT(best, 0.70);   // pre-fix this measured 0.008 - 0.024
 }
+
+// 8-bit WAV is unsigned with 128 as zero and the reader scales by 128, but the
+// writer scaled by 127. Every 8-bit round trip therefore came back 0.78% quiet
+// - a whole quantisation step of SYSTEMATIC error, on top of quantisation. With
+// both sides on the same grid, every value that the 128-step scale can express
+// round-trips to within half a step and -1.0 is exact; only +1.0 clamps, which
+// the scale itself forces.
+DSPARK_TEST(WavFile_8bit_roundtrip_has_no_systematic_gain_error)
+{
+    FileCleanup cleanup { "dspark_test_8bit_gain.wav" };
+
+    const float probes[] = { -1.0f, -0.75f, -0.5f, -0.25f, 0.0f, 0.25f, 0.5f, 0.75f };
+    constexpr int N = 8;
+
+    {
+        WavFile w;
+        AudioFileInfo info;
+        info.sampleRate = 44100.0;
+        info.numChannels = 1;
+        info.bitsPerSample = 8;
+        info.isFloatingPoint = false;
+        info.numSamples = N;
+        EXPECT_TRUE(w.openWrite("dspark_test_8bit_gain.wav", info));
+        AudioBuffer<float> b;
+        b.resize(1, N);
+        for (int i = 0; i < N; ++i) b.getChannel(0)[i] = probes[i];
+        EXPECT_TRUE(w.writeSamples(std::as_const(b).toView()));
+        w.close();
+    }
+
+    WavFile r;
+    EXPECT_TRUE(r.openRead("dspark_test_8bit_gain.wav"));
+    AudioBuffer<float> b;
+    b.resize(1, N);
+    EXPECT_TRUE(r.readSamples(b.toView()));
+    r.close();
+
+    // Every probe sits exactly on the 128-step grid, so the round trip is exact.
+    for (int i = 0; i < N; ++i)
+        EXPECT_NEAR(b.getChannel(0)[i], probes[i], 1e-6f);
+    EXPECT_BOUNDED(b.getChannel(0), N, -1.0f, 1.0f);
+}

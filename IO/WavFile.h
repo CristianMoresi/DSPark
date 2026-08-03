@@ -613,7 +613,13 @@ private:
 
                 // Precise rounding & strict clipping bounds
                 if constexpr (Bits == 8) {
-                    auto val = static_cast<uint8_t>(std::clamp(std::round(value * 127.0f) + 128.0f, 0.0f, 255.0f));
+                    // 8-bit WAV is unsigned with 128 as zero, and the reader
+                    // scales by 128. Writing with 127 put every sample on a
+                    // different grid, so an 8-bit round trip came back 0.78%
+                    // quiet - a whole quantisation step of systematic error on
+                    // top of the quantisation itself. Only +1.0 now clamps,
+                    // which is inherent to the 128-step scale.
+                    auto val = static_cast<uint8_t>(std::clamp(std::round(value * 128.0f) + 128.0f, 0.0f, 255.0f));
                     ptr[0] = val;
                 }
                 else if constexpr (Bits == 16) {

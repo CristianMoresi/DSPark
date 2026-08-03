@@ -1533,3 +1533,74 @@ DSPARK_TEST(Mp3File_encoder_decoder_cascade_has_unity_gain)
     EXPECT_LT(residualDb, -40.0);
 }
 
+// A MIXED block (block_type 2 with mixed_block_flag 1) keeps subbands 0 and 1
+// long and switches the rest to three short windows. Its short region therefore
+// begins where the long region ends, at longBands[8] == 3*shortBands[3] == 36,
+// and band sfb sits at the CUMULATIVE offset 36 + 3*(shortBands[sfb] -
+// shortBands[3]) - the same cumulative rule the non-mixed path uses, offset by
+// the long region. LAME never emits mixed blocks, so no recorded fixture reaches
+// this path and it has to be crafted. This frame puts one value at bitstream
+// index 240, which is band 10 window 0 line 0 at 48 kHz: frequency line 80, i.e.
+// subband 13, 9750..10500 Hz. Scaling the band index by the current band's width
+// instead put it outside the granule, where a bounds guard discarded it.
+DSPARK_TEST(Mp3File_mixed_block_short_region_uses_cumulative_band_offsets)
+{
+    FileCleanup cleanup { "dspark_test_mixed.mp3" };
+
+    auto side = [](Mp3TestBits& b) {
+        for (int gr = 0; gr < 2; ++gr)
+        {
+            b.put(123, 12); b.put(121, 9); b.put(190, 8); b.put(0, 4); b.put(1, 1);
+            b.put(2, 2); b.put(1, 1);              // block_type 2, MIXED
+            b.put(1, 5); b.put(1, 5);
+            b.put(0, 3); b.put(0, 3); b.put(0, 3);
+            b.put(0, 1); b.put(0, 1); b.put(0, 1);
+        }
+    };
+    auto main_ = [](Mp3TestBits& b) {
+        for (int gr = 0; gr < 2; ++gr)
+        {
+            for (int i = 0; i < 120; ++i) b.put(0b1, 1);   // (0,0) up to index 239
+            b.put(0b01, 2); b.put(0, 1);                   // (1,0) at 240, 241
+        }
+    };
+    mp3WriteFile("dspark_test_mixed.mp3", mp3CraftFrame(side, main_), 8);
+
+    Mp3File r;
+    EXPECT_TRUE(r.openRead("dspark_test_mixed.mp3"));
+    auto info = r.getInfo();
+    EXPECT_TRUE(info.numSamples >= 3072);
+    AudioBuffer<float> buf;
+    buf.resize(1, static_cast<int>(info.numSamples));
+    EXPECT_TRUE(r.readSamples(buf.toView()));
+    r.close();
+    EXPECT_NO_NAN(buf.getChannel(0), static_cast<int>(info.numSamples));
+
+    constexpr int kN = 2048;
+    constexpr int kOff = 1152;
+    const double fs = 48000.0;
+    const float* x = buf.getChannel(0);
+    auto binMag = [&](int k) {
+        double re = 0.0, im = 0.0;
+        for (int nn = 0; nn < kN; ++nn)
+        {
+            const double a = 2.0 * pi<double> * double(k) * double(nn) / double(kN);
+            re += double(x[kOff + nn]) * std::cos(a);
+            im -= double(x[kOff + nn]) * std::sin(a);
+        }
+        return std::sqrt(re * re + im * im);
+    };
+
+    // Subband 13 spans 13*fs/64 .. 14*fs/64 == 9750..10500 Hz.
+    const int lo = int(9750.0 * kN / fs);
+    const int hi = int(10500.0 * kN / fs);
+    double inBand = 0.0, outBand = 0.0;
+    for (int k = 1; k <= kN / 2; ++k)
+    {
+        const double m = binMag(k);
+        if (k >= lo && k <= hi) inBand = std::max(inBand, m);
+        else                    outBand = std::max(outBand, m);
+    }
+    EXPECT_GT(inBand, 1.0);                                   // pre-fix: digital silence
+    EXPECT_LT(20.0 * std::log10(outBand / inBand), -20.0);    // and it is where it belongs
+}

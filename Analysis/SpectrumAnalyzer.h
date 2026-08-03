@@ -23,17 +23,25 @@
  * - pushSamples(): audio thread (stream owner). No-op before prepare().
  * - getMagnitudesDb() / getPeakHoldDb() / isNewDataReady(): ONE reader
  *   thread (GUI). Wait-free triple-buffer hand-off; never blocks the writer.
+ *   Frame-coherence contract: the array a getter returns always holds bins
+ *   that all come from ONE analysis frame, however slow the reader is
+ *   relative to the writer. The copy is validated against the frame's
+ *   seqlock and is committed only if it completed against a single frame;
+ *   a copy that did not is discarded, the previous (coherent, one frame
+ *   older) snapshot is returned instead, and getStaleSnapshotCount()
+ *   increments. A torn mixture of two frames is never returned.
  *   Pointer-validity contract: each getter adopts the freshest published
  *   frame and copies it into reader-private snapshot storage; the returned
- *   pointer refers to that snapshot, NEVER into the hand-off slots. Its
- *   contents are overwritten only by the reader's own next call to the SAME
- *   getter or by the setup-only reset()/prepare() (a throwing prepare()
- *   leaves them untouched), and the pointer itself is invalidated only by a
- *   SUCCESSFUL prepare(). No other thread ever writes through a returned
- *   pointer, so the reader may hold it across frames (the values simply go
- *   stale). A consecutive getMagnitudesDb()/getPeakHoldDb() pair may
- *   represent adjacent analysis frames; each snapshot is internally
- *   frame-coherent.
+ *   pointer refers to that snapshot, NEVER into the hand-off slots. Each
+ *   getter alternates between TWO such buffers, so a returned pointer
+ *   survives the reader's next call to the same getter and its contents are
+ *   reused only by the call after that (or by the setup-only
+ *   reset()/prepare(); a throwing prepare() leaves them untouched); the
+ *   pointer itself is invalidated only by a SUCCESSFUL prepare(). No other
+ *   thread ever writes through a returned pointer, so the reader may hold
+ *   it across frames (the values simply go stale). A consecutive
+ *   getMagnitudesDb()/getPeakHoldDb() pair may represent adjacent analysis
+ *   frames; each snapshot is internally frame-coherent.
  * - setSmoothing() / setPeakDecay() / setPeakHoldEnabled() / setFloorDb():
  *   control thread (ONE non-audio writer, per the framework's SPSC thread
  *   model; single-word relaxed atomics, picked up once per analysis frame).
@@ -167,21 +175,26 @@ public:
         std::vector<T> peakState(static_cast<size_t>(numBins), floorDb);
 
         // Triple buffer for tear-free cross-thread reading (relaxed-atomic
-        // words; ordering comes from the pendingSlot_ RMWs, see below).
+        // words; ordering comes from the pendingSlot_ RMWs and from each
+        // slot's own seqlock counter, see below).
         std::array<OutSlot, 3> slots;
         for (auto& slot : slots)
         {
             slot.magnitudesDb = std::make_unique<std::atomic<T>[]>(static_cast<size_t>(numBins));
             slot.peakDb = std::make_unique<std::atomic<T>[]>(static_cast<size_t>(numBins));
+            slot.seq = std::make_unique<std::atomic<unsigned>>(0u);
             for (int k = 0; k < numBins; ++k)
             {
                 slot.magnitudesDb[static_cast<size_t>(k)].store(floorDb, std::memory_order_relaxed);
                 slot.peakDb[static_cast<size_t>(k)].store(floorDb, std::memory_order_relaxed);
             }
         }
-        // Reader-private snapshot storage backing the getter return pointers.
-        std::vector<T> magSnapshot(static_cast<size_t>(numBins), floorDb);
-        std::vector<T> peakSnapshot(static_cast<size_t>(numBins), floorDb);
+        // Reader-private snapshot storage backing the getter return pointers:
+        // TWO alternating numBins-sized halves per getter, so a copy that
+        // fails seqlock validation is discarded without disturbing the
+        // coherent snapshot the reader is still allowed to be holding.
+        std::vector<T> magSnapshot(static_cast<size_t>(2 * numBins), floorDb);
+        std::vector<T> peakSnapshot(static_cast<size_t>(2 * numBins), floorDb);
 
         auto fft = std::make_unique<FFTReal<T>>(static_cast<size_t>(fftSize));
 
@@ -215,6 +228,9 @@ public:
         outSlots_ = std::move(slots);
         magSnapshot_ = std::move(magSnapshot);
         peakSnapshot_ = std::move(peakSnapshot);
+        magSnapshotHalf_ = 0;
+        peakSnapshotHalf_ = 0;
+        staleSnapshots_ = 0;
         writeSlot_ = 0;
         readSlot_  = 1;
         pendingSlot_.store(2, std::memory_order_relaxed);
@@ -346,11 +362,18 @@ public:
      * @brief Returns the current magnitude spectrum in decibels.
      *
      * Adopts the freshest published frame (if any) and copies it into
-     * reader-private snapshot storage. The returned pointer refers to that
-     * snapshot: it is overwritten only by the reader's own next call to
-     * THIS getter or by the setup-only reset()/prepare(), and invalidated
-     * only by a successful prepare(); no other thread ever writes through
-     * it (see the Threading pointer-validity contract).
+     * reader-private snapshot storage. Every bin in the returned array comes
+     * from the SAME analysis frame no matter how slow this thread is
+     * relative to the writer: the copy is validated against the frame's
+     * seqlock and, if it did not complete against one frame, it is discarded
+     * and the previous (coherent, one frame older) snapshot is returned with
+     * getStaleSnapshotCount() incremented. The returned pointer refers to
+     * reader-private storage no other thread can reach; the getter
+     * alternates between two such buffers, so the pointer survives the
+     * reader's next call to THIS getter and its contents are reused by the
+     * call after that (or by the setup-only reset()/prepare()), and it is
+     * invalidated only by a successful prepare() (see the Threading
+     * frame-coherence and pointer-validity contracts).
      *
      * @return Pointer to an array of size getNumBins(); the size is 0 before
      *         the first successful prepare() (a throwing first prepare()
@@ -358,21 +381,14 @@ public:
      */
     [[nodiscard]] const T* getMagnitudesDb() const noexcept
     {
-        acquireLatestSlot();
-        const OutSlot& slot = outSlots_[static_cast<size_t>(readSlot_)];
-        for (int k = 0; k < numBins_; ++k)
-            magSnapshot_[static_cast<size_t>(k)] =
-                slot.magnitudesDb[static_cast<size_t>(k)].load(std::memory_order_relaxed);
-        return magSnapshot_.data();
+        return snapshotFrame(false);
     }
 
     /**
      * @brief Returns the peak-hold spectrum in decibels.
      *
-     * Same snapshot semantics as getMagnitudesDb(): the returned pointer
-     * refers to reader-private storage overwritten only by the reader's own
-     * next call to THIS getter or by the setup-only reset()/prepare(), and
-     * invalidated only by a successful prepare().
+     * Same frame-coherence, snapshot and pointer-validity semantics as
+     * getMagnitudesDb(), over its own pair of reader-private buffers.
      *
      * @return Pointer to an array of size getNumBins(); the size is 0 before
      *         the first successful prepare() (a throwing first prepare()
@@ -380,13 +396,21 @@ public:
      */
     [[nodiscard]] const T* getPeakHoldDb() const noexcept
     {
-        acquireLatestSlot();
-        const OutSlot& slot = outSlots_[static_cast<size_t>(readSlot_)];
-        for (int k = 0; k < numBins_; ++k)
-            peakSnapshot_[static_cast<size_t>(k)] =
-                slot.peakDb[static_cast<size_t>(k)].load(std::memory_order_relaxed);
-        return peakSnapshot_.data();
+        return snapshotFrame(true);
     }
+
+    /**
+     * @brief Number of getter calls that had to return the previous snapshot
+     *        because no attempt copied one frame coherently.
+     *
+     * Diagnostic for the frame-coherence contract, reader thread only
+     * (reset to 0 by a successful prepare(), untouched by reset()). It never
+     * counts a torn readout -- a torn copy is discarded, never returned; it
+     * counts how often the reader lost every retry against the writer and
+     * therefore repeated the previous frame. Expected to stay 0 outside
+     * pathological reader stalls.
+     */
+    [[nodiscard]] long long getStaleSnapshotCount() const noexcept { return staleSnapshots_; }
 
     /** @brief Consumes and returns the new data flag. True if updated since last call. */
     [[nodiscard]] bool isNewDataReady() noexcept
@@ -474,6 +498,19 @@ private:
 
         // 5. Write into the writer-owned slot of the triple buffer
         auto& slot = outSlots_[static_cast<size_t>(writeSlot_)];
+        std::atomic<unsigned>& seq = *slot.seq;
+
+        // Seqlock OPEN, frame-for-frame the same discipline as the reference
+        // implementation in Core/Biquad.h setCoeffs(). An odd counter marks
+        // this slot's frame as mid-write, so a reader copying the slot can
+        // detect that its copy would mix two frames and discard it instead of
+        // returning the mixture. The release fence is MANDATORY
+        // ([atomics.fences]/2; Boehm, MSPC 2012): without it the relaxed bin
+        // stores below may be hoisted above the odd counter, and a copy that
+        // read mid-write words would pass validation. Cost is per analysis
+        // FRAME (two RMWs and one fence per hop), never per sample.
+        seq.fetch_add(1u, std::memory_order_acq_rel);   // -> odd
+        std::atomic_thread_fence(std::memory_order_release);
 
         // 6. DB Conversion and Peak Hold (relaxed atomic stores: the slot is
         // writer-owned here, ordering is carried by the publication exchange)
@@ -493,6 +530,11 @@ private:
                 slot.peakDb[static_cast<size_t>(k)].store(peak, std::memory_order_relaxed);
             }
         }
+
+        // Seqlock CLOSE: the frame staged in this slot is complete. The
+        // release half publishes every bin store above to any reader that
+        // reads this counter with acquire.
+        seq.fetch_add(1u, std::memory_order_release);  // -> even
 
         // 7. Publish: swap the finished slot into 'pending' (with the fresh
         // bit) and adopt whatever slot was there as the next write target.
@@ -529,9 +571,11 @@ private:
     // hand-off. Classic wait-free GUI metering scheme.
     //
     // Cross-thread publication derivation. No local race detector can
-    // certify relaxed atomics, so the argument is made here. Two
-    // obligations, BOTH required: an ownership argument at acquisition
-    // time is NOT sufficient, every returned pointer needs a LIFETIME one.
+    // certify relaxed atomics, so the argument is made here. THREE
+    // obligations, all required: an ownership argument at acquisition time
+    // is not sufficient -- every returned pointer needs a LIFETIME one, and
+    // every multi-word readout needs a FRAME-COHERENCE one that holds for
+    // the whole duration of the copy, not just at its first instruction.
     //
     // 1) OWNERSHIP at access time. A slot's words are accessed only by the
     //    thread that currently owns the slot, and ownership moves
@@ -567,6 +611,23 @@ private:
     //    reach the snapshots, so a held pointer can never be written by
     //    another thread, regardless of how long the caller keeps it.
     //
+    // 3) FRAME COHERENCE across a slow copy. (1) and (2) are arguments
+    //    about the OWNERSHIP protocol, and both hold only as long as that
+    //    protocol is exactly right: a numBins-word copy is not atomic, so a
+    //    reader that took a slow path (page fault, preemption, debugger,
+    //    an unoptimised build) would return bins from two different frames
+    //    the instant a future edit let the writer reach the slot being
+    //    copied. Nothing about the copy itself detected that. Each slot
+    //    therefore carries its own seqlock counter (OutSlot::seq): the
+    //    writer brackets the bin stores with odd/even RMWs and a release
+    //    fence, and the reader validates the counter after the copy behind
+    //    an acquire fence ([atomics.fences]/2). A copy that could have
+    //    mixed frames FAILS validation and is discarded into the spare
+    //    snapshot half rather than published, so the contract holds by
+    //    construction and not merely by the correctness of (1). It is the
+    //    library's canonical seqlock applied per slot; the reference
+    //    implementation is Core/Biquad.h.
+    //
     // Defence in depth + oracle legibility: the slot words are relaxed
     // std::atomic<T>. Under (1)+(2) they are never accessed concurrently,
     // so plain words would be formally correct -- but atomics make any
@@ -584,14 +645,27 @@ private:
     static constexpr int kFreshBit = 4;
     static constexpr int kSlotMask = 3;
 
+    /** @brief Coherent-copy attempts before the reader gives up and repeats
+     *         the previous snapshot. Bounded so the getter stays wait-free:
+     *         it never waits for the writer, it only declines to publish a
+     *         copy it could not prove coherent. */
+    static constexpr int kSnapshotAttempts = 4;
+
     static_assert(std::atomic<T>::is_always_lock_free,
                   "SpectrumAnalyzer requires lock-free atomic<T> slot words "
                   "(audio-thread stores must not lock)");
+    static_assert(std::atomic<unsigned>::is_always_lock_free,
+                  "SpectrumAnalyzer requires a lock-free seqlock counter "
+                  "(audio-thread RMWs must not lock)");
 
     struct OutSlot
     {
         std::unique_ptr<std::atomic<T>[]> magnitudesDb;
         std::unique_ptr<std::atomic<T>[]> peakDb;
+        // Seqlock counter for the frame staged here: odd = mid-write,
+        // even = complete (obligation 3 above). Heap-held so that OutSlot
+        // stays movable and prepare()'s commit phase remains noexcept.
+        std::unique_ptr<std::atomic<unsigned>> seq;
     };
     std::array<OutSlot, 3> outSlots_;
     int writeSlot_ = 0;                       // writer-thread private
@@ -600,9 +674,16 @@ private:
 
     // Reader-private snapshot storage backing the getter return pointers
     // (see the lifetime derivation above). Only the reader thread touches
-    // these; contents change only on the reader's own getter calls.
+    // these; contents change only on the reader's own getter calls. Each
+    // vector holds TWO numBins_-sized halves: the getter copies into the
+    // spare half and swaps the published index only once the copy has been
+    // proved frame-coherent, so a discarded copy can never be observed and
+    // a pointer handed out last call is never scribbled on mid-copy.
     mutable std::vector<T> magSnapshot_;
     mutable std::vector<T> peakSnapshot_;
+    mutable int magSnapshotHalf_ = 0;         // half currently published
+    mutable int peakSnapshotHalf_ = 0;
+    mutable long long staleSnapshots_ = 0;    // coherent-copy failures
 
     /** @brief Reader side: adopt the freshest published slot, if any. */
     void acquireLatestSlot() const noexcept
@@ -618,6 +699,61 @@ private:
                 return;
             }
         }
+    }
+
+    /**
+     * @brief Reader side: adopt the freshest frame and copy one of its two
+     *        arrays out coherently.
+     *
+     * Copies into the spare snapshot half and validates the source slot's
+     * seqlock around the copy, frame-for-frame the same shape as the
+     * reference reader in Core/Biquad.h applyPendingCoeffs(): the
+     * counter must be even before the copy and unchanged after it, read
+     * behind an acquire fence so neither the compiler nor a weakly ordered
+     * CPU can sink the bin loads past the re-read. Only a validated copy is
+     * published; otherwise the previously published half is returned
+     * unchanged and staleSnapshots_ counts the miss.
+     *
+     * @param peakArray false = magnitudes, true = peak hold.
+     */
+    [[nodiscard]] const T* snapshotFrame(bool peakArray) const noexcept
+    {
+        std::vector<T>& store = peakArray ? peakSnapshot_ : magSnapshot_;
+        int& half = peakArray ? peakSnapshotHalf_ : magSnapshotHalf_;
+
+        // Unprepared: no slots, no seq counters, nothing readable. Honest
+        // empty result (the pointer may be null), as documented.
+        if (numBins_ <= 0) return store.data();
+
+        T* const spare = store.data()
+                       + static_cast<size_t>(half ^ 1) * static_cast<size_t>(numBins_);
+
+        for (int attempt = 0; attempt < kSnapshotAttempts; ++attempt)
+        {
+            acquireLatestSlot();
+            const OutSlot& slot = outSlots_[static_cast<size_t>(readSlot_)];
+            const std::atomic<T>* const src =
+                (peakArray ? slot.peakDb : slot.magnitudesDb).get();
+            const std::atomic<unsigned>& seq = *slot.seq;
+
+            const unsigned s0 = seq.load(std::memory_order_acquire);
+            if ((s0 & 1u) != 0u) continue;    // a frame is mid-write in here
+
+            for (int k = 0; k < numBins_; ++k)
+                spare[static_cast<size_t>(k)] =
+                    src[static_cast<size_t>(k)].load(std::memory_order_relaxed);
+
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (seq.load(std::memory_order_relaxed) == s0)
+            {
+                half ^= 1;                    // commit the validated copy
+                return spare;
+            }
+        }
+
+        ++staleSnapshots_;
+        return store.data()
+             + static_cast<size_t>(half) * static_cast<size_t>(numBins_);
     }
 
     int ringMask_ = 2047;

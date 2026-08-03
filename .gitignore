@@ -111,6 +111,3 @@ $RECYCLE.BIN/
 *.ps1
 *.sh
 *.command
-
-# Local working notes, never part of the framework
-Universal-Orchestrator/

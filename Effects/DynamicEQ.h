@@ -24,9 +24,15 @@
  *   thread; the audio thread applies them at the next block. Each band is
  *   published through its own seqlock over std::atomic words, so the audio
  *   thread adopts a whole band configuration or none of it. Non-finite band
- *   fields keep the previous value.
+ *   fields keep the previous value. The audio thread's read of that seqlock is
+ *   BOUNDED (StagedBand::tryRead): it never waits for the control thread to
+ *   finish publishing, and a band whose read gives up keeps its current state
+ *   while its dirty flag is re-armed, so the change lands one block later
+ *   instead of holding the callback open.
  * - getState() reads the same seqlock into a private copy, so it is safe from
- *   any thread (it allocates, so keep it off the audio thread).
+ *   any thread (it allocates, so keep it off the audio thread). It uses the
+ *   UNBOUNDED StagedBand::read(): a readout has no previously adopted copy to
+ *   keep, and it is not real-time.
  * - getBandGainDb() is an atomic metering read; getLatency() is safe from any
  *   thread once prepared.
  * - Lookahead changes take effect immediately and may click (configure
@@ -552,12 +558,22 @@ private:
 
     void updateBandInternalState(int b, double fs) noexcept
     {
-        // Seqlock read of the published config into a thread-private plain
-        // copy. Every word crossing threads is std::atomic (see StagedBand):
-        // copying the struct itself here, even under a correct counter, was a
-        // plain concurrent read of words the control thread writes and so a
-        // data race by the C++ model, not merely a torn-value hazard.
-        const BandConfig cfg = staged_[static_cast<size_t>(b)].read();
+        // Bounded seqlock read of the published config into a thread-private
+        // plain copy. Every word crossing threads is std::atomic (see
+        // StagedBand): copying the struct itself here, even under a correct
+        // counter, was a plain concurrent read of words the control thread
+        // writes and so a data race by the C++ model, not merely a torn-value
+        // hazard. This runs on the audio thread, so the read is bounded: it
+        // never waits for the control thread to finish publishing.
+        BandConfig cfg;
+        if (!staged_[static_cast<size_t>(b)].tryRead(cfg))
+        {
+            // Gave up: leave states_[b] exactly as it is -- the band keeps
+            // running on its current config -- and re-arm so the publication is
+            // adopted on a later block.
+            paramsDirty_[b].store(true, std::memory_order_release);
+            return;
+        }
 
         // A band re-enabled after being disabled would replay arbitrarily old
         // filter history and gain state: start it clean.
@@ -701,8 +717,83 @@ private:
             seq.fetch_add(1, std::memory_order_release);   // -> even
         }
 
+        /// Attempt bound for the audio-thread read (tryRead). Three is enough
+        /// that attempt 1 succeeds whenever the reader does not collide with a
+        /// publish, with two spare attempts to absorb one unlucky collision;
+        /// past that, deferring the update by one call costs less than spending
+        /// more of the block budget on it.
+        static constexpr int kSeqlockMaxAttempts = 3;
+
+        /** @brief Relaxed copy of the fifteen published words (no ordering of
+         *  its own; the caller's fences and counter checks provide that).
+         *
+         *  Shared by both readers below so the word list exists exactly once: a
+         *  field added to the band cannot be picked up by one reader and missed
+         *  by the other. */
+        void loadWordsRelaxed(BandConfig& c) const noexcept
+        {
+            c.frequency      = frequency.load(std::memory_order_relaxed);
+            c.q              = q.load(std::memory_order_relaxed);
+            c.threshold      = threshold.load(std::memory_order_relaxed);
+            c.shape          = static_cast<BandShape>(shape.load(std::memory_order_relaxed));
+            c.enabled        = enabled.load(std::memory_order_relaxed);
+            c.aboveRatio     = aboveRatio.load(std::memory_order_relaxed);
+            c.aboveAttackMs  = aboveAttackMs.load(std::memory_order_relaxed);
+            c.aboveReleaseMs = aboveReleaseMs.load(std::memory_order_relaxed);
+            c.aboveRangeDb   = aboveRangeDb.load(std::memory_order_relaxed);
+            c.aboveBoost     = aboveBoost.load(std::memory_order_relaxed);
+            c.belowRatio     = belowRatio.load(std::memory_order_relaxed);
+            c.belowAttackMs  = belowAttackMs.load(std::memory_order_relaxed);
+            c.belowReleaseMs = belowReleaseMs.load(std::memory_order_relaxed);
+            c.belowRangeDb   = belowRangeDb.load(std::memory_order_relaxed);
+            c.belowBoost     = belowBoost.load(std::memory_order_relaxed);
+        }
+
         /**
-         * @brief Reads the band into a caller-private plain copy (any thread).
+         * @brief The bounded seqlock read for the AUDIO thread.
+         *
+         * Makes at most kSeqlockMaxAttempts validation attempts and then gives
+         * up rather than spin until the control thread finishes publishing --
+         * an audio-thread loop whose exit depends on another thread's progress
+         * is a stall of that thread's scheduling quantum, inside the callback.
+         * The accept test is the same one read() uses, so bounding can never
+         * make a torn set adoptable; it can only defer an adoption. `out` is
+         * written only once a copy has validated, so a caller may pass storage
+         * it is still using and a give-up leaves it intact.
+         *
+         * An odd counter means the writer is mid-publish: skip the copy
+         * entirely instead of copying fifteen words that would be discarded.
+         *
+         * @param out Receives the band configuration if and only if true is returned.
+         * @return true if a consistent configuration was adopted; false if the
+         *         attempt bound was reached (the caller keeps what it has and
+         *         should re-arm its dirty flag to retry on a later call).
+         */
+        [[nodiscard]] bool tryRead(BandConfig& out) const noexcept
+        {
+            for (int attempt = 0; attempt < kSeqlockMaxAttempts; ++attempt)
+            {
+                const unsigned s0 = seq.load(std::memory_order_acquire);
+                if ((s0 & 1u) != 0u) continue;   // writer mid-publish: do not copy
+                BandConfig c;
+                loadWordsRelaxed(c);
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (s0 == seq.load(std::memory_order_relaxed))
+                {
+                    out = c;                     // commit only on validation
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * @brief Reads the band into a caller-private plain copy (readouts).
+         *
+         * Control- and GUI-thread entry point, and NOT for the audio thread:
+         * this retry is unbounded on purpose. A readout has no previously
+         * adopted copy to fall back on, so "sorry, try again" would be a worse
+         * API than a microsecond of spinning; the audio path uses tryRead().
          *
          * The acquire fence keeps the word copy from sinking below the re-read
          * of the counter: an acquire LOAD orders only later accesses, so
@@ -717,21 +808,7 @@ private:
             unsigned s0, s1;
             do {
                 s0 = seq.load(std::memory_order_acquire);
-                c.frequency      = frequency.load(std::memory_order_relaxed);
-                c.q              = q.load(std::memory_order_relaxed);
-                c.threshold      = threshold.load(std::memory_order_relaxed);
-                c.shape          = static_cast<BandShape>(shape.load(std::memory_order_relaxed));
-                c.enabled        = enabled.load(std::memory_order_relaxed);
-                c.aboveRatio     = aboveRatio.load(std::memory_order_relaxed);
-                c.aboveAttackMs  = aboveAttackMs.load(std::memory_order_relaxed);
-                c.aboveReleaseMs = aboveReleaseMs.load(std::memory_order_relaxed);
-                c.aboveRangeDb   = aboveRangeDb.load(std::memory_order_relaxed);
-                c.aboveBoost     = aboveBoost.load(std::memory_order_relaxed);
-                c.belowRatio     = belowRatio.load(std::memory_order_relaxed);
-                c.belowAttackMs  = belowAttackMs.load(std::memory_order_relaxed);
-                c.belowReleaseMs = belowReleaseMs.load(std::memory_order_relaxed);
-                c.belowRangeDb   = belowRangeDb.load(std::memory_order_relaxed);
-                c.belowBoost     = belowBoost.load(std::memory_order_relaxed);
+                loadWordsRelaxed(c);
                 std::atomic_thread_fence(std::memory_order_acquire);
                 s1 = seq.load(std::memory_order_relaxed);
             } while ((s0 & 1u) != 0u || s0 != s1);

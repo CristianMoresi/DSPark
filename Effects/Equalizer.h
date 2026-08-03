@@ -21,11 +21,16 @@
  *   through its own seqlock over std::atomic words, so the audio thread adopts
  *   a whole band configuration or none of it; a change is consumed at the next
  *   block (or the next processSample()). Non-finite band fields are replaced
- *   with the band's current values.
+ *   with the band's current values. The audio thread's read of that seqlock is
+ *   BOUNDED (StagedBand::tryRead): it never waits for the control thread to
+ *   finish publishing, and a band whose read gives up keeps its current
+ *   coefficients while the dirty flag is re-armed, so the change lands one call
+ *   later instead of holding the callback open.
  * - Any thread: getBandConfig(), getMagnitudeForFrequencyArray(), getState(),
  *   getNumBands(), getFilterMode(), getSoftMode(), getLatency(). The first two
  *   read the same seqlock and hand back a private copy, so they never observe a
- *   half-written band.
+ *   half-written band. They use the UNBOUNDED StagedBand::read(): a readout has
+ *   no previously adopted copy to keep, and it is not real-time.
  * - Processing thread only: getBandFilter(), which returns a reference to a
  *   band's live FilterEngine (its contract, not the equalizer's).
  *
@@ -530,7 +535,7 @@ public:
      * debug build asserts first: clamping keeps a release build defined, it
      * does not make a wrong index mean anything.
      *
-     * @param index Band index. Clamped safely to valid range in release mode.
+     * @param index Band index. Clamped, not validated -- see the note above.
      * @return Reference to the FilterEngine for this band.
      */
     [[nodiscard]] FilterEngine<T>& getBandFilter(int index) noexcept
@@ -637,6 +642,11 @@ protected:
      * reads and configure a filter with a frequency from one call and a slope
      * from the next. That is not a theoretical hazard: before this was a
      * seqlock, roughly one adoption in thirty was such a mixture.
+     *
+     * The pull is bounded (tryRead): a band whose read gives up is left with
+     * the coefficients it already has, and configDirty_ is re-armed so the whole
+     * set is retried on a later call. Reconfiguring a band from its published
+     * config is idempotent, so retrying all of them costs nothing but the work.
      */
     void updateActiveFilters() noexcept
     {
@@ -646,7 +656,14 @@ protected:
         for (int i = 0; i < activeBands; ++i)
         {
             auto& filter = bands_[i];
-            const BandConfig cfg = staged_[i].read();
+            BandConfig cfg;
+            if (!staged_[i].tryRead(cfg))
+            {
+                // Bounded read gave up: keep this band's current coefficients
+                // and pick the publication up on a later call.
+                configDirty_.store(true, std::memory_order_release);
+                continue;
+            }
 
             float freq = static_cast<float>(cfg.frequency);
             float gain = static_cast<float>(cfg.gain);
@@ -785,7 +802,17 @@ protected:
         const double sr = spec_.sampleRate;
         for (int b = 0; b < activeBands; ++b)
         {
-            const BandConfig cfg = staged_[b].read();
+            BandConfig cfg;
+            if (!staged_[b].tryRead(cfg))
+            {
+                // Bounded read gave up. Abandon the whole recompute and re-arm:
+                // this bail sits BEFORE any store into lpKernel_, so the kernel
+                // currently convolving stays intact and the next call rebuilds
+                // it from a complete band set. The scratch buffers may be left
+                // partially written; nothing reads them across calls.
+                lpDirty_.store(true, std::memory_order_release);
+                return;
+            }
             if (!cfg.enabled) continue;
 
             BiquadCoeffs st[5];
@@ -967,8 +994,74 @@ protected:
             seq.fetch_add(1, std::memory_order_release);   // -> even
         }
 
+        /// Attempt bound for the audio-thread read (tryRead). Three is enough
+        /// that attempt 1 succeeds whenever the reader does not collide with a
+        /// publish, with two spare attempts to absorb one unlucky collision;
+        /// past that, deferring the update by one call costs less than spending
+        /// more of the block budget on it.
+        static constexpr int kSeqlockMaxAttempts = 3;
+
+        /** @brief Relaxed copy of the six published words (no ordering of its
+         *  own; the caller's fences and counter checks provide that).
+         *
+         *  Shared by both readers below so the word list exists exactly once: a
+         *  field added to the band cannot be picked up by one reader and missed
+         *  by the other. */
+        void loadWordsRelaxed(BandConfig& c) const noexcept
+        {
+            c.frequency = frequency.load(std::memory_order_relaxed);
+            c.gain      = gain.load(std::memory_order_relaxed);
+            c.q         = q.load(std::memory_order_relaxed);
+            c.type      = static_cast<BandType>(type.load(std::memory_order_relaxed));
+            c.slope     = slope.load(std::memory_order_relaxed);
+            c.enabled   = enabled.load(std::memory_order_relaxed);
+        }
+
         /**
-         * @brief Reads the band into a caller-private plain copy (any thread).
+         * @brief The bounded seqlock read for the AUDIO thread.
+         *
+         * Makes at most kSeqlockMaxAttempts validation attempts and then gives
+         * up rather than spin until the control thread finishes publishing --
+         * an audio-thread loop whose exit depends on another thread's progress
+         * is a stall of that thread's scheduling quantum, inside the callback.
+         * The accept test is the same one read() uses, so bounding can never
+         * make a torn set adoptable; it can only defer an adoption. `out` is
+         * written only once a copy has validated, so a caller may pass storage
+         * it is still using and a give-up leaves it intact.
+         *
+         * An odd counter means the writer is mid-publish: skip the copy
+         * entirely instead of copying six words that would be discarded.
+         *
+         * @param out Receives the band configuration if and only if true is returned.
+         * @return true if a consistent configuration was adopted; false if the
+         *         attempt bound was reached (the caller keeps what it has and
+         *         should re-arm its dirty flag to retry on a later call).
+         */
+        [[nodiscard]] bool tryRead(BandConfig& out) const noexcept
+        {
+            for (int attempt = 0; attempt < kSeqlockMaxAttempts; ++attempt)
+            {
+                const unsigned s0 = seq.load(std::memory_order_acquire);
+                if ((s0 & 1u) != 0u) continue;   // writer mid-publish: do not copy
+                BandConfig c;
+                loadWordsRelaxed(c);
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (s0 == seq.load(std::memory_order_relaxed))
+                {
+                    out = c;                     // commit only on validation
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * @brief Reads the band into a caller-private plain copy (readouts).
+         *
+         * Control- and GUI-thread entry point, and NOT for the audio thread:
+         * this retry is unbounded on purpose. A readout has no previously
+         * adopted copy to fall back on, so "sorry, try again" would be a worse
+         * API than a microsecond of spinning; the audio path uses tryRead().
          *
          * The acquire fence keeps the word copy from sinking below the re-read
          * of the counter: an acquire LOAD orders only later accesses, so
@@ -984,12 +1077,7 @@ protected:
             unsigned s0, s1;
             do {
                 s0 = seq.load(std::memory_order_acquire);
-                c.frequency = frequency.load(std::memory_order_relaxed);
-                c.gain      = gain.load(std::memory_order_relaxed);
-                c.q         = q.load(std::memory_order_relaxed);
-                c.type      = static_cast<BandType>(type.load(std::memory_order_relaxed));
-                c.slope     = slope.load(std::memory_order_relaxed);
-                c.enabled   = enabled.load(std::memory_order_relaxed);
+                loadWordsRelaxed(c);
                 std::atomic_thread_fence(std::memory_order_acquire);
                 s1 = seq.load(std::memory_order_relaxed);
             } while ((s0 & 1u) != 0u || s0 != s1);

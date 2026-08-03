@@ -39,6 +39,7 @@
 #include "WindowFunctions.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -312,6 +313,25 @@ private:
  * ns/sample, g++ -O2); block-level bench deltas are within run-to-run noise
  * (5.78/5.89/5.95 vs 5.87/5.98/5.79 ns/frame medians, 63-tap mono LP).
  *
+ * Real-time bound: the audio thread's read is BOUNDED to kSeqlockMaxAttempts
+ * validation attempts. If none validates it adopts nothing, keeps the
+ * coefficient set already in use and re-arms the dirty flag, so the update
+ * lands on a later call instead of holding the callback open until the control
+ * thread finishes publishing. Without that bound the wait is the writer's
+ * scheduling, not this filter's instruction count: with 8192 taps published
+ * from a control thread sharing one CPU with the audio thread -- the ordinary
+ * arrangement on single-core embedded and wasm targets -- a single
+ * processBlock() call was measured at 5.1 SECONDS, and one block was all that
+ * completed in five seconds. Bounded, the same configuration's worst block is
+ * 6057 us against a 6045 us pure-CPU-contention control on the same machine
+ * and 58156 blocks complete, i.e. contention rather than waiting. Bounding
+ * cannot make a torn set adoptable: the accept test is unchanged and a read
+ * that fails it adopts nothing. What it can do is deliver a coefficient update
+ * one call late under sustained contention, which is the trade being made. The
+ * commit-on-validate rule is what makes it safe: the copy goes into the spare
+ * one of TWO private active buffers and the index flips only after the copy
+ * validates, so a give-up can never leave a half-copied set live.
+ *
  * Threading (SPSC model, see docs/threading.md):
  * - prepare(): setup thread only (allocates; never concurrent with any
  *   other call).
@@ -355,8 +375,10 @@ public:
         // against reading a half-published set. Allocated here, at setup time.
         stagingCoeffs_ = std::vector<std::atomic<T>>(static_cast<size_t>(maxTaps_));
         for (auto& s : stagingCoeffs_) s.store(T(0), std::memory_order_relaxed);
-        activeCoeffs_.assign(static_cast<size_t>(maxTaps_), T(0));
+        activeCoeffs_[0].assign(static_cast<size_t>(maxTaps_), T(0));
+        activeCoeffs_[1].assign(static_cast<size_t>(maxTaps_), T(0));
         stagingTaps_.store(0, std::memory_order_relaxed);
+        activeIdx_    = 0;
         activeTaps_   = 0;
         coeffSeq_.store(0, std::memory_order_release);
         coeffDirty_.store(false, std::memory_order_release);
@@ -439,7 +461,9 @@ public:
         const int currentTaps = activeTaps_;
         if (currentTaps == 0) return; // Bypass if uninitialized
 
-        const T* currentCoeffs = activeCoeffs_.data();
+        // Hoisted exactly as the single-buffer .data() was: one private index
+        // load outside the loops, nothing added inside them.
+        const T* currentCoeffs = activeCoeffs_[static_cast<size_t>(activeIdx_)].data();
         const int numChannels = std::min(buffer.getNumChannels(), numChannels_);
         const int numSamples  = buffer.getNumSamples();
 
@@ -494,7 +518,7 @@ public:
         const int currentTaps = activeTaps_;
         if (currentTaps == 0) return input;
 
-        const T* currentCoeffs = activeCoeffs_.data();
+        const T* currentCoeffs = activeCoeffs_[static_cast<size_t>(activeIdx_)].data();
 
         auto& wp = writePositions_[static_cast<size_t>(channel)];
         const int channelOffset = channel * (maxTaps_ * 2);
@@ -523,29 +547,69 @@ public:
     }
 
 private:
+    /// Attempt bound for the audio-thread seqlock read in pullCoeffsIfDirty().
+    /// Three is enough that attempt 1 succeeds whenever the reader does not
+    /// collide with a publish (the overwhelming majority of calls) and attempts
+    /// 2-3 absorb one unlucky collision; past that, deferring the update by one
+    /// call costs less than spending more of the block budget on it.
+    static constexpr int kSeqlockMaxAttempts = 3;
+
     /** @brief Audio-thread: copy the staged coefficient set into the private
-     *  active buffer if an update was published (seqlock read with retry). */
+     *  active buffer if an update was published (bounded seqlock read).
+     *
+     *  At most kSeqlockMaxAttempts validation attempts. On give-up the previous
+     *  set stays in force and the dirty flag is re-armed, so the audio thread's
+     *  worst case here is three copies of one coefficient set -- this filter's
+     *  own instruction count -- and never the time a control thread happens to
+     *  hold the sequence counter odd. */
     void pullCoeffsIfDirty() noexcept
     {
         if (!coeffDirty_.exchange(false, std::memory_order_acquire)) return;
-        unsigned s0, s1;
-        int n;
-        do {
-            s0 = coeffSeq_.load(std::memory_order_acquire);
+
+        // Commit-on-validate: the copy lands in the SPARE active buffer, never
+        // in the one the per-sample loop is reading. A give-up therefore leaves
+        // the live set untouched instead of leaving a torn mixture behind it.
+        const size_t spare = static_cast<size_t>(activeIdx_ ^ 1);
+        T* const dest = activeCoeffs_[spare].data();
+
+        bool adopted = false;
+        int n = 0;
+        for (int attempt = 0; attempt < kSeqlockMaxAttempts; ++attempt)
+        {
+            const unsigned s0 = coeffSeq_.load(std::memory_order_acquire);
+            // Odd counter: the writer is mid-publish. Skip the copy entirely --
+            // testing this BEFORE copying is what makes a collision cost one
+            // relaxed load instead of up to maxTaps loads that would then be
+            // thrown away, and is why the bound is affordable per sample.
+            if ((s0 & 1u) != 0u) continue;
             // Defensive clamp: the loop bound must never exceed the buffers
             // even if this speculative read races a concurrent publish.
             n = std::min(stagingTaps_.load(std::memory_order_relaxed), maxTaps_);
             for (int k = 0; k < n; ++k)
-                activeCoeffs_[static_cast<size_t>(k)] =
-                    stagingCoeffs_[static_cast<size_t>(k)].load(std::memory_order_relaxed);
+                dest[k] = stagingCoeffs_[static_cast<size_t>(k)].load(std::memory_order_relaxed);
             // The fence orders the copy above BEFORE the re-read below. A plain
             // load-acquire is not enough: acquire only orders LATER accesses,
             // so on weakly-ordered CPUs (ARM) the copy could sink below the
-            // second read and a torn copy would pass the s0 == s1 check.
+            // second read and a torn copy would pass the equality check.
             std::atomic_thread_fence(std::memory_order_acquire);
-            s1 = coeffSeq_.load(std::memory_order_relaxed);
-        } while ((s0 & 1u) != 0u || s0 != s1);
-        activeTaps_ = n;
+            if (s0 == coeffSeq_.load(std::memory_order_relaxed))
+            {
+                adopted = true;
+                break;
+            }
+        }
+
+        if (!adopted)
+        {
+            // Adopt nothing: neither the index nor activeTaps_ moves, so the
+            // set already in use stays live. Re-arm and pick the update up on a
+            // later call.
+            coeffDirty_.store(true, std::memory_order_release);
+            return;
+        }
+
+        activeIdx_  ^= 1;   // flip: the validated copy becomes the live set
+        activeTaps_  = n;
     }
 
     int maxTaps_{0};
@@ -564,8 +628,14 @@ private:
     std::atomic<bool> coeffDirty_{false};   ///< Pending-update flag (fast path).
     std::atomic<int> reportedTaps_{0};      ///< Latest set tap count for getLatency().
 
-    // Audio-thread-private active coefficient set (never overwritten mid-block).
-    std::vector<T> activeCoeffs_;
+    // Audio-thread-private active coefficient sets (never overwritten
+    // mid-block). TWO buffers plus a private index, not one: the bounded read
+    // must be able to give up without having damaged the set in use, so it
+    // copies into activeCoeffs_[activeIdx_ ^ 1] and only flips the index once
+    // the copy validates. Both are audio-thread-private, so the index needs no
+    // synchronization; the cost is one extra maxTaps buffer at prepare time.
+    std::array<std::vector<T>, 2> activeCoeffs_;
+    int activeIdx_{0};
     int activeTaps_{0};
 
     // Flattened, cache-contiguous delay lines

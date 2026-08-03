@@ -60,6 +60,20 @@
 #include "AudioBuffer.h"
 #include "DenormalGuard.h"
 
+// Keeps a cold path out of a hot caller's stack frame. Needed exactly once here
+// (see Biquad::adoptStagedCoeffs), where inlining the coefficient adoption into
+// the per-sample entry points costs four instructions on EVERY sample. Locally
+// defined and guarded, the same way Core/SimdOps.h spells DSPARK_RESTRICT.
+#ifndef DSPARK_NOINLINE
+  #if defined(_MSC_VER)
+    #define DSPARK_NOINLINE __declspec(noinline)
+  #elif defined(__GNUC__) || defined(__clang__)
+    #define DSPARK_NOINLINE __attribute__((noinline))
+  #else
+    #define DSPARK_NOINLINE
+  #endif
+#endif
+
 namespace dspark {
 
 // ============================================================================
@@ -548,6 +562,16 @@ private:
  * untouched. Per-channel states are stored compactly so adjacent channels
  * share cache lines during block processing.
  *
+ * The audio-thread side of that handoff is BOUNDED: applyPendingCoeffs() makes
+ * at most kSeqlockMaxAttempts validation attempts and then keeps the
+ * coefficients already in use, so the callback's worst case is a fixed multiple
+ * of one five-word copy rather than however long the control thread holds the
+ * counter odd. The fence-pairing derivation is unchanged by that bound, because
+ * the bound touches only how many times the derivation is applied: the accept
+ * test (even counter, unchanged across the copy) is byte-for-byte the same, and
+ * a read that fails it adopts nothing. The trade is stated where it is made --
+ * a coefficient update can land one call later under sustained contention.
+ *
  * Threading (SPSC model, see docs/threading.md):
  * - setCoeffs(): control thread (ONE non-audio writer; canonical seqlock
  *   publish).
@@ -652,40 +676,19 @@ public:
      * immediately, e.g. for an offline / introspection getCoeffs() right
      * after pushing new ones.
      *
-     * @return true if the active coefficients changed in this call.
+     * @return true if the active coefficients changed in this call. false means
+     *         nothing was pending OR the adoption was DEFERRED: the read is
+     *         bounded (see below), so under a concurrently publishing control
+     *         thread it may give up, keep the coefficients already in use and
+     *         re-arm the pending flag, and the update then lands on a later
+     *         call. The single-thread use documented above is unaffected: with
+     *         no concurrent writer the sequence counter is even and stable, so
+     *         the first attempt always validates.
      */
     bool applyPendingCoeffs() noexcept
     {
-        if (coeffsDirty_.exchange(false, std::memory_order_acquire))
-        {
-            // Seqlock read: retry on a torn/in-progress publish. The writer's
-            // critical section is a 5-double copy, so this converges in at most
-            // a couple of iterations even under a busy GUI thread.
-            BiquadCoeffs tmp;
-            unsigned s0, s1;
-            do {
-                s0  = coeffsSeq_.load(std::memory_order_acquire);
-                // Relaxed word loads: each access is race-free because the
-                // staging words are std::atomic<double>.
-                tmp.b0 = stagedCoeffs_.b0.load(std::memory_order_relaxed);
-                tmp.b1 = stagedCoeffs_.b1.load(std::memory_order_relaxed);
-                tmp.b2 = stagedCoeffs_.b2.load(std::memory_order_relaxed);
-                tmp.a1 = stagedCoeffs_.a1.load(std::memory_order_relaxed);
-                tmp.a2 = stagedCoeffs_.a2.load(std::memory_order_relaxed);
-                // The fence keeps the copy above from sinking below the
-                // re-read of the counter. A plain acquire load only orders
-                // LATER accesses; without the fence, both the compiler and
-                // weakly-ordered CPUs (ARM) may complete the copy after s1
-                // is read, and a torn copy would pass the s0 == s1 check.
-                // It also pairs with the writer's release fence, so a copy
-                // that read any mid-publish word cannot pass validation.
-                std::atomic_thread_fence(std::memory_order_acquire);
-                s1  = coeffsSeq_.load(std::memory_order_relaxed);
-            } while ((s0 & 1u) != 0u || s0 != s1);
-            activeCoeffs_ = tmp;
-            return true;
-        }
-        return false;
+        if (!coeffsDirty_.exchange(false, std::memory_order_acquire)) return false;
+        return adoptStagedCoeffs();
     }
 
     /**
@@ -817,6 +820,80 @@ public:
     }
 
 private:
+    /// Attempt bound for the audio-thread seqlock read in adoptStagedCoeffs().
+    /// Three is enough that attempt 1 succeeds whenever the reader does not
+    /// collide with a publish (the overwhelming majority of calls) and attempts
+    /// 2-3 absorb one unlucky collision; past that, deferring the update by one
+    /// call costs less than spending more of the block budget.
+    static constexpr int kSeqlockMaxAttempts = 3;
+
+    /**
+     * @brief Adopts the staged set, or defers (a bounded seqlock read).
+     *
+     * Kept OUT of line on purpose. processSample()/processSampleCore() reach
+     * this only on the rare call where a publication is pending, but if the
+     * body is inlined into them their stack frame grows by one callee-saved
+     * register, and that push/pop pair is paid on EVERY sample. Measured on
+     * DynamicEQ's block path, which runs four of these filters per sample:
+     * +7.3% (g++ 13.3) / +8.9% (clang 18.1) with the body inlined, both
+     * recovered by keeping it here. The spelling follows DSPARK_RESTRICT in
+     * Core/SimdOps.h -- a locally defined, guarded, compiler-specific macro.
+     *
+     * At most kSeqlockMaxAttempts validation attempts, then give up, adopt
+     * nothing and re-arm. The audio thread's worst case is therefore a fixed
+     * multiple of one five-word copy -- this filter's own instruction count --
+     * instead of however long the control thread happens to hold the counter
+     * odd. The accept test is unchanged from the unbounded form, so bounding
+     * can never make a torn set adoptable; it can only defer an adoption.
+     *
+     * @return true if the active coefficients changed in this call.
+     */
+    DSPARK_NOINLINE bool adoptStagedCoeffs() noexcept
+    {
+        BiquadCoeffs tmp;
+        bool adopted = false;
+        for (int attempt = 0; attempt < kSeqlockMaxAttempts; ++attempt)
+        {
+            const unsigned s0 = coeffsSeq_.load(std::memory_order_acquire);
+            // Odd counter: the writer is mid-publish, so do not copy at all.
+            // Testing this BEFORE the copy makes a collision cost one relaxed
+            // load instead of a full word-set copy that would be thrown away,
+            // which is what keeps the bound cheap enough for the per-sample
+            // entry point.
+            if ((s0 & 1u) != 0u) continue;
+            // Relaxed word loads: each access is race-free because the staging
+            // words are std::atomic<double>. The destination is a stack
+            // temporary, NOT the live activeCoeffs_ the hot path reads, so a
+            // give-up leaves the active set untouched (commit-on-validate).
+            tmp.b0 = stagedCoeffs_.b0.load(std::memory_order_relaxed);
+            tmp.b1 = stagedCoeffs_.b1.load(std::memory_order_relaxed);
+            tmp.b2 = stagedCoeffs_.b2.load(std::memory_order_relaxed);
+            tmp.a1 = stagedCoeffs_.a1.load(std::memory_order_relaxed);
+            tmp.a2 = stagedCoeffs_.a2.load(std::memory_order_relaxed);
+            // The fence keeps the copy above from sinking below the re-read of
+            // the counter. A plain acquire load only orders LATER accesses;
+            // without the fence, both the compiler and weakly-ordered CPUs
+            // (ARM) may complete the copy after the counter is re-read, and a
+            // torn copy would pass the equality check. It also pairs with the
+            // writer's release fence, so a copy that read any mid-publish word
+            // cannot pass validation.
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (s0 == coeffsSeq_.load(std::memory_order_relaxed))
+            {
+                adopted = true;
+                break;
+            }
+        }
+        if (!adopted)
+        {
+            // Adopt nothing; keep the set in use and pick the update up later.
+            coeffsDirty_.store(true, std::memory_order_release);
+            return false;
+        }
+        activeCoeffs_ = tmp;
+        return true;
+    }
+
     // Kept compact on purpose (no over-alignment): the states are only ever
     // touched by the processing thread, sequentially per channel, so packing
     // adjacent channels into the same cache line is strictly better than

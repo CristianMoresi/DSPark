@@ -100,9 +100,14 @@ A change is ready when all of it is green.
   else, so a comment must not cite a reference code -- an issue number, a
   ticket tag, a design or planning document id -- that only resolves somewhere
   they cannot reach. Write the reason out instead; that reason is the valuable
-  half, and it is the half a bare code throws away. Pointing at a commit in
-  this repository is fine. `python3 tools/check_comment_style.py` checks this
-  and runs in CI.
+  half, and it is the half a bare code throws away. The same test applies to
+  anything else a comment points at: a commit in this repository is fine, a
+  published paper or a standard's number is fine, and a file path is fine when
+  the path is here -- but a path to a file this repository does not contain is
+  a reference code with a slash in it. A short label a file invents for its own
+  use (an acceptance suite tagging its criteria, say) is fine in the file that
+  defines the label, and is a dangling reference anywhere else.
+  `python3 tools/check_comment_style.py` checks all three and runs in CI.
 
 ### Tests
 

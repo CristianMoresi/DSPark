@@ -828,8 +828,8 @@ void runMetricTests()
         check(snr > 90.0, "metrics", "Resampler High sine SNR > 90 dB", d);
     }
     {
-        // OnsetDetector OA-1 floor: isolated band-limited clicks over silence
-        // must be detected exactly (F = 1.0, zero false positives), +/-25 ms.
+        // OnsetDetector floor: isolated band-limited clicks over silence must
+        // be detected exactly (F = 1.0, zero false positives), +/-25 ms.
         const double fs = 44100.0;
         const int n = static_cast<int>(fs * 4.0);
         std::vector<float> sig(static_cast<size_t>(n), 0.0f);
@@ -862,7 +862,7 @@ void runMetricTests()
         const int fp = static_cast<int>(det.size()) - tp;
         const int fn = static_cast<int>(truth.size()) - tp;
         char d[80]; std::snprintf(d, sizeof(d), "(tp=%d fp=%d fn=%d)", tp, fp, fn);
-        check(fp == 0 && fn == 0, "metrics", "OnsetDetector OA-1 clicks/silence F=1.0", d);
+        check(fp == 0 && fn == 0, "metrics", "OnsetDetector clicks/silence F=1.0", d);
     }
     {
         // Oscillator waveform levels must match within 1 dB.

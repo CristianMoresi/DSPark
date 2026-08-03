@@ -1046,7 +1046,7 @@ DSPARK_TEST(AudioBuffer_move_leaves_source_reusable)
 // (float/double were already pinned by FIR_double_instantiation_lockfree_
 // and_reprepare; this adds the integer/bool/enum-underlying words:
 // seq counters, dirty flags, indices, packed 64-bit readouts.)
-DSPARK_TEST(M008B_swept_atomic_word_types_are_lock_free)
+DSPARK_TEST(swept_atomic_word_types_are_lock_free)
 {
     EXPECT_TRUE(std::atomic<bool>::is_always_lock_free);
     EXPECT_TRUE(std::atomic<int>::is_always_lock_free);

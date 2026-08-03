@@ -106,8 +106,10 @@ A change is ready when all of it is green.
   the path is here -- but a path to a file this repository does not contain is
   a reference code with a slash in it. A short label a file invents for its own
   use (an acceptance suite tagging its criteria, say) is fine in the file that
-  defines the label, and is a dangling reference anywhere else.
-  `python3 tools/check_comment_style.py` checks all three and runs in CI.
+  defines the label, and is a dangling reference anywhere else. Nor may a
+  comment name a directory that only exists on your machine; someone who
+  clones this repository has no way to know what it is.
+  `python3 tools/check_comment_style.py` checks all four and runs in CI.
 
 ### Tests
 

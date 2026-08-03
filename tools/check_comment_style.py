@@ -7,7 +7,7 @@ planning document, a directory that exists only on the author's machine --
 sends that reader after something they cannot open, and the reason the code is
 the way it is goes with it.
 
-Three rules, from the narrowest to the most general:
+Four rules, from the narrowest to the most general:
 
 1. REFERENCE CODES are rejected outright, and the reasoning is written out
    instead:
@@ -29,10 +29,21 @@ Three rules, from the narrowest to the most general:
    Families are listed in LOCAL_LABEL_FAMILIES; a definition is a comment line
    of the form "LABEL-n: what it means".
 
+4. LOCAL DIRECTORIES: a top-level directory that exists on the machine running
+   the check and is hidden by a rule this repository does not carry is not
+   something a reader can look up, so its name must not appear in a comment
+   either. See local_only_directories() for how the list is built and for the
+   two tests that keep this rule off the vocabulary of the project itself.
+
+Rules 1 and 4 ignore case; rule 4's list is read from the working tree, so on a
+clean clone it is empty and that rule checks nothing. The run says how many
+names it holds, because a green line for a check that did not run is worth
+less than no line at all.
+
 Referring to a commit in this repository is fine; a reader can resolve it. So
 is a published citation or a standard's number: those resolve in the world.
 
-All three rules are applied to every tracked text file that this project
+All four rules are applied to every tracked text file that this project
 authors, AND to the tracked file names themselves: a name is more public than
 anything inside the file, since it shows in the file listing and in every
 release archive without being opened. Vendored code is excluded because it is
@@ -46,12 +57,17 @@ agree (each limit below was measured against this tree before being accepted):
 
   - A location claim is a token of three or more segments that either ends in
     a file extension, or ends in "/", or is rooted at "/", "~/" or a drive
-    letter. Separators may be "/" or "\\".
+    letter. Separators may be "/" or "\\", doubled separators count once, and
+    a "file://" prefix is dropped, since such a URL is a local path wearing a
+    scheme. An "https://" URL is not a location claim at all: it resolves in
+    the world.
   - Extensions are NOT an allow-list; every extension counts except those of
     build outputs and binary assets (ARTEFACT_EXTENSIONS), because a bundle
     layout in a build recipe is not a claim about this repository.
-  - A rooted path needs four or more segments: three-segment absolute paths in
-    this tree are system locations (/usr/bin/env) rather than project files.
+  - A path rooted at "/" needs four or more segments: three-segment absolute
+    paths in this tree are system locations (/usr/bin/env) rather than project
+    files. A path rooted at a home directory takes the ordinary floor of
+    three, since nothing under someone's home directory is a system location.
   - An extension-less path with no trailing "/" is NOT seen. It cannot be told
     apart from ordinary prose alternation (HTML/CSS/JS, attack/release/ratio)
     by shape alone: measured on this tree, treating those as location claims
@@ -61,6 +77,23 @@ agree (each limit below was measured against this tree before being accepted):
     slash between them.
   - In Windows scripts the backslash form is skipped, since backslash paths
     are that language's native way of naming system directories.
+  - A path written through the home DIRECTORY VARIABLE -- "$HOME/...",
+    "${HOME}/..." or "%USERPROFILE%\\..." -- is NOT seen, and this one was
+    rejected on measurement rather than on principle: reading those as "~/"
+    reports one line on this tree, the plugin install destination in this
+    repository's own CI recipe, which is a real location on the reader's
+    machine and not a claim about this repository. No shape test separates it
+    from a private working tree under the same home directory, and a rule
+    that reddens the project's own untouched files costs more than it saves.
+
+What NO rule sees, stated for the same reason. The scan is line oriented, so a
+token split across two lines of a wrapped comment, across a backslash
+continuation, or written as two adjacent string literals is not seen; and it
+compares bytes, so a Cyrillic letter standing in for a Latin one, a U+2010
+hyphen or a zero-width space is not seen either. Closing those needs a parser
+and a Unicode normaliser. This check is for the honest mistake, which is the
+one that actually happens; it is not a defence against an author working
+around it, and nothing here should be read as one.
 
 Run from the repository root:
 
@@ -95,6 +128,12 @@ PATTERNS = [
 #    definition in the same file, they are reference codes.
 LOCAL_LABEL_FAMILIES = ("OA",)
 
+# 4. A local directory's name is banned only if it looks like a name someone
+#    chose rather than a word the language or the field already owns: it
+#    carries a hyphen, an underscore, or a capital that is not the first
+#    letter. See local_only_directories().
+NAME_SHAPED = re.compile(r"[-_]|(?<=.)[A-Z]")
+
 # Third-party code is vendored verbatim and is not ours to restyle.
 EXCLUDE_PREFIXES = (
     "DSParkLab/vendor/",
@@ -115,6 +154,10 @@ DRIVE_TOKEN = re.compile(
 BACKSLASH_TOKEN = re.compile(
     r"(?<![\w\\.$%:-])([A-Za-z][\w.+-]*(?:\\" + SEGMENT + r"){2,})")
 ANY_EXTENSION = re.compile(r"\.([A-Za-z][A-Za-z0-9]{0,5})$")
+# A "file://" URL is a local path with a scheme in front; the path underneath
+# is the claim. Doubled separators are the same path written carelessly.
+FILE_URL = re.compile(r"\bfile://")
+DOUBLED_SEPARATOR = re.compile(r"(?<!:)/{2,}")
 # Extensions of things a build produces or of binary assets. A path ending in
 # one of these describes an output layout, not a file this repository tracks.
 ARTEFACT_EXTENSIONS = frozenset((
@@ -144,8 +187,67 @@ def run(*args):
                           text=True).stdout
 
 
+def run_quiet(*args):
+    """run() with git's own diagnostics discarded. Used for the probes below,
+    which ask git questions it is entitled to refuse: an unignored path, or a
+    path behind a symlink. Those refusals are answers here, not errors, and a
+    raw "fatal:" in this tool's output -- or in a CI log -- would say the
+    check broke when it did not."""
+    return subprocess.run(args, check=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, text=True).stdout
+
+
+# A gitlink is a commit id, not a file: there is nothing in this worktree to
+# open at that path, and opening it is how a submodule would turn this check
+# red with a message about an unreadable file.
+GITLINK_MODE = "160000"
+
+
 def tracked_paths():
-    return [p for p in run("git", "ls-files", "-z").split("\0") if p]
+    paths = []
+    for entry in run("git", "ls-files", "-s", "-z").split("\0"):
+        if not entry or "\t" not in entry:
+            continue
+        header, path = entry.split("\t", 1)
+        if header.split(" ", 1)[0] == GITLINK_MODE:
+            continue
+        paths.append(path)
+    return paths
+
+
+def published_paths():
+    """The file list of the last commit. See local_only_directories() for why
+    the calibration corpus must be the committed tree and not this one."""
+    try:
+        out = run_quiet("git", "ls-tree", "-r", "-z", "--name-only", "HEAD")
+    except subprocess.CalledProcessError:
+        return []
+    return [p for p in out.split("\0") if p]
+
+
+def used_as_a_word_here(name, published):
+    """True when `name` already occurs as a word in the committed tree, in a
+    file name or in the text of a file this check reads.
+
+    The corpus is HEAD rather than the working tree or the index, and that is
+    the whole point: a comment naming the private directory is exactly what
+    this rule is looking for, and if it counted as the repository "using" the
+    word, planting one would switch the rule off."""
+    if any(re.search(r"\b" + re.escape(name) + r"\b", path, re.IGNORECASE)
+           for path in published):
+        return True
+    # Vendored code is excluded here for the same reason it is excluded from
+    # the scan: a word this repository never reads cannot be reported by it.
+    probe = subprocess.run(
+        ("git", "grep", "-I", "-i", "-w", "-F", "-q", "-e", name, "HEAD", "--")
+        + tuple(":(exclude)" + prefix for prefix in EXCLUDE_PREFIXES),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 0 found, 1 not found, anything else is git declining to answer (no
+    # commit yet, a git too old for exclude pathspecs). An unanswered question
+    # counts as "used", which drops the candidate: this rule reporting nothing
+    # is visible in the status line, whereas this rule reporting the wrong
+    # thing is what made it worth deleting.
+    return probe.returncode != 1
 
 
 def local_only_directories(tracked_set):
@@ -156,18 +258,38 @@ def local_only_directories(tracked_set):
 
     A candidate comes from git's own list of ignored entries, and is kept when
     `git check-ignore` answers for it with a rule whose source file is not
-    tracked here. The question is asked about the directory's CONTENTS -- the
-    trailing slash matters -- because a directory is very often hidden by a
-    .gitignore that sits inside it rather than by a rule that names it from
-    outside, and asked about the bare name that case answers "no rule" and the
-    directory would be missed. Both shapes must reach this list; they were
-    measured side by side.
+    tracked here. The question is asked BOTH ways, about the directory's
+    contents and about the bare name, and either answer will do. A directory is
+    very often hidden by a .gitignore sitting inside it rather than by a rule
+    naming it from outside, and asked about the bare name that case answers "no
+    rule"; but asked with the trailing slash about a name that is a symlink to
+    a tree elsewhere, git refuses the question entirely ("pathspec is beyond a
+    symbolic link") and the answer is only available without it. Each form is
+    the only one that works in a configuration this project actually uses.
+
+    A name is then banned only if it could not plausibly be anything else,
+    because this rule reads a private machine and reports on shared code, and
+    a false report here is worse than a miss: it turns the check red on files
+    the contributor never touched, and a check that cries wolf gets deleted.
+    Two tests, both cheap:
+
+      - It must LOOK like a name rather than a word -- a hyphen, an underscore
+        or an internal capital. "audio", "gain", "private" and "samples" are
+        the names people give scratch directories in this field, and they are
+        also this framework's own vocabulary.
+      - It must not already be USED as a word by the committed tree, in a file
+        name or in the text of a file this check reads. A word the repository
+        itself writes down is by definition not something only resolvable on
+        one machine, so banning it can only produce false reports.
+
+    A plain lowercase name stays reachable through rule 2 in its path form,
+    which is unchanged and needs no local knowledge at all.
 
     The list is read from the working tree at run time and never written down.
     That has a consequence worth stating: on a clean clone, and on any machine
     whose working tree holds nothing locally ignored, it comes out empty and
     this rule checks nothing at all. A green run is not evidence that the rule
-    fired."""
+    fired, which is why the run prints how many names it holds."""
     names = set()
     try:
         status = run("git", "status", "--ignored", "--porcelain")
@@ -176,19 +298,32 @@ def local_only_directories(tracked_set):
     candidates = sorted({line[3:].split("/", 1)[0]
                          for line in status.split("\n")
                          if line.startswith("!! ")})
+    published = None
     for name in candidates:
-        try:
-            source = run("git", "check-ignore", "-v",
-                         name + "/").split(":", 1)[0]
-        except subprocess.CalledProcessError:
+        # Very short names collide with ordinary words too easily to ban.
+        if len(name) < 4:
+            continue
+        if not NAME_SHAPED.search(name):
+            continue
+        source = None
+        for probe in (name + "/", name):
+            try:
+                source = run_quiet("git", "check-ignore", "-v",
+                                   probe).split(":", 1)[0]
+                break
+            except subprocess.CalledProcessError:
+                continue
+        if source is None:
             continue
         # Hidden by a rule that ships with the repository: every reader sees
         # that rule, so the name is public and may be mentioned freely.
         if source in tracked_set:
             continue
-        # Very short names collide with ordinary words too easily to ban.
-        if len(name) >= 4:
-            names.add(name)
+        if published is None:
+            published = published_paths()
+        if used_as_a_word_here(name, published):
+            continue
+        names.add(name)
     return names
 
 
@@ -209,6 +344,7 @@ def extension_of(segment):
 def path_claims(line, in_windows_script):
     """Every token in `line` that claims to be a location, normalised to
     forward slashes."""
+    line = DOUBLED_SEPARATOR.sub("/", FILE_URL.sub("", line))
     tokens = []
     for match in DRIVE_TOKEN.finditer(line):
         tokens.append(match.group(1)[2:].replace("\\", "/"))
@@ -220,10 +356,12 @@ def path_claims(line, in_windows_script):
     claims = []
     for token in tokens:
         token = token.rstrip(".,;:")
-        rooted = token.startswith(("/", "~/"))
+        absolute = token.startswith("/")
         body = token[2:] if token.startswith("~/") else token.lstrip("/")
         segments = [s for s in body.split("/") if s]
-        if len(segments) < 3 or (rooted and len(segments) < 4):
+        # The four-segment floor answers /usr/bin/env; nothing under someone's
+        # home directory is a system location, so "~/" keeps the usual three.
+        if len(segments) < 3 or (absolute and len(segments) < 4):
             continue
         if any(extension_of(s) in ARTEFACT_EXTENSIONS for s in segments):
             continue
@@ -264,10 +402,16 @@ def main():
         for index in range(1, len(parts)):
             directories.add("/".join(parts[:index]))
 
-    regex = re.compile("|".join(PATTERNS))
+    # Case is not part of either claim. A reference code lower-cased is the
+    # same dangling reference, and this repository's own file names are all
+    # lower case, which is the spelling a document migrating out of a private
+    # tree would most naturally arrive with. Measured over this tree, reading
+    # both rules without regard to case costs nothing: it adds no report.
+    regex = re.compile("|".join(PATTERNS), re.IGNORECASE)
     local_dirs = local_only_directories(tracked_set)
     local_regex = (re.compile("|".join(r"\b" + re.escape(n) + r"\b"
-                                       for n in sorted(local_dirs)))
+                                       for n in sorted(local_dirs)),
+                              re.IGNORECASE)
                    if local_dirs else None)
     label_regex = re.compile(
         r"\b(" + "|".join(LOCAL_LABEL_FAMILIES) + r")-(\d+)\b")
@@ -339,6 +483,11 @@ def main():
     if skipped_binary:
         print("comment style: {} tracked file(s) skipped as binary "
               "(names still checked).".format(skipped_binary))
+    # The count, never the names: it is 0 on a clean clone and on CI, and it
+    # is the difference between "this rule found nothing" and "this rule was
+    # not looking". The names themselves are the private thing and stay here.
+    print("comment style: local-directory rule: {} name(s) in effect".format(
+        len(local_dirs)))
     if not hits:
         print("comment style: no unresolvable references found")
         return 0

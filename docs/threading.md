@@ -41,19 +41,25 @@ let the reader observe the writer's later stores. (A getter that returns a
 reference to state owned by the processing thread is a different animal; see
 the exception at the end of "Pointers returned across threads".)
 
-The words are drawn from a list chosen so they cannot lock: `bool`, `int`,
-`unsigned`, `std::size_t`, the fixed-width integers up to 64 bits, `float`,
-`double`, and enums whose underlying type is one of those.
-`tests/TestCoreFoundation.cpp` sweeps that list and asserts
-`std::atomic<T>::is_always_lock_free` for each word type, so a target where one
-of them falls back to a mutex fails the suite.
+The words are chosen so they cannot lock. `tests/TestCoreFoundation.cpp`
+asserts `std::atomic<T>::is_always_lock_free` for nine word types -- `bool`,
+`int`, `unsigned`, `std::size_t`, `std::uint32_t`, `std::int64_t`,
+`std::uint64_t`, `float` and `double` -- so a target where one of them falls
+back to a mutex fails the suite.
+
+Those nine are what the suite pins, not every word the framework publishes. An
+enum word inherits the property from its underlying integer type, and the
+atomic enums here are backed by the integers above, so they hold without being
+asserted one by one. One published word is neither an integer nor an enum:
+`Effects/Saturation.h` hands its active algorithm across as an atomic pointer,
+lock-free on every supported target and outside the census.
 
 That is a run-time census of the word types. It is **not** a compile-time check
 on your component, and the build will not stop you using a word the census
 never saw. Where the word type is a template parameter the census cannot reach
-it, so the header pins it itself -- `Analysis/SpectrumAnalyzer.h` and
-`Effects/AutoGain.h` both do. A new component with an atomic word on the audio
-path should do the same:
+it at all. Two headers pin it themselves -- `Analysis/SpectrumAnalyzer.h` and
+`Effects/AutoGain.h` -- and most of the headers that declare such an atomic do
+not. A new component with an atomic word on the audio path should do the same:
 
 ```cpp
 static_assert(std::atomic<T>::is_always_lock_free,

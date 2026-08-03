@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -103,6 +104,7 @@ public:
 
     static_assert(std::atomic<T>::is_always_lock_free,
                   "audio-thread stores must not lock");
+    static_assert(MaxBands > 0, "an equalizer needs at least one band");
 
     // -- Lifecycle --------------------------------------------------------------
 
@@ -522,13 +524,27 @@ public:
 
     /**
      * @brief Direct access to a band's underlying FilterEngine.
-     * @param index Band index.
+     *
+     * The index is clamped, so an out-of-range one returns band 0 or the last
+     * band instead of binding a reference past the end of the band array. A
+     * debug build asserts first: clamping keeps a release build defined, it
+     * does not make a wrong index mean anything.
+     *
+     * @param index Band index. Clamped safely to valid range in release mode.
      * @return Reference to the FilterEngine for this band.
      */
-    FilterEngine<T>& getBandFilter(int index) { return bands_[index]; }
+    [[nodiscard]] FilterEngine<T>& getBandFilter(int index) noexcept
+    {
+        assert(index >= 0 && index < MaxBands);
+        return bands_[static_cast<std::size_t>(std::clamp(index, 0, MaxBands - 1))];
+    }
 
-    /** @brief Const overload. */
-    const FilterEngine<T>& getBandFilter(int index) const { return bands_[index]; }
+    /** @brief Const overload. Same clamping contract. */
+    [[nodiscard]] const FilterEngine<T>& getBandFilter(int index) const noexcept
+    {
+        assert(index >= 0 && index < MaxBands);
+        return bands_[static_cast<std::size_t>(std::clamp(index, 0, MaxBands - 1))];
+    }
 
 
     /** @brief Serializes bands and modes (setup/UI threads; allocates). */
@@ -914,12 +930,16 @@ protected:
      */
     struct StagedBand
     {
-        std::atomic<T>    frequency { T(1000) };
-        std::atomic<T>    gain      { T(0) };
-        std::atomic<T>    q         { T(0.707) };
-        std::atomic<int>  type      { static_cast<int>(BandType::Peak) };
-        std::atomic<int>  slope     { 12 };
-        std::atomic<bool> enabled   { true };
+        // Initialised FROM BandConfig's own defaults, never from a second copy
+        // of the literals: a staged band that starts life disagreeing with the
+        // BandConfig a caller reads back is a bug no test would obviously
+        // catch, and two hand-written default sets drift one field at a time.
+        std::atomic<T>    frequency { BandConfig{}.frequency };
+        std::atomic<T>    gain      { BandConfig{}.gain };
+        std::atomic<T>    q         { BandConfig{}.q };
+        std::atomic<int>  type      { static_cast<int>(BandConfig{}.type) };
+        std::atomic<int>  slope     { BandConfig{}.slope };
+        std::atomic<bool> enabled   { BandConfig{}.enabled };
         std::atomic<unsigned> seq   { 0 };
 
         /**

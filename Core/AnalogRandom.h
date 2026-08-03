@@ -634,7 +634,7 @@ namespace dspark
                 // "instrumentation-grade" variant): parallel one-pole bank whose
                 // summed response tracks -3 dB/oct across the audio band to
                 // within ~0.5 dB. The previous 3-pole truncation measured ~-5
-                // dB/oct when measured, violating the documented pink slope.
+                // dB/oct, violating the documented pink slope.
                 Real b0 = pinkNoiseOctaves_[0];
                 Real b1 = pinkNoiseOctaves_[1];
                 Real b2 = pinkNoiseOctaves_[2];

@@ -465,9 +465,9 @@ private:
 
                 // Refresh gain-filter coefficients every 16 samples - the gain
                 // envelope is slow enough that this granularity is inaudible.
-                // Bells use the precomputed freq/Q trig (a single pow() per
-                // refresh, which is the point); shelves run their full
-                // design, which at 1/16th rate stays negligible.
+                // Bells use the precomputed freq/Q trig, so a refresh costs
+                // one pow() instead of a full sin/cos/pow redesign; shelves
+                // run their full design, which at 1/16th rate stays negligible.
                 if ((i & 15) == 0)
                 {
                     if (std::abs(currentGain) > T(0.01))

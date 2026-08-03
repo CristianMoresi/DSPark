@@ -2326,6 +2326,18 @@ private:
 
             size_t headerSize = 4 + (hdr.crcProtect ? 2 : 0);
 
+            // The frame scan only proves that the 4 sync bytes are inside the
+            // file, so a stream truncated inside a frame reaches here with a
+            // side-info block that runs past the end of the buffer. Reading it
+            // is a heap over-read on attacker-supplied input; a frame whose
+            // side info is not fully present is skipped and leaves its slot
+            // silent, exactly like a frame whose header fails to parse.
+            if (frameStart + headerSize + static_cast<size_t>(hdr.sideInfoSize) > fileData_.size())
+            {
+                sampleIdx += kSamplesPerFrame;
+                continue;
+            }
+
             BitReader siBr;
             siBr.init(fileData_.data() + frameStart + headerSize, static_cast<size_t>(hdr.sideInfoSize));
 

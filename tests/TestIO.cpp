@@ -739,3 +739,95 @@ DSPARK_TEST(Mp3File_part23_budget_includes_scalefactor_bits)
         energy += std::fabs(double(buf.getChannel(0)[i]));
     EXPECT_NEAR(energy, 0.0, 1e-12); // exact silence; the old decoder measured 2568
 }
+
+// ============================================================================
+// Mp3File - hostile-input and bitstream-conformance pins (file I/O hardening)
+// ============================================================================
+
+// Builds one MPEG-1 Layer III frame: no CRC, 64 kbps, 48 kHz, mono, 192 bytes.
+// `writeGranule(gr, bits)` contributes that granule's side-info fields and
+// main data; the caller supplies both through the two callbacks.
+template <typename SideInfoFn, typename MainDataFn>
+static std::vector<uint8_t> mp3CraftFrame(SideInfoFn sideInfo, MainDataFn mainData,
+                                          uint32_t scfsi = 0)
+{
+    Mp3TestBits b;
+    b.put(0x7FF, 11); b.put(3, 2); b.put(1, 2); b.put(1, 1);   // sync, MPEG-1, layer III, no CRC
+    b.put(5, 4); b.put(1, 2); b.put(0, 1); b.put(0, 1);        // 64 kbps, 48 kHz, no padding
+    b.put(3, 2); b.put(0, 2); b.put(0, 1); b.put(1, 1); b.put(0, 2); // mono
+    b.put(0, 9); b.put(0, 5); b.put(scfsi, 4);                 // main_data_begin, private, scfsi
+    sideInfo(b);
+    while (b.bitPos < 21 * 8) b.put(0, 1);                     // pad to the end of the side info
+    mainData(b);
+    std::vector<uint8_t> frame = b.bytes;
+    frame.resize(192, 0);
+    return frame;
+}
+
+static void mp3WriteFile(const char* path, const std::vector<uint8_t>& frame, int repeats)
+{
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    for (int i = 0; i < repeats; ++i)
+        f.write(reinterpret_cast<const char*>(frame.data()),
+                static_cast<std::streamsize>(frame.size()));
+}
+
+static double mp3DecodeEnergy(const char* path)
+{
+    Mp3File r;
+    if (!r.openRead(path)) return -1.0;
+    auto info = r.getInfo();
+    AudioBuffer<float> buf;
+    buf.resize(static_cast<int>(info.numChannels), static_cast<int>(info.numSamples));
+    if (!r.readSamples(buf.toView())) return -1.0;
+    double e = 0.0;
+    for (int i = 0; i < static_cast<int>(info.numSamples); ++i)
+    {
+        const double v = double(buf.getChannel(0)[i]);
+        e += v * v;
+    }
+    r.close();
+    return e;
+}
+
+// A stream truncated inside a frame: the last frame contributes only its four
+// sync bytes, so its 17-byte side info is not in the file at all. The frame
+// scan only proves the sync word is present, so the decoder used to hand
+// parseSideInfo a reader over 17 bytes past the end of the buffer -- a heap
+// over-read on untrusted input, reproduced under AddressSanitizer as
+// "heap-buffer-overflow ... READ of size 1 ... in BitReader::readBits" and
+// minimised to this shape. Decoding must simply skip the incomplete frame.
+DSPARK_TEST(Mp3File_frame_truncated_before_side_info_is_not_overread)
+{
+    FileCleanup cleanup { "dspark_test_trunc.mp3" };
+
+    auto silentSide = [](Mp3TestBits& b) {
+        for (int gr = 0; gr < 2; ++gr)
+        {
+            b.put(0, 12); b.put(0, 9); b.put(210, 8); b.put(0, 4); b.put(0, 1);
+            b.put(0, 5); b.put(0, 5); b.put(0, 5); b.put(0, 4); b.put(0, 3);
+            b.put(0, 1); b.put(0, 1); b.put(0, 1);
+        }
+    };
+    std::vector<uint8_t> frame = mp3CraftFrame(silentSide, [](Mp3TestBits&) {});
+
+    {
+        std::ofstream f("dspark_test_trunc.mp3", std::ios::binary | std::ios::trunc);
+        for (int i = 0; i < 2; ++i)
+            f.write(reinterpret_cast<const char*>(frame.data()),
+                    static_cast<std::streamsize>(frame.size()));
+        f.write(reinterpret_cast<const char*>(frame.data()), 4); // header only
+    }
+
+    Mp3File r;
+    EXPECT_TRUE(r.openRead("dspark_test_trunc.mp3"));
+    auto info = r.getInfo();
+    EXPECT_EQ(info.numChannels, 1u);
+    EXPECT_TRUE(info.numSamples > 0);
+
+    AudioBuffer<float> buf;
+    buf.resize(1, static_cast<int>(info.numSamples));
+    EXPECT_TRUE(r.readSamples(buf.toView()));
+    EXPECT_NO_NAN(buf.getChannel(0), static_cast<int>(info.numSamples));
+    r.close();
+}

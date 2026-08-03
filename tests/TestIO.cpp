@@ -933,3 +933,65 @@ DSPARK_TEST(Mp3File_scfsi_granule1_inherits_granule0_scalefactors)
     EXPECT_GT(eOff, 0.0);
     EXPECT_NEAR(eOn / eOff, 1.0, 0.02);   // pre-fix the inheriting file measured ~65x
 }
+
+// The encoder has to produce the transform the decoder inverts. It did not:
+// the forward MDCT ran at twice the correct argument scale, the analysis window
+// was the synthesis window (32x hot), and the frequency inversion and the alias
+// butterfly the decoder undoes were never applied. The result was a legal MP3
+// carrying noise -- a full-scale, 98%-clipped decode whose correlation with the
+// input was 0.024, confirmed independently by a third-party decoder.
+DSPARK_TEST(Mp3File_encoder_output_decodes_back_to_its_input)
+{
+    FileCleanup cleanup { "dspark_test_rt.mp3" };
+
+    constexpr int N = 44100;
+    std::vector<float> orig(N);
+    for (int i = 0; i < N; ++i)
+        orig[static_cast<size_t>(i)] =
+            0.5f * std::sin(2.0f * pi<float> * 1000.0f * float(i) / 44100.0f);
+
+    {
+        Mp3File w;
+        AudioFileInfo info;
+        info.sampleRate = 44100.0;
+        info.numChannels = 1;
+        info.bitsPerSample = 320;   // kbps
+        info.numSamples = N;
+        EXPECT_TRUE(w.openWrite("dspark_test_rt.mp3", info));
+        AudioBuffer<float> buf;
+        buf.resize(1, N);
+        std::copy(orig.begin(), orig.end(), buf.getChannel(0));
+        EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+        w.close();
+    }
+
+    Mp3File r;
+    EXPECT_TRUE(r.openRead("dspark_test_rt.mp3"));
+    auto info = r.getInfo();
+    const int n = static_cast<int>(info.numSamples);
+    EXPECT_TRUE(n > N);
+    AudioBuffer<float> dec;
+    dec.resize(1, n);
+    EXPECT_TRUE(r.readSamples(dec.toView()));
+    r.close();
+    EXPECT_NO_NAN(dec.getChannel(0), n);
+
+    // Best-lag normalised correlation over the codec's delay range.
+    const float* d = dec.getChannel(0);
+    double best = -1.0;
+    for (int lag = 0; lag <= 4096; ++lag)
+    {
+        const int use = std::min(N - 4096, n - lag - 4096);
+        if (use < 8192) break;
+        double sa = 0.0, sb = 0.0, sab = 0.0;
+        for (int i = 0; i < use; ++i)
+        {
+            const double a = orig[static_cast<size_t>(i)];
+            const double b = d[i + lag];
+            sa += a * a; sb += b * b; sab += a * b;
+        }
+        const double den = std::sqrt(sa * sb);
+        if (den > 0.0 && sab / den > best) best = sab / den;
+    }
+    EXPECT_GT(best, 0.70);   // pre-fix this measured 0.008 - 0.024
+}

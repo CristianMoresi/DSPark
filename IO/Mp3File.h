@@ -1869,10 +1869,14 @@ private:
         std::memmove(st.analysisBuf + 32, st.analysisBuf, 480 * sizeof(double));
         for (int i = 0; i < 32; ++i) st.analysisBuf[i] = pcm32[31 - i];
 
+        // The analysis window is the synthesis window divided by 32 (ISO
+        // 11172-3: C[i] = D[i]/32). Windowing the input with D itself made the
+        // subband samples 32x hot, which the decoder then reproduces faithfully
+        // as a 32x hot output.
         double Y[64] = {};
         for (int i = 0; i < 64; ++i)
             for (int j = 0; j < 8; ++j)
-                Y[i] += st.analysisBuf[i + j * 64] * kSynthWindow[i + j * 64];
+                Y[i] += st.analysisBuf[i + j * 64] * (kSynthWindow[i + j * 64] / 32.0);
 
         static constexpr double kPi = 3.14159265358979323846;
         for (int k = 0; k < 32; ++k)
@@ -1890,12 +1894,37 @@ private:
         double zw[36];
         for (int n = 0; n < 36; ++n) zw[n] = z[n] * kNormalWindow[n];
 
+        // Forward MDCT, the exact transpose of the decoder's IMDCT: the
+        // argument scale is pi/(2n) with n = 36, i.e. pi/72. Using pi/36 halved
+        // the period of every basis function, so the analysis basis was not the
+        // synthesis basis at all and the encoder emitted noise.
         for (int k = 0; k < 18; ++k)
         {
             double sum = 0.0;
             for (int n = 0; n < 36; ++n)
-                sum += zw[n] * std::cos(kPi / 36.0 * (2.0 * n + 19.0) * (2.0 * k + 1.0));
-            X[k] = sum;
+                sum += zw[n] * std::cos(kPi / 72.0 * (2.0 * n + 19.0) * (2.0 * k + 1.0));
+            X[k] = sum * (2.0 / 18.0);
+        }
+    }
+
+    // Inverse of the decoder's alias reduction: the decoder rotates every
+    // subband boundary back, so the encoder has to rotate it forward first.
+    // Without this the decoder's butterfly mixes coefficients that were never
+    // mixed and the reconstruction is aliased everywhere.
+    static void encAliasButterfly(double xr[576])
+    {
+        static const AliasCoeffs ac = getAliasCoeffs();
+        for (int sb = 0; sb < 31; ++sb)
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                const int i1 = (sb + 1) * 18 - 1 - i;
+                const int i2 = (sb + 1) * 18 + i;
+                const double a = xr[i1];
+                const double b = xr[i2];
+                xr[i1] = a * ac.cs[i] + b * ac.ca[i];
+                xr[i2] = b * ac.cs[i] - a * ac.ca[i];
+            }
         }
     }
 
@@ -2176,6 +2205,14 @@ private:
                 encAnalysis(&encInput_[ch][ts * 32], ch, S);
                 for (int sb = 0; sb < 32; ++sb) subbands[ch][sb][ts] = S[sb];
             }
+
+            // Counterpart of the decoder's frequency inversion: every second
+            // sample of every second subband is negated before the MDCT so the
+            // decoder's own inversion undoes it. Time slot parity survives the
+            // granule split because a granule is 18 slots long.
+            for (int sb = 1; sb < 32; sb += 2)
+                for (int ts = 1; ts < 36; ts += 2)
+                    subbands[ch][sb][ts] = -subbands[ch][sb][ts];
         }
 
         SideInfo si {};
@@ -2197,6 +2234,7 @@ private:
                     encMdct36(mdctIn, mdctOut);
                     for (int k = 0; k < 18; ++k) xr[gr][ch][sb * 18 + k] = mdctOut[k];
                 }
+                encAliasButterfly(xr[gr][ch]);
             }
         }
 

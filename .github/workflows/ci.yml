@@ -13,8 +13,8 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Comment style: comments and documentation must be self-contained. Cheap,
-  # so it runs first and on every push.
+  # Documentation must be self-contained and must match the code it describes.
+  # Both checks are cheap and need no build, so they run first on every push.
   # ---------------------------------------------------------------------------
   comment-style:
     name: Comment style
@@ -23,6 +23,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check for unresolvable reference codes
         run: python3 tools/check_comment_style.py
+      - name: Check the threading page against the code
+        run: python3 tools/verify_threading_doc.py
 
   # ---------------------------------------------------------------------------
   # Build + run the public conformance suite on every platform

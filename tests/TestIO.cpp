@@ -1283,3 +1283,86 @@ DSPARK_TEST(Mp3File_short_block_starts_six_samples_into_the_window)
     EXPECT_GT(g[1], 1.0);       // window 2 lands in the next granule, in full
     EXPECT_LT(g[0], 1e-9);      // ... and none of it here; pre-fix: 1.6e-2
 }
+
+// ============================================================================
+// Mp3File - the last long scalefactor band, and the encoder's region fields
+// ============================================================================
+
+// Decodes a whole file and returns its samples for channel 0.
+static std::vector<double> mp3DecodeChannel0(const char* path)
+{
+    std::vector<double> out;
+    Mp3File r;
+    if (!r.openRead(path)) return out;
+    auto info = r.getInfo();
+    AudioBuffer<float> buf;
+    buf.resize(static_cast<int>(info.numChannels), static_cast<int>(info.numSamples));
+    if (!r.readSamples(buf.toView())) return out;
+    r.close();
+    out.resize(static_cast<size_t>(info.numSamples));
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i] = double(buf.getChannel(0)[i]);
+    return out;
+}
+
+// ISO 11172-3 2.4.2.7 sends long scalefactors for bands 0..20 only: band 21 has
+// none and is implicitly 0. The decoder seeds granule 1's scalefactor array with
+// granule 0's so that scfsi inheritance works, but scfsi only ever covers bands
+// 0..20 - so when granule 0 is a SHORT block, whose 12 bands x 3 windows fill
+// entries 0..35, entry 21 still held one of ITS per-window scalefactors and
+// granule 1 requantised long band 21 with it.
+//
+// Band 21 is the top of the spectrum (coefficients 384..575 at 48 kHz), and the
+// granule that follows a short block is the stop block of a transient, so this
+// darkened the top octave of every transient by up to 2^-7.5. These two files
+// differ ONLY in a short-block scalefactor of granule 0, at the entry that band
+// 21 aliased onto; granule 1 carries one coefficient at index 384. A conformant
+// decoder must return byte-identical audio for both.
+DSPARK_TEST(Mp3File_long_band_21_ignores_the_previous_granule_short_scalefactors)
+{
+    FileCleanup cleanupA { "dspark_test_band21_a.mp3" };
+    FileCleanup cleanupB { "dspark_test_band21_b.mp3" };
+
+    // granule 0: short block, silent, 54 bits of scalefactors (scalefac_compress
+    //            3 -> slen1 0, slen2 3, so only bands 6..11 spend bits);
+    // granule 1: stop block carrying (1,0) at coefficients 384,385 - long band 21.
+    auto build = [](uint32_t shortSf21) {
+        auto side = [](Mp3TestBits& b) {
+            b.put(54, 12); b.put(0, 9); b.put(190, 8); b.put(3, 4); b.put(1, 1);
+            b.put(2, 2); b.put(0, 1); b.put(0, 5); b.put(0, 5);
+            b.put(0, 3); b.put(0, 3); b.put(0, 3);
+            b.put(0, 1); b.put(0, 1); b.put(0, 1);
+            b.put(195, 12); b.put(193, 9); b.put(190, 8); b.put(0, 4); b.put(1, 1);
+            b.put(3, 2); b.put(0, 1); b.put(1, 5); b.put(1, 5);
+            b.put(0, 3); b.put(0, 3); b.put(0, 3);
+            b.put(0, 1); b.put(0, 1); b.put(0, 1);
+        };
+        auto main_ = [shortSf21](Mp3TestBits& b) {
+            // granule 0: 18 short scalefactors of 3 bits (bands 6..11 x 3 windows).
+            // Entry 21 is the fourth of them - the one long band 21 aliases onto.
+            for (int i = 0; i < 18; ++i) b.put(i == 3 ? shortSf21 : 0u, 3);
+            // granule 1: 192 (0,0) pairs, then (1,0) at coefficients 384,385.
+            for (int i = 0; i < 192; ++i) b.put(0b1, 1);
+            b.put(0b01, 2); b.put(0, 1);
+        };
+        return mp3CraftFrame(side, main_);
+    };
+
+    mp3WriteFile("dspark_test_band21_a.mp3", build(0), 8);
+    mp3WriteFile("dspark_test_band21_b.mp3", build(7), 8);
+
+    const std::vector<double> a = mp3DecodeChannel0("dspark_test_band21_a.mp3");
+    const std::vector<double> b = mp3DecodeChannel0("dspark_test_band21_b.mp3");
+    EXPECT_EQ(a.size(), b.size());
+    EXPECT_TRUE(a.size() >= 4608);
+
+    double energy = 0.0, worst = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        energy += std::fabs(a[i]);
+        worst = std::max(worst, std::fabs(a[i] - b[i]));
+    }
+    EXPECT_GT(energy, 1.0);      // the band-21 coefficient really is audible
+    EXPECT_LT(worst, 1e-12);     // pre-fix the two decodes differed by 2^-3.5
+}
+

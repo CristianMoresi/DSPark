@@ -1443,6 +1443,20 @@ private:
                 for (int sfb = bandStart[group]; sfb < bandEnd[group]; ++sfb)
                     scalefac[sfb] = static_cast<int>(br.readBits(slen));
             }
+
+            // A long block carries scalefactors for sfb 0..20 only (ISO
+            // 11172-3 2.4.2.7): band 21 has none and is implicitly 0, and
+            // entries 21..38 of this array belong to the short-block layout.
+            // Granule 1 is seeded with granule 0's whole array so that scfsi
+            // inheritance works, but scfsi only ever covers sfb 0..20 -- so
+            // when granule 0 was a SHORT block, entry 21 still held one of its
+            // per-window scalefactors, and requantize() then attenuated long
+            // band 21 by a factor the encoder never sent. Band 21 is the top
+            // of the spectrum (coefficients 418..575 at 44100 Hz, 384..575 at
+            // 48000 Hz), and the granule after a short block is always the
+            // stop block of a transient, so every transient decoded with a
+            // silently darkened top octave.
+            for (int sfb = 21; sfb < 39; ++sfb) scalefac[sfb] = 0;
         }
         bitsRead = br.getPos() - startBits;
     }

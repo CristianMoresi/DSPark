@@ -81,13 +81,15 @@ agree (each limit below was measured against this tree before being accepted):
   - In Windows scripts the backslash form is skipped, since backslash paths
     are that language's native way of naming system directories.
   - A path written through the home DIRECTORY VARIABLE -- "$HOME/...",
-    "${HOME}/..." or "%USERPROFILE%\\..." -- is NOT seen, and this one was
-    rejected on measurement rather than on principle: reading those as "~/"
-    reports one line on this tree, the plugin install destination in this
-    repository's own CI recipe, which is a real location on the reader's
-    machine and not a claim about this repository. No shape test separates it
-    from a private working tree under the same home directory, and a rule
-    that reddens the project's own untouched files costs more than it saves.
+    "${HOME}/..." or "%USERPROFILE%\\..." -- is read as "~/", because it is
+    the same claim about the same place; but inside a shell or CI recipe it
+    is left alone, for the same reason the backslash form is left alone in a
+    Windows script: there that spelling is how the language names a system
+    directory, not prose about this repository. Measured on this tree, that
+    condition is what makes the form free: read everywhere, it reports one
+    line, the plugin install destination in this project's own CI recipe;
+    read everywhere but in recipes, it reports none and still catches a
+    private working tree named under the same home directory.
 
 What NO rule sees, stated for the same reason. The scan is line oriented, so a
 token split across two lines of a wrapped comment, across a backslash
@@ -174,6 +176,12 @@ ARTEFACT_EXTENSIONS = frozenset((
 # Windows scripts name system directories with backslashes as a matter of
 # course; the backslash form of the rule would be noise there.
 WINDOWS_SCRIPT_SUFFIXES = (".bat", ".cmd", ".ps1")
+# The home directory written through its variable is the same claim as "~/".
+HOME_VARIABLE = re.compile(r"(?:\$\{?HOME\}?|%USERPROFILE%)[\\/]")
+# ... except in a recipe, where naming a system directory through that
+# variable is the language's own spelling rather than a claim about this
+# repository -- the same exemption Windows scripts get for backslashes.
+RECIPE_SUFFIXES = (".sh", ".yml", ".yaml")
 # The installation docs write include paths with the framework's own folder
 # name in front, the way a user who copied it into their project would -- and
 # they write where that folder goes in the user's project, which is the same
@@ -369,9 +377,11 @@ def extension_of(segment):
     return match.group(1).lower() if match else ""
 
 
-def path_claims(line, in_windows_script):
+def path_claims(line, in_windows_script, in_recipe):
     """Every token in `line` that claims to be a location, normalised to
     forward slashes."""
+    if not in_recipe:
+        line = HOME_VARIABLE.sub("~/", line)
     line = DOUBLED_SEPARATOR.sub("/", FILE_URL.sub("", line))
     tokens = []
     for match in DRIVE_TOKEN.finditer(line):
@@ -497,13 +507,15 @@ def main():
             continue
 
         windows_script = name.lower().endswith(WINDOWS_SCRIPT_SUFFIXES)
+        recipe = windows_script or name.lower().endswith(RECIPE_SUFFIXES)
         for number, line in enumerate(lines, 1):
             scan_names(line, number, path, body, "")
             if name in NO_PATH_RULE:
                 continue
             stripped = re.sub(r"https?://\S+", "", line)
             stripped = re.sub(r"#\s*include\s*<[^>]*>", "", stripped)
-            for token, normalised in path_claims(stripped, windows_script):
+            for token, normalised in path_claims(stripped, windows_script,
+                                                 recipe):
                 if resolves(normalised, base, tracked_set, directories):
                     continue
                 hits.append((path, number, token, line,

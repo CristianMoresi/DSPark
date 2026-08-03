@@ -1159,6 +1159,31 @@ DSPARK_TEST(PhaseCorrelation_reset_clears_ring_and_mono_is_dual_mono)
 // Cross-thread publication pins (concurrent, with a reachability argument)
 // ============================================================================
 
+// Shared probe signal for the SpectrumAnalyzer publication pins: two tones
+// of EQUAL amplitude at 1500 Hz and 18750 Hz, which at 48 kHz land exactly
+// on bins fftSize/32 and fftSize*25/64 for every power-of-two fftSize the
+// analyser accepts. The phase index is reduced modulo 64 -- the tones'
+// exact common period (2 and 25 whole cycles) -- so both stay on-bin
+// however long the writer has been running. Reducing it is load-bearing,
+// not cosmetic: with the raw index, static_cast<float>(n) stops being exact
+// at n = 2^24 = 16777216 and the 18750 Hz argument, 12.5x larger than the
+// 1500 Hz one, loses its low bits first, so the upper probe bin
+// decorrelates while the lower one survives. The pins then report tens of
+// dB of "tear" on a handoff that never tore, and their verdict becomes a
+// function of how many frames the writer got through -- i.e. of machine
+// speed and -O level. SpectrumAnalyzer_probe_signal_stays_on_bin_past_2p24
+// below is the deterministic guard for exactly that.
+static void fillProbeTones(float* dst, int numSamples, long long& n, float amp)
+{
+    const float w1 = twoPi<float> * 1500.0f / 48000.0f;
+    const float w2 = twoPi<float> * 18750.0f / 48000.0f;
+    for (int i = 0; i < numSamples; ++i, ++n)
+    {
+        const float ph = static_cast<float>(n & 63);
+        dst[static_cast<size_t>(i)] = amp * (std::sin(w1 * ph) + std::sin(w2 * ph));
+    }
+}
+
 // Pin for the SpectrumAnalyzer triple-buffer handoff (audio writer vs GUI
 // reader), the largest un-oracled lock-free structure in the library before
 // this pin. The writer publishes spectra whose two probe bins ALWAYS carry
@@ -1169,7 +1194,9 @@ DSPARK_TEST(PhaseCorrelation_reset_clears_ring_and_mono_is_dual_mono)
 // STEP's spectral splatter at 368 bins distance is >30 dB under either
 // tone). A reader that ever observes a slot the writer is concurrently
 // writing mixes a high-level bin 32 with a low-level bin 400 (or vice
-// versa) and trips the 12 dB delta bound.
+// versa) and trips the 12 dB delta bound. That "every coherent frame" claim
+// holds for any run length only because fillProbeTones() reduces the phase
+// index; read its comment before touching the signal.
 // Reachability argument: breaking the ownership handoff -- a mutated
 // computeSpectrum() that publishes the finished slot but KEEPS
 // writing into it (no slot adoption) -- makes this exact assertion fail with
@@ -1192,17 +1219,12 @@ DSPARK_TEST(SpectrumAnalyzer_triple_buffer_concurrent_readout_is_tear_free)
 
     std::thread audio([&] {
         std::vector<float> block(512);
-        const float w1 = twoPi<float> * 1500.0f / 48000.0f;
-        const float w2 = twoPi<float> * 18750.0f / 48000.0f;
         long long n = 0;
         int hop = 0;
         while (!stop.load(std::memory_order_relaxed))
         {
             const float amp = ((hop / 8) & 1) ? 0.025f : 0.4f; // 24 dB toggle
-            for (int i = 0; i < 512; ++i, ++n)
-                block[static_cast<size_t>(i)] =
-                    amp * (std::sin(w1 * static_cast<float>(n))
-                         + std::sin(w2 * static_cast<float>(n)));
+            fillProbeTones(block.data(), 512, n, amp);
             sa->pushSamples(block.data(), 512);
             ++hop;
             frames.fetch_add(1, std::memory_order_relaxed); // 1 hop = 1 frame
@@ -1229,6 +1251,121 @@ DSPARK_TEST(SpectrumAnalyzer_triple_buffer_concurrent_readout_is_tear_free)
     EXPECT_EQ(violations, 0);
     EXPECT_GT(frames.load(std::memory_order_relaxed), 63); // writer liveness
     EXPECT_GT(fresh, 16);                                  // adoption liveness
+}
+
+// Deterministic guard for the probe signal the two publication pins above
+// and below rely on. NO threads: one writer, one reader, same call, so a
+// failure here can only be the signal or the analyser, never a handoff.
+// It drives the sample index across 2^24 = 16777216 -- the last integer a
+// float represents exactly -- which is where the raw-index form of this
+// signal silently stops being two equal on-bin tones. Starting the index
+// just below the cliff instead of counting up to it keeps the pin at a few
+// hundred frames.
+// Reachability argument: with fillProbeTones()'s `n & 63` replaced by the
+// raw `n` this pin fails unconditionally -- measured on this tree,
+// single-threaded at -O2, all 204 checked frames violate and |d| reaches
+// 27.22 dB against a bound of 1 dB -- which is exactly the reading the
+// concurrent pin above reports as a torn snapshot when it is really just
+// this. With the reduction in place every frame gives |d| = 0.00 dB.
+DSPARK_TEST(SpectrumAnalyzer_probe_signal_stays_on_bin_past_2p24)
+{
+    auto sa = std::make_unique<SpectrumAnalyzer<float>>();
+    sa->prepare(48000.0, 1024);
+    sa->setSmoothing(0.0f);
+    sa->setPeakHoldEnabled(false);
+    sa->setFloorDb(-200.0f);
+
+    std::vector<float> block(512);
+    // Start 8 hops below the 2^24 cliff and run 200 hops past it.
+    long long n = (1LL << 24) - 8LL * 512LL;
+    int violations = 0;
+    float worst = 0.0f;
+    int checked = 0;
+
+    for (int hop = 0; hop < 208; ++hop)
+    {
+        const float amp = ((hop / 8) & 1) ? 0.025f : 0.4f; // 24 dB toggle
+        fillProbeTones(block.data(), 512, n, amp);
+        sa->pushSamples(block.data(), 512);
+        if (hop < 4) continue; // let the analysis window fill
+        const float* m = sa->getMagnitudesDb();
+        const float d = std::abs(m[32] - m[400]);
+        if (d > worst) worst = d;
+        if (d > 1.0f) ++violations;
+        ++checked;
+    }
+
+    EXPECT_EQ(violations, 0);
+    EXPECT_LT(worst, 1.0f);
+    EXPECT_GT(checked, 200);
+    EXPECT_GT(n, 1LL << 24); // the run really crossed the cliff
+}
+
+// Frame coherence of a getter snapshot against a SLOW reader, which is the
+// case the copy-out getters exist for (a GUI thread stalled by a page
+// fault, a preemption or a debugger). fftSize 16384 makes the copy 8193
+// bins -- the longest the analyser can be asked for and 16x the pin above
+// -- so the reader spends as much of its life inside the copy loop as the
+// public API allows, while the writer keeps publishing.
+// Two distinct assertions, and the second is the one this pin adds:
+//  - no snapshot is ever a mixture of two frames (the |d| bound, as above);
+//  - getStaleSnapshotCount() stays 0, i.e. the reader never had to fall
+//    back on the previous frame, which is the health of the handoff itself.
+// Reachability argument, measured on this tree with a mutated
+// computeSpectrum() that publishes the finished slot and then KEEPS writing
+// into it (the `writeSlot_ = old & kSlotMask` adoption deleted): against
+// the pre-seqlock header that mutation makes the reader RETURN torn frames
+// (2450-2592 per 300k reads, worst |d| 18.59 dB); against this header it
+// returns none and reports 257288-262313 stale snapshots instead. So the
+// two assertions cover the two ways the handoff can go wrong, and neither
+// is vacuous.
+DSPARK_TEST(SpectrumAnalyzer_slow_reader_snapshot_is_frame_coherent)
+{
+    auto sa = std::make_unique<SpectrumAnalyzer<float>>();
+    sa->prepare(48000.0, 16384); // 8193 bins, hop 8192
+    sa->setSmoothing(0.0f);
+    sa->setPeakHoldEnabled(false);
+    sa->setFloorDb(-200.0f);
+    EXPECT_EQ(sa->getNumBins(), 8193);
+
+    std::atomic<bool> stop{ false };
+    std::atomic<int> frames{ 0 };
+
+    std::thread audio([&] {
+        std::vector<float> block(8192);
+        long long n = 0;
+        int hop = 0;
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            const float amp = ((hop / 4) & 1) ? 0.025f : 0.4f; // 24 dB toggle
+            fillProbeTones(block.data(), 8192, n, amp);
+            sa->pushSamples(block.data(), 8192);
+            ++hop;
+            frames.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    int violations = 0;
+    int fresh = 0;
+    long long reads = 0;
+    const long long kMaxReads = 5000000; // hard cap: never hang, fail loudly
+    while ((frames.load(std::memory_order_relaxed) < 24 || reads < 4000)
+           && reads < kMaxReads)
+    {
+        ++reads;
+        if (sa->isNewDataReady()) ++fresh;
+        const float* m = sa->getMagnitudesDb();
+        // 1500 Hz -> bin 512, 18750 Hz -> bin 6400 at fftSize 16384.
+        if (std::abs(m[512] - m[6400]) > 12.0f) ++violations;
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    audio.join();
+
+    EXPECT_EQ(violations, 0);
+    EXPECT_EQ(sa->getStaleSnapshotCount(), 0LL);           // handoff health
+    EXPECT_GT(frames.load(std::memory_order_relaxed), 23); // writer liveness
+    EXPECT_GT(fresh, 8);                                   // adoption liveness
 }
 
 // Paired-getter returned-pointer LIFETIME. The tear pin above reads only

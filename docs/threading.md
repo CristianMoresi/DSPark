@@ -1,8 +1,9 @@
 # Threading model
 
 Every DSPark component that can be touched by more than one thread follows the
-same contract. It is written down once here; each header's `Threading:` block
-then only has to say which of its own methods belongs where.
+same contract, and states in its own header wherever it departs from it. The
+contract is written down once here; each header's `Threading:` block then only
+has to say which of its own methods belongs where.
 
 ## The two threads
 
@@ -14,7 +15,7 @@ single consumer.
 | **Setup** | `prepare()`, `setState()`, construction, moves, and -- unless a header says otherwise -- `reset()`. Never concurrent with processing. |
 | **Audio** | `processBlock()` / `processSample()` and anything else that runs inside the callback. Exactly one stream owner per object. |
 | **Control** | Parameter setters. **One** non-audio writer. |
-| **Any thread** | Lock-free readouts: `get*()` methods that return an already-published value. These may run concurrently with processing. |
+| **Any thread** | Lock-free readouts: getters that load a published atomic word, or hand back a private copy of one. These may run concurrently with processing. The `get` prefix is not the criterion -- a getter that returns a reference or a raw pointer needs the rule in "Pointers returned across threads" below. |
 
 Two things fall outside the contract, and a component that needs them says so
 in its own header:
@@ -24,27 +25,43 @@ in its own header:
 - **`prepare()` or `reset()` concurrent with processing.** Setup calls
   reallocate; nothing may be running in the callback while they do.
 
-Thread-safety claims in DSPark are always per method. There is no blanket
-"this class is thread-safe" anywhere in the framework, because there is no
-useful version of that sentence.
+Thread-safety claims in DSPark are scoped -- to a method, or to a named group
+of setters. A few class briefs do say "thread-safe" without qualification; read
+that as shorthand for the per-method contract stated further down in the same
+header, not as a class-wide guarantee, because there is no useful version of
+that sentence.
 
 ## Which words must be atomic
 
 Any word that both threads can reach concurrently is `std::atomic`, or it
 travels through `Core/SpscQueue.h`. No plain scalar, struct or array is read on
 one thread while another writes it -- including inside a seqlock's critical
-section -- and nothing is read across threads *by reference*, which would let
-the reader observe the writer's later stores.
+section -- and no hand-off is read across threads *by reference*, which would
+let the reader observe the writer's later stores. (A getter that returns a
+reference to state owned by the processing thread is a different animal; see
+the exception at the end of "Pointers returned across threads".)
 
-Every atomic type on an audio path is verified lock-free at compile time:
+The words are drawn from a list chosen so they cannot lock: `bool`, `int`,
+`unsigned`, `std::size_t`, the fixed-width integers up to 64 bits, `float`,
+`double`, and enums whose underlying type is one of those.
+`tests/TestCoreFoundation.cpp` sweeps that list and asserts
+`std::atomic<T>::is_always_lock_free` for each word type, so a target where one
+of them falls back to a mutex fails the suite.
+
+That is a run-time census of the word types. It is **not** a compile-time check
+on your component, and the build will not stop you using a word the census
+never saw. Where the word type is a template parameter the census cannot reach
+it, so the header pins it itself -- `Analysis/SpectrumAnalyzer.h` and
+`Effects/AutoGain.h` both do. A new component with an atomic word on the audio
+path should do the same:
 
 ```cpp
 static_assert(std::atomic<T>::is_always_lock_free,
               "audio-thread stores must not lock");
 ```
 
-A type that is not lock-free on some target fails the build there rather than
-quietly taking a mutex inside the callback.
+Without it, a type that is not lock-free on some target quietly takes a mutex
+inside the callback and nothing says a word.
 
 ## The two publication patterns
 
@@ -80,12 +97,11 @@ Reader, on the audio thread:
 ```cpp
 if (!dirty.exchange(false, std::memory_order_acquire)) return;  // nothing new
 do {
-    s1 = seq.load(std::memory_order_acquire);
-    if (s1 & 1) continue;                          // writer mid-update
+    s0 = seq.load(std::memory_order_acquire);
     // relaxed loads of every word into a THREAD-PRIVATE plain copy
     std::atomic_thread_fence(std::memory_order_acquire);
-    s2 = seq.load(std::memory_order_relaxed);
-} while (s1 != s2);
+    s1 = seq.load(std::memory_order_relaxed);
+} while ((s0 & 1u) != 0u || s0 != s1);   // odd = writer was mid-update
 ```
 
 Both fences are mandatory, not decoration. Without them the relaxed data
@@ -110,12 +126,33 @@ second question beyond "who may touch this now": **how long does the returned
 pointer stay valid?** Ownership at the moment of the call says nothing about
 the next call.
 
-DSPark's answer is that no pointer into shared storage escapes a component.
-Where a getter returns a buffer -- `SpectrumAnalyzer::getMagnitudes()`, for
-instance -- it copies the published data into reader-private storage while it
-still owns the source, and returns a pointer to that copy. The audio thread
-cannot reach the copy, so the caller may hold the pointer for as long as it
-likes without another thread writing underneath it.
+DSPark's answer is that no pointer into *published* (cross-thread) storage
+escapes a component. `Analysis/SpectrumAnalyzer.h` is the worked case.
+`getMagnitudesDb()` and `getPeakHoldDb()` each acquire the freshest published
+slot, copy it into reader-private snapshot storage while they still own that
+slot, and return a pointer to the copy. The audio thread cannot reach a
+snapshot, so the caller may hold the pointer for as long as it likes without
+another thread writing underneath it.
+
+Naming both getters is the point, because one alone does not show why the copy
+is necessary rather than merely tidy: they share one slot pool, so the next
+acquisition by *either* of them hands the previously held slot back to the
+writer. A pointer into the slot would therefore be invalidated by the *other*
+getter's next call. A pointer into a snapshot is not: each snapshot is
+rewritten only by its own getter, plus the setup-only `reset()` / `prepare()`.
+
+**The exception, stated here because the headers state it.** A getter that
+returns a reference to state owned by the *processing* thread is not a
+cross-thread readout, and the rule above does not cover it. `Core/Biquad.h`'s
+`getCoeffs()` returns a reference straight into the active coefficient set,
+which the processing thread rewrites in `applyPendingCoeffs()`; a GUI thread
+reading it concurrently with a promotion may observe a half-updated set. The
+header says so at the method, and says what to do instead -- keep your own copy
+of the coefficients you computed. `Core/ProcessorChain.h`'s `get()` has the
+same shape: it hands back the sub-processor itself, so what you may do with the
+reference is that processor's contract, not the chain's. The rule to carry
+away: a getter that returns a reference or a raw pointer belongs to the
+processing thread unless its own documentation says otherwise.
 
 ## Blocking
 

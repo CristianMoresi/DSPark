@@ -38,7 +38,10 @@ Four rules, from the narrowest to the most general:
 Rules 1 and 4 ignore case; rule 4's list is read from the working tree, so on a
 clean clone it is empty and that rule checks nothing. The run says how many
 names it holds, because a green line for a check that did not run is worth
-less than no line at all.
+less than no line at all. It also says which commit it measured "a word this
+repository already uses" against, since that answer decides which names the
+rule holds: a name this repository already PUBLISHES is not banned, so a
+mention that has already been pushed stops arming the rule for that name.
 
 Referring to a commit in this repository is fine; a reader can resolve it. So
 is a published citation or a standard's number: those resolve in the world.
@@ -215,31 +218,52 @@ def tracked_paths():
     return paths
 
 
-def published_paths():
-    """The file list of the last commit. See local_only_directories() for why
-    the calibration corpus must be the committed tree and not this one."""
+def published_ref():
+    """The commit this repository has PUBLISHED, and whether that is what it
+    really is. The branch's upstream if it has one, else the remote's default
+    branch, else HEAD.
+
+    See local_only_directories() for why the calibration corpus must not be
+    the working tree or the index. HEAD is not right either, and for the same
+    reason one step along: a commit that has not left this machine is not yet
+    something a reader can resolve, so a mention of the private name inside
+    one must not count as this repository "using" the word -- otherwise the
+    very act the rule guards against, committing the name, switches the rule
+    off for that name for good.
+
+    With no upstream and no remote there is nothing published to measure
+    against and the corpus falls back to HEAD, which is the old behaviour and
+    the weaker one; the run says so rather than pretending otherwise."""
+    for candidate in ("@{upstream}", "origin/HEAD"):
+        try:
+            name = run_quiet("git", "rev-parse", "--abbrev-ref", "--verify",
+                             candidate).strip()
+        except subprocess.CalledProcessError:
+            continue
+        if name:
+            return name, True
+    return "HEAD", False
+
+
+def published_paths(ref):
+    """The file list of the published commit."""
     try:
-        out = run_quiet("git", "ls-tree", "-r", "-z", "--name-only", "HEAD")
+        out = run_quiet("git", "ls-tree", "-r", "-z", "--name-only", ref)
     except subprocess.CalledProcessError:
         return []
     return [p for p in out.split("\0") if p]
 
 
-def used_as_a_word_here(name, published):
-    """True when `name` already occurs as a word in the committed tree, in a
-    file name or in the text of a file this check reads.
-
-    The corpus is HEAD rather than the working tree or the index, and that is
-    the whole point: a comment naming the private directory is exactly what
-    this rule is looking for, and if it counted as the repository "using" the
-    word, planting one would switch the rule off."""
+def used_as_a_word_here(name, published, ref):
+    """True when `name` already occurs as a word in the published tree, in a
+    file name or in the text of a file this check reads."""
     if any(re.search(r"\b" + re.escape(name) + r"\b", path, re.IGNORECASE)
            for path in published):
         return True
     # Vendored code is excluded here for the same reason it is excluded from
     # the scan: a word this repository never reads cannot be reported by it.
     probe = subprocess.run(
-        ("git", "grep", "-I", "-i", "-w", "-F", "-q", "-e", name, "HEAD", "--")
+        ("git", "grep", "-I", "-i", "-w", "-F", "-q", "-e", name, ref, "--")
         + tuple(":(exclude)" + prefix for prefix in EXCLUDE_PREFIXES),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # 0 found, 1 not found, anything else is git declining to answer (no
@@ -250,7 +274,7 @@ def used_as_a_word_here(name, published):
     return probe.returncode != 1
 
 
-def local_only_directories(tracked_set):
+def local_only_directories(tracked_set, ref=None):
     """Top-level names that exist here but are hidden by a rule this
     repository does not carry -- a scratch tree, a private working area, an
     editor's cache. A reader cloning the repository has no way to know what
@@ -277,10 +301,13 @@ def local_only_directories(tracked_set):
         or an internal capital. "audio", "gain", "private" and "samples" are
         the names people give scratch directories in this field, and they are
         also this framework's own vocabulary.
-      - It must not already be USED as a word by the committed tree, in a file
+      - It must not already be USED as a word by the PUBLISHED tree, in a file
         name or in the text of a file this check reads. A word the repository
-        itself writes down is by definition not something only resolvable on
-        one machine, so banning it can only produce false reports.
+        itself publishes is by definition not something only resolvable on one
+        machine, so banning it can only produce false reports. The other side
+        of that is the rule's one blind spot, and it is worth stating plainly:
+        once a mention of the name has been pushed, the name is published
+        vocabulary and this rule no longer holds it. See published_ref().
 
     A plain lowercase name stays reachable through rule 2 in its path form,
     which is unchanged and needs no local knowledge at all.
@@ -320,8 +347,9 @@ def local_only_directories(tracked_set):
         if source in tracked_set:
             continue
         if published is None:
-            published = published_paths()
-        if used_as_a_word_here(name, published):
+            ref = ref or published_ref()[0]
+            published = published_paths(ref)
+        if used_as_a_word_here(name, published, ref):
             continue
         names.add(name)
     return names
@@ -408,7 +436,8 @@ def main():
     # tree would most naturally arrive with. Measured over this tree, reading
     # both rules without regard to case costs nothing: it adds no report.
     regex = re.compile("|".join(PATTERNS), re.IGNORECASE)
-    local_dirs = local_only_directories(tracked_set)
+    ref, is_published = published_ref()
+    local_dirs = local_only_directories(tracked_set, ref)
     local_regex = (re.compile("|".join(r"\b" + re.escape(n) + r"\b"
                                        for n in sorted(local_dirs)),
                               re.IGNORECASE)
@@ -486,8 +515,13 @@ def main():
     # The count, never the names: it is 0 on a clean clone and on CI, and it
     # is the difference between "this rule found nothing" and "this rule was
     # not looking". The names themselves are the private thing and stay here.
-    print("comment style: local-directory rule: {} name(s) in effect".format(
-        len(local_dirs)))
+    # The ref is public by construction, and which one it is decides which
+    # names the rule holds, so it is said out loud rather than assumed.
+    print("comment style: local-directory rule: {} name(s) in effect "
+          "(calibrated against {})".format(
+              len(local_dirs),
+              ref if is_published
+              else ref + ": nothing published to measure against"))
     if not hits:
         print("comment style: no unresolvable references found")
         return 0

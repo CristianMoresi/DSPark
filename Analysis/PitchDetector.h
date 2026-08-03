@@ -93,8 +93,11 @@ public:
      * 44.1..192 kHz on band-limited sawtooths from E1 to A5, every reading was
      * either correct to within 0.1 cents or absent, never confidently wrong.
      * The automatic window keeps fmin at 43.1 Hz (44.1 kHz family) / 46.9 Hz
-     * (48 kHz family) from 44.1 to 192 kHz. For a lower floor pass an explicit
-     * window: fmin scales as fs/windowSize, so doubling the window halves it.
+     * (48 kHz family) from 8 kHz all the way to 384 kHz, where it reaches the
+     * 16384 clamp. ABOVE 384 kHz the ceiling binds and the floor climbs again
+     * (measured 93.8 Hz at 768 kHz) -- documented, not fixed; pass an explicit
+     * window there. For a lower floor at any rate pass an explicit window:
+     * fmin scales as fs/windowSize, so doubling the window halves it.
      */
     void prepare(double sampleRate, int windowSize = 0, int hopSize = 0)
     {

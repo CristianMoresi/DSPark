@@ -157,7 +157,9 @@ public:
      *                   [256, 16384] spanning at least 2048/48000 s (~42.7 ms)
      *                   at sampleRate -- 2048 at 44.1/48 kHz, 4096 at
      *                   88.2/96 kHz, 8192 at 176.4/192 kHz, 16384 at 384 kHz,
-     *                   512 at 8 kHz. Explicit positive values (power of two,
+     *                   512 at 8 kHz. Above 384 kHz the 16384 ceiling binds
+     *                   and the bins widen again (documented, not fixed).
+     *                   Explicit positive values (power of two,
      *                   256 to 16384) are honoured as given.
      * @param windowType Window function to use (default: Hann).
      */

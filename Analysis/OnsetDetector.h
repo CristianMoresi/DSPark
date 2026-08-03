@@ -129,7 +129,9 @@ public:
      *                [512, 16384] spanning at least 2048/48000 s (~42.7 ms) at
      *                spec.sampleRate -- 2048 at 44.1/48 kHz, 4096 at
      *                88.2/96 kHz, 8192 at 176.4/192 kHz, 16384 at 384 kHz,
-     *                512 at 8 kHz. Explicit positive values are rounded up to
+     *                512 at 8 kHz. Above 384 kHz the 16384 ceiling binds and
+     *                the bin width widens again (documented, not fixed: pass
+     *                an explicit frame there). Explicit positive values are rounded up to
      *                a power of two in [64, 1<<16] and honoured as given, with
      *                the reduced validity described below. Read the resolved
      *                value back with getFftSize().

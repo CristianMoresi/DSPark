@@ -32,6 +32,9 @@
 #include <limits>
 #include <memory>
 #include <vector>
+#include <array>
+#include <atomic>
+#include <thread>
 
 using namespace dspark;
 using namespace dspark::test;
@@ -3519,4 +3522,126 @@ DSPARK_TEST(PitchShifter_mix_change_is_click_free)
         }
     }
     EXPECT_LT(clickStep, regimeStep * 1.5 + 1e-4);   // old header: 3.7x regime
+}
+
+// ---------------------------------------------------------------------------
+// CHANGE-REQUEST M-008C-TEST-2 (ADDITIVE ONLY): concurrent publication pins for
+// Effects/DynamicEQ.h and Effects/Reverb.h. Nothing above this marker is
+// modified.
+
+// Every field of a published DynamicEQ band is atomic behind a per-band
+// seqlock, so a band the audio thread adopts is always one whole publication.
+//
+// HONEST NOTE ON THIS PIN'S POWER, so it is not mistaken for a red/green pair
+// like the Equalizer one: pre-fix DynamicEQ already carried a working seq
+// counter with an s0 == s1 retry, so a torn copy was retried rather than
+// adopted. Its defects were the plain struct staged inside the seqlock (formal
+// UB) and the writer's missing release fence -- neither of which any x86 test
+// can observe. This pin therefore does NOT go red on the pre-fix header. What
+// it does is fix the invariant against future regressions and, more usefully,
+// drive the handoff concurrently so CI ThreadSanitizer -- the only oracle here
+// that understands the C++11 model, and the only one that could ever see the
+// fence -- has something to look at. Before this, no test drove any Effects/
+// handoff concurrently at all.
+DSPARK_TEST(DynamicEQ_concurrent_setBand_is_never_torn)
+{
+    using DEQ = DynamicEQ<float, 4>;
+
+    auto deq = std::make_unique<DEQ>();
+    AudioSpec spec; spec.sampleRate = 48000.0; spec.maxBlockSize = 32; spec.numChannels = 1;
+    deq->prepare(spec);
+    deq->setNumBands(1);
+
+    DEQ::BandConfig a;
+    a.frequency = 120.0f;  a.q = 0.6f; a.threshold = -30.0f;
+    a.shape = DEQ::BandShape::Bell;      a.enabled = true;
+    a.aboveRatio = 2.0f; a.aboveAttackMs = 1.0f; a.aboveReleaseMs = 20.0f; a.aboveRangeDb = 3.0f;
+    DEQ::BandConfig b;
+    b.frequency = 9000.0f; b.q = 6.0f; b.threshold = -6.0f;
+    b.shape = DEQ::BandShape::HighShelf; b.enabled = true;
+    b.aboveRatio = 8.0f; b.aboveAttackMs = 40.0f; b.aboveReleaseMs = 300.0f; b.aboveRangeDb = 18.0f;
+    deq->setBand(0, a);
+
+    std::atomic<bool> stop{ false };
+    std::atomic<long long> blocks{ 0 };
+
+    std::thread control([&] {
+        bool even = true;
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            deq->setBand(0, even ? a : b);
+            even = !even;
+        }
+    });
+
+    std::thread audio([&] {
+        std::array<float, 32> buf{};
+        buf.fill(0.25f);
+        float* chans[1] = { buf.data() };
+        long long n = 0;
+        for (int i = 0; i < 20000; ++i)
+        {
+            buf.fill(0.25f);
+            AudioBufferView<float> view(chans, 1, 32);
+            deq->processBlock(view);
+            for (int k = 0; k < 32; ++k)
+                EXPECT_TRUE(std::isfinite(buf[static_cast<size_t>(k)]));
+            ++n;
+        }
+        blocks.store(n);
+        stop.store(true, std::memory_order_relaxed);
+    });
+
+    control.join();
+    audio.join();
+
+    // A band assembled from two different publications can pair a 9 kHz shelf
+    // with a 1 ms attack and a -30 dB threshold; the gain readout must stay a
+    // finite, bounded number whatever the interleaving.
+    const float gr = deq->getBandGainDb(0);
+    EXPECT_TRUE(std::isfinite(gr));
+    EXPECT_LT(std::abs(gr), 60.0f);
+    EXPECT_GT(blocks.load(), 1000LL);   // liveness: no vacuous pass
+}
+
+// Effects/Reverb.h::getConvolver() returns a reference into the published
+// convolver bank. This pin holds that reference across a republication and
+// keeps using it.
+//
+// Why it can actually fail: on the pre-fix header this is a deterministic
+// heap-use-after-free, single-threaded, through documented public API -- the
+// accessor took a local shared_ptr snapshot, returned a reference into it and
+// let the snapshot die at the closing brace, so loadIR() freed the bank under
+// the caller (ASan report in tests/results/M-008C/reverb-dangle-before.log).
+// Under the ASan+UBSan build this pin is a hard failure on any regression; on
+// normal builds it asserts the observed values, which a freed bank has no
+// obligation to preserve.
+DSPARK_TEST(Reverb_getConvolver_reference_survives_republication)
+{
+    auto rv = std::make_unique<Reverb<float>>();
+    AudioSpec spec; spec.sampleRate = 48000.0; spec.maxBlockSize = 64; spec.numChannels = 2;
+    rv->prepare(spec);
+
+    std::vector<float> ir(4096, 0.0f);
+    ir[0] = 1.0f;
+    ir[128] = 0.4f;
+    EXPECT_TRUE(rv->loadIR(ir.data(), static_cast<int>(ir.size()), 48000.0));
+
+    auto& conv = rv->getConvolver(0);
+    const int partsBefore = conv.getNumPartitions();
+    const int blockBefore = conv.getBlockSize();
+    EXPECT_GT(partsBefore, 0);
+
+    // Documented as an ordinary thing to do: the bank "may be replaced by a
+    // future loadIR() call". The reference must not die with the old bank.
+    ir[1] = 0.25f;
+    EXPECT_TRUE(rv->loadIR(ir.data(), static_cast<int>(ir.size()), 48000.0));
+
+    EXPECT_EQ(conv.getNumPartitions(), partsBefore);
+    EXPECT_EQ(conv.getBlockSize(), blockBefore);
+
+    // And again after the other publishing setters.
+    rv->setDecayScale(0.5f);
+    rv->setStretch(1.5f);
+    EXPECT_EQ(conv.getNumPartitions(), partsBefore);
 }

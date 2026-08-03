@@ -20,6 +20,9 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <array>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 using namespace dspark;
@@ -2661,4 +2664,82 @@ DSPARK_TEST(Equalizer_shelf_band_Q_change_is_audible_in_min_phase)
     cfg.q = 1.2f; eq.setBand(0, cfg);          // ONLY Q changes (same freq/gain/type)
     const double hiQ = eqEnergy(eq, 16);
     EXPECT_GT(std::abs(hiQ - loQ), 1e-3 * loQ);
+}
+
+// ---------------------------------------------------------------------------
+// CHANGE-REQUEST M-008C-TEST-1 (ADDITIVE ONLY): concurrent publication pin for
+// Effects/Equalizer.h. Nothing above this marker is modified.
+//
+// Why this pin can actually fail, which is the whole point of it:
+// before the band configs became a seqlock, this exact schedule adopted a
+// config that was never published -- ~560k-680k torn adoptions per 5 s run,
+// ~3.3% of all adoptions, reproduced three times out of three
+// (tests/results/M-008C/torn-probe-before.log). The two configs below differ
+// in EVERY field, and the audio thread reads back what it just adopted through
+// the band's own FilterEngine, ON THE AUDIO THREAD, so the read-back cannot
+// itself invent a mismatch. A (shape, slope) pair that is neither of the two
+// published pairs can only come from one updateActiveFilters() pass reading
+// cfg.type from one publication and cfg.slope from another.
+//
+// The liveness floor makes a vacuous pass impossible: if the threads never
+// overlapped, adoptions would not accumulate and the test fails instead of
+// silently proving nothing.
+DSPARK_TEST(Equalizer_concurrent_setBand_is_never_torn)
+{
+    using EQ = Equalizer<float, 8>;
+    using Shape = FilterEngine<float>::Shape;
+
+    auto eq = std::make_unique<EQ>();
+    AudioSpec spec; spec.sampleRate = 48000.0; spec.maxBlockSize = 16; spec.numChannels = 1;
+    eq->prepare(spec);
+    eq->setNumBands(1);
+
+    EQ::BandConfig a;
+    a.frequency = 100.0f;   a.gain = 12.0f;   a.q = 0.5f;
+    a.type = EQ::BandType::LowPass;  a.slope = 12; a.enabled = true;
+    EQ::BandConfig b;
+    b.frequency = 15000.0f; b.gain = -18.0f;  b.q = 8.0f;
+    b.type = EQ::BandType::HighPass; b.slope = 48; b.enabled = true;
+    eq->setBand(0, a);
+
+    std::atomic<bool> stop{ false };
+    std::atomic<long long> torn{ 0 };
+    std::atomic<long long> adoptions{ 0 };
+
+    std::thread control([&] {
+        bool even = true;
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            eq->setBand(0, even ? a : b);
+            even = !even;
+        }
+    });
+
+    std::thread audio([&] {
+        std::array<float, 16> buf{};
+        buf.fill(0.05f);
+        float* chans[1] = { buf.data() };
+        long long localTorn = 0, localAdopt = 0;
+        for (int i = 0; i < 200000; ++i)
+        {
+            AudioBufferView<float> view(chans, 1, 16);
+            eq->processBlock(view);
+
+            const auto& fe = eq->getBandFilter(0);
+            const Shape shape = fe.getShape();
+            const int   slope = fe.getSlopeDb();
+            const bool isA = (shape == Shape::LowPass  && slope == 12);
+            const bool isB = (shape == Shape::HighPass && slope == 48);
+            if (isA || isB) ++localAdopt; else ++localTorn;
+        }
+        torn.store(localTorn);
+        adoptions.store(localAdopt);
+        stop.store(true, std::memory_order_relaxed);
+    });
+
+    control.join();
+    audio.join();
+
+    EXPECT_EQ(torn.load(), 0LL);                 // the invariant
+    EXPECT_GT(adoptions.load(), 1000LL);         // liveness: no vacuous pass
 }

@@ -1037,3 +1037,184 @@ DSPARK_TEST(WavFile_8bit_roundtrip_has_no_systematic_gain_error)
         EXPECT_NEAR(b.getChannel(0)[i], probes[i], 1e-6f);
     EXPECT_BOUNDED(b.getChannel(0), N, -1.0f, 1.0f);
 }
+
+// ============================================================================
+// Mp3File - polyphase synthesis window and the short-block (block_type 2) path
+// ============================================================================
+
+// Builds one 48 kHz / 64 kbps / mono frame whose granules carry a SHORT block
+// (block_type 2, not mixed) with a single nonzero spectral value at bitstream
+// index `2*pairs`. scalefac_compress 0 means slen1 = slen2 = 0, so the granule
+// spends no bits at all on scalefactors and part2_3_length is exactly the
+// Huffman length: `pairs` copies of the table-1 code for (0,0) (one bit each)
+// followed by the code for (1,0) plus its sign bit.
+static std::vector<uint8_t> mp3CraftShortBlockFrame(int pairs)
+{
+    auto side = [pairs](Mp3TestBits& b) {
+        for (int gr = 0; gr < 2; ++gr)
+        {
+            b.put(uint32_t(pairs + 3), 12);        // part2_3_length
+            b.put(uint32_t(pairs + 1), 9);         // big_values
+            b.put(190, 8);                         // global_gain
+            b.put(0, 4);                           // scalefac_compress -> no sf bits
+            b.put(1, 1);                           // window_switching
+            b.put(2, 2); b.put(0, 1);              // block_type 2, not mixed
+            b.put(1, 5); b.put(1, 5);              // table_select 1, 1
+            b.put(0, 3); b.put(0, 3); b.put(0, 3); // subblock_gain
+            b.put(0, 1); b.put(0, 1); b.put(0, 1); // preflag, scalefac_scale, count1
+        }
+    };
+    auto main_ = [pairs](Mp3TestBits& b) {
+        for (int gr = 0; gr < 2; ++gr)
+        {
+            for (int i = 0; i < pairs; ++i) b.put(0b1, 1);   // (0,0)
+            b.put(0b01, 2); b.put(0, 1);                     // (1,0), sign +
+        }
+    };
+    return mp3CraftFrame(side, main_);
+}
+
+// Sum of |pcm| in each of the 18 subband slots of a granule, folded over all
+// granules of the file: a 18-bin picture of WHEN inside a granule the energy is.
+static void mp3GranuleSlotProfile(const char* path, double slot[18], int& granules)
+{
+    for (int i = 0; i < 18; ++i) slot[i] = 0.0;
+    granules = 0;
+
+    Mp3File r;
+    if (!r.openRead(path)) return;
+    auto info = r.getInfo();
+    AudioBuffer<float> buf;
+    buf.resize(1, static_cast<int>(info.numSamples));
+    if (!r.readSamples(buf.toView())) return;
+    r.close();
+
+    const size_t n = static_cast<size_t>(info.numSamples);
+    for (size_t g = 2; (g + 2) * 576 <= n; ++g)
+    {
+        ++granules;
+        for (int s = 0; s < 18; ++s)
+            for (int j = 0; j < 32; ++j)
+                slot[s] += std::fabs(double(buf.getChannel(0)[g * 576 + size_t(s * 32 + j)]));
+    }
+}
+
+// A short block stores three windows per scalefactor band, so band sfb starts
+// at the CUMULATIVE offset 3*shortBands[sfb]. Scaling the band index by the
+// CURRENT band's width instead was only right while the widths stayed equal:
+// at 48 kHz the short widths are 4,4,4,4,6,6,10,12,14,16,20,26,66, so sfb 10
+// computed a base of 600 and the top three bands fell outside the granule,
+// where an `index < 576` guard silently discarded them. This frame codes ONE
+// value in sfb 10 (bitstream index 240) and nothing else: pre-fix the decode is
+// digital silence, because both requantize() and reorder() threw that band away.
+DSPARK_TEST(Mp3File_short_block_decodes_its_top_scalefactor_bands)
+{
+    FileCleanup cleanup { "dspark_test_shorthi.mp3" };
+    mp3WriteFile("dspark_test_shorthi.mp3", mp3CraftShortBlockFrame(120), 8);
+
+    const double energy = mp3DecodeEnergy("dspark_test_shorthi.mp3");
+    EXPECT_GT(energy, 0.5);   // pre-fix this was exactly 0.0
+}
+
+// reorder() interleaves the three short windows (index 3*i + win), and the
+// 12-point IMDCT must read them back the same way, xr[sb*18 + win + 3*i] (ISO
+// 11172-3 2.4.3.4.9 reads in[win + 3*m]). Reading each window's six values
+// contiguously fed every IMDCT a mixture of all three. The two files below
+// differ ONLY in which short window carries the value, inside sfb 1 - a band
+// whose base offset is the same before and after the base-offset fix, so this
+// case isolates the IMDCT read order. A correct decoder emits window 2 exactly
+// two short windows (12 subband slots) after window 0 and with the same shape.
+DSPARK_TEST(Mp3File_short_block_windows_are_read_interleaved)
+{
+    FileCleanup c1 { "dspark_test_shortw0.mp3" };
+    FileCleanup c2 { "dspark_test_shortw2.mp3" };
+
+    // sfb 1 at 48 kHz: base 12, width 4 -> window w, first value = index 12+4w.
+    mp3WriteFile("dspark_test_shortw0.mp3", mp3CraftShortBlockFrame(6), 8);
+    mp3WriteFile("dspark_test_shortw2.mp3", mp3CraftShortBlockFrame(10), 8);
+
+    double p0[18], p2[18];
+    int g0 = 0, g2 = 0;
+    mp3GranuleSlotProfile("dspark_test_shortw0.mp3", p0, g0);
+    mp3GranuleSlotProfile("dspark_test_shortw2.mp3", p2, g2);
+    EXPECT_GT(g0, 4);
+    EXPECT_EQ(g0, g2);
+
+    double t0 = 0.0, t2 = 0.0;
+    for (int s = 0; s < 18; ++s) { t0 += p0[s]; t2 += p2[s]; }
+    EXPECT_GT(t0, 0.0);
+    EXPECT_NEAR(t2 / t0, 1.0, 0.02);   // the same value, only in another window
+
+    // Same shape, delayed by two short windows: p0[s] == p2[(s+12) % 18].
+    for (int s = 0; s < 18; ++s)
+        EXPECT_NEAR(p2[(s + 12) % 18] / t2, p0[s] / t0, 0.01);
+
+    // ... and the two are NOT the same profile, which is what the pre-fix
+    // decoder produced: it could not tell the three windows apart.
+    double maxDiff = 0.0;
+    for (int s = 0; s < 18; ++s)
+        maxDiff = std::max(maxDiff, std::fabs(p2[s] / t2 - p0[s] / t0));
+    EXPECT_GT(maxDiff, 0.05);
+}
+
+// The three short windows occupy samples 6..29 of the 36-sample block, so the
+// IMDCT must accumulate at tmp[6*win + i + 6]. At tmp[6*win + i] the block came
+// out six samples early and its overlap with the neighbouring start/stop blocks
+// never cancelled. Here ONLY granule 0 is coded, in window 2, and window 2 lives
+// entirely in samples 18..29 - the overlap tail. Its energy therefore belongs to
+// granule 1 in full, and granule 0 must be exactly silent. Six samples early it
+// is not: the pre-fix decoder leaked 1.6e-2 into granule 0.
+DSPARK_TEST(Mp3File_short_block_starts_six_samples_into_the_window)
+{
+    FileCleanup cleanup { "dspark_test_shortgran.mp3" };
+
+    auto side = [](Mp3TestBits& b) {
+        b.put(13, 12); b.put(11, 9); b.put(190, 8); b.put(0, 4); b.put(1, 1);
+        b.put(2, 2); b.put(0, 1); b.put(1, 5); b.put(1, 5);
+        b.put(0, 3); b.put(0, 3); b.put(0, 3);
+        b.put(0, 1); b.put(0, 1); b.put(0, 1);
+        b.put(0, 12); b.put(0, 9); b.put(190, 8); b.put(0, 4); b.put(0, 1);
+        b.put(0, 5); b.put(0, 5); b.put(0, 5); b.put(0, 4); b.put(0, 3);
+        b.put(0, 1); b.put(0, 1); b.put(0, 1);
+    };
+    auto main_ = [](Mp3TestBits& b) {
+        for (int i = 0; i < 10; ++i) b.put(0b1, 1);
+        b.put(0b01, 2); b.put(0, 1);
+    };
+    auto silent = [](Mp3TestBits& b) {
+        for (int gr = 0; gr < 2; ++gr)
+        {
+            b.put(0, 12); b.put(0, 9); b.put(190, 8); b.put(0, 4); b.put(0, 1);
+            b.put(0, 5); b.put(0, 5); b.put(0, 5); b.put(0, 4); b.put(0, 3);
+            b.put(0, 1); b.put(0, 1); b.put(0, 1);
+        }
+    };
+
+    const std::vector<uint8_t> coded = mp3CraftFrame(side, main_);
+    const std::vector<uint8_t> quiet = mp3CraftFrame(silent, [](Mp3TestBits&) {});
+    {
+        std::ofstream f("dspark_test_shortgran.mp3", std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(coded.data()),
+                static_cast<std::streamsize>(coded.size()));
+        for (int i = 0; i < 7; ++i)
+            f.write(reinterpret_cast<const char*>(quiet.data()),
+                    static_cast<std::streamsize>(quiet.size()));
+    }
+
+    Mp3File r;
+    EXPECT_TRUE(r.openRead("dspark_test_shortgran.mp3"));
+    auto info = r.getInfo();
+    EXPECT_TRUE(info.numSamples >= 1152);
+    AudioBuffer<float> buf;
+    buf.resize(1, static_cast<int>(info.numSamples));
+    EXPECT_TRUE(r.readSamples(buf.toView()));
+    r.close();
+
+    double g[2] = { 0.0, 0.0 };
+    for (int gi = 0; gi < 2; ++gi)
+        for (int n = 0; n < 576; ++n)
+            g[gi] += std::fabs(double(buf.getChannel(0)[gi * 576 + n]));
+
+    EXPECT_GT(g[1], 1.0);       // window 2 lands in the next granule, in full
+    EXPECT_LT(g[0], 1e-9);      // ... and none of it here; pre-fix: 1.6e-2
+}

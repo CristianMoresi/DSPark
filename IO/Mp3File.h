@@ -357,6 +357,21 @@ private:
         int shortCount      = 0;
     };
 
+    // The two invariants reorder() relies on, checked at compile time for every
+    // table below instead of guarded at run time:
+    //   sb[13] == 192  -- the three windows of the short bands span exactly
+    //                     3*192 == 576 coefficients, so the reordering cannot
+    //                     run past the granule;
+    //   lb[8] == 3*sb[3] -- a mixed block's short region begins exactly where
+    //                     its long region ends.
+    // A table edit that breaks either one is a build failure, not silent data
+    // loss.
+#define DSPARK_MP3_CHECK_BAND_TABLE(lbArr, sbArr)                                   \
+    static_assert((sbArr)[13] == 192,                                               \
+        "short scalefactor bands must span 192 coefficients per window");           \
+    static_assert((lbArr)[8] == 3 * (sbArr)[3],                                     \
+        "mixed blocks: the short region must begin where the long region ends")
+
     static BandTable getBandTable(int sampleRate)
     {
         BandTable t {};
@@ -364,6 +379,7 @@ private:
         {
             static constexpr int lb[] = {0,4,8,12,16,20,24,30,36,44,52,62,74,90,110,134,162,196,238,288,342,418,576};
             static constexpr int sb[] = {0,4,8,12,16,22,30,40,52,66,84,106,136,192};
+            DSPARK_MP3_CHECK_BAND_TABLE(lb, sb);
             std::memcpy(t.longBands, lb, sizeof(lb));
             std::memcpy(t.shortBands, sb, sizeof(sb));
             t.longCount = 22;
@@ -373,6 +389,7 @@ private:
         {
             static constexpr int lb[] = {0,4,8,12,16,20,24,30,36,42,50,60,72,88,106,128,156,190,230,276,330,384,576};
             static constexpr int sb[] = {0,4,8,12,16,22,28,38,50,64,80,100,126,192};
+            DSPARK_MP3_CHECK_BAND_TABLE(lb, sb);
             std::memcpy(t.longBands, lb, sizeof(lb));
             std::memcpy(t.shortBands, sb, sizeof(sb));
             t.longCount = 22;
@@ -382,6 +399,7 @@ private:
         {
             static constexpr int lb[] = {0,4,8,12,16,20,24,30,36,44,54,66,82,102,126,156,194,240,296,364,448,550,576};
             static constexpr int sb[] = {0,4,8,12,16,22,30,42,58,78,104,138,180,192};
+            DSPARK_MP3_CHECK_BAND_TABLE(lb, sb);
             std::memcpy(t.longBands, lb, sizeof(lb));
             std::memcpy(t.shortBands, sb, sizeof(sb));
             t.longCount = 22;
@@ -389,6 +407,8 @@ private:
         }
         return t;
     }
+
+#undef DSPARK_MP3_CHECK_BAND_TABLE
 
     static constexpr int kSlen1[16] = {0,0,0,0,3,1,1,1,2,2,2,3,3,3,4,4};
     static constexpr int kSlen2[16] = {0,1,2,3,0,1,2,3,1,2,3,1,2,3,2,3};
@@ -1465,7 +1485,12 @@ private:
 
                 for (int sfb = 3; sfb < bands.shortCount; ++sfb)
                 {
-                    int width = bands.shortBands[sfb + 1] - bands.shortBands[sfb];
+                    const int width = bands.shortBands[sfb + 1] - bands.shortBands[sfb];
+                    // Cumulative base, as in reorder(): the Huffman coefficients
+                    // of a short band follow all the coefficients of the bands
+                    // before it, three windows each.
+                    const int base = longEnd
+                                   + 3 * (bands.shortBands[sfb] - bands.shortBands[3]);
                     for (int win = 0; win < 3; ++win)
                     {
                         double sbGain = std::exp2(-2.0 * gc.subblock_gain[win]);
@@ -1475,8 +1500,7 @@ private:
 
                         for (int k = 0; k < width; ++k)
                         {
-                            int i = longEnd + (sfb - 3) * 3 * width + win * width + k;
-                            if (i >= 576) break;
+                            const int i = base + win * width + k;
                             xr[i] = mult * pow43(is[i]);
                         }
                     }
@@ -1484,9 +1508,15 @@ private:
             }
             else
             {
+                // Same cumulative base as reorder(): scaling the band index by
+                // the CURRENT band's width applied every short band's
+                // scalefactor and subblock gain to the wrong coefficients as
+                // soon as the widths stopped being equal (sfb >= 4), and the
+                // `i >= 576` break then left the top bands unscaled entirely.
                 for (int sfb = 0; sfb < bands.shortCount; ++sfb)
                 {
-                    int width = bands.shortBands[sfb + 1] - bands.shortBands[sfb];
+                    const int width = bands.shortBands[sfb + 1] - bands.shortBands[sfb];
+                    const int base  = 3 * bands.shortBands[sfb];
                     for (int win = 0; win < 3; ++win)
                     {
                         double sbGain = std::exp2(-2.0 * gc.subblock_gain[win]);
@@ -1495,8 +1525,7 @@ private:
 
                         for (int k = 0; k < width; ++k)
                         {
-                            int i = sfb * width * 3 + win * width + k;
-                            if (i >= 576) break;
+                            const int i = base + win * width + k;
                             xr[i] = mult * pow43(is[i]);
                         }
                     }
@@ -1558,9 +1587,10 @@ private:
                         if (sf >= 7) continue;
 
                         bool allZero = true;
-                        int baseIdx = sfb * width * 3 + win * width;
+                        // Cumulative base, as in requantize() and reorder().
+                        const int baseIdx = 3 * bands.shortBands[sfb] + win * width;
                         for (int k = 0; k < width; ++k)
-                            if (baseIdx + k < 576 && xr[1][baseIdx + k] != 0.0) { allZero = false; break; }
+                            if (xr[1][baseIdx + k] != 0.0) { allZero = false; break; }
 
                         if (allZero)
                         {
@@ -1569,8 +1599,7 @@ private:
                             double kr = 1.0 / (1.0 + ratio);
                             for (int k = 0; k < width; ++k)
                             {
-                                int i = baseIdx + k;
-                                if (i >= 576) break;
+                                const int i = baseIdx + k;
                                 xr[1][i] = xr[0][i] * kr;
                                 xr[0][i] = xr[0][i] * kl;
                             }
@@ -1619,18 +1648,28 @@ private:
         if (gc.mixed_block)
             for (int i = 0; i < startIdx; ++i) tmp[i] = xr[i];
 
+        // A short scalefactor band begins at the CUMULATIVE offset of the bands
+        // before it, 3*(shortBands[sfb] - shortBands[startBand]), because each
+        // one carries three windows. Scaling the band index by the CURRENT
+        // band's width instead was right only while the widths stayed equal: at
+        // 44100 Hz the widths are 4,4,4,4,6,8,10,12,14,18,22,30,56, so sfb 4
+        // landed at 72 instead of 48, sfb 9 at 486 instead of 198, and sfb
+        // 10..12 computed bases of 660/990/2016 that a `< 576` guard then threw
+        // away - the top three short bands were zeroed on every short block.
+        //
+        // No guard is used here now. getBandTable() static_asserts that
+        // shortBands[13] == 192 and that startIdx == 3*shortBands[startBand],
+        // so the last index touched is 3*192 - 1 == 575 by construction. A
+        // guard would only convert a future table error back into the silent
+        // data loss this fix removes.
         for (int sfb = startBand; sfb < bands.shortCount; ++sfb)
         {
-            int width = bands.shortBands[sfb + 1] - bands.shortBands[sfb];
+            const int width = bands.shortBands[sfb + 1] - bands.shortBands[sfb];
+            const int base  = startIdx
+                            + 3 * (bands.shortBands[sfb] - bands.shortBands[startBand]);
             for (int win = 0; win < 3; ++win)
-            {
                 for (int k = 0; k < width; ++k)
-                {
-                    int srcIdx = startIdx + (sfb - startBand) * width * 3 + win * width + k;
-                    int dstIdx = startIdx + (sfb - startBand) * width * 3 + k * 3 + win;
-                    if (srcIdx < 576 && dstIdx < 576) tmp[dstIdx] = xr[srcIdx];
-                }
-            }
+                    tmp[base + k * 3 + win] = xr[base + win * width + k];
         }
         std::memcpy(xr, tmp, sizeof(tmp));
     }
@@ -1687,9 +1726,19 @@ private:
                     for (int win = 0; win < 3; ++win)
                     {
                         double in[6], out12[12];
-                        for (int i = 0; i < 6; ++i) in[i] = xr[sb * 18 + win * 6 + i];
+                        // reorder() leaves the three windows INTERLEAVED, as the
+                        // standard requires (ISO 11172-3 2.4.3.4.9 reads
+                        // in[win + 3*m]). Reading each window's six coefficients
+                        // contiguously fed every 12-point IMDCT a mixture of all
+                        // three windows.
+                        for (int i = 0; i < 6; ++i) in[i] = xr[sb * 18 + win + 3 * i];
                         imdct12(in, out12);
-                        for (int i = 0; i < 12; ++i) tmp[6 * win + i] += out12[i] * kShortWindow[i];
+                        // The three short windows occupy samples 6..29 of the
+                        // 36-sample block, not 0..23: emitting them six samples
+                        // early left their TDAC overlap with the neighbouring
+                        // start/stop blocks uncancelled.
+                        for (int i = 0; i < 12; ++i)
+                            tmp[6 * win + i + 6] += out12[i] * kShortWindow[i];
                     }
                     for (int i = 0; i < 18; ++i)
                     {
@@ -1706,9 +1755,19 @@ private:
                     for (int win = 0; win < 3; ++win)
                     {
                         double in[6], out12[12];
-                        for (int i = 0; i < 6; ++i) in[i] = xr[sb * 18 + win * 6 + i];
+                        // reorder() leaves the three windows INTERLEAVED, as the
+                        // standard requires (ISO 11172-3 2.4.3.4.9 reads
+                        // in[win + 3*m]). Reading each window's six coefficients
+                        // contiguously fed every 12-point IMDCT a mixture of all
+                        // three windows.
+                        for (int i = 0; i < 6; ++i) in[i] = xr[sb * 18 + win + 3 * i];
                         imdct12(in, out12);
-                        for (int i = 0; i < 12; ++i) tmp[6 * win + i] += out12[i] * kShortWindow[i];
+                        // The three short windows occupy samples 6..29 of the
+                        // 36-sample block, not 0..23: emitting them six samples
+                        // early left their TDAC overlap with the neighbouring
+                        // start/stop blocks uncancelled.
+                        for (int i = 0; i < 12; ++i)
+                            tmp[6 * win + i + 6] += out12[i] * kShortWindow[i];
                     }
                     for (int i = 0; i < 18; ++i)
                     {

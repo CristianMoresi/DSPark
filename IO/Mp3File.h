@@ -2085,6 +2085,10 @@ private:
         }
     }
 
+    // ISO 11172-3 codes a magnitude as at most 15 + (2^linbits - 1) with
+    // linbits <= 13, so 8206 is the largest value any Huffman table can carry.
+    static constexpr int kMaxQuantised = 8206;
+
     static int encQuantize(const double xr[576], int ix[576], int globalGain)
     {
         double step = std::pow(2.0, 0.25 * (globalGain - 210));
@@ -2094,10 +2098,19 @@ private:
         for (int i = 0; i < 576; ++i)
         {
             double val = std::abs(xr[i]) / step;
-            int q = static_cast<int>(std::pow(val, 0.75) + 0.4054);
-            if (q > 8206) q = 8206; // Clamped to absolute standard maximum
-            ix[i] = (xr[i] >= 0.0) ? q : -q;
+            double qd = std::pow(val, 0.75) + 0.4054;
+            if (qd > 1.0e9) qd = 1.0e9;     // keep the conversion in range
+            int q = static_cast<int>(qd);
+            // Report the magnitude the quantiser WANTED, before the clamp. The
+            // largest value ISO 11172-3 can code is 15 + (2^13 - 1) = 8206, so
+            // anything above that is quantiser overload: the clamp silently
+            // replaces the coefficient with one up to three orders of magnitude
+            // smaller. The rate-control search needs to see that, because the
+            // clamp also caps the bit count and would otherwise make an
+            // overloaded gain look like a cheap, legal fit.
             if (q > maxIx) maxIx = q;
+            if (q > kMaxQuantised) q = kMaxQuantised;
+            ix[i] = (xr[i] >= 0.0) ? q : -q;
         }
         return maxIx;
     }
@@ -2121,6 +2134,17 @@ private:
             if (!allSmall) break;
             count1Start -= 4;
         }
+
+        // The count1 region begins exactly at 2*big_values: that is where the
+        // writer starts emitting quads and where every decoder starts reading
+        // them. count1Start walks down in fours from rzero, so it can land on an
+        // odd index, and 2*(count1Start/2) is then one BELOW it -- the counter
+        // priced a region the writer never wrote, part2_3_length came out short
+        // by a few bits, and the decoder duly stopped early and dropped the tail
+        // of the granule. Round the boundary up to the even index instead: it
+        // moves one coefficient into the big-values region, which can code any
+        // magnitude, and leaves the two sides describing the same bitstream.
+        if (count1Start & 1) ++count1Start;
 
         gc.big_values = count1Start / 2;
         int bigEnd = gc.big_values * 2;
@@ -2147,8 +2171,9 @@ private:
         bits += encSelectTable(ix + reg0End, reg1End - reg0End, gc.table_select[1]);
         bits += encSelectTable(ix + reg1End, bigEnd - reg1End, gc.table_select[2]);
 
+        // Priced over exactly the span the writer walks: [bigEnd, rzero).
         int count1Bits_A = 0, count1Bits_B = 0;
-        for (int i = count1Start; i < count1End; i += 4)
+        for (int i = bigEnd; i < count1End; i += 4)
         {
             int v = ix[i] != 0 ? 1 : 0;
             int w = (i+1 < 576 && ix[i+1] != 0) ? 1 : 0;
@@ -2309,16 +2334,23 @@ private:
                 int targetBits = bitsPerGranule / nch;
                 int lo = 0, hi = 255, bestGain = 210, bestBits = 999999;
 
+                // Both conditions below fall the same way as the gain rises -- a
+                // coarser step means fewer bits AND smaller quantised values --
+                // so the set of acceptable gains is an upper interval and the
+                // bisection is sound. Judging by the bit count alone was not:
+                // once the coefficients overload, the clamp caps the bit count
+                // too, so the deepest overload looked like the cheapest fit and
+                // the search walked straight into it.
                 while (lo <= hi)
                 {
                     int mid = (lo + hi) / 2;
                     int tmpIx[576];
-                    encQuantize(xr[gr][ch], tmpIx, mid);
+                    const int wantedMax = encQuantize(xr[gr][ch], tmpIx, mid);
 
                     GranuleChannel tmpGc = gc;
                     int bits = encCountGranuleBits(tmpIx, tmpGc, bands);
 
-                    if (bits <= targetBits)
+                    if (wantedMax <= kMaxQuantised && bits <= targetBits)
                     {
                         if (bits <= bestBits || mid < bestGain)
                         {

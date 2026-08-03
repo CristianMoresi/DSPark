@@ -1366,3 +1366,170 @@ DSPARK_TEST(Mp3File_long_band_21_ignores_the_previous_granule_short_scalefactors
     EXPECT_LT(worst, 1e-12);     // pre-fix the two decodes differed by 2^-3.5
 }
 
+// region0_count is a 4-bit side-info field and region1_count a 3-bit one, so the
+// encoder's region split must satisfy r0 <= 16 and r1 - r0 - 1 <= 7. Splitting
+// the band range in half did not: a granule whose coefficients reach past
+// scalefactor band 17 gives r1 >= 17 and a region1_count of 8..10, which the
+// 3-bit field truncated. The writer then emitted the Huffman regions using the
+// untruncated value while the bitstream carried the truncated one, so the
+// decoder placed the region-1/region-2 boundary up to nine scalefactor bands too
+// low and read the rest of the granule with the wrong table and the wrong
+// linbits count.
+//
+// The first frequency at which a steady tone pushes the granule past band 17 is
+// the boundary of subband 10, 6890.6 Hz at 44.1 kHz: below it the round trip was
+// exact and above it collapsed - 7 kHz came back at correlation 0.026 with its
+// amplitude deleted, 7.5 kHz at 0.0014 with 141% of the source amplitude at the
+// wrong frequency.
+DSPARK_TEST(Mp3File_encoder_codes_tones_above_the_region_boundary)
+{
+    FileCleanup cleanup { "dspark_test_hf.mp3" };
+
+    constexpr int N = 22050;
+    for (double freq : { 6500.0, 7000.0, 7500.0, 11000.0 })
+    {
+        std::vector<float> orig(N);
+        for (int i = 0; i < N; ++i)
+            orig[static_cast<size_t>(i)] =
+                0.5f * std::sin(2.0f * pi<float> * float(freq) * float(i) / 44100.0f);
+
+        {
+            Mp3File w;
+            AudioFileInfo info;
+            info.sampleRate = 44100.0;
+            info.numChannels = 1;
+            info.bitsPerSample = 320;   // kbps
+            info.numSamples = N;
+            EXPECT_TRUE(w.openWrite("dspark_test_hf.mp3", info));
+            AudioBuffer<float> buf;
+            buf.resize(1, N);
+            std::copy(orig.begin(), orig.end(), buf.getChannel(0));
+            EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+            w.close();
+        }
+
+        Mp3File r;
+        EXPECT_TRUE(r.openRead("dspark_test_hf.mp3"));
+        auto info = r.getInfo();
+        const int n = static_cast<int>(info.numSamples);
+        AudioBuffer<float> dec;
+        dec.resize(1, n);
+        EXPECT_TRUE(r.readSamples(dec.toView()));
+        r.close();
+        EXPECT_NO_NAN(dec.getChannel(0), n);
+
+        const float* d = dec.getChannel(0);
+        double best = -1.0;
+        for (int lag = 0; lag <= 4096; ++lag)
+        {
+            const int use = std::min(N - 4096, n - lag - 4096);
+            if (use < 8192) break;
+            double sa = 0.0, sb = 0.0, sab = 0.0;
+            for (int i = 0; i < use; ++i)
+            {
+                const double x = orig[static_cast<size_t>(i)];
+                const double y = d[i + lag];
+                sa += x * x; sb += y * y; sab += x * y;
+            }
+            const double den = std::sqrt(sa * sb);
+            if (den > 0.0 && sab / den > best) best = sab / den;
+        }
+
+        double ms = 0.0;
+        int used = 0;
+        for (int i = 4096; i < n - 4096; ++i) { ms += double(d[i]) * double(d[i]); ++used; }
+        const double rms = std::sqrt(ms / std::max(1, used));
+
+        EXPECT_GT(best, 0.99);        // 7 kHz measured 0.026 before the fix
+        EXPECT_GT(rms, 0.336);        // source RMS is 0.3536; 7 kHz returned 0.0007
+        EXPECT_LT(rms, 0.372);        // 7.5 kHz returned 0.498, 141% of the source
+    }
+}
+
+// The encoder's analysis filterbank and the decoder's synthesis filterbank share
+// one prototype: ISO 11172-3 gives the analysis window as C[i] = D[i]/32. Nothing
+// pinned that /32 or the cascade it belongs to, and the two are only checkable
+// together - windowing the encoder's input with D itself makes the subband
+// samples 32x hot, which the decoder then reproduces faithfully. At 320 kbps the
+// quantiser is transparent enough that the round-trip gain of a broadband signal
+// is the cascade's own gain: it must be 1, not 32 and not 1/32.
+DSPARK_TEST(Mp3File_encoder_decoder_cascade_has_unity_gain)
+{
+    FileCleanup cleanup { "dspark_test_cascade.mp3" };
+
+    constexpr int N = 22050;
+    std::vector<float> orig(N);
+    for (int i = 0; i < N; ++i)
+    {
+        const double t = double(i) / 44100.0;
+        double v = 0.0;
+        for (double f : { 220.0, 1370.0, 3100.0, 5300.0, 9100.0 })
+            v += std::sin(2.0 * pi<double> * f * t);
+        orig[static_cast<size_t>(i)] = float(0.14 * v);
+    }
+
+    {
+        Mp3File w;
+        AudioFileInfo info;
+        info.sampleRate = 44100.0;
+        info.numChannels = 1;
+        info.bitsPerSample = 320;
+        info.numSamples = N;
+        EXPECT_TRUE(w.openWrite("dspark_test_cascade.mp3", info));
+        AudioBuffer<float> buf;
+        buf.resize(1, N);
+        std::copy(orig.begin(), orig.end(), buf.getChannel(0));
+        EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+        w.close();
+    }
+
+    Mp3File r;
+    EXPECT_TRUE(r.openRead("dspark_test_cascade.mp3"));
+    auto info = r.getInfo();
+    const int n = static_cast<int>(info.numSamples);
+    AudioBuffer<float> dec;
+    dec.resize(1, n);
+    EXPECT_TRUE(r.readSamples(dec.toView()));
+    r.close();
+    EXPECT_NO_NAN(dec.getChannel(0), n);
+
+    const float* d = dec.getChannel(0);
+    double best = -1.0;
+    int bestLag = 0;
+    for (int lag = 0; lag <= 4096; ++lag)
+    {
+        const int use = std::min(N - 4096, n - lag - 4096);
+        if (use < 8192) break;
+        double sa = 0.0, sb = 0.0, sab = 0.0;
+        for (int i = 0; i < use; ++i)
+        {
+            const double x = orig[static_cast<size_t>(i)];
+            const double y = d[i + lag];
+            sa += x * x; sb += y * y; sab += x * y;
+        }
+        const double den = std::sqrt(sa * sb);
+        if (den > 0.0 && sab / den > best) { best = sab / den; bestLag = lag; }
+    }
+
+    const int use = std::min(N - 4096, n - bestLag - 4096);
+    double sxy = 0.0, syy = 0.0, sxx = 0.0;
+    for (int i = 0; i < use; ++i)
+    {
+        const double x = orig[static_cast<size_t>(i)];
+        const double y = d[i + bestLag];
+        sxy += x * y; syy += y * y; sxx += x * x;
+    }
+    const double gain = sxy / syy;      // the scale the decode needs to match the source
+    double err = 0.0;
+    for (int i = 0; i < use; ++i)
+    {
+        const double e = orig[static_cast<size_t>(i)] - gain * double(d[i + bestLag]);
+        err += e * e;
+    }
+    const double residualDb = 10.0 * std::log10(err / sxx);
+
+    EXPECT_GT(best, 0.99);
+    EXPECT_NEAR(gain, 1.0, 0.01);       // 32 or 1/32 if the /32 is dropped
+    EXPECT_LT(residualDb, -40.0);
+}
+

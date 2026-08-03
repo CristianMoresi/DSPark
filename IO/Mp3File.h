@@ -2169,16 +2169,32 @@ private:
             int bestR0 = 1, bestR1 = 2;
             for (int t = 1; t < bands.longCount && bands.longBands[t] < bigEnd; ++t) bestR1 = t;
             bestR0 = (bestR1 > 1) ? bestR1 / 2 : 1;
+            // region0_count is a 4-bit side-info field and region1_count a
+            // 3-bit one, so the split has to satisfy r0 <= 16 and
+            // r1 - r0 - 1 <= 7. Halving alone did not: a granule whose
+            // coefficients reach past scalefactor band 17 gives r1 >= 17 and a
+            // region1_count of 8..10, which the 3-bit field truncates. The
+            // writer below then emitted the regions using the untruncated
+            // value while the bitstream carried the truncated one, so the
+            // decoder placed region 2 up to nine scalefactor bands too low and
+            // read the rest of the granule with the wrong Huffman table.
+            if (bestR0 < bestR1 - 8) bestR0 = bestR1 - 8;
+            if (bestR0 > 16) bestR0 = 16;
             if (bestR0 >= bestR1) bestR0 = bestR1 - 1;
             if (bestR0 < 1) bestR0 = 1;
             r0 = bestR0; r1 = bestR1;
         }
 
-        gc.region0_count = std::max(r0 - 1, 0);
-        gc.region1_count = std::max(r1 - r0 - 1, 0);
+        gc.region0_count = std::clamp(r0 - 1, 0, 15);
+        gc.region1_count = std::clamp(r1 - r0 - 1, 0, 7);
 
-        int reg0End = (r0 < bands.longCount) ? std::min(bands.longBands[r0], bigEnd) : bigEnd;
-        int reg1End = (r1 < bands.longCount) ? std::min(bands.longBands[r1], bigEnd) : bigEnd;
+        // Derive the region ends from the STORED counts, exactly as the writer
+        // and every decoder do, so the three can never describe different
+        // bitstreams even if the split rule above changes again.
+        const int r0Stored = std::min(gc.region0_count + 1, bands.longCount);
+        const int r1Stored = std::min(gc.region0_count + gc.region1_count + 2, bands.longCount);
+        int reg0End = std::min(bands.longBands[r0Stored], bigEnd);
+        int reg1End = std::min(bands.longBands[r1Stored], bigEnd);
 
         int bits = 0;
         bits += encSelectTable(ix, reg0End, gc.table_select[0]);

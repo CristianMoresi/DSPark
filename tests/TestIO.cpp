@@ -1099,6 +1099,71 @@ static void mp3GranuleSlotProfile(const char* path, double slot[18], int& granul
     }
 }
 
+// The 512 synthesis-window coefficients are the polyphase prototype of the
+// cosine-modulated bank the decoder ends in: the filter for subband k is
+// kSynthWindow[n] * (-1)^floor(n/64) * cos(pi/64*(2k+1)*(n+16)). 115 of the 512
+// carried the wrong SIGN, which left that prototype with a -25 dB stopband
+// instead of about -100 dB, so every decode came back with images of itself at
+// +-m*fs/32. This frame excites subband 0 and NOTHING else - one spectral value
+// per granule, at xr[0] - so all it may contain is subband 0's own band,
+// 0..fs/64. Everything at or above 3*fs/64 is an image the prototype failed to
+// reject: -36.4 dB with the broken signs, -108.9 dB with them corrected.
+DSPARK_TEST(Mp3File_synthesis_window_rejects_out_of_band_images)
+{
+    FileCleanup cleanup { "dspark_test_subband0.mp3" };
+
+    auto side = [](Mp3TestBits& b) {
+        for (int gr = 0; gr < 2; ++gr)
+        {
+            b.put(3, 12); b.put(1, 9); b.put(190, 8); b.put(0, 4); b.put(0, 1);
+            b.put(1, 5); b.put(0, 5); b.put(0, 5); b.put(0, 4); b.put(0, 3);
+            b.put(0, 1); b.put(0, 1); b.put(0, 1);
+        }
+    };
+    auto main_ = [](Mp3TestBits& b) {
+        for (int gr = 0; gr < 2; ++gr) { b.put(0b01, 2); b.put(0, 1); }
+    };
+    mp3WriteFile("dspark_test_subband0.mp3", mp3CraftFrame(side, main_), 8);
+
+    Mp3File r;
+    EXPECT_TRUE(r.openRead("dspark_test_subband0.mp3"));
+    auto info = r.getInfo();
+    AudioBuffer<float> buf;
+    buf.resize(1, static_cast<int>(info.numSamples));
+    EXPECT_TRUE(r.readSamples(buf.toView()));
+    r.close();
+    EXPECT_TRUE(info.numSamples >= 3072);
+    EXPECT_NO_NAN(buf.getChannel(0), static_cast<int>(info.numSamples));
+
+    constexpr int kN = 2048;
+    constexpr int kOff = 1024;
+    const double fs = 48000.0;
+    const float* x = buf.getChannel(0);
+
+    // Naive DFT at the bins that matter: subband 0 spans 0..fs/64, and the
+    // first image of a 32-band bank lands at or above 3*fs/64.
+    auto binMag = [&](int k) {
+        double re = 0.0, im = 0.0;
+        for (int n = 0; n < kN; ++n)
+        {
+            const double a = 2.0 * pi<double> * double(k) * double(n) / double(kN);
+            re += double(x[kOff + n]) * std::cos(a);
+            im -= double(x[kOff + n]) * std::sin(a);
+        }
+        return std::sqrt(re * re + im * im);
+    };
+
+    const int kPassEnd = static_cast<int>((fs / 64.0) * kN / fs);        // 32
+    const int kStopStart = static_cast<int>((3.0 * fs / 64.0) * kN / fs); // 96
+    double passPeak = 0.0, stopPeak = 0.0;
+    for (int k = 0; k <= kPassEnd; ++k) passPeak = std::max(passPeak, binMag(k));
+    for (int k = kStopStart; k <= kN / 2; ++k) stopPeak = std::max(stopPeak, binMag(k));
+
+    EXPECT_GT(passPeak, 1.0);
+    const double rejectionDb = 20.0 * std::log10(stopPeak / passPeak);
+    EXPECT_LT(rejectionDb, -80.0);   // broken signs: -36.4 dB; corrected: -108.9 dB
+}
+
 // A short block stores three windows per scalefactor band, so band sfb starts
 // at the CUMULATIVE offset 3*shortBands[sfb]. Scaling the band index by the
 // CURRENT band's width instead was only right while the widths stayed equal:

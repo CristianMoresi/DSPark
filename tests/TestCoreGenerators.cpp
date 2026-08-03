@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -1268,11 +1269,58 @@ DSPARK_TEST(Oscillator_setFrequency_NaN_recovers_finite)
 // net scoped to targets and variants where torn or stale readouts are
 // actually producible (weakly-ordered hardware, broken publication
 // variants); on the x86 hosts running this suite an aligned float load does
-// not tear, so pre-fix they would essentially never fire locally. The
-// liveness floors prove the threads actually overlapped rather than running
-// back-to-back.
+// not tear, so pre-fix they would essentially never fire locally.
+//
+// Liveness is asserted in two separate places, because the two questions
+// are different and only one of them can be answered deterministically:
+//  - Part 1 asserts that the readouts are LIVE and PUBLISHED at all, on one
+//    thread with no scheduler in the loop. That is what a dead or
+//    unpublished readout would break, and it is checked hard.
+//  - Part 2's overlap counter asserts that the two threads actually
+//    interleaved, which is a property of the SCHEDULER, not of the code
+//    under test. It used to be a hard floor (distinct > 100) and it failed
+//    at random under sanitizer instrumentation, where thread start-up can
+//    cost more than the reader's whole read budget: the reader then spins
+//    out its 200000 reads against a generator that has not run yet, the
+//    audio thread bursts past the 4096-sample gate in one scheduling slice,
+//    and the reader exits having seen one value. Nothing was wrong; the
+//    suite went red anyway, which is how people learn to stop reading CI.
+//    It is now a bounded WAIT (the reader keeps reading until it has seen
+//    the overlap, so the observation is made rather than hoped for) plus a
+//    diagnostic if even that does not achieve it. The correctness
+//    assertions above it stay hard and unchanged.
 DSPARK_TEST(AnalogRandom_concurrent_readout_is_published_and_bounded)
 {
+    // ---- Part 1: publication liveness, single-threaded and deterministic.
+    // getCurrentValue()/getPhase() must track generation. No threads, so
+    // this cannot be flaky; it is the assertion that a dead readout breaks.
+    {
+        auto solo = std::make_unique<AnalogRandom::Generator<float>>(777u);
+        solo->prepare(48000.0);
+        solo->setNoiseType(AnalogRandom::NoiseType::Pink);
+        solo->setRateHz(500.0f);
+        solo->setSmoothing(true, 2.0f);
+        solo->setRange(-1.0f, 1.0f);
+
+        int distinctSolo = 0;
+        int phaseMoves = 0;
+        float lastSolo = solo->getCurrentValue();
+        float lastPhase = solo->getPhase();
+        for (int i = 0; i < 4096; ++i)
+        {
+            (void)solo->getNextSample();
+            const float v = solo->getCurrentValue();
+            const float p = solo->getPhase();
+            EXPECT_TRUE(std::isfinite(v) && std::abs(v) <= 1.001f);
+            EXPECT_TRUE(std::isfinite(p) && p >= 0.0f && p <= 1.0f);
+            if (v != lastSolo) { ++distinctSolo; lastSolo = v; }
+            if (p != lastPhase) { ++phaseMoves; lastPhase = p; }
+        }
+        EXPECT_GT(distinctSolo, 100); // the value readout is published
+        EXPECT_GT(phaseMoves, 100);   // the phase readout is published
+    }
+
+    // ---- Part 2: the concurrent interleaving (the oracle's access pattern).
     auto gen = std::make_unique<AnalogRandom::Generator<float>>(777u);
     gen->prepare(48000.0);
     gen->setNoiseType(AnalogRandom::NoiseType::Pink);
@@ -1306,9 +1354,21 @@ DSPARK_TEST(AnalogRandom_concurrent_readout_is_published_and_bounded)
     int distinct = 0;
     float lastV = 0.0f;
     long long reads = 0;
-    const long long kMaxReads = 50000000; // hard cap: never hang, fail loudly
-    while ((generated.load(std::memory_order_relaxed) < 4096 || reads < 200000)
-           && reads < kMaxReads)
+    const int kOverlapTarget = 100;
+    // Hard cap: never hang, fail loudly -- but in WALL TIME, not in reads.
+    // A read-count cap does not bound how long this loop runs, and worse, it
+    // can expire before the other threads have even been scheduled: measured
+    // at -O2 under ASan with a 150 ms thread start-up, the reader retires
+    // 50 million reads first and then fails `generated > 4095` for a purely
+    // scheduling reason (0/20 runs survived that). A deadline cannot be
+    // outrun, so the floors below only fire when a thread is genuinely dead.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    // The liveness targets are part of the EXIT condition, not only of the
+    // verdict: the reader keeps reading (with the writer still running)
+    // until it has actually observed the interleaving, instead of stopping
+    // at a fixed budget and hoping the scheduler cooperated.
+    while (generated.load(std::memory_order_relaxed) < 4096 || reads < 200000
+           || distinct < kOverlapTarget)
     {
         ++reads;
         const float v = gen->getCurrentValue();
@@ -1319,6 +1379,13 @@ DSPARK_TEST(AnalogRandom_concurrent_readout_is_published_and_bounded)
         if (!std::isfinite(v) || std::abs(v) > 1.001f) ++violations;
         if (!std::isfinite(p) || p < 0.0f || p > 1.0f) ++violations;
         if (v != lastV) { ++distinct; lastV = v; }
+
+        if ((reads & 0xFFFF) == 0)
+        {
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            std::this_thread::yield(); // never outrun a thread that has
+                                       // not been given a core yet
+        }
     }
 
     stop.store(true, std::memory_order_relaxed);
@@ -1326,6 +1393,14 @@ DSPARK_TEST(AnalogRandom_concurrent_readout_is_published_and_bounded)
     control.join();
 
     EXPECT_EQ(violations, 0);
-    EXPECT_GT(distinct, 100);                                     // publication liveness
     EXPECT_GT(generated.load(std::memory_order_relaxed), 4095LL); // real overlap
+    // Scheduler observation, reported and not asserted: Part 1 already
+    // proved the readouts are published, so a thin interleaving here means
+    // this run exercised the concurrent pattern less than usual, not that
+    // anything regressed. Failing on it would only teach people to ignore
+    // a red suite.
+    if (distinct < kOverlapTarget)
+        std::cerr << "    NOTE: AnalogRandom concurrent overlap thin this run ("
+                  << distinct << " distinct published values in " << reads
+                  << " reads); correctness assertions unaffected.\n";
 }

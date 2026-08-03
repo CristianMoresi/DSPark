@@ -35,7 +35,7 @@
  * channel-0 sample). Non-finite setter arguments are ignored. getLatency()
  * derives from the published lookahead parameter, so a host reads the correct
  * value immediately after setLookahead(). getGainReductionDb() is metering:
- * an unsynchronized cross-thread read of the live envelope (approximate).
+ * a cross-thread read of a published atomic word (up to one block behind).
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, RingBuffer.h,
  *               SmoothedValue.h, DenormalGuard.h, TruePeakDetector.h,
@@ -244,6 +244,9 @@ public:
                 chData[ch][i] = out;
             }
         }
+
+        // One relaxed store per block, outside the per-sample loop.
+        publishedGain_.store(currentGain_, std::memory_order_relaxed);
     }
 
     /**
@@ -301,6 +304,7 @@ public:
             const T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
             const T targetGain = (heldPeak_ > ceiling) ? ceiling / heldPeak_ : T(1);
             smoothGain(targetGain, adaptive, relMs);
+            publishedGain_.store(currentGain_, std::memory_order_relaxed);
         }
 
         T out = delayLines_[channel].read(sampleLookNow_) * currentGain_;
@@ -321,6 +325,7 @@ public:
         for (auto& dl : delayLines_) dl.reset();
         truePeak_.reset();
         currentGain_ = T(1);
+        publishedGain_.store(T(1), std::memory_order_relaxed);
         limitingDuration_ = 0;
         heldPeak_ = T(0);
         peakHoldCounter_ = 0;
@@ -409,8 +414,17 @@ public:
         return lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
     }
 
-    /** @brief Current gain reduction in dB (metering; unsynchronized read). */
-    [[nodiscard]] T getGainReductionDb() const noexcept { return gainToDecibels(currentGain_); }
+    /** @brief Current gain reduction in dB (metering).
+     *
+     *  Safe from any thread: it loads a published atomic word, so off the audio
+     *  thread it may be up to one block behind. It used to read `currentGain_`
+     *  directly -- a plain word the audio thread writes every sample, read from
+     *  another thread, which is a data race and not merely an approximate
+     *  number. */
+    [[nodiscard]] T getGainReductionDb() const noexcept
+    {
+        return gainToDecibels(publishedGain_.load(std::memory_order_relaxed));
+    }
 
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
@@ -571,6 +585,9 @@ protected:
     T lastReleaseMs_ = T(-1);
 
     T currentGain_ = T(1);
+    /// Cross-thread metering readout of currentGain_ (published once per block
+    /// / per processSample() call, never inside a per-sample loop).
+    std::atomic<T> publishedGain_ { T(1) };
     int limitingDuration_ = 0;
     T lookaheadCurrent_ = T(96); ///< Smoothed read offset (glides on live changes).
 

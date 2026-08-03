@@ -22,8 +22,9 @@
  * compensate() and reset() belong to the audio thread. Setters are lock-free
  * atomic publications, safe from any thread, consumed at the next
  * compensate(). Non-finite setter arguments are ignored.
- * getCompensationDb() may be read from any thread for metering (approximate:
- * the value is written unsynchronised by the audio thread).
+ * getCompensationDb() may be read from any thread for metering: it loads an
+ * atomic word the audio thread publishes once per compensate(), so the read is
+ * synchronised and may be up to one block behind.
  *
  * Dependencies: DspMath.h, SimdOps.h, AudioSpec.h, AudioBuffer.h, StateBlob.h.
  */
@@ -152,6 +153,11 @@ public:
 
         // Update internal state for the next block
         compensationDb_ = endCompensationDb;
+        // Publish it for cross-thread metering. The working member stays
+        // audio-thread-private: getCompensationDb() used to read it directly,
+        // which is a plain word written by the audio thread and read by
+        // another -- a data race, not merely an approximate number.
+        publishedCompensationDb_.store(compensationDb_, std::memory_order_relaxed);
     }
 
     /**
@@ -161,13 +167,22 @@ public:
     {
         refLevelDb_ = SILENCE_THRESH_DB;
         compensationDb_ = T(0);
+        publishedCompensationDb_.store(T(0), std::memory_order_relaxed);
     }
 
     /**
      * @brief Returns the current internal compensation in dB. Useful for UI metering.
+     *
+     * Safe from any thread: it loads a published atomic word, not the audio
+     * thread's working state. The value is the one the last completed
+     * compensate() left, so it may be up to one block old.
+     *
      * @return Current gain offset in decibels.
      */
-    [[nodiscard]] T getCompensationDb() const noexcept { return compensationDb_; }
+    [[nodiscard]] T getCompensationDb() const noexcept
+    {
+        return publishedCompensationDb_.load(std::memory_order_relaxed);
+    }
 
     /**
      * @brief Thread-safe assignment of the maximum allowed compensation limit.
@@ -256,7 +271,8 @@ private:
 
     std::atomic<T> smoothTimeSecs_{ T(0.100) };      ///< Smoothing time constant in seconds.
     T refLevelDb_ = SILENCE_THRESH_DB;               ///< Snapshot of input level.
-    T compensationDb_ = T(0);                        ///< Current applied compensation state.
+    T compensationDb_ = T(0);                        ///< Audio-thread working state.
+    std::atomic<T> publishedCompensationDb_{ T(0) }; ///< Cross-thread metering readout.
 
     std::atomic<T> maxCompensation_{ T(12) };        ///< Lock-free UI bound for max +/- dB change.
 };

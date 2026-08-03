@@ -113,11 +113,14 @@ public:
     }
 
     /** @brief Returns the current internal smoothed value.
-     *  @note Exact on the audio thread; from other threads (metering) the
-     *        read is unsynchronized and merely approximate. */
+     *  @note Safe from any thread: it loads an atomic word the processing call
+     *        publishes once per block, so off the audio thread it may be up to
+     *        one block behind. It used to read the smoother directly, which is
+     *        a plain word the audio thread writes -- a data race, not merely an
+     *        approximate number. */
     [[nodiscard]] T getCurrentGain() const noexcept
     {
-        return gainSmooth_.getCurrentValue();
+        return publishedGain_.load(std::memory_order_relaxed);
     }
 
     /**
@@ -197,6 +200,8 @@ public:
         {
             simd::applyGain(data + i, gainSmooth_.getCurrentValue(), numSamples - i);
         }
+
+        publishGain();
     }
 
     /**
@@ -221,6 +226,8 @@ public:
             for (int ch = 0; ch < numChannels; ++ch)
                 simd::applyGain(channelData[ch] + i, g, remaining);
         }
+
+        publishGain();
     }
 
     /**
@@ -245,6 +252,8 @@ public:
             std::copy_n(input + i, remaining, output + i);
             simd::applyGain(output + i, g, remaining);
         }
+
+        publishGain();
     }
 
     /** @brief Skips smoothing - immediately sets current gain to target. */
@@ -285,6 +294,18 @@ public:
 
 protected:
     /**
+     * @brief Publishes the smoother's value for cross-thread metering.
+     *
+     * getCurrentGain() used to read the smoother directly: a plain word the
+     * audio thread advances every sample, read from another thread. One
+     * relaxed store per processing call, outside every per-sample loop.
+     */
+    inline void publishGain() noexcept
+    {
+        publishedGain_.store(gainSmooth_.getCurrentValue(), std::memory_order_relaxed);
+    }
+
+    /**
      * @brief Synchronizes atomic UI variables with audio thread state.
      * Must be called at the start of any audio processing block.
      */
@@ -305,6 +326,7 @@ protected:
             gainSmooth_.setTargetValue(finalTarget);
             currentTarget_ = finalTarget;
         }
+
     }
 
     /** @brief Forces instantaneous synchronization of state without ramping. */
@@ -318,6 +340,7 @@ protected:
         
         currentTarget_ = finalTarget;
         gainSmooth_.reset(currentTarget_);
+        publishedGain_.store(gainSmooth_.getCurrentValue(), std::memory_order_relaxed);
     }
 
     double sampleRate_ = 48000.0;
@@ -327,6 +350,7 @@ protected:
     SmoothedValue<T> gainSmooth_;
 
     // Atomic Communication (UI -> Audio Thread)
+    std::atomic<T> publishedGain_ { T(1) }; ///< Cross-thread metering readout.
     std::atomic<T> targetGainLinear_ { T(1) };
     std::atomic<double> rampTimeMs_ { 10.0 };
     std::atomic<bool> rampTimeChanged_ { false };

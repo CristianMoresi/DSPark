@@ -19,8 +19,9 @@
  *
  * Threading: setCurve()/setPosition() are safe from any thread (atomics,
  * consumed by the processing calls on the audio thread); non-finite positions
- * are ignored. The processing calls and the gain getters belong to the audio
- * thread (getters read unsynchronized audio-thread state: metering only).
+ * are ignored. The processing calls belong to the audio thread. getGainA() and
+ * getGainB() are safe from any thread: they load atomic words the processing
+ * call publishes, so they may be up to one call behind.
  */
 
 #include "../Core/DspMath.h"
@@ -196,13 +197,25 @@ public:
         lastCurve_ = curv;
         gainA_ = gA;
         gainB_ = gB;
+        publishedGainA_.store(gainA_, std::memory_order_relaxed);
+        publishedGainB_.store(gainB_, std::memory_order_relaxed);
     }
 
-    /** @brief Gets the current internal gain multiplier for signal A. */
-    [[nodiscard]] T getGainA() const noexcept { return gainA_; }
+    /** @brief Gets the current internal gain multiplier for signal A.
+     *  Safe from any thread: loads a published atomic word, so it may be up to
+     *  one processing call behind. */
+    [[nodiscard]] T getGainA() const noexcept
+    {
+        return publishedGainA_.load(std::memory_order_relaxed);
+    }
 
-    /** @brief Gets the current internal gain multiplier for signal B. */
-    [[nodiscard]] T getGainB() const noexcept { return gainB_; }
+    /** @brief Gets the current internal gain multiplier for signal B.
+     *  Safe from any thread: loads a published atomic word, so it may be up to
+     *  one processing call behind. */
+    [[nodiscard]] T getGainB() const noexcept
+    {
+        return publishedGainB_.load(std::memory_order_relaxed);
+    }
 
 private:
     /**
@@ -255,6 +268,12 @@ private:
             computeGains(curv, pos, gainA_, gainB_);
             lastPos_   = pos;
             lastCurve_ = curv;
+            // Publish for cross-thread metering. The working pair stays
+            // audio-thread-private: the getters used to read it directly,
+            // which is a plain word written by the audio thread and read by
+            // another.
+            publishedGainA_.store(gainA_, std::memory_order_relaxed);
+            publishedGainB_.store(gainB_, std::memory_order_relaxed);
         }
     }
 
@@ -265,6 +284,9 @@ private:
     // Audio Thread Local State (Cache)
     T gainA_ = T(1);
     T gainB_ = T(0);
+    // Cross-thread metering readouts of the pair above.
+    std::atomic<T> publishedGainA_ { T(1) };
+    std::atomic<T> publishedGainB_ { T(0) };
     T lastPos_ = T(-1);  // Sentinel to force initial compute
     Curve lastCurve_ = Curve::EqualPower;
 };

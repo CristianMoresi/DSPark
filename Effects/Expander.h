@@ -20,8 +20,8 @@
  *   never concurrently with processBlock().
  * - All parameter setters are RT-safe atomic publications from any thread;
  *   the audio thread picks them up at the next block.
- * - getGateState() / getCurrentGainDb() are approximate cross-thread metering
- *   reads (unsynchronized).
+ * - getGateState() / getCurrentGainDb() are cross-thread metering reads of
+ *   published atomic words (up to one block behind).
  * - processBlock() before prepare() is a pass-through (it used to hard-mute:
  *   the smoothing coefficients were still zero, freezing the gain at 0).
  *
@@ -230,15 +230,24 @@ public:
 
     // -- Queries -------------------------------------------------------------
 
-    /** @return The current state of the expander's logic gate (approximate
-     *  cross-thread metering read).
+    /** @return The current state of the expander's logic gate.
+     *  Safe from any thread: loads a published atomic word, so it may be up to
+     *  one block behind. It used to read the plain member the audio thread
+     *  writes per sample -- a data race, not merely an approximate number.
      *  (Renamed from getState(), which now follows the framework-wide preset
      *  serialization convention.) */
-    [[nodiscard]] State getGateState() const noexcept { return state_; }
+    [[nodiscard]] State getGateState() const noexcept
+    {
+        return publishedState_.load(std::memory_order_relaxed);
+    }
 
-    /** @return The current actual gain being applied, in decibels (approximate
-     *  cross-thread metering read). */
-    [[nodiscard]] T getCurrentGainDb() const noexcept { return gainToDecibels(gateGain_); }
+    /** @return The current actual gain being applied, in decibels.
+     *  Safe from any thread: loads a published atomic word, so it may be up to
+     *  one block behind (same reason as getGateState()). */
+    [[nodiscard]] T getCurrentGainDb() const noexcept
+    {
+        return gainToDecibels(publishedGateGain_.load(std::memory_order_relaxed));
+    }
 
     /** @brief Resets all internal DSP states to prevent clicks on playback start. */
     void reset() noexcept
@@ -247,6 +256,7 @@ public:
         gateGain_ = rangeLinear_.load(std::memory_order_relaxed);
         envelope_ = T(0);
         holdCounter_ = 0;
+        publishMeters();
 
         std::fill(scHpfState_.begin(), scHpfState_.end(), T(0));
         std::fill(scHpfPrev_.begin(), scHpfPrev_.end(), T(0));
@@ -364,6 +374,21 @@ protected:
                 buffer.getChannel(ch)[i] *= gain;
             }
         }
+
+        publishMeters();
+    }
+
+    /**
+     * @brief Publishes the metering words for cross-thread readout.
+     *
+     * Two relaxed stores per block, outside the per-sample loop: the getters
+     * used to read `state_` and `gateGain_` directly, which are plain words the
+     * audio thread writes every sample.
+     */
+    void publishMeters() noexcept
+    {
+        publishedState_.store(state_, std::memory_order_relaxed);
+        publishedGateGain_.store(gateGain_, std::memory_order_relaxed);
     }
 
     void updateStateMachine(T levelDb) noexcept
@@ -493,6 +518,9 @@ protected:
 
     State state_ = State::Closed;
     T gateGain_ = T(0);
+    // Cross-thread metering readouts of the two audio-thread words above.
+    std::atomic<State> publishedState_ { State::Closed };
+    std::atomic<T> publishedGateGain_ { T(0) };
     T envelope_ = T(0);
     int holdCounter_ = 0;
 };

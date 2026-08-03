@@ -326,7 +326,6 @@ protected:
             gainSmooth_.setTargetValue(finalTarget);
             currentTarget_ = finalTarget;
         }
-
     }
 
     /** @brief Forces instantaneous synchronization of state without ramping. */

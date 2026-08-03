@@ -585,8 +585,10 @@ protected:
     T lastReleaseMs_ = T(-1);
 
     T currentGain_ = T(1);
-    /// Cross-thread metering readout of currentGain_ (published once per block
-    /// / per processSample() call, never inside a per-sample loop).
+    /// Cross-thread metering readout of currentGain_: published once per
+    /// processBlock() and once per processSample() call. processSample() is the
+    /// per-sample entry point, so there the store does run once per sample --
+    /// what it never does is sit inside processBlock()'s own sample loop.
     std::atomic<T> publishedGain_ { T(1) };
     int limitingDuration_ = 0;
     T lookaheadCurrent_ = T(96); ///< Smoothed read offset (glides on live changes).

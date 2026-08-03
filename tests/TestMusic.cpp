@@ -544,6 +544,15 @@ DSPARK_TEST(ChordDetector_default_window_tracks_sample_rate)
     EXPECT_TRUE(c48.type == CT::Major);
     EXPECT_GT(c48.confidence, 0.5f);
 
+    // The doubling boundaries of the auto map: 88.2 and 176.4 kHz are the
+    // rates where the span requirement crosses into the next power of two.
+    // Documented and measured, previously unpinned.
+    int w88 = 0, w176 = 0;
+    (void)detectAt({60, 64, 67}, 88200.0, 0, 8, &w88);
+    EXPECT_EQ(w88, 8192);
+    (void)detectAt({60, 64, 67}, 176400.0, 0, 8, &w176);
+    EXPECT_EQ(w176, 16384);
+
     const auto c96 = detectAt({60, 64, 67}, 96000.0, 0, 240, &w96);
     EXPECT_EQ(w96, 8192);
     EXPECT_EQ(c96.rootPitchClass, 0);
@@ -650,4 +659,76 @@ DSPARK_TEST(Harmony_diatonicChord_heptatonic_contract)
     EXPECT_EQ(odd.intervals[1], 4);
     EXPECT_EQ(odd.intervals[2], 9);
     EXPECT_TRUE(odd.view() == std::string_view("?"));
+}
+
+// ============================================================================
+// Above the E5 root ceiling the detector has no correct answer to give, but it
+// is not silent: the window-fill transient can push a WRONG chord through the
+// confidence gate, and hold-last-confident then keeps it on display for as
+// long as the programme runs. This pins the documented hazard and the
+// documented mitigation (reset() on programme change).
+// ============================================================================
+DSPARK_TEST(ChordDetector_above_ceiling_fill_transient_latches_and_persists)
+{
+    using CT = ChordDetector<float>::ChordType;
+    const double fs = 48000.0;
+
+    ChordDetector<float> det;
+    det.prepare(spec(fs, 512, 2));
+    const int N = det.getWindowSize();
+
+    // C6 root-position major triad (MIDI 84/88/91): the root is 8 semitones
+    // above the E5 ceiling, so NO reading of this signal is correct.
+    auto midiHz = [](int m) { return 440.0 * std::exp2((m - 69) / 12.0); };
+    auto buf = makeStereoBuffer(512);
+    const long long total = 12LL * N;
+    long long n = 0;
+    int gatePassesDuringFill = 0, gatePassesAfterFill = 0;
+    ChordDetector<float>::Result firstPass {};
+    while (n < total)
+    {
+        for (int i = 0; i < 512; ++i)
+        {
+            double v = 0.0;
+            for (int m : { 84, 88, 91 })
+                v += std::sin(dspark::twoPi<double> * midiHz(m)
+                              * static_cast<double>(n + i) / fs);
+            buf.ch(0)[i] = static_cast<float>(0.25 * v);
+            buf.ch(1)[i] = buf.ch(0)[i];
+        }
+        det.processBlock(AudioBufferView<const float>(buf.view()));
+        n += 512;
+        const auto r = det.getChord();
+        if (r.confidence >= det.getConfidenceThreshold() && r.type != CT::None)
+        {
+            if (n <= 2LL * N) { if (gatePassesDuringFill++ == 0) firstPass = r; }
+            else              ++gatePassesAfterFill;
+        }
+    }
+
+    std::cout << "  [ceiling] fill passes=" << gatePassesDuringFill
+              << " steady passes=" << gatePassesAfterFill
+              << " latched pc=" << firstPass.rootPitchClass
+              << " type=" << static_cast<int>(firstPass.type)
+              << " conf=" << firstPass.confidence << "\n";
+
+    // The hazard: something passed the gate while the window was filling...
+    EXPECT_GT(gatePassesDuringFill, 0);
+    // ...it was not the chord that is playing (C major would be pc 0)...
+    EXPECT_FALSE(firstPass.rootPitchClass == 0 && firstPass.type == CT::Major);
+    // ...nothing passes once the window is full (so no later reading corrects
+    // it)...
+    EXPECT_EQ(gatePassesAfterFill, 0);
+    // ...and the wrong chord is still what a caller reads at the end, at a
+    // confidence BELOW the gate: a stale value, not a current one.
+    const auto held = det.getChord();
+    EXPECT_EQ(held.rootPitchClass, firstPass.rootPitchClass);
+    EXPECT_TRUE(held.type == firstPass.type);
+    EXPECT_LT(held.confidence, det.getConfidenceThreshold());
+
+    // The documented mitigation clears it.
+    det.reset();
+    const auto afterReset = det.getChord();
+    EXPECT_EQ(afterReset.rootPitchClass, -1);
+    EXPECT_TRUE(afterReset.type == CT::None);
 }

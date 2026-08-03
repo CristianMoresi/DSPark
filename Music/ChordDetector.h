@@ -105,7 +105,13 @@ public:
      * - Upper bound (every configuration): the analysis bins stop at
      *   MIDI 83 (B5), so chord tones above B5 are invisible and
      *   root-position triads with roots above E5 (MIDI 76) are NEVER
-     *   detected.
+     *   detected. Above that ceiling, exactly as below the F#3 floor, the
+     *   window-fill transient can still pass the confidence gate with a WRONG
+     *   chord (measured: a C6 root-position major triad latches B Maj7 at
+     *   ~0.58 during the first window, then never again), and the
+     *   hold-last-confident rule keeps that reading on display indefinitely.
+     *   Call reset() on programme change, and treat a Result whose confidence
+     *   is below the threshold as STALE rather than as a current reading.
      * - Lower bound: adjacent-semitone leakage from the Hann main lobe,
      *   ~4*fs/windowSize Hz wide. The floor is a property of that RATIO,
      *   not of the rate alone; measured floors:

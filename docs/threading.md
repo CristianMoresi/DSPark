@@ -57,9 +57,10 @@ lock-free on every supported target and outside the census.
 That is a run-time census of the word types. It is **not** a compile-time check
 on your component, and the build will not stop you using a word the census
 never saw. Where the word type is a template parameter the census cannot reach
-it at all. Two headers pin it themselves -- `Analysis/SpectrumAnalyzer.h` and
-`Effects/AutoGain.h` -- and most of the headers that declare such an atomic do
-not. A new component with an atomic word on the audio path should do the same:
+it at all. Four headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
+`Effects/AutoGain.h`, `Effects/Equalizer.h` and `Effects/DynamicEQ.h` -- and
+most of the headers that declare such an atomic do not. A new component with an
+atomic word on the audio path should do the same:
 
 ```cpp
 static_assert(std::atomic<T>::is_always_lock_free,

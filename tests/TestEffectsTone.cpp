@@ -2667,14 +2667,13 @@ DSPARK_TEST(Equalizer_shelf_band_Q_change_is_audible_in_min_phase)
 }
 
 // ---------------------------------------------------------------------------
-// CHANGE-REQUEST M-008C-TEST-1 (ADDITIVE ONLY): concurrent publication pin for
-// Effects/Equalizer.h. Nothing above this marker is modified.
+// Concurrent publication pin for Effects/Equalizer.h.
 //
 // Why this pin can actually fail, which is the whole point of it:
 // before the band configs became a seqlock, this exact schedule adopted a
-// config that was never published -- ~560k-680k torn adoptions per 5 s run,
-// ~3.3% of all adoptions, reproduced three times out of three
-// (tests/results/M-008C/torn-probe-before.log). The two configs below differ
+// config that was never published -- several hundred thousand mixed configs
+// per five-second run, roughly one adoption in thirty, on every attempt.
+// The two configs below differ
 // in EVERY field, and the audio thread reads back what it just adopted through
 // the band's own FilterEngine, ON THE AUDIO THREAD, so the read-back cannot
 // itself invent a mismatch. A (shape, slope) pair that is neither of the two

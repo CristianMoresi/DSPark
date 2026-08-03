@@ -3525,9 +3525,7 @@ DSPARK_TEST(PitchShifter_mix_change_is_click_free)
 }
 
 // ---------------------------------------------------------------------------
-// CHANGE-REQUEST M-008C-TEST-2 (ADDITIVE ONLY): concurrent publication pins for
-// Effects/DynamicEQ.h and Effects/Reverb.h. Nothing above this marker is
-// modified.
+// Concurrent publication pins for Effects/DynamicEQ.h and Effects/Reverb.h.
 
 // Every field of a published DynamicEQ band is atomic behind a per-band
 // seqlock, so a band the audio thread adopts is always one whole publication.
@@ -3612,7 +3610,7 @@ DSPARK_TEST(DynamicEQ_concurrent_setBand_is_never_torn)
 // heap-use-after-free, single-threaded, through documented public API -- the
 // accessor took a local shared_ptr snapshot, returned a reference into it and
 // let the snapshot die at the closing brace, so loadIR() freed the bank under
-// the caller (ASan report in tests/results/M-008C/reverb-dangle-before.log).
+// the caller, which AddressSanitizer reports as a heap-use-after-free.
 // Under the ASan+UBSan build this pin is a hard failure on any regression; on
 // normal builds it asserts the observed values, which a freed bank has no
 // obligation to preserve.

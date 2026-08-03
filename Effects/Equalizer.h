@@ -619,8 +619,8 @@ protected:
      * the filter is configured from ONE publication. Reading the band by
      * reference instead would let a concurrent setBand() land between two field
      * reads and configure a filter with a frequency from one call and a slope
-     * from the next -- measured at ~3% of adoptions before this was a seqlock
-     * (tests/results/M-008C/torn-probe-before.log).
+     * from the next. That is not a theoretical hazard: before this was a
+     * seqlock, roughly one adoption in thirty was such a mixture.
      */
     void updateActiveFilters() noexcept
     {

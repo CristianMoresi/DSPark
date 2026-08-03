@@ -60,13 +60,43 @@ public:
      * Must be called before audio processing begins. Zero allocations
      * happen after this point. Release-safe: a non-finite or non-positive
      * sample rate is ignored (no-op keeping the previous configuration);
-     * windowSize is clamped to [64, 1 << 20].
+     * an explicit windowSize is clamped to [64, 1 << 20].
      *
      * @param sampleRate The system sample rate in Hz.
-     * @param windowSize Analysis window size in samples (default: 2048).
-     * @param hopSize    Number of samples between detections (overlap). Lower is smoother.
+     * @param windowSize Analysis window in samples. Values <= 0 (the default)
+     *                   select the AUTOMATIC window: the smallest power of two
+     *                   in [512, 16384] spanning at least 2048/48000 s
+     *                   (~42.7 ms) at sampleRate -- 2048 at 44.1/48 kHz, 4096
+     *                   at 88.2/96 kHz, 8192 at 176.4/192 kHz, 16384 at
+     *                   384 kHz, 512 at 8 kHz. Read it back with
+     *                   getWindowSize().
+     * @param hopSize    Samples between detections. Values <= 0 (the default)
+     *                   select windowSize/4, which is 512 at the 44.1/48 kHz
+     *                   window and keeps the detection RATE at ~one per
+     *                   10.7 ms at every sample rate. Explicit positive values
+     *                   are clamped to [1, windowSize].
+     *
+     * THE WINDOW IS A REGISTER, NOT A COUNT. YIN searches lags tau in
+     * [2, windowSize/2), so the lowest fundamental the detector can reach is
+     *
+     *     fmin = fs / (windowSize/2 - 1)      (approximately 2*fs/windowSize)
+     *
+     * -- a property of the RATIO fs/windowSize alone. Measured, identical
+     * across rates at equal ratio: fs/windowSize = 23.44 Hz recovers down to
+     * A1 55 Hz (48 kHz/2048, 96 kHz/4096, 192 kHz/8192 all agree to within
+     * 0.01 cents); fs/windowSize = 5.86 Hz reaches C1 32.7 Hz. Holding the
+     * COUNT fixed instead moves the floor with the rate: an explicit 2048
+     * window gives fmin 46.9 Hz at 48 kHz but 93.8 Hz at 96 kHz and 187.7 Hz
+     * at 192 kHz, so E1/A1/E2 -- and at 176.4/192 kHz A2 as well -- are simply
+     * never reported. Out-of-register notes read as unvoiced (0 Hz,
+     * confidence 0) rather than as a wrong pitch: measured across
+     * 44.1..192 kHz on band-limited sawtooths from E1 to A5, every reading was
+     * either correct to within 0.1 cents or absent, never confidently wrong.
+     * The automatic window keeps fmin at 43.1 Hz (44.1 kHz family) / 46.9 Hz
+     * (48 kHz family) from 44.1 to 192 kHz. For a lower floor pass an explicit
+     * window: fmin scales as fs/windowSize, so doubling the window halves it.
      */
-    void prepare(double sampleRate, int windowSize = 2048, int hopSize = 512)
+    void prepare(double sampleRate, int windowSize = 0, int hopSize = 0)
     {
         if (!std::isfinite(sampleRate) || sampleRate <= 0.0)
             return;
@@ -74,9 +104,25 @@ public:
         fft_.reset(); // gate OFF: pushSamples() is a no-op while rebuilding
 
         sampleRate_ = sampleRate;
-        windowSize_ = std::clamp(windowSize, 64, 1 << 20);
+        if (windowSize <= 0)
+        {
+            // Automatic: hold the analysis TIME SPAN constant across sample
+            // rates (the span 2048 samples cover at 48 kHz). The reachable
+            // register is fs/(windowSize/2 - 1), so a constant span pins the
+            // lowest detectable fundamental instead of letting it climb with
+            // the rate.
+            const double target = sampleRate_ * (kAutoSpanRef / kAutoSpanRate);
+            int n = kAutoMinWindow;
+            while (n < kAutoMaxWindow && static_cast<double>(n) < target) n <<= 1;
+            windowSize_ = n;
+        }
+        else
+        {
+            windowSize_ = std::clamp(windowSize, 64, 1 << 20);
+        }
         halfWindow_ = windowSize_ / 2;
-        hopSize_    = std::clamp(hopSize, 1, windowSize_);
+        hopSize_    = (hopSize <= 0) ? std::max(1, windowSize_ / 4)
+                                     : std::clamp(hopSize, 1, windowSize_);
 
         // Mirrored buffer technique: size is 2x windowSize.
         // Guarantees continuous memory layout without modulo operations.
@@ -111,8 +157,10 @@ public:
      *
      * @note The difference function runs as a frequency-domain
      * cross-correlation (YIN-FFT): O(N log N) per detection - roughly 20x
-     * faster than the direct O(windowSize^2) form at the 2048 default and
-     * generally fine on the audio thread. For very low-latency callbacks you
+     * faster than the direct O(windowSize^2) form at the 2048-sample window
+     * the automatic policy picks at 44.1/48 kHz, and generally fine on the
+     * audio thread. Cost per SECOND of audio is rate-invariant under the
+     * automatic policy (window and hop scale together). For very low-latency callbacks you
      * can still feed an SPSC queue (Core/SpscQueue.h) and detect on a worker.
      *
      * @param samples Span of input audio data (mono).
@@ -187,6 +235,19 @@ public:
     {
         return threshold_.load(std::memory_order_relaxed);
     }
+
+    /**
+     * @return The analysis window (samples) in effect: the automatic choice if
+     *         prepare() was called with windowSize <= 0, the clamped explicit
+     *         request otherwise (member default 2048 before the first
+     *         successful prepare()). The lowest reachable fundamental is
+     *         sampleRate / (getWindowSize()/2 - 1).
+     */
+    [[nodiscard]] int getWindowSize() const noexcept { return windowSize_; }
+
+    /** @return Samples between detections in effect (windowSize/4 by
+     *          default), i.e. one detection every getHopSize()/sampleRate s. */
+    [[nodiscard]] int getHopSize() const noexcept { return hopSize_; }
 
     /** @brief Resets state buffers. Not thread-safe with pushSamples(). */
     void reset() noexcept
@@ -326,6 +387,13 @@ private:
         T adjustment = (s0 - s2) / (T(2) * denom);
         return static_cast<T>(tau) + adjustment;
     }
+
+    /// Automatic-window policy: the span 2048 samples cover at 48 kHz,
+    /// resolved inside [512, 16384] (covers 8 kHz .. 384 kHz without clamping).
+    static constexpr double kAutoSpanRef = 2048.0;
+    static constexpr double kAutoSpanRate = 48000.0;
+    static constexpr int kAutoMinWindow = 512;
+    static constexpr int kAutoMaxWindow = 16384;
 
     double sampleRate_ = 44100.0;
     int windowSize_ = 2048;

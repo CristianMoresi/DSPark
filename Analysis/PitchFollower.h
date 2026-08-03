@@ -84,14 +84,28 @@ public:
      * keeping the previous state.
      *
      * @param spec       Audio environment specification.
-     * @param windowSize Detector analysis window (default 2048 - good down to
-     *                   ~50 Hz at 48 kHz; updates every windowSize/4 samples).
+     * @param windowSize Detector analysis window. Values <= 0 (the default)
+     *                   select PitchDetector's AUTOMATIC window: 2048 at
+     *                   44.1/48 kHz, 4096 at 88.2/96 kHz, 8192 at
+     *                   176.4/192 kHz. Explicit positive values are forwarded
+     *                   as given (with a hop of windowSize/4).
+     *
+     * The tracked register is the detector's: the lowest reachable fundamental
+     * is sampleRate/(windowSize/2 - 1), so it depends on the RATIO, never on
+     * the count. The automatic window is good down to ~47 Hz at every rate
+     * from 44.1 to 192 kHz. A fixed 2048-sample window would instead stop at
+     * ~94 Hz at 96 kHz and ~188 Hz at 192 kHz: measured, a 55 Hz or 82 Hz
+     * sawtooth then never leaves getSmoothedHz() at 0 and isTracking() stays
+     * false, whatever setRange() says -- the range gate cannot widen a
+     * register the detector cannot reach. For a lower floor pass an explicit
+     * window (doubling it halves the floor and doubles the analysis latency).
      */
-    void prepare(const AudioSpec& spec, int windowSize = 2048)
+    void prepare(const AudioSpec& spec, int windowSize = 0)
     {
         if (!spec.isValid()) return;
         sampleRate_ = spec.sampleRate;
-        detector_.prepare(spec.sampleRate, windowSize, windowSize / 4);
+        detector_.prepare(spec.sampleRate, windowSize,
+                          (windowSize > 0) ? windowSize / 4 : 0);
         monoScratch_.assign(static_cast<size_t>(std::max(spec.maxBlockSize, 1)), T(0));
         prepared_.store(true, std::memory_order_relaxed);
         reset();
@@ -159,6 +173,12 @@ public:
 
     /** @brief Returns the glide time in milliseconds per octave. */
     [[nodiscard]] T getGlide() const noexcept { return glideMs_.load(std::memory_order_relaxed); }
+
+    /** @return The wrapped detector's analysis window in samples (the
+     *          automatic choice unless prepare() was given an explicit one).
+     *          The lowest trackable fundamental is
+     *          sampleRate/(getWindowSize()/2 - 1). */
+    [[nodiscard]] int getWindowSize() const noexcept { return detector_.getWindowSize(); }
 
     // -- Readout (lock-free, any thread) ------------------------------------------
 

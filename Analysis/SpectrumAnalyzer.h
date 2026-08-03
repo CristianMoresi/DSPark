@@ -51,7 +51,10 @@
  *
  * @code
  * dspark::SpectrumAnalyzer<float> analyzer;
- * analyzer.prepare(48000.0, 2048);  // 48 kHz, 2048-point FFT
+ * analyzer.prepare(48000.0);        // automatic size: 2048 points at 48 kHz,
+ *                                   // 4096 at 96 kHz, 8192 at 192 kHz --
+ *                                   // ~23 Hz bins at every rate
+ * // analyzer.prepare(48000.0, 2048);  // or pin the count explicitly
  *
  * // In audio callback:
  * analyzer.pushSamples(buffer.getChannel(0), numSamples);
@@ -86,8 +89,10 @@ namespace dspark {
  *
  * The magnitude smoothing is a per-frame exponential (one analysis frame per
  * hop = fftSize/2 samples), so its settling TIME depends on fftSize and the
- * sample rate: frameRate = 2 * sampleRate / fftSize. The peak-hold decay is
- * specified in dB/second and is rate-invariant.
+ * sample rate: frameRate = 2 * sampleRate / fftSize. The automatic default
+ * size holds that frame rate near 47 fps from 44.1 to 192 kHz; a fixed count
+ * would let it rise with the rate. The peak-hold decay is specified in
+ * dB/second and is rate-invariant either way.
  *
  * @tparam T Sample type (float or double).
  */
@@ -110,10 +115,26 @@ public:
      * @brief Prepares the analyser and allocates all necessary buffers.
      *
      * Release-safe: a non-finite or non-positive sample rate is ignored
-     * (conservative no-op); fftSize is clamped to [256, 16384] and rounded
-     * UP to the next power of two; an out-of-range window enum falls back
-     * to Hann. May allocate (setup thread only; while re-preparing, the old
-     * and the new storage transiently coexist).
+     * (conservative no-op); an explicit fftSize is clamped to [256, 16384] and
+     * rounded UP to the next power of two; an out-of-range window enum falls
+     * back to Hann. May allocate (setup thread only; while re-preparing, the
+     * old and the new storage transiently coexist).
+     *
+     * RESOLUTION IS A RATIO, NOT A COUNT. Everything the transform resolves is
+     * a function of fs/fftSize: the bin width is fs/fftSize (23.44 Hz at
+     * 48 kHz/2048), the Hann main lobe spans 4*fs/fftSize (93.75 Hz there),
+     * and the analysis frame rate is 2*fs/fftSize (46.9 fps there). A constant
+     * sample count therefore delivers a coarser display as the rate rises:
+     * measured on two partials a fifth apart in the mid register (D4 293.66 Hz
+     * and A4 440.00 Hz), a fixed 2048-point transform separates them into two
+     * peaks at 44.1, 48, 88.2 and 96 kHz but merges them into one at 176.4 and
+     * 192 kHz, where the 375 Hz main lobe is wider than the interval. The
+     * default is therefore AUTOMATIC and holds the span, hence the resolution,
+     * constant; getFFTSize(), getNumBins() and binToFrequency() report what it
+     * chose. The per-frame smoothing follows the frame rate the same way: at a
+     * fixed 2048 the default 0.8 factor settles (90% of a step) in 255 ms at
+     * 44.1 kHz but 59 ms at 192 kHz, while the automatic size holds it at
+     * 235-255 ms across the range.
      *
      * On exceptions-enabled builds: if an allocation throws, the analyser is
      * left unprepared (pushSamples is a no-op until a later prepare()
@@ -131,15 +152,34 @@ public:
      * post-throw states above is observable there.)
      *
      * @param sampleRate Sample rate in Hz.
-     * @param fftSize    FFT size (power of two, 256 to 16384).
+     * @param fftSize    FFT size. Values <= 0 (the default) select the
+     *                   AUTOMATIC size: the smallest power of two in
+     *                   [256, 16384] spanning at least 2048/48000 s (~42.7 ms)
+     *                   at sampleRate -- 2048 at 44.1/48 kHz, 4096 at
+     *                   88.2/96 kHz, 8192 at 176.4/192 kHz, 16384 at 384 kHz,
+     *                   512 at 8 kHz. Explicit positive values (power of two,
+     *                   256 to 16384) are honoured as given.
      * @param windowType Window function to use (default: Hann).
      */
-    void prepare(double sampleRate, int fftSize = 2048, WindowType windowType = WindowType::Hann)
+    void prepare(double sampleRate, int fftSize = 0, WindowType windowType = WindowType::Hann)
     {
-        assert(fftSize >= 256 && fftSize <= 16384 && (fftSize & (fftSize - 1)) == 0);
+        assert(fftSize <= 0 ||
+               (fftSize >= 256 && fftSize <= 16384 && (fftSize & (fftSize - 1)) == 0));
 
         if (!std::isfinite(sampleRate) || sampleRate <= 0.0)
             return;
+
+        if (fftSize <= 0)
+        {
+            // Automatic: hold the analysis TIME SPAN constant across sample
+            // rates (the span 2048 samples cover at 48 kHz). Bin width, main
+            // lobe and frame rate are all fs/fftSize up to a constant, so a
+            // constant span pins the resolution the display shows.
+            const double target = sampleRate * (kAutoSpanRef / kAutoSpanRate);
+            int n = kAutoMinFft;
+            while (n < kAutoMaxFft && static_cast<double>(n) < target) n <<= 1;
+            fftSize = n;
+        }
 
         // Release-safe size sanitation (the assert only guards debug builds;
         // an unvalidated size would make FFTReal throw at stream time).
@@ -644,6 +684,13 @@ private:
     // paired-getter lifetime pin).
     static constexpr int kFreshBit = 4;
     static constexpr int kSlotMask = 3;
+
+    /// Automatic-size policy: the span 2048 samples cover at 48 kHz, resolved
+    /// inside [256, 16384] (covers 8 kHz .. 384 kHz without hitting a clamp).
+    static constexpr double kAutoSpanRef = 2048.0;
+    static constexpr double kAutoSpanRate = 48000.0;
+    static constexpr int kAutoMinFft = 256;
+    static constexpr int kAutoMaxFft = 16384;
 
     /** @brief Coherent-copy attempts before the reader gives up and repeats
      *         the previous snapshot. Bounded so the getter stays wait-free:

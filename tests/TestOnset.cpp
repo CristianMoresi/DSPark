@@ -451,3 +451,86 @@ DSPARK_TEST(Onset_double_instantiation)
     std::cout << "  [double] detected=" << det.size() << "\n";
     EXPECT_GT(det.size(), 0u);
 }
+
+// ===========================================================================
+// Rate invariance of the DEFAULT analysis frame.
+//
+// The frame decides the STFT bin width fs/N, and with it the frequency above
+// which the log-frequency filterbank's declared quarter-tone spacing is
+// actually delivered. A fixed sample COUNT therefore moves the detector's
+// usable low register with the sample rate. These pins are all integer counts
+// and event counts -- nothing here is a wall-clock measurement, so no build
+// or instrumentation can invert them.
+//
+// Measured on the pre-fix tree (fixed 2048): 135 bands at 48 kHz but 111 at
+// 96 kHz and 88 at 192 kHz, and soft bass onsets recalled 8/8 at 48 kHz but
+// 5/8 at 96 kHz. Both halves of this test fail there.
+// ===========================================================================
+DSPARK_TEST(Onset_default_frame_holds_the_span_across_rates)
+{
+    struct Case { double fs; int expectedFft; int expectedHop; int expectedLatency; };
+    const Case cases[] = {
+        { 44100.0,  2048, 221, 2269 }, { 48000.0,  2048, 240, 2288 },
+        { 88200.0,  4096, 441, 4537 }, { 96000.0,  4096, 480, 4576 },
+        { 176400.0, 8192, 882, 9074 }, { 192000.0, 8192, 960, 9152 },
+    };
+    int bands441 = 0, bands48 = 0;
+    for (const Case& c : cases)
+    {
+        OnsetDetector<float> od;
+        od.prepare(AudioSpec{ c.fs, 512, 1 });
+        EXPECT_EQ(od.getFftSize(), c.expectedFft);
+        EXPECT_EQ(od.getHopSize(), c.expectedHop);
+
+        // The filterbank the frame builds is the resolution in force. Equal
+        // fs/N families must build the SAME bank, exactly.
+        if (c.fs == 44100.0) bands441 = od.getNumBands();
+        if (c.fs == 48000.0) bands48  = od.getNumBands();
+        if (c.fs == 88200.0 || c.fs == 176400.0) EXPECT_EQ(od.getNumBands(), bands441);
+        if (c.fs == 96000.0 || c.fs == 192000.0) EXPECT_EQ(od.getNumBands(), bands48);
+
+        // Reporting latency L = N + hop, pinned in SAMPLES per rate. The frame
+        // doubles exactly; the hop is round(fs/200), which at 44.1 kHz rounds
+        // 220.5 up to 221, so L is NOT exactly 2x between 44.1 and 88.2 kHz
+        // (2269 vs 4537). Each value is therefore pinned outright rather than
+        // as a ratio: 2269/44100 s = 4537/88200 s to within one sample.
+        EXPECT_EQ(od.getLatencySamples(), c.expectedLatency);
+        EXPECT_EQ(od.getLatencySamples(), od.getFftSize() + od.getHopSize());
+    }
+    std::cout << "  [rate-inv] onset auto map 2048/2048/4096/4096/8192/8192, bands "
+              << bands441 << " (44.1 family) / " << bands48 << " (48 family)\n";
+
+    // An explicit frame is still honoured verbatim at any rate.
+    OnsetDetector<float> explicitFrame;
+    explicitFrame.prepare(AudioSpec{ 192000.0, 512, 1 }, 2048);
+    EXPECT_EQ(explicitFrame.getFftSize(), 2048);
+}
+
+// Correctness anchor at a non-48k rate: soft BASS note onsets, the material
+// the low-register loss actually costs. Pre-fix at 96 kHz this recalls 5 of 8
+// (measured, identical on g++ and clang++); with the span held it recalls 8.
+DSPARK_TEST(Onset_soft_bass_onsets_survive_96k)
+{
+    const double fs = 96000.0;
+    const int n = static_cast<int>(fs * 6.0);
+    std::vector<float> sig(static_cast<size_t>(n), 0.0f);
+    std::vector<int64_t> truth;
+    auto midiHz = [](int m) { return 440.0 * std::exp2((m - 69) / 12.0); };
+    for (int k = 0; k < 8; ++k)   // E1 .. B2, all under the quarter-tone floor
+    {
+        const int64_t at = static_cast<int64_t>(fs * (0.4 + 0.6 * k));
+        addSoftNote(sig, at, fs, midiHz(28 + 2 * k), 10.0, 400.0, 0.6f);
+        truth.push_back(at);
+    }
+    OnsetDetector<float> od;
+    od.prepare(AudioSpec{ fs, 512, 1 });          // automatic frame
+    float* ptr = sig.data();
+    AudioBufferView<float> view(&ptr, 1, n);
+    auto det = od.detectOffline(view);
+    PRF s = scoreOnsets(det, truth, fs, 50.0);
+    std::cout << "  [rate-inv] 96 kHz soft bass: N=" << od.getFftSize()
+              << " bands=" << od.getNumBands() << " tp=" << s.tp
+              << " fn=" << s.fn << " fp=" << s.fp << "\n";
+    EXPECT_EQ(s.tp, 8);
+    EXPECT_EQ(s.fn, 0);
+}

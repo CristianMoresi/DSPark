@@ -16,6 +16,23 @@
  * will suffer from spectral leakage. For precise offline analysis, consider
  * pre-windowing your input data (e.g., Hann window).
  *
+ * SELECTIVITY IS A RATIO, NOT A COUNT. The block length N is a required
+ * argument here precisely because only the caller knows the requirement, and
+ * that requirement is always a frequency: the analysis bin width is fs/N and
+ * the block spans N/fs seconds, so a block size chosen at one sample rate does
+ * NOT carry to another. To hold a requirement constant, scale N with fs:
+ *
+ *     N >= fs / (wanted bin width in Hz),   rounded up as you prefer.
+ *
+ * Measured on the classic musical case -- separating one semitone from its
+ * neighbour at C4 (261.63 Hz target, 277.18 Hz interferer) -- with N held at
+ * 2048 samples: 9.4 dB rejection at 44.1 kHz, 7.5 dB at 48 kHz, 1.6 dB at
+ * 88.2 kHz, 1.3 dB at 96 kHz, 0.4 dB at 176.4 kHz, 0.2 dB at 192 kHz. The two
+ * semitones are simply no longer distinguishable above 48 kHz. Scaling N with
+ * the rate instead (2048 at 48 kHz, 4096 at 96 kHz, 8192 at 192 kHz) holds the
+ * rejection at 7.5-9.4 dB across that whole range. ChordDetector applies
+ * exactly this rule when it sizes its per-note Goertzel bank.
+ *
  * Threading: owner-managed. All methods (prepare, push/process, readouts,
  * reset) are meant to be called from the thread that owns the stream; no
  * internal synchronization is provided. Use one instance per thread.
@@ -57,6 +74,10 @@ public:
      * @param sampleRate Sample rate in Hz. Must be > 0.
      * @param targetFreqHz The frequency to detect, in [0, sampleRate/2].
      * @param blockSize Number of samples per analysis window. Must be > 0.
+     *                  There is deliberately no default: the useful quantity
+     *                  is the bin width fs/blockSize, so the count that meets
+     *                  a requirement at one sample rate does not meet it at
+     *                  another (see the selectivity note in the file header).
      *                  With float precision, very long windows (hundreds of
      *                  thousands of samples) accumulate rounding error in the
      *                  resonator; prefer double for extreme block sizes.

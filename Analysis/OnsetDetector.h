@@ -22,15 +22,27 @@
  * for the deterministic latency contract below. It is the shared onset
  * front-end consumed by BeatTracker.
  *
- * Latency (ONE definition). Frame N (default 2048, Hann), hop =
+ * Frame length is a TIME requirement, not a sample count. The ODF is computed
+ * over a log-frequency filterbank whose declared spacing is a quarter tone, and
+ * the STFT bin width fs/fftSize decides the frequency above which that spacing
+ * is actually delivered: f_qt = (fs/fftSize) / (2^(1/24) - 1), about 34 times
+ * the bin width. A CONSTANT sample count therefore moves the detector's usable
+ * low register with the sample rate (measured: 800 Hz at 48 kHz/2048, 3199 Hz
+ * at 192 kHz/2048, and soft bass onsets around E1..B2 fall from 8/8 recalled at
+ * 48 kHz to 5/8 at 96 kHz). The default frame is therefore AUTOMATIC and holds
+ * the span constant instead; see prepare().
+ *
+ * Latency (ONE definition). Frame N (Hann; automatic by default), hop =
  * round(fs/200) (221 samples at 44.1 kHz, 240 at 48 kHz; ~5 ms). The detector
  * reports every onset at a
  * single fixed causal reporting latency
  *
  *     L = fftSize + hop        (getLatencySamples()).
  *
- * At 44.1 kHz with the defaults this is 2048 + 221 = 2269 samples (~51.4 ms;
- * 2048 + 240 = 2288 at 48 kHz).
+ * With the automatic frame this is 2048 + 221 = 2269 samples at 44.1 kHz
+ * (~51.4 ms), 2048 + 240 = 2288 at 48 kHz (~47.7 ms), 4096 + 480 = 4576 at
+ * 96 kHz (~47.7 ms) and 8192 + 960 = 9152 at 192 kHz (~47.7 ms) -- one
+ * latency in TIME across the range, not one in samples.
  * The onsetDetected() latch asserts exactly L samples after the onset's
  * reference sample (the analysis-frame centre that localises the transient).
  * Detection completes internally earlier (~fftSize/2 + hop); events are held
@@ -112,12 +124,40 @@ public:
      *
      * @param spec    Audio environment (only sampleRate is used; the detector
      *                is mono -- feed channel 0, or mix down before pushing).
-     * @param fftSize Analysis frame size; rounded up to a power of two in
-     *                [64, 1<<16]. Default 2048.
+     * @param fftSize Analysis frame size. Values <= 0 (the default) select the
+     *                AUTOMATIC frame: the smallest power of two in
+     *                [512, 16384] spanning at least 2048/48000 s (~42.7 ms) at
+     *                spec.sampleRate -- 2048 at 44.1/48 kHz, 4096 at
+     *                88.2/96 kHz, 8192 at 176.4/192 kHz, 16384 at 384 kHz,
+     *                512 at 8 kHz. Explicit positive values are rounded up to
+     *                a power of two in [64, 1<<16] and honoured as given, with
+     *                the reduced validity described below. Read the resolved
+     *                value back with getFftSize().
      * @param hop     Hop in samples; hop <= 0 selects round(fs/200) (~5 ms).
      *                Clamped to [1, fftSize].
+     *
+     * FRAME LENGTH IS A TIME REQUIREMENT. Everything the frame decides is a
+     * function of the RATIO fs/fftSize, never of the count alone:
+     *
+     * - STFT bin width          = fs/fftSize   (23.44 Hz at 48 kHz/2048)
+     * - quarter-tone floor f_qt = (fs/fftSize) / (2^(1/24) - 1), the frequency
+     *   above which the filterbank's declared quarter-tone spacing is really
+     *   delivered (measured band counts: 135 bands and f_qt 800 Hz at
+     *   48 kHz/2048; 111 bands and 1600 Hz at 96 kHz/2048; 88 bands and
+     *   3199 Hz at 192 kHz/2048 -- the same 2048 samples, four times the floor)
+     * - reporting latency L/fs  = (fftSize + hop)/fs seconds
+     *
+     * With a CONSTANT sample count the low register therefore degrades as the
+     * rate rises: measured on soft bass onsets (E1..B2, 10 ms attacks) the
+     * fixed 2048 frame recalls 8/8 at 44.1/48 kHz but 5/8 at 96 kHz, while the
+     * automatic frame recalls 8/8 there. Percussive clicks, mid-register notes
+     * and the vibrato/tremolo false-positive guard were measured unaffected at
+     * every rate from 44.1 to 192 kHz, so this is a low-register loss, not a
+     * general one. Explicit frames stay available for callers who want the
+     * shorter one: at 192 kHz an explicit 2048 buys ~10.7 ms of frame span
+     * (L ~= 15.7 ms) at the cost of the register above.
      */
-    void prepare(const AudioSpec& spec, int fftSize = 2048, int hop = 0)
+    void prepare(const AudioSpec& spec, int fftSize = 0, int hop = 0)
     {
         if (!(spec.sampleRate > 0.0) || !std::isfinite(spec.sampleRate))
             return;
@@ -126,10 +166,25 @@ public:
 
         sampleRate_ = spec.sampleRate;
 
-        int fs = std::clamp(fftSize, kMinFft, kMaxFft);
-        int pow2 = kMinFft;
-        while (pow2 < fs) pow2 <<= 1;
-        fftSize_ = pow2;
+        if (fftSize <= 0)
+        {
+            // Automatic: hold the analysis TIME SPAN constant across sample
+            // rates (the span 2048 samples cover at 48 kHz). Bin width and the
+            // filterbank's quarter-tone floor are both fs/fftSize, so a
+            // constant span pins them -- and with them the usable low register
+            // -- instead of letting them widen as fs rises.
+            const double target = sampleRate_ * (kAutoSpanRef / kAutoSpanRate);
+            int n = kAutoMinFft;
+            while (n < kAutoMaxFft && static_cast<double>(n) < target) n <<= 1;
+            fftSize_ = n;
+        }
+        else
+        {
+            int fs = std::clamp(fftSize, kMinFft, kMaxFft);
+            int pow2 = kMinFft;
+            while (pow2 < fs) pow2 <<= 1;
+            fftSize_ = pow2;
+        }
         numBins_ = fftSize_ / 2 + 1;
 
         if (hop <= 0)
@@ -319,8 +374,17 @@ public:
         return static_cast<int>(latencySamples_.load(std::memory_order_relaxed));
     }
 
+    /** @brief Analysis frame in samples actually in effect: the automatic
+     *         choice when prepare() got fftSize <= 0, the rounded explicit
+     *         request otherwise. Divide by the sample rate for the span in
+     *         seconds; fs/getFftSize() is the STFT bin width. */
     [[nodiscard]] int getFftSize() const noexcept { return fftSize_; }
+
+    /** @brief Hop in samples in effect (round(fs/200) unless overridden). */
     [[nodiscard]] int getHopSize() const noexcept { return hop_; }
+
+    /** @brief Number of log-frequency filterbank bands built for the resolved
+     *         frame; a direct readout of the analysis resolution in force. */
     [[nodiscard]] int getNumBands() const noexcept { return numBands_; }
 
     // -- Offline convenience -------------------------------------------------
@@ -409,6 +473,12 @@ private:
     // -- Constants -----------------------------------------------------------
     static constexpr int kMinFft = 64;
     static constexpr int kMaxFft = 1 << 16;
+    /// Automatic-frame policy: the span 2048 samples cover at 48 kHz, resolved
+    /// inside [512, 16384] (covers 8 kHz .. 384 kHz without hitting a clamp).
+    static constexpr double kAutoSpanRef = 2048.0;
+    static constexpr double kAutoSpanRate = 48000.0;
+    static constexpr int kAutoMinFft = 512;
+    static constexpr int kAutoMaxFft = 16384;
     static constexpr int64_t kBig = int64_t(1) << 60;
     static constexpr T kDefaultDelta = T(0.03);
     static constexpr double kLocalizationLead = 0.34; ///< Flux-to-energy lead (fraction of N).

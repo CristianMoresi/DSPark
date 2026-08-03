@@ -1488,3 +1488,222 @@ DSPARK_TEST(SpectrumAnalyzer_paired_getter_held_pointer_never_mutates)
         EXPECT_GT(fresh, 16);                                  // adoption liveness
     }
 }
+
+// ============================================================================
+// Rate invariance of the shipped analysis defaults (Analysis/).
+//
+// Every default below used to be a fixed SAMPLE COUNT, which makes the
+// property it delivers -- a musical register, a display resolution, a
+// selectivity in Hz -- a function of the sample rate. The pins are counts, Hz
+// and dB only: no wall-clock durations are asserted anywhere here, so nothing
+// a build or an instrumented run can rescale is load-bearing.
+// ============================================================================
+
+namespace {
+
+// Band-limited sawtooth: harmonic-rich, so YIN has a genuine period to find.
+std::vector<float> rateInvSaw(int n, double fs, double f0)
+{
+    std::vector<float> out(static_cast<size_t>(n), 0.0f);
+    const int H = std::max(1, static_cast<int>(std::min(8000.0, fs * 0.45) / f0));
+    for (int i = 0; i < n; ++i)
+    {
+        double s = 0.0;
+        for (int h = 1; h <= H; ++h)
+            s += std::sin(dspark::twoPi<double> * f0 * h * i / fs) / h;
+        out[static_cast<size_t>(i)] = 0.5f * static_cast<float>(s * 0.5);
+    }
+    return out;
+}
+
+double centsOff(double got, double want)
+{
+    if (!(got > 0.0)) return 1e9;
+    return 1200.0 * std::log2(got / want);
+}
+
+} // namespace
+
+// The YIN lag search reaches down to fs/(windowSize/2 - 1). With the old fixed
+// 2048-sample default that floor was 46.9 Hz at 48 kHz but 93.8 Hz at 96 kHz
+// and 187.7 Hz at 192 kHz, so A1/E2 -- and at 192 kHz A2 -- read as unvoiced
+// with the DEFAULT settings. Measured pre-fix: 0 Hz, confidence 0.
+DSPARK_TEST(PitchDetector_default_window_holds_the_register_across_rates)
+{
+    struct Case { double fs; int expectedWindow; };
+    const Case cases[] = {
+        { 44100.0, 2048 }, { 48000.0, 2048 },
+        { 88200.0, 4096 }, { 96000.0, 4096 },
+        { 176400.0, 8192 }, { 192000.0, 8192 },
+    };
+    for (const Case& c : cases)
+    {
+        PitchDetector<float> pd;
+        pd.prepare(c.fs);
+        EXPECT_EQ(pd.getWindowSize(), c.expectedWindow);
+        EXPECT_EQ(pd.getHopSize(), c.expectedWindow / 4);   // constant overlap
+    }
+
+    // Correctness at the professional rates, not just a map: A1 (55 Hz) and
+    // E2 (82.41 Hz) with the DEFAULT settings.
+    for (double fs : { 96000.0, 176400.0, 192000.0 })
+    {
+        for (double f0 : { 55.0, 82.4069 })
+        {
+            const int n = static_cast<int>(fs * 1.2);
+            std::vector<float> sig = rateInvSaw(n, fs, f0);
+            PitchDetector<float> pd;
+            pd.prepare(fs);
+            pd.pushSamples(std::span<const float>(sig.data(), static_cast<size_t>(n)));
+            const double hz = static_cast<double>(pd.getFrequencyHz());
+            std::cout << "  [rate-inv] pitch fs=" << fs << " f0=" << f0
+                      << " -> " << hz << " Hz conf=" << pd.getConfidence() << "\n";
+            EXPECT_GT(hz, 0.0);
+            EXPECT_LT(std::abs(centsOff(hz, f0)), 25.0);
+            EXPECT_GT(static_cast<double>(pd.getConfidence()), 0.8);
+        }
+    }
+
+    // Explicit windows are still honoured verbatim, with their documented
+    // (rate-dependent) register. 2048 samples at 192 kHz put the floor at
+    // 187.7 Hz, so A1 is out of reach: the documented outcome is a reading
+    // that is NOT the played note. If this ever starts reporting 55 Hz, the
+    // register documentation is stale -- update it.
+    PitchDetector<float> pinned;
+    pinned.prepare(192000.0, 2048, 512);
+    EXPECT_EQ(pinned.getWindowSize(), 2048);
+    EXPECT_EQ(pinned.getHopSize(), 512);
+    {
+        const int n = static_cast<int>(192000.0 * 1.2);
+        std::vector<float> sig = rateInvSaw(n, 192000.0, 55.0);
+        pinned.pushSamples(std::span<const float>(sig.data(), static_cast<size_t>(n)));
+        const double hz = static_cast<double>(pinned.getFrequencyHz());
+        std::cout << "  [rate-inv] explicit 2048 at 192 kHz, A1 -> " << hz << " Hz\n";
+        EXPECT_FALSE(hz > 0.0 && std::abs(centsOff(hz, 55.0)) < 25.0);
+    }
+}
+
+// The wrapper inherits the register: its documented low-end claim has to hold
+// at professional rates too. Pre-fix at 192 kHz a 55 Hz sawtooth left
+// getSmoothedHz() at 0 and isTracking() false whatever setRange() said.
+DSPARK_TEST(PitchFollower_tracks_bass_at_professional_rates)
+{
+    for (double fs : { 96000.0, 192000.0 })
+    {
+        PitchFollower<float> pf;
+        pf.prepare(spec(fs, 512, 1));
+        EXPECT_EQ(pf.getWindowSize(), (fs > 100000.0) ? 8192 : 4096);
+        pf.setRange(40.0f, 1200.0f);
+
+        const int n = static_cast<int>(fs * 1.5);
+        std::vector<float> sig = rateInvSaw(n, fs, 55.0);
+        pf.pushSamples(std::span<const float>(sig.data(), static_cast<size_t>(n)));
+        std::cout << "  [rate-inv] follower fs=" << fs << " A1 -> "
+                  << pf.getSmoothedHz() << " Hz tracking=" << pf.isTracking() << "\n";
+        EXPECT_TRUE(pf.isTracking());
+        EXPECT_NEAR(static_cast<double>(pf.getSmoothedHz()), 55.0, 0.5);
+    }
+}
+
+// The display resolution is 4*fs/fftSize (Hann main lobe). With the old fixed
+// 2048-point default, two partials a fifth apart in the mid register (D4 and
+// A4, 146.3 Hz) merged into ONE peak at 176.4 and 192 kHz.
+DSPARK_TEST(SpectrumAnalyzer_default_size_holds_the_resolution_across_rates)
+{
+    struct Case { double fs; int expectedFft; };
+    const Case cases[] = {
+        { 44100.0, 2048 }, { 48000.0, 2048 },
+        { 88200.0, 4096 }, { 96000.0, 4096 },
+        { 176400.0, 8192 }, { 192000.0, 8192 },
+    };
+    for (const Case& c : cases)
+    {
+        SpectrumAnalyzer<float> sa;
+        sa.prepare(c.fs);
+        EXPECT_EQ(sa.getFFTSize(), c.expectedFft);
+        EXPECT_EQ(sa.getNumBins(), c.expectedFft / 2 + 1);
+        // Bin width is the resolution; it must not move with the rate.
+        EXPECT_NEAR(static_cast<double>(sa.binToFrequency(1)), c.fs / c.expectedFft, 1e-6);
+        EXPECT_LT(static_cast<double>(sa.binToFrequency(1)), 24.0);
+    }
+
+    // Two tones a fifth apart must read as TWO peaks at every rate.
+    for (double fs : { 96000.0, 176400.0, 192000.0 })
+    {
+        SpectrumAnalyzer<float> sa;
+        sa.prepare(fs);
+        sa.setSmoothing(0.0f);
+        const int N = sa.getFFTSize();
+        const int numBins = sa.getNumBins();
+        const int n = 24 * N;
+        std::vector<float> sig(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            sig[static_cast<size_t>(i)] = 0.45f * static_cast<float>(
+                std::sin(dspark::twoPi<double> * 293.665 * i / fs)
+                + std::sin(dspark::twoPi<double> * 440.0 * i / fs));
+        sa.pushSamples(sig.data(), n);
+        const float* mag = sa.getMagnitudesDb();
+
+        const double binHz = fs / N;
+        const int b1 = static_cast<int>(std::lround(293.665 / binHz));
+        const int b2 = static_cast<int>(std::lround(440.0 / binHz));
+        EXPECT_GT(b2 - b1, 1);
+        double p1 = -300.0, p2 = -300.0, dip = 300.0;
+        for (int k = std::max(0, b1 - 2); k <= std::min(numBins - 1, b1 + 2); ++k)
+            p1 = std::max(p1, static_cast<double>(mag[k]));
+        for (int k = std::max(0, b2 - 2); k <= std::min(numBins - 1, b2 + 2); ++k)
+            p2 = std::max(p2, static_cast<double>(mag[k]));
+        for (int k = b1 + 1; k < b2; ++k) dip = std::min(dip, static_cast<double>(mag[k]));
+        std::cout << "  [rate-inv] spectrum fs=" << fs << " N=" << N
+                  << " D4=" << p1 << " dip=" << dip << " A4=" << p2 << " dB\n";
+        EXPECT_GT(std::min(p1, p2) - dip, 3.0);   // a real valley between them
+    }
+
+    // Explicit sizes remain honoured verbatim.
+    SpectrumAnalyzer<float> pinned;
+    pinned.prepare(192000.0, 2048);
+    EXPECT_EQ(pinned.getFFTSize(), 2048);
+}
+
+// Goertzel takes its block length from the caller by design; what the header
+// documents is the LAW. This pins the law itself: a count that separates two
+// semitones at 48 kHz does not separate them at 96 or 192 kHz, and a length
+// scaled with the rate does.
+DSPARK_TEST(Goertzel_semitone_selectivity_follows_the_rate_law)
+{
+    auto rejectionDb = [](double fs, int N) {
+        auto magAt = [&](double toneHz) {
+            Goertzel<double> g;
+            g.prepare(fs, 261.6255653, N);
+            std::vector<double> sig(static_cast<size_t>(N));
+            for (int i = 0; i < N; ++i)
+                sig[static_cast<size_t>(i)] = std::sin(dspark::twoPi<double> * toneHz * i / fs);
+            g.processBlock(sig.data(), N);
+            return static_cast<double>(g.getMagnitude());
+        };
+        const double on = magAt(261.6255653);      // C4
+        const double off = magAt(277.1826310);     // C#4, one semitone up
+        return 20.0 * std::log10(std::max(on, 1e-30) / std::max(off, 1e-30));
+    };
+
+    // The 48 kHz reference block separates the semitones.
+    EXPECT_GT(rejectionDb(48000.0, 2048), 6.0);
+
+    // Reusing that COUNT at higher rates does not (measured 1.3 dB at 96 kHz,
+    // 0.2 dB at 192 kHz): the two semitones become one reading.
+    EXPECT_LT(rejectionDb(96000.0, 2048), 3.0);
+    EXPECT_LT(rejectionDb(192000.0, 2048), 3.0);
+
+    // Scaling the block with the rate -- N >= fs / (wanted bin width) --
+    // restores it. This is the rule ChordDetector applies to its note bank.
+    for (double fs : { 96000.0, 192000.0 })
+    {
+        int n = 1024;
+        const double target = fs * (2048.0 / 48000.0);
+        while (n < 16384 && static_cast<double>(n) < target) n *= 2;
+        const double r = rejectionDb(fs, n);
+        std::cout << "  [rate-inv] goertzel fs=" << fs << " N=" << n
+                  << " semitone rejection=" << r << " dB\n";
+        EXPECT_GT(r, 6.0);
+    }
+}

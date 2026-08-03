@@ -1002,20 +1002,35 @@ static std::vector<float> tagKernel(float tag, int taps)
 
 struct BoundedReadTrials
 {
+    int trialsRun     = 0;   ///< Trials actually executed (the loop stops early).
     int deferrals     = 0;   ///< Reads that gave up and kept the previous set.
     int adoptions     = 0;   ///< Reads that adopted one of the two new sets.
     int illegal       = 0;   ///< Reads whose result was no published set at all.
     int reArmFailures = 0;   ///< Deferred updates NOT picked up by the next read.
-    long long medianReadNs = 0;
+    int signalTimeouts = 0;  ///< Trials where the writer never signalled in time.
+    int resetMismatches = 0; ///< Trials whose uncontended reset read the wrong set.
+    long long medianReadNs = 0;  ///< Reported, never asserted on -- see below.
     long long maxReadNs    = 0;
     long long publishNs    = 0;  ///< One uncontended publish of P2's size.
     float lastTag  = 0.0f;       ///< Tag of the final publication of the run.
     float finalTag = 0.0f;       ///< Tag in force after the writers are all joined.
 };
 
-// Runs the protocol above `trials` times against the real FIRFilter header and
-// reports what the audio-thread read did each time.
-static BoundedReadTrials runBoundedReadTrials(int trials)
+// Runs the protocol above until it has seen `wantDeferrals` give-ups, or until
+// `maxTrials` trials have run, and reports what the audio-thread read did.
+//
+// Nothing here is asserted in wall-clock terms, deliberately. The tempting
+// assertion -- "a colliding read is much faster than one publish" -- compares a
+// reader-side duration against a writer-side one, and a sanitizer build does
+// not instrument the two sides equally: the same code that shows a 1169x margin
+// under ASan on one host inverts on another. The property being pinned is not a
+// duration, it is that the reader CAME BACK from a read it was guaranteed to
+// enter, without the publication that was in flight. An unbounded reader cannot
+// do that in any build, at any optimisation level, because its loop has no exit
+// other than a validated read. The durations are still measured, and reported
+// out of band by the probe in tests/results, where a number is evidence rather
+// than a pass/fail condition.
+static BoundedReadTrials runBoundedReadTrials(int wantDeferrals, int maxTrials)
 {
     using clock = std::chrono::steady_clock;
     auto nsSince = [](clock::time_point t0) {
@@ -1050,10 +1065,11 @@ static BoundedReadTrials runBoundedReadTrials(int trials)
     for (int i = 0; i < kTagTaps + 8; ++i) (void) fir.processSample(1.0f, 0);
 
     std::vector<long long> readNs;
-    readNs.reserve(static_cast<size_t>(trials));
+    readNs.reserve(static_cast<size_t>(maxTrials));
 
-    for (int trial = 0; trial < trials; ++trial)
+    for (int trial = 0; trial < maxTrials && st.deferrals < wantDeferrals; ++trial)
     {
+        ++st.trialsRun;
         const float t1 = 2.0f + 2.0f * static_cast<float>(trial);
         const float t2 = t1 + 1.0f;
         const std::vector<float> k1 = tagKernel(t1, kTagTaps);
@@ -1066,8 +1082,15 @@ static BoundedReadTrials runBoundedReadTrials(int trials)
             fir.setCoefficients(k2);                    // P2: the long critical section
         });
 
-        while (!inFlight.load(std::memory_order_acquire))
+        // Hard-capped rather than open: a writer thread that never runs must
+        // fail this pin loudly, not hang the suite.
+        long long spins = 0;
+        while (!inFlight.load(std::memory_order_acquire) && spins < 2000000000LL)
+        {
+            ++spins;
             std::this_thread::yield();
+        }
+        if (spins >= 2000000000LL) ++st.signalTimeouts;
 
         const auto t0 = clock::now();
         const float out = fir.processSample(1.0f, 0);   // the audio-thread read
@@ -1096,11 +1119,13 @@ static BoundedReadTrials runBoundedReadTrials(int trials)
         }
 
         // Put a small set back in force so the next trial reads cheaply again.
+        // With no writer running the counter is even and stable, so this single
+        // uncontended read must adopt: it is the control for every trial.
         fir.setCoefficients(tagKernel(live, kTagTaps));
-        for (int i = 0; i < kTagTaps + 8; ++i) (void) fir.processSample(1.0f, 0);
+        if (fir.processSample(1.0f, 0) != live) ++st.resetMismatches;
     }
 
-    st.lastTag = 2.0f * static_cast<float>(trials) + 7.0f;
+    st.lastTag = 2.0f * static_cast<float>(maxTrials) + 7.0f;
     fir.setCoefficients(tagKernel(st.lastTag, kTagTaps));
     st.finalTag = fir.processSample(1.0f, 0);
 
@@ -1114,20 +1139,22 @@ static BoundedReadTrials runBoundedReadTrials(int trials)
     return st;
 }
 
-// The bound itself: an audio-thread read that meets a publish in flight must
-// come back on its own instruction count, not when the control thread happens
-// to finish. Against the unbounded reader the median read costs the remainder
-// of the publish, so this fails; the four-times margin is what keeps the
-// assertion honest on a slower machine rather than merely lucky on this one.
+// The bound itself. The audio thread is made to read while a publish is in
+// flight, under a protocol that guarantees the read enters the seqlock loop,
+// and it comes back holding a set OLDER than the publication that completed
+// before the writer signalled. Only a bounded reader can do that: the unbounded
+// loop has no exit other than a validated read, so it must wait for the writer
+// and must come back with the new set. That is a property of the code and holds
+// at any optimisation level and under any sanitizer, which a duration does not.
 DSPARK_TEST(FIR_bounded_seqlock_read_does_not_wait_for_the_publisher)
 {
-    const BoundedReadTrials st = runBoundedReadTrials(32);
+    const BoundedReadTrials st = runBoundedReadTrials(4, 96);
 
-    EXPECT_GT(st.publishNs, 0LL);
+    EXPECT_GT(st.deferrals, 0);                   // it came back without waiting
     EXPECT_EQ(st.illegal, 0);                     // never a set nobody published
-    EXPECT_GT(st.deferrals, 0);                   // the give-up path really ran
-    EXPECT_EQ(st.reArmFailures, 0);               // and the update landed next call
-    EXPECT_LT(st.medianReadNs * 4, st.publishNs); // the read did not wait for it
+    EXPECT_EQ(st.reArmFailures, 0);               // the update landed on the next read
+    EXPECT_EQ(st.signalTimeouts, 0);              // every trial really raced
+    EXPECT_EQ(st.resetMismatches, 0);             // and an uncontended read always adopts
     EXPECT_NEAR(st.finalTag, st.lastTag, 1e-4f);  // nothing was lost on the way
 }
 
@@ -1157,26 +1184,41 @@ DSPARK_TEST(FIR_bounded_seqlock_read_never_adopts_a_torn_set)
         }
     });
 
+    // The overlap is guaranteed by construction, not asserted after the fact: the
+    // reader keeps going until it has done its reads AND the producer has landed
+    // its publications, so a build where one side runs far slower than the other
+    // still exercises the race instead of failing a liveness floor. The cap is
+    // there so a producer that never runs fails this pin loudly.
+    constexpr long long kReads = 200000;
+    constexpr long long kMinPublications = 2000;
+    constexpr long long kReadCap = 40000000LL;
+
     int torn = 0;
-    for (int i = 0; i < 200000; ++i)
+    long long reads = 0;
+    while (reads < kReadCap
+           && (reads < kReads
+               || published.load(std::memory_order_relaxed) < kMinPublications))
     {
         const float out = fir.processSample(1.0f, 0);
         bool legal = false;
         for (int t = 1; t <= 4; ++t)
             if (std::abs(out - static_cast<float>(t)) < 1e-4f) legal = true;
         if (!legal) ++torn;
+        ++reads;
     }
 
     stop.store(true, std::memory_order_relaxed);
     producer.join();
 
     EXPECT_EQ(torn, 0);
-    EXPECT_GT(published.load(std::memory_order_relaxed), 2000LL);
+    EXPECT_TRUE(reads < kReadCap);   // the producer really ran
+    EXPECT_TRUE(published.load(std::memory_order_relaxed) >= kMinPublications);
 
     // Not vacuous: the same header, driven so that the reader must give up.
-    const BoundedReadTrials st = runBoundedReadTrials(32);
+    const BoundedReadTrials st = runBoundedReadTrials(4, 96);
     EXPECT_GT(st.deferrals, 0);
     EXPECT_EQ(st.illegal, 0);
+    EXPECT_EQ(st.signalTimeouts, 0);
 }
 
 // The flat delay-line layout must keep channels fully independent.

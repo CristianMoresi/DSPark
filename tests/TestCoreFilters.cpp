@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -954,6 +955,228 @@ DSPARK_TEST(FIR_seqlock_coefficient_swap_is_atomic)
 
     EXPECT_EQ(torn, 0);
     EXPECT_GT(published.load(std::memory_order_relaxed), 2000);
+}
+
+// ============================================================================
+// Bounded audio-thread seqlock reads (the real-time bound, not race freedom)
+// ============================================================================
+//
+// The audio thread's coefficient pull enters its seqlock loop only when the
+// dirty flag is set, and setCoefficients() raises that flag AFTER it leaves its
+// critical section. A reader can therefore only meet a publish in progress if
+// an EARLIER publish is still unconsumed:
+//
+//   1. publish P1 completes           -> dirty = true, nothing adopted yet
+//   2. signal, then start publish P2  -> the sequence counter goes odd
+//   3. the audio thread reads         -> dirty was true, so it MUST enter the
+//                                        loop, and it meets P2 in flight
+//
+// Step 3's read is guaranteed to enter the loop, so an audio thread that comes
+// out of it still holding a set OLDER than P1 can only have got there by giving
+// up: the attempt bound ran out, nothing was adopted, the flag was re-armed.
+// That is what makes "the give-up path ran" a proof below and not a guess.
+//
+// P2 is published with a much larger tap count than P1 on purpose. The staged
+// tap COUNT is stored at the end of the critical section, so while P2 is in
+// flight a reader still sees P1's small count and retries cheaply instead of
+// hiding the wait inside one huge copy -- which is what lets the timing
+// assertion see the wait at all.
+
+static constexpr int kTagTaps = 512;        ///< The taps that carry the tag.
+static constexpr int kBigTaps = 1 << 18;    ///< A publish long enough to collide with.
+
+// A kernel whose first kTagTaps user taps are tag/kTagTaps and whose remaining
+// taps are zero. FIRFilter stores coefficients reversed, so those taps multiply
+// the NEWEST kTagTaps input samples: with the delay line holding DC 1.0, one
+// processSample() returns exactly `tag` for any tap count, and a set mixed from
+// two publications lands somewhere else. Every value here is a dyadic rational,
+// so the sum is exact in float and the comparisons below can be exact.
+static std::vector<float> tagKernel(float tag, int taps)
+{
+    std::vector<float> c(static_cast<size_t>(taps), 0.0f);
+    const float v = tag / static_cast<float>(kTagTaps);
+    for (int i = 0; i < kTagTaps; ++i)
+        c[static_cast<size_t>(i)] = v;
+    return c;
+}
+
+struct BoundedReadTrials
+{
+    int deferrals     = 0;   ///< Reads that gave up and kept the previous set.
+    int adoptions     = 0;   ///< Reads that adopted one of the two new sets.
+    int illegal       = 0;   ///< Reads whose result was no published set at all.
+    int reArmFailures = 0;   ///< Deferred updates NOT picked up by the next read.
+    long long medianReadNs = 0;
+    long long maxReadNs    = 0;
+    long long publishNs    = 0;  ///< One uncontended publish of P2's size.
+    float lastTag  = 0.0f;       ///< Tag of the final publication of the run.
+    float finalTag = 0.0f;       ///< Tag in force after the writers are all joined.
+};
+
+// Runs the protocol above `trials` times against the real FIRFilter header and
+// reports what the audio-thread read did each time.
+static BoundedReadTrials runBoundedReadTrials(int trials)
+{
+    using clock = std::chrono::steady_clock;
+    auto nsSince = [](clock::time_point t0) {
+        return static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   clock::now() - t0).count());
+    };
+
+    BoundedReadTrials st;
+
+    // Calibration, on a filter of its own so it disturbs nothing: how long one
+    // publish of P2's size holds the sequence counter odd on THIS machine. The
+    // pin compares against that instead of a hard-coded microsecond count.
+    {
+        FIRFilter<float> cal;
+        cal.prepare(kBigTaps, 1);
+        const std::vector<float> big = tagKernel(1.0f, kBigTaps);
+        cal.setCoefficients(big);                       // fault the pages in
+        st.publishNs = std::numeric_limits<long long>::max();
+        for (int i = 0; i < 5; ++i)
+        {
+            const auto t0 = clock::now();
+            cal.setCoefficients(big);
+            st.publishNs = std::min(st.publishNs, nsSince(t0));
+        }
+    }
+
+    FIRFilter<float> fir;
+    fir.prepare(kBigTaps, 1);
+
+    float live = 1.0f;
+    fir.setCoefficients(tagKernel(live, kTagTaps));
+    for (int i = 0; i < kTagTaps + 8; ++i) (void) fir.processSample(1.0f, 0);
+
+    std::vector<long long> readNs;
+    readNs.reserve(static_cast<size_t>(trials));
+
+    for (int trial = 0; trial < trials; ++trial)
+    {
+        const float t1 = 2.0f + 2.0f * static_cast<float>(trial);
+        const float t2 = t1 + 1.0f;
+        const std::vector<float> k1 = tagKernel(t1, kTagTaps);
+        const std::vector<float> k2 = tagKernel(t2, kBigTaps);
+
+        std::atomic<bool> inFlight { false };
+        std::thread writer([&] {
+            fir.setCoefficients(k1);                    // P1: completes, raises dirty
+            inFlight.store(true, std::memory_order_release);
+            fir.setCoefficients(k2);                    // P2: the long critical section
+        });
+
+        while (!inFlight.load(std::memory_order_acquire))
+            std::this_thread::yield();
+
+        const auto t0 = clock::now();
+        const float out = fir.processSample(1.0f, 0);   // the audio-thread read
+        readNs.push_back(nsSince(t0));
+
+        writer.join();
+
+        if (out == live)
+        {
+            ++st.deferrals;
+            // A deferred publication must land on the very next read: the
+            // give-up re-armed the dirty flag instead of dropping the update.
+            const float next = fir.processSample(1.0f, 0);
+            if (next == t2) ; else ++st.reArmFailures;
+            live = next;
+        }
+        else if (out == t1 || out == t2)
+        {
+            ++st.adoptions;
+            live = out;
+        }
+        else
+        {
+            ++st.illegal;
+            live = out;
+        }
+
+        // Put a small set back in force so the next trial reads cheaply again.
+        fir.setCoefficients(tagKernel(live, kTagTaps));
+        for (int i = 0; i < kTagTaps + 8; ++i) (void) fir.processSample(1.0f, 0);
+    }
+
+    st.lastTag = 2.0f * static_cast<float>(trials) + 7.0f;
+    fir.setCoefficients(tagKernel(st.lastTag, kTagTaps));
+    st.finalTag = fir.processSample(1.0f, 0);
+
+    if (!readNs.empty())
+    {
+        st.maxReadNs = *std::max_element(readNs.begin(), readNs.end());
+        std::nth_element(readNs.begin(), readNs.begin() + static_cast<long>(readNs.size() / 2),
+                         readNs.end());
+        st.medianReadNs = readNs[readNs.size() / 2];
+    }
+    return st;
+}
+
+// The bound itself: an audio-thread read that meets a publish in flight must
+// come back on its own instruction count, not when the control thread happens
+// to finish. Against the unbounded reader the median read costs the remainder
+// of the publish, so this fails; the four-times margin is what keeps the
+// assertion honest on a slower machine rather than merely lucky on this one.
+DSPARK_TEST(FIR_bounded_seqlock_read_does_not_wait_for_the_publisher)
+{
+    const BoundedReadTrials st = runBoundedReadTrials(32);
+
+    EXPECT_GT(st.publishNs, 0LL);
+    EXPECT_EQ(st.illegal, 0);                     // never a set nobody published
+    EXPECT_GT(st.deferrals, 0);                   // the give-up path really ran
+    EXPECT_EQ(st.reArmFailures, 0);               // and the update landed next call
+    EXPECT_LT(st.medianReadNs * 4, st.publishNs); // the read did not wait for it
+    EXPECT_NEAR(st.finalTag, st.lastTag, 1e-4f);  // nothing was lost on the way
+}
+
+// No tear under the bound. Phase 1 hammers publications at the audio thread and
+// checks every set it adopts is one whole publication: with all taps equal to
+// tag/kTagTaps and the delay line at DC 1.0, the output IS the tag, and a
+// mixture of two publications is off by at least 1/kTagTaps. Phase 2 then
+// proves the give-up path was exercised, so a green phase 1 cannot be green
+// merely because the reader never reached the bound.
+DSPARK_TEST(FIR_bounded_seqlock_read_never_adopts_a_torn_set)
+{
+    FIRFilter<float> fir;
+    fir.prepare(kTagTaps, 1);
+    fir.setCoefficients(tagKernel(1.0f, kTagTaps));
+    for (int i = 0; i < kTagTaps + 8; ++i) (void) fir.processSample(1.0f, 0);
+
+    std::vector<std::vector<float>> sets;
+    for (int t = 1; t <= 4; ++t) sets.push_back(tagKernel(static_cast<float>(t), kTagTaps));
+
+    std::atomic<bool> stop { false };
+    std::atomic<long long> published { 0 };
+    std::thread producer([&] {
+        for (long long i = 0; !stop.load(std::memory_order_relaxed); ++i)
+        {
+            fir.setCoefficients(sets[static_cast<size_t>(i & 3)]);
+            published.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    int torn = 0;
+    for (int i = 0; i < 200000; ++i)
+    {
+        const float out = fir.processSample(1.0f, 0);
+        bool legal = false;
+        for (int t = 1; t <= 4; ++t)
+            if (std::abs(out - static_cast<float>(t)) < 1e-4f) legal = true;
+        if (!legal) ++torn;
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    producer.join();
+
+    EXPECT_EQ(torn, 0);
+    EXPECT_GT(published.load(std::memory_order_relaxed), 2000LL);
+
+    // Not vacuous: the same header, driven so that the reader must give up.
+    const BoundedReadTrials st = runBoundedReadTrials(32);
+    EXPECT_GT(st.deferrals, 0);
+    EXPECT_EQ(st.illegal, 0);
 }
 
 // The flat delay-line layout must keep channels fully independent.

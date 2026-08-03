@@ -19,11 +19,15 @@ Tiers
      names several headers is held to all of them together, not skipped.
   C  every backticked path must be a tracked file.
   D  quantifier claims. The word types the page says the suite asserts must be
-     exactly the word types it does assert, in both directions. The headers the
-     page names as pinning the property locally must be exactly the headers
-     that carry that static_assert. The page must not promise a compile-time
-     guarantee it does not have, and its "most do not" must stay true of the
-     headers whose atomic word type is a template parameter.
+     exactly the word types it does assert, in both directions, AND the numeral
+     the sentence writes in front of them must be that many; likewise for the
+     headers the page names as pinning the property locally, which must be
+     exactly the headers that carry that static_assert, in the number the
+     sentence claims. A count in prose and the list beside it can drift apart
+     one at a time, and the prose is the half nobody rereads. The page must
+     also not promise a compile-time guarantee it does not have, and its "most
+     do not" must stay true of the headers whose atomic word type is a
+     template parameter.
   E  the seqlock reader snippet must be semantically equal to Core/Biquad.h's.
 """
 
@@ -73,9 +77,14 @@ CODE = {p: code_of(p) for p in SOURCES}
 
 
 def declared_in(name, path):
-    """True if `name` is used as a declared/defined entity in `path`."""
+    """True if `name` is used as a declared/defined entity in `path`.
+
+    A call through an object -- `dirty.exchange(...)`, `p->reset()` -- is not
+    a declaration, and counting it as one would let the page attribute a
+    method to a header that merely uses it. A qualified definition
+    (`Biquad<T>::getCoeffs(...)`) is one, so only member access is excluded."""
     body = CODE.get(path, "")
-    if re.search(r"\b" + re.escape(name) + r"\s*\(", body):
+    if re.search(r"(?<![.\w>])" + re.escape(name) + r"\s*\(", body):
         return True
     if re.search(r"\b(class|struct|using|enum\s+class)\s+" + re.escape(name)
                  + r"\b", body):
@@ -122,7 +131,10 @@ paragraphs = blocks(prose)
 tick = re.compile(r"`([^`]+)`")
 callish = re.compile(r"^(?:([A-Za-z_][A-Za-z_0-9]*)::)?([A-Za-z_][A-Za-z_0-9]*)"
                      r"(?:<[^>]*>)?\(\)$")
-pathish = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*(?:/[A-Za-z_0-9.]+)+$")
+# The character set git actually uses for the paths in this tree: hyphens are
+# in every documentation file name here, and a leading dot is how the CI
+# directory is spelled. A path this cannot parse is a path tier C cannot check.
+pathish = re.compile(r"^[.A-Za-z_][A-Za-z_0-9.-]*(?:/[A-Za-z_0-9.-]+)+$")
 # A bare type name, as the page writes one: no template arguments, no path.
 typeish = re.compile(r"^(?:std::)?[a-z_][A-Za-z_0-9]*$")
 
@@ -180,6 +192,40 @@ for para in paragraphs:
                 .format(tok, ", ".join(headers)))
 print("  {} call/paragraph pair(s) checked".format(checked_b))
 
+NUMBER_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+
+
+def check_numeral(text, phrase, subject, expected):
+    """The count the page writes in front of `phrase` must be `expected`.
+
+    Written out or in digits: this page writes its small numbers as words, and
+    a word is what a stale count looks like."""
+    found = re.search(r"(\w+)\s+" + phrase, text)
+    if not found:
+        failures.append("D: the page no longer states how many {}; the count "
+                        "cannot be checked".format(subject))
+        return
+    written = found.group(1)
+    value = int(written) if written.isdigit() else NUMBER_WORDS.get(
+        written.lower())
+    if value is None:
+        failures.append("D: the page says '{} {}' and '{}' is not a number "
+                        "this can read".format(written, subject, written))
+    elif value != expected:
+        failures.append("D: the page says '{} {}'; disk says {}".format(
+            written, subject, expected))
+    else:
+        print("  the page's count of {} reads '{}' = {}  OK".format(
+            subject, written, expected))
+
+
 print("== tier D: quantifier claims ==")
 template_atomic = sorted(p for p in SOURCES
                          if p.startswith(FRAMEWORK_DIRS) and p.endswith(".h")
@@ -219,6 +265,8 @@ else:
     if set(named_assert) != set(assert_headers):
         failures.append("D: the page names {} as pinning it locally; disk says {}"
                         .format(named_assert, assert_headers))
+    check_numeral(para, r"headers?\s+pin it themselves",
+                  "headers that pin it themselves", len(assert_headers))
     # "most of the headers that declare such an atomic do not" must stay true.
     if re.search(r"most of the headers that declare such an atomic do\s+not",
                  para):
@@ -260,6 +308,7 @@ else:
                         "the suite: " + word)
     if swept == claimed:
         print("  the two sets are equal ({} word types)  OK".format(len(swept)))
+    check_numeral(sweep_para[0], r"word types", "word types", len(swept))
 
 print("== tier E: seqlock reader snippet vs Core/Biquad.h ==")
 reader = [b for b in fenced if "dirty.exchange" in b]

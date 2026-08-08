@@ -17,27 +17,30 @@
  * squeezes the stretched stream back to the original duration, which is why
  * that one moves pitch and this one does not.)
  *
- * Two engines, chosen with setEngine():
+ * How it keeps its quality:
  *
- * - **Fast** (default). Identity phase locking (Laroche & Dolson, "Improved
- *   phase vocoder time-scale modification of audio", IEEE Trans. Speech and
- *   Audio Processing 7(3), 1999): the spectral peaks are found each frame and
+ * - **Identity phase locking** (Laroche & Dolson, "Improved phase vocoder
+ *   time-scale modification of audio", IEEE Trans. Speech and Audio
+ *   Processing 7(3), 1999): the spectral peaks are found each frame and
  *   every bin in a peak's region of influence is rotated by the SAME phase
  *   increment as its peak, so the partial stays vertically coherent instead
  *   of dissolving into the hollow, chorused sound a plain vocoder makes.
- *   Onsets additionally reset the synthesis phases to the analysis phases,
- *   which keeps attacks from smearing.
- * - **Fine** (opt-in). Adds a harmonic/percussive split before synthesis
- *   (Fitzgerald, "Harmonic/percussive separation using median filtering",
- *   DAFx 2010): a median along time keeps what is sustained, a median along
- *   frequency keeps what is broadband, and the two drive complementary
- *   masks. The sustained share is phase-propagated as in Fast; the
- *   percussive share keeps its analysis phase and is simply overlap-added,
- *   which is what a strike wants, since propagating its phase is exactly
- *   what softens it (Driedger, Mueller & Ewert, "Improving time-scale
- *   modification of music signals using harmonic-percussive separation",
- *   IEEE Signal Processing Letters 21(1), 2014). Both shares come out of one
- *   analysis frame, so Fine costs the two medians and no extra transform.
+ * - **Onset detection and a transient-locked hop.** Attacks are found with
+ *   half-wave-rectified spectral flux over a log-frequency filterbank, which
+ *   sees a strike over a sustained bed where a broadband energy test cannot:
+ *   on a drum strike over a 110 Hz harmonic bed the weakest onset frame
+ *   carries 14.46 dB more flux than the median frame and only 0.13 dB more
+ *   energy. Across a detected attack the synthesis phases are reset to the
+ *   analysis phases AND the analysis hop is held at the synthesis hop for
+ *   one whole window, so every frame that sees the strike places it at the
+ *   same offset. Without that hold, a stretch spreads one strike over
+ *   `fftSize * |ratio - 1|` samples and the attack audibly doubles; with it,
+ *   the strike measures as concentrated as the input's own, at every frame
+ *   size from 256 to 4096 and every ratio. The input the hold does not
+ *   consume is repaid over the following hops, so the timeline stays exact:
+ *   measured over 30 s, no onset lands more than 1.71 ms from where the
+ *   stretched timeline puts it, at 120, 480 and 960 strikes per minute
+ *   alike.
  *
  * Peaks are grouped by the plain magnitude valley between them; no
  * perceptual band table is involved anywhere in this file.
@@ -48,7 +51,9 @@
  * sqrt-Hann analysis and synthesis windows overlap-add to a constant), and
  * the analysis hop is `round(Rs / ratio)` carried through a fractional
  * accumulator, so the realised stretch is exactly the requested ratio for
- * arbitrary ratios and never drifts, however long the stream runs.
+ * arbitrary ratios and never drifts, however long the stream runs. The
+ * transient hold above is the one exception, and it borrows rather than
+ * skips: what it does not consume it repays.
  *
  * Latency and the two processing paths:
  *
@@ -99,15 +104,19 @@
  * and its time resolution `fftSize / sampleRate` s, so the same fftSize is a
  * different trade at a different rate: 2048 spans 42.7 ms at 48 kHz and
  * 21.3 ms at 96 kHz. Low material wants the longer window (partials must be
- * resolved into separate bins), percussive material the shorter one. The
- * harmonic/percussive medians of Fine are specified in physical units - 0.2 s
- * along time, 500 Hz along frequency - and are converted to frames and bins
- * at prepare(), so Fine behaves the same at every sample rate.
+ * resolved into separate bins), percussive material the shorter one -
+ * though the transient hold above is what actually protects a strike, and it
+ * measures the same at every frame size from 256 to 4096. One consequence of
+ * the frame size is worth stating: the hold needs an unlocked hop between
+ * strikes to repay in, so the strike density it can serve scales as
+ * `sampleRate / fftSize`. At 2048 and 48 kHz the 1.71 ms figure above holds
+ * measured from 100 to 1040 strikes per minute and breaks down past about
+ * 1060, where per-onset timing degrades to roughly 3.9 ms.
  *
  * Threading (single control thread + single audio thread):
  * - `processBlock()`, `reset()`: audio thread (the stream owner).
- * - `setTimeRatio()`, `setTempoChangePercent()`, `setEngine()`,
- *   `setTransientPreserve()`, `setPhaseLock()`: control thread. Each one
+ * - `setTimeRatio()`, `setTempoChangePercent()`, `setTransientPreserve()`,
+ *   `setPhaseLock()`: control thread. Each one
  *   publishes the WHOLE parameter set as a unit, so a gesture that moves two
  *   of them at once can never be adopted half-way; the audio thread picks the
  *   set up at the next frame boundary through a bounded read that gives up
@@ -165,16 +174,6 @@ public:
     static constexpr T kMinRatio = T(0.5);
     static constexpr T kMaxRatio = T(2);
 
-    /**
-     * @enum Engine
-     * @brief Which synthesis path to use.
-     */
-    enum class Engine
-    {
-        Fast,   ///< Identity phase locking + transient reset. The default.
-        Fine    ///< Fast plus the harmonic/percussive split. Costs two medians.
-    };
-
     // -- Lifecycle ---------------------------------------------------------------
 
     /**
@@ -183,8 +182,7 @@ public:
      * Invalid specs (non-positive or non-finite rate, block size or channel
      * count) and fftSize values that are not a power of two in [256, 1 << 20]
      * are ignored: the previous state is kept and an unprepared instance
-     * stays pass-through. The `Fine` median history is allocated here too,
-     * whichever engine is selected, so setEngine() never allocates.
+     * stays pass-through.
      *
      * @param spec    Audio environment specification.
      * @param fftSize STFT frame size, power of two (default 2048). Larger
@@ -218,7 +216,7 @@ public:
         while (queueSize_ < capacity) queueSize_ <<= 1;
         queueMask_ = queueSize_ - 1;
 
-        engine_.prepare(spec.sampleRate, numChannels_, fftSize_, false, true);
+        engine_.prepare(spec.sampleRate, numChannels_, fftSize_, false, false, true);
         accumMask_ = engine_.olaMask();
 
         queue_.assign(static_cast<size_t>(numChannels_), {});
@@ -282,14 +280,6 @@ public:
         setTimeRatio(T(1) / denom);
     }
 
-    /** @brief Selects the synthesis engine (default Fast). Never allocates:
-     *  the Fine path's buffers were reserved by prepare(). */
-    void setEngine(Engine e) noexcept
-    {
-        engineMode_.store(e, std::memory_order_relaxed);
-        publishEngineParams();
-    }
-
     /** @brief Enables phase reset on detected transients (default on).
      *  Without it, attacks are stretched along with everything else and
      *  soften audibly. */
@@ -317,12 +307,6 @@ public:
     [[nodiscard]] T getTimeRatio() const noexcept
     {
         return timeRatio_.load(std::memory_order_relaxed);
-    }
-
-    /** @return Current synthesis engine. */
-    [[nodiscard]] Engine getEngine() const noexcept
-    {
-        return engineMode_.load(std::memory_order_relaxed);
     }
 
     /** @return Whether transient phase reset is enabled. */
@@ -355,8 +339,6 @@ public:
     {
         StateWriter w(stateId("TSTR"), 1);
         w.write("ratio", static_cast<float>(timeRatio_.load(std::memory_order_relaxed)));
-        w.write("engine", static_cast<int32_t>(
-                    engineMode_.load(std::memory_order_relaxed) == Engine::Fine ? 1 : 0));
         w.write("transient", transientPreserve_.load(std::memory_order_relaxed));
         w.write("phaselock", phaseLock_.load(std::memory_order_relaxed));
         return w.blob();
@@ -368,7 +350,6 @@ public:
         StateReader r(data, size);
         if (!r.isValid() || r.processorId() != stateId("TSTR")) return false;
         setTimeRatio(static_cast<T>(r.read("ratio", 1.0f)));
-        setEngine(r.read("engine", static_cast<int32_t>(0)) == 1 ? Engine::Fine : Engine::Fast);
         setTransientPreserve(r.read("transient", true));
         setPhaseLock(r.read("phaselock", true));
         return true;
@@ -562,8 +543,7 @@ private:
         p.transientPreserve = transientPreserve_.load(std::memory_order_relaxed);
         p.formantPreserve = false;   // nothing resamples the output here
         p.phaseLock = phaseLock_.load(std::memory_order_relaxed);
-        p.percussiveSplit =
-            engineMode_.load(std::memory_order_relaxed) == Engine::Fine;
+        p.percussiveSplit = false;   // no public switch selects the split here
         engine_.publishParams(p);
     }
 
@@ -648,7 +628,6 @@ private:
     int64_t readPos_ = 0;       ///< Reader position in the synthesis stream.
 
     std::atomic<T> timeRatio_ { T(1) };
-    std::atomic<Engine> engineMode_ { Engine::Fast };
     std::atomic<bool> transientPreserve_ { true };
     std::atomic<bool> phaseLock_ { true };
 };

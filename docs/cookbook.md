@@ -336,13 +336,21 @@ does not drift: measured over 30 s at 48 kHz the stretch lands within
 0.003% of the target, and the output is exactly `round(inputLength * ratio)`
 samples long, so a stretched loop still meets its own end.
 
-Two engines. `Fast` is the default and is what you want for pitched
-material; `Fine` adds a harmonic/percussive split and is worth its extra
-cost on mixes with strong drums:
+**Drums and other strikes need no setting.** Attacks are found with spectral
+flux over a log-frequency filterbank and the analysis hop is held across each
+one, which is what keeps a strike from doubling when the stretch spreads it.
+Measured on a click train, the stretched strike is as concentrated as the
+input's own at every frame size from 256 to 4096 and at every ratio, and no
+onset lands more than 1.71 ms from where the stretched timeline puts it - at
+120, 480 and 960 strikes per minute alike. It is on by default;
+`setTransientPreserve(false)` turns the whole transient path off, which is
+useful for hearing what it does and is not otherwise a better setting.
 
-```cpp
-ts.setEngine(dspark::TimeStretch<float>::Engine::Fine);
-```
+The one limit worth knowing: the hold needs a gap between strikes to repay
+the input it did not consume, and the density it can serve scales as
+`sampleRate / fftSize`. At the default 2048-sample frame and 48 kHz that
+holds to about 1040 strikes per minute; past roughly 1060 the timing
+degrades to about 3.9 ms. A shorter frame moves the limit up in proportion.
 
 **Streaming versus whole-signal.** `process()` above is the exact path and
 has no length restriction. `processBlock()` is the real-time path, latency

@@ -116,7 +116,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `TubePreamp<T>` | Koren triode stages (12AX7) solved per sample with Newton-Raphson, exact Fender FMV tone stack as a Wave Digital R-type network, power-supply sag |
 | `TransformerModel<T>` | Audio transformer coloration: flux-domain Jiles-Atherton core (distortion rises as frequency falls — the LF "bloom"), magnetizing-inductance corner, HF resonance bell |
 | `PitchShifter<T>` | Phase vocoder with identity phase locking (Laroche-Dolson), exact tuning, transient phase reset, **formant preservation** (cepstral lift), stereo-coherent |
-| `TimeStretch<T>` | Tempo change without pitch change: identity-phase-locked phase vocoder, exact ratio with no drift, transient phase reset, opt-in **harmonic/percussive split** (median filtering), streaming and whole-signal paths |
+| `TimeStretch<T>` | Tempo change without pitch change: identity-phase-locked phase vocoder, exact ratio with no drift, **spectral-flux onset detection with a transient-locked hop** (strikes keep the input's own sharpness instead of doubling), streaming and whole-signal paths |
 | `GranularProcessor<T>` | 64-grain clouds over live input: per-grain pitch/pan/jitter, freeze, equal-power spread |
 | `SpectralDenoiser<T>` | Learnable-noise-profile spectral gating with the standard musical-noise defenses |
 

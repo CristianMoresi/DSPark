@@ -419,7 +419,6 @@ std::vector<double> wsola(const std::vector<double>& x, double ratio, int frame,
 struct Options
 {
     double ratio = 1.0;
-    bool fine = false;
     bool phaseLock = true;
     bool transient = true;
     int fftSize = 2048;
@@ -439,8 +438,6 @@ Signal stretchOffline(const Signal& in, const Options& opt)
     dspark::TimeStretch<float> ts;
     ts.prepare({ kRate, kBlock, nCh }, opt.fftSize);
     ts.setTimeRatio(static_cast<float>(opt.ratio));
-    ts.setEngine(opt.fine ? dspark::TimeStretch<float>::Engine::Fine
-                          : dspark::TimeStretch<float>::Engine::Fast);
     ts.setPhaseLock(opt.phaseLock);
     ts.setTransientPreserve(opt.transient);
     ts.process(src.toView(), dst);
@@ -460,8 +457,6 @@ std::vector<double> stretchStreaming(const std::vector<double>& in, const Option
     dspark::TimeStretch<float> ts;
     ts.prepare({ kRate, 4096, 1 }, opt.fftSize);
     ts.setTimeRatio(static_cast<float>(opt.ratio));
-    ts.setEngine(opt.fine ? dspark::TimeStretch<float>::Engine::Fine
-                          : dspark::TimeStretch<float>::Engine::Fast);
 
     std::vector<double> out;
     out.reserve(in.size());
@@ -620,9 +615,15 @@ int main(int argc, char** argv)
             const double residual = db(std::sqrt(num / std::max<size_t>(count, 1)));
 
             // THD+N of the tone: everything outside the fundamental bin group.
+            // On a bed that is not a single tone the quantity is not defined,
+            // and the field is written `n/a`. Writing 0.00 there would read as
+            // a measurement of zero dB - a 60 dB failure - to anything checking
+            // this file with a machine rather than an eye.
+            bool thdnApplies = false;
             double thdn = 0.0;
             if (std::strcmp(name, "1 kHz tone") == 0)
             {
+                thdnApplies = true;
                 const auto mag = segmentSpectrum(out, start, kToneFft);
                 double fund = 0.0, rest = 0.0;
                 for (size_t k = 0; k < mag.size(); ++k)
@@ -636,7 +637,8 @@ int main(int argc, char** argv)
             double peak = 0.0;
             for (double v : out) peak = std::max(peak, std::fabs(v));
             f << name << ',' << (streaming ? "streaming" : "offline") << ','
-              << fmt(residual, 2) << ',' << fmt(thdn, 2) << ',' << fmt(db(peak), 2) << '\n';
+              << fmt(residual, 2) << ',' << (thdnApplies ? fmt(thdn, 2) : std::string("n/a"))
+              << ',' << fmt(db(peak), 2) << '\n';
         };
 
         const Signal tone = sine(toneHz, 4.0, 1);
@@ -650,7 +652,7 @@ int main(int argc, char** argv)
     // ------------------------------------------------------------------- C8
     {
         std::ofstream f(dir + "/c8-chopping-determinism.csv");
-        f << "ratio,engine,pattern,samples_compared,differing_samples,first_divergence,"
+        f << "ratio,pattern,samples_compared,differing_samples,first_divergence,"
              "max_abs_difference\n";
         const std::vector<std::vector<int>> patterns = {
             { 512 }, { 64 }, { 1, 7, 63, 512, 129, 4096 }, { 4096 }, { 333 }
@@ -658,9 +660,9 @@ int main(int argc, char** argv)
         Signal bed = harmonicBed(6.0, 1);
         for (double r : { 0.926, 1.0, 1.05, 1.081 })
         {
-            for (int fine = 0; fine <= 1; ++fine)
+            // one engine path: the split has no public switch here
             {
-                Options opt; opt.ratio = r; opt.fine = (fine == 1);
+                Options opt; opt.ratio = r;
                 const auto ref = stretchStreaming(bed[0], opt, patterns[0]);
                 for (size_t p = 1; p < patterns.size(); ++p)
                 {
@@ -681,7 +683,7 @@ int main(int argc, char** argv)
                     }
                     std::string desc;
                     for (int b : patterns[p]) desc += std::to_string(b) + "|";
-                    f << fmt(r, 3) << ',' << (fine ? "Fine" : "Fast") << ',' << desc << ','
+                    f << fmt(r, 3) << ',' << desc << ','
                       << n << ',' << diff << ',' << first << ',' << fmt(worst, 12) << '\n';
                 }
             }
@@ -697,7 +699,7 @@ int main(int argc, char** argv)
               "# in BOTH spectra; without the clip their ratio is the dominant term\n"
               "# and the metric reports the analyser instead of the device. The\n"
               "# unclipped value is carried alongside so the difference is visible.\n";
-        f1 << "ratio,engine,lsd_db,lsd_limit_db,lsd_db_unclipped,spectral_convergence_db\n";
+        f1 << "ratio,lsd_db,lsd_limit_db,lsd_db_unclipped,spectral_convergence_db\n";
         std::ofstream f4(dir + "/c4-vertical-coherence.csv");
         f4 << "# consistency_* is the round-trip ratio as specified. The transform\n"
               "# pair inverts exactly on any real signal, so every one of these is\n"
@@ -723,9 +725,9 @@ int main(int argc, char** argv)
         for (size_t ti = 0; ti < std::size(targets); ++ti)
         {
             const auto& t = targets[ti];
-            for (int fine = 0; fine <= 1; ++fine)
+            // one engine path: the split has no public switch here
             {
-                Options opt; opt.ratio = t.ratio; opt.fine = (fine == 1);
+                Options opt; opt.ratio = t.ratio;
                 const auto out = stretchOffline(bed, opt)[0];
                 const auto sout = averageSpectrum(out, 4096, 1024);
 
@@ -746,10 +748,10 @@ int main(int argc, char** argv)
                 const double lsd = std::sqrt(acc / std::max(used, 1));
                 const double lsdRaw = std::sqrt(accRaw / std::max(used, 1));
                 const double sc = 10.0 * std::log10(dn / std::max(dd, 1e-300));
-                f1 << fmt(t.ratio, 6) << ',' << (fine ? "Fine" : "Fast") << ','
+                f1 << fmt(t.ratio, 6) << ','
                    << fmt(lsd, 4) << ',' << fmt(t.lsdLimit, 1) << ',' << fmt(lsdRaw, 2) << ','
                    << fmt(sc, 2) << '\n';
-                if (fine == 0) { rows[ti].lsd = lsd; rows[ti].sc = sc; }
+                { rows[ti].lsd = lsd; rows[ti].sc = sc; }
             }
 
             // Phase locking versus the plain vocoder on the same bed.
@@ -789,13 +791,13 @@ int main(int argc, char** argv)
     // ------------------------------------------------------------------- C2
     {
         std::ofstream f(dir + "/c2-spurious-floor.csv");
-        f << "ratio,engine,worst_spurious_db_re_fundamental,worst_bin,worst_hz\n";
+        f << "ratio,worst_spurious_db_re_fundamental,worst_bin,worst_hz\n";
         const Signal tone = sine(toneHz, 4.0, 1);
         for (size_t ti = 0; ti < std::size(targets); ++ti)
         {
-            for (int fine = 0; fine <= 1; ++fine)
+            // one engine path: the split has no public switch here
             {
-                Options opt; opt.ratio = targets[ti].ratio; opt.fine = (fine == 1);
+                Options opt; opt.ratio = targets[ti].ratio;
                 const auto out = stretchOffline(tone, opt)[0];
                 const auto mag = segmentSpectrum(out, 48000, kToneFft);
                 double fund = 0.0;
@@ -812,10 +814,10 @@ int main(int argc, char** argv)
                     if (mag[k] > worst) { worst = mag[k]; worstBin = static_cast<long long>(k); }
                 }
                 const double rel = db(worst / std::max(fund, 1e-300));
-                f << fmt(targets[ti].ratio, 6) << ',' << (fine ? "Fine" : "Fast") << ','
+                f << fmt(targets[ti].ratio, 6) << ','
                   << fmt(rel, 2) << ',' << worstBin << ','
                   << fmt(static_cast<double>(worstBin) * kRate / kToneFft, 1) << '\n';
-                if (fine == 0) rows[ti].spurious = rel;
+                rows[ti].spurious = rel;
             }
         }
     }
@@ -823,7 +825,7 @@ int main(int argc, char** argv)
     // ------------------------------------------------------------------- C3
     {
         std::ofstream f(dir + "/c3-transient-preservation.csv");
-        f << "ratio,engine,onsets,mean_energy_ratio_vs_wsola,worst_energy_ratio_vs_wsola,"
+        f << "ratio,onsets,mean_energy_ratio_vs_wsola,worst_energy_ratio_vs_wsola,"
              "source_attack_ms,output_attack_ms,attack_expansion_percent\n";
 
         std::vector<size_t> onsets;
@@ -873,9 +875,9 @@ int main(int argc, char** argv)
         {
             const double r = targets[ti].ratio;
             const auto ref = wsola(clicks[0], r, 2048, 512);
-            for (int fine = 0; fine <= 1; ++fine)
+            // one engine path: the split has no public switch here
             {
-                Options opt; opt.ratio = r; opt.fine = (fine == 1);
+                Options opt; opt.ratio = r;
                 const auto out = stretchOffline(clicks, opt)[0];
                 const auto outEnv = envelope(out);
 
@@ -929,11 +931,11 @@ int main(int argc, char** argv)
                 const double meanRatio = sumRatio / std::max(used, 1);
                 const double outAttack = sumAttack / std::max(used, 1);
                 const double expansion = (outAttack / std::max(srcAttack * r, 1e-9) - 1.0) * 100.0;
-                f << fmt(r, 6) << ',' << (fine ? "Fine" : "Fast") << ',' << used << ','
+                f << fmt(r, 6) << ',' << used << ','
                   << fmt(meanRatio, 4) << ',' << fmt(worstRatio, 4) << ','
                   << fmt(srcAttack * r, 4) << ',' << fmt(outAttack, 4) << ','
                   << fmt(expansion, 2) << '\n';
-                if (fine == 0) { rows[ti].transientKeep = meanRatio; rows[ti].attack = expansion; }
+                { rows[ti].transientKeep = meanRatio; rows[ti].attack = expansion; }
             }
         }
     }
@@ -941,7 +943,7 @@ int main(int argc, char** argv)
     // ------------------------------------------------------------------- C5
     {
         std::ofstream f(dir + "/c5-stereo-integrity.csv");
-        f << "ratio,engine,ild_in_db,ild_out_db,ild_delta_db,coherence_in,coherence_out\n";
+        f << "ratio,ild_in_db,ild_out_db,ild_delta_db,coherence_in,coherence_out\n";
 
         // Correlated stereo: the same bed in both channels, right delayed 3 ms.
         // The bed is pink noise rather than the 12 partials of the fidelity
@@ -1009,18 +1011,18 @@ int main(int argc, char** argv)
         const double cohIn = coherence(st[0], st[1]);
         for (size_t ti = 0; ti < std::size(targets); ++ti)
         {
-            for (int fine = 0; fine <= 1; ++fine)
+            // one engine path: the split has no public switch here
             {
-                Options opt; opt.ratio = targets[ti].ratio; opt.fine = (fine == 1);
+                Options opt; opt.ratio = targets[ti].ratio;
                 const auto out = stretchOffline(st, opt);
                 const size_t skip = 8192;
                 const double ildOut = db(rms(out[0], skip, out[0].size() - skip))
                                     - db(rms(out[1], skip, out[1].size() - skip));
                 const double cohOut = coherence(out[0], out[1]);
-                f << fmt(targets[ti].ratio, 6) << ',' << (fine ? "Fine" : "Fast") << ','
+                f << fmt(targets[ti].ratio, 6) << ','
                   << fmt(ildIn, 4) << ',' << fmt(ildOut, 4) << ','
                   << fmt(ildOut - ildIn, 4) << ',' << fmt(cohIn, 5) << ',' << fmt(cohOut, 5) << '\n';
-                if (fine == 0) { rows[ti].ild = ildOut - ildIn; rows[ti].coherence = cohOut; }
+                { rows[ti].ild = ildOut - ildIn; rows[ti].coherence = cohOut; }
             }
         }
     }
@@ -1028,11 +1030,10 @@ int main(int argc, char** argv)
     // -------------------------------------------------------------- summary
     {
         std::ofstream f(dir + "/timestretch-metrics.md");
-        f << "# TimeStretch characterisation (48 kHz, 2048 frame, Fast engine)\n\n"
+        f << "# TimeStretch characterisation (48 kHz, 2048 frame)\n\n"
              "Machine-generated by `tools/characterize_timestretch.cpp`. Every number\n"
-             "here is at 48 kHz with the default 2048-sample frame; the per-criterion\n"
-             "CSV files beside this one carry the Fine engine and the plain-vocoder\n"
-             "control as well.\n\n"
+             "here is at 48 kHz with the default 2048-sample frame; the CSV files\n"
+             "beside this one carry the plain-vocoder control as well.\n\n"
              "| Target | out/in length | ratio error % | LSD dB | SC dB | spurious dB |"
              " transient vs WSOLA | attack exp % | vertical coherence | dILD dB | stereo coherence |\n"
              "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";

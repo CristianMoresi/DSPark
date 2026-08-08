@@ -3911,7 +3911,236 @@ std::vector<float> tsStream(TimeStretch<float>& ts, const std::vector<float>& in
     return out;
 }
 
+
+/// A band-limited windowed-sinc click train: the strike bed. `onsets` is
+/// filled with the exact sample each strike is centred on.
+std::vector<float> tsClicks(double seconds, double bpm, std::vector<int>& onsets,
+                            double rate = 48000.0)
+{
+    const int n = static_cast<int>(rate * seconds);
+    const int half = 64;
+    const double fc = 0.45;
+    std::vector<float> x(static_cast<size_t>(n), 0.0f);
+    std::vector<double> h(static_cast<size_t>(2 * half + 1), 0.0);
+    for (int k = -half; k <= half; ++k)
+    {
+        const double sinc = (k == 0) ? 2 * fc
+            : std::sin(2 * dspark::pi<double> * fc * k) / (dspark::pi<double> * k);
+        const double w = 0.5 - 0.5 * std::cos(2 * dspark::pi<double>
+                                              * (k + half) / (2.0 * half));
+        h[static_cast<size_t>(k + half)] = sinc * w;
+    }
+    double pk = 0;
+    for (double v : h) pk = std::max(pk, std::fabs(v));
+    for (auto& v : h) v /= pk;
+    const int period = static_cast<int>(std::lround(60.0 / bpm * rate));
+    onsets.clear();
+    for (int c = period; c + half < n; c += period)
+    {
+        onsets.push_back(c);
+        for (int k = -half; k <= half; ++k)
+            x[static_cast<size_t>(c + k)] += static_cast<float>(h[static_cast<size_t>(k + half)]);
+    }
+    return x;
+}
+
+/// A 12-partial harmonic bed at 110 Hz: the sustain a strike has to be found
+/// over. Deterministic partial phases, so the test is reproducible.
+std::vector<float> tsHarmonic(double seconds, double rate = 48000.0)
+{
+    const int n = static_cast<int>(rate * seconds);
+    std::vector<float> x(static_cast<size_t>(n), 0.0f);
+    for (int p = 1; p <= 12; ++p)
+    {
+        const double f = 110.0 * p;
+        if (f >= 0.45 * rate) break;
+        const double a = 0.5 / p;
+        const double ph = 0.7 * p;
+        for (int i = 0; i < n; ++i)
+            x[static_cast<size_t>(i)] += static_cast<float>(
+                a * std::sin(2 * dspark::pi<double> * f * i / rate + ph));
+    }
+    float pk = 0;
+    for (float v : x) pk = std::max(pk, std::fabs(v));
+    if (pk > 0) for (auto& v : x) v *= 0.7f / pk;
+    return x;
+}
+
+/// Median over strikes of the energy in the +-0.5 ms core of the strike over
+/// the energy in its +-20 ms event: how concentrated the attack still is.
+/// Higher is sharper; the input's own value is the reference.
+double tsConcentration(const std::vector<float>& x, const std::vector<int>& onsets,
+                       double ratio, double rate = 48000.0)
+{
+    const int core = static_cast<int>(std::lround(0.0005 * rate));
+    const int evt = static_cast<int>(std::lround(0.0200 * rate));
+    std::vector<double> ks;
+    for (int t : onsets)
+    {
+        const auto c = static_cast<long>(std::llround(static_cast<double>(t) * ratio));
+        const long lo = std::max(0L, c - evt);
+        const long hi = std::min(static_cast<long>(x.size()), c + evt + 1);
+        if (hi - lo < 2 * core + 2) continue;
+        long pk = lo; double pv = 0;
+        for (long i = lo; i < hi; ++i)
+        {
+            const double v = std::fabs(static_cast<double>(x[static_cast<size_t>(i)]));
+            if (v > pv) { pv = v; pk = i; }
+        }
+        if (pv <= 0) continue;
+        const long clo = std::max(lo, pk - core);
+        const long chi = std::min(hi, pk + core + 1);
+        double eC = 0, eE = 0;
+        for (long i = lo; i < hi; ++i)
+        {
+            const double v = static_cast<double>(x[static_cast<size_t>(i)]);
+            eE += v * v;
+            if (i >= clo && i < chi) eC += v * v;
+        }
+        if (eE > 0) ks.push_back(eC / eE);
+    }
+    if (ks.empty()) return 0.0;
+    std::sort(ks.begin(), ks.end());
+    return ks[ks.size() / 2];
+}
+
+/// Worst distance, in samples, between where a strike came out and where the
+/// stretched timeline says it should be.
+double tsWorstOnsetError(const std::vector<float>& out, const std::vector<int>& onsets,
+                         double ratio, double bpm, double rate = 48000.0)
+{
+    const int period = static_cast<int>(std::lround(60.0 / bpm * rate));
+    double worst = 0.0;
+    for (int t : onsets)
+    {
+        const double e = ratio * static_cast<double>(t);
+        const long lo = std::max(0L, static_cast<long>(e) - period / 2);
+        const long hi = std::min(static_cast<long>(out.size()),
+                                 static_cast<long>(e) + period / 2);
+        if (hi - lo < 4) continue;
+        long pk = lo; double pv = 0;
+        for (long i = lo; i < hi; ++i)
+        {
+            const double v = std::fabs(static_cast<double>(out[static_cast<size_t>(i)]));
+            if (v > pv) { pv = v; pk = i; }
+        }
+        worst = std::max(worst, std::fabs(static_cast<double>(pk) - e));
+    }
+    return worst;
+}
+
+/// Offline stretch of a mono signal.
+std::vector<float> tsOffline(const std::vector<float>& in, double ratio, int fftSize,
+                             bool transientPreserve = true)
+{
+    TimeStretch<float> ts;
+    AudioSpec sp; sp.sampleRate = 48000.0; sp.maxBlockSize = 512; sp.numChannels = 1;
+    ts.prepare(sp, fftSize);
+    ts.setTransientPreserve(transientPreserve);
+    ts.setTimeRatio(static_cast<float>(ratio));
+    AudioBuffer<float> src; src.resize(1, static_cast<int>(in.size()));
+    std::copy(in.begin(), in.end(), src.getChannel(0));
+    AudioBuffer<float> out;
+    ts.process(src.toView(), out);
+    return std::vector<float>(out.getChannel(0),
+                              out.getChannel(0) + out.getNumSamples());
+}
+
 }   // namespace
+
+// A stretch spreads one strike over fftSize * |ratio - 1| samples unless the
+// analysis hop is held across it, and the result is an attack that audibly
+// doubles. Held, the stretched strike must be as concentrated as the input's
+// own - not merely close to it - at every frame size and every ratio. The
+// same measurement with the transient path switched off is the control: it
+// has to fall well below the bound, or the test is measuring nothing.
+DSPARK_TEST(TimeStretch_strikes_keep_the_input_s_own_concentration)
+{
+    std::vector<int> onsets;
+    const auto bed = tsClicks(6.0, 120.0, onsets);
+    const double kIn = tsConcentration(bed, onsets, 1.0);
+    EXPECT_GT(kIn, 0.99);
+
+    for (int fftSize : { 256, 512, 1024, 2048, 4096 })
+    {
+        for (double r : { 0.926, 0.95, 1.05, 1.081 })
+        {
+            const auto out = tsOffline(bed, r, fftSize);
+            EXPECT_GT(tsConcentration(out, onsets, r), 0.95 * kIn);
+        }
+    }
+
+    // Control: without the transient path the same strike smears badly.
+    const auto loose = tsOffline(bed, 0.926, 2048, false);
+    EXPECT_LT(tsConcentration(loose, onsets, 0.926), 0.90 * kIn);
+}
+
+// The bed that actually needs an onset detector: strikes over a sustained
+// 110 Hz harmonic bed, where a broadband energy test cannot see the strike at
+// all. Measured on the band the strike owns - the bed's partials stop at
+// 1320 Hz - by comparing the concentration of the stretched strike with the
+// concentration of the unstretched one.
+DSPARK_TEST(TimeStretch_finds_strikes_over_a_sustained_bed)
+{
+    std::vector<int> onsets;
+    const auto clicks = tsClicks(6.0, 120.0, onsets);
+    const auto harm = tsHarmonic(6.0);
+    std::vector<float> mix(clicks.size());
+    for (size_t i = 0; i < mix.size(); ++i)
+        mix[i] = 0.6f * harm[i] + 0.9f * clicks[i];
+
+    // A one-pole-cascade high pass at 3 kHz is enough to isolate the strike
+    // from a bed whose highest partial is 1320 Hz.
+    auto highPass = [](const std::vector<float>& x)
+    {
+        const double a = std::exp(-2.0 * dspark::pi<double> * 3000.0 / 48000.0);
+        std::vector<float> y(x.size());
+        double s1 = 0, s2 = 0, p1 = 0, p2 = 0;
+        for (size_t i = 0; i < x.size(); ++i)
+        {
+            const double v = static_cast<double>(x[i]);
+            s1 = a * (s1 + v - p1); p1 = v;
+            s2 = a * (s2 + s1 - p2); p2 = s1;
+            y[i] = static_cast<float>(s2);
+        }
+        return y;
+    };
+
+    const auto hpIn = highPass(mix);
+    const double kIn = tsConcentration(hpIn, onsets, 1.0);
+    EXPECT_GT(kIn, 0.5);
+
+    for (double r : { 0.926, 0.95, 1.05, 1.081 })
+    {
+        const auto out = highPass(tsOffline(mix, r, 2048));
+        EXPECT_GT(tsConcentration(out, onsets, r), 0.90 * kIn);
+    }
+
+    // Control: with the transient path off the strike is not preserved.
+    const auto loose = highPass(tsOffline(mix, 0.926, 2048, false));
+    EXPECT_LT(tsConcentration(loose, onsets, 0.926), 0.90 * kIn);
+}
+
+// Holding the analysis hop across a strike borrows input, and the borrow has
+// to be repaid or the timeline drifts strike by strike. What must hold is not
+// only the average ratio but every individual strike's position, and it must
+// hold at strike densities where the hold occupies most of the timeline: at
+// 960 strikes per minute the hold covers about three quarters of it.
+DSPARK_TEST(TimeStretch_every_strike_lands_where_the_stretch_puts_it)
+{
+    for (double bpm : { 120.0, 480.0, 960.0 })
+    {
+        std::vector<int> onsets;
+        const auto bed = tsClicks(10.0, bpm, onsets);
+        EXPECT_GT(static_cast<int>(onsets.size()), 8);
+        for (double r : { 0.926, 0.95, 1.05, 1.081 })
+        {
+            const auto out = tsOffline(bed, r, 2048);
+            // 2 ms at 48 kHz.
+            EXPECT_LT(tsWorstOnsetError(out, onsets, r, bpm), 96.0);
+        }
+    }
+}
 
 // The offline path must deliver exactly round(inputLength * ratio) samples.
 // A stretch that is a hop or two out per call is a stretch that walks away
@@ -3995,9 +4224,9 @@ DSPARK_TEST(TimeStretch_output_is_bit_identical_under_block_chopping)
         { 512 }, { 64 }, { 1, 7, 63, 512, 129, 4096 }, { 4096 }, { 333 }
     };
 
-    for (double r : { 0.926, 1.0, 1.081 })
+    for (double r : { 0.5, 0.926, 1.0, 1.081, 2.0 })
     {
-        for (int fine = 0; fine <= 1; ++fine)
+        for (int transient = 0; transient <= 1; ++transient)
         {
             std::vector<float> reference;
             for (size_t p = 0; p < patterns.size(); ++p)
@@ -4005,8 +4234,7 @@ DSPARK_TEST(TimeStretch_output_is_bit_identical_under_block_chopping)
                 TimeStretch<float> ts;
                 ts.prepare(spec(48000.0, 4096, 1));
                 ts.setTimeRatio(static_cast<float>(r));
-                ts.setEngine(fine ? TimeStretch<float>::Engine::Fine
-                                  : TimeStretch<float>::Engine::Fast);
+                ts.setTransientPreserve(transient != 0);
                 const auto got = tsStream(ts, src, patterns[p]);
                 if (p == 0) { reference = got; continue; }
                 EXPECT_EQ(got.size(), reference.size());
@@ -4101,36 +4329,52 @@ DSPARK_TEST(TimeStretch_reported_latency_is_the_measured_one)
     }
 }
 
-// The Fine engine's median filters walk a history ring and a window that
-// straddles the edges of the spectrum. Small frames put Nyquist and DC inside
-// every window, which is where an off-by-one in either walk reads outside its
-// buffer; under the sanitize preset this case is the hard failure, on other
-// builds it asserts that nothing came out non-finite.
-DSPARK_TEST(TimeStretch_percussive_split_stays_inside_its_buffers)
+// The harmonic/percussive split's median filters walk a history ring and a
+// window that straddles the edges of the spectrum. Small frames put Nyquist
+// and DC inside every window, which is where an off-by-one in either walk
+// reads outside its buffer; under the sanitize preset this case is the hard
+// failure, on other builds it asserts that nothing came out non-finite. No
+// shipped effect exposes a switch for the split, so the engine is driven
+// directly here - the code is shared with the pitch shifter and stays.
+DSPARK_TEST(PhaseVocoderEngine_percussive_split_stays_inside_its_buffers)
 {
     for (int fftSize : { 256, 512 })
     {
-        TimeStretch<float> ts;
-        ts.prepare(spec(44100.0, 512, 2), fftSize);
-        ts.setEngine(TimeStretch<float>::Engine::Fine);
-        ts.setTimeRatio(1.081f);
+        dspark::detail::PhaseVocoderEngine<float> engine;
+        EXPECT_TRUE(engine.prepare(44100.0, 2, fftSize, false, true, true));
+        dspark::detail::PhaseVocoderEngine<float>::Params p;
+        p.targetSemitones = 12.0 * std::log2(1.081);
+        p.percussiveSplit = true;
+        engine.publishParams(p);
+        engine.reset();
 
         const auto src = tsBroadband(512 * 200, 0xFEEDu);
-        std::vector<float> a(512), b(512);
         int nonFinite = 0;
         for (int blk = 0; blk < 200; ++blk)
         {
-            for (int i = 0; i < 512; ++i)
+            int done = 0;
+            while (done < 512)
             {
-                a[static_cast<size_t>(i)] = src[static_cast<size_t>(blk * 512 + i)];
-                b[static_cast<size_t>(i)] = -src[static_cast<size_t>(blk * 512 + i)];
+                const int chunk = std::min(512 - done, engine.samplesToNextHop());
+                std::vector<float> a(static_cast<size_t>(chunk));
+                std::vector<float> b(static_cast<size_t>(chunk));
+                for (int i = 0; i < chunk; ++i)
+                {
+                    a[static_cast<size_t>(i)] =
+                        src[static_cast<size_t>(blk * 512 + done + i)];
+                    b[static_cast<size_t>(i)] = -a[static_cast<size_t>(i)];
+                }
+                engine.pushInput(0, a.data(), chunk);
+                engine.pushInput(1, b.data(), chunk);
+                engine.commitInput(chunk, 2);
+                done += chunk;
             }
-            float* ch[2] = { a.data(), b.data() };
-            AudioBufferView<float> view(ch, 2, 512);
-            ts.processBlock(view);
-            for (int i = 0; i < 512; ++i)
-                if (!std::isfinite(a[static_cast<size_t>(i)])
-                    || !std::isfinite(b[static_cast<size_t>(i)])) ++nonFinite;
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                const float* acc = engine.olaData(ch);
+                for (int i = 0; i < engine.olaSize(); ++i)
+                    if (!std::isfinite(acc[static_cast<size_t>(i)])) ++nonFinite;
+            }
         }
         EXPECT_EQ(nonFinite, 0);
     }
@@ -4195,14 +4439,12 @@ DSPARK_TEST(TimeStretch_state_round_trips)
     a.prepare(spec(48000.0, 512, 2));
     b.prepare(spec(48000.0, 512, 2));
     a.setTimeRatio(1.081f);
-    a.setEngine(TimeStretch<float>::Engine::Fine);
     a.setTransientPreserve(false);
     a.setPhaseLock(false);
 
     const auto blob = a.getState();
     EXPECT_TRUE(b.setState(blob.data(), blob.size()));
     EXPECT_NEAR(b.getTimeRatio(), 1.081f, 1e-4f);
-    EXPECT_TRUE(b.getEngine() == TimeStretch<float>::Engine::Fine);
     EXPECT_FALSE(b.getTransientPreserve());
     EXPECT_FALSE(b.getPhaseLock());
 

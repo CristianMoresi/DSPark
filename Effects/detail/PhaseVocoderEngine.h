@@ -42,12 +42,41 @@
  *   synthesis hop instead of being phase-propagated (Driedger, Mueller &
  *   Ewert, "Improving time-scale modification of music signals using
  *   harmonic-percussive separation", IEEE Signal Processing Letters 21(1),
- *   2014). Both paths share one analysis frame, so the split costs the two
- *   medians and nothing else.
- * - **Transient phase reset**: onsets (frame energy rising more than 6 dB
- *   over the tracked envelope) re-initialise synthesis phases to the
- *   analysis phases. Peaks with no history (new partials) are reset
- *   individually even without a global onset.
+ *   2014). Both paths share one analysis frame, so the split adds no
+ *   transform - but it is NOT cheap: the two medians measure 4.85x to 5.24x
+ *   the cost of the whole rest of the engine (stereo, 2048-sample frame,
+ *   48 kHz, 512-sample blocks, 42.7 s of audio, best of five runs), because
+ *   a median runs per bin per frame while the transform runs once per frame.
+ * - **Onset detection**: half-wave-rectified spectral flux over a
+ *   log-frequency triangular filterbank (quarter-tone spacing, 27.5 Hz to
+ *   16 kHz), compressed as log10(x + 1), differenced against a
+ *   three-neighbour frequency maximum filter of the previous frame so that
+ *   vibrato does not read as an attack (Boeck & Widmer, "Maximum filter
+ *   vibrato suppression for onset detection", DAFx-13). A frame fires when
+ *   that flux rises a fixed amount above the running median of the recent
+ *   flux history. The broadband frame-energy test this replaces cannot see a
+ *   strike over a sustained bed at all: on a strike over a 110 Hz harmonic
+ *   bed the weakest onset frame carries 0.13 dB more energy than the median
+ *   non-onset frame, against the 6 dB that test needed, where the flux above
+ *   carries 14.46 dB.
+ * - **Transient phase reset**: a firing frame re-initialises synthesis
+ *   phases to the analysis phases. Peaks with no history (new partials) are
+ *   reset individually even without a global onset.
+ * - **Transient-locked analysis hop** (opt-in at prepare(); only an owner
+ *   that reads the synthesis stream directly may ask for it, see prepare()):
+ *   across a detected attack the analysis
+ *   hop is forced to Ra = Rs for ceil(fftSize / Rs) frames - one whole
+ *   window - so every frame whose window contains the strike places it at
+ *   the same offset and the positional spread fftSize * |ratio - 1| that
+ *   doubles an attack is identically zero. The input the lock does not
+ *   consume is carried as a debt and repaid by widening later hops, capped
+ *   at Rs/2 per hop. Three rules keep the debt self-limiting rather than
+ *   cumulative, and each is load-bearing: a firing inside an engaged lock is
+ *   ignored (one strike, one lock), a lock does not arm until the previous
+ *   lock's debt is fully repaid, and no lock arms on the first frame of a
+ *   stream. With them max|debt| = N * Rs * |1 - ratio| / ratio exactly, and
+ *   independently of how dense the strikes are; without the arming gate the
+ *   debt accumulates across strikes instead of being cleared between them.
  * - **Exact fractional analysis hop**: the analysis hop carries a fractional
  *   accumulator so the average stretch is exactly Rs / (Rs / ratio) = ratio
  *   for arbitrary ratios, with no cumulative drift.
@@ -185,10 +214,29 @@ public:
      *                             streaming without ever allocating again.
      *                             False leaves those buffers empty and the
      *                             split permanently off.
+     * @param transientLockedHop   True to force the analysis hop to Rs across a
+     *                             detected attack (see the file doc). Only an
+     *                             owner that reads the synthesis stream
+     *                             directly may ask for it. An owner that
+     *                             resamples the synthesis stream back advances
+     *                             its reader by `ratio` per input sample and so
+     *                             assumes Ra = Rs/ratio every hop; a locked hop
+     *                             breaks that assumption for the length of the
+     *                             lock and the reader runs past the write head
+     *                             into ring content no frame has written yet.
+     *                             Measured on a click train, which is 84%
+     *                             silence: locking the hop under a
+     *                             resample-back reader raises the output RMS by
+     *                             0.8 to 5.9 dB, which is energy appearing in
+     *                             the silence. The lock also buys such an owner
+     *                             nothing, because resampling puts the strike
+     *                             back where it started whatever the analysis
+     *                             hop did.
      * @return true if the engine (re)allocated and is ready for reset().
      */
     bool prepare(double sampleRate, int numChannels, int fftSize,
-                 bool resampleCompensation, bool separationSupport = false)
+                 bool resampleCompensation, bool separationSupport = false,
+                 bool transientLockedHop = false)
     {
         if (!(sampleRate > 0.0) || !std::isfinite(sampleRate) || numChannels < 1
             || (fftSize & (fftSize - 1)) != 0 || fftSize < 256 || fftSize > (1 << 20))
@@ -238,6 +286,28 @@ public:
         rotRe_.resize(static_cast<size_t>(numBins_));
         rotIm_.resize(static_cast<size_t>(numBins_));
         peakBin_.resize(static_cast<size_t>(numBins_ / 2 + 2));
+
+        // Onset detection front end. Everything it needs per frame is sized
+        // here: the filterbank tables, the two band frames it differences,
+        // and the flux history the running median is taken over.
+        buildOnsetFilterBank();
+        bandCur_.assign(static_cast<size_t>(numBands_), T(0));
+        bandPrev_.assign(static_cast<size_t>(numBands_), T(0));
+        bandMaxPrev_.assign(static_cast<size_t>(numBands_), T(0));
+        fluxHist_.assign(static_cast<size_t>(kFluxWindow), 0.0);
+        fluxScratch_.assign(static_cast<size_t>(kFluxWindow), 0.0);
+        // Un-normalised |X| grows linearly with the frame length, so the
+        // band accumulation is referred to a 2048-sample frame before the
+        // log compression: the growth cancels and one firing threshold means
+        // the same sensitivity at every frame size. fftSize is a power of
+        // two, so the factor is exact and introduces no rounding.
+        odfScale_ = static_cast<T>(kOdfRefFrame / static_cast<double>(fftSize_));
+        // One lock spans every analysis frame whose window can contain the
+        // strike; that count is a property of the window geometry, not of
+        // any signal. An owner that did not ask for the locked hop gets a
+        // lock length of zero, which is the schedule with no lock in it.
+        lockEnabled_ = transientLockedHop;
+        lockFrames_ = lockEnabled_ ? (fftSize_ + synthHop_ - 1) / synthHop_ : 0;
 
         // Harmonic/percussive median filtering. Both window lengths are
         // chosen from a PHYSICAL span, so they follow the sample rate and the
@@ -294,6 +364,14 @@ public:
         histPos_ = 0;
         histFilled_ = 0;
 
+        std::fill(bandPrev_.begin(), bandPrev_.end(), T(0));
+        std::fill(bandMaxPrev_.begin(), bandMaxPrev_.end(), T(0));
+        std::fill(fluxHist_.begin(), fluxHist_.end(), 0.0);
+        fluxPos_ = 0;
+        fluxFilled_ = 0;
+        lockLeft_ = 0;
+        debt_ = 0.0;
+
         inputPos_ = 0;
         writeHead_ = static_cast<int64_t>(accumSize_);       // keep indices positive
 
@@ -303,7 +381,6 @@ public:
         hopCarry_ = 0.0;
         inputSinceHop_ = 0;
         analysisHop_ = computeAnalysisHop();
-        onsetEnv_ = 0.0;
         firstFrame_ = true;
     }
 
@@ -432,6 +509,31 @@ private:
     /// be broadband to the exclusion of everything else.
     static constexpr double kSeparationFactor = 2.0;
 
+    /// Onset filterbank: quarter-tone log-frequency triangles from 27.5 Hz
+    /// (the lowest note of a piano) to 16 kHz, the same construction the
+    /// framework's standalone onset detector uses, so the two agree on what
+    /// an onset is.
+    static constexpr double kOnsetFMin = 27.5;
+    static constexpr double kOnsetFMax = 16000.0;
+    static constexpr int kOnsetBandsPerOctave = 24;
+    /// Frame length the band magnitudes are referred to before the log
+    /// compression, so that one firing threshold means the same sensitivity
+    /// at every frame size and every sample rate.
+    static constexpr double kOdfRefFrame = 2048.0;
+    /// Frames of flux history the firing threshold's running median is taken
+    /// over. Twelve frames is three windows at 75% overlap: long enough that
+    /// one strike cannot move the median, short enough to follow a passage
+    /// that changes density.
+    static constexpr int kFluxWindow = 12;
+    /// How far above the running median a frame's flux must rise to fire, in
+    /// the units of the compressed band difference above. It is an amount
+    /// rather than a multiple: on sustained material the median flux is
+    /// almost zero, and any multiple of almost zero is reached by the
+    /// numerical wobble of a steady partial - measured, a multiplicative
+    /// form fires 148 times on a bed with no onset in it at all, where this
+    /// form fires none.
+    static constexpr double kFluxDelta = 0.02;
+
     /** @brief Adopts the staged parameter set, or defers (bounded seqlock read).
      *
      *  At most kSeqlockMaxAttempts validation attempts. On give-up the
@@ -487,14 +589,65 @@ private:
         return x - kTwoPi * std::round(x / kTwoPi);
     }
 
-    /** @brief Next analysis hop from the active ratio, with exact fractional carry. */
+    /**
+     * @brief Next analysis hop from the active ratio, with exact fractional
+     * carry, the transient lock and the debt repayment.
+     *
+     * While a lock is engaged the analysis hop equals the synthesis hop, so
+     * the strike sits at the same offset in every frame that sees it. The
+     * input those frames did not consume - Rs/ratio - Rs each - accumulates
+     * as a debt, which unlocked hops repay by up to Rs/2 apiece. Rs/2 is the
+     * smallest binary fraction that clears one lock's debt inside one
+     * unlocked hop over the +-10% band this device is built for
+     * (k >= N * (1 - ratio) / ratio = 0.444 there); a quarter of a hop does
+     * not, and a whole hop measures identically to a half, because past that
+     * point what binds is the existence of the unlocked hop and not its
+     * width.
+     */
     [[nodiscard]] int computeAnalysisHop() noexcept
     {
-        const double ideal = static_cast<double>(synthHop_) / ratioActive_ + hopCarry_;
+        double ideal;
+        if (lockLeft_ > 0)
+        {
+            --lockLeft_;
+            debt_ += static_cast<double>(synthHop_) / ratioActive_
+                   - static_cast<double>(synthHop_);
+            ideal = static_cast<double>(synthHop_) + hopCarry_;
+        }
+        else
+        {
+            const double cap = 0.5 * static_cast<double>(synthHop_);
+            const double repay = std::clamp(debt_, -cap, cap);
+            debt_ -= repay;
+            ideal = static_cast<double>(synthHop_) / ratioActive_ + repay + hopCarry_;
+        }
         int hop = static_cast<int>(ideal);
         hop = std::clamp(hop, 1, fftSize_);
         hopCarry_ = ideal - static_cast<double>(hop);
         return hop;
+    }
+
+    /**
+     * @brief Arms the transient lock for this frame, or refuses to.
+     *
+     * Three refusals, and dropping any one of them costs measurable timing
+     * accuracy at dense strike rates. A firing inside an engaged lock is
+     * ignored, so one strike buys one lock and a burst cannot chain them. A
+     * lock does not arm while any debt is outstanding, which is what keeps
+     * the debt from accumulating across strikes: every lock starts from
+     * zero, so its maximum is a property of the ratio alone and not of the
+     * tempo. And no lock arms on the very first frame, which always reports
+     * an onset by construction and would otherwise open every stream,
+     * stationary material included, with a lock nothing asked for.
+     */
+    void armTransientLock(bool transient) noexcept
+    {
+        if (!lockEnabled_) return;
+        if (!transient) return;
+        if (firstFrame_) return;
+        if (lockLeft_ > 0) return;
+        if (std::abs(debt_) >= 1.0) return;
+        lockLeft_ = lockFrames_;
     }
 
     /** @brief One analysis->synthesis frame for all channels. */
@@ -514,6 +667,7 @@ private:
         analyzeChannel(0);
 
         const bool transient = detectTransient();
+        armTransientLock(transient);
         buildRotations(transient);
         // The magnitude history is kept whenever the owner allocated it, not
         // only while the split is engaged: turning the split on mid-stream
@@ -566,20 +720,171 @@ private:
         }
     }
 
-    /** @brief Frame-energy onset detector (6 dB rise over tracked envelope). */
+    /**
+     * @brief Half-wave-rectified spectral flux over the log-frequency
+     * filterbank, fired against the running median of its own history.
+     *
+     * The flux is taken against a three-neighbour frequency maximum filter
+     * of the previous band frame rather than against the band frame itself,
+     * so a partial that wobbles by up to one band - vibrato, a bent note -
+     * contributes nothing, while a strike, which lights up bands that were
+     * dark in every neighbour, contributes everything. The log compression
+     * before the difference is what makes one threshold work across levels:
+     * without it the flux of a loud passage swamps the flux of a quiet one
+     * and no single multiple of the median fits both.
+     *
+     * The history is advanced on every frame, whether or not transient
+     * handling is engaged, so that switching the parameter on mid-stream
+     * finds a full window behind it rather than an empty one. The first
+     * frame always reports true: there is no history to compare against, and
+     * a stream's first frame has no previous synthesis phase to propagate
+     * from either.
+     */
     [[nodiscard]] bool detectTransient() noexcept
     {
-        double energy = 0.0;
-        for (int k = 0; k < numBins_; ++k)
+        const double flux = computeSpectralFlux();
+
+        // Median of the trailing window, taken before this frame is pushed:
+        // a frame is compared with the material that preceded it, never with
+        // itself.
+        bool rise = false;
+        if (fluxFilled_ >= kFluxWindow)
         {
-            const double m = static_cast<double>(mag_[static_cast<size_t>(k)]);
-            energy += m * m;
+            std::copy(fluxHist_.begin(), fluxHist_.end(), fluxScratch_.begin());
+            const auto mid = fluxScratch_.begin() + kFluxWindow / 2;
+            std::nth_element(fluxScratch_.begin(), mid, fluxScratch_.end());
+            rise = (flux - *mid) >= kFluxDelta;
         }
-        const double prevEnv = onsetEnv_;
-        onsetEnv_ = std::max(energy, onsetEnv_ * 0.7);
+
+        fluxHist_[static_cast<size_t>(fluxPos_)] = flux;
+        fluxPos_ = (fluxPos_ + 1) % kFluxWindow;
+        if (fluxFilled_ < kFluxWindow) ++fluxFilled_;
+
         if (!transientOn_)
             return firstFrame_;
-        return firstFrame_ || (energy > 4.0 * prevEnv && energy > 1e-12);
+        return firstFrame_ || rise;
+    }
+
+    /** @brief One frame of log-filterbank half-wave-rectified spectral flux,
+     *  and the band-history rotation that goes with it. */
+    [[nodiscard]] double computeSpectralFlux() noexcept
+    {
+        filterLogBands();
+
+        double flux = 0.0;
+        for (int b = 0; b < numBands_; ++b)
+        {
+            const double d = static_cast<double>(bandCur_[static_cast<size_t>(b)])
+                           - static_cast<double>(bandMaxPrev_[static_cast<size_t>(b)]);
+            if (d > 0.0) flux += d;
+        }
+        flux /= static_cast<double>(std::max(1, numBands_));
+
+        // Rotate: previous <- current, and rebuild the maximum-filtered
+        // reference the next frame will be differenced against.
+        bandPrev_ = bandCur_;
+        maxFilterBands();
+        return flux;
+    }
+
+    /** @brief Applies the filterbank to mag_ and compresses each band as
+     *  log10(scale * x + 1). Scaling the accumulated band is identical to
+     *  scaling the spectrum first, the filterbank being linear. */
+    void filterLogBands() noexcept
+    {
+        for (int b = 0; b < numBands_; ++b)
+        {
+            const int start = fbStart_[static_cast<size_t>(b)];
+            const int off   = fbOffset_[static_cast<size_t>(b)];
+            const int cnt   = fbCount_[static_cast<size_t>(b)];
+            T acc = T(0);
+            for (int i = 0; i < cnt; ++i)
+            {
+                const int k = start + i;
+                if (k >= 0 && k < numBins_)
+                    acc += mag_[static_cast<size_t>(k)]
+                         * fbWeights_[static_cast<size_t>(off + i)];
+            }
+            bandCur_[static_cast<size_t>(b)] = std::log10(acc * odfScale_ + T(1));
+        }
+    }
+
+    /** @brief Three-neighbour maximum filter of bandPrev_ into bandMaxPrev_. */
+    void maxFilterBands() noexcept
+    {
+        for (int b = 0; b < numBands_; ++b)
+        {
+            T mx = bandPrev_[static_cast<size_t>(b)];
+            if (b > 0) mx = std::max(mx, bandPrev_[static_cast<size_t>(b - 1)]);
+            if (b + 1 < numBands_) mx = std::max(mx, bandPrev_[static_cast<size_t>(b + 1)]);
+            bandMaxPrev_[static_cast<size_t>(b)] = mx;
+        }
+    }
+
+    /**
+     * @brief Builds the quarter-tone log-frequency triangular filterbank.
+     *
+     * Centres are the quarter-tone grid from 27.5 Hz up, rounded to bins and
+     * de-duplicated, so at small frame sizes the low end thins out to
+     * whatever the resolution actually supports instead of pretending to a
+     * spacing it cannot deliver. Each filter is the triangle over a
+     * consecutive triple of centres, peak-normalised.
+     */
+    void buildOnsetFilterBank()
+    {
+        fbStart_.clear();
+        fbOffset_.clear();
+        fbCount_.clear();
+        fbWeights_.clear();
+        numBands_ = 0;
+
+        const double binHz = sampleRate_ / static_cast<double>(fftSize_);
+        const double fMax = std::min(kOnsetFMax, sampleRate_ * 0.5 * 0.999);
+
+        std::vector<int> centres;
+        for (int i = 0; ; ++i)
+        {
+            const double f = kOnsetFMin * std::pow(2.0, static_cast<double>(i)
+                                 / static_cast<double>(kOnsetBandsPerOctave));
+            if (f > fMax) break;
+            int bin = static_cast<int>(std::lround(f / binHz));
+            bin = std::clamp(bin, 0, numBins_ - 1);
+            if (centres.empty() || bin > centres.back())
+                centres.push_back(bin);
+        }
+
+        for (size_t j = 1; j + 1 < centres.size(); ++j)
+        {
+            const int lo = centres[j - 1];
+            const int ce = centres[j];
+            const int hi = centres[j + 1];
+            if (!(lo < ce && ce < hi)) continue;
+
+            fbStart_.push_back(lo);
+            fbOffset_.push_back(static_cast<int>(fbWeights_.size()));
+            for (int k = lo; k <= hi; ++k)
+            {
+                const T wv = (k <= ce)
+                    ? static_cast<T>(static_cast<double>(k - lo)
+                                     / static_cast<double>(ce - lo))
+                    : static_cast<T>(static_cast<double>(hi - k)
+                                     / static_cast<double>(hi - ce));
+                fbWeights_.push_back(wv);
+            }
+            ++numBands_;
+        }
+        for (int b = 0; b < numBands_; ++b)
+        {
+            const int off = fbOffset_[static_cast<size_t>(b)];
+            const int nextOff = (b + 1 < numBands_)
+                                ? fbOffset_[static_cast<size_t>(b + 1)]
+                                : static_cast<int>(fbWeights_.size());
+            fbCount_.push_back(nextOff - off);
+        }
+        // A frame size too small to carry a single triangle leaves the flux
+        // at zero, which never fires: the detector goes quiet rather than
+        // reading out of an empty table.
+        if (numBands_ < 1) numBands_ = 0;
     }
 
     /**
@@ -1015,6 +1320,25 @@ private:
     std::vector<int> peakBin_;
     int numPeaks_ = 0;
 
+    // Onset detection: log-frequency filterbank tables, the two band frames
+    // the flux is taken between, and the flux history the firing threshold's
+    // running median is taken over. All sized in prepare().
+    std::vector<int> fbStart_, fbOffset_, fbCount_;
+    std::vector<T> fbWeights_;
+    int numBands_ = 0;
+    T odfScale_ = T(1);
+    std::vector<T> bandCur_, bandPrev_, bandMaxPrev_;
+    std::vector<double> fluxHist_;            ///< Trailing flux window (ring).
+    std::vector<double> fluxScratch_;         ///< Selection scratch for the median.
+    int fluxPos_ = 0;                         ///< Next history slot to overwrite.
+    int fluxFilled_ = 0;                      ///< Slots written since reset().
+
+    // Transient-locked hop.
+    bool lockEnabled_ = false;                ///< Owner asked for the locked hop.
+    int lockFrames_ = 0;                      ///< Lock length, ceil(fftSize / Rs).
+    int lockLeft_ = 0;                        ///< Locked frames still to come.
+    double debt_ = 0.0;                       ///< Input the lock has not consumed.
+
     // Harmonic/percussive split (allocated only when the owner asked for it).
     bool separationEnabled_ = false;
     int timeMedian_ = 0;                      ///< Median length along time, frames (odd).
@@ -1036,7 +1360,6 @@ private:
     double hopCarry_ = 0.0;
     int analysisHop_ = 512;
     int inputSinceHop_ = 0;
-    double onsetEnv_ = 0.0;
     bool firstFrame_ = true;
 
     // Audio-thread-private active copies of the published parameter set

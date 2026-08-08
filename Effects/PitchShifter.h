@@ -329,12 +329,25 @@ public:
                 }
             }
 
-            // Commit shared positions once per chunk.
+            // Commit shared positions once per chunk, running the SAME
+            // per-sample recurrence the output loops ran: a single
+            // frac + ratio * chunk product rounds differently for different
+            // chunk sizes, and chunk boundaries follow the host block size,
+            // so committing the product form made the output depend on how
+            // the host chopped the stream (~1 ulp per flip, but a bit-exact
+            // contract is a bit-exact contract).
             {
-                double rf = readPosFrac_ + ratio * chunk;
-                const auto adv = static_cast<int64_t>(rf);
-                readPosInt_ += adv;
-                readPosFrac_ = rf - static_cast<double>(adv);
+                int64_t rp = readPosInt_;
+                double  rf = readPosFrac_;
+                for (int k = 0; k < chunk; ++k)
+                {
+                    rf += ratio;
+                    const auto adv = static_cast<int64_t>(rf);
+                    rp += adv;
+                    rf -= static_cast<double>(adv);
+                }
+                readPosInt_  = rp;
+                readPosFrac_ = rf;
                 dryPos_ = (dryPos_ + chunk) & dryMask_;
             }
 

@@ -3743,3 +3743,85 @@ DSPARK_TEST(PhaseVocoderEngine_concurrent_publication_adopts_whole_sets)
     EXPECT_FALSE(pf.transientPreserve);
     EXPECT_FALSE(pf.formantPreserve);
 }
+
+// A streaming processor's output must depend on the audio, not on how the
+// host happened to chop it into blocks. The old processBlock committed the
+// shared fractional read position once per chunk as a single
+// frac + ratio * chunk product, while the per-sample output loop advanced
+// the same position iteratively; the two round differently whenever
+// ratio * chunk is inexact, and chunk boundaries follow the host block size,
+// so at st = +7 (ratio 2^(7/12)) a 512-sample chopping and a 64-sample
+// chopping of the same signal produced different bit streams (measured:
+// max delta 7.45e-9, i.e. ~1 float ulp at 0.5 FS, hashes acc88bdde0c56924
+// vs b50b6343b9975ca5). The commit now runs the same per-sample recurrence,
+// so any chopping of the same input yields the identical bit stream.
+DSPARK_TEST(PitchShifter_output_is_bit_identical_under_block_chopping)
+{
+    // Same scenario the characterisation harness measured red: 3 s stereo,
+    // 440 / 620.5 Hz sines plus deterministic LCG noise, st = +7.
+    const int total = 44100 * 3;
+    std::vector<std::vector<float>> sig(2, std::vector<float>(static_cast<size_t>(total)));
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        const double f = (ch == 0) ? 440.0 : 620.5;
+        const double w = 2.0 * 3.141592653589793 * f / 44100.0;
+        double phase = 0.0;
+        for (int n = 0; n < total; ++n)
+        {
+            sig[static_cast<size_t>(ch)][static_cast<size_t>(n)] =
+                static_cast<float>(0.5 * std::sin(phase));
+            phase += w;
+            if (phase > 2.0 * 3.141592653589793) phase -= 2.0 * 3.141592653589793;
+        }
+    }
+    uint64_t lcg = 0xC0FFEEu;
+    for (int ch = 0; ch < 2; ++ch)
+        for (int n = 0; n < total; ++n)
+        {
+            lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+            const float r = (static_cast<float>(static_cast<uint32_t>(lcg >> 33))
+                             / 4294967296.0f) * 2.0f - 0.5f;
+            sig[static_cast<size_t>(ch)][static_cast<size_t>(n)] += 0.05f * r;
+        }
+
+    auto runWith = [&](const std::vector<int>& chop) {
+        auto ps = std::make_unique<PitchShifter<float>>();
+        ps->setSemitones(7.0f);                    // irrational ratio 2^(7/12)
+        ps->prepare(spec(44100.0, 512, 2));
+        auto buf = sig;
+        int pos = 0;
+        size_t ci = 0;
+        while (pos < total)
+        {
+            const int blk = std::min(chop[ci % chop.size()], total - pos);
+            ++ci;
+            float* ch[2] = { buf[0].data() + pos, buf[1].data() + pos };
+            AudioBufferView<float> view(ch, 2, blk);
+            ps->processBlock(view);
+            pos += blk;
+        }
+        return buf;
+    };
+
+    const auto a = runWith({ 512 });
+    const auto b = runWith({ 64 });
+    const auto c = runWith({ 371, 64, 512, 1, 128 });
+    int diffAB = 0, diffAC = 0, firstAB = -1;
+    for (int ch = 0; ch < 2; ++ch)
+        for (int n = 0; n < total; ++n)
+        {
+            const auto sc = static_cast<size_t>(ch);
+            const auto sn = static_cast<size_t>(n);
+            if (a[sc][sn] != b[sc][sn])
+            {
+                if (firstAB < 0) firstAB = n;
+                ++diffAB;
+            }
+            if (a[sc][sn] != c[sc][sn]) ++diffAC;
+        }
+    if (firstAB >= 0)
+        std::cerr << "    first 512-vs-64 divergence at sample " << firstAB
+                  << " (" << diffAB << " samples differ)\n";
+    EXPECT_EQ(diffAB, 0);
+    EXPECT_EQ(diffAC, 0);
+}

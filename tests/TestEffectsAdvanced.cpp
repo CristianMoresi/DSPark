@@ -22,6 +22,7 @@
 #include "../Effects/Reverb.h"
 #include "../Effects/Panner.h"
 #include "../Effects/PitchShifter.h"
+#include "../Effects/TimeStretch.h"
 #include "../Effects/detail/PhaseVocoderEngine.h"
 #include "../Effects/GranularProcessor.h"
 #include "../Effects/SpectralDenoiser.h"
@@ -3861,4 +3862,352 @@ DSPARK_TEST(PitchShifter_peak_scan_stays_inside_the_spectrum)
             if (!std::isfinite(v)) ++nonFinite;
     }
     EXPECT_EQ(nonFinite, 0);
+}
+
+// ============================================================================
+// TimeStretch
+// ============================================================================
+
+namespace {
+
+/// The seven stretch targets the acceptance battery uses: +-5%, +-8% and the
+/// two tempo endpoints (120 BPM played at 110 and at 130).
+const double kStretchRatios[] = {
+    0.926, 0.95, 1.0, 1.05, 1.081, 120.0 / 110.0, 120.0 / 130.0
+};
+
+std::vector<float> tsBroadband(int n, uint64_t seed)
+{
+    std::vector<float> x(static_cast<size_t>(n));
+    uint64_t lcg = seed;
+    for (auto& v : x)
+    {
+        lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+        v = 0.4f * ((static_cast<float>(static_cast<uint32_t>(lcg >> 33)) / 4294967296.0f) - 0.5f);
+    }
+    return x;
+}
+
+/// Runs the streaming path over `in` with a repeating block-size pattern.
+std::vector<float> tsStream(TimeStretch<float>& ts, const std::vector<float>& in,
+                            const std::vector<int>& pattern)
+{
+    std::vector<float> out;
+    out.reserve(in.size());
+    std::vector<float> scratch(4096);
+    size_t pos = 0, p = 0;
+    while (pos < in.size())
+    {
+        const auto n = static_cast<int>(std::min<size_t>(
+            static_cast<size_t>(pattern[p % pattern.size()]), in.size() - pos));
+        for (int i = 0; i < n; ++i) scratch[static_cast<size_t>(i)] = in[pos + static_cast<size_t>(i)];
+        float* ch[1] = { scratch.data() };
+        AudioBufferView<float> view(ch, 1, n);
+        ts.processBlock(view);
+        for (int i = 0; i < n; ++i) out.push_back(scratch[static_cast<size_t>(i)]);
+        pos += static_cast<size_t>(n);
+        ++p;
+    }
+    return out;
+}
+
+}   // namespace
+
+// The offline path must deliver exactly round(inputLength * ratio) samples.
+// A stretch that is a hop or two out per call is a stretch that walks away
+// from the beat over the length of a track, so the length is pinned exactly
+// rather than approximately.
+DSPARK_TEST(TimeStretch_offline_length_is_exact_at_every_ratio)
+{
+    const int n = 48000;
+    AudioBuffer<float> in;
+    in.resize(1, n);
+    const auto src = tsBroadband(n, 0xA11CEu);
+    std::copy(src.begin(), src.end(), in.getChannel(0));
+
+    for (double r : kStretchRatios)
+    {
+        TimeStretch<float> ts;
+        ts.prepare(spec(48000.0, 512, 1));
+        ts.setTimeRatio(static_cast<float>(r));
+        AudioBuffer<float> out;
+        ts.process(in.toView(), out);
+        EXPECT_EQ(out.getNumSamples(), static_cast<int>(std::lround(n * r)));
+    }
+}
+
+// At a ratio of 1 the stretcher must be a delay and nothing else, on BOTH
+// paths. The phase vocoder is the whole signal path here, so any error in the
+// hop schedule, the window normalisation or the overlap-add shows up as a
+// residual against the delayed input.
+DSPARK_TEST(TimeStretch_unity_is_transparent_on_both_paths)
+{
+    const int n = 96000;
+    const auto src = tsBroadband(n, 0xBEEF01u);
+
+    // Streaming: compare against the input delayed by the reported latency.
+    {
+        TimeStretch<float> ts;
+        ts.prepare(spec(48000.0, 512, 1));
+        const int lat = ts.getLatency();
+        const auto got = tsStream(ts, src, { 512 });
+        double num = 0.0, den = 0.0;
+        for (size_t i = static_cast<size_t>(lat) + 24000; i < got.size(); ++i)
+        {
+            const double d = got[i] - src[i - static_cast<size_t>(lat)];
+            num += d * d;
+            den += static_cast<double>(src[i - static_cast<size_t>(lat)])
+                 * static_cast<double>(src[i - static_cast<size_t>(lat)]);
+        }
+        EXPECT_LT(10.0 * std::log10(num / den + 1e-300), -60.0);
+    }
+
+    // Offline: the delay is removed inside, so the output lines up directly.
+    {
+        TimeStretch<float> ts;
+        ts.prepare(spec(48000.0, 512, 1));
+        AudioBuffer<float> in, out;
+        in.resize(1, n);
+        std::copy(src.begin(), src.end(), in.getChannel(0));
+        ts.process(in.toView(), out);
+        EXPECT_EQ(out.getNumSamples(), n);
+        double num = 0.0, den = 0.0;
+        for (int i = 24000; i < n; ++i)
+        {
+            const double d = out.getChannel(0)[i] - src[static_cast<size_t>(i)];
+            num += d * d;
+            den += static_cast<double>(src[static_cast<size_t>(i)]) * src[static_cast<size_t>(i)];
+        }
+        EXPECT_LT(10.0 * std::log10(num / den + 1e-300), -60.0);
+    }
+}
+
+// The stream the caller hears must not depend on how the host cuts it into
+// blocks. Every decision inside the streaming path is taken at a position in
+// the stream, with input entering the queue in step with output leaving it;
+// if any of them were taken per block instead, this case separates the
+// patterns below.
+DSPARK_TEST(TimeStretch_output_is_bit_identical_under_block_chopping)
+{
+    const int n = 120000;
+    const auto src = tsBroadband(n, 0xC0FFEEu);
+    const std::vector<std::vector<int>> patterns = {
+        { 512 }, { 64 }, { 1, 7, 63, 512, 129, 4096 }, { 4096 }, { 333 }
+    };
+
+    for (double r : { 0.926, 1.0, 1.081 })
+    {
+        for (int fine = 0; fine <= 1; ++fine)
+        {
+            std::vector<float> reference;
+            for (size_t p = 0; p < patterns.size(); ++p)
+            {
+                TimeStretch<float> ts;
+                ts.prepare(spec(48000.0, 4096, 1));
+                ts.setTimeRatio(static_cast<float>(r));
+                ts.setEngine(fine ? TimeStretch<float>::Engine::Fine
+                                  : TimeStretch<float>::Engine::Fast);
+                const auto got = tsStream(ts, src, patterns[p]);
+                if (p == 0) { reference = got; continue; }
+                EXPECT_EQ(got.size(), reference.size());
+                int differing = 0;
+                for (size_t i = 0; i < got.size() && i < reference.size(); ++i)
+                    if (got[i] != reference[i]) ++differing;
+                EXPECT_EQ(differing, 0);
+            }
+        }
+    }
+}
+
+// The analysis hop carries a fractional accumulator so that the average
+// stretch is the requested ratio exactly. Without it the hop rounds the same
+// way every frame and the error accumulates; over half a minute that is
+// audible as a tempo that is simply wrong. Measured from where the clicks
+// land, not from the length of the buffer the class allocates.
+DSPARK_TEST(TimeStretch_realised_ratio_does_not_drift)
+{
+    const int n = 48000 * 30;
+    std::vector<size_t> onsets;
+    AudioBuffer<float> in;
+    in.resize(1, n);
+    for (int t = 4800; t < n - 4800; t += 24000)
+    {
+        onsets.push_back(static_cast<size_t>(t));
+        in.getChannel(0)[t] = 0.9f;
+    }
+
+    for (double r : { 0.926, 1.05, 120.0 / 110.0 })
+    {
+        TimeStretch<float> ts;
+        ts.prepare(spec(48000.0, 512, 1));
+        ts.setTimeRatio(static_cast<float>(r));
+        AudioBuffer<float> out;
+        ts.process(in.toView(), out);
+
+        double sxy = 0.0, sxx = 0.0;
+        int used = 0;
+        for (size_t o : onsets)
+        {
+            const auto expect = static_cast<long long>(std::llround(static_cast<double>(o) * r));
+            const long long lo = std::max(0LL, expect - 2000);
+            const long long hi = std::min<long long>(out.getNumSamples(), expect + 2000);
+            long long peak = -1;
+            float best = 0.0f;
+            for (long long i = lo; i < hi; ++i)
+                if (std::fabs(out.getChannel(0)[i]) > best)
+                { best = std::fabs(out.getChannel(0)[i]); peak = i; }
+            if (peak < 0 || best < 0.02f) continue;
+            sxy += static_cast<double>(o) * static_cast<double>(peak);
+            sxx += static_cast<double>(o) * static_cast<double>(o);
+            ++used;
+        }
+        EXPECT_GT(used, 25);
+        const double realised = sxy / sxx;
+        EXPECT_LT(std::fabs(realised - r) / r * 100.0, 0.1);
+    }
+}
+
+// The reported latency has to be the real one: a host that compensates by
+// getLatency() and hears a comb filter on a parallel path was told a number
+// that was never measured.
+DSPARK_TEST(TimeStretch_reported_latency_is_the_measured_one)
+{
+    for (int fftSize : { 512, 2048, 8192 })
+    {
+        const int n = 96000;
+        const auto src = tsBroadband(n, 0xD00Du);
+        TimeStretch<float> ts;
+        ts.prepare(spec(48000.0, 512, 1), fftSize);
+        EXPECT_EQ(ts.getLatency(), fftSize);
+        const auto got = tsStream(ts, src, { 512 });
+
+        double best = 1e300;
+        int bestLag = -1;
+        for (int lag = fftSize - 64; lag <= fftSize + 64; ++lag)
+        {
+            double num = 0.0, den = 0.0;
+            for (size_t i = static_cast<size_t>(lag) + 32000; i < got.size(); ++i)
+            {
+                const double d = got[i] - src[i - static_cast<size_t>(lag)];
+                num += d * d;
+                den += static_cast<double>(src[i - static_cast<size_t>(lag)])
+                     * src[i - static_cast<size_t>(lag)];
+            }
+            const double v = 10.0 * std::log10(num / den + 1e-300);
+            if (v < best) { best = v; bestLag = lag; }
+        }
+        EXPECT_EQ(bestLag, fftSize);
+        EXPECT_LT(best, -60.0);
+    }
+}
+
+// The Fine engine's median filters walk a history ring and a window that
+// straddles the edges of the spectrum. Small frames put Nyquist and DC inside
+// every window, which is where an off-by-one in either walk reads outside its
+// buffer; under the sanitize preset this case is the hard failure, on other
+// builds it asserts that nothing came out non-finite.
+DSPARK_TEST(TimeStretch_percussive_split_stays_inside_its_buffers)
+{
+    for (int fftSize : { 256, 512 })
+    {
+        TimeStretch<float> ts;
+        ts.prepare(spec(44100.0, 512, 2), fftSize);
+        ts.setEngine(TimeStretch<float>::Engine::Fine);
+        ts.setTimeRatio(1.081f);
+
+        const auto src = tsBroadband(512 * 200, 0xFEEDu);
+        std::vector<float> a(512), b(512);
+        int nonFinite = 0;
+        for (int blk = 0; blk < 200; ++blk)
+        {
+            for (int i = 0; i < 512; ++i)
+            {
+                a[static_cast<size_t>(i)] = src[static_cast<size_t>(blk * 512 + i)];
+                b[static_cast<size_t>(i)] = -src[static_cast<size_t>(blk * 512 + i)];
+            }
+            float* ch[2] = { a.data(), b.data() };
+            AudioBufferView<float> view(ch, 2, 512);
+            ts.processBlock(view);
+            for (int i = 0; i < 512; ++i)
+                if (!std::isfinite(a[static_cast<size_t>(i)])
+                    || !std::isfinite(b[static_cast<size_t>(i)])) ++nonFinite;
+        }
+        EXPECT_EQ(nonFinite, 0);
+    }
+}
+
+// Everything a caller can get wrong, and the guarantee that none of it
+// reaches the signal: an unprepared instance passes audio through, invalid
+// specs are refused, non-finite parameters are ignored, ratios clamp, and a
+// zero-length block is a no-op rather than a walk off the end.
+DSPARK_TEST(TimeStretch_invalid_inputs_are_ignored)
+{
+    TimeStretch<float> ts;
+    std::vector<float> buf(64, 0.25f);
+    float* ch[1] = { buf.data() };
+
+    // Unprepared: pass-through.
+    { AudioBufferView<float> v(ch, 1, 64); ts.processBlock(v); }
+    for (float s : buf) EXPECT_NEAR(s, 0.25f, 1e-9f);
+
+    ts.prepare(spec(0.0, 512, 1));            // invalid rate
+    { AudioBufferView<float> v(ch, 1, 64); ts.processBlock(v); }
+    for (float s : buf) EXPECT_NEAR(s, 0.25f, 1e-9f);
+
+    ts.prepare(spec(48000.0, 512, 1), 1000);  // fftSize not a power of two
+    { AudioBufferView<float> v(ch, 1, 64); ts.processBlock(v); }
+    for (float s : buf) EXPECT_NEAR(s, 0.25f, 1e-9f);
+
+    ts.prepare(spec(48000.0, 512, 1));
+    ts.setTimeRatio(1.25f);
+    ts.setTimeRatio(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_NEAR(ts.getTimeRatio(), 1.25f, 1e-6f);
+    ts.setTempoChangePercent(std::numeric_limits<float>::infinity());
+    EXPECT_NEAR(ts.getTimeRatio(), 1.25f, 1e-6f);
+
+    ts.setTimeRatio(50.0f);
+    EXPECT_NEAR(ts.getTimeRatio(), TimeStretch<float>::kMaxRatio, 1e-6f);
+    ts.setTimeRatio(-3.0f);
+    EXPECT_NEAR(ts.getTimeRatio(), TimeStretch<float>::kMinRatio, 1e-6f);
+
+    // -100% or worse is not a tempo; it clamps rather than dividing by zero.
+    ts.setTempoChangePercent(-100.0f);
+    EXPECT_NEAR(ts.getTimeRatio(), TimeStretch<float>::kMaxRatio, 1e-6f);
+    ts.setTempoChangePercent(10.0f);
+    EXPECT_NEAR(ts.getTimeRatio(), 1.0f / 1.1f, 1e-6f);
+
+    // Zero-length block, and a channel count above the prepared one.
+    { AudioBufferView<float> v(ch, 1, 0); ts.processBlock(v); }
+    EXPECT_NO_NAN(buf.data(), 64);
+
+    // Zero-length offline input.
+    AudioBuffer<float> empty, out;
+    empty.resize(1, 0);
+    ts.process(empty.toView(), out);
+    EXPECT_EQ(out.getNumSamples(), 0);
+}
+
+// State survives a round trip, and a blob from another processor is refused
+// rather than half-applied.
+DSPARK_TEST(TimeStretch_state_round_trips)
+{
+    TimeStretch<float> a, b;
+    a.prepare(spec(48000.0, 512, 2));
+    b.prepare(spec(48000.0, 512, 2));
+    a.setTimeRatio(1.081f);
+    a.setEngine(TimeStretch<float>::Engine::Fine);
+    a.setTransientPreserve(false);
+    a.setPhaseLock(false);
+
+    const auto blob = a.getState();
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(b.getTimeRatio(), 1.081f, 1e-4f);
+    EXPECT_TRUE(b.getEngine() == TimeStretch<float>::Engine::Fine);
+    EXPECT_FALSE(b.getTransientPreserve());
+    EXPECT_FALSE(b.getPhaseLock());
+
+    PitchShifter<float> foreign;
+    const auto other = foreign.getState();
+    EXPECT_FALSE(b.setState(other.data(), other.size()));
+    EXPECT_FALSE(b.setState(nullptr, 0));
 }

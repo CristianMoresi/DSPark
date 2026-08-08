@@ -57,9 +57,9 @@ lock-free on every supported target and outside the census.
 That is a run-time census of the word types. It is **not** a compile-time check
 on your component, and the build will not stop you using a word the census
 never saw. Where the word type is a template parameter the census cannot reach
-it at all. Five headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
-`Effects/AutoGain.h`, `Effects/Equalizer.h`, `Effects/DynamicEQ.h` and
-`Effects/detail/PhaseVocoderEngine.h` -- and
+it at all. Six headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
+`Effects/AutoGain.h`, `Effects/Equalizer.h`, `Effects/DynamicEQ.h`,
+`Effects/detail/PhaseVocoderEngine.h` and `Effects/TimeStretch.h` -- and
 most of the headers that declare such an atomic do not. A new component with an
 atomic word on the audio path should do the same:
 

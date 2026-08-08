@@ -1688,6 +1688,11 @@ std::vector<MetricsCase> buildMetricsCases()
       add("PitchShifter", "+4 st", "spectrum displaced by design",
           [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }, true); }
 
+    { auto p = std::make_shared<dspark::TimeStretch<float>>();
+      p->prepare(spec); p->setTimeRatio(1.081f);
+      add("TimeStretch", "ratio 1.081 (-8% tempo)", "stretched stream: block counts do not carry duration",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }, true); }
+
     { auto p = std::make_shared<dspark::GranularProcessor<float>>();
       p->prepare(spec); p->setDensity(30.0f);
       add("GranularProcessor", "density 30/s", "granular texture is the effect",

@@ -22,6 +22,7 @@
 #include "../Effects/Reverb.h"
 #include "../Effects/Panner.h"
 #include "../Effects/PitchShifter.h"
+#include "../Effects/detail/PhaseVocoderEngine.h"
 #include "../Effects/GranularProcessor.h"
 #include "../Effects/SpectralDenoiser.h"
 #include "../Core/FFT.h"
@@ -3642,4 +3643,103 @@ DSPARK_TEST(Reverb_getConvolver_reference_survives_republication)
     rv->setDecayScale(0.5f);
     rv->setStretch(1.5f);
     EXPECT_EQ(conv.getNumPartitions(), partsBefore);
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent publication pin for Effects/detail/PhaseVocoderEngine.h.
+//
+// The engine's ONE cross-thread handoff is publishParams(): a canonical
+// seqlock publish of the {targetSemitones, transientPreserve,
+// formantPreserve} set, adopted on the audio thread by a BOUNDED reader at
+// hop boundaries. This pin drives that handoff concurrently, which is what
+// makes the race reachable: a control thread publishes triples whose fields
+// are tied together by construction while the stream-owner thread pushes
+// audio and inspects the adopted set after every commit. A reader that mixed
+// words from two publications would produce a triple outside the published
+// table; the bounded reader must instead adopt whole sets only (give-ups keep
+// the previous whole set, so the invariant also covers the give-up path).
+// The subject is heap-allocated (valgrind DRD ignores stack subjects by
+// default) and both loops are bounded (valgrind's serializing scheduler can
+// starve a consumer behind an unbounded producer). The single-threaded tail
+// is the deterministic control: with no concurrency, the last publish must be
+// adopted at the next hop, exactly.
+DSPARK_TEST(PhaseVocoderEngine_concurrent_publication_adopts_whole_sets)
+{
+    using Engine = dspark::detail::PhaseVocoderEngine<float>;
+    auto eng = std::make_unique<Engine>();
+    EXPECT_TRUE(eng->prepare(48000.0, 1, 256, true));
+    eng->reset();
+
+    // Field-tying: semitones k-12 pairs with transient=(k&1) and
+    // formant=(k%3==0), all exact integer-valued doubles.
+    auto tripleOf = [](int i) {
+        const int k = i % 25;
+        Engine::Params p;
+        p.targetSemitones   = static_cast<double>(k) - 12.0;
+        p.transientPreserve = (k & 1) != 0;
+        p.formantPreserve   = (k % 3) == 0;
+        return p;
+    };
+
+    std::thread control([&] {
+        for (int i = 0; i < 20000; ++i)
+            eng->publishParams(tripleOf(i));
+    });
+
+    std::atomic<int> adoptionChanges{ 0 };
+    std::thread audio([&] {
+        std::array<float, 64> buf{};
+        buf.fill(0.1f);
+        double lastSt = 0.0;
+        int changes = 0;
+        for (int i = 0; i < 30000; ++i)
+        {
+            const int n = std::min<int>(64, eng->samplesToNextHop());
+            eng->pushInput(0, buf.data(), n);
+            eng->commitInput(n, 1);
+            const auto p = eng->activeParams();
+            const int k = static_cast<int>(p.targetSemitones + 12.0);
+            const bool isDefault = p.targetSemitones == 0.0
+                                && p.transientPreserve && !p.formantPreserve;
+            const bool inTable = k >= 0 && k <= 24
+                && p.targetSemitones == static_cast<double>(k) - 12.0
+                && p.transientPreserve == ((k & 1) != 0)
+                && p.formantPreserve == ((k % 3) == 0);
+            EXPECT_TRUE(isDefault || inTable);
+            if (p.targetSemitones != lastSt)
+            {
+                ++changes;
+                lastSt = p.targetSemitones;
+            }
+        }
+        adoptionChanges.store(changes);
+    });
+
+    control.join();
+    audio.join();
+
+    // Probe-input liveness: publications actually landed (the last published
+    // triple has st = +12, so at least one adoption must have been observed).
+    EXPECT_GT(adoptionChanges.load(), 0);
+
+    // Deterministic single-threaded control: the last publish is adopted at
+    // the next hop, as one whole set.
+    Engine::Params fin;
+    fin.targetSemitones = 5.0;
+    fin.transientPreserve = false;
+    fin.formantPreserve = false;
+    eng->publishParams(fin);
+    std::array<float, 256> tail{};
+    int fed = 0;
+    while (fed < 512)
+    {
+        const int n = std::min<int>(256, eng->samplesToNextHop());
+        eng->pushInput(0, tail.data(), n);
+        eng->commitInput(n, 1);
+        fed += n;
+    }
+    const auto pf = eng->activeParams();
+    EXPECT_EQ(pf.targetSemitones, 5.0);
+    EXPECT_FALSE(pf.transientPreserve);
+    EXPECT_FALSE(pf.formantPreserve);
 }

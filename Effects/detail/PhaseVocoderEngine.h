@@ -511,7 +511,12 @@ private:
         if (maxMag > T(1e-9))
         {
             const T floorMag = maxMag * T(1e-4);   // -80 dB relative floor
-            const int last = numBins_ - 2;
+            // Candidates stop at numBins-3 so the +-2-bin neighbour tests
+            // stay inside mag_ (the old bound of numBins-2 read mag_[k+2]
+            // one float past the end whenever the bin below Nyquist was a
+            // candidate above the floor - broadband material at small frame
+            // sizes reached it routinely).
+            const int last = numBins_ - 3;
             for (int k = 2; k <= last; ++k)
             {
                 const T m = mag_[static_cast<size_t>(k)];

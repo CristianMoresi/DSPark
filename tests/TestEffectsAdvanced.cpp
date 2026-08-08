@@ -3825,3 +3825,40 @@ DSPARK_TEST(PitchShifter_output_is_bit_identical_under_block_chopping)
     EXPECT_EQ(diffAB, 0);
     EXPECT_EQ(diffAC, 0);
 }
+
+// The peak scan of the vocoder engine (inherited verbatim from the old
+// PitchShifter body) walked candidate bins up to numBins-2 and tested
+// mag[k+2], reading ONE FLOAT PAST THE END of the magnitude array whenever
+// the bin below Nyquist was a local-maximum candidate above the -80 dB
+// relative floor -- which broadband material reaches routinely at small
+// frame sizes. AddressSanitizer reports it as a heap-buffer-overflow READ at
+// the mag[k+2] locator (red run stored); on non-instrumented builds the read
+// is silent UB whose value can decide a peak. The scan is now bounded to
+// numBins-3 so every neighbour access stays inside the spectrum. On normal
+// builds this case asserts finiteness; under the sanitize preset it is a
+// hard failure on any regression.
+DSPARK_TEST(PitchShifter_peak_scan_stays_inside_the_spectrum)
+{
+    auto ps = std::make_unique<PitchShifter<float>>();
+    ps->setSemitones(3.0f);
+    ps->prepare(spec(44100.0, 512, 1), 256);   // small frame: Nyquist-1 is live
+
+    uint64_t lcg = 0x5EEDBEEFu;
+    std::vector<float> buf(512);
+    int nonFinite = 0;
+    for (int b = 0; b < 200; ++b)              // ~400 hops of broadband noise
+    {
+        for (auto& v : buf)
+        {
+            lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+            v = (static_cast<float>(static_cast<uint32_t>(lcg >> 33))
+                 / 4294967296.0f) - 0.5f;
+        }
+        float* ch[1] = { buf.data() };
+        AudioBufferView<float> view(ch, 1, 512);
+        ps->processBlock(view);
+        for (float v : buf)
+            if (!std::isfinite(v)) ++nonFinite;
+    }
+    EXPECT_EQ(nonFinite, 0);
+}

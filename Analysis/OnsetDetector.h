@@ -28,9 +28,17 @@
  * is actually delivered: f_qt = (fs/fftSize) / (2^(1/24) - 1), about 34 times
  * the bin width. A CONSTANT sample count therefore moves the detector's usable
  * low register with the sample rate (measured: 800 Hz at 48 kHz/2048, 3199 Hz
- * at 192 kHz/2048, and soft bass onsets around E1..B2 fall from 8/8 recalled at
- * 48 kHz to 5/8 at 96 kHz). The default frame is therefore AUTOMATIC and holds
- * the span constant instead; see prepare().
+ * at 192 kHz/2048, and soft bass onsets around E1..B2 with 10 ms attacks fall
+ * from 7/8 recalled at 48 kHz to 5/8 at 96 kHz at a fixed 2048). The default
+ * frame is therefore AUTOMATIC and holds the span constant instead; see
+ * prepare(). The ODF magnitude scale is frame-invariant as well (band
+ * magnitudes are scaled by 2048/fftSize before the log compression), so the
+ * peak-pick delta selects the same sensitivity at every rate -- neither the
+ * resolution nor the threshold's meaning moves with the session rate. Recall
+ * on that corpus under the defaults is 7 of 8 at EVERY rate: one soft F#1
+ * stays below the default delta everywhere. That is the detector's soft-bass
+ * sensitivity limit, the same at all rates -- raise it with setThreshold()
+ * (smaller delta), at the usual false-positive cost.
  *
  * Latency (ONE definition). Frame N (Hann; automatic by default), hop =
  * round(fs/200) (221 samples at 44.1 kHz, 240 at 48 kHz; ~5 ms). The detector
@@ -158,6 +166,35 @@ public:
      * general one. Explicit frames stay available for callers who want the
      * shorter one: at 192 kHz an explicit 2048 buys ~10.7 ms of frame span
      * (L ~= 15.7 ms) at the cost of the register above.
+     *
+     * ODF SCALE. The SuperFlux band magnitudes are scaled by 2048/fftSize
+     * before the log10(x + 1) compression, so the onset-strength scale --
+     * and with it the meaning of setThreshold()'s delta -- is the same at
+     * every frame length, and therefore at every rate under the automatic
+     * frame. Without this, |X| grows linearly with the frame and quiet-onset
+     * sensitivity roughly doubles per rate-family doubling against a fixed
+     * delta. The factor is exactly 1 at the 2048-sample reference where the
+     * default delta was tuned, so 44.1/48 kHz default behaviour (and any
+     * explicit-2048 caller at any rate) is bit-identical to previous
+     * releases. Explicit frames OTHER than 2048 now read the ODF on the
+     * reference scale too -- an intentional behaviour change: one delta means
+     * one sensitivity, at every frame length. Under adaptive whitening the
+     * per-bin peak division already removes the growth, so the whitened path
+     * is not scaled again.
+     *
+     * CPU AND MEMORY. The hop is TIME-fixed (round(fs/200), ~200 frames per
+     * second at every rate) while the automatic frame follows the rate, so
+     * CPU per second of audio is NOT rate-invariant under the automatic
+     * frame: measured ~2x at 88.2/96 kHz and ~3.8x at 176.4/192 kHz versus
+     * the old fixed-2048 default at the same rate (50.4 / 95.6 / 189.6 ms of
+     * CPU per 10 s of audio at 48/96/192 kHz automatic, vs 50.4 ms at
+     * 192 kHz with an explicit 2048; g++ -O2, one core -- absolute numbers
+     * vary by machine, the growth tracks the frame size). prepare()-time
+     * heap grows the same way: ~125 KB at 44.1/48 kHz, ~223 KB at
+     * 88.2/96 kHz, ~420 KB at 176.4/192 kHz (float instantiation). The audio
+     * path stays allocation-free at every size. Budget from these figures;
+     * an explicit 2048 restores the old cost at the cost of the register
+     * above.
      */
     void prepare(const AudioSpec& spec, int fftSize = 0, int hop = 0)
     {
@@ -205,6 +242,11 @@ public:
         // onsets localise slightly late but stay within the acceptance window).
         localizationOffset_ = static_cast<int>(std::lround(kLocalizationLead
                                                            * static_cast<double>(fftSize_)));
+        // ODF scale invariance: cancel the linear growth of |X| with the
+        // frame length so the peak-pick delta means the same thing at every
+        // rate. Exactly 1.0 at the 2048-sample reference; an exact power of
+        // two at every other frame (fftSize is a power of two).
+        odfScale_ = static_cast<T>(kOdfRefFrame / static_cast<double>(fftSize_));
         // Warm-up: suppress onsets until the analysis ring is fully primed so
         // the silence->first-input ramp cannot fire a spurious onset.
         primeFrames_ = fftSize_ / hop_ + 2;
@@ -272,6 +314,9 @@ public:
     /**
      * @brief Sets the adaptive peak-pick delta (margin above the moving mean).
      * Non-finite values are ignored; negative values are clamped to 0.
+     * The delta is read against the frame-invariant ODF scale (see
+     * prepare()), so one value selects the same sensitivity at every rate
+     * and frame length.
      */
     void setThreshold(T deltaAboveMean) noexcept
     {
@@ -355,7 +400,8 @@ public:
         return onsetLatched_.load(std::memory_order_relaxed);
     }
 
-    /** @brief Onset strength (ODF value) of the most recent reported onset. */
+    /** @brief Onset strength (ODF value, frame-invariant scale; see
+     *         prepare()) of the most recent reported onset. */
     [[nodiscard]] T getOnsetStrength() const noexcept
     {
         return onsetStrength_.load(std::memory_order_relaxed);
@@ -483,6 +529,19 @@ private:
     static constexpr int kAutoMaxFft = 16384;
     static constexpr int64_t kBig = int64_t(1) << 60;
     static constexpr T kDefaultDelta = T(0.03);
+    /// ODF magnitude reference frame. Un-normalised |X| grows linearly with
+    /// the frame length, so the SuperFlux filterbank accumulation is scaled
+    /// by kOdfRefFrame / fftSize before the log10(x + 1) compression: the
+    /// growth cancels and a given peak-pick delta selects the same
+    /// quiet-onset sensitivity at every frame length (and therefore at every
+    /// rate under the automatic frame). 2048 is the frame kDefaultDelta was
+    /// tuned at, so the factor is exactly 1 at the 44.1/48 kHz reference --
+    /// and because fftSize is always a power of two the factor is an exact
+    /// power of two everywhere: the scaling introduces no rounding at all.
+    /// The compensation must sit on the magnitude (inside the log), not on
+    /// the delta: log10(x + 1) is not affine, so no post-log delta rescale
+    /// could keep the reference behaviour unchanged.
+    static constexpr double kOdfRefFrame = 2048.0;
     static constexpr double kLocalizationLead = 0.34; ///< Flux-to-energy lead (fraction of N).
     static constexpr double kFMin = 27.5;      ///< Filterbank low edge (Hz).
     static constexpr double kFMaxHz = 16000.0; ///< Filterbank high edge (Hz).
@@ -589,7 +648,13 @@ private:
             {
                 // Log-filtered magnitude bands, flux to the mu-th previous
                 // frame after a frequency maximum filter on the reference.
-                filterLogBands(bandCur_);
+                // The frame-invariant magnitude scale (kOdfRefFrame/fftSize)
+                // applies to the raw spectrum only: adaptive whitening
+                // already divides each bin by its running peak, which
+                // carries the same linear-in-N growth, so the whitened
+                // spectrum is dimensionless and scaling it again would
+                // INVERT the rate dependence instead of removing it.
+                filterLogBands(bandCur_, whiten ? T(1) : odfScale_);
                 for (int b = 0; b < numBands_; ++b)
                 {
                     const T d = bandCur_[static_cast<size_t>(b)]
@@ -759,8 +824,13 @@ private:
         if (numBands_ < 1) numBands_ = 1; // degenerate guard (tiny fftSize)
     }
 
-    /** @brief Applies the filterbank to mag_ and takes log10(x+1) per band. */
-    void filterLogBands(std::vector<T>& out) noexcept
+    /** @brief Applies the filterbank to mag_ and takes log10(scale*x + 1)
+     *  per band. @p scale is the frame-invariance factor kOdfRefFrame /
+     *  fftSize (see the constant), or exactly 1 under adaptive whitening;
+     *  scaling the accumulated band is identical to scaling the spectrum
+     *  before the filterbank (the filterbank is linear) and touches the
+     *  other ODF families not at all. */
+    void filterLogBands(std::vector<T>& out, T scale) noexcept
     {
         for (int b = 0; b < numBands_ && b < static_cast<int>(fbStart_.size()); ++b)
         {
@@ -775,7 +845,7 @@ private:
                     acc += mag_[static_cast<size_t>(k)]
                          * fbWeights_[static_cast<size_t>(off + i)];
             }
-            out[static_cast<size_t>(b)] = std::log10(acc + T(1));
+            out[static_cast<size_t>(b)] = std::log10(acc * scale + T(1));
         }
     }
 
@@ -838,6 +908,7 @@ private:
     int muFrames_ = 1;
     int localizationOffset_ = 0;
     int primeFrames_ = 12;
+    T odfScale_ = T(1); ///< kOdfRefFrame / fftSize (ODF frame invariance).
 
     std::unique_ptr<FFTReal<T>> fft_; // doubles as the "prepared" gate
 

@@ -507,30 +507,135 @@ DSPARK_TEST(Onset_default_frame_holds_the_span_across_rates)
 }
 
 // Correctness anchor at a non-48k rate: soft BASS note onsets, the material
-// the low-register loss actually costs. Pre-fix at 96 kHz this recalls 5 of 8
-// (measured, identical on g++ and clang++); with the span held it recalls 8.
-DSPARK_TEST(Onset_soft_bass_onsets_survive_96k)
+// the low-register loss actually costs.
+//
+// SUPERSEDES Onset_soft_bass_onsets_survive_96k, which asserted 8 of 8
+// recalled at 96 kHz. That 8th detection was an artifact of a second defect:
+// the un-normalised ODF magnitude grew with the analysis frame, so 96 kHz ran
+// at roughly double the reference sensitivity and recalled a note the 44.1/48
+// kHz reference never did. With the ODF scale now frame-invariant, 96 kHz
+// reads exactly like 48 kHz, and the honest recall of this corpus is 7 of 8
+// AT EVERY RATE: the soft F#1 at t = 1.0 s sits below the default delta
+// everywhere, and always did at the shipped 44.1/48 kHz reference. A bare
+// absolute recall at one rate is what let the artifact in, so the successor
+// asserts INVARIANCE on an equal-fs/N pair (48 kHz/2048 and 96 kHz/4096, both
+// 23.44 Hz bins, identical 135-band filterbank): identical event lists in
+// TIME, plus a recall floor and zero false positives so a dead detector
+// cannot satisfy the equality. Still red on the pre-fix tree (fixed 2048 at
+// 96 kHz recalls 5 of 8, so the floor fails); also red on the un-normalised
+// tree (96 kHz reports 8 events to the reference's 7, so equality fails).
+DSPARK_TEST(Onset_soft_bass_96k_reads_like_the_48k_reference)
 {
-    const double fs = 96000.0;
-    const int n = static_cast<int>(fs * 6.0);
-    std::vector<float> sig(static_cast<size_t>(n), 0.0f);
-    std::vector<int64_t> truth;
     auto midiHz = [](int m) { return 440.0 * std::exp2((m - 69) / 12.0); };
-    for (int k = 0; k < 8; ++k)   // E1 .. B2, all under the quarter-tone floor
+    struct Run { int events; int tp, fn, fp; std::vector<double> timesSec; };
+    auto runAt = [&](double fs) {
+        const int n = static_cast<int>(fs * 6.0);
+        std::vector<float> sig(static_cast<size_t>(n), 0.0f);
+        std::vector<int64_t> truth;
+        for (int k = 0; k < 8; ++k)   // E1 .. B2, under the quarter-tone floor
+        {
+            const int64_t at = static_cast<int64_t>(fs * (0.4 + 0.6 * k));
+            addSoftNote(sig, at, fs, midiHz(28 + 2 * k), 10.0, 400.0, 0.6f);
+            truth.push_back(at);
+        }
+        OnsetDetector<float> od;
+        od.prepare(AudioSpec{ fs, 512, 1 });      // automatic frame
+        float* ptr = sig.data();
+        AudioBufferView<float> view(&ptr, 1, n);
+        auto det = od.detectOffline(view);
+        PRF s = scoreOnsets(det, truth, fs, 50.0);
+        Run r{ static_cast<int>(det.size()), s.tp, s.fn, s.fp, {} };
+        for (int64_t d : det) r.timesSec.push_back(static_cast<double>(d) / fs);
+        std::cout << "  [rate-inv] fs=" << fs << " soft bass: events="
+                  << r.events << " tp=" << s.tp << " fn=" << s.fn
+                  << " fp=" << s.fp << "\n";
+        return r;
+    };
+    const Run ref = runAt(48000.0);
+    const Run hi  = runAt(96000.0);
+
+    // Quality floor at the reference meaning of the default delta: at least
+    // 7 of 8 recalled, zero false positives, at BOTH rates.
+    EXPECT_GT(ref.tp, 6);
+    EXPECT_GT(hi.tp, 6);
+    EXPECT_EQ(ref.fp, 0);
+    EXPECT_EQ(hi.fp, 0);
+
+    // Invariance: the 96 kHz session reports the same events as the 48 kHz
+    // reference -- same count, same score, same positions in TIME (one hop,
+    // 5 ms, of localisation slack; the hop grids differ by rounding).
+    EXPECT_EQ(hi.events, ref.events);
+    EXPECT_EQ(hi.tp, ref.tp);
+    EXPECT_EQ(hi.fn, ref.fn);
+    if (hi.events == ref.events)
+        for (int i = 0; i < ref.events; ++i)
+            EXPECT_LT(std::abs(hi.timesSec[static_cast<size_t>(i)]
+                               - ref.timesSec[static_cast<size_t>(i)]), 0.005);
+}
+
+// ===========================================================================
+// The ODF magnitude SCALE is frame-invariant, not just the filterbank.
+//
+// |X| grows linearly with the analysis frame, so an un-normalised spectrum
+// against a fixed peak-pick delta means a quiet-onset sensitivity that
+// roughly doubles per rate-family doubling even when the filterbank is
+// identical (measured: the same soft-bass corpus read 7 events at
+// 44.1/48 kHz, 8 at 88.2/96 kHz and 9 at 176.4/192 kHz, the 9th being a
+// 10 ms note-OFF release ramp reported as an onset only at the top family).
+// The band magnitudes are now scaled by 2048/fftSize before the log
+// compression, so the same music with default settings must produce the
+// SAME events at every rate.
+//
+// Within a rate family the auto ladder holds fs/N exactly (44.1 -> 2048,
+// 88.2 -> 4096, 176.4 -> 8192 build the identical 138-band filterbank), so
+// the requirement is EQUALITY of the detection results, asserted as
+// equality rather than as per-rate magic counts; a quality floor (>= 7 of 8
+// recalled, zero false positives) keeps the equality from being satisfiable
+// by a dead detector. All assertions are integer event counts -- nothing
+// here can be inverted by instrumentation.
+//
+// RED on the pre-normalisation tree: event counts 7 vs 8 vs 9 across the
+// families, with one false positive at 176.4/192 kHz.
+// ===========================================================================
+DSPARK_TEST(Onset_odf_scale_is_rate_invariant_at_equal_span)
+{
+    auto midiHz = [](int m) { return 440.0 * std::exp2((m - 69) / 12.0); };
+    const double families[2][3] = { { 44100.0, 88200.0, 176400.0 },
+                                    { 48000.0, 96000.0, 192000.0 } };
+    for (const auto& fam : families)
     {
-        const int64_t at = static_cast<int64_t>(fs * (0.4 + 0.6 * k));
-        addSoftNote(sig, at, fs, midiHz(28 + 2 * k), 10.0, 400.0, 0.6f);
-        truth.push_back(at);
+        int firstEvents = -1, firstTp = -1;
+        for (double fs : fam)
+        {
+            const int n = static_cast<int>(fs * 6.0);
+            std::vector<float> sig(static_cast<size_t>(n), 0.0f);
+            std::vector<int64_t> truth;
+            for (int k = 0; k < 8; ++k)   // E1 .. B2, soft attacks
+            {
+                const int64_t at = static_cast<int64_t>(fs * (0.4 + 0.6 * k));
+                addSoftNote(sig, at, fs, midiHz(28 + 2 * k), 10.0, 400.0, 0.6f);
+                truth.push_back(at);
+            }
+            OnsetDetector<float> od;
+            od.prepare(AudioSpec{ fs, 512, 1 });          // automatic frame
+            float* ptr = sig.data();
+            AudioBufferView<float> view(&ptr, 1, n);
+            auto det = od.detectOffline(view);
+            PRF s = scoreOnsets(det, truth, fs, 50.0);
+            std::cout << "  [odf-inv] fs=" << fs << " N=" << od.getFftSize()
+                      << " bands=" << od.getNumBands() << " events=" << det.size()
+                      << " tp=" << s.tp << " fn=" << s.fn << " fp=" << s.fp << "\n";
+
+            // Zero false positives at every rate: the note-OFF release ramp
+            // must not be reported as an onset at ANY session rate.
+            EXPECT_EQ(s.fp, 0);
+            // Sensitivity floor at the reference meaning of the delta.
+            EXPECT_GT(s.tp, 6);
+
+            if (firstEvents < 0) { firstEvents = static_cast<int>(det.size()); firstTp = s.tp; }
+            // Equal fs/N, equal bank, equal ODF scale => equal result.
+            EXPECT_EQ(static_cast<int>(det.size()), firstEvents);
+            EXPECT_EQ(s.tp, firstTp);
+        }
     }
-    OnsetDetector<float> od;
-    od.prepare(AudioSpec{ fs, 512, 1 });          // automatic frame
-    float* ptr = sig.data();
-    AudioBufferView<float> view(&ptr, 1, n);
-    auto det = od.detectOffline(view);
-    PRF s = scoreOnsets(det, truth, fs, 50.0);
-    std::cout << "  [rate-inv] 96 kHz soft bass: N=" << od.getFftSize()
-              << " bands=" << od.getNumBands() << " tp=" << s.tp
-              << " fn=" << s.fn << " fp=" << s.fp << "\n";
-    EXPECT_EQ(s.tp, 8);
-    EXPECT_EQ(s.fn, 0);
 }

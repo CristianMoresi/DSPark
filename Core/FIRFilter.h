@@ -305,13 +305,24 @@ private:
  * allocation- and lock-free. The audio thread copies the published set once per
  * update into its PRIVATE, non-atomic activeCoeffs_ buffer, so the per-sample
  * hot path (simd::dotProduct over activeCoeffs_) runs on plain scalars. Cost,
- * measured against the pre-atomic code: the PER-SAMPLE LOOPS of
- * processBlock<float/double> are instruction-identical (objdump: 207 == 207
+ * in two dated steps, because the code has changed since the first number.
+ * 2026-07, when the staging buffer became atomic (measured against the
+ * pre-atomic code, g++ 13.3 -O2): the per-sample loops of
+ * processBlock<float/double> were instruction-identical (objdump: 207 == 207
  * and 200 == 200 insns; only the once-per-update pull copy changed), while
- * whole-function processSample codegen differs by +3 prologue instructions
+ * whole-function processSample codegen differed by +3 prologue instructions
  * from the reshaped cold pull path and measured FASTER (7.06 -> 6.88
- * ns/sample, g++ -O2); block-level bench deltas are within run-to-run noise
+ * ns/sample); block-level bench deltas were within run-to-run noise
  * (5.78/5.89/5.95 vs 5.87/5.98/5.79 ns/frame medians, 63-tap mono LP).
+ * 2026-08, when the read became BOUNDED (the "Real-time bound" paragraph
+ * below): the outer per-sample loop of processBlock is no longer
+ * instruction-identical to the pre-atomic code -- it went 79 -> 78 insns
+ * (float) and 73 -> 72 (double) with one loop-carried comparison spilled to
+ * the stack; the three inner dot-product kernels are unchanged (11/8/6
+ * insns), and wall clock measured neutral, within run-to-run noise: +0.0%
+ * (g++ 13.3) / -1.4% (clang++ 18.1.3) at -O2, and +0.3% / -1.2% at -O3,
+ * on a 63-tap FIRFilter<float> processing 2-channel 512-sample blocks
+ * (medians of 11 pinned rounds against the pre-bound code).
  *
  * Real-time bound: the audio thread's read is BOUNDED to kSeqlockMaxAttempts
  * validation attempts. If none validates it adopts nothing, keeps the

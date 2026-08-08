@@ -379,6 +379,7 @@
  * | `RingModulator<T>`       | Effects/RingModulator.h | Ring modulation (signal x carrier) with mix control               |
  * | `FrequencyShifter<T>`    | Effects/FrequencyShifter.h | Constant-Hz frequency shift via Hilbert transform              |
  * | `PitchShifter<T>`        | Effects/PitchShifter.h | Phase-vocoder pitch shift +/-12 st (identity phase locking)        |
+ * | `TimeStretch<T>`         | Effects/TimeStretch.h | Phase-vocoder time stretch 0.5x-2x, pitch unchanged (tempo change) |
  * | `TapeMachine<T>`         | Effects/TapeMachine.h | Physical tape: JA hysteresis, NAB/CCIR EQ, losses, wow/flutter    |
  * | `TubePreamp<T>`          | Effects/TubePreamp.h  | Koren 12AX7 stages, WDF FMV tone stack (R-type), supply sag       |
  * | `TransformerModel<T>`    | Effects/TransformerModel.h | Audio transformer: flux-domain JA hysteresis, LF bloom, HF bell |
@@ -716,6 +717,7 @@
 #include "Effects/MultibandCompressor.h"
 #include "Effects/Clipper.h"
 #include "Effects/PitchShifter.h"
+#include "Effects/TimeStretch.h"
 #include "Effects/TapeMachine.h"
 #include "Effects/TubePreamp.h"
 #include "Effects/TransformerModel.h"

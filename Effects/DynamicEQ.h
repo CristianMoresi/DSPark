@@ -35,6 +35,11 @@
  *   keep, and it is not real-time.
  * - getBandGainDb() is an atomic metering read; getLatency() is safe from any
  *   thread once prepared.
+ * - One-master designation (Core/Biquad.h, setCoeffsNow()): the embedded
+ *   bandFilter_/bandDetector_ Biquads are AUDIO-MODULATED -- the audio thread
+ *   writes their coefficients directly via Biquad::setCoeffsNow(), and nothing
+ *   ever calls Biquad::setCoeffs() on them. Control parameters arrive only
+ *   through this class's own StagedBand seqlock, adopted at processCore entry.
  * - Lookahead changes take effect immediately and may click (configure
  *   before playback).
  *
@@ -484,6 +489,9 @@ private:
                 // Bells use the precomputed freq/Q trig, so a refresh costs
                 // one pow() instead of a full sin/cos/pow redesign; shelves
                 // run their full design, which at 1/16th rate stays negligible.
+                // Stream-owner direct writes (setCoeffsNow): these values are
+                // computed HERE, on the audio thread, for this thread's own
+                // use, so they never touch the staged cross-thread channel.
                 if ((i & 15) == 0)
                 {
                     if (std::abs(currentGain) > T(0.01))
@@ -494,19 +502,19 @@ private:
                             updateDynamicPeakCoeffs(b, currentGain);
                             break;
                         case BandShape::LowShelf:
-                            bandFilter_[b].setCoeffs(BiquadCoeffs::makeLowShelf(
+                            bandFilter_[b].setCoeffsNow(BiquadCoeffs::makeLowShelf(
                                 currentFs, static_cast<double>(states_[b].cfg.frequency),
                                 static_cast<double>(currentGain)));
                             break;
                         case BandShape::HighShelf:
-                            bandFilter_[b].setCoeffs(BiquadCoeffs::makeHighShelf(
+                            bandFilter_[b].setCoeffsNow(BiquadCoeffs::makeHighShelf(
                                 currentFs, static_cast<double>(states_[b].cfg.frequency),
                                 static_cast<double>(currentGain)));
                             break;
                         }
                     }
                     else
-                        bandFilter_[b].setCoeffs(BiquadCoeffs{}); // Bypass
+                        bandFilter_[b].setCoeffsNow(BiquadCoeffs{}); // Bypass
                 }
 
                 if ((i & 63) == 0) // Sub-sample metering update
@@ -588,16 +596,20 @@ private:
 
         // Detector listens where the gain filter acts: bandpass for bells,
         // the corresponding half of the spectrum for shelves.
+        // Direct writes (setCoeffsNow): this runs on the audio thread, which
+        // owns these Biquads (one-master rule, see the threading block), so
+        // even this cold reconfiguration must not self-publish through the
+        // staged channel.
         switch (cfg.shape)
         {
         case BandShape::Bell:
-            bandDetector_[b].setCoeffs(BiquadCoeffs::makeBandPass(fs, cfg.frequency, cfg.q));
+            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeBandPass(fs, cfg.frequency, cfg.q));
             break;
         case BandShape::LowShelf:
-            bandDetector_[b].setCoeffs(BiquadCoeffs::makeLowPass(fs, cfg.frequency, T(0.707)));
+            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeLowPass(fs, cfg.frequency, T(0.707)));
             break;
         case BandShape::HighShelf:
-            bandDetector_[b].setCoeffs(BiquadCoeffs::makeHighPass(fs, cfg.frequency, T(0.707)));
+            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeHighPass(fs, cfg.frequency, T(0.707)));
             break;
         }
 
@@ -634,7 +646,9 @@ private:
         c.b2 = (1.0 - alpha * A) * a0Inv;
         c.a1 = (-2.0 * cosw)     * a0Inv;
         c.a2 = (1.0 - alpha / A) * a0Inv;
-        bandFilter_[b].setCoeffs(c);
+        // Stream-owner direct write: computed on the audio thread for its
+        // own use, so it bypasses the staged cross-thread channel.
+        bandFilter_[b].setCoeffsNow(c);
     }
 
     void updateLookahead() noexcept

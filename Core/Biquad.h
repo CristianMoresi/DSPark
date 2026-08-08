@@ -629,11 +629,18 @@ public:
     Biquad& operator=(const Biquad&) = delete;
 
     /**
-     * @brief Sets the filter coefficients asynchronously.
+     * @brief Sets the filter coefficients asynchronously (control thread).
      *
      * Safely updates coefficients without locking. The audio thread will
      * pick up the new coefficients safely on the next process call to avoid
      * torn reads and filter blow-ups.
+     *
+     * This is the CROSS-THREAD channel: it exists to move a coefficient set
+     * from the control thread to the audio thread. Coefficients computed on
+     * the processing thread for its own use (self-modulation) belong in
+     * setCoeffsNow() instead -- routing them through here pays a full
+     * publish plus a gated re-adoption of the same thread's own write,
+     * inside the hot path (see docs/threading.md, the origin rule).
      *
      * @param c New coefficient set.
      */
@@ -663,6 +670,40 @@ public:
         coeffsSeq_.fetch_add(1, std::memory_order_release);   // -> even
         coeffsDirty_.store(true, std::memory_order_release);
     }
+
+    /**
+     * @brief Stream-owner direct set: makes @p c the active set immediately.
+     *
+     * Writes the audio-thread-private active coefficient set with no
+     * staging, no seqlock and no dirty flag. This is the setter for
+     * coefficients computed ON the processing thread for its own use --
+     * self-modulation such as a dynamic EQ's gain refresh or a smoothed
+     * filter glide -- and for single-threaded / offline use. The staged
+     * channel (setCoeffs()) exists to cross threads; a stream owner must
+     * never self-publish through it (docs/threading.md, the origin rule).
+     *
+     * Caller: the stream owner only -- the thread that calls
+     * processSample() / processBlock() -- or any thread in single-threaded /
+     * offline use; the same rule as reset(). NOT for control-thread updates
+     * concurrent with processing: those use setCoeffs().
+     *
+     * Memory model: composes with the SPSC contract unchanged. The active
+     * set keeps exactly one writing thread (the audio thread, whether via
+     * staged adoption or via this setter) and the staging words keep exactly
+     * one writing thread (the control thread), so this method adds no
+     * cross-thread pair.
+     *
+     * Dual-master semantics: on an instance that receives BOTH direct sets
+     * and cross-thread publications, a pending publication overwrites a
+     * direct set at the next adoption gate -- the audio thread's last write
+     * wins, and an armed dirty flag is a later write. A class embedding
+     * Biquads must therefore designate ONE master per instance --
+     * control-published (setCoeffs()) or audio-modulated (setCoeffsNow()) --
+     * and say so in its threading block.
+     *
+     * @param c New coefficient set, active from the next processed sample.
+     */
+    void setCoeffsNow(const BiquadCoeffs& c) noexcept { activeCoeffs_ = c; }
 
     /**
      * @brief Promotes any pending staged coefficients to active.
@@ -830,13 +871,20 @@ private:
     /**
      * @brief Adopts the staged set, or defers (a bounded seqlock read).
      *
-     * Kept OUT of line on purpose. processSample()/processSampleCore() reach
-     * this only on the rare call where a publication is pending, but if the
-     * body is inlined into them their stack frame grows by one callee-saved
-     * register, and that push/pop pair is paid on EVERY sample. Measured on
-     * DynamicEQ's block path, which runs four of these filters per sample:
-     * +7.3% (g++ 13.3) / +8.9% (clang 18.1) with the body inlined, both
-     * recovered by keeping it here. The spelling follows DSPARK_RESTRICT in
+     * Kept OUT of line on purpose, uniformly on every compiler: this is
+     * cold code reached from a per-sample gate. Under the origin rule
+     * (docs/threading.md) only the control thread arms coeffsDirty_, so this
+     * body runs at most once per publication, while the gate guarding it
+     * runs every sample -- and inlining the body into processSample()/
+     * processSampleCore() grows their stack frame by one callee-saved
+     * register, a push/pop pair paid on EVERY sample to speed up a path
+     * that almost never runs. Cold code must not grow the hot frame.
+     * Measured once at a NAMED operating point -- DynamicEQ<float>, 2
+     * default bands, gain computer idle, 1 channel, 512-sample blocks,
+     * g++ 13.3 / clang++ 18.1.3, -O2 -- inlining the body cost +7.3% /
+     * +8.9% wall clock on that block path. That number is a property of
+     * that configuration and those compilers, not of the change; the frame
+     * growth is what is structural. The spelling follows DSPARK_RESTRICT in
      * Core/SimdOps.h -- a locally defined, guarded, compiler-specific macro.
      *
      * At most kSeqlockMaxAttempts validation attempts, then give up, adopt

@@ -1751,6 +1751,66 @@ DSPARK_TEST(Biquad_move_carries_state_and_pending_coeffs)
     }
 }
 
+DSPARK_TEST(Biquad_setCoeffsNow_is_immediate_and_bypasses_staging)
+{
+    // The stream-owner direct set (origin rule, docs/threading.md): the set
+    // becomes active with no staging, no adoption and no dirty flag. A filter
+    // written through setCoeffsNow() must be bit-identical to one whose
+    // coefficients were baked in from the start -- including on the very
+    // first sample after the write, where a staged update would still be one
+    // gate away if the flag logic were involved at all.
+    const auto lp = BiquadCoeffs::makeLowPass(48000.0, 2000.0);
+    const auto hp = BiquadCoeffs::makeHighPass(48000.0, 500.0);
+
+    Biquad<float> ref, direct;
+    ref.setCoeffs(lp);
+    ref.applyPendingCoeffs();
+    direct.setCoeffsNow(lp);
+
+    // getCoeffs() reflects the direct write immediately, no promotion call.
+    EXPECT_EQ(direct.getCoeffs().b0, lp.b0);
+    EXPECT_EQ(direct.getCoeffs().a2, lp.a2);
+
+    for (int i = 0; i < 96; ++i)
+    {
+        const float x = std::sin(0.17f * static_cast<float>(i));
+        // Re-write mid-stream every 16 samples, as a modulating owner would.
+        if ((i & 15) == 0)
+        {
+            const auto& c = (i & 16) ? hp : lp;
+            ref.setCoeffs(c);
+            ref.applyPendingCoeffs(); // staged path needs explicit promotion
+            direct.setCoeffsNow(c);   // direct path must already be there
+        }
+        EXPECT_EQ(direct.processSample(x, 0), ref.processSample(x, 0));
+    }
+}
+
+DSPARK_TEST(Biquad_pending_publication_overwrites_a_direct_set_at_the_gate)
+{
+    // Dual-master semantics documented at setCoeffsNow(): on an instance
+    // receiving BOTH a staged publication and a direct set, the armed dirty
+    // flag is a LATER write by the adopting thread, so the publication wins
+    // at the next gate. Single-threaded here, so the interleaving is exact
+    // and the outcome deterministic.
+    const auto staged = BiquadCoeffs::makeLowPass(48000.0, 1000.0);
+    const auto direct = BiquadCoeffs::makeHighPass(48000.0, 4000.0);
+
+    Biquad<float> bq;
+    bq.setCoeffs(staged);    // publication pending, dirty armed
+    bq.setCoeffsNow(direct); // direct set active right now...
+    EXPECT_EQ(bq.getCoeffs().b0, direct.b0);
+
+    (void)bq.processSample(0.5f, 0); // ...until the gate adopts the pending set
+    EXPECT_EQ(bq.getCoeffs().b0, staged.b0);
+    EXPECT_EQ(bq.getCoeffs().a1, staged.a1);
+
+    // And with nothing pending, a direct set is not disturbed by the gate.
+    bq.setCoeffsNow(direct);
+    (void)bq.processSample(0.5f, 0);
+    EXPECT_EQ(bq.getCoeffs().b0, direct.b0);
+}
+
 // ============================================================================
 // EnvelopeFollower
 // ============================================================================

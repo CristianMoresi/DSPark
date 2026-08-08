@@ -89,6 +89,14 @@ Used when several words must be adopted together, because half of one update
 combined with half of the next is not a valid state -- a biquad's five
 coefficients, an FIR's coefficient vector, a band configuration.
 
+**The origin rule.** The staged channel exists for control-to-audio
+publication only: a value computed on the audio thread for its own use is
+written directly into the audio-thread-private active state (as
+`Core/Biquad.h`'s `setCoeffsNow()` does), and the stream owner never
+self-publishes -- self-publication would pay the cross-thread publish and then
+re-adopt the same thread's own write inside the hot path, and it is what keeps
+every adoption below cold: only the control thread can arm one.
+
 Writer, on the control thread only:
 
 ```cpp

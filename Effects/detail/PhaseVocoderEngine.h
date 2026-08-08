@@ -28,7 +28,22 @@
  * - **Identity phase locking** (Laroche & Dolson 1999): spectral peaks are
  *   detected each frame and every bin in a peak's region of influence is
  *   rotated by the *same* phase increment as its peak, preserving vertical
- *   phase coherence.
+ *   phase coherence. Switching it off (params.phaseLock) leaves the plain
+ *   phase vocoder, where every bin propagates its own instantaneous
+ *   frequency independently - the control condition phase locking is meant
+ *   to beat, kept in the engine so an owner can expose the comparison.
+ * - **Harmonic/percussive split** (opt-in, params.percussiveSplit; enabled
+ *   at prepare()): median filtering of the magnitude spectrogram along time
+ *   enhances sustained partials, median filtering along frequency enhances
+ *   broadband strikes (Fitzgerald, "Harmonic/percussive separation using
+ *   median filtering", DAFx 2010). The two medians drive complementary
+ *   Wiener-form masks; the harmonic share is phase-propagated as above and
+ *   the percussive share keeps its analysis phase, so it overlap-adds at the
+ *   synthesis hop instead of being phase-propagated (Driedger, Mueller &
+ *   Ewert, "Improving time-scale modification of music signals using
+ *   harmonic-percussive separation", IEEE Signal Processing Letters 21(1),
+ *   2014). Both paths share one analysis frame, so the split costs the two
+ *   medians and nothing else.
  * - **Transient phase reset**: onsets (frame energy rising more than 6 dB
  *   over the tracked envelope) re-initialise synthesis phases to the
  *   analysis phases. Peaks with no history (new partials) are reset
@@ -59,7 +74,8 @@
  *
  * Cross-thread publication (the one and only handoff in this class):
  * publishParams() moves the multi-word set {targetSemitones,
- * transientPreserve, formantPreserve} from the control thread to the audio
+ * transientPreserve, formantPreserve, phaseLock, percussiveSplit} from the
+ * control thread to the audio
  * thread through a canonical seqlock: counter to odd (acq_rel), a RELEASE
  * FENCE, relaxed stores of the three std::atomic data words, counter to even
  * (release), dirty flag (release). The release fence is mandatory: an
@@ -92,6 +108,12 @@
  * thread never publishes to itself through the staged channel, so the
  * adoption above is cold by construction (it runs only when the control
  * thread actually published).
+ *
+ * Every buffer the audio path touches, including the harmonic/percussive
+ * median history, is sized and allocated in prepare(); the hop path only
+ * writes into what is already there. The median windows are chosen from the
+ * physical spans below and therefore scale with the sample rate, so their
+ * behaviour is the same at 44.1 kHz and at 96 kHz.
  *
  * Dependencies: Core/FFT.h, Core/WindowFunctions.h, Core/DspMath.h.
  */
@@ -136,6 +158,8 @@ public:
         double targetSemitones  = 0.0;    ///< Stretch/shift target, semitones, clamped +-12.
         bool   transientPreserve = true;  ///< Phase reset on detected transients.
         bool   formantPreserve   = false; ///< Cepstral envelope pre-warp (resample-back owners).
+        bool   phaseLock         = true;  ///< Identity phase locking; false = plain vocoder.
+        bool   percussiveSplit   = false; ///< Median-filter harmonic/percussive split.
     };
 
     // -- Lifecycle (setup thread) ---------------------------------------------
@@ -155,10 +179,16 @@ public:
      *                             engine then tapers bins that would land
      *                             above Nyquist after resampling, and the
      *                             formant pre-warp targets env(k*ratio).
+     * @param separationSupport    True to allocate the harmonic/percussive
+     *                             median history, which is what lets an owner
+     *                             turn params.percussiveSplit on and off while
+     *                             streaming without ever allocating again.
+     *                             False leaves those buffers empty and the
+     *                             split permanently off.
      * @return true if the engine (re)allocated and is ready for reset().
      */
     bool prepare(double sampleRate, int numChannels, int fftSize,
-                 bool resampleCompensation)
+                 bool resampleCompensation, bool separationSupport = false)
     {
         if (!(sampleRate > 0.0) || !std::isfinite(sampleRate) || numChannels < 1
             || (fftSize & (fftSize - 1)) != 0 || fftSize < 256 || fftSize > (1 << 20))
@@ -209,6 +239,43 @@ public:
         rotIm_.resize(static_cast<size_t>(numBins_));
         peakBin_.resize(static_cast<size_t>(numBins_ / 2 + 2));
 
+        // Harmonic/percussive median filtering. Both window lengths are
+        // chosen from a PHYSICAL span, so they follow the sample rate and the
+        // frame size instead of being fixed bin/frame counts:
+        //   - along time, 0.2 s of history, the span over which a musical
+        //     partial is steady but a strike is not;
+        //   - along frequency, 500 Hz, wide enough to bridge the harmonic
+        //     comb of any pitched note in range and narrow enough to leave a
+        //     broadband strike untouched.
+        // Both are forced odd so the median is a sample of the window rather
+        // than an average of two, and both are clamped so extreme frame sizes
+        // cannot ask for a window longer than the data.
+        separationEnabled_ = separationSupport;
+        if (separationEnabled_)
+        {
+            const double hopSeconds = static_cast<double>(synthHop_) / sampleRate_;
+            const double binHz = sampleRate_ / static_cast<double>(fftSize_);
+            timeMedian_ = makeOdd(static_cast<int>(std::lround(0.2 / hopSeconds)), 3, 31);
+            freqMedian_ = makeOdd(static_cast<int>(std::lround(500.0 / binHz)), 3, 63);
+            freqMedian_ = std::min(freqMedian_, makeOdd(numBins_, 3, 63));
+
+            magHist_.assign(static_cast<size_t>(timeMedian_) * static_cast<size_t>(numBins_), T(0));
+            medianScratch_.resize(static_cast<size_t>(std::max(timeMedian_, freqMedian_)));
+            maskHarm_.resize(static_cast<size_t>(numBins_));
+            maskPerc_.resize(static_cast<size_t>(numBins_));
+            specRaw_.resize(static_cast<size_t>(fftSize_ + 2));
+        }
+        else
+        {
+            timeMedian_ = 0;
+            freqMedian_ = 0;
+            magHist_.clear();
+            medianScratch_.clear();
+            maskHarm_.clear();
+            maskPerc_.clear();
+            specRaw_.clear();
+        }
+
         prepared_ = true;
         return true;
     }
@@ -223,6 +290,9 @@ public:
         std::fill(prevAnalysis_.begin(), prevAnalysis_.end(), T(0));
         std::fill(prevSynth_.begin(), prevSynth_.end(), T(0));
         std::fill(prevMag_.begin(), prevMag_.end(), T(0));
+        std::fill(magHist_.begin(), magHist_.end(), T(0));
+        histPos_ = 0;
+        histFilled_ = 0;
 
         inputPos_ = 0;
         writeHead_ = static_cast<int64_t>(accumSize_);       // keep indices positive
@@ -258,6 +328,8 @@ public:
         stgSemitones_.store(p.targetSemitones, std::memory_order_relaxed);
         stgTransient_.store(p.transientPreserve, std::memory_order_relaxed);
         stgFormant_.store(p.formantPreserve, std::memory_order_relaxed);
+        stgPhaseLock_.store(p.phaseLock, std::memory_order_relaxed);
+        stgSplit_.store(p.percussiveSplit, std::memory_order_relaxed);
         seq_.fetch_add(1, std::memory_order_release);   // -> even
         dirty_.store(true, std::memory_order_release);
     }
@@ -314,6 +386,8 @@ public:
         p.targetSemitones   = targetSemitones_;
         p.transientPreserve = transientOn_;
         p.formantPreserve   = formantOn_;
+        p.phaseLock         = phaseLockOn_;
+        p.percussiveSplit   = splitOn_;
         return p;
     }
 
@@ -351,6 +425,13 @@ private:
     /// update by one hop costs less than spending more of the block budget.
     static constexpr int kSeqlockMaxAttempts = 3;
 
+    /// How far the frequency median must dominate the time median before a
+    /// bin is treated as a strike rather than a partial. Two is the value the
+    /// separation literature settles on: it is well past the point where the
+    /// two medians are merely comparable, and short of demanding that a bin
+    /// be broadband to the exclusion of everything else.
+    static constexpr double kSeparationFactor = 2.0;
+
     /** @brief Adopts the staged parameter set, or defers (bounded seqlock read).
      *
      *  At most kSeqlockMaxAttempts validation attempts. On give-up the
@@ -367,7 +448,7 @@ private:
         // previously adopted private copy.
         bool adopted = false;
         double st = 0.0;
-        bool tr = true, fo = false;
+        bool tr = true, fo = false, pl = true, sp = false;
         for (int attempt = 0; attempt < kSeqlockMaxAttempts; ++attempt)
         {
             const unsigned s0 = seq_.load(std::memory_order_acquire);
@@ -375,6 +456,8 @@ private:
             st = stgSemitones_.load(std::memory_order_relaxed);
             tr = stgTransient_.load(std::memory_order_relaxed);
             fo = stgFormant_.load(std::memory_order_relaxed);
+            pl = stgPhaseLock_.load(std::memory_order_relaxed);
+            sp = stgSplit_.load(std::memory_order_relaxed);
             // The fence orders the copy above BEFORE the re-read below and
             // pairs with the writer's release fence ([atomics.fences]/2); a
             // plain load-acquire orders only LATER accesses, so without it
@@ -394,6 +477,8 @@ private:
         targetSemitones_ = st;
         transientOn_     = tr;
         formantOn_       = fo;
+        phaseLockOn_     = pl;
+        splitOn_         = sp && separationEnabled_;
     }
 
     /** @brief Wraps a phase difference into (-pi, pi]. */
@@ -430,6 +515,14 @@ private:
 
         const bool transient = detectTransient();
         buildRotations(transient);
+        // The magnitude history is kept whenever the owner allocated it, not
+        // only while the split is engaged: turning the split on mid-stream
+        // must find a full window behind it, not an empty one.
+        if (separationEnabled_)
+        {
+            pushMagnitudeHistory();
+            if (splitOn_) updateSeparationMasks();
+        }
 
         // Snapshot the reference analysis spectrum for the next frame's
         // heterodyned phase increments (after decisions, before modification).
@@ -502,6 +595,12 @@ private:
         {
             std::fill(rotRe_.begin(), rotRe_.end(), T(1));
             std::fill(rotIm_.begin(), rotIm_.end(), T(0));
+            return;
+        }
+
+        if (!phaseLockOn_)
+        {
+            buildPerBinRotations();
             return;
         }
 
@@ -606,10 +705,140 @@ private:
         rotRe_[static_cast<size_t>(numBins_ - 1)] = T(1);     rotIm_[static_cast<size_t>(numBins_ - 1)] = T(0);
     }
 
+    /**
+     * @brief Plain-vocoder rotations: one independent phase increment per bin.
+     *
+     * The classic phase vocoder, with no coupling between neighbouring bins.
+     * It is exact for a single stationary sinusoid per bin and drifts apart
+     * across the bins of one partial as soon as the partial moves, which is
+     * the vertical incoherence that makes a plain vocoder sound hollow. Kept
+     * as the control condition for the locked path above.
+     */
+    void buildPerBinRotations() noexcept
+    {
+        const double Ra = static_cast<double>(analysisHop_);
+        const double Rs = static_cast<double>(synthHop_);
+        const double binW = kTwoPi / static_cast<double>(fftSize_);
+
+        // DC and Nyquist are real-valued in the packed spectrum: never rotate.
+        rotRe_[0] = T(1);                                   rotIm_[0] = T(0);
+        rotRe_[static_cast<size_t>(numBins_ - 1)] = T(1);
+        rotIm_[static_cast<size_t>(numBins_ - 1)] = T(0);
+
+        for (int k = 1; k < numBins_ - 1; ++k)
+        {
+            double rotR = 1.0, rotI = 0.0;
+            // A bin with no magnitude history carries no phase to propagate.
+            if (prevMag_[static_cast<size_t>(k)] > T(0.1) * mag_[static_cast<size_t>(k)])
+            {
+                const double re  = static_cast<double>(spec_[static_cast<size_t>(2 * k)]);
+                const double im  = static_cast<double>(spec_[static_cast<size_t>(2 * k + 1)]);
+                const double pre = static_cast<double>(prevAnalysis_[static_cast<size_t>(2 * k)]);
+                const double pim = static_cast<double>(prevAnalysis_[static_cast<size_t>(2 * k + 1)]);
+
+                const double deltaPhi = std::atan2(im * pre - re * pim, re * pre + im * pim);
+                const double omegaK = binW * static_cast<double>(k);
+                const double omegaInst = omegaK + princArg(deltaPhi - omegaK * Ra) / Ra;
+
+                const double psiPrev = std::atan2(
+                    static_cast<double>(prevSynth_[static_cast<size_t>(2 * k + 1)]),
+                    static_cast<double>(prevSynth_[static_cast<size_t>(2 * k)]));
+                const double phi = std::atan2(im, re);
+                const double theta = psiPrev + Rs * omegaInst - phi;
+                rotR = std::cos(theta);
+                rotI = std::sin(theta);
+            }
+            rotRe_[static_cast<size_t>(k)] = static_cast<T>(rotR);
+            rotIm_[static_cast<size_t>(k)] = static_cast<T>(rotI);
+        }
+    }
+
+    /** @brief Largest odd value <= `v`, clamped into [lo, hi] and kept odd. */
+    [[nodiscard]] static int makeOdd(int v, int lo, int hi) noexcept
+    {
+        v = std::clamp(v, lo, hi);
+        if ((v & 1) == 0) --v;
+        return std::max(v, lo | 1);
+    }
+
+    /** @brief Rolls the current magnitudes into the trailing history ring. */
+    void pushMagnitudeHistory() noexcept
+    {
+        T* slot = magHist_.data() + static_cast<size_t>(histPos_) * static_cast<size_t>(numBins_);
+        std::copy(mag_.begin(), mag_.end(), slot);
+        histPos_ = (histPos_ + 1) % timeMedian_;
+        if (histFilled_ < timeMedian_) ++histFilled_;
+    }
+
+    /**
+     * @brief Complementary harmonic/percussive masks for the current frame.
+     *
+     * A partial that is steady in time survives a median taken ALONG TIME at
+     * its own bin and is wiped out by one taken ALONG FREQUENCY across it; a
+     * broadband strike is the other way round. Comparing the two medians
+     * therefore separates the two kinds of content without any model of
+     * either. The masks are complementary and binary: every bin goes down
+     * exactly one of the two paths, so the split neither loses nor invents
+     * energy.
+     *
+     * The time median is TRAILING (the current frame and the ones before it)
+     * rather than centred: a centred window would need frames that have not
+     * been analysed yet, which is latency this engine does not have to spend.
+     * The cost is that the mask reacts to a strike one window late on its
+     * decay side, not on its onset.
+     */
+    void updateSeparationMasks() noexcept
+    {
+        const int nHist = histFilled_;
+        const int half = freqMedian_ / 2;
+
+        for (int k = 0; k < numBins_; ++k)
+        {
+            // Median along time at this bin, over the frames seen so far.
+            for (int f = 0; f < nHist; ++f)
+                medianScratch_[static_cast<size_t>(f)] =
+                    magHist_[static_cast<size_t>(f) * static_cast<size_t>(numBins_)
+                             + static_cast<size_t>(k)];
+            auto mid = medianScratch_.begin() + nHist / 2;
+            std::nth_element(medianScratch_.begin(), mid,
+                             medianScratch_.begin() + nHist);
+            const double h = static_cast<double>(*mid);
+
+            // Median along frequency in this frame, clamped at both edges so
+            // the window never reads outside the spectrum.
+            const int lo = std::max(0, k - half);
+            const int hi = std::min(numBins_ - 1, k + half);
+            const int n = hi - lo + 1;
+            for (int j = 0; j < n; ++j)
+                medianScratch_[static_cast<size_t>(j)] = mag_[static_cast<size_t>(lo + j)];
+            auto midF = medianScratch_.begin() + n / 2;
+            std::nth_element(medianScratch_.begin(), midF, medianScratch_.begin() + n);
+            const double p = static_cast<double>(*midF);
+
+            // A bin goes down the percussive path only when the frequency
+            // median dominates the time median by the separation factor.
+            // Everything else, including everything ambiguous, stays
+            // harmonic: the phase-propagated path is the one that is right
+            // for most material, so the split must earn each bin it takes
+            // rather than divide every bin in proportion. A proportional
+            // (Wiener) mask measured 1.5 dB of log-spectral distance on a
+            // purely harmonic bed, where the correct answer is that nothing
+            // is percussive at all.
+            const bool percussive = (p > kSeparationFactor * h);
+            maskHarm_[static_cast<size_t>(k)] = percussive ? T(0) : T(1);
+            maskPerc_[static_cast<size_t>(k)] = percussive ? T(1) : T(0);
+        }
+    }
+
     /** @brief Applies rotations + spectral post-stages to spec_, IFFTs and
      *  overlap-adds. */
     void synthesizeChannel(int ch, bool isReference) noexcept
     {
+        // The percussive path re-uses this channel's UNROTATED spectrum, so
+        // it has to be kept before the rotation overwrites it.
+        if (splitOn_)
+            std::copy(spec_.begin(), spec_.end(), specRaw_.begin());
+
         // Rigid per-region rotation preserves intra-region (and inter-channel)
         // relative phases exactly.
         for (int k = 1; k < numBins_ - 1; ++k)
@@ -658,6 +887,23 @@ private:
 
         if (isReference)
             std::copy(spec_.begin(), spec_.end(), prevSynth_.begin());
+
+        // Harmonic/percussive recombination. The phase recursion above is fed
+        // the fully propagated spectrum (the line just past), never the mix:
+        // the percussive share deliberately breaks the phase recursion, and
+        // letting it back in would poison the next frame's propagation.
+        if (splitOn_)
+        {
+            for (int k = 0; k < numBins_; ++k)
+            {
+                const T mh = maskHarm_[static_cast<size_t>(k)];
+                const T mp = maskPerc_[static_cast<size_t>(k)];
+                const auto re = static_cast<size_t>(2 * k);
+                const auto im = static_cast<size_t>(2 * k + 1);
+                spec_[re] = spec_[re] * mh + specRaw_[re] * mp;
+                spec_[im] = spec_[im] * mh + specRaw_[im] * mp;
+            }
+        }
 
         fft_->inverse(spec_.data(), fftResult_.data());
 
@@ -769,6 +1015,17 @@ private:
     std::vector<int> peakBin_;
     int numPeaks_ = 0;
 
+    // Harmonic/percussive split (allocated only when the owner asked for it).
+    bool separationEnabled_ = false;
+    int timeMedian_ = 0;                      ///< Median length along time, frames (odd).
+    int freqMedian_ = 0;                      ///< Median length along frequency, bins (odd).
+    std::vector<T> magHist_;                  ///< timeMedian_ x numBins_ magnitude ring.
+    std::vector<T> medianScratch_;            ///< Selection scratch for one median.
+    std::vector<T> maskHarm_, maskPerc_;      ///< Complementary per-bin masks.
+    std::vector<T> specRaw_;                  ///< Analysis spectrum before rotation.
+    int histPos_ = 0;                         ///< Next history slot to overwrite.
+    int histFilled_ = 0;                      ///< Slots written since reset().
+
     int inputPos_ = 0;
     int64_t writeHead_ = 0;
 
@@ -787,12 +1044,16 @@ private:
     double targetSemitones_ = 0.0;
     bool transientOn_ = true;
     bool formantOn_ = false;
+    bool phaseLockOn_ = true;
+    bool splitOn_ = false;
 
     // Control -> audio staged parameter channel (canonical seqlock; the ONLY
     // cross-thread handoff in this class).
     std::atomic<double> stgSemitones_ { 0.0 };
     std::atomic<bool> stgTransient_ { true };
     std::atomic<bool> stgFormant_ { false };
+    std::atomic<bool> stgPhaseLock_ { true };
+    std::atomic<bool> stgSplit_ { false };
     std::atomic<unsigned> seq_ { 0 };        ///< Seqlock counter (odd = writing).
     std::atomic<bool> dirty_ { false };      ///< Pending-update flag (fast path).
 };

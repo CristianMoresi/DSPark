@@ -162,9 +162,20 @@ public:
      * cross-correlation (YIN-FFT): O(N log N) per detection - roughly 20x
      * faster than the direct O(windowSize^2) form at the 2048-sample window
      * the automatic policy picks at 44.1/48 kHz, and generally fine on the
-     * audio thread. Cost per SECOND of audio is rate-invariant under the
-     * automatic policy (window and hop scale together). For very low-latency callbacks you
-     * can still feed an SPSC queue (Core/SpscQueue.h) and detect on a worker.
+     * audio thread. Under the automatic policy the detection RATE is
+     * rate-invariant (hop = window/4, about one detection per 10.7 ms), but
+     * CPU per second of audio is NOT: each detection costs O(N log N) and N
+     * follows the rate, so the per-second cost grows by a measured ~2.2x at
+     * 96 kHz and ~4.8x at 192 kHz relative to 48 kHz (35.2 / 76.7 / 169.7 ms
+     * of CPU per 10 s of audio at 48/96/192 kHz; g++ -O2, one core --
+     * absolute numbers vary by machine, the growth tracks N log N). Against
+     * the old fixed-2048 default at the SAME rate the automatic window costs
+     * roughly 20% more (169.7 vs 139.3 ms at 192 kHz). prepare()-time heap grows
+     * the same way: ~160 KB at 44.1/48 kHz, ~320 KB at 88.2/96 kHz, ~640 KB
+     * at 176.4/192 kHz (float); the audio path stays allocation-free. Budget
+     * from these figures, not from the rate alone. For very low-latency
+     * callbacks you can still feed an SPSC queue (Core/SpscQueue.h) and
+     * detect on a worker.
      *
      * @param samples Span of input audio data (mono).
      */

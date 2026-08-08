@@ -46,7 +46,8 @@
  * time-stretcher), drives the chunk loop, and reads the OLA ring through the
  * accessors below.
  *
- * Threading (SPSC model, docs/threading.md; ADR-013/014/015 apply from birth):
+ * Threading (SPSC model, see docs/threading.md; the role split below holds
+ * from construction on, not only after prepare()):
  * - prepare(): setup thread only (allocates; never concurrent with any other
  *   call).
  * - publishParams(): CONTROL thread only (ONE non-audio writer; canonical
@@ -79,12 +80,13 @@
  * keeps the set in use, and re-arms the dirty flag (release) so the update
  * lands on a later hop; the audio thread's worst case here is
  * kSeqlockMaxAttempts copies of three words - this class's own instruction
- * count - never the time the control thread holds the counter odd (ADR-014).
+ * count - never the time the control thread holds the counter odd.
  * Bounding cannot make a torn set adoptable: the accept predicate is the
  * same as the unbounded form's, so the bound can only DEFER an adoption.
  *
- * Origin rule (ADR-015): the staged channel above carries CONTROL -> AUDIO
- * publications only. Everything the audio thread computes for its own use -
+ * Origin rule (see docs/threading.md): the staged channel above carries
+ * CONTROL -> AUDIO publications only. Everything the audio thread computes
+ * for its own use -
  * the glided active ratio, the fractional hop accumulator, the spectral
  * state - is stream-owner state written directly as plain members; the audio
  * thread never publishes to itself through the staged channel, so the
@@ -413,8 +415,9 @@ private:
     /** @brief One analysis->synthesis frame for all channels. */
     void processHop(int nCh) noexcept
     {
-        // Adopt pending control publications at the hop boundary (cold: only
-        // runs when the control thread actually published; ADR-015).
+        // Adopt pending control publications at the hop boundary (cold by
+        // construction: it runs only when the control thread published; the
+        // audio thread never publishes to itself through the staged channel).
         adoptParamsIfDirty();
 
         // --- glide the active ratio toward the target (max 0.5 st per hop) ----
@@ -769,7 +772,8 @@ private:
     int inputPos_ = 0;
     int64_t writeHead_ = 0;
 
-    // Audio-thread-private active state (stream-owner writes only; ADR-015).
+    // Audio-thread-private active state: the stream owner writes these as
+    // plain members and never publishes them through the staged channel.
     double stActive_ = 0.0;
     double ratioActive_ = 1.0;
     double hopCarry_ = 0.0;

@@ -301,6 +301,8 @@ public:
 
             // 2. Produce output: fractional read of the synthesis stream + mix.
             const double ratio = engine_.activeRatio();
+            int64_t rpEnd = readPosInt_;
+            double  rfEnd = readPosFrac_;
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* out = buffer.getChannel(ch) + i;
@@ -327,27 +329,30 @@ public:
                     rf -= static_cast<double>(adv);
                     dp = (dp + 1) & dryMask_;
                 }
+                if (ch == 0) { rpEnd = rp; rfEnd = rf; }   // recurrence result
             }
 
-            // Commit shared positions once per chunk, running the SAME
-            // per-sample recurrence the output loops ran: a single
+            // Commit shared positions once per chunk, using the SAME
+            // per-sample recurrence result the output loops computed (taken
+            // from channel 0, whose loop ran it already): a single
             // frac + ratio * chunk product rounds differently for different
             // chunk sizes, and chunk boundaries follow the host block size,
             // so committing the product form made the output depend on how
             // the host chopped the stream (~1 ulp per flip, but a bit-exact
             // contract is a bit-exact contract).
             {
-                int64_t rp = readPosInt_;
-                double  rf = readPosFrac_;
-                for (int k = 0; k < chunk; ++k)
+                if (nCh == 0)   // channel-less call: advance the stream anyway
                 {
-                    rf += ratio;
-                    const auto adv = static_cast<int64_t>(rf);
-                    rp += adv;
-                    rf -= static_cast<double>(adv);
+                    for (int k = 0; k < chunk; ++k)
+                    {
+                        rfEnd += ratio;
+                        const auto adv = static_cast<int64_t>(rfEnd);
+                        rpEnd += adv;
+                        rfEnd -= static_cast<double>(adv);
+                    }
                 }
-                readPosInt_  = rp;
-                readPosFrac_ = rf;
+                readPosInt_  = rpEnd;
+                readPosFrac_ = rfEnd;
                 dryPos_ = (dryPos_ + chunk) & dryMask_;
             }
 

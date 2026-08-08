@@ -159,8 +159,10 @@ public:
      *
      * With a CONSTANT sample count the low register therefore degrades as the
      * rate rises: measured on soft bass onsets (E1..B2, 10 ms attacks) the
-     * fixed 2048 frame recalls 8/8 at 44.1/48 kHz but 5/8 at 96 kHz, while the
-     * automatic frame recalls 8/8 there. Percussive clicks, mid-register notes
+     * fixed 2048 frame recalls 7/8 at 44.1/48 kHz but 5/8 at 96 kHz, while
+     * the automatic frame holds the 7/8 reference recall there (the missed
+     * F#1 sits below the default delta at every rate; see the file header).
+     * Percussive clicks, mid-register notes
      * and the vibrato/tremolo false-positive guard were measured unaffected at
      * every rate from 44.1 to 192 kHz, so this is a low-register loss, not a
      * general one. Explicit frames stay available for callers who want the
@@ -179,8 +181,13 @@ public:
      * releases. Explicit frames OTHER than 2048 now read the ODF on the
      * reference scale too -- an intentional behaviour change: one delta means
      * one sensitivity, at every frame length. Under adaptive whitening the
-     * per-bin peak division already removes the growth, so the whitened path
-     * is not scaled again.
+     * per-bin peak division removes the growth wherever the running peak
+     * exceeds the whitening floor (1e-4), so the whitened path is not scaled
+     * again. Caveat: the floor is an absolute magnitude, so bins whose peak
+     * is held AT the floor keep the raw frame-scaled magnitude -- very quiet
+     * whitened material therefore retains a residual rate dependence
+     * (borderline events can appear at high rates that a 48 kHz session does
+     * not report).
      *
      * CPU AND MEMORY. The hop is TIME-fixed (round(fs/200), ~200 frames per
      * second at every rate) while the automatic frame follows the rate, so
@@ -651,9 +658,12 @@ private:
                 // The frame-invariant magnitude scale (kOdfRefFrame/fftSize)
                 // applies to the raw spectrum only: adaptive whitening
                 // already divides each bin by its running peak, which
-                // carries the same linear-in-N growth, so the whitened
-                // spectrum is dimensionless and scaling it again would
-                // INVERT the rate dependence instead of removing it.
+                // carries the same linear-in-N growth, so above kWhitenFloor
+                // the whitened spectrum is dimensionless and scaling it
+                // again would INVERT the rate dependence instead of removing
+                // it. Below the floor the divisor is the absolute constant
+                // kWhitenFloor, so those bins keep the linear-in-N growth --
+                // the residual rate dependence documented at prepare().
                 filterLogBands(bandCur_, whiten ? T(1) : odfScale_);
                 for (int b = 0; b < numBands_; ++b)
                 {

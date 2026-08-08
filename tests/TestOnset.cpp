@@ -463,7 +463,7 @@ DSPARK_TEST(Onset_double_instantiation)
 // or instrumentation can invert them.
 //
 // Measured on the pre-fix tree (fixed 2048): 135 bands at 48 kHz but 111 at
-// 96 kHz and 88 at 192 kHz, and soft bass onsets recalled 8/8 at 48 kHz but
+// 96 kHz and 88 at 192 kHz, and soft bass onsets recalled 7/8 at 48 kHz but
 // 5/8 at 96 kHz. Both halves of this test fail there.
 // ===========================================================================
 DSPARK_TEST(Onset_default_frame_holds_the_span_across_rates)

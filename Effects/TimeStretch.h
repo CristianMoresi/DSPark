@@ -216,7 +216,12 @@ public:
         while (queueSize_ < capacity) queueSize_ <<= 1;
         queueMask_ = queueSize_ - 1;
 
-        engine_.prepare(spec.sampleRate, numChannels_, fftSize_, false, false, true);
+        // No resample-back stage and no harmonic/percussive split; the
+        // locked analysis hop and the spectral-flux onset detector are both
+        // asked for, because this owner reads the synthesis stream directly
+        // and its hop schedule has to act on strikes the frame-energy test
+        // cannot see over sustained material.
+        engine_.prepare(spec.sampleRate, numChannels_, fftSize_, false, false, true, true);
         accumMask_ = engine_.olaMask();
 
         queue_.assign(static_cast<size_t>(numChannels_), {});

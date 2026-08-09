@@ -3827,6 +3827,236 @@ DSPARK_TEST(PitchShifter_output_is_bit_identical_under_block_chopping)
     EXPECT_EQ(diffAC, 0);
 }
 
+// PitchShifter's rendering is a published contract, so it gets a gate that
+// fails when it moves.
+//
+// The shared vocoder engine is developed for two effects with incompatible
+// needs, and a change made for one of them - a different onset test, a
+// different analysis-hop schedule - can silently re-render the other. A user
+// who mixed a track last month has that render on disk; it is not restored by
+// a release note. Nothing else in this suite renders this effect against a
+// stored reference, so nothing else can fail when its output changes.
+//
+// The bed is a strike over sustained material, because that is where a change
+// to the transient path is largest and where a bed of clicks in silence shows
+// almost nothing. Four points of the semitone range are stored, unity among
+// them as the null point, with 96 samples spanning a strike plus the whole
+// render's energy and peak, so that a change outside the window is caught as
+// well - though only down to the energy tolerance, which is coarser than a
+// sample comparison.
+//
+// The numbers were captured on this tree and reproduce BIT-FOR-BIT under
+// g++ -O2, g++ -O0 and clang++ -O2 on x86-64. They are compared with a
+// tolerance rather than exactly, because floating-point contraction is
+// permitted and differs across compilers and architectures: with FMA
+// contraction enabled (-march=native, -ffast-math) the worst sample moves by
+// 1.7e-07, which is 121 dB below the strike's own peak. The tolerance below
+// is 1e-05, sixty times that spread - and a real rendering change is four
+// orders of magnitude larger still: swapping this effect onto the other
+// owner's onset detector moves the worst stored sample by 1.9e-01, its energy
+// by 2.9 percent and its peak by 16 percent. The gate therefore cannot be
+// tripped by a compiler and cannot be passed by a re-rendering.
+DSPARK_TEST(PitchShifter_rendering_matches_its_stored_reference)
+{
+    constexpr int refRate = 48000;
+    constexpr int refLen = 96000;         // 2 s
+    constexpr int refBlock = 512;
+    constexpr int refFft = 2048;
+    constexpr int refStart = 28064;       // 32 samples before the 0.5 s strike,
+                                          // shifted by the 2 * fftSize latency
+    constexpr int refCount = 96;
+    constexpr double sampleTol = 1.0e-5;  // absolute, on a peak of 0.9
+    constexpr double relTol = 1.0e-6;     // on energy and peak
+
+    struct Ref { double energy; double peak; float s[refCount]; };
+    static const float refSemitones[4] = { -7.0f, 0.0f, 5.0f, 12.0f };
+    static const Ref refs[4] = {
+    // st -7.0  energy 0x1.8353fd2e5038ap+12  peak 0x1.39c968p-1
+    { 0x1.8353fd2e5038ap+12, 0x1.39c968p-1,
+      { -0x1.8b147ep-3f, -0x1.8bf818p-3f, -0x1.8ca5b8p-3f, -0x1.8d1fb8p-3f,
+        -0x1.8d68c2p-3f, -0x1.8d8552p-3f, -0x1.8d7864p-3f, -0x1.8d4542p-3f,
+        -0x1.8cf14ap-3f, -0x1.8c7ff2p-3f, -0x1.8bf50ep-3f, -0x1.8b56a2p-3f,
+        -0x1.8aa87ep-3f, -0x1.89eed4p-3f, -0x1.893008p-3f, -0x1.887012p-3f,
+        -0x1.87b352p-3f, -0x1.87005p-3f, -0x1.865afep-3f, -0x1.85c7b4p-3f,
+        -0x1.854cd2p-3f, -0x1.84ee1cp-3f, -0x1.84afa8p-3f, -0x1.84975cp-3f,
+        -0x1.84a8a4p-3f, -0x1.84e736p-3f, -0x1.855834p-3f, -0x1.85fe8p-3f,
+        -0x1.86dd38p-3f, -0x1.87f888p-3f, -0x1.8952ap-3f, -0x1.8aedep-3f,
+        -0x1.8ccd44p-3f, -0x1.8ef238p-3f, -0x1.915e4p-3f, -0x1.9412fp-3f,
+        -0x1.9710dp-3f, -0x1.9a587ep-3f, -0x1.9dea26p-3f, -0x1.a1c556p-3f,
+        -0x1.a5e99cp-3f, -0x1.aa55acp-3f, -0x1.af082ap-3f, -0x1.b3ffaep-3f,
+        -0x1.b93978p-3f, -0x1.beb332p-3f, -0x1.c46a86p-3f, -0x1.ca5b5p-3f,
+        -0x1.d0826ap-3f, -0x1.d6dc9ep-3f, -0x1.dd648ep-3f, -0x1.e41658p-3f,
+        -0x1.eaee0ep-3f, -0x1.f1e54cp-3f, -0x1.f8f7a6p-3f, -0x1.00104ap-2f,
+        -0x1.03ac7ap-2f, -0x1.074dfap-2f, -0x1.0af254p-2f, -0x1.0e95cp-2f,
+        -0x1.1235b6p-2f, -0x1.15cfb4p-2f, -0x1.195fdep-2f, -0x1.1ce3b4p-2f,
+        -0x1.2058b6p-2f, -0x1.23bb28p-2f, -0x1.2708acp-2f, -0x1.2a3eeap-2f,
+        -0x1.2d5a6ap-2f, -0x1.30590cp-2f, -0x1.3338b4p-2f, -0x1.35f668p-2f,
+        -0x1.38906p-2f, -0x1.3b04ep-2f, -0x1.3d517ep-2f, -0x1.3f74ecp-2f,
+        -0x1.416dd6p-2f, -0x1.433a9ap-2f, -0x1.44da64p-2f, -0x1.464c7p-2f,
+        -0x1.478feep-2f, -0x1.48a4a8p-2f, -0x1.498a62p-2f, -0x1.4a4136p-2f,
+        -0x1.4ac98ap-2f, -0x1.4b23cp-2f, -0x1.4b50e4p-2f, -0x1.4b5204p-2f,
+        -0x1.4b280cp-2f, -0x1.4ad5p-2f, -0x1.4a5a8cp-2f, -0x1.49ba34p-2f,
+        -0x1.48f6e2p-2f, -0x1.4812cap-2f, -0x1.470ffap-2f, -0x1.45f23p-2f } },
+    // st +0.0  energy 0x1.8602ab0ea923ep+12  peak 0x1.ccccccp-1
+    { 0x1.8602ab0ea923ep+12, 0x1.ccccccp-1,
+      { -0x1.ee549ap-2f, -0x1.f311a2p-2f, -0x1.f6d0eap-2f, -0x1.f97cep-2f,
+        -0x1.fb011p-2f, -0x1.fb4a6cp-2f, -0x1.fa4768p-2f, -0x1.f7e834p-2f,
+        -0x1.f41eecp-2f, -0x1.eedf9ep-2f, -0x1.e8207cp-2f, -0x1.dfd9eep-2f,
+        -0x1.d606c6p-2f, -0x1.caa438p-2f, -0x1.bdb1cep-2f, -0x1.af31dp-2f,
+        -0x1.9f28dcp-2f, -0x1.8d9e26p-2f, -0x1.7a9b6p-2f, -0x1.662cb4p-2f,
+        -0x1.5060bcp-2f, -0x1.39484cp-2f, -0x1.20f68ap-2f, -0x1.0780acp-2f,
+        -0x1.d9fbccp-3f, -0x1.a30e74p-3f, -0x1.6a6eb6p-3f, -0x1.3054ecp-3f,
+        -0x1.e9f7eep-4f, -0x1.71422ep-4f, -0x1.ee0c86p-5f, -0x1.ef12f4p-6f,
+        0x1.ccccc8p-1f, -0x1.e099ep-6f, -0x1.17d2bep-3f, -0x1.b68ca2p-4f,
+        -0x1.782cp-3f, -0x1.43283p-3f, 0x1.d92fa8p-4f, 0x1.46b76p-5f,
+        0x1.9f63dap-6f, 0x1.9c9f2cp-4f, 0x1.5b6a7cp-3f, 0x1.9ea02p-4f,
+        0x1.39bda6p-3f, 0x1.bf0654p-4f, 0x1.dd518ap-3f, 0x1.362b56p-2f,
+        0x1.e860ap-3f, 0x1.1768d8p-2f, 0x1.f1bc86p-3f, 0x1.b873e8p-2f,
+        0x1.5746dcp-2f, 0x1.adea08p-2f, 0x1.41f4bcp-2f, 0x1.b9997ap-2f,
+        0x1.c3abap-2f, 0x1.62a69p-2f, 0x1.cee444p-2f, 0x1.d702ecp-2f,
+        0x1.bf3c42p-2f, 0x1.495222p-2f, 0x1.ea33f4p-2f, 0x1.b88548p-2f,
+        0x1.89cf2ap-2f, 0x1.863fe4p-2f, 0x1.5d7eaep-2f, 0x1.d4781ep-2f,
+        0x1.a99e86p-2f, 0x1.8a1888p-2f, 0x1.6f1b4ep-2f, 0x1.5dc9f6p-2f,
+        0x1.5977c8p-2f, 0x1.84b738p-2f, 0x1.7396a8p-2f, 0x1.23857p-2f,
+        0x1.465fccp-2f, 0x1.26f898p-2f, 0x1.1363cap-2f, 0x1.0f4658p-2f,
+        0x1.f27422p-3f, 0x1.f6fb68p-3f, 0x1.2087fp-2f, 0x1.ea8348p-3f,
+        0x1.0ad14cp-2f, 0x1.376c8p-2f, 0x1.e11eep-3f, 0x1.08acfp-2f,
+        0x1.2ee4ap-2f, 0x1.004224p-2f, 0x1.e2b524p-3f, 0x1.cd731p-3f,
+        0x1.f4562p-3f, 0x1.227e8cp-2f, 0x1.c6f628p-3f, 0x1.0dde9p-2f } },
+    // st +5.0  energy 0x1.8730c76b5ffc8p+12  peak 0x1.0fa7dcp-1
+    { 0x1.8730c76b5ffc8p+12, 0x1.0fa7dcp-1,
+      { 0x1.129fc4p-3f, 0x1.0a24e2p-3f, 0x1.f9baa8p-4f, 0x1.e27d7ep-4f,
+        0x1.c70308p-4f, 0x1.b359fp-4f, 0x1.9c908p-4f, 0x1.8380f4p-4f,
+        0x1.78c272p-4f, 0x1.685166p-4f, 0x1.56aa9ap-4f, 0x1.4604c4p-4f,
+        0x1.31b5a6p-4f, 0x1.29e05cp-4f, 0x1.1d72e4p-4f, 0x1.1c06a2p-4f,
+        0x1.12d01p-4f, 0x1.08c60ep-4f, 0x1.09903ep-4f, 0x1.00a954p-4f,
+        0x1.00c5f8p-4f, 0x1.e43aa8p-5f, 0x1.f867fep-5f, 0x1.f3a25p-5f,
+        0x1.f15ca6p-5f, 0x1.f72f12p-5f, 0x1.e25086p-5f, 0x1.eb60dp-5f,
+        0x1.e28c5cp-5f, 0x1.efc12ep-5f, 0x1.e190eep-5f, 0x1.cb5f8p-5f,
+        0x1.bdf74cp-5f, 0x1.9e9eacp-5f, 0x1.9aec7ep-5f, 0x1.88c17ap-5f,
+        0x1.7deefcp-5f, 0x1.591a66p-5f, 0x1.29721cp-5f, 0x1.060e2p-5f,
+        0x1.a7b89ep-6f, 0x1.73fa3p-6f, 0x1.10aa96p-6f, 0x1.890ebap-7f,
+        0x1.80f4e4p-8f, -0x1.39b32p-11f, -0x1.687508p-8f, -0x1.9800e8p-7f,
+        -0x1.23268ep-6f, -0x1.83c27cp-6f, -0x1.d4db2cp-6f, -0x1.0e8aaep-5f,
+        -0x1.26921p-5f, -0x1.4569a6p-5f, -0x1.634946p-5f, -0x1.83da56p-5f,
+        -0x1.a0bebcp-5f, -0x1.b28d32p-5f, -0x1.b647bp-5f, -0x1.c34174p-5f,
+        -0x1.cbaf18p-5f, -0x1.d6c42cp-5f, -0x1.defdbap-5f, -0x1.e31006p-5f,
+        -0x1.eab96p-5f, -0x1.ed75b2p-5f, -0x1.efa818p-5f, -0x1.e5eee8p-5f,
+        -0x1.e46bc6p-5f, -0x1.f13f94p-5f, -0x1.f8058p-5f, -0x1.f7cb8ep-5f,
+        -0x1.f2441ap-5f, -0x1.f83eb4p-5f, -0x1.fc69c8p-5f, -0x1.07e956p-4f,
+        -0x1.131ae8p-4f, -0x1.1daaf8p-4f, -0x1.277dfap-4f, -0x1.313582p-4f,
+        -0x1.3fb9b6p-4f, -0x1.4cc1dep-4f, -0x1.62b496p-4f, -0x1.7c7da4p-4f,
+        -0x1.919862p-4f, -0x1.a5297ap-4f, -0x1.be0ae6p-4f, -0x1.d5948ap-4f,
+        -0x1.e9ba66p-4f, -0x1.0337b2p-3f, -0x1.0f5a42p-3f, -0x1.1d3832p-3f,
+        -0x1.296d96p-3f, -0x1.3606d4p-3f, -0x1.42c72cp-3f, -0x1.4cafep-3f } },
+    // st +12.0  energy 0x1.86d889e3c29b1p+12  peak 0x1.26f58ep-1
+    { 0x1.86d889e3c29b1p+12, 0x1.26f58ep-1,
+      { 0x1.3a2588p-2f, 0x1.3e016ep-2f, 0x1.429a6ap-2f, 0x1.478498p-2f,
+        0x1.4c5548p-2f, 0x1.50a83ep-2f, 0x1.5422a8p-2f, 0x1.567754p-2f,
+        0x1.57689ap-2f, 0x1.56caf8p-2f, 0x1.548568p-2f, 0x1.509288p-2f,
+        0x1.4aff18p-2f, 0x1.43e9bap-2f, 0x1.3b7ffep-2f, 0x1.31fcb8p-2f,
+        0x1.27a438p-2f, 0x1.1cc1c2p-2f, 0x1.11a346p-2f, 0x1.0696b4p-2f,
+        0x1.f7cb8ap-3f, 0x1.e3a7a6p-3f, 0x1.d13424p-3f, 0x1.c0ccecp-3f,
+        0x1.b2b1d8p-3f, 0x1.a70708p-3f, 0x1.9dd1cep-3f, 0x1.96fb6ap-3f,
+        0x1.9250eap-3f, 0x1.8f8828p-3f, 0x1.8e4198p-3f, 0x1.8e0f4ep-3f,
+        0x1.8e7808p-3f, 0x1.8eff24p-3f, 0x1.8f280ep-3f, 0x1.8e7e28p-3f,
+        0x1.8c978cp-3f, 0x1.891c08p-3f, 0x1.83c636p-3f, 0x1.7c68ecp-3f,
+        0x1.72ee3ap-3f, 0x1.675a9ap-3f, 0x1.59c9bap-3f, 0x1.4a6f7cp-3f,
+        0x1.3992acp-3f, 0x1.278c1ep-3f, 0x1.14bfccp-3f, 0x1.019ae4p-3f,
+        0x1.dd1804p-4f, 0x1.b801d2p-4f, 0x1.94bd9p-4f, 0x1.740178p-4f,
+        0x1.56616ap-4f, 0x1.3c4f08p-4f, 0x1.260e7ep-4f, 0x1.13ba5cp-4f,
+        0x1.053c74p-4f, 0x1.f4ab3ep-5f, 0x1.e5355ap-5f, 0x1.dafffcp-5f,
+        0x1.d4b344p-5f, 0x1.d0d452p-5f, 0x1.cdc8bep-5f, 0x1.c9f76p-5f,
+        0x1.c3cd32p-5f, 0x1.b9dd6p-5f, 0x1.aae35ep-5f, 0x1.95dfe2p-5f,
+        0x1.7a15d4p-5f, 0x1.572102p-5f, 0x1.2ceb86p-5f, 0x1.f77a6ap-6f,
+        0x1.885314p-6f, 0x1.0e2e24p-6f, 0x1.1698ccp-7f, 0x1.327afp-13f,
+        -0x1.1330ap-7f, -0x1.15869cp-6f, -0x1.9e50a6p-6f, -0x1.107a44p-5f,
+        -0x1.4d6356p-5f, -0x1.84b8cep-5f, -0x1.b59834p-5f, -0x1.df6278p-5f,
+        -0x1.00e912p-4f, -0x1.0e77b6p-4f, -0x1.188ffp-4f, -0x1.1f88b6p-4f,
+        -0x1.23e166p-4f, -0x1.263428p-4f, -0x1.27367cp-4f, -0x1.27a954p-4f,
+        -0x1.2857eap-4f, -0x1.2a0686p-4f, -0x1.2d716ep-4f, -0x1.333bb4p-4f } },
+    };
+
+    // The bed: a 110 Hz harmonic sustain with a strike every half second.
+    std::vector<float> bed(static_cast<size_t>(refLen), 0.0f);
+    {
+        const double twoPi = 6.283185307179586;
+        for (int p = 1; p <= 7; ++p)
+            for (int n = 0; n < refLen; ++n)
+                bed[static_cast<size_t>(n)] += static_cast<float>(
+                    (0.30 / p) * std::sin(twoPi * 110.0 * p * n / refRate));
+        uint64_t lcg = 0x5EEDu;
+        for (int t = 24000; t < refLen; t += 24000)
+            for (int k = 0; k < 240 && t + k < refLen; ++k)
+            {
+                lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+                const float r = static_cast<float>(static_cast<uint32_t>(lcg >> 33))
+                              / 2147483648.0f - 1.0f;
+                const float env = static_cast<float>(0.9 * std::exp(-k / 40.0));
+                bed[static_cast<size_t>(t + k)] += env * (k == 0 ? 1.0f : 0.4f * r);
+            }
+    }
+
+    int movedSamples = 0, movedEnergy = 0, movedPeak = 0;
+    double worstSample = 0.0;
+    for (int c = 0; c < 4; ++c)
+    {
+        auto ps = std::make_unique<PitchShifter<float>>();
+        ps->prepare(spec(static_cast<double>(refRate), refBlock, 1), refFft);
+        ps->setSemitones(refSemitones[c]);
+        ps->setMix(1.0f);
+
+        std::vector<float> y = bed;
+        for (int pos = 0; pos < refLen; pos += refBlock)
+        {
+            const int n = std::min(refBlock, refLen - pos);
+            float* ch[1] = { y.data() + pos };
+            AudioBufferView<float> view(ch, 1, n);
+            ps->processBlock(view);
+        }
+
+        double e = 0.0, pk = 0.0;
+        for (int n = 0; n < refLen; ++n)
+        {
+            const double v = static_cast<double>(y[static_cast<size_t>(n)]);
+            e += v * v;
+            pk = std::max(pk, std::fabs(v));
+        }
+
+        for (int i = 0; i < refCount; ++i)
+        {
+            const double d = std::fabs(static_cast<double>(y[static_cast<size_t>(refStart + i)])
+                                       - static_cast<double>(refs[c].s[i]));
+            if (d > worstSample) worstSample = d;
+            if (d > sampleTol)
+            {
+                if (movedSamples == 0)
+                    std::cerr << "    st " << refSemitones[c] << " sample " << i
+                              << ": stored " << refs[c].s[i] << ", rendered "
+                              << y[static_cast<size_t>(refStart + i)] << "\n";
+                ++movedSamples;
+            }
+        }
+        if (std::fabs(e - refs[c].energy) > relTol * refs[c].energy)
+        {
+            std::cerr << "    st " << refSemitones[c] << " energy: stored "
+                      << refs[c].energy << ", rendered " << e << "\n";
+            ++movedEnergy;
+        }
+        if (std::fabs(pk - refs[c].peak) > relTol * refs[c].peak)
+        {
+            std::cerr << "    st " << refSemitones[c] << " peak: stored "
+                      << refs[c].peak << ", rendered " << pk << "\n";
+            ++movedPeak;
+        }
+    }
+    if (worstSample > 0.0)
+        std::cerr << "    worst stored-sample deviation " << worstSample << "\n";
+    EXPECT_EQ(movedSamples, 0);
+    EXPECT_EQ(movedEnergy, 0);
+    EXPECT_EQ(movedPeak, 0);
+}
+
 // The peak scan of the vocoder engine (inherited verbatim from the old
 // PitchShifter body) walked candidate bins up to numBins-2 and tested
 // mag[k+2], reading ONE FLOAT PAST THE END of the magnitude array whenever

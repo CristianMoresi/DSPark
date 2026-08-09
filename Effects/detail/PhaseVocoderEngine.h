@@ -47,18 +47,29 @@
  *   the cost of the whole rest of the engine (stereo, 2048-sample frame,
  *   48 kHz, 512-sample blocks, 42.7 s of audio, best of five runs), because
  *   a median runs per bin per frame while the transform runs once per frame.
- * - **Onset detection**: half-wave-rectified spectral flux over a
- *   log-frequency triangular filterbank (quarter-tone spacing, 27.5 Hz to
- *   16 kHz), compressed as log10(x + 1), differenced against a
- *   three-neighbour frequency maximum filter of the previous frame so that
- *   vibrato does not read as an attack (Boeck & Widmer, "Maximum filter
- *   vibrato suppression for onset detection", DAFx-13). A frame fires when
- *   that flux rises a fixed amount above the running median of the recent
- *   flux history. The broadband frame-energy test this replaces cannot see a
- *   strike over a sustained bed at all: on a strike over a 110 Hz harmonic
- *   bed the weakest onset frame carries 0.13 dB more energy than the median
- *   non-onset frame, against the 6 dB that test needed, where the flux above
- *   carries 14.46 dB.
+ * - **Onset detection**, selected by the owner at prepare(). Two detectors
+ *   live here because the two owners want different things from one, and
+ *   neither answer is right for both:
+ *   - the *broadband frame-energy* test (the default): a frame fires when
+ *     its total magnitude-squared rises 6 dB over an envelope that decays
+ *     at 0.7 per frame. It is deliberately blunt, and an owner whose
+ *     rendering is already published stays on it because its firings are
+ *     part of that rendering;
+ *   - *half-wave-rectified spectral flux* over a log-frequency triangular
+ *     filterbank (quarter-tone spacing, 27.5 Hz to 16 kHz), compressed as
+ *     log10(x + 1), differenced against a three-neighbour frequency maximum
+ *     filter of the previous frame so that vibrato does not read as an
+ *     attack (Boeck & Widmer, "Maximum filter vibrato suppression for onset
+ *     detection", DAFx-13). A frame fires when that flux rises a fixed
+ *     amount above the running median of the recent flux history.
+ *   The energy test cannot see a strike over a sustained bed at all: on a
+ *   strike over a 110 Hz harmonic bed the weakest onset frame carries
+ *   0.13 dB more energy than the median non-onset frame, against the 6 dB
+ *   that test needs, where the flux carries 14.46 dB. An owner that drives a
+ *   hop schedule from onsets therefore asks for the flux detector; an owner
+ *   that only resets phase on them, and whose users already have renders on
+ *   disk, does not, because a more sensitive detector resets phase more
+ *   often and that is audible on material with strikes over sustain.
  * - **Transient phase reset**: a firing frame re-initialises synthesis
  *   phases to the analysis phases. Peaks with no history (new partials) are
  *   reset individually even without a global onset.
@@ -225,18 +236,46 @@ public:
      *                             lock and the reader runs past the write head
      *                             into ring content no frame has written yet.
      *                             Measured on a click train, which is 84%
-     *                             silence: locking the hop under a
+     *                             silence - 48 kHz, 10 s at 120 BPM, a
+     *                             2048-sample frame, over -12 to +12
+     *                             semitones: locking the hop under a
      *                             resample-back reader raises the output RMS by
      *                             0.8 to 5.9 dB, which is energy appearing in
-     *                             the silence. The lock also buys such an owner
+     *                             the silence. How far it rises is a property
+     *                             of that bed - a sparser one has more silence
+     *                             to fill - so the range is a reading and not
+     *                             a bound. The lock also buys such an owner
      *                             nothing, because resampling puts the strike
      *                             back where it started whatever the analysis
      *                             hop did.
+     * @param spectralFluxDetector True to detect onsets by log-filterbank
+     *                             spectral flux, false to keep the broadband
+     *                             frame-energy test (see the file doc). It is
+     *                             the owner's choice and not the engine's,
+     *                             and it defaults to the energy test, because
+     *                             the detector decides where phase is reset
+     *                             and so it is part of an owner's rendering:
+     *                             an owner whose output has already been
+     *                             released cannot change detector without
+     *                             changing renders its users already have.
+     *                             Measured on strikes over a sustained bed,
+     *                             switching an owner from the energy test to
+     *                             the flux detector moves strike
+     *                             concentration by up to -91.6% and adds up
+     *                             to 16.5 dB of pre-echo. Only an owner that
+     *                             needs onsets its schedule can act on -
+     *                             which the energy test cannot supply over
+     *                             sustained material - should ask for it, and
+     *                             its own acceptance measurements then cover
+     *                             it. False also leaves the filterbank
+     *                             unallocated and the flux front end
+     *                             permanently off.
      * @return true if the engine (re)allocated and is ready for reset().
      */
     bool prepare(double sampleRate, int numChannels, int fftSize,
                  bool resampleCompensation, bool separationSupport = false,
-                 bool transientLockedHop = false)
+                 bool transientLockedHop = false,
+                 bool spectralFluxDetector = false)
     {
         if (!(sampleRate > 0.0) || !std::isfinite(sampleRate) || numChannels < 1
             || (fftSize & (fftSize - 1)) != 0 || fftSize < 256 || fftSize > (1 << 20))
@@ -287,21 +326,44 @@ public:
         rotIm_.resize(static_cast<size_t>(numBins_));
         peakBin_.resize(static_cast<size_t>(numBins_ / 2 + 2));
 
-        // Onset detection front end. Everything it needs per frame is sized
+        // Onset detection front end, sized only for the owner that asked for
+        // it. Everything the flux detector needs per frame is allocated
         // here: the filterbank tables, the two band frames it differences,
-        // and the flux history the running median is taken over.
-        buildOnsetFilterBank();
-        bandCur_.assign(static_cast<size_t>(numBands_), T(0));
-        bandPrev_.assign(static_cast<size_t>(numBands_), T(0));
-        bandMaxPrev_.assign(static_cast<size_t>(numBands_), T(0));
-        fluxHist_.assign(static_cast<size_t>(kFluxWindow), 0.0);
-        fluxScratch_.assign(static_cast<size_t>(kFluxWindow), 0.0);
-        // Un-normalised |X| grows linearly with the frame length, so the
-        // band accumulation is referred to a 2048-sample frame before the
-        // log compression: the growth cancels and one firing threshold means
-        // the same sensitivity at every frame size. fftSize is a power of
-        // two, so the factor is exact and introduces no rounding.
-        odfScale_ = static_cast<T>(kOdfRefFrame / static_cast<double>(fftSize_));
+        // and the flux history the running median is taken over. An owner on
+        // the frame-energy test allocates none of it and runs the same
+        // detector, over the same magnitudes, as it did before this
+        // selection existed.
+        fluxDetectorEnabled_ = spectralFluxDetector;
+        if (fluxDetectorEnabled_)
+        {
+            buildOnsetFilterBank();
+            bandCur_.assign(static_cast<size_t>(numBands_), T(0));
+            bandPrev_.assign(static_cast<size_t>(numBands_), T(0));
+            bandMaxPrev_.assign(static_cast<size_t>(numBands_), T(0));
+            fluxHist_.assign(static_cast<size_t>(kFluxWindow), 0.0);
+            fluxScratch_.assign(static_cast<size_t>(kFluxWindow), 0.0);
+            // Un-normalised |X| grows linearly with the frame length, so the
+            // band accumulation is referred to a 2048-sample frame before
+            // the log compression: the growth cancels and one firing
+            // threshold means the same sensitivity at every frame size.
+            // fftSize is a power of two, so the factor is exact and
+            // introduces no rounding.
+            odfScale_ = static_cast<T>(kOdfRefFrame / static_cast<double>(fftSize_));
+        }
+        else
+        {
+            numBands_ = 0;
+            fbStart_.clear();
+            fbOffset_.clear();
+            fbCount_.clear();
+            fbWeights_.clear();
+            bandCur_.clear();
+            bandPrev_.clear();
+            bandMaxPrev_.clear();
+            fluxHist_.clear();
+            fluxScratch_.clear();
+            odfScale_ = T(1);
+        }
         // One lock spans every analysis frame whose window can contain the
         // strike; that count is a property of the window geometry, not of
         // any signal. An owner that did not ask for the locked hop gets a
@@ -369,6 +431,7 @@ public:
         std::fill(fluxHist_.begin(), fluxHist_.end(), 0.0);
         fluxPos_ = 0;
         fluxFilled_ = 0;
+        onsetEnv_ = 0.0;
         lockLeft_ = 0;
         debt_ = 0.0;
 
@@ -599,10 +662,17 @@ private:
      * as a debt, which unlocked hops repay by up to Rs/2 apiece. Rs/2 is the
      * smallest binary fraction that clears one lock's debt inside one
      * unlocked hop over the +-10% band this device is built for
-     * (k >= N * (1 - ratio) / ratio = 0.444 there); a quarter of a hop does
-     * not, and a whole hop measures identically to a half, because past that
-     * point what binds is the existence of the unlocked hop and not its
-     * width.
+     * (k >= N * (1 - ratio) / ratio = 0.444 there), and a quarter of a hop
+     * does not.
+     *
+     * The cost of the smaller cap is not visible in the timing of the strikes
+     * that do lock - those read the same to the sample either way - but in
+     * how many strikes lock at all. Measured at 16 strikes per second: a
+     * quarter-hop cap leaves 103 of 479 strikes with no lock, because the
+     * previous lock's debt is still outstanding when the next strike arrives,
+     * where a half-hop cap locks 478 of them. A whole hop measures
+     * identically to a half, because past that point what binds is the
+     * existence of the unlocked hop and not its width.
      */
     [[nodiscard]] int computeAnalysisHop() noexcept
     {
@@ -630,15 +700,16 @@ private:
     /**
      * @brief Arms the transient lock for this frame, or refuses to.
      *
-     * Three refusals, and dropping any one of them costs measurable timing
-     * accuracy at dense strike rates. A firing inside an engaged lock is
-     * ignored, so one strike buys one lock and a burst cannot chain them. A
-     * lock does not arm while any debt is outstanding, which is what keeps
-     * the debt from accumulating across strikes: every lock starts from
-     * zero, so its maximum is a property of the ratio alone and not of the
-     * tempo. And no lock arms on the very first frame, which always reports
-     * an onset by construction and would otherwise open every stream,
-     * stationary material included, with a lock nothing asked for.
+     * Three refusals. A firing inside an engaged lock is ignored, so one
+     * strike buys one lock and a burst cannot chain them. A lock does not arm
+     * while any debt is outstanding, which is what keeps the debt from
+     * accumulating across strikes - every lock starts from zero, so its
+     * maximum is a property of the ratio alone and not of the tempo - and it
+     * is the refusal that carries the timing: at 16 strikes per second the
+     * worst per-onset displacement is 1.71 ms with it and 4.40 ms without.
+     * And no lock arms on the very first frame, which always reports an onset
+     * by construction and would otherwise open every stream, stationary
+     * material included, with a lock nothing asked for.
      */
     void armTransientLock(bool transient) noexcept
     {
@@ -721,6 +792,44 @@ private:
     }
 
     /**
+     * @brief The onset test the owner selected at prepare().
+     *
+     * The first frame always reports true whichever detector is running:
+     * there is no history to compare against, and a stream's first frame has
+     * no previous synthesis phase to propagate from either.
+     */
+    [[nodiscard]] bool detectTransient() noexcept
+    {
+        return fluxDetectorEnabled_ ? detectTransientByFlux()
+                                    : detectTransientByEnergy();
+    }
+
+    /**
+     * @brief Broadband frame-energy onset test: a 6 dB rise over an envelope
+     * that decays at 0.7 per frame.
+     *
+     * Blunt by construction. It cannot see an attack that does not lift the
+     * whole frame's energy, which is why an owner driving a hop schedule off
+     * onsets asks for the flux detector instead. It is kept, and kept exact,
+     * because the firings of a published effect are part of what that effect
+     * sounds like: changing them changes renders that already exist.
+     */
+    [[nodiscard]] bool detectTransientByEnergy() noexcept
+    {
+        double energy = 0.0;
+        for (int k = 0; k < numBins_; ++k)
+        {
+            const double m = static_cast<double>(mag_[static_cast<size_t>(k)]);
+            energy += m * m;
+        }
+        const double prevEnv = onsetEnv_;
+        onsetEnv_ = std::max(energy, onsetEnv_ * 0.7);
+        if (!transientOn_)
+            return firstFrame_;
+        return firstFrame_ || (energy > 4.0 * prevEnv && energy > 1e-12);
+    }
+
+    /**
      * @brief Half-wave-rectified spectral flux over the log-frequency
      * filterbank, fired against the running median of its own history.
      *
@@ -735,12 +844,9 @@ private:
      *
      * The history is advanced on every frame, whether or not transient
      * handling is engaged, so that switching the parameter on mid-stream
-     * finds a full window behind it rather than an empty one. The first
-     * frame always reports true: there is no history to compare against, and
-     * a stream's first frame has no previous synthesis phase to propagate
-     * from either.
+     * finds a full window behind it rather than an empty one.
      */
-    [[nodiscard]] bool detectTransient() noexcept
+    [[nodiscard]] bool detectTransientByFlux() noexcept
     {
         const double flux = computeSpectralFlux();
 
@@ -1320,9 +1426,14 @@ private:
     std::vector<int> peakBin_;
     int numPeaks_ = 0;
 
-    // Onset detection: log-frequency filterbank tables, the two band frames
-    // the flux is taken between, and the flux history the firing threshold's
-    // running median is taken over. All sized in prepare().
+    // Onset detection. The frame-energy test needs one scalar; the flux
+    // detector needs the log-frequency filterbank tables, the two band
+    // frames the flux is taken between, and the flux history the firing
+    // threshold's running median is taken over. Which of the two runs is the
+    // owner's choice, fixed in prepare(), and only the selected one is
+    // allocated for.
+    bool fluxDetectorEnabled_ = false;        ///< Owner asked for spectral flux.
+    double onsetEnv_ = 0.0;                   ///< Frame-energy test's tracked envelope.
     std::vector<int> fbStart_, fbOffset_, fbCount_;
     std::vector<T> fbWeights_;
     int numBands_ = 0;

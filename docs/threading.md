@@ -207,14 +207,31 @@ it, which is a stale position a full beat period old. So the pair is ordered:
 the latch is stored with release and `beatNow()` loads it with acquire, which
 costs nothing on x86 and one instruction on ARM.
 
-With that ordering, the two reader orders are covered separately and both are
-safe. A reader that tests the latch and *then* reads the position is guaranteed
-the position from that same call or a later one, never an earlier one. A reader
-that takes the position first and tests the latch second can still pair a
-position with the latch of the *next* call, which reports a later real beat and
-never a position no beat occupied. Neither order can produce a stale answer,
-which is the claim this section makes and the reason these two readouts need no
-publication mechanism beyond the pairing.
+That ordering makes exactly ONE reader order safe, and it is the order to use:
+test the latch with `beatNow()` first, and read `getLastBeatSample()` second.
+Then the position is the one written in the same processing call that set the
+latch, or in a later one -- never an earlier one.
+
+The reverse order is not safe, and the reason has nothing to do with the memory
+model. `getLastBeatSample()` and `beatNow()` are two separate loads, and the
+writer is free to run between them: a reader that takes the position first and
+tests the latch second holds a position from before that pause and a latch from
+after it, so it is told a beat just happened and handed the position of an
+earlier one. The release/acquire pairing cannot help, because the two values
+the reader ends up with never came from the same call in the first place.
+
+The cost is a full beat, and it is not capped at one. Measured against this
+implementation with a writer on real-time-paced blocks and a pause between the
+reader's two loads: in the position-first order 179 of 181 latched observations
+carried a stale position, worst 1022.3 ms at 60 BPM (1.02 beat periods) and
+666.5 ms at 180 BPM (2.00 beat periods) -- the staleness is bounded by how long
+the reader takes between its own two loads, not by the beat period. In the
+latch-first order the same probe reports 0 stale positions out of 183. A caller
+that cannot
+guarantee the two loads stay adjacent -- one that reads the position in a
+message-thread timer and tests the latch elsewhere, say -- should not use these
+two readouts as a pair at all; it should treat the latch alone as the event and
+the position alone as a timestamp, or ask for a packed publication.
 
 The same class's `setTempoRange()` packs its two indices for the opposite
 reason: they travel control-to-audio, and half of one range combined with half

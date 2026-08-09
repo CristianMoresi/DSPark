@@ -495,6 +495,13 @@ beat happened in your own timeline;
 (549 samples, 12.4 ms, at 44.1 kHz). Use the former to align anything and the
 latter only to state your own delay.
 
+The order of those two calls is part of the contract, and the snippet above
+uses it: test `beatNow()` first, read `getLastBeatSample()` second. They are
+two separate loads and the processing call can run between them, so the
+reverse order hands you a fresh "a beat just happened" together with the
+position of an earlier beat -- measured at a full beat period, and at more than
+one when the two reads are further apart than a beat. See the threading page.
+
 One behaviour to know: with no onset energy arriving, the pulse estimate and
 the mass it is measured against decay together, so the confidence HOLDS its
 last value through silence instead of falling. A caller that needs to tell

@@ -182,6 +182,129 @@ Corpus polyrhythm(double barSeconds, double seconds, uint32_t seed = 17u)
     return c;
 }
 
+// Clicks from sample 0, with no lead-in silence at all: the shape every
+// corpus above avoids, and the one a caller feeding a file from its first
+// sample actually has.
+Corpus flushClickTrain(double bpm, double seconds, uint32_t seed = 7u)
+{
+    Corpus c;
+    c.bpm = bpm;
+    const int64_t n = static_cast<int64_t>((seconds + 1.0) * kFs);
+    c.x.assign(static_cast<size_t>(n), 0.0f);
+    const double period = 60.0 / bpm * kFs;
+    for (int k = 0;; ++k)
+    {
+        const double at = static_cast<double>(k) * period;
+        if (at > static_cast<double>(n) - kFs * 0.3) break;
+        addClick(c.x, static_cast<int64_t>(at), kFs, 1.0f, seed);
+        c.beats.push_back(static_cast<int64_t>(at));
+    }
+    return c;
+}
+
+// Quarter notes with a straight eighth between each pair, at a swept relative
+// amplitude. This is the direction the iteration-1 corpus never contained:
+// every accent there sat AT or BELOW the beat rate, which is the direction
+// coherence rejects unaided.
+Corpus subdivisionTrain(double bpm, double seconds, float offAmp, uint32_t seed = 23u)
+{
+    Corpus c;
+    c.bpm = bpm;
+    const int64_t n = static_cast<int64_t>((seconds + kLeadSeconds + 1.0) * kFs);
+    c.x.assign(static_cast<size_t>(n), 0.0f);
+    const double period = 60.0 / bpm * kFs;
+    const int64_t lead = static_cast<int64_t>(kLeadSeconds * kFs);
+    for (int k = 0;; ++k)
+    {
+        const double q = static_cast<double>(lead) + static_cast<double>(k) * period;
+        if (q > static_cast<double>(n) - kFs * 0.3) break;
+        addClick(c.x, static_cast<int64_t>(q), kFs, 1.0f, seed);
+        c.beats.push_back(static_cast<int64_t>(q));
+        const double off = q + 0.5 * period;
+        if (off < static_cast<double>(n) - kFs * 0.3)
+            addClick(c.x, static_cast<int64_t>(off), kFs, offAmp, seed);
+    }
+    return c;
+}
+
+// The same waveform read the other way up: a pulse at TWICE the rate whose
+// alternate events are attenuated. Used to show that the two are one signal.
+Corpus alternatingTrain(double bpm, double seconds, float weakAmp, uint32_t seed = 23u)
+{
+    Corpus c;
+    c.bpm = bpm;
+    const int64_t n = static_cast<int64_t>((seconds + kLeadSeconds + 1.0) * kFs);
+    c.x.assign(static_cast<size_t>(n), 0.0f);
+    const double period = 60.0 / bpm * kFs;
+    const int64_t lead = static_cast<int64_t>(kLeadSeconds * kFs);
+    for (int k = 0;; ++k)
+    {
+        const double at = static_cast<double>(lead) + static_cast<double>(k) * period;
+        if (at > static_cast<double>(n) - kFs * 0.3) break;
+        addClick(c.x, static_cast<int64_t>(at), kFs, (k % 2 == 0) ? 1.0f : weakAmp, seed);
+        c.beats.push_back(static_cast<int64_t>(at));
+    }
+    return c;
+}
+
+// Rubato: the instantaneous tempo swings sinusoidally about a centre. Unlike
+// jitter, successive intervals are correlated, so the interval-consistency
+// term is genuinely at stake instead of averaging out.
+Corpus rubatoTrain(double centreBpm, double depth, double cycleSeconds,
+                   double seconds, uint32_t seed = 29u)
+{
+    Corpus c;
+    c.bpm = centreBpm;
+    const int64_t n = static_cast<int64_t>((seconds + kLeadSeconds + 1.0) * kFs);
+    c.x.assign(static_cast<size_t>(n), 0.0f);
+    const int64_t lead = static_cast<int64_t>(kLeadSeconds * kFs);
+    double t = 0.0;
+    for (;;)
+    {
+        const int64_t at = lead + static_cast<int64_t>(std::llround(t * kFs));
+        if (static_cast<double>(at) > static_cast<double>(n) - kFs * 0.3) break;
+        addClick(c.x, at, kFs, 1.0f, seed);
+        c.beats.push_back(at);
+        const double bpm = centreBpm * (1.0 + depth
+                                        * std::sin(twoPi<double> * t / cycleSeconds));
+        t += 60.0 / bpm;
+    }
+    return c;
+}
+
+// A sparse bar pattern with the loudest event of the bar off the beat and no
+// onset at all on beat 4. The grid can only be carried across that by the
+// interval term, so this is the case a tightness of nothing loses.
+Corpus sparsePattern(double bpm, double seconds, uint32_t seed = 31u)
+{
+    Corpus c;
+    c.bpm = bpm;
+    const int64_t n = static_cast<int64_t>((seconds + kLeadSeconds + 1.0) * kFs);
+    c.x.assign(static_cast<size_t>(n), 0.0f);
+    const double period = 60.0 / bpm * kFs;
+    const int64_t lead = static_cast<int64_t>(kLeadSeconds * kFs);
+    const double events[4][2] = { { 0.0, 1.0 }, { 1.0, 0.9 }, { 1.75, 0.75 }, { 3.0, 0.9 } };
+    for (int bar = 0;; ++bar)
+    {
+        const double at = static_cast<double>(lead) + static_cast<double>(bar) * 4.0 * period;
+        if (at > static_cast<double>(n) - kFs * 0.3) break;
+        for (int b = 0; b < 4; ++b)
+        {
+            const double q = at + static_cast<double>(b) * period;
+            if (q <= static_cast<double>(n) - kFs * 0.3)
+                c.beats.push_back(static_cast<int64_t>(q));
+        }
+        for (const auto& e : events)
+        {
+            const double q = at + e[0] * period;
+            if (q <= static_cast<double>(n) - kFs * 0.3)
+                addClick(c.x, static_cast<int64_t>(q), kFs, static_cast<float>(e[1]), seed);
+        }
+    }
+    std::sort(c.beats.begin(), c.beats.end());
+    return c;
+}
+
 void addNoiseBed(std::vector<float>& x, float rms, uint32_t seed)
 {
     rngState = seed;
@@ -611,6 +734,166 @@ DSPARK_TEST(Beat_secondary_hypothesis_names_and_discounts)
 }
 
 // ---------------------------------------------------------------------------
+// Tightness
+// ---------------------------------------------------------------------------
+
+// The tightness sweep, on a bed that can actually show tightness -- and the
+// proof that it can, which comes first. On isochronous clicks the optimal
+// interval equals the target period exactly, so the transition cost is
+// identically zero and the parameter multiplies nothing: a sweep run there
+// reports a spread of zero whatever the code does, and the run that proves it
+// is the one with the mechanism DELETED. This case asserts both directions:
+// the bed moves when the mechanism is deleted, the old bed does not, and the
+// shipped default beats the paper's 400 at the worst point of the bed.
+DSPARK_TEST(Beat_tightness_measured_where_the_interval_term_is_live)
+{
+    constexpr double kFloorAlpha = 1e-3;   // below the clamp: the term is gone
+
+    // (a) capability. The bed is disqualified unless deleting the mechanism
+    // changes the grid; the steady bed is shown failing that test.
+    const Corpus rub = rubatoTrain(120.0, 0.15, 8.0, 20.0);
+    const Corpus clean = clickTrain(120.0, 20.0);
+    const auto rubFloor = analyzeCorpus(rub, kFloorAlpha);
+    const auto rubTight = analyzeCorpus(rub, 4000.0);
+    const auto cleanFloor = analyzeCorpus(clean, kFloorAlpha);
+    const auto cleanTight = analyzeCorpus(clean, 4000.0);
+    std::cout << "  capability control: rubato grids at alpha 0.001 vs 4000 "
+              << (rubFloor.beatSamples == rubTight.beatSamples ? "IDENTICAL" : "differ")
+              << "; clean clicks "
+              << (cleanFloor.beatSamples == cleanTight.beatSamples ? "IDENTICAL" : "differ")
+              << "\n";
+    EXPECT_TRUE(rubFloor.beatSamples != rubTight.beatSamples);
+    EXPECT_TRUE(cleanFloor.beatSamples == cleanTight.beatSamples);
+
+    // (b) the sweep, reported at its worst case with the case named.
+    const Corpus sparse = sparsePattern(96.0, 20.0);
+    double worstDefault = 1.0, worstPaper = 1.0, worstFloor = 1.0;
+    for (const auto& c : { rub, sparse, clean })
+    {
+        const double fDefault = scoreBeats(c.beats, analyzeCorpus(c).beatSamples, 70.0).f;
+        const double fPaper = scoreBeats(c.beats, analyzeCorpus(c, 400.0).beatSamples, 70.0).f;
+        const double fFloor = scoreBeats(c.beats,
+                                         analyzeCorpus(c, kFloorAlpha).beatSamples, 70.0).f;
+        std::cout << "    " << c.bpm << " BPM case: F at the default "
+                  << fDefault << ", at alpha=400 " << fPaper << ", with the term deleted "
+                  << fFloor << "\n";
+        worstDefault = std::min(worstDefault, fDefault);
+        worstPaper = std::min(worstPaper, fPaper);
+        worstFloor = std::min(worstFloor, fFloor);
+    }
+    std::cout << "  worst over the bed: default " << worstDefault << ", alpha=400 "
+              << worstPaper << ", term deleted " << worstFloor << "\n";
+    EXPECT_GT(worstDefault, 0.79);
+    EXPECT_LT(worstPaper, worstDefault);      // the paper's default is worse here
+    EXPECT_LT(worstFloor, worstDefault);      // and so is having no term at all
+}
+
+// ---------------------------------------------------------------------------
+// The metrical level, in both directions
+// ---------------------------------------------------------------------------
+
+// Onsets BETWEEN the beats -- eighth notes, the commonest event in music --
+// swept in amplitude. This is the direction the design says coherence cannot
+// reject unaided, so it is the direction that has to be measured rather than
+// assumed. The threshold is stated, not hidden: below it the beat is reported,
+// above it the eighth level is, and the beat is then in secondaryTempoBpm.
+DSPARK_TEST(Beat_octave_corpus_reaches_above_the_beat_rate)
+{
+    // Amplitudes below the measured threshold for each tempo, where the beat
+    // itself must be reported. The thresholds are not the same at every tempo
+    // and are not asserted to be: the level decision is settled by which rate
+    // is the likelier tactus, so it turns over sooner the further the beat
+    // sits below the preferred tapping rate.
+    struct Point { double bpm; std::vector<float> below; float above; };
+    const std::vector<Point> points = {
+        { 90.0,  { 0.05f, 0.10f, 0.20f },        0.40f },
+        { 100.0, { 0.05f, 0.10f, 0.20f, 0.30f }, 0.80f },
+        { 120.0, { 0.05f, 0.10f, 0.20f, 0.30f }, 0.90f },
+    };
+
+    int wrong = 0, total = 0;
+    for (const auto& pt : points)
+    {
+        const double bpm = pt.bpm;
+        for (const float amp : pt.below)
+        {
+            const Corpus c = subdivisionTrain(bpm, 20.0, amp);
+            const auto r = analyzeCorpus(c);
+            const Level l = classify(static_cast<double>(r.tempoBpm), bpm);
+            ++total;
+            if (l != Level::Correct) ++wrong;
+            std::cout << "  " << bpm << " BPM, eighths at " << amp << ": tempo "
+                      << static_cast<double>(r.tempoBpm) << " (" << levelName(l)
+                      << "), confidence " << static_cast<double>(r.confidence)
+                      << ", secondary " << static_cast<double>(r.secondaryTempoBpm) << "\n";
+            // Whatever it reports, it must offer a genuinely different
+            // reading to go to: non-zero, and at least the documented quarter
+            // of an octave away rather than the same peak one lag over.
+            const double sec = static_cast<double>(r.secondaryTempoBpm);
+            EXPECT_GT(sec, 0.0);
+            EXPECT_GT(std::abs(std::log2(sec / static_cast<double>(r.tempoBpm))), 0.249);
+        }
+    }
+    std::cout << "  wrong level below the stated thresholds: " << wrong << " of "
+              << total << " points (bound: 0)\n";
+    EXPECT_EQ(wrong, 0);
+
+    // Above the threshold the eighth level IS what is reported, and the
+    // documentation's promise there is that the beat is in the secondary. That
+    // promise is the one a caller acts on, so it is asserted at the point
+    // where it matters rather than assumed.
+    for (const auto& pt : points)
+    {
+        const Corpus loud = subdivisionTrain(pt.bpm, 20.0, pt.above);
+        const auto rl = analyzeCorpus(loud);
+        const Level l = classify(static_cast<double>(rl.tempoBpm), pt.bpm);
+        std::cout << "  " << pt.bpm << " BPM, eighths at " << pt.above << ": tempo "
+                  << static_cast<double>(rl.tempoBpm) << " (" << levelName(l)
+                  << "), confidence " << static_cast<double>(rl.confidence)
+                  << ", secondary " << static_cast<double>(rl.secondaryTempoBpm) << "\n";
+        EXPECT_TRUE(l == Level::Double);
+        EXPECT_NEAR(static_cast<double>(rl.secondaryTempoBpm), pt.bpm, 0.05 * pt.bpm);
+    }
+}
+
+// Why the confidence is not allowed to carry that decision, demonstrated
+// rather than asserted: straight eighths under a beat and a backbeat at twice
+// the rate are THE SAME WAVEFORM, sample for sample, with different correct
+// answers. No number computed from the signal can separate them, so the
+// documentation promises the secondary hypothesis instead.
+DSPARK_TEST(Beat_metrical_level_ambiguity_is_a_property_of_the_signal)
+{
+    const Corpus eighths = subdivisionTrain(120.0, 20.0, 0.6f);
+    const Corpus backbeat = alternatingTrain(240.0, 20.0, 0.6f);
+    EXPECT_EQ(eighths.x.size(), backbeat.x.size());
+    double worstDiff = 0.0;
+    const size_t n = std::min(eighths.x.size(), backbeat.x.size());
+    for (size_t i = 0; i < n; ++i)
+        worstDiff = std::max(worstDiff,
+                             std::abs(static_cast<double>(eighths.x[i] - backbeat.x[i])));
+    const auto a = analyzeCorpus(eighths);
+    const auto b = analyzeCorpus(backbeat);
+    std::cout << "  the two corpora differ by at most " << worstDiff
+              << " in sample value; reported tempo " << static_cast<double>(a.tempoBpm)
+              << " vs " << static_cast<double>(b.tempoBpm) << ", confidence "
+              << static_cast<double>(a.confidence) << " vs "
+              << static_cast<double>(b.confidence) << "\n";
+    EXPECT_LT(worstDiff, 1e-9);
+    EXPECT_NEAR(static_cast<double>(a.tempoBpm), static_cast<double>(b.tempoBpm), 1e-3);
+    EXPECT_NEAR(static_cast<double>(a.confidence), static_cast<double>(b.confidence), 1e-6);
+
+    // Where the two readings really are level, the confidence says so by
+    // collapsing -- which is the one thing about the level it CAN report.
+    const Corpus edge = subdivisionTrain(90.0, 20.0, 0.15f);
+    const auto e = analyzeCorpus(edge);
+    std::cout << "  at the level frontier (90 BPM, eighths at 0.15): tempo "
+              << static_cast<double>(e.tempoBpm) << ", confidence "
+              << static_cast<double>(e.confidence) << ", secondary "
+              << static_cast<double>(e.secondaryTempoBpm) << "\n";
+    EXPECT_LT(static_cast<double>(e.confidence), kUntrustworthy);
+}
+
+// ---------------------------------------------------------------------------
 // Causal path
 // ---------------------------------------------------------------------------
 
@@ -675,28 +958,70 @@ DSPARK_TEST(Beat_causal_lock_in_and_beat_placement)
 }
 
 // The causal readouts must not depend on how the host happens to cut the
-// stream into blocks.
+// stream into blocks. What is asserted is the ATTRIBUTED SAMPLE -- where the
+// tracker says the beat was, in the caller's timeline -- because that is the
+// quantity a caller aligns to and the only one that can be block-size
+// independent. When a beat is ANNOUNCED cannot be: the announcement waits for
+// the block that completes the analysis frame, so it moves with the block
+// size by construction, and a criterion written on the announcement would be
+// measuring the harness rather than the tracker.
 DSPARK_TEST(Beat_causal_output_is_block_size_independent)
 {
     const Corpus c = clickTrain(120.0, 20.0);
-    const auto a = runCausal(c, 64);
-    const auto b = runCausal(c, 512);
-    const auto d = runCausal(c, 1000);
-    std::cout << "  beats reported: 64 -> " << a.beatSamples.size() << ", 512 -> "
-              << b.beatSamples.size() << ", 1000 -> " << d.beatSamples.size() << "\n";
-    EXPECT_EQ(a.beatSamples.size(), b.beatSamples.size());
-    EXPECT_EQ(a.beatSamples.size(), d.beatSamples.size());
+    const auto reference = runCausal(c, 512);
     int64_t worst = 0;
-    const size_t m = std::min({ a.beatSamples.size(), b.beatSamples.size(),
-                                d.beatSamples.size() });
-    for (size_t i = 0; i < m; ++i)
+    for (const int block : { 1, 64, 128, 333, 1000, 4096 })
     {
-        worst = std::max<int64_t>(worst, std::llabs(a.beatSamples[i] - b.beatSamples[i]));
-        worst = std::max<int64_t>(worst, std::llabs(a.beatSamples[i] - d.beatSamples[i]));
+        const auto t = runCausal(c, block);
+        std::cout << "  block " << block << ": " << t.beatSamples.size() << " beats\n";
+        EXPECT_EQ(t.beatSamples.size(), reference.beatSamples.size());
+        const size_t m = std::min(t.beatSamples.size(), reference.beatSamples.size());
+        for (size_t i = 0; i < m; ++i)
+            worst = std::max<int64_t>(worst,
+                                      std::llabs(t.beatSamples[i] - reference.beatSamples[i]));
     }
-    std::cout << "  worst difference in attributed sample across block sizes: "
-              << worst << "\n";
+    std::cout << "  worst difference in attributed sample across block sizes 1 to 4096: "
+              << worst << " samples\n";
     EXPECT_EQ(worst, static_cast<int64_t>(0));
+}
+
+// The causal path over the WHOLE range the class accepts by default, with the
+// metrical level named per point. A sweep that stops short of the range the
+// class advertises leaves the ends of that range untested, and the ends are
+// where the multiples of the true period all fit inside the search: at the
+// bottom of 40..240 every candidate from twice to six times the truth is
+// searchable, and a resonator at a fifth of the true period receives every
+// pulse in phase.
+DSPARK_TEST(Beat_causal_covers_the_whole_default_range)
+{
+    std::vector<double> tempi = { 40.0, 42.0, 44.0, 46.0, 48.0 };
+    for (double bpm = 50.0; bpm <= 240.5; bpm += 10.0) tempi.push_back(bpm);
+
+    int wrong = 0;
+    double worstPct = 0.0, worstAt = 0.0;
+    for (const double bpm : tempi)
+    {
+        const Corpus c = clickTrain(bpm, 20.0);
+        const auto tr = runCausal(c, 512);
+        const Level l = classify(tr.bpm.empty() ? 0.0 : tr.bpm.back(), bpm);
+        const double got = tr.bpm.empty() ? 0.0 : tr.bpm.back();
+        if (l != Level::Correct)
+        {
+            ++wrong;
+            std::cout << "    " << bpm << " BPM -> " << got << " (" << levelName(l)
+                      << "), confidence " << tr.finalConfidence << "\n";
+        }
+        else
+        {
+            const double pct = (got - bpm) / bpm * 100.0;
+            if (std::abs(pct) > std::abs(worstPct)) { worstPct = pct; worstAt = bpm; }
+        }
+    }
+    std::cout << "  causal range sweep: wrong level at " << wrong << " of "
+              << tempi.size() << " points; worst in-level error " << worstPct
+              << "% at " << worstAt << " BPM\n";
+    EXPECT_EQ(wrong, 0);
+    EXPECT_LT(std::abs(worstPct), 1.0);
 }
 
 // On material the offline path also finds unreliable, the causal readout must
@@ -796,6 +1121,77 @@ DSPARK_TEST(Beat_onset_envelope_readout_advances_once_per_hop)
 
 // Setting the tempo range must be honoured and must not need to allocate,
 // so it stays callable while audio is running.
+// A signal that begins at sample 0 keeps its first beat. The analysis front
+// end's first frames are computed over a partly-filled ring, and discarding
+// them costs exactly the beat that sits at time zero -- one real beat at the
+// head of every signal with no lead-in, which is most files. The hazard that
+// discarding guards against is measured here too, in the case that produces
+// it: a full-level tone starting at sample 0 with no beat there must not
+// generate one.
+DSPARK_TEST(Beat_grid_keeps_the_first_beat_of_a_signal_that_starts_at_zero)
+{
+    for (const double bpm : { 90.0, 120.0, 200.0 })
+    {
+        const Corpus c = flushClickTrain(bpm, 20.0);
+        const auto r = analyzeCorpus(c);
+        const auto s = scoreBeats(c.beats, r.beatSamples, 70.0);
+        const double firstMs = r.beatSamples.empty()
+            ? -1.0 : static_cast<double>(r.beatSamples.front()) / kFs * 1000.0;
+        std::cout << "  " << bpm << " BPM from sample 0: F=" << s.f << ", "
+                  << r.beatSamples.size() << " beats for " << c.beats.size()
+                  << ", first at " << firstMs << " ms\n";
+        EXPECT_GT(s.f, 0.9999);
+        EXPECT_LT(firstMs, 20.0);
+    }
+
+    // The hazard: a step from silence into a sustained tone at sample 0, with
+    // the beats starting a second later. No beat may be reported before the
+    // first real one.
+    const double bpm = 120.0;
+    Corpus c;
+    c.bpm = bpm;
+    const int64_t n = static_cast<int64_t>(21.0 * kFs);
+    c.x.assign(static_cast<size_t>(n), 0.0f);
+    for (int64_t i = 0; i < n; ++i)
+        c.x[static_cast<size_t>(i)] = 0.5f * static_cast<float>(
+            std::sin(twoPi<double> * 220.0 * static_cast<double>(i) / kFs));
+    const double period = 60.0 / bpm * kFs;
+    for (int k = 0;; ++k)
+    {
+        const double at = kFs + static_cast<double>(k) * period;
+        if (at > static_cast<double>(n) - kFs * 0.3) break;
+        addClick(c.x, static_cast<int64_t>(at), kFs, 1.0f, 7u);
+        c.beats.push_back(static_cast<int64_t>(at));
+    }
+    const auto r = analyzeCorpus(c);
+    int before = 0;
+    for (const int64_t b : r.beatSamples)
+        if (b < c.beats.front() - static_cast<int64_t>(0.25 * period)) ++before;
+    std::cout << "  step into a sustained tone at sample 0: " << before
+              << " beats reported before the first real one, first at "
+              << (r.beatSamples.empty() ? -1.0
+                                        : static_cast<double>(r.beatSamples.front()) / kFs)
+              << " s\n";
+    EXPECT_EQ(before, 0);
+}
+
+// The front end's warm-up count is public, so its documented law is pinned at
+// more than one rate rather than merely asserted to be positive.
+DSPARK_TEST(Beat_warmup_frame_count_follows_its_documented_law)
+{
+    for (const double fs : { 44100.0, 96000.0 })
+    {
+        OnsetDetector<float> od;
+        od.prepare(AudioSpec{ fs, 512, 1 });
+        const int expected = od.getFftSize() / od.getHopSize() + 2;
+        std::cout << "  " << fs << " Hz: fft " << od.getFftSize() << ", hop "
+                  << od.getHopSize() << ", warm-up " << od.getWarmupFrames()
+                  << " (law says " << expected << ")\n";
+        EXPECT_EQ(od.getWarmupFrames(), expected);
+        EXPECT_GT(od.getWarmupFrames(), 2);
+    }
+}
+
 DSPARK_TEST(Beat_tempo_range_is_honoured_and_rejects_nonsense)
 {
     const Corpus c = clickTrain(160.0, 30.0);
@@ -824,7 +1220,7 @@ DSPARK_TEST(Beat_tempo_range_is_honoured_and_rejects_nonsense)
     EXPECT_NEAR(static_cast<double>(still.tempoBpm), 160.0, 1.0);
 
     bt.setTightness(std::numeric_limits<float>::quiet_NaN());
-    EXPECT_NEAR(static_cast<double>(bt.getTightness()), 400.0, 1e-3);
+    EXPECT_NEAR(static_cast<double>(bt.getTightness()), 100.0, 1e-3);
 }
 
 // Degenerate and hostile input must return an empty answer rather than a

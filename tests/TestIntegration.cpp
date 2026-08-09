@@ -200,6 +200,12 @@ DSPARK_TEST(ProcessorTraits_insert_effects_satisfy_AudioProcessor)
     EXPECT_TRUE((AudioProcessor<SpectralDenoiser<float>, float>));
     EXPECT_TRUE((AudioProcessor<StereoWidth<float>, float>));
     EXPECT_TRUE((AudioProcessor<TapeMachine<float>, float>));
+    // TimeStretch also offers a rate-changing pair of entry points beside the
+    // in-place block call. That pair is deliberately outside this contract,
+    // but the block call is inside it and must stay inside it: an insert that
+    // stopped satisfying this would break every chain it sits in, and adding
+    // a streaming surface is exactly the kind of change that could do it.
+    EXPECT_TRUE((AudioProcessor<TimeStretch<float>, float>));
     EXPECT_TRUE((AudioProcessor<TransformerModel<float>, float>));
     EXPECT_TRUE((AudioProcessor<TransientDesigner<float>, float>));
     EXPECT_TRUE((AudioProcessor<Tremolo<float>, float>));
@@ -209,6 +215,7 @@ DSPARK_TEST(ProcessorTraits_insert_effects_satisfy_AudioProcessor)
     // Double-precision spot checks (the contract is type-parametric).
     EXPECT_TRUE((AudioProcessor<Gain<double>, double>));
     EXPECT_TRUE((AudioProcessor<Saturation<double>, double>));
+    EXPECT_TRUE((AudioProcessor<TimeStretch<double>, double>));
 }
 
 // SampleProcessor refines AudioProcessor with per-sample scalar processing;

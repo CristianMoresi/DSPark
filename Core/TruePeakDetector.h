@@ -100,6 +100,16 @@ public:
     /** @brief Group delay of the interpolation FIR in samples (per phase). */
     [[nodiscard]] static constexpr int getLatency() noexcept { return kTaps / 2; }
 
+    /**
+     * @brief Input samples one estimate is computed from (taps per phase).
+     *
+     * The reading returned for sample n was formed from x[n-getTaps()+1] .. x[n].
+     * A caller that wants to change a reported peak has to change all of them:
+     * a gain applied to only part of that span does not scale the estimate by
+     * that gain.
+     */
+    [[nodiscard]] static constexpr int getTaps() noexcept { return kTaps; }
+
 private:
     static constexpr int kTaps     = 12;  ///< Taps per polyphase branch.
     static constexpr int kPhases   = 4;   ///< Interpolation phases (4x oversampling).

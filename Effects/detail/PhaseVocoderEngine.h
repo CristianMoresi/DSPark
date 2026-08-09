@@ -258,11 +258,16 @@ public:
      *                             an owner whose output has already been
      *                             released cannot change detector without
      *                             changing renders its users already have.
-     *                             Measured on strikes over a sustained bed,
-     *                             switching an owner from the energy test to
-     *                             the flux detector moves strike
-     *                             concentration by up to -91.6% and adds up
-     *                             to 16.5 dB of pre-echo. Only an owner that
+     *                             On strikes over sustained material the flux
+     *                             detector fires earlier and more often: that
+     *                             is the point of it, and the cost is that
+     *                             each extra reset loosens the strike and
+     *                             smears energy ahead of the attack, which is
+     *                             audible as pre-echo. How much of either
+     *                             depends on the material and on the
+     *                             estimator it is measured with, so the trade
+     *                             is named here and its size is left to the
+     *                             owner that asks for it. Only an owner that
      *                             needs onsets its schedule can act on -
      *                             which the energy test cannot supply over
      *                             sustained material - should ask for it, and

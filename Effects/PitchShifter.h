@@ -130,11 +130,15 @@ public:
         // flips would change what this effect sounds like. The locked
         // analysis hop breaks the resample-back reader's Ra = Rs/ratio
         // assumption and buys nothing here. The spectral-flux onset detector
-        // fires more often than the frame-energy test, and every firing
-        // resets phase, so adopting it moves the rendering of every release
-        // already in a user's hands: measured on strikes over a sustained
-        // bed, strike concentration falls by up to 91.6% and pre-echo rises
-        // by up to 16.5 dB. This effect keeps the detector it shipped with.
+        // fires earlier and more often than the frame-energy test, and every
+        // firing resets phase, so adopting it smears energy ahead of a strike
+        // - audible pre-echo on percussive material - and re-renders every
+        // release already in a user's hands. A mix finished last month is not
+        // restored by a release note. How large the smear is depends on the
+        // material and on the estimator it is measured with, so no figure is
+        // quoted here; that it is audible on percussive material is the
+        // durable part, and it is why this effect keeps the detector it
+        // shipped with.
         engine_.prepare(spec.sampleRate, numChannels_, fftSize, true, false, false, false);
         accumMask_ = engine_.olaMask();
 

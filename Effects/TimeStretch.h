@@ -55,49 +55,92 @@
  * transient hold above is the one exception, and it borrows rather than
  * skips: what it does not consume it repays.
  *
- * Latency and the two processing paths:
+ * Latency and the three processing paths:
  *
- * - `processBlock()` is the streaming path: real-time safe, no allocation,
- *   no lock, no throw, latency `fftSize` samples as reported by
- *   `getLatency()`.
+ * - `feedInput()` / `pullOutput()` is the rate-changing streaming pair and
+ *   the correct path at any ratio: real-time safe, no allocation, no lock,
+ *   no throw. It carries no compensation latency - what comes out IS the
+ *   stretched timeline - but it primes (see below).
+ * - `processBlock()` is the fixed-rate playback adaptor: same block in, same
+ *   block in-place out, real-time safe, latency `fftSize` samples as reported
+ *   by `getLatency()`. Exact at ratio 1; away from unity it pays a cost that
+ *   is stated in samples below.
  * - `process()` is the offline path for a whole signal. It returns a buffer
  *   of `round(inputLength * ratio)` samples aligned with the input - the
  *   algorithmic delay is removed inside, so there is nothing to compensate
  *   and the effective latency of that path is zero.
  *
  * **What streaming can and cannot do.** Stretching changes duration: over
- * `n` input samples the stretched signal is `ratio * n` samples long. A block
- * call that is handed `n` samples and must return `n` samples cannot make
- * that difference disappear, so this class states plainly where it goes.
- * `processBlock()` always accepts the whole block into a bounded input queue
- * sized in prepare(), and always emits `n` samples of the stretched stream,
- * in order, never repeating or dropping one:
+ * `n` input samples the stretched signal is `ratio * n` samples long. A call
+ * that is handed `n` samples and must return `n` samples cannot make that
+ * difference disappear. The two streaming entry points answer that fact
+ * differently, and neither of them pretends the counts match.
  *
- * - `ratio == 1`: exact, indefinitely. The queue level does not move and the
- *   output is the input delayed by `getLatency()`.
- * - `ratio > 1` (slower): the stretched stream is longer than the input, so
- *   the caller supplies more input than the stretch consumes and the surplus
- *   accumulates. The queue absorbs it for a bounded time - about 4.5 s at
- *   ratio 1.081, 48 kHz and the default 2048 frame (queue capacity divided
- *   by the surplus rate `1 - 1/ratio`) - after which the newest input is
- *   refused and the stream splices.
+ * **The rate-changing pair - use this one away from ratio 1.** The caller
+ * hands over input with `feedInput()`, which takes what it has room for and
+ * returns how many samples it took (never more than `getInputCapacity()`),
+ * and takes output with `pullOutput()`, which writes what is ready and
+ * returns how many samples it wrote (never more than `getAvailableOutput()`).
+ * The rate change lives in the difference between those two numbers, in the
+ * open, instead of being absorbed by a queue that must eventually lie. The
+ * caller owns both buffers; this class copies in and copies out, so nothing
+ * aliases and nothing is borrowed. There is no compensation latency to
+ * subtract: output sample `k` is sample `k` of the stretched signal. What
+ * there is instead is a priming requirement: `pullOutput()` returns 0 until
+ * the overlap-add's first complete sample exists, which takes 1024 to 3072
+ * input samples at the default 2048-sample frame, over ratios 0.5 to 2.
+ * After that, cumulative output is `ratio *` cumulative input fed, less a
+ * constant of 1408 to 1799 samples at that frame size - the overlap-add's own
+ * incomplete tail plus whatever input is still queued. It is an offset, not a
+ * drift: it does not grow with the length of the stream.
+ *
+ * **The fixed-rate adaptor.** `processBlock()` delivers into a slot that does
+ * not change rate, and it is exact at `ratio == 1` indefinitely: the output
+ * is the input delayed by `getLatency()`. Away from unity it cannot be, and
+ * the cost is specified rather than described:
+ *
  * - `ratio < 1` (faster): the stretch needs more input than the block brings.
  *   The class never invents material: it emits the stretched stream as far as
  *   the input it has allows and waits, in silence, for exactly as many
- *   samples as are missing before going on. Everything the caller feeds still
- *   comes out, in order; what it cannot do is come out sooner than it
- *   arrived.
+ *   samples as are missing before going on. Exactly `1 - ratio` of the output
+ *   is that silence: measured 20.00% at ratio 0.8, 7.40% at 0.926 and 5.00%
+ *   at 0.95, worst error 0.03 percentage points over durations of 5 to 30 s
+ *   and host blocks of 64 to 4096 samples. It arrives as gaps of at most one
+ *   block - at a 512-sample block, one gap every 11 to 13 ms of output - so
+ *   it is audible, and this is not a usable real-time stretch.
+ * - `ratio > 1` (slower): the stretched stream is longer than the input, so
+ *   the block physically cannot carry all of it and something must be lost.
+ *   The choice made here is to lose it at the input head and say so: the
+ *   adaptor refuses the fraction `1 - 1/ratio` of the input, spread evenly
+ *   across the stream, and counts every refused sample in
+ *   `getDiscardedInput()`. What it does carry keeps its place: measured on a
+ *   strike train at ratio 1.081, no strike lands more than 38 samples
+ *   (0.79 ms) from where the fixed-rate slot puts it, over runs of 5 to 30 s.
+ *   A caller therefore detects the degradation in one call instead of by
+ *   listening. What refusing input cannot preserve is the shape of a strike -
+ *   an even refusal is a decimation, and four strikes in five survive it at
+ *   full height at ratio 1.081 while at ratio 2 none do. That is the same on
+ *   this path with or without the refusal, and it is the reason the pair
+ *   above exists.
  *
- * Input is taken in step with output, one sample in for one sample out, so
- * every one of those decisions falls at a position in the stream rather than
- * at a block boundary: the output is bit-identical however the host chops the
- * stream, at every ratio, including while the queue is saturated.
+ * Which input the adaptor refuses is a function of the cumulative stream
+ * position alone, never of where the caller's block boundaries fall: between
+ * two analysis frames the adaptor is handed exactly one synthesis hop of
+ * input and can carry only the next analysis hop of it, so the surplus
+ * `Rs - Ra` is what goes. Input is taken in step with output, one sample in
+ * for one sample out, so every decision falls at a position in the stream
+ * rather than at a block boundary: the output, the number of samples
+ * consumed and `getDiscardedInput()` are identical however the host chops the
+ * stream, at every ratio.
+ *
+ * **The two streaming paths own the same queue with different invariants and
+ * must not be interleaved.** The first of them used after `prepare()` or
+ * `reset()` owns the instance until the next `reset()`; the other one's calls
+ * then do nothing - `feedInput()` and `pullOutput()` return 0, their two
+ * queries return 0, and `processBlock()` leaves the block untouched.
  *
  * If you have the whole signal, use `process()`: it is exact at every ratio
- * with none of the above. If you are stretching a live stream by a lot, the
- * input has to arrive at `1 / ratio` the output rate, which means a
- * variable-rate source feeding the block - a file player reading faster or
- * slower - not a fixed host block of the same size in and out.
+ * with none of the above.
  *
  * Frame size and sample rate: `fftSize` is a quality/latency trade-off, not
  * a tuning constant. Its frequency resolution is `sampleRate / fftSize` Hz
@@ -114,7 +157,11 @@
  * 1060, where per-onset timing degrades to roughly 3.9 ms.
  *
  * Threading (single control thread + single audio thread):
- * - `processBlock()`, `reset()`: audio thread (the stream owner).
+ * - `processBlock()`, `feedInput()`, `pullOutput()`, `reset()`: audio thread
+ *   (the stream owner).
+ * - `getInputCapacity()`, `getAvailableOutput()`, `getQueuedInputSamples()`
+ *   and `getDiscardedInput()` read the stream owner's own state and belong to
+ *   that same thread; they are not cross-thread queries.
  * - `setTimeRatio()`, `setTempoChangePercent()`, `setTransientPreserve()`,
  *   `setPhaseLock()`: control thread. Each one
  *   publishes the WHOLE parameter set as a unit, so a gesture that moves two
@@ -245,10 +292,13 @@ public:
         queueWrite_ = 0;
         queueRead_  = 0;
         queued_     = 0;
+        discarded_  = 0;
+        path_       = Path::None;
         // Start one synthesis hop behind the write head: those cells are
         // still silent, which is the latency the class reports, and from
         // there the reader stays exactly that far behind.
         readPos_ = engine_.writeHead() - static_cast<int64_t>(synthHop_);
+        openIntake();
     }
 
     // -- Parameters ---------------------------------------------------------------
@@ -326,18 +376,131 @@ public:
         return phaseLock_.load(std::memory_order_relaxed);
     }
 
-    /** @brief Latency of the streaming path in samples: one frame (42.7 ms at
-     *  the default 2048 frame and 48 kHz), 0 before prepare() succeeds. The
-     *  offline process() removes its own delay and needs no compensation. */
+    /** @brief Latency of the fixed-rate processBlock() path in samples: one
+     *  frame (42.7 ms at the default 2048 frame and 48 kHz), 0 before
+     *  prepare() succeeds. The rate-changing feedInput()/pullOutput() pair
+     *  carries no compensation latency - its output is the stretched timeline
+     *  itself - and the offline process() removes its own delay. */
     [[nodiscard]] int getLatency() const noexcept
     {
         return prepared_.load(std::memory_order_relaxed) ? latency_ : 0;
     }
 
-    /** @brief Input samples accepted but not yet consumed by the stretch.
-     *  Rises while the ratio is above 1 and the caller feeds a fixed block
-     *  size; at the queue capacity further input is refused. */
+    /** @brief Input samples accepted but not yet consumed by the stretch. */
     [[nodiscard]] int getQueuedInputSamples() const noexcept { return queued_; }
+
+    // -- Rate-changing streaming: the correct path at any ratio -------------
+
+    /**
+     * @brief Room for input right now, in samples (stream owner).
+     *
+     * The bound on what the next feedInput() can take. It falls to 0 while
+     * the caller stops pulling, which is the back pressure that keeps the
+     * stretch honest instead of letting a queue overrun. 0 before prepare()
+     * succeeds and 0 once processBlock() owns the instance.
+     */
+    [[nodiscard]] int getInputCapacity() const noexcept
+    {
+        if (!prepared_.load(std::memory_order_relaxed) || path_ == Path::Adaptor)
+            return 0;
+        return queueSize_ - queued_;
+    }
+
+    /**
+     * @brief Stretched output ready right now, in samples (stream owner).
+     *
+     * The bound on what the next pullOutput() can write. 0 until enough input
+     * has been fed for the first overlap-add to complete, 0 before prepare()
+     * succeeds and 0 unless the pair owns the instance.
+     */
+    [[nodiscard]] int getAvailableOutput() const noexcept
+    {
+        if (!prepared_.load(std::memory_order_relaxed) || path_ != Path::Pull)
+            return 0;
+        return static_cast<int>(engine_.writeHead() - readPos_);
+    }
+
+    /**
+     * @brief Hands input to the stretch; real-time safe (stream owner).
+     *
+     * Takes as many of the block's samples as there is room for, in order,
+     * and runs every analysis frame the queue can now feed. Channels the
+     * caller does not supply are fed silence, so the stretch stays aligned
+     * across a prepared stereo pair.
+     *
+     * @param  in Source block; the caller keeps ownership and nothing is
+     *            aliased or retained.
+     * @return Samples taken from each channel, at most getInputCapacity().
+     *         0 before prepare() succeeds or if processBlock() owns the
+     *         instance.
+     */
+    int feedInput(AudioBufferView<const T> in) noexcept
+    {
+        if (!prepared_.load(std::memory_order_relaxed) || !claimPullPath()) return 0;
+        DenormalGuard guard;
+
+        const int nCh   = std::min(in.getNumChannels(), numChannels_);
+        const int count = std::min(std::max(0, in.getNumSamples()), queueSize_ - queued_);
+        int wp = queueWrite_;
+        for (int k = 0; k < count; ++k)
+        {
+            for (int ch = 0; ch < nCh; ++ch)
+                queue_[static_cast<size_t>(ch)][static_cast<size_t>(wp)]
+                    = in.getChannel(ch)[k];
+            for (int ch = nCh; ch < numChannels_; ++ch)
+                queue_[static_cast<size_t>(ch)][static_cast<size_t>(wp)] = T(0);
+            wp = (wp + 1) & queueMask_;
+        }
+        queueWrite_ = wp;
+        queued_ += count;
+
+        runReadyFrames();
+        return count;
+    }
+
+    /**
+     * @brief Takes stretched output; real-time safe (stream owner).
+     *
+     * Writes what is ready and no more. The output is the stretched timeline
+     * with nothing to compensate: sample `k` of the stream this returns is
+     * sample `k` of the stretched signal. Channels beyond the prepared count
+     * are left untouched.
+     *
+     * @param  out Destination block.
+     * @return Samples written to each channel, at most getAvailableOutput().
+     *         0 before prepare() succeeds or if processBlock() owns the
+     *         instance.
+     */
+    int pullOutput(AudioBufferView<T> out) noexcept
+    {
+        if (!prepared_.load(std::memory_order_relaxed) || !claimPullPath()) return 0;
+        DenormalGuard guard;
+
+        const int nCh   = std::min(out.getNumChannels(), numChannels_);
+        const int count = std::min(std::max(0, out.getNumSamples()),
+                                   static_cast<int>(engine_.writeHead() - readPos_));
+        if (count > 0)
+        {
+            readSynthesis(out, nCh, 0, count);
+            readPos_ += count;
+        }
+        // Reading frees room in the synthesis ring, which may be what was
+        // holding the next analysis frame back.
+        runReadyFrames();
+        return std::max(0, count);
+    }
+
+    /**
+     * @brief Input samples the fixed-rate adaptor refused, cumulative since
+     *  prepare() or reset() (stream owner).
+     *
+     * Above ratio 1 the block cannot carry the stretched stream, so the
+     * adaptor refuses the fraction `1 - 1/ratio` of the input at the head and
+     * counts it here rather than displacing what survives. Exactly 0 at ratio
+     * 1 and below, where the adaptor pads with silence instead of dropping,
+     * and 0 on the feedInput()/pullOutput() path, which refuses nothing.
+     */
+    [[nodiscard]] int64_t getDiscardedInput() const noexcept { return discarded_; }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
@@ -363,19 +526,24 @@ public:
     // -- Processing ----------------------------------------------------------------
 
     /**
-     * @brief Streaming, in-place, real-time safe.
+     * @brief Fixed-rate playback adaptor: streaming, in-place, real-time safe.
      *
-     * Accepts the block's samples into the input queue and writes the same
+     * Takes the block's samples into the input queue and writes the same
      * number of samples of the stretched stream back into the block. See the
      * file header for what happens to the length difference at ratios away
-     * from 1. Pass-through until prepare() succeeds; channels beyond the
-     * prepared count are left untouched.
+     * from 1: below unity the shortfall is silence, above it the surplus
+     * input is refused at the head and reported by getDiscardedInput().
+     * Pass-through until prepare() succeeds, and untouched if the
+     * feedInput()/pullOutput() pair already owns the instance; channels
+     * beyond the prepared count are left untouched.
      *
      * @param buffer Audio block; all prepared channels are processed.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
         if (!prepared_.load(std::memory_order_relaxed)) return;
+        if (path_ == Path::Pull) return;
+        path_ = Path::Adaptor;
         DenormalGuard guard;
 
         const int nCh = std::min(buffer.getNumChannels(), numChannels_);
@@ -434,6 +602,7 @@ public:
             engine_.commitInput(need, nCh);
             queueRead_ = (queueRead_ + need) & queueMask_;
             queued_ -= need;
+            openIntake();
         }
     }
 
@@ -463,6 +632,7 @@ public:
         }
 
         reset();
+        path_ = Path::Adaptor;   // this path drives the same reader as the adaptor
 
         const int nCh = std::min(inCh, numChannels_);
         const double ratio = engine_.activeRatio();
@@ -553,8 +723,48 @@ private:
     }
 
     /**
-     * @brief Queues this block's input up to sample `upTo`, refusing what
-     * does not fit.
+     * @brief Opens the intake window the adaptor's next analysis frame gets
+     * its input through.
+     *
+     * Between two frames the adaptor is handed exactly one synthesis hop of
+     * input - the caller's block returns as many samples as it was given, and
+     * one hop of output is what a frame produces - while the stretch can
+     * carry only the next analysis hop of it. Above unity that hop is the
+     * shorter of the two and the difference is what cannot be carried; the
+     * window is what refuses it, evenly across the hop, so that the refusal
+     * falls at a position in the stream and not where a block boundary
+     * happens to land. At and below unity the analysis hop is the longer of
+     * the two, the window is over-subscribed and nothing is ever refused.
+     */
+    void openIntake() noexcept
+    {
+        intakeSpan_  = std::max(1, synthHop_);
+        // Never wider than the queue: the window is bounded by one analysis
+        // hop and the queue holds several frames, so this cannot bind, and
+        // stating it is what keeps the loop below total.
+        intakeWant_  = std::clamp(engine_.samplesToNextHop() - queued_,
+                                  0, queueSize_ - queued_);
+        intakeTaken_ = 0;
+        intakeErr_   = 0;
+    }
+
+    /** @brief Decides one offered input sample against the intake window. */
+    [[nodiscard]] bool acceptOffered() noexcept
+    {
+        if (intakeTaken_ >= intakeWant_) return false;
+        if (intakeWant_ < intakeSpan_)
+        {
+            intakeErr_ += intakeWant_;
+            if (intakeErr_ < intakeSpan_) return false;
+            intakeErr_ -= intakeSpan_;
+        }
+        ++intakeTaken_;
+        return true;
+    }
+
+    /**
+     * @brief Queues this block's input up to sample `upTo`, counting what the
+     * intake window refuses.
      *
      * `taken` is how far the block has been read so far and moves with the
      * output, so the queue level at any decision point is a property of the
@@ -565,23 +775,62 @@ private:
     void takeInput(AudioBufferView<T> buffer, int nCh, int& taken, int upTo) noexcept
     {
         if (upTo <= taken) return;
-        const int room = queueSize_ - queued_;
-        const int count = std::min(upTo - taken, room);
-        if (count <= 0) { taken = upTo; return; }   // full: this input is refused
-        for (int ch = 0; ch < nCh; ++ch)
+        int wp = queueWrite_;
+        int held = queued_;
+        for (int k = taken; k < upTo; ++k)
         {
-            const T* src = buffer.getChannel(ch) + taken;
-            auto& q = queue_[static_cast<size_t>(ch)];
-            int wp = queueWrite_;
-            for (int k = 0; k < count; ++k)
-            {
-                q[static_cast<size_t>(wp)] = src[k];
-                wp = (wp + 1) & queueMask_;
-            }
+            if (!acceptOffered()) { ++discarded_; continue; }
+            for (int ch = 0; ch < nCh; ++ch)
+                queue_[static_cast<size_t>(ch)][static_cast<size_t>(wp)]
+                    = buffer.getChannel(ch)[k];
+            wp = (wp + 1) & queueMask_;
+            ++held;
         }
-        queueWrite_ = (queueWrite_ + count) & queueMask_;
-        queued_ += count;
+        queueWrite_ = wp;
+        queued_ = held;
         taken = upTo;
+    }
+
+    /** @brief Claims the instance for the rate-changing pair, or reports that
+     *  the adaptor already owns it. */
+    [[nodiscard]] bool claimPullPath() noexcept
+    {
+        if (path_ == Path::Pull) return true;
+        if (path_ != Path::None) return false;
+        path_ = Path::Pull;
+        // This path's output is the stretched timeline itself, so it starts
+        // at the first synthesis sample whose overlap-add is complete: one
+        // frame past the write head, less the analysis hop the first frame
+        // consumes. Nothing has been fed yet, so that hop is the one the
+        // engine reports now.
+        readPos_ = engine_.writeHead()
+                 + static_cast<int64_t>(fftSize_ - engine_.samplesToNextHop());
+        return true;
+    }
+
+    /** @brief Runs every analysis frame the queue can feed and the synthesis
+     *  ring has room for (rate-changing pair only). */
+    void runReadyFrames() noexcept
+    {
+        for (;;)
+        {
+            const int need = engine_.samplesToNextHop();
+            if (queued_ < need) return;
+            // A frame writes one whole window ahead of the head; stop before
+            // it would reach unread output.
+            if (engine_.writeHead() + static_cast<int64_t>(fftSize_) - readPos_
+                > static_cast<int64_t>(accumMask_) + 1)
+                return;
+
+            for (int ch = 0; ch < numChannels_; ++ch)
+            {
+                dequeueInto(ch, need);
+                engine_.pushInput(ch, feed_.data(), need);
+            }
+            engine_.commitInput(need, numChannels_);
+            queueRead_ = (queueRead_ + need) & queueMask_;
+            queued_ -= need;
+        }
     }
 
     /** @brief Lays `count` queued samples of one channel out contiguously.
@@ -629,6 +878,16 @@ private:
     int queueWrite_ = 0;
     int queueRead_ = 0;
     int queued_ = 0;
+
+    /** @brief Which streaming entry point owns the instance until reset(). */
+    enum class Path { None, Adaptor, Pull };
+    Path path_ = Path::None;
+
+    int64_t discarded_ = 0;     ///< Input the adaptor refused, cumulative.
+    int intakeSpan_ = 0;        ///< Input offered before the next frame.
+    int intakeWant_ = 0;        ///< How much of it the stretch can carry.
+    int intakeTaken_ = 0;       ///< Accepted so far in this window.
+    int intakeErr_ = 0;         ///< Even-spread accumulator for the refusals.
 
     int64_t readPos_ = 0;       ///< Reader position in the synthesis stream.
 

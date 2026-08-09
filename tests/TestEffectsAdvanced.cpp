@@ -4376,6 +4376,83 @@ std::vector<float> tsStream(TimeStretch<float>& ts, const std::vector<float>& in
 }
 
 
+/// One accounting sample of the fixed-rate adaptor, taken at a block boundary.
+struct TsAcct
+{
+    long long offered = 0;
+    long long discarded = 0;
+};
+
+/// Runs the fixed-rate adaptor over `in` in whole blocks of one size, keeping
+/// what it wrote and what it says it refused at every block boundary. A
+/// partial trailing block is never handed to the device, so the caller can
+/// count over exactly the samples the adaptor wrote.
+std::vector<float> tsAdaptor(const std::vector<float>& in, double ratio, int block,
+                             std::vector<TsAcct>* acct = nullptr, int fftSize = 2048)
+{
+    TimeStretch<float> ts;
+    AudioSpec sp; sp.sampleRate = 48000.0; sp.maxBlockSize = 4096; sp.numChannels = 1;
+    ts.prepare(sp, fftSize);
+    ts.setTimeRatio(static_cast<float>(ratio));
+    ts.reset();   // adopt the ratio at once rather than gliding into it
+    std::vector<float> out;
+    out.reserve(in.size());
+    std::vector<float> scratch(static_cast<size_t>(block));
+    long long offered = 0;
+    for (size_t i = 0; i + static_cast<size_t>(block) <= in.size();
+         i += static_cast<size_t>(block))
+    {
+        std::copy(in.begin() + static_cast<long>(i),
+                  in.begin() + static_cast<long>(i) + block, scratch.begin());
+        float* ch[1] = { scratch.data() };
+        AudioBufferView<float> view(ch, 1, block);
+        ts.processBlock(view);
+        out.insert(out.end(), scratch.begin(), scratch.end());
+        offered += block;
+        if (acct) acct->push_back({ offered, ts.getDiscardedInput() });
+    }
+    return out;
+}
+
+/// Runs the rate-changing pair over `in` with fixed feed and pull sizes and
+/// returns the stretched stream. Feeding and pulling alternate, so the
+/// schedule interleaves the two entry points as a host would.
+std::vector<float> tsPull(const std::vector<float>& in, double ratio, int feedBlock,
+                          int pullBlock, int fftSize = 2048, bool transient = true)
+{
+    TimeStretch<float> ts;
+    AudioSpec sp; sp.sampleRate = 48000.0; sp.maxBlockSize = 4096; sp.numChannels = 1;
+    ts.prepare(sp, fftSize);
+    ts.setTransientPreserve(transient);
+    ts.setTimeRatio(static_cast<float>(ratio));
+    ts.reset();
+    std::vector<float> out, fb(static_cast<size_t>(feedBlock)),
+                       pb(static_cast<size_t>(pullBlock));
+    out.reserve(static_cast<size_t>(static_cast<double>(in.size()) * std::max(1.0, ratio)) + 4096);
+    size_t pos = 0;
+    for (;;)
+    {
+        int took = 0;
+        const auto have = static_cast<int>(std::min<size_t>(
+            static_cast<size_t>(feedBlock), in.size() - pos));
+        if (have > 0)
+        {
+            std::copy(in.begin() + static_cast<long>(pos),
+                      in.begin() + static_cast<long>(pos) + have, fb.begin());
+            float* fc[1] = { fb.data() };
+            AudioBufferView<float> fv(fc, 1, have);
+            took = ts.feedInput(AudioBufferView<const float>(fv));
+            pos += static_cast<size_t>(took);
+        }
+        float* pc[1] = { pb.data() };
+        AudioBufferView<float> pv(pc, 1, pullBlock);
+        const int got = ts.pullOutput(pv);
+        out.insert(out.end(), pb.begin(), pb.begin() + got);
+        if (took == 0 && got == 0) break;
+    }
+    return out;
+}
+
 /// A band-limited windowed-sinc click train: the strike bed. `onsets` is
 /// filled with the exact sample each strike is centred on.
 std::vector<float> tsClicks(double seconds, double bpm, std::vector<int>& onsets,
@@ -4708,6 +4785,299 @@ DSPARK_TEST(TimeStretch_output_is_bit_identical_under_block_chopping)
                 EXPECT_EQ(differing, 0);
             }
         }
+    }
+}
+
+// The rate-changing pair is the path a caller is sent to away from unity, so
+// it owes the same transparency at unity that the block path does. Its output
+// is the stretched timeline itself, which at ratio 1 is the input with nothing
+// to compensate: the residual is taken against the input directly, at no lag.
+DSPARK_TEST(TimeStretch_pull_path_is_transparent_at_unity)
+{
+    const int n = 96000;
+    const auto src = tsBroadband(n, 0x5EED01u);
+    const auto got = tsPull(src, 1.0, 512, 512);
+    EXPECT_GT(static_cast<int>(got.size()), n - 4096);
+
+    double num = 0.0, den = 0.0;
+    for (size_t i = 24000; i < got.size() && i < src.size(); ++i)
+    {
+        const double d = static_cast<double>(got[i]) - static_cast<double>(src[i]);
+        num += d * d;
+        den += static_cast<double>(src[i]) * static_cast<double>(src[i]);
+    }
+    EXPECT_LT(10.0 * std::log10(num / den + 1e-300), -60.0);
+}
+
+// The same input must give the same stretched stream however the caller
+// splits the feeding and the pulling, down to one sample at a time and with
+// the two interleaved in any proportion. Nothing about a call may reach the
+// signal: every decision belongs to a position in the stream.
+DSPARK_TEST(TimeStretch_pull_output_is_bit_identical_under_any_schedule)
+{
+    const int n = 96000;
+    const auto src = tsBroadband(n, 0x5EED02u);
+    const std::vector<std::pair<int, int>> schedules = {
+        { 512, 512 }, { 1, 1 }, { 4096, 64 }, { 64, 4096 }, { 333, 777 }
+    };
+
+    for (double r : { 0.5, 0.926, 1.0, 1.081, 2.0 })
+    {
+        std::vector<float> reference;
+        for (size_t s = 0; s < schedules.size(); ++s)
+        {
+            const auto got = tsPull(src, r, schedules[s].first, schedules[s].second);
+            if (s == 0) { reference = got; continue; }
+            EXPECT_EQ(got.size(), reference.size());
+            int differing = 0;
+            for (size_t i = 0; i < got.size() && i < reference.size(); ++i)
+                if (got[i] != reference[i]) ++differing;
+            EXPECT_EQ(differing, 0);
+        }
+    }
+}
+
+// Above ratio 1 the block hands back as many samples as it was given while
+// the stretch is longer than that, so content MUST be lost. What the class
+// promises is that it is lost at the input head, in the stated proportion,
+// and counted - not that it does not happen. Below and at unity nothing is
+// refused at all, and that half is exact rather than approximate.
+DSPARK_TEST(TimeStretch_adaptor_reports_the_input_it_refuses)
+{
+    const int n = 48000 * 5;
+    const auto src = tsBroadband(n, 0x5EED03u);
+
+    for (double r : { 0.8, 0.926, 0.95, 1.0, 1.081 })
+        for (int block : { 64, 512, 4096 })
+        {
+            std::vector<TsAcct> acct;
+            const auto got = tsAdaptor(src, r, block, &acct);
+            EXPECT_GT(static_cast<int>(acct.size()), 0);
+            if (acct.empty()) continue;
+
+            // The accounting must close exactly at EVERY block boundary, and
+            // the refused count may never fall or exceed what was offered.
+            long long previous = 0;
+            int broken = 0;
+            for (const auto& a : acct)
+            {
+                const long long consumed = a.offered - a.discarded;
+                if (consumed + a.discarded != a.offered) ++broken;
+                if (a.discarded < previous || a.discarded > a.offered) ++broken;
+                previous = a.discarded;
+            }
+            EXPECT_EQ(broken, 0);
+
+            const auto& last = acct.back();
+            const double refused = 100.0 * static_cast<double>(last.discarded)
+                                 / static_cast<double>(last.offered);
+            const double carried = 100.0 * static_cast<double>(last.offered - last.discarded)
+                                 / static_cast<double>(last.offered);
+            // The two halves are the same integer read from both ends, so they
+            // must sum to 100% to within the one sample that is their quantum.
+            EXPECT_LT(std::fabs(refused + carried - 100.0)
+                          * static_cast<double>(last.offered) / 100.0, 1.0);
+            EXPECT_LT(std::fabs(refused - 100.0 * std::max(0.0, 1.0 - 1.0 / r)), 0.5);
+            EXPECT_LT(std::fabs(carried - 100.0 * std::min(1.0, 1.0 / r)), 0.5);
+            if (r <= 1.0) EXPECT_EQ(last.discarded, 0LL);
+            EXPECT_EQ(got.size(), static_cast<size_t>(last.offered));
+        }
+}
+
+// Which input the adaptor refuses is a function of the cumulative stream
+// position and of nothing else. A refusal taken because a queue happens to be
+// full when a block arrives is a function of the host's block sizes instead,
+// and this case separates the two: the count refused at any given cumulative
+// input-sample count, and the whole output stream, must be identical for one
+// sample at a time, for three constant block sizes and for a randomised
+// schedule.
+DSPARK_TEST(TimeStretch_refusal_falls_at_a_stream_position_not_a_block_boundary)
+{
+    const int n = 48000 * 2;
+    const auto src = tsBroadband(n, 0x5EED04u);
+
+    for (double r : { 0.926, 1.0, 1.081, 2.0 })
+    {
+        std::vector<TsAcct> byOne;
+        const auto reference = tsAdaptor(src, r, 1, &byOne);
+        std::vector<long long> refused(byOne.size() + 1, 0);
+        for (const auto& a : byOne)
+            refused[static_cast<size_t>(a.offered)] = a.discarded;
+
+        for (int block : { 64, 512, 4096 })
+        {
+            std::vector<TsAcct> acct;
+            const auto got = tsAdaptor(src, r, block, &acct);
+            int disagreeing = 0;
+            for (const auto& a : acct)
+                if (static_cast<size_t>(a.offered) < refused.size()
+                    && refused[static_cast<size_t>(a.offered)] != a.discarded)
+                    ++disagreeing;
+            EXPECT_EQ(disagreeing, 0);
+            int differing = 0;
+            for (size_t i = 0; i < got.size() && i < reference.size(); ++i)
+                if (got[i] != reference[i]) ++differing;
+            EXPECT_EQ(differing, 0);
+        }
+
+        // The same again with the host changing its block size every call.
+        {
+            TimeStretch<float> ts;
+            AudioSpec sp; sp.sampleRate = 48000.0; sp.maxBlockSize = 4096;
+            sp.numChannels = 1;
+            ts.prepare(sp, 2048);
+            ts.setTimeRatio(static_cast<float>(r));
+            ts.reset();
+            std::vector<float> scratch(4096), got;
+            uint64_t lcg = 0x9E3779B97F4A7C15ull;
+            size_t pos = 0;
+            long long offered = 0;
+            int disagreeing = 0;
+            while (pos < src.size())
+            {
+                lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+                const auto want = static_cast<int>(1 + (lcg >> 40) % 4096u);
+                const auto have = static_cast<int>(std::min<size_t>(
+                    static_cast<size_t>(want), src.size() - pos));
+                std::copy(src.begin() + static_cast<long>(pos),
+                          src.begin() + static_cast<long>(pos) + have, scratch.begin());
+                float* ch[1] = { scratch.data() };
+                AudioBufferView<float> view(ch, 1, have);
+                ts.processBlock(view);
+                got.insert(got.end(), scratch.begin(), scratch.begin() + have);
+                pos += static_cast<size_t>(have);
+                offered += have;
+                if (static_cast<size_t>(offered) < refused.size()
+                    && refused[static_cast<size_t>(offered)] != ts.getDiscardedInput())
+                    ++disagreeing;
+            }
+            EXPECT_EQ(disagreeing, 0);
+            int differing = 0;
+            for (size_t i = 0; i < got.size() && i < reference.size(); ++i)
+                if (got[i] != reference[i]) ++differing;
+            EXPECT_EQ(differing, 0);
+        }
+    }
+}
+
+// Below unity the adaptor waits in silence for input that has not arrived
+// yet, and how much silence that is, is not a matter of opinion: it is
+// exactly the fraction of the stream the stretch cannot fill. Counted over
+// the samples the adaptor actually wrote, after a start guard - counting an
+// unwritten trailing block as silence measures the harness instead.
+DSPARK_TEST(TimeStretch_adaptor_silence_is_the_fraction_the_ratio_says)
+{
+    const int n = 48000 * 5;
+    std::vector<float> bed(static_cast<size_t>(n), 0.0f);
+    for (int p = 1; p <= 12; ++p)
+        for (int i = 0; i < n; ++i)
+            bed[static_cast<size_t>(i)] += static_cast<float>(
+                (0.5 / p) * std::sin(2.0 * dspark::pi<double> * 110.0 * p * i / 48000.0));
+    float peak = 0.0f;
+    for (float v : bed) peak = std::max(peak, std::fabs(v));
+    for (auto& v : bed) v *= 0.7f / peak;
+
+    for (double r : { 0.8, 0.926, 0.95, 1.0, 1.081 })
+        for (int block : { 64, 512, 4096 })
+        {
+            const auto got = tsAdaptor(bed, r, block);
+            long long zero = 0, counted = 0;
+            for (size_t i = 24000; i < got.size(); ++i)
+            {
+                ++counted;
+                if (got[i] == 0.0f) ++zero;
+            }
+            EXPECT_GT(static_cast<int>(counted), 0);
+            const double silent = 100.0 * static_cast<double>(zero)
+                                / static_cast<double>(std::max(1LL, counted));
+            EXPECT_LT(std::fabs(silent - 100.0 * std::max(0.0, 1.0 - r)), 0.5);
+        }
+}
+
+// The two streaming paths own the same queue with different invariants, so an
+// instance belongs to whichever one is used first. The other one has to do
+// nothing at all rather than half of something, and reset() has to hand the
+// instance back.
+DSPARK_TEST(TimeStretch_only_one_streaming_path_owns_an_instance)
+{
+    const int n = 8192;
+    const auto src = tsBroadband(n, 0x5EED05u);
+    std::vector<float> scratch(512);
+
+    // The block path first: the pair must then report no room, no output and
+    // take and write nothing.
+    {
+        TimeStretch<float> ts;
+        AudioSpec sp; sp.sampleRate = 48000.0; sp.maxBlockSize = 512; sp.numChannels = 1;
+        ts.prepare(sp, 2048);
+        std::copy(src.begin(), src.begin() + 512, scratch.begin());
+        float* ch[1] = { scratch.data() };
+        AudioBufferView<float> view(ch, 1, 512);
+        ts.processBlock(view);
+        EXPECT_EQ(ts.getInputCapacity(), 0);
+        EXPECT_EQ(ts.getAvailableOutput(), 0);
+        EXPECT_EQ(ts.feedInput(AudioBufferView<const float>(view)), 0);
+        EXPECT_EQ(ts.pullOutput(view), 0);
+        ts.reset();
+        EXPECT_GT(ts.getInputCapacity(), 0);
+    }
+
+    // The pair first: the block path must leave the caller's block alone.
+    {
+        TimeStretch<float> ts;
+        AudioSpec sp; sp.sampleRate = 48000.0; sp.maxBlockSize = 512; sp.numChannels = 1;
+        ts.prepare(sp, 2048);
+        std::copy(src.begin(), src.begin() + 512, scratch.begin());
+        float* ch[1] = { scratch.data() };
+        AudioBufferView<float> view(ch, 1, 512);
+        EXPECT_EQ(ts.feedInput(AudioBufferView<const float>(view)), 512);
+        std::vector<float> before(scratch.begin(), scratch.end());
+        ts.processBlock(view);
+        int differing = 0;
+        for (size_t i = 0; i < before.size(); ++i)
+            if (scratch[i] != before[i]) ++differing;
+        EXPECT_EQ(differing, 0);
+        EXPECT_EQ(ts.getDiscardedInput(), 0LL);
+    }
+}
+
+// Nothing the adaptor keeps may be displaced. Above unity it refuses input at
+// the head rather than letting a queue fill and splice the stream, so a
+// strike still comes out where the fixed-rate slot puts it: at its own
+// position plus the reported latency.
+DSPARK_TEST(TimeStretch_strikes_keep_their_place_through_the_adaptor)
+{
+    std::vector<int> onsets;
+    const auto bed = tsClicks(5.0, 120.0, onsets);
+    const int period = 24000;
+
+    for (double r : { 0.926, 1.0, 1.081 })
+    {
+        TimeStretch<float> probe;
+        AudioSpec sp; sp.sampleRate = 48000.0; sp.maxBlockSize = 4096; sp.numChannels = 1;
+        probe.prepare(sp, 2048);
+        const int latency = probe.getLatency();
+
+        const auto got = tsAdaptor(bed, r, 512);
+        double worst = 0.0;
+        int used = 0;
+        for (size_t i = 0; i < onsets.size(); ++i)
+        {
+            const auto want = static_cast<long long>(onsets[i]) + latency;
+            const long long lo = std::max(0LL, want - period / 2);
+            const long long hi = std::min(static_cast<long long>(got.size()),
+                                          want + period / 2);
+            if (hi - lo < 4) continue;
+            long long peak = lo;
+            double best = 0.0;
+            for (long long j = lo; j < hi; ++j)
+                if (std::fabs(static_cast<double>(got[static_cast<size_t>(j)])) > best)
+                { best = std::fabs(static_cast<double>(got[static_cast<size_t>(j)])); peak = j; }
+            worst = std::max(worst, std::fabs(static_cast<double>(peak - want)));
+            ++used;
+        }
+        EXPECT_GT(used, 7);
+        EXPECT_LT(worst, 96.0);   // 2 ms at 48 kHz
     }
 }
 

@@ -352,16 +352,45 @@ the input it did not consume, and the density it can serve scales as
 holds to about 1040 strikes per minute; past roughly 1060 the timing
 degrades to about 3.9 ms. A shorter frame moves the limit up in proportion.
 
-**Streaming versus whole-signal.** `process()` above is the exact path and
-has no length restriction. `processBlock()` is the real-time path, latency
-`getLatency()` (one frame: 2048 samples, 42.7 ms at 48 kHz), and it is
-subject to something no block-in/block-out effect can escape: a stretch
-changes duration, but the block hands back exactly as many samples as it was
-given. The class holds a bounded input queue for the difference and states
-what happens at each end - above ratio 1 the surplus accumulates for a few
-seconds before the newest input is refused, below it the output waits in
-silence for input that has not arrived yet. Feed it from a variable-rate
-source (a file player reading at `1 / ratio` speed) or use `process()`.
+**Streaming: use the rate-changing pair away from ratio 1.** A stretch
+changes duration, so the honest streaming shape is one where the input count
+and the output count are allowed to differ. That is `feedInput()` /
+`pullOutput()`:
+
+```cpp
+ts.setTimeRatio(120.0f / 110.0f);
+// per callback, in either order and in any sizes:
+const int took = ts.feedInput(block.toView());        // <= getInputCapacity()
+const int gave = ts.pullOutput(destination.toView()); // <= getAvailableOutput()
+```
+
+There is no latency to compensate on that path: what comes out is the
+stretched timeline itself, output sample `k` being sample `k` of the
+stretched signal. It primes first - `pullOutput()` returns 0 until about one
+frame of input has been fed - and after that the output tracks
+`ratio *` the input it has consumed, less a fixed offset of one frame minus
+one analysis hop that is the overlap-add's own incomplete tail. Feeding
+without pulling makes `getInputCapacity()` fall to 0, which is the back
+pressure that keeps the two ends honest.
+
+**The block path is a fixed-rate playback adaptor.** `processBlock()` hands
+back exactly as many samples as it was given, latency `getLatency()` (one
+frame: 2048 samples, 42.7 ms at 48 kHz). At ratio 1 it is exact
+indefinitely. Away from unity it cannot be, and the cost is stated in
+numbers rather than described: below unity exactly `1 - ratio` of the output
+is silence (measured 20.00% at 0.8, 7.40% at 0.926, 5.00% at 0.95, worst
+error 0.03 percentage points over durations of 5 to 30 s and blocks of 64 to
+4096), delivered as gaps of at most one block; above unity the block
+physically cannot carry the stretched stream, so the adaptor refuses the
+fraction `1 - 1/ratio` of the input at the head, spread evenly, and counts
+every refused sample in `getDiscardedInput()`. Nothing that survives is
+displaced - measured worst 38 samples, 0.79 ms, at ratio 1.081 - which is
+the whole point of refusing at the head rather than letting a queue fill and
+splice the stream. Use the pair above, or `process()`, unless the ratio is 1.
+
+The two streaming paths own the same queue with different invariants, so
+whichever one is used first after `prepare()` or `reset()` owns the instance
+until the next `reset()`; the other one's calls do nothing in the meantime.
 
 At ratio 1 the streaming path is transparent: measured residual against the
 delayed input is -146 dBFS at 48 kHz on a 1 kHz tone, so leaving the effect

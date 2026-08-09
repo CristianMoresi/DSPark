@@ -786,6 +786,25 @@ DSPARK_TEST(Beat_tightness_measured_where_the_interval_term_is_live)
     EXPECT_GT(worstDefault, 0.79);
     EXPECT_LT(worstPaper, worstDefault);      // the paper's default is worse here
     EXPECT_LT(worstFloor, worstDefault);      // and so is having no term at all
+
+    // (c) direction tripwire. The default is the bottom of the worst-case
+    // plateau rather than the top, and what put it there is a per-case
+    // ranking: over the wider sweep the header quotes, no case prefers a
+    // tighter grid and three prefer this one. This bed is four cases wide and
+    // does NOT separate the two values -- every case here ties -- so what
+    // follows is a guard, not the demonstration: if any future change makes
+    // the default worse than a grid four times tighter on material this
+    // ordinary, the reason the default sits where it does has gone.
+    const Corpus rub90 = rubatoTrain(90.0, 0.15, 6.0, 30.0);
+    for (const auto& c : { rub, sparse, clean, rub90 })
+    {
+        const double fDefault = scoreBeats(c.beats, analyzeCorpus(c).beatSamples, 70.0).f;
+        const double fTighter = scoreBeats(c.beats,
+                                           analyzeCorpus(c, 100.0).beatSamples, 70.0).f;
+        std::cout << "    " << c.bpm << " BPM case: F at the default " << fDefault
+                  << ", four times tighter " << fTighter << "\n";
+        EXPECT_TRUE(fDefault >= fTighter - 1e-9);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,7 +1239,7 @@ DSPARK_TEST(Beat_tempo_range_is_honoured_and_rejects_nonsense)
     EXPECT_NEAR(static_cast<double>(still.tempoBpm), 160.0, 1.0);
 
     bt.setTightness(std::numeric_limits<float>::quiet_NaN());
-    EXPECT_NEAR(static_cast<double>(bt.getTightness()), 100.0, 1e-3);
+    EXPECT_NEAR(static_cast<double>(bt.getTightness()), 25.0, 1e-3);
 }
 
 // Degenerate and hostile input must return an empty answer rather than a

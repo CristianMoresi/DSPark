@@ -49,19 +49,21 @@
  * supporting it. Together they take the grid F-measure on clean clicks from
  * 0.9315 to 1.0000 and the worst beat error from 29.1 ms to 5.4 ms.
  *
- * TIGHTNESS. The default is 100, chosen by measurement on this implementation
+ * TIGHTNESS. The default is 25, chosen by measurement on this implementation
  * rather than inherited. The published values disagree with each other by most
  * of an order of magnitude -- the paper names 400 as its default (Figure 5
  * caption) and hard-codes it (beat2.m line 56, beatdyn.m line 56), its own
  * best score on its own tuning set is at alpha = 680 (section 4.2), and
  * librosa shipped 400 through 0.3.x and 100 from 0.4.0 onward. All use the
  * natural logarithm and the same cost, so the numbers are comparable and the
- * disagreement is real rather than a change of units. Measured here on
- * material where the term is actually live -- which excludes isochronous
- * clicks, where it multiplies a quantity that is identically zero -- the
- * plateau is 25 to 100 and 400 is off it: a +/-15% rubato costs 43% of the
- * grid at 400 and nothing at 100. See setTightness() for the sweep and for
- * why a steady-tempo bed cannot measure this parameter at all.
+ * disagreement is real rather than a change of units -- but none of them
+ * decides anything here. Measured on material where the term is actually live
+ * -- which excludes isochronous clicks, where it multiplies a quantity that is
+ * identically zero -- no case in the bed prefers a value above the default and
+ * three prefer it to 100: a +/-15% rubato at 120 BPM costs 43% of the grid at
+ * 400, 0.8% at 100 and nothing at the default. See setTightness() for the
+ * sweep, for the case-by-case ranking that picks the number, and for why a
+ * steady-tempo bed cannot measure this parameter at all.
  *
  * CAUSAL (processBlock()). A bank of one-pole complex resonators over the same
  * envelope -- baseline-removed the same way, by a trailing mean rather than a
@@ -190,16 +192,19 @@
  *   update.
  * - beatNow() / getLastBeatSample(): any thread, lock free, two independent
  *   words, ORDERED against each other. The position is written first and the
- *   latch is released last; beatNow() acquires. A reader that tests the latch
- *   and then reads the position therefore gets the position from that same
- *   processing call or a later one. Without that pairing the two are relaxed
- *   loads of distinct objects and a weakly ordered machine is free to satisfy
- *   them in either order, which would let a caller be told a beat just
- *   happened and handed the previous beat's position -- a full beat period
- *   out, up to 1.5 s at the bottom of the tempo range. Reading them the other
- *   way round (position first, latch second) can still pair the latch of one
- *   call with the position of the next, which is a LATER real beat and never
- *   a position that was not a beat.
+ *   latch is released last; beatNow() acquires. READ THEM IN THAT ORDER: test
+ *   the latch first, then read the position, and the position is the one
+ *   written in the call that set the latch or in a later one. Without the
+ *   pairing the two are relaxed loads of distinct objects and a weakly ordered
+ *   machine is free to satisfy them in either order, which would let a caller
+ *   be told a beat just happened and handed the previous beat's position -- a
+ *   full beat period out, up to 1.5 s at the bottom of the tempo range. The
+ *   reverse reader order (position first, latch second) is NOT made safe by
+ *   the pairing and is not a memory-model question at all: the writer may run
+ *   between the reader's two loads, so the reader holds a position from before
+ *   that gap and a latch from after it. Measured, that order returns a stale
+ *   position on essentially every beat it observes, by a full beat period and
+ *   by more when the reader's two loads are further apart than one beat.
  * - setTempoRange() / setTightness(): control thread, lock free. The range is
  *   two indices with an invariant between them, so it travels as one packed
  *   word as well; setTempoRange() never allocates, because the resonator bank
@@ -344,7 +349,7 @@ public:
      * term the recursion is built on and leaves the grid free to place a beat
      * at every envelope peak.
      *
-     * Default 100, and the number is measured rather than inherited.
+     * Default 25, and the number is measured rather than inherited.
      *
      * A CAUTION ON MEASURING IT. On isochronous clicks this parameter does
      * nothing at all: the optimal interval is exactly the target period, so
@@ -365,35 +370,54 @@ public:
      *   worst F  0.685  0.760  0.820  0.820  0.820  0.609  0.564  0.520  0.544
      *   mean  F  0.938  0.978  0.984  0.982  0.978  0.944  0.913  0.881  0.881
      *
-     * The plateau is 25 to 100 and its two edges are real failures, one on
-     * each side: below it the grid follows spurious peaks (a sparse pattern
-     * with the kick off the beat drops from 0.820 to 0.760, and with the term
-     * deleted the same case is 0.760 and the metrical level is wrong twice);
-     * above it expressive timing collapses (a +/-15% rubato at 120 BPM scores
-     * 1.0000 up to alpha = 100 and 0.5645 at 400 -- at 400 the tracker loses
-     * 43% of that grid).
+     * The WORST-case row has a plateau from 25 to 100, and its two edges are
+     * real failures, one on each side: below it the grid follows spurious
+     * peaks (a sparse pattern with the kick off the beat drops from 0.820 to
+     * 0.760, and with the term deleted the same case is 0.760 and the metrical
+     * level is wrong twice); above it expressive timing collapses (a +/-15%
+     * rubato at 120 BPM scores 1.0000 at alpha = 25 and at 50, 0.9919 at 100
+     * and 0.5645 at 400 -- at 400 the tracker loses 43% of that grid).
      *
-     * The default is the top of the plateau. Inside the plateau the bed cannot
-     * separate the three values, so the tie goes to the strongest interval
-     * term the measurement allows: that is the direction that protects
-     * material the bed does not contain, since a tighter grid is held together
-     * by its own period when the onset evidence thins out. It is also the
-     * value the most widely used implementation of this algorithm has shipped
-     * since 2015, so two independent reasons pick the same number.
+     * That plateau is one statistic, and it is not a tie. Compared case by
+     * case, alpha = 25 is equal to alpha = 100 on 12 of the 15 cases, better
+     * on three -- +/-15% rubato at 120 BPM 1.0000 against 0.9919, +/-15%
+     * rubato at 90 BPM 1.0000 against 0.9574, the syncopated pattern at 110
+     * BPM 1.0000 against 0.9649 -- and worse on none. 25 likewise loses to 50
+     * on no case and beats it on one. The mean row printed above says the same
+     * thing in one number, and the ranking, not the plateau, is what picks the
+     * default: the bed contains no case that prefers a larger value.
+     *
+     * The default is therefore the BOTTOM of the plateau, decided by that
+     * per-case comparison. The same order holds OFF this bed, on the sparse
+     * and noisy material a larger value might be expected to protect: over a
+     * second bed of 16 cases -- noise swept to 0.50 rms at two tempi, and
+     * beats carrying no onset at all, with and without noise -- alpha = 25 is
+     * better than 100 on six, worse on one and level on nine. The six are
+     * large (F 0.8113 against 0.2885 at 0.45 rms, 0.9346 against 0.6226 at
+     * 0.40) and the one is small (0.9720 against 0.9811 at 0.30 rms). A
+     * tighter grid does not rescue thin evidence: it holds the grid to a
+     * period that thin evidence was too weak to have set correctly in the
+     * first place.
      *
      * It is NOT the 400 the original paper names as its default (Figure 5
-     * caption) and hard-codes in its reference implementation. That value is
-     * measurably worse here on every case in the bed that can move, and the
-     * published values disagree with each other by most of an order of
-     * magnitude in any case -- the same paper's best score on its own tuning
-     * set is at alpha = 680, and the reference implementation above shipped
-     * 400 through its 0.3 series and 100 from 0.4.0 on. All of them use the
-     * natural logarithm and the same cost, so the numbers are directly
-     * comparable and the disagreement is real rather than a change of units.
+     * caption) and hard-codes in its reference implementation. Against the
+     * default, 400 loses on six of the fifteen cases -- the four expressive
+     * ones, the syncopated pattern and the jittered bed -- ties on the other
+     * nine and wins on none, the largest single loss being 0.4355 of F. The
+     * published values also disagree with each other by most of an order of
+     * magnitude: the same paper's best score on its own tuning set is at
+     * alpha = 680, and the reference implementation above shipped 400 through
+     * its 0.3 series and 100 from 0.4.0 on. All of them use the natural
+     * logarithm and the same cost, so the numbers are directly comparable and
+     * the disagreement is real rather than a change of units. None of those
+     * numbers is a reason here; the sweep above is.
      *
      * Callers whose material has a genuinely elastic tempo should lower it
-     * further; callers tracking sparse or noisy material can raise it, at the
-     * measured cost above.
+     * further. Raising it is not recommended and was not left as advice: on
+     * the two beds above, 30 of the 31 cases are flat or worse when it is
+     * raised to 100, and the single case that improves does so by 0.009 of F.
+     * A caller that raises it anyway should measure the effect on its own
+     * material rather than trust the direction.
      */
     void setTightness(T alpha) noexcept
     {
@@ -619,9 +643,15 @@ public:
      * Acquire, paired with the release the processing call ends on: a reader
      * that sees this true and then reads getLastBeatSample() is guaranteed the
      * position written in that same call or a later one, never an earlier one.
-     * Reading the two in the other order can still pair the latch of one call
-     * with the position of the NEXT, which is a later real beat; see the
-     * threading notes in the file header for why that direction is harmless.
+     *
+     * That is the order to use, and it is the only safe one. Reading the two
+     * the other way round -- position first, latch second -- is not covered by
+     * the pairing: the two loads are separate, the processing call may run
+     * between them, and the reader is then told a beat just happened while
+     * holding the position of an earlier one. Measured, that order returns a
+     * stale position on essentially every beat it observes, by one full beat
+     * period and by more when the reader's two loads are further apart than
+     * one beat. See the threading notes in the file header.
      */
     [[nodiscard]] bool beatNow() const noexcept
     {
@@ -636,6 +666,10 @@ public:
      * was announced. The two differ by getLatencySamples() and a caller that
      * aligns anything to the grid wants this one: the announcement carries the
      * analysis delay, the attribution does not.
+     *
+     * Relaxed on its own. To pair it with beatNow(), call beatNow() FIRST and
+     * this second; the reverse order can hand back the position of an earlier
+     * beat than the one the latch announced. See beatNow().
      */
     [[nodiscard]] int64_t getLastBeatSample() const noexcept
     {
@@ -674,11 +708,13 @@ private:
     static constexpr double kBankMinBpm = 20.0;
     static constexpr double kBankMaxBpm = 480.0;
     /// The bank itself runs slower than the slowest searchable tempo, because
-    /// the harmonic test below has to read resonators BELOW every candidate:
-    /// as far past the bottom of the searchable range as the largest divisor
-    /// the test uses, or the test silently stops applying to the slowest
-    /// candidates -- which is where it is needed most, since those are the
-    /// ones whose multiples all fit inside the range.
+    /// the harmonic test below has to read resonators BELOW every candidate.
+    /// Reaching as far past the bottom of the searchable range as the largest
+    /// divisor the test uses keeps that test DEFINED for the slowest
+    /// candidates instead of silently skipped; it is not known to change any
+    /// answer. Reverting the reach to 3 while keeping the divisors leaves the
+    /// causal range sweep at 0 wrong of 30, and the widening costs nothing
+    /// measurable, so it is defensive rather than load-bearing.
     static constexpr double kHarmonicReach = 5.0;
     static constexpr int kBinsPerOctave = 128; ///< Bank resolution, ~0.54%.
     static constexpr double kDefaultMinBpm = 40.0;
@@ -733,7 +769,7 @@ private:
 
     /// Dynamic-programming tightness. See setTightness() for what the number
     /// is, where it comes from and why it is a default rather than a constant.
-    static constexpr double kDefaultTightness = 100.0;
+    static constexpr double kDefaultTightness = 25.0;
     static constexpr double kMinTightness = 1e-3;
 
     /// Least share of the onset mass a candidate must carry in phase before

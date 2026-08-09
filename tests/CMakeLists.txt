@@ -37,6 +37,7 @@ add_executable(dspark_tests
     TestIO.cpp
     TestIntegration.cpp
     TestMusic.cpp
+    TestBeat.cpp
     TestOnset.cpp
     TestQualityAudit.cpp
     TestState.cpp)

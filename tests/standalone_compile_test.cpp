@@ -98,12 +98,13 @@ void instantiate()
     PitchFollower<T> pitchFollow;
     SpectrumAnalyzer<T> sa;
     OnsetDetector<T> onset;
+    BeatTracker<T> beats;
 
     // -- Music ----------------------------------------------------------------
     ChordDetector<T> chords;
 
     // Touch everything so the optimiser cannot drop it.
-    (void)spec;
+    (void)spec; (void)beats;
     (void)buf; (void)biquad; (void)conv; (void)dither; (void)dw; (void)envGen;
     (void)fftReal; (void)fftComplex; (void)fir; (void)hil; (void)hyst;
     (void)ladder; (void)modRouter; (void)osc; (void)ov; (void)ph; (void)rs;

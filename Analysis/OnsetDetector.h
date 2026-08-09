@@ -497,14 +497,23 @@ public:
      *        signal.
      *
      * The analysis ring starts empty, so the first frames measure the step
-     * from silence into the first input as well as the input itself, and the
-     * flux they report is an artefact of that step. The detector suppresses
-     * its own onsets over this span; a caller reading the envelope directly
-     * must discard the same span, or a spurious peak lands at time zero --
-     * where a periodicity estimator weights it most heavily, because every
-     * lag can reach it. Equal to fftSize/hop + 2: the frames needed to fill
-     * the ring, plus two so the flux to the previous frame is itself computed
-     * from two full frames.
+     * from silence into the first input as well as the input itself, and part
+     * of the flux they report is an artefact of that step. The detector
+     * suppresses its own onsets over this span, which is what the number is
+     * for.
+     *
+     * Whether an envelope reader should discard the same span is its own
+     * decision and is not obviously yes. Measured on a beat grid built from
+     * this envelope, discarding it costs a real beat whenever the material
+     * starts at sample 0 -- F 0.9919 against 1.0000, one beat missing at the
+     * head of every such signal -- while the hazard it guards against did not
+     * appear even on a full-level tone starting at sample 0 with no beat
+     * there, because a consumer that removes a local baseline has already
+     * removed the step. That consumer therefore keeps the frames.
+     *
+     * Equal to fftSize/hop + 2: the frames needed to fill the ring, plus two
+     * so the flux to the previous frame is itself computed from two full
+     * frames.
      */
     [[nodiscard]] int getWarmupFrames() const noexcept { return primeFrames_; }
 

@@ -49,16 +49,19 @@
  * supporting it. Together they take the grid F-measure on clean clicks from
  * 0.9315 to 1.0000 and the worst beat error from 29.1 ms to 5.4 ms.
  *
- * TIGHTNESS. The default is 400 -- the value the paper names as its default
- * (Figure 5 caption) and the one its author's reference implementation
- * hard-codes (beat2.m line 56, beatdyn.m line 56). It is a default, not a
- * constant of nature, and the published values disagree with each other by
- * most of an order of magnitude: the same paper's best score on its own tuning
- * set is at alpha = 680 (section 4.2), while librosa shipped 400 through 0.3.x
- * and 100 from 0.4.0 onward. Both use the natural logarithm and the same form,
- * so those numbers are directly comparable and the disagreement is real rather
- * than a change of units. What that disagreement is worth here is measured
- * rather than assumed, and the answer is: very little. See setTightness().
+ * TIGHTNESS. The default is 100, chosen by measurement on this implementation
+ * rather than inherited. The published values disagree with each other by most
+ * of an order of magnitude -- the paper names 400 as its default (Figure 5
+ * caption) and hard-codes it (beat2.m line 56, beatdyn.m line 56), its own
+ * best score on its own tuning set is at alpha = 680 (section 4.2), and
+ * librosa shipped 400 through 0.3.x and 100 from 0.4.0 onward. All use the
+ * natural logarithm and the same cost, so the numbers are comparable and the
+ * disagreement is real rather than a change of units. Measured here on
+ * material where the term is actually live -- which excludes isochronous
+ * clicks, where it multiplies a quantity that is identically zero -- the
+ * plateau is 25 to 100 and 400 is off it: a +/-15% rubato costs 43% of the
+ * grid at 400 and nothing at 100. See setTightness() for the sweep and for
+ * why a steady-tempo bed cannot measure this parameter at all.
  *
  * CAUSAL (processBlock()). A bank of one-pole complex resonators over the same
  * envelope -- baseline-removed the same way, by a trailing mean rather than a
@@ -90,11 +93,19 @@
  * that closed form on a 120 BPM pulse jittered from 0 to 40 ms, the worst
  * disagreement over the sweep is 0.011.
  *
- * The reported confidence is C at the delivered tempo, reduced only where a
+ * The reported confidence is C at the delivered tempo, reduced where a
  * different metrical level explained the signal nearly as well (see THE
  * SECONDARY HYPOTHESIS). It answers how much of what the signal did is
- * explained by the grid that was returned. It is NOT a probability that the
- * tempo is right.
+ * explained by the grid that was returned, and how much of that explanation is
+ * unique to it. It is NOT a probability that the tempo is right, and in
+ * particular it CANNOT flag a metrical-level error: the waveform argument
+ * under THE OCTAVE shows two pieces of music with different correct answers
+ * that are the same signal, so any number computed from the signal is the same
+ * for both. A caller who needs the level checked reads secondaryTempoBpm,
+ * always, not the confidence. What the confidence does report faithfully is
+ * the state where the signal genuinely does not determine the level: there the
+ * two readings explain it equally, the discount is total, and the number goes
+ * to zero.
  *
  * THE OCTAVE, which is the error that matters. Half and double tempo explain a
  * pulse train almost as well as the truth does, and a tolerance band will
@@ -105,31 +116,65 @@
  * itself and cannot reject double at all, and the discriminator both paths use
  * is
  *
- *     score(tau) = W(tau) * C(tau) * prod_m (1 - C(m*tau)),   m in {2, 3},
+ *     score(tau) = W(tau) * C(tau) * prod_m (1 - min(1, R_m(tau) * C(m*tau))),
+ *     m in {2, 3, 5},
  *
  * where each extra factor asks whether the candidate's own subharmonic is just
  * as coherent as the candidate: if it is, the candidate is a harmonic of the
- * real pulse and the real pulse is the slower one. Two and three between them
- * catch every integer multiple up to four, and they are exactly the relations
- * a tempo evaluation calls a metrical-level confusion. Leaving the m = 3
- * factor out is not an academic point: on a 60 BPM pulse the causal path then
- * locks to 180 BPM and reports a confidence of 0.994 while doing it. W is the
- * log-Gaussian tempo prior of the same paper (eq. 6), centred on 0.5 s per
- * beat with a width of 1.4 octaves; it is the weakest factor on purpose, being
- * the only one that does not look at the signal.
+ * real pulse and the real pulse is the slower one. A candidate that is k times
+ * the true pulse is caught whenever k is divisible by one of the divisors, so
+ * two, three and five catch every k up to six -- every relation a range
+ * spanning a factor of six can hold, which the default 40..240 does exactly.
+ * None of this is academic: without the m = 3 factor a 60 BPM pulse locks the
+ * causal path to 180 BPM at a confidence of 0.994, and without the m = 5
+ * factor 40, 42, 44 and 46 BPM all publish five times too fast, inside the
+ * default range. W is the log-Gaussian tempo prior of the paper (eq. 6),
+ * centred on 0.5 s per beat with a width of 1.4 octaves; it is the weakest
+ * factor on purpose, being the only one that does not look at the signal.
+ *
+ * R_m is the TAPPING PREFERENCE of the subharmonic against the candidate,
+ * never below one, and it is there because of a limit that has to be stated
+ * rather than engineered away. Take a click train at rate R with alternate
+ * events attenuated to a fraction of the others. That single waveform is two
+ * different pieces of music: a beat at R with a backbeat, and a beat at R/2
+ * with straight eighths. Nothing in the envelope distinguishes them -- they
+ * ARE the same envelope -- so no measurement can, and C(2*tau) is exactly the
+ * depth of the attenuation in both readings. What separates them is only which
+ * absolute rate a listener would tap, so that is what R_m carries: a sharper
+ * preference than W, and asymmetric, because a level at twice the preferred
+ * rate is a far less plausible tactus than one at half of it. It can only ever
+ * make the test reject a candidate more readily, never protect a plain
+ * harmonic, whose subharmonic is fully coherent and whose rejection stays
+ * absolute.
+ *
+ * Where that leaves the double, measured on straight eighths swept from 0.05
+ * to 1.0 of the beat's amplitude at 70..140 BPM: the tracker reports the beat
+ * while the eighths stay below an onset-strength ratio of about 0.44 at 90
+ * BPM, 0.72 at 100 and 0.90 at 120, against 0.28 to 0.37 without R_m. Above
+ * that ratio it reports the eighth level, with the beat in
+ * secondaryTempoBpm. Below 90 BPM it reports the eighth level from a ratio of
+ * 0.28 up, and that is the tapping-preferred reading rather than a defect:
+ * 140 BPM is a likelier tactus than 70. See getConfidence() for what the
+ * confidence can and cannot tell a caller about this.
  *
  * THE SECONDARY HYPOTHESIS is a competitor, not a label. It is the
  * best-scoring candidate at least a quarter of an octave from the winner --
  * the metrical level a listener could plausibly have tapped instead -- and it
  * is 0 when the envelope offers no such alternative inside the searched range,
  * which is the honest answer for a pulse near the bottom of that range. It
- * does two things. It is reported, so a caller that disagrees about the level
- * has somewhere to go. And it discounts the confidence when it scores close to
- * the winner, because a grid that fits is not the same claim as a grid that is
- * the only one that fits: on a three-against-two polyrhythm, where both pulses
- * are real, that takes the reported confidence from 0.52 to between 0.05 and
- * 0.40, while leaving every unambiguous case in the acceptance corpus
- * untouched. See kAmbiguityFloor for why it has a floor under it.
+ * does two things, and it does them from two different scores because they are
+ * two different questions. What is REPORTED is the best alternative after the
+ * tapping preference, since the point of reporting it is to name a level a
+ * caller might have wanted instead. What DISCOUNTS the confidence is the best
+ * explanation of the same envelope at any other level, tapping preference set
+ * aside, because a grid that fits is not the same claim as a grid that is the
+ * only one that fits -- and a discount taken from the adjudicated score would
+ * measure the tracker's own decision rather than the signal, reporting
+ * certainty that the preference had manufactured. On a three-against-two
+ * polyrhythm, where both pulses are real, the discount takes the reported
+ * confidence from 0.52 to between 0.02 and 0.38, while leaving every
+ * unambiguous case in the acceptance corpus untouched. See kAmbiguityFloor for
+ * why it has a floor under it.
  *
  * Threading:
  * - prepare(): setup thread (allocates; not concurrent with anything else).
@@ -144,10 +189,17 @@
  *   so are consistent individually, but two separate calls can straddle an
  *   update.
  * - beatNow() / getLastBeatSample(): any thread, lock free, two independent
- *   words. They can only disagree in one direction and it is harmless: both
- *   are written in the same processing call, so a reader that catches the
- *   latch of one call and the sample of the next is handed a LATER real beat,
- *   never a stale one and never a position that was not a beat.
+ *   words, ORDERED against each other. The position is written first and the
+ *   latch is released last; beatNow() acquires. A reader that tests the latch
+ *   and then reads the position therefore gets the position from that same
+ *   processing call or a later one. Without that pairing the two are relaxed
+ *   loads of distinct objects and a weakly ordered machine is free to satisfy
+ *   them in either order, which would let a caller be told a beat just
+ *   happened and handed the previous beat's position -- a full beat period
+ *   out, up to 1.5 s at the bottom of the tempo range. Reading them the other
+ *   way round (position first, latch second) can still pair the latch of one
+ *   call with the position of the next, which is a LATER real beat and never
+ *   a position that was not a beat.
  * - setTempoRange() / setTightness(): control thread, lock free. The range is
  *   two indices with an invariant between them, so it travels as one packed
  *   word as well; setTempoRange() never allocates, because the resonator bank
@@ -230,7 +282,6 @@ public:
         onset_.prepare(spec);
         hop_ = onset_.getHopSize();
         if (hop_ < 1) hop_ = 1;
-        warmupFrames_ = onset_.getWarmupFrames();
         frameRate_ = sampleRate_ / static_cast<double>(hop_);
         baselineCoef_ = 1.0 - std::exp(-1.0 / std::max(1.0, kBaselineSeconds * frameRate_));
 
@@ -293,24 +344,56 @@ public:
      * term the recursion is built on and leaves the grid free to place a beat
      * at every envelope peak.
      *
-     * Default 400. Measured sensitivity on this implementation, swept over
-     * alpha = 25, 50, 100, 200, 400, 680, 1000, 2000, 4000:
+     * Default 100, and the number is measured rather than inherited.
      *
-     * - Clean 120 BPM clicks and the same track jittered by 20 ms: the grid is
-     *   BIT-IDENTICAL across the whole sweep. F-measure 1.0000 and worst beat
-     *   error 4.72 ms (clean) / 4.97 ms (jittered) at every value.
-     * - A 100-to-140 BPM ramp is the only case that moves, and it moves the
-     *   way the term predicts: F 1.0000 for alpha <= 100, 0.9939 for 200 to
-     *   1000, 0.9877 for 2000 and above. One beat in 81 across a factor of
-     *   forty in alpha.
+     * A CAUTION ON MEASURING IT. On isochronous clicks this parameter does
+     * nothing at all: the optimal interval is exactly the target period, so
+     * the cost it weighs is identically zero, and the grid is BIT-IDENTICAL
+     * from alpha = 0.001 -- which deletes the term outright -- to alpha =
+     * 4000. Any sweep run only on steady material measures nothing and will
+     * report a spread of zero whatever the code does. The term is live only
+     * where the played interval departs from the target by more than the
+     * grid-snap window, an eighth of a period.
      *
-     * So on this corpus the tightness that scores best is the LOOSEST end,
-     * which is not the shipped default. The default stays at 400 because that
-     * is the value the algorithm's source names and ships, and because the
-     * whole measured spread is a single beat; a default chosen instead to win
-     * one synthetic ramp by a fortieth of a percent would be tuned to this
-     * suite rather than to music. Callers whose material has a genuinely
-     * elastic tempo should lower it.
+     * MEASURED, on a bed that does exercise it: expressive timing (rubato at
+     * +/-8, +/-10 and +/-15%, ritardando, accelerando), material with onsets
+     * off the beat and beats carrying no onset (dropouts, syncopation,
+     * straight eighths, swing), and a noise bed under heavy jitter. Reported
+     * at the WORST case of that bed, F-measure at +/-70 ms:
+     *
+     *   alpha    0.001    10     25     50    100    200    400   1000   4000
+     *   worst F  0.685  0.760  0.820  0.820  0.820  0.609  0.564  0.520  0.544
+     *   mean  F  0.938  0.978  0.984  0.982  0.978  0.944  0.913  0.881  0.881
+     *
+     * The plateau is 25 to 100 and its two edges are real failures, one on
+     * each side: below it the grid follows spurious peaks (a sparse pattern
+     * with the kick off the beat drops from 0.820 to 0.760, and with the term
+     * deleted the same case is 0.760 and the metrical level is wrong twice);
+     * above it expressive timing collapses (a +/-15% rubato at 120 BPM scores
+     * 1.0000 up to alpha = 100 and 0.5645 at 400 -- at 400 the tracker loses
+     * 43% of that grid).
+     *
+     * The default is the top of the plateau. Inside the plateau the bed cannot
+     * separate the three values, so the tie goes to the strongest interval
+     * term the measurement allows: that is the direction that protects
+     * material the bed does not contain, since a tighter grid is held together
+     * by its own period when the onset evidence thins out. It is also the
+     * value the most widely used implementation of this algorithm has shipped
+     * since 2015, so two independent reasons pick the same number.
+     *
+     * It is NOT the 400 the original paper names as its default (Figure 5
+     * caption) and hard-codes in its reference implementation. That value is
+     * measurably worse here on every case in the bed that can move, and the
+     * published values disagree with each other by most of an order of
+     * magnitude in any case -- the same paper's best score on its own tuning
+     * set is at alpha = 680, and the reference implementation above shipped
+     * 400 through its 0.3 series and 100 from 0.4.0 on. All of them use the
+     * natural logarithm and the same cost, so the numbers are directly
+     * comparable and the disagreement is real rather than a change of units.
+     *
+     * Callers whose material has a genuinely elastic tempo should lower it
+     * further; callers tracking sparse or noisy material can raise it, at the
+     * measured cost above.
      */
     void setTightness(T alpha) noexcept
     {
@@ -458,7 +541,16 @@ public:
             }
         }
 
-        beatLatched_.store(fired, std::memory_order_relaxed);
+        // Release, and the matching acquire is in beatNow(). The latch and the
+        // beat's position are two separate words written in this same call,
+        // and a caller that sees the latch set must not then read a position
+        // from an earlier call: on a weakly ordered machine two relaxed loads
+        // of distinct objects may be observed in either order, so without this
+        // pairing a reader could be handed the PREVIOUS beat's position -- an
+        // error of one whole beat period -- while being told a beat just
+        // happened. The store is last on purpose: everything the frame wrote,
+        // the position included, is ordered before it.
+        beatLatched_.store(fired, std::memory_order_release);
     }
 
     // -- Readout (lock-free) -------------------------------------------------
@@ -471,8 +563,32 @@ public:
         return static_cast<T>(bpm);
     }
 
-    /** @brief Coherence of the envelope with the running tempo, in [0,1].
-     *         See the file header for exactly what the number measures. */
+    /**
+     * @brief Coherence of the envelope with the running tempo, in [0,1].
+     *
+     * The share of onset strength that falls in phase with the delivered
+     * grid, discounted by how nearly another metrical level explained the same
+     * envelope. See the file header for the definition and for the closed form
+     * it can be checked against.
+     *
+     * WHAT IT DOES NOT TELL YOU. It is not a detector of half and double
+     * tempo, and no number computed from the signal can be: a click train with
+     * alternate events attenuated is at once a backbeat at the fast rate and
+     * straight eighths at the slow one, so the two cases that a caller would
+     * want told apart are the same waveform. Measured on straight eighths, the
+     * tracker reports the eighth level above the amplitude ratios in the file
+     * header and reports it with a confidence of 0.99, because that grid does
+     * explain nearly all of the onset strength -- which is what the number
+     * says, and it is true. Check secondaryTempoBpm whenever the metrical
+     * level matters; it holds the other reading at every one of those points.
+     *
+     * A LOW value means one of two things and they are worth separating: the
+     * grid explains little of what happened, or another level explains it just
+     * as well. The second is the case the discount produces, and there the
+     * number falls to zero rather than to something middling -- measured 0.000
+     * on straight eighths at the amplitude where the two readings are level,
+     * against 0.99 on either side of it.
+     */
     [[nodiscard]] T getConfidence() const noexcept
     {
         float bpm = 0.0f, conf = 0.0f;
@@ -497,10 +613,19 @@ public:
         confidenceOut = static_cast<T>(conf);
     }
 
-    /** @brief True if a beat was reported during the most recent call. */
+    /**
+     * @brief True if a beat was reported during the most recent call.
+     *
+     * Acquire, paired with the release the processing call ends on: a reader
+     * that sees this true and then reads getLastBeatSample() is guaranteed the
+     * position written in that same call or a later one, never an earlier one.
+     * Reading the two in the other order can still pair the latch of one call
+     * with the position of the NEXT, which is a later real beat; see the
+     * threading notes in the file header for why that direction is harmless.
+     */
     [[nodiscard]] bool beatNow() const noexcept
     {
-        return beatLatched_.load(std::memory_order_relaxed);
+        return beatLatched_.load(std::memory_order_acquire);
     }
 
     /**
@@ -550,21 +675,29 @@ private:
     static constexpr double kBankMaxBpm = 480.0;
     /// The bank itself runs slower than the slowest searchable tempo, because
     /// the harmonic test below has to read resonators BELOW every candidate:
-    /// a factor of three past the bottom of the searchable range.
-    static constexpr double kHarmonicReach = 3.0;
+    /// as far past the bottom of the searchable range as the largest divisor
+    /// the test uses, or the test silently stops applying to the slowest
+    /// candidates -- which is where it is needed most, since those are the
+    /// ones whose multiples all fit inside the range.
+    static constexpr double kHarmonicReach = 5.0;
     static constexpr int kBinsPerOctave = 128; ///< Bank resolution, ~0.54%.
     static constexpr double kDefaultMinBpm = 40.0;
     static constexpr double kDefaultMaxBpm = 240.0;
 
     /// Which subharmonics the metrical-level test reads. A candidate that is
     /// really a harmonic of the true pulse has a subharmonic just as coherent
-    /// as itself, and the true pulse does not. Two and three are the divisors
-    /// that matter: every octave error is caught by the two, every triplet
-    /// error by the three, and between them they catch every integer multiple
-    /// up to four inclusive. They are also exactly the relations a tempo
-    /// evaluation calls a metrical-level confusion rather than a wrong answer.
-    static constexpr int kNumHarmonics = 2;
-    static constexpr double kHarmonicDivisors[kNumHarmonics] = { 2.0, 3.0 };
+    /// as itself, and the true pulse does not. A candidate that is the true
+    /// pulse times k is caught whenever k is divisible by one of these
+    /// divisors, so two and three alone leave k = 5 open -- and k = 5 fits
+    /// inside the default range at its bottom, where a resonator at a fifth of
+    /// the true period receives every pulse in phase and the tempo prior
+    /// prefers it: measured at 40, 42, 44 and 46 BPM, all four published five
+    /// times too fast before the fifth divisor existed. Two, three and five
+    /// between them catch every integer multiple up to six inclusive, which is
+    /// every multiple a range spanning a factor of six can hold, and the
+    /// default range spans exactly six.
+    static constexpr int kNumHarmonics = 3;
+    static constexpr double kHarmonicDivisors[kNumHarmonics] = { 2.0, 3.0, 5.0 };
 
     /// Memory of every resonator, in units of its own period. Equal memory in
     /// BEATS rather than in seconds, so a 60 BPM and a 240 BPM candidate are
@@ -577,9 +710,30 @@ private:
     static constexpr double kPriorCentreSeconds = 0.5;
     static constexpr double kPriorWidthOctaves = 1.4;
 
+    /// Tapping preference, used ONLY to decide between two readings that stand
+    /// in an exact metrical relation to each other. It is a different question
+    /// from the search prior above and it gets a different, sharper answer.
+    ///
+    /// The search prior has to be broad, because it ranks candidates all over
+    /// the searched range and a narrow one would suppress real tempi at the
+    /// ends of it. The metrical-level question is narrower: both readings
+    /// explain the same events and differ only in which of them is called the
+    /// beat, so the only thing left to decide it with is which rate a listener
+    /// would tap -- and that preference is sharp, and it is not symmetric. A
+    /// level twice the preferred rate is a much less plausible tactus than one
+    /// half of it, which is why the width above the centre tempo is the tight
+    /// one and the width below it is the search prior's own.
+    ///
+    /// The two widths are the only free parameters in the level decision and
+    /// they were chosen by measurement over both directions of the metrical
+    /// corpus, not by citation; the frontier they produce is stated as a
+    /// measured amplitude in setTightness()'s neighbour, getConfidence().
+    static constexpr double kTactusFastOctaves = 0.45;
+    static constexpr double kTactusSlowOctaves = kPriorWidthOctaves;
+
     /// Dynamic-programming tightness. See setTightness() for what the number
     /// is, where it comes from and why it is a default rather than a constant.
-    static constexpr double kDefaultTightness = 400.0;
+    static constexpr double kDefaultTightness = 100.0;
     static constexpr double kMinTightness = 1e-3;
 
     /// Least share of the onset mass a candidate must carry in phase before
@@ -754,6 +908,16 @@ private:
         for (int k = 0; k < kNumHarmonics; ++k)
             harmonicOffset_[k] = static_cast<int>(std::lround(
                 std::log2(kHarmonicDivisors[k]) * static_cast<double>(kBinsPerOctave)));
+
+        // The tactus preference of each subharmonic against its own candidate,
+        // tabulated here so the per-frame score stays a few multiplies.
+        bankLevelRatio_.assign(static_cast<size_t>(kNumHarmonics)
+                                   * static_cast<size_t>(bankSize_), 1.0);
+        for (int k = 0; k < kNumHarmonics; ++k)
+            for (int i = 0; i < bankSize_; ++i)
+                bankLevelRatio_[static_cast<size_t>(k) * static_cast<size_t>(bankSize_)
+                                + static_cast<size_t>(i)]
+                    = levelRatio(bankPeriod_[static_cast<size_t>(i)], kHarmonicDivisors[k]);
     }
 
     // -- Causal path ---------------------------------------------------------
@@ -770,12 +934,6 @@ private:
     {
         const typename OnsetDetector<T>::OdfFrame f = onset_.getLastOdfFrame();
         ++frameIndex_;
-
-        // The first frames read the step from silence into the input rather
-        // than the input, and a periodicity estimator weights an impulse at
-        // time zero more heavily than any other, because every candidate
-        // period reaches it.
-        if (frameIndex_ <= warmupFrames_) return false;
 
         const double raw = (std::isfinite(f.value) && f.value > T(0))
                                ? static_cast<double>(f.value) : 0.0;
@@ -845,10 +1003,28 @@ private:
         for (int i = iLo; i <= iHi; ++i)
         {
             if (std::abs(i - best) < apart) continue;
-            runnerUp = std::max(runnerUp, scoreAt(i));
+            runnerUp = std::max(runnerUp, scoreAt(i, false));
         }
-        const double share = (bestScore > 0.0)
-            ? std::clamp(runnerUp / bestScore, 0.0, 1.0) : 0.0;
+        const double bestExplains = scoreAt(best, false);
+        const double share = (bestExplains > 0.0)
+            ? std::clamp(runnerUp / bestExplains, 0.0, 1.0) : 0.0;
+
+        // The level is adjudicated with a preference that changes from bin to
+        // bin, so the bin it selects can sit one bin off the coherence peak of
+        // the very level it selected. The period and the phase are read from
+        // the peak itself, which is where the signal actually is: two steps
+        // are enough, because the two functions never differ by more than the
+        // preference's slope over one bin, and it costs -0.27% -> -0.14% on
+        // the worst reported tempo at the top of the default range.
+        for (int guard = 0; guard < 2; ++guard)
+        {
+            if (best > 0 && bankCoherence_[static_cast<size_t>(best - 1)]
+                            > bankCoherence_[static_cast<size_t>(best)]) --best;
+            else if (best + 1 < bankSize_
+                     && bankCoherence_[static_cast<size_t>(best + 1)]
+                        > bankCoherence_[static_cast<size_t>(best)]) ++best;
+            else break;
+        }
 
         const size_t ub = static_cast<size_t>(best);
         const double period = refinePeriod(best);
@@ -891,15 +1067,20 @@ private:
         return beat;
     }
 
-    /** @brief Parabolic refinement of the winning period, on log period, over
-     *  the octave-adjudicated score. The bank is geometric, so the three
-     *  points are equally spaced in the variable being interpolated. */
+    /** @brief Parabolic refinement of the winning period, on log period. The
+     *  bank is geometric, so the three points are equally spaced in the
+     *  variable being interpolated. The refinement reads the EXPLANATORY
+     *  score: the metrical level is already settled by the time this runs, and
+     *  the tapping preference varies from bin to bin, so interpolating over it
+     *  would tilt the parabola and pull the reported period towards the
+     *  preferred tempo -- measured at -0.53% at the top of the default range
+     *  before this used the preference-free score. */
     [[nodiscard]] double refinePeriod(int i) const noexcept
     {
         if (i <= 0 || i >= bankSize_ - 1) return bankPeriod_[static_cast<size_t>(i)];
-        const double a = scoreAt(i - 1);
-        const double b = scoreAt(i);
-        const double c = scoreAt(i + 1);
+        const double a = scoreAt(i - 1, false);
+        const double b = scoreAt(i, false);
+        const double c = scoreAt(i + 1, false);
         const double den = a - 2.0 * b + c;
         if (!(std::abs(den) > 0.0)) return bankPeriod_[static_cast<size_t>(i)];
         double d = 0.5 * (a - c) / den;
@@ -908,17 +1089,71 @@ private:
              * std::pow(2.0, d / static_cast<double>(kBinsPerOctave));
     }
 
-    [[nodiscard]] double scoreAt(int i) const noexcept
+    /**
+     * @brief Score of a bank candidate.
+     * @param withPreference apply the tapping preference to the level test.
+     *
+     * The two readings answer different questions and both are needed. WITH
+     * the preference is the adjudicated score: which level to report. WITHOUT
+     * it is the explanatory score: how much of the envelope that level
+     * accounts for, which is what the confidence must be discounted against.
+     * Using the adjudicated score for both would let the preference hide the
+     * ambiguity it was applied to resolve -- the moment the tracker decides a
+     * level, the loser's adjudicated score collapses, and a confidence read
+     * off that ratio would report certainty produced by the decision itself
+     * rather than by the signal.
+     */
+    [[nodiscard]] double scoreAt(int i, bool withPreference = true) const noexcept
     {
         const size_t u = static_cast<size_t>(i);
         double s = bankPrior_[u] * bankCoherence_[u];
         for (int k = 0; k < kNumHarmonics; ++k)
         {
             const int sub = i + harmonicOffset_[k];
-            if (sub < bankSize_)
-                s *= (1.0 - bankCoherence_[static_cast<size_t>(sub)]);
+            if (sub >= bankSize_) continue;
+            const double r = withPreference
+                ? bankLevelRatio_[static_cast<size_t>(k) * static_cast<size_t>(bankSize_) + u]
+                : 1.0;
+            s *= (1.0 - std::min(1.0, r * bankCoherence_[static_cast<size_t>(sub)]));
         }
         return s;
+    }
+
+    /**
+     * @brief How much more plausible a tactus the candidate's subharmonic is
+     *        than the candidate itself, never less than one.
+     *
+     * The metrical-level test asks whether the candidate's own subharmonic is
+     * as coherent as the candidate. On a pulse train with weaker events
+     * between the beats, that coherence is exactly the depth of the accent --
+     * and the same signal read the other way up is a backbeat, where the fast
+     * level is the beat and the accent sits below it. The two are the same
+     * waveform: a click train at rate R with alternate events attenuated is a
+     * beat at R with a backbeat, and a beat at R/2 with eighth notes, at once.
+     * No measurement of the envelope can separate them, and the only thing
+     * that can is which absolute rate a listener would tap. This ratio is
+     * that judgement, applied to the accent depth before it is weighed.
+     *
+     * It never falls below one, so it can only ever make the test REJECT a
+     * candidate more readily -- never protect a candidate that is a plain
+     * harmonic of the true pulse, whose subharmonic is fully coherent and
+     * whose rejection must stay absolute.
+     */
+    [[nodiscard]] static double levelPreference(double periodSeconds) noexcept
+    {
+        const double lg = std::log2(periodSeconds / kPriorCentreSeconds);
+        const double w = (lg >= 0.0) ? kTactusSlowOctaves : kTactusFastOctaves;
+        const double x = lg / w;
+        return std::exp(-0.5 * x * x);
+    }
+
+    [[nodiscard]] double levelRatio(double periodFrames, double divisor) const noexcept
+    {
+        if (!(frameRate_ > 0.0) || !(periodFrames > 0.0)) return 1.0;
+        const double p = periodFrames / frameRate_;
+        const double here = levelPreference(p);
+        if (!(here > 0.0)) return 1.0;
+        return std::max(1.0, levelPreference(p * divisor) / here);
     }
 
     // -- Offline stages ------------------------------------------------------
@@ -938,7 +1173,6 @@ private:
 
         onset_.reset();
         int64_t pos = 0;
-        int64_t frame = 0;
         while (pos < static_cast<int64_t>(n))
         {
             const int64_t take = std::min<int64_t>(hop_, static_cast<int64_t>(n) - pos);
@@ -946,15 +1180,11 @@ private:
             pos += take;
             if (take == static_cast<int64_t>(hop_))
             {
-                ++frame;
-                if (frame > warmupFrames_)
-                {
-                    const typename OnsetDetector<T>::OdfFrame f = onset_.getLastOdfFrame();
-                    const double v = std::isfinite(f.value)
-                                         ? static_cast<double>(f.value) : 0.0;
-                    env_.push_back(std::max(0.0, v));
-                    envRef_.push_back(f.referenceSample);
-                }
+                const typename OnsetDetector<T>::OdfFrame f = onset_.getLastOdfFrame();
+                const double v = std::isfinite(f.value)
+                                     ? static_cast<double>(f.value) : 0.0;
+                env_.push_back(std::max(0.0, v));
+                envRef_.push_back(f.referenceSample);
             }
         }
         onset_.reset();
@@ -1113,15 +1343,26 @@ private:
         }
         if (candidates_.empty()) return;
 
-        // Rank by the octave discriminator, not by correlation height.
+        // Rank by the octave discriminator, not by correlation height. Two
+        // scores per candidate, for the two questions of scoreAt(): the
+        // adjudicated one decides the level, the explanatory one is what the
+        // confidence is discounted against.
         candScore_.assign(candidates_.size(), 0.0);
+        candExplains_.assign(candidates_.size(), 0.0);
         for (size_t k = 0; k < candidates_.size(); ++k)
         {
             const double tau = refineLag(candidates_[k]);
             const double lg = std::log2(tau / centre) / kPriorWidthOctaves;
-            candScore_[k] = std::exp(-0.5 * lg * lg) * coherence(tau);
+            const double base = std::exp(-0.5 * lg * lg) * coherence(tau);
+            double adjudicated = base, explains = base;
             for (const double m : kHarmonicDivisors)
-                candScore_[k] *= (1.0 - coherence(m * tau));
+            {
+                const double c = coherence(m * tau);
+                adjudicated *= (1.0 - std::min(1.0, levelRatio(tau, m) * c));
+                explains *= (1.0 - std::min(1.0, c));
+            }
+            candScore_[k] = adjudicated;
+            candExplains_[k] = explains;
         }
 
         size_t k1 = 0;
@@ -1152,7 +1393,17 @@ private:
         }
         tau1 = refineLag(candidates_[k1]);
 
+        // The reported alternative and the ambiguity it implies are two
+        // different quantities and are taken from the two different scores.
+        // What gets REPORTED is the level a listener could plausibly have
+        // tapped instead, so it is the best adjudicated alternative. What
+        // DISCOUNTS the confidence is the best explanation of the envelope at
+        // any other level, tapping preference set aside -- on a polyrhythm the
+        // most competitive explanation is the tatum, which is not a level
+        // anyone taps, and a confidence blind to it would call the signal
+        // unambiguous because the reported alternative happens to be modest.
         int k2 = -1;
+        double bestOther = 0.0;
         for (size_t k = 0; k < candidates_.size(); ++k)
         {
             const double sep = std::abs(std::log2(static_cast<double>(candidates_[k])
@@ -1160,14 +1411,13 @@ private:
             if (sep < kCandidateSeparationOctaves) continue;
             if (k2 < 0 || candScore_[k] > candScore_[static_cast<size_t>(k2)])
                 k2 = static_cast<int>(k);
+            bestOther = std::max(bestOther, candExplains_[k]);
         }
         if (k2 >= 0)
         {
             tau2 = refineLag(candidates_[static_cast<size_t>(k2)]);
-            const double top = candScore_[k1];
-            secondaryShare_ = (top > 0.0)
-                ? std::clamp(candScore_[static_cast<size_t>(k2)] / top, 0.0, 1.0)
-                : 0.0;
+            const double top = candExplains_[k1];
+            secondaryShare_ = (top > 0.0) ? std::clamp(bestOther / top, 0.0, 1.0) : 0.0;
         }
     }
 
@@ -1590,15 +1840,28 @@ private:
      * recovers where the peak really fell between them. The correction is
      * clamped to half a frame: beyond that the parabola is describing
      * something other than one peak.
+     *
+     * The parabola is fitted to the CONDITIONED envelope and not to the
+     * smoothed score the recursion scores against. Which frame a beat belongs
+     * to is a question about the neighbourhood, and smoothing helps answer it;
+     * where inside that frame the transient fell is a question about the peak
+     * itself, and smoothing an asymmetric peak -- an onset function rises fast
+     * and decays slowly -- moves its apex late in proportion to the smoothing
+     * width. Measured over a full sub-hop phase sweep at 90, 120 and 160 BPM,
+     * fitting the smoothed curve put the grid +4.45, +4.23 and +4.00 ms late,
+     * the tempo dependence being the giveaway, since the width is a fraction
+     * of the period; fitting the conditioned envelope gives +2.58, +2.56 and
+     * +2.53 ms, of which +1.55 to +1.60 ms is the front end's own transient
+     * lead and not this path's to remove.
      */
     [[nodiscard]] int64_t beatSample(int f) const noexcept
     {
         const int n = static_cast<int>(env_.size());
         const int64_t base = envRef_[static_cast<size_t>(f)];
         if (f <= 0 || f >= n - 1) return base;
-        const double a = local_[static_cast<size_t>(f - 1)];
-        const double b = local_[static_cast<size_t>(f)];
-        const double c = local_[static_cast<size_t>(f + 1)];
+        const double a = env_[static_cast<size_t>(f - 1)];
+        const double b = env_[static_cast<size_t>(f)];
+        const double c = env_[static_cast<size_t>(f + 1)];
         const double den = a - 2.0 * b + c;
         if (!(den < 0.0)) return base;   // not a peak: nothing to interpolate
         const double d = std::clamp(0.5 * (a - c) / den, -0.5, 0.5);
@@ -1662,14 +1925,14 @@ private:
     double sampleRate_ = 44100.0;
     double frameRate_ = 200.0;
     int hop_ = 221;
-    int warmupFrames_ = 12;
 
     // Resonator bank (built at prepare, read on the audio thread).
     int bankSize_ = 0;
     std::vector<double> bankPeriod_;
     std::vector<double> bankCosCoef_, bankSinCoef_, bankDecay_, bankPrior_;
-    int harmonicOffset_[kNumHarmonics] = { 0, 0 };
+    int harmonicOffset_[kNumHarmonics] = { 0, 0, 0 };
     std::vector<double> zRe_, zIm_, zMass_, bankCoherence_;
+    std::vector<double> bankLevelRatio_;
 
     // Causal stream state (audio thread only).
     int64_t samplesPushed_ = 0;
@@ -1689,7 +1952,7 @@ private:
     std::vector<double> localPeriod_, sweepA_, sweepB_;
     std::vector<int> backlink_;
     std::vector<int> candidates_;
-    std::vector<double> candScore_;
+    std::vector<double> candScore_, candExplains_;
     double secondaryShare_ = 0.0;
 
     // Published state.

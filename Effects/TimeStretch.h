@@ -89,10 +89,19 @@
  * there is instead is a priming requirement: `pullOutput()` returns 0 until
  * the overlap-add's first complete sample exists, which takes 1024 to 3072
  * input samples at the default 2048-sample frame, over ratios 0.5 to 2.
- * After that, cumulative output is `ratio *` cumulative input fed, less a
- * constant of 1408 to 1799 samples at that frame size - the overlap-add's own
- * incomplete tail plus whatever input is still queued. It is an offset, not a
- * drift: it does not grow with the length of the stream.
+ * After that, cumulative output is `ratio *` cumulative input fed, less an
+ * offset that has two parts. One is the overlap-add's own incomplete tail: it
+ * is what is left when a stream has been fed to its end and drained, and it
+ * measures 1152 to 2091 samples at the default frame size over ratios 0.5 to 2,
+ * on sustained and on percussive material alike, whatever the feed and pull
+ * sizes. The other is whatever input has been fed but not yet pulled back,
+ * which is the caller's own doing and is bounded by `getInputCapacity()`:
+ * feeding 512 and pulling 4096 it reaches 3840 samples mid-stream on a strike
+ * train, and feeding faster than pulling it reaches the whole queue. So it is
+ * an offset and not a drift - it is bounded and does not grow with the length
+ * of the stream - but it is not a constant, and latency or sync arithmetic must
+ * come from the counts `feedInput()` and `pullOutput()` return rather than from
+ * any figure quoted here.
  *
  * **The fixed-rate adaptor.** `processBlock()` delivers into a slot that does
  * not change rate, and it is exact at `ratio == 1` indefinitely: the output
@@ -117,11 +126,23 @@
  *   strike train at ratio 1.081, no strike lands more than 38 samples
  *   (0.79 ms) from where the fixed-rate slot puts it, over runs of 5 to 30 s.
  *   A caller therefore detects the degradation in one call instead of by
- *   listening. What refusing input cannot preserve is the shape of a strike -
- *   an even refusal is a decimation, and four strikes in five survive it at
- *   full height at ratio 1.081 while at ratio 2 none do. That is the same on
- *   this path with or without the refusal, and it is the reason the pair
- *   above exists.
+ *   listening. What refusing input cannot preserve is the shape of a strike:
+ *   an even refusal is a decimation, and it costs strike height. Measured on a
+ *   120 BPM strike train over 30 s, matched onset by onset with no search
+ *   window, the mean strike height as a fraction of this class's own ratio-1
+ *   rendering is 1.00 at every ratio at or below 1, then 0.85 at 1.01, 0.79 at
+ *   1.02, 0.38 at 1.05, 0.82 at 1.081, 0.89 at 1.25, 0.56 at 1.5 and 0.11 at
+ *   2. That cost is NOT monotonic in the ratio - 1.05 is far worse than 1.081,
+ *   and 1.25 is better than either - so do not take two of these figures and
+ *   interpolate between them. Counting instead the strikes that arrive at half
+ *   height or better: four in five at ratio 1.081, fewer than one in three at
+ *   1.05, none at ratio 2. Keeping the input instead, and letting the surplus
+ *   output be spliced away, is not the better trade: that keeps every strike
+ *   at full height up to ratio 1.081, but it displaces the stream by 150 ms at
+ *   ratio 1.01, 359 ms at 1.081 and up to 10.7 s at ratio 2, and from ratio
+ *   1.25 up it loses whole strikes as well - 52 of 59 recovered at 1.25, 36 of
+ *   59 at ratio 2. Neither trade is good away from ratio 1, and that is the
+ *   reason the pair above exists.
  *
  * Which input the adaptor refuses is a function of the cumulative stream
  * position alone, never of where the caller's block boundaries fall: between

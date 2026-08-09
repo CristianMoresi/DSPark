@@ -386,7 +386,12 @@ fraction `1 - 1/ratio` of the input at the head, spread evenly, and counts
 every refused sample in `getDiscardedInput()`. Nothing that survives is
 displaced - measured worst 38 samples, 0.79 ms, at ratio 1.081 - which is
 the whole point of refusing at the head rather than letting a queue fill and
-splice the stream. Use the pair above, or `process()`, unless the ratio is 1.
+splice the stream. What it cannot preserve is a strike's height: on the same
+strike train the mean strike height, as a fraction of the same class's own
+ratio-1 rendering, is 0.85 at ratio 1.01, 0.79 at 1.02, 0.38 at 1.05, 0.82 at
+1.081, 0.89 at 1.25, 0.56 at 1.5 and 0.11 at 2 - not monotonic in the ratio,
+so those figures cannot be interpolated between. Use the pair above, or
+`process()`, unless the ratio is 1.
 
 The two streaming paths own the same queue with different invariants, so
 whichever one is used first after `prepare()` or `reset()` owns the instance

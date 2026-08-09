@@ -386,6 +386,7 @@
  * | `GranularProcessor<T>`   | Effects/GranularProcessor.h | Granular clouds/freeze: per-grain pitch, jitter, stereo spread |
  * | `SpectralDenoiser<T>`    | Effects/SpectralDenoiser.h | Learnable-profile spectral gating noise reduction |
  * | `ChordDetector<T>`       | Music/ChordDetector.h     | Goertzel chroma + template chord recognition with confidence |
+ * | `KeyDetector<T>`         | Music/KeyDetector.h       | Musical key estimation: accumulated chroma against published key profiles |
  * | `DeEsser<T>`             | Effects/DeEsser.h     | Split-band de-esser with dynamic sibilance detection                |
  * | `AutoGain<T>`            | Effects/AutoGain.h    | Automatic gain compensation for honest A/B comparison               |
  * | `Clipper<T>`             | Effects/Clipper.h     | Multi-mode clipper (Hard/Soft/Analog/GoldenRatio, oversampling)     |
@@ -411,6 +412,7 @@
  * | `EnvelopeFollower<T>`    | Analysis/EnvelopeFollower.h | Peak/RMS envelope source with per-channel readouts |
  * | `OnsetDetector<T>`       | Analysis/OnsetDetector.h  | Causal SuperFlux onset detection (Boeck-2012 picker, shared beat front-end) |
  * | `BeatTracker<T>`         | Analysis/BeatTracker.h    | Tempo and beat tracking: offline dynamic programming plus a causal resonator bank |
+ * | `LoudnessNormalizer<T>`  | Analysis/LoudnessNormalizer.h | Offline LUFS-target normalisation under a BS.1770 true-peak ceiling |
  *
  * @subsection classes_io File I/O
  *
@@ -745,6 +747,7 @@
 #include "Analysis/EnvelopeFollower.h"
 #include "Analysis/OnsetDetector.h"
 #include "Analysis/BeatTracker.h"
+#include "Analysis/LoudnessNormalizer.h"
 
 // === I/O ====================================================================
 // File I/O uses <fstream>/<filesystem>, which do not exist on bare-metal
@@ -761,3 +764,4 @@
 
 #include "Music/HarmonyConstants.h"
 #include "Music/ChordDetector.h"
+#include "Music/KeyDetector.h"

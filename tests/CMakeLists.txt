@@ -38,6 +38,8 @@ add_executable(dspark_tests
     TestIntegration.cpp
     TestMusic.cpp
     TestBeat.cpp
+    TestKey.cpp
+    TestLoudnessNormalizer.cpp
     TestOnset.cpp
     TestQualityAudit.cpp
     TestState.cpp)

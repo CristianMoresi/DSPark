@@ -93,6 +93,7 @@ void instantiate()
     Goertzel<T> goe;
     LevelFollower<T> lvl;
     LoudnessMeter<T> ldm;
+    LoudnessNormalizer<T> ldn;
     PhaseCorrelation<T> phaseCorr;
     PitchDetector<T> pd;
     PitchFollower<T> pitchFollow;
@@ -102,6 +103,7 @@ void instantiate()
 
     // -- Music ----------------------------------------------------------------
     ChordDetector<T> chords;
+    KeyDetector<T> keys;
 
     // Touch everything so the optimiser cannot drop it.
     (void)spec; (void)beats;

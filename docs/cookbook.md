@@ -400,3 +400,81 @@ until the next `reset()`; the other one's calls do nothing in the meantime.
 At ratio 1 the streaming path is transparent: measured residual against the
 delayed input is -146 dBFS at 48 kHz on a 1 kHz tone, so leaving the effect
 in a chain unengaged costs nothing but its latency.
+
+---
+
+## 13. Find the tempo and the beats
+
+`BeatTracker` answers two different questions with two different methods, and
+which one you want depends on whether you have the whole file.
+
+**Offline, when you do.** `analyze()` sees the future, so it can place beats
+using evidence that arrives after them:
+
+```cpp
+dspark::BeatTracker<float> bt;
+bt.prepare(spec);                          // mono: channel 0 is read
+
+auto beat = bt.analyze(loop.toView());
+// beat.tempoBpm          fitted to the whole grid, not read off one lag
+// beat.beatSamples       every beat position, in samples, ascending
+// beat.confidence        [0,1] -- how much of the signal the grid explains
+// beat.secondaryTempoBpm the metrical level that came second, or 0 if none
+```
+
+On a click track from 40 to 240 BPM the tempo lands within 0.001 BPM of the
+truth at the correct metrical level across the whole range, and every beat is
+found within 5.4 ms at worst. On a 100-to-140 BPM ramp the grid follows the
+tempo being played rather than the average: worst local inter-beat error
+0.18%.
+
+**Read the confidence before you trust the grid.** It is the share of the
+onset strength that falls in phase with the beats returned, so 1.0 means the
+grid explains everything the signal did. It is not a probability that the
+tempo is right, and it is deliberately reduced when a second metrical reading
+explains the signal nearly as well: on a three-against-two polyrhythm, where
+two pulses are genuinely present, it reports around 0.2 rather than pretending
+one of them is the answer. Below about 0.5, look at `secondaryTempoBpm` before
+acting.
+
+**Half and double tempo are the error that matters,** so check the level, not
+just the number. `secondaryTempoBpm` names the alternative a listener could
+plausibly have tapped instead -- usually the half-tempo reading -- and is 0
+when there is no distinct alternative inside the searched range. Narrow the
+range if you know the material:
+
+```cpp
+bt.setTempoRange(70.0f, 140.0f);   // no allocation; safe while audio runs
+```
+
+**In the callback, when you do not have the future.** Feed blocks and read the
+running estimate:
+
+```cpp
+void processBlock(dspark::AudioBufferView<float> io)
+{
+    bt.processBlock(io);                       // allocation-free, lock-free
+
+    float bpm = 0.0f, confidence = 0.0f;
+    bt.getTempoAndConfidence(bpm, confidence); // one load: they belong together
+
+    if (bt.beatNow())
+        scheduleClick(bt.getLastBeatSample()); // where the beat WAS
+}
+```
+
+The running tempo reaches within 5% of the truth inside 2.6 s at worst on a
+click track and holds to 0.75% after that, and beats are attributed to within
+21 ms. `getLastBeatSample()` is where the beat happened in your own timeline;
+`getLatencySamples()` is how far in the past that is by the time you are told
+(549 samples, 12.4 ms, at 44.1 kHz). Use the former to align anything and the
+latter only to state your own delay.
+
+One behaviour to know: with no onset energy arriving, the pulse estimate and
+the mass it is measured against decay together, so the confidence HOLDS its
+last value through silence instead of falling. A caller that needs to tell
+"steady" from "nothing playing" reads level separately.
+
+`BeatTracker` consumes `OnsetDetector`'s onset-strength envelope, so if you
+want onsets too, take them from `getOnsetDetector()` rather than running a
+second copy of the same analysis.

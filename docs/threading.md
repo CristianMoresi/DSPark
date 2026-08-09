@@ -57,11 +57,17 @@ lock-free on every supported target and outside the census.
 That is a run-time census of the word types. It is **not** a compile-time check
 on your component, and the build will not stop you using a word the census
 never saw. Where the word type is a template parameter the census cannot reach
-it at all. Six headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
-`Effects/AutoGain.h`, `Effects/Equalizer.h`, `Effects/DynamicEQ.h`,
-`Effects/detail/PhaseVocoderEngine.h` and `Effects/TimeStretch.h` -- and
-most of the headers that declare such an atomic do not. A new component with an
-atomic word on the audio path should do the same:
+it at all. Seven headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
+`Analysis/BeatTracker.h`, `Effects/AutoGain.h`, `Effects/Equalizer.h`,
+`Effects/DynamicEQ.h`, `Effects/detail/PhaseVocoderEngine.h` and
+`Effects/TimeStretch.h` -- and most of the headers that declare such an atomic do
+not. Six of the seven are pinning a word whose type is a template parameter,
+which is the case the census cannot reach; `Analysis/BeatTracker.h` publishes
+concrete widths that the census does cover, and pins them anyway, because a
+compile-time assertion at the declaration is a stronger statement than a
+run-time one in another file and it is the declaration that a later edit
+changes. A new component with an atomic word on the audio path should do the
+same:
 
 ```cpp
 static_assert(std::atomic<T>::is_always_lock_free,
@@ -174,6 +180,35 @@ as `Effects/Equalizer.h` and `Effects/DynamicEQ.h` do.
 `Core/FIRFilter.h` (runtime-sized coefficient vector) and `Core/Biquad.h`
 (five named coefficients) are the reference implementations. A new hand-off
 should match one of them frame for frame rather than improvise.
+
+### The other direction: a set the audio thread publishes
+
+A seqlock moves a set from the control thread to the audio thread. A set that
+travels the other way -- computed inside the callback, read by a GUI -- does not
+need one, and should not have one, because the cheaper answer is available: pack
+the set into a single word and it cannot tear at all. `Music/ChordDetector.h`
+does this with its whole result, and `Analysis/BeatTracker.h` does it with the
+pair a caller is most likely to misuse if it can straddle an update. Its
+`getRunningTempoBpm()` and `getConfidence()` describe the same instant -- the
+confidence is measured *at* that tempo -- so a caller that gates on the
+confidence before trusting the tempo must never be handed one of them refreshed
+without the other. Both unpack the same 64-bit load, and
+`getTempoAndConfidence()` returns them together for callers that want both.
+
+Two of its readouts stay independent single words, and the reason they may is
+worth stating rather than assuming. `beatNow()` and `getLastBeatSample()` are
+both written in the same processing call, so the only disagreement a reader can
+observe is the latch of one call paired with the sample of the next -- which is
+a *later* real beat, never a stale one and never a position that was not a beat.
+An invariant that can only be broken in a harmless direction is not an invariant
+that needs a publication mechanism; one that could hand back a position no beat
+occupied would be.
+
+The same class's `setTempoRange()` packs its two indices for the opposite
+reason: they travel control-to-audio, and half of one range combined with half
+of the next is a range nobody asked for, which the audio thread would then
+search. Packing is what lets that setter stay allocation-free and callable while
+the stream runs.
 
 ## Pointers returned across threads
 

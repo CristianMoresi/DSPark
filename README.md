@@ -180,6 +180,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `PitchFollower<T>` | Musical pitch tracking source: confidence gating, octave-jump correction, constant-rate semitone glide |
 | `PhaseCorrelation<T>` | Stereo correlation/balance meter with a goniometer (vectorscope) point feed |
 | `OnsetDetector<T>` | Causal SuperFlux onset detection (log-filtered spectral flux, vibrato-suppressing max filter, Boeck-2012 adaptive peak picker); shared front-end for beat tracking |
+| `BeatTracker<T>` | Tempo and beat tracking over that same envelope: offline dynamic-programming beat grid, causal resonator-bank tempo and beat phase, confidence and a secondary metrical hypothesis |
 
 ### I/O (3 file handlers)
 

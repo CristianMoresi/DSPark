@@ -1827,7 +1827,7 @@ void writeAnalysisAccuracy(FILE* out)
     double worstBeatError = 0.0, worstBeatAt = 0.0;
     double lowestConfidence = 1.0;
     int missing = 0, spurious = 0;
-    for (double bpm : { 60.0, 90.0, 120.0, 150.0, 180.0, 210.0, 240.0 })
+    for (double bpm : { 40.0, 45.0, 60.0, 90.0, 120.0, 150.0, 180.0, 210.0, 240.0 })
     {
         std::vector<int64_t> truth;
         std::vector<float> sig = clickTrack(bpm, 20.0, truth);
@@ -1868,7 +1868,7 @@ void writeAnalysisAccuracy(FILE* out)
     }
 
     std::fprintf(out,
-        "| `BeatTracker` tempo | click track, 60 to 240 BPM | worst tempo error"
+        "| `BeatTracker` tempo | click track, 40 to 240 BPM | worst tempo error"
         " over the sweep | %+.3f BPM (at %.0f BPM) |\n", worstBpmError, worstBpmAt);
     std::fprintf(out,
         "| `BeatTracker` grid | same | worst beat placement error | %.2f ms"

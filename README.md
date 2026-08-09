@@ -442,6 +442,42 @@ DSPark/
 
 ---
 
+## Unreleased
+
+**The processor contract now enforces what it always claimed.** `AudioProcessor`
+is documented as the contract for in-place single-buffer inserts, and it did not
+check that: a type that only *read* the buffer satisfied it. Two changes close
+that, and one of them narrows a public type.
+
+- **`AudioBufferView`'s converting and pointer-array constructors are now
+  constrained rather than checked inside their bodies.** A `const` view no
+  longer reports itself as convertible to a mutable one. The surface this can
+  break is trait queries and other unevaluated contexts only -
+  `std::is_convertible_v`, `std::is_constructible_v`, `decltype` and SFINAE
+  probes - and in every one of those cases the pre-change answer was the false
+  one. **No expression that previously compiled and ran changes meaning**: the
+  old body check fired the moment the constructor was actually used, so every
+  evaluated use of it was already a hard error. Where the illegal candidate
+  used to make a call *ambiguous*, the call now resolves - ill-formed becomes
+  well-formed, never the reverse. If a probe of yours read the old answer, the
+  migration is one line: ask the direction that is actually legal,
+  `std::is_convertible_v<AudioBufferView<T>, AudioBufferView<const T>>`.
+- **Read-only analysers no longer satisfy `AudioProcessor`.** `BeatTracker`,
+  `ChordDetector`, `EnvelopeFollower`, `LoudnessMeter`, `OnsetDetector`,
+  `PhaseCorrelation` and `PitchFollower` take an `AudioBufferView<const T>` and
+  return measurements. They never wrote to the buffer, and a contract that
+  admitted them would let a `ProcessorChain` hand the next stage untouched
+  audio. Run them beside a chain on the same buffer, as the cookbook already
+  does. Generic code of yours constrained on `AudioProcessor` will now reject an
+  analyser argument at compile time.
+- **A processor that *also* offers a read-only `processBlock` overload counts as
+  read-only.** The concept asks whether a const view binds at all, so a type
+  carrying both overloads falls outside the contract even though a chain would
+  call its in-place overload. If such a type is meant to be an insert, give its
+  read-only overload a different name.
+
+---
+
 ## What's New in v1.6.1
 
 **Reverb performance**: an Eco engine for constrained targets and direct

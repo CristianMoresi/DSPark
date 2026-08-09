@@ -60,9 +60,9 @@ public:
      * @param numSamples  Number of samples per channel.
      */
     template <typename U>
+        requires std::is_convertible_v<U*, T*>
     AudioBufferView(U* const* channelPtrs, int numChannels, int numSamples) noexcept
     {
-        static_assert(std::is_convertible_v<U*, T*>, "Pointer type U* must be convertible to T*");
         assert(numChannels >= 0 && numChannels <= MaxViewChannels);
 
         // Release-safe clamp: an out-of-range channel count must never write
@@ -79,17 +79,25 @@ public:
      * @brief Converting constructor allowing mutable to const view conversions.
      *
      * Enables passing AudioBufferView<float> to functions expecting
-     * AudioBufferView<const float>.
+     * AudioBufferView<const float>. The reverse never compiles.
+     *
+     * The direction is a constraint rather than a body check, because the two
+     * say different things to the type system. A body check makes an illegal
+     * conversion a hard error inside an otherwise viable candidate, so
+     * overload resolution, `std::is_convertible_v` and every `requires`
+     * expression answer that a const view converts to a mutable one -- which
+     * is the opposite of the truth for the pointers underneath. A constraint
+     * makes it a substitution failure, which is what those questions are
+     * asking about and what callers and concepts already assume they get.
      *
      * @tparam U Source sample type.
      * @param other The view to convert from.
      */
     template <typename U>
+        requires std::is_convertible_v<U*, T*>
     AudioBufferView(const AudioBufferView<U, MaxViewChannels>& other) noexcept
         : numChannels_(other.getNumChannels()), numSamples_(other.getNumSamples())
     {
-        static_assert(std::is_convertible_v<U*, T*>, "Cannot convert view (e.g., const to non-const)");
-        
         for (int ch = 0; ch < numChannels_; ++ch)
             channels_[ch] = other.getChannel(ch);
     }

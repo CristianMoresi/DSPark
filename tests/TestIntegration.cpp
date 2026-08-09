@@ -232,6 +232,81 @@ DSPARK_TEST(ProcessorTraits_sample_and_generator_contracts)
     EXPECT_TRUE((GeneratorProcessor<Oscillator<double>, double>));
 }
 
+// The assertions above say what must be accepted. They cannot, on their own,
+// tell anyone what the contract EXCLUDES -- and for a long time it excluded
+// almost nothing beyond a missing noexcept, because a class that only reads
+// the buffer satisfied it too. These four shapes are the boundary, written as
+// types so the boundary is checked rather than described.
+namespace {
+
+// The shape the contract must reject: reads the buffer, cannot write it.
+struct ReadOnlyInsert
+{
+    void prepare(const AudioSpec&) {}
+    void processBlock(AudioBufferView<const float>) noexcept {}
+    void reset() noexcept {}
+};
+
+// The shape the contract must NOT reject: const handle, mutable samples. This
+// is in-place and several inserts are free to be declared this way.
+struct ConstHandleInsert
+{
+    void prepare(const AudioSpec&) {}
+    void processBlock(const AudioBufferView<float>&) noexcept {}
+    void reset() noexcept {}
+};
+
+// The same boundary on the generator side.
+struct ReadOnlyGenerator
+{
+    void prepare(const AudioSpec&) {}
+    void generateBlock(AudioBufferView<const float>) noexcept {}
+    void reset() noexcept {}
+    [[nodiscard]] float getSample() noexcept { return 0.0f; }
+};
+
+struct WritingGenerator
+{
+    void prepare(const AudioSpec&) {}
+    void generateBlock(AudioBufferView<float>) noexcept {}
+    void reset() noexcept {}
+    [[nodiscard]] float getSample() noexcept { return 0.0f; }
+};
+
+} // namespace
+
+DSPARK_TEST(ProcessorTraits_contract_excludes_processors_that_cannot_write)
+{
+    // A processor whose block call takes a const view is not an insert: it
+    // cannot produce the output the next stage of a chain expects.
+    EXPECT_FALSE((AudioProcessor<ReadOnlyInsert, float>));
+    EXPECT_FALSE((SampleProcessor<ReadOnlyInsert, float>));
+    EXPECT_FALSE((GeneratorProcessor<ReadOnlyGenerator, float>));
+
+    // Constness of the HANDLE is not constness of the samples. This one writes
+    // through the view it is given and must stay inside the contract.
+    EXPECT_TRUE((AudioProcessor<ConstHandleInsert, float>));
+    EXPECT_TRUE((GeneratorProcessor<WritingGenerator, float>));
+}
+
+// The shipped read-only analysers are the same boundary in production code.
+// Each takes an AudioBufferView<const T> and returns measurements, so none of
+// them is an insert; putting one in a ProcessorChain would silently give the
+// following stage the untouched input. They satisfied the contract until the
+// in-place clause existed, which is the reason these are pinned: the exclusion
+// is a property of the contract, not an accident of how they happen to be
+// written today.
+DSPARK_TEST(ProcessorTraits_read_only_analysers_are_outside_the_insert_contract)
+{
+    EXPECT_FALSE((AudioProcessor<BeatTracker<float>, float>));
+    EXPECT_FALSE((AudioProcessor<ChordDetector<float>, float>));
+    EXPECT_FALSE((AudioProcessor<EnvelopeFollower<float>, float>));
+    EXPECT_FALSE((AudioProcessor<LoudnessMeter<float>, float>));
+    EXPECT_FALSE((AudioProcessor<OnsetDetector<float>, float>));
+    EXPECT_FALSE((AudioProcessor<PhaseCorrelation<float>, float>));
+    EXPECT_FALSE((AudioProcessor<PitchFollower<float>, float>));
+}
+
 // ============================================================================
 // Plugin layer (plugin/DSParkPlugin.h) - normalisation, state container
 // ============================================================================

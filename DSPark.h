@@ -493,7 +493,8 @@
  * no vtable, clear error messages if you forget a method.
  *
  * ```cpp
- * // Any type that has prepare(AudioSpec), processBlock(AudioBufferView<T>), reset()
+ * // Any type that has prepare(AudioSpec), processBlock(AudioBufferView<T>),
+ * // reset() -- and that writes its output back into the buffer it is given
  * template <typename P, typename T>
  * concept AudioProcessor = ...;
  *
@@ -506,8 +507,15 @@
  * concept GeneratorProcessor = ...;
  * ```
  *
- * All processors in this framework satisfy `AudioProcessor`. You can use these
- * concepts in your own code to write generic functions or verify your classes:
+ * Every in-place insert in this framework satisfies `AudioProcessor`. The
+ * read-only analysers do not, and must not: they take an
+ * `AudioBufferView<const T>` and return measurements rather than audio, so
+ * they have nothing to hand the next stage of a chain. Run them beside a
+ * chain on the same buffer. The multi-buffer and per-call-parameterised
+ * utilities listed in `ProcessorTraits.h` are outside the contract too.
+ *
+ * You can use these concepts in your own code to write generic functions or
+ * verify your classes:
  *
  * ```cpp
  * static_assert(dspark::AudioProcessor<dspark::Compressor<float>, float>);

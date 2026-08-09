@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 
 using namespace dspark;
 using namespace dspark::test;
@@ -369,6 +370,40 @@ DSPARK_TEST(AudioBufferView_subView)
     EXPECT_EQ(sub.getNumSamples(), 50);
     EXPECT_NEAR(sub.getChannel(0)[0], 100.0f, 1e-6f);
     EXPECT_NEAR(sub.getChannel(0)[49], 149.0f, 1e-6f);
+}
+
+// The view must answer the type system the same way its pointers do, in both
+// directions. A mutable view converts to a const one; a const view must never
+// convert to a mutable one. This has to be a CONSTRAINT on the converting
+// constructor, not a check inside its body: a body check leaves the candidate
+// viable, so is_convertible_v, overload resolution and every requires-clause
+// reply that const-to-mutable works and only the instantiation fails. Anything
+// that asks the type system about buffer constness -- the processor contract
+// here, and user code we never see -- gets a wrong answer while that is true,
+// so the wrong answers are pinned here rather than in the one caller that
+// happened to notice.
+DSPARK_TEST(AudioBufferView_conversion_matches_pointer_conversion)
+{
+    // Mutable -> const: allowed, exactly as float* -> const float*.
+    EXPECT_TRUE((std::is_convertible_v<float*, const float*>));
+    EXPECT_TRUE((std::is_convertible_v<AudioBufferView<float>, AudioBufferView<const float>>));
+    EXPECT_TRUE((std::is_convertible_v<AudioBufferView<double>, AudioBufferView<const double>>));
+
+    // Const -> mutable: refused, exactly as const float* -> float*.
+    EXPECT_FALSE((std::is_convertible_v<const float*, float*>));
+    EXPECT_FALSE((std::is_convertible_v<AudioBufferView<const float>, AudioBufferView<float>>));
+    EXPECT_FALSE((std::is_convertible_v<AudioBufferView<const double>, AudioBufferView<double>>));
+
+    // The pointer-array constructor answers the same way.
+    EXPECT_TRUE((std::is_constructible_v<AudioBufferView<const float>, float* const*, int, int>));
+    EXPECT_FALSE((std::is_constructible_v<AudioBufferView<float>, const float* const*, int, int>));
+
+    // And the conversion that is allowed still produces a usable view.
+    auto tb = makeMonoBuffer(64);
+    tb.ch(0)[7] = 0.5f;
+    AudioBufferView<const float> ro = tb.view();
+    EXPECT_EQ(ro.getNumSamples(), 64);
+    EXPECT_NEAR(ro.getChannel(0)[7], 0.5f, 1e-6f);
 }
 
 // ============================================================================

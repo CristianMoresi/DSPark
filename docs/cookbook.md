@@ -424,24 +424,44 @@ auto beat = bt.analyze(loop.toView());
 
 On a click track from 40 to 240 BPM the tempo lands within 0.001 BPM of the
 truth at the correct metrical level across the whole range, and every beat is
-found within 5.4 ms at worst. On a 100-to-140 BPM ramp the grid follows the
+found within 7.4 ms at worst. On a 100-to-140 BPM ramp the grid follows the
 tempo being played rather than the average: worst local inter-beat error
-0.18%.
+1.03%.
+
+**The signal must be long enough for the range in force.** `analyze()` needs
+four beats at the SLOWEST tempo it is searching, not at the tempo you have, so
+at the 40 BPM default floor it needs 6 s of audio whatever the material is
+doing; below that it returns an empty grid and a tempo of 0 rather than a
+tempo fitted to nothing. A six-second loop at 120 BPM contains twelve beats and
+still returns nothing at default settings. Narrowing the range with
+`setTempoRange()` lowers the requirement in proportion: 70 BPM as the floor
+brings it down to 3.4 s.
 
 **Read the confidence before you trust the grid.** It is the share of the
 onset strength that falls in phase with the beats returned, so 1.0 means the
-grid explains everything the signal did. It is not a probability that the
-tempo is right, and it is deliberately reduced when a second metrical reading
-explains the signal nearly as well: on a three-against-two polyrhythm, where
-two pulses are genuinely present, it reports around 0.2 rather than pretending
-one of them is the answer. Below about 0.5, look at `secondaryTempoBpm` before
-acting.
+grid explains everything the signal did, reduced by how nearly another
+metrical level explains the same thing. On a three-against-two polyrhythm,
+where two pulses are genuinely present, it reports 0.02 to 0.38 rather than
+pretending one of them is the answer, and where two readings are exactly level
+it goes to 0.
+
+**It cannot tell you the level is wrong, and no number can.** A click train
+whose alternate events are quieter is at once a beat with a backbeat and a
+half-speed beat with straight eighths -- the same samples, two different right
+answers -- so anything computed from the signal is identical for both. Do not
+gate on the confidence for this: **read `secondaryTempoBpm` whenever the
+metrical level matters.** Measured on eighth notes swept in amplitude, the
+tracker reports the beat while the eighths stay below roughly 0.44 of the
+beat's onset strength at 90 BPM, 0.72 at 100 and 0.90 at 120, and reports the
+eighth level above that -- with the beat in `secondaryTempoBpm`, and with a
+confidence near 1.0, because that grid genuinely does explain the onsets.
+Below 90 BPM the eighth level is reported from about 0.28 up, which is the
+rate a listener would tap rather than a defect.
 
 **Half and double tempo are the error that matters,** so check the level, not
 just the number. `secondaryTempoBpm` names the alternative a listener could
-plausibly have tapped instead -- usually the half-tempo reading -- and is 0
-when there is no distinct alternative inside the searched range. Narrow the
-range if you know the material:
+plausibly have tapped instead and is 0 when there is no distinct alternative
+inside the searched range. Narrow the range if you know the material:
 
 ```cpp
 bt.setTempoRange(70.0f, 140.0f);   // no allocation; safe while audio runs
@@ -463,9 +483,14 @@ void processBlock(dspark::AudioBufferView<float> io)
 }
 ```
 
-The running tempo reaches within 5% of the truth inside 2.6 s at worst on a
-click track and holds to 0.75% after that, and beats are attributed to within
-21 ms. `getLastBeatSample()` is where the beat happened in your own timeline;
+On a click track, over the whole 40 to 240 BPM range this class searches by
+default, the running tempo reaches within 5% of the truth inside 3.6 s at
+worst -- 60 BPM is the slowest to settle -- holds to 0.34% after that, and
+lands at the correct metrical level at every point of the range; beats are
+attributed to within 13.4 ms. The scope matters: measured only from 60 to 180
+BPM, this path once published five times the true tempo at 40, 42, 44 and 46
+BPM and nothing in the sweep could see it. `getLastBeatSample()` is where the
+beat happened in your own timeline;
 `getLatencySamples()` is how far in the past that is by the time you are told
 (549 samples, 12.4 ms, at 44.1 kHz). Use the former to align anything and the
 latter only to state your own delay.

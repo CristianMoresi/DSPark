@@ -195,14 +195,26 @@ confidence before trusting the tempo must never be handed one of them refreshed
 without the other. Both unpack the same 64-bit load, and
 `getTempoAndConfidence()` returns them together for callers that want both.
 
-Two of its readouts stay independent single words, and the reason they may is
-worth stating rather than assuming. `beatNow()` and `getLastBeatSample()` are
-both written in the same processing call, so the only disagreement a reader can
-observe is the latch of one call paired with the sample of the next -- which is
-a *later* real beat, never a stale one and never a position that was not a beat.
-An invariant that can only be broken in a harmless direction is not an invariant
-that needs a publication mechanism; one that could hand back a position no beat
-occupied would be.
+Two of its readouts stay independent single words, and what keeps them
+consistent is stated here because an argument, not a mechanism, is doing the
+work. `beatNow()` and `getLastBeatSample()` are both written in the same
+processing call: the position first, the latch last. That order is not enough
+on its own. Two relaxed loads of two distinct objects may be satisfied in
+either order, and a weakly ordered machine -- the 64-bit ARM this library also
+ships to emits plain loads and plain stores here, with no barrier -- is free to
+give a reader the latch from one call and the position from the one *before*
+it, which is a stale position a full beat period old. So the pair is ordered:
+the latch is stored with release and `beatNow()` loads it with acquire, which
+costs nothing on x86 and one instruction on ARM.
+
+With that ordering, the two reader orders are covered separately and both are
+safe. A reader that tests the latch and *then* reads the position is guaranteed
+the position from that same call or a later one, never an earlier one. A reader
+that takes the position first and tests the latch second can still pair a
+position with the latch of the *next* call, which reports a later real beat and
+never a position no beat occupied. Neither order can produce a stale answer,
+which is the claim this section makes and the reason these two readouts need no
+publication mechanism beyond the pairing.
 
 The same class's `setTempoRange()` packs its two indices for the opposite
 reason: they travel control-to-audio, and half of one range combined with half

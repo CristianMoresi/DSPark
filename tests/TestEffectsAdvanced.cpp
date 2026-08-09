@@ -3839,23 +3839,37 @@ DSPARK_TEST(PitchShifter_output_is_bit_identical_under_block_chopping)
 //
 // The bed is a strike over sustained material, because that is where a change
 // to the transient path is largest and where a bed of clicks in silence shows
-// almost nothing. Four points of the semitone range are stored, unity among
-// them as the null point, with 96 samples spanning a strike plus the whole
-// render's energy and peak, so that a change outside the window is caught as
-// well - though only down to the energy tolerance, which is coarser than a
-// sample comparison.
+// almost nothing. Four points of the semitone range are stored mono at full
+// wet, unity among them as the null point, and two more stereo - one at full
+// wet, one at mix 0.5 - so that all four of this effect's signal paths carry
+// an assertion rather than only the mono wet one. Each configuration stores
+// 96 samples spanning a strike plus the render's energy and peak, so that a
+// change outside the window is caught as well - though only down to the
+// energy tolerance, which is coarser than a sample comparison.
 //
-// The numbers were captured on this tree and reproduce BIT-FOR-BIT under
-// g++ -O2, g++ -O0 and clang++ -O2 on x86-64. They are compared with a
-// tolerance rather than exactly, because floating-point contraction is
-// permitted and differs across compilers and architectures: with FMA
-// contraction enabled (-march=native, -ffast-math) the worst sample moves by
-// 1.7e-07, which is 121 dB below the strike's own peak. The tolerance below
-// is 1e-05, sixty times that spread - and a real rendering change is four
-// orders of magnitude larger still: swapping this effect onto the other
-// owner's onset detector moves the worst stored sample by 1.9e-01, its energy
-// by 2.9 percent and its peak by 16 percent. The gate therefore cannot be
-// tripped by a compiler and cannot be passed by a re-rendering.
+// The numbers were captured on this tree and reproduce BIT-FOR-BIT under g++
+// and clang++ at -O0, -O2 and -O3, with and without -ffp-contract=fast. They
+// are compared with a tolerance rather than exactly, because floating-point
+// contraction is permitted and differs across compilers and architectures.
+//
+// Two tolerances are applied and they are not equally sensitive; the tighter
+// one is what decides. The binding term is the 1e-06 relative bound on energy
+// and peak: a uniform wet gain of 5.2e-07 (-126 dB) is the smallest change
+// measured to trip this gate, and at that point the worst stored sample has
+// moved by 8.3e-07, twelve times inside its own 1e-05 bound. Against the
+// binding term, contraction still leaves room: enabling FMA for this machine
+// moves the worst relative energy by 5.7e-09 (176 times under the bound) and
+// the worst relative peak by 6.6e-08 (15 times under it). Under unsafe
+// fast-math, which this project does not support, the worst relative peak
+// reaches 4.1e-07 - the tightest any term gets, 2.4 times under the bound.
+// The sample bound is the secondary statement: the worst sample moves by
+// 2.2e-07 under contraction, 45 times inside 1e-05.
+//
+// A real rendering change is orders of magnitude past all of that: swapping
+// this effect onto the other owner's onset detector moves the worst stored
+// sample by 1.9e-01, its energy by 2.9 percent and its peak by 22 percent.
+// The gate therefore cannot be tripped by a compiler and cannot be passed by
+// a re-rendering.
 DSPARK_TEST(PitchShifter_rendering_matches_its_stored_reference)
 {
     constexpr int refRate = 48000;
@@ -4050,6 +4064,226 @@ DSPARK_TEST(PitchShifter_rendering_matches_its_stored_reference)
             ++movedPeak;
         }
     }
+
+    // -- Stereo and partial-mix references --------------------------------------
+    //
+    // The four configurations above are mono at full wet, which watches one of
+    // this effect's four signal paths and leaves three unwatched: the second
+    // channel, the latency-compensated dry path, and the blend between them. A
+    // gain error confined to the right channel, or to the dry delay line,
+    // re-renders a user's session while matching every number above; a ten
+    // percent right-channel error - 0.83 dB of channel imbalance - does exactly
+    // that. The two configurations below close it. Both are stereo and both
+    // store samples on BOTH channels, plus per-channel energy and peak: one at
+    // full wet, which pins the wet path of channel 1, and one at mix 0.5, where
+    // half of every output sample comes from the dry delay line, which pins the
+    // dry path and the blend as well.
+    //
+    // The right-hand bed is correlated with the left but not equal to it: the
+    // same partial series at a lower level with a per-partial phase offset, and
+    // strikes on a different pseudo-random tail with a slower decay. Equal
+    // channels would let a channel swap through.
+    //
+    // One second is rendered rather than two. The reference window sits at
+    // 0.585 s, so the first strike and the whole window are inside it, and the
+    // stored energy and peak still cover everything that was rendered. The mix
+    // is set before prepare() so it is settled from the first sample and the
+    // one-block ramp plays no part in the stored numbers.
+    constexpr int refLen2   = 48000;      // 1 s
+    constexpr int refStart2 = 28064;      // same window, same 2 * fftSize shift
+
+    std::vector<float> bedR(static_cast<size_t>(refLen), 0.0f);
+    {
+        const double twoPi = 6.283185307179586;
+        for (int p = 1; p <= 7; ++p)
+            for (int n = 0; n < refLen; ++n)
+                bedR[static_cast<size_t>(n)] += static_cast<float>(
+                    (0.24 / p) * std::sin(twoPi * 110.0 * p * n / refRate + 0.35 * p));
+        uint64_t lcg = 0xC0FFEEu;
+        for (int t = 24000; t < refLen; t += 24000)
+            for (int k = 0; k < 240 && t + k < refLen; ++k)
+            {
+                lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+                const float r = static_cast<float>(static_cast<uint32_t>(lcg >> 33))
+                              / 2147483648.0f - 1.0f;
+                const float env = static_cast<float>(0.75 * std::exp(-k / 55.0));
+                bedR[static_cast<size_t>(t + k)] += env * (k == 0 ? 1.0f : 0.5f * r);
+            }
+    }
+
+    struct Ref2 { double energy[2]; double peak[2]; float s[2][refCount]; };
+    static const float ref2Semitones[2] = { 5.0f, -7.0f };
+    static const float ref2Mix[2]       = { 1.0f, 0.5f };
+    static const Ref2 refs2[2] = {
+    // st +5.0  mix 1.00  stereo
+    { { 0x1.77c468b8f919ep+11, 0x1.e0706c969e282p+10 },
+      { 0x1.0fa7dcp-1, 0x1.cf5466p-2 }, {
+      {
+        0x1.129fc4p-3f, 0x1.0a24e2p-3f, 0x1.f9baa8p-4f, 0x1.e27d7ep-4f,
+        0x1.c70308p-4f, 0x1.b359fp-4f, 0x1.9c908p-4f, 0x1.8380f4p-4f,
+        0x1.78c272p-4f, 0x1.685166p-4f, 0x1.56aa9ap-4f, 0x1.4604c4p-4f,
+        0x1.31b5a6p-4f, 0x1.29e05cp-4f, 0x1.1d72e4p-4f, 0x1.1c06a2p-4f,
+        0x1.12d01p-4f, 0x1.08c60ep-4f, 0x1.09903ep-4f, 0x1.00a954p-4f,
+        0x1.00c5f8p-4f, 0x1.e43aa8p-5f, 0x1.f867fep-5f, 0x1.f3a25p-5f,
+        0x1.f15ca6p-5f, 0x1.f72f12p-5f, 0x1.e25086p-5f, 0x1.eb60dp-5f,
+        0x1.e28c5cp-5f, 0x1.efc12ep-5f, 0x1.e190eep-5f, 0x1.cb5f8p-5f,
+        0x1.bdf74cp-5f, 0x1.9e9eacp-5f, 0x1.9aec7ep-5f, 0x1.88c17ap-5f,
+        0x1.7deefcp-5f, 0x1.591a66p-5f, 0x1.29721cp-5f, 0x1.060e2p-5f,
+        0x1.a7b89ep-6f, 0x1.73fa3p-6f, 0x1.10aa96p-6f, 0x1.890ebap-7f,
+        0x1.80f4e4p-8f, -0x1.39b32p-11f, -0x1.687508p-8f, -0x1.9800e8p-7f,
+        -0x1.23268ep-6f, -0x1.83c27cp-6f, -0x1.d4db2cp-6f, -0x1.0e8aaep-5f,
+        -0x1.26921p-5f, -0x1.4569a6p-5f, -0x1.634946p-5f, -0x1.83da56p-5f,
+        -0x1.a0bebcp-5f, -0x1.b28d32p-5f, -0x1.b647bp-5f, -0x1.c34174p-5f,
+        -0x1.cbaf18p-5f, -0x1.d6c42cp-5f, -0x1.defdbap-5f, -0x1.e31006p-5f,
+        -0x1.eab96p-5f, -0x1.ed75b2p-5f, -0x1.efa818p-5f, -0x1.e5eee8p-5f,
+        -0x1.e46bc6p-5f, -0x1.f13f94p-5f, -0x1.f8058p-5f, -0x1.f7cb8ep-5f,
+        -0x1.f2441ap-5f, -0x1.f83eb4p-5f, -0x1.fc69c8p-5f, -0x1.07e956p-4f,
+        -0x1.131ae8p-4f, -0x1.1daaf8p-4f, -0x1.277dfap-4f, -0x1.313582p-4f,
+        -0x1.3fb9b6p-4f, -0x1.4cc1dep-4f, -0x1.62b496p-4f, -0x1.7c7da4p-4f,
+        -0x1.919862p-4f, -0x1.a5297ap-4f, -0x1.be0ae6p-4f, -0x1.d5948ap-4f,
+        -0x1.e9ba66p-4f, -0x1.0337b2p-3f, -0x1.0f5a42p-3f, -0x1.1d3832p-3f,
+        -0x1.296d96p-3f, -0x1.3606d4p-3f, -0x1.42c72cp-3f, -0x1.4cafep-3f },
+      {
+        0x1.8a5496p-5f, 0x1.8afcb6p-5f, 0x1.86c48ap-5f, 0x1.860528p-5f,
+        0x1.7ec1f6p-5f, 0x1.851b6ep-5f, 0x1.851af6p-5f, 0x1.7b3d04p-5f,
+        0x1.83f6d8p-5f, 0x1.916198p-5f, 0x1.7d01dp-5f, 0x1.794c36p-5f,
+        0x1.68dd78p-5f, 0x1.68989ap-5f, 0x1.5a523p-5f, 0x1.5b3a2cp-5f,
+        0x1.45b4cep-5f, 0x1.258526p-5f, 0x1.1ac55ep-5f, 0x1.fb953cp-6f,
+        0x1.c467b2p-6f, 0x1.65512ap-6f, 0x1.480c74p-6f, 0x1.05d25p-6f,
+        0x1.527f7cp-7f, 0x1.e9bdd8p-8f, 0x1.9fdc9p-10f, -0x1.34326p-9f,
+        -0x1.98bd3ep-8f, -0x1.32d16cp-7f, -0x1.b6a1cp-7f, -0x1.471bdap-6f,
+        -0x1.783e6cp-6f, -0x1.cd962p-6f, -0x1.deeb2p-6f, -0x1.0254aap-5f,
+        -0x1.0f44ccp-5f, -0x1.2b2618p-5f, -0x1.50d484p-5f, -0x1.53c1ccp-5f,
+        -0x1.6bcdp-5f, -0x1.699e5ep-5f, -0x1.7567fep-5f, -0x1.779b5cp-5f,
+        -0x1.801ff2p-5f, -0x1.8c2156p-5f, -0x1.83f772p-5f, -0x1.8a4c3ep-5f,
+        -0x1.91cbfep-5f, -0x1.8ccc42p-5f, -0x1.9093bap-5f, -0x1.8e266p-5f,
+        -0x1.83a66cp-5f, -0x1.8053acp-5f, -0x1.8dd888p-5f, -0x1.9c3cfcp-5f,
+        -0x1.a450b6p-5f, -0x1.b71232p-5f, -0x1.b27a06p-5f, -0x1.c2edcap-5f,
+        -0x1.d76266p-5f, -0x1.f1a09ep-5f, -0x1.06678p-4f, -0x1.14cb6cp-4f,
+        -0x1.2815e4p-4f, -0x1.3a18c8p-4f, -0x1.4cb384p-4f, -0x1.5e4a48p-4f,
+        -0x1.6ee7fep-4f, -0x1.8c53eep-4f, -0x1.a42454p-4f, -0x1.b8002ap-4f,
+        -0x1.c9be7ap-4f, -0x1.e21fcep-4f, -0x1.f517acp-4f, -0x1.057936p-3f,
+        -0x1.12e8a8p-3f, -0x1.19e9ap-3f, -0x1.2252eep-3f, -0x1.284bbap-3f,
+        -0x1.30bdp-3f, -0x1.350c92p-3f, -0x1.3bc88ep-3f, -0x1.42f32p-3f,
+        -0x1.43fdcap-3f, -0x1.44e1fp-3f, -0x1.47b146p-3f, -0x1.49916p-3f,
+        -0x1.467c4p-3f, -0x1.4820f4p-3f, -0x1.4800dp-3f, -0x1.455c7p-3f,
+        -0x1.43c8e8p-3f, -0x1.422c8ap-3f, -0x1.423262p-3f, -0x1.3f5c98p-3f } } },
+    // st -7.0  mix 0.50  stereo
+    { { 0x1.7c1355121497fp+10, 0x1.d4a78a32e33efp+9 },
+      { 0x1.f616dp-2, 0x1.d00e04p-2 }, {
+      {
+        -0x1.59ef6ep-2f, -0x1.5c86d8p-2f, -0x1.5e91e4p-2f, -0x1.60066p-2f,
+        -0x1.60dabap-2f, -0x1.61068cp-2f, -0x1.6081cep-2f, -0x1.5f456cp-2f,
+        -0x1.5d4bccp-2f, -0x1.5a8fcep-2f, -0x1.570d84p-2f, -0x1.52c2a2p-2f,
+        -0x1.4dad86p-2f, -0x1.47cddp-2f, -0x1.4124ecp-2f, -0x1.39b4eep-2f,
+        -0x1.318142p-2f, -0x1.288f28p-2f, -0x1.1ee47p-2f, -0x1.148848p-2f,
+        -0x1.098392p-2f, -0x1.fbbf5ep-3f, -0x1.e34e6p-3f, -0x1.c9cc5ep-3f,
+        -0x1.af523ap-3f, -0x1.93fad8p-3f, -0x1.77e378p-3f, -0x1.5b29b6p-3f,
+        -0x1.3dec9cp-3f, -0x1.204cdp-3f, -0x1.026aep-3f, -0x1.c8d04p-4f,
+        0x1.69997cp-2f, -0x1.cb0576p-4f, -0x1.54988p-3f, -0x1.37acap-3f,
+        -0x1.879e68p-3f, -0x1.6ec058p-3f, -0x1.62a4a8p-5f, -0x1.50177cp-4f,
+        -0x1.71fd2p-4f, -0x1.b80c28p-5f, -0x1.4e76a8p-6f, -0x1.c95f3cp-5f,
+        -0x1.fdef4p-6f, -0x1.be600cp-5f, 0x1.8e704p-8f, 0x1.43f6cp-5f,
+        0x1.7de3ap-8f, 0x1.5fd448p-6f, 0x1.457f6p-8f, 0x1.8cd18p-4f,
+        0x1.873f4cp-5f, 0x1.69eec4p-4f, 0x1.15e3b4p-5f, 0x1.731264p-4f,
+        0x1.7ffe5p-4f, 0x1.6d6268p-5f, 0x1.87e3e8p-4f, 0x1.90da58p-4f,
+        0x1.5a0d2p-4f, 0x1.9c138p-6f, 0x1.a1a834p-4f, 0x1.37433p-4f,
+        0x1.a5d9dp-5f, 0x1.8a13p-5f, 0x1.b3b03p-6f, 0x1.54726cp-4f,
+        0x1.f1108p-5f, 0x1.66fe08p-5f, 0x1.df14fp-6f, 0x1.3e9c8p-6f,
+        0x1.073b4p-6f, 0x1.26c97p-5f, 0x1.b2296p-6f, -0x1.bef7cp-7f,
+        0x1.3c7dp-9f, -0x1.c4202p-7f, -0x1.8bb4cp-6f, -0x1.b830cp-6f,
+        -0x1.395768p-5f, -0x1.349bdp-5f, -0x1.48138p-6f, -0x1.53fe4cp-5f,
+        -0x1.ffc1ep-6f, -0x1.3b74p-7f, -0x1.6b05d8p-5f, -0x1.0a945p-5f,
+        -0x1.c436ap-7f, -0x1.2a4b6p-5f, -0x1.63ffe4p-5f, -0x1.8c02bcp-5f,
+        -0x1.3b2f5p-5f, -0x1.2ca1fp-6f, -0x1.8e539p-5f, -0x1.c09dp-6f },
+      {
+        -0x1.58bd0cp-3f, -0x1.43e996p-3f, -0x1.2e8cf8p-3f, -0x1.18bddcp-3f,
+        -0x1.0293ep-3f, -0x1.d84e3cp-4f, -0x1.ab20b4p-4f, -0x1.7dd186p-4f,
+        -0x1.50929ap-4f, -0x1.23969cp-4f, -0x1.ee1fbep-5f, -0x1.965dcep-5f,
+        -0x1.40489ap-5f, -0x1.d87cc8p-6f, -0x1.352e7p-6f, -0x1.2ea8p-7f,
+        0x1.baap-16f, 0x1.230d5p-7f, 0x1.1b6528p-6f, 0x1.9d88d8p-6f,
+        0x1.0bc2a4p-5f, 0x1.4479acp-5f, 0x1.78be18p-5f, 0x1.a86fc4p-5f,
+        0x1.d371ep-5f, 0x1.f9b07cp-5f, 0x1.0d9192p-4f, 0x1.1be29ap-4f,
+        0x1.27cd4cp-4f, 0x1.31593ep-4f, 0x1.388fep-4f, 0x1.3d7e98p-4f,
+        0x1.d00e04p-2f, 0x1.86ee04p-5f, -0x1.51297cp-5f, -0x1.3deb58p-4f,
+        -0x1.d2276p-8f, 0x1.2bb64p-6f, 0x1.20bed8p-4f, -0x1.e64dacp-5f,
+        0x1.b24368p-5f, 0x1.1a76cp-7f, 0x1.ee7528p-5f, -0x1.4a4cp-8f,
+        -0x1.88ad1cp-5f, -0x1.010e28p-6f, 0x1.bebd2p-7f, 0x1.30cf7p-6f,
+        -0x1.4b6ebp-6f, -0x1.52c8a2p-4f, -0x1.a49e54p-4f, 0x1.5dcfp-9f,
+        -0x1.5a5684p-5f, -0x1.503994p-4f, -0x1.7cc48p-9f, -0x1.857314p-5f,
+        -0x1.998d28p-5f, -0x1.63088p-6f, -0x1.92b2b2p-4f, -0x1.aecap-8f,
+        -0x1.07e404p-4f, -0x1.59ebp-9f, -0x1.41520ap-4f, -0x1.03914p-5f,
+        -0x1.3464bp-6f, -0x1.8e56fp-6f, -0x1.d9c1c8p-6f, -0x1.5ab954p-4f,
+        -0x1.5e34dp-7f, -0x1.465e88p-4f, -0x1.0379b4p-4f, -0x1.cf0648p-6f,
+        -0x1.4ca00ap-4f, -0x1.0f9fd8p-6f, -0x1.b84aep-7f, -0x1.10341cp-4f,
+        -0x1.3fefa8p-6f, -0x1.22c87p-7f, -0x1.912fd4p-5f, -0x1.275b4p-4f,
+        -0x1.160372p-4f, -0x1.5b0b1p-7f, -0x1.8eddf8p-5f, -0x1.f5749cp-5f,
+        -0x1.701eep-8f, -0x1.ba9738p-5f, -0x1.0835c8p-6f, 0x1.22934p-8f,
+        -0x1.1d2f78p-5f, -0x1.dcb944p-5f, -0x1.e1016p-6f, -0x1.7339fp-7f,
+        -0x1.3654b8p-5f, -0x1.ed893cp-5f, -0x1.47b9a8p-5f, -0x1.0be388p-5f } } },
+    };
+
+    for (int c = 0; c < 2; ++c)
+    {
+        auto ps = std::make_unique<PitchShifter<float>>();
+        ps->setMix(ref2Mix[c]);           // settled by prepare(): no ramp
+        ps->prepare(spec(static_cast<double>(refRate), refBlock, 2), refFft);
+        ps->setSemitones(ref2Semitones[c]);
+
+        std::vector<float> yL(bed.begin(), bed.begin() + refLen2);
+        std::vector<float> yR(bedR.begin(), bedR.begin() + refLen2);
+        for (int pos = 0; pos < refLen2; pos += refBlock)
+        {
+            const int n = std::min(refBlock, refLen2 - pos);
+            float* ch[2] = { yL.data() + pos, yR.data() + pos };
+            AudioBufferView<float> view(ch, 2, n);
+            ps->processBlock(view);
+        }
+
+        for (int chn = 0; chn < 2; ++chn)
+        {
+            const std::vector<float>& y = (chn == 0) ? yL : yR;
+            double e = 0.0, pk = 0.0;
+            for (int n = 0; n < refLen2; ++n)
+            {
+                const double v = static_cast<double>(y[static_cast<size_t>(n)]);
+                e += v * v;
+                pk = std::max(pk, std::fabs(v));
+            }
+
+            for (int i = 0; i < refCount; ++i)
+            {
+                const double d = std::fabs(
+                    static_cast<double>(y[static_cast<size_t>(refStart2 + i)])
+                    - static_cast<double>(refs2[c].s[chn][i]));
+                if (d > worstSample) worstSample = d;
+                if (d > sampleTol)
+                {
+                    if (movedSamples == 0)
+                        std::cerr << "    st " << ref2Semitones[c] << " mix "
+                                  << ref2Mix[c] << " ch " << chn << " sample " << i
+                                  << ": stored " << refs2[c].s[chn][i] << ", rendered "
+                                  << y[static_cast<size_t>(refStart2 + i)] << "\n";
+                    ++movedSamples;
+                }
+            }
+            if (std::fabs(e - refs2[c].energy[chn]) > relTol * refs2[c].energy[chn])
+            {
+                std::cerr << "    st " << ref2Semitones[c] << " mix " << ref2Mix[c]
+                          << " ch " << chn << " energy: stored " << refs2[c].energy[chn]
+                          << ", rendered " << e << "\n";
+                ++movedEnergy;
+            }
+            if (std::fabs(pk - refs2[c].peak[chn]) > relTol * refs2[c].peak[chn])
+            {
+                std::cerr << "    st " << ref2Semitones[c] << " mix " << ref2Mix[c]
+                          << " ch " << chn << " peak: stored " << refs2[c].peak[chn]
+                          << ", rendered " << pk << "\n";
+                ++movedPeak;
+            }
+        }
+    }
+
     if (worstSample > 0.0)
         std::cerr << "    worst stored-sample deviation " << worstSample << "\n";
     EXPECT_EQ(movedSamples, 0);

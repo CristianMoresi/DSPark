@@ -90,18 +90,22 @@
  * the overlap-add's first complete sample exists, which takes 1024 to 3072
  * input samples at the default 2048-sample frame, over ratios 0.5 to 2.
  * After that, cumulative output is `ratio *` cumulative input fed, less an
- * offset that has two parts. One is the overlap-add's own incomplete tail: it
- * is what is left when a stream has been fed to its end and drained, and it
- * measures 1152 to 2091 samples at the default frame size over ratios 0.5 to 2,
- * on sustained and on percussive material alike, whatever the feed and pull
- * sizes. The other is whatever input has been fed but not yet pulled back,
- * which is the caller's own doing and is bounded by `getInputCapacity()`:
- * feeding 512 and pulling 4096 it reaches 3840 samples mid-stream on a strike
- * train, and feeding faster than pulling it reaches the whole queue. So it is
- * an offset and not a drift - it is bounded and does not grow with the length
- * of the stream - but it is not a constant, and latency or sync arithmetic must
- * come from the counts `feedInput()` and `pullOutput()` return rather than from
- * any figure quoted here.
+ * offset that has two parts. One is the overlap-add's own incomplete tail,
+ * which nothing the caller does can remove: it measures 1152 to 2091 samples at
+ * the default frame size over ratios 0.5 to 2 once a stream has been fed to its
+ * end and drained, and up to 3840 mid-stream on percussive material, where the
+ * transient-locked hop varies how much of a frame stands incomplete. The other
+ * is whatever has been fed and not yet pulled back. That part is the caller's
+ * own doing, and the caller can read it at any moment: it is `ratio *`
+ * `getQueuedInputSamples()` plus `getAvailableOutput()`, and pulling until
+ * `getAvailableOutput()` returns 0 keeps it near zero. Nothing bounds it but
+ * how far the caller lets the two calls drift apart - pulling in 64-sample
+ * blocks at ratio 2 while feeding the same size leaves 39422 samples standing
+ * and the whole offset reads 42752, because a stretch above 1 makes more output
+ * than a same-sized pull can take. So it is an offset and not a drift - it does
+ * not grow with the length of the stream - but it is not a constant, and
+ * latency or sync arithmetic must come from the counts `feedInput()` and
+ * `pullOutput()` return rather than from any figure quoted here.
  *
  * **The fixed-rate adaptor.** `processBlock()` delivers into a slot that does
  * not change rate, and it is exact at `ratio == 1` indefinitely: the output

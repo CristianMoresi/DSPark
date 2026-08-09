@@ -865,6 +865,54 @@ void runMetricTests()
         check(fp == 0 && fn == 0, "metrics", "OnsetDetector clicks/silence F=1.0", d);
     }
     {
+        // BeatTracker floor: a clean click train must return the tempo it was
+        // given, at the metrical level it was given, with every beat found.
+        // A tempo out by a factor of two is a wrong answer, not a near miss,
+        // so the level is checked separately from the timing.
+        const double fs = 44100.0;
+        const double bpm = 120.0;
+        const int n = static_cast<int>(fs * 20.0);
+        std::vector<float> sig(static_cast<size_t>(n), 0.0f);
+        std::vector<int64_t> truth;
+        const double tau = 4.0 * 0.001 * fs;
+        const int clen = static_cast<int>(tau * 6.0);
+        const double period = 60.0 / bpm * fs;
+        for (int k = 0;; ++k)
+        {
+            const int64_t at = static_cast<int64_t>(fs * 0.5 + period * k);
+            if (at > n - static_cast<int64_t>(fs * 0.3)) break;
+            truth.push_back(at);
+            for (int m = 0; m < clen; ++m)
+            {
+                const int64_t i = at + m;
+                if (i < n)
+                    sig[static_cast<size_t>(i)] += static_cast<float>(
+                        std::sin(2.0 * kPiConf * 1000.0 * m / fs) * std::exp(-m / tau));
+            }
+        }
+        dspark::BeatTracker<float> bt;
+        bt.prepare(dspark::AudioSpec{ fs, 512, 1 });
+        const float* bp = sig.data();
+        dspark::AudioBufferView<const float> bview(&bp, 1, n);
+        const auto res = bt.analyze(bview);
+        const int64_t win = static_cast<int64_t>(0.070 * fs);
+        int tp = 0;
+        std::vector<bool> used(res.beatSamples.size(), false);
+        for (int64_t gt : truth)
+            for (size_t j = 0; j < res.beatSamples.size(); ++j)
+                if (!used[j] && std::llabs(res.beatSamples[j] - gt) <= win)
+                { used[j] = true; ++tp; break; }
+        const int bfp = static_cast<int>(res.beatSamples.size()) - tp;
+        const int bfn = static_cast<int>(truth.size()) - tp;
+        const double err = static_cast<double>(res.tempoBpm) - bpm;
+        char bd[128];
+        std::snprintf(bd, sizeof(bd), "(%.3f BPM, err %+.3f, tp=%d fp=%d fn=%d, conf %.3f)",
+                      static_cast<double>(res.tempoBpm), err, tp, bfp, bfn,
+                      static_cast<double>(res.confidence));
+        check(std::fabs(err) <= 0.5 && bfp == 0 && bfn == 0, "metrics",
+              "BeatTracker 120 BPM clicks: tempo and full beat grid", bd);
+    }
+    {
         // Oscillator waveform levels must match within 1 dB.
         dspark::Oscillator<float> osc;
         osc.prepare(48000.0);
@@ -1737,6 +1785,111 @@ std::vector<MetricsCase> buildMetricsCases()
     return cases;
 }
 
+// Accuracy of the analysis readouts, measured on synthetic material whose
+// answer is known exactly. Written into the same generated page as the
+// processor table: a reader looking up what a component is worth should not
+// have to know which kind of component it is to find out.
+void writeAnalysisAccuracy(FILE* out)
+{
+    std::fprintf(out,
+        "\n## Analysis accuracy\n\n"
+        "Measured on synthetic material with exactly known answers, at 44.1 kHz,"
+        " by this same run.\n\n"
+        "| Readout | Material | Quantity | Result |\n"
+        "|---|---|---|---:|\n");
+
+    const double fs = 44100.0;
+    auto clickTrack = [fs](double bpm, double seconds, std::vector<int64_t>& truth) {
+        const int n = static_cast<int>(fs * seconds);
+        std::vector<float> sig(static_cast<size_t>(n), 0.0f);
+        const double tau = 4.0 * 0.001 * fs;
+        const int clen = static_cast<int>(tau * 6.0);
+        const double period = 60.0 / bpm * fs;
+        truth.clear();
+        for (int k = 0;; ++k)
+        {
+            const int64_t at = static_cast<int64_t>(fs * 0.5 + period * k);
+            if (at > n - static_cast<int64_t>(fs * 0.3)) break;
+            truth.push_back(at);
+            for (int m = 0; m < clen; ++m)
+            {
+                const int64_t i = at + m;
+                if (i < n)
+                    sig[static_cast<size_t>(i)] += static_cast<float>(
+                        std::sin(2.0 * kPiConf * 1000.0 * m / fs) * std::exp(-m / tau));
+            }
+        }
+        return sig;
+    };
+
+    // Worst case over a tempo sweep, not a single convenient point.
+    double worstBpmError = 0.0, worstBpmAt = 0.0;
+    double worstBeatError = 0.0, worstBeatAt = 0.0;
+    double lowestConfidence = 1.0;
+    int missing = 0, spurious = 0;
+    for (double bpm : { 60.0, 90.0, 120.0, 150.0, 180.0, 210.0, 240.0 })
+    {
+        std::vector<int64_t> truth;
+        std::vector<float> sig = clickTrack(bpm, 20.0, truth);
+        dspark::BeatTracker<float> bt;
+        bt.prepare(dspark::AudioSpec{ fs, 512, 1 });
+        const float* p = sig.data();
+        dspark::AudioBufferView<const float> v(&p, 1, static_cast<int>(sig.size()));
+        const auto r = bt.analyze(v);
+
+        const double err = static_cast<double>(r.tempoBpm) - bpm;
+        if (std::fabs(err) > std::fabs(worstBpmError)) { worstBpmError = err; worstBpmAt = bpm; }
+        if (static_cast<double>(r.confidence) < lowestConfidence)
+            lowestConfidence = static_cast<double>(r.confidence);
+
+        const int64_t win = static_cast<int64_t>(0.070 * fs);
+        int tp = 0;
+        std::vector<bool> used(r.beatSamples.size(), false);
+        for (int64_t gt : truth)
+        {
+            double best = 1e18;
+            for (size_t j = 0; j < r.beatSamples.size(); ++j)
+            {
+                if (used[j]) continue;
+                const double d = static_cast<double>(std::llabs(r.beatSamples[j] - gt));
+                if (d <= static_cast<double>(win) && d < best) { best = d; }
+            }
+            for (size_t j = 0; j < r.beatSamples.size(); ++j)
+                if (!used[j] && std::llabs(r.beatSamples[j] - gt) <= win)
+                { used[j] = true; ++tp; break; }
+            if (best < 1e17)
+            {
+                const double ms = best / fs * 1000.0;
+                if (ms > worstBeatError) { worstBeatError = ms; worstBeatAt = bpm; }
+            }
+        }
+        missing += static_cast<int>(truth.size()) - tp;
+        spurious += static_cast<int>(r.beatSamples.size()) - tp;
+    }
+
+    std::fprintf(out,
+        "| `BeatTracker` tempo | click track, 60 to 240 BPM | worst tempo error"
+        " over the sweep | %+.3f BPM (at %.0f BPM) |\n", worstBpmError, worstBpmAt);
+    std::fprintf(out,
+        "| `BeatTracker` grid | same | worst beat placement error | %.2f ms"
+        " (at %.0f BPM) |\n", worstBeatError, worstBeatAt);
+    std::fprintf(out,
+        "| `BeatTracker` grid | same | beats missed / invented | %d / %d |\n",
+        missing, spurious);
+    std::fprintf(out,
+        "| `BeatTracker` confidence | same | lowest reported over the sweep |"
+        " %.3f |\n", lowestConfidence);
+    std::fprintf(out,
+        "\nThe tempo figures are the WORST point of the sweep with its sign, not an"
+        " average and not an endpoint: a tracker's error is not monotonic in tempo,"
+        " so an average would hide the tempo it is worst at. Beats are matched"
+        " one-to-one inside 70 ms.\n");
+    std::printf("TABLE %-26s worst tempo %+.3f BPM  worst beat %.2f ms  missed %d"
+                "  invented %d  lowest conf %.3f\n",
+                "BeatTracker", worstBpmError, worstBeatError, missing, spurious,
+                lowestConfidence);
+}
+
 int runMetricsTable(const char* outPath)
 {
 #ifndef DSPARK_NO_FILE_IO
@@ -1803,6 +1956,12 @@ int runMetricsTable(const char* outPath)
         "high \"THD+N\" — for them the column documents the character at the listed\n"
         "settings rather than a defect. Linear processors read at the measurement's\n"
         "own floor.\n");
+
+    // Analysis readouts produce numbers, not audio, so distortion and noise
+    // say nothing about them. What they owe a caller is that the number is
+    // right, so that is what is measured here, on the same run.
+    writeAnalysisAccuracy(out);
+
     std::fclose(out);
     std::printf("\nMetrics table written to %s\n", outPath);
     return 0;

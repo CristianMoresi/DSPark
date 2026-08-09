@@ -49,3 +49,16 @@ Modulated, inharmonic-by-design and time-based processors necessarily show
 high "THD+N" — for them the column documents the character at the listed
 settings rather than a defect. Linear processors read at the measurement's
 own floor.
+
+## Analysis accuracy
+
+Measured on synthetic material with exactly known answers, at 44.1 kHz, by this same run.
+
+| Readout | Material | Quantity | Result |
+|---|---|---|---:|
+| `BeatTracker` tempo | click track, 60 to 240 BPM | worst tempo error over the sweep | -0.001 BPM (at 210 BPM) |
+| `BeatTracker` grid | same | worst beat placement error | 3.17 ms (at 60 BPM) |
+| `BeatTracker` grid | same | beats missed / invented | 0 / 0 |
+| `BeatTracker` confidence | same | lowest reported over the sweep | 0.993 |
+
+The tempo figures are the WORST point of the sweep with its sign, not an average and not an endpoint: a tracker's error is not monotonic in tempo, so an average would hide the tempo it is worst at. Beats are matched one-to-one inside 70 ms.

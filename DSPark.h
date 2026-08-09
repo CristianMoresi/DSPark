@@ -410,6 +410,7 @@
  * | `PhaseCorrelation<T>`    | Analysis/PhaseCorrelation.h | Stereo correlation/balance meter + goniometer feed |
  * | `EnvelopeFollower<T>`    | Analysis/EnvelopeFollower.h | Peak/RMS envelope source with per-channel readouts |
  * | `OnsetDetector<T>`       | Analysis/OnsetDetector.h  | Causal SuperFlux onset detection (Boeck-2012 picker, shared beat front-end) |
+ * | `BeatTracker<T>`         | Analysis/BeatTracker.h    | Tempo and beat tracking: offline dynamic programming plus a causal resonator bank |
  *
  * @subsection classes_io File I/O
  *
@@ -735,6 +736,7 @@
 #include "Analysis/PhaseCorrelation.h"
 #include "Analysis/EnvelopeFollower.h"
 #include "Analysis/OnsetDetector.h"
+#include "Analysis/BeatTracker.h"
 
 // === I/O ====================================================================
 // File I/O uses <fstream>/<filesystem>, which do not exist on bare-metal

@@ -75,6 +75,10 @@
  *   words are independent, so a reader overlapping a release may pair a
  *   fresh reference sample with the previous strength -- benign for
  *   triggering/metering).
+ * - getLastOdfFrame(): STREAM OWNER ONLY -- plain words, no publication. It
+ *   is the envelope readout for the component that is itself driving
+ *   pushSamples() and therefore knows when a frame boundary passed; any other
+ *   thread must use the atomic onset readouts above.
  * - setMethod() / setThreshold() / setAdaptiveWhitening(): control thread
  *   (independent single-word relaxed atomics; non-finite thresholds are
  *   ignored).
@@ -442,6 +446,88 @@ public:
      *         frame; a direct readout of the analysis resolution in force. */
     [[nodiscard]] int getNumBands() const noexcept { return numBands_; }
 
+    // -- Onset-strength envelope (stream owner only) -------------------------
+
+    /**
+     * @brief One frame of the onset-strength envelope (the ODF before the
+     *        peak picker).
+     *
+     * The peak picker answers "was there an onset"; a periodicity analysis
+     * needs the continuous strength curve the picker thresholds, because the
+     * pulse it looks for is carried by the shape between onsets as much as by
+     * the events that clear the threshold. This is that curve, one frame at a
+     * time.
+     */
+    struct OdfFrame
+    {
+        T value = T(0);              ///< ODF value of the most recent frame.
+        int64_t referenceSample = 0; ///< Sample index the frame localises to.
+        int64_t frameIndex = 0;      ///< Frames computed since the last reset.
+    };
+
+    /**
+     * @brief The most recent analysis frame's onset-strength value.
+     *
+     * STREAM OWNER ONLY -- this is not a cross-thread readout. It hands back
+     * three plain words that describe one frame, and it is meant for the
+     * component that is itself feeding pushSamples(): that caller knows
+     * exactly when a frame boundary passed (every getHopSize() samples from
+     * the last reset), so it can read the frame it just caused without any
+     * publication at all. Reading it from another thread would race the
+     * writer word by word and could pair a fresh value with a stale reference
+     * sample, which is the one thing a beat grid cannot survive. Other
+     * threads use onsetDetected() / getOnsetStrength() / getLastOnsetSample(),
+     * which are published atomically for exactly that purpose.
+     *
+     * `frameIndex` counts from 1 for the first frame after a reset and is 0
+     * before any frame has been computed. Frames below getWarmupFrames() are
+     * computed over a partly-empty analysis ring and their values are not
+     * meaningful; see that method.
+     *
+     * Reflects the streaming path (processBlock/pushSamples). detectOffline()
+     * runs its own envelope internally and leaves this cleared.
+     */
+    [[nodiscard]] OdfFrame getLastOdfFrame() const noexcept
+    {
+        return OdfFrame { lastOdfValue_, lastOdfRef_, frameIndex_ };
+    }
+
+    /**
+     * @brief Frames at the start of a stream whose ODF value is warm-up, not
+     *        signal.
+     *
+     * The analysis ring starts empty, so the first frames measure the step
+     * from silence into the first input as well as the input itself, and the
+     * flux they report is an artefact of that step. The detector suppresses
+     * its own onsets over this span; a caller reading the envelope directly
+     * must discard the same span, or a spurious peak lands at time zero --
+     * where a periodicity estimator weights it most heavily, because every
+     * lag can reach it. Equal to fftSize/hop + 2: the frames needed to fill
+     * the ring, plus two so the flux to the previous frame is itself computed
+     * from two full frames.
+     */
+    [[nodiscard]] int getWarmupFrames() const noexcept { return primeFrames_; }
+
+    /**
+     * @brief How far behind the newest input sample a frame's reference sample
+     *        sits, in samples.
+     *
+     * The envelope has its own delay and it is NOT getLatencySamples(). That
+     * one is the ONSET latch delay: detected events are deliberately held and
+     * released at a fixed offset so a caller sees one block-size-independent
+     * latency. An envelope reader takes each frame as it is computed and does
+     * not wait for that release, so what it pays is only the distance from the
+     * frame's reference sample to the input sample that completed the frame --
+     * half the analysis frame, less the group-delay compensation already
+     * folded into the reference. Always smaller than getLatencySamples(); a
+     * consumer that reports positions in the caller's timeline uses the
+     * reference sample directly and needs this only to state its own delay.
+     */
+    [[nodiscard]] int getEnvelopeLatencySamples() const noexcept
+    {
+        return fftSize_ / 2 - localizationOffset_;
+    }
+
     // -- Offline convenience -------------------------------------------------
 
     /**
@@ -707,6 +793,12 @@ private:
         odfWrite_ = (odfWrite_ + 1) % odfHistLen_;
         ++frameIndex_;
 
+        // Envelope readout for the stream owner (see getLastOdfFrame()). The
+        // frame fired at totalSamples_, so it localises exactly where an onset
+        // decided from it would: one definition of frame time, not two.
+        lastOdfValue_ = value;
+        lastOdfRef_ = referenceSample(totalSamples_);
+
         // Causal peak-pick with a single-frame confirmation: we decide whether
         // the PREVIOUS frame was a maximum now that we have the current one.
         // This one-hop confirmation is exactly the +hop term of L.
@@ -895,6 +987,8 @@ private:
         totalSamples_ = 0;
         frameIndex_ = 0;
         odfWrite_ = 0;
+        lastOdfValue_ = T(0);
+        lastOdfRef_ = 0;
         lastConfirmOdf_ = T(0);
         lastOnsetFrame_ = -kBig;
         pendingHead_ = 0;
@@ -948,6 +1042,8 @@ private:
     int odfHistLen_ = 32;
     int odfWrite_ = 0;
     int64_t frameIndex_ = 0;
+    T lastOdfValue_ = T(0);   ///< Envelope readout (stream owner only).
+    int64_t lastOdfRef_ = 0;  ///< Reference sample of lastOdfValue_'s frame.
     T lastConfirmOdf_ = T(0);
     int64_t lastOnsetFrame_ = -kBig;
 

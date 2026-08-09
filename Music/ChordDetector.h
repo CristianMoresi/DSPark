@@ -36,7 +36,9 @@
  * pushSamples and reset() belong to the thread that owns the stream.
  * setConfidenceThreshold() may be called from any thread, and getChord()
  * is a lock-free readout safe from any thread (single packed atomic word,
- * never torn).
+ * never torn). getChroma() and getFrameCount() expose the shared front end
+ * to a second consumer and are NOT cross-thread readouts: they read plain
+ * state owned by the thread that pushes samples, and belong to that thread.
  *
  * Dependencies: Goertzel.h, HarmonyConstants.h, AudioSpec.h, AudioBuffer.h,
  * WindowFunctions.h, DspMath.h.
@@ -197,6 +199,8 @@ public:
         std::fill(ring_.begin(), ring_.end(), T(0));
         writePos_ = 0;
         sinceHop_ = 0;
+        chromaFrame_.fill(T(0));
+        frameCount_ = 0;
         packed_.store(pack(Result {}), std::memory_order_relaxed);
     }
 
@@ -227,6 +231,51 @@ public:
      *         readings update every windowSize/2 samples.
      */
     [[nodiscard]] int getWindowSize() const noexcept { return windowSize_; }
+
+    /**
+     * @return Samples between consecutive analysis frames (windowSize/2).
+     *
+     * A second consumer of this front end feeds it in chunks of at most this
+     * many samples and polls getFrameCount(): frames are exactly this far
+     * apart, so a chunk that long spans at most one of them and none can be
+     * missed.
+     */
+    [[nodiscard]] int getHopSize() const noexcept { return hopSize_; }
+
+    // -- Shared chroma front end (stream-owner thread) ---------------------------
+
+    /**
+     * @brief Number of analysis frames produced since prepare()/reset().
+     *
+     * Increments once per hop, so a caller can tell a fresh chroma frame from
+     * the one it already consumed.
+     *
+     * Reads plain state owned by the thread that pushes samples: call it from
+     * that thread only. It is NOT a cross-thread readout -- getChord() is the
+     * one that is.
+     */
+    [[nodiscard]] std::uint64_t getFrameCount() const noexcept { return frameCount_; }
+
+    /**
+     * @brief The chroma vector of the most recent analysis frame.
+     *
+     * Twelve bins of summed note ENERGY (Goertzel magnitude squared) over
+     * MIDI 36..83, folded by pitch class with index 0 = C. Raw, unnormalized
+     * and in the units the analysis produces, because a consumer that
+     * accumulates frames needs to choose its own weighting -- normalizing here
+     * would destroy the frame-to-frame level information and pre-empt that
+     * choice. All zeros before the first frame.
+     *
+     * The register the numbers are trustworthy in is the register documented
+     * on prepare(): energy below the leakage floor or above the MIDI 83 bin
+     * ceiling is not present in these bins, and adjacent-semitone leakage is.
+     *
+     * Returns a reference to state owned by the thread that pushes samples,
+     * which is the one exception to the rule that nothing is read across
+     * threads by reference: it is valid on that thread only, between its own
+     * calls, and a caller on any other thread would be racing the writer.
+     */
+    [[nodiscard]] const std::array<T, 12>& getChroma() const noexcept { return chromaFrame_; }
 
     // -- Processing -------------------------------------------------------------------
 
@@ -357,6 +406,15 @@ private:
             total += e * e;
             maxNote = std::max(maxNote, e * e);
         }
+        // Publish the frame for consumers of this front end before any of the
+        // chord-specific work, and count it even when the frame turns out to
+        // be silent: a consumer polls the count to tell a new frame from the
+        // previous one, so a frame that fails to increment it would be lost.
+        for (int pc = 0; pc < 12; ++pc)
+            chromaFrame_[static_cast<std::size_t>(pc)] =
+                static_cast<T>(chroma[static_cast<std::size_t>(pc)]);
+        ++frameCount_;
+
         // Lowest LOCAL maximum: window-lobe leakage spreads energy onto
         // neighbouring semitones, so a plain threshold would pick a sidelobe.
         int bassPc = -1;
@@ -462,6 +520,10 @@ private:
     int sinceHop_ = 0;
 
     std::array<Goertzel<T>, static_cast<std::size_t>(kNumNotes)> notes_;
+
+    // Latest analysis frame, owned by the thread that pushes samples.
+    std::array<T, 12> chromaFrame_ {};
+    std::uint64_t frameCount_ = 0;
 
     std::atomic<std::uint64_t> packed_ { 0 };
     std::atomic<float> threshold_ { 0.55f };

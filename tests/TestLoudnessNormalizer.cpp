@@ -403,11 +403,13 @@ DSPARK_TEST(LoudnessNorm_reports_the_target_it_could_not_reach)
 DSPARK_TEST(LoudnessNorm_defaults_are_the_broadcast_ones)
 {
     // -23.0 LUFS is the EBU R 128 Programme Loudness Level and -1 dBTP its
-    // maximum permitted true-peak level. Both are the defaults, and a change
-    // to either is a change to what this class means out of the box.
+    // maximum permitted true-peak level. The 1 ms release is the independently
+    // measured transparency/loudness selection documented at setReleaseMs().
+    // A change to any default is therefore deliberate and tested here.
     LoudnessNormalizer<float> ln;
     EXPECT_EQ(ln.getTargetLUFS(), -23.0f);
     EXPECT_EQ(ln.getTruePeakCeilingDb(), -1.0f);
+    EXPECT_EQ(ln.getReleaseMs(), 1.0f);
 }
 
 DSPARK_TEST(LoudnessNorm_degenerate_input_is_survived)

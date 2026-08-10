@@ -39,6 +39,12 @@ Tiers
      that existed when this was written and would miss a `for (;;) { break; }`
      written next month -- so the tier keys on the accept guard every seqlock
      reader must contain, and requires each one to say which kind it is.
+  G  public const-reference accessors that return member storage, enumerated
+     POSITIVELY. A stream-owner-only readout carries the marker `stream-owner
+     reference readout` in both its method documentation and the class's
+     Threading block. Existing unmarked sites are an explicit, counted legacy
+     set until their owning audits document them; any new unclassified site is
+     a failure, so the warning set cannot grow silently.
 """
 
 import re
@@ -548,12 +554,200 @@ if MARKER_BOUNDED not in doc:
 else:
     print("  the page names the marker '{}'  OK".format(MARKER_BOUNDED))
 
+
+# A public method that returns a const reference to one of its object's data
+# members exposes storage whose later mutation the caller can observe. The
+# syntax is intentionally found from the declaration and the return statement,
+# not from a list of today's two conforming names: that is what makes this a
+# positive enumeration tier. It is not a C++ parser, but the accepted shape is
+# deliberately narrow and every candidate is printed for review.
+MARKER_STREAM_OWNER_REF = "stream-owner reference readout"
+
+# These sites pre-date this tier and belong to their component audits. Keeping
+# the set explicit makes the gate useful immediately: it exits green with a
+# counted warning for this fixed debt, while any NEW unmarked site fails. An
+# owning audit removes an entry only after adding the marker and the complete
+# per-method contract.
+LEGACY_REFERENCE_ACCESSORS = {
+    ("Analysis/BeatTracker.h", "getOnsetDetector"),
+    ("Core/Biquad.h", "getCoeffs"),
+    ("Core/ProcessorChain.h", "get"),
+    ("Core/StateBlob.h", "entries"),
+    ("Effects/Equalizer.h", "getBandFilter"),
+    ("Effects/MultibandCompressor.h", "getBandCompressor"),
+}
+
+# A marked reference is admitted only when the same class exposes the result a
+# foreign thread legitimately needs through an atomic publication. The map is
+# intentionally exact: a marker cannot be pasted onto an arbitrary reference
+# accessor and turn it into a conforming one.
+STREAM_OWNER_FOREIGN_READOUT = {
+    ("Music/ChordDetector.h", "getChroma"): "getChord",
+    ("Music/KeyDetector.h", "chroma"): "getKey",
+}
+
+REF_SIGNATURE = re.compile(
+    r"(?m)^[ \t]*(?:\[\[nodiscard\]\][ \t]*)?"
+    r"(?:inline[ \t]+|constexpr[ \t]+|static[ \t]+)*"
+    r"const[ \t]+[^;{}\n]+?&[ \t]*(\w+)[ \t]*"
+    r"\([^;{}]*\)[ \t]*(?:const[ \t]*)?(?:noexcept[ \t]*)?\s*\{")
+
+
+def matching_brace(text, opening):
+    """Index of the brace matching `opening`, or the end of text."""
+    depth = 0
+    for i in range(opening, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return len(text) - 1
+
+
+def line_number(text, offset):
+    return text.count("\n", 0, offset) + 1
+
+
+def preceding_doc(text, start):
+    """Contiguous comment block immediately preceding a declaration."""
+    line_start = text.rfind("\n", 0, start) + 1
+    prefix = text[:line_start].splitlines()
+    out = []
+    while prefix:
+        line = prefix[-1]
+        stripped = line.lstrip()
+        if stripped.startswith(("/**", "/*", "*", "//")) or not stripped:
+            out.append(prefix.pop())
+            continue
+        break
+    return "\n".join(reversed(out))
+
+
+def is_public_at(text, offset):
+    """Whether the nearest C++ access label before `offset` is public."""
+    labels = list(re.finditer(r"(?m)^[ \t]*(public|private|protected)[ \t]*:",
+                              text[:offset]))
+    return bool(labels) and labels[-1].group(1) == "public"
+
+
+def reference_accessors(path):
+    """Public const-reference functions returning member storage."""
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    out = []
+    for match in REF_SIGNATURE.finditer(text):
+        if not is_public_at(text, match.start()):
+            continue
+        opening = text.find("{", match.start(), match.end())
+        end = matching_brace(text, opening)
+        body = text[opening + 1:end]
+        returns = re.findall(r"\breturn\s+([^;]+);", body)
+        # A member name ends in underscore; optional indexing still exposes a
+        # subobject of that member. Calls and temporaries are not candidates.
+        direct_member = r"\b[A-Za-z_]\w*_\s*(?:\[[^;]+\])?\s*$"
+        member_subobject = (
+            r"\b(?:std::)?get\s*<[^;>]+>\s*\(\s*[A-Za-z_]\w*_\s*\)\s*$")
+        if not any(re.search(direct_member, value)
+                   or re.search(member_subobject, value) for value in returns):
+            continue
+        doc_region = preceding_doc(text, match.start())
+        out.append((match.group(1), doc_region, line_number(text, match.start())))
+    return out
+
+
+print("== tier G: stream-owner reference readouts, enumerated positively ==")
+reference_sites = []
+marked_sites = set()
+for path in sorted(p for p in SOURCES
+                   if p.startswith(FRAMEWORK_DIRS) and p.endswith(".h")):
+    for name, region, line_no in reference_accessors(path):
+        site = (path, name)
+        reference_sites.append(site)
+        label = "{}:{} {}()".format(path, line_no, name)
+        marked = MARKER_STREAM_OWNER_REF in region
+        if marked:
+            marked_sites.add(site)
+            print("  MARKED  {}".format(label))
+            if site not in STREAM_OWNER_FOREIGN_READOUT:
+                failures.append(
+                    "G: {} carries the stream-owner marker but has no declared "
+                    "foreign-thread publication in STREAM_OWNER_FOREIGN_READOUT"
+                    .format(label))
+                continue
+            foreign = STREAM_OWNER_FOREIGN_READOUT[site]
+            if not declared_in(foreign, path):
+                failures.append(
+                    "G: {} names {}() as its foreign-thread publication, but the "
+                    "header does not declare it".format(label, foreign))
+            with open(path, "r", encoding="utf-8") as fh:
+                header = fh.read()
+            threading = re.search(r"Threading:.*?(?:\n \*\s*\n|\n \*/)",
+                                  header, re.S)
+            if not threading or MARKER_STREAM_OWNER_REF not in threading.group(0):
+                failures.append(
+                    "G: {} has the marker at the accessor but not in its class "
+                    "Threading block".format(label))
+        elif site in LEGACY_REFERENCE_ACCESSORS:
+            print("  LEGACY  {}  <== counted warning: owner audit must mark it"
+                  .format(label))
+        else:
+            print("  {}  <== UNCLASSIFIED".format(label))
+            failures.append(
+                "G: {} is a public const-reference accessor returning member "
+                "storage without the '{}' marker. Mark and document it, or add "
+                "a reviewed legacy classification.".format(
+                    label, MARKER_STREAM_OWNER_REF))
+
+found = set(reference_sites)
+for site in sorted(LEGACY_REFERENCE_ACCESSORS - found):
+    failures.append("G: stale legacy reference-accessor entry: {} {}()"
+                    .format(site[0], site[1]))
+for site in sorted(set(STREAM_OWNER_FOREIGN_READOUT) - found):
+    failures.append("G: required marked reference accessor not found: {} {}()"
+                    .format(site[0], site[1]))
+
+marked_count = len(marked_sites)
+legacy_count = sum(1 for site in found if site in LEGACY_REFERENCE_ACCESSORS)
+print("  {} marked conforming site(s), {} explicit legacy warning(s), {} total"
+      .format(marked_count, legacy_count, len(reference_sites)))
+
+ref_paragraphs = [p for p in paragraphs
+                  if "enumerates public const-reference accessors" in p]
+if not ref_paragraphs:
+    failures.append("G: the page has no paragraph stating the reference-accessor "
+                    "population and legacy count")
+else:
+    ref_para = ref_paragraphs[0]
+    for pattern, subject, expected in [
+            (r"finds\s+(\w+)", "total reference accessors", len(reference_sites)),
+            (r"the\s+(\w+)\s+marked sites", "marked reference accessors", marked_count),
+            (r"and\s+(\w+)\s+explicit legacy warnings", "legacy reference accessors",
+             legacy_count)]:
+        match = re.search(pattern, ref_para)
+        if not match:
+            failures.append("G: the page no longer states its {} count"
+                            .format(subject))
+            continue
+        word = match.group(1)
+        value = int(word) if word.isdigit() else NUMBER_WORDS.get(word.lower())
+        print("  page count {:28s}: '{}' -> {}".format(subject, word, value))
+        if value != expected:
+            failures.append("G: the page says {} {} but disk says {}"
+                            .format(word, subject, expected))
+if MARKER_STREAM_OWNER_REF not in doc:
+    failures.append("G: the page never writes the marker '{}' that this tier "
+                    "enumerates by".format(MARKER_STREAM_OWNER_REF))
+else:
+    print("  the page names the marker '{}'  OK".format(MARKER_STREAM_OWNER_REF))
+
 print("")
 if failures:
     print("FAILURES ({}):".format(len(failures)))
     for f in failures:
         print("  - " + f)
     sys.exit(1)
-print("threading: every identifier, path, quantifier and snippet in the page "
-      "checks out against the tree.")
+print("threading: every identifier, path, quantifier, snippet and reference "
+      "readout in the page checks out against the tree.")
 sys.exit(0)

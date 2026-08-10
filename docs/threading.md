@@ -39,7 +39,7 @@ one thread while another writes it -- including inside a seqlock's critical
 section -- and no hand-off is read across threads *by reference*, which would
 let the reader observe the writer's later stores. (A getter that returns a
 reference to state owned by the processing thread is a different animal; see
-the exception at the end of "Pointers returned across threads".)
+the stream-owner case at the end of "Pointers returned across threads".)
 
 The words are chosen so they cannot lock. `tests/TestCoreFoundation.cpp`
 asserts `std::atomic<T>::is_always_lock_free` for nine word types -- `bool`,
@@ -262,18 +262,29 @@ writer. A pointer into the slot would therefore be invalidated by the *other*
 getter's next call. A pointer into a snapshot is not: each snapshot is
 rewritten only by its own getter, plus the setup-only `reset()` / `prepare()`.
 
-**The exception, stated here because the headers state it.** A getter that
-returns a reference to state owned by the *processing* thread is not a
-cross-thread readout, and the rule above does not cover it. `Core/Biquad.h`'s
-`getCoeffs()` returns a reference straight into the active coefficient set,
-which the processing thread rewrites in `applyPendingCoeffs()`; a GUI thread
-reading it concurrently with a promotion may observe a half-updated set. The
-header says so at the method, and says what to do instead -- keep your own copy
-of the coefficients you computed. `Core/ProcessorChain.h`'s `get()` has the
-same shape: it hands back the sub-processor itself, so what you may do with the
-reference is that processor's contract, not the chain's. The rule to carry
-away: a getter that returns a reference or a raw pointer belongs to the
-processing thread unless its own documentation says otherwise.
+**The stream-owner case.** A getter that returns a reference to state owned by
+the *processing* thread is not a cross-thread readout. It is valid on that
+thread only, between that thread's own processing calls; reading it on another
+thread while processing continues is a data race. A conforming method carries
+the exact marker `stream-owner reference readout` both at the accessor and in
+its class's `Threading:` block, and the class provides a separate atomic
+publication for what another thread legitimately needs. `Music/ChordDetector.h`
+does that with `getChroma()` / `getChord()`, and `Music/KeyDetector.h` with
+`chroma()` / `getKey()`.
+
+`tools/verify_threading_doc.py` enumerates public const-reference accessors
+that return member storage positively. It currently finds eight: the two
+marked sites above and six explicit legacy warnings whose component audits
+must document them. A new unmarked site fails the check, so the warning set
+cannot grow silently. `Core/Biquad.h`'s `getCoeffs()` illustrates the hazard:
+it returns a reference straight into the active coefficient set, which the
+processing thread rewrites in `applyPendingCoeffs()`, so a GUI thread reading
+it during a promotion may observe a half-updated set. `Core/ProcessorChain.h`'s
+`get()` has both mutable- and const-reference forms; either hands back the
+sub-processor itself, so what may be done with the reference is that processor's
+contract. The rule to carry away is unchanged: a getter that returns a reference
+or raw pointer belongs to the processing thread unless its own documentation
+says otherwise.
 
 ## Blocking
 

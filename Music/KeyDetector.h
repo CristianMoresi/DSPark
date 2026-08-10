@@ -50,8 +50,9 @@
  * analysis frame. getKey() is a lock-free readout safe from any thread: the
  * whole result travels in one packed atomic word, so a reader can never see a
  * tonic from one estimate beside a confidence from another. chroma() is NOT
- * such a readout -- it hands back a reference to state owned by the thread
- * that pushes samples, and belongs to that thread.
+ * such a readout: it is a stream-owner reference readout, valid on the thread
+ * that pushes samples and between that thread's own calls, and a caller on any
+ * other thread would be reading it while the owning thread writes it.
  *
  * Dependencies: ChordDetector.h, HarmonyConstants.h, AudioSpec.h,
  * AudioBuffer.h, DspMath.h.
@@ -119,8 +120,8 @@ public:
         int tonicPitchClass = -1;      ///< 0 = C ... 11 = B; -1 = nothing yet.
         bool isMinor = false;          ///< true = minor mode.
         T confidence = T(0);           ///< [0, 1]; see getKey().
-        int runnerUpPitchClass = -1;   ///< Second-best key, same encoding.
-        bool runnerUpMinor = false;    ///< Mode of the second-best key.
+        int runnerUpPitchClass = -1;   ///< Relative alternate, or numeric runner-up.
+        bool runnerUpMinor = false;    ///< Mode of that alternate key.
     };
 
     // -- Lifecycle ---------------------------------------------------------------
@@ -239,20 +240,28 @@ public:
     /**
      * @return The current key estimate. Lock-free and safe from any thread.
      *
-     * `confidence` is the margin of the winning correlation over the runner-up,
-     * (top - runnerUp) / top, clamped to [0, 1]. It answers one question --
-     * how far ahead the winner is -- and deliberately not "is this the right
+     * `confidence` is the numerical top-two margin,
+     * (top - numericalSecond) / top, clamped to [0, 1]. It answers one question
+     * -- how far ahead the winner is -- and deliberately not "is this the right
      * key": a passage that is genuinely between two keys reports a low margin
      * whether or not the winner is correct, and a short excerpt that happens to
-     * fit one profile well reports a high one. Where the top two are a relative
-     * pair the margin is the one number that says so, together with the
-     * runner-up fields themselves.
+     * fit one profile well reports a high one.
      *
-     * The clamp is not cosmetic. The runner-up correlation can be negative, in
-     * which case the raw ratio exceeds 1; and where the winning correlation is
-     * itself zero or negative -- silence, noise, or a chroma with no tonal
-     * structure at all -- the ratio has no meaning and the confidence is
-     * reported as 0 rather than as whatever the division produced.
+     * The published runner-up is deliberately the winner's RELATIVE key while
+     * that key has a positive correlation; otherwise it is the numerical
+     * second place. This makes the alternate carry the ambiguity the method is
+     * known to have instead of replacing it with an unrelated subdominant that
+     * happened to score between the pair. The winning key is still the argmax
+     * over all 24 correlations. Confidence deliberately retains the numerical
+     * top-two margin, which can name a different competitor: otherwise
+     * replacing the alternate would make flat or atonal material look more
+     * certain merely because its relative key ranked lower.
+     *
+     * The clamp is not cosmetic. The numerical runner-up correlation can be
+     * negative, in which case the raw ratio exceeds 1; and where the winning
+     * correlation is itself zero or negative -- silence, noise, or a chroma
+     * with no tonal structure at all -- the ratio has no meaning and the
+     * confidence is reported as 0 rather than as whatever the division produced.
      */
     [[nodiscard]] Key getKey() const noexcept
     {
@@ -263,12 +272,17 @@ public:
      * @brief The accumulated chroma the estimate was formed from.
      *
      * Twelve bins, index 0 = C, normalized to sum to 1 so it can be compared
-     * against a profile directly and does not grow with programme length. All
-     * zeros before the first frame is accumulated.
+     * against a profile directly and does not grow with programme length. That
+     * normalization is a property of this readout and of nothing else: the
+     * correlation behind getKey() is computed from the unnormalized
+     * accumulator, and scaling a chroma cannot move a Pearson correlation.
+     * All zeros before the first frame is accumulated.
      *
-     * Returns a reference to state owned by the thread that pushes samples: it
-     * is valid on that thread only, between its own calls. A caller on another
-     * thread would be reading it while that thread writes it.
+     * stream-owner reference readout: the reference is to state owned by the
+     * thread that calls processBlock()/pushSamples(), and it is valid on that
+     * thread only, between that thread's own calls. A caller on any other
+     * thread would be reading these words while the owning thread writes them.
+     * getKey() is the readout for any other thread.
      */
     [[nodiscard]] const std::array<T, 12>& chroma() const noexcept { return chromaOut_; }
 
@@ -403,13 +417,18 @@ private:
         for (const double v : accum_) sum += v;
         if (!(sum > 0.0)) return;
 
-        std::array<double, 12> x {};
+        // The correlation reads the ACCUMULATOR, not the normalized readout
+        // built below. Pearson subtracts each argument's mean and divides by
+        // its spread, so multiplying the chroma by any positive constant
+        // divides straight back out of r: normalizing first cannot move an
+        // argmax, a top correlation or a confidence, only their last bits.
+        // The normalization exists for the readout alone, for the reason
+        // stated at chroma(), and is deliberately not in the path of the
+        // estimate.
+        const double inv = 1.0 / sum;
         for (int pc = 0; pc < 12; ++pc)
-        {
-            x[static_cast<std::size_t>(pc)] = accum_[static_cast<std::size_t>(pc)] / sum;
             chromaOut_[static_cast<std::size_t>(pc)] =
-                static_cast<T>(x[static_cast<std::size_t>(pc)]);
-        }
+                static_cast<T>(accum_[static_cast<std::size_t>(pc)] * inv);
 
         const bool temperley = (getProfile() == Profile::Temperley);
         const auto& major = temperley ? kTemperleyMajor : kKrumhanslKesslerMajor;
@@ -418,13 +437,15 @@ private:
         double best = -2.0, second = -2.0;
         int bestPc = -1, secondPc = -1;
         bool bestMinor = false, secondMinor = false;
+        std::array<double, 24> scores {};
 
         for (int mode = 0; mode < 2; ++mode)
         {
             const auto& p = (mode == 0) ? major : minor;
             for (int tonic = 0; tonic < 12; ++tonic)
             {
-                const double r = pearsonRotated(x, p, tonic);
+                const double r = pearsonRotated(accum_, p, tonic);
+                scores[static_cast<std::size_t>(mode * 12 + tonic)] = r;
                 if (r > best)
                 {
                     second = best; secondPc = bestPc; secondMinor = bestMinor;
@@ -437,6 +458,25 @@ private:
             }
         }
 
+        const double numericalSecond = second;
+
+        // A major key's relative minor is nine semitones above it; a minor
+        // key's relative major is three above. Profile correlation is known to
+        // swap that pair on tonic-avoiding diatonic material. Publish the pair
+        // while it remains a tonal candidate (positive r), because that is the
+        // ambiguity a caller can act on. The numerical second remains the
+        // fallback for noise or evidence with no positively correlated pair.
+        const int relativePc = (bestPc + (bestMinor ? 3 : 9)) % 12;
+        const bool relativeMinor = !bestMinor;
+        const double relative = scores[static_cast<std::size_t>(
+            (relativeMinor ? 12 : 0) + relativePc)];
+        if (relative > 0.0)
+        {
+            second = relative;
+            secondPc = relativePc;
+            secondMinor = relativeMinor;
+        }
+
         Key key;
         key.tonicPitchClass = bestPc;
         key.isMinor = bestMinor;
@@ -446,7 +486,8 @@ private:
         // dividing by a zero or negative top would turn "no tonal structure"
         // into a large number of the wrong sign.
         key.confidence = (best > 0.0)
-                       ? static_cast<T>(std::clamp((best - second) / best, 0.0, 1.0))
+                       ? static_cast<T>(std::clamp(
+                             (best - numericalSecond) / best, 0.0, 1.0))
                        : T(0);
         packed_.store(pack(key), std::memory_order_relaxed);
     }
@@ -457,6 +498,11 @@ private:
      * The profile's own mean and spread are recomputed here rather than cached:
      * a rotation permutes the vector, so they are the same for all twelve
      * rotations, and this is 24 twelve-element passes per analysis frame.
+     *
+     * `x` is passed in whatever scale it arrives in. Both arguments are
+     * centred and divided by their own spread, so the result is unchanged by
+     * any positive rescaling of either -- which is why the caller hands over
+     * the raw accumulator instead of normalizing it first.
      */
     [[nodiscard]] static double pearsonRotated(const std::array<double, 12>& x,
                                                const std::array<double, 12>& profile,

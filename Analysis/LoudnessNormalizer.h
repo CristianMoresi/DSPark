@@ -19,9 +19,12 @@
  *
  * - The measurement is ITU-R BS.1770-5, Annex 1: K-weighting (two-stage
  *   pre-filter, Tables 1 and 2), mean square per channel, channel-weighted
- *   sum (Table 3), and the two-stage gate of equations (6) and (7) -- 400 ms
- *   gating blocks overlapping by 75% (equation (3)), an absolute threshold at
- *   -70 LKFS and a relative threshold 10 LU below the absolute-gated result.
+ *   sum (Table 3), and the two-stage gate of equations (6) and (7) -- an
+ *   absolute threshold at -70 LKFS and a relative threshold 10 LU below the
+ *   absolute-gated result. The gating block is 400 ms long and overlaps its
+ *   neighbour by 75%; the Annex states that as normative prose, not as a
+ *   numbered equation, and equation (3) is the block mean square z_ij written
+ *   in terms of that duration and that overlap.
  *   `LoudnessMeter` implements all of it and this class calls it; the
  *   measurement is not re-derived here.
  * - The true-peak estimate is ITU-R BS.1770-5, Annex 2: 4x over-sampling with
@@ -180,28 +183,23 @@ public:
     }
 
     /**
-     * @brief Forward decay of the gain envelope, in milliseconds (default 100).
+     * @brief Forward decay of the gain envelope, in milliseconds (default 1).
      *
      * How long the gain takes to come back after a peak has passed, in the same
      * unit as the lookahead: the time to traverse a factor of ten in amplitude
      * (20 dB). Clamped to [1, 2000] ms.
      *
-     * The default is a starting point and NOT a measured optimum, which is
-     * worth saying plainly. The ceiling is unaffected by it -- it holds at every
-     * point of a 6 x 5 lookahead/release grid on a transient bed, worst case
-     * 0.0009 dB UNDER the ceiling -- so the choice is about transparency, and
-     * the three quantities that can be measured on such a bed (loudness
-     * shortfall, the depth of gain modulation on a steady tone, and modulation
-     * sidebands more than 20 Hz from a carrier) all rank the SHORTEST release
-     * first. They share one structural bias that cannot be removed from that
-     * bed: a fast release does its whole gain movement in the milliseconds
-     * immediately after the transient, which is the region any analysis window
-     * has to exclude to keep the transient itself out of the spectrum. So the
-     * bed cannot see the cost of a fast release, and its ranking is not
-     * evidence about it. 100 ms is a conventional programme-limiter release;
-     * a caller who wants the loudness the short end recovers -- about 0.13 LU
-     * on that bed -- can ask for it, and this documentation is the reason the
-     * number is not presented as having been derived.
+     * The default was selected on a steady-state 1 kHz carrier with periodic
+     * transient trains at 4, 6, 10, 20, 40 and 80 Hz. Nine candidates from 1
+     * to 2000 ms were ranked independently at every rate by output sideband
+     * energy more than 20 Hz from the carrier and by absolute loudness miss;
+     * the predeclared equal-rank sum selected 1 ms (24, against 39 for 5 ms and
+     * 47 for 20 ms). Its worst far-sideband result was -29.49 dBc and its worst
+     * absolute miss was 0.2397 LU. All 54 points met a -1 dBTP ceiling at
+     * -1.00087 dBTP, so release controls transparency and loudness rather than
+     * the ceiling guarantee. The bed is synthetic and intentionally separating,
+     * not a claim that one release is perceptually optimal for every programme;
+     * callers may choose any value in the documented range.
      */
     void setReleaseMs(T ms) noexcept
     {
@@ -235,6 +233,17 @@ public:
      * Silence, or anything whose gated loudness sits at the meter's floor, is
      * left alone: there is no gain that makes silence measure -23 LUFS, and
      * applying an enormous one would only normalize the noise floor.
+     *
+     * WHAT IT COSTS, so a caller can size the job before starting it. The
+     * ceiling stage keeps two `double` buffers as long as the programme --
+     * the gain envelope and the double buffer its support dilation writes
+     * through -- which is **16 bytes per sample, independent of the channel
+     * count**: about 5.5 GB for a 60-minute programme at 96 kHz, mono or 5.1
+     * alike. Time is proportional to the programme too, and the constant is
+     * not small: each measurement walks every sample through a 48-tap
+     * interpolator per channel, and a run performs two or three loudness
+     * measurements plus one true-peak pass per ceiling refinement. A caller
+     * whose material will not fit should normalize in sections.
      */
     template <int MaxChannels>
     Result normalize(AudioBuffer<T, MaxChannels>& audio, double sampleRate)
@@ -326,11 +335,12 @@ private:
     /// amount that peak demands, but the interpolator has negative taps and the
     /// envelope is not constant across that support, so the first pass is a
     /// very good estimate and not a proof. Each further pass measures what is
-    /// actually left and removes it; the residual falls by orders of magnitude
-    /// per pass. The bound exists so the function cannot loop forever, and
-    /// whatever a run at the bound still leaves is removed by the constant trim
-    /// below, so the ceiling does not depend on the loop converging.
-    static constexpr int kMaxCeilingPasses = 8;
+    /// actually left and removes it. One local pass preserves nearly all the
+    /// loudness this stage can recover on the declared programme beds; the
+    /// mandatory constant trim below removes the small residual exactly. The
+    /// bound therefore keeps the offline cost predictable and makes the
+    /// guarantee visibly independent of iterative convergence.
+    static constexpr int kMaxCeilingPasses = 1;
 
     /// The passes aim this far BELOW the ceiling, as a fraction of it
     /// (1e-4 = 0.00087 dB). Aiming exactly at the boundary makes each pass land
@@ -501,14 +511,25 @@ private:
             }
         }
 
-        // The loop is bounded, so it can in principle stop with something still
-        // above the ceiling. A constant gain scales the true-peak estimate
-        // EXACTLY -- the estimator is linear and its input is scaled uniformly,
-        // which is the one thing the per-sample envelope cannot promise -- so
-        // whatever is left is removed here in one step. That makes the ceiling
-        // a property of the function rather than of the loop's convergence.
-        // It costs loudness across the whole programme, which is why it is the
-        // fallback and not the method.
+        // THIS is where the ceiling comes from, and it is not optional.
+        //
+        // The loop above is bounded, and a run that ends at the bound can still
+        // leave the estimate above the ceiling: the envelope is not constant
+        // across a peak's support and the interpolator has negative taps.
+        // Measured on a pink programme targeted to -5 LUFS, deleting this step
+        // leaves the output at -0.95050 dBTP for a -1 dBTP ceiling; the two
+        // outputs differ at every sample, so the trim is not a no-op on that
+        // operating point. A constant gain, by contrast, scales the true-peak
+        // estimate EXACTLY -- the estimator is linear and its input is scaled
+        // uniformly -- so one multiplication puts the peak at the aim by
+        // construction. That makes the ceiling a property of the function
+        // rather than of the loop's convergence, which is the only form in
+        // which a bounded loop can carry a guarantee at all.
+        //
+        // It costs loudness across the whole programme. That cost is the
+        // reason the loop above exists -- to leave this step as little as
+        // possible to take -- and not a reason to treat this step as a
+        // fallback that a later optimisation may remove.
         const T left = truePeakLinear(audio);
         if (std::isfinite(left) && left > ceiling)
         {
@@ -544,7 +565,7 @@ private:
     std::atomic<T> targetLUFS_  { T(-23) };
     std::atomic<T> ceilingDb_   { T(-1) };
     std::atomic<T> lookaheadMs_ { T(1) };
-    std::atomic<T> releaseMs_   { T(100) };
+    std::atomic<T> releaseMs_   { T(1) };
 
     LoudnessMeter<T> meter_;
     TruePeakDetector<T, kMaxTpChannels> tp_;

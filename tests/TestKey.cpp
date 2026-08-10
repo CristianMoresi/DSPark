@@ -101,6 +101,32 @@ std::vector<float> renderCadence(int tonicPc, bool minor, const Timbre& tb,
     return out;
 }
 
+std::vector<float> renderTonicAvoidingMinor(int tonicPc, const Timbre& tb,
+                                             int low, bool aeolianCadence)
+{
+    const int relativeLoop[4][3] = {
+        { 0, 3, 7 }, { 8, 0, 3 }, { 3, 7, 10 }, { 10, 2, 5 }
+    };
+    const int aeolianLoop[4][3] = {
+        { 0, 3, 7 }, { 5, 8, 0 }, { 7, 10, 2 }, { 0, 3, 7 }
+    };
+    const auto& chords = aeolianCadence ? aeolianLoop : relativeLoop;
+    constexpr double bar = 0.75;
+    std::vector<float> out(static_cast<std::size_t>(kFs * (bar * 12.0 + 1.0)), 0.0f);
+    double t = 0.0;
+    for (int rep = 0; rep < 3; ++rep)
+        for (int chord = 0; chord < 4; ++chord)
+        {
+            for (int voice = 0; voice < 3; ++voice)
+            {
+                const int midi = foldRoot((tonicPc + chords[chord][voice]) % 12, low);
+                addNote(out, t, bar * 0.95, midi, 0.16, tb);
+            }
+            t += bar;
+        }
+    return out;
+}
+
 // Pure Aeolian: no leading tone, so the pitch-class content is EXACTLY that of
 // the relative major and only the dwelling separates the two.
 std::vector<float> renderAeolian(int tonicPc, const Timbre& tb, int low,
@@ -293,6 +319,40 @@ DSPARK_TEST(Key_all_24_keys_cadence_and_aeolian)
         const double nonRelative = 100.0 * (par + dom + sub + other + none) / n;
         EXPECT_LT(nonRelative, 10.0);
     }
+}
+
+DSPARK_TEST(Key_relative_alternate_recovers_tonic_avoiding_minor)
+{
+    using KD = KeyDetector<float>;
+    int relativeTop = 0;
+    for (int prof = 0; prof < 2; ++prof)
+    {
+        KD kd;
+        kd.prepare(keySpec(), 0);
+        kd.setProfile(prof == 0 ? KD::Profile::KrumhanslKessler
+                                : KD::Profile::Temperley);
+        for (const bool aeolianCadence : { false, true })
+        {
+            constexpr int tonic = 0;  // C minor; the offline sweep rotates all 12.
+            const auto audio = renderTonicAvoidingMinor(
+                tonic, kTimbres[1], 58, aeolianCadence);
+            const auto key = run(kd, audio);
+            const bool top = key.tonicPitchClass == tonic && key.isMinor;
+            const bool alternate = key.runnerUpPitchClass == tonic && key.runnerUpMinor;
+            const bool relative = key.tonicPitchClass == 3 && !key.isMinor;
+            if (relative) ++relativeTop;
+            std::printf("  [key] %-16s %-18s top=%d/%d runner=%d/%d recovery=%d\n",
+                        prof == 0 ? "KrumhanslKessler" : "Temperley",
+                        aeolianCadence ? "i-iv-v-i aeolian" : "i-VI-III-VII",
+                        key.tonicPitchClass, static_cast<int>(key.isMinor),
+                        key.runnerUpPitchClass, static_cast<int>(key.runnerUpMinor),
+                        static_cast<int>(top || alternate));
+            EXPECT_TRUE(top || alternate);
+        }
+    }
+    // The test must contain the ambiguity it claims to recover; otherwise a
+    // corpus on which every top answer is already correct would gate nothing.
+    EXPECT_GT(relativeTop, 0);
 }
 
 // ============================================================================

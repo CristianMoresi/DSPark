@@ -400,6 +400,10 @@ DSPARK_TEST(ChordDetector_invalid_inputs_are_ignored)
     // An invalid re-prepare on a hot detector is a conservative no-op.
     det.prepare(spec(std::numeric_limits<double>::quiet_NaN(), 512, 2));
     det.prepare(spec(-48000.0, 512, 2));
+    // A positive but unusably low rate is invalid for this analyser too:
+    // MIDI 83 cannot sit below Nyquist. Reject it before Goertzel's debug
+    // assertion and preserve the working configuration.
+    det.prepare(spec(1.0, 512, 2));
 
     // Change to F major: the detector must follow.
     feed({ 349.23, 440.00, 523.25 }, 60);

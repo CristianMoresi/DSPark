@@ -37,8 +37,10 @@
  * setConfidenceThreshold() may be called from any thread, and getChord()
  * is a lock-free readout safe from any thread (single packed atomic word,
  * never torn). getChroma() and getFrameCount() expose the shared front end
- * to a second consumer and are NOT cross-thread readouts: they read plain
- * state owned by the thread that pushes samples, and belong to that thread.
+ * to a second consumer and are NOT cross-thread readouts: getChroma() is a
+ * stream-owner reference readout, valid on the thread that pushes samples and
+ * between that thread's own calls, and a caller on any other thread would be
+ * reading it while the owning thread writes it.
  *
  * Dependencies: Goertzel.h, HarmonyConstants.h, AudioSpec.h, AudioBuffer.h,
  * WindowFunctions.h, DspMath.h.
@@ -98,6 +100,9 @@ public:
      *                   (~85 ms) at spec.sampleRate -- 4096 at 44.1/48 kHz,
      *                   8192 at 88.2/96 kHz, 16384 at 176.4/192 kHz.
      *                   Explicit values are clamped to [1024, 16384].
+     *                   Rates that cannot place the highest analysed note
+     *                   (MIDI 83, B5) below Nyquist are rejected and leave a
+     *                   previous valid configuration untouched.
      *
      * REGISTER BOUNDS -- every number below is measured (a sweep of
      * root-position pure-tone major triads, roots MIDI 36..84);
@@ -149,6 +154,9 @@ public:
         // Conservative no-op on invalid specs (NaN rate included): a hot
         // detector keeps its previous configuration instead of going deaf.
         if (!spec.isValid()) return;
+        const double highestNote =
+            440.0 * std::exp2((kFirstMidi + kNumNotes - 1 - 69) / 12.0);
+        if (!(highestNote < spec.sampleRate * 0.5)) return;
         sampleRate_ = spec.sampleRate;
         if (windowSize <= 0)
         {
@@ -270,10 +278,11 @@ public:
      * on prepare(): energy below the leakage floor or above the MIDI 83 bin
      * ceiling is not present in these bins, and adjacent-semitone leakage is.
      *
-     * Returns a reference to state owned by the thread that pushes samples,
-     * which is the one exception to the rule that nothing is read across
-     * threads by reference: it is valid on that thread only, between its own
-     * calls, and a caller on any other thread would be racing the writer.
+     * stream-owner reference readout: the reference is to state owned by the
+     * thread that calls processBlock()/pushSamples(), and it is valid on that
+     * thread only, between that thread's own calls. A caller on any other
+     * thread would be reading these words while the owning thread writes them.
+     * getChord() is the readout for any other thread.
      */
     [[nodiscard]] const std::array<T, 12>& getChroma() const noexcept { return chromaFrame_; }
 

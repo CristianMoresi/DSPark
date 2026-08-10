@@ -40,23 +40,34 @@ Tiers
      written next month -- so the tier keys on the accept guard every seqlock
      reader must contain, and requires each one to say which kind it is.
   G  public const-reference accessors that return member storage, enumerated
-     POSITIVELY by declaration-aware tokenization. Explicit/trailing returns,
-     const-reference aliases, multiline/parenthesized declarators, attributes,
-     qualifiers, reopened/qualified namespace aliases, namespace-scope inline
-     definitions, exact overload association, accessible inherited storage and
-     direct member/subobject returns are covered. Roots qualified by a bounded
-     owner or ancestor retain exact owner, qualifier and member-declaration
-     identities across relative, absolute, namespace and visible class-alias
-     spellings, including complete-class and accessible inherited aliases;
-     out-of-class leading returns use enclosing namespace/global lookup while
+     POSITIVELY by declaration-aware tokenization. One source-wide lexical
+     graph records global, namespace-fragment, class, function, lambda and
+     ordinary-block scopes plus each type fact's declaration point and
+     lifetime. Explicit/trailing returns, const-reference aliases, multiline/
+     parenthesized declarators, attributes, qualifiers, reopened/qualified
+     namespace aliases, namespace-scope inline definitions, exact overload
+     association, accessible inherited storage and direct member/subobject
+     returns are covered. Roots qualified by a bounded owner or ancestor retain
+     exact owner, qualifier and member-declaration identities across relative,
+     absolute, namespace and visible class-alias spellings. Direct owner names
+     and aliases precede one canonical injected base name, which precedes
+     enclosing lexical lookup. Namespace- and type-alias owner components
+     compose without losing canonical identity or exact overload association.
+     Out-of-class leading returns use enclosing namespace/global lookup while
      parameters, trailing returns and bodies use the exact member owner.
      Positive subobjects admit dot/index suffixes and literal std::get forms,
      while custom get calls and post-root pointer arrows remain ordinary
-     negatives. Every return retains exact identity and source position;
-     singular identity is projected only for a uniform complete collection.
-     value, temporary, shadowing
-     parameter and shadowing local returns are excluded. Explicit `this->`
-     remains member-bound. Out-of-class definitions match a unique declaration
+     negatives. Relative std provenance observes class, union, alias,
+     using-declaration and namespace facts at the exact use point and block
+     lifetime; absolute ::std bypasses those shadows. Complete-class lookup is
+     confined to genuine member contexts. Local classes never become census
+     owners. Every return retains exact identity and source position; singular
+     identity is projected only for a uniform complete collection. Nested
+     lambda and local-class bodies own their returns and traversal resumes after
+     them, while ordinary branch/loop/switch blocks remain in the outer method.
+     Value, temporary, shadowing parameter and shadowing local returns are
+     excluded. Explicit `this->` remains member-bound. Out-of-class definitions
+     match a unique declaration
      by parameter types, member cv/ref qualifiers and return type/category;
      ordinary parameter names and declaration-only defaults are ignored. A
      C++ function-type identity normalizes top-level parameter cv, equivalent

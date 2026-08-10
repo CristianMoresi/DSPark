@@ -274,10 +274,11 @@ does that with `getChroma()` / `getChord()`, and `Music/KeyDetector.h` with
 
 `tools/verify_threading_doc.py` enumerates public const-reference accessors
 that return member storage positively. Its dependency-free C++ tokenizer and
-declaration parser resolves explicit and trailing return types, const-reference
-aliases, multiline and parenthesized function names, attributes, member
-qualifiers, direct member/subobject returns, reopened and nested named namespace
-identity, qualified type aliases, direct/chained/nested namespace aliases,
+declaration parser builds one source-wide graph of lexical scopes, declaration
+points and lifetimes, then resolves explicit and trailing return types,
+const-reference aliases, multiline and parenthesized function names, attributes,
+member qualifiers, direct member/subobject returns, reopened and nested named
+namespace identity, qualified type aliases, direct/chained/nested namespace aliases,
 public declarations with namespace-scope inline definitions, accessible
 inherited storage through literal bases or visible non-dependent `using` and
 `typedef` base aliases, and lexical alias shadowing across global, namespace,
@@ -291,21 +292,37 @@ the supported `this->member` and `this->class-id::member` object prefixes.
 Unqualified, ADL-selected, namespace-aliased and custom qualified `get` calls
 remain ordinary call negatives. A relative `std::get` is standard only when
 `std` is unshadowed and denotes the global standard namespace at that exact
-use point; a local type alias, class, namespace or namespace alias named `std`
-makes the call an ordinary 0/0 negative. A later namespace- or non-member-class
-declaration does not retroactively shadow an earlier use. The absolute
+use point; a visible type alias, class, union, namespace, namespace alias or
+using-declaration named `std` makes the call an ordinary 0/0 negative. A block
+declaration begins at its declaration point and stops at that block's end. A
+local class is a block type fact only: it never becomes a class-member identity
+or a census owner. Namespace fragments share one canonical namespace identity,
+but a fact in a later reopened fragment cannot retroactively shadow an earlier
+use. A later namespace- or non-member-class declaration likewise does not
+retroactively shadow an earlier use in the same fragment. The absolute
 `::std::get` spelling is not affected by such local shadows, while an alias to
 `::std` is still not one of the two admitted literal spellings. The
 expression's `class-id` is resolved
 independently at that exact use point and must be the accessor owner or one
-uniquely reachable accessible ancestor. Qualified lookup retains the exact accessor owner,
-qualifier target, data-member owner and member name, so ordinary hiding,
-ambiguous base subobjects, inheritance access and private members cannot be
-replaced by a matching basename. Relative, absolute, namespace-qualified,
+uniquely reachable accessible ancestor. Qualified lookup retains the exact
+accessor owner, qualifier target, data-member owner and member name, so ordinary
+hiding, ambiguous base subobjects, inheritance access and private members cannot
+be replaced by a matching basename. Relative, absolute, namespace-qualified,
 namespace-alias-qualified and visible direct or chained class aliases are
-supported. A namespace-alias prefix is canonicalized before a terminal type
-alias is resolved, so the two alias kinds compose without losing either use
-point or RHS declaration point. Class-member alias access is checked from the
+supported. For an unqualified class-id in a member context, direct owner names
+and aliases are considered first, followed by one canonical injected base-class
+name, and only then enclosing lexical scopes. A direct but unsupported or
+imported type fact is still decisive: it blocks injected-base and enclosing
+lookup instead of allowing a lower-precedence declaration to win. Tokens inside
+a bounded `[[...]]` attribute never introduce declaration-graph facts. The
+injected candidate must name one accessible, non-virtual ancestry path;
+repeated, virtual or inaccessible paths stay fail-closed. A namespace-alias
+prefix is canonicalized before a terminal type alias is resolved, so the two
+alias kinds compose without losing either use point or RHS declaration point.
+Direct and chained type aliases may
+also qualify an out-of-class definition; association still uses their canonical
+original owner and the exact overload, never the alias basename. Class-member
+alias access is checked from the
 owner and its enclosing/ancestor context: public aliases are nameable,
 protected inherited aliases are supported, and own or enclosing private aliases
 remain available, while private/protected access that works only through
@@ -348,11 +365,16 @@ Return roots are bound against parameters and visible block locals before
 member lookup; `this->` explicitly selects the member. Every return in a method
 is retained as an ordered record with its disposition, exact qualifier/member
 identity and return-token offset and line, and every record must bind positively
-for enumeration. Equal returns are not deduplicated. When all records carry one
+for enumeration. Ordinary compound, branch, loop and switch blocks remain part
+of that method. A nested lambda or local-class method owns its own returns, so
+those bodies are skipped and traversal resumes after them; their returns can
+neither create nor contaminate an outer accessor. Equal returns are not
+deduplicated. When all records carry one
 exact identity, the legacy singular identity fields project that value and an
 explicit uniform flag is true. When identities differ, the complete collection
 remains authoritative, the flag is false and all three singular identity fields
-are cleared together rather than selecting a branch by source order. An unsupported owner/ancestor return
+are cleared together rather than selecting a branch by source order. An
+unsupported owner/ancestor return
 diagnoses even beside a bound return, while a bound return mixed only with a
 deliberate negative (an unrelated class, call, namespace object, parameter or
 other non-member) remains an ordinary 0/0 exclusion. Its production-policy
@@ -371,10 +393,12 @@ contract. The rule to carry away is unchanged: a getter that returns a reference
 or raw pointer belongs to the processing thread unless its own documentation
 says otherwise.
 
-The parser's deliberate boundary is named class/struct definitions and named
-namespaces present in the same header, with direct return expressions and
-ordinary parameter or block-local declarations. Base definitions and aliases
-must also be visible in that header. Overload matching removes ordinary
+The parser's deliberate boundary is named class, struct and union type facts and
+named namespaces present in the same header, with direct return expressions and
+ordinary parameter or block-local declarations. Class and struct definitions
+are the ordinary accessor owners; local types remain shadow facts rather than
+owners. Base definitions and aliases must also be visible in that header.
+Overload matching removes ordinary
 top-level parameter names, so those names may differ and a default may appear
 only on the declaration; the resulting structural type identities must agree
 after alias expansion and the parameter adjustments above. Names nested inside
@@ -394,8 +418,11 @@ including the supported `std::get<I>(...)` wrapper, diagnose instead of being
 silently omitted. The controls separately prove that value-return, member-call,
 free-object, private, private-template and qualified namespace free-function
 forms do not raise that diagnostic. Macro-generated declarations, dependent
-bases, imported members and lambda/coroutine returns remain outside the
-positive dependency-free subset. Function-block type aliases are tracked
+bases, imported members and coroutine returns remain outside the positive
+dependency-free subset. Returns inside a nested lambda or local class are
+structurally owned by that callable and deliberately excluded from the outer
+method; this is distinct from treating lambda declarations as accessor owners.
+Function-block type aliases are tracked
 positionally only as shadow facts: a member-like return through one diagnoses,
 the alias stops shadowing at the end of its block, and it is never promoted into
 the positive alias subset. A template-id qualifier, including balanced

@@ -40,16 +40,28 @@ Tiers
      written next month -- so the tier keys on the accept guard every seqlock
      reader must contain, and requires each one to say which kind it is.
   G  public const-reference accessors that return member storage, enumerated
-     POSITIVELY. A stream-owner-only readout carries the marker `stream-owner
-     reference readout` in both its method documentation and the class's
-     Threading block. Existing unmarked sites are an explicit, counted legacy
-     set until their owning audits document them; any new unclassified site is
-     a failure, so the warning set cannot grow silently.
+     POSITIVELY by declaration-aware tokenization. Explicit/trailing returns,
+     const-reference aliases, multiline/parenthesized declarators, attributes,
+     qualifiers and direct member/subobject returns are covered; value,
+     temporary, parameter and local returns are excluded. A stream-owner-only
+     readout carries the marker `stream-owner reference readout` in both its
+     method documentation and the class's Threading block. Existing unmarked
+     sites are an explicit, counted legacy set until their owning audits
+     document them; any new unclassified site is a failure, so the warning set
+     cannot grow silently. The production policy runs its mutation matrix on
+     every invocation.
 """
 
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from threading_reference_parser import (  # noqa: E402
+    find_public_const_reference_accessors,
+    mutation_matrix_cases,
+)
 
 DOC = "docs/threading.md"
 SWEEP_SOURCE = "tests/TestCoreFoundation.cpp"
@@ -556,11 +568,10 @@ else:
 
 
 # A public method that returns a const reference to one of its object's data
-# members exposes storage whose later mutation the caller can observe. The
-# syntax is intentionally found from the declaration and the return statement,
-# not from a list of today's two conforming names: that is what makes this a
-# positive enumeration tier. It is not a C++ parser, but the accepted shape is
-# deliberately narrow and every candidate is printed for review.
+# members exposes storage whose later mutation the caller can observe. A
+# dependency-free tokenizer/parser resolves the declaration and direct return
+# semantics instead of matching one spelling or today's two conforming names.
+# Every candidate is printed for review.
 MARKER_STREAM_OWNER_REF = "stream-owner reference readout"
 
 # These sites pre-date this tier and belong to their component audits. Keeping
@@ -586,83 +597,270 @@ STREAM_OWNER_FOREIGN_READOUT = {
     ("Music/KeyDetector.h", "chroma"): "getKey",
 }
 
-REF_SIGNATURE = re.compile(
-    r"(?m)^[ \t]*(?:\[\[nodiscard\]\][ \t]*)?"
-    r"(?:inline[ \t]+|constexpr[ \t]+|static[ \t]+)*"
-    r"const[ \t]+[^;{}\n]+?&[ \t]*(\w+)[ \t]*"
-    r"\([^;{}]*\)[ \t]*(?:const[ \t]*)?(?:noexcept[ \t]*)?\s*\{")
-
-
-def matching_brace(text, opening):
-    """Index of the brace matching `opening`, or the end of text."""
-    depth = 0
-    for i in range(opening, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return i
-    return len(text) - 1
-
-
-def line_number(text, offset):
-    return text.count("\n", 0, offset) + 1
-
-
-def preceding_doc(text, start):
-    """Contiguous comment block immediately preceding a declaration."""
-    line_start = text.rfind("\n", 0, start) + 1
-    prefix = text[:line_start].splitlines()
-    out = []
-    while prefix:
-        line = prefix[-1]
-        stripped = line.lstrip()
-        if stripped.startswith(("/**", "/*", "*", "//")) or not stripped:
-            out.append(prefix.pop())
-            continue
-        break
-    return "\n".join(reversed(out))
-
-
-def is_public_at(text, offset):
-    """Whether the nearest C++ access label before `offset` is public."""
-    labels = list(re.finditer(r"(?m)^[ \t]*(public|private|protected)[ \t]*:",
-                              text[:offset]))
-    return bool(labels) and labels[-1].group(1) == "public"
-
-
 def reference_accessors(path):
     """Public const-reference functions returning member storage."""
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
-    out = []
-    for match in REF_SIGNATURE.finditer(text):
-        if not is_public_at(text, match.start()):
-            continue
-        opening = text.find("{", match.start(), match.end())
-        end = matching_brace(text, opening)
-        body = text[opening + 1:end]
-        returns = re.findall(r"\breturn\s+([^;]+);", body)
-        # A member name ends in underscore; optional indexing still exposes a
-        # subobject of that member. Calls and temporaries are not candidates.
-        direct_member = r"\b[A-Za-z_]\w*_\s*(?:\[[^;]+\])?\s*$"
-        member_subobject = (
-            r"\b(?:std::)?get\s*<[^;>]+>\s*\(\s*[A-Za-z_]\w*_\s*\)\s*$")
-        if not any(re.search(direct_member, value)
-                   or re.search(member_subobject, value) for value in returns):
-            continue
-        doc_region = preceding_doc(text, match.start())
-        out.append((match.group(1), doc_region, line_number(text, match.start())))
-    return out
+    return [(item.name, item.documentation, item.class_documentation,
+             item.class_definition, item.line)
+            for item in find_public_const_reference_accessors(text)]
+
+
+def reference_policy_issues(label, region, class_documentation, foreign,
+                            foreign_declared):
+    """Apply the production marker/foreign-readout policy to one candidate."""
+    issues = []
+    if MARKER_STREAM_OWNER_REF not in region:
+        issues.append(
+            "{} has no '{}' marker in its method documentation"
+            .format(label, MARKER_STREAM_OWNER_REF))
+        return issues
+    if foreign is None:
+        issues.append(
+            "{} carries the stream-owner marker but has no declared "
+            "foreign-thread publication".format(label))
+        return issues
+    if not foreign_declared:
+        issues.append(
+            "{} names {}() as its foreign-thread publication, but the "
+            "header does not declare it".format(label, foreign))
+    threading = re.search(r"Threading:.*?\*/", class_documentation, re.S)
+    if not threading or MARKER_STREAM_OWNER_REF not in threading.group(0):
+        issues.append(
+            "{} has the marker at the accessor but not in its class "
+            "Threading block".format(label))
+    return issues
 
 
 print("== tier G: stream-owner reference readouts, enumerated positively ==")
+print("  declaration spelling and near-miss mutation matrix (production policy):")
+accepted_matrix, negative_matrix = mutation_matrix_cases(MARKER_STREAM_OWNER_REF)
+for matrix_label, source in accepted_matrix:
+    found_matrix = find_public_const_reference_accessors(source)
+    if len(found_matrix) != 1:
+        failures.append("G: matrix {} was not enumerated exactly once"
+                        .format(matrix_label))
+        continue
+    matrix_item = found_matrix[0]
+    matrix_site = "matrix {} {}()".format(matrix_label, matrix_item.name)
+    issues = reference_policy_issues(
+        matrix_site, matrix_item.documentation, matrix_item.class_documentation,
+        "getPublished",
+        re.search(r"\bgetPublished\s*\(",
+                  matrix_item.class_definition) is not None)
+    if issues:
+        failures.extend("G: matrix correct-marker integration: " + issue
+                        for issue in issues)
+        continue
+    deleted_source = source.replace(
+        "/** {} */".format(MARKER_STREAM_OWNER_REF),
+        "/** same-thread reference */", 1)
+    deleted = find_public_const_reference_accessors(deleted_source)
+    deleted_issues = [] if len(deleted) != 1 else reference_policy_issues(
+        matrix_site, deleted[0].documentation,
+        deleted[0].class_documentation, "getPublished", True)
+    if len(deleted) != 1 or not any("has no" in issue and "marker" in issue
+                                    for issue in deleted_issues):
+        failures.append("G: matrix {} marker deletion did not fail production policy"
+                        .format(matrix_label))
+        continue
+    print("    {}: discovered, classified, marker deletion fails".format(matrix_label))
+
+# A marker on a different class in the same header cannot classify the owner.
+alien_source = accepted_matrix[0][1].replace(
+    "/** Threading: the foreign readout is atomic; this is a {}. */".format(
+        MARKER_STREAM_OWNER_REF),
+    "/** Threading: stream-owner only. */", 1)
+alien_source = ("/** Threading: {}. */\nstruct AlienMarkerOwner {{}};\n".format(
+    MARKER_STREAM_OWNER_REF) + alien_source)
+alien_found = find_public_const_reference_accessors(alien_source)
+alien_issues = [] if len(alien_found) != 1 else reference_policy_issues(
+    "matrix foreign-class-marker explicitAccessor()",
+    alien_found[0].documentation, alien_found[0].class_documentation,
+    "getPublished",
+    re.search(r"\bgetPublished\s*\(",
+              alien_found[0].class_definition) is not None)
+if len(alien_found) != 1 or not any("class Threading block" in issue
+                                    for issue in alien_issues):
+    failures.append("G: a Threading marker on another class satisfied the owner")
+else:
+    print("    foreign-class-marker: rejected (marker belongs to AlienMarkerOwner)")
+
+def check_scoped_alias_case(case_label, source, expected_names):
+    """Require every scoped accessor and make each method marker load-bearing."""
+    found_case = find_public_const_reference_accessors(source)
+    found_by_name = {item.name: item for item in found_case}
+    issues = []
+    for item in found_case:
+        issues.extend(reference_policy_issues(
+            "matrix {} {}()".format(case_label, item.name),
+            item.documentation, item.class_documentation, "getPublished",
+            re.search(r"\bgetPublished\s*\(", item.class_definition) is not None))
+    if (len(found_case) != len(expected_names)
+            or set(found_by_name) != set(expected_names) or issues):
+        failures.append(
+            "G: {} lexical scopes were not all independently enumerated and "
+            "classified (expected {}; found {})".format(
+                case_label, sorted(expected_names), sorted(found_by_name)))
+        return
+    print("    {}: {}/{} independently discovered and classified".format(
+        case_label, len(found_case), len(expected_names)))
+
+    # Delete each accessor marker separately.  Both declarations must remain
+    # in the positive census and only the mutated one may fail policy.  This
+    # makes every scoped discovery, rather than merely the aggregate count,
+    # load-bearing in the production gate.
+    for name in expected_names:
+        marked_comment = "/** {} method:{} */".format(
+            MARKER_STREAM_OWNER_REF, name)
+        if source.count(marked_comment) != 1:
+            failures.append("G: {} has no unique mutation anchor for {}()"
+                            .format(case_label, name))
+            continue
+        mutated_source = source.replace(
+            marked_comment, "/** same-thread reference method:{} */".format(name), 1)
+        mutated = find_public_const_reference_accessors(mutated_source)
+        mutated_by_name = {item.name: item for item in mutated}
+        if (len(mutated) != len(expected_names)
+                or set(mutated_by_name) != set(expected_names)):
+            failures.append("G: {} marker deletion hid a scoped declaration: {}()"
+                            .format(case_label, name))
+            continue
+        target = mutated_by_name[name]
+        target_issues = reference_policy_issues(
+            "matrix {} {}()".format(case_label, name), target.documentation,
+            target.class_documentation, "getPublished", True)
+        other_issues = []
+        for other_name, other in mutated_by_name.items():
+            if other_name != name:
+                other_issues.extend(reference_policy_issues(
+                    "matrix {} {}()".format(case_label, other_name),
+                    other.documentation, other.class_documentation,
+                    "getPublished", True))
+        if (not any("has no" in issue and "marker" in issue
+                    for issue in target_issues) or other_issues):
+            failures.append("G: {} marker deletion was not isolated to {}()"
+                            .format(case_label, name))
+        else:
+            print("      marker deletion for {}() fails only that policy"
+                  .format(name))
+
+
+# Identically named aliases in sibling classes have independent class scopes.
+sibling_alias_source = """
+/** Threading: the publication is atomic; this is a %s. */
+struct IntAliasOwner {
+    using Ref = const int&;
+    /** %s method:intValue */
+    Ref intValue() const { return value_; }
+    int getPublished() const { return 0; }
+private:
+    int value_ = 0;
+};
+/** Threading: the publication is atomic; this is a %s. */
+struct FloatAliasOwner {
+    using Ref = const float&;
+    /** %s method:floatValue */
+    Ref floatValue() const { return value_; }
+    int getPublished() const { return 0; }
+private:
+    float value_ = 0.0f;
+};
+""" % ((MARKER_STREAM_OWNER_REF,) * 4)
+check_scoped_alias_case(
+    "sibling-class-alias", sibling_alias_source,
+    ("intValue", "floatValue"))
+
+# A nested class's same-spelled alias must not erase its outer class's alias.
+nested_alias_source = """
+/** Threading: the publication is atomic; this is a %s. */
+struct OuterAliasOwner {
+    using Ref = const int&;
+    /** Threading: the publication is atomic; this is a %s. */
+    struct InnerAliasOwner {
+        using Ref = const float&;
+        /** %s method:inner */
+        Ref inner() const { return inner_; }
+        int getPublished() const { return 0; }
+    private:
+        float inner_ = 0.0f;
+    };
+    /** %s method:outer */
+    Ref outer() const { return outer_; }
+    int getPublished() const { return 0; }
+private:
+    int outer_ = 0;
+};
+""" % ((MARKER_STREAM_OWNER_REF,) * 4)
+check_scoped_alias_case(
+    "nested-class-alias-shadow", nested_alias_source, ("inner", "outer"))
+
+# Namespace aliases are lexical: siblings do not poison each other.
+sibling_namespace_source = """
+namespace IntNamespace {
+using Ref = const int&;
+/** Threading: the publication is atomic; this is a %s. */
+struct IntOwner {
+    /** %s method:namespaceInt */
+    Ref namespaceInt() const { return value_; }
+    int getPublished() const { return 0; }
+private:
+    int value_ = 0;
+};
+}
+namespace FloatNamespace {
+using Ref = const float&;
+/** Threading: the publication is atomic; this is a %s. */
+struct FloatOwner {
+    /** %s method:namespaceFloat */
+    Ref namespaceFloat() const { return value_; }
+    int getPublished() const { return 0; }
+private:
+    float value_ = 0.0f;
+};
+}
+""" % ((MARKER_STREAM_OWNER_REF,) * 4)
+check_scoped_alias_case(
+    "sibling-namespace-alias", sibling_namespace_source,
+    ("namespaceInt", "namespaceFloat"))
+
+# A namespace-local alias shadows a global alias only inside that namespace.
+global_namespace_shadow_source = """
+using Ref = const int&;
+/** Threading: the publication is atomic; this is a %s. */
+struct GlobalAliasOwner {
+    /** %s method:globalValue */
+    Ref globalValue() const { return value_; }
+    int getPublished() const { return 0; }
+private:
+    int value_ = 0;
+};
+namespace ShadowNamespace {
+using Ref = const float&;
+/** Threading: the publication is atomic; this is a %s. */
+struct NamespaceAliasOwner {
+    /** %s method:namespaceValue */
+    Ref namespaceValue() const { return value_; }
+    int getPublished() const { return 0; }
+private:
+    float value_ = 0.0f;
+};
+}
+""" % ((MARKER_STREAM_OWNER_REF,) * 4)
+check_scoped_alias_case(
+    "global-namespace-alias-shadow", global_namespace_shadow_source,
+    ("globalValue", "namespaceValue"))
+for matrix_label, source in negative_matrix:
+    if find_public_const_reference_accessors(source):
+        failures.append("G: matrix near miss entered the census: " + matrix_label)
+    else:
+        print("    {}: excluded".format(matrix_label))
 reference_sites = []
 marked_sites = set()
 for path in sorted(p for p in SOURCES
                    if p.startswith(FRAMEWORK_DIRS) and p.endswith(".h")):
-    for name, region, line_no in reference_accessors(path):
+    for name, region, class_documentation, class_definition, line_no in \
+            reference_accessors(path):
         site = (path, name)
         reference_sites.append(site)
         label = "{}:{} {}()".format(path, line_no, name)
@@ -670,25 +868,13 @@ for path in sorted(p for p in SOURCES
         if marked:
             marked_sites.add(site)
             print("  MARKED  {}".format(label))
-            if site not in STREAM_OWNER_FOREIGN_READOUT:
-                failures.append(
-                    "G: {} carries the stream-owner marker but has no declared "
-                    "foreign-thread publication in STREAM_OWNER_FOREIGN_READOUT"
-                    .format(label))
-                continue
-            foreign = STREAM_OWNER_FOREIGN_READOUT[site]
-            if not declared_in(foreign, path):
-                failures.append(
-                    "G: {} names {}() as its foreign-thread publication, but the "
-                    "header does not declare it".format(label, foreign))
-            with open(path, "r", encoding="utf-8") as fh:
-                header = fh.read()
-            threading = re.search(r"Threading:.*?(?:\n \*\s*\n|\n \*/)",
-                                  header, re.S)
-            if not threading or MARKER_STREAM_OWNER_REF not in threading.group(0):
-                failures.append(
-                    "G: {} has the marker at the accessor but not in its class "
-                    "Threading block".format(label))
+            foreign = STREAM_OWNER_FOREIGN_READOUT.get(site)
+            failures.extend(
+                "G: " + issue for issue in reference_policy_issues(
+                    label, region, class_documentation, foreign,
+                    foreign is not None and
+                    re.search(r"\b{}\s*\(".format(re.escape(foreign)),
+                              class_definition) is not None))
         elif site in LEGACY_REFERENCE_ACCESSORS:
             print("  LEGACY  {}  <== counted warning: owner audit must mark it"
                   .format(label))

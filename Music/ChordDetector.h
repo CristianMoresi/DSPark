@@ -68,6 +68,12 @@ namespace dspark {
  * @class ChordDetector
  * @brief Monophonic-buffer chord recognition with confidence gating.
  *
+ * Threading: getChord() is the atomic foreign-thread publication. getChroma()
+ * is a stream-owner reference readout and is valid only on the thread that
+ * owns processBlock() / pushSamples(), between that thread's own calls. Calling
+ * getChroma() from another thread while processing runs would race the
+ * non-atomic chroma storage.
+ *
  * @tparam T Sample type (float or double).
  */
 template <FloatType T>
@@ -148,15 +154,18 @@ public:
      *   8 kHz and resolves G3/C4 majors exactly); requests below 1024
      *   clamp INTO 1024 and inherit all of this. Prefer the automatic
      *   window.
+     *
+     * @return true when the specification was accepted and state was reset;
+     *         false when the complete previous state was preserved.
      */
-    void prepare(const AudioSpec& spec, int windowSize = 0)
+    bool prepare(const AudioSpec& spec, int windowSize = 0)
     {
         // Conservative no-op on invalid specs (NaN rate included): a hot
         // detector keeps its previous configuration instead of going deaf.
-        if (!spec.isValid()) return;
+        if (!spec.isValid() || !std::isfinite(spec.sampleRate)) return false;
         const double highestNote =
             440.0 * std::exp2((kFirstMidi + kNumNotes - 1 - 69) / 12.0);
-        if (!(highestNote < spec.sampleRate * 0.5)) return;
+        if (!(spec.sampleRate > highestNote * 2.0)) return false;
         sampleRate_ = spec.sampleRate;
         if (windowSize <= 0)
         {
@@ -193,6 +202,7 @@ public:
 
         prepared_.store(true, std::memory_order_release);
         reset();
+        return true;
     }
 
     /**

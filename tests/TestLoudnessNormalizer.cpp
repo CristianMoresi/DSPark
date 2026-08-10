@@ -20,8 +20,12 @@
 #include "../Analysis/LoudnessNormalizer.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include <type_traits>
 #include <vector>
 
 using namespace dspark;
@@ -112,13 +116,138 @@ void interSampleProgramme(AudioBuffer<float>& b, double sec, float scale)
     }
 }
 
-float maxAbs(const AudioBuffer<float>& b)
+template <typename T, int MaxChannels>
+T maxAbs(const AudioBuffer<T, MaxChannels>& b)
 {
-    float m = 0;
+    T m = T(0);
     for (int ch = 0; ch < b.getNumChannels(); ++ch)
         for (int i = 0; i < b.getNumSamples(); ++i)
             m = std::max(m, std::abs(b.getChannel(ch)[i]));
     return m;
+}
+
+template <typename T, int MaxChannels>
+T truePeakLinear(const AudioBuffer<T, MaxChannels>& b, bool flushTail)
+{
+    TruePeakDetector<T, MaxChannels> detector;
+    T peak = T(0);
+    for (int ch = 0; ch < b.getNumChannels(); ++ch)
+    {
+        for (int i = 0; i < b.getNumSamples(); ++i)
+            peak = std::max(peak, detector.processSample(b.getChannel(ch)[i], ch));
+        if (flushTail)
+            for (int i = 0; i < TruePeakDetector<T, MaxChannels>::getTaps() - 1; ++i)
+                peak = std::max(peak, detector.processSample(T(0), ch));
+    }
+    return peak;
+}
+
+template <typename T, int MaxChannels>
+std::vector<T> snapshot(const AudioBuffer<T, MaxChannels>& b)
+{
+    std::vector<T> result;
+    result.reserve(static_cast<std::size_t>(b.getNumChannels())
+                   * static_cast<std::size_t>(b.getNumSamples()));
+    for (int ch = 0; ch < b.getNumChannels(); ++ch)
+        result.insert(result.end(), b.getChannel(ch),
+                      b.getChannel(ch) + b.getNumSamples());
+    return result;
+}
+
+template <typename T, int MaxChannels>
+bool bitwiseEqual(const AudioBuffer<T, MaxChannels>& b, const std::vector<T>& reference)
+{
+    std::size_t offset = 0;
+    for (int ch = 0; ch < b.getNumChannels(); ++ch)
+    {
+        const auto bytes = static_cast<std::size_t>(b.getNumSamples()) * sizeof(T);
+        if (std::memcmp(b.getChannel(ch), reference.data() + offset, bytes) != 0)
+            return false;
+        offset += static_cast<std::size_t>(b.getNumSamples());
+    }
+    return offset == reference.size();
+}
+
+template <typename T>
+bool finiteResult(const typename LoudnessNormalizer<T>::Result& result)
+{
+    return std::isfinite(result.measuredLUFS)
+        && std::isfinite(result.requestedGainDb)
+        && std::isfinite(result.appliedGainDb)
+        && std::isfinite(result.outLUFS)
+        && std::isfinite(result.outTruePeakDb);
+}
+
+template <typename T, int MaxChannels>
+void verifyNonFiniteMatrix(int runtimeChannels)
+{
+    using Normalizer = LoudnessNormalizer<T>;
+    const std::array<T, 3> poisons {
+        std::numeric_limits<T>::quiet_NaN(),
+        std::numeric_limits<T>::infinity(),
+        -std::numeric_limits<T>::infinity(),
+    };
+    constexpr int numSamples = 31;
+    const int positions[3] = { 0, numSamples / 2, numSamples - 1 };
+    for (int channel = 0; channel < runtimeChannels; ++channel)
+        for (const int position : positions)
+            for (const T poison : poisons)
+            {
+                AudioBuffer<T, MaxChannels> b;
+                b.resize(runtimeChannels, numSamples);
+                for (int ch = 0; ch < runtimeChannels; ++ch)
+                    for (int i = 0; i < numSamples; ++i)
+                        b.getChannel(ch)[i] = static_cast<T>(
+                            0.01 * (1 + ch) + 0.0001 * i);
+                b.getChannel(channel)[position] = poison;
+                const auto before = snapshot(b);
+                Normalizer normalizer;
+                const auto result = normalizer.normalize(b, kFs);
+                EXPECT_TRUE(result.status == Normalizer::Status::NonFiniteInput);
+                EXPECT_TRUE(bitwiseEqual(b, before));
+                EXPECT_TRUE(finiteResult<T>(result));
+                EXPECT_FALSE(result.targetReached);
+                EXPECT_FALSE(result.ceilingLimited);
+                EXPECT_EQ(result.requestedGainDb, T(0));
+                EXPECT_EQ(result.appliedGainDb, T(0));
+            }
+}
+
+template <typename T, int MaxChannels>
+void verifyAllChannelCeiling(int runtimeChannels)
+{
+    using Normalizer = LoudnessNormalizer<T>;
+    const int numSamples = static_cast<int>(0.6 * kFs);
+    std::array<int, 2> positions { 0, runtimeChannels - 1 };
+    const int cases = runtimeChannels == 1 ? 1 : 2;
+    for (int caseIndex = 0; caseIndex < cases; ++caseIndex)
+    {
+        const int decisiveChannel = positions[static_cast<std::size_t>(caseIndex)];
+        AudioBuffer<T, MaxChannels> b;
+        b.resize(runtimeChannels, numSamples);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const T tone = static_cast<T>(
+                0.01 * std::sin(twoPi<double> * 997.0 * i / kFs));
+            b.getChannel(0)[i] = tone;
+            if (runtimeChannels > 1) b.getChannel(1)[i] = tone;
+        }
+        b.getChannel(decisiveChannel)[numSamples / 2] = T(0.8);
+
+        Normalizer normalizer;
+        normalizer.setTargetLUFS(T(0));
+        const auto result = normalizer.normalize(b, kFs);
+        const T oraclePeak = truePeakLinear(b, true);
+        const double oracleDb = 20.0 * std::log10(static_cast<double>(oraclePeak));
+        EXPECT_TRUE(result.status == Normalizer::Status::Success);
+        EXPECT_TRUE(result.ceilingLimited);
+        EXPECT_TRUE(oracleDb <= -1.0);
+        EXPECT_NEAR(static_cast<double>(result.outTruePeakDb), oracleDb, 0.001);
+        EXPECT_TRUE(maxAbs(b) <= T(1));
+        if (runtimeChannels >= 17)
+            std::printf("  [ln] all-channel width=%d decisive=%d TP=%+.6f dBTP\n",
+                        runtimeChannels, decisiveChannel, oracleDb);
+    }
 }
 
 // EBU Tech 3341 signal builders.
@@ -253,7 +382,8 @@ DSPARK_TEST(LoudnessNorm_hits_the_target_when_the_ceiling_allows)
                 ln.setTargetLUFS(static_cast<float>(tgt));
                 ln.setTruePeakCeilingDb(static_cast<float>(ceil));
                 const auto r = ln.normalize(b, kFs);
-                if (r.limiterPasses != 0) continue;   // ceiling bound; see the next case
+                EXPECT_TRUE(r.status == LoudnessNormalizer<float>::Status::Success);
+                if (r.ceilingLimited) continue;   // ceiling bound; see the next case
                 const double err = static_cast<double>(r.outLUFS) - tgt;
                 ++counted;
                 if (std::abs(err) > std::abs(worst)) { worst = err; worstT = tgt; worstC = ceil; }
@@ -261,6 +391,8 @@ DSPARK_TEST(LoudnessNorm_hits_the_target_when_the_ceiling_allows)
                 EXPECT_NEAR(static_cast<double>(r.outLUFS), tgt, 0.1);
                 // The gain the class says it applied must be the gain it applied.
                 EXPECT_NEAR(static_cast<double>(r.appliedGainDb),
+                            tgt - static_cast<double>(r.measuredLUFS), 0.01);
+                EXPECT_NEAR(static_cast<double>(r.requestedGainDb),
                             tgt - static_cast<double>(r.measuredLUFS), 0.01);
             }
     std::printf("  [ln] target grid: %d unbound points, WORST signed error %+.4f LU "
@@ -298,7 +430,8 @@ DSPARK_TEST(LoudnessNorm_true_peak_never_exceeds_the_ceiling)
                 ln.setTargetLUFS(static_cast<float>(tgt));
                 ln.setTruePeakCeilingDb(static_cast<float>(ceil));
                 const auto r = ln.normalize(b, kFs);
-                if (r.limiterPasses > 0) ++engaged;
+                EXPECT_TRUE(r.status == LoudnessNormalizer<float>::Status::Success);
+                if (r.ceilingLimited) ++engaged;
 
                 const double over = static_cast<double>(r.outTruePeakDb) - ceil;
                 if (over > worstOver) { worstOver = over; worstT = tgt; worstC = ceil; }
@@ -310,11 +443,11 @@ DSPARK_TEST(LoudnessNorm_true_peak_never_exceeds_the_ceiling)
                 // about, so it is asserted and not inferred.
                 EXPECT_TRUE(maxAbs(b) <= 1.0f);
                 // The reported true peak must be the buffer's true peak.
-                LoudnessNormalizer<float> probe;
-                EXPECT_NEAR(static_cast<double>(probe.measureTruePeakDb(b)),
-                            static_cast<double>(r.outTruePeakDb), 1e-4);
+                const double oracleDb = 20.0 * std::log10(
+                    static_cast<double>(truePeakLinear(b, true)));
+                EXPECT_NEAR(oracleDb, static_cast<double>(r.outTruePeakDb), 1e-3);
             }
-    std::printf("  [ln] ceiling grid: %d of 36 points engaged the limiter, "
+    std::printf("  [ln] ceiling grid: %d of 36 points selected ceiling gain, "
                 "WORST true peak vs ceiling %+.4f dB at target %.1f / ceiling %.1f, "
                 "worst sample %.6f (%.4f dBFS)\n",
                 engaged, worstOver, worstT, worstC, static_cast<double>(worstSample),
@@ -324,49 +457,44 @@ DSPARK_TEST(LoudnessNorm_true_peak_never_exceeds_the_ceiling)
 }
 
 // ============================================================================
-// The ceiling holds across the whole parameter grid, not only at the defaults:
-// the envelope shape is a preference, the ceiling is a contract.
+// The successful path is one rounded constant multiplication at every sample.
 // ============================================================================
 
-DSPARK_TEST(LoudnessNorm_ceiling_holds_across_the_envelope_grid)
+DSPARK_TEST(LoudnessNorm_is_one_transparent_constant_gain)
 {
-    const double las[4]  = { 0.05, 0.5, 2.0, 5.0 };
-    const double rels[3] = { 10.0, 100.0, 200.0 };
-    double worstOver = -1e9, worstLoss = -1e9;
-    double lossAtShortest = 0.0, lossAtLongest = 0.0;
-
-    for (double la : las)
-        for (double rl : rels)
-        {
-            AudioBuffer<float> b;
-            percussiveProgramme(b, 12.0, 1.0f);
-            LoudnessNormalizer<float> ln;
-            ln.setTargetLUFS(-14.0f);
-            ln.setTruePeakCeilingDb(-1.0f);
-            ln.setLookaheadMs(static_cast<float>(la));
-            ln.setReleaseMs(static_cast<float>(rl));
-            const auto r = ln.normalize(b, kFs);
-            const double over = static_cast<double>(r.outTruePeakDb) + 1.0;
-            const double loss = -14.0 - static_cast<double>(r.outLUFS);
-            worstOver = std::max(worstOver, over);
-            worstLoss = std::max(worstLoss, loss);
-            if (la == 0.5 && rl == 10.0) lossAtShortest = loss;
-            if (la == 0.5 && rl == 200.0) lossAtLongest = loss;
-            EXPECT_TRUE(over <= 0.0);
-        }
-    std::printf("  [ln] envelope grid 4x3: WORST over %+.4f dB, WORST loudness "
-                "shortfall %+.4f LU (short release %.4f, long release %.4f)\n",
-                worstOver, worstLoss, lossAtShortest, lossAtLongest);
-    EXPECT_TRUE(worstOver <= 0.0);
-    // Setters reject what they cannot use and clamp what they can.
+    AudioBuffer<float> b;
+    percussiveProgramme(b, 12.0, 0.4f);
+    const auto before = snapshot(b);
     LoudnessNormalizer<float> ln;
-    ln.setLookaheadMs(1.5f);
-    ln.setLookaheadMs(std::numeric_limits<float>::quiet_NaN());
-    EXPECT_EQ(ln.getLookaheadMs(), 1.5f);
-    ln.setLookaheadMs(1000.0f);
-    EXPECT_EQ(ln.getLookaheadMs(), 50.0f);
-    ln.setReleaseMs(0.0f);
-    EXPECT_EQ(ln.getReleaseMs(), 1.0f);
+    ln.setTargetLUFS(0.0f);
+    const auto r = ln.normalize(b, kFs);
+    EXPECT_TRUE(r.status == LoudnessNormalizer<float>::Status::Success);
+    EXPECT_TRUE(r.ceilingLimited);
+
+    const double gain = std::pow(10.0, static_cast<double>(r.appliedGainDb) / 20.0);
+    double worstResidual = 0.0;
+    double maxReference = 0.0;
+    std::size_t offset = 0;
+    for (int ch = 0; ch < b.getNumChannels(); ++ch)
+        for (int i = 0; i < b.getNumSamples(); ++i, ++offset)
+        {
+            const float reference = static_cast<float>(
+                static_cast<double>(before[offset]) * gain);
+            worstResidual = std::max(worstResidual,
+                std::abs(static_cast<double>(b.getChannel(ch)[i])
+                         - static_cast<double>(reference)));
+            maxReference = std::max(maxReference,
+                                    std::abs(static_cast<double>(reference)));
+        }
+    const double bound = 8.0 * std::numeric_limits<float>::epsilon()
+                       * std::max(1.0, maxReference);
+    std::printf("  [ln] constant gain: requested %+.5f dB, applied %+.5f dB, "
+                "worst rounded-oracle residual %.9g (bound %.9g)\n",
+                static_cast<double>(r.requestedGainDb),
+                static_cast<double>(r.appliedGainDb), worstResidual, bound);
+    EXPECT_TRUE(worstResidual <= bound);
+
+    // Controls reject non-finite requests and clamp the finite ceiling range.
     ln.setTruePeakCeilingDb(5.0f);
     EXPECT_EQ(ln.getTruePeakCeilingDb(), 0.0f);
     ln.setTruePeakCeilingDb(std::numeric_limits<float>::infinity());
@@ -389,27 +517,29 @@ DSPARK_TEST(LoudnessNorm_reports_the_target_it_could_not_reach)
     ln.setTargetLUFS(-9.0f);            // unreachable under a -1 dBTP ceiling here
     ln.setTruePeakCeilingDb(-1.0f);
     const auto r = ln.normalize(b, kFs);
-    std::printf("  [ln] unreachable target: measured %.3f, applied %+.3f dB, "
-                "out %.3f LUFS, TP %.3f dBTP, passes %d, targetReached %d\n",
-                static_cast<double>(r.measuredLUFS), static_cast<double>(r.appliedGainDb),
+    std::printf("  [ln] unreachable target: measured %.3f, requested %+.3f dB, "
+                "applied %+.3f dB, out %.3f LUFS, TP %.3f dBTP, "
+                "ceilingLimited %d, targetReached %d\n",
+                static_cast<double>(r.measuredLUFS),
+                static_cast<double>(r.requestedGainDb),
+                static_cast<double>(r.appliedGainDb),
                 static_cast<double>(r.outLUFS), static_cast<double>(r.outTruePeakDb),
-                r.limiterPasses, static_cast<int>(r.targetReached));
+                static_cast<int>(r.ceilingLimited), static_cast<int>(r.targetReached));
+    EXPECT_TRUE(r.status == LoudnessNormalizer<float>::Status::Success);
     EXPECT_FALSE(r.targetReached);
+    EXPECT_TRUE(r.ceilingLimited);
     EXPECT_LT(static_cast<double>(r.outLUFS), -9.0);
     EXPECT_TRUE(static_cast<double>(r.outTruePeakDb) <= -1.0);
-    EXPECT_GT(r.limiterPasses, 0);
+    EXPECT_LT(r.appliedGainDb, r.requestedGainDb);
 }
 
 DSPARK_TEST(LoudnessNorm_defaults_are_the_broadcast_ones)
 {
     // -23.0 LUFS is the EBU R 128 Programme Loudness Level and -1 dBTP its
-    // maximum permitted true-peak level. The 1 ms release is the independently
-    // measured transparency/loudness selection documented at setReleaseMs().
-    // A change to any default is therefore deliberate and tested here.
+    // maximum permitted true-peak level.
     LoudnessNormalizer<float> ln;
     EXPECT_EQ(ln.getTargetLUFS(), -23.0f);
     EXPECT_EQ(ln.getTruePeakCeilingDb(), -1.0f);
-    EXPECT_EQ(ln.getReleaseMs(), 1.0f);
 }
 
 DSPARK_TEST(LoudnessNorm_degenerate_input_is_survived)
@@ -419,20 +549,27 @@ DSPARK_TEST(LoudnessNorm_degenerate_input_is_survived)
     // Empty buffer, and a rate that is not a rate: no crash, nothing claimed.
     AudioBuffer<float> empty;
     auto r = ln.normalize(empty, kFs);
+    EXPECT_TRUE(r.status == LoudnessNormalizer<float>::Status::EmptyInput);
+    EXPECT_TRUE(finiteResult<float>(r));
     EXPECT_EQ(r.appliedGainDb, 0.0f);
     AudioBuffer<float> b;
     pinkProgramme(b, 2.0, 1.0f);
-    const float before = b.getChannel(0)[1000];
+    const auto before = snapshot(b);
     r = ln.normalize(b, std::numeric_limits<double>::quiet_NaN());
-    EXPECT_EQ(b.getChannel(0)[1000], before);
+    EXPECT_TRUE(r.status == LoudnessNormalizer<float>::Status::InvalidSampleRate);
+    EXPECT_TRUE(bitwiseEqual(b, before));
     r = ln.normalize(b, -1.0);
-    EXPECT_EQ(b.getChannel(0)[1000], before);
+    EXPECT_TRUE(r.status == LoudnessNormalizer<float>::Status::InvalidSampleRate);
+    EXPECT_TRUE(bitwiseEqual(b, before));
 
     // Silence has no gain that makes it -23 LUFS. It is returned untouched
     // rather than amplified until its noise floor measures right.
     AudioBuffer<float> quiet;
     quiet.resize(2, static_cast<int>(kFs * 3.0));
+    const auto quietBefore = snapshot(quiet);
     r = ln.normalize(quiet, kFs);
+    EXPECT_TRUE(r.status == LoudnessNormalizer<float>::Status::NoMeasurableLoudness);
+    EXPECT_TRUE(bitwiseEqual(quiet, quietBefore));
     EXPECT_EQ(r.appliedGainDb, 0.0f);
     EXPECT_EQ(maxAbs(quiet), 0.0f);
 
@@ -444,19 +581,110 @@ DSPARK_TEST(LoudnessNorm_degenerate_input_is_survived)
     r = ln.normalize(mono, kFs);
     std::printf("  [ln] mono 997 Hz: measured %.3f -> out %.3f LUFS\n",
                 static_cast<double>(r.measuredLUFS), static_cast<double>(r.outLUFS));
+    EXPECT_TRUE(r.status == LoudnessNormalizer<float>::Status::Success);
     EXPECT_NEAR(static_cast<double>(r.outLUFS), -23.0, 0.1);
+}
 
-    // Injected non-finite samples must not turn the whole programme into NaN.
-    AudioBuffer<float> nasty;
-    pinkProgramme(nasty, 6.0, 1.0f);
-    nasty.getChannel(0)[5000] = std::numeric_limits<float>::quiet_NaN();
-    nasty.getChannel(1)[9000] = std::numeric_limits<float>::infinity();
-    r = ln.normalize(nasty, kFs);
-    EXPECT_TRUE(std::isfinite(r.outTruePeakDb));
-    int finite = 0;
-    for (int i = 0; i < nasty.getNumSamples(); ++i)
-        if (std::isfinite(nasty.getChannel(0)[i])) ++finite;
-    EXPECT_GT(finite, nasty.getNumSamples() - 10);
+DSPARK_TEST(LoudnessNorm_non_finite_input_is_bitwise_rejected)
+{
+    verifyNonFiniteMatrix<float, 1>(1);
+    verifyNonFiniteMatrix<float, 2>(2);
+    verifyNonFiniteMatrix<float, 6>(6);
+    verifyNonFiniteMatrix<float, 16>(16);
+    verifyNonFiniteMatrix<float, 17>(17);
+    verifyNonFiniteMatrix<float, 20>(20);
+    verifyNonFiniteMatrix<double, 1>(1);
+    verifyNonFiniteMatrix<double, 2>(2);
+    verifyNonFiniteMatrix<double, 6>(6);
+    verifyNonFiniteMatrix<double, 16>(16);
+    verifyNonFiniteMatrix<double, 17>(17);
+    verifyNonFiniteMatrix<double, 20>(20);
+}
+
+DSPARK_TEST(LoudnessNorm_ceiling_covers_every_runtime_channel)
+{
+    verifyAllChannelCeiling<float, 1>(1);
+    verifyAllChannelCeiling<float, 2>(2);
+    verifyAllChannelCeiling<float, 6>(6);
+    verifyAllChannelCeiling<float, 16>(16);
+    verifyAllChannelCeiling<float, 17>(17);
+    verifyAllChannelCeiling<float, 20>(20);
+    verifyAllChannelCeiling<float, 32>(32);
+    verifyAllChannelCeiling<double, 1>(1);
+    verifyAllChannelCeiling<double, 2>(2);
+    verifyAllChannelCeiling<double, 6>(6);
+    verifyAllChannelCeiling<double, 16>(16);
+    verifyAllChannelCeiling<double, 17>(17);
+    verifyAllChannelCeiling<double, 20>(20);
+    verifyAllChannelCeiling<double, 32>(32);
+}
+
+DSPARK_TEST(LoudnessNorm_end_of_programme_inter_sample_peak_is_bounded)
+{
+    constexpr std::array<double, 12> tailPattern {
+        -0.011016845703125, -0.59326171875, 0.453399658203125,
+        -0.679534912109375, 0.8564453125, -0.30316162109375,
+        0.321533203125, -0.90863037109375, 0.855712890625,
+        0.911041259765625, -0.805908203125, 0.87860107421875,
+    };
+    AudioBuffer<double, 1> b;
+    const int numSamples = static_cast<int>(0.6 * kFs);
+    b.resize(1, numSamples);
+    for (int i = 0; i < numSamples; ++i)
+        b.getChannel(0)[i] = 0.01 * std::sin(twoPi<double> * 997.0 * i / kFs);
+    for (std::size_t i = 0; i < tailPattern.size(); ++i)
+        b.getChannel(0)[numSamples - static_cast<int>(tailPattern.size())
+                        + static_cast<int>(i)] = 0.5 * tailPattern[i];
+
+    const double peakWithoutTail = truePeakLinear(b, false);
+    const double peakWithTail = truePeakLinear(b, true);
+    EXPECT_GT(peakWithTail, peakWithoutTail * 1.5);
+
+    LoudnessNormalizer<double> normalizer;
+    normalizer.setTargetLUFS(0.0);
+    const auto result = normalizer.normalize(b, kFs);
+    const double applied = std::pow(10.0, result.appliedGainDb / 20.0);
+    const double expectedSafe = std::pow(10.0, -1.0 / 20.0)
+                              * (1.0 - 1.0e-4) / peakWithTail;
+    const double outputPeak = truePeakLinear(b, true);
+    std::printf("  [ln] end ISP: no-tail %.9f, causal-tail %.9f, "
+                "requested-applied %.3f dB, out %+.6f dBTP\n",
+                peakWithoutTail, peakWithTail,
+                result.requestedGainDb - result.appliedGainDb,
+                20.0 * std::log10(outputPeak));
+    EXPECT_TRUE(result.status == LoudnessNormalizer<double>::Status::Success);
+    EXPECT_TRUE(result.ceilingLimited);
+    EXPECT_GT(result.requestedGainDb - result.appliedGainDb, 6.0);
+    EXPECT_NEAR(applied, expectedSafe, 1e-12);
+    EXPECT_TRUE(20.0 * std::log10(outputPeak) <= -1.0);
+}
+
+DSPARK_TEST(LoudnessNorm_numerical_failures_precede_mutation)
+{
+    AudioBuffer<float> b;
+    pinkProgramme(b, 2.0, 0.2f);
+    const auto before = snapshot(b);
+    LoudnessNormalizer<float> normalizer;
+
+    normalizer.setTargetLUFS(std::numeric_limits<float>::max());
+    auto result = normalizer.normalize(b, kFs);
+    EXPECT_TRUE(result.status == LoudnessNormalizer<float>::Status::NumericalFailure);
+    EXPECT_TRUE(bitwiseEqual(b, before));
+    EXPECT_TRUE(finiteResult<float>(result));
+
+    normalizer.setTargetLUFS(std::numeric_limits<float>::lowest());
+    result = normalizer.normalize(b, kFs);
+    EXPECT_TRUE(result.status == LoudnessNormalizer<float>::Status::NumericalFailure);
+    EXPECT_TRUE(bitwiseEqual(b, before));
+    EXPECT_TRUE(finiteResult<float>(result));
+
+    // A representable gain below -200 dB remains a successful, truthfully
+    // reported constant gain rather than being clipped to a convenience floor.
+    normalizer.setTargetLUFS(-250.0f);
+    result = normalizer.normalize(b, kFs);
+    EXPECT_TRUE(result.status == LoudnessNormalizer<float>::Status::Success);
+    EXPECT_LT(result.appliedGainDb, -200.0f);
+    EXPECT_NEAR(result.appliedGainDb, result.requestedGainDb, 0.001);
 }
 
 DSPARK_TEST(LoudnessNorm_is_deterministic_and_idempotent)

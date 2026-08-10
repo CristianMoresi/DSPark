@@ -273,10 +273,16 @@ does that with `getChroma()` / `getChord()`, and `Music/KeyDetector.h` with
 `chroma()` / `getKey()`.
 
 `tools/verify_threading_doc.py` enumerates public const-reference accessors
-that return member storage positively. It currently finds eight: the two
-marked sites above and six explicit legacy warnings whose component audits
-must document them. A new unmarked site fails the check, so the warning set
-cannot grow silently. `Core/Biquad.h`'s `getCoeffs()` illustrates the hazard:
+that return member storage positively. Its dependency-free C++ tokenizer and
+declaration parser resolves explicit and trailing return types, const-reference
+aliases, multiline and parenthesized declarators, attributes, member
+qualifiers, direct member/subobject returns, and lexical alias shadowing across
+global, namespace, nested-class and sibling-class scopes. Its production-policy
+mutation matrix checks every spelling and scope, marker deletion, and value/
+temporary/parameter/local near miss on every run. It currently finds eight: the two marked sites
+above and six explicit legacy warnings whose component audits must document
+them. A new unmarked site fails the check, so the warning set cannot grow
+silently. `Core/Biquad.h`'s `getCoeffs()` illustrates the hazard:
 it returns a reference straight into the active coefficient set, which the
 processing thread rewrites in `applyPendingCoeffs()`, so a GUI thread reading
 it during a promotion may observe a half-updated set. `Core/ProcessorChain.h`'s

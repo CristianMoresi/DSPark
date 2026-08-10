@@ -202,6 +202,107 @@ AudioSpec keySpec(double sr = kFs)
     return s;
 }
 
+template <typename T>
+struct KeyOrder
+{
+    std::array<double, 24> scores {};
+    std::array<int, 24> ordinals {};
+};
+
+template <typename T>
+KeyOrder<T> independentKeyOrder(
+    const std::array<T, 12>& chroma,
+    typename KeyDetector<T>::Profile profile)
+{
+    using KD = KeyDetector<T>;
+    const bool temperley = profile == KD::Profile::Temperley;
+    const auto& major = temperley ? KD::kTemperleyMajor
+                                  : KD::kKrumhanslKesslerMajor;
+    const auto& minor = temperley ? KD::kTemperleyMinor
+                                  : KD::kKrumhanslKesslerMinor;
+
+    KeyOrder<T> result;
+    double chromaMean = 0.0;
+    for (const T value : chroma) chromaMean += static_cast<double>(value);
+    chromaMean /= 12.0;
+    for (int mode = 0; mode < 2; ++mode)
+    {
+        const auto& weights = mode == 0 ? major : minor;
+        double profileMean = 0.0;
+        for (const double value : weights) profileMean += value;
+        profileMean /= 12.0;
+        for (int tonic = 0; tonic < 12; ++tonic)
+        {
+            double numerator = 0.0;
+            double chromaPower = 0.0;
+            double profilePower = 0.0;
+            for (int pc = 0; pc < 12; ++pc)
+            {
+                const double x = static_cast<double>(
+                    chroma[static_cast<std::size_t>(pc)]) - chromaMean;
+                const double y = weights[static_cast<std::size_t>(
+                    (pc - tonic + 12) % 12)] - profileMean;
+                numerator += x * y;
+                chromaPower += x * x;
+                profilePower += y * y;
+            }
+            const double denominator = std::sqrt(chromaPower * profilePower);
+            result.scores[static_cast<std::size_t>(mode * 12 + tonic)] =
+                denominator > 0.0 ? numerator / denominator : 0.0;
+        }
+    }
+
+    for (int ordinal = 0; ordinal < 24; ++ordinal)
+    {
+        int position = ordinal;
+        while (position > 0
+               && result.scores[static_cast<std::size_t>(ordinal)]
+                  > result.scores[static_cast<std::size_t>(
+                      result.ordinals[static_cast<std::size_t>(position - 1)])])
+        {
+            result.ordinals[static_cast<std::size_t>(position)] =
+                result.ordinals[static_cast<std::size_t>(position - 1)];
+            --position;
+        }
+        result.ordinals[static_cast<std::size_t>(position)] = ordinal;
+    }
+    return result;
+}
+
+template <typename T>
+void expectKeyMatchesOrder(
+    const typename KeyDetector<T>::Key& key,
+    const KeyOrder<T>& order)
+{
+    const int winner = order.ordinals[0];
+    const int runner = order.ordinals[1];
+    EXPECT_EQ(key.tonicPitchClass, winner % 12);
+    EXPECT_EQ(key.isMinor, winner >= 12);
+    EXPECT_EQ(key.runnerUpPitchClass, runner % 12);
+    EXPECT_EQ(key.runnerUpMinor, runner >= 12);
+
+    const int relativePc = (winner % 12 + (winner >= 12 ? 3 : 9)) % 12;
+    const bool relativeMinor = winner < 12;
+    const int relativeOrdinal = (relativeMinor ? 12 : 0) + relativePc;
+    int relativeRank = 0;
+    for (int index = 0; index < 24; ++index)
+        if (order.ordinals[static_cast<std::size_t>(index)] == relativeOrdinal)
+            relativeRank = index + 1;
+    EXPECT_EQ(key.relativeAlternativePitchClass, relativePc);
+    EXPECT_EQ(key.relativeAlternativeMinor, relativeMinor);
+    EXPECT_EQ(key.relativeAlternativeRank, relativeRank);
+    EXPECT_TRUE(relativeRank >= 2 && relativeRank <= 24);
+
+    const double top = order.scores[static_cast<std::size_t>(winner)];
+    const double second = order.scores[static_cast<std::size_t>(runner)];
+    const double expectedConfidence = top > 0.0
+        ? std::clamp((top - second) / top, 0.0, 1.0) : 0.0;
+    const double packingBound = 1.0 / (2.0 * 65535.0)
+                              + 2.0 * std::numeric_limits<T>::epsilon();
+    EXPECT_TRUE(std::abs(static_cast<double>(key.confidence)
+                         - expectedConfidence) <= packingBound);
+}
+
 } // namespace
 
 // ============================================================================
@@ -321,10 +422,11 @@ DSPARK_TEST(Key_all_24_keys_cadence_and_aeolian)
     }
 }
 
-DSPARK_TEST(Key_relative_alternate_recovers_tonic_avoiding_minor)
+DSPARK_TEST(Key_numerical_order_and_relative_policy_are_separate)
 {
     using KD = KeyDetector<float>;
-    int relativeTop = 0;
+    int relativeTop = 0, numericalTopTwo = 0, policyCoverage = 0;
+    int runnerAndPolicyDiffer = 0;
     for (int prof = 0; prof < 2; ++prof)
     {
         KD kd;
@@ -337,22 +439,43 @@ DSPARK_TEST(Key_relative_alternate_recovers_tonic_avoiding_minor)
             const auto audio = renderTonicAvoidingMinor(
                 tonic, kTimbres[1], 58, aeolianCadence);
             const auto key = run(kd, audio);
+            const auto order = independentKeyOrder(kd.chroma(), kd.getProfile());
+            expectKeyMatchesOrder<float>(key, order);
             const bool top = key.tonicPitchClass == tonic && key.isMinor;
-            const bool alternate = key.runnerUpPitchClass == tonic && key.runnerUpMinor;
+            const bool numericalRunner =
+                key.runnerUpPitchClass == tonic && key.runnerUpMinor;
+            const bool policyAlternative =
+                key.relativeAlternativePitchClass == tonic
+                && key.relativeAlternativeMinor;
             const bool relative = key.tonicPitchClass == 3 && !key.isMinor;
             if (relative) ++relativeTop;
-            std::printf("  [key] %-16s %-18s top=%d/%d runner=%d/%d recovery=%d\n",
+            numericalTopTwo += static_cast<int>(top || numericalRunner);
+            policyCoverage += static_cast<int>(top || policyAlternative);
+            runnerAndPolicyDiffer += static_cast<int>(
+                key.runnerUpPitchClass != key.relativeAlternativePitchClass
+                || key.runnerUpMinor != key.relativeAlternativeMinor);
+            std::printf("  [key] %-16s %-18s top=%d/%d runner=%d/%d "
+                        "relative=%d/%d rank=%d numeric-top-two=%d policy-pair=%d\n",
                         prof == 0 ? "KrumhanslKessler" : "Temperley",
                         aeolianCadence ? "i-iv-v-i aeolian" : "i-VI-III-VII",
                         key.tonicPitchClass, static_cast<int>(key.isMinor),
                         key.runnerUpPitchClass, static_cast<int>(key.runnerUpMinor),
-                        static_cast<int>(top || alternate));
-            EXPECT_TRUE(top || alternate);
+                        key.relativeAlternativePitchClass,
+                        static_cast<int>(key.relativeAlternativeMinor),
+                        key.relativeAlternativeRank,
+                        static_cast<int>(top || numericalRunner),
+                        static_cast<int>(top || policyAlternative));
+            EXPECT_TRUE(top || policyAlternative);
         }
     }
-    // The test must contain the ambiguity it claims to recover; otherwise a
-    // corpus on which every top answer is already correct would gate nothing.
+    std::printf("  [key] compact tonic-avoiding diagnostics: numerical-top-two=%d/4 "
+                "relative-pair-coverage=%d/4 runner-policy-different=%d/4\n",
+                numericalTopTwo, policyCoverage, runnerAndPolicyDiffer);
+    // The bed contains real relative confusion and demonstrates that policy
+    // coverage is not a relabelled numerical-runner result.
     EXPECT_GT(relativeTop, 0);
+    EXPECT_EQ(policyCoverage, 4);
+    EXPECT_GT(runnerAndPolicyDiffer, 0);
 }
 
 // ============================================================================
@@ -452,7 +575,8 @@ DSPARK_TEST(Key_auto_window_map_and_non_48k_anchor)
 DSPARK_TEST(Key_result_travels_in_one_word)
 {
     // The published set is multi-word by nature -- tonic, mode, confidence and
-    // the runner-up pair -- and travels as ONE atomic word. Reading it twice
+    // the numerical runner-up and ranked relative pair -- and travels as ONE
+    // atomic word. Reading it twice
     // without new material must give the identical struct, field for field:
     // two independently racing words could not promise that.
     KeyDetector<float> kd;
@@ -466,16 +590,95 @@ DSPARK_TEST(Key_result_travels_in_one_word)
         EXPECT_EQ(k2.isMinor, k1.isMinor);
         EXPECT_EQ(k2.runnerUpPitchClass, k1.runnerUpPitchClass);
         EXPECT_EQ(k2.runnerUpMinor, k1.runnerUpMinor);
+        EXPECT_EQ(k2.relativeAlternativePitchClass,
+                  k1.relativeAlternativePitchClass);
+        EXPECT_EQ(k2.relativeAlternativeMinor, k1.relativeAlternativeMinor);
+        EXPECT_EQ(k2.relativeAlternativeRank, k1.relativeAlternativeRank);
         EXPECT_EQ(k2.confidence, k1.confidence);
     }
     EXPECT_EQ(k1.tonicPitchClass, 7);
     EXPECT_TRUE(k1.isMinor);
-    // The runner-up is populated and is a different key from the winner.
+    // Both alternatives are populated and differ from the winner.
     EXPECT_TRUE(k1.runnerUpPitchClass >= 0);
     EXPECT_TRUE(k1.runnerUpPitchClass != k1.tonicPitchClass || k1.runnerUpMinor != k1.isMinor);
+    EXPECT_TRUE(k1.relativeAlternativePitchClass >= 0);
+    EXPECT_TRUE(k1.relativeAlternativePitchClass != k1.tonicPitchClass
+                || k1.relativeAlternativeMinor != k1.isMinor);
+    EXPECT_TRUE(k1.relativeAlternativeRank >= 2
+                && k1.relativeAlternativeRank <= 24);
     // Quantisation of the confidence into the packed word is bounded by one
     // step of a 16-bit field.
     EXPECT_TRUE(k1.confidence >= 0.0f && k1.confidence <= 1.0f);
+}
+
+DSPARK_TEST(Key_rejected_prepare_preserves_complete_state)
+{
+    using KD = KeyDetector<float>;
+    KD kd;
+    kd.prepare(keySpec(), 0);
+    const auto programme = renderCadence(9, true, kTimbres[1], 56, 2);
+    const auto initialKey = run(kd, programme);
+    EXPECT_TRUE(initialKey.tonicPitchClass >= 0);
+    EXPECT_GT(kd.getFrameCount(), 0u);
+
+    const double highestNote = 440.0 * std::exp2((83 - 69) / 12.0);
+    const double boundary = highestNote * 2.0;
+    std::array<AudioSpec, 7> rejected {
+        keySpec(std::nextafter(boundary, 0.0)),
+        keySpec(boundary),
+        keySpec(std::numeric_limits<double>::quiet_NaN()),
+        keySpec(std::numeric_limits<double>::infinity()),
+        keySpec(-1.0),
+        AudioSpec { 48000.0, 0, 1 },
+        AudioSpec { 48000.0, 512, 0 },
+    };
+    for (const auto& spec : rejected)
+    {
+        const auto beforeKey = kd.getKey();
+        const auto beforeChroma = kd.chroma();
+        const auto beforeFrames = kd.getFrameCount();
+        const int beforeWindow = kd.getWindowSize();
+        kd.prepare(spec, 0);
+        const auto after = kd.getKey();
+        EXPECT_EQ(kd.getWindowSize(), beforeWindow);
+        EXPECT_EQ(kd.getFrameCount(), beforeFrames);
+        EXPECT_TRUE(kd.chroma() == beforeChroma);
+        EXPECT_EQ(after.tonicPitchClass, beforeKey.tonicPitchClass);
+        EXPECT_EQ(after.isMinor, beforeKey.isMinor);
+        EXPECT_EQ(after.confidence, beforeKey.confidence);
+        EXPECT_EQ(after.runnerUpPitchClass, beforeKey.runnerUpPitchClass);
+        EXPECT_EQ(after.runnerUpMinor, beforeKey.runnerUpMinor);
+        EXPECT_EQ(after.relativeAlternativePitchClass,
+                  beforeKey.relativeAlternativePitchClass);
+        EXPECT_EQ(after.relativeAlternativeMinor,
+                  beforeKey.relativeAlternativeMinor);
+        EXPECT_EQ(after.relativeAlternativeRank,
+                  beforeKey.relativeAlternativeRank);
+
+        // Rejection must also preserve the prepared bit. A detector that kept
+        // the snapshot but silently unprepared itself would fail to advance on
+        // this valid continuation.
+        std::vector<float> continuation(
+            static_cast<std::size_t>(beforeWindow * 2), 0.0f);
+        for (std::size_t i = 0; i < continuation.size(); ++i)
+            continuation[i] = 0.15f * static_cast<float>(
+                std::sin(twoPi<double> * 440.0 * static_cast<double>(i) / kFs));
+        kd.pushSamples(std::span<const float>(continuation.data(),
+                                              continuation.size()));
+        EXPECT_GT(kd.getFrameCount(), beforeFrames);
+    }
+
+    const double firstValid = std::nextafter(boundary,
+                                              std::numeric_limits<double>::infinity());
+    kd.prepare(keySpec(firstValid), 0);
+    const auto fresh = kd.getKey();
+    EXPECT_EQ(kd.getWindowSize(), 1024);
+    EXPECT_EQ(kd.getFrameCount(), 0u);
+    EXPECT_EQ(fresh.tonicPitchClass, -1);
+    EXPECT_EQ(fresh.runnerUpPitchClass, -1);
+    EXPECT_EQ(fresh.relativeAlternativePitchClass, -1);
+    EXPECT_EQ(fresh.relativeAlternativeRank, 0);
+    for (const float value : kd.chroma()) EXPECT_EQ(value, 0.0f);
 }
 
 DSPARK_TEST(Key_confidence_is_zero_without_tonal_evidence)

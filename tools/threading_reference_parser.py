@@ -53,6 +53,11 @@ class NamespaceRegion:
 class FunctionSignature:
     name: str
     const_reference: bool
+    return_type: tuple
+    parameter_types: tuple
+    member_const: bool
+    member_volatile: bool
+    ref_qualifier: str
     name_start: int
     parameters_open: int
     parameters_close: int
@@ -79,6 +84,17 @@ _NON_FUNCTION_NAMES = {
 _RETURN_SPECIFIERS = {
     "consteval", "constexpr", "explicit", "extern", "friend", "inline",
     "static", "virtual",
+}
+
+_PARAMETER_TYPE_KEYWORDS = {
+    "auto", "bool", "char", "char8_t", "char16_t", "char32_t",
+    "decltype", "double", "float", "int", "long", "short", "signed",
+    "unsigned", "void", "wchar_t",
+}
+
+_PARAMETER_NON_NAMES = _PARAMETER_TYPE_KEYWORDS | {
+    "class", "const", "enum", "register", "restrict", "struct",
+    "typename", "volatile",
 }
 
 
@@ -465,6 +481,148 @@ def _is_const_lvalue_reference(values, aliases):
     return "&" in values and "&&" not in values and "const" in values
 
 
+def _qualified_owner_start(signature, name_start):
+    """Return the first token of the owner preceding a qualified function."""
+    cursor = name_start - 1
+    while cursor >= 1 and signature[cursor].text == "::":
+        owner = signature[cursor - 1].text
+        if not owner or not _is_identifier_start(owner[0]):
+            break
+        cursor -= 2
+    if cursor >= 0 and signature[cursor].text == "::":
+        cursor -= 1
+    return cursor + 1
+
+
+def _canonical_type_tokens(values, aliases):
+    values = [value for value in _strip_attributes(values)
+              if value not in _RETURN_SPECIFIERS]
+    return tuple(_expand_aliases(values, aliases))
+
+
+def _ordinary_parameter_name_index(values):
+    """Find the declarator name in the supported ordinary parameter subset.
+
+    Only a top-level ordinary name is removed. A nested declarator stays in
+    the key verbatim, and a sole user-defined type is never mistaken for a
+    name.
+    """
+    parens = brackets = angles = 0
+    candidates = []
+    for index, value in enumerate(values):
+        if value == "(":
+            parens += 1
+        elif value == ")":
+            parens -= 1
+        elif value == "[":
+            brackets += 1
+        elif value == "]":
+            brackets -= 1
+        elif value == "<":
+            angles += 1
+        elif value == ">" and angles:
+            angles -= 1
+        elif value == ">>" and angles >= 2:
+            angles -= 2
+        elif (parens == brackets == angles == 0 and value
+              and _is_identifier_start(value[0])
+              and value not in _PARAMETER_NON_NAMES
+              and (index == 0 or values[index - 1] != "::")
+              and (index + 1 == len(values) or values[index + 1] != "::")):
+            candidates.append(index)
+
+    if parens or brackets or angles:
+        return None
+    if len(candidates) >= 2:
+        return candidates[-1]
+    if not candidates:
+        return -1
+
+    candidate = candidates[0]
+    prefix = values[:candidate]
+    if candidate and values[candidate - 1] in {
+            "class", "enum", "struct", "typename"}:
+        return -1
+    has_type_evidence = any(
+        value in _PARAMETER_TYPE_KEYWORDS
+        or value in ("*", "&", "&&", ">", ">>", ")")
+        or (value and _is_identifier_start(value[0])
+            and value not in {"const", "volatile", "typename"})
+        for value in prefix
+    )
+    return candidate if has_type_evidence else -1
+
+
+def _canonical_parameter_types(signature, parameter_open, parameter_close,
+                               aliases):
+    parameters = signature[parameter_open + 1:parameter_close]
+    parts = _top_level_parts(parameters, ",")
+    if len(parts) == 1 and not parts[0]:
+        return ()
+
+    output = []
+    for parameter in parts:
+        default_parts = _top_level_parts(parameter, "=")
+        values = _strip_attributes(
+            [token.text for token in default_parts[0]])
+        if not values:
+            return None
+        name_index = _ordinary_parameter_name_index(values)
+        if name_index is None:
+            return None
+        if name_index >= 0:
+            del values[name_index]
+        canonical = _canonical_type_tokens(values, aliases)
+        if not canonical:
+            return None
+        output.append(canonical)
+    if len(output) == 1 and output[0] == ("void",):
+        return ()
+    return tuple(output)
+
+
+def _member_qualifiers(signature, parameter_close):
+    member_const = False
+    member_volatile = False
+    ref_qualifier = ""
+    parens = brackets = attributes = 0
+    for token in signature[parameter_close + 1:]:
+        value = token.text
+        if value == "[[":
+            attributes += 1
+            continue
+        if value == "]]" and attributes:
+            attributes -= 1
+            continue
+        if attributes:
+            continue
+        parens += (value == "(") - (value == ")")
+        brackets += (value == "[") - (value == "]")
+        if parens or brackets:
+            continue
+        if value in ("->", "requires"):
+            break
+        if value == "const":
+            member_const = True
+        elif value == "volatile":
+            member_volatile = True
+        elif value in ("&", "&&"):
+            ref_qualifier = value
+    return member_const, member_volatile, ref_qualifier
+
+
+def _signature_key(details):
+    return (
+        details.name,
+        details.parameter_types,
+        details.member_const,
+        details.member_volatile,
+        details.ref_qualifier,
+        details.return_type,
+        details.const_reference,
+    )
+
+
 def _function_signature_details(signature, aliases):
     """Return the supported function-declaration details or ``None``."""
     if not signature:
@@ -517,7 +675,23 @@ def _function_signature_details(signature, aliases):
     if not candidates:
         return None
 
-    name, name_start, _, parameter_close = candidates[-1]
+    selected = candidates[-1]
+    nesting = 0
+    initializer_colon = None
+    for index, token in enumerate(signature):
+        value = token.text
+        nesting += (value in ("(", "[", "{"))
+        nesting -= (value in (")", "]", "}"))
+        if value == ":" and nesting == 0:
+            initializer_colon = index
+            break
+    if initializer_colon is not None:
+        before_initializer = [candidate for candidate in candidates
+                              if candidate[3] < initializer_colon]
+        if before_initializer:
+            selected = before_initializer[-1]
+
+    name, name_start, parameter_open, parameter_close = selected
     trailing = None
     qualifier_depth = 0
     for index in range(parameter_close + 1, len(signature)):
@@ -531,12 +705,24 @@ def _function_signature_details(signature, aliases):
         if "requires" in return_values:
             return_values = return_values[:return_values.index("requires")]
     else:
-        return_values = [token.text for token in signature[:name_start]]
+        owner_start = _qualified_owner_start(signature, name_start)
+        return_values = [token.text for token in signature[:owner_start]]
+    parameter_types = _canonical_parameter_types(
+        signature, parameter_open, parameter_close, aliases)
+    if parameter_types is None:
+        return None
+    member_const, member_volatile, ref_qualifier = _member_qualifiers(
+        signature, parameter_close)
     return FunctionSignature(
         name=name,
         const_reference=_is_const_lvalue_reference(return_values, aliases),
+        return_type=_canonical_type_tokens(return_values, aliases),
+        parameter_types=parameter_types,
+        member_const=member_const,
+        member_volatile=member_volatile,
+        ref_qualifier=ref_qualifier,
         name_start=name_start,
-        parameters_open=candidates[-1][2],
+        parameters_open=parameter_open,
         parameters_close=parameter_close,
     )
 
@@ -1142,13 +1328,15 @@ def find_public_const_reference_accessors(text):
                                classes_by_identity)
         if owner is None:
             continue
-        declared = [item for item in declarations[owner].get(
-            preliminary.name, ()) if item[0].const_reference]
-        if not declared:
-            continue
         aliases = alias_contexts[owner]
         details = _function_signature_details(signature, aliases)
-        if details is None:
+        if details is None or not details.const_reference:
+            continue
+        declared = [
+            item for item in declarations[owner].get(details.name, ())
+            if _signature_key(item[0]) == _signature_key(details)
+        ]
+        if len(declared) != 1 or not declared[0][0].const_reference:
             continue
         body_close = brace_pairs[opening]
         body = tokens[opening + 1:body_close]
@@ -1165,7 +1353,7 @@ def find_public_const_reference_accessors(text):
         class_definition = text[tokens[owner.declaration].start:
                                 tokens[owner.closing].end]
         output.append(ReferenceAccessor(
-            name=preliminary.name,
+            name=details.name,
             documentation=documentation,
             class_documentation=class_documentation,
             class_definition=class_definition,
@@ -1233,6 +1421,26 @@ private:
 };
 """ % (marker, marker, signature, body)
 
+    def overload_source(owner, sibling_declaration, matched_declaration,
+                        definition):
+        return """
+/** Threading: the foreign readout is atomic; this is a %s. */
+struct %s {
+    /** %s sibling overload */
+    %s
+    /** %s */
+    %s
+    int getPublished() const { return 0; }
+private:
+    int storage_ = 0;
+};
+%s
+{
+    return storage_;
+}
+""" % (marker, owner, marker, sibling_declaration, marker,
+       matched_declaration, definition)
+
     accepted_sources = [(label, source_for(signature, body))
                         for label, signature, body in accepted]
     accepted_sources.append((
@@ -1297,6 +1505,26 @@ inline const int& OutOfClassOwner::outOfClassAccessor() const noexcept
     return storage_;
 }
 """ % (marker, marker)),
+        ("out-of-class-arity-overload", overload_source(
+            "ArityOverloadOwner",
+            "const int& state(int sibling) const;",
+            "const int& state() const;",
+            "inline const int& ArityOverloadOwner::state() const")),
+        ("out-of-class-type-default-name-overload", overload_source(
+            "TypeOverloadOwner",
+            "const int& state(int sibling) const;",
+            "const int& state(double declared = 0.0) const;",
+            "inline const int& TypeOverloadOwner::state(double defined) const")),
+        ("out-of-class-ref-qualifier-overload", overload_source(
+            "RefOverloadOwner",
+            "const int& state() const &;",
+            "const int& state() const &&;",
+            "inline const int& RefOverloadOwner::state() const &&")),
+        ("out-of-class-cv-qualifier-overload", overload_source(
+            "CvOverloadOwner",
+            "const volatile int& state() const;",
+            "const volatile int& state() const volatile;",
+            "inline const volatile int& CvOverloadOwner::state() const volatile")),
         ("inherited-member", """
 struct StorageBase { protected: int storage_ = 0; };
 /** Threading: the foreign readout is atomic; this is a %s. */
@@ -1307,9 +1535,110 @@ struct InheritedOwner : StorageBase {
 };
 """ % (marker, marker)),
     ])
-    return (accepted_sources,
-            [(label, source_for(signature, body))
-             for label, signature, body in near_misses])
+    near_miss_sources = [(label, source_for(signature, body))
+                         for label, signature, body in near_misses]
+    near_miss_sources.extend([
+        ("out-of-class-value-return-overload", """
+/** Threading: the foreign readout is atomic; this is a %s. */
+struct ValueReturnOverloadOwner {
+    /** %s sibling overload */
+    const int& state(int sibling) const;
+    int state() const;
+    int getPublished() const { return 0; }
+private:
+    int storage_ = 0;
+};
+inline int ValueReturnOverloadOwner::state() const
+{
+    return storage_;
+}
+""" % (marker, marker)),
+        ("out-of-class-ambiguous-exact-declarations", """
+/** Threading: the foreign readout is atomic; this is a %s. */
+struct AmbiguousOverloadOwner {
+    /** %s first declaration */
+    const int& state() const;
+    /** %s second declaration */
+    const int& state() const;
+    int getPublished() const { return 0; }
+private:
+    int storage_ = 0;
+};
+inline const int& AmbiguousOverloadOwner::state() const
+{
+    return storage_;
+}
+""" % (marker, marker, marker)),
+    ])
+    return accepted_sources, near_miss_sources
+
+
+def overload_association_cases(marker):
+    """Return exact metadata expectations for out-of-class overloads."""
+    return (
+        (
+            "unoverloaded-control",
+            """
+/** Threading: the publication is atomic; this is a %s. */
+struct Owner {
+  /** %s: the reference is stream-owned. */
+  const int& state() const;
+private:
+  int storage_ = 0;
+};
+inline const int& Owner::state() const { return storage_; }
+""" % (marker, marker),
+            1, True, 5,
+        ),
+        (
+            "arity-overload-does-not-borrow-marker",
+            """
+/** Threading: the publication is atomic; this is a %s. */
+struct Owner {
+  /** %s: marked overload. */
+  const int& state(int) const;
+  /** Ordinary unmarked overload. */
+  const int& state() const;
+private:
+  int storage_ = 0;
+};
+inline const int& Owner::state() const { return storage_; }
+""" % (marker, marker),
+            1, False, 7,
+        ),
+        (
+            "type-overload-does-not-borrow-marker",
+            """
+/** Threading: the publication is atomic; this is a %s. */
+struct Owner {
+  /** %s: marked overload. */
+  const int& state(int) const;
+  /** Ordinary unmarked overload. */
+  const int& state(double) const;
+private:
+  int storage_ = 0;
+};
+inline const int& Owner::state(double) const { return storage_; }
+""" % (marker, marker),
+            1, False, 7,
+        ),
+        (
+            "ref-qualifier-overload-does-not-borrow-marker",
+            """
+/** Threading: the publication is atomic; this is a %s. */
+struct Owner {
+  /** %s: marked overload. */
+  const int& state() const &;
+  /** Ordinary unmarked overload. */
+  const int& state() const &&;
+private:
+  int storage_ = 0;
+};
+inline const int& Owner::state() const && { return storage_; }
+""" % (marker, marker),
+            1, False, 7,
+        ),
+    )
 
 
 def run_mutation_matrix(marker):

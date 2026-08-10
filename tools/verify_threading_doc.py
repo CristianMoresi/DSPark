@@ -43,9 +43,12 @@ Tiers
      POSITIVELY by declaration-aware tokenization. Explicit/trailing returns,
      const-reference aliases, multiline/parenthesized declarators, attributes,
      qualifiers, reopened/qualified namespace aliases, namespace-scope inline
-     definitions, accessible inherited storage and direct member/subobject
-     returns are covered; value, temporary, shadowing parameter and shadowing
-     local returns are excluded. Explicit `this->` remains member-bound. A
+     definitions, exact overload association, accessible inherited storage and
+     direct member/subobject returns are covered; value, temporary, shadowing
+     parameter and shadowing local returns are excluded. Explicit `this->`
+     remains member-bound. Out-of-class definitions match a unique declaration
+     by parameter types, member cv/ref qualifiers and return type/category;
+     ordinary parameter names and declaration-only defaults are ignored. A
      stream-owner-only readout carries the marker `stream-owner reference readout`
      in both its
      method documentation and the class's Threading block. Existing unmarked
@@ -64,6 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from threading_reference_parser import (  # noqa: E402
     find_public_const_reference_accessors,
     mutation_matrix_cases,
+    overload_association_cases,
 )
 
 DOC = "docs/threading.md"
@@ -636,6 +640,39 @@ def reference_policy_issues(label, region, class_documentation, foreign,
 
 
 print("== tier G: stream-owner reference readouts, enumerated positively ==")
+print("  exact out-of-class overload association matrix:")
+for (matrix_label, source, expected_count, expected_marker,
+     expected_line) in overload_association_cases(MARKER_STREAM_OWNER_REF):
+    found_matrix = find_public_const_reference_accessors(source)
+    actual_marker = bool(
+        found_matrix
+        and MARKER_STREAM_OWNER_REF in found_matrix[0].documentation)
+    actual_line = found_matrix[0].line if found_matrix else None
+    if (len(found_matrix) != expected_count
+            or actual_marker != expected_marker
+            or actual_line != expected_line):
+        failures.append(
+            "G: overload matrix {} expected count/marker/line {}/{}/{}, "
+            "found {}/{}/{}".format(
+                matrix_label, expected_count, int(expected_marker),
+                expected_line, len(found_matrix), int(actual_marker),
+                actual_line))
+        continue
+    policy_issues = reference_policy_issues(
+        "overload matrix {} state()".format(matrix_label),
+        found_matrix[0].documentation, found_matrix[0].class_documentation,
+        "getPublished", True)
+    has_missing_marker = any(
+        "has no" in issue and "marker" in issue for issue in policy_issues)
+    if has_missing_marker == expected_marker:
+        failures.append(
+            "G: overload matrix {} did not make only the matched method "
+            "marker load-bearing".format(matrix_label))
+        continue
+    print("    {}: count={}, marker={}, line={}, policy={}".format(
+        matrix_label, len(found_matrix), int(actual_marker), actual_line,
+        "classified" if expected_marker else "missing-marker rejection"))
+
 print("  declaration spelling and near-miss mutation matrix (production policy):")
 accepted_matrix, negative_matrix = mutation_matrix_cases(MARKER_STREAM_OWNER_REF)
 for matrix_label, source in accepted_matrix:

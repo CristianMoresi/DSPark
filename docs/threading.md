@@ -275,16 +275,23 @@ does that with `getChroma()` / `getChord()`, and `Music/KeyDetector.h` with
 `tools/verify_threading_doc.py` enumerates public const-reference accessors
 that return member storage positively. Its dependency-free C++ tokenizer and
 declaration parser resolves explicit and trailing return types, const-reference
-aliases, multiline and parenthesized declarators, attributes, member
+aliases, multiline and parenthesized function names, attributes, member
 qualifiers, direct member/subobject returns, reopened and nested named namespace
 identity, qualified aliases, public declarations with namespace-scope inline
 definitions, accessible inherited storage, and lexical alias shadowing across
-global, namespace, nested-class and sibling-class scopes. Return roots are
-bound against parameters and visible block locals before member lookup;
-`this->` explicitly selects the member. Its production-policy mutation matrix
-checks every spelling, scope and binding, isolated marker deletion, and value/
-temporary/parameter/local near miss on every run. It currently finds eight: the
-two marked sites
+global, namespace, nested-class and sibling-class scopes. A namespace-scope
+definition is associated only when exactly one public declaration has the same
+function name, return type and reference category, ordinary parameter-type
+sequence, member `const`/`volatile` qualification, and `&`/`&&` ref qualifier.
+Parameter names and declaration-only default arguments are ignored, and visible
+type aliases are expanded. An arity, parameter-type, cv/ref or value-return
+sibling therefore cannot lend its documentation, source line or public access
+to the definition; zero or multiple exact matches are rejected conservatively.
+Return roots are bound against parameters and visible block locals before
+member lookup; `this->` explicitly selects the member. Its production-policy
+mutation matrix checks every spelling, overload association, scope and binding,
+isolated marker deletion, and value/temporary/parameter/local near miss on every
+run. It currently finds eight: the two marked sites
 above and six explicit legacy warnings whose component audits must document
 them. A new unmarked site fails the check, so the warning set cannot grow
 silently. `Core/Biquad.h`'s `getCoeffs()` illustrates the hazard:
@@ -300,11 +307,16 @@ says otherwise.
 The parser's deliberate boundary is named class/struct definitions and named
 namespaces present in the same header, with direct return expressions and
 ordinary parameter or block-local declarations. Base definitions and aliases
-must also be visible in that header. Macro-generated declarations, dependent
-bases, imported members, lambda/coroutine returns and forms that require
-template instantiation are outside this dependency-free subset; a public
-reference accessor may not use one of those forms until the gate is extended
-with a positive fixture for it.
+must also be visible in that header. Overload matching removes ordinary
+top-level parameter names, so those names may differ and a default may appear
+only on the declaration; the remaining type tokens must agree after alias
+expansion. Names nested inside parenthesized declarators remain in the key, so
+different spellings are rejected rather than guessed. Macro-generated
+declarations, dependent bases, imported members, lambda/coroutine returns and
+forms that require template instantiation are outside this dependency-free
+subset. Those forms are not associated by declaration order; a public
+reference accessor may not use one until the gate is extended with a positive
+fixture for it.
 
 ## Blocking
 

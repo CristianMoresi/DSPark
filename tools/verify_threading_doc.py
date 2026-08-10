@@ -44,7 +44,11 @@ Tiers
      const-reference aliases, multiline/parenthesized declarators, attributes,
      qualifiers, reopened/qualified namespace aliases, namespace-scope inline
      definitions, exact overload association, accessible inherited storage and
-     direct member/subobject returns are covered; value, temporary, shadowing
+     direct member/subobject returns are covered. Roots qualified by a bounded
+     owner or ancestor retain exact owner, qualifier and member-declaration
+     identities across relative, absolute, namespace and visible class-alias
+     spellings, including complete-class and accessible inherited aliases;
+     value, temporary, shadowing
      parameter and shadowing local returns are excluded. Explicit `this->`
      remains member-bound. Out-of-class definitions match a unique declaration
      by parameter types, member cv/ref qualifiers and return type/category;
@@ -84,6 +88,7 @@ from threading_reference_parser import (  # noqa: E402
     find_public_const_reference_accessors,
     mutation_matrix_cases,
     overload_association_cases,
+    qualified_owner_ancestor_association_cases,
 )
 
 DOC = "docs/threading.md"
@@ -665,6 +670,82 @@ def reference_policy_issues(label, region, class_documentation, foreign,
 
 
 print("== tier G: stream-owner reference readouts, enumerated positively ==")
+print("  qualified owner/ancestor invariant matrix:")
+qualified_cases = qualified_owner_ancestor_association_cases(
+    MARKER_STREAM_OWNER_REF)
+if len(qualified_cases) != 128 or len({case.label for case in qualified_cases}) != 128:
+    failures.append(
+        "G: qualified owner/ancestor matrix must contain 128 unique cells")
+for qualified_case in qualified_cases:
+    found_matrix, parse_diagnostics = \
+        analyze_public_const_reference_accessors(qualified_case.source)
+    metadata = [] if len(found_matrix) != 1 else [
+        found_matrix[0].line,
+        found_matrix[0].access,
+        found_matrix[0].accessor_owner,
+        found_matrix[0].qualifier_target,
+        found_matrix[0].member_declaring_owner,
+        found_matrix[0].member_name,
+    ]
+    expected_metadata = [
+        qualified_case.expected_line,
+        "public",
+        qualified_case.accessor_owner,
+        qualified_case.qualifier_target,
+        qualified_case.member_declaring_owner,
+        qualified_case.member_name,
+    ]
+    if (parse_diagnostics or len(found_matrix) != 1
+            or metadata != expected_metadata):
+        failures.append(
+            "G: qualified matrix {} expected exact owner/qualifier/member "
+            "metadata {}, found {} with {} diagnostics".format(
+                qualified_case.label, expected_metadata, metadata,
+                len(parse_diagnostics)))
+        continue
+    item = found_matrix[0]
+    policy_issues = reference_policy_issues(
+        "qualified matrix {} state()".format(qualified_case.label),
+        item.documentation, item.class_documentation, "getPublished", True)
+    if policy_issues:
+        failures.extend("G: qualified matrix: " + issue
+                        for issue in policy_issues)
+        continue
+    if qualified_case.source.count(qualified_case.deletion_anchor) != 1:
+        failures.append(
+            "G: qualified matrix {} has no unique method marker".format(
+                qualified_case.label))
+        continue
+    deleted_source = qualified_case.source.replace(
+        qualified_case.deletion_anchor,
+        "/** ordinary matched declaration after mutation */", 1)
+    deleted, deleted_diagnostics = \
+        analyze_public_const_reference_accessors(deleted_source)
+    deleted_issues = [] if len(deleted) != 1 else reference_policy_issues(
+        "qualified deletion {} state()".format(qualified_case.label),
+        deleted[0].documentation, deleted[0].class_documentation,
+        "getPublished", True)
+    deletion_isolated = (
+        not deleted_diagnostics
+        and len(deleted) == 1
+        and deleted[0].line == qualified_case.expected_line
+        and deleted[0].accessor_owner == qualified_case.accessor_owner
+        and deleted[0].qualifier_target == qualified_case.qualifier_target
+        and deleted[0].member_declaring_owner
+            == qualified_case.member_declaring_owner
+        and deleted[0].member_name == qualified_case.member_name
+        and MARKER_STREAM_OWNER_REF not in deleted[0].documentation
+        and deleted_source.count(MARKER_STREAM_OWNER_REF) >= 2
+        and any("has no" in issue and "marker" in issue
+                for issue in deleted_issues)
+    )
+    if not deletion_isolated:
+        failures.append(
+            "G: qualified matrix {} method-marker deletion was not isolated"
+            .format(qualified_case.label))
+print("    {} cells: exact binding metadata and isolated marker deletion"
+      .format(len(qualified_cases)))
+
 print("  exact out-of-class overload association matrix:")
 for (matrix_label, source, expected_count, expected_marker,
      expected_line) in overload_association_cases(MARKER_STREAM_OWNER_REF):

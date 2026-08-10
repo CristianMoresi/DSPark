@@ -29,6 +29,10 @@ class ReferenceAccessor:
     class_definition: str
     line: int
     access: str
+    accessor_owner: tuple = ()
+    qualifier_target: tuple = ()
+    member_declaring_owner: tuple = ()
+    member_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,38 @@ class ClassRegion:
     name_index: int
     name: str
     base_tokens: tuple
+
+
+@dataclass(frozen=True)
+class BaseEdge:
+    """One resolved same-header inheritance edge."""
+
+    derived_class: tuple
+    base_class: tuple
+    spelling: tuple
+    access: str
+    declaration: int
+    virtual: bool
+
+
+@dataclass(frozen=True)
+class DataMember:
+    """One data-member declaration with its exact owning class."""
+
+    declaring_class: tuple
+    name: str
+    access: str
+    declaration: int
+
+
+@dataclass(frozen=True)
+class QualifiedMemberBinding:
+    """Classification of one bounded class-qualified return expression."""
+
+    disposition: str
+    qualifier_target: tuple = ()
+    member_declaring_owner: tuple = ()
+    member_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -80,6 +116,9 @@ class AliasResolutionEnvironment:
     namespace_alias_cache: dict
     classes_by_identity: dict
     class_identities: dict
+    type_alias_cache: dict
+    complete_class_scopes: dict
+    base_edges: dict
 
 
 @dataclass(frozen=True)
@@ -87,6 +126,7 @@ class AliasContext:
     environment: AliasResolutionEnvironment
     current_scope: tuple = ()
     use_position: int = 0
+    complete_class_scopes: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -102,6 +142,7 @@ class TypeAliasTarget:
     scope: tuple
     rhs: tuple
     declaration: int
+    access: str = "public"
 
 
 @dataclass(frozen=True)
@@ -113,6 +154,18 @@ class IdentityAssociationCase:
     expected_line: int
     expected_access: str
     deletion_anchor: str = ""
+
+
+@dataclass(frozen=True)
+class QualifiedIdentityCase:
+    label: str
+    source: str
+    expected_line: int
+    accessor_owner: tuple
+    qualifier_target: tuple
+    member_declaring_owner: tuple
+    member_name: str
+    deletion_anchor: str
 
 
 _MULTI_PUNCTUATION = (
@@ -388,15 +441,18 @@ def _direct_scope_tokens(tokens, opening, closing, brace_pairs):
     return output
 
 
-def _region_key(kind, opening, closing):
-    return kind, opening, closing
-
-
-def _type_alias_declarations(tokens, scope):
+def _type_alias_declarations(tokens, scope, default_access="public"):
     """Collect direct type aliases with their lexical declaration points."""
     declarations = []
+    access = default_access
     index = 0
     while index < len(tokens):
+        if (tokens[index].text in ("public", "protected", "private")
+                and index + 1 < len(tokens)
+                and tokens[index + 1].text == ":"):
+            access = tokens[index].text
+            index += 2
+            continue
         if tokens[index].text == "using" and index + 2 < len(tokens):
             name = tokens[index + 1].text
             if _is_identifier_start(name[0]) and tokens[index + 2].text == "=":
@@ -412,7 +468,7 @@ def _type_alias_declarations(tokens, scope):
                     end += 1
                 rhs = tuple(token.text for token in tokens[index + 3:end])
                 declarations.append((name, TypeAliasTarget(
-                    tuple(scope), rhs, tokens[index].start)))
+                    tuple(scope), rhs, tokens[index].start, access)))
                 index = end
         elif tokens[index].text == "typedef":
             end = index + 1
@@ -425,7 +481,7 @@ def _type_alias_declarations(tokens, scope):
                 name = tokens[name_index].text
                 rhs = tuple(token.text for token in tokens[index + 1:name_index])
                 declarations.append((name, TypeAliasTarget(
-                    tuple(scope), rhs, tokens[index].start)))
+                    tuple(scope), rhs, tokens[index].start, access)))
                 index = end
         index += 1
     return tuple(declarations)
@@ -463,10 +519,11 @@ def _namespace_alias_declarations(tokens, scope):
     return tuple(declarations)
 
 
-def _visible_alias_targets(targets, use_position):
+def _visible_alias_targets(targets, use_position, complete_class_scopes=()):
     """Return declarations visible at one lexical use point, in order."""
     return tuple(target for target in targets
-                 if target.declaration < use_position)
+                 if (target.declaration < use_position
+                     or target.scope in complete_class_scopes))
 
 
 def _namespace_alias_prefix(parts, scope, aliases, use_position,
@@ -615,11 +672,18 @@ def _stable_class_alias_spelling(expanded, canonical):
 
 
 def _alias_replacement(parts, absolute, aliases, active):
-    key, targets = _type_alias_key(
+    environment = aliases.environment
+    key, targets = _qualified_type_alias_key(
         parts, absolute, aliases.current_scope,
-        aliases.environment.type_aliases,
-        aliases.use_position)
-    if key is None:
+        environment.type_aliases, environment.namespace_aliases,
+        aliases.use_position, environment.known_namespaces,
+        environment.namespace_alias_cache, aliases.complete_class_scopes)
+    access_scopes = (aliases.complete_class_scopes
+                     or environment.complete_class_scopes.get(
+                         aliases.current_scope, ()))
+    if (key is None or not _type_alias_targets_accessible(
+            targets, access_scopes, environment.classes_by_identity,
+            environment.base_edges)):
         return None
     resolutions = []
     for target in targets:
@@ -1334,15 +1398,15 @@ def _std_get_argument(values):
     return values[cursor + 1:-1]
 
 
-def _direct_member_expression(values, member_names, shadow_names=()):
+def _direct_member_root(values, member_names, shadow_names=()):
     values = _strip_outer_parentheses(values)
     if not values:
-        return False
+        return None
 
     # std::get<I>(member_) is a direct member subobject, not an arbitrary call.
     get_argument = _std_get_argument(values)
     if get_argument is not None:
-        return _direct_member_expression(
+        return _direct_member_root(
             get_argument, member_names, shadow_names)
 
     cursor = 0
@@ -1351,11 +1415,15 @@ def _direct_member_expression(values, member_names, shadow_names=()):
         cursor = 2
         explicit_this = True
     if cursor >= len(values) or not _is_identifier_start(values[cursor][0]):
-        return False
+        return None
     root = values[cursor]
     if root not in member_names or (not explicit_this and root in shadow_names):
-        return False
-    return _member_subobject_suffix(values, cursor + 1)
+        return None
+    return root if _member_subobject_suffix(values, cursor + 1) else None
+
+
+def _direct_member_expression(values, member_names, shadow_names=()):
+    return _direct_member_root(values, member_names, shadow_names) is not None
 
 
 def _qualified_base_member_candidate(values, unresolved_base_types):
@@ -1397,28 +1465,6 @@ def _direct_member_candidate(values, shadow_names=(),
                 values, unresolved_base_types))
 
 
-def _return_expressions(body):
-    expressions = []
-    index = 0
-    while index < len(body):
-        if body[index].text != "return":
-            index += 1
-            continue
-        cursor = index + 1
-        parens = brackets = braces = 0
-        while cursor < len(body):
-            value = body[cursor].text
-            parens += (value == "(") - (value == ")")
-            brackets += (value == "[") - (value == "]")
-            braces += (value == "{") - (value == "}")
-            if value == ";" and parens == brackets == braces == 0:
-                break
-            cursor += 1
-        expressions.append([token.text for token in body[index + 1:cursor]])
-        index = cursor + 1
-    return expressions
-
-
 def _parameter_names(signature, details, aliases):
     names = set()
     parameters = signature[details.parameters_open + 1:
@@ -1442,8 +1488,13 @@ def _looks_like_block_open(tokens, index, brace_kinds):
     return True
 
 
+def _declared_block_type_alias_names(statement):
+    """Return local alias names used only as positional shadow facts."""
+    return {name for name, _ in _type_alias_declarations(statement, ())}
+
+
 def _return_expressions_with_bindings(body, parameter_names, aliases):
-    """Return each expression with parameters and visible block locals.
+    """Return each expression with bindings and its exact lexical position.
 
     This is the binding distinction the policy needs: an unqualified spelling
     names the nearest parameter/local first, while ``this->`` bypasses that
@@ -1453,6 +1504,7 @@ def _return_expressions_with_bindings(body, parameter_names, aliases):
     """
     expressions = []
     scopes = [set(parameter_names)]
+    block_alias_scopes = [set()]
     brace_kinds = []
     statement_start = 0
     index = 0
@@ -1470,8 +1522,10 @@ def _return_expressions_with_bindings(body, parameter_names, aliases):
                     break
                 cursor += 1
             shadows = set().union(*scopes)
+            block_aliases = set().union(*block_alias_scopes)
             expressions.append((
-                [token.text for token in body[index + 1:cursor]], shadows))
+                [token.text for token in body[index + 1:cursor]], shadows,
+                body[index].start, block_aliases))
             statement_start = cursor + 1
             index = cursor + 1
             continue
@@ -1480,12 +1534,14 @@ def _return_expressions_with_bindings(body, parameter_names, aliases):
             brace_kinds.append(is_block)
             if is_block:
                 scopes.append(set())
+                block_alias_scopes.append(set())
                 statement_start = index + 1
         elif value == "}" and brace_kinds:
             is_block = brace_kinds.pop()
             if is_block:
                 if len(scopes) > 1:
                     scopes.pop()
+                    block_alias_scopes.pop()
                 statement_start = index + 1
         elif value == ";" and not any(not kind for kind in brace_kinds):
             statement = body[statement_start:index]
@@ -1494,6 +1550,8 @@ def _return_expressions_with_bindings(body, parameter_names, aliases):
                     "break", "co_return", "continue", "goto", "if",
                     "return", "static_assert", "switch", "while"}:
                 scopes[-1].update(_declared_data_names(statement, aliases))
+                block_alias_scopes[-1].update(
+                    _declared_block_type_alias_names(statement))
             statement_start = index + 1
         index += 1
     return expressions
@@ -1600,9 +1658,10 @@ def _declared_data_names(statement, aliases):
 
 
 def _member_names_by_access(tokens, opening, closing, brace_pairs, aliases,
-                            default_access):
+                            default_access, class_identity):
     names = set()
     inherited_accessible = set()
+    declarations = []
     access = default_access
     statement_start = opening + 1
     index = statement_start
@@ -1623,6 +1682,11 @@ def _member_names_by_access(tokens, opening, closing, brace_pairs, aliases,
             names.update(declared)
             if access != "private":
                 inherited_accessible.update(declared)
+            declaration = (statement[0].start if statement
+                           else tokens[index].start)
+            declarations.extend(
+                DataMember(tuple(class_identity), name, access, declaration)
+                for name in sorted(declared))
             statement_start = index + 1
             index += 1
             continue
@@ -1640,7 +1704,7 @@ def _member_names_by_access(tokens, opening, closing, brace_pairs, aliases,
             index = body_close + 1
             continue
         index += 1
-    return names, inherited_accessible
+    return names, inherited_accessible, tuple(declarations)
 
 
 def _containing_namespace(region, namespace_regions):
@@ -1683,11 +1747,21 @@ def _context_for_namespace(path, environment, use_position):
 
 def _alias_context_at(context, use_position):
     return AliasContext(
-        context.environment, context.current_scope, use_position)
+        context.environment, context.current_scope, use_position,
+        context.complete_class_scopes)
 
 
-def _base_type_values(base_tokens):
-    """Return each base type spelling without access/virtual specifiers."""
+def _member_body_alias_context(context, use_position, owner_identity):
+    """Apply complete-class lookup only inside a member-function body."""
+    complete_scopes = context.environment.complete_class_scopes.get(
+        tuple(owner_identity), (tuple(owner_identity),))
+    return AliasContext(
+        context.environment, context.current_scope, use_position,
+        complete_scopes)
+
+
+def _base_specifications(base_tokens, default_access):
+    """Return base spellings with their declared inheritance properties."""
     values = list(base_tokens)
     if not values or ":" not in [token.text for token in values]:
         return []
@@ -1696,10 +1770,13 @@ def _base_type_values(base_tokens):
     output = []
     for base in _top_level_parts(values[colon + 1:], ","):
         filtered = _strip_attributes([token.text for token in base])
-        filtered = [value for value in filtered if value not in {
-            "public", "protected", "private", "virtual"}]
-        if filtered:
-            output.append(tuple(filtered))
+        access = next((value for value in filtered if value in {
+            "public", "protected", "private"}), default_access)
+        is_virtual = "virtual" in filtered
+        spelling = tuple(value for value in filtered if value not in {
+            "public", "protected", "private", "virtual"})
+        if spelling:
+            output.append((spelling, access, is_virtual))
     return output
 
 
@@ -1731,15 +1808,64 @@ def _simple_qualified_type(values):
     return tuple(parts), absolute
 
 
-def _type_alias_key(parts, absolute, scope, aliases, use_position):
+def _type_alias_key(parts, absolute, scope, aliases, use_position,
+                    complete_class_scopes=()):
     scope_lengths = (0,) if absolute else range(len(scope), -1, -1)
     for length in scope_lengths:
         key = tuple(scope[:length]) + tuple(parts)
         targets = _visible_alias_targets(
-            aliases.get(key, ()), use_position)
+            aliases.get(key, ()), use_position, complete_class_scopes)
         if targets:
             return key, targets
     return None, ()
+
+
+def _qualified_type_alias_key(parts, absolute, scope, type_aliases,
+                              namespace_aliases, use_position,
+                              known_namespaces, namespace_alias_cache,
+                              complete_class_scopes=()):
+    """Find a type alias after positional namespace-alias composition."""
+    key, targets = _type_alias_key(
+        parts, absolute, scope, type_aliases, use_position,
+        complete_class_scopes)
+    if key is not None or len(parts) < 2:
+        return key, targets
+
+    match = _namespace_alias_prefix(
+        parts, scope, namespace_aliases, use_position,
+        maximum=len(parts) - 1, absolute=absolute)
+    if match is None:
+        return None, ()
+    namespace_key, consumed = match
+    namespace = _resolve_namespace_alias(
+        namespace_key, use_position, namespace_aliases, known_namespaces,
+        namespace_alias_cache)
+    if namespace is None:
+        return None, ()
+    key = tuple(namespace) + tuple(parts[consumed:])
+    targets = _visible_alias_targets(
+        type_aliases.get(key, ()), use_position, complete_class_scopes)
+    return (key, targets) if targets else (None, ())
+
+
+def _type_alias_targets_accessible(targets, access_scopes,
+                                   classes_by_identity, base_edges):
+    """Check class-member alias access without assuming friendship."""
+    for target in targets:
+        declaring_class = tuple(target.scope)
+        if declaring_class not in classes_by_identity:
+            continue
+        if declaring_class in access_scopes or target.access == "public":
+            continue
+        if target.access != "protected":
+            return False
+        if not any(
+                _owner_or_unique_ancestor_relation(
+                    tuple(scope), declaring_class, base_edges)[0]
+                in ("owner", "ancestor")
+                for scope in access_scopes):
+            return False
+    return True
 
 
 def _resolve_type_alias_class(key, target, type_aliases, namespace_aliases,
@@ -1756,8 +1882,9 @@ def _resolve_type_alias_class(key, target, type_aliases, namespace_aliases,
         cache[cache_key] = None
         return None
     parts, absolute = parsed
-    nested_key, nested_targets = _type_alias_key(
-        parts, absolute, target.scope, type_aliases, target.declaration)
+    nested_key, nested_targets = _qualified_type_alias_key(
+        parts, absolute, target.scope, type_aliases, namespace_aliases,
+        target.declaration, known_namespaces, namespace_alias_cache)
     if nested_key is not None:
         resolutions = [
             _resolve_type_alias_class(
@@ -1783,14 +1910,20 @@ def _resolve_type_alias_class(key, target, type_aliases, namespace_aliases,
 def _resolve_base_class(values, scope, use_position, type_aliases,
                         namespace_aliases,
                         known_namespaces, namespace_alias_cache,
-                        classes_by_identity, type_alias_cache):
+                        classes_by_identity, type_alias_cache,
+                        access_scopes=(), base_edges=None):
     parsed = _simple_qualified_type(values)
     if parsed is None:
         return None
     parts, absolute = parsed
-    alias_key, alias_targets = _type_alias_key(
-        parts, absolute, scope, type_aliases, use_position)
+    alias_key, alias_targets = _qualified_type_alias_key(
+        parts, absolute, scope, type_aliases, namespace_aliases,
+        use_position, known_namespaces, namespace_alias_cache)
     if alias_key is not None:
+        if not _type_alias_targets_accessible(
+                alias_targets, access_scopes, classes_by_identity,
+                base_edges or {}):
+            return None
         resolutions = [
             _resolve_type_alias_class(
                 alias_key, alias_target, type_aliases, namespace_aliases,
@@ -1806,6 +1939,412 @@ def _resolve_base_class(values, scope, use_position, type_aliases,
     return _resolve_aliased_class(
         parts, absolute, scope, namespace_aliases, use_position,
         known_namespaces, namespace_alias_cache, classes_by_identity)
+
+
+def _inherited_alias_candidates(owner, name, environment, active=()):
+    """Find class-member type aliases through bounded base lookup."""
+    if owner in active:
+        return (), True
+    key = tuple(owner) + (name,)
+    direct = environment.type_aliases.get(key, ())
+    if direct:
+        return ((key, direct, ()),), False
+
+    candidates = []
+    unsupported = False
+    for edge in environment.base_edges.get(owner, ()):
+        nested, nested_unsupported = _inherited_alias_candidates(
+            edge.base_class, name, environment, active + (owner,))
+        candidates.extend((nested_key, targets, (edge,) + path)
+                          for nested_key, targets, path in nested)
+        unsupported = unsupported or nested_unsupported or edge.virtual
+    return tuple(candidates), unsupported
+
+
+def _expression_type_alias_lookup(parts, absolute, aliases):
+    """Apply member, base-member and enclosing-class alias lookup order."""
+    environment = aliases.environment
+
+    def checked(key, targets):
+        if key is None:
+            return None, (), "none"
+        access_scopes = (
+            aliases.complete_class_scopes
+            or environment.complete_class_scopes.get(
+                aliases.current_scope, ()))
+        if not _type_alias_targets_accessible(
+                targets, access_scopes, environment.classes_by_identity,
+                environment.base_edges):
+            return None, (), "unsupported"
+        return key, targets, "found"
+
+    if absolute or len(parts) != 1 or not aliases.complete_class_scopes:
+        key, targets = _qualified_type_alias_key(
+            parts, absolute, aliases.current_scope,
+            environment.type_aliases, environment.namespace_aliases,
+            aliases.use_position, environment.known_namespaces,
+            environment.namespace_alias_cache, aliases.complete_class_scopes)
+        return checked(key, targets)
+
+    name = parts[0]
+    for class_scope in aliases.complete_class_scopes:
+        key = tuple(class_scope) + (name,)
+        targets = _visible_alias_targets(
+            environment.type_aliases.get(key, ()), aliases.use_position,
+            aliases.complete_class_scopes)
+        if targets:
+            return checked(key, targets)
+
+        inherited, unsupported = _inherited_alias_candidates(
+            tuple(class_scope), name, environment)
+        if unsupported or len(inherited) > 1:
+            return None, (), "unsupported"
+        if inherited:
+            inherited_key, inherited_targets, path = inherited[0]
+            if (not _path_accessible_from_owner(path)
+                    or checked(inherited_key, inherited_targets)[2]
+                    == "unsupported"):
+                return None, (), "unsupported"
+            return inherited_key, inherited_targets, "found"
+
+    key, targets = _qualified_type_alias_key(
+        parts, absolute, aliases.current_scope,
+        environment.type_aliases, environment.namespace_aliases,
+        aliases.use_position, environment.known_namespaces,
+        environment.namespace_alias_cache, aliases.complete_class_scopes)
+    return checked(key, targets)
+
+
+def _resolve_expression_qualifier(values, aliases):
+    """Resolve one bounded class-id at its exact expression use point."""
+    parsed = _simple_qualified_type(values)
+    if parsed is None:
+        return None
+    parts, absolute = parsed
+    environment = aliases.environment
+    alias_key, alias_targets, alias_status = _expression_type_alias_lookup(
+        parts, absolute, aliases)
+    if alias_status == "unsupported":
+        return None
+    if alias_key is not None:
+        resolutions = [
+            _resolve_type_alias_class(
+                alias_key, target, environment.type_aliases,
+                environment.namespace_aliases, environment.known_namespaces,
+                environment.namespace_alias_cache,
+                environment.classes_by_identity,
+                environment.type_alias_cache)
+            for target in alias_targets
+        ]
+        resolved = (
+            resolutions[0] if resolutions and resolutions[0] is not None
+            and all(item is resolutions[0] for item in resolutions)
+            else None
+        )
+    else:
+        resolved = _resolve_aliased_class(
+            parts, absolute, aliases.current_scope,
+            environment.namespace_aliases, aliases.use_position,
+            environment.known_namespaces,
+            environment.namespace_alias_cache,
+            environment.classes_by_identity)
+    return (None if resolved is None
+            else environment.class_identities.get(resolved))
+
+
+def _expression_qualifier_has_visible_type_alias(values, aliases):
+    """Whether a failed class-id has a visible type-alias interpretation."""
+    parsed = _simple_qualified_type(values)
+    if parsed is None:
+        return False
+    parts, absolute = parsed
+    alias_key, _, alias_status = _expression_type_alias_lookup(
+        parts, absolute, aliases)
+    return alias_key is not None or alias_status == "unsupported"
+
+
+def _expression_qualifier_has_visible_alias(values, aliases):
+    """Whether a failed class-id names an alias visible at this use point."""
+    parsed = _simple_qualified_type(values)
+    if parsed is None:
+        return False
+    parts, absolute = parsed
+    environment = aliases.environment
+    if _expression_qualifier_has_visible_type_alias(values, aliases):
+        return True
+    if len(parts) < 2:
+        return False
+    return _namespace_alias_prefix(
+        parts, aliases.current_scope, environment.namespace_aliases,
+        aliases.use_position, maximum=len(parts) - 1,
+        absolute=absolute) is not None
+
+
+def _expression_qualifier_is_namespace(values, aliases):
+    """Whether a failed class-id canonically denotes a known namespace."""
+    parsed = _simple_qualified_type(values)
+    if parsed is None:
+        return False
+    parts, absolute = parsed
+    environment = aliases.environment
+    return _resolve_aliased_namespace(
+        parts, absolute, aliases.current_scope,
+        environment.namespace_aliases, aliases.use_position,
+        environment.known_namespaces,
+        environment.namespace_alias_cache) is not None
+
+
+def _qualified_member_parts(values):
+    """Split direct qualified-member syntax before class-id validation."""
+    values = _strip_outer_parentheses(values)
+    get_argument = _std_get_argument(values)
+    if get_argument is not None:
+        return _qualified_member_parts(get_argument)
+    if values[:2] == ["this", "->"]:
+        values = values[2:]
+    separators = [index for index, value in enumerate(values)
+                  if value == "::"]
+    if not separators:
+        return None
+    separator = separators[-1]
+    member_index = separator + 1
+    if (member_index >= len(values)
+            or not _is_identifier_start(values[member_index][0])
+            or not _member_subobject_suffix(values, member_index + 1)):
+        return None
+    qualifier = values[:separator]
+    if not qualifier:
+        return None
+    return tuple(qualifier), values[member_index]
+
+
+def _qualified_member_syntax(values):
+    """Return ``(class-id tokens, member)`` for the supported direct form."""
+    parsed = _qualified_member_parts(values)
+    if parsed is None or _simple_qualified_type(parsed[0]) is None:
+        return None
+    return parsed
+
+
+def _template_qualified_type_skeleton(values):
+    """Erase balanced template arguments for exclusion classification."""
+    values = list(values)
+    absolute = bool(values and values[0] == "::")
+    if absolute:
+        values.pop(0)
+    output = ["::"] if absolute else []
+    index = 0
+    saw_template_id = False
+    while index < len(values):
+        if not _is_identifier_start(values[index][0]):
+            return None
+        output.append(values[index])
+        index += 1
+        if index < len(values) and values[index] == "<":
+            saw_template_id = True
+            depth = 0
+            while index < len(values):
+                value = values[index]
+                depth = _angle_depth_change(value, depth)
+                index += 1
+                if depth == 0:
+                    break
+            if depth:
+                return None
+        if index == len(values):
+            break
+        if values[index] != "::":
+            return None
+        output.append("::")
+        index += 1
+    return tuple(output) if saw_template_id else None
+
+
+def _bind_template_qualified_member_exclusion(values, aliases, owner,
+                                               base_edges):
+    """Recognize template-id ownership only to keep it fail-closed."""
+    parsed = _qualified_member_parts(values)
+    if parsed is None:
+        return QualifiedMemberBinding("not-qualified")
+    skeleton = _template_qualified_type_skeleton(parsed[0])
+    if skeleton is None:
+        return QualifiedMemberBinding("not-qualified")
+    qualifier = _resolve_expression_qualifier(skeleton, aliases)
+    if qualifier is None:
+        if _expression_qualifier_has_visible_alias(skeleton, aliases):
+            return QualifiedMemberBinding("unsupported", (), (), parsed[1])
+        return QualifiedMemberBinding("unresolved", (), (), parsed[1])
+    relation, _ = _owner_or_unique_ancestor_relation(
+        owner, qualifier, base_edges)
+    if relation == "unrelated":
+        return QualifiedMemberBinding(
+            "unrelated", tuple(qualifier), (), parsed[1])
+    return QualifiedMemberBinding(
+        "unsupported", tuple(qualifier), (), parsed[1])
+
+
+def _inheritance_paths(owner, target, base_edges, active=()):
+    """Return every bounded non-cyclic inheritance path to one identity."""
+    if owner == target:
+        return ((),)
+    if owner in active:
+        return ()
+    paths = []
+    for edge in base_edges.get(owner, ()):
+        for suffix in _inheritance_paths(
+                edge.base_class, target, base_edges, active + (owner,)):
+            paths.append((edge,) + suffix)
+    return tuple(paths)
+
+
+def _path_accessible_from_owner(path):
+    """Whether a derived member can traverse this inheritance path."""
+    return all(edge.access != "private" or index == 0
+               for index, edge in enumerate(path))
+
+
+def _owner_or_unique_ancestor_relation(owner, target, base_edges):
+    """Classify the exact owner/ancestor relationship for a qualifier."""
+    if owner == target:
+        return "owner", ()
+    paths = _inheritance_paths(owner, target, base_edges)
+    if not paths:
+        return "unrelated", ()
+    if len(paths) != 1 or any(edge.virtual for path in paths for edge in path):
+        return "ambiguous", ()
+    path = paths[0]
+    if not _path_accessible_from_owner(path):
+        return "inaccessible", path
+    return "ancestor", path
+
+
+def _member_lookup_candidates(owner, name, base_edges, data_members,
+                              active=()):
+    """Perform bounded qualified data-member lookup with ordinary hiding."""
+    if owner in active:
+        return (), True
+    direct = tuple(member for member in data_members.get(owner, ())
+                   if member.name == name)
+    if direct:
+        return tuple((member, ()) for member in direct), len(direct) != 1
+
+    candidates = []
+    unsupported = False
+    for edge in base_edges.get(owner, ()):
+        nested, nested_unsupported = _member_lookup_candidates(
+            edge.base_class, name, base_edges, data_members,
+            active + (owner,))
+        candidates.extend((member, (edge,) + path)
+                          for member, path in nested)
+        unsupported = unsupported or nested_unsupported or edge.virtual
+    return tuple(candidates), unsupported
+
+
+def _select_qualified_data_member(owner, qualifier, name, owner_path,
+                                  base_edges, data_members):
+    """Select one exact accessible declaration after qualified lookup."""
+    candidates, unsupported = _member_lookup_candidates(
+        qualifier, name, base_edges, data_members)
+    if unsupported or len(candidates) != 1:
+        return QualifiedMemberBinding(
+            "unsupported", tuple(qualifier), (), name)
+    member, lookup_path = candidates[0]
+    complete_path = tuple(owner_path) + tuple(lookup_path)
+    accessible = (
+        (member.access != "private" or member.declaring_class == owner)
+        and _path_accessible_from_owner(complete_path)
+    )
+    if not accessible:
+        return QualifiedMemberBinding(
+            "unsupported", tuple(qualifier),
+            tuple(member.declaring_class), name)
+    return QualifiedMemberBinding(
+        "bound", tuple(qualifier), tuple(member.declaring_class), name)
+
+
+def _bind_resolved_qualified_member(values, aliases, owner, base_edges,
+                                    data_members):
+    """Bind one supported class-qualified owner/ancestor member expression."""
+    parsed = _qualified_member_syntax(values)
+    if parsed is None:
+        return QualifiedMemberBinding("not-qualified")
+    qualifier_values, member_name = parsed
+    qualifier = _resolve_expression_qualifier(qualifier_values, aliases)
+    if qualifier is None:
+        if _expression_qualifier_has_visible_type_alias(
+                qualifier_values, aliases):
+            return QualifiedMemberBinding(
+                "unsupported", (), (), member_name)
+        if _expression_qualifier_is_namespace(qualifier_values, aliases):
+            return QualifiedMemberBinding(
+                "namespace", (), (), member_name)
+        if _expression_qualifier_has_visible_alias(
+                qualifier_values, aliases):
+            return QualifiedMemberBinding(
+                "unsupported", (), (), member_name)
+        return QualifiedMemberBinding("unresolved", (), (), member_name)
+    relation, owner_path = _owner_or_unique_ancestor_relation(
+        owner, qualifier, base_edges)
+    if relation == "unrelated":
+        return QualifiedMemberBinding(
+            "unrelated", tuple(qualifier), (), member_name)
+    if relation not in ("owner", "ancestor"):
+        return QualifiedMemberBinding(
+            "unsupported", tuple(qualifier), (), member_name)
+    return _select_qualified_data_member(
+        owner, qualifier, member_name, owner_path, base_edges, data_members)
+
+
+def _classify_storage_expression(values, member_names, shadow_names, aliases,
+                                 owner, base_edges, data_members,
+                                 unresolved_base_types,
+                                 block_type_aliases=()):
+    """Share one direct-storage classifier across all definition placements."""
+    root = _direct_member_root(values, member_names, shadow_names)
+    if root is not None:
+        relation = _select_qualified_data_member(
+            owner, owner, root, (), base_edges, data_members)
+        if relation.disposition == "bound":
+            return QualifiedMemberBinding(
+                "bound", (), relation.member_declaring_owner, root)
+        return relation
+
+    qualified_syntax = _qualified_member_syntax(values)
+    if qualified_syntax is not None:
+        qualifier = _simple_qualified_type(qualified_syntax[0])
+        if (qualifier is not None and not qualifier[1]
+                and qualifier[0][0] in block_type_aliases):
+            return QualifiedMemberBinding(
+                "unsupported", (), (), qualified_syntax[1])
+
+    qualified = _bind_resolved_qualified_member(
+        values, aliases, owner, base_edges, data_members)
+    if qualified.disposition in (
+            "bound", "unsupported", "unrelated", "namespace"):
+        return qualified
+    if _qualified_base_member_candidate(values, unresolved_base_types):
+        return QualifiedMemberBinding("unresolved-base")
+    if (unresolved_base_types
+            and _direct_member_candidate(
+                values, shadow_names, unresolved_base_types)):
+        return QualifiedMemberBinding("unresolved-base")
+    template_qualified = _bind_template_qualified_member_exclusion(
+        values, aliases, owner, base_edges)
+    if template_qualified.disposition in ("unsupported", "unrelated"):
+        return template_qualified
+    return QualifiedMemberBinding("not-member")
+
+
+def _classify_return_bindings(bindings):
+    """Aggregate exact returns without conflating deliberate negatives."""
+    dispositions = tuple(binding.disposition for binding in bindings)
+    if dispositions and all(item == "bound" for item in dispositions):
+        return "bound"
+    if "unresolved-base" in dispositions:
+        return "unresolved-base"
+    if "unsupported" in dispositions:
+        return "unsupported"
+    return "deliberate-negative"
 
 
 def _qualified_owner(signature, name_start):
@@ -1865,8 +2404,8 @@ def analyze_public_const_reference_accessors(text):
     scoped_type_aliases = {}
     scoped_namespace_aliases = {}
 
-    def add_aliases(destination, scope, direct, collector):
-        for name, target in collector(direct, scope):
+    def add_aliases(destination, scope, direct, collector, *collector_args):
+        for name, target in collector(direct, scope, *collector_args):
             destination.setdefault(tuple(scope) + (name,), []).append(target)
 
     add_aliases(
@@ -1887,7 +2426,7 @@ def analyze_public_const_reference_accessors(text):
         add_aliases(
             scoped_type_aliases,
             _class_identity(region, class_regions, namespace_regions),
-            direct, _type_alias_declarations)
+            direct, _type_alias_declarations, region.default_access)
 
     scoped_type_aliases = {
         key: tuple(sorted(values, key=lambda item: item.declaration))
@@ -1901,6 +2440,16 @@ def analyze_public_const_reference_accessors(text):
         region: _class_identity(region, class_regions, namespace_regions)
         for region in class_regions
     }
+    complete_class_scopes = {
+        class_identities[region]: (
+            class_identities[region],
+            *(class_identities[ancestor] for ancestor in reversed(
+                _class_ancestors(region, class_regions))),
+        )
+        for region in class_regions
+    }
+    type_alias_cache = {}
+    alias_base_edges = {}
     alias_environment = AliasResolutionEnvironment(
         type_aliases=scoped_type_aliases,
         namespace_aliases=scoped_namespace_aliases,
@@ -1908,6 +2457,9 @@ def analyze_public_const_reference_accessors(text):
         namespace_alias_cache=namespace_alias_cache,
         classes_by_identity=classes_by_identity,
         class_identities=class_identities,
+        type_alias_cache=type_alias_cache,
+        complete_class_scopes=complete_class_scopes,
+        base_edges=alias_base_edges,
     )
 
     alias_contexts = {
@@ -1918,32 +2470,47 @@ def analyze_public_const_reference_accessors(text):
     }
     own_members = {}
     inheritable_members = {}
+    data_members_by_identity = {}
     for region in class_regions:
-        own, inheritable = _member_names_by_access(
+        own, inheritable, member_declarations = _member_names_by_access(
             tokens, region.opening, region.closing, brace_pairs,
-            alias_contexts[region], region.default_access)
+            alias_contexts[region], region.default_access,
+            class_identities[region])
         own_members[region] = own
         inheritable_members[region] = inheritable
+        data_members_by_identity[class_identities[region]] = \
+            member_declarations
 
     base_regions = {}
+    base_edges_by_identity = {}
     unresolved_bases = {}
-    type_alias_cache = {}
     for region in class_regions:
         scope = _class_identity(region, class_regions, namespace_regions)[:-1]
         resolved_bases = []
+        resolved_edges = []
         unresolved = []
-        for values in _base_type_values(region.base_tokens):
+        for values, inheritance_access, is_virtual in _base_specifications(
+                region.base_tokens, region.default_access):
             resolved = _resolve_base_class(
                 values, scope, tokens[region.declaration].start,
                 scoped_type_aliases, scoped_namespace_aliases,
                 known_namespaces, namespace_alias_cache,
-                classes_by_identity, type_alias_cache)
+                classes_by_identity, type_alias_cache,
+                complete_class_scopes[class_identities[region]],
+                base_edges_by_identity)
             if resolved is None:
                 unresolved.append(values)
             else:
                 resolved_bases.append(resolved)
+                resolved_edges.append(BaseEdge(
+                    class_identities[region], class_identities[resolved],
+                    tuple(values), inheritance_access,
+                    tokens[region.declaration].start, is_virtual))
         base_regions[region] = tuple(resolved_bases)
+        base_edges_by_identity[class_identities[region]] = \
+            tuple(resolved_edges)
         unresolved_bases[region] = tuple(unresolved)
+    alias_base_edges.update(base_edges_by_identity)
 
     inherited_cache = {}
 
@@ -2028,11 +2595,23 @@ def analyze_public_const_reference_accessors(text):
                     body, parameters, signature_aliases)
                 eligible = (access == "public" and details.const_reference
                             and returns)
-                member_bound = (eligible and all(
-                    _direct_member_expression(expr, members, shadows)
-                    for expr, shadows in returns))
-                if member_bound:
+                owner_identity = class_identities[region]
+                bindings = [
+                    _classify_storage_expression(
+                        expr, members, shadows,
+                        _member_body_alias_context(
+                            aliases, use_position, owner_identity),
+                        owner_identity, base_edges_by_identity,
+                        data_members_by_identity, unresolved_bases[region],
+                        block_aliases)
+                    for expr, shadows, use_position, block_aliases in returns
+                ] if eligible else []
+                return_classification = (
+                    _classify_return_bindings(bindings)
+                    if eligible else "ineligible")
+                if return_classification == "bound":
                     first = signature[0] if signature else tokens[index]
+                    binding = bindings[0]
                     output.append(ReferenceAccessor(
                         name=details.name,
                         documentation=_preceding_doc(text, first.start),
@@ -2040,11 +2619,12 @@ def analyze_public_const_reference_accessors(text):
                         class_definition=class_definition,
                         line=first.line,
                         access=access,
+                        accessor_owner=owner_identity,
+                        qualifier_target=binding.qualifier_target,
+                        member_declaring_owner=binding.member_declaring_owner,
+                        member_name=binding.member_name,
                     ))
-                elif (eligible and unresolved_bases[region]
-                      and all(_direct_member_candidate(
-                          expr, shadows, unresolved_bases[region])
-                              for expr, shadows in returns)):
+                elif return_classification == "unresolved-base":
                     first = signature[0] if signature else tokens[index]
                     diagnostics.append(ReferenceParseDiagnostic(
                         line=first.line,
@@ -2053,6 +2633,16 @@ def analyze_public_const_reference_accessors(text):
                             "a member-like expression through an unsupported "
                             "or unresolved base; Tier G cannot safely classify "
                             "inherited storage".format(details.name)),
+                    ))
+                elif return_classification == "unsupported":
+                    first = signature[0] if signature else tokens[index]
+                    diagnostics.append(ReferenceParseDiagnostic(
+                        line=first.line,
+                        message=(
+                            "public const-reference definition {}() has a "
+                            "direct owner/ancestor member return that Tier G "
+                            "cannot bind uniquely and accessibly"
+                            .format(details.name)),
                     ))
             elif access == "public":
                 unsupported_name = _potential_const_reference_signature(
@@ -2196,22 +2786,38 @@ def analyze_public_const_reference_accessors(text):
         members = all_members[owner]
         if not returns:
             continue
-        member_bound = all(
-            _direct_member_expression(expr, members, shadows)
-            for expr, shadows in returns)
-        if not member_bound:
-            if (unresolved_bases[owner]
-                    and all(_direct_member_candidate(
-                        expr, shadows, unresolved_bases[owner])
-                            for expr, shadows in returns)):
+        owner_identity = class_identities[owner]
+        bindings = [
+            _classify_storage_expression(
+                expr, members, shadows,
+                _member_body_alias_context(
+                    aliases, use_position, owner_identity),
+                owner_identity, base_edges_by_identity,
+                data_members_by_identity, unresolved_bases[owner],
+                block_aliases)
+            for expr, shadows, use_position, block_aliases in returns
+        ]
+        return_classification = _classify_return_bindings(bindings)
+        if return_classification != "bound":
+            if return_classification == "unresolved-base":
                 first = signature[0] if signature else tokens[opening]
                 diagnostics.append(ReferenceParseDiagnostic(
                     line=first.line,
                     message=(
                         "const-reference definition {}() returns a member-like "
                         "expression through an unsupported or unresolved "
-                        "base; Tier G cannot safely classify inherited storage"
+                        "base; Tier G cannot safely classify inherited "
+                        "storage"
                         .format(details.name)),
+                ))
+            elif return_classification == "unsupported":
+                first = signature[0] if signature else tokens[opening]
+                diagnostics.append(ReferenceParseDiagnostic(
+                    line=first.line,
+                    message=(
+                        "const-reference definition {}() has a direct "
+                        "owner/ancestor member return that Tier G cannot bind "
+                        "uniquely and accessibly".format(details.name)),
                 ))
             continue
         class_documentation = _preceding_class_doc(
@@ -2225,6 +2831,10 @@ def analyze_public_const_reference_accessors(text):
             class_definition=class_definition,
             line=line,
             access=access,
+            accessor_owner=owner_identity,
+            qualifier_target=bindings[0].qualifier_target,
+            member_declaring_owner=bindings[0].member_declaring_owner,
+            member_name=bindings[0].member_name,
         ))
     return output, tuple(diagnostics)
 
@@ -2233,6 +2843,116 @@ def find_public_const_reference_accessors(text):
     """Enumerate the supported public const-reference member accessors."""
     accessors, _ = analyze_public_const_reference_accessors(text)
     return accessors
+
+
+def qualified_owner_ancestor_association_cases(marker):
+    """Generate the complete qualified owner/ancestor invariant product."""
+    target_axes = (
+        ("owner", "Owner", "owner"),
+        ("literal-base", "Base", "literal-base"),
+        ("aliased-base", "Base", "aliased-base"),
+        ("grand-base", "Root", "grand-base"),
+    )
+    qualifier_axes = (
+        ("relative", lambda target: target),
+        ("absolute", lambda target: "::matrix::" + target),
+        ("namespace", lambda target: "matrix::" + target),
+        ("type-alias", lambda target: "Exact"),
+    )
+    shape_axes = (
+        ("direct", "int storage_ = 7;",
+         "static inline int storage_ = 11;", "{qualifier}::storage_"),
+        ("field", "Payload storage_ {};",
+         "static inline Payload storage_ {};",
+         "{qualifier}::storage_.field"),
+        ("index", "int storage_[1] {7};",
+         "static inline int storage_[1] {11};",
+         "{qualifier}::storage_[(0)]"),
+        ("std-get", "std::tuple<int> storage_ {7};",
+         "static inline std::tuple<int> storage_ {11};",
+         "std::get<0>({qualifier}::storage_)"),
+    )
+    placement_axes = ("in-class", "namespace-scope")
+    method_anchor = "/** {} matched declaration */".format(marker)
+    class_doc = (
+        "/** Threading: the foreign readout is atomic; this is a {}. */"
+        .format(marker))
+    sibling_doc = "/** {} sibling declaration */".format(marker)
+    cases = []
+
+    for target_label, target_name, target_kind in target_axes:
+        for qualifier_label, qualifier_factory in qualifier_axes:
+            qualifier = qualifier_factory(target_name)
+            for shape_label, member, decoy_member, expression in shape_axes:
+                return_expression = expression.format(qualifier=qualifier)
+                for placement in placement_axes:
+                    lines = [
+                        "#include <tuple>",
+                        "namespace matrix {",
+                        "struct Payload { int field = 7; };",
+                        "struct Decoy {{ {} }};".format(decoy_member),
+                    ]
+                    if target_kind == "literal-base":
+                        lines.append(
+                            "struct Base {{ protected: {} }};".format(member))
+                    elif target_kind == "aliased-base":
+                        lines.extend((
+                            "struct Base {{ protected: {} }};".format(member),
+                            "using Parent = Base;",
+                        ))
+                    elif target_kind == "grand-base":
+                        lines.extend((
+                            "struct Root {{ protected: {} }};".format(member),
+                            "struct Mid : public Root {};",
+                        ))
+
+                    inheritance = {
+                        "owner": "",
+                        "literal-base": " : public Base",
+                        "aliased-base": " : public Parent",
+                        "grand-base": " : public Mid",
+                    }[target_kind]
+                    lines.extend((class_doc, "struct Owner{} {{".format(
+                        inheritance)))
+                    if target_kind == "owner":
+                        lines.extend(("private:", "    " + member))
+                    lines.append("public:")
+                    lines.append("    " + method_anchor)
+                    declaration_line = len(lines) + 1
+                    if placement == "in-class":
+                        lines.append(
+                            "    const int& state() const { return "
+                            + return_expression + "; }")
+                    else:
+                        lines.append("    const int& state() const;")
+                    lines.extend((
+                        "    " + sibling_doc,
+                        "    int sibling() const { return 0; }",
+                        "    int getPublished() const { return 0; }",
+                        "    using Exact = {};".format(target_name),
+                        "};",
+                        "}",
+                    ))
+                    if placement == "namespace-scope":
+                        lines.append(
+                            "inline const int& matrix::Owner::state() const "
+                            "{ return " + return_expression + "; }")
+                    lines.append(
+                        "int main() { matrix::Owner value; return value.state(); }")
+                    source = "\n".join(lines) + "\n"
+                    identity = ("matrix", target_name)
+                    cases.append(QualifiedIdentityCase(
+                        label="-".join((target_label, qualifier_label,
+                                        shape_label, placement)),
+                        source=source,
+                        expected_line=declaration_line,
+                        accessor_owner=("matrix", "Owner"),
+                        qualifier_target=identity,
+                        member_declaring_owner=identity,
+                        member_name="storage_",
+                        deletion_anchor=method_anchor,
+                    ))
+    return tuple(cases)
 
 
 def cpp_identity_association_cases(marker):

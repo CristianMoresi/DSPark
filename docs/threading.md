@@ -282,7 +282,27 @@ public declarations with namespace-scope inline definitions, accessible
 inherited storage through literal bases or visible non-dependent `using` and
 `typedef` base aliases, and lexical alias shadowing across global, namespace,
 nested-class and sibling-class scopes. Base aliases may be direct or chained;
-every alias lookup is evaluated at its exact lexical use point, while an alias
+direct return roots may also spell
+`[this->] class-id::member` before a supported field, balanced index or
+`std::get<I>` subobject. The expression's `class-id` is resolved independently
+at that exact use point and must be the accessor owner or one uniquely reachable
+accessible ancestor. Qualified lookup retains the exact accessor owner,
+qualifier target, data-member owner and member name, so ordinary hiding,
+ambiguous base subobjects, inheritance access and private members cannot be
+replaced by a matching basename. Relative, absolute, namespace-qualified,
+namespace-alias-qualified and visible direct or chained class aliases are
+supported. A namespace-alias prefix is canonicalized before a terminal type
+alias is resolved, so the two alias kinds compose without losing either use
+point or RHS declaration point. Class-member alias access is checked from the
+owner and its enclosing/ancestor context: public aliases are nameable,
+protected inherited aliases are supported, and own or enclosing private aliases
+remain available, while private/protected access that works only through
+friendship stays fail-closed. Inline member-function bodies use complete-class
+lookup for the owner and its enclosing classes, including later aliases, and
+may use an accessible unambiguous alias inherited from a base. Function return
+types and namespace/global lookup keep their ordinary point-of-declaration
+behavior.
+Every alias lookup is evaluated at its exact lexical use point, while an alias
 right-hand side and each link in a chain are evaluated at that alias's own
 declaration point. A later declaration therefore cannot retroactively change a
 base or function signature, and a same-header class identity retained by a type
@@ -308,7 +328,11 @@ parameter-type, cv/ref or value-return sibling therefore cannot lend its
 documentation, source line or public access to the definition; zero or multiple
 exact matches are rejected conservatively.
 Return roots are bound against parameters and visible block locals before
-member lookup; `this->` explicitly selects the member. Its production-policy
+member lookup; `this->` explicitly selects the member. Every return in a method
+must bind positively for enumeration. An unsupported owner/ancestor return
+diagnoses even beside a bound return, while a bound return mixed only with a
+deliberate negative (an unrelated class, call, namespace object, parameter or
+other non-member) remains an ordinary 0/0 exclusion. Its production-policy
 mutation matrix checks every spelling, overload association, scope and binding,
 isolated marker deletion, and value/temporary/parameter/local near miss on every
 run. It currently finds eight: the two marked sites
@@ -347,8 +371,17 @@ including the supported `std::get<I>(...)` wrapper, diagnose instead of being
 silently omitted. The controls separately prove that value-return, member-call,
 free-object, private, private-template and qualified namespace free-function
 forms do not raise that diagnostic. Macro-generated declarations, dependent
-bases, imported members, lambda/coroutine returns and forms that require
-template instantiation remain outside the positive dependency-free subset.
+bases, imported members and lambda/coroutine returns remain outside the
+positive dependency-free subset. Function-block type aliases are tracked
+positionally only as shadow facts: a member-like return through one diagnoses,
+the alias stops shadowing at the end of its block, and it is never promoted into
+the positive alias subset. A template-id qualifier, including balanced
+template arguments on nested components, is likewise recognized only far
+enough to diagnose a proven owner/ancestor case; an unrelated template class or
+a call remains 0/0. Namespace-alias-qualified namespace objects are
+canonicalized as namespaces and also remain 0/0. Friend-only access,
+virtual-base ownership and repeated base graphs that cannot prove one
+accessible subobject remain fail-closed rather than being guessed.
 Those forms are not associated by declaration order or basename; a
 recognizable public reference accessor must diagnose until the gate is extended
 with a sound positive fixture for it.

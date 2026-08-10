@@ -51,11 +51,16 @@ Tiers
      ordinary parameter names and declaration-only defaults are ignored. A
      C++ function-type identity normalizes top-level parameter cv, equivalent
      cv spelling and outer array-to-pointer adjustment while preserving
-     pointee/referred cv and nested array extents. Namespace aliases resolve by
-     lexical direct/chained/nested identity without sibling leakage. A
-     recognizable unsupported const-reference definition emits a production-
-     fatal diagnostic; ordinary value and qualified namespace free-function
-     definitions do not. A stream-owner-only readout carries the marker
+     pointee/referred cv and nested array extents. Repeated cv introduced by
+     aliases is idempotent at its own type level. Namespace and visible base-
+     type aliases resolve by lexical direct/chained/nested identity without
+     sibling leakage. Each use and alias RHS observes its own declaration
+     point; equivalent semantic redeclarations coalesce, while conflicting or
+     cyclic targets fail closed. A recognizable unsupported const-reference
+     definition, exact public class-template target or direct/subobject return
+     through an unresolved base emits a production-fatal diagnostic; value,
+     member-call, free-object, private-template and qualified namespace free-
+     function controls do not. A stream-owner-only readout carries the marker
      `stream-owner reference readout`
      in both its
      method documentation and the class's Threading block. Existing unmarked
@@ -75,6 +80,7 @@ from threading_reference_parser import (  # noqa: E402
     analyze_public_const_reference_accessors,
     cpp_identity_association_cases,
     fail_closed_association_cases,
+    fail_closed_diagnostic_expectations,
     find_public_const_reference_accessors,
     mutation_matrix_cases,
     overload_association_cases,
@@ -782,6 +788,7 @@ for identity_case in cpp_identity_association_cases(MARKER_STREAM_OWNER_REF):
         if identity_case.deletion_anchor else ", marked sibling not borrowed"))
 
 print("  fail-closed unsupported-association diagnostics:")
+diagnostic_expectations = fail_closed_diagnostic_expectations()
 for (case_label, source, expected_count,
      expected_diagnostics) in fail_closed_association_cases(
          MARKER_STREAM_OWNER_REF):
@@ -805,6 +812,21 @@ for (case_label, source, expected_count,
     if not expected_diagnostics and production_rejections:
         failures.extend(production_rejections)
         continue
+    if case_label in diagnostic_expectations:
+        expected_line, message_fragment = diagnostic_expectations[case_label]
+        exact_diagnostic = (
+            len(parse_diagnostics) == 1
+            and parse_diagnostics[0].line == expected_line
+            and message_fragment in parse_diagnostics[0].message
+        )
+        if not exact_diagnostic:
+            failures.append(
+                "G: fail-closed matrix {} expected diagnostic line/text "
+                "{}/{!r}, found {}".format(
+                    case_label, expected_line, message_fragment,
+                    [(item.line, item.message)
+                     for item in parse_diagnostics]))
+            continue
     print("    {}: census={}, diagnostics={}, production={}".format(
         case_label, len(found_case), len(parse_diagnostics),
         "rejected" if production_rejections else "not-applicable"))

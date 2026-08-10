@@ -279,10 +279,19 @@ aliases, multiline and parenthesized function names, attributes, member
 qualifiers, direct member/subobject returns, reopened and nested named namespace
 identity, qualified type aliases, direct/chained/nested namespace aliases,
 public declarations with namespace-scope inline definitions, accessible
-inherited storage, and lexical alias shadowing across global, namespace,
-nested-class and sibling-class scopes. Reopened namespace fragments share only
-the aliases owned by that namespace; an identically named sibling alias cannot
-leak into owner lookup. A namespace-scope
+inherited storage through literal bases or visible non-dependent `using` and
+`typedef` base aliases, and lexical alias shadowing across global, namespace,
+nested-class and sibling-class scopes. Base aliases may be direct or chained;
+every alias lookup is evaluated at its exact lexical use point, while an alias
+right-hand side and each link in a chain are evaluated at that alias's own
+declaration point. A later declaration therefore cannot retroactively change a
+base or function signature, and a same-header class identity retained by a type
+alias cannot be reinterpreted by a nearer class or namespace alias at a later
+use. Reopened namespace fragments share only the aliases owned by that
+namespace, and an identically named sibling alias cannot leak into owner lookup.
+Multiple visible declarations of one alias coalesce only when they resolve to
+the same canonical type, class or namespace; conflicting or cyclic targets stay
+unsupported. A namespace-scope
 definition is associated only when exactly one public declaration has the same
 function name, return type and reference category, ordinary parameter-type
 sequence, member `const`/`volatile` qualification, and `&`/`&&` ref qualifier.
@@ -290,8 +299,11 @@ Parameter names and declaration-only default arguments are ignored, visible
 type aliases are expanded, and ordinary parameter types use the C++ function-
 type adjustments: top-level cv on a value parameter is ignored, including cv
 on the outermost pointer, while pointee and referred-to cv remain significant;
-prefix/suffix cv spellings are equivalent; and an outer array parameter becomes
-a pointer while element cv and nested extents remain significant. An arity,
+prefix/suffix cv spellings are equivalent; repeated `const` or `volatile`
+introduced by direct or chained alias expansion is idempotent at that exact
+base or pointer level; and an outer array parameter becomes a pointer while
+element cv and nested extents remain significant. Qualification never moves
+across a pointer, reference or array-element boundary. An arity,
 parameter-type, cv/ref or value-return sibling therefore cannot lend its
 documentation, source line or public access to the definition; zero or multiple
 exact matches are rejected conservatively.
@@ -325,13 +337,21 @@ cannot be associated inside this boundary emits a line-specific diagnostic,
 and the production Tier-G gate fails on every such diagnostic. The matrix pins
 that fail-closed path with compiler-valid nested function-pointer declarators,
 including qualified parenthesized names and `operator[]` / `operator()`, and
-separately proves that ordinary value-return and qualified namespace free-
-function definitions do not raise it. Macro-generated
-declarations, dependent bases, imported members, lambda/coroutine returns and
-forms that require template instantiation are outside this dependency-free
-subset. Those forms are not associated by declaration order; a public
-reference accessor may not use one until the gate is extended with a positive
-fixture for it.
+with a qualified class-template owner or a member-like return through an
+unresolved base. A template-id owner is recognized but is not reported as a
+successful census entry because the parser does not instantiate templates; it
+diagnoses only when one exact normalized declaration is public, so an unrelated
+public overload cannot lend access to a private target. For an unresolved base,
+direct qualified member and subobject returns such as `Base<T>::storage_`,
+including the supported `std::get<I>(...)` wrapper, diagnose instead of being
+silently omitted. The controls separately prove that value-return, member-call,
+free-object, private, private-template and qualified namespace free-function
+forms do not raise that diagnostic. Macro-generated declarations, dependent
+bases, imported members, lambda/coroutine returns and forms that require
+template instantiation remain outside the positive dependency-free subset.
+Those forms are not associated by declaration order or basename; a
+recognizable public reference accessor must diagnose until the gate is extended
+with a sound positive fixture for it.
 
 ## Blocking
 

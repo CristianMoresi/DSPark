@@ -250,6 +250,146 @@ void verifyAllChannelCeiling(int runtimeChannels)
     }
 }
 
+template <typename T, int MaxChannels>
+void fillMeasurementRangeTone(AudioBuffer<T, MaxChannels>& b, double sampleRate,
+                              int runtimeChannels, T amplitude)
+{
+    const int numSamples = static_cast<int>(std::ceil(0.6 * sampleRate));
+    b.resize(runtimeChannels, numSamples);
+    for (int channel = 0; channel < runtimeChannels; ++channel)
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const T unit = static_cast<T>(std::sin(
+                twoPi<double> * 997.0 * static_cast<double>(i) / sampleRate));
+            b.getChannel(channel)[i] = static_cast<T>(unit * amplitude);
+        }
+}
+
+template <typename T, int MaxChannels>
+void verifyMeasurementRange(double sampleRate, int runtimeChannels)
+{
+    using Normalizer = LoudnessNormalizer<T>;
+    using Status = typename Normalizer::Status;
+
+    AudioBuffer<T, MaxChannels> baselineAudio;
+    fillMeasurementRangeTone(baselineAudio, sampleRate, runtimeChannels, T(1));
+    Normalizer baselineNormalizer;
+    const auto baseline = baselineNormalizer.normalize(baselineAudio, sampleRate);
+    EXPECT_TRUE(baseline.status == Status::Success);
+    EXPECT_TRUE(finiteResult<T>(baseline));
+    const double baselineLUFS = static_cast<double>(baseline.measuredLUFS);
+
+    const T belowUpperBoundary = static_cast<T>(std::pow(
+        10.0, (29.7 - baselineLUFS) / 20.0));
+    const T aboveUpperBoundary = static_cast<T>(std::pow(
+        10.0, (30.2 - baselineLUFS) / 20.0));
+
+    auto runPoint = [&](const char* label, T amplitude, bool expectSuccess)
+    {
+        AudioBuffer<T, MaxChannels> audio;
+        fillMeasurementRangeTone(audio, sampleRate, runtimeChannels, amplitude);
+        const auto before = snapshot(audio);
+        Normalizer normalizer;
+        const auto result = normalizer.normalize(audio, sampleRate);
+        const double expectedMeasured = baselineLUFS
+            + 20.0 * std::log10(static_cast<double>(amplitude));
+
+        EXPECT_FALSE(result.status == Status::NoMeasurableLoudness);
+        EXPECT_TRUE(finiteResult<T>(result));
+        if (expectSuccess)
+        {
+            EXPECT_TRUE(result.status == Status::Success);
+            EXPECT_NEAR(static_cast<double>(result.measuredLUFS),
+                        expectedMeasured, 0.11);
+            EXPECT_NEAR(static_cast<double>(result.requestedGainDb),
+                        -23.0 - static_cast<double>(result.measuredLUFS),
+                        0.001);
+            EXPECT_FALSE(result.ceilingLimited);
+            EXPECT_TRUE(result.targetReached);
+            EXPECT_TRUE(std::abs(static_cast<double>(result.outLUFS) + 23.0)
+                        <= 0.1);
+            EXPECT_TRUE(std::abs(expectedMeasured
+                                 + static_cast<double>(result.appliedGainDb)
+                                 + 23.0) <= 0.11);
+            for (int channel = 0; channel < runtimeChannels; ++channel)
+                for (int i = 0; i < audio.getNumSamples(); ++i)
+                    EXPECT_TRUE(std::isfinite(audio.getChannel(channel)[i]));
+        }
+        else
+        {
+            EXPECT_TRUE(result.status == Status::NumericalFailure);
+            EXPECT_TRUE(bitwiseEqual(audio, before));
+            EXPECT_EQ(result.measuredLUFS, T(-100));
+            EXPECT_EQ(result.requestedGainDb, T(0));
+            EXPECT_EQ(result.appliedGainDb, T(0));
+            EXPECT_EQ(result.outLUFS, T(-100));
+            EXPECT_EQ(result.outTruePeakDb, T(-100));
+            EXPECT_FALSE(result.targetReached);
+            EXPECT_FALSE(result.ceilingLimited);
+        }
+        std::printf("  [ln] range type=%s rate=%.0f channels=%d point=%s "
+                    "amplitude=%.6e status=%d measured=%+.3f expected=%+.3f\n",
+                    std::is_same_v<T, float> ? "float" : "double",
+                    sampleRate, runtimeChannels, label,
+                    static_cast<double>(amplitude),
+                    static_cast<int>(result.status),
+                    static_cast<double>(result.measuredLUFS), expectedMeasured);
+    };
+
+    runPoint("ordinary", T(0.1), true);
+    runPoint("below-upper-histogram", belowUpperBoundary, true);
+    runPoint("above-upper-histogram", aboveUpperBoundary, false);
+    runPoint("amplitude-100", T(100), false);
+    runPoint("amplitude-1e10", T(1.0e10), false);
+
+    if constexpr (std::is_same_v<T, double>)
+    {
+        const double blockSamples = std::max(1.0, sampleRate * 0.1);
+        const double accumulationPivot = std::sqrt(
+            std::numeric_limits<double>::max()
+            / (blockSamples * runtimeChannels));
+        runPoint("below-power-overflow-pivot", accumulationPivot * 0.1, false);
+        runPoint("above-power-overflow-pivot", accumulationPivot * 10.0, false);
+        runPoint("amplitude-1e153", 1.0e153, false);
+        runPoint("representable-max-half",
+                 std::numeric_limits<double>::max() / 2.0, false);
+        runPoint("representable-max", std::numeric_limits<double>::max(), false);
+    }
+    else
+    {
+        runPoint("representable-max-quarter",
+                 std::numeric_limits<float>::max() / 4.0f, false);
+        runPoint("representable-max-half",
+                 std::numeric_limits<float>::max() / 2.0f, false);
+        runPoint("representable-max", std::numeric_limits<float>::max(), false);
+    }
+}
+
+template <typename T>
+void verifyBelowGateStatuses()
+{
+    using Normalizer = LoudnessNormalizer<T>;
+    using Status = typename Normalizer::Status;
+    const std::array<T, 3> levels {
+        T(0), std::numeric_limits<T>::denorm_min(), T(1.0e-4)
+    };
+    for (const T level : levels)
+    {
+        AudioBuffer<T, 2> audio;
+        audio.resize(2, 24000);
+        std::fill_n(audio.getChannel(0), audio.getNumSamples(), level);
+        std::fill_n(audio.getChannel(1), audio.getNumSamples(), level);
+        const auto before = snapshot(audio);
+        Normalizer normalizer;
+        const auto result = normalizer.normalize(audio, 48000.0);
+        EXPECT_TRUE(result.status == Status::NoMeasurableLoudness);
+        EXPECT_TRUE(bitwiseEqual(audio, before));
+        EXPECT_TRUE(finiteResult<T>(result));
+        EXPECT_FALSE(result.targetReached);
+        EXPECT_FALSE(result.ceilingLimited);
+    }
+}
+
 // EBU Tech 3341 signal builders.
 void toneSeq(AudioBuffer<double>& b, double fs, const double (*segs)[2], int nSeg)
 {
@@ -685,6 +825,31 @@ DSPARK_TEST(LoudnessNorm_numerical_failures_precede_mutation)
     EXPECT_TRUE(result.status == LoudnessNormalizer<float>::Status::Success);
     EXPECT_LT(result.appliedGainDb, -200.0f);
     EXPECT_NEAR(result.appliedGainDb, result.requestedGainDb, 0.001);
+}
+
+DSPARK_TEST(LoudnessNorm_measurement_range_is_truthful_or_rejected)
+{
+    LoudnessMeter<double> meter;
+    meter.prepare(48000.0, 1);
+    EXPECT_TRUE(meter.isMeasurementValid());
+    const double hostile = std::numeric_limits<double>::max();
+    meter.process(&hostile, 1);
+    EXPECT_FALSE(meter.isMeasurementValid());
+    meter.reset();
+    EXPECT_TRUE(meter.isMeasurementValid());
+    const double silence = 0.0;
+    meter.process(&silence, 1);
+    EXPECT_TRUE(meter.isMeasurementValid());
+
+    for (const double sampleRate : { 8000.0, 48000.0, 192000.0 })
+    {
+        verifyMeasurementRange<float, 2>(sampleRate, 1);
+        verifyMeasurementRange<float, 2>(sampleRate, 2);
+        verifyMeasurementRange<double, 2>(sampleRate, 1);
+        verifyMeasurementRange<double, 2>(sampleRate, 2);
+    }
+    verifyBelowGateStatuses<float>();
+    verifyBelowGateStatuses<double>();
 }
 
 DSPARK_TEST(LoudnessNorm_is_deterministic_and_idempotent)

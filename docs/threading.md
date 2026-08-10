@@ -276,10 +276,15 @@ does that with `getChroma()` / `getChord()`, and `Music/KeyDetector.h` with
 that return member storage positively. Its dependency-free C++ tokenizer and
 declaration parser resolves explicit and trailing return types, const-reference
 aliases, multiline and parenthesized declarators, attributes, member
-qualifiers, direct member/subobject returns, and lexical alias shadowing across
-global, namespace, nested-class and sibling-class scopes. Its production-policy
-mutation matrix checks every spelling and scope, marker deletion, and value/
-temporary/parameter/local near miss on every run. It currently finds eight: the two marked sites
+qualifiers, direct member/subobject returns, reopened and nested named namespace
+identity, qualified aliases, public declarations with namespace-scope inline
+definitions, accessible inherited storage, and lexical alias shadowing across
+global, namespace, nested-class and sibling-class scopes. Return roots are
+bound against parameters and visible block locals before member lookup;
+`this->` explicitly selects the member. Its production-policy mutation matrix
+checks every spelling, scope and binding, isolated marker deletion, and value/
+temporary/parameter/local near miss on every run. It currently finds eight: the
+two marked sites
 above and six explicit legacy warnings whose component audits must document
 them. A new unmarked site fails the check, so the warning set cannot grow
 silently. `Core/Biquad.h`'s `getCoeffs()` illustrates the hazard:
@@ -291,6 +296,15 @@ sub-processor itself, so what may be done with the reference is that processor's
 contract. The rule to carry away is unchanged: a getter that returns a reference
 or raw pointer belongs to the processing thread unless its own documentation
 says otherwise.
+
+The parser's deliberate boundary is named class/struct definitions and named
+namespaces present in the same header, with direct return expressions and
+ordinary parameter or block-local declarations. Base definitions and aliases
+must also be visible in that header. Macro-generated declarations, dependent
+bases, imported members, lambda/coroutine returns and forms that require
+template instantiation are outside this dependency-free subset; a public
+reference accessor may not use one of those forms until the gate is extended
+with a positive fixture for it.
 
 ## Blocking
 

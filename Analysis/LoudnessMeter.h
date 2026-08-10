@@ -19,8 +19,8 @@
  * - process() / processBlock(): audio thread (stream owner). No-op before
  *   prepare().
  * - All readouts (getMomentaryLUFS, getShortTermLUFS, getIntegratedLUFS,
- *   getLoudnessRange, getTruePeakDb): any thread, lock-free; values are
- *   approximate while a block is in flight (metering).
+ *   getLoudnessRange, getTruePeakDb, isMeasurementValid): any thread,
+ *   lock-free; values are approximate while a block is in flight (metering).
  *
  * Dependencies: AudioBuffer.h, AudioSpec.h, DspMath.h, TruePeakDetector.h.
  */
@@ -34,6 +34,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <numbers>
 #include <array>
 
@@ -128,10 +129,15 @@ public:
             // K-filter / histogram path already self-recovers, so the true
             // peak must too (same non-finite robustness contract).
             const T tp0 = truePeak_.processSample(data[i], 0);
-            if (std::isfinite(tp0)) tpMax = std::max(tpMax, tp0);
+            if (std::isfinite(tp0))
+                tpMax = std::max(tpMax, tp0);
+            else
+                invalidateMeasurement();
 
             double filtered = applyKWeighting(static_cast<double>(data[i]), 0);
             currentBlockPower_ += filtered * filtered;
+            if (!std::isfinite(currentBlockPower_))
+                invalidateMeasurement();
 
             if (++currentBlockSamples_ >= blockSamples_)
                 commitBlock();
@@ -158,13 +164,21 @@ public:
             // Inf/NaN sample must not latch the max-hold at +Inf forever.
             const T tpL = truePeak_.processSample(left[i], 0);
             const T tpR = truePeak_.processSample(right[i], 1);
-            if (std::isfinite(tpL)) tpMax = std::max(tpMax, tpL);
-            if (std::isfinite(tpR)) tpMax = std::max(tpMax, tpR);
+            if (std::isfinite(tpL))
+                tpMax = std::max(tpMax, tpL);
+            else
+                invalidateMeasurement();
+            if (std::isfinite(tpR))
+                tpMax = std::max(tpMax, tpR);
+            else
+                invalidateMeasurement();
 
             double filtL = applyKWeighting(static_cast<double>(left[i]), 0);
             double filtR = applyKWeighting(static_cast<double>(right[i]), 1);
 
             currentBlockPower_ += (filtL * filtL + filtR * filtR);
+            if (!std::isfinite(currentBlockPower_))
+                invalidateMeasurement();
 
             if (++currentBlockSamples_ >= blockSamples_)
                 commitBlock();
@@ -200,7 +214,7 @@ public:
     {
         // Pass 1: Absolute Gate (-70 LUFS)
         double sumPowerUngated = 0.0;
-        uint32_t countUngated = 0;
+        uint64_t countUngated = 0;
 
         for (int i = 0; i < kNumBins; ++i)
         {
@@ -224,7 +238,7 @@ public:
         relativeGateBin = std::clamp(relativeGateBin, 0, kNumBins - 1);
 
         double sumPowerGated = 0.0;
-        uint32_t countGated = 0;
+        uint64_t countGated = 0;
 
         for (int i = relativeGateBin; i < kNumBins; ++i)
         {
@@ -240,6 +254,20 @@ public:
         if (countGated == 0) return T(-100);
 
         return static_cast<T>(powerToLUFS(sumPowerGated / countGated));
+    }
+
+    /**
+     * @brief Reports whether every measurement since reset was representable.
+     *
+     * False means a filter/accumulator became non-finite, a block had to be
+     * discarded, or a histogram could not represent another value exactly.
+     * The streaming meter continues recovering where possible, but an offline
+     * caller can use this diagnostic to distinguish recovery from silence.
+     * reset() starts a new diagnostic transaction.
+     */
+    [[nodiscard]] bool isMeasurementValid() const noexcept
+    {
+        return measurementValid_.load(std::memory_order_relaxed);
     }
 
     /**
@@ -264,7 +292,7 @@ public:
     {
         // Pass 1: relative gate from the mean of absolute-gated ST values.
         double sumPower = 0.0;
-        uint32_t count = 0;
+        uint64_t count = 0;
         for (int i = 0; i < kNumBins; ++i)
         {
             const uint32_t c = lraHistogram_[i].load(std::memory_order_relaxed);
@@ -281,16 +309,16 @@ public:
         gateBin = std::clamp(gateBin, 0, kNumBins - 1);
 
         // Pass 2: 10th / 95th percentiles above the relative gate.
-        uint32_t gatedCount = 0;
+        uint64_t gatedCount = 0;
         for (int i = gateBin; i < kNumBins; ++i)
             gatedCount += lraHistogram_[i].load(std::memory_order_relaxed);
         if (gatedCount == 0) return T(0);
 
-        const auto target10 = static_cast<uint32_t>(0.10 * gatedCount);
-        const auto target95 = static_cast<uint32_t>(0.95 * gatedCount);
+        const auto target10 = static_cast<uint64_t>(0.10 * gatedCount);
+        const auto target95 = static_cast<uint64_t>(0.95 * gatedCount);
 
         double p10 = kMinHistogramLUFS, p95 = kMaxHistogramLUFS;
-        uint32_t running = 0;
+        uint64_t running = 0;
         bool have10 = false;
         for (int i = gateBin; i < kNumBins; ++i)
         {
@@ -339,6 +367,7 @@ public:
         totalCommittedBlocks_ = 0;
         currentBlockPower_ = 0.0;
         currentBlockSamples_ = 0;
+        measurementValid_.store(true, std::memory_order_relaxed);
     }
 
 private:
@@ -420,6 +449,7 @@ private:
         // measuring clean on the next one.
         if (!std::isfinite(meanPower))
         {
+            invalidateMeasurement();
             for (int ch = 0; ch < kMaxChannels; ++ch)
             {
                 preState_[ch] = {};
@@ -451,11 +481,17 @@ private:
             gating400 *= 0.25;
 
             const double lufs = powerToLUFS(gating400);
-            if (lufs >= kMinHistogramLUFS)
+            if (!std::isfinite(gating400) || !std::isfinite(lufs))
+            {
+                invalidateMeasurement();
+            }
+            else if (lufs >= kMinHistogramLUFS)
             {
                 int binIndex = static_cast<int>(std::round((lufs - kMinHistogramLUFS) / kBinWidth));
+                if (binIndex >= kNumBins)
+                    invalidateMeasurement();
                 binIndex = std::clamp(binIndex, 0, kNumBins - 1);
-                histogram_[binIndex].fetch_add(1, std::memory_order_relaxed);
+                incrementHistogram(histogram_[binIndex]);
             }
         }
 
@@ -464,13 +500,35 @@ private:
         if (totalCommittedBlocks_ >= 30 && (totalCommittedBlocks_ % 10) == 0)
         {
             const double stLufs = static_cast<double>(calculateLUFSFromBlocks(30));
-            if (stLufs >= kMinHistogramLUFS)
+            if (!std::isfinite(stLufs))
+            {
+                invalidateMeasurement();
+            }
+            else if (stLufs >= kMinHistogramLUFS)
             {
                 int binIndex = static_cast<int>(std::round((stLufs - kMinHistogramLUFS) / kBinWidth));
+                if (binIndex >= kNumBins)
+                    invalidateMeasurement();
                 binIndex = std::clamp(binIndex, 0, kNumBins - 1);
-                lraHistogram_[binIndex].fetch_add(1, std::memory_order_relaxed);
+                incrementHistogram(lraHistogram_[binIndex]);
             }
         }
+    }
+
+    void invalidateMeasurement() noexcept
+    {
+        measurementValid_.store(false, std::memory_order_relaxed);
+    }
+
+    void incrementHistogram(std::atomic<uint32_t>& bin) noexcept
+    {
+        if (bin.load(std::memory_order_relaxed)
+            == std::numeric_limits<uint32_t>::max())
+        {
+            invalidateMeasurement();
+            return;
+        }
+        bin.fetch_add(1, std::memory_order_relaxed);
     }
 
     T calculateLUFSFromBlocks(int numBlocks) const noexcept
@@ -518,6 +576,9 @@ private:
 
     // EBU Tech 3342 loudness-range histogram (short-term values, 1 s hop)
     std::array<std::atomic<uint32_t>, kNumBins> lraHistogram_;
+
+    // Sticky for one reset-to-reset measurement transaction.
+    std::atomic<bool> measurementValid_ { true };
 
     // ITU-R BS.1770-4 true-peak (dBTP) tracking
     TruePeakDetector<T, kMaxChannels> truePeak_;

@@ -42,9 +42,12 @@ Tiers
   G  public const-reference accessors that return member storage, enumerated
      POSITIVELY by declaration-aware tokenization. Explicit/trailing returns,
      const-reference aliases, multiline/parenthesized declarators, attributes,
-     qualifiers and direct member/subobject returns are covered; value,
-     temporary, parameter and local returns are excluded. A stream-owner-only
-     readout carries the marker `stream-owner reference readout` in both its
+     qualifiers, reopened/qualified namespace aliases, namespace-scope inline
+     definitions, accessible inherited storage and direct member/subobject
+     returns are covered; value, temporary, shadowing parameter and shadowing
+     local returns are excluded. Explicit `this->` remains member-bound. A
+     stream-owner-only readout carries the marker `stream-owner reference readout`
+     in both its
      method documentation and the class's Threading block. Existing unmarked
      sites are an explicit, counted legacy set until their owning audits
      document them; any new unclassified site is a failure, so the warning set
@@ -855,6 +858,42 @@ for matrix_label, source in negative_matrix:
         failures.append("G: matrix near miss entered the census: " + matrix_label)
     else:
         print("    {}: excluded".format(matrix_label))
+
+# Bind the same unqualified token before falling back to a member. Method and
+# class markers are present in all three cases, so comments cannot manufacture
+# a candidate when a parameter or visible local owns the spelling.
+def binding_source(parameters="", local=""):
+    return """
+/** Threading: the publication is atomic; this is a %s. */
+struct BindingOwner {
+    using Storage = int;
+    /** %s */
+    const Storage& bindingAccessor(%s) const
+    {
+        %s
+        return storage_;
+    }
+    int getPublished() const { return 0; }
+private:
+    Storage storage_ = 0;
+};
+""" % (MARKER_STREAM_OWNER_REF, MARKER_STREAM_OWNER_REF, parameters, local)
+
+
+binding_cases = (
+    ("member", binding_source()),
+    ("parameter-shadow", binding_source("const Storage& storage_")),
+    ("block-local-shadow", binding_source(
+        local="static const Storage storage_ = 1;")),
+)
+binding_counts = [len(find_public_const_reference_accessors(source))
+                  for _, source in binding_cases]
+print("    member-binding-discriminator: expected=1/0/0 found={}".format(
+    "/".join(map(str, binding_counts))))
+if binding_counts != [1, 0, 0]:
+    failures.append(
+        "G: member/parameter/local binding discriminator expected 1/0/0, got "
+        + "/".join(map(str, binding_counts)))
 reference_sites = []
 marked_sites = set()
 for path in sorted(p for p in SOURCES

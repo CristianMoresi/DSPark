@@ -178,6 +178,11 @@ public:
         }
 
         const T measured = measureIntegrated(audio, sampleRate);
+        if (!meter_.isMeasurementValid())
+        {
+            out.status = Status::NumericalFailure;
+            return out;
+        }
         const T inputTruePeak = measureTruePeakLinear(audio);
         if (!std::isfinite(measured) || !std::isfinite(inputTruePeak)
             || inputTruePeak < T(0))
@@ -186,9 +191,9 @@ public:
             return out;
         }
 
-        out.measuredLUFS = measured;
         if (measured <= kMeterFloorLUFS || !(inputTruePeak > T(0)))
         {
+            out.measuredLUFS = measured;
             out.status = Status::NoMeasurableLoudness;
             out.outLUFS = measured;
             out.outTruePeakDb = linearToDecibels(inputTruePeak, T(-100));
@@ -206,8 +211,6 @@ public:
         const T appliedLinear = std::min(requestedLinear, ceilingSafeLinear);
         const T appliedGainDb = linearToDecibels(appliedLinear, T(0));
 
-        out.requestedGainDb = std::isfinite(requestedGainDb)
-                            ? requestedGainDb : T(0);
         if (!std::isfinite(requestedGainDb) || !std::isfinite(requestedLinear)
             || !std::isfinite(ceilingLinear)
             || !std::isfinite(ceilingSafeLinear)
@@ -221,6 +224,8 @@ public:
             return out;
         }
 
+        out.measuredLUFS = measured;
+        out.requestedGainDb = requestedGainDb;
         out.appliedGainDb = appliedGainDb;
         out.ceilingLimited = ceilingSafeLinear < requestedLinear;
 

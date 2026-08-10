@@ -48,6 +48,12 @@ Tiers
      owner or ancestor retain exact owner, qualifier and member-declaration
      identities across relative, absolute, namespace and visible class-alias
      spellings, including complete-class and accessible inherited aliases;
+     out-of-class leading returns use enclosing namespace/global lookup while
+     parameters, trailing returns and bodies use the exact member owner.
+     Positive subobjects admit dot/index suffixes and literal std::get forms,
+     while custom get calls and post-root pointer arrows remain ordinary
+     negatives. Every return retains exact identity and source position;
+     singular identity is projected only for a uniform complete collection.
      value, temporary, shadowing
      parameter and shadowing local returns are excluded. Explicit `this->`
      remains member-bound. Out-of-class definitions match a unique declaration
@@ -630,9 +636,47 @@ def reference_accessors(path):
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
     accessors, diagnostics = analyze_public_const_reference_accessors(text)
-    return ([(item.name, item.documentation, item.class_documentation,
-              item.class_definition, item.line)
-             for item in accessors], diagnostics)
+    return accessors, diagnostics, text
+
+
+def reference_binding_issues(label, item, source):
+    """Validate the complete return collection and compatibility projection."""
+    issues = []
+    bindings = tuple(item.return_bindings)
+    if not bindings:
+        return [label + " exposes no return-binding records"]
+    if any(binding.disposition != "bound" for binding in bindings):
+        issues.append(label + " exposes a non-bound enumerated return")
+    positions = tuple(binding.source_offset for binding in bindings)
+    if (positions != tuple(sorted(positions))
+            or len(set(positions)) != len(positions)):
+        issues.append(label + " return positions are not unique source order")
+    for binding in bindings:
+        if (source[binding.source_offset:binding.source_offset + 6] != "return"
+                or binding.source_line
+                != source.count("\n", 0, binding.source_offset) + 1):
+            issues.append(label + " has a detached return source position")
+            break
+    identities = tuple((
+        tuple(binding.qualifier_target),
+        tuple(binding.member_declaring_owner),
+        binding.member_name,
+    ) for binding in bindings)
+    uniform = (
+        all(binding.disposition == "bound" for binding in bindings)
+        and all(identity == identities[0] for identity in identities)
+    )
+    projection = identities[0] if uniform else ((), (), "")
+    observed = (
+        tuple(item.qualifier_target),
+        tuple(item.member_declaring_owner),
+        item.member_name,
+    )
+    if item.binding_identity_is_uniform is not uniform:
+        issues.append(label + " has an incorrect uniform-binding flag")
+    if observed != projection:
+        issues.append(label + " has a non-atomic singular binding projection")
+    return issues
 
 
 def reference_diagnostic_issues(label, diagnostics):
@@ -704,6 +748,29 @@ for qualified_case in qualified_cases:
                 len(parse_diagnostics)))
         continue
     item = found_matrix[0]
+    binding_issues = reference_binding_issues(
+        "qualified matrix {} state()".format(qualified_case.label),
+        item, qualified_case.source)
+    exact_binding = (
+        len(item.return_bindings) == 1
+        and item.binding_identity_is_uniform
+        and (
+            tuple(item.return_bindings[0].qualifier_target),
+            tuple(item.return_bindings[0].member_declaring_owner),
+            item.return_bindings[0].member_name,
+        ) == (
+            qualified_case.qualifier_target,
+            qualified_case.member_declaring_owner,
+            qualified_case.member_name,
+        )
+    )
+    if binding_issues or not exact_binding:
+        failures.extend("G: " + issue for issue in binding_issues)
+        if not exact_binding:
+            failures.append(
+                "G: qualified matrix {} did not retain its exact return binding"
+                .format(qualified_case.label))
+        continue
     policy_issues = reference_policy_issues(
         "qualified matrix {} state()".format(qualified_case.label),
         item.documentation, item.class_documentation, "getPublished", True)
@@ -808,6 +875,12 @@ for identity_case in cpp_identity_association_cases(MARKER_STREAM_OWNER_REF):
                 int(identity_case.expected_marker),
                 identity_case.expected_line, identity_case.expected_access,
                 actual))
+        continue
+    binding_issues = reference_binding_issues(
+        "identity matrix {} state()".format(identity_case.label),
+        found_matrix[0], identity_case.source)
+    if binding_issues:
+        failures.extend("G: " + issue for issue in binding_issues)
         continue
     if (identity_case.deletion_anchor
             and found_matrix[0].documentation.strip()
@@ -922,6 +995,12 @@ for matrix_label, source in accepted_matrix:
         continue
     matrix_item = found_matrix[0]
     matrix_site = "matrix {} {}()".format(matrix_label, matrix_item.name)
+    binding_issues = reference_binding_issues(
+        matrix_site, matrix_item, source)
+    if binding_issues:
+        failures.extend("G: matrix binding: " + issue
+                        for issue in binding_issues)
+        continue
     issues = reference_policy_issues(
         matrix_site, matrix_item.documentation, matrix_item.class_documentation,
         "getPublished",
@@ -1174,17 +1253,25 @@ reference_sites = []
 marked_sites = set()
 for path in sorted(p for p in SOURCES
                    if p.startswith(FRAMEWORK_DIRS) and p.endswith(".h")):
-    parsed_accessors, parse_diagnostics = reference_accessors(path)
+    parsed_accessors, parse_diagnostics, reference_source = \
+        reference_accessors(path)
     if parse_diagnostics:
         failures.extend(reference_diagnostic_issues(path, parse_diagnostics))
         for diagnostic in parse_diagnostics:
             print("  UNSUPPORTED {}:{}  {}".format(
                 path, diagnostic.line, diagnostic.message))
-    for name, region, class_documentation, class_definition, line_no in \
-            parsed_accessors:
+    for item in parsed_accessors:
+        name = item.name
+        region = item.documentation
+        class_documentation = item.class_documentation
+        class_definition = item.class_definition
+        line_no = item.line
         site = (path, name)
         reference_sites.append(site)
         label = "{}:{} {}()".format(path, line_no, name)
+        failures.extend(
+            "G: " + issue for issue in reference_binding_issues(
+                label, item, reference_source))
         marked = MARKER_STREAM_OWNER_REF in region
         if marked:
             marked_sites.add(site)

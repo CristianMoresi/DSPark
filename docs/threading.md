@@ -284,9 +284,21 @@ inherited storage through literal bases or visible non-dependent `using` and
 nested-class and sibling-class scopes. Base aliases may be direct or chained;
 direct return roots may also spell
 `[this->] class-id::member` before a supported field, balanced index or
-`std::get<I>` subobject. The expression's `class-id` is resolved independently
-at that exact use point and must be the accessor owner or one uniquely reachable
-accessible ancestor. Qualified lookup retains the exact accessor owner,
+literal `std::get<I>` / `::std::get<I>` subobject. Only dot fields and balanced
+built-in indexes may follow a storage root; a later `->` crosses an indirection
+and does not prove member-subobject ownership. That exclusion does not affect
+the supported `this->member` and `this->class-id::member` object prefixes.
+Unqualified, ADL-selected, namespace-aliased and custom qualified `get` calls
+remain ordinary call negatives. A relative `std::get` is standard only when
+`std` is unshadowed and denotes the global standard namespace at that exact
+use point; a local type alias, class, namespace or namespace alias named `std`
+makes the call an ordinary 0/0 negative. A later namespace- or non-member-class
+declaration does not retroactively shadow an earlier use. The absolute
+`::std::get` spelling is not affected by such local shadows, while an alias to
+`::std` is still not one of the two admitted literal spellings. The
+expression's `class-id` is resolved
+independently at that exact use point and must be the accessor owner or one
+uniquely reachable accessible ancestor. Qualified lookup retains the exact accessor owner,
 qualifier target, data-member owner and member name, so ordinary hiding,
 ambiguous base subobjects, inheritance access and private members cannot be
 replaced by a matching basename. Relative, absolute, namespace-qualified,
@@ -301,7 +313,12 @@ friendship stays fail-closed. Inline member-function bodies use complete-class
 lookup for the owner and its enclosing classes, including later aliases, and
 may use an accessible unambiguous alias inherited from a base. Function return
 types and namespace/global lookup keep their ordinary point-of-declaration
-behavior.
+behavior. In an out-of-class member definition, an explicit leading return
+type is resolved in the enclosing namespace/global context before the
+qualified declarator. Parameters, supported member suffixes, a trailing return
+type and the body are resolved after that boundary in the exact member-owner
+context. The parser segments those token ranges before canonicalizing types; it
+never reparses the whole signature under one convenient scope.
 Every alias lookup is evaluated at its exact lexical use point, while an alias
 right-hand side and each link in a chain are evaluated at that alias's own
 declaration point. A later declaration therefore cannot retroactively change a
@@ -329,7 +346,13 @@ documentation, source line or public access to the definition; zero or multiple
 exact matches are rejected conservatively.
 Return roots are bound against parameters and visible block locals before
 member lookup; `this->` explicitly selects the member. Every return in a method
-must bind positively for enumeration. An unsupported owner/ancestor return
+is retained as an ordered record with its disposition, exact qualifier/member
+identity and return-token offset and line, and every record must bind positively
+for enumeration. Equal returns are not deduplicated. When all records carry one
+exact identity, the legacy singular identity fields project that value and an
+explicit uniform flag is true. When identities differ, the complete collection
+remains authoritative, the flag is false and all three singular identity fields
+are cleared together rather than selecting a branch by source order. An unsupported owner/ancestor return
 diagnoses even beside a bound return, while a bound return mixed only with a
 deliberate negative (an unrelated class, call, namespace object, parameter or
 other non-member) remains an ordinary 0/0 exclusion. Its production-policy

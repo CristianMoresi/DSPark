@@ -30,6 +30,8 @@ class ReferenceAccessor:
     line: int
     access: str
     accessor_owner: tuple = ()
+    return_bindings: tuple = ()
+    binding_identity_is_uniform: bool = False
     qualifier_target: tuple = ()
     member_declaring_owner: tuple = ()
     member_name: str = ""
@@ -87,6 +89,18 @@ class QualifiedMemberBinding:
 
 
 @dataclass(frozen=True)
+class ReturnBinding:
+    """One exact return-expression classification and source position."""
+
+    disposition: str
+    qualifier_target: tuple = ()
+    member_declaring_owner: tuple = ()
+    member_name: str = ""
+    source_offset: int = 0
+    source_line: int = 0
+
+
+@dataclass(frozen=True)
 class NamespaceRegion:
     opening: int
     closing: int
@@ -109,13 +123,26 @@ class FunctionSignature:
 
 
 @dataclass(frozen=True)
+class FunctionDeclaratorStructure:
+    """Token ranges of one supported function declarator."""
+
+    name: str
+    name_start: int
+    parameters_open: int
+    parameters_close: int
+    trailing_return: int = -1
+
+
+@dataclass(frozen=True)
 class AliasResolutionEnvironment:
     type_aliases: dict
     namespace_aliases: dict
     known_namespaces: frozenset
+    namespace_declarations: dict
     namespace_alias_cache: dict
     classes_by_identity: dict
     class_identities: dict
+    class_declarations: dict
     type_alias_cache: dict
     complete_class_scopes: dict
     base_edges: dict
@@ -1204,8 +1231,8 @@ def _function_name_candidate(signature, parameter_open, paren_pairs):
     return None if name is None else (name, name_start)
 
 
-def _function_signature_details(signature, aliases):
-    """Return the supported function-declaration details or ``None``."""
+def _function_declarator_structure(signature):
+    """Segment a supported declarator before resolving any type tokens."""
     if not signature:
         return None
     local_pairs = _pair_map(signature, "(", ")")
@@ -1251,7 +1278,7 @@ def _function_signature_details(signature, aliases):
             selected = before_initializer[-1]
 
     name, name_start, parameter_open, parameter_close = selected
-    trailing = None
+    trailing = -1
     qualifier_depth = 0
     for index in range(parameter_close + 1, len(signature)):
         value = signature[index].text
@@ -1259,13 +1286,38 @@ def _function_signature_details(signature, aliases):
         if value == "->" and qualifier_depth == 0:
             trailing = index
             break
-    if trailing is not None:
+    return FunctionDeclaratorStructure(
+        name=name,
+        name_start=name_start,
+        parameters_open=parameter_open,
+        parameters_close=parameter_close,
+        trailing_return=trailing,
+    )
+
+
+def _function_signature_details(signature, aliases, structure=None,
+                                leading_return_aliases=None,
+                                trailing_return_aliases=None):
+    """Return supported declaration details under token-range contexts."""
+    if structure is None:
+        structure = _function_declarator_structure(signature)
+    if structure is None:
+        return None
+
+    name = structure.name
+    name_start = structure.name_start
+    parameter_open = structure.parameters_open
+    parameter_close = structure.parameters_close
+    trailing = structure.trailing_return
+    if trailing >= 0:
         return_values = [token.text for token in signature[trailing + 1:]]
         if "requires" in return_values:
             return_values = return_values[:return_values.index("requires")]
+        return_aliases = trailing_return_aliases or aliases
     else:
         owner_start = _qualified_owner_start(signature, name_start)
         return_values = [token.text for token in signature[:owner_start]]
+        return_aliases = leading_return_aliases or aliases
     return_values = _strip_leading_template_headers(return_values)
     parameter_types = _canonical_parameter_types(
         signature, parameter_open, parameter_close, aliases)
@@ -1275,8 +1327,9 @@ def _function_signature_details(signature, aliases):
         signature, parameter_close)
     return FunctionSignature(
         name=name,
-        const_reference=_is_const_lvalue_reference(return_values, aliases),
-        return_type=_canonical_type_tokens(return_values, aliases),
+        const_reference=_is_const_lvalue_reference(
+            return_values, return_aliases),
+        return_type=_canonical_type_tokens(return_values, return_aliases),
         parameter_types=parameter_types,
         member_const=member_const,
         member_volatile=member_volatile,
@@ -1367,7 +1420,7 @@ def _member_subobject_suffix(values, cursor):
                 cursor += 1
             if depth:
                 return False
-        elif values[cursor] in (".", "->"):
+        elif values[cursor] == ".":
             cursor += 1
             if (cursor >= len(values)
                     or not _is_identifier_start(values[cursor][0])):
@@ -1379,23 +1432,142 @@ def _member_subobject_suffix(values, cursor):
 
 
 def _std_get_argument(values):
-    """Return the sole argument of the supported ``std::get<I>`` form."""
-    if len(values) < 7 or values[:3] not in (
-            ["std", "::", "get"], ["get", "<", "0"]):
+    """Return the argument of an exact standard ``get`` wrapper."""
+    if values[:4] == ["std", "::", "get", "<"]:
+        selector_open = 3
+    elif values[:5] == ["::", "std", "::", "get", "<"]:
+        selector_open = 4
+    else:
         return None
-    get_index = 2 if values[:3] == ["std", "::", "get"] else 0
-    cursor = get_index + 1
-    if cursor >= len(values) or values[cursor] != "<":
-        return None
+
+    selector_start = selector_open + 1
+    cursor = selector_start
     angle = 1
-    cursor += 1
-    while cursor < len(values) and angle:
-        angle = _angle_depth_change(values[cursor], angle)
+    parens = brackets = braces = 0
+    selector_close = None
+    while cursor < len(values):
+        value = values[cursor]
+        if (value == "," and angle == 1
+                and parens == brackets == braces == 0):
+            return None
+        if value == "<":
+            angle += 1
+        elif value == ">":
+            angle -= 1
+        elif value == ">>":
+            if angle < 2:
+                return None
+            angle -= 2
+        elif value == "(":
+            parens += 1
+        elif value == ")":
+            parens -= 1
+        elif value == "[":
+            brackets += 1
+        elif value == "]":
+            brackets -= 1
+        elif value == "{":
+            braces += 1
+        elif value == "}":
+            braces -= 1
+        if min(angle, parens, brackets, braces) < 0:
+            return None
+        if angle == 0:
+            selector_close = cursor
+            break
         cursor += 1
-    if (angle or cursor >= len(values) or values[cursor] != "("
-            or values[-1] != ")"):
+    if (selector_close is None or selector_close == selector_start
+            or parens or brackets or braces):
         return None
-    return values[cursor + 1:-1]
+
+    call_open = selector_close + 1
+    if call_open >= len(values) or values[call_open] != "(":
+        return None
+    depth = 1
+    call_close = None
+    cursor = call_open + 1
+    while cursor < len(values):
+        depth += (values[cursor] == "(") - (values[cursor] == ")")
+        if depth < 0:
+            return None
+        if depth == 0:
+            call_close = cursor
+            break
+        cursor += 1
+    if (call_close != len(values) - 1
+            or call_close == call_open + 1):
+        return None
+    return values[call_open + 1:call_close]
+
+
+def _inherited_nested_class_is_visible(owner, name, environment, active=()):
+    """Whether a base path contributes a nested class with this name."""
+    if owner in active:
+        return False
+    for edge in environment.base_edges.get(owner, ()):
+        if edge.base_class + (name,) in environment.classes_by_identity:
+            return True
+        if _inherited_nested_class_is_visible(
+                edge.base_class, name, environment, active + (owner,)):
+            return True
+    return False
+
+
+def _relative_std_names_global_namespace(aliases, block_type_aliases=()):
+    """Whether unqualified ``std`` is unshadowed at this use point."""
+    if "std" in block_type_aliases:
+        return False
+    environment = aliases.environment
+    if _namespace_alias_prefix(
+            ("std",), aliases.current_scope,
+            environment.namespace_aliases, aliases.use_position,
+            maximum=1) is not None:
+        return False
+    alias_key, _, alias_status = _expression_type_alias_lookup(
+        ("std",), False, aliases)
+    if alias_key is not None or alias_status != "none":
+        return False
+    resolved_class = _resolve_aliased_class(
+        ("std",), False, aliases.current_scope,
+        environment.namespace_aliases, aliases.use_position,
+        environment.known_namespaces,
+        environment.namespace_alias_cache,
+        environment.classes_by_identity)
+    if resolved_class is not None:
+        identity = environment.class_identities[resolved_class]
+        declaration = environment.class_declarations[identity]
+        complete = identity[:-1] in aliases.complete_class_scopes
+        if declaration <= aliases.use_position or complete:
+            return False
+    if any(
+            _inherited_nested_class_is_visible(scope, "std", environment)
+            for scope in aliases.complete_class_scopes):
+        return False
+    for length in range(len(aliases.current_scope), 0, -1):
+        namespace = tuple(aliases.current_scope[:length])
+        declarations = environment.namespace_declarations.get(
+            namespace + ("std",), ())
+        if (namespace in environment.known_namespaces
+                and any(declaration <= aliases.use_position
+                        for declaration in declarations)):
+            return False
+    return True
+
+
+def _standard_get_provenance_is_exact(values, aliases,
+                                      block_type_aliases=()):
+    """Require every admitted ``std::get`` wrapper to name global std."""
+    values = _strip_outer_parentheses(values)
+    argument = _std_get_argument(values)
+    if argument is None:
+        return True
+    absolute = values[:5] == ["::", "std", "::", "get", "<"]
+    if (not absolute
+            and not _relative_std_names_global_namespace(
+                aliases, block_type_aliases)):
+        return False
+    return _standard_get_provenance_is_exact(
+        argument, aliases, block_type_aliases)
 
 
 def _direct_member_root(values, member_names, shadow_names=()):
@@ -1751,13 +1923,44 @@ def _alias_context_at(context, use_position):
         context.complete_class_scopes)
 
 
-def _member_body_alias_context(context, use_position, owner_identity):
-    """Apply complete-class lookup only inside a member-function body."""
+def _member_scope_alias_context(context, use_position, owner_identity):
+    """Apply complete-class lookup after a qualified member declarator."""
     complete_scopes = context.environment.complete_class_scopes.get(
         tuple(owner_identity), (tuple(owner_identity),))
     return AliasContext(
         context.environment, context.current_scope, use_position,
         complete_scopes)
+
+
+def _member_body_alias_context(context, use_position, owner_identity):
+    """Apply complete-class lookup inside a member-function body."""
+    return _member_scope_alias_context(
+        context, use_position, owner_identity)
+
+
+def _definition_signature_details(signature, structure, namespace_context,
+                                  owner_context, owner_identity):
+    """Resolve each out-of-class signature range in its C++ context."""
+    leading_position = signature[0].start
+    parameter_index = min(
+        structure.parameters_open + 1, len(signature) - 1)
+    parameter_context = _member_scope_alias_context(
+        owner_context, signature[parameter_index].start, owner_identity)
+    if structure.trailing_return >= 0:
+        trailing_index = min(
+            structure.trailing_return + 1, len(signature) - 1)
+    else:
+        trailing_index = structure.name_start
+    trailing_context = _member_scope_alias_context(
+        owner_context, signature[trailing_index].start, owner_identity)
+    return _function_signature_details(
+        signature,
+        parameter_context,
+        structure,
+        leading_return_aliases=_alias_context_at(
+            namespace_context, leading_position),
+        trailing_return_aliases=trailing_context,
+    )
 
 
 def _base_specifications(base_tokens, default_access):
@@ -2300,6 +2503,9 @@ def _classify_storage_expression(values, member_names, shadow_names, aliases,
                                  unresolved_base_types,
                                  block_type_aliases=()):
     """Share one direct-storage classifier across all definition placements."""
+    if not _standard_get_provenance_is_exact(
+            values, aliases, block_type_aliases):
+        return QualifiedMemberBinding("not-member")
     root = _direct_member_root(values, member_names, shadow_names)
     if root is not None:
         relation = _select_qualified_data_member(
@@ -2347,10 +2553,65 @@ def _classify_return_bindings(bindings):
     return "deliberate-negative"
 
 
-def _qualified_owner(signature, name_start):
-    parts, absolute, has_template_id, _ = _qualified_owner_components(
-        signature, name_start)
-    return parts, absolute, has_template_id
+def _position_return_binding(binding, source_offset, source_line):
+    """Attach one classifier result to its exact return token."""
+    return ReturnBinding(
+        disposition=binding.disposition,
+        qualifier_target=tuple(binding.qualifier_target),
+        member_declaring_owner=tuple(binding.member_declaring_owner),
+        member_name=binding.member_name,
+        source_offset=source_offset,
+        source_line=source_line,
+    )
+
+
+def _retain_return_bindings(bindings):
+    """Preserve every return record in lexical source order."""
+    return tuple(bindings)
+
+
+def _binding_compatibility_projection(bindings):
+    """Project singular identity only for one uniform bound identity."""
+    identities = tuple((
+        binding.qualifier_target,
+        binding.member_declaring_owner,
+        binding.member_name,
+    ) for binding in bindings)
+    uniform = (
+        bool(bindings)
+        and all(binding.disposition == "bound" for binding in bindings)
+        and all(identity == identities[0] for identity in identities)
+    )
+    if not uniform:
+        return False, (), (), ""
+    qualifier, member_owner, member_name = identities[0]
+    return True, qualifier, member_owner, member_name
+
+
+def _classify_positioned_return_bindings(
+        returns, text, members, aliases, owner_identity, base_edges,
+        data_members, unresolved_base_types):
+    """Classify and position all returns through one shared path."""
+    output = []
+    for expression, shadows, source_offset, block_aliases in returns:
+        classification = _classify_storage_expression(
+            expression,
+            members,
+            shadows,
+            _member_body_alias_context(
+                aliases, source_offset, owner_identity),
+            owner_identity,
+            base_edges,
+            data_members,
+            unresolved_base_types,
+            block_aliases,
+        )
+        output.append(_position_return_binding(
+            classification,
+            source_offset,
+            text.count("\n", 0, source_offset) + 1,
+        ))
+    return tuple(output)
 
 
 def _direct_definition_start(tokens, parent_opening, opening, brace_pairs):
@@ -2386,9 +2647,16 @@ def analyze_public_const_reference_accessors(text):
             direct)
 
     known_namespaces = {()}
+    namespace_declarations = {}
     for namespace in namespace_regions:
         for length in range(1, len(namespace.path) + 1):
             known_namespaces.add(namespace.path[:length])
+        namespace_declarations.setdefault(namespace.path, []).append(
+            tokens[namespace.declaration].start)
+    namespace_declarations = {
+        path: tuple(sorted(declarations))
+        for path, declarations in namespace_declarations.items()
+    }
     namespace_alias_cache = {}
     class_direct_tokens = {
         region: _direct_scope_tokens(
@@ -2440,6 +2708,10 @@ def analyze_public_const_reference_accessors(text):
         region: _class_identity(region, class_regions, namespace_regions)
         for region in class_regions
     }
+    class_declarations = {
+        class_identities[region]: tokens[region.declaration].start
+        for region in class_regions
+    }
     complete_class_scopes = {
         class_identities[region]: (
             class_identities[region],
@@ -2454,9 +2726,11 @@ def analyze_public_const_reference_accessors(text):
         type_aliases=scoped_type_aliases,
         namespace_aliases=scoped_namespace_aliases,
         known_namespaces=frozenset(known_namespaces),
+        namespace_declarations=namespace_declarations,
         namespace_alias_cache=namespace_alias_cache,
         classes_by_identity=classes_by_identity,
         class_identities=class_identities,
+        class_declarations=class_declarations,
         type_alias_cache=type_alias_cache,
         complete_class_scopes=complete_class_scopes,
         base_edges=alias_base_edges,
@@ -2596,22 +2870,26 @@ def analyze_public_const_reference_accessors(text):
                 eligible = (access == "public" and details.const_reference
                             and returns)
                 owner_identity = class_identities[region]
-                bindings = [
-                    _classify_storage_expression(
-                        expr, members, shadows,
-                        _member_body_alias_context(
-                            aliases, use_position, owner_identity),
-                        owner_identity, base_edges_by_identity,
-                        data_members_by_identity, unresolved_bases[region],
-                        block_aliases)
-                    for expr, shadows, use_position, block_aliases in returns
-                ] if eligible else []
+                bindings = _classify_positioned_return_bindings(
+                    returns,
+                    text,
+                    members,
+                    aliases,
+                    owner_identity,
+                    base_edges_by_identity,
+                    data_members_by_identity,
+                    unresolved_bases[region],
+                ) if eligible else ()
                 return_classification = (
                     _classify_return_bindings(bindings)
                     if eligible else "ineligible")
                 if return_classification == "bound":
                     first = signature[0] if signature else tokens[index]
-                    binding = bindings[0]
+                    retained_bindings = _retain_return_bindings(bindings)
+                    (binding_uniform, qualifier_target,
+                     member_declaring_owner,
+                     member_name) = _binding_compatibility_projection(
+                         retained_bindings)
                     output.append(ReferenceAccessor(
                         name=details.name,
                         documentation=_preceding_doc(text, first.start),
@@ -2620,9 +2898,11 @@ def analyze_public_const_reference_accessors(text):
                         line=first.line,
                         access=access,
                         accessor_owner=owner_identity,
-                        qualifier_target=binding.qualifier_target,
-                        member_declaring_owner=binding.member_declaring_owner,
-                        member_name=binding.member_name,
+                        return_bindings=retained_bindings,
+                        binding_identity_is_uniform=binding_uniform,
+                        qualifier_target=qualifier_target,
+                        member_declaring_owner=member_declaring_owner,
+                        member_name=member_name,
                     ))
                 elif return_classification == "unresolved-base":
                     first = signature[0] if signature else tokens[index]
@@ -2684,8 +2964,8 @@ def analyze_public_const_reference_accessors(text):
                           if parent is not None else ())
         namespace_context = _context_for_namespace(
             namespace_path, alias_environment, definition_position)
-        preliminary = _function_signature_details(signature, namespace_context)
-        if preliminary is None:
+        structure = _function_declarator_structure(signature)
+        if structure is None:
             unsupported_name = _potential_const_reference_signature(
                 signature, namespace_context, require_qualified=True)
             if unsupported_name is not None:
@@ -2698,20 +2978,25 @@ def analyze_public_const_reference_accessors(text):
                         "associate it".format(unsupported_name)),
                 ))
             continue
-        owner_parts, owner_absolute, owner_has_template_id = _qualified_owner(
-            signature, preliminary.name_start)
+        (owner_parts, owner_absolute, owner_has_template_id,
+         owner_start) = _qualified_owner_components(
+             signature, structure.name_start)
         if not owner_parts:
             continue
+        owner_position = signature[owner_start].start
         owner = _resolve_aliased_class(
             owner_parts, owner_absolute, namespace_path,
-            scoped_namespace_aliases, definition_position, known_namespaces,
+            scoped_namespace_aliases, owner_position, known_namespaces,
             namespace_alias_cache, classes_by_identity)
         if owner_has_template_id:
             if owner is None:
                 continue
-            aliases = _alias_context_at(
-                alias_contexts[owner], definition_position)
-            details = _function_signature_details(signature, aliases)
+            owner_identity = class_identities[owner]
+            owner_context = _alias_context_at(
+                alias_contexts[owner], owner_position)
+            details = _definition_signature_details(
+                signature, structure, namespace_context, owner_context,
+                owner_identity)
             if details is None or not details.const_reference:
                 continue
             declared = _matching_declarations(
@@ -2725,16 +3010,18 @@ def analyze_public_const_reference_accessors(text):
                         "qualified const-reference definition {}() uses the "
                         "class-template owner {}<...>; Tier G does not "
                         "instantiate template ownership"
-                        .format(preliminary.name, "::".join(owner_parts))),
+                        .format(structure.name, "::".join(owner_parts))),
                 ))
             continue
         if owner is None:
             namespace_owner = _resolve_aliased_namespace(
                 owner_parts, owner_absolute, namespace_path,
-                scoped_namespace_aliases, definition_position,
+                scoped_namespace_aliases, owner_position,
                 known_namespaces,
                 namespace_alias_cache)
-            if preliminary.const_reference and namespace_owner is None:
+            potential_name = _potential_const_reference_signature(
+                signature, namespace_context, require_qualified=True)
+            if potential_name is not None and namespace_owner is None:
                 first = signature[0] if signature else tokens[opening]
                 diagnostics.append(ReferenceParseDiagnostic(
                     line=first.line,
@@ -2742,12 +3029,18 @@ def analyze_public_const_reference_accessors(text):
                         "const-reference definition {}() has an owner that "
                         "cannot be resolved as a same-header class or namespace "
                         "in its namespace-alias scope"
-                        .format(preliminary.name)),
+                        .format(structure.name)),
                 ))
             continue
-        aliases = _alias_context_at(
-            alias_contexts[owner], definition_position)
-        details = _function_signature_details(signature, aliases)
+        owner_identity = class_identities[owner]
+        owner_context = _alias_context_at(
+            alias_contexts[owner], owner_position)
+        details = _definition_signature_details(
+            signature, structure, namespace_context, owner_context,
+            owner_identity)
+        aliases = _member_scope_alias_context(
+            owner_context, signature[structure.name_start].start,
+            owner_identity)
         if details is None:
             if _potential_const_reference_signature(
                     signature, aliases, require_qualified=True) is not None:
@@ -2786,17 +3079,16 @@ def analyze_public_const_reference_accessors(text):
         members = all_members[owner]
         if not returns:
             continue
-        owner_identity = class_identities[owner]
-        bindings = [
-            _classify_storage_expression(
-                expr, members, shadows,
-                _member_body_alias_context(
-                    aliases, use_position, owner_identity),
-                owner_identity, base_edges_by_identity,
-                data_members_by_identity, unresolved_bases[owner],
-                block_aliases)
-            for expr, shadows, use_position, block_aliases in returns
-        ]
+        bindings = _classify_positioned_return_bindings(
+            returns,
+            text,
+            members,
+            aliases,
+            owner_identity,
+            base_edges_by_identity,
+            data_members_by_identity,
+            unresolved_bases[owner],
+        )
         return_classification = _classify_return_bindings(bindings)
         if return_classification != "bound":
             if return_classification == "unresolved-base":
@@ -2824,6 +3116,10 @@ def analyze_public_const_reference_accessors(text):
             text, tokens[owner.declaration].start)
         class_definition = text[tokens[owner.declaration].start:
                                 tokens[owner.closing].end]
+        retained_bindings = _retain_return_bindings(bindings)
+        (binding_uniform, qualifier_target, member_declaring_owner,
+         member_name) = _binding_compatibility_projection(
+             retained_bindings)
         output.append(ReferenceAccessor(
             name=details.name,
             documentation=documentation,
@@ -2832,9 +3128,11 @@ def analyze_public_const_reference_accessors(text):
             line=line,
             access=access,
             accessor_owner=owner_identity,
-            qualifier_target=bindings[0].qualifier_target,
-            member_declaring_owner=bindings[0].member_declaring_owner,
-            member_name=bindings[0].member_name,
+            return_bindings=retained_bindings,
+            binding_identity_is_uniform=binding_uniform,
+            qualifier_target=qualifier_target,
+            member_declaring_owner=member_declaring_owner,
+            member_name=member_name,
         ))
     return output, tuple(diagnostics)
 

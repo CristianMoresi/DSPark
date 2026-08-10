@@ -277,16 +277,24 @@ that return member storage positively. Its dependency-free C++ tokenizer and
 declaration parser resolves explicit and trailing return types, const-reference
 aliases, multiline and parenthesized function names, attributes, member
 qualifiers, direct member/subobject returns, reopened and nested named namespace
-identity, qualified aliases, public declarations with namespace-scope inline
-definitions, accessible inherited storage, and lexical alias shadowing across
-global, namespace, nested-class and sibling-class scopes. A namespace-scope
+identity, qualified type aliases, direct/chained/nested namespace aliases,
+public declarations with namespace-scope inline definitions, accessible
+inherited storage, and lexical alias shadowing across global, namespace,
+nested-class and sibling-class scopes. Reopened namespace fragments share only
+the aliases owned by that namespace; an identically named sibling alias cannot
+leak into owner lookup. A namespace-scope
 definition is associated only when exactly one public declaration has the same
 function name, return type and reference category, ordinary parameter-type
 sequence, member `const`/`volatile` qualification, and `&`/`&&` ref qualifier.
-Parameter names and declaration-only default arguments are ignored, and visible
-type aliases are expanded. An arity, parameter-type, cv/ref or value-return
-sibling therefore cannot lend its documentation, source line or public access
-to the definition; zero or multiple exact matches are rejected conservatively.
+Parameter names and declaration-only default arguments are ignored, visible
+type aliases are expanded, and ordinary parameter types use the C++ function-
+type adjustments: top-level cv on a value parameter is ignored, including cv
+on the outermost pointer, while pointee and referred-to cv remain significant;
+prefix/suffix cv spellings are equivalent; and an outer array parameter becomes
+a pointer while element cv and nested extents remain significant. An arity,
+parameter-type, cv/ref or value-return sibling therefore cannot lend its
+documentation, source line or public access to the definition; zero or multiple
+exact matches are rejected conservatively.
 Return roots are bound against parameters and visible block locals before
 member lookup; `this->` explicitly selects the member. Its production-policy
 mutation matrix checks every spelling, overload association, scope and binding,
@@ -309,9 +317,16 @@ namespaces present in the same header, with direct return expressions and
 ordinary parameter or block-local declarations. Base definitions and aliases
 must also be visible in that header. Overload matching removes ordinary
 top-level parameter names, so those names may differ and a default may appear
-only on the declaration; the remaining type tokens must agree after alias
-expansion. Names nested inside parenthesized declarators remain in the key, so
-different spellings are rejected rather than guessed. Macro-generated
+only on the declaration; the resulting structural type identities must agree
+after alias expansion and the parameter adjustments above. Names nested inside
+parenthesized declarators remain in the key, so different spellings are rejected
+rather than guessed. A recognizable public const-reference definition that
+cannot be associated inside this boundary emits a line-specific diagnostic,
+and the production Tier-G gate fails on every such diagnostic. The matrix pins
+that fail-closed path with compiler-valid nested function-pointer declarators,
+including qualified parenthesized names and `operator[]` / `operator()`, and
+separately proves that ordinary value-return and qualified namespace free-
+function definitions do not raise it. Macro-generated
 declarations, dependent bases, imported members, lambda/coroutine returns and
 forms that require template instantiation are outside this dependency-free
 subset. Those forms are not associated by declaration order; a public

@@ -49,7 +49,14 @@ Tiers
      remains member-bound. Out-of-class definitions match a unique declaration
      by parameter types, member cv/ref qualifiers and return type/category;
      ordinary parameter names and declaration-only defaults are ignored. A
-     stream-owner-only readout carries the marker `stream-owner reference readout`
+     C++ function-type identity normalizes top-level parameter cv, equivalent
+     cv spelling and outer array-to-pointer adjustment while preserving
+     pointee/referred cv and nested array extents. Namespace aliases resolve by
+     lexical direct/chained/nested identity without sibling leakage. A
+     recognizable unsupported const-reference definition emits a production-
+     fatal diagnostic; ordinary value and qualified namespace free-function
+     definitions do not. A stream-owner-only readout carries the marker
+     `stream-owner reference readout`
      in both its
      method documentation and the class's Threading block. Existing unmarked
      sites are an explicit, counted legacy set until their owning audits
@@ -65,6 +72,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from threading_reference_parser import (  # noqa: E402
+    analyze_public_const_reference_accessors,
+    cpp_identity_association_cases,
+    fail_closed_association_cases,
     find_public_const_reference_accessors,
     mutation_matrix_cases,
     overload_association_cases,
@@ -605,12 +615,21 @@ STREAM_OWNER_FOREIGN_READOUT = {
 }
 
 def reference_accessors(path):
-    """Public const-reference functions returning member storage."""
+    """Public const-reference functions plus fail-closed parser diagnostics."""
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
-    return [(item.name, item.documentation, item.class_documentation,
-             item.class_definition, item.line)
-            for item in find_public_const_reference_accessors(text)]
+    accessors, diagnostics = analyze_public_const_reference_accessors(text)
+    return ([(item.name, item.documentation, item.class_documentation,
+              item.class_definition, item.line)
+             for item in accessors], diagnostics)
+
+
+def reference_diagnostic_issues(label, diagnostics):
+    """Make unsupported associations fatal in the production Tier-G gate."""
+    return [
+        "G: {}:{}: {}".format(label, diagnostic.line, diagnostic.message)
+        for diagnostic in diagnostics
+    ]
 
 
 def reference_policy_issues(label, region, class_documentation, foreign,
@@ -672,6 +691,123 @@ for (matrix_label, source, expected_count, expected_marker,
     print("    {}: count={}, marker={}, line={}, policy={}".format(
         matrix_label, len(found_matrix), int(actual_marker), actual_line,
         "classified" if expected_marker else "missing-marker rejection"))
+
+print("  C++ parameter identity and namespace-alias association matrix:")
+for identity_case in cpp_identity_association_cases(MARKER_STREAM_OWNER_REF):
+    found_matrix, parse_diagnostics = \
+        analyze_public_const_reference_accessors(identity_case.source)
+    if parse_diagnostics:
+        failures.extend(reference_diagnostic_issues(
+            "identity matrix " + identity_case.label, parse_diagnostics))
+        continue
+    actual_marker = bool(
+        found_matrix
+        and MARKER_STREAM_OWNER_REF in found_matrix[0].documentation)
+    metadata_matches = (
+        len(found_matrix) == identity_case.expected_count
+        and found_matrix[0].name == "state"
+        and actual_marker == identity_case.expected_marker
+        and found_matrix[0].line == identity_case.expected_line
+        and found_matrix[0].access == identity_case.expected_access
+    )
+    if not metadata_matches:
+        actual = [(item.name,
+                   MARKER_STREAM_OWNER_REF in item.documentation,
+                   item.line, item.access) for item in found_matrix]
+        failures.append(
+            "G: identity matrix {} expected count/name/marker/line/access "
+            "{}/state/{}/{}/{}, found {}".format(
+                identity_case.label, identity_case.expected_count,
+                int(identity_case.expected_marker),
+                identity_case.expected_line, identity_case.expected_access,
+                actual))
+        continue
+    if (identity_case.deletion_anchor
+            and found_matrix[0].documentation.strip()
+            != identity_case.deletion_anchor):
+        failures.append(
+            "G: identity matrix {} did not preserve the matched declaration's "
+            "exact documentation".format(identity_case.label))
+        continue
+
+    policy_issues = reference_policy_issues(
+        "identity matrix {} state()".format(identity_case.label),
+        found_matrix[0].documentation, found_matrix[0].class_documentation,
+        "getPublished", True)
+    missing_marker = any("has no" in issue and "marker" in issue
+                         for issue in policy_issues)
+    if missing_marker == identity_case.expected_marker:
+        failures.append(
+            "G: identity matrix {} did not bind policy to the exact matched "
+            "declaration".format(identity_case.label))
+        continue
+
+    if identity_case.deletion_anchor:
+        if identity_case.source.count(identity_case.deletion_anchor) != 1:
+            failures.append(
+                "G: identity matrix {} has no unique matched-marker anchor"
+                .format(identity_case.label))
+            continue
+        deleted_source = identity_case.source.replace(
+            identity_case.deletion_anchor,
+            "/** ordinary matched declaration after mutation */", 1)
+        deleted, deleted_diagnostics = \
+            analyze_public_const_reference_accessors(deleted_source)
+        if deleted_diagnostics:
+            failures.extend(reference_diagnostic_issues(
+                "identity deletion " + identity_case.label,
+                deleted_diagnostics))
+            continue
+        deleted_metadata = (
+            len(deleted) == 1 and deleted[0].name == "state"
+            and deleted[0].line == identity_case.expected_line
+            and deleted[0].access == identity_case.expected_access
+            and MARKER_STREAM_OWNER_REF not in deleted[0].documentation)
+        deleted_issues = [] if not deleted else reference_policy_issues(
+            "identity deletion {} state()".format(identity_case.label),
+            deleted[0].documentation, deleted[0].class_documentation,
+            "getPublished", True)
+        if (not deleted_metadata
+                or MARKER_STREAM_OWNER_REF not in deleted_source
+                or not any("has no" in issue and "marker" in issue
+                           for issue in deleted_issues)):
+            failures.append(
+                "G: identity matrix {} matched-marker deletion did not retain "
+                "discovery and fail policy while sibling/class markers remained"
+                .format(identity_case.label))
+            continue
+    print("    {}: exact identity/metadata{}".format(
+        identity_case.label,
+        ", marker deletion fails policy"
+        if identity_case.deletion_anchor else ", marked sibling not borrowed"))
+
+print("  fail-closed unsupported-association diagnostics:")
+for (case_label, source, expected_count,
+     expected_diagnostics) in fail_closed_association_cases(
+         MARKER_STREAM_OWNER_REF):
+    found_case, parse_diagnostics = \
+        analyze_public_const_reference_accessors(source)
+    production_rejections = reference_diagnostic_issues(
+        "fail-closed matrix " + case_label, parse_diagnostics)
+    if (len(found_case) != expected_count
+            or len(parse_diagnostics) != expected_diagnostics):
+        failures.append(
+            "G: fail-closed matrix {} expected census/diagnostics {}/{}, "
+            "found {}/{}".format(
+                case_label, expected_count, expected_diagnostics,
+                len(found_case), len(parse_diagnostics)))
+        continue
+    if expected_diagnostics and not production_rejections:
+        failures.append(
+            "G: fail-closed matrix {} produced no production-gate rejection"
+            .format(case_label))
+        continue
+    if not expected_diagnostics and production_rejections:
+        failures.extend(production_rejections)
+        continue
+    print("    {}: census={}, diagnostics={}, production={}".format(
+        case_label, len(found_case), len(parse_diagnostics),
+        "rejected" if production_rejections else "not-applicable"))
 
 print("  declaration spelling and near-miss mutation matrix (production policy):")
 accepted_matrix, negative_matrix = mutation_matrix_cases(MARKER_STREAM_OWNER_REF)
@@ -935,8 +1071,14 @@ reference_sites = []
 marked_sites = set()
 for path in sorted(p for p in SOURCES
                    if p.startswith(FRAMEWORK_DIRS) and p.endswith(".h")):
+    parsed_accessors, parse_diagnostics = reference_accessors(path)
+    if parse_diagnostics:
+        failures.extend(reference_diagnostic_issues(path, parse_diagnostics))
+        for diagnostic in parse_diagnostics:
+            print("  UNSUPPORTED {}:{}  {}".format(
+                path, diagnostic.line, diagnostic.message))
     for name, region, class_documentation, class_definition, line_no in \
-            reference_accessors(path):
+            parsed_accessors:
         site = (path, name)
         reference_sites.append(site)
         label = "{}:{} {}()".format(path, line_no, name)

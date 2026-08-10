@@ -28,6 +28,15 @@ class ReferenceAccessor:
     class_documentation: str
     class_definition: str
     line: int
+    access: str
+
+
+@dataclass(frozen=True)
+class ReferenceParseDiagnostic:
+    """A const-reference definition that the bounded parser cannot bind."""
+
+    line: int
+    message: str
 
 
 @dataclass(frozen=True)
@@ -68,6 +77,24 @@ class AliasContext:
     unqualified: dict
     qualified: dict
     current_scope: tuple = ()
+
+
+@dataclass(frozen=True)
+class NamespaceAliasTarget:
+    scope: tuple
+    absolute: bool
+    parts: tuple
+
+
+@dataclass(frozen=True)
+class IdentityAssociationCase:
+    label: str
+    source: str
+    expected_count: int
+    expected_marker: bool
+    expected_line: int
+    expected_access: str
+    deletion_anchor: str = ""
 
 
 _MULTI_PUNCTUATION = (
@@ -407,6 +434,141 @@ def _merge_aliases(alias_maps):
     return merged
 
 
+def _collect_namespace_aliases(tokens, scope):
+    """Collect direct namespace aliases owned by one lexical scope."""
+    aliases = {}
+    ambiguous = set()
+    index = 0
+    while index + 3 < len(tokens):
+        if (tokens[index].text != "namespace"
+                or not _is_identifier_start(tokens[index + 1].text[0])
+                or tokens[index + 2].text != "="):
+            index += 1
+            continue
+        name = tokens[index + 1].text
+        end = index + 3
+        while end < len(tokens) and tokens[end].text != ";":
+            end += 1
+        values = [token.text for token in tokens[index + 3:end]]
+        absolute = bool(values and values[0] == "::")
+        if absolute:
+            values = values[1:]
+        parts = values[::2]
+        separators = values[1::2]
+        valid = (bool(parts)
+                 and all(part and _is_identifier_start(part[0])
+                         for part in parts)
+                 and all(separator == "::" for separator in separators)
+                 and len(values) == len(parts) + len(separators))
+        if valid:
+            target = NamespaceAliasTarget(tuple(scope), absolute, tuple(parts))
+            if name in aliases and aliases[name] != target:
+                ambiguous.add(name)
+            elif name not in ambiguous:
+                aliases[name] = target
+        index = end + 1
+    for name in ambiguous:
+        aliases.pop(name, None)
+    return aliases
+
+
+def _merge_namespace_aliases(alias_maps):
+    merged = {}
+    ambiguous = set()
+    for aliases in alias_maps:
+        for name, target in aliases.items():
+            if name in merged and merged[name] != target:
+                ambiguous.add(name)
+            elif name not in ambiguous:
+                merged[name] = target
+    for name in ambiguous:
+        merged.pop(name, None)
+    return merged
+
+
+def _namespace_alias_prefix(parts, scope, aliases, maximum=None,
+                            absolute=False):
+    if maximum is None:
+        maximum = len(parts)
+    for prefix_length in range(min(maximum, len(parts)), 0, -1):
+        prefix = tuple(parts[:prefix_length])
+        scope_lengths = (0,) if absolute else range(len(scope), -1, -1)
+        for scope_length in scope_lengths:
+            key = tuple(scope[:scope_length]) + prefix
+            if key in aliases:
+                return key, prefix_length
+    return None
+
+
+def _resolve_namespace_alias(key, aliases, known_namespaces, cache,
+                             active=()):
+    if key in cache:
+        return cache[key]
+    if key in active:
+        return None
+    target = aliases.get(key)
+    if target is None:
+        return None
+
+    match = _namespace_alias_prefix(
+        target.parts, target.scope, aliases,
+        absolute=target.absolute)
+    if match is not None:
+        nested_key, consumed = match
+        base = _resolve_namespace_alias(
+            nested_key, aliases, known_namespaces, cache, active + (key,))
+        candidate = None if base is None else base + target.parts[consumed:]
+        resolved = candidate if candidate in known_namespaces else None
+    else:
+        candidates = ((target.parts,) if target.absolute else (
+            tuple(target.scope[:length]) + target.parts
+            for length in range(len(target.scope), -1, -1)))
+        resolved = next((candidate for candidate in candidates
+                         if candidate in known_namespaces), None)
+    cache[key] = resolved
+    return resolved
+
+
+def _resolve_aliased_class(parts, absolute, scope, namespace_aliases,
+                           known_namespaces, alias_cache,
+                           classes_by_identity):
+    match = _namespace_alias_prefix(
+        parts, scope, namespace_aliases,
+        maximum=max(0, len(parts) - 1), absolute=absolute)
+    if match is not None:
+        key, consumed = match
+        namespace = _resolve_namespace_alias(
+            key, namespace_aliases, known_namespaces, alias_cache)
+        if namespace is None:
+            return None
+        return classes_by_identity.get(namespace + tuple(parts[consumed:]))
+    if absolute:
+        return classes_by_identity.get(tuple(parts))
+    return _resolve_class(parts, scope, classes_by_identity)
+
+
+def _resolve_aliased_namespace(parts, absolute, scope, namespace_aliases,
+                               known_namespaces, alias_cache):
+    """Resolve a qualified owner that may be a namespace, not a class."""
+    match = _namespace_alias_prefix(
+        parts, scope, namespace_aliases, absolute=absolute)
+    if match is not None:
+        key, consumed = match
+        namespace = _resolve_namespace_alias(
+            key, namespace_aliases, known_namespaces, alias_cache)
+        candidate = None if namespace is None else (
+            namespace + tuple(parts[consumed:]))
+        return candidate if candidate in known_namespaces else None
+    if absolute:
+        candidate = tuple(parts)
+        return candidate if candidate in known_namespaces else None
+    for length in range(len(scope), -1, -1):
+        candidate = tuple(scope[:length]) + tuple(parts)
+        if candidate in known_namespaces:
+            return candidate
+    return None
+
+
 def _strip_attributes(values):
     result = []
     depth = 0
@@ -432,6 +594,17 @@ def _lookup_qualified_alias(parts, absolute, aliases):
 
 
 def _expand_aliases(values, aliases):
+    def append_replacement(output, replacement):
+        # In ``const Alias`` the qualifier applies to the alias as a whole,
+        # not to the first token of its replacement. Move an immediately
+        # preceding cv sequence behind the replacement so ``const Pointer``
+        # expands like ``Pointer const`` (for Pointer = int*, int* const).
+        prefix_cv = []
+        while output and output[-1] in ("const", "volatile"):
+            prefix_cv.insert(0, output.pop())
+        output.extend(replacement)
+        output.extend(prefix_cv)
+
     expanded = list(values)
     for _ in range(16):
         changed = False
@@ -452,7 +625,7 @@ def _expand_aliases(values, aliases):
                     replacement = _lookup_qualified_alias(parts, absolute,
                                                           aliases)
                     if replacement is not None:
-                        output.extend(replacement)
+                        append_replacement(output, replacement)
                         changed = True
                     else:
                         output.extend(expanded[index:end])
@@ -460,7 +633,7 @@ def _expand_aliases(values, aliases):
                     continue
                 replacement = aliases.unqualified.get(parts[0])
                 if replacement is not None:
-                    output.extend(replacement)
+                    append_replacement(output, replacement)
                     changed = True
                 else:
                     output.append(parts[0])
@@ -491,13 +664,139 @@ def _qualified_owner_start(signature, name_start):
         cursor -= 2
     if cursor >= 0 and signature[cursor].text == "::":
         cursor -= 1
+    if cursor >= 0 and signature[cursor].text == "(":
+        return cursor
     return cursor + 1
 
 
-def _canonical_type_tokens(values, aliases):
+def _angle_depth_change(value, depth):
+    if value == "<":
+        return depth + 1
+    if value == ">" and depth:
+        return depth - 1
+    if value == ">>" and depth >= 2:
+        return depth - 2
+    return depth
+
+
+def _array_suffix(values):
+    """Split ordinary declarator array suffixes from their element type."""
+    parens = angles = 0
+    opening = None
+    for index, value in enumerate(values):
+        if value == "(" and angles == 0:
+            parens += 1
+        elif value == ")" and angles == 0:
+            parens -= 1
+        elif parens == 0:
+            angles = _angle_depth_change(value, angles)
+        if value == "[" and parens == angles == 0:
+            opening = index
+            break
+    if opening is None:
+        return list(values), ()
+
+    groups = []
+    cursor = opening
+    while cursor < len(values):
+        if values[cursor] != "[":
+            return None
+        closing = cursor + 1
+        depth = 1
+        while closing < len(values) and depth:
+            depth += (values[closing] == "[") - (values[closing] == "]")
+            closing += 1
+        if depth:
+            return None
+        groups.append(tuple(values[cursor + 1:closing - 1]))
+        cursor = closing
+    return list(values[:opening]), tuple(groups)
+
+
+def _canonical_ordinary_type(values, parameter):
+    """Build a bounded structural identity for ordinary C++ declarators.
+
+    Modifiers are stored from the base type outwards. This makes the C++
+    parameter adjustments explicit: an outer array becomes a pointer, and cv
+    is removed only from the outermost non-reference parameter type. Pointee,
+    referred-to and inner-pointer cv therefore remain load-bearing.
+    """
+    split = _array_suffix(values)
+    if split is None:
+        return ("raw", tuple(values))
+    core, arrays = split
+
+    base = []
+    base_cv = []
+    modifiers = []
+    index = 0
+    angles = parens = 0
+    while index < len(core):
+        value = core[index]
+        if value == "(" and angles == 0:
+            parens += 1
+        elif value == ")" and angles == 0:
+            parens -= 1
+        elif parens == 0:
+            angles = _angle_depth_change(value, angles)
+        if parens < 0:
+            return ("raw", tuple(values))
+        if parens == angles == 0 and value in ("*", "&", "&&"):
+            break
+        if parens == angles == 0 and value in ("const", "volatile"):
+            base_cv.append(value)
+        else:
+            base.append(value)
+        index += 1
+
+    if parens or angles or not base:
+        return ("raw", tuple(values))
+
+    while index < len(core):
+        value = core[index]
+        if value in ("&", "&&"):
+            if index + 1 != len(core):
+                return ("raw", tuple(values))
+            modifiers.append(("lref" if value == "&" else "rref",))
+            index += 1
+            continue
+        if value != "*":
+            return ("raw", tuple(values))
+        index += 1
+        pointer_cv = []
+        while index < len(core) and core[index] in ("const", "volatile"):
+            pointer_cv.append(core[index])
+            index += 1
+        modifiers.append(("pointer", tuple(
+            qualifier for qualifier in ("const", "volatile")
+            for _ in range(pointer_cv.count(qualifier)))))
+
+    canonical_base_cv = tuple(
+        qualifier for qualifier in ("const", "volatile")
+        for _ in range(base_cv.count(qualifier)))
+
+    if arrays:
+        # Tokens spell dimensions outermost first. Declarator modifiers are
+        # represented base-outwards, so retain inner extents in reverse order.
+        for extent in reversed(arrays[1:] if parameter else arrays):
+            modifiers.append(("array", extent))
+        if parameter:
+            modifiers.append(("pointer", ()))
+
+    if parameter:
+        if modifiers and modifiers[-1][0] == "pointer":
+            modifiers[-1] = ("pointer", ())
+        elif not modifiers:
+            canonical_base_cv = ()
+
+    return ("type", tuple(base), canonical_base_cv, tuple(modifiers))
+
+
+def _canonical_type_tokens(values, aliases, parameter=False):
     values = [value for value in _strip_attributes(values)
               if value not in _RETURN_SPECIFIERS]
-    return tuple(_expand_aliases(values, aliases))
+    expanded = _expand_aliases(values, aliases)
+    return _canonical_ordinary_type(expanded, parameter)
 
 
 def _ordinary_parameter_name_index(values):
@@ -572,11 +871,12 @@ def _canonical_parameter_types(signature, parameter_open, parameter_close,
             return None
         if name_index >= 0:
             del values[name_index]
-        canonical = _canonical_type_tokens(values, aliases)
+        canonical = _canonical_type_tokens(values, aliases, parameter=True)
         if not canonical:
             return None
         output.append(canonical)
-    if len(output) == 1 and output[0] == ("void",):
+    if (len(output) == 1 and output[0]
+            == ("type", ("void",), (), ())):
         return ()
     return tuple(output)
 
@@ -623,6 +923,49 @@ def _signature_key(details):
     )
 
 
+def _function_name_candidate(signature, parameter_open, paren_pairs):
+    """Return a supported function name and its declarator start."""
+    previous = parameter_open - 1
+    if previous < 0:
+        return None
+
+    name = None
+    name_start = previous
+    if _is_identifier_start(signature[previous].text[0]):
+        possible = signature[previous].text
+        if (possible not in _NON_FUNCTION_NAMES
+                and not (possible == "operator"
+                         and paren_pairs.get(parameter_open)
+                         == parameter_open + 1)):
+            name = possible
+    elif signature[previous].text == ")":
+        left = paren_pairs.get(previous)
+        if left is not None:
+            inside = [
+                part.text for part in signature[left + 1:previous]
+                if part.text not in ("[[", "]]")
+            ]
+            if (left > 0 and signature[left - 1].text == "operator"
+                    and not inside):
+                name = "operator()"
+                name_start = left - 1
+            elif (len(inside) == 1
+                  and _is_identifier_start(inside[0][0])):
+                name = inside[0]
+                name_start = left
+            elif (len(inside) >= 3 and inside[-2] == "::"
+                  and _is_identifier_start(inside[-1][0])):
+                name = inside[-1]
+                name_start = previous - 1
+    elif (previous >= 2
+          and signature[previous - 2].text == "operator"
+          and signature[previous - 1].text == "["
+          and signature[previous].text == "]"):
+        name = "operator[]"
+        name_start = previous - 2
+    return None if name is None else (name, name_start)
+
+
 def _function_signature_details(signature, aliases):
     """Return the supported function-declaration details or ``None``."""
     if not signature:
@@ -642,32 +985,10 @@ def _function_signature_details(signature, aliases):
         if attribute_depth:
             continue
         if value == "(" and depth == 0:
-            previous = index - 1
-            name = None
-            name_start = previous
-            if previous >= 0 and _is_identifier_start(signature[previous].text[0]):
-                possible = signature[previous].text
-                if possible not in _NON_FUNCTION_NAMES:
-                    name = possible
-            elif previous >= 0 and signature[previous].text == ")":
-                left = local_pairs.get(previous)
-                if left is not None:
-                    inside = [part.text for part in signature[left + 1:previous]
-                              if part.text not in ("[[", "]]")]
-                    if len(inside) == 1 and _is_identifier_start(inside[0][0]):
-                        name = inside[0]
-                        name_start = left
-                if (left is not None and left > 0
-                        and signature[left - 1].text == "operator"
-                        and left + 1 == previous):
-                    name = "operator()"
-                    name_start = left - 1
-            elif (previous >= 2 and signature[previous - 2].text == "operator"
-                  and signature[previous - 1].text == "["
-                  and signature[previous].text == "]"):
-                name = "operator[]"
-                name_start = previous - 2
-            if name is not None:
+            candidate = _function_name_candidate(
+                signature, index, local_pairs)
+            if candidate is not None:
+                name, name_start = candidate
                 closing = local_pairs.get(index)
                 if closing is not None:
                     candidates.append((name, name_start, index, closing))
@@ -725,6 +1046,51 @@ def _function_signature_details(signature, aliases):
         parameters_open=parameter_open,
         parameters_close=parameter_close,
     )
+
+
+def _potential_const_reference_signature(signature, aliases,
+                                         require_qualified=False):
+    """Recognize a const-reference function before parameter parsing.
+
+    This intentionally does less than ``_function_signature_details``. It is
+    used only to turn an otherwise invisible unsupported definition into a
+    fail-closed diagnostic; it never creates a census entry.
+    """
+    pairs = _pair_map(signature, "(", ")")
+    depth = 0
+    for index, token in enumerate(signature):
+        value = token.text
+        if value == "(" and depth == 0 and index:
+            candidate = _function_name_candidate(signature, index, pairs)
+            if candidate is None:
+                depth += 1
+                continue
+            name, name_start = candidate
+            qualified = (name_start > 0
+                         and signature[name_start - 1].text == "::")
+            if require_qualified and not qualified:
+                depth += 1
+                continue
+            owner_start = _qualified_owner_start(signature, name_start)
+            return_values = [part.text for part in signature[:owner_start]]
+            closing = pairs.get(index)
+            if closing is not None:
+                qualifier_depth = 0
+                for cursor in range(closing + 1, len(signature)):
+                    current = signature[cursor].text
+                    qualifier_depth += (current == "(") - (current == ")")
+                    if current == "->" and qualifier_depth == 0:
+                        return_values = [
+                            part.text for part in signature[cursor + 1:]
+                        ]
+                        if "requires" in return_values:
+                            return_values = return_values[
+                                :return_values.index("requires")]
+                        break
+            if _is_const_lvalue_reference(return_values, aliases):
+                return name
+        depth += (value == "(") - (value == ")")
+    return None
 
 
 def _function_signature(signature, aliases):
@@ -1127,7 +1493,8 @@ def _qualified_owner(signature, name_start):
             break
         reversed_parts.append(owner)
         cursor -= 2
-    return tuple(reversed(reversed_parts))
+    absolute = cursor >= 0 and signature[cursor].text == "::"
+    return tuple(reversed(reversed_parts)), absolute
 
 
 def _direct_definition_start(tokens, parent_opening, opening, brace_pairs):
@@ -1146,8 +1513,8 @@ def _direct_definition_start(tokens, parent_opening, opening, brace_pairs):
     return start
 
 
-def find_public_const_reference_accessors(text):
-    """Enumerate the supported public const-reference member accessors."""
+def analyze_public_const_reference_accessors(text):
+    """Enumerate accessors and report recognizable unsupported bindings."""
     tokens = tokenize_cpp(text)
     brace_pairs = _pair_map(tokens, "{", "}")
     class_regions = _class_regions(tokens, brace_pairs)
@@ -1164,6 +1531,27 @@ def find_public_const_reference_accessors(text):
         path: _merge_aliases(fragments)
         for path, fragments in namespace_fragments.items()
     }
+
+    global_namespace_aliases = _collect_namespace_aliases(
+        _direct_scope_tokens(tokens, -1, len(tokens), brace_pairs), ())
+    namespace_alias_fragments = {}
+    for namespace in namespace_regions:
+        namespace_alias_fragments.setdefault(namespace.path, []).append(
+            _collect_namespace_aliases(_direct_scope_tokens(
+                tokens, namespace.opening, namespace.closing, brace_pairs),
+                namespace.path))
+    scoped_namespace_aliases = {
+        (name,): target for name, target in global_namespace_aliases.items()
+    }
+    for path, fragments in namespace_alias_fragments.items():
+        for name, target in _merge_namespace_aliases(fragments).items():
+            scoped_namespace_aliases[path + (name,)] = target
+
+    known_namespaces = {()}
+    for namespace in namespace_regions:
+        for length in range(1, len(namespace.path) + 1):
+            known_namespaces.add(namespace.path[:length])
+    namespace_alias_cache = {}
     class_aliases = {
         region: _collect_aliases(_direct_scope_tokens(
             tokens, region.opening, region.closing, brace_pairs))
@@ -1230,6 +1618,7 @@ def find_public_const_reference_accessors(text):
     }
 
     output = []
+    diagnostics = []
     declarations = {region: {} for region in class_regions}
 
     for region in class_regions:
@@ -1255,12 +1644,13 @@ def find_public_const_reference_accessors(text):
             if value == ";":
                 signature = tokens[member_start:index]
                 details = _function_signature_details(signature, aliases)
-                if details is not None and access == "public":
+                if details is not None:
                     first = signature[0] if signature else tokens[index]
                     declarations[region].setdefault(details.name, []).append((
                         details,
                         _preceding_doc(text, first.start),
                         first.line,
+                        access,
                     ))
                 member_start = index + 1
                 index += 1
@@ -1290,8 +1680,21 @@ def find_public_const_reference_accessors(text):
                         class_documentation=class_documentation,
                         class_definition=class_definition,
                         line=first.line,
+                        access=access,
                     ))
-                member_start = body_close + 1
+            elif access == "public":
+                unsupported_name = _potential_const_reference_signature(
+                    signature, aliases)
+                if unsupported_name is not None:
+                    first = signature[0] if signature else tokens[index]
+                    diagnostics.append(ReferenceParseDiagnostic(
+                        line=first.line,
+                        message=(
+                            "public const-reference definition {}() uses an "
+                            "unsupported declarator; Tier G cannot safely "
+                            "classify it".format(unsupported_name)),
+                    ))
+            member_start = body_close + 1
             index = body_close + 1
 
     # Public declarations may keep their inline definition at namespace scope.
@@ -1320,23 +1723,77 @@ def find_public_const_reference_accessors(text):
             qualified_aliases)
         preliminary = _function_signature_details(signature, namespace_context)
         if preliminary is None:
+            unsupported_name = _potential_const_reference_signature(
+                signature, namespace_context, require_qualified=True)
+            if unsupported_name is not None:
+                first = signature[0] if signature else tokens[opening]
+                diagnostics.append(ReferenceParseDiagnostic(
+                    line=first.line,
+                    message=(
+                        "qualified const-reference definition {}() uses an "
+                        "unsupported declarator; Tier G cannot safely "
+                        "associate it".format(unsupported_name)),
+                ))
             continue
-        owner_parts = _qualified_owner(signature, preliminary.name_start)
+        owner_parts, owner_absolute = _qualified_owner(
+            signature, preliminary.name_start)
         if not owner_parts:
             continue
-        owner = _resolve_class(owner_parts, namespace_path,
-                               classes_by_identity)
+        owner = _resolve_aliased_class(
+            owner_parts, owner_absolute, namespace_path,
+            scoped_namespace_aliases, known_namespaces,
+            namespace_alias_cache, classes_by_identity)
         if owner is None:
+            namespace_owner = _resolve_aliased_namespace(
+                owner_parts, owner_absolute, namespace_path,
+                scoped_namespace_aliases, known_namespaces,
+                namespace_alias_cache)
+            if preliminary.const_reference and namespace_owner is None:
+                first = signature[0] if signature else tokens[opening]
+                diagnostics.append(ReferenceParseDiagnostic(
+                    line=first.line,
+                    message=(
+                        "const-reference definition {}() has an owner that "
+                        "cannot be resolved as a same-header class or namespace "
+                        "in its namespace-alias scope"
+                        .format(preliminary.name)),
+                ))
             continue
         aliases = alias_contexts[owner]
         details = _function_signature_details(signature, aliases)
-        if details is None or not details.const_reference:
+        if details is None:
+            if _potential_const_reference_signature(
+                    signature, aliases, require_qualified=True) is not None:
+                first = signature[0] if signature else tokens[opening]
+                diagnostics.append(ReferenceParseDiagnostic(
+                    line=first.line,
+                    message=(
+                        "const-reference definition for resolved owner {} "
+                        "uses an unsupported declarator"
+                        .format("::".join(owner_parts))),
+                ))
+            continue
+        if not details.const_reference:
             continue
         declared = [
             item for item in declarations[owner].get(details.name, ())
             if _signature_key(item[0]) == _signature_key(details)
         ]
-        if len(declared) != 1 or not declared[0][0].const_reference:
+        if len(declared) != 1:
+            first = signature[0] if signature else tokens[opening]
+            diagnostics.append(ReferenceParseDiagnostic(
+                line=first.line,
+                message=(
+                    "const-reference definition {}() matched {} declarations; "
+                    "Tier G requires one exact owner, name, parameter, return "
+                    "and member-qualifier identity".format(
+                        details.name, len(declared))),
+            ))
+            continue
+        if not declared[0][0].const_reference:
+            continue
+        _, documentation, line, access = declared[0]
+        if access != "public":
             continue
         body_close = brace_pairs[opening]
         body = tokens[opening + 1:body_close]
@@ -1347,7 +1804,6 @@ def find_public_const_reference_accessors(text):
                 _direct_member_expression(expr, members, shadows)
                 for expr, shadows in returns):
             continue
-        _, documentation, line = declared[0]
         class_documentation = _preceding_class_doc(
             text, tokens[owner.declaration].start)
         class_definition = text[tokens[owner.declaration].start:
@@ -1358,8 +1814,404 @@ def find_public_const_reference_accessors(text):
             class_documentation=class_documentation,
             class_definition=class_definition,
             line=line,
+            access=access,
         ))
-    return output
+    return output, tuple(diagnostics)
+
+
+def find_public_const_reference_accessors(text):
+    """Enumerate the supported public const-reference member accessors."""
+    accessors, _ = analyze_public_const_reference_accessors(text)
+    return accessors
+
+
+def cpp_identity_association_cases(marker):
+    """Production Tier-G C++ identity and namespace-alias fixtures."""
+    class_doc = (
+        "/** Threading: this is a {}; getPublished is atomic. */"
+        .format(marker))
+    matched_doc = "/** {} matched declaration */".format(marker)
+    sibling_doc = "/** {} sibling declaration */".format(marker)
+
+    def owner_case(declarations, definition, prelude=""):
+        return """
+{prelude}
+{class_doc}
+struct Owner {{
+public:
+{declarations}
+    int getPublished() const noexcept {{ return 0; }}
+private:
+    int storage_ = 7;
+}};
+{definition}
+int main() {{ return 0; }}
+""".format(prelude=prelude, class_doc=class_doc,
+           declarations=declarations, definition=definition)
+
+    cases = [
+        IdentityAssociationCase(
+            "top-level-parameter-cv-adjustment",
+            owner_case(
+                """    {sibling}
+    const int& state(double sibling) const;
+    {matched}
+    const int& state(int declared) const;""".format(
+                    sibling=sibling_doc, matched=matched_doc),
+                """inline const int& Owner::state(const int defined) const
+{{
+    (void)defined;
+    return storage_;
+}}"""),
+            1, True, 9, "public", matched_doc),
+        IdentityAssociationCase(
+            "array-to-pointer-parameter-adjustment",
+            owner_case(
+                """    {sibling}
+    const int& state(double sibling) const;
+    {matched}
+    const int& state(int declared[3]) const;""".format(
+                    sibling=sibling_doc, matched=matched_doc),
+                """inline const int& Owner::state(int* defined) const
+{{
+    (void)defined;
+    return storage_;
+}}"""),
+            1, True, 9, "public", matched_doc),
+        IdentityAssociationCase(
+            "equivalent-cv-token-order",
+            owner_case(
+                """    struct Payload {{ int value = 0; }};
+    {sibling}
+    const int& state(double sibling) const;
+    {matched}
+    const int& state(const Payload& declared) const;""".format(
+                    sibling=sibling_doc, matched=matched_doc),
+                """inline const int& Owner::state(Payload const& defined) const
+{{
+    (void)defined;
+    return storage_;
+}}"""),
+            1, True, 10, "public", matched_doc),
+        IdentityAssociationCase(
+            "namespace-alias-qualified-owner",
+            """
+namespace actual {{
+{class_doc}
+struct Owner {{
+public:
+    {sibling}
+    const int& state(int sibling) const;
+    {matched}
+    const int& state() const;
+    int getPublished() const noexcept {{ return 0; }}
+private:
+    int storage_ = 7;
+}};
+}}
+namespace facade = actual;
+inline const int& facade::Owner::state() const {{ return storage_; }}
+int main() {{ return 0; }}
+""".format(class_doc=class_doc, sibling=sibling_doc,
+           matched=matched_doc),
+            1, True, 9, "public", matched_doc),
+        IdentityAssociationCase(
+            "top-level-pointer-cv-adjustment",
+            owner_case(
+                """    {sibling}
+    const int& state(double sibling) const;
+    {matched}
+    const int& state(int* declared) const;""".format(
+                    sibling=sibling_doc, matched=matched_doc),
+                """inline const int& Owner::state(int* const defined) const
+{{
+    (void)defined;
+    return storage_;
+}}"""),
+            1, True, 9, "public", matched_doc),
+        IdentityAssociationCase(
+            "alias-top-level-cv-adjustment",
+            owner_case(
+                """    using Pointer = int*;
+    {sibling}
+    const int& state(double sibling) const;
+    {matched}
+    const int& state(Pointer const declared) const;""".format(
+                    sibling=sibling_doc, matched=matched_doc),
+                """inline const int& Owner::state(const Pointer defined) const
+{{
+    (void)defined;
+    return storage_;
+}}"""),
+            1, True, 10, "public", matched_doc),
+        IdentityAssociationCase(
+            "pointee-cv-remains-distinct",
+            owner_case(
+                """    {sibling}
+    const int& state(const int* declared) const;
+    /** ordinary matched declaration */
+    const int& state(int* declared) const;""".format(
+                    sibling=sibling_doc),
+                """inline const int& Owner::state(int* defined) const
+{{
+    (void)defined;
+    return storage_;
+}}"""),
+            1, False, 9, "public"),
+        IdentityAssociationCase(
+            "nested-array-extent-retained",
+            owner_case(
+                """    {sibling}
+    const int& state(int declared[3][4]) const;
+    /** ordinary matched declaration */
+    const int& state(int declared[5][6]) const;""".format(
+                    sibling=sibling_doc),
+                """inline const int& Owner::state(int defined[5][6]) const
+{{
+    (void)defined;
+    return storage_;
+}}"""),
+            1, False, 9, "public"),
+        IdentityAssociationCase(
+            "chained-namespace-alias-owner",
+            """
+namespace actual_chain {{
+{class_doc}
+struct Owner {{
+public:
+    {sibling}
+    const int& state(int sibling) const;
+    {matched}
+    const int& state() const;
+    int getPublished() const noexcept {{ return 0; }}
+private:
+    int storage_ = 7;
+}};
+}}
+namespace first_facade = actual_chain;
+namespace second_facade = first_facade;
+inline const int& second_facade::Owner::state() const {{ return storage_; }}
+int main() {{ return 0; }}
+""".format(class_doc=class_doc, sibling=sibling_doc,
+           matched=matched_doc),
+            1, True, 9, "public", matched_doc),
+        IdentityAssociationCase(
+            "nested-reopened-namespace-alias-owner",
+            """
+namespace actual_nested {{
+{class_doc}
+struct Owner {{
+public:
+    {sibling}
+    const int& state(int sibling) const;
+    {matched}
+    const int& state() const;
+    int getPublished() const noexcept {{ return 0; }}
+private:
+    int storage_ = 7;
+}};
+}}
+namespace api {{}}
+namespace api {{ namespace facade = actual_nested; }}
+namespace api {{}}
+inline const int& api::facade::Owner::state() const {{ return storage_; }}
+int main() {{ return 0; }}
+""".format(class_doc=class_doc, sibling=sibling_doc,
+           matched=matched_doc),
+            1, True, 9, "public", matched_doc),
+        IdentityAssociationCase(
+            "absolute-namespace-alias-owner",
+            """
+namespace actual_absolute {{
+{class_doc}
+struct Owner {{
+public:
+    {sibling}
+    const int& state(int sibling) const;
+    {matched}
+    const int& state() const;
+    int getPublished() const noexcept {{ return 0; }}
+private:
+    int storage_ = 7;
+}};
+}}
+namespace absolute_facade = actual_absolute;
+inline const int& ::absolute_facade::Owner::state() const
+{{
+    return storage_;
+}}
+int main() {{ return 0; }}
+""".format(class_doc=class_doc, sibling=sibling_doc,
+           matched=matched_doc),
+            1, True, 9, "public", matched_doc),
+        IdentityAssociationCase(
+            "qualified-parenthesized-member-name",
+            owner_case(
+                """    {sibling}
+    const int& state(double sibling) const;
+    {matched}
+    const int& state(int declared) const;""".format(
+                    sibling=sibling_doc, matched=matched_doc),
+                """inline const int& (Owner::state)(int defined) const
+{{
+    (void)defined;
+    return storage_;
+}}"""),
+            1, True, 9, "public", matched_doc),
+        IdentityAssociationCase(
+            "sibling-namespace-alias-does-not-poison",
+            """
+namespace marked_target {{
+{class_doc}
+struct Owner {{
+public:
+    {matched}
+    const int& state() const;
+private:
+    int storage_ = 7;
+}};
+}}
+namespace ordinary_target {{
+{class_doc}
+struct Owner {{
+public:
+    /** ordinary matched declaration */
+    const int& state() const;
+    int getPublished() const noexcept {{ return 0; }}
+private:
+    int storage_ = 7;
+}};
+}}
+namespace left_scope {{ namespace facade = marked_target; }}
+namespace right_scope {{ namespace facade = ordinary_target; }}
+inline const int& right_scope::facade::Owner::state() const
+{{
+    return storage_;
+}}
+int main() {{ return 0; }}
+""".format(class_doc=class_doc, matched=matched_doc),
+            1, False, 17, "public"),
+    ]
+    return tuple(cases)
+
+
+def fail_closed_association_cases(marker):
+    """Compiler-valid unsupported/control definitions for diagnostic policy."""
+    class_doc = "/** Threading: this is a {}; getPublished is atomic. */".format(
+        marker)
+    unsupported = """
+{class_doc}
+struct UnsupportedOwner {{
+public:
+    /** {marker} matched declaration */
+    const int& state(int (*declared)(int)) const;
+    int getPublished() const noexcept {{ return 0; }}
+private:
+    int storage_ = 7;
+}};
+inline const int& UnsupportedOwner::state(int (*defined)(int)) const
+{{
+    (void)defined;
+    return storage_;
+}}
+int main() {{ return 0; }}
+""".format(class_doc=class_doc, marker=marker)
+    value_control = """
+struct ValueOwner {
+public:
+    int state(int (*declared)(int)) const;
+};
+inline int ValueOwner::state(int (*defined)(int)) const
+{
+    return defined(0);
+}
+int identity(int value) { return value; }
+int main() { ValueOwner owner; return owner.state(identity); }
+"""
+    parenthesized = """
+{class_doc}
+struct ParenthesizedOwner {{
+public:
+    /** {marker} matched declaration */
+    const int& state(int (*declared)()) const;
+    int getPublished() const noexcept {{ return 0; }}
+private:
+    int storage_ = 7;
+}};
+inline const int& (ParenthesizedOwner::state)(int (*defined)()) const
+{{
+    (void)defined;
+    return storage_;
+}}
+int main() {{ return 0; }}
+""".format(class_doc=class_doc, marker=marker)
+    subscript_operator = """
+{class_doc}
+struct SubscriptOwner {{
+public:
+    /** {marker} matched declaration */
+    const int& operator[](int (*declared)()) const;
+    int getPublished() const noexcept {{ return 0; }}
+private:
+    int storage_ = 7;
+}};
+inline const int& SubscriptOwner::operator[](int (*defined)()) const
+{{
+    (void)defined;
+    return storage_;
+}}
+int main() {{ return 0; }}
+""".format(class_doc=class_doc, marker=marker)
+    call_operator = """
+{class_doc}
+struct CallOwner {{
+public:
+    /** {marker} matched declaration */
+    const int& operator()(int (*declared)()) const;
+    int getPublished() const noexcept {{ return 0; }}
+private:
+    int storage_ = 7;
+}};
+inline const int& CallOwner::operator()(int (*defined)()) const
+{{
+    (void)defined;
+    return storage_;
+}}
+int main() {{ return 0; }}
+""".format(class_doc=class_doc, marker=marker)
+    unresolved_owner = """
+#define DECLARE_EXTERNAL_OWNER \\
+struct ExternalOwner { \\
+public: \\
+    const int& state() const; \\
+private: \\
+    int storage_ = 7; \\
+}
+DECLARE_EXTERNAL_OWNER;
+inline const int& ExternalOwner::state() const { return storage_; }
+int main() { return 0; }
+"""
+    namespace_free_function = """
+namespace utility {
+inline int storage = 7;
+const int& state();
+}
+inline const int& utility::state() { return storage; }
+int main() { return 0; }
+"""
+    return (
+        ("unsupported-const-reference-declarator", unsupported, 0, 1),
+        ("unsupported-parenthesized-const-reference-declarator",
+         parenthesized, 0, 1),
+        ("unsupported-subscript-operator-declarator",
+         subscript_operator, 0, 1),
+        ("unsupported-call-operator-declarator",
+         call_operator, 0, 1),
+        ("unresolved-qualified-class-owner", unresolved_owner, 0, 1),
+        ("ordinary-value-definition-control", value_control, 0, 0),
+        ("qualified-namespace-free-function-control",
+         namespace_free_function, 0, 0),
+    )
 
 
 def mutation_matrix_cases(marker):

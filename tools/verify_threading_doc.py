@@ -47,24 +47,53 @@ Tiers
      parenthesized declarators, attributes, qualifiers, reopened/qualified
      namespace aliases, namespace-scope inline definitions, exact overload
      association, accessible inherited storage and direct member/subobject
-     returns are covered. Roots qualified by a bounded owner or ancestor retain
-     exact owner, qualifier and member-declaration identities across relative,
-     absolute, namespace and visible class-alias spellings. Direct owner names
-     and aliases precede one canonical injected base name, which precedes
-     enclosing lexical lookup. Namespace- and type-alias owner components
-     compose without losing canonical identity or exact overload association.
+     returns are covered. One immutable qualified result retains the selected
+     first declaration, canonical target, remaining components with exact
+     coordinates and class-head template-id presence, access, exact use point
+     and alias provenance; a selected unsupported fact is terminal. Selected
+     aliases and every recursive inheritance consumer share one 64-step depth
+     bound plus cycle guards; a 65th alias or base edge is fail-closed while
+     ordinary shorter chains retain their result.
+     Qualified class joins use that same resolver through a lightweight
+     declaration-id index, followed by exactly one immutable graph
+     materialization. Definition-owner privileges for private nested classes
+     are purpose-bound and do not relax ordinary expression access.
+     Roots qualified by a bounded owner or ancestor retain exact owner,
+     qualifier and member-declaration identities across relative, absolute,
+     namespace and visible class-alias spellings. Direct owner names and aliases
+     precede one canonical injected base name, which precedes enclosing lexical
+     lookup. Namespace- and type-alias owner components compose without losing
+     canonical identity or exact overload association. Every class-key token is
+     classified before graph insertion, so elaborated uses, template/enum
+     components and attribute contents cannot become phantom declarations.
      Out-of-class leading returns use enclosing namespace/global lookup while
-     parameters, trailing returns and bodies use the exact member owner.
+     parameters, trailing returns and direct bodies use the nearest exact
+     member owner. Inline, out-of-class, body, local and accessible inherited
+     elaborated uses retain their existing identity and token coordinates.
      Positive subobjects admit dot/index suffixes and literal std::get forms,
      while custom get calls and post-root pointer arrows remain ordinary
      negatives. Relative std provenance observes class, union, alias,
      using-declaration and namespace facts at the exact use point and block
-     lifetime; absolute ::std bypasses those shadows. Complete-class lookup is
-     confined to genuine member contexts. Local classes never become census
-     owners. Every return retains exact identity and source position; singular
+     lifetime; its graph-backed consumer accepts only the central qualified
+     result, with no inherited-type veto or fallback. The graphless compatibility
+     path retains its namespace-alias check, and absolute ::std bypasses those
+     shadows. Complete-class lookup is confined to genuine member contexts.
+     Local classes never become census owners. Every return retains exact
+     identity and source position; singular
      identity is projected only for a uniform complete collection. Nested
      lambda and local-class bodies own their returns and traversal resumes after
      them, while ordinary branch/loop/switch blocks remain in the outer method.
+     Classic/range-for, if and switch data names use graph-owned declaration
+     points and recursively exact braced or unbraced controlled-statement ends.
+     Parameters, block locals and every comma-separated control declarator are
+     facts in the same graph. Declaration conditions and valid auto structured
+     bindings are distinguished from subscript, logical, conditional and
+     assignment expressions, which introduce no data-name fact. A syntactically
+     unambiguous local declaration with an unresolved qualified or template-id
+     type remains a conservative fail-closed shadow fact and can never create a
+     member-storage positive.
+     Ordinary and fail-closed recognizers share a backward declarator-name
+     cursor that crosses only complete adjacent post-name attribute groups.
      Value, temporary, shadowing parameter and shadowing local returns are
      excluded. Explicit `this->` remains member-bound. Out-of-class definitions
      match a unique declaration
@@ -76,9 +105,11 @@ Tiers
      aliases is idempotent at its own type level. Namespace and visible base-
      type aliases resolve by lexical direct/chained/nested identity without
      sibling leakage. Each use and alias RHS observes its own declaration
-     point; equivalent semantic redeclarations coalesce, while conflicting or
-     cyclic targets fail closed. A recognizable unsupported const-reference
-     definition, exact public class-template target or direct/subobject return
+     point; equivalent semantic redeclarations coalesce, while conflicting,
+     cyclic or over-depth targets fail closed. Nested-template class joins
+     retain template-id metadata without instantiating template owners. A
+     recognizable unsupported const-reference definition, exact public
+     class-template target or direct/subobject return
      through an unresolved base emits a production-fatal diagnostic; value,
      member-call, free-object, private-template and qualified namespace free-
      function controls do not. A stream-owner-only readout carries the marker

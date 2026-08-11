@@ -278,8 +278,8 @@ declaration parser builds one source-wide graph of lexical scopes, declaration
 points and lifetimes, then resolves explicit and trailing return types,
 const-reference aliases, multiline and parenthesized function names, attributes,
 member qualifiers, direct member/subobject returns, reopened and nested named
-namespace identity, qualified type aliases, direct/chained/nested namespace aliases,
-public declarations with namespace-scope inline definitions, accessible
+namespace identity, qualified type aliases, direct/chained/nested namespace
+aliases, public declarations with namespace-scope inline definitions, accessible
 inherited storage through literal bases or visible non-dependent `using` and
 `typedef` base aliases, and lexical alias shadowing across global, namespace,
 nested-class and sibling-class scopes. Base aliases may be direct or chained;
@@ -302,7 +302,10 @@ use. A later namespace- or non-member-class declaration likewise does not
 retroactively shadow an earlier use in the same fragment. The absolute
 `::std::get` spelling is not affected by such local shadows, while an alias to
 `::std` is still not one of the two admitted literal spellings. The
-expression's `class-id` is resolved
+graph-backed relative-`std` decision is solely the central qualified result,
+including its inherited-type selection; no consumer-specific inherited veto
+or fallback follows it. The graphless compatibility branch retains only its
+lexical namespace-alias check. The expression's `class-id` is resolved
 independently at that exact use point and must be the accessor owner or one
 uniquely reachable accessible ancestor. Qualified lookup retains the exact
 accessor owner, qualifier target, data-member owner and member name, so ordinary
@@ -314,8 +317,40 @@ and aliases are considered first, followed by one canonical injected base-class
 name, and only then enclosing lexical scopes. A direct but unsupported or
 imported type fact is still decisive: it blocks injected-base and enclosing
 lookup instead of allowing a lower-precedence declaration to win. Tokens inside
-a bounded `[[...]]` attribute never introduce declaration-graph facts. The
-injected candidate must name one accessible, non-virtual ancestry path;
+a bounded `[[...]]` attribute never introduce declaration-graph facts. Every
+supported qualified lookup starts with one source-positioned selected
+declaration and retains that declaration, its kind, canonical target, remaining
+components, access and alias provenance as one result. Each class-head
+component also retains its identifier coordinates and whether its source form
+was a template-id; template arguments remain opaque. A selected alias is
+followed only from its own right-hand-side position. An inaccessible, imported,
+dependent, conflicting or otherwise unsupported selection is terminal; lookup
+does not retry an outer alias, basename or later aggregate fact. Every recursive
+declaration-graph walk shares a 64-step limit in addition to its cycle guard:
+one selected alias or one inheritance edge consumes one step. Attempting a 65th
+step is a stable fail-closed `unsupported` result. This bound applies to
+selected aliases, inherited named types and aliases, injected base names,
+owner/ancestor paths, member lookup and inherited-member aggregation; ordinary
+chains within the limit retain their normal result.
+Qualified class definitions are joined by declaration ID in a lightweight
+structural phase that uses this same resolver. Only after those identities
+stabilize is the immutable source-wide graph materialized, exactly once; the
+structural index is not a second graph or a consumer-specific lookup path.
+Namespace and type aliases retain their selected declaration and terminal class
+provenance through that join. Nested-template class-head joins retain each
+component's template-id bit, but that metadata never instantiates an accessor
+owner: explicit or partial class-template owner forms keep their existing
+fail-closed census behavior. A qualified class definition or out-of-class member
+definition may name its own private nested owner, but that purpose-bound
+association does not relax access for an ordinary type or return expression.
+Every `class`, `struct` and `union` token is classified before the graph can
+record it. Definitions and genuine standalone forward declarations introduce
+type facts. Elaborated uses in signatures, data declarations and alignment
+expressions resolve existing types without inventing nested declarations;
+template parameters, the `class` component of an enum, and attribute contents
+introduce none. A compiler-valid form outside this bounded grammar is retained
+as unsupported instead of being guessed. The injected candidate must name one
+accessible, non-virtual ancestry path;
 repeated, virtual or inaccessible paths stay fail-closed. A namespace-alias
 prefix is canonicalized before a terminal type alias is resolved, so the two
 alias kinds compose without losing either use point or RHS declaration point.
@@ -335,7 +370,13 @@ type is resolved in the enclosing namespace/global context before the
 qualified declarator. Parameters, supported member suffixes, a trailing return
 type and the body are resolved after that boundary in the exact member-owner
 context. The parser segments those token ranges before canonicalizing types; it
-never reparses the whole signature under one convenient scope.
+never reparses the whole signature under one convenient scope. The nearest
+matching member signature supplies the owner for its parameters, trailing
+return and direct body. Elaborated uses there, in an inline member signature,
+in a function-local class declaration, or through an accessible protected base
+type retain the existing canonical identity and original token coordinates;
+none creates a phantom class fact. A nested callable or local-class method
+starts its own owner range.
 Every alias lookup is evaluated at its exact lexical use point, while an alias
 right-hand side and each link in a chain are evaluated at that alias's own
 declaration point. A later declaration therefore cannot retroactively change a
@@ -345,8 +386,8 @@ use. Reopened namespace fragments share only the aliases owned by that
 namespace, and an identically named sibling alias cannot leak into owner lookup.
 Multiple visible declarations of one alias coalesce only when they resolve to
 the same canonical type, class or namespace; conflicting or cyclic targets stay
-unsupported. A namespace-scope
-definition is associated only when exactly one public declaration has the same
+unsupported. A namespace-scope definition is associated only when exactly one
+public declaration has the same
 function name, return type and reference category, ordinary parameter-type
 sequence, member `const`/`volatile` qualification, and `&`/`&&` ref qualifier.
 Parameter names and declaration-only default arguments are ignored, visible
@@ -365,12 +406,26 @@ Return roots are bound against parameters and visible block locals before
 member lookup; `this->` explicitly selects the member. Every return in a method
 is retained as an ordered record with its disposition, exact qualifier/member
 identity and return-token offset and line, and every record must bind positively
-for enumeration. Ordinary compound, branch, loop and switch blocks remain part
-of that method. A nested lambda or local-class method owns its own returns, so
+for enumeration. Data names declared by classic `for`, range `for`, `if` and
+`switch` headers have graph-owned declaration points and exact recursively
+computed controlled-statement ends. Their lifetimes cover the complete braced
+or unbraced controlled statement, including nested controls and an associated
+`else`, and end before the following statement. Parameters, ordinary block
+locals and control declarations are all facts in that same graph. Every
+declarator in a comma-separated init statement is retained; an `if` or
+`switch` may contribute names from both its init-statement and declaration
+condition. A structured binding is admitted only after a valid declaration
+prefix containing `auto`. A syntactically unambiguous local declaration whose
+qualified or template-id type cannot be resolved within this bounded grammar
+is retained as a conservative, fail-closed shadow fact. It may suppress a
+member-storage positive, but it can never create one. Subscript, logical,
+conditional and assignment expressions in the same positions never become
+declarations. Ordinary compound, branch, loop and switch blocks remain part of
+that method. A nested lambda or local-class method owns its own returns, so
 those bodies are skipped and traversal resumes after them; their returns can
 neither create nor contaminate an outer accessor. Equal returns are not
-deduplicated. When all records carry one
-exact identity, the legacy singular identity fields project that value and an
+deduplicated. When all records carry one exact identity, the legacy singular
+identity fields project that value and an
 explicit uniform flag is true. When identities differ, the complete collection
 remains authoritative, the flag is false and all three singular identity fields
 are cleared together rather than selecting a branch by source order. An
@@ -403,8 +458,12 @@ top-level parameter names, so those names may differ and a default may appear
 only on the declaration; the resulting structural type identities must agree
 after alias expansion and the parameter adjustments above. Names nested inside
 parenthesized declarators remain in the key, so different spellings are rejected
-rather than guessed. A recognizable public const-reference definition that
-cannot be associated inside this boundary emits a line-specific diagnostic,
+rather than guessed. Ordinary and fail-closed definition recognition share one
+backward name cursor. It crosses only complete adjacent post-name `[[...]]`
+groups without changing source coordinates and recognizes ordinary, qualified,
+parenthesized, `operator[]` and `operator()` names. A recognizable public
+const-reference definition that cannot be associated inside this boundary
+emits a line-specific diagnostic,
 and the production Tier-G gate fails on every such diagnostic. The matrix pins
 that fail-closed path with compiler-valid nested function-pointer declarators,
 including qualified parenthesized names and `operator[]` / `operator()`, and

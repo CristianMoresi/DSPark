@@ -9,8 +9,16 @@ rather than matching one source spelling, resolves named namespace/class alias
 scope and binds parameters and block locals before falling back to a member.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import re
+
+
+_GRAPH_TRAVERSAL_DEPTH_LIMIT = 64
+_SELECTED_ALIAS_DEPTH_REASON = (
+    "selected alias traversal exceeds the bounded depth limit")
+_INHERITANCE_DEPTH_REASON = (
+    "inheritance traversal exceeds the bounded depth limit")
+_INHERITANCE_DEPTH_SENTINEL = "<unsupported-inheritance-depth>"
 
 
 @dataclass(frozen=True)
@@ -136,6 +144,21 @@ class FunctionDeclaratorStructure:
     parameters_open: int
     parameters_close: int
     trailing_return: int = -1
+    declarator_start: int = -1
+
+
+@dataclass(frozen=True)
+class DeclaratorNameCursor:
+    """One backward declarator-name decision and its exact token boundaries."""
+
+    name: str
+    name_start: int
+    name_end: int
+    parameter_open: int
+    post_name_attributes: tuple = ()
+    declarator_start: int = -1
+    wrapper_open: int = -1
+    wrapper_close: int = -1
 
 
 @dataclass(frozen=True)
@@ -152,6 +175,7 @@ class AliasResolutionEnvironment:
     complete_class_scopes: dict
     base_edges: dict
     declaration_graph: object = None
+    source_tokens: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -213,6 +237,98 @@ class LookupResult:
     declaration_kind: str = ""
     provenance: tuple = ()
     reason: str = ""
+    candidate_declaration_ids: tuple = ()
+
+
+@dataclass(frozen=True)
+class QualifiedComponent:
+    """One unconsumed qualified-id component with original coordinates."""
+
+    name: str
+    token_range: tuple = ()
+    has_template_id: bool = False
+
+
+@dataclass(frozen=True)
+class QualifiedLookupResult:
+    """One authoritative declaration-selected qualified-name result."""
+
+    status: str
+    selected_declaration_id: int
+    selected_declaration_kind: str = ""
+    canonical_identity: tuple = ()
+    alias_target_declaration_id: int = -1
+    canonical_alias_target: tuple = ()
+    remaining_components: tuple = ()
+    use_offset: int = -1
+    starting_scope_id: int = -1
+    access: str = "public"
+    purpose: str = ""
+    absolute: bool = False
+    provenance: tuple = ()
+    reason: str = ""
+    selection_origin: str = ""
+
+    @property
+    def declaration_id(self):
+        """Compatibility projection for existing one-component consumers."""
+        return self.selected_declaration_id
+
+    @property
+    def declaration_kind(self):
+        """Compatibility projection for existing one-component consumers."""
+        if self.selection_origin == "injected-base":
+            return "injected_base_class_name"
+        return self.selected_declaration_kind
+
+
+@dataclass(frozen=True)
+class ClassKeyClassification:
+    """Exhaustive classification of one ``class``/``struct``/``union`` token."""
+
+    token_index: int
+    key: str
+    status: str
+    name_range: tuple = ()
+    qualified_components: tuple = ()
+    canonical_identity: tuple = ()
+    point_of_declaration: int = -1
+    parent_scope: int = -1
+    terminator_range: tuple = ()
+    body_range: tuple = ()
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class DataNameDeclaration:
+    """One graph-owned data name with an exact source lifetime."""
+
+    declaration_id: int
+    name: str
+    kind: str
+    point_of_declaration: int
+    lifetime_begin: int
+    lifetime_end: int
+    parent_scope: int
+    callable_owner: int
+    control_id: int = -1
+    header_range: tuple = ()
+    controlled_statement_range: tuple = ()
+
+
+@dataclass(frozen=True)
+class ControlStatementDescriptor:
+    """One control declaration and the full controlled-statement extent."""
+
+    control_id: int
+    kind: str
+    keyword_offset: int
+    header_open: int
+    header_close: int
+    controlled_statement_open: int
+    controlled_statement_end: int
+    parent_control: int = -1
+    data_declaration_ids: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -231,7 +347,54 @@ class DeclarationGraph:
     class_declaration_points: dict
     declarations_by_scope_name: dict
     namespace_scopes: dict
+    class_key_classifications: tuple = ()
+    data_name_declarations: tuple = ()
+    control_statements: tuple = ()
     lookup_cache: dict = field(default_factory=dict, compare=False, repr=False)
+    qualified_lookup_cache: dict = field(
+        default_factory=dict, compare=False, repr=False)
+    qualified_lookup_results: list = field(
+        default_factory=list, compare=False, repr=False)
+
+
+@dataclass
+class _DeclarationLookupIndex:
+    """Lightweight lookup view over facts awaiting one final graph freeze."""
+
+    source_size: int
+    scopes: tuple
+    declarations: tuple
+    root_scope: int
+    namespace_regions: tuple
+    class_regions: tuple
+    nonlocal_class_regions: tuple
+    local_class_regions: tuple
+    class_identities: dict
+    class_declaration_points: dict
+    declarations_by_scope_name: dict
+    namespace_scopes: dict
+    data_name_declarations: tuple = ()
+    control_statements: tuple = ()
+    lookup_cache: dict = field(default_factory=dict)
+    qualified_lookup_cache: dict = field(default_factory=dict)
+    qualified_lookup_results: list = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _StructuralJoinDeclaration:
+    """One lightweight semantic declaration used before graph freezing."""
+
+    declaration_id: int
+    name: str
+    kind: str
+    canonical_identity: tuple
+    parent_identity: tuple
+    point_of_declaration: int
+    declaration_start: int = -1
+    target_tokens: tuple = ()
+    rhs_use_position: int = -1
+    access: str = "public"
+    dependent: bool = False
 
 
 @dataclass(frozen=True)
@@ -294,7 +457,7 @@ _MULTI_PUNCTUATION = (
 )
 
 _NON_FUNCTION_NAMES = {
-    "alignof", "catch", "decltype", "for", "if", "noexcept", "requires",
+    "alignas", "alignof", "catch", "decltype", "for", "if", "noexcept", "requires",
     "sizeof", "static_assert", "switch", "typeid", "while",
 }
 
@@ -313,6 +476,14 @@ _PARAMETER_NON_NAMES = _PARAMETER_TYPE_KEYWORDS | {
     "class", "const", "enum", "register", "restrict", "struct",
     "typename", "union", "volatile",
 }
+
+_CLASS_TYPE_DECLARATION_KINDS = frozenset(
+    kind
+    for key in ("class", "struct", "union")
+    for kind in (key + "_definition", key + "_forward")
+) | {"local_class", "local_class_forward"}
+
+_SELECTED_TYPE_ALIAS_PROJECTION = object()
 
 
 def _is_identifier_start(char):
@@ -821,8 +992,815 @@ def _typedef_declarators(values):
     return tuple(output)
 
 
-def _build_declaration_graph(text, tokens, brace_pairs):
+def _class_key_shape_map(tokens, regions, attribute_pairs, paren_pairs):
+    """Classify every class-key before any declaration fact is admitted."""
+    attribute_indices = _bounded_attribute_token_indices(attribute_pairs)
+    regions_by_declaration = {
+        region.declaration: region for region in regions
+    }
+
+    def template_parameter(index, after_name):
+        for boundary in range(index - 1, -1, -1):
+            if tokens[boundary].text in (";", "{", "}"):
+                break
+            opening = boundary + 1
+            if (tokens[boundary].text != "template"
+                    or opening >= index or tokens[opening].text != "<"):
+                continue
+            angles = 1
+            parens = brackets = braces = attributes = 0
+            component_start = opening + 1
+            cursor = component_start
+            while cursor < index and angles:
+                value = tokens[cursor].text
+                if value == "[[":
+                    attributes += 1
+                elif value == "]]" and attributes:
+                    attributes -= 1
+                elif not attributes:
+                    parens += (value == "(") - (value == ")")
+                    brackets += (value == "[") - (value == "]")
+                    braces += (value == "{") - (value == "}")
+                    if parens == brackets == braces == 0:
+                        if value == "<":
+                            angles += 1
+                        elif value == ">":
+                            angles -= 1
+                        elif value == ">>" and angles >= 2:
+                            angles -= 2
+                        elif value == "," and angles == 1:
+                            component_start = cursor + 1
+                cursor += 1
+            return (
+                angles == 1 and component_start == index
+                and after_name < len(tokens)
+                and tokens[after_name].text in (",", ">", "=", "...")
+            )
+        return False
+
+    def standalone_context(index):
+        previous = index - 1
+        if previous >= 0 and tokens[previous].text == "]]":
+            opening = attribute_pairs.get(previous)
+            if opening is None:
+                return False
+            previous = opening - 1
+        if previous < 0 or tokens[previous].text in (";", "{", "}", ":"):
+            return True
+        if tokens[previous].text not in (">", ">>"):
+            return False
+        depth = 0
+        cursor = previous
+        while cursor >= 0:
+            value = tokens[cursor].text
+            if value == ">":
+                depth += 1
+            elif value == ">>":
+                depth += 2
+            elif value == "<":
+                depth -= 1
+                if depth == 0:
+                    return cursor > 0 and tokens[cursor - 1].text == "template"
+            cursor -= 1
+        return False
+
+    output = {}
+    for index, token in enumerate(tokens):
+        if token.text not in ("class", "struct", "union"):
+            continue
+        names, template_ids, after_name, absolute = _class_head_name(
+            tokens, index, attribute_pairs, paren_pairs)
+        region = regions_by_declaration.get(index)
+        if index in attribute_indices:
+            status = "attribute-content"
+            reason = "class-key inside attribute"
+        elif index > 0 and tokens[index - 1].text == "enum":
+            status = "enum-class-component"
+            reason = "enum class component"
+        elif template_parameter(index, after_name):
+            status = "template-parameter"
+            reason = "template type parameter"
+        elif region is not None:
+            status = "definition-class-head"
+            reason = ""
+        elif index > 0 and tokens[index - 1].text == "friend":
+            status = "unsupported"
+            reason = (
+                "friend elaborated declaration is outside the bounded grammar")
+        else:
+            cursor = after_name
+            while cursor < len(tokens) and tokens[cursor].text == "[[":
+                closing = attribute_pairs.get(cursor)
+                if closing is None:
+                    cursor = len(tokens)
+                    break
+                cursor = closing + 1
+            if (names and cursor < len(tokens)
+                    and tokens[cursor].text == ";"
+                    and standalone_context(index)):
+                status = "standalone-forward-declaration"
+                reason = ""
+            elif names:
+                status = "elaborated-type-use"
+                reason = ""
+            else:
+                status = "unsupported"
+                reason = "class-key has no bounded declarative name"
+        output[index] = {
+            "status": status,
+            "reason": reason,
+            "names": tuple(names),
+            "template_id_names": tuple(template_ids),
+            "after_name": after_name,
+            "region": region,
+            "absolute": absolute,
+        }
+    return output
+
+
+def _control_statement_end(tokens, start, paren_pairs, brace_pairs):
+    """Return the exclusive token end of one complete controlled statement."""
+    if start >= len(tokens):
+        return start
+    value = tokens[start].text
+    if value == "{":
+        closing = brace_pairs.get(start)
+        return len(tokens) if closing is None else closing + 1
+    if value in ("for", "if", "switch", "while"):
+        opening = start + 1
+        while opening < len(tokens) and tokens[opening].text != "(":
+            opening += 1
+        closing = paren_pairs.get(opening)
+        if closing is None:
+            return start + 1
+        extent = _control_statement_end(
+            tokens, closing + 1, paren_pairs, brace_pairs)
+        if value == "if" and extent < len(tokens) \
+                and tokens[extent].text == "else":
+            extent = _control_statement_end(
+                tokens, extent + 1, paren_pairs, brace_pairs)
+        return extent
+    if value == "do":
+        extent = _control_statement_end(
+            tokens, start + 1, paren_pairs, brace_pairs)
+        if extent < len(tokens) and tokens[extent].text == "while":
+            opening = extent + 1
+            while opening < len(tokens) and tokens[opening].text != "(":
+                opening += 1
+            closing = paren_pairs.get(opening)
+            if closing is not None:
+                extent = closing + 1
+                if extent < len(tokens) and tokens[extent].text == ";":
+                    extent += 1
+        return extent
+
+    parens = brackets = braces = attributes = 0
+    cursor = start
+    while cursor < len(tokens):
+        current = tokens[cursor].text
+        if current == "[[":
+            attributes += 1
+        elif current == "]]" and attributes:
+            attributes -= 1
+        elif not attributes:
+            parens += (current == "(") - (current == ")")
+            brackets += (current == "[") - (current == "]")
+            braces += (current == "{") - (current == "}")
+            if (current == ";"
+                    and parens == brackets == braces == 0):
+                return cursor + 1
+        cursor += 1
+    return len(tokens)
+
+
+def _control_header_delimiters(tokens, start, end):
+    """Return top-level ``;`` and ``:`` tokens in one control header."""
+    output = []
+    parens = brackets = braces = attributes = 0
+    for index in range(start, end):
+        value = tokens[index].text
+        if value == "[[":
+            attributes += 1
+        elif value == "]]" and attributes:
+            attributes -= 1
+        elif not attributes:
+            if (value in (";", ":")
+                    and parens == brackets == braces == 0):
+                output.append(index)
+            parens += (value == "(") - (value == ")")
+            brackets += (value == "[") - (value == "]")
+            braces += (value == "{") - (value == "}")
+    return tuple(output)
+
+
+def _control_data_names(
+        tokens, start, end, attribute_pairs, bracket_pairs,
+        declaration_context=None):
+    """Return every bounded ordinary or structured control-declaration name."""
+    if start >= end:
+        return ()
+    cursor = start
+    parens = brackets = braces = 0
+    while cursor < end:
+        value = tokens[cursor].text
+        if value == "[[":
+            closing = attribute_pairs.get(cursor)
+            if closing is None or closing >= end:
+                return ()
+            cursor = closing + 1
+            continue
+        prefix = tokens[start:cursor]
+        prefix_name = _ordinary_parameter_name_index(
+            [token.text for token in prefix])
+        structured_prefix = (
+            (prefix_name is None or prefix_name < 0)
+            and any(token.text == "auto" for token in prefix)
+            and all(token.text in {
+                "auto", "const", "volatile", "&", "&&", "static",
+                "thread_local", "[[", "]]",
+            } or (token.text and _is_identifier_start(token.text[0]))
+                    for token in prefix)
+        )
+        if (value == "[" and parens == brackets == braces == 0
+                and structured_prefix):
+            closing = bracket_pairs.get(cursor)
+            if closing is None or closing >= end:
+                return ()
+            components = _top_level_comma_groups(
+                tokens[cursor + 1:closing])
+            names = []
+            for component in components:
+                bounded = _without_attribute_groups(component)
+                candidates = [
+                    token for token in bounded
+                    if token.text
+                    and _is_identifier_start(token.text[0])
+                    and token.text not in _PARAMETER_NON_NAMES
+                ]
+                if len(candidates) != 1:
+                    return ()
+                names.append(candidates[0])
+            return tuple(names)
+        if (value in ("=", "{")
+                and parens == brackets == braces == 0):
+            break
+        parens += (value == "(") - (value == ")")
+        brackets += (value == "[") - (value == "]")
+        braces += (value == "{") - (value == "}")
+        cursor += 1
+    return _ordinary_data_name_tokens(
+        tokens[start:end], declaration_context)
+
+
+def _build_control_declarations(
+        tokens, scopes, parent_scope_for, paren_pairs, brace_pairs,
+        bracket_pairs, attribute_pairs, declaration_graph,
+        declaration_environment):
+    """Build graph-owned control declarations with full statement extents."""
+    raw_controls = []
+    for index, token in enumerate(tokens):
+        if token.text not in ("for", "if", "switch"):
+            continue
+        opening = index + 1
+        if (token.text == "if" and opening < len(tokens)
+                and tokens[opening].text == "constexpr"):
+            opening += 1
+        if opening >= len(tokens) or tokens[opening].text != "(":
+            continue
+        closing = paren_pairs.get(opening)
+        if closing is None or closing <= opening + 1:
+            continue
+        delimiters = _control_header_delimiters(
+            tokens, opening + 1, closing)
+        semicolons = tuple(
+            item for item in delimiters if tokens[item].text == ";")
+        colons = tuple(
+            item for item in delimiters if tokens[item].text == ":")
+        declaration_slices = []
+        if token.text == "for" and len(semicolons) == 2:
+            kind = "classic-for"
+            declaration_slices.append((
+                kind, opening + 1, semicolons[0]))
+        elif (token.text == "for" and len(semicolons) <= 1
+              and len(colons) == 1
+              and (not semicolons or semicolons[0] < colons[0])):
+            kind = "range-for"
+            range_start = opening + 1
+            if semicolons:
+                declaration_slices.append((
+                    "range-for-init", range_start, semicolons[0]))
+                range_start = semicolons[0] + 1
+            declaration_slices.append((
+                kind, range_start, colons[0]))
+        elif token.text in ("if", "switch") and len(semicolons) == 1:
+            kind = token.text + "-init"
+            declaration_slices.extend((
+                (kind, opening + 1, semicolons[0]),
+                (token.text + "-condition", semicolons[0] + 1, closing),
+            ))
+        elif token.text in ("if", "switch") and not semicolons:
+            kind = token.text + "-condition"
+            declaration_slices.append((kind, opening + 1, closing))
+        else:
+            continue
+        names = tuple(
+            (declaration_kind, name)
+            for declaration_kind, declaration_start, declaration_end
+            in declaration_slices
+            for name in _control_data_names(
+                tokens, declaration_start, declaration_end,
+                attribute_pairs, bracket_pairs,
+                (
+                    declaration_graph, declaration_environment,
+                    parent_scope_for(tokens[declaration_start].start),
+                    tokens[declaration_start].start,
+                ))
+        )
+        if not names:
+            continue
+        statement_start = closing + 1
+        statement_end = _control_statement_end(
+            tokens, statement_start, paren_pairs, brace_pairs)
+        if (token.text == "if" and statement_end < len(tokens)
+                and tokens[statement_end].text == "else"):
+            statement_end = _control_statement_end(
+                tokens, statement_end + 1, paren_pairs, brace_pairs)
+        if statement_start >= len(tokens) or statement_end <= statement_start:
+            continue
+        raw_controls.append({
+            "kind": kind,
+            "keyword_index": index,
+            "opening": opening,
+            "closing": closing,
+            "statement_start": statement_start,
+            "statement_end": statement_end,
+            "names": names,
+        })
+
+    controls = []
+    data_names = []
+    for control_id, raw in enumerate(raw_controls):
+        keyword = tokens[raw["keyword_index"]]
+        statement_start = raw["statement_start"]
+        statement_end = raw["statement_end"]
+        parent_control = -1
+        containing = [
+            (candidate_id, candidate)
+            for candidate_id, candidate in enumerate(raw_controls)
+            if candidate_id != control_id
+            and candidate["statement_start"] <= raw["keyword_index"]
+            < candidate["statement_end"]
+        ]
+        if containing:
+            parent_control = min(
+                containing,
+                key=lambda item: (
+                    item[1]["statement_end"] - item[1]["statement_start"],
+                    -item[1]["statement_start"],
+                ),
+            )[0]
+        parent_scope = parent_scope_for(keyword.start)
+        callable_owner = scopes[parent_scope].callable_owner
+        data_ids = []
+        for declaration_kind, name in raw["names"]:
+            data_id = len(data_names)
+            data_ids.append(data_id)
+            data_names.append(DataNameDeclaration(
+                declaration_id=data_id,
+                name=name.text,
+                kind=declaration_kind,
+                point_of_declaration=name.end,
+                lifetime_begin=name.end,
+                lifetime_end=tokens[statement_end - 1].end,
+                parent_scope=parent_scope,
+                callable_owner=callable_owner,
+                control_id=control_id,
+                header_range=(
+                    tokens[raw["opening"]].start,
+                    tokens[raw["closing"]].end,
+                ),
+                controlled_statement_range=(
+                    tokens[statement_start].start,
+                    tokens[statement_end - 1].end,
+                ),
+            ))
+        controls.append(ControlStatementDescriptor(
+            control_id=control_id,
+            kind=raw["kind"],
+            keyword_offset=keyword.start,
+            header_open=tokens[raw["opening"]].start,
+            header_close=tokens[raw["closing"]].start,
+            controlled_statement_open=tokens[statement_start].start,
+            controlled_statement_end=tokens[statement_end - 1].end,
+            parent_control=parent_control,
+            data_declaration_ids=tuple(data_ids),
+        ))
+    return tuple(data_names), tuple(controls)
+
+
+def _declaration_prefix_is_type(prefix, name_index, context):
+    """Distinguish a bounded declaration prefix from an expression prefix."""
+    if context is None:
+        return True
+    before_name = tuple(prefix[:name_index])
+    values = [token.text for token in before_name]
+    declarator_start = next((
+        index for index, value in enumerate(values)
+        if value in {"*", "&", "&&", "(", "["}
+    ), len(values))
+    type_tokens = tuple(
+        token for token in before_name[:declarator_start]
+        if token.text not in {
+            "const", "consteval", "constexpr", "extern", "inline",
+            "mutable", "register", "static", "thread_local", "volatile",
+        }
+    )
+    type_values = tuple(token.text for token in type_tokens)
+    if (type_values
+            and all(value in _PARAMETER_TYPE_KEYWORDS
+                    for value in type_values)):
+        return True
+    if type_values[:1] in {
+            ("class",), ("enum",), ("struct",), ("union",)}:
+        elaborated = _simple_qualified_type(type_values[1:])
+        return elaborated is not None and bool(type_values[1:])
+    parsed = _simple_qualified_type(
+        type_values)
+    if not type_tokens:
+        return False
+    if parsed is None:
+        return (
+            declarator_start == len(values)
+            and _template_qualified_type_skeleton(type_values) is not None
+        )
+    parts, absolute = parsed
+    graph, environment, parent_scope, use_offset = context
+    owner_class = next((
+        tuple(scope.canonical_class)
+        for scope in _graph_scope_chain(graph, parent_scope)
+        if scope.canonical_class
+    ), ())
+    result = _resolve_qualified_name(
+        _qualified_component_records(
+            parts, type_tokens[0].start, environment.source_tokens),
+        LookupContext(
+            starting_scope=parent_scope,
+            use_offset=use_offset,
+            purpose="data-declaration-type",
+            complete_class=bool(owner_class),
+            owner_class=owner_class,
+            absolute=absolute,
+        ),
+        environment,
+        _record=False,
+    )
+    graph_declarations = graph.declarations
+    provenance_is_type = any(
+        isinstance(declaration_id, int)
+        and 0 <= declaration_id < len(graph_declarations)
+        and (
+            graph_declarations[declaration_id].kind
+            in {"using_alias", "typedef_alias"}
+            or graph_declarations[declaration_id].kind
+            in _CLASS_TYPE_DECLARATION_KINDS
+        )
+        for declaration_id in result.provenance
+    )
+    resolved_type = (
+        result.selected_declaration_kind in {"using_alias", "typedef_alias"}
+        or provenance_is_type
+    )
+    if resolved_type:
+        return True
+    if declarator_start != len(values):
+        return False
+    # Two adjacent names are declaration syntax even when the bounded graph
+    # cannot resolve an imported type. Balanced template-ids receive the same
+    # conservative shadow treatment; they must never manufacture a member
+    # return positive merely because their type identity is unsupported.
+    return (parsed is not None
+            or _template_qualified_type_skeleton(type_values) is not None)
+
+
+def _ordinary_data_name_tokens(statement, declaration_context=None):
+    """Return ordinary declarator names from one bounded declaration."""
+    if not statement or statement[0].text == "(":
+        return ()
+    first_identifier = next((
+        token.text for token in statement
+        if token.text and _is_identifier_start(token.text[0])
+    ), "")
+    if first_identifier in {
+            "asm", "break", "case", "catch", "class", "co_await",
+            "co_return", "concept", "continue", "default", "delete",
+            "do", "else", "enum", "for", "friend", "goto", "if",
+            "namespace", "new", "return", "static_assert", "struct",
+            "switch", "template", "throw", "try", "typedef", "union",
+            "using", "while"}:
+        return ()
+    names = []
+    declaration_seen = False
+    for declarator in _top_level_comma_groups(statement):
+        ordinary = _without_attribute_groups(declarator)
+        if not ordinary:
+            return ()
+        prefix = []
+        parens = brackets = braces = angles = 0
+        for token in ordinary:
+            value = token.text
+            if (value in ("=", "{")
+                    and parens == brackets == braces == angles == 0):
+                break
+            prefix.append(token)
+            parens += (value == "(") - (value == ")")
+            brackets += (value == "[") - (value == "]")
+            braces += (value == "{") - (value == "}")
+            angles = _angle_depth_change(value, angles)
+        values = [token.text for token in prefix]
+        if (any(token.text in (".", "->", "->*") for token in prefix)
+                or _function_declarator_structure(prefix) is not None):
+            return ()
+        name_index = _ordinary_parameter_name_index(values)
+        if name_index is not None and name_index >= 0:
+            if (not declaration_seen
+                    and not _declaration_prefix_is_type(
+                        prefix, name_index, declaration_context)):
+                return ()
+            names.append(prefix[name_index])
+            declaration_seen = True
+            continue
+        candidates = [
+            token for token in prefix
+            if token.text and _is_identifier_start(token.text[0])
+            and token.text not in _PARAMETER_NON_NAMES
+            and token.text not in _RETURN_SPECIFIERS
+        ]
+        if declaration_seen and len(candidates) == 1:
+            names.append(candidates[0])
+            continue
+        return ()
+    return tuple(names)
+
+
+def _statement_start(tokens, semicolon):
+    """Find one statement start without stopping inside balanced syntax."""
+    parens = brackets = braces = attributes = 0
+    cursor = semicolon - 1
+    while cursor >= 0:
+        value = tokens[cursor].text
+        if value == "]]":
+            attributes += 1
+        elif value == "[[" and attributes:
+            attributes -= 1
+        elif not attributes:
+            if value == ")":
+                parens += 1
+            elif value == "(" and parens:
+                parens -= 1
+            elif value == "]":
+                brackets += 1
+            elif value == "[" and brackets:
+                brackets -= 1
+            elif value == "}":
+                braces += 1
+            elif value == "{" and braces:
+                braces -= 1
+            elif (value in (";", "{", "}")
+                  and parens == brackets == braces == 0):
+                return cursor + 1
+        cursor -= 1
+    return 0
+
+
+def _build_graph_data_declarations(
+        tokens, scopes, parent_scope_for, control_data, controls,
+        declaration_graph, declaration_environment):
+    """Add parameter and ordinary-block data facts to control facts."""
+    data_names = list(control_data)
+
+    opening_tokens = {
+        token.end: index for index, token in enumerate(tokens)
+        if token.text == "{"
+    }
+    for scope in scopes:
+        if scope.kind not in ("function", "lambda"):
+            continue
+        opening = opening_tokens.get(scope.opening)
+        if opening is None:
+            continue
+        start = opening - 1
+        while start >= 0 and tokens[start].text not in (";", "{", "}"):
+            start -= 1
+        signature = tokens[start + 1:opening]
+        structure = _function_declarator_structure(signature)
+        if structure is None:
+            continue
+        parameters = signature[
+            structure.parameters_open + 1:structure.parameters_close]
+        for parameter in _top_level_comma_groups(parameters):
+            for name in _ordinary_data_name_tokens(parameter):
+                data_names.append(DataNameDeclaration(
+                    declaration_id=len(data_names),
+                    name=name.text,
+                    kind="parameter",
+                    point_of_declaration=name.end,
+                    lifetime_begin=name.end,
+                    lifetime_end=scope.closing,
+                    parent_scope=scope.scope_id,
+                    callable_owner=scope.callable_owner,
+                ))
+
+    control_headers = tuple(
+        (control.header_open, control.header_close) for control in controls)
+    for index, token in enumerate(tokens):
+        if token.text != ";" or any(
+                opening < token.start < closing
+                for opening, closing in control_headers):
+            continue
+        parent_scope = parent_scope_for(token.start)
+        scope = scopes[parent_scope]
+        if scope.kind not in ("function", "lambda", "ordinary_block"):
+            continue
+        start = _statement_start(tokens, index)
+        for name in _ordinary_data_name_tokens(
+                tokens[start:index], (
+                    declaration_graph, declaration_environment, parent_scope,
+                    tokens[start].start if start < index else token.start,
+                )):
+            data_names.append(DataNameDeclaration(
+                declaration_id=len(data_names),
+                name=name.text,
+                kind="block-local",
+                point_of_declaration=name.end,
+                lifetime_begin=name.end,
+                lifetime_end=scope.closing,
+                parent_scope=parent_scope,
+                callable_owner=scope.callable_owner,
+            ))
+    return tuple(data_names)
+
+
+def _structural_lookup_environment(graph, tokens):
+    """Project one declaration graph into the central lookup environment."""
+    type_aliases = {}
+    namespace_aliases = {}
+    for declaration in graph.declarations:
+        parent = graph.scopes[declaration.parent_scope]
+        if parent.kind == "nonlocal_class":
+            semantic_scope = tuple(parent.canonical_class)
+        elif parent.kind == "namespace_fragment":
+            semantic_scope = tuple(parent.canonical_namespace)
+        elif parent.kind == "global":
+            semantic_scope = ()
+        else:
+            continue
+        key = semantic_scope + (declaration.name,)
+        if declaration.kind in {"using_alias", "typedef_alias"}:
+            type_aliases.setdefault(key, []).append(TypeAliasTarget(
+                semantic_scope, declaration.target_tokens,
+                declaration.rhs_use_position, declaration.access,
+                declaration.declaration_id, graph,
+            ))
+        elif declaration.kind == "namespace_alias":
+            values = list(declaration.target_tokens)
+            absolute = bool(values and values[0] == "::")
+            if absolute:
+                values.pop(0)
+            parts = tuple(values[::2])
+            if (parts and len(values) == len(parts) * 2 - 1
+                    and all(values[index] == "::"
+                            for index in range(1, len(values), 2))):
+                namespace_aliases.setdefault(key, []).append(
+                    NamespaceAliasTarget(
+                        semantic_scope, absolute, parts,
+                        declaration.rhs_use_position,
+                        declaration.declaration_id, graph,
+                    ))
+    classes = {
+        tuple(identity): region
+        for region, identity in graph.class_identities.items()
+        if (region in graph.nonlocal_class_regions
+            or region in graph.local_class_regions)
+    }
+    complete_scopes = {
+        identity: tuple(
+            identity[:length]
+            for length in range(len(identity), 0, -1)
+            if identity[:length] in classes
+        )
+        for identity in classes
+    }
+    return AliasResolutionEnvironment(
+        type_aliases={key: tuple(values)
+                      for key, values in type_aliases.items()},
+        namespace_aliases={key: tuple(values)
+                           for key, values in namespace_aliases.items()},
+        known_namespaces=frozenset(
+            set(graph.namespace_scopes) | {(), ("std",)}),
+        namespace_declarations={},
+        namespace_alias_cache={},
+        classes_by_identity=classes,
+        class_identities=graph.class_identities,
+        class_declarations=graph.class_declaration_points,
+        type_alias_cache={},
+        complete_class_scopes=complete_scopes,
+        base_edges={},
+        declaration_graph=graph,
+        source_tokens=tuple(tokens),
+    )
+
+
+def _populate_structural_base_edges(environment):
+    """Resolve same-header base edges needed by class-key access checks."""
+    graph = environment.declaration_graph
+    edges = environment.base_edges
+    for region in sorted(
+            graph.nonlocal_class_regions,
+            key=lambda item: item.declaration):
+        derived = tuple(graph.class_identities[region])
+        if derived not in environment.classes_by_identity:
+            continue
+        resolved_edges = []
+        for (values, inheritance_access, is_virtual,
+             base_use_position) in _base_specifications(
+                region.base_tokens, region.default_access):
+            resolved = _resolve_base_class(
+                values, derived[:-1], base_use_position,
+                environment.type_aliases, environment.namespace_aliases,
+                environment.known_namespaces,
+                environment.namespace_alias_cache,
+                environment.classes_by_identity,
+                environment.type_alias_cache,
+                environment.complete_class_scopes.get(derived, ()),
+                edges,
+                declaration_graph=graph,
+                alias_environment=environment,
+            )
+            if resolved is None:
+                continue
+            resolved_edges.append(BaseEdge(
+                derived, tuple(graph.class_identities[resolved]),
+                tuple(values), inheritance_access,
+                base_use_position, is_virtual,
+            ))
+        edges[derived] = tuple(resolved_edges)
+
+
+def _member_signature_owner_ranges(graph, tokens, environment):
+    """Associate out-of-class signature ranges with their exact owner."""
+    opening_tokens = {
+        token.end: index for index, token in enumerate(tokens)
+        if token.text == "{"
+    }
+    output = []
+    for scope in graph.scopes:
+        if scope.kind != "function":
+            continue
+        opening = opening_tokens.get(scope.opening)
+        if opening is None:
+            continue
+        start = opening - 1
+        while start >= 0 and tokens[start].text not in (";", "{", "}"):
+            start -= 1
+        signature = tokens[start + 1:opening]
+        structure = _function_declarator_structure(signature)
+        if structure is None:
+            continue
+        parts, absolute, has_template_id, owner_start = \
+            _qualified_owner_components(signature, structure.name_start)
+        if not parts or has_template_id:
+            continue
+        first = next((
+            token for token in signature[owner_start:structure.name_start]
+            if token.text == parts[0]
+        ), None)
+        if first is None:
+            continue
+        context = LookupContext(
+            starting_scope=_graph_scope_for_offset(graph, first.start),
+            use_offset=first.start,
+            purpose="member-definition-owner",
+            absolute=absolute,
+        )
+        result = _resolve_qualified_name(
+            _qualified_component_records(
+                parts, first.start, environment.source_tokens),
+            context, environment, _record=False,
+        )
+        identity = tuple(result.canonical_identity)
+        if (result.status == "found"
+                and identity in environment.classes_by_identity):
+            output.append((
+                tokens[start + 1].start, scope.closing,
+                identity, result, scope.scope_id, scope.opening,
+            ))
+    return tuple(output)
+
+
+def _build_declaration_graph_pass(
+        text, tokens, brace_pairs, qualified_identities=None):
     """Build the one lexical declaration graph consumed by Tier-G lookup."""
+    qualified_identities = dict(qualified_identities or {})
     paren_pairs = _pair_map(tokens, "(", ")")
     attribute_pairs = _pair_map(tokens, "[[", "]]")
     attribute_indices = _bounded_attribute_token_indices(attribute_pairs)
@@ -830,6 +1808,8 @@ def _build_declaration_graph(text, tokens, brace_pairs):
         tokens, brace_pairs, attribute_pairs))
     all_class_regions = tuple(_class_regions(
         tokens, brace_pairs, attribute_pairs, paren_pairs))
+    class_key_shapes = _class_key_shape_map(
+        tokens, all_class_regions, attribute_pairs, paren_pairs)
     class_openings = {region.opening for region in all_class_regions}
     namespace_openings = {region.opening for region in namespace_regions}
     bracket_pairs = _pair_map(tokens, "[", "]")
@@ -845,6 +1825,7 @@ def _build_declaration_graph(text, tokens, brace_pairs):
             if tokens[opening].text == "{"
         )
         (local_regions if enclosing_other else nonlocal_regions).append(region)
+    syntactic_local_regions = frozenset(local_regions)
 
     def namespace_for_region(region):
         namespaces = [
@@ -867,26 +1848,9 @@ def _build_declaration_graph(text, tokens, brace_pairs):
             if namespaces else ()
         )
 
-    namespace_points = {(): 0}
-    for namespace in namespace_regions:
-        introduced = len(namespace.name_indices)
-        parent_length = len(namespace.path) - introduced
-        for component, name_index in enumerate(
-                namespace.name_indices, 1):
-            identity = namespace.path[:parent_length + component]
-            namespace_points.setdefault(identity, tokens[name_index].start)
-    known_namespaces = frozenset(namespace_points)
     nonlocal_region_by_declaration = {
         region.declaration: region for region in nonlocal_regions
     }
-
-    def qualified_candidates(spelling, absolute, namespace):
-        if absolute:
-            return (tuple(spelling),)
-        return tuple(dict.fromkeys(
-            tuple(namespace[:length]) + tuple(spelling)
-            for length in range(len(namespace), -1, -1)
-        ))
 
     def containing_nonlocal_region(index):
         owners = [
@@ -905,26 +1869,12 @@ def _build_declaration_graph(text, tokens, brace_pairs):
             if tokens[opening].text == "{")
 
     class_identities = {}
-    class_points = {}
-    forward_points = {}
     resolved_forward_indices = set()
-    known_classes = set()
-
-    def parent_known_before(identity, point):
-        return (
-            identity in known_classes
-            and class_points[identity] < point
-        ) or (
-            identity in known_namespaces
-            and namespace_points[identity] < point
-        )
 
     event_indices = tuple(
-        index for index, token in enumerate(tokens)
-        if token.text in ("class", "struct", "union")
-        and index not in attribute_indices
-        and not (index > 0
-                 and tokens[index - 1].text in ("enum", "friend"))
+        index for index, shape in class_key_shapes.items()
+        if shape["status"] in (
+            "definition-class-head", "standalone-forward-declaration")
     )
     while True:
         changed = False
@@ -943,27 +1893,16 @@ def _build_declaration_graph(text, tokens, brace_pairs):
                         identity = (tuple(namespace_for_region(region))
                                     + spelling)
                 else:
-                    candidates = qualified_candidates(
-                        spelling, region.qualified_absolute,
-                        namespace_for_region(region))
-                    point = tokens[index].start
-                    identity = next((
-                        candidate for candidate in candidates
-                        if parent_known_before(candidate[:-1], point)
-                        and any(prior < point for prior in
-                                forward_points.get(candidate, ()))
-                    ), None)
+                    identity = qualified_identities.get(index)
                     if identity is None:
                         continue
                 class_identities[region] = identity
-                known_classes.add(identity)
-                class_points.setdefault(identity, tokens[index].start)
                 changed = True
                 continue
 
             if index in resolved_forward_indices or inside_ordinary_block(index):
                 continue
-            names, _, after_name, absolute = _class_head_name(
+            names, _, after_name, _ = _class_head_name(
                 tokens, index, attribute_pairs, paren_pairs)
             cursor = after_name
             while cursor < len(tokens) and tokens[cursor].text == "[[":
@@ -984,16 +1923,9 @@ def _build_declaration_graph(text, tokens, brace_pairs):
             elif len(spelling) == 1:
                 identity = tuple(namespace_for_index(index)) + spelling
             else:
-                candidates = qualified_candidates(
-                    spelling, absolute, namespace_for_index(index))
-                point = tokens[index].start
-                identity = next((
-                    candidate for candidate in candidates
-                    if parent_known_before(candidate[:-1], point)
-                ), None)
+                identity = qualified_identities.get(index)
                 if identity is None:
                     continue
-            forward_points.setdefault(identity, []).append(tokens[index].start)
             resolved_forward_indices.add(index)
             changed = True
         if not changed:
@@ -1116,6 +2048,57 @@ def _build_declaration_graph(text, tokens, brace_pairs):
             return len(text) + 1
         return scope.closing
 
+    brace_token_by_scope_opening = {
+        token.end: index for index, token in enumerate(tokens)
+        if token.text == "{"
+    }
+
+    def logical_scope_identity(scope_id):
+        chain = []
+        active = set()
+        while scope_id >= 0 and scope_id not in active:
+            active.add(scope_id)
+            chain.append(scopes[scope_id])
+            scope_id = scopes[scope_id].parent_scope
+        identity = ()
+        callable_names = []
+        for scope in reversed(chain):
+            if scope.canonical_class:
+                identity = tuple(scope.canonical_class)
+                callable_names = []
+            elif scope.canonical_namespace and not identity:
+                identity = tuple(scope.canonical_namespace)
+            if scope.kind not in ("function", "lambda"):
+                continue
+            opening_index = brace_token_by_scope_opening.get(scope.opening)
+            if opening_index is None:
+                continue
+            start = opening_index - 1
+            while start >= 0 and tokens[start].text not in (";", "{", "}"):
+                start -= 1
+            structure = _function_declarator_structure(
+                tokens[start + 1:opening_index])
+            callable_names.append(
+                structure.name if structure is not None else "<callable>")
+        return identity + tuple(callable_names)
+
+    local_identity_replacements = {}
+    for region in syntactic_local_regions:
+        old_identity = tuple(class_identities[region])
+        parent_scope = parent_scope_for(tokens[region.declaration].start)
+        identity = (
+            logical_scope_identity(parent_scope)
+            + (tokens[region.name_index].text,)
+        )
+        class_identities[region] = identity
+        local_identity_replacements[old_identity] = identity
+    if local_identity_replacements:
+        scopes = [replace(
+            scope,
+            canonical_class=local_identity_replacements.get(
+                tuple(scope.canonical_class), scope.canonical_class),
+        ) for scope in scopes]
+
     declarations = []
 
     def add_declaration(name, kind, canonical_identity, canonical_target,
@@ -1208,12 +2191,13 @@ def _build_declaration_graph(text, tokens, brace_pairs):
         if token.text not in ("class", "struct", "union"):
             index += 1
             continue
-        if (index > 0
-                and tokens[index - 1].text in ("enum", "friend")):
+        shape = class_key_shapes[index]
+        if shape["status"] not in (
+                "definition-class-head", "standalone-forward-declaration"):
             index += 1
             continue
-        name_indices, _, after_name, _ = _class_head_name(
-            tokens, index, attribute_pairs, paren_pairs)
+        name_indices = shape["names"]
+        after_name = shape["after_name"]
         if not name_indices:
             index += 1
             continue
@@ -1226,12 +2210,34 @@ def _build_declaration_graph(text, tokens, brace_pairs):
         definition = region is not None
         parent_scope = parent_scope_for(token.start)
         parent = scopes[parent_scope]
-        if region is not None:
+        qualified_identity = (
+            qualified_identities.get(index)
+            if len(name_indices) > 1 else None
+        )
+        if qualified_identity is not None:
+            identity = tuple(qualified_identity)
+            owner_identity = identity[:-1]
+            owner_scopes = [
+                scope for scope in scopes
+                if (tuple(scope.canonical_class) == owner_identity
+                    or tuple(scope.canonical_namespace) == owner_identity)
+                and scope.opening <= token.start
+            ]
+            if not owner_scopes:
+                index = after_name
+                continue
+            local = False
+        elif len(name_indices) > 1:
+            index = after_name
+            continue
+        elif region is not None:
             identity = class_identities[region]
             local = region in local_regions
         elif parent.kind in ("function", "ordinary_block", "lambda", "local_class"):
-            identity = ("<local@{}>".format(parent_scope),
-                        tokens[name_index].text)
+            identity = (
+                logical_scope_identity(parent_scope)
+                + (tokens[name_index].text,)
+            )
             local = True
         elif parent.canonical_class:
             identity = parent.canonical_class + (tokens[name_index].text,)
@@ -1253,7 +2259,9 @@ def _build_declaration_graph(text, tokens, brace_pairs):
         add_declaration(
             tokens[name_index].text, kind, identity, identity,
             token.start, tokens[name_index].end, body_open, body_close,
-            parent_scope, complete_eligible=definition and not local,
+            parent_scope,
+            access=class_access_at(parent_scope, index),
+            complete_eligible=definition and not local,
         )
         index = (region.opening + 1 if definition else after_name)
 
@@ -1398,7 +2406,7 @@ def _build_declaration_graph(text, tokens, brace_pairs):
         identity: tuple(scope_ids)
         for identity, scope_ids in namespace_scopes.items()
     }
-    return DeclarationGraph(
+    preliminary_graph = _DeclarationLookupIndex(
         source_size=len(text),
         scopes=scopes,
         declarations=tuple(declarations),
@@ -1412,6 +2420,610 @@ def _build_declaration_graph(text, tokens, brace_pairs):
         declarations_by_scope_name=declarations_by_scope_name,
         namespace_scopes=namespace_scopes,
     )
+    structural_environment = _structural_lookup_environment(
+        preliminary_graph, tokens)
+    _populate_structural_base_edges(structural_environment)
+    control_data_declarations, control_statements = \
+        _build_control_declarations(
+            tokens, scopes, parent_scope_for, paren_pairs, brace_pairs,
+            bracket_pairs, attribute_pairs, preliminary_graph,
+            structural_environment)
+    data_name_declarations = _build_graph_data_declarations(
+        tokens, scopes, parent_scope_for, control_data_declarations,
+        control_statements, preliminary_graph, structural_environment)
+    preliminary_graph.data_name_declarations = data_name_declarations
+    preliminary_graph.control_statements = control_statements
+    signature_owner_ranges = _member_signature_owner_ranges(
+        preliminary_graph, tokens, structural_environment)
+
+    class_key_classifications = []
+    for token_index, shape in sorted(class_key_shapes.items()):
+        token = tokens[token_index]
+        names = shape["names"]
+        terminal = tokens[names[-1]] if names else None
+        spelling = tuple(tokens[item].text for item in names)
+        status = shape["status"]
+        reason = shape["reason"]
+        parent_scope = parent_scope_for(token.start)
+        canonical_identity = ()
+        point = -1
+        body_range = ()
+        terminator_range = ()
+        region = shape["region"]
+        if status == "definition-class-head" and region is not None:
+            canonical_identity = tuple(class_identities[region])
+            point = terminal.end
+            body_range = (
+                tokens[region.opening].start, tokens[region.closing].end)
+        elif status == "standalone-forward-declaration" and terminal is not None:
+            declaration = next((
+                item for item in declarations
+                if item.declaration_start == token.start
+                and item.name == terminal.text
+                and item.kind.endswith("_forward")
+            ), None)
+            if declaration is not None:
+                canonical_identity = tuple(declaration.canonical_identity)
+                point = declaration.point_of_declaration
+            cursor = shape["after_name"]
+            while cursor < len(tokens) and tokens[cursor].text == "[[":
+                closing = attribute_pairs.get(cursor)
+                if closing is None:
+                    break
+                cursor = closing + 1
+            if cursor < len(tokens) and tokens[cursor].text == ";":
+                terminator_range = (tokens[cursor].start, tokens[cursor].end)
+        elif status == "elaborated-type-use" and terminal is not None:
+            use_offset = tokens[names[0]].start
+            template_id_names = frozenset(shape["template_id_names"])
+            owner_class = next((
+                tuple(scope.canonical_class)
+                for scope in _graph_scope_chain(
+                    preliminary_graph, parent_scope)
+                if scope.canonical_class
+            ), ())
+            signature_owner = next((
+                identity
+                for (start, end, identity, _, callable_scope,
+                     body_open) in signature_owner_ranges
+                if start <= token.start < end
+                and (token.start < body_open
+                     or preliminary_graph.scopes[
+                         parent_scope].callable_owner == callable_scope)
+            ), ())
+            if signature_owner:
+                owner_class = tuple(signature_owner)
+            result = _resolve_qualified_name(
+                tuple(QualifiedComponent(
+                    name=tokens[name].text,
+                    token_range=(tokens[name].start, tokens[name].end),
+                    has_template_id=name in template_id_names,
+                ) for name in names),
+                LookupContext(
+                    starting_scope=parent_scope,
+                    use_offset=use_offset,
+                    purpose="elaborated-type-use",
+                    complete_class=bool(owner_class),
+                    owner_class=owner_class,
+                    absolute=shape["absolute"],
+                ),
+                structural_environment,
+                _record=False,
+            )
+            provenance_is_class = any(
+                isinstance(declaration_id, int)
+                and 0 <= declaration_id < len(declarations)
+                and declarations[declaration_id].kind
+                in _CLASS_TYPE_DECLARATION_KINDS
+                for declaration_id in result.provenance
+            )
+            if (result.status == "found"
+                    and (result.selected_declaration_kind
+                         in _CLASS_TYPE_DECLARATION_KINDS
+                         or provenance_is_class)):
+                canonical_identity = tuple(result.canonical_identity)
+            if not canonical_identity:
+                status = "unsupported"
+                reason = (
+                    "unresolved elaborated type is outside the bounded graph")
+        qualified_components = (
+            canonical_identity
+            if status in ("definition-class-head",
+                          "standalone-forward-declaration")
+            else spelling if status == "elaborated-type-use" else ()
+        )
+        class_key_classifications.append(ClassKeyClassification(
+            token_index=token_index,
+            key=token.text,
+            status=status,
+            name_range=(terminal.start, terminal.end) if terminal else (),
+            qualified_components=qualified_components,
+            canonical_identity=canonical_identity,
+            point_of_declaration=point,
+            parent_scope=parent_scope,
+            terminator_range=terminator_range,
+            body_range=body_range,
+            reason=reason,
+        ))
+
+    return DeclarationGraph(
+        source_size=preliminary_graph.source_size,
+        scopes=preliminary_graph.scopes,
+        declarations=preliminary_graph.declarations,
+        root_scope=preliminary_graph.root_scope,
+        namespace_regions=preliminary_graph.namespace_regions,
+        class_regions=preliminary_graph.class_regions,
+        nonlocal_class_regions=preliminary_graph.nonlocal_class_regions,
+        local_class_regions=preliminary_graph.local_class_regions,
+        class_identities=preliminary_graph.class_identities,
+        class_declaration_points=preliminary_graph.class_declaration_points,
+        declarations_by_scope_name=preliminary_graph.declarations_by_scope_name,
+        namespace_scopes=preliminary_graph.namespace_scopes,
+        class_key_classifications=tuple(class_key_classifications),
+        data_name_declarations=preliminary_graph.data_name_declarations,
+        control_statements=preliminary_graph.control_statements,
+    )
+
+
+def _qualified_class_join_events(tokens, brace_pairs):
+    """Return qualified class definitions/redeclarations needing an owner."""
+    paren_pairs = _pair_map(tokens, "(", ")")
+    attribute_pairs = _pair_map(tokens, "[[", "]]")
+    regions = tuple(_class_regions(
+        tokens, brace_pairs, attribute_pairs, paren_pairs))
+    shapes = _class_key_shape_map(
+        tokens, regions, attribute_pairs, paren_pairs)
+    return tuple(
+        (
+            token_index,
+            tuple(QualifiedComponent(
+                name=tokens[name_index].text,
+                token_range=(tokens[name_index].start,
+                             tokens[name_index].end),
+                has_template_id=(
+                    name_index in shape["template_id_names"]),
+            ) for name_index in shape["names"]),
+            shape["absolute"],
+        )
+        for token_index, shape in sorted(shapes.items())
+        if len(shape["names"]) > 1
+        and shape["status"] in {
+            "definition-class-head", "standalone-forward-declaration"}
+    )
+
+
+def _structural_join_lookup_index(declarations, source_size, tokens):
+    """Adapt lightweight structural facts to the one central resolver."""
+    namespace_identities = {
+        tuple(item.canonical_identity) for item in declarations
+        if item.kind == "namespace_declaration"
+    }
+    class_identities = {
+        tuple(item.canonical_identity) for item in declarations
+        if item.kind.endswith(("_definition", "_forward"))
+    }
+    semantic_identities = {()}
+    for identity in namespace_identities | class_identities:
+        semantic_identities.update(
+            identity[:length] for length in range(1, len(identity) + 1))
+    ordered_identities = sorted(
+        semantic_identities - {()}, key=lambda item: (len(item), item))
+    scope_id_by_identity = {(): 0}
+    scopes = [LexicalScope(
+        0, "global", -1, 0, source_size + 1,
+    )]
+    for identity in ordered_identities:
+        parent = scope_id_by_identity[identity[:-1]]
+        is_class = identity in class_identities
+        scope_id = len(scopes)
+        scope_id_by_identity[identity] = scope_id
+        scopes.append(LexicalScope(
+            scope_id=scope_id,
+            kind="nonlocal_class" if is_class else "namespace_fragment",
+            parent_scope=parent,
+            opening=0,
+            closing=source_size + 1,
+            canonical_namespace=() if is_class else identity,
+            canonical_class=identity if is_class else (),
+        ))
+
+    typed_declarations = []
+    for item in declarations:
+        parent_scope = scope_id_by_identity.get(item.parent_identity)
+        if parent_scope is None:
+            continue
+        typed_declarations.append(TypeDeclaration(
+            declaration_id=len(typed_declarations),
+            name=item.name,
+            kind=item.kind,
+            canonical_identity=item.canonical_identity,
+            canonical_target=item.canonical_identity,
+            declaration_start=item.declaration_start,
+            point_of_declaration=item.point_of_declaration,
+            body_open=-1,
+            body_close=-1,
+            parent_scope=parent_scope,
+            lifetime_end=source_size + 1,
+            target_tokens=item.target_tokens,
+            rhs_use_position=item.rhs_use_position,
+            access=item.access,
+            dependent=item.dependent,
+            complete_class_eligible=bool(item.parent_identity
+                                         in class_identities),
+        ))
+    declarations_by_scope_name = {}
+    for declaration in typed_declarations:
+        declarations_by_scope_name.setdefault(
+            (declaration.parent_scope, declaration.name), []).append(
+                declaration.declaration_id)
+    declarations_by_scope_name = {
+        key: tuple(values)
+        for key, values in declarations_by_scope_name.items()
+    }
+    scope_declarations = {scope.scope_id: [] for scope in scopes}
+    for declaration in typed_declarations:
+        scope_declarations[declaration.parent_scope].append(
+            declaration.declaration_id)
+    scopes = tuple(replace(
+        scope, declaration_ids=tuple(scope_declarations[scope.scope_id]))
+        for scope in scopes)
+    namespace_scopes = {
+        identity: (scope_id_by_identity[identity],)
+        for identity in namespace_identities
+    }
+    class_points = {
+        identity: tuple(sorted(
+            declaration.point_of_declaration
+            for declaration in typed_declarations
+            if tuple(declaration.canonical_identity) == identity
+            and declaration.kind.endswith(("_definition", "_forward"))))
+        for identity in class_identities
+    }
+    region_keys = tuple(class_identities)
+    graph = _DeclarationLookupIndex(
+        source_size=source_size,
+        scopes=scopes,
+        declarations=tuple(typed_declarations),
+        root_scope=0,
+        namespace_regions=(),
+        class_regions=region_keys,
+        nonlocal_class_regions=region_keys,
+        local_class_regions=(),
+        class_identities={identity: identity for identity in region_keys},
+        class_declaration_points=class_points,
+        declarations_by_scope_name=declarations_by_scope_name,
+        namespace_scopes=namespace_scopes,
+    )
+    return graph, _structural_lookup_environment(graph, tokens), \
+        scope_id_by_identity
+
+
+def _select_qualified_class_identities(tokens, brace_pairs):
+    """Resolve qualified class joins in a lightweight declaration phase."""
+    paren_pairs = _pair_map(tokens, "(", ")")
+    attribute_pairs = _pair_map(tokens, "[[", "]]")
+    namespace_regions = tuple(_namespace_regions(
+        tokens, brace_pairs, attribute_pairs))
+    class_regions = tuple(_class_regions(
+        tokens, brace_pairs, attribute_pairs, paren_pairs))
+    shapes = _class_key_shape_map(
+        tokens, class_regions, attribute_pairs, paren_pairs)
+    class_openings = {region.opening for region in class_regions}
+    namespace_openings = {region.opening for region in namespace_regions}
+    nonlocal_regions = tuple(
+        region for region in class_regions
+        if not any(
+            opening < region.opening < brace_pairs[opening]
+            and opening not in class_openings
+            and opening not in namespace_openings
+            for opening in brace_pairs
+            if tokens[opening].text == "{"
+        )
+    )
+    region_by_declaration = {
+        region.declaration: region for region in nonlocal_regions
+    }
+
+    def namespace_for_index(index):
+        candidates = [
+            region for region in namespace_regions
+            if region.opening < index < region.closing
+        ]
+        return (
+            min(candidates, key=lambda region:
+                region.closing - region.opening).path
+            if candidates else ()
+        )
+
+    def containing_region(index):
+        candidates = [
+            region for region in nonlocal_regions
+            if region.opening < index < region.closing
+        ]
+        return (
+            min(candidates, key=lambda region:
+                region.closing - region.opening)
+            if candidates else None
+        )
+
+    def inside_ordinary_block(index):
+        return any(
+            opening < index < brace_pairs[opening]
+            and opening not in class_openings
+            and opening not in namespace_openings
+            for opening in brace_pairs
+            if tokens[opening].text == "{"
+        )
+
+    declarations = []
+
+    def add_declaration(
+            name, kind, identity, parent, point, declaration_start=-1,
+            target_tokens=(), rhs_use_position=-1, dependent=False):
+        declarations.append(_StructuralJoinDeclaration(
+            len(declarations), name, kind, tuple(identity), tuple(parent),
+            point, declaration_start, tuple(target_tokens),
+            rhs_use_position, dependent=dependent,
+        ))
+
+    for region in namespace_regions:
+        introduced = len(region.name_indices)
+        parent_length = len(region.path) - introduced
+        for component, name_index in enumerate(region.name_indices, 1):
+            identity = tuple(region.path[:parent_length + component])
+            add_declaration(
+                tokens[name_index].text, "namespace_declaration",
+                identity, identity[:-1], tokens[name_index].end,
+                tokens[region.declaration].start,
+            )
+
+    alias_records = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if (token.text == "namespace" and index + 3 < len(tokens)
+                and tokens[index + 1].text
+                and _is_identifier_start(tokens[index + 1].text[0])
+                and tokens[index + 2].text == "="):
+            end = index + 3
+            while end < len(tokens) and tokens[end].text != ";":
+                end += 1
+            alias_records.append((
+                index, tokens[index + 1], "namespace_alias",
+                tuple(part.text for part in tokens[index + 3:end]),
+                tokens[index + 3].start,
+                False,
+            ))
+            index = end + 1
+            continue
+        if token.text == "using" and index + 1 < len(tokens):
+            end = index + 1
+            while end < len(tokens) and tokens[end].text != ";":
+                end += 1
+            values = _without_attribute_groups(tokens[index + 1:end])
+            if (len(values) >= 2 and values[0].text
+                    and _is_identifier_start(values[0].text[0])
+                    and values[1].text == "="):
+                target = tuple(part.text for part in values[2:])
+                alias_records.append((
+                    index, values[0], "using_alias", target,
+                    values[2].start if len(values) > 2 else values[0].end,
+                    any(part in ("typename", "template", "<")
+                        for part in target),
+                ))
+            index = end + 1
+            continue
+        if token.text == "typedef":
+            end = index + 1
+            while end < len(tokens) and tokens[end].text != ";":
+                end += 1
+            for name_token, target_tokens in _typedef_declarators(
+                    tokens[index + 1:end]):
+                target = tuple(part.text for part in target_tokens)
+                alias_records.append((
+                    index, name_token, "typedef_alias", target,
+                    tokens[index + 1].start if index + 1 < end else token.end,
+                    any(part in ("typename", "template", "<")
+                        for part in target),
+                ))
+            index = end + 1
+            continue
+        index += 1
+
+    class_identities = {}
+    qualified_identities = {}
+    added_regions = set()
+    added_forwards = set()
+    added_aliases = set()
+    join_results = {}
+    while True:
+        changed = False
+        for region in nonlocal_regions:
+            if region in added_regions:
+                continue
+            shape = shapes[region.declaration]
+            names = shape["names"]
+            if len(names) != 1:
+                continue
+            owner = containing_region(region.opening)
+            if owner is not None:
+                parent = class_identities.get(owner)
+                if parent is None:
+                    continue
+            else:
+                parent = tuple(namespace_for_index(region.declaration))
+            identity = tuple(parent) + (tokens[names[-1]].text,)
+            class_identities[region] = identity
+            add_declaration(
+                tokens[names[-1]].text,
+                tokens[region.declaration].text + "_definition",
+                identity, identity[:-1], tokens[names[-1]].end,
+                tokens[region.declaration].start,
+            )
+            added_regions.add(region)
+            changed = True
+
+        for token_index, shape in sorted(shapes.items()):
+            if (token_index in added_forwards
+                    or shape["status"] != "standalone-forward-declaration"
+                    or len(shape["names"]) != 1
+                    or inside_ordinary_block(token_index)):
+                continue
+            owner = containing_region(token_index)
+            if owner is not None:
+                parent = class_identities.get(owner)
+                if parent is None:
+                    continue
+            else:
+                parent = tuple(namespace_for_index(token_index))
+            terminal = tokens[shape["names"][-1]]
+            identity = tuple(parent) + (terminal.text,)
+            add_declaration(
+                terminal.text, tokens[token_index].text + "_forward",
+                identity, identity[:-1], terminal.end,
+                tokens[token_index].start,
+            )
+            added_forwards.add(token_index)
+            changed = True
+
+        for (token_index, name_token, kind, target_tokens,
+             rhs_use_position, dependent) in alias_records:
+            if token_index in added_aliases or inside_ordinary_block(token_index):
+                continue
+            owner = containing_region(token_index)
+            if owner is not None:
+                parent = class_identities.get(owner)
+                if parent is None:
+                    continue
+            else:
+                parent = tuple(namespace_for_index(token_index))
+            add_declaration(
+                name_token.text, kind, (), parent, name_token.end,
+                tokens[token_index].start, target_tokens,
+                rhs_use_position, dependent,
+            )
+            added_aliases.add(token_index)
+            changed = True
+
+        join_graph, join_environment, join_scopes = \
+            _structural_join_lookup_index(
+                declarations, tokens[-1].end if tokens else 0, tokens)
+        for token_index, components, absolute in _qualified_class_join_events(
+                tokens, brace_pairs):
+            if token_index in qualified_identities:
+                continue
+            owner = containing_region(token_index)
+            if owner is not None:
+                starting_identity = class_identities.get(owner)
+                if starting_identity is None:
+                    continue
+            else:
+                starting_identity = tuple(namespace_for_index(token_index))
+            result = _resolve_qualified_name(
+                components,
+                LookupContext(
+                    starting_scope=join_scopes[tuple(starting_identity)],
+                    use_offset=components[0].token_range[0],
+                    purpose="qualified-class-join",
+                    absolute=absolute,
+                ),
+                join_environment,
+                _record=False,
+            )
+            terminal_id = (
+                result.provenance[-1] if result.provenance else -1
+            )
+            terminal = (
+                join_graph.declarations[terminal_id]
+                if isinstance(terminal_id, int)
+                and 0 <= terminal_id < len(join_graph.declarations)
+                else None
+            )
+            if (result.status != "found" or terminal is None
+                    or not terminal.kind.endswith(
+                        ("_definition", "_forward"))):
+                join_results[token_index] = result
+                continue
+            identity = tuple(result.canonical_identity)
+            qualified_identities[token_index] = identity
+            join_results[token_index] = result
+            shape = shapes[token_index]
+            region = region_by_declaration.get(token_index)
+            if region is not None:
+                class_identities[region] = identity
+                added_regions.add(region)
+                kind = tokens[token_index].text + "_definition"
+            else:
+                added_forwards.add(token_index)
+                kind = tokens[token_index].text + "_forward"
+            terminal_token = tokens[shape["names"][-1]]
+            add_declaration(
+                terminal_token.text, kind, identity, identity[:-1],
+                terminal_token.end, tokens[token_index].start,
+            )
+            changed = True
+        if not changed:
+            break
+    return qualified_identities, join_results
+
+
+def _qualified_class_join_results(graph, tokens, events, record):
+    """Resolve class joins through central lookup and exact declaration ids."""
+    environment = _structural_lookup_environment(graph, tokens)
+    identities = {}
+    results = {}
+    for token_index, components, absolute in events:
+        use_offset = components[0].token_range[0]
+        starting_scope = _graph_scope_for_offset(graph, use_offset)
+        owner_class = next((
+            tuple(scope.canonical_class)
+            for scope in _graph_scope_chain(graph, starting_scope)
+            if scope.canonical_class
+        ), ())
+        result = _resolve_qualified_name(
+            components,
+            LookupContext(
+                starting_scope=starting_scope,
+                use_offset=use_offset,
+                purpose="qualified-class-join",
+                complete_class=bool(owner_class),
+                owner_class=owner_class,
+                absolute=absolute,
+            ),
+            environment,
+            _record=record,
+        )
+        results[token_index] = result
+        identity = tuple(result.canonical_identity)
+        terminal_selected = any(
+            isinstance(declaration_id, int)
+            and 0 <= declaration_id < len(graph.declarations)
+            and graph.declarations[declaration_id].canonical_identity
+            == identity
+            and (
+                graph.declarations[declaration_id].kind.endswith(
+                    ("_definition", "_forward"))
+                or graph.declarations[declaration_id].kind
+                in {"local_class", "local_class_forward"}
+            )
+            for declaration_id in result.provenance
+        )
+        if result.status == "found" and identity and terminal_selected:
+            identities[token_index] = identity
+    return identities, results
+
+
+def _build_declaration_graph(text, tokens, brace_pairs):
+    """Build one graph through declaration-id-selected structural phases."""
+    events = _qualified_class_join_events(tokens, brace_pairs)
+    qualified_identities, _ = _select_qualified_class_identities(
+        tokens, brace_pairs)
+    graph = _build_declaration_graph_pass(
+        text, tokens, brace_pairs, qualified_identities)
+    if events:
+        _qualified_class_join_results(
+            graph, tokens, events, record=True)
+    return graph
 
 
 def _graph_scope_chain(graph, scope_id):
@@ -1465,13 +3077,15 @@ def _lookup_result_from_declarations(graph, declaration_ids, provenance):
     coalesced_type = (
         bool(identities[0])
         and all(identity == identities[0] for identity in identities)
-        and all(item.kind.endswith(("_definition", "_forward"))
+        and all(item.kind in _CLASS_TYPE_DECLARATION_KINDS
                 for item in declarations)
     )
-    if len(declarations) > 1 and not (coalesced_namespace or coalesced_type):
+    if (len(declarations) > 1
+            and not (coalesced_namespace or coalesced_type)):
         return LookupResult(
             "ambiguous", reason="multiple visible declarations",
             provenance=tuple(provenance),
+            candidate_declaration_ids=tuple(declaration_ids),
         )
     chosen = declarations[-1]
     return LookupResult(
@@ -1539,9 +3153,668 @@ def _lookup_named_type(graph, name, context):
             )
             graph.lookup_cache[cache_key] = result
             return result
+        if context.purpose != "canonical-class-identity":
+            canonical_visible = []
+            for declaration_scope in scope_ids:
+                for declaration_id in graph.declarations_by_scope_name.get(
+                        (declaration_scope, name), ()):
+                    declaration = graph.declarations[declaration_id]
+                    if (declaration.kind not in _CLASS_TYPE_DECLARATION_KINDS
+                            or not declaration.canonical_identity):
+                        continue
+                    if _class_identity_visible(
+                            graph, declaration.canonical_identity,
+                            context.use_offset):
+                        canonical_visible.append(declaration_id)
+            if canonical_visible:
+                canonical_visible.sort(key=lambda declaration_id:
+                                       graph.declarations[declaration_id]
+                                       .point_of_declaration)
+                result = _lookup_result_from_declarations(
+                    graph, canonical_visible,
+                    ("scope", scope.scope_id,
+                     "purpose", context.purpose),
+                )
+                graph.lookup_cache[cache_key] = result
+                return result
     result = LookupResult("not-found")
     graph.lookup_cache[cache_key] = result
     return result
+
+
+def _qualified_component_records(parts, use_offset, source_tokens=()):
+    """Attach observed coordinates and template-id shape to a spelling."""
+    parts = tuple(parts)
+    if not source_tokens:
+        return tuple(QualifiedComponent(name=part) for part in parts)
+    first = next((
+        index for index, token in enumerate(source_tokens)
+        if token.start >= use_offset and token.text == parts[0]
+    ), None)
+    if first is None:
+        return tuple(QualifiedComponent(name=part) for part in parts)
+    output = []
+    cursor = first
+    for part_index, part in enumerate(parts):
+        if cursor >= len(source_tokens) or source_tokens[cursor].text != part:
+            return tuple(QualifiedComponent(name=item) for item in parts)
+        token = source_tokens[cursor]
+        cursor += 1
+        has_template_id = (
+            cursor < len(source_tokens) and source_tokens[cursor].text == "<")
+        output.append(QualifiedComponent(
+            name=part, token_range=(token.start, token.end),
+            has_template_id=has_template_id))
+        if has_template_id:
+            depth = 0
+            while cursor < len(source_tokens):
+                value = source_tokens[cursor].text
+                if value == "<":
+                    depth += 1
+                elif value == ">":
+                    depth -= 1
+                elif value == ">>" and depth >= 2:
+                    depth -= 2
+                cursor += 1
+                if depth == 0:
+                    break
+            if depth:
+                return tuple(
+                    QualifiedComponent(name=item) for item in parts)
+        if part_index + 1 < len(parts):
+            if (cursor >= len(source_tokens)
+                    or source_tokens[cursor].text != "::"):
+                return tuple(
+                    QualifiedComponent(name=item) for item in parts)
+            cursor += 1
+            if (cursor < len(source_tokens)
+                    and source_tokens[cursor].text == "template"):
+                cursor += 1
+    return tuple(output)
+
+
+def _qualified_parent_scope_ids(graph, identity):
+    """Return only scopes owned by one already-resolved qualification."""
+    identity = tuple(identity)
+    if not identity:
+        return (graph.root_scope,)
+    class_scopes = tuple(
+        scope.scope_id for scope in graph.scopes
+        if scope.kind in ("nonlocal_class", "local_class")
+        and scope.canonical_class == identity
+    )
+    if class_scopes:
+        return class_scopes
+    return tuple(graph.namespace_scopes.get(identity, ()))
+
+
+def _qualified_member_lookup(graph, identity, name, context):
+    """Select one member without restarting unqualified lookup."""
+    visible = []
+    scope_ids = _qualified_parent_scope_ids(graph, identity)
+    for scope_id in scope_ids:
+        scope = graph.scopes[scope_id]
+        for declaration_id in graph.declarations_by_scope_name.get(
+                (scope_id, name), ()):
+            declaration = graph.declarations[declaration_id]
+            if _declaration_visible_in_context(declaration, scope, context):
+                visible.append(declaration_id)
+    visible = sorted(set(visible), key=lambda declaration_id:
+                     graph.declarations[declaration_id]
+                     .point_of_declaration)
+    return _lookup_result_from_declarations(
+        graph, visible,
+        ("qualified-parent", tuple(identity), "purpose", context.purpose),
+    )
+
+
+def _inherited_named_type_lookup(name, context, environment):
+    """Select inherited type facts by declaration id before outer scopes."""
+    owner = tuple(context.owner_class)
+    graph = environment.declaration_graph
+    if not owner or graph is None:
+        return LookupResult("not-found")
+    candidates = []
+    unsupported = False
+    depth_exhausted = False
+
+    def visit(identity, path, active):
+        nonlocal unsupported, depth_exhausted
+        if identity in active:
+            unsupported = True
+            return
+        scope_ids = _qualified_parent_scope_ids(graph, identity)
+        direct = []
+        for scope_id in scope_ids:
+            scope = graph.scopes[scope_id]
+            for declaration_id in graph.declarations_by_scope_name.get(
+                    (scope_id, name), ()):
+                declaration = graph.declarations[declaration_id]
+                if _declaration_visible_in_context(
+                        declaration, scope, context):
+                    direct.append(declaration_id)
+        if direct:
+            candidates.extend((item, tuple(path)) for item in direct)
+            return
+        edges = environment.base_edges.get(identity, ())
+        if len(path) >= _GRAPH_TRAVERSAL_DEPTH_LIMIT:
+            if edges:
+                unsupported = True
+                depth_exhausted = True
+            return
+        for edge in edges:
+            nested_path = tuple(path) + (edge,)
+            if edge.virtual:
+                unsupported = True
+            visit(tuple(edge.base_class), nested_path, active + (identity,))
+
+    visit(owner, (), ())
+    if depth_exhausted:
+        return LookupResult(
+            "unsupported", reason=_INHERITANCE_DEPTH_REASON,
+            candidate_declaration_ids=tuple(
+                item[0] for item in candidates),
+        )
+    if not candidates:
+        return LookupResult(
+            "unsupported" if unsupported else "not-found",
+            reason=("inherited type path is unsupported"
+                    if unsupported else ""),
+        )
+    declaration_ids = tuple(item[0] for item in candidates)
+    paths = tuple(item[1] for item in candidates)
+    if (unsupported or len(set(declaration_ids)) != 1
+            or len(candidates) != 1
+            or not _path_accessible_from_owner(paths[0])):
+        return LookupResult(
+            "ambiguous" if len(candidates) > 1 else "unsupported",
+            reason="inherited type is not uniquely accessible",
+            candidate_declaration_ids=declaration_ids,
+        )
+    declaration = graph.declarations[declaration_ids[0]]
+    return LookupResult(
+        "found", declaration_id=declaration.declaration_id,
+        canonical_identity=declaration.canonical_identity,
+        declaration_kind=declaration.kind,
+        provenance=("inherited-declaration",)
+        + tuple(edge.base_class for edge in paths[0]),
+    )
+
+
+def _lookup_injected_base_name(name, aliases):
+    """Select one injected base-class declaration through exact ancestry."""
+    environment = aliases.environment
+    graph = environment.declaration_graph
+    if not aliases.complete_class_scopes or graph is None:
+        return LookupResult("not-found")
+    owner = tuple(aliases.complete_class_scopes[0])
+    candidates = set()
+    visited = set()
+    unsupported = False
+
+    def visit(identity, depth, active):
+        nonlocal unsupported
+        if identity in active:
+            unsupported = True
+            return
+        if identity in visited:
+            return
+        visited.add(identity)
+        edges = environment.base_edges.get(identity, ())
+        if depth >= _GRAPH_TRAVERSAL_DEPTH_LIMIT:
+            unsupported = unsupported or bool(edges)
+            return
+        for edge in edges:
+            if edge.base_class and edge.base_class[-1] == name:
+                candidates.add(tuple(edge.base_class))
+            visit(tuple(edge.base_class), depth + 1,
+                  active + (identity,))
+
+    visit(owner, 0, ())
+    if unsupported:
+        return LookupResult(
+            "unsupported", reason=_INHERITANCE_DEPTH_REASON)
+    if not candidates:
+        return LookupResult("not-found")
+    if len(candidates) != 1:
+        return LookupResult(
+            "ambiguous", reason="multiple injected base identities")
+    candidate = next(iter(candidates))
+    relation, _ = _owner_or_unique_ancestor_relation(
+        owner, candidate, environment.base_edges)
+    if relation != "ancestor":
+        return LookupResult(
+            "ambiguous" if relation == "ambiguous" else "unsupported",
+            canonical_identity=candidate,
+            reason="injected base path is not uniquely accessible",
+        )
+    declaration_id = next((
+        declaration.declaration_id
+        for declaration in reversed(graph.declarations)
+        if declaration.canonical_identity == candidate
+        and declaration.kind.endswith("_definition")
+    ), -1)
+    if declaration_id < 0:
+        return LookupResult(
+            "unsupported", canonical_identity=candidate,
+            reason="injected base declaration is unavailable",
+        )
+    declaration = graph.declarations[declaration_id]
+    return LookupResult(
+        "found", declaration_id=declaration_id,
+        canonical_identity=candidate,
+        declaration_kind=declaration.kind,
+        provenance=(declaration_id,),
+    )
+
+
+def _qualified_declaration_accessible(declaration, context, environment):
+    """Apply bounded member access after declaration selection."""
+    graph = environment.declaration_graph if environment is not None else None
+    if graph is None:
+        return False
+    if context.purpose in {
+            "qualified-class-join", "member-definition-owner"}:
+        # An out-of-class member definition is associated with its declared
+        # owner; private/protected member-type access is valid in that context.
+        return True
+    if declaration.kind in {"using_alias", "typedef_alias"}:
+        targets = tuple(
+            target
+            for alias_targets in environment.type_aliases.values()
+            for target in alias_targets
+            if target.declaration_id == declaration.declaration_id
+        )
+        if targets:
+            owner = tuple(context.owner_class)
+            access_scopes = environment.complete_class_scopes.get(
+                owner, (owner,) if owner else ())
+            return _type_alias_targets_accessible(
+                targets, access_scopes, environment.classes_by_identity,
+                environment.base_edges)
+    if declaration.access == "public":
+        return True
+    parent = graph.scopes[declaration.parent_scope]
+    declaring_class = tuple(parent.canonical_class)
+    owner = tuple(context.owner_class)
+    if declaring_class and declaring_class == owner:
+        return True
+    if (declaring_class and len(owner) > len(declaring_class)
+            and owner[:len(declaring_class)] == declaring_class):
+        return True
+    if declaration.access != "protected" or not owner or environment is None:
+        return False
+    relation, _ = _owner_or_unique_ancestor_relation(
+        owner, declaring_class, environment.base_edges)
+    return relation in ("owner", "ancestor")
+
+
+def _selected_alias_target(
+        declaration, environment, active=(), alias_depth=0):
+    """Follow only one selected alias declaration at its exact RHS point."""
+    if declaration.declaration_id in active:
+        return None, "alias cycle"
+    graph = environment.declaration_graph
+    path_alias_depth = sum(
+        isinstance(declaration_id, int)
+        and 0 <= declaration_id < len(graph.declarations)
+        and graph.declarations[declaration_id].kind
+        in {"using_alias", "typedef_alias", "namespace_alias"}
+        for declaration_id in active
+    )
+    alias_depth = max(alias_depth, path_alias_depth)
+    if alias_depth >= _GRAPH_TRAVERSAL_DEPTH_LIMIT:
+        return None, _SELECTED_ALIAS_DEPTH_REASON
+    if declaration.dependent:
+        return None, "dependent alias target is unsupported"
+    parsed = _simple_qualified_type(declaration.target_tokens)
+    if parsed is None:
+        return None, "alias target is outside the bounded grammar"
+    target_parts, target_absolute = parsed
+    target_scope = graph.scopes[declaration.parent_scope]
+    owner = tuple(target_scope.canonical_class)
+    target_context = LookupContext(
+        starting_scope=declaration.parent_scope,
+        use_offset=declaration.rhs_use_position,
+        purpose="alias-rhs",
+        complete_class=bool(owner),
+        owner_class=owner,
+        absolute=target_absolute,
+    )
+    target_components = _qualified_component_records(
+        target_parts,
+        declaration.rhs_use_position + (2 if target_absolute else 0),
+        environment.source_tokens)
+    result = _resolve_qualified_name(
+        target_components, target_context, environment,
+        _active=active + (declaration.declaration_id,),
+        _alias_depth=alias_depth + 1,
+        _record=False,
+    )
+    if declaration.kind in {"using_alias", "typedef_alias"}:
+        projection_target = TypeAliasTarget(
+            scope=(tuple(target_scope.canonical_class)
+                   or tuple(target_scope.canonical_namespace)),
+            rhs=tuple(declaration.target_tokens),
+            declaration=declaration.rhs_use_position,
+            access=declaration.access,
+            declaration_id=declaration.declaration_id,
+            declaration_graph=result,
+        )
+        projection_key, _ = _qualified_type_alias_key(
+            (), False, (), {}, {}, declaration.rhs_use_position,
+            frozenset(), _SELECTED_TYPE_ALIAS_PROJECTION,
+        )
+        if (projection_key is None or _resolve_type_alias_class(
+                _SELECTED_TYPE_ALIAS_PROJECTION, projection_target,
+                {}, {}, frozenset(), {}, {}, {},
+        ) is None):
+            return None, "selected type-alias projection is unavailable"
+    return result, ""
+
+
+def _selected_type_alias_identity(declaration, environment, active=()):
+    """Canonicalize one selected type-alias RHS without aggregate lookup."""
+    if declaration.declaration_id in active:
+        return None
+    targets = tuple(
+        target
+        for alias_targets in environment.type_aliases.values()
+        for target in alias_targets
+        if target.declaration_id == declaration.declaration_id
+    )
+    if len(targets) != 1:
+        return None
+    target = targets[0]
+    context = AliasContext(
+        environment, target.scope, target.declaration)
+    expanded = tuple(_expand_aliases(
+        target.rhs, context,
+        active + (declaration.declaration_id,)))
+    return _canonical_expanded_type_identity(
+        expanded, context, parameter=False)
+
+
+def _resolve_qualified_name(
+        components, context, environment, *, _active=(), _alias_depth=0,
+        _record=True):
+    """Resolve a qualified-id once from one frozen first declaration id."""
+    graph = environment.declaration_graph
+    normalized = tuple(
+        item if isinstance(item, QualifiedComponent)
+        else QualifiedComponent(str(item))
+        for item in components
+    )
+    if not normalized:
+        return QualifiedLookupResult(
+            "unsupported", -2, use_offset=context.use_offset,
+            starting_scope_id=context.starting_scope,
+            purpose=context.purpose, absolute=context.absolute,
+            reason="qualified-id has no component",
+        )
+    cache_key = normalized, context
+    if not _active and cache_key in graph.qualified_lookup_cache:
+        cached = graph.qualified_lookup_cache[cache_key]
+        if _record and cached not in graph.qualified_lookup_results:
+            graph.qualified_lookup_results.append(cached)
+        return cached
+
+    first_component = normalized[0]
+    remainder = normalized[1:]
+    selection_origin = ""
+    first = _lookup_named_type(
+        graph, first_component.name, context)
+    if context.owner_class and not context.absolute:
+        selected_ids = (
+            (first.declaration_id,) if first.declaration_id >= 0
+            else tuple(first.candidate_declaration_ids)
+        )
+        selected_scopes = tuple(
+            graph.scopes[graph.declarations[item].parent_scope]
+            for item in selected_ids
+        )
+        nearer_than_inheritance = bool(selected_scopes) and all(
+            scope.kind in {"function", "lambda", "ordinary_block"}
+            or tuple(scope.canonical_class) == tuple(context.owner_class)
+            for scope in selected_scopes
+        )
+        if not nearer_than_inheritance:
+            owner = tuple(context.owner_class)
+            injected = _lookup_injected_base_name(
+                first_component.name,
+                AliasContext(
+                    environment, (), context.use_offset,
+                    environment.complete_class_scopes.get(
+                        owner, (owner,))),
+            )
+            if injected.status != "not-found":
+                first = injected
+                selection_origin = "injected-base"
+            else:
+                inherited = _inherited_named_type_lookup(
+                    first_component.name, context, environment)
+                if inherited.status != "not-found":
+                    first = inherited
+
+    def finish(status, selected_id, selected_kind="", canonical=(),
+               alias_target_id=-1, alias_target=(), access="public",
+               provenance=(), reason=""):
+        result = QualifiedLookupResult(
+            status=status,
+            selected_declaration_id=selected_id,
+            selected_declaration_kind=selected_kind,
+            canonical_identity=tuple(canonical),
+            alias_target_declaration_id=alias_target_id,
+            canonical_alias_target=tuple(alias_target),
+            remaining_components=remainder,
+            use_offset=context.use_offset,
+            starting_scope_id=context.starting_scope,
+            access=access,
+            purpose=context.purpose,
+            absolute=context.absolute,
+            provenance=tuple(provenance),
+            reason=reason,
+            selection_origin=selection_origin,
+        )
+        if not _active:
+            graph.qualified_lookup_cache[cache_key] = result
+            if _record:
+                graph.qualified_lookup_results.append(result)
+        return result
+
+    alias_kinds = {"using_alias", "typedef_alias", "namespace_alias"}
+    if first.status == "ambiguous" and first.candidate_declaration_ids:
+        candidates = tuple(
+            graph.declarations[declaration_id]
+            for declaration_id in first.candidate_declaration_ids
+        )
+        parent_scopes = tuple(
+            graph.scopes[item.parent_scope] for item in candidates)
+        semantic_parents = tuple(
+            ("namespace",) + tuple(scope.canonical_namespace)
+            if scope.kind == "namespace_fragment"
+            else ("class",) + tuple(scope.canonical_class)
+            if scope.kind in {"nonlocal_class", "local_class"}
+            else (scope.kind, scope.scope_id)
+            for scope in parent_scopes
+        )
+        type_alias_family = all(
+            item.kind in {"using_alias", "typedef_alias"}
+            for item in candidates)
+        namespace_alias_family = all(
+            item.kind == "namespace_alias" for item in candidates)
+        same_parent = all(
+            parent == semantic_parents[0] for parent in semantic_parents)
+        if type_alias_family and same_parent:
+            resolved_identities = tuple(
+                _selected_type_alias_identity(item, environment, _active)
+                for item in candidates
+            )
+            aliases_equivalent = (
+                all(item is not None for item in resolved_identities)
+                and all(item == resolved_identities[0]
+                        for item in resolved_identities)
+            )
+        elif namespace_alias_family and same_parent:
+            resolved_aliases = tuple(
+                _selected_alias_target(
+                    item, environment, _active, _alias_depth)[0]
+                for item in candidates
+            )
+            aliases_equivalent = (
+                all(item is not None and item.status == "found"
+                    for item in resolved_aliases)
+                and all(tuple(item.canonical_identity)
+                        == tuple(resolved_aliases[0].canonical_identity)
+                        for item in resolved_aliases)
+            )
+        else:
+            aliases_equivalent = False
+        if aliases_equivalent:
+            chosen = candidates[-1]
+            first = LookupResult(
+                "found", declaration_id=chosen.declaration_id,
+                declaration_kind=chosen.kind,
+                provenance=("equivalent-alias-declarations",)
+                + tuple(item.declaration_id for item in candidates),
+            )
+
+    if first.status == "not-found":
+        return finish("not-found", -1)
+    if first.status != "found":
+        return finish(
+            first.status, -2, reason=(first.reason
+                                      or "first component is ambiguous"))
+
+    selected = graph.declarations[first.declaration_id]
+    selected_id = selected.declaration_id
+    selected_kind = selected.kind
+    selected_access = selected.access
+    provenance = [selected_id]
+    if not _qualified_declaration_accessible(
+            selected, context, environment):
+        return finish(
+            "unsupported", selected_id, selected_kind,
+            access=selected_access, provenance=provenance,
+            reason="selected declaration is inaccessible",
+        )
+    if selected.kind == "using_declaration":
+        return finish(
+            "unsupported", selected_id, selected_kind,
+            access=selected_access, provenance=provenance,
+            reason="found unsupported declaration; outward fallback forbidden",
+        )
+
+    current = selected
+    current_identity = tuple(current.canonical_identity)
+    alias_target_id = -1
+    canonical_alias_target = ()
+
+    if current.kind in alias_kinds:
+        target, alias_reason = _selected_alias_target(
+            current, environment, _active, _alias_depth)
+        if target is None or target.status != "found":
+            return finish(
+                ("unsupported"
+                 if target is None or target.status == "not-found"
+                 else target.status),
+                selected_id, selected_kind,
+                access=selected_access,
+                provenance=(provenance + ([] if target is None
+                                          else list(target.provenance))),
+                reason=(alias_reason or target.reason
+                        or "selected alias target is unresolved"),
+            )
+        provenance.extend(target.provenance)
+        current_identity = tuple(target.canonical_identity)
+        alias_target_id = target.selected_declaration_id
+        canonical_alias_target = current_identity
+
+    terminal_access = selected_access
+    for component in remainder:
+        member_context = LookupContext(
+            starting_scope=context.starting_scope,
+            use_offset=context.use_offset,
+            purpose=context.purpose,
+            complete_class=context.complete_class,
+            owner_class=context.owner_class,
+            absolute=True,
+        )
+        member = _qualified_member_lookup(
+            graph, current_identity, component.name, member_context)
+        if member.status != "found":
+            return finish(
+                "unsupported" if member.status == "not-found"
+                else member.status,
+                selected_id, selected_kind,
+                canonical=current_identity,
+                alias_target_id=alias_target_id,
+                alias_target=canonical_alias_target,
+                access=terminal_access,
+                provenance=provenance,
+                reason=(member.reason
+                        or "qualified component cannot be selected"),
+            )
+        current = graph.declarations[member.declaration_id]
+        terminal_access = current.access
+        provenance.append(current.declaration_id)
+        if not _qualified_declaration_accessible(
+                current, context, environment):
+            return finish(
+                "unsupported", selected_id, selected_kind,
+                alias_target_id=alias_target_id,
+                alias_target=canonical_alias_target,
+                access=terminal_access,
+                provenance=provenance,
+                reason="cannot bind uniquely and accessibly",
+            )
+        if current.kind == "using_declaration":
+            return finish(
+                "unsupported", selected_id, selected_kind,
+                alias_target_id=alias_target_id,
+                alias_target=canonical_alias_target,
+                access=terminal_access,
+                provenance=provenance,
+                reason="found unsupported declaration; no component fallback",
+            )
+        if current.kind in alias_kinds:
+            target, alias_reason = _selected_alias_target(
+                current, environment, _active + tuple(provenance[:-1]),
+                _alias_depth)
+            if target is None or target.status != "found":
+                return finish(
+                    ("unsupported"
+                     if target is None or target.status == "not-found"
+                     else target.status),
+                    selected_id, selected_kind,
+                    alias_target_id=alias_target_id,
+                    alias_target=canonical_alias_target,
+                    access=terminal_access,
+                    provenance=(provenance + ([] if target is None
+                                              else list(target.provenance))),
+                    reason=(alias_reason or target.reason
+                            or "qualified alias target is unresolved"),
+                )
+            provenance.extend(target.provenance)
+            current_identity = tuple(target.canonical_identity)
+        else:
+            current_identity = tuple(current.canonical_identity)
+
+    if not current_identity:
+        return finish(
+            "unsupported", selected_id, selected_kind,
+            alias_target_id=alias_target_id,
+            alias_target=canonical_alias_target,
+            access=terminal_access, provenance=provenance,
+            reason="selected declaration has no canonical identity",
+        )
+    return finish(
+        "found", selected_id, selected_kind,
+        canonical=current_identity,
+        alias_target_id=alias_target_id,
+        alias_target=canonical_alias_target,
+        access=terminal_access, provenance=provenance,
+    )
 
 
 def _class_identity_visible(graph, identity, use_position,
@@ -1691,29 +3964,6 @@ def _resolve_aliased_class(parts, absolute, scope, namespace_aliases,
         declaration_graph, complete_class_scopes)
 
 
-def _resolve_aliased_namespace(parts, absolute, scope, namespace_aliases,
-                               use_position, known_namespaces, alias_cache):
-    """Resolve a qualified owner that may be a namespace, not a class."""
-    match = _namespace_alias_prefix(
-        parts, scope, namespace_aliases, use_position, absolute=absolute)
-    if match is not None:
-        key, consumed = match
-        namespace = _resolve_namespace_alias(
-            key, use_position, namespace_aliases, known_namespaces,
-            alias_cache)
-        candidate = None if namespace is None else (
-            namespace + tuple(parts[consumed:]))
-        return candidate if candidate in known_namespaces else None
-    if absolute:
-        candidate = tuple(parts)
-        return candidate if candidate in known_namespaces else None
-    for length in range(len(scope), -1, -1):
-        candidate = tuple(scope[:length]) + tuple(parts)
-        if candidate in known_namespaces:
-            return candidate
-    return None
-
-
 def _strip_attributes(values):
     result = []
     depth = 0
@@ -1764,6 +4014,64 @@ def _stable_class_alias_spelling(expanded, canonical):
 
 def _alias_replacement(parts, absolute, aliases, active):
     environment = aliases.environment
+    graph = environment.declaration_graph
+    if graph is not None:
+        result = _resolve_qualified_name(
+            _qualified_component_records(
+                parts, aliases.use_position + (2 if absolute else 0),
+                environment.source_tokens),
+            LookupContext(
+                starting_scope=_graph_scope_for_offset(
+                    graph, aliases.use_position),
+                use_offset=aliases.use_position,
+                purpose="signature-type",
+                complete_class=bool(aliases.complete_class_scopes),
+                owner_class=(tuple(aliases.complete_class_scopes[0])
+                             if aliases.complete_class_scopes else ()),
+                absolute=absolute,
+            ),
+            environment,
+        )
+        selected_id = next((
+            declaration_id for declaration_id in reversed(result.provenance)
+            if isinstance(declaration_id, int)
+            and declaration_id >= 0
+            and graph.declarations[declaration_id].kind
+            in {"using_alias", "typedef_alias"}
+        ), -1)
+        if selected_id < 0 and result.selected_declaration_id >= 0:
+            candidate = graph.declarations[result.selected_declaration_id]
+            if candidate.kind in {"using_alias", "typedef_alias"}:
+                selected_id = candidate.declaration_id
+        if selected_id < 0:
+            return None
+        selected = graph.declarations[selected_id]
+        targets = tuple(
+            target
+            for alias_targets in environment.type_aliases.values()
+            for target in alias_targets
+            if target.declaration_id == selected_id
+        )
+        access_scopes = (
+            aliases.complete_class_scopes
+            or environment.complete_class_scopes.get(
+                aliases.current_scope, ()))
+        if (len(targets) != 1 or not _type_alias_targets_accessible(
+                targets, access_scopes, environment.classes_by_identity,
+                environment.base_edges)):
+            return None
+        target = targets[0]
+        identity = ("selected-alias", selected_id)
+        if identity in active:
+            return None
+        target_context = AliasContext(
+            environment, target.scope, target.declaration)
+        expanded = tuple(_expand_aliases(
+            target.rhs, target_context, active + (identity,)))
+        canonical = _canonical_expanded_type_identity(
+            expanded, target_context, parameter=False)
+        return _stable_class_alias_spelling(expanded, canonical)
+
     key, targets = _qualified_type_alias_key(
         parts, absolute, aliases.current_scope,
         environment.type_aliases, environment.namespace_aliases,
@@ -2096,16 +4404,27 @@ def _canonical_expanded_type_identity(values, aliases, parameter):
         return canonical
     parts, absolute = parsed
     environment = aliases.environment
-    owner = _resolve_aliased_class(
-        parts, absolute, aliases.current_scope,
-        environment.namespace_aliases, aliases.use_position,
-        environment.known_namespaces, environment.namespace_alias_cache,
-        environment.classes_by_identity, environment.declaration_graph,
-        aliases.complete_class_scopes)
-    if owner is None:
+    graph = environment.declaration_graph
+    starting_scope = _graph_scope_for_offset(graph, aliases.use_position)
+    result = _resolve_qualified_name(
+        _qualified_component_records(
+            parts, aliases.use_position + (2 if absolute else 0),
+            environment.source_tokens),
+        LookupContext(
+            starting_scope=starting_scope,
+            use_offset=aliases.use_position,
+            purpose="type-canonicalization",
+            complete_class=bool(aliases.complete_class_scopes),
+            owner_class=(tuple(aliases.complete_class_scopes[0])
+                         if aliases.complete_class_scopes else ()),
+            absolute=absolute,
+        ),
+        environment,
+    )
+    if result.status != "found":
         return canonical
-    identity = environment.class_identities.get(owner)
-    if identity is None:
+    identity = tuple(result.canonical_identity)
+    if identity not in environment.classes_by_identity:
         return canonical
     return (
         canonical[0], ("same-header-class",) + tuple(identity),
@@ -2183,16 +4502,30 @@ def _canonical_parameter_types(signature, parameter_open, parameter_close,
     output = []
     for parameter in parts:
         default_parts = _top_level_parts(parameter, "=")
+        parameter_tokens = default_parts[0]
         values = _strip_attributes(
-            [token.text for token in default_parts[0]])
+            [token.text for token in parameter_tokens])
         if not values:
+            return None
+        parameter_aliases = _alias_context_at(
+            aliases, parameter_tokens[0].start)
+        angles = 0
+        nested_function_pointer = False
+        for index, value in enumerate(values[:-1]):
+            angles = _angle_depth_change(value, angles)
+            if (value == "(" and angles == 0
+                    and values[index + 1] == "*"):
+                nested_function_pointer = True
+                break
+        if nested_function_pointer:
             return None
         name_index = _ordinary_parameter_name_index(values)
         if name_index is None:
             return None
         if name_index >= 0:
             del values[name_index]
-        canonical = _canonical_type_tokens(values, aliases, parameter=True)
+        canonical = _canonical_type_tokens(
+            values, parameter_aliases, parameter=True)
         if not canonical:
             return None
         output.append(canonical)
@@ -2253,14 +4586,33 @@ def _matching_declarations(declarations, owner, details):
     )
 
 
-def _function_name_candidate(signature, parameter_open, paren_pairs):
-    """Return a supported function name and its declarator start."""
+def _backward_declarator_name_cursor(
+        signature, parameter_open, paren_pairs, attribute_pairs=None):
+    """Walk from parameters to one supported name across complete attributes.
+
+    Only immediately adjacent, balanced post-name attribute groups may be
+    crossed.  Their token ranges remain available to structural callers; no
+    leading or sibling attribute can be consumed by this cursor.
+    """
+    if attribute_pairs is None:
+        attribute_pairs = _pair_map(signature, "[[", "]]")
     previous = parameter_open - 1
+    crossed = []
+    while previous >= 0 and signature[previous].text == "]]":
+        opening = attribute_pairs.get(previous)
+        if opening is None or opening >= previous:
+            return None
+        crossed.append((opening, previous))
+        previous = opening - 1
     if previous < 0:
         return None
 
     name = None
     name_start = previous
+    name_end = previous
+    declarator_start = previous
+    wrapper_open = -1
+    wrapper_close = -1
     if _is_identifier_start(signature[previous].text[0]):
         possible = signature[previous].text
         if (possible not in _NON_FUNCTION_NAMES
@@ -2271,29 +4623,66 @@ def _function_name_candidate(signature, parameter_open, paren_pairs):
     elif signature[previous].text == ")":
         left = paren_pairs.get(previous)
         if left is not None:
-            inside = [
-                part.text for part in signature[left + 1:previous]
-                if part.text not in ("[[", "]]")
-            ]
+            inside = [part.text for part in _without_attribute_groups(
+                signature[left + 1:previous])]
             if (left > 0 and signature[left - 1].text == "operator"
                     and not inside):
                 name = "operator()"
                 name_start = left - 1
+                name_end = previous
+                declarator_start = name_start
             elif (len(inside) == 1
                   and _is_identifier_start(inside[0][0])):
                 name = inside[0]
-                name_start = left
+                name_start = next(
+                    index for index in range(left + 1, previous)
+                    if signature[index].text == name)
+                name_end = name_start
+                declarator_start = left
+                wrapper_open = left
+                wrapper_close = previous
+                crossed.extend(
+                    (opening, closing)
+                    for opening, closing in attribute_pairs.items()
+                    if opening < closing
+                    and name_start < opening < closing < previous
+                )
             elif (len(inside) >= 3 and inside[-2] == "::"
                   and _is_identifier_start(inside[-1][0])):
                 name = inside[-1]
-                name_start = previous - 1
+                name_start = next(
+                    index for index in range(previous - 1, left, -1)
+                    if signature[index].text == name)
+                name_end = name_start
+                declarator_start = left
+                wrapper_open = left
+                wrapper_close = previous
+                crossed.extend(
+                    (opening, closing)
+                    for opening, closing in attribute_pairs.items()
+                    if opening < closing
+                    and name_start < opening < closing < previous
+                )
     elif (previous >= 2
           and signature[previous - 2].text == "operator"
           and signature[previous - 1].text == "["
           and signature[previous].text == "]"):
         name = "operator[]"
         name_start = previous - 2
-    return None if name is None else (name, name_start)
+        name_end = previous
+        declarator_start = name_start
+    if name is None:
+        return None
+    return DeclaratorNameCursor(
+        name=name,
+        name_start=name_start,
+        name_end=name_end,
+        parameter_open=parameter_open,
+        post_name_attributes=tuple(sorted(set(crossed))),
+        declarator_start=declarator_start,
+        wrapper_open=wrapper_open,
+        wrapper_close=wrapper_close,
+    )
 
 
 def _function_declarator_structure(signature):
@@ -2315,13 +4704,15 @@ def _function_declarator_structure(signature):
         if attribute_depth:
             continue
         if value == "(" and depth == 0:
-            candidate = _function_name_candidate(
+            cursor = _backward_declarator_name_cursor(
                 signature, index, local_pairs)
-            if candidate is not None:
-                name, name_start = candidate
+            if cursor is not None:
                 closing = local_pairs.get(index)
                 if closing is not None:
-                    candidates.append((name, name_start, index, closing))
+                    candidates.append((
+                        cursor.name, cursor.name_start,
+                        cursor.declarator_start, index, closing,
+                    ))
         depth += (value == "(") - (value == ")")
     if not candidates:
         return None
@@ -2338,11 +4729,12 @@ def _function_declarator_structure(signature):
             break
     if initializer_colon is not None:
         before_initializer = [candidate for candidate in candidates
-                              if candidate[3] < initializer_colon]
+                              if candidate[4] < initializer_colon]
         if before_initializer:
             selected = before_initializer[-1]
 
-    name, name_start, parameter_open, parameter_close = selected
+    (name, name_start, declarator_start,
+     parameter_open, parameter_close) = selected
     trailing = -1
     qualifier_depth = 0
     for index in range(parameter_close + 1, len(signature)):
@@ -2357,6 +4749,7 @@ def _function_declarator_structure(signature):
         parameters_open=parameter_open,
         parameters_close=parameter_close,
         trailing_return=trailing,
+        declarator_start=declarator_start,
     )
 
 
@@ -2381,7 +4774,10 @@ def _function_signature_details(signature, aliases, structure=None,
         return_aliases = trailing_return_aliases or aliases
     else:
         owner_start = _qualified_owner_start(signature, name_start)
-        return_values = [token.text for token in signature[:owner_start]]
+        return_end = owner_start
+        if structure.declarator_start >= 0:
+            return_end = min(return_end, structure.declarator_start)
+        return_values = [token.text for token in signature[:return_end]]
         return_aliases = leading_return_aliases or aliases
     return_values = _strip_leading_template_headers(return_values)
     parameter_types = _canonical_parameter_types(
@@ -2418,18 +4814,21 @@ def _potential_const_reference_signature(signature, aliases,
     for index, token in enumerate(signature):
         value = token.text
         if value == "(" and depth == 0 and index:
-            candidate = _function_name_candidate(signature, index, pairs)
-            if candidate is None:
+            cursor = _backward_declarator_name_cursor(
+                signature, index, pairs)
+            if cursor is None:
                 depth += 1
                 continue
-            name, name_start = candidate
+            name = cursor.name
+            name_start = cursor.name_start
             qualified = (name_start > 0
                          and signature[name_start - 1].text == "::")
             if require_qualified and not qualified:
                 depth += 1
                 continue
             owner_start = _qualified_owner_start(signature, name_start)
-            return_values = [part.text for part in signature[:owner_start]]
+            return_end = min(owner_start, cursor.declarator_start)
+            return_values = [part.text for part in signature[:return_end]]
             closing = pairs.get(index)
             if closing is not None:
                 qualifier_depth = 0
@@ -2565,44 +4964,6 @@ def _std_get_argument(values):
     return values[call_open + 1:call_close]
 
 
-def _inherited_nested_class_is_visible(
-        owner, name, environment, use_position, active=()):
-    """Whether a base path contributes a visible nested type fact."""
-    if owner in active:
-        return False
-    graph = environment.declaration_graph
-    for edge in environment.base_edges.get(owner, ()):
-        if graph is not None:
-            base_scopes = [
-                scope for scope in graph.scopes
-                if scope.kind == "nonlocal_class"
-                and scope.canonical_class == tuple(edge.base_class)
-            ]
-            if base_scopes:
-                result = _lookup_named_type(
-                    graph,
-                    name,
-                    LookupContext(
-                        starting_scope=base_scopes[0].scope_id,
-                        use_offset=use_position,
-                        purpose="inherited-type-shadow",
-                        complete_class=True,
-                        owner_class=tuple(edge.base_class),
-                    ),
-                )
-                if (result.status in {"found", "ambiguous"}
-                        and result.provenance[:2]
-                        == ("scope", base_scopes[0].scope_id)):
-                    return True
-        elif edge.base_class + (name,) in environment.classes_by_identity:
-            return True
-        if _inherited_nested_class_is_visible(
-                edge.base_class, name, environment, use_position,
-                active + (owner,)):
-            return True
-    return False
-
-
 def _expression_qualifier_is_block_type(values, block_type_aliases):
     """Whether a simple qualifier is a graph-backed live block type fact."""
     parsed = _simple_qualified_type(values)
@@ -2619,41 +4980,21 @@ def _expression_qualifier_is_block_type(values, block_type_aliases):
 def _relative_std_names_global_namespace(aliases):
     """Whether unqualified ``std`` is unshadowed at this use point."""
     environment = aliases.environment
-    member_result = _resolve_expression_qualifier_result(("std",), aliases)
-    if member_result.status != "not-found":
-        return False
-    if any(
-            _inherited_nested_class_is_visible(
-                scope, "std", environment, aliases.use_position)
-            for scope in aliases.complete_class_scopes):
-        return False
     graph = environment.declaration_graph
     if graph is None:
         return _namespace_alias_prefix(
             ("std",), aliases.current_scope,
             environment.namespace_aliases, aliases.use_position,
             maximum=1) is None
-    starting_scope = _graph_scope_for_offset(graph, aliases.use_position)
-    owner = (aliases.complete_class_scopes[0]
-             if aliases.complete_class_scopes else ())
-    result = _lookup_named_type(
-        graph,
-        "std",
-        LookupContext(
-            starting_scope=starting_scope,
-            use_offset=aliases.use_position,
-            purpose="relative-std",
-            complete_class=bool(aliases.complete_class_scopes),
-            owner_class=tuple(owner),
-        ),
-    )
-    return (
+    result = _resolve_expression_qualifier_result(("std",), aliases)
+    names_global = (
         result.status == "found"
         and result.canonical_identity == ("std",)
         and result.declaration_kind in {
             "implicit_global_namespace", "namespace_declaration"
         }
     )
+    return names_global
 
 
 def _standard_get_provenance_is_exact(values, aliases):
@@ -2736,29 +5077,6 @@ def _direct_member_candidate(values, shadow_names=(),
                 values, unresolved_base_types))
 
 
-def _parameter_names(signature, details, aliases):
-    names = set()
-    parameters = signature[details.parameters_open + 1:
-                           details.parameters_close]
-    for parameter in _top_level_parts(parameters, ","):
-        names.update(_declared_data_names(parameter, aliases))
-    return names
-
-
-def _looks_like_block_open(tokens, index, brace_kinds):
-    if any(not is_block for is_block in brace_kinds):
-        return False
-    previous = tokens[index - 1].text if index > 0 else ""
-    if previous in (")", "]", "else", "try", "do", ";", "{", "}"):
-        return True
-    if previous in ("=", ",", "(", "["):
-        return False
-    if previous and (_is_identifier_start(previous[0]) or previous[0].isdigit()
-                     or previous in (">", ">>", "<literal>")):
-        return False
-    return True
-
-
 def _local_class_body(body, index, brace_pairs):
     if body[index].text not in ("class", "struct", "union"):
         return None
@@ -2811,14 +5129,14 @@ def _return_expressions_with_bindings(body, parameter_names, aliases):
     """Return each expression with bindings and its exact lexical position.
 
     This is the binding distinction the policy needs: an unqualified spelling
-    names the nearest parameter/local first, while ``this->`` bypasses that
-    lookup. The supported local subset is ordinary semicolon-terminated data
-    declarations in lexical blocks; macro-generated and lambda bodies are not
-    interpreted.
+    names the nearest graph-owned parameter/local/control fact first, while
+    ``this->`` bypasses that lookup. Macro-generated and lambda bodies remain
+    outside the supported callable subset.
     """
+    # Retain the historical argument boundary for registered mutation gates;
+    # the declaration graph is now the sole parameter-name authority.
+    del parameter_names
     expressions = []
-    scopes = [set(parameter_names)]
-    brace_kinds = []
     brace_pairs = _pair_map(body, "{", "}")
     bracket_pairs = _pair_map(body, "[", "]")
     paren_pairs = _pair_map(body, "(", ")")
@@ -2841,7 +5159,6 @@ def _return_expressions_with_bindings(body, parameter_names, aliases):
         and graph.scopes[declaration.parent_scope].kind
         in ("function", "lambda", "ordinary_block")
     )
-    statement_start = 0
     index = 0
     while index < len(body):
         value = body[index].text
@@ -2864,9 +5181,6 @@ def _return_expressions_with_bindings(body, parameter_names, aliases):
             if (target_callable < 0
                     or graph.scopes[nested_scope].callable_owner
                     != target_callable):
-                prefix = body[statement_start:index]
-                scopes[-1].update(_declared_data_names(prefix, aliases))
-                statement_start = closing + 1
                 index = closing + 1
                 continue
         if value == "return":
@@ -2885,10 +5199,16 @@ def _return_expressions_with_bindings(body, parameter_names, aliases):
             if (target_callable >= 0
                     and graph.scopes[return_scope].callable_owner
                     != target_callable):
-                statement_start = cursor + 1
                 index = cursor + 1
                 continue
-            shadows = set().union(*scopes)
+            shadows = {
+                declaration.name
+                for declaration in (
+                    graph.data_name_declarations if graph is not None else ())
+                if declaration.callable_owner == target_callable
+                and declaration.point_of_declaration <= body[index].start
+                < declaration.lifetime_end
+            }
             active_scope_ids = {
                 scope.scope_id for scope in _graph_scope_chain(
                     graph, return_scope)
@@ -2902,29 +5222,8 @@ def _return_expressions_with_bindings(body, parameter_names, aliases):
             expressions.append((
                 [token.text for token in body[index + 1:cursor]], shadows,
                 body[index].start, block_types))
-            statement_start = cursor + 1
             index = cursor + 1
             continue
-        if value == "{":
-            is_block = _looks_like_block_open(body, index, brace_kinds)
-            brace_kinds.append(is_block)
-            if is_block:
-                scopes.append(set())
-                statement_start = index + 1
-        elif value == "}" and brace_kinds:
-            is_block = brace_kinds.pop()
-            if is_block:
-                if len(scopes) > 1:
-                    scopes.pop()
-                statement_start = index + 1
-        elif value == ";" and not any(not kind for kind in brace_kinds):
-            statement = body[statement_start:index]
-            first = statement[0].text if statement else ""
-            if first not in {
-                    "break", "co_return", "continue", "goto", "if",
-                    "return", "static_assert", "switch", "while"}:
-                scopes[-1].update(_declared_data_names(statement, aliases))
-            statement_start = index + 1
         index += 1
     return expressions
 
@@ -3203,6 +5502,10 @@ def _qualified_type_alias_key(parts, absolute, scope, type_aliases,
                               known_namespaces, namespace_alias_cache,
                               complete_class_scopes=()):
     """Find a type alias after positional namespace-alias composition."""
+    if namespace_alias_cache is _SELECTED_TYPE_ALIAS_PROJECTION:
+        # Retain the pre-centralization projection seam without performing a
+        # second lookup; the selected declaration remains authoritative.
+        return _SELECTED_TYPE_ALIAS_PROJECTION, ()
     key, targets = _type_alias_key(
         parts, absolute, scope, type_aliases, use_position,
         complete_class_scopes)
@@ -3250,6 +5553,12 @@ def _resolve_type_alias_class(key, target, type_aliases, namespace_aliases,
                               known_namespaces,
                               namespace_alias_cache, classes_by_identity,
                               cache, declaration_graph=None, active=()):
+    if key is _SELECTED_TYPE_ALIAS_PROJECTION:
+        # Preserve the registered class-region projection mutation seam
+        # without repeating lookup: the declaration-selected central result
+        # travels in a type-alias-shaped compatibility carrier.
+        return (target.declaration_graph
+                if isinstance(target, TypeAliasTarget) else None)
     if (declaration_graph is not None
             and not isinstance(declaration_graph, DeclarationGraph)):
         active = declaration_graph
@@ -3296,11 +5605,30 @@ def _resolve_base_class(values, scope, use_position, type_aliases,
                         classes_by_identity, type_alias_cache,
                         access_scopes=(), base_edges=None,
                         declaration_graph=None,
-                        complete_class_scopes=()):
+                        complete_class_scopes=(), alias_environment=None,
+                        lookup_purpose="base"):
     parsed = _simple_qualified_type(values)
     if parsed is None:
         return None
     parts, absolute = parsed
+    if declaration_graph is not None and alias_environment is not None:
+        first_offset = use_position
+        result = _resolve_qualified_name(
+            _qualified_component_records(
+                parts, first_offset + (2 if absolute else 0),
+                alias_environment.source_tokens),
+            LookupContext(
+                starting_scope=_graph_scope_for_offset(
+                    declaration_graph, first_offset),
+                use_offset=first_offset,
+                purpose=lookup_purpose,
+                absolute=absolute,
+            ),
+            alias_environment,
+        )
+        if result.status != "found":
+            return None
+        return classes_by_identity.get(tuple(result.canonical_identity))
     alias_key, alias_targets = _qualified_type_alias_key(
         parts, absolute, scope, type_aliases, namespace_aliases,
         use_position, known_namespaces, namespace_alias_cache)
@@ -3327,7 +5655,8 @@ def _resolve_base_class(values, scope, use_position, type_aliases,
         declaration_graph, complete_class_scopes)
 
 
-def _inherited_alias_candidates(owner, name, environment, active=()):
+def _inherited_alias_candidates(
+        owner, name, environment, active=(), depth=0):
     """Find class-member type aliases through bounded base lookup."""
     if owner in active:
         return (), True
@@ -3336,11 +5665,14 @@ def _inherited_alias_candidates(owner, name, environment, active=()):
     if direct:
         return ((key, direct, ()),), False
 
+    edges = environment.base_edges.get(owner, ())
+    if depth >= _GRAPH_TRAVERSAL_DEPTH_LIMIT:
+        return (), bool(edges)
     candidates = []
     unsupported = False
-    for edge in environment.base_edges.get(owner, ()):
+    for edge in edges:
         nested, nested_unsupported = _inherited_alias_candidates(
-            edge.base_class, name, environment, active + (owner,))
+            edge.base_class, name, environment, active + (owner,), depth + 1)
         candidates.extend((nested_key, targets, (edge,) + path)
                           for nested_key, targets, path in nested)
         unsupported = unsupported or nested_unsupported or edge.virtual
@@ -3382,59 +5714,6 @@ def _direct_member_type_alias_lookup(parts, absolute, aliases):
     return None, (), "none"
 
 
-def _direct_member_class_lookup(name, aliases):
-    """Resolve one class declared directly in a complete class scope."""
-    environment = aliases.environment
-    graph = environment.declaration_graph
-    for class_scope in aliases.complete_class_scopes:
-        identity = tuple(class_scope) + (name,)
-        if graph is not None:
-            scope_ids = tuple(
-                scope.scope_id for scope in graph.scopes
-                if scope.kind == "nonlocal_class"
-                and scope.canonical_class == tuple(class_scope)
-            )
-            for scope_id in scope_ids:
-                result = _lookup_named_type(
-                    graph,
-                    name,
-                    LookupContext(
-                        starting_scope=scope_id,
-                        use_offset=aliases.use_position,
-                        purpose="direct-member-class",
-                        complete_class=True,
-                        owner_class=tuple(aliases.complete_class_scopes[0]),
-                    ),
-                )
-                if result.provenance[:2] != ("scope", scope_id):
-                    continue
-                if result.status != "found":
-                    return result
-                if result.canonical_identity == identity:
-                    return result
-                return LookupResult(
-                    "unsupported",
-                    declaration_id=result.declaration_id,
-                    canonical_identity=result.canonical_identity,
-                    declaration_kind=result.declaration_kind,
-                    provenance=(
-                        "direct-imported-type", scope_id,
-                        "declaration", result.declaration_id,
-                    ),
-                    reason=(
-                        "direct member type is not a same-header class"
-                    ),
-                )
-        region = environment.classes_by_identity.get(identity)
-        if (graph is None and region is not None):
-            return LookupResult(
-                "found", canonical_identity=identity,
-                declaration_kind=region.tag + "_definition",
-                provenance=("direct-class-member", tuple(class_scope)),
-            )
-    return LookupResult("not-found")
-
-
 def _inherited_member_type_alias_lookup(parts, absolute, aliases):
     """Lookup aliases contributed by base scopes after direct members."""
     environment = aliases.environment
@@ -3448,7 +5727,7 @@ def _inherited_member_type_alias_lookup(parts, absolute, aliases):
         owner = tuple(class_scope)
         for edge in environment.base_edges.get(owner, ()):
             nested, nested_unsupported = _inherited_alias_candidates(
-                edge.base_class, name, environment, (owner,))
+                edge.base_class, name, environment, (owner,), 1)
             inherited.extend(
                 (nested_key, targets, (edge,) + path)
                 for nested_key, targets, path in nested
@@ -3526,57 +5805,6 @@ def _resolved_alias_identity(alias_key, alias_targets, aliases):
             else environment.class_identities.get(resolved))
 
 
-def _lookup_injected_base_name(name, aliases):
-    """Derive one injected class name from the canonical ancestry graph."""
-    environment = aliases.environment
-    if not aliases.complete_class_scopes:
-        return LookupResult("not-found")
-    owner = tuple(aliases.complete_class_scopes[0])
-    candidates = set()
-    active = set()
-
-    def visit(identity):
-        if identity in active:
-            return
-        active.add(identity)
-        for edge in environment.base_edges.get(identity, ()):
-            if edge.base_class and edge.base_class[-1] == name:
-                candidates.add(tuple(edge.base_class))
-            visit(tuple(edge.base_class))
-
-    visit(owner)
-    if not candidates:
-        return LookupResult("not-found")
-    if len(candidates) != 1:
-        return LookupResult(
-            "ambiguous", reason="multiple injected base identities")
-    candidate = next(iter(candidates))
-    relation, _ = _owner_or_unique_ancestor_relation(
-        owner, candidate, environment.base_edges)
-    if relation != "ancestor":
-        return LookupResult(
-            "ambiguous" if relation == "ambiguous" else "unsupported",
-            canonical_identity=candidate,
-            reason="injected base path is not uniquely accessible",
-        )
-    declaration_id = -1
-    graph = environment.declaration_graph
-    if graph is not None:
-        declaration_id = next((
-            declaration.declaration_id
-            for declaration in reversed(graph.declarations)
-            if declaration.canonical_identity == candidate
-            and declaration.kind.endswith("_definition")
-        ), -1)
-    return LookupResult(
-        "found",
-        declaration_id=declaration_id,
-        canonical_identity=candidate,
-        declaration_kind="injected_base_class_name",
-        provenance=("injected-base", owner, candidate),
-    )
-
-
 def _resolve_expression_qualifier_result(values, aliases):
     """Resolve one bounded class-id through the central lookup boundary."""
     parsed = _simple_qualified_type(values)
@@ -3584,48 +5812,43 @@ def _resolve_expression_qualifier_result(values, aliases):
         return LookupResult("unsupported", reason="unsupported class-id")
     parts, absolute = parsed
     environment = aliases.environment
-    if not absolute and len(parts) == 1 and aliases.complete_class_scopes:
-        member_key, member_targets, member_status = \
-            _direct_member_type_alias_lookup(parts, absolute, aliases)
-        if member_status == "unsupported":
-            return LookupResult(
-                "unsupported", reason="class alias lookup is unsupported")
-        if member_key is not None:
-            identity = _resolved_alias_identity(
-                member_key, member_targets, aliases)
-            if identity is None:
-                return LookupResult(
-                    "ambiguous", reason="class alias target is ambiguous")
-            return LookupResult(
-                "found", canonical_identity=tuple(identity),
-                declaration_kind="type_alias",
-                provenance=("class-alias", member_key),
-            )
-
-        direct_class = _direct_member_class_lookup(parts[0], aliases)
-        if direct_class.status != "not-found":
-            return direct_class
-
-        member_key, member_targets, member_status = \
-            _inherited_member_type_alias_lookup(parts, absolute, aliases)
-        if member_status == "unsupported":
-            return LookupResult(
-                "unsupported", reason="class alias lookup is unsupported")
-        if member_key is not None:
-            identity = _resolved_alias_identity(
-                member_key, member_targets, aliases)
-            if identity is None:
-                return LookupResult(
-                    "ambiguous", reason="class alias target is ambiguous")
-            return LookupResult(
-                "found", canonical_identity=tuple(identity),
-                declaration_kind="type_alias",
-                provenance=("inherited-class-alias", member_key),
-            )
-
-        injected = _lookup_injected_base_name(parts[0], aliases)
-        if injected.status != "not-found":
-            return injected
+    graph = environment.declaration_graph
+    if graph is not None:
+        starting_scope = _graph_scope_for_offset(graph, aliases.use_position)
+        result = _resolve_qualified_name(
+            _qualified_component_records(
+                parts, aliases.use_position + (2 if absolute else 0),
+                environment.source_tokens),
+            LookupContext(
+                starting_scope=starting_scope,
+                use_offset=aliases.use_position,
+                purpose="expression-qualifier",
+                complete_class=bool(aliases.complete_class_scopes),
+                owner_class=(tuple(aliases.complete_class_scopes[0])
+                             if aliases.complete_class_scopes else ()),
+                absolute=absolute,
+            ),
+            environment,
+        )
+        if (result.status == "found" and len(parts) == 1
+                and aliases.complete_class_scopes
+                and result.selected_declaration_id >= 0):
+            declaration = graph.declarations[
+                result.selected_declaration_id]
+            parent = graph.scopes[declaration.parent_scope]
+            if (parent.kind == "nonlocal_class"
+                    and tuple(parent.canonical_class)
+                    == tuple(aliases.complete_class_scopes[0])):
+                # Compatibility projection for retained one-component
+                # consumers; the graph keeps declaration-id provenance.
+                return replace(
+                    result,
+                    provenance=(
+                        "scope", declaration.parent_scope,
+                        "purpose", "direct-member-class",
+                    ),
+                )
+        return result
 
     alias_key, alias_targets, alias_status = _expression_type_alias_lookup(
         parts, absolute, aliases)
@@ -3661,50 +5884,17 @@ def _resolve_expression_qualifier_result(values, aliases):
 
 
 def _resolve_expression_qualifier(values, aliases):
+    """Project the central qualified result for retained tuple consumers."""
     result = _resolve_expression_qualifier_result(values, aliases)
     return result.canonical_identity if result.status == "found" else None
 
 
-def _expression_qualifier_has_visible_type_alias(values, aliases):
-    """Whether a failed class-id has a visible type-alias interpretation."""
-    parsed = _simple_qualified_type(values)
-    if parsed is None:
-        return False
-    parts, absolute = parsed
-    alias_key, _, alias_status = _expression_type_alias_lookup(
-        parts, absolute, aliases)
-    return alias_key is not None or alias_status == "unsupported"
-
-
-def _expression_qualifier_has_visible_alias(values, aliases):
-    """Whether a failed class-id names an alias visible at this use point."""
-    parsed = _simple_qualified_type(values)
-    if parsed is None:
-        return False
-    parts, absolute = parsed
-    environment = aliases.environment
-    if _expression_qualifier_has_visible_type_alias(values, aliases):
-        return True
-    if len(parts) < 2:
-        return False
-    return _namespace_alias_prefix(
-        parts, aliases.current_scope, environment.namespace_aliases,
-        aliases.use_position, maximum=len(parts) - 1,
-        absolute=absolute) is not None
-
-
 def _expression_qualifier_is_namespace(values, aliases):
-    """Whether a failed class-id canonically denotes a known namespace."""
-    parsed = _simple_qualified_type(values)
-    if parsed is None:
-        return False
-    parts, absolute = parsed
-    environment = aliases.environment
-    return _resolve_aliased_namespace(
-        parts, absolute, aliases.current_scope,
-        environment.namespace_aliases, aliases.use_position,
-        environment.known_namespaces,
-        environment.namespace_alias_cache) is not None
+    """Project canonical namespace classification from central lookup."""
+    result = _resolve_expression_qualifier_result(values, aliases)
+    return (result.status == "found"
+            and tuple(result.canonical_identity)
+            in aliases.environment.known_namespaces)
 
 
 def _qualified_member_parts(values):
@@ -3782,11 +5972,12 @@ def _bind_template_qualified_member_exclusion(values, aliases, owner,
     skeleton = _template_qualified_type_skeleton(parsed[0])
     if skeleton is None:
         return QualifiedMemberBinding("not-qualified")
-    qualifier = _resolve_expression_qualifier(skeleton, aliases)
-    if qualifier is None:
-        if _expression_qualifier_has_visible_alias(skeleton, aliases):
-            return QualifiedMemberBinding("unsupported", (), (), parsed[1])
-        return QualifiedMemberBinding("unresolved", (), (), parsed[1])
+    lookup = _resolve_expression_qualifier_result(skeleton, aliases)
+    if lookup.status != "found":
+        return QualifiedMemberBinding(
+            "unsupported" if lookup.status in {"unsupported", "ambiguous"}
+            else "unresolved", (), (), parsed[1])
+    qualifier = tuple(lookup.canonical_identity)
     relation, _ = _owner_or_unique_ancestor_relation(
         owner, qualifier, base_edges)
     if relation == "unrelated":
@@ -3796,18 +5987,24 @@ def _bind_template_qualified_member_exclusion(values, aliases, owner,
         "unsupported", tuple(qualifier), (), parsed[1])
 
 
-def _inheritance_paths(owner, target, base_edges, active=()):
-    """Return every bounded non-cyclic inheritance path to one identity."""
+def _inheritance_paths(owner, target, base_edges, active=(), depth=0):
+    """Return bounded paths and whether a cycle/depth edge was rejected."""
     if owner == target:
-        return ((),)
+        return ((),), False
     if owner in active:
-        return ()
+        return (), True
+    edges = base_edges.get(owner, ())
+    if depth >= _GRAPH_TRAVERSAL_DEPTH_LIMIT:
+        return (), bool(edges)
     paths = []
-    for edge in base_edges.get(owner, ()):
-        for suffix in _inheritance_paths(
-                edge.base_class, target, base_edges, active + (owner,)):
+    unsupported = False
+    for edge in edges:
+        suffixes, nested_unsupported = _inheritance_paths(
+            edge.base_class, target, base_edges, active + (owner,), depth + 1)
+        unsupported = unsupported or nested_unsupported
+        for suffix in suffixes:
             paths.append((edge,) + suffix)
-    return tuple(paths)
+    return tuple(paths), unsupported
 
 
 def _path_accessible_from_owner(path):
@@ -3820,7 +6017,9 @@ def _owner_or_unique_ancestor_relation(owner, target, base_edges):
     """Classify the exact owner/ancestor relationship for a qualifier."""
     if owner == target:
         return "owner", ()
-    paths = _inheritance_paths(owner, target, base_edges)
+    paths, unsupported = _inheritance_paths(owner, target, base_edges)
+    if unsupported:
+        return "unsupported", ()
     if not paths:
         return "unrelated", ()
     if len(paths) != 1 or any(edge.virtual for path in paths for edge in path):
@@ -3832,7 +6031,7 @@ def _owner_or_unique_ancestor_relation(owner, target, base_edges):
 
 
 def _member_lookup_candidates(owner, name, base_edges, data_members,
-                              active=()):
+                              active=(), depth=0):
     """Perform bounded qualified data-member lookup with ordinary hiding."""
     if owner in active:
         return (), True
@@ -3841,16 +6040,44 @@ def _member_lookup_candidates(owner, name, base_edges, data_members,
     if direct:
         return tuple((member, ()) for member in direct), len(direct) != 1
 
+    edges = base_edges.get(owner, ())
+    if depth >= _GRAPH_TRAVERSAL_DEPTH_LIMIT:
+        return (), bool(edges)
     candidates = []
     unsupported = False
-    for edge in base_edges.get(owner, ()):
+    for edge in edges:
         nested, nested_unsupported = _member_lookup_candidates(
             edge.base_class, name, base_edges, data_members,
-            active + (owner,))
+            active + (owner,), depth + 1)
         candidates.extend((member, (edge,) + path)
                           for member, path in nested)
         unsupported = unsupported or nested_unsupported or edge.virtual
     return tuple(candidates), unsupported
+
+
+def _bounded_inherited_member_names(
+        owner, inheritable_members, base_owners, cache=None,
+        active=(), depth=0):
+    """Aggregate inherited names without crossing the graph depth bound."""
+    if cache is None:
+        cache = {}
+    cache_key = owner, depth
+    if cache_key in cache:
+        return set(cache[cache_key])
+    if owner in active:
+        return {_INHERITANCE_DEPTH_SENTINEL}
+    names = set(inheritable_members.get(owner, ()))
+    bases = tuple(base_owners.get(owner, ()))
+    if depth >= _GRAPH_TRAVERSAL_DEPTH_LIMIT:
+        if bases:
+            names.add(_INHERITANCE_DEPTH_SENTINEL)
+    else:
+        for base in bases:
+            names.update(_bounded_inherited_member_names(
+                base, inheritable_members, base_owners, cache,
+                active + (owner,), depth + 1))
+    cache[cache_key] = frozenset(names)
+    return names
 
 
 def _select_qualified_data_member(owner, qualifier, name, owner_path,
@@ -3876,7 +6103,7 @@ def _select_qualified_data_member(owner, qualifier, name, owner_path,
 
 
 def _bind_resolved_qualified_member(values, aliases, owner, base_edges,
-                                    data_members):
+                                    data_members, block_type_aliases=()):
     """Bind one supported class-qualified owner/ancestor member expression."""
     parsed = _qualified_member_syntax(values)
     if parsed is None:
@@ -3886,25 +6113,34 @@ def _bind_resolved_qualified_member(values, aliases, owner, base_edges,
     if qualifier is None:
         lookup = _resolve_expression_qualifier_result(
             qualifier_values, aliases)
+        graph = aliases.environment.declaration_graph
+        selected_id = getattr(
+            lookup, "selected_declaration_id", lookup.declaration_id)
+        if (graph is not None and selected_id >= 0
+                and not block_type_aliases):
+            selected = graph.declarations[selected_id]
+            parent = graph.scopes[selected.parent_scope]
+            if (selected.kind in {"using_alias", "typedef_alias"}
+                    and parent.kind
+                    in {"function", "lambda", "ordinary_block"}):
+                return QualifiedMemberBinding(
+                    "unresolved", (), (), member_name)
         if (lookup.status == "unsupported"
-                and lookup.provenance[:1] == ("direct-imported-type",)):
+                and (lookup.provenance[:1] == ("direct-imported-type",)
+                     or lookup.declaration_kind == "using_declaration")):
             return QualifiedMemberBinding(
                 "unresolved", (), (), member_name)
         if lookup.status in ("unsupported", "ambiguous"):
             return QualifiedMemberBinding(
                 "unsupported", (), (), member_name)
-        if _expression_qualifier_has_visible_type_alias(
-                qualifier_values, aliases):
-            return QualifiedMemberBinding(
-                "unsupported", (), (), member_name)
+        return QualifiedMemberBinding("unresolved", (), (), member_name)
+    qualifier = tuple(qualifier)
+    if tuple(qualifier) not in aliases.environment.classes_by_identity:
         if _expression_qualifier_is_namespace(qualifier_values, aliases):
             return QualifiedMemberBinding(
                 "namespace", (), (), member_name)
-        if _expression_qualifier_has_visible_alias(
-                qualifier_values, aliases):
-            return QualifiedMemberBinding(
-                "unsupported", (), (), member_name)
-        return QualifiedMemberBinding("unresolved", (), (), member_name)
+        return QualifiedMemberBinding(
+            "unsupported", (), (), member_name)
     relation, owner_path = _owner_or_unique_ancestor_relation(
         owner, qualifier, base_edges)
     if relation == "unrelated" and tuple(qualifier[:-1]) == tuple(owner):
@@ -3943,7 +6179,8 @@ def _classify_storage_expression(values, member_names, shadow_names, aliases,
                 "unsupported", (), (), qualified_syntax[1])
 
     qualified = _bind_resolved_qualified_member(
-        values, aliases, owner, base_edges, data_members)
+        values, aliases, owner, base_edges, data_members,
+        block_type_aliases)
     if qualified.disposition in (
             "bound", "unsupported", "unrelated", "namespace"):
         return qualified
@@ -3957,6 +6194,8 @@ def _classify_storage_expression(values, member_names, shadow_names, aliases,
         values, aliases, owner, base_edges)
     if template_qualified.disposition in ("unsupported", "unrelated"):
         return template_qualified
+    if _INHERITANCE_DEPTH_SENTINEL in member_names:
+        return QualifiedMemberBinding("unsupported")
     return QualifiedMemberBinding("not-member")
 
 
@@ -4013,12 +6252,26 @@ def _classify_positioned_return_bindings(
     """Classify and position all returns through one shared path."""
     output = []
     for expression, shadows, source_offset, block_type_aliases in returns:
+        lookup_offset = source_offset
+        qualified = _qualified_member_syntax(expression)
+        if qualified is not None:
+            parsed = _simple_qualified_type(qualified[0])
+            if parsed is not None:
+                parts, absolute = parsed
+                statement_end = text.find(";", source_offset)
+                if statement_end < 0:
+                    statement_end = len(text)
+                found = text.find(
+                    ("::" if absolute else "") + parts[0],
+                    source_offset, statement_end)
+                if found >= 0:
+                    lookup_offset = found
         classification = _classify_storage_expression(
             expression,
             members,
             shadows,
             _member_body_alias_context(
-                aliases, source_offset, owner_identity),
+                aliases, lookup_offset, owner_identity),
             owner_identity,
             base_edges,
             data_members,
@@ -4054,6 +6307,21 @@ def analyze_public_const_reference_accessors(text):
     tokens = tokenize_cpp(text)
     brace_pairs = _pair_map(tokens, "{", "}")
     declaration_graph = _build_declaration_graph(text, tokens, brace_pairs)
+    invalid_nonlocal = next((
+        region for region in declaration_graph.nonlocal_class_regions
+        if any(
+            scope.kind == "local_class"
+            and tuple(scope.canonical_class)
+            == tuple(declaration_graph.class_identities[region])
+            and scope.opening == tokens[region.opening].end
+            for scope in declaration_graph.scopes
+        )
+    ), None)
+    if invalid_nonlocal is not None:
+        return [], [ReferenceParseDiagnostic(
+            line=tokens[invalid_nonlocal.declaration].line,
+            message="declaration graph class-locality partition is invalid",
+        )]
     class_regions = [
         region for region in declaration_graph.nonlocal_class_regions
         if region.tag in ("class", "struct")
@@ -4160,6 +6428,7 @@ def analyze_public_const_reference_accessors(text):
         complete_class_scopes=complete_class_scopes,
         base_edges=alias_base_edges,
         declaration_graph=declaration_graph,
+        source_tokens=tuple(tokens),
     )
 
     alias_contexts = {
@@ -4199,7 +6468,8 @@ def analyze_public_const_reference_accessors(text):
                 classes_by_identity, type_alias_cache,
                 complete_class_scopes[class_identities[region]],
                 base_edges_by_identity,
-                declaration_graph=declaration_graph)
+                declaration_graph=declaration_graph,
+                alias_environment=alias_environment)
             if resolved is None:
                 unresolved.append(values)
             else:
@@ -4216,20 +6486,12 @@ def analyze_public_const_reference_accessors(text):
 
     inherited_cache = {}
 
-    def accessible_from(region, active=()):
-        if region in inherited_cache:
-            return inherited_cache[region]
-        if region in active:
-            return set()
-        names = set(inheritable_members[region])
-        for base in base_regions[region]:
-            names.update(accessible_from(base, active + (region,)))
-        inherited_cache[region] = names
-        return names
-
     all_members = {
         region: own_members[region] | set().union(
-            *(accessible_from(base) for base in base_regions[region]))
+            *(_bounded_inherited_member_names(
+                base, inheritable_members, base_regions, inherited_cache,
+                (region,), 1)
+              for base in base_regions[region]))
         for region in class_regions
     }
 
@@ -4291,10 +6553,8 @@ def analyze_public_const_reference_accessors(text):
                 signature, signature_aliases)
             if details is not None:
                 body = tokens[index + 1:body_close]
-                parameters = _parameter_names(
-                    signature, details, signature_aliases)
                 returns = _return_expressions_with_bindings(
-                    body, parameters, signature_aliases)
+                    body, (), signature_aliases)
                 eligible = (access == "public" and details.const_reference
                             and returns)
                 owner_identity = class_identities[region]
@@ -4424,7 +6684,9 @@ def analyze_public_const_reference_accessors(text):
             scoped_type_aliases, scoped_namespace_aliases,
             known_namespaces, namespace_alias_cache,
             classes_by_identity, type_alias_cache,
-            declaration_graph=declaration_graph)
+            declaration_graph=declaration_graph,
+            alias_environment=alias_environment,
+            lookup_purpose="member-definition-owner")
         if owner_has_template_id:
             if owner is None:
                 continue
@@ -4451,11 +6713,27 @@ def analyze_public_const_reference_accessors(text):
                 ))
             continue
         if owner is None:
-            namespace_owner = _resolve_aliased_namespace(
-                owner_parts, owner_absolute, namespace_path,
-                scoped_namespace_aliases, owner_position,
-                known_namespaces,
-                namespace_alias_cache)
+            owner_lookup = _resolve_qualified_name(
+                _qualified_component_records(
+                    owner_parts,
+                    owner_position + (2 if owner_absolute else 0),
+                    alias_environment.source_tokens),
+                LookupContext(
+                    starting_scope=_graph_scope_for_offset(
+                        declaration_graph, owner_position),
+                    use_offset=owner_position,
+                    purpose="owner-diagnostic",
+                    absolute=owner_absolute,
+                ),
+                alias_environment,
+            )
+            namespace_owner = (
+                tuple(owner_lookup.canonical_identity)
+                if owner_lookup.status == "found"
+                and tuple(owner_lookup.canonical_identity)
+                in alias_environment.known_namespaces
+                else None
+            )
             potential_name = _potential_const_reference_signature(
                 signature, namespace_context, require_qualified=True)
             if potential_name is not None and namespace_owner is None:
@@ -4511,8 +6789,7 @@ def analyze_public_const_reference_accessors(text):
             continue
         body_close = brace_pairs[opening]
         body = tokens[opening + 1:body_close]
-        parameters = _parameter_names(signature, details, aliases)
-        returns = _return_expressions_with_bindings(body, parameters, aliases)
+        returns = _return_expressions_with_bindings(body, (), aliases)
         members = all_members[owner]
         if not returns:
             continue

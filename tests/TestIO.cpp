@@ -6,13 +6,27 @@
 
 #include "../IO/WavFile.h"
 #include "../IO/Mp3File.h"
+#include "../IO/MidiFile.h"
+#include "../IO/FlacFile.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <iterator>
 #include <limits>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 using namespace dspark;
@@ -1603,4 +1617,1098 @@ DSPARK_TEST(Mp3File_mixed_block_short_region_uses_cumulative_band_offsets)
     }
     EXPECT_GT(inBand, 1.0);                                   // pre-fix: digital silence
     EXPECT_LT(20.0 * std::log10(outBand / inBand), -20.0);    // and it is where it belongs
+}
+
+// ============================================================================
+// MidiFile - semantic SMF, hostile input, and deterministic timing
+// ============================================================================
+
+namespace midi_test {
+
+class TempDirectory
+{
+public:
+    explicit TempDirectory(const std::string& label)
+    {
+        static std::atomic<uint64_t> serial { 0 };
+        const auto stamp = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const std::filesystem::path base = std::filesystem::temp_directory_path();
+        for (uint64_t attempt = 0; attempt < 128; ++attempt)
+        {
+            const uint64_t id = serial.fetch_add(1, std::memory_order_relaxed);
+            path_ = base / ("dspark-midi-" + label + "-"
+                            + std::to_string(stamp) + "-" + std::to_string(id));
+            std::error_code ec;
+            if (std::filesystem::create_directory(path_, ec))
+                return;
+        }
+        throw std::runtime_error("could not create unique MIDI test directory");
+    }
+
+    TempDirectory(const TempDirectory&) = delete;
+    TempDirectory& operator=(const TempDirectory&) = delete;
+
+    ~TempDirectory()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+
+    [[nodiscard]] std::filesystem::path file(const std::string& name) const
+    {
+        return path_ / name;
+    }
+
+private:
+    std::filesystem::path path_;
+};
+
+void be16(std::vector<uint8_t>& out, uint16_t value)
+{
+    out.push_back(static_cast<uint8_t>(value >> 8));
+    out.push_back(static_cast<uint8_t>(value));
+}
+
+void be32(std::vector<uint8_t>& out, uint32_t value)
+{
+    out.push_back(static_cast<uint8_t>(value >> 24));
+    out.push_back(static_cast<uint8_t>(value >> 16));
+    out.push_back(static_cast<uint8_t>(value >> 8));
+    out.push_back(static_cast<uint8_t>(value));
+}
+
+void tag(std::vector<uint8_t>& out, const char* value)
+{
+    out.insert(out.end(), value, value + 4);
+}
+
+std::vector<uint8_t> withEot(std::vector<uint8_t> events)
+{
+    const uint8_t eot[] = { 0x00, 0xff, 0x2f, 0x00 };
+    events.insert(events.end(), std::begin(eot), std::end(eot));
+    return events;
+}
+
+std::vector<uint8_t> smf(uint16_t format, uint16_t division,
+                         const std::vector<std::vector<uint8_t>>& tracks,
+                         const std::vector<uint8_t>& headerExtension = {},
+                         const std::vector<uint8_t>& alien = {})
+{
+    std::vector<uint8_t> out;
+    tag(out, "MThd");
+    be32(out, static_cast<uint32_t>(6 + headerExtension.size()));
+    be16(out, format);
+    be16(out, static_cast<uint16_t>(tracks.size()));
+    be16(out, division);
+    out.insert(out.end(), headerExtension.begin(), headerExtension.end());
+    if (!alien.empty())
+    {
+        tag(out, "TEST");
+        be32(out, static_cast<uint32_t>(alien.size()));
+        out.insert(out.end(), alien.begin(), alien.end());
+    }
+    for (const auto& trackData : tracks)
+    {
+        tag(out, "MTrk");
+        be32(out, static_cast<uint32_t>(trackData.size()));
+        out.insert(out.end(), trackData.begin(), trackData.end());
+    }
+    return out;
+}
+
+bool writeBytes(const std::filesystem::path& path, std::span<const uint8_t> bytes)
+{
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) return false;
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    return out.good();
+}
+
+std::vector<uint8_t> readBytes(const std::filesystem::path& path)
+{
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in.is_open()) return {};
+    const std::streampos end = in.tellg();
+    if (end <= std::streampos(0)) return {};
+    std::vector<uint8_t> bytes(static_cast<size_t>(end));
+    in.seekg(0, std::ios::beg);
+    in.read(reinterpret_cast<char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+    if (in.gcount() != static_cast<std::streamsize>(bytes.size())) return {};
+    return bytes;
+}
+
+bool reject(const std::vector<uint8_t>& bytes, const std::string& label)
+{
+    TempDirectory temp(label);
+    const auto path = temp.file("input.mid");
+    if (!writeBytes(path, bytes)) return false;
+    MidiFile file;
+    if (!file.create(1, 96, 1)) return false;
+    if (file.read(path)) return false;
+    return file.format() == -1 && file.ticksPerQuarter() == 0
+        && file.tracks().empty();
+}
+
+bool record(bool condition, const std::string& name)
+{
+    if (!condition)
+        std::cerr << "    MIDI subcase failed: " << name << "\n";
+    return condition;
+}
+
+uint64_t fnv1a(uint64_t hash, std::span<const uint8_t> bytes)
+{
+    for (uint8_t byte : bytes)
+    {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+} // namespace midi_test
+
+DSPARK_TEST(MidiFile_RP001_primary_byte_oracles)
+{
+    namespace fs = std::filesystem;
+    const fs::path root = fs::path(DSPARK_TEST_FIXTURE_DIR) / "midi";
+    const auto format0Bytes = midi_test::readBytes(root / "rp001-format0.mid");
+    const auto format1Bytes = midi_test::readBytes(root / "rp001-format1.mid");
+    EXPECT_EQ(format0Bytes.size(), size_t(81));
+    EXPECT_EQ(format1Bytes.size(), size_t(118));
+
+    MidiFile f0;
+    EXPECT_TRUE(f0.read(root / "rp001-format0.mid"));
+    EXPECT_EQ(f0.format(), 0);
+    EXPECT_EQ(f0.ticksPerQuarter(), uint16_t(96));
+    EXPECT_EQ(f0.tracks().size(), size_t(1));
+    EXPECT_EQ(f0.tracks()[0].events.size(), size_t(14));
+    EXPECT_EQ(f0.tracks()[0].events[6].status, uint8_t(0x92));
+    EXPECT_EQ(f0.tracks()[0].events[6].data1, uint8_t(0x3c));
+    EXPECT_EQ(f0.tracks()[0].events[9].deltaTicks, uint32_t(192));
+    EXPECT_EQ(f0.tracks()[0].events.back().metaType, uint8_t(0x2f));
+
+    MidiFile f1;
+    EXPECT_TRUE(f1.read(root / "rp001-format1.mid"));
+    EXPECT_EQ(f1.format(), 1);
+    EXPECT_EQ(f1.tracks().size(), size_t(4));
+    size_t eventCount = 0;
+    for (const MidiTrack& track : f1.tracks()) eventCount += track.events.size();
+    EXPECT_EQ(eventCount, size_t(17));
+    EXPECT_EQ(f1.tracks()[1].events[2].status, uint8_t(0x90));
+    EXPECT_EQ(f1.tracks()[1].events[2].data2, uint8_t(0x00));
+
+    midi_test::TempDirectory temp("rp001-roundtrip");
+    const auto rewritten = temp.file("rewritten.mid");
+    EXPECT_TRUE(f1.write(rewritten));
+    MidiFile reread;
+    EXPECT_TRUE(reread.read(rewritten));
+    EXPECT_TRUE(reread.tracks() == f1.tracks());
+}
+
+DSPARK_TEST(MidiFile_semantic_authoring_and_roundtrip)
+{
+    MidiFile midi;
+    EXPECT_TRUE(midi.create(1, 960, 2));
+
+    const uint8_t tempo[] = { 0x07, 0xa1, 0x20 };
+    const uint8_t signature[] = { 4, 2, 24, 8 };
+    EXPECT_TRUE(midi.addMetaEvent(0, 0, 0x51, tempo));
+    EXPECT_TRUE(midi.addMetaEvent(0, 0, 0x58, signature));
+    EXPECT_TRUE(midi.addChannelEvent(0, 0, 0x80, 60, 64));
+    EXPECT_TRUE(midi.addChannelEvent(0, 1, 0x91, 61, 0));
+    EXPECT_TRUE(midi.addChannelEvent(0, 2, 0xa2, 62, 3));
+    EXPECT_TRUE(midi.addChannelEvent(0, 3, 0xb3, 7, 100));
+    EXPECT_TRUE(midi.addChannelEvent(0, 4, 0xc4, 10));
+    EXPECT_TRUE(midi.addChannelEvent(0, 5, 0xd5, 11));
+    EXPECT_TRUE(midi.addChannelEvent(0, 6, 0xe6, 0, 64));
+
+    const uint8_t complete[] = { 0x43, 0x12, 0xf7 };
+    const uint8_t escape[] = { 0xf8, 0x01 };
+    const uint8_t split0[] = { 0x43, 0x12 };
+    const uint8_t split1[] = { 0x00, 0x43 };
+    const uint8_t split2[] = { 0x12, 0xf7 };
+    EXPECT_TRUE(midi.addSysExEvent(0, 7, MidiEventKind::SysExF0, complete));
+    EXPECT_TRUE(midi.addSysExEvent(0, 8, MidiEventKind::SysExF7, escape));
+    EXPECT_TRUE(midi.addSysExEvent(0, 9, MidiEventKind::SysExF0, split0));
+    EXPECT_TRUE(midi.addSysExEvent(0, 10, MidiEventKind::SysExF7, split1));
+    EXPECT_TRUE(midi.addSysExEvent(0, 11, MidiEventKind::SysExF7, split2));
+
+    std::vector<uint8_t> opaque(130);
+    for (size_t i = 0; i < opaque.size(); ++i)
+        opaque[i] = static_cast<uint8_t>((i * 17) & 0xffu);
+    EXPECT_TRUE(midi.addMetaEvent(0, 12, 0x7f, opaque));
+    EXPECT_TRUE(midi.addMetaEvent(0, 13, 0x2f));
+    const uint8_t ignoredTempo[] = { 0x03, 0x0d, 0x40 };
+    EXPECT_TRUE(midi.addMetaEvent(1, 0, 0x51, ignoredTempo));
+    EXPECT_TRUE(midi.addMetaEvent(1, 0, 0x2f));
+
+    const MidiTrack beforeFailure = midi.tracks()[0];
+    const uint8_t zeroTempo[] = { 0, 0, 0 };
+    EXPECT_TRUE(!midi.addMetaEvent(0, 0, 0x51, zeroTempo));
+    EXPECT_TRUE(!midi.addChannelEvent(0, 0, 0xf0, 0, 0));
+    EXPECT_TRUE(midi.tracks()[0] == beforeFailure);
+    EXPECT_TRUE(!midi.create(0, 0, 1));
+    EXPECT_EQ(midi.format(), 1);
+
+    midi_test::TempDirectory temp("semantic");
+    const auto path = temp.file("semantic.mid");
+    EXPECT_TRUE(midi.write(path));
+    MidiFile decoded;
+    EXPECT_TRUE(decoded.read(path));
+    EXPECT_TRUE(decoded.tracks() == midi.tracks());
+
+    bool all = true;
+    const auto& events = decoded.tracks()[0].events;
+    const char* names[] = {
+        "format-1-write-read", "channel-80", "channel-90-velocity-zero",
+        "channel-a0", "channel-b0", "channel-c0-one-byte",
+        "channel-d0-one-byte", "channel-e0", "multiple-channels",
+        "f0-complete", "f7-escape", "f0-split", "f7-continuation",
+        "f7-terminal", "tempo-meta", "time-signature-meta",
+        "unknown-oversized-meta", "final-eot", "transactional-mutator",
+        "tempo-outside-track-zero-retained"
+    };
+    const bool checks[] = {
+        decoded.format() == 1, events[2].status == 0x80,
+        events[3].status == 0x91 && events[3].data2 == 0,
+        events[4].status == 0xa2, events[5].status == 0xb3,
+        events[6].status == 0xc4 && events[6].data2 == 0,
+        events[7].status == 0xd5 && events[7].data2 == 0,
+        events[8].status == 0xe6, events[3].status != events[4].status,
+        events[9].kind == MidiEventKind::SysExF0 && events[9].payload.back() == 0xf7,
+        events[10].kind == MidiEventKind::SysExF7,
+        events[11].kind == MidiEventKind::SysExF0 && events[11].payload.back() != 0xf7,
+        events[12].kind == MidiEventKind::SysExF7 && events[12].payload.back() != 0xf7,
+        events[13].kind == MidiEventKind::SysExF7 && events[13].payload.back() == 0xf7,
+        events[0].metaType == 0x51, events[1].metaType == 0x58,
+        events[14].metaType == 0x7f && events[14].payload.size() == 130,
+        events.back().metaType == 0x2f, midi.tracks()[0] == beforeFailure,
+        decoded.tracks()[1].events[0].metaType == 0x51
+    };
+    static_assert(std::size(names) == std::size(checks));
+    for (size_t i = 0; i < std::size(names); ++i)
+        all = midi_test::record(checks[i], names[i]) && all;
+    EXPECT_TRUE(all);
+}
+
+DSPARK_TEST(MidiFile_authoring_cache_state_stays_synchronized)
+{
+    MidiFile midi;
+    EXPECT_TRUE(midi.create(1, 480, 2));
+
+    const uint8_t openPacket[] = { 0x43, 0x12 };
+    const uint8_t continuation[] = { 0x01, 0x02 };
+    const uint8_t terminal[] = { 0x03, 0xf7 };
+    const uint8_t escape[] = { 0x7d, 0x01 };
+    const uint8_t text[] = { 'c', 'a', 'c', 'h', 'e' };
+
+    EXPECT_TRUE(midi.addChannelEvent(0, 1, 0x90, 60, 100));
+    EXPECT_TRUE(midi.addMetaEvent(1, 2, 0x01, text));
+    EXPECT_TRUE(midi.addSysExEvent(0, 3, MidiEventKind::SysExF0,
+                                  openPacket));
+    EXPECT_TRUE(!midi.addChannelEvent(0, 4, 0x80, 60, 0));
+    EXPECT_TRUE(!midi.addMetaEvent(0, 4, 0x01, text));
+    EXPECT_TRUE(!midi.addSysExEvent(0, 4, MidiEventKind::SysExF0,
+                                   openPacket));
+    EXPECT_TRUE(midi.addSysExEvent(0, 4, MidiEventKind::SysExF7,
+                                  continuation));
+    EXPECT_TRUE(!midi.addChannelEvent(0, 5, 0x80, 60, 0));
+    EXPECT_TRUE(midi.addSysExEvent(0, 5, MidiEventKind::SysExF7, terminal));
+    EXPECT_TRUE(midi.addMetaEvent(0, 6, 0x01, text));
+    EXPECT_TRUE(midi.addChannelEvent(1, 7, 0xc1, 11));
+    EXPECT_TRUE(midi.addSysExEvent(1, 8, MidiEventKind::SysExF7, escape));
+    EXPECT_TRUE(midi.addMetaEvent(0, 9, 0x2f));
+    EXPECT_TRUE(midi.addMetaEvent(1, 10, 0x2f));
+
+    const std::vector<MidiTrack> beforeFailures = midi.tracks();
+    EXPECT_TRUE(!midi.addChannelEvent(0, 0, 0x90, 1, 1));
+    EXPECT_TRUE(!midi.addMetaEvent(1, 0, 0x01, text));
+    EXPECT_TRUE(!midi.addSysExEvent(0, 0, MidiEventKind::SysExF7, escape));
+    EXPECT_TRUE(!midi.create(0, 0, 1));
+    EXPECT_TRUE(midi.tracks() == beforeFailures);
+
+    const auto added = midi.addTrack();
+    EXPECT_TRUE(added.has_value());
+    EXPECT_EQ(*added, size_t(2));
+    EXPECT_TRUE(midi.addChannelEvent(*added, 11, 0xe2, 0, 64));
+    EXPECT_TRUE(midi.addSysExEvent(*added, 12, MidiEventKind::SysExF0,
+                                  openPacket));
+    EXPECT_TRUE(midi.addSysExEvent(*added, 13, MidiEventKind::SysExF7,
+                                  terminal));
+    EXPECT_TRUE(midi.addMetaEvent(*added, 14, 0x2f));
+
+    midi_test::TempDirectory temp("authoring-cache");
+    const auto firstPath = temp.file("first.mid");
+    EXPECT_TRUE(midi.write(firstPath));
+
+    MidiFile decoded;
+    EXPECT_TRUE(decoded.read(firstPath));
+    EXPECT_TRUE(decoded.tracks() == midi.tracks());
+    EXPECT_TRUE(!decoded.addChannelEvent(0, 0, 0x90, 1, 1));
+    EXPECT_TRUE(!decoded.addMetaEvent(1, 0, 0x01, text));
+    EXPECT_TRUE(!decoded.addSysExEvent(2, 0, MidiEventKind::SysExF7, escape));
+
+    MidiFile moved = std::move(decoded);
+    EXPECT_TRUE(moved.tracks() == midi.tracks());
+    EXPECT_TRUE(!moved.addChannelEvent(2, 0, 0x90, 1, 1));
+    MidiFile moveAssigned;
+    EXPECT_TRUE(moveAssigned.create(0, 96));
+    moveAssigned = std::move(moved);
+    EXPECT_TRUE(moveAssigned.tracks() == midi.tracks());
+    EXPECT_TRUE(!moveAssigned.addMetaEvent(0, 0, 0x01, text));
+
+    const auto secondPath = temp.file("second.mid");
+    EXPECT_TRUE(moveAssigned.write(secondPath));
+    MidiFile roundTripped;
+    EXPECT_TRUE(roundTripped.read(secondPath));
+    EXPECT_TRUE(roundTripped.tracks() == midi.tracks());
+
+    moveAssigned.clear();
+    EXPECT_EQ(moveAssigned.format(), -1);
+    EXPECT_TRUE(moveAssigned.tracks().empty());
+    EXPECT_TRUE(moveAssigned.create(0, 96));
+    EXPECT_TRUE(moveAssigned.addChannelEvent(0, 1, 0x90, 64, 127));
+    const MidiTrack beforeInvalidAddTrack = moveAssigned.tracks()[0];
+    EXPECT_TRUE(!moveAssigned.addTrack().has_value());
+    EXPECT_TRUE(moveAssigned.tracks()[0] == beforeInvalidAddTrack);
+    EXPECT_TRUE(moveAssigned.addMetaEvent(0, 2, 0x2f));
+    EXPECT_EQ(moveAssigned.tracks()[0].events.size(), size_t(2));
+}
+
+DSPARK_TEST(MidiFile_format2_tempo_map_and_exact_rational_time)
+{
+    const std::vector<uint8_t> track0 = midi_test::withEot({
+        0x00, 0xff, 0x51, 0x03, 0x09, 0x27, 0xc0,
+        0x00, 0xff, 0x51, 0x03, 0x04, 0x93, 0xe0,
+        0x03, 0xff, 0x51, 0x03, 0x06, 0x1a, 0x80
+    });
+    const std::vector<uint8_t> track1 = midi_test::withEot({
+        0x00, 0xff, 0x51, 0x03, 0x0f, 0x42, 0x40
+    });
+    const auto bytes = midi_test::smf(2, 3, { track0, track1 });
+    midi_test::TempDirectory temp("format2");
+    const auto path = temp.file("patterns.mid");
+    EXPECT_TRUE(midi_test::writeBytes(path, bytes));
+
+    MidiFile midi;
+    EXPECT_TRUE(midi.read(path));
+    EXPECT_EQ(midi.format(), 2);
+    const auto map0 = midi.tempoMap(0);
+    const auto map1 = midi.tempoMap(1);
+    EXPECT_TRUE(map0.has_value());
+    EXPECT_TRUE(map1.has_value());
+    EXPECT_EQ(map0->size(), size_t(2));
+    EXPECT_EQ((*map0)[0].tick, uint64_t(0));
+    EXPECT_EQ((*map0)[0].microsecondsPerQuarter, uint32_t(300000));
+    EXPECT_EQ((*map0)[1].tick, uint64_t(3));
+    EXPECT_EQ((*map0)[1].microsecondsPerQuarter, uint32_t(400000));
+    EXPECT_EQ((*map1)[0].microsecondsPerQuarter, uint32_t(1000000));
+    EXPECT_TRUE(!midi.tempoMap(2).has_value());
+    EXPECT_EQ(*midi.tickToMicroseconds(2, 0), uint64_t(200000));
+    EXPECT_EQ(*midi.tickToMicroseconds(4, 0), uint64_t(433333));
+    EXPECT_NEAR(*midi.tickToSeconds(4, 0), 13.0 / 30.0, 1e-15);
+    EXPECT_EQ(*midi.tickToMicroseconds(3, 1), uint64_t(1000000));
+    EXPECT_TRUE(!midi.write(temp.file("format2-write.mid")));
+}
+
+DSPARK_TEST(MidiFile_VLQ_PPQN_and_chunk_boundaries)
+{
+    const uint32_t deltas[] = {
+        0u, 0x7fu, 0x80u, 0x3fffu, 0x4000u, 0x1fffffu,
+        0x200000u, 0x0fffffffu
+    };
+    midi_test::TempDirectory temp("boundaries");
+    bool all = true;
+    for (size_t i = 0; i < std::size(deltas); ++i)
+    {
+        MidiFile source;
+        bool ok = source.create(0, 96)
+            && source.addChannelEvent(0, deltas[i], 0x90, 60, 64)
+            && source.addMetaEvent(0, 0, 0x2f);
+        const auto path = temp.file("vlq-" + std::to_string(i) + ".mid");
+        ok = ok && source.write(path);
+        MidiFile decoded;
+        ok = ok && decoded.read(path)
+            && decoded.tracks()[0].events[0].deltaTicks == deltas[i];
+        all = midi_test::record(ok, "VLQ-" + std::to_string(deltas[i])) && all;
+    }
+
+    MidiFile ppqn1, ppqnMax;
+    all = midi_test::record(ppqn1.create(0, 1), "PPQN-1") && all;
+    all = midi_test::record(ppqnMax.create(0, 0x7fff), "PPQN-32767") && all;
+
+    const auto exact = midi_test::smf(0, 96,
+        { midi_test::withEot({ 0x00, 0x90, 60, 64 }) });
+    const auto extended = midi_test::smf(0, 96,
+        { midi_test::withEot({}) }, { 0xaa, 0x55 }, { 1, 2, 3, 4, 5 });
+    const auto exactPath = temp.file("exact.mid");
+    const auto extendedPath = temp.file("extended.mid");
+    MidiFile parser;
+    all = midi_test::record(midi_test::writeBytes(exactPath, exact)
+                            && parser.read(exactPath), "exact-track-chunk-end") && all;
+    all = midi_test::record(midi_test::writeBytes(extendedPath, extended)
+                            && parser.read(extendedPath), "header-extension") && all;
+    all = midi_test::record(parser.tracks().size() == 1,
+                            "bounded-alien-chunk") && all;
+    EXPECT_TRUE(all);
+}
+
+DSPARK_TEST(MidiFile_public_resource_policy_boundaries)
+{
+    EXPECT_EQ(MidiFile::kMaxInputBytes, 256ull * 1024 * 1024);
+    EXPECT_EQ(MidiFile::kMaxTracks, uint32_t(4096));
+    EXPECT_EQ(MidiFile::kMaxEvents, uint64_t(2000000));
+    EXPECT_EQ(MidiFile::kMaxAggregatePayloadBytes, 128ull * 1024 * 1024);
+    EXPECT_EQ(MidiFile::kMaxTrackChunkBytes, 128ull * 1024 * 1024);
+
+    MidiFile exactTracks;
+    EXPECT_TRUE(exactTracks.create(1, 96, MidiFile::kMaxTracks));
+    EXPECT_EQ(exactTracks.tracks().size(), size_t(MidiFile::kMaxTracks));
+    EXPECT_TRUE(!exactTracks.addTrack().has_value());
+    EXPECT_TRUE(!exactTracks.create(1, 96,
+                                    static_cast<size_t>(MidiFile::kMaxTracks) + 1));
+    EXPECT_EQ(exactTracks.tracks().size(), size_t(MidiFile::kMaxTracks));
+
+    MidiFile delta;
+    EXPECT_TRUE(delta.create(0, 96));
+    EXPECT_TRUE(delta.addChannelEvent(0, 0x0fffffff, 0x90, 60, 64));
+    EXPECT_TRUE(!delta.addChannelEvent(0, 0x10000000, 0x90, 60, 64));
+    EXPECT_EQ(delta.tracks()[0].events.size(), size_t(1));
+
+    midi_test::TempDirectory temp("midi-resource");
+    const auto inputOver = temp.file("input-over.mid");
+    {
+        std::ofstream output(inputOver, std::ios::binary | std::ios::trunc);
+        output.seekp(static_cast<std::streamoff>(MidiFile::kMaxInputBytes));
+        output.put(0);
+    }
+    MidiFile parser;
+    EXPECT_TRUE(!parser.read(inputOver));
+    EXPECT_EQ(parser.format(), -1);
+
+    auto lengthOver = midi_test::smf(0, 96, { midi_test::withEot({}) });
+    lengthOver[18] = 0x08;
+    lengthOver[19] = 0x00;
+    lengthOver[20] = 0x00;
+    lengthOver[21] = 0x01;
+    EXPECT_TRUE(midi_test::reject(lengthOver, "track-chunk-cap-over"));
+
+    auto alienOver = midi_test::smf(0, 96, { midi_test::withEot({}) }, {}, { 0 });
+    alienOver[18] = 0x08;
+    alienOver[19] = 0x00;
+    alienOver[20] = 0x00;
+    alienOver[21] = 0x01;
+    EXPECT_TRUE(midi_test::reject(alienOver, "alien-chunk-cap-over"));
+}
+
+DSPARK_TEST(MidiFile_malformed_corpus_58_named_cases)
+{
+    using midi_test::smf;
+    using midi_test::withEot;
+    const auto valid = smf(0, 96, { withEot({}) });
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> cases;
+
+    auto changed = [&](const std::string& name, size_t offset, uint8_t value) {
+        auto bytes = valid; bytes[offset] = value; cases.push_back({ name, std::move(bytes) });
+    };
+    changed("bad-magic", 0, 'X');
+    auto shortHeader = valid; shortHeader.resize(13); cases.push_back({ "header-truncated", shortHeader });
+    changed("header-length-five", 7, 5);
+    auto headerOverrun = valid; headerOverrun[7] = 100; cases.push_back({ "header-extension-overrun", headerOverrun });
+    changed("unknown-format", 9, 3);
+    changed("zero-track-count", 11, 0);
+    auto format0Two = valid; format0Two[11] = 2; cases.push_back({ "format0-two-tracks", format0Two });
+    changed("zero-ppqn", 13, 0);
+    changed("smpte-division", 12, 0xe2);
+    auto shortChunkHeader = valid; shortChunkHeader.resize(20); cases.push_back({ "track-header-truncated", shortChunkHeader });
+    auto chunkOverrun = valid; chunkOverrun[21] = 5; cases.push_back({ "track-chunk-overrun", chunkOverrun });
+    auto extraTrack = valid; extraTrack.insert(extraTrack.end(), valid.begin() + 14, valid.end()); cases.push_back({ "extra-mtrk", extraTrack });
+    auto trailing = valid; trailing.push_back(0); cases.push_back({ "trailing-junk", trailing });
+    auto duplicateHeader = valid; duplicateHeader.insert(duplicateHeader.end(), { 'M','T','h','d',0,0,0,0 }); cases.push_back({ "duplicate-mthd", duplicateHeader });
+    cases.push_back({ "missing-eot", smf(0, 96, { { 0x00, 0x90, 60, 64 } }) });
+    cases.push_back({ "duplicate-eot", smf(0, 96, { { 0x00,0xff,0x2f,0, 0x00,0xff,0x2f,0 } }) });
+    cases.push_back({ "nonfinal-eot", smf(0, 96, { { 0x00,0xff,0x2f,0, 0x00,0x90,60,64 } }) });
+    cases.push_back({ "nonempty-eot", smf(0, 96, { { 0x00,0xff,0x2f,1,0, 0x00,0xff,0x2f,0 } }) });
+    cases.push_back({ "eot-overlong-length", smf(0, 96, { { 0x00,0xff,0x2f,0x80,0x00 } }) });
+
+    for (uint8_t status : { uint8_t(0xf1), uint8_t(0xf2), uint8_t(0xf3),
+                            uint8_t(0xf4), uint8_t(0xf5), uint8_t(0xf6),
+                            uint8_t(0xf8), uint8_t(0xf9), uint8_t(0xfa),
+                            uint8_t(0xfb), uint8_t(0xfc), uint8_t(0xfd),
+                            uint8_t(0xfe) })
+    {
+        cases.push_back({ "illegal-system-status-" + std::to_string(status),
+                          smf(0, 96, { withEot({ 0x00, status }) }) });
+    }
+
+    cases.push_back({ "running-status-at-start", smf(0, 96, { withEot({ 0x00,60,64 }) }) });
+    cases.push_back({ "running-after-meta", smf(0, 96, { withEot({ 0x00,0x90,60,64, 0x00,0xff,1,0, 0x00,61,64 }) }) });
+    cases.push_back({ "running-after-f0", smf(0, 96, { withEot({ 0x00,0x90,60,64, 0x00,0xf0,1,0xf7, 0x00,61,64 }) }) });
+    cases.push_back({ "running-after-f7", smf(0, 96, { withEot({ 0x00,0x90,60,64, 0x00,0xf7,1,1, 0x00,61,64 }) }) });
+    cases.push_back({ "open-sysex-at-end", smf(0, 96, { { 0x00,0xf0,1,1 } }) });
+    cases.push_back({ "channel-inside-sysex", smf(0, 96, { withEot({ 0x00,0xf0,1,1, 0x00,0x90,60,64 }) }) });
+    cases.push_back({ "meta-inside-sysex", smf(0, 96, { withEot({ 0x00,0xf0,1,1, 0x00,0xff,1,0 }) }) });
+    cases.push_back({ "f0-inside-sysex", smf(0, 96, { withEot({ 0x00,0xf0,1,1, 0x00,0xf0,1,0xf7 }) }) });
+    cases.push_back({ "channel-data1-high", smf(0, 96, { withEot({ 0x00,0x90,0x80,0 }) }) });
+    cases.push_back({ "channel-data2-high", smf(0, 96, { withEot({ 0x00,0x90,60,0x80 }) }) });
+    cases.push_back({ "channel-one-byte-incomplete", smf(0, 96, { { 0x00,0xc0 } }) });
+    cases.push_back({ "channel-two-byte-incomplete", smf(0, 96, { { 0x00,0x90,60 } }) });
+    cases.push_back({ "delta-vlq-overlong", smf(0, 96, { { 0x80,0x00,0xff,0x2f,0 } }) });
+    cases.push_back({ "delta-vlq-five-byte", smf(0, 96, { { 0x81,0x80,0x80,0x80,0x00,0xff,0x2f,0 } }) });
+    cases.push_back({ "delta-vlq-unterminated", smf(0, 96, { { 0x81 } }) });
+    cases.push_back({ "meta-length-overlong", smf(0, 96, { { 0,0xff,1,0x80,0, 0,0xff,0x2f,0 } }) });
+    cases.push_back({ "meta-length-unterminated", smf(0, 96, { { 0,0xff,1,0x81 } }) });
+    cases.push_back({ "meta-length-overrun", smf(0, 96, { { 0,0xff,1,2,0 } }) });
+    cases.push_back({ "sysex-length-overlong", smf(0, 96, { { 0,0xf7,0x80,0, 0,0xff,0x2f,0 } }) });
+    cases.push_back({ "sysex-length-unterminated", smf(0, 96, { { 0,0xf7,0x81 } }) });
+    cases.push_back({ "sysex-length-overrun", smf(0, 96, { { 0,0xf7,2,0 } }) });
+    cases.push_back({ "sysex-length-missing", smf(0, 96, { { 0,0xf0 } }) });
+    cases.push_back({ "zero-tempo", smf(0, 96, { withEot({ 0,0xff,0x51,3,0,0,0 }) }) });
+    cases.push_back({ "meta-type-high", smf(0, 96, { withEot({ 0,0xff,0x80,0 }) }) });
+    cases.push_back({ "empty-track-chunk", smf(0, 96, { {} }) });
+    auto hugeTrack = valid; hugeTrack[18] = 0x08; hugeTrack[19] = 0x00;
+    hugeTrack[20] = 0x00; hugeTrack[21] = 0x01;
+    cases.push_back({ "track-cap-over", hugeTrack });
+    auto hugeAlien = smf(0, 96, { withEot({}) }, {}, { 0 });
+    hugeAlien[18] = 0x08; hugeAlien[19] = 0x00; hugeAlien[20] = 0x00; hugeAlien[21] = 0x01;
+    cases.push_back({ "alien-cap-over", hugeAlien });
+
+    EXPECT_TRUE(cases.size() >= 58);
+    bool all = true;
+    for (const auto& test : cases)
+        all = midi_test::record(midi_test::reject(test.second, test.first), test.first) && all;
+    EXPECT_TRUE(all);
+}
+
+DSPARK_TEST(MidiFile_running_status_is_cancelled_by_meta)
+{
+    const auto bytes = midi_test::smf(0, 96, { midi_test::withEot({
+        0,0x90,60,64, 0,0xff,1,0, 0,61,64
+    }) });
+    EXPECT_TRUE(midi_test::reject(bytes, "mut-running-meta"));
+}
+
+DSPARK_TEST(MidiFile_rejects_noncanonical_VLQ)
+{
+    const auto bytes = midi_test::smf(0, 96,
+        { { 0x80,0x00,0xff,0x2f,0x00 } });
+    EXPECT_TRUE(midi_test::reject(bytes, "mut-vlq"));
+}
+
+DSPARK_TEST(MidiFile_requires_one_final_EOT)
+{
+    const auto bytes = midi_test::smf(0, 96,
+        { { 0x00,0x90,60,64 } });
+    EXPECT_TRUE(midi_test::reject(bytes, "mut-eot"));
+}
+
+DSPARK_TEST(MidiFile_enforces_track_chunk_remaining_bytes)
+{
+    const auto bytes = midi_test::smf(0, 96,
+        { { 0x00,0xff,0x01,0x04,0x41, 0x00,0xff,0x2f,0x00 } });
+    EXPECT_TRUE(midi_test::reject(bytes, "mut-track-remaining"));
+}
+
+DSPARK_TEST(MidiFile_rejects_SMPTE_division)
+{
+    const auto bytes = midi_test::smf(0, 0xe250,
+        { midi_test::withEot({}) });
+    EXPECT_TRUE(midi_test::reject(bytes, "mut-smpte"));
+}
+
+DSPARK_TEST(MidiFile_hostile_mutation_campaign_20000)
+{
+    namespace fs = std::filesystem;
+    const fs::path root = fs::path(DSPARK_TEST_FIXTURE_DIR) / "midi";
+    const std::vector<uint8_t> corpus[] = {
+        midi_test::readBytes(root / "rp001-format0.mid"),
+        midi_test::readBytes(root / "rp001-format1.mid")
+    };
+    EXPECT_TRUE(!corpus[0].empty() && !corpus[1].empty());
+
+    uint64_t state = 0x4d4944495f323031ull;
+    uint64_t mutationHash = 1469598103934665603ull;
+    uint64_t accepted = 0, rejected = 0;
+    int64_t worstMicros = 0;
+    const auto campaignStart = std::chrono::steady_clock::now();
+    for (size_t caseIndex = 0; caseIndex < 20000; ++caseIndex)
+    {
+        auto next = [&]() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            return state;
+        };
+        std::vector<uint8_t> bytes = corpus[caseIndex & 1u];
+        const unsigned edits = 1u + static_cast<unsigned>(next() % 4u);
+        for (unsigned edit = 0; edit < edits; ++edit)
+        {
+            const size_t pos = static_cast<size_t>(next() % bytes.size());
+            bytes[pos] ^= static_cast<uint8_t>(1u << (next() & 7u));
+        }
+        mutationHash = midi_test::fnv1a(mutationHash, bytes);
+
+        midi_test::TempDirectory temp("mutation-" + std::to_string(caseIndex));
+        const auto path = temp.file("mutated.mid");
+        EXPECT_TRUE(midi_test::writeBytes(path, bytes));
+        MidiFile file;
+        const auto start = std::chrono::steady_clock::now();
+        const bool ok = file.read(path);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        worstMicros = std::max(worstMicros, elapsed);
+        EXPECT_TRUE(elapsed < 2000000);
+        if (ok) ++accepted;
+        else
+        {
+            ++rejected;
+            EXPECT_EQ(file.format(), -1);
+            EXPECT_TRUE(file.tracks().empty());
+        }
+    }
+    const auto campaignSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - campaignStart).count();
+    EXPECT_TRUE(campaignSeconds < 180);
+    EXPECT_EQ(accepted + rejected, uint64_t(20000));
+    std::cout << "MIDI mutation seed=0x4d4944495f323031 cases=20000 accepted="
+              << accepted << " rejected=" << rejected << " corpus-fnv64="
+              << mutationHash << " worst-us=" << worstMicros << "\n";
+}
+
+// ============================================================================
+// FlacFile - RFC 9639, independent fixtures, hardening and range semantics
+// ============================================================================
+
+namespace flac_test {
+
+struct Fixture
+{
+    const char* name;
+    uint32_t sampleRate;
+    uint32_t channels;
+    uint32_t bits;
+    int64_t frames;
+};
+
+constexpr std::array fixtures {
+    Fixture { "rfc9639-d1", 44100, 2, 16, 1 },
+    Fixture { "rfc9639-d2", 44100, 2, 16, 19 },
+    Fixture { "rfc9639-d3", 32000, 1, 8, 24 },
+    Fixture { "libflac-1ch-8bit", 48000, 1, 8, 64 },
+    Fixture { "libflac-1ch-16bit", 48000, 1, 16, 64 },
+    Fixture { "libflac-1ch-24bit", 48000, 1, 24, 64 },
+    Fixture { "libflac-1ch-32bit", 48000, 1, 32, 64 },
+    Fixture { "libflac-2ch-8bit", 48000, 2, 8, 64 },
+    Fixture { "libflac-2ch-16bit", 48000, 2, 16, 64 },
+    Fixture { "libflac-2ch-24bit", 48000, 2, 24, 64 },
+    Fixture { "libflac-2ch-32bit", 48000, 2, 32, 64 },
+    Fixture { "decl-constant", 48000, 1, 16, 32 },
+    Fixture { "decl-verbatim-wasted", 48000, 1, 16, 32 },
+    Fixture { "decl-fixed0-rice4", 48000, 1, 16, 32 },
+    Fixture { "decl-fixed1-rice5", 48000, 1, 16, 32 },
+    Fixture { "decl-fixed2-escape0", 48000, 1, 16, 32 },
+    Fixture { "decl-fixed3-escape31", 48000, 1, 24, 32 },
+    Fixture { "decl-fixed4-partitioned", 48000, 1, 24, 32 },
+    Fixture { "decl-lpc1", 48000, 1, 16, 32 },
+    Fixture { "decl-lpc12", 48000, 1, 24, 32 },
+    Fixture { "decl-lpc32-mid-side", 96000, 2, 32, 33 },
+    Fixture { "decl-left-side", 44100, 2, 16, 32 },
+    Fixture { "decl-side-right", 44100, 2, 16, 32 },
+    Fixture { "decl-mid-side-negative-odd", 44100, 2, 16, 32 },
+    Fixture { "decl-variable-uncommon-rate", 12345, 1, 16, 33 },
+    Fixture { "decl-rice-unary-cap", 48000, 1, 32, 16 },
+    Fixture { "decl-zero-md5-unknown-total", 48000, 1, 16, 16 },
+    Fixture { "decl-depth4-rate-code12", 48000, 1, 4, 32 },
+    Fixture { "decl-depth12-rate-code14", 44100, 1, 12, 32 },
+    Fixture { "decl-depth20", 88200, 1, 20, 32 },
+    Fixture { "decl-eight-channel", 48000, 8, 16, 16 },
+};
+
+std::filesystem::path root()
+{
+    return std::filesystem::path(DSPARK_TEST_FIXTURE_DIR) / "flac";
+}
+
+std::vector<int32_t> readPcm32(const std::filesystem::path& path)
+{
+    const std::vector<uint8_t> bytes = midi_test::readBytes(path);
+    if ((bytes.size() & 3u) != 0) return {};
+    std::vector<int32_t> samples;
+    samples.reserve(bytes.size() / 4);
+    for (size_t offset = 0; offset < bytes.size(); offset += 4)
+    {
+        const uint32_t representation = static_cast<uint32_t>(bytes[offset])
+            | (static_cast<uint32_t>(bytes[offset + 1]) << 8)
+            | (static_cast<uint32_t>(bytes[offset + 2]) << 16)
+            | (static_cast<uint32_t>(bytes[offset + 3]) << 24);
+        samples.push_back(std::bit_cast<int32_t>(representation));
+    }
+    return samples;
+}
+
+bool verifyFixture(const Fixture& fixture)
+{
+    const auto fixtureRoot = root();
+    const auto source = readPcm32(fixtureRoot / (std::string(fixture.name) + ".source.pcm"));
+    const auto reference = readPcm32(
+        fixtureRoot / (std::string(fixture.name) + ".reference.pcm"));
+    if (source != reference
+        || source.size() != static_cast<size_t>(fixture.frames) * fixture.channels)
+        return false;
+
+    FlacFile file;
+    if (!file.openRead(fixtureRoot / (std::string(fixture.name) + ".flac")))
+        return false;
+    const AudioFileInfo info = file.getInfo();
+    if (info.sampleRate != fixture.sampleRate || info.numChannels != fixture.channels
+        || info.bitsPerSample != fixture.bits || info.numSamples != fixture.frames
+        || info.isFloatingPoint)
+        return false;
+
+    AudioBuffer<float> output;
+    output.resize(static_cast<int>(fixture.channels), static_cast<int>(fixture.frames));
+    if (!file.readSamples(output.toView())) return false;
+    for (int64_t sample = 0; sample < fixture.frames; ++sample)
+    {
+        for (uint32_t channel = 0; channel < fixture.channels; ++channel)
+        {
+            const int32_t integer = source[static_cast<size_t>(sample) * fixture.channels + channel];
+            const float expected = std::ldexp(static_cast<float>(integer),
+                                               1 - static_cast<int>(fixture.bits));
+            if (std::bit_cast<uint32_t>(output.getChannel(static_cast<int>(channel))[sample])
+                != std::bit_cast<uint32_t>(expected))
+                return false;
+        }
+    }
+    return true;
+}
+
+const Fixture* named(const std::string& name)
+{
+    const auto found = std::find_if(fixtures.begin(), fixtures.end(),
+        [&](const Fixture& fixture) { return name == fixture.name; });
+    return found == fixtures.end() ? nullptr : &*found;
+}
+
+bool verifyNamed(const char* name)
+{
+    const Fixture* fixture = named(name);
+    return fixture != nullptr && verifyFixture(*fixture);
+}
+
+bool rejectsNamed(const char* name)
+{
+    FlacFile file;
+    return !file.openRead(root() / "malformed" / (std::string(name) + ".flac"))
+        && !file.isOpen() && file.getInfo().numChannels == 0;
+}
+
+uint8_t crc8(std::span<const uint8_t> bytes)
+{
+    uint8_t value = 0;
+    for (uint8_t byte : bytes)
+    {
+        value ^= byte;
+        for (unsigned bit = 0; bit < 8; ++bit)
+            value = static_cast<uint8_t>((value & 0x80u) != 0
+                ? static_cast<uint8_t>((value << 1) ^ 0x07u)
+                : static_cast<uint8_t>(value << 1));
+    }
+    return value;
+}
+
+uint16_t crc16(std::span<const uint8_t> bytes)
+{
+    uint16_t value = 0;
+    for (uint8_t byte : bytes)
+    {
+        value ^= static_cast<uint16_t>(byte) << 8;
+        for (unsigned bit = 0; bit < 8; ++bit)
+            value = static_cast<uint16_t>((value & 0x8000u) != 0
+                ? static_cast<uint16_t>((value << 1) ^ 0x8005u)
+                : static_cast<uint16_t>(value << 1));
+    }
+    return value;
+}
+
+std::vector<uint8_t> noncanonicalCodedNumber()
+{
+    std::vector<uint8_t> bytes = midi_test::readBytes(root() / "decl-constant.flac");
+    constexpr size_t frame = 42;
+    constexpr size_t coded = frame + 4;
+    bytes[coded] = 0xc0;
+    bytes.insert(bytes.begin() + static_cast<std::ptrdiff_t>(coded + 1), 0x80);
+    constexpr size_t crcPosition = frame + 7;
+    bytes[crcPosition] = crc8(std::span<const uint8_t>(bytes.data() + frame,
+                                                       crcPosition - frame));
+    const uint16_t footer = crc16(std::span<const uint8_t>(
+        bytes.data() + frame, bytes.size() - frame - 2));
+    bytes[bytes.size() - 2] = static_cast<uint8_t>(footer >> 8);
+    bytes.back() = static_cast<uint8_t>(footer);
+    return bytes;
+}
+
+} // namespace flac_test
+
+DSPARK_TEST(FlacFile_complete_positive_corpus_is_integer_and_float_exact)
+{
+    bool all = true;
+    for (const auto& fixture : flac_test::fixtures)
+        all = midi_test::record(flac_test::verifyFixture(fixture), fixture.name) && all;
+    EXPECT_TRUE(all);
+}
+
+DSPARK_TEST(FlacFile_indexed_range_and_untouched_excess_semantics)
+{
+    const auto* fixture = flac_test::named("decl-variable-uncommon-rate");
+    EXPECT_TRUE(fixture != nullptr);
+    FlacFile file;
+    EXPECT_TRUE(file.openRead(flac_test::root() / "decl-variable-uncommon-rate.flac"));
+    const auto source = flac_test::readPcm32(
+        flac_test::root() / "decl-variable-uncommon-rate.source.pcm");
+
+    AudioBuffer<float> range;
+    range.resize(2, 12);
+    for (int channel = 0; channel < 2; ++channel)
+        std::fill_n(range.getChannel(channel), 12, 123.25f);
+    EXPECT_TRUE(file.readSamples(range.toView(), 13, 9));
+    for (int sample = 0; sample < 9; ++sample)
+    {
+        const float expected = std::ldexp(static_cast<float>(source[13 + sample]), -15);
+        EXPECT_EQ(std::bit_cast<uint32_t>(range.getChannel(0)[sample]),
+                  std::bit_cast<uint32_t>(expected));
+    }
+    for (int sample = 9; sample < 12; ++sample)
+        EXPECT_EQ(range.getChannel(0)[sample], 123.25f);
+    for (int sample = 0; sample < 12; ++sample)
+        EXPECT_EQ(range.getChannel(1)[sample], 123.25f);
+
+    AudioBuffer<float> empty;
+    EXPECT_TRUE(file.readSamples(empty.toView(), 0, 1));
+    EXPECT_TRUE(!file.readSamples(range.toView(), -1, 1));
+    EXPECT_TRUE(!file.readSamples(range.toView(), 32, 2));
+    EXPECT_TRUE(!file.readSamples(range.toView(), 0, 0));
+
+    AudioBuffer<float> repeat;
+    repeat.resize(1, 9);
+    EXPECT_TRUE(file.readSamples(repeat.toView(), 13, 9));
+    for (int sample = 0; sample < 9; ++sample)
+        EXPECT_EQ(std::bit_cast<uint32_t>(repeat.getChannel(0)[sample]),
+                  std::bit_cast<uint32_t>(range.getChannel(0)[sample]));
+}
+
+DSPARK_TEST(FlacFile_decode_only_and_transactional_lifecycle)
+{
+    midi_test::TempDirectory temp("flac-lifecycle");
+    const auto target = temp.file("preserve.bin");
+    const std::vector<uint8_t> sentinel { 1, 3, 3, 7 };
+    EXPECT_TRUE(midi_test::writeBytes(target, sentinel));
+
+    FlacFile file;
+    EXPECT_TRUE(file.openRead(flac_test::root() / "rfc9639-d1.flac"));
+    AudioFileInfo info;
+    info.sampleRate = 48000;
+    info.numChannels = 2;
+    info.bitsPerSample = 16;
+    EXPECT_TRUE(!file.openWrite(target, info));
+    EXPECT_TRUE(!file.isOpen());
+    EXPECT_TRUE(midi_test::readBytes(target) == sentinel);
+
+    AudioBuffer<float> samples;
+    samples.resize(1, 1);
+    EXPECT_TRUE(!file.writeSamples(std::as_const(samples).toView()));
+    EXPECT_TRUE(file.openRead(flac_test::root() / "rfc9639-d3.flac"));
+    EXPECT_TRUE(!file.openRead(flac_test::root() / "malformed" / "marker-byte-0.flac"));
+    EXPECT_TRUE(!file.isOpen());
+    EXPECT_EQ(file.getInfo().numChannels, 0u);
+    EXPECT_TRUE(!file.readSamples(samples.toView()));
+    file.close();
+    file.close();
+}
+
+DSPARK_TEST(FlacFile_surgical_malformed_corpus)
+{
+    size_t cases = 0;
+    bool all = true;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             flac_test::root() / "malformed"))
+    {
+        if (!entry.is_regular_file() || entry.path().extension() != ".flac")
+            continue;
+        ++cases;
+        FlacFile file;
+        const bool rejected = !file.openRead(entry.path()) && !file.isOpen()
+            && file.getInfo().numChannels == 0;
+        all = midi_test::record(rejected, entry.path().filename().string()) && all;
+    }
+    EXPECT_TRUE(cases >= 48);
+    EXPECT_TRUE(all);
+}
+
+DSPARK_TEST(FlacFile_public_resource_policy_boundaries)
+{
+    EXPECT_EQ(FlacFile::kMaxInputBytes, 256ull * 1024 * 1024);
+    EXPECT_EQ(FlacFile::kMaxMetadataBlocks, uint64_t(65536));
+    EXPECT_EQ(FlacFile::kMaxFrames, uint64_t(1048576));
+    EXPECT_EQ(FlacFile::kMaxInterchannelSamples, uint64_t(1) << 31);
+    EXPECT_EQ(FlacFile::kMaxDecodedPcmBytes, uint64_t(8) << 30);
+    EXPECT_EQ(FlacFile::kMaxRiceUnaryZeros, uint64_t(1) << 20);
+
+    midi_test::TempDirectory temp("flac-resource");
+    const auto inputOver = temp.file("input-over.flac");
+    {
+        std::ofstream output(inputOver, std::ios::binary | std::ios::trunc);
+        output.seekp(static_cast<std::streamoff>(FlacFile::kMaxInputBytes));
+        output.put(0);
+    }
+    FlacFile file;
+    EXPECT_TRUE(!file.openRead(inputOver));
+
+    const auto base = midi_test::readBytes(flac_test::root() / "decl-constant.flac");
+    auto metadataFile = [&](uint64_t blockCount, const char* name)
+        -> std::filesystem::path {
+        std::vector<uint8_t> bytes(base.begin(), base.begin() + 42);
+        bytes[4] = 0;
+        for (uint64_t block = 1; block < blockCount; ++block)
+        {
+            const uint8_t type = static_cast<uint8_t>(
+                (block + 1 == blockCount ? 0x80u : 0u) | 1u);
+            bytes.insert(bytes.end(), { type, 0, 0, 0 });
+        }
+        bytes.insert(bytes.end(), base.begin() + 42, base.end());
+        const auto path = temp.file(name);
+        return midi_test::writeBytes(path, bytes) ? path : std::filesystem::path {};
+    };
+    const auto exact = metadataFile(FlacFile::kMaxMetadataBlocks, "metadata-exact.flac");
+    EXPECT_TRUE(!exact.empty());
+    EXPECT_TRUE(file.openRead(exact));
+    file.close();
+    const auto over = metadataFile(FlacFile::kMaxMetadataBlocks + 1,
+                                   "metadata-over.flac");
+    EXPECT_TRUE(!over.empty());
+    EXPECT_TRUE(!file.openRead(over));
+    EXPECT_TRUE(flac_test::verifyNamed("decl-rice-unary-cap"));
+    EXPECT_TRUE(flac_test::rejectsNamed("rice-unary-cap-over"));
+}
+
+DSPARK_TEST(FlacFile_MUT_F01_crc8_is_load_bearing)
+{
+    EXPECT_TRUE(flac_test::rejectsNamed("frame-crc8"));
+}
+
+DSPARK_TEST(FlacFile_MUT_F02_crc16_is_load_bearing)
+{
+    EXPECT_TRUE(flac_test::rejectsNamed("frame-crc16"));
+}
+
+DSPARK_TEST(FlacFile_MUT_F03_side_width_is_load_bearing)
+{
+    EXPECT_TRUE(flac_test::verifyNamed("decl-left-side"));
+    EXPECT_TRUE(flac_test::verifyNamed("decl-side-right"));
+}
+
+DSPARK_TEST(FlacFile_MUT_F04_mid_side_odd_rounding_is_load_bearing)
+{
+    EXPECT_TRUE(flac_test::verifyNamed("decl-mid-side-negative-odd"));
+}
+
+DSPARK_TEST(FlacFile_MUT_F05_lpc32_checked_width_is_load_bearing)
+{
+    EXPECT_TRUE(flac_test::verifyNamed("decl-lpc32-mid-side"));
+}
+
+DSPARK_TEST(FlacFile_MUT_F06_rice_unfolding_is_load_bearing)
+{
+    EXPECT_TRUE(flac_test::verifyNamed("decl-fixed0-rice4"));
+}
+
+DSPARK_TEST(FlacFile_MUT_F07_escape_dispatch_is_load_bearing)
+{
+    EXPECT_TRUE(flac_test::verifyNamed("decl-fixed3-escape31"));
+}
+
+DSPARK_TEST(FlacFile_MUT_F08_wasted_restore_is_load_bearing)
+{
+    EXPECT_TRUE(flac_test::verifyNamed("decl-verbatim-wasted"));
+}
+
+DSPARK_TEST(FlacFile_MUT_F09_coded_number_minimality_is_load_bearing)
+{
+    midi_test::TempDirectory temp("flac-coded-number");
+    const auto path = temp.file("overlong.flac");
+    EXPECT_TRUE(midi_test::writeBytes(path, flac_test::noncanonicalCodedNumber()));
+    FlacFile file;
+    EXPECT_TRUE(!file.openRead(path));
+}
+
+DSPARK_TEST(FlacFile_MUT_F10_metadata_bounds_precede_use)
+{
+    EXPECT_TRUE(flac_test::rejectsNamed("streaminfo-length-16777215"));
+}
+
+DSPARK_TEST(FlacFile_MUT_F11_nonzero_md5_is_load_bearing)
+{
+    EXPECT_TRUE(flac_test::rejectsNamed("nonzero-md5-mismatch"));
+}
+
+DSPARK_TEST(FlacFile_hostile_mutation_campaign_20000)
+{
+    const std::vector<uint8_t> corpus[] = {
+        midi_test::readBytes(flac_test::root() / "rfc9639-d1.flac"),
+        midi_test::readBytes(flac_test::root() / "decl-lpc32-mid-side.flac"),
+        midi_test::readBytes(flac_test::root() / "decl-variable-uncommon-rate.flac")
+    };
+    EXPECT_TRUE(!corpus[0].empty() && !corpus[1].empty() && !corpus[2].empty());
+
+    uint64_t state = 0x464c41435f323031ull;
+    uint64_t mutationHash = 1469598103934665603ull;
+    uint64_t accepted = 0, rejected = 0;
+    int64_t worstMicros = 0;
+    const auto campaignStart = std::chrono::steady_clock::now();
+    for (size_t caseIndex = 0; caseIndex < 20000; ++caseIndex)
+    {
+        auto next = [&]() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            return state;
+        };
+        std::vector<uint8_t> bytes = corpus[caseIndex % 3];
+        const unsigned edits = 1u + static_cast<unsigned>(next() % 4u);
+        for (unsigned edit = 0; edit < edits; ++edit)
+        {
+            const size_t position = static_cast<size_t>(next() % bytes.size());
+            bytes[position] ^= static_cast<uint8_t>(1u << (next() & 7u));
+        }
+        mutationHash = midi_test::fnv1a(mutationHash, bytes);
+
+        midi_test::TempDirectory temp("flac-mutation-" + std::to_string(caseIndex));
+        const auto path = temp.file("mutated.flac");
+        EXPECT_TRUE(midi_test::writeBytes(path, bytes));
+        FlacFile file;
+        const auto start = std::chrono::steady_clock::now();
+        const bool ok = file.openRead(path);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        worstMicros = std::max(worstMicros, elapsed);
+        EXPECT_TRUE(elapsed < 2000000);
+        if (ok) ++accepted;
+        else
+        {
+            ++rejected;
+            EXPECT_TRUE(!file.isOpen());
+            EXPECT_EQ(file.getInfo().numChannels, 0u);
+        }
+    }
+    const auto campaignSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - campaignStart).count();
+    EXPECT_TRUE(campaignSeconds < 180);
+    EXPECT_EQ(accepted + rejected, uint64_t(20000));
+    std::cout << "FLAC mutation seed=0x464c41435f323031 cases=20000 accepted="
+              << accepted << " rejected=" << rejected << " corpus-fnv64="
+              << mutationHash << " worst-us=" << worstMicros << "\n";
 }

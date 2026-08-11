@@ -28,6 +28,7 @@
 
 #include "DSPark.h"
 
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -390,6 +391,32 @@ void runCoreGuardTests()
     else
         check(inside == before, "core", "DenormalGuard is a transparent no-op on this target");
     check(after == before, "core", "DenormalGuard restores the previous FP state");
+}
+
+// -----------------------------------------------------------------------------
+// [io] - public offline MIDI and FLAC contracts remain available through the
+// umbrella. Complete byte-level conformance is exercised by the fixture suite.
+// -----------------------------------------------------------------------------
+
+void runIoApiTests()
+{
+#ifndef DSPARK_NO_FILE_IO
+    dspark::MidiFile midi;
+    const bool midiCreated = midi.create(0, 480)
+        && midi.addChannelEvent(0, 0, 0x90, 60, 0)
+        && midi.addMetaEvent(0, 0, 0x51, std::array<uint8_t, 3> { 0x07, 0xa1, 0x20 });
+    const auto micros = midi.tickToMicroseconds(480);
+    check(midiCreated && micros && *micros == 500000, "io",
+          "MidiFile validates events and integrates tempo exactly");
+
+    dspark::FlacFile flac;
+    check(!flac.isOpen() && flac.getInfo().numChannels == 0
+          && dspark::FlacFile::kWriteUnsupportedReason
+             == "FlacFile is decode-only; FLAC encoding is not supported.",
+          "io", "FlacFile exposes a closed decode-only lifecycle");
+#else
+    skip("io", "MIDI and FLAC public API", "built with DSPARK_NO_FILE_IO");
+#endif
 }
 
 // -----------------------------------------------------------------------------
@@ -1985,6 +2012,7 @@ int main(int argc, char** argv)
 
     runSimdKernelTests();
     runCoreGuardTests();
+    runIoApiTests();
     runSmokeTests();
     runPdcNullTests();
     runMetricTests();

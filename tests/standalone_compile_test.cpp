@@ -101,6 +101,15 @@ void instantiate()
     OnsetDetector<T> onset;
     BeatTracker<T> beats;
 
+#ifndef DSPARK_NO_FILE_IO
+    // -- File I/O ------------------------------------------------------------
+    AudioFileInfo audioFileInfo;
+    WavFile wavFile;
+    Mp3File mp3File;
+    MidiFile midiFile;
+    FlacFile flacFile;
+#endif
+
     // -- Music ----------------------------------------------------------------
     ChordDetector<T> chords;
     KeyDetector<T> keys;
@@ -118,14 +127,21 @@ void instantiate()
     (void)ngt; (void)ng; (void)pan; (void)phr; (void)pitchShift; (void)rev;
     (void)rm; (void)sat; (void)denoiser; (void)sw; (void)tape; (void)xfmr;
     (void)td; (void)tr; (void)tube; (void)vib;
-    (void)envFollow; (void)goe; (void)lvl; (void)ldm; (void)phaseCorr;
+    (void)envFollow; (void)goe; (void)lvl; (void)ldm; (void)ldn;
+    (void)phaseCorr;
     (void)pd; (void)pitchFollow; (void)sa; (void)onset;
-    (void)chords;
+    (void)chords; (void)keys;
+#ifndef DSPARK_NO_FILE_IO
+    (void)audioFileInfo; (void)wavFile; (void)mp3File; (void)midiFile;
+    (void)flacFile;
+#endif
 }
-
-template void instantiate<float>();
-template void instantiate<double>();
 
 } // namespace
 
-int main() { return 0; }
+int main()
+{
+    instantiate<float>();
+    instantiate<double>();
+    return 0;
+}

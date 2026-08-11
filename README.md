@@ -182,13 +182,19 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `OnsetDetector<T>` | Causal SuperFlux onset detection (log-filtered spectral flux, vibrato-suppressing max filter, Boeck-2012 adaptive peak picker); shared front-end for beat tracking |
 | `BeatTracker<T>` | Tempo and beat tracking over that same envelope: offline dynamic-programming beat grid, causal resonator-bank tempo and beat phase, confidence and a secondary metrical hypothesis |
 
-### I/O (3 file handlers)
+### I/O (5 interfaces and file handlers)
 
 | Class | Description |
 |---|---|
 | `WavFile` | Read/write WAV (PCM 8/16/24/32-bit, float 32/64-bit) |
 | `Mp3File` | MPEG-1 Layer III codec — read (CBR/VBR) + write (CBR encoder, 32–320 kbps) |
+| `MidiFile` | Validating Standard MIDI File reader (formats 0/1/2) and writer (formats 0/1), with exact PPQN tempo conversion |
+| `FlacFile` | Native, dependency-free FLAC reader with eager CRC/MD5 validation and indexed range decode; decode-only by design |
 | `AudioFile` | Abstract base class for custom format implementations |
+
+Define `DSPARK_NO_FILE_IO` before including `DSPark.h` to omit all five I/O
+headers for embedded targets. `FlacFile::openWrite()` and `writeSamples()`
+always return `false`; no FLAC encoder or external codec library is linked.
 
 ### Music (2 modules)
 
@@ -429,10 +435,10 @@ DSPark/
 ├── Core/          (41)      # Building blocks: filters, FFT, WDF, oscillators, SIMD
 ├── Effects/       (36)      # Ready-to-use processors: EQ, compressor, reverb, tape...
 ├── Analysis/       (9)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation, onset
-├── IO/             (3)      # File I/O: WAV read/write, MP3 read/write
+├── IO/             (5)      # WAV/MP3, Standard MIDI and native FLAC I/O
 ├── Music/          (2)      # Harmony constants + real-time chord detection
 ├── plugin/                  # Native plugin layer: VST3, CLAP, AU + WebView editor
-├── tests/                   # Test suite: 630+ cases, zero dependencies
+├── tests/                   # Test suite: 830+ cases, zero dependencies
 ├── conformance/             # Public conformance suite (runs in CI)
 ├── docs/                    # Cookbook, plugin guide, threading model, metrics
 ├── examples/                # WAV processing, channel strip, plugins, templates

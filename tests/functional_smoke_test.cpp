@@ -7,7 +7,7 @@
 //   - bad default parameter values
 //
 // Build:
-//   cl /std:c++20 /O2 /EHsc /DUNICODE /DNOMINMAX /I.. functional_smoke_test.cpp \
+//   cl /std:c++20 /O2 /EHsc /DUNICODE /DNOMINMAX /I.. functional_smoke_test.cpp
 //      /Fe:functional_smoke_test.exe
 //
 // Returns non-zero on the first failed effect.
@@ -226,6 +226,22 @@ int testAll()
         std::printf("FAIL %-18s exception: %s\n", "OnsetDetector", e.what());
         ++failed;
     }
+
+#ifndef DSPARK_NO_FILE_IO
+    // File codecs are exercised without a device. This smoke only pins their
+    // public lifecycle; byte-exact corpora live in TestIO.
+    MidiFile midi;
+    FlacFile flac;
+    if (!midi.create(0, 960) || midi.format() != 0
+        || midi.ticksPerQuarter() != 960 || flac.isOpen()
+        || FlacFile::kWriteUnsupportedReason.empty())
+    {
+        std::printf("FAIL %-18s public lifecycle\n", "MIDI/FLAC I/O");
+        ++failed;
+    }
+    else
+        std::printf("OK   %-18s (offline lifecycle)\n", "MIDI/FLAC I/O");
+#endif
 
     std::printf("\n%d / %zu effects passed\n",
                 static_cast<int>(slots.size()) - failed, slots.size());

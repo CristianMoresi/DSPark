@@ -272,6 +272,17 @@ publication for what another thread legitimately needs. `Music/ChordDetector.h`
 does that with `getChroma()` / `getChord()`, and `Music/KeyDetector.h` with
 `chroma()` / `getKey()`.
 
+**The owner-managed offline case.** A reference into an offline document does
+not need an atomic publication when the owning object forbids concurrent
+access. `IO/MidiFile.h`'s `tracks()` is the exact current case. It carries the
+marker `owner-thread reference view` both at the method and in the class's
+`Threading:` block. The reference is valid only while its `MidiFile` owner
+remains alive and until the next non-const operation that can replace or mutate
+the document. No thread may read the view while another thread accesses the
+same instance mutably. This is owner-managed use, not atomic publication, and
+it does not satisfy the processing-thread rule above: a processing component
+must still provide a separate atomic publication for foreign-thread readout.
+
 `tools/verify_threading_doc.py` enumerates public const-reference accessors
 that return member storage positively. Its dependency-free C++ tokenizer and
 declaration parser builds one source-wide graph of lexical scopes, declaration
@@ -435,10 +446,10 @@ deliberate negative (an unrelated class, call, namespace object, parameter or
 other non-member) remains an ordinary 0/0 exclusion. Its production-policy
 mutation matrix checks every spelling, overload association, scope and binding,
 isolated marker deletion, and value/temporary/parameter/local near miss on every
-run. It currently finds eight: the two marked sites
-above and six explicit legacy warnings whose component audits must document
-them. A new unmarked site fails the check, so the warning set cannot grow
-silently. `Core/Biquad.h`'s `getCoeffs()` illustrates the hazard:
+run. It currently finds nine: the two stream-owner marked sites above, one
+owner-thread view and six explicit legacy warnings whose component audits must
+document them. A new unmarked site fails the check, so the warning set cannot
+grow silently. `Core/Biquad.h`'s `getCoeffs()` illustrates the hazard:
 it returns a reference straight into the active coefficient set, which the
 processing thread rewrites in `applyPendingCoeffs()`, so a GUI thread reading
 it during a promotion may observe a half-updated set. `Core/ProcessorChain.h`'s
@@ -446,7 +457,8 @@ it during a promotion may observe a half-updated set. `Core/ProcessorChain.h`'s
 sub-processor itself, so what may be done with the reference is that processor's
 contract. The rule to carry away is unchanged: a getter that returns a reference
 or raw pointer belongs to the processing thread unless its own documentation
-says otherwise.
+identifies a stricter exact category. An offline owner-thread view still
+forbids concurrent mutable access and promises no publication.
 
 The parser's deliberate boundary is named class, struct and union type facts and
 named namespaces present in the same header, with direct return expressions and

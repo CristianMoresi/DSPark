@@ -112,14 +112,16 @@ Tiers
      class-template target or direct/subobject return
      through an unresolved base emits a production-fatal diagnostic; value,
      member-call, free-object, private-template and qualified namespace free-
-     function controls do not. A stream-owner-only readout carries the marker
-     `stream-owner reference readout`
-     in both its
-     method documentation and the class's Threading block. Existing unmarked
-     sites are an explicit, counted legacy set until their owning audits
-     document them; any new unclassified site is a failure, so the warning set
-     cannot grow silently. The production policy runs its mutation matrix on
-     every invocation.
+     function controls do not. A processing-thread-only readout carries the
+     marker `stream-owner reference readout` in both its method documentation
+     and the class's Threading block, and names its separate atomic publication.
+     An owner-managed offline view carries the distinct marker `owner-thread
+     reference view` in both places and must belong to the exact reviewed-site
+     set; it does not borrow or broaden the processing-thread policy. Existing
+     unmarked sites are an explicit, counted legacy set until their owning
+     audits document them; any new unclassified site is a failure, so the
+     warning set cannot grow silently. The production policy runs its mutation
+     matrix on every invocation.
 """
 
 import re
@@ -649,6 +651,7 @@ else:
 # semantics instead of matching one spelling or today's two conforming names.
 # Every candidate is printed for review.
 MARKER_STREAM_OWNER_REF = "stream-owner reference readout"
+MARKER_OWNER_THREAD_REF = "owner-thread reference view"
 
 # These sites pre-date this tier and belong to their component audits. Keeping
 # the set explicit makes the gate useful immediately: it exits green with a
@@ -671,6 +674,17 @@ LEGACY_REFERENCE_ACCESSORS = {
 STREAM_OWNER_FOREIGN_READOUT = {
     ("Music/ChordDetector.h", "getChroma"): "getChord",
     ("Music/KeyDetector.h", "chroma"): "getKey",
+}
+
+# Offline document views have a different contract from processing-thread
+# readouts: callers retain no cross-thread publication guarantee and must avoid
+# every concurrent mutable access. Keep this category exact so its marker
+# cannot be pasted onto an arbitrary reference accessor as an exemption.
+OWNER_THREAD_REFERENCE_VIEWS = {
+    ("IO/MidiFile.h", "tracks"),
+}
+EXPECTED_OWNER_THREAD_REFERENCE_VIEWS = {
+    ("IO/MidiFile.h", "tracks"),
 }
 
 def reference_accessors(path):
@@ -755,7 +769,22 @@ def reference_policy_issues(label, region, class_documentation, foreign,
     return issues
 
 
-print("== tier G: stream-owner reference readouts, enumerated positively ==")
+def owner_thread_reference_policy_issues(label, region, class_documentation):
+    """Require the offline owner-thread marker at the method and class."""
+    issues = []
+    if MARKER_OWNER_THREAD_REF not in region:
+        issues.append(
+            "{} has no '{}' marker in its method documentation"
+            .format(label, MARKER_OWNER_THREAD_REF))
+    threading = re.search(r"Threading:.*?\*/", class_documentation, re.S)
+    if not threading or MARKER_OWNER_THREAD_REF not in threading.group(0):
+        issues.append(
+            "{} has no '{}' marker in its class Threading block"
+            .format(label, MARKER_OWNER_THREAD_REF))
+    return issues
+
+
+print("== tier G: reference readouts and views, enumerated positively ==")
 print("  qualified owner/ancestor invariant matrix:")
 qualified_cases = qualified_owner_ancestor_association_cases(
     MARKER_STREAM_OWNER_REF)
@@ -1293,6 +1322,12 @@ if binding_counts != [1, 0, 0]:
         + "/".join(map(str, binding_counts)))
 reference_sites = []
 marked_sites = set()
+owner_thread_sites = set()
+if OWNER_THREAD_REFERENCE_VIEWS != EXPECTED_OWNER_THREAD_REFERENCE_VIEWS:
+    failures.append(
+        "G: owner-thread reference-view category must be exactly {} but is {}"
+        .format(sorted(EXPECTED_OWNER_THREAD_REFERENCE_VIEWS),
+                sorted(OWNER_THREAD_REFERENCE_VIEWS)))
 for path in sorted(p for p in SOURCES
                    if p.startswith(FRAMEWORK_DIRS) and p.endswith(".h")):
     parsed_accessors, parse_diagnostics, reference_source = \
@@ -1315,7 +1350,24 @@ for path in sorted(p for p in SOURCES
             "G: " + issue for issue in reference_binding_issues(
                 label, item, reference_source))
         marked = MARKER_STREAM_OWNER_REF in region
-        if marked:
+        owner_marked = MARKER_OWNER_THREAD_REF in region
+        if site in OWNER_THREAD_REFERENCE_VIEWS:
+            owner_thread_sites.add(site)
+            print("  OWNER   {}".format(label))
+            if marked:
+                failures.append(
+                    "G: {} carries the processing-thread marker but belongs to "
+                    "the owner-thread reference-view category".format(label))
+            failures.extend(
+                "G: " + issue for issue in owner_thread_reference_policy_issues(
+                    label, region, class_documentation))
+        elif owner_marked:
+            print("  {}  <== UNCLASSIFIED OWNER-THREAD MARKER".format(label))
+            failures.append(
+                "G: {} carries the '{}' marker but is not in the exact "
+                "owner-thread reference-view category".format(
+                    label, MARKER_OWNER_THREAD_REF))
+        elif marked:
             marked_sites.add(site)
             print("  MARKED  {}".format(label))
             foreign = STREAM_OWNER_FOREIGN_READOUT.get(site)
@@ -1343,11 +1395,16 @@ for site in sorted(LEGACY_REFERENCE_ACCESSORS - found):
 for site in sorted(set(STREAM_OWNER_FOREIGN_READOUT) - found):
     failures.append("G: required marked reference accessor not found: {} {}()"
                     .format(site[0], site[1]))
+for site in sorted(OWNER_THREAD_REFERENCE_VIEWS - found):
+    failures.append("G: required owner-thread reference view not found: {} {}()"
+                    .format(site[0], site[1]))
 
 marked_count = len(marked_sites)
+owner_thread_count = len(owner_thread_sites)
 legacy_count = sum(1 for site in found if site in LEGACY_REFERENCE_ACCESSORS)
-print("  {} marked conforming site(s), {} explicit legacy warning(s), {} total"
-      .format(marked_count, legacy_count, len(reference_sites)))
+print("  {} stream-owner marked site(s), {} owner-thread view(s), "
+      "{} explicit legacy warning(s), {} total".format(
+          marked_count, owner_thread_count, legacy_count, len(reference_sites)))
 
 ref_paragraphs = [p for p in paragraphs
                   if "enumerates public const-reference accessors" in p]
@@ -1358,7 +1415,10 @@ else:
     ref_para = ref_paragraphs[0]
     for pattern, subject, expected in [
             (r"finds\s+(\w+)", "total reference accessors", len(reference_sites)),
-            (r"the\s+(\w+)\s+marked sites", "marked reference accessors", marked_count),
+            (r"the\s+(\w+)\s+stream-owner marked sites",
+             "stream-owner reference accessors", marked_count),
+            (r"(?:and\s+)?(?:the\s+)?(\w+)\s+owner-thread view",
+             "owner-thread reference views", owner_thread_count),
             (r"and\s+(\w+)\s+explicit legacy warnings", "legacy reference accessors",
              legacy_count)]:
         match = re.search(pattern, ref_para)
@@ -1377,6 +1437,11 @@ if MARKER_STREAM_OWNER_REF not in doc:
                     "enumerates by".format(MARKER_STREAM_OWNER_REF))
 else:
     print("  the page names the marker '{}'  OK".format(MARKER_STREAM_OWNER_REF))
+if MARKER_OWNER_THREAD_REF not in doc:
+    failures.append("G: the page never writes the marker '{}' that this tier "
+                    "enumerates by".format(MARKER_OWNER_THREAD_REF))
+else:
+    print("  the page names the marker '{}'  OK".format(MARKER_OWNER_THREAD_REF))
 
 print("")
 if failures:

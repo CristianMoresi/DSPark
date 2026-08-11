@@ -1,0 +1,29 @@
+{
+  "command": "python3 tests/fixtures/midi/generate_fixtures.py",
+  "fixtures": [
+    {
+      "bytes": 81,
+      "file": "rp001-format0.mid",
+      "format": 0,
+      "license": "MIDI Manufacturers Association copyright; minimal factual interoperability example bytes reproduced for conformance",
+      "origin": "MIDI Manufacturers Association, Standard MIDI Files 1.0, RP-001 revised February 1996, pages 12-13",
+      "semantic_events_including_eot": 14,
+      "sha256": "9c512dc6fc73b8bef93a39c93142b7e828cfe51bf5340b84fe0fc87f0b8536ed",
+      "tracks": 1
+    },
+    {
+      "bytes": 118,
+      "file": "rp001-format1.mid",
+      "format": 1,
+      "license": "MIDI Manufacturers Association copyright; minimal factual interoperability example bytes reproduced for conformance",
+      "origin": "MIDI Manufacturers Association, Standard MIDI Files 1.0, RP-001 revised February 1996, pages 13",
+      "semantic_events_including_eot": 17,
+      "sha256": "83ba1f523c7d4591f9c190d76f5fc62e04c3eb0b4a87132e03067224061729c7",
+      "tracks": 4
+    }
+  ],
+  "generator": "generate_fixtures.py",
+  "generator_sha256": "8c6b2d855ad2b6d06ca6a309d8c6a58b19a2e0fd9f6ee226773ff159a5b4c287",
+  "schema_version": "1",
+  "source_locator": "https://midi.org/standard-midi-files-specification"
+}

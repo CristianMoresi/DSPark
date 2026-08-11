@@ -1,0 +1,1251 @@
+{
+  "schema_version": 1,
+  "description": "Deterministic positive and malformed native FLAC fixture corpus",
+  "generator_command": "python3 tests/fixtures/flac/generate_fixtures.py",
+  "verification_command": "python3 tests/fixtures/flac/generate_fixtures.py --verify",
+  "oracle_compile_command": "g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror tests/fixtures/flac/libflac_fixture_tool.cpp $(pkg-config --cflags --libs flac) -o tests/fixtures/flac/.libflac_fixture_tool",
+  "oracle_version": "1.4.3",
+  "generator_sha256": "2f754874e4fc9cc2e338064d6e164b7d54b096688d647d5e91ea8434eb0b1db2",
+  "oracle_source_sha256": "8fbe248446cecc2dc49c9faaebcc5f11dded1f272992cb443917bf7026f8e106",
+  "positive_count": 31,
+  "malformed_count": 88,
+  "actual_branch_inventory": {
+    "blocking": [
+      "fixed",
+      "variable"
+    ],
+    "channel_modes": [
+      "independent",
+      "left_side",
+      "mid_side",
+      "side_right"
+    ],
+    "subframes": [
+      "CONSTANT",
+      "FIXED0",
+      "FIXED1",
+      "FIXED2",
+      "FIXED3",
+      "FIXED4",
+      "LPC1",
+      "LPC12",
+      "LPC32",
+      "VERBATIM",
+      "VERBATIM_WASTED2"
+    ],
+    "residual_modes": [
+      "ESCAPE0",
+      "ESCAPE31",
+      "RICE4",
+      "RICE5"
+    ]
+  },
+  "fixtures": [
+    {
+      "name": "rfc9639-d1",
+      "origin": "RFC 9639 Appendix D exact hexadecimal listing",
+      "license": "IETF Trust Legal Provisions / Code Components",
+      "sample_rate": 44100,
+      "channels": 2,
+      "bits_per_sample": 16,
+      "sample_frames": 1,
+      "source_pcm_sha256": "26d11828082e8d76cf1befe101f1be56e3db32d387b67a102a4ac17d9c7807c3",
+      "flac_sha256": "702607714813462e228a9268ce81e3fc6ca5382462e179bd21ccbbe9380b1139",
+      "reference_pcm_sha256": "26d11828082e8d76cf1befe101f1be56e3db32d387b67a102a4ac17d9c7807c3",
+      "actual_inventory": [
+        {
+          "source": "RFC 9639 Appendix D1"
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/rfc9639-d1.flac tests/fixtures/flac/rfc9639-d1.reference.pcm"
+    },
+    {
+      "name": "rfc9639-d2",
+      "origin": "RFC 9639 Appendix D exact hexadecimal listing",
+      "license": "IETF Trust Legal Provisions / Code Components",
+      "sample_rate": 44100,
+      "channels": 2,
+      "bits_per_sample": 16,
+      "sample_frames": 19,
+      "source_pcm_sha256": "872e56cb2d08721137e8dc3050d8bdfa9ce4b4c22a0053f130f388ba02f102d3",
+      "flac_sha256": "f209a0d09134174ac4ce63ea8b7dbba365e778d79447fee06f92f8abcd39d935",
+      "reference_pcm_sha256": "872e56cb2d08721137e8dc3050d8bdfa9ce4b4c22a0053f130f388ba02f102d3",
+      "actual_inventory": [
+        {
+          "source": "RFC 9639 Appendix D2"
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/rfc9639-d2.flac tests/fixtures/flac/rfc9639-d2.reference.pcm"
+    },
+    {
+      "name": "rfc9639-d3",
+      "origin": "RFC 9639 Appendix D exact hexadecimal listing",
+      "license": "IETF Trust Legal Provisions / Code Components",
+      "sample_rate": 32000,
+      "channels": 1,
+      "bits_per_sample": 8,
+      "sample_frames": 24,
+      "source_pcm_sha256": "0352210dc3aac53acbf58250b55fc3011ace7b5e852c59daa1d29947912a7f83",
+      "flac_sha256": "a07f91b390d1f4404f16b0be2379965c8db90ed48a8e83da59971262f206ac3a",
+      "reference_pcm_sha256": "0352210dc3aac53acbf58250b55fc3011ace7b5e852c59daa1d29947912a7f83",
+      "actual_inventory": [
+        {
+          "source": "RFC 9639 Appendix D3"
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/rfc9639-d3.flac tests/fixtures/flac/rfc9639-d3.reference.pcm"
+    },
+    {
+      "name": "libflac-1ch-8bit",
+      "origin": "deterministic source PCM encoded by libFLAC 1.4.3",
+      "license": "MIT fixture data; libFLAC is BSD-3-Clause",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 8,
+      "sample_frames": 64,
+      "source_pcm_sha256": "fae0d3c7fbdb9f47b0ee26d54657fb5e588b42b92b35002ea524c9968d07ba6b",
+      "flac_sha256": "31a13fc4978841afd173cf80e042158e8c627196162ae58a21df2f9e1c8d98bf",
+      "reference_pcm_sha256": "fae0d3c7fbdb9f47b0ee26d54657fb5e588b42b92b35002ea524c9968d07ba6b",
+      "actual_inventory": [
+        {
+          "encoder": "libFLAC 1.4.3",
+          "channels": 1,
+          "bits_per_sample": 8
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/libflac-1ch-8bit.flac tests/fixtures/flac/libflac-1ch-8bit.reference.pcm",
+      "encoder_command": "tests/fixtures/flac/.libflac_fixture_tool encode tests/fixtures/flac/libflac-1ch-8bit.source.pcm tests/fixtures/flac/libflac-1ch-8bit.flac 48000 1 8 64"
+    },
+    {
+      "name": "libflac-1ch-16bit",
+      "origin": "deterministic source PCM encoded by libFLAC 1.4.3",
+      "license": "MIT fixture data; libFLAC is BSD-3-Clause",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 16,
+      "sample_frames": 64,
+      "source_pcm_sha256": "9949ccdede882f7343cc8c66124c5dd5e693b6bfcb421c990345072d64999b44",
+      "flac_sha256": "186639b13811fd23e8ccf8165f2f4e7003717d39315bbab97a833713ba20c474",
+      "reference_pcm_sha256": "9949ccdede882f7343cc8c66124c5dd5e693b6bfcb421c990345072d64999b44",
+      "actual_inventory": [
+        {
+          "encoder": "libFLAC 1.4.3",
+          "channels": 1,
+          "bits_per_sample": 16
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/libflac-1ch-16bit.flac tests/fixtures/flac/libflac-1ch-16bit.reference.pcm",
+      "encoder_command": "tests/fixtures/flac/.libflac_fixture_tool encode tests/fixtures/flac/libflac-1ch-16bit.source.pcm tests/fixtures/flac/libflac-1ch-16bit.flac 48000 1 16 64"
+    },
+    {
+      "name": "libflac-1ch-24bit",
+      "origin": "deterministic source PCM encoded by libFLAC 1.4.3",
+      "license": "MIT fixture data; libFLAC is BSD-3-Clause",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 24,
+      "sample_frames": 64,
+      "source_pcm_sha256": "5410ca2b32f7e916cc5e639f7d44d10eaecd2da74a75d1a9aff29ab1c8a84cf5",
+      "flac_sha256": "16109684f4ad8669184c76f6137a8f1c11c9042bbd315cb16dc2666446c38189",
+      "reference_pcm_sha256": "5410ca2b32f7e916cc5e639f7d44d10eaecd2da74a75d1a9aff29ab1c8a84cf5",
+      "actual_inventory": [
+        {
+          "encoder": "libFLAC 1.4.3",
+          "channels": 1,
+          "bits_per_sample": 24
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/libflac-1ch-24bit.flac tests/fixtures/flac/libflac-1ch-24bit.reference.pcm",
+      "encoder_command": "tests/fixtures/flac/.libflac_fixture_tool encode tests/fixtures/flac/libflac-1ch-24bit.source.pcm tests/fixtures/flac/libflac-1ch-24bit.flac 48000 1 24 64"
+    },
+    {
+      "name": "libflac-1ch-32bit",
+      "origin": "deterministic source PCM encoded by libFLAC 1.4.3",
+      "license": "MIT fixture data; libFLAC is BSD-3-Clause",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 32,
+      "sample_frames": 64,
+      "source_pcm_sha256": "d1bcc0b75729164d6c207fabb88cebec54c38dba7cc176e21a18dc6cc23edced",
+      "flac_sha256": "e27be5f00164086adc84426afdf270b4163519beb40900523defac032973c10b",
+      "reference_pcm_sha256": "d1bcc0b75729164d6c207fabb88cebec54c38dba7cc176e21a18dc6cc23edced",
+      "actual_inventory": [
+        {
+          "encoder": "libFLAC 1.4.3",
+          "channels": 1,
+          "bits_per_sample": 32
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/libflac-1ch-32bit.flac tests/fixtures/flac/libflac-1ch-32bit.reference.pcm",
+      "encoder_command": "tests/fixtures/flac/.libflac_fixture_tool encode tests/fixtures/flac/libflac-1ch-32bit.source.pcm tests/fixtures/flac/libflac-1ch-32bit.flac 48000 1 32 64"
+    },
+    {
+      "name": "libflac-2ch-8bit",
+      "origin": "deterministic source PCM encoded by libFLAC 1.4.3",
+      "license": "MIT fixture data; libFLAC is BSD-3-Clause",
+      "sample_rate": 48000,
+      "channels": 2,
+      "bits_per_sample": 8,
+      "sample_frames": 64,
+      "source_pcm_sha256": "83536d496419371fb1bc2366ce994e3a035b47e4144a4009871583967095800d",
+      "flac_sha256": "6c1aa27a98edba7af036484d7f0e69655c3a8f14ef9829eafe892eaab23f17f8",
+      "reference_pcm_sha256": "83536d496419371fb1bc2366ce994e3a035b47e4144a4009871583967095800d",
+      "actual_inventory": [
+        {
+          "encoder": "libFLAC 1.4.3",
+          "channels": 2,
+          "bits_per_sample": 8
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/libflac-2ch-8bit.flac tests/fixtures/flac/libflac-2ch-8bit.reference.pcm",
+      "encoder_command": "tests/fixtures/flac/.libflac_fixture_tool encode tests/fixtures/flac/libflac-2ch-8bit.source.pcm tests/fixtures/flac/libflac-2ch-8bit.flac 48000 2 8 64"
+    },
+    {
+      "name": "libflac-2ch-16bit",
+      "origin": "deterministic source PCM encoded by libFLAC 1.4.3",
+      "license": "MIT fixture data; libFLAC is BSD-3-Clause",
+      "sample_rate": 48000,
+      "channels": 2,
+      "bits_per_sample": 16,
+      "sample_frames": 64,
+      "source_pcm_sha256": "e78ce48cd9bc95ffc2bc49055f56357cf68551a47490585d1ad6cfebfcf0c9aa",
+      "flac_sha256": "bcf8f5c9515a38fe7cbe9de87ae66e1874fb1c8421e1643f5265c98c95eeaa79",
+      "reference_pcm_sha256": "e78ce48cd9bc95ffc2bc49055f56357cf68551a47490585d1ad6cfebfcf0c9aa",
+      "actual_inventory": [
+        {
+          "encoder": "libFLAC 1.4.3",
+          "channels": 2,
+          "bits_per_sample": 16
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/libflac-2ch-16bit.flac tests/fixtures/flac/libflac-2ch-16bit.reference.pcm",
+      "encoder_command": "tests/fixtures/flac/.libflac_fixture_tool encode tests/fixtures/flac/libflac-2ch-16bit.source.pcm tests/fixtures/flac/libflac-2ch-16bit.flac 48000 2 16 64"
+    },
+    {
+      "name": "libflac-2ch-24bit",
+      "origin": "deterministic source PCM encoded by libFLAC 1.4.3",
+      "license": "MIT fixture data; libFLAC is BSD-3-Clause",
+      "sample_rate": 48000,
+      "channels": 2,
+      "bits_per_sample": 24,
+      "sample_frames": 64,
+      "source_pcm_sha256": "eebf5831d0652893805cf356718b9b4e25f5e9ba88cfb0f130b1a2d1d4638347",
+      "flac_sha256": "7f5282657745aff190cb6d2c6703ae0dd8fb4b7cca1018d2c5cddd578bbcd108",
+      "reference_pcm_sha256": "eebf5831d0652893805cf356718b9b4e25f5e9ba88cfb0f130b1a2d1d4638347",
+      "actual_inventory": [
+        {
+          "encoder": "libFLAC 1.4.3",
+          "channels": 2,
+          "bits_per_sample": 24
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/libflac-2ch-24bit.flac tests/fixtures/flac/libflac-2ch-24bit.reference.pcm",
+      "encoder_command": "tests/fixtures/flac/.libflac_fixture_tool encode tests/fixtures/flac/libflac-2ch-24bit.source.pcm tests/fixtures/flac/libflac-2ch-24bit.flac 48000 2 24 64"
+    },
+    {
+      "name": "libflac-2ch-32bit",
+      "origin": "deterministic source PCM encoded by libFLAC 1.4.3",
+      "license": "MIT fixture data; libFLAC is BSD-3-Clause",
+      "sample_rate": 48000,
+      "channels": 2,
+      "bits_per_sample": 32,
+      "sample_frames": 64,
+      "source_pcm_sha256": "9e310c0bd69c06476499e794ec64f23d5d52b38e256eafb279648995e4b0c6e9",
+      "flac_sha256": "0217cdd0e3c407c33e141b5299f7ffaae983a7b83de07113380b5fd621dc69f3",
+      "reference_pcm_sha256": "9e310c0bd69c06476499e794ec64f23d5d52b38e256eafb279648995e4b0c6e9",
+      "actual_inventory": [
+        {
+          "encoder": "libFLAC 1.4.3",
+          "channels": 2,
+          "bits_per_sample": 32
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/libflac-2ch-32bit.flac tests/fixtures/flac/libflac-2ch-32bit.reference.pcm",
+      "encoder_command": "tests/fixtures/flac/.libflac_fixture_tool encode tests/fixtures/flac/libflac-2ch-32bit.source.pcm tests/fixtures/flac/libflac-2ch-32bit.flac 48000 2 32 64"
+    },
+    {
+      "name": "decl-constant",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 16,
+      "sample_frames": 32,
+      "source_pcm_sha256": "3a5e407d202248809ef2d28d09fed0a47b49945841ee482b320ff1864223937f",
+      "flac_sha256": "a6d48e080eece2c2163c183ea85f3c58dec93bb0907732562b1955ded8e58458",
+      "reference_pcm_sha256": "3a5e407d202248809ef2d28d09fed0a47b49945841ee482b320ff1864223937f",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "CONSTANT"
+          ],
+          "residual_modes": []
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-constant.flac tests/fixtures/flac/decl-constant.reference.pcm"
+    },
+    {
+      "name": "decl-verbatim-wasted",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 16,
+      "sample_frames": 32,
+      "source_pcm_sha256": "a6a2b948732dcedbc9f46a4601e3e61cce0199ec8f303fcd8d63c2e8b81ead04",
+      "flac_sha256": "320309c812d23e42fbccc0f6be044c2118f6269c99578e9937e4f5df74182ef5",
+      "reference_pcm_sha256": "a6a2b948732dcedbc9f46a4601e3e61cce0199ec8f303fcd8d63c2e8b81ead04",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "VERBATIM_WASTED2"
+          ],
+          "residual_modes": []
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-verbatim-wasted.flac tests/fixtures/flac/decl-verbatim-wasted.reference.pcm"
+    },
+    {
+      "name": "decl-fixed0-rice4",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 16,
+      "sample_frames": 32,
+      "source_pcm_sha256": "d6db504e8b4ab09033abe21ad029d95991970458dcf6efc13c110bef16e1dffd",
+      "flac_sha256": "e278f4112b56a375b9055e13d9830585ecdf07a27a3d5d9a77d80e1e44946090",
+      "reference_pcm_sha256": "d6db504e8b4ab09033abe21ad029d95991970458dcf6efc13c110bef16e1dffd",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "FIXED0"
+          ],
+          "residual_modes": [
+            "RICE4"
+          ]
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-fixed0-rice4.flac tests/fixtures/flac/decl-fixed0-rice4.reference.pcm"
+    },
+    {
+      "name": "decl-fixed1-rice5",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 16,
+      "sample_frames": 32,
+      "source_pcm_sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe",
+      "flac_sha256": "4c0e90f420b8e6bd348c0a99e9f91f84c03c3ac0251ab2b55c2bc8843e8f7e75",
+      "reference_pcm_sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "FIXED1"
+          ],
+          "residual_modes": [
+            "RICE5"
+          ]
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-fixed1-rice5.flac tests/fixtures/flac/decl-fixed1-rice5.reference.pcm"
+    },
+    {
+      "name": "decl-fixed2-escape0",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 16,
+      "sample_frames": 32,
+      "source_pcm_sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe",
+      "flac_sha256": "8e07bcc5fd18b88fd63f5fa0ae7482ddaa65ffdff954d889719c7d5c6ea4a8c8",
+      "reference_pcm_sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "FIXED2"
+          ],
+          "residual_modes": [
+            "RICE4",
+            "ESCAPE0"
+          ]
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-fixed2-escape0.flac tests/fixtures/flac/decl-fixed2-escape0.reference.pcm"
+    },
+    {
+      "name": "decl-fixed3-escape31",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 24,
+      "sample_frames": 32,
+      "source_pcm_sha256": "33833208856794da07527c786ba7049b246e2612760fc9fed7ec105ce977cd93",
+      "flac_sha256": "888ca35afba0b732caa136c3355262ee334092f32a6d0ab106ec36d6bf770f5c",
+      "reference_pcm_sha256": "33833208856794da07527c786ba7049b246e2612760fc9fed7ec105ce977cd93",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "FIXED3"
+          ],
+          "residual_modes": [
+            "RICE4",
+            "ESCAPE31"
+          ]
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-fixed3-escape31.flac tests/fixtures/flac/decl-fixed3-escape31.reference.pcm"
+    },
+    {
+      "name": "decl-fixed4-partitioned",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 24,
+      "sample_frames": 32,
+      "source_pcm_sha256": "f1ee5545c3abdcae6342c48a3936f222bd38725c3860bb81594b5ef00088e843",
+      "flac_sha256": "6f72ba511200220045b294f4d963b1eb57ce6f699842d7c04471944b15dbb25b",
+      "reference_pcm_sha256": "f1ee5545c3abdcae6342c48a3936f222bd38725c3860bb81594b5ef00088e843",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "FIXED4"
+          ],
+          "residual_modes": [
+            "RICE4"
+          ]
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-fixed4-partitioned.flac tests/fixtures/flac/decl-fixed4-partitioned.reference.pcm"
+    },
+    {
+      "name": "decl-lpc1",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 16,
+      "sample_frames": 32,
+      "source_pcm_sha256": "74c94a019b964926c220358d75c060e961aaef535d79c88236125d7b6c4bacff",
+      "flac_sha256": "2df2d33f9f592dd7f26d614d44af8fc2486c0c0e8ee8de0332c9a498701320f5",
+      "reference_pcm_sha256": "74c94a019b964926c220358d75c060e961aaef535d79c88236125d7b6c4bacff",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "LPC1"
+          ],
+          "residual_modes": [
+            "RICE4"
+          ]
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-lpc1.flac tests/fixtures/flac/decl-lpc1.reference.pcm"
+    },
+    {
+      "name": "decl-lpc12",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 24,
+      "sample_frames": 32,
+      "source_pcm_sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe",
+      "flac_sha256": "0a46b324b6248a25556d213d40d89f27c2247a0fd1bd407d907684c99fe34ecb",
+      "reference_pcm_sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "LPC12"
+          ],
+          "residual_modes": [
+            "RICE5"
+          ]
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-lpc12.flac tests/fixtures/flac/decl-lpc12.reference.pcm"
+    },
+    {
+      "name": "decl-lpc32-mid-side",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 96000,
+      "channels": 2,
+      "bits_per_sample": 32,
+      "sample_frames": 33,
+      "source_pcm_sha256": "2696ae3f2e9eaf7c32a3be894c98189e5ada1e0fc691aedbce4a39dbf792cf58",
+      "flac_sha256": "a2f58c6f03f3026e8379e4f89c11b7ff98f11b31932b574d52cca5069c76857c",
+      "reference_pcm_sha256": "2696ae3f2e9eaf7c32a3be894c98189e5ada1e0fc691aedbce4a39dbf792cf58",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 33,
+          "sample_rate_code": 0,
+          "channel_mode": "mid_side",
+          "subframes": [
+            "VERBATIM",
+            "LPC32"
+          ],
+          "residual_modes": [
+            "RICE4",
+            "ESCAPE0"
+          ]
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-lpc32-mid-side.flac tests/fixtures/flac/decl-lpc32-mid-side.reference.pcm"
+    },
+    {
+      "name": "decl-left-side",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 44100,
+      "channels": 2,
+      "bits_per_sample": 16,
+      "sample_frames": 32,
+      "source_pcm_sha256": "2948e3c8eff97971ff2bb385bd88a612bf2323f8a4f5f7dc668d702fd4ab3e43",
+      "flac_sha256": "d397e0eb897c01946840156bf9345917e612a7dad3ab4524e729ffd79ab9f572",
+      "reference_pcm_sha256": "2948e3c8eff97971ff2bb385bd88a612bf2323f8a4f5f7dc668d702fd4ab3e43",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "left_side",
+          "subframes": [
+            "VERBATIM",
+            "VERBATIM"
+          ],
+          "residual_modes": []
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-left-side.flac tests/fixtures/flac/decl-left-side.reference.pcm"
+    },
+    {
+      "name": "decl-side-right",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 44100,
+      "channels": 2,
+      "bits_per_sample": 16,
+      "sample_frames": 32,
+      "source_pcm_sha256": "2948e3c8eff97971ff2bb385bd88a612bf2323f8a4f5f7dc668d702fd4ab3e43",
+      "flac_sha256": "fd14dd383d991bdab86e4a9c09f7ac4714d61a35a3366ac756c136f48b80d1bc",
+      "reference_pcm_sha256": "2948e3c8eff97971ff2bb385bd88a612bf2323f8a4f5f7dc668d702fd4ab3e43",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "side_right",
+          "subframes": [
+            "VERBATIM",
+            "VERBATIM"
+          ],
+          "residual_modes": []
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-side-right.flac tests/fixtures/flac/decl-side-right.reference.pcm"
+    },
+    {
+      "name": "decl-mid-side-negative-odd",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 44100,
+      "channels": 2,
+      "bits_per_sample": 16,
+      "sample_frames": 32,
+      "source_pcm_sha256": "df1bd7f7f2756f7aec5ddec3044d4e7098ffd4fd6be3a21387a52b8f86e4807d",
+      "flac_sha256": "f245f10c35f321ef96e4e6e9ec6b58e61c9a7918db353a62865b4b046499752f",
+      "reference_pcm_sha256": "df1bd7f7f2756f7aec5ddec3044d4e7098ffd4fd6be3a21387a52b8f86e4807d",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "mid_side",
+          "subframes": [
+            "VERBATIM",
+            "VERBATIM"
+          ],
+          "residual_modes": []
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-mid-side-negative-odd.flac tests/fixtures/flac/decl-mid-side-negative-odd.reference.pcm"
+    },
+    {
+      "name": "decl-variable-uncommon-rate",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 12345,
+      "channels": 1,
+      "bits_per_sample": 16,
+      "sample_frames": 33,
+      "source_pcm_sha256": "4bf5519b10913624a5c865f43ac5abd692ff96c82b8bb0af04964bac0f8e6cd0",
+      "flac_sha256": "c29b5f4d9cbc06eb1d32ef300a6854c886bf469d82fff10f488966644306d5ba",
+      "reference_pcm_sha256": "4bf5519b10913624a5c865f43ac5abd692ff96c82b8bb0af04964bac0f8e6cd0",
+      "actual_inventory": [
+        {
+          "blocking": "variable",
+          "block_size": 16,
+          "sample_rate_code": 13,
+          "channel_mode": "independent",
+          "subframes": [
+            "VERBATIM"
+          ],
+          "residual_modes": []
+        },
+        {
+          "blocking": "variable",
+          "block_size": 17,
+          "sample_rate_code": 13,
+          "channel_mode": "independent",
+          "subframes": [
+            "VERBATIM"
+          ],
+          "residual_modes": []
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-variable-uncommon-rate.flac tests/fixtures/flac/decl-variable-uncommon-rate.reference.pcm"
+    },
+    {
+      "name": "decl-rice-unary-cap",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 32,
+      "sample_frames": 16,
+      "source_pcm_sha256": "5d434409283cdc8e500c72de5591f50bd858c8377a7f5f979e5f1b446e091ec0",
+      "flac_sha256": "105a0819b0ad2dadc226cb0df55abcffa2184345c132a84b7715b7af481a8c7b",
+      "reference_pcm_sha256": "5d434409283cdc8e500c72de5591f50bd858c8377a7f5f979e5f1b446e091ec0",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 16,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "FIXED0"
+          ],
+          "residual_modes": [
+            "RICE4"
+          ]
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-rice-unary-cap.flac tests/fixtures/flac/decl-rice-unary-cap.reference.pcm"
+    },
+    {
+      "name": "decl-zero-md5-unknown-total",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 16,
+      "sample_frames": 16,
+      "source_pcm_sha256": "c9ded81c51d2dcb758717a93c90989023e049ffd340756aac4a761a40f0fa5d9",
+      "flac_sha256": "0536fce127fb21f029be62a6d32e7185ccf46e1572519bb861c17714c12fba92",
+      "reference_pcm_sha256": "c9ded81c51d2dcb758717a93c90989023e049ffd340756aac4a761a40f0fa5d9",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 16,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "CONSTANT"
+          ],
+          "residual_modes": []
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-zero-md5-unknown-total.flac tests/fixtures/flac/decl-zero-md5-unknown-total.reference.pcm"
+    },
+    {
+      "name": "decl-depth4-rate-code12",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 1,
+      "bits_per_sample": 4,
+      "sample_frames": 32,
+      "source_pcm_sha256": "ba35115a8329fbe8f3027ea2080d93d7809f21e16890c9ab60f70464ca9fcfe7",
+      "flac_sha256": "64c88c02ff17b7d3f34804356e9405a0c8ef2d9284dd8b4e54e41556a9d1c771",
+      "reference_pcm_sha256": "ba35115a8329fbe8f3027ea2080d93d7809f21e16890c9ab60f70464ca9fcfe7",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 12,
+          "channel_mode": "independent",
+          "subframes": [
+            "VERBATIM"
+          ],
+          "residual_modes": []
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-depth4-rate-code12.flac tests/fixtures/flac/decl-depth4-rate-code12.reference.pcm"
+    },
+    {
+      "name": "decl-depth12-rate-code14",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 44100,
+      "channels": 1,
+      "bits_per_sample": 12,
+      "sample_frames": 32,
+      "source_pcm_sha256": "d6ce495c4fd57ba7ffc8da66c4ef831280b408e69c7734257dfae00e6b1500b3",
+      "flac_sha256": "ac32981b9f55a2fd2f70cd5a6daa0d4773ca7e4bf02971bc7532de6599b22da4",
+      "reference_pcm_sha256": "d6ce495c4fd57ba7ffc8da66c4ef831280b408e69c7734257dfae00e6b1500b3",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 14,
+          "channel_mode": "independent",
+          "subframes": [
+            "VERBATIM"
+          ],
+          "residual_modes": []
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-depth12-rate-code14.flac tests/fixtures/flac/decl-depth12-rate-code14.reference.pcm"
+    },
+    {
+      "name": "decl-depth20",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 88200,
+      "channels": 1,
+      "bits_per_sample": 20,
+      "sample_frames": 32,
+      "source_pcm_sha256": "0b39b9ba689686ec57d1605834be37349f4bb21b0b928f9cd6e1bbff20e29265",
+      "flac_sha256": "109ebbf7359bd1558a927e1032284fc86e4556b95101c613d315378b46237077",
+      "reference_pcm_sha256": "0b39b9ba689686ec57d1605834be37349f4bb21b0b928f9cd6e1bbff20e29265",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 32,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "VERBATIM"
+          ],
+          "residual_modes": []
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-depth20.flac tests/fixtures/flac/decl-depth20.reference.pcm"
+    },
+    {
+      "name": "decl-eight-channel",
+      "origin": "DSPark declarative RFC 9639 field generator",
+      "license": "MIT",
+      "sample_rate": 48000,
+      "channels": 8,
+      "bits_per_sample": 16,
+      "sample_frames": 16,
+      "source_pcm_sha256": "a58d8b5d21e0886fe0a5d1f4327525dd90e726061bff2bab2eb83142e0ef8678",
+      "flac_sha256": "3d1e721656b60a3efa65fee8709e8c7dcf55d8d68b25c2a2f87bb8c4029c525b",
+      "reference_pcm_sha256": "a58d8b5d21e0886fe0a5d1f4327525dd90e726061bff2bab2eb83142e0ef8678",
+      "actual_inventory": [
+        {
+          "blocking": "fixed",
+          "block_size": 16,
+          "sample_rate_code": 0,
+          "channel_mode": "independent",
+          "subframes": [
+            "VERBATIM",
+            "VERBATIM",
+            "VERBATIM",
+            "VERBATIM",
+            "VERBATIM",
+            "VERBATIM",
+            "VERBATIM",
+            "VERBATIM"
+          ],
+          "residual_modes": []
+        }
+      ],
+      "oracle_command": "tests/fixtures/flac/.libflac_fixture_tool decode tests/fixtures/flac/decl-eight-channel.flac tests/fixtures/flac/decl-eight-channel.reference.pcm"
+    }
+  ],
+  "malformed": [
+    {
+      "name": "marker-byte-0",
+      "reason": "native marker mismatch",
+      "sha256": "0ae717bd63b434ecf7cd3ea04e1964ae64f8747b9fedab16b5ba1b8229679a3b"
+    },
+    {
+      "name": "marker-byte-1",
+      "reason": "native marker mismatch",
+      "sha256": "9f9810741a79c02c29352073885773d5e5d7992eb708ae64637145ee3814d60d"
+    },
+    {
+      "name": "marker-byte-2",
+      "reason": "native marker mismatch",
+      "sha256": "dbe7dff8ed6b26d8579563953d69615565ff4c049d8d87ef3e3effdf912743cc"
+    },
+    {
+      "name": "marker-byte-3",
+      "reason": "native marker mismatch",
+      "sha256": "1d5098b291c9212ad2915fd4c18d4dfdc877a8d1e4fd44e914786dac331b41ca"
+    },
+    {
+      "name": "truncated-marker-0",
+      "reason": "truncated native marker",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "truncated-marker-1",
+      "reason": "truncated native marker",
+      "sha256": "252f10c83610ebca1a059c0bae8255eba2f95be4d1d7bcfa89d7248a82d9f111"
+    },
+    {
+      "name": "truncated-marker-2",
+      "reason": "truncated native marker",
+      "sha256": "f7616ca89ec4663ed718dd29a00c236c5909207a5bc9791c1fe7ddfdace13d32"
+    },
+    {
+      "name": "truncated-marker-3",
+      "reason": "truncated native marker",
+      "sha256": "09ee4dae854d0b8eee5cecebf68a91f3282ed819d58d694e9de0323ede789322"
+    },
+    {
+      "name": "truncated-metadata-header-4",
+      "reason": "truncated metadata header",
+      "sha256": "70bf93310284b039f237e82db4407df3e3ca642fac2b9ebb02973764424c7418"
+    },
+    {
+      "name": "truncated-metadata-header-5",
+      "reason": "truncated metadata header",
+      "sha256": "dc101364b6d7553813071bbd4ac1330529bebe7ffae6e8cbef3fed2570512257"
+    },
+    {
+      "name": "truncated-metadata-header-6",
+      "reason": "truncated metadata header",
+      "sha256": "9007efbac1ba96cc737bb4d41330ab4a9d54507973785fd5623e311d4620e16c"
+    },
+    {
+      "name": "truncated-metadata-header-7",
+      "reason": "truncated metadata header",
+      "sha256": "98664d579970a3efd977552218e6a6dc9b668fe495d257bc643569fdc61a8d1b"
+    },
+    {
+      "name": "streaminfo-length-0",
+      "reason": "STREAMINFO length is not 34",
+      "sha256": "f5c9589717550f623c916559757115b4570f3455c760b4b6f3afb17a61587ab5"
+    },
+    {
+      "name": "streaminfo-length-1",
+      "reason": "STREAMINFO length is not 34",
+      "sha256": "8becb9bbfddaff7f5795b74092ba5524118a5ad0604c08fa136fc278e72c712b"
+    },
+    {
+      "name": "streaminfo-length-33",
+      "reason": "STREAMINFO length is not 34",
+      "sha256": "6624267c51b2874fe692c42018c9b24fe6b7aa3aecb1491eba57bca1f147b413"
+    },
+    {
+      "name": "streaminfo-length-35",
+      "reason": "STREAMINFO length is not 34",
+      "sha256": "69cbbf2b5d845a95b8cbbafe7593f00dd0cc691a8d7052a9cbacca5759c5c92a"
+    },
+    {
+      "name": "streaminfo-length-16777215",
+      "reason": "STREAMINFO length is not 34",
+      "sha256": "579dd74b2e790cf7be915825fc391a2cb926968e2da7cfea16c1f2650b2251e7"
+    },
+    {
+      "name": "min-block-zero",
+      "reason": "minimum block size zero",
+      "sha256": "dc32a113ff84385068ab25561d3229d9505f64ffb222e7f18c852f21a9b8a47d"
+    },
+    {
+      "name": "min-block-fifteen",
+      "reason": "minimum block size below 16",
+      "sha256": "cc450089917320ceef0cdfd1d1f7e71f787c009f13c8bafd50bcc923c6ac5b3e"
+    },
+    {
+      "name": "min-block-over-max",
+      "reason": "minimum block exceeds maximum",
+      "sha256": "59c5d9817b70affa70c8ea40a675224bf1de60e483cc5db21f8510b82d0e9dac"
+    },
+    {
+      "name": "max-block-fifteen",
+      "reason": "maximum block size below 16",
+      "sha256": "3d8903bb50d681c0bfbfc496a80395ced5bfc309eb1a723816a8bb023fdb6533"
+    },
+    {
+      "name": "sample-rate-zero",
+      "reason": "sample rate zero",
+      "sha256": "ad9447d4cf6cb2d143cacd765681c98ca468e071c15866092f99a3d66dfd62fa"
+    },
+    {
+      "name": "metadata-type-127",
+      "reason": "reserved metadata type",
+      "sha256": "e889a4fe3526b4a979bc9647016f39eaf2d1c51ae9e67063db56a90ed44a831b"
+    },
+    {
+      "name": "streaminfo-not-first",
+      "reason": "first metadata block is not STREAMINFO",
+      "sha256": "b86b2556ec019a10f54d61bf7af02dcb68acb9331837618814c68203a6383341"
+    },
+    {
+      "name": "unterminated-metadata",
+      "reason": "metadata last flag missing",
+      "sha256": "d21eb8cfb1b904c23b4a3210b08af1dbeb7769931307b7f6b3f905502fbea0ee"
+    },
+    {
+      "name": "metadata-without-frame",
+      "reason": "no audio frame",
+      "sha256": "7e0b85774228f3f6124aaae7ccf16dea6e2df410740f7321cdfabd619377c8be"
+    },
+    {
+      "name": "duplicate-streaminfo",
+      "reason": "duplicate STREAMINFO",
+      "sha256": "5b4fc05fc77b4dea974bb3a89d4d4a93aa6c81541b3bacaf8a3db7d015eae575"
+    },
+    {
+      "name": "declared-sample-mismatch",
+      "reason": "declared sample coverage mismatch",
+      "sha256": "6dd2a94c20809fb969be2a27e22f407ceaa855e4ff507d51528f9640168f0104"
+    },
+    {
+      "name": "nonzero-md5-mismatch",
+      "reason": "STREAMINFO MD5 mismatch",
+      "sha256": "dc73b0ae53f72f9d2c74ece5616e0caf43b27b0109efeb9dc85eb35d455dc1ef"
+    },
+    {
+      "name": "frame-sync",
+      "reason": "frame sync mismatch",
+      "sha256": "897a0f00d7f7156f0ec7cc6a16b5b825d291bc3f9a9b3782867711f69b3e8102"
+    },
+    {
+      "name": "frame-reserved-bit",
+      "reason": "reserved frame bit",
+      "sha256": "873e0a748d6e66e8675134da384d0bdfdeae45e9705a0bfe8c9b6335a6c7d2cd"
+    },
+    {
+      "name": "frame-block-code-zero",
+      "reason": "reserved block-size code",
+      "sha256": "b7e5650018ea26e3a0906cd2ca79237374f8b82a001afbd34c6df98dfcab2898"
+    },
+    {
+      "name": "frame-rate-code-15",
+      "reason": "reserved sample-rate code",
+      "sha256": "970ef9fc87e61e3a22a45fe1674c4962ee12509bcf7d804873834b7dcf57ac17"
+    },
+    {
+      "name": "frame-channel-code-11",
+      "reason": "reserved channel assignment",
+      "sha256": "276ea1e63eca02c9a320ce65adb9ce866993a860959a0dadc64a92fb2f7b1863"
+    },
+    {
+      "name": "frame-depth-code-3",
+      "reason": "reserved sample-depth code",
+      "sha256": "635883f0caa6e2cc87fc71a23b3b17d2afacc9227d17f73366263f0c14afa58c"
+    },
+    {
+      "name": "frame-fourth-reserved",
+      "reason": "reserved frame-header bit",
+      "sha256": "c2fd56bcdce2773b5c1776541843b15db8d14d0155fc5488c42b7e452791617f"
+    },
+    {
+      "name": "frame-crc8",
+      "reason": "frame-header CRC-8 mismatch",
+      "sha256": "b2a2a241bc7c8f4bba1d57235061c5da1023fa42a587ebb3f500a04a0a65d1b4"
+    },
+    {
+      "name": "frame-crc16",
+      "reason": "frame CRC-16 mismatch",
+      "sha256": "90525c18f92827c3bfc06ea2fa7af07a935e6d628a93223d8f019108e3cf2ee1"
+    },
+    {
+      "name": "truncated-frame-tail-1",
+      "reason": "truncated frame field",
+      "sha256": "0139c1caa8237c60eb48cfa258bff2babdfba13af5ee168434efc9a13366426c"
+    },
+    {
+      "name": "truncated-frame-tail-2",
+      "reason": "truncated frame field",
+      "sha256": "a1ed58c00a93213f32e98cf25ed7a1ae789d7c758d719080c2d952a7c947eecd"
+    },
+    {
+      "name": "truncated-frame-tail-3",
+      "reason": "truncated frame field",
+      "sha256": "44e547207d5257229bb912768da54ae3cf16c72af6081a878961998b5bb3c87c"
+    },
+    {
+      "name": "truncated-frame-tail-4",
+      "reason": "truncated frame field",
+      "sha256": "129a360467aae3c36876138f1d247b99179d62ec5c1fdbda2c30e719e8b87761"
+    },
+    {
+      "name": "truncated-frame-tail-5",
+      "reason": "truncated frame field",
+      "sha256": "632313c2aab36a26d20bb1f3c8a22b29108b427d0ed31f97981325c1e3e45bf0"
+    },
+    {
+      "name": "truncated-frame-tail-6",
+      "reason": "truncated frame field",
+      "sha256": "24dcd736d8adbcef6c3e61c25fb4b90ea4295de5e7b904e4216c4d768a1d99b5"
+    },
+    {
+      "name": "truncated-frame-tail-7",
+      "reason": "truncated frame field",
+      "sha256": "77bca0134c07e3223becd7155ac25f42386fb08b91b0302c68cfb8cc8c8f3bb8"
+    },
+    {
+      "name": "truncated-frame-tail-8",
+      "reason": "truncated frame field",
+      "sha256": "53f44daf3ee99d91399fc55626b734073c8bc39202c5e3a7e23bf17e21720b23"
+    },
+    {
+      "name": "truncated-frame-tail-9",
+      "reason": "truncated frame field",
+      "sha256": "f708b8e356172562e0a64bbd6ae190f79fa6a3b7835ca4cfef2dbc41c8a6142e"
+    },
+    {
+      "name": "truncated-frame-tail-10",
+      "reason": "truncated frame field",
+      "sha256": "ad9b76adb4c873a631cfa29d80f5d6f4866a0b40c179cd483938a095228a0a46"
+    },
+    {
+      "name": "truncated-frame-tail-11",
+      "reason": "truncated frame field",
+      "sha256": "5a103ce43711230f485a0559789bb04e305494be3f08e42fa22b4be4b1985b6e"
+    },
+    {
+      "name": "truncated-frame-tail-12",
+      "reason": "truncated frame field",
+      "sha256": "2f48f5c7172dd21bda650137eeda2be16ef70473f081fbd4ac6a5430d65d0f1c"
+    },
+    {
+      "name": "trailing-zero",
+      "reason": "trailing byte",
+      "sha256": "3fd1fb741386f418bc4db4b897948f9ca5427b5610284b37efdf1e2937dc770f"
+    },
+    {
+      "name": "trailing-frame-prefix",
+      "reason": "truncated extra frame",
+      "sha256": "ec673b3e0d955d907fbfdc2ec9b8f5a9251eb11b80f236f43df8fa2034cadf46"
+    },
+    {
+      "name": "subframe-bit-corruption-0",
+      "reason": "subframe or payload corruption",
+      "sha256": "a26a8206cfd78e286939257c624327813a96cdaf7c06d424991e42e199552c42"
+    },
+    {
+      "name": "subframe-bit-corruption-1",
+      "reason": "subframe or payload corruption",
+      "sha256": "4a71f46cd2cc416b4fba1b897814e26392b462469fb2a1598d10b8711841a786"
+    },
+    {
+      "name": "subframe-bit-corruption-2",
+      "reason": "subframe or payload corruption",
+      "sha256": "b94d35eaf327b3f05c90db13b302899dfd8ee0dedc88d533899ae6fd24aea639"
+    },
+    {
+      "name": "subframe-bit-corruption-3",
+      "reason": "subframe or payload corruption",
+      "sha256": "85dc3d1e541275f5763d77578568a85cef0ffad86b6c38f59a78d617364963c4"
+    },
+    {
+      "name": "subframe-bit-corruption-4",
+      "reason": "subframe or payload corruption",
+      "sha256": "5d88364c6bf37140302874987c1508ebe9d6f822ff8eaf7f0d742fac77d468e9"
+    },
+    {
+      "name": "subframe-bit-corruption-5",
+      "reason": "subframe or payload corruption",
+      "sha256": "9df1c8d316241bdaa5c668c2bcc60384d059e2b16a7cc81d4f48221932bc6b37"
+    },
+    {
+      "name": "subframe-bit-corruption-6",
+      "reason": "subframe or payload corruption",
+      "sha256": "979ff724613f3a69806c9d6ff354137a0391eee77671b8e9d30d2370508b72f8"
+    },
+    {
+      "name": "subframe-bit-corruption-7",
+      "reason": "subframe or payload corruption",
+      "sha256": "3b00067dd3df6515e26f983aa2b432ae9b6df3d611c409f7f531e4606484f014"
+    },
+    {
+      "name": "frame-reserved-sync-bit-repaired",
+      "reason": "reserved frame-header sync bit",
+      "sha256": "e3c1340904960184ca985ec82fe0e83e273c409af958ef138a3c90c7be0ce36c"
+    },
+    {
+      "name": "frame-channel-property-change",
+      "reason": "channel count differs from STREAMINFO",
+      "sha256": "097cac15b7ffd8f8056c48cd6a0b157f8f92297fb8c930cdaf61101e3eda050b"
+    },
+    {
+      "name": "frame-depth-property-change",
+      "reason": "bit depth differs from STREAMINFO",
+      "sha256": "52c0dd6715d3ea203c42dc7f51c017592b7d39512ea9344ab98bd639bf2d8fce"
+    },
+    {
+      "name": "frame-number-gap",
+      "reason": "fixed-block frame number is not sequential",
+      "sha256": "ec7a68346dd8c418a7206a320849e9f9ba7f87355142013dbc4ecbc4e5800b08"
+    },
+    {
+      "name": "frame-block-over-stream-max",
+      "reason": "block exceeds STREAMINFO maximum",
+      "sha256": "85180c4c72d17379105d7080efac4138a92f714e78d42341c93bee20dc5524c5"
+    },
+    {
+      "name": "frame-rate-property-change",
+      "reason": "sample rate differs from STREAMINFO",
+      "sha256": "87529f7fd52c7881310df843d8e8b8b174e48b00139a7d07c571c3796173965a"
+    },
+    {
+      "name": "subframe-zero-padding-bit",
+      "reason": "subframe header zero bit is one",
+      "sha256": "ddf7cad0fcd12beed26d326c81a2a88c2c08d03565cbfcc534d2c7e9904c8eb0"
+    },
+    {
+      "name": "subframe-reserved-type-2",
+      "reason": "reserved subframe type 2",
+      "sha256": "9b22c39888c506734291ef6e19883839eb8d319eeaa8197458704611395f6c86"
+    },
+    {
+      "name": "subframe-reserved-type-7",
+      "reason": "reserved subframe type 7",
+      "sha256": "bcc73fcfb377523ac95a97d8da861ca2a951ea66d023b2e3b02344fc1db9d6a9"
+    },
+    {
+      "name": "subframe-reserved-type-13",
+      "reason": "reserved subframe type 13",
+      "sha256": "f0a3401da5a090f40e27ac6821f83a57506791c1da25277c6ef6858368d57a55"
+    },
+    {
+      "name": "residual-method-reserved-2",
+      "reason": "reserved residual coding method 2",
+      "sha256": "6d7694db064ffffe575e61a6c06ab35e36483e7555e4a063c4782a624ad88706"
+    },
+    {
+      "name": "residual-method-reserved-3",
+      "reason": "reserved residual coding method 3",
+      "sha256": "38f9bd38b2b2c002a980211a2091092f09024a4e10dd778d485bfe67881986ae"
+    },
+    {
+      "name": "residual-partition-not-divisible",
+      "reason": "Rice partition count does not divide block size",
+      "sha256": "d3d35081a6b18c09c70aa9d185e308a25bc8a40ffabc58a225f83b761237512f"
+    },
+    {
+      "name": "coded-number-overlong-repaired",
+      "reason": "nonminimal two-byte coded frame number",
+      "sha256": "1b451346c22e9b403139172a9f9ecf794fd5c3fce620880774b02883b0dc12b8"
+    },
+    {
+      "name": "coded-number-bad-continuation-repaired",
+      "reason": "coded frame number continuation byte lacks 10 prefix",
+      "sha256": "358a2d36546e2dff6a01ab49a240fb9193cb8642b2995c9ffbfb9506348971a7"
+    },
+    {
+      "name": "lpc-precision-16",
+      "reason": "reserved LPC precision field",
+      "sha256": "df809cc73ceecf587f1620de3fce7419a3efb12a60ac85436a6ff8df837328f2"
+    },
+    {
+      "name": "lpc-negative-shift",
+      "reason": "negative LPC shift rejected by the DSPark arithmetic contract",
+      "sha256": "5dbfafc51181e1fe35b87e1492bb8ecb9fea64b752c28ab8c42384d85d3ea125"
+    },
+    {
+      "name": "subframe-nonzero-byte-padding",
+      "reason": "nonzero frame-alignment padding bit",
+      "sha256": "e8a6fe3eca2c3e8a4216d7cb949e1f4b19bea76115ad8b426c21f289f8d85852"
+    },
+    {
+      "name": "variable-sample-overlap",
+      "reason": "variable frame overlaps prior coverage",
+      "sha256": "a0000331135a0deceb71793fac1584e370640b08db6911620843704b342695e5"
+    },
+    {
+      "name": "variable-sample-gap",
+      "reason": "variable frame leaves a coverage gap",
+      "sha256": "561946d4231a6cd18a22b107d0c3356dc8d70a9e287cbe619939163a2ff3afed"
+    },
+    {
+      "name": "mixed-blocking-strategy",
+      "reason": "blocking strategy changes between frames",
+      "sha256": "5f5b4dfe80b1b388d4b0f60556d348db5dd5499396535fefbaee7ead32a54ac4"
+    },
+    {
+      "name": "changing-frame-sample-rate",
+      "reason": "second frame changes sample rate",
+      "sha256": "614baaee0923296a5011f747f57b678a09d8700f4dd4440c751b0424fa841a71"
+    },
+    {
+      "name": "streaminfo-min-frame-too-large",
+      "reason": "actual frame is smaller than STREAMINFO minimum",
+      "sha256": "1b2e9909921d82014a7f362867b44be2c0ffa9337e5e5e6d75db84590b048fce"
+    },
+    {
+      "name": "streaminfo-max-frame-too-small",
+      "reason": "actual frame is larger than STREAMINFO maximum",
+      "sha256": "0ed0c7e6627525fdb274f1cb9ec5902ca832ed6dc89f3ebea5795cfd58504436"
+    },
+    {
+      "name": "streaminfo-frame-min-over-max",
+      "reason": "STREAMINFO minimum frame size exceeds maximum",
+      "sha256": "06e6be836380f403f26e20bb2958a1db6701f749183cfe69a3785668e18ddc82"
+    },
+    {
+      "name": "streaminfo-bit-depth-three",
+      "reason": "STREAMINFO bit depth is below four",
+      "sha256": "49619a89ca91e2d7fcbd028d458c1e7624468d789c1b3b0eaf186f953fcd5b2b"
+    },
+    {
+      "name": "streaminfo-sample-policy-over",
+      "reason": "declared sample count exceeds the public policy",
+      "sha256": "45391788b3d0833b6c200d92e740f91ed8b77621f932534eee940913692ed1f0"
+    },
+    {
+      "name": "rice-unary-cap-over",
+      "reason": "Rice unary quotient exceeds the public parser policy by one",
+      "sha256": "2ba4969b38ea734807f79117cad57015366cd5b1a8138253776d21778c99760c"
+    }
+  ]
+}

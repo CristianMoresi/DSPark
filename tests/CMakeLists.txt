@@ -5,7 +5,7 @@
 #   ctest --test-dir build --output-on-failure
 #
 # Four targets:
-#   dspark_tests            the suite proper (630+ cases, zero dependencies)
+#   dspark_tests            the suite proper (830+ cases, zero dependencies)
 #   dspark_alloc_failure    allocation-failure injection, deliberately apart
 #   dspark_standalone       compile gate: umbrella header alone, float + double
 #   dspark_smoke            every effect at defaults, checked for NaN/Inf/runaway
@@ -46,6 +46,9 @@ add_executable(dspark_tests
 
 add_executable(dspark_standalone standalone_compile_test.cpp)
 add_executable(dspark_smoke      functional_smoke_test.cpp)
+
+target_compile_definitions(dspark_tests PRIVATE
+    DSPARK_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 
 # Allocation-failure injection is a separate executable, not one more source
 # file of dspark_tests. Its translation unit defines replacement operator

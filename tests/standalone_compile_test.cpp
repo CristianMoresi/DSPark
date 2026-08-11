@@ -137,11 +137,9 @@ void instantiate()
 #endif
 }
 
+template void instantiate<float>();
+template void instantiate<double>();
+
 } // namespace
 
-int main()
-{
-    instantiate<float>();
-    instantiate<double>();
-    return 0;
-}
+int main() { return 0; }

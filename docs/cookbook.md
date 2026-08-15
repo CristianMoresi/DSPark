@@ -510,3 +510,71 @@ last value through silence instead of falling. A caller that needs to tell
 `BeatTracker` consumes `OnsetDetector`'s onset-strength envelope, so if you
 want onsets too, take them from `getOnsetDetector()` rather than running a
 second copy of the same analysis.
+
+## 14. Freeze a chord into an endless pad
+
+`SpectralFreeze` captures the sound that is playing and sustains it as long
+as you hold the request: the frequency-domain counterpart to
+`GranularProcessor`'s time-domain grain freeze. In tonal mode the captured
+partials keep advancing at their own measured frequencies with the phase
+relations of the source locked in place, so a held piano chord stays a chord.
+Diffuse mode rotates every bin by a deterministic random sequence instead,
+which turns the same capture into a wash that never repeats yet renders the
+same on every run.
+
+```cpp
+dspark::SpectralFreeze<float> freeze;
+freeze.prepare(spec);                       // N = 2048 by default; latency N
+
+// Audio thread: always in the chain. Live input passes through untouched.
+freeze.processBlock(io);
+
+// Any thread, e.g. a pedal or a MIDI note:
+freeze.setFrozen(true);                     // capture and hold, ~N/4 later
+freeze.setPhaseMode(
+    dspark::SpectralFreeze<float>::PhaseMode::Diffuse);  // next capture
+freeze.setFrozen(false);                    // glide back to the live input
+```
+
+Enter and exit are a single spectral crossfade of `getTransitionSamples()`
+(= N) samples, so there is no click in either direction, and toggling the
+request mid-transition just reverses the glide without recapturing. A mode
+change while frozen is remembered and applies at the next capture; the
+running hold never switches texture underneath you. Both setters are
+lock-free and safe from any thread.
+
+## 15. Find where a recording loops cleanly
+
+`LoopFinder` answers "between which two samples can this sustain loop
+without a seam?" It is an offline search -- run it when loading a sample,
+not on the audio thread -- and it is explicit about failure: a result with
+`status != Success` carries no plausible-looking endpoints to misuse.
+
+```cpp
+dspark::LoopFinder<float> finder;
+dspark::LoopFinder<float>::Settings settings;   // W 1024, fade 256 defaults
+
+const auto loop = finder.find(sustain.toView(),
+                              { 40000, 90000 },   // where the loop may start
+                              { 200000, 260000 }, // where it may end
+                              80000, 220000,      // loop length bounds
+                              settings);
+if (loop)
+{
+    dspark::AudioBuffer<float> cycle;
+    cycle.resize(sustain.getNumChannels(),
+                 static_cast<int>(loop.renderedLength()));
+    if (dspark::LoopFinder<float>::renderLoop(sustain.toView(), loop,
+                                              cycle.toView())
+            == dspark::LoopFinder<float>::Status::Success)
+        playForever(cycle);                 // end-to-start is now seamless
+}
+```
+
+The search scores every candidate pair on three things at once -- waveform
+match, slope match and spectral similarity -- so silence, DC or a loud-but-
+different section cannot win, and it refuses (`NoAcceptableLoop`) rather
+than return a bad splice. `renderLoop()` writes one cycle of
+`end - start - crossfadeLength` samples whose last sample flows into its
+first: the overlap is an equal-power crossfade renormalized so correlated
+material keeps unit gain instead of the raw +3 dB center bulge.

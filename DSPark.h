@@ -384,6 +384,7 @@
  * | `TubePreamp<T>`          | Effects/TubePreamp.h  | Koren 12AX7 stages, WDF FMV tone stack (R-type), supply sag       |
  * | `TransformerModel<T>`    | Effects/TransformerModel.h | Audio transformer: flux-domain JA hysteresis, LF bloom, HF bell |
  * | `GranularProcessor<T>`   | Effects/GranularProcessor.h | Granular clouds/freeze: per-grain pitch, jitter, stereo spread |
+ * | `SpectralFreeze<T>`      | Effects/SpectralFreeze.h | Tonal or diffuse STFT magnitude hold with deterministic transitions |
  * | `SpectralDenoiser<T>`    | Effects/SpectralDenoiser.h | Learnable-profile spectral gating noise reduction |
  * | `ChordDetector<T>`       | Music/ChordDetector.h     | Goertzel chroma + template chord recognition with confidence |
  * | `KeyDetector<T>`         | Music/KeyDetector.h       | Musical key estimation: accumulated chroma against published key profiles |
@@ -413,6 +414,7 @@
  * | `OnsetDetector<T>`       | Analysis/OnsetDetector.h  | Causal SuperFlux onset detection (Boeck-2012 picker, shared beat front-end) |
  * | `BeatTracker<T>`         | Analysis/BeatTracker.h    | Tempo and beat tracking: offline dynamic programming plus a causal resonator bank |
  * | `LoudnessNormalizer<T>`  | Analysis/LoudnessNormalizer.h | Offline LUFS-target normalisation under a BS.1770 true-peak ceiling |
+ * | `LoopFinder<T>`          | Analysis/LoopFinder.h     | Bounded offline loop-point search and normalized equal-power seam rendering |
  *
  * @subsection classes_io File I/O
  *
@@ -735,6 +737,7 @@
 #include "Effects/TubePreamp.h"
 #include "Effects/TransformerModel.h"
 #include "Effects/GranularProcessor.h"
+#include "Effects/SpectralFreeze.h"
 #include "Effects/SpectralDenoiser.h"
 
 // === Analysis ===============================================================
@@ -750,6 +753,7 @@
 #include "Analysis/OnsetDetector.h"
 #include "Analysis/BeatTracker.h"
 #include "Analysis/LoudnessNormalizer.h"
+#include "Analysis/LoopFinder.h"
 
 // === I/O ====================================================================
 // File I/O uses <fstream>/<filesystem>, which do not exist on bare-metal

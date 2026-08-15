@@ -572,7 +572,20 @@ void runSmokeTests()
         auto p = std::make_shared<dspark::SpectralDenoiser<float>>();
         p->prepare(spec); p->setReduction(12.0f);
         return std::function<void(V)>([p](V b) { p->processBlock(b); });
-    }});    cases.push_back({ "TransformerModel", [&] {
+    }});
+    cases.push_back({ "SpectralFreezeLive", [&] {
+        auto p = std::make_shared<dspark::SpectralFreeze<float>>();
+        p->prepare(spec);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "SpectralFreezeHold", [&] {
+        auto p = std::make_shared<dspark::SpectralFreeze<float>>();
+        p->setFrozen(true);
+        p->setPhaseMode(dspark::SpectralFreeze<float>::PhaseMode::Diffuse);
+        p->prepare(spec);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "TransformerModel", [&] {
         auto p = std::make_shared<dspark::TransformerModel<float>>();
         p->prepare(spec); p->setDrive(9.0f);
         return std::function<void(V)>([p](V b) { p->processBlock(b); });
@@ -639,6 +652,70 @@ void runSmokeTests()
     {
         auto proc = c.make();
         check(smokeRun(proc, 48000.0, 512, 40, 60, c.isGenerator), "smoke", c.name);
+    }
+
+    // LoopFinder is offline rather than a block processor: one bounded search
+    // over a planted seam, one transactional render, and the documented
+    // failure payload for a search that cannot succeed.
+    {
+        constexpr int loopSamples = 4096;
+        constexpr int plantedStart = 512;
+        constexpr int plantedEnd = 2949;
+        constexpr int contextLength = 256;
+        std::vector<float> source(static_cast<size_t>(loopSamples));
+        for (int i = 0; i < loopSamples; ++i)
+            source[static_cast<size_t>(i)] = static_cast<float>(
+                0.4 * std::sin(2.0 * kPiConf * 0.019 * i)
+                + 0.1 * std::sin(2.0 * kPiConf * 0.077 * i + 0.3));
+        for (int i = 0; i < contextLength; ++i)
+            source[static_cast<size_t>(plantedEnd - contextLength + i)] =
+                source[static_cast<size_t>(plantedStart + i)];
+
+        dspark::LoopFinder<float> finder;
+        dspark::LoopFinder<float>::Settings settings;
+        settings.comparisonLength = 256;
+        settings.crossfadeLength = 64;
+        settings.coarseStride = 16;
+        settings.refinementRadius = 15;
+        const float* pointer = source.data();
+        dspark::AudioBufferView<const float> view(&pointer, 1, loopSamples);
+        const auto loop = finder.find(view, { plantedStart - 64, plantedStart + 64 },
+                                      { plantedEnd - 64, plantedEnd + 64 },
+                                      2000, 2600, settings);
+        check(static_cast<bool>(loop) && loop.start == plantedStart
+                  && loop.end == plantedEnd,
+              "smoke", "LoopFinder planted seam recovery");
+
+        bool renderOk = false;
+        if (loop)
+        {
+            std::vector<float> rendered(
+                static_cast<size_t>(loop.renderedLength()), 0.0f);
+            float* renderPointer = rendered.data();
+            dspark::AudioBufferView<float> output(
+                &renderPointer, 1, static_cast<int>(rendered.size()));
+            renderOk = dspark::LoopFinder<float>::renderLoop(view, loop, output)
+                    == dspark::LoopFinder<float>::Status::Success
+                && rendered.front() == source[static_cast<size_t>(
+                       plantedEnd - settings.crossfadeLength)];
+            for (const float sample : rendered)
+                if (!std::isfinite(sample)) renderOk = false;
+        }
+        check(renderOk, "smoke", "LoopFinder transactional render");
+
+        const auto silence = [&] {
+            std::vector<float> zero(static_cast<size_t>(loopSamples), 0.0f);
+            const float* zeroPointer = zero.data();
+            dspark::AudioBufferView<const float> zeroView(&zeroPointer, 1,
+                                                          loopSamples);
+            return finder.find(zeroView, { 0, 64 }, { 2900, 2964 }, 2000, 2964,
+                               settings);
+        }();
+        check(silence.status
+                      == dspark::LoopFinder<float>::Status::InsufficientActivity
+                  && silence.start == 0 && silence.end == 0
+                  && silence.renderedLength() == 0,
+              "smoke", "LoopFinder canonical failure payload");
     }
 }
 
@@ -1778,6 +1855,12 @@ std::vector<MetricsCase> buildMetricsCases()
       add("SpectralDenoiser", "reduction 12 dB", "",
           [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
 
+    { auto p = std::make_shared<dspark::SpectralFreeze<float>>();
+      p->prepare(spec);
+      add("SpectralFreeze", "live path, N 2048, hop 512",
+          "hold engages on request; the live path is measured",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
+
     { auto p = std::make_shared<dspark::AlgorithmicReverb<float>>();
       p->prepare(spec); p->setType(dspark::AlgorithmicReverb<float>::Type::Hall);
       p->setMix(0.4f);
@@ -1906,6 +1989,49 @@ void writeAnalysisAccuracy(FILE* out)
     std::fprintf(out,
         "| `BeatTracker` confidence | same | lowest reported over the sweep |"
         " %.3f |\n", lowestConfidence);
+    // LoopFinder: recovery of a planted seam whose exact endpoints are known,
+    // plus the seam cost the search reports for that exact splice.
+    {
+        constexpr int loopLength = 8192;
+        constexpr int plantedStart = 1024;
+        constexpr int plantedEnd = 5893;
+        constexpr int contextLength = 512;
+        std::vector<float> source(static_cast<size_t>(loopLength));
+        for (int i = 0; i < loopLength; ++i)
+            source[static_cast<size_t>(i)] = static_cast<float>(
+                0.30 * std::sin(2.0 * kPiConf * 0.0173 * i)
+                + 0.12 * std::sin(2.0 * kPiConf * 0.0611 * i + 0.7)
+                + 0.05 * std::sin(2.0 * kPiConf * 0.1937 * i + 1.9));
+        for (int i = 0; i < contextLength; ++i)
+            source[static_cast<size_t>(plantedEnd - contextLength + i)] =
+                source[static_cast<size_t>(plantedStart + i)];
+
+        dspark::LoopFinder<float> finder;
+        dspark::LoopFinder<float>::Settings settings;
+        settings.comparisonLength = 512;
+        settings.crossfadeLength = 128;
+        settings.coarseStride = 32;
+        settings.refinementRadius = 31;
+        const float* pointer = source.data();
+        dspark::AudioBufferView<const float> view(&pointer, 1, loopLength);
+        const auto loop = finder.find(view, { plantedStart - 96, plantedStart + 96 },
+                                      { plantedEnd - 96, plantedEnd + 96 },
+                                      4000, 5500, settings);
+        const bool exact = static_cast<bool>(loop)
+            && loop.start == plantedStart && loop.end == plantedEnd;
+        std::fprintf(out,
+            "| `LoopFinder` endpoints | three-tone texture, planted %d-sample"
+            " loop | endpoint recovery | %s |\n",
+            plantedEnd - plantedStart, exact ? "exact" : "MISSED");
+        std::fprintf(out,
+            "| `LoopFinder` seam cost | same | reported normalized cost at the"
+            " planted splice | %.2e |\n",
+            exact ? static_cast<double>(loop.seamCost) : 1.0);
+        std::printf("TABLE %-26s recovery %s  seam cost %.2e\n", "LoopFinder",
+                    exact ? "exact" : "MISSED",
+                    exact ? static_cast<double>(loop.seamCost) : 1.0);
+    }
+
     std::fprintf(out,
         "\nThe tempo figures are the WORST point of the sweep with its sign, not an"
         " average and not an endpoint: a tracker's error is not monotonic in tempo,"

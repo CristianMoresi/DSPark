@@ -2,11 +2,11 @@
   <img src="docs/img/dspark-gh.png" alt="DSPark - A header-only audio DSP framework in pure C++20" width="100%">
 </p>
 
-**v1.6.1** — 90+ headers of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins (effects and MIDI instruments) with HTML/CSS/JS editors.
+**v1.6.1** — 99 headers of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins (effects and MIDI instruments) with HTML/CSS/JS editors.
 
 **📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
-CI runs a 630-case test suite and the public conformance suite on every commit across Windows (MSVC, x64 and ARM64), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus AddressSanitizer/UBSan, an exceptions-free embedded profile and a single-header amalgamation. Loudness is validated against the official EBU R128 test vectors, and a [per-processor quality metrics table](docs/metrics.md) (THD+N, noise floor, spurious/aliasing, latency) is generated from the measurements.
+CI runs an 857-case test suite and the public conformance suite on every commit across Windows (MSVC, x64 and ARM64), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus AddressSanitizer/UBSan, an exceptions-free embedded profile and a single-header amalgamation. Loudness is validated against the official EBU R128 test vectors, and a [per-processor quality metrics table](docs/metrics.md) (THD+N, noise floor, spurious/aliasing, latency) is generated from the measurements.
 
 ```cpp
 #include "DSPark/DSPark.h"
@@ -78,7 +78,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 
 ## What's Included
 
-### Effects (37 processors)
+### Effects (38 processors)
 
 | Class | Description |
 |---|---|
@@ -117,7 +117,8 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `TransformerModel<T>` | Audio transformer coloration: flux-domain Jiles-Atherton core (distortion rises as frequency falls — the LF "bloom"), magnetizing-inductance corner, HF resonance bell |
 | `PitchShifter<T>` | Phase vocoder with identity phase locking (Laroche-Dolson), exact tuning, transient phase reset, **formant preservation** (cepstral lift), stereo-coherent |
 | `TimeStretch<T>` | Tempo change without pitch change: identity-phase-locked phase vocoder, exact ratio with no drift, **spectral-flux onset detection with a transient-locked hop** (strikes keep the input's own sharpness instead of doubling), streaming and whole-signal paths |
-| `GranularProcessor<T>` | 64-grain clouds over live input: per-grain pitch/pan/jitter, freeze, equal-power spread |
+| `GranularProcessor<T>` | 64-grain clouds over live input: per-grain pitch/pan/jitter, time-domain grain-history freeze, equal-power spread |
+| `SpectralFreeze<T>` | Spectral hold: captures the playing STFT frame and sustains it with peak-locked tonal or deterministic diffuse phase evolution, click-free enter/exit |
 | `SpectralDenoiser<T>` | Learnable-noise-profile spectral gating with the standard musical-noise defenses |
 
 ### Core (40 building blocks)
@@ -167,7 +168,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `AnalogConstants` | Reference constants from analog-hardware research (zero runtime cost) |
 | `ProcessorTraits` | C++20 concepts: `AudioProcessor`, `SampleProcessor`, `GeneratorProcessor` |
 
-### Analysis (9 analyzers)
+### Analysis (11 analyzers)
 
 | Class | Description |
 |---|---|
@@ -181,6 +182,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `PhaseCorrelation<T>` | Stereo correlation/balance meter with a goniometer (vectorscope) point feed |
 | `OnsetDetector<T>` | Causal SuperFlux onset detection (log-filtered spectral flux, vibrato-suppressing max filter, Boeck-2012 adaptive peak picker); shared front-end for beat tracking |
 | `BeatTracker<T>` | Tempo and beat tracking over that same envelope: offline dynamic-programming beat grid, causal resonator-bank tempo and beat phase, confidence and a secondary metrical hypothesis |
+| `LoopFinder<T>` | Offline loop-point search: bounded coarse-plus-refinement scan with a waveform/derivative/spectral seam cost, normalized equal-power seam rendering |
 
 ### I/O (5 interfaces and file handlers)
 
@@ -433,12 +435,12 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 DSPark/
 ├── DSPark.h                 # Single umbrella include + full documentation
 ├── Core/          (41)      # Building blocks: filters, FFT, WDF, oscillators, SIMD
-├── Effects/       (36)      # Ready-to-use processors: EQ, compressor, reverb, tape...
-├── Analysis/       (9)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation, onset
+├── Effects/       (38)      # Ready-to-use processors: EQ, compressor, reverb, tape...
+├── Analysis/      (12)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation, onset
 ├── IO/             (5)      # WAV/MP3, Standard MIDI and native FLAC I/O
-├── Music/          (2)      # Harmony constants + real-time chord detection
+├── Music/          (3)      # Harmony constants + real-time chord and key detection
 ├── plugin/                  # Native plugin layer: VST3, CLAP, AU + WebView editor
-├── tests/                   # Test suite: 830+ cases, zero dependencies
+├── tests/                   # Test suite: 857 cases, zero dependencies
 ├── conformance/             # Public conformance suite (runs in CI)
 ├── docs/                    # Cookbook, plugin guide, threading model, metrics
 ├── examples/                # WAV processing, channel strip, plugins, templates

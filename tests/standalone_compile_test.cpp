@@ -69,6 +69,7 @@ void instantiate()
     FrequencyShifter<T> fs;
     Gain<T> g;
     GranularProcessor<T> gran;
+    SpectralFreeze<T> spectralFreeze;
     Limiter<T> lim;
     MultibandCompressor<T> mbc;
     NoiseGate<T> ngt;
@@ -100,6 +101,7 @@ void instantiate()
     SpectrumAnalyzer<T> sa;
     OnsetDetector<T> onset;
     BeatTracker<T> beats;
+    LoopFinder<T> loopFinder;
 
 #ifndef DSPARK_NO_FILE_IO
     // -- File I/O ------------------------------------------------------------
@@ -123,13 +125,14 @@ void instantiate()
     (void)svf; (void)tpd; (void)ws; (void)wto; (void)zlc;
     (void)ar; (void)ag; (void)ch; (void)clip; (void)cmp; (void)xfade; (void)cf;
     (void)dcb; (void)dee; (void)dly; (void)deq; (void)eq; (void)ex;
-    (void)filterEngine; (void)fs; (void)g; (void)gran; (void)lim; (void)mbc;
+    (void)filterEngine; (void)fs; (void)g; (void)gran; (void)spectralFreeze;
+    (void)lim; (void)mbc;
     (void)ngt; (void)ng; (void)pan; (void)phr; (void)pitchShift; (void)rev;
     (void)rm; (void)sat; (void)denoiser; (void)sw; (void)tape; (void)xfmr;
     (void)td; (void)tr; (void)tube; (void)vib;
     (void)envFollow; (void)goe; (void)lvl; (void)ldm; (void)ldn;
     (void)phaseCorr;
-    (void)pd; (void)pitchFollow; (void)sa; (void)onset;
+    (void)pd; (void)pitchFollow; (void)sa; (void)onset; (void)loopFinder;
     (void)chords; (void)keys;
 #ifndef DSPARK_NO_FILE_IO
     (void)audioFileInfo; (void)wavFile; (void)mp3File; (void)midiFile;

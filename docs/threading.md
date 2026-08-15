@@ -57,14 +57,16 @@ lock-free on every supported target and outside the census.
 That is a run-time census of the word types. It is **not** a compile-time check
 on your component, and the build will not stop you using a word the census
 never saw. Where the word type is a template parameter the census cannot reach
-it at all. Eight headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
+it at all. Nine headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
 `Analysis/BeatTracker.h`, `Effects/AutoGain.h`, `Effects/Equalizer.h`,
-`Effects/DynamicEQ.h`, `Effects/detail/PhaseVocoderEngine.h`,
+`Effects/DynamicEQ.h`, `Effects/SpectralFreeze.h`,
+`Effects/detail/PhaseVocoderEngine.h`,
 `Effects/TimeStretch.h` and `Music/KeyDetector.h` -- and
 most of the headers that declare such an atomic do not.
-Six of the eight are pinning a word whose
+Six of the nine are pinning a word whose
 type is a template parameter, which is the case the census cannot reach;
-`Analysis/BeatTracker.h` and `Music/KeyDetector.h` publish concrete widths that
+`Analysis/BeatTracker.h`, `Effects/SpectralFreeze.h` and `Music/KeyDetector.h`
+publish concrete widths that
 the census does cover, and pin them anyway, because a compile-time assertion at
 the declaration is a stronger statement than a run-time one in another file and
 it is the declaration that a later edit changes. A new component with an atomic
@@ -239,6 +241,27 @@ reason: they travel control-to-audio, and half of one range combined with half
 of the next is a range nobody asked for, which the audio thread would then
 search. Packing is what lets that setter stay allocation-free and callable while
 the stream runs.
+
+`Effects/SpectralFreeze.h` packs its two requested controls -- the freeze
+request and the phase mode -- into one `std::atomic<std::uint32_t>` for that
+same control-to-audio reason, plus one of its own: the word is a state latch,
+not an event queue. `setFrozen()` and `setPhaseMode()` each perform one relaxed
+read-modify-write on the packed word and may be called from any thread; the
+stream owner loads the word exactly once per completed all-channel STFT frame,
+so requests landing between frame boundaries coalesce to the latest word and
+are adopted together at the next frame. `isFrozen()` and `getPhaseMode()`
+report the requested bits, deliberately not transition progress -- there is no
+cross-thread active-state readout to catch mid-glide. `prepare()` and `reset()`
+keep the usual setup ownership and preserve the requested word, like any other
+parameter.
+
+`Analysis/LoopFinder.h` sits outside the audio-thread contract altogether: the
+loop search is an offline operation. `find()` may allocate bounded scratch and
+take real time on a long file, so it belongs on a worker or loading thread, one
+caller owning the instance for the duration of the search; `renderLoop()` is
+allocation-free and validates everything before its first write, but it is
+offline all the same. Neither has cross-thread setters, because there is
+nothing to publish: every argument arrives in the call.
 
 ## Pointers returned across threads
 

@@ -14,6 +14,7 @@
 
 #include "../DSPark.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -224,6 +225,101 @@ int testAll()
     catch (const std::exception& e)
     {
         std::printf("FAIL %-18s exception: %s\n", "OnsetDetector", e.what());
+        ++failed;
+    }
+
+    // SpectralFreeze changes behavior on a control request, so the plain
+    // Slot loop cannot cover its held state: run the live path, request the
+    // hold mid-stream, and require finite bounded output in both states.
+    try
+    {
+        SpectralFreeze<float> freeze;
+        freeze.prepare(spec);
+        bool freezeFailed = false;
+        for (int b = 0; b < 24 && !freezeFailed; ++b)
+        {
+            if (b == 12) freeze.setFrozen(true);
+            fillSine(buf, b * kBlockSize);
+            freeze.processBlock(buf.toView());
+            std::string reason;
+            if (isUnsafe(buf, 4.0f, reason))
+            {
+                std::printf("FAIL %-18s block %d: %s\n", "SpectralFreeze", b,
+                            reason.c_str());
+                ++failed;
+                freezeFailed = true;
+            }
+        }
+        if (!freezeFailed && freeze.getLatency() != freeze.getFFTSize())
+        {
+            std::printf("FAIL %-18s latency != fftSize\n", "SpectralFreeze");
+            ++failed;
+            freezeFailed = true;
+        }
+        if (!freezeFailed)
+            std::printf("OK   %-18s (live + frozen hold)\n", "SpectralFreeze");
+    }
+    catch (const std::exception& e)
+    {
+        std::printf("FAIL %-18s exception: %s\n", "SpectralFreeze", e.what());
+        ++failed;
+    }
+
+    // LoopFinder is offline: one bounded search over a planted seam and one
+    // transactional render, checked for status, shape and finite samples.
+    try
+    {
+        constexpr int loopSamples = 4096;
+        constexpr int plantedStart = 512;
+        constexpr int plantedEnd = 2949;
+        constexpr int contextLength = 256;
+        std::vector<float> loopSource(loopSamples);
+        for (int i = 0; i < loopSamples; ++i)
+            loopSource[static_cast<size_t>(i)] = 0.4f
+                * std::sin(2.0f * 3.14159265f * 0.019f * static_cast<float>(i))
+                + 0.1f * std::sin(2.0f * 3.14159265f * 0.077f
+                                  * static_cast<float>(i) + 0.3f);
+        std::copy_n(loopSource.begin() + plantedStart, contextLength,
+                    loopSource.begin() + plantedEnd - contextLength);
+
+        LoopFinder<float> finder;
+        LoopFinder<float>::Settings settings;
+        settings.comparisonLength = 256;
+        settings.crossfadeLength = 64;
+        settings.coarseStride = 16;
+        settings.refinementRadius = 15;
+        const float* channelPointer = loopSource.data();
+        AudioBufferView<const float> source(&channelPointer, 1, loopSamples);
+        const auto loop = finder.find(source,
+                                      { plantedStart - 64, plantedStart + 64 },
+                                      { plantedEnd - 64, plantedEnd + 64 },
+                                      2000, 2600, settings);
+        std::vector<float> rendered;
+        bool loopOk = static_cast<bool>(loop)
+            && loop.start == plantedStart && loop.end == plantedEnd;
+        if (loopOk)
+        {
+            rendered.assign(static_cast<size_t>(loop.renderedLength()), 0.0f);
+            float* renderPointer = rendered.data();
+            AudioBufferView<float> output(&renderPointer, 1,
+                                          static_cast<int>(rendered.size()));
+            loopOk = LoopFinder<float>::renderLoop(source, loop, output)
+                == LoopFinder<float>::Status::Success;
+            for (const float sample : rendered)
+                if (!std::isfinite(sample) || std::abs(sample) > 1.0f)
+                    loopOk = false;
+        }
+        if (!loopOk)
+        {
+            std::printf("FAIL %-18s find/render smoke\n", "LoopFinder");
+            ++failed;
+        }
+        else
+            std::printf("OK   %-18s (bounded find + render)\n", "LoopFinder");
+    }
+    catch (const std::exception& e)
+    {
+        std::printf("FAIL %-18s exception: %s\n", "LoopFinder", e.what());
         ++failed;
     }
 

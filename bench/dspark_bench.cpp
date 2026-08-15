@@ -227,6 +227,111 @@ int main()
             g_sink += out.empty() ? 0.0 : out[0];
         }, 48000.0));
     }
+    {
+        // SpectralFreeze in its three steady states: transparent live path,
+        // tonal hold and diffuse hold (N 2048, hop 512).
+        struct FreezeCase
+        {
+            const char* name;
+            bool frozen;
+            dspark::SpectralFreeze<float>::PhaseMode mode;
+        };
+        const FreezeCase freezeCases[] = {
+            { "SpectralFreeze live", false,
+              dspark::SpectralFreeze<float>::PhaseMode::Tonal },
+            { "SpectralFreeze tonal hold", true,
+              dspark::SpectralFreeze<float>::PhaseMode::Tonal },
+            { "SpectralFreeze diffuse hold", true,
+              dspark::SpectralFreeze<float>::PhaseMode::Diffuse },
+        };
+        for (const auto& freezeCase : freezeCases)
+        {
+            dspark::SpectralFreeze<float> freeze;
+            freeze.setFrozen(freezeCase.frozen);
+            freeze.setPhaseMode(freezeCase.mode);
+            freeze.prepare(spec);
+            for (int warm = 0; warm < 24; ++warm)
+            {
+                fill();
+                freeze.processBlock(stereo.toView());
+            }
+            printRow(freezeCase.name, medianNsPerFrame([&] {
+                fill();
+                freeze.processBlock(stereo.toView());
+                g_sink += stereo.getChannel(0)[0];
+            }, kBlock));
+        }
+    }
+
+    std::printf("\n| LoopFinder (offline, W=1024, stereo) | value |\n");
+    std::printf("|--------------------------------------|-------|\n");
+    {
+        // Bounded offline search throughput: candidate pairs scored per
+        // second on a planted stereo texture, and one seam render.
+        constexpr int loopSamples = 1 << 16;
+        constexpr int plantedStart = 8192;
+        constexpr int plantedEnd = 40961;
+        constexpr int contextLength = 1024;
+        std::vector<std::vector<float>> source(
+            2, std::vector<float>(static_cast<size_t>(loopSamples)));
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < loopSamples; ++i)
+                source[static_cast<size_t>(ch)][static_cast<size_t>(i)] =
+                    static_cast<float>(
+                        0.3 * std::sin(2.0 * kPiBench * (0.011 + 0.002 * ch) * i)
+                        + 0.1 * std::sin(2.0 * kPiBench * 0.0713 * i + ch));
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < contextLength; ++i)
+                source[static_cast<size_t>(ch)]
+                      [static_cast<size_t>(plantedEnd - contextLength + i)] =
+                    source[static_cast<size_t>(ch)]
+                          [static_cast<size_t>(plantedStart + i)];
+        const float* pointers[2] = { source[0].data(), source[1].data() };
+        dspark::AudioBufferView<const float> view(pointers, 2, loopSamples);
+        dspark::LoopFinder<float> finder;
+        dspark::LoopFinder<float>::Settings settings;
+        settings.comparisonLength = 1024;
+        settings.crossfadeLength = 256;
+        settings.coarseStride = 64;
+        settings.refinementRadius = 0;
+        // 33 x 33 coarse lattice = 1089 scored pairs per call.
+        const dspark::LoopFinder<float>::Range startRange {
+            plantedStart - 1024, plantedStart + 1024 };
+        const dspark::LoopFinder<float>::Range endRange {
+            plantedEnd - 1025, plantedEnd + 1023 };
+        constexpr double pairsPerCall = 33.0 * 33.0;
+        const double nsPerPair = medianNsPerFrame([&] {
+            const auto result = finder.find(view, startRange, endRange,
+                                            24576, 40960, settings);
+            g_sink += static_cast<double>(result.seamCost);
+        }, pairsPerCall);
+        std::printf("| candidate pairs scored per second    | %.0f |\n",
+                    1e9 / nsPerPair);
+
+        settings.refinementRadius = 63;
+        const auto loop = finder.find(view, { plantedStart, plantedStart },
+                                      { plantedEnd, plantedEnd },
+                                      24576, 40960, settings);
+        std::vector<std::vector<float>> rendered(
+            2, std::vector<float>(loop ? static_cast<size_t>(loop.renderedLength())
+                                       : 1u));
+        float* renderPointers[2] = { rendered[0].data(), rendered[1].data() };
+        dspark::AudioBufferView<float> output(
+            renderPointers, 2, static_cast<int>(rendered[0].size()));
+        if (loop)
+        {
+            const double nsPerSample = medianNsPerFrame([&] {
+                (void)dspark::LoopFinder<float>::renderLoop(view, loop, output);
+                g_sink += rendered[0][0];
+            }, static_cast<double>(rendered[0].size()));
+            std::printf("| seam render Msample/s (per channel)  | %.1f |\n",
+                        1000.0 / nsPerSample);
+        }
+        else
+        {
+            std::printf("| seam render Msample/s (per channel)  | n/a |\n");
+        }
+    }
 
     std::printf("\n| FFT (float, forward + inverse) | us / pair | pairs / s |\n");
     std::printf("|--------------------------------|-----------|-----------|\n");

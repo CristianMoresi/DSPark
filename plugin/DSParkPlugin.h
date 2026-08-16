@@ -64,6 +64,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -158,10 +159,13 @@ constexpr double toNormalized(const Param& p, double plain) noexcept
 /** @brief Normalized [0, 1] -> plain [min, max], snapped for stepped params. */
 constexpr double toPlain(const Param& p, double normalized) noexcept
 {
-    double n = normalized < 0.0 ? 0.0 : (normalized > 1.0 ? 1.0 : normalized);
+    // Written so a NaN lands on 0 rather than passing through: NaN compares
+    // false against both bounds, and the snap below would then convert it.
+    double n = !(normalized > 0.0) ? 0.0 : (normalized > 1.0 ? 1.0 : normalized);
     if (p.steps > 0)
     {
-        // Snap to the nearest of steps+1 positions.
+        // Snap to the nearest of steps+1 positions. n is bounded above, so the
+        // conversion is in range by construction.
         const double scaled = n * p.steps + 0.5;
         const double idx = static_cast<double>(static_cast<long long>(scaled));
         n = idx / p.steps;
@@ -698,6 +702,38 @@ constexpr EditorResize editorResizeOf() noexcept
 inline constexpr double kEditorMinSizeFactor = 0.5;
 inline constexpr double kEditorMaxSizeFactor = 3.0;
 
+/** @brief Pixel ceiling for a negotiated editor size.
+ *
+ *  The window sizes below are products of a scale factor the host chooses, and
+ *  every caller turns them into an integer. A host is free to hand over a
+ *  scale that puts the product outside that integer's range, where the
+ *  conversion is undefined, so the size is bounded before anyone converts it.
+ *  No display is this large; the value is the largest a signed 16-bit
+ *  coordinate can carry, which is the smallest window coordinate any of the
+ *  supported formats uses. */
+inline constexpr double kEditorMaxPixels = 32767.0;
+
+/**
+ * @brief A floating value from outside converted to an integer, with the range
+ * settled BEFORE the conversion.
+ *
+ * Converting a floating value that does not fit the destination is undefined
+ * behaviour, not a wrap: the usual shape - convert, then clamp - has already
+ * lost by the time the clamp runs. Every value this layer converts comes from
+ * a host or from a project file, so the guard belongs ahead of the cast.
+ *
+ * A NaN maps to @p lo. That is deliberate and it is the reason this is a
+ * function rather than a pair of ternaries at each site: NaN compares false
+ * against everything, so it sails straight through a clamp written the obvious
+ * way and reaches the conversion anyway.
+ */
+constexpr int toBoundedInt(double value, int lo, int hi) noexcept
+{
+    if (!(value > static_cast<double>(lo))) return lo;   // false for NaN
+    if (value >= static_cast<double>(hi))   return hi;
+    return static_cast<int>(value);
+}
+
 /**
  * @brief Applies the resize policy of @p P to a size the host proposes:
  * Fixed pins it, Free clamps each axis to the 0.5x..3x window, KeepAspect
@@ -734,6 +770,14 @@ constexpr void constrainEditorSize(double& width, double& height, double scale) 
             height = fitW / ratio;
         }
     }
+    // The policy above is expressed as multiples of a host-chosen scale, so
+    // its own bounds move with that scale. Every caller converts these to an
+    // integer; bound them in pixels first, and write the test so a NaN cannot
+    // pass through it.
+    width  = !(width  > 1.0) ? 1.0
+           : (width  > kEditorMaxPixels ? kEditorMaxPixels : width);
+    height = !(height > 1.0) ? 1.0
+           : (height > kEditorMaxPixels ? kEditorMaxPixels : height);
 }
 
 /** @brief Optional `static constexpr bool editorDebug = true;` - enables the
@@ -964,8 +1008,21 @@ inline bool applyState(P& user, const uint8_t* data, size_t size, double* normal
         if (v != v) continue;
         if (id == kProgramStateId)
         {
+            // Converting a double that does not fit an int is undefined, and a
+            // blob out of a project file can carry any value at all, so the
+            // range is settled BEFORE the conversion rather than after it. An
+            // index past the end of the preset list is refused by the caller's
+            // own bounds check, exactly as an index written by a build with a
+            // longer list always was.
             if (programIndex != nullptr && v >= 0.0)
-                *programIndex = static_cast<int>(v + 0.5);
+            {
+                const double rounded = v + 0.5;
+                constexpr double intLimit =
+                    static_cast<double>(std::numeric_limits<int>::max());
+                *programIndex = rounded < intLimit
+                              ? static_cast<int>(rounded)
+                              : std::numeric_limits<int>::max();
+            }
             continue;
         }
         if (id == kBypassStateId)

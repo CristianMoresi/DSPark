@@ -558,10 +558,19 @@ READOUTS = {
         "is the WRITER here, so this reader is not on the audio path. It is "
         "bounded anyway, by kSnapshotAttempts, with its own previous-snapshot "
         "fallback",
+    ("DSParkLab/AudioEngine.h", "getWaveform"):
+        "interface-thread readout of the waveform snapshot; the audio thread is "
+        "the WRITER here, so this reader is not on the audio path",
 }
 
+# The seqlock population is deliberately WIDER than the page's scope. The page
+# documents the framework's headers; this tier exists so that no seqlock reader
+# anywhere in the repository can be added without being classified, and a
+# reader in the demo application is a reader all the same. Only this population
+# is widened - every claim checked against the page stays framework-scoped.
+SEQLOCK_DIRS = FRAMEWORK_DIRS + ("DSParkLab/",)
 seq_headers = sorted(p for p in SOURCES
-                     if p.startswith(FRAMEWORK_DIRS) and p.endswith(".h")
+                     if p.startswith(SEQLOCK_DIRS) and p.endswith(".h")
                      and "atomic_thread_fence" in CODE[p])
 print("  headers with a cross-thread fence (the seqlock population): {}".format(
     len(seq_headers)))

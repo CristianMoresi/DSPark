@@ -1,17 +1,84 @@
 // DSParkLab — Effect Slot abstraction
 // Type-erased wrapper for any DSPark processor with parameter descriptors.
+//
+// Threading
+// ---------
+// The interface thread owns every member of a slot except one: process() runs
+// on the audio thread and reads `enabled`, which the interface writes whenever
+// the user clicks the slot's checkbox. That one word is therefore published
+// rather than plain (see PublishedFlag). Everything else here -- the parameter
+// values, the descriptors, the callables -- is written and read by the
+// interface thread alone, or installed once by a factory before any device
+// exists; applyParam() reaches the processor through setParamFn, and it is the
+// processor that publishes its own parameters to the audio thread.
 
 #pragma once
 
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace dsplab {
+
+// --- A word shared by the interface and the audio thread ---------------------
+
+/// A boolean one thread writes and another reads.
+///
+/// A plain bool would not do: a value written by one thread and read by
+/// another with no synchronisation is a data race, and a compiler that may
+/// assume nobody else is looking is free to fold, duplicate or reorder the
+/// accesses. Nothing else is ordered against this flag -- a processor publishes
+/// its own parameters -- so a single relaxed store/load pair is the whole
+/// contract, and it costs the audio thread exactly what the plain read cost.
+///
+/// The wrapper exists because std::atomic is neither copyable nor movable,
+/// which would make every slot unmovable and break the factories that return
+/// one by value. Copying transfers the value; it happens at setup, where a
+/// relaxed access is all the ordering a copy needs.
+///
+/// The word must also be lock-free, or the audio thread would take a lock to
+/// read it. No assertion is made here because this is a concrete width the
+/// framework's own suite already sweeps, alongside every other word type this
+/// application publishes; a header that pins a width the sweep cannot reach --
+/// one named by a template parameter -- is the case that asserts locally.
+class PublishedFlag
+{
+public:
+    PublishedFlag() = default;
+    explicit PublishedFlag(bool v) noexcept : value_(v) {}
+    ~PublishedFlag() = default;
+
+    PublishedFlag(const PublishedFlag& other) noexcept : value_(other.get()) {}
+    PublishedFlag(PublishedFlag&& other) noexcept : value_(other.get()) {}
+    PublishedFlag& operator=(const PublishedFlag& other) noexcept
+    {
+        set(other.get());
+        return *this;
+    }
+    PublishedFlag& operator=(PublishedFlag&& other) noexcept
+    {
+        set(other.get());
+        return *this;
+    }
+
+    PublishedFlag& operator=(bool v) noexcept { set(v); return *this; }
+
+    [[nodiscard]] bool get() const noexcept
+    {
+        return value_.load(std::memory_order_relaxed);
+    }
+    void set(bool v) noexcept { value_.store(v, std::memory_order_relaxed); }
+
+    explicit operator bool() const noexcept { return get(); }
+
+private:
+    std::atomic<bool> value_ { false };
+};
 
 // --- Parameter descriptor ---------------------------------------------------
 
@@ -38,7 +105,7 @@ public:
     std::string category;
     std::vector<ParamDesc> params;
     std::vector<float>     values;   // Current parameter values
-    bool enabled  = false;
+    PublishedFlag enabled;           // Read by the audio thread in process()
     bool selected = false;           // UI: which panel to show
 
     // Type-erased processor interface
@@ -88,14 +155,16 @@ public:
 
     void addToggle(const char* n, bool def = false)
     {
-        params.push_back({ n, 0.0f, 1.0f, def ? 1.0f : 0.0f, ParamDesc::Toggle });
+        params.push_back({ n, 0.0f, 1.0f, def ? 1.0f : 0.0f, ParamDesc::Toggle,
+                           "", {}, false });
         values.push_back(def ? 1.0f : 0.0f);
     }
 
     void addChoice(const char* n, std::vector<std::string> opts, int def = 0)
     {
         params.push_back({ n, 0.0f, static_cast<float>(opts.size() - 1),
-                           static_cast<float>(def), ParamDesc::Choice, "", std::move(opts) });
+                           static_cast<float>(def), ParamDesc::Choice, "",
+                           std::move(opts), false });
         values.push_back(static_cast<float>(def));
     }
 
@@ -106,9 +175,10 @@ public:
         if (prepareFn) prepareFn(spec);
     }
 
+    /// Audio thread. One published load of the enabled flag decides the call.
     void process(dspark::AudioBufferView<float> buf)
     {
-        if (enabled && processFn) processFn(buf);
+        if (enabled.get() && processFn) processFn(buf);
     }
 
     void reset()

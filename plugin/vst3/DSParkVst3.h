@@ -211,7 +211,13 @@ struct Plugin
     P user {};
     Steinberg_Vst_ProcessSetup setup { 0, 0, 0, 48000.0 };
     bool prepared = false;
-    int  cachedLatency = 0;
+    /// Latency in samples, as last reported to the host. The processing call
+    /// re-reads it after parameter motion while the host fetches it from its
+    /// own thread, so it is a published word rather than a plain int. It
+    /// stands alone -- nothing else is ordered against it, and the host is
+    /// told to re-fetch through the notification path below -- so the plain
+    /// store/load idiom for a single independent value is the whole contract.
+    std::atomic<int> cachedLatency { 0 };
     int  currentChannels = defaultChannelCount<P>();   // negotiated bus width
 
     std::atomic<double> shadow[kNumParams == 0 ? 1 : kNumParams] {};
@@ -346,6 +352,22 @@ struct Plugin
             (void) idx;
     }
 
+    /** The preset index a host-supplied normalized value selects.
+     *
+     *  The value arrives from a host or from a project file. VST3 declares it
+     *  to be in [0, 1] and the wrapper enforces nothing, so the range is
+     *  settled BEFORE the conversion: converting a double that does not fit an
+     *  int is undefined behaviour, and a clamp written after the cast has
+     *  already lost. A NaN selects the first preset. */
+    static int programIndexOf(Steinberg_Vst_ParamValue normalized) noexcept
+    {
+        if constexpr (kNumPresets <= 0)
+            return 0;
+        else
+            return toBoundedInt(normalized * (kNumPresets - 1) + 0.5,
+                                0, kNumPresets - 1);
+    }
+
     /** Re-reads the plugin latency; on a change, updates the cache and asks
      *  the host to re-fetch it. Mainstream hosts accept the restart request
      *  from the audio thread (they defer internally); extraFlags lets the
@@ -356,9 +378,9 @@ struct Plugin
         if constexpr (HasLatency<P>)
         {
             const int now = user.getLatency();
-            if (prepared && now != cachedLatency)
+            if (prepared && now != cachedLatency.load(std::memory_order_relaxed))
             {
-                cachedLatency = now;
+                cachedLatency.store(now, std::memory_order_relaxed);
                 flags |= Steinberg_Vst_RestartFlags_kLatencyChanged;
             }
         }
@@ -502,8 +524,7 @@ struct Plugin
             {
                 if (ev.paramId == kProgramParamId)
                 {
-                    applyFactoryPresetIdx(static_cast<int>(
-                        ev.value * (kNumPresets - 1) + 0.5));
+                    applyFactoryPresetIdx(programIndexOf(ev.value));
                     programChanged = true;
                     return true;
                 }
@@ -637,7 +658,7 @@ struct Plugin
                 p->silence.assign(static_cast<size_t>(maxBlock), 0.0f);
             p->bypassMix = p->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
             if constexpr (HasLatency<P>)
-                p->cachedLatency = p->user.getLatency();
+                p->cachedLatency.store(p->user.getLatency(), std::memory_order_relaxed);
             p->prepared = true;
         }
         return Steinberg_kResultOk;
@@ -750,7 +771,8 @@ struct Plugin
 
     static Steinberg_uint32 SMTG_STDMETHODCALLTYPE sGetLatencySamples(void* self_)
     {
-        return static_cast<Steinberg_uint32>(fromLens(self_, 1)->cachedLatency);
+        return static_cast<Steinberg_uint32>(
+            fromLens(self_, 1)->cachedLatency.load(std::memory_order_relaxed));
     }
 
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sSetupProcessing(void* self_,
@@ -1117,8 +1139,7 @@ struct Plugin
         {
             if constexpr (HasFactoryPresets<P>)
             {
-                int idx = static_cast<int>(normalized * (kNumPresets - 1) + 0.5);
-                idx = idx < 0 ? 0 : (idx >= kNumPresets ? kNumPresets - 1 : idx);
+                const int idx = programIndexOf(normalized);
                 std::snprintf(text, sizeof(text), "%s",
                               P::factoryPresets[static_cast<size_t>(idx)].name);
             }
@@ -1194,8 +1215,7 @@ struct Plugin
     {
         if (id == kBypassParamId) return normalized >= 0.5 ? 1.0 : 0.0;
         if (kNumPresets > 0 && id == kProgramParamId)
-            return static_cast<double>(
-                static_cast<int>(normalized * (kNumPresets - 1) + 0.5));
+            return static_cast<double>(programIndexOf(normalized));
         if (HasMidi<P> && isMidiProxyId(id)) return normalized;
         const int idx = indexOfParamId(id);
         return idx < 0 ? 0.0 : toPlain(P::parameters[static_cast<size_t>(idx)], normalized);
@@ -1247,8 +1267,7 @@ struct Plugin
         {
             // A program change from the host UI: apply the preset and tell
             // the host every other parameter moved (main-thread call).
-            p->applyFactoryPresetIdx(
-                static_cast<int>(value * (kNumPresets - 1) + 0.5));
+            p->applyFactoryPresetIdx(programIndexOf(value));
             p->refreshLatency(Steinberg_Vst_RestartFlags_kParamValuesChanged);
             return Steinberg_kResultOk;
         }
@@ -1760,8 +1779,8 @@ struct View
         webview_ui::debugLog("vst3 onSize %.0fx%.0f -> %.0fx%.0f%s",
                              proposedW, proposedH, w, h,
                              view->correctingSize ? " (correction round-trip)" : "");
-        view->width  = static_cast<int>(w + 0.5);
-        view->height = static_cast<int>(h + 0.5);
+        view->width  = toBoundedInt(w + 0.5, 1, static_cast<int>(kEditorMaxPixels));
+        view->height = toBoundedInt(h + 0.5, 1, static_cast<int>(kEditorMaxPixels));
         view->editor.setBounds(view->width, view->height);
         if (!view->correctingSize && view->frame != nullptr
             && (view->width - proposedW > 1.0 || proposedW - view->width > 1.0
@@ -1816,8 +1835,10 @@ struct View
         double w = proposedW;
         double h = proposedH;
         constrainEditorSize<P>(w, h, view->scale);
-        rect->right  = rect->left + static_cast<Steinberg_int32>(w + 0.5);
-        rect->bottom = rect->top + static_cast<Steinberg_int32>(h + 0.5);
+        rect->right  = rect->left
+                     + toBoundedInt(w + 0.5, 1, static_cast<int>(kEditorMaxPixels));
+        rect->bottom = rect->top
+                     + toBoundedInt(h + 0.5, 1, static_cast<int>(kEditorMaxPixels));
         webview_ui::debugLog("vst3 checkSizeConstraint %.0fx%.0f -> %.0fx%.0f",
                              proposedW, proposedH, w, h);
         return Steinberg_kResultTrue;
@@ -1844,8 +1865,10 @@ struct View
                              view->scale, previous);
         // Rescale the negotiated physical size (the page itself never zooms:
         // the web engine applies the window DPI to CSS pixels on its own).
-        view->width  = static_cast<int>(view->width * (view->scale / previous) + 0.5);
-        view->height = static_cast<int>(view->height * (view->scale / previous) + 0.5);
+        view->width  = toBoundedInt(view->width * (view->scale / previous) + 0.5,
+                                    1, static_cast<int>(kEditorMaxPixels));
+        view->height = toBoundedInt(view->height * (view->scale / previous) + 0.5,
+                                    1, static_cast<int>(kEditorMaxPixels));
         if (view->editor.created() && view->frame != nullptr)
         {
             // Already on screen (e.g. dragged to another monitor): ask the

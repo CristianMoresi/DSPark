@@ -97,7 +97,13 @@ struct Plugin
     double sampleRate = 48000.0;
     uint32_t maxFrames = 0;
     bool prepared = false;
-    int cachedLatency = 0;
+    /// Latency in samples, as last reported to the host. The processing call
+    /// re-reads it after parameter motion while the host fetches it from its
+    /// own thread, so it is a published word rather than a plain int. It
+    /// stands alone -- nothing else is ordered against it, and the host is
+    /// told to re-fetch through the notification path below -- so the plain
+    /// store/load idiom for a single independent value is the whole contract.
+    std::atomic<int> cachedLatency { 0 };
     int currentChannels = defaultChannelCount<P>();   // selected ports config
     bool offlineRender = false;          // last render-extension setting
     std::atomic<bool> latencyDirty { false };   // audio -> main thread notify
@@ -186,9 +192,9 @@ struct Plugin
         if constexpr (HasLatency<P>)
         {
             const int now = user.getLatency();
-            if (prepared && now != cachedLatency)
+            if (prepared && now != cachedLatency.load(std::memory_order_relaxed))
             {
-                cachedLatency = now;
+                cachedLatency.store(now, std::memory_order_relaxed);
                 latencyDirty.store(true, std::memory_order_release);
                 if (host != nullptr && host->request_callback != nullptr)
                     host->request_callback(host);
@@ -470,7 +476,7 @@ struct Plugin
             s->silence.assign(maxFrames, 0.0f);
         s->bypassMix = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
         if constexpr (HasLatency<P>)
-            s->cachedLatency = s->user.getLatency();
+            s->cachedLatency.store(s->user.getLatency(), std::memory_order_relaxed);
         s->prepared = true;
         return true;
     }
@@ -1063,7 +1069,8 @@ struct Plugin
 
     static uint32_t sLatencyGet(const clap_plugin_t* p) noexcept
     {
-        return static_cast<uint32_t>(self(p)->cachedLatency);
+        return static_cast<uint32_t>(
+            self(p)->cachedLatency.load(std::memory_order_relaxed));
     }
 
     inline static const clap_plugin_latency_t kLatency = { &sLatencyGet };
@@ -1183,8 +1190,10 @@ struct Plugin
         }
 #endif
         const EditorSize logical = editorSizeOf<P>();
-        s->guiWidth  = static_cast<int>(logical.width * s->guiScale + 0.5);
-        s->guiHeight = static_cast<int>(logical.height * s->guiScale + 0.5);
+        s->guiWidth  = toBoundedInt(logical.width * s->guiScale + 0.5,
+                                    1, static_cast<int>(kEditorMaxPixels));
+        s->guiHeight = toBoundedInt(logical.height * s->guiScale + 0.5,
+                                    1, static_cast<int>(kEditorMaxPixels));
         s->guiActive = true;
         webview_ui::debugLog("clap gui create %dx%d scale=%.2f",
                              s->guiWidth, s->guiHeight, s->guiScale);
@@ -1216,8 +1225,10 @@ struct Plugin
         // zooms (the web engine applies the window DPI to CSS pixels itself).
         const double previous = s->guiScale;
         s->guiScale = scale;
-        s->guiWidth  = static_cast<int>(s->guiWidth * (scale / previous) + 0.5);
-        s->guiHeight = static_cast<int>(s->guiHeight * (scale / previous) + 0.5);
+        s->guiWidth  = toBoundedInt(s->guiWidth * (scale / previous) + 0.5,
+                                    1, static_cast<int>(kEditorMaxPixels));
+        s->guiHeight = toBoundedInt(s->guiHeight * (scale / previous) + 0.5,
+                                    1, static_cast<int>(kEditorMaxPixels));
         s->guiEditor.setBounds(s->guiWidth, s->guiHeight);
         return true;
 #endif
@@ -1260,8 +1271,10 @@ struct Plugin
         double w = *width;
         double h = *height;
         constrainEditorSize<P>(w, h, s->guiScale);
-        *width  = static_cast<uint32_t>(w + 0.5);
-        *height = static_cast<uint32_t>(h + 0.5);
+        *width  = static_cast<uint32_t>(
+            toBoundedInt(w + 0.5, 1, static_cast<int>(kEditorMaxPixels)));
+        *height = static_cast<uint32_t>(
+            toBoundedInt(h + 0.5, 1, static_cast<int>(kEditorMaxPixels)));
         return true;
     }
 
@@ -1275,8 +1288,8 @@ struct Plugin
         double h = height;
         constrainEditorSize<P>(w, h, s->guiScale);
         webview_ui::debugLog("clap gui set_size %ux%u -> %.0fx%.0f", width, height, w, h);
-        s->guiWidth  = static_cast<int>(w + 0.5);
-        s->guiHeight = static_cast<int>(h + 0.5);
+        s->guiWidth  = toBoundedInt(w + 0.5, 1, static_cast<int>(kEditorMaxPixels));
+        s->guiHeight = toBoundedInt(h + 0.5, 1, static_cast<int>(kEditorMaxPixels));
         s->guiEditor.setBounds(s->guiWidth, s->guiHeight);
         return true;
     }

@@ -273,7 +273,13 @@ struct Plugin
     std::atomic<double> shadow[kNumParams == 0 ? 1 : kNumParams] {};
     std::atomic<bool>   bypass { false };
     float bypassMix = 0.0f;
-    int cachedLatency = 0;
+    /// Latency in samples, as last reported to the host. The processing call
+    /// re-reads it after parameter motion while the host fetches it from its
+    /// own thread, so it is a published word rather than a plain int. It
+    /// stands alone -- nothing else is ordered against it, and the host is
+    /// told to re-fetch through the notification path below -- so the plain
+    /// store/load idiom for a single independent value is the whole contract.
+    std::atomic<int> cachedLatency { 0 };
 
     // Input elements: 0 = main, 1 = sidechain. An instrument has none.
     static constexpr UInt32 kNumInputElements =
@@ -354,9 +360,9 @@ struct Plugin
         if constexpr (HasLatency<P>)
         {
             const int now = user.getLatency();
-            if (initialized && now != cachedLatency)
+            if (initialized && now != cachedLatency.load(std::memory_order_relaxed))
             {
-                cachedLatency = now;
+                cachedLatency.store(now, std::memory_order_relaxed);
                 notifyProperty(kAudioUnitProperty_Latency,
                                kAudioUnitScope_Global, 0);
             }
@@ -539,7 +545,7 @@ struct Plugin
         }
         bypassMix = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
         if constexpr (HasLatency<P>)
-            cachedLatency = user.getLatency();
+            cachedLatency.store(user.getLatency(), std::memory_order_relaxed);
         scheduledCount = 0;
         initialized = true;
         return noErr;
@@ -824,7 +830,9 @@ struct Plugin
         case kAudioUnitProperty_Latency:
             if (*ioSize < sizeof(Float64)) return kAudioUnitErr_InvalidPropertyValue;
             *static_cast<Float64*>(outData) =
-                sampleRate > 0.0 ? cachedLatency / sampleRate : 0.0;
+                sampleRate > 0.0
+                    ? cachedLatency.load(std::memory_order_relaxed) / sampleRate
+                    : 0.0;
             *ioSize = sizeof(Float64);
             return noErr;
         case kAudioUnitProperty_TailTime:
@@ -1223,7 +1231,16 @@ struct Plugin
                         hostCallbacks.hostUserData, &deltaToNextBeat, &num, &den,
                         &downbeat) == noErr)
                 {
-                    info.timeSigNumerator = static_cast<int>(num);
+                    // The host WRITES the numerator, and this is the one
+                    // format that delivers it as a floating-point number
+                    // (VST3 sends an int32, CLAP a uint16), so it is the one
+                    // place the value has to be bounded before it is
+                    // converted: a conversion that does not fit an int is
+                    // undefined, and a NaN would sail through a test written
+                    // the obvious way. The ceiling is far above any meter a
+                    // sequencer can express and the floor keeps the field
+                    // usable as a divisor.
+                    info.timeSigNumerator = toBoundedInt(num, 1, 255);
                     info.timeSigDenominator = static_cast<int>(den);
                     info.timeSigValid = true;
                     info.barStartPpq = downbeat;

@@ -963,24 +963,32 @@ DSPARK_TEST(FIR_seqlock_coefficient_swap_is_atomic)
 //
 // The audio thread's coefficient pull enters its seqlock loop only when the
 // dirty flag is set, and setCoefficients() raises that flag AFTER it leaves its
-// critical section. A reader can therefore only meet a publish in progress if
-// an EARLIER publish is still unconsumed:
+// critical section. So a read that begins while a publication STRICTLY NEWER
+// than the set the reader holds has already completed is guaranteed to enter
+// the loop. If such a read comes back still holding the older set, it did not
+// adopt anything: the attempt bound ran out, the flag was re-armed, and the
+// give-up path ran. That is a statement about which code executed, derived
+// from published counters, and it needs no clock.
 //
-//   1. publish P1 completes           -> dirty = true, nothing adopted yet
-//   2. signal, then start publish P2  -> the sequence counter goes odd
-//   3. the audio thread reads         -> dirty was true, so it MUST enter the
-//                                        loop, and it meets P2 in flight
+// The reachability of the give-up path is left to a writer that publishes
+// CONTINUOUSLY rather than to a scheduled instant. This is deliberate, and it
+// is the difference between this protocol and the one it replaces. The earlier
+// shape armed the flag with a short publication, signalled, and then began a
+// long one, hoping the reader would arrive while that long one was in flight;
+// on a host that gives the writer no core between the signal and the start of
+// the publication, the reader arrives to an idle writer, adopts, and the pin
+// reports zero give-ups -- a red that says nothing about the code. Under
+// continuous publication the pressure runs the other way: every attempt the
+// reader makes must survive a full copy of the staged set without the counter
+// moving, and the busier the host, the less likely that is. Starvation makes
+// this pin easier to satisfy, never harder, which is the property a pin on a
+// shared runner has to have.
 //
-// Step 3's read is guaranteed to enter the loop, so an audio thread that comes
-// out of it still holding a set OLDER than P1 can only have got there by giving
-// up: the attempt bound ran out, nothing was adopted, the flag was re-armed.
-// That is what makes "the give-up path ran" a proof below and not a guess.
-//
-// P2 is published with a much larger tap count than P1 on purpose. The staged
-// tap COUNT is stored at the end of the critical section, so while P2 is in
-// flight a reader still sees P1's small count and retries cheaply instead of
-// hiding the wait inside one huge copy -- which is what lets the timing
-// assertion see the wait at all.
+// Every publication carries the full kBigTaps set, so an attempt costs a copy
+// of that set and a writer that so much as STARTS a publication during it
+// invalidates it. The buffer is stamped in place rather than rebuilt, so the
+// writer allocates nothing between publications and the window in which its
+// counter is even stays short.
 
 static constexpr int kTagTaps = 512;        ///< The taps that carry the tag.
 static constexpr int kBigTaps = 1 << 18;    ///< A publish long enough to collide with.
@@ -1002,22 +1010,38 @@ static std::vector<float> tagKernel(float tag, int taps)
 
 struct BoundedReadTrials
 {
-    int trialsRun     = 0;   ///< Trials actually executed (the loop stops early).
+    long long reads   = 0;   ///< Audio-thread reads performed.
+    long long opportunities = 0; ///< Reads GUARANTEED to enter the seqlock loop.
+    long long publications  = 0; ///< Publications the writer completed.
     int deferrals     = 0;   ///< Reads that gave up and kept the previous set.
-    int adoptions     = 0;   ///< Reads that adopted one of the two new sets.
+    int adoptions     = 0;   ///< Reads that adopted a newer published set.
     int illegal       = 0;   ///< Reads whose result was no published set at all.
-    int reArmFailures = 0;   ///< Deferred updates NOT picked up by the next read.
-    int signalTimeouts = 0;  ///< Trials where the writer never signalled in time.
-    int resetMismatches = 0; ///< Trials whose uncontended reset read the wrong set.
-    long long medianReadNs = 0;  ///< Reported, never asserted on -- see below.
+    int regressions   = 0;   ///< Reads that went BACK to an older set.
+    int reArmFailures = 0;   ///< Deferred updates NOT picked up once the writer stops.
+    int quiesceTimeouts = 0; ///< The writer never acknowledged a pause request.
+    int capHit        = 0;   ///< The read cap ran out before the run finished.
+    int stalls        = 0;   ///< A single read made no progress for the budget.
+    long long medianReadNs = 0;  ///< Median COLLIDING read.
     long long maxReadNs    = 0;
-    long long publishNs    = 0;  ///< One uncontended publish of P2's size.
+    long long quietReadNs  = 0;  ///< Median UNCONTENDED read of the same set.
     float lastTag  = 0.0f;       ///< Tag of the final publication of the run.
-    float finalTag = 0.0f;       ///< Tag in force after the writers are all joined.
+    float finalTag = 0.0f;       ///< Tag in force after the writer is joined.
 };
 
+/// The integer tag a published set carries, or -1 for a value no publication
+/// could have produced. Every tap of a set is tag/kTagTaps and the delay line
+/// holds DC 1.0, so a whole set reads back as its own tag exactly, and any
+/// mixture of two sets lands strictly between two integers.
+static long long tagOf(float out)
+{
+    const float rounded = std::floor(out + 0.5f);
+    if (out != rounded || rounded < 1.0f) return -1;
+    return static_cast<long long>(rounded);
+}
+
 // Runs the protocol above until it has seen `wantDeferrals` give-ups, or until
-// `maxTrials` trials have run, and reports what the audio-thread read did.
+// `maxOpportunities` reads that were guaranteed to enter the loop have gone by,
+// and reports what the audio-thread reads did.
 //
 // Nothing here is asserted in wall-clock terms, deliberately. The tempting
 // assertion -- "a colliding read is much faster than one publish" -- compares a
@@ -1030,7 +1054,9 @@ struct BoundedReadTrials
 // other than a validated read. The durations are still measured, and reported
 // out of band by the probe in tests/results, where a number is evidence rather
 // than a pass/fail condition.
-static BoundedReadTrials runBoundedReadTrials(int wantDeferrals, int maxTrials)
+static BoundedReadTrials runBoundedReadTrials(int wantDeferrals,
+                                              long long maxOpportunities,
+                                              long long readCap = 20000)
 {
     using clock = std::chrono::steady_clock;
     auto nsSince = [](clock::time_point t0) {
@@ -1040,94 +1066,181 @@ static BoundedReadTrials runBoundedReadTrials(int wantDeferrals, int maxTrials)
 
     BoundedReadTrials st;
 
-    // Calibration, on a filter of its own so it disturbs nothing: how long one
-    // publish of P2's size holds the sequence counter odd on THIS machine. The
-    // pin compares against that instead of a hard-coded microsecond count.
-    {
-        FIRFilter<float> cal;
-        cal.prepare(kBigTaps, 1);
-        const std::vector<float> big = tagKernel(1.0f, kBigTaps);
-        cal.setCoefficients(big);                       // fault the pages in
-        st.publishNs = std::numeric_limits<long long>::max();
-        for (int i = 0; i < 5; ++i)
-        {
-            const auto t0 = clock::now();
-            cal.setCoefficients(big);
-            st.publishNs = std::min(st.publishNs, nsSince(t0));
-        }
-    }
-
     FIRFilter<float> fir;
     fir.prepare(kBigTaps, 1);
 
-    float live = 1.0f;
-    fir.setCoefficients(tagKernel(live, kTagTaps));
+    // One buffer, stamped in place: the writer allocates nothing between
+    // publications, so its counter spends nearly all of its time odd.
+    std::vector<float> staged(static_cast<size_t>(kBigTaps), 0.0f);
+    auto stamp = [&staged](long long tag) {
+        const float v = static_cast<float>(tag) / static_cast<float>(kTagTaps);
+        for (int i = 0; i < kTagTaps; ++i) staged[static_cast<size_t>(i)] = v;
+    };
+
+    stamp(1);
+    fir.setCoefficients(staged);
     for (int i = 0; i < kTagTaps + 8; ++i) (void) fir.processSample(1.0f, 0);
+    long long heldTag = 1;
 
+    std::atomic<bool> stop { false };
+    std::atomic<bool> pauseRequested { false };
+    std::atomic<bool> writerIdle { false };
+    std::atomic<long long> publishedTag { 1 };
+
+    // A read that never returns cannot be caught by any cap on the loop that
+    // would perform the next one, and that is exactly what a reader with no
+    // bound does under a writer that publishes continuously: it waits inside
+    // the call. So the loop is watched from outside it. If no read completes
+    // for the budget below, the watchdog records a stall and tears the writer
+    // down, which lets the stuck read finish so the case can FAIL BY NAME
+    // instead of being killed by a test-runner timeout that names nothing.
+    //
+    // This is a diagnostic budget, not a performance assertion. A bounded read
+    // costs about 20 us here; the budget is twenty seconds, six orders of
+    // magnitude above it, and the only thing that can consume it is the
+    // unbounded wait the attempt limit exists to prevent.
+    std::atomic<long long> readTicket { 0 };
+    std::atomic<int> stallCount { 0 };
+    std::atomic<bool> watchdogStop { false };
+    std::thread watchdog([&] {
+        long long last = -1;
+        int idleTicks = 0;
+        while (!watchdogStop.load(std::memory_order_relaxed))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const long long now = readTicket.load(std::memory_order_relaxed);
+            if (now != last) { last = now; idleTicks = 0; continue; }
+            if (++idleTicks >= 400)          // 20 s with no read completing
+            {
+                stallCount.fetch_add(1, std::memory_order_relaxed);
+                stop.store(true, std::memory_order_relaxed);
+                pauseRequested.store(false, std::memory_order_release);
+                idleTicks = 0;
+            }
+        }
+    });
+
+    std::thread writer([&] {
+        long long tag = 1;
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            if (pauseRequested.load(std::memory_order_acquire))
+            {
+                writerIdle.store(true, std::memory_order_release);
+                while (pauseRequested.load(std::memory_order_acquire)
+                       && !stop.load(std::memory_order_relaxed))
+                    std::this_thread::yield();
+                writerIdle.store(false, std::memory_order_release);
+                continue;
+            }
+            ++tag;
+            stamp(tag);
+            fir.setCoefficients(staged);
+            publishedTag.store(tag, std::memory_order_release);
+        }
+    });
+
+    // Every loop below is capped, including the outer one, and hitting a cap
+    // is a loud failure rather than a quiet exit. That matters in BOTH
+    // directions: a writer that never runs must not hang the suite, and a
+    // reader whose bound has been lost must not either. An unbounded reader
+    // never gives up, so it turns every opportunity into an adoption and would
+    // otherwise walk the opportunity budget at the cost of a full stalled read
+    // apiece; the caps here are what make that end in seconds, by name,
+    // instead of in a test-runner timeout that names nothing.
+    constexpr long long kSpinCap = 2000000000LL;
     std::vector<long long> readNs;
-    readNs.reserve(static_cast<size_t>(maxTrials));
 
-    for (int trial = 0; trial < maxTrials && st.deferrals < wantDeferrals; ++trial)
+    while (st.opportunities < maxOpportunities && st.deferrals < wantDeferrals
+           && st.reads < readCap)
     {
-        ++st.trialsRun;
-        const float t1 = 2.0f + 2.0f * static_cast<float>(trial);
-        const float t2 = t1 + 1.0f;
-        const std::vector<float> k1 = tagKernel(t1, kTagTaps);
-        const std::vector<float> k2 = tagKernel(t2, kBigTaps);
+        const long long before = publishedTag.load(std::memory_order_acquire);
 
-        std::atomic<bool> inFlight { false };
-        std::thread writer([&] {
-            fir.setCoefficients(k1);                    // P1: completes, raises dirty
-            inFlight.store(true, std::memory_order_release);
-            fir.setCoefficients(k2);                    // P2: the long critical section
-        });
+        const auto t0 = clock::now();
+        const float out = fir.processSample(1.0f, 0);   // the audio-thread read
+        const long long ns = nsSince(t0);
+        ++st.reads;
+        readTicket.fetch_add(1, std::memory_order_relaxed);   // the watchdog's pulse
+        if (readNs.size() < 4096) readNs.push_back(ns);
 
-        // Hard-capped rather than open: a writer thread that never runs must
-        // fail this pin loudly, not hang the suite.
+        const long long outTag = tagOf(out);
+        if (outTag < 0)          { ++st.illegal;     heldTag = -1; continue; }
+        if (outTag < heldTag)    { ++st.regressions; heldTag = outTag; continue; }
+
+        // A publication strictly newer than the set in force had already
+        // COMPLETED when this read began, so the dirty flag was necessarily
+        // set and the read necessarily entered the seqlock loop.
+        if (before <= heldTag) { heldTag = outTag; continue; }
+        ++st.opportunities;
+
+        if (outTag > heldTag) { ++st.adoptions; heldTag = outTag; continue; }
+
+        // Same set as before: the loop was entered and nothing was adopted.
+        ++st.deferrals;
+
+        // The deferred update must have been re-armed rather than dropped.
+        // Stopping the writer settles the counter at an even value, and an
+        // uncontended read validates on its first attempt by construction, so
+        // this check does not depend on how the two threads are scheduled.
+        pauseRequested.store(true, std::memory_order_release);
         long long spins = 0;
-        while (!inFlight.load(std::memory_order_acquire) && spins < 2000000000LL)
+        while (!writerIdle.load(std::memory_order_acquire) && spins < kSpinCap
+               && !stop.load(std::memory_order_relaxed))
         {
             ++spins;
             std::this_thread::yield();
         }
-        if (spins >= 2000000000LL) ++st.signalTimeouts;
-
-        const auto t0 = clock::now();
-        const float out = fir.processSample(1.0f, 0);   // the audio-thread read
-        readNs.push_back(nsSince(t0));
-
-        writer.join();
-
-        if (out == live)
+        if (spins >= kSpinCap)
         {
-            ++st.deferrals;
-            // A deferred publication must land on the very next read: the
-            // give-up re-armed the dirty flag instead of dropping the update.
-            const float next = fir.processSample(1.0f, 0);
-            if (next == t2) ; else ++st.reArmFailures;
-            live = next;
-        }
-        else if (out == t1 || out == t2)
-        {
-            ++st.adoptions;
-            live = out;
+            ++st.quiesceTimeouts;
         }
         else
         {
-            ++st.illegal;
-            live = out;
+            const long long newest = publishedTag.load(std::memory_order_acquire);
+            const float again = fir.processSample(1.0f, 0);
+            ++st.reads;
+            if (tagOf(again) != newest) ++st.reArmFailures;
+            heldTag = tagOf(again);
         }
-
-        // Put a small set back in force so the next trial reads cheaply again.
-        // With no writer running the counter is even and stable, so this single
-        // uncontended read must adopt: it is the control for every trial.
-        fir.setCoefficients(tagKernel(live, kTagTaps));
-        if (fir.processSample(1.0f, 0) != live) ++st.resetMismatches;
+        pauseRequested.store(false, std::memory_order_release);
     }
 
-    st.lastTag = 2.0f * static_cast<float>(maxTrials) + 7.0f;
-    fir.setCoefficients(tagKernel(st.lastTag, kTagTaps));
+    if (st.reads >= readCap) st.capHit = 1;
+
+    watchdogStop.store(true, std::memory_order_relaxed);
+    watchdog.join();
+    st.stalls = stallCount.load(std::memory_order_relaxed);
+
+    stop.store(true, std::memory_order_relaxed);
+    pauseRequested.store(false, std::memory_order_release);
+    writer.join();
+    st.publications = publishedTag.load(std::memory_order_acquire) - 1;
+
+    // With the writer joined the counter is even and stable, so this last
+    // publication must be in force after one read: nothing was lost.
+    const long long finalTagValue = publishedTag.load(std::memory_order_acquire) + 1;
+    stamp(finalTagValue);
+    fir.setCoefficients(staged);
+    st.lastTag  = static_cast<float>(finalTagValue);
     st.finalTag = fir.processSample(1.0f, 0);
+
+    // The denominator for the bound check: the same reader, the same set, the
+    // same build, with nobody publishing. Measured after the writer is joined
+    // so it is genuinely uncontended.
+    {
+        std::vector<long long> quiet;
+        for (int i = 0; i < 32; ++i)
+        {
+            stamp(finalTagValue + 1 + i);
+            fir.setCoefficients(staged);
+            const auto q0 = clock::now();
+            (void) fir.processSample(1.0f, 0);
+            quiet.push_back(nsSince(q0));
+        }
+        std::nth_element(quiet.begin(), quiet.begin() + static_cast<long>(quiet.size() / 2),
+                         quiet.end());
+        st.quietReadNs = quiet[quiet.size() / 2];
+    }
 
     if (!readNs.empty())
     {
@@ -1142,19 +1255,47 @@ static BoundedReadTrials runBoundedReadTrials(int wantDeferrals, int maxTrials)
 // The bound itself. The audio thread is made to read while a publish is in
 // flight, under a protocol that guarantees the read enters the seqlock loop,
 // and it comes back holding a set OLDER than the publication that completed
-// before the writer signalled. Only a bounded reader can do that: the unbounded
-// loop has no exit other than a validated read, so it must wait for the writer
-// and must come back with the new set. That is a property of the code and holds
-// at any optimisation level and under any sanitizer, which a duration does not.
+// before it began. Only a bounded reader can do that: the unbounded loop has no
+// exit other than a validated read, so it must wait for the writer and must
+// come back with the new set. That is a property of the code and holds at any
+// optimisation level and under any sanitizer, which a duration does not.
+//
+// The two failure modes are told apart rather than conflated. A writer that
+// never ran is reported by `opportunities` and `publications`, which are the
+// preconditions; a reader that never had to give up is reported by `deferrals`,
+// which is the property. A busy host makes the second EASIER to satisfy, so
+// scheduling pressure cannot turn this pin red.
 DSPARK_TEST(FIR_bounded_seqlock_read_does_not_wait_for_the_publisher)
 {
-    const BoundedReadTrials st = runBoundedReadTrials(4, 96);
+    const BoundedReadTrials st = runBoundedReadTrials(4, 64);
 
+    EXPECT_GT(st.publications, 0);                // the writer really published
+    EXPECT_GT(st.opportunities, 0);               // reads really entered the loop
     EXPECT_GT(st.deferrals, 0);                   // it came back without waiting
     EXPECT_EQ(st.illegal, 0);                     // never a set nobody published
-    EXPECT_EQ(st.reArmFailures, 0);               // the update landed on the next read
-    EXPECT_EQ(st.signalTimeouts, 0);              // every trial really raced
-    EXPECT_EQ(st.resetMismatches, 0);             // and an uncontended read always adopts
+    EXPECT_EQ(st.regressions, 0);                 // and never an older one
+    EXPECT_EQ(st.reArmFailures, 0);               // a deferred update is not dropped
+    EXPECT_EQ(st.quiesceTimeouts, 0);             // the writer answered every pause
+    EXPECT_EQ(st.capHit, 0);                      // and the run ended on its own terms
+    EXPECT_EQ(st.stalls, 0);                      // no read waited for the publisher
+
+    // What this case does NOT pin, said here rather than left to be assumed:
+    // the SIZE of the attempt limit. It pins that the give-up path exists and
+    // is reached. A limit raised to a billion still gives up eventually, so
+    // the counters above stay green while a single read stalls for hundreds of
+    // milliseconds -- and no duration written here can separate that from an
+    // ordinary preemption: measured on this host, the worst colliding read is
+    // 27 ms on a loaded machine with the limit intact and 448 ms with the
+    // limit at a billion, while the MEDIAN is 21 us in both. A threshold
+    // between those maxima is a coin toss on a busy runner, which is the
+    // failure this protocol was reshaped to remove.
+    //
+    // The size of the limit is guarded instead by tools/verify_threading_doc.py,
+    // which checks every site agrees on the declared value and that the reader
+    // is a counted loop over it. Both breaks make it exit 1, and it runs on
+    // every push. The durations below are recorded by the probe alongside this
+    // suite, where a number is evidence rather than a pass condition.
+    EXPECT_TRUE(st.quietReadNs > 0);
     EXPECT_NEAR(st.finalTag, st.lastTag, 1e-4f);  // nothing was lost on the way
 }
 
@@ -1215,10 +1356,15 @@ DSPARK_TEST(FIR_bounded_seqlock_read_never_adopts_a_torn_set)
     EXPECT_TRUE(published.load(std::memory_order_relaxed) >= kMinPublications);
 
     // Not vacuous: the same header, driven so that the reader must give up.
-    const BoundedReadTrials st = runBoundedReadTrials(4, 96);
+    const BoundedReadTrials st = runBoundedReadTrials(4, 64);
+    EXPECT_GT(st.publications, 0);
+    EXPECT_GT(st.opportunities, 0);
     EXPECT_GT(st.deferrals, 0);
     EXPECT_EQ(st.illegal, 0);
-    EXPECT_EQ(st.signalTimeouts, 0);
+    EXPECT_EQ(st.regressions, 0);
+    EXPECT_EQ(st.quiesceTimeouts, 0);
+    EXPECT_EQ(st.capHit, 0);
+    EXPECT_EQ(st.stalls, 0);
 }
 
 // The flat delay-line layout must keep channels fully independent.
@@ -1691,16 +1837,28 @@ DSPARK_TEST(Biquad_concurrent_setCoeffs_is_tear_free)
 
     Biquad<float> bq;
     std::atomic<bool> stop { false };
+    std::atomic<long long> published { 0 };
     std::thread gui([&] {
         for (unsigned i = 0; !stop.load(std::memory_order_relaxed); ++i)
+        {
             bq.setCoeffs((i & 1u) ? setB : setA);
+            published.fetch_add(1, std::memory_order_relaxed);
+        }
     });
 
+    // The reader stops when it has seen enough adoptions, or when the WRITER
+    // stops making progress -- never on an iteration count. A count is a proxy
+    // for time, and on a host that hands both threads the same core the reader
+    // burns through it while the writer is descheduled, which would turn a
+    // scheduling decision into a verdict about the seqlock. Yielding when
+    // there is nothing to adopt is part of the same reasoning: it gives the
+    // writer the core it needs to produce the next publication.
+    constexpr long long kIdleCap = 20000000LL;
     int torn = 0, seen = 0;
-    long long iters = 0;
-    while (seen < 2000 && iters < 50000000LL)
+    long long lastPublished = 0;
+    long long idleSpins = 0;
+    while (seen < 2000 && idleSpins < kIdleCap)
     {
-        ++iters;
         if (bq.applyPendingCoeffs())
         {
             const auto& c = bq.getCoeffs();
@@ -1710,12 +1868,24 @@ DSPARK_TEST(Biquad_concurrent_setCoeffs_is_tear_free)
             if (!homogeneous)
                 ++torn;
             ++seen;
+            idleSpins = 0;
+            continue;
         }
+
+        const long long now = published.load(std::memory_order_relaxed);
+        if (now != lastPublished) { lastPublished = now; idleSpins = 0; }
+        else                      { ++idleSpins; }
+        // Spin for a while before yielding. On a machine with a core to spare
+        // the yield would cost far more than the poll it replaces, and on one
+        // without, giving the slice back every so often is enough for the
+        // writer to keep publishing.
+        if ((idleSpins & 0x3ffLL) == 0) std::this_thread::yield();
     }
     stop.store(true, std::memory_order_relaxed);
     gui.join();
 
     EXPECT_EQ(torn, 0);
+    EXPECT_GT(published.load(std::memory_order_relaxed), 0);  // the writer ran
     EXPECT_TRUE(seen >= 2000);  // the race actually ran; not a vacuous pass
 }
 

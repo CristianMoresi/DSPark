@@ -10,6 +10,7 @@
 #include "vendor/imgui/imgui.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -123,6 +124,10 @@ private:
     bool  seekActive_ = false;  // true while the seek bar is grabbed (defer the seek)
     float thdTimer_ = 0.0f;     // live THD reading refresh accumulator
     AudioEngine::ThdReading thdLast_ {};
+
+    // Reader-owned copy of the engine's waveform snapshot (see drawMeters).
+    std::array<float, AudioEngine::kBlockSize> waveL_ {};
+    std::array<float, AudioEngine::kBlockSize> waveR_ {};
 
     // --- Frequency / dB mapping helpers ---------------------------------------
 
@@ -253,7 +258,12 @@ private:
             if (!catOpen) continue;
 
             ImGui::PushID(i);
-            ImGui::Checkbox("##en", &e.enabled);
+            // The audio thread reads this flag, so the widget edits a local
+            // copy and the result is published back rather than letting the
+            // checkbox store straight into the shared word.
+            bool slotEnabled = e.enabled.get();
+            if (ImGui::Checkbox("##en", &slotEnabled))
+                e.enabled = slotEnabled;
             ImGui::SameLine();
             if (ImGui::Selectable(e.name.c_str(), e.selected))
             {
@@ -349,7 +359,12 @@ private:
         // One sample per screen pixel so sharp features (notch nulls, high-Q peaks)
         // render smoothly and don't flicker/alias as the frequency is moved.
         constexpr int kMaxN = 1200;
-        const int N = std::clamp(static_cast<int>(w), 64, kMaxN);
+        // Bounded BEFORE the conversion, not after: the content region can be
+        // zero or negative at some window sizes, and a clamp on the result of
+        // an out-of-range conversion runs too late. The test is written so a
+        // NaN takes the low branch instead of failing both comparisons.
+        const int N = !(w > 64.0f) ? 64
+                    : (w > static_cast<float>(kMaxN) ? kMaxN : static_cast<int>(w));
         static float freqs[kMaxN], mags[kMaxN];
         static ImVec2 pts[kMaxN];
         for (int i = 0; i < N; ++i)
@@ -381,8 +396,13 @@ private:
         dl->AddPolyline(pts, N, IM_COL32(255, 190, 70, 255), 0, 2.4f);
 
         auto curveDbAt = [&](float fHz) -> float {
-            float t = (freqToX(fHz, p0.x, w) - p0.x) / w;
-            int idx = std::clamp(static_cast<int>(t * (N - 1) + 0.5f), 0, N - 1);
+            const float t = (freqToX(fHz, p0.x, w) - p0.x) / w;
+            // Same rule as the sample count above: a zero-width region makes t
+            // a NaN, so the range is settled before the conversion.
+            const float scaled = t * static_cast<float>(N - 1) + 0.5f;
+            const int idx = !(scaled > 0.0f) ? 0
+                          : (scaled >= static_cast<float>(N - 1) ? N - 1
+                                                                : static_cast<int>(scaled));
             return mags[idx];
         };
 
@@ -628,9 +648,13 @@ private:
 
     void drawMeters(AudioEngine& engine)
     {
-        int waveN = engine.getWaveformSize();
+        // The engine overwrites its snapshot every block on the audio thread,
+        // so the plot is drawn from a copy taken here rather than from a
+        // pointer into it.
+        const int waveN = engine.getWaveform(waveL_.data(), waveR_.data(),
+                                             static_cast<int>(waveL_.size()));
         if (waveN > 0)
-            ImGui::PlotLines("##wave", engine.getWaveformL(), waveN, 0, "Waveform", -1.0f, 1.0f, ImVec2(-1, 50));
+            ImGui::PlotLines("##wave", waveL_.data(), waveN, 0, "Waveform", -1.0f, 1.0f, ImVec2(-1, 50));
 
         float peakL = engine.getPeakL(), peakR = engine.getPeakR();
         float dbL = peakL > 0.0f ? 20.0f * std::log10(peakL) : -100.0f;

@@ -386,6 +386,7 @@
  * | `GranularProcessor<T>`   | Effects/GranularProcessor.h | Granular clouds/freeze: per-grain pitch, jitter, stereo spread |
  * | `SpectralFreeze<T>`      | Effects/SpectralFreeze.h | Tonal or diffuse STFT magnitude hold with deterministic transitions |
  * | `SpectralDenoiser<T>`    | Effects/SpectralDenoiser.h | Learnable-profile spectral gating noise reduction |
+ * | `PitchCorrector<T>`      | Effects/PitchCorrector.h | Monophonic scale-aware retune: detect, quantize, shift, with formant preservation |
  * | `ChordDetector<T>`       | Music/ChordDetector.h     | Goertzel chroma + template chord recognition with confidence |
  * | `KeyDetector<T>`         | Music/KeyDetector.h       | Musical key estimation: accumulated chroma against published key profiles |
  * | `DeEsser<T>`             | Effects/DeEsser.h     | Split-band de-esser with dynamic sibilance detection                |
@@ -739,6 +740,7 @@
 #include "Effects/GranularProcessor.h"
 #include "Effects/SpectralFreeze.h"
 #include "Effects/SpectralDenoiser.h"
+#include "Effects/PitchCorrector.h"
 
 // === Analysis ===============================================================
 

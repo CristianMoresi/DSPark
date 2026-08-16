@@ -228,6 +228,35 @@ int main()
         }, 48000.0));
     }
     {
+        // PitchCorrector in its three working modes. The chain is a YIN
+        // detector plus a phase vocoder, so the interesting number is how much
+        // the correction layer adds on top of the shifter it drives; formant
+        // preservation buys two more FFTs per analysis frame.
+        struct CorrectorCase { const char* name; double retuneMs; bool formant; };
+        const CorrectorCase correctorCases[] = {
+            { "PitchCorrector hard snap", 0.0, false },
+            { "PitchCorrector glide 60 ms", 60.0, false },
+            { "PitchCorrector formant preserve", 60.0, true },
+        };
+        for (const auto& correctorCase : correctorCases)
+        {
+            dspark::PitchCorrector<float> corrector;
+            corrector.setRetuneSpeedMs(static_cast<float>(correctorCase.retuneMs));
+            corrector.setFormantPreserve(correctorCase.formant);
+            corrector.prepare(spec);
+            for (int warm = 0; warm < 24; ++warm)
+            {
+                fill();
+                corrector.processBlock(stereo.toView());
+            }
+            printRow(correctorCase.name, medianNsPerFrame([&] {
+                fill();
+                corrector.processBlock(stereo.toView());
+                g_sink += stereo.getChannel(0)[0];
+            }, kBlock));
+        }
+    }
+    {
         // SpectralFreeze in its three steady states: transparent live path,
         // tonal hold and diffuse hold (N 2048, hop 512).
         struct FreezeCase

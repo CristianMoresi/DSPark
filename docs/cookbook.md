@@ -578,3 +578,67 @@ than return a bad splice. `renderLoop()` writes one cycle of
 `end - start - crossfadeLength` samples whose last sample flows into its
 first: the overlap is an equal-power crossfade renormalized so correlated
 material keeps unit gain instead of the raw +3 dB center bulge.
+
+## 16. Retune a vocal to a key
+
+`PitchCorrector` is the detect-quantize-shift chain in one processor: it
+tracks the fundamental with the framework's YIN detector, snaps it to the
+nearest note of the scale you choose, and shifts by the difference with the
+phase-vocoder pitch shifter. The retune speed is the whole character
+control -- 0 ms is the hard, quantized snap; a few tens of milliseconds is
+intonation help nobody hears.
+
+```cpp
+dspark::PitchCorrector<float> retune;
+retune.setScale(dspark::harmony::allScales[0].mask, 7);  // G major
+retune.setRetuneSpeedMs(35.0f);          // 0 = hard snap, larger = gentler
+retune.setFormantPreserve(true);         // keep the singer's timbre
+retune.prepare(spec);                    // latency = 4096 samples
+
+// Audio thread:
+retune.processBlock(vocal);              // in place, allocation-free
+```
+
+Report `getLatency()` to the host: the shifter's 4096 samples (85 ms at
+48 kHz) are constant and must be compensated like any other look-ahead.
+
+How fast a hard snap lands follows from one property of the mask you choose,
+its **widest gap** — the largest distance between two adjacent notes of the
+scale. The largest correction is half that gap; the largest CHANGE in the
+correction is the whole gap, taken when the singer crosses the middle of it.
+The phase vocoder moves the shift by at most half a semitone per analysis
+hop, so settling grows with the change (worst case over control phase, both
+directions, 48 / 44.1 kHz):
+
+| widest gap | scales | largest correction | largest change | settles in |
+|---|---|---|---|---|
+| 1 st | Chromatic (the default) | 0.5 st | 1 st | 23 / 26 ms |
+| 2 st | major, minor, the modes, whole tone | 1 st | 2 st | 44 / 49 ms |
+| 3 st | harmonic minor, the pentatonics, and 28 others | 1.5 st | 3 st | 66 / 72 ms |
+| 4 st | Hirajoshi, InSen, Balinese, Chinese, Japanese | 2 st | 4 st | 89 / 96 ms |
+| 12 st | a one-note mask | 6 st | 12 st | about 265 / 288 ms |
+
+Up to one semitone the transition finishes inside the effect's own latency
+and is inaudible; wider gaps are audible by their excess. They are traversals,
+not errors: the pitch glides continuously and lands within 10 cents. If you
+need a bounded response, choose a scale whose widest gap is a whole tone or
+less. Time to target grows with the retune speed above about 8 ms; shorter
+glides are already at the vocoder's floor and sound identical.
+
+Those milliseconds hold at every sample rate, because the analysis frame is
+chosen from the rate to keep its span near 43 ms rather than being pinned to
+a sample count: 2048 samples at 44.1/48 kHz, 4096 at 88.2/96 kHz, 8192 at
+176.4/192 kHz. `getFrameSize()` reports the choice and `getLatency()` grows
+with it, staying near 85 ms in time. Pass a frame to `prepare()` if you want
+a different trade — a shorter one settles faster and stops resolving the
+harmonics of a bass voice, which is the whole reason the default is what it
+is.
+
+The scale mask is a 12-bit `harmony::NoteSet` (bit k = k semitones above the
+root), so anything in `harmony::allScales` works, as does a mask you build
+yourself; an empty mask switches correction off without leaving the chain.
+The default is the chromatic scale, which snaps to the nearest semitone
+whatever the key. Correction holds through consonants and breaths instead of
+sagging back to the sung pitch, and it is monophonic by construction: one
+voice, one fundamental. On chords the detector reports whichever periodicity
+wins, and the correction follows that.

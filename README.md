@@ -2,11 +2,11 @@
   <img src="docs/img/dspark-gh.png" alt="DSPark - A header-only audio DSP framework in pure C++20" width="100%">
 </p>
 
-**v1.6.1** — 99 headers of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins (effects and MIDI instruments) with HTML/CSS/JS editors.
+**v1.6.1** — 100 headers of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins (effects and MIDI instruments) with HTML/CSS/JS editors.
 
 **📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
-CI runs an 857-case test suite and the public conformance suite on every commit across Windows (MSVC, x64 and ARM64), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus AddressSanitizer/UBSan, an exceptions-free embedded profile and a single-header amalgamation. Loudness is validated against the official EBU R128 test vectors, and a [per-processor quality metrics table](docs/metrics.md) (THD+N, noise floor, spurious/aliasing, latency) is generated from the measurements.
+CI runs an 882-case test suite and the public conformance suite on every commit across Windows (MSVC, x64 and ARM64), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus AddressSanitizer/UBSan, an exceptions-free embedded profile and a single-header amalgamation. Loudness is validated against the official EBU R128 test vectors, and a [per-processor quality metrics table](docs/metrics.md) (THD+N, noise floor, spurious/aliasing, latency) is generated from the measurements.
 
 ```cpp
 #include "DSPark/DSPark.h"
@@ -78,7 +78,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 
 ## What's Included
 
-### Effects (38 processors)
+### Effects (39 processors)
 
 | Class | Description |
 |---|---|
@@ -120,6 +120,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `GranularProcessor<T>` | 64-grain clouds over live input: per-grain pitch/pan/jitter, time-domain grain-history freeze, equal-power spread |
 | `SpectralFreeze<T>` | Spectral hold: captures the playing STFT frame and sustains it with peak-locked tonal or deterministic diffuse phase evolution, click-free enter/exit |
 | `SpectralDenoiser<T>` | Learnable-noise-profile spectral gating with the standard musical-noise defenses |
+| `PitchCorrector<T>` | Monophonic pitch correction: YIN detection, scale-aware quantization and phase-vocoder retune, from hard snap to a transparent glide, with formant preservation |
 
 ### Core (40 building blocks)
 
@@ -435,12 +436,12 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 DSPark/
 ├── DSPark.h                 # Single umbrella include + full documentation
 ├── Core/          (41)      # Building blocks: filters, FFT, WDF, oscillators, SIMD
-├── Effects/       (38)      # Ready-to-use processors: EQ, compressor, reverb, tape...
+├── Effects/       (39)      # Ready-to-use processors: EQ, compressor, reverb, tape...
 ├── Analysis/      (12)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation, onset
 ├── IO/             (5)      # WAV/MP3, Standard MIDI and native FLAC I/O
 ├── Music/          (3)      # Harmony constants + real-time chord and key detection
 ├── plugin/                  # Native plugin layer: VST3, CLAP, AU + WebView editor
-├── tests/                   # Test suite: 857 cases, zero dependencies
+├── tests/                   # Test suite: 882 cases, zero dependencies
 ├── conformance/             # Public conformance suite (runs in CI)
 ├── docs/                    # Cookbook, plugin guide, threading model, metrics
 ├── examples/                # WAV processing, channel strip, plugins, templates

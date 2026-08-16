@@ -77,6 +77,7 @@ void instantiate()
     Panner<T> pan;
     Phaser<T> phr;
     PitchShifter<T> pitchShift;
+    PitchCorrector<T> pitchCorrect;
     Reverb<T> rev;
     RingModulator<T> rm;
     Saturation<T> sat;
@@ -128,7 +129,8 @@ void instantiate()
     (void)filterEngine; (void)fs; (void)g; (void)gran; (void)spectralFreeze;
     (void)lim; (void)mbc;
     (void)ngt; (void)ng; (void)pan; (void)phr; (void)pitchShift; (void)rev;
-    (void)rm; (void)sat; (void)denoiser; (void)sw; (void)tape; (void)xfmr;
+    (void)rm; (void)sat; (void)denoiser; (void)pitchCorrect; (void)sw;
+    (void)tape; (void)xfmr;
     (void)td; (void)tr; (void)tube; (void)vib;
     (void)envFollow; (void)goe; (void)lvl; (void)ldm; (void)ldn;
     (void)phaseCorr;

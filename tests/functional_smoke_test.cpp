@@ -139,6 +139,9 @@ int testAll()
     slots.push_back(make("Panner",         std::make_shared<Panner<float>>()));
     slots.push_back(make("StereoWidth",    std::make_shared<StereoWidth<float>>()));
 
+    // Pitch
+    slots.push_back(make("PitchCorrector", std::make_shared<PitchCorrector<float>>()));
+
     // Utility
     slots.push_back(make("Gain",           std::make_shared<Gain<float>>()));
 
@@ -225,6 +228,47 @@ int testAll()
     catch (const std::exception& e)
     {
         std::printf("FAIL %-18s exception: %s\n", "OnsetDetector", e.what());
+        ++failed;
+    }
+
+    // The Slot loop runs PitchCorrector at its defaults and never touches its
+    // control surface. Drive the scale, the retune speed and the formant mode
+    // while the stream runs, and check the documented latency.
+    try
+    {
+        PitchCorrector<float> corrector;
+        corrector.prepare(spec);
+        bool correctorFailed = false;
+        for (int b = 0; b < 24 && !correctorFailed; ++b)
+        {
+            if (b == 6) corrector.setScale(0x0AB5, 2);     // D major
+            if (b == 10) corrector.setRetuneSpeedMs(40.0f);
+            if (b == 14) corrector.setFormantPreserve(true);
+            if (b == 18) corrector.setScale(0, 0);         // correction off
+            fillSine(buf, b * kBlockSize);
+            corrector.processBlock(buf.toView());
+            std::string reason;
+            if (isUnsafe(buf, 4.0f, reason))
+            {
+                std::printf("FAIL %-18s block %d: %s\n", "PitchCorrector", b,
+                            reason.c_str());
+                ++failed;
+                correctorFailed = true;
+            }
+        }
+        if (!correctorFailed && corrector.getLatency() != 4096)
+        {
+            std::printf("FAIL %-18s latency != 4096\n", "PitchCorrector");
+            ++failed;
+            correctorFailed = true;
+        }
+        if (!correctorFailed)
+            std::printf("OK   %-18s (live scale, speed and formant changes)\n",
+                        "PitchCorrector");
+    }
+    catch (const std::exception& e)
+    {
+        std::printf("FAIL %-18s exception: %s\n", "PitchCorrector", e.what());
         ++failed;
     }
 

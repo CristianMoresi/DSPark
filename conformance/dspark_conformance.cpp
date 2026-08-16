@@ -585,6 +585,19 @@ void runSmokeTests()
         p->prepare(spec);
         return std::function<void(V)>([p](V b) { p->processBlock(b); });
     }});
+    cases.push_back({ "PitchCorrectorSnap", [&] {
+        auto p = std::make_shared<dspark::PitchCorrector<float>>();
+        p->prepare(spec);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
+    cases.push_back({ "PitchCorrectorGlide", [&] {
+        auto p = std::make_shared<dspark::PitchCorrector<float>>();
+        p->setScale(0x0AB5, 9);   // major mask rooted at A
+        p->setRetuneSpeedMs(60.0f);
+        p->setFormantPreserve(true);
+        p->prepare(spec);
+        return std::function<void(V)>([p](V b) { p->processBlock(b); });
+    }});
     cases.push_back({ "TransformerModel", [&] {
         auto p = std::make_shared<dspark::TransformerModel<float>>();
         p->prepare(spec); p->setDrive(9.0f);
@@ -1861,6 +1874,12 @@ std::vector<MetricsCase> buildMetricsCases()
           "hold engages on request; the live path is measured",
           [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }); }
 
+    { auto p = std::make_shared<dspark::PitchCorrector<float>>();
+      p->prepare(spec);
+      add("PitchCorrector", "chromatic, hard snap",
+          "retunes the probe tone to the nearest semitone: displaced by design",
+          [p](V b){ p->processBlock(b); }, [p]{ return p->getLatency(); }, true); }
+
     { auto p = std::make_shared<dspark::AlgorithmicReverb<float>>();
       p->prepare(spec); p->setType(dspark::AlgorithmicReverb<float>::Type::Hall);
       p->setMix(0.4f);
@@ -2030,6 +2049,110 @@ void writeAnalysisAccuracy(FILE* out)
         std::printf("TABLE %-26s recovery %s  seam cost %.2e\n", "LoopFinder",
                     exact ? "exact" : "MISSED",
                     exact ? static_cast<double>(loop.seamCost) : 1.0);
+    }
+
+    // PitchCorrector: how far the corrected output lands from the note it was
+    // asked to snap to. The measurement is a plain autocorrelation period
+    // estimate written here, not the framework's own pitch detector: asking
+    // the detector that drives the correction whether the correction is right
+    // would only confirm that it agrees with itself. A periodic signal
+    // correlates equally at every multiple of its period, so the coarse pass
+    // takes the smallest strong local maximum and the refinement measures a
+    // high multiple of it, which divides the interpolation error by that
+    // multiple.
+    {
+        const double rate = 48000.0;
+        const auto measureF0 = [&](const std::vector<float>& x) {
+            const int n = static_cast<int>(x.size());
+            std::vector<double> s(static_cast<size_t>(n));
+            double mean = 0.0;
+            for (int i = 0; i < n; ++i) { s[static_cast<size_t>(i)] = x[static_cast<size_t>(i)]; mean += s[static_cast<size_t>(i)]; }
+            mean /= static_cast<double>(n);
+            for (double& v : s) v -= mean;
+            const int minLag = 34, maxLag = 800;
+            const int span = n - maxLag;
+            const auto acf = [&](int lag) {
+                double num = 0.0, e0 = 0.0, e1 = 0.0;
+                for (int i = 0; i < span; ++i)
+                {
+                    const double a = s[static_cast<size_t>(i)];
+                    const double b = s[static_cast<size_t>(i + lag)];
+                    num += a * b; e0 += a * a; e1 += b * b;
+                }
+                const double den = std::sqrt(e0 * e1);
+                return den > 0.0 ? num / den : 0.0;
+            };
+            std::vector<double> r(static_cast<size_t>(maxLag + 2), 0.0);
+            double top = -2.0;
+            for (int lag = minLag; lag <= maxLag; ++lag)
+            { r[static_cast<size_t>(lag)] = acf(lag); top = std::max(top, r[static_cast<size_t>(lag)]); }
+            int coarse = -1;
+            for (int lag = minLag + 1; lag < maxLag; ++lag)
+            {
+                const double v = r[static_cast<size_t>(lag)];
+                if (v < 0.93 * top) continue;
+                if (v >= r[static_cast<size_t>(lag - 1)] && v >= r[static_cast<size_t>(lag + 1)])
+                { coarse = lag; break; }
+            }
+            if (coarse < 0) return 0.0;
+            const int multiple = std::max(1, (maxLag - 1) / coarse);
+            const int centre = multiple * coarse;
+            const int radius = std::max(2, coarse / 4);
+            int peak = centre;
+            double best = -2.0;
+            for (int lag = centre - radius; lag <= centre + radius; ++lag)
+            {
+                if (lag < minLag || lag + span >= n) continue;
+                const double v = acf(lag);
+                if (v > best) { best = v; peak = lag; }
+            }
+            const double ym = acf(peak - 1), y0 = acf(peak), yp = acf(peak + 1);
+            const double denom = ym - 2.0 * y0 + yp;
+            const double delta = denom != 0.0 ? 0.5 * (ym - yp) / denom : 0.0;
+            const double refined = peak + (std::fabs(delta) < 1.0 ? delta : 0.0);
+            return refined > 0.0 ? rate * multiple / refined : 0.0;
+        };
+
+        double worstCents = 0.0;
+        int worstNote = 0;
+        for (int note : { 45, 57, 64, 69, 76 })
+        {
+            for (double detune : { -45.0, 45.0 })
+            {
+                const double target = 440.0 * std::exp2((note - 69) / 12.0);
+                const double f0 = target * std::exp2(detune / 1200.0);
+                const int n = static_cast<int>(rate * 0.45);
+                std::vector<float> signal(static_cast<size_t>(n), 0.0f);
+                const int harmonics = static_cast<int>(0.45 * rate / f0);
+                for (int k = 1; k <= harmonics; ++k)
+                    for (int i = 0; i < n; ++i)
+                        signal[static_cast<size_t>(i)] += static_cast<float>(
+                            0.35 / k * std::sin(2.0 * kPiConf * f0 * k * i / rate + 0.37 * k));
+
+                dspark::PitchCorrector<float> corrector;
+                corrector.prepare(dspark::AudioSpec{ rate, 512, 1 });
+                int position = 0;
+                while (position < n)
+                {
+                    const int length = std::min(512, n - position);
+                    float* pointer = signal.data() + position;
+                    corrector.processBlock(dspark::AudioBufferView<float>(&pointer, 1, length));
+                    position += length;
+                }
+                std::vector<float> tail(signal.end() - 9600, signal.end());
+                const double measured = measureF0(tail);
+                const double cents = measured > 0.0
+                    ? 1200.0 * std::log2(measured / target) : 9999.0;
+                if (std::fabs(cents) > std::fabs(worstCents))
+                { worstCents = cents; worstNote = note; }
+            }
+        }
+        std::fprintf(out,
+            "| `PitchCorrector` tuning | harmonic tones 45 cents off five notes,"
+            " chromatic scale | worst steady-state error | %+.2f cents (note %d) |\n",
+            worstCents, worstNote);
+        std::printf("TABLE %-26s worst steady-state error %+.2f cents\n",
+                    "PitchCorrector", worstCents);
     }
 
     std::fprintf(out,

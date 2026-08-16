@@ -57,17 +57,17 @@ lock-free on every supported target and outside the census.
 That is a run-time census of the word types. It is **not** a compile-time check
 on your component, and the build will not stop you using a word the census
 never saw. Where the word type is a template parameter the census cannot reach
-it at all. Nine headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
+it at all. Ten headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
 `Analysis/BeatTracker.h`, `Effects/AutoGain.h`, `Effects/Equalizer.h`,
 `Effects/DynamicEQ.h`, `Effects/SpectralFreeze.h`,
-`Effects/detail/PhaseVocoderEngine.h`,
+`Effects/PitchCorrector.h`, `Effects/detail/PhaseVocoderEngine.h`,
 `Effects/TimeStretch.h` and `Music/KeyDetector.h` -- and
 most of the headers that declare such an atomic do not.
-Six of the nine are pinning a word whose
-type is a template parameter, which is the case the census cannot reach;
-`Analysis/BeatTracker.h`, `Effects/SpectralFreeze.h` and `Music/KeyDetector.h`
-publish concrete widths that
-the census does cover, and pin them anyway, because a compile-time assertion at
+Five of the ten pin a word whose
+type is a template parameter, which is the case the census cannot reach, and
+six pin a concrete width the census already covers -- `Effects/PitchCorrector.h`
+does both. They pin the concrete ones anyway, because a compile-time assertion
+at
 the declaration is a stronger statement than a run-time one in another file and
 it is the declaration that a later edit changes. A new component with an atomic
 word on the audio path should do the same:
@@ -254,6 +254,23 @@ report the requested bits, deliberately not transition progress -- there is no
 cross-thread active-state readout to catch mid-glide. `prepare()` and `reset()`
 keep the usual setup ownership and preserve the requested word, like any other
 parameter.
+
+`Effects/PitchCorrector.h` packs its scale the same way, and for the same
+reason: `setScale()` publishes the mask, the root and the pre-rotated
+pitch-class set in one `std::atomic<std::uint32_t>`, so the audio thread can
+never pair a fresh mask with a stale root. It is also the framework's clearest
+case of a processor that OWNS other processors. Its detector and its shifter
+are private members, and their control entry points -- the ones a normal owner
+would call from a message thread -- are called only by the stream owner from
+inside `processBlock()` and `reset()`. That is stronger than the single-writer
+rule those members are documented for, not weaker: their control-to-audio
+hand-offs become same-thread sequential code, and the only genuinely
+cross-thread words left are this class's own three relaxed publications. A
+component that composes others should either do this, or leave the inner
+setters to one external control writer -- never both at once, because two
+writers are exactly what the single-producer contract does not cover. The
+inner `setSemitones()` and `setFormantPreserve()` calls named here belong to
+`Effects/PitchShifter.h`.
 
 `Analysis/LoopFinder.h` sits outside the audio-thread contract altogether: the
 loop search is an offline operation. `find()` may allocate bounded scratch and

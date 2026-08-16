@@ -43,6 +43,7 @@ add_executable(dspark_tests
     TestOnset.cpp
     TestSpectralFreeze.cpp
     TestLoopFinder.cpp
+    TestPitchCorrector.cpp
     TestQualityAudit.cpp
     TestState.cpp)
 

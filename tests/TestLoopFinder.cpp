@@ -316,8 +316,13 @@ void exerciseSearchAndRender()
             EXPECT_EQ(output[static_cast<std::size_t>(ch)][static_cast<std::size_t>(i)],
                       audio[static_cast<std::size_t>(ch)][static_cast<std::size_t>(96 + i)]);
 
-        Crossfade<T> crossfade;
-        crossfade.setCurve(Crossfade<T>::Curve::EqualPower);
+        // The expectation is rebuilt from the equal-power curve itself, out of
+        // pure operands. A crossfader publishes its gain pair from the
+        // processing call, so asking it for the blend and for the gains to
+        // divide the blend by inside one expression leaves the two calls
+        // unsequenced: the divisor is then whichever pair the compiler
+        // happened to read first, and the expectation stops being the same
+        // number on every toolchain.
         for (int i = 1; i < 15; ++i)
         {
             const T tail = audio[static_cast<std::size_t>(ch)]
@@ -325,15 +330,48 @@ void exerciseSearchAndRender()
             const T head = audio[static_cast<std::size_t>(ch)]
                                 [static_cast<std::size_t>(96 + i)];
             const T scale = std::max(std::abs(tail), std::abs(head));
-            crossfade.setPosition(static_cast<T>(i) / T(15));
+            const T position = static_cast<T>(i) / T(15);
+            const T gainTail = std::sqrt(T(1) - position);
+            const T gainHead = std::sqrt(position);
             const T expected = scale == T(0) ? T(0) : scale * std::clamp(
-                crossfade.process(tail / scale, head / scale)
-                    / (crossfade.getGainA() + crossfade.getGainB()),
+                (tail / scale * gainTail + head / scale * gainHead)
+                    / (gainTail + gainHead),
                 T(-1), T(1));
             EXPECT_NEAR(output[static_cast<std::size_t>(ch)]
                               [static_cast<std::size_t>(i)],
                         expected, T(8) * std::numeric_limits<T>::epsilon());
         }
+    }
+}
+
+// The overlap divides the blend by the sum of the two gains it just applied,
+// so a seam between identical constant signals must come back as that
+// constant, exactly, at every position of every fade length. Any other divisor
+// - a gain pair read before the blend that produced it, for one - is an
+// amplitude error here, on every toolchain and with no tolerance to hide in.
+template <typename T>
+void exerciseConstantSeam()
+{
+    using Finder = LoopFinder<T>;
+    const T level = T(0.37);
+    const std::vector<std::vector<T>> audio(2, std::vector<T>(640, level));
+    const std::array<int, 5> fades { 2, 3, 16, 64, 160 };
+    for (const int fade : fades)
+    {
+        const typename Finder::Result loop { Finder::Status::Success, 96, 417,
+                                             fade, T(0) };
+        const int rendered = static_cast<int>(loop.renderedLength());
+        EXPECT_EQ(rendered, 321 - fade);
+
+        std::vector<std::vector<T>> output(
+            2, std::vector<T>(static_cast<std::size_t>(rendered), T(-9)));
+        EXPECT_TRUE(Finder::renderLoop(constView(audio), loop,
+                                       mutableView(output))
+                    == Finder::Status::Success);
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < rendered; ++i)
+                EXPECT_EQ(output[static_cast<std::size_t>(ch)]
+                                [static_cast<std::size_t>(i)], level);
     }
 }
 
@@ -511,6 +549,16 @@ DSPARK_TEST(LoopFinder_find_and_render_float)
 DSPARK_TEST(LoopFinder_find_and_render_double)
 {
     exerciseSearchAndRender<double>();
+}
+
+DSPARK_TEST(LoopFinder_constant_seam_renders_unchanged_float)
+{
+    exerciseConstantSeam<float>();
+}
+
+DSPARK_TEST(LoopFinder_constant_seam_renders_unchanged_double)
+{
+    exerciseConstantSeam<double>();
 }
 
 DSPARK_TEST(LoopFinder_render_minimal_fade_and_cyclic_step)

@@ -284,6 +284,43 @@ DSPARK_TEST(Crossfade_EqualPower_midpoint)
     EXPECT_NEAR(gainB, 0.707f, 0.05f);
 }
 
+DSPARK_TEST(Crossfade_published_gains_come_from_the_processing_call)
+{
+    // The published pair is a readout of the last processing call, never of
+    // the pending position: a new position reaches it only through a call.
+    // Callers that normalize a blend by the sum of its gains must therefore
+    // read the pair in a statement after the call that produced the blend.
+    // Folded into one expression the two are unsequenced, and the divisor
+    // becomes whichever pair the compiler reads first.
+    Crossfade<float> cf;
+    cf.setCurve(Crossfade<float>::Curve::EqualPower);
+
+    // A fresh crossfader publishes full A, and a position alone moves nothing.
+    EXPECT_EQ(cf.getGainA(), 1.0f);
+    EXPECT_EQ(cf.getGainB(), 0.0f);
+    cf.setPosition(0.25f);
+    EXPECT_EQ(cf.getGainA(), 1.0f);
+    EXPECT_EQ(cf.getGainB(), 0.0f);
+
+    // After the call the pair is the one the call applied, so blending two
+    // unit samples returns exactly the sum of the published gains.
+    const float blend = cf.process(1.0f, 1.0f);
+    const float gainA = cf.getGainA();
+    const float gainB = cf.getGainB();
+    EXPECT_EQ(gainB, 0.5f);
+    EXPECT_NEAR(gainA * gainA, 0.75f, 1e-6f);
+    EXPECT_EQ(blend, gainA + gainB);
+
+    // A further position still reports the previous pair until the next call.
+    cf.setPosition(1.0f);
+    EXPECT_EQ(cf.getGainA(), gainA);
+    EXPECT_EQ(cf.getGainB(), gainB);
+    const float second = cf.process(1.0f, 1.0f);
+    EXPECT_EQ(cf.getGainA(), 0.0f);
+    EXPECT_EQ(cf.getGainB(), 1.0f);
+    EXPECT_EQ(second, 1.0f);
+}
+
 DSPARK_TEST(Crossfade_Linear_midpoint)
 {
     Crossfade<float> cf;

@@ -323,6 +323,181 @@ std::vector<double> vowelTone(double f0, double sampleRate, int n)
     return out;
 }
 
+// -- Harmonic integrity: the stimulus, and an instrument that proves itself ---
+//
+// A harmonic-to-residual ratio in decibels is a property of the instrument that
+// reads it as much as of the audio it reads. A probe counts whatever its window
+// leaks outside the capture band as residual, even on a signal that has none,
+// so a probe with a true ratio R and its own leakage floor F reports
+// 1/M = 1/R + 1/F: near its floor it is measuring itself and not the product,
+// and a threshold quoted without its instrument is not a threshold but a
+// reading. The two calibrations below are therefore run before any number from
+// this instrument is allowed to decide anything.
+
+// Additive source-filter vowel. Because it is a sum of exact harmonics of f0,
+// its residual is zero by construction, which is what lets the same signal
+// serve as the instrument's calibration reference. The harmonic phases come
+// from a stated integer recurrence rather than from a standard-library
+// distribution, whose mapping onto a real interval is not specified across
+// implementations, so this stimulus is identical on every platform.
+std::vector<double> vowelStimulus(double f0, double sampleRate, int n)
+{
+    const double formantHz[5]   = { 730.0, 1090.0, 2440.0, 3400.0, 4500.0 };
+    const double bandwidthHz[5] = {  90.0,  110.0,  140.0,  180.0,  220.0 };
+    const double gain[5]        = {   1.0,    0.7,    0.4,    0.2,    0.1 };
+
+    std::vector<double> out(static_cast<std::size_t>(n), 0.0);
+    const int harmonics = static_cast<int>(
+        std::floor(std::min(8000.0, 0.45 * sampleRate) / f0));
+    std::uint32_t state = 12345u;
+    for (int k = 1; k <= harmonics; ++k)
+    {
+        const double f = static_cast<double>(k) * f0;
+        double envelope = 0.0;
+        for (int j = 0; j < 5; ++j)
+        {
+            const double detune = f * f - formantHz[j] * formantHz[j];
+            const double magnitude = std::sqrt(
+                detune * detune + 4.0 * f * f * bandwidthHz[j] * bandwidthHz[j]);
+            envelope += gain[j] * formantHz[j] * bandwidthHz[j]
+                      / std::max(magnitude, 1.0e-9);
+        }
+        const double amplitude = envelope / (1.0 + (f / 300.0) * (f / 300.0));
+        state = 1664525u * state + 1013904223u;
+        const double phase = twoPi<double> * static_cast<double>(state) / 4294967296.0;
+        const double omega = twoPi<double> * f / sampleRate;
+        for (int i = 0; i < n; ++i)
+            out[static_cast<std::size_t>(i)] +=
+                amplitude * std::sin(omega * static_cast<double>(i) + phase);
+    }
+    double peak = 0.0;
+    for (double v : out) peak = std::max(peak, std::abs(v));
+    if (peak > 0.0) for (double& v : out) v *= 0.5 / peak;
+    return out;
+}
+
+// The analysis segment: the largest power of two whose duration does not exceed
+// 0.75 s. Stated in TIME, so the resolution in Hz is the same at every rate; a
+// rule that rounds UP to a power of two gives two adjacent supported rates a
+// factor of two in resolution and makes them disagree about the same audio.
+int analysisSegment(double sampleRate)
+{
+    int n = 1;
+    while (2.0 * static_cast<double>(n) <= 0.75 * sampleRate) n <<= 1;
+    return n;
+}
+
+// Harmonic-to-residual ratio in dB over one segment: one window over the whole
+// segment and one DFT of exactly that many points, with NO zero padding, which
+// would widen the window's main lobe in bins while the capture stayed where it
+// was. The capture is four bins around each harmonic because the four-term
+// Blackman-Harris window nulls at four bins: capturing less than its main lobe
+// counts the skirt as residual for every harmonic and drops the instrument's
+// own floor from 89 dB to 45 dB, which is below the values it has to judge.
+// `f0` is the MEASURED fundamental of this segment, never the nominal target:
+// on a nominal grid a pitch error walks the grid off the harmonics and this
+// measurement double-counts a failure the accuracy tests already own.
+double harmonicResidualDb(const std::vector<double>& x, double sampleRate, double f0)
+{
+    const int n = static_cast<int>(x.size());
+    if (n <= 0 || (n & (n - 1)) != 0 || f0 <= 0.0) return -300.0;
+    std::vector<std::complex<double>> spectrum(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = static_cast<double>(i) / static_cast<double>(n);
+        const double w = 0.35875 - 0.48829 * std::cos(twoPi<double> * t)
+                       + 0.14128 * std::cos(2.0 * twoPi<double> * t)
+                       - 0.01168 * std::cos(3.0 * twoPi<double> * t);
+        spectrum[static_cast<std::size_t>(i)] = { x[static_cast<std::size_t>(i)] * w, 0.0 };
+    }
+    fftRadix2(spectrum);
+
+    const double binHz = sampleRate / static_cast<double>(n);
+    const int lowest = 2;                      // DC leakage, out of BOTH sums
+    const int top = std::min(n / 2, static_cast<int>(
+        std::floor(std::min(20000.0, 0.45 * sampleRate) / binHz)));
+    std::vector<char> isHarmonic(static_cast<std::size_t>(top) + 1, 0);
+    for (int k = 1; static_cast<double>(k) * f0 <= 8000.0; ++k)
+    {
+        const double centre = static_cast<double>(k) * f0 / binHz;
+        const int lo = static_cast<int>(std::ceil(centre - 4.0));
+        const int hi = static_cast<int>(std::floor(centre + 4.0));
+        for (int b = std::max(lo, lowest); b <= std::min(hi, top); ++b)
+            isHarmonic[static_cast<std::size_t>(b)] = 1;
+    }
+    double harmonic = 0.0, residual = 0.0;
+    for (int b = lowest; b <= top; ++b)
+    {
+        const double power = std::norm(spectrum[static_cast<std::size_t>(b)]);
+        if (isHarmonic[static_cast<std::size_t>(b)]) harmonic += power;
+        else                                        residual += power;
+    }
+    if (harmonic <= 0.0) return -300.0;
+    return 10.0 * std::log10(harmonic / std::max(residual, 1.0e-300));
+}
+
+// `clean` plus white Gaussian noise band-limited to exactly the bins the
+// instrument sums as residual, scaled so the in-band ratio of the sum is
+// `snrDb`. Band-limiting is the point: noise spread to Nyquist, read by a probe
+// whose residual band stops short of it, measures a bookkeeping mismatch
+// instead of the probe. The deviates come from a stated recurrence rather than
+// from <random>, whose engines' mapping onto doubles is implementation-defined.
+std::vector<double> plantNoise(const std::vector<double>& clean, double sampleRate,
+                               double snrDb, std::uint64_t seed)
+{
+    const int n = static_cast<int>(clean.size());
+    if (n <= 0 || (n & (n - 1)) != 0) return clean;
+
+    std::uint64_t state = seed;
+    auto uniform = [&state]() {
+        state += 0x9E3779B97F4A7C15ull;
+        std::uint64_t z = state;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= z >> 31;
+        return (static_cast<double>(z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    };
+    std::vector<std::complex<double>> spectrum(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; i += 2)
+    {
+        const double radius = std::sqrt(-2.0 * std::log(uniform()));
+        const double angle = twoPi<double> * uniform();
+        spectrum[static_cast<std::size_t>(i)] = { radius * std::cos(angle), 0.0 };
+        if (i + 1 < n)
+            spectrum[static_cast<std::size_t>(i + 1)] = { radius * std::sin(angle), 0.0 };
+    }
+    fftRadix2(spectrum);
+
+    const double binHz = sampleRate / static_cast<double>(n);
+    const int top = std::min(n / 2, static_cast<int>(
+        std::floor(std::min(20000.0, 0.45 * sampleRate) / binHz)));
+    for (int b = 0; b <= n / 2; ++b)
+    {
+        if (b >= 2 && b <= top) continue;
+        spectrum[static_cast<std::size_t>(b)] = { 0.0, 0.0 };
+        if (b > 0 && b < n / 2) spectrum[static_cast<std::size_t>(n - b)] = { 0.0, 0.0 };
+    }
+    for (auto& value : spectrum) value = std::conj(value);   // inverse through
+    fftRadix2(spectrum);                                     // the forward one
+
+    double noisePower = 0.0, signalPower = 0.0;
+    std::vector<double> noise(static_cast<std::size_t>(n), 0.0);
+    for (int i = 0; i < n; ++i)
+    {
+        noise[static_cast<std::size_t>(i)] =
+            spectrum[static_cast<std::size_t>(i)].real() / static_cast<double>(n);
+        noisePower += noise[static_cast<std::size_t>(i)] * noise[static_cast<std::size_t>(i)];
+        signalPower += clean[static_cast<std::size_t>(i)] * clean[static_cast<std::size_t>(i)];
+    }
+    if (noisePower <= 0.0) return clean;
+    const double scale = std::sqrt(signalPower * std::pow(10.0, -snrDb / 10.0) / noisePower);
+    std::vector<double> out(static_cast<std::size_t>(n), 0.0);
+    for (int i = 0; i < n; ++i)
+        out[static_cast<std::size_t>(i)] = clean[static_cast<std::size_t>(i)]
+                                         + scale * noise[static_cast<std::size_t>(i)];
+    return out;
+}
+
 // -- Corrector driver ---------------------------------------------------------
 
 constexpr std::uint16_t kChromatic = 0x0FFF;
@@ -340,6 +515,7 @@ struct Run
     double retuneMs = 0.0;
     bool formant = false;
     int channels = 1;
+    int frame = 0;                    ///< 0 = the rate's automatic analysis frame
     int scaleAt = -1;                 ///< absolute sample of a second setScale
     std::uint16_t secondMask = 0;
     int secondRoot = 0;
@@ -365,7 +541,7 @@ std::vector<std::vector<T>> renderAll(const std::vector<double>& mono, const Run
     corrector.setScale(run.mask, run.root);
     corrector.setRetuneSpeedMs(static_cast<T>(run.retuneMs));
     corrector.setFormantPreserve(run.formant);
-    corrector.prepare(spec);
+    corrector.prepare(spec, run.frame);
 
     int position = 0;
     while (position < n)
@@ -1138,6 +1314,100 @@ DSPARK_TEST(PitchCorrector_holds_its_analysis_span_across_sample_rates)
     PitchCorrector<float> tiny;
     tiny.prepare(spec, 1);
     EXPECT_EQ(tiny.getFrameSize(), 256);
+}
+
+DSPARK_TEST(PitchCorrector_keeps_the_low_register_resolved_at_its_analysis_span)
+{
+    // What the analysis span is FOR, measured rather than asserted. A bass
+    // voice's harmonics are resolvable only in a long enough span, so this
+    // reads the harmonic-to-residual ratio of a corrected vowel at F2, A2 and
+    // A3 and requires 25 dB; and it reads the same thing again with the frame
+    // pinned to half the policy span, where the low notes must collapse. The
+    // control is expressed as half of whatever the policy chooses at this rate,
+    // never as a sample count: at a high rate a fixed count is a quarter of the
+    // span and would be testing something else. A3 is measured for the same
+    // floor as a guard against a global collapse, but it is NOT required to
+    // fail at half the span, and it does not - which is exactly why it takes a
+    // bass voice to pin the frame from below.
+    const double fs = 48000.0;
+    const int segment = analysisSegment(fs);
+    const int n = static_cast<int>(2.6 * fs);
+    const int offset = static_cast<int>(0.9 * fs);
+
+    AudioSpec spec;
+    spec.sampleRate = fs;
+    spec.maxBlockSize = 512;
+    spec.numChannels = 1;
+    PitchCorrector<float> policy;
+    policy.prepare(spec);
+    const int policyFrame = policy.getFrameSize();
+    const int policyLatency = policy.getLatency();
+    PitchCorrector<float> halved;
+    halved.prepare(spec, policyFrame / 2);
+    const int halvedLatency = halved.getLatency();
+    EXPECT_EQ(halved.getFrameSize(), policyFrame / 2);
+
+    struct Note { double f0; int midi; };
+    const Note notes[3] = { { 87.31, 41 }, { 110.0, 45 }, { 220.0, 57 } };
+
+    for (int index = 0; index < 3; ++index)
+    {
+        const auto stimulus = vowelStimulus(notes[index].f0, fs, n);
+        const double target = notes[index].f0 * std::exp2(1.0 / 12.0);
+
+        Run run;
+        run.sampleRate = fs;
+        run.block = 512;
+        run.mask = noteMask(notes[index].midi + 1);      // forces exactly +1 st
+        const auto corrected = render(stimulus, run);
+        const auto tail = slice(corrected, policyLatency + offset, segment);
+        const double measured = estimateF0(tail, fs, 40.0, 700.0);
+        // The grid sits on the measured f0, so it has to BE the corrected note:
+        // otherwise this measurement would be re-reporting a tuning error.
+        EXPECT_LT(std::abs(centsBetween(measured, target)), 10.0);
+        const double reading = harmonicResidualDb(tail, fs, measured);
+
+        // The instrument, pointed at the same stimulus synthesized at the
+        // corrected pitch and never passed through the class: that signal's
+        // residual is zero by construction, so whatever it reports there is its
+        // own leakage floor. Ten decibels of headroom over the value it is
+        // about to judge bounds that value's underestimate at 0.41 dB.
+        const auto reference = vowelStimulus(target, fs, n);
+        const auto referenceTail = slice(reference, offset, segment);
+        const double referenceF0 = estimateF0(referenceTail, fs, 40.0, 700.0);
+        const double instrumentFloor = harmonicResidualDb(referenceTail, fs, referenceF0);
+        EXPECT_GT(instrumentFloor - reading, 10.0);
+
+        if (index == 0)
+        {
+            // And it returns an answer planted in advance. A capture narrower
+            // than the window's main lobe fails this by leakage, a much wider
+            // one by absorbing the planted noise, so the one check closes both
+            // ends of the instrument space.
+            for (double planted : { 15.0, 20.0, 25.0, 30.0, 35.0, 40.0 })
+            {
+                const auto noisy = plantNoise(referenceTail, fs, planted, 20260816u);
+                const double noisyF0 = estimateF0(noisy, fs, 40.0, 700.0);
+                EXPECT_LT(std::abs(harmonicResidualDb(noisy, fs, noisyF0) - planted), 1.0);
+            }
+        }
+
+        EXPECT_GT(reading, 25.0);
+
+        if (index < 2)
+        {
+            Run control = run;
+            control.frame = policyFrame / 2;
+            const auto collapsed = render(stimulus, control);
+            const auto controlTail = slice(collapsed, halvedLatency + offset, segment);
+            const double controlF0 = estimateF0(controlTail, fs, 40.0, 700.0);
+            const double controlDb = harmonicResidualDb(controlTail, fs, controlF0);
+            // The control must be shown firing: a control that passes the floor
+            // proves nothing about what the span buys.
+            EXPECT_LT(controlDb, 25.0);
+            EXPECT_GT(reading - controlDb, 15.0);
+        }
+    }
 }
 
 DSPARK_TEST(PitchCorrector_corrects_accurately_at_every_supported_rate)

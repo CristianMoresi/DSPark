@@ -128,22 +128,34 @@
  * settling times above are milliseconds; so a frame pinned in samples would
  * halve its own span every time the rate doubled and take the low register with
  * it. At a 21 ms span - which is what 2048 samples give at 96 kHz - the
- * harmonic-to-residual ratio of a corrected F2 falls to about 7 dB, from 23 dB
- * at 43 ms. Holding the span keeps every millisecond figure in this file true
- * at every supported rate, at the cost of latency growing with the rate in
- * samples while staying constant in time. Pass an explicit frame to prepare()
- * to override the policy; what that trade costs is measured below.
+ * harmonic-to-residual ratio of a corrected F2 falls to 3.5-7.3 dB, from
+ * 42-48 dB at 43 ms. Holding the span keeps every millisecond figure in this
+ * file true at every supported rate, at the cost of latency growing with the
+ * rate in samples while staying constant in time. Pass an explicit frame to
+ * prepare() to override the policy; what that trade costs is measured below.
  *
  * At the automatic frame, both ends of that trade were measured before the span
- * was fixed. Halving it - a 21 ms span, whether by asking for 1024 at 48 kHz or
- * by leaving 2048 pinned at 96 kHz - halves every settling time and drops the
- * harmonic-to-residual ratio of a corrected vowel from about 22 dB to 7.5 dB at
- * F2 (87.31 Hz) and from 23 dB to 6.1 dB at A2 (110 Hz), with A3 (220 Hz)
- * untouched at about 21 dB: fifteen dB of harmonic structure, paid by exactly
- * the voices this effect is pointed at. Doubling it to an 85 ms span keeps the
- * low register but a one-semitone change no longer settles inside the
- * pipeline's latency (42 ms at 48 kHz). The 43 ms span is the only one in that
- * family which satisfies both ends.
+ * was fixed. Every decibel below is read by one stated instrument - a four-term
+ * Blackman-Harris DFT over a single un-padded 0.68 s segment, summing the
+ * window's main lobe around each harmonic of the MEASURED fundamental against
+ * everything else up to 20 kHz - which reads about 89 dB on a signal
+ * constructed to have no residual at all, and returns planted ratios of 15 to
+ * 40 dB within 0.4 dB. That headroom is what makes these figures reproducible:
+ * a probe reports 1/M = 1/R + 1/F for a true ratio R and its own leakage floor
+ * F, so one whose floor sat near 20 dB would report its own aperture here and
+ * not the effect. Halving the span - a 21 ms span, whether by asking for 1024
+ * at 48 kHz or by leaving 2048 pinned at 96 kHz - halves every settling time
+ * and drops the harmonic-to-residual ratio of a corrected vowel from 42-48 dB
+ * to 3.5-7.3 dB at F2 (87.31 Hz) and from 38-41 dB to 4.0-4.4 dB at A2
+ * (110 Hz), while A3 (220 Hz) moves only from 47-51 dB to 40-42 dB: 34 to
+ * 45 dB of harmonic structure at the low notes against 5 to 11 dB an octave
+ * up, paid by exactly the voices this effect is pointed at. The low notes read
+ * below A3 even at the full span, by 3 to 13 dB, and that is the resolution of
+ * a 43 ms window rather than damage: at a fixed span 220 Hz gets about two and
+ * a half times as many bins per harmonic spacing as 87 Hz. Doubling the span
+ * to 85 ms keeps the low register but a one-semitone change no longer settles
+ * inside the pipeline's latency (42 ms at 48 kHz). The 43 ms span is the only
+ * one in that family which satisfies both ends.
  *
  * Latency: exactly the internal shifter's twice the frame - 4096 samples at
  * 44.1/48 kHz (85.3 ms at 48 kHz, 92.9 ms at 44.1 kHz), and about the same

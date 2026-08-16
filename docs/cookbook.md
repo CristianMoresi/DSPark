@@ -632,7 +632,12 @@ a sample count: 2048 samples at 44.1/48 kHz, 4096 at 88.2/96 kHz, 8192 at
 with it, staying near 85 ms in time. Pass a frame to `prepare()` if you want
 a different trade — a shorter one settles faster and stops resolving the
 harmonics of a bass voice, which is the whole reason the default is what it
-is.
+is. Halving the default span costs a corrected F2 most of its harmonic
+structure: its harmonic-to-residual ratio falls from 42-48 dB to 3.5-7.3 dB,
+and A2's from 38-41 dB to 4.0-4.4 dB, while A3 an octave up moves only from
+47-51 dB to 40-42 dB. Those decibels are read by a four-term Blackman-Harris
+DFT over one un-padded 0.68 s segment, which reads about 89 dB on a signal
+built to have no residual at all, so it has the headroom to see them.
 
 The scale mask is a 12-bit `harmony::NoteSet` (bit k = k semitones above the
 root), so anything in `harmony::allScales` works, as does a mask you build

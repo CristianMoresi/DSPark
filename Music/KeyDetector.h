@@ -312,7 +312,9 @@ public:
     static int getKeyName(const Key& key, char* dest, int size) noexcept
     {
         if (dest == nullptr || size <= 0) return 0;
-        if (key.tonicPitchClass < 0 || key.tonicPitchClass > 11)
+        // Parenthesised on purpose: inside a class template MSVC can read a
+        // bare `a.b < ... || a.b > ...` chain as a template argument list.
+        if ((key.tonicPitchClass < 0) || (key.tonicPitchClass > 11))
         {
             dest[0] = '\0';
             return 0;

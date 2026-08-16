@@ -135,13 +135,17 @@ public:
             if (audio.getChannel(ch) == nullptr)
                 return failure(Status::InvalidArgument);
 
+        // Every comparison below is parenthesised on purpose. Left bare in a
+        // template, MSVC reads `endRange.last < ... || endRange.last >` as a
+        // template argument list on a member name it has not resolved yet and
+        // rejects the whole predicate.
         if (!validSettings(settings)
-            || startRange.first < 0 || startRange.last < startRange.first
-            || startRange.last >= static_cast<std::int64_t>(sampleCount)
-            || endRange.first < 0 || endRange.last < endRange.first
-            || endRange.last > static_cast<std::int64_t>(sampleCount)
-            || minLoopLength < 1 || maxLoopLength < minLoopLength
-            || maxLoopLength > static_cast<std::int64_t>(sampleCount))
+            || (startRange.first < 0) || (startRange.last < startRange.first)
+            || (startRange.last >= static_cast<std::int64_t>(sampleCount))
+            || (endRange.first < 0) || (endRange.last < endRange.first)
+            || (endRange.last > static_cast<std::int64_t>(sampleCount))
+            || (minLoopLength < 1) || (maxLoopLength < minLoopLength)
+            || (maxLoopLength > static_cast<std::int64_t>(sampleCount)))
             return failure(Status::InvalidArgument);
 
         const std::int64_t window = settings.comparisonLength;
@@ -354,13 +358,16 @@ public:
     {
         const int channels = audio.getNumChannels();
         const int sampleCount = audio.getNumSamples();
-        if (loop.status != Status::Success || channels < 1
-            || channels > kMaxChannels || sampleCount <= 0
-            || loop.start < 0 || loop.end <= loop.start
-            || loop.end > static_cast<std::int64_t>(sampleCount)
-            || loop.crossfadeLength < 2
-            || !std::isfinite(loop.seamCost) || loop.seamCost < T(0)
-            || loop.seamCost > T(1))
+        // Parenthesised for the same reason as the range check in find():
+        // bare, `loop.end < ... || loop.end >` reads as a template argument
+        // list to MSVC.
+        if (loop.status != Status::Success || (channels < 1)
+            || (channels > kMaxChannels) || (sampleCount <= 0)
+            || (loop.start < 0) || (loop.end <= loop.start)
+            || (loop.end > static_cast<std::int64_t>(sampleCount))
+            || (loop.crossfadeLength < 2)
+            || !std::isfinite(loop.seamCost) || (loop.seamCost < T(0))
+            || (loop.seamCost > T(1)))
             return Status::InvalidArgument;
         for (int ch = 0; ch < channels; ++ch)
             if (audio.getChannel(ch) == nullptr)

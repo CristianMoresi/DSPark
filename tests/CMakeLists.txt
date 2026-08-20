@@ -75,15 +75,38 @@ foreach(target IN LISTS dspark_test_targets)
         # the deliberately 32-byte-aligned coefficient structs.
         # /bigobj:  the heavier translation units exceed the default section
         #           limit once the templates are instantiated at -O2.
-        target_compile_options(${target} PRIVATE /W4 /wd4324 /bigobj)
+        target_compile_options(${target} PRIVATE /W4 /WX /wd4324 /bigobj)
     else()
-        target_compile_options(${target} PRIVATE -Wall -Wextra)
+        target_compile_options(${target} PRIVATE
+                               -Wall -Wextra -Wpedantic -Werror)
     endif()
 endforeach()
 
-# TestIO writes and deletes small WAV/MP3 files in the working directory.
 add_test(NAME suite         COMMAND dspark_tests
          WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 add_test(NAME alloc_failure COMMAND dspark_alloc_failure)
 add_test(NAME smoke         COMMAND dspark_smoke)
 add_test(NAME standalone    COMMAND dspark_standalone)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME dependent_comparisons
+    COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tools/check_dependent_comparisons.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+add_test(NAME dependent_comparisons_self_test
+    COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tools/check_dependent_comparisons.py --self-test
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_test(NAME header_missing_include_control
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tools/check_header_self_sufficiency.py
+                --self-test-negative-control
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    add_test(NAME header_self_sufficiency
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tools/check_header_self_sufficiency.py
+                --compiler ${CMAKE_CXX_COMPILER}
+                --std c++20 --warnings-as-errors
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+endif()

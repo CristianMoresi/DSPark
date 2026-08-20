@@ -65,10 +65,10 @@ it at all. Ten headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
 most of the headers that declare such an atomic do not.
 Five of the ten pin a word whose
 type is a template parameter, which is the case the census cannot reach, and
-six pin a concrete width the census already covers -- `Effects/PitchCorrector.h`
-does both. They pin the concrete ones anyway, because a compile-time assertion
-at
-the declaration is a stronger statement than a run-time one in another file and
+seven pin a concrete width the census already covers --
+`Analysis/SpectrumAnalyzer.h` and `Effects/PitchCorrector.h` do both. They pin
+the concrete ones anyway, because a compile-time assertion at the declaration
+is a stronger statement than a run-time one in another file and
 it is the declaration that a later edit changes. A new component with an atomic
 word on the audio path should do the same:
 
@@ -104,8 +104,9 @@ publication only: a value computed on the audio thread for its own use is
 written directly into the audio-thread-private active state (as
 `Core/Biquad.h`'s `setCoeffsNow()` does), and the stream owner never
 self-publishes -- self-publication would pay the cross-thread publish and then
-re-adopt the same thread's own write inside the hot path, and it is what keeps
-every adoption below cold: only the control thread can arm one.
+re-adopt the same thread's own write inside the hot path. After this origin
+rule, every adoption the audio thread performs is cold by construction: only
+the control thread can arm one.
 
 Writer, on the control thread only:
 

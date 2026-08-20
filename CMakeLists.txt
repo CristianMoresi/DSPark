@@ -11,7 +11,7 @@
 #                             DSPark is the top-level project).
 
 cmake_minimum_required(VERSION 3.21)
-project(DSPark VERSION 1.6.1 LANGUAGES CXX)
+project(DSPark VERSION 1.7.0 LANGUAGES CXX)
 
 add_library(dspark INTERFACE)
 add_library(dspark::dspark ALIAS dspark)
@@ -27,9 +27,13 @@ target_include_directories(dspark INTERFACE
 if(PROJECT_IS_TOP_LEVEL)
     option(DSPARK_BUILD_CONFORMANCE "Build the DSPark public conformance suite" ON)
     option(DSPARK_BUILD_TESTS       "Build the DSPark test suite"               ON)
+    option(DSPARK_VERIFY_FLOAT_CAST_OVERFLOW_SANITIZER
+           "Build and run the float-cast-overflow sanitizer negative control" OFF)
 else()
     option(DSPARK_BUILD_CONFORMANCE "Build the DSPark public conformance suite" OFF)
     option(DSPARK_BUILD_TESTS       "Build the DSPark test suite"               OFF)
+    option(DSPARK_VERIFY_FLOAT_CAST_OVERFLOW_SANITIZER
+           "Build and run the float-cast-overflow sanitizer negative control" OFF)
 endif()
 
 if(DSPARK_BUILD_CONFORMANCE OR DSPARK_BUILD_TESTS)
@@ -41,9 +45,10 @@ if(DSPARK_BUILD_CONFORMANCE)
     target_link_libraries(dspark_conformance PRIVATE dspark::dspark)
 
     if(MSVC)
-        target_compile_options(dspark_conformance PRIVATE /W4 /wd4324)
+        target_compile_options(dspark_conformance PRIVATE /W4 /WX /wd4324)
     else()
-        target_compile_options(dspark_conformance PRIVATE -Wall -Wextra)
+        target_compile_options(dspark_conformance PRIVATE
+                               -Wall -Wextra -Wpedantic -Werror)
     endif()
 
     add_test(NAME conformance COMMAND dspark_conformance)
@@ -54,6 +59,27 @@ endif()
 # ------------------------------------------------------------------------------
 if(DSPARK_BUILD_TESTS)
     add_subdirectory(tests)
+endif()
+
+if(DSPARK_VERIFY_FLOAT_CAST_OVERFLOW_SANITIZER)
+    if(MSVC)
+        message(FATAL_ERROR
+            "MSVC does not provide the required float-cast-overflow sanitizer")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_executable(dspark_float_cast_overflow_control
+                   tests/float_cast_overflow_subject.cpp)
+    target_compile_options(dspark_float_cast_overflow_control PRIVATE
+        -Wall -Wextra -Wpedantic -Werror
+        -fsanitize=float-cast-overflow
+        -fno-sanitize-recover=float-cast-overflow)
+    target_link_options(dspark_float_cast_overflow_control PRIVATE
+        -fsanitize=float-cast-overflow
+        -fno-sanitize-recover=float-cast-overflow)
+    add_test(NAME float_cast_overflow_sanitizer_control
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_float_cast_overflow_sanitizer.py
+                --subject $<TARGET_FILE:dspark_float_cast_overflow_control>)
 endif()
 
 # ------------------------------------------------------------------------------

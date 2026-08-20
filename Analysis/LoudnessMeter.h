@@ -387,11 +387,14 @@ private:
     {
         // Pre-warped analog parameterization that reproduces the official
         // ITU-R BS.1770-5 table 1/2 coefficients at 48 kHz to machine
-        // precision (verified: max error 8.9e-16) and generalizes to any
-        // sample rate with the same frequency response, as the spec requires.
-        // The -0.691 constant in powerToLUFS assumes this exact cascade gain
-        // (+0.691 dB at 997 Hz); an RBJ shelf or a gain-normalized RLB
-        // high-pass reads ~0.26 LU low on the EBU conformance vectors.
+        // precision (verified: max error 8.9e-16). This is an exact 48 kHz
+        // parameterization, not a claim of an identical response at every
+        // rate: the retained 997 Hz cascade gains are +0.691014 dB at 48 kHz,
+        // +0.693776 dB at 44.1 kHz and +0.663943 dB at 192 kHz. Residual
+        // full-band deviation stays below 0.05 dB through 384 kHz and inside
+        // the standard tolerance. The -0.691 constant in powerToLUFS remains
+        // tied to this cascade; an RBJ shelf or a gain-normalized RLB high-pass
+        // reads ~0.26 LU low on the EBU conformance vectors.
         {
             const double G  = 3.999843853973347;     // dB, stage 1 shelf
             const double Q  = 0.7071752369554196;

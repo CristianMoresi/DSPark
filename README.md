@@ -2,11 +2,11 @@
   <img src="docs/img/dspark-gh.png" alt="DSPark - A header-only audio DSP framework in pure C++20" width="100%">
 </p>
 
-**v1.6.1** — 100 headers of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins (effects and MIDI instruments) with HTML/CSS/JS editors.
+**v1.7.0** — 100 umbrella-facing public headers (101 installed library headers, including the shared phase-vocoder engine) of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins (effects and MIDI instruments) with HTML/CSS/JS editors.
 
 **📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
-CI runs an 882-case test suite and the public conformance suite on every commit across Windows (MSVC, x64 and ARM64), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus AddressSanitizer/UBSan, an exceptions-free embedded profile and a single-header amalgamation. Loudness is validated against the official EBU R128 test vectors, and a [per-processor quality metrics table](docs/metrics.md) (THD+N, noise floor, spurious/aliasing, latency) is generated from the measurements.
+CI runs an 885-case test suite and the public conformance suite on every commit across Windows (MSVC, x64 and ARM64), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus GCC and Clang AddressSanitizer/UBSan/float-cast-overflow coverage, an exceptions-free embedded profile and a single-header amalgamation. Loudness is validated against the official EBU R128 test vectors, and a [per-processor quality metrics table](docs/metrics.md) (THD+N, noise floor, spurious/aliasing, latency) is generated from the measurements.
 
 ```cpp
 #include "DSPark/DSPark.h"
@@ -122,7 +122,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `SpectralDenoiser<T>` | Learnable-noise-profile spectral gating with the standard musical-noise defenses |
 | `PitchCorrector<T>` | Monophonic pitch correction: YIN detection, scale-aware quantization and phase-vocoder retune, from hard snap to a transparent glide, with formant preservation |
 
-### Core (40 building blocks)
+### Core (41 building blocks)
 
 | Class | Description |
 |---|---|
@@ -169,7 +169,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `AnalogConstants` | Reference constants from analog-hardware research (zero runtime cost) |
 | `ProcessorTraits` | C++20 concepts: `AudioProcessor`, `SampleProcessor`, `GeneratorProcessor` |
 
-### Analysis (11 analyzers)
+### Analysis (12 analyzers)
 
 | Class | Description |
 |---|---|
@@ -177,6 +177,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `EnvelopeFollower<T>` | Public attack/release detector (Peak or RMS law) for sidechains, modulation and metering |
 | `SpectrumAnalyzer<T>` | Real-time FFT spectrum with peak hold |
 | `LoudnessMeter<T>` | EBU R128: momentary, short-term, integrated, LRA, true peak — **passes the official EBU test vectors** (Tech 3341/3342, BS.1770-5 K-weighting and true-peak interpolator) |
+| `LoudnessNormalizer<T>` | Offline LUFS normalization under a true-peak ceiling, with measured gain and limiting reports |
 | `Goertzel<T>` | Single-frequency O(N) magnitude detection |
 | `PitchDetector<T>` | YIN pitch detection with FFT-accelerated difference function (O(N log N)) |
 | `PitchFollower<T>` | Musical pitch tracking source: confidence gating, octave-jump correction, constant-rate semitone glide |
@@ -199,12 +200,13 @@ Define `DSPARK_NO_FILE_IO` before including `DSPark.h` to omit all five I/O
 headers for embedded targets. `FlacFile::openWrite()` and `writeSamples()`
 always return `false`; no FLAC encoder or external codec library is linked.
 
-### Music (2 modules)
+### Music (3 modules)
 
 | Class | Description |
 |---|---|
 | `HarmonyConstants` | Constexpr musical harmony toolkit: 61 scales (bitmask representation), 15 chord recipes with inversions, MIDI/note conversion, key-aware naming (sharp/flat), diatonic chord generation. Fully `constexpr`/`consteval` — generates static tables at compile time. |
 | `ChordDetector<T>` | Real-time chord recognition: per-note Goertzel chroma, template matching over ten chord families, bass-note root disambiguation, confidence-gated hold |
+| `KeyDetector<T>` | Musical-key estimation from accumulated chroma, with major/minor confidence and key-aware naming |
 
 ---
 
@@ -441,7 +443,7 @@ DSPark/
 ├── IO/             (5)      # WAV/MP3, Standard MIDI and native FLAC I/O
 ├── Music/          (3)      # Harmony constants + real-time chord and key detection
 ├── plugin/                  # Native plugin layer: VST3, CLAP, AU + WebView editor
-├── tests/                   # Test suite: 882 cases, zero dependencies
+├── tests/                   # Test suite: 885 cases, zero dependencies
 ├── conformance/             # Public conformance suite (runs in CI)
 ├── docs/                    # Cookbook, plugin guide, threading model, metrics
 ├── examples/                # WAV processing, channel strip, plugins, templates
@@ -451,12 +453,44 @@ DSPark/
 
 ---
 
-## Unreleased
+## What's New in v1.7.0
+
+**Musical timing, pitch and spectral processing.** This release adds complete,
+header-only building blocks for tempo-aware editing and production workflows.
+
+- `OnsetDetector` supplies causal spectral-flux, complex-domain and SuperFlux
+  onset detection, while `BeatTracker` turns the detected events into tempo,
+  phase and beat-position estimates.
+- `LoopFinder` searches bounded regions for low-cost, crossfade-ready loop
+  seams. `LoudnessNormalizer` performs offline LUFS normalization under a
+  true-peak ceiling, and `KeyDetector` estimates major and minor keys from
+  accumulated chroma.
+- `TimeStretch` provides independent high-quality duration and pitch control;
+  `PitchCorrector` combines YIN detection, scale-aware quantization, glide and
+  formant preservation. `SpectralFreeze` retains captured magnitudes while its
+  phase-aware modes advance, reconstruct or decorrelate phases, avoiding the
+  brittle result of simply holding both magnitude and phase fixed.
+
+**Native formats and production hardening.** `FlacFile` adds dependency-free
+native FLAC decoding, `MidiFile` adds Standard MIDI File reading and writing,
+and the existing WAV/MP3 paths now reject a wider range of malformed input.
+Audio buffers remain safely empty after allocation failure, non-finite prepare
+arguments preserve the last valid configuration, and plugin wrappers now bound
+host input, publication and editor-lifetime edge cases more defensively.
+
+**Rate and real-time contracts.** Automatic analysis windows preserve their
+time span across sample rates; resolved sizes are available through each
+analyser's size getter, including `PitchDetector::getWindowSize()`. Audio-thread
+adoption of staged multi-word state is bounded: under contention an update may
+be deferred to a later call, but the callback never waits for the control
+thread. `Biquad::setCoeffs()` remains the control-to-audio publication path;
+stream-owner modulation and single-threaded/offline code use the new
+`setCoeffsNow()` direct path.
 
 **The processor contract now enforces what it always claimed.** `AudioProcessor`
-is documented as the contract for in-place single-buffer inserts, and it did not
-check that: a type that only *read* the buffer satisfied it. Two changes close
-that, and one of them narrows a public type.
+is the contract for in-place single-buffer inserts, but previously a type that
+only *read* the buffer could satisfy it. Two changes close that, and one narrows
+a public type.
 
 - **`AudioBufferView`'s converting and pointer-array constructors are now
   constrained rather than checked inside their bodies.** A `const` view no
@@ -484,6 +518,11 @@ that, and one of them narrows a public type.
   carrying both overloads falls outside the contract even though a chain would
   call its in-place overload. If such a type is meant to be an insert, give its
   read-only overload a different name.
+
+`BiquadCoeffs` and the biquad recursion now use double precision for every
+sample type, preserving very-low-frequency pole placement at high and
+oversampled rates. See the [v1.7.0 migration guide](docs/migration-v1.7.0.md)
+for source changes and latency choices.
 
 ---
 

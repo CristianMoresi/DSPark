@@ -25,6 +25,26 @@ jobs:
         run: python3 tools/check_comment_style.py
       - name: Check the threading page against the code
         run: python3 tools/verify_threading_doc.py
+      - name: Check dependent member comparisons
+        run: |
+          python3 tools/check_dependent_comparisons.py
+          python3 tools/check_dependent_comparisons.py --self-test
+
+  header-audit:
+    name: Header audit - ${{ matrix.compiler }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile every installed header and umbrella profile
+        run: >
+          python3 tools/check_header_self_sufficiency.py
+          --compiler ${{ matrix.compiler }} --std c++20 --warnings-as-errors
+      - name: Prove the missing-include control
+        run: python3 tools/check_header_self_sufficiency.py --self-test-negative-control
 
   # ---------------------------------------------------------------------------
   # Build + run the public conformance suite on every platform
@@ -56,11 +76,11 @@ jobs:
       - name: Build (MSVC)
         if: matrix.compiler == 'msvc'
         shell: cmd
-        run: cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /I . conformance\dspark_conformance.cpp /Fe:dspark_conformance.exe
+        run: cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . conformance\dspark_conformance.cpp /Fe:dspark_conformance.exe
 
       - name: Build (GCC/Clang)
         if: matrix.compiler != 'msvc'
-        run: ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -I . conformance/dspark_conformance.cpp -o dspark_conformance
+        run: ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . conformance/dspark_conformance.cpp -o dspark_conformance
 
       - name: Run conformance suite
         shell: bash
@@ -73,49 +93,49 @@ jobs:
         if: matrix.name == 'Windows MSVC x64'
         shell: cmd
         run: |
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /arch:AVX2 /I . conformance\dspark_conformance.cpp /Fe:dspark_conformance_avx2.exe
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /arch:AVX2 /I . conformance\dspark_conformance.cpp /Fe:dspark_conformance_avx2.exe
           dspark_conformance_avx2.exe
 
       - name: Build + run conformance on the AVX2/FMA paths (GCC/Clang)
         if: matrix.name == 'Linux GCC x64' || matrix.name == 'Linux Clang x64'
         run: |
-          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -march=x86-64-v3 -I . conformance/dspark_conformance.cpp -o dspark_conformance_avx2
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -march=x86-64-v3 -I . conformance/dspark_conformance.cpp -o dspark_conformance_avx2
           ./dspark_conformance_avx2
 
       - name: Build example plugin (VST3+CLAP) + smoke hosts (MSVC)
         if: matrix.name == 'Windows MSVC x64'
         shell: cmd
         run: |
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_saturator\saturator.cpp /Fe:DSParkSaturator.vst3
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /I . tools\vst3_smoke_host.cpp /Fe:vst3_smoke_host.exe
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /I . tools\clap_smoke_host.cpp /Fe:clap_smoke_host.exe
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /LD /I . examples\plugin_saturator\saturator.cpp /Fe:DSParkSaturator.vst3
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . tools\vst3_smoke_host.cpp /Fe:vst3_smoke_host.exe
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . tools\clap_smoke_host.cpp /Fe:clap_smoke_host.exe
           vst3_smoke_host.exe DSParkSaturator.vst3
           copy DSParkSaturator.vst3 DSParkSaturator.clap
           clap_smoke_host.exe DSParkSaturator.clap
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_template\plugin_template.cpp /Fe:DSParkTemplate.vst3
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /LD /I . examples\plugin_template\plugin_template.cpp /Fe:DSParkTemplate.vst3
           vst3_smoke_host.exe DSParkTemplate.vst3
           copy DSParkTemplate.vst3 DSParkTemplate.clap
           clap_smoke_host.exe DSParkTemplate.clap
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_ducker\ducker.cpp /Fe:DSParkDucker.vst3
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /LD /I . examples\plugin_ducker\ducker.cpp /Fe:DSParkDucker.vst3
           vst3_smoke_host.exe DSParkDucker.vst3 --expect-sidechain
           copy DSParkDucker.vst3 DSParkDucker.clap
           clap_smoke_host.exe DSParkDucker.clap --expect-sidechain
           rem Host-contract probe: transport, offline, sample-accurate
           rem automation, MIDI + pitch bend, latency change, mono, presets.
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . tools\plugin_probe.cpp /Fe:DSParkProbe.vst3
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /LD /I . tools\plugin_probe.cpp /Fe:DSParkProbe.vst3
           vst3_smoke_host.exe DSParkProbe.vst3 --probe
           copy DSParkProbe.vst3 DSParkProbe.clap
           clap_smoke_host.exe DSParkProbe.clap --probe
           rem Instrument reference: no audio in, note in, pitch + decay.
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_synth\synth.cpp /Fe:DSParkSynth.vst3
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /LD /I . examples\plugin_synth\synth.cpp /Fe:DSParkSynth.vst3
           vst3_smoke_host.exe DSParkSynth.vst3 --expect-instrument
           copy DSParkSynth.vst3 DSParkSynth.clap
           clap_smoke_host.exe DSParkSynth.clap --expect-instrument
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /LD /I . examples\plugin_webview_editor\webview_saturator.cpp /Fe:DSParkWebSaturator.vst3
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /LD /I . examples\plugin_webview_editor\webview_saturator.cpp /Fe:DSParkWebSaturator.vst3
           vst3_smoke_host.exe DSParkWebSaturator.vst3
           copy DSParkWebSaturator.vst3 DSParkWebSaturator.clap
           clap_smoke_host.exe DSParkWebSaturator.clap
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /wd4324 /I . tools\vst3_editor_host.cpp /Fe:vst3_editor_host.exe user32.lib
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . tools\vst3_editor_host.cpp /Fe:vst3_editor_host.exe user32.lib
           cmake -S examples\plugin_webview_files -B build_webgain
           cmake --build build_webgain --config Release
           vst3_smoke_host.exe build_webgain\DSParkWebGain.vst3\Contents\x86_64-win\DSParkWebGain.vst3
@@ -131,30 +151,30 @@ jobs:
             # AudioToolbox symbols on Apple platforms.
             EXTRA="-framework AudioToolbox -framework CoreFoundation"
           fi
-          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_saturator/saturator.cpp -o DSParkSaturator.vst3 $EXTRA
-          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -I . tools/vst3_smoke_host.cpp -o vst3_smoke_host -ldl
-          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -I . tools/clap_smoke_host.cpp -o clap_smoke_host -ldl
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -fPIC -shared -I . examples/plugin_saturator/saturator.cpp -o DSParkSaturator.vst3 $EXTRA
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . tools/vst3_smoke_host.cpp -o vst3_smoke_host -ldl
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . tools/clap_smoke_host.cpp -o clap_smoke_host -ldl
           ./vst3_smoke_host ./DSParkSaturator.vst3
           cp DSParkSaturator.vst3 DSParkSaturator.clap
           ./clap_smoke_host ./DSParkSaturator.clap
-          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_template/plugin_template.cpp -o DSParkTemplate.vst3
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -fPIC -shared -I . examples/plugin_template/plugin_template.cpp -o DSParkTemplate.vst3
           ./vst3_smoke_host ./DSParkTemplate.vst3
           cp DSParkTemplate.vst3 DSParkTemplate.clap
           ./clap_smoke_host ./DSParkTemplate.clap
           # Sidechain reference plugin: bus layout + functional ducking proof
-          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_ducker/ducker.cpp -o DSParkDucker.vst3 $EXTRA
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -fPIC -shared -I . examples/plugin_ducker/ducker.cpp -o DSParkDucker.vst3 $EXTRA
           ./vst3_smoke_host ./DSParkDucker.vst3 --expect-sidechain
           cp DSParkDucker.vst3 DSParkDucker.clap
           ./clap_smoke_host ./DSParkDucker.clap --expect-sidechain
           # Host-contract probe: transport, offline render mode,
           # sample-accurate automation, MIDI + pitch bend, the
           # latency-changed notification, mono negotiation, presets.
-          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . tools/plugin_probe.cpp -o DSParkProbe.vst3
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -fPIC -shared -I . tools/plugin_probe.cpp -o DSParkProbe.vst3
           ./vst3_smoke_host ./DSParkProbe.vst3 --probe
           cp DSParkProbe.vst3 DSParkProbe.clap
           ./clap_smoke_host ./DSParkProbe.clap --probe
           # Instrument reference: no audio in, note in, pitch + decay.
-          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_synth/synth.cpp -o DSParkSynth.vst3 $EXTRA
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -fPIC -shared -I . examples/plugin_synth/synth.cpp -o DSParkSynth.vst3 $EXTRA
           ./vst3_smoke_host ./DSParkSynth.vst3 --expect-instrument
           cp DSParkSynth.vst3 DSParkSynth.clap
           ./clap_smoke_host ./DSParkSynth.clap --expect-instrument
@@ -163,7 +183,7 @@ jobs:
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             WEBVIEW_EXTRA="-lobjc"
           fi
-          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -fPIC -shared -I . examples/plugin_webview_editor/webview_saturator.cpp -o DSParkWebSaturator.vst3 $WEBVIEW_EXTRA
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -fPIC -shared -I . examples/plugin_webview_editor/webview_saturator.cpp -o DSParkWebSaturator.vst3 $WEBVIEW_EXTRA
           ./vst3_smoke_host ./DSParkWebSaturator.vst3
           cp DSParkWebSaturator.vst3 DSParkWebSaturator.clap
           ./clap_smoke_host ./DSParkWebSaturator.clap
@@ -191,7 +211,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q xvfb libwebkit2gtk-4.1-0 \
             || sudo apt-get install -y -q xvfb libwebkit2gtk-4.0-37
-          g++ -std=c++20 -O2 -Wall -Wextra -I . tools/x11_editor_smoke.cpp \
+          g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . tools/x11_editor_smoke.cpp \
             -o x11_editor_smoke -ldl
           # No GPU/DRI on CI runners: keep WebKit on the software paths.
           export WEBKIT_DISABLE_COMPOSITING_MODE=1
@@ -203,7 +223,7 @@ jobs:
         if: matrix.name == 'macOS Clang arm64'
         shell: bash
         run: |
-          clang++ -std=c++20 -O2 -Wall -Wextra -bundle -I . \
+          clang++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -bundle -I . \
             examples/plugin_saturator/saturator.cpp \
             -framework AudioToolbox -framework CoreFoundation \
             -o DSParkSaturatorAU
@@ -216,7 +236,7 @@ jobs:
           auval -v aufx DSst DSpk
           # The sidechain reference plugin: a second input element (auval
           # validates the element/stream-format/render contract for both).
-          clang++ -std=c++20 -O2 -Wall -Wextra -bundle -I . \
+          clang++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -bundle -I . \
             examples/plugin_ducker/ducker.cpp \
             -framework AudioToolbox -framework CoreFoundation \
             -o DSParkDuckerAU
@@ -234,7 +254,7 @@ jobs:
           auval -v aufx DSwg DSpk
           # The instrument reference: an aumu music device (no input
           # elements, MusicDevice MIDI selectors, factory presets).
-          clang++ -std=c++20 -O2 -Wall -Wextra -bundle -I . \
+          clang++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -bundle -I . \
             examples/plugin_synth/synth.cpp \
             -framework AudioToolbox -framework CoreFoundation \
             -o DSParkSynthAU
@@ -247,7 +267,7 @@ jobs:
           auval -v aumu DSsy DSpk
           # WebView editor through the AU Cocoa contract: factory class, real
           # WKWebView attach, bridge handshake, both teardown orders.
-          clang++ -std=c++20 -O2 -Wall -Wextra -I . tools/au_editor_smoke.cpp \
+          clang++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . tools/au_editor_smoke.cpp \
             -framework AudioToolbox -framework CoreFoundation -framework AppKit \
             -lobjc -o au_editor_smoke
           ./au_editor_smoke aufx DSst DSpk --expect-no-editor
@@ -368,6 +388,7 @@ jobs:
           -A ${{ matrix.msvc_arch == 'arm64' && 'ARM64' || 'x64' }}
           -DDSPARK_BUILD_TESTS=ON
           -DDSPARK_BUILD_CONFORMANCE=OFF
+          -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
 
       - name: Configure (GCC/Clang)
         if: matrix.msvc_arch == ''
@@ -377,6 +398,7 @@ jobs:
           -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
           -DDSPARK_BUILD_TESTS=ON
           -DDSPARK_BUILD_CONFORMANCE=OFF
+          -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
 
       - name: Build
         shell: bash
@@ -391,20 +413,51 @@ jobs:
           --output-on-failure --test-output-size-failed 0
 
   # ---------------------------------------------------------------------------
-  # AddressSanitizer + UndefinedBehaviorSanitizer
+  # TestIO process isolation and its real fixed-name collision control
+  # ---------------------------------------------------------------------------
+  testio-concurrency:
+    name: TestIO concurrent process isolation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run three complete suites from one working directory
+        run: >
+          python3 tools/run_concurrent_test_suites.py
+          --copies 3 --working-directory shared --expect-all-pass
+      - name: Prove fixed names collide under the same runner
+        run: >
+          python3 tools/run_concurrent_test_suites.py
+          --copies 3 --working-directory shared
+          --mutant fixed-testio-names --expect-collision
+
+  # ---------------------------------------------------------------------------
+  # AddressSanitizer + UndefinedBehaviorSanitizer + float-cast-overflow
   # ---------------------------------------------------------------------------
   sanitizers:
-    name: ASan + UBSan (Linux GCC)
+    name: ASan + UBSan + float-cast-overflow (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: GCC, compiler: g++ }
+          - { name: Clang, compiler: clang++ }
     steps:
       - uses: actions/checkout@v4
       - name: Build with sanitizers
         run: >
-          g++ -std=c++20 -O1 -g -Wall -Wextra
-          -fsanitize=address,undefined -fno-sanitize-recover=all
+          ${{ matrix.compiler }} -std=c++20 -O1 -g
+          -Wall -Wextra -Wpedantic -Werror
+          -fsanitize=address,undefined,float-cast-overflow
+          -fno-sanitize-recover=all
           -I . conformance/dspark_conformance.cpp -o dspark_conformance_san
       - name: Run under sanitizers
         run: ./dspark_conformance_san
+
+      - name: Prove float-cast-overflow instrumentation and flag dependence
+        run: |
+          python3 tools/verify_float_cast_overflow_sanitizer.py --compiler ${{ matrix.compiler }}
+          python3 tools/verify_float_cast_overflow_sanitizer.py --compiler ${{ matrix.compiler }} --self-test-flag-removal
 
       # The suite reaches far more of the framework than the conformance
       # checks do, so it is where a stray read or an unsigned overflow is
@@ -413,10 +466,13 @@ jobs:
         run: |
           cmake -S . -B build-san \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DDSPARK_BUILD_TESTS=ON -DDSPARK_BUILD_CONFORMANCE=OFF \
-            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all"
+            -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
+            -DCMAKE_COMPILE_WARNING_AS_ERROR=ON \
+            -DDSPARK_BUILD_TESTS=ON -DDSPARK_BUILD_CONFORMANCE=ON \
+            -DDSPARK_VERIFY_FLOAT_CAST_OVERFLOW_SANITIZER=ON \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all"
           cmake --build build-san --parallel
-          ctest --test-dir build-san --output-on-failure
+          ctest --test-dir build-san --output-on-failure --test-output-size-failed 0
 
   # ---------------------------------------------------------------------------
   # ThreadSanitizer (Linux GCC) — data-race detection for the lock-free code
@@ -441,7 +497,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build with ThreadSanitizer
         run: >
-          g++ -std=c++20 -O1 -g -Wall -Wextra
+          g++ -std=c++20 -O1 -g -Wall -Wextra -Wpedantic -Werror
           -fsanitize=thread
           -I . conformance/dspark_conformance.cpp -o dspark_conformance_tsan
       - name: Run under ThreadSanitizer
@@ -502,7 +558,7 @@ jobs:
       - uses: mymindstorm/setup-emsdk@v14
       - name: Build
         run: >
-          em++ -std=c++20 -O2 -I .
+          em++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I .
           -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB
           conformance/dspark_conformance.cpp -o dspark_conformance.js
       - name: Run with node
@@ -511,7 +567,7 @@ jobs:
       # paths of SimdOps to v128 when built with -msimd128 -msse2.
       - name: Build (Wasm SIMD128 through the SSE2 mapping)
         run: >
-          em++ -std=c++20 -O2 -I . -msimd128 -msse2
+          em++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . -msimd128 -msse2
           -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB
           conformance/dspark_conformance.cpp -o dspark_conformance_simd.js
       - name: Run with node (SIMD128)
@@ -543,7 +599,7 @@ jobs:
               return buf.getChannel(0)[0] == buf.getChannel(0)[0] ? 0 : 1;
           }
           EOF
-          g++ -std=c++20 -O2 -Wall -Wextra -fno-exceptions -fno-rtti -I . embedded_check.cpp -o embedded_check
+          g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti -I . embedded_check.cpp -o embedded_check
           ./embedded_check
 
   # ---------------------------------------------------------------------------
@@ -569,7 +625,7 @@ jobs:
               return 0;
           }
           EOF
-          g++ -std=c++20 -O2 -Wall -Wextra amalgam_check.cpp -o amalgam_check
+          g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror amalgam_check.cpp -o amalgam_check
           ./amalgam_check
       - uses: actions/upload-artifact@v4
         with:
@@ -588,11 +644,11 @@ jobs:
         run: |
           for src in examples/*.cpp; do
             echo "== $src"
-            g++ -std=c++20 -O2 -Wall -Wextra -I . "$src" -o /dev/null -fsyntax-only
+            g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . "$src" -o /dev/null -fsyntax-only
           done
       - name: Build and smoke-run bench
         run: |
-          g++ -std=c++20 -O2 -Wall -Wextra -I . bench/dspark_bench.cpp -o dspark_bench
+          g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . bench/dspark_bench.cpp -o dspark_bench
           ./dspark_bench
       - name: AVX2-without-FMA build check (FMA gating regression)
         run: |
@@ -631,7 +687,7 @@ jobs:
             && unzip -q ebu.zip -d ebu-test-set \
             || echo "::warning::EBU test set unavailable from this runner; EBU cases will be skipped"
       - name: Build conformance suite
-        run: g++ -std=c++20 -O2 -Wall -Wextra -I . conformance/dspark_conformance.cpp -o dspark_conformance
+        run: g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . conformance/dspark_conformance.cpp -o dspark_conformance
       - name: Run conformance (EBU cases skip cleanly when the set is absent)
         run: |
           if [ -d ebu-test-set ] && ls ebu-test-set/**/*.wav >/dev/null 2>&1; then

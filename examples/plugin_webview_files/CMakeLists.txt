@@ -11,3 +11,11 @@ dspark_add_plugin(DSParkWebGain
     AU_MANUFACTURER DSpk
     AU_NAME         "DSPark: WebGain"
 )
+
+if(MSVC)
+    # C4324 is intentional padding from DSPark's explicitly aligned storage.
+    target_compile_options(DSParkWebGain PRIVATE /W4 /WX /wd4324)
+else()
+    target_compile_options(DSParkWebGain PRIVATE
+                           -Wall -Wextra -Wpedantic -Werror)
+endif()

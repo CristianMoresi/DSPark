@@ -610,12 +610,15 @@ The phase vocoder moves the shift by at most half a semitone per analysis
 hop, so settling grows with the change (worst case over control phase, both
 directions, 48 / 44.1 kHz):
 
+A half-semitone correction change settles within 12.5 / 14.5 ms under the
+same 32-phase measurement.
+
 | widest gap | scales | largest correction | largest change | settles in |
 |---|---|---|---|---|
-| 1 st | Chromatic (the default) | 0.5 st | 1 st | 23 / 26 ms |
-| 2 st | major, minor, the modes, whole tone | 1 st | 2 st | 44 / 49 ms |
-| 3 st | harmonic minor, the pentatonics, and 28 others | 1.5 st | 3 st | 66 / 72 ms |
-| 4 st | Hirajoshi, InSen, Balinese, Chinese, Japanese | 2 st | 4 st | 89 / 96 ms |
+| 1 st | Chromatic (the default) | 0.5 st | 1 st | 23.3 / 25.6 ms |
+| 2 st | major, minor, the modes, whole tone | 1 st | 2 st | 44.6 / 49.0 ms |
+| 3 st | harmonic minor, the pentatonics, and 28 others | 1.5 st | 3 st | 66.4 / 72.7 ms |
+| 4 st | Hirajoshi, InSen, Balinese, Chinese, Japanese | 2 st | 4 st | 89.2 / 96.6 ms |
 | 12 st | a one-note mask | 6 st | 12 st | about 265 / 288 ms |
 
 Up to one semitone the transition finishes inside the effect's own latency
@@ -633,11 +636,12 @@ with it, staying near 85 ms in time. Pass a frame to `prepare()` if you want
 a different trade — a shorter one settles faster and stops resolving the
 harmonics of a bass voice, which is the whole reason the default is what it
 is. Halving the default span costs a corrected F2 most of its harmonic
-structure: its harmonic-to-residual ratio falls from 42-48 dB to 3.5-7.3 dB,
-and A2's from 38-41 dB to 4.0-4.4 dB, while A3 an octave up moves only from
-47-51 dB to 40-42 dB. Those decibels are read by a four-term Blackman-Harris
-DFT over one un-padded 0.68 s segment, which reads about 89 dB on a signal
-built to have no residual at all, so it has the headroom to see them.
+structure: its harmonic-to-residual ratio falls from 42-48 dB to below about
+7.5 dB, and A2's from 38-41 dB to 4.0-4.4 dB, while A3 an octave up moves
+only from 47-51 dB to 40-42 dB. Those decibels are read by a four-term
+Blackman-Harris DFT over one un-padded 0.68 s segment, which reads about 89 dB
+on a signal built to have no residual at all, so it has the headroom to see
+them.
 
 The scale mask is a 12-bit `harmony::NoteSet` (bit k = k semitones above the
 root), so anything in `harmony::allScales` works, as does a mask you build

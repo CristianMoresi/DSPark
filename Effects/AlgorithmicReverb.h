@@ -419,6 +419,12 @@ public:
     // Level 1: Simple API
     // =========================================================================
 
+    /**
+     * @brief Loads the selected preset baseline.
+     *
+     * Call setDecay(), setSize() and other parameter setters after setType()
+     * when those values should override the selected preset.
+     */
     void setType(Type type) noexcept
     {
         // C2 fix: don't touch non-atomic state from GUI thread. Publish the

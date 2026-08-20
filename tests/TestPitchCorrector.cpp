@@ -698,6 +698,62 @@ DSPARK_TEST(PitchCorrector_public_api_float_double)
     f.processBlock(AudioBufferView<float>(stereo, 2, 0));
 }
 
+DSPARK_TEST(PitchCorrector_invalid_rates_preserve_the_prepared_stream)
+{
+    auto check = []<typename T>() {
+        AudioSpec valid { 48000.0, 64, 1 };
+        PitchCorrector<T> subject;
+        PitchCorrector<T> reference;
+        subject.prepare(valid);
+        reference.prepare(valid);
+
+        const int frame = subject.getFrameSize();
+        const int latency = subject.getLatency();
+        double phase = 0.0;
+        auto processEqualBlock = [&]() {
+            std::vector<T> subjectSamples(64);
+            std::vector<T> referenceSamples(64);
+            for (int sample = 0; sample < 64; ++sample)
+            {
+                const T value = static_cast<T>(0.2 * std::sin(phase));
+                phase += twoPi<double> * 220.0 / valid.sampleRate;
+                subjectSamples[static_cast<std::size_t>(sample)] = value;
+                referenceSamples[static_cast<std::size_t>(sample)] = value;
+            }
+            T* subjectChannel = subjectSamples.data();
+            T* referenceChannel = referenceSamples.data();
+            subject.processBlock(AudioBufferView<T>(&subjectChannel, 1, 64));
+            reference.processBlock(AudioBufferView<T>(&referenceChannel, 1, 64));
+            for (int sample = 0; sample < 64; ++sample)
+                EXPECT_EQ(subjectSamples[static_cast<std::size_t>(sample)],
+                          referenceSamples[static_cast<std::size_t>(sample)]);
+        };
+
+        for (int block = 0; block < 8; ++block)
+            processEqualBlock();
+
+        const double invalidRates[] = {
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::quiet_NaN(),
+            -std::numeric_limits<double>::infinity(),
+            0.0,
+            -48000.0
+        };
+        for (double rate : invalidRates)
+        {
+            AudioSpec invalid = valid;
+            invalid.sampleRate = rate;
+            subject.prepare(invalid);
+            EXPECT_EQ(subject.getFrameSize(), frame);
+            EXPECT_EQ(subject.getLatency(), latency);
+            processEqualBlock();
+        }
+    };
+
+    check.template operator()<float>();
+    check.template operator()<double>();
+}
+
 // ============================================================================
 // Steady-state accuracy, against the independent autocorrelation oracle
 // ============================================================================

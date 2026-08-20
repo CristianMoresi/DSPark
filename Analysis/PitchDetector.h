@@ -168,11 +168,11 @@ public:
      * follows the rate, so the per-second cost grows by a measured ~2.0x at
      * 96 kHz and ~4.6x at 192 kHz relative to 48 kHz (35.6 / 71.2 / 162.4 ms
      * of CPU per 10 s of audio at 48/96/192 kHz; float, automatic window,
-     * g++ 13 -O2, min of 15 runs pinned to one core of an otherwise idle
-     * host, per-point spread under 4% -- absolute numbers vary by machine,
-     * the growth tracks N log N). Against the old fixed-2048 default at the
-     * SAME rate the automatic window costs roughly 15% more (162.4 vs
-     * 142.0 ms at 192 kHz). prepare()-time heap grows
+     * g++ 13 -O2, min of 15 runs pinned to six cores with taskset -c 0-5 on
+     * an otherwise idle host, per-point spread under 4% -- absolute numbers
+     * vary by machine, the growth tracks N log N). Against the old fixed-2048
+     * default at the SAME rate the automatic window costs roughly 15% more
+     * (162.4 vs 142.0 ms at 192 kHz). prepare()-time heap grows
      * the same way: ~160 KB at 44.1/48 kHz, ~320 KB at 88.2/96 kHz, ~640 KB
      * at 176.4/192 kHz (float); the audio path stays allocation-free. Budget
      * from these figures, not from the rate alone. For very low-latency

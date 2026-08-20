@@ -22,17 +22,83 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
 using namespace dspark;
 using namespace dspark::test;
 
-// Helper: create a temp file path
+// One atomically claimed root per suite process keeps every generated I/O file
+// away from both the launch directory and every concurrent suite process.  The
+// current directory is changed once so the older relative-path cases below are
+// covered as well; immutable fixtures use their configured absolute path.
+class TestIOProcessRoot
+{
+public:
+    TestIOProcessRoot()
+        : launchDirectory_(std::filesystem::current_path())
+    {
+#if defined(DSPARK_TESTIO_FIXED_NAME_MUTANT)
+        // Targeted concurrency control: retaining the caller's directory
+        // restores the historical fixed-name collision without changing any
+        // individual test expectation.
+        path_ = launchDirectory_;
+#else
+        const std::filesystem::path base = std::filesystem::temp_directory_path();
+        std::random_device entropy;
+        const auto stamp = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const uint64_t randomPart = (static_cast<uint64_t>(entropy()) << 32)
+                                  ^ static_cast<uint64_t>(entropy());
+        for (uint64_t attempt = 0; attempt < 256; ++attempt)
+        {
+            path_ = base / ("dspark-testio-" + std::to_string(stamp) + "-"
+                            + std::to_string(randomPart) + "-"
+                            + std::to_string(attempt));
+            std::error_code ec;
+            if (std::filesystem::create_directory(path_, ec))
+            {
+                ownsPath_ = true;
+                std::filesystem::current_path(path_);
+                return;
+            }
+        }
+        throw std::runtime_error("could not create process-unique TestIO directory");
+#endif
+    }
+
+    TestIOProcessRoot(const TestIOProcessRoot&) = delete;
+    TestIOProcessRoot& operator=(const TestIOProcessRoot&) = delete;
+
+    ~TestIOProcessRoot()
+    {
+        if (!ownsPath_) return;
+        std::error_code ignored;
+        std::filesystem::current_path(launchDirectory_, ignored);
+        std::filesystem::remove_all(path_, ignored);
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept
+    {
+        return path_;
+    }
+
+private:
+    std::filesystem::path launchDirectory_;
+    std::filesystem::path path_;
+    bool ownsPath_ = false;
+};
+
+static TestIOProcessRoot testIOProcessRoot;
+
+// Helpers retained as names because several round-trip tests share them, but
+// their relative paths now resolve only inside testIOProcessRoot.
 static const char* tempWav16()  { return "dspark_test_16.wav"; }
 static const char* tempWav24()  { return "dspark_test_24.wav"; }
 static const char* tempWavF32() { return "dspark_test_f32.wav"; }
@@ -45,6 +111,22 @@ struct FileCleanup
     const char* path;
     ~FileCleanup() { std::remove(path); }
 };
+
+DSPARK_TEST(TestIO_process_temporary_root_is_exclusive)
+{
+    // create_directory is the portable atomic claim.  Three concurrent suite
+    // processes each succeed inside their own root; the fixed-root mutant
+    // makes two of them collide while the winner holds the claim.
+    const std::filesystem::path claim = "dspark_process_exclusive_claim";
+    std::error_code ec;
+    const bool acquired = std::filesystem::create_directory(claim, ec);
+    EXPECT_TRUE(acquired);
+    if (acquired)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::filesystem::remove(claim, ec);
+    }
+}
 
 // ============================================================================
 // WavFile - 16-bit PCM
@@ -1633,7 +1715,7 @@ public:
         static std::atomic<uint64_t> serial { 0 };
         const auto stamp = static_cast<uint64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count());
-        const std::filesystem::path base = std::filesystem::temp_directory_path();
+        const std::filesystem::path base = testIOProcessRoot.path();
         for (uint64_t attempt = 0; attempt < 128; ++attempt)
         {
             const uint64_t id = serial.fetch_add(1, std::memory_order_relaxed);

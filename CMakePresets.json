@@ -27,11 +27,12 @@
     },
     {
       "name": "sanitize",
-      "displayName": "ASan + UBSan (GCC/Clang)",
+      "displayName": "ASan + UBSan + float-cast-overflow (GCC/Clang)",
       "inherits": "ninja",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-sanitize-recover=all"
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all",
+        "DSPARK_VERIFY_FLOAT_CAST_OVERFLOW_SANITIZER": "ON"
       },
       "condition": { "type": "notEquals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     }

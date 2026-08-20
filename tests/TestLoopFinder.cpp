@@ -502,10 +502,12 @@ DSPARK_TEST(LoopFinder_validation_status_precedence)
                           Finder::Status::NoAcceptableLoop);
     const auto firstLegal = finder.find(constView(boundary), { 0, 0 }, { 65, 65 },
                                         1, 65, settings);
-    EXPECT_TRUE(firstLegal.status == Finder::Status::Success
-                || firstLegal.status == Finder::Status::NoAcceptableLoop);
-    if (firstLegal.status == Finder::Status::Success)
-        EXPECT_EQ(firstLegal.end - firstLegal.start, std::int64_t(65));
+    EXPECT_TRUE(firstLegal.status == Finder::Status::Success);
+    EXPECT_EQ(firstLegal.start, std::int64_t(0));
+    EXPECT_EQ(firstLegal.end, std::int64_t(65));
+    EXPECT_EQ(firstLegal.end - firstLegal.start, std::int64_t(65));
+    EXPECT_EQ(firstLegal.crossfadeLength, 16);
+    EXPECT_EQ(firstLegal.seamCost, 0.65);
 
     std::vector<std::vector<double>> silence(1, std::vector<double>(128, 0.0));
     expectNeutral<double>(finder.find(constView(silence), { 0, 0 }, { 65, 65 },

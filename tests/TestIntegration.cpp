@@ -365,9 +365,9 @@ DSPARK_TEST(PluginLayer_normalisation_and_hashing)
     static_assert(paramIdsUnique<MiniPlug>());
 
     // UIDs derive deterministically from the productId.
-    constexpr auto uidA = makeUid("com.dspark.test.mini", 1);
-    constexpr auto uidB = makeUid("com.dspark.test.mini", 1);
-    constexpr auto uidC = makeUid("com.dspark.test.mini", 2);
+    constexpr auto uidA = makeUid(MiniPlug::descriptor.productId, 1);
+    constexpr auto uidB = makeUid(MiniPlug::descriptor.productId, 1);
+    constexpr auto uidC = makeUid(MiniPlug::descriptor.productId, 2);
     EXPECT_TRUE(uidA == uidB);
     EXPECT_TRUE(uidA != uidC);
 }

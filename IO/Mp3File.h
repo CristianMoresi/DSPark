@@ -1453,9 +1453,10 @@ private:
             // per-window scalefactors, and requantize() then attenuated long
             // band 21 by a factor the encoder never sent. Band 21 is the top
             // of the spectrum (coefficients 418..575 at 44100 Hz, 384..575 at
-            // 48000 Hz), and the granule after a short block is always the
-            // stop block of a transient, so every transient decoded with a
-            // silently darkened top octave.
+            // 48000 Hz). The granule after a short block may be another short
+            // block or the stop block of a transient; in the stop-block case
+            // it decodes long band 21, so a stale short-block value would
+            // silently darken the transient's top octave.
             for (int sfb = 21; sfb < 39; ++sfb) scalefac[sfb] = 0;
         }
         bitsRead = br.getPos() - startBits;

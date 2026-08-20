@@ -89,11 +89,11 @@
  * staying within 10 cents of the new note, worst case over a full
  * analysis-hop period of control phases, both directions, at 48 / 44.1 kHz:
  *
- *   change 0.5 semitones   12.3 / 14.3 ms
+ *   change 0.5 semitones   12.5 / 14.5 ms
  *   change 1               23.3 / 25.6 ms
- *   change 2               44.3 / 48.6 ms
- *   change 3               66.0 / 72.3 ms
- *   change 4               88.8 / 96.2 ms
+ *   change 2               44.6 / 49.0 ms
+ *   change 3               66.4 / 72.7 ms
+ *   change 4               89.2 / 96.6 ms
  *
  * Up to one semitone that fits inside the pipeline's own latency, so the
  * transition is complete before the audio it governs is heard. Above it the
@@ -103,7 +103,7 @@
  * by a heterodyne fundamental tracker averaging over one period of the target.
  * Against the engine's slew law (half a semitone per analysis hop, the hop
  * dilating with the active ratio) the rows above one semitone agree to within
- * 4%; the two smallest rows read up to 20% above it, which is the estimator
+ * 5.1%; the two smallest rows read up to 20% above it, which is the estimator
  * window rather than the class - at one slew hop the tracker's own averaging
  * is a fifth of the quantity being measured. Either way the correction layer
  * adds nothing to the rate limit it inherits. A nonzero retune speed reaches
@@ -128,7 +128,7 @@
  * settling times above are milliseconds; so a frame pinned in samples would
  * halve its own span every time the rate doubled and take the low register with
  * it. At a 21 ms span - which is what 2048 samples give at 96 kHz - the
- * harmonic-to-residual ratio of a corrected F2 falls to 3.5-7.3 dB, from
+ * harmonic-to-residual ratio of a corrected F2 falls below about 7.5 dB, from
  * 42-48 dB at 43 ms. Holding the span keeps every millisecond figure in this
  * file true at every supported rate, at the cost of latency growing with the
  * rate in samples while staying constant in time. Pass an explicit frame to
@@ -146,7 +146,7 @@
  * not the effect. Halving the span - a 21 ms span, whether by asking for 1024
  * at 48 kHz or by leaving 2048 pinned at 96 kHz - halves every settling time
  * and drops the harmonic-to-residual ratio of a corrected vowel from 42-48 dB
- * to 3.5-7.3 dB at F2 (87.31 Hz) and from 38-41 dB to 4.0-4.4 dB at A2
+ * to below about 7.5 dB at F2 (87.31 Hz) and from 38-41 dB to 4.0-4.4 dB at A2
  * (110 Hz), while A3 (220 Hz) moves only from 47-51 dB to 40-42 dB: 34 to
  * 45 dB of harmonic structure at the low notes against 5 to 11 dB an octave
  * up, paid by exactly the voices this effect is pointed at. The low notes read
@@ -261,7 +261,7 @@ public:
     /**
      * @brief Allocates the detector and shifter state (setup thread).
      *
-     * Invalid specifications (per AudioSpec::isValid()) are ignored and the
+     * Invalid specifications and non-finite sample rates are ignored and the
      * previous state is kept; an unprepared instance passes audio through
      * untouched. The detector uses its own automatic window policy, which holds
      * its analysis span constant across rates; the shifter's frame follows the
@@ -280,7 +280,7 @@ public:
      */
     void prepare(const AudioSpec& spec, int fftSize = 0)
     {
-        if (!spec.isValid()) return;
+        if (!std::isfinite(spec.sampleRate) || !spec.isValid()) return;
 
         prepared_ = false;
 

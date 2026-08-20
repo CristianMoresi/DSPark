@@ -147,4 +147,9 @@ template void instantiate<double>();
 
 } // namespace
 
-int main() { return 0; }
+int main()
+{
+    instantiate<float>();
+    instantiate<double>();
+    return 0;
+}

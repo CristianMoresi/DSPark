@@ -1184,6 +1184,95 @@ static void fillProbeTones(float* dst, int numSamples, long long& n, float amp)
     }
 }
 
+struct SpectrumPublicationProof
+{
+    static constexpr int publications = 12;
+    int observable = 0;
+    int consumedOnce = 0;
+    int coherent = 0;
+};
+
+// isNewDataReady() is a coalescing Boolean, not a frame counter. Prove its
+// publication contract on a finite cross-thread schedule: the writer cannot
+// publish frame N+1 until the reader has observed, consumed and adopted frame
+// N. The acknowledgement is independent of the analyser notification, so a
+// missing notification fails the counts below instead of hanging this proof.
+static SpectrumPublicationProof runSpectrumPublicationProof()
+{
+    SpectrumAnalyzer<float> sa;
+    sa.prepare(48000.0, 1024);
+    sa.setSmoothing(0.0f);
+    sa.setPeakHoldEnabled(false);
+    sa.setFloorDb(-200.0f);
+
+    std::vector<float> block(512);
+    long long n = 0;
+    for (int warmup = 0; warmup < 4; ++warmup)
+    {
+        fillProbeTones(block.data(), 512, n, 0.4f);
+        sa.pushSamples(block.data(), 512);
+    }
+    (void)sa.isNewDataReady();
+    (void)sa.getMagnitudesDb();
+
+    std::atomic<int> requested{ 0 };
+    std::atomic<int> published{ 0 };
+    std::atomic<int> acknowledged{ 0 };
+    std::thread publisher([&] {
+        for (int publication = 1;
+             publication <= SpectrumPublicationProof::publications;
+             ++publication)
+        {
+            int observed = requested.load(std::memory_order_acquire);
+            while (observed < publication)
+            {
+                requested.wait(observed, std::memory_order_acquire);
+                observed = requested.load(std::memory_order_acquire);
+            }
+
+            fillProbeTones(block.data(), 512, n, 0.4f);
+            sa.pushSamples(block.data(), 512);
+            published.store(publication, std::memory_order_release);
+            published.notify_one();
+
+            observed = acknowledged.load(std::memory_order_acquire);
+            while (observed < publication)
+            {
+                acknowledged.wait(observed, std::memory_order_acquire);
+                observed = acknowledged.load(std::memory_order_acquire);
+            }
+        }
+    });
+
+    SpectrumPublicationProof proof;
+    for (int publication = 1;
+         publication <= SpectrumPublicationProof::publications;
+         ++publication)
+    {
+        requested.store(publication, std::memory_order_release);
+        requested.notify_one();
+
+        int observed = published.load(std::memory_order_acquire);
+        while (observed < publication)
+        {
+            published.wait(observed, std::memory_order_acquire);
+            observed = published.load(std::memory_order_acquire);
+        }
+
+        const bool ready = sa.isNewDataReady();
+        const bool consumed = !sa.isNewDataReady();
+        if (ready) ++proof.observable;
+        if (ready && consumed) ++proof.consumedOnce;
+        const float* m = sa.getMagnitudesDb();
+        if (std::abs(m[32] - m[400]) <= 12.0f) ++proof.coherent;
+
+        acknowledged.store(publication, std::memory_order_release);
+        acknowledged.notify_one();
+    }
+    publisher.join();
+    return proof;
+}
+
 // Pin for the SpectrumAnalyzer triple-buffer handoff (audio writer vs GUI
 // reader), the largest un-oracled lock-free structure in the library before
 // this pin. The writer publishes spectra whose two probe bins ALWAYS carry
@@ -1204,8 +1293,8 @@ static void fillProbeTones(float* dst, int numSamples, long long& n, float amp)
 // the structure it guards rather than merely running beside it. Liveness
 // is guaranteed by construction: the reader keeps polling until the writer
 // has published at least 64 frames (hard-capped so a starved writer fails
-// loudly instead of hanging), and the fresh-adoption floor proves the
-// handoff actually cycled.
+// loudly instead of hanging). Notification publication is proved separately
+// by runSpectrumPublicationProof(), without counting scheduler slices.
 DSPARK_TEST(SpectrumAnalyzer_triple_buffer_concurrent_readout_is_tear_free)
 {
     auto sa = std::make_unique<SpectrumAnalyzer<float>>();
@@ -1232,14 +1321,13 @@ DSPARK_TEST(SpectrumAnalyzer_triple_buffer_concurrent_readout_is_tear_free)
     });
 
     int violations = 0;
-    int fresh = 0;
     long long reads = 0;
     const long long kMaxReads = 50000000; // hard cap: never hang, fail loudly
     while ((frames.load(std::memory_order_relaxed) < 64 || reads < 300000)
            && reads < kMaxReads)
     {
         ++reads;
-        if (sa->isNewDataReady()) ++fresh;
+        (void)sa->isNewDataReady();
         const float* m = sa->getMagnitudesDb();
         const float d = m[32] - m[400];
         if (std::abs(d) > 12.0f) ++violations;
@@ -1250,7 +1338,6 @@ DSPARK_TEST(SpectrumAnalyzer_triple_buffer_concurrent_readout_is_tear_free)
 
     EXPECT_EQ(violations, 0);
     EXPECT_GT(frames.load(std::memory_order_relaxed), 63); // writer liveness
-    EXPECT_GT(fresh, 16);                                  // adoption liveness
 }
 
 // Deterministic guard for the probe signal the two publication pins above
@@ -1346,14 +1433,13 @@ DSPARK_TEST(SpectrumAnalyzer_slow_reader_snapshot_is_frame_coherent)
     });
 
     int violations = 0;
-    int fresh = 0;
     long long reads = 0;
     const long long kMaxReads = 5000000; // hard cap: never hang, fail loudly
     while ((frames.load(std::memory_order_relaxed) < 24 || reads < 4000)
            && reads < kMaxReads)
     {
         ++reads;
-        if (sa->isNewDataReady()) ++fresh;
+        (void)sa->isNewDataReady();
         const float* m = sa->getMagnitudesDb();
         // 1500 Hz -> bin 512, 18750 Hz -> bin 6400 at fftSize 16384.
         if (std::abs(m[512] - m[6400]) > 12.0f) ++violations;
@@ -1365,7 +1451,11 @@ DSPARK_TEST(SpectrumAnalyzer_slow_reader_snapshot_is_frame_coherent)
     EXPECT_EQ(violations, 0);
     EXPECT_EQ(sa->getStaleSnapshotCount(), 0LL);           // handoff health
     EXPECT_GT(frames.load(std::memory_order_relaxed), 23); // writer liveness
-    EXPECT_GT(fresh, 8);                                   // adoption liveness
+
+    const SpectrumPublicationProof proof = runSpectrumPublicationProof();
+    EXPECT_EQ(proof.observable, SpectrumPublicationProof::publications);
+    EXPECT_EQ(proof.consumedOnce, SpectrumPublicationProof::publications);
+    EXPECT_EQ(proof.coherent, SpectrumPublicationProof::publications);
 }
 
 // Paired-getter returned-pointer LIFETIME. The tear pin above reads only

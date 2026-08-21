@@ -11,7 +11,7 @@
 
 #include "../DSPark.h"
 
-namespace {
+namespace standalone_compile_audit {
 
 // Force instantiation of every template that takes a sample type.
 template <typename T>
@@ -145,11 +145,6 @@ void instantiate()
 template void instantiate<float>();
 template void instantiate<double>();
 
-} // namespace
+} // namespace standalone_compile_audit
 
-int main()
-{
-    instantiate<float>();
-    instantiate<double>();
-    return 0;
-}
+int main() { return 0; }

@@ -1478,8 +1478,10 @@ DSPARK_TEST(SpectrumAnalyzer_slow_reader_snapshot_is_frame_coherent)
 //    plain-word data race TSan reports; the live pre-fix mutation rate was
 //    ~263k observed mutations per 200k frames, measured live against the
 //    pre-fix header -- far above this pin's zero tolerance.
-// Liveness floors prove real overlap; hard caps fail loudly instead of
-// hanging.
+// Free-running progress floors prove real overlap; the finite
+// request/publish/acknowledge proof below pins notification/adoption without
+// making its verdict depend on how many writer publications one reader slice
+// happens to observe. Hard caps fail loudly instead of hanging.
 DSPARK_TEST(SpectrumAnalyzer_paired_getter_held_pointer_never_mutates)
 {
     // Part 1: deterministic defect schedule (single-threaded, public API).
@@ -1543,7 +1545,6 @@ DSPARK_TEST(SpectrumAnalyzer_paired_getter_held_pointer_never_mutates)
 
         long long mutationsBehindHeldPtr = 0;
         int violations = 0;
-        int fresh = 0;
         long long reads = 0;
         const long long kMaxReads = 50000000; // hard cap: never hang
         std::vector<float> snap(static_cast<size_t>(nb));
@@ -1552,7 +1553,7 @@ DSPARK_TEST(SpectrumAnalyzer_paired_getter_held_pointer_never_mutates)
                && reads < kMaxReads)
         {
             ++reads;
-            if (sa->isNewDataReady()) ++fresh;
+            (void)sa->isNewDataReady();
             const float* m = sa->getMagnitudesDb();          // held pointer
             for (int k = 0; k < nb; ++k)
                 snap[static_cast<size_t>(k)] = m[k];
@@ -1575,8 +1576,12 @@ DSPARK_TEST(SpectrumAnalyzer_paired_getter_held_pointer_never_mutates)
         EXPECT_EQ(mutationsBehindHeldPtr, 0LL);
         EXPECT_EQ(violations, 0);
         EXPECT_GT(frames.load(std::memory_order_relaxed), 63); // writer liveness
-        EXPECT_GT(fresh, 16);                                  // adoption liveness
     }
+
+    const SpectrumPublicationProof proof = runSpectrumPublicationProof();
+    EXPECT_EQ(proof.observable, SpectrumPublicationProof::publications);
+    EXPECT_EQ(proof.consumedOnce, SpectrumPublicationProof::publications);
+    EXPECT_EQ(proof.coherent, SpectrumPublicationProof::publications);
 }
 
 // ============================================================================

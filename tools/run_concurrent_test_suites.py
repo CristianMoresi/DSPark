@@ -43,6 +43,181 @@ _TAIL_LINE_CHARACTERS = 320
 _MAX_COPIES = 64
 _TERMINATE_GRACE_SECONDS = 5.0
 _PR_SET_CHILD_SUBREAPER = 36
+_EXPECTED_SUITE_TESTS = 885
+_ATOMIC_CLAIM_TEST = "TestIO_process_temporary_root_is_exclusive"
+_WINDOWS_TRAMPOLINE = "--windows-trampoline"
+_WINDOWS_SELF_TEST_SUBJECT = "--windows-self-test-subject"
+_WINDOWS_SELF_TEST_DESCENDANT = "--windows-self-test-descendant"
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_WINDOWS_JOB_TERMINATION_EXIT = 0xC000013A
+
+_PROGRESS_PATTERN = re.compile(r"^\[ (\d+)/(\d+) \] ([^\r\n]+)\r?$", re.MULTILINE)
+_SUMMARY_PATTERN = re.compile(
+    r"^[ \t]*(\d+) tests \| (\d+) passed \| (\d+) failed \| (\d+) ms[ \t]*\r?$",
+    re.MULTILINE,
+)
+_FAILURE_PATTERN = re.compile(r"^[ \t]*FAIL: ([^\r\n]+?)[ \t]*\r?$", re.MULTILINE)
+_EXCEPTION_PATTERN = re.compile(
+    r"^[ \t]*EXCEPTION \[([^\]\r\n]+)\](?: [^\r\n]*)?[ \t]*\r?$",
+    re.MULTILINE,
+)
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class _JobObjectBasicAccountingInformation(ctypes.Structure):
+    _fields_ = [
+        ("TotalUserTime", ctypes.c_int64),
+        ("TotalKernelTime", ctypes.c_int64),
+        ("ThisPeriodTotalUserTime", ctypes.c_int64),
+        ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+        ("TotalPageFaultCount", ctypes.c_uint32),
+        ("TotalProcesses", ctypes.c_uint32),
+        ("ActiveProcesses", ctypes.c_uint32),
+        ("TotalTerminatedProcesses", ctypes.c_uint32),
+    ]
+
+
+def _last_windows_error(operation: str) -> OSError:
+    error_number = ctypes.get_last_error()
+    return OSError(error_number, f"{operation}: {ctypes.FormatError(error_number)}")
+
+
+class _WindowsJob:
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise OSError("Windows Job Objects are unavailable on this platform")
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
+        self._kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        self._kernel32.SetInformationJobObject.argtypes = (
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32
+        )
+        self._kernel32.SetInformationJobObject.restype = ctypes.c_int
+        self._kernel32.AssignProcessToJobObject.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+        self._kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+        self._kernel32.QueryInformationJobObject.argtypes = (
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_void_p,
+        )
+        self._kernel32.QueryInformationJobObject.restype = ctypes.c_int
+        self._kernel32.TerminateJobObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        self._kernel32.TerminateJobObject.restype = ctypes.c_int
+        self._kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        self._kernel32.CloseHandle.restype = ctypes.c_int
+        handle = self._kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise _last_windows_error("CreateJobObjectW")
+        self._handle: int | None = int(handle)
+        limits = _JobObjectExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self._kernel32.SetInformationJobObject(
+            ctypes.c_void_p(self._handle), _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits), ctypes.sizeof(limits)
+        ):
+            error = _last_windows_error("SetInformationJobObject")
+            close_error: OSError | None = None
+            try:
+                self.close()
+            except OSError as close_failure:
+                close_error = close_failure
+            if close_error is not None:
+                raise OSError(f"{error}; cleanup also failed: {close_error}") from error
+            raise error
+
+    def _required_handle(self) -> int:
+        if self._handle is None:
+            raise OSError("Job Object handle is already closed")
+        return self._handle
+
+    def assign(self, process: subprocess.Popen[bytes]) -> None:
+        process_handle = int(process._handle)  # type: ignore[attr-defined]
+        if not self._kernel32.AssignProcessToJobObject(
+            ctypes.c_void_p(self._required_handle()), ctypes.c_void_p(process_handle)
+        ):
+            raise _last_windows_error("AssignProcessToJobObject")
+
+    def active_processes(self) -> int:
+        accounting = _JobObjectBasicAccountingInformation()
+        if not self._kernel32.QueryInformationJobObject(
+            ctypes.c_void_p(self._required_handle()),
+            _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+            ctypes.byref(accounting), ctypes.sizeof(accounting), None
+        ):
+            raise _last_windows_error("QueryInformationJobObject")
+        return int(accounting.ActiveProcesses)
+
+    def terminate(self) -> None:
+        if not self._kernel32.TerminateJobObject(
+            ctypes.c_void_p(self._required_handle()), _WINDOWS_JOB_TERMINATION_EXIT
+        ):
+            raise _last_windows_error("TerminateJobObject")
+
+    def close(self) -> None:
+        handle = self._required_handle()
+        if not self._kernel32.CloseHandle(ctypes.c_void_p(handle)):
+            raise _last_windows_error("CloseHandle(JobObject)")
+        self._handle = None
+
+
+class _OwnedProcess:
+    def __init__(self, process: subprocess.Popen[bytes], job: _WindowsJob | None = None,
+                 assignment_before_release: bool = False,
+                 release_completed: bool = False) -> None:
+        self.process = process
+        self.job = job
+        self.assignment_before_release = assignment_before_release
+        self.release_completed = release_completed
+
+    @property
+    def pid(self) -> int:
+        return self.process.pid
+
+    @property
+    def returncode(self) -> int | None:
+        return self.process.returncode
+
+    def poll(self) -> int | None:
+        return self.process.poll()
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.process.wait(timeout=timeout)
 
 
 def _bounded_line(line: str, limit: int = _TAIL_LINE_CHARACTERS) -> str:
@@ -63,6 +238,52 @@ def _stream_result(output: bytes) -> dict[str, object]:
         "sha256": hashlib.sha256(output).hexdigest(),
         "size": len(output),
         "tail": _summary_tail(output),
+    }
+
+
+def _parse_suite_output(stdout: bytes, stderr: bytes) -> dict[str, object]:
+    stdout_text = stdout.decode("utf-8", errors="replace")
+    stderr_text = stderr.decode("utf-8", errors="replace")
+    progress = [
+        (int(index), int(total), name)
+        for index, total, name in _PROGRESS_PATTERN.findall(stdout_text)
+    ]
+    summaries = [
+        {
+            "total": int(total), "passed": int(passed),
+            "failed": int(failed), "milliseconds": int(milliseconds),
+        }
+        for total, passed, failed, milliseconds in _SUMMARY_PATTERN.findall(stdout_text)
+    ]
+    failed_tests = _FAILURE_PATTERN.findall(stdout_text + "\n" + stderr_text)
+    exception_tests = _EXCEPTION_PATTERN.findall(stdout_text + "\n" + stderr_text)
+    indices = [item[0] for item in progress]
+    totals = [item[1] for item in progress]
+    names = [item[2] for item in progress]
+    summary = summaries[0] if len(summaries) == 1 else None
+    complete = bool(
+        summary is not None
+        and summary["total"] == _EXPECTED_SUITE_TESTS
+        and summary["passed"] + summary["failed"] == _EXPECTED_SUITE_TESTS
+        and summary["failed"] == len(failed_tests)
+        and len(progress) == _EXPECTED_SUITE_TESTS
+        and indices == list(range(1, _EXPECTED_SUITE_TESTS + 1))
+        and all(total == _EXPECTED_SUITE_TESTS for total in totals)
+        and len(set(names)) == _EXPECTED_SUITE_TESTS
+    )
+    names_payload = "\0".join(names).encode("utf-8", errors="surrogatepass")
+    return {
+        "complete": complete,
+        "expected_total": _EXPECTED_SUITE_TESTS,
+        "progress_count": len(progress),
+        "progress_indices_exact": indices == list(range(1, len(indices) + 1)),
+        "progress_totals": sorted(set(totals)),
+        "progress_test_names_sha256": hashlib.sha256(names_payload).hexdigest(),
+        "progress_unique_test_names": len(set(names)),
+        "summary_count": len(summaries),
+        "summary": summary,
+        "failed_tests": failed_tests,
+        "exception_tests": exception_tests,
     }
 
 
@@ -134,11 +355,19 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _group_alive(process: subprocess.Popen[bytes]) -> bool:
-    if os.name != "posix":
-        return process.poll() is None
+def _leader(process: _OwnedProcess | subprocess.Popen[bytes]) -> subprocess.Popen[bytes]:
+    return process.process if isinstance(process, _OwnedProcess) else process
+
+
+def _group_alive(process: _OwnedProcess | subprocess.Popen[bytes]) -> bool:
+    if os.name == "nt":
+        if not isinstance(process, _OwnedProcess) or process.job is None:
+            raise OSError("Windows process tree has no owned Job Object")
+        return process.job.active_processes() != 0
+    leader = _leader(process)
+    leader.poll()
     try:
-        os.killpg(process.pid, 0)
+        os.killpg(leader.pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -156,58 +385,268 @@ def _enable_child_subreaper() -> None:
         raise OSError(error_number, os.strerror(error_number))
 
 
-def _reap_process_group(process: subprocess.Popen[bytes]) -> None:
+def _reap_process_group(process: _OwnedProcess | subprocess.Popen[bytes]) -> None:
+    leader = _leader(process)
     while sys.platform.startswith("linux"):
         try:
-            if os.waitpid(-process.pid, os.WNOHANG)[0] == 0:
+            if os.waitpid(-leader.pid, os.WNOHANG)[0] == 0:
                 return
         except ChildProcessError:
             return
 
 
-def _signal_process_tree(process: subprocess.Popen[bytes], force: bool) -> None:
+def _signal_process_tree(process: _OwnedProcess | subprocess.Popen[bytes],
+                         force: bool) -> None:
+    leader = _leader(process)
     if os.name == "posix":
-        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
-    else:
-        (process.kill if force else process.terminate)()
+        os.killpg(leader.pid, signal.SIGKILL if force else signal.SIGTERM)
+        return
+    if not isinstance(process, _OwnedProcess) or process.job is None:
+        raise OSError("refusing leader-only Windows termination without a Job Object")
+    process.job.terminate()
 
 
-def _stop_processes(processes: list[subprocess.Popen[bytes]], reason: str
-                    ) -> dict[int, dict[str, object]]:
-    targeted = [process for process in processes if _group_alive(process)]
-    states: dict[int, dict[str, object]] = {
-        process.pid: {"reason": reason, "terminate_requested": True,
-                      "kill_requested": False} for process in targeted
-    }
+def _stop_posix_processes(
+    processes: list[_OwnedProcess | subprocess.Popen[bytes]], reason: str
+) -> dict[int, dict[str, object]]:
+    targeted: list[_OwnedProcess | subprocess.Popen[bytes]] = []
+    states: dict[int, dict[str, object]] = {}
+    for process in processes:
+        try:
+            if _group_alive(process):
+                targeted.append(process)
+                states[process.pid] = {
+                    "reason": reason,
+                    "ownership_mode": "posix_process_group",
+                    "terminate_requested": True,
+                    "kill_requested": False,
+                }
+        except OSError as error:
+            states[process.pid] = {
+                "reason": reason,
+                "ownership_mode": "posix_process_group",
+                "liveness_query_failed": f"{type(error).__name__}: {error}",
+                "terminate_requested": False,
+                "kill_requested": False,
+                "group_alive_after_stop": True,
+            }
     for process in targeted:
         try:
             _signal_process_tree(process, False)
         except ProcessLookupError:
             pass
+        except OSError as error:
+            states[process.pid]["terminate_failed"] = f"{type(error).__name__}: {error}"
     deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
-    while any(_group_alive(process) for process in targeted) and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        try:
+            if not any(_group_alive(process) for process in targeted):
+                break
+        except OSError:
+            break
         time.sleep(0.05)
     for process in targeted:
-        if _group_alive(process):
+        try:
+            alive = _group_alive(process)
+        except OSError as error:
+            states[process.pid]["liveness_query_failed"] = f"{type(error).__name__}: {error}"
+            alive = True
+        if alive:
             states[process.pid]["kill_requested"] = True
             try:
                 _signal_process_tree(process, True)
             except ProcessLookupError:
                 pass
+            except OSError as error:
+                states[process.pid]["kill_failed"] = f"{type(error).__name__}: {error}"
     for process in targeted:
         try:
             process.wait(timeout=_TERMINATE_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             states[process.pid]["wait_failed_after_kill"] = True
     group_deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
-    while any(_group_alive(process) for process in targeted) and time.monotonic() < group_deadline:
+    while time.monotonic() < group_deadline:
+        try:
+            if not any(_group_alive(process) for process in targeted):
+                break
+        except OSError:
+            break
         for process in targeted:
             _reap_process_group(process)
         time.sleep(0.01)
     for process in targeted:
         _reap_process_group(process)
-        states[process.pid]["group_alive_after_stop"] = _group_alive(process)
+        try:
+            states[process.pid]["group_alive_after_stop"] = _group_alive(process)
+        except OSError as error:
+            states[process.pid]["liveness_query_failed"] = f"{type(error).__name__}: {error}"
+            states[process.pid]["group_alive_after_stop"] = True
     return states
+
+
+def _stop_windows_processes(
+    processes: list[_OwnedProcess | subprocess.Popen[bytes]], reason: str
+) -> dict[int, dict[str, object]]:
+    states: dict[int, dict[str, object]] = {}
+    for candidate in processes:
+        state: dict[str, object] = {
+            "reason": reason,
+            "ownership_mode": "windows_job_object",
+            "terminate_requested": False,
+            "kill_requested": False,
+            "assignment_before_release": False,
+            "release_completed": False,
+            "job_zero_active_proven": False,
+            "job_closed": False,
+        }
+        states[candidate.pid] = state
+        if not isinstance(candidate, _OwnedProcess) or candidate.job is None:
+            state["job_ownership_missing"] = True
+            state["group_alive_after_stop"] = True
+            continue
+        state["assignment_before_release"] = candidate.assignment_before_release
+        state["release_completed"] = candidate.release_completed
+        active: int | None = None
+        try:
+            active = candidate.job.active_processes()
+            state["active_processes_before_stop"] = active
+        except OSError as error:
+            state["job_query_failed"] = f"{type(error).__name__}: {error}"
+
+        if active is None or active != 0:
+            state["terminate_requested"] = True
+            state["kill_requested"] = True
+            try:
+                candidate.job.terminate()
+                state["job_terminate_succeeded"] = True
+            except OSError as error:
+                state["job_terminate_failed"] = f"{type(error).__name__}: {error}"
+
+        deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                active = candidate.job.active_processes()
+            except OSError as error:
+                state["job_query_failed"] = f"{type(error).__name__}: {error}"
+                active = None
+                break
+            if active == 0:
+                state["active_processes_after_stop"] = 0
+                state["job_zero_active_proven"] = True
+                break
+            time.sleep(0.01)
+        if not state["job_zero_active_proven"] and active is not None:
+            state["active_processes_after_stop"] = active
+            state["job_zero_wait_timed_out"] = True
+
+        try:
+            candidate.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            state["wait_failed_after_kill"] = True
+            state["leader_wait_failed"] = True
+
+        try:
+            candidate.job.close()
+            state["job_closed"] = True
+        except OSError as error:
+            state["job_close_failed"] = f"{type(error).__name__}: {error}"
+        state["group_alive_after_stop"] = not bool(state["job_zero_active_proven"])
+    return states
+
+
+def _stop_processes(
+    processes: list[_OwnedProcess | subprocess.Popen[bytes]], reason: str
+) -> dict[int, dict[str, object]]:
+    if os.name == "nt":
+        return _stop_windows_processes(processes, reason)
+    return _stop_posix_processes(processes, reason)
+
+
+def _write_release_token(path: Path) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, b"release\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _cleanup_unassigned_windows_wrapper(
+    process: subprocess.Popen[bytes], job: _WindowsJob
+) -> list[str]:
+    errors: list[str] = []
+    try:
+        process.terminate()
+        process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+    except BaseException as error:
+        errors.append(f"blocked-wrapper-terminate: {type(error).__name__}: {error}")
+    if process.poll() is None:
+        try:
+            process.kill()
+            process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        except BaseException as error:
+            errors.append(f"blocked-wrapper-wait: {type(error).__name__}: {error}")
+    try:
+        if job.active_processes() != 0:
+            errors.append("unassigned Job Object unexpectedly has active processes")
+    except OSError as error:
+        errors.append(f"unassigned-job-query: {type(error).__name__}: {error}")
+    try:
+        job.close()
+    except OSError as error:
+        errors.append(f"unassigned-job-close: {type(error).__name__}: {error}")
+    return errors
+
+
+def _start_owned_process(
+    command: list[str], cwd: Path, environment: dict[str, str],
+    stdout_stream: object, stderr_stream: object, release_path: Path
+) -> _OwnedProcess:
+    if os.name != "nt":
+        return _OwnedProcess(subprocess.Popen(
+            command, cwd=cwd, env=environment,
+            stdout=stdout_stream, stderr=stderr_stream,
+            start_new_session=True,
+        ))
+
+    release_path.unlink(missing_ok=True)
+    job = _WindowsJob()
+    wrapper_command = [
+        sys.executable, os.fspath(Path(__file__).resolve()),
+        _WINDOWS_TRAMPOLINE, os.fspath(release_path), "--", *command,
+    ]
+    try:
+        process = subprocess.Popen(
+            wrapper_command, cwd=cwd, env=environment,
+            stdout=stdout_stream, stderr=stderr_stream,
+        )
+    except BaseException as error:
+        close_error: OSError | None = None
+        try:
+            job.close()
+        except OSError as failure:
+            close_error = failure
+        if close_error is not None:
+            raise OSError(
+                f"blocked-wrapper launch failed: {error}; Job Object close failed: "
+                f"{close_error}"
+            ) from error
+        raise
+    owned = _OwnedProcess(process=process, job=job)
+    try:
+        job.assign(process)
+        owned.assignment_before_release = True
+    except BaseException as error:
+        cleanup_errors = _cleanup_unassigned_windows_wrapper(process, job)
+        suffix = f"; cleanup_errors={cleanup_errors}" if cleanup_errors else ""
+        raise OSError(f"assignment-before-release failed: {error}{suffix}") from error
+    try:
+        _write_release_token(release_path)
+        owned.release_completed = True
+    except BaseException as error:
+        state = _stop_windows_processes([owned], "handshake_release_failure")[owned.pid]
+        raise OSError(f"pre-execution release failed: {error}; cleanup={state}") from error
+    return owned
 
 
 def _launch(executable: Path, copies: int, shared: Path,
@@ -224,7 +663,7 @@ def _launch(executable: Path, copies: int, shared: Path,
     ):
         base_environment.pop(variable, None)
 
-    processes: list[subprocess.Popen[bytes]] = []
+    processes: list[_OwnedProcess] = []
     log_paths: list[tuple[Path, Path]] = []
     identities: list[int] = []
     observed_roots: set[str] = set()
@@ -255,17 +694,14 @@ def _launch(executable: Path, copies: int, shared: Path,
             stdout_path = log_directory / f"copy-{index}.stdout"
             stderr_path = log_directory / f"copy-{index}.stderr"
             with stdout_path.open("wb") as stdout_stream, stderr_path.open("wb") as stderr_stream:
-                process = subprocess.Popen(
-                    [os.fspath(executable)],
-                    cwd=shared,
-                    env=environment,
-                    stdout=stdout_stream,
-                    stderr=stderr_stream,
-                    start_new_session=(os.name == "posix"),
+                process = _start_owned_process(
+                    [os.fspath(executable)], shared, environment,
+                    stdout_stream, stderr_stream,
+                    log_directory / f"copy-{index}.release",
                 )
             processes.append(process)
             log_paths.append((stdout_path, stderr_path))
-        while any(process.poll() is None for process in processes):
+        while any(_group_alive(process) for process in processes):
             observe_roots()
             if synchronization_mutant is not None:
                 expected = _SYNC_DIAGNOSTICS[synchronization_mutant]
@@ -285,6 +721,13 @@ def _launch(executable: Path, copies: int, shared: Path,
                         processes, "synchronization_mutant_diagnostic"
                     )
                     break
+            # Leader completion is a cleanup trigger, never a whole-tree proof.
+            # A surviving group/job is still queried, terminated and proved empty.
+            if all(process.poll() is not None for process in processes):
+                termination = _stop_processes(
+                    processes, "post_exit_descendant_cleanup"
+                )
+                break
             if time.monotonic() >= deadline:
                 timed_out = True
                 termination = _stop_processes(processes, "timeout")
@@ -299,13 +742,27 @@ def _launch(executable: Path, copies: int, shared: Path,
 
     results: list[dict[str, object]] = []
     for index, (process, paths) in enumerate(zip(processes, log_paths)):
-        process.wait()
+        stop_state = termination.get(process.pid, {})
+        try:
+            process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            if not stop_state:
+                stop_state = {
+                    "reason": "result_collection",
+                    "ownership_mode": (
+                        "windows_job_object" if os.name == "nt"
+                        else "posix_process_group"
+                    ),
+                }
+                termination[process.pid] = stop_state
+            stop_state["leader_wait_failed"] = True
+            stop_state["wait_failed_after_kill"] = True
         stdout = paths[0].read_bytes()
         stderr = paths[1].read_bytes()
-        stop_state = termination.get(process.pid, {})
+        exit_code = process.returncode if process.returncode is not None else -1
         results.append(
             {
-                "copy": index, "identity": identities[index], "exit": process.returncode,
+                "copy": index, "identity": identities[index], "exit": exit_code,
                 "timed_out": stop_state.get("reason") == "timeout",
                 "termination": stop_state or None,
                 "reported_atomic_claim_failure": (
@@ -316,6 +773,7 @@ def _launch(executable: Path, copies: int, shared: Path,
                 "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
                 "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
                 "stdout_tail": _summary_tail(stdout), "stderr_tail": _summary_tail(stderr),
+                "suite": _parse_suite_output(stdout, stderr),
             }
         )
     return {
@@ -510,11 +968,191 @@ def _fail(message: str, classification: str, phase: str) -> None:
     raise HarnessFailure(message, classification=classification, phase=phase)
 
 
+def _windows_trampoline(arguments: list[str]) -> int:
+    if os.name != "nt":
+        print("Windows trampoline invoked on a non-Windows host", file=sys.stderr)
+        return 125
+    if len(arguments) < 3 or arguments[1] != "--":
+        print("invalid Windows trampoline arguments", file=sys.stderr)
+        return 125
+    release_path = Path(arguments[0])
+    command = arguments[2:]
+    deadline = time.monotonic() + 60.0
+    while not release_path.is_file():
+        if time.monotonic() >= deadline:
+            print("Windows trampoline release timed out", file=sys.stderr)
+            return 124
+        time.sleep(0.005)
+    try:
+        child = subprocess.Popen(command)
+        return child.wait()
+    except BaseException as error:
+        print(f"Windows trampoline child launch failed: {type(error).__name__}: {error}",
+              file=sys.stderr)
+        return 125
+
+
+def _wait_for_path(path: Path, timeout_seconds: float) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while not path.is_file():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for {path.name}")
+        time.sleep(0.01)
+
+
+def _windows_self_test_descendant(arguments: list[str]) -> int:
+    if os.name != "nt" or len(arguments) != 1:
+        return 125
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    except (AttributeError, OSError, ValueError):
+        pass
+    marker = Path(arguments[0])
+    descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    while True:
+        time.sleep(1.0)
+
+
+def _windows_self_test_subject(arguments: list[str]) -> int:
+    if os.name != "nt" or len(arguments) != 2:
+        return 125
+    mode, marker_name = arguments
+    if mode not in ("timeout-resistant-descendant", "leader-exit-descendant"):
+        return 125
+    if mode == "timeout-resistant-descendant":
+        try:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        except (AttributeError, OSError, ValueError):
+            pass
+    child = subprocess.Popen([
+        sys.executable, os.fspath(Path(__file__).resolve()),
+        _WINDOWS_SELF_TEST_DESCENDANT, marker_name,
+    ])
+    _wait_for_path(Path(marker_name), 10.0)
+    if mode == "leader-exit-descendant":
+        return 0
+    while child.poll() is None:
+        time.sleep(1.0)
+    return child.returncode if child.returncode is not None else 125
+
+
+def _windows_self_test_state_is_green(state: dict[str, object]) -> bool:
+    failures = (
+        "wait_failed_after_kill", "leader_wait_failed", "group_alive_after_stop",
+        "job_ownership_missing", "job_query_failed", "job_terminate_failed",
+        "job_zero_wait_timed_out", "job_close_failed",
+    )
+    return bool(
+        state.get("assignment_before_release") is True
+        and state.get("release_completed") is True
+        and state.get("terminate_requested") is True
+        and state.get("job_terminate_succeeded") is True
+        and state.get("job_zero_active_proven") is True
+        and state.get("active_processes_after_stop") == 0
+        and state.get("job_closed") is True
+        and not any(state.get(key) for key in failures)
+    )
+
+
+def _run_windows_self_test_case(root: Path, mode: str) -> dict[str, object]:
+    marker = root / f"{mode}.descendant-pid"
+    stdout_path = root / f"{mode}.stdout"
+    stderr_path = root / f"{mode}.stderr"
+    release_path = root / f"{mode}.release"
+    command = [
+        sys.executable, os.fspath(Path(__file__).resolve()),
+        _WINDOWS_SELF_TEST_SUBJECT, mode, os.fspath(marker),
+    ]
+    owned: _OwnedProcess | None = None
+    stopped = False
+    try:
+        with stdout_path.open("wb") as stdout_stream, stderr_path.open("wb") as stderr_stream:
+            owned = _start_owned_process(
+                command, root, dict(os.environ), stdout_stream, stderr_stream, release_path
+            )
+        _wait_for_path(marker, 10.0)
+        assert owned.job is not None
+        active_with_descendant = owned.job.active_processes()
+        minimum_active = 2 if mode == "timeout-resistant-descendant" else 1
+        if active_with_descendant < minimum_active:
+            raise RuntimeError(
+                f"Job Object did not observe the descendant tree: active={active_with_descendant}"
+            )
+        leader_exited_while_descendant_live = False
+        if mode == "timeout-resistant-descendant":
+            timeout_deadline = time.monotonic() + 0.25
+            while time.monotonic() < timeout_deadline:
+                time.sleep(0.01)
+        else:
+            deadline = time.monotonic() + 10.0
+            while owned.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if owned.poll() is None:
+                raise TimeoutError("leader-exit trampoline did not exit boundedly")
+            active_after_leader_exit = owned.job.active_processes()
+            leader_exited_while_descendant_live = active_after_leader_exit > 0
+            if not leader_exited_while_descendant_live:
+                raise RuntimeError("leader exit was mistaken for whole-job completion")
+        state = _stop_processes([owned], mode)[owned.pid]
+        stopped = True
+        if not _windows_self_test_state_is_green(state):
+            raise RuntimeError(f"Windows Job Object cleanup proof failed: {state}")
+        return {
+            "mode": mode,
+            "status": "PASS",
+            "active_processes_with_descendant": active_with_descendant,
+            "leader_exited_while_descendant_live": leader_exited_while_descendant_live,
+            "termination": state,
+        }
+    finally:
+        if owned is not None and not stopped:
+            _stop_processes([owned], "self_test_exception_cleanup")
+
+
+def _windows_process_tree_self_test() -> int:
+    if os.name != "nt":
+        print(json.dumps({
+            "schema": "dspark.windows-process-tree-self-test.v1",
+            "status": "PENDING_REMOTE",
+            "platform": sys.platform,
+            "terminal": "native Windows Job Object runtime is unavailable locally",
+        }, sort_keys=True))
+        return 0
+    record: dict[str, object] = {
+        "schema": "dspark.windows-process-tree-self-test.v1",
+        "status": "FAIL",
+        "platform": sys.platform,
+        "cases": [],
+    }
+    try:
+        with tempfile.TemporaryDirectory(prefix="dspark-windows-job-self-test-") as directory:
+            root = Path(directory)
+            cases = record["cases"]
+            assert isinstance(cases, list)
+            cases.append(_run_windows_self_test_case(root, "timeout-resistant-descendant"))
+            cases.append(_run_windows_self_test_case(root, "leader-exit-descendant"))
+        record.update(
+            status="PASS",
+            terminal="native Windows Job Object tree ownership and cleanup proved",
+        )
+    except BaseException as error:
+        record["terminal"] = f"{type(error).__name__}: {error}"
+    print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+    return 0 if record["status"] == "PASS" else 1
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     if args.copies < 3 or args.copies > _MAX_COPIES:
         _reject(f"copies must be in [3, {_MAX_COPIES}]")
     if args.timeout_seconds <= 0:
         _reject("timeout-seconds must be positive")
+    if not args.expect_all_pass and not args.expect_collision:
+        _reject("one expectation is required")
     if args.expect_collision != (args.mutant == "fixed-testio-names"):
         _reject("the collision expectation requires the fixed-name mutant")
     if args.sync_mutant is not None and args.mutant != "fixed-testio-names":
@@ -531,11 +1169,15 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--self-test-windows-process-tree", action="store_true",
+        help="run the bounded native-Windows Job Object ownership control",
+    )
     parser.add_argument("--copies", type=int, default=3)
     parser.add_argument("--working-directory", choices=("shared",), default="shared")
     parser.add_argument("--mutant", choices=("fixed-testio-names",))
     parser.add_argument("--sync-mutant", choices=tuple(_SYNC_DIAGNOSTICS))
-    expectation = parser.add_mutually_exclusive_group(required=True)
+    expectation = parser.add_mutually_exclusive_group()
     expectation.add_argument("--expect-all-pass", action="store_true")
     expectation.add_argument("--expect-collision", action="store_true")
     parser.add_argument("--executable", type=Path)
@@ -562,8 +1204,83 @@ def _executable(args: argparse.Namespace, repo: Path, root: Path,
     return executable
 
 
+def _validate_process_cleanup(record: dict[str, object]) -> None:
+    results = record.get("results", [])
+    assert isinstance(results, list)
+    issues: list[dict[str, object]] = []
+    failure_keys = (
+        "wait_failed_after_kill", "leader_wait_failed", "group_alive_after_stop",
+        "liveness_query_failed", "terminate_failed", "kill_failed",
+        "job_ownership_missing", "job_query_failed", "job_terminate_failed",
+        "job_zero_wait_timed_out", "job_close_failed",
+    )
+    for result in results:
+        if not isinstance(result, dict):
+            issues.append({"copy": None, "issue": "malformed result"})
+            continue
+        termination = result.get("termination")
+        if termination is None:
+            if os.name == "nt":
+                issues.append({
+                    "copy": result.get("copy"),
+                    "issue": "missing Windows Job Object cleanup proof",
+                })
+            continue
+        if not isinstance(termination, dict):
+            issues.append({"copy": result.get("copy"), "issue": "malformed termination"})
+            continue
+        present = {
+            key: termination[key] for key in failure_keys
+            if termination.get(key)
+        }
+        windows_proof_present = (
+            termination.get("ownership_mode") == "windows_job_object"
+            or "job_zero_active_proven" in termination
+            or "active_processes_after_stop" in termination
+            or "job_closed" in termination
+        )
+        if windows_proof_present:
+            requirements = {
+                "ownership_mode": termination.get("ownership_mode") == "windows_job_object",
+                "assignment_before_release": termination.get("assignment_before_release") is True,
+                "release_completed": termination.get("release_completed") is True,
+                "job_zero_active_proven": termination.get("job_zero_active_proven") is True,
+                "active_processes_after_stop": termination.get("active_processes_after_stop") == 0,
+                "job_closed": termination.get("job_closed") is True,
+            }
+            missing = [key for key, satisfied in requirements.items() if not satisfied]
+            if missing:
+                present["missing_windows_proofs"] = missing
+        if present:
+            issues.append({"copy": result.get("copy"), "uncertainty": present})
+    if issues:
+        _fail(
+            "process-tree cleanup was not proven: " + repr(issues),
+            "process_cleanup_failure", "process-cleanup-validation",
+        )
+
+
+def _validate_complete_suite(result: dict[str, object], classification: str,
+                             phase: str) -> dict[str, object]:
+    suite = result.get("suite")
+    if not isinstance(suite, dict) or suite.get("complete") is not True:
+        _fail(
+            f"copy {result.get('copy')} did not complete the exact "
+            f"{_EXPECTED_SUITE_TESTS}-test suite: {suite!r}",
+            classification, phase,
+        )
+    summary = suite.get("summary")
+    if not isinstance(summary, dict):
+        _fail(
+            f"copy {result.get('copy')} lacked one exact suite summary",
+            classification, phase,
+        )
+    return suite
+
+
 def _evaluate(args: argparse.Namespace, record: dict[str, object],
               outcome: dict[str, object], synchronization_root: Path | None) -> None:
+    _validate_process_cleanup(record)
     if outcome["launch_error"] is not None:
         _fail("child launch or monitoring failed: " + str(outcome["launch_error"]),
               "launch_failure", "child-launch-or-monitor")
@@ -586,6 +1303,23 @@ def _evaluate(args: argparse.Namespace, record: dict[str, object],
         if any(exits):
             _fail(f"candidate concurrent exits were {exits}",
                   "child_nonzero", "candidate-validation")
+        for result in results:
+            assert isinstance(result, dict)
+            suite = _validate_complete_suite(
+                result, "candidate_oracle_failure", "candidate-validation"
+            )
+            summary = suite["summary"]
+            assert isinstance(summary, dict)
+            if (
+                summary.get("passed") != _EXPECTED_SUITE_TESTS
+                or summary.get("failed") != 0
+                or suite.get("failed_tests") != []
+                or suite.get("exception_tests") != []
+            ):
+                _fail(
+                    f"copy {result.get('copy')} was not an exact green suite: {suite!r}",
+                    "candidate_oracle_failure", "candidate-validation",
+                )
         roots = record["observed_testio_roots"]
         if not isinstance(roots, list) or len(roots) < args.copies:
             _fail("did not observe one process-unique TestIO root per copy: " + repr(roots),
@@ -610,12 +1344,44 @@ def _evaluate(args: argparse.Namespace, record: dict[str, object],
         _fail(f"atomic claim lacked one winner and at least one loser: {outcomes}",
               "collision_oracle_failure", "collision-validation")
     by_identity = {int(result["identity"]): result for result in results}
+    if len(by_identity) != args.copies or set(by_identity) != set(range(args.copies)):
+        _fail(f"result identities did not exactly cover every copy: {sorted(by_identity)}",
+              "collision_oracle_failure", "collision-validation")
+    winner = by_identity[winners[0]]
+    winner_suite = _validate_complete_suite(
+        winner, "collision_oracle_failure", "collision-validation"
+    )
+    winner_summary = winner_suite["summary"]
+    assert isinstance(winner_summary, dict)
+    if (
+        int(winner["exit"]) != 0
+        or winner_summary.get("passed") != _EXPECTED_SUITE_TESTS
+        or winner_summary.get("failed") != 0
+        or winner_suite.get("failed_tests") != []
+        or winner_suite.get("exception_tests") != []
+    ):
+        _fail(
+            f"atomic-claim winner was not an exact green suite: {winner!r}",
+            "collision_oracle_failure", "collision-validation",
+        )
     for identity in losers:
         result = by_identity[identity]
-        if int(result["exit"]) == 0 or not result["reported_atomic_claim_failure"]:
-            _fail(f"losing identity {identity} lacked the exact atomic-claim failure",
+        suite = _validate_complete_suite(
+            result, "collision_oracle_failure", "collision-validation"
+        )
+        summary = suite["summary"]
+        assert isinstance(summary, dict)
+        if (
+            int(result["exit"]) == 0
+            or summary.get("passed") != _EXPECTED_SUITE_TESTS - 1
+            or summary.get("failed") != 1
+            or suite.get("failed_tests") != [_ATOMIC_CLAIM_TEST]
+            or suite.get("exception_tests") != []
+            or not result["reported_atomic_claim_failure"]
+        ):
+            _fail(f"losing identity {identity} lacked only the exact atomic-claim failure",
                   "collision_oracle_failure", "collision-validation")
-    if by_identity[winners[0]]["reported_atomic_claim_failure"]:
+    if winner["reported_atomic_claim_failure"]:
         _fail("atomic-claim winner reported the loser failure",
               "collision_oracle_failure", "collision-validation")
     record.update(
@@ -626,7 +1392,23 @@ def _evaluate(args: argparse.Namespace, record: dict[str, object],
 
 
 def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == _WINDOWS_TRAMPOLINE:
+        return _windows_trampoline(sys.argv[2:])
+    if len(sys.argv) >= 2 and sys.argv[1] == _WINDOWS_SELF_TEST_SUBJECT:
+        return _windows_self_test_subject(sys.argv[2:])
+    if len(sys.argv) >= 2 and sys.argv[1] == _WINDOWS_SELF_TEST_DESCENDANT:
+        return _windows_self_test_descendant(sys.argv[2:])
     args = _parse_args()
+    if args.self_test_windows_process_tree:
+        if len(sys.argv) != 2:
+            print(json.dumps({
+                "schema": "dspark.windows-process-tree-self-test.v1",
+                "status": "FAIL",
+                "classification": "configuration_failure",
+                "terminal": "--self-test-windows-process-tree accepts no other options",
+            }, sort_keys=True), file=sys.stderr)
+            return 1
+        return _windows_process_tree_self_test()
     record = _base_record(args)
     try:
         _validate_args(args)

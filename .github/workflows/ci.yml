@@ -372,6 +372,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Prove Windows process-tree ownership and cleanup
+        if: matrix.msvc_arch != ''
+        run: python tools/run_concurrent_test_suites.py --self-test-windows-process-tree
+
       - name: Set up MSVC environment
         if: matrix.msvc_arch != ''
         uses: ilammy/msvc-dev-cmd@v1

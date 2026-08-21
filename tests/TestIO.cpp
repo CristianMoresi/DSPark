@@ -45,12 +45,6 @@ public:
     TestIOProcessRoot()
         : launchDirectory_(std::filesystem::current_path())
     {
-#if defined(DSPARK_TESTIO_FIXED_NAME_MUTANT)
-        // Targeted concurrency control: retaining the caller's directory
-        // restores the historical fixed-name collision without changing any
-        // individual test expectation.
-        path_ = launchDirectory_;
-#else
         const std::filesystem::path base = std::filesystem::temp_directory_path();
         std::random_device entropy;
         const auto stamp = static_cast<uint64_t>(
@@ -71,7 +65,6 @@ public:
             }
         }
         throw std::runtime_error("could not create process-unique TestIO directory");
-#endif
     }
 
     TestIOProcessRoot(const TestIOProcessRoot&) = delete;
@@ -277,7 +270,14 @@ DSPARK_TEST(TestIO_process_temporary_root_is_exclusive)
             + std::to_string(ready));
 #endif
 
+#if defined(DSPARK_TESTIO_FIXED_NAME_MUTANT)
+    // Only this deliberate claim is shared. Every WAV/MP3/MIDI/FLAC and
+    // integration artifact remains inside the process-unique root above.
+    const std::filesystem::path claim =
+        sync.root / "dspark_process_exclusive_claim";
+#else
     const std::filesystem::path claim = "dspark_process_exclusive_claim";
+#endif
     std::error_code ec;
     const bool acquired = std::filesystem::create_directory(claim, ec);
     if (ec)

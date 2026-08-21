@@ -16,14 +16,17 @@ later ``>`` balances the ``<`` and the span has a top-level comma, ``||`` or
 keyword and is therefore actionable too.
 
 Run from the repository root.  Exit 1 means at least one ambiguous span, and
-exit 2 means a tracked source could not be enumerated or read.
+exit 2 means an authored comparison source could not be enumerated or read.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
+import stat
 import subprocess
 import sys
 
@@ -35,6 +38,31 @@ EXCLUDE_PREFIXES = (
     "plugin/vst3/vst3_c_api.h",
     "plugin/webview/webview/",
 )
+# The fallback domain mirrors the public authored-source areas represented in
+# a Git archive.  It deliberately names areas, not today's individual files.
+SOURCE_ROOTS = (
+    "Analysis",
+    "Core",
+    "DSParkLab",
+    "Effects",
+    "IO",
+    "Music",
+    "bench",
+    "conformance",
+    "examples",
+    "plugin",
+    "tests",
+    "tools",
+)
+ROOT_SOURCES = ("DSPark.h",)
+GENERATED_DIRECTORY_NAMES = (
+    "CMakeFiles",
+    "__pycache__",
+    "_deps",
+    "_build",
+    "generated",
+)
+BUILD_DIRECTORY_PREFIXES = ("build-", "build_", "cmake-build-")
 PUNCTUATION = sorted(
     (
         "<=>", "...", "->*", "<<=", ">>=", "->", "::", "<=", ">=", "<<",
@@ -51,7 +79,40 @@ AMBIGUITY_MARKERS = (",", "||", "&&")
 GITLINK_MODE = "160000"
 
 
-def tracked_sources(repo: Path) -> list[str]:
+def _safe_relative_path(path: str) -> bool:
+    try:
+        path.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        return False
+    parsed = PurePosixPath(path)
+    return (
+        bool(path)
+        and not parsed.is_absolute()
+        and "\\" not in path
+        and not any(ord(char) < 32 or ord(char) == 127 for char in path)
+        and all(part not in ("", ".", "..") for part in parsed.parts)
+    )
+
+
+def _eligible_source(path: str) -> bool:
+    return (
+        path.endswith(SOURCE_SUFFIXES)
+        and not path.startswith(EXCLUDE_PREFIXES)
+    )
+
+
+def _excluded_fallback_directory(relative: str, name: str) -> bool:
+    prefix = relative + "/"
+    return (
+        name.startswith(".")
+        or name in GENERATED_DIRECTORY_NAMES
+        or name == "build"
+        or name.startswith(BUILD_DIRECTORY_PREFIXES)
+        or any(prefix.startswith(excluded) for excluded in EXCLUDE_PREFIXES)
+    )
+
+
+def git_tracked_sources(repo: Path) -> list[str]:
     completed = subprocess.run(
         ("git", "-C", str(repo), "ls-files", "-s", "-z"),
         check=False,
@@ -63,19 +124,115 @@ def tracked_sources(repo: Path) -> list[str]:
         raise OSError(f"cannot enumerate tracked files: {detail}")
     paths: list[str] = []
     for raw_entry in completed.stdout.split(b"\0"):
-        if not raw_entry or b"\t" not in raw_entry:
+        if not raw_entry:
             continue
+        if b"\t" not in raw_entry:
+            raise OSError("cannot parse git source inventory")
         raw_header, raw_path = raw_entry.split(b"\t", 1)
-        mode = raw_header.split(b" ", 1)[0].decode("ascii")
-        path = raw_path.decode("utf-8", "surrogateescape")
+        try:
+            mode = raw_header.split(b" ", 1)[0].decode("ascii")
+            path = raw_path.decode("utf-8", "strict")
+        except UnicodeDecodeError as error:
+            raise OSError("git source inventory is not UTF-8") from error
+        if not _safe_relative_path(path):
+            raise OSError(f"unsafe path in git source inventory: {path!r}")
         if mode == GITLINK_MODE:
             continue
-        if not path.endswith(SOURCE_SUFFIXES):
-            continue
-        if path.startswith(EXCLUDE_PREFIXES):
-            continue
-        paths.append(path)
-    return paths
+        if _eligible_source(path):
+            paths.append(path)
+    if len(paths) != len(set(paths)):
+        raise OSError("duplicate path in git source inventory")
+    return sorted(paths)
+
+
+def archive_sources(repo: Path) -> list[str]:
+    """Enumerate the authored source domain present in a Git archive."""
+
+    paths: list[str] = []
+    for relative in ROOT_SOURCES:
+        path = repo / relative
+        try:
+            mode = path.lstat().st_mode
+        except OSError as error:
+            raise OSError(f"cannot inspect required source {relative}: {error}") from error
+        if not stat.S_ISREG(mode):
+            raise OSError(f"required source is not a regular file: {relative}")
+        paths.append(relative)
+
+    for root_name in SOURCE_ROOTS:
+        source_root = repo / root_name
+        try:
+            root_mode = source_root.lstat().st_mode
+        except OSError as error:
+            raise OSError(f"cannot inspect source root {root_name}: {error}") from error
+        if not stat.S_ISDIR(root_mode):
+            raise OSError(f"source root is not a directory: {root_name}")
+
+        walk_error: list[OSError] = []
+
+        def remember_error(error: OSError) -> None:
+            walk_error.append(error)
+
+        for current, directories, files in os.walk(
+            source_root, topdown=True, onerror=remember_error, followlinks=False
+        ):
+            if walk_error:
+                raise OSError(f"cannot walk source root {root_name}: {walk_error[0]}")
+            current_path = Path(current)
+            current_relative = current_path.relative_to(repo).as_posix()
+            kept_directories: list[str] = []
+            for name in sorted(directories):
+                relative = f"{current_relative}/{name}"
+                if not _safe_relative_path(relative):
+                    raise OSError(
+                        "unsafe directory in archive source inventory: "
+                        + ascii(relative)
+                    )
+                if _excluded_fallback_directory(relative, name):
+                    continue
+                child = current_path / name
+                try:
+                    child_mode = child.lstat().st_mode
+                except OSError as error:
+                    raise OSError(f"cannot inspect {relative}: {error}") from error
+                if stat.S_ISLNK(child_mode):
+                    raise OSError(f"source directory is a symlink: {relative}")
+                if not stat.S_ISDIR(child_mode):
+                    raise OSError(f"source directory is unsafe: {relative}")
+                kept_directories.append(name)
+            directories[:] = kept_directories
+
+            for name in sorted(files):
+                relative = f"{current_relative}/{name}"
+                if not _safe_relative_path(relative):
+                    raise OSError(
+                        "unsafe path in archive source inventory: " + ascii(relative)
+                    )
+                if not _eligible_source(relative):
+                    continue
+                path = current_path / name
+                try:
+                    mode = path.lstat().st_mode
+                except OSError as error:
+                    raise OSError(f"cannot inspect {relative}: {error}") from error
+                if not stat.S_ISREG(mode):
+                    raise OSError(f"source is not a regular file: {relative}")
+                paths.append(relative)
+        if walk_error:
+            raise OSError(f"cannot walk source root {root_name}: {walk_error[0]}")
+
+    if len(paths) != len(set(paths)):
+        raise OSError("duplicate path in archive source inventory")
+    return sorted(paths)
+
+
+def comparison_sources(repo: Path) -> list[str]:
+    git_metadata = repo / ".git"
+    if git_metadata.is_symlink():
+        raise OSError("Git metadata path is a symlink")
+    if git_metadata.exists():
+        return git_tracked_sources(repo)
+    return archive_sources(repo)
 
 
 def tokenize(text: str) -> list[tuple[int, str]]:
@@ -220,16 +377,24 @@ def offences(tokens: list[tuple[int, str]]):
 
 
 def scan_repository(repo: Path) -> int:
+    try:
+        sources = comparison_sources(repo)
+    except OSError as error:
+        print(f"cannot enumerate comparison sources: {error}", file=sys.stderr)
+        return 2
     found = 0
-    for relative in tracked_sources(repo):
+    for relative in sources:
         path = repo / relative
         try:
+            if not stat.S_ISREG(path.lstat().st_mode):
+                raise OSError("not a regular file")
             text = path.read_text(encoding="utf-8", errors="strict")
         except OSError as error:
             print(f"cannot read {relative}: {error}", file=sys.stderr)
             return 2
-        except UnicodeDecodeError:
-            continue
+        except UnicodeDecodeError as error:
+            print(f"cannot decode {relative} as UTF-8: {error}", file=sys.stderr)
+            return 2
         for line, closing_line, span in offences(tokenize(text)):
             found += 1
             print(
@@ -275,6 +440,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--self-test-bad", action="store_true")
+    parser.add_argument("--list-sources", action="store_true")
     return parser.parse_args()
 
 
@@ -284,7 +450,15 @@ def main() -> int:
         return self_test_bad()
     if args.self_test:
         return self_test()
-    return scan_repository(Path(__file__).resolve().parents[1])
+    repo = Path(__file__).resolve().parents[1]
+    if args.list_sources:
+        try:
+            print("\n".join(comparison_sources(repo)))
+        except OSError as error:
+            print(f"cannot enumerate comparison sources: {error}", file=sys.stderr)
+            return 2
+        return 0
+    return scan_repository(repo)
 
 
 if __name__ == "__main__":

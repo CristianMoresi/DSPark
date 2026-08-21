@@ -559,9 +559,9 @@ DSPARK_TEST(SpectralFreeze_sound_gate_tonal_held_phase_law)
     std::vector<std::vector<double>> audio(
         1, std::vector<double>(static_cast<std::size_t>(total)));
     for (int i = 0; i < total; ++i)
-        audio[0][static_cast<std::size_t>(i)] = 0.25L
-            * std::sin(2.0L * std::numbers::pi_v<long double>
-                       * cyclesPerSample * i + 0.41L);
+        audio[0][static_cast<std::size_t>(i)] = static_cast<double>(
+            0.25L * std::sin(2.0L * std::numbers::pi_v<long double>
+                             * cyclesPerSample * i + 0.41L));
 
     SpectralFreeze<double> freeze;
     freeze.prepare(spec, n, h);
@@ -622,10 +622,11 @@ DSPARK_TEST(SpectralFreeze_sound_gate_diffuse_stability_and_decorrelation)
         1, std::vector<double>(static_cast<std::size_t>(total), 0.0));
     for (int m = 1; m <= partials; ++m)
         for (int i = 0; i < total; ++i)
-            source[0][static_cast<std::size_t>(i)] += (0.11L / m)
-                * std::sin(2.0L * std::numbers::pi_v<long double>
-                           * (static_cast<long double>(fundamentalBin) * m / n)
-                           * i + 0.37L * m);
+            source[0][static_cast<std::size_t>(i)] = static_cast<double>(
+                source[0][static_cast<std::size_t>(i)] + (0.11L / m)
+                    * std::sin(2.0L * std::numbers::pi_v<long double>
+                               * (static_cast<long double>(fundamentalBin) * m / n)
+                               * i + 0.37L * m));
 
     auto held = source;
     SpectralFreeze<double> diffuse;
@@ -1041,8 +1042,9 @@ DSPARK_TEST(SpectralFreeze_sound_gate_reversals_retain_capture)
     for (int i = 0; i < total; ++i)
     {
         const long double cycles = i < 4 * n ? capturedCycles : laterCycles;
-        audio[0][static_cast<std::size_t>(i)] = 0.25L
-            * std::sin(2.0L * std::numbers::pi_v<long double> * cycles * i);
+        audio[0][static_cast<std::size_t>(i)] = static_cast<double>(
+            0.25L * std::sin(
+                2.0L * std::numbers::pi_v<long double> * cycles * i));
     }
 
     std::vector<ControlEvent> events { { 3 * n, ControlEvent::Kind::Freeze } };

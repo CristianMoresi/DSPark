@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,18 @@ import time
 
 class HarnessFailure(RuntimeError):
     pass
+
+
+_SYNC_ROOT = "DSPARK_TESTIO_COLLISION_SYNC_ROOT"
+_SYNC_IDENTITY = "DSPARK_TESTIO_COLLISION_SYNC_IDENTITY"
+_SYNC_PARTICIPANTS = "DSPARK_TESTIO_COLLISION_SYNC_PARTICIPANTS"
+_SYNC_TIMEOUT = "DSPARK_TESTIO_COLLISION_SYNC_TIMEOUT_MS"
+_SYNC_MUTANT = "DSPARK_TESTIO_COLLISION_SYNC_MUTANT"
+_SYNC_DIAGNOSTICS = {
+    "missing-readiness": "DSPARK_TESTIO_SYNC_TIMEOUT: readiness",
+    "duplicate-identity": "DSPARK_TESTIO_SYNC_ERROR: duplicate process identity",
+    "missing-attempted": "DSPARK_TESTIO_SYNC_TIMEOUT: attempted",
+}
 
 
 def _run(command: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -97,15 +110,33 @@ def _stop_processes(processes: list[subprocess.Popen[str]]) -> list[int]:
 
 def _launch(executable: Path, copies: int, shared: Path,
             temporary_parent: Path, log_directory: Path,
-            timeout_seconds: int) -> tuple[list[dict[str, object]], list[str]]:
-    environment = dict(os.environ)
+            timeout_seconds: int, synchronization_root: Path | None,
+            synchronization_mutant: str | None
+            ) -> tuple[list[dict[str, object]], list[str], str | None]:
+    base_environment = dict(os.environ)
     for variable in ("TMPDIR", "TMP", "TEMP"):
-        environment[variable] = os.fspath(temporary_parent)
+        base_environment[variable] = os.fspath(temporary_parent)
+    for variable in (
+        _SYNC_ROOT, _SYNC_IDENTITY, _SYNC_PARTICIPANTS, _SYNC_TIMEOUT, _SYNC_MUTANT
+    ):
+        base_environment.pop(variable, None)
 
     processes: list[subprocess.Popen[str]] = []
     log_paths: list[tuple[Path, Path]] = []
     log_streams: list[object] = []
+    identities: list[int] = []
     for index in range(copies):
+        identity = 0 if synchronization_mutant == "duplicate-identity" and index == 1 else index
+        identities.append(identity)
+        environment = dict(base_environment)
+        if synchronization_root is not None:
+            environment[_SYNC_ROOT] = os.fspath(synchronization_root)
+            environment[_SYNC_IDENTITY] = str(identity)
+            environment[_SYNC_PARTICIPANTS] = str(copies)
+            environment[_SYNC_TIMEOUT] = "1000" if synchronization_mutant else "30000"
+            if (synchronization_mutant in ("missing-readiness", "missing-attempted")
+                    and index == copies - 1):
+                environment[_SYNC_MUTANT] = synchronization_mutant
         stdout_path = log_directory / f"copy-{index}.stdout"
         stderr_path = log_directory / f"copy-{index}.stderr"
         stdout_stream = stdout_path.open("w", encoding="utf-8", newline="\n")
@@ -127,6 +158,7 @@ def _launch(executable: Path, copies: int, shared: Path,
     deadline = time.monotonic() + timeout_seconds
     timed_out = False
     killed: list[int] = []
+    early_diagnostic: str | None = None
     try:
         while any(process.poll() is None for process in processes):
             observed_roots.update(
@@ -134,6 +166,22 @@ def _launch(executable: Path, copies: int, shared: Path,
                 for path in temporary_parent.iterdir()
                 if path.name.startswith("dspark-testio-")
             )
+            if synchronization_mutant is not None:
+                expected = _SYNC_DIAGNOSTICS[synchronization_mutant]
+                for _, stderr_path in log_paths:
+                    stderr = stderr_path.read_text(
+                        encoding="utf-8", errors="replace")
+                    matching = next(
+                        (line.strip() for line in stderr.splitlines()
+                         if expected in line),
+                        None,
+                    )
+                    if matching is not None:
+                        early_diagnostic = matching
+                        killed = _stop_processes(processes)
+                        break
+                if early_diagnostic is not None:
+                    break
             if time.monotonic() >= deadline:
                 timed_out = True
                 killed = _stop_processes(processes)
@@ -159,7 +207,12 @@ def _launch(executable: Path, copies: int, shared: Path,
         results.append(
             {
                 "copy": index,
+                "identity": identities[index],
                 "exit": process.returncode,
+                "reported_atomic_claim_failure": (
+                    "FAIL: TestIO_process_temporary_root_is_exclusive" in stdout
+                    or "FAIL: TestIO_process_temporary_root_is_exclusive" in stderr
+                ),
                 "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
                 "stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
                 "stdout_tail": _summary_tail(stdout),
@@ -180,7 +233,28 @@ def _launch(executable: Path, copies: int, shared: Path,
             "kill_pids=%s tails=%s"
             % (timeout_seconds, exits, killed, tails)
         )
-    return results, sorted(observed_roots)
+    return results, sorted(observed_roots), early_diagnostic
+
+
+def _synchronization_outcomes(root: Path, copies: int) -> dict[int, str]:
+    pattern = re.compile(r"attempted-(\d+)-(winner|loser)\Z")
+    outcomes: dict[int, str] = {}
+    for path in root.iterdir():
+        match = pattern.fullmatch(path.name)
+        if match is None or not path.is_dir():
+            continue
+        identity = int(match.group(1))
+        outcome = match.group(2)
+        if identity in outcomes:
+            raise HarnessFailure(
+                f"duplicate synchronization outcome for identity {identity}"
+            )
+        outcomes[identity] = outcome
+    if set(outcomes) != set(range(copies)):
+        raise HarnessFailure(
+            "incomplete synchronization outcomes: " + repr(outcomes)
+        )
+    return outcomes
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
@@ -195,6 +269,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--copies", type=int, default=3)
     parser.add_argument("--working-directory", choices=("shared",), default="shared")
     parser.add_argument("--mutant", choices=("fixed-testio-names",))
+    parser.add_argument("--sync-mutant", choices=tuple(_SYNC_DIAGNOSTICS))
     expectation = parser.add_mutually_exclusive_group(required=True)
     expectation.add_argument("--expect-all-pass", action="store_true")
     expectation.add_argument("--expect-collision", action="store_true")
@@ -212,6 +287,8 @@ def main() -> int:
         raise HarnessFailure("timeout-seconds must be positive")
     if args.expect_collision != (args.mutant == "fixed-testio-names"):
         raise HarnessFailure("the collision expectation requires the fixed-name mutant")
+    if args.sync_mutant is not None and args.mutant != "fixed-testio-names":
+        raise HarnessFailure("a synchronization mutant requires the fixed-name mutant")
 
     repo = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="dspark-concurrent-suites-") as directory:
@@ -219,9 +296,14 @@ def main() -> int:
         shared = root / "shared"
         temporary_parent = root / "temporary"
         log_directory = root / "logs"
+        synchronization_root = (
+            root / "synchronization" if args.mutant == "fixed-testio-names" else None
+        )
         shared.mkdir()
         temporary_parent.mkdir()
         log_directory.mkdir()
+        if synchronization_root is not None:
+            synchronization_root.mkdir()
         build_commands: list[list[str]] = []
         if args.executable is None:
             executable, build_commands = _build(repo, root, args.mutant)
@@ -230,10 +312,20 @@ def main() -> int:
             if args.mutant is not None:
                 raise HarnessFailure("an external executable cannot establish the requested mutant")
 
-        results, observed_roots = _launch(
+        results, observed_roots, early_diagnostic = _launch(
             executable, args.copies, shared, temporary_parent, log_directory,
-            args.timeout_seconds
+            args.timeout_seconds, synchronization_root, args.sync_mutant
         )
+        if args.sync_mutant is not None:
+            expected = _SYNC_DIAGNOSTICS[args.sync_mutant]
+            if early_diagnostic is None or expected not in early_diagnostic:
+                raise HarnessFailure(
+                    f"synchronization mutant {args.sync_mutant} lacked {expected}"
+                )
+            raise HarnessFailure(
+                f"synchronization mutant {args.sync_mutant} live red: "
+                + early_diagnostic
+            )
         exits = [int(result["exit"]) for result in results]
         shared_residue = sorted(path.name for path in shared.iterdir())
         temporary_residue = sorted(path.name for path in temporary_parent.iterdir())
@@ -254,19 +346,36 @@ def main() -> int:
             status = "PASS"
             terminal = "all concurrent suites passed with unique cleaned roots"
         else:
-            failing = [result for result in results if int(result["exit"]) != 0]
-            failure_text = "\n".join(
-                "\n".join(result["stdout_tail"] + result["stderr_tail"])
-                for result in failing
+            assert synchronization_root is not None
+            outcomes = _synchronization_outcomes(
+                synchronization_root, args.copies)
+            winners = sorted(
+                identity for identity, outcome in outcomes.items()
+                if outcome == "winner"
             )
-            if not failing:
-                raise HarnessFailure("fixed-name mutant did not produce a real collision")
-            if "TestIO_process_temporary_root_is_exclusive" not in failure_text:
+            losers = sorted(
+                identity for identity, outcome in outcomes.items()
+                if outcome == "loser"
+            )
+            if len(winners) != 1 or not losers:
                 raise HarnessFailure(
-                    "mutant failed without the atomic TestIO collision control"
-                )
+                    f"atomic claim lacked one winner and at least one loser: {outcomes}"
+            )
+            by_identity = {int(result["identity"]): result for result in results}
+            for identity in losers:
+                result = by_identity[identity]
+                if (int(result["exit"]) == 0
+                        or not result["reported_atomic_claim_failure"]):
+                    raise HarnessFailure(
+                        f"losing identity {identity} lacked the exact atomic-claim failure"
+                    )
+            if by_identity[winners[0]]["reported_atomic_claim_failure"]:
+                raise HarnessFailure("atomic-claim winner reported the loser failure")
             status = "PASS"
-            terminal = "fixed-name mutant produced an atomic shared-path collision"
+            terminal = (
+                "fixed-name mutant produced one synchronized atomic winner and "
+                f"{len(losers)} losers"
+            )
 
         record: dict[str, object] = {
             "schema": "dspark.concurrent-test-suites.v1",
@@ -280,6 +389,9 @@ def main() -> int:
             "observed_testio_roots": observed_roots,
             "shared_residue": shared_residue,
             "temporary_residue": temporary_residue,
+            "synchronization_outcomes": (
+                outcomes if args.expect_collision else None
+            ),
         }
         if args.output is not None:
             _write_json(args.output, record)

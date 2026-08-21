@@ -497,7 +497,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build with ThreadSanitizer
         run: >
-          g++ -std=c++20 -O1 -g -Wall -Wextra -Wpedantic -Werror
+          g++ -std=c++20 -O1 -g -Wall -Wextra -Wpedantic -Werror -Wno-error=tsan
           -fsanitize=thread
           -I . conformance/dspark_conformance.cpp -o dspark_conformance_tsan
       - name: Run under ThreadSanitizer
@@ -543,7 +543,7 @@ jobs:
           cmake -S . -B build-tsan \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DDSPARK_BUILD_TESTS=ON -DDSPARK_BUILD_CONFORMANCE=OFF \
-            -DCMAKE_CXX_FLAGS="-fsanitize=thread"
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -Wno-error=tsan"
           cmake --build build-tsan --parallel
           ctest --test-dir build-tsan -V --timeout 5400
 

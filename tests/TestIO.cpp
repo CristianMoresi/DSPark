@@ -15,6 +15,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -105,6 +106,149 @@ static const char* tempWavF32() { return "dspark_test_f32.wav"; }
 static const char* tempWavStereo() { return "dspark_test_stereo.wav"; }
 static const char* tempMp3()    { return "dspark_test.mp3"; }
 
+#if defined(DSPARK_TESTIO_FIXED_NAME_MUTANT)
+namespace {
+
+constexpr const char* testIOSyncRootVariable =
+    "DSPARK_TESTIO_COLLISION_SYNC_ROOT";
+constexpr const char* testIOSyncIdentityVariable =
+    "DSPARK_TESTIO_COLLISION_SYNC_IDENTITY";
+constexpr const char* testIOSyncParticipantsVariable =
+    "DSPARK_TESTIO_COLLISION_SYNC_PARTICIPANTS";
+constexpr const char* testIOSyncTimeoutVariable =
+    "DSPARK_TESTIO_COLLISION_SYNC_TIMEOUT_MS";
+constexpr const char* testIOSyncMutantVariable =
+    "DSPARK_TESTIO_COLLISION_SYNC_MUTANT";
+
+struct TestIOCollisionSynchronization
+{
+    std::filesystem::path root;
+    uint64_t identity = 0;
+    uint64_t participants = 0;
+    std::chrono::milliseconds timeout { 0 };
+    std::string mutant;
+};
+
+uint64_t parseTestIOSyncUnsigned(const char* value, const char* variable)
+{
+    if (value == nullptr || *value == '\0')
+        throw std::runtime_error(std::string("DSPARK_TESTIO_SYNC_ERROR: missing ")
+                                 + variable);
+    uint64_t parsed = 0;
+    for (const char* cursor = value; *cursor != '\0'; ++cursor)
+    {
+        if (*cursor < '0' || *cursor > '9')
+            throw std::runtime_error(std::string("DSPARK_TESTIO_SYNC_ERROR: invalid ")
+                                     + variable);
+        const uint64_t digit = static_cast<uint64_t>(*cursor - '0');
+        if (parsed > (std::numeric_limits<uint64_t>::max() - digit) / 10)
+            throw std::runtime_error(std::string("DSPARK_TESTIO_SYNC_ERROR: overflow ")
+                                     + variable);
+        parsed = parsed * 10 + digit;
+    }
+    return parsed;
+}
+
+TestIOCollisionSynchronization testIOCollisionSynchronization()
+{
+    TestIOCollisionSynchronization sync;
+    const char* root = std::getenv(testIOSyncRootVariable);
+    if (root == nullptr || *root == '\0')
+        throw std::runtime_error(std::string("DSPARK_TESTIO_SYNC_ERROR: missing ")
+                                 + testIOSyncRootVariable);
+    sync.root = std::filesystem::path(root);
+    sync.identity = parseTestIOSyncUnsigned(
+        std::getenv(testIOSyncIdentityVariable), testIOSyncIdentityVariable);
+    sync.participants = parseTestIOSyncUnsigned(
+        std::getenv(testIOSyncParticipantsVariable),
+        testIOSyncParticipantsVariable);
+    const uint64_t timeoutMilliseconds = parseTestIOSyncUnsigned(
+        std::getenv(testIOSyncTimeoutVariable), testIOSyncTimeoutVariable);
+    if (sync.participants < 2 || sync.participants > 64
+        || sync.identity >= sync.participants
+        || timeoutMilliseconds == 0 || timeoutMilliseconds > 60000)
+        throw std::runtime_error("DSPARK_TESTIO_SYNC_ERROR: invalid synchronization bounds");
+    sync.timeout = std::chrono::milliseconds(timeoutMilliseconds);
+    if (const char* mutant = std::getenv(testIOSyncMutantVariable))
+        sync.mutant = mutant;
+    if (!sync.mutant.empty() && sync.mutant != "missing-readiness"
+        && sync.mutant != "missing-attempted")
+        throw std::runtime_error("DSPARK_TESTIO_SYNC_ERROR: unknown synchronization mutant");
+    std::error_code ec;
+    if (!std::filesystem::is_directory(sync.root, ec) || ec)
+        throw std::runtime_error("DSPARK_TESTIO_SYNC_ERROR: invalid synchronization root");
+    return sync;
+}
+
+void publishTestIOSyncDirectory(const std::filesystem::path& path,
+                                const std::string& duplicateDiagnostic)
+{
+    std::error_code ec;
+    if (std::filesystem::create_directory(path, ec)) return;
+    if (!ec)
+        throw std::runtime_error(duplicateDiagnostic);
+    throw std::runtime_error("DSPARK_TESTIO_SYNC_ERROR: publication failed: "
+                             + ec.message());
+}
+
+bool testIOSyncDirectoryExists(const std::filesystem::path& path,
+                               const char* phase)
+{
+    std::error_code ec;
+    const std::filesystem::file_status status = std::filesystem::status(path, ec);
+    if (!ec) return std::filesystem::is_directory(status);
+    if (ec == std::errc::no_such_file_or_directory) return false;
+    throw std::runtime_error(std::string("DSPARK_TESTIO_SYNC_ERROR: ") + phase
+                             + " scan failed: " + ec.message());
+}
+
+size_t countTestIOReady(const TestIOCollisionSynchronization& sync)
+{
+    size_t observed = 0;
+    for (uint64_t id = 0; id < sync.participants; ++id)
+    {
+        const bool exists = testIOSyncDirectoryExists(
+            sync.root / ("ready-" + std::to_string(id)), "readiness");
+        if (exists) ++observed;
+    }
+    return observed;
+}
+
+size_t countTestIOAttempted(const TestIOCollisionSynchronization& sync)
+{
+    size_t observed = 0;
+    for (uint64_t id = 0; id < sync.participants; ++id)
+    {
+        const bool winner = testIOSyncDirectoryExists(
+            sync.root / ("attempted-" + std::to_string(id) + "-winner"),
+            "attempted");
+        const bool loser = testIOSyncDirectoryExists(
+            sync.root / ("attempted-" + std::to_string(id) + "-loser"),
+            "attempted");
+        if (winner && loser)
+            throw std::runtime_error("DSPARK_TESTIO_SYNC_ERROR: ambiguous attempted outcome");
+        if (winner || loser) ++observed;
+    }
+    return observed;
+}
+
+template <typename Counter>
+size_t waitForTestIOSyncPhase(const TestIOCollisionSynchronization& sync,
+                              Counter counter)
+{
+    const auto deadline = std::chrono::steady_clock::now() + sync.timeout;
+    for (;;)
+    {
+        const size_t observed = counter(sync);
+        if (observed == sync.participants) return observed;
+        if (std::chrono::steady_clock::now() >= deadline) return observed;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
+} // namespace
+#endif
+
 // Cleanup helper
 struct FileCleanup
 {
@@ -116,16 +260,53 @@ DSPARK_TEST(TestIO_process_temporary_root_is_exclusive)
 {
     // create_directory is the portable atomic claim.  Three concurrent suite
     // processes each succeed inside their own root; the fixed-root mutant
-    // makes two of them collide while the winner holds the claim.
+    // makes two of them collide while a two-phase runner-owned barrier keeps
+    // the winner's claim live until every participant has attempted it.
+#if defined(DSPARK_TESTIO_FIXED_NAME_MUTANT)
+    const TestIOCollisionSynchronization sync = testIOCollisionSynchronization();
+    if (sync.mutant != "missing-readiness")
+        publishTestIOSyncDirectory(
+            sync.root / ("ready-" + std::to_string(sync.identity)),
+            "DSPARK_TESTIO_SYNC_ERROR: duplicate process identity "
+                + std::to_string(sync.identity));
+    const size_t ready = waitForTestIOSyncPhase(sync, countTestIOReady);
+    if (ready != sync.participants)
+        throw std::runtime_error(
+            "DSPARK_TESTIO_SYNC_TIMEOUT: readiness expected="
+            + std::to_string(sync.participants) + " observed="
+            + std::to_string(ready));
+#endif
+
     const std::filesystem::path claim = "dspark_process_exclusive_claim";
     std::error_code ec;
     const bool acquired = std::filesystem::create_directory(claim, ec);
-    EXPECT_TRUE(acquired);
+    if (ec)
+        throw std::runtime_error("DSPARK_TESTIO_SYNC_ERROR: atomic claim failed: "
+                                 + ec.message());
+
+#if defined(DSPARK_TESTIO_FIXED_NAME_MUTANT)
+    if (sync.mutant != "missing-attempted")
+        publishTestIOSyncDirectory(
+            sync.root / ("attempted-" + std::to_string(sync.identity)
+                         + (acquired ? "-winner" : "-loser")),
+            "DSPARK_TESTIO_SYNC_ERROR: duplicate attempted publication");
+    const size_t attempted = waitForTestIOSyncPhase(sync, countTestIOAttempted);
     if (acquired)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
         std::filesystem::remove(claim, ec);
+        if (ec)
+            throw std::runtime_error("DSPARK_TESTIO_SYNC_ERROR: claim cleanup failed: "
+                                     + ec.message());
     }
+    if (attempted != sync.participants)
+        throw std::runtime_error(
+            "DSPARK_TESTIO_SYNC_TIMEOUT: attempted expected="
+            + std::to_string(sync.participants) + " observed="
+            + std::to_string(attempted));
+#else
+    if (acquired) std::filesystem::remove(claim, ec);
+#endif
+    EXPECT_TRUE(acquired);
 }
 
 // ============================================================================
@@ -2141,11 +2322,11 @@ DSPARK_TEST(MidiFile_VLQ_PPQN_and_chunk_boundaries)
 
 DSPARK_TEST(MidiFile_public_resource_policy_boundaries)
 {
-    EXPECT_EQ(MidiFile::kMaxInputBytes, 256ull * 1024 * 1024);
-    EXPECT_EQ(MidiFile::kMaxTracks, uint32_t(4096));
-    EXPECT_EQ(MidiFile::kMaxEvents, uint64_t(2000000));
-    EXPECT_EQ(MidiFile::kMaxAggregatePayloadBytes, 128ull * 1024 * 1024);
-    EXPECT_EQ(MidiFile::kMaxTrackChunkBytes, 128ull * 1024 * 1024);
+    static_assert(MidiFile::kMaxInputBytes == 256ull * 1024 * 1024);
+    static_assert(MidiFile::kMaxTracks == uint32_t(4096));
+    static_assert(MidiFile::kMaxEvents == uint64_t(2000000));
+    static_assert(MidiFile::kMaxAggregatePayloadBytes == 128ull * 1024 * 1024);
+    static_assert(MidiFile::kMaxTrackChunkBytes == 128ull * 1024 * 1024);
 
     MidiFile exactTracks;
     EXPECT_TRUE(exactTracks.create(1, 96, MidiFile::kMaxTracks));
@@ -2633,12 +2814,12 @@ DSPARK_TEST(FlacFile_surgical_malformed_corpus)
 
 DSPARK_TEST(FlacFile_public_resource_policy_boundaries)
 {
-    EXPECT_EQ(FlacFile::kMaxInputBytes, 256ull * 1024 * 1024);
-    EXPECT_EQ(FlacFile::kMaxMetadataBlocks, uint64_t(65536));
-    EXPECT_EQ(FlacFile::kMaxFrames, uint64_t(1048576));
-    EXPECT_EQ(FlacFile::kMaxInterchannelSamples, uint64_t(1) << 31);
-    EXPECT_EQ(FlacFile::kMaxDecodedPcmBytes, uint64_t(8) << 30);
-    EXPECT_EQ(FlacFile::kMaxRiceUnaryZeros, uint64_t(1) << 20);
+    static_assert(FlacFile::kMaxInputBytes == 256ull * 1024 * 1024);
+    static_assert(FlacFile::kMaxMetadataBlocks == uint64_t(65536));
+    static_assert(FlacFile::kMaxFrames == uint64_t(1048576));
+    static_assert(FlacFile::kMaxInterchannelSamples == uint64_t(1) << 31);
+    static_assert(FlacFile::kMaxDecodedPcmBytes == uint64_t(8) << 30);
+    static_assert(FlacFile::kMaxRiceUnaryZeros == uint64_t(1) << 20);
 
     midi_test::TempDirectory temp("flac-resource");
     const auto inputOver = temp.file("input-over.flac");

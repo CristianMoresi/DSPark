@@ -76,9 +76,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <memory>
-#include <numbers>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -1183,10 +1181,16 @@ protected:
             // Resample if the (stretch-adjusted) IR rate differs from the engine
             if (std::abs(effIrRate - processingSpec.sampleRate) > 1.0)
             {
-                auto resampled = resampleImpulseResponse(
-                    irData, irLen, effIrRate, processingSpec.sampleRate);
-                conv.prepare(fftBlock, resampled.first.data(),
-                             resampled.second);
+                Resampler<T> resampler;
+                resampler.prepare(effIrRate, processingSpec.sampleRate);
+                // Size from the resampler's own bound (INT_MAX-safe): direct
+                // floor(n*ratio)+1 arithmetic could overflow the int cast with
+                // an extreme rate ratio.
+                std::vector<T> resampled(
+                    static_cast<size_t>(resampler.getMaxOutputSamples(irLen)));
+                const int produced = resampler.processBlock(
+                    irData, irLen, resampled.data());
+                conv.prepare(fftBlock, resampled.data(), produced);
             }
             else
             {
@@ -1194,120 +1198,6 @@ protected:
             }
         }
         return newBank;
-    }
-
-    /**
-     * Reverb's transaction-local equivalent of the Normal-quality streaming
-     * Resampler pass historically used here. It deliberately preserves the
-     * same 32-tap/256-phase Kaiser kernel and causal sample schedule byte for
-     * byte. The separate implementation is necessary at this exception
-     * boundary: Resampler::prepare() finishes through its public noexcept
-     * reset(), whose first-use history resize cannot propagate bad_alloc.
-     * Every allocation below is instead allowed to reach setState/loadIR's
-     * caller before any publication or parameter commit.
-     */
-    [[nodiscard]] static std::pair<std::vector<T>, int> resampleImpulseResponse(
-        const T* input, int inputLength, double sourceRate, double targetRate)
-    {
-        constexpr int sincPoints = 32;
-        constexpr int halfSinc = sincPoints / 2;
-        constexpr int oversample = 256;
-        constexpr double beta = 10.0;
-
-        const double ratio = std::max(targetRate, 1.0)
-                           / std::max(sourceRate, 1.0);
-        const double sourceStep = 1.0 / ratio;
-        const double cutoff = ratio < 1.0 ? ratio * 0.95 : 1.0;
-        const double i0Beta = reverbBesselI0(beta);
-
-        std::vector<T> sincTable(
-            static_cast<std::size_t>((oversample + 1) * sincPoints));
-        for (int phase = 0; phase <= oversample; ++phase)
-        {
-            const double fraction = static_cast<double>(phase)
-                                  / static_cast<double>(oversample);
-            const int base = phase * sincPoints;
-            double sum = 0.0;
-            for (int tap = 0; tap < sincPoints; ++tap)
-            {
-                const double time =
-                    static_cast<double>(tap - halfSinc + 1) - fraction;
-                const double x = time * cutoff;
-                const double sinc = std::abs(x) < 1e-10
-                    ? cutoff
-                    : cutoff * std::sin(std::numbers::pi * x)
-                        / (std::numbers::pi * x);
-                const double windowPosition =
-                    time / static_cast<double>(halfSinc);
-                const double window = std::abs(windowPosition) >= 1.0
-                    ? 0.0
-                    : reverbBesselI0(
-                        beta * std::sqrt(1.0 - windowPosition * windowPosition))
-                        / i0Beta;
-                const double value = sinc * window;
-                sincTable[static_cast<std::size_t>(base + tap)] =
-                    static_cast<T>(value);
-                sum += value;
-            }
-            if (std::abs(sum) > 1e-12)
-            {
-                const T inverse = static_cast<T>(1.0 / sum);
-                for (int tap = 0; tap < sincPoints; ++tap)
-                    sincTable[static_cast<std::size_t>(base + tap)] *= inverse;
-            }
-        }
-
-        const double maximumOutput =
-            std::ceil(static_cast<double>(inputLength) * ratio) + 2.0;
-        const int outputCapacity = static_cast<int>(std::min(
-            maximumOutput, static_cast<double>(std::numeric_limits<int>::max())));
-        std::vector<T> output(static_cast<std::size_t>(outputCapacity));
-        std::vector<T> history(static_cast<std::size_t>(sincPoints * 2), T(0));
-        int writePosition = 0;
-        double fractionalPosition = 0.0;
-        int produced = 0;
-        for (int index = 0; index < inputLength; ++index)
-        {
-            const T sample = input[index];
-            history[static_cast<std::size_t>(writePosition)] = sample;
-            history[static_cast<std::size_t>(writePosition + sincPoints)] = sample;
-            if (++writePosition >= sincPoints) writePosition = 0;
-
-            while (fractionalPosition < 1.0)
-            {
-                const double exactPhase = fractionalPosition
-                                        * static_cast<double>(oversample);
-                int phase = static_cast<int>(exactPhase);
-                if (phase > oversample - 1) phase = oversample - 1;
-                const T phaseFraction = static_cast<T>(
-                    exactPhase - static_cast<double>(phase));
-                const T* const kernel0 = sincTable.data()
-                    + static_cast<std::size_t>(phase * sincPoints);
-                const T* const kernel1 = kernel0 + sincPoints;
-                const T* const samples = history.data() + writePosition;
-                const T value0 = simd::dotProduct(kernel0, samples, sincPoints);
-                const T value1 = simd::dotProduct(kernel1, samples, sincPoints);
-                output[static_cast<std::size_t>(produced++)] =
-                    value0 + phaseFraction * (value1 - value0);
-                fractionalPosition += sourceStep;
-            }
-            fractionalPosition -= 1.0;
-        }
-        return { std::move(output), produced };
-    }
-
-    [[nodiscard]] static double reverbBesselI0(double value) noexcept
-    {
-        double sum = 1.0;
-        double term = 1.0;
-        for (int index = 1; index <= 50; ++index)
-        {
-            const double half = value / (2.0 * static_cast<double>(index));
-            term *= half * half;
-            sum += term;
-            if (term < 1e-15 * sum) break;
-        }
-        return sum;
     }
 
     [[nodiscard]] static std::uint32_t bankLatency(

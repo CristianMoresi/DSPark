@@ -112,7 +112,7 @@ add_test(NAME public_text_policy_self_test
     COMMAND ${Python3_EXECUTABLE}
             ${PROJECT_SOURCE_DIR}/tools/check_public_text.py --self-test
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-add_test(NAME m018_global_corrections
+add_test(NAME global_product_corrections
     COMMAND ${Python3_EXECUTABLE}
             ${PROJECT_SOURCE_DIR}/tools/verify_m018_global_corrections.py
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})

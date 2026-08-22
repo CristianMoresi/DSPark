@@ -57,11 +57,11 @@ lock-free on every supported target and outside the census.
 That is a run-time census of the word types. It is **not** a compile-time check
 on your component, and the build will not stop you using a word the census
 never saw. Where the word type is a template parameter the census cannot reach
-it at all. Ten headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
+it at all. Eleven headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
 `Analysis/BeatTracker.h`, `Effects/AutoGain.h`, `Effects/Equalizer.h`,
-`Effects/DynamicEQ.h`, `Effects/SpectralFreeze.h`,
-`Effects/PitchCorrector.h`, `Effects/detail/PhaseVocoderEngine.h`,
-`Effects/TimeStretch.h` and `Music/KeyDetector.h` -- and
+`Effects/DynamicEQ.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`,
+`Effects/SpectralFreeze.h`, `Effects/TimeStretch.h`,
+`Effects/detail/PhaseVocoderEngine.h` and `Music/KeyDetector.h` -- and
 most of the headers that declare such an atomic do not.
 Five of the ten pin a word whose
 type is a template parameter, which is the case the census cannot reach, and
@@ -555,17 +555,30 @@ with a sound positive fixture for it.
 `Core/SpinLock.h` exists for mutual exclusion **off** the audio path. The audio
 thread never calls its blocking `lock()`; only `tryLock()` / `ScopedTryLock`,
 which cannot be made to wait on a control thread. An audio-thread reader that
-can block on a control-thread writer is priority inversion by construction, and
-the framework contains exactly one, named here rather than left to be found.
+can block on a control-thread writer is priority inversion by construction.
+Reverb's fixed-state handoff is named here because its ownership and pin
+lifetime need a more specific contract than a single atomic-value readout.
 
-`Effects/Reverb.h` publishes its impulse-response bank behind a one-flag
-spinlock instead of a lock-free swap. `loadBank()` runs from `processBlock()`
-and spins on the flag `storeBank()` holds while `loadIR()` swaps a bank in from
-the control thread. The critical section is a single shared-pointer copy, so the
-audio thread normally waits nanoseconds; if the control thread is descheduled
-inside it, the audio thread spins for a whole scheduling quantum inside the
-callback, which is a dropout. The method states the trade where it is made, and
-a wait-free reclaim is backlogged.
+`Effects/Reverb.h` publishes complete impulse-response banks through four fixed
+slots, each with unique control-side ownership and one atomic state word. The
+serialized control owner builds a candidate entirely off to the side, scans the
+four slots at most once plus one bounded rescan, and moves the chosen slot from
+FREE or RETIRED through BUILDING to PUBLISHED before offering its exact
+generation token. At each `processBlock()` boundary the single audio owner does
+one exchange, bounded validation, and at most the state stores needed to make
+that token ACTIVE and the former ACTIVE token RETIRED. It never scans, spins,
+retries, allocates, reclaims, or destroys a bank.
+
+`getConvolver()` pins the exact slot and generation behind the returned
+reference until the next call to that accessor or final joined-owner
+destruction, so a concurrent publication cannot reclaim its storage. If the
+bounded control scan finds no eligible slot, publication reports no capacity
+before changing a slot, a parameter, or the published loaded/latency metadata;
+the prior bank and every observable remain intact. A RETIRED slot at the
+generation limit is reclaimed and marked EXHAUSTED instead of wrapping, so a
+stale token cannot regain ownership. Retired-bank reclamation runs only on the
+control owner, and final reclamation runs only after the owners are joined at
+destruction.
 
 Two other things on the audio path repeat work, and neither is a wait. The
 seqlock readers above retry at most `kSeqlockMaxAttempts` times and then give

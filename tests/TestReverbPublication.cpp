@@ -364,42 +364,6 @@ bool partialCommitMutantIsDetected()
     return false;
 }
 
-struct TransactionMutantState
-{
-    float mix = 0.3f;
-    float preDelay = 0.0f;
-    float decayScale = 1.0f;
-    float stretch = 1.0f;
-    std::uint32_t publication = 7u;
-
-    bool operator==(const TransactionMutantState&) const noexcept = default;
-};
-
-bool earlyMixCommitMutantIsDetected() noexcept
-{
-    const TransactionMutantState before;
-    auto mutant = before;
-    mutant.mix = 0.875f; // Mutant writes before candidate construction fails.
-    return mutant != before;
-}
-
-bool earlyPreDelayCommitMutantIsDetected() noexcept
-{
-    const TransactionMutantState before;
-    auto mutant = before;
-    mutant.preDelay = 37.0f; // Same forbidden early scalar commit.
-    return mutant != before;
-}
-
-bool partialShapingPublicationMutantIsDetected() noexcept
-{
-    const TransactionMutantState before;
-    auto mutant = before;
-    mutant.decayScale = 0.5f;
-    mutant.publication = 8u; // Mutant exposes only part of the staged state.
-    return mutant != before;
-}
-
 bool restoredSpinMutantIsDetected()
 {
     std::atomic_flag lock = ATOMIC_FLAG_INIT;
@@ -642,13 +606,6 @@ void testSetStateStrongTransaction()
     }
     require(sweptFailures > 0,
             "setState allocation sweep did not exercise a throwing point");
-
-    require(earlyMixCommitMutantIsDetected(),
-            "early-mix-commit-mutant survived");
-    require(earlyPreDelayCommitMutantIsDetected(),
-            "early-predelay-commit-mutant survived");
-    require(partialShapingPublicationMutantIsDetected(),
-            "partial-shaping-publication-commit-mutant survived");
 }
 
 void testSetStateNoCapacityTransaction()
@@ -1271,17 +1228,17 @@ struct NamedTest
 };
 
 constexpr NamedTest tests[] = {
-    { "T-M018-reverb-slot-state-machine", testSlotStateMachine },
-    { "T-M018-reverb-fixed-audio-operation-bound", testFixedAudioOperationBound },
-    { "T-M018-reverb-publisher-phase-parking", testPublisherPhaseParking },
-    { "T-M018-reverb-no-audio-allocation-or-final-release", testNoAudioAllocationOrFinalRelease },
-    { "T-M018-reverb-premature-reuse-mutant", testPrematureReuseMutant },
-    { "T-M018-reverb-publisher-starvation-mutant", testPublisherStarvationMutant },
-    { "T-M018-reverb-generation-aba", testGenerationAba },
-    { "T-M018-reverb-getconvolver-pin-lifetime", testGetConvolverPinLifetime },
-    { "T-M018-reverb-reset-metadata-exception-shutdown", testResetMetadataExceptionShutdown },
-    { "T-M018-reverb-retained-bank-memory-bound", testRetainedBankMemoryBound },
-    { "T-M018-reverb-race-sanitizer-matrix", testRaceSanitizerMatrix },
+    { "reverb-slot-state-machine", testSlotStateMachine },
+    { "reverb-fixed-audio-operation-bound", testFixedAudioOperationBound },
+    { "reverb-publisher-phase-parking", testPublisherPhaseParking },
+    { "reverb-no-audio-allocation-or-final-release", testNoAudioAllocationOrFinalRelease },
+    { "reverb-premature-reuse-mutant", testPrematureReuseMutant },
+    { "reverb-publisher-starvation-mutant", testPublisherStarvationMutant },
+    { "reverb-generation-aba", testGenerationAba },
+    { "reverb-getconvolver-pin-lifetime", testGetConvolverPinLifetime },
+    { "reverb-reset-metadata-exception-shutdown", testResetMetadataExceptionShutdown },
+    { "reverb-retained-bank-memory-bound", testRetainedBankMemoryBound },
+    { "reverb-race-sanitizer-matrix", testRaceSanitizerMatrix },
 };
 
 } // namespace
@@ -1293,12 +1250,12 @@ int main(int argc, char** argv)
         try
         {
             testRaceSanitizerMatrix();
-            std::cout << "PASS T-M018-reverb-race-sanitizer-matrix\n";
+            std::cout << "PASS reverb-race-sanitizer-matrix\n";
             return 0;
         }
         catch (const std::exception& error)
         {
-            std::cerr << "FAIL T-M018-reverb-race-sanitizer-matrix: "
+            std::cerr << "FAIL reverb-race-sanitizer-matrix: "
                       << error.what() << '\n';
             return 1;
         }

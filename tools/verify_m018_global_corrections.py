@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate fail-closed gates for M-018 product-source correction P."""
+"""Aggregate fail-closed gates for global product-source corrections."""
 
 from __future__ import annotations
 
@@ -209,38 +209,55 @@ def reverb_errors(root: Path) -> list[str]:
         "ReverbBankPublisher", "std::array<BankSlot, 4>",
         "pendingToken_.exchange", "Phase::exhausted", "pinLatest",
         "publicationMetadata_", "std::unique_ptr<Bank>",
+        "Resampler<T> resampler", "resampler.prepare(effIrRate",
+        "resampler.getMaxOutputSamples(irLen)", "resampler.processBlock(",
     )
     for marker in required:
         if marker not in source:
             errors.append(f"REVERB_PROTOCOL_MARKER_MISSING {marker}")
-    for marker in ("std::shared_ptr", "atomic_flag", "while (bankLock_"):
+    for marker in (
+        "std::shared_ptr", "atomic_flag", "while (bankLock_",
+        "resampleImpulseResponse", "reverbBesselI0",
+        "same 32-tap/256-phase", "first-use history resize",
+    ):
         if marker in source:
-            errors.append(f"REVERB_FORBIDDEN_OWNERSHIP {marker}")
+            errors.append(f"REVERB_FORBIDDEN_IMPLEMENTATION {marker}")
+    anchor_count = source.count(LIVE_REVERB_MUTATION_ANCHOR)
+    if anchor_count != 1:
+        errors.append(
+            f"REVERB_LIVE_MUTATION_ANCHOR expected 1 got {anchor_count}"
+        )
     tests = (root / "tests/TestReverbPublication.cpp").read_text(encoding="ascii")
     for test_id in (
-        "T-M018-reverb-slot-state-machine",
-        "T-M018-reverb-fixed-audio-operation-bound",
-        "T-M018-reverb-publisher-phase-parking",
-        "T-M018-reverb-no-audio-allocation-or-final-release",
-        "T-M018-reverb-premature-reuse-mutant",
-        "T-M018-reverb-publisher-starvation-mutant",
-        "T-M018-reverb-generation-aba",
-        "T-M018-reverb-getconvolver-pin-lifetime",
-        "T-M018-reverb-reset-metadata-exception-shutdown",
-        "T-M018-reverb-retained-bank-memory-bound",
-        "T-M018-reverb-race-sanitizer-matrix",
+        "reverb-slot-state-machine",
+        "reverb-fixed-audio-operation-bound",
+        "reverb-publisher-phase-parking",
+        "reverb-no-audio-allocation-or-final-release",
+        "reverb-premature-reuse-mutant",
+        "reverb-publisher-starvation-mutant",
+        "reverb-generation-aba",
+        "reverb-getconvolver-pin-lifetime",
+        "reverb-reset-metadata-exception-shutdown",
+        "reverb-retained-bank-memory-bound",
+        "reverb-race-sanitizer-matrix",
     ):
         if test_id not in tests:
             errors.append(f"REVERB_NAMED_TEST_MISSING {test_id}")
     for control in (
-        "early-mix-commit-mutant",
-        "early-predelay-commit-mutant",
-        "partial-shaping-publication-commit-mutant",
         "generation-exhausted Reverb did not report no-capacity",
         "for (std::ptrdiff_t failurePoint = 0;; ++failurePoint)",
+        "failed setState changed serialized state bytes",
+        "failed setState changed fixed rendered PCM bytes",
     ):
         if control not in tests:
             errors.append(f"REVERB_TRANSACTION_CONTROL_MISSING {control}")
+    for detached in (
+        "TransactionMutantState", "earlyMixCommitMutantIsDetected",
+        "earlyPreDelayCommitMutantIsDetected",
+        "partialShapingPublicationMutantIsDetected",
+    ):
+        if detached in tests:
+            errors.append(f"REVERB_DETACHED_MUTANT_HELPER {detached}")
     cmake = (root / "tests/CMakeLists.txt").read_text(encoding="ascii")
     suite_block = cmake.split("add_executable(dspark_tests", 1)[1].split(")", 1)[0]
     if "TestReverbPublication.cpp" in suite_block:
@@ -338,9 +355,243 @@ def run_doxygen_duplicate_mainpage_mutant(doxygen: str) -> bool:
             and "mainpage" in result.stdout
 
 
+LIVE_REVERB_MUTATION_ANCHOR = (
+    "        // Candidate construction owns every throwing operation. Publisher\n"
+    "        // capacity is resolved before its first slot/scalar mutation; once the\n"
+    "        // commit begins, only unique_ptr moves and atomic/plain no-throw stores\n"
+    "        // remain.\n"
+    "        auto candidate = buildBank(irStorage_, irLength_, irChannels_,\n"
+)
+
+LIVE_REVERB_MUTATIONS = (
+    (
+        "early-mix-commit",
+        "        mix_.store(mix, std::memory_order_relaxed);",
+    ),
+    (
+        "early-pre-delay-commit",
+        "        preDelayMs_.store(preDelay, std::memory_order_relaxed);\n"
+        "        preDelaySamples_.store(preDelaySamples, std::memory_order_relaxed);",
+    ),
+    (
+        "partial-shaping-publication-commit",
+        "        decayScale_.store(ds, std::memory_order_relaxed);",
+    ),
+)
+
+REQUIRED_COMPILER_CANDIDATES = {
+    "gcc": ("g++-13", "g++"),
+    "clang": ("clang++-18", "clang++"),
+}
+
+
+def compiler_family(version: str) -> str | None:
+    lowered = version.lower()
+    if "clang" in lowered:
+        return "clang"
+    if "g++" in lowered or "gcc" in lowered:
+        return "gcc"
+    return None
+
+
+def discover_required_compilers() -> tuple[
+    dict[str, tuple[str, str]], dict[str, str]
+]:
+    compilers: dict[str, tuple[str, str]] = {}
+    failures: dict[str, str] = {}
+    for required_family, candidates in REQUIRED_COMPILER_CANDIDATES.items():
+        attempts: list[str] = []
+        for candidate in candidates:
+            executable = shutil.which(candidate)
+            if executable is None:
+                attempts.append(f"{candidate}: not found")
+                continue
+            version_result = run([executable, "--version"])
+            first_line = version_result.stdout.splitlines()[0] \
+                if version_result.stdout.splitlines() else "no version output"
+            actual_family = compiler_family(first_line)
+            attempts.append(
+                f"{candidate}: {first_line} (classified {actual_family})"
+            )
+            if version_result.returncode == 0 and actual_family == required_family:
+                compilers[required_family] = (executable, first_line)
+                break
+        if required_family not in compilers:
+            failures[required_family] = "; ".join(attempts)
+    return compilers, failures
+
+
+def copy_reverb_subject(root: Path, destination: Path) -> None:
+    shutil.copytree(root / "Core", destination / "Core")
+    shutil.copytree(root / "IO", destination / "IO")
+    (destination / "Effects").mkdir()
+    (destination / "tests").mkdir()
+    shutil.copy2(root / "Effects/Reverb.h", destination / "Effects/Reverb.h")
+    shutil.copy2(
+        root / "tests/TestReverbPublication.cpp",
+        destination / "tests/TestReverbPublication.cpp",
+    )
+
+
+def apply_live_reverb_mutation(destination: Path, insertion: str) -> str | None:
+    header = destination / "Effects/Reverb.h"
+    source = header.read_text(encoding="ascii")
+    count = source.count(LIVE_REVERB_MUTATION_ANCHOR)
+    if count != 1:
+        return f"production anchor count expected 1, got {count}"
+    replacement = LIVE_REVERB_MUTATION_ANCHOR.replace(
+        "        auto candidate = buildBank(irStorage_, irLength_, irChannels_,\n",
+        insertion
+        + "\n        auto candidate = buildBank(irStorage_, irLength_, irChannels_,\n",
+    )
+    header.write_text(
+        source.replace(LIVE_REVERB_MUTATION_ANCHOR, replacement, 1),
+        encoding="ascii",
+    )
+    return None
+
+
+def compile_and_run_reverb_subject(
+    compiler: str,
+    family: str,
+    source_root: Path,
+    binary_name: str,
+    expect_transaction_red: bool,
+) -> tuple[bool, str]:
+    binary = source_root / binary_name
+    command = [
+        compiler,
+        "-std=c++20",
+        "-O1",
+        "-Wall",
+        "-Wextra",
+        "-Wpedantic",
+        "-Werror",
+        "-DDSPARK_REVERB_TEST_GENERATION_MAX=1",
+        "-pthread",
+        "-I",
+        str(source_root),
+        str(source_root / "tests/TestReverbPublication.cpp"),
+        "-o",
+        str(binary),
+    ]
+    if family == "gcc":
+        command.insert(6, "-Wno-mismatched-new-delete")
+    try:
+        built = subprocess.run(
+            command,
+            cwd=source_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired as error:
+        return False, f"build timed out: {error}"
+    if built.returncode != 0:
+        return False, "build failed:\n" + built.stdout[-8000:]
+    try:
+        executed = subprocess.run(
+            [str(binary)],
+            cwd=source_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as error:
+        return False, f"execution timed out: {error}"
+    if expect_transaction_red:
+        expected = "failed setState changed serialized state bytes"
+        passed = executed.returncode != 0 and expected in executed.stdout
+        if passed:
+            return True, (
+                f"expected transaction RED rc={executed.returncode}: {expected}"
+            )
+        return False, (
+            f"expected transaction RED missing; rc={executed.returncode}\n"
+            + executed.stdout[-8000:]
+        )
+    passed = executed.returncode == 0 and "11 checks, 0 failures" in executed.stdout
+    if passed:
+        return True, "baseline dedicated Reverb subject passed 11 checks"
+    return False, (
+        f"baseline dedicated Reverb subject failed; rc={executed.returncode}\n"
+        + executed.stdout[-8000:]
+    )
+
+
+def live_reverb_mutation_checks(
+    root: Path,
+) -> tuple[list[tuple[str, bool]], dict[str, str]]:
+    checks: list[tuple[str, bool]] = []
+    details: dict[str, str] = {}
+    compilers, discovery_failures = discover_required_compilers()
+    for family in REQUIRED_COMPILER_CANDIDATES:
+        name = f"live-reverb-{family}-compiler-discovery"
+        passed = family in compilers
+        checks.append((name, passed))
+        details[name] = compilers[family][1] if passed \
+            else discovery_failures.get(family, "no discovery evidence")
+
+    with tempfile.TemporaryDirectory(prefix="dspark-live-reverb-mutants-") as directory:
+        scratch = Path(directory)
+        baseline = scratch / "baseline"
+        copy_reverb_subject(root, baseline)
+
+        mutation_roots: dict[str, Path] = {}
+        for mutation_name, insertion in LIVE_REVERB_MUTATIONS:
+            mutation_root = scratch / mutation_name
+            copy_reverb_subject(root, mutation_root)
+            mutation_error = apply_live_reverb_mutation(mutation_root, insertion)
+            if mutation_error is not None:
+                details[f"mutation-source-{mutation_name}"] = mutation_error
+            mutation_roots[mutation_name] = mutation_root
+
+        for family in REQUIRED_COMPILER_CANDIDATES:
+            if family not in compilers:
+                continue
+            compiler, _version = compilers[family]
+            baseline_name = f"live-reverb-baseline-{family}"
+            baseline_passed, baseline_detail = compile_and_run_reverb_subject(
+                compiler, family, baseline, f"subject-{family}", False
+            )
+            checks.append((baseline_name, baseline_passed))
+            details[baseline_name] = baseline_detail
+
+            for mutation_name, _insertion in LIVE_REVERB_MUTATIONS:
+                check_name = f"live-reverb-{mutation_name}-{family}"
+                source_error = details.get(f"mutation-source-{mutation_name}")
+                if source_error is not None:
+                    checks.append((check_name, False))
+                    details[check_name] = source_error
+                    continue
+                passed, detail = compile_and_run_reverb_subject(
+                    compiler,
+                    family,
+                    mutation_roots[mutation_name],
+                    f"subject-{family}",
+                    True,
+                )
+                checks.append((check_name, passed))
+                details[check_name] = detail
+
+    expected_check_count = 10
+    cardinality_name = "live-reverb-execution-matrix-cardinality"
+    cardinality_passed = len(checks) == expected_check_count
+    details[cardinality_name] = (
+        f"expected {expected_check_count} discovery/build/run checks, got {len(checks)}"
+    )
+    checks.append((cardinality_name, cardinality_passed))
+    return checks, details
+
+
 def self_test(root: Path, doxygen: str | None) -> int:
     config = (root / "Doxyfile").read_text(encoding="ascii")
     checks: list[tuple[str, bool]] = []
+    details: dict[str, str] = {}
     checks.append(("warning-as-error-disabled", bool(doxyfile_errors(root, config.replace("WARN_AS_ERROR          = YES", "WARN_AS_ERROR          = NO")))))
     checks.append(("public-header-excluded", bool(doxyfile_errors(root, config.replace("DSPark.h Core", "DSPark.h")))))
     checks.append(("required-public-markdown-excluded", bool(doxyfile_errors(root, config.replace(" examples/README.md ", " ")))))
@@ -407,8 +658,13 @@ def self_test(root: Path, doxygen: str | None) -> int:
         checks.append(("parameter-warning-disabled-mutant-rejected", not warning_disabled))
     else:
         print("UNAVAILABLE mutant undocumented-public-parameter (no Doxygen)")
+    live_checks, live_details = live_reverb_mutation_checks(root)
+    checks.extend(live_checks)
+    details.update(live_details)
     for name, passed in checks:
         print(f"{'PASS' if passed else 'FAIL'} mutant {name}")
+        if name in details:
+            print(details[name])
     return 0 if all(passed for _name, passed in checks) else 1
 
 
@@ -437,8 +693,9 @@ def main() -> int:
     if errors:
         return 1
     print(
-        f"PASS M-018 P aggregate: {EXPECTED_INSTALLED_HEADERS} installed headers, "
-        f"ordinary suite authority {EXPECTED_ORDINARY_TESTS}, package semantics held for R"
+        f"PASS global product corrections: {EXPECTED_INSTALLED_HEADERS} installed headers, "
+        f"ordinary suite authority {EXPECTED_ORDINARY_TESTS}, "
+        "later package-revision semantics preserved"
     )
     return 0
 

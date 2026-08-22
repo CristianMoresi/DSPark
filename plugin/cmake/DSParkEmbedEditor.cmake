@@ -1,10 +1,10 @@
-# DSPark — editor page embedder (script mode).
+# DSPark - editor page embedder (script mode).
 #
 #   cmake -DINPUT=<editor.html> -DOUTPUT=<header.h> -DVARIABLE=<name> \
 #         -P DSParkEmbedEditor.cmake
 #
 # Reads the HTML page, inlines every local stylesheet and script it
-# references — develop your UI as ordinary separate files, ship one
+# references - develop your UI as ordinary separate files, ship one
 # self-contained C++ raw string:
 #
 #   <link rel="stylesheet" href="editor.css">  ->  <style>...file...</style>

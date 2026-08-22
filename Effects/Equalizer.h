@@ -744,6 +744,7 @@ public:
      * including the user's resonance on LP/HP cascades, soft mode's Q cap and
      * the matched-bell design. Mirrors the engine's own parameter
      * sanitization (frequency and Q floors). Requires prepare().
+     * @param cfg Band configuration to translate into processing stages.
      * @param stages Output buffer (capacity >= 5).
      */
     [[nodiscard]] int buildBandStages(const BandConfig& cfg, BiquadCoeffs* stages) const noexcept

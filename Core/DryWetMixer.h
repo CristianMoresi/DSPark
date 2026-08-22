@@ -25,8 +25,8 @@
  * setLatencyCompensation() (and getLatencyCompensation()) allocate/touch
  * setup state and belong to the setup thread. Moves are setup-time only.
  *
- * Dependencies: AudioBuffer.h, AudioSpec.h, C++20 standard library
- * (<algorithm>, <atomic>, <cmath>).
+ * Dependencies: AudioBuffer.h, AudioSpec.h, and the C++20 standard-library
+ * `algorithm`, `atomic`, and `cmath` headers.
  *
  * @code
  * dspark::DryWetMixer<float> mixer;

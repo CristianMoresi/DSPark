@@ -1,4 +1,4 @@
-// DSPark — X11 WebView editor smoke host (Linux)
+// DSPark - X11 WebView editor smoke host (Linux)
 //
 // Loads a .vst3 module and exercises the Linux editor path exactly like an
 // X11 host: createView -> setFrame (offering a real IRunLoop) -> attached to

@@ -1,10 +1,10 @@
-// DSPark instrument example — a polyphonic synthesizer in one file.
+// DSPark instrument example - a polyphonic synthesizer in one file.
 //
 // The canonical Category::Instrument reference: no audio input in any
 // format (VST3 instrument class, CLAP "instrument" feature, AU `aumu`
 // music device), MIDI in through handleMidiEvent, eight voices built from
 // DSPark's Oscillator + EnvelopeGenerator, factory presets, and host
-// transport received per block (printed nowhere — wired so the pattern is
+// transport received per block (printed nowhere - wired so the pattern is
 // on display; a tempo-synced LFO would read it the same way).
 //
 // Voices ADD into `io`: the wrapper hands an instrument a cleared buffer.

@@ -7,7 +7,7 @@
  * @file DenormalGuard.h
  * @brief RAII scope guard that disables denormal (subnormal) float arithmetic.
  *
- * Part of the DSPark framework. Standalone: depends only on <cstdint> and the
+ * Part of the DSPark framework. Standalone: depends only on `cstdint` and the
  * control-register intrinsics of the active architecture.
  */
 

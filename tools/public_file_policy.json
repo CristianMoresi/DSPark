@@ -1,0 +1,2225 @@
+{
+  "baseline": {
+    "additions": [
+      "tests/TestReverbPublication.cpp",
+      "tools/check_generated_docs.py",
+      "tools/check_public_text.py",
+      "tools/public_file_policy.json",
+      "tools/verify_m018_global_corrections.py"
+    ],
+    "commit": "863a39119ff075ae9e1bd375f3ce1c2789f29d52",
+    "deletions": [],
+    "path_count": 478
+  },
+  "contract": {
+    "binary": "exact paths and SHA-256; Git text attribute must be unset",
+    "classification": "exact path inventory; a new, missing, duplicate, or unknown path is fatal until reviewed policy bytes change",
+    "first_party": "valid UTF-8 whose decoded code points are all U+0000..U+007F; NUL is forbidden",
+    "third_party": "valid UTF-8 at exact paths; source/license SHA-256 is pinned so names and legal bytes cannot drift silently",
+    "tracked_authority": "git ls-files -z"
+  },
+  "counts": {
+    "binary_exact": 184,
+    "first_party_ascii_text": 230,
+    "third_party_utf8_exact": 69,
+    "total": 483
+  },
+  "gitattributes_required_lines": [
+    "* text=auto",
+    "*.bat text eol=crlf",
+    "*.png binary",
+    "*.wav binary",
+    "*.mp3 binary",
+    "*.flac binary",
+    "*.pcm binary",
+    "*.mid binary"
+  ],
+  "paths": [
+    {
+      "kind": "first_party_ascii_text",
+      "path": ".gitattributes"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": ".github/workflows/ci.yml"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": ".github/workflows/docs.yml"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": ".gitignore"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/BeatTracker.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/EnvelopeFollower.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/Goertzel.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/LevelFollower.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/LoopFinder.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/LoudnessMeter.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/LoudnessNormalizer.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/OnsetDetector.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/PhaseCorrelation.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/PitchDetector.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/PitchFollower.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/SpectrumAnalyzer.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "CHANGELOG.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "CMakeLists.txt"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "CMakePresets.json"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "CONTRIBUTING.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/AnalogConstants.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/AnalogRandom.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/AudioBuffer.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/AudioSpec.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/Biquad.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/Convolver.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/DenormalGuard.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/Dither.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/DryWetMixer.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/DspMath.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/EnvelopeGenerator.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/FFT.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/FIRFilter.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/Hilbert.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/Hysteresis.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/Interpolation.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/LadderFilter.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/MinBlepTable.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/ModulationRouter.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/Oscillator.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/Oversampling.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/Phasor.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/ProcessorChain.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/ProcessorTraits.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/Resampler.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/RingBuffer.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/SampleAndHold.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/SimdOps.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/SmoothedValue.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/Smoothers.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/SpectralProcessor.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/SpinLock.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/SpscQueue.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/StateBlob.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/StateVariableFilter.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/TruePeakDetector.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/WDF.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/WaveshapeTable.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/WavetableOscillator.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/WindowFunctions.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/ZeroLatencyConvolver.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSPark.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/AudioEngine.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/EffectRegistry.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/EffectSlot.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/Gui.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/build.bat"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/main.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imconfig.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imgui.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imgui.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imgui_draw.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imgui_impl_dx11.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imgui_impl_dx11.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imgui_impl_win32.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imgui_impl_win32.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imgui_internal.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imgui_tables.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imgui_widgets.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imstb_rectpack.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imstb_textedit.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/imgui/imstb_truetype.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "DSParkLab/vendor/miniaudio.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Doxyfile"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/AlgorithmicReverb.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/AutoGain.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Chorus.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Clipper.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Compressor.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Crossfade.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/CrossoverFilter.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/DCBlocker.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/DeEsser.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Delay.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/DynamicEQ.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Equalizer.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Expander.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Filters.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/FrequencyShifter.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Gain.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/GranularProcessor.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Limiter.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/MidSide.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/MultibandCompressor.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/NoiseGate.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/NoiseGenerator.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Panner.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Phaser.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/PitchCorrector.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/PitchShifter.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Reverb.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/RingModulator.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Saturation.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/SpectralDenoiser.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/SpectralFreeze.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/StereoWidth.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/TapeMachine.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/TimeStretch.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/TransformerModel.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/TransientDesigner.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Tremolo.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/TubePreamp.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/Vibrato.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/detail/PhaseVocoderEngine.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "IO/AudioFile.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "IO/FlacFile.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "IO/MidiFile.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "IO/Mp3File.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "IO/WavFile.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "LICENSE"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Music/ChordDetector.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Music/HarmonyConstants.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Music/KeyDetector.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "README.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "bench/dspark_bench.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "cmake/dsparkConfig.cmake.in"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "conformance/dspark_conformance.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "docs/cookbook.md"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "docs/img/dspark-gh.png",
+      "sha256": "13f4594bf3e3c8542a09f0cc9269f024ddd71d1a1866e917fd15ec6d1ccf143f"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "docs/metrics.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "docs/migration-v1.7.0.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "docs/plugins.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "docs/threading.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/README.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/channel_strip.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/pitch_tracking_eq.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_ducker/README.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_ducker/au/Info.plist"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_ducker/ducker.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_saturator/README.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_saturator/au/Info.plist"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_saturator/saturator.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_synth/au/Info.plist"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_synth/synth.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_template/plugin_template.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_webview_editor/README.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_webview_editor/webview_saturator.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_webview_files/CMakeLists.txt"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_webview_files/README.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_webview_files/ui/editor.css"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_webview_files/ui/editor.html"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_webview_files/ui/editor.js"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/plugin_webview_files/webgain.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/wav_process.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "packaging/conan/conanfile.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "packaging/vcpkg/portfile.cmake"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "packaging/vcpkg/vcpkg.json"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "plugin/DSParkPlugin.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "plugin/au/DSParkAu.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "plugin/clap/DSParkClap.h"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/LICENSE_CLAP.txt",
+      "sha256": "ced49f9ef950277afdb56199369ea6e8165ebfdbfbb37ebfe1827e0de892088d"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/all.h",
+      "sha256": "ec8df8aab20b2f5c2ee00f2be0f48e6dd0dc60e633ef4a79c95cb04f18e98947"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/audio-buffer.h",
+      "sha256": "efe1d90ba87499fc8f930d9c9c86157e023bede2c6ade01a20de6d2dfef3828e"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/clap.h",
+      "sha256": "a92456f80610d3be34e0c037b448619cd10e18291d7ea82c9b4c0900c39b669c"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/color.h",
+      "sha256": "acc184298ff9987e90c214e7998110b4bdb4b7d8e56d6a7a6f5ef0832713f6ca"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/entry.h",
+      "sha256": "ef6b40a61a5aaf3bf3c1473da43aba65d247c7cc1c4dd580d076b258d784a604"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/events.h",
+      "sha256": "681c975f9b4fc1efd54988911d5520a18c29b79133993c54e3abb1b8fc488b9c"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/ambisonic.h",
+      "sha256": "eabed521abc0677c750937c729c904e302576e7b3890e64a4b27831ea6be7b65"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/audio-ports-activation.h",
+      "sha256": "44ccd8668bfb2badd6c9538dc7135ccdb69d000c0a1990bc580808b95567a8c2"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/audio-ports-config.h",
+      "sha256": "4fea079dd1ac5e2638a697bf045af54a407190078914956dc1aec24796853c83"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/audio-ports.h",
+      "sha256": "560d41cd2985772f1ef0c7720537ebd2b9b1298fa8e82bc8d0665b154cd6405a"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/configurable-audio-ports.h",
+      "sha256": "4d91dcc554f4b21ac369359a5a4ed3f741724a3ed721602684834e410b6ff693"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/context-menu.h",
+      "sha256": "9e235a77132a2eb3121a94d97b7fbc5924d52be6f1f67505d358764b32112223"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/extensible-audio-ports.h",
+      "sha256": "087ff0e91e0a988c808a4bab159d3c2ae91a8c928be07b1f031850ef6ee519dd"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/gain-adjustment-metering.h",
+      "sha256": "ea4177b7363bbf2ae87c7b30d8cb8aa14aa0febbfae6ddbaeec6ed42bc08ad51"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/mini-curve-display.h",
+      "sha256": "e93371a0fdfa10eff539fe0efde1567ee3a8d5c0468e67f6269777d3ab5cdda6"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/octave-number.h",
+      "sha256": "612ee7516034dd25338a983b5ef3d55ebc18ee9043dc1693442cf12fad71e292"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/project-location.h",
+      "sha256": "5f09ac2806fad93fbd40273d777f066ec2a4d2384e27b9d1ac4dd9e33396e3b1"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/resource-directory.h",
+      "sha256": "7276929113825a3b23d97ddbd03ad2ba1e41d4332ccd97d9478e543652661150"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/scratch-memory.h",
+      "sha256": "186f42db66fd4107fe4b84e25d0e37066efcf90aaa7eb099a8303305dd5867d1"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/transport-control.h",
+      "sha256": "45affb164850c4c30b6c3eb05c46e3547d98651a5568c439560ccc64f0670337"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/triggers.h",
+      "sha256": "5576da586a679c0b72eb87665b832d64f5d17940d347300c85edaaccab4c4dd1"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/tuning.h",
+      "sha256": "7a7979f8abcd7875a6708189d35bb337253b42d350a52bc56c4a0cde285f2b9b"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/undo.h",
+      "sha256": "6d88258bdbd1c42008b4c606490c24cf437db36db754ee0804f9ace1c1712308"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/draft/webview.h",
+      "sha256": "c7d0a1d4ef8869b993d93512365b4fdf39a2b28451c8f0812f89d1ce4f26acb2"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/event-registry.h",
+      "sha256": "a673ac102f7af52a18886aa53f218d0fbe8381de745679efa6676eb55c81a9b6"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/gui.h",
+      "sha256": "489c27e5147e3faa19046a86b50fc439ee1d08f45dcd803637f1c30c62dfbc1e"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/latency.h",
+      "sha256": "a6ab271c2287817bb5f35a010876c3344357da7d9c380e31ce627949f90e9746"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/log.h",
+      "sha256": "4c7a28368df3412a1b44b42188f7b4b25920c52a08fd4b525799a7e76f72263c"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/note-name.h",
+      "sha256": "fac02f93927b0e37d0d662d35233b9293a1aced5854d445c37cd11b1985d26d0"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/note-ports.h",
+      "sha256": "0bc144d3b41d0495a2f007abba80bcdf31ad0d76b144245d4344386132463fcf"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/param-indication.h",
+      "sha256": "b60023659350452c61f24017adba5507c9b182f63088ef28862ba0be224cc5a5"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/params.h",
+      "sha256": "d588571233b91b76b0a5f1c17e0d765448b7084efab62089e0026d6dc7870a79"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/posix-fd-support.h",
+      "sha256": "713bff1fc10ad29b13c43dd800d92bf9f6aa3e5ee699498a722bd9a5332f42a6"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/preset-load.h",
+      "sha256": "b8ab27916ff26b25bd97f01dc91921706b2dce1b2c9fe53890758dfebb84193e"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/remote-controls.h",
+      "sha256": "704cd78099ca5f773d0a35081881a5fbfc07ece820f6406eb47fe74c1264e8f1"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/render.h",
+      "sha256": "04d36c03bdcc63fd79edb023e9afe3dd02e3e6d9360dd43bc24f33c9c7bb62ba"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/state-context.h",
+      "sha256": "de392a8a7a7616c3e1016e2854578419c0ef6a0f3501a6536225185cb0a566f6"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/state.h",
+      "sha256": "616450227a2e4fa7de0a0c7f8d2e6ef7f7f6ab4f346aca06ad927a391a9b0001"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/surround.h",
+      "sha256": "5dc476e2a3eac9224b01e918840d091f829c3fa70144d4c40ca7ce5e24860739"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/tail.h",
+      "sha256": "5cd612fc32a292e0e5f0868cb34a1ca4f3a68336ec1d4b47c8b33190236cff06"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/thread-check.h",
+      "sha256": "e89edd4d056cfb6271d1837d65424381da3119d7bcdca81d5a00da63bc57e880"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/thread-pool.h",
+      "sha256": "670f90d6a0da76fece9b3e0c1bbb8e1b03325da53f9a3fc1e5116afc414b89d5"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/timer-support.h",
+      "sha256": "f3a3cbf10495be51706efb81305e8b319860d2bcdca1fae0d8e42dc14320a26c"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/track-info.h",
+      "sha256": "5ff9f735240b0d7ada1479b36daa961ded9cc892de56600039034053289f84d4"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/ext/voice-info.h",
+      "sha256": "65e5b2d225559be6dab67cef945a9ba8263093943534916421c98cfd0b867b27"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/factory/draft/plugin-invalidation.h",
+      "sha256": "aa6c6275a1cc5c4f66ae0c476c046e7397225fd1bcd2623e3f136e44184ee64c"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/factory/draft/plugin-state-converter.h",
+      "sha256": "88cb6215d4e79f9ad0f1dc9a430ddd0ae8489280e5bfad17430720d934d36633"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/factory/plugin-factory.h",
+      "sha256": "bf9893fff04874f18ebb4a3f3ba7323ab7e0e675bb475081a39b6e69d9e595fa"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/factory/preset-discovery.h",
+      "sha256": "50fa2ade36f2ec1f0a19ded5708226114295bc96de45c2342a579cb6b4b9ab27"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/fixedpoint.h",
+      "sha256": "58f50936f9539e39b1cf01dfe70f9e95f179c9d730fa6686fbb490b6a7769e8a"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/host.h",
+      "sha256": "b5208ad85fa384811e81729c32c3d2e25b16128142ce84357b4b1838f23c3900"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/id.h",
+      "sha256": "7c8cdeea37bdcc4df1be83473fd42712e1b005c45cb64d5b1fde2f892a182ea4"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/plugin-features.h",
+      "sha256": "99aff972b7d887ba1bb7370e776373f8500f5b5b9f8f698e60374fd4ce01cc23"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/plugin.h",
+      "sha256": "7c9066dc2028ffb1a3f464ff909af04fd07049877129b56853c7422e1e28b6e2"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/private/macros.h",
+      "sha256": "861b57a204da34542413c021110dc4740f3dd27bc7a1f6ba3619092c7fd90b17"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/private/std.h",
+      "sha256": "6e489536d32a059a7f27ccf3c2833e3e09f16336c1aa77d9101c714e70053011"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/process.h",
+      "sha256": "93132a2dc8c3ce7073c652ae0c9fa386bebb5ce23408a95a77842d2d85bae0a2"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/stream.h",
+      "sha256": "bec9b7c95007ec729a668697d9e0637d0cea57eb767504de5744dbce6741957f"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/string-sizes.h",
+      "sha256": "e8ebc287f05c3f068788f27b2db4bfd5727b252e8cc806064cb3dce7eb608b27"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/timestamp.h",
+      "sha256": "848e362e19c388dd088c0b2de682be08be628082079a77b2652722296c060acc"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/universal-plugin-id.h",
+      "sha256": "f25fd6e0479d9f0e0ec54a8e573bbba380d89db18322e51f0de91382624f45ad"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/clap/clap/version.h",
+      "sha256": "8eb1c9d537a671c4157164466a884ac96a15db83578b392afbba7e6ccdc3322c"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "plugin/cmake/DSParkEmbedEditor.cmake"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "plugin/cmake/DSParkPlugin.cmake"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "plugin/vst3/DSParkVst3.h"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/vst3/LICENSE_VST3_C_API.txt",
+      "sha256": "facf3001018f7b873c04f24e41d903a3cd85154ed53206d74ef044d612bbfe54"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/vst3/vst3_c_api.h",
+      "sha256": "201f759822a802ee1a82e7e0a6f8d48f8f55945310f92d4db55bc9ade1c158d0"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "plugin/webview/DSParkWebViewEditor.h"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/webview/LICENSE_WEBVIEW.txt",
+      "sha256": "22c4c38a605ae5362bdbd795b4358f3599c7a7e58d4824c4ed55e3be192386e0"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/webview/LICENSE_WEBVIEW2_SDK.txt",
+      "sha256": "0af8f1b807512aae39c2ac1aa4d0cae65cabecb6fd554b8439a5162a0d6eca55"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/webview/webview/WebView2.h",
+      "sha256": "abf504ecf3fa2ee0c35f1dd811c839ec0a590fba010f2227e4da501a90426784"
+    },
+    {
+      "kind": "third_party_utf8_exact",
+      "path": "plugin/webview/webview/webview.h",
+      "sha256": "b1ff6e11431d031e5f7917e5301f4bcdf3910a2763a0720abfd291994eee7f7b"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/CMakeLists.txt"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestAllocFailure.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestAnalysis.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestBeat.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestCoreFilters.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestCoreFoundation.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestCoreGenerators.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestCoreSpectral.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestCoreUtilities.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestEffectsAdvanced.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestEffectsDynamics.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestEffectsModulation.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestEffectsStereo.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestEffectsTone.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestIO.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestIntegration.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestKey.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestLoopFinder.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestLoudnessNormalizer.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestMusic.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestOnset.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestPitchCorrector.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestQualityAudit.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestReverbPublication.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestSignals.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestSpectralFreeze.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestState.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/dspark_test.h"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-constant.flac",
+      "sha256": "a6d48e080eece2c2163c183ea85f3c58dec93bb0907732562b1955ded8e58458"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-constant.reference.pcm",
+      "sha256": "3a5e407d202248809ef2d28d09fed0a47b49945841ee482b320ff1864223937f"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-constant.source.pcm",
+      "sha256": "3a5e407d202248809ef2d28d09fed0a47b49945841ee482b320ff1864223937f"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-depth12-rate-code14.flac",
+      "sha256": "ac32981b9f55a2fd2f70cd5a6daa0d4773ca7e4bf02971bc7532de6599b22da4"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-depth12-rate-code14.reference.pcm",
+      "sha256": "d6ce495c4fd57ba7ffc8da66c4ef831280b408e69c7734257dfae00e6b1500b3"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-depth12-rate-code14.source.pcm",
+      "sha256": "d6ce495c4fd57ba7ffc8da66c4ef831280b408e69c7734257dfae00e6b1500b3"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-depth20.flac",
+      "sha256": "109ebbf7359bd1558a927e1032284fc86e4556b95101c613d315378b46237077"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-depth20.reference.pcm",
+      "sha256": "0b39b9ba689686ec57d1605834be37349f4bb21b0b928f9cd6e1bbff20e29265"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-depth20.source.pcm",
+      "sha256": "0b39b9ba689686ec57d1605834be37349f4bb21b0b928f9cd6e1bbff20e29265"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-depth4-rate-code12.flac",
+      "sha256": "64c88c02ff17b7d3f34804356e9405a0c8ef2d9284dd8b4e54e41556a9d1c771"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-depth4-rate-code12.reference.pcm",
+      "sha256": "ba35115a8329fbe8f3027ea2080d93d7809f21e16890c9ab60f70464ca9fcfe7"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-depth4-rate-code12.source.pcm",
+      "sha256": "ba35115a8329fbe8f3027ea2080d93d7809f21e16890c9ab60f70464ca9fcfe7"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-eight-channel.flac",
+      "sha256": "3d1e721656b60a3efa65fee8709e8c7dcf55d8d68b25c2a2f87bb8c4029c525b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-eight-channel.reference.pcm",
+      "sha256": "a58d8b5d21e0886fe0a5d1f4327525dd90e726061bff2bab2eb83142e0ef8678"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-eight-channel.source.pcm",
+      "sha256": "a58d8b5d21e0886fe0a5d1f4327525dd90e726061bff2bab2eb83142e0ef8678"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed0-rice4.flac",
+      "sha256": "e278f4112b56a375b9055e13d9830585ecdf07a27a3d5d9a77d80e1e44946090"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed0-rice4.reference.pcm",
+      "sha256": "d6db504e8b4ab09033abe21ad029d95991970458dcf6efc13c110bef16e1dffd"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed0-rice4.source.pcm",
+      "sha256": "d6db504e8b4ab09033abe21ad029d95991970458dcf6efc13c110bef16e1dffd"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed1-rice5.flac",
+      "sha256": "4c0e90f420b8e6bd348c0a99e9f91f84c03c3ac0251ab2b55c2bc8843e8f7e75"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed1-rice5.reference.pcm",
+      "sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed1-rice5.source.pcm",
+      "sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed2-escape0.flac",
+      "sha256": "8e07bcc5fd18b88fd63f5fa0ae7482ddaa65ffdff954d889719c7d5c6ea4a8c8"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed2-escape0.reference.pcm",
+      "sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed2-escape0.source.pcm",
+      "sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed3-escape31.flac",
+      "sha256": "888ca35afba0b732caa136c3355262ee334092f32a6d0ab106ec36d6bf770f5c"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed3-escape31.reference.pcm",
+      "sha256": "33833208856794da07527c786ba7049b246e2612760fc9fed7ec105ce977cd93"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed3-escape31.source.pcm",
+      "sha256": "33833208856794da07527c786ba7049b246e2612760fc9fed7ec105ce977cd93"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed4-partitioned.flac",
+      "sha256": "6f72ba511200220045b294f4d963b1eb57ce6f699842d7c04471944b15dbb25b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed4-partitioned.reference.pcm",
+      "sha256": "f1ee5545c3abdcae6342c48a3936f222bd38725c3860bb81594b5ef00088e843"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-fixed4-partitioned.source.pcm",
+      "sha256": "f1ee5545c3abdcae6342c48a3936f222bd38725c3860bb81594b5ef00088e843"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-left-side.flac",
+      "sha256": "d397e0eb897c01946840156bf9345917e612a7dad3ab4524e729ffd79ab9f572"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-left-side.reference.pcm",
+      "sha256": "2948e3c8eff97971ff2bb385bd88a612bf2323f8a4f5f7dc668d702fd4ab3e43"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-left-side.source.pcm",
+      "sha256": "2948e3c8eff97971ff2bb385bd88a612bf2323f8a4f5f7dc668d702fd4ab3e43"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-lpc1.flac",
+      "sha256": "2df2d33f9f592dd7f26d614d44af8fc2486c0c0e8ee8de0332c9a498701320f5"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-lpc1.reference.pcm",
+      "sha256": "74c94a019b964926c220358d75c060e961aaef535d79c88236125d7b6c4bacff"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-lpc1.source.pcm",
+      "sha256": "74c94a019b964926c220358d75c060e961aaef535d79c88236125d7b6c4bacff"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-lpc12.flac",
+      "sha256": "0a46b324b6248a25556d213d40d89f27c2247a0fd1bd407d907684c99fe34ecb"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-lpc12.reference.pcm",
+      "sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-lpc12.source.pcm",
+      "sha256": "2da4ff7754ba3bc5c7dfef448941287bff0cf1c1e40caa3b87e0ea554eea26fe"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-lpc32-mid-side.flac",
+      "sha256": "a2f58c6f03f3026e8379e4f89c11b7ff98f11b31932b574d52cca5069c76857c"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-lpc32-mid-side.reference.pcm",
+      "sha256": "2696ae3f2e9eaf7c32a3be894c98189e5ada1e0fc691aedbce4a39dbf792cf58"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-lpc32-mid-side.source.pcm",
+      "sha256": "2696ae3f2e9eaf7c32a3be894c98189e5ada1e0fc691aedbce4a39dbf792cf58"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-mid-side-negative-odd.flac",
+      "sha256": "f245f10c35f321ef96e4e6e9ec6b58e61c9a7918db353a62865b4b046499752f"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-mid-side-negative-odd.reference.pcm",
+      "sha256": "df1bd7f7f2756f7aec5ddec3044d4e7098ffd4fd6be3a21387a52b8f86e4807d"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-mid-side-negative-odd.source.pcm",
+      "sha256": "df1bd7f7f2756f7aec5ddec3044d4e7098ffd4fd6be3a21387a52b8f86e4807d"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-rice-unary-cap.flac",
+      "sha256": "105a0819b0ad2dadc226cb0df55abcffa2184345c132a84b7715b7af481a8c7b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-rice-unary-cap.reference.pcm",
+      "sha256": "5d434409283cdc8e500c72de5591f50bd858c8377a7f5f979e5f1b446e091ec0"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-rice-unary-cap.source.pcm",
+      "sha256": "5d434409283cdc8e500c72de5591f50bd858c8377a7f5f979e5f1b446e091ec0"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-side-right.flac",
+      "sha256": "fd14dd383d991bdab86e4a9c09f7ac4714d61a35a3366ac756c136f48b80d1bc"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-side-right.reference.pcm",
+      "sha256": "2948e3c8eff97971ff2bb385bd88a612bf2323f8a4f5f7dc668d702fd4ab3e43"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-side-right.source.pcm",
+      "sha256": "2948e3c8eff97971ff2bb385bd88a612bf2323f8a4f5f7dc668d702fd4ab3e43"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-variable-uncommon-rate.flac",
+      "sha256": "c29b5f4d9cbc06eb1d32ef300a6854c886bf469d82fff10f488966644306d5ba"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-variable-uncommon-rate.reference.pcm",
+      "sha256": "4bf5519b10913624a5c865f43ac5abd692ff96c82b8bb0af04964bac0f8e6cd0"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-variable-uncommon-rate.source.pcm",
+      "sha256": "4bf5519b10913624a5c865f43ac5abd692ff96c82b8bb0af04964bac0f8e6cd0"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-verbatim-wasted.flac",
+      "sha256": "320309c812d23e42fbccc0f6be044c2118f6269c99578e9937e4f5df74182ef5"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-verbatim-wasted.reference.pcm",
+      "sha256": "a6a2b948732dcedbc9f46a4601e3e61cce0199ec8f303fcd8d63c2e8b81ead04"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-verbatim-wasted.source.pcm",
+      "sha256": "a6a2b948732dcedbc9f46a4601e3e61cce0199ec8f303fcd8d63c2e8b81ead04"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-zero-md5-unknown-total.flac",
+      "sha256": "0536fce127fb21f029be62a6d32e7185ccf46e1572519bb861c17714c12fba92"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-zero-md5-unknown-total.reference.pcm",
+      "sha256": "c9ded81c51d2dcb758717a93c90989023e049ffd340756aac4a761a40f0fa5d9"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/decl-zero-md5-unknown-total.source.pcm",
+      "sha256": "c9ded81c51d2dcb758717a93c90989023e049ffd340756aac4a761a40f0fa5d9"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/fixtures/flac/generate_fixtures.py"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-16bit.flac",
+      "sha256": "186639b13811fd23e8ccf8165f2f4e7003717d39315bbab97a833713ba20c474"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-16bit.reference.pcm",
+      "sha256": "9949ccdede882f7343cc8c66124c5dd5e693b6bfcb421c990345072d64999b44"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-16bit.source.pcm",
+      "sha256": "9949ccdede882f7343cc8c66124c5dd5e693b6bfcb421c990345072d64999b44"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-24bit.flac",
+      "sha256": "16109684f4ad8669184c76f6137a8f1c11c9042bbd315cb16dc2666446c38189"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-24bit.reference.pcm",
+      "sha256": "5410ca2b32f7e916cc5e639f7d44d10eaecd2da74a75d1a9aff29ab1c8a84cf5"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-24bit.source.pcm",
+      "sha256": "5410ca2b32f7e916cc5e639f7d44d10eaecd2da74a75d1a9aff29ab1c8a84cf5"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-32bit.flac",
+      "sha256": "e27be5f00164086adc84426afdf270b4163519beb40900523defac032973c10b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-32bit.reference.pcm",
+      "sha256": "d1bcc0b75729164d6c207fabb88cebec54c38dba7cc176e21a18dc6cc23edced"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-32bit.source.pcm",
+      "sha256": "d1bcc0b75729164d6c207fabb88cebec54c38dba7cc176e21a18dc6cc23edced"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-8bit.flac",
+      "sha256": "31a13fc4978841afd173cf80e042158e8c627196162ae58a21df2f9e1c8d98bf"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-8bit.reference.pcm",
+      "sha256": "fae0d3c7fbdb9f47b0ee26d54657fb5e588b42b92b35002ea524c9968d07ba6b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-1ch-8bit.source.pcm",
+      "sha256": "fae0d3c7fbdb9f47b0ee26d54657fb5e588b42b92b35002ea524c9968d07ba6b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-16bit.flac",
+      "sha256": "bcf8f5c9515a38fe7cbe9de87ae66e1874fb1c8421e1643f5265c98c95eeaa79"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-16bit.reference.pcm",
+      "sha256": "e78ce48cd9bc95ffc2bc49055f56357cf68551a47490585d1ad6cfebfcf0c9aa"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-16bit.source.pcm",
+      "sha256": "e78ce48cd9bc95ffc2bc49055f56357cf68551a47490585d1ad6cfebfcf0c9aa"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-24bit.flac",
+      "sha256": "7f5282657745aff190cb6d2c6703ae0dd8fb4b7cca1018d2c5cddd578bbcd108"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-24bit.reference.pcm",
+      "sha256": "eebf5831d0652893805cf356718b9b4e25f5e9ba88cfb0f130b1a2d1d4638347"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-24bit.source.pcm",
+      "sha256": "eebf5831d0652893805cf356718b9b4e25f5e9ba88cfb0f130b1a2d1d4638347"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-32bit.flac",
+      "sha256": "0217cdd0e3c407c33e141b5299f7ffaae983a7b83de07113380b5fd621dc69f3"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-32bit.reference.pcm",
+      "sha256": "9e310c0bd69c06476499e794ec64f23d5d52b38e256eafb279648995e4b0c6e9"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-32bit.source.pcm",
+      "sha256": "9e310c0bd69c06476499e794ec64f23d5d52b38e256eafb279648995e4b0c6e9"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-8bit.flac",
+      "sha256": "6c1aa27a98edba7af036484d7f0e69655c3a8f14ef9829eafe892eaab23f17f8"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-8bit.reference.pcm",
+      "sha256": "83536d496419371fb1bc2366ce994e3a035b47e4144a4009871583967095800d"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/libflac-2ch-8bit.source.pcm",
+      "sha256": "83536d496419371fb1bc2366ce994e3a035b47e4144a4009871583967095800d"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/fixtures/flac/libflac_fixture_tool.cpp"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/changing-frame-sample-rate.flac",
+      "sha256": "614baaee0923296a5011f747f57b678a09d8700f4dd4440c751b0424fa841a71"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/coded-number-bad-continuation-repaired.flac",
+      "sha256": "358a2d36546e2dff6a01ab49a240fb9193cb8642b2995c9ffbfb9506348971a7"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/coded-number-overlong-repaired.flac",
+      "sha256": "1b451346c22e9b403139172a9f9ecf794fd5c3fce620880774b02883b0dc12b8"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/declared-sample-mismatch.flac",
+      "sha256": "6dd2a94c20809fb969be2a27e22f407ceaa855e4ff507d51528f9640168f0104"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/duplicate-streaminfo.flac",
+      "sha256": "5b4fc05fc77b4dea974bb3a89d4d4a93aa6c81541b3bacaf8a3db7d015eae575"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-block-code-zero.flac",
+      "sha256": "b7e5650018ea26e3a0906cd2ca79237374f8b82a001afbd34c6df98dfcab2898"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-block-over-stream-max.flac",
+      "sha256": "85180c4c72d17379105d7080efac4138a92f714e78d42341c93bee20dc5524c5"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-channel-code-11.flac",
+      "sha256": "276ea1e63eca02c9a320ce65adb9ce866993a860959a0dadc64a92fb2f7b1863"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-channel-property-change.flac",
+      "sha256": "097cac15b7ffd8f8056c48cd6a0b157f8f92297fb8c930cdaf61101e3eda050b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-crc16.flac",
+      "sha256": "90525c18f92827c3bfc06ea2fa7af07a935e6d628a93223d8f019108e3cf2ee1"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-crc8.flac",
+      "sha256": "b2a2a241bc7c8f4bba1d57235061c5da1023fa42a587ebb3f500a04a0a65d1b4"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-depth-code-3.flac",
+      "sha256": "635883f0caa6e2cc87fc71a23b3b17d2afacc9227d17f73366263f0c14afa58c"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-depth-property-change.flac",
+      "sha256": "52c0dd6715d3ea203c42dc7f51c017592b7d39512ea9344ab98bd639bf2d8fce"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-fourth-reserved.flac",
+      "sha256": "c2fd56bcdce2773b5c1776541843b15db8d14d0155fc5488c42b7e452791617f"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-number-gap.flac",
+      "sha256": "ec7a68346dd8c418a7206a320849e9f9ba7f87355142013dbc4ecbc4e5800b08"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-rate-code-15.flac",
+      "sha256": "970ef9fc87e61e3a22a45fe1674c4962ee12509bcf7d804873834b7dcf57ac17"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-rate-property-change.flac",
+      "sha256": "87529f7fd52c7881310df843d8e8b8b174e48b00139a7d07c571c3796173965a"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-reserved-bit.flac",
+      "sha256": "873e0a748d6e66e8675134da384d0bdfdeae45e9705a0bfe8c9b6335a6c7d2cd"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-reserved-sync-bit-repaired.flac",
+      "sha256": "e3c1340904960184ca985ec82fe0e83e273c409af958ef138a3c90c7be0ce36c"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/frame-sync.flac",
+      "sha256": "897a0f00d7f7156f0ec7cc6a16b5b825d291bc3f9a9b3782867711f69b3e8102"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/lpc-negative-shift.flac",
+      "sha256": "5dbfafc51181e1fe35b87e1492bb8ecb9fea64b752c28ab8c42384d85d3ea125"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/lpc-precision-16.flac",
+      "sha256": "df809cc73ceecf587f1620de3fce7419a3efb12a60ac85436a6ff8df837328f2"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/marker-byte-0.flac",
+      "sha256": "0ae717bd63b434ecf7cd3ea04e1964ae64f8747b9fedab16b5ba1b8229679a3b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/marker-byte-1.flac",
+      "sha256": "9f9810741a79c02c29352073885773d5e5d7992eb708ae64637145ee3814d60d"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/marker-byte-2.flac",
+      "sha256": "dbe7dff8ed6b26d8579563953d69615565ff4c049d8d87ef3e3effdf912743cc"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/marker-byte-3.flac",
+      "sha256": "1d5098b291c9212ad2915fd4c18d4dfdc877a8d1e4fd44e914786dac331b41ca"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/max-block-fifteen.flac",
+      "sha256": "3d8903bb50d681c0bfbfc496a80395ced5bfc309eb1a723816a8bb023fdb6533"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/metadata-type-127.flac",
+      "sha256": "e889a4fe3526b4a979bc9647016f39eaf2d1c51ae9e67063db56a90ed44a831b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/metadata-without-frame.flac",
+      "sha256": "7e0b85774228f3f6124aaae7ccf16dea6e2df410740f7321cdfabd619377c8be"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/min-block-fifteen.flac",
+      "sha256": "cc450089917320ceef0cdfd1d1f7e71f787c009f13c8bafd50bcc923c6ac5b3e"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/min-block-over-max.flac",
+      "sha256": "59c5d9817b70affa70c8ea40a675224bf1de60e483cc5db21f8510b82d0e9dac"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/min-block-zero.flac",
+      "sha256": "dc32a113ff84385068ab25561d3229d9505f64ffb222e7f18c852f21a9b8a47d"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/mixed-blocking-strategy.flac",
+      "sha256": "5f5b4dfe80b1b388d4b0f60556d348db5dd5499396535fefbaee7ead32a54ac4"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/nonzero-md5-mismatch.flac",
+      "sha256": "dc73b0ae53f72f9d2c74ece5616e0caf43b27b0109efeb9dc85eb35d455dc1ef"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/residual-method-reserved-2.flac",
+      "sha256": "6d7694db064ffffe575e61a6c06ab35e36483e7555e4a063c4782a624ad88706"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/residual-method-reserved-3.flac",
+      "sha256": "38f9bd38b2b2c002a980211a2091092f09024a4e10dd778d485bfe67881986ae"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/residual-partition-not-divisible.flac",
+      "sha256": "d3d35081a6b18c09c70aa9d185e308a25bc8a40ffabc58a225f83b761237512f"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/rice-unary-cap-over.flac",
+      "sha256": "2ba4969b38ea734807f79117cad57015366cd5b1a8138253776d21778c99760c"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/sample-rate-zero.flac",
+      "sha256": "ad9447d4cf6cb2d143cacd765681c98ca468e071c15866092f99a3d66dfd62fa"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/streaminfo-bit-depth-three.flac",
+      "sha256": "49619a89ca91e2d7fcbd028d458c1e7624468d789c1b3b0eaf186f953fcd5b2b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/streaminfo-frame-min-over-max.flac",
+      "sha256": "06e6be836380f403f26e20bb2958a1db6701f749183cfe69a3785668e18ddc82"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/streaminfo-length-0.flac",
+      "sha256": "f5c9589717550f623c916559757115b4570f3455c760b4b6f3afb17a61587ab5"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/streaminfo-length-1.flac",
+      "sha256": "8becb9bbfddaff7f5795b74092ba5524118a5ad0604c08fa136fc278e72c712b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/streaminfo-length-16777215.flac",
+      "sha256": "579dd74b2e790cf7be915825fc391a2cb926968e2da7cfea16c1f2650b2251e7"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/streaminfo-length-33.flac",
+      "sha256": "6624267c51b2874fe692c42018c9b24fe6b7aa3aecb1491eba57bca1f147b413"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/streaminfo-length-35.flac",
+      "sha256": "69cbbf2b5d845a95b8cbbafe7593f00dd0cc691a8d7052a9cbacca5759c5c92a"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/streaminfo-max-frame-too-small.flac",
+      "sha256": "0ed0c7e6627525fdb274f1cb9ec5902ca832ed6dc89f3ebea5795cfd58504436"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/streaminfo-min-frame-too-large.flac",
+      "sha256": "1b2e9909921d82014a7f362867b44be2c0ffa9337e5e5e6d75db84590b048fce"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/streaminfo-not-first.flac",
+      "sha256": "b86b2556ec019a10f54d61bf7af02dcb68acb9331837618814c68203a6383341"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/streaminfo-sample-policy-over.flac",
+      "sha256": "45391788b3d0833b6c200d92e740f91ed8b77621f932534eee940913692ed1f0"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-bit-corruption-0.flac",
+      "sha256": "a26a8206cfd78e286939257c624327813a96cdaf7c06d424991e42e199552c42"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-bit-corruption-1.flac",
+      "sha256": "4a71f46cd2cc416b4fba1b897814e26392b462469fb2a1598d10b8711841a786"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-bit-corruption-2.flac",
+      "sha256": "b94d35eaf327b3f05c90db13b302899dfd8ee0dedc88d533899ae6fd24aea639"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-bit-corruption-3.flac",
+      "sha256": "85dc3d1e541275f5763d77578568a85cef0ffad86b6c38f59a78d617364963c4"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-bit-corruption-4.flac",
+      "sha256": "5d88364c6bf37140302874987c1508ebe9d6f822ff8eaf7f0d742fac77d468e9"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-bit-corruption-5.flac",
+      "sha256": "9df1c8d316241bdaa5c668c2bcc60384d059e2b16a7cc81d4f48221932bc6b37"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-bit-corruption-6.flac",
+      "sha256": "979ff724613f3a69806c9d6ff354137a0391eee77671b8e9d30d2370508b72f8"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-bit-corruption-7.flac",
+      "sha256": "3b00067dd3df6515e26f983aa2b432ae9b6df3d611c409f7f531e4606484f014"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-nonzero-byte-padding.flac",
+      "sha256": "e8a6fe3eca2c3e8a4216d7cb949e1f4b19bea76115ad8b426c21f289f8d85852"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-reserved-type-13.flac",
+      "sha256": "f0a3401da5a090f40e27ac6821f83a57506791c1da25277c6ef6858368d57a55"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-reserved-type-2.flac",
+      "sha256": "9b22c39888c506734291ef6e19883839eb8d319eeaa8197458704611395f6c86"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-reserved-type-7.flac",
+      "sha256": "bcc73fcfb377523ac95a97d8da861ca2a951ea66d023b2e3b02344fc1db9d6a9"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/subframe-zero-padding-bit.flac",
+      "sha256": "ddf7cad0fcd12beed26d326c81a2a88c2c08d03565cbfcc534d2c7e9904c8eb0"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/trailing-frame-prefix.flac",
+      "sha256": "ec673b3e0d955d907fbfdc2ec9b8f5a9251eb11b80f236f43df8fa2034cadf46"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/trailing-zero.flac",
+      "sha256": "3fd1fb741386f418bc4db4b897948f9ca5427b5610284b37efdf1e2937dc770f"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-1.flac",
+      "sha256": "0139c1caa8237c60eb48cfa258bff2babdfba13af5ee168434efc9a13366426c"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-10.flac",
+      "sha256": "ad9b76adb4c873a631cfa29d80f5d6f4866a0b40c179cd483938a095228a0a46"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-11.flac",
+      "sha256": "5a103ce43711230f485a0559789bb04e305494be3f08e42fa22b4be4b1985b6e"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-12.flac",
+      "sha256": "2f48f5c7172dd21bda650137eeda2be16ef70473f081fbd4ac6a5430d65d0f1c"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-2.flac",
+      "sha256": "a1ed58c00a93213f32e98cf25ed7a1ae789d7c758d719080c2d952a7c947eecd"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-3.flac",
+      "sha256": "44e547207d5257229bb912768da54ae3cf16c72af6081a878961998b5bb3c87c"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-4.flac",
+      "sha256": "129a360467aae3c36876138f1d247b99179d62ec5c1fdbda2c30e719e8b87761"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-5.flac",
+      "sha256": "632313c2aab36a26d20bb1f3c8a22b29108b427d0ed31f97981325c1e3e45bf0"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-6.flac",
+      "sha256": "24dcd736d8adbcef6c3e61c25fb4b90ea4295de5e7b904e4216c4d768a1d99b5"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-7.flac",
+      "sha256": "77bca0134c07e3223becd7155ac25f42386fb08b91b0302c68cfb8cc8c8f3bb8"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-8.flac",
+      "sha256": "53f44daf3ee99d91399fc55626b734073c8bc39202c5e3a7e23bf17e21720b23"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-frame-tail-9.flac",
+      "sha256": "f708b8e356172562e0a64bbd6ae190f79fa6a3b7835ca4cfef2dbc41c8a6142e"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-marker-0.flac",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-marker-1.flac",
+      "sha256": "252f10c83610ebca1a059c0bae8255eba2f95be4d1d7bcfa89d7248a82d9f111"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-marker-2.flac",
+      "sha256": "f7616ca89ec4663ed718dd29a00c236c5909207a5bc9791c1fe7ddfdace13d32"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-marker-3.flac",
+      "sha256": "09ee4dae854d0b8eee5cecebf68a91f3282ed819d58d694e9de0323ede789322"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-metadata-header-4.flac",
+      "sha256": "70bf93310284b039f237e82db4407df3e3ca642fac2b9ebb02973764424c7418"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-metadata-header-5.flac",
+      "sha256": "dc101364b6d7553813071bbd4ac1330529bebe7ffae6e8cbef3fed2570512257"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-metadata-header-6.flac",
+      "sha256": "9007efbac1ba96cc737bb4d41330ab4a9d54507973785fd5623e311d4620e16c"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/truncated-metadata-header-7.flac",
+      "sha256": "98664d579970a3efd977552218e6a6dc9b668fe495d257bc643569fdc61a8d1b"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/unterminated-metadata.flac",
+      "sha256": "d21eb8cfb1b904c23b4a3210b08af1dbeb7769931307b7f6b3f905502fbea0ee"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/variable-sample-gap.flac",
+      "sha256": "561946d4231a6cd18a22b107d0c3356dc8d70a9e287cbe619939163a2ff3afed"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/malformed/variable-sample-overlap.flac",
+      "sha256": "a0000331135a0deceb71793fac1584e370640b08db6911620843704b342695e5"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/fixtures/flac/manifest.json"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/rfc9639-d1.flac",
+      "sha256": "702607714813462e228a9268ce81e3fc6ca5382462e179bd21ccbbe9380b1139"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/rfc9639-d1.reference.pcm",
+      "sha256": "26d11828082e8d76cf1befe101f1be56e3db32d387b67a102a4ac17d9c7807c3"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/rfc9639-d1.source.pcm",
+      "sha256": "26d11828082e8d76cf1befe101f1be56e3db32d387b67a102a4ac17d9c7807c3"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/rfc9639-d2.flac",
+      "sha256": "f209a0d09134174ac4ce63ea8b7dbba365e778d79447fee06f92f8abcd39d935"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/rfc9639-d2.reference.pcm",
+      "sha256": "872e56cb2d08721137e8dc3050d8bdfa9ce4b4c22a0053f130f388ba02f102d3"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/rfc9639-d2.source.pcm",
+      "sha256": "872e56cb2d08721137e8dc3050d8bdfa9ce4b4c22a0053f130f388ba02f102d3"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/rfc9639-d3.flac",
+      "sha256": "a07f91b390d1f4404f16b0be2379965c8db90ed48a8e83da59971262f206ac3a"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/rfc9639-d3.reference.pcm",
+      "sha256": "0352210dc3aac53acbf58250b55fc3011ace7b5e852c59daa1d29947912a7f83"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/flac/rfc9639-d3.source.pcm",
+      "sha256": "0352210dc3aac53acbf58250b55fc3011ace7b5e852c59daa1d29947912a7f83"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/fixtures/midi/generate_fixtures.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/fixtures/midi/manifest.json"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/midi/rp001-format0.mid",
+      "sha256": "9c512dc6fc73b8bef93a39c93142b7e828cfe51bf5340b84fe0fc87f0b8536ed"
+    },
+    {
+      "kind": "binary_exact",
+      "path": "tests/fixtures/midi/rp001-format1.mid",
+      "sha256": "83ba1f523c7d4591f9c190d76f5fc62e04c3eb0b4a87132e03067224061729c7"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/float_cast_overflow_subject.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/functional_smoke_test.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/main.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/standalone_compile_test.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/amalgamate.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/au_editor_smoke.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/characterize_pitchshifter.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/characterize_timestretch.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/check_comment_style.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/check_dependent_comparisons.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/check_generated_docs.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/check_header_self_sufficiency.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/check_public_text.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/clap_smoke_host.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/plugin_probe.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/public_file_policy.json"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/run_concurrent_test_suites.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/threading_reference_parser.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/verify_float_cast_overflow_sanitizer.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/verify_m018_global_corrections.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/verify_threading_doc.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/vst3_editor_host.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/vst3_smoke_host.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/x11_editor_smoke.cpp"
+    }
+  ],
+  "schema": "dspark.public-file-policy.v1"
+}

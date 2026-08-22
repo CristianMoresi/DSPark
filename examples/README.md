@@ -4,13 +4,13 @@
 
 | Example | What it shows |
 |---|---|
-| [`wav_process.cpp`](wav_process.cpp) | offline file processing: WAV in → mastering chain → 24-bit WAV out |
+| [`wav_process.cpp`](wav_process.cpp) | offline file processing: WAV in -> mastering chain -> 24-bit WAV out |
 | [`channel_strip.cpp`](channel_strip.cpp) | the real-time block-processing pattern (prepare / per-block / setters) |
 | [`pitch_tracking_eq.cpp`](pitch_tracking_eq.cpp) | analysis driving DSP: PitchFollower steering a tracking low-cut |
 
 ## Building plugins (VST3 / CLAP / AU)
 
-In learning order — each example is the canonical reference for exactly one
+In learning order - each example is the canonical reference for exactly one
 capability. The full guide is [`docs/plugins.md`](../docs/plugins.md).
 
 | Example | What it teaches |

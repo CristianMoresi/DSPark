@@ -47,10 +47,10 @@
  * (after K. Werner's thesis): an N-port connector for arbitrary -- non
  * series/parallel -- topologies. Its scattering matrix is derived numerically
  * from the interconnection network via Modified Nodal Analysis: each port is
- * replaced by its instantaneous Thévenin equivalent (source a_i, resistance
+ * replaced by its instantaneous Thevenin equivalent (source a_i, resistance
  * R_i), the linear node system is solved once per topology/parameter change,
  * and S = 2M - I where M maps incident waves to port voltages. The up-facing
- * port is adapted to the Thévenin resistance seen looking into the network,
+ * port is adapted to the Thevenin resistance seen looking into the network,
  * so R-types nest under any root. `ToneStackFMV` builds on it: the exact
  * Fender '59 Bassman treble/bass/middle network (topology and verification
  * transfer function after Yeh & Smith, DAFx-06).
@@ -169,7 +169,7 @@ private:
 };
 
 /**
- * @brief Voltage source with series resistance (Thévenin leaf): b = Vs.
+ * @brief Voltage source with series resistance (Thevenin leaf): b = Vs.
  *
  * The series resistance doubles as the port resistance, which is what makes
  * the source usable anywhere in the tree (an ideal source can only be a root).
@@ -547,7 +547,7 @@ private:
  * @brief N-port R-type adaptor for non-series/parallel interconnections.
  *
  * Port 0 faces up (toward the root) and is adapted: its resistance is set to
- * the Thévenin resistance seen into the network, making S(0,0) = 0. Ports
+ * the Thevenin resistance seen into the network, making S(0,0) = 0. Ports
  * 1..N-1 connect the children, in declaration order. The topology is a list
  * of (node+, node-) pairs over a small node graph (-1 = ground reference).
  *
@@ -606,7 +606,7 @@ public:
                        children_);
         }
 
-        // 1) Thévenin resistance looking into the network from port 0:
+        // 1) Thevenin resistance looking into the network from port 0:
         //    assemble MNA without port 0, inject 1 A across its nodes.
         assembleConductance(false);
         factor();

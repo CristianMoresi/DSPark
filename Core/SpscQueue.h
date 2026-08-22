@@ -12,7 +12,7 @@
  * Features a local index caching optimization to aggressively minimize CPU
  * cache-line bouncing.
  *
- * Dependencies: C++20 standard library only (<array>, <atomic>, <cstddef>).
+ * Dependencies: C++20 standard library only (`array`, `atomic`, and `cstddef`).
  *
  * Threading (docs/threading.md): exactly ONE producer thread calls push()
  * and exactly ONE consumer thread calls pop(). sizeApprox()/empty() are

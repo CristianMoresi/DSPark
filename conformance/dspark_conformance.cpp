@@ -1,5 +1,5 @@
-// DSPark — Public conformance suite
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Public conformance suite
+// Copyright (c) 2026 Cristian Moresi - MIT License
 //
 // This is the PUBLIC quality gate that runs in CI on every platform:
 //
@@ -7,7 +7,7 @@
 //             path that is active for the build (SSE2/AVX/NEON/Wasm/scalar)
 //   [core]    DenormalGuard flush + restore semantics on the active target
 //             (real FTZ on x86/ARM, documented no-op on WebAssembly)
-//   [smoke]   every effect: prepare → process → finite output → silent tail
+//   [smoke]   every effect: prepare -> process -> finite output -> silent tail
 //   [pdc]     null tests: latency-reporting processors cancel against a
 //             delay-compensated dry path
 //   [metrics] objective quality numbers (resampler SNR, EQ linear-phase
@@ -151,7 +151,7 @@ bool smokeRun(const std::function<void(dspark::AudioBufferView<float>)>& process
 }
 
 // -----------------------------------------------------------------------------
-// [simd] — every SimdOps kernel against a scalar reference. Counts cover
+// [simd] - every SimdOps kernel against a scalar reference. Counts cover
 // empty, sub-vector, vector-boundary and unrolled-loop sizes, so both the
 // SIMD body and the scalar tail of every kernel run on the active path.
 // -----------------------------------------------------------------------------
@@ -358,7 +358,7 @@ void runSimdKernelTests()
 }
 
 // -----------------------------------------------------------------------------
-// [core] — DenormalGuard flushes denormal results where the architecture has
+// [core] - DenormalGuard flushes denormal results where the architecture has
 // an FTZ mode, is a transparent no-op where none exists (e.g. WebAssembly),
 // and always restores the previous FP state exactly.
 // -----------------------------------------------------------------------------
@@ -420,7 +420,7 @@ void runIoApiTests()
 }
 
 // -----------------------------------------------------------------------------
-// [smoke] — every effect builds, runs, stays finite, and dies down
+// [smoke] - every effect builds, runs, stays finite, and dies down
 // -----------------------------------------------------------------------------
 
 void runSmokeTests()
@@ -733,7 +733,7 @@ void runSmokeTests()
 }
 
 // -----------------------------------------------------------------------------
-// [pdc] — latency-compensated null tests
+// [pdc] - latency-compensated null tests
 // -----------------------------------------------------------------------------
 
 // Processes `signal` through `process` and measures the residual (in dB,
@@ -851,12 +851,12 @@ void runPdcNullTests()
 }
 
 // -----------------------------------------------------------------------------
-// [metrics] — objective quality numbers
+// [metrics] - objective quality numbers
 // -----------------------------------------------------------------------------
 
 // Low-corner filter realisation. A high-pass has H(1) = 0 exactly, so on a
 // DC-free input the output must stay DC-free and the sum of the impulse
-// response must be zero — at EVERY sample rate, because fc/fs is what decides
+// response must be zero - at EVERY sample rate, because fc/fs is what decides
 // whether the poles are resolvable. Realised in the sample type instead of the
 // biquad core's double, both collapsed: 10 Hz at 384 kHz published -1.46e-01
 // of sustained DC and a realised DC gain of +2.89e-01, and the 36/48 dB/oct
@@ -1321,7 +1321,7 @@ void runMetricTests()
     }
     {
         // WDF diode clipper solves the node equation (vin - v)/R = 2 Is sinh(v/nVt)
-        // to the same answer as an independent bisection — physical-model gate.
+        // to the same answer as an independent bisection - physical-model gate.
         const double R = 2200.0, Is = 2.52e-9, nVt = 1.752 * 0.02585;
         dspark::wdf::ResistiveVoltageSource<double> vsrc { R };
         dspark::wdf::DiodePairRoot<double, decltype(vsrc)> clip { vsrc, Is, nVt };
@@ -1359,7 +1359,7 @@ void runMetricTests()
 }
 
 // -----------------------------------------------------------------------------
-// [ebu] — official EBU R128 test set (optional)
+// [ebu] - official EBU R128 test set (optional)
 // -----------------------------------------------------------------------------
 
 #ifndef DSPARK_NO_FILE_IO
@@ -1372,7 +1372,7 @@ std::string toLowerAscii(std::string s)
 }
 
 // True when `nameLower` contains `tokenLower` not immediately followed by a
-// digit — "3341-1" matches "seq-3341-1-16bit.wav" but not "seq-3341-10-...".
+// digit - "3341-1" matches "seq-3341-1-16bit.wav" but not "seq-3341-10-...".
 bool containsCaseToken(const std::string& nameLower, const std::string& tokenLower)
 {
     size_t pos = 0;
@@ -1424,7 +1424,7 @@ struct EbuMeasurement
 };
 
 // Streams a whole WAV through LoudnessMeter, then feeds 2 s of silence so the
-// final short-term windows drain — the Tech 3342 reference implementation
+// final short-term windows drain - the Tech 3342 reference implementation
 // requires >= 1.5 s of trailing silence before the LRA readout. The silence
 // cannot bias any measure: it falls under the -70 LUFS absolute gate.
 bool measureFile(const std::string& path, EbuMeasurement& out)
@@ -1571,7 +1571,7 @@ void runEbuTests() { skip("ebu", "EBU R128 conformance", "built with DSPARK_NO_F
 #endif // DSPARK_NO_FILE_IO
 
 // -----------------------------------------------------------------------------
-// [table] — public per-processor metrics table (KPI K3): THD+N, noise floor,
+// [table] - public per-processor metrics table (KPI K3): THD+N, noise floor,
 // spurious/aliasing floor and latency at documented settings, in Markdown.
 // Run with:  dspark_conformance --metrics docs/metrics.md
 // -----------------------------------------------------------------------------
@@ -2177,13 +2177,13 @@ int runMetricsTable(const char* outPath)
     }
 
     std::fprintf(out,
-        "# DSPark — Per-Processor Quality Metrics\n\n"
+        "# DSPark - Per-Processor Quality Metrics\n\n"
         "Generated by `dspark_conformance --metrics` (48 kHz, stereo, block 512).\n\n"
         "- **THD+N**: spectral energy outside the fundamental, 1 kHz tone at -6 dBFS,\n"
         "  relative to the fundamental, 20 Hz-20 kHz.\n"
         "- **Noise floor**: output RMS (dBFS) with silent input.\n"
         "- **Spurious**: worst non-harmonic component (dB re fundamental) with a\n"
-        "  10.1 kHz tone at -6 dBFS — aliasing shows up here.\n"
+        "  10.1 kHz tone at -6 dBFS - aliasing shows up here.\n"
         "- **Latency**: as reported by `getLatency()` (samples @ 48 kHz). Validated\n"
         "  by the PDC null tests in this same suite.\n\n"
         "| Processor | Settings | Latency | THD+N @1 kHz | Noise floor | Spurious @10.1 kHz | Notes |\n"
@@ -2197,7 +2197,7 @@ int runMetricsTable(const char* outPath)
     auto cases = buildMetricsCases();
     for (auto& c : cases)
     {
-        // Noise floor FIRST, while the processor state is pristine — granular
+        // Noise floor FIRST, while the processor state is pristine - granular
         // and reverb tails from a previous tone are not the effect's noise.
         const double noise = noiseFloorDbfs(c.process);
         const int lat = c.latency ? c.latency() : 0;
@@ -2229,7 +2229,7 @@ int runMetricsTable(const char* outPath)
 
     std::fprintf(out,
         "\nModulated, inharmonic-by-design and time-based processors necessarily show\n"
-        "high \"THD+N\" — for them the column documents the character at the listed\n"
+        "high \"THD+N\" - for them the column documents the character at the listed\n"
         "settings rather than a defect. Linear processors read at the measurement's\n"
         "own floor.\n");
 

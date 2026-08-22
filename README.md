@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="docs/img/dspark-gh.png" alt="DSPark - A header-only audio DSP framework in pure C++20" width="100%">
+  <img src="https://raw.githubusercontent.com/CristianMoresi/DSPark/main/docs/img/dspark-gh.png" alt="DSPark - A header-only audio DSP framework in pure C++20" width="100%">
 </p>
 
-**v1.7.0** — 100 umbrella-facing public headers (101 installed library headers, including the shared phase-vocoder engine) of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target — desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins (effects and MIDI instruments) with HTML/CSS/JS editors.
+**v1.7.0** - 100 umbrella-facing public headers (101 installed library headers, including the shared phase-vocoder engine) of professional audio DSP: filters, dynamics, reverbs, physically-modeled analog (tape, tube, transformer), pitch, spectral tools, EBU-verified metering. One `#include`, the same code on every target - desktop apps, WebAssembly, mobile, embedded, offline tools, and native VST3/CLAP/AU plugins (effects and MIDI instruments) with HTML/CSS/JS editors.
 
-**📖 Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
+**[Docs] Full API documentation: [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)**
 
 CI runs an 885-case test suite and the public conformance suite on every commit across Windows (MSVC, x64 and ARM64), Linux (GCC + Clang, x64 and ARM64), macOS (ARM64) and WebAssembly (Emscripten), plus GCC and Clang AddressSanitizer/UBSan/float-cast-overflow coverage, an exceptions-free embedded profile and a single-header amalgamation. Loudness is validated against the official EBU R128 test vectors, and a [per-processor quality metrics table](docs/metrics.md) (THD+N, noise floor, spurious/aliasing, latency) is generated from the measurements.
 
@@ -50,13 +50,13 @@ You get the same framework, the same headers, the same API. The difference is ho
 Every processor exposes three levels of complexity:
 
 ```cpp
-// Level 1 — Just works:
+// Level 1 - Just works:
 eq.setBand(0, 1000.0f, -3.0f);
 
-// Level 2 — More control:
+// Level 2 - More control:
 eq.setBand(0, 1000.0f, -3.0f, 1.5f);   // Adds Q factor
 
-// Level 3 — Full control:
+// Level 3 - Full control:
 eq.setBand(0, { .frequency = 1000, .gain = -3, .q = 1.5,
                 .type = BandType::LowShelf, .slope = 24 });
 ```
@@ -65,7 +65,7 @@ You never see complexity you don't need. But it's always there when you do.
 
 ### Extensible by Design
 
-Effect classes expose **protected internals** so you can subclass them directly to reach the delay lines, filters and early reflections inside. They are deliberately **leaf classes with non-virtual destructors** — honouring the zero-virtual-dispatch design — so you extend by direct inheritance and composition rather than polymorphic base-pointer deletion:
+Effect classes expose **protected internals** so you can subclass them directly to reach the delay lines, filters and early reflections inside. They are deliberately **leaf classes with non-virtual destructors** - honouring the zero-virtual-dispatch design - so you extend by direct inheritance and composition rather than polymorphic base-pointer deletion:
 
 ```cpp
 class MyReverb : public dspark::AlgorithmicReverb<float> {
@@ -95,7 +95,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `Reverb<T>` | Convolution reverb with IR loading, pre-delay, auto-resample |
 | `Saturation<T>` | 10 algorithms (Tube, Tape, Transformer, SoftClip, HardClip, Exciter, Wavefolder, Bitcrusher, Downsample, MultiStage). Adaptive blend, slew-dependent saturation, oversampling. |
 | `Clipper<T>` | 4-mode clipper (Hard/Soft/Analog/GoldenRatio), multi-stage, slew limiter, up to 16x oversampling |
-| `FilterEngine<T>` | Cascaded biquads, 9 shapes, 6–48 dB/oct slopes |
+| `FilterEngine<T>` | Cascaded biquads, 9 shapes, 6-48 dB/oct slopes |
 | `CrossoverFilter<T>` | Linkwitz-Riley crossover (LR12/24/48), IIR + linear-phase modes |
 | `Chorus<T>` | Multi-voice LFO delay, stereo spread, flanger mode |
 | `Phaser<T>` | Allpass chain with LFO modulation, configurable stages, stereo LFO spread |
@@ -111,10 +111,10 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `StereoWidth<T>` | M/S width control with bass-mono option |
 | `MidSide<T>` | Stereo Mid/Side encoding and decoding |
 | `NoiseGenerator<T>` | White, pink, and brown noise generation |
-| `DCBlocker<T>` | DC offset removal (1-pole or Butterworth order 2–10) |
+| `DCBlocker<T>` | DC offset removal (1-pole or Butterworth order 2-10) |
 | `TapeMachine<T>` | Physical tape model: Jiles-Atherton hysteresis at 2x oversampling, NAB/CCIR record/play EQ with exact digital inverses, speed-dependent head-gap/spacing/thickness loss, head bump, common-transport wow & flutter |
 | `TubePreamp<T>` | Koren triode stages (12AX7) solved per sample with Newton-Raphson, exact Fender FMV tone stack as a Wave Digital R-type network, power-supply sag |
-| `TransformerModel<T>` | Audio transformer coloration: flux-domain Jiles-Atherton core (distortion rises as frequency falls — the LF "bloom"), magnetizing-inductance corner, HF resonance bell |
+| `TransformerModel<T>` | Audio transformer coloration: flux-domain Jiles-Atherton core (distortion rises as frequency falls - the LF "bloom"), magnetizing-inductance corner, HF resonance bell |
 | `PitchShifter<T>` | Phase vocoder with identity phase locking (Laroche-Dolson), exact tuning, transient phase reset, **formant preservation** (cepstral lift), stereo-coherent |
 | `TimeStretch<T>` | Tempo change without pitch change: identity-phase-locked phase vocoder, exact ratio with no drift, **spectral-flux onset detection with a transient-locked hop** (strikes keep the input's own sharpness instead of doubling), streaming and whole-signal paths |
 | `GranularProcessor<T>` | 64-grain clouds over live input: per-grain pitch/pan/jitter, time-domain grain-history freeze, equal-power spread |
@@ -136,23 +136,23 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `wdf::*` (WDF.h) | Wave Digital Filter circuit toolkit: R/L/C leaves, series/parallel adaptors, Newton-Raphson diode roots with analytic seeds, and an R-type adaptor (MNA-derived scattering) for non-adaptable topologies |
 | `Hysteresis<T>` | Jiles-Atherton magnetic hysteresis with implicit trapezoidal Newton-Raphson solver (tape, transformers) |
 | `ModulationRouter<T>` | Block-rate modulation routing: any source callable to any parameter setter, with depth and smoothing |
-| `StateWriter`/`StateReader` | Versioned key/value preset blobs + JSON helpers — every effect implements `getState()`/`setState()` |
+| `StateWriter`/`StateReader` | Versioned key/value preset blobs + JSON helpers - every effect implements `getState()`/`setState()` |
 | `FIRFilter<T>` | FIR engine with windowed-sinc design |
-| `Oversampling<T>` | 2x–16x polyphase half-band Kaiser filters (-80 dB+ rejection), transparent up/down round-trip, exact reported latency |
+| `Oversampling<T>` | 2x-16x polyphase half-band Kaiser filters (-80 dB+ rejection), transparent up/down round-trip, exact reported latency |
 | `Oscillator<T>` | PolyBLEP (sine, saw, square, triangle) |
 | `WavetableOscillator<T>` | Mipmapped wavetable with bandlimited harmonics |
 | `Resampler<T>` | Polyphase windowed-sinc sample-rate conversion |
 | `EnvelopeGenerator<T>` (`ADSREnvelope`) | ADSR with exponential curves |
 | `RingBuffer<T>` | Power-of-two circular buffer with interpolated read |
 | `SmoothedValue<T>` | Parameter smoother (exponential, linear, chase, or disabled) |
-| `Smoothers` | 9 smoothing algorithms (linear, exponential, one-pole, asymmetric, slew, SVF, Butterworth…) |
+| `Smoothers` | 9 smoothing algorithms (linear, exponential, one-pole, asymmetric, slew, SVF, Butterworth...) |
 | `ProcessorChain<T,...>` | Zero-overhead compile-time processor chain with per-slot bypass |
 | `SpectralProcessor<T>` | STFT-based analysis-modification-synthesis framework |
 | `Dither<T>` | TPDF dithering with noise shaping |
 | `DenormalGuard` | RAII FTZ/DAZ (x86 SSE, ARM, WebAssembly) |
 | `Interpolation` | 5 methods (linear, cubic, Hermite, Lagrange, allpass) |
-| `Hilbert<T>` | FIR (windowed-sinc) Hilbert transform for analytic signals — flat magnitude across the audible band |
-| `WindowFunctions<T>` | 8 windows (Hann, Hamming, Blackman, Kaiser…) |
+| `Hilbert<T>` | FIR (windowed-sinc) Hilbert transform for analytic signals - flat magnitude across the audible band |
+| `WindowFunctions<T>` | 8 windows (Hann, Hamming, Blackman, Kaiser...) |
 | `DryWetMixer<T>` | Parallel dry/wet mixing for effects |
 | `TruePeakDetector<T>` | Shared ITU-R BS.1770-4 inter-sample peak detector (used by Compressor, Limiter, LoudnessMeter) |
 | `SpinLock` | RT-safe spinlock for thread-safe parameters |
@@ -161,7 +161,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `AudioBuffer<T>` | 32-byte aligned owning buffer (SIMD-ready) |
 | `AudioBufferView<T>` | Non-owning view (what processors receive) |
 | `SimdOps` | SIMD-accelerated buffer operations (SSE2/AVX/NEON with scalar fallback) |
-| `DspMath` | Constants, dB ⇄ gain, fast tanh / tan / sin / cos / exp / log / pow10, range mapping |
+| `DspMath` | Constants, dB <-> gain, fast tanh / tan / sin / cos / exp / log / pow10, range mapping |
 | `Phasor<T>` | Phase accumulator for LFO and oscillator construction |
 | `SampleAndHold<T>` | Sample-and-hold with configurable hold time |
 | `WaveshapeTable<T>` | LUT-based waveshaping with linear / cubic interpolation |
@@ -176,7 +176,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | `LevelFollower<T>` | Peak and RMS envelope follower |
 | `EnvelopeFollower<T>` | Public attack/release detector (Peak or RMS law) for sidechains, modulation and metering |
 | `SpectrumAnalyzer<T>` | Real-time FFT spectrum with peak hold |
-| `LoudnessMeter<T>` | EBU R128: momentary, short-term, integrated, LRA, true peak — **passes the official EBU test vectors** (Tech 3341/3342, BS.1770-5 K-weighting and true-peak interpolator) |
+| `LoudnessMeter<T>` | EBU R128: momentary, short-term, integrated, LRA, true peak - **passes the official EBU test vectors** (Tech 3341/3342, BS.1770-5 K-weighting and true-peak interpolator) |
 | `LoudnessNormalizer<T>` | Offline LUFS normalization under a true-peak ceiling, with measured gain and limiting reports |
 | `Goertzel<T>` | Single-frequency O(N) magnitude detection |
 | `PitchDetector<T>` | YIN pitch detection with FFT-accelerated difference function (O(N log N)) |
@@ -191,7 +191,7 @@ class MyReverb : public dspark::AlgorithmicReverb<float> {
 | Class | Description |
 |---|---|
 | `WavFile` | Read/write WAV (PCM 8/16/24/32-bit, float 32/64-bit) |
-| `Mp3File` | MPEG-1 Layer III codec — read (CBR/VBR) + write (CBR encoder, 32–320 kbps) |
+| `Mp3File` | MPEG-1 Layer III codec - read (CBR/VBR) + write (CBR encoder, 32-320 kbps) |
 | `MidiFile` | Validating Standard MIDI File reader (formats 0/1/2) and writer (formats 0/1), with exact PPQN tempo conversion |
 | `FlacFile` | Native, dependency-free FLAC reader with eager CRC/MD5 validation and indexed range decode; decode-only by design |
 | `AudioFile` | Abstract base class for custom format implementations |
@@ -204,7 +204,7 @@ always return `false`; no FLAC encoder or external codec library is linked.
 
 | Class | Description |
 |---|---|
-| `HarmonyConstants` | Constexpr musical harmony toolkit: 61 scales (bitmask representation), 15 chord recipes with inversions, MIDI/note conversion, key-aware naming (sharp/flat), diatonic chord generation. Fully `constexpr`/`consteval` — generates static tables at compile time. |
+| `HarmonyConstants` | Constexpr musical harmony toolkit: 61 scales (bitmask representation), 15 chord recipes with inversions, MIDI/note conversion, key-aware naming (sharp/flat), diatonic chord generation. Fully `constexpr`/`consteval` - generates static tables at compile time. |
 | `ChordDetector<T>` | Real-time chord recognition: per-note Goertzel chroma, template matching over ten chord families, bass-note root disambiguation, confidence-gated hold |
 | `KeyDetector<T>` | Musical-key estimation from accumulated chroma, with major/minor confidence and key-aware naming |
 
@@ -305,7 +305,7 @@ for (int i = 0; i < 512; ++i)
     freqs[i] = 20.0f * std::pow(1000.0f, static_cast<float>(i) / 511.0f);
 
 eq.getMagnitudeForFrequencyArray(freqs.data(), mags.data(), 512);
-// mags[] now contains the combined EQ curve — plot it in your GUI
+// mags[] now contains the combined EQ curve - plot it in your GUI
 ```
 
 ---
@@ -314,7 +314,7 @@ eq.getMagnitudeForFrequencyArray(freqs.data(), mags.data(), 512);
 
 DSPark is a DSP framework first, but it ships a complete native plugin
 layer: the same class that processes your audio becomes a loadable plugin
-with nothing but this repository — no external SDK to download (Steinberg's
+with nothing but this repository - no external SDK to download (Steinberg's
 official C API header is vendored under its permissive 2025 license).
 
 ```cpp
@@ -351,17 +351,17 @@ byte-portable across all three formats by construction. The optional
 contract grows with one method each: a host-routable **sidechain bus**
 (two-buffer `processBlock`, `examples/plugin_ducker/`), **MIDI input and
 instruments** (`handleMidiEvent` + `Category::Instrument`,
-`examples/plugin_synth/` — an 8-voice synth validated as an `aumu` music
+`examples/plugin_synth/` - an 8-voice synth validated as an `aumu` music
 device), **host transport** for tempo-synced DSP (`setTransport`),
 **offline render quality switching** (`setOfflineRendering`) and
 **factory presets** published to every host's preset browser
 (`factoryPresets`). Each capability is proven functionally in CI by
-dedicated smoke hosts — measured ducking, measured note pitch, measured
-automation step positions — not just compiled.
+dedicated smoke hosts - measured ducking, measured note pitch, measured
+automation step positions - not just compiled.
 
 For a custom GUI, write it in **plain HTML/CSS/JS**: the WebView editor
-layer embeds it in the host window on every format and platform — WebView2
-on Windows, WKWebView on macOS, WebKitGTK on Linux/X11 — with a tiny
+layer embeds it in the host window on every format and platform - WebView2
+on Windows, WKWebView on macOS, WebKitGTK on Linux/X11 - with a tiny
 `dspark` JS bridge for parameters and automation gestures, and a
 `dspark_add_plugin(... EDITOR_HTML ui/editor.html)` build step that inlines
 ordinary separate web files. Every example plugin passes Tracktion's
@@ -379,7 +379,7 @@ examples are `examples/plugin_webview_editor/` (single file) and
 
 ---
 
-## DSParkLab — Interactive Testing App
+## DSParkLab - Interactive Testing App
 
 DSParkLab is an interactive, plugin-style GUI application for real-time testing of every DSPark processor. Load any audio file, enable effects, shape them on an interactive analyzer or with parameter controls, and hear the results instantly.
 
@@ -392,7 +392,7 @@ DSParkLab\DSParkLab.exe
 **Features:**
 
 - Asynchronous WAV/MP3 loading with format auto-detection (audio thread never blocks on I/O)
-- 34 effects organised by category (Filters, Dynamics, Distortion, Analog, Modulation, Pitch, Spatial, Utility) — including the physical tape/tube/transformer models, pitch shifter with formant preservation, granular engine and denoiser
+- 34 effects organised by category (Filters, Dynamics, Distortion, Analog, Modulation, Pitch, Spatial, Utility) - including the physical tape/tube/transformer models, pitch shifter with formant preservation, granular engine and denoiser
 - **Interactive analyzer**: log-frequency spectrum behind a live response curve, with **draggable nodes** for the EQ / Filter / Dynamic EQ (drag X = frequency, Y = gain, mouse-wheel = Q)
 - Dynamic EQ draws its **live** per-band reaction in real time; multiband compressor shows crossover bands with per-band gain reduction
 - Auto-generated parameter panels with mouse-wheel-adjustable sliders and combo boxes
@@ -401,7 +401,7 @@ DSParkLab\DSParkLab.exe
 - Per-channel level meters, waveform view, and gain-reduction metering
 - A/B bypass for instant comparison, and transport controls (play, pause, stop, seek, loop)
 
-Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](https://miniaud.io/) (public domain). These dependencies are bundled in `DSParkLab/vendor/` and are only used by the testing app — the DSPark framework itself remains 100% dependency-free.
+Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](https://miniaud.io/) (public domain). These dependencies are bundled in `DSParkLab/vendor/` and are only used by the testing app - the DSPark framework itself remains 100% dependency-free.
 
 ---
 
@@ -424,11 +424,11 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 - **Zero allocation in audio thread**: All memory pre-allocated in `prepare()`
 - **SIMD inner loops**: SSE2/SSE3/AVX/NEON-accelerated buffer operations and FFT, with automatic scalar fallback
 - **Cache-friendly**: Contiguous memory, 32-byte aligned buffers
-- **Thread-safe parameters**: All setters use `std::atomic` with `memory_order_relaxed` — safe to call from any thread (UI, automation, audio) with zero contention
+- **Thread-safe parameters**: All setters use `std::atomic` with `memory_order_relaxed` - safe to call from any thread (UI, automation, audio) with zero contention
 - **Lock-free coefficient updates**: `Biquad::setCoeffs()` is consumed automatically by `processBlock()` and `processSample()` via a relaxed-load fast path. No external sequencing required.
 - **No virtual dispatch in hot path**: Templates and compile-time polymorphism
 - **Physically-modeled algorithms**: Tape (Chowdhury 2019 hysteresis with Langevin function, head bump pre-filter, gap-loss HF rolloff), FDN reverb (Jot 1991 absorption, Householder mixing, Dattorro 1997 multi-tap output, Lexicon-style modulation, serial allpass density, allpass interpolation, tanh soft saturation), TPT state-variable and ladder filters
-- **Full Doxygen documentation**: Every public class and method documented — browse it at [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)
+- **Full Doxygen documentation**: Every public class and method documented - browse it at [cristianmoresi.github.io/DSPark](https://cristianmoresi.github.io/DSPark/)
 
 ---
 
@@ -436,19 +436,19 @@ Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](
 
 ```
 DSPark/
-├── DSPark.h                 # Single umbrella include + full documentation
-├── Core/          (41)      # Building blocks: filters, FFT, WDF, oscillators, SIMD
-├── Effects/       (39)      # Ready-to-use processors: EQ, compressor, reverb, tape...
-├── Analysis/      (12)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation, onset
-├── IO/             (5)      # WAV/MP3, Standard MIDI and native FLAC I/O
-├── Music/          (3)      # Harmony constants + real-time chord and key detection
-├── plugin/                  # Native plugin layer: VST3, CLAP, AU + WebView editor
-├── tests/                   # Test suite: 885 cases, zero dependencies
-├── conformance/             # Public conformance suite (runs in CI)
-├── docs/                    # Cookbook, plugin guide, threading model, metrics
-├── examples/                # WAV processing, channel strip, plugins, templates
-├── tools/                   # VST3/CLAP/AU-editor smoke hosts, editor host, amalgamator
-└── DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)
++-- DSPark.h                 # Single umbrella include + full documentation
++-- Core/          (41)      # Building blocks: filters, FFT, WDF, oscillators, SIMD
++-- Effects/       (39)      # Ready-to-use processors: EQ, compressor, reverb, tape...
++-- Analysis/      (12)      # Metering: LUFS (EBU-verified), spectrum, pitch, correlation, onset
++-- IO/             (5)      # WAV/MP3, Standard MIDI and native FLAC I/O
++-- Music/          (3)      # Harmony constants + real-time chord and key detection
++-- plugin/                  # Native plugin layer: VST3, CLAP, AU + WebView editor
++-- tests/                   # Test suite: 885 cases, zero dependencies
++-- conformance/             # Public conformance suite (runs in CI)
++-- docs/                    # Cookbook, plugin guide, threading model, metrics
++-- examples/                # WAV processing, channel strip, plugins, templates
++-- tools/                   # VST3/CLAP/AU-editor smoke hosts, editor host, amalgamator
++-- DSParkLab/               # Interactive testing app (Win32 + ImGui + miniaudio)
 ```
 
 ---
@@ -551,7 +551,7 @@ synthesizer firmware project (issue #2).
 ## What's New in v1.6.0
 
 **The host contract**: the plugin layer now covers everything a host can
-offer an effect or an instrument — each capability one declarative member,
+offer an effect or an instrument - each capability one declarative member,
 each one proven functionally in CI (measured, not just compiled).
 
 - **Instruments & MIDI**: `handleMidiEvent(MidiEvent)` adds a note input to
@@ -559,12 +559,12 @@ each one proven functionally in CI (measured, not just compiled).
   sustain / pressure, CLAP note ports speaking both CLAP and raw-MIDI
   dialects, AU MusicDevice selectors), and `Category::Instrument` builds a
   true generator: no audio inputs, an `aumu` Audio Unit, cleared buffers
-  that voices add into. `examples/plugin_synth/` — 8 voices, voice
-  stealing, pitch bend, sample-accurate note starts — passes `auval` and
+  that voices add into. `examples/plugin_synth/` - 8 voices, voice
+  stealing, pitch bend, sample-accurate note starts - passes `auval` and
   plays a measured 440 Hz in CI.
 - **Host transport**: `setTransport(TransportInfo)` delivers tempo, musical
   position, time signature, loop points and play state per block, from the
-  VST3 ProcessContext, the CLAP transport event and the AU host callbacks —
+  VST3 ProcessContext, the CLAP transport event and the AU host callbacks -
   the basis for tempo-synced delays, LFOs and gates.
 - **Mono everywhere**: every plugin now negotiates mono and stereo by
   default (`ChannelSupport` restricts it when the DSP is inherently
@@ -581,9 +581,9 @@ each one proven functionally in CI (measured, not just compiled).
   state container; `process()` runs under DSPark's denormal guard.
 - **Proven by instrumentation**: the new `tools/plugin_probe.cpp` encodes
   what the wrapper delivers into its output, and the smoke hosts measure it
-  — transport DC, the offline sign flip, an automation step landing on its
+  - transport DC, the offline sign flip, an automation step landing on its
   exact sample, note pitch by zero crossings, the latency-changed
-  notification — on every platform, on every commit. pluginval and
+  notification - on every platform, on every commit. pluginval and
   clap-validator caught two real state-persistence bugs along the way; both
   fixed and now regression-covered.
 
@@ -599,9 +599,9 @@ Free to use in commercial and open-source projects. Attribution appreciated.
 
 ## Author
 
-**Cristian Moresi** — Software developer and music producer with professional experience in mixing engineering and sound design.
+**Cristian Moresi** - Software developer and music producer with professional experience in mixing engineering and sound design.
 
-DSPark was created to provide a truly free, professional-grade DSP toolkit accessible to developers at every level of expertise — from desktop app builders to DSP engineers designing embedded audio systems. It is a genuine open-source alternative to commercial audio frameworks, built from the ground up with no dependencies and no compromises.
+DSPark was created to provide a truly free, professional-grade DSP toolkit accessible to developers at every level of expertise - from desktop app builders to DSP engineers designing embedded audio systems. It is a genuine open-source alternative to commercial audio frameworks, built from the ground up with no dependencies and no compromises.
 
 - GitHub: [github.com/CristianMoresi](https://github.com/CristianMoresi)
 - LinkedIn: [linkedin.com/in/cristianmoresi](https://www.linkedin.com/in/cristianmoresi/)

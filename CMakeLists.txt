@@ -1,4 +1,4 @@
-# DSPark — header-only audio DSP framework (C++20, zero dependencies)
+# DSPark - header-only audio DSP framework (C++20, zero dependencies)
 #
 # Consumption:
 #   add_subdirectory(DSPark)            # or FetchContent

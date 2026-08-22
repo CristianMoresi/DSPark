@@ -1,4 +1,4 @@
-// DSPark — host-contract probe plugin (test instrumentation, not an example)
+// DSPark - host-contract probe plugin (test instrumentation, not an example)
 //
 // A deliberately bare plugin whose OUTPUT encodes what the wrapper delivered,
 // so the smoke hosts can prove each host-facing capability end to end:

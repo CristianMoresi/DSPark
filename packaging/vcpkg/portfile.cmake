@@ -1,4 +1,4 @@
-# DSPark vcpkg port — submit to microsoft/vcpkg once a release tag exists.
+# DSPark vcpkg port - submit to microsoft/vcpkg once a release tag exists.
 # Update REF and SHA512 for the published release archive
 # (vcpkg hashes the GitHub source tarball of the tag).
 

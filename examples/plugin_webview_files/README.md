@@ -1,7 +1,7 @@
-# DSPark WebGain — a WebView editor developed as separate web files
+# DSPark WebGain - a WebView editor developed as separate web files
 
 [`plugin_webview_editor`](../plugin_webview_editor/) keeps its whole UI in
-one C++ raw string — great for a single-file example, not for real UI work.
+one C++ raw string - great for a single-file example, not for real UI work.
 This example shows the **production workflow**: the interface lives in
 ordinary web files,
 
@@ -45,5 +45,5 @@ and, on macOS, `DSParkWebGain.component` (validate with
 `auval -v aufx DSwg DSpk`).
 
 While designing the UI, add `editorDevFile()` pointing at `ui/editor.html`
-to reload it from disk on every editor open — no rebuild at all (inline the
+to reload it from disk on every editor open - no rebuild at all (inline the
 css/js references manually or keep styles in the page while iterating).

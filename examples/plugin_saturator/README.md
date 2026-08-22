@@ -1,4 +1,4 @@
-# A complete VST3 + CLAP plugin with DSPark alone — no SDK download
+# A complete VST3 + CLAP plugin with DSPark alone - no SDK download
 
 `saturator.cpp` is a finished, loadable effect (drive / algorithm / mix /
 output around `dspark::Saturation`) written against DSPark's native plugin
@@ -38,8 +38,9 @@ dspark_add_plugin(DSParkSaturator
 
 Install by copying the result into the platform VST3 folder
 (`C:\Program Files\Common Files\VST3`, `~/.vst3`,
-`/Library/Audio/Plug-Ins/VST3`). The plugin shows the host's generic
-parameter editor; a DSPark editor layer is on the roadmap.
+`/Library/Audio/Plug-Ins/VST3`). This deliberately minimal example uses the
+host's generic parameter editor. DSPark's shipped WebView editor layer and
+complete examples are documented in [`docs/plugins.md`](../../docs/plugins.md).
 
 ## Verify before shipping
 
@@ -74,5 +75,5 @@ DSPARK_VST3_PLUGIN(DSParkSaturator)
 
 State saving, the bypass parameter, latency reporting, bus negotiation and
 parameter automation are handled by the layer. Parameter ids are stable text
-strings — reorder or insert parameters freely between versions without
+strings - reorder or insert parameters freely between versions without
 breaking saved sessions.

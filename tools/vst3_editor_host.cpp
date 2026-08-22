@@ -1,6 +1,6 @@
-// DSPark — VST3 editor host
+// DSPark - VST3 editor host
 //
-// Opens a plugin's editor view in a plain native window — the 10-second
+// Opens a plugin's editor view in a plain native window - the 10-second
 // visual check for WebView editors without launching a DAW:
 //
 //   vst3_editor_host <path-to-module> [seconds]
@@ -245,7 +245,7 @@ int main(int argc, char** argv)
     ShowWindow(hwnd, SW_SHOW);
 
     // Self-test: resize the window programmatically and verify the embedded
-    // web widget follows the client area — the exact chain DAW resizes use.
+    // web widget follows the client area - the exact chain DAW resizes use.
     auto pumpFor = [](DWORD ms)
     {
         const ULONGLONG until = GetTickCount64() + ms;

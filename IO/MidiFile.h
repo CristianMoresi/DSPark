@@ -175,7 +175,10 @@ public:
 
     /**
      * @brief Adds an F0 or F7 SysEx packet event.
+     * @param track Destination track index.
+     * @param delta Delta time in ticks from the preceding event.
      * @param f0OrF7 Must be MidiEventKind::SysExF0 or SysExF7.
+     * @param payload SysEx payload bytes, excluding the status byte.
      */
     [[nodiscard]] bool addSysExEvent(size_t track, uint32_t delta,
                                      MidiEventKind f0OrF7,

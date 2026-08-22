@@ -70,14 +70,462 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace dspark {
+
+namespace detail {
+
+/** Internal no-op instrumentation for the fixed Reverb publication protocol. */
+struct ReverbPublisherNoopHooks
+{
+    enum class ControlPoint
+    {
+        candidateReady,
+        beforeFirstScan,
+        afterSlotSelection,
+        afterPublishedStore,
+        beforePendingExchange,
+        afterPendingExchange,
+        beforeOldRetirement,
+        beforeOldReclaim,
+        beforeCommit,
+        afterCommit,
+        noCapacity
+    };
+
+    static constexpr void control(ControlPoint) noexcept {}
+    static constexpr void audioExchange() noexcept {}
+    static constexpr void audioAfterExchange(bool) noexcept {}
+    static constexpr void audioStateStore() noexcept {}
+    static constexpr void audioValidation(bool) noexcept {}
+    static constexpr void controlValidation(bool) noexcept {}
+    static constexpr void controlScan() noexcept {}
+};
+
+/**
+ * Fixed-capacity ownership handoff used by Reverb.
+ *
+ * The audio owner performs one pending-token exchange and never constructs,
+ * destroys, scans or reference-counts a bank. The serialized control owner
+ * alone constructs and reclaims the four slot-owned banks.
+ */
+template <typename Bank,
+          typename Hooks = ReverbPublisherNoopHooks,
+          std::uint32_t GenerationMax = 134217727u>
+class ReverbBankPublisher
+{
+public:
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
+                  "Reverb publication requires lock-free 32-bit atomics");
+    static_assert(GenerationMax >= 1u && GenerationMax <= 134217727u,
+                  "Generation must fit the 27-bit token encoding");
+
+    enum class Phase : std::uint32_t
+    {
+        free = 0u,
+        building = 1u,
+        published = 2u,
+        active = 3u,
+        retired = 4u,
+        exhausted = 5u
+    };
+
+    enum class PublishResult
+    {
+        published,
+        noCapacity,
+        invariantViolation
+    };
+
+    ReverbBankPublisher() noexcept = default;
+    ~ReverbBankPublisher() noexcept { shutdown(); }
+
+    ReverbBankPublisher(const ReverbBankPublisher&) = delete;
+    ReverbBankPublisher& operator=(const ReverbBankPublisher&) = delete;
+    ReverbBankPublisher(ReverbBankPublisher&&) = delete;
+    ReverbBankPublisher& operator=(ReverbBankPublisher&&) = delete;
+
+    /** Publishes one fully-built bank; called only by the control owner. */
+    template <typename Commit>
+    PublishResult publish(std::unique_ptr<Bank> candidate,
+                          std::uint32_t latency,
+                          Commit&& commit) noexcept
+    {
+        static_assert(std::is_nothrow_invocable_v<Commit&>,
+                      "Reverb publication commit must be noexcept");
+        assert(candidate != nullptr);
+        Hooks::control(Hooks::ControlPoint::candidateReady);
+        Hooks::control(Hooks::ControlPoint::beforeFirstScan);
+
+        SlotChoice choice = scanOnce();
+        if (!choice.valid)
+        {
+            const std::uint32_t observed =
+                pendingToken_.load(std::memory_order_acquire);
+            const bool exactPinnedPending = observed != emptyToken
+                && observed == pinnedToken_;
+            const bool generationLimitPending = observed != emptyToken
+                && tokenGeneration(observed) >= GenerationMax;
+            if (!exactPinnedPending && !generationLimitPending)
+            {
+                Hooks::control(Hooks::ControlPoint::beforePendingExchange);
+                const std::uint32_t old =
+                    pendingToken_.exchange(emptyToken, std::memory_order_acq_rel);
+                Hooks::control(Hooks::ControlPoint::afterPendingExchange);
+                if (old != emptyToken && !retireControlOwned(old))
+                    return PublishResult::invariantViolation;
+                choice = scanOnce(); // The sole bounded rescan.
+            }
+        }
+
+        if (!choice.valid)
+        {
+            Hooks::control(Hooks::ControlPoint::noCapacity);
+            return PublishResult::noCapacity;
+        }
+
+        Hooks::control(Hooks::ControlPoint::afterSlotSelection);
+        auto& slot = slots_[choice.index];
+        nextGeneration_[choice.index] = choice.generation;
+        slot.stateWord.store(encodeState(choice.generation, Phase::building),
+                             std::memory_order_relaxed);
+        if (choice.reclaimsRetired)
+            Hooks::control(Hooks::ControlPoint::beforeOldReclaim);
+        slot.bank = std::move(candidate);
+        slot.stateWord.store(encodeState(choice.generation, Phase::published),
+                             std::memory_order_release);
+        Hooks::control(Hooks::ControlPoint::afterPublishedStore);
+
+        const std::uint32_t token = makeToken(choice.generation, choice.index);
+        Hooks::control(Hooks::ControlPoint::beforePendingExchange);
+        const std::uint32_t old =
+            pendingToken_.exchange(token, std::memory_order_acq_rel);
+        Hooks::control(Hooks::ControlPoint::afterPendingExchange);
+        if (old != emptyToken && !retireControlOwned(old))
+        {
+            // This is unreachable under the single-writer contract. Keep the
+            // newly published exact token intact and report the broken model.
+            return PublishResult::invariantViolation;
+        }
+
+        Hooks::control(Hooks::ControlPoint::beforeCommit);
+        commit();
+        latestToken_ = token;
+        publicationMetadata_.store(packMetadata(latency),
+                                   std::memory_order_release);
+        scanStart_ = (choice.index + 1u) & slotMask;
+        Hooks::control(Hooks::ControlPoint::afterCommit);
+        return PublishResult::published;
+    }
+
+    /** One fixed-operation audio-boundary adoption; returns the active bank. */
+    [[nodiscard]] Bank* adoptAtBoundary() noexcept
+    {
+        Hooks::audioExchange();
+        const std::uint32_t next =
+            pendingToken_.exchange(emptyToken, std::memory_order_acq_rel);
+        Hooks::audioAfterExchange(next != emptyToken);
+        if (next != emptyToken)
+        {
+            const std::size_t nextIndex = tokenIndex(next);
+            const std::uint32_t nextGeneration = tokenGeneration(next);
+            const bool nextValid =
+                slots_[nextIndex].stateWord.load(std::memory_order_acquire)
+                == encodeState(nextGeneration, Phase::published);
+            Hooks::audioValidation(nextValid);
+            assert(nextValid);
+            if (nextValid)
+            {
+                slots_[nextIndex].stateWord.store(
+                    encodeState(nextGeneration, Phase::active),
+                    std::memory_order_release);
+                Hooks::audioStateStore();
+
+                const std::uint32_t old = activeToken_;
+                activeToken_ = next;
+                if (old != emptyToken)
+                {
+                    const std::size_t oldIndex = tokenIndex(old);
+                    const std::uint32_t oldGeneration = tokenGeneration(old);
+                    const bool oldValid =
+                        slots_[oldIndex].stateWord.load(std::memory_order_acquire)
+                        == encodeState(oldGeneration, Phase::active);
+                    Hooks::audioValidation(oldValid);
+                    assert(oldValid);
+                    if (oldValid)
+                    {
+                        slots_[oldIndex].stateWord.store(
+                            encodeState(oldGeneration, Phase::retired),
+                            std::memory_order_release);
+                        Hooks::audioStateStore();
+                    }
+                }
+            }
+        }
+
+        return activeToken_ == emptyToken
+            ? nullptr
+            : slots_[tokenIndex(activeToken_)].bank.get();
+    }
+
+    /** Ends the previous accessor lifetime and pins the exact latest bank. */
+    [[nodiscard]] Bank* pinLatest() noexcept
+    {
+        const std::uint32_t previous = pinnedToken_;
+        pinnedToken_ = emptyToken;
+        const std::uint32_t latest = latestToken_;
+        if (previous != emptyToken && previous != latest)
+            reclaimIfRetired(previous);
+
+        if (latest == emptyToken) return nullptr;
+        const std::size_t index = tokenIndex(latest);
+        const std::uint32_t state =
+            slots_[index].stateWord.load(std::memory_order_acquire);
+        const Phase phase = statePhase(state);
+        const bool valid = stateGeneration(state) == tokenGeneration(latest)
+            && phase != Phase::free && phase != Phase::building
+            && phase != Phase::exhausted && slots_[index].bank != nullptr;
+        Hooks::controlValidation(valid);
+        assert(valid);
+        if (!valid) return nullptr;
+        pinnedToken_ = latest;
+        return slots_[index].bank.get();
+    }
+
+    [[nodiscard]] bool isLoaded() const noexcept
+    {
+        return (publicationMetadata_.load(std::memory_order_acquire)
+                & loadedMask) != 0u;
+    }
+
+    [[nodiscard]] int latency() const noexcept
+    {
+        return static_cast<int>(publicationMetadata_.load(
+            std::memory_order_acquire) & latencyMask);
+    }
+
+    /** Joined-owner destruction; safe to call repeatedly. */
+    void shutdown() noexcept
+    {
+        pendingToken_.exchange(emptyToken, std::memory_order_acq_rel);
+        activeToken_ = emptyToken;
+        latestToken_ = emptyToken;
+        pinnedToken_ = emptyToken;
+        publicationMetadata_.store(0u, std::memory_order_release);
+        for (auto& slot : slots_)
+        {
+            slot.bank.reset();
+            slot.stateWord.store(encodeState(0u, Phase::free),
+                                 std::memory_order_relaxed);
+        }
+        nextGeneration_.fill(0u);
+        scanStart_ = 0u;
+    }
+
+    // Deterministic detail-level observability used by the dedicated tests.
+    [[nodiscard]] std::uint32_t stateWordForTest(std::size_t index) const noexcept
+    {
+        return slots_[index].stateWord.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] std::uint32_t pendingTokenForTest() const noexcept
+    {
+        return pendingToken_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] std::uint32_t activeTokenForTest() const noexcept { return activeToken_; }
+    [[nodiscard]] std::uint32_t latestTokenForTest() const noexcept { return latestToken_; }
+    [[nodiscard]] std::uint32_t pinnedTokenForTest() const noexcept { return pinnedToken_; }
+    [[nodiscard]] std::size_t residentBanksForTest() const noexcept
+    {
+        std::size_t count = 0;
+        for (const auto& slot : slots_) count += slot.bank != nullptr ? 1u : 0u;
+        return count;
+    }
+    [[nodiscard]] const void* atomicWordAddressForTest(
+        std::size_t index) const noexcept
+    {
+        if (index < slots_.size())
+            return static_cast<const void*>(&slots_[index].stateWord);
+        if (index == slots_.size())
+            return static_cast<const void*>(&pendingToken_);
+        return static_cast<const void*>(&publicationMetadata_);
+    }
+    [[nodiscard]] static constexpr std::size_t atomicWordCountForTest() noexcept
+    {
+        return 6u;
+    }
+    [[nodiscard]] static constexpr Phase phaseForTest(std::uint32_t state) noexcept
+    {
+        return statePhase(state);
+    }
+    [[nodiscard]] static constexpr std::uint32_t generationForTest(
+        std::uint32_t state) noexcept
+    {
+        return stateGeneration(state);
+    }
+
+private:
+    static constexpr std::uint32_t emptyToken = 0u;
+    static constexpr std::uint32_t slotMask = 3u;
+    static constexpr std::uint32_t phaseMask = 7u;
+    static constexpr std::uint32_t loadedMask = 0x80000000u;
+    static constexpr std::uint32_t latencyMask = 0x7fffffffu;
+
+    struct BankSlot
+    {
+        std::unique_ptr<Bank> bank;
+        std::atomic<std::uint32_t> stateWord { 0u };
+    };
+
+    struct SlotChoice
+    {
+        std::size_t index = 0;
+        std::uint32_t generation = 0;
+        bool valid = false;
+        bool reclaimsRetired = false;
+    };
+
+    [[nodiscard]] static constexpr std::uint32_t makeToken(
+        std::uint32_t generation, std::size_t index) noexcept
+    {
+        return (generation << 2u) | static_cast<std::uint32_t>(index);
+    }
+
+    [[nodiscard]] static constexpr std::size_t tokenIndex(
+        std::uint32_t token) noexcept
+    {
+        return static_cast<std::size_t>(token & slotMask);
+    }
+
+    [[nodiscard]] static constexpr std::uint32_t tokenGeneration(
+        std::uint32_t token) noexcept
+    {
+        return token >> 2u;
+    }
+
+    [[nodiscard]] static constexpr std::uint32_t encodeState(
+        std::uint32_t generation, Phase phase) noexcept
+    {
+        return (generation << 3u) | static_cast<std::uint32_t>(phase);
+    }
+
+    [[nodiscard]] static constexpr std::uint32_t stateGeneration(
+        std::uint32_t state) noexcept
+    {
+        return state >> 3u;
+    }
+
+    [[nodiscard]] static constexpr Phase statePhase(std::uint32_t state) noexcept
+    {
+        return static_cast<Phase>(state & phaseMask);
+    }
+
+    [[nodiscard]] static constexpr std::uint32_t packMetadata(
+        std::uint32_t latency) noexcept
+    {
+        return loadedMask | std::min(latency, latencyMask);
+    }
+
+    [[nodiscard]] SlotChoice scanOnce() noexcept
+    {
+        for (std::size_t offset = 0; offset < slots_.size(); ++offset)
+        {
+            Hooks::controlScan();
+            const std::size_t index = (scanStart_ + offset) & slotMask;
+            auto& slot = slots_[index];
+            const std::uint32_t state =
+                slot.stateWord.load(std::memory_order_acquire);
+            const Phase phase = statePhase(state);
+            const std::uint32_t generation = stateGeneration(state);
+            const std::uint32_t exactToken = makeToken(generation, index);
+
+            if (phase == Phase::free)
+            {
+                const bool pristine = generation == 0u
+                    && nextGeneration_[index] == 0u && slot.bank == nullptr;
+                Hooks::controlValidation(pristine);
+                assert(pristine);
+                if (pristine) return { index, 1u, true, false };
+                continue;
+            }
+
+            if (phase != Phase::retired || exactToken == pinnedToken_)
+                continue;
+
+            const bool generationMatches =
+                nextGeneration_[index] == generation;
+            Hooks::controlValidation(generationMatches);
+            assert(generationMatches);
+            if (!generationMatches) continue;
+
+            if (generation >= GenerationMax)
+            {
+                Hooks::control(Hooks::ControlPoint::beforeOldReclaim);
+                slot.bank.reset();
+                slot.stateWord.store(encodeState(generation, Phase::exhausted),
+                                     std::memory_order_release);
+                continue;
+            }
+            return { index, generation + 1u, true, true };
+        }
+        return {};
+    }
+
+    bool retireControlOwned(std::uint32_t token) noexcept
+    {
+        const std::size_t index = tokenIndex(token);
+        const std::uint32_t generation = tokenGeneration(token);
+        auto& slot = slots_[index];
+        const bool valid =
+            slot.stateWord.load(std::memory_order_acquire)
+            == encodeState(generation, Phase::published);
+        Hooks::controlValidation(valid);
+        assert(valid);
+        if (!valid) return false;
+
+        Hooks::control(Hooks::ControlPoint::beforeOldRetirement);
+        slot.stateWord.store(encodeState(generation, Phase::retired),
+                             std::memory_order_release);
+        if (token != pinnedToken_)
+        {
+            Hooks::control(Hooks::ControlPoint::beforeOldReclaim);
+            slot.bank.reset();
+        }
+        return true;
+    }
+
+    void reclaimIfRetired(std::uint32_t token) noexcept
+    {
+        auto& slot = slots_[tokenIndex(token)];
+        const std::uint32_t state =
+            slot.stateWord.load(std::memory_order_acquire);
+        if (state == encodeState(tokenGeneration(token), Phase::retired))
+        {
+            Hooks::control(Hooks::ControlPoint::beforeOldReclaim);
+            slot.bank.reset();
+        }
+    }
+
+    std::array<BankSlot, 4> slots_ {};
+    std::atomic<std::uint32_t> pendingToken_ { emptyToken };
+    std::atomic<std::uint32_t> publicationMetadata_ { 0u };
+    std::uint32_t activeToken_ = emptyToken;  // Audio-owner only.
+    std::uint32_t latestToken_ = emptyToken;  // Control-owner only.
+    std::uint32_t pinnedToken_ = emptyToken;  // Control-owner only.
+    std::array<std::uint32_t, 4> nextGeneration_ {};
+    std::size_t scanStart_ = 0;                // Control-owner only.
+};
+
+} // namespace detail
 
 /**
  * @class Reverb
@@ -91,8 +539,22 @@ namespace dspark {
 template <FloatType T>
 class Reverb
 {
+protected:
+    struct ConvolverBank
+    {
+        std::vector<Convolver<T>> convolvers;
+    };
+
+    using Publisher = detail::ReverbBankPublisher<ConvolverBank>;
+
 public:
-    ~Reverb() = default; // non-virtual: leaf class (no virtual dispatch)
+    Reverb() = default;
+    ~Reverb() noexcept { bankPublisher_.shutdown(); }
+
+    Reverb(const Reverb&) = delete;
+    Reverb& operator=(const Reverb&) = delete;
+    Reverb(Reverb&&) = delete;
+    Reverb& operator=(Reverb&&) = delete;
 
     // -- Lifecycle --------------------------------------------------------------
 
@@ -111,8 +573,6 @@ public:
     {
         if (!spec.isValid()) return; // release-safe: keep previous state
 
-        spec_ = spec;
-
         // The convolution engine partitions at the next power of two of the
         // max block size (>= 2, matching Convolver's own normalisation), and
         // that is exactly its processing latency. Clamp before the round-up
@@ -120,26 +580,47 @@ public:
         const int blockSize = std::clamp(spec.maxBlockSize, 1, 1 << 20);
         int fftBlock = 2;
         while (fftBlock < blockSize) fftBlock <<= 1;
-        fftBlockSize_ = fftBlock;
-
-        // Delay the dry path by the same amount so dry and wet stay aligned
-        // at any mix (the wet is late by the convolver latency; without this
-        // the mix comb-filtered against the shifted dry).
-        mixer_.prepare(spec);
-        mixer_.setLatencyCompensation(fftBlockSize_);
+        // Build every potentially-throwing setup object locally. The stopped
+        // audio/setup ownership contract makes the final moves atomic as one
+        // logical transaction even though the members themselves are plain.
+        DryWetMixer<T> nextMixer;
+        nextMixer.prepare(spec);
+        nextMixer.setLatencyCompensation(fftBlock);
 
         // Pre-delay ring buffers (one per channel, max 500ms)
-        int maxDelaySamples = static_cast<int>(spec.sampleRate * 0.5) + 1;
-        preDelayBuffers_.resize(static_cast<size_t>(spec.numChannels));
-        for (auto& rb : preDelayBuffers_)
+        const int maxDelaySamples = static_cast<int>(spec.sampleRate * 0.5) + 1;
+        std::vector<RingBuffer<T>> nextPreDelayBuffers(
+            static_cast<size_t>(spec.numChannels));
+        for (auto& rb : nextPreDelayBuffers)
             rb.prepare(maxDelaySamples);
+        const int nextPreDelaySamples = calculatePreDelaySamples(spec);
 
-        updatePreDelay();
+        if (irStorage_.empty())
+        {
+            spec_ = spec;
+            fftBlockSize_ = fftBlock;
+            mixer_ = std::move(nextMixer);
+            preDelayBuffers_ = std::move(nextPreDelayBuffers);
+            preDelaySamples_.store(nextPreDelaySamples,
+                                   std::memory_order_relaxed);
+            return;
+        }
 
-        // Re-apply IR if one was already loaded. applyIR() rebuilds the bank
-        // on this (GUI) thread and publishes it atomically.
-        if (!irStorage_.empty())
-            applyIR();
+        auto candidate = buildBank(irStorage_, irLength_, irChannels_,
+                                   irSampleRate_, spec, fftBlock,
+                                   decayScale_.load(std::memory_order_relaxed),
+                                   stretch_.load(std::memory_order_relaxed));
+        const std::uint32_t latency = bankLatency(*candidate);
+        (void)bankPublisher_.publish(
+            std::move(candidate), latency,
+            [&]() noexcept {
+                spec_ = spec;
+                fftBlockSize_ = fftBlock;
+                mixer_ = std::move(nextMixer);
+                preDelayBuffers_ = std::move(nextPreDelayBuffers);
+                preDelaySamples_.store(nextPreDelaySamples,
+                                       std::memory_order_relaxed);
+            });
     }
 
     /**
@@ -150,22 +631,16 @@ public:
      * loaded IR the audio passes through untouched (and getLatency() is 0).
      * Channels beyond the prepared count pass through untouched.
      *
-     * Thread-safety: the ConvolverBank is published atomically by
-     * loadIR/applyIR. We snapshot the current bank once at the top of the
-     * block into a local shared_ptr, so even if the GUI thread publishes a
-     * replacement mid-block, the audio thread keeps using a stable bank
-     * until the block completes. No resize of a live vector, no torn reads.
+     * Thread-safety: a fixed four-slot ownership handoff adopts at most one
+     * complete bank at the block boundary. The audio path performs one atomic
+     * exchange and uses a raw pointer whose slot cannot be reclaimed until a
+     * later boundary release-retires it.
      *
      * @param buffer Audio data to process in-place.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        // Design note: the bank swap is guarded by a one-flag spinlock (see
-        // loadBank()): the only writer is loadIR(), a rare, user-initiated
-        // event, so contention is effectively zero. A manual RCU scheme
-        // would remove the spinlock at the cost of a real use-after-free
-        // hazard under racing loads; correctness wins here.
-        auto bank = loadBank();
+        ConvolverBank* const bank = bankPublisher_.adoptAtBoundary();
         if (!bank || bank->convolvers.empty()) return;
 
         const int nCh = std::min(buffer.getNumChannels(),
@@ -208,7 +683,7 @@ public:
     {
         // Reset the snapshot we can see; if a concurrent load publishes a
         // replacement bank it arrives freshly zeroed anyway.
-        if (auto bank = loadBank())
+        if (ConvolverBank* const bank = bankPublisher_.adoptAtBoundary())
             for (auto& conv : bank->convolvers)
                 conv.reset();
         for (auto& rb : preDelayBuffers_)
@@ -250,24 +725,19 @@ public:
         wav.readSamples(irBuf.toView());
         wav.close();
 
-        // Store channel 0 (or all channels)
-        irChannels_ = info.numChannels;
-        int irLen = static_cast<int>(info.numSamples);
-
-        irStorage_.resize(static_cast<size_t>(irChannels_) * static_cast<size_t>(irLen));
-        for (int ch = 0; ch < irChannels_; ++ch)
+        const int nextChannels = info.numChannels;
+        const int nextLength = static_cast<int>(info.numSamples);
+        std::vector<T> nextStorage(
+            static_cast<size_t>(nextChannels) * static_cast<size_t>(nextLength));
+        for (int ch = 0; ch < nextChannels; ++ch)
         {
             const T* src = irBuf.getChannel(ch);
-            T* dst = irStorage_.data() + static_cast<size_t>(ch) * static_cast<size_t>(irLen);
-            std::copy_n(src, irLen, dst);
+            T* dst = nextStorage.data()
+                   + static_cast<size_t>(ch) * static_cast<size_t>(nextLength);
+            std::copy_n(src, nextLength, dst);
         }
-        irLength_ = irLen;
-        irSampleRate_ = info.sampleRate;
-
-        if (spec_.sampleRate > 0)
-            applyIR();
-
-        return true;
+        return commitImpulseResponse(std::move(nextStorage), nextLength,
+                                     nextChannels, info.sampleRate);
     }
 #endif // DSPARK_NO_FILE_IO
 
@@ -298,16 +768,9 @@ public:
             || !std::isfinite(irSampleRate) || !(irSampleRate > 0.0))
             return false;
 
-        irChannels_ = 1;
-        irLength_ = length;
-        irSampleRate_ = irSampleRate;
-
-        irStorage_.assign(data, data + length);
-
-        if (spec_.sampleRate > 0)
-            applyIR();
-
-        return true;
+        std::vector<T> nextStorage(data, data + length);
+        return commitImpulseResponse(std::move(nextStorage), length, 1,
+                                     irSampleRate);
     }
 
     /**
@@ -353,10 +816,20 @@ public:
     void setDecayScale(T scale)
     {
         if (!std::isfinite(scale)) return;
-        decayScale_.store(std::clamp(scale, T(0.25), T(2)),
-                          std::memory_order_relaxed);
-        if (spec_.sampleRate > 0 && !irStorage_.empty())
-            applyIR();
+        const T next = std::clamp(scale, T(0.25), T(2));
+        if (next == decayScale_.load(std::memory_order_relaxed)) return;
+        if (spec_.sampleRate <= 0 || irStorage_.empty())
+        {
+            decayScale_.store(next, std::memory_order_relaxed);
+            return;
+        }
+        auto candidate = buildBank(irStorage_, irLength_, irChannels_,
+                                   irSampleRate_, spec_, fftBlockSize_, next,
+                                   stretch_.load(std::memory_order_relaxed));
+        const std::uint32_t latency = bankLatency(*candidate);
+        (void)bankPublisher_.publish(
+            std::move(candidate), latency,
+            [&]() noexcept { decayScale_.store(next, std::memory_order_relaxed); });
     }
 
     /**
@@ -376,10 +849,21 @@ public:
     void setStretch(T ratio)
     {
         if (!std::isfinite(ratio)) return;
-        stretch_.store(std::clamp(ratio, T(0.5), T(2)),
-                       std::memory_order_relaxed);
-        if (spec_.sampleRate > 0 && !irStorage_.empty())
-            applyIR();
+        const T next = std::clamp(ratio, T(0.5), T(2));
+        if (next == stretch_.load(std::memory_order_relaxed)) return;
+        if (spec_.sampleRate <= 0 || irStorage_.empty())
+        {
+            stretch_.store(next, std::memory_order_relaxed);
+            return;
+        }
+        auto candidate = buildBank(irStorage_, irLength_, irChannels_,
+                                   irSampleRate_, spec_, fftBlockSize_,
+                                   decayScale_.load(std::memory_order_relaxed),
+                                   next);
+        const std::uint32_t latency = bankLatency(*candidate);
+        (void)bankPublisher_.publish(
+            std::move(candidate), latency,
+            [&]() noexcept { stretch_.store(next, std::memory_order_relaxed); });
     }
 
     /** @brief Returns the current IR decay scale. */
@@ -396,8 +880,8 @@ public:
      * Lifetime of the returned reference: valid until YOUR next call to
      * getConvolver() on this object, or until the object is destroyed. It is
      * NOT invalidated by a concurrent loadIR() / setDecayScale() / setStretch()
-     * / setState() / prepare(), because this accessor pins the bank it hands a
-     * reference into (see `pinnedBank_`); the publication those calls make
+     * / setState() / prepare(), because this accessor pins the exact slot and
+     * generation it hands a reference into; the publication those calls make
      * simply is not what you are looking at any more, so what you hold is the
      * bank as of your call, kept alive for you.
      *
@@ -418,19 +902,12 @@ public:
      */
     Convolver<T>& getConvolver(int channel = 0)
     {
-        auto bank = loadBank();
+        ConvolverBank* const bank = bankPublisher_.pinLatest();
         if (!bank || bank->convolvers.empty())
-        {
-            pinnedBank_.reset();
             return fallbackConvolver_;
-        }
         const int n = static_cast<int>(bank->convolvers.size());
         channel = std::clamp(channel, 0, n - 1);
-        // Pin it: the reference below points INTO this bank, and `bank` itself
-        // dies when this function returns. The pin is what keeps the caller's
-        // reference alive past the next publication.
-        pinnedBank_ = std::move(bank);
-        return pinnedBank_->convolvers[static_cast<size_t>(channel)];
+        return bank->convolvers[static_cast<size_t>(channel)];
     }
 
     /**
@@ -447,7 +924,7 @@ public:
     /** @brief Returns true if an IR has been loaded and applied. */
     [[nodiscard]] bool isLoaded() const noexcept
     {
-        return static_cast<bool>(loadBank());
+        return bankPublisher_.isLoaded();
     }
 
     /** @brief Returns the current mix value. */
@@ -466,9 +943,7 @@ public:
      */
     [[nodiscard]] int getLatency() const noexcept
     {
-        auto bank = loadBank();
-        return (bank && !bank->convolvers.empty())
-               ? bank->convolvers.front().getLatency() : 0;
+        return bankPublisher_.latency();
     }
 
 
@@ -503,64 +978,118 @@ public:
         const bool shapeChanged =
             ds != decayScale_.load(std::memory_order_relaxed)
             || st != stretch_.load(std::memory_order_relaxed);
-        decayScale_.store(ds, std::memory_order_relaxed);
-        stretch_.store(st, std::memory_order_relaxed);
-        if (shapeChanged && spec_.sampleRate > 0 && !irStorage_.empty())
-            applyIR();
+        if (!shapeChanged) return true;
+        if (spec_.sampleRate <= 0 || irStorage_.empty())
+        {
+            decayScale_.store(ds, std::memory_order_relaxed);
+            stretch_.store(st, std::memory_order_relaxed);
+            return true;
+        }
+
+        auto candidate = buildBank(irStorage_, irLength_, irChannels_,
+                                   irSampleRate_, spec_, fftBlockSize_, ds, st);
+        const std::uint32_t latency = bankLatency(*candidate);
+        const auto result = bankPublisher_.publish(
+            std::move(candidate), latency,
+            [&]() noexcept {
+                decayScale_.store(ds, std::memory_order_relaxed);
+                stretch_.store(st, std::memory_order_relaxed);
+            });
+        if (result != Publisher::PublishResult::published) return false;
         return true;
     }
 
 protected:
+    [[nodiscard]] int calculatePreDelaySamples(const AudioSpec& spec) const noexcept
+    {
+        if (!(spec.sampleRate > 0)) return 0;
+        const int maxSamp = static_cast<int>(spec.sampleRate * 0.5);
+        const int samp = static_cast<int>(
+            static_cast<T>(spec.sampleRate)
+            * preDelayMs_.load(std::memory_order_relaxed) / T(1000));
+        return std::clamp(samp, 0, maxSamp);
+    }
+
     void updatePreDelay() noexcept
     {
         if (spec_.sampleRate > 0)
         {
             // The pre-delay ring buffers hold 500 ms; clamp so an over-range pre-delay
             // can't read past the buffer (RingBuffer::read would wrap to a wrong sample).
-            const int maxSamp = static_cast<int>(spec_.sampleRate * 0.5);
-            const int samp = static_cast<int>(static_cast<T>(spec_.sampleRate)
-                                              * preDelayMs_.load(std::memory_order_relaxed) / T(1000));
-            preDelaySamples_.store(std::clamp(samp, 0, maxSamp), std::memory_order_relaxed);
+            preDelaySamples_.store(calculatePreDelaySamples(spec_),
+                                   std::memory_order_relaxed);
         }
     }
 
-    void applyIR()
+    bool commitImpulseResponse(std::vector<T> nextStorage,
+                               int nextLength,
+                               int nextChannels,
+                               double nextSampleRate)
     {
-        if (irStorage_.empty() || irLength_ <= 0 || fftBlockSize_ <= 0) return;
+        if (spec_.sampleRate <= 0 || fftBlockSize_ <= 0)
+        {
+            irStorage_.swap(nextStorage);
+            irLength_ = nextLength;
+            irChannels_ = nextChannels;
+            irSampleRate_ = nextSampleRate;
+            return true;
+        }
 
-        int numCh = spec_.numChannels;
+        auto candidate = buildBank(nextStorage, nextLength, nextChannels,
+                                   nextSampleRate, spec_, fftBlockSize_,
+                                   decayScale_.load(std::memory_order_relaxed),
+                                   stretch_.load(std::memory_order_relaxed));
+        const std::uint32_t latency = bankLatency(*candidate);
+        const auto result = bankPublisher_.publish(
+            std::move(candidate), latency,
+            [&]() noexcept {
+                irStorage_.swap(nextStorage);
+                irLength_ = nextLength;
+                irChannels_ = nextChannels;
+                irSampleRate_ = nextSampleRate;
+            });
+        return result == Publisher::PublishResult::published;
+    }
 
-        // Build the new bank in a local shared_ptr. The old bank (if any)
-        // stays live until the last audio-thread snapshot releases it.
-        auto newBank = std::make_shared<ConvolverBank>();
-        newBank->convolvers.resize(static_cast<size_t>(numCh));
+    [[nodiscard]] std::unique_ptr<ConvolverBank> buildBank(
+        const std::vector<T>& source,
+        int sourceLength,
+        int sourceChannels,
+        double sourceSampleRate,
+        const AudioSpec& processingSpec,
+        int fftBlock,
+        T decayScale,
+        T stretchRatio) const
+    {
+        auto newBank = std::make_unique<ConvolverBank>();
+        newBank->convolvers.resize(
+            static_cast<size_t>(processingSpec.numChannels));
 
         // IR shaping controls, always applied to the stored original.
         // Stretch works by declaring a scaled source rate and letting the
         // resampling stage do the time-scaling (tape-speed semantics).
-        const double dScale =
-            static_cast<double>(decayScale_.load(std::memory_order_relaxed));
-        const double stretch =
-            static_cast<double>(stretch_.load(std::memory_order_relaxed));
+        const double dScale = static_cast<double>(decayScale);
+        const double stretch = static_cast<double>(stretchRatio);
         const bool doShape = std::abs(dScale - 1.0) > 1e-6;
-        const double effIrRate = irSampleRate_ / std::max(stretch, 0.01);
+        const double effIrRate = sourceSampleRate / std::max(stretch, 0.01);
 
         std::vector<T> shaped;   // lazy decay-shaped copy of one IR channel
         int shapedCh = -1;
 
-        for (int ch = 0; ch < numCh; ++ch)
+        for (int ch = 0; ch < processingSpec.numChannels; ++ch)
         {
             // Pick IR channel: use corresponding channel if available, else mono (ch 0)
-            int irCh = (ch < irChannels_) ? ch : 0;
-            const T* irData = irStorage_.data()
-                            + static_cast<size_t>(irCh) * static_cast<size_t>(irLength_);
-            int irLen = irLength_;
+            const int irCh = (ch < sourceChannels) ? ch : 0;
+            const T* irData = source.data()
+                            + static_cast<size_t>(irCh)
+                            * static_cast<size_t>(sourceLength);
+            int irLen = sourceLength;
 
             if (doShape)
             {
                 if (shapedCh != irCh)
                 {
-                    shaped = shapeDecay(irData, irLength_, dScale);
+                    shaped = shapeDecay(irData, sourceLength, dScale);
                     shapedCh = irCh;
                 }
                 if (!shaped.empty())
@@ -573,10 +1102,10 @@ protected:
             auto& conv = newBank->convolvers[static_cast<size_t>(ch)];
 
             // Resample if the (stretch-adjusted) IR rate differs from the engine
-            if (std::abs(effIrRate - spec_.sampleRate) > 1.0)
+            if (std::abs(effIrRate - processingSpec.sampleRate) > 1.0)
             {
                 Resampler<T> resampler;
-                resampler.prepare(effIrRate, spec_.sampleRate);
+                resampler.prepare(effIrRate, processingSpec.sampleRate);
                 // Size from the resampler's own bound (INT_MAX-safe): the old
                 // floor(n*ratio)+1 arithmetic could overflow the int cast with
                 // an extreme rate ratio.
@@ -585,17 +1114,22 @@ protected:
                 int produced = resampler.processBlock(irData, irLen,
                                                       resampled.data());
 
-                conv.prepare(fftBlockSize_, resampled.data(), produced);
+                conv.prepare(fftBlock, resampled.data(), produced);
             }
             else
             {
-                conv.prepare(fftBlockSize_, irData, irLen);
+                conv.prepare(fftBlock, irData, irLen);
             }
         }
+        return newBank;
+    }
 
-        // Atomic release-store: any subsequent acquire-load in processBlock
-        // will observe the fully-constructed bank.
-        storeBank(newBank);
+    [[nodiscard]] static std::uint32_t bankLatency(
+        const ConvolverBank& bank) noexcept
+    {
+        if (bank.convolvers.empty()) return 0u;
+        return static_cast<std::uint32_t>(
+            std::max(0, bank.convolvers.front().getLatency()));
     }
 
     /**
@@ -697,14 +1231,6 @@ protected:
         return out;
     }
 
-    // Holds the current convolver set. Published by applyIR() and snapshotted
-    // by the audio thread at the top of processBlock, so an in-flight block
-    // keeps a stable bank alive.
-    struct ConvolverBank
-    {
-        std::vector<Convolver<T>> convolvers;
-    };
-
     AudioSpec spec_ {};
     int fftBlockSize_ = 0; ///< Convolver partition size = engine latency (set in prepare()).
     std::atomic<T> mix_ { T(0.3) };
@@ -719,44 +1245,7 @@ protected:
     int irChannels_ = 0;
     double irSampleRate_ = 0;
 
-    // Processing (audio-thread visible state).
-    //
-    // Portable stand-in for std::atomic<std::shared_ptr>: libc++ (macOS,
-    // Emscripten) does not ship the C++20 specialization. A one-flag
-    // spinlock guards only the pointer copy/swap (nanoseconds on the audio
-    // thread against one UI-initiated store per IR load), preserving the
-    // exact snapshot semantics: an in-flight processBlock keeps its own
-    // shared_ptr alive, so audio never reads a half-freed bank.
-    // HONEST CAVEAT (known, accepted as minor): the previous bank is normally
-    // released on the UI thread by storeBank(), BUT in the rare interleaving
-    // where the audio thread had already snapshotted it, storeBank() only drops
-    // to refcount 1 and the FINAL release runs on the audio thread when the
-    // block's local shared_ptr expires -- i.e. an IR hot-swap concurrent with a
-    // block can free the old bank's FFT buffers on the audio thread. This is
-    // load-time only (never in steady state) and does not corrupt audio; a
-    // fully wait-free reclaim (hazard pointer / retire list) is backlogged.
-    [[nodiscard]] std::shared_ptr<ConvolverBank> loadBank() const noexcept
-    {
-        while (bankLock_.test_and_set(std::memory_order_acquire)) {}
-        auto copy = bankPtr_;
-        bankLock_.clear(std::memory_order_release);
-        return copy;
-    }
-    void storeBank(std::shared_ptr<ConvolverBank> next) noexcept
-    {
-        while (bankLock_.test_and_set(std::memory_order_acquire)) {}
-        bankPtr_.swap(next);
-        bankLock_.clear(std::memory_order_release);
-        // `next` (the previous bank) destructs here, outside the lock.
-    }
-
-    mutable std::atomic_flag bankLock_ = ATOMIC_FLAG_INIT;
-    std::shared_ptr<ConvolverBank> bankPtr_;
-    /// Keeps alive whatever bank getConvolver() last handed a reference into.
-    /// GUI thread only, like getConvolver() itself; never read by the audio
-    /// thread. Costs one retired bank's memory until the next call, which is
-    /// the price of the accessor returning a reference at all.
-    std::shared_ptr<ConvolverBank> pinnedBank_;
+    Publisher bankPublisher_;
     std::vector<RingBuffer<T>> preDelayBuffers_;
     DryWetMixer<T> mixer_;
     Convolver<T> fallbackConvolver_; ///< Inert engine for getConvolver() with no bank.

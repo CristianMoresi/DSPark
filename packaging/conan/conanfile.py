@@ -1,4 +1,4 @@
-# DSPark Conan recipe — submit to conan-center-index once a release tag exists.
+# DSPark Conan recipe - submit to conan-center-index once a release tag exists.
 from conan import ConanFile
 from conan.tools.files import copy, get
 from conan.tools.layout import basic_layout

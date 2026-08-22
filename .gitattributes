@@ -10,3 +10,6 @@
 *.png binary
 *.wav binary
 *.mp3 binary
+*.flac binary
+*.pcm binary
+*.mid binary

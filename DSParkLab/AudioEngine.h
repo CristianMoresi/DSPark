@@ -1,4 +1,4 @@
-// DSParkLab — Audio Engine
+// DSParkLab - Audio Engine
 // File loading (WAV/MP3), real-time playback via miniaudio, effect processing.
 //
 // Threading
@@ -87,7 +87,7 @@ public:
 
     ~AudioEngine()
     {
-        // Wait for any in-flight load before tearing down the device — the
+        // Wait for any in-flight load before tearing down the device - the
         // worker thread still holds references to staging buffers owned by
         // this object.
         if (loadThread_.joinable()) loadThread_.join();
@@ -103,10 +103,10 @@ public:
     //
     // Async load architecture:
     //
-    //  GUI thread → loadFile(path) → spawns worker → returns immediately.
-    //  Worker thread → opens file, fully decodes into staging buffers,
+    //  GUI thread -> loadFile(path) -> spawns worker -> returns immediately.
+    //  Worker thread -> opens file, fully decodes into staging buffers,
     //                  then sets loadState_ to Ready or Failed.
-    //  GUI thread → calls update() each frame; if state == Ready, swap
+    //  GUI thread -> calls update() each frame; if state == Ready, swap
     //               staging into active buffers and re-init the audio
     //               device. While loading, fileSamples_ is held at 0 so
     //               the audio callback outputs silence.

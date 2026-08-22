@@ -1,4 +1,4 @@
-// DSPark — VST3 smoke host
+// DSPark - VST3 smoke host
 //
 // Loads a .vst3 module through the public C ABI exactly like a DAW would and
 // drives the full lifecycle: factory -> class info -> instantiation ->

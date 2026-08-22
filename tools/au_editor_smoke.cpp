@@ -1,10 +1,10 @@
-// DSPark — AUv2 WebView editor smoke host (macOS)
+// DSPark - AUv2 WebView editor smoke host (macOS)
 //
 // Exercises the Cocoa editor contract exactly like an AU host: reads
 // kAudioUnitProperty_CocoaUI, resolves the announced view factory class,
 // asks it for the editor NSView, verifies the embedded WKWebView completes
 // the JS bridge handshake (through the DSPARK_WEBVIEW_LOG diagnostic trace),
-// then tears down in BOTH orders — view before AudioUnit and AudioUnit
+// then tears down in BOTH orders - view before AudioUnit and AudioUnit
 // before view. Plugins without an editor are checked to NOT announce one.
 // Exit code 0 means every step behaved. Companion to vst3/clap_smoke_host;
 // auval remains the format-conformance gate.
@@ -100,7 +100,7 @@ void poolDrain(ObjId pool)
 // The editor layer traces its host interaction to $TMPDIR/DSParkWebView.log
 // when DSPARK_WEBVIEW_LOG is set. The "page metric" lines are emitted only
 // after the page's JS bridge completed the ready handshake with the native
-// side — the strongest headless proof that the whole WKWebView pipeline
+// side - the strongest headless proof that the whole WKWebView pipeline
 // (engine, page load, script message channel, eval downlink) works.
 
 void logPath(char* out, size_t cap)
@@ -227,7 +227,7 @@ int main(int argc, char** argv)
     NSApplicationLoad();
 
     // Host contract: after reading the property the class must resolve
-    // (NSClassFromString) — the plugin registers it when serving CocoaUI.
+    // (NSClassFromString) - the plugin registers it when serving CocoaUI.
     Class factoryClass = objc_getClass(className);
     expect(factoryClass != nullptr, "factory class resolves");
     if (factoryClass == nullptr) return 1;

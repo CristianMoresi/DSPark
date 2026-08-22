@@ -72,7 +72,7 @@ namespace dspark {
  * inner loops (the recursive filter state rules out SIMD vectorization).
  *
  * The filter core (coefficients, history and recursion) is always double
- * precision, independent of the sample type: see the @file header for the
+ * precision, independent of the sample type: see the file-level documentation for the
  * measurements behind that decision. Rejection is therefore rate-independent
  * - a DC-free signal picks up less than 1e-9 of DC and a steady DC input
  * decays to exactly zero at every rate from 44.1 kHz to 768 kHz.

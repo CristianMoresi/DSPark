@@ -1,4 +1,4 @@
-// DSParkLab — Effect Slot abstraction
+// DSParkLab - Effect Slot abstraction
 // Type-erased wrapper for any DSPark processor with parameter descriptors.
 //
 // Threading
@@ -114,7 +114,7 @@ public:
     std::function<void()>                                resetFn;
     std::function<void(int, float)>                      setParamFn;
 
-    // Optional metering getter — returns gain reduction in dB (positive value
+    // Optional metering getter - returns gain reduction in dB (positive value
     // means the processor is attenuating the signal by that amount).
     // Leave empty if the processor does not expose gain reduction.
     std::function<float()> gainReductionDbFn;

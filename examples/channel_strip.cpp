@@ -1,5 +1,5 @@
-// DSPark example — real-time style vocal channel strip
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark example - real-time style vocal channel strip
+// Copyright (c) 2026 Cristian Moresi - MIT License
 //
 // Shows the real-time usage pattern: prepare() everything up front, then a
 // block loop with zero allocation, exactly like an audio callback. The chain
@@ -96,7 +96,7 @@ int main()
         meter.processBlock(view);
     }
 
-    std::printf("processed %.1f s — momentary %.1f LUFS, integrated %.1f LUFS, true peak %.2f dBTP\n",
+    std::printf("processed %.1f s - momentary %.1f LUFS, integrated %.1f LUFS, true peak %.2f dBTP\n",
                 totalBlocks * kBlock / kRate,
                 static_cast<double>(meter.getMomentaryLUFS()),
                 static_cast<double>(meter.getIntegratedLUFS()),

@@ -1,4 +1,4 @@
-// DSPark plugin template — every contract method, present and explained.
+// DSPark plugin template - every contract method, present and explained.
 //
 // This is the "kitchen sink" companion to docs/plugins.md: a working plugin
 // that implements EVERY optional method the format wrappers can detect, with
@@ -7,7 +7,7 @@
 // It inherits dspark::plugin::PluginBase<T>: the base defines the WHOLE
 // optional contract with safe defaults (latency 0, no tail, nothing to
 // reset, no extra state), so the full menu of overridable methods is one
-// Go-to-Definition away and your IDE autocompletes it — delete any override
+// Go-to-Definition away and your IDE autocompletes it - delete any override
 // below and the plugin still builds, falling back to the default. A
 // free-standing struct without the base works identically if you prefer
 // (see examples/plugin_saturator/).
@@ -29,7 +29,7 @@
 struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
 {
     // =========================================================================
-    // REQUIRED 1/5 — identity. productId is FOREVER: it derives the VST3
+    // REQUIRED 1/5 - identity. productId is FOREVER: it derives the VST3
     // class UID and is the CLAP id. Changing it orphans every saved session.
     // =========================================================================
     static constexpr auto descriptor = dspark::plugin::Descriptor {
@@ -43,7 +43,7 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     };
 
     // =========================================================================
-    // REQUIRED 2/5 — the parameter table. The TEXT IDS are the stable
+    // REQUIRED 2/5 - the parameter table. The TEXT IDS are the stable
     // identity (state + automation). Reorder or insert freely in future
     // versions; never rename an id. Three kinds:
     //   param(...)            continuous, with unit for host display
@@ -57,17 +57,17 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
         dspark::plugin::param ("lookahead","Lookahead",  0.5f, 10.0f,  5.0f, "ms"));
 
     // =========================================================================
-    // OPTIONAL — factoryPresets. One PLAIN value per parameter, in table
+    // OPTIONAL - factoryPresets. One PLAIN value per parameter, in table
     // order. Every format publishes them natively: a VST3 program list with
     // a program-change parameter, CLAP preset-load + preset-discovery, AU
-    // factory presets — so the host's own preset browser offers them.
+    // factory presets - so the host's own preset browser offers them.
     // =========================================================================
     static constexpr auto factoryPresets = dspark::plugin::presets(
         dspark::plugin::preset("Subtle Glue", 0.2f, -1.0f, 1.0f, 5.0f),
         dspark::plugin::preset("Big Hall",    0.6f, -3.0f, 1.0f, 8.0f));
 
     // =========================================================================
-    // REQUIRED 3/5 — prepare. Main thread, before audio, allocation allowed.
+    // REQUIRED 3/5 - prepare. Main thread, before audio, allocation allowed.
     // Maps to VST3 setActive(true) and CLAP activate.
     // =========================================================================
     void prepare(const dspark::AudioSpec& spec)
@@ -83,7 +83,7 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     }
 
     // =========================================================================
-    // REQUIRED 4/5 — setParameter. CALLED FROM ANY THREAD (host automation
+    // REQUIRED 4/5 - setParameter. CALLED FROM ANY THREAD (host automation
     // arrives on the audio thread, generic-UI edits on the main thread).
     // DSPark setters are atomic and smoothed by contract, so forwarding is
     // all you do here. Index = position in `parameters`. Values are PLAIN
@@ -102,7 +102,7 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     }
 
     // =========================================================================
-    // REQUIRED 5/5 — processBlock. Audio thread: no allocation, no locks.
+    // REQUIRED 5/5 - processBlock. Audio thread: no allocation, no locks.
     // Exactly the DSPark contract you already know.
     // =========================================================================
     void processBlock(dspark::AudioBufferView<float> io) noexcept
@@ -112,7 +112,7 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     }
 
     // =========================================================================
-    // OPTIONAL — getLatency. Implement when your chain delays the signal
+    // OPTIONAL - getLatency. Implement when your chain delays the signal
     // (lookahead limiter, linear-phase EQ, oversampling, FFT processing).
     // The host shifts every other track to compensate; report it accurately
     // or your users hear phasing on parallel paths. Read after prepare()
@@ -127,10 +127,10 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     }
 
     // =========================================================================
-    // OPTIONAL — setTransport. The host timeline lands here once per block
+    // OPTIONAL - setTransport. The host timeline lands here once per block
     // (audio thread): tempo, musical position, play state, loop points.
     // This demo only stores it; a tempo-synced delay would derive its time
-    // from transport.samplesPerBeat(sampleRate). Check the *Valid flags —
+    // from transport.samplesPerBeat(sampleRate). Check the *Valid flags -
     // not every host provides every field.
     // =========================================================================
     void setTransport(const dspark::plugin::TransportInfo& transport) noexcept
@@ -139,7 +139,7 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     }
 
     // =========================================================================
-    // OPTIONAL — setOfflineRendering. Hosts flip it for non-realtime
+    // OPTIONAL - setOfflineRendering. Hosts flip it for non-realtime
     // bounces: the moment to raise quality/cost trade-offs (oversampling,
     // longer lookahead). Called outside the audio thread.
     // =========================================================================
@@ -149,7 +149,7 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     }
 
     // =========================================================================
-    // OPTIONAL — getTailSeconds. Implement when sound continues after the
+    // OPTIONAL - getTailSeconds. Implement when sound continues after the
     // input stops (reverbs, delays): hosts keep processing you that long
     // instead of cutting the tail. Maps to VST3 getTailSamples and the CLAP
     // tail extension.
@@ -160,7 +160,7 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     }
 
     // =========================================================================
-    // OPTIONAL — reset. Implement when you keep history that should clear
+    // OPTIONAL - reset. Implement when you keep history that should clear
     // on transport jumps (delay lines, envelopes, reverb tails). Invoked by
     // CLAP hosts; VST3 hosts re-activate (prepare runs again) instead.
     // =========================================================================
@@ -171,8 +171,8 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     }
 
     // =========================================================================
-    // OPTIONAL — getState/setState. The wrapper ALREADY saves and restores
-    // every parameter by its stable id — most plugins should delete this
+    // OPTIONAL - getState/setState. The wrapper ALREADY saves and restores
+    // every parameter by its stable id - most plugins should delete this
     // pair. Implement it only for state BEYOND the parameters: learned noise
     // profiles, user-loaded IRs, editor layout... DSPark's StateBlob gives
     // you versioned, tolerant serialization for free. This demo persists one
@@ -195,7 +195,7 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
         return true;
     }
 
-    // OPTIONAL — hasEditor: inherited from PluginBase as false. Hosts show
+    // OPTIONAL - hasEditor: inherited from PluginBase as false. Hosts show
     // their generic parameter UI. The WebView editor layer will claim this
     // hook; see docs/plugins.md.
 

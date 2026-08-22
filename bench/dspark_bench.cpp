@@ -1,5 +1,5 @@
-// DSPark — Reproducible micro-benchmarks
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark - Reproducible micro-benchmarks
+// Copyright (c) 2026 Cristian Moresi - MIT License
 //
 // Zero-dependency benchmark harness for the DSP hot paths. Prints a Markdown
 // table; numbers are machine-dependent, so commit them only together with the
@@ -80,7 +80,7 @@ int main()
     const Source src;
     const dspark::AudioSpec spec { kRate, kBlock, 2 };
 
-    std::printf("DSPark micro-benchmarks — block %d, %.0f Hz, single thread\n", kBlock, kRate);
+    std::printf("DSPark micro-benchmarks - block %d, %.0f Hz, single thread\n", kBlock, kRate);
 #if defined(_MSC_VER)
     std::printf("Compiler: MSVC %d\n\n", _MSC_VER);
 #elif defined(__clang__)

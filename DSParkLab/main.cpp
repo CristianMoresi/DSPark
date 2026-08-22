@@ -1,4 +1,4 @@
-// DSParkLab — Main entry point
+// DSParkLab - Main entry point
 // Win32 window + D3D11 + Dear ImGui + AudioEngine main loop.
 
 #ifndef WIN32_LEAN_AND_MEAN

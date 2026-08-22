@@ -1,9 +1,9 @@
-// DSPark example — WebView editor developed as SEPARATE web files.
+// DSPark example - WebView editor developed as SEPARATE web files.
 //
 // The interface lives in ui/editor.html + ui/editor.css + ui/editor.js,
 // like any web project. At build time dspark_add_plugin(EDITOR_HTML ...)
 // inlines them into one generated header (see CMakeLists.txt), so the
-// shipped binary stays fully self-contained. Edit a ui/ file and rebuild —
+// shipped binary stays fully self-contained. Edit a ui/ file and rebuild -
 // or point editorDevFile() at the page to skip even the rebuild while
 // iterating (see docs/plugins.md).
 //

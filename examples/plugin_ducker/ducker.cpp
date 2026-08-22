@@ -1,4 +1,4 @@
-// DSPark example — a sidechain ducker: the classic "music dips when the
+// DSPark example - a sidechain ducker: the classic "music dips when the
 // voice speaks" compressor, and the reference for the sidechain contract.
 //
 // Implementing the TWO-BUFFER processBlock is all it takes: every format
@@ -6,7 +6,7 @@
 // CLAP non-main port, an AU input element). Route a voice or kick track
 // into it in your DAW and the compressor's detector follows THAT signal
 // while the gain reduction lands on the main audio. When the host has
-// nothing routed, the wrapper hands the plugin silence — no branches here.
+// nothing routed, the wrapper hands the plugin silence - no branches here.
 //
 // Build (Windows):
 //   cl /std:c++20 /O2 /LD /EHsc /I ..\.. ducker.cpp /Fe:DSParkDucker.vst3

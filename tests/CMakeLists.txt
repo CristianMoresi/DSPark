@@ -4,9 +4,10 @@
 #   cmake --build build
 #   ctest --test-dir build --output-on-failure
 #
-# Four targets:
-#   dspark_tests            the suite proper (830+ cases, zero dependencies)
+# Five targets:
+#   dspark_tests            the ordinary 885-case suite (zero dependencies)
 #   dspark_alloc_failure    allocation-failure injection, deliberately apart
+#   dspark_reverb_publication fixed-operation ownership/publication contract
 #   dspark_standalone       compile gate: umbrella header alone, float + double
 #   dspark_smoke            every effect at defaults, checked for NaN/Inf/runaway
 
@@ -63,9 +64,10 @@ target_compile_definitions(dspark_tests PRIVATE
 # the one case that needs it and leaves the suite with full sanitizer coverage.
 # It reuses main.cpp: the harness registry is per-binary.
 add_executable(dspark_alloc_failure main.cpp TestAllocFailure.cpp)
+add_executable(dspark_reverb_publication TestReverbPublication.cpp)
 
 set(dspark_test_targets dspark_tests dspark_alloc_failure
-                        dspark_standalone dspark_smoke)
+                        dspark_reverb_publication dspark_standalone dspark_smoke)
 
 foreach(target IN LISTS dspark_test_targets)
     target_link_libraries(${target} PRIVATE dspark::dspark)
@@ -85,6 +87,7 @@ endforeach()
 add_test(NAME suite         COMMAND dspark_tests
          WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 add_test(NAME alloc_failure COMMAND dspark_alloc_failure)
+add_test(NAME reverb_publication COMMAND dspark_reverb_publication)
 add_test(NAME smoke         COMMAND dspark_smoke)
 add_test(NAME standalone    COMMAND dspark_standalone)
 
@@ -96,6 +99,22 @@ add_test(NAME dependent_comparisons
 add_test(NAME dependent_comparisons_self_test
     COMMAND ${Python3_EXECUTABLE}
             ${PROJECT_SOURCE_DIR}/tools/check_dependent_comparisons.py --self-test
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+add_test(NAME public_text_policy
+    COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tools/check_public_text.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+add_test(NAME public_text_policy_self_test
+    COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tools/check_public_text.py --self-test
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+add_test(NAME m018_global_corrections
+    COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tools/verify_m018_global_corrections.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+add_test(NAME generated_docs_self_test
+    COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tools/check_generated_docs.py --self-test
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_test(NAME header_missing_include_control

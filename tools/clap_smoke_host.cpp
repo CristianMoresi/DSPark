@@ -1,4 +1,4 @@
-// DSPark — CLAP smoke host
+// DSPark - CLAP smoke host
 //
 // Loads a .clap module through the public C ABI like a DAW would and drives
 // the full lifecycle: entry -> factory -> descriptor -> instantiation ->
@@ -742,7 +742,7 @@ int main(int argc, char** argv)
 
     // --- gui extension (WebView editor layer; optional) -------------------------------
     // Contract-only: create/inspect/destroy without set_parent, so no real
-    // window or web engine is needed — this also runs on headless CI.
+    // window or web engine is needed - this also runs on headless CI.
     if (const auto* gui = static_cast<const clap_plugin_gui_t*>(
             plugin->get_extension(plugin, CLAP_EXT_GUI)))
     {

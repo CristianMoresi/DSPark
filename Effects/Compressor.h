@@ -1265,6 +1265,8 @@ protected:
 
     /**
      * @brief Level-dependent effective ratio of the character (Varimu grows).
+     * @param charType Compressor character whose ratio law is applied.
+     * @param ratio Configured compression ratio.
      * @param excessDb Input level above the threshold in dB.
      */
     [[nodiscard]] static T effectiveRatioFor(Character charType, T ratio, T excessDb) noexcept
@@ -1294,6 +1296,7 @@ protected:
      * @param knee Soft-knee width parameter in dB.
      * @param charType Applies the character's knee floor and ratio law.
      * @param modeType Upward or Downward processing mode.
+     * @param guardDb Sustained level used to suppress upward gain in silence.
      * @return Target gain reduction in Decibels.
      */
     [[nodiscard]] T computeGain(T inputDb, T thresh, T ratio, T knee, Character charType, Mode modeType,
@@ -1423,6 +1426,10 @@ protected:
      * 0.1 dB of the exact curve).
      *
      * @param outDb Detected output level (dB).
+     * @param thresh Threshold parameter in dB.
+     * @param ratio Configured compression ratio.
+     * @param knee Soft-knee width parameter in dB.
+     * @param charType Compressor character whose static law is applied.
      */
     [[nodiscard]] FeedbackLaw computeGainFeedback(T outDb, T thresh, T ratio, T knee,
                                                   Character charType) const noexcept
@@ -1465,6 +1472,10 @@ protected:
      * @param inDb Input level in dB (post link and sidechain filter).
      * @param k Explicit part of the ballistics step (coeff-weighted history).
      * @param effB Implicit weight: (1 - coeff) times the fast-stage blend.
+     * @param thresh Threshold parameter in dB.
+     * @param ratio Configured compression ratio.
+     * @param knee Soft-knee width parameter in dB.
+     * @param charType Compressor character whose static law is applied.
      */
     [[nodiscard]] FeedbackSolve solveFeedbackGain(T inDb, T k, T effB, T thresh,
                                                   T ratio, T knee, Character charType) const noexcept
@@ -1508,6 +1519,11 @@ protected:
      * the inline note), and the memory stage tracks the real static curve.
      *
      * @param inDb Input level in dB (post link and sidechain filter).
+     * @param ch Processing channel index.
+     * @param charType Compressor character whose ballistics are applied.
+     * @param thresh Threshold parameter in dB.
+     * @param ratio Configured compression ratio.
+     * @param knee Soft-knee width parameter in dB.
      */
     [[nodiscard]] T applyBallisticsFeedbackImplicit(T inDb, int ch, Character charType,
                                                     T thresh, T ratio, T knee) noexcept

@@ -1,4 +1,4 @@
-// DSParkLab — Effect Registry
+// DSParkLab - Effect Registry
 // Factory functions that create EffectSlot wrappers for all DSPark processors.
 
 #pragma once
@@ -49,7 +49,7 @@ inline EffectSlot makeFilterEngine()
             case 2: p->setResonance(v); break;
             case 3: p->setGain(v); break;
             case 4: {
-                // Slope only applies to LP / HP — for other shapes setShape()
+                // Slope only applies to LP / HP - for other shapes setShape()
                 // already pinned numStages_ = 1, so this is a no-op there.
                 int slope = std::clamp(static_cast<int>(v), 6, 48);
                 // Round to the nearest 6 dB/oct step so cascade size matches.
@@ -74,7 +74,7 @@ inline EffectSlot makeFilterEngine()
         BC st[5]; int ns = 0;
         auto add = [&](const BC& c){ if (ns < 5) st[ns++] = c; };
         switch (type) {
-            case 0: case 1: {  // LowPass / HighPass — Butterworth cascade for the slope
+            case 0: case 1: {  // LowPass / HighPass - Butterworth cascade for the slope
                 auto info = FE::cascadeForSlope(slope, Q);  // user Q scales the final stage, like the engine
                 const bool lp = (type == 0);
                 if (info.hasFirstOrder) add(lp ? BC::makeFirstOrderLowPass(sr, freq) : BC::makeFirstOrderHighPass(sr, freq));
@@ -106,7 +106,7 @@ inline EffectSlot makeEqualizer()
     EffectSlot s;
     s.name = "Equalizer"; s.category = "Filters";
     // Per band: Freq, Gain, Q, Type, Slope. Type/Slope expose the full
-    // framework BandType set (shelves, cuts, notch, bandpass, tilt) — they
+    // framework BandType set (shelves, cuts, notch, bandpass, tilt) - they
     // were missing from the registry, leaving the EQ bells-only.
     static constexpr float kDefFreq[4] = { 100, 500, 2000, 8000 };
     for (int b = 0; b < 4; ++b)
@@ -322,7 +322,7 @@ inline EffectSlot makeLimiter()
     s.addToggle("Adaptive Release", true);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p, inputGainDb](auto b) {
-        // Input Gain MUST be applied BEFORE the limiter — otherwise
+        // Input Gain MUST be applied BEFORE the limiter - otherwise
         // amplifying post-limit would exceed the ceiling and the limiter
         // would never engage for sub-threshold signals.
         float gDb = *inputGainDb;
@@ -489,7 +489,7 @@ inline EffectSlot makeSaturation()
     s.processFn = [p, osWanted, osApplied](auto b) {
         const int want = osWanted->load(std::memory_order_relaxed);
         if (want != osApplied->load(std::memory_order_relaxed)) {
-            p->setOversampling(want);   // reallocates — safe here (audio thread, no concurrent process)
+            p->setOversampling(want);   // reallocates - safe here (audio thread, no concurrent process)
             osApplied->store(want, std::memory_order_relaxed);
         }
         p->process(b);
@@ -538,7 +538,7 @@ inline EffectSlot makeClipper()
         const int want = osWanted->load(std::memory_order_relaxed);
         if (want != osApplied->load(std::memory_order_relaxed) && spec->sampleRate > 0) {
             p->setOversampling(want);
-            p->prepare(*spec);          // rebuilds filters — safe here (audio thread)
+            p->prepare(*spec);          // rebuilds filters - safe here (audio thread)
             osApplied->store(want, std::memory_order_relaxed);
         }
         p->processBlock(b);
@@ -781,7 +781,7 @@ inline EffectSlot makeAlgorithmicReverb()
     s.addSlider("Early Level", -20, 6, 0, "dB");             // 15
     s.addSlider("Late Level", -20, 6, 0, "dB");              // 16
     s.addSlider("Width", 0, 2, 1, "");                        // 17
-    s.addSlider("Mix", 0, 1, 0, "");                          // 18 — default 0 = dry only
+    s.addSlider("Mix", 0, 1, 0, "");                          // 18 - default 0 = dry only
     s.addChoice("Quality", {"Full","Eco"}, 0);                // 19 (Eco = reduced engine)
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
@@ -1098,9 +1098,9 @@ inline EffectSlot makeConvolutionReverb()
 
     EffectSlot s;
     s.name = "Convolution Reverb"; s.category = "Spatial";
-    s.addSlider("Decay", 0.2f, 6.0f, 1.5f, "s");   // 0 — (re)builds the synthetic IR
+    s.addSlider("Decay", 0.2f, 6.0f, 1.5f, "s");   // 0 - (re)builds the synthetic IR
     s.addSlider("Pre-Delay", 0, 100, 10, "ms");    // 1
-    s.addSlider("Mix", 0, 1, 0, "");               // 2 — default dry
+    s.addSlider("Mix", 0, 1, 0, "");               // 2 - default dry
     s.addSlider("Decay Scale", 0.25f, 2.0f, 1.0f, "x"); // 3 (reshapes loaded/synthetic IR)
     s.addSlider("Stretch", 0.5f, 2.0f, 1.0f, "x");      // 4 (tape-speed style)
     s.prepareFn = [p, sr, fileLoaded, regenIR](auto& sp) {
@@ -1111,7 +1111,7 @@ inline EffectSlot makeConvolutionReverb()
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, decayS, regenIR](int i, float v) {
         switch (i) {
-            case 0: *decayS = v; regenIR(); break;   // switch to synthetic IR (atomic publish — safe live)
+            case 0: *decayS = v; regenIR(); break;   // switch to synthetic IR (atomic publish - safe live)
             case 1: p->setPreDelay(v); break;
             case 2: p->setMix(v); break;
             case 3: p->setDecayScale(v); break;      // IR rebuild, atomic publish (safe live)

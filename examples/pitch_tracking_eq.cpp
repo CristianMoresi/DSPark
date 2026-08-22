@@ -1,5 +1,5 @@
-// DSPark example — pitch-tracking EQ (low-cut that follows the voice)
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark example - pitch-tracking EQ (low-cut that follows the voice)
+// Copyright (c) 2026 Cristian Moresi - MIT License
 //
 // A high-pass filter whose cutoff rides just below the tonic of the incoming
 // voice: low frequencies are cleaned as aggressively as possible without ever
@@ -10,7 +10,7 @@
 // PitchFollower wraps the raw PitchDetector with everything this use case
 // needs: readings outside the range or below the confidence threshold never
 // move the cutoff (consonants and silence hold the last pitch), octave errors
-// are folded back, and the output glides in semitones — so the filter moves
+// are folded back, and the output glides in semitones - so the filter moves
 // musically, with no zipper (FilterEngine::setFrequency also smooths
 // internally and is thread-safe).
 //

@@ -1,5 +1,5 @@
-// DSPark example — offline WAV processing
-// Copyright (c) 2026 Cristian Moresi — MIT License
+// DSPark example - offline WAV processing
+// Copyright (c) 2026 Cristian Moresi - MIT License
 //
 // The simplest end-to-end DSPark program: read a WAV, run a small mastering
 // chain (EQ -> compressor -> true-peak limiter), write the result as 24-bit
@@ -27,7 +27,7 @@ int main(int argc, char** argv)
         return 1;
     }
     const dspark::AudioFileInfo info = in.getInfo();
-    std::printf("in : %s — %.0f Hz, %u ch, %lld frames\n",
+    std::printf("in : %s - %.0f Hz, %u ch, %lld frames\n",
                 argv[1], info.sampleRate, info.numChannels,
                 static_cast<long long>(info.numSamples));
 
@@ -93,7 +93,7 @@ int main(int argc, char** argv)
     in.close();
     out.close();
 
-    std::printf("out: %s — integrated %.1f LUFS, true peak %.2f dBTP\n",
+    std::printf("out: %s - integrated %.1f LUFS, true peak %.2f dBTP\n",
                 argv[2],
                 static_cast<double>(meter.getIntegratedLUFS()),
                 static_cast<double>(meter.getTruePeakDb()));

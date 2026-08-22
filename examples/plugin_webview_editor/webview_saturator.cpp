@@ -1,17 +1,17 @@
-// DSPark example — a VST3/CLAP saturator with a custom WebView editor.
+// DSPark example - a VST3/CLAP saturator with a custom WebView editor.
 //
 // The GUI is plain HTML/CSS/JS embedded in this file and served through
 // DSPark's WebView editor layer: one UI codebase for every format, rendered
 // by the platform web engine (WebView2 on Windows, WKWebView on macOS,
-// WebKitGTK on Linux/X11 — dlopen'd at runtime, generic host UI where it is
-// missing). The page talks to the DSP through the injected `dspark` bridge —
+// WebKitGTK on Linux/X11 - dlopen'd at runtime, generic host UI where it is
+// missing). The page talks to the DSP through the injected `dspark` bridge -
 // same stable text ids as state and automation.
 //
 // Build (Windows):
 //   cl /std:c++20 /O2 /LD /EHsc /I ..\.. webview_saturator.cpp /Fe:DSParkWebSaturator.vst3
-// Build (macOS — -lobjc for the WKWebView glue):
+// Build (macOS - -lobjc for the WKWebView glue):
 //   clang++ -std=c++20 -O2 -fPIC -shared -lobjc -I ../.. webview_saturator.cpp -o DSParkWebSaturator
-// Build (Linux — compiles and runs with the generic host UI):
+// Build (Linux - WebKitGTK/X11 editor, with runtime generic-UI fallback):
 //   g++ -std=c++20 -O2 -fPIC -shared -I ../.. webview_saturator.cpp -o DSParkWebSaturator.vst3
 //
 // Rename/copy the same binary to .clap for the CLAP build, or use
@@ -88,10 +88,10 @@ private:
 };
 
 // The page below shows the whole bridge surface:
-//   dspark.onReady(params)  — parameter table + current values (handshake)
-//   dspark.onParam(id, cb)  — DSP/automation -> UI (knobs follow the host)
-//   dspark.setParam(id, v)  — UI -> DSP, plain values
-//   dspark.beginEdit/endEdit — automation gestures around drags (host undo)
+//   dspark.onReady(params)  - parameter table + current values (handshake)
+//   dspark.onParam(id, cb)  - DSP/automation -> UI (knobs follow the host)
+//   dspark.setParam(id, v)  - UI -> DSP, plain values
+//   dspark.beginEdit/endEdit - automation gestures around drags (host undo)
 // Knobs: vertical drag (Shift = fine), mouse wheel, double-click = default.
 const char* DSParkWebSaturator::editorHtml()
 {
@@ -192,7 +192,7 @@ const char* DSParkWebSaturator::editorHtml()
       val.setAttribute('stroke-dashoffset', ARC * (1 - f));
       ptr.setAttribute('transform', 'rotate(' + (-135 + 270 * f) + ' 50 50)');
       out.textContent = v.toFixed(p.max - p.min > 4 ? 1 : 2)
-                      + (p.unit ? ' ' + p.unit : '');
+                      + (p.unit ? ' ' + p.unit : '');
     }
     dspark.onParam(p.id, paint);   // covers host automation and our own edits
 
@@ -242,6 +242,6 @@ const char* DSParkWebSaturator::editorHtml()
 </body></html>)dsphtml";
 }
 
-// One translation unit, one binary, two formats — now with a custom editor.
+// One translation unit, one binary, two formats - now with a custom editor.
 DSPARK_VST3_PLUGIN(DSParkWebSaturator)
 DSPARK_CLAP_PLUGIN(DSParkWebSaturator)

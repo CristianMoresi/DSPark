@@ -1,4 +1,4 @@
-# DSPark — dspark_add_plugin(): build a plugin bundle from one source file.
+# DSPark - dspark_add_plugin(): build a plugin bundle from one source file.
 #
 #   include(plugin/cmake/DSParkPlugin.cmake)
 #   dspark_add_plugin(MySaturator

@@ -36,8 +36,9 @@
  *   invariant exists between them, so no seqlock is required -- each is
  *   a single independent word).
  *
- * Dependencies: AnalogConstants.h, C++20 standard library (<algorithm>,
- * <array>, <atomic>, <chrono>, <cmath>, <cstdint>, <span>, <type_traits>).
+ * Dependencies: AnalogConstants.h and the C++20 standard-library `algorithm`,
+ * `array`, `atomic`, `chrono`, `cmath`, `cstdint`, `span`, and `type_traits`
+ * headers.
  */
 
 #include <algorithm>

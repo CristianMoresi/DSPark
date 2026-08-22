@@ -9,8 +9,8 @@ using namespace dspark;
 AudioSpec spec { 48000.0, 512, 2 };   // rate, max block, channels
 ```
 
-All processors follow the same lifecycle: construct → `prepare(spec)` once
-(allocates) → `processBlock(view)` in the callback (allocation-free,
+All processors follow the same lifecycle: construct -> `prepare(spec)` once
+(allocates) -> `processBlock(view)` in the callback (allocation-free,
 lock-free parameter setters from any thread).
 
 ---
@@ -88,7 +88,7 @@ meter.processBlock(buffer);
 ```
 
 The LoudnessMeter passes the official EBU R128 vectors (Tech 3341/3342:
-integrated, LRA and true peak) — see `conformance/`.
+integrated, LRA and true peak) - see `conformance/`.
 
 ## 5. Analog console color (tape + transformer + tube)
 
@@ -603,7 +603,7 @@ Report `getLatency()` to the host: the shifter's 4096 samples (85 ms at
 48 kHz) are constant and must be compensated like any other look-ahead.
 
 How fast a hard snap lands follows from one property of the mask you choose,
-its **widest gap** — the largest distance between two adjacent notes of the
+its **widest gap** - the largest distance between two adjacent notes of the
 scale. The largest correction is half that gap; the largest CHANGE in the
 correction is the whole gap, taken when the singer crosses the middle of it.
 The phase vocoder moves the shift by at most half a semitone per analysis
@@ -633,7 +633,7 @@ chosen from the rate to keep its span near 43 ms rather than being pinned to
 a sample count: 2048 samples at 44.1/48 kHz, 4096 at 88.2/96 kHz, 8192 at
 176.4/192 kHz. `getFrameSize()` reports the choice and `getLatency()` grows
 with it, staying near 85 ms in time. Pass a frame to `prepare()` if you want
-a different trade — a shorter one settles faster and stops resolving the
+a different trade - a shorter one settles faster and stops resolving the
 harmonics of a bass voice, which is the whole reason the default is what it
 is. Halving the default span costs a corrected F2 most of its harmonic
 structure: its harmonic-to-residual ratio falls from 42-48 dB to below about

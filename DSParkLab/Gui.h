@@ -1,4 +1,4 @@
-// DSParkLab — GUI
+// DSParkLab - GUI
 // ImGui interface: transport, effect list, parameter panel, and an interactive
 // plugin-style analyzer (log-frequency spectrum + draggable EQ curve + multiband).
 
@@ -85,14 +85,14 @@ public:
         const float listW  = 230.0f;
         const float paramW = 340.0f;
 
-        // Column 1 — effect list
+        // Column 1 - effect list
         ImGui::BeginChild("EffectList", ImVec2(listW, 0), true);
         drawEffectList(effects);
         ImGui::EndChild();
 
         ImGui::SameLine();
 
-        // Column 2 — analyzer (fills the vertical slack) + meters underneath
+        // Column 2 - analyzer (fills the vertical slack) + meters underneath
         float centerW = ImGui::GetContentRegionAvail().x - paramW - 8.0f;
         if (centerW < 220.0f) centerW = 220.0f;
         ImGui::BeginChild("Center", ImVec2(centerW, 0), false);
@@ -107,7 +107,7 @@ public:
 
         ImGui::SameLine();
 
-        // Column 3 — parameters for the selected effect. NoScrollWithMouse so the
+        // Column 3 - parameters for the selected effect. NoScrollWithMouse so the
         // wheel adjusts the hovered control (combo/slider) instead of scrolling the
         // list; use the scrollbar to scroll long parameter sets.
         ImGui::BeginChild("ParamCol", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollWithMouse);
@@ -198,7 +198,7 @@ private:
         if (ImGui::Checkbox("Loop", &loop))
             engine.setLooping(loop);
 
-        // Seek bar — only jumps the transport when the mouse is RELEASED, not
+        // Seek bar - only jumps the transport when the mouse is RELEASED, not
         // continuously while dragging (which made the position thrash/loop).
         ImGui::SameLine();
         float playPos = engine.getPosition();
@@ -282,7 +282,7 @@ private:
         ImGui::Text("%s", sel ? sel->name.c_str() : "Analyzer");
         if (hasOverlay) {
             ImGui::SameLine();
-            ImGui::TextDisabled("— drag nodes: X freq, Y gain | wheel = Q");
+            ImGui::TextDisabled("- drag nodes: X freq, Y gain | wheel = Q");
         }
 
         ImDrawList* dl = ImGui::GetWindowDrawList();

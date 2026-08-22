@@ -46,7 +46,8 @@
  * processSampleCore() exists so a cascade can keep the intermediate signal in
  * the core precision instead of re-quantising it to T between stages.
  *
- * Dependencies: C++20 standard library (<algorithm>, <array>, <atomic>, <cassert>, <cmath>, <numbers>, <span>).
+ * Dependencies: C++20 standard library (`algorithm`, `array`, `atomic`,
+ * `cassert`, `cmath`, `numbers`, and `span`).
  */
 
 #include <algorithm>
@@ -95,7 +96,7 @@ namespace dspark {
  *
  * There is no float instantiation and no coefficient type parameter: a corner
  * far below the sample rate is exact as a DESIGN but cannot be REALISED in
- * float (see the @file header for the measurements), and a coefficient set that
+ * float (see the file-level documentation for the measurements), and a coefficient set that
  * cannot be realised is not a coefficient set. One precision, one rule, and the
  * magnitude response drawn from these numbers is the response the audio path
  * actually applies. For DC removal specifically, use DCBlocker, which is built
@@ -584,7 +585,7 @@ private:
  *   relocation).
  *
  * The filter core (coefficients, history and recursion) is always double
- * precision, independent of the sample type: see the @file header for the
+ * precision, independent of the sample type: see the file-level documentation for the
  * measurements behind that decision. The realised response is therefore
  * rate-independent down to the corners the designs already supported on paper.
  *

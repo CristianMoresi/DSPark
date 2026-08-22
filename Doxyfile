@@ -1,13 +1,24 @@
-# DSPark — Doxygen configuration (API reference for GitHub Pages)
+# DSPark - Doxygen configuration (API reference for GitHub Pages)
 
 PROJECT_NAME           = "DSPark"
-PROJECT_BRIEF          = "Header-only audio DSP framework in pure C++20 — zero dependencies"
+PROJECT_BRIEF          = "Header-only audio DSP framework in pure C++20 - zero dependencies"
 PROJECT_NUMBER         = 1.7.0
 
-INPUT                  = README.md DSPark.h Core Effects Analysis IO Music plugin plugin/vst3 plugin/clap plugin/au plugin/webview docs/cookbook.md docs/plugins.md
+INPUT                  = README.md CHANGELOG.md CONTRIBUTING.md \
+                         DSPark.h Core Effects Analysis IO Music plugin \
+                         docs/cookbook.md docs/metrics.md \
+                         docs/migration-v1.7.0.md docs/plugins.md \
+                         docs/threading.md examples/README.md \
+                         examples/plugin_ducker/README.md \
+                         examples/plugin_saturator/README.md \
+                         examples/plugin_webview_editor/README.md \
+                         examples/plugin_webview_files/README.md
 USE_MDFILE_AS_MAINPAGE = README.md
-EXCLUDE_PATTERNS       = */vst3_c_api.h */webview/webview/*
-RECURSIVE              = NO
+EXCLUDE_PATTERNS       = */plugin/clap/clap/* \
+                         */plugin/vst3/vst3_c_api.h \
+                         */plugin/webview/webview/* \
+                         */docs/api/*
+RECURSIVE              = YES
 FILE_PATTERNS          = *.h *.md
 
 OUTPUT_DIRECTORY       = docs/api
@@ -19,12 +30,18 @@ EXTRACT_ALL            = YES
 EXTRACT_PRIVATE        = NO
 HIDE_UNDOC_MEMBERS     = NO
 SOURCE_BROWSER         = YES
+SHOW_FILES             = NO
+FULL_PATH_NAMES        = NO
 GENERATE_TREEVIEW      = YES
 DISABLE_INDEX          = NO
 FULL_SIDEBAR           = NO
 
 QUIET                  = YES
 WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_IF_INCOMPLETE_DOC = YES
+WARN_NO_PARAMDOC       = YES
+WARN_AS_ERROR          = YES
 
 PREDEFINED             = DSPARK_FFT_SSE=0
 MACRO_EXPANSION        = YES

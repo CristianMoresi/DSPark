@@ -21,7 +21,7 @@
  * None of these constants is required by the DSP hot paths: this header is
  * pure reference data with zero runtime cost.
  *
- * Dependencies: C++20 standard library only (<array>).
+ * Dependencies: C++20 standard library only (`array`).
  */
 
 #include <array>

@@ -12,7 +12,7 @@
  * unacceptable latency: typically parameter hand-off between a GUI thread
  * and the audio thread.
  *
- * Dependencies: C++20 standard library only (<atomic>).
+ * Dependencies: C++20 standard library only (`atomic`).
  *
  * Threading (docs/threading.md): lock()/try_lock()/unlock() are safe from
  * any thread (mutual exclusion is the primitive's purpose); the acquire/

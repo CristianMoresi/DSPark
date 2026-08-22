@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -363,6 +364,42 @@ bool partialCommitMutantIsDetected()
     return false;
 }
 
+struct TransactionMutantState
+{
+    float mix = 0.3f;
+    float preDelay = 0.0f;
+    float decayScale = 1.0f;
+    float stretch = 1.0f;
+    std::uint32_t publication = 7u;
+
+    bool operator==(const TransactionMutantState&) const noexcept = default;
+};
+
+bool earlyMixCommitMutantIsDetected() noexcept
+{
+    const TransactionMutantState before;
+    auto mutant = before;
+    mutant.mix = 0.875f; // Mutant writes before candidate construction fails.
+    return mutant != before;
+}
+
+bool earlyPreDelayCommitMutantIsDetected() noexcept
+{
+    const TransactionMutantState before;
+    auto mutant = before;
+    mutant.preDelay = 37.0f; // Same forbidden early scalar commit.
+    return mutant != before;
+}
+
+bool partialShapingPublicationMutantIsDetected() noexcept
+{
+    const TransactionMutantState before;
+    auto mutant = before;
+    mutant.decayScale = 0.5f;
+    mutant.publication = 8u; // Mutant exposes only part of the staged state.
+    return mutant != before;
+}
+
 bool restoredSpinMutantIsDetected()
 {
     std::atomic_flag lock = ATOMIC_FLAG_INIT;
@@ -421,6 +458,225 @@ void publish(P& publisher, int value, std::uint32_t latency = 64u)
     const auto result = publisher.publish(
         std::make_unique<FakeBank>(value), latency, []() noexcept {});
     require(result == P::PublishResult::published, "publication was rejected");
+}
+
+std::vector<std::uint8_t> makeReverbState(float mix, float preDelay,
+                                          float decayScale, float stretch)
+{
+    dspark::StateWriter writer(dspark::stateId("CRVB"), 1);
+    writer.write("mix", mix);
+    writer.write("preDelay", preDelay);
+    writer.write("decayScale", decayScale);
+    writer.write("stretch", stretch);
+    return writer.blob();
+}
+
+const std::array<float, 512>& reverbTransactionImpulse()
+{
+    static const std::array<float, 512> impulse = [] {
+        std::array<float, 512> result {};
+        float amplitude = 1.0f;
+        for (std::size_t index = 0; index < result.size(); ++index)
+        {
+            result[index] = amplitude;
+            amplitude *= 0.985f;
+        }
+        return result;
+    }();
+    return impulse;
+}
+
+void configureTransactionalReverb(dspark::Reverb<float>& reverb)
+{
+    const dspark::AudioSpec spec { 48000.0, 64, 1 };
+    reverb.prepare(spec);
+    const auto& impulse = reverbTransactionImpulse();
+    require(reverb.loadIR(impulse.data(), static_cast<int>(impulse.size()),
+                          spec.sampleRate),
+            "transactional Reverb IR load failed");
+}
+
+struct ReverbObservables
+{
+    std::vector<std::uint8_t> state;
+    float mix = 0.0f;
+    float preDelay = 0.0f;
+    float decayScale = 0.0f;
+    float stretch = 0.0f;
+    int latency = 0;
+    bool loaded = false;
+    dspark::Convolver<float>* convolver = nullptr;
+};
+
+ReverbObservables observe(dspark::Reverb<float>& reverb)
+{
+    return {
+        reverb.getState(),
+        reverb.getMix(),
+        reverb.getPreDelay(),
+        reverb.getDecayScale(),
+        reverb.getStretch(),
+        reverb.getLatency(),
+        reverb.isLoaded(),
+        &reverb.getConvolver(),
+    };
+}
+
+void requireSameObservables(dspark::Reverb<float>& reverb,
+                            const ReverbObservables& before)
+{
+    require(reverb.getState() == before.state,
+            "failed setState changed serialized state bytes");
+    require(reverb.getMix() == before.mix,
+            "failed setState changed mix");
+    require(reverb.getPreDelay() == before.preDelay,
+            "failed setState changed pre-delay");
+    require(reverb.getDecayScale() == before.decayScale,
+            "failed setState changed decay scale");
+    require(reverb.getStretch() == before.stretch,
+            "failed setState changed stretch");
+    require(reverb.getLatency() == before.latency,
+            "failed setState changed latency");
+    require(reverb.isLoaded() == before.loaded,
+            "failed setState changed loaded state");
+    require(&reverb.getConvolver() == before.convolver,
+            "failed setState changed exact pinned Convolver identity");
+    require(before.convolver->getLatency() == before.latency,
+            "failed setState invalidated the prior Convolver pin");
+}
+
+void requireFixedRenderIdentity(dspark::Reverb<float>& subject,
+                                dspark::Reverb<float>& control)
+{
+    subject.reset();
+    control.reset();
+    dspark::AudioBuffer<float> subjectBuffer;
+    dspark::AudioBuffer<float> controlBuffer;
+    subjectBuffer.resize(1, 64);
+    controlBuffer.resize(1, 64);
+    for (int block = 0; block < 8; ++block)
+    {
+        for (int sample = 0; sample < 64; ++sample)
+        {
+            const float value = block == 0 && sample == 0
+                ? 1.0f
+                : static_cast<float>(((block * 64 + sample) % 31) - 15)
+                    * 0.0005f;
+            subjectBuffer.getChannel(0)[sample] = value;
+            controlBuffer.getChannel(0)[sample] = value;
+        }
+        subject.processBlock(subjectBuffer.toView());
+        control.processBlock(controlBuffer.toView());
+        require(std::memcmp(subjectBuffer.getChannel(0),
+                            controlBuffer.getChannel(0),
+                            64u * sizeof(float)) == 0,
+                "failed setState changed fixed rendered PCM bytes");
+    }
+}
+
+void adoptReverbPublication(dspark::Reverb<float>& reverb)
+{
+    dspark::AudioBuffer<float> buffer;
+    buffer.resize(1, 64);
+    buffer.clear();
+    reverb.processBlock(buffer.toView());
+}
+
+void testSetStateStrongTransaction()
+{
+    const auto requested = makeReverbState(0.875f, 37.0f, 0.5f, 1.5f);
+    std::ptrdiff_t sweptFailures = 0;
+    for (std::ptrdiff_t failurePoint = 0;; ++failurePoint)
+    {
+        dspark::Reverb<float> subject;
+        dspark::Reverb<float> control;
+        configureTransactionalReverb(subject);
+        configureTransactionalReverb(control);
+        const ReverbObservables before = observe(subject);
+
+        bool threw = false;
+        bool restored = false;
+        try
+        {
+            allocation_probe::failAfter = failurePoint;
+            restored = subject.setState(requested.data(), requested.size());
+            allocation_probe::failAfter = -1;
+        }
+        catch (const std::bad_alloc&)
+        {
+            allocation_probe::failAfter = -1;
+            threw = true;
+        }
+        catch (...)
+        {
+            allocation_probe::failAfter = -1;
+            throw;
+        }
+
+        if (threw)
+        {
+            ++sweptFailures;
+            requireSameObservables(subject, before);
+            requireFixedRenderIdentity(subject, control);
+            continue;
+        }
+
+        require(restored,
+                "setState returned no-capacity in a fresh allocation sweep");
+        require(subject.getState() == requested,
+                "successful setState did not commit the exact state blob");
+        require(subject.getMix() == 0.875f
+                    && subject.getPreDelay() == 37.0f
+                    && subject.getDecayScale() == 0.5f
+                    && subject.getStretch() == 1.5f,
+                "successful setState committed incoherent parameters");
+        require(subject.isLoaded() && subject.getLatency() == 64,
+                "successful setState committed incoherent metadata");
+
+        dspark::Reverb<float> successfulControl;
+        configureTransactionalReverb(successfulControl);
+        require(successfulControl.setState(requested.data(), requested.size()),
+                "successful transaction control was rejected");
+        requireFixedRenderIdentity(subject, successfulControl);
+        break; // First eventual success: every preceding allocation was swept.
+    }
+    require(sweptFailures > 0,
+            "setState allocation sweep did not exercise a throwing point");
+
+    require(earlyMixCommitMutantIsDetected(),
+            "early-mix-commit-mutant survived");
+    require(earlyPreDelayCommitMutantIsDetected(),
+            "early-predelay-commit-mutant survived");
+    require(partialShapingPublicationMutantIsDetected(),
+            "partial-shaping-publication-commit-mutant survived");
+}
+
+void testSetStateNoCapacityTransaction()
+{
+    dspark::Reverb<float> subject;
+    dspark::Reverb<float> control;
+    configureTransactionalReverb(subject);
+    configureTransactionalReverb(control);
+    adoptReverbPublication(subject);
+    adoptReverbPublication(control);
+
+    for (const float scale : { 0.5f, 0.75f, 1.25f })
+    {
+        const auto state = makeReverbState(0.4f + scale * 0.1f,
+                                           5.0f + scale, scale, 1.0f);
+        require(subject.setState(state.data(), state.size())
+                    && control.setState(state.data(), state.size()),
+                "no-capacity setup publication failed early");
+        adoptReverbPublication(subject);
+        adoptReverbPublication(control);
+    }
+
+    const ReverbObservables before = observe(subject);
+    const auto rejected = makeReverbState(0.9f, 49.0f, 1.5f, 1.25f);
+    require(!subject.setState(rejected.data(), rejected.size()),
+            "generation-exhausted Reverb did not report no-capacity");
+    requireSameObservables(subject, before);
+    requireFixedRenderIdentity(subject, control);
 }
 
 void testSlotStateMachine()
@@ -691,6 +947,15 @@ void testGenerationAba()
     }
     const std::uint32_t latest = publisher.latestTokenForTest();
     const int latency = publisher.latency();
+    FakeBank* const exactLatest = publisher.pinLatest();
+    const std::array<std::uint32_t, 4> statesBefore = {
+        publisher.stateWordForTest(0), publisher.stateWordForTest(1),
+        publisher.stateWordForTest(2), publisher.stateWordForTest(3),
+    };
+    const std::uint32_t pendingBefore = publisher.pendingTokenForTest();
+    const std::uint32_t activeBefore = publisher.activeTokenForTest();
+    const std::uint32_t pinnedBefore = publisher.pinnedTokenForTest();
+    const std::size_t residentBefore = publisher.residentBanksForTest();
     int commits = 0;
     const auto result = publisher.publish(
         std::make_unique<FakeBank>(9), 999u,
@@ -702,6 +967,19 @@ void testGenerationAba()
             "no-capacity changed the latest token");
     require(publisher.latency() == latency,
             "no-capacity changed packed metadata");
+    require(publisher.pendingTokenForTest() == pendingBefore
+                && publisher.activeTokenForTest() == activeBefore
+                && publisher.pinnedTokenForTest() == pinnedBefore,
+            "no-capacity changed ownership tokens");
+    require(publisher.residentBanksForTest() == residentBefore,
+            "no-capacity changed resident bank ownership");
+    for (std::size_t index = 0; index < statesBefore.size(); ++index)
+        require(publisher.stateWordForTest(index) == statesBefore[index],
+                "no-capacity changed a slot state word");
+    require(publisher.pinLatest() == exactLatest
+                && exactLatest->value == 8
+                && exactLatest->storage.front() == 8,
+            "no-capacity changed exact pinned bank identity or content");
     const std::size_t staleIndex = stale & 3u;
     const auto state = publisher.stateWordForTest(staleIndex);
     require(TinyPublisher::phaseForTest(state) == TinyPublisher::Phase::exhausted,
@@ -827,6 +1105,8 @@ void testResetMetadataExceptionShutdown()
             "shutdown destroyed a bank on audio");
     require(partialCommitMutantIsDetected(),
             "partial source/config commit mutant survived");
+    testSetStateStrongTransaction();
+    testSetStateNoCapacityTransaction();
 
     dspark::Reverb<float> reverb;
     dspark::Reverb<float> control;

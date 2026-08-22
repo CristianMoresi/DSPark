@@ -65,6 +65,10 @@ target_compile_definitions(dspark_tests PRIVATE
 # It reuses main.cpp: the harness registry is per-binary.
 add_executable(dspark_alloc_failure main.cpp TestAllocFailure.cpp)
 add_executable(dspark_reverb_publication TestReverbPublication.cpp)
+# Deterministically reach the real generation-exhaustion/no-capacity path in
+# four publications; the production default remains the full 27-bit range.
+target_compile_definitions(dspark_reverb_publication PRIVATE
+                           DSPARK_REVERB_TEST_GENERATION_MAX=1)
 
 set(dspark_test_targets dspark_tests dspark_alloc_failure
                         dspark_reverb_publication dspark_standalone dspark_smoke)

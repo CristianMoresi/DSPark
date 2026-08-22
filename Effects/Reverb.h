@@ -76,7 +76,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <numbers>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -168,6 +170,7 @@ public:
         Hooks::control(Hooks::ControlPoint::beforeFirstScan);
 
         SlotChoice choice = scanOnce();
+        bool claimedPending = false;
         if (!choice.valid)
         {
             const std::uint32_t observed =
@@ -182,9 +185,35 @@ public:
                 const std::uint32_t old =
                     pendingToken_.exchange(emptyToken, std::memory_order_acq_rel);
                 Hooks::control(Hooks::ControlPoint::afterPendingExchange);
-                if (old != emptyToken && !retireControlOwned(old))
-                    return PublishResult::invariantViolation;
-                choice = scanOnce(); // The sole bounded rescan.
+                if (old != emptyToken)
+                {
+                    const std::size_t index = tokenIndex(old);
+                    const std::uint32_t generation = tokenGeneration(old);
+                    const bool exactObserved = old == observed;
+                    const bool reusable = exactObserved
+                        && old != pinnedToken_ && generation < GenerationMax
+                        && slots_[index].stateWord.load(std::memory_order_acquire)
+                            == encodeState(generation, Phase::published);
+                    Hooks::controlValidation(reusable);
+                    assert(reusable);
+                    if (!reusable)
+                    {
+                        // No slot or metadata has changed yet. Restore the exact
+                        // token so even an injected invariant failure has the
+                        // strong failure guarantee.
+                        pendingToken_.store(old, std::memory_order_release);
+                        return PublishResult::invariantViolation;
+                    }
+                    choice = { index, generation + 1u, true, false };
+                    claimedPending = true;
+                }
+                else
+                {
+                    // Audio won the pending token. One read-only bounded rescan
+                    // may observe the RETIRED slot it released; an empty-token
+                    // exchange changed no externally visible state.
+                    choice = scanOnce();
+                }
             }
         }
 
@@ -196,6 +225,14 @@ public:
 
         Hooks::control(Hooks::ControlPoint::afterSlotSelection);
         auto& slot = slots_[choice.index];
+        if (claimedPending)
+        {
+            const std::uint32_t claimedGeneration = choice.generation - 1u;
+            const bool retired = retireControlOwned(
+                makeToken(claimedGeneration, choice.index));
+            assert(retired);
+            (void)retired;
+        }
         nextGeneration_[choice.index] = choice.generation;
         slot.stateWord.store(encodeState(choice.generation, Phase::building),
                              std::memory_order_relaxed);
@@ -213,9 +250,10 @@ public:
         Hooks::control(Hooks::ControlPoint::afterPendingExchange);
         if (old != emptyToken && !retireControlOwned(old))
         {
-            // This is unreachable under the single-writer contract. Keep the
-            // newly published exact token intact and report the broken model.
-            return PublishResult::invariantViolation;
+            // Once slot publication begins, the protocol is a no-fail commit.
+            // A token returned by this exchange is control-owned and must name
+            // PUBLISHED storage under the single-writer contract.
+            assert(false && "Reverb publication ownership invariant");
         }
 
         Hooks::control(Hooks::ControlPoint::beforeCommit);
@@ -224,6 +262,7 @@ public:
         publicationMetadata_.store(packMetadata(latency),
                                    std::memory_order_release);
         scanStart_ = (choice.index + 1u) & slotMask;
+        quarantineExhaustedRetired();
         Hooks::control(Hooks::ControlPoint::afterCommit);
         return PublishResult::published;
     }
@@ -467,14 +506,7 @@ private:
             assert(generationMatches);
             if (!generationMatches) continue;
 
-            if (generation >= GenerationMax)
-            {
-                Hooks::control(Hooks::ControlPoint::beforeOldReclaim);
-                slot.bank.reset();
-                slot.stateWord.store(encodeState(generation, Phase::exhausted),
-                                     std::memory_order_release);
-                continue;
-            }
+            if (generation >= GenerationMax) continue;
             return { index, generation + 1u, true, true };
         }
         return {};
@@ -501,6 +533,25 @@ private:
             slot.bank.reset();
         }
         return true;
+    }
+
+    void quarantineExhaustedRetired() noexcept
+    {
+        for (std::size_t index = 0; index < slots_.size(); ++index)
+        {
+            auto& slot = slots_[index];
+            const std::uint32_t state =
+                slot.stateWord.load(std::memory_order_acquire);
+            const std::uint32_t generation = stateGeneration(state);
+            if (statePhase(state) != Phase::retired
+                || generation < GenerationMax
+                || makeToken(generation, index) == pinnedToken_)
+                continue;
+            Hooks::control(Hooks::ControlPoint::beforeOldReclaim);
+            slot.bank.reset();
+            slot.stateWord.store(encodeState(generation, Phase::exhausted),
+                                 std::memory_order_release);
+        }
     }
 
     void reclaimIfRetired(std::uint32_t token) noexcept
@@ -545,7 +596,14 @@ protected:
         std::vector<Convolver<T>> convolvers;
     };
 
-    using Publisher = detail::ReverbBankPublisher<ConvolverBank>;
+#if defined(DSPARK_REVERB_TEST_GENERATION_MAX)
+    static constexpr std::uint32_t publisherGenerationMax =
+        DSPARK_REVERB_TEST_GENERATION_MAX;
+#else
+    static constexpr std::uint32_t publisherGenerationMax = 134217727u;
+#endif
+    using Publisher = detail::ReverbBankPublisher<
+        ConvolverBank, detail::ReverbPublisherNoopHooks, publisherGenerationMax>;
 
 public:
     Reverb() = default;
@@ -964,37 +1022,51 @@ public:
     {
         StateReader r(data, size);
         if (!r.isValid() || r.processorId() != stateId("CRVB")) return false;
-        setMix(static_cast<T>(r.read("mix", 0.3f)));
-        setPreDelay(static_cast<T>(r.read("preDelay", 0.0f)));
-        // Store both shaping values first, then rebuild once (each setter
-        // would otherwise trigger its own IR rebuild). Non-finite blob values
-        // keep the current settings.
+
+        // Parse, validate and stage the complete requested state before the
+        // first externally observable write. Non-finite blob values retain the
+        // corresponding current value, matching the individual setter policy.
+        T mix = static_cast<T>(r.read("mix", 0.3f));
+        T preDelay = static_cast<T>(r.read("preDelay", 0.0f));
         T ds = static_cast<T>(r.read("decayScale", 1.0f));
         T st = static_cast<T>(r.read("stretch", 1.0f));
+        if (!std::isfinite(mix)) mix = mix_.load(std::memory_order_relaxed);
+        if (!std::isfinite(preDelay))
+            preDelay = preDelayMs_.load(std::memory_order_relaxed);
         if (!std::isfinite(ds)) ds = decayScale_.load(std::memory_order_relaxed);
         if (!std::isfinite(st)) st = stretch_.load(std::memory_order_relaxed);
+        mix = std::clamp(mix, T(0), T(1));
+        preDelay = std::clamp(preDelay, T(0), T(500));
         ds = std::clamp(ds, T(0.25), T(2));
         st = std::clamp(st, T(0.5), T(2));
+        const int preDelaySamples = calculatePreDelaySamples(spec_, preDelay);
         const bool shapeChanged =
             ds != decayScale_.load(std::memory_order_relaxed)
             || st != stretch_.load(std::memory_order_relaxed);
-        if (!shapeChanged) return true;
-        if (spec_.sampleRate <= 0 || irStorage_.empty())
-        {
+
+        const auto commitParameters = [&]() noexcept {
+            mix_.store(mix, std::memory_order_relaxed);
+            preDelayMs_.store(preDelay, std::memory_order_relaxed);
+            preDelaySamples_.store(preDelaySamples, std::memory_order_relaxed);
             decayScale_.store(ds, std::memory_order_relaxed);
             stretch_.store(st, std::memory_order_relaxed);
+        };
+
+        if (!shapeChanged || spec_.sampleRate <= 0 || irStorage_.empty())
+        {
+            commitParameters();
             return true;
         }
 
+        // Candidate construction owns every throwing operation. Publisher
+        // capacity is resolved before its first slot/scalar mutation; once the
+        // commit begins, only unique_ptr moves and atomic/plain no-throw stores
+        // remain.
         auto candidate = buildBank(irStorage_, irLength_, irChannels_,
                                    irSampleRate_, spec_, fftBlockSize_, ds, st);
         const std::uint32_t latency = bankLatency(*candidate);
         const auto result = bankPublisher_.publish(
-            std::move(candidate), latency,
-            [&]() noexcept {
-                decayScale_.store(ds, std::memory_order_relaxed);
-                stretch_.store(st, std::memory_order_relaxed);
-            });
+            std::move(candidate), latency, commitParameters);
         if (result != Publisher::PublishResult::published) return false;
         return true;
     }
@@ -1002,11 +1074,18 @@ public:
 protected:
     [[nodiscard]] int calculatePreDelaySamples(const AudioSpec& spec) const noexcept
     {
+        return calculatePreDelaySamples(
+            spec, preDelayMs_.load(std::memory_order_relaxed));
+    }
+
+    [[nodiscard]] static int calculatePreDelaySamples(
+        const AudioSpec& spec, T preDelayMs) noexcept
+    {
         if (!(spec.sampleRate > 0)) return 0;
         const int maxSamp = static_cast<int>(spec.sampleRate * 0.5);
         const int samp = static_cast<int>(
             static_cast<T>(spec.sampleRate)
-            * preDelayMs_.load(std::memory_order_relaxed) / T(1000));
+            * preDelayMs / T(1000));
         return std::clamp(samp, 0, maxSamp);
     }
 
@@ -1104,17 +1183,10 @@ protected:
             // Resample if the (stretch-adjusted) IR rate differs from the engine
             if (std::abs(effIrRate - processingSpec.sampleRate) > 1.0)
             {
-                Resampler<T> resampler;
-                resampler.prepare(effIrRate, processingSpec.sampleRate);
-                // Size from the resampler's own bound (INT_MAX-safe): the old
-                // floor(n*ratio)+1 arithmetic could overflow the int cast with
-                // an extreme rate ratio.
-                std::vector<T> resampled(
-                    static_cast<size_t>(resampler.getMaxOutputSamples(irLen)));
-                int produced = resampler.processBlock(irData, irLen,
-                                                      resampled.data());
-
-                conv.prepare(fftBlock, resampled.data(), produced);
+                auto resampled = resampleImpulseResponse(
+                    irData, irLen, effIrRate, processingSpec.sampleRate);
+                conv.prepare(fftBlock, resampled.first.data(),
+                             resampled.second);
             }
             else
             {
@@ -1122,6 +1194,120 @@ protected:
             }
         }
         return newBank;
+    }
+
+    /**
+     * Reverb's transaction-local equivalent of the Normal-quality streaming
+     * Resampler pass historically used here. It deliberately preserves the
+     * same 32-tap/256-phase Kaiser kernel and causal sample schedule byte for
+     * byte. The separate implementation is necessary at this exception
+     * boundary: Resampler::prepare() finishes through its public noexcept
+     * reset(), whose first-use history resize cannot propagate bad_alloc.
+     * Every allocation below is instead allowed to reach setState/loadIR's
+     * caller before any publication or parameter commit.
+     */
+    [[nodiscard]] static std::pair<std::vector<T>, int> resampleImpulseResponse(
+        const T* input, int inputLength, double sourceRate, double targetRate)
+    {
+        constexpr int sincPoints = 32;
+        constexpr int halfSinc = sincPoints / 2;
+        constexpr int oversample = 256;
+        constexpr double beta = 10.0;
+
+        const double ratio = std::max(targetRate, 1.0)
+                           / std::max(sourceRate, 1.0);
+        const double sourceStep = 1.0 / ratio;
+        const double cutoff = ratio < 1.0 ? ratio * 0.95 : 1.0;
+        const double i0Beta = reverbBesselI0(beta);
+
+        std::vector<T> sincTable(
+            static_cast<std::size_t>((oversample + 1) * sincPoints));
+        for (int phase = 0; phase <= oversample; ++phase)
+        {
+            const double fraction = static_cast<double>(phase)
+                                  / static_cast<double>(oversample);
+            const int base = phase * sincPoints;
+            double sum = 0.0;
+            for (int tap = 0; tap < sincPoints; ++tap)
+            {
+                const double time =
+                    static_cast<double>(tap - halfSinc + 1) - fraction;
+                const double x = time * cutoff;
+                const double sinc = std::abs(x) < 1e-10
+                    ? cutoff
+                    : cutoff * std::sin(std::numbers::pi * x)
+                        / (std::numbers::pi * x);
+                const double windowPosition =
+                    time / static_cast<double>(halfSinc);
+                const double window = std::abs(windowPosition) >= 1.0
+                    ? 0.0
+                    : reverbBesselI0(
+                        beta * std::sqrt(1.0 - windowPosition * windowPosition))
+                        / i0Beta;
+                const double value = sinc * window;
+                sincTable[static_cast<std::size_t>(base + tap)] =
+                    static_cast<T>(value);
+                sum += value;
+            }
+            if (std::abs(sum) > 1e-12)
+            {
+                const T inverse = static_cast<T>(1.0 / sum);
+                for (int tap = 0; tap < sincPoints; ++tap)
+                    sincTable[static_cast<std::size_t>(base + tap)] *= inverse;
+            }
+        }
+
+        const double maximumOutput =
+            std::ceil(static_cast<double>(inputLength) * ratio) + 2.0;
+        const int outputCapacity = static_cast<int>(std::min(
+            maximumOutput, static_cast<double>(std::numeric_limits<int>::max())));
+        std::vector<T> output(static_cast<std::size_t>(outputCapacity));
+        std::vector<T> history(static_cast<std::size_t>(sincPoints * 2), T(0));
+        int writePosition = 0;
+        double fractionalPosition = 0.0;
+        int produced = 0;
+        for (int index = 0; index < inputLength; ++index)
+        {
+            const T sample = input[index];
+            history[static_cast<std::size_t>(writePosition)] = sample;
+            history[static_cast<std::size_t>(writePosition + sincPoints)] = sample;
+            if (++writePosition >= sincPoints) writePosition = 0;
+
+            while (fractionalPosition < 1.0)
+            {
+                const double exactPhase = fractionalPosition
+                                        * static_cast<double>(oversample);
+                int phase = static_cast<int>(exactPhase);
+                if (phase > oversample - 1) phase = oversample - 1;
+                const T phaseFraction = static_cast<T>(
+                    exactPhase - static_cast<double>(phase));
+                const T* const kernel0 = sincTable.data()
+                    + static_cast<std::size_t>(phase * sincPoints);
+                const T* const kernel1 = kernel0 + sincPoints;
+                const T* const samples = history.data() + writePosition;
+                const T value0 = simd::dotProduct(kernel0, samples, sincPoints);
+                const T value1 = simd::dotProduct(kernel1, samples, sincPoints);
+                output[static_cast<std::size_t>(produced++)] =
+                    value0 + phaseFraction * (value1 - value0);
+                fractionalPosition += sourceStep;
+            }
+            fractionalPosition -= 1.0;
+        }
+        return { std::move(output), produced };
+    }
+
+    [[nodiscard]] static double reverbBesselI0(double value) noexcept
+    {
+        double sum = 1.0;
+        double term = 1.0;
+        for (int index = 1; index <= 50; ++index)
+        {
+            const double half = value / (2.0 * static_cast<double>(index));
+            term *= half * half;
+            sum += term;
+            if (term < 1e-15 * sum) break;
+        }
+        return sum;
     }
 
     [[nodiscard]] static std::uint32_t bankLatency(

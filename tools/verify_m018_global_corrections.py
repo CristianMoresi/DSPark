@@ -88,6 +88,7 @@ def doxyfile_errors(root: Path, text: str) -> list[str]:
         "WARN_NO_PARAMDOC": "YES",
         "RECURSIVE": "YES",
         "EXTRACT_ALL": "YES",
+        "HIDE_UNDOC_CLASSES": "YES",
     }
     for key, expected in required.items():
         if config.get(key) != expected:
@@ -96,6 +97,10 @@ def doxyfile_errors(root: Path, text: str) -> list[str]:
     # that prevents an undocumented declaration/header from being omitted.
     if config.get("WARN_IF_UNDOCUMENTED") != "NO":
         errors.append("DOXYGEN_CONFIG WARN_IF_UNDOCUMENTED expected NO with census")
+    if config.get("USE_MDFILE_AS_MAINPAGE") != "./README.md":
+        errors.append(
+            "DOXYGEN_CONFIG USE_MDFILE_AS_MAINPAGE expected ./README.md"
+        )
 
     inputs = split_doxygen_words(config.get("INPUT", ""))
     excludes = split_doxygen_words(config.get("EXCLUDE_PATTERNS", ""))
@@ -227,6 +232,15 @@ def reverb_errors(root: Path) -> list[str]:
     ):
         if test_id not in tests:
             errors.append(f"REVERB_NAMED_TEST_MISSING {test_id}")
+    for control in (
+        "early-mix-commit-mutant",
+        "early-predelay-commit-mutant",
+        "partial-shaping-publication-commit-mutant",
+        "generation-exhausted Reverb did not report no-capacity",
+        "for (std::ptrdiff_t failurePoint = 0;; ++failurePoint)",
+    ):
+        if control not in tests:
+            errors.append(f"REVERB_TRANSACTION_CONTROL_MISSING {control}")
     cmake = (root / "tests/CMakeLists.txt").read_text(encoding="ascii")
     suite_block = cmake.split("add_executable(dspark_tests", 1)[1].split(")", 1)[0]
     if "TestReverbPublication.cpp" in suite_block:
@@ -236,26 +250,92 @@ def reverb_errors(root: Path) -> list[str]:
     return errors
 
 
-def run_doxygen_param_mutant(doxygen: str) -> bool:
+def doxygen_param_config(generate_xml: bool = True,
+                         warn_no_paramdoc: bool = True) -> str:
+    return (
+        "PROJECT_NAME=X\nINPUT=subject.h\nOUTPUT_DIRECTORY=out\n"
+        "GENERATE_HTML=NO\n"
+        f"GENERATE_XML={'YES' if generate_xml else 'NO'}\n"
+        "XML_OUTPUT=xml\nGENERATE_LATEX=NO\nQUIET=YES\nEXTRACT_ALL=YES\n"
+        "WARN_IF_UNDOCUMENTED=NO\nWARN_IF_DOC_ERROR=YES\n"
+        "WARN_IF_INCOMPLETE_DOC=YES\n"
+        f"WARN_NO_PARAMDOC={'YES' if warn_no_paramdoc else 'NO'}\n"
+        "WARN_AS_ERROR=YES\n"
+    )
+
+
+def doxygen_param_contract_errors(config_text: str) -> list[str]:
+    config = parse_doxyfile(config_text)
+    required = {
+        "GENERATE_HTML": "NO",
+        "GENERATE_XML": "YES",
+        "XML_OUTPUT": "xml",
+        "WARN_IF_DOC_ERROR": "YES",
+        "WARN_IF_INCOMPLETE_DOC": "YES",
+        "WARN_NO_PARAMDOC": "YES",
+        "WARN_AS_ERROR": "YES",
+    }
+    return [
+        f"{key} expected {expected}"
+        for key, expected in required.items()
+        if config.get(key) != expected
+    ]
+
+
+def run_doxygen_param_subject(doxygen: str, documented: bool,
+                              config_text: str) -> tuple[bool, str]:
     with tempfile.TemporaryDirectory(prefix="dspark-doxygen-mutant-") as directory:
         root = Path(directory)
+        missing_doc = (
+            " * @param missing The second documented argument.\n"
+            if documented else ""
+        )
         (root / "subject.h").write_text(
             "/** @file subject.h */\n"
-            "/** @brief Function with one intentionally undocumented argument.\n"
-            " * @param documented The documented argument. */\n"
+            "/** @brief Function with two arguments.\n"
+            " * @param documented The first documented argument.\n"
+            + missing_doc
+            + " */\n"
             "inline void subject(int documented, int missing) "
             "{ (void)documented; (void)missing; }\n",
             encoding="ascii",
         )
+        (root / "Doxyfile").write_text(config_text, encoding="ascii")
+        result = run([doxygen, "Doxyfile"], root)
+        contract_ok = not doxygen_param_contract_errors(config_text)
+        xml_exists = (root / "out" / "xml" / "index.xml").is_file()
+        if documented:
+            valid = contract_ok and result.returncode == 0 and xml_exists
+        else:
+            diagnostic = "parameter 'missing'" in result.stdout \
+                and "not documented" in result.stdout
+            # Newer Doxygen aborts before flushing index.xml when a warning is
+            # fatal; 1.9.8 leaves a partial XML tree. The configured real-output
+            # contract, intended diagnostic and nonzero exit are the portable
+            # oracle. The documented positive independently proves XML emission.
+            valid = contract_ok and result.returncode != 0 and diagnostic
+        return valid, result.stdout
+
+
+def run_doxygen_duplicate_mainpage_mutant(doxygen: str) -> bool:
+    with tempfile.TemporaryDirectory(prefix="dspark-doxygen-mainpage-") as directory:
+        root = Path(directory)
+        (root / "one.md").write_text(
+            "\\mainpage First\n\nFirst page.\n", encoding="ascii"
+        )
+        (root / "two.md").write_text(
+            "\\mainpage Second\n\nSecond page.\n", encoding="ascii"
+        )
         (root / "Doxyfile").write_text(
-            "PROJECT_NAME=X\nINPUT=subject.h\nGENERATE_HTML=NO\n"
-            "GENERATE_LATEX=NO\nQUIET=YES\nEXTRACT_ALL=YES\n"
-            "WARN_IF_DOC_ERROR=YES\nWARN_IF_INCOMPLETE_DOC=YES\n"
-            "WARN_NO_PARAMDOC=YES\nWARN_AS_ERROR=YES\n",
+            "PROJECT_NAME=X\nINPUT=one.md two.md\nOUTPUT_DIRECTORY=out\n"
+            "GENERATE_HTML=YES\nGENERATE_LATEX=NO\nQUIET=YES\n"
+            "WARN_IF_DOC_ERROR=YES\nWARN_AS_ERROR=YES\n",
             encoding="ascii",
         )
         result = run([doxygen, "Doxyfile"], root)
-        return result.returncode != 0 and "not documented" in result.stdout
+        return result.returncode != 0 \
+            and "more than one" in result.stdout \
+            and "mainpage" in result.stdout
 
 
 def self_test(root: Path, doxygen: str | None) -> int:
@@ -263,6 +343,8 @@ def self_test(root: Path, doxygen: str | None) -> int:
     checks: list[tuple[str, bool]] = []
     checks.append(("warning-as-error-disabled", bool(doxyfile_errors(root, config.replace("WARN_AS_ERROR          = YES", "WARN_AS_ERROR          = NO")))))
     checks.append(("public-header-excluded", bool(doxyfile_errors(root, config.replace("DSPark.h Core", "DSPark.h")))))
+    checks.append(("required-public-markdown-excluded", bool(doxyfile_errors(root, config.replace(" examples/README.md ", " ")))))
+    checks.append(("duplicate-mainpage-basename-restored", bool(doxyfile_errors(root, config.replace("USE_MDFILE_AS_MAINPAGE = ./README.md", "USE_MDFILE_AS_MAINPAGE = README.md")))))
     ci = (root / ".github/workflows/ci.yml").read_text(encoding="ascii")
     stale_mutants = (
         (
@@ -302,7 +384,27 @@ def self_test(root: Path, doxygen: str | None) -> int:
     mutated_conan = (root / "packaging/conan/conanfile.py").read_bytes().replace(b'1.2.2', b'1.7.0', 1)
     checks.append(("premature-package-semantics", digest(conan_semantics(mutated_conan)) != EXPECTED_SEMANTIC_HASHES["packaging/conan/conanfile.py"]))
     if doxygen:
-        checks.append(("undocumented-public-parameter", run_doxygen_param_mutant(doxygen)))
+        checks.append((
+            "duplicate-mainpage-restored",
+            run_doxygen_duplicate_mainpage_mutant(doxygen),
+        ))
+        parameter_config = doxygen_param_config()
+        undocumented, _undocumented_log = run_doxygen_param_subject(
+            doxygen, False, parameter_config
+        )
+        documented, _documented_log = run_doxygen_param_subject(
+            doxygen, True, parameter_config
+        )
+        output_disabled, _output_disabled_log = run_doxygen_param_subject(
+            doxygen, False, doxygen_param_config(generate_xml=False)
+        )
+        warning_disabled, _warning_disabled_log = run_doxygen_param_subject(
+            doxygen, False, doxygen_param_config(warn_no_paramdoc=False)
+        )
+        checks.append(("undocumented-public-parameter", undocumented))
+        checks.append(("documented-public-parameter-positive", documented))
+        checks.append(("output-disabled-mutant-rejected", not output_disabled))
+        checks.append(("parameter-warning-disabled-mutant-rejected", not warning_disabled))
     else:
         print("UNAVAILABLE mutant undocumented-public-parameter (no Doxygen)")
     for name, passed in checks:

@@ -17,13 +17,17 @@
 #include "dspark_test.h"
 
 #include "../Analysis/SpectrumAnalyzer.h"
+#include "../Core/Resampler.h"
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <new>
+#include <utility>
 #include <vector>
 
 using namespace dspark;
@@ -232,4 +236,382 @@ DSPARK_TEST(SpectrumAnalyzer_recovers_after_failed_prepare_allocation)
     }
     EXPECT_TRUE(sweepDone);
     EXPECT_GT(injected, 10);
+}
+
+namespace {
+
+constexpr int kResamplerInputSamples = 64;
+constexpr int kResamplerOutputCapacity = 256;
+
+using ResamplerInput = std::array<float, kResamplerInputSamples>;
+
+ResamplerInput makeResamplerInput(unsigned seed)
+{
+    ResamplerInput input {};
+    for (auto& sample : input)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        sample = static_cast<float>(seed >> 8) / 8388608.0f - 1.0f;
+    }
+    return input;
+}
+
+struct MonoRender
+{
+    std::array<float, kResamplerOutputCapacity> samples {};
+    int produced = 0;
+};
+
+MonoRender renderMonoBlock(Resampler<float>& resampler,
+                           const ResamplerInput& input) noexcept
+{
+    MonoRender rendered;
+    rendered.produced = resampler.processBlock(
+        input.data(), static_cast<int>(input.size()), rendered.samples.data());
+    return rendered;
+}
+
+template <size_t Channels>
+using MultiInput = std::array<ResamplerInput, Channels>;
+
+template <size_t Channels>
+MultiInput<Channels> makeMultiInput(unsigned seed)
+{
+    MultiInput<Channels> input {};
+    for (auto& channel : input)
+    {
+        channel = makeResamplerInput(seed);
+        seed += 0x9e3779b9u;
+    }
+    return input;
+}
+
+template <size_t Channels>
+struct MultiRender
+{
+    std::array<std::array<float, kResamplerOutputCapacity>, Channels> samples {};
+    int produced = 0;
+};
+
+template <size_t Channels>
+MultiRender<Channels> renderMultiBlock(
+    Resampler<float>& resampler, MultiInput<Channels>& input) noexcept
+{
+    MultiRender<Channels> rendered;
+    std::array<float*, Channels> inputPointers {};
+    std::array<float*, Channels> outputPointers {};
+    for (size_t channel = 0; channel < Channels; ++channel)
+    {
+        inputPointers[channel] = input[channel].data();
+        outputPointers[channel] = rendered.samples[channel].data();
+    }
+    AudioBufferView<float> inputView(
+        inputPointers.data(), static_cast<int>(Channels), kResamplerInputSamples);
+    AudioBufferView<float> outputView(
+        outputPointers.data(), static_cast<int>(Channels),
+        kResamplerOutputCapacity);
+    rendered.produced = resampler.processBlock(inputView, outputView);
+    return rendered;
+}
+
+bool sameRender(const MonoRender& a, const MonoRender& b) noexcept
+{
+    return a.produced == b.produced && a.samples == b.samples;
+}
+
+template <size_t Channels>
+bool sameRender(const MultiRender<Channels>& a,
+                const MultiRender<Channels>& b) noexcept
+{
+    return a.produced == b.produced && a.samples == b.samples;
+}
+
+template <typename Function>
+bool injectResamplerAllocationFailure(int failIndex, Function&& function,
+                                      int& observedAllocations)
+{
+    namespace fa = dspark_test_failing_alloc;
+    fa::count.store(0, std::memory_order_relaxed);
+    fa::failAt.store(failIndex, std::memory_order_relaxed);
+    bool threwBadAlloc = false;
+    try
+    {
+        std::forward<Function>(function)();
+    }
+    catch (const std::bad_alloc&)
+    {
+        threwBadAlloc = true;
+    }
+    catch (...)
+    {
+        fa::failAt.store(-1, std::memory_order_relaxed);
+        throw;
+    }
+    fa::failAt.store(-1, std::memory_order_relaxed);
+    observedAllocations = fa::count.load(std::memory_order_relaxed);
+    return threwBadAlloc;
+}
+
+} // namespace
+
+DSPARK_TEST(Resampler_prepare_is_transactional_and_reset_does_not_allocate)
+{
+    using R = Resampler<float>;
+    using Q = R::Quality;
+    namespace fa = dspark_test_failing_alloc;
+
+    static_assert(noexcept(std::declval<R&>().reset()),
+                  "Resampler::reset must remain noexcept");
+
+    const auto offlineInput = makeResamplerInput(0x12345678u);
+    const auto primeInput = makeResamplerInput(0x87654321u);
+    const auto continuationInput = makeResamplerInput(0x0badc0deu);
+
+    // First mono prepare: every allocation failure propagates, preserves the
+    // coherent default/unprepared state, and permits immediate recovery.
+    int firstMonoFailures = 0;
+    bool firstMonoSweepDone = false;
+    for (int failIndex = 1; failIndex <= 32 && !firstMonoSweepDone; ++failIndex)
+    {
+        R candidate;
+        int observedAllocations = 0;
+        const bool threw = injectResamplerAllocationFailure(
+            failIndex,
+            [&] { candidate.prepare(44100.0, 48000.0, Q::High); },
+            observedAllocations);
+
+        if (!threw)
+        {
+            EXPECT_EQ(observedAllocations, failIndex - 1);
+            EXPECT_NEAR(candidate.getRatio(), 48000.0 / 44100.0, 0.0);
+            EXPECT_EQ(candidate.getLatency(), 35);
+            firstMonoSweepDone = true;
+            break;
+        }
+        ++firstMonoFailures;
+        EXPECT_EQ(observedAllocations, failIndex);
+        EXPECT_NEAR(candidate.getRatio(), 1.0, 0.0);
+        EXPECT_EQ(candidate.getLatency(), 16);
+        EXPECT_TRUE(candidate.process(offlineInput.data(),
+                                      static_cast<int>(offlineInput.size())).empty());
+        EXPECT_EQ(renderMonoBlock(candidate, offlineInput).produced, 0);
+
+        candidate.prepare(44100.0, 48000.0, Q::High);
+        R recoveredReference;
+        recoveredReference.prepare(44100.0, 48000.0, Q::High);
+        EXPECT_TRUE(candidate.process(offlineInput.data(),
+                                      static_cast<int>(offlineInput.size()))
+                    == recoveredReference.process(offlineInput.data(),
+                                                  static_cast<int>(offlineInput.size())));
+        EXPECT_TRUE(sameRender(renderMonoBlock(candidate, continuationInput),
+                               renderMonoBlock(recoveredReference,
+                                               continuationInput)));
+    }
+    EXPECT_TRUE(firstMonoSweepDone);
+    EXPECT_GT(firstMonoFailures, 1);
+
+    // Mono re-prepare grows Draft history to Ultra. Preserve both stateless
+    // offline behavior and the exact in-flight streaming position on failure.
+    int monoReprepareFailures = 0;
+    bool monoReprepareSweepDone = false;
+    for (int failIndex = 1; failIndex <= 32 && !monoReprepareSweepDone; ++failIndex)
+    {
+        R candidate;
+        R priorReference;
+        candidate.prepare(32000.0, 48000.0, Q::Draft);
+        priorReference.prepare(32000.0, 48000.0, Q::Draft);
+        EXPECT_TRUE(sameRender(renderMonoBlock(candidate, primeInput),
+                               renderMonoBlock(priorReference, primeInput)));
+        const double priorRatio = candidate.getRatio();
+        const int priorLatency = candidate.getLatency();
+
+        int observedAllocations = 0;
+        const bool threw = injectResamplerAllocationFailure(
+            failIndex,
+            [&] { candidate.prepare(96000.0, 44100.0, Q::Ultra); },
+            observedAllocations);
+
+        if (!threw)
+        {
+            EXPECT_EQ(observedAllocations, failIndex - 1);
+            EXPECT_NEAR(candidate.getRatio(), 44100.0 / 96000.0, 0.0);
+            EXPECT_EQ(candidate.getLatency(), 29);
+            monoReprepareSweepDone = true;
+            break;
+        }
+        ++monoReprepareFailures;
+        EXPECT_EQ(observedAllocations, failIndex);
+        EXPECT_NEAR(candidate.getRatio(), priorRatio, 0.0);
+        EXPECT_EQ(candidate.getLatency(), priorLatency);
+        EXPECT_TRUE(candidate.process(offlineInput.data(),
+                                      static_cast<int>(offlineInput.size()))
+                    == priorReference.process(offlineInput.data(),
+                                              static_cast<int>(offlineInput.size())));
+        EXPECT_TRUE(sameRender(renderMonoBlock(candidate, continuationInput),
+                               renderMonoBlock(priorReference,
+                                               continuationInput)));
+        candidate.reset();
+        priorReference.reset();
+        EXPECT_TRUE(sameRender(renderMonoBlock(candidate, continuationInput),
+                               renderMonoBlock(priorReference,
+                                               continuationInput)));
+
+        candidate.prepare(96000.0, 44100.0, Q::Ultra);
+        R recoveredReference;
+        recoveredReference.prepare(96000.0, 44100.0, Q::Ultra);
+        EXPECT_TRUE(candidate.process(offlineInput.data(),
+                                      static_cast<int>(offlineInput.size()))
+                    == recoveredReference.process(offlineInput.data(),
+                                                  static_cast<int>(offlineInput.size())));
+        EXPECT_TRUE(sameRender(renderMonoBlock(candidate, continuationInput),
+                               renderMonoBlock(recoveredReference,
+                                               continuationInput)));
+    }
+    EXPECT_TRUE(monoReprepareSweepDone);
+    EXPECT_GT(monoReprepareFailures, 1);
+
+    // First AudioSpec prepare grows from zero to three independent channels.
+    // Its whole allocation frontier must retain first-prepare semantics.
+    const AudioSpec firstSpec { 44100.0, kResamplerInputSamples, 3 };
+    auto threeChannelInput = makeMultiInput<3>(0x31415926u);
+    int firstSpecFailures = 0;
+    bool firstSpecSweepDone = false;
+    for (int failIndex = 1; failIndex <= 64 && !firstSpecSweepDone; ++failIndex)
+    {
+        R candidate;
+        int observedAllocations = 0;
+        const bool threw = injectResamplerAllocationFailure(
+            failIndex,
+            [&] { candidate.prepare(firstSpec, 48000.0, Q::High); },
+            observedAllocations);
+
+        if (!threw)
+        {
+            EXPECT_EQ(observedAllocations, failIndex - 1);
+            EXPECT_NEAR(candidate.getRatio(), 48000.0 / 44100.0, 0.0);
+            EXPECT_EQ(candidate.getLatency(), 35);
+            const auto rendered = renderMultiBlock(candidate, threeChannelInput);
+            EXPECT_GT(rendered.produced, 0);
+            firstSpecSweepDone = true;
+            break;
+        }
+        ++firstSpecFailures;
+        EXPECT_EQ(observedAllocations, failIndex);
+        EXPECT_NEAR(candidate.getRatio(), 1.0, 0.0);
+        EXPECT_EQ(candidate.getLatency(), 16);
+        EXPECT_TRUE(candidate.process(offlineInput.data(),
+                                      static_cast<int>(offlineInput.size())).empty());
+        EXPECT_EQ(renderMonoBlock(candidate, offlineInput).produced, 0);
+
+        candidate.prepare(firstSpec, 48000.0, Q::High);
+        R recoveredReference;
+        recoveredReference.prepare(firstSpec, 48000.0, Q::High);
+        EXPECT_TRUE(sameRender(renderMultiBlock(candidate, threeChannelInput),
+                               renderMultiBlock(recoveredReference,
+                                                threeChannelInput)));
+    }
+    EXPECT_TRUE(firstSpecSweepDone);
+    EXPECT_GT(firstSpecFailures, 4);
+
+    // AudioSpec re-prepare grows both quality/history and the channel count.
+    // Exercise prior mono and multichannel streaming state, reset behavior,
+    // offline output and recovery after every injected failure.
+    const AudioSpec priorSpec { 32000.0, kResamplerInputSamples, 2 };
+    const AudioSpec grownSpec { 96000.0, kResamplerInputSamples, 4 };
+    auto twoChannelPrime = makeMultiInput<2>(0x27182818u);
+    auto twoChannelContinuation = makeMultiInput<2>(0xfeedfaceu);
+    auto fourChannelInput = makeMultiInput<4>(0xc001d00du);
+    int grownSpecFailures = 0;
+    bool grownSpecSweepDone = false;
+    for (int failIndex = 1; failIndex <= 64 && !grownSpecSweepDone; ++failIndex)
+    {
+        R candidate;
+        R priorReference;
+        candidate.prepare(priorSpec, 48000.0, Q::Draft);
+        priorReference.prepare(priorSpec, 48000.0, Q::Draft);
+        EXPECT_TRUE(sameRender(renderMonoBlock(candidate, primeInput),
+                               renderMonoBlock(priorReference, primeInput)));
+        EXPECT_TRUE(sameRender(renderMultiBlock(candidate, twoChannelPrime),
+                               renderMultiBlock(priorReference,
+                                                twoChannelPrime)));
+        const double priorRatio = candidate.getRatio();
+        const int priorLatency = candidate.getLatency();
+
+        int observedAllocations = 0;
+        const bool threw = injectResamplerAllocationFailure(
+            failIndex,
+            [&] { candidate.prepare(grownSpec, 44100.0, Q::Ultra); },
+            observedAllocations);
+
+        if (!threw)
+        {
+            EXPECT_EQ(observedAllocations, failIndex - 1);
+            EXPECT_NEAR(candidate.getRatio(), 44100.0 / 96000.0, 0.0);
+            EXPECT_EQ(candidate.getLatency(), 29);
+            const auto rendered = renderMultiBlock(candidate, fourChannelInput);
+            EXPECT_GT(rendered.produced, 0);
+            for (const auto& channel : rendered.samples)
+            {
+                bool nonzero = false;
+                for (int sample = 0; sample < rendered.produced; ++sample)
+                    nonzero = nonzero
+                        || channel[static_cast<size_t>(sample)] != 0.0f;
+                EXPECT_TRUE(nonzero);
+            }
+            grownSpecSweepDone = true;
+            break;
+        }
+        ++grownSpecFailures;
+        EXPECT_EQ(observedAllocations, failIndex);
+        EXPECT_NEAR(candidate.getRatio(), priorRatio, 0.0);
+        EXPECT_EQ(candidate.getLatency(), priorLatency);
+        EXPECT_TRUE(candidate.process(offlineInput.data(),
+                                      static_cast<int>(offlineInput.size()))
+                    == priorReference.process(offlineInput.data(),
+                                              static_cast<int>(offlineInput.size())));
+        EXPECT_TRUE(sameRender(renderMonoBlock(candidate, continuationInput),
+                               renderMonoBlock(priorReference,
+                                               continuationInput)));
+        EXPECT_TRUE(sameRender(
+            renderMultiBlock(candidate, twoChannelContinuation),
+            renderMultiBlock(priorReference, twoChannelContinuation)));
+        candidate.reset();
+        priorReference.reset();
+        EXPECT_TRUE(sameRender(renderMonoBlock(candidate, continuationInput),
+                               renderMonoBlock(priorReference,
+                                               continuationInput)));
+        EXPECT_TRUE(sameRender(
+            renderMultiBlock(candidate, twoChannelContinuation),
+            renderMultiBlock(priorReference, twoChannelContinuation)));
+
+        candidate.prepare(grownSpec, 44100.0, Q::Ultra);
+        R recoveredReference;
+        recoveredReference.prepare(grownSpec, 44100.0, Q::Ultra);
+        EXPECT_TRUE(candidate.process(offlineInput.data(),
+                                      static_cast<int>(offlineInput.size()))
+                    == recoveredReference.process(offlineInput.data(),
+                                                  static_cast<int>(offlineInput.size())));
+        EXPECT_TRUE(sameRender(renderMonoBlock(candidate, continuationInput),
+                               renderMonoBlock(recoveredReference,
+                                               continuationInput)));
+        EXPECT_TRUE(sameRender(renderMultiBlock(candidate, fourChannelInput),
+                               renderMultiBlock(recoveredReference,
+                                                fourChannelInput)));
+    }
+    EXPECT_TRUE(grownSpecSweepDone);
+    EXPECT_GT(grownSpecFailures, 5);
+
+    // Counting mode arms the replacement allocator beyond any reachable call
+    // index. reset() must touch no allocation function for a fully prepared
+    // mono + multichannel object.
+    R resetProbe;
+    resetProbe.prepare(grownSpec, 44100.0, Q::Ultra);
+    (void)renderMonoBlock(resetProbe, primeInput);
+    (void)renderMultiBlock(resetProbe, fourChannelInput);
+    fa::count.store(0, std::memory_order_relaxed);
+    fa::failAt.store(std::numeric_limits<int>::max(), std::memory_order_relaxed);
+    resetProbe.reset();
+    const int resetAllocations = fa::count.load(std::memory_order_relaxed);
+    fa::failAt.store(-1, std::memory_order_relaxed);
+    EXPECT_EQ(resetAllocations, 0);
 }

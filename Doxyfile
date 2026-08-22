@@ -13,7 +13,7 @@ INPUT                  = README.md CHANGELOG.md CONTRIBUTING.md \
                          examples/plugin_saturator/README.md \
                          examples/plugin_webview_editor/README.md \
                          examples/plugin_webview_files/README.md
-USE_MDFILE_AS_MAINPAGE = README.md
+USE_MDFILE_AS_MAINPAGE = ./README.md
 EXCLUDE_PATTERNS       = */plugin/clap/clap/* \
                          */plugin/vst3/vst3_c_api.h \
                          */plugin/webview/webview/* \
@@ -29,6 +29,7 @@ HTML_OUTPUT            = .
 EXTRACT_ALL            = YES
 EXTRACT_PRIVATE        = NO
 HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = YES
 SOURCE_BROWSER         = YES
 SHOW_FILES             = NO
 FULL_PATH_NAMES        = NO

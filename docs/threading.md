@@ -336,11 +336,12 @@ inherited storage through literal bases or visible non-dependent `using` and
 `typedef` base aliases, and lexical alias shadowing across global, namespace,
 nested-class and sibling-class scopes. Base aliases may be direct or chained;
 direct return roots may also spell
-`[this->] class-id::member` before a supported field, balanced index or
-literal `std::get<I>` / `::std::get<I>` subobject. Only dot fields and balanced
+<code>[this-&gt;] class-id&#58;&#58;member</code> before a supported field, balanced index or
+literal <code>std&#58;&#58;get&lt;I&gt;</code> / <code>&#58;&#58;std&#58;&#58;get&lt;I&gt;</code> subobject. Only dot fields and balanced
 built-in indexes may follow a storage root; a later `->` crosses an indirection
 and does not prove member-subobject ownership. That exclusion does not affect
-the supported `this->member` and `this->class-id::member` object prefixes.
+the supported <code>this-&gt;member</code> and
+<code>this-&gt;class-id&#58;&#58;member</code> object prefixes.
 Unqualified, ADL-selected, namespace-aliased and custom qualified `get` calls
 remain ordinary call negatives. A relative `std::get` is standard only when
 `std` is unshadowed and denotes the global standard namespace at that exact
@@ -352,8 +353,9 @@ or a census owner. Namespace fragments share one canonical namespace identity,
 but a fact in a later reopened fragment cannot retroactively shadow an earlier
 use. A later namespace- or non-member-class declaration likewise does not
 retroactively shadow an earlier use in the same fragment. The absolute
-`::std::get` spelling is not affected by such local shadows, while an alias to
-`::std` is still not one of the two admitted literal spellings. The
+<code>&#58;&#58;std&#58;&#58;get</code> spelling is not affected by such local shadows,
+while an alias to <code>&#58;&#58;std</code> is still not one of the two admitted
+literal spellings. The
 graph-backed relative-`std` decision is solely the central qualified result,
 including its inherited-type selection; no consumer-specific inherited veto
 or fallback follows it. The graphless compatibility branch retains only its

@@ -171,17 +171,33 @@ def validate(root: Path, policy_path: Path) -> tuple[list[tuple[str, str]], dict
     return errors, expected_counts
 
 
-def self_test() -> int:
+def self_test(root: Path, policy_path: Path) -> int:
     checks: list[tuple[str, bool]] = []
     first = {"kind": "first_party_ascii_text"}
-    checks.append(("one-codepoint-nonascii", "FIRST_PARTY_NON_ASCII" in validate_bytes(first, b"x\xc3\xa9", "auto")))
+    checks.append(("first-party-nonascii", "FIRST_PARTY_NON_ASCII" in validate_bytes(first, b"x\xc3\xa9", "auto")))
     checks.append(("invalid-utf8-text", "INVALID_UTF8_TEXT" in validate_bytes(first, b"x\xff", "auto")))
-    checks.append(("new-unclassified-text-path", compare_inventory({"a"}, {"a", "new"}) == [("UNKNOWN_PATH", "new")]))
-    vendor_data = b"vendor legal text\n"
-    vendor = {"kind": "third_party_utf8_exact", "sha256": sha256(vendor_data)}
-    checks.append(("vendor-license-byte-drift", "VENDOR_BYTE_DRIFT" in validate_bytes(vendor, vendor_data + b"x", "auto")))
+    checks.append(("new-unclassified-path", compare_inventory({"a"}, {"a", "new"}) == [("UNKNOWN_PATH", "new")]))
+
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    by_path = {entry["path"]: entry for entry in policy["paths"]}
+    vendor_mutants = (
+        ("imgui-valid-ascii-byte-drift", "DSParkLab/vendor/imgui/imgui.h"),
+        ("miniaudio-valid-ascii-byte-drift", "DSParkLab/vendor/miniaudio.h"),
+        ("existing-webview-vendor-byte-drift", "plugin/webview/webview/webview.h"),
+        ("existing-clap-vendor-byte-drift", "plugin/clap/clap/clap.h"),
+        ("legal-file-byte-drift", "plugin/clap/LICENSE_CLAP.txt"),
+    )
+    for name, path in vendor_mutants:
+        entry = by_path.get(path, {})
+        data = (root / path).read_bytes()
+        checks.append((
+            name,
+            entry.get("kind") == "third_party_utf8_exact"
+            and "VENDOR_BYTE_DRIFT" in validate_bytes(entry, data + b" ", "auto"),
+        ))
+
     binary = {"kind": "binary_exact", "sha256": sha256(b"\x00\x01")}
-    checks.append(("binary-text-attribute", "BINARY_TEXT_ATTRIBUTE_DRIFT" in validate_bytes(binary, b"\x00\x01", "auto")))
+    checks.append(("binary-text-attribute-drift", "BINARY_TEXT_ATTRIBUTE_DRIFT" in validate_bytes(binary, b"\x00\x01", "auto")))
     failures = [name for name, passed in checks if not passed]
     for name, passed in checks:
         print(f"{'PASS' if passed else 'FAIL'} mutant {name}")
@@ -195,7 +211,11 @@ def main() -> int:
     parser.add_argument("--self-test", action="store_true")
     arguments = parser.parse_args()
     if arguments.self_test:
-        return self_test()
+        try:
+            return self_test(arguments.root.resolve(), arguments.policy.resolve())
+        except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
+            print(f"ERROR HARNESS {error}", file=sys.stderr)
+            return 2
     try:
         errors, counts = validate(arguments.root.resolve(), arguments.policy.resolve())
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:

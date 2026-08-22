@@ -131,8 +131,10 @@ def self_test() -> int:
             '<html><body><a href="other.html#present">ok</a></body></html>',
             encoding="utf-8",
         )
+        # Doxygen versions use both HTML4 name anchors and HTML5 id anchors.
+        # Either is a real semantic destination, rather than a guessed slug.
         (root / "other.html").write_text(
-            '<html><body><div id="present"></div></body></html>', encoding="utf-8"
+            '<html><body><a name="present"></a></body></html>', encoding="utf-8"
         )
         good = not validate(root)
         (root / "index.html").write_text(
@@ -140,9 +142,20 @@ def self_test() -> int:
             encoding="utf-8",
         )
         bad = any(error.startswith("MISSING_LOCAL_TARGET") for error in validate(root))
+        (root / "index.html").write_text(
+            '<html><body><a href="other.html#absent">bad fragment</a></body></html>',
+            encoding="utf-8",
+        )
+        missing_fragment = any(
+            error.startswith("MISSING_LOCAL_FRAGMENT") for error in validate(root)
+        )
     print(f"{'PASS' if good else 'FAIL'} generated-link-positive-control")
-    print(f"{'PASS' if bad else 'FAIL'} mutant bad-local-link")
-    return 0 if good and bad else 1
+    print(f"{'PASS' if bad else 'FAIL'} mutant unresolved-local-link")
+    print(
+        f"{'PASS' if missing_fragment else 'FAIL'} "
+        "mutant missing-generated-fragment"
+    )
+    return 0 if good and bad and missing_fragment else 1
 
 
 def main() -> int:

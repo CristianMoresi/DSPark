@@ -39,6 +39,8 @@
 #include <cstddef>
 #include <limits>
 #include <numbers>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace dspark {
@@ -88,18 +90,8 @@ public:
     void prepare(double sourceRate, double targetRate,
                  Quality quality = Quality::Normal)
     {
-        // Guard against non-positive rates (would make ratio_ = inf/NaN and
-        // poison every downstream division).
-        sourceRate_ = std::max(sourceRate, 1.0);
-        targetRate_ = std::max(targetRate, 1.0);
-        ratio_ = targetRate_ / sourceRate_;
-        srcStep_ = 1.0 / ratio_; // source samples advanced per output sample
-
-        sincPoints_ = qualityToSincPoints(quality);
-        kaiserBeta_ = qualityToKaiserBeta(quality);
-
-        buildSincTable();
-        reset();
+        prepareTransactional(sourceRate, targetRate, quality,
+                             channelStates_.size());
     }
 
     /**
@@ -114,22 +106,21 @@ public:
     void prepare(const AudioSpec& spec, double targetRate,
                  Quality quality = Quality::Normal)
     {
-        prepare(spec.sampleRate, targetRate, quality);
-        ensureChannelStates(spec.numChannels);
+        const size_t requestedChannels = spec.numChannels > 0
+            ? static_cast<size_t>(spec.numChannels)
+            : size_t(0);
+        prepareTransactional(spec.sampleRate, targetRate, quality,
+                             std::max(channelStates_.size(), requestedChannels));
     }
 
     /**
      * @brief Resets the internal state (delay lines, all channels) to zero.
      *
-     * Safe to call from the audio thread after prepare(): the assigns below
-     * only refill storage that prepare() already sized (no reallocation).
+     * Safe to call from the audio thread after prepare(): it only fills
+     * storage that prepare() already sized and never allocates.
      */
     void reset() noexcept
     {
-        // assign (not fill): after a re-prepare with a higher quality the
-        // histories must GROW to the new sincPoints_, otherwise the mirror
-        // write at [writePos + sincPoints_] lands past the end of the
-        // allocation (confirmed heap overflow under ASan).
         resetChannelState(mono_);
         for (auto& cs : channelStates_)
             resetChannelState(cs);
@@ -251,6 +242,22 @@ public:
 private:
     static constexpr int kOversample = 256;
 
+    struct ChannelState
+    {
+        std::vector<T> history;
+        int writePos = 0;
+        double fractionalPos = 0.0;
+    };
+
+    static_assert(std::is_nothrow_copy_assignable_v<T>,
+                  "Resampler sample storage must be reset without throwing");
+    static_assert(std::is_nothrow_swappable_v<ChannelState>,
+                  "Resampler state commit must be no-throw");
+    static_assert(std::is_nothrow_swappable_v<std::vector<T>>,
+                  "Resampler table commit must be no-throw");
+    static_assert(std::is_nothrow_swappable_v<std::vector<ChannelState>>,
+                  "Resampler channel commit must be no-throw");
+
     static int qualityToSincPoints(Quality q) noexcept
     {
         switch (q)
@@ -299,28 +306,30 @@ private:
         return sum;
     }
 
-    void buildSincTable()
+    [[nodiscard]] static std::vector<T> buildSincTable(
+        double ratio, int sincPoints, double kaiserBeta)
     {
         // kOversample + 1 phases: the extra phase holds the frac = 1.0 kernel,
         // so the 2-point phase interpolation in the read path never has to
         // clamp or wrap (exact at both ends of the fractional range).
-        sincTable_.resize(static_cast<size_t>((kOversample + 1) * sincPoints_));
+        std::vector<T> table(
+            static_cast<size_t>((kOversample + 1) * sincPoints));
 
-        const int halfSinc = sincPoints_ / 2;
+        const int halfSinc = sincPoints / 2;
         constexpr double kPi = std::numbers::pi;
-        const double beta = kaiserBeta_;
+        const double beta = kaiserBeta;
         const double i0Beta = besselI0(beta);
 
         // Apply 0.95 margin on downsampling to prevent transition-band aliasing.
-        double cutoff = (ratio_ < 1.0) ? (ratio_ * 0.95) : 1.0;
+        double cutoff = (ratio < 1.0) ? (ratio * 0.95) : 1.0;
 
         for (int phase = 0; phase <= kOversample; ++phase)
         {
             const double frac = static_cast<double>(phase) / static_cast<double>(kOversample);
-            const int base = phase * sincPoints_;
+            const int base = phase * sincPoints;
             double sum = 0.0;
 
-            for (int tap = 0; tap < sincPoints_; ++tap)
+            for (int tap = 0; tap < sincPoints; ++tap)
             {
                 // Tap alignment: tap j weighs source sample intPos-halfSinc+1+j,
                 // so its position relative to the interpolation point
@@ -349,7 +358,7 @@ private:
                     : besselI0(beta * std::sqrt(1.0 - wx * wx)) / i0Beta;
 
                 const double v = sincVal * win;
-                sincTable_[static_cast<size_t>(base + tap)] = static_cast<T>(v);
+                table[static_cast<size_t>(base + tap)] = static_cast<T>(v);
                 sum += v;
             }
 
@@ -358,10 +367,58 @@ private:
             if (std::abs(sum) > 1e-12)
             {
                 const T inv = static_cast<T>(1.0 / sum);
-                for (int tap = 0; tap < sincPoints_; ++tap)
-                    sincTable_[static_cast<size_t>(base + tap)] *= inv;
+                for (int tap = 0; tap < sincPoints; ++tap)
+                    table[static_cast<size_t>(base + tap)] *= inv;
             }
         }
+
+        return table;
+    }
+
+    static void initialiseChannelState(ChannelState& state, int sincPoints)
+    {
+        state.history.assign(static_cast<size_t>(sincPoints * 2), T(0));
+        state.writePos = 0;
+        state.fractionalPos = 0.0;
+    }
+
+    void prepareTransactional(double sourceRate, double targetRate,
+                              Quality quality, size_t channelCount)
+    {
+        // Derive the complete candidate configuration without touching the
+        // live object. The std::max behavior intentionally preserves the
+        // established treatment of non-positive rates.
+        const double stagedSourceRate = std::max(sourceRate, 1.0);
+        const double stagedTargetRate = std::max(targetRate, 1.0);
+        const double stagedRatio = stagedTargetRate / stagedSourceRate;
+        const double stagedSrcStep = 1.0 / stagedRatio;
+        const int stagedSincPoints = qualityToSincPoints(quality);
+        const double stagedKaiserBeta = qualityToKaiserBeta(quality);
+
+        // Every potentially throwing allocation belongs to local state. A
+        // failure therefore destroys only the candidate and leaves the live
+        // conversion, histories and streaming positions untouched.
+        auto stagedSincTable = buildSincTable(
+            stagedRatio, stagedSincPoints, stagedKaiserBeta);
+        ChannelState stagedMono;
+        initialiseChannelState(stagedMono, stagedSincPoints);
+        std::vector<ChannelState> stagedChannels(channelCount);
+        for (auto& state : stagedChannels)
+            initialiseChannelState(state, stagedSincPoints);
+
+        // Scalar assignment and the mechanically checked swaps below cannot
+        // throw. Once commit starts, observers can only see the complete new
+        // state (prepare itself remains a setup-thread operation).
+        sourceRate_ = stagedSourceRate;
+        targetRate_ = stagedTargetRate;
+        ratio_ = stagedRatio;
+        srcStep_ = stagedSrcStep;
+        kaiserBeta_ = stagedKaiserBeta;
+        sincPoints_ = stagedSincPoints;
+        sincTable_.swap(stagedSincTable);
+        using std::swap;
+        swap(mono_, stagedMono);
+        channelStates_.swap(stagedChannels);
     }
 
     /**
@@ -432,38 +489,11 @@ private:
         return s0 + pf * (s1 - s0);
     }
 
-    struct ChannelState
+    static void resetChannelState(ChannelState& cs) noexcept
     {
-        std::vector<T> history;
-        int writePos = 0;
-        double fractionalPos = 0.0;
-    };
-
-    void resetChannelState(ChannelState& cs)
-    {
-        cs.history.assign(static_cast<size_t>(sincPoints_ * 2), T(0));
+        std::fill(cs.history.begin(), cs.history.end(), T(0));
         cs.writePos = 0;
         cs.fractionalPos = 0.0;
-    }
-
-    void ensureChannelStates(int numChannels)
-    {
-        if (static_cast<int>(channelStates_.size()) < numChannels)
-            channelStates_.resize(static_cast<size_t>(numChannels));
-
-        // Double size supports the modulo-free mirrored convolution. The size
-        // check is against the CURRENT sincPoints_: quality may have changed
-        // between prepares, and a stale (smaller) history would overflow.
-        const size_t needed = static_cast<size_t>(sincPoints_ * 2);
-        for (auto& cs : channelStates_)
-        {
-            if (cs.history.size() != needed)
-            {
-                cs.history.assign(needed, T(0));
-                cs.writePos = 0;
-                cs.fractionalPos = 0.0;
-            }
-        }
     }
 
     int processChannel(const T* input, int inputLength, T* output,

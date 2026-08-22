@@ -20,8 +20,8 @@
   },
   "counts": {
     "binary_exact": 184,
-    "first_party_ascii_text": 230,
-    "third_party_utf8_exact": 69,
+    "first_party_ascii_text": 215,
+    "third_party_utf8_exact": 84,
     "total": 483
   },
   "gitattributes_required_lines": [
@@ -308,64 +308,79 @@
       "path": "DSParkLab/main.cpp"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imconfig.h"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imconfig.h",
+      "sha256": "bd89b32de6a8a286700383bae47b4f4bba753ba13058d1a350770c5232b2e4e8"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imgui.cpp"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imgui.cpp",
+      "sha256": "75def72d9ff61b057445ee01c7be3b5a0cc9d07158173aab1b67202d2c342367"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imgui.h"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imgui.h",
+      "sha256": "c54743f229027d3a9c057343073c6c6efa37a907306aafe94c79d706b8bf832a"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imgui_draw.cpp"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imgui_draw.cpp",
+      "sha256": "138849e6fb4cf8c4ab31f0ca23ea722df235e29c5496901cc7c14aec8c90c770"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imgui_impl_dx11.cpp"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imgui_impl_dx11.cpp",
+      "sha256": "0bb4c8d19f4baf1beb07adfbcd2062ae08ecf99ad35cb27c4dacfc5328c88ffb"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imgui_impl_dx11.h"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imgui_impl_dx11.h",
+      "sha256": "cf55f23132dcd240c31995494e0828abb84e552adee71be20f384d68eca21697"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imgui_impl_win32.cpp"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imgui_impl_win32.cpp",
+      "sha256": "b7c28188bfb6da535aaad5c68f7bc226b30f9a713fbc7d863fe8a8b324b552fb"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imgui_impl_win32.h"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imgui_impl_win32.h",
+      "sha256": "606df46db972371ac6b5f5ad94bba75a09657da47b259105c4845c1f8638fa0c"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imgui_internal.h"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imgui_internal.h",
+      "sha256": "2bbbfb8dd39f287455e42f3350ad99c377906f366cf6e136c5e7f6438683647c"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imgui_tables.cpp"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imgui_tables.cpp",
+      "sha256": "b7f7de78d8cd7f5b6757f75499b6df0b2c42f85cdd276bf3016c2ab77eac6ad9"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imgui_widgets.cpp"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imgui_widgets.cpp",
+      "sha256": "6c7cff645d1a317e82fd9fd2bfd636cccbb84388ea0178554ff4a6b253f10f43"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imstb_rectpack.h"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imstb_rectpack.h",
+      "sha256": "2efa3d5f7d003c19743b15155dad9f46d9f9fc783a18893d703b431d3c990972"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imstb_textedit.h"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imstb_textedit.h",
+      "sha256": "77010e494caf72c178b573569612aec409d24380409676325a31d02de0ec64b7"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/imgui/imstb_truetype.h"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/imgui/imstb_truetype.h",
+      "sha256": "87f08919ae8e7223451d0e9d06b62829075d3e920c9e6ad436db9d7e7427ffce"
     },
     {
-      "kind": "first_party_ascii_text",
-      "path": "DSParkLab/vendor/miniaudio.h"
+      "kind": "third_party_utf8_exact",
+      "path": "DSParkLab/vendor/miniaudio.h",
+      "sha256": "ac7af4de748b7e26b777f37e01cee313a308a7296a3eb080e2906b320cc55c89"
     },
     {
       "kind": "first_party_ascii_text",

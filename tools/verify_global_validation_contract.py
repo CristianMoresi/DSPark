@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -148,6 +149,46 @@ EXPECTED_OUTPUTS = (
     "c7-unity-passthrough.csv",
     "c8-chopping-determinism.csv",
     "timestretch-metrics.md",
+)
+TIMESTRETCH_TRANSACTION_DIRECTORY = ".dspark-timestretch-transaction"
+TIMESTRETCH_FAILURE_PHASES = (
+    ("STAGE", "DSPARK_TIMESTRETCH_FAIL_STAGE_INDEX"),
+    ("COMMIT", "DSPARK_TIMESTRETCH_FAIL_COMMIT_INDEX"),
+)
+EXPECTED_THREADING_EXTERNAL_IDS = (
+    "count-total",
+    "count-template",
+    "count-concrete",
+    "count-overlap",
+    "member-total-01",
+    "member-total-02",
+    "member-total-03",
+    "member-total-04",
+    "member-total-05",
+    "member-total-06",
+    "member-total-07",
+    "member-total-08",
+    "member-total-09",
+    "member-total-10",
+    "member-total-11",
+    "member-template-01",
+    "member-template-02",
+    "member-template-03",
+    "member-template-04",
+    "member-template-05",
+    "member-concrete-01",
+    "member-concrete-02",
+    "member-concrete-03",
+    "member-concrete-04",
+    "member-concrete-05",
+    "member-concrete-06",
+    "member-concrete-07",
+    "member-concrete-08",
+    "member-overlap-01",
+    "member-overlap-02",
+    "stale-10-5-7-2",
+    "block-absent",
+    "block-duplicate",
 )
 LIVE_COMMAND = (
     "python3 -B tools/verify_global_validation_contract.py --live"
@@ -386,7 +427,95 @@ def structural_errors(
     if producer_self_test is None or direct_call_count(
             producer_self_test, "build_live_transcript") != 1:
         errors.append("VALIDATION_OUTER_PRODUCER_MATRIX_CALL_CARDINALITY")
+
+    phases_node = assignment_value(tree, "TIMESTRETCH_FAILURE_PHASES")
+    try:
+        phases_value = ast.literal_eval(phases_node) \
+            if phases_node is not None else None
+    except (ValueError, TypeError):
+        phases_value = None
+    if phases_value != TIMESTRETCH_FAILURE_PHASES:
+        errors.append("VALIDATION_OUTER_TIMESTRETCH_PHASE_INVENTORY")
+    timestretch = function_definition(tree, "timestretch_live")
+    if timestretch is None:
+        errors.append("VALIDATION_OUTER_TIMESTRETCH_LIVE_FUNCTION")
+    else:
+        if direct_call_count(timestretch, "validate_timestretch_rollback") != 1:
+            errors.append("VALIDATION_OUTER_TIMESTRETCH_ROLLBACK_CALL")
+        phase_loops = [
+            node for node in ast.walk(timestretch)
+            if isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Name)
+            and node.iter.id == "TIMESTRETCH_FAILURE_PHASES"
+            and ast.unparse(node.target) == "(phase, variable)"
+        ]
+        position_loops = [
+            node for node in ast.walk(timestretch)
+            if isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Name)
+            and node.iter.func.id == "enumerate"
+            and any(isinstance(item, ast.Name)
+                    and item.id == "EXPECTED_OUTPUTS"
+                    for item in node.iter.args)
+        ]
+        if len(phase_loops) != 1 or len(position_loops) != 1:
+            errors.append("VALIDATION_OUTER_TIMESTRETCH_POSITION_LOOPS")
+    rollback_validator = function_definition(
+        tree, "validate_timestretch_rollback")
+    if rollback_validator is None:
+        errors.append("VALIDATION_OUTER_TIMESTRETCH_ROLLBACK_ORACLE")
+    else:
+        validator_text = ast.unparse(rollback_validator)
+        if "after != before" not in validator_text:
+            errors.append("VALIDATION_OUTER_TIMESTRETCH_SENTINEL_ORACLE")
+        if "timestretch_transaction_residue(directory)" \
+                not in validator_text:
+            errors.append("VALIDATION_OUTER_TIMESTRETCH_CLEANUP_ORACLE")
     return errors
+
+
+def threading_control_structure_errors(source: str) -> list[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as error:
+        return ["THREADING_CONTROL_SOURCE_SYNTAX:" + str(error)]
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_census_controls"
+    ]
+    loops = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Name)
+        and node.iter.id == "census_controls"
+    ]
+    errors: list[str] = []
+    if len(calls) != 1:
+        errors.append("THREADING_INTERNAL_CONTROL_INVOCATION")
+    if len(loops) != 1:
+        errors.append("THREADING_INTERNAL_CONTROL_EXECUTION")
+    baseline_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "validate_pin_census"
+        and any(isinstance(argument, ast.Name) and argument.id == "doc"
+                for argument in node.args)
+    ]
+    if len(calls) == 1 and (len(baseline_calls) != 1
+                            or baseline_calls[0].lineno >= calls[0].lineno):
+        errors.append("THREADING_BASELINE_BEFORE_INTERNAL_CONTROLS")
+    return errors
+
+
+GCC_DRIVER_TOKEN = (
+    r"(?<![A-Za-z0-9_+.-])"
+    r"(?:g\+\+(?:-\d+)?|gcc(?:-\d+)?)"
+    r"(?![A-Za-z0-9_+.-])"
+)
 
 
 def compiler_version_identity(first_line: str) -> tuple[str | None, int | None]:
@@ -396,9 +525,13 @@ def compiler_version_identity(first_line: str) -> tuple[str | None, int | None]:
     if "clang" in first_line.lower():
         return "clang", None
     gcc = re.search(
-        r"(?:^|\s)(?:g\+\+(?:-\d+)?|gcc(?:-\d+)?)\b.*?"
+        GCC_DRIVER_TOKEN + r".*?"
         r"(?:\)\s*|\bversion\s+)?(\d+)\.(\d+)", first_line, re.I)
-    return ("gcc", int(gcc.group(1))) if gcc else (None, None)
+    if gcc:
+        return "gcc", int(gcc.group(1))
+    if re.search(GCC_DRIVER_TOKEN, first_line, re.I):
+        return "gcc", None
+    return None, None
 
 
 def process_record_errors(
@@ -745,8 +878,10 @@ def synthetic_transcript() -> dict[str, object]:
 
 
 def fake_compiler(path: Path, family: str = "gcc", major: int = 13,
-                  mode: str = "ok") -> None:
-    first = "gcc (validation control) {}.2.0".format(major) \
+                  mode: str = "ok", driver: str | None = None,
+                  dump_major: int | None = None) -> None:
+    driver = driver or "gcc"
+    first = "{} (validation control) {}.2.0".format(driver, major) \
         if family == "gcc" else "clang version {}.0.1".format(major)
     body = """#!/usr/bin/env python3
 import signal
@@ -781,10 +916,24 @@ if mode == "malformed":
 if "--version" in sys.argv:
     print({first!r})
 elif "-dumpfullversion" in sys.argv:
+    if mode == "dump-nonzero":
+        raise SystemExit(9)
+    if mode == "dump-empty":
+        raise SystemExit(0)
+    if mode == "dump-malformed":
+        print("unknown")
+        raise SystemExit(0)
+    if mode == "dump-hang":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(60)
     print({dump!r})
 else:
     time.sleep(60)
-""".format(mode=mode, first=first, dump="{}.2.0".format(major))
+""".format(
+        mode=mode,
+        first=first,
+        dump="{}.2.0".format(major if dump_major is None else dump_major),
+    )
     path.write_text(body, encoding="ascii")
     path.chmod(0o755)
 
@@ -803,6 +952,19 @@ def compiler_process_controls() -> list[tuple[str, bool]]:
         producer.PROCESS_GRACE_SECONDS = 0.1
         producer.PROCESS_CLEANUP_SECONDS = 0.5
         try:
+            for name, driver in (("generic-gxx", "g++"),
+                                 ("versioned-gxx", "g++-13")):
+                path = scratch / ("compiler-" + name)
+                fake_compiler(path, driver=driver)
+                record = producer.discover_compiler(
+                    name, "gcc", 13, (driver,), scratch,
+                    {driver: str(path)})
+                controls.append((
+                    "compiler-" + name + "-positive",
+                    record.get("status") == "PASS"
+                    and record.get("candidate") == driver
+                    and record.get("family") == "gcc"
+                    and record.get("major") == 13))
             missing = producer.discover_compiler(
                 "gcc13", "gcc", 13, ("candidate",), scratch, {})
             controls.append((
@@ -835,6 +997,21 @@ def compiler_process_controls() -> list[tuple[str, bool]]:
                     {"candidate": str(path)})
                 controls.append(("compiler-" + mode,
                                  reason in str(record.get("terminal"))))
+            for mode, dump_major, reason in (
+                    ("dump-empty", None, "DUMP_VERSION_MALFORMED"),
+                    ("dump-malformed", None, "DUMP_VERSION_MALFORMED"),
+                    ("dump-nonzero", None, "DUMP_VERSION_NONZERO:9"),
+                    ("dump-hang", None, "DUMP_VERSION_TIMEOUT"),
+                    ("ok", 14, "DUMP_VERSION_MAJOR_MISMATCH:14")):
+                name = "compiler-wrong-dump-{}-{}".format(
+                    mode, "default" if dump_major is None else dump_major)
+                path = scratch / name
+                fake_compiler(path, mode=mode, dump_major=dump_major)
+                record = producer.discover_compiler(
+                    name, "gcc", 13, ("candidate",), scratch,
+                    {"candidate": str(path)})
+                controls.append((name,
+                                 reason in str(record.get("terminal"))))
             hanging = scratch / "phase-timeout"
             fake_compiler(hanging, mode="hang-leader")
             for phase in ("compile", "run"):
@@ -857,15 +1034,73 @@ def compiler_process_controls() -> list[tuple[str, bool]]:
     return controls
 
 
+def compiler_banner_controls() -> list[tuple[str, bool]]:
+    cases = (
+        ("generic-gxx", "g++ (Ubuntu 13.4.0) 13.4.0", ("gcc", 13)),
+        ("versioned-gxx", "g++-13 (Ubuntu 13.4.0) 13.4.0", ("gcc", 13)),
+        ("generic-gcc", "gcc (Ubuntu 13.4.0) 13.4.0", ("gcc", 13)),
+        ("versioned-gcc", "gcc-13 (Ubuntu 13.4.0) 13.4.0", ("gcc", 13)),
+        ("path-versioned-gxx", "/usr/bin/g++-13 (control) 13.2.0", ("gcc", 13)),
+        ("punctuated-generic-gxx", "(g++) (control) 13.2.0", ("gcc", 13)),
+        ("clang18", "Ubuntu clang version 18.1.3", ("clang", 18)),
+        ("generic-gxx-no-version", "g++ (unknown)", ("gcc", None)),
+        ("substring-prefix-gxx", "myg++ (control) 13.2.0", (None, None)),
+        ("substring-suffix-gxx", "g++driver (control) 13.2.0", (None, None)),
+        ("substring-versioned-gxx", "g++-13driver (control) 13.2.0", (None, None)),
+        ("substring-prefix-gcc", "mygcc (control) 13.2.0", (None, None)),
+        ("substring-suffix-gcc", "gccdriver (control) 13.2.0", (None, None)),
+        ("substring-versioned-gcc", "gcc-13driver (control) 13.2.0", (None, None)),
+    )
+    return [
+        (
+            "compiler-banner-" + name,
+            compiler_version_identity(banner) == expected
+            and producer.parse_compiler_version(banner) == expected,
+        )
+        for name, banner, expected in cases
+    ]
+
+
+def generic_gcc_live(root: Path) -> list[str]:
+    with tempfile.TemporaryDirectory(
+            prefix="dspark-generic-gcc-live-") as directory:
+        record = producer.discover_compiler(
+            "gcc13-generic", "gcc", 13, ("g++",), Path(directory))
+    errors: list[str] = []
+    if record.get("status") != "PASS":
+        errors.append("GENERIC_GCC13_DISCOVERY:" + str(record.get("terminal")))
+        return errors
+    if record.get("candidate") != "g++" \
+            or record.get("family") != "gcc" or record.get("major") != 13:
+        errors.append("GENERIC_GCC13_IDENTITY")
+    first_line = record.get("version_first_line")
+    if not isinstance(first_line, str) \
+            or compiler_version_identity(first_line) != ("gcc", 13) \
+            or producer.parse_compiler_version(first_line) != ("gcc", 13):
+        errors.append("GENERIC_GCC13_REAL_BANNER")
+    for key in ("version_process", "dump_process"):
+        value = record.get(key)
+        if not isinstance(value, dict) or value.get("errors") != [] \
+                or value.get("timed_out") is not False \
+                or value.get("cleanup_residue"):
+            errors.append("GENERIC_GCC13_PROCESS:" + key)
+    return errors
+
+
 def self_test(root: Path) -> int:
     baseline = synthetic_transcript()
     source = Path(__file__).read_text(encoding="ascii")
     producer_source = (
         root / "tools/verify_m018_global_corrections.py"
     ).read_text(encoding="ascii")
+    threading_source = (
+        root / "tools/verify_threading_doc.py"
+    ).read_text(encoding="ascii")
     controls: list[tuple[str, bool]] = [
         ("outer-baseline", not validate_transcript(baseline)),
         ("outer-structure", not structural_errors(source, producer_source)),
+        ("threading-control-structure",
+         not threading_control_structure_errors(threading_source)),
     ]
 
     def catches(name: str, value: dict[str, object], prefix: str,
@@ -977,6 +1212,42 @@ def self_test(root: Path) -> int:
         "VALIDATION_OUTER_PRODUCER_MATRIX_CALL_CARDINALITY"
         in structural_errors(
             source, producer_source.replace(PRODUCER_MATRIX_CALL, "", 1))))
+    controls.append((
+        "delete-timestretch-rollback-call",
+        "VALIDATION_OUTER_TIMESTRETCH_ROLLBACK_CALL"
+        in structural_errors(source.replace(
+            "                    errors.extend(validate_timestretch_rollback(\n"
+            "                        failure_root, before, result, phase, output_name))\n",
+            "", 1), producer_source)))
+    controls.append((
+        "neutralize-timestretch-sentinel-oracle",
+        "VALIDATION_OUTER_TIMESTRETCH_SENTINEL_ORACLE"
+        in structural_errors(source.replace(
+            "    if after != before:\n", "    if False:\n", 1),
+            producer_source)))
+    controls.append((
+        "neutralize-timestretch-cleanup-oracle",
+        "VALIDATION_OUTER_TIMESTRETCH_CLEANUP_ORACLE"
+        in structural_errors(source.replace(
+            "    if timestretch_transaction_residue(directory):\n",
+            "    if False:\n", 1), producer_source)))
+    controls.append((
+        "delete-timestretch-position-loop",
+        "VALIDATION_OUTER_TIMESTRETCH_POSITION_LOOPS"
+        in structural_errors(source.replace(
+            "                for index, output_name in enumerate(EXPECTED_OUTPUTS):\n",
+            "                for index, output_name in ():\n", 1),
+            producer_source)))
+    controls.append((
+        "delete-threading-internal-controls",
+        "THREADING_INTERNAL_CONTROL_INVOCATION"
+        in threading_control_structure_errors(threading_source.replace(
+            "build_census_controls(doc, pin_census)", "([], [])", 1))))
+    controls.append((
+        "threading-external-missing-row",
+        "THREADING_EXTERNAL_CARDINALITY:32"
+        in threading_external_inventory_errors(
+            list(EXPECTED_THREADING_EXTERNAL_IDS[:-1]))))
     workflow_paths = (
         ".github/workflows/ci.yml",
         ".github/workflows/docs.yml",
@@ -994,6 +1265,7 @@ def self_test(root: Path) -> int:
         controls.append((
             "binding-" + path,
             bool(binding_errors(root, {path: changed}))))
+    controls.extend(compiler_banner_controls())
     controls.extend(compiler_process_controls())
     for name, passed in controls:
         print("{} outer mutant {}".format("PASS" if passed else "FAIL", name))
@@ -1008,6 +1280,8 @@ def normal_gate(root: Path) -> dict[str, object]:
 
 def ctest_mode(root: Path) -> int:
     errors = structural_errors(Path(__file__).read_text(encoding="ascii"))
+    errors.extend(threading_control_structure_errors(
+        (root / "tools/verify_threading_doc.py").read_text(encoding="ascii")))
     errors.extend(binding_errors(root))
     if self_test(root) != 0:
         errors.append("VALIDATION_OUTER_META_CONTROLS")
@@ -1139,6 +1413,239 @@ def measurement_errors(directory: Path) -> list[str]:
     return sorted(set(errors))
 
 
+def threading_external_inventory_errors(observed: list[str]) -> list[str]:
+    errors: list[str] = []
+    if len(observed) != len(EXPECTED_THREADING_EXTERNAL_IDS):
+        errors.append("THREADING_EXTERNAL_CARDINALITY:{}".format(
+            len(observed)))
+    if len(observed) != len(set(observed)):
+        errors.append("THREADING_EXTERNAL_DUPLICATE_ID")
+    if set(observed) != set(EXPECTED_THREADING_EXTERNAL_IDS):
+        errors.append("THREADING_EXTERNAL_IDENTITY_SET")
+    return errors
+
+
+def threading_census_mutations(
+    text: str,
+) -> list[tuple[str, str, str]]:
+    begin = "<!-- THREADING_PIN_CENSUS_BEGIN -->"
+    end = "<!-- THREADING_PIN_CENSUS_END -->"
+    labels = (
+        ("total", "All local pin headers"),
+        ("template", "Template-parameter pin headers"),
+        ("concrete", "Concrete-word pin headers"),
+        ("overlap", "Overlap headers"),
+    )
+
+    def row(key: str, label: str, source: str) -> tuple[int, list[str], int]:
+        lines = source.splitlines(keepends=True)
+        matches = [
+            index for index, line in enumerate(lines)
+            if line.startswith("- {} (".format(label))
+        ]
+        if len(matches) != 1:
+            raise ValueError("{} row cardinality {}".format(key, len(matches)))
+        line = lines[matches[0]]
+        count = re.search(r"\((\d+)\)", line)
+        members = re.findall(r"`([^`]+\.h)`", line)
+        if count is None or int(count.group(1)) != len(members):
+            raise ValueError("{} row is not a valid baseline".format(key))
+        return matches[0], members, int(count.group(1))
+
+    def replace_line(source: str, index: int, replacement: str) -> str:
+        lines = source.splitlines(keepends=True)
+        newline = "\n" if lines[index].endswith("\n") else ""
+        lines[index] = replacement.rstrip("\n") + newline
+        return "".join(lines)
+
+    mutations: list[tuple[str, str, str]] = []
+    baseline_rows: dict[str, tuple[str, list[str], int]] = {}
+    for key, label in labels:
+        index, members, count = row(key, label, text)
+        baseline_rows[key] = (label, members, count)
+        count_mutant = replace_line(
+            text, index,
+            text.splitlines()[index].replace(
+                "({})".format(count), "({})".format(count - 1), 1))
+        mutations.append((
+            "count-" + key, count_mutant,
+            "DOC_COUNT_MISMATCH:" + key))
+
+    for key, label in labels:
+        index, members, _count = row(key, label, text)
+        original_line = text.splitlines()[index]
+        for member_index, member in enumerate(members, 1):
+            needle = "`{}`".format(member)
+            if original_line.count(needle) != 1:
+                raise ValueError("{} member anchor is not unique".format(key))
+            mutant = replace_line(
+                text, index,
+                original_line.replace(
+                    needle, "`Core/AnalogRandom.h`", 1))
+            mutations.append((
+                "member-{}-{:02d}".format(key, member_index), mutant,
+                "SOURCE_SET_MISMATCH:" + key))
+
+    stale = text
+    for key in ("total", "concrete"):
+        label, _members, _count = baseline_rows[key]
+        index, members, count = row(key, label, stale)
+        members.remove("Analysis/BeatTracker.h")
+        stale = replace_line(
+            stale, index,
+            "- {} ({}): {}.".format(
+                label, count - 1,
+                ", ".join("`{}`".format(member) for member in members)))
+    mutations.append((
+        "stale-10-5-7-2", stale, "SOURCE_SET_MISMATCH:"))
+    mutations.append((
+        "block-absent", text.replace(begin, "", 1),
+        "DOC_CENSUS_BLOCK_CARDINALITY"))
+    if text.count(begin) != 1 or text.count(end) != 1:
+        raise ValueError("census block baseline cardinality changed")
+    body = text.split(begin, 1)[1].split(end, 1)[0]
+    mutations.append((
+        "block-duplicate", text + "\n" + begin + body + end + "\n",
+        "DOC_CENSUS_BLOCK_CARDINALITY"))
+    return mutations
+
+
+def threading_external_live(root: Path) -> list[str]:
+    errors: list[str] = []
+    baseline_doc = (root / "docs/threading.md").read_text(encoding="ascii")
+    try:
+        mutations = threading_census_mutations(baseline_doc)
+    except (OSError, UnicodeError, ValueError) as error:
+        return ["THREADING_EXTERNAL_GENERATOR:" + str(error)]
+    generated_ids = [name for name, _text, _terminal in mutations]
+    errors.extend(threading_external_inventory_errors(generated_ids))
+    if errors:
+        return errors
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=root, check=False,
+        capture_output=True, timeout=30).stdout.split(b"\0")
+    tracked_paths = [item.decode("utf-8") for item in tracked if item]
+    if len(tracked_paths) != 484 or len(tracked_paths) != len(set(tracked_paths)):
+        return ["THREADING_EXTERNAL_TRACKED_CENSUS:{}".format(
+            len(tracked_paths))]
+
+    observed: list[str] = []
+    with tempfile.TemporaryDirectory(
+            prefix="dspark-threading-external-") as directory:
+        scratch = Path(directory)
+        base = scratch / "base"
+        base.mkdir()
+        for relative in tracked_paths:
+            source = root / relative
+            destination = base / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_symlink() or not source.is_file():
+                return ["THREADING_EXTERNAL_NONREGULAR_SOURCE:" + relative]
+            shutil.copy2(source, destination)
+
+        for name, mutant_doc, expected_terminal in mutations:
+            fixture = scratch / name
+            shutil.copytree(base, fixture, copy_function=os.link)
+            doc_path = fixture / "docs/threading.md"
+            doc_path.unlink()
+            doc_path.write_text(mutant_doc, encoding="ascii", newline="")
+            setup = subprocess.run(
+                ["git", "init", "-q"], cwd=fixture, check=False,
+                capture_output=True, timeout=30)
+            indexed = subprocess.run(
+                ["git", "add", "-f", "-A"], cwd=fixture, check=False,
+                capture_output=True, timeout=60)
+            indexed_paths = subprocess.run(
+                ["git", "ls-files", "-z"], cwd=fixture, check=False,
+                capture_output=True, timeout=30)
+            indexed_count = len([
+                item for item in indexed_paths.stdout.split(b"\0") if item
+            ])
+            if setup.returncode != 0 or indexed.returncode != 0 \
+                    or indexed_paths.returncode != 0 or indexed_count != 484:
+                errors.append("THREADING_EXTERNAL_FIXTURE:{}".format(name))
+                observed.append(name)
+                continue
+            result = producer.run_owned(
+                [sys.executable, "-B", "tools/verify_threading_doc.py"],
+                fixture, 120, "threading_external")
+            combined = str(result.get("stdout")) + str(result.get("stderr"))
+            prefix = "THREADING_EXTERNAL_MUTANT:" + name
+            if result.get("exit_code") == 0 or result.get("errors") != []:
+                errors.append(prefix + ":PROCESS")
+            if expected_terminal not in combined:
+                errors.append(prefix + ":NAMED_TERMINAL")
+            if "Traceback" in combined or "RuntimeError" in combined:
+                errors.append(prefix + ":UNCAUGHT_EXCEPTION")
+            if "SKIP threading census internal controls: external baseline invalid" \
+                    not in combined:
+                errors.append(prefix + ":BASELINE_FIRST")
+            if "threading census mutant" in combined:
+                errors.append(prefix + ":LATE_INTERNAL_CONTROL")
+            observed.append(name)
+    errors.extend(threading_external_inventory_errors(observed))
+    return errors
+
+
+def timestretch_snapshot(directory: Path) -> dict[str, str] | None:
+    snapshot: dict[str, str] = {}
+    for name in EXPECTED_OUTPUTS:
+        path = directory / name
+        if path.is_symlink() or not path.is_file():
+            return None
+        snapshot[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return snapshot
+
+
+def write_timestretch_sentinels(directory: Path, seed: str) -> dict[str, str]:
+    directory.mkdir()
+    for index, name in enumerate(EXPECTED_OUTPUTS):
+        (directory / name).write_bytes(
+            "DSPark transaction sentinel {} {} {}\n".format(
+                seed, index, name).encode("ascii"))
+    snapshot = timestretch_snapshot(directory)
+    if snapshot is None:
+        raise RuntimeError("sentinel construction failed")
+    return snapshot
+
+
+def timestretch_transaction_residue(directory: Path) -> list[str]:
+    return sorted(
+        path.name for path in directory.iterdir()
+        if path.name == TIMESTRETCH_TRANSACTION_DIRECTORY
+        or path.name.startswith(".dspark-timestretch-transaction-")
+    )
+
+
+def validate_timestretch_rollback(
+    directory: Path,
+    before: dict[str, str],
+    result: dict[str, object],
+    phase: str,
+    output_name: str,
+) -> list[str]:
+    errors: list[str] = []
+    prefix = "TIMESTRETCH_{}_ROLLBACK:{}".format(phase, output_name)
+    expected_stderr = "ERROR TIMESTRETCH_TRANSACTION_{} {}\n".format(
+        phase, output_name)
+    if result.get("exit_code") != 3 or result.get("errors") != []:
+        errors.append(prefix + ":PROCESS")
+    if result.get("stderr") != expected_stderr:
+        errors.append(prefix + ":TYPED_TERMINAL")
+    if "characterisation written" in str(result.get("stdout")):
+        errors.append(prefix + ":FALSE_SUCCESS")
+    if sorted(path.name for path in directory.iterdir()) \
+            != sorted(EXPECTED_OUTPUTS):
+        errors.append(prefix + ":FINAL_CENSUS")
+    after = timestretch_snapshot(directory)
+    if after != before:
+        errors.append(prefix + ":SENTINEL_HASH_DRIFT")
+    if timestretch_transaction_residue(directory):
+        errors.append(prefix + ":TRANSACTION_RESIDUE")
+    return errors
+
+
 def timestretch_live(root: Path,
                      discovery: list[dict[str, object]]) -> list[str]:
     errors: list[str] = []
@@ -1148,16 +1655,25 @@ def timestretch_live(root: Path,
         for compiler in discovery:
             label = str(compiler["label"])
             binary = scratch / ("characterize-" + label)
-            command = [
+            instrumented = scratch / ("characterize-transaction-" + label)
+            base_command = [
                 str(compiler["path"]), "-std=c++20", "-O2", "-Wall",
                 "-Wextra", "-Wpedantic", "-Werror", "-I", str(root),
                 str(root / "tools/characterize_timestretch.cpp"),
-                "-o", str(binary),
             ]
-            build = producer.run_owned(command, scratch, 240, "compile")
+            build = producer.run_owned(
+                [*base_command, "-o", str(binary)], scratch, 240, "compile")
+            test_build = producer.run_owned(
+                [*base_command,
+                 "-DDSPARK_TIMESTRETCH_TRANSACTION_TESTING=1",
+                 "-o", str(instrumented)], scratch, 240, "compile")
             if build["exit_code"] != 0 or build["errors"]:
                 errors.append("TIMESTRETCH_BUILD:" + label)
                 continue
+            if test_build["exit_code"] != 0 or test_build["errors"]:
+                errors.append("TIMESTRETCH_INSTRUMENTED_BUILD:" + label)
+                continue
+
             missing = scratch / ("missing-" + label)
             result = producer.run_owned(
                 [str(binary), str(missing)], scratch, 180, "run")
@@ -1174,32 +1690,100 @@ def timestretch_live(root: Path,
                     or "ERROR TIMESTRETCH_OUTPUT_DIRECTORY" not in result["stderr"] \
                     or "characterisation written" in result["stdout"]:
                 errors.append("TIMESTRETCH_REGULAR_FILE:" + label)
-            io_failure = scratch / ("io-failure-" + label)
-            io_failure.mkdir()
-            (io_failure / "c6-exact-ratio-drift.csv").mkdir()
+
+            nonregular = scratch / ("nonregular-final-" + label)
+            nonregular.mkdir()
+            (nonregular / EXPECTED_OUTPUTS[0]).mkdir()
             result = producer.run_owned(
-                [str(binary), str(io_failure)], scratch, 180, "run")
+                [str(binary), str(nonregular)], scratch, 180, "run")
             if result["exit_code"] != 3 \
-                    or "ERROR TIMESTRETCH_OUTPUT_IO c6-exact-ratio-drift.csv" \
-                    not in result["stderr"] \
-                    or "characterisation written" in result["stdout"]:
-                errors.append("TIMESTRETCH_IO_FAILURE:" + label)
+                    or result["stderr"] != (
+                        "ERROR TIMESTRETCH_TRANSACTION_PRECHECK {}\n".format(
+                            EXPECTED_OUTPUTS[0])) \
+                    or not (nonregular / EXPECTED_OUTPUTS[0]).is_dir() \
+                    or len(list(nonregular.iterdir())) != 1:
+                errors.append("TIMESTRETCH_NONREGULAR_FINAL:" + label)
+
+            symlink_root = scratch / ("symlink-final-" + label)
+            symlink_root.mkdir()
+            symlink_target = scratch / ("symlink-target-" + label)
+            symlink_target.write_bytes(b"caller-owned symlink target\n")
+            (symlink_root / EXPECTED_OUTPUTS[0]).symlink_to(symlink_target)
+            target_before = hashlib.sha256(symlink_target.read_bytes()).hexdigest()
+            result = producer.run_owned(
+                [str(binary), str(symlink_root)], scratch, 180, "run")
+            if result["exit_code"] != 3 \
+                    or result["stderr"] != (
+                        "ERROR TIMESTRETCH_TRANSACTION_PRECHECK {}\n".format(
+                            EXPECTED_OUTPUTS[0])) \
+                    or not (symlink_root / EXPECTED_OUTPUTS[0]).is_symlink() \
+                    or hashlib.sha256(symlink_target.read_bytes()).hexdigest() \
+                    != target_before:
+                errors.append("TIMESTRETCH_SYMLINK_FINAL:" + label)
+
+            collision = scratch / ("collision-" + label)
+            collision_before = write_timestretch_sentinels(
+                collision, label + "-collision")
+            (collision / TIMESTRETCH_TRANSACTION_DIRECTORY).mkdir()
+            result = producer.run_owned(
+                [str(binary), str(collision)], scratch, 180, "run")
+            (collision / TIMESTRETCH_TRANSACTION_DIRECTORY).rmdir()
+            if result["exit_code"] != 3 \
+                    or result["stderr"] != (
+                        "ERROR TIMESTRETCH_TRANSACTION_COLLISION {}\n".format(
+                            TIMESTRETCH_TRANSACTION_DIRECTORY)) \
+                    or timestretch_snapshot(collision) != collision_before:
+                errors.append("TIMESTRETCH_STAGE_COLLISION:" + label)
+
+            for phase, variable in TIMESTRETCH_FAILURE_PHASES:
+                for index, output_name in enumerate(EXPECTED_OUTPUTS):
+                    failure_root = scratch / (
+                        "{}-failure-{}-{}".format(
+                            phase.lower(), label, index))
+                    before = write_timestretch_sentinels(
+                        failure_root,
+                        "{}-{}-{}".format(label, phase.lower(), index))
+                    environment = dict(os.environ)
+                    for _other_phase, other_variable \
+                            in TIMESTRETCH_FAILURE_PHASES:
+                        environment.pop(other_variable, None)
+                    environment[variable] = str(index)
+                    result = producer.run_owned(
+                        [str(instrumented), str(failure_root)],
+                        scratch, 180, "run", environment)
+                    errors.extend(validate_timestretch_rollback(
+                        failure_root, before, result, phase, output_name))
+
             output = scratch / ("output-" + label)
             output.mkdir()
+            production_environment = dict(os.environ)
+            production_environment.update({
+                "DSPARK_TIMESTRETCH_FAIL_STAGE_INDEX": "0",
+                "DSPARK_TIMESTRETCH_FAIL_COMMIT_INDEX": "0",
+            })
             result = producer.run_owned(
-                [str(binary), str(output)], scratch, 180, "run")
+                [str(binary), str(output)], scratch, 180, "run",
+                production_environment)
             names = sorted(path.name for path in output.iterdir())
             if result["exit_code"] != 0 or result["errors"] \
                     or result["stderr"] != "" \
                     or result["stdout"] != (
                         "characterisation written to {}\n".format(output)) \
-                    or names != sorted(EXPECTED_OUTPUTS):
+                    or names != sorted(EXPECTED_OUTPUTS) \
+                    or timestretch_transaction_residue(output):
                 errors.append("TIMESTRETCH_SUCCESS_TRANSACTION:" + label)
                 continue
-            if any(not (output / name).is_file()
-                   or (output / name).stat().st_size == 0
-                   for name in EXPECTED_OUTPUTS):
+            first_success = timestretch_snapshot(output)
+            if first_success is None:
                 errors.append("TIMESTRETCH_OUTPUT_ARTIFACT:" + label)
+                continue
+            rerun = producer.run_owned(
+                [str(binary), str(output)], scratch, 180, "run")
+            if rerun["exit_code"] != 0 or rerun["errors"] \
+                    or rerun["stderr"] != "" \
+                    or timestretch_snapshot(output) != first_success \
+                    or timestretch_transaction_residue(output):
+                errors.append("TIMESTRETCH_SUCCESSFUL_REPLACEMENT:" + label)
             errors.extend(
                 error + ":" + label for error in measurement_errors(output))
     return errors
@@ -1257,14 +1841,20 @@ def live_mode(root: Path) -> int:
                 producer_result["errors"]))
         discovery = transcript.get("compiler_discovery", [])
         if not errors:
+            errors.extend(generic_gcc_live(root))
+        if not errors:
+            errors.extend(threading_external_live(root))
+        if not errors:
             errors.extend(timestretch_live(root, discovery))
             errors.extend(flac_live(root, discovery))
         for error in errors:
             print("ERROR " + error, file=sys.stderr)
         if errors:
             return 1
-    print("PASS global validation contract live: 2 discovery, 4 source, "
-          "16 execution rows, 4 green baselines, 12 exact expected REDs")
+    print("PASS global validation contract live: 2 primary discovery, "
+          "1 generic GCC13 fallback, 4 source, 16 execution rows, "
+          "33 threading mutations, 36 TimeStretch rollback injections, "
+          "4 green baselines, 12 exact expected REDs")
     return 0
 
 

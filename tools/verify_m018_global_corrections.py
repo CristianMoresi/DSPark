@@ -549,6 +549,13 @@ def run_owned(command: list[str], cwd: Path, timeout: float, phase: str,
     }
 
 
+GCC_DRIVER_TOKEN = (
+    r"(?<![A-Za-z0-9_+.-])"
+    r"(?:g\+\+(?:-\d+)?|gcc(?:-\d+)?)"
+    r"(?![A-Za-z0-9_+.-])"
+)
+
+
 def parse_compiler_version(first_line: str) -> tuple[str | None, int | None]:
     clang = re.search(r"\bclang version\s+(\d+)(?:\.|\b)", first_line, re.I)
     if clang:
@@ -556,14 +563,14 @@ def parse_compiler_version(first_line: str) -> tuple[str | None, int | None]:
     if "clang" in first_line.lower():
         return "clang", None
     gcc = re.search(
-        r"(?:^|\s)(?:g\+\+(?:-\d+)?|gcc(?:-\d+)?)\b.*?"
+        GCC_DRIVER_TOKEN + r".*?"
         r"(?:\)\s*|\bversion\s+)?(\d+)\.(\d+)",
         first_line,
         re.I,
     )
     if gcc:
         return "gcc", int(gcc.group(1))
-    if re.search(r"\b(?:g\+\+|gcc)\b", first_line, re.I):
+    if re.search(GCC_DRIVER_TOKEN, first_line, re.I):
         return "gcc", None
     return None, None
 

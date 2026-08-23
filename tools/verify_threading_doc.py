@@ -528,6 +528,50 @@ def remove_census_member(text, key, member):
     raise RuntimeError("census field is missing")
 
 
+def emit_failures_and_exit(items):
+    print("")
+    print("FAILURES ({}):".format(len(items)))
+    for item in items:
+        print("  - " + item)
+    raise SystemExit(1)
+
+
+def build_census_controls(text, source):
+    controls = []
+    try:
+        for key, label in CENSUS_LABELS.items():
+            count = len(source[key])
+            mutant = text.replace("{} ({})".format(label, count),
+                                  "{} ({})".format(label, count - 1), 1)
+            controls.append((
+                "count-{}".format(key), mutant,
+                "DOC_COUNT_MISMATCH:{}".format(key)))
+        for key in CENSUS_LABELS:
+            for index, member in enumerate(source[key], 1):
+                controls.append((
+                    "member-{}-{:02d}".format(key, index),
+                    replace_census_member(
+                        text, key, member, "Core/AnalogRandom.h"),
+                    "SOURCE_SET_MISMATCH:{}".format(key)))
+        stale_census = remove_census_member(
+            text, "total", "Analysis/BeatTracker.h")
+        stale_census = remove_census_member(
+            stale_census, "concrete", "Analysis/BeatTracker.h")
+        controls.extend((
+            ("stale-10-5-7-2", stale_census, "SOURCE_SET_MISMATCH:"),
+            ("block-absent", text.replace(CENSUS_BEGIN, "", 1),
+             "DOC_CENSUS_BLOCK_CARDINALITY"),
+            ("block-duplicate", text + "\n" + text.split(CENSUS_BEGIN, 1)[1]
+             .split(CENSUS_END, 1)[0].join((CENSUS_BEGIN, CENSUS_END)) + "\n",
+             "DOC_CENSUS_BLOCK_CARDINALITY"),
+        ))
+    except (KeyError, RuntimeError, IndexError) as error:
+        return [], [
+            "INTERNAL_CENSUS_CONTROL_CONSTRUCTION:{}:{}".format(
+                type(error).__name__, error)]
+    return controls, []
+
+
 pin_census, pin_census_issues = derive_pin_census()
 failures.extend("D: " + issue for issue in pin_census_issues)
 if pin_census != CENSUS_EXPECTED:
@@ -539,33 +583,15 @@ print("  exact pin census sets: total={total} template={template} "
       "concrete={concrete} overlap={overlap}".format(
           **{key: len(value) for key, value in pin_census.items()}))
 
-census_controls = []
-for key, label in CENSUS_LABELS.items():
-    count = len(pin_census[key])
-    mutant = doc.replace("{} ({})".format(label, count),
-                         "{} ({})".format(label, count - 1), 1)
-    census_controls.append((
-        "count-{}".format(key), mutant,
-        "DOC_COUNT_MISMATCH:{}".format(key)))
-for key in CENSUS_LABELS:
-    for index, member in enumerate(pin_census[key], 1):
-        census_controls.append((
-            "member-{}-{:02d}".format(key, index),
-            replace_census_member(
-                doc, key, member, "Core/AnalogRandom.h"),
-            "SOURCE_SET_MISMATCH:{}".format(key)))
-stale_census = remove_census_member(
-    doc, "total", "Analysis/BeatTracker.h")
-stale_census = remove_census_member(
-    stale_census, "concrete", "Analysis/BeatTracker.h")
-census_controls.extend((
-    ("stale-10-5-7-2", stale_census, "SOURCE_SET_MISMATCH:"),
-    ("block-absent", doc.replace(CENSUS_BEGIN, "", 1),
-     "DOC_CENSUS_BLOCK_CARDINALITY"),
-    ("block-duplicate", doc + "\n" + doc.split(CENSUS_BEGIN, 1)[1]
-     .split(CENSUS_END, 1)[0].join((CENSUS_BEGIN, CENSUS_END)) + "\n",
-     "DOC_CENSUS_BLOCK_CARDINALITY"),
-))
+if pin_census_issues or pin_census != CENSUS_EXPECTED \
+        or baseline_census_issues:
+    print("  SKIP threading census internal controls: external baseline invalid")
+    emit_failures_and_exit(failures)
+
+census_controls, census_control_construction_issues = \
+    build_census_controls(doc, pin_census)
+failures.extend(
+    "D: " + issue for issue in census_control_construction_issues)
 if len(census_controls) != 33:
     failures.append("D: threading census control cardinality is {}, expected 33"
                     .format(len(census_controls)))
@@ -1646,10 +1672,7 @@ else:
 
 print("")
 if failures:
-    print("FAILURES ({}):".format(len(failures)))
-    for f in failures:
-        print("  - " + f)
-    sys.exit(1)
+    emit_failures_and_exit(failures)
 print("threading: every identifier, path, quantifier, snippet and reference "
       "readout in the page checks out against the tree.")
 sys.exit(0)

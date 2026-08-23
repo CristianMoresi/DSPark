@@ -353,39 +353,231 @@ for phrase in ["verified lock-free at compile time", "fails the build there"]:
     else:
         print("  page does not claim: '{}'  OK".format(phrase))
 
-# The claim about which headers pin the property locally is read from the ONE
-# paragraph that makes it, not from the page as a whole: a header can be named
-# elsewhere on the page for unrelated reasons, and counting that as "named as
-# pinning it" would let a new static_assert land unnoticed in any header the
-# page already mentions.
-PIN_ANCHOR = "pin it themselves"
-pin_para = [p for p in paragraphs if PIN_ANCHOR in p]
-if not pin_para:
-    failures.append("D: the sentence naming the headers that pin the property "
-                    "locally is no longer in the page; tier D cannot check it")
-else:
-    para = pin_para[0]
-    named_assert = sorted({t for t in tick.findall(para)
-                           if pathish.match(t) and t in TRACKED})
-    print("  headers named by that paragraph as pinning it: {}".format(named_assert))
-    if set(named_assert) != set(assert_headers):
-        failures.append("D: the page names {} as pinning it locally; disk says {}"
-                        .format(named_assert, assert_headers))
-    check_numeral(para, r"headers?\s+pin it themselves",
-                  "headers that pin it themselves", len(assert_headers))
-    # "most of the headers that declare such an atomic do not" must stay true.
-    if re.search(r"most of the headers that declare such an atomic do\s+not",
-                 para):
-        if len(assert_headers) * 2 >= len(template_atomic):
-            failures.append("D: the page says most such headers do not pin it, "
-                            "but {} of {} do".format(len(assert_headers),
-                                                     len(template_atomic)))
-        else:
-            print("  'most do not' holds: {} of {} pin it locally  OK".format(
-                len(assert_headers), len(template_atomic)))
-    else:
-        failures.append("D: the sentence bounding how many headers pin it "
-                        "locally is no longer in the page; tier D cannot check it")
+# The exact block below is deliberately more rigid than the prose around it.
+# It binds four independent source-derived sets, every member, their overlap
+# and their union. A self-consistent stale census must fail just as surely as a
+# typo in one count.
+CENSUS_BEGIN = "<!-- THREADING_PIN_CENSUS_BEGIN -->"
+CENSUS_END = "<!-- THREADING_PIN_CENSUS_END -->"
+CENSUS_LABELS = {
+    "total": "All local pin headers",
+    "template": "Template-parameter pin headers",
+    "concrete": "Concrete-word pin headers",
+    "overlap": "Overlap headers",
+}
+CENSUS_EXPECTED = {
+    "total": [
+        "Analysis/BeatTracker.h",
+        "Analysis/SpectrumAnalyzer.h",
+        "Effects/AutoGain.h",
+        "Effects/DynamicEQ.h",
+        "Effects/Equalizer.h",
+        "Effects/PitchCorrector.h",
+        "Effects/Reverb.h",
+        "Effects/SpectralFreeze.h",
+        "Effects/TimeStretch.h",
+        "Effects/detail/PhaseVocoderEngine.h",
+        "Music/KeyDetector.h",
+    ],
+    "template": [
+        "Analysis/SpectrumAnalyzer.h",
+        "Effects/AutoGain.h",
+        "Effects/DynamicEQ.h",
+        "Effects/Equalizer.h",
+        "Effects/PitchCorrector.h",
+    ],
+    "concrete": [
+        "Analysis/BeatTracker.h",
+        "Analysis/SpectrumAnalyzer.h",
+        "Effects/PitchCorrector.h",
+        "Effects/Reverb.h",
+        "Effects/SpectralFreeze.h",
+        "Effects/TimeStretch.h",
+        "Effects/detail/PhaseVocoderEngine.h",
+        "Music/KeyDetector.h",
+    ],
+    "overlap": [
+        "Analysis/SpectrumAnalyzer.h",
+        "Effects/PitchCorrector.h",
+    ],
+}
+CENSUS_PIN = re.compile(
+    r"static_assert\s*\(\s*std::atomic\s*<\s*([^<>]+?)\s*>\s*::\s*"
+    r"is_always_lock_free\b"
+)
+CENSUS_TEMPLATE_DECL = re.compile(r"template\s*<([^>]+)>", re.S)
+CENSUS_CONCRETE = re.compile(
+    r"(?:bool|char|signed|unsigned(?:\s+int)?|float|double|"
+    r"std::(?:u?int(?:8|16|32|64)_t|size_t))\Z"
+)
+
+
+def derive_pin_census():
+    sets = {key: set() for key in ("total", "template", "concrete")}
+    issues = []
+    for path in sorted(p for p in SOURCES
+                       if p.startswith(FRAMEWORK_DIRS) and p.endswith(".h")):
+        code = CODE[path]
+        marker_count = len(re.findall(
+            r"static_assert\s*\(\s*std::atomic", code))
+        arguments = [" ".join(match.group(1).split())
+                     for match in CENSUS_PIN.finditer(code)]
+        if marker_count != len(arguments):
+            issues.append(
+                "UNSUPPORTED_ATOMIC_PIN_SYNTAX {} markers={} parsed={}"
+                .format(path, marker_count, len(arguments)))
+            continue
+        if not arguments:
+            continue
+        template_names = set()
+        for declaration in CENSUS_TEMPLATE_DECL.findall(code):
+            for parameter in declaration.split(","):
+                identifiers = re.findall(
+                    r"[A-Za-z_]\w*", parameter.split("=", 1)[0])
+                if identifiers:
+                    template_names.add(identifiers[-1])
+        for argument in arguments:
+            if (re.fullmatch(r"[A-Za-z_]\w*", argument)
+                    and argument in template_names):
+                sets["template"].add(path)
+            elif CENSUS_CONCRETE.fullmatch(argument):
+                sets["concrete"].add(path)
+            else:
+                issues.append(
+                    "UNCLASSIFIED_ATOMIC_PIN_ARGUMENT {} {!r}"
+                    .format(path, argument))
+        sets["total"].add(path)
+    sets["overlap"] = sets["template"] & sets["concrete"]
+    return {key: sorted(value) for key, value in sets.items()}, issues
+
+
+def parse_pin_census(text):
+    if text.count(CENSUS_BEGIN) != 1 or text.count(CENSUS_END) != 1:
+        return None, [
+            "DOC_CENSUS_BLOCK_CARDINALITY begin={} end={}".format(
+                text.count(CENSUS_BEGIN), text.count(CENSUS_END))]
+    body = text.split(CENSUS_BEGIN, 1)[1].split(CENSUS_END, 1)[0]
+    parsed = {}
+    issues = []
+    for key, label in CENSUS_LABELS.items():
+        matches = re.findall(
+            r"^- {} \((\d+)\):\s*(.*?)\.\s*$".format(re.escape(label)),
+            body, flags=re.M)
+        if len(matches) != 1:
+            issues.append("DOC_FIELD_CARDINALITY:{}:{}".format(
+                key, len(matches)))
+            continue
+        stated, members_text = matches[0]
+        members = re.findall(r"`([^`]+\.h)`", members_text)
+        if len(members) != len(set(members)):
+            issues.append("DOC_DUPLICATE_MEMBER:" + key)
+        if int(stated) != len(members):
+            issues.append(
+                "DOC_COUNT_MISMATCH:{}:stated={}:listed={}".format(
+                    key, stated, len(members)))
+        parsed[key] = sorted(set(members))
+    if all(key in parsed for key in CENSUS_LABELS):
+        if (set(parsed["template"]) & set(parsed["concrete"])
+                != set(parsed["overlap"])):
+            issues.append("DOC_OVERLAP_NOT_EXACT_INTERSECTION")
+        if (set(parsed["template"]) | set(parsed["concrete"])
+                != set(parsed["total"])):
+            issues.append("DOC_TOTAL_NOT_EXACT_UNION")
+    return parsed, issues
+
+
+def validate_pin_census(text, source):
+    parsed, issues = parse_pin_census(text)
+    if parsed is None:
+        return issues
+    for key in CENSUS_LABELS:
+        if key in parsed and parsed[key] != source[key]:
+            issues.append("SOURCE_SET_MISMATCH:{}:doc={}:source={}".format(
+                key, parsed[key], source[key]))
+    return issues
+
+
+def replace_census_member(text, key, old, new):
+    label = CENSUS_LABELS[key]
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.startswith("- {} (".format(label)):
+            needle = "`{}`".format(old)
+            if line.count(needle) != 1:
+                raise RuntimeError("census member anchor is not unique")
+            lines[index] = line.replace(needle, "`{}`".format(new), 1)
+            return "".join(lines)
+    raise RuntimeError("census field is missing")
+
+
+def remove_census_member(text, key, member):
+    label = CENSUS_LABELS[key]
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if not line.startswith("- {} (".format(label)):
+            continue
+        count = re.search(r"\((\d+)\)", line)
+        members = re.findall(r"`([^`]+\.h)`", line)
+        if count is None or member not in members:
+            raise RuntimeError("census stale-control anchor is missing")
+        members.remove(member)
+        lines[index] = "- {} ({}): {}.\n".format(
+            label, int(count.group(1)) - 1,
+            ", ".join("`{}`".format(item) for item in members))
+        return "".join(lines)
+    raise RuntimeError("census field is missing")
+
+
+pin_census, pin_census_issues = derive_pin_census()
+failures.extend("D: " + issue for issue in pin_census_issues)
+if pin_census != CENSUS_EXPECTED:
+    failures.append("D: exact source pin census changed: expected {} got {}"
+                    .format(CENSUS_EXPECTED, pin_census))
+baseline_census_issues = validate_pin_census(doc, pin_census)
+failures.extend("D: " + issue for issue in baseline_census_issues)
+print("  exact pin census sets: total={total} template={template} "
+      "concrete={concrete} overlap={overlap}".format(
+          **{key: len(value) for key, value in pin_census.items()}))
+
+census_controls = []
+for key, label in CENSUS_LABELS.items():
+    count = len(pin_census[key])
+    mutant = doc.replace("{} ({})".format(label, count),
+                         "{} ({})".format(label, count - 1), 1)
+    census_controls.append((
+        "count-{}".format(key), mutant,
+        "DOC_COUNT_MISMATCH:{}".format(key)))
+for key in CENSUS_LABELS:
+    for index, member in enumerate(pin_census[key], 1):
+        census_controls.append((
+            "member-{}-{:02d}".format(key, index),
+            replace_census_member(
+                doc, key, member, "Core/AnalogRandom.h"),
+            "SOURCE_SET_MISMATCH:{}".format(key)))
+stale_census = remove_census_member(
+    doc, "total", "Analysis/BeatTracker.h")
+stale_census = remove_census_member(
+    stale_census, "concrete", "Analysis/BeatTracker.h")
+census_controls.extend((
+    ("stale-10-5-7-2", stale_census, "SOURCE_SET_MISMATCH:"),
+    ("block-absent", doc.replace(CENSUS_BEGIN, "", 1),
+     "DOC_CENSUS_BLOCK_CARDINALITY"),
+    ("block-duplicate", doc + "\n" + doc.split(CENSUS_BEGIN, 1)[1]
+     .split(CENSUS_END, 1)[0].join((CENSUS_BEGIN, CENSUS_END)) + "\n",
+     "DOC_CENSUS_BLOCK_CARDINALITY"),
+))
+if len(census_controls) != 33:
+    failures.append("D: threading census control cardinality is {}, expected 33"
+                    .format(len(census_controls)))
+for name, mutant, expected_prefix in census_controls:
+    issues = validate_pin_census(mutant, pin_census)
+    passed = any(issue.startswith(expected_prefix) for issue in issues)
+    print("  {} threading census mutant {}".format(
+        "PASS" if passed else "FAIL", name))
+    if not passed:
+        failures.append(
+            "D: threading census mutant {} did not produce {}: {}".format(
+                name, expected_prefix, issues))
 
 
 def bare(word):

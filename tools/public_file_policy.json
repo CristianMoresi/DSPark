@@ -20,9 +20,9 @@
   },
   "counts": {
     "binary_exact": 184,
-    "first_party_ascii_text": 215,
+    "first_party_ascii_text": 216,
     "third_party_utf8_exact": 84,
-    "total": 483
+    "total": 484
   },
   "gitattributes_required_lines": [
     "* text=auto",
@@ -2214,6 +2214,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "tools/verify_float_cast_overflow_sanitizer.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/verify_global_validation_contract.py"
     },
     {
       "kind": "first_party_ascii_text",

@@ -113,8 +113,9 @@ add_test(NAME public_text_policy_self_test
             ${PROJECT_SOURCE_DIR}/tools/check_public_text.py --self-test
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 add_test(NAME global_product_corrections
-    COMMAND ${Python3_EXECUTABLE}
-            ${PROJECT_SOURCE_DIR}/tools/verify_m018_global_corrections.py
+    COMMAND ${Python3_EXECUTABLE} -B
+            ${PROJECT_SOURCE_DIR}/tools/verify_global_validation_contract.py
+            --ctest
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 add_test(NAME generated_docs_self_test
     COMMAND ${Python3_EXECUTABLE}

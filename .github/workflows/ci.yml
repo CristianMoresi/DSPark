@@ -32,17 +32,16 @@ jobs:
 
   documentation-quality:
     name: Public text and documentation quality
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install documentation tools
-        run: sudo apt-get update && sudo apt-get install -y doxygen graphviz
+        run: sudo apt-get update && sudo apt-get install -y doxygen graphviz g++-13 clang-18
       - name: Check the closed public-text policy and correction contract
         run: |
           python3 tools/check_public_text.py
           python3 tools/check_public_text.py --self-test
-          python3 tools/verify_m018_global_corrections.py
-          python3 tools/verify_m018_global_corrections.py --self-test
+          python3 -B tools/verify_global_validation_contract.py --live
       - name: Generate and validate the API reference
         run: |
           doxygen Doxyfile

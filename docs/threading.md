@@ -57,20 +57,24 @@ lock-free on every supported target and outside the census.
 That is a run-time census of the word types. It is **not** a compile-time check
 on your component, and the build will not stop you using a word the census
 never saw. Where the word type is a template parameter the census cannot reach
-it at all. Eleven headers pin it themselves -- `Analysis/SpectrumAnalyzer.h`,
-`Analysis/BeatTracker.h`, `Effects/AutoGain.h`, `Effects/Equalizer.h`,
-`Effects/DynamicEQ.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`,
-`Effects/SpectralFreeze.h`, `Effects/TimeStretch.h`,
-`Effects/detail/PhaseVocoderEngine.h` and `Music/KeyDetector.h` -- and
-most of the headers that declare such an atomic do not.
-Five of the ten pin a word whose
-type is a template parameter, which is the case the census cannot reach, and
-seven pin a concrete width the census already covers --
-`Analysis/SpectrumAnalyzer.h` and `Effects/PitchCorrector.h` do both. They pin
-the concrete ones anyway, because a compile-time assertion at the declaration
-is a stronger statement than a run-time one in another file and
-it is the declaration that a later edit changes. A new component with an atomic
-word on the audio path should do the same:
+it at all. The local lock-free pin census is therefore source-derived and
+exact. These are header sets, not assertion counts; a header that pins both
+kinds appears once in each applicable set.
+
+<!-- THREADING_PIN_CENSUS_BEGIN -->
+- All local pin headers (11): `Analysis/BeatTracker.h`, `Analysis/SpectrumAnalyzer.h`, `Effects/AutoGain.h`, `Effects/DynamicEQ.h`, `Effects/Equalizer.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`, `Effects/SpectralFreeze.h`, `Effects/TimeStretch.h`, `Effects/detail/PhaseVocoderEngine.h`, `Music/KeyDetector.h`.
+- Template-parameter pin headers (5): `Analysis/SpectrumAnalyzer.h`, `Effects/AutoGain.h`, `Effects/DynamicEQ.h`, `Effects/Equalizer.h`, `Effects/PitchCorrector.h`.
+- Concrete-word pin headers (8): `Analysis/BeatTracker.h`, `Analysis/SpectrumAnalyzer.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`, `Effects/SpectralFreeze.h`, `Effects/TimeStretch.h`, `Effects/detail/PhaseVocoderEngine.h`, `Music/KeyDetector.h`.
+- Overlap headers (2): `Analysis/SpectrumAnalyzer.h`, `Effects/PitchCorrector.h`.
+<!-- THREADING_PIN_CENSUS_END -->
+
+The overlap is the exact set intersection, so the union identity is
+`11 = 5 + 8 - 2`. Every count and every named membership is checked against
+the headers rather than inferred from another number in this paragraph. The
+concrete pins remain useful because a compile-time assertion at the declaration
+is a stronger statement than a run-time one in another file, and the
+declaration is what a later edit changes. A new component with an atomic word
+on the audio path should do the same:
 
 ```cpp
 static_assert(std::atomic<T>::is_always_lock_free,

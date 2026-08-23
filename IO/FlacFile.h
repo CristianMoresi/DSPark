@@ -1035,7 +1035,7 @@ private:
         return true;
     }
 
-    static void updateMd5(Md5& md5, const std::vector<int64_t>& pcm,
+    static bool updateMd5(Md5& md5, const std::vector<int64_t>& pcm,
                           uint8_t channels, uint8_t bitsPerSample,
                           uint32_t blockSize) noexcept
     {
@@ -1047,11 +1047,21 @@ private:
             {
                 const int64_t value = pcm[static_cast<size_t>(channel) * blockSize + sample];
                 const uint64_t representation = static_cast<uint64_t>(value);
-                for (unsigned byte = 0; byte < bytesPerSample; ++byte)
-                    encoded[byte] = static_cast<uint8_t>(representation >> (8 * byte));
-                md5.update(std::span<const uint8_t>(encoded, bytesPerSample));
+                encoded[0] = static_cast<uint8_t>(representation);
+                encoded[1] = static_cast<uint8_t>(representation >> 8);
+                encoded[2] = static_cast<uint8_t>(representation >> 16);
+                encoded[3] = static_cast<uint8_t>(representation >> 24);
+                switch (bytesPerSample)
+                {
+                    case 1: md5.update(std::span<const uint8_t>(encoded, 1)); break;
+                    case 2: md5.update(std::span<const uint8_t>(encoded, 2)); break;
+                    case 3: md5.update(std::span<const uint8_t>(encoded, 3)); break;
+                    case 4: md5.update(std::span<const uint8_t>(encoded, 4)); break;
+                    default: return false;
+                }
             }
         }
+        return true;
     }
 
     static bool allZero(const std::array<uint8_t, 16>& value) noexcept
@@ -1140,8 +1150,9 @@ private:
             if (coverage > kMaxDecodedPcmBytes
                 / (static_cast<uint64_t>(state.stream.channels) * bytesPerSample))
                 return false;
-            updateMd5(md5, pcm, state.stream.channels,
-                      state.stream.bitsPerSample, decoded.blockSize);
+            if (!updateMd5(md5, pcm, state.stream.channels,
+                           state.stream.bitsPerSample, decoded.blockSize))
+                return false;
             state.frames.push_back({ frameOffset, frameSize, firstSample,
                                      decoded.blockSize });
             if (!cursor.skip(frameSize))

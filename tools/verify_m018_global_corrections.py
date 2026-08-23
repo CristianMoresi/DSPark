@@ -5,15 +5,19 @@ from __future__ import annotations
 
 import argparse
 import ast
+import difflib
 import fnmatch
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Iterable
 
 
@@ -356,72 +360,341 @@ def run_doxygen_duplicate_mainpage_mutant(doxygen: str) -> bool:
 
 
 LIVE_REVERB_MUTATION_ANCHOR = (
-    "        // Candidate construction owns every throwing operation. Publisher\n"
-    "        // capacity is resolved before its first slot/scalar mutation; once the\n"
-    "        // commit begins, only unique_ptr moves and atomic/plain no-throw stores\n"
-    "        // remain.\n"
     "        auto candidate = buildBank(irStorage_, irLength_, irChannels_,\n"
+    "                                   irSampleRate_, spec_, fftBlockSize_, ds, st);\n"
+)
+LIVE_REVERB_BASELINE_HASH = (
+    "294a1053756adc86d84ab22240afdc4a55a706bef5e09a890ba6e084f4f6a80f"
+)
+LIVE_REVERB_SUBJECT_HASH = (
+    "ad203837e0ca53a8da3af2868d1c349e2e340fac3baed5a46371295d350d3e2b"
+)
+LIVE_REVERB_ANCHOR_HASH = (
+    "6cf8d8b452439b4a8b12e6a4e3cf68c962f315bb4fcc4060af68f4aad031c616"
+)
+LIVE_REVERB_VARIANTS = (
+    {
+        "id": "baseline",
+        "insertion": "",
+        "source_sha256": LIVE_REVERB_BASELINE_HASH,
+        "patch_sha256": hashlib.sha256(b"").hexdigest(),
+        "oracle": "GREEN",
+    },
+    {
+        "id": "early-mix",
+        "insertion": "        mix_.store(mix, std::memory_order_relaxed);\n",
+        "source_sha256": "a92a17baa0dee3618acf0a0de08a2e70b74fe479c73fd0bbf53c7dde4ec6ccfa",
+        "patch_sha256": "39400ede7f92730ec68e02599d8d0c125e066b571573422d036aaefaaa3222e9",
+        "oracle": "EXPECTED_RED",
+    },
+    {
+        "id": "early-predelay",
+        "insertion": (
+            "        preDelayMs_.store(preDelay, std::memory_order_relaxed);\n"
+            "        preDelaySamples_.store(preDelaySamples, std::memory_order_relaxed);\n"
+        ),
+        "source_sha256": "2bfc9fc8137ea9c214c740e0e953b4c1f9a5e13b096c5fcd0a4967c64cca23b6",
+        "patch_sha256": "42f1bb61861e677382493a2675f5d387959dab2af11aabca81bc1572ce977aff",
+        "oracle": "EXPECTED_RED",
+    },
+    {
+        "id": "partial-shaping-publication",
+        "insertion": "        decayScale_.store(ds, std::memory_order_relaxed);\n",
+        "source_sha256": "1f6af93ae51eeaead1cb4c929641ecaa7817d687b36ee7ff7fb6441cce6b2010",
+        "patch_sha256": "557fbc4018cef7d9f91ffc8c9aee972a0b7218e24b210238f25f33834a8fdadc",
+        "oracle": "EXPECTED_RED",
+    },
+)
+LIVE_COMPILER_SPECS = (
+    ("gcc13", "gcc", 13, ("g++-13", "g++")),
+    ("clang18", "clang", 18, ("clang++-18", "clang++")),
+)
+LIVE_PROFILES = (
+    ("normal", ()),
+    (
+        "sanitizer",
+        (
+            "-fno-omit-frame-pointer",
+            "-fsanitize=address,undefined,float-cast-overflow",
+            "-fno-sanitize-recover=all",
+        ),
+    ),
+)
+VERSION_TIMEOUT_SECONDS = 5
+COMPILE_TIMEOUT_SECONDS = 240
+RUN_TIMEOUT_SECONDS = 180
+PROCESS_GRACE_SECONDS = 1
+PROCESS_CLEANUP_SECONDS = 2
+MAX_CAPTURE_BYTES = 1024 * 1024
+BASELINE_STDOUT_HASH = (
+    "eafa64837b60b5c6e9549451a31a60eae06c9ae7e1c5668be64317c799a004b3"
+)
+MUTANT_STDOUT_HASH = (
+    "841c51be4ed070ceee4c4821c4fc60f89a273d7e30051bf8c7564f7282a3fd40"
+)
+MUTANT_STDERR = (
+    "FAIL reverb-reset-metadata-exception-shutdown: "
+    "failed setState changed serialized state bytes\n"
+)
+MUTANT_STDERR_HASH = (
+    "0f05f2094aec4099a5a1d7bc0de2b35f6dfeffa1ec4c0bafc4aa88da1376900b"
+)
+EMPTY_HASH = hashlib.sha256(b"").hexdigest()
+SANITIZER_DIAGNOSTICS = (
+    "ERROR: AddressSanitizer",
+    "runtime error:",
+    "LeakSanitizer",
 )
 
-LIVE_REVERB_MUTATIONS = (
-    (
-        "early-mix-commit",
-        "        mix_.store(mix, std::memory_order_relaxed);",
-    ),
-    (
-        "early-pre-delay-commit",
-        "        preDelayMs_.store(preDelay, std::memory_order_relaxed);\n"
-        "        preDelaySamples_.store(preDelaySamples, std::memory_order_relaxed);",
-    ),
-    (
-        "partial-shaping-publication-commit",
-        "        decayScale_.store(ds, std::memory_order_relaxed);",
-    ),
-)
 
-REQUIRED_COMPILER_CANDIDATES = {
-    "gcc": ("g++-13", "g++"),
-    "clang": ("clang++-18", "clang++"),
-}
+def process_group_members(process_group: int) -> list[int]:
+    members: list[int] = []
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return members
+    for item in proc.iterdir():
+        if not item.name.isdigit():
+            continue
+        try:
+            stat_text = (item / "stat").read_text(encoding="ascii")
+            fields = stat_text[stat_text.rfind(")") + 2:].split()
+            if fields[0] != "Z" and int(fields[2]) == process_group:
+                members.append(int(item.name))
+        except (FileNotFoundError, PermissionError, ValueError, IndexError):
+            continue
+    return sorted(members)
 
 
-def compiler_family(version: str) -> str | None:
-    lowered = version.lower()
-    if "clang" in lowered:
-        return "clang"
-    if "g++" in lowered or "gcc" in lowered:
-        return "gcc"
-    return None
+def signal_process_group(process_group: int, value: signal.Signals) -> None:
+    try:
+        os.killpg(process_group, value)
+    except ProcessLookupError:
+        pass
 
 
-def discover_required_compilers() -> tuple[
-    dict[str, tuple[str, str]], dict[str, str]
-]:
-    compilers: dict[str, tuple[str, str]] = {}
-    failures: dict[str, str] = {}
-    for required_family, candidates in REQUIRED_COMPILER_CANDIDATES.items():
-        attempts: list[str] = []
-        for candidate in candidates:
-            executable = shutil.which(candidate)
-            if executable is None:
-                attempts.append(f"{candidate}: not found")
+def run_owned(command: list[str], cwd: Path, timeout: float, phase: str,
+              environment: dict[str, str] | None = None) -> dict[str, object]:
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        shell=False,
+    )
+    process_group = process.pid
+    timed_out = False
+    cleanup_actions: list[str] = []
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        cleanup_actions.append("SIGTERM_PROCESS_GROUP")
+        signal_process_group(process_group, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(
+                timeout=PROCESS_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            cleanup_actions.append("SIGKILL_PROCESS_GROUP")
+            signal_process_group(process_group, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+
+    residue_detected = process_group_members(process_group)
+    if residue_detected:
+        cleanup_actions.append("SIGTERM_RESIDUAL_PROCESS_GROUP")
+        signal_process_group(process_group, signal.SIGTERM)
+        time.sleep(PROCESS_GRACE_SECONDS)
+        if process_group_members(process_group):
+            cleanup_actions.append("SIGKILL_RESIDUAL_PROCESS_GROUP")
+            signal_process_group(process_group, signal.SIGKILL)
+    deadline = time.monotonic() + PROCESS_CLEANUP_SECONDS
+    residue = process_group_members(process_group)
+    while residue and time.monotonic() < deadline:
+        time.sleep(0.02)
+        residue = process_group_members(process_group)
+
+    stdout_too_large = len(stdout) > MAX_CAPTURE_BYTES
+    stderr_too_large = len(stderr) > MAX_CAPTURE_BYTES
+    stdout = stdout[:MAX_CAPTURE_BYTES]
+    stderr = stderr[:MAX_CAPTURE_BYTES]
+    errors: list[str] = []
+    if timed_out:
+        errors.append(phase.upper() + "_TIMEOUT")
+    if residue_detected or residue:
+        errors.append("PROCESS_TREE_CLEANUP_FAILED")
+    if stdout_too_large:
+        errors.append("STDOUT_LIMIT_EXCEEDED")
+    if stderr_too_large:
+        errors.append("STDERR_LIMIT_EXCEEDED")
+    return {
+        "command": command,
+        "phase": phase,
+        "timeout_seconds": timeout,
+        "duration_seconds": round(time.monotonic() - started, 6),
+        "exit_code": process.returncode,
+        "timed_out": timed_out,
+        "stdout": stdout.decode("utf-8", "replace"),
+        "stderr": stderr.decode("utf-8", "replace"),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        "stdout_size": len(stdout),
+        "stderr_size": len(stderr),
+        "cleanup_actions": cleanup_actions,
+        "residue_detected": residue_detected,
+        "cleanup_residue": residue,
+        "errors": errors,
+    }
+
+
+def parse_compiler_version(first_line: str) -> tuple[str | None, int | None]:
+    clang = re.search(r"\bclang version\s+(\d+)(?:\.|\b)", first_line, re.I)
+    if clang:
+        return "clang", int(clang.group(1))
+    if "clang" in first_line.lower():
+        return "clang", None
+    gcc = re.search(
+        r"(?:^|\s)(?:g\+\+(?:-\d+)?|gcc(?:-\d+)?)\b.*?"
+        r"(?:\)\s*|\bversion\s+)?(\d+)\.(\d+)",
+        first_line,
+        re.I,
+    )
+    if gcc:
+        return "gcc", int(gcc.group(1))
+    if re.search(r"\b(?:g\+\+|gcc)\b", first_line, re.I):
+        return "gcc", None
+    return None, None
+
+
+def parse_dump_version(output: str) -> int | None:
+    match = re.fullmatch(r"\s*(\d+)(?:\.\d+){0,3}\s*", output)
+    return int(match.group(1)) if match else None
+
+
+def discover_compiler(label: str, family: str, major: int,
+                      candidates: tuple[str, ...], cwd: Path,
+                      resolver: dict[str, str] | None = None) -> dict[str, object]:
+    attempts: list[dict[str, object]] = []
+    for candidate in candidates:
+        executable = (resolver or {}).get(candidate) if resolver is not None \
+            else shutil.which(candidate)
+        if not executable:
+            attempts.append({
+                "family": family,
+                "candidate": candidate,
+                "reason": "MISSING_EXECUTABLE",
+            })
+            continue
+        version = run_owned(
+            [executable, "--version"], cwd, VERSION_TIMEOUT_SECONDS,
+            "version_probe")
+        if version["timed_out"] or version["cleanup_residue"] \
+                or version["residue_detected"]:
+            reason = "VERSION_PROBE_TIMEOUT" if version["timed_out"] \
+                else "PROCESS_TREE_CLEANUP_FAILED"
+        elif version["exit_code"] != 0:
+            reason = "VERSION_PROBE_NONZERO:{}".format(version["exit_code"])
+        elif not str(version["stdout"]).splitlines():
+            reason = "VERSION_OUTPUT_EMPTY"
+        else:
+            first_line = str(version["stdout"]).splitlines()[0]
+            parsed_family, parsed_major = parse_compiler_version(first_line)
+            if parsed_family is None or parsed_major is None:
+                reason = "VERSION_OUTPUT_MALFORMED"
+            elif parsed_family != family:
+                reason = "FAMILY_MISMATCH:{}".format(parsed_family)
+            elif parsed_major != major:
+                reason = "MAJOR_MISMATCH:{}".format(parsed_major)
+            else:
+                dumped = run_owned(
+                    [executable, "-dumpfullversion", "-dumpversion"], cwd,
+                    VERSION_TIMEOUT_SECONDS, "dump_version_probe")
+                dump_major = parse_dump_version(str(dumped["stdout"])) \
+                    if dumped["exit_code"] == 0 else None
+                if dumped["timed_out"] or dumped["cleanup_residue"] \
+                        or dumped["residue_detected"]:
+                    reason = "DUMP_VERSION_TIMEOUT" if dumped["timed_out"] \
+                        else "PROCESS_TREE_CLEANUP_FAILED"
+                elif dumped["exit_code"] != 0:
+                    reason = "DUMP_VERSION_NONZERO:{}".format(
+                        dumped["exit_code"])
+                elif dump_major is None:
+                    reason = "DUMP_VERSION_MALFORMED"
+                elif dump_major != major or dump_major != parsed_major:
+                    reason = "DUMP_VERSION_MAJOR_MISMATCH:{}".format(dump_major)
+                else:
+                    return {
+                        "label": label,
+                        "status": "PASS",
+                        # Preserve the invoked driver spelling. On common
+                        # installations clang++ is a symlink to clang; resolving
+                        # it before execution silently drops C++ linker-driver
+                        # semantics even though both names reach one binary.
+                        "path": executable,
+                        "resolved_path": str(Path(executable).resolve()),
+                        "candidate": candidate,
+                        "family": family,
+                        "major": major,
+                        "version_first_line": first_line,
+                        "dump_version": str(dumped["stdout"]).strip(),
+                        "version_process": version,
+                        "dump_process": dumped,
+                        "attempts": attempts,
+                    }
+                attempts.append({
+                    "family": family,
+                    "candidate": candidate,
+                    "reason": reason,
+                    "process": dumped,
+                })
                 continue
-            version_result = run([executable, "--version"])
-            first_line = version_result.stdout.splitlines()[0] \
-                if version_result.stdout.splitlines() else "no version output"
-            actual_family = compiler_family(first_line)
-            attempts.append(
-                f"{candidate}: {first_line} (classified {actual_family})"
-            )
-            if version_result.returncode == 0 and actual_family == required_family:
-                compilers[required_family] = (executable, first_line)
-                break
-        if required_family not in compilers:
-            failures[required_family] = "; ".join(attempts)
-    return compilers, failures
+        attempts.append({
+            "family": family,
+            "candidate": candidate,
+            "reason": reason,
+            "process": version,
+        })
+    terminal = (
+        "COMPILER_DISCOVERY_FAILED family={} required_major={}; ".format(
+            family, major)
+        + "; ".join(
+            "candidate={} reason={}".format(
+                attempt["candidate"], attempt["reason"])
+            for attempt in attempts)
+    )
+    return {
+        "label": label,
+        "status": "FAIL",
+        "required_family": family,
+        "required_major": major,
+        "attempts": attempts,
+        "terminal": terminal,
+    }
 
 
-def copy_reverb_subject(root: Path, destination: Path) -> None:
+def validate_copy_source(path: Path) -> list[str]:
+    errors: list[str] = []
+    if not path.is_dir() or path.is_symlink():
+        return ["SOURCE_COPY_ROOT_INVALID " + str(path)]
+    for item in path.rglob("*"):
+        if item.is_symlink():
+            errors.append("SOURCE_COPY_SYMLINK " + str(item))
+        elif not item.is_dir() and not item.is_file():
+            errors.append("SOURCE_COPY_NONREGULAR " + str(item))
+    return errors
+
+
+def copy_reverb_subject(root: Path, destination: Path) -> list[str]:
+    errors = validate_copy_source(root / "Core")
+    errors.extend(validate_copy_source(root / "IO"))
+    for relative in ("Effects/Reverb.h", "tests/TestReverbPublication.cpp"):
+        path = root / relative
+        if not path.is_file() or path.is_symlink():
+            errors.append("SOURCE_COPY_FILE_INVALID " + relative)
+    if errors:
+        return errors
     shutil.copytree(root / "Core", destination / "Core")
     shutil.copytree(root / "IO", destination / "IO")
     (destination / "Effects").mkdir()
@@ -429,166 +702,226 @@ def copy_reverb_subject(root: Path, destination: Path) -> None:
     shutil.copy2(root / "Effects/Reverb.h", destination / "Effects/Reverb.h")
     shutil.copy2(
         root / "tests/TestReverbPublication.cpp",
-        destination / "tests/TestReverbPublication.cpp",
-    )
+        destination / "tests/TestReverbPublication.cpp")
+    return []
 
 
-def apply_live_reverb_mutation(destination: Path, insertion: str) -> str | None:
-    header = destination / "Effects/Reverb.h"
-    source = header.read_text(encoding="ascii")
-    count = source.count(LIVE_REVERB_MUTATION_ANCHOR)
-    if count != 1:
-        return f"production anchor count expected 1, got {count}"
-    replacement = LIVE_REVERB_MUTATION_ANCHOR.replace(
-        "        auto candidate = buildBank(irStorage_, irLength_, irChannels_,\n",
-        insertion
-        + "\n        auto candidate = buildBank(irStorage_, irLength_, irChannels_,\n",
-    )
-    header.write_text(
-        source.replace(LIVE_REVERB_MUTATION_ANCHOR, replacement, 1),
-        encoding="ascii",
-    )
-    return None
+def prepare_reverb_variants(root: Path, scratch: Path) -> tuple[
+    list[dict[str, object]], dict[str, Path], list[str]
+]:
+    errors: list[str] = []
+    baseline_bytes = (root / "Effects/Reverb.h").read_bytes()
+    subject_bytes = (root / "tests/TestReverbPublication.cpp").read_bytes()
+    baseline = baseline_bytes.decode("ascii")
+    if digest(baseline_bytes) != LIVE_REVERB_BASELINE_HASH:
+        errors.append("BASELINE_SOURCE_HASH")
+    if digest(subject_bytes) != LIVE_REVERB_SUBJECT_HASH:
+        errors.append("DEDICATED_SUBJECT_HASH")
+    if baseline.count(LIVE_REVERB_MUTATION_ANCHOR) != 1:
+        errors.append("MUTATION_ANCHOR_CARDINALITY:{}".format(
+            baseline.count(LIVE_REVERB_MUTATION_ANCHOR)))
+    if digest(LIVE_REVERB_MUTATION_ANCHOR.encode("ascii")) \
+            != LIVE_REVERB_ANCHOR_HASH:
+        errors.append("MUTATION_ANCHOR_HASH")
+
+    records: list[dict[str, object]] = []
+    roots: dict[str, Path] = {}
+    for variant in LIVE_REVERB_VARIANTS:
+        variant_id = str(variant["id"])
+        insertion = str(variant["insertion"])
+        changed = baseline if not insertion else baseline.replace(
+            LIVE_REVERB_MUTATION_ANCHOR,
+            insertion + LIVE_REVERB_MUTATION_ANCHOR,
+            1)
+        patch = "".join(difflib.unified_diff(
+            baseline.splitlines(keepends=True),
+            changed.splitlines(keepends=True),
+            fromfile="Effects/Reverb.h@P3",
+            tofile="Effects/Reverb.h@{}".format(variant_id),
+        ))
+        insertion_delta = 0
+        if insertion:
+            insertion_delta = changed.count(insertion.rstrip()) \
+                - baseline.count(insertion.rstrip())
+        record = {
+            "id": variant_id,
+            "insertion_sha256": digest(insertion.encode("ascii")),
+            "source_sha256": digest(changed.encode("ascii")),
+            "patch_sha256": digest(patch.encode("ascii")),
+            "anchor_count_before": baseline.count(LIVE_REVERB_MUTATION_ANCHOR),
+            "anchor_count_after": changed.count(LIVE_REVERB_MUTATION_ANCHOR),
+            "insertion_delta": insertion_delta,
+        }
+        records.append(record)
+        expected_delta = 0 if variant_id == "baseline" else 1
+        if record["source_sha256"] != variant["source_sha256"]:
+            errors.append("MUTATED_SOURCE_HASH:" + variant_id)
+        if record["patch_sha256"] != variant["patch_sha256"]:
+            errors.append("MUTATION_PATCH_HASH:" + variant_id)
+        if record["anchor_count_after"] != 1:
+            errors.append("POST_MUTATION_ANCHOR_CARDINALITY:" + variant_id)
+        if insertion_delta != expected_delta:
+            errors.append("MUTATION_INSERTION_DELTA:" + variant_id)
+
+        destination = scratch / variant_id
+        errors.extend(copy_reverb_subject(root, destination))
+        if destination.is_dir():
+            header = destination / "Effects/Reverb.h"
+            header.write_text(changed, encoding="ascii")
+            if digest(header.read_bytes()) != record["source_sha256"]:
+                errors.append("ISOLATED_SOURCE_HASH:" + variant_id)
+            roots[variant_id] = destination
+    return records, roots, errors
 
 
-def compile_and_run_reverb_subject(
-    compiler: str,
-    family: str,
-    source_root: Path,
-    binary_name: str,
-    expect_transaction_red: bool,
-) -> tuple[bool, str]:
-    binary = source_root / binary_name
-    command = [
-        compiler,
-        "-std=c++20",
-        "-O1",
-        "-Wall",
-        "-Wextra",
-        "-Wpedantic",
-        "-Werror",
-        "-DDSPARK_REVERB_TEST_GENERATION_MAX=1",
-        "-pthread",
-        "-I",
-        str(source_root),
-        str(source_root / "tests/TestReverbPublication.cpp"),
-        "-o",
-        str(binary),
+def reverb_row(compiler_record: dict[str, object], profile: str,
+               extra_flags: tuple[str, ...], variant: dict[str, object],
+               source_record: dict[str, object], source_root: Path) -> dict[str, object]:
+    compiler_label = str(compiler_record["label"])
+    family = str(compiler_record["family"])
+    variant_id = str(variant["id"])
+    identity = "reverb::{}::{}::{}".format(
+        compiler_label, profile, variant_id)
+    binary = source_root / "subject-{}-{}-{}".format(
+        compiler_label, profile, variant_id)
+    flags = [
+        "-std=c++20", "-O1", "-g", *extra_flags,
+        "-Wall", "-Wextra", "-Wpedantic", "-Werror",
     ]
     if family == "gcc":
-        command.insert(6, "-Wno-mismatched-new-delete")
-    try:
-        built = subprocess.run(
-            command,
-            cwd=source_root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-            timeout=180,
-        )
-    except subprocess.TimeoutExpired as error:
-        return False, f"build timed out: {error}"
-    if built.returncode != 0:
-        return False, "build failed:\n" + built.stdout[-8000:]
-    try:
-        executed = subprocess.run(
-            [str(binary)],
-            cwd=source_root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired as error:
-        return False, f"execution timed out: {error}"
-    if expect_transaction_red:
-        expected = "failed setState changed serialized state bytes"
-        passed = executed.returncode != 0 and expected in executed.stdout
-        if passed:
-            return True, (
-                f"expected transaction RED rc={executed.returncode}: {expected}"
-            )
-        return False, (
-            f"expected transaction RED missing; rc={executed.returncode}\n"
-            + executed.stdout[-8000:]
-        )
-    passed = executed.returncode == 0 and "11 checks, 0 failures" in executed.stdout
-    if passed:
-        return True, "baseline dedicated Reverb subject passed 11 checks"
-    return False, (
-        f"baseline dedicated Reverb subject failed; rc={executed.returncode}\n"
-        + executed.stdout[-8000:]
+        flags.append("-Wno-mismatched-new-delete")
+    command = [
+        str(compiler_record["path"]), *flags,
+        "-DDSPARK_REVERB_TEST_GENERATION_MAX=1", "-pthread",
+        "-I", str(source_root),
+        str(source_root / "tests/TestReverbPublication.cpp"),
+        "-o", str(binary),
+    ]
+    build = run_owned(
+        command, source_root, COMPILE_TIMEOUT_SECONDS, "compile")
+    build_ok = (
+        build["exit_code"] == 0 and not build["errors"]
+        and binary.is_file() and not binary.is_symlink()
     )
+    removed_environment = ("ASAN_OPTIONS", "UBSAN_OPTIONS", "LSAN_OPTIONS")
+    set_environment = {"LC_ALL": "C", "LANG": "C"}
+    if profile == "sanitizer":
+        set_environment.update({
+            "ASAN_OPTIONS": "halt_on_error=1:abort_on_error=1:detect_leaks=1",
+            "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1",
+        })
+    environment_contract = {
+        "remove_first": list(removed_environment),
+        "set": set_environment,
+    }
+    execution: dict[str, object] | None = None
+    oracle_satisfied = False
+    if build_ok:
+        environment = dict(os.environ)
+        for name in removed_environment:
+            environment.pop(name, None)
+        environment.update(set_environment)
+        execution = run_owned(
+            [str(binary)], source_root, RUN_TIMEOUT_SECONDS, "run",
+            environment)
+        combined = str(execution["stdout"]) + str(execution["stderr"])
+        sanitizer_clean = not any(
+            marker in combined for marker in SANITIZER_DIAGNOSTICS)
+        if variant_id == "baseline":
+            oracle_satisfied = (
+                execution["exit_code"] == 0
+                and execution["stdout_sha256"] == BASELINE_STDOUT_HASH
+                and str(execution["stdout"]).endswith("11 checks, 0 failures\n")
+                and execution["stderr_sha256"] == EMPTY_HASH
+                and not execution["errors"]
+                and sanitizer_clean
+            )
+        else:
+            oracle_satisfied = (
+                execution["exit_code"] == 1
+                and execution["stdout_sha256"] == MUTANT_STDOUT_HASH
+                and str(execution["stdout"]).endswith("11 checks, 1 failures\n")
+                and execution["stderr_sha256"] == MUTANT_STDERR_HASH
+                and execution["stderr"] == MUTANT_STDERR
+                and not execution["errors"]
+                and sanitizer_clean
+            )
+    return {
+        "id": identity,
+        "compiler": compiler_label,
+        "profile": profile,
+        "variant": variant_id,
+        "oracle": variant["oracle"],
+        "source_sha256": source_record["source_sha256"],
+        "build_ok": build_ok,
+        "run_timed_out": bool(execution and execution["timed_out"]),
+        "cleanup_residue": [] if execution is None else execution["cleanup_residue"],
+        "oracle_satisfied": oracle_satisfied,
+        "environment_contract": environment_contract,
+        "compile": build,
+        "run": execution,
+    }
 
 
-def live_reverb_mutation_checks(
-    root: Path,
-) -> tuple[list[tuple[str, bool]], dict[str, str]]:
-    checks: list[tuple[str, bool]] = []
-    details: dict[str, str] = {}
-    compilers, discovery_failures = discover_required_compilers()
-    for family in REQUIRED_COMPILER_CANDIDATES:
-        name = f"live-reverb-{family}-compiler-discovery"
-        passed = family in compilers
-        checks.append((name, passed))
-        details[name] = compilers[family][1] if passed \
-            else discovery_failures.get(family, "no discovery evidence")
-
-    with tempfile.TemporaryDirectory(prefix="dspark-live-reverb-mutants-") as directory:
+def build_live_transcript(root: Path) -> dict[str, object]:
+    transcript: dict[str, object] = {
+        "schema": "dspark.global-validation-producer.v1",
+        "invocation_count": 1,
+        "compiler_discovery": [],
+        "source_variants": [],
+        "executions": [],
+        "errors": [],
+    }
+    if os.name != "posix" or not Path("/proc").is_dir():
+        transcript["errors"] = ["UNSUPPORTED_PROCESS_TREE_PLATFORM"]
+        transcript["status"] = "FAIL"
+        return transcript
+    with tempfile.TemporaryDirectory(
+            prefix="dspark-global-validation-") as directory:
         scratch = Path(directory)
-        baseline = scratch / "baseline"
-        copy_reverb_subject(root, baseline)
-
-        mutation_roots: dict[str, Path] = {}
-        for mutation_name, insertion in LIVE_REVERB_MUTATIONS:
-            mutation_root = scratch / mutation_name
-            copy_reverb_subject(root, mutation_root)
-            mutation_error = apply_live_reverb_mutation(mutation_root, insertion)
-            if mutation_error is not None:
-                details[f"mutation-source-{mutation_name}"] = mutation_error
-            mutation_roots[mutation_name] = mutation_root
-
-        for family in REQUIRED_COMPILER_CANDIDATES:
-            if family not in compilers:
-                continue
-            compiler, _version = compilers[family]
-            baseline_name = f"live-reverb-baseline-{family}"
-            baseline_passed, baseline_detail = compile_and_run_reverb_subject(
-                compiler, family, baseline, f"subject-{family}", False
-            )
-            checks.append((baseline_name, baseline_passed))
-            details[baseline_name] = baseline_detail
-
-            for mutation_name, _insertion in LIVE_REVERB_MUTATIONS:
-                check_name = f"live-reverb-{mutation_name}-{family}"
-                source_error = details.get(f"mutation-source-{mutation_name}")
-                if source_error is not None:
-                    checks.append((check_name, False))
-                    details[check_name] = source_error
-                    continue
-                passed, detail = compile_and_run_reverb_subject(
-                    compiler,
-                    family,
-                    mutation_roots[mutation_name],
-                    f"subject-{family}",
-                    True,
-                )
-                checks.append((check_name, passed))
-                details[check_name] = detail
-
-    expected_check_count = 10
-    cardinality_name = "live-reverb-execution-matrix-cardinality"
-    cardinality_passed = len(checks) == expected_check_count
-    details[cardinality_name] = (
-        f"expected {expected_check_count} discovery/build/run checks, got {len(checks)}"
-    )
-    checks.append((cardinality_name, cardinality_passed))
-    return checks, details
+        discovery = [
+            discover_compiler(label, family, major, candidates, scratch)
+            for label, family, major, candidates in LIVE_COMPILER_SPECS
+        ]
+        transcript["compiler_discovery"] = discovery
+        source_records, source_roots, source_errors = prepare_reverb_variants(
+            root, scratch / "variants")
+        transcript["source_variants"] = source_records
+        errors = list(source_errors)
+        errors.extend(
+            str(record["terminal"])
+            for record in discovery if record["status"] != "PASS")
+        rows: list[dict[str, object]] = []
+        if not errors:
+            source_by_id = {
+                str(record["id"]): record for record in source_records}
+            for compiler_record in discovery:
+                for profile, extra_flags in LIVE_PROFILES:
+                    for variant in LIVE_REVERB_VARIANTS:
+                        variant_id = str(variant["id"])
+                        rows.append(reverb_row(
+                            compiler_record, profile, extra_flags, variant,
+                            source_by_id[variant_id], source_roots[variant_id]))
+        transcript["executions"] = rows
+        if len(rows) != 16:
+            errors.append("EXECUTION_ROW_CARDINALITY:{}".format(len(rows)))
+        errors.extend(
+            "ROW_ORACLE_FAILED:" + str(row["id"])
+            for row in rows if not row["oracle_satisfied"])
+        transcript["errors"] = errors
+        transcript["status"] = "PASS" if not errors else "FAIL"
+    return transcript
 
 
-def self_test(root: Path, doxygen: str | None) -> int:
+def write_machine_transcript(path: Path, transcript: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="ascii", newline="\n") as handle:
+        json.dump(transcript, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def self_test(root: Path, doxygen: str | None,
+              machine_json: Path | None = None) -> int:
     config = (root / "Doxyfile").read_text(encoding="ascii")
     checks: list[tuple[str, bool]] = []
     details: dict[str, str] = {}
@@ -658,9 +991,25 @@ def self_test(root: Path, doxygen: str | None) -> int:
         checks.append(("parameter-warning-disabled-mutant-rejected", not warning_disabled))
     else:
         print("UNAVAILABLE mutant undocumented-public-parameter (no Doxygen)")
-    live_checks, live_details = live_reverb_mutation_checks(root)
-    checks.extend(live_checks)
-    details.update(live_details)
+    transcript = build_live_transcript(root)
+    discovery = transcript.get("compiler_discovery", [])
+    sources = transcript.get("source_variants", [])
+    rows = transcript.get("executions", [])
+    checks.extend((
+        ("live-reverb-compiler-discovery-cardinality", len(discovery) == 2),
+        ("live-reverb-source-cardinality", len(sources) == 4),
+        ("live-reverb-execution-cardinality", len(rows) == 16),
+        ("live-reverb-complete-matrix", transcript.get("status") == "PASS"),
+    ))
+    details["live-reverb-complete-matrix"] = json.dumps(
+        transcript.get("errors", []), sort_keys=True)
+    if machine_json is not None:
+        try:
+            write_machine_transcript(machine_json, transcript)
+        except (FileExistsError, OSError) as error:
+            print(f"ERROR HARNESS MACHINE_TRANSCRIPT_WRITE {error}",
+                  file=sys.stderr)
+            return 2
     for name, passed in checks:
         print(f"{'PASS' if passed else 'FAIL'} mutant {name}")
         if name in details:
@@ -673,11 +1022,16 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--skip-public-text", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--machine-json", type=Path)
     parser.add_argument("--doxygen", default=shutil.which("doxygen"))
     arguments = parser.parse_args()
     root = arguments.root.resolve()
     if arguments.self_test:
-        return self_test(root, arguments.doxygen)
+        return self_test(root, arguments.doxygen, arguments.machine_json)
+    if arguments.machine_json is not None:
+        print("ERROR HARNESS --machine-json requires --self-test",
+              file=sys.stderr)
+        return 2
 
     errors: list[str] = []
     errors.extend(doxyfile_errors(root, (root / "Doxyfile").read_text(encoding="ascii")))

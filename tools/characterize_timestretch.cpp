@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <numbers>
 #include <string>
@@ -124,6 +125,20 @@ Signal pinkNoise(double seconds, int channels)
         for (auto& ch : sig) ch[i] = v;
     }
     return sig;
+}
+
+bool finishOutput(std::ofstream& output) noexcept
+{
+    output.flush();
+    const bool flushed = static_cast<bool>(output);
+    output.close();
+    return flushed && !output.fail();
+}
+
+int outputFailure(const char* name) noexcept
+{
+    std::fprintf(stderr, "ERROR TIMESTRETCH_OUTPUT_IO %s\n", name);
+    return 3;
 }
 
 /// Band-limited click: a windowed sinc, so it has no energy above the cutoff.
@@ -503,7 +518,23 @@ std::string fmt(double v, int prec = 3)
 
 int main(int argc, char** argv)
 {
-    const std::string dir = (argc > 1) ? argv[1] : ".";
+    if (argc != 2)
+    {
+        std::fprintf(stderr,
+                     "ERROR TIMESTRETCH_OUTPUT_DIRECTORY expected exactly one existing directory argument\n");
+        return 2;
+    }
+    const std::filesystem::path outputDirectory(argv[1]);
+    std::error_code directoryError;
+    if (!std::filesystem::is_directory(outputDirectory, directoryError)
+        || directoryError)
+    {
+        std::fprintf(stderr,
+                     "ERROR TIMESTRETCH_OUTPUT_DIRECTORY path is not an existing directory: %s\n",
+                     argv[1]);
+        return 2;
+    }
+    const std::string dir = outputDirectory.string();
 
     // The tone frequency is placed exactly on an analysis bin of the 32768
     // spectrum used for C2/C7, so a rectangular window leaks nothing and the
@@ -528,6 +559,7 @@ int main(int argc, char** argv)
     // The regression tripwires run first, before any aesthetic measurement.
     {
         std::ofstream f(dir + "/c6-exact-ratio-drift.csv");
+        if (!f.is_open()) return outputFailure("c6-exact-ratio-drift.csv");
         f << "target_ratio,input_samples,output_samples,expected_samples,length_error_samples,"
              "one_hop,realised_ratio_from_onsets,ratio_error_percent,onsets_used,"
              "worst_onset_error_samples\n";
@@ -580,10 +612,12 @@ int main(int argc, char** argv)
             r.outLen = m; r.wantLen = want; r.ratioError = err;
             rows.push_back(r);
         }
+        if (!finishOutput(f)) return outputFailure("c6-exact-ratio-drift.csv");
     }
 
     {
         std::ofstream f(dir + "/c7-unity-passthrough.csv");
+        if (!f.is_open()) return outputFailure("c7-unity-passthrough.csv");
         f << "signal,path,residual_dbfs,thd_n_dbfs,peak_dbfs\n";
         Options unity; unity.ratio = 1.0;
 
@@ -647,11 +681,13 @@ int main(int argc, char** argv)
         measure("1 kHz tone", tone, true);
         measure("pink noise", pink, false);
         measure("pink noise", pink, true);
+        if (!finishOutput(f)) return outputFailure("c7-unity-passthrough.csv");
     }
 
     // ------------------------------------------------------------------- C8
     {
         std::ofstream f(dir + "/c8-chopping-determinism.csv");
+        if (!f.is_open()) return outputFailure("c8-chopping-determinism.csv");
         f << "ratio,pattern,samples_compared,differing_samples,first_divergence,"
              "max_abs_difference\n";
         const std::vector<std::vector<int>> patterns = {
@@ -688,11 +724,13 @@ int main(int argc, char** argv)
                 }
             }
         }
+        if (!finishOutput(f)) return outputFailure("c8-chopping-determinism.csv");
     }
 
     // --------------------------------------------------------------- C1, C4
     {
         std::ofstream f1(dir + "/c1-stationary-fidelity.csv");
+        if (!f1.is_open()) return outputFailure("c1-stationary-fidelity.csv");
         f1 << "# LSD is computed on both averaged spectra clipped to 80 dB below the\n"
               "# reference's own peak. The bed is 12 partials, so most bins of the\n"
               "# 20 Hz-16 kHz range hold nothing but the analyser's numerical residue\n"
@@ -701,6 +739,7 @@ int main(int argc, char** argv)
               "# unclipped value is carried alongside so the difference is visible.\n";
         f1 << "ratio,lsd_db,lsd_limit_db,lsd_db_unclipped,spectral_convergence_db\n";
         std::ofstream f4(dir + "/c4-vertical-coherence.csv");
+        if (!f4.is_open()) return outputFailure("c4-vertical-coherence.csv");
         f4 << "# consistency_* is the round-trip ratio as specified. The transform\n"
               "# pair inverts exactly on any real signal, so every one of these is\n"
               "# pinned at the numerical ceiling and the comparison between them is\n"
@@ -786,11 +825,14 @@ int main(int argc, char** argv)
             rows[ti].vcohLocked = vvLocked;
             rows[ti].vcohPlain = vvPlain;
         }
+        if (!finishOutput(f1)) return outputFailure("c1-stationary-fidelity.csv");
+        if (!finishOutput(f4)) return outputFailure("c4-vertical-coherence.csv");
     }
 
     // ------------------------------------------------------------------- C2
     {
         std::ofstream f(dir + "/c2-spurious-floor.csv");
+        if (!f.is_open()) return outputFailure("c2-spurious-floor.csv");
         f << "ratio,worst_spurious_db_re_fundamental,worst_bin,worst_hz\n";
         const Signal tone = sine(toneHz, 4.0, 1);
         for (size_t ti = 0; ti < std::size(targets); ++ti)
@@ -820,11 +862,13 @@ int main(int argc, char** argv)
                 rows[ti].spurious = rel;
             }
         }
+        if (!finishOutput(f)) return outputFailure("c2-spurious-floor.csv");
     }
 
     // ------------------------------------------------------------------- C3
     {
         std::ofstream f(dir + "/c3-transient-preservation.csv");
+        if (!f.is_open()) return outputFailure("c3-transient-preservation.csv");
         f << "ratio,onsets,mean_energy_ratio_vs_wsola,worst_energy_ratio_vs_wsola,"
              "source_attack_ms,output_attack_ms,attack_expansion_percent\n";
 
@@ -938,11 +982,13 @@ int main(int argc, char** argv)
                 { rows[ti].transientKeep = meanRatio; rows[ti].attack = expansion; }
             }
         }
+        if (!finishOutput(f)) return outputFailure("c3-transient-preservation.csv");
     }
 
     // ------------------------------------------------------------------- C5
     {
         std::ofstream f(dir + "/c5-stereo-integrity.csv");
+        if (!f.is_open()) return outputFailure("c5-stereo-integrity.csv");
         f << "ratio,ild_in_db,ild_out_db,ild_delta_db,coherence_in,coherence_out\n";
 
         // Correlated stereo: the same bed in both channels, right delayed 3 ms.
@@ -1025,11 +1071,13 @@ int main(int argc, char** argv)
                 { rows[ti].ild = ildOut - ildIn; rows[ti].coherence = cohOut; }
             }
         }
+        if (!finishOutput(f)) return outputFailure("c5-stereo-integrity.csv");
     }
 
     // -------------------------------------------------------------- summary
     {
         std::ofstream f(dir + "/timestretch-metrics.md");
+        if (!f.is_open()) return outputFailure("timestretch-metrics.md");
         f << "# TimeStretch characterisation (48 kHz, 2048 frame)\n\n"
              "Machine-generated by `tools/characterize_timestretch.cpp`. Every number\n"
              "here is at 48 kHz with the default 2048-sample frame; the CSV files\n"
@@ -1058,7 +1106,45 @@ int main(int argc, char** argv)
               << fmt(r.consistencyOut / std::max(r.consistencyIn, 1e-30), 4) << " | "
               << fmt(r.vcohLocked, 5) << " | " << fmt(r.vcohPlain, 5) << " | "
               << (r.vcohLocked > r.vcohPlain ? "yes" : "NO") << " |\n";
+        if (!finishOutput(f)) return outputFailure("timestretch-metrics.md");
     }
+
+    constexpr const char* expectedOutputs[] = {
+        "c1-stationary-fidelity.csv",
+        "c2-spurious-floor.csv",
+        "c3-transient-preservation.csv",
+        "c4-vertical-coherence.csv",
+        "c5-stereo-integrity.csv",
+        "c6-exact-ratio-drift.csv",
+        "c7-unity-passthrough.csv",
+        "c8-chopping-determinism.csv",
+        "timestretch-metrics.md",
+    };
+    for (const char* name : expectedOutputs)
+    {
+        const std::filesystem::path path = outputDirectory / name;
+        std::error_code fileError;
+        const auto status = std::filesystem::symlink_status(path, fileError);
+        if (fileError || !std::filesystem::is_regular_file(status)
+            || std::filesystem::file_size(path, fileError) == 0 || fileError)
+            return outputFailure(name);
+    }
+    std::error_code censusError;
+    size_t artifactCount = 0;
+    std::filesystem::directory_iterator iterator(outputDirectory, censusError);
+    const std::filesystem::directory_iterator end;
+    for (; !censusError && iterator != end; iterator.increment(censusError))
+    {
+        const std::string name = iterator->path().filename().string();
+        const bool expected = std::any_of(
+            std::begin(expectedOutputs), std::end(expectedOutputs),
+            [&name](const char* item) { return name == item; });
+        if (!expected)
+            return outputFailure("artifact-census");
+        ++artifactCount;
+    }
+    if (censusError || artifactCount != std::size(expectedOutputs))
+        return outputFailure("artifact-census");
 
     std::printf("characterisation written to %s\n", dir.c_str());
     return 0;

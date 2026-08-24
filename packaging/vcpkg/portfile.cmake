@@ -1,13 +1,12 @@
 # DSPark vcpkg port - submit to microsoft/vcpkg once a release tag exists.
-# Update REF and SHA512 for the published release archive
-# (vcpkg hashes the GitHub source tarball of the tag).
+# REF pins the immutable source commit.
+# SHA512 authenticates the archive for that exact commit.
 
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO CristianMoresi/DSPark
-    REF v1.4.1
-    SHA512 b9fd5b6d7428a2a82589661d65f73e91a72aeeb243572ad5c88aaa6974b8ad6a5282a01b6c3623872f2b2241e97070555864be243af8de2b1a29807a64684bfd
-    HEAD_REF main
+    REF 5a47d959de4b3d48445a8850960f74377999faf9
+    SHA512 b7382dc3e0247fbf93e0a5555750deda74798809d4c3d8154a08bb517faf9cf046cabdd04d88fc6e7895a7a6666e7017eeed719ea2582edca5363bba8ef9383f
 )
 
 vcpkg_cmake_configure(

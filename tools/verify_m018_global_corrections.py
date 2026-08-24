@@ -25,15 +25,72 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_DIRECTORIES = ("Core", "Effects", "Analysis", "IO", "Music")
 EXPECTED_INSTALLED_HEADERS = 102
 EXPECTED_ORDINARY_TESTS = 885
+PRODUCT_P7_COMMIT = "5a47d959de4b3d48445a8850960f74377999faf9"
+PRODUCT_P7_PARENT = "ff56759f0d12e9bfad20a77b5b8c80b642ffe5f2"
+PACKAGE_SOURCE_URL_PREFIX = (
+    "https://codeload.github.com/CristianMoresi/DSPark/tar.gz/"
+)
+PACKAGE_SOURCE_SHA256 = (
+    "3b6d44a863ab97749f1b4131c255689c2fbdf00b891bdaa9329aadc1a1e00ce2"
+)
+PACKAGE_SOURCE_FILENAME = "dspark-1.7.0.tar.gz"
+PACKAGE_SOURCE_SHA512 = (
+    "b7382dc3e0247fbf93e0a5555750deda74798809d4c3d8154a08bb517faf9cf0"
+    "46cabdd04d88fc6e7895a7a6666e7017eeed719ea2582edca5363bba8ef9383f"
+)
 EXPECTED_PACKAGE_HASHES = {
-    "packaging/conan/conanfile.py": "796ddfeb9e73dbc6815bd4f5ab813116c8d484f3bf0b403a7cf5ec2811b0a0b3",
-    "packaging/vcpkg/portfile.cmake": "24671f71c4e248f2922d114bc43951938eda12ef961e8d95b590d71d95dbe8ea",
-    "packaging/vcpkg/vcpkg.json": "dc1cc44137d375143c531a06ae690e2c215f7b3a4ed0150d6d25dd254e833c0e",
+    "packaging/conan/conanfile.py": "fe14207493ecdecc7fcefcc4eccda4cdd09f88c9755db576133bfff3bdfa74f0",
+    "packaging/vcpkg/portfile.cmake": "c2b5f8c0c30518e220c1f85abed9cbe7bdcaa26608f153821be99f5785d10815",
+    "packaging/vcpkg/vcpkg.json": "08fd9782597218b0f6ddbfc4720ebe83a4a710cff6758f76752833f491e99bdd",
 }
 EXPECTED_SEMANTIC_HASHES = {
-    "packaging/conan/conanfile.py": "a5ca52184e29c51b093507a8855122ec38e766469bdb69207931f267cbfdaa17",
-    "packaging/vcpkg/portfile.cmake": "7e8ad3376e35622215041bd7cb3b855cef1ef5f408485cd507a6a8f3bd64d1b5",
+    "packaging/conan/conanfile.py": "4eabfe4a38cd593eb73789313dea018e2a9ba022339ec566125c2aeb178a832d",
+    "packaging/vcpkg/portfile.cmake": "9dfe0b00f07741b1308546e76f0985d277952ed3f3aaa6864d31a2ef9e2a9048",
+    "packaging/vcpkg/vcpkg.json": "987800079ee1d7556da43c2ff8cea3fb08553eb3e1bd3e7142e8fb342255093e",
 }
+PACKAGE_FIELD_MUTANT_IDS = (
+    "MUT-R-CONAN-COMMENT",
+    "MUT-R-CONAN-NAME",
+    "MUT-R-CONAN-VERSION",
+    "MUT-R-CONAN-PACKAGE-TYPE",
+    "MUT-R-CONAN-HOMEPAGE",
+    "MUT-R-CONAN-SOURCE-URL",
+    "MUT-R-CONAN-FILENAME",
+    "MUT-R-CONAN-REF",
+    "MUT-R-CONAN-SHA256",
+    "MUT-R-CONAN-STRIP-ROOT",
+    "MUT-R-CONAN-MODULES",
+    "MUT-R-CONAN-INCLUDE-DESTINATION",
+    "MUT-R-CONAN-CMAKE-FILE",
+    "MUT-R-CONAN-CMAKE-TARGET",
+    "MUT-R-CONAN-LIB-BIN-DIRS",
+    "MUT-R-CONAN-PACKAGE-ID",
+    "MUT-R-VCPKG-COMMENT",
+    "MUT-R-VCPKG-REPO",
+    "MUT-R-VCPKG-REF",
+    "MUT-R-VCPKG-SHA512",
+    "MUT-R-VCPKG-HEAD-REF",
+    "MUT-R-VCPKG-CONFIGURE",
+    "MUT-R-VCPKG-FIXUP",
+    "MUT-R-VCPKG-CLEANUP",
+    "MUT-R-VCPKG-COPYRIGHT",
+    "MUT-R-MANIFEST-BYTES",
+    "MUT-R-MANIFEST-NAME",
+    "MUT-R-MANIFEST-VERSION",
+    "MUT-R-MANIFEST-HOMEPAGE-LICENSE",
+    "MUT-R-MANIFEST-DEPENDENCIES",
+    "MUT-R-MANIFEST-DUPLICATE-OR-EXTRA",
+)
+PACKAGE_FIELD_MUTANT_INVENTORY_SHA256 = (
+    "1434ee1784aa0dd7e16e2d04c4dbfd95d5e14af0278c68bbf65c50c2fe430227"
+)
+PACKAGE_FIELD_MUTANT_SUBCASE_COUNTS = (
+    1, 1, 1, 1, 1, 1, 12, 5, 1, 2,
+    3, 1, 1, 1, 2, 1, 1, 2, 5, 1,
+    1, 3, 2, 2, 1, 2, 1, 1, 2, 5,
+    2,
+)
+EXPECTED_PACKAGE_FIELD_MUTANT_SUBCASES = 66
 
 
 def digest(data: bytes) -> str:
@@ -135,48 +192,840 @@ def doxyfile_errors(root: Path, text: str) -> list[str]:
 
 
 def conan_semantics(data: bytes) -> bytes:
-    tree = ast.parse(data.decode("utf-8"))
+    tree = ast.parse(data.decode("ascii"))
     return ast.dump(tree, annotate_fields=True, include_attributes=False).encode("ascii")
 
 
 def cmake_noncomment_semantics(data: bytes) -> bytes:
     canonical: list[str] = []
-    for source_line in data.decode("utf-8").splitlines():
-        # This recipe has no quoted '#'; the exact-file hash below prevents a
-        # future syntax change from silently broadening this canonicalizer.
+    for source_line in data.decode("ascii").splitlines():
         line = source_line.split("#", 1)[0]
         line = " ".join(line.split())
         if line:
             canonical.append(line)
-    return "\n".join(canonical).encode("utf-8")
+    return "\n".join(canonical).encode("ascii")
 
 
-def package_errors(root: Path) -> list[str]:
+class DuplicateJsonKey(ValueError):
+    """Raised when strict package-manifest parsing sees a duplicate key."""
+
+
+def reject_json_duplicates(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKey(key)
+        result[key] = value
+    return result
+
+
+def strict_json_value(data: bytes) -> object:
+    return json.loads(
+        data.decode("ascii"), object_pairs_hook=reject_json_duplicates)
+
+
+def manifest_semantics(data: bytes) -> bytes:
+    return json.dumps(
+        strict_json_value(data), sort_keys=True, separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+
+
+def unique_errors(errors: list[str]) -> list[str]:
+    return list(dict.fromkeys(errors))
+
+
+def class_literal(class_node: ast.ClassDef, name: str) -> object | None:
+    values: list[ast.AST] = []
+    for node in class_node.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if any(isinstance(target, ast.Name) and target.id == name
+               for target in targets):
+            values.append(node.value)
+    if len(values) != 1:
+        return None
+    try:
+        return ast.literal_eval(values[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def class_method(
+    class_node: ast.ClassDef, name: str,
+) -> ast.FunctionDef | None:
+    matches = [
+        node for node in class_node.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def conan_field_errors(data: bytes) -> list[str]:
     errors: list[str] = []
-    for path, expected in EXPECTED_PACKAGE_HASHES.items():
-        actual = digest((root / path).read_bytes())
-        if actual != expected:
-            errors.append(f"PACKAGE_P_BYTE_DRIFT {path} {actual}")
+    try:
+        tree = ast.parse(data.decode("ascii"))
+    except (UnicodeError, SyntaxError):
+        return ["PACKAGE_R_CONAN_FIELD:syntax"]
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    if len(classes) != 1 or classes[0].name != "DSParkConan":
+        return ["PACKAGE_R_CONAN_FIELD:class"]
+    recipe = classes[0]
+    for field, expected in (
+        ("name", "dspark"),
+        ("version", "1.7.0"),
+        ("package_type", "header-library"),
+        ("homepage", "https://github.com/CristianMoresi/DSPark"),
+    ):
+        if class_literal(recipe, field) != expected:
+            errors.append("PACKAGE_R_CONAN_FIELD:" + field)
+
+    source = class_method(recipe, "source")
+    get_calls = [] if source is None else [
+        node for node in ast.walk(source)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "get"
+    ]
+    if len(get_calls) != 1:
+        errors.append("PACKAGE_R_CONAN_FIELD:source_url")
+    else:
+        call = get_calls[0]
+        url = call.args[1].value if len(call.args) == 2 \
+            and isinstance(call.args[1], ast.Constant) \
+            and isinstance(call.args[1].value, str) else None
+        if len(call.args) != 2 or ast.unparse(call.args[0]) != "self":
+            errors.append("PACKAGE_R_CONAN_FIELD:source_url")
+        if not isinstance(url, str) or not url.startswith(
+                PACKAGE_SOURCE_URL_PREFIX):
+            errors.append("PACKAGE_R_CONAN_FIELD:source_url")
+        elif url[len(PACKAGE_SOURCE_URL_PREFIX):] != PRODUCT_P7_COMMIT:
+            errors.append("PACKAGE_R_CONAN_FIELD:source_ref")
+        keywords = {
+            keyword.arg: keyword.value for keyword in call.keywords
+            if keyword.arg is not None
+        }
+        filename_nodes = [
+            keyword.value for keyword in call.keywords
+            if keyword.arg == "filename"
+        ]
+        if len(filename_nodes) != 1 \
+                or not isinstance(filename_nodes[0], ast.Constant) \
+                or filename_nodes[0].value != PACKAGE_SOURCE_FILENAME:
+            errors.append("PACKAGE_R_CONAN_FIELD:filename")
+        if len(keywords) != len(call.keywords) or set(keywords) != {
+                "filename", "sha256", "strip_root"}:
+            errors.append("PACKAGE_R_CONAN_FIELD:source_url")
+        sha_node = keywords.get("sha256")
+        if not isinstance(sha_node, ast.Constant) \
+                or sha_node.value != PACKAGE_SOURCE_SHA256:
+            errors.append("PACKAGE_R_CONAN_FIELD:source_sha256")
+        strip_node = keywords.get("strip_root")
+        if not isinstance(strip_node, ast.Constant) or strip_node.value is not True:
+            errors.append("PACKAGE_R_CONAN_FIELD:strip_root")
+
+    package = class_method(recipe, "package")
+    module_loops = [] if package is None else [
+        node for node in ast.walk(package)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name) and node.target.id == "module"
+    ]
+    modules: object | None = None
+    if len(module_loops) == 1:
+        try:
+            modules = ast.literal_eval(module_loops[0].iter)
+        except (TypeError, ValueError):
+            modules = None
+    if modules != ("Core", "Effects", "Analysis", "IO", "Music"):
+        errors.append("PACKAGE_R_CONAN_FIELD:modules")
+    copy_calls = [] if package is None else [
+        node for node in ast.walk(package)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "copy"
+    ]
+    module_destinations = [
+        ast.unparse(call.args[3]) for call in copy_calls
+        if len(call.args) == 4 and isinstance(call.args[1], ast.Constant)
+        and call.args[1].value == "*.h"
+    ]
+    umbrella_destinations = [
+        ast.unparse(call.args[3]) for call in copy_calls
+        if len(call.args) == 4 and isinstance(call.args[1], ast.Constant)
+        and call.args[1].value == "DSPark.h"
+    ]
+    if module_destinations != [
+            "os.path.join(self.package_folder, 'include', 'DSPark', module)"
+    ] or umbrella_destinations != [
+            "os.path.join(self.package_folder, 'include', 'DSPark')"
+    ]:
+        errors.append("PACKAGE_R_CONAN_FIELD:include_destination")
+
+    package_info = class_method(recipe, "package_info")
+    property_calls = [] if package_info is None else [
+        node for node in ast.walk(package_info)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "self.cpp_info.set_property"
+        and len(node.args) == 2
+        and all(isinstance(argument, ast.Constant) for argument in node.args)
+    ]
+    properties = {
+        str(call.args[0].value): call.args[1].value for call in property_calls
+    }
+    if len(properties) != len(property_calls) \
+            or properties.get("cmake_file_name") != "dspark":
+        errors.append("PACKAGE_R_CONAN_FIELD:cmake_file_name")
+    if properties.get("cmake_target_name") != "dspark::dspark":
+        errors.append("PACKAGE_R_CONAN_FIELD:cmake_target_name")
+    directory_values: dict[str, object] = {}
+    if package_info is not None:
+        for node in package_info.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = ast.unparse(node.targets[0])
+            if target in ("self.cpp_info.bindirs", "self.cpp_info.libdirs"):
+                try:
+                    directory_values[target] = ast.literal_eval(node.value)
+                except (TypeError, ValueError):
+                    directory_values[target] = None
+    if directory_values != {
+        "self.cpp_info.bindirs": [],
+        "self.cpp_info.libdirs": [],
+    }:
+        errors.append("PACKAGE_R_CONAN_FIELD:header_only_dirs")
+
+    package_id = class_method(recipe, "package_id")
+    clear_calls = [] if package_id is None else [
+        node for node in ast.walk(package_id)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "self.info.clear"
+        and not node.args and not node.keywords
+    ]
+    if len(clear_calls) != 1:
+        errors.append("PACKAGE_R_CONAN_FIELD:package_id")
+    return unique_errors(errors)
+
+
+def strip_cmake_comments(text: str) -> str:
+    result: list[str] = []
+    quoted = False
+    escaped = False
+    comment = False
+    for character in text:
+        if comment:
+            if character == "\n":
+                result.append(character)
+                comment = False
+            continue
+        if quoted:
+            result.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == "#":
+            comment = True
+        else:
+            result.append(character)
+            if character == '"':
+                quoted = True
+    if quoted or escaped:
+        raise ValueError("unterminated quoted CMake argument")
+    return "".join(result)
+
+
+def cmake_argument_tokens(body: str) -> list[str]:
+    tokens: list[str] = []
+    index = 0
+    while index < len(body):
+        while index < len(body) and body[index].isspace():
+            index += 1
+        if index == len(body):
+            break
+        if body[index] == '"':
+            index += 1
+            token: list[str] = []
+            escaped = False
+            while index < len(body):
+                character = body[index]
+                index += 1
+                if escaped:
+                    token.append(character)
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    break
+                else:
+                    token.append(character)
+            else:
+                raise ValueError("unterminated CMake argument")
+            if escaped:
+                raise ValueError("unterminated CMake escape")
+            if index < len(body) and not body[index].isspace():
+                raise ValueError("concatenated CMake argument")
+            tokens.append("".join(token))
+            continue
+        begin = index
+        while index < len(body) and not body[index].isspace():
+            if body[index] in '()"':
+                raise ValueError("unsupported CMake token boundary")
+            index += 1
+        tokens.append(body[begin:index])
+    return tokens
+
+
+def cmake_commands(data: bytes) -> list[tuple[str, list[str]]]:
+    text = strip_cmake_comments(data.decode("ascii"))
+    commands: list[tuple[str, list[str]]] = []
+    index = 0
+    while index < len(text):
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index == len(text):
+            break
+        match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text[index:])
+        if match is None:
+            raise ValueError("CMake command name expected")
+        name = match.group(0)
+        index += len(name)
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index == len(text) or text[index] != "(":
+            raise ValueError("CMake command opening parenthesis expected")
+        index += 1
+        begin = index
+        quoted = False
+        escaped = False
+        depth = 1
+        while index < len(text) and depth:
+            character = text[index]
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    quoted = False
+            elif character == '"':
+                quoted = True
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            index += 1
+        if depth != 0 or quoted or escaped:
+            raise ValueError("unbalanced CMake command")
+        body = text[begin:index]
+        index += 1
+        commands.append((name, cmake_argument_tokens(body)))
+    return commands
+
+
+def cmake_keyword(args: list[str], keyword: str) -> str | None:
+    positions = [index for index, value in enumerate(args) if value == keyword]
+    if len(positions) != 1 or positions[0] + 1 >= len(args):
+        return None
+    return args[positions[0] + 1]
+
+
+def vcpkg_field_errors(data: bytes) -> list[str]:
+    try:
+        commands = cmake_commands(data)
+    except (UnicodeError, ValueError):
+        return ["PACKAGE_R_VCPKG_FIELD:syntax"]
+    errors: list[str] = []
+    expected_names = [
+        "vcpkg_from_github",
+        "vcpkg_cmake_configure",
+        "vcpkg_cmake_install",
+        "vcpkg_cmake_config_fixup",
+        "file",
+        "vcpkg_install_copyright",
+    ]
+    if [name for name, _args in commands] != expected_names:
+        errors.append("PACKAGE_R_VCPKG_FIELD:command_inventory")
+    by_name: dict[str, list[list[str]]] = {}
+    for name, args in commands:
+        by_name.setdefault(name, []).append(args)
+    source_rows = by_name.get("vcpkg_from_github", [])
+    if len(source_rows) != 1:
+        return unique_errors(errors + ["PACKAGE_R_VCPKG_FIELD:source_helper"])
+    source = source_rows[0]
+    if cmake_keyword(source, "REPO") != "CristianMoresi/DSPark":
+        errors.append("PACKAGE_R_VCPKG_FIELD:repo")
+    if cmake_keyword(source, "REF") != PRODUCT_P7_COMMIT:
+        errors.append("PACKAGE_R_VCPKG_FIELD:ref")
+    if cmake_keyword(source, "SHA512") != PACKAGE_SOURCE_SHA512:
+        errors.append("PACKAGE_R_VCPKG_FIELD:sha512")
+    if "HEAD_REF" in source:
+        errors.append("PACKAGE_R_VCPKG_FIELD:head_ref_forbidden")
+    if source != [
+        "OUT_SOURCE_PATH", "SOURCE_PATH",
+        "REPO", "CristianMoresi/DSPark",
+        "REF", PRODUCT_P7_COMMIT,
+        "SHA512", PACKAGE_SOURCE_SHA512,
+    ]:
+        errors.append("PACKAGE_R_VCPKG_FIELD:source_shape")
+    configure = by_name.get("vcpkg_cmake_configure", [])
+    if configure != [[
+        "SOURCE_PATH", "${SOURCE_PATH}", "OPTIONS",
+        "-DDSPARK_BUILD_CONFORMANCE=OFF", "-DDSPARK_BUILD_TESTS=OFF",
+    ]]:
+        errors.append("PACKAGE_R_VCPKG_FIELD:configure")
+    if by_name.get("vcpkg_cmake_install", []) != [[]]:
+        errors.append("PACKAGE_R_VCPKG_FIELD:install")
+    if by_name.get("vcpkg_cmake_config_fixup", []) != [[
+            "PACKAGE_NAME", "dspark", "CONFIG_PATH", "lib/cmake/dspark"]]:
+        errors.append("PACKAGE_R_VCPKG_FIELD:config_fixup")
+    if by_name.get("file", []) != [[
+        "REMOVE_RECURSE", "${CURRENT_PACKAGES_DIR}/debug",
+        "${CURRENT_PACKAGES_DIR}/lib",
+    ]]:
+        errors.append("PACKAGE_R_VCPKG_FIELD:cleanup")
+    if by_name.get("vcpkg_install_copyright", []) != [[
+            "FILE_LIST", "${SOURCE_PATH}/LICENSE"]]:
+        errors.append("PACKAGE_R_VCPKG_FIELD:copyright")
+    return unique_errors(errors)
+
+
+def manifest_field_errors(data: bytes) -> list[str]:
+    try:
+        value = strict_json_value(data)
+    except (UnicodeError, json.JSONDecodeError, DuplicateJsonKey):
+        return ["PACKAGE_R_MANIFEST_FIELD:object_shape"]
+    if not isinstance(value, dict):
+        return ["PACKAGE_R_MANIFEST_FIELD:object_shape"]
+    errors: list[str] = []
+    expected_keys = {
+        "name", "version", "description", "homepage", "license",
+        "dependencies",
+    }
+    if set(value) != expected_keys:
+        errors.append("PACKAGE_R_MANIFEST_FIELD:object_shape")
+    if value.get("name") != "dspark":
+        errors.append("PACKAGE_R_MANIFEST_FIELD:name")
+    if value.get("version") != "1.7.0":
+        errors.append("PACKAGE_R_MANIFEST_FIELD:version")
+    if value.get("homepage") != "https://github.com/CristianMoresi/DSPark" \
+            or value.get("license") != "MIT":
+        errors.append("PACKAGE_R_MANIFEST_FIELD:metadata")
+    dependencies = value.get("dependencies")
+    if dependencies != [
+        {"name": "vcpkg-cmake", "host": True},
+        {"name": "vcpkg-cmake-config", "host": True},
+    ]:
+        errors.append("PACKAGE_R_MANIFEST_FIELD:dependencies")
+    return unique_errors(errors)
+
+
+def validate_package_data(data_by_path: dict[str, bytes]) -> list[str]:
+    errors: list[str] = []
     semantic_functions = {
         "packaging/conan/conanfile.py": conan_semantics,
         "packaging/vcpkg/portfile.cmake": cmake_noncomment_semantics,
+        "packaging/vcpkg/vcpkg.json": manifest_semantics,
     }
-    for path, function in semantic_functions.items():
-        actual = digest(function((root / path).read_bytes()))
-        if actual != EXPECTED_SEMANTIC_HASHES[path]:
-            errors.append(f"PACKAGE_P_SEMANTIC_DRIFT {path} {actual}")
+    field_functions = {
+        "packaging/conan/conanfile.py": conan_field_errors,
+        "packaging/vcpkg/portfile.cmake": vcpkg_field_errors,
+        "packaging/vcpkg/vcpkg.json": manifest_field_errors,
+    }
+    for path, expected in EXPECTED_PACKAGE_HASHES.items():
+        data = data_by_path.get(path)
+        if not isinstance(data, bytes):
+            errors.append("PACKAGE_R_MISSING:" + path)
+            continue
+        actual = digest(data)
+        if actual != expected:
+            errors.append("PACKAGE_R_BYTE_DRIFT:{}:{}".format(path, actual))
+        try:
+            semantic = semantic_functions[path](data)
+        except (UnicodeError, SyntaxError, ValueError, json.JSONDecodeError):
+            semantic = None
+        if semantic is not None:
+            semantic_hash = digest(semantic)
+            if semantic_hash != EXPECTED_SEMANTIC_HASHES[path]:
+                errors.append("PACKAGE_R_SEMANTIC_DRIFT:{}:{}".format(
+                    path, semantic_hash))
+        errors.extend(field_functions[path](data))
+    if set(data_by_path) != set(EXPECTED_PACKAGE_HASHES):
+        errors.append("PACKAGE_R_RECIPE_PATH_SET")
+    return unique_errors(errors)
 
-    conan = (root / "packaging/conan/conanfile.py").read_text(encoding="ascii")
-    port = (root / "packaging/vcpkg/portfile.cmake").read_text(encoding="ascii")
-    required_stale = (
-        ('version = "1.2.2"', conan),
-        ('"cmake_target_name", "DSPark::DSPark"', conan),
-        ("REF v1.4.1", port),
+
+def replace_package_bytes(
+    data: bytes, old: bytes, new: bytes, *, expected_count: int = 1,
+) -> bytes:
+    if data.count(old) != expected_count:
+        raise ValueError("package mutant source anchor cardinality")
+    return data.replace(old, new)
+
+
+def dumped_manifest(value: object) -> bytes:
+    return (json.dumps(value, indent=2, ensure_ascii=True) + "\n").encode(
+        "ascii")
+
+
+def package_mutant_cases(
+    baseline: dict[str, bytes],
+) -> list[dict[str, object]]:
+    conan_path = "packaging/conan/conanfile.py"
+    port_path = "packaging/vcpkg/portfile.cmake"
+    manifest_path = "packaging/vcpkg/vcpkg.json"
+    conan = baseline[conan_path]
+    port = baseline[port_path]
+    manifest = baseline[manifest_path]
+    cases: list[dict[str, object]] = []
+
+    def add(mutant_id: str, case: str, path: str, data: bytes,
+            terminal: str) -> None:
+        cases.append({
+            "case": case,
+            "data": data,
+            "id": mutant_id,
+            "path": path,
+            "required_terminal": terminal,
+        })
+
+    add("MUT-R-CONAN-COMMENT", "one-comment-byte", conan_path,
+        replace_package_bytes(conan, b"# DSPark Conan", b"# DSpark Conan"),
+        "PACKAGE_R_BYTE_DRIFT:" + conan_path)
+    add("MUT-R-CONAN-NAME", "uppercase", conan_path,
+        replace_package_bytes(conan, b'name = "dspark"', b'name = "DSPark"'),
+        "PACKAGE_R_CONAN_FIELD:name")
+    add("MUT-R-CONAN-VERSION", "next-patch", conan_path,
+        replace_package_bytes(conan, b'version = "1.7.0"', b'version = "1.7.1"'),
+        "PACKAGE_R_CONAN_FIELD:version")
+    add("MUT-R-CONAN-PACKAGE-TYPE", "static-library", conan_path,
+        replace_package_bytes(
+            conan, b'package_type = "header-library"',
+            b'package_type = "static-library"'),
+        "PACKAGE_R_CONAN_FIELD:package_type")
+    add("MUT-R-CONAN-HOMEPAGE", "wrong-repository", conan_path,
+        replace_package_bytes(
+            conan, b'homepage = "https://github.com/CristianMoresi/DSPark"',
+            b'homepage = "https://github.com/CristianMoresi/Other"'),
+        "PACKAGE_R_CONAN_FIELD:homepage")
+    add("MUT-R-CONAN-SOURCE-URL", "tag-url", conan_path,
+        replace_package_bytes(
+            conan,
+            (PACKAGE_SOURCE_URL_PREFIX + PRODUCT_P7_COMMIT).encode("ascii"),
+            b"https://github.com/CristianMoresi/DSPark/archive/refs/tags/v1.7.0.tar.gz"),
+        "PACKAGE_R_CONAN_FIELD:source_url")
+    filename_anchor = (
+        b'            filename="' + PACKAGE_SOURCE_FILENAME.encode("ascii")
+        + b'",\n'
     )
-    for marker, content in required_stale:
-        if marker not in content:
-            errors.append(f"PACKAGE_R_SEMANTIC_CHANGED_PREMATURELY {marker}")
-    return errors
+    add("MUT-R-CONAN-FILENAME", "absent", conan_path,
+        replace_package_bytes(conan, filename_anchor, b""),
+        "PACKAGE_R_CONAN_FIELD:filename")
+    for case, replacement in (
+        ("extensionless", "dspark-1.7.0"),
+        ("zip", "dspark-1.7.0.zip"),
+        ("posix-path", "archive/dspark-1.7.0.tar.gz"),
+        ("windows-path", r"archive\\dspark-1.7.0.tar.gz"),
+        ("url", "https://example.invalid/dspark-1.7.0.tar.gz"),
+        ("version-drift", "dspark-1.7.1.tar.gz"),
+        ("tag-ref", "dspark-v1.7.0.tar.gz"),
+        ("branch-ref", "dspark-main.tar.gz"),
+        ("short-ref", "dspark-" + PRODUCT_P7_COMMIT[:12] + ".tar.gz"),
+        ("r-placeholder", "dspark-" + "R" * 40 + ".tar.gz"),
+    ):
+        replacement_line = (
+            b'            filename="' + replacement.encode("ascii") + b'",\n'
+        )
+        add("MUT-R-CONAN-FILENAME", case, conan_path,
+            replace_package_bytes(conan, filename_anchor, replacement_line),
+            "PACKAGE_R_CONAN_FIELD:filename")
+    add("MUT-R-CONAN-FILENAME", "duplicate", conan_path,
+        replace_package_bytes(conan, filename_anchor,
+                              filename_anchor + filename_anchor),
+        "PACKAGE_R_CONAN_FIELD:filename")
+
+    for case, reference in (
+        ("parent", PRODUCT_P7_PARENT),
+        ("short", PRODUCT_P7_COMMIT[:12]),
+        ("tag", "v1.7.0"),
+        ("branch", "main"),
+        ("r-placeholder", "R" * 40),
+    ):
+        add("MUT-R-CONAN-REF", case, conan_path,
+            replace_package_bytes(
+                conan,
+                (PACKAGE_SOURCE_URL_PREFIX + PRODUCT_P7_COMMIT).encode("ascii"),
+                (PACKAGE_SOURCE_URL_PREFIX + reference).encode("ascii")),
+            "PACKAGE_R_CONAN_FIELD:source_ref")
+    changed_sha256 = ("4" + PACKAGE_SOURCE_SHA256[1:]).encode("ascii")
+    add("MUT-R-CONAN-SHA256", "nibble", conan_path,
+        replace_package_bytes(
+            conan, PACKAGE_SOURCE_SHA256.encode("ascii"), changed_sha256),
+        "PACKAGE_R_CONAN_FIELD:source_sha256")
+    add("MUT-R-CONAN-STRIP-ROOT", "false", conan_path,
+        replace_package_bytes(conan, b"strip_root=True", b"strip_root=False"),
+        "PACKAGE_R_CONAN_FIELD:strip_root")
+    add("MUT-R-CONAN-STRIP-ROOT", "absent", conan_path,
+        replace_package_bytes(conan, b", strip_root=True", b""),
+        "PACKAGE_R_CONAN_FIELD:strip_root")
+    module_tuple = b'("Core", "Effects", "Analysis", "IO", "Music")'
+    for case, replacement in (
+        ("remove", b'("Core", "Effects", "Analysis", "IO")'),
+        ("add", b'("Core", "Effects", "Analysis", "IO", "Music", "Extra")'),
+        ("reorder", b'("Effects", "Core", "Analysis", "IO", "Music")'),
+    ):
+        add("MUT-R-CONAN-MODULES", case, conan_path,
+            replace_package_bytes(conan, module_tuple, replacement),
+            "PACKAGE_R_CONAN_FIELD:modules")
+    add("MUT-R-CONAN-INCLUDE-DESTINATION", "lowercase", conan_path,
+        replace_package_bytes(
+            conan, b'"include", "DSPark"', b'"include", "dspark"',
+            expected_count=2),
+        "PACKAGE_R_CONAN_FIELD:include_destination")
+    add("MUT-R-CONAN-CMAKE-FILE", "uppercase", conan_path,
+        replace_package_bytes(
+            conan, b'("cmake_file_name", "dspark")',
+            b'("cmake_file_name", "DSPark")'),
+        "PACKAGE_R_CONAN_FIELD:cmake_file_name")
+    add("MUT-R-CONAN-CMAKE-TARGET", "uppercase", conan_path,
+        replace_package_bytes(
+            conan, b'("cmake_target_name", "dspark::dspark")',
+            b'("cmake_target_name", "DSPark::DSPark")'),
+        "PACKAGE_R_CONAN_FIELD:cmake_target_name")
+    for case, old, new in (
+        ("bindirs", b"self.cpp_info.bindirs = []",
+         b'self.cpp_info.bindirs = ["bin"]'),
+        ("libdirs", b"self.cpp_info.libdirs = []",
+         b'self.cpp_info.libdirs = ["lib"]'),
+    ):
+        add("MUT-R-CONAN-LIB-BIN-DIRS", case, conan_path,
+            replace_package_bytes(conan, old, new),
+            "PACKAGE_R_CONAN_FIELD:header_only_dirs")
+    add("MUT-R-CONAN-PACKAGE-ID", "clear-removed", conan_path,
+        replace_package_bytes(
+            conan, b"        self.info.clear()\n", b"        pass\n"),
+        "PACKAGE_R_CONAN_FIELD:package_id")
+
+    add("MUT-R-VCPKG-COMMENT", "one-comment-byte", port_path,
+        replace_package_bytes(port, b"# DSPark vcpkg", b"# DSpark vcpkg"),
+        "PACKAGE_R_BYTE_DRIFT:" + port_path)
+    for case, replacement in (
+        ("owner", b"Other/DSPark"),
+        ("repository", b"CristianMoresi/Other"),
+    ):
+        add("MUT-R-VCPKG-REPO", case, port_path,
+            replace_package_bytes(
+                port, b"CristianMoresi/DSPark", replacement),
+            "PACKAGE_R_VCPKG_FIELD:repo")
+    for case, reference in (
+        ("parent", PRODUCT_P7_PARENT),
+        ("tag", "v1.7.0"),
+        ("branch", "main"),
+        ("short", PRODUCT_P7_COMMIT[:12]),
+        ("r-placeholder", "R" * 40),
+    ):
+        add("MUT-R-VCPKG-REF", case, port_path,
+            replace_package_bytes(
+                port, ("REF " + PRODUCT_P7_COMMIT).encode("ascii"),
+                ("REF " + reference).encode("ascii")),
+            "PACKAGE_R_VCPKG_FIELD:ref")
+    changed_sha512 = ("7" + PACKAGE_SOURCE_SHA512[1:]).encode("ascii")
+    add("MUT-R-VCPKG-SHA512", "nibble", port_path,
+        replace_package_bytes(
+            port, PACKAGE_SOURCE_SHA512.encode("ascii"), changed_sha512),
+        "PACKAGE_R_VCPKG_FIELD:sha512")
+    add("MUT-R-VCPKG-HEAD-REF", "main", port_path,
+        replace_package_bytes(
+            port, b"    SHA512 " + PACKAGE_SOURCE_SHA512.encode("ascii") + b"\n",
+            b"    SHA512 " + PACKAGE_SOURCE_SHA512.encode("ascii")
+            + b"\n    HEAD_REF main\n"),
+        "PACKAGE_R_VCPKG_FIELD:head_ref_forbidden")
+    for case, old, new in (
+        ("source", b'SOURCE_PATH "${SOURCE_PATH}"',
+         b'SOURCE_PATH "${SOURCE_PATH}/wrong"'),
+        ("conformance", b"-DDSPARK_BUILD_CONFORMANCE=OFF",
+         b"-DDSPARK_BUILD_CONFORMANCE=ON"),
+        ("tests", b"-DDSPARK_BUILD_TESTS=OFF",
+         b"-DDSPARK_BUILD_TESTS=ON"),
+    ):
+        add("MUT-R-VCPKG-CONFIGURE", case, port_path,
+            replace_package_bytes(port, old, new),
+            "PACKAGE_R_VCPKG_FIELD:configure")
+    for case, old, new in (
+        ("name", b"PACKAGE_NAME dspark", b"PACKAGE_NAME DSPark"),
+        ("path", b"CONFIG_PATH lib/cmake/dspark",
+         b"CONFIG_PATH lib/cmake/DSPark"),
+    ):
+        add("MUT-R-VCPKG-FIXUP", case, port_path,
+            replace_package_bytes(port, old, new),
+            "PACKAGE_R_VCPKG_FIELD:config_fixup")
+    for case, old in (
+        ("debug", b'    "${CURRENT_PACKAGES_DIR}/debug"\n'),
+        ("lib", b'    "${CURRENT_PACKAGES_DIR}/lib"'),
+    ):
+        add("MUT-R-VCPKG-CLEANUP", case, port_path,
+            replace_package_bytes(port, old, b""),
+            "PACKAGE_R_VCPKG_FIELD:cleanup")
+    add("MUT-R-VCPKG-COPYRIGHT", "license-path", port_path,
+        replace_package_bytes(
+            port, b'"${SOURCE_PATH}/LICENSE"', b'"${SOURCE_PATH}/COPYING"'),
+        "PACKAGE_R_VCPKG_FIELD:copyright")
+
+    add("MUT-R-MANIFEST-BYTES", "whitespace", manifest_path,
+        replace_package_bytes(
+            manifest, b'{\n  "name"', b'{\n\n  "name"'),
+        "PACKAGE_R_BYTE_DRIFT:" + manifest_path)
+    manifest_value = strict_json_value(manifest)
+    if not isinstance(manifest_value, dict):
+        raise ValueError("manifest baseline object")
+    reordered = {
+        key: manifest_value[key] for key in (
+            "version", "name", "description", "homepage", "license",
+            "dependencies",
+        )
+    }
+    add("MUT-R-MANIFEST-BYTES", "ordering", manifest_path,
+        dumped_manifest(reordered), "PACKAGE_R_BYTE_DRIFT:" + manifest_path)
+    changed = dict(manifest_value)
+    changed["name"] = "DSPark"
+    add("MUT-R-MANIFEST-NAME", "uppercase", manifest_path,
+        dumped_manifest(changed), "PACKAGE_R_MANIFEST_FIELD:name")
+    changed = dict(manifest_value)
+    changed["version"] = "1.7.1"
+    add("MUT-R-MANIFEST-VERSION", "next-patch", manifest_path,
+        dumped_manifest(changed), "PACKAGE_R_MANIFEST_FIELD:version")
+    for case, key, value in (
+        ("homepage", "homepage", "https://github.com/Other/DSPark"),
+        ("license", "license", "Apache-2.0"),
+    ):
+        changed = dict(manifest_value)
+        changed[key] = value
+        add("MUT-R-MANIFEST-HOMEPAGE-LICENSE", case, manifest_path,
+            dumped_manifest(changed), "PACKAGE_R_MANIFEST_FIELD:metadata")
+    dependency_mutants: list[tuple[str, list[dict[str, object]]]] = []
+    dependencies = manifest_value.get("dependencies")
+    if not isinstance(dependencies, list):
+        raise ValueError("manifest baseline dependencies")
+    dependency_mutants.append(("remove", [dict(dependencies[0])]))
+    dependency_mutants.append((
+        "add", [*(dict(item) for item in dependencies),
+                {"name": "extra", "host": True}]))
+    dependency_mutants.append((
+        "reorder", [dict(dependencies[1]), dict(dependencies[0])]))
+    renamed = [dict(item) for item in dependencies]
+    renamed[0]["name"] = "vcpkg-cmake-wrong"
+    dependency_mutants.append(("rename", renamed))
+    host_cleared = [dict(item) for item in dependencies]
+    host_cleared[0]["host"] = False
+    dependency_mutants.append(("host-flag", host_cleared))
+    for case, mutant_dependencies in dependency_mutants:
+        changed = dict(manifest_value)
+        changed["dependencies"] = mutant_dependencies
+        add("MUT-R-MANIFEST-DEPENDENCIES", case, manifest_path,
+            dumped_manifest(changed), "PACKAGE_R_MANIFEST_FIELD:dependencies")
+    duplicate = replace_package_bytes(
+        manifest, b'  "version": "1.7.0",\n',
+        b'  "version": "1.7.0",\n  "version": "1.7.0",\n')
+    add("MUT-R-MANIFEST-DUPLICATE-OR-EXTRA", "duplicate", manifest_path,
+        duplicate, "PACKAGE_R_MANIFEST_FIELD:object_shape")
+    changed = dict(manifest_value)
+    changed["extra"] = True
+    add("MUT-R-MANIFEST-DUPLICATE-OR-EXTRA", "extra", manifest_path,
+        dumped_manifest(changed), "PACKAGE_R_MANIFEST_FIELD:object_shape")
+    return cases
+
+
+def terminal_seen(errors: list[str], terminal: str) -> bool:
+    return any(error == terminal or error.startswith(terminal + ":")
+               for error in errors)
+
+
+def package_mutant_control_results(
+    baseline: dict[str, bytes],
+) -> tuple[list[dict[str, object]], list[str]]:
+    integrity_errors: list[str] = []
+    inventory_hash = digest("\n".join(
+        PACKAGE_FIELD_MUTANT_IDS).encode("ascii"))
+    if len(PACKAGE_FIELD_MUTANT_IDS) != 31 \
+            or len(set(PACKAGE_FIELD_MUTANT_IDS)) != 31 \
+            or inventory_hash != PACKAGE_FIELD_MUTANT_INVENTORY_SHA256:
+        integrity_errors.append("PACKAGE_R_MUTANT_INVENTORY_LITERAL")
+    try:
+        cases = package_mutant_cases(baseline)
+    except (KeyError, TypeError, ValueError) as error:
+        return [], integrity_errors + [
+            "PACKAGE_R_MUTANT_GENERATOR:" + str(error)]
+    observed_ids = list(dict.fromkeys(str(case["id"]) for case in cases))
+    if observed_ids != list(PACKAGE_FIELD_MUTANT_IDS):
+        integrity_errors.append("PACKAGE_R_MUTANT_INVENTORY_ORDER")
+    counts = tuple(sum(case["id"] == mutant_id for case in cases)
+                   for mutant_id in PACKAGE_FIELD_MUTANT_IDS)
+    if counts != PACKAGE_FIELD_MUTANT_SUBCASE_COUNTS \
+            or len(cases) != EXPECTED_PACKAGE_FIELD_MUTANT_SUBCASES:
+        integrity_errors.append("PACKAGE_R_MUTANT_SUBCASE_INVENTORY")
+
+    grouped: dict[str, list[dict[str, object]]] = {
+        mutant_id: [] for mutant_id in PACKAGE_FIELD_MUTANT_IDS
+    }
+    for case in cases:
+        path = str(case["path"])
+        mutated = dict(baseline)
+        mutated[path] = bytes(case["data"])
+        errors = validate_package_data(mutated)
+        required = str(case["required_terminal"])
+        passed = bool(errors) and terminal_seen(errors, required)
+        grouped.setdefault(str(case["id"]), []).append({
+            "case": case["case"],
+            "errors": errors,
+            "passed": passed,
+            "required_terminal": required,
+        })
+    results = []
+    for mutant_id, expected_count in zip(
+            PACKAGE_FIELD_MUTANT_IDS, PACKAGE_FIELD_MUTANT_SUBCASE_COUNTS):
+        subcases = grouped.get(mutant_id, [])
+        results.append({
+            "case_count": len(subcases),
+            "expected_case_count": expected_count,
+            "id": mutant_id,
+            "status": "PASS" if len(subcases) == expected_count
+            and all(bool(item["passed"]) for item in subcases) else "FAIL",
+            "subcases": subcases,
+        })
+    return results, integrity_errors
+
+
+def package_mutant_control_errors(
+    baseline: dict[str, bytes],
+) -> list[str]:
+    results, errors = package_mutant_control_results(baseline)
+    errors.extend(
+        "PACKAGE_R_MUTANT_CONTROL:" + str(result["id"])
+        for result in results if result["status"] != "PASS"
+    )
+    if len(results) != 31:
+        errors.append("PACKAGE_R_MUTANT_RESULT_CARDINALITY")
+    return unique_errors(errors)
+
+
+def package_errors(root: Path) -> list[str]:
+    data_by_path: dict[str, bytes] = {}
+    errors: list[str] = []
+    for path in EXPECTED_PACKAGE_HASHES:
+        try:
+            data_by_path[path] = (root / path).read_bytes()
+        except OSError as error:
+            errors.append("PACKAGE_R_READ:{}:{}".format(path, error))
+    errors.extend(validate_package_data(data_by_path))
+    # Every normal invocation executes exactly the same production oracle and
+    # literal field-mutant inventory used by --self-test.
+    errors.extend(package_mutant_control_errors(data_by_path))
+    return unique_errors(errors)
 
 
 STALE_PUBLIC_PHRASES = {
@@ -933,6 +1782,25 @@ def self_test(root: Path, doxygen: str | None,
     config = (root / "Doxyfile").read_text(encoding="ascii")
     checks: list[tuple[str, bool]] = []
     details: dict[str, str] = {}
+    package_data = {
+        path: (root / path).read_bytes() for path in EXPECTED_PACKAGE_HASHES
+    }
+    package_positive_errors = validate_package_data(package_data)
+    package_results, package_inventory_errors = \
+        package_mutant_control_results(package_data)
+    checks.append(("package-r-positive", not package_positive_errors))
+    checks.append((
+        "package-r-inventory-integrity",
+        not package_inventory_errors and len(package_results) == 31,
+    ))
+    details["package-r-positive"] = json.dumps(
+        package_positive_errors, sort_keys=True)
+    details["package-r-inventory-integrity"] = json.dumps(
+        package_inventory_errors, sort_keys=True)
+    for result in package_results:
+        name = str(result["id"])
+        checks.append((name, result["status"] == "PASS"))
+        details[name] = json.dumps(result, sort_keys=True)
     checks.append(("warning-as-error-disabled", bool(doxyfile_errors(root, config.replace("WARN_AS_ERROR          = YES", "WARN_AS_ERROR          = NO")))))
     checks.append(("public-header-excluded", bool(doxyfile_errors(root, config.replace("DSPark.h Core", "DSPark.h")))))
     checks.append(("required-public-markdown-excluded", bool(doxyfile_errors(root, config.replace(" examples/README.md ", " ")))))
@@ -973,8 +1841,6 @@ def self_test(root: Path, doxygen: str | None,
             name,
             bool(stale_truth_errors_for_text(path, original + "\n" + phrase + "\n")),
         ))
-    mutated_conan = (root / "packaging/conan/conanfile.py").read_bytes().replace(b'1.2.2', b'1.7.0', 1)
-    checks.append(("premature-package-semantics", digest(conan_semantics(mutated_conan)) != EXPECTED_SEMANTIC_HASHES["packaging/conan/conanfile.py"]))
     if doxygen:
         checks.append((
             "duplicate-mainpage-restored",
@@ -1057,7 +1923,7 @@ def main() -> int:
     print(
         f"PASS global product corrections: {EXPECTED_INSTALLED_HEADERS} installed headers, "
         f"ordinary suite authority {EXPECTED_ORDINARY_TESTS}, "
-        "later package-revision semantics preserved"
+        "exact Package R and 31 field-mutant oracles"
     )
     return 0
 

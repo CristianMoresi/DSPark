@@ -7,7 +7,7 @@ import os
 
 class DSParkConan(ConanFile):
     name = "dspark"
-    version = "1.2.2"
+    version = "1.7.0"
     description = ("Header-only audio DSP framework in pure C++20 with zero "
                    "external dependencies: filters, dynamics, reverbs, physical "
                    "analog models, pitch tools, EBU R128 metering and more.")
@@ -23,8 +23,10 @@ class DSParkConan(ConanFile):
         basic_layout(self, src_folder="src")
 
     def source(self):
-        get(self, f"{self.homepage}/archive/refs/tags/v{self.version}.tar.gz",
-            strip_root=True)
+        get(self,
+            "https://codeload.github.com/CristianMoresi/DSPark/tar.gz/5a47d959de4b3d48445a8850960f74377999faf9",
+            filename="dspark-1.7.0.tar.gz",
+            sha256="3b6d44a863ab97749f1b4131c255689c2fbdf00b891bdaa9329aadc1a1e00ce2", strip_root=True)
 
     def package(self):
         copy(self, "LICENSE", self.source_folder,
@@ -39,8 +41,8 @@ class DSParkConan(ConanFile):
     def package_info(self):
         self.cpp_info.bindirs = []
         self.cpp_info.libdirs = []
-        self.cpp_info.set_property("cmake_file_name", "DSPark")
-        self.cpp_info.set_property("cmake_target_name", "DSPark::DSPark")
+        self.cpp_info.set_property("cmake_file_name", "dspark")
+        self.cpp_info.set_property("cmake_target_name", "dspark::dspark")
 
     def package_id(self):
         self.info.clear()

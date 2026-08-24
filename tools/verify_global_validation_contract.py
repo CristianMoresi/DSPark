@@ -763,6 +763,40 @@ EXPECTED_THREADING_EXTERNAL_IDS = (
     "block-absent",
     "block-duplicate",
 )
+PACKAGE_R_ORACLE_LEGAL_POSITIVE_IDS = (
+    "POS-CANONICAL",
+    "POS-MULTILINE",
+    "POS-REDUNDANT-PARENTHESES",
+    "POS-COMMENTED-MULTILINE",
+)
+PACKAGE_R_ORACLE_META_CONTROL_IDS = (
+    "PACKAGE-R-ORACLE-CALL-DELETE",
+    "PACKAGE-R-ORACLE-CALL-NEUTRALIZE",
+    "PACKAGE-R-ORACLE-CALL-DUPLICATE",
+    "PACKAGE-R-ORACLE-CALL-WRONG-CALLEE",
+    "PACKAGE-R-ORACLE-CALL-WRONG-ROOT",
+    "PACKAGE-R-ORACLE-CALL-RESULT-DISCARD",
+    "PACKAGE-R-ORACLE-CALL-WRONG-SINK",
+    "PACKAGE-R-ORACLE-CALL-NESTED",
+    "PACKAGE-R-ORACLE-CALL-AFTER-RETURN",
+    "PACKAGE-R-ORACLE-INVARIANT-CALL-DELETE",
+    "PACKAGE-R-ORACLE-INVARIANT-CALL-NEUTRALIZE",
+    "PACKAGE-R-ORACLE-INVARIANT-HELPER-DELETE",
+    "PACKAGE-R-ORACLE-INVARIANT-HELPER-RETURN-EMPTY",
+    "PACKAGE-R-ORACLE-OUTER-PRODUCER-CHECK-DELETE",
+    "PACKAGE-R-ORACLE-OUTER-PRODUCER-CHECK-NEUTRALIZE",
+    "PACKAGE-R-ORACLE-OUTER-SELF-CHECK-DELETE",
+    "PACKAGE-R-ORACLE-OUTER-CONTROLS-CALL-DELETE",
+    "PACKAGE-R-ORACLE-OUTER-CONTROLS-CALL-NEUTRALIZE",
+    "PACKAGE-R-ORACLE-OUTER-CONTROL-ID-DELETE",
+    "PACKAGE-R-ORACLE-OUTER-CTEST-STRUCTURAL-CALL-DELETE",
+    "PACKAGE-R-ORACLE-OUTER-CTEST-SELFTEST-CALL-DELETE",
+    "PACKAGE-R-ORACLE-CONFIGURED-CTEST-BINDING-DELETE",
+)
+PACKAGE_R_ORACLE_EXPECTED_META_CONTROL_COUNT = 22
+PACKAGE_R_ORACLE_META_CONTROL_INVENTORY_SHA256 = (
+    "d999a44f0f1950f375f2422b19536161ce8fa27f130907baa739045b825b50d4"
+)
 LIVE_COMMAND = (
     "python3 -B tools/verify_global_validation_contract.py --live"
 )
@@ -940,6 +974,645 @@ def direct_call_count(node: ast.AST, name: str) -> int:
     )
 
 
+def _rmo_top_level_function(
+    tree: ast.Module, name: str,
+) -> ast.FunctionDef | None:
+    matches = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _rmo_top_level_assignment(tree: ast.Module, name: str) -> ast.AST | None:
+    matches: list[ast.AST] = []
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            targets = statement.targets
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            targets = [statement.target]
+            value = statement.value
+        else:
+            continue
+        if any(isinstance(target, ast.Name) and target.id == name
+               for target in targets):
+            matches.append(value)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _rmo_literal(tree: ast.Module, name: str) -> object | None:
+    node = _rmo_top_level_assignment(tree, name)
+    try:
+        return ast.literal_eval(node) if node is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _rmo_called_name(call: ast.Call, name: str) -> bool:
+    return isinstance(call.func, ast.Name) and call.func.id == name
+
+
+def _rmo_extend_argument(
+    statement: ast.stmt, sink: str,
+) -> ast.AST | None:
+    if not isinstance(statement, ast.Expr) \
+            or not isinstance(statement.value, ast.Call):
+        return None
+    call = statement.value
+    if call.keywords or len(call.args) != 1:
+        return None
+    if not isinstance(call.func, ast.Attribute) or call.func.attr != "extend":
+        return None
+    if not isinstance(call.func.value, ast.Name) \
+            or call.func.value.id != sink:
+        return None
+    return call.args[0]
+
+
+def _rmo_exact_call_aggregation(
+    statement: ast.stmt, sink: str, callee: str,
+    arguments: tuple[str, ...],
+) -> bool:
+    value = _rmo_extend_argument(statement, sink)
+    return (
+        isinstance(value, ast.Call)
+        and _rmo_called_name(value, callee)
+        and not value.keywords
+        and len(value.args) == len(arguments)
+        and all(
+            isinstance(argument, ast.Name) and argument.id == expected
+            for argument, expected in zip(value.args, arguments)
+        )
+    )
+
+
+def _rmo_direct_indexes(
+    function: ast.FunctionDef, predicate: object,
+) -> list[int]:
+    return [
+        index for index, statement in enumerate(function.body)
+        if callable(predicate) and predicate(statement)
+    ]
+
+
+def _rmo_named_call_count(function: ast.FunctionDef, name: str) -> int:
+    return sum(
+        isinstance(node, ast.Call) and _rmo_called_name(node, name)
+        for node in ast.walk(function)
+    )
+
+
+def _rmo_errors_initializations(
+    function: ast.FunctionDef,
+) -> tuple[list[int], list[int]]:
+    assignments: list[int] = []
+    empty_lists: list[int] = []
+    for index, statement in enumerate(function.body):
+        target: ast.AST | None = None
+        value: ast.AST | None = None
+        if isinstance(statement, ast.AnnAssign):
+            target = statement.target
+            value = statement.value
+        elif isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+            value = statement.value
+        if isinstance(target, ast.Name) and target.id == "errors":
+            assignments.append(index)
+            if isinstance(value, ast.List) and not value.elts:
+                empty_lists.append(index)
+    return assignments, empty_lists
+
+
+def _rmo_terminal_boundary(function: ast.FunctionDef) -> int | None:
+    for index, statement in enumerate(function.body):
+        if isinstance(statement, ast.For) \
+                and isinstance(statement.iter, ast.Name) \
+                and statement.iter.id == "errors":
+            return index
+        if isinstance(statement, ast.If) \
+                and isinstance(statement.test, ast.Name) \
+                and statement.test.id == "errors":
+            return index
+        if isinstance(statement, ast.Return):
+            return index
+    return None
+
+
+def _rmo_producer_helper_errors(tree: ast.Module) -> list[str]:
+    errors: list[str] = []
+    checker = _rmo_top_level_function(tree, "package_oracle_binding_errors")
+    current = _rmo_top_level_function(
+        tree, "current_package_oracle_binding_errors")
+    if checker is None or current is None:
+        return ["PACKAGE_R_ORACLE_OUTER_PRODUCER_HELPER_MISSING"]
+    checker_returns = [
+        node for node in checker.body
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Call)
+        and _rmo_called_name(node.value, "unique_errors")
+        and len(node.value.args) == 1
+        and isinstance(node.value.args[0], ast.Name)
+        and node.value.args[0].id == "errors"
+        and not node.value.keywords
+    ]
+    parse_calls = [
+        node for node in ast.walk(checker)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "parse"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "ast"
+    ]
+    source_reads = [
+        node for node in ast.walk(current)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "read_text"
+        and isinstance(node.func.value, ast.Call)
+        and isinstance(node.func.value.func, ast.Name)
+        and node.func.value.func.id == "Path"
+        and len(node.func.value.args) == 1
+        and isinstance(node.func.value.args[0], ast.Name)
+        and node.func.value.args[0].id == "__file__"
+        and len(node.keywords) == 1
+        and node.keywords[0].arg == "encoding"
+        and isinstance(node.keywords[0].value, ast.Constant)
+        and node.keywords[0].value.value == "ascii"
+    ]
+    if len(checker_returns) != 1 or len(parse_calls) != 1 \
+            or _rmo_named_call_count(
+                current, "package_oracle_binding_errors") != 1 \
+            or len(source_reads) != 1:
+        errors.append("PACKAGE_R_ORACLE_OUTER_PRODUCER_HELPER_NEUTRALIZED")
+    return errors
+
+
+def producer_package_oracle_binding_errors(
+    producer_source: str,
+) -> list[str]:
+    """Independently audit the producer Package-R binding from its AST."""
+    errors: list[str] = []
+    try:
+        tree = ast.parse(producer_source)
+    except SyntaxError:
+        return [
+            "PACKAGE_R_ORACLE_OUTER_PRODUCER_CALL_DRIFT",
+            "PACKAGE_R_ORACLE_OUTER_PRODUCER_POSITION",
+        ]
+    main_function = _rmo_top_level_function(tree, "main")
+    if main_function is None:
+        return list(dict.fromkeys([
+            "PACKAGE_R_ORACLE_OUTER_PRODUCER_CALL_DRIFT",
+            "PACKAGE_R_ORACLE_OUTER_PRODUCER_POSITION",
+            *_rmo_producer_helper_errors(tree),
+        ]))
+    package_indexes = _rmo_direct_indexes(
+        main_function,
+        lambda statement: _rmo_exact_call_aggregation(
+            statement, "errors", "package_errors", ("root",)),
+    )
+    invariant_indexes = _rmo_direct_indexes(
+        main_function,
+        lambda statement: _rmo_exact_call_aggregation(
+            statement, "errors", "current_package_oracle_binding_errors", ()),
+    )
+    package_calls = _rmo_named_call_count(main_function, "package_errors")
+    invariant_calls = _rmo_named_call_count(
+        main_function, "current_package_oracle_binding_errors")
+    assignments, empty_initializations = \
+        _rmo_errors_initializations(main_function)
+    boundary = _rmo_terminal_boundary(main_function)
+    if package_calls == 0:
+        errors.append("PACKAGE_R_ORACLE_OUTER_PRODUCER_MISSING")
+    if package_calls > 1 or len(package_indexes) > 1:
+        errors.append("PACKAGE_R_ORACLE_OUTER_PRODUCER_DUPLICATE")
+    if package_calls != 1 or len(package_indexes) != 1:
+        errors.append("PACKAGE_R_ORACLE_OUTER_PRODUCER_CALL_DRIFT")
+    if invariant_calls != 1 or len(invariant_indexes) != 1:
+        errors.append("PACKAGE_R_ORACLE_OUTER_PRODUCER_INVARIANT_MISSING")
+    if (
+        len(assignments) != 1
+        or len(empty_initializations) != 1
+        or len(package_indexes) != 1
+        or len(invariant_indexes) != 1
+        or boundary is None
+        or not (
+            empty_initializations[0]
+            < invariant_indexes[0]
+            < package_indexes[0]
+            < boundary
+        )
+    ):
+        errors.append("PACKAGE_R_ORACLE_OUTER_PRODUCER_POSITION")
+    errors.extend(_rmo_producer_helper_errors(tree))
+    return list(dict.fromkeys(errors))
+
+
+def _rmo_result_append_indexes(function: ast.FunctionDef) -> list[int]:
+    indexes: list[int] = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call) or node.keywords \
+                or len(node.args) != 1:
+            continue
+        if not isinstance(node.func, ast.Attribute) \
+                or node.func.attr != "append" \
+                or not isinstance(node.func.value, ast.Name) \
+                or node.func.value.id != "results":
+            continue
+        value = node.args[0]
+        if not isinstance(value, ast.Tuple) or len(value.elts) != 2:
+            continue
+        identity = value.elts[0]
+        if not isinstance(identity, ast.Subscript) \
+                or not isinstance(identity.value, ast.Name) \
+                or identity.value.id not in (
+                    "PACKAGE_R_ORACLE_META_CONTROL_IDS", "control_ids") \
+                or not isinstance(identity.slice, ast.Constant) \
+                or not isinstance(identity.slice.value, int):
+            continue
+        indexes.append(identity.slice.value)
+    return indexes
+
+
+def package_oracle_outer_binding_errors(source: str) -> list[str]:
+    """Audit the independent outer surface and its mutual bindings."""
+    errors: list[str] = []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ["PACKAGE_R_ORACLE_OUTER_SOURCE_SYNTAX"]
+    inventory = _rmo_literal(tree, "PACKAGE_R_ORACLE_META_CONTROL_IDS")
+    expected_count = _rmo_literal(
+        tree, "PACKAGE_R_ORACLE_EXPECTED_META_CONTROL_COUNT")
+    inventory_digest = _rmo_literal(
+        tree, "PACKAGE_R_ORACLE_META_CONTROL_INVENTORY_SHA256")
+    observed_digest = None
+    if isinstance(inventory, tuple) \
+            and all(isinstance(item, str) for item in inventory):
+        observed_digest = hashlib.sha256(
+            ("\n".join(inventory) + "\n").encode("ascii")
+        ).hexdigest()
+    if (
+        not isinstance(inventory, tuple)
+        or len(inventory) != 22
+        or len(set(inventory)) != 22
+        or expected_count != 22
+        or inventory_digest
+            != "d999a44f0f1950f375f2422b19536161ce8fa27f130907baa739045b825b50d4"
+        or observed_digest
+            != "d999a44f0f1950f375f2422b19536161ce8fa27f130907baa739045b825b50d4"
+    ):
+        errors.append("PACKAGE_R_ORACLE_OUTER_CONTROL_INVENTORY")
+    positive_inventory = _rmo_literal(
+        tree, "PACKAGE_R_ORACLE_LEGAL_POSITIVE_IDS")
+    if positive_inventory != (
+        "POS-CANONICAL", "POS-MULTILINE", "POS-REDUNDANT-PARENTHESES",
+        "POS-COMMENTED-MULTILINE",
+    ):
+        errors.append("PACKAGE_R_ORACLE_OUTER_POSITIVE_INVENTORY")
+
+    structural = _rmo_top_level_function(tree, "structural_errors")
+    if structural is None:
+        errors.append("PACKAGE_R_ORACLE_OUTER_STRUCTURAL_FUNCTION_MISSING")
+    else:
+        producer_checks = _rmo_direct_indexes(
+            structural,
+            lambda statement: _rmo_exact_call_aggregation(
+                statement, "errors",
+                "producer_package_oracle_binding_errors",
+                ("producer_source",)),
+        )
+        self_checks = _rmo_direct_indexes(
+            structural,
+            lambda statement: _rmo_exact_call_aggregation(
+                statement, "errors", "package_oracle_outer_binding_errors",
+                ("source",)),
+        )
+        if len(producer_checks) != 1 or _rmo_named_call_count(
+                structural, "producer_package_oracle_binding_errors") != 1:
+            errors.append("PACKAGE_R_ORACLE_OUTER_CHECK_MISSING")
+        if len(self_checks) != 1 or _rmo_named_call_count(
+                structural, "package_oracle_outer_binding_errors") != 1:
+            errors.append("PACKAGE_R_ORACLE_OUTER_SELF_CHECK_MISSING")
+
+    self_test_function = _rmo_top_level_function(tree, "self_test")
+    if self_test_function is None:
+        errors.append("PACKAGE_R_ORACLE_OUTER_SELFTEST_MISSING")
+    else:
+        controls_calls = _rmo_direct_indexes(
+            self_test_function,
+            lambda statement: _rmo_exact_call_aggregation(
+                statement, "controls", "package_oracle_meta_control_results",
+                ("source", "producer_source")),
+        )
+        positive_calls = _rmo_direct_indexes(
+            self_test_function,
+            lambda statement: _rmo_exact_call_aggregation(
+                statement, "controls",
+                "package_oracle_legal_positive_results",
+                ("producer_source",)),
+        )
+        if len(controls_calls) != 1 or _rmo_named_call_count(
+                self_test_function,
+                "package_oracle_meta_control_results") != 1:
+            errors.append("PACKAGE_R_ORACLE_OUTER_CONTROLS_CALL_MISSING")
+        if len(positive_calls) != 1 or _rmo_named_call_count(
+                self_test_function,
+                "package_oracle_legal_positive_results") != 1:
+            errors.append("PACKAGE_R_ORACLE_OUTER_POSITIVES_CALL_MISSING")
+
+    ctest_function = _rmo_top_level_function(tree, "ctest_mode")
+    if ctest_function is None:
+        errors.append("PACKAGE_R_ORACLE_OUTER_CTEST_MODE_MISSING")
+    else:
+        if _rmo_named_call_count(ctest_function, "structural_errors") != 1:
+            errors.append("PACKAGE_R_ORACLE_OUTER_CTEST_STRUCTURAL_CALL")
+        if _rmo_named_call_count(ctest_function, "self_test") != 1:
+            errors.append("PACKAGE_R_ORACLE_OUTER_CTEST_SELFTEST_CALL")
+        if _rmo_named_call_count(ctest_function, "normal_gate") != 1:
+            errors.append("PACKAGE_R_ORACLE_OUTER_CTEST_NORMAL_GATE_CALL")
+
+    controls_function = _rmo_top_level_function(
+        tree, "package_oracle_meta_control_results")
+    if controls_function is None \
+            or [argument.arg for argument in controls_function.args.args] \
+            != ["source", "producer_source"] \
+            or _rmo_result_append_indexes(controls_function) != list(range(22)) \
+            or len([
+                node for node in controls_function.body
+                if isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "results"
+            ]) != 1:
+        errors.append("PACKAGE_R_ORACLE_OUTER_CONTROL_HELPER")
+    positives_function = _rmo_top_level_function(
+        tree, "package_oracle_legal_positive_results")
+    if positives_function is None \
+            or [argument.arg for argument in positives_function.args.args] \
+            != ["producer_source"] \
+            or _rmo_named_call_count(
+                positives_function, "producer_package_oracle_binding_errors") \
+            != 4:
+        errors.append("PACKAGE_R_ORACLE_OUTER_POSITIVE_HELPER")
+    return list(dict.fromkeys(errors))
+
+
+def _rmo_replace_once(source: str, old: str, new: str) -> str | None:
+    if source.count(old) != 1:
+        return None
+    return source.replace(old, new, 1)
+
+
+def _rmo_delete_producer_checker(producer_source: str) -> str | None:
+    start = producer_source.find("def package_oracle_binding_errors(")
+    finish = producer_source.find(
+        "def current_package_oracle_binding_errors(", start + 1)
+    if start < 0 or finish < 0:
+        return None
+    return producer_source[:start] + producer_source[finish:]
+
+
+def _rmo_canonicalize_package_call(producer_source: str) -> str | None:
+    try:
+        tree = ast.parse(producer_source)
+    except SyntaxError:
+        return None
+    main_function = _rmo_top_level_function(tree, "main")
+    if main_function is None:
+        return None
+    statements = [
+        statement for statement in main_function.body
+        if _rmo_exact_call_aggregation(
+            statement, "errors", "package_errors", ("root",))
+    ]
+    if len(statements) != 1:
+        return None
+    statement = statements[0]
+    if statement.end_lineno is None:
+        return None
+    lines = producer_source.splitlines(keepends=True)
+    lines[statement.lineno - 1:statement.end_lineno] = [
+        "    errors.extend(package_errors(root))\n"]
+    return "".join(lines)
+
+
+def package_oracle_legal_positive_results(
+    producer_source: str,
+) -> list[tuple[str, bool]]:
+    """Exercise the four legal AST-equivalent Package-R call forms."""
+    normalized = _rmo_canonicalize_package_call(producer_source)
+    if normalized is None:
+        return [
+            (identity, False)
+            for identity in PACKAGE_R_ORACLE_LEGAL_POSITIVE_IDS
+        ]
+    producer_source = normalized
+    canonical = "    errors.extend(package_errors(root))\n"
+    multiline = _rmo_replace_once(
+        producer_source, canonical,
+        "    errors.extend(\n        package_errors(root)\n    )\n")
+    redundant = _rmo_replace_once(
+        producer_source, canonical,
+        "    errors.extend(((package_errors((root)))))\n")
+    commented = _rmo_replace_once(
+        producer_source, canonical,
+        "    errors.extend(  # required aggregation\n"
+        "        package_errors(  # exact root\n"
+        "            root\n"
+        "        )\n"
+        "    )\n")
+    return [
+        (PACKAGE_R_ORACLE_LEGAL_POSITIVE_IDS[0],
+         not producer_package_oracle_binding_errors(producer_source)),
+        (PACKAGE_R_ORACLE_LEGAL_POSITIVE_IDS[1], multiline is not None
+         and not producer_package_oracle_binding_errors(multiline)),
+        (PACKAGE_R_ORACLE_LEGAL_POSITIVE_IDS[2], redundant is not None
+         and not producer_package_oracle_binding_errors(redundant)),
+        (PACKAGE_R_ORACLE_LEGAL_POSITIVE_IDS[3], commented is not None
+         and not producer_package_oracle_binding_errors(commented)),
+    ]
+
+
+def package_oracle_meta_control_results(
+    source: str, producer_source: str,
+) -> list[tuple[str, bool]]:
+    """Exercise the literal ordered 22-control meta-oracle inventory."""
+    results: list[tuple[str, bool]] = []
+    control_ids = (
+        PACKAGE_R_ORACLE_META_CONTROL_IDS
+        + tuple(
+            "PACKAGE-R-ORACLE-MISSING-CONTROL-{:02d}".format(index)
+            for index in range(22)
+        )
+    )[:22]
+    canonical_source = _rmo_canonicalize_package_call(producer_source)
+    if canonical_source is not None:
+        producer_source = canonical_source
+    package_call = "    errors.extend(package_errors(root))\n"
+    invariant_call = (
+        "    errors.extend(current_package_oracle_binding_errors())\n")
+    outer_producer_check = (
+        "    errors.extend("
+        "producer_package_oracle_binding_errors(producer_source))\n")
+    outer_self_check = (
+        "    errors.extend(package_oracle_outer_binding_errors(source))\n")
+    outer_controls_call = (
+        "    controls.extend("
+        "package_oracle_meta_control_results(source, producer_source))\n")
+
+    changed = _rmo_replace_once(producer_source, package_call, "")
+    results.append((control_ids[0],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_MISSING"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        producer_source, package_call, "    errors.extend([])\n")
+    results.append((control_ids[1],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_MISSING"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        producer_source, package_call, package_call + package_call)
+    results.append((control_ids[2],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_DUPLICATE"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        producer_source, package_call,
+        "    errors.extend(package_mutant_control_errors(root))\n")
+    results.append((control_ids[3],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_MISSING"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        producer_source, package_call,
+        "    errors.extend(package_errors(ROOT))\n")
+    results.append((control_ids[4],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_CALL_DRIFT"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        producer_source, package_call, "    package_errors(root)\n")
+    results.append((control_ids[5],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_CALL_DRIFT"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        producer_source, package_call,
+        "    other_errors.extend(package_errors(root))\n")
+    results.append((control_ids[6],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_CALL_DRIFT"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        producer_source, package_call,
+        "    if not arguments.skip_public_text:\n"
+        "        errors.extend(package_errors(root))\n")
+    results.append((control_ids[7],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_CALL_DRIFT"
+                    in producer_package_oracle_binding_errors(changed)))
+    moved = _rmo_replace_once(producer_source, package_call, "")
+    changed = None if moved is None else _rmo_replace_once(
+        moved, "    return 0\n\n\nif __name__ == \"__main__\":\n",
+        "    return 0\n    errors.extend(package_errors(root))\n\n\n"
+        "if __name__ == \"__main__\":\n")
+    results.append((control_ids[8],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_POSITION"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_replace_once(producer_source, invariant_call, "")
+    results.append((control_ids[9],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_INVARIANT_MISSING"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        producer_source, invariant_call, "    errors.extend([])\n")
+    results.append((control_ids[10],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_INVARIANT_MISSING"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_delete_producer_checker(producer_source)
+    results.append((control_ids[11],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_HELPER_MISSING"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        producer_source,
+        "    return unique_errors(errors)\n\n\n"
+        "def current_package_oracle_binding_errors",
+        "    return []\n\n\n"
+        "def current_package_oracle_binding_errors")
+    results.append((control_ids[12],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_PRODUCER_HELPER_NEUTRALIZED"
+                    in producer_package_oracle_binding_errors(changed)))
+    changed = _rmo_replace_once(source, outer_producer_check, "")
+    results.append((control_ids[13],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_CHECK_MISSING"
+                    in package_oracle_outer_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        source, outer_producer_check, "    errors.extend([])\n")
+    results.append((control_ids[14],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_CHECK_MISSING"
+                    in package_oracle_outer_binding_errors(changed)))
+    changed = _rmo_replace_once(source, outer_self_check, "")
+    results.append((control_ids[15],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_SELF_CHECK_MISSING"
+                    in package_oracle_outer_binding_errors(changed)))
+    changed = _rmo_replace_once(source, outer_controls_call, "")
+    results.append((control_ids[16],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_CONTROLS_CALL_MISSING"
+                    in package_oracle_outer_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        source, outer_controls_call, "    controls.extend([])\n")
+    results.append((control_ids[17],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_CONTROLS_CALL_MISSING"
+                    in package_oracle_outer_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        source, '    "PACKAGE-R-ORACLE-CALL-DELETE",\n', "")
+    results.append((control_ids[18],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_CONTROL_INVENTORY"
+                    in package_oracle_outer_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        source,
+        '    errors = structural_errors('
+        'Path(__file__).read_text(encoding="ascii"))\n',
+        "    errors: list[str] = []\n")
+    results.append((control_ids[19],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_CTEST_STRUCTURAL_CALL"
+                    in package_oracle_outer_binding_errors(changed)))
+    changed = _rmo_replace_once(
+        source, "    if self_test(root) != 0:\n", "    if False:\n")
+    results.append((control_ids[20],
+                    changed is not None and
+                    "PACKAGE_R_ORACLE_OUTER_CTEST_SELFTEST_CALL"
+                    in package_oracle_outer_binding_errors(changed)))
+    cmake_path = ROOT / "tests/CMakeLists.txt"
+    try:
+        cmake_source = cmake_path.read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        cmake_mutant = None
+    else:
+        cmake_mutant = _rmo_replace_once(
+            cmake_source,
+            "${PROJECT_SOURCE_DIR}/tools/verify_global_validation_contract.py",
+            "${PROJECT_SOURCE_DIR}/tools/verify_m018_global_corrections.py")
+    binding_result = [] if cmake_mutant is None else binding_errors(
+        ROOT, {"tests/CMakeLists.txt": cmake_mutant})
+    results.append((control_ids[21],
+                    "VALIDATION_OUTER_BINDING_CTEST" in binding_result))
+    return results
+
+
 def process_group_race_structure_errors(
     source: str, producer_source: str,
 ) -> list[str]:
@@ -1111,6 +1784,8 @@ def structural_errors(
         producer_source = (
             ROOT / "tools/verify_m018_global_corrections.py"
         ).read_text(encoding="ascii")
+    errors.extend(producer_package_oracle_binding_errors(producer_source))
+    errors.extend(package_oracle_outer_binding_errors(source))
     try:
         producer_tree = ast.parse(producer_source)
     except SyntaxError as error:
@@ -2108,12 +2783,16 @@ def self_test(root: Path) -> int:
     threading_source = (
         root / "tools/verify_threading_doc.py"
     ).read_text(encoding="ascii")
+    package_outer_errors = package_oracle_outer_binding_errors(source)
     controls: list[tuple[str, bool]] = [
         ("outer-baseline", not validate_transcript(baseline)),
         ("outer-structure", not structural_errors(source, producer_source)),
+        ("package-r-meta-outer-structure", not package_outer_errors),
         ("threading-control-structure",
          not threading_control_structure_errors(threading_source)),
     ]
+    controls.extend(package_oracle_legal_positive_results(producer_source))
+    controls.extend(package_oracle_meta_control_results(source, producer_source))
     controls.extend(process_group_members_race_control())
     ctest_records = [
         {
@@ -2331,6 +3010,8 @@ def self_test(root: Path) -> int:
             bool(binding_errors(root, {path: changed}))))
     controls.extend(compiler_banner_controls())
     controls.extend(compiler_process_controls())
+    for error in package_outer_errors:
+        print("ERROR " + error, file=sys.stderr)
     for name, passed in controls:
         print("{} outer mutant {}".format("PASS" if passed else "FAIL", name))
     return 0 if all(passed for _name, passed in controls) else 1

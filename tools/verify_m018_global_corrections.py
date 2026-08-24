@@ -237,6 +237,223 @@ def unique_errors(errors: list[str]) -> list[str]:
     return list(dict.fromkeys(errors))
 
 
+def _m018_top_level_function(
+    tree: ast.Module, name: str,
+) -> ast.FunctionDef | None:
+    matches = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _m018_called_name(call: ast.Call, name: str) -> bool:
+    return isinstance(call.func, ast.Name) and call.func.id == name
+
+
+def _m018_errors_extend_argument(statement: ast.stmt) -> ast.AST | None:
+    if not isinstance(statement, ast.Expr) \
+            or not isinstance(statement.value, ast.Call):
+        return None
+    call = statement.value
+    if call.keywords or len(call.args) != 1:
+        return None
+    if not isinstance(call.func, ast.Attribute) or call.func.attr != "extend":
+        return None
+    if not isinstance(call.func.value, ast.Name) \
+            or call.func.value.id != "errors":
+        return None
+    return call.args[0]
+
+
+def _m018_exact_package_aggregation(statement: ast.stmt) -> bool:
+    value = _m018_errors_extend_argument(statement)
+    return (
+        isinstance(value, ast.Call)
+        and _m018_called_name(value, "package_errors")
+        and not value.keywords
+        and len(value.args) == 1
+        and isinstance(value.args[0], ast.Name)
+        and value.args[0].id == "root"
+    )
+
+
+def _m018_exact_invariant_aggregation(statement: ast.stmt) -> bool:
+    value = _m018_errors_extend_argument(statement)
+    return (
+        isinstance(value, ast.Call)
+        and _m018_called_name(
+            value, "current_package_oracle_binding_errors")
+        and not value.args
+        and not value.keywords
+    )
+
+
+def _m018_direct_indexes(
+    function: ast.FunctionDef, predicate: object,
+) -> list[int]:
+    return [
+        index for index, statement in enumerate(function.body)
+        if callable(predicate) and predicate(statement)
+    ]
+
+
+def _m018_errors_initialization_indexes(
+    function: ast.FunctionDef,
+) -> tuple[list[int], list[int]]:
+    assignments: list[int] = []
+    empty_lists: list[int] = []
+    for index, statement in enumerate(function.body):
+        target: ast.AST | None = None
+        value: ast.AST | None = None
+        if isinstance(statement, ast.AnnAssign):
+            target = statement.target
+            value = statement.value
+        elif isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+            value = statement.value
+        if isinstance(target, ast.Name) and target.id == "errors":
+            assignments.append(index)
+            if isinstance(value, ast.List) and not value.elts:
+                empty_lists.append(index)
+    return assignments, empty_lists
+
+
+def _m018_terminal_boundary(function: ast.FunctionDef) -> int | None:
+    for index, statement in enumerate(function.body):
+        if isinstance(statement, ast.For) \
+                and isinstance(statement.iter, ast.Name) \
+                and statement.iter.id == "errors":
+            return index
+        if isinstance(statement, ast.If) \
+                and isinstance(statement.test, ast.Name) \
+                and statement.test.id == "errors":
+            return index
+        if isinstance(statement, ast.Return):
+            return index
+    return None
+
+
+def _m018_named_call_count(function: ast.FunctionDef, name: str) -> int:
+    return sum(
+        isinstance(node, ast.Call) and _m018_called_name(node, name)
+        for node in ast.walk(function)
+    )
+
+
+def _m018_helper_surface_errors(tree: ast.Module) -> list[str]:
+    errors: list[str] = []
+    checker = _m018_top_level_function(tree, "package_oracle_binding_errors")
+    current = _m018_top_level_function(
+        tree, "current_package_oracle_binding_errors")
+    if checker is None or current is None:
+        return ["PACKAGE_R_ORACLE_PRODUCER_HELPER_MISSING"]
+    checker_return = [
+        node for node in checker.body
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Call)
+        and _m018_called_name(node.value, "unique_errors")
+        and len(node.value.args) == 1
+        and isinstance(node.value.args[0], ast.Name)
+        and node.value.args[0].id == "errors"
+        and not node.value.keywords
+    ]
+    checker_parse_calls = [
+        node for node in ast.walk(checker)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "parse"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "ast"
+    ]
+    if len(checker_return) != 1 or len(checker_parse_calls) != 1:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_HELPER_NEUTRALIZED")
+    current_calls = _m018_named_call_count(
+        current, "package_oracle_binding_errors")
+    source_reads = [
+        node for node in ast.walk(current)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "read_text"
+        and isinstance(node.func.value, ast.Call)
+        and isinstance(node.func.value.func, ast.Name)
+        and node.func.value.func.id == "Path"
+        and len(node.func.value.args) == 1
+        and isinstance(node.func.value.args[0], ast.Name)
+        and node.func.value.args[0].id == "__file__"
+        and len(node.keywords) == 1
+        and node.keywords[0].arg == "encoding"
+        and isinstance(node.keywords[0].value, ast.Constant)
+        and node.keywords[0].value.value == "ascii"
+    ]
+    if current_calls != 1 or len(source_reads) != 1:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_HELPER_NEUTRALIZED")
+    return errors
+
+
+def package_oracle_binding_errors(source: str) -> list[str]:
+    """Validate the normal Package-R oracle binding from Python AST only."""
+    errors: list[str] = []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return [
+            "PACKAGE_R_ORACLE_PRODUCER_CALL_DRIFT",
+            "PACKAGE_R_ORACLE_PRODUCER_POSITION",
+        ]
+    main_function = _m018_top_level_function(tree, "main")
+    if main_function is None:
+        return unique_errors([
+            "PACKAGE_R_ORACLE_PRODUCER_CALL_DRIFT",
+            "PACKAGE_R_ORACLE_PRODUCER_POSITION",
+            *_m018_helper_surface_errors(tree),
+        ])
+    package_indexes = _m018_direct_indexes(
+        main_function, _m018_exact_package_aggregation)
+    invariant_indexes = _m018_direct_indexes(
+        main_function, _m018_exact_invariant_aggregation)
+    package_calls = _m018_named_call_count(main_function, "package_errors")
+    invariant_calls = _m018_named_call_count(
+        main_function, "current_package_oracle_binding_errors")
+    assignments, empty_initializations = \
+        _m018_errors_initialization_indexes(main_function)
+    boundary = _m018_terminal_boundary(main_function)
+
+    if package_calls == 0:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_MISSING")
+    if package_calls > 1 or len(package_indexes) > 1:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_DUPLICATE")
+    if package_calls != 1 or len(package_indexes) != 1:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_CALL_DRIFT")
+    if invariant_calls != 1 or len(invariant_indexes) != 1:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_INVARIANT_MISSING")
+    if (
+        len(assignments) != 1
+        or len(empty_initializations) != 1
+        or len(package_indexes) != 1
+        or len(invariant_indexes) != 1
+        or boundary is None
+        or not (
+            empty_initializations[0]
+            < invariant_indexes[0]
+            < package_indexes[0]
+            < boundary
+        )
+    ):
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_POSITION")
+    errors.extend(_m018_helper_surface_errors(tree))
+    return unique_errors(errors)
+
+
+def current_package_oracle_binding_errors() -> list[str]:
+    """Read and validate this producer's current source fail-closed."""
+    try:
+        source = Path(__file__).read_text(encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        return ["PACKAGE_R_ORACLE_PRODUCER_SOURCE_READ:" + str(error)]
+    return package_oracle_binding_errors(source)
+
+
 def class_literal(class_node: ast.ClassDef, name: str) -> object | None:
     values: list[ast.AST] = []
     for node in class_node.body:
@@ -1908,6 +2125,7 @@ def main() -> int:
         return 2
 
     errors: list[str] = []
+    errors.extend(current_package_oracle_binding_errors())
     errors.extend(doxyfile_errors(root, (root / "Doxyfile").read_text(encoding="ascii")))
     errors.extend(package_errors(root))
     errors.extend(stale_truth_errors(root))

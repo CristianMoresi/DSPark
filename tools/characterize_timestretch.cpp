@@ -35,8 +35,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <numbers>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -145,30 +149,1739 @@ Signal pinkNoise(double seconds, int channels)
     return sig;
 }
 
-class OutputTransaction
+// -- durable nine-artifact publication ----------------------------------------
+
+// This is deliberately self-contained: the characterisation tool is built on
+// every supported C++20 platform and cannot depend on an OS transaction API or
+// a crypto library.  The journal checksum and artifact identities therefore use
+// this compact SHA-256 implementation.
+class TransactionSha256
 {
 public:
-    explicit OutputTransaction(std::filesystem::path outputDirectory)
-        : outputDirectory_(std::move(outputDirectory)),
-          transactionDirectory_(outputDirectory_ / kTransactionDirectory),
-          stagedDirectory_(transactionDirectory_ / "staged"),
-          backupDirectory_(transactionDirectory_ / "backup")
+    void update(const unsigned char* bytes, size_t count) noexcept
     {
-    }
-
-    OutputTransaction(const OutputTransaction&) = delete;
-    OutputTransaction& operator=(const OutputTransaction&) = delete;
-
-    ~OutputTransaction()
-    {
-        if (ownsTransactionDirectory_)
+        bitCount_ += static_cast<uint64_t>(count) * 8u;
+        while (count > 0)
         {
-            std::error_code ignored;
-            std::filesystem::remove_all(transactionDirectory_, ignored);
+            const size_t copied = std::min(count, block_.size() - used_);
+            std::copy_n(bytes, copied, block_.begin() + static_cast<long>(used_));
+            bytes += copied;
+            count -= copied;
+            used_ += copied;
+            if (used_ == block_.size())
+            {
+                transform(block_.data());
+                used_ = 0;
+            }
         }
     }
 
-    bool begin()
+    void update(std::string_view text) noexcept
+    {
+        update(reinterpret_cast<const unsigned char*>(text.data()), text.size());
+    }
+
+    std::string finish() noexcept
+    {
+        const uint64_t originalBits = bitCount_;
+        const unsigned char marker = 0x80u;
+        update(&marker, 1);
+        const unsigned char zero = 0;
+        while (used_ != 56)
+            update(&zero, 1);
+        std::array<unsigned char, 8> length{};
+        for (size_t index = 0; index < length.size(); ++index)
+            length[7 - index] = static_cast<unsigned char>(
+                (originalBits >> (index * 8u)) & 0xffu);
+        update(length.data(), length.size());
+        std::ostringstream output;
+        output << std::hex << std::setfill('0');
+        for (uint32_t word : state_)
+            output << std::setw(8) << word;
+        return output.str();
+    }
+
+private:
+    static uint32_t rotate(uint32_t value, unsigned count) noexcept
+    {
+        return (value >> count) | (value << (32u - count));
+    }
+
+    static uint32_t load(const unsigned char* bytes) noexcept
+    {
+        return (static_cast<uint32_t>(bytes[0]) << 24u)
+             | (static_cast<uint32_t>(bytes[1]) << 16u)
+             | (static_cast<uint32_t>(bytes[2]) << 8u)
+             | static_cast<uint32_t>(bytes[3]);
+    }
+
+    void transform(const unsigned char* bytes) noexcept
+    {
+        static constexpr std::array<uint32_t, 64> constants = {
+            0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+            0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+            0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+            0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+            0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+            0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+            0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+            0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+            0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+            0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+            0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+            0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+            0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+            0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+            0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+            0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
+        };
+        std::array<uint32_t, 64> schedule{};
+        for (size_t index = 0; index < 16; ++index)
+            schedule[index] = load(bytes + index * 4);
+        for (size_t index = 16; index < schedule.size(); ++index)
+        {
+            const uint32_t a = schedule[index - 15];
+            const uint32_t b = schedule[index - 2];
+            const uint32_t s0 = rotate(a, 7) ^ rotate(a, 18) ^ (a >> 3u);
+            const uint32_t s1 = rotate(b, 17) ^ rotate(b, 19) ^ (b >> 10u);
+            schedule[index] = schedule[index - 16] + s0
+                            + schedule[index - 7] + s1;
+        }
+        uint32_t a = state_[0], b = state_[1], c = state_[2], d = state_[3];
+        uint32_t e = state_[4], f = state_[5], g = state_[6], h = state_[7];
+        for (size_t index = 0; index < schedule.size(); ++index)
+        {
+            const uint32_t s1 = rotate(e, 6) ^ rotate(e, 11) ^ rotate(e, 25);
+            const uint32_t choose = (e & f) ^ (~e & g);
+            const uint32_t first = h + s1 + choose
+                                 + constants[index] + schedule[index];
+            const uint32_t s0 = rotate(a, 2) ^ rotate(a, 13) ^ rotate(a, 22);
+            const uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t second = s0 + majority;
+            h = g; g = f; f = e; e = d + first;
+            d = c; c = b; b = a; a = first + second;
+        }
+        state_[0] += a; state_[1] += b; state_[2] += c; state_[3] += d;
+        state_[4] += e; state_[5] += f; state_[6] += g; state_[7] += h;
+    }
+
+    std::array<uint32_t, 8> state_ = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u,
+    };
+    std::array<unsigned char, 64> block_{};
+    size_t used_ = 0;
+    uint64_t bitCount_ = 0;
+};
+
+std::string transactionSha256(std::string_view text) noexcept
+{
+    TransactionSha256 hash;
+    hash.update(text);
+    return hash.finish();
+}
+
+constexpr std::string_view kZeroSha256 =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+struct TransactionFileIdentity
+{
+    bool present = false;
+    bool valid = false;
+    uintmax_t size = 0;
+    std::string sha256;
+};
+
+TransactionFileIdentity transactionFileIdentity(
+    const std::filesystem::path& path, bool requireNonempty = true) noexcept
+{
+    TransactionFileIdentity result;
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error == std::errc::no_such_file_or_directory)
+        return result;
+    if (error || !std::filesystem::exists(status))
+        return result;
+    result.present = true;
+    if (!std::filesystem::is_regular_file(status))
+        return result;
+    result.size = std::filesystem::file_size(path, error);
+    if (error || (requireNonempty && result.size == 0))
+        return result;
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open())
+        return result;
+    TransactionSha256 hash;
+    std::array<char, 8192> buffer{};
+    while (input)
+    {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize count = input.gcount();
+        if (count > 0)
+            hash.update(reinterpret_cast<const unsigned char*>(buffer.data()),
+                        static_cast<size_t>(count));
+    }
+    if (!input.eof())
+        return result;
+    result.sha256 = hash.finish();
+    result.valid = true;
+    return result;
+}
+
+enum class TransactionState
+{
+    Empty,
+    Setup,
+    Staging,
+    Staged,
+    BackupInProgress,
+    PublishInProgress,
+    CommitReady,
+    RollbackRequired,
+    RecoveryRequiredRollback,
+    CommittedCleanupPending,
+    RecoveryRequiredCleanup,
+    Complete,
+    ForeignOrMalformedCollision,
+};
+
+enum class TransactionPending
+{
+    None,
+    Backup,
+    Publish,
+    RemoveNew,
+    RestoreOld,
+    CleanupBackup,
+};
+
+constexpr std::array<std::string_view, 13> kTransactionStateNames = {
+    "EMPTY", "SETUP", "STAGING", "STAGED", "BACKUP_IN_PROGRESS",
+    "PUBLISH_IN_PROGRESS", "COMMIT_READY", "ROLLBACK_REQUIRED",
+    "RECOVERY_REQUIRED_ROLLBACK", "COMMITTED_CLEANUP_PENDING",
+    "RECOVERY_REQUIRED_CLEANUP", "COMPLETE",
+    "FOREIGN_OR_MALFORMED_COLLISION",
+};
+
+constexpr std::array<std::string_view, 6> kTransactionPendingNames = {
+    "NONE", "BACKUP", "PUBLISH", "REMOVE_NEW", "RESTORE_OLD",
+    "CLEANUP_BACKUP",
+};
+
+struct TransactionEntry
+{
+    bool oldPresent = false;
+    uintmax_t oldSize = 0;
+    std::string oldSha256 = std::string(kZeroSha256);
+    std::string oldLocation = "ABSENT";
+    uintmax_t newSize = 0;
+    std::string newSha256 = std::string(kZeroSha256);
+    std::string newLocation = "NONE";
+};
+
+struct TransactionJournal
+{
+    std::string transactionId;
+    std::string rootBindingSha256;
+    uint64_t generation = 0;
+    std::string previousPayloadSha256 = std::string(kZeroSha256);
+    std::string transitionId = "BEGIN";
+    uint64_t transitionIndex = 0;
+    TransactionState state = TransactionState::Empty;
+    TransactionPending pending = TransactionPending::None;
+    size_t pendingIndex = kExpectedOutputs.size();
+    size_t rollbackCursor = 0;
+    size_t cleanupCursor = 0;
+    size_t finalizeCursor = 0;
+    std::array<TransactionEntry, kExpectedOutputs.size()> entries{};
+};
+
+constexpr std::array<std::string_view, 32> kTransactionTransitionIds = {
+    "T01", "T02", "T03", "T04", "T05", "T06", "T07", "T08",
+    "T09", "T10", "T11", "T12", "T13", "T14", "T15", "T16",
+    "T17", "T18", "T19", "T20", "T21", "T22", "T23", "T24",
+    "T25", "T26", "T27", "T28", "T29", "T30", "T31", "T32",
+};
+
+std::string twoDigitIndex(size_t index)
+{
+    std::ostringstream output;
+    output << std::setw(2) << std::setfill('0') << index;
+    return output.str();
+}
+
+bool transactionLowerHex(std::string_view value, size_t size) noexcept
+{
+    return value.size() == size
+        && std::all_of(value.begin(), value.end(), [](char character) {
+            return (character >= '0' && character <= '9')
+                || (character >= 'a' && character <= 'f');
+        });
+}
+
+bool transactionDecimal(std::string_view value, uint64_t& result) noexcept
+{
+    if (value.empty() || (value.size() > 1 && value.front() == '0'))
+        return false;
+    uint64_t parsed = 0;
+    for (char character : value)
+    {
+        if (character < '0' || character > '9')
+            return false;
+        const uint64_t digit = static_cast<uint64_t>(character - '0');
+        if (parsed > (std::numeric_limits<uint64_t>::max() - digit) / 10u)
+            return false;
+        parsed = parsed * 10u + digit;
+    }
+    result = parsed;
+    return true;
+}
+
+std::vector<std::string_view> transactionSplit(
+    std::string_view value, char delimiter)
+{
+    std::vector<std::string_view> fields;
+    size_t begin = 0;
+    while (true)
+    {
+        const size_t end = value.find(delimiter, begin);
+        fields.push_back(value.substr(begin, end - begin));
+        if (end == std::string_view::npos)
+            break;
+        begin = end + 1;
+    }
+    return fields;
+}
+
+std::string serializeTransactionJournal(const TransactionJournal& journal)
+{
+    std::ostringstream payload;
+    payload << "magic=DSPARK_TIMESTRETCH_TXN\n"
+            << "version=2\n"
+            << "transaction_id=" << journal.transactionId << '\n'
+            << "root_binding_sha256=" << journal.rootBindingSha256 << '\n'
+            << "generation=" << journal.generation << '\n'
+            << "previous_payload_sha256=" << journal.previousPayloadSha256 << '\n'
+            << "transition_id=" << journal.transitionId << '\n'
+            << "transition_index=" << journal.transitionIndex << '\n'
+            << "state=" << kTransactionStateNames[static_cast<size_t>(journal.state)] << '\n'
+            << "pending_kind=" << kTransactionPendingNames[static_cast<size_t>(journal.pending)] << '\n'
+            << "pending_index=" << journal.pendingIndex << '\n'
+            << "rollback_cursor=" << journal.rollbackCursor << '\n'
+            << "cleanup_cursor=" << journal.cleanupCursor << '\n'
+            << "finalize_cursor=" << journal.finalizeCursor << '\n';
+    for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
+    {
+        const auto& entry = journal.entries[index];
+        payload << "output" << index << '=' << index << '|'
+                << kExpectedOutputs[index] << '|'
+                << (entry.oldPresent ? 1 : 0) << '|'
+                << entry.oldSize << '|' << entry.oldSha256 << '|'
+                << entry.oldLocation << '|' << entry.newSize << '|'
+                << entry.newSha256 << '|' << entry.newLocation << '\n';
+    }
+    const std::string bytes = payload.str();
+    return bytes + "payload_sha256=" + transactionSha256(bytes) + "\n";
+}
+
+bool transactionStateFromName(std::string_view name,
+                              TransactionState& state) noexcept
+{
+    for (size_t index = 0; index < kTransactionStateNames.size(); ++index)
+        if (name == kTransactionStateNames[index])
+        {
+            state = static_cast<TransactionState>(index);
+            return true;
+        }
+    return false;
+}
+
+bool transactionPendingFromName(std::string_view name,
+                                TransactionPending& pending) noexcept
+{
+    for (size_t index = 0; index < kTransactionPendingNames.size(); ++index)
+        if (name == kTransactionPendingNames[index])
+        {
+            pending = static_cast<TransactionPending>(index);
+            return true;
+        }
+    return false;
+}
+
+bool transactionTransitionId(std::string_view value) noexcept
+{
+    return std::find(kTransactionTransitionIds.begin(),
+                     kTransactionTransitionIds.end(), value)
+        != kTransactionTransitionIds.end();
+}
+
+bool parseTransactionJournal(std::string_view bytes,
+                             TransactionJournal& journal) noexcept
+{
+    if (bytes.empty() || bytes.size() > 65536 || bytes.back() != '\n'
+        || bytes.find('\r') != std::string_view::npos
+        || bytes.find('\0') != std::string_view::npos)
+        return false;
+    for (unsigned char character : bytes)
+        if (character != '\n' && (character < 0x20u || character > 0x7eu))
+            return false;
+    std::vector<std::string_view> lines;
+    size_t begin = 0;
+    while (begin < bytes.size())
+    {
+        const size_t end = bytes.find('\n', begin);
+        if (end == std::string_view::npos || end == begin)
+            return false;
+        lines.push_back(bytes.substr(begin, end - begin));
+        begin = end + 1;
+    }
+    if (lines.size() != 24)
+        return false;
+    auto value = [&lines](size_t index, std::string_view key,
+                          std::string_view& output) {
+        const std::string prefix = std::string(key) + '=';
+        if (!lines[index].starts_with(prefix))
+            return false;
+        output = lines[index].substr(prefix.size());
+        return true;
+    };
+    if (lines[0] != "magic=DSPARK_TIMESTRETCH_TXN"
+        || lines[1] != "version=2")
+        return false;
+    std::string_view field;
+    if (!value(2, "transaction_id", field)
+        || !transactionLowerHex(field, 32))
+        return false;
+    journal.transactionId = field;
+    if (!value(3, "root_binding_sha256", field)
+        || !transactionLowerHex(field, 64))
+        return false;
+    journal.rootBindingSha256 = field;
+    uint64_t number = 0;
+    if (!value(4, "generation", field) || !transactionDecimal(field, number)
+        || number == 0)
+        return false;
+    journal.generation = number;
+    if (!value(5, "previous_payload_sha256", field)
+        || !transactionLowerHex(field, 64))
+        return false;
+    journal.previousPayloadSha256 = field;
+    if (!value(6, "transition_id", field)
+        || (field != "BEGIN" && !transactionTransitionId(field)))
+        return false;
+    journal.transitionId = field;
+    if (!value(7, "transition_index", field)
+        || !transactionDecimal(field, number))
+        return false;
+    journal.transitionIndex = number;
+    if ((journal.generation == 1
+         && (journal.previousPayloadSha256 != kZeroSha256
+             || journal.transitionId != "BEGIN"
+             || journal.transitionIndex != 0))
+        || (journal.generation != 1
+            && (journal.previousPayloadSha256 == kZeroSha256
+                || journal.transitionId == "BEGIN"
+                || journal.transitionIndex != journal.generation - 1)))
+        return false;
+    if (!value(8, "state", field) || !transactionStateFromName(field, journal.state)
+        || journal.state == TransactionState::Empty
+        || journal.state == TransactionState::Complete
+        || journal.state == TransactionState::ForeignOrMalformedCollision)
+        return false;
+    if (!value(9, "pending_kind", field)
+        || !transactionPendingFromName(field, journal.pending))
+        return false;
+    if (!value(10, "pending_index", field) || !transactionDecimal(field, number)
+        || number > kExpectedOutputs.size())
+        return false;
+    journal.pendingIndex = static_cast<size_t>(number);
+    if ((journal.pending == TransactionPending::None
+         && journal.pendingIndex != kExpectedOutputs.size())
+        || (journal.pending != TransactionPending::None
+            && journal.pendingIndex >= kExpectedOutputs.size()))
+        return false;
+    if (!value(11, "rollback_cursor", field) || !transactionDecimal(field, number)
+        || number > 2 * kExpectedOutputs.size())
+        return false;
+    journal.rollbackCursor = static_cast<size_t>(number);
+    if (!value(12, "cleanup_cursor", field) || !transactionDecimal(field, number)
+        || number > kExpectedOutputs.size())
+        return false;
+    journal.cleanupCursor = static_cast<size_t>(number);
+    if (!value(13, "finalize_cursor", field) || !transactionDecimal(field, number)
+        || number > 3)
+        return false;
+    journal.finalizeCursor = static_cast<size_t>(number);
+    for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
+    {
+        const std::string key = "output" + std::to_string(index);
+        if (!value(14 + index, key, field))
+            return false;
+        const auto fields = transactionSplit(field, '|');
+        if (fields.size() != 9 || fields[0] != std::to_string(index)
+            || fields[1] != kExpectedOutputs[index]
+            || (fields[2] != "0" && fields[2] != "1"))
+            return false;
+        auto& entry = journal.entries[index];
+        entry.oldPresent = fields[2] == "1";
+        if (!transactionDecimal(fields[3], number))
+            return false;
+        entry.oldSize = static_cast<uintmax_t>(number);
+        if (!transactionLowerHex(fields[4], 64))
+            return false;
+        entry.oldSha256 = fields[4];
+        if (fields[5] != "FINAL" && fields[5] != "BACKUP"
+            && fields[5] != "ABSENT")
+            return false;
+        entry.oldLocation = fields[5];
+        if (!transactionDecimal(fields[6], number))
+            return false;
+        entry.newSize = static_cast<uintmax_t>(number);
+        if (!transactionLowerHex(fields[7], 64))
+            return false;
+        entry.newSha256 = fields[7];
+        if (fields[8] != "NONE" && fields[8] != "STAGED"
+            && fields[8] != "FINAL")
+            return false;
+        entry.newLocation = fields[8];
+        if ((!entry.oldPresent
+             && (entry.oldSize != 0 || entry.oldSha256 != kZeroSha256
+                 || entry.oldLocation != "ABSENT"))
+            || (entry.oldPresent
+                && (entry.oldSize == 0 || entry.oldSha256 == kZeroSha256
+                    || (entry.oldLocation == "ABSENT"
+                        && journal.state
+                            != TransactionState::CommittedCleanupPending
+                        && journal.state
+                            != TransactionState::RecoveryRequiredCleanup)))
+            || (entry.newSize == 0
+                && (entry.newSha256 != kZeroSha256
+                    || entry.newLocation != "NONE"))
+            || (entry.newSize > 0 && entry.newSha256 == kZeroSha256))
+            return false;
+    }
+    if (!value(23, "payload_sha256", field)
+        || !transactionLowerHex(field, 64))
+        return false;
+    const size_t checksumLine = bytes.rfind("payload_sha256=");
+    if (checksumLine == std::string_view::npos
+        || transactionSha256(bytes.substr(0, checksumLine)) != field)
+        return false;
+    const bool committed = journal.state == TransactionState::CommittedCleanupPending
+                        || journal.state == TransactionState::RecoveryRequiredCleanup;
+    if (committed)
+    {
+        for (const auto& entry : journal.entries)
+            if (entry.newSize == 0 || entry.newLocation != "FINAL")
+                return false;
+        if (journal.pending != TransactionPending::None
+            && journal.pending != TransactionPending::CleanupBackup)
+            return false;
+    }
+    else if (journal.pending == TransactionPending::CleanupBackup)
+    {
+        return false;
+    }
+
+    size_t established = 0;
+    bool sawUnestablished = false;
+    for (const auto& entry : journal.entries)
+    {
+        if (entry.newSize == 0)
+        {
+            sawUnestablished = true;
+        }
+        else
+        {
+            if (sawUnestablished)
+                return false;
+            ++established;
+        }
+    }
+    const auto oldInitial = [&journal]() {
+        return std::all_of(journal.entries.begin(), journal.entries.end(),
+            [](const TransactionEntry& entry) {
+                return entry.oldLocation == (entry.oldPresent ? "FINAL" : "ABSENT");
+            });
+    };
+    const auto oldBackedUp = [&journal]() {
+        return std::all_of(journal.entries.begin(), journal.entries.end(),
+            [](const TransactionEntry& entry) {
+                return entry.oldLocation == (entry.oldPresent ? "BACKUP" : "ABSENT");
+            });
+    };
+    const auto newLocations = [&journal](std::string_view value) {
+        return std::all_of(journal.entries.begin(), journal.entries.end(),
+            [value](const TransactionEntry& entry) {
+                return entry.newSize == 0
+                    ? entry.newLocation == "NONE"
+                    : entry.newLocation == value;
+            });
+    };
+    const bool cursorsZero = journal.rollbackCursor == 0
+                          && journal.cleanupCursor == 0
+                          && journal.finalizeCursor == 0;
+    switch (journal.state)
+    {
+        case TransactionState::Setup:
+            if (established != 0 || journal.pending != TransactionPending::None
+                || !cursorsZero || !oldInitial())
+                return false;
+            break;
+        case TransactionState::Staging:
+            if (established == 0 || established >= kExpectedOutputs.size()
+                || journal.pending != TransactionPending::None || !cursorsZero
+                || !oldInitial() || !newLocations("STAGED"))
+                return false;
+            break;
+        case TransactionState::Staged:
+            if (established != kExpectedOutputs.size()
+                || journal.pending != TransactionPending::None || !cursorsZero
+                || !oldInitial() || !newLocations("STAGED"))
+                return false;
+            break;
+        case TransactionState::BackupInProgress:
+            if (established != kExpectedOutputs.size() || !cursorsZero
+                || !newLocations("STAGED")
+                || (journal.pending != TransactionPending::None
+                    && journal.pending != TransactionPending::Backup))
+                return false;
+            break;
+        case TransactionState::PublishInProgress:
+        {
+            if (established != kExpectedOutputs.size() || !cursorsZero
+                || !oldBackedUp()
+                || (journal.pending != TransactionPending::None
+                    && journal.pending != TransactionPending::Publish))
+                return false;
+            bool sawStaged = false;
+            for (const auto& entry : journal.entries)
+            {
+                if (entry.newLocation == "STAGED")
+                    sawStaged = true;
+                else if (entry.newLocation != "FINAL" || sawStaged)
+                    return false;
+            }
+            break;
+        }
+        case TransactionState::CommitReady:
+            if (established != kExpectedOutputs.size()
+                || journal.pending != TransactionPending::None || !cursorsZero
+                || !oldBackedUp() || !newLocations("FINAL"))
+                return false;
+            break;
+        case TransactionState::RollbackRequired:
+        case TransactionState::RecoveryRequiredRollback:
+            if (journal.cleanupCursor != 0
+                || (journal.pending != TransactionPending::None
+                    && journal.pending != TransactionPending::RemoveNew
+                    && journal.pending != TransactionPending::RestoreOld)
+                || (journal.finalizeCursor != 0 && journal.rollbackCursor != 18))
+                return false;
+            if (journal.pending == TransactionPending::RemoveNew
+                && (journal.rollbackCursor >= 9
+                    || journal.pendingIndex != 8 - journal.rollbackCursor))
+                return false;
+            if (journal.pending == TransactionPending::RestoreOld
+                && (journal.rollbackCursor < 9 || journal.rollbackCursor >= 18
+                    || journal.pendingIndex != 17 - journal.rollbackCursor))
+                return false;
+            break;
+        case TransactionState::CommittedCleanupPending:
+        case TransactionState::RecoveryRequiredCleanup:
+            if (established != kExpectedOutputs.size()
+                || journal.rollbackCursor != 0 || !newLocations("FINAL")
+                || (journal.pending != TransactionPending::None
+                    && journal.pending != TransactionPending::CleanupBackup)
+                || (journal.pending == TransactionPending::CleanupBackup
+                    && journal.pendingIndex != journal.cleanupCursor)
+                || (journal.finalizeCursor != 0
+                    && journal.cleanupCursor != kExpectedOutputs.size()))
+                return false;
+            for (size_t index = 0; index < journal.entries.size(); ++index)
+            {
+                const auto& entry = journal.entries[index];
+                const std::string_view expected = !entry.oldPresent
+                    || index < journal.cleanupCursor ? "ABSENT" : "BACKUP";
+                if (entry.oldLocation != expected)
+                    return false;
+            }
+            break;
+        case TransactionState::Empty:
+        case TransactionState::Complete:
+        case TransactionState::ForeignOrMalformedCollision:
+            return false;
+    }
+    return true;
+}
+
+struct ParsedTransactionJournal
+{
+    bool present = false;
+    bool valid = false;
+    std::string bytes;
+    std::string payloadSha256;
+    TransactionJournal journal;
+};
+
+ParsedTransactionJournal readTransactionJournal(
+    const std::filesystem::path& path) noexcept
+{
+    ParsedTransactionJournal result;
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error == std::errc::no_such_file_or_directory)
+        return result;
+    if (error || !std::filesystem::exists(status))
+        return result;
+    result.present = true;
+    if (!std::filesystem::is_regular_file(status))
+        return result;
+    const uintmax_t size = std::filesystem::file_size(path, error);
+    if (error || size == 0 || size > 65536)
+        return result;
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open())
+        return result;
+    result.bytes.assign(std::istreambuf_iterator<char>(input), {});
+    if (!input.eof() && input.fail())
+        return result;
+    result.valid = parseTransactionJournal(result.bytes, result.journal);
+    if (result.valid)
+    {
+        const size_t checksumLine = result.bytes.rfind("payload_sha256=");
+        result.payloadSha256 = transactionSha256(
+            std::string_view(result.bytes).substr(0, checksumLine));
+    }
+    return result;
+}
+
+bool transactionEntryEqual(const TransactionEntry& first,
+                           const TransactionEntry& second) noexcept
+{
+    return first.oldPresent == second.oldPresent
+        && first.oldSize == second.oldSize
+        && first.oldSha256 == second.oldSha256
+        && first.oldLocation == second.oldLocation
+        && first.newSize == second.newSize
+        && first.newSha256 == second.newSha256
+        && first.newLocation == second.newLocation;
+}
+
+bool transactionJournalBodyEqual(const TransactionJournal& first,
+                                 const TransactionJournal& second) noexcept
+{
+    if (first.transactionId != second.transactionId
+        || first.rootBindingSha256 != second.rootBindingSha256
+        || first.state != second.state || first.pending != second.pending
+        || first.pendingIndex != second.pendingIndex
+        || first.rollbackCursor != second.rollbackCursor
+        || first.cleanupCursor != second.cleanupCursor
+        || first.finalizeCursor != second.finalizeCursor)
+        return false;
+    for (size_t index = 0; index < first.entries.size(); ++index)
+        if (!transactionEntryEqual(first.entries[index], second.entries[index]))
+            return false;
+    return true;
+}
+
+bool transactionJournalEqual(const TransactionJournal& first,
+                             const TransactionJournal& second) noexcept
+{
+    return transactionJournalBodyEqual(first, second)
+        && first.generation == second.generation
+        && first.previousPayloadSha256 == second.previousPayloadSha256
+        && first.transitionId == second.transitionId
+        && first.transitionIndex == second.transitionIndex;
+}
+
+bool transactionApplyTransition(const TransactionJournal& low,
+                                const TransactionJournal& supplied,
+                                std::string_view transitionId,
+                                std::string_view lowPayloadSha256,
+                                TransactionJournal& high) noexcept
+{
+    if (low.generation == std::numeric_limits<uint64_t>::max()
+        || !transactionLowerHex(lowPayloadSha256, 64))
+        return false;
+    high = low;
+    const auto noPending = [&low]() {
+        return low.pending == TransactionPending::None
+            && low.pendingIndex == kExpectedOutputs.size();
+    };
+    const auto allNewAt = [&low](std::string_view location) {
+        return std::all_of(low.entries.begin(), low.entries.end(),
+            [location](const TransactionEntry& entry) {
+                return entry.newSize > 0 && entry.newLocation == location;
+            });
+    };
+    const auto allOldBackedUp = [&low]() {
+        return std::all_of(low.entries.begin(), low.entries.end(),
+            [](const TransactionEntry& entry) {
+                return entry.oldLocation == (entry.oldPresent ? "BACKUP" : "ABSENT");
+            });
+    };
+    if (transitionId == "T01")
+    {
+        if (low.state != TransactionState::Setup)
+            return false;
+    }
+    else if (transitionId == "T02")
+    {
+        if (low.state != TransactionState::Setup
+            || low.entries[0].newSize != 0
+            || supplied.entries[0].newSize == 0
+            || supplied.entries[0].newSha256 == kZeroSha256
+            || supplied.entries[0].newLocation != "STAGED")
+            return false;
+        high.state = TransactionState::Staging;
+        high.entries[0].newSize = supplied.entries[0].newSize;
+        high.entries[0].newSha256 = supplied.entries[0].newSha256;
+        high.entries[0].newLocation = "STAGED";
+    }
+    else if (transitionId == "T03" || transitionId == "T04")
+    {
+        if (low.state != TransactionState::Staging)
+            return false;
+        const auto targetIterator = std::find_if(
+            low.entries.begin(), low.entries.end(),
+            [](const TransactionEntry& entry) { return entry.newSize == 0; });
+        if (targetIterator == low.entries.end())
+            return false;
+        const size_t target = static_cast<size_t>(
+            std::distance(low.entries.begin(), targetIterator));
+        if ((transitionId == "T03" && (target == 0 || target == 8))
+            || (transitionId == "T04" && target != 8)
+            || supplied.entries[target].newSize == 0
+            || supplied.entries[target].newSha256 == kZeroSha256
+            || supplied.entries[target].newLocation != "STAGED")
+            return false;
+        high.entries[target].newSize = supplied.entries[target].newSize;
+        high.entries[target].newSha256 = supplied.entries[target].newSha256;
+        high.entries[target].newLocation = "STAGED";
+        high.state = transitionId == "T04"
+                   ? TransactionState::Staged : TransactionState::Staging;
+    }
+    else if (transitionId == "T05")
+    {
+        if (low.state != TransactionState::Staged || !noPending())
+            return false;
+        high.state = TransactionState::BackupInProgress;
+        high.pending = TransactionPending::Backup;
+        high.pendingIndex = 0;
+    }
+    else if (transitionId == "T06")
+    {
+        if (low.state != TransactionState::BackupInProgress
+            || low.pending != TransactionPending::Backup
+            || low.pendingIndex >= kExpectedOutputs.size())
+            return false;
+        const size_t target = low.pendingIndex;
+        high.entries[target].oldLocation = high.entries[target].oldPresent
+            ? "BACKUP" : "ABSENT";
+        high.pending = TransactionPending::None;
+        high.pendingIndex = kExpectedOutputs.size();
+    }
+    else if (transitionId == "T07")
+    {
+        if (low.state != TransactionState::BackupInProgress || !noPending())
+            return false;
+        const auto targetIterator = std::find_if(
+            low.entries.begin(), low.entries.end(),
+            [](const TransactionEntry& entry) {
+                return entry.oldPresent && entry.oldLocation == "FINAL";
+            });
+        if (targetIterator == low.entries.end())
+            return false;
+        high.pending = TransactionPending::Backup;
+        high.pendingIndex = static_cast<size_t>(
+            std::distance(low.entries.begin(), targetIterator));
+    }
+    else if (transitionId == "T08")
+    {
+        if (low.state != TransactionState::BackupInProgress || !noPending()
+            || !allOldBackedUp())
+            return false;
+        high.state = TransactionState::PublishInProgress;
+        high.pending = TransactionPending::Publish;
+        high.pendingIndex = 0;
+    }
+    else if (transitionId == "T09")
+    {
+        if (low.state != TransactionState::PublishInProgress
+            || low.pending != TransactionPending::Publish
+            || low.pendingIndex >= kExpectedOutputs.size())
+            return false;
+        high.entries[low.pendingIndex].newLocation = "FINAL";
+        high.pending = TransactionPending::None;
+        high.pendingIndex = kExpectedOutputs.size();
+    }
+    else if (transitionId == "T10")
+    {
+        if (low.state != TransactionState::PublishInProgress || !noPending())
+            return false;
+        const auto targetIterator = std::find_if(
+            low.entries.begin(), low.entries.end(),
+            [](const TransactionEntry& entry) {
+                return entry.newLocation == "STAGED";
+            });
+        if (targetIterator == low.entries.end())
+            return false;
+        high.pending = TransactionPending::Publish;
+        high.pendingIndex = static_cast<size_t>(
+            std::distance(low.entries.begin(), targetIterator));
+    }
+    else if (transitionId == "T11")
+    {
+        if (low.state != TransactionState::PublishInProgress || !noPending()
+            || !allNewAt("FINAL"))
+            return false;
+        high.state = TransactionState::CommitReady;
+    }
+    else if (transitionId == "T12")
+    {
+        if (low.state != TransactionState::CommitReady || !noPending()
+            || !allNewAt("FINAL"))
+            return false;
+        high.state = TransactionState::CommittedCleanupPending;
+    }
+    else if (transitionId >= "T13" && transitionId <= "T18")
+    {
+        const std::array<TransactionState, 6> sources = {
+            TransactionState::Setup, TransactionState::Staging,
+            TransactionState::Staged, TransactionState::BackupInProgress,
+            TransactionState::PublishInProgress, TransactionState::CommitReady,
+        };
+        const size_t offset = static_cast<size_t>(transitionId[2] - '3');
+        if (offset >= sources.size() || low.state != sources[offset] || !noPending())
+            return false;
+        high.state = TransactionState::RollbackRequired;
+        high.rollbackCursor = 0;
+        high.cleanupCursor = 0;
+        high.finalizeCursor = 0;
+    }
+    else if (transitionId == "T19")
+    {
+        if (low.state != TransactionState::RollbackRequired || !noPending()
+            || low.rollbackCursor >= 9)
+            return false;
+        high.pending = TransactionPending::RemoveNew;
+        high.pendingIndex = 8 - low.rollbackCursor;
+    }
+    else if (transitionId == "T20")
+    {
+        if (low.state != TransactionState::RollbackRequired
+            || low.pending != TransactionPending::RemoveNew
+            || low.rollbackCursor >= 9
+            || low.pendingIndex != 8 - low.rollbackCursor)
+            return false;
+        high.entries[low.pendingIndex].newLocation = "NONE";
+        high.pending = TransactionPending::None;
+        high.pendingIndex = kExpectedOutputs.size();
+        ++high.rollbackCursor;
+    }
+    else if (transitionId == "T21")
+    {
+        if (low.state != TransactionState::RollbackRequired || !noPending()
+            || low.rollbackCursor < 9 || low.rollbackCursor >= 18)
+            return false;
+        high.pending = TransactionPending::RestoreOld;
+        high.pendingIndex = 17 - low.rollbackCursor;
+    }
+    else if (transitionId == "T22")
+    {
+        if (low.state != TransactionState::RollbackRequired
+            || low.pending != TransactionPending::RestoreOld
+            || low.rollbackCursor < 9 || low.rollbackCursor >= 18
+            || low.pendingIndex != 17 - low.rollbackCursor)
+            return false;
+        high.entries[low.pendingIndex].oldLocation =
+            high.entries[low.pendingIndex].oldPresent ? "FINAL" : "ABSENT";
+        high.pending = TransactionPending::None;
+        high.pendingIndex = kExpectedOutputs.size();
+        ++high.rollbackCursor;
+    }
+    else if (transitionId == "T23")
+    {
+        if (low.state != TransactionState::RollbackRequired)
+            return false;
+        high.state = TransactionState::RecoveryRequiredRollback;
+    }
+    else if (transitionId == "T24")
+    {
+        if (low.state != TransactionState::RecoveryRequiredRollback)
+            return false;
+    }
+    else if (transitionId == "T25")
+    {
+        if (low.state != TransactionState::RecoveryRequiredRollback)
+            return false;
+        high.state = TransactionState::RollbackRequired;
+    }
+    else if (transitionId == "T26")
+    {
+        if (low.state != TransactionState::RollbackRequired || !noPending()
+            || low.rollbackCursor != 18 || low.finalizeCursor >= 3)
+            return false;
+        ++high.finalizeCursor;
+    }
+    else if (transitionId == "T27")
+    {
+        if (low.state != TransactionState::CommittedCleanupPending || !noPending()
+            || low.cleanupCursor >= kExpectedOutputs.size())
+            return false;
+        high.pending = TransactionPending::CleanupBackup;
+        high.pendingIndex = low.cleanupCursor;
+    }
+    else if (transitionId == "T28")
+    {
+        if (low.state != TransactionState::CommittedCleanupPending
+            || low.pending != TransactionPending::CleanupBackup
+            || low.pendingIndex != low.cleanupCursor
+            || low.cleanupCursor >= kExpectedOutputs.size())
+            return false;
+        high.entries[low.pendingIndex].oldLocation = "ABSENT";
+        high.pending = TransactionPending::None;
+        high.pendingIndex = kExpectedOutputs.size();
+        ++high.cleanupCursor;
+    }
+    else if (transitionId == "T29")
+    {
+        if (low.state != TransactionState::CommittedCleanupPending)
+            return false;
+        high.state = TransactionState::RecoveryRequiredCleanup;
+    }
+    else if (transitionId == "T30")
+    {
+        if (low.state != TransactionState::RecoveryRequiredCleanup)
+            return false;
+    }
+    else if (transitionId == "T31")
+    {
+        if (low.state != TransactionState::RecoveryRequiredCleanup)
+            return false;
+        high.state = TransactionState::CommittedCleanupPending;
+    }
+    else if (transitionId == "T32")
+    {
+        if (low.state != TransactionState::CommittedCleanupPending || !noPending()
+            || low.cleanupCursor != kExpectedOutputs.size()
+            || low.finalizeCursor >= 3)
+            return false;
+        ++high.finalizeCursor;
+    }
+    else
+    {
+        return false;
+    }
+    high.generation = low.generation + 1;
+    high.previousPayloadSha256 = std::string(lowPayloadSha256);
+    high.transitionId = std::string(transitionId);
+    high.transitionIndex = low.transitionIndex + 1;
+    if (!transactionJournalBodyEqual(high, supplied))
+        return false;
+    TransactionJournal parsed;
+    return parseTransactionJournal(serializeTransactionJournal(high), parsed)
+        && transactionJournalEqual(high, parsed);
+}
+
+bool transactionValidateAdjacent(const ParsedTransactionJournal& low,
+                                 const ParsedTransactionJournal& high) noexcept
+{
+    if (!low.valid || !high.valid
+        || low.journal.generation == std::numeric_limits<uint64_t>::max()
+        || high.journal.generation != low.journal.generation + 1
+        || high.journal.previousPayloadSha256 != low.payloadSha256
+        || high.journal.transitionIndex != low.journal.transitionIndex + 1)
+        return false;
+    TransactionJournal expected;
+    return transactionApplyTransition(
+               low.journal, high.journal, high.journal.transitionId,
+               low.payloadSha256, expected)
+        && transactionJournalEqual(expected, high.journal);
+}
+
+bool transactionClassifyAuthority(
+    const std::array<ParsedTransactionJournal, 2>& slots,
+    const std::array<ParsedTransactionJournal, 2>& temporaries,
+    std::string_view currentRoot,
+    std::string_view currentTransaction,
+    int& selected) noexcept
+{
+    for (const auto& slot : slots)
+        if (slot.present
+            && (!slot.valid || slot.bytes != serializeTransactionJournal(slot.journal)
+                || slot.journal.rootBindingSha256 != currentRoot
+                || slot.journal.transactionId != currentTransaction))
+            return false;
+    for (const auto& temporary : temporaries)
+        if (temporary.present
+            && (!temporary.valid
+                || temporary.bytes != serializeTransactionJournal(temporary.journal)
+                || temporary.journal.rootBindingSha256 != currentRoot
+                || temporary.journal.transactionId != currentTransaction))
+            return false;
+    const size_t finalCount = static_cast<size_t>(slots[0].present)
+                            + static_cast<size_t>(slots[1].present);
+    const size_t temporaryCount = static_cast<size_t>(temporaries[0].present)
+                                + static_cast<size_t>(temporaries[1].present);
+    if (finalCount == 0 || temporaryCount > 1
+        || (finalCount == 2 && temporaryCount != 0))
+        return false;
+    selected = slots[0].present ? 0 : 1;
+    if (finalCount == 2)
+    {
+        if (slots[0].journal.generation == slots[1].journal.generation)
+        {
+            if (slots[0].bytes != slots[1].bytes)
+                return false;
+            selected = 0;
+        }
+        else
+        {
+            const int low = slots[0].journal.generation
+                          < slots[1].journal.generation ? 0 : 1;
+            const int high = low == 0 ? 1 : 0;
+            if (!transactionValidateAdjacent(
+                    slots[static_cast<size_t>(low)],
+                    slots[static_cast<size_t>(high)]))
+                return false;
+            selected = high;
+        }
+    }
+    if (slots[static_cast<size_t>(selected)].journal.generation
+        == std::numeric_limits<uint64_t>::max())
+        return false;
+    if (temporaryCount == 1)
+    {
+        const size_t temporaryIndex = temporaries[0].present ? 0 : 1;
+        if (slots[temporaryIndex].present
+            || !transactionValidateAdjacent(
+                slots[static_cast<size_t>(selected)],
+                temporaries[temporaryIndex]))
+            return false;
+    }
+    return true;
+}
+
+bool transactionIdentityMatches(const TransactionFileIdentity& identity,
+                                uintmax_t size,
+                                const std::string& sha256) noexcept
+{
+    return identity.present && identity.valid
+        && identity.size == size && identity.sha256 == sha256;
+}
+
+class OutputTransaction
+{
+public:
+    explicit OutputTransaction(std::filesystem::path outputDirectory);
+    OutputTransaction(const OutputTransaction&) = delete;
+    OutputTransaction& operator=(const OutputTransaction&) = delete;
+    ~OutputTransaction() = default; // Recovery is explicit; destruction never mutates files.
+
+    bool begin();
+    bool openOutput(std::ofstream& output, const char* name);
+    bool finishOutput(std::ofstream& output, const char* name) noexcept;
+    bool commit();
+    int abortAndReport() noexcept;
+    int reportFailure() const noexcept;
+    bool recoveredCommitted() const noexcept { return recoveredCommitted_; }
+
+private:
+    enum class PathKind { Missing, Regular, Directory, Other, Error };
+
+    static int outputIndex(const std::string& name) noexcept;
+    static PathKind pathKind(const std::filesystem::path& path) noexcept;
+    static bool directoryEmpty(const std::filesystem::path& path) noexcept;
+
+    bool readLegacyInjections();
+    bool outerCensus(bool allowTransaction);
+    bool internalCensus() const;
+    bool initializeNewTransaction();
+    bool recoverExistingTransaction();
+    bool loadJournalAuthority();
+    bool reconcilePending(bool committed);
+    bool validateStagedCensus() const;
+    bool validateOldAuthority() const;
+    bool validateRecoveryPhysicalState(bool committed) const;
+    bool validateCommittedFinals() const;
+    bool validateTerminalFinalCensus(bool allowTransaction) const;
+    bool discardUnjournaledStaged() noexcept;
+
+    bool writeJournal(const std::string& logicalPoint,
+                      std::string_view transitionId);
+    bool writeJournalDirect(const std::filesystem::path& path,
+                            const TransactionJournal& journal) const;
+    bool removeKnownFile(const std::filesystem::path& path,
+                         const std::string& faultPoint = {});
+    bool removeKnownDirectory(const std::filesystem::path& path,
+                              const std::string& faultPoint = {});
+    bool renameKnown(const std::filesystem::path& source,
+                     const std::filesystem::path& destination,
+                     const std::string& faultPoint);
+    bool rollbackAndClean() noexcept;
+    bool committedCleanup() noexcept;
+    bool cleanupTransactionTree(bool committed) noexcept;
+    bool failPrecommit(const char* phase, const std::string& detail) noexcept;
+    bool failRecoveryRollback(const std::string& detail) noexcept;
+    bool failRecoveryCleanup(const std::string& detail) noexcept;
+    bool failCollision(const std::string& detail) noexcept;
+    void setFailure(const char* phase, const std::string& detail,
+                    int code = 3, bool replace = false) noexcept;
+
+#if defined(DSPARK_TIMESTRETCH_TRANSACTION_TESTING)
+    bool readInjectionIndex(const char* variable, int& target);
+    bool injectedFault(const std::string& point);
+    void crashCut(const std::string& point) const noexcept;
+    void trace(const std::string& event) const noexcept;
+#else
+    bool injectedFault(const std::string&) noexcept { return false; }
+    void crashCut(const std::string&) const noexcept {}
+    void trace(const std::string&) const noexcept {}
+#endif
+
+    std::filesystem::path outputDirectory_;
+    std::filesystem::path transactionDirectory_;
+    std::filesystem::path stagedDirectory_;
+    std::filesystem::path backupDirectory_;
+    std::array<std::filesystem::path, 2> journalPaths_;
+    std::array<std::filesystem::path, 2> journalTempPaths_;
+    TransactionJournal journal_;
+    int activeJournalSlot_ = -1;
+    std::array<bool, kExpectedOutputs.size()> opened_{};
+    std::array<bool, kExpectedOutputs.size()> finished_{};
+    std::array<TransactionFileIdentity, kExpectedOutputs.size()>
+        stagedIdentities_{};
+    std::string failurePhase_;
+    std::string failureDetail_;
+    int terminalCode_ = 3;
+    bool journalInitialized_ = false;
+    bool terminalFinalized_ = false;
+    bool committed_ = false;
+    bool recoveredCommitted_ = false;
+    bool recovering_ = false;
+#if defined(DSPARK_TIMESTRETCH_TRANSACTION_TESTING)
+    int stageFailureIndex_ = -1;
+    int commitFailureIndex_ = -1;
+    bool faultConsumed_ = false;
+#endif
+};
+
+OutputTransaction::OutputTransaction(std::filesystem::path outputDirectory)
+    : outputDirectory_(std::move(outputDirectory)),
+      transactionDirectory_(outputDirectory_ / kTransactionDirectory),
+      stagedDirectory_(transactionDirectory_ / "staged"),
+      backupDirectory_(transactionDirectory_ / "backup"),
+      journalPaths_{transactionDirectory_ / "journal.a",
+                    transactionDirectory_ / "journal.b"},
+      journalTempPaths_{transactionDirectory_ / "journal.a.tmp",
+                        transactionDirectory_ / "journal.b.tmp"}
+{
+}
+
+int OutputTransaction::outputIndex(const std::string& name) noexcept
+{
+    for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
+        if (name == kExpectedOutputs[index])
+            return static_cast<int>(index);
+    return -1;
+}
+
+OutputTransaction::PathKind OutputTransaction::pathKind(
+    const std::filesystem::path& path) noexcept
+{
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error == std::errc::no_such_file_or_directory)
+        return PathKind::Missing;
+    if (error)
+        return PathKind::Error;
+    if (!std::filesystem::exists(status))
+        return PathKind::Missing;
+    if (std::filesystem::is_regular_file(status))
+        return PathKind::Regular;
+    if (std::filesystem::is_directory(status))
+        return PathKind::Directory;
+    return PathKind::Other;
+}
+
+bool OutputTransaction::directoryEmpty(
+    const std::filesystem::path& path) noexcept
+{
+    std::error_code error;
+    const bool empty = std::filesystem::is_empty(path, error);
+    return !error && empty;
+}
+
+void OutputTransaction::setFailure(const char* phase,
+                                   const std::string& detail,
+                                   int code, bool replace) noexcept
+{
+    if (failurePhase_.empty() || replace)
+    {
+        failurePhase_ = phase;
+        failureDetail_ = detail;
+        terminalCode_ = code;
+    }
+}
+
+bool OutputTransaction::failRecoveryRollback(
+    const std::string& detail) noexcept
+{
+    setFailure("RECOVERY_REQUIRED_ROLLBACK", detail, 4, true);
+    terminalFinalized_ = true;
+    trace("terminal:RECOVERY_REQUIRED_ROLLBACK:" + detail);
+    return false;
+}
+
+bool OutputTransaction::failRecoveryCleanup(
+    const std::string& detail) noexcept
+{
+    setFailure("RECOVERY_REQUIRED_CLEANUP", detail, 5, true);
+    terminalFinalized_ = true;
+    trace("terminal:RECOVERY_REQUIRED_CLEANUP:" + detail);
+    return false;
+}
+
+bool OutputTransaction::failCollision(const std::string& detail) noexcept
+{
+    setFailure("RECOVERY_COLLISION", detail, 6, true);
+    terminalFinalized_ = true;
+    trace("terminal:RECOVERY_COLLISION:" + detail);
+    return false;
+}
+
+int OutputTransaction::reportFailure() const noexcept
+{
+    const char* phase = failurePhase_.empty()
+                      ? "UNKNOWN" : failurePhase_.c_str();
+    const char* detail = failureDetail_.empty()
+                       ? "unspecified" : failureDetail_.c_str();
+    std::fprintf(stderr, "ERROR TIMESTRETCH_TRANSACTION_%s %s\n",
+                 phase, detail);
+    return terminalCode_;
+}
+
+#if defined(DSPARK_TIMESTRETCH_TRANSACTION_TESTING)
+bool OutputTransaction::readInjectionIndex(const char* variable, int& target)
+{
+    const char* value = std::getenv(variable);
+    if (value == nullptr)
+        return true;
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < 0
+        || parsed >= static_cast<long>(kExpectedOutputs.size()))
+    {
+        setFailure("INJECTION_CONFIGURATION", variable);
+        return false;
+    }
+    target = static_cast<int>(parsed);
+    return true;
+}
+
+bool OutputTransaction::injectedFault(const std::string& point)
+{
+    const char* selected = std::getenv("DSPARK_TIMESTRETCH_DURABLE_FAULT");
+    if (selected == nullptr || point != selected)
+        return false;
+    const char* mode = std::getenv("DSPARK_TIMESTRETCH_DURABLE_MODE");
+    if (mode == nullptr
+        || (std::strcmp(mode, "one-shot") != 0
+            && std::strcmp(mode, "persistent") != 0))
+    {
+        setFailure("INJECTION_CONFIGURATION",
+                   "DSPARK_TIMESTRETCH_DURABLE_MODE");
+        return true;
+    }
+    if (std::strcmp(mode, "one-shot") == 0 && faultConsumed_)
+        return false;
+    faultConsumed_ = true;
+    trace("fault:" + point + ':' + mode);
+    return true;
+}
+
+void OutputTransaction::crashCut(const std::string& point) const noexcept
+{
+    const char* selected = std::getenv("DSPARK_TIMESTRETCH_CRASH_CUT");
+    if (selected != nullptr && point == selected)
+    {
+        trace("crash:" + point);
+        std::_Exit(86);
+    }
+}
+
+void OutputTransaction::trace(const std::string& event) const noexcept
+{
+    const char* path = std::getenv("DSPARK_TIMESTRETCH_TRACE_FILE");
+    if (path == nullptr)
+        return;
+    std::ofstream output(path, std::ios::out | std::ios::app);
+    if (output.is_open())
+        output << event << '\n';
+}
+#endif
+
+bool OutputTransaction::readLegacyInjections()
+{
+#if defined(DSPARK_TIMESTRETCH_TRANSACTION_TESTING)
+    if (!readInjectionIndex("DSPARK_TIMESTRETCH_FAIL_STAGE_INDEX",
+                            stageFailureIndex_)
+        || !readInjectionIndex("DSPARK_TIMESTRETCH_FAIL_COMMIT_INDEX",
+                               commitFailureIndex_))
+        return false;
+    const char* durable = std::getenv("DSPARK_TIMESTRETCH_DURABLE_FAULT");
+    const char* mode = std::getenv("DSPARK_TIMESTRETCH_DURABLE_MODE");
+    if ((durable == nullptr) != (mode == nullptr))
+    {
+        setFailure("INJECTION_CONFIGURATION",
+                   "DSPARK_TIMESTRETCH_DURABLE_FAULT");
+        return false;
+    }
+#endif
+    return true;
+}
+
+bool OutputTransaction::outerCensus(bool allowTransaction)
+{
+    std::array<bool, kExpectedOutputs.size()> seen{};
+    std::error_code error;
+    std::filesystem::directory_iterator iterator(outputDirectory_, error);
+    const std::filesystem::directory_iterator end;
+    for (; !error && iterator != end; iterator.increment(error))
+    {
+        const std::string name = iterator->path().filename().string();
+        if (allowTransaction && name == kTransactionDirectory)
+        {
+            if (pathKind(iterator->path()) != PathKind::Directory)
+                return false;
+            continue;
+        }
+        const int index = outputIndex(name);
+        if (index < 0 || seen[static_cast<size_t>(index)]
+            || pathKind(iterator->path()) != PathKind::Regular)
+            return false;
+        seen[static_cast<size_t>(index)] = true;
+    }
+    return !error;
+}
+
+bool OutputTransaction::internalCensus() const
+{
+    if (pathKind(transactionDirectory_) != PathKind::Directory)
+        return false;
+    std::error_code error;
+    std::filesystem::directory_iterator iterator(transactionDirectory_, error);
+    const std::filesystem::directory_iterator end;
+    for (; !error && iterator != end; iterator.increment(error))
+    {
+        const std::string name = iterator->path().filename().string();
+        if (name == "staged" || name == "backup")
+        {
+            if (pathKind(iterator->path()) != PathKind::Directory)
+                return false;
+            std::array<bool, kExpectedOutputs.size()> seen{};
+            std::error_code childError;
+            std::filesystem::directory_iterator child(iterator->path(), childError);
+            for (; !childError && child != end; child.increment(childError))
+            {
+                const int index = outputIndex(child->path().filename().string());
+                if (index < 0 || seen[static_cast<size_t>(index)]
+                    || pathKind(child->path()) != PathKind::Regular)
+                    return false;
+                seen[static_cast<size_t>(index)] = true;
+            }
+            if (childError)
+                return false;
+            continue;
+        }
+        if (name != "journal.a" && name != "journal.b"
+            && name != "journal.a.tmp" && name != "journal.b.tmp")
+            return false;
+        if (pathKind(iterator->path()) != PathKind::Regular)
+            return false;
+    }
+    return !error;
+}
+
+bool OutputTransaction::writeJournalDirect(
+    const std::filesystem::path& path,
+    const TransactionJournal& journal) const
+{
+    if (pathKind(path) != PathKind::Missing)
+        return false;
+    const std::string bytes = serializeTransactionJournal(journal);
+    if (bytes.size() > 65536)
+        return false;
+    std::ofstream output(path, std::ios::out | std::ios::binary);
+    if (!output.is_open())
+        return false;
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    output.flush();
+    const bool flushed = static_cast<bool>(output);
+    output.close();
+    if (!flushed || output.fail())
+        return false;
+    const ParsedTransactionJournal reread = readTransactionJournal(path);
+    return reread.present && reread.valid && reread.bytes == bytes
+        && reread.journal.generation == journal.generation
+        && reread.journal.transactionId == journal.transactionId
+        && reread.journal.rootBindingSha256 == journal.rootBindingSha256;
+}
+
+bool OutputTransaction::writeJournal(const std::string& logicalPoint,
+                                     std::string_view transitionId)
+{
+    const int target = activeJournalSlot_ == 0 ? 1 : 0;
+    if (activeJournalSlot_ < 0 && journal_.generation != 0)
+        return false;
+    const std::string currentRoot = transactionSha256(
+        std::filesystem::absolute(outputDirectory_).lexically_normal().generic_string());
+    const std::string currentTransaction = transactionSha256(
+        "DSPark-TimeStretch-transaction-id|" + currentRoot).substr(0, 32);
+    if (journal_.rootBindingSha256 != currentRoot
+        || journal_.transactionId != currentTransaction)
+        return false;
+
+    ParsedTransactionJournal active;
+    TransactionJournal next;
+    bool temporaryOwnedByAttempt = false;
+    const auto rejectWrite = [this, &active, &next, &temporaryOwnedByAttempt,
+                              target]() {
+        if (temporaryOwnedByAttempt
+            && pathKind(journalPaths_[static_cast<size_t>(target)])
+                == PathKind::Missing)
+        {
+            const ParsedTransactionJournal temporary = readTransactionJournal(
+                journalTempPaths_[static_cast<size_t>(target)]);
+            if (temporary.present && temporary.valid
+                && transactionJournalEqual(temporary.journal, next)
+                && temporary.bytes == serializeTransactionJournal(next))
+            {
+                std::error_code error;
+                std::filesystem::remove(
+                    journalTempPaths_[static_cast<size_t>(target)], error);
+            }
+        }
+        if (active.present && active.valid)
+            journal_ = active.journal;
+        return false;
+    };
+    if (activeJournalSlot_ >= 0)
+    {
+        active =
+            readTransactionJournal(journalPaths_[static_cast<size_t>(activeJournalSlot_)]);
+        if (!active.present || !active.valid
+            || active.bytes != serializeTransactionJournal(active.journal)
+            || active.journal.transactionId != currentTransaction
+            || active.journal.rootBindingSha256 != currentRoot
+            || !transactionApplyTransition(
+                active.journal, journal_, transitionId,
+                active.payloadSha256, next))
+            return rejectWrite();
+    }
+    else
+    {
+        if (journal_.state != TransactionState::Setup
+            || transitionId != "T01")
+            return rejectWrite();
+        next = journal_;
+        next.generation = 1;
+        next.previousPayloadSha256 = std::string(kZeroSha256);
+        next.transitionId = "BEGIN";
+        next.transitionIndex = 0;
+        TransactionJournal parsed;
+        if (!parseTransactionJournal(serializeTransactionJournal(next), parsed)
+            || !transactionJournalEqual(next, parsed))
+            return rejectWrite();
+    }
+    if (next.generation == std::numeric_limits<uint64_t>::max())
+        return rejectWrite();
+    if (pathKind(journalTempPaths_[static_cast<size_t>(target)]) != PathKind::Missing)
+    {
+        const ParsedTransactionJournal temporary =
+            readTransactionJournal(journalTempPaths_[static_cast<size_t>(target)]);
+        if (activeJournalSlot_ < 0 || !temporary.present || !temporary.valid
+            || pathKind(journalPaths_[static_cast<size_t>(target)])
+                != PathKind::Missing
+            || temporary.journal.transactionId != currentTransaction
+            || temporary.journal.rootBindingSha256 != currentRoot
+            || !transactionValidateAdjacent(active, temporary))
+            return rejectWrite();
+        std::error_code error;
+        if (!std::filesystem::remove(
+                journalTempPaths_[static_cast<size_t>(target)], error) || error)
+            return rejectWrite();
+    }
+    if (pathKind(journalPaths_[static_cast<size_t>(target)]) != PathKind::Missing)
+    {
+        if (activeJournalSlot_ < 0)
+            return rejectWrite();
+        const ParsedTransactionJournal stale =
+            readTransactionJournal(journalPaths_[static_cast<size_t>(target)]);
+        if (!stale.present || !stale.valid
+            || stale.journal.transactionId != currentTransaction
+            || stale.journal.rootBindingSha256 != currentRoot
+            || (stale.bytes != active.bytes
+                && !transactionValidateAdjacent(stale, active)))
+            return rejectWrite();
+        std::error_code error;
+        if (!std::filesystem::remove(journalPaths_[static_cast<size_t>(target)], error)
+            || error)
+            return rejectWrite();
+    }
+
+    const std::string writePoint = "journal-write:" + logicalPoint;
+    if (injectedFault(writePoint))
+        return rejectWrite();
+    temporaryOwnedByAttempt = true;
+    if (!writeJournalDirect(journalTempPaths_[static_cast<size_t>(target)], next))
+        return rejectWrite();
+    if (injectedFault("journal-replace:" + logicalPoint))
+        return rejectWrite();
+    std::error_code error;
+    std::filesystem::rename(journalTempPaths_[static_cast<size_t>(target)],
+                            journalPaths_[static_cast<size_t>(target)], error);
+    if (error)
+        return rejectWrite();
+    const ParsedTransactionJournal promoted =
+        readTransactionJournal(journalPaths_[static_cast<size_t>(target)]);
+    if (!promoted.present || !promoted.valid
+        || !transactionJournalEqual(promoted.journal, next)
+        || promoted.bytes != serializeTransactionJournal(next))
+        return rejectWrite();
+    journal_ = std::move(next);
+    activeJournalSlot_ = target;
+    journalInitialized_ = true;
+    trace("journal:" + logicalPoint + ":generation="
+          + std::to_string(journal_.generation));
+    return true;
+}
+
+bool OutputTransaction::removeKnownFile(const std::filesystem::path& path,
+                                        const std::string& faultPoint)
+{
+    const PathKind kind = pathKind(path);
+    if (kind == PathKind::Missing)
+        return true;
+    if (kind != PathKind::Regular || (!faultPoint.empty() && injectedFault(faultPoint)))
+        return false;
+    std::error_code error;
+    const bool removed = std::filesystem::remove(path, error);
+    if (!removed || error)
+        return false;
+    trace("remove-file:" + path.generic_string());
+    return true;
+}
+
+bool OutputTransaction::removeKnownDirectory(
+    const std::filesystem::path& path, const std::string& faultPoint)
+{
+    const PathKind kind = pathKind(path);
+    if (kind == PathKind::Missing)
+        return true;
+    if (kind != PathKind::Directory || !directoryEmpty(path)
+        || (!faultPoint.empty() && injectedFault(faultPoint)))
+        return false;
+    std::error_code error;
+    const bool removed = std::filesystem::remove(path, error);
+    if (!removed || error)
+        return false;
+    trace("remove-directory:" + path.generic_string());
+    return true;
+}
+
+bool OutputTransaction::renameKnown(
+    const std::filesystem::path& source,
+    const std::filesystem::path& destination,
+    const std::string& faultPoint)
+{
+    if (pathKind(source) != PathKind::Regular
+        || pathKind(destination) != PathKind::Missing
+        || injectedFault(faultPoint))
+        return false;
+    std::error_code error;
+    std::filesystem::rename(source, destination, error);
+    if (error)
+        return false;
+    trace("rename:" + source.generic_string() + "->" + destination.generic_string());
+    return true;
+}
+
+bool OutputTransaction::initializeNewTransaction()
+{
+    journal_ = {};
+    const std::string rootSpelling = std::filesystem::absolute(outputDirectory_)
+        .lexically_normal().generic_string();
+    journal_.rootBindingSha256 = transactionSha256(rootSpelling);
+    journal_.transactionId = transactionSha256(
+        "DSPark-TimeStretch-transaction-id|" + journal_.rootBindingSha256).substr(0, 32);
+    journal_.state = TransactionState::Setup;
+    for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
+    {
+        const auto identity = transactionFileIdentity(
+            outputDirectory_ / kExpectedOutputs[index]);
+        if (identity.present && !identity.valid)
+        {
+            setFailure("PRECHECK", kExpectedOutputs[index]);
+            return false;
+        }
+        auto& entry = journal_.entries[index];
+        entry.oldPresent = identity.present;
+        if (identity.present)
+        {
+            entry.oldSize = identity.size;
+            entry.oldSha256 = identity.sha256;
+            entry.oldLocation = "FINAL";
+        }
+    }
+
+    if (injectedFault("setup:00"))
+    {
+        setFailure("SETUP", "transaction-directory");
+        return false;
+    }
+    std::error_code error;
+    if (!std::filesystem::create_directory(transactionDirectory_, error) || error)
+    {
+        setFailure("COLLISION", kTransactionDirectory);
+        return false;
+    }
+    if (!writeJournal("setup:00", "T01"))
+        return failPrecommit("SETUP", "journal.a");
+    crashCut("setup:00");
+
+    if (injectedFault("setup:01")
+        || !std::filesystem::create_directory(stagedDirectory_, error) || error)
+        return failPrecommit("SETUP", "staged");
+    if (!writeJournal("setup:01", "T01"))
+        return failPrecommit("SETUP", "journal-staged");
+    crashCut("setup:01");
+
+    error.clear();
+    if (injectedFault("setup:02")
+        || !std::filesystem::create_directory(backupDirectory_, error) || error)
+        return failPrecommit("SETUP", "backup");
+    if (!writeJournal("setup:02", "T01"))
+        return failPrecommit("SETUP", "journal-backup");
+    crashCut("setup:02");
+    return true;
+}
+
+bool OutputTransaction::begin()
+{
+    if (!readLegacyInjections())
+        return false;
+    const PathKind transactionKind = pathKind(transactionDirectory_);
+    if (transactionKind != PathKind::Missing)
+    {
+        if (transactionKind != PathKind::Directory || !outerCensus(true))
+            return failCollision(kTransactionDirectory);
+        return recoverExistingTransaction();
+    }
+    if (!outerCensus(false))
     {
         std::error_code error;
         std::filesystem::directory_iterator iterator(outputDirectory_, error);
@@ -176,405 +1889,853 @@ public:
         for (; !error && iterator != end; iterator.increment(error))
         {
             const std::string name = iterator->path().filename().string();
-            if (name == kTransactionDirectory)
-            {
-                setFailure("COLLISION", kTransactionDirectory);
-                return false;
-            }
             const int index = outputIndex(name);
             if (index < 0)
             {
                 setFailure("ARTIFACT_CENSUS", name);
                 return false;
             }
-            std::error_code statusError;
-            const auto status = std::filesystem::symlink_status(
-                iterator->path(), statusError);
-            if (statusError || !std::filesystem::is_regular_file(status))
+            if (pathKind(iterator->path()) != PathKind::Regular)
             {
                 setFailure("PRECHECK", name);
                 return false;
             }
-            preexisting_[static_cast<size_t>(index)] = true;
         }
-        if (error)
-        {
-            setFailure("ARTIFACT_CENSUS", "directory-iteration");
-            return false;
-        }
-
-#if defined(DSPARK_TIMESTRETCH_TRANSACTION_TESTING)
-        if (!readInjectionIndex("DSPARK_TIMESTRETCH_FAIL_STAGE_INDEX",
-                                stageFailureIndex_)
-            || !readInjectionIndex("DSPARK_TIMESTRETCH_FAIL_COMMIT_INDEX",
-                                   commitFailureIndex_))
-            return false;
-#endif
-
-        const bool created = std::filesystem::create_directory(
-            transactionDirectory_, error);
-        if (error || !created)
-        {
-            setFailure("COLLISION", kTransactionDirectory);
-            return false;
-        }
-        ownsTransactionDirectory_ = true;
-        if (!std::filesystem::create_directory(stagedDirectory_, error)
-            || error)
-        {
-            setFailure("SETUP", "staged");
-            return false;
-        }
-        if (!std::filesystem::create_directory(backupDirectory_, error)
-            || error)
-        {
-            setFailure("SETUP", "backup");
-            return false;
-        }
-        return true;
+        setFailure("ARTIFACT_CENSUS", "directory-iteration");
+        return false;
     }
+    return initializeNewTransaction();
+}
 
-    bool openOutput(std::ofstream& output, const char* name)
+bool OutputTransaction::openOutput(std::ofstream& output, const char* name)
+{
+    const int signedIndex = outputIndex(name);
+    if (signedIndex < 0)
     {
-        const int index = outputIndex(name);
-        if (index < 0 || opened_[static_cast<size_t>(index)])
+        setFailure("STAGE", name);
+        return false;
+    }
+    const size_t index = static_cast<size_t>(signedIndex);
+    if (opened_[index] || !journalInitialized_ || committed_
+        || pathKind(stagedDirectory_) != PathKind::Directory)
+    {
+        setFailure("STAGE", name);
+        return false;
+    }
+#if defined(DSPARK_TIMESTRETCH_TRANSACTION_TESTING)
+    if (signedIndex == stageFailureIndex_)
+    {
+        setFailure("STAGE", name);
+        return false;
+    }
+#endif
+    if (pathKind(stagedDirectory_ / name) != PathKind::Missing)
+    {
+        setFailure("STAGE", name);
+        return false;
+    }
+    output.open(stagedDirectory_ / name, std::ios::out | std::ios::binary);
+    if (!output.is_open())
+    {
+        setFailure("STAGE", name);
+        return false;
+    }
+    opened_[index] = true;
+    return true;
+}
+
+bool OutputTransaction::finishOutput(std::ofstream& output,
+                                     const char* name) noexcept
+{
+    const int signedIndex = outputIndex(name);
+    output.flush();
+    const bool flushed = static_cast<bool>(output);
+    output.close();
+    const bool closed = !output.fail();
+    if (signedIndex < 0 || !flushed || !closed)
+    {
+        setFailure("STAGE", name);
+        return false;
+    }
+    const size_t index = static_cast<size_t>(signedIndex);
+    const auto identity = transactionFileIdentity(stagedDirectory_ / name);
+    if (!opened_[index] || finished_[index] || !identity.valid)
+    {
+        setFailure("STAGE", name);
+        return false;
+    }
+    stagedIdentities_[index] = identity;
+    finished_[index] = true;
+    size_t established = static_cast<size_t>(std::count_if(
+        journal_.entries.begin(), journal_.entries.end(),
+        [](const TransactionEntry& candidate) {
+            return candidate.newSize > 0;
+        }));
+    while (established < kExpectedOutputs.size() && finished_[established])
+    {
+        const auto& establishedIdentity = stagedIdentities_[established];
+        const auto establishedPath =
+            stagedDirectory_ / kExpectedOutputs[established];
+        if (!transactionIdentityMatches(
+                transactionFileIdentity(establishedPath),
+                establishedIdentity.size, establishedIdentity.sha256))
         {
-            setFailure("STAGE", name);
+            setFailure("STAGE", kExpectedOutputs[established]);
             return false;
         }
-        const std::filesystem::path path = stagedDirectory_ / name;
-#if defined(DSPARK_TIMESTRETCH_TRANSACTION_TESTING)
-        if (index == stageFailureIndex_)
+        auto& entry = journal_.entries[established];
+        entry.newSize = establishedIdentity.size;
+        entry.newSha256 = establishedIdentity.sha256;
+        entry.newLocation = "STAGED";
+        const bool last = established + 1 == kExpectedOutputs.size();
+        journal_.state = last ? TransactionState::Staged
+                              : TransactionState::Staging;
+        const std::string_view transitionId = established == 0 ? "T02"
+                                            : (last ? "T04" : "T03");
+        if (!writeJournal(
+                "stage:" + twoDigitIndex(established), transitionId))
         {
-#if defined(_WIN32)
-            setFailure("STAGE", name);
+            setFailure("STAGE", kExpectedOutputs[established]);
             return false;
-#else
-            std::error_code injectionError;
-            std::filesystem::create_symlink("/dev/full", path, injectionError);
-            if (injectionError)
-            {
-                setFailure("STAGE", name);
+        }
+        crashCut("stage:" + twoDigitIndex(established));
+        if (last)
+            crashCut("staged-boundary");
+        ++established;
+    }
+    return true;
+}
+
+bool OutputTransaction::discardUnjournaledStaged() noexcept
+{
+    for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
+    {
+        if (!finished_[index] || journal_.entries[index].newSize > 0)
+            continue;
+        const auto& identity = stagedIdentities_[index];
+        const auto path = stagedDirectory_ / kExpectedOutputs[index];
+        if (!transactionIdentityMatches(
+                transactionFileIdentity(path), identity.size, identity.sha256)
+            || !removeKnownFile(path))
+            return false;
+    }
+    return true;
+}
+
+bool OutputTransaction::validateStagedCensus() const
+{
+    if (pathKind(stagedDirectory_) != PathKind::Directory)
+        return false;
+    std::array<bool, kExpectedOutputs.size()> seen{};
+    std::error_code error;
+    std::filesystem::directory_iterator iterator(stagedDirectory_, error);
+    const std::filesystem::directory_iterator end;
+    for (; !error && iterator != end; iterator.increment(error))
+    {
+        const int signedIndex = outputIndex(iterator->path().filename().string());
+        if (signedIndex < 0)
+            return false;
+        const size_t index = static_cast<size_t>(signedIndex);
+        if (seen[index]
+            || !transactionIdentityMatches(
+                transactionFileIdentity(iterator->path()),
+                journal_.entries[index].newSize,
+                journal_.entries[index].newSha256))
+            return false;
+        seen[index] = true;
+    }
+    return !error && std::all_of(
+        seen.begin(), seen.end(), [](bool value) { return value; });
+}
+
+bool OutputTransaction::validateOldAuthority() const
+{
+    for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
+    {
+        const auto& entry = journal_.entries[index];
+        const auto finalIdentity = transactionFileIdentity(
+            outputDirectory_ / kExpectedOutputs[index]);
+        const auto backupIdentity = transactionFileIdentity(
+            backupDirectory_ / kExpectedOutputs[index]);
+        if (entry.oldPresent)
+        {
+            const bool oldFinal = transactionIdentityMatches(
+                finalIdentity, entry.oldSize, entry.oldSha256);
+            const bool oldBackup = transactionIdentityMatches(
+                backupIdentity, entry.oldSize, entry.oldSha256);
+            const bool newFinal = entry.newSize > 0 && transactionIdentityMatches(
+                finalIdentity, entry.newSize, entry.newSha256);
+            if ((oldFinal && oldBackup) || (!oldFinal && !oldBackup)
+                || (finalIdentity.present && !oldFinal && !newFinal)
+                || (backupIdentity.present && !oldBackup))
                 return false;
-            }
-#endif
         }
-#endif
-        output.open(path, std::ios::out | std::ios::trunc);
-        if (!output.is_open())
+        else if (backupIdentity.present)
         {
-            setFailure("STAGE", name);
             return false;
         }
-        opened_[static_cast<size_t>(index)] = true;
-        return true;
     }
+    return true;
+}
 
-    bool finishOutput(std::ofstream& output, const char* name) noexcept
+bool OutputTransaction::validateRecoveryPhysicalState(bool committed) const
+{
+    for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
     {
-        const int index = outputIndex(name);
-        output.flush();
-        const bool flushed = static_cast<bool>(output);
-        output.close();
-        const bool closed = !output.fail();
-        if (index < 0 || !flushed || !closed)
+        const auto& entry = journal_.entries[index];
+        const auto finalIdentity = transactionFileIdentity(
+            outputDirectory_ / kExpectedOutputs[index]);
+        const auto stagedIdentity = transactionFileIdentity(
+            stagedDirectory_ / kExpectedOutputs[index]);
+        const auto backupIdentity = transactionFileIdentity(
+            backupDirectory_ / kExpectedOutputs[index]);
+        const bool oldFinal = entry.oldPresent && transactionIdentityMatches(
+            finalIdentity, entry.oldSize, entry.oldSha256);
+        const bool oldBackup = entry.oldPresent && transactionIdentityMatches(
+            backupIdentity, entry.oldSize, entry.oldSha256);
+        const bool newFinal = entry.newSize > 0 && transactionIdentityMatches(
+            finalIdentity, entry.newSize, entry.newSha256);
+        const bool newStaged = entry.newSize > 0 && transactionIdentityMatches(
+            stagedIdentity, entry.newSize, entry.newSha256);
+        if ((finalIdentity.present && !oldFinal && !newFinal)
+            || (stagedIdentity.present && !newStaged)
+            || (backupIdentity.present && !oldBackup)
+            || (newFinal && newStaged))
+            return false;
+        if (committed)
         {
-            setFailure("STAGE", name);
+            if (!newFinal)
+                return false;
+        }
+        else if ((entry.oldPresent && oldFinal == oldBackup)
+                 || (!entry.oldPresent && backupIdentity.present))
+        {
             return false;
         }
-        const std::filesystem::path path = stagedDirectory_ / name;
+    }
+    return true;
+}
+
+bool OutputTransaction::validateCommittedFinals() const
+{
+    for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
+    {
+        const auto& entry = journal_.entries[index];
+        if (entry.newSize == 0
+            || !transactionIdentityMatches(
+                transactionFileIdentity(outputDirectory_ / kExpectedOutputs[index]),
+                entry.newSize, entry.newSha256))
+            return false;
+    }
+    return true;
+}
+
+bool OutputTransaction::validateTerminalFinalCensus(
+    bool allowTransaction) const
+{
+    std::array<bool, kExpectedOutputs.size()> seen{};
+    std::error_code error;
+    std::filesystem::directory_iterator iterator(outputDirectory_, error);
+    const std::filesystem::directory_iterator end;
+    for (; !error && iterator != end; iterator.increment(error))
+    {
+        const std::string name = iterator->path().filename().string();
+        if (allowTransaction && name == kTransactionDirectory)
+            continue;
+        const int signedIndex = outputIndex(name);
+        if (signedIndex < 0)
+            return false;
+        const size_t index = static_cast<size_t>(signedIndex);
+        if (seen[index] || pathKind(iterator->path()) != PathKind::Regular)
+            return false;
+        seen[index] = true;
+    }
+    return !error && std::all_of(
+        seen.begin(), seen.end(), [](bool value) { return value; });
+}
+
+bool OutputTransaction::loadJournalAuthority()
+{
+    if (!internalCensus())
+        return false;
+    std::array<ParsedTransactionJournal, 2> slots = {
+        readTransactionJournal(journalPaths_[0]),
+        readTransactionJournal(journalPaths_[1]),
+    };
+    std::array<ParsedTransactionJournal, 2> temporaries = {
+        readTransactionJournal(journalTempPaths_[0]),
+        readTransactionJournal(journalTempPaths_[1]),
+    };
+    const std::string currentRoot = transactionSha256(
+        std::filesystem::absolute(outputDirectory_).lexically_normal().generic_string());
+    const std::string currentTransaction = transactionSha256(
+        "DSPark-TimeStretch-transaction-id|" + currentRoot).substr(0, 32);
+    const size_t temporaryCount = static_cast<size_t>(temporaries[0].present)
+                                + static_cast<size_t>(temporaries[1].present);
+    int selected = -1;
+    if (!transactionClassifyAuthority(
+            slots, temporaries, currentRoot, currentTransaction, selected))
+        return false;
+    journal_ = slots[static_cast<size_t>(selected)].journal;
+    activeJournalSlot_ = selected;
+    if (temporaryCount == 1)
+    {
+        const size_t temporaryIndex = temporaries[0].present ? 0 : 1;
         std::error_code error;
-        const auto status = std::filesystem::symlink_status(path, error);
-        if (error || !std::filesystem::is_regular_file(status))
-        {
-            setFailure("STAGE", name);
+        if (!std::filesystem::remove(journalTempPaths_[temporaryIndex], error)
+            || error)
             return false;
-        }
-        const auto size = std::filesystem::file_size(path, error);
-        if (error || size == 0)
-        {
-            setFailure("STAGE", name);
-            return false;
-        }
-        finished_[static_cast<size_t>(index)] = true;
-        return true;
     }
+    journalInitialized_ = true;
+    return true;
+}
 
-    bool commit()
+bool OutputTransaction::reconcilePending(bool committed)
+{
+    if (journal_.pending == TransactionPending::None)
+        return true;
+    const size_t index = journal_.pendingIndex;
+    if (index >= kExpectedOutputs.size())
+        return false;
+    auto& entry = journal_.entries[index];
+    const auto finalIdentity = transactionFileIdentity(
+        outputDirectory_ / kExpectedOutputs[index]);
+    const auto stagedIdentity = transactionFileIdentity(
+        stagedDirectory_ / kExpectedOutputs[index]);
+    const auto backupIdentity = transactionFileIdentity(
+        backupDirectory_ / kExpectedOutputs[index]);
+    const bool oldFinal = entry.oldPresent && transactionIdentityMatches(
+        finalIdentity, entry.oldSize, entry.oldSha256);
+    const bool oldBackup = entry.oldPresent && transactionIdentityMatches(
+        backupIdentity, entry.oldSize, entry.oldSha256);
+    const bool newFinal = entry.newSize > 0 && transactionIdentityMatches(
+        finalIdentity, entry.newSize, entry.newSha256);
+    const bool newStaged = entry.newSize > 0 && transactionIdentityMatches(
+        stagedIdentity, entry.newSize, entry.newSha256);
+    switch (journal_.pending)
     {
-        if (!std::all_of(finished_.begin(), finished_.end(),
-                         [](bool value) { return value; })
-            || !validateStagedCensus())
-        {
-            setFailure("STAGE", "artifact-census");
-            rollback();
-            return false;
-        }
-
-        for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
-        {
-            const std::filesystem::path finalPath =
-                outputDirectory_ / kExpectedOutputs[index];
-            std::error_code statusError;
-            const auto status = std::filesystem::symlink_status(
-                finalPath, statusError);
-            if (preexisting_[index])
+        case TransactionPending::Backup:
+            if (entry.oldPresent)
             {
-                if (statusError || !std::filesystem::is_regular_file(status))
+                if (oldFinal == oldBackup)
+                    return false;
+                if (oldFinal
+                    && !renameKnown(outputDirectory_ / kExpectedOutputs[index],
+                                    backupDirectory_ / kExpectedOutputs[index], {}))
+                    return false;
+                entry.oldLocation = "BACKUP";
+            }
+            else
+            {
+                if (finalIdentity.present || backupIdentity.present)
+                    return false;
+                entry.oldLocation = "ABSENT";
+            }
+            journal_.pending = TransactionPending::None;
+            journal_.pendingIndex = kExpectedOutputs.size();
+            return writeJournal("coherence:T06:reconcile", "T06");
+        case TransactionPending::Publish:
+            if (newStaged == newFinal)
+                return false;
+            if (newStaged
+                && !renameKnown(stagedDirectory_ / kExpectedOutputs[index],
+                                outputDirectory_ / kExpectedOutputs[index], {}))
+                return false;
+            entry.newLocation = "FINAL";
+            journal_.pending = TransactionPending::None;
+            journal_.pendingIndex = kExpectedOutputs.size();
+            return writeJournal("coherence:T09:reconcile", "T09");
+        case TransactionPending::RemoveNew:
+            if (newFinal && entry.oldPresent && !oldBackup)
+                return false;
+            if (finalIdentity.present && !newFinal && !oldFinal)
+                return false;
+            if (newFinal
+                && !removeKnownFile(
+                    outputDirectory_ / kExpectedOutputs[index],
+                    "new-final-remove:" + twoDigitIndex(index)))
+                return false;
+            if (newStaged
+                && !removeKnownFile(stagedDirectory_ / kExpectedOutputs[index]))
+                return false;
+            entry.newLocation = "NONE";
+            journal_.pending = TransactionPending::None;
+            journal_.pendingIndex = kExpectedOutputs.size();
+            ++journal_.rollbackCursor;
+            return writeJournal(
+                "recovery-reconcile:"
+                    + twoDigitIndex(journal_.rollbackCursor - 1),
+                "T20");
+        case TransactionPending::RestoreOld:
+            if (!entry.oldPresent || oldBackup == oldFinal)
+            {
+                if (!entry.oldPresent && !finalIdentity.present
+                    && !backupIdentity.present)
                 {
-                    setFailure("PRECHECK", kExpectedOutputs[index]);
-                    rollback();
+                    entry.oldLocation = "ABSENT";
+                }
+                else
+                {
                     return false;
                 }
-                std::error_code renameError;
-                std::filesystem::rename(
-                    finalPath, backupDirectory_ / kExpectedOutputs[index],
-                    renameError);
-                if (renameError)
-                {
-                    setFailure("BACKUP", kExpectedOutputs[index]);
-                    rollback();
+            }
+            else
+            {
+                if (oldBackup
+                    && !renameKnown(backupDirectory_ / kExpectedOutputs[index],
+                                    outputDirectory_ / kExpectedOutputs[index],
+                                    "restore-rename:" + twoDigitIndex(index)))
                     return false;
-                }
-                backedUp_[index] = true;
+                entry.oldLocation = "FINAL";
             }
-            else if (!statusError && std::filesystem::exists(status))
-            {
-                setFailure("PRECHECK", kExpectedOutputs[index]);
-                rollback();
+            journal_.pending = TransactionPending::None;
+            journal_.pendingIndex = kExpectedOutputs.size();
+            ++journal_.rollbackCursor;
+            return writeJournal("coherence:T22:reconcile", "T22");
+        case TransactionPending::CleanupBackup:
+            if (!committed || !validateCommittedFinals()
+                || (backupIdentity.present && !oldBackup))
                 return false;
-            }
-            else if (statusError
-                     && statusError != std::errc::no_such_file_or_directory)
-            {
-                setFailure("PRECHECK", kExpectedOutputs[index]);
-                rollback();
+            if (oldBackup
+                && !removeKnownFile(
+                    backupDirectory_ / kExpectedOutputs[index],
+                    "backup-cleanup:" + twoDigitIndex(index)))
                 return false;
-            }
-        }
+            entry.oldLocation = "ABSENT";
+            journal_.pending = TransactionPending::None;
+            journal_.pendingIndex = kExpectedOutputs.size();
+            ++journal_.cleanupCursor;
+            return writeJournal("coherence:T28:reconcile", "T28");
+        case TransactionPending::None:
+            break;
+    }
+    return true;
+}
 
-        for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
-        {
-#if defined(DSPARK_TIMESTRETCH_TRANSACTION_TESTING)
-            if (static_cast<int>(index) == commitFailureIndex_)
-            {
-                setFailure("COMMIT", kExpectedOutputs[index]);
-                rollback();
-                return false;
-            }
-#endif
-            std::error_code renameError;
-            std::filesystem::rename(
-                stagedDirectory_ / kExpectedOutputs[index],
-                outputDirectory_ / kExpectedOutputs[index], renameError);
-            if (renameError)
-            {
-                setFailure("PUBLISH", kExpectedOutputs[index]);
-                rollback();
-                return false;
-            }
-            published_[index] = true;
-        }
-
-        if (!validateFinalCensus(true))
-        {
-            setFailure("COMMIT", "artifact-census");
-            rollback();
+bool OutputTransaction::recoverExistingTransaction()
+{
+    recovering_ = true;
+    if (!loadJournalAuthority())
+        return failCollision(kTransactionDirectory);
+    const bool committed =
+        journal_.state == TransactionState::CommittedCleanupPending
+        || journal_.state == TransactionState::RecoveryRequiredCleanup;
+    if (!validateRecoveryPhysicalState(committed))
+        return failCollision(kTransactionDirectory);
+    if (committed)
+    {
+        committed_ = true;
+        if (!committedCleanup())
             return false;
-        }
-
-        std::error_code cleanupError;
-        std::filesystem::remove_all(transactionDirectory_, cleanupError);
-        if (cleanupError)
-        {
-            setFailure("CLEANUP", kTransactionDirectory);
-            rollback();
-            return false;
-        }
-        ownsTransactionDirectory_ = false;
-        if (!validateFinalCensus(false))
-        {
-            setFailure("COMMIT", "terminal-artifact-census");
-            return false;
-        }
+        recoveredCommitted_ = true;
         return true;
     }
+    setFailure("RECOVERED_ROLLBACK", kTransactionDirectory);
+    return rollbackAndClean();
+}
 
-    int abortAndReport() noexcept
+bool OutputTransaction::failPrecommit(const char* phase,
+                                      const std::string& detail) noexcept
+{
+    setFailure(phase, detail);
+    if (pathKind(transactionDirectory_) == PathKind::Missing)
     {
-        if (ownsTransactionDirectory_)
+        terminalFinalized_ = true;
+        return false;
+    }
+    return rollbackAndClean();
+}
+
+bool OutputTransaction::rollbackAndClean() noexcept
+{
+    if (committed_)
+        return failRecoveryCleanup("rollback-forbidden-after-commit");
+    trace("rollback:begin");
+
+    if (!recovering_ && !discardUnjournaledStaged())
+        return failRecoveryRollback("unrecorded-staged");
+
+    if (!journalInitialized_)
+    {
+        if (!removeKnownDirectory(stagedDirectory_)
+            || !removeKnownDirectory(backupDirectory_)
+            || !removeKnownDirectory(transactionDirectory_))
+            return failRecoveryRollback("uninitialized-transaction");
+        terminalFinalized_ = true;
+        return false;
+    }
+    if (journal_.state == TransactionState::RecoveryRequiredRollback)
+    {
+        journal_.state = TransactionState::RollbackRequired;
+        if (!writeJournal("coherence:T25", "T25"))
+            return failRecoveryRollback("retry-rollback");
+    }
+    if (!reconcilePending(false))
+        return failRecoveryRollback("pending-operation");
+    if (journal_.state != TransactionState::RollbackRequired)
+    {
+        std::string_view transitionId;
+        switch (journal_.state)
         {
-            std::error_code cleanupError;
-            std::filesystem::remove_all(transactionDirectory_, cleanupError);
-            if (cleanupError)
-                setFailure("ROLLBACK", kTransactionDirectory, true);
-            else
-                ownsTransactionDirectory_ = false;
+            case TransactionState::Setup: transitionId = "T13"; break;
+            case TransactionState::Staging: transitionId = "T14"; break;
+            case TransactionState::Staged: transitionId = "T15"; break;
+            case TransactionState::BackupInProgress: transitionId = "T16"; break;
+            case TransactionState::PublishInProgress: transitionId = "T17"; break;
+            case TransactionState::CommitReady: transitionId = "T18"; break;
+            default: return failRecoveryRollback("rollback-source-state");
         }
-        return reportFailure();
+        journal_.state = TransactionState::RollbackRequired;
+        journal_.pending = TransactionPending::None;
+        journal_.pendingIndex = kExpectedOutputs.size();
+        journal_.rollbackCursor = 0;
+        journal_.cleanupCursor = 0;
+        journal_.finalizeCursor = 0;
+        if (!writeJournal("coherence:" + std::string(transitionId), transitionId))
+            return failRecoveryRollback("enter-rollback");
     }
 
-    int reportFailure() const noexcept
+    while (journal_.rollbackCursor < 9)
     {
-        const char* phase = failurePhase_.empty()
-                          ? "UNKNOWN" : failurePhase_.c_str();
-        const char* detail = failureDetail_.empty()
-                           ? "unspecified" : failureDetail_.c_str();
-        std::fprintf(stderr, "ERROR TIMESTRETCH_TRANSACTION_%s %s\n",
-                     phase, detail);
-        return 3;
+        const size_t cursor = journal_.rollbackCursor;
+        const size_t index = 8 - cursor;
+        journal_.pending = TransactionPending::RemoveNew;
+        journal_.pendingIndex = index;
+        if (!writeJournal("rollback-remove:" + twoDigitIndex(index), "T19"))
+            return failRecoveryRollback(kExpectedOutputs[index]);
+        crashCut("rollback-remove-before:" + twoDigitIndex(index));
+        auto& entry = journal_.entries[index];
+        const auto finalPath = outputDirectory_ / kExpectedOutputs[index];
+        const auto stagedPath = stagedDirectory_ / kExpectedOutputs[index];
+        const auto backupPath = backupDirectory_ / kExpectedOutputs[index];
+        const auto finalIdentity = transactionFileIdentity(finalPath);
+        const auto stagedIdentity = transactionFileIdentity(stagedPath);
+        const bool newFinal = entry.newSize > 0 && transactionIdentityMatches(
+            finalIdentity, entry.newSize, entry.newSha256);
+        const bool newStaged = entry.newSize > 0 && transactionIdentityMatches(
+            stagedIdentity, entry.newSize, entry.newSha256);
+        const bool oldFinal = entry.oldPresent && transactionIdentityMatches(
+            finalIdentity, entry.oldSize, entry.oldSha256);
+        if ((finalIdentity.present && !newFinal && !oldFinal)
+            || (stagedIdentity.present && !newStaged) || (newFinal && newStaged))
+            return failRecoveryRollback(kExpectedOutputs[index]);
+        if (newFinal && entry.oldPresent
+            && !transactionIdentityMatches(transactionFileIdentity(backupPath),
+                                           entry.oldSize, entry.oldSha256))
+            return failRecoveryRollback(kExpectedOutputs[index]);
+        if (newFinal
+            && !removeKnownFile(finalPath,
+                                "new-final-remove:" + twoDigitIndex(index)))
+            return failRecoveryRollback(kExpectedOutputs[index]);
+        if (newStaged && !removeKnownFile(stagedPath))
+            return failRecoveryRollback(kExpectedOutputs[index]);
+        entry.newLocation = "NONE";
+        crashCut("rollback-remove-after:" + twoDigitIndex(index));
+        journal_.pending = TransactionPending::None;
+        journal_.pendingIndex = kExpectedOutputs.size();
+        ++journal_.rollbackCursor;
+        if (!writeJournal("recovery-reconcile:" + twoDigitIndex(cursor), "T20"))
+            return failRecoveryRollback(kExpectedOutputs[index]);
     }
 
-private:
-    static int outputIndex(const std::string& name) noexcept
+    while (journal_.rollbackCursor < 18)
     {
-        for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
-            if (name == kExpectedOutputs[index])
-                return static_cast<int>(index);
-        return -1;
-    }
-
-#if defined(DSPARK_TIMESTRETCH_TRANSACTION_TESTING)
-    bool readInjectionIndex(const char* variable, int& target)
-    {
-        const char* value = std::getenv(variable);
-        if (value == nullptr)
-            return true;
-        errno = 0;
-        char* end = nullptr;
-        const long parsed = std::strtol(value, &end, 10);
-        if (errno != 0 || end == value || *end != '\0'
-            || parsed < 0
-            || parsed >= static_cast<long>(kExpectedOutputs.size()))
+        const size_t index = 17 - journal_.rollbackCursor;
+        journal_.pending = TransactionPending::RestoreOld;
+        journal_.pendingIndex = index;
+        if (!writeJournal("rollback-restore:" + twoDigitIndex(index), "T21"))
+            return failRecoveryRollback(kExpectedOutputs[index]);
+        crashCut("rollback-restore-before:" + twoDigitIndex(index));
+        auto& entry = journal_.entries[index];
+        const auto finalPath = outputDirectory_ / kExpectedOutputs[index];
+        const auto backupPath = backupDirectory_ / kExpectedOutputs[index];
+        if (entry.oldPresent)
         {
-            setFailure("INJECTION_CONFIGURATION", variable);
-            return false;
+            const auto finalIdentity = transactionFileIdentity(finalPath);
+            const auto backupIdentity = transactionFileIdentity(backupPath);
+            const bool oldFinal = transactionIdentityMatches(
+                finalIdentity, entry.oldSize, entry.oldSha256);
+            const bool oldBackup = transactionIdentityMatches(
+                backupIdentity, entry.oldSize, entry.oldSha256);
+            if (oldFinal == oldBackup)
+                return failRecoveryRollback(kExpectedOutputs[index]);
+            if (oldBackup
+                && (finalIdentity.present
+                    || !renameKnown(backupPath, finalPath,
+                                    "restore-rename:" + twoDigitIndex(index))))
+                return failRecoveryRollback(kExpectedOutputs[index]);
+            entry.oldLocation = "FINAL";
         }
-        target = static_cast<int>(parsed);
-        return true;
-    }
-#endif
-
-    bool validateStagedCensus()
-    {
-        std::array<bool, kExpectedOutputs.size()> seen{};
-        std::error_code error;
-        std::filesystem::directory_iterator iterator(stagedDirectory_, error);
-        const std::filesystem::directory_iterator end;
-        for (; !error && iterator != end; iterator.increment(error))
-        {
-            const int index = outputIndex(
-                iterator->path().filename().string());
-            if (index < 0 || seen[static_cast<size_t>(index)])
-                return false;
-            std::error_code fileError;
-            const auto status = std::filesystem::symlink_status(
-                iterator->path(), fileError);
-            if (fileError || !std::filesystem::is_regular_file(status)
-                || std::filesystem::file_size(iterator->path(), fileError) == 0
-                || fileError)
-                return false;
-            seen[static_cast<size_t>(index)] = true;
-        }
-        return !error
-            && std::all_of(seen.begin(), seen.end(),
-                           [](bool value) { return value; });
-    }
-
-    bool validateFinalCensus(bool allowTransactionDirectory)
-    {
-        std::array<bool, kExpectedOutputs.size()> seen{};
-        std::error_code error;
-        std::filesystem::directory_iterator iterator(outputDirectory_, error);
-        const std::filesystem::directory_iterator end;
-        for (; !error && iterator != end; iterator.increment(error))
-        {
-            const std::string name = iterator->path().filename().string();
-            if (allowTransactionDirectory && name == kTransactionDirectory)
-                continue;
-            const int index = outputIndex(name);
-            if (index < 0 || seen[static_cast<size_t>(index)])
-                return false;
-            std::error_code fileError;
-            const auto status = std::filesystem::symlink_status(
-                iterator->path(), fileError);
-            if (fileError || !std::filesystem::is_regular_file(status)
-                || std::filesystem::file_size(iterator->path(), fileError) == 0
-                || fileError)
-                return false;
-            seen[static_cast<size_t>(index)] = true;
-        }
-        return !error
-            && std::all_of(seen.begin(), seen.end(),
-                           [](bool value) { return value; });
-    }
-
-    void rollback() noexcept
-    {
-        bool rollbackFailed = false;
-        for (size_t offset = 0; offset < kExpectedOutputs.size(); ++offset)
-        {
-            const size_t index = kExpectedOutputs.size() - 1 - offset;
-            if (!published_[index])
-                continue;
-            std::error_code error;
-            if (!std::filesystem::remove(
-                    outputDirectory_ / kExpectedOutputs[index], error)
-                || error)
-                rollbackFailed = true;
-            published_[index] = false;
-        }
-        for (size_t offset = 0; offset < kExpectedOutputs.size(); ++offset)
-        {
-            const size_t index = kExpectedOutputs.size() - 1 - offset;
-            if (!backedUp_[index])
-                continue;
-            std::error_code error;
-            std::filesystem::rename(
-                backupDirectory_ / kExpectedOutputs[index],
-                outputDirectory_ / kExpectedOutputs[index], error);
-            if (error)
-                rollbackFailed = true;
-            else
-                backedUp_[index] = false;
-        }
-        std::error_code cleanupError;
-        std::filesystem::remove_all(transactionDirectory_, cleanupError);
-        if (cleanupError)
-            rollbackFailed = true;
         else
-            ownsTransactionDirectory_ = false;
-        if (rollbackFailed)
-            setFailure("ROLLBACK", kTransactionDirectory, true);
-    }
-
-    void setFailure(const char* phase, const std::string& detail,
-                    bool replace = false)
-    {
-        if (failurePhase_.empty() || replace)
         {
-            failurePhase_ = phase;
-            failureDetail_ = detail;
+            if (transactionFileIdentity(finalPath).present
+                || transactionFileIdentity(backupPath).present)
+                return failRecoveryRollback(kExpectedOutputs[index]);
+            entry.oldLocation = "ABSENT";
         }
+        crashCut("rollback-restore-after:" + twoDigitIndex(index));
+        journal_.pending = TransactionPending::None;
+        journal_.pendingIndex = kExpectedOutputs.size();
+        ++journal_.rollbackCursor;
+        if (!writeJournal("coherence:T22:" + twoDigitIndex(index), "T22"))
+            return failRecoveryRollback(kExpectedOutputs[index]);
     }
 
-    std::filesystem::path outputDirectory_;
-    std::filesystem::path transactionDirectory_;
-    std::filesystem::path stagedDirectory_;
-    std::filesystem::path backupDirectory_;
-    std::array<bool, kExpectedOutputs.size()> preexisting_{};
-    std::array<bool, kExpectedOutputs.size()> opened_{};
-    std::array<bool, kExpectedOutputs.size()> finished_{};
-    std::array<bool, kExpectedOutputs.size()> backedUp_{};
-    std::array<bool, kExpectedOutputs.size()> published_{};
-    std::string failurePhase_;
-    std::string failureDetail_;
-    bool ownsTransactionDirectory_ = false;
+    if (!validateOldAuthority())
+        return failRecoveryRollback("old-authority-census");
+    journal_.pending = TransactionPending::None;
+    journal_.pendingIndex = kExpectedOutputs.size();
+    if (journal_.finalizeCursor > 3)
+        return failRecoveryRollback("finalize-cursor");
+    for (size_t index = journal_.finalizeCursor; index < 3; ++index)
+    {
+        journal_.finalizeCursor = index + 1;
+        if (!writeJournal("finalize:" + twoDigitIndex(index), "T26"))
+            return failRecoveryRollback("finalize-journal");
+    }
+    if (!cleanupTransactionTree(false))
+        return false;
+    terminalFinalized_ = true;
+    journal_.state = TransactionState::Complete;
+    trace("rollback:complete");
+    return false;
+}
+
+bool OutputTransaction::committedCleanup() noexcept
+{
+    committed_ = true;
+    trace("cleanup:begin");
+    if (journal_.state == TransactionState::RecoveryRequiredCleanup)
+    {
+        journal_.state = TransactionState::CommittedCleanupPending;
+        if (!writeJournal("coherence:T31", "T31"))
+            return failRecoveryCleanup("retry-cleanup");
+    }
+    if (!reconcilePending(true))
+        return failRecoveryCleanup("pending-operation");
+    if (journal_.state != TransactionState::CommittedCleanupPending
+        || journal_.cleanupCursor > kExpectedOutputs.size())
+        return failRecoveryCleanup("cleanup-cursor");
+    while (journal_.cleanupCursor < kExpectedOutputs.size())
+    {
+        const size_t index = journal_.cleanupCursor;
+        if (!validateCommittedFinals())
+            return failRecoveryCleanup(kExpectedOutputs[index]);
+        auto& entry = journal_.entries[index];
+        journal_.pending = TransactionPending::CleanupBackup;
+        journal_.pendingIndex = index;
+        if (!writeJournal("cleanup-backup:" + twoDigitIndex(index), "T27"))
+            return failRecoveryCleanup(kExpectedOutputs[index]);
+        crashCut("cleanup-backup-before:" + twoDigitIndex(index));
+        const auto backupPath = backupDirectory_ / kExpectedOutputs[index];
+        const auto identity = transactionFileIdentity(backupPath);
+        if (identity.present)
+        {
+            if (!entry.oldPresent
+                || !transactionIdentityMatches(identity, entry.oldSize,
+                                                entry.oldSha256)
+                || !removeKnownFile(
+                    backupPath, "backup-cleanup:" + twoDigitIndex(index)))
+                return failRecoveryCleanup(kExpectedOutputs[index]);
+        }
+        entry.oldLocation = "ABSENT";
+        crashCut("cleanup-backup-after:" + twoDigitIndex(index));
+        journal_.pending = TransactionPending::None;
+        journal_.pendingIndex = kExpectedOutputs.size();
+        ++journal_.cleanupCursor;
+        if (!writeJournal("coherence:T28:" + twoDigitIndex(index), "T28"))
+            return failRecoveryCleanup(kExpectedOutputs[index]);
+    }
+    journal_.pending = TransactionPending::None;
+    journal_.pendingIndex = kExpectedOutputs.size();
+    journal_.cleanupCursor = kExpectedOutputs.size();
+    if (journal_.finalizeCursor > 3)
+        return failRecoveryCleanup("finalize-cursor");
+    for (size_t index = journal_.finalizeCursor; index < 3; ++index)
+    {
+        journal_.finalizeCursor = index + 1;
+        if (!writeJournal("finalize:" + twoDigitIndex(index), "T32"))
+            return failRecoveryCleanup("finalize-journal");
+    }
+    if (!cleanupTransactionTree(true))
+        return false;
+    terminalFinalized_ = true;
+    journal_.state = TransactionState::Complete;
+    trace("cleanup:complete");
+    return true;
+}
+
+bool OutputTransaction::cleanupTransactionTree(bool committed) noexcept
+{
+    auto fail = [this, committed](const std::string& detail) {
+        return committed ? failRecoveryCleanup(detail)
+                         : failRecoveryRollback(detail);
+    };
+    if (committed && !validateCommittedFinals())
+        return fail("final-census");
+    for (const auto& temporary : journalTempPaths_)
+    {
+        const auto parsed = readTransactionJournal(temporary);
+        if (parsed.present
+            && (!parsed.valid
+                || parsed.journal.transactionId != journal_.transactionId
+                || parsed.journal.rootBindingSha256 != journal_.rootBindingSha256))
+            return fail("journal-temp");
+        if (parsed.present && !removeKnownFile(temporary))
+            return fail("journal-temp");
+    }
+    const int inactive = activeJournalSlot_ == 0 ? 1 : 0;
+    crashCut("journal-cleanup-before:00");
+    if (committed && !validateCommittedFinals())
+        return fail("final-census");
+    if (!removeKnownFile(journalPaths_[static_cast<size_t>(inactive)],
+                         "journal-cleanup:00"))
+        return fail("journal-cleanup:00");
+    crashCut("journal-cleanup-after:00");
+
+    crashCut("directory-cleanup-before:00");
+    if (committed && !validateCommittedFinals())
+        return fail("final-census");
+    if (!removeKnownDirectory(stagedDirectory_, "directory-cleanup:00"))
+        return fail("directory-cleanup:00");
+    crashCut("directory-cleanup-after:00");
+
+    crashCut("directory-cleanup-before:01");
+    if (committed && !validateCommittedFinals())
+        return fail("final-census");
+    if (!removeKnownDirectory(backupDirectory_, "directory-cleanup:01"))
+        return fail("directory-cleanup:01");
+    crashCut("directory-cleanup-after:01");
+
+    crashCut("journal-cleanup-before:01");
+    crashCut("directory-cleanup-before:02");
+    if (committed && !validateCommittedFinals())
+        return fail("final-census");
+    if (injectedFault("journal-cleanup:01"))
+        return fail("journal-cleanup:01");
+    if (injectedFault("directory-cleanup:02"))
+        return fail("directory-cleanup:02");
+    const std::filesystem::path active =
+        journalPaths_[static_cast<size_t>(activeJournalSlot_)];
+    if (!removeKnownFile(active))
+        return fail("journal-cleanup:01");
+    std::error_code error;
+    if (!std::filesystem::remove(transactionDirectory_, error) || error)
+    {
+        // A reported final rmdir error must not strand an unidentifiable empty
+        // directory. Recreate the last valid committed/rollback journal so a
+        // later invocation retains deterministic recovery authority.
+        if (!writeJournalDirect(active, journal_))
+            return fail("directory-cleanup:02-journal-recreate");
+        return fail("directory-cleanup:02");
+    }
+    activeJournalSlot_ = -1;
+    journalInitialized_ = false;
+    crashCut("journal-cleanup-after:01");
+    crashCut("directory-cleanup-after:02");
+    return true;
+}
+
+bool OutputTransaction::commit()
+{
+    if (!std::all_of(finished_.begin(), finished_.end(),
+                     [](bool value) { return value; })
+        || journal_.state != TransactionState::Staged
+        || !validateStagedCensus() || !validateOldAuthority())
+        return failPrecommit("STAGE", "artifact-census");
+
+    for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
+    {
+        auto& entry = journal_.entries[index];
+        const auto finalPath = outputDirectory_ / kExpectedOutputs[index];
+        const auto backupPath = backupDirectory_ / kExpectedOutputs[index];
+        if (index != 0 && !entry.oldPresent)
+            continue;
+        journal_.state = TransactionState::BackupInProgress;
+        journal_.pending = TransactionPending::Backup;
+        journal_.pendingIndex = index;
+        if (!writeJournal("backup:" + twoDigitIndex(index),
+                          index == 0 ? "T05" : "T07"))
+            return failPrecommit("BACKUP", kExpectedOutputs[index]);
+        crashCut("backup-before:" + twoDigitIndex(index));
+        if (entry.oldPresent)
+        {
+            if (!transactionIdentityMatches(transactionFileIdentity(finalPath),
+                                            entry.oldSize, entry.oldSha256)
+                || pathKind(backupPath) != PathKind::Missing
+                || !renameKnown(finalPath, backupPath,
+                                "backup-rename:" + twoDigitIndex(index)))
+                return failPrecommit("BACKUP", kExpectedOutputs[index]);
+            entry.oldLocation = "BACKUP";
+        }
+        else if (pathKind(finalPath) != PathKind::Missing
+                 || pathKind(backupPath) != PathKind::Missing)
+        {
+            return failPrecommit("PRECHECK", kExpectedOutputs[index]);
+        }
+        crashCut("backup-after:" + twoDigitIndex(index));
+        journal_.pending = TransactionPending::None;
+        journal_.pendingIndex = kExpectedOutputs.size();
+        if (!writeJournal("coherence:T06:" + twoDigitIndex(index), "T06"))
+            return failRecoveryRollback(kExpectedOutputs[index]);
+    }
+
+    for (size_t index = 0; index < kExpectedOutputs.size(); ++index)
+    {
+        auto& entry = journal_.entries[index];
+        const auto stagedPath = stagedDirectory_ / kExpectedOutputs[index];
+        const auto finalPath = outputDirectory_ / kExpectedOutputs[index];
+        journal_.state = TransactionState::PublishInProgress;
+        journal_.pending = TransactionPending::Publish;
+        journal_.pendingIndex = index;
+        if (!writeJournal("publish:" + twoDigitIndex(index),
+                          index == 0 ? "T08" : "T10"))
+            return failPrecommit("PUBLISH", kExpectedOutputs[index]);
+        crashCut("publish-before:" + twoDigitIndex(index));
 #if defined(DSPARK_TIMESTRETCH_TRANSACTION_TESTING)
-    int stageFailureIndex_ = -1;
-    int commitFailureIndex_ = -1;
+        if (static_cast<int>(index) == commitFailureIndex_)
+            return failPrecommit("COMMIT", kExpectedOutputs[index]);
 #endif
-};
+        if (!transactionIdentityMatches(transactionFileIdentity(stagedPath),
+                                        entry.newSize, entry.newSha256)
+            || pathKind(finalPath) != PathKind::Missing
+            || !renameKnown(stagedPath, finalPath,
+                            "publish-rename:" + twoDigitIndex(index)))
+            return failPrecommit("PUBLISH", kExpectedOutputs[index]);
+        entry.newLocation = "FINAL";
+        crashCut("publish-after:" + twoDigitIndex(index));
+        journal_.pending = TransactionPending::None;
+        journal_.pendingIndex = kExpectedOutputs.size();
+        if (!writeJournal("coherence:T09:" + twoDigitIndex(index), "T09"))
+            return failRecoveryRollback(kExpectedOutputs[index]);
+    }
+
+    journal_.state = TransactionState::CommitReady;
+    journal_.pending = TransactionPending::None;
+    journal_.pendingIndex = kExpectedOutputs.size();
+    if (!validateCommittedFinals())
+        return failPrecommit("COMMIT", "artifact-census");
+    if (!writeJournal("coherence:T11", "T11"))
+        return failPrecommit("COMMIT", "commit-ready");
+    crashCut("commit-ready");
+    journal_.state = TransactionState::CommittedCleanupPending;
+    if (!writeJournal("commit-marker", "T12"))
+        return failPrecommit("COMMIT", "commit-marker");
+    committed_ = true; // Successful promotion above is the sole commit point.
+    trace("commit-point:COMMITTED_CLEANUP_PENDING");
+    crashCut("post-commit-marker");
+    if (!committedCleanup())
+        return false;
+    return validateTerminalFinalCensus(false);
+}
+
+int OutputTransaction::abortAndReport() noexcept
+{
+    if (!terminalFinalized_ && !committed_
+        && pathKind(transactionDirectory_) == PathKind::Directory)
+        rollbackAndClean();
+    return reportFailure();
+}
 
 /// Band-limited click: a windowed sinc, so it has no energy above the cutoff.
 void addClick(std::vector<double>& dst, size_t at, double cutoffHz, double amp)
@@ -961,8 +3122,9 @@ int main(int argc, char** argv)
     }
     const std::filesystem::path outputDirectory(argv[1]);
     std::error_code directoryError;
-    if (!std::filesystem::is_directory(outputDirectory, directoryError)
-        || directoryError)
+    const auto outputStatus = std::filesystem::symlink_status(
+        outputDirectory, directoryError);
+    if (directoryError || !std::filesystem::is_directory(outputStatus))
     {
         std::fprintf(stderr,
                      "ERROR TIMESTRETCH_OUTPUT_DIRECTORY path is not an existing directory: %s\n",
@@ -972,6 +3134,12 @@ int main(int argc, char** argv)
     OutputTransaction transaction(outputDirectory);
     if (!transaction.begin())
         return transaction.abortAndReport();
+    if (transaction.recoveredCommitted())
+    {
+        std::printf("characterisation written to %s\n",
+                    outputDirectory.string().c_str());
+        return 0;
+    }
     const std::string dir =
         (outputDirectory / kTransactionDirectory / "staged").string();
 

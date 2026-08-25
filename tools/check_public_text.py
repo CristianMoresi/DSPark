@@ -24,6 +24,16 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def canonical_text_bytes(data: bytes) -> bytes:
+    """Return the LF identity for a uniform LF or CRLF text materialization."""
+    if b"\r" not in data:
+        return data
+    residue = data.replace(b"\r\n", b"")
+    if b"\r" in residue or b"\n" in residue:
+        raise ValueError("mixed line endings or lone carriage return")
+    return data.replace(b"\r\n", b"\n")
+
+
 def git(root: Path, arguments: list[str], input_bytes: bytes | None = None) -> bytes:
     result = subprocess.run(
         ["git", "-C", str(root), *arguments],
@@ -76,6 +86,12 @@ def text_attributes(root: Path, paths: Iterable[str]) -> dict[str, str]:
 def validate_bytes(entry: dict[str, Any], data: bytes, attribute: str) -> list[str]:
     kind = entry["kind"]
     errors: list[str] = []
+    canonical = data
+    if kind in TEXT_KINDS and attribute != "unset":
+        try:
+            canonical = canonical_text_bytes(data)
+        except ValueError:
+            errors.append("TEXT_EOL_MATERIALIZATION_DRIFT")
     if kind == "first_party_ascii_text":
         if b"\0" in data:
             errors.append("NUL_IN_FIRST_PARTY_TEXT")
@@ -91,7 +107,7 @@ def validate_bytes(entry: dict[str, Any], data: bytes, attribute: str) -> list[s
             data.decode("utf-8", "strict")
         except UnicodeDecodeError:
             errors.append("INVALID_UTF8_VENDOR_TEXT")
-        if sha256(data) != entry.get("sha256"):
+        if sha256(canonical) != entry.get("sha256"):
             errors.append("VENDOR_BYTE_DRIFT")
     elif kind == "binary_exact":
         if sha256(data) != entry.get("sha256"):
@@ -150,8 +166,11 @@ def validate(root: Path, policy_path: Path) -> tuple[list[tuple[str, str]], dict
         except FileNotFoundError:
             errors.append(("MISSING_WORKTREE_PATH", path))
             continue
-        if not stat.S_ISREG(file_stat.st_mode) or modes.get(path) not in {"100644", "100755"}:
+        if not stat.S_ISREG(file_stat.st_mode):
             errors.append(("NONREGULAR_OR_SYMLINK_PATH", path))
+            continue
+        if modes.get(path) != "100644":
+            errors.append(("INDEX_MODE_DRIFT", path))
             continue
         data = full_path.read_bytes()
         for code in validate_bytes(entry, data, attributes.get(path, "unspecified")):

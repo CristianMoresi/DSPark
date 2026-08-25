@@ -340,7 +340,7 @@ bool pinnedReclaimMutantIsDetected()
     constexpr std::uint32_t pinnedToken = token;
     const int destroyedBefore = FakeBank::destroyed.load(std::memory_order_relaxed);
     // Mutant omits the exact-token pin guard before control-side reclaim.
-    if (token == pinnedToken) bank.reset();
+    if constexpr (token == pinnedToken) bank.reset();
     return FakeBank::destroyed.load(std::memory_order_relaxed)
         == destroyedBefore + 1;
 }

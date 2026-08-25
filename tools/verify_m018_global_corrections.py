@@ -20,6 +20,8 @@ import tempfile
 import time
 from typing import Iterable
 
+from check_public_text import canonical_text_bytes
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_DIRECTORIES = ("Core", "Effects", "Analysis", "IO", "Music")
@@ -193,7 +195,10 @@ def doxyfile_errors(root: Path, text: str) -> list[str]:
 
 def conan_semantics(data: bytes) -> bytes:
     tree = ast.parse(data.decode("ascii"))
-    return ast.dump(tree, annotate_fields=True, include_attributes=False).encode("ascii")
+    options = {"annotate_fields": True, "include_attributes": False}
+    if sys.version_info >= (3, 13):
+        options["show_empty"] = True
+    return ast.dump(tree, **options).encode("ascii")
 
 
 def cmake_noncomment_semantics(data: bytes) -> bytes:
@@ -1486,7 +1491,9 @@ def package_errors(root: Path) -> list[str]:
     errors: list[str] = []
     for path in EXPECTED_PACKAGE_HASHES:
         try:
-            data_by_path[path] = (root / path).read_bytes()
+            data_by_path[path] = canonical_text_bytes((root / path).read_bytes())
+        except ValueError as error:
+            errors.append("PACKAGE_R_EOL_DRIFT:{}:{}".format(path, error))
         except OSError as error:
             errors.append("PACKAGE_R_READ:{}:{}".format(path, error))
     errors.extend(validate_package_data(data_by_path))
@@ -1684,7 +1691,7 @@ LIVE_REVERB_BASELINE_HASH = (
     "294a1053756adc86d84ab22240afdc4a55a706bef5e09a890ba6e084f4f6a80f"
 )
 LIVE_REVERB_SUBJECT_HASH = (
-    "ad203837e0ca53a8da3af2868d1c349e2e340fac3baed5a46371295d350d3e2b"
+    "ebf743a9e67d0236682043d679dc624cce2f82cc6977d0f0ee81da4bb8cefca4"
 )
 LIVE_REVERB_ANCHOR_HASH = (
     "6cf8d8b452439b4a8b12e6a4e3cf68c962f315bb4fcc4060af68f4aad031c616"
@@ -2251,7 +2258,8 @@ def self_test(root: Path, doxygen: str | None,
     checks: list[tuple[str, bool]] = []
     details: dict[str, str] = {}
     package_data = {
-        path: (root / path).read_bytes() for path in EXPECTED_PACKAGE_HASHES
+        path: canonical_text_bytes((root / path).read_bytes())
+        for path in EXPECTED_PACKAGE_HASHES
     }
     package_positive_errors = validate_package_data(package_data)
     package_results, package_inventory_errors = \

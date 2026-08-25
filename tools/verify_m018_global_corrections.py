@@ -237,6 +237,166 @@ def unique_errors(errors: list[str]) -> list[str]:
     return list(dict.fromkeys(errors))
 
 
+
+def package_r_executable_bootstrap_errors(source: str) -> list[str]:
+    """Audit the producer binding before any protected helper is invoked."""
+    errors: list[str] = []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return [
+            "PACKAGE_R_ORACLE_PRODUCER_CALL_DRIFT",
+            "PACKAGE_R_ORACLE_PRODUCER_POSITION",
+        ]
+
+    def top(name: str) -> ast.FunctionDef | None:
+        matches = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def called(call: ast.Call, name: str) -> bool:
+        return isinstance(call.func, ast.Name) and call.func.id == name
+
+    def extend_argument(statement: ast.stmt) -> ast.AST | None:
+        if not isinstance(statement, ast.Expr) \
+                or not isinstance(statement.value, ast.Call):
+            return None
+        call = statement.value
+        if call.keywords or len(call.args) != 1 \
+                or not isinstance(call.func, ast.Attribute) \
+                or call.func.attr != "extend" \
+                or not isinstance(call.func.value, ast.Name) \
+                or call.func.value.id != "errors":
+            return None
+        return call.args[0]
+
+    def exact(statement: ast.stmt, callee: str,
+              arguments: tuple[str, ...]) -> bool:
+        value = extend_argument(statement)
+        return isinstance(value, ast.Call) and called(value, callee) \
+            and not value.keywords and len(value.args) == len(arguments) \
+            and all(isinstance(argument, ast.Name)
+                    and argument.id == expected
+                    for argument, expected in zip(value.args, arguments))
+
+    checker = top("package_oracle_binding_errors")
+    current = top("current_package_oracle_binding_errors")
+    if checker is None or current is None:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_HELPER_MISSING")
+    else:
+        checker_returns = [
+            node for node in checker.body
+            if isinstance(node, ast.Return)
+            and isinstance(node.value, ast.Call)
+            and called(node.value, "unique_errors")
+            and len(node.value.args) == 1
+            and isinstance(node.value.args[0], ast.Name)
+            and node.value.args[0].id == "errors"
+            and not node.value.keywords
+        ]
+        checker_parses = [
+            node for node in ast.walk(checker)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "parse"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "ast"
+        ]
+        current_calls = [
+            node for node in ast.walk(current)
+            if isinstance(node, ast.Call)
+            and called(node, "package_oracle_binding_errors")
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "source"
+            and not node.keywords
+        ]
+        source_reads = [
+            node for node in ast.walk(current)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "read_text"
+            and isinstance(node.func.value, ast.Call)
+            and isinstance(node.func.value.func, ast.Name)
+            and node.func.value.func.id == "Path"
+            and len(node.func.value.args) == 1
+            and isinstance(node.func.value.args[0], ast.Name)
+            and node.func.value.args[0].id == "__file__"
+            and len(node.keywords) == 1
+            and node.keywords[0].arg == "encoding"
+            and isinstance(node.keywords[0].value, ast.Constant)
+            and node.keywords[0].value.value == "ascii"
+        ]
+        if [item.arg for item in checker.args.args] != ["source"] \
+                or current.args.args or len(checker_returns) != 1 \
+                or len(checker_parses) != 1 or len(current_calls) != 1 \
+                or len(source_reads) != 1:
+            errors.append("PACKAGE_R_ORACLE_PRODUCER_HELPER_NEUTRALIZED")
+
+    main_function = top("main")
+    if main_function is None:
+        return list(dict.fromkeys(errors + [
+            "PACKAGE_R_ORACLE_PRODUCER_CALL_DRIFT",
+            "PACKAGE_R_ORACLE_PRODUCER_POSITION",
+        ]))
+    package_indexes = [
+        index for index, statement in enumerate(main_function.body)
+        if exact(statement, "package_errors", ("root",))
+    ]
+    invariant_indexes = [
+        index for index, statement in enumerate(main_function.body)
+        if exact(statement, "current_package_oracle_binding_errors", ())
+    ]
+    package_calls = sum(
+        isinstance(node, ast.Call) and called(node, "package_errors")
+        for node in ast.walk(main_function)
+    )
+    invariant_calls = sum(
+        isinstance(node, ast.Call)
+        and called(node, "current_package_oracle_binding_errors")
+        for node in ast.walk(main_function)
+    )
+    assignments: list[int] = []
+    empty: list[int] = []
+    for index, statement in enumerate(main_function.body):
+        target: ast.AST | None = None
+        value: ast.AST | None = None
+        if isinstance(statement, ast.AnnAssign):
+            target, value = statement.target, statement.value
+        elif isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target, value = statement.targets[0], statement.value
+        if isinstance(target, ast.Name) and target.id == "errors":
+            assignments.append(index)
+            if isinstance(value, ast.List) and not value.elts:
+                empty.append(index)
+    boundary = next((
+        index for index, statement in enumerate(main_function.body)
+        if (isinstance(statement, ast.For)
+            and isinstance(statement.iter, ast.Name)
+            and statement.iter.id == "errors")
+        or (isinstance(statement, ast.If)
+            and isinstance(statement.test, ast.Name)
+            and statement.test.id == "errors")
+        or isinstance(statement, ast.Return)
+    ), None)
+    if package_calls == 0:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_MISSING")
+    if package_calls > 1 or len(package_indexes) > 1:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_DUPLICATE")
+    if package_calls != 1 or len(package_indexes) != 1:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_CALL_DRIFT")
+    if invariant_calls != 1 or len(invariant_indexes) != 1:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_INVARIANT_MISSING")
+    if len(assignments) != 1 or len(empty) != 1 \
+            or len(invariant_indexes) != 1 or len(package_indexes) != 1 \
+            or boundary is None \
+            or not empty[0] < invariant_indexes[0] < package_indexes[0] < boundary:
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_POSITION")
+    return list(dict.fromkeys(errors))
+
+
 def _m018_top_level_function(
     tree: ast.Module, name: str,
 ) -> ast.FunctionDef | None:
@@ -391,6 +551,96 @@ def _m018_helper_surface_errors(tree: ast.Module) -> list[str]:
     return errors
 
 
+
+def _m018_bootstrap_surface_errors(tree: ast.Module) -> list[str]:
+    errors: list[str] = []
+    bootstrap = _m018_top_level_function(
+        tree, "package_r_executable_bootstrap_errors")
+    if bootstrap is None:
+        return ["PACKAGE_R_ORACLE_PRODUCER_BOOTSTRAP_HELPER_MISSING"]
+    constants = {
+        node.value for node in ast.walk(bootstrap)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    required = {
+        "PACKAGE_R_ORACLE_PRODUCER_CALL_DRIFT",
+        "PACKAGE_R_ORACLE_PRODUCER_POSITION",
+        "PACKAGE_R_ORACLE_PRODUCER_HELPER_MISSING",
+        "PACKAGE_R_ORACLE_PRODUCER_HELPER_NEUTRALIZED",
+        "PACKAGE_R_ORACLE_PRODUCER_INVARIANT_MISSING",
+    }
+    parse_calls = [
+        node for node in ast.walk(bootstrap)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "parse"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "ast"
+    ]
+    if [item.arg for item in bootstrap.args.args] != ["source"] \
+            or len(parse_calls) != 1 or not required.issubset(constants) \
+            or not any(isinstance(node, ast.Return)
+                       and isinstance(node.value, ast.Call)
+                       and isinstance(node.value.func, ast.Name)
+                       and node.value.func.id == "list"
+                       for node in ast.walk(bootstrap)):
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_BOOTSTRAP_NEUTRALIZED")
+
+    main_function = _m018_top_level_function(tree, "main")
+    if main_function is None:
+        return errors + ["PACKAGE_R_ORACLE_PRODUCER_BOOTSTRAP_BOUNDARY"]
+    get_calls = [
+        node for node in ast.walk(main_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Call)
+        and isinstance(node.func.value.func, ast.Name)
+        and node.func.value.func.id == "globals"
+        and node.func.attr == "get"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "package_r_executable_bootstrap_errors"
+    ]
+    bootstrap_calls = [
+        node for node in ast.walk(main_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "package_r_bootstrap"
+    ]
+    source_reads = [
+        node for node in ast.walk(main_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "read_text"
+        and any(isinstance(item, ast.Name) and item.id == "__file__"
+                for item in ast.walk(node.func.value))
+    ]
+    caught: list[str] = []
+    try_nodes = [
+        node for node in ast.walk(main_function)
+        if isinstance(node, ast.Try)
+        and any(isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Name)
+                and item.func.id == "package_r_bootstrap"
+                for item in ast.walk(node))
+    ]
+    for node in try_nodes:
+        for handler in node.handlers:
+            if isinstance(handler.type, ast.Tuple):
+                caught.extend(
+                    item.id for item in handler.type.elts
+                    if isinstance(item, ast.Name))
+    expected = [
+        "AttributeError", "NameError", "OSError", "SyntaxError",
+        "TypeError", "UnicodeError", "ValueError",
+    ]
+    if len(get_calls) != 1 or len(bootstrap_calls) != 1 \
+            or len(try_nodes) != 1 \
+            or len(source_reads) < 1 or sorted(caught) != sorted(expected):
+        errors.append("PACKAGE_R_ORACLE_PRODUCER_BOOTSTRAP_BOUNDARY")
+    return errors
+
+
 def package_oracle_binding_errors(source: str) -> list[str]:
     """Validate the normal Package-R oracle binding from Python AST only."""
     errors: list[str] = []
@@ -401,6 +651,7 @@ def package_oracle_binding_errors(source: str) -> list[str]:
             "PACKAGE_R_ORACLE_PRODUCER_CALL_DRIFT",
             "PACKAGE_R_ORACLE_PRODUCER_POSITION",
         ]
+    errors.extend(_m018_bootstrap_surface_errors(tree))
     main_function = _m018_top_level_function(tree, "main")
     if main_function is None:
         return unique_errors([
@@ -2117,6 +2368,32 @@ def main() -> int:
     parser.add_argument("--doxygen", default=shutil.which("doxygen"))
     arguments = parser.parse_args()
     root = arguments.root.resolve()
+    package_r_bootstrap = globals().get(
+        "package_r_executable_bootstrap_errors")
+    if not callable(package_r_bootstrap):
+        package_r_bootstrap_errors = [
+            "PACKAGE_R_ORACLE_PRODUCER_BOOTSTRAP_HELPER_MISSING"]
+    else:
+        try:
+            package_r_bootstrap_source = Path(__file__).read_text(
+                encoding="ascii")
+            package_r_bootstrap_errors = package_r_bootstrap(
+                package_r_bootstrap_source)
+        except (AttributeError, NameError, OSError, SyntaxError, TypeError,
+                UnicodeError, ValueError) as error:
+            package_r_bootstrap_errors = [
+                "PACKAGE_R_ORACLE_PRODUCER_BOOTSTRAP_INVOCATION:"
+                + type(error).__name__]
+    if not isinstance(package_r_bootstrap_errors, list) \
+            or not all(isinstance(item, str)
+                       for item in package_r_bootstrap_errors):
+        package_r_bootstrap_errors = [
+            "PACKAGE_R_ORACLE_PRODUCER_BOOTSTRAP_RESULT"]
+    if package_r_bootstrap_errors:
+        for error in package_r_bootstrap_errors:
+            print("ERROR " + error, file=sys.stderr)
+        return 1
+
     if arguments.self_test:
         return self_test(root, arguments.doxygen, arguments.machine_json)
     if arguments.machine_json is not None:

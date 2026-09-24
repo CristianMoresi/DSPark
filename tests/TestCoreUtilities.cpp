@@ -222,6 +222,27 @@ DSPARK_TEST(SmoothedValue_linear)
     EXPECT_NEAR(sv.getCurrentValue(), 1.0f, 0.01f);
 }
 
+DSPARK_TEST(SmoothedValue_linear_ramp_time_is_independent_of_step_size)
+{
+    // The Linear rate used to be sized for a UNIT step, so a 1000 Hz jump on
+    // a 10 ms frequency ramp took 1000 x 10 ms = 10 s instead of 10 ms.
+    SmoothedValue<double> sv;
+    sv.prepare(48000.0, 10.0);
+    sv.setSmoothingType(SmoothedValue<double>::SmoothingType::Linear);
+    sv.reset(1000.0);
+    sv.setTargetValue(2000.0);
+
+    int n = 0;
+    while (sv.isSmoothing() && n < 100000) { (void)sv.getNextValue(); ++n; }
+    EXPECT_NEAR(static_cast<double>(n), 480.0, 1.0);
+    EXPECT_TRUE(sv.getCurrentValue() == 2000.0);
+
+    // A small step takes the same time, at a proportionally lower velocity.
+    sv.setTargetValue(2000.5);
+    const double first = sv.getNextValue();
+    EXPECT_NEAR(first - 2000.0, 0.5 / 480.0, 1e-9);
+}
+
 DSPARK_TEST(SmoothedValue_disabled_instant)
 {
     SmoothedValue<float> sv;

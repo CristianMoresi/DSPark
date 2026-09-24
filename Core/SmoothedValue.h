@@ -36,9 +36,9 @@ namespace dspark {
  * - **Exponential**: one-pole time constant (63% arrival). The value snaps
  *   exactly onto the target once within a relative epsilon, about 16 time
  *   constants after a unit step, and isSmoothing() then reports false.
- * - **Linear**: constant velocity sized to traverse a UNIT step in
- *   rampTimeMs; smaller steps arrive proportionally sooner, exactly on
- *   target.
+ * - **Linear**: constant velocity chosen at each retarget so that ANY step,
+ *   whatever its size or unit (a gain, a frequency in Hz), arrives exactly on
+ *   target after rampTimeMs.
  * - **Chase**: adaptive (not clocked): gentle right after a target change,
  *   accelerating as it settles.
  *
@@ -89,8 +89,10 @@ public:
         const double tau = rampTimeMs_ / 1000.0;
         expCoeff_ = std::exp(-1.0 / (sampleRate_ * tau));
 
-        // Linear: Rate of change per sample (Rate Limiter)
-        linearRate_ = 1000.0 / (rampTimeMs_ * sampleRate_);
+        // Linear: ramp length in samples; the per-sample rate is sized from
+        // the remaining distance so an in-flight ramp keeps its new duration.
+        rampSamples_ = std::max(1.0, rampTimeMs_ * sampleRate_ / 1000.0);
+        updateLinearRate();
 
         // Chase: Sample-rate correction ratio relative to 44.1kHz base
         const double srRatio = 44100.0 / sampleRate_;
@@ -99,7 +101,11 @@ public:
     }
 
     /** @brief Sets the smoothing algorithm. */
-    void setSmoothingType(SmoothingType type) noexcept { type_ = type; }
+    void setSmoothingType(SmoothingType type) noexcept
+    {
+        type_ = type;
+        updateLinearRate(); // a switch to Linear mid-flight keeps the full ramp time
+    }
 
     /** @brief Returns the current smoothing algorithm. */
     [[nodiscard]] SmoothingType getSmoothingType() const noexcept { return type_; }
@@ -115,6 +121,7 @@ public:
         if (newTarget != target_)
         {
             target_ = newTarget;
+            updateLinearRate();
             if (type_ == SmoothingType::Chase)
                 chaseSpeed_ = 2500.0; // Reset chase velocity on target change
         }
@@ -278,6 +285,11 @@ public:
     }
 
 private:
+    void updateLinearRate() noexcept
+    {
+        linearRate_ = std::abs(static_cast<double>(target_) - current_) / rampSamples_;
+    }
+
     double current_{ 0.0 };
     T target_{ T(0) };
     SmoothingType type_{ SmoothingType::Exponential };
@@ -285,6 +297,7 @@ private:
     // DSP coefficients (double: recursive state and its drivers, see @class)
     double expCoeff_{ 0.0 };
     double linearRate_{ 0.0 };
+    double rampSamples_{ 882.0 };
 
     // Chase state & coefficients
     double chaseSpeed_{ 350.0 };

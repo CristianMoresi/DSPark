@@ -392,12 +392,12 @@ public:
     }
 
     /**
-     * @brief Switches Peak bands to the Orfanidis matched (de-cramped) design.
+     * @brief Switches Peak bands to the analog-matched (de-cramped) design.
      *
      * Bilinear bells cramp near Nyquist (narrower, response pinned at fs/2);
-     * the matched design prescribes the analog prototype's Nyquist gain so
-     * high bells keep their analog shape, the state-of-the-art digital EQ
-     * behaviour. Applies to the IIR engines, the linear-phase kernel, and the
+     * the matched design (BiquadCoeffs::makePeakMatched, impulse-invariant
+     * poles with a magnitude-matched numerator) keeps high bells on their
+     * analog shape, the state-of-the-art digital EQ behaviour. Applies to the IIR engines, the linear-phase kernel, and the
      * analysis curve alike. Off by default for bit-compatibility with
      * previous output.
      */

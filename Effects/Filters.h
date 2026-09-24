@@ -256,10 +256,10 @@ public:
     }
 
     /**
-     * @brief Selects the Orfanidis matched (de-cramped) design for Peak bells.
+     * @brief Selects the analog-matched (de-cramped) design for Peak bells.
      *
-     * Bilinear bells cramp near Nyquist; the matched design prescribes the
-     * analog prototype's Nyquist gain so high bells keep their analog shape.
+     * Bilinear bells cramp near Nyquist; the matched design
+     * (BiquadCoeffs::makePeakMatched) keeps high bells on their analog shape.
      * Off by default (bit-compatible with previous output). Thread-safe.
      * Not serialized by getState()/setState(); owners that persist it must
      * re-apply it on restore (Equalizer does).

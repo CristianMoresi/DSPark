@@ -127,7 +127,7 @@ inline EffectSlot makeEqualizer()
     // Global controls (indices 20/21, appended so band indices stay stable):
     // Phase Mode switches the IIR cascade for the FFT overlap-save engine
     // (adds maxBlockSize of latency, audible as a small delay here), and
-    // Matched Bells selects the Orfanidis de-cramped design for Peak bands
+    // Matched Bells selects the analog-matched de-cramped design for Peak bands
     // (audible on high-frequency bells; the curve follows).
     s.addChoice("Phase Mode", {"Minimum","Linear"}, 0);
     s.addToggle("Matched Bells", false);

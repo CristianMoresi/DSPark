@@ -1711,7 +1711,7 @@ DSPARK_TEST(WDF_RType_FMV_matches_Yeh_transfer_function)
 
 
 // ============================================================================
-// Orfanidis matched peaking (prescribed Nyquist gain)
+// Analog-matched peaking (Vicanek)
 // ============================================================================
 
 namespace {
@@ -1726,34 +1726,52 @@ double biquadMagDb(const BiquadCoeffs& c, double freq, double fs)
     return 20.0 * std::log10(std::abs(h));
 }
 
+// The cookbook bell's analog prototype, H(s) = (s^2 + s*W0*sqrt(G)/Q + W0^2)
+// / (s^2 + s*W0/(sqrt(G)*Q) + W0^2): the response makePeak() converges to at
+// low frequencies, and the one a de-cramped design must follow up high.
 double analogPeakDb(double f0, double Q, double gainDb, double freq)
 {
     const double G = std::pow(10.0, gainDb / 20.0);
-    const double W0 = 2.0 * 3.14159265358979 * f0, DW = W0 / Q;
+    const double W0 = 2.0 * 3.14159265358979 * f0;
+    const double B = W0 / (Q * std::sqrt(G));
     const double W = 2.0 * 3.14159265358979 * freq;
     const double d2 = (W * W - W0 * W0) * (W * W - W0 * W0);
-    return 10.0 * std::log10((d2 + G * G * DW * DW * W * W) / (d2 + DW * DW * W * W));
+    return 10.0 * std::log10((d2 + G * G * B * B * W * W) / (d2 + B * B * W * W));
+}
+
+double worstAudibleErrorDb(const BiquadCoeffs& c, double fs, double f0, double Q, double g)
+{
+    double worst = 0.0;
+    for (double f = 20.0; f <= 20000.0; f *= 1.02)
+        worst = std::max(worst, std::abs(biquadMagDb(c, f, fs) - analogPeakDb(f0, Q, g, f)));
+    return worst;
 }
 
 } // namespace
 
-DSPARK_TEST(BiquadCoeffs_matched_peak_prescribes_f0_and_Nyquist)
+DSPARK_TEST(BiquadCoeffs_matched_peak_follows_the_analog_bell)
 {
-    const double fs = 48000.0, f0 = 16000.0, Q = 1.0, g = 6.0;
-    const auto m = BiquadCoeffs::makePeakMatched(fs, f0, Q, g);
-    EXPECT_NEAR(biquadMagDb(m, f0, fs), g, 0.01);
-    EXPECT_NEAR(biquadMagDb(m, fs / 2.0, fs), analogPeakDb(f0, Q, g, fs / 2.0), 0.01);
-
-    // And it de-cramps: residual vs analog under half the cookbook's.
-    const auto r = BiquadCoeffs::makePeak(fs, f0, Q, g);
-    double errM = 0, errR = 0;
-    for (double f = 1000.0; f <= 23000.0; f *= 1.05)
+    // Regression: the previous (Orfanidis) design prescribed its Nyquist gain
+    // from a prototype with the wrong pole bandwidth (W0/Q instead of
+    // W0/(Q*sqrt(G))), and broke down once the centre passed
+    // (1 - 1/(2Q)) * Nyquist. Worst 20 Hz - 20 kHz deviation from the bell it
+    // claims to match, old -> cookbook -> now:
+    //   48 kHz 16 kHz Q1 +6 dB:    2.53 -> 3.16 -> 0.18 dB
+    //   48 kHz 10 kHz Q0.7 +12 dB: 2.73 -> 4.40 -> 0.56 dB
+    //   44.1 kHz 15 kHz Q0.7 -12:  10.45 -> 7.47 -> 1.14 dB
+    struct Case { double fs, f0, Q, g, maxErr; };
+    for (const Case k : { Case { 48000.0, 16000.0, 1.0,   6.0, 0.25 },
+                          Case { 48000.0, 12000.0, 1.0,  -9.0, 0.90 },
+                          Case { 48000.0, 10000.0, 0.7, 12.0, 0.65 },
+                          Case { 44100.0, 15000.0, 0.7, -12.0, 1.25 } })
     {
-        const double a = analogPeakDb(f0, Q, g, f);
-        errM = std::max(errM, std::abs(biquadMagDb(m, f, fs) - a));
-        errR = std::max(errR, std::abs(biquadMagDb(r, f, fs) - a));
+        const auto m = BiquadCoeffs::makePeakMatched(k.fs, k.f0, k.Q, k.g);
+        const auto r = BiquadCoeffs::makePeak(k.fs, k.f0, k.Q, k.g);
+        EXPECT_NEAR(biquadMagDb(m, k.f0, k.fs), k.g, 0.01);   // exact peak gain
+        const double errM = worstAudibleErrorDb(m, k.fs, k.f0, k.Q, k.g);
+        EXPECT_LT(errM, k.maxErr);
+        EXPECT_LT(errM, 0.3 * worstAudibleErrorDb(r, k.fs, k.f0, k.Q, k.g));
     }
-    EXPECT_LT(errM, errR * 0.45);
 }
 
 DSPARK_TEST(BiquadCoeffs_matched_peak_converges_to_cookbook_at_LF)
@@ -1768,6 +1786,25 @@ DSPARK_TEST(BiquadCoeffs_matched_peak_converges_to_cookbook_at_LF)
     EXPECT_NEAR(biquadMagDb(cut, 12000.0, 48000.0), -9.0, 0.05);
     const auto flat = BiquadCoeffs::makePeakMatched(48000.0, 1000.0, 1.0, 0.0);
     EXPECT_NEAR(biquadMagDb(flat, 1000.0, 48000.0), 0.0, 1e-9);
+}
+
+DSPARK_TEST(BiquadCoeffs_matched_peak_is_stable_and_finite_everywhere)
+{
+    // Includes the corners the closed forms are most exposed to: a tiny Q
+    // (real poles; e^(-q w0) * cosh(r w0) overflowed there), centres at the
+    // Nyquist clamp, and deep boosts/cuts at 10 Hz / 768 kHz.
+    for (double fs : { 44100.0, 48000.0, 768000.0 })
+        for (double f0 : { 10.0, 1000.0, 20000.0, fs * 0.499 })
+            for (double Q : { 0.001, 0.3, 0.707, 10.0, 100.0 })
+                for (double g : { -30.0, -0.5, 0.5, 30.0 })
+                {
+                    const auto c = BiquadCoeffs::makePeakMatched(fs, f0, Q, g);
+                    EXPECT_TRUE(std::isfinite(c.b0) && std::isfinite(c.b1) && std::isfinite(c.b2)
+                                && std::isfinite(c.a1) && std::isfinite(c.a2));
+                    // Stability triangle: |a2| < 1 and |a1| < 1 + a2.
+                    EXPECT_LT(std::abs(c.a2), 1.0);
+                    EXPECT_LT(std::abs(c.a1), 1.0 + c.a2 + 1e-12);
+                }
 }
 
 // ============================================================================

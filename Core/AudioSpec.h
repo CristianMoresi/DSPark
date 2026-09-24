@@ -10,7 +10,7 @@
  * Every DSP processor receives an AudioSpec in its `prepare()` method to configure
  * internal resources (buffers, filter coefficients, smoothing rates, etc.).
  *
- * Dependencies: none.
+ * Dependencies: C++20 standard library only.
  *
  * @code
  * dspark::AudioSpec spec { .sampleRate = 48000.0, .maxBlockSize = 512, .numChannels = 2 };
@@ -18,6 +18,8 @@
  *     mySaturator.prepare(spec);
  * @endcode
  */
+
+#include <limits>
 
 namespace dspark {
 
@@ -59,14 +61,17 @@ struct AudioSpec
      * @brief Checks if the specification contains valid, processable parameters.
      *
      * Use this in assertions at the start of your processor's `prepare()`
-     * method. A NaN sample rate fails the check (every comparison against
-     * NaN is false), so corrupted specs are rejected too.
+     * method. A NaN or infinite sample rate fails the check (every comparison
+     * against NaN is false, and infinity exceeds the largest finite double),
+     * so corrupted specs are rejected too.
      *
-     * @return true if all parameters are strictly positive (> 0), false otherwise.
+     * @return true if all parameters are strictly positive (> 0) and the
+     *         sample rate is finite, false otherwise.
      */
     [[nodiscard]] constexpr bool isValid() const noexcept
     {
-        return sampleRate > 0.0 && maxBlockSize > 0 && numChannels > 0;
+        return sampleRate > 0.0 && sampleRate <= std::numeric_limits<double>::max()
+            && maxBlockSize > 0 && numChannels > 0;
     }
 
     /**

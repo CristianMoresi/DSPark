@@ -199,6 +199,9 @@ DSPARK_TEST(AudioSpec_isValid_rejects_nan_and_nonpositive)
     EXPECT_FALSE((AudioSpec { 48000.0, -512, 2 }).isValid());
     EXPECT_FALSE((AudioSpec { 48000.0, 512, 0 }).isValid());
     EXPECT_FALSE((AudioSpec { 48000.0, 512, -2 }).isValid());
+    // Regression: +inf used to pass (inf > 0), letting prepare() derive zero
+    // or NaN coefficients from an infinite rate.
+    EXPECT_FALSE((AudioSpec { std::numeric_limits<double>::infinity(), 512, 2 }).isValid());
 }
 
 DSPARK_TEST(AudioSpec_equality_detects_any_field_change)

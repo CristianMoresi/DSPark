@@ -149,6 +149,10 @@ public:
         // clear() on a read-only view can never be mistaken for a real one.
         static_assert(!std::is_const_v<T>, "Cannot clear a const view");
         const auto bytes = static_cast<std::size_t>(numSamples_) * sizeof(T);
+        // An empty view may hold null channel pointers (a zero-length host
+        // block, an empty AudioBuffer); memset on null is undefined even with
+        // a zero length.
+        if (bytes == 0) return;
         for (int ch = 0; ch < numChannels_; ++ch)
             std::memset(channels_[ch], 0, bytes);
     }

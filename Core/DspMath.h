@@ -197,12 +197,12 @@ template <FloatType T>
 /**
  * @brief Fast sine approximation (degree-9 odd minimax polynomial).
  *
- * Maximum error ~4e-6 in either precision (over 110 dB below the signal):
- * inaudible even for audio-rate synthesis. The degree-9 minimax coefficients
- * are stored to ~7 significant digits, so the double path is coefficient-
- * limited to the same ~3.2e-6 as float rather than reaching double's own
- * resolution (measured in both). Use std::sin where sub-ppm accuracy
- * is required. About 3-6x faster than std::sin depending on platform. The input is
+ * The coefficients are a Remez minimax fit of sin on [-pi/2, pi/2] under the
+ * constraint that the polynomial is exactly 1 at pi/2, so the output never
+ * overshoots the unit circle in double. Maximum absolute error is ~3.7e-9 in
+ * double (about -168 dB) and float-rounding-limited (~1.8e-7, about -135 dB)
+ * in float: a pure sine rendered with it is cleaner than a 24-bit converter.
+ * About 3-6x faster than std::sin depending on platform. The input is
  * range-reduced internally (two-term Cody-Waite), so any finite argument
  * within a few thousand periods of zero stays accurate.
  *
@@ -224,19 +224,19 @@ template <FloatType T>
     else if (x < -halfPi<T>) x = -pi<T> - x;
 
     const T x2 = x * x;
-    // Minimax coefficients for sin on [-pi/2, pi/2]. Stored to ~7 digits, so
-    // the realised max abs error is ~3.2e-6 (coefficient-limited, identical in
-    // float and double; measured, not inferred from the degree).
-    return x * (T(0.9999999995)
-         + x2 * (T(-0.1666666580)
-         + x2 * (T(0.0083333075)
-         + x2 * (T(-0.0001984090)
-         + x2 *  T(0.0000027526)))));
+    // Endpoint-constrained Remez minimax coefficients for sin on [-pi/2, pi/2]
+    // (equiripple error 3.73e-9, p(pi/2) == 1). Near-Taylor coefficients of
+    // the same degree leave ~3e-6 of error: a -110 dB harmonic floor.
+    return x * (T(0.99999997408724855)
+         + x2 * (T(-0.16666646026660671)
+         + x2 * (T(0.0083328727116396326)
+         + x2 * (T(-0.00019799239565814083)
+         + x2 *  T(2.5871610835732768e-6)))));
 }
 
 /**
  * @brief Fast cosine approximation. See fastSin() for accuracy notes
- * (float error is ~7e-6 here: half an ulp more from the pi/2 offset).
+ * (the pi/2 offset costs float about half an ulp more).
  * @param x Argument in radians.
  * @return Approximation of cos(x).
  */

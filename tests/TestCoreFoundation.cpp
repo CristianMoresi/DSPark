@@ -160,6 +160,28 @@ DSPARK_TEST(DspMath_fastLog_matches_log_across_range)
     }
 }
 
+DSPARK_TEST(DspMath_fastSin_is_minimax_accurate)
+{
+    // The old near-Taylor coefficients left 3.2e-6 of error in both
+    // precisions (a -110 dB harmonic floor on every fastSin oscillator).
+    double worstD = 0.0, peakD = 0.0;
+    float  worstF = 0.0f;
+    for (int i = -200000; i <= 200000; ++i)
+    {
+        const double x = static_cast<double>(i) * 1.5e-4; // about +/- 4.8 periods
+        worstD = std::max(worstD, std::abs(fastSin(x) - std::sin(x)));
+        peakD  = std::max(peakD, std::abs(fastSin(x)));
+        const float xf = static_cast<float>(x);
+        worstF = std::max(worstF, static_cast<float>(
+            std::abs(static_cast<double>(fastSin(xf)) - std::sin(static_cast<double>(xf)))));
+    }
+    EXPECT_LT(worstD, 5e-9);
+    EXPECT_LT(worstF, 4e-7f);
+    EXPECT_TRUE(peakD <= 1.0);
+    EXPECT_NEAR(fastSin(halfPi<double>), 1.0, 1e-15);
+    EXPECT_NEAR(fastCos(0.0), 1.0, 1e-15);
+}
+
 DSPARK_TEST(DspMath_wrapPhase_stays_in_range_for_large_phases)
 {
     // Regression: for large phases the k * twoPi product can overshoot the

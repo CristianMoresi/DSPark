@@ -468,3 +468,26 @@ DSPARK_TEST(State_json_non_finite_float_is_legal)
     EXPECT_TRUE(r.isValid());
     EXPECT_NEAR(r.read("bad", -1.0f), 0.0f, 1e-9f); // non-finite -> 0
 }
+
+DSPARK_TEST(State_json_out_of_range_numbers_never_convert_undefined)
+{
+    // Regression: stateFromJson cast parsed doubles to int32/uint32/float
+    // unchecked. A legal float parameter of 3e9 (beyond int32) hit an
+    // undefined double->int32 conversion in the "exact integer" mirror, and
+    // hostile ids or out-of-float-range values did the same on untrusted text.
+    StateWriter w(0x42494731u, 2);
+    w.write("big", 3.0e9f);
+    w.write("neg", -3.0e9f);
+    const auto back = stateFromJson(stateToJson(w.blob()));
+    EXPECT_TRUE(!back.empty());
+    StateReader r(back.data(), back.size());
+    EXPECT_TRUE(r.isValid());
+    EXPECT_NEAR(r.read("big", 0.0f), 3.0e9f, 1.0f);
+    EXPECT_NEAR(r.read("neg", 0.0f), -3.0e9f, 1.0f);
+    EXPECT_EQ(r.read("big", int32_t(-7)), int32_t(-7)); // no int mirror out of range
+
+    EXPECT_TRUE(stateFromJson("{\"id\":1e30,\"version\":1,\"params\":{}}").empty());
+    EXPECT_TRUE(stateFromJson("{\"id\":-1,\"version\":1,\"params\":{}}").empty());
+    EXPECT_TRUE(stateFromJson("{\"id\":1,\"version\":70000,\"params\":{}}").empty());
+    EXPECT_TRUE(stateFromJson("{\"id\":1,\"version\":1,\"params\":{\"x\":1e300}}").empty());
+}

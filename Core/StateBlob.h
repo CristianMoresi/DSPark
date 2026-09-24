@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -517,10 +518,15 @@ inline std::vector<uint8_t> stateFromJsonImpl(const std::string& json, int depth
         if (!parseString(p, key) || !expect(p, ':')) return {};
         if (key == "id" && parseNumber(p, num))
         {
+            // Range-check before every float->int conversion: an out-of-range
+            // conversion is undefined behaviour, and this parser reads
+            // untrusted preset text.
+            if (!(num >= 0.0 && num <= 4294967295.0)) return {};
             id = static_cast<uint32_t>(num);
         }
         else if (key == "version" && parseNumber(p, num))
         {
+            if (!(num >= 0.0 && num <= 65535.0)) return {};
             version = static_cast<uint16_t>(num);
         }
         else if (key == "params")
@@ -563,10 +569,16 @@ inline std::vector<uint8_t> stateFromJsonImpl(const std::string& json, int depth
                     {
                         // Integers without fraction round-trip as int32 too;
                         // store as float (type 0) plus int mirror when exact.
+                        // Beyond the float range the double->float conversion
+                        // is undefined: reject such text as malformed.
+                        if (!(std::abs(num) <= static_cast<double>(
+                                  std::numeric_limits<float>::max())))
+                            return {};
                         const auto f = static_cast<float>(num);
                         std::memcpy(&prm.payload, &f, 4);
                         prm.type = 0;
-                        if (num == static_cast<double>(static_cast<int32_t>(num)))
+                        if (num >= -2147483648.0 && num <= 2147483647.0
+                            && num == static_cast<double>(static_cast<int32_t>(num)))
                         {
                             params.push_back({ pk, 1,
                                 static_cast<uint32_t>(static_cast<int32_t>(num)), {} });

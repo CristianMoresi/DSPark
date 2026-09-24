@@ -1457,6 +1457,36 @@ DSPARK_TEST(DryWetMixer_equalpower_ramp_is_nan_free_on_huge_blocks)
     EXPECT_NEAR(buf.getChannel(0)[100], 0.0f, 1e-7f);
 }
 
+DSPARK_TEST(DryWetMixer_small_blocks_ramp_over_the_minimum_time)
+{
+    // The mix used to ramp across exactly one block: with 32-sample host
+    // blocks a 0 -> 1 move completed in 0.67 ms (a click on uncorrelated
+    // dry/wet material). Now a full-scale move takes at least 20 ms.
+    constexpr int B = 32;
+    DryWetMixer<float> mixer;
+    mixer.prepare(spec(48000.0, B, 1));
+
+    AudioBuffer<float> buf;
+    buf.resize(1, B);
+    auto runBlock = [&](float mix) {
+        generateDC(buf.getChannel(0), B, 1.0f);  // dry = 1
+        mixer.pushDry(buf.toView());
+        buf.toView().clear();                    // wet = 0
+        mixer.mixWet(buf.toView(), mix);
+        return buf.getChannel(0)[B - 1];         // = 1 - mix at the last sample
+    };
+
+    (void)runBlock(0.0f);                    // first call settles at 0
+    const float afterOne = runBlock(1.0f);
+    EXPECT_NEAR(1.0f - afterOne, 31.0f / 960.0f, 1e-4f);  // not 31/32
+
+    int blocks = 1;
+    float last = afterOne;
+    while (last > 1e-6f && blocks < 100) { last = runBlock(1.0f); ++blocks; }
+    EXPECT_EQ(blocks, 31);                   // 960 samples / 32 = 30 ramp blocks
+    EXPECT_NEAR(runBlock(1.0f), 0.0f, 1e-7f);
+}
+
 DSPARK_TEST(DryWetMixer_latency_compensation_time_aligns_dry)
 {
     // The compensated dry must be the input delayed by exactly D samples,

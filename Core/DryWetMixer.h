@@ -97,7 +97,8 @@ public:
           latencySamples_(other.latencySamples_),
           histPos_(other.histPos_),
           mixRule_(other.mixRule_.load(std::memory_order_relaxed)),
-          currentMix_(other.currentMix_)
+          currentMix_(other.currentMix_),
+          maxMixStep_(other.maxMixStep_)
     {}
 
     DryWetMixer& operator=(DryWetMixer&& other) noexcept
@@ -111,6 +112,7 @@ public:
         mixRule_.store(other.mixRule_.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
         currentMix_      = other.currentMix_;
+        maxMixStep_      = other.maxMixStep_;
         return *this;
     }
 
@@ -124,6 +126,13 @@ public:
     void prepare(const AudioSpec& spec)
     {
         dryBuffer_.resize(spec.numChannels, spec.maxBlockSize);
+
+        // Mix changes ramp over at least kMinRampSeconds for a full-scale
+        // move, whatever the host block size (an invalid rate keeps the
+        // one-block ramp).
+        maxMixStep_ = spec.isValid()
+            ? static_cast<T>(1.0 / std::max(1.0, spec.sampleRate * kMinRampSeconds))
+            : T(1);
 
         // If latency compensation was configured before prepare(), the delay
         // history was sized with 0 channels; rebuild it now that the channel
@@ -239,7 +248,11 @@ public:
      * @brief Blends the stored dry signal with the current (wet) buffer in-place.
      *
      * Automatically applies sample-accurate linear interpolation to the mix
-     * proportion to prevent zipper noise when the parameter changes.
+     * proportion to prevent zipper noise when the parameter changes. A change
+     * ramps across the block, but never faster than a full-scale move in
+     * 20 ms: with small host blocks (32 samples is under a millisecond) a
+     * one-block ramp would click on uncorrelated dry/wet pairs, so the ramp
+     * then continues into the following blocks.
      *
      * Only the region covered by the last pushDry() snapshot is blended:
      * without a captured snapshot (e.g. right after reset()) this is a no-op
@@ -264,7 +277,17 @@ public:
         if (currentMix_ < T(0)) currentMix_ = targetMix;
 
         const bool needsSmoothing = std::abs(currentMix_ - targetMix) > T(1e-5);
-        const T mixStep = needsSmoothing ? (targetMix - currentMix_) / T(nSamples) : T(0);
+        T mixStep = T(0);
+        bool rateLimited = false;
+        if (needsSmoothing)
+        {
+            mixStep = (targetMix - currentMix_) / T(nSamples);
+            if (std::abs(mixStep) > maxMixStep_)
+            {
+                mixStep = mixStep > T(0) ? maxMixStep_ : -maxMixStep_;
+                rateLimited = true;
+            }
+        }
         const MixRule rule = mixRule_.load(std::memory_order_relaxed);
 
         // Every channel ramps from the same smoothed origin. The ramps below
@@ -272,8 +295,9 @@ public:
         // rounding per sample instead of a drift that grows with the block
         // (a serial accumulator can overshoot the [0, 1] range on long
         // blocks), and no loop-carried dependency in the way of the
-        // auto-vectoriser.
-        const T mix0 = currentMix_;
+        // auto-vectoriser. A settled mix within the 1e-5 dead band renders
+        // at the target itself, so no residual offset is ever held.
+        const T mix0 = needsSmoothing ? currentMix_ : targetMix;
 
         for (int ch = 0; ch < chCount; ++ch)
         {
@@ -327,8 +351,11 @@ public:
             }
         }
 
-        // Update the persistent state after the block is processed
-        if (needsSmoothing) currentMix_ = targetMix;
+        // Update the persistent state after the block is processed: a
+        // rate-limited ramp resumes from where this block left it.
+        currentMix_ = rateLimited
+            ? std::clamp(mix0 + mixStep * T(nSamples), T(0), T(1))
+            : targetMix;
     }
 
     /**
@@ -359,6 +386,9 @@ private:
 
     std::atomic<MixRule> mixRule_ { MixRule::Linear };
     T currentMix_ = T(-1); // Internal state for parameter smoothing
+    T maxMixStep_ = T(1);  // Per-sample mix slew limit (set in prepare())
+
+    static constexpr double kMinRampSeconds = 0.02;
 };
 
 } // namespace dspark

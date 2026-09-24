@@ -414,20 +414,27 @@ inline void Smoothers::ExponentialSmoother::setTargetValue(float newTarget) noex
 
     if (newTarget == target) return;
     target = newTarget;
-    stepsToGo = totalSteps;
 
-    if (stepsToGo > 0 && std::abs(current) > epsilon)
+    if (totalSteps > 0 && std::abs(current) > epsilon)
     {
         float safeCur = (current > 0.0f) ? std::max(current, epsilon)
                                          : std::min(current, -epsilon);
         float ratio = target / safeCur;
         if (ratio > 0.0f)
+        {
+            stepsToGo = totalSteps;
             coeff = std::exp(std::log(ratio) / static_cast<float>(stepsToGo));
-        else
-            current = target;
+            return;
+        }
     }
-    else
-        current = target;
+
+    // Snap. The ramp must also stop here: leaving stepsToGo armed replays the
+    // previous ramp's coefficient, dragging the value away from the target
+    // for a whole ramp and then jumping back (a sign flip after a 1 -> 2 ramp
+    // went -1 -> -1.997 -> -1).
+    current   = target;
+    coeff     = 1.0f;
+    stepsToGo = 0;
 }
 
 inline float Smoothers::ExponentialSmoother::getNextValue() noexcept

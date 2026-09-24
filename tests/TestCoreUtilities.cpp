@@ -59,6 +59,25 @@ DSPARK_TEST(ExponentialSmoother_converges)
     EXPECT_NEAR(s.getNextValue(), 1.0f, 0.05f);
 }
 
+DSPARK_TEST(ExponentialSmoother_snap_does_not_replay_previous_ramp)
+{
+    // Regression: a sign-flipping target snaps, but the ramp counter stayed
+    // armed with the previous ramp's coefficient. After a 1 -> 2 ramp, a
+    // retarget to -1 drifted to -1.997 over the next ramp and then jumped
+    // back to -1 (a full-scale click).
+    Smoothers::ExponentialSmoother s;
+    s.reset(48000.0, 10.0f, 1.0f);
+    s.setTargetValue(2.0f);
+    for (int i = 0; i < 600; ++i)
+        (void)s.getNextValue();
+    EXPECT_NEAR(s.getCurrentValue(), 2.0f, 1e-6f);
+
+    s.setTargetValue(-1.0f);
+    for (int i = 0; i < 600; ++i)
+        EXPECT_NEAR(s.getNextValue(), -1.0f, 1e-6f);
+    EXPECT_FALSE(s.isSmoothing());
+}
+
 DSPARK_TEST(OnePoleSmoother_converges)
 {
     Smoothers::OnePoleSmoother s;

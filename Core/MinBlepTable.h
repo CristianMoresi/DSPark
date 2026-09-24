@@ -114,6 +114,19 @@ public:
         return a + frac * (b - a);
     }
 
+    /**
+     * @brief Low-frequency delay of the minimum-phase step, in samples.
+     *
+     * Equals minus the integral of the residual: the band-limited step
+     * completes its rise about this much later than the ideal step it
+     * replaces. A generator that adds the residuals to a naive waveform must
+     * delay the waveform's continuous (sloped) segments by the same amount,
+     * i.e. subtract slope * dcDelay(): otherwise every jump contributes
+     * jump * -dcDelay() of area, a DC offset of 2 * dcDelay() * f0 / fs on a
+     * sawtooth (+0.49 at 5 kHz / 44.1 kHz).
+     */
+    [[nodiscard]] T dcDelay() const noexcept { return dcDelay_; }
+
 private:
     MinBlepTable() noexcept { build(); }
 
@@ -199,12 +212,20 @@ private:
             step[static_cast<size_t>(i)] = acc;
         }
         const double settle = step[static_cast<size_t>(n - 1)];
+        double area = 0.0;
         for (int i = 0; i < n; ++i)
-            residual_[static_cast<size_t>(i)] =
-                static_cast<T>(step[static_cast<size_t>(i)] / settle - 1.0);
+        {
+            const double r = step[static_cast<size_t>(i)] / settle - 1.0;
+            residual_[static_cast<size_t>(i)] = static_cast<T>(r);
+            // Trapezoidal integral of the stored residual (what residual()
+            // interpolates), in samples.
+            area += (i == 0 || i == n - 1) ? 0.5 * r : r;
+        }
+        dcDelay_ = static_cast<T>(-area / kOversample);
     }
 
     std::array<T, kTableSize> residual_{};
+    T dcDelay_ = T(0);
 };
 
 } // namespace dspark

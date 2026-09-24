@@ -5,17 +5,21 @@
 
 /**
  * @file Oscillator.h
- * @brief Band-limited oscillator: PolyBLEP waveforms plus table-minBLEP hard sync.
+ * @brief Band-limited oscillator: table-minBLEP waveforms (PolyBLEP optional).
  *
  * Header-only C++20 oscillator for audio-rate synthesis and LFO duty. Saw and
- * square discontinuities are corrected with PolyBLEP; the triangle is a leaky
- * integration of the band-limited square (analog-style curve). Under hard
- * sync every discontinuity is instead corrected with the shared minimum-phase
- * band-limited step table (MinBlepTable), whose causal kernel survives the
- * arbitrary jump amplitudes sync creates.
+ * square discontinuities are corrected with the shared minimum-phase
+ * band-limited step table (MinBlepTable) by default, or with a 2-point
+ * PolyBLEP when setAntiAliasing() selects it (LFO duty, where the minBLEP's
+ * band-limited overshoot is unwanted). The triangle is a leaky integration of
+ * the band-limited square (analog-style curve). Hard sync always uses the
+ * minBLEP, whose causal kernel survives the arbitrary jump amplitudes sync
+ * creates.
  *
  * Features:
- * - Sine / Saw / Square / Triangle, band-limited.
+ * - Sine / Saw / Square / Triangle, band-limited. Worst alias component in
+ *   the audible band, 48 kHz saw: minBLEP -94 dB (110 Hz .. 7 kHz, measured)
+ *   against PolyBLEP's -59 dB at 110 Hz falling to -23 dB at 7 kHz.
  * - Hard sync with table-minBLEP correction (alias floor ~-90 dB or better).
  * - Triangle integrator state kept in double (framework rule for recursive state).
  * - Zero allocations after prepare(); the shared minBLEP table builds once there.
@@ -42,16 +46,22 @@ namespace dspark {
  * @brief Band-limited oscillator featuring PolyBLEP anti-aliasing and analog-modeled integration.
  *
  * This oscillator provides high-quality waveform generation suitable for both
- * audio-rate synthesis and low-frequency modulation (LFO). It utilizes PolyBLEP
- * (Polynomial Band-Limited Step) to drastically reduce aliasing artifacts in
- * discontinuous waveforms (Saw, Square). The Triangle wave is generated via a
- * leaky integrator driven by a PolyBLEP square, providing an analog-style curve.
- * Under hard sync (setSyncRatio) every discontinuity is instead corrected with
- * a table minBLEP (MinBlepTable) -- a causal minimum-phase kernel whose alias
- * rejection (~-90 dB measured) survives the arbitrary jump amplitudes sync
- * creates. Exception: a hard-synced Sine has no value discontinuity, only a
- * derivative kink at the reset, which the minBLEP does not address; its
- * residual alias floor is ~-64 dB (a minBLAMP table is the future direction).
+ * audio-rate synthesis and low-frequency modulation (LFO). Every discontinuity
+ * of the Saw and Square waves is corrected with a table minBLEP (MinBlepTable)
+ * -- a causal minimum-phase band-limited step whose alias rejection (~-90 dB
+ * measured) is some 35-70 dB better than a 2-point PolyBLEP across the
+ * keyboard. The Triangle wave is generated via a leaky integrator driven by
+ * the band-limited square, providing an analog-style curve. Under hard sync
+ * (setSyncRatio) the same kernel corrects the slave edges and the reset jumps.
+ * Exception: a hard-synced Sine has no value discontinuity, only a derivative
+ * kink at the reset, which the minBLEP does not address; its residual alias
+ * floor is ~-64 dB (a minBLAMP table is the future direction).
+ *
+ * A band-limited step rings (Gibbs), and a minimum-phase one puts all of that
+ * ringing after the edge: minBLEP saw and square peaks reach about 1.45x full
+ * scale, so leave ~3.5 dB of headroom. For modulation duty, where that
+ * overshoot is unwanted and aliasing is irrelevant, select
+ * AntiAliasing::PolyBLEP (the waveforms then stay within [-1, 1]).
  *
  * @note This class is not internally thread-safe: apply parameter changes
  * (e.g. setFrequency) from the audio thread between process calls, publishing
@@ -66,6 +76,13 @@ class Oscillator
 
 public:
     enum class Waveform { Sine, Saw, Square, Triangle };
+
+    /** @brief Discontinuity correction used when hard sync is off. */
+    enum class AntiAliasing
+    {
+        MinBLEP,  ///< Minimum-phase band-limited step table (default; audio duty).
+        PolyBLEP  ///< 2-point polynomial step (no overshoot; LFO duty).
+    };
 
     /**
      * @brief Prepares the oscillator with the system sample rate.
@@ -82,8 +99,9 @@ public:
         sampleRate_ = sampleRate;
         // Touch the shared minBLEP table here so its one-time FFT build runs
         // on the control thread, never inside the audio callback.
-        (void) MinBlepTable<T>::instance();
+        blepDelay_ = MinBlepTable<T>::instance().dcDelay();
         setFrequency(frequency_);
+        if (!syncOn_) primeMinBlep();
     }
 
     /**
@@ -115,7 +133,33 @@ public:
      * @brief Changes the active waveform.
      * @param w The desired waveform type.
      */
-    void setWaveform(Waveform w) noexcept { waveform_ = w; }
+    void setWaveform(Waveform w) noexcept
+    {
+        if (w == waveform_) return;
+        waveform_ = w;
+        // The pending minBLEP tails belong to the previous waveform's edges.
+        if (!syncOn_) primeMinBlep();
+    }
+
+    /**
+     * @brief Selects the discontinuity correction for the non-synced waveforms.
+     *
+     * MinBLEP (the default) is the audio-rate choice; its band-limited edges
+     * ring to ~1.45x full scale. PolyBLEP keeps every waveform inside [-1, 1]
+     * at the cost of far more aliasing: use it for LFOs and control signals. Pending minBLEP corrections are discarded on a
+     * change. Hard sync always uses the minBLEP.
+     *
+     * @param mode Correction method.
+     */
+    void setAntiAliasing(AntiAliasing mode) noexcept
+    {
+        if (mode == antiAliasing_) return;
+        antiAliasing_ = mode;
+        if (!syncOn_) primeMinBlep();
+    }
+
+    /** @brief Returns the discontinuity correction in use (see setAntiAliasing()). */
+    [[nodiscard]] AntiAliasing getAntiAliasing() const noexcept { return antiAliasing_; }
 
     /**
      * @brief Enables band-limited hard sync.
@@ -164,15 +208,17 @@ public:
         if (phase_ >= T(1)) phase_ -= T(1);
 
         if (syncOn_)
+        {
             reseedSlave();
+        }
+        else
+        {
+            // A forced phase is a new stream: rebuild the pending minBLEP
+            // tails of the edges that stream would already have produced.
+            primeMinBlep();
+        }
 
-        // Steady-state triangle value at this phase (piecewise-linear ideal;
-        // the leaky integrator's true cycle deviates by O(increment), so any
-        // remaining transient is negligible). Phase 0 drives the underlying
-        // square positive, so the triangle rises from -peak over [0, 0.5).
-        const T ph = syncOn_ ? slavePhase_ : phase_;
-        const T ideal = (ph < T(0.5)) ? (T(4) * ph - T(1)) : (T(3) - T(4) * ph);
-        triState_ = static_cast<double>(ideal * triExpectedPeak_);
+        seedTriangle();
     }
 
     /** @brief Hard-resets the oscillator phase and integrator state.
@@ -184,29 +230,33 @@ public:
     void reset() noexcept
     {
         phase_ = T(0);
-        triState_ = -static_cast<double>(triExpectedPeak_);
         slavePhase_ = T(0);
         corr_.fill(T(0));
         corrHead_ = 0;
+        if (!syncOn_) primeMinBlep();
+        seedTriangle();
     }
 
     /**
      * @brief Computes and returns the next single audio sample.
-     * @return A band-limited sample in the range [-1.0, 1.0] (hard sync may
-     *         overshoot to ~1.5x full scale -- Gibbs, see setSyncRatio()).
+     * @return A band-limited sample. PolyBLEP output stays in [-1.0, 1.0];
+     *         minBLEP edges (the default, and hard sync) ring to ~1.45x full
+     *         scale -- Gibbs, see setAntiAliasing().
      */
     [[nodiscard]] inline T getNextSample() noexcept
     {
         if (syncOn_)
             return nextSyncSample();
+        if (antiAliasing_ == AntiAliasing::MinBLEP && waveform_ != Waveform::Sine)
+            return nextMinBlepSample();
 
         T out = T(0);
 
         switch (waveform_)
         {
             case Waveform::Sine:
-                // fastSin: error < ~4e-6 in float (over 100 dB down), 3-6x
-                // faster than std::sin -- inaudible even for direct synthesis.
+                // fastSin: minimax error ~2e-7 in float / 4e-9 in double
+                // (-135 / -168 dB), 3-6x faster than std::sin.
                 out = fastSin(phase_ * twoPi<T>);
                 break;
 
@@ -318,6 +368,122 @@ private:
     }
 
     /**
+     * @brief Seeds the triangle integrator at its steady-state value.
+     *
+     * Piecewise-linear ideal at the current phase (the leaky integrator's
+     * true cycle deviates by O(increment), so any remaining transient is
+     * negligible). Phase 0 drives the underlying square positive, so the
+     * triangle rises from -peak over [0, 0.5). The free-running minBLEP square
+     * lags the naive one by MinBlepTable::dcDelay() samples, so its triangle
+     * is seeded that much earlier in phase: seeding at the naive phase opened
+     * a 5 kHz / 44.1 kHz triangle at 1.62x full scale.
+     */
+    void seedTriangle() noexcept
+    {
+        T ph = syncOn_ ? slavePhase_ : phase_;
+        if (!syncOn_ && antiAliasing_ == AntiAliasing::MinBLEP)
+        {
+            ph -= phaseInc_ * blepDelay_;
+            ph -= std::floor(ph);
+        }
+        const T ideal = (ph < T(0.5)) ? (T(4) * ph - T(1)) : (T(3) - T(4) * ph);
+        triState_ = static_cast<double>(ideal * triExpectedPeak_);
+    }
+
+    /**
+     * @brief Rebuilds the minBLEP ring as if the oscillator had been running.
+     *
+     * The saw's ramp is delayed by the kernel's dcDelay() and every edge's
+     * band-limited tail lasts kCorrLen samples, so a stream that starts cold
+     * (reset(), setPhase(), a waveform or mode change) would open with the
+     * ramp compensation but none of the tails it pairs with: a saw at
+     * 15 kHz / 44.1 kHz started at -2.47 instead of its steady-state -0.48.
+     * Queueing the tails of the edges the free-running waveform produced
+     * during the last kCorrLen samples makes the first sample the
+     * steady-state continuation.
+     */
+    void primeMinBlep() noexcept
+    {
+        corr_.fill(T(0));
+        corrHead_ = 0;
+        if (antiAliasing_ != AntiAliasing::MinBLEP || waveform_ == Waveform::Sine
+            || !(phaseInc_ > T(0)))
+            return;
+
+        const T period = T(1) / phaseInc_;
+        const auto primeEdge = [&](T edgePhase, T jump) noexcept {
+            // Samples elapsed since the most recent edge at edgePhase, taken
+            // relative to the sample about to be emitted.
+            T age = (phase_ - edgePhase) * period;
+            if (age < T(0)) age += period;
+            for (; age < static_cast<T>(kCorrLen); age += period)
+                scheduleMinBlep(jump, age);
+        };
+        if (waveform_ == Waveform::Saw)
+        {
+            primeEdge(T(0), T(-2));
+        }
+        else
+        {
+            primeEdge(T(0), T(2));
+            primeEdge(T(0.5), T(-2));
+        }
+    }
+
+    /**
+     * @brief One free-running Saw/Square/Triangle sample with table-minBLEP
+     *        correction of every discontinuity.
+     *
+     * Same causal bookkeeping as the synced path: emit the raw value plus the
+     * pending correction, advance the phase, and queue the band-limiting
+     * residual of each edge crossed inside the interval (at most one: the
+     * increment is clamped to 0.5).
+     */
+    [[nodiscard]] T nextMinBlepSample() noexcept
+    {
+        T raw = rawSlaveValue(phase_) + corr_[static_cast<size_t>(corrHead_)];
+        corr_[static_cast<size_t>(corrHead_)] = T(0);
+        corrHead_ = (corrHead_ + 1) & kCorrMask;   // now the NEXT sample's slot
+
+        T out = raw;
+        if (waveform_ == Waveform::Saw)
+        {
+            // Delay the ramp by the minBLEP's own low-frequency delay so the
+            // band-limited jumps and the slope stay time-aligned (see
+            // MinBlepTable::dcDelay): without this the saw carries a DC offset
+            // of 2 * dcDelay * f0 / fs.
+            out -= T(2) * phaseInc_ * blepDelay_;
+        }
+        else if (waveform_ == Waveform::Triangle)
+        {
+            // Leaky integration of the band-limited square (double state:
+            // framework rule for recursive state).
+            const double inc = static_cast<double>(phaseInc_);
+            triState_ = inc * static_cast<double>(raw) + (1.0 - inc) * triState_;
+            out = static_cast<T>(triState_) * triNorm_;
+        }
+
+        const T old = phase_;
+        phase_ += phaseInc_;
+        if (phaseInc_ > T(0))
+        {
+            if (phase_ >= T(1))
+            {
+                // Wrap: saw falls by 2, square/triangle drive rises by 2.
+                const T alpha = (T(1) - old) / phaseInc_;
+                scheduleMinBlep(waveform_ == Waveform::Saw ? T(-2) : T(2), T(1) - alpha);
+            }
+            else if (waveform_ != Waveform::Saw && old < T(0.5) && phase_ >= T(0.5))
+            {
+                const T alpha = (T(0.5) - old) / phaseInc_;
+                scheduleMinBlep(T(-2), T(1) - alpha);
+            }
+        }
+        if (phase_ >= T(1)) phase_ -= T(1);
+        return out;
+    }
+
+    /**
      * @brief One sample of the hard-synced slave with table-minBLEP correction.
      *
      * The minBLEP kernel is causal (minimum phase): every correction lands at
@@ -340,7 +506,12 @@ private:
         corrHead_ = (corrHead_ + 1) & kCorrMask;   // now the NEXT sample's slot
 
         T out = raw;
-        if (waveform_ == Waveform::Triangle)
+        if (waveform_ == Waveform::Saw)
+        {
+            // Ramp aligned with the minBLEP delay (see nextMinBlepSample()).
+            out -= T(2) * slaveInc_ * blepDelay_;
+        }
+        else if (waveform_ == Waveform::Triangle)
         {
             // Feed the integrator with the duty-compensated square: the synced
             // square has inherent DC (see updatePhaseInc) and the integrator's
@@ -402,9 +573,9 @@ private:
     /**
      * @brief Queues the minBLEP residual of one discontinuity into the ring.
      * @param jump Signed discontinuity amplitude (new value minus old value).
-     * @param frac Sub-sample position of the event before the next output
-     *             sample, in [0, 1): `1 - alpha` of the event inside the
-     *             just-finished interval.
+     * @param frac Time from the event to the next output sample, in samples:
+     *             `1 - alpha` of an event inside the just-finished interval
+     *             (in [0, 1)), or an older event's age when priming the ring.
      */
     void scheduleMinBlep(T jump, T frac) noexcept
     {
@@ -531,8 +702,10 @@ private:
     T        triExpectedPeak_ = T(0.25); ///< Steady-state integrator peak (reset seed).
     T        triNormInc_ = T(-1);    ///< Increment the tri norm was computed for (cache key).
     Waveform waveform_   = Waveform::Sine;
+    AntiAliasing antiAliasing_ = AntiAliasing::MinBLEP;
+    T        blepDelay_  = T(0);         ///< MinBlepTable::dcDelay(), cached by prepare().
 
-    // Hard sync (slave) state.
+    // Hard sync (slave) and minBLEP correction state.
     static constexpr int kCorrLen  = MinBlepTable<T>::kTaps;
     static constexpr int kCorrMask = kCorrLen - 1;
     static_assert((kCorrLen & kCorrMask) == 0, "minBLEP ring needs a power-of-two span");

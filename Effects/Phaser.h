@@ -88,10 +88,13 @@ public:
         mixer_.prepare(spec);
 
         lfo_.prepare(spec.sampleRate);
+        // LFO duty: keep the waveforms inside [-1, 1] (no minBLEP overshoot).
+        lfo_.setAntiAliasing(Oscillator<T>::AntiAliasing::PolyBLEP);
         lfo_.setFrequency(rate_.load(std::memory_order_relaxed));
         lfo_.setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
 
         lfoR_.prepare(spec.sampleRate);
+        lfoR_.setAntiAliasing(Oscillator<T>::AntiAliasing::PolyBLEP);
         lfoR_.setFrequency(rate_.load(std::memory_order_relaxed));
         lfoR_.setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
 

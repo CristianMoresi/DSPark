@@ -95,6 +95,8 @@ public:
             for (int v = 0; v < kMaxVoices; ++v)
             {
                 lfos_[ch][v].prepare(spec.sampleRate);
+                // LFO duty: keep the waveforms inside [-1, 1] (no minBLEP overshoot).
+                lfos_[ch][v].setAntiAliasing(Oscillator<T>::AntiAliasing::PolyBLEP);
                 lfos_[ch][v].setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
             }
         }

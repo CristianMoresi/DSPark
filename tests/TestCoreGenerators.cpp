@@ -1004,6 +1004,110 @@ DSPARK_TEST(Oscillator_hard_sync_is_band_limited)
     EXPECT_LT(syncAliasFloorDb(WF::Triangle, 3.1f), -90.0);
 }
 
+namespace {
+
+double freeRunAliasFloorDb(Oscillator<float>::Waveform wf, double f0,
+                           Oscillator<float>::AntiAliasing mode)
+{
+    Oscillator<float> osc;
+    osc.prepare(48000.0);
+    osc.setWaveform(wf);
+    osc.setAntiAliasing(mode);
+    osc.setFrequency(static_cast<float>(f0));
+    osc.reset();
+
+    constexpr size_t kN = 1 << 17;
+    std::vector<double> win(kN);
+    WindowFunctions<double>::blackmanHarris(win.data(), (int)kN, false);
+    std::vector<double> t(kN), f(kN + 2);
+    for (size_t i = 0; i < kN; ++i)
+        t[i] = static_cast<double>(osc.getNextSample()) * win[i];
+    FFTReal<double> fft(kN);
+    fft.forward(t.data(), f.data());
+
+    const double binHz = 48000.0 / static_cast<double>(kN);
+    const auto maxBin = static_cast<size_t>(20000.0 / binHz);
+    double fund = 0, worst = 0;
+    for (size_t k = 16; k <= maxBin; ++k)
+    {
+        const double p = f[2 * k] * f[2 * k] + f[2 * k + 1] * f[2 * k + 1];
+        const double harm = static_cast<double>(k) * binHz / f0;
+        if (std::abs(harm - std::round(harm)) * f0 / binHz <= 10.0)
+            fund = std::max(fund, p);
+        else
+            worst = std::max(worst, p);
+    }
+    return 10.0 * std::log10((worst + 1e-300) / (fund + 1e-300));
+}
+
+} // namespace
+
+DSPARK_TEST(Oscillator_free_running_waveforms_are_minblep_band_limited)
+{
+    // The default correction is the table minBLEP. The previous default, a
+    // 2-point PolyBLEP, left a saw's worst in-band alias at -47 dB for 440 Hz
+    // and -23 dB for 7040 Hz (48 kHz); the minBLEP measures -94 / -97 dB.
+    using WF = Oscillator<float>::Waveform;
+    using AA = Oscillator<float>::AntiAliasing;
+    EXPECT_LT(freeRunAliasFloorDb(WF::Saw,      440.0, AA::MinBLEP), -88.0);
+    EXPECT_LT(freeRunAliasFloorDb(WF::Saw,     7040.0, AA::MinBLEP), -88.0);
+    EXPECT_LT(freeRunAliasFloorDb(WF::Square,  3520.0, AA::MinBLEP), -88.0);
+    EXPECT_LT(freeRunAliasFloorDb(WF::Triangle, 3520.0, AA::MinBLEP), -88.0);
+    // And PolyBLEP stays selectable, with its known weaker floor.
+    EXPECT_GT(freeRunAliasFloorDb(WF::Saw, 7040.0, AA::PolyBLEP), -40.0);
+}
+
+DSPARK_TEST(Oscillator_minblep_saw_is_dc_free_and_starts_in_steady_state)
+{
+    // The minimum-phase step lags the ideal one by MinBlepTable::dcDelay()
+    // (~2.17 samples); with the ramp left undelayed every wrap added area,
+    // a DC offset of 2 * dcDelay * f0 / fs (+0.49 at 5 kHz, +1.47 at 15 kHz
+    // on 44.1 kHz). And a cold start without the previous edges' tails
+    // opened a 15 kHz saw at -2.47 instead of its steady state.
+    for (double f0 : { 440.0, 5000.0, 15000.0 })
+    {
+        Oscillator<double> osc;
+        osc.prepare(44100.0);
+        osc.setWaveform(Oscillator<double>::Waveform::Saw);
+        osc.setFrequency(f0);
+        osc.reset();
+        double dc = 0.0, peak = 0.0;
+        constexpr int kN = 44100;
+        for (int i = 0; i < kN; ++i)
+        {
+            const double v = osc.getNextSample();
+            dc += v;
+            peak = std::max(peak, std::abs(v));
+        }
+        EXPECT_NEAR(dc / kN, 0.0, 2e-3);
+        EXPECT_LT(peak, 1.45);
+        if (f0 > 11025.0)
+            EXPECT_LT(peak, 0.70);  // only the fundamental is in band: 2/pi
+    }
+}
+
+DSPARK_TEST(Oscillator_polyblep_mode_stays_within_unit_range)
+{
+    // LFO duty (Chorus, Phaser) selects PolyBLEP so the waveforms never
+    // overshoot +-1; the minBLEP's band-limited step rings to ~1.09x.
+    using WF = Oscillator<float>::Waveform;
+    for (auto wf : { WF::Saw, WF::Square, WF::Triangle })
+    {
+        Oscillator<float> lfo;
+        lfo.prepare(48000.0);
+        lfo.setWaveform(wf);
+        lfo.setAntiAliasing(Oscillator<float>::AntiAliasing::PolyBLEP);
+        lfo.setFrequency(3.0f);
+        lfo.reset();
+        float peak = 0.0f;
+        for (int i = 0; i < 48000; ++i)
+            peak = std::max(peak, std::abs(lfo.getNextSample()));
+        // The leaky-integrator triangle's analytic normalisation lands within
+        // ~1.5e-4 of unity; the stepped waveforms are exact.
+        EXPECT_LT(peak, 1.0f + (wf == WF::Triangle ? 1e-3f : 1e-5f));
+    }
+}
+
 DSPARK_TEST(MinBlepTable_residual_shape)
 {
     const auto& tab = MinBlepTable<float>::instance();

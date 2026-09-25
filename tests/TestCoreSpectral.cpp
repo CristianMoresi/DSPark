@@ -213,6 +213,91 @@ DSPARK_TEST(FFTComplex_shifted_impulse_exact_spectrum)
     }
 }
 
+// The engine is a Stockham radix-4 transform on split buffers with a radix-2
+// pass for odd log2(N), SIMD kernels chosen per pass by stride and a vectorised
+// real-FFT post-pass: every size from 2 to 1024 (both pass parities, every
+// kernel width and every scalar remainder) must match a direct DFT, invert
+// back to its input, and give the same result in place.
+template <typename T>
+static void checkFftAgainstDft(double tolerance)
+{
+    unsigned int rng = 12345u;
+    auto uniform = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<double>(rng >> 8) / 8388608.0 - 1.0;
+    };
+    for (size_t n = 2; n <= 1024; n *= 2)
+    {
+        // Complex: forward against the DFT, inverse back to the input.
+        std::vector<T> z(2 * n);
+        for (auto& v : z) v = static_cast<T>(uniform());
+        const std::vector<T> z0 = z;
+        FFTComplex<T> fc(n);
+        fc.forward(z.data());
+        double err = 0.0, ref = 0.0;
+        for (size_t k = 0; k < n; ++k)
+        {
+            double re = 0.0, im = 0.0;
+            for (size_t j = 0; j < n; ++j)
+            {
+                const double a = -2.0 * 3.14159265358979323846 * static_cast<double>((j * k) % n)
+                               / static_cast<double>(n);
+                re += z0[2 * j] * std::cos(a) - z0[2 * j + 1] * std::sin(a);
+                im += z0[2 * j] * std::sin(a) + z0[2 * j + 1] * std::cos(a);
+            }
+            err += (z[2 * k] - re) * (z[2 * k] - re) + (z[2 * k + 1] - im) * (z[2 * k + 1] - im);
+            ref += re * re + im * im;
+        }
+        EXPECT_LT(std::sqrt(err / ref), tolerance);
+        fc.inverse(z.data());
+        double back = 0.0;
+        for (size_t i = 0; i < 2 * n; ++i) back = std::max(back, std::abs(double(z[i] - z0[i])));
+        EXPECT_LT(back, 10.0 * tolerance);
+
+        if (n < 4) continue;
+        // Real: forward against the DFT, in place, and the inverse.
+        std::vector<T> x(n + 2, T(0));
+        for (size_t i = 0; i < n; ++i) x[i] = static_cast<T>(uniform());
+        const std::vector<T> x0 = x;
+        FFTReal<T> fr(n);
+        std::vector<T> spec(n + 2);
+        fr.forward(x.data(), spec.data());
+        err = 0.0; ref = 0.0;
+        for (size_t k = 0; k <= n / 2; ++k)
+        {
+            double re = 0.0, im = 0.0;
+            for (size_t j = 0; j < n; ++j)
+            {
+                const double a = -2.0 * 3.14159265358979323846 * static_cast<double>((j * k) % n)
+                               / static_cast<double>(n);
+                re += x0[j] * std::cos(a);
+                im += x0[j] * std::sin(a);
+            }
+            err += (spec[2 * k] - re) * (spec[2 * k] - re) + (spec[2 * k + 1] - im) * (spec[2 * k + 1] - im);
+            ref += re * re + im * im;
+        }
+        EXPECT_LT(std::sqrt(err / ref), tolerance);
+        fr.forward(x.data(), x.data());                       // in place
+        for (size_t i = 0; i < n + 2; ++i) EXPECT_EQ(x[i], spec[i]);
+        std::vector<T> y(n);
+        fr.inverse(spec.data(), y.data());
+        fr.inverse(x.data(), x.data());                       // in place
+        back = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            back = std::max(back, std::abs(double(y[i] - x0[i])));
+            EXPECT_EQ(x[i], y[i]);
+        }
+        EXPECT_LT(back, 10.0 * tolerance);
+    }
+}
+
+DSPARK_TEST(FFT_matches_the_direct_dft_at_every_size)
+{
+    checkFftAgainstDft<float>(1e-6);
+    checkFftAgainstDft<double>(1e-14);
+}
+
 // ============================================================================
 // WindowFunctions
 // ============================================================================

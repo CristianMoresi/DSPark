@@ -29,6 +29,8 @@
 #include "../Effects/TubePreamp.h"
 #include "../Effects/TransformerModel.h"
 #include "../Effects/TapeMachine.h"
+#include "../Effects/RingModulator.h"
+#include "../Effects/FrequencyShifter.h"
 #include "../Core/FFT.h"
 
 #include <algorithm>
@@ -1265,6 +1267,10 @@ DSPARK_TEST(Wet_dry_mix_ramps_over_20_ms_with_small_blocks)
         [](auto&) {}), 0.9);
     EXPECT_GT(effectiveMixAfterOneBlock.template operator()<TapeMachine<float>>(
         [](auto& fx) { fx.setDrive(12.0f); }), 0.9);  // was an unsmoothed step
+    EXPECT_GT(effectiveMixAfterOneBlock.template operator()<RingModulator<float>>(
+        [](auto& fx) { fx.setFrequency(700.0f); }), 0.9);
+    EXPECT_GT(effectiveMixAfterOneBlock.template operator()<FrequencyShifter<float>>(
+        [](auto& fx) { fx.setShift(150.0f); }), 0.9);
 }
 
 DSPARK_TEST(DynamicEQ_below_threshold_no_change)

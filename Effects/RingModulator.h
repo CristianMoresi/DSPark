@@ -94,6 +94,7 @@ public:
         phasor_.setFrequency(initialFreq);
         currentFreq_ = initialFreq;
         currentMix_ = initialMix;
+        mixMaxStep_ = static_cast<T>(1.0 / (spec.sampleRate * 0.02));
         numChannels_ = spec.numChannels;
     }
 
@@ -119,9 +120,13 @@ public:
         const auto modeVal = mode_.load(std::memory_order_relaxed);
 
         // Calculate smoothing steps
+        // The frequency glides linearly across the block (phase continuous,
+        // so the block length only sets the glide speed); the mix is rate
+        // limited to full scale per 20 ms (a per-block ramp landed in 0.7 ms
+        // with 32-sample blocks and clicked).
         const T invSamples = T(1) / static_cast<T>(numSamples);
         const T freqStep = (targetFreq - currentFreq_) * invSamples;
-        const T mixStep = (targetMix - currentMix_) * invSamples;
+        const T mixStart = currentMix_;
 
         // Process in L1-cache friendly chunks to allow outer channel loop
         constexpr int CHUNK_SIZE = 64;
@@ -138,7 +143,6 @@ public:
             for (int i = 0; i < chunkLen; ++i)
             {
                 currentFreq_ += freqStep;
-                currentMix_ += mixStep;
 
                 phasor_.setFrequency(currentFreq_);
                 T phase = phasor_.advance();
@@ -146,7 +150,8 @@ public:
                 // fastSin: error > 100 dB below the carrier - inaudible even
                 // though the carrier itself is audible in ring modulation.
                 carrierChunk[i] = fastSin(phase * twoPi);
-                mixChunk[i] = currentMix_;
+                mixChunk[i] = moveTowards(mixStart, targetMix,
+                                          mixMaxStep_ * static_cast<T>(start + i + 1));
             }
 
             // 2. Process channels with hoisted branches and SIMD-friendly loops
@@ -194,7 +199,7 @@ public:
         // within rounding of them, and the next block must start settled
         // (matches the framework's smoothing convention).
         currentFreq_ = targetFreq;
-        currentMix_ = targetMix;
+        currentMix_ = moveTowards(mixStart, targetMix, mixMaxStep_ * static_cast<T>(numSamples));
     }
 
     /** @brief Resets the internal phase of the carrier oscillator. */
@@ -299,6 +304,7 @@ private:
     // DSP State (Internal audio-thread only, no atomics required)
     T currentFreq_ { T(440) };
     T currentMix_ { T(1) };
+    T mixMaxStep_ { T(1.0 / 960.0) };   ///< Mix ramp rate: full scale per 20 ms.
     Phasor<T> phasor_;
 };
 

@@ -75,6 +75,7 @@ public:
         if (!spec.isValid()) return; // release-safe: keep previous state
 
         sampleRate_ = spec.sampleRate;
+        mixMaxStep_ = static_cast<T>(1.0 / (spec.sampleRate * 0.02));
         numChannels_ = spec.numChannels;
 
         // Zero-allocations on audio thread: allocate all Hilberts during prepare.
@@ -106,11 +107,12 @@ public:
         const T targetMix = mix_.load(std::memory_order_relaxed);
         const T shiftHz = shift_.load(std::memory_order_relaxed);
 
-        // The mix is smoothed with a linear per-block ramp: an unsmoothed
-        // step would jump the dry/wet crossfade audibly. The shift needs no
+        // The mix is rate limited to full scale per 20 ms: an unsmoothed step
+        // would jump the dry/wet crossfade audibly, and a per-block ramp
+        // landed in 0.7 ms with 32-sample blocks. The shift needs no
         // smoothing - it only changes the speed of the quadrature carrier,
         // whose phase stays continuous across blocks.
-        const T mixInc = (targetMix - currentMix_) / static_cast<T>(numSamples);
+        const T mixStart = currentMix_;
 
         // 1. Compute rotation matrix coefficients once per block
         const double w = (shiftHz * 2.0 * std::numbers::pi) / sampleRate_;
@@ -131,11 +133,11 @@ public:
             // ramp on every channel)
             T u = startCos;
             T v = startSin;
-            T smoothMix = currentMix_;
 
             for (int i = 0; i < numSamples; ++i)
             {
-                smoothMix += mixInc;
+                const T smoothMix = moveTowards(mixStart, targetMix,
+                                                mixMaxStep_ * static_cast<T>(i + 1));
 
                 // Hilbert processing (I + jQ)
                 auto h = hilbert.process(data[i]);
@@ -154,9 +156,7 @@ public:
             }
         }
 
-        // Land the mix ramp exactly on the published target (the next block
-        // must start settled - the framework's smoothing convention).
-        currentMix_ = targetMix;
+        currentMix_ = moveTowards(mixStart, targetMix, mixMaxStep_ * static_cast<T>(numSamples));
 
         // 3. Advance absolute phase once per block to prevent float drift
         phase_ += w * numSamples;
@@ -252,6 +252,7 @@ private:
 
     // Smoothed state for the audio thread
     T currentMix_{ T(1) };
+    T mixMaxStep_{ T(1.0 / 960.0) };   ///< Mix ramp rate: full scale per 20 ms.
 
     std::vector<Hilbert<T>> hilberts_;
 };

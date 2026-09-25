@@ -1227,5 +1227,363 @@ void addWithGainRampT(T* DSPARK_RESTRICT dst, const T* DSPARK_RESTRICT src, T ga
     addWithGainRamp(dst, src, gainStart, gainEnd, count);
 }
 
+// ============================================================================
+// Vec<T, W>: W lanes of T for kernels written once for every target. W = 1 is
+// plain scalar code and exists everywhere; 4/2 lanes (float/double) exist on
+// SSE2 and NEON, 8/4 lanes with AVX. Used by FFT.h, Oversampling.h and
+// firCorrelate() below.
+// ============================================================================
+
+template <typename T, int W> struct Vec;
+
+template <typename T>
+struct Vec<T, 1>
+{
+    using V = T;
+    static V load(const T* p) noexcept { return *p; }
+    static void store(T* p, V v) noexcept { *p = v; }
+    static V set1(T x) noexcept { return x; }
+    static V add(V a, V b) noexcept { return a + b; }
+    static V sub(V a, V b) noexcept { return a - b; }
+    static V mul(V a, V b) noexcept { return a * b; }
+    static V mulSub(V a, V b, V c, V d) noexcept { return a * b - c * d; }
+    static V mulAdd(V a, V b, V c, V d) noexcept { return a * b + c * d; }
+    static V madd(V a, V b, V c) noexcept { return a * b + c; }
+    static V reverse(V v) noexcept { return v; }
+    static void loadDeinterleave(const T* p, V& re, V& im) noexcept { re = p[0]; im = p[1]; }
+    static void storeInterleave2(T* p, V re, V im) noexcept { p[0] = re; p[1] = im; }
+    static void storeInterleave4(T* p, V a, V b, V c, V d) noexcept
+    {
+        p[0] = a; p[1] = b; p[2] = c; p[3] = d;
+    }
+};
+
+#if defined(DSPARK_SIMD_SSE2)
+inline constexpr int kVecFloatNarrow = 4;
+inline constexpr int kVecDoubleNarrow = 2;
+
+template <>
+struct Vec<float, 4>
+{
+    using V = __m128;
+    static V load(const float* p) noexcept { return _mm_loadu_ps(p); }
+    static void store(float* p, V v) noexcept { _mm_storeu_ps(p, v); }
+    static V set1(float x) noexcept { return _mm_set1_ps(x); }
+    static V add(V a, V b) noexcept { return _mm_add_ps(a, b); }
+    static V sub(V a, V b) noexcept { return _mm_sub_ps(a, b); }
+    static V mul(V a, V b) noexcept { return _mm_mul_ps(a, b); }
+#if defined(DSPARK_SIMD_FMA)
+    static V mulSub(V a, V b, V c, V d) noexcept { return _mm_fmsub_ps(a, b, _mm_mul_ps(c, d)); }
+    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_fmadd_ps(a, b, _mm_mul_ps(c, d)); }
+    static V madd(V a, V b, V c) noexcept { return _mm_fmadd_ps(a, b, c); }
+#else
+    static V mulSub(V a, V b, V c, V d) noexcept { return _mm_sub_ps(_mm_mul_ps(a, b), _mm_mul_ps(c, d)); }
+    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_add_ps(_mm_mul_ps(a, b), _mm_mul_ps(c, d)); }
+    static V madd(V a, V b, V c) noexcept { return _mm_add_ps(_mm_mul_ps(a, b), c); }
+#endif
+    static V reverse(V v) noexcept { return _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 1, 2, 3)); }
+    static void loadDeinterleave(const float* p, V& re, V& im) noexcept
+    {
+        const V a = _mm_loadu_ps(p), b = _mm_loadu_ps(p + 4);
+        re = _mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0));
+        im = _mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1));
+    }
+    static void storeInterleave2(float* p, V re, V im) noexcept
+    {
+        _mm_storeu_ps(p, _mm_unpacklo_ps(re, im));
+        _mm_storeu_ps(p + 4, _mm_unpackhi_ps(re, im));
+    }
+    static void storeInterleave4(float* p, V a, V b, V c, V d) noexcept
+    {
+        _MM_TRANSPOSE4_PS(a, b, c, d);
+        _mm_storeu_ps(p, a); _mm_storeu_ps(p + 4, b);
+        _mm_storeu_ps(p + 8, c); _mm_storeu_ps(p + 12, d);
+    }
+};
+
+template <>
+struct Vec<double, 2>
+{
+    using V = __m128d;
+    static V load(const double* p) noexcept { return _mm_loadu_pd(p); }
+    static void store(double* p, V v) noexcept { _mm_storeu_pd(p, v); }
+    static V set1(double x) noexcept { return _mm_set1_pd(x); }
+    static V add(V a, V b) noexcept { return _mm_add_pd(a, b); }
+    static V sub(V a, V b) noexcept { return _mm_sub_pd(a, b); }
+    static V mul(V a, V b) noexcept { return _mm_mul_pd(a, b); }
+#if defined(DSPARK_SIMD_FMA)
+    static V mulSub(V a, V b, V c, V d) noexcept { return _mm_fmsub_pd(a, b, _mm_mul_pd(c, d)); }
+    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_fmadd_pd(a, b, _mm_mul_pd(c, d)); }
+    static V madd(V a, V b, V c) noexcept { return _mm_fmadd_pd(a, b, c); }
+#else
+    static V mulSub(V a, V b, V c, V d) noexcept { return _mm_sub_pd(_mm_mul_pd(a, b), _mm_mul_pd(c, d)); }
+    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_add_pd(_mm_mul_pd(a, b), _mm_mul_pd(c, d)); }
+    static V madd(V a, V b, V c) noexcept { return _mm_add_pd(_mm_mul_pd(a, b), c); }
+#endif
+    static V reverse(V v) noexcept { return _mm_shuffle_pd(v, v, 1); }
+    static void loadDeinterleave(const double* p, V& re, V& im) noexcept
+    {
+        const V a = _mm_loadu_pd(p), b = _mm_loadu_pd(p + 2);
+        re = _mm_unpacklo_pd(a, b);
+        im = _mm_unpackhi_pd(a, b);
+    }
+    static void storeInterleave2(double* p, V re, V im) noexcept
+    {
+        _mm_storeu_pd(p, _mm_unpacklo_pd(re, im));
+        _mm_storeu_pd(p + 2, _mm_unpackhi_pd(re, im));
+    }
+    static void storeInterleave4(double* p, V a, V b, V c, V d) noexcept
+    {
+        _mm_storeu_pd(p,     _mm_unpacklo_pd(a, b));
+        _mm_storeu_pd(p + 2, _mm_unpacklo_pd(c, d));
+        _mm_storeu_pd(p + 4, _mm_unpackhi_pd(a, b));
+        _mm_storeu_pd(p + 6, _mm_unpackhi_pd(c, d));
+    }
+};
+#elif defined(DSPARK_SIMD_NEON)
+inline constexpr int kVecFloatNarrow = 4;
+inline constexpr int kVecDoubleNarrow = 2;
+
+template <>
+struct Vec<float, 4>
+{
+    using V = float32x4_t;
+    static V load(const float* p) noexcept { return vld1q_f32(p); }
+    static void store(float* p, V v) noexcept { vst1q_f32(p, v); }
+    static V set1(float x) noexcept { return vdupq_n_f32(x); }
+    static V add(V a, V b) noexcept { return vaddq_f32(a, b); }
+    static V sub(V a, V b) noexcept { return vsubq_f32(a, b); }
+    static V mul(V a, V b) noexcept { return vmulq_f32(a, b); }
+    static V mulSub(V a, V b, V c, V d) noexcept { return vsubq_f32(vmulq_f32(a, b), vmulq_f32(c, d)); }
+    static V mulAdd(V a, V b, V c, V d) noexcept { return vaddq_f32(vmulq_f32(a, b), vmulq_f32(c, d)); }
+    static V madd(V a, V b, V c) noexcept { return vaddq_f32(vmulq_f32(a, b), c); }
+    static V reverse(V v) noexcept { const V r = vrev64q_f32(v); return vextq_f32(r, r, 2); }
+    static void loadDeinterleave(const float* p, V& re, V& im) noexcept
+    {
+        const float32x4x2_t v = vld2q_f32(p);
+        re = v.val[0]; im = v.val[1];
+    }
+    static void storeInterleave2(float* p, V re, V im) noexcept
+    {
+        float32x4x2_t v; v.val[0] = re; v.val[1] = im;
+        vst2q_f32(p, v);
+    }
+    static void storeInterleave4(float* p, V a, V b, V c, V d) noexcept
+    {
+        float32x4x4_t v; v.val[0] = a; v.val[1] = b; v.val[2] = c; v.val[3] = d;
+        vst4q_f32(p, v);
+    }
+};
+
+template <>
+struct Vec<double, 2>
+{
+    using V = float64x2_t;
+    static V load(const double* p) noexcept { return vld1q_f64(p); }
+    static void store(double* p, V v) noexcept { vst1q_f64(p, v); }
+    static V set1(double x) noexcept { return vdupq_n_f64(x); }
+    static V add(V a, V b) noexcept { return vaddq_f64(a, b); }
+    static V sub(V a, V b) noexcept { return vsubq_f64(a, b); }
+    static V mul(V a, V b) noexcept { return vmulq_f64(a, b); }
+    static V mulSub(V a, V b, V c, V d) noexcept { return vsubq_f64(vmulq_f64(a, b), vmulq_f64(c, d)); }
+    static V mulAdd(V a, V b, V c, V d) noexcept { return vaddq_f64(vmulq_f64(a, b), vmulq_f64(c, d)); }
+    static V madd(V a, V b, V c) noexcept { return vaddq_f64(vmulq_f64(a, b), c); }
+    static V reverse(V v) noexcept { return vextq_f64(v, v, 1); }
+    static void loadDeinterleave(const double* p, V& re, V& im) noexcept
+    {
+        const float64x2x2_t v = vld2q_f64(p);
+        re = v.val[0]; im = v.val[1];
+    }
+    static void storeInterleave2(double* p, V re, V im) noexcept
+    {
+        float64x2x2_t v; v.val[0] = re; v.val[1] = im;
+        vst2q_f64(p, v);
+    }
+    static void storeInterleave4(double* p, V a, V b, V c, V d) noexcept
+    {
+        float64x2x4_t v; v.val[0] = a; v.val[1] = b; v.val[2] = c; v.val[3] = d;
+        vst4q_f64(p, v);
+    }
+};
+#else
+inline constexpr int kVecFloatNarrow = 1;
+inline constexpr int kVecDoubleNarrow = 1;
+#endif
+
+#if defined(DSPARK_SIMD_AVX)
+inline constexpr int kVecFloatWide = 8;
+inline constexpr int kVecDoubleWide = 4;
+
+template <>
+struct Vec<float, 8>
+{
+    using V = __m256;
+    static V load(const float* p) noexcept { return _mm256_loadu_ps(p); }
+    static void store(float* p, V v) noexcept { _mm256_storeu_ps(p, v); }
+    static V set1(float x) noexcept { return _mm256_set1_ps(x); }
+    static V add(V a, V b) noexcept { return _mm256_add_ps(a, b); }
+    static V sub(V a, V b) noexcept { return _mm256_sub_ps(a, b); }
+    static V mul(V a, V b) noexcept { return _mm256_mul_ps(a, b); }
+#if defined(DSPARK_SIMD_FMA)
+    static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_fmsub_ps(a, b, _mm256_mul_ps(c, d)); }
+    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_fmadd_ps(a, b, _mm256_mul_ps(c, d)); }
+    static V madd(V a, V b, V c) noexcept { return _mm256_fmadd_ps(a, b, c); }
+#else
+    static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_sub_ps(_mm256_mul_ps(a, b), _mm256_mul_ps(c, d)); }
+    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_add_ps(_mm256_mul_ps(a, b), _mm256_mul_ps(c, d)); }
+    static V madd(V a, V b, V c) noexcept { return _mm256_add_ps(_mm256_mul_ps(a, b), c); }
+#endif
+    static V reverse(V v) noexcept
+    {
+        const V swapped = _mm256_permute2f128_ps(v, v, 1);
+        return _mm256_permute_ps(swapped, _MM_SHUFFLE(0, 1, 2, 3));
+    }
+    static void loadDeinterleave(const float* p, V& re, V& im) noexcept
+    {
+        const V a = _mm256_loadu_ps(p), b = _mm256_loadu_ps(p + 8);
+        const V lo = _mm256_permute2f128_ps(a, b, 0x20);
+        const V hi = _mm256_permute2f128_ps(a, b, 0x31);
+        re = _mm256_shuffle_ps(lo, hi, _MM_SHUFFLE(2, 0, 2, 0));
+        im = _mm256_shuffle_ps(lo, hi, _MM_SHUFFLE(3, 1, 3, 1));
+    }
+    static void storeInterleave2(float* p, V re, V im) noexcept
+    {
+        const V lo = _mm256_unpacklo_ps(re, im);
+        const V hi = _mm256_unpackhi_ps(re, im);
+        _mm256_storeu_ps(p,     _mm256_permute2f128_ps(lo, hi, 0x20));
+        _mm256_storeu_ps(p + 8, _mm256_permute2f128_ps(lo, hi, 0x31));
+    }
+    static void storeInterleave4(float* p, V a, V b, V c, V d) noexcept
+    {
+        const V t0 = _mm256_unpacklo_ps(a, b), t1 = _mm256_unpackhi_ps(a, b);
+        const V t2 = _mm256_unpacklo_ps(c, d), t3 = _mm256_unpackhi_ps(c, d);
+        const V u0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
+        const V u1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
+        const V u2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
+        const V u3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
+        _mm256_storeu_ps(p,      _mm256_permute2f128_ps(u0, u1, 0x20));
+        _mm256_storeu_ps(p + 8,  _mm256_permute2f128_ps(u2, u3, 0x20));
+        _mm256_storeu_ps(p + 16, _mm256_permute2f128_ps(u0, u1, 0x31));
+        _mm256_storeu_ps(p + 24, _mm256_permute2f128_ps(u2, u3, 0x31));
+    }
+};
+
+template <>
+struct Vec<double, 4>
+{
+    using V = __m256d;
+    static V load(const double* p) noexcept { return _mm256_loadu_pd(p); }
+    static void store(double* p, V v) noexcept { _mm256_storeu_pd(p, v); }
+    static V set1(double x) noexcept { return _mm256_set1_pd(x); }
+    static V add(V a, V b) noexcept { return _mm256_add_pd(a, b); }
+    static V sub(V a, V b) noexcept { return _mm256_sub_pd(a, b); }
+    static V mul(V a, V b) noexcept { return _mm256_mul_pd(a, b); }
+#if defined(DSPARK_SIMD_FMA)
+    static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_fmsub_pd(a, b, _mm256_mul_pd(c, d)); }
+    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_fmadd_pd(a, b, _mm256_mul_pd(c, d)); }
+    static V madd(V a, V b, V c) noexcept { return _mm256_fmadd_pd(a, b, c); }
+#else
+    static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_sub_pd(_mm256_mul_pd(a, b), _mm256_mul_pd(c, d)); }
+    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_add_pd(_mm256_mul_pd(a, b), _mm256_mul_pd(c, d)); }
+    static V madd(V a, V b, V c) noexcept { return _mm256_add_pd(_mm256_mul_pd(a, b), c); }
+#endif
+    static V reverse(V v) noexcept
+    {
+        const V swapped = _mm256_permute2f128_pd(v, v, 1);
+        return _mm256_permute_pd(swapped, 0x5);
+    }
+    static void loadDeinterleave(const double* p, V& re, V& im) noexcept
+    {
+        const V a = _mm256_loadu_pd(p), b = _mm256_loadu_pd(p + 4);
+        const V lo = _mm256_permute2f128_pd(a, b, 0x20);
+        const V hi = _mm256_permute2f128_pd(a, b, 0x31);
+        re = _mm256_unpacklo_pd(lo, hi);
+        im = _mm256_unpackhi_pd(lo, hi);
+    }
+    static void storeInterleave2(double* p, V re, V im) noexcept
+    {
+        const V lo = _mm256_unpacklo_pd(re, im);
+        const V hi = _mm256_unpackhi_pd(re, im);
+        _mm256_storeu_pd(p,     _mm256_permute2f128_pd(lo, hi, 0x20));
+        _mm256_storeu_pd(p + 4, _mm256_permute2f128_pd(lo, hi, 0x31));
+    }
+    static void storeInterleave4(double* p, V a, V b, V c, V d) noexcept
+    {
+        const V t0 = _mm256_unpacklo_pd(a, b), t1 = _mm256_unpackhi_pd(a, b);
+        const V t2 = _mm256_unpacklo_pd(c, d), t3 = _mm256_unpackhi_pd(c, d);
+        _mm256_storeu_pd(p,      _mm256_permute2f128_pd(t0, t2, 0x20));
+        _mm256_storeu_pd(p + 4,  _mm256_permute2f128_pd(t1, t3, 0x20));
+        _mm256_storeu_pd(p + 8,  _mm256_permute2f128_pd(t0, t2, 0x31));
+        _mm256_storeu_pd(p + 12, _mm256_permute2f128_pd(t1, t3, 0x31));
+    }
+};
+#else
+inline constexpr int kVecFloatWide = kVecFloatNarrow;
+inline constexpr int kVecDoubleWide = kVecDoubleNarrow;
+#endif
+
+/// Widest vector width for T on this target (1 = scalar).
+template <typename T> inline constexpr int kVecWidth = std::is_same_v<T, float> ? kVecFloatWide : kVecDoubleWide;
+/// The next width down (the SSE2/NEON width in AVX builds).
+template <typename T> inline constexpr int kVecNarrowWidth = std::is_same_v<T, float> ? kVecFloatNarrow : kVecDoubleNarrow;
+
+/**
+ * @brief Block FIR as a valid correlation: y[i] = gain * sum_j h[j] * x[i + j]
+ *        for i in [0, n), reading x[0 .. n + taps - 1).
+ *
+ * Register-blocked over outputs (four vectors at a time, the taps in the
+ * inner loop), so no output pays a horizontal sum: for the 16..256-tap
+ * kernels of oversamplers and resamplers it runs several times faster than
+ * one dotProduct() per output. y must not overlap x or h.
+ *
+ * @param x     Input, n + taps - 1 samples.
+ * @param h     Kernel, taps coefficients (h[0] meets x[i]).
+ * @param taps  Kernel length.
+ * @param y     Output, n samples.
+ * @param n     Number of outputs.
+ * @param gain  Scale applied to every output.
+ */
+template <typename T>
+void firCorrelate(const T* x, const T* h, int taps, T* DSPARK_RESTRICT y, int n, T gain) noexcept
+{
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
+    constexpr int W = kVecWidth<T>;
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    const V g = O::set1(gain);
+    int i = 0;
+    for (; i + 4 * W <= n; i += 4 * W)
+    {
+        V a0 = O::set1(T(0)), a1 = a0, a2 = a0, a3 = a0;
+        const T* xp = x + i;
+        for (int j = 0; j < taps; ++j)
+        {
+            const V hj = O::set1(h[j]);
+            a0 = O::madd(hj, O::load(xp + j), a0);
+            a1 = O::madd(hj, O::load(xp + j + W), a1);
+            a2 = O::madd(hj, O::load(xp + j + 2 * W), a2);
+            a3 = O::madd(hj, O::load(xp + j + 3 * W), a3);
+        }
+        O::store(y + i, O::mul(a0, g));
+        O::store(y + i + W, O::mul(a1, g));
+        O::store(y + i + 2 * W, O::mul(a2, g));
+        O::store(y + i + 3 * W, O::mul(a3, g));
+    }
+    for (; i + W <= n; i += W)
+    {
+        V a = O::set1(T(0));
+        for (int j = 0; j < taps; ++j)
+            a = O::madd(O::set1(h[j]), O::load(x + i + j), a);
+        O::store(y + i, O::mul(a, g));
+    }
+    for (; i < n; ++i)
+    {
+        T a = T(0);
+        for (int j = 0; j < taps; ++j)
+            a += h[j] * x[i + j];
+        y[i] = a * gain;
+    }
+}
+
 } // namespace simd
 } // namespace dspark

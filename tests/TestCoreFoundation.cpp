@@ -796,6 +796,42 @@ DSPARK_TEST(SimdOps_reductions_match_scalar)
     }
 }
 
+// firCorrelate is register-blocked (four vectors of outputs per pass) with a
+// single-vector and a scalar tail: every output count and kernel length must
+// match the direct sum, in float and double, on every SIMD width.
+template <typename T>
+static void checkFirCorrelate(double tolerance)
+{
+    unsigned int rng = 7u;
+    auto uniform = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<T>(static_cast<double>(rng >> 8) / 8388608.0 - 1.0);
+    };
+    for (int taps : { 1, 3, 16, 33, 128 })
+        for (int n : { 0, 1, 5, 8, 31, 32, 33, 67, 200 })
+        {
+            std::vector<T> x(static_cast<size_t>(n + taps)), h(static_cast<size_t>(taps));
+            for (auto& v : x) v = uniform();
+            for (auto& v : h) v = uniform();
+            std::vector<T> y(static_cast<size_t>(n) + 1, T(-7));
+            simd::firCorrelate(x.data(), h.data(), taps, y.data(), n, T(0.5));
+            for (int i = 0; i < n; ++i)
+            {
+                double want = 0.0;
+                for (int j = 0; j < taps; ++j)
+                    want += static_cast<double>(h[static_cast<size_t>(j)]) * x[static_cast<size_t>(i + j)];
+                EXPECT_NEAR(static_cast<double>(y[static_cast<size_t>(i)]), 0.5 * want, tolerance * taps);
+            }
+            EXPECT_EQ(y[static_cast<size_t>(n)], T(-7));   // nothing written past n
+        }
+}
+
+DSPARK_TEST(SimdOps_fir_correlate_matches_the_direct_sum)
+{
+    checkFirCorrelate<float>(1e-6);
+    checkFirCorrelate<double>(1e-14);
+}
+
 DSPARK_TEST(SimdOps_peak_level_ignores_nan)
 {
     const float  nanF = std::numeric_limits<float>::quiet_NaN();

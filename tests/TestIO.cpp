@@ -1273,6 +1273,73 @@ DSPARK_TEST(Mp3File_encoder_output_decodes_back_to_its_input)
     EXPECT_GT(best, 0.70);   // pre-fix this measured 0.008 - 0.024
 }
 
+// part2_3_length is a 12-bit field, but the encoder let a mono granule use the
+// frame's whole budget: 4096 bits at 320 kbps / 44.1 kHz, and more at 32 kHz.
+// 4096 wrapped to 0 and the decoder dropped that granule and the rest of its
+// frame: dense material came back with whole frames missing (0 dB residual
+// where the other frames sat near -38 dB).
+DSPARK_TEST(Mp3File_mono_high_bitrate_granules_fit_their_12_bit_length)
+{
+    for (const double rate : { 44100.0, 32000.0 })
+    {
+        FileCleanup cleanup { "dspark_test_mono320.mp3" };
+        const int N = static_cast<int>(rate);   // 1 s
+        std::vector<float> orig(static_cast<size_t>(N));
+        uint32_t rng = 1u;
+        for (auto& v : orig)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            v = 0.2f * (static_cast<float>(rng >> 8) / 8388608.0f - 1.0f);
+        }
+        {
+            Mp3File w;
+            AudioFileInfo info;
+            info.sampleRate = rate;
+            info.numChannels = 1;
+            info.bitsPerSample = 320;
+            info.numSamples = N;
+            EXPECT_TRUE(w.openWrite("dspark_test_mono320.mp3", info));
+            AudioBuffer<float> buf;
+            buf.resize(1, N);
+            std::copy(orig.begin(), orig.end(), buf.getChannel(0));
+            EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+            w.close();
+        }
+        Mp3File r;
+        EXPECT_TRUE(r.openRead("dspark_test_mono320.mp3"));
+        const int n = static_cast<int>(r.getInfo().numSamples);
+        AudioBuffer<float> dec;
+        dec.resize(1, n);
+        EXPECT_TRUE(r.readSamples(dec.toView()));
+        r.close();
+        const float* d = dec.getChannel(0);
+
+        int lag = 0;
+        double best = -1.0;
+        for (int l = 0; l <= 2400; ++l)
+        {
+            double sab = 0.0;
+            for (int i = 4000; i < 12000 && i + l < n; ++i)
+                sab += static_cast<double>(orig[static_cast<size_t>(i)]) * d[i + l];
+            if (sab > best) { best = sab; lag = l; }
+        }
+        double worstDb = -300.0;
+        for (int b = 1; (b + 2) * 1152 < N && (b + 1) * 1152 + lag <= n; ++b)
+        {
+            double e = 0.0, ref = 0.0;
+            for (int i = b * 1152; i < (b + 1) * 1152; ++i)
+            {
+                const double x = orig[static_cast<size_t>(i)];
+                const double y = d[i + lag];
+                e += (y - x) * (y - x);
+                ref += x * x;
+            }
+            worstDb = std::max(worstDb, 10.0 * std::log10(e / ref));
+        }
+        EXPECT_LT(worstDb, -20.0);   // old: 0 dB in the frames that hit 4096 bits
+    }
+}
+
 // 8-bit WAV is unsigned with 128 as zero and the reader scales by 128, but the
 // writer scaled by 127. Every 8-bit round trip therefore came back 0.78% quiet
 // - a whole quantisation step of SYSTEMATIC error, on top of quantisation. With

@@ -228,6 +228,7 @@ private:
     static constexpr int kSubbands     = 32;
     static constexpr int kSynthSlots   = 16;
     static constexpr int kMaxReservoir = 8192; // Bit reservoir maximum bytes
+    static constexpr int kMaxPart23Bits = 4095; // part2_3_length is 12 bits
 
     // ========================================================================
     // Frame header & Side Info Structs
@@ -2362,7 +2363,11 @@ private:
                 gc.block_type = 0; gc.window_switching = false; gc.mixed_block = 0;
                 gc.preflag = 0; gc.scalefac_scale = 0; gc.scalefac_compress = 0;
 
-                int targetBits = bitsPerGranule / nch;
+                // part2_3_length is a 12-bit field: a granule of 4096 bits or
+                // more wrapped it (4096 wrote 0), and the decoder lost that
+                // granule and every one after it in the frame. Mono at 320
+                // kbps (and at 256 kbps and up at 32 kHz) reached it.
+                int targetBits = std::min(bitsPerGranule / nch, kMaxPart23Bits);
                 int lo = 0, hi = 255, bestGain = 210, bestBits = 999999;
 
                 // Both conditions below fall the same way as the gain rises -- a

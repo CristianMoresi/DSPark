@@ -424,6 +424,46 @@ DSPARK_TEST(Crossfade_glides_at_constant_power_with_smooth_ends)
 // Panner
 // ============================================================================
 
+DSPARK_TEST(Panner_spectral_follows_the_smoothed_pan_and_prepare_starts_settled)
+{
+    // The Spectral shelves jumped to the pan TARGET once per block, ignoring
+    // the 50 ms pan smoothing (a zipper on automation). And prepare() started
+    // the pan smoother at 0, so a preset panned hard right faded in from the
+    // centre.
+    Panner<float> sp;
+    sp.setAlgorithm(Panner<float>::Algorithm::Spectral);
+    sp.prepare(spec(48000.0, 32, 2));
+    const int total = 12000, jump = 4800;
+    std::vector<float> l(static_cast<size_t>(total)), r(static_cast<size_t>(total));
+    for (int i = 0; i < total; ++i)
+        l[static_cast<size_t>(i)] = r[static_cast<size_t>(i)]
+            = 0.5f * std::sin(6.2831853f * 12000.0f * static_cast<float>(i) / 48000.0f + 0.3f);
+    for (int off = 0; off < total; off += 32)
+    {
+        if (off == jump) sp.setPan(1.0f);
+        float* p[2] = { l.data() + off, r.data() + off };
+        sp.processBlock(AudioBufferView<float>(p, 2, 32));
+    }
+    auto rms = [&](int from) {
+        double s = 0.0;
+        for (int i = from; i < from + 64; ++i)
+            s += static_cast<double>(l[static_cast<size_t>(i)]) * l[static_cast<size_t>(i)];
+        return std::sqrt(s / 64.0);
+    };
+    const double before = rms(jump - 128);
+    EXPECT_GT(rms(jump + 32) / before, 0.95);   // old: the whole -6 dB cut in one block
+    EXPECT_LT(rms(jump + 4800) / before, 0.6);  // the cut arrives after the glide
+
+    Panner<float> ep;
+    ep.setPan(1.0f);
+    ep.prepare(spec(48000.0, 32, 2));
+    std::vector<float> a(32, 1.0f), b(32, 1.0f);
+    float* q[2] = { a.data(), b.data() };
+    ep.processBlock(AudioBufferView<float>(q, 2, 32));
+    EXPECT_NEAR(a[0], 0.0f, 1e-6f);             // hard right from the first sample
+    EXPECT_NEAR(b[0], 1.0f, 1e-6f);             // (old: 0.707 each, at the centre)
+}
+
 DSPARK_TEST(Panner_invalid_inputs_are_ignored)
 {
     // NaN setters used to poison the engine in two ways: setPan(NaN) parked

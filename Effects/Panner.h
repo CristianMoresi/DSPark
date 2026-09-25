@@ -41,6 +41,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace dspark {
@@ -72,7 +73,10 @@ public:
     {
         if (!spec.isValid()) return;
         sampleRate_ = spec.sampleRate;
-        panSmoother_.reset(sampleRate_, smoothingTime_.load(std::memory_order_relaxed));
+        // Start settled on the configured pan: from 0 a preset panned hard
+        // right faded in from the centre over the smoothing time.
+        panSmoother_.reset(sampleRate_, smoothingTime_.load(std::memory_order_relaxed),
+                           static_cast<float>(pan_.load(std::memory_order_relaxed)));
 
         float maxMs = std::max(binauralMaxITD_.load(std::memory_order_relaxed),
                                haasMaxDelay_.load(std::memory_order_relaxed));
@@ -88,7 +92,8 @@ public:
         delayL_.setSmoothingTime(smoothingTime_);
         delayR_.setSmoothingTime(smoothingTime_);
 
-        updateSpectralFilters(T(0));
+        spectralPan_ = std::numeric_limits<float>::quiet_NaN();   // new rate: rebuild
+        updateSpectralFilters(static_cast<T>(panSmoother_.getCurrentValue()));
     }
 
     /**
@@ -412,23 +417,29 @@ protected:
         }
     }
 
-    void applySpectral(AudioBufferView<T> buffer, float panTarget) noexcept
+    void applySpectral(AudioBufferView<T> buffer, float /*panTarget*/) noexcept
     {
-        // Recompute high-shelf coefficients based on the current pan target
-        // (cheap, once per block - the trig math is hoisted out of the inner
-        // loop). Biquad::processSample picks up the new coefficients on the
-        // first sample via its lock-free fast path, so no extra sync needed.
-        updateSpectralFilters(static_cast<T>(panTarget));
-
+        // The shelves follow the SMOOTHED pan, re-designed every 16 samples
+        // while it moves (they used to jump to the target once per block: a
+        // zipper on automation). Settled, the cached design is reused.
         T* L = buffer.getChannel(0);
         T* R = buffer.getChannel(1);
         const int n = buffer.getNumSamples();
+        constexpr int kSubBlock = 16;
 
-        for (int i = 0; i < n; ++i)
+        for (int start = 0; start < n; start += kSubBlock)
         {
-            (void)panSmoother_.getNextValue();  // keep smoother in step
-            L[i] = spectralL_.processSample(L[i], 0);
-            R[i] = spectralR_.processSample(R[i], 0);
+            const int end = std::min(n, start + kSubBlock);
+            float p = panSmoother_.getCurrentValue();
+            for (int i = start; i < end; ++i)
+                p = panSmoother_.getNextValue();
+            updateSpectralFilters(static_cast<T>(p));
+
+            for (int i = start; i < end; ++i)
+            {
+                L[i] = spectralL_.processSample(L[i], 0);
+                R[i] = spectralR_.processSample(R[i], 0);
+            }
         }
     }
 
@@ -436,6 +447,12 @@ protected:
     {
         float sMaxGain = spectralMaxGain_.load(std::memory_order_relaxed);
         float sFreq    = spectralFreq_.load(std::memory_order_relaxed);
+        const float pan = static_cast<float>(targetPan);
+        if (pan == spectralPan_ && sFreq == spectralFreqUsed_ && sMaxGain == spectralGainUsed_)
+            return;   // design unchanged
+        spectralPan_ = pan;
+        spectralFreqUsed_ = sFreq;
+        spectralGainUsed_ = sMaxGain;
 
         T gainLdB = -targetPan * static_cast<T>(sMaxGain);
         T gainRdB =  targetPan * static_cast<T>(sMaxGain);
@@ -460,6 +477,11 @@ protected:
     std::atomic<float> haasMaxDelay_    { 30.0f };
     std::atomic<float> spectralFreq_    { 4000.0f };
     std::atomic<float> spectralMaxGain_ { 6.0f };
+
+    // Settings of the current shelf design (audio thread; NaN forces a rebuild).
+    float spectralPan_      = std::numeric_limits<float>::quiet_NaN();
+    float spectralFreqUsed_ = 0.0f;
+    float spectralGainUsed_ = 0.0f;
 };
 
 } // namespace dspark

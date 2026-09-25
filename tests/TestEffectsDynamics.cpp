@@ -384,10 +384,15 @@ DSPARK_TEST(Limiter_block_matches_per_sample)
 
     auto blockOut = makeBuffer(1, n);
     std::copy(in.ch(0), in.ch(0) + n, blockOut.ch(0));
-    for (int off = 0; off < n; off += 512)
+    // Uneven block sizes, so processBlock()'s internal chunking sees full,
+    // partial and single-sample chunks.
+    const int sizes[] = { 512, 37, 300, 1, 129, 700 };
+    for (int off = 0, k = 0; off < n; ++k)
     {
+        const int len = std::min(sizes[k % 6], n - off);
         float* p[1] = { blockOut.ch(0) + off };
-        lb.processBlock(AudioBufferView<float>(p, 1, 512));
+        lb.processBlock(AudioBufferView<float>(p, 1, len));
+        off += len;
     }
 
     float maxDiff = 0.0f;
@@ -421,6 +426,78 @@ DSPARK_TEST(Limiter_prepare_preserves_lookahead)
     lim.prepare(44100.0, 2, 3.0);              // explicit override still works
     EXPECT_EQ(lim.getLatency(), 132);          // 3 ms @ 44.1 kHz
     EXPECT_NEAR(lim.getLookahead(), 3.0f, 1e-6f);
+}
+
+namespace {
+
+// Runs a mono -1 dB Limiter<double> one sample per block and counts the
+// samples whose delayed input times the applied gain exceeds the ceiling:
+// the samples the final clamp has to hard-clip because the gain computer
+// did not turn them down in time.
+int limiterClampHits(const std::vector<double>& x, double releaseMs, bool truePeak)
+{
+    Limiter<double> lim;
+    lim.setCeiling(-1.0);
+    lim.prepare(48000.0, 1);
+    lim.setRelease(releaseMs);
+    lim.setTruePeak(truePeak);
+    const double ceiling = decibelsToGain(-1.0);
+    const size_t latency = static_cast<size_t>(lim.getLatency());
+    int hits = 0;
+    for (size_t n = 0; n < x.size(); ++n)
+    {
+        double s = x[n];
+        double* p[1] = { &s };
+        lim.processBlock(AudioBufferView<double>(p, 1, 1));
+        const double gain = decibelsToGain(lim.getGainReductionDb());
+        if (n >= latency && std::abs(x[n - latency]) * gain > ceiling * (1.0 + 1e-9))
+            ++hits;
+    }
+    return hits;
+}
+
+} // namespace
+
+DSPARK_TEST(Limiter_close_peaks_with_fast_release_are_never_hard_clipped)
+{
+    // The old gain computer held a peak for the lookahead and then released,
+    // so a second peak inside the release met a gain that had already
+    // recovered (measured: 1 ms release, a peak reached 1.64x the ceiling
+    // before the clamp flattened it). The sliding minimum plus the
+    // S-curve ramp now turns every peak down before it reaches the output.
+    std::vector<double> x(4000);
+    for (size_t n = 0; n < x.size(); ++n)
+        x[n] = 0.5 * std::sin(2.0 * 3.14159265358979 * 1000.0 * static_cast<double>(n) / 48000.0);
+    x[1000] = 2.0;
+    x[1090] = 1.6;
+
+    for (double releaseMs : { 1.0, 5.0, 50.0 })
+        for (bool truePeak : { false, true })
+            EXPECT_EQ(limiterClampHits(x, releaseMs, truePeak), 0);
+}
+
+DSPARK_TEST(Limiter_dense_material_is_never_hard_clipped)
+{
+    // Drum-like material: noise bursts every 3000 samples over a noise bed.
+    // The old design left the clamp to hard-clip 195 samples at 1 ms release
+    // (up to 1.20x the ceiling) and 17 at 50 ms; the gain computer now meets
+    // the ceiling by itself, with and without true-peak detection.
+    std::vector<double> x(48000);
+    uint32_t state = 0x12345678u;
+    auto noise = [&state] {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        return static_cast<double>(state) / 2147483648.0 - 1.0;
+    };
+    for (size_t n = 0; n < x.size(); ++n)
+    {
+        const double phase = static_cast<double>(n % 3000);
+        const double env = std::exp(-phase / 400.0) * (1.5 + 0.8 * std::sin(static_cast<double>(n) * 0.0007));
+        x[n] = 0.3 * noise() + 1.4 * env * noise();
+    }
+
+    for (double releaseMs : { 1.0, 5.0, 50.0 })
+        for (bool truePeak : { false, true })
+            EXPECT_EQ(limiterClampHits(x, releaseMs, truePeak), 0);
 }
 
 // ============================================================================

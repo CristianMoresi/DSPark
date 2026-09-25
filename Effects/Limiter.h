@@ -9,13 +9,19 @@
  *        and adaptive release for mastering.
  *
  * A peak limiter that prevents audio from exceeding a configurable ceiling.
- * It uses a lookahead delay line with a peak hold over the lookahead window
- * and a smoothed attack envelope, so transients are turned down transparently
+ * The gain computer is the modern lookahead design: the gain each sample
+ * requires (ceiling / peak) enters an exact sliding-window minimum spanning
+ * the lookahead, a one-pole release lets the gain recover, and two cascaded
+ * moving averages turn every reduction into an S-shaped ramp that completes
+ * exactly when the peak reaches the (delayed) output. Because the averaged
+ * window only ever contains gains at or below each peak's requirement, the
+ * ceiling is met by construction: transients are turned down smoothly
  * instead of being clipped. Optional ISP (Inter-Sample Peak) detection feeds
- * the sidechain with the ITU-R BS.1770 4x oversampled true-peak estimate,
- * which greatly reduces inter-sample overs. The exact brickwall guarantee is
- * in the sample domain (a final clamp at the ceiling); true-peak levels after
- * that clamp are reduced but not mathematically bounded.
+ * the sidechain with the ITU-R BS.1770 4x oversampled true-peak estimate and
+ * shortens the ramp so the reduction covers every sample that estimate is
+ * formed from. A final clamp at the ceiling remains as a rounding backstop
+ * (and covers live ceiling or lookahead changes); true-peak levels are
+ * reduced but not mathematically bounded.
  *
  * @note This class is strictly real-time safe. It performs zero allocations
  *       in the audio thread. The maximum lookahead time dictates the memory
@@ -24,7 +30,7 @@
  * Features:
  * - Brickwall limiting (sample peaks never exceed the ceiling)
  * - ISP true-peak detection (4x oversampled FIR sidechain)
- * - Lookahead peak hold + smoothed attack curve (artifact-free transients)
+ * - Sliding-minimum gain hold + S-curve attack (artifact-free transients)
  * - CPU-optimized adaptive release (avoids std::exp in hot paths)
  * - Real-time safe parameter updates (lock-free atomics)
  *
@@ -57,6 +63,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+
+// Keeps the gain computer's rare paths (once per hold block, once per 2^16
+// frames) out of the per-sample loop, so the hot part inlines. Guarded the same
+// way as in Core/Biquad.h.
+#ifndef DSPARK_NOINLINE
+  #if defined(_MSC_VER)
+    #define DSPARK_NOINLINE __declspec(noinline)
+  #elif defined(__GNUC__) || defined(__clang__)
+    #define DSPARK_NOINLINE __attribute__((noinline))
+  #else
+    #define DSPARK_NOINLINE
+  #endif
+#endif
 
 namespace dspark {
 
@@ -114,7 +133,18 @@ public:
         // make processBlock index delayLines_ out of bounds) nor over-allocate.
         delayLines_.resize(static_cast<size_t>(numChannels_));
         for (auto& dl : delayLines_)
-            dl.prepare(maxLookaheadSamples * 2); // Double size for safety margin
+            dl.prepare(maxLookaheadSamples * 2 + kChunk); // lookahead glide + one processBlock() chunk
+
+        // Gain-computer histories: power-of-two rings covering the longest
+        // hold window (L + 1) plus the moving-average lookback.
+        int hist = 4;
+        while (hist < maxLookaheadSamples + 4) hist <<= 1;
+        histSize_ = hist;
+        histMask_ = hist - 1;
+        eHist_.assign(static_cast<size_t>(hist), 1.0);
+        avgHist_.assign(static_cast<size_t>(hist), 1.0);
+        rHist_.assign(static_cast<size_t>(hist), 1.0);
+        sufMin_.assign(static_cast<size_t>(hist) + 1, 1.0);
 
         if (std::isfinite(initialLookaheadMs) && initialLookaheadMs > 0.0)
             lookaheadMs_.store(std::clamp(static_cast<T>(initialLookaheadMs),
@@ -186,62 +216,69 @@ public:
         for (int ch = 0; ch < nCh; ++ch)
             chData[ch] = buffer.getChannel(ch);
 
-        for (int i = 0; i < nS; ++i)
+        // Three passes per chunk: detection (the true-peak FIR, throughput
+        // bound), the serial gain computer (latency bound) and the gain
+        // application. Kept apart, the out-of-order core no longer stalls the
+        // FIR work behind the gain recursion. The per-sample arithmetic is
+        // unchanged, so processSample() stays bit-identical for mono.
+        for (int start = 0; start < nS; start += kChunk)
         {
-            T ceiling = ceilingSmooth_.getNextValue();
-            T peak = T(0);
+            const int n = std::min(kChunk, nS - start);
 
-            // Live-change smoothing of the lookahead read offset: at most one
-            // sample of change per sample, so a setLookahead() during playback
-            // glides (brief micro pitch-shift) instead of clicking.
-            if (lookaheadCurrent_ < lookTarget)      lookaheadCurrent_ += T(1);
-            else if (lookaheadCurrent_ > lookTarget) lookaheadCurrent_ -= T(1);
-            const int lookNow = static_cast<int>(lookaheadCurrent_);
-
-            // Phase 1: Peak detection and delay line push
+            // Pass 1: linked peak detection (loudest channel per frame).
+            std::fill(chunkPeak_, chunkPeak_ + n, T(0));
             for (int ch = 0; ch < nCh; ++ch)
             {
-                T sample = chData[ch][i];
-                delayLines_[ch].push(sample);
-
-                T chPeak = isp ? truePeak_.processSample(sample, ch) : std::abs(sample);
-                if (chPeak > peak) peak = chPeak;
+                const T* x = chData[ch] + start;
+                for (int i = 0; i < n; ++i)
+                {
+                    const T chPeak = isp ? truePeak_.processSample(x[i], ch) : std::abs(x[i]);
+                    chunkPeak_[i] = std::max(chunkPeak_[i], chPeak); // NaN is ignored
+                }
             }
 
-            // Phase 2: Peak-hold over the lookahead window, then gain envelope.
-            // The gain reduction for a transient must persist until that transient
-            // reaches the (delayed) output lookaheadSamples_ later; otherwise an
-            // isolated peak would be output after the envelope has already released
-            // and could exceed the ceiling. Holding the detected peak for the
-            // look-ahead duration guarantees the brickwall without an instantaneous
-            // (clicky) attack; the one-pole attack still reaches ~99% over the window.
-            if (peak >= heldPeak_)      { heldPeak_ = peak; peakHoldCounter_ = lookaheadSamples_; }
-            else if (peakHoldCounter_ > 0) { --peakHoldCounter_; }
-            else                          { heldPeak_ = peak; }
+            // Pass 2: ceiling smoother, lookahead glide and gain computer.
+            for (int i = 0; i < n; ++i)
+            {
+                const T ceiling = ceilingSmooth_.getNextValue();
+                chunkCeiling_[i] = ceiling;
 
-            T targetGain = (heldPeak_ > ceiling) ? ceiling / heldPeak_ : T(1);
-            smoothGain(targetGain, adaptive, relMs);
+                // Live-change smoothing of the lookahead read offset: at most
+                // one sample of change per sample, so a setLookahead() during
+                // playback glides (brief micro pitch-shift) instead of clicking.
+                if (lookaheadCurrent_ < lookTarget)      lookaheadCurrent_ += T(1);
+                else if (lookaheadCurrent_ > lookTarget) lookaheadCurrent_ -= T(1);
+                chunkLook_[i] = static_cast<int>(lookaheadCurrent_);
 
-            // Phase 3: Apply gain, guarantee the ceiling, optional safety clip
+                advanceGain(chunkPeak_[i], ceiling, adaptive, relMs);
+                chunkGain_[i] = currentGain_;
+            }
+
+            // Pass 3: delay, apply the gain, optional safety clip.
             for (int ch = 0; ch < nCh; ++ch)
             {
-                T out = delayLines_[ch].read(lookNow) * currentGain_;
-
-                // Hard ceiling guarantee: the smoothed attack converges to
-                // ~99% of the target inside the lookahead window, leaving up
-                // to ~0.09 dB of residual overshoot. Clamping that residual is
-                // inaudible (it only ever trims the last 1%) and makes the
-                // brickwall contract exact.
-                out = std::clamp(out, -ceiling, ceiling);
-
-                if (safetyClip)
+                T* x = chData[ch] + start;
+                auto& line = delayLines_[static_cast<size_t>(ch)];
+                line.pushBlock(x, n); // frame i now sits (n - 1 - i) samples back
+                for (int i = 0; i < n; ++i)
                 {
-                    T clipCeil = std::min(kSafetyClipCeiling, ceiling);
-                    if (std::abs(out) > clipCeil)
-                        out = applySafetyClipper(out, clipCeil);
-                }
+                    const T ceiling = chunkCeiling_[i];
+                    T out = line.read(chunkLook_[i] + (n - 1 - i)) * chunkGain_[i];
 
-                chData[ch][i] = out;
+                    // Rounding backstop: the gain computer already meets the
+                    // ceiling; the clamp only trims float rounding and the
+                    // brief transition after a live ceiling or lookahead change.
+                    out = std::clamp(out, -ceiling, ceiling);
+
+                    if (safetyClip)
+                    {
+                        const T clipCeil = std::min(kSafetyClipCeiling, ceiling);
+                        if (std::abs(out) > clipCeil)
+                            out = applySafetyClipper(out, clipCeil);
+                    }
+
+                    x[i] = out;
+                }
             }
         }
 
@@ -252,12 +289,12 @@ public:
     /**
      * @brief Processes a single sample of one channel.
      *
-     * The shared state (ceiling smoother, lookahead glide, peak hold decay and
-     * gain envelope) advances on channel 0, so call channel 0 first within
-     * each sample frame. For mono streams (channel 0 only) this path is
-     * bit-identical to processBlock(). Any channel's peak can raise the
-     * shared peak hold, but only channel 0 detects into the envelope; for
-     * properly linked multi-channel limiting prefer processBlock().
+     * The shared state (ceiling smoother, lookahead glide and gain computer)
+     * advances on channel 0, so call channel 0 first within each sample
+     * frame. For mono streams (channel 0 only) this path is bit-identical to
+     * processBlock(). Peaks of the other channels enter the gain computer one
+     * frame late; for properly linked multi-channel limiting prefer
+     * processBlock().
      *
      * @note No DenormalGuard here (per-sample hot path); per-sample callers
      *       are expected to guard their own processing loop.
@@ -290,21 +327,20 @@ public:
         delayLines_[channel].push(input);
         const T chPeak = isp ? truePeak_.processSample(input, channel) : std::abs(input);
 
-        // Shared peak hold: any channel may raise it; the per-frame decay and
-        // the gain envelope advance on channel 0 only.
-        if (chPeak >= heldPeak_)      { heldPeak_ = chPeak; peakHoldCounter_ = lookaheadSamples_; }
-        else if (channel == 0)
-        {
-            if (peakHoldCounter_ > 0) --peakHoldCounter_;
-            else                      heldPeak_ = chPeak;
-        }
-
+        // The gain computer advances on channel 0. Peaks of the other channels
+        // reach it on the next frame (they are processed after channel 0), so
+        // they are one sample late: prefer processBlock() for linked
+        // multi-channel limiting. Mono is bit-identical to processBlock().
         if (channel == 0)
         {
             const T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
-            const T targetGain = (heldPeak_ > ceiling) ? ceiling / heldPeak_ : T(1);
-            smoothGain(targetGain, adaptive, relMs);
+            advanceGain(std::max(chPeak, pendingPeak_), ceiling, adaptive, relMs);
+            pendingPeak_ = T(0);
             publishedGain_.store(currentGain_, std::memory_order_relaxed);
+        }
+        else if (chPeak > pendingPeak_)
+        {
+            pendingPeak_ = chPeak;
         }
 
         T out = delayLines_[channel].read(sampleLookNow_) * currentGain_;
@@ -327,8 +363,8 @@ public:
         currentGain_ = T(1);
         publishedGain_.store(T(1), std::memory_order_relaxed);
         limitingDuration_ = 0;
-        heldPeak_ = T(0);
-        peakHoldCounter_ = 0;
+        pendingPeak_ = T(0);
+        resetGainComputer();
         lookaheadCurrent_ = static_cast<T>(lookaheadSamples_);
         ceilingSmooth_.skip();
         sampleCeiling_ = ceilingSmooth_.getCurrentValue();
@@ -381,8 +417,14 @@ public:
 
     // -- Level 3: Expert API ----------------------------------------------------
 
-    /** @brief Enables 4x oversampled ISP true-peak detection. RT-Safe. */
-    void setTruePeak(bool enabled) noexcept { truePeakEnabled_.store(enabled, std::memory_order_relaxed); }
+    /** @brief Enables 4x oversampled ISP true-peak detection. RT-Safe.
+     *  The attack ramp shortens by the estimator's support (11 samples) so the
+     *  reduction covers every sample a true-peak reading is formed from. */
+    void setTruePeak(bool enabled) noexcept
+    {
+        truePeakEnabled_.store(enabled, std::memory_order_relaxed);
+        lookaheadDirty_.store(true, std::memory_order_release);
+    }
 
     /** @brief Enables program-dependent adaptive release. RT-Safe. */
     void setAdaptiveRelease(bool enabled) noexcept { adaptiveRelease_.store(enabled, std::memory_order_relaxed); }
@@ -476,11 +518,143 @@ protected:
     inline void applyLookaheadTarget() noexcept
     {
         lookaheadSamples_ = lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
+        configureGainComputer();
+    }
 
-        // Calculate an attack coefficient that guarantees reaching 99% of target gain
-        // exactly within the lookahead window to prevent transient clipping.
-        // Formula: alpha = 1 - exp(-ln(100) / samples)
-        attackCoeff_ = T(1) - std::exp(T(-4.60517) / static_cast<T>(lookaheadSamples_));
+    // ---- Gain computer ------------------------------------------------------
+    //
+    // r[n] = min(1, ceiling / peak[n]) is the gain sample n requires. With a
+    // lookahead of L samples the audio sample x[p] leaves the delay line at
+    // p + L, and the applied gain there is the double moving average of the
+    // released envelope e over [p + L - span, p + L]. e never exceeds the
+    // sliding minimum h[n] = min(r[n - L .. n]), so every e in that window is
+    // at or below r[p] whenever span <= L: the ceiling holds by construction.
+    // In ISP mode a true-peak reading at n is formed from x[n - 11 .. n], so
+    // the span shrinks by 11 samples to cover the earliest of them.
+
+    /** Sizes the hold window and the two moving averages for the current
+     *  lookahead / ISP mode and rebuilds their running sums from history. */
+    void configureGainComputer() noexcept
+    {
+        if (histSize_ == 0) return;
+        const int L = std::clamp(lookaheadSamples_, 1, histSize_ - 3);
+        const int isp = truePeakEnabled_.load(std::memory_order_relaxed)
+                      ? TruePeakDetector<T, kMaxChannels>::getTaps() - 1 : 0;
+        const int span = std::max(0, L - isp);          // (a - 1) + (b - 1)
+        holdLen_ = L + 1;
+        boxA_ = span / 2 + 1;
+        boxB_ = span - (boxA_ - 1) + 1;
+        invBoxA_ = 1.0 / static_cast<double>(boxA_);
+        invBoxB_ = 1.0 / static_cast<double>(boxB_);
+
+        // Rebuild the running sums and the hold from the stored history
+        // (O(L), only on a configuration change), so the new windows are
+        // exact from the next frame on.
+        resumBoxes();
+        restartHoldBlock(frame_ - holdLen_);
+    }
+
+    /** Recomputes both moving-average sums exactly from their histories. */
+    DSPARK_NOINLINE void resumBoxes() noexcept
+    {
+        sum1_ = 0.0;
+        for (int k = 0; k < boxA_; ++k)
+            sum1_ += eHist_[static_cast<size_t>((frame_ - 1 - k) & histMask_)];
+        sum2_ = 0.0;
+        for (int k = 0; k < boxB_; ++k)
+            sum2_ += avgHist_[static_cast<size_t>((frame_ - 1 - k) & histMask_)];
+    }
+
+    /** Sliding minimum (van Herk / Gil-Werman, streaming form): the frames are
+     *  cut into blocks of holdLen_. Once a block is complete its suffix minima
+     *  are stored; the window ending at a frame of the next block is then the
+     *  minimum of one stored suffix and the running prefix of that block.
+     *  Branch-free per frame, one backward pass per block (amortised O(1)).
+     *  This stores the suffix minima of the block starting at firstFrame and
+     *  starts a new block at the following frame. */
+    DSPARK_NOINLINE void restartHoldBlock(int64_t firstFrame) noexcept
+    {
+        double m = 1.0;
+        sufMin_[static_cast<size_t>(holdLen_)] = 1.0; // empty suffix
+        for (int j = holdLen_ - 1; j >= 0; --j)
+        {
+            m = std::min(m, rHist_[static_cast<size_t>((firstFrame + j) & histMask_)]);
+            sufMin_[static_cast<size_t>(j)] = m;
+        }
+        blockPos_ = 0;
+        prefixMin_ = 1.0;
+    }
+
+    /** Clears the gain computer to unity gain (history included). */
+    void resetGainComputer() noexcept
+    {
+        std::fill(eHist_.begin(), eHist_.end(), 1.0);
+        std::fill(avgHist_.begin(), avgHist_.end(), 1.0);
+        std::fill(rHist_.begin(), rHist_.end(), 1.0);
+        std::fill(sufMin_.begin(), sufMin_.end(), 1.0);
+        blockPos_ = 0;
+        prefixMin_ = 1.0;
+        frame_ = 0;
+        envelope_ = 1.0;
+        sum1_ = static_cast<double>(boxA_);
+        sum2_ = static_cast<double>(boxB_);
+        sinceResum_ = 0;
+        currentGain_ = T(1);
+    }
+
+    /** One frame of the gain computer; leaves the gain to apply in currentGain_. */
+    inline void advanceGain(T peak, T ceiling, bool adaptive, T relMs) noexcept
+    {
+        // min() instead of a branch on peak > ceiling (data-dependent, so it
+        // mispredicts constantly under limiting); peak == 0 gives +inf -> 1.
+        const double required = std::min(1.0, static_cast<double>(ceiling / peak));
+
+        // Exact minimum of r over the last holdLen_ frames (see restartHoldBlock()).
+        rHist_[static_cast<size_t>(frame_ & histMask_)] = required;
+        prefixMin_ = std::min(prefixMin_, required);
+        const double held = std::min(sufMin_[static_cast<size_t>(blockPos_ + 1)], prefixMin_);
+        if (++blockPos_ == holdLen_)
+            restartHoldBlock(frame_ - (holdLen_ - 1));
+
+        // Release: the envelope follows reductions at once (the moving
+        // averages below shape the attack) and recovers with the one-pole.
+        // min() selects between the two without a data-dependent branch.
+        const bool attacking = held < envelope_;
+        double coeff = static_cast<double>(releaseCoeff_);
+        if (adaptive)
+        {
+            // Program-dependent release: up to 3x slower after sustained
+            // limiting. 1 / (1 + fs * tau) avoids std::exp per sample.
+            T baseFactor = T(1);
+            if (limitingDuration_ > 0)
+            {
+                const T durationMs = static_cast<T>(limitingDuration_) * T(1000) * invSampleRate_;
+                baseFactor = T(1) + std::min(durationMs / T(100), T(2));
+            }
+            coeff = 1.0 / (1.0 + sampleRate_ * static_cast<double>(relMs * baseFactor) / 1000.0);
+        }
+        envelope_ = std::min(held, envelope_ + coeff * (held - envelope_));
+        limitingDuration_ = attacking ? std::min(limitingDuration_ + 1, maxLimitSamples_)
+                                      : (envelope_ > 0.999 ? 0 : limitingDuration_);
+
+        // Two cascaded moving averages (lengths boxA_, boxB_): an S-shaped,
+        // click-free ramp spanning exactly the window the hold covers.
+        const size_t w = static_cast<size_t>(frame_ & histMask_);
+        eHist_[w] = envelope_;
+        sum1_ += envelope_ - eHist_[static_cast<size_t>((frame_ - boxA_) & histMask_)];
+        const double avg1 = sum1_ * invBoxA_;
+        avgHist_[w] = avg1;
+        sum2_ += avg1 - avgHist_[static_cast<size_t>((frame_ - boxB_) & histMask_)];
+        ++frame_;
+
+        // Periodic exact re-summation keeps the running sums drift-free.
+        if (++sinceResum_ >= kResumPeriod)
+        {
+            sinceResum_ = 0;
+            resumBoxes();
+        }
+
+        currentGain_ = static_cast<T>(std::min(sum2_ * invBoxB_, 1.0));
     }
 
     // Fast-path synchronization for atomic variables. The linear ceiling is
@@ -506,44 +680,6 @@ protected:
     {
         if (sampleRate_ > 0)
             releaseCoeff_ = T(1) - std::exp(T(-1) / (static_cast<T>(sampleRate_) * lastReleaseMs_ / T(1000)));
-    }
-
-    inline void smoothGain(T targetGain, bool adaptive, T relMs) noexcept
-    {
-        if (targetGain < currentGain_)
-        {
-            // Smoothed attack to prevent discontinuous clicks on transients
-            currentGain_ += attackCoeff_ * (targetGain - currentGain_);
-
-            // Limit duration to max 2 seconds to prevent integer overflow
-            if (limitingDuration_ < maxLimitSamples_) limitingDuration_++;
-        }
-        else
-        {
-            T coeff;
-            if (adaptive)
-            {
-                T baseFactor = T(1);
-                if (limitingDuration_ > 0)
-                {
-                    T durationMs = static_cast<T>(limitingDuration_) * T(1000) * invSampleRate_;
-                    baseFactor = T(1) + std::min(durationMs / T(100), T(2));
-                }
-                T adaptedRelease = relMs * baseFactor;
-
-                // Fast path for exp() approximation: 1 / (1 + fs * tau_seconds)
-                // Avoids brutal CPU spike of std::exp() in the audio thread loop
-                coeff = T(1) / (T(1) + (static_cast<T>(sampleRate_) * adaptedRelease / T(1000)));
-            }
-            else
-            {
-                coeff = releaseCoeff_;
-            }
-
-            currentGain_ += coeff * (targetGain - currentGain_);
-            if (currentGain_ > T(1)) currentGain_ = T(1);
-            if (currentGain_ > T(0.999)) limitingDuration_ = 0;
-        }
     }
 
     /** Symmetric soft-knee clipper for the region above the clip threshold,
@@ -581,7 +717,6 @@ protected:
     T lastCeilingDb_ = T(-0.3);      ///< Change detector for the ceiling pow skip.
 
     T releaseCoeff_ = T(0);
-    T attackCoeff_ = T(1);
     T lastReleaseMs_ = T(-1);
 
     T currentGain_ = T(1);
@@ -593,10 +728,35 @@ protected:
     int limitingDuration_ = 0;
     T lookaheadCurrent_ = T(96); ///< Smoothed read offset (glides on live changes).
 
-    // Look-ahead peak hold (brickwall guarantee): holds the detected peak for
-    // lookaheadSamples_ so the gain stays reduced until the peak is output.
-    T heldPeak_ = T(0);
-    int peakHoldCounter_ = 0;
+    // Gain computer (see advanceGain()): sliding minimum, released envelope
+    // and the two moving averages, all in double (recursive state).
+    static constexpr int kResumPeriod = 1 << 16;
+    int histSize_ = 0;
+    int histMask_ = 0;
+    std::vector<double> eHist_;      ///< Released envelope history.
+    std::vector<double> avgHist_;    ///< First moving-average output history.
+    std::vector<double> rHist_;      ///< Required-gain history.
+    std::vector<double> sufMin_;     ///< Suffix minima of the last complete hold block (+1 empty).
+    int blockPos_ = 0;               ///< Position inside the current hold block.
+    double prefixMin_ = 1.0;         ///< Running minimum of the current hold block.
+    int64_t frame_ = 0;
+    double envelope_ = 1.0;
+    double sum1_ = 1.0;
+    double sum2_ = 1.0;
+    int boxA_ = 1;
+    int boxB_ = 1;
+    double invBoxA_ = 1.0;
+    double invBoxB_ = 1.0;
+    int holdLen_ = 97;
+    int sinceResum_ = 0;
+    T pendingPeak_ = T(0);           ///< Other channels' peaks for the next processSample() frame.
+
+    // processBlock() chunk scratch (see its three passes).
+    static constexpr int kChunk = 128;
+    T chunkPeak_[kChunk] = {};
+    T chunkCeiling_[kChunk] = {};
+    T chunkGain_[kChunk] = {};
+    int chunkLook_[kChunk] = {};
 
     // Per-sample path caches (advanced on channel 0, reused by later channels).
     T sampleCeiling_ = T(0.96605);

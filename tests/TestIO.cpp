@@ -1429,12 +1429,96 @@ DSPARK_TEST(Mp3File_round_trip_is_gapless)
     EXPECT_LT(residualDb(dec, 1057, 0, N), -25.0);              // the codec delay, untrimmed
 }
 
+// A NaN written to the MP3 encoder reached the quantiser as NaN: its
+// float-to-int conversion, and then the negation of the INT_MIN it produced
+// on x86, are undefined behaviour (the sanitizer builds flag both).
+// Non-finite input now encodes as silence and the stream carries on.
+DSPARK_TEST(Mp3File_nonfinite_input_does_not_poison_the_stream)
+{
+    FileCleanup cleanup { "dspark_test_nonfinite.mp3" };
+    constexpr int N = 22050;
+    std::vector<float> orig(N);
+    for (int i = 0; i < N; ++i)
+        orig[static_cast<size_t>(i)] = 0.4f * std::sin(2.0f * pi<float> * 440.0f * float(i) / 44100.0f);
+    {
+        Mp3File w;
+        AudioFileInfo info;
+        info.sampleRate = 44100.0;
+        info.numChannels = 1;
+        info.bitsPerSample = 128;
+        info.numSamples = N;
+        EXPECT_TRUE(w.openWrite("dspark_test_nonfinite.mp3", info));
+        AudioBuffer<float> buf;
+        buf.resize(1, N);
+        std::copy(orig.begin(), orig.end(), buf.getChannel(0));
+        buf.getChannel(0)[5000] = std::numeric_limits<float>::quiet_NaN();
+        buf.getChannel(0)[5001] = std::numeric_limits<float>::infinity();
+        EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+        w.close();
+    }
+    Mp3File r;
+    EXPECT_TRUE(r.openRead("dspark_test_nonfinite.mp3"));
+    const int n = static_cast<int>(r.getInfo().numSamples);
+    AudioBuffer<float> dec;
+    dec.resize(1, n);
+    EXPECT_TRUE(r.readSamples(dec.toView()));
+    EXPECT_NO_NAN(dec.getChannel(0), n);
+    double e = 0.0, ref = 0.0;   // the tone survives after the burst
+    for (int i = 10000; i < N; ++i)
+    {
+        const double d = dec.getChannel(0)[i] - orig[static_cast<size_t>(i)];
+        e += d * d;
+        ref += static_cast<double>(orig[static_cast<size_t>(i)]) * orig[static_cast<size_t>(i)];
+    }
+    EXPECT_LT(10.0 * std::log10(e / ref), -30.0);
+}
+
 // 8-bit WAV is unsigned with 128 as zero and the reader scales by 128, but the
 // writer scaled by 127. Every 8-bit round trip therefore came back 0.78% quiet
 // - a whole quantisation step of SYSTEMATIC error, on top of quantisation. With
 // both sides on the same grid, every value that the 128-step scale can express
 // round-trips to within half a step and -1.0 is exact; only +1.0 clamps, which
 // the scale itself forces.
+// A NaN sample reached static_cast<int>(NaN) - undefined behaviour, which on
+// x86 wrote the most negative code (a full-scale click) into integer WAVs.
+// Integer formats now write NaN as silence and clamp +-Inf to full scale.
+DSPARK_TEST(WavFile_nonfinite_samples_write_as_silence_or_full_scale)
+{
+    for (const int bits : { 8, 16, 24, 32 })
+    {
+        FileCleanup cleanup { "dspark_test_nonfinite.wav" };
+        const float probes[] = { std::numeric_limits<float>::quiet_NaN(),
+                                 std::numeric_limits<float>::infinity(),
+                                 -std::numeric_limits<float>::infinity(), 0.5f };
+        {
+            WavFile w;
+            AudioFileInfo info;
+            info.sampleRate = 44100.0;
+            info.numChannels = 1;
+            info.bitsPerSample = bits;
+            info.isFloatingPoint = false;
+            info.numSamples = 4;
+            EXPECT_TRUE(w.openWrite("dspark_test_nonfinite.wav", info));
+            AudioBuffer<float> b;
+            b.resize(1, 4);
+            for (int i = 0; i < 4; ++i) b.getChannel(0)[i] = probes[i];
+            EXPECT_TRUE(w.writeSamples(std::as_const(b).toView()));
+            w.close();
+        }
+        WavFile r;
+        EXPECT_TRUE(r.openRead("dspark_test_nonfinite.wav"));
+        AudioBuffer<float> b;
+        b.resize(1, 4);
+        EXPECT_TRUE(r.readSamples(b.toView()));
+        r.close();
+        const float step = std::ldexp(1.0f, 1 - bits);
+        EXPECT_EQ(b.getChannel(0)[0], 0.0f);                  // NaN -> silence
+        EXPECT_NEAR(b.getChannel(0)[1], 1.0f, 1.01f * step);  // +Inf -> top code
+        EXPECT_EQ(b.getChannel(0)[2], -1.0f);                 // -Inf -> bottom code
+        EXPECT_NEAR(b.getChannel(0)[3], 0.5f, step);
+    }
+}
+
 DSPARK_TEST(WavFile_8bit_roundtrip_has_no_systematic_gain_error)
 {
     FileCleanup cleanup { "dspark_test_8bit_gain.wav" };

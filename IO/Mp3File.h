@@ -200,6 +200,9 @@ public:
             for (int ch = 0; ch < static_cast<int>(info_.numChannels); ++ch)
             {
                 float val = (ch < nCh) ? src.getChannel(ch)[i] : 0.0f;
+                // A non-finite sample reached the quantiser as NaN, whose
+                // float-to-int conversion is undefined: encode it as silence.
+                if (!std::isfinite(val)) val = 0.0f;
                 encInput_[ch][encInputPos_] = static_cast<double>(val);
             }
             ++encInputPos_;

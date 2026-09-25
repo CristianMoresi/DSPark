@@ -608,8 +608,15 @@ private:
         {
             for (int ch = 0; ch < fileCh; ++ch)
             {
-                const float value = (ch < srcCh) ? src.getChannel(ch)[srcOffset + f] : 0.0f;
+                float value = (ch < srcCh) ? src.getChannel(ch)[srcOffset + f] : 0.0f;
                 uint8_t* ptr = raw + ((f * fileCh + ch) * bytesPerSample);
+
+                // A NaN has no integer code: std::clamp passes it through and
+                // the float-to-int conversion is then undefined (x86 wrote the
+                // most negative code, a full-scale click). Integer formats
+                // write it as silence; +-Inf clamp to full scale below.
+                if constexpr (std::is_integral_v<T>)
+                    if (value != value) value = 0.0f;
 
                 // Precise rounding & strict clipping bounds
                 if constexpr (Bits == 8) {

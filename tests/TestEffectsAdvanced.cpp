@@ -1163,6 +1163,52 @@ DSPARK_TEST(TransientDesigner_no_NaN)
 // DynamicEQ
 // ============================================================================
 
+// The detector used the rectified band signal, so the gain computer rode the
+// ripple of every steady low note (measured THD+N at 60 Hz: 0.22% bell,
+// 0.30% low shelf). It now follows the analytic magnitude, flat for a tone.
+DSPARK_TEST(DynamicEQ_does_not_distort_steady_bass)
+{
+    for (int shape = 0; shape < 2; ++shape)
+    {
+        const double fs = 48000.0, f = 60.0;
+        const int n = 96000;
+        DynamicEQ<double> eq;
+        eq.prepare(spec(fs, 512, 1));
+        eq.setNumBands(1);
+        DynamicEQ<double>::BandConfig c;
+        c.frequency = f;
+        c.threshold = -30.0;
+        c.aboveRatio = 3.0;
+        c.shape = static_cast<DynamicEQ<double>::BandShape>(shape);
+        eq.setBand(0, c);
+        std::vector<double> y(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) y[static_cast<size_t>(i)] = 0.5 * std::sin(twoPi<double> * f * i / fs);
+        for (int off = 0; off < n; off += 512)
+        {
+            double* p[1] = { y.data() + off };
+            eq.processBlock(AudioBufferView<double>(p, 1, std::min(512, n - off)));
+        }
+        double ss = 0, sc = 0, cc = 0, ys = 0, yc = 0;
+        for (int i = n / 2; i < n; ++i)
+        {
+            const double si = std::sin(twoPi<double> * f * i / fs), co = std::cos(twoPi<double> * f * i / fs);
+            ss += si * si; sc += si * co; cc += co * co;
+            ys += y[static_cast<size_t>(i)] * si; yc += y[static_cast<size_t>(i)] * co;
+        }
+        const double det = ss * cc - sc * sc;
+        const double a = (ys * cc - yc * sc) / det, b = (yc * ss - ys * sc) / det;
+        double res = 0, sig = 0;
+        for (int i = n / 2; i < n; ++i)
+        {
+            const double fit = a * std::sin(twoPi<double> * f * i / fs) + b * std::cos(twoPi<double> * f * i / fs);
+            res += (y[static_cast<size_t>(i)] - fit) * (y[static_cast<size_t>(i)] - fit);
+            sig += fit * fit;
+        }
+        EXPECT_LT(std::sqrt(res / sig), 1e-4);   // < 0.01 %
+        EXPECT_LT(eq.getBandGainDb(0), -3.0);    // and the band still compresses
+    }
+}
+
 DSPARK_TEST(DynamicEQ_below_threshold_no_change)
 {
     DynamicEQ<float> deq;

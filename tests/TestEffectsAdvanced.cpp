@@ -3395,6 +3395,73 @@ DSPARK_TEST(PitchShifter_sideband_rejection)
     EXPECT_LT(sidebandDb, -35.0);
 }
 
+DSPARK_TEST(PitchShifter_high_quality_reader_is_transparent_at_high_frequencies)
+{
+    // The Standard resample-back reader (4-point Catmull-Rom, the published
+    // rendering) errs with the sweeping fractional read position: a 12 kHz
+    // tone shifted by +0.3 semitones came out 0.55 dB low over a -23.5 dB
+    // residual. Quality::High reads with the 32-tap windowed sinc: exact
+    // amplitude, -50 dB residual. A reader switch crossfades over 64
+    // samples and then matches a twin that ran High from the start exactly.
+    auto render = [](bool high, int switchAt) {
+        PitchShifter<double> ps;
+        if (high) ps.setQuality(PitchShifter<double>::Quality::High);
+        ps.prepare(spec(48000.0, 256, 1));
+        ps.setSemitones(0.3);
+        std::vector<double> x(static_cast<size_t>(300 * 256));
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = 0.5 * std::sin(6.283185307179586 * 12000.0 * static_cast<double>(i) / 48000.0);
+        for (int off = 0; off < static_cast<int>(x.size()); off += 256)
+        {
+            if (off == switchAt) ps.setQuality(PitchShifter<double>::Quality::High);
+            double* p[1] = { x.data() + off };
+            ps.processBlock(AudioBufferView<double>(p, 1, 256));
+        }
+        return x;
+    };
+    auto measure = [](const std::vector<double>& x, double& residualDb) {
+        // Least-squares sine fit at the shifted frequency (exact over any
+        // window, unlike a plain DFT projection).
+        const double f = 12000.0 * std::pow(2.0, 0.3 / 12.0);
+        const size_t from = x.size() - 36000;
+        double cc = 0.0, ss = 0.0, cs = 0.0, xc = 0.0, xs = 0.0;
+        for (size_t i = from; i < x.size(); ++i)
+        {
+            const double ph = 6.283185307179586 * f * static_cast<double>(i) / 48000.0;
+            const double c = std::cos(ph), sn = std::sin(ph);
+            cc += c * c; ss += sn * sn; cs += c * sn;
+            xc += x[i] * c; xs += x[i] * sn;
+        }
+        const double det = cc * ss - cs * cs;
+        const double a = (xc * ss - xs * cs) / det;
+        const double b = (xs * cc - xc * cs) / det;
+        double res = 0.0, sig = 0.0;
+        for (size_t i = from; i < x.size(); ++i)
+        {
+            const double ph = 6.283185307179586 * f * static_cast<double>(i) / 48000.0;
+            const double fit = a * std::cos(ph) + b * std::sin(ph);
+            res += (x[i] - fit) * (x[i] - fit);
+            sig += fit * fit;
+        }
+        residualDb = 10.0 * std::log10(std::max(res, 1e-300) / sig);
+        return std::sqrt(a * a + b * b);
+    };
+    double resStandard = 0.0, resHigh = 0.0;
+    const double ampStandard = measure(render(false, -1), resStandard);
+    const auto high = render(true, -1);
+    const double ampHigh = measure(high, resHigh);
+    EXPECT_LT(ampStandard, 0.48);                // the published reader's droop
+    EXPECT_GT(resStandard, -30.0);
+    EXPECT_NEAR(ampHigh, 0.5, 0.001);
+    EXPECT_LT(resHigh, -45.0);
+
+    const auto switched = render(false, 100 * 256);
+    double diff = 0.0;
+    for (size_t i = 100 * 256 + 64; i < high.size(); ++i)
+        diff = std::max(diff, std::abs(switched[i] - high[i]));
+    EXPECT_EQ(diff, 0.0);
+}
+
 DSPARK_TEST(PitchShifter_dry_path_is_latency_compensated)
 {
     // mix = 0 must be a pure delay of getLatency() samples.

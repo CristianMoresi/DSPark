@@ -456,7 +456,7 @@
  * | `EnvelopeGenerator<T>`   | Core/EnvelopeGenerator.h  | ADSR envelope for synthesis and dynamics          |
  * | `Dither<T>`              | Core/Dither.h             | TPDF dithering with noise shaping                 |
  * | `DenormalGuard`          | Core/DenormalGuard.h      | RAII denormal flush (SSE FTZ/DAZ, ARM FZ)         |
- * | `Interpolation`          | Core/Interpolation.h      | 5 interpolation methods (linear to Lagrange)      |
+ * | `Interpolation`          | Core/Interpolation.h      | Linear to Lagrange, allpass, 32-tap sinc reader   |
  * | `Phasor<T>`              | Core/Phasor.h             | Phase accumulator for oscillators/LFOs            |
  * | `RingBuffer<T>`          | Core/RingBuffer.h         | Power-of-two circular buffer with interp. read    |
  * | `SampleAndHold<T>`       | Core/SampleAndHold.h      | S&H for bit-crush and stepped modulation          |

@@ -29,12 +29,22 @@
  *     -> FFT -> peak picking & phase propagation (reference channel)
  *     -> per-channel rigid phase rotation per region -> IFFT
  *     -> overlap-add at fixed synthesis hop Rs = N/4 (exact COLA)
- *     -> Catmull-Rom fractional reader at rate `ratio` -> output
+ *     -> fractional reader at rate `ratio` -> output
  *
  * The analysis/synthesis stages up to the OLA ring are the shared vocoder
  * engine (Effects/detail/PhaseVocoderEngine.h); this class owns the
- * resample-back stage (the Catmull-Rom fractional reader) and the
- * latency-compensated dry path.
+ * resample-back stage and the latency-compensated dry path.
+ *
+ * Resample-back quality (setQuality()): Quality::Standard reads the
+ * synthesis stream with a 4-point Catmull-Rom interpolator, the published
+ * rendering (a stored-reference test pins it). Its error changes with the
+ * fractional read position, which sweeps whenever the pitch moves, so it
+ * surfaces as HF modulation noise: a 12 kHz tone shifted by +0.3 semitones
+ * comes out 0.55 dB low over a -23.5 dB residual (16 kHz: 1.5 dB low, -14.5
+ * dB). Quality::High reads it with the 32-tap windowed sinc of
+ * Core/Interpolation.h: exact amplitude and a -50 dB residual at 12 kHz
+ * (-46 to -72 dB at 16 kHz), at the same latency. High is recommended for
+ * new work; Standard stays the default so existing renders do not move.
  *
  * The analysis hop carries a fractional accumulator so the average stretch is
  * exactly Rs/(Rs/ratio) = ratio: tuning is exact for arbitrary ratios, with
@@ -55,13 +65,15 @@
  * of the stream; getState()/setState() are setup/UI threads.
  *
  * Dependencies: Effects/detail/PhaseVocoderEngine.h, Core/AudioSpec.h,
- * Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h, Core/StateBlob.h.
+ * Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h,
+ * Core/Interpolation.h, Core/StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
+#include "../Core/Interpolation.h"
 #include "../Core/StateBlob.h"
 #include "detail/PhaseVocoderEngine.h"
 
@@ -163,9 +175,36 @@ public:
         readPosInt_ = engine_.writeHead() - readOffset_;
         readPosFrac_ = 0.0;
         currentMix_ = mix_.load(std::memory_order_relaxed);
+        highReader_ = quality_.load(std::memory_order_relaxed) == Quality::High;
+        readerFadeLeft_ = 0;   // start settled on the selected reader
     }
 
     // -- Parameters (thread-safe) -----------------------------------------------
+
+    /** @brief Resample-back reader quality (see the file overview). */
+    enum class Quality
+    {
+        Standard,   ///< 4-point Catmull-Rom reader: the published rendering (default).
+        High        ///< 32-tap windowed-sinc reader: transparent HF, same latency.
+    };
+
+    /**
+     * @brief Selects the resample-back reader. Thread-safe; a change
+     *        crossfades between the two readers over 64 samples.
+     * @param quality Reader quality. Out-of-range values clamp to High.
+     */
+    void setQuality(Quality quality) noexcept
+    {
+        quality = static_cast<Quality>(std::clamp(static_cast<int>(quality), 0,
+                                                  static_cast<int>(Quality::High)));
+        quality_.store(quality, std::memory_order_relaxed);
+    }
+
+    /** @return The resample-back reader quality. */
+    [[nodiscard]] Quality getQuality() const noexcept
+    {
+        return quality_.load(std::memory_order_relaxed);
+    }
 
     /**
      * @brief Sets the pitch shift in semitones, clamped to +-12.
@@ -257,6 +296,7 @@ public:
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("transient", transientPreserve_.load(std::memory_order_relaxed));
         w.write("formant", formantPreserve_.load(std::memory_order_relaxed));
+        w.write("quality", static_cast<int32_t>(quality_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -269,6 +309,7 @@ public:
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setTransientPreserve(r.read("transient", true));
         setFormantPreserve(r.read("formant", false));
+        setQuality(static_cast<Quality>(r.read("quality", 0)));   // clamped inside
         return true;
     }
 
@@ -295,6 +336,15 @@ public:
         // in 0.7 ms with 32-sample blocks.
         const T mixTarget = mix_.load(std::memory_order_relaxed);
         const T mixStart  = currentMix_;
+
+        // Reader selection: a change crossfades from the old reader to the
+        // new one over kReaderFade samples (the readers differ at HF).
+        const bool highQuality = quality_.load(std::memory_order_relaxed) == Quality::High;
+        if (highQuality != highReader_)
+        {
+            highReader_ = highQuality;
+            readerFadeLeft_ = kReaderFade;
+        }
 
         int i = 0;
         while (i < nS)
@@ -328,10 +378,18 @@ public:
                 int64_t rp = readPosInt_;
                 double  rf = readPosFrac_;
                 int     dp = dryPos_;
+                int     fadeLeft = readerFadeLeft_;
 
                 for (int k = 0; k < chunk; ++k)
                 {
-                    const T wet = readCatmullRom(acc, rp, rf);
+                    T wet = readWet(highReader_, acc, rp, rf);
+                    if (fadeLeft > 0)
+                    {
+                        const T w = static_cast<T>(fadeLeft) * (T(1) / T(kReaderFade));
+                        const T old = readWet(!highReader_, acc, rp, rf);
+                        wet += (old - wet) * w;
+                        --fadeLeft;
+                    }
                     const int dryIdx = (dp - latency_) & dryMask_;
                     const T drySample = dry[static_cast<size_t>(dryIdx)];
                     const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + k + 1));
@@ -370,6 +428,7 @@ public:
                 readPosInt_  = rpEnd;
                 readPosFrac_ = rfEnd;
                 dryPos_ = (dryPos_ + chunk) & dryMask_;
+                readerFadeLeft_ = std::max(0, readerFadeLeft_ - chunk);
             }
 
             // 3. Advance the engine (runs an STFT hop at the analysis boundary).
@@ -382,15 +441,11 @@ public:
     }
 
 private:
-    /** @brief Publishes the engine's parameter set from the atomic parameters
-     *  (control thread; one seqlock publish per setter call). */
-    void publishEngineParams() noexcept
+    /** @brief Reads the synthesis stream with the selected reader. */
+    [[nodiscard]] T readWet(bool high, const T* acc, int64_t ip, double frac) const noexcept
     {
-        typename detail::PhaseVocoderEngine<T>::Params p;
-        p.targetSemitones = static_cast<double>(semitones_.load(std::memory_order_relaxed));
-        p.transientPreserve = transientPreserve_.load(std::memory_order_relaxed);
-        p.formantPreserve = formantPreserve_.load(std::memory_order_relaxed);
-        engine_.publishParams(p);
+        return high ? reader_.readRing(acc, accumMask_, ip, frac)
+                    : readCatmullRom(acc, ip, frac);
     }
 
     /** @brief 4-point Catmull-Rom read of the synthesis accumulator. */
@@ -407,6 +462,17 @@ private:
                  + f * (T(3) * (x1 - x2) + x3 - x0)));
     }
 
+    /** @brief Publishes the engine's parameter set from the atomic parameters
+     *  (control thread; one seqlock publish per setter call). */
+    void publishEngineParams() noexcept
+    {
+        typename detail::PhaseVocoderEngine<T>::Params p;
+        p.targetSemitones = static_cast<double>(semitones_.load(std::memory_order_relaxed));
+        p.transientPreserve = transientPreserve_.load(std::memory_order_relaxed);
+        p.formantPreserve = formantPreserve_.load(std::memory_order_relaxed);
+        engine_.publishParams(p);
+    }
+
     // -- Members -----------------------------------------------------------------
     int numChannels_ = 0;
     std::atomic<bool> prepared_ { false };
@@ -418,6 +484,12 @@ private:
     int64_t accumMask_ = 8191;   ///< Cached engine OLA ring mask.
 
     detail::PhaseVocoderEngine<T> engine_;   ///< Shared analysis/synthesis core.
+    SincInterpolator<T> reader_;             ///< High-quality reader (it trails the
+                                             ///< OLA write head by far more than
+                                             ///< its 16-sample reach).
+    static constexpr int kReaderFade = 64;   ///< Reader-switch crossfade length.
+    bool highReader_ = false;                ///< Reader in use (audio thread).
+    int readerFadeLeft_ = 0;                 ///< Samples left in a reader crossfade.
 
     std::vector<std::vector<T>> dryRing_;    ///< Per-channel latency-matched dry.
 
@@ -431,6 +503,7 @@ private:
     std::atomic<T> mix_ { T(1) };
     std::atomic<bool> transientPreserve_ { true };
     std::atomic<bool> formantPreserve_ { false };
+    std::atomic<Quality> quality_ { Quality::Standard };
 };
 
 } // namespace dspark

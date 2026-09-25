@@ -510,6 +510,34 @@ DSPARK_TEST(Interpolation_buffer_overloads_wrap_circularly)
     EXPECT_TRUE(interpolateCubic(buf, n, 3.7f) == interpolateHermite(buf, n, 3.7f));
 }
 
+DSPARK_TEST(Interpolation_sinc_is_exact_at_integers_and_transparent_to_18_khz)
+{
+    // The 32-tap windowed-sinc reader: an exact identity at integer positions,
+    // and within -90 dB of the ideal fractional delay up to 18 kHz at 48 kHz
+    // at every fractional position (4-point cubic: -12 dB at 15 kHz).
+    SincInterpolator<double> sinc;
+    std::vector<double> ring(256);
+    for (size_t i = 0; i < ring.size(); ++i)
+        ring[i] = std::sin(0.37 * static_cast<double>(i)) + 0.2 * std::cos(2.9 * static_cast<double>(i));
+    for (int64_t p = 0; p < 256; p += 7)   // wraps both ends of the ring
+        EXPECT_EQ(sinc.readRing(ring.data(), 255, p, 0.0), ring[static_cast<size_t>(p)]);
+
+    for (const double hz : { 1000.0, 10000.0, 15000.0, 18000.0 })
+    {
+        const double w = 6.283185307179586 * hz / 48000.0;
+        for (size_t i = 0; i < ring.size(); ++i)
+            ring[i] = std::sin(w * static_cast<double>(i));
+        double worst = 0.0;
+        for (int step = 1; step < 64; ++step)
+        {
+            const double frac = step / 64.0;
+            const double got = sinc.readRing(ring.data(), 255, 100, frac);
+            worst = std::max(worst, std::abs(got - std::sin(w * (100.0 + frac))));
+        }
+        EXPECT_LT(20.0 * std::log10(worst), -90.0);
+    }
+}
+
 DSPARK_TEST(Interpolation_allpass_delay_magnitude_and_stability)
 {
     // frac = 1 -> coefficient is exactly 0 -> pure one-sample delay, bit-exact.

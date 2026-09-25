@@ -10,6 +10,8 @@
  * Free-function interpolators used across the framework (RingBuffer's
  * interpolated reads, modulated delay lines). All of them are small scalar
  * helpers that inline into the caller's loop; none allocates or locks.
+ * SincInterpolator is the high-fidelity reader for resampling a stream
+ * (pitch shifting, varispeed); it owns a kernel table built on construction.
  *
  * | Method    | Points | Quality       | CPU Cost  | Use case                     |
  * |-----------|--------|---------------|-----------|------------------------------|
@@ -17,6 +19,7 @@
  * | Hermite   | 4      | Good+         | Low       | Modulated delays (default)   |
  * | Lagrange  | 4      | High          | Low       | Precision fractional reads   |
  * | Allpass   | 2      | Frequency-dep | Low       | Static fractional delays     |
+ * | Sinc      | 32     | Transparent   | Medium    | Resampling a stream          |
  *
  * Polynomial accuracy: Linear reconstructs degree-1 signals exactly, Hermite
  * (Catmull-Rom) degree 2, Lagrange degree 3. Hermite is the recommended
@@ -36,14 +39,21 @@
  * Threading: all functions are pure and re-entrant; the Allpass state lives
  * in the caller. Real-time safe: no allocation, no locks, no modulo; the only
  * floating-point division is the Allpass coefficient (one per call).
+ * SincInterpolator allocates its table in the constructor (setup thread);
+ * its reads are const, allocation-free and safe from any thread.
  *
- * Dependencies: DspMath.h (FloatType concept).
+ * Dependencies: DspMath.h (FloatType concept), SimdOps.h (dot products).
  */
 
 #include "DspMath.h"
+#include "SimdOps.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
 
 namespace dspark {
 
@@ -282,5 +292,131 @@ template <FloatType T>
     state = output;
     return output;
 }
+
+/**
+ * @class SincInterpolator
+ * @brief 32-tap Kaiser-windowed sinc reader for transparent fractional reads.
+ *
+ * The reader for resampling a stream at a fixed or varying rate. Its
+ * worst-case error against the ideal fractional delay, over every fractional
+ * position, stays below -96 dB up to 15 kHz at 44.1 and 48 kHz (and 18 kHz
+ * at 48 kHz). A 4-point cubic (Hermite / Catmull-Rom) reader reaches -24 dB
+ * at 10 kHz and -12 dB at 15 kHz, and because its error changes with the
+ * fractional position, a moving read point turns it into modulation noise.
+ *
+ * The kernel is a full-band sinc (cutoff at Nyquist) under a Kaiser window
+ * (beta 10), tabulated at 256 fractional phases, each normalized to unit DC
+ * gain, and linearly interpolated between phases. Integer positions are an
+ * exact identity. Near Nyquist the 32 taps cannot hold the band: at 20 kHz
+ * the error is -50 dB at 48 kHz and -17 dB at 44.1 kHz.
+ *
+ * Reading position intPos + frac needs the samples intPos - 15 through
+ * intPos + 16.
+ *
+ * @tparam T Sample type (float or double).
+ */
+template <FloatType T>
+class SincInterpolator
+{
+public:
+    static constexpr int kTaps   = 32;          ///< Kernel length.
+    static constexpr int kBefore = kTaps / 2 - 1; ///< Samples needed before intPos.
+    static constexpr int kAfter  = kTaps / 2;   ///< Samples needed after intPos.
+    static constexpr int kPhases = 256;         ///< Tabulated fractional phases.
+
+    /** @brief Builds the kernel table (allocates: construct on a setup thread). */
+    SincInterpolator()
+        : table_(static_cast<size_t>((kPhases + 1) * kTaps))
+    {
+        constexpr double kBeta = 10.0;
+        constexpr double kPi = 3.14159265358979323846;
+        const double invI0Beta = 1.0 / besselI0(kBeta);
+        const double halfSpan = static_cast<double>(kTaps) / 2.0;
+
+        for (int p = 0; p <= kPhases; ++p)
+        {
+            T* row = table_.data() + static_cast<size_t>(p) * kTaps;
+            const double phase = static_cast<double>(p) / kPhases;
+            if (p == 0 || p == kPhases)
+            {
+                // Integer positions: an exact identity (sin(pi * k) rounds
+                // to ~1e-16, not 0, so the sinc is not evaluated here).
+                std::fill(row, row + kTaps, T(0));
+                row[p == 0 ? kBefore : kBefore + 1] = T(1);
+                continue;
+            }
+            double h[kTaps];
+            double sum = 0.0;
+            for (int t = 0; t < kTaps; ++t)
+            {
+                const double x = static_cast<double>(t - kBefore) - phase;
+                const double r = x / halfSpan;
+                const double window = (r * r < 1.0)
+                    ? besselI0(kBeta * std::sqrt(1.0 - r * r)) * invI0Beta
+                    : 0.0;
+                h[t] = std::sin(kPi * x) / (kPi * x) * window;
+                sum += h[t];
+            }
+            for (int t = 0; t < kTaps; ++t)
+                row[t] = static_cast<T>(h[t] / sum);   // unit DC gain
+        }
+    }
+
+    /**
+     * @brief Interpolates kTaps consecutive samples at x[kBefore] + frac.
+     * @param x    Samples intPos - kBefore through intPos + kAfter.
+     * @param frac Fractional position in [0, 1).
+     * @return Interpolated value.
+     */
+    [[nodiscard]] T read(const T* x, double frac) const noexcept
+    {
+        const double p = frac * static_cast<double>(kPhases);
+        const int ip = std::clamp(static_cast<int>(p), 0, kPhases - 1);
+        const T t = static_cast<T>(p - static_cast<double>(ip));
+        const T* h0 = table_.data() + static_cast<size_t>(ip) * kTaps;
+        const T* h1 = h0 + kTaps;   // the table holds kPhases + 1 rows
+        const T a = simd::dotProductT(h0, x, kTaps);
+        const T b = simd::dotProductT(h1, x, kTaps);
+        return a + t * (b - a);
+    }
+
+    /**
+     * @brief Reads a power-of-two ring buffer at intPos + frac.
+     * @param ring   Ring storage.
+     * @param mask   Ring size minus one (the size must be a power of two).
+     * @param intPos Integer read position (masked, so any value works).
+     * @param frac   Fractional position in [0, 1).
+     * @return Interpolated value.
+     */
+    [[nodiscard]] T readRing(const T* ring, int64_t mask, int64_t intPos, double frac) const noexcept
+    {
+        const int64_t first = intPos - kBefore;
+        const auto start = static_cast<size_t>(first & mask);
+        if (start + static_cast<size_t>(kTaps) <= static_cast<size_t>(mask) + 1)
+            return read(ring + start, frac);   // contiguous: no gather
+        T window[kTaps];
+        for (int t = 0; t < kTaps; ++t)
+            window[t] = ring[static_cast<size_t>((first + t) & mask)];
+        return read(window, frac);
+    }
+
+private:
+    /** @brief Modified Bessel I0 (power series, converges for Kaiser betas). */
+    [[nodiscard]] static double besselI0(double x) noexcept
+    {
+        double sum = 1.0, term = 1.0;
+        const double halfX = x / 2.0;
+        for (int k = 1; k < 60; ++k)
+        {
+            const double f = halfX / static_cast<double>(k);
+            term *= f * f;
+            sum += term;
+            if (term < sum * 1e-17) break;
+        }
+        return sum;
+    }
+
+    std::vector<T> table_;   ///< (kPhases + 1) rows of kTaps coefficients.
+};
 
 } // namespace dspark

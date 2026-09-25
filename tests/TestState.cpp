@@ -215,6 +215,7 @@ DSPARK_TEST(State_roundtrip_new_effects)
     })));
     EXPECT_TRUE((roundTrip<PitchShifter<float>>([](auto& p) {
         p.setSemitones(7.0f); p.setMix(0.9f);
+        p.setQuality(PitchShifter<float>::Quality::High);
     })));
     EXPECT_TRUE((roundTrip<GranularProcessor<float>>([](auto& g) {
         g.setGrainSize(120.0f); g.setDensity(35.0f); g.setPitch(-5.0f);

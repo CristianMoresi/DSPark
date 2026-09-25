@@ -497,6 +497,49 @@ DSPARK_TEST(Saturation_antialiasing_bounded_and_active)
     EXPECT_GT(maxDiff, 0.001f);
 }
 
+// The ADAA difference quotients ran in T: for float the antiderivative (order
+// 1) minus its previous value, divided by input steps as small as 1e-5, kept
+// only a few correct bits (measured on 20-200 Hz tones: errors up to -48 dB
+// re peak for Tube/SoftClip and -51 dB for the Wavefolder, spiking at every
+// crest). The float path must now track the double path to float precision.
+DSPARK_TEST(Saturation_adaa_is_accurate_in_float)
+{
+    using Algo = Saturation<float>::Algorithm;
+    for (Algo algo : { Algo::Tube, Algo::SoftClip, Algo::Wavefolder })
+    {
+        for (double f : { 20.0, 50.0 })
+        {
+            Saturation<float> sf;
+            Saturation<double> sd;
+            sf.setAlgorithm(algo);
+            sd.setAlgorithm(static_cast<Saturation<double>::Algorithm>(algo));
+            sf.setDrive(6.0f); sd.setDrive(6.0);
+            sf.setAntialiasing(true); sd.setAntialiasing(true);
+            sf.prepare(spec(48000.0, 512, 1));
+            sd.prepare(spec(48000.0, 512, 1));
+            const int n = 24000;
+            std::vector<float> xf(static_cast<size_t>(n));
+            std::vector<double> xd(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i)
+            {
+                xf[static_cast<size_t>(i)] = static_cast<float>(0.5 * std::sin(twoPi<double> * f * i / 48000.0));
+                xd[static_cast<size_t>(i)] = static_cast<double>(xf[static_cast<size_t>(i)]);
+            }
+            for (int off = 0; off < n; off += 512)
+            {
+                float* pf[1] = { xf.data() + off };
+                double* pd[1] = { xd.data() + off };
+                sf.processBlock(AudioBufferView<float>(pf, 1, std::min(512, n - off)));
+                sd.processBlock(AudioBufferView<double>(pd, 1, std::min(512, n - off)));
+            }
+            double worst = 0.0;
+            for (int i = n / 2; i < n; ++i)
+                worst = std::max(worst, std::abs(static_cast<double>(xf[static_cast<size_t>(i)]) - xd[static_cast<size_t>(i)]));
+            EXPECT_LT(worst, 1e-5);   // was up to 5e-3
+        }
+    }
+}
+
 DSPARK_TEST(Saturation_silence)
 {
     Saturation<float> sat;

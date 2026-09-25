@@ -107,13 +107,17 @@ protected:
 };
 
 // -- SoftClip (tanh) ---------------------------------------------------------
+// The ADAA difference quotients below run in double whatever T is: the
+// antiderivative is O(1) while successive inputs can differ by 1e-5, so in
+// float the quotient kept only a few correct bits (measured on 20-200 Hz
+// tones: errors up to -48 dB re peak, spiking at every waveform crest).
 template <typename T>
 class TanhAlgorithm final : public SaturationAlgorithm<T>
 {
-    std::array<T, SaturationAlgorithm<T>::kAaCh> prevX_ {};
+    std::array<double, SaturationAlgorithm<T>::kAaCh> prevX_ {};
 public:
     void prepare(const AudioSpec&) noexcept override { reset(); }
-    void reset() noexcept override { prevX_.fill(T(0)); }
+    void reset() noexcept override { prevX_.fill(0.0); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::SoftClip; }
 
     inline T processSample(T sample, T drive, T character, int ch) noexcept
@@ -124,14 +128,16 @@ public:
             return fastTanh(x + bias) - fastTanh(bias);
 
         // ADAA of f(x) = tanh(x+bias) - tanh(bias); antiderivative log(cosh(x+bias)) - tanh(bias)*x.
-        int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
-        T x0 = prevX_[c];
-        prevX_[c] = x;
-        T tb = std::tanh(bias);
-        T dx = x - x0;
-        if (std::abs(dx) > T(1e-5))
-            return (logCosh(x + bias) - logCosh(x0 + bias)) / dx - tb;
-        return std::tanh(T(0.5) * (x + x0) + bias) - tb;
+        const int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
+        const double xd = static_cast<double>(x);
+        const double b  = static_cast<double>(bias);
+        const double x0 = prevX_[static_cast<size_t>(c)];
+        prevX_[static_cast<size_t>(c)] = xd;
+        const double tb = std::tanh(b);
+        const double dx = xd - x0;
+        if (std::abs(dx) > 1e-7)
+            return static_cast<T>((logCosh(xd + b) - logCosh(x0 + b)) / dx - tb);
+        return static_cast<T>(std::tanh(0.5 * (xd + x0) + b) - tb);
     }
 };
 
@@ -139,15 +145,15 @@ public:
 template <typename T>
 class TubeAlgorithm final : public SaturationAlgorithm<T>
 {
-    std::array<T, SaturationAlgorithm<T>::kAaCh> prevX_ {};
+    std::array<double, SaturationAlgorithm<T>::kAaCh> prevX_ {};
 
-    static inline T f1(T x, T asym) noexcept
+    static inline double f1(double x, double asym) noexcept
     {
-        return (x >= T(0)) ? logCosh(x) : logCosh(x * asym) / asym;
+        return (x >= 0.0) ? logCosh(x) : logCosh(x * asym) / asym;
     }
 public:
     void prepare(const AudioSpec&) noexcept override { reset(); }
-    void reset() noexcept override { prevX_.fill(T(0)); }
+    void reset() noexcept override { prevX_.fill(0.0); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Tube; }
 
     inline T processSample(T sample, T drive, T character, int ch) noexcept
@@ -158,14 +164,16 @@ public:
             return (x >= T(0)) ? fastTanh(x) : fastTanh(x * asym);
 
         // ADAA of the asymmetric triode curve; antiderivative is piecewise log(cosh).
-        int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
-        T x0 = prevX_[c];
-        prevX_[c] = x;
-        T dx = x - x0;
-        if (std::abs(dx) > T(1e-5))
-            return (f1(x, asym) - f1(x0, asym)) / dx;
-        T m = T(0.5) * (x + x0);
-        return (m >= T(0)) ? std::tanh(m) : std::tanh(m * asym);
+        const int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
+        const double xd = static_cast<double>(x);
+        const double a  = static_cast<double>(asym);
+        const double x0 = prevX_[static_cast<size_t>(c)];
+        prevX_[static_cast<size_t>(c)] = xd;
+        const double dx = xd - x0;
+        if (std::abs(dx) > 1e-7)
+            return static_cast<T>((f1(xd, a) - f1(x0, a)) / dx);
+        const double m = 0.5 * (xd + x0);
+        return static_cast<T>((m >= 0.0) ? std::tanh(m) : std::tanh(m * a));
     }
 };
 
@@ -233,15 +241,10 @@ class WavefolderAlgorithm final : public SaturationAlgorithm<T>
 {
     static constexpr int kMaxCh = 16;
     std::array<T, kMaxCh> lastX_ {};
-    std::array<T, kMaxCh> lastF_ {};
 
 public:
     void prepare(const AudioSpec&) noexcept override { reset(); }
-    void reset() noexcept override
-    {
-        lastX_.fill(T(0));
-        lastF_.fill(T(-1));
-    }
+    void reset() noexcept override { lastX_.fill(T(0)); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Wavefolder; }
 
     /**
@@ -260,18 +263,18 @@ public:
         const T bias = character * (pi<T> / T(4));
         const T x    = sample * drive + bias;
         const T sb   = std::sin(bias);
-        T F_x = -std::cos(x);
-        T diff = x - lastX_[ch];
+        const int c  = ch & (kMaxCh - 1);
 
-        T result;
-        if (std::abs(diff) > T(1e-5))
-            result = (F_x - lastF_[ch]) / diff - sb;   // exact: mean of sin minus the constant
-        else
-            result = std::sin(x) - sb;
-
-        lastX_[ch] = x;
-        lastF_[ch] = F_x;
-        return result;
+        // Mean of sin over [x0, x], (cos x0 - cos x) / (x - x0), written as
+        // sin(mid) * sinc(half) via the sum-to-product identity: exact, with
+        // no cancellation (the difference of cosines lost most of its digits
+        // in float whenever consecutive inputs were close).
+        const T half = T(0.5) * (x - lastX_[static_cast<size_t>(c)]);
+        const T mid  = T(0.5) * (x + lastX_[static_cast<size_t>(c)]);
+        const T sinc = (std::abs(half) > T(1e-4)) ? std::sin(half) / half
+                                                  : T(1) - half * half / T(6);
+        lastX_[static_cast<size_t>(c)] = x;
+        return std::sin(mid) * sinc - sb;
     }
 };
 

@@ -1040,6 +1040,71 @@ DSPARK_TEST(TransientDesigner_attack_boost_changes_peak)
     EXPECT_GT(peakAfter, peakBefore * 0.8f);
 }
 
+// The envelopes used to follow the rectified signal, whose fast envelope
+// ripples at twice the signal frequency: a steady note was gain-modulated as
+// if it were a string of transients (measured THD+N on a steady 40 Hz tone:
+// 2.5% at attack +50%, 4.5% at sustain -50%). They now follow
+// max(|x|, analytic magnitude), which is flat for a steady tone, while hits
+// are still shaped (the attack boost on a kick-like hit is checked too).
+DSPARK_TEST(TransientDesigner_leaves_steady_tones_undistorted)
+{
+    const double fs = 48000.0;
+    auto thdn = [&](double f, double attack, double sustain) {
+        TransientDesigner<double> td;
+        td.prepare(fs);
+        td.setAttack(attack);
+        td.setSustain(sustain);
+        const int n = 48000;
+        std::vector<double> y(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) y[static_cast<size_t>(i)] = 0.5 * std::sin(twoPi<double> * f * i / fs);
+        for (int off = 0; off < n; off += 512)
+        {
+            double* p[1] = { y.data() + off };
+            td.processBlock(AudioBufferView<double>(p, 1, std::min(512, n - off)));
+        }
+        // Least-squares sine fit over the settled half; the residual is THD+N.
+        double ss = 0, sc = 0, cc = 0, ys = 0, yc = 0;
+        for (int i = n / 2; i < n; ++i)
+        {
+            const double si = std::sin(twoPi<double> * f * i / fs), co = std::cos(twoPi<double> * f * i / fs);
+            ss += si * si; sc += si * co; cc += co * co;
+            ys += y[static_cast<size_t>(i)] * si; yc += y[static_cast<size_t>(i)] * co;
+        }
+        const double det = ss * cc - sc * sc;
+        const double a = (ys * cc - yc * sc) / det, b = (yc * ss - ys * sc) / det;
+        double res = 0, sig = 0;
+        for (int i = n / 2; i < n; ++i)
+        {
+            const double fit = a * std::sin(twoPi<double> * f * i / fs) + b * std::cos(twoPi<double> * f * i / fs);
+            res += (y[static_cast<size_t>(i)] - fit) * (y[static_cast<size_t>(i)] - fit);
+            sig += fit * fit;
+        }
+        return std::sqrt(res / sig);
+    };
+    for (double f : { 40.0, 100.0, 1000.0 })
+    {
+        EXPECT_LT(thdn(f, 50.0, 0.0), 1e-3);    // < 0.1 %
+        EXPECT_LT(thdn(f, 0.0, -50.0), 1e-3);
+    }
+
+    // A kick-like hit (55 Hz, 150 ms decay) still gets its onset lifted.
+    TransientDesigner<double> td;
+    td.prepare(fs);
+    td.setAttack(50.0);
+    std::vector<double> kick(12000), out;
+    for (int i = 0; i < 12000; ++i)
+    {
+        const double t = i / fs;
+        kick[static_cast<size_t>(i)] = i < 2000 ? 0.0 : 0.8 * std::exp(-(t - 2000 / fs) / 0.15) * std::sin(twoPi<double> * 55.0 * (t - 2000 / fs));
+    }
+    out = kick;
+    double* p[1] = { out.data() };
+    td.processBlock(AudioBufferView<double>(p, 1, 12000));
+    double eIn = 0, eOut = 0;
+    for (int i = 2000; i < 2240; ++i) { eIn += kick[static_cast<size_t>(i)] * kick[static_cast<size_t>(i)]; eOut += out[static_cast<size_t>(i)] * out[static_cast<size_t>(i)]; }
+    EXPECT_GT(10.0 * std::log10(eOut / eIn), 3.0);
+}
+
 DSPARK_TEST(TransientDesigner_no_NaN)
 {
     TransientDesigner<float> td;

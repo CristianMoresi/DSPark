@@ -531,14 +531,18 @@ public:
 
         const int64_t first = intPos - (half - 1);
         const auto start = static_cast<size_t>(first & mask);
-        const T* x = ring + start;
-        T window[kMaxTaps];
-        if (start + static_cast<size_t>(taps) > static_cast<size_t>(mask) + 1)
+        if (start + static_cast<size_t>(taps) > static_cast<size_t>(mask) + 1) [[unlikely]]
         {
+            // The window straddles the ring's end: gather it (value-initialised,
+            // so no compiler can see an unwritten element reach the dot product).
+            T window[kMaxTaps] {};
             for (int k = 0; k < taps; ++k)
                 window[k] = ring[static_cast<size_t>((first + k) & mask)];
-            x = window;
+            const T a = simd::dotProductT(h0, window, taps);
+            const T b = simd::dotProductT(h1, window, taps);
+            return a + t * (b - a);
         }
+        const T* x = ring + start;
         const T a = simd::dotProductT(h0, x, taps);
         const T b = simd::dotProductT(h1, x, taps);
         return a + t * (b - a);

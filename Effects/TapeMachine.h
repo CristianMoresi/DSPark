@@ -50,9 +50,9 @@
  *    sidebands near the base-rate Nyquist).
  *
  * The dry path of the mix control is delay-compensated to getLatency(). The
- * mix is applied per block without smoothing: the wet stream is correlated
- * with and aligned to the dry, so a mix step moves the output by the (small)
- * timbral difference only - measured below the steady-state sample delta.
+ * mix ramps at no more than full scale per 20 ms, like the other saturators:
+ * the wet stream is aligned to the dry, but at high drive the timbral
+ * difference a step would jump across is not small.
  * Channels beyond the prepared count pass through untouched.
  *
  * Threading model: parameter setters/getters are std::atomic based and safe
@@ -138,6 +138,7 @@ public:
         prepared_.store(false, std::memory_order_relaxed);
         spec_ = spec;
         sampleRate_ = spec.sampleRate;
+        mixMaxStep_ = static_cast<T>(1.0 / std::max(1.0, sampleRate_ * 0.02));
         numChannels_ = spec.numChannels;
         maxBlock_ = std::max(spec.maxBlockSize, 1);
 
@@ -244,6 +245,7 @@ public:
         firPos_ = 0;
         delayPos_ = 0;
         dryPos_ = 0;
+        currentMix_ = mix_.load(std::memory_order_relaxed); // no fade-in on start
         biasPhase_ = 0;
         modPhaseWow_ = 0.0;
         modPhaseFlut_ = 0.0;
@@ -462,7 +464,8 @@ public:
             && dirty_.exchange(false, std::memory_order_acquire))
             recompute();
 
-        const T mixVal = mix_.load(std::memory_order_relaxed);
+        const T mixTarget = mix_.load(std::memory_order_relaxed);
+        const T mixStart  = currentMix_;
         const double noiseAmp = std::pow(10.0, static_cast<double>(
             noiseDb_.load(std::memory_order_relaxed)) / 20.0);
         const bool noiseOn = noiseDb_.load(std::memory_order_relaxed) > T(-120);
@@ -594,6 +597,7 @@ public:
                 const auto& dry = dryRing_[static_cast<size_t>(ch)];
                 const int dryIdx = (dryPos_ + i - latency_) & (drySize_ - 1);
                 const T drySample = dry[static_cast<size_t>(dryIdx)];
+                const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + 1));
                 d[i] = drySample + (w - drySample) * mixVal;
             }
 
@@ -601,6 +605,7 @@ public:
             delayPos_ = (delayPos_ + 1) & delayMask_;
         }
         dryPos_ = (dryPos_ + nS) & (drySize_ - 1);
+        currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS));
     }
 
 private:
@@ -990,6 +995,8 @@ private:
     std::atomic<T> wowFlutter_ { T(0.15) };
     std::atomic<T> noiseDb_ { T(-200) };
     std::atomic<T> mix_ { T(1) };
+    T currentMix_ = T(1);            ///< Audio-thread mix ramp state (exact landing).
+    T mixMaxStep_ = T(1.0 / 960.0);  ///< Mix ramp rate: full scale per 20 ms.
     std::atomic<bool> dirty_ { true };
 };
 

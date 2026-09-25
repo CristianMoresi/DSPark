@@ -28,6 +28,7 @@
 #include "../Effects/SpectralDenoiser.h"
 #include "../Effects/TubePreamp.h"
 #include "../Effects/TransformerModel.h"
+#include "../Effects/TapeMachine.h"
 #include "../Core/FFT.h"
 
 #include <algorithm>
@@ -1211,7 +1212,8 @@ DSPARK_TEST(DynamicEQ_does_not_distort_steady_bass)
     }
 }
 
-// The dry/wet mix of these four effects used to ramp across one block, so
+// The dry/wet mix of these effects used to ramp across one block (or, in
+// TapeMachine, to step unsmoothed), so
 // with 32-sample blocks a mix change landed in 0.7 ms and clicked against the
 // distorted / shifted / decorrelated wet stream. The ramp is now rate limited
 // to full scale per 20 ms whatever the block size: one 32-sample block after
@@ -1261,6 +1263,8 @@ DSPARK_TEST(Wet_dry_mix_ramps_over_20_ms_with_small_blocks)
         [](auto& fx) { fx.setSemitones(5.0f); }), 0.9);
     EXPECT_GT(effectiveMixAfterOneBlock.template operator()<GranularProcessor<float>>(
         [](auto&) {}), 0.9);
+    EXPECT_GT(effectiveMixAfterOneBlock.template operator()<TapeMachine<float>>(
+        [](auto& fx) { fx.setDrive(12.0f); }), 0.9);  // was an unsmoothed step
 }
 
 DSPARK_TEST(DynamicEQ_below_threshold_no_change)

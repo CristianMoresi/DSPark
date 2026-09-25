@@ -1191,18 +1191,13 @@ protected:
         return targetGR_Db;
     }
 
-    // ---- Detectors ----
-
     /**
-     * @brief Computes level detection in Decibels.
-     * @param sample Input sample.
-     * @param ch Channel index (for state tracking).
-     * @param detType Selected detector methodology.
-     * @return Decibel representation of detected level.
+     * @brief Makeup dB to linear, cached: the makeup is shared by every
+     * channel of a frame and constant unless automated or adaptive. Same
+     * value as a direct decibelsToGain() call.
+     * @param makeupDb Makeup gain in dB.
+     * @return Linear makeup gain.
      */
-    /** Makeup dB -> linear, cached: the makeup is shared by every channel of
-     *  a frame and constant unless automated or adaptive. Same value as a
-     *  direct decibelsToGain() call. */
     [[nodiscard]] T makeupToGain(T makeupDb) noexcept
     {
         if (makeupDb != cachedMakeupDb_)
@@ -1213,6 +1208,15 @@ protected:
         return cachedMakeupLin_;
     }
 
+    // ---- Detectors ----
+
+    /**
+     * @brief Computes level detection in Decibels.
+     * @param sample Input sample.
+     * @param ch Channel index (for state tracking).
+     * @param detType Selected detector methodology.
+     * @return Decibel representation of detected level.
+     */
     [[nodiscard]] T detectLevel(T sample, int ch, DetectorType detType) noexcept
     {
         T level = std::abs(sample);

@@ -466,6 +466,7 @@ namespace dspark
 
             /**
              * @brief Enables one-pole smoothing of the held targets.
+             * @param shouldBeEnabled True to smooth, false for hard steps.
              * @param timeInMs Time constant in ms; zero, negative or NaN means
              *                 instantaneous. Stored as a time, so it stays
              *                 correct across a later prepare() at another rate.

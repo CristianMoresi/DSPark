@@ -941,18 +941,21 @@ DSPARK_TEST(SampleAndHold_trigger_mode_level_semantics)
     for (int i = 0; i < 8; ++i) EXPECT_TRUE(more[i] == held);
 }
 
-DSPARK_TEST(SampleAndHold_setHoldRate_rounds_and_rejects_invalid)
+DSPARK_TEST(SampleAndHold_setHoldRate_is_exact_and_rejects_invalid)
 {
-    // 48000 / 9601 = 4.9995: nearest period is 5 (truncation would give 4 and
-    // bias the effective rate upward by a full step).
+    // 48000 / 9601 = 4.9995: the period is fractional now. Truncating to 4
+    // used to bias the rate a full step up and rounding to 5 still moved it;
+    // the capture lands on the 5th call and takes the input at the exact
+    // instant 4.9995 (the ramp value there).
     SampleAndHold<float> sh;
     sh.setHoldRate(9601.0, 48000.0);
     sh.reset(0.0f);
+    EXPECT_NEAR(sh.getHoldPeriod(), 48000.0 / 9601.0, 1e-12);
     EXPECT_NEAR(sh.process(1.0f), 0.0f, 1e-6f);
     EXPECT_NEAR(sh.process(2.0f), 0.0f, 1e-6f);
     EXPECT_NEAR(sh.process(3.0f), 0.0f, 1e-6f);
-    EXPECT_NEAR(sh.process(4.0f), 0.0f, 1e-6f); // truncated period 4 captures here
-    EXPECT_NEAR(sh.process(5.0f), 5.0f, 1e-6f); // rounded period 5 captures here
+    EXPECT_NEAR(sh.process(4.0f), 0.0f, 1e-6f);
+    EXPECT_NEAR(sh.process(5.0f), static_cast<float>(48000.0 / 9601.0), 1e-5f);
 
     // Exact ratio stays exact.
     sh.setHoldRate(12000.0, 48000.0);
@@ -975,6 +978,41 @@ DSPARK_TEST(SampleAndHold_setHoldRate_rounds_and_rejects_invalid)
     sh.reset(0.33f);
     for (int i = 0; i < 1000; ++i)
         EXPECT_TRUE(sh.process(1.0f) == 0.33f);
+}
+
+DSPARK_TEST(SampleAndHold_fractional_period_captures_exact_instants)
+{
+    // A fractional period keeps the average rate exact (7 kHz at 48 kHz is a
+    // 6.857-sample period, which whole-sample periods could only reach as
+    // 6.86 kHz or 8 kHz) and each capture reads the input at its exact
+    // instant: on a unit ramp the k-th held value is k * period.
+    SampleAndHold<double> sh;
+    sh.setHoldRate(7000.0, 48000.0);
+    sh.reset(0.0);
+    const double period = 48000.0 / 7000.0;
+
+    int captures = 0;
+    double last = 0.0;
+    double worstInstant = 0.0;
+    for (int n = 1; n <= 48000; ++n)
+    {
+        const double held = sh.process(static_cast<double>(n));
+        if (held != last)
+        {
+            ++captures;
+            worstInstant = std::max(worstInstant, std::abs(held - captures * period));
+            last = held;
+        }
+    }
+    EXPECT_EQ(captures, 7000);
+    EXPECT_TRUE(worstInstant < 1e-6);
+
+    // Degenerate periods: below 1 and NaN clamp to transparent.
+    sh.setHoldPeriod(0.25);
+    EXPECT_NEAR(sh.getHoldPeriod(), 1.0, 0.0);
+    sh.setHoldPeriod(std::numeric_limits<double>::quiet_NaN());
+    EXPECT_NEAR(sh.getHoldPeriod(), 1.0, 0.0);
+    EXPECT_NEAR(sh.process(0.5), 0.5, 0.0);
 }
 
 DSPARK_TEST(SampleAndHold_block_matches_per_sample_counter)

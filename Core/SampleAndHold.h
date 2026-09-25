@@ -7,10 +7,11 @@
  * @file SampleAndHold.h
  * @brief Sample-and-hold processor for stepped modulation and bit-crushing.
  *
- * Captures an input sample and holds it for a configurable number of samples
- * or until an external trigger fires. This introduces deliberate spectral
- * imaging (aliasing) due to its Zero-Order Hold (ZOH) nature, making it ideal
- * for creative bit-crushing and classic stepped LFO synthesis.
+ * Captures an input sample and holds it for a configurable (fractional)
+ * number of samples or until an external trigger fires. This introduces
+ * deliberate spectral imaging (aliasing) due to its Zero-Order Hold (ZOH)
+ * nature, making it ideal for creative bit-crushing, sample-rate reduction
+ * and classic stepped LFO synthesis.
  *
  * Threading: owner-managed. Not internally thread-safe: call setters and
  * process methods from the owning (audio) thread, or synchronise externally.
@@ -22,6 +23,7 @@
 
 #include "DspMath.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -51,7 +53,7 @@ public:
     void setMode(Mode mode) noexcept { mode_ = mode; }
 
     /**
-     * @brief Sets the hold duration for Counter mode in samples.
+     * @brief Sets the hold duration for Counter mode in whole samples.
      *
      * A value of 1 passes the signal transparently. A value of N reduces the
      * effective sample rate by a factor of N. Capture phase: after reset(),
@@ -62,14 +64,40 @@ public:
      */
     void setHoldSamples(int numSamples) noexcept
     {
-        holdPeriod_ = numSamples > 0 ? numSamples : 1;
+        setHoldPeriod(static_cast<double>(numSamples));
     }
 
     /**
-     * @brief Sets the hold period based on a target effective sample rate.
+     * @brief Sets a fractional hold period for Counter mode, in samples.
      *
-     * The period is rounded to the nearest integer (truncating would bias the
-     * effective rate upward) and clamped to a valid range.
+     * A non-integer period keeps the average capture rate exact, so a swept
+     * rate moves continuously instead of jumping between whole-sample periods
+     * (at 48 kHz those are 24 k, 16 k, 12 k, 9.6 k...). Each capture takes the
+     * input at its exact fractional instant, interpolated linearly between
+     * the two neighbouring samples; the held steps themselves still change on
+     * sample boundaries. Integer periods behave exactly as setHoldSamples().
+     *
+     * @param samples Hold period in samples. Values below 1 and NaN clamp to
+     *                1; huge values clamp to 2^31 - 1 (holds indefinitely).
+     */
+    void setHoldPeriod(double samples) noexcept
+    {
+        constexpr double maxPeriod = static_cast<double>(std::numeric_limits<int>::max());
+        holdPeriod_ = (samples >= 1.0) ? std::min(samples, maxPeriod) : 1.0; // NaN -> 1
+        // An integer period drops any sub-sample offset left by a fractional
+        // one, so it captures on the sample grid (period 1 is transparent).
+        if (holdPeriod_ == std::floor(holdPeriod_))
+            phase_ = std::floor(phase_);
+    }
+
+    /** @brief Returns the Counter-mode hold period in samples. */
+    [[nodiscard]] double getHoldPeriod() const noexcept { return holdPeriod_; }
+
+    /**
+     * @brief Sets the hold period from a target effective sample rate.
+     *
+     * The period is the exact ratio actualRate / targetRate (fractional, see
+     * setHoldPeriod()), so the effective rate is exactly targetRate on average.
      *
      * @param targetRate The desired effective sample rate in Hz. Invalid
      * values (non-positive or NaN, either argument) reset the period to 1.
@@ -79,15 +107,10 @@ public:
     {
         if (!(targetRate > 0.0) || !(actualRate > 0.0))
         {
-            setHoldSamples(1);
+            setHoldPeriod(1.0);
             return;
         }
-        // Clamp in double before the integer conversion: a huge ratio would
-        // overflow the int cast (undefined behaviour).
-        const double ratio = actualRate / targetRate;
-        constexpr double maxPeriod = static_cast<double>(std::numeric_limits<int>::max());
-        setHoldSamples(ratio >= maxPeriod ? std::numeric_limits<int>::max()
-                                          : static_cast<int>(std::llround(ratio)));
+        setHoldPeriod(actualRate / targetRate);
     }
 
     /**
@@ -105,21 +128,10 @@ public:
     [[nodiscard]] T process(T input, bool trigger = false) noexcept
     {
         if (mode_ == Mode::Counter)
-        {
-            ++counter_;
-            if (counter_ >= holdPeriod_)
-            {
-                heldValue_ = input;
-                counter_ = 0;
-            }
-        }
-        else // Mode::Trigger
-        {
-            if (trigger)
-            {
-                heldValue_ = input;
-            }
-        }
+            advanceCounter(input);
+        else if (trigger) // Mode::Trigger
+            heldValue_ = input;
+        previous_ = input;
         return heldValue_;
     }
 
@@ -140,18 +152,16 @@ public:
             // Branch hoisted out of the hot loop
             for (int i = 0; i < numSamples; ++i)
             {
-                ++counter_;
-                if (counter_ >= holdPeriod_)
-                {
-                    heldValue_ = data[i];
-                    counter_ = 0;
-                }
+                const T input = data[i];
+                advanceCounter(input);
+                previous_ = input;
                 data[i] = heldValue_;
             }
         }
-        else
+        else if (numSamples > 0)
         {
             // In trigger mode with no triggers provided, it holds indefinitely.
+            previous_ = data[numSamples - 1];
             for (int i = 0; i < numSamples; ++i)
             {
                 data[i] = heldValue_;
@@ -182,6 +192,7 @@ public:
                 {
                     heldValue_ = data[i];
                 }
+                previous_ = data[i];
                 data[i] = heldValue_;
             }
         }
@@ -205,14 +216,32 @@ public:
     void reset(T initialValue = T(0)) noexcept
     {
         heldValue_ = initialValue;
-        counter_ = 0; // Ensures initialValue is output before the next capture
+        previous_ = initialValue;
+        phase_ = 0.0; // Ensures initialValue is output before the next capture
     }
 
 private:
+    /** Counter-mode step: captures once a full (fractional) period elapsed.
+     *  After the wrap, phase_ is how far past the exact capture instant this
+     *  sample lies (0 for integer periods, where the capture is exact). */
+    inline void advanceCounter(T input) noexcept
+    {
+        phase_ += 1.0;
+        if (phase_ >= holdPeriod_)
+        {
+            phase_ -= holdPeriod_;
+            // The period shrank below the time already elapsed: capture now.
+            if (phase_ >= 1.0) phase_ = 0.0;
+            heldValue_ = (phase_ > 0.0) ? input - static_cast<T>(phase_) * (input - previous_)
+                                        : input;
+        }
+    }
+
     Mode mode_ = Mode::Counter;
-    int holdPeriod_ = 1;
-    int counter_ = 0;
+    double holdPeriod_ = 1.0;
+    double phase_ = 0.0;     ///< Samples elapsed since the last capture instant.
     T heldValue_ = T(0);
+    T previous_ = T(0);      ///< Last input, for the fractional capture.
 };
 
 } // namespace dspark

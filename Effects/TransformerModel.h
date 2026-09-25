@@ -49,8 +49,8 @@
  * a release store and consumed at the next block). prepare() is setup-thread
  * only (allocates; invalid specs are ignored and an unprepared instance
  * passes audio through). reset() belongs to the stream owner.
- * getState()/setState() are setup/UI threads. The dry/wet mix is smoothed
- * linearly over one block. Channels beyond the prepared count pass through
+ * getState()/setState() are setup/UI threads. The dry/wet mix is
+ * ramped at no more than full scale per 20 ms, whatever the block size. Channels beyond the prepared count pass through
  * untouched.
  *
  * Dependencies: Core/Hysteresis.h, Core/Biquad.h, Core/AudioSpec.h,
@@ -96,6 +96,7 @@ public:
         if (!spec.isValid()) return;
         prepared_.store(false, std::memory_order_relaxed);
         sampleRate_ = spec.sampleRate;
+        mixMaxStep_ = static_cast<T>(1.0 / std::max(1.0, sampleRate_ * 0.02));
         numChannels_ = spec.numChannels;
 
         channels_.assign(static_cast<size_t>(numChannels_), {});
@@ -162,7 +163,7 @@ public:
         dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Dry/wet mix [0, 1]; smoothed linearly over one block. Zero
+    /** @brief Dry/wet mix [0, 1]; ramped over at least 20 ms. Zero
      *  latency: no compensation needed. Non-finite values are ignored. */
     void setMix(T mix) noexcept
     {
@@ -221,13 +222,13 @@ public:
             && dirty_.exchange(false, std::memory_order_acquire))
             recompute();
 
-        // Linear per-block mix ramp with exact landing (settled: step == 0
-        // and the per-sample value reduces to the constant, bit-identically).
+        // Rate-limited mix ramp (moveTowards, exact landing; settled it
+        // reduces to the constant, bit-identically). A per-block ramp landed
+        // in 0.7 ms with 32-sample blocks.
         // A hard flip on the differentiated wet stream clicked at 4.6x the
         // steady-state sample delta.
         const T mixTarget = mix_.load(std::memory_order_relaxed);
         const T mixStart  = currentMix_;
-        const T mixStep   = (mixTarget - mixStart) / static_cast<T>(nS);
 
         // Anti-zipper: GEOMETRIC in-block ramps toward the recompute()
         // targets (~50 ms across blocks), shared by all channels. Two
@@ -290,11 +291,11 @@ public:
                 const double y = st.bell.process(hp);
 
                 const T wet = static_cast<T>(y);
-                const T mixVal = mixStart + mixStep * static_cast<T>(i);
+                const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + 1));
                 d[i] = d[i] + (wet - d[i]) * mixVal;
             }
         }
-        currentMix_ = mixTarget;   // exact landing
+        currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS));
         hScaleSm_ = hEnd;
         mScaleSm_ = mEnd;
     }
@@ -412,6 +413,7 @@ private:
     double hScaleSm_ = -1.0;    ///< Anti-zipper ramp states (-1 = seed on
     double mScaleSm_ = -1.0;    ///<  first block after prepare/reset).
     T currentMix_ = T(1);       ///< Audio-thread mix ramp state.
+    T mixMaxStep_ = T(1.0 / 960.0); ///< Mix ramp rate: full scale per 20 ms.
 
     std::atomic<T> driveDb_ { T(0) };
     std::atomic<T> coreSize_ { T(0.5) };

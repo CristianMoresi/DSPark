@@ -61,8 +61,9 @@
  * only (allocates and runs the reference calibration; invalid specs are
  * ignored and an unprepared instance passes audio through). reset() belongs
  * to the stream owner. getState()/setState() are setup/UI threads.
- * getSupplyVoltage() is a metering-style read. The dry/wet mix is smoothed
- * linearly over one block. Channels beyond the prepared count pass through
+ * getSupplyVoltage() is a metering-style read. The dry/wet mix ramps at a
+ * rate of at most full scale per 20 ms, whatever the block size (a per-block
+ * ramp landed in 0.7 ms with 32-sample blocks and clicked). Channels beyond the prepared count pass through
  * untouched.
  *
  * Dependencies: Core/WDF.h, Core/Oversampling.h, Core/Biquad.h,
@@ -113,6 +114,7 @@ public:
         prepared_.store(false, std::memory_order_relaxed);
         spec_ = spec;
         sampleRate_ = spec.sampleRate;
+        mixMaxStep_ = static_cast<T>(1.0 / std::max(1.0, sampleRate_ * 0.02));
         // Internal processing rate = active oversampling factor x base rate
         // (the factor is configurable; 1 = off, no resampling).
         fs2_ = static_cast<double>(osFactor_) * sampleRate_;
@@ -254,7 +256,7 @@ public:
     }
 
     /** @brief Dry/wet mix [0, 1]; dry is latency-compensated and the mix is
-     *  smoothed linearly over one block. Non-finite values are ignored. */
+     *  ramped over at least 20 ms. Non-finite values are ignored. */
     void setMix(T mix) noexcept
     {
         if (!std::isfinite(mix)) return;
@@ -352,11 +354,10 @@ public:
             && dirty_.exchange(false, std::memory_order_acquire))
             recompute();
 
-        // Linear per-block mix ramp with exact landing (settled: step == 0
-        // and the per-sample value reduces to the constant, bit-identically).
+        // Rate-limited mix ramp (moveTowards, exact landing; settled it
+        // reduces to the constant, bit-identically).
         const T mixTarget = mix_.load(std::memory_order_relaxed);
         const T mixStart  = currentMix_;
-        const T mixStep   = (mixTarget - mixStart) / static_cast<T>(nS);
         const double outGain = mScale_
             * std::pow(10.0, static_cast<double>(outputDb_.load(std::memory_order_relaxed)) / 20.0);
 
@@ -426,11 +427,11 @@ public:
             {
                 const int idx = (dryPos_ + i - latency_) & (drySize_ - 1);
                 const T drySample = dry[static_cast<size_t>(idx)];
-                const T mixVal = mixStart + mixStep * static_cast<T>(i);
+                const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + 1));
                 d[i] = drySample + (d[i] - drySample) * mixVal;
             }
         }
-        currentMix_ = mixTarget;   // exact landing
+        currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS));
         dryPos_ = (dryPos_ + nS) & (drySize_ - 1);
     }
 
@@ -862,6 +863,7 @@ private:
     double hScaleSm_ = -1.0;                    ///< Anti-zipper ramp states (-1 = seed on
     double outGainSm_ = -1.0;                   ///<  first block after prepare/reset).
     T currentMix_ = T(1);                       ///< Audio-thread mix ramp state.
+    T mixMaxStep_ = T(1.0 / 960.0);             ///< Mix ramp rate: full scale per 20 ms.
 
     std::atomic<T> driveDb_ { T(0) };
     std::atomic<T> treble_ { T(0.5) };

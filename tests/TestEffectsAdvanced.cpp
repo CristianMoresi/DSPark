@@ -26,6 +26,8 @@
 #include "../Effects/detail/PhaseVocoderEngine.h"
 #include "../Effects/GranularProcessor.h"
 #include "../Effects/SpectralDenoiser.h"
+#include "../Effects/TubePreamp.h"
+#include "../Effects/TransformerModel.h"
 #include "../Core/FFT.h"
 
 #include <algorithm>
@@ -1207,6 +1209,58 @@ DSPARK_TEST(DynamicEQ_does_not_distort_steady_bass)
         EXPECT_LT(std::sqrt(res / sig), 1e-4);   // < 0.01 %
         EXPECT_LT(eq.getBandGainDb(0), -3.0);    // and the band still compresses
     }
+}
+
+// The dry/wet mix of these four effects used to ramp across one block, so
+// with 32-sample blocks a mix change landed in 0.7 ms and clicked against the
+// distorted / shifted / decorrelated wet stream. The ramp is now rate limited
+// to full scale per 20 ms whatever the block size: one 32-sample block after
+// switching from wet to dry the output must still be almost fully wet. The
+// effective mix is read against fully wet and fully dry twins.
+DSPARK_TEST(Wet_dry_mix_ramps_over_20_ms_with_small_blocks)
+{
+    auto effectiveMixAfterOneBlock = []<typename Fx>(auto setup) {
+        Fx wet, dry, subject;
+        for (Fx* fx : { &wet, &dry, &subject })
+        {
+            setup(*fx);
+            fx->prepare(spec(48000.0, 32, 1));
+        }
+        dry.setMix(0.0f);
+        dry.reset();
+        const int warm = 32 * 150;
+        std::vector<float> in(static_cast<size_t>(warm + 32));
+        for (size_t i = 0; i < in.size(); ++i)
+            in[i] = 0.5f * std::sin(6.2831853f * 220.0f * static_cast<float>(i) / 48000.0f);
+        std::vector<float> a = in, b = in, c = in;
+        for (int off = 0; off < warm + 32; off += 32)
+        {
+            if (off == warm) subject.setMix(0.0f);   // wet -> dry at a block edge
+            float* pa[1] = { a.data() + off };
+            float* pb[1] = { b.data() + off };
+            float* pc[1] = { c.data() + off };
+            wet.processBlock(AudioBufferView<float>(pa, 1, 32));
+            dry.processBlock(AudioBufferView<float>(pb, 1, 32));
+            subject.processBlock(AudioBufferView<float>(pc, 1, 32));
+        }
+        // mix = (subject - dry) / (wet - dry), on the last samples of the block
+        double num = 0.0, den = 0.0;
+        for (int i = warm + 24; i < warm + 32; ++i)
+        {
+            const double d = static_cast<double>(a[static_cast<size_t>(i)]) - b[static_cast<size_t>(i)];
+            num += (static_cast<double>(c[static_cast<size_t>(i)]) - b[static_cast<size_t>(i)]) * d;
+            den += d * d;
+        }
+        return den > 0.0 ? num / den : -1.0;
+    };
+    EXPECT_GT(effectiveMixAfterOneBlock.template operator()<TubePreamp<float>>(
+        [](auto& fx) { fx.setDrive(12.0f); }), 0.9);
+    EXPECT_GT(effectiveMixAfterOneBlock.template operator()<TransformerModel<float>>(
+        [](auto& fx) { fx.setDrive(12.0f); }), 0.9);
+    EXPECT_GT(effectiveMixAfterOneBlock.template operator()<PitchShifter<float>>(
+        [](auto& fx) { fx.setSemitones(5.0f); }), 0.9);
+    EXPECT_GT(effectiveMixAfterOneBlock.template operator()<GranularProcessor<float>>(
+        [](auto&) {}), 0.9);
 }
 
 DSPARK_TEST(DynamicEQ_below_threshold_no_change)

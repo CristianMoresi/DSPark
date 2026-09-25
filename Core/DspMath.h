@@ -108,6 +108,25 @@ template <FloatType T>
     return outMin + (outMax - outMin) * ((value - inMin) / (inMax - inMin));
 }
 
+/**
+ * @brief Moves a value toward a target by at most a given distance.
+ *
+ * The rate-limiter step: lands exactly on the target once within reach.
+ * Evaluated with maxDelta = step * (i + 1) it gives the i-th sample of a
+ * rate-limited ramp in closed form (no loop-carried state), which is how the
+ * framework's dry/wet ramps keep a minimum duration whatever the block size.
+ *
+ * @param from     Current value.
+ * @param to       Target value.
+ * @param maxDelta Largest allowed move (non-negative).
+ * @return from + clamp(to - from, -maxDelta, maxDelta).
+ */
+template <FloatType T>
+[[nodiscard]] inline T moveTowards(T from, T to, T maxDelta) noexcept
+{
+    return from + std::clamp(to - from, -maxDelta, maxDelta);
+}
+
 // ============================================================================
 // Fast Approximations
 // ============================================================================

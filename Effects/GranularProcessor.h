@@ -21,8 +21,8 @@
  * from any thread (non-finite values are ignored). prepare() is setup-thread
  * only (allocates; invalid specs are ignored and an unprepared instance
  * passes audio through). reset() belongs to the stream owner.
- * getState()/setState() are setup/UI threads. The dry/wet mix is smoothed
- * linearly over one block (the grain cloud is decorrelated from the dry
+ * getState()/setState() are setup/UI threads. The dry/wet mix is
+ * ramped at no more than full scale per 20 ms, whatever the block size (the grain cloud is decorrelated from the dry
  * signal, so an unsmoothed step would click). Channels beyond the first two
  * pass through untouched.
  *
@@ -78,6 +78,7 @@ public:
         if (!std::isfinite(bufferSeconds)) bufferSeconds = 4.0;
         prepared_.store(false, std::memory_order_relaxed);
         sampleRate_ = spec.sampleRate;
+        mixMaxStep_ = static_cast<T>(1.0 / std::max(1.0, sampleRate_ * 0.02));
         numChannels_ = std::min(spec.numChannels, 2);
 
         int size = 1;
@@ -231,13 +232,13 @@ public:
         if (nCh == 0 || nS == 0) return;
 
         const bool frozen = freeze_.load(std::memory_order_relaxed);
-        // Linear per-block mix ramp with exact landing (settled: step == 0
-        // and the per-sample value reduces to the constant, bit-identically).
+        // Rate-limited mix ramp (moveTowards, exact landing; settled it
+        // reduces to the constant, bit-identically). A per-block ramp landed
+        // in 0.7 ms with 32-sample blocks.
         // The cloud is decorrelated from the dry signal: a hard flip clicked
         // at 11x the steady-state sample delta.
         const T mixTarget = mix_.load(std::memory_order_relaxed);
         const T mixStart  = currentMix_;
-        const T mixStep   = (mixTarget - mixStart) / static_cast<T>(nS);
         const double spawnPerSample =
             static_cast<double>(density_.load(std::memory_order_relaxed)) / sampleRate_;
 
@@ -292,7 +293,7 @@ public:
                     g.active = false;
             }
 
-            const T mixVal = mixStart + mixStep * static_cast<T>(i);
+            const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + 1));
             const T dryL = buffer.getChannel(0)[i];
             buffer.getChannel(0)[i] = dryL + (outL - dryL) * mixVal;
             if (nCh > 1)
@@ -301,7 +302,7 @@ public:
                 buffer.getChannel(1)[i] = dryR + (outR - dryR) * mixVal;
             }
         }
-        currentMix_ = mixTarget;   // exact landing
+        currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS));
     }
 
 private:
@@ -378,6 +379,7 @@ private:
     double spawnAcc_ = 0.0;
     uint32_t rng_ = 0x9E3779B9u;
     T currentMix_ = T(1);   ///< Audio-thread mix ramp state.
+    T mixMaxStep_ = T(1.0 / 960.0); ///< Mix ramp rate: full scale per 20 ms.
 
     std::atomic<T> grainMs_ { T(80) };
     std::atomic<T> density_ { T(25) };

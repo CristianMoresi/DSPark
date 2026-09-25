@@ -140,6 +140,7 @@ public:
         // durable part, and it is why this effect keeps the detector it
         // shipped with.
         engine_.prepare(spec.sampleRate, numChannels_, fftSize, true, false, false, false);
+        mixMaxStep_ = static_cast<T>(1.0 / std::max(1.0, spec.sampleRate * 0.02));
         accumMask_ = engine_.olaMask();
 
         dryRing_.assign(static_cast<size_t>(numChannels_), {});
@@ -192,7 +193,7 @@ public:
     }
 
     /** @brief Dry/wet mix, [0, 1]. The dry path is latency-compensated and the
-     *  mix is smoothed linearly over one block (the wet stream is decorrelated
+     *  mix is ramped over at least 20 ms (the wet stream is decorrelated
      *  from the dry, so an unsmoothed step would click). Non-finite values are
      *  ignored. */
     void setMix(T mix) noexcept
@@ -289,11 +290,11 @@ public:
         const int nCh = std::min(buffer.getNumChannels(), numChannels_);
         const int nS  = buffer.getNumSamples();
 
-        // Linear per-block mix ramp with exact landing (settled: step == 0 and
-        // the per-sample value reduces to the constant, bit-identically).
+        // Rate-limited mix ramp (moveTowards, exact landing; settled it
+        // reduces to the constant, bit-identically). A per-block ramp landed
+        // in 0.7 ms with 32-sample blocks.
         const T mixTarget = mix_.load(std::memory_order_relaxed);
         const T mixStart  = currentMix_;
-        const T mixStep   = (nS > 0) ? (mixTarget - mixStart) / static_cast<T>(nS) : T(0);
 
         int i = 0;
         while (i < nS)
@@ -333,7 +334,7 @@ public:
                     const T wet = readCatmullRom(acc, rp, rf);
                     const int dryIdx = (dp - latency_) & dryMask_;
                     const T drySample = dry[static_cast<size_t>(dryIdx)];
-                    const T mixVal = mixStart + mixStep * static_cast<T>(i + k);
+                    const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + k + 1));
                     // Two-product blend: exact at both ends (mix 1 emits the
                     // wet stream bit-exactly, mix 0 the delayed dry).
                     out[k] = drySample * (T(1) - mixVal) + wet * mixVal;
@@ -377,7 +378,7 @@ public:
             i += chunk;
         }
 
-        currentMix_ = mixTarget;   // exact landing
+        currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS));
     }
 
 private:
@@ -424,6 +425,7 @@ private:
     int64_t readPosInt_ = 0;
     double readPosFrac_ = 0.0;
     T currentMix_ = T(1);     ///< Audio-thread mix ramp state (exact landing).
+    T mixMaxStep_ = T(1.0 / 960.0); ///< Mix ramp rate: full scale per 20 ms.
 
     std::atomic<T> semitones_ { T(0) };
     std::atomic<T> mix_ { T(1) };

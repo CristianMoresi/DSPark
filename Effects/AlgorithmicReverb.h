@@ -5,79 +5,81 @@
 
 /**
  * @file AlgorithmicReverb.h
- * @brief World-class 16-line FDN reverb with Jot absorption and Hadamard mixing.
+ * @brief True-stereo 32-line FDN reverb with exact per-band decay and a
+ *        dispersive spring-tank model.
  *
  * Architecture:
  * ```
- * Input (mono sum)
+ * Input L                         Input R
+ *   |                               |
+ * [Pre-delay]                     [Pre-delay]
+ *   |                               |
+ * [Input diffusion: 4 allpass]    [Input diffusion: 4 allpass, other delays]
+ *   |                               |
+ *   +---- diffused rings (L, R) ----+
+ *   |                               |
+ *   +--> [Early reflections: ipsilateral + contralateral taps per side,
+ *   |     grouped air/wall absorption, lateralised early, diffuse late]
  *   |
+ *   +--> [Late injection: one tap per line, L/R interleaved, after the
+ *   |     ER-to-late gap]
+ *   |       |
+ *   |       v
+ *   |    [FDN core: 32 lines]
+ *   |      +- allpass-interpolated read at a smoothly modulated length
+ *   |      +- Hadamard 32x32 mix + line rotation (lossless, dense)
+ *   |      +- Jot absorption shelf (mid/high T60) per line
+ *   |      +- bass shelf (bass/mid T60) per line
+ *   |      +- short in-loop allpass (echo density)
+ *   |      +- safety soft limit, write back + injection
+ *   |       |
+ *   |       v
+ *   |    [Output: orthogonal L/R sign sums -> output diffusion -> width]
  *   v
- * [Pre-delay: 0-200ms]
- *   |
- *   v
- * [Input Diffusion: 8 cascaded allpass, 1.0-9.5ms]
- *   |
- *   +--> [Early Reflections: 40 taps with progressive HF absorption, L/R decorrelated]
- *   |
- *   +--> [ER-to-Late gap]
- *   |       |
- *   |       v
- *   |    [Parallel Allpass Diffuser: 16 parallel AP + Hadamard -> 16 delay + Hadamard]
- *   |    (2-step, 16^2 = 256 echo paths, each FDN line gets unique dense input)
- *   |       |
- *   |       v
- *   |    [FDN Core: 16 delay lines]
- *   |      +- Read with dual smooth-random-LFO modulated delay
- *   |      +- Householder 16x16 reflection (I - (2/N)J, lossless) feedback mix
- *   |      +- Jot absorption filter (1st-order shelving) per line
- *   |      +- Bass shelf (1-pole) per line
- *   |      +- 2 feedback allpass per line
- *   |      +- DC blocker + soft limiter
- *   |      +- Write back + input injection
- *   |       |
- *   |       v
- *   |    [Output: sign-weighted + Dattorro multi-tap]
- *   |       |
- *   |       v
- *   |    [Output Diffusion: 2 allpass/channel, L/R decorrelated]
- *   |
- *   v
- * [Combine early + late] -> [Tone EQ: Biquad LP + HP (12 dB/oct)] -> DryWetMixer -> Output
+ * [Early + late] -> [DC block] -> [Tone EQ] -> DryWetMixer -> Output
  * ```
+ * Type::Spring replaces the FDN with two spring tanks (see runSprings()).
  *
- * Key features:
- * - **Jot absorption filter** (Jot 1991): 1st-order pole-zero shelving IIR per
- *   delay line for smooth frequency-dependent decay, the #1 factor for natural
- *   sound. DC and Nyquist gains anchor the mid/HF T60 exactly; the transition
- *   sits at the high crossover. Separate bass shelf for independent LF control.
- * - **Householder 16x16 FDN feedback** (I - (2/N)J): unitary reflection,
- *   eigenvalues {-1 once, +1 x15}, |lambda|=1 so it is lossless and
- *   zero-coloring. (The Hadamard 16x16 below is the input diffuser's mix, not
- *   the feedback matrix.)
- * - **Parallel allpass diffuser** (Signalsmith-inspired): 16 parallel allpass
- *   + 2-step Hadamard mixing (all eigenvalues +/-1) -> 256 unique echo paths
- *   per input sample.
- *   Each FDN line receives a different, densely-mixed version of the input.
- * - **Feedback allpass**: 2 regular allpass per delay line for in-loop density
- * - **Output diffusion**: 2 allpass per channel with decorrelated delays,
- *   smears residual temporal patterns
- * - **Smooth random modulation** (Lexicon-style): Hermite-interpolated
- *   noise replaces periodic sine LFOs for organic character
- * - **Multi-tap output** (Dattorro-style): 7 taps/channel from different
- *   delay line positions for true temporal decorrelation
- * - **Tone correction EQ**: Biquad high/low cut (12 dB/oct) for tonal shaping
- * - **Early reflections**: 40-tap with progressive frequency absorption
- *   simulating wall absorption; late taps are naturally darker
- * - **Soft saturation**: fast branchless rational soft-clip (transparent below
- *   +/-1), more musical than a hard clamp, prevents pipeline stalls.
- * - **Allpass interpolation**: in modulated FDN reads, preserves HF over
- *   hundreds of feedback iterations (linear/cubic causes cumulative dulling)
- * - **Stereo width**: M/S width control on late reverb tail
- * - **Eco quality mode** (setQuality): opt-in reduced engine (8 FDN lines,
- *   control-rate modulation, linear allpass interpolation, no extra output
- *   taps, single-stage input scatter, 12 early taps) at a fraction of the
- *   CPU cost, for embedded and other constrained targets. The default Full
- *   quality path is bit-identical to previous releases.
+ * Design notes:
+ * - **True stereo.** Each input channel has its own pre-delay, diffusion and
+ *   early reflections, so a left source stays on the left in the early field
+ *   while the late tail becomes diffuse (early taps start lateralised and
+ *   blend toward equal L/R as they get later, like a real room).
+ * - **Exact decay per band.** Each line carries two first-order shelves
+ *   designed by the bilinear transform: the Jot shelf pins the loop gain at
+ *   DC to the mid T60 and at Nyquist to the HF T60 (midpoint at the high
+ *   crossover), the bass shelf pins DC to the bass T60 and leaves the top at
+ *   unity (midpoint at the bass crossover). The gains use each line's full
+ *   loop length (line plus the in-loop allpass's mean group delay). There is
+ *   no DC blocker or smoothing filter in the loop, so nothing else bends the
+ *   decay: measured T60s land within a few percent of the targets in every
+ *   octave, at any sample rate.
+ * - **Low modal coloration.** 32 lines (about 2.7 s of total delay at full
+ *   size) double the modal density of a 16-line network; the Hadamard
+ *   matrix feeds every line from every other with equal weight, and the
+ *   rotation that follows it spreads the eigenvalues over the unit circle.
+ *   The in-loop allpasses are short (1-5 ms, fixed in time), so their
+ *   group-delay ripple barely modulates the decay across frequency.
+ * - **Transparent modulation.** Each line's length wanders with its own
+ *   smooth random LFO (Lexicon style), updated at control rate with a
+ *   per-sample linear ramp and read through a first-order allpass
+ *   interpolator kept in its low-dispersion range ([0.5, 1.5) samples of
+ *   fractional delay), so there is no cumulative HF loss. Depth is set in
+ *   time and scales with the room size: the same chorus at every sample
+ *   rate, and small rooms do not warble. The presets smear the tail's
+ *   resonances while keeping a steady tone's sidebands 45-55 dB down
+ *   (Plate, lusher by design, about 25 dB).
+ * - **Smooth size changes.** setSize() glides the line lengths (a short
+ *   tape-style Doppler) instead of jumping, so it can be automated.
+ * - **Spring tanks.** Type::Spring models two springs as dispersive loops
+ *   (Valimaki, Parker & Abel 2010): stretched-allpass cascades make every
+ *   round trip a chirp whose band edge arrives last, re-dispersed on each
+ *   pass, band-limited like a real tank. setDiffusion() sets the chirp
+ *   strength for this type.
+ * - **Eco quality** (setQuality): 8 lines, no in-loop allpasses, 2 input
+ *   diffusers per channel, 12 early taps per side, 1 output diffuser and a
+ *   40-stage spring cascade, with the same decay calibration and loudness
+ *   (within 0.2 dB), at about a third of the CPU.
  *
  * Threading: prepare() belongs to the setup thread (allocates). processBlock(),
  * processSample() and reset() belong to the audio thread. All setters are
@@ -95,14 +97,15 @@
  *
  * References:
  * - Jot & Chaigne (1991): FDN with frequency-dependent decay (shelving absorption)
- * - Dattorro (1997, JAES): multi-tap output, plate topology
- * - Griesinger / Lexicon 480L: random modulation, Spin/Wander
- * - Sean Costello / Valhalla DSP: practical FDN design, absorbent allpass
+ * - Schlecht & Habets (2017, 2019): FDN mixing matrices, echo density, modulation
+ * - Valimaki, Parker & Abel (2010, JAES): parametric spring reverberation
+ * - Dattorro (1997, JAES): plate topology, allpass-interpolated modulation
+ * - Griesinger / Lexicon 480L: random modulation
  * - Valimaki et al. (2012, IEEE): "50 Years of Artificial Reverberation"
- * - Smith (CCRMA): Hadamard matrices, prime power delay selection
+ * - Abel & Huang (2006): normalized echo density
  *
- * Dependencies: RingBuffer.h, DryWetMixer.h, DspMath.h, Biquad.h,
- *               AudioSpec.h, AudioBuffer.h, DenormalGuard.h, StateBlob.h.
+ * Dependencies: DryWetMixer.h, DspMath.h, Biquad.h, AudioSpec.h,
+ *               AudioBuffer.h, DenormalGuard.h, StateBlob.h, SimdOps.h.
  *
  * @code
  *   dspark::AlgorithmicReverb<float> reverb;
@@ -118,7 +121,6 @@
  * @endcode
  */
 
-#include "../Core/RingBuffer.h"
 #include "../Core/DryWetMixer.h"
 #include "../Core/DspMath.h"
 #include "../Core/AudioSpec.h"
@@ -126,6 +128,7 @@
 #include "../Core/DenormalGuard.h"
 #include "../Core/Biquad.h"
 #include "../Core/StateBlob.h"
+#include "../Core/SimdOps.h"
 
 #include <algorithm>
 #include <array>
@@ -140,7 +143,7 @@ namespace dspark {
 
 /**
  * @class AlgorithmicReverb
- * @brief 16-line FDN reverb with Jot absorption and 6 presets.
+ * @brief True-stereo 32-line FDN reverb with exact per-band decay and 6 presets.
  *
  * @tparam T Sample type (float or double).
  */
@@ -164,8 +167,8 @@ public:
      */
     enum class Quality
     {
-        Full,   ///< Complete 16-line engine. Default; bit-identical to previous releases.
-        Eco     ///< Reduced engine, roughly 3-4x cheaper. For constrained targets.
+        Full,   ///< Complete 32-line engine. Default.
+        Eco     ///< Reduced 8-line engine, about 3x cheaper. For constrained targets.
     };
 
     ~AlgorithmicReverb() = default; // non-virtual: leaf class (no virtual dispatch)
@@ -175,12 +178,8 @@ public:
     /**
      * @brief Prepares the reverberation engine and allocates required memory.
      *
-     * Initializes delay lines, filters, and LFOs based on the specified sample rate.
-     * This method avoids memory allocations on the audio thread and must be called
-     * prior to any processing.
-     *
-     * An invalid spec (non-positive or non-finite fields) is a no-op that
-     * keeps the previous state.
+     * Must be called before processing. An invalid spec (non-positive or
+     * non-finite fields) is a no-op that keeps the previous state.
      *
      * @param spec Audio specification detailing sample rate and maximum block size.
      */
@@ -190,114 +189,86 @@ public:
 
         spec_ = spec;
         mixer_.prepare(spec);
-        double sr = spec.sampleRate;
+        const double sr = spec.sampleRate;
 
         // Re-derive the sample counts stored at set-time: after a re-prepare
-        // at a different rate they would keep the OLD rate's sample count
-        // (e.g. a 100 ms pre-delay set at 48 kHz played back as 50 ms at 96 kHz).
-        preDelaySamples_.store(static_cast<int>(
-            static_cast<T>(sr) * preDelayMs_.load(std::memory_order_relaxed) / T(1000)),
-            std::memory_order_relaxed);
-        erToLateSamples_.store(static_cast<int>(
-            static_cast<T>(sr) * erToLateMs_.load(std::memory_order_relaxed) / T(1000)),
-            std::memory_order_relaxed);
+        // at a different rate they would keep the OLD rate's sample count.
+        preDelaySamples_.store(msToSamples(preDelayMs_.load(std::memory_order_relaxed)),
+                               std::memory_order_relaxed);
+        erToLateSamples_.store(msToSamples(erToLateMs_.load(std::memory_order_relaxed)),
+                               std::memory_order_relaxed);
 
-        preDelayBuf_.prepare(static_cast<int>(sr * 0.2) + 1);
-        erBuf_.prepare(static_cast<int>(sr * 0.2) + 1);
-        erToLateBuf_.prepare(static_cast<int>(sr * 0.2) + 1);
-
-        int maxDiff = static_cast<int>(sr * 0.012) + 1;
-        for (auto& buf : diffBufs_)
-            buf.prepare(maxDiff);
-
-        int maxFDN = static_cast<int>(sr * 0.5) + 1;
-        for (auto& dl : fdnDelays_)
-            dl.prepare(maxFDN);
-
-        // Parallel allpass diffuser - step 1 (~20ms max)
-        int maxParAP = static_cast<int>(sr * 0.021) + 1;
-        for (auto& buf : parAPBufs_) buf.prepare(maxParAP);
-
-        // Multi-channel diffuser - step 2 (~47ms max)
-        int maxDiffS2 = static_cast<int>(sr * 0.047) + 1;
-        for (auto& buf : diffuserStep2_) buf.prepare(maxDiffS2);
-
-        // Feedback allpass buffers (~60ms max, proportional to FDN delays)
-        int maxFbAP = static_cast<int>(sr * 0.06) + 1;
-        for (auto& buf : fbAPBufsA_) buf.prepare(maxFbAP);
-        for (auto& buf : fbAPBufsB_) buf.prepare(maxFbAP);
-
-        // Internal serial allpass buffers (~35ms max)
-        int maxIntAP = static_cast<int>(sr * 0.035) + 1;
-        for (auto& buf : intAPBufsA_) buf.prepare(maxIntAP);
-        for (auto& buf : intAPBufsB_) buf.prepare(maxIntAP);
-
-        // Output diffusion buffers (~3ms max)
-        int maxOutDiff = static_cast<int>(sr * 0.003) + 1;
-        for (auto& buf : outDiffBufsL_)
-            buf.prepare(maxOutDiff);
-        for (auto& buf : outDiffBufsR_)
-            buf.prepare(maxOutDiff);
-
-        // Initialize smooth random LFOs
-        T rate = modRate_.load(std::memory_order_relaxed);
-        for (int i = 0; i < kFDNSize; ++i)
+        const auto samples = [sr](double ms) { return static_cast<int>(ms * sr / 1000.0) + 8; };
+        for (int c = 0; c < 2; ++c)
         {
-            modLFOA_[i].prepare(sr, rate * (T(0.7) + T(0.05) * static_cast<T>(i)),
-                                static_cast<uint32_t>(i * 7919 + 1));
-            modLFOB_[i].prepare(sr, rate * (T(1.8) + T(0.11) * static_cast<T>(i)),
-                                static_cast<uint32_t>(i * 6271 + 31337));
+            preDelay_[c].prepare(samples(kMaxPreDelayMs));
+            // The diffused ring feeds the early taps (up to 170 ms, their
+            // contralateral copies up to 1.3x that) and the late injection
+            // (ER-to-late gap plus the injection spread).
+            ring_[c].prepare(samples(kMaxErToLateMs + kMaxInjectMs + 2.0 * kMaxErMs));
+            for (auto& ap : inAP_[c]) ap.prepare(samples(kMaxInDiffMs));
+            for (auto& ap : outAP_[c]) ap.prepare(samples(kMaxOutDiffMs));
+        }
+        const int maxLine = samples(kBaseDelaysMs_[kMaxLines - 1] + kModMaxMs) + 4;
+        lines_.prepare(kMaxLines, maxLine);
+        loopAP_.prepare(kMaxLines, samples(kMaxLoopApMs));
+
+        // Spring dispersion: stretching factor K puts the chirp band edge at
+        // fs / (2K) ~ kSpringCutHz; a 4th-order Butterworth just below it
+        // removes the stretched allpasses' mirrored bands.
+        springK_ = std::max(1, static_cast<int>(std::lround(sr / (2.0 * kSpringCutHz))));
+        springP_ = 1;
+        while (springP_ < springK_ + 1) springP_ <<= 1;
+        springHist_.assign(static_cast<std::size_t>(kSprings * (kSpringStages + 1) * springP_), T(0));
+        {
+            const double fc = 0.9 * sr / (2.0 * springK_);
+            const double qs[2] = { 0.5411961001461970, 1.3065629648763764 };
+            for (int k = 0; k < 2; ++k)
+            {
+                const auto c = BiquadCoeffs::makeLowPass(sr, fc, qs[k]);
+                springLP_[k] = { static_cast<T>(c.b0), static_cast<T>(c.b1), static_cast<T>(c.b2),
+                                 static_cast<T>(c.a1), static_cast<T>(c.a2) };
+            }
         }
 
-        // DC block coefficient (~23 Hz, sample-rate independent)
-        dcCoeff_ = T(1) - std::exp(T(-6.283185307179586) * T(23)
-                                    / static_cast<T>(sr));
-
-        // Noise modulation: LP cutoff ~3 Hz, depth scales with modDepth_
-        noiseCoeff_ = T(1) - std::exp(T(-6.283185307179586) * T(3)
-                                       / static_cast<T>(sr));
-        // Eco quality refreshes the noise LP only once per control interval,
-        // so the coefficient is scaled to keep the same ~3 Hz cutoff.
-        noiseCoeffEco_ = T(1) - std::exp(T(-6.283185307179586) * T(3)
-                                          * T(kEcoCtrlInterval)
-                                          / static_cast<T>(sr));
-        noiseState_ = 1;
-        noiseLP_ = T(0);
+        const T srT = static_cast<T>(sr);
+        dcR_ = T(1) - T(6.283185307179586) * T(kDcCutHz) / srT;
+        maxReadPos_ = static_cast<T>(maxLine - 2);
 
         eco_ = quality_.load(std::memory_order_relaxed) == Quality::Eco;
-        nLines_ = eco_ ? kEcoLines : kFDNSize;
+        spring_ = type_.load(std::memory_order_relaxed) == Type::Spring;
+        refreshTopology();
+        prepared_ = true;
 
         applyPreset(type_.load(std::memory_order_relaxed));
-        // Clear pending flags - prepare() has already applied whatever the
-        // caller configured before prepare, so no drain is needed on the first
-        // processBlock.
+        // prepare() applied whatever the caller configured before it, so no
+        // drain is needed on the first processBlock.
         presetDirty_.store(false, std::memory_order_relaxed);
         paramsDirty_.store(false, std::memory_order_relaxed);
-        toneDirty_.store(false, std::memory_order_relaxed);
         qualityDirty_.store(false, std::memory_order_relaxed);
+        toneDirty_.store(true, std::memory_order_relaxed);
+        drainTone();
         reset();
     }
 
     /**
-     * @brief Processes an audio block in-place with zero allocations.
+     * @brief Processes an audio block in place with zero allocations.
      *
-     * Applies the complete FDN reverberation algorithm, handling mono, stereo,
-     * and mid/side signal edge cases. Thread-safe and designed for the hot path.
+     * Stereo buffers are reverberated in true stereo; a mono buffer feeds
+     * both inputs and receives the average of the two outputs. Extra
+     * channels beyond two are left untouched.
      *
-     * @param buffer View of the audio buffers (supports mono or stereo).
+     * @param buffer View of the audio buffers (mono or stereo).
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
         DenormalGuard guard;
         const int nCh = std::min(buffer.getNumChannels(), 2);
         const int nS  = buffer.getNumSamples();
-        if (nCh == 0 || nS == 0) return;
+        if (nCh == 0 || nS == 0 || !prepared_) return;
 
-        // Front-door non-finite guard: the FDN is fully recursive (fdnDelays_
-        // feed back through Householder/absorption/allpasses) and the
-        // soft-clip does not remove NaN, so a single NaN/Inf input poisons the
-        // tail forever. Scrub non-finite input to 0 before the dry snapshot and
-        // any state. No-op on finite input (metrics byte-identical).
+        // Front-door non-finite guard: the FDN is fully recursive, so a single
+        // NaN/Inf input would poison the tail forever. No-op on finite input.
         for (int ch = 0; ch < nCh; ++ch)
         {
             T* d = buffer.getChannel(ch);
@@ -310,42 +281,21 @@ public:
         mixer_.pushDry(buffer);
         refreshCachedParams();
 
+        T* chL = buffer.getChannel(0);
+        T* chR = nCh >= 2 ? buffer.getChannel(1) : nullptr;
         for (int i = 0; i < nS; ++i)
         {
-            T monoIn;
-            if (nCh >= 2)
+            const T inL = chL[i];
+            const T inR = chR ? chR[i] : inL;
+            auto [outL, outR] = processSampleInternal(inL, inR);
+            if (chR)
             {
-                T L = buffer.getChannel(0)[i];
-                T R = buffer.getChannel(1)[i];
-                T sum = L + R;
-                T env = std::abs(L) + std::abs(R);
-
-                if (std::abs(sum) < T(1e-5) * env)
-                {
-                    // Pure side condition: decode the side channel instead of hard-switching
-                    // Preserves phase coherency and prevents toggle distortion.
-                    monoIn = (L - R) * T(0.5);
-                }
-                else
-                {
-                    monoIn = sum * T(0.5);
-                }
+                chL[i] = outL;
+                chR[i] = outR;
             }
             else
             {
-                monoIn = buffer.getChannel(0)[i];
-            }
-
-            auto [outL, outR] = processSampleInternal(monoIn);
-
-            if (nCh >= 2)
-            {
-                buffer.getChannel(0)[i] = outL;
-                buffer.getChannel(1)[i] = outR;
-            }
-            else
-            {
-                buffer.getChannel(0)[i] = (outL + outR) * T(0.5);
+                chL[i] = (outL + outR) * T(0.5);
             }
         }
 
@@ -353,62 +303,62 @@ public:
     }
 
     /**
-     * @brief Processes a single sample and returns a stereo pair.
+     * @brief Processes a single mono sample and returns the wet stereo pair.
      *
-     * Pending parameter/preset/quality changes are drained here too (per-sample
-     * streams that never call processBlock() used to keep the old topology
-     * forever: a setType() was published but never applied).
+     * The input feeds both reverb inputs; the result is the wet signal only
+     * (the mix is not applied). Pending parameter, preset and quality changes
+     * are drained here too.
      *
      * @param input The mono input sample to reverberate.
-     * @return std::pair<T, T> A pair containing the {Left, Right} reverberated output.
+     * @return The {Left, Right} reverberated output.
      */
     [[nodiscard]] std::pair<T, T> processSample(T input) noexcept
     {
+        if (!prepared_) return { T(0), T(0) };
+        DenormalGuard guard;
         drainPendingChanges();
         refreshCachedParams();
-        // Front-door non-finite guard: mirror processBlock so a per-sample
-        // caller cannot poison the recursive FDN tail forever.
+        // Front-door non-finite guard (see processBlock).
         if (!std::isfinite(input)) input = T(0);
-        return processSampleInternal(input);
+        return processSampleInternal(input, input);
     }
 
     /**
-     * @brief Resets all internal delay buffers, filters, and LFO phases.
-     *
-     * Prevents feedback clicks or ringing when transport stops or topology changes.
+     * @brief Clears all delay lines and filter states and restarts the
+     *        modulation, snapping any length glide to its target.
      */
     void reset() noexcept
     {
-        preDelayBuf_.reset();
-        erBuf_.reset();
-        erToLateBuf_.reset();
-        for (auto& buf : diffBufs_) buf.reset();
-        for (auto& dl : fdnDelays_) dl.reset();
-        for (auto& buf : parAPBufs_) buf.reset();
-        for (auto& buf : diffuserStep2_) buf.reset();
-        for (auto& buf : fbAPBufsA_) buf.reset();
-        for (auto& buf : fbAPBufsB_) buf.reset();
-        for (auto& buf : intAPBufsA_) buf.reset();
-        for (auto& buf : intAPBufsB_) buf.reset();
-        for (auto& buf : outDiffBufsL_) buf.reset();
-        for (auto& buf : outDiffBufsR_) buf.reset();
+        for (int c = 0; c < 2; ++c)
+        {
+            preDelay_[c].clear();
+            ring_[c].clear();
+            for (auto& ap : inAP_[c]) ap.clear();
+            for (auto& ap : outAP_[c]) ap.clear();
+            erLP_[c].fill(T(0));
+            dcX1_[c] = dcY1_[c] = T(0);
+        }
+        lines_.clear();
+        loopAP_.clear();
+        std::fill(springHist_.begin(), springHist_.end(), T(0));
+        springW_ = 0;
+        for (auto& st : springLPState_) st.fill(T(0));
+        apY1_.fill(T(0));
+        jotX1_.fill(T(0));
+        jotY1_.fill(T(0));
+        bassX1_.fill(T(0));
+        bassY1_.fill(T(0));
 
-        absState_.fill(T(0));
-        absX1_.fill(T(0));
-        bassState_.fill(T(0));
-        dcZ_.fill(T(0));
-        prevFeedback_.fill(T(0));
-        apInterpState_.fill(T(0));
-        erLPStateL_.fill(T(0));
-        erLPStateR_.fill(T(0));
-        modACache_.fill(T(0));
-        modBCache_.fill(T(0));
-        noiseND_ = T(0);
-        noiseLP_ = T(0);
+        const double sr = spec_.sampleRate > 0 ? spec_.sampleRate : 48000.0;
+        const T rate = modRate_.load(std::memory_order_relaxed);
+        for (int i = 0; i < kMaxLines; ++i)
+        {
+            lfo_[i].prepare(sr, rate * lfoRateFactor(i), lfoSeed(i));
+            lenCur_[i] = static_cast<T>(lenTarget_[i]);
+            pos_[i] = std::max(lenCur_[i], T(kMinReadPos));
+            posInc_[i] = T(0);
+        }
         ctrlPhase_ = 0;
-
-        for (auto& lfo : modLFOA_) lfo.reset();
-        for (auto& lfo : modLFOB_) lfo.reset();
 
         toneLPBiquad_.reset();
         toneHPBiquad_.reset();
@@ -423,13 +373,11 @@ public:
      * @brief Loads the selected preset baseline.
      *
      * Call setDecay(), setSize() and other parameter setters after setType()
-     * when those values should override the selected preset.
+     * when those values should override the selected preset. Applied at the
+     * start of the next processBlock(); the running tail is cleared.
      */
     void setType(Type type) noexcept
     {
-        // C2 fix: don't touch non-atomic state from GUI thread. Publish the
-        // new type and raise the preset-dirty flag; the audio thread will
-        // run applyPreset() + reset() at the top of its next processBlock.
         // Wild enum values (a corrupted blob, a stray cast) clamp into range.
         const int t = std::clamp(static_cast<int>(type), 0,
                                  static_cast<int>(Type::Cathedral));
@@ -443,25 +391,22 @@ public:
     /**
      * @brief Selects the engine quality / CPU cost trade-off.
      *
-     * Quality::Full (default) runs the complete 16-line engine and is
-     * bit-identical to previous releases. Quality::Eco reduces the engine to
-     * roughly a quarter of the CPU cost for embedded and other constrained
-     * targets, keeping the same control set and decay calibration:
+     * Quality::Full (default) runs the complete engine. Quality::Eco runs
+     * at about a third of the CPU for embedded and other constrained
+     * targets, with the same controls, decay calibration and loudness:
      *
-     * - 8 FDN lines instead of 16 (alternate base delays keep the full
-     *   29.7-160 ms span, and per-line decay gains keep T60 exact)
-     * - modulation LFOs and noise updated at control rate (every 16 samples;
-     *   steps are orders of magnitude below audibility at reverb mod rates)
-     * - linear interpolation in modulated allpasses (Dattorro-standard)
-     *   instead of 4-point Hermite
-     * - single-stage input scatter (16 unique echo paths instead of 256)
-     * - no extra output taps (multi-tap / allpass taps); output density
-     *   comes from the sign-weighted line sum plus output diffusion
-     * - early reflections capped at 12 taps
+     * - 8 FDN lines instead of 32 (every fourth base delay, so the lines
+     *   still span 35-160 ms; per-line decay gains keep every T60 exact)
+     * - no in-loop allpasses (lower echo density in the first ~100 ms of
+     *   the tail)
+     * - 2 input diffusion allpasses per channel instead of 4
+     * - early reflections capped at 12 taps per side, 1 output diffuser
+     * - a 40-stage spring dispersion cascade instead of 72 (with a stronger
+     *   coefficient, so the chirp spread matches)
      *
-     * The audible difference is a somewhat lower tail density (most
-     * noticeable on long, exposed cathedral tails); short and mid rooms stay
-     * very close to Full.
+     * The audible difference is a grainier build-up on sharp transients
+     * and more modal coloration on long, exposed tails; sustained material
+     * in short and mid rooms sounds almost the same.
      *
      * Like setType(), this is an engine-mode switch, not an automation
      * target: it is applied at the start of the next processBlock() and
@@ -476,6 +421,7 @@ public:
         qualityDirty_.store(true, std::memory_order_release);
     }
 
+    /** @brief Mid-band decay time T60 in seconds (0.1 - 30). */
     void setDecay(T seconds) noexcept
     {
         if (!std::isfinite(seconds)) return;
@@ -485,6 +431,7 @@ public:
         paramsDirty_.store(true, std::memory_order_release);
     }
 
+    /** @brief Dry/wet mix (0 = dry, 1 = wet). */
     void setMix(T dryWet) noexcept
     {
         if (!std::isfinite(dryWet)) return;
@@ -495,6 +442,11 @@ public:
     // Level 2: Intermediate API
     // =========================================================================
 
+    /**
+     * @brief Room size (0.01 - 1). Scales the delay lines from 36% to 100%
+     *        of their base lengths. Changes glide smoothly (with a brief
+     *        Doppler, like a tape delay), so the size can be automated.
+     */
     void setSize(T size) noexcept
     {
         if (!std::isfinite(size)) return;
@@ -519,19 +471,21 @@ public:
         paramsDirty_.store(true, std::memory_order_release);
     }
 
+    /** @brief Pre-delay before the early reflections, in ms (0 - 200). */
     void setPreDelay(T ms) noexcept
     {
         if (!std::isfinite(ms)) return;
-        T clamped = std::clamp(ms, T(0), T(200));
+        T clamped = std::clamp(ms, T(0), T(kMaxPreDelayMs));
         preDelayMs_.store(clamped, std::memory_order_relaxed);
-        // preDelaySamples_ is already atomic and only consumed in the audio
-        // loop; storing it from any thread is safe and cheap.
         if (spec_.sampleRate > 0)
-            preDelaySamples_.store(static_cast<int>(
-                static_cast<T>(spec_.sampleRate) * clamped / T(1000)),
-                std::memory_order_relaxed);
+            preDelaySamples_.store(msToSamples(clamped), std::memory_order_relaxed);
     }
 
+    /**
+     * @brief Diffusion (0 - 1): the strength of the input, in-loop and output
+     *        allpass diffusers. High values give a smooth, dense onset; low
+     *        values keep discrete early echoes audible.
+     */
     void setDiffusion(T amount) noexcept
     {
         if (!std::isfinite(amount)) return;
@@ -540,14 +494,17 @@ public:
         paramsDirty_.store(true, std::memory_order_release);
     }
 
+    /**
+     * @brief Modulation depth (0 - 1) of the delay-line wander. It smears
+     *        the tail's resonances; 0 is fully static, 1 is a strong chorus.
+     *        The depth is defined in time and scales with the room size.
+     */
     void setModulation(T amount) noexcept
     {
         if (!std::isfinite(amount)) return;
-        T clamped = std::clamp(amount, T(0), T(1));
-        modDepth_.store(clamped, std::memory_order_relaxed);
-        modDepthA_.store(clamped * T(30), std::memory_order_relaxed);
-        modDepthB_.store(clamped * T(15), std::memory_order_relaxed);
+        modDepth_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
         markUserParam(kUserModDepth);
+        paramsDirty_.store(true, std::memory_order_release);
     }
 
     /**
@@ -564,16 +521,15 @@ public:
         width_.store(std::clamp(width, T(0), T(2)), std::memory_order_relaxed);
     }
 
+    /** @brief Extra gap between the early reflections and the late tail, in ms (0 - 200). */
     void setErToLateDelay(T ms) noexcept
     {
         if (!std::isfinite(ms)) return;
-        T clamped = std::clamp(ms, T(0), T(200));
+        T clamped = std::clamp(ms, T(0), T(kMaxErToLateMs));
         erToLateMs_.store(clamped, std::memory_order_relaxed);
         markUserParam(kUserErToLate);
         if (spec_.sampleRate > 0)
-            erToLateSamples_.store(static_cast<int>(
-                static_cast<T>(spec_.sampleRate) * clamped / T(1000)),
-                std::memory_order_relaxed);
+            erToLateSamples_.store(msToSamples(clamped), std::memory_order_relaxed);
     }
 
     // =========================================================================
@@ -642,7 +598,11 @@ public:
     }
 
     /**
-     * @brief Frequency below which bass decay multiplier applies.
+     * @brief Frequency where the bass decay transition is centered.
+     *
+     * A first-order shelf per line gives the bass T60 exactly at DC and
+     * leaves the mid band untouched; its geometric midpoint lands here.
+     *
      * @param hz Crossover in Hz (50 - 500). Default: 200.
      */
     void setBassCrossover(T hz) noexcept
@@ -658,6 +618,7 @@ public:
     // Level 3: Expert API - Tone & Levels
     // =========================================================================
 
+    /** @brief Early reflections level in dB (-60 to +6). */
     void setEarlyLevel(T dB) noexcept
     {
         if (!std::isfinite(dB)) return;
@@ -665,6 +626,7 @@ public:
         markUserParam(kUserEarly);
     }
 
+    /** @brief Late tail level in dB (-60 to +6). */
     void setLateLevel(T dB) noexcept
     {
         if (!std::isfinite(dB)) return;
@@ -672,6 +634,7 @@ public:
         markUserParam(kUserLate);
     }
 
+    /** @brief Modulation rate in Hz (0.1 - 5); each line wanders at its own multiple. */
     void setModRate(T hz) noexcept
     {
         if (!std::isfinite(hz)) return;
@@ -687,7 +650,6 @@ public:
     void setToneLowCut(T hz) noexcept
     {
         if (!std::isfinite(hz)) return;
-        // Queue target; audio thread rebuilds the biquad inside processBlock.
         toneLowCutHz_.store(hz, std::memory_order_relaxed);
         toneDirty_.store(true, std::memory_order_release);
     }
@@ -711,12 +673,18 @@ public:
     [[nodiscard]] Quality getQuality() const noexcept { return quality_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getDecay() const noexcept { return decayTime_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getSize() const noexcept { return size_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getDamping() const noexcept { return damping_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getDiffusion() const noexcept { return diffusion_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getModulation() const noexcept { return modDepth_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getModRate() const noexcept { return modRate_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getPreDelay() const noexcept { return preDelayMs_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getErToLateDelay() const noexcept { return erToLateMs_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getHighDecayMultiplier() const noexcept { return highDecayMult_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getBassDecayMultiplier() const noexcept { return bassDecayMult_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getHighCrossover() const noexcept { return highCrossover_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getBassCrossover() const noexcept { return bassCrossover_.load(std::memory_order_relaxed); }
-
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
@@ -753,7 +721,7 @@ public:
         StateReader r(data, size);
         if (!r.isValid() || r.processorId() != stateId("ARVB")) return false;
         setType(static_cast<Type>(r.read("type", 0)));
-        // Older blobs have no "quality" key: default 0 = Full (unchanged sound).
+        // Older blobs have no "quality" key: default 0 = Full.
         setQuality(r.read("quality", 0) == 1 ? Quality::Eco : Quality::Full);
         setDecay(static_cast<T>(r.read("decay", 1.0f)));
         setSize(static_cast<T>(r.read("size", 0.5f)));
@@ -781,92 +749,170 @@ public:
 protected:
     // --- Constants -----------------------------------------------------------
 
-    static constexpr int kFDNSize      = 16;
-    static constexpr int kDiffStages   = 8;
-    static constexpr int kMaxERTaps    = 40;
-    static constexpr int kNumMultiTaps = 7;
-    static constexpr int kOutDiffStages = 2;
+    static constexpr int kMaxLines   = 32;
+    static constexpr int kEcoLines   = 8;
+    static constexpr int kInStages   = 4;   ///< input diffusers per channel (Full)
+    static constexpr int kEcoInStages = 2;
+    static constexpr int kOutStages  = 2;   ///< output diffusers per channel (Full)
+    static constexpr int kEcoOutStages = 1;
+    static constexpr int kMaxERTaps  = 24;  ///< early taps per side (Full)
+    static constexpr int kEcoERTaps  = 12;
+    static constexpr int kERGroups   = 4;   ///< absorption groups (early -> late)
+    static constexpr int kCtrl       = 16;  ///< modulation control period (samples)
 
-    // Eco quality engine reductions (see setQuality)
-    static constexpr int kEcoLines        = 8;   ///< FDN lines in Eco quality
-    static constexpr int kEcoCtrlInterval = 16;  ///< modulation refresh period (samples)
-    static constexpr int kEcoERTaps       = 12;  ///< early-reflection tap cap in Eco
+    static constexpr double kMaxPreDelayMs = 200.0;
+    static constexpr double kMaxErToLateMs = 200.0;
+    static constexpr double kMaxErMs       = 170.0;
+    static constexpr double kMaxInjectMs   = 8.0;
+    static constexpr double kMaxInDiffMs   = 6.0;
+    static constexpr double kMaxOutDiffMs  = 3.0;
+    static constexpr double kMaxLoopApMs   = 5.5;
+    static constexpr double kModMaxMs      = 2.0;   ///< peak line wander at modulation 1, size 1
+    static constexpr double kGlideMs       = 60.0;  ///< size-change glide time constant
+    static constexpr double kMaxGlideSpeed = 0.04;  ///< max length change per sample (4% Doppler)
+    static constexpr double kDcCutHz       = 5.0;   ///< wet-output DC blocker
+    static constexpr T      kMinReadPos    = T(2);
+    static constexpr T      kSoftLimit     = T(2);  ///< in-loop safety limiter threshold
 
-    static constexpr T kInputGain = T(1) / T(8);
+    /// Wet output scale: calibrated so the steady-state level matches the
+    /// previous engine's (and Full matches Eco within a fraction of a dB).
+    static constexpr T kOutGain = T(0.25);
+    /// Early-reflection energy per side before earlyLevel.
+    static constexpr T kErEnergy = T(0.0625);
 
-    // Output normalization: 16 main + 7 multi-tap + fbAP taps + intAP taps
-    static constexpr T kOutputNorm = T(1) / T(5.0);
-
-    // Eco output normalization: 8 sign-weighted lines only (no extra taps).
-    // Calibrated so the Eco wet tail matches Full loudness (measured RMS).
-    static constexpr T kOutputNormEco = T(0.32);
-
-    // Orthogonal stereo output sign vectors (inner product = 0)
-    static constexpr int kOutSignL_[kFDNSize] = {
-         1, -1,  1,  1, -1,  1, -1, -1,
-         1, -1, -1,  1, -1,  1,  1, -1
-    };
-    static constexpr int kOutSignR_[kFDNSize] = {
-         1,  1, -1,  1,  1, -1, -1, -1,
-        -1,  1, -1,  1, -1, -1,  1,  1
-    };
-
-    // Multi-tap output: Dattorro-style decorrelation from different delay positions
-    static constexpr int    kMultiTapLineL_[kNumMultiTaps] = {0, 2, 5, 7, 9, 12, 14};
-    static constexpr int    kMultiTapLineR_[kNumMultiTaps] = {1, 3, 4, 8, 10, 13, 15};
-    static constexpr double kMultiTapFracL_[kNumMultiTaps] = {0.37, 0.67, 0.23, 0.81, 0.44, 0.59, 0.31};
-    static constexpr double kMultiTapFracR_[kNumMultiTaps] = {0.43, 0.71, 0.29, 0.63, 0.47, 0.53, 0.37};
-    static constexpr int    kMultiTapSignL_[kNumMultiTaps] = {+1, -1, +1, -1, +1, -1, +1};
-    static constexpr int    kMultiTapSignR_[kNumMultiTaps] = {+1, +1, -1, +1, -1, +1, -1};
-
-    // FDN base delay times in ms (at size=1.0)
-    static constexpr double kBaseDelaysMs_[kFDNSize] = {
-        29.7, 34.1, 39.3, 45.2, 52.0, 58.1, 64.9, 72.3,
-        80.4, 89.0, 98.3, 108.7, 119.9, 132.3, 145.7, 160.1
+    // FDN base delay times in ms (at size = 1); lengths are rounded to primes.
+    static constexpr double kBaseDelaysMs_[kMaxLines] = {
+         29.7,  31.0,  33.1,  34.9,  37.4,  39.3,  41.3,  43.5,
+         45.7,  49.1,  50.8,  53.2,  57.6,  59.9,  63.8,  67.5,
+         70.3,  75.0,  77.8,  84.3,  88.1,  93.7,  97.9, 102.7,
+        108.6, 117.2, 122.7, 128.5, 136.0, 145.7, 149.5, 160.1
     };
 
-    // Input diffusion allpass delays (ms) - 8 stages (Dattorro-style, ~34ms total)
-    static constexpr double kDiffDelaysMs_[kDiffStages] = {
-        1.03, 1.47, 2.19, 3.13, 4.23, 5.59, 7.19, 9.47
+    // In-loop allpass delays (ms): short and fixed in time, shuffled against
+    // the line lengths so no line's total is a near multiple of another's.
+    static constexpr double kLoopApMs_[kMaxLines] = {
+        3.55, 1.47, 3.80, 1.96, 1.84, 2.33, 4.41, 4.90,
+        1.10, 1.35, 4.29, 3.43, 4.16, 4.53, 2.08, 3.06,
+        1.22, 2.94, 3.92, 3.18, 2.57, 4.04, 4.65, 2.45,
+        2.69, 4.78, 3.67, 1.71, 2.20, 1.59, 2.82, 3.31
     };
 
-    static constexpr double kDiffBaseCoeffs_[kDiffStages] = {
-        0.75, 0.75, 0.72, 0.72, 0.70, 0.70, 0.68, 0.68
+    // Late injection taps (ms after the ER-to-late gap), one per line.
+    static constexpr double kInjectMs_[kMaxLines] = {
+        7.14, 3.31, 0.76, 0.25, 5.86, 2.04, 4.84, 5.35,
+        5.61, 6.88, 0.00, 7.65, 2.80, 1.02, 7.90, 1.53,
+        1.27, 4.33, 6.63, 2.55, 3.06, 6.12, 5.10, 6.37,
+        3.82, 1.78, 3.57, 7.39, 2.29, 0.51, 4.08, 4.59
+    };
+    static constexpr int kInjectSign_[kMaxLines] = {
+         1,  1, -1,  1, -1,  1,  1, -1,
+        -1,  1,  1, -1,  1, -1,  1,  1,
+         1,  1,  1, -1,  1,  1,  1,  1,
+         1, -1,  1,  1, -1,  1, -1, -1
     };
 
-    // Feedback allpass stages per FDN line (echo density multiplier)
-    static constexpr int kFbAPStages = 2;
-
-    // Feedback allpass delays as fraction of FDN delay (Dattorro-style proportional)
-    static constexpr double kFbAPRatioA_ = 0.25;  // 25% of FDN delay
-    static constexpr double kFbAPRatioB_ = 0.35;  // 35% of FDN delay
-
-    // Parallel allpass diffuser - step 1 delays (ms, per channel, different IRs)
-    static constexpr double kParAPDelaysMs_[kFDNSize] = {
-        5.3, 6.1, 7.1, 7.9, 8.9, 9.7, 10.7, 11.7,
-        12.3, 13.3, 14.3, 15.1, 16.1, 17.1, 18.1, 19.1
+    // Orthogonal stereo output sign vectors (inner product 0; the first 8
+    // entries are orthogonal too, so Eco keeps the decorrelation).
+    static constexpr int kOutSignL_[kMaxLines] = {
+        -1, -1,  1, -1, -1,  1,  1,  1,
+        -1, -1,  1,  1, -1, -1, -1,  1,
+        -1, -1,  1, -1, -1,  1,  1, -1,
+         1,  1, -1, -1, -1, -1, -1,  1
+    };
+    static constexpr int kOutSignR_[kMaxLines] = {
+        -1,  1,  1,  1, -1, -1,  1, -1,
+        -1,  1,  1, -1, -1,  1, -1, -1,
+        -1,  1,  1,  1, -1, -1,  1,  1,
+         1, -1, -1,  1, -1,  1, -1, -1
     };
 
-    // Multi-channel diffuser - step 2 per-channel delays (ms)
-    static constexpr double kDiffuserStep2Ms_[kFDNSize] = {
-        15.7, 17.9, 20.1, 22.3, 24.7, 26.9, 29.3, 31.1,
-        33.7, 35.3, 37.1, 39.3, 41.1, 42.9, 44.3, 45.7
-    };
+    // Spring tanks (Type::Spring): two springs of different lengths.
+    static constexpr int    kSprings          = 2;
+    static constexpr int    kSpringStages     = 72;   ///< dispersion allpasses per spring (Full)
+    static constexpr int    kEcoSpringStages  = 40;
+    static constexpr double kSpringBaseMs_[kSprings] = { 35.3, 43.8 };
+    static constexpr double kSpringCutHz      = 4400.0;  ///< dispersion band edge (transition frequency)
+    static constexpr T      kSpringOutGain    = T(2);
 
-    // Output diffusion allpass delays (ms, decorrelated L/R)
-    static constexpr double kOutDiffDelaysMsL_[kOutDiffStages] = {1.47, 2.31};
-    static constexpr double kOutDiffDelaysMsR_[kOutDiffStages] = {1.63, 2.47};
+    // Input diffusion allpass delays (ms), decorrelated between channels.
+    static constexpr double kInDiffMs_[2][kInStages] = {
+        { 1.03, 1.97, 3.13, 4.71 },
+        { 1.21, 2.29, 3.43, 5.11 }
+    };
+    static constexpr double kInDiffCoeffs_[kInStages] = { 0.75, 0.72, 0.68, 0.64 };
+
+    // Output diffusion allpass delays (ms, decorrelated L/R).
+    static constexpr double kOutDiffMs_[2][kOutStages] = {
+        { 1.47, 2.31 },
+        { 1.63, 2.47 }
+    };
 
     // =========================================================================
-    // Smooth Random LFO (Lexicon-style modulation)
+    // Building blocks
     // =========================================================================
+
+    /** @brief Power-of-two circular delay line: at(k) is the sample pushed k samples ago. */
+    struct Line
+    {
+        std::vector<T> buf;
+        int mask = 0;
+        int w = 0;
+
+        void prepare(int maxDelay)
+        {
+            int size = 1;
+            while (size < maxDelay + 2) size <<= 1;
+            buf.assign(static_cast<std::size_t>(size), T(0));
+            mask = size - 1;
+            w = 0;
+        }
+        void clear() noexcept { std::fill(buf.begin(), buf.end(), T(0)); w = 0; }
+        [[nodiscard]] T at(int k) const noexcept { return buf[static_cast<std::size_t>((w - k) & mask)]; }
+        void push(T x) noexcept { buf[static_cast<std::size_t>(w)] = x; w = (w + 1) & mask; }
+    };
+
+    /**
+     * @brief Equal-size delay lines in one contiguous buffer sharing a write
+     *        index (every line is written once per sample): at(i, k) is the
+     *        sample line i received k samples ago.
+     */
+    struct DelayBank
+    {
+        std::vector<T> buf;
+        int size = 0;
+        int mask = 0;
+        int w = 0;
+
+        void prepare(int numLines, int maxDelay)
+        {
+            size = 1;
+            while (size < maxDelay + 2) size <<= 1;
+            mask = size - 1;
+            buf.assign(static_cast<std::size_t>(size) * static_cast<std::size_t>(numLines), T(0));
+            w = 0;
+        }
+        void clear() noexcept { std::fill(buf.begin(), buf.end(), T(0)); w = 0; }
+        [[nodiscard]] T at(int i, int k) const noexcept
+        { return buf[static_cast<std::size_t>(i * size + ((w - k) & mask))]; }
+        void write(int i, T x) noexcept { buf[static_cast<std::size_t>(i * size + w)] = x; }
+        void advance() noexcept { w = (w + 1) & mask; }
+    };
+
+    /** @brief Schroeder allpass of m samples: (-g + z^-m) / (1 - g z^-m). */
+    static T allpass(Line& l, int m, T g, T x) noexcept
+    {
+        const T d = l.at(m);
+        const T v = x + g * d;
+        l.push(v);
+        return d - g * v;
+    }
 
     /**
      * @brief Hermite-interpolated random noise generator for organic modulation.
      *
-     * Generates band-limited random values via cubic Hermite (Catmull-Rom)
-     * interpolation between xorshift32 random targets. Produces smooth,
-     * non-periodic modulation - the key to Lexicon-quality reverb character.
+     * Band-limited random values via cubic Hermite (Catmull-Rom)
+     * interpolation between xorshift32 random targets: smooth, non-periodic
+     * modulation.
      */
     struct SmoothRandomLFO
     {
@@ -884,21 +930,10 @@ protected:
             phase_ = T(0);
         }
 
-        void setRate(T rate, double sr) noexcept
-        {
-            phaseInc_ = rate / static_cast<T>(sr);
-        }
+        void setRate(T rate, double sr) noexcept { phaseInc_ = rate / static_cast<T>(sr); }
 
-        T next() noexcept { return nextStride(1); }
-
-        /**
-         * @brief Advances the LFO by `stride` samples in one call.
-         *
-         * Used by Eco quality to run modulation at control rate: the phase
-         * advances by stride * phaseInc_ so the effective LFO frequency is
-         * unchanged. Rates are clamped well below 1/stride of the sample
-         * rate, so at most one Hermite target is consumed per call.
-         */
+        /// Advances by `stride` samples (rates stay far below sr / stride, so
+        /// at most one new target is drawn per call).
         T nextStride(int stride) noexcept
         {
             phase_ += phaseInc_ * static_cast<T>(stride);
@@ -908,16 +943,12 @@ protected:
                 h0_ = h1_; h1_ = h2_; h2_ = h3_;
                 h3_ = nextRandom();
             }
-            // Cubic Hermite (Catmull-Rom) interpolation
-            T d = phase_;
-            T c0 = h1_;
-            T c1 = T(0.5) * (h2_ - h0_);
-            T c2 = h0_ - T(2.5) * h1_ + T(2) * h2_ - T(0.5) * h3_;
-            T c3 = T(0.5) * (h3_ - h0_) + T(1.5) * (h1_ - h2_);
-            return ((c3 * d + c2) * d + c1) * d + c0;
+            const T d = phase_;
+            const T c1 = T(0.5) * (h2_ - h0_);
+            const T c2 = h0_ - T(2.5) * h1_ + T(2) * h2_ - T(0.5) * h3_;
+            const T c3 = T(0.5) * (h3_ - h0_) + T(1.5) * (h1_ - h2_);
+            return ((c3 * d + c2) * d + c1) * d + h1_;
         }
-
-        void reset() noexcept { phase_ = T(0); h0_ = h1_ = h2_ = h3_ = T(0); }
 
     private:
         T nextRandom() noexcept
@@ -925,117 +956,99 @@ protected:
             state_ ^= state_ << 13;
             state_ ^= state_ >> 17;
             state_ ^= state_ << 5;
-            return static_cast<T>(state_)
-                   / static_cast<T>(0xFFFFFFFFu) * T(2) - T(1);
+            return static_cast<T>(state_) / static_cast<T>(0xFFFFFFFFu) * T(2) - T(1);
         }
     };
+
+    static constexpr T lfoRateFactor(int i) noexcept
+    {
+        return T(0.71) + T(0.063) * static_cast<T>(i);
+    }
+    static constexpr uint32_t lfoSeed(int i) noexcept
+    {
+        return static_cast<uint32_t>(i) * 7919u + 1u;
+    }
+
+    /// Deterministic hash in [0, 1) for the early-reflection layout.
+    static double hash01(int k, int s) noexcept
+    {
+        const double v = std::sin(static_cast<double>(k) * 12.9898
+                                  + static_cast<double>(s) * 78.233) * 43758.5453;
+        return v - std::floor(v);
+    }
+
+    int msToSamples(T ms) const noexcept
+    {
+        return static_cast<int>(static_cast<T>(spec_.sampleRate) * ms / T(1000));
+    }
 
     // --- State ---------------------------------------------------------------
 
     AudioSpec spec_ {};
+    bool prepared_ = false;
+    bool eco_ = false;
+    int nLines_ = kMaxLines;
+    int ctrlPhase_ = 0;
 
-    // FDN delay lines
-    std::array<RingBuffer<T>, kFDNSize> fdnDelays_;
-    std::array<int, kFDNSize> fdnDelayLens_ {};
+    // Input stage (per channel)
+    std::array<Line, 2> preDelay_;
+    std::array<std::array<Line, kInStages>, 2> inAP_;
+    std::array<std::array<int, kInStages>, 2> inAPLen_ {};
+    std::array<T, kInStages> inAPCoeff_ {};
+    std::array<Line, 2> ring_;             ///< diffused input, feeds ER + injection
 
-    // Jot absorption filter state (per line): first-order pole-zero shelf
-    // H(z) = (b0 + b1 z^-1) / (1 + a1 z^-1), designed so |H(1)| = gMid and
-    // |H(-1)| = gHigh EXACTLY (the T60 calibration anchors) with the
-    // transition midpoint sqrt(gMid * gHigh) placed at highCrossover_.
-    std::array<T, kFDNSize> absB0_ {};       // feedforward x[n]
-    std::array<T, kFDNSize> absB1_ {};       // feedforward x[n-1]
-    std::array<T, kFDNSize> absA1_ {};       // feedback y[n-1] (denominator sign)
-    std::array<T, kFDNSize> absX1_ {};       // x[n-1] state
-    std::array<T, kFDNSize> absState_ {};    // y[n-1] state
-
-    // Bass shelf state (per line)
-    std::array<T, kFDNSize> bassRatio_ {};   // g_bass / g_mid
-    std::array<T, kFDNSize> bassState_ {};   // 1-pole LP state
-
-    // DC blocker state
-    std::array<T, kFDNSize> dcZ_ {};
-
-    // Feedback allpass (2 stages per FDN line, density multiplier)
-    std::array<RingBuffer<T>, kFDNSize> fbAPBufsA_;
-    std::array<RingBuffer<T>, kFDNSize> fbAPBufsB_;
-    std::array<int, kFDNSize> fbAPDelaysA_ {};
-    std::array<int, kFDNSize> fbAPDelaysB_ {};
-    T fbAPCoeff_ = T(0.6);
-
-    // Internal serial allpasses (per FDN line, pre-write + post-read)
-    std::array<RingBuffer<T>, kFDNSize> intAPBufsA_;  // pre-write
-    std::array<RingBuffer<T>, kFDNSize> intAPBufsB_;  // post-read
-    std::array<int, kFDNSize> intAPDelaysA_ {};
-    std::array<int, kFDNSize> intAPDelaysB_ {};
-    static constexpr T intAPCoeff_ = T(0.5);  // Infinity2 uses 0.5
-    static constexpr double kIntAPRatioA_ = 0.15;  // 15% of FDN delay
-    static constexpr double kIntAPRatioB_ = 0.20;  // 20% of FDN delay
-
-    // Feedback IIR smoothing (Verbity technique: eliminates discrete-echo quality)
-    std::array<T, kFDNSize> prevFeedback_ {};
-    T fbSmooth_ = T(0.3);
-
-    // Smooth random modulation (2 per line = 32 total)
-    std::array<SmoothRandomLFO, kFDNSize> modLFOA_;
-    std::array<SmoothRandomLFO, kFDNSize> modLFOB_;
-
-    // Allpass interpolation state for modulated FDN reads (preserves HF)
-    std::array<T, kFDNSize> apInterpState_ {};
-
-    // Filtered noise for modulation randomization (Progenitor-style)
-    uint32_t noiseState_ = 1;
-    T noiseLP_ = T(0);
-    T noiseCoeff_ = T(0);
-    T noiseDepth_ = T(0);
-
-    // Quality engine state (audio-thread only, derived from quality_ at the
-    // dirty-flag drain). Full: 16 lines, per-sample modulation. Eco: 8 lines,
-    // control-rate modulation refreshed every kEcoCtrlInterval samples.
-    bool eco_   = false;
-    int  nLines_ = kFDNSize;
-    std::array<T, kFDNSize> modACache_ {};   // per-line LFO A value (samples)
-    std::array<T, kFDNSize> modBCache_ {};   // per-line LFO B value (samples)
-    T   noiseND_ = T(0);                     // filtered noise * noiseDepth_
-    int ctrlPhase_ = 0;                      // Eco control-rate phase counter
-    T   noiseCoeffEco_ = T(0);               // noise LP coeff at control rate
-
-    // Input diffusion
-    std::array<RingBuffer<T>, kDiffStages> diffBufs_;
-    std::array<int, kDiffStages> diffDelays_ {};
-    std::array<T, kDiffStages> diffCoeffs_ {};
-
-    // Parallel allpass diffuser - step 1 (16 parallel allpass, different delays)
-    std::array<RingBuffer<T>, kFDNSize> parAPBufs_;
-    std::array<int, kFDNSize> parAPDelays_ {};
-    T parAPCoeff_ = T(0.65);
-
-    // Multi-channel diffuser - step 2 (16 per-channel delay buffers)
-    std::array<RingBuffer<T>, kFDNSize> diffuserStep2_;
-    std::array<int, kFDNSize> diffuserStep2Delays_ {};
-
-    // Output diffusion (L/R decorrelated)
-    std::array<RingBuffer<T>, kOutDiffStages> outDiffBufsL_;
-    std::array<RingBuffer<T>, kOutDiffStages> outDiffBufsR_;
-    std::array<int, kOutDiffStages> outDiffDelaysL_ {};
-    std::array<int, kOutDiffStages> outDiffDelaysR_ {};
-    T outDiffCoeff_ = T(0.45);
-
-    // Early reflections
-    RingBuffer<T> erBuf_;
-    std::array<int, kMaxERTaps> erTapsL_ {}, erTapsR_ {};
-    std::array<T, kMaxERTaps> erGainsL_ {}, erGainsR_ {};
-    std::array<T, kMaxERTaps> erAbsCoeffs_ {};
-    std::array<T, kMaxERTaps> erLPStateL_ {};
-    std::array<T, kMaxERTaps> erLPStateR_ {};
+    // Early reflections (per side): ipsilateral and contralateral taps
     int numERTaps_ = 0;
+    std::array<std::array<int, kMaxERTaps>, 2> erTapI_ {}, erTapC_ {};
+    std::array<std::array<T, kMaxERTaps>, 2> erGainI_ {}, erGainC_ {};
+    std::array<int, kERGroups + 1> erGroupStart_ {};
+    std::array<T, kERGroups> erLPCoeff_ {};
+    std::array<std::array<T, kERGroups>, 2> erLP_ {};
 
-    // Pre-delay
-    RingBuffer<T> preDelayBuf_;
-    std::atomic<int> preDelaySamples_ { 0 };
+    // FDN
+    DelayBank lines_;
+    std::array<int, kMaxLines> lenTarget_ {};    ///< prime line lengths (samples)
+    std::array<T, kMaxLines> lenCur_ {};         ///< gliding length
+    std::array<T, kMaxLines> pos_ {};            ///< current read position
+    std::array<T, kMaxLines> posInc_ {};         ///< per-sample ramp
+    std::array<T, kMaxLines> apY1_ {};           ///< allpass interpolator state
+    std::array<int, kMaxLines> injTap_ {};
+    std::array<T, kMaxLines> injGain_ {};        ///< sign / sqrt(lines)
+    std::array<T, kMaxLines> outSignL_ {}, outSignR_ {};
+    std::array<SmoothRandomLFO, kMaxLines> lfo_;
+    T modDepthSamples_ = T(0);
+    T glideCoeff_ = T(0);
+    T maxGlideStep_ = T(0);
+    T maxReadPos_ = T(8);
 
-    // ER-to-late gap
-    RingBuffer<T> erToLateBuf_;
-    std::atomic<int> erToLateSamples_ { 0 };
+    // Spring tanks: stretched-allpass histories [spring][stage + 1][P]
+    // (stage m reads history m and writes history m + 1), shared write
+    // index; 4th-order Butterworth band limit per spring.
+    bool spring_ = false;
+    std::vector<T> springHist_;
+    int springP_ = 8;
+    int springW_ = 0;
+    int springK_ = 5;
+    int springStages_ = kSpringStages;
+    T springA_ = T(0.5);
+    std::array<std::array<T, 5>, 2> springLP_ {};              ///< b0 b1 b2 a1 a2, two sections
+    std::array<std::array<T, 4>, kSprings> springLPState_ {};
+
+    // Absorption: Jot shelf (mid/high) and bass shelf, per line
+    std::array<T, kMaxLines> jotB0_ {}, jotB1_ {}, jotA1_ {}, jotX1_ {}, jotY1_ {};
+    std::array<T, kMaxLines> bassB0_ {}, bassB1_ {}, bassA1_ {}, bassX1_ {}, bassY1_ {};
+
+    // In-loop allpasses
+    DelayBank loopAP_;
+    std::array<int, kMaxLines> loopAPLen_ {};
+    T loopAPCoeff_ = T(0.4);
+
+    // Output stage
+    std::array<std::array<Line, kOutStages>, 2> outAP_;
+    std::array<std::array<int, kOutStages>, 2> outAPLen_ {};
+    T outAPCoeff_ = T(0.4);
+    std::array<T, 2> dcX1_ {}, dcY1_ {};
+    T dcR_ = T(0.999);
 
     // Tone correction EQ (Biquad 12 dB/oct)
     Biquad<T, 2> toneLPBiquad_;
@@ -1043,18 +1056,14 @@ protected:
     bool toneLPActive_ = false;
     bool toneHPActive_ = false;
 
-    // Mixer
     DryWetMixer<T> mixer_;
 
     // --- Parameters ----------------------------------------------------------
     //
-    // Thread-safety model (C2/C3 fix):
-    //  - All GUI-thread setters mutate ONLY atomic shadow fields below and set
-    //    `paramsDirty_` (or `presetDirty_` for setType).
-    //  - The audio thread drains the dirty flags at the top of `processBlock()`
-    //    and calls the update helpers there - so every non-atomic array that
-    //    participates in the audio path (fdnDelayLens_, diffCoeffs_, ...) is
-    //    mutated exclusively from the audio thread. No races, no torn reads.
+    // Thread-safety model: every setter mutates only the atomic shadows below
+    // and raises a dirty flag; the audio thread drains the flags at the top of
+    // processBlock()/processSample() and rebuilds the non-atomic coefficient
+    // arrays there, so nothing on the audio path is written from other threads.
 
     std::atomic<Type> type_      { Type::Room };
     std::atomic<T> decayTime_    { T(1) };
@@ -1068,9 +1077,8 @@ protected:
     std::atomic<T> mix_          { T(0.3) };
     std::atomic<T> earlyLevel_   { T(1) };
     std::atomic<T> lateLevel_    { T(1) };
-    std::atomic<T> width_        { T(1) };     // Stereo width: 0=mono, 1=natural, 2=wide
+    std::atomic<T> width_        { T(1) };     // 0 = mono, 1 = natural, 2 = wide
 
-    // Frequency-dependent decay parameters
     std::atomic<T> highDecayMult_ { T(0.5) };   // HF T60 multiplier (0.05-1.0)
     std::atomic<T> bassDecayMult_ { T(1.2) };   // bass T60 multiplier (0.3-3.0)
     std::atomic<T> highCrossover_ { T(5000) };  // Hz
@@ -1078,18 +1086,21 @@ protected:
 
     std::atomic<Quality> quality_ { Quality::Full };
 
-    // Deferred-apply flags (audio thread drains these at top of processBlock)
-    std::atomic<bool> presetDirty_ { false };  // setType() -> rebuild topology + reset
-    std::atomic<bool> paramsDirty_ { false };  // any other setter -> refresh coeffs
+    std::atomic<int> preDelaySamples_ { 0 };
+    std::atomic<int> erToLateSamples_ { 0 };
 
-    // Per-param user-override mask. A preset load (setType) must not
-    // silently discard param setters batched with it before the first
-    // processBlock -- the header's own documented quick-start is
-    // `setType(Hall); setDecay(2.0f);`. setType() clears the mask so the preset
-    // re-establishes the baseline; each param setter marks its bit; commitPreset()
-    // then SKIPS any atomic the user overrode, so a setter issued after setType
-    // always wins regardless of drain timing. RT-safe: release-mark on the UI
-    // thread, acquire-read on the audio thread, one atomic, no locks.
+    std::atomic<bool> presetDirty_  { false };  // setType() -> rebuild + reset
+    std::atomic<bool> paramsDirty_  { false };  // other setters -> refresh coefficients
+    std::atomic<bool> qualityDirty_ { false };  // setQuality() -> resize engine + reset
+    std::atomic<bool> toneDirty_    { false };  // tone EQ cutoff changes
+    std::atomic<T> toneLowCutHz_  { T(-1) };    // <= 0 = off
+    std::atomic<T> toneHighCutHz_ { T(-1) };
+
+    // Per-param user-override mask. setType() clears it so the preset
+    // re-establishes the baseline; each param setter marks its bit;
+    // commitPreset() skips any atomic the user overrode, so a setter issued
+    // after setType() always wins regardless of drain timing (the documented
+    // quick-start is `setType(Hall); setDecay(2.0f);`).
     enum : uint32_t {
         kUserDecay = 1u, kUserSize = 2u, kUserDamping = 4u, kUserDiffusion = 8u,
         kUserBassDecay = 16u, kUserHighXover = 32u, kUserBassXover = 64u,
@@ -1099,134 +1110,8 @@ protected:
     std::atomic<uint32_t> userParamMask_ { 0u };
     void markUserParam(uint32_t bit) noexcept
     { userParamMask_.fetch_or(bit, std::memory_order_release); }
-    std::atomic<bool> toneDirty_   { false };  // tone EQ cutoff changes
-    std::atomic<bool> qualityDirty_ { false }; // setQuality() -> resize engine + reset
-    std::atomic<T> toneLowCutHz_  { T(-1) };   // <0 = off, queued value for audio thread
-    std::atomic<T> toneHighCutHz_ { T(-1) };
 
-    // --- Computed coefficients ------------------------------------------------
-
-    T bassLPCoeff_ = T(0.026);   // bass crossover filter coeff
-    T dcCoeff_     = T(0.003);   // DC blocker coeff (~23Hz)
-    std::atomic<T> modDepthA_ { T(1) };       // slow LFO depth in samples
-    std::atomic<T> modDepthB_ { T(0.5) };     // fast LFO depth in samples
-
-    // =========================================================================
-    // Processing helpers
-    // =========================================================================
-
-    /// Lowpass-filtered white noise for modulation randomization.
-    T nextFilteredNoise() noexcept
-    {
-        noiseState_ = noiseState_ * 196314165u + 907633515u;
-        T white = static_cast<T>(static_cast<int32_t>(noiseState_))
-                  / T(2147483648.0);
-        noiseLP_ += noiseCoeff_ * (white - noiseLP_);
-        return noiseLP_;
-    }
-
-    /// Control-rate variant (Eco): same generator, coefficient scaled so the
-    /// ~3 Hz cutoff is preserved when called every kEcoCtrlInterval samples.
-    T nextFilteredNoiseEco() noexcept
-    {
-        noiseState_ = noiseState_ * 196314165u + 907633515u;
-        T white = static_cast<T>(static_cast<int32_t>(noiseState_))
-                  / T(2147483648.0);
-        noiseLP_ += noiseCoeffEco_ * (white - noiseLP_);
-        return noiseLP_;
-    }
-
-    T processAllpass(RingBuffer<T>& buf, int delay, T coeff, T input) noexcept
-    {
-        T delayed = buf.read(delay);
-        T temp = input + coeff * delayed;
-        T output = delayed - coeff * temp;
-        buf.push(temp);
-        return output;
-    }
-
-    T processAllpassModulated(RingBuffer<T>& buf, int baseDelay, T modAmount,
-                              T coeff, T input, bool linearInterp) noexcept
-    {
-        T readPos = static_cast<T>(baseDelay) + modAmount;
-        readPos = std::max(readPos, T(1));
-        // Eco quality reads with 2-point linear interpolation (the industry
-        // standard for diffusion allpasses with small excursions); Full keeps
-        // the default 4-point Hermite read.
-        T delayed = linearInterp
-            ? buf.template readInterpolated<InterpMethod::Linear>(readPos)
-            : buf.readInterpolated(readPos);
-        T temp = input + coeff * delayed;
-        T output = delayed - coeff * temp;
-        buf.push(temp);
-        return output;
-    }
-
-    /**
-     * @brief In-place Hadamard 16x16 via Fast Walsh-Hadamard butterfly.
-     *
-     * 4-stage butterfly, 64 add/sub, normalized by 1/sqrt(16)=1/4.
-     * Used in diffusion stages where maximum inter-channel mixing is desired.
-     */
-    static void hadamardInPlace(std::array<T, kFDNSize>& x) noexcept
-    {
-        for (int i = 0; i < kFDNSize; i += 2)
-        { T a = x[i], b = x[i+1]; x[i] = a + b; x[i+1] = a - b; }
-
-        for (int i = 0; i < kFDNSize; i += 4)
-            for (int j = 0; j < 2; ++j)
-            { T a = x[i+j], b = x[i+j+2]; x[i+j] = a + b; x[i+j+2] = a - b; }
-
-        for (int i = 0; i < kFDNSize; i += 8)
-            for (int j = 0; j < 4; ++j)
-            { T a = x[i+j], b = x[i+j+4]; x[i+j] = a + b; x[i+j+4] = a - b; }
-
-        for (int j = 0; j < 8; ++j)
-        { T a = x[j], b = x[j+8]; x[j] = a + b; x[j+8] = a - b; }
-
-        for (auto& v : x) v *= T(0.25);
-    }
-
-    /**
-     * @brief In-place Hadamard 8x8 on the first 8 elements (Eco quality).
-     *
-     * 3-stage butterfly, normalized by 1/sqrt(8). Elements 8..15 untouched.
-     */
-    static void hadamard8InPlace(std::array<T, kFDNSize>& x) noexcept
-    {
-        for (int i = 0; i < 8; i += 2)
-        { T a = x[i], b = x[i+1]; x[i] = a + b; x[i+1] = a - b; }
-
-        for (int i = 0; i < 8; i += 4)
-            for (int j = 0; j < 2; ++j)
-            { T a = x[i+j], b = x[i+j+2]; x[i+j] = a + b; x[i+j+2] = a - b; }
-
-        for (int j = 0; j < 4; ++j)
-        { T a = x[j], b = x[j+4]; x[j] = a + b; x[j+4] = a - b; }
-
-        constexpr T norm = T(0.35355339059327373);  // 1/sqrt(8)
-        for (int i = 0; i < 8; ++i) x[i] *= norm;
-    }
-
-    /**
-     * @brief In-place Householder reflection for 16 channels.
-     *
-     * H = I - (2/N) * ones. Each output = input - (2/N) * sum.
-     * Provides moderate cross-feeding without locking delays together,
-     * as recommended by Signalsmith for FDN feedback mixing.
-     */
-    static void householderInPlace(std::array<T, kFDNSize>& x, int n) noexcept
-    {
-        T sum = T(0);
-        for (int i = 0; i < n; ++i) sum += x[i];
-        T factor = sum * T(2) / static_cast<T>(n);
-        for (int i = 0; i < n; ++i) x[i] -= factor;
-    }
-
-    /// Block-cached copies of the atomic parameters: 16 FDN lines reading
-    /// ~10 relaxed atomics per SAMPLE added measurable overhead; one refresh
-    /// per block (refreshCachedParams) is bit-identical for parameters that
-    /// only change at block rate anyway.
+    /// Block-cached copies of the atomics read in the sample loop.
     struct CachedParams
     {
         int preDelaySamples = 0;
@@ -1234,104 +1119,69 @@ protected:
         T earlyLevel = T(1);
         T lateLevel  = T(1);
         T width      = T(1);
-        T modDepthA  = T(1);
-        T modDepthB  = T(0.5);
     };
     CachedParams cachedParams_ {};
+
+    // =========================================================================
+    // Audio-thread control
+    // =========================================================================
 
     /**
      * @brief Drains deferred parameter changes on the audio thread.
      *
-     * C2/C3 model: all mutations of non-atomic topology arrays
-     * (fdnDelayLens_, diffCoeffs_, ...) happen here, never from GUI-thread
-     * setters. The acquire-ordered exchanges synchronize with the
-     * release-stores in setType/setXxx. Called at the top of processBlock()
-     * and processSample(); each flag is pre-checked with a plain load so the
-     * per-sample path pays no RMW when nothing is pending.
+     * The acquire-ordered exchanges synchronize with the release stores in
+     * the setters. Each flag is pre-checked with a plain load so the
+     * per-sample path pays no read-modify-write when nothing is pending.
      */
     void drainPendingChanges() noexcept
     {
         if (qualityDirty_.load(std::memory_order_acquire)
             && qualityDirty_.exchange(false, std::memory_order_acquire))
         {
-            const bool eco =
-                quality_.load(std::memory_order_relaxed) == Quality::Eco;
+            const bool eco = quality_.load(std::memory_order_relaxed) == Quality::Eco;
             if (eco != eco_)
             {
                 eco_ = eco;
-                nLines_ = eco ? kEcoLines : kFDNSize;
-                if (spec_.sampleRate > 0)
-                {
-                    updateDelayLengths();  // re-derives per-line delays + decay
-                    generateERTapsForType(type_.load(std::memory_order_relaxed));
-                }
-                // Engine topology changed: old delay/filter state is stale.
-                reset();
+                refreshTopology();
+                updateAll();
+                generateERTapsForType(type_.load(std::memory_order_relaxed));
+                reset();   // engine topology changed: old state is stale
             }
         }
 
         if (presetDirty_.load(std::memory_order_acquire)
             && presetDirty_.exchange(false, std::memory_order_acquire))
         {
-            Type t = type_.load(std::memory_order_relaxed);
-            applyPreset(t);
-            // C3 fix: wipe all delay buffers and filter state; topology just
-            // changed, so old state is stale and can spike the output.
-            reset();
-            // The preset-rebuild already ran updateDelayLengths /
-            // updateDiffCoeffs / updateModulation, so consume paramsDirty_
-            // without doing the work twice.
+            applyPreset(type_.load(std::memory_order_relaxed));
+            reset();       // new room: drop the old tail, snap the lengths
             paramsDirty_.store(false, std::memory_order_relaxed);
         }
         else if (paramsDirty_.load(std::memory_order_acquire)
                  && paramsDirty_.exchange(false, std::memory_order_acquire))
         {
-            // Non-topology parameter change: refresh coefficient arrays but
-            // DO NOT wipe delay buffers (would click on every knob tweak).
-            if (spec_.sampleRate > 0)
-            {
-                updateDelayLengths();  // also runs updateDecayParams
-                updateDiffCoeffs();
-                updateModulation();
-
-                T md = modDepth_.load(std::memory_order_relaxed);
-                modDepthA_.store(md * T(30), std::memory_order_relaxed);
-                modDepthB_.store(md * T(15), std::memory_order_relaxed);
-
-                T hd = highDecayMult_.load(std::memory_order_relaxed);
-                T damp = std::clamp((T(1) - hd) / T(0.9), T(0), T(1));
-                damping_.store(damp, std::memory_order_relaxed);
-            }
+            // Knob change: refresh coefficients without touching the audio
+            // state; line lengths glide to their new targets.
+            updateAll();
         }
 
-        if (toneDirty_.load(std::memory_order_acquire)
-            && toneDirty_.exchange(false, std::memory_order_acquire))
-        {
-            T hpHz = toneLowCutHz_.load(std::memory_order_relaxed);
-            T lpHz = toneHighCutHz_.load(std::memory_order_relaxed);
-            if (hpHz <= T(0) || spec_.sampleRate <= 0)
-            {
-                toneHPActive_ = false;
-            }
-            else
-            {
-                toneHPActive_ = true;
-                toneHPBiquad_.setCoeffs(BiquadCoeffs::makeHighPass(
-                    spec_.sampleRate,
-                    static_cast<double>(std::clamp(hpHz, T(20), T(500)))));
-            }
-            if (lpHz <= T(0) || spec_.sampleRate <= 0)
-            {
-                toneLPActive_ = false;
-            }
-            else
-            {
-                toneLPActive_ = true;
-                toneLPBiquad_.setCoeffs(BiquadCoeffs::makeLowPass(
-                    spec_.sampleRate,
-                    static_cast<double>(std::clamp(lpHz, T(2000), T(16000)))));
-            }
-        }
+        drainTone();
+    }
+
+    void drainTone() noexcept
+    {
+        if (!(toneDirty_.load(std::memory_order_acquire)
+              && toneDirty_.exchange(false, std::memory_order_acquire)))
+            return;
+        const T hpHz = toneLowCutHz_.load(std::memory_order_relaxed);
+        const T lpHz = toneHighCutHz_.load(std::memory_order_relaxed);
+        toneHPActive_ = hpHz > T(0) && spec_.sampleRate > 0;
+        if (toneHPActive_)
+            toneHPBiquad_.setCoeffsNow(BiquadCoeffs::makeHighPass(
+                spec_.sampleRate, static_cast<double>(std::clamp(hpHz, T(20), T(500)))));
+        toneLPActive_ = lpHz > T(0) && spec_.sampleRate > 0;
+        if (toneLPActive_)
+            toneLPBiquad_.setCoeffsNow(BiquadCoeffs::makeLowPass(
+                spec_.sampleRate, static_cast<double>(std::clamp(lpHz, T(2000), T(16000)))));
     }
 
     /// Pulls the atomic parameters into the block-local cache (audio thread).
@@ -1342,540 +1192,542 @@ protected:
         cachedParams_.earlyLevel = earlyLevel_.load(std::memory_order_relaxed);
         cachedParams_.lateLevel  = lateLevel_.load(std::memory_order_relaxed);
         cachedParams_.width      = width_.load(std::memory_order_relaxed);
-        cachedParams_.modDepthA  = modDepthA_.load(std::memory_order_relaxed);
-        cachedParams_.modDepthB  = modDepthB_.load(std::memory_order_relaxed);
     }
 
-    /// Core per-sample processing - returns wet {L, R}.
-    std::pair<T, T> processSampleInternal(T input) noexcept
+    /**
+     * @brief Control-rate update: glides the line lengths toward their
+     *        targets, draws the next modulation values and sets the
+     *        per-sample read-position ramps for the next kCtrl samples.
+     */
+    void controlTick() noexcept
     {
-        // Block-cached params (see refreshCachedParams)
-        const int preDelSamp = cachedParams_.preDelaySamples;
-        const int erToLateSamp = cachedParams_.erToLateSamples;
-        const T earlyLvl = cachedParams_.earlyLevel;
-        const T lateLvl = cachedParams_.lateLevel;
-        const T widthVal = cachedParams_.width;
-        const T modDA = cachedParams_.modDepthA;
-        const T modDB = cachedParams_.modDepthB;
-
-        // --- Pre-delay ---
-        preDelayBuf_.push(input);
-        T delayed = (preDelSamp > 0)
-            ? preDelayBuf_.read(preDelSamp) : input;
-
-        // --- Input diffusion: 8 cascaded modulated allpass ---
-        T diffused = delayed;
-        T diffNoise = nextFilteredNoise();
-        for (int d = 0; d < kDiffStages; ++d)
-        {
-            T diffPol = (d & 1) ? T(-1) : T(1);
-            T diffMod = diffNoise * T(2) * diffPol;  // +/-2 samples excursion
-            diffused = processAllpassModulated(diffBufs_[d], diffDelays_[d],
-                                               diffMod, diffCoeffs_[d], diffused,
-                                               eco_);
-        }
-
-        // --- Early reflections with progressive absorption ---
-        erBuf_.push(diffused);
-        T earlyL = T(0), earlyR = T(0);
-        for (int t = 0; t < numERTaps_; ++t)
-        {
-            T rawL = erBuf_.read(erTapsL_[t]) * erGainsL_[t];
-            T rawR = erBuf_.read(erTapsR_[t]) * erGainsR_[t];
-            // Progressive 1-pole LP: later taps are darker (wall absorption)
-            erLPStateL_[t] += erAbsCoeffs_[t] * (rawL - erLPStateL_[t]);
-            erLPStateR_[t] += erAbsCoeffs_[t] * (rawR - erLPStateR_[t]);
-            earlyL += erLPStateL_[t];
-            earlyR += erLPStateR_[t];
-        }
-        earlyL *= earlyLvl;
-        earlyR *= earlyLvl;
-
-        // --- ER-to-late gap ---
-        erToLateBuf_.push(diffused);
-        T fdnInputRaw = (erToLateSamp > 0)
-            ? erToLateBuf_.read(erToLateSamp) : diffused;
-
-        // --- Parallel allpass diffuser (2-step, 16^2 = 256 echo paths) ---
-        // Step 1: parallel allpass with different delays create unique IRs.
-        // Eco: single step, 8 channels (16 echo paths via one Hadamard).
         const int n = nLines_;
-        std::array<T, kFDNSize> diffCh {};
-        for (int d = 0; d < n; ++d)
-            diffCh[d] = processAllpass(parAPBufs_[d], parAPDelays_[d],
-                                        parAPCoeff_, fdnInputRaw);
-        if (!eco_)
+        for (int i = 0; i < n; ++i)
         {
-            hadamardInPlace(diffCh);
-            // Step 2: per-channel delay + Hadamard -> 256 unique paths
-            for (int d = 0; d < kFDNSize; ++d)
-                diffuserStep2_[d].push(diffCh[d]);
-            for (int d = 0; d < kFDNSize; ++d)
-                diffCh[d] = diffuserStep2_[d].read(diffuserStep2Delays_[d]);
-            hadamardInPlace(diffCh);
+            const T diff = static_cast<T>(lenTarget_[i]) - lenCur_[i];
+            lenCur_[i] += std::clamp(diff * glideCoeff_, -maxGlideStep_, maxGlideStep_);
+            const T m = lfo_[i].nextStride(kCtrl) * modDepthSamples_;
+            const T target = std::clamp(lenCur_[i] + m, kMinReadPos, maxReadPos_);
+            posInc_[i] = (target - pos_[i]) * (T(1) / T(kCtrl));
         }
-        else
+    }
+
+    /**
+     * @brief One sample of the N-line FDN (compile-time N so the per-line
+     *        stages vectorize): allpass-interpolated modulated reads, the
+     *        L/R output sums, Hadamard mix plus rotation, absorption
+     *        shelves, in-loop allpass, safety limiter, injection, write.
+     *        The Hadamard normalization is folded into the Jot shelf.
+     */
+    template <int N, bool LoopAllpass>
+    void runFdn(T& lateL, T& lateR, int gap) noexcept
+    {
+        constexpr int W = std::min(simd::kVecWidth<T>, N);
+        using O = simd::Vec<T, W>;
+        using V = typename O::V;
+        static_assert(N % W == 0, "line count must be a multiple of the SIMD width");
+
+        alignas(64) std::array<T, N + 1> r;   // +1: wrap slot for the rotation
+        alignas(64) std::array<T, N> v;
+        alignas(64) std::array<T, N> tmp;
+
+        // Allpass-interpolated modulated reads. eta = (1 - d) / (1 + d) for
+        // the fractional part d in [0.5, 1.5), as the series -h / (1 + h) in
+        // h = (d - 1) / 2, |h| <= 1/4: the error (< 1e-3) only nudges the
+        // fractional delay, the interpolator stays exactly allpass.
+        for (int i = 0; i < N; ++i)
         {
-            hadamard8InPlace(diffCh);
+            const T p = pos_[i] += posInc_[i];
+            const int M = static_cast<int>(p - T(0.5));
+            const T h = (p - static_cast<T>(M) - T(1)) * T(0.5);
+            const T eta = -h * (T(1) - h * (T(1) - h * (T(1) - h)));
+            const T y = eta * (lines_.at(i, M) - apY1_[i]) + lines_.at(i, M + 1);
+            apY1_[i] = y;
+            r[i] = y;
         }
 
-        // =================================================================
-        // FDN Core
-        // =================================================================
-
-        // Refresh modulation values. Full: per sample (bit-identical to the
-        // previous inline computation: same LFO call order and arithmetic).
-        // Eco: every kEcoCtrlInterval samples (control rate); at reverb mod
-        // rates (0.1-5 Hz) the position steps are microscopic (< 1e-2 samples)
-        // and far below audibility.
-        if (!eco_)
+        // Orthogonal L/R output sums.
         {
-            T noise = nextFilteredNoise();
-            noiseND_ = noise * noiseDepth_;
-            for (int d = 0; d < n; ++d)
+            V aL = O::set1(T(0)), aR = aL;
+            for (int i = 0; i < N; i += W)
             {
-                modACache_[d] = modLFOA_[d].next() * modDA;
-                modBCache_[d] = modLFOB_[d].next() * modDB;
+                const V x = O::load(r.data() + i);
+                aL = O::madd(O::load(outSignL_.data() + i), x, aL);
+                aR = O::madd(O::load(outSignR_.data() + i), x, aR);
             }
+            O::store(v.data(), aL);
+            O::store(tmp.data(), aR);
+            for (int k = 0; k < W; ++k) { lateL += v[k]; lateR += tmp[k]; }
         }
-        else
-        {
-            if (ctrlPhase_ == 0)
-            {
-                noiseND_ = nextFilteredNoiseEco() * noiseDepth_;
-                for (int d = 0; d < n; ++d)
+
+        // Unnormalized Hadamard butterflies (the 1/sqrt(N) is folded into
+        // the Jot shelf): in-vector strides scalar, the rest in SIMD.
+        for (int h = 1; h < W; h <<= 1)
+            for (int i = 0; i < N; i += h << 1)
+                for (int j = i; j < i + h; ++j)
                 {
-                    modACache_[d] = modLFOA_[d].nextStride(kEcoCtrlInterval) * modDA;
-                    modBCache_[d] = modLFOB_[d].nextStride(kEcoCtrlInterval) * modDB;
+                    const T a = r[j], b = r[j + h];
+                    r[j] = a + b;
+                    r[j + h] = a - b;
                 }
-            }
-            if (++ctrlPhase_ >= kEcoCtrlInterval) ctrlPhase_ = 0;
-        }
+        for (int h = W; h < N; h <<= 1)
+            for (int i = 0; i < N; i += h << 1)
+                for (int j = i; j < i + h; j += W)
+                {
+                    const V a = O::load(r.data() + j), b = O::load(r.data() + j + h);
+                    O::store(r.data() + j, O::add(a, b));
+                    O::store(r.data() + j + h, O::sub(a, b));
+                }
+        r[N] = r[0];
 
-        // Read from the delay lines with LFO + noise modulated delay
-        std::array<T, kFDNSize> reads {};
-        for (int d = 0; d < n; ++d)
+        // Rotate the lines by one, then absorb: Jot mid/high shelf and bass
+        // shelf, y = b0 x + b1 x1 - a1 y1 each.
+        for (int i = 0; i < N; i += W)
         {
-            // Noise with alternating polarity (Progenitor-style)
-            T polarity = (d & 1) ? T(-1) : T(1);
-            T noiseMod = noiseND_ * polarity;
-            T readPos = static_cast<T>(fdnDelayLens_[d]) + modACache_[d]
-                        + modBCache_[d] + noiseMod;
-            readPos = std::max(readPos, T(1));
-            // Allpass interpolation: preserves HF over hundreds of feedback
-            // iterations (linear/cubic causes cumulative dulling).
-            // Formula: z1 = older + frac*(newer - z1)  [Progenitor2-style]
-            {
-                int readInt = static_cast<int>(readPos);
-                T frac = readPos - static_cast<T>(readInt);
-                T newer = fdnDelays_[d].read(readInt);
-                T older = fdnDelays_[d].read(readInt + 1);
-                apInterpState_[d] = older + frac * (newer - apInterpState_[d]);
-                reads[d] = apInterpState_[d];
-            }
-            // Post-read serial allpass (density multiplier, Infinity2-style)
-            reads[d] = processAllpass(intAPBufsB_[d], intAPDelaysB_[d],
-                                       intAPCoeff_, reads[d]);
+            const V x = O::load(r.data() + i + 1);
+            const V j = O::sub(O::madd(O::load(jotB0_.data() + i), x,
+                                       O::mul(O::load(jotB1_.data() + i), O::load(jotX1_.data() + i))),
+                               O::mul(O::load(jotA1_.data() + i), O::load(jotY1_.data() + i)));
+            O::store(jotX1_.data() + i, x);
+            O::store(jotY1_.data() + i, j);
+            const V b = O::sub(O::madd(O::load(bassB0_.data() + i), j,
+                                       O::mul(O::load(bassB1_.data() + i), O::load(bassX1_.data() + i))),
+                               O::mul(O::load(bassA1_.data() + i), O::load(bassY1_.data() + i)));
+            O::store(bassX1_.data() + i, j);
+            O::store(bassY1_.data() + i, b);
+            O::store(v.data() + i, b);
         }
 
-        // Householder mixing (moderate coupling, keeps lines independent)
-        std::array<T, kFDNSize> mixed = reads;
-        householderInPlace(mixed, n);
-
-        // Per-line: Jot absorption -> bass shelf -> feedback allpass -> write
-        for (int d = 0; d < n; ++d)
+        if constexpr (LoopAllpass)
         {
-            T val = mixed[d];
-
-            // --- Jot absorption filter (1st-order pole-zero shelf) ---
-            // y[n] = b0*x[n] + b1*x[n-1] - a1*y[n-1]
-            // DC gain = g_mid, Nyquist gain = g_high (exact: T60 anchors),
-            // transition midpoint at the highCrossover_ frequency.
+            for (int i = 0; i < N; ++i)
+                tmp[i] = loopAP_.at(i, loopAPLen_[i]);
+            const V g = O::set1(loopAPCoeff_);
+            for (int i = 0; i < N; i += W)
             {
-                const T y = absB0_[d] * val + absB1_[d] * absX1_[d]
-                            - absA1_[d] * absState_[d];
-                absX1_[d] = val;
-                absState_[d] = y;
-                val = y;
+                const V d = O::load(tmp.data() + i);
+                const V w = O::madd(g, d, O::load(v.data() + i));
+                O::store(v.data() + i, O::sub(d, O::mul(g, w)));
+                O::store(tmp.data() + i, w);
             }
-
-            // --- Bass shelf (independent LF control) ---
-            bassState_[d] += bassLPCoeff_ * (val - bassState_[d]);
-            val += bassState_[d] * (bassRatio_[d] - T(1));
-
-            // --- Feedback allpass (2 stages, modulated, Dattorro-style) ---
-            {
-                T fbMod = modBCache_[d] * T(0.3);
-                val = processAllpassModulated(fbAPBufsA_[d], fbAPDelaysA_[d],
-                                              fbMod, fbAPCoeff_, val, eco_);
-                val = processAllpassModulated(fbAPBufsB_[d], fbAPDelaysB_[d],
-                                              fbMod * T(-0.7), fbAPCoeff_, val,
-                                              eco_);
-            }
-
-            // --- DC blocker (~23 Hz) ---
-            dcZ_[d] += dcCoeff_ * (val - dcZ_[d]);
-            val -= dcZ_[d];
-
-            // --- Soft saturation (Branchless fast approximation) ---
-            // Extract the overshoot beyond [-1, 1] without branching
-            T exceed = std::max(T(0), val - T(1)) - std::max(T(0), T(-1) - val);
-
-            // Limit base value strictly to [-1, 1]
-            val -= exceed;
-
-            // Apply fast rational soft-clip: x / (1 + |x|) ONLY to the exceeding portion
-            // Approximates tanh curve infinitely closer to limits without unpredictable CPU branch hits
-            val += exceed / (T(1) + std::abs(exceed));
-
-            // --- Pre-write serial allpass (density, Infinity2-style) ---
-            val = processAllpass(intAPBufsA_[d], intAPDelaysA_[d],
-                                  intAPCoeff_, val);
-
-            // --- Feedback IIR smoothing (Verbity technique) ---
-            val = val * (T(1) - fbSmooth_) + prevFeedback_[d] * fbSmooth_;
-            prevFeedback_[d] = val;
-
-            // --- Write back with per-line diffuser output ---
-            fdnDelays_[d].push(val + diffCh[d] * kInputGain);
+            for (int i = 0; i < N; ++i)
+                loopAP_.write(i, tmp[i]);
+            loopAP_.advance();
         }
 
-        // --- Stereo output ---
+        for (int i = 0; i < N; ++i)
+        {
+            T x = v[i];
+            // Safety limiter (never reached at sane levels): identity below
+            // kSoftLimit, a rational soft knee above.
+            if (std::abs(x) > kSoftLimit) [[unlikely]]
+            {
+                const T over = std::abs(x) - kSoftLimit;
+                x = std::copysign(kSoftLimit + over / (T(1) + over), x);
+            }
+            lines_.write(i, x + injGain_[i] * ring_[(i >> 1) & 1].at(gap + injTap_[i]));
+        }
+        lines_.advance();
+    }
 
-        // Main: orthogonal sign-weighted from all line reads (the first 8
-        // sign entries are also mutually orthogonal, so Eco keeps the L/R
-        // decorrelation property)
+    /**
+     * @brief One sample of the two spring tanks (Type::Spring).
+     *
+     * Each spring is a feedback loop after Valimaki, Parker & Abel (2010):
+     * the round-trip delay line (modulated, allpass-interpolated like the
+     * FDN lines), a cascade of stretched first-order allpasses
+     * (a + z^-K) / (1 + a z^-K) whose group delay rises from DC to the
+     * transition frequency fs / (2K) (the characteristic chirp, re-dispersed
+     * on every round trip), a 4th-order band limit just below fs / (2K), and
+     * the same exact-T60 absorption shelves as the FDN. Left mostly drives
+     * spring 0 and right spring 1; each spring's band-limited chirp train is
+     * its output. setDiffusion() sets the chirp strength here.
+     */
+    template <int Stages>
+    void runSprings(T& lateL, T& lateR, int gap) noexcept
+    {
+        const int P = springP_;
+        const int mask = P - 1;
+        const int iw = springW_;
+        const int ik = (springW_ - springK_) & mask;
+        const T a = springA_;
+        T out[kSprings];
+        // Each spring hears mostly its own side (a mono input drives both).
+        const T inL = ring_[0].at(gap + 1), inR = ring_[1].at(gap + 1);
+        const T drive[kSprings] = { T(0.75) * inL + T(0.25) * inR,
+                                    T(0.25) * inL + T(0.75) * inR };
+
+        for (int s = 0; s < kSprings; ++s)
+        {
+            const T p = pos_[s] += posInc_[s];
+            const int M = static_cast<int>(p - T(0.5));
+            const T h = (p - static_cast<T>(M) - T(1)) * T(0.5);
+            const T eta = -h * (T(1) - h * (T(1) - h * (T(1) - h)));
+            T x = eta * (lines_.at(s, M) - apY1_[s]) + lines_.at(s, M + 1);
+            apY1_[s] = x;
+
+            // Dispersion: y = a (x - y[n-K]) + x[n-K], stage by stage.
+            T* hist = springHist_.data() + static_cast<std::size_t>(s * (kSpringStages + 1) * P);
+            for (int m = 0; m < Stages; ++m)
+            {
+                T* hin = hist + m * P;
+                const T* hout = hin + P;
+                hin[iw] = x;
+                x = a * (x - hout[ik]) + hin[ik];
+            }
+            hist[Stages * P + iw] = x;
+
+            // Band limit: two TDF-II Butterworth sections.
+            auto& st = springLPState_[s];
+            for (int k = 0; k < 2; ++k)
+            {
+                const auto& c = springLP_[k];
+                const T y = c[0] * x + st[2 * k];
+                st[2 * k] = c[1] * x - c[3] * y + st[2 * k + 1];
+                st[2 * k + 1] = c[2] * x - c[4] * y;
+                x = y;
+            }
+            out[s] = x;
+
+            // Absorption shelves (exact per-band T60), limiter, injection.
+            const T j = jotB0_[s] * x + jotB1_[s] * jotX1_[s] - jotA1_[s] * jotY1_[s];
+            jotX1_[s] = x;
+            jotY1_[s] = j;
+            T v = bassB0_[s] * j + bassB1_[s] * bassX1_[s] - bassA1_[s] * bassY1_[s];
+            bassX1_[s] = j;
+            bassY1_[s] = v;
+            if (std::abs(v) > kSoftLimit) [[unlikely]]
+            {
+                const T over = std::abs(v) - kSoftLimit;
+                v = std::copysign(kSoftLimit + over / (T(1) + over), v);
+            }
+            lines_.write(s, v + drive[s]);
+        }
+        lines_.advance();
+        springW_ = (springW_ + 1) & mask;
+        lateL += out[0] * kSpringOutGain;
+        lateR += out[1] * kSpringOutGain;
+    }
+
+    /// Line count of the active engine: 2 springs, or the FDN size.
+    void refreshTopology() noexcept
+    {
+        nLines_ = spring_ ? kSprings : eco_ ? kEcoLines : kMaxLines;
+    }
+
+    /// Core per-sample processing: stereo in, wet stereo out.
+    std::pair<T, T> processSampleInternal(T inL, T inR) noexcept
+    {
+        if (ctrlPhase_ == 0) controlTick();
+        ctrlPhase_ = (ctrlPhase_ + 1) & (kCtrl - 1);
+
+        // A spring tank is driven by the raw transducer signal and has no
+        // output diffusers: both would blur the chirps.
+        const int nIn = spring_ ? 0 : eco_ ? kEcoInStages : kInStages;
+        const int nOut = spring_ ? 0 : eco_ ? kEcoOutStages : kOutStages;
+        const int pd = cachedParams_.preDelaySamples;
+        const int gap = cachedParams_.erToLateSamples;
+
+        // --- Pre-delay and input diffusion, per channel ---
+        const T in[2] = { inL, inR };
+        for (int c = 0; c < 2; ++c)
+        {
+            T x = pd > 0 ? preDelay_[c].at(pd) : in[c];
+            preDelay_[c].push(in[c]);
+            for (int s = 0; s < nIn; ++s)
+                x = allpass(inAP_[c][s], inAPLen_[c][s], inAPCoeff_[s], x);
+            ring_[c].push(x);
+        }
+
+        // --- Early reflections: ipsilateral + contralateral taps, grouped
+        //     absorption (later groups darker) ---
+        T early[2] = { T(0), T(0) };
+        for (int s = 0; s < 2; ++s)
+        {
+            const Line& ipsi = ring_[s];
+            const Line& contra = ring_[1 - s];
+            auto& lp = erLP_[s];
+            for (int g = 0; g < kERGroups; ++g)
+            {
+                T acc = T(0);
+                for (int k = erGroupStart_[g]; k < erGroupStart_[g + 1]; ++k)
+                    acc += erGainI_[s][k] * ipsi.at(erTapI_[s][k])
+                         + erGainC_[s][k] * contra.at(erTapC_[s][k]);
+                lp[g] += erLPCoeff_[g] * (acc - lp[g]);
+                early[s] += lp[g];
+            }
+        }
+
+        // --- FDN ---
         T lateL = T(0), lateR = T(0);
-        for (int d = 0; d < n; ++d)
+        if (spring_)
         {
-            lateL += reads[d] * static_cast<T>(kOutSignL_[d]);
-            lateR += reads[d] * static_cast<T>(kOutSignR_[d]);
+            if (eco_) runSprings<kEcoSpringStages>(lateL, lateR, gap);
+            else      runSprings<kSpringStages>(lateL, lateR, gap);
         }
+        else if (eco_) runFdn<kEcoLines, false>(lateL, lateR, gap);
+        else           runFdn<kMaxLines, true>(lateL, lateR, gap);
 
-        if (!eco_)
+        // --- Output: diffusion, width, early + late, DC block, tone ---
+        const T lateLvl = cachedParams_.lateLevel * kOutGain;
+        lateL *= lateLvl;
+        lateR *= lateLvl;
+        for (int s = 0; s < nOut; ++s)
         {
-        // Multi-tap: Dattorro-style reads from different delay positions
-        for (int t = 0; t < kNumMultiTaps; ++t)
-        {
-            int posL = std::max(1, static_cast<int>(
-                fdnDelayLens_[kMultiTapLineL_[t]] * kMultiTapFracL_[t]));
-            int posR = std::max(1, static_cast<int>(
-                fdnDelayLens_[kMultiTapLineR_[t]] * kMultiTapFracR_[t]));
-            lateL += fdnDelays_[kMultiTapLineL_[t]].read(posL)
-                     * static_cast<T>(kMultiTapSignL_[t]) * T(0.7);
-            lateR += fdnDelays_[kMultiTapLineR_[t]].read(posR)
-                     * static_cast<T>(kMultiTapSignR_[t]) * T(0.7);
+            lateL = allpass(outAP_[0][s], outAPLen_[0][s], outAPCoeff_, lateL);
+            lateR = allpass(outAP_[1][s], outAPLen_[1][s], outAPCoeff_, lateR);
         }
-
-        // Feedback allpass taps (Dattorro-style: read from within AP buffers)
-        for (int d = 0; d < kFDNSize; d += 2)
         {
-            int tapA = std::max(1, fbAPDelaysA_[d] * 2 / 3);
-            int tapB = std::max(1, fbAPDelaysB_[d] * 3 / 5);
-            lateL += fbAPBufsA_[d].read(tapA) * static_cast<T>(kOutSignL_[d]) * T(0.35);
-            lateR += fbAPBufsB_[d].read(tapB) * static_cast<T>(kOutSignR_[d]) * T(0.35);
-        }
-        for (int d = 1; d < kFDNSize; d += 2)
-        {
-            int tapA = std::max(1, fbAPDelaysA_[d] * 3 / 5);
-            int tapB = std::max(1, fbAPDelaysB_[d] * 2 / 3);
-            lateL += fbAPBufsB_[d].read(tapB) * static_cast<T>(kOutSignL_[d]) * T(0.35);
-            lateR += fbAPBufsA_[d].read(tapA) * static_cast<T>(kOutSignR_[d]) * T(0.35);
-        }
-
-        // Internal serial allpass taps (additional temporal smearing)
-        for (int d = 0; d < kFDNSize; d += 2)
-        {
-            int tapA = std::max(1, intAPDelaysA_[d] * 2 / 3);
-            int tapB = std::max(1, intAPDelaysB_[d] * 3 / 5);
-            lateL += intAPBufsA_[d].read(tapA) * static_cast<T>(kOutSignL_[d]) * T(0.2);
-            lateR += intAPBufsB_[d].read(tapB) * static_cast<T>(kOutSignR_[d]) * T(0.2);
-        }
-        for (int d = 1; d < kFDNSize; d += 2)
-        {
-            int tapA = std::max(1, intAPDelaysA_[d] * 3 / 5);
-            int tapB = std::max(1, intAPDelaysB_[d] * 2 / 3);
-            lateL += intAPBufsB_[d].read(tapB) * static_cast<T>(kOutSignL_[d]) * T(0.2);
-            lateR += intAPBufsA_[d].read(tapA) * static_cast<T>(kOutSignR_[d]) * T(0.2);
-        }
-        } // !eco_ (extra output taps)
-
-        const T outNorm = eco_ ? kOutputNormEco : kOutputNorm;
-        lateL *= lateLvl * outNorm;
-        lateR *= lateLvl * outNorm;
-
-        // --- Output diffusion (L/R decorrelated allpass) ---
-        for (int s = 0; s < kOutDiffStages; ++s)
-        {
-            lateL = processAllpass(outDiffBufsL_[s], outDiffDelaysL_[s],
-                                   outDiffCoeff_, lateL);
-            lateR = processAllpass(outDiffBufsR_[s], outDiffDelaysR_[s],
-                                   outDiffCoeff_, lateR);
-        }
-
-        // --- Stereo width (M/S on late tail only) ---
-        {
-            T mid  = (lateL + lateR) * T(0.5);
-            T side = (lateL - lateR) * T(0.5);
-            side *= widthVal;
+            const T mid  = (lateL + lateR) * T(0.5);
+            const T side = (lateL - lateR) * T(0.5) * cachedParams_.width;
             lateL = mid + side;
             lateR = mid - side;
         }
 
-        // --- Combine early + late ---
-        T outL = earlyL + lateL;
-        T outR = earlyR + lateR;
-
-        // --- Tone correction EQ (Biquad 12 dB/oct) ---
+        T out[2] = { early[0] * cachedParams_.earlyLevel + lateL,
+                     early[1] * cachedParams_.earlyLevel + lateR };
+        for (int c = 0; c < 2; ++c)
+        {
+            const T y = out[c] - dcX1_[c] + dcR_ * dcY1_[c];
+            dcX1_[c] = out[c];
+            dcY1_[c] = y;
+            out[c] = y;
+        }
         if (toneHPActive_)
         {
-            outL = toneHPBiquad_.processSample(outL, 0);
-            outR = toneHPBiquad_.processSample(outR, 1);
+            out[0] = toneHPBiquad_.processSample(out[0], 0);
+            out[1] = toneHPBiquad_.processSample(out[1], 1);
         }
         if (toneLPActive_)
         {
-            outL = toneLPBiquad_.processSample(outL, 0);
-            outR = toneLPBiquad_.processSample(outR, 1);
+            out[0] = toneLPBiquad_.processSample(out[0], 0);
+            out[1] = toneLPBiquad_.processSample(out[1], 1);
         }
-
-        return { outL, outR };
+        return { out[0], out[1] };
     }
 
     // =========================================================================
-    // Coefficient update helpers
+    // Coefficient update helpers (audio thread or prepare)
     // =========================================================================
 
-    /**
-     * @brief Computes per-line Jot absorption filter coefficients.
-     *
-     * Implements Jot/Chaigne (1991): each delay line gets a 1st-order
-     * pole-zero shelving IIR that produces frequency-dependent decay.
-     *
-     * H(z) = (b0 + b1 * z^-1) / (1 + a1 * z^-1)
-     *
-     * with |H(1)| = g_mid (decay at DC/mid), |H(-1)| = g_high (decay at
-     * Nyquist), and the transition midpoint sqrt(g_mid * g_high) placed at
-     * the highCrossover_ frequency (shared by all lines so the
-     * frequency-dependent T60 stays coherent across the FDN).
-     */
-    void updateDecayParams() noexcept
+    void updateAll() noexcept
     {
-        T decay = decayTime_.load(std::memory_order_relaxed);
-        if (spec_.sampleRate <= 0 || decay <= T(0)) return;
+        if (spec_.sampleRate <= 0) return;
+        updateDelayLengths();
+        updateDiffCoeffs();
+        updateModulation();
+        updateDecayParams();
+        const T hd = highDecayMult_.load(std::memory_order_relaxed);
+        damping_.store(std::clamp((T(1) - hd) / T(0.9), T(0), T(1)), std::memory_order_relaxed);
+        erToLateSamples_.store(msToSamples(erToLateMs_.load(std::memory_order_relaxed)),
+                               std::memory_order_relaxed);
+    }
 
-        T sr = static_cast<T>(spec_.sampleRate);
-        T hdMult = highDecayMult_.load(std::memory_order_relaxed);
-        T bdMult = bassDecayMult_.load(std::memory_order_relaxed);
-        T t60Mid  = decay;
-        T t60High = decay * hdMult;
-        T t60Bass = decay * bdMult;
-
-        t60High = std::max(t60High, T(0.05));
-        t60Bass = std::max(t60Bass, T(0.05));
-
-        // Common shelf transition for every line (Jot: a shared shape keeps
-        // the frequency-dependent T60 coherent across lines). Designed via
-        // the bilinear transform of the analog prototype
-        //   Ha(s) = gHigh * (s + w1) / (s + w2),
-        //   w1 = K * sqrt(gMid/gHigh), w2 = K * sqrt(gHigh/gMid),
-        // which pins |H(1)| = gMid and |H(-1)| = gHigh EXACTLY (the T60
-        // anchors, independent of the crossover) and places the geometric
-        // midpoint sqrt(gMid*gHigh) at the crossover frequency.
-        // The clamp keeps tan() below the pole at fs/2 for low sample rates.
-        const double fsD = static_cast<double>(spec_.sampleRate);
-        const double fc = std::clamp(
-            static_cast<double>(highCrossover_.load(std::memory_order_relaxed)),
-            100.0, 0.45 * fsD);
-        const double K = std::tan(3.14159265358979323846 * fc / fsD);
-
-        for (int d = 0; d < kFDNSize; ++d)
-        {
-            // Total loop delay = FDN delay + feedback APs + internal APs
-            T M = static_cast<T>(fdnDelayLens_[d] + fbAPDelaysA_[d] + fbAPDelaysB_[d]
-                                  + intAPDelaysA_[d] + intAPDelaysB_[d]);
-            if (M < T(1)) M = T(1);
-
-            // Per-loop gains: g = 0.001^(M / (T60 * sr))
-            T gMid  = std::pow(T(0.001), M / (t60Mid * sr));
-            T gHigh = std::pow(T(0.001), M / (t60High * sr));
-            T gBass = std::pow(T(0.001), M / (t60Bass * sr));
-
-            // Pole-zero shelf coefficients (designed in double):
-            //   H(z) = gHigh * ((1+w1) + (w1-1) z^-1) / ((1+w2) + (w2-1) z^-1)
-            // Unconditionally stable: pole = (1-w2)/(1+w2), |pole| < 1 for w2 > 0.
-            {
-                const double gM = std::max(static_cast<double>(gMid), 1e-12);
-                const double gH = std::clamp(static_cast<double>(gHigh), 1e-12, gM);
-                const double ratio = std::sqrt(gM / gH);
-                const double w1 = K * ratio;
-                const double w2 = K / ratio;
-                const double inv = 1.0 / (1.0 + w2);
-                absB0_[d] = static_cast<T>(gH * (1.0 + w1) * inv);
-                absB1_[d] = static_cast<T>(gH * (w1 - 1.0) * inv);
-                absA1_[d] = static_cast<T>((w2 - 1.0) * inv);
-            }
-
-            // Bass ratio for independent LF control. The bass shelf multiplies the
-            // per-line DC loop gain by bassRatio, so cap it so gMid*bassRatio stays
-            // below 1 - otherwise extreme decay + high bass multiplier make the low
-            // end self-sustain (a non-decaying drone) instead of ringing out.
-            bassRatio_[d] = gBass / (gMid + T(1e-10));
-            const T maxBassRatio = T(0.98) / std::max(gMid, T(1e-6));
-            bassRatio_[d] = std::clamp(bassRatio_[d], T(0.1), std::min(T(3), maxBassRatio));
-        }
-
-        // Bass crossover filter coefficient
-        T bassCut = bassCrossover_.load(std::memory_order_relaxed);
-        bassLPCoeff_ = T(1) - std::exp(T(-6.283185307179586) * bassCut / sr);
+    /// Size factor: size 0 -> 0.35, size 1 -> 1.
+    T sizeFactor() const noexcept
+    {
+        return T(0.35) + T(0.65) * size_.load(std::memory_order_relaxed);
     }
 
     void updateDelayLengths() noexcept
     {
-        double sr = spec_.sampleRate;
-        // Nonlinear size mapping: size=0 -> 0.35, size=1 -> 1.0
-        double sz = 0.35 + 0.65 * static_cast<double>(
-            size_.load(std::memory_order_relaxed));
+        const double sr = spec_.sampleRate;
+        const double sz = static_cast<double>(sizeFactor());
+        const auto ms = [sr](double v) { return std::max(1, static_cast<int>(v * sr / 1000.0)); };
 
-        for (int d = 0; d < kFDNSize; ++d)
+        for (int i = 0; i < kMaxLines; ++i)
         {
-            // Eco (8 lines) picks every other base delay so the active lines
-            // still span the full 29.7-160 ms range (mode density stays even).
-            const int srcIdx = eco_ ? std::min(d * 2, kFDNSize - 1) : d;
-            int raw = std::max(1, static_cast<int>(
-                kBaseDelaysMs_[srcIdx] * sz * sr / 1000.0));
-            fdnDelayLens_[d] = nearestPrime(raw);
+            // Eco picks every other base delay, so its 8 lines still span
+            // the full range (even mode density).
+            const int src = eco_ ? std::min(i * 4 + 3, kMaxLines - 1) : i;
+            lenTarget_[i] = nearestPrime(ms(kBaseDelaysMs_[src] * sz));
+            loopAPLen_[i] = nearestPrime(ms(kLoopApMs_[i]));
+            injTap_[i] = std::max(1, ms(kInjectMs_[i]));
+            injGain_[i] = static_cast<T>(kInjectSign_[i]) / std::sqrt(static_cast<T>(nLines_));
+            outSignL_[i] = static_cast<T>(kOutSignL_[i]);
+            outSignR_[i] = static_cast<T>(kOutSignR_[i]);
         }
-
-        for (int d = 0; d < kDiffStages; ++d)
-            diffDelays_[d] = nearestPrime(std::max(1,
-                static_cast<int>(kDiffDelaysMs_[d] * sr / 1000.0)));
-
-        for (int d = 0; d < kFDNSize; ++d)
+        if (spring_)
         {
-            fbAPDelaysA_[d] = nearestPrime(std::max(1,
-                static_cast<int>(fdnDelayLens_[d] * kFbAPRatioA_)));
-            fbAPDelaysB_[d] = nearestPrime(std::max(1,
-                static_cast<int>(fdnDelayLens_[d] * kFbAPRatioB_)));
-            intAPDelaysA_[d] = nearestPrime(std::max(1,
-                static_cast<int>(fdnDelayLens_[d] * kIntAPRatioA_)));
-            intAPDelaysB_[d] = nearestPrime(std::max(1,
-                static_cast<int>(fdnDelayLens_[d] * kIntAPRatioB_)));
+            const double springScale = 0.6 + 2.6 * static_cast<double>(size_.load(std::memory_order_relaxed));
+            for (int s = 0; s < kSprings; ++s)
+                lenTarget_[s] = nearestPrime(ms(kSpringBaseMs_[s] * springScale));
         }
-
-        for (int s = 0; s < kOutDiffStages; ++s)
+        for (int c = 0; c < 2; ++c)
         {
-            outDiffDelaysL_[s] = nearestPrime(std::max(1,
-                static_cast<int>(kOutDiffDelaysMsL_[s] * sr / 1000.0)));
-            outDiffDelaysR_[s] = nearestPrime(std::max(1,
-                static_cast<int>(kOutDiffDelaysMsR_[s] * sr / 1000.0)));
+            for (int s = 0; s < kInStages; ++s)
+                inAPLen_[c][s] = nearestPrime(ms(kInDiffMs_[c][s]));
+            for (int s = 0; s < kOutStages; ++s)
+                outAPLen_[c][s] = nearestPrime(ms(kOutDiffMs_[c][s]));
         }
-
-        // Parallel allpass diffuser - step 1 delays
-        for (int d = 0; d < kFDNSize; ++d)
-            parAPDelays_[d] = nearestPrime(std::max(1,
-                static_cast<int>(kParAPDelaysMs_[d] * sr / 1000.0)));
-
-        // Multi-channel diffuser - step 2 delays
-        for (int d = 0; d < kFDNSize; ++d)
-            diffuserStep2Delays_[d] = nearestPrime(std::max(1,
-                static_cast<int>(kDiffuserStep2Ms_[d] * sr / 1000.0)));
-
-        updateDecayParams();
     }
 
     void updateDiffCoeffs() noexcept
     {
-        T diff = diffusion_.load(std::memory_order_relaxed);
-        for (int d = 0; d < kDiffStages; ++d)
-            diffCoeffs_[d] = static_cast<T>(kDiffBaseCoeffs_[d]) * diff;
-        outDiffCoeff_ = T(0.45) * diff;
-        fbAPCoeff_ = T(0.3) + T(0.4) * diff;  // Dattorro range 0.3-0.7
-        // Feedback IIR smoothing: higher diffusion = more smoothing
-        fbSmooth_ = T(0.1) + T(0.25) * diff;   // range 0.1-0.35
+        const T diff = diffusion_.load(std::memory_order_relaxed);
+        for (int s = 0; s < kInStages; ++s)
+            inAPCoeff_[s] = static_cast<T>(kInDiffCoeffs_[s]) * diff;
+        loopAPCoeff_ = T(0.15) + T(0.35) * diff;
+        outAPCoeff_ = T(0.45) * diff;
+        // Spring chirp strength: the group-delay rise per stage is
+        // (1 + a) / (1 - a) - (1 - a) / (1 + a); Eco's shorter cascade gets
+        // a larger coefficient so the total dispersion matches Full's.
+        {
+            const double aFull = 0.3 + 0.5 * static_cast<double>(diff);
+            springStages_ = eco_ ? kEcoSpringStages : kSpringStages;
+            const double f = static_cast<double>(kSpringStages) / springStages_
+                             * (1.0 + aFull) / (1.0 - aFull);
+            springA_ = static_cast<T>((f - 1.0) / (f + 1.0));
+        }
     }
 
     void updateModulation() noexcept
     {
-        if (spec_.sampleRate <= 0) return;
-        T rate = modRate_.load(std::memory_order_relaxed);
-        for (int i = 0; i < kFDNSize; ++i)
+        const double sr = spec_.sampleRate;
+        const T rate = modRate_.load(std::memory_order_relaxed);
+        for (int i = 0; i < kMaxLines; ++i)
+            lfo_[i].setRate(rate * lfoRateFactor(i), sr);
+        modDepthSamples_ = modDepth_.load(std::memory_order_relaxed)
+                           * static_cast<T>(kModMaxMs * sr / 1000.0) * sizeFactor();
+        glideCoeff_ = static_cast<T>(1.0 - std::exp(-kCtrl / (kGlideMs * sr / 1000.0)));
+        maxGlideStep_ = static_cast<T>(kMaxGlideSpeed * kCtrl);
+    }
+
+    /**
+     * @brief Per-line absorption: Jot mid/high shelf and bass shelf.
+     *
+     * Both are first-order sections from the bilinear transform of
+     * H(s) = (s + a) / (s + b) (prewarped at the crossover):
+     *   H(z) = ((1 + a) + (a - 1) z^-1) / ((1 + b) + (b - 1) z^-1).
+     * Jot: gHigh * H with a = K sqrt(gMid/gHigh), b = K sqrt(gHigh/gMid),
+     * so |H(1)| = gMid and |H(-1)| = gHigh exactly. Bass: a = K sqrt(r),
+     * b = K / sqrt(r) with r = gBass / gMid, so the DC gain is r and the
+     * Nyquist gain 1. Each midpoint (geometric mean) lands on its crossover.
+     * The loop length includes the in-loop allpass (its mean group delay
+     * equals its length).
+     */
+    void updateDecayParams() noexcept
+    {
+        const double sr = spec_.sampleRate;
+        const double decay = static_cast<double>(decayTime_.load(std::memory_order_relaxed));
+        const double t60H = std::max(0.05, decay * static_cast<double>(
+            highDecayMult_.load(std::memory_order_relaxed)));
+        const double t60B = std::max(0.05, decay * static_cast<double>(
+            bassDecayMult_.load(std::memory_order_relaxed)));
+        const double kPi = 3.14159265358979323846;
+        const double fh = std::clamp(static_cast<double>(
+            highCrossover_.load(std::memory_order_relaxed)), 100.0, 0.45 * sr);
+        const double fb = std::clamp(static_cast<double>(
+            bassCrossover_.load(std::memory_order_relaxed)), 10.0, 0.45 * sr);
+        const double Kh = std::tan(kPi * fh / sr);
+        const double Kb = std::tan(kPi * fb / sr);
+        // The FDN runs unnormalized Hadamard butterflies; 1/sqrt(N) lives here.
+        const double hadNorm = spring_ ? 1.0 : 1.0 / std::sqrt(static_cast<double>(nLines_));
+
+        for (int i = 0; i < kMaxLines; ++i)
         {
-            modLFOA_[i].setRate(rate * (T(0.7) + T(0.05) * static_cast<T>(i)),
-                                spec_.sampleRate);
-            modLFOB_[i].setRate(rate * (T(1.8) + T(0.11) * static_cast<T>(i)),
-                                spec_.sampleRate);
+            // Loop length: line + group delay of the in-loop allpasses. The
+            // FDN's short allpasses count their mean (their length). A
+            // spring's dispersion makes the loop time frequency dependent,
+            // from K (1 - a) / (1 + a) per stage at DC up to the chirp at the
+            // band edge; the low and mid band, where the energy is, set it.
+            const double M = spring_
+                ? static_cast<double>(lenTarget_[i]) + springStages_ * springK_
+                      * (1.0 - static_cast<double>(springA_)) / (1.0 + static_cast<double>(springA_))
+                : static_cast<double>(lenTarget_[i] + (eco_ ? 0 : loopAPLen_[i]));
+            const double gM = std::pow(0.001, M / (decay * sr));
+            const double gH = std::min(std::pow(0.001, M / (t60H * sr)), gM);
+            // Keep the bass loop gain below 1 so extreme settings ring out
+            // instead of self-sustaining.
+            const double gB = std::min(std::pow(0.001, M / (t60B * sr)), 0.9995);
+
+            {
+                const double ratio = std::sqrt(gM / gH);
+                const double a = Kh * ratio, b = Kh / ratio, inv = 1.0 / (1.0 + b);
+                jotB0_[i] = static_cast<T>(hadNorm * gH * (1.0 + a) * inv);
+                jotB1_[i] = static_cast<T>(hadNorm * gH * (a - 1.0) * inv);
+                jotA1_[i] = static_cast<T>((b - 1.0) * inv);
+            }
+            {
+                const double sq = std::sqrt(gB / gM);
+                const double a = Kb * sq, b = Kb / sq, inv = 1.0 / (1.0 + b);
+                bassB0_[i] = static_cast<T>((1.0 + a) * inv);
+                bassB1_[i] = static_cast<T>((a - 1.0) * inv);
+                bassA1_[i] = static_cast<T>((b - 1.0) * inv);
+            }
         }
-        // Noise depth: 40% of LFO depth (breaks periodic patterns)
-        noiseDepth_ = modDepthA_.load(std::memory_order_relaxed) * T(0.4);
     }
 
     // --- Early reflection generation -----------------------------------------
 
-    /// Regenerates the ER tap set for a reverb type, honouring the Eco cap.
-    /// The taps are re-spread over the type's full min..max window, so a
-    /// reduced count keeps the temporal coverage (and the 1/sqrt(N) gain
-    /// normalization stays correct).
+    /// Regenerates the early-reflection taps for a reverb type (Eco caps the count).
     void generateERTapsForType(Type type) noexcept
     {
         const int cap = eco_ ? kEcoERTaps : kMaxERTaps;
         switch (type)
         {
-            case Type::Room:      generateERTaps(1.5, 35.0, std::min(30, cap));   break;
-            case Type::Hall:      generateERTaps(5.0, 110.0, std::min(40, cap));  break;
-            case Type::Chamber:   generateERTaps(3.0, 60.0, std::min(35, cap));   break;
-            case Type::Plate:     numERTaps_ = 0;                                 break;
-            case Type::Spring:    generateERTaps(1.0, 25.0, std::min(15, cap));   break;
-            case Type::Cathedral: generateERTaps(10.0, 160.0, std::min(40, cap)); break;
+            case Type::Room:      generateERTaps(1.5, 35.0, cap);                break;
+            case Type::Hall:      generateERTaps(5.0, 110.0, cap);               break;
+            case Type::Chamber:   generateERTaps(3.0, 60.0, cap);                break;
+            case Type::Plate:     generateERTaps(0.0, 0.0, 0);                   break;
+            case Type::Spring:    generateERTaps(0.0, 0.0, 0);                   break;
+            case Type::Cathedral: generateERTaps(10.0, 160.0, cap);              break;
         }
     }
 
+    /**
+     * @brief Lays out numTaps early reflections per side between minMs and
+     *        maxMs (exponential spacing, jittered per side). Each tap reads
+     *        its own channel (ipsilateral) and, slightly later and weaker,
+     *        the other channel (contralateral); the contralateral share grows
+     *        from 25% to 85% across the window, so the early field starts
+     *        lateralised and turns diffuse. Amplitudes fall as (t0/t)^0.8
+     *        and later tap groups pass darker absorption low-passes.
+     */
     void generateERTaps(double minMs, double maxMs, int numTaps) noexcept
     {
-        numERTaps_ = std::min(numTaps, kMaxERTaps);
-        if (numERTaps_ <= 0) return;
+        numERTaps_ = std::clamp(numTaps, 0, kMaxERTaps);
+        for (int g = 0; g <= kERGroups; ++g)
+            erGroupStart_[g] = numERTaps_ * g / kERGroups;
+        if (numERTaps_ == 0) return;
 
-        double sr = spec_.sampleRate;
-        double ratio = (maxMs > minMs) ? maxMs / minMs : 1.0;
-        double sqrtN = std::sqrt(static_cast<double>(numERTaps_));
-
-        for (int t = 0; t < numERTaps_; ++t)
+        const double sr = spec_.sampleRate;
+        const double ratio = maxMs / minMs;
+        for (int s = 0; s < 2; ++s)
         {
-            double frac = (numERTaps_ > 1)
-                ? static_cast<double>(t) / static_cast<double>(numERTaps_ - 1) : 0.0;
-
-            double msL = minMs * std::pow(ratio, frac);
-            erTapsL_[t] = std::max(1, static_cast<int>(msL * sr / 1000.0));
-
-            double jitter = 1.0 + 0.13 * std::sin(static_cast<double>(t) * 2.39996323);
-            double msR = msL * jitter;
-            msR = std::clamp(msR, minMs * 0.8, maxMs * 1.15);
-            erTapsR_[t] = std::max(1, static_cast<int>(msR * sr / 1000.0));
-
-            if (erTapsR_[t] == erTapsL_[t])
-                erTapsR_[t] = std::max(1, erTapsR_[t] + ((t & 1) ? 1 : -1));
-
-            double rawGain = std::pow(0.92, static_cast<double>(t));
-            erGainsL_[t] = static_cast<T>(rawGain / sqrtN);
-            erGainsR_[t] = static_cast<T>(rawGain / sqrtN * 0.95);
+            double energy = 0.0;
+            std::array<double, kMaxERTaps> gi {}, gc {};
+            for (int k = 0; k < numERTaps_; ++k)
+            {
+                const double frac = numERTaps_ > 1 ? static_cast<double>(k) / (numERTaps_ - 1) : 0.0;
+                const double jitter = 1.0 + 0.16 * (hash01(k, s) - 0.5);
+                const double ms = std::clamp(minMs * std::pow(ratio, frac) * jitter, 0.5, kMaxErMs);
+                const double msC = std::min(ms * (1.06 + 0.1 * hash01(k, s + 2)) + 0.3, 1.3 * kMaxErMs);
+                erTapI_[s][k] = std::max(1, static_cast<int>(ms * sr / 1000.0));
+                erTapC_[s][k] = std::max(1, static_cast<int>(msC * sr / 1000.0));
+                const double amp = std::pow(minMs / ms, 0.8);
+                gi[k] = amp;
+                gc[k] = amp * (0.25 + 0.6 * frac);
+                energy += gi[k] * gi[k] + gc[k] * gc[k];
+            }
+            const double norm = std::sqrt(static_cast<double>(kErEnergy) / energy);
+            for (int k = 0; k < numERTaps_; ++k)
+            {
+                erGainI_[s][k] = static_cast<T>(gi[k] * norm);
+                erGainC_[s][k] = static_cast<T>(gc[k] * norm);
+            }
         }
 
-        // Progressive frequency absorption: early taps bright, late taps dark
-        // Cutoff sweeps exponentially from 15kHz (tap 0) to 3kHz (last tap)
-        for (int t = 0; t < numERTaps_; ++t)
+        static constexpr double kGroupCutHz[kERGroups] = { 14000.0, 9000.0, 5500.0, 3200.0 };
+        for (int g = 0; g < kERGroups; ++g)
         {
-            T f = static_cast<T>(t) / static_cast<T>(std::max(1, numERTaps_ - 1));
-            T cutoff = T(15000) * std::pow(T(3000) / T(15000), f);
-            erAbsCoeffs_[t] = T(1) - std::exp(T(-6.283185307179586) * cutoff
-                                               / static_cast<T>(sr));
+            const double fc = std::min(kGroupCutHz[g], 0.45 * sr);
+            erLPCoeff_[g] = static_cast<T>(1.0 - std::exp(-6.283185307179586 * fc / sr));
         }
     }
 
-    // Sieve of Eratosthenes up to kPrimeTableMax, computed once the first
-    // time `nearestPrime` is called. Keeps parameter-update calls cheap
-    // (previously O(sqrt(n)) per lookup x ~20 calls per update). For
-    // `n >= kPrimeTableMax` we fall back to the original trial division -
-    // that branch is only reached at extreme sample rates / reverb sizes (M4).
-    static constexpr int kPrimeTableMax = 131072;  // 2^17 - covers up to ~2.7 s @48kHz
+    // Sieve of Eratosthenes up to kPrimeTableMax, computed once on first use.
+    static constexpr int kPrimeTableMax = 131072;
 
     static const std::vector<uint8_t>& getPrimeSieve() noexcept
     {
@@ -1893,6 +1745,7 @@ protected:
         return sieve;
     }
 
+    /// Smallest prime >= n (lengths only grow by a few samples).
     static int nearestPrime(int n) noexcept
     {
         if (n <= 2) return 2;
@@ -1902,7 +1755,6 @@ protected:
             while (n < kPrimeTableMax && !sieve[static_cast<size_t>(n)])
                 ++n;
             if (n < kPrimeTableMax) return n;
-            // fall through to trial division for values at/above the table
         }
         if (n % 2 == 0) ++n;
         while (true)
@@ -1917,19 +1769,15 @@ protected:
 
     // --- Preset application --------------------------------------------------
 
-    // Small helper: atomic-store all preset params in one go. Keeps the big
-    // preset switch readable and avoids repeating `.store(..., mo_relaxed)`.
     struct PresetValues {
         T size, decay, hdMult, bdMult, hxover, bxover;
         T diff, modDepth, modRate, earlyLvl, lateLvl, erToLate;
-        bool toneLP, toneHP;
     };
 
     void commitPreset(const PresetValues& p) noexcept
     {
         // Only write the atomics the user did NOT override since the last
-        // setType(). The acquire-read pairs with the release-mark in each
-        // setter so a param batched after setType (its bit set) is preserved.
+        // setType(). The acquire-read pairs with the release-mark in each setter.
         const uint32_t m = userParamMask_.load(std::memory_order_acquire);
         if (!(m & kUserSize))      size_.store(p.size, std::memory_order_relaxed);
         if (!(m & kUserDecay))     decayTime_.store(p.decay, std::memory_order_relaxed);
@@ -1943,83 +1791,45 @@ protected:
         if (!(m & kUserEarly))     earlyLevel_.store(p.earlyLvl, std::memory_order_relaxed);
         if (!(m & kUserLate))      lateLevel_.store(p.lateLvl, std::memory_order_relaxed);
         if (!(m & kUserErToLate))  erToLateMs_.store(p.erToLate, std::memory_order_relaxed);
-        toneLPActive_ = p.toneLP;
-        toneHPActive_ = p.toneHP;
     }
 
-    void applyPreset(Type type)
+    void applyPreset(Type type) noexcept
     {
+        //                          size     decay    hdMult   bdMult   hxover   bxover
+        //                          diff     modDep   modRate  early    late     erToLate
         switch (type)
         {
             case Type::Room:
-                commitPreset({T(0.22), T(0.5),  T(0.40), T(1.1),
-                              T(5000), T(250),  T(0.72), T(0.14), T(1.2),
-                              T(1),    T(0.8),  T(0),    false,   false});
+                commitPreset({T(0.22), T(0.5),  T(0.40), T(1.1),  T(5000), T(250),
+                              T(0.72), T(0.14), T(1.2),  T(1),    T(0.8),  T(0)});
                 break;
-
             case Type::Hall:
-                commitPreset({T(0.68), T(2.2),  T(0.32), T(1.3),
-                              T(4500), T(200),  T(0.84), T(0.22), T(0.55),
-                              T(0.7),  T(1),    T(15),   false,   false});
+                commitPreset({T(0.68), T(2.2),  T(0.32), T(1.3),  T(4500), T(200),
+                              T(0.84), T(0.18), T(0.55), T(0.7),  T(1),    T(15)});
                 break;
-
             case Type::Chamber:
-                commitPreset({T(0.38), T(1.2),  T(0.38), T(1.1),
-                              T(5000), T(250),  T(0.78), T(0.18), T(0.8),
-                              T(0.9),  T(0.9),  T(8),    false,   false});
+                commitPreset({T(0.38), T(1.2),  T(0.38), T(1.1),  T(5000), T(250),
+                              T(0.78), T(0.14), T(0.8),  T(0.9),  T(0.9),  T(8)});
                 break;
-
             case Type::Plate:
-                commitPreset({T(0.14), T(1.5),  T(0.55), T(0.8),
-                              T(7000), T(150),  T(0.94), T(0.32), T(1.4),
-                              T(0),    T(1),    T(0),    false,   false});
-                numERTaps_ = 0;
+                commitPreset({T(0.14), T(1.5),  T(0.55), T(0.8),  T(7000), T(150),
+                              T(0.94), T(0.16), T(1.4),  T(0),    T(1),    T(0)});
                 break;
-
             case Type::Spring:
-                commitPreset({T(0.11), T(0.9),  T(0.28), T(1.0),
-                              T(4000), T(200),  T(0.38), T(0.08), T(0.35),
-                              T(0.5),  T(1),    T(0),    false,   false});
+                commitPreset({T(0.11), T(0.9),  T(0.28), T(1.0),  T(4000), T(200),
+                              T(0.6),  T(0.08), T(0.35), T(0.5),  T(1),    T(0)});
                 break;
-
             case Type::Cathedral:
-                commitPreset({T(0.98), T(5.0),  T(0.24), T(1.5),
-                              T(3500), T(150),  T(0.91), T(0.18), T(0.35),
-                              T(0.5),  T(1),    T(25),   false,   false});
+                commitPreset({T(0.98), T(5.0),  T(0.24), T(1.5),  T(3500), T(150),
+                              T(0.91), T(0.22), T(0.35), T(0.5),  T(1),    T(25)});
                 break;
         }
 
-        // Sync damping_ from highDecayMult_
-        T hd = highDecayMult_.load(std::memory_order_relaxed);
-        T damp = std::clamp((T(1) - hd) / T(0.9), T(0), T(1));
-        damping_.store(damp, std::memory_order_relaxed);
-
-        updateDiffCoeffs();
-        T md = modDepth_.load(std::memory_order_relaxed);
-        modDepthA_.store(md * T(30), std::memory_order_relaxed);
-        modDepthB_.store(md * T(15), std::memory_order_relaxed);
-
-        if (spec_.sampleRate > 0)
+        spring_ = type == Type::Spring;
+        refreshTopology();
+        if (prepared_)
         {
-            updateDelayLengths(); // also calls updateDecayParams()
-            updateModulation();
-
-            T er = erToLateMs_.load(std::memory_order_relaxed);
-            erToLateSamples_.store(static_cast<int>(
-                static_cast<T>(spec_.sampleRate) * er / T(1000)),
-                std::memory_order_relaxed);
-
-            T rate = modRate_.load(std::memory_order_relaxed);
-            for (int i = 0; i < kFDNSize; ++i)
-            {
-                modLFOA_[i].prepare(spec_.sampleRate,
-                    rate * (T(0.7) + T(0.05) * static_cast<T>(i)),
-                    static_cast<uint32_t>(i * 7919 + 1));
-                modLFOB_[i].prepare(spec_.sampleRate,
-                    rate * (T(1.8) + T(0.11) * static_cast<T>(i)),
-                    static_cast<uint32_t>(i * 6271 + 31337));
-            }
-
+            updateAll();
             generateERTapsForType(type);
         }
     }

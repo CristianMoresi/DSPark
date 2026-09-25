@@ -2600,9 +2600,12 @@ DSPARK_TEST(Reverb_default_quality_is_full)
 
 DSPARK_TEST(Reverb_eco_quality_tail_matches_full_calibration)
 {
-    // Eco (8 lines, control-rate mod, linear interp, no extra taps) must keep
-    // the Full engine's calibration: same decay-time law, tail loudness
-    // within 1.5 dB, stereo decorrelation preserved, everything finite.
+    // Eco (8 lines, no in-loop allpasses, lighter diffusion) must keep the
+    // Full engine's calibration: same decay-time law, tail loudness within
+    // 0.5 dB, stereo decorrelation preserved, everything finite. The burst
+    // is broadband noise: a single sine lands on a random point of each
+    // engine's modal response, whose level swings by +/-10 dB between
+    // nearby frequencies in any reverb, so it cannot measure calibration.
     const double fs = 48000.0;
     const int block = 512;
     const int burstBlocks = static_cast<int>(fs * 1.0) / block;
@@ -2625,15 +2628,15 @@ DSPARK_TEST(Reverb_eco_quality_tail_matches_full_calibration)
 
         std::vector<float> tailBufL, tailBufR;
         double sumSq = 0.0; long sumN = 0;
-        double phase = 0.0;
+        uint32_t seed = 12345u;
         for (int b = 0; b < burstBlocks + tailBlocks; ++b)
         {
             auto tb = makeStereoBuffer(block);
             for (int i = 0; i < block; ++i)
             {
-                phase += 200.0 / fs; if (phase >= 1.0) phase -= 1.0;
+                seed = seed * 1664525u + 1013904223u;
                 const float v = (b < burstBlocks)
-                    ? static_cast<float>(0.5 * std::sin(6.283185307179586 * phase))
+                    ? (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f) * 0.5f
                     : 0.0f;
                 tb.ch(0)[i] = v; tb.ch(1)[i] = v;
             }
@@ -2669,13 +2672,13 @@ DSPARK_TEST(Reverb_eco_quality_tail_matches_full_calibration)
 
     EXPECT_TRUE(finite[0]);
     EXPECT_TRUE(finite[1]);
-    // Tail loudness match (measured +0.26 dB on the reference machine)
+    // Tail loudness match (measured -0.02 dB)
     const double dbDelta = 20.0 * std::log10(std::max(steadyRms[1], 1e-12)
                                               / std::max(steadyRms[0], 1e-12));
-    EXPECT_LT(std::abs(dbDelta), 1.5);
-    // Same decay law: Eco T60 within 35% of Full's measured T60
-    EXPECT_GT(t60L[1], t60L[0] * 0.65);
-    EXPECT_LT(t60L[1], t60L[0] * 1.35);
+    EXPECT_LT(std::abs(dbDelta), 0.5);
+    // Same decay law: Eco T60 within 15% of Full's measured T60
+    EXPECT_GT(t60L[1], t60L[0] * 0.85);
+    EXPECT_LT(t60L[1], t60L[0] * 1.15);
     // Stereo tail stays decorrelated
     EXPECT_LT(corr[1], 0.5);
 }
@@ -3205,6 +3208,248 @@ DSPARK_TEST(AlgoReverb_processSample_applies_pending_changes)
         if (i > 48000) tail += static_cast<double>(oL) * oL;
     }
     EXPECT_GT(tail, 1e-6); // the Cathedral tail is ringing after 1 s
+}
+
+namespace {
+using ARevF = AlgorithmicReverb<float>;
+
+// Impulse response (left output; optional right) of a prepared reverb.
+std::vector<float> algoReverbIR(ARevF& rev, double fs, double seconds, bool leftOnly = false,
+                                std::vector<float>* right = nullptr)
+{
+    const int total = static_cast<int>(fs * seconds) / 256 * 256;
+    std::vector<float> outL(static_cast<size_t>(total)), outR(static_cast<size_t>(total));
+    auto tb = makeBuffer(2, 256);
+    for (int off = 0; off < total; off += 256)
+    {
+        for (int i = 0; i < 256; ++i)
+        {
+            tb.ch(0)[i] = (off + i == 0) ? 1.0f : 0.0f;
+            tb.ch(1)[i] = leftOnly ? 0.0f : tb.ch(0)[i];
+        }
+        rev.processBlock(tb.view());
+        for (int i = 0; i < 256; ++i)
+        {
+            outL[static_cast<size_t>(off + i)] = tb.ch(0)[i];
+            outR[static_cast<size_t>(off + i)] = tb.ch(1)[i];
+        }
+    }
+    if (right) *right = outR;
+    return outL;
+}
+
+// T60 from the -5..-25 dB Schroeder fit of x, band-passed at bandHz (0 = broadband).
+double algoReverbT60(std::vector<float> x, double fs, double bandHz)
+{
+    if (bandHz > 0.0)
+    {
+        Biquad<float, 1> a, b;
+        const auto c = BiquadCoeffs::makeBandPass(fs, bandHz, 1.4);
+        a.setCoeffsNow(c);
+        b.setCoeffsNow(c);
+        for (auto& v : x) v = b.processSample(a.processSample(v, 0), 0);
+    }
+    double totalE = 0.0;
+    for (const float v : x) totalE += static_cast<double>(v) * v;
+    if (totalE <= 1e-30) return -1.0;
+    double rem = totalE;
+    int t5 = -1, t25 = -1;
+    for (int i = 0; i < static_cast<int>(x.size()); ++i)
+    {
+        const double r = rem / totalE;
+        if (t5 < 0 && r <= 0.31622776601683794) t5 = i;
+        if (r <= 0.0031622776601683794) { t25 = i; break; }
+        rem -= static_cast<double>(x[static_cast<size_t>(i)]) * x[static_cast<size_t>(i)];
+    }
+    if (t5 < 0 || t25 < 0 || t25 <= t5) return -1.0;
+    return 3.0 * (t25 - t5) / fs;
+}
+
+// A Hall with the late tail isolated and the preset drained, so the decay
+// setters that follow override it. The mix is set before the drain block:
+// changed later, the mixer's glide would leak the dry impulse into the IR.
+void algoReverbLateHall(ARevF& rev, double fs)
+{
+    rev.prepare(spec(fs, 256, 2));
+    rev.setType(ARevF::Type::Hall);
+    rev.setEarlyLevel(-60.0f);
+    rev.setMix(1.0f);
+    auto w = makeBuffer(2, 64);
+    rev.processBlock(w.view());
+}
+} // namespace
+
+DSPARK_TEST(AlgoReverb_flat_decay_is_exact_in_every_band)
+{
+    // With the HF and bass multipliers at 1 the decay must be the same in
+    // every band and equal setDecay(), at any sample rate. The previous engine
+    // bent it with an in-loop 23 Hz DC blocker and a feedback smoothing
+    // low-pass (measured 2.32 s at 125 Hz, 2.22 s at 1 kHz, 1.86 s at 4 kHz
+    // for a 2 s target; now 1.93 / 2.06 / 1.99 s).
+    for (const double fs : { 44100.0, 96000.0 })
+    {
+        ARevF rev;
+        algoReverbLateHall(rev, fs);
+        rev.setDecay(2.0f);
+        rev.setHighDecayMultiplier(1.0f);
+        rev.setBassDecayMultiplier(1.0f);
+        const auto ir = algoReverbIR(rev, fs, 5.0);
+        EXPECT_NEAR(algoReverbT60(ir, fs, 0.0), 2.0, 0.1);
+        for (const double band : { 125.0, 1000.0, 4000.0 })
+            EXPECT_NEAR(algoReverbT60(ir, fs, band), 2.0, 0.2);
+    }
+}
+
+DSPARK_TEST(AlgoReverb_bass_and_treble_decay_follow_their_multipliers)
+{
+    // Bass x2.5 and HF x0.25 of a 1.5 s mid decay: the 63 Hz band must ring
+    // clearly longer than 1 kHz (measured 2.27x; the old in-loop DC blocker
+    // held it to 1.93x) and 8 kHz clearly shorter (measured 0.33x).
+    ARevF rev;
+    algoReverbLateHall(rev, 48000.0);
+    rev.setDecay(1.5f);
+    rev.setHighDecayMultiplier(0.25f);
+    rev.setBassDecayMultiplier(2.5f);
+    const auto ir = algoReverbIR(rev, 48000.0, 8.0);
+    const double mid = algoReverbT60(ir, 48000.0, 1000.0);
+    EXPECT_GT(mid, 1.2);
+    EXPECT_LT(mid, 1.7);
+    EXPECT_GT(algoReverbT60(ir, 48000.0, 63.0) / mid, 2.05);
+    EXPECT_LT(algoReverbT60(ir, 48000.0, 8000.0) / mid, 0.45);
+}
+
+DSPARK_TEST(AlgoReverb_left_source_stays_left_in_the_early_field)
+{
+    // True stereo: a left-only impulse must produce a left-weighted early
+    // field (the old engine summed the input to mono: 0.5 dB, i.e. no
+    // image). Measured 5.4-9.7 dB over the first 50 ms.
+    for (const auto type : { ARevF::Type::Room, ARevF::Type::Hall,
+                             ARevF::Type::Chamber, ARevF::Type::Cathedral })
+    {
+        ARevF rev;
+        rev.prepare(spec(48000.0, 256, 2));
+        rev.setType(type);
+        rev.setMix(1.0f);
+        std::vector<float> right;
+        const auto left = algoReverbIR(rev, 48000.0, 0.1, true, &right);
+        double eL = 0.0, eR = 0.0;
+        for (int i = 0; i < 2400; ++i)
+        {
+            eL += static_cast<double>(left[static_cast<size_t>(i)]) * left[static_cast<size_t>(i)];
+            eR += static_cast<double>(right[static_cast<size_t>(i)]) * right[static_cast<size_t>(i)];
+        }
+        EXPECT_GT(10.0 * std::log10(eL / std::max(eR, 1e-30)), 3.0);
+    }
+}
+
+DSPARK_TEST(AlgoReverb_modulation_does_not_detune_a_steady_tone)
+{
+    // The tail's line modulation must smear resonances without audible
+    // pitch wobble: a steady 1 kHz tone through the Hall keeps all but a
+    // tiny fraction of its energy within +/-3 Hz (measured -47 dB outside).
+    ARevF rev;
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setType(ARevF::Type::Hall);
+    rev.setMix(1.0f);
+    rev.setEarlyLevel(-60.0f);
+    const int lead = 4 * 48000, n = 2 * 48000;
+    std::vector<double> x(static_cast<size_t>(n));
+    auto tb = makeBuffer(2, 256);
+    double ph = 0.0;
+    for (int off = 0; off < lead + n; off += 256)
+    {
+        for (int i = 0; i < 256; ++i)
+        {
+            tb.ch(0)[i] = tb.ch(1)[i] = static_cast<float>(0.3 * std::sin(ph));
+            ph += 6.283185307179586 * 1000.0 / 48000.0;
+        }
+        rev.processBlock(tb.view());
+        for (int i = 0; i < 256; ++i)
+            if (off + i >= lead)
+            {
+                const int k = off + i - lead;
+                x[static_cast<size_t>(k)] = tb.ch(0)[i]
+                    * (0.5 - 0.5 * std::cos(6.283185307179586 * k / n));
+            }
+    }
+    double total = 0.0, inBand = 0.0;
+    for (const double v : x) total += v * v;
+    for (double f = 997.0; f <= 1003.0; f += 0.5)   // DFT bins at 0.5 Hz spacing
+    {
+        double re = 0.0, im = 0.0;
+        const double w = 6.283185307179586 * f / 48000.0;
+        for (int i = 0; i < n; ++i)
+        {
+            re += x[static_cast<size_t>(i)] * std::cos(w * i);
+            im += x[static_cast<size_t>(i)] * std::sin(w * i);
+        }
+        inBand += 2.0 * (re * re + im * im) / n;
+    }
+    EXPECT_GT(total, 1e-6);
+    EXPECT_LT(10.0 * std::log10(std::max(total - inBand, 1e-30) / total), -35.0);
+}
+
+DSPARK_TEST(AlgoReverb_size_changes_glide_without_clicks)
+{
+    // Size used to switch every delay length at once (a click per change:
+    // max second difference 0.14 on a 220 Hz tone toggled 0.3 <-> 0.9).
+    // The lengths now glide: measured 0.0014 (static 0.00007).
+    ARevF rev;
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setType(ARevF::Type::Hall);
+    rev.setMix(1.0f);
+    auto tb = makeBuffer(2, 256);
+    double ph = 0.0, maxD2 = 0.0;
+    float y1 = 0.0f, y2 = 0.0f;
+    const int blocks = 6 * 48000 / 256;
+    for (int k = 0; k < blocks; ++k)
+    {
+        if (k % 8 == 0) rev.setSize(((k / 8) & 1) ? 0.9f : 0.3f);
+        for (int i = 0; i < 256; ++i)
+        {
+            tb.ch(0)[i] = tb.ch(1)[i] = static_cast<float>(0.3 * std::sin(ph));
+            ph += 6.283185307179586 * 220.0 / 48000.0;
+        }
+        rev.processBlock(tb.view());
+        for (int i = 0; i < 256; ++i)
+        {
+            const float y = tb.ch(0)[i];
+            if (k > blocks / 3) maxD2 = std::max(maxD2, static_cast<double>(std::abs(y - 2.0f * y1 + y2)));
+            y2 = y1;
+            y1 = y;
+        }
+    }
+    EXPECT_LT(maxD2, 0.01);
+}
+
+DSPARK_TEST(AlgoReverb_spring_is_dispersive)
+{
+    // Type::Spring is a dispersive spring-tank model: on each round trip
+    // the band edge (~4 kHz) arrives well after the midrange (the chirp).
+    ARevF rev;
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setType(ARevF::Type::Spring);
+    rev.setMix(1.0f);
+    const auto ir = algoReverbIR(rev, 48000.0, 0.2);
+    // First-pass envelope peak per band, in the first round trip window.
+    const auto peakMs = [&](double fc)
+    {
+        Biquad<float, 1> a, b;
+        const auto c = BiquadCoeffs::makeBandPass(48000.0, fc, 4.0);
+        a.setCoeffsNow(c);
+        b.setCoeffsNow(c);
+        double best = 0.0;
+        int at = 0;
+        double env = 0.0;
+        for (int i = 0; i < static_cast<int>(0.062 * 48000.0); ++i)
+        {
+            const double y = b.processSample(a.processSample(ir[static_cast<size_t>(i)], 0), 0);
+            env += (y * y - env) * 0.01;
+            if (i > static_cast<int>(0.025 * 48000.0) && env > best) { best = env; at = i; }
+        }
+        return 1000.0 * at / 48000.0;
+    };
+    EXPECT_GT(peakMs(4000.0) - peakMs(500.0), 5.0);
 }
 
 // ============================================================================

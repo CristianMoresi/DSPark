@@ -372,7 +372,7 @@
  * | `MultibandCompressor<T>` | Effects/MultibandCompressor.h | Multi-band compressor (crossover split + per-band Compressor) |
  * | `DynamicEQ<T>`           | Effects/DynamicEQ.h   | Per-band dynamic EQ (above/below threshold, ext. sidechain)        |
  * | `TransientDesigner<T>`   | Effects/TransientDesigner.h | Dual-envelope transient shaper (attack/sustain control)       |
- * | `AlgorithmicReverb<T>`   | Effects/AlgorithmicReverb.h | FDN reverb: Room/Hall/Chamber/Plate/Spring/Cathedral presets            |
+ * | `AlgorithmicReverb<T>`   | Effects/AlgorithmicReverb.h | True-stereo FDN reverb with spring model: Room/Hall/Chamber/Plate/Spring/Cathedral |
  * | `NoiseGenerator<T>`      | Effects/NoiseGenerator.h | White/pink/brown noise generator (AudioProcessor contract)        |
  * | `Tremolo<T>`             | Effects/Tremolo.h     | LFO amplitude modulation with stereo auto-pan option                |
  * | `Vibrato<T>`             | Effects/Vibrato.h     | Pitch modulation via LFO-driven delay line                          |

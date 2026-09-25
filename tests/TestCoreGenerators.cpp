@@ -475,6 +475,57 @@ DSPARK_TEST(WavetableOsc_loadWavetable_reconstructs_harmonics)
     EXPECT_TRUE(std::isfinite(wt.getSample()));
 }
 
+DSPARK_TEST(WavetableOsc_saw_is_alias_free_and_bright)
+{
+    // Regression: the octave mipmaps crossfaded into the next BRIGHTER level,
+    // whose top harmonics fold below 20 kHz: worst in-band alias of a 48 kHz
+    // saw was -39 dB at 440 Hz, -22 dB at 3.52 kHz and -16 dB at 7.04 kHz.
+    // Half-octave levels, blended only while audibly alias-free, measure
+    // -98 dB or better while keeping the spectrum complete to ~18 kHz.
+    constexpr double fs = 48000.0;
+    constexpr size_t kN = 1 << 16;
+    std::vector<double> win(kN), t(kN), f(kN + 2);
+    WindowFunctions<double>::blackmanHarris(win.data(), (int)kN, false);
+    FFTReal<double> fft(kN);
+
+    WavetableOscillator<double> wt;
+    wt.prepare(fs);
+    wt.buildSaw();
+    for (double f0 : { 440.0, 3520.0, 7040.0 })
+    {
+        wt.setFrequency(f0);
+        wt.reset();
+        for (size_t i = 0; i < kN; ++i)
+            t[i] = wt.getSample() * win[i];
+        fft.forward(t.data(), f.data());
+        const double binHz = fs / static_cast<double>(kN);
+        auto mag = [&](size_t k) { return std::hypot(f[2 * k], f[2 * k + 1]); };
+        double fund = 0.0, worst = 0.0;
+        for (size_t k = 8; k <= static_cast<size_t>(20000.0 / binHz); ++k)
+        {
+            const double h = static_cast<double>(k) * binHz / f0;
+            if (std::abs(h - std::round(h)) * f0 / binHz <= 10.0)
+            {
+                if (std::round(h) == 1.0) fund = std::max(fund, mag(k));
+            }
+            else
+            {
+                worst = std::max(worst, mag(k));
+            }
+        }
+        EXPECT_LT(20.0 * std::log10(worst / fund), -90.0);
+
+        if (f0 == 440.0)
+        {
+            // Harmonic 32 (14.08 kHz) sits on the ideal 1/h saw spectrum.
+            double h32 = 0.0;
+            const auto k32 = static_cast<size_t>(std::lround(32.0 * f0 / binHz));
+            for (size_t k = k32 - 3; k <= k32 + 3; ++k) h32 = std::max(h32, mag(k));
+            EXPECT_NEAR(20.0 * std::log10(h32 / fund), 20.0 * std::log10(1.0 / 32.0), 1.0);
+        }
+    }
+}
+
 DSPARK_TEST(WavetableOsc_generateBlock_fills_all_channels)
 {
     WavetableOscillator<float> wt;

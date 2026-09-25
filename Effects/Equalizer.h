@@ -407,6 +407,12 @@ public:
         configDirty_.store(true, std::memory_order_release);
     }
 
+    /** @brief Returns whether Peak bands use the matched design (setMatchedBells()). */
+    [[nodiscard]] bool isMatchedBells() const noexcept
+    {
+        return matchedBells_.load(std::memory_order_relaxed);
+    }
+
     /**
      * @brief Returns the current configuration of a band.
      *

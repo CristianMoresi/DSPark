@@ -2637,6 +2637,30 @@ DSPARK_TEST(FilterEngine_shelf_slope_change_is_audible)
     EXPECT_GT(std::abs(steep - gentle), 1e-3 * gentle);
 }
 
+DSPARK_TEST(FilterEngine_granular_shelf_slope_setter)
+{
+    // setShelfSlope() is the one-parameter counterpart of the slope argument
+    // of setLowShelf(): same audible result, and a NaN slope (which would pass
+    // the design clamp and poison every coefficient) is ignored.
+    FilterEngine<float> a, b;
+    a.prepare(spec(48000.0, 512, 1));
+    b.prepare(spec(48000.0, 512, 1));
+    a.setLowShelf(200.0f, 12.0f, 0.4f);
+    b.setLowShelf(200.0f, 12.0f);
+    b.setShelfSlope(0.4f);
+    EXPECT_NEAR(b.getShelfSlope(), 0.4f, 1e-7f);
+    EXPECT_NEAR(feEnergy(a, kShelfSettle), feEnergy(b, kShelfSettle), 1e-9);
+
+    b.setShelfSlope(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_NEAR(b.getShelfSlope(), 0.4f, 1e-7f);
+    EXPECT_TRUE(std::isfinite(feEnergy(b, 4)));
+
+    Equalizer<float> eq;
+    EXPECT_FALSE(eq.isMatchedBells());
+    eq.setMatchedBells(true);
+    EXPECT_TRUE(eq.isMatchedBells());
+}
+
 static double eqEnergy(dspark::Equalizer<float>& eq, int nblk)
 {
     using namespace dspark;

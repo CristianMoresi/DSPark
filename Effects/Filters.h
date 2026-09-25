@@ -192,7 +192,7 @@ public:
         shape_ = Shape::LowShelf;
         slopeDb_ = 12;
         numStages_ = 1;
-        shelfSlope_ = slope;
+        setShelfSlope(slope);
         setFrequency(freq);
         setGain(gainDb);
     }
@@ -208,7 +208,7 @@ public:
         shape_ = Shape::HighShelf;
         slopeDb_ = 12;
         numStages_ = 1;
-        shelfSlope_ = slope;
+        setShelfSlope(slope);
         setFrequency(freq);
         setGain(gainDb);
     }
@@ -273,6 +273,30 @@ public:
     [[nodiscard]] bool isMatchedPeak() const noexcept
     {
         return matchedPeak_.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Sets the shelf slope S on its own (LowShelf/HighShelf shapes).
+     *
+     * The granular counterpart of the slope argument of setLowShelf() /
+     * setHighShelf(), for parameter models with one setter per parameter.
+     * RBJ semantics: 1.0 is the steepest shelf without overshoot, smaller
+     * values are gentler. Clamped to [0.0001, 1]; non-finite values are
+     * ignored (a NaN slope would otherwise pass the design clamp and turn
+     * every coefficient into NaN). Thread-safe; applied at the next block.
+     *
+     * @param slope Shelf slope S in (0, 1].
+     */
+    void setShelfSlope(float slope) noexcept
+    {
+        if (!std::isfinite(slope)) return;
+        shelfSlope_.store(std::clamp(slope, 0.0001f, 1.0f), std::memory_order_relaxed);
+    }
+
+    /** @brief Returns the shelf slope S used by the shelf shapes. */
+    [[nodiscard]] float getShelfSlope() const noexcept
+    {
+        return shelfSlope_.load(std::memory_order_relaxed);
     }
 
     /** @brief Returns the active filter shape. */

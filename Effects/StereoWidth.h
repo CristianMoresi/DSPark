@@ -21,7 +21,10 @@
  *
  * Threading: prepare() belongs to the setup thread; the processing calls and
  * reset() to the audio thread. setWidth()/setBassMono() are safe from any
- * thread (atomics read once per block); non-finite values are ignored.
+ * thread (atomics read once per block); non-finite values are ignored. The
+ * width glides at no more than one unit per 20 ms (it used to step once per
+ * block, clicking on side content); the first block after prepare() or
+ * reset() starts settled on the current width.
  */
 
 #include "../Core/DspMath.h"
@@ -57,8 +60,9 @@ public:
      */
     void prepare(double sampleRate) noexcept
     {
-        if (!(sampleRate > 0.0)) return;
+        if (!(sampleRate > 0.0) || !std::isfinite(sampleRate)) return;
         sampleRate_ = sampleRate;
+        widthMaxStep_ = static_cast<T>(1.0 / (sampleRate * 0.02));
         updateBassMonoCoeff(bassMonoCutoff_.load(std::memory_order_relaxed));
         reset();
     }
@@ -117,8 +121,19 @@ public:
      */
     void process(T* left, T* right, int numSamples) noexcept
     {
-        // Load atomics once per block to allow tight loop vectorization
-        const T currentWidth = width_.load(std::memory_order_relaxed);
+        if (numSamples <= 0) return;
+
+        // Load atomics once per block to allow tight loop vectorization. The
+        // width ramp is closed form per sample (moveTowards), so the pure-width
+        // loop still vectorizes; settled, it reduces to the constant exactly.
+        const T widthTarget = width_.load(std::memory_order_relaxed);
+        if (snapWidth_)
+        {
+            currentWidth_ = widthTarget;
+            snapWidth_ = false;
+        }
+        const T widthStart  = currentWidth_;
+        const T widthStep   = widthMaxStep_;
         const bool bassMono = bassMonoEnabled_.load(std::memory_order_acquire);
 
         if (bassMono)
@@ -136,8 +151,9 @@ public:
                 T l = left[i];
                 T r = right[i];
 
+                const T width = moveTowards(widthStart, widthTarget, widthStep * static_cast<T>(i + 1));
                 T mid  = (l + r) * T(0.5);
-                T side = (l - r) * T(0.5) * currentWidth;
+                T side = (l - r) * T(0.5) * width;
 
                 // Side processing (1-pole high-pass: side - LP(side))
                 T sideLpIn = side;
@@ -154,19 +170,22 @@ public:
             // Fast-path branch: Pure Width control without filtering overhead
             for (int i = 0; i < numSamples; ++i)
             {
+                const T width = moveTowards(widthStart, widthTarget, widthStep * static_cast<T>(i + 1));
                 T mid  = (left[i] + right[i]) * T(0.5);
-                T side = (left[i] - right[i]) * T(0.5) * currentWidth;
+                T side = (left[i] - right[i]) * T(0.5) * width;
                 
                 left[i]  = mid + side;
                 right[i] = mid - side;
             }
         }
+        currentWidth_ = moveTowards(widthStart, widthTarget, widthStep * static_cast<T>(numSamples));
     }
 
     /** @brief Clears the internal filter states to prevent artifact ringing. */
     void reset() noexcept
     {
         sideState_ = T(0);
+        snapWidth_ = true;   // the next block starts settled (no glide on start)
     }
 
 
@@ -213,6 +232,11 @@ private:
 
     // Filter states
     T sideState_ = T(0);
+
+    // Width glide (audio thread)
+    T currentWidth_ = T(1);
+    T widthMaxStep_ = T(1.0 / 960.0);   ///< One width unit per 20 ms.
+    bool snapWidth_ = true;             ///< Next block lands on the target at once.
 
     // Anti-denormal DC offset (type generic)
     static constexpr T antiDenormal_ = static_cast<T>(1e-15); 

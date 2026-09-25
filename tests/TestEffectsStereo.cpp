@@ -10,6 +10,7 @@
 #include "../Effects/Panner.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <vector>
 
@@ -212,6 +213,27 @@ DSPARK_TEST(StereoWidth_silence)
     EXPECT_SILENT(tb.ch(0), 128, 1e-10f);
 }
 
+DSPARK_TEST(StereoWidth_width_glides_over_20_ms_with_small_blocks)
+{
+    // setWidth() applied per block as a constant: a change stepped the side
+    // level at the next block edge (a click on side content). The width now
+    // glides at one unit per 20 ms whatever the block size.
+    StereoWidth<float> sw;
+    sw.prepare(48000.0);
+    const int total = 2048, start = 64;
+    std::vector<float> l(total, 0.5f), r(total, -0.5f);   // pure side content
+    for (int off = 0; off < total; off += 32)
+    {
+        if (off == start) sw.setWidth(0.0f);
+        sw.process(l.data() + off, r.data() + off, 32);
+    }
+    auto side = [&](int i) { return 0.5f * (l[static_cast<size_t>(i)] - r[static_cast<size_t>(i)]); };
+    EXPECT_NEAR(side(start - 1), 0.5f, 1e-6f);
+    EXPECT_NEAR(side(start + 31), 0.5f * (1.0f - 32.0f / 960.0f), 1e-4f); // old: 0
+    EXPECT_NEAR(side(start + 479), 0.25f, 1e-4f);                         // width 0.5
+    EXPECT_NEAR(side(start + 1000), 0.0f, 1e-6f);                         // settled mono
+}
+
 // ============================================================================
 // Crossfade
 // ============================================================================
@@ -307,8 +329,8 @@ DSPARK_TEST(Crossfade_published_gains_come_from_the_processing_call)
     const float blend = cf.process(1.0f, 1.0f);
     const float gainA = cf.getGainA();
     const float gainB = cf.getGainB();
-    EXPECT_EQ(gainB, 0.5f);
-    EXPECT_NEAR(gainA * gainA, 0.75f, 1e-6f);
+    EXPECT_NEAR(gainB, 0.38268343f, 1e-6f);     // sin(pi/8): the sine law
+    EXPECT_NEAR(gainA * gainA + gainB * gainB, 1.0f, 1e-6f);
     EXPECT_EQ(blend, gainA + gainB);
 
     // A further position still reports the previous pair until the next call.
@@ -332,6 +354,70 @@ DSPARK_TEST(Crossfade_Linear_midpoint)
     float gainB = cf.getGainB();
     EXPECT_NEAR(gainA, 0.5f, 0.01f);
     EXPECT_NEAR(gainB, 0.5f, 0.01f);
+}
+
+DSPARK_TEST(Crossfade_glides_at_constant_power_with_smooth_ends)
+{
+    // The equal-power law was the square root: constant power, but with an
+    // infinite slope at both ends (-20 dB after 1% of a fade, a step-like
+    // onset). A position change ramped the two GAINS linearly across one
+    // block, so a jump dipped the power 3 dB mid-ramp, and with 32-sample
+    // blocks the whole fade took 0.7 ms. Now: the sine law, evaluated at every
+    // sample of a glide, and after prepare() a full sweep takes 20 ms.
+    using CF = Crossfade<float>;
+    float gA = 0.0f, gB = 0.0f;
+    CF::gainsFor(CF::Curve::EqualPower, 0.01f, gA, gB);
+    EXPECT_NEAR(gB, 0.015707317f, 1e-6f);        // sin(pi/200); square root: 0.1
+    CF::gainsFor(CF::Curve::EqualPower, 1.0f, gA, gB);
+    EXPECT_EQ(gA, 0.0f);                         // exact ends
+    EXPECT_EQ(gB, 1.0f);
+
+    // Per-sample gains: feeding A = 1, B = 0 reads gain A, and vice versa. The
+    // first block starts settled at position 0; the jump comes after it.
+    auto run = [](bool prepared, int block, std::vector<float>& ga, std::vector<float>& gb) {
+        CF x, y;
+        if (prepared) { x.prepare(48000.0); y.prepare(48000.0); }
+        const int total = 2048;
+        ga.assign(total, 0.0f);
+        gb.assign(total, 0.0f);
+        std::vector<float> one(static_cast<size_t>(block), 1.0f), zero(static_cast<size_t>(block), 0.0f);
+        for (int off = 0; off < total; off += block)
+        {
+            if (off == block) { x.setPosition(1.0f); y.setPosition(1.0f); }
+            x.process(one.data(), zero.data(), ga.data() + off, block);
+            y.process(zero.data(), one.data(), gb.data() + off, block);
+        }
+    };
+    auto maxPowerError = [](const std::vector<float>& ga, const std::vector<float>& gb) {
+        float e = 0.0f;
+        for (size_t i = 0; i < ga.size(); ++i)
+            e = std::max(e, std::abs(ga[i] * ga[i] + gb[i] * gb[i] - 1.0f));
+        return e;
+    };
+
+    std::vector<float> ga, gb;
+    run(true, 32, ga, gb);                       // prepared: 960 samples per sweep
+    EXPECT_NEAR(ga[32 + 479], 0.70710678f, 1e-5f);   // halfway after 10 ms
+    EXPECT_GT(ga[32 + 900], 0.0f);               // old: finished after 32 samples
+    EXPECT_EQ(ga[32 + 1000], 0.0f);
+    EXPECT_EQ(gb[32 + 1000], 1.0f);
+    EXPECT_LT(maxPowerError(ga, gb), 1e-6f);
+
+    run(false, 256, ga, gb);                     // unprepared: one-block ramp
+    EXPECT_NEAR(ga[256 + 127], 0.70710678f, 1e-2f);
+    EXPECT_EQ(ga[511], 0.0f);                    // lands on the target
+    EXPECT_LT(maxPowerError(ga, gb), 1e-6f);     // old: 0.5 (a 3 dB dip)
+
+    // A curve change blends the old law into the new one across the block.
+    CF c;
+    c.setPosition(0.5f);
+    std::vector<float> one(64, 1.0f), zero(64, 0.0f), out(64);
+    c.process(one.data(), zero.data(), out.data(), 64);   // settled at once
+    EXPECT_NEAR(out[0], 0.70710678f, 1e-6f);
+    c.setCurve(CF::Curve::Linear);
+    c.process(one.data(), zero.data(), out.data(), 64);
+    EXPECT_NEAR(out[0], 0.70710678f, 0.01f);     // starts at the sine law
+    EXPECT_NEAR(out[63], 0.5f, 1e-6f);           // ends at the linear law
 }
 
 // ============================================================================

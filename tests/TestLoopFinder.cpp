@@ -316,8 +316,8 @@ void exerciseSearchAndRender()
             EXPECT_EQ(output[static_cast<std::size_t>(ch)][static_cast<std::size_t>(i)],
                       audio[static_cast<std::size_t>(ch)][static_cast<std::size_t>(96 + i)]);
 
-        // The expectation is rebuilt from the equal-power curve itself, out of
-        // pure operands. A crossfader publishes its gain pair from the
+        // The expectation is rebuilt from the equal-power law itself (the pure
+        // Crossfade::gainsFor), out of pure operands. A crossfader publishes its gain pair from the
         // processing call, so asking it for the blend and for the gains to
         // divide the blend by inside one expression leaves the two calls
         // unsequenced: the divisor is then whichever pair the compiler
@@ -331,8 +331,10 @@ void exerciseSearchAndRender()
                                 [static_cast<std::size_t>(96 + i)];
             const T scale = std::max(std::abs(tail), std::abs(head));
             const T position = static_cast<T>(i) / T(15);
-            const T gainTail = std::sqrt(T(1) - position);
-            const T gainHead = std::sqrt(position);
+            T gainTail = T(0);
+            T gainHead = T(0);
+            Crossfade<T>::gainsFor(Crossfade<T>::Curve::EqualPower, position,
+                                   gainTail, gainHead);
             const T expected = scale == T(0) ? T(0) : scale * std::clamp(
                 (tail / scale * gainTail + head / scale * gainHead)
                     / (gainTail + gainHead),

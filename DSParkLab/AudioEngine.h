@@ -467,7 +467,10 @@ private:
         fileSampleRate_ = fileInfo_.sampleRate;
         fileChannels_   = fileInfo_.numChannels;
 
-        spec_ = { fileSampleRate_, kBlockSize, std::min(fileChannels_, 2) };
+        // The chain always runs in stereo: a mono file feeds both channels, so
+        // panners, wideners and stereo reverbs are audible on mono material
+        // too (with a 1-channel chain they had nothing to act on).
+        spec_ = { fileSampleRate_, kBlockSize, 2 };
         workBuffer_.resize(spec_.numChannels, kBlockSize);
 
         spectrum_.prepare(fileSampleRate_, 4096);
@@ -526,7 +529,8 @@ private:
         int pos = self->position_.load();
         const int requested = self->seekRequest_.exchange(-1, std::memory_order_acquire);
         if (requested >= 0) pos = std::clamp(requested, 0, fileSamples);
-        const int nCh = std::min(self->fileChannels_, 2);
+        const int nCh = 2;                                   // chain is always stereo
+        const int srcChannels = std::min(self->fileChannels_, 2);
         int written = 0;
 
         while (written < frames)
@@ -552,7 +556,7 @@ private:
             // Copy from source to work buffer
             for (int ch = 0; ch < nCh; ++ch)
             {
-                const float* src = self->fileBuffer_.getChannel(ch) + pos;
+                const float* src = self->fileBuffer_.getChannel(std::min(ch, srcChannels - 1)) + pos;
                 float* dst = self->workBuffer_.getChannel(ch);
                 std::copy(src, src + chunk, dst);
             }
@@ -610,7 +614,7 @@ private:
         const double inc = 2.0 * 3.14159265358979323846
                          * static_cast<double>(toneFreq_.load()) / fs;
         const float amp = std::pow(10.0f, toneDb_.load() / 20.0f);
-        const int nCh = std::max(1, std::min(fileChannels_, 2));
+        const int nCh = 2;                                   // chain is always stereo
 
         int written = 0;
         while (written < frames)
@@ -721,7 +725,7 @@ private:
 
         ma_device_config config = ma_device_config_init(ma_device_type_playback);
         config.playback.format   = ma_format_f32;
-        config.playback.channels = static_cast<ma_uint32>(std::min(fileChannels_, 2));
+        config.playback.channels = 2;                        // chain is always stereo
         config.sampleRate        = static_cast<ma_uint32>(fileSampleRate_);
         config.dataCallback      = audioCallback;
         config.pUserData         = this;

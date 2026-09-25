@@ -75,7 +75,7 @@ public:
         sampleRate_ = spec.sampleRate;
         // Start settled on the configured pan: from 0 a preset panned hard
         // right faded in from the centre over the smoothing time.
-        panSmoother_.reset(sampleRate_, smoothingTime_.load(std::memory_order_relaxed),
+        panSmoother_.reset(sampleRate_, panTimeConstantMs(smoothingTime_.load(std::memory_order_relaxed)),
                            static_cast<float>(pan_.load(std::memory_order_relaxed)));
 
         float maxMs = std::max(binauralMaxITD_.load(std::memory_order_relaxed),
@@ -89,8 +89,11 @@ public:
         delayR_.prepareMs(monoSpec, static_cast<double>(maxMs) + 1.0);
         delayL_.setSmoother(Delay<T>::SmootherType::CriticallyDamped);
         delayR_.setSmoother(Delay<T>::SmootherType::CriticallyDamped);
-        delayL_.setSmoothingTime(smoothingTime_);
-        delayR_.setSmoothingTime(smoothingTime_);
+        // The ITD/Haas delays glide more slowly than the gains (time constant
+        // = the whole smoothing time): a delay that moves fast is a Doppler
+        // pitch bend, up to 30 ms of travel for Haas.
+        delayL_.setSmoothingTime(smoothingTime_.load(std::memory_order_relaxed));
+        delayR_.setSmoothingTime(smoothingTime_.load(std::memory_order_relaxed));
 
         spectralPan_ = std::numeric_limits<float>::quiet_NaN();   // new rate: rebuild
         updateSpectralFilters(static_cast<T>(panSmoother_.getCurrentValue()));
@@ -151,7 +154,7 @@ public:
         // Apply control-thread publications (audio-thread application point).
         if (smoothingDirty_.exchange(false, std::memory_order_acquire))
             panSmoother_.reset(sampleRate_,
-                               smoothingTime_.load(std::memory_order_relaxed),
+                               panTimeConstantMs(smoothingTime_.load(std::memory_order_relaxed)),
                                panSmoother_.getCurrentValue());
 
         float pTarget = static_cast<float>(pan_.load(std::memory_order_relaxed));
@@ -204,9 +207,9 @@ public:
         spectralMaxGain_.store(dB, std::memory_order_relaxed);
     }
 
-    /** @brief Sets the pan smoothing time. Thread-safe; applied at the top of
-     *  the next processBlock() (previously it only took effect on the next
-     *  prepare(), silently). */
+    /** @brief Sets the pan smoothing time: a change settles (to 96%) in this
+     *  many ms along a critically damped curve. Thread-safe; applied at the
+     *  top of the next processBlock(). */
     void setSmoothingTime(float ms) noexcept
     {
         if (!std::isfinite(ms)) return;
@@ -419,13 +422,13 @@ protected:
 
     void applySpectral(AudioBufferView<T> buffer, float /*panTarget*/) noexcept
     {
-        // The shelves follow the SMOOTHED pan, re-designed every 16 samples
-        // while it moves (they used to jump to the target once per block: a
-        // zipper on automation). Settled, the cached design is reused.
+        // The shelves follow the SMOOTHED pan, re-designed every 4 samples
+        // while it moves (coarser steps left an audible coefficient zipper).
+        // Settled, the cached design is reused.
         T* L = buffer.getChannel(0);
         T* R = buffer.getChannel(1);
         const int n = buffer.getNumSamples();
-        constexpr int kSubBlock = 16;
+        constexpr int kSubBlock = 4;
 
         for (int start = 0; start < n; start += kSubBlock)
         {
@@ -457,9 +460,11 @@ protected:
         T gainLdB = -targetPan * static_cast<T>(sMaxGain);
         T gainRdB =  targetPan * static_cast<T>(sMaxGain);
 
-        spectralL_.setCoeffs(BiquadCoeffs::makeHighShelf(
+        // Audio-thread-owned coefficients: the direct setter (setCoeffs() is
+        // the cross-thread channel; a stream owner must not self-publish).
+        spectralL_.setCoeffsNow(BiquadCoeffs::makeHighShelf(
             sampleRate_, static_cast<double>(sFreq), static_cast<double>(gainLdB)));
-        spectralR_.setCoeffs(BiquadCoeffs::makeHighShelf(
+        spectralR_.setCoeffsNow(BiquadCoeffs::makeHighShelf(
             sampleRate_, static_cast<double>(sFreq), static_cast<double>(gainRdB)));
     }
 
@@ -468,7 +473,14 @@ protected:
     std::atomic<T> pan_ { T(0) };
 
     Delay<T> delayL_, delayR_;
-    Smoothers::LinearSmoother panSmoother_;
+    // Second-order (critically damped) pan smoothing: position AND velocity
+    // are continuous, so a control stream updated at GUI/automation rate
+    // (a new target every ~16 ms) moves without the 60 Hz kinks of a linear
+    // ramp restarted on every update (an audible zipper on fast drags).
+    Smoothers::CriticallyDampedSmoother panSmoother_;
+    /// Time constant of the critically damped smoother for a smoothing time:
+    /// 1 - (1 + t/tau) e^(-t/tau) reaches 96% at t = 5 tau.
+    static float panTimeConstantMs(float smoothingMs) noexcept { return smoothingMs * 0.2f; }
     Biquad<T, 1> spectralL_, spectralR_;
 
     std::atomic<float> smoothingTime_   { 50.0f };

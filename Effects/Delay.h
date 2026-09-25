@@ -754,12 +754,28 @@ private:
         SampleType* data = delayBuffer_.getChannel(ch);
         int writeIdx = writeIndices_[ch];
 
-        SampleType readPos = static_cast<SampleType>(writeIdx) - delaySamples;
-        if (readPos < SampleType(0)) readPos += static_cast<SampleType>(maxDelaySamples_);
+        // Read position writeIdx - delaySamples, split into an integer index
+        // and a fraction in [0, 1] without ever forming the wrapped float
+        // position: writeIdx - delay + size rounded up to exactly `size` when
+        // the position fell a hair below 0, which masked the index to 0 while
+        // the "fraction" became `size` (a Hermite blow-up, heard as random
+        // zips on moving Haas/binaural delays).
+        const int dInt = static_cast<int>(delaySamples);            // >= 3
+        const SampleType dFrac = delaySamples - static_cast<SampleType>(dInt);
+        int idx0;
+        SampleType frac;
+        if (dFrac > SampleType(0))
+        {
+            idx0 = (writeIdx - dInt - 1) & bufferMask_;
+            frac = SampleType(1) - dFrac;
+        }
+        else
+        {
+            idx0 = (writeIdx - dInt) & bufferMask_;
+            frac = SampleType(0);
+        }
 
         // 3rd-order Hermite Interpolation (4-point)
-        int idx0 = static_cast<int>(readPos) & bufferMask_;
-        SampleType frac = readPos - static_cast<SampleType>(idx0);
 
         int idxM1 = (idx0 - 1 + maxDelaySamples_) & bufferMask_;
         int idx1  = (idx0 + 1) & bufferMask_;

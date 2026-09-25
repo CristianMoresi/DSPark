@@ -3456,6 +3456,46 @@ DSPARK_TEST(AlgoReverb_spring_is_dispersive)
 // Panner - Smooth Transition
 // ============================================================================
 
+DSPARK_TEST(Panner_delay_panners_stay_bounded_while_dragged)
+{
+    // Dragging a Binaural or Haas pan moves its fractional delay across the
+    // ring's wrap point. Delay formed the wrapped read position in floating
+    // point, and a position a hair below 0 rounded up to exactly the ring
+    // size: the index masked to 0 while the Hermite fraction became the ring
+    // size (measured peaks of 67771 on a 0.3 sine, heard as zips). The output
+    // must stay at the input level and as smooth as a static pan.
+    for (const auto algo : { Panner<float>::Algorithm::Binaural, Panner<float>::Algorithm::Haas })
+    {
+        Panner<float> pan;
+        pan.prepare(spec(48000.0, 256, 2));
+        pan.setAlgorithm(algo);
+        auto tb = makeBuffer(2, 256);
+        double ph = 0.0, maxAbs = 0.0, maxD2 = 0.0;
+        float y1 = 0.0f, y2 = 0.0f;
+        for (int k = 0; k < 4 * 48000 / 256; ++k)
+        {
+            if (k % 3 == 0)
+                pan.setPan(static_cast<float>(std::sin(k * 256.0 / 48000.0 * 6.283185307179586 * 0.5)));
+            for (int i = 0; i < 256; ++i)
+            {
+                tb.ch(0)[i] = tb.ch(1)[i] = static_cast<float>(0.3 * std::sin(ph));
+                ph += 6.283185307179586 * 220.0 / 48000.0;
+            }
+            pan.processBlock(tb.view());
+            for (int i = 0; i < 256; ++i)
+            {
+                const float y = tb.ch(0)[i];
+                maxAbs = std::max(maxAbs, static_cast<double>(std::abs(y)));
+                if (k > 10) maxD2 = std::max(maxD2, static_cast<double>(std::abs(y - 2.0f * y1 + y2)));
+                y2 = y1;
+                y1 = y;
+            }
+        }
+        EXPECT_LT(maxAbs, 0.5);
+        EXPECT_LT(maxD2, 0.002);   // a clean 220 Hz sine at 0.3: 0.00025
+    }
+}
+
 DSPARK_TEST(Panner_smooth_transition_no_click)
 {
     Panner<float> pan;

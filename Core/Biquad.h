@@ -493,6 +493,54 @@ struct alignas(32) BiquadCoeffs
         return coeffs;
     }
 
+    /**
+     * @brief ITU-R BS.1770 K-weighting, stage 1: the head-related high shelf.
+     *
+     * Pre-warped analog parameterization that reproduces the official table 1
+     * coefficients at 48 kHz to machine precision (max error 8.9e-16) and
+     * stays within the standard's tolerance at every other rate. Cascade with
+     * makeKWeightingHighPass() for the full K filter (LoudnessMeter's).
+     */
+    [[nodiscard]] static BiquadCoeffs makeKWeightingShelf(double sampleRate) noexcept
+    {
+        const double G  = 3.999843853973347;     // dB
+        const double Q  = 0.7071752369554196;
+        const double fc = 1681.9744509555319;    // Hz
+        const double K  = std::tan(std::numbers::pi * fc / sampleRate);
+        const double Vh = std::pow(10.0, G / 20.0);
+        const double Vb = std::pow(Vh, 0.4996667741545416);
+        const double a0 = 1.0 + K / Q + K * K;
+        BiquadCoeffs c;
+        c.b0 = (Vh + Vb * K / Q + K * K) / a0;
+        c.b1 = 2.0 * (K * K - Vh) / a0;
+        c.b2 = (Vh - Vb * K / Q + K * K) / a0;
+        c.a1 = 2.0 * (K * K - 1.0) / a0;
+        c.a2 = (1.0 - K / Q + K * K) / a0;
+        return c;
+    }
+
+    /**
+     * @brief ITU-R BS.1770 K-weighting, stage 2: the RLB high-pass.
+     *
+     * The official table 2 numerator is exactly [1, -2, 1], NOT normalized to
+     * unity passband gain (it passes about +0.04 dB); the -0.691 dB constant
+     * of the LUFS formula is tied to this exact cascade.
+     */
+    [[nodiscard]] static BiquadCoeffs makeKWeightingHighPass(double sampleRate) noexcept
+    {
+        const double Q  = 0.5003270373238773;
+        const double fc = 38.13547087602444;     // Hz
+        const double K  = std::tan(std::numbers::pi * fc / sampleRate);
+        const double a0 = 1.0 + K / Q + K * K;
+        BiquadCoeffs c;
+        c.b0 = 1.0;
+        c.b1 = -2.0;
+        c.b2 = 1.0;
+        c.a1 = 2.0 * (K * K - 1.0) / a0;
+        c.a2 = (1.0 - K / Q + K * K) / a0;
+        return c;
+    }
+
     // -- Frequency response analysis -------------------------------------------
 
     /**

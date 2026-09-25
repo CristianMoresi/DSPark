@@ -11,6 +11,16 @@
  * after processing to match. This eliminates the loudness bias that makes
  * louder signals sound "better", enabling honest A/B testing.
  *
+ * Levels are loudness, not raw RMS: both sides are K-weighted (ITU-R
+ * BS.1770, the LUFS filter; setWeighting(Flat) selects plain RMS) and
+ * integrated with the same 400 ms time constant (the BS.1770 momentary
+ * window). Raw per-block RMS over-corrected low-end changes (a sub-bass rise
+ * the ear barely hears moved the match by several dB) and, with small blocks,
+ * made the match wobble whenever the processed block's waveform differed
+ * from the reference's (latency, phase shifts): each block's ratio was an
+ * independent noisy estimate. Integrating both sides from the same start
+ * keeps the ratio exact for stationary material from the first block on.
+ *
  * Usage pattern (sandwich):
  * @code
  *   autoGain.pushReference(buffer);   // measure input level
@@ -26,13 +36,13 @@
  * atomic word the audio thread publishes once per compensate(), so the read is
  * synchronised and may be up to one block behind.
  *
- * Dependencies: DspMath.h, SimdOps.h, AudioSpec.h, AudioBuffer.h, StateBlob.h.
+ * Dependencies: DspMath.h, Biquad.h, AudioSpec.h, AudioBuffer.h, StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/Biquad.h"
 #include "../Core/DspMath.h"
-#include "../Core/SimdOps.h"
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
@@ -68,20 +78,31 @@ class AutoGain
         "AutoGain requires a lock-free float type for thread safety in the audio path.");
 
 public:
+    /** @brief Level measurement used for the match. */
+    enum class Weighting
+    {
+        KWeighted, ///< ITU-R BS.1770 K-weighting (loudness, LUFS filter). Default.
+        Flat       ///< Unweighted mean square (plain RMS).
+    };
+
     /**
      * @brief Prepares the auto-gain processor.
      *
      * An invalid spec (non-positive or non-finite fields) is a no-op that
-     * keeps the previous state.
+     * keeps the previous state. Allocates the per-channel weighting state.
      *
      * @param spec Audio environment specification containing sample rate and channels.
      */
-    void prepare(const AudioSpec& spec) noexcept
+    void prepare(const AudioSpec& spec)
     {
         if (!spec.isValid()) return; // release-safe: keep previous state
 
         sampleRate_ = spec.sampleRate;
         numChannels_ = spec.numChannels;
+        shelf_ = BiquadCoeffs::makeKWeightingShelf(sampleRate_);
+        highPass_ = BiquadCoeffs::makeKWeightingHighPass(sampleRate_);
+        refFilters_.assign(static_cast<size_t>(numChannels_), WeightingState {});
+        outFilters_.assign(static_cast<size_t>(numChannels_), WeightingState {});
         reset();
     }
 
@@ -98,7 +119,7 @@ public:
         if (std::min(buffer.getNumChannels(), numChannels_) <= 0 ||
             buffer.getNumSamples() <= 0)
             return;
-        refLevelDb_ = measureRmsDb(buffer);
+        integrate(refMeanSquare_, buffer, refFilters_);
     }
 
     /**
@@ -113,19 +134,17 @@ public:
 
         if (numSamples == 0 || numCh == 0) return;
 
-        T outLevelDb = measureRmsDb(buffer);
-        T targetDb = refLevelDb_ - outLevelDb;
-
-        // Safety: Prevent NaN propagation if both levels are -Inf
-        if (std::isnan(targetDb))
-            targetDb = T(0);
+        integrate(outMeanSquare_, buffer, outFilters_);
+        const T refLevelDb = meanSquareToDb(refMeanSquare_);
+        const T outLevelDb = meanSquareToDb(outMeanSquare_);
+        T targetDb = refLevelDb - outLevelDb;
 
         // Clamp to safety limits
         const T maxComp = maxCompensation_.load(std::memory_order_relaxed);
         targetDb = std::clamp(targetDb, -maxComp, maxComp);
 
         // Silence bypass (-90 dB threshold)
-        if (refLevelDb_ < SILENCE_THRESH_DB && outLevelDb < SILENCE_THRESH_DB)
+        if (refLevelDb < SILENCE_THRESH_DB && outLevelDb < SILENCE_THRESH_DB)
             targetDb = T(0);
 
         // Calculate analytical end-state of the one-pole filter for the current block size:
@@ -165,9 +184,25 @@ public:
      */
     void reset() noexcept
     {
-        refLevelDb_ = SILENCE_THRESH_DB;
+        refMeanSquare_ = 0.0;
+        outMeanSquare_ = 0.0;
+        for (auto& f : refFilters_) f = {};
+        for (auto& f : outFilters_) f = {};
         compensationDb_ = T(0);
         publishedCompensationDb_.store(T(0), std::memory_order_relaxed);
+    }
+
+    /** @brief Selects the level measurement (K-weighted loudness by default). RT-safe. */
+    void setWeighting(Weighting w) noexcept
+    {
+        const int v = std::clamp(static_cast<int>(w), 0, static_cast<int>(Weighting::Flat));
+        weighting_.store(static_cast<Weighting>(v), std::memory_order_relaxed);
+    }
+
+    /** @return The level measurement in use. */
+    [[nodiscard]] Weighting getWeighting() const noexcept
+    {
+        return weighting_.load(std::memory_order_relaxed);
     }
 
     /**
@@ -228,6 +263,7 @@ public:
         StateWriter w(stateId("AGAN"), 1);
         w.write("maxComp", static_cast<float>(maxCompensation_.load(std::memory_order_relaxed)));
         w.write("smoothMs", static_cast<float>(getSmoothingTime()));
+        w.write("weighting", static_cast<int32_t>(getWeighting()));
         return w.blob();
     }
 
@@ -238,39 +274,88 @@ public:
         if (!r.isValid() || r.processorId() != stateId("AGAN")) return false;
         setMaxCompensation(static_cast<T>(r.read("maxComp", 12.0f)));
         setSmoothingTime(static_cast<T>(r.read("smoothMs", 100.0f)));
+        setWeighting(static_cast<Weighting>(r.read("weighting", 0)));
         return true;
     }
 
 private:
-    /**
-     * @brief Calculates the global RMS level across all active channels.
-     * @param buffer Read-only audio view.
-     * @return RMS level in decibels (silence floor when the view is empty).
-     */
-    [[nodiscard]] T measureRmsDb(AudioBufferView<T> buffer) const noexcept
+    /** Two-biquad K-weighting state (double, like LoudnessMeter's). */
+    struct WeightingState { double s1a = 0.0, s2a = 0.0, s1b = 0.0, s2b = 0.0; };
+
+    static inline double tdf2(double x, const BiquadCoeffs& c, double& s1, double& s2) noexcept
     {
-        const int numCh = std::min(buffer.getNumChannels(), numChannels_);
-        const int numSamples = buffer.getNumSamples();
-        if (numCh <= 0 || numSamples <= 0) return SILENCE_THRESH_DB;
-
-        T sumSq = T(0);
-        const int totalSamples = numSamples * numCh;
-
-        for (int ch = 0; ch < numCh; ++ch)
-            sumSq += simd::sumOfSquares(buffer.getChannel(ch), numSamples);
-
-        // Apply a strict epsilon floor (approx -150dB) to avoid std::sqrt(0) and gainToDecibels(0) -> -Inf
-        T meanSq = std::max<T>(sumSq / static_cast<T>(totalSamples), T(1e-15));
-        return gainToDecibels(std::sqrt(meanSq));
+        const double y = c.b0 * x + s1;
+        s1 = c.b1 * x - c.a1 * y + s2;
+        s2 = c.b2 * x - c.a2 * y;
+        return y;
     }
 
+    /**
+     * @brief Folds one block into a level: the (weighted) mean square over
+     * the prepared channels, integrated with the 400 ms one-pole evaluated
+     * for the block length. A non-finite block leaves the level unchanged and
+     * clears that side's filter state (it would otherwise stay poisoned).
+     */
+    void integrate(double& meanSquare, AudioBufferView<T> buffer,
+                   std::vector<WeightingState>& filters) noexcept
+    {
+        const int numCh = std::min({ buffer.getNumChannels(), numChannels_,
+                                     static_cast<int>(filters.size()) });
+        const int numSamples = buffer.getNumSamples();
+        if (numCh <= 0 || numSamples <= 0) return;
+
+        const bool weighted = weighting_.load(std::memory_order_relaxed) == Weighting::KWeighted;
+        double sumSq = 0.0;
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            const T* x = buffer.getChannel(ch);
+            WeightingState& f = filters[static_cast<size_t>(ch)];
+            if (weighted)
+            {
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    const double y = tdf2(tdf2(static_cast<double>(x[i]), shelf_, f.s1a, f.s2a),
+                                          highPass_, f.s1b, f.s2b);
+                    sumSq += y * y;
+                }
+            }
+            else
+            {
+                for (int i = 0; i < numSamples; ++i)
+                    sumSq += static_cast<double>(x[i]) * static_cast<double>(x[i]);
+            }
+        }
+
+        const double blockMs = sumSq / static_cast<double>(numSamples * numCh);
+        if (!std::isfinite(blockMs))
+        {
+            for (auto& state : filters) state = {};
+            return;
+        }
+        const double a = std::exp(-static_cast<double>(numSamples) / (sampleRate_ * kIntegrationSeconds));
+        meanSquare = blockMs + (meanSquare - blockMs) * a;
+    }
+
+    /** Mean square to dB, floored like the old -150 dB epsilon. */
+    [[nodiscard]] static T meanSquareToDb(double meanSquare) noexcept
+    {
+        return static_cast<T>(10.0 * std::log10(std::max(meanSquare, 1e-15)));
+    }
+
+    static constexpr double kIntegrationSeconds = 0.4; ///< BS.1770 momentary window.
     static constexpr T SILENCE_THRESH_DB = T(-90);   ///< Threshold below which audio is considered dead silence.
 
     double sampleRate_ = 44100.0;                    ///< Current system sample rate.
     int numChannels_ = 0;                            ///< Expected number of processing channels.
 
     std::atomic<T> smoothTimeSecs_{ T(0.100) };      ///< Smoothing time constant in seconds.
-    T refLevelDb_ = SILENCE_THRESH_DB;               ///< Snapshot of input level.
+    std::atomic<Weighting> weighting_{ Weighting::KWeighted };
+    double refMeanSquare_ = 0.0;                     ///< Integrated reference level.
+    double outMeanSquare_ = 0.0;                     ///< Integrated processed level.
+    BiquadCoeffs shelf_ = BiquadCoeffs::makeKWeightingShelf(48000.0);
+    BiquadCoeffs highPass_ = BiquadCoeffs::makeKWeightingHighPass(48000.0);
+    std::vector<WeightingState> refFilters_;
+    std::vector<WeightingState> outFilters_;
     T compensationDb_ = T(0);                        ///< Audio-thread working state.
     std::atomic<T> publishedCompensationDb_{ T(0) }; ///< Cross-thread metering readout.
 

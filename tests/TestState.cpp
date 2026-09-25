@@ -101,6 +101,7 @@ DSPARK_TEST(State_roundtrip_dynamics)
     })));
     EXPECT_TRUE((roundTrip<AutoGain<float>>([](auto& a) {
         a.setMaxCompensation(9.0f); a.setSmoothingTime(50.0f);
+        a.setWeighting(AutoGain<float>::Weighting::Flat);
     })));
 }
 

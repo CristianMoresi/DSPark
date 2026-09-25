@@ -1740,6 +1740,64 @@ DSPARK_TEST(AutoGain_compensates_boost)
     EXPECT_NEAR(compDb, -6.0f, 1.0f);
 }
 
+// The match used raw per-block RMS: sub-bass the ear barely hears moved it
+// by several dB (measured: a 20 Hz rumble under a 1 kHz tone pulled the
+// output down 7.55 dB), and with small blocks every block's ratio was a new
+// noisy estimate, so an effect with latency made the gain wobble (measured
+// -0.23..+0.11 dB on a 40 Hz tone through a 100-sample delay, 64-sample
+// blocks). Both sides are now K-weighted and integrated alike.
+DSPARK_TEST(AutoGain_matches_loudness_and_stays_steady)
+{
+    auto rumbleMatch = [](AutoGain<double>::Weighting w) {
+        AutoGain<double> ag;
+        ag.prepare(spec(48000.0, 512, 1));
+        ag.setSmoothingTime(10.0);
+        ag.setWeighting(w);
+        std::vector<double> b(512);
+        double* p[1] = { b.data() };
+        for (int blk = 0; blk < 400; ++blk)
+        {
+            for (int i = 0; i < 512; ++i)
+                b[static_cast<size_t>(i)] = 0.2 * std::sin(twoPi<double> * 1000.0 * (blk * 512 + i) / 48000.0);
+            ag.pushReference(AudioBufferView<double>(p, 1, 512));
+            for (int i = 0; i < 512; ++i)
+                b[static_cast<size_t>(i)] += 0.4 * std::sin(twoPi<double> * 20.0 * (blk * 512 + i) / 48000.0);
+            ag.compensate(AudioBufferView<double>(p, 1, 512));
+        }
+        return static_cast<double>(ag.getCompensationDb());
+    };
+    EXPECT_GT(rumbleMatch(AutoGain<double>::Weighting::KWeighted), -1.5);  // ~ -0.6 dB
+    EXPECT_NEAR(rumbleMatch(AutoGain<double>::Weighting::Flat), -7.0, 0.3); // plain RMS
+
+    AutoGain<double> ag;
+    ag.prepare(spec(48000.0, 64, 1));
+    std::vector<double> delay(100, 0.0), b(64);
+    size_t dp = 0;
+    double lo = 1e9, hi = -1e9;
+    double* p[1] = { b.data() };
+    for (int blk = 0; blk < 2250; ++blk)
+    {
+        for (int i = 0; i < 64; ++i)
+            b[static_cast<size_t>(i)] = 0.5 * std::sin(twoPi<double> * 40.0 * (blk * 64 + i) / 48000.0);
+        ag.pushReference(AudioBufferView<double>(p, 1, 64));
+        for (int i = 0; i < 64; ++i)
+        {
+            const double v = b[static_cast<size_t>(i)];
+            b[static_cast<size_t>(i)] = delay[dp];
+            delay[dp] = v;
+            dp = (dp + 1) % delay.size();
+        }
+        ag.compensate(AudioBufferView<double>(p, 1, 64));
+        if (blk > 1500)
+        {
+            lo = std::min(lo, static_cast<double>(ag.getCompensationDb()));
+            hi = std::max(hi, static_cast<double>(ag.getCompensationDb()));
+        }
+    }
+    EXPECT_LT(hi - lo, 0.02);
+    EXPECT_LT(std::abs(hi), 0.05);
+}
+
 DSPARK_TEST(AutoGain_silence_safe)
 {
     auto s = spec(48000.0, 512, 1);

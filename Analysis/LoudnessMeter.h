@@ -22,12 +22,13 @@
  *   getLoudnessRange, getTruePeakDb, isMeasurementValid): any thread,
  *   lock-free; values are approximate while a block is in flight (metering).
  *
- * Dependencies: AudioBuffer.h, AudioSpec.h, DspMath.h, TruePeakDetector.h.
+ * Dependencies: AudioBuffer.h, AudioSpec.h, Biquad.h, DspMath.h, TruePeakDetector.h.
  */
 
 #include "../Core/DspMath.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
+#include "../Core/Biquad.h"
 #include "../Core/TruePeakDetector.h"
 
 #include <algorithm>
@@ -394,34 +395,12 @@ private:
         // full-band deviation stays below 0.05 dB through 384 kHz and inside
         // the standard tolerance. The -0.691 constant in powerToLUFS remains
         // tied to this cascade; an RBJ shelf or a gain-normalized RLB high-pass
-        // reads ~0.26 LU low on the EBU conformance vectors.
-        {
-            const double G  = 3.999843853973347;     // dB, stage 1 shelf
-            const double Q  = 0.7071752369554196;
-            const double fc = 1681.9744509555319;    // Hz
-            const double K  = std::tan(std::numbers::pi * fc / sr);
-            const double Vh = std::pow(10.0, G / 20.0);
-            const double Vb = std::pow(Vh, 0.4996667741545416);
-            const double a0 = 1.0 + K / Q + K * K;
-            pre_.b0 = (Vh + Vb * K / Q + K * K) / a0;
-            pre_.b1 = 2.0 * (K * K - Vh) / a0;
-            pre_.b2 = (Vh - Vb * K / Q + K * K) / a0;
-            pre_.a1 = 2.0 * (K * K - 1.0) / a0;
-            pre_.a2 = (1.0 - K / Q + K * K) / a0;
-        }
-        {
-            const double Q  = 0.5003270373238773;    // stage 2 RLB high-pass
-            const double fc = 38.13547087602444;     // Hz
-            const double K  = std::tan(std::numbers::pi * fc / sr);
-            const double a0 = 1.0 + K / Q + K * K;
-            // The official table 2 numerator is exactly [1, -2, 1] - NOT
-            // normalized to unity passband gain (it passes ~+0.04 dB).
-            rlb_.b0 = 1.0;
-            rlb_.b1 = -2.0;
-            rlb_.b2 = 1.0;
-            rlb_.a1 = 2.0 * (K * K - 1.0) / a0;
-            rlb_.a2 = (1.0 - K / Q + K * K) / a0;
-        }
+        // reads ~0.26 LU low on the EBU conformance vectors. The design lives
+        // in BiquadCoeffs so every K-weighted measurement shares it.
+        const auto shelf = BiquadCoeffs::makeKWeightingShelf(sr);
+        pre_ = { shelf.b0, shelf.b1, shelf.b2, shelf.a1, shelf.a2 };
+        const auto rlb = BiquadCoeffs::makeKWeightingHighPass(sr);
+        rlb_ = { rlb.b0, rlb.b1, rlb.b2, rlb.a1, rlb.a2 };
     }
 
     double applyBiquad(double input, const BiquadCoeff& c, BiquadState& s) noexcept

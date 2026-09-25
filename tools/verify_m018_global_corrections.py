@@ -26,7 +26,7 @@ from check_public_text import canonical_text_bytes
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_DIRECTORIES = ("Core", "Effects", "Analysis", "IO", "Music")
 EXPECTED_INSTALLED_HEADERS = 102
-EXPECTED_ORDINARY_TESTS = 895
+EXPECTED_ORDINARY_TESTS = 896
 PRODUCT_P7_COMMIT = "5a47d959de4b3d48445a8850960f74377999faf9"
 PRODUCT_P7_PARENT = "ff56759f0d12e9bfad20a77b5b8c80b642ffe5f2"
 PACKAGE_SOURCE_URL_PREFIX = (
@@ -1525,8 +1525,8 @@ def stale_truth_errors(root: Path) -> list[str]:
         content = (root / path).read_text(encoding="ascii")
         errors.extend(stale_truth_errors_for_text(path, content))
     ci = (root / ".github/workflows/ci.yml").read_text(encoding="ascii")
-    if "ordinary suite authority is currently 895" not in ci:
-        errors.append("CURRENT_TEST_AUTHORITY_MISSING 895")
+    if "ordinary suite authority is currently 896" not in ci:
+        errors.append("CURRENT_TEST_AUTHORITY_MISSING 896")
     return errors
 
 

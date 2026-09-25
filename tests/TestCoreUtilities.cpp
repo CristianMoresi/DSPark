@@ -243,6 +243,22 @@ DSPARK_TEST(SmoothedValue_linear_ramp_time_is_independent_of_step_size)
     EXPECT_NEAR(first - 2000.0, 0.5 / 480.0, 1e-9);
 }
 
+DSPARK_TEST(SmoothedValue_zero_ramp_time_is_instant)
+{
+    // A 0 ms ramp used to be floored at 0.1 ms: "no smoothing" still glided
+    // over ~5 samples at 48 kHz (Gain documents non-positive ramps as 0).
+    for (auto type : { SmoothedValue<float>::SmoothingType::Exponential,
+                       SmoothedValue<float>::SmoothingType::Linear })
+    {
+        SmoothedValue<float> sv;
+        sv.prepare(48000.0, 0.0);
+        sv.setSmoothingType(type);
+        sv.setTargetValue(0.8f);
+        EXPECT_TRUE(sv.getNextValue() == 0.8f);
+        EXPECT_FALSE(sv.isSmoothing());
+    }
+}
+
 DSPARK_TEST(SmoothedValue_disabled_instant)
 {
     SmoothedValue<float> sv;

@@ -77,17 +77,22 @@ public:
     /**
      * @brief Precalculates internal coefficients based on sample rate and timing.
      * @param sampleRate Sample rate in Hz (must be > 0).
-     * @param rampTimeMs Smoothing duration in milliseconds (must be > 0).
-     *                   See the class notes for the per-curve semantics.
+     * @param rampTimeMs Smoothing duration in milliseconds. 0 (or any
+     *                   non-positive value) means no smoothing: every curve
+     *                   lands on a new target at the next sample. See the class
+     *                   notes for the per-curve semantics.
      */
     void prepare(double sampleRate, double rampTimeMs = 20.0) noexcept
     {
         sampleRate_ = std::max(1.0, sampleRate);
-        rampTimeMs_ = std::max(0.1, rampTimeMs);
+        // (a NaN ramp time also lands on 0: std::max returns its first argument.)
+        rampTimeMs_ = std::max(0.0, rampTimeMs);
 
-        // Exponential: 1-pole coefficient
-        const double tau = rampTimeMs_ / 1000.0;
-        expCoeff_ = std::exp(-1.0 / (sampleRate_ * tau));
+        // Exponential: 1-pole coefficient. A zero ramp used to be floored at
+        // 0.1 ms, so a caller asking for "no smoothing" (Gain documents
+        // non-positive ramps as 0) still got a few samples of glide.
+        const double tauSamples = sampleRate_ * rampTimeMs_ / 1000.0;
+        expCoeff_ = (tauSamples > 0.0) ? std::exp(-1.0 / tauSamples) : 0.0;
 
         // Linear: ramp length in samples; the per-sample rate is sized from
         // the remaining distance so an in-flight ramp keeps its new duration.

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <vector>
 
@@ -1289,13 +1290,18 @@ DSPARK_TEST(ZeroLatencyConvolver_cpu_is_flat)
     conv.prepare(ir.data(), static_cast<int>(ir.size()));
 
     constexpr int kBlock = 512;
-    constexpr int kRuns = 5;
+    constexpr int kRuns = 7;
     std::vector<float> buf(kBlock, 0.1f);
     const int blocks = 48000 * 2 / kBlock;
     std::vector<double> best(static_cast<size_t>(blocks), 1e30);
 
     for (int run = 0; run < kRuns; ++run)
     {
+        // Runs of identical length keep a periodic host interruption (a
+        // system timer) on the same block index in every run, where the
+        // minimum cannot filter it (seen once on a shared macOS runner:
+        // 3.1x). A run-dependent pause breaks that phase lock.
+        std::this_thread::sleep_for(std::chrono::microseconds(1000 + 1700 * run));
         conv.reset();
         for (int b = 0; b < blocks; ++b)
         {

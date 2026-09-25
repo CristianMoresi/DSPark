@@ -1114,6 +1114,28 @@ def _run_windows_self_test_case(root: Path, mode: str) -> dict[str, object]:
             _stop_processes([owned], "self_test_exception_cleanup")
 
 
+def _remove_tree_patiently(path: Path, timeout_seconds: float = 10.0) -> None:
+    """Delete a scratch tree, retrying while Windows still holds a handle.
+
+    Windows can report every owned process gone while a handle to a file
+    they wrote is still open for a moment (handle teardown, or an on-access
+    scanner opening the fresh file), so an immediate rmtree can fail with
+    WinError 32 after a proven-clean stop. A lock that outlives the bounded
+    retry is still an error.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+
+
 def _windows_process_tree_self_test() -> int:
     if os.name != "nt":
         print(json.dumps({
@@ -1130,12 +1152,14 @@ def _windows_process_tree_self_test() -> int:
         "cases": [],
     }
     try:
-        with tempfile.TemporaryDirectory(prefix="dspark-windows-job-self-test-") as directory:
-            root = Path(directory)
+        root = Path(tempfile.mkdtemp(prefix="dspark-windows-job-self-test-"))
+        try:
             cases = record["cases"]
             assert isinstance(cases, list)
             cases.append(_run_windows_self_test_case(root, "timeout-resistant-descendant"))
             cases.append(_run_windows_self_test_case(root, "leader-exit-descendant"))
+        finally:
+            _remove_tree_patiently(root)
         record.update(
             status="PASS",
             terminal="native Windows Job Object tree ownership and cleanup proved",

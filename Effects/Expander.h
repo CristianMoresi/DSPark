@@ -28,14 +28,19 @@
  * Channels beyond the 16-channel detector cap still receive the (scalar)
  * expander gain; only the per-channel sidechain HPF state is capped.
  *
+ * Optional lookahead (setLookahead(), 0-10 ms) delays the audio so the gain
+ * rises before a transient reaches the output instead of chopping its onset;
+ * getLatency() reports the delay.
+ *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h,
- *               StateBlob.h.
+ *               RingBuffer.h, StateBlob.h.
  */
 
 #include "../Core/DspMath.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/RingBuffer.h"
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
@@ -67,13 +72,19 @@ public:
 
     /**
      * @brief Initializes the expander with a specific sample rate.
-     * @param sampleRate The sample rate in Hz. Non-finite or non-positive
-     *                   rates are ignored (previous state is kept).
+     * @param sampleRate  The sample rate in Hz. Non-finite or non-positive
+     *                    rates are ignored (previous state is kept).
+     * @param numChannels Channels that receive the lookahead delay (clamped
+     *                    to [1, 16]); further channels are processed undelayed.
      */
-    void prepare(double sampleRate) noexcept
+    void prepare(double sampleRate, int numChannels = 2) noexcept
     {
         if (!std::isfinite(sampleRate) || sampleRate <= 0.0) return;
         sampleRate_ = sampleRate;
+        lookaheadChannels_ = std::clamp(numChannels, 1, MAX_CHANNELS);
+        maxLookaheadSamples_ = static_cast<int>(std::ceil(sampleRate * kMaxLookaheadMs / 1000.0));
+        for (int ch = 0; ch < lookaheadChannels_; ++ch)
+            lookahead_[static_cast<size_t>(ch)].prepare(maxLookaheadSamples_ + 1);
         updateCoefficients();
         // Re-derive the hold counter for the (possibly new) rate: it used to
         // be computed only inside setHold() with the rate of that moment, so
@@ -91,7 +102,7 @@ public:
     void prepare(const AudioSpec& spec) noexcept
     {
         if (!spec.isValid()) return;
-        prepare(spec.sampleRate);
+        prepare(spec.sampleRate, spec.numChannels);
     }
 
     /**
@@ -228,6 +239,32 @@ public:
         updateCoefficients();
     }
 
+    /**
+     * @brief Sets the lookahead: the audio is delayed so the gain moves ahead
+     *        of it. 0 (default) is latency-free.
+     *
+     * RT-safe publication, consumed at the next block; change it while
+     * stopped (a live change jumps the delay and may click). Report
+     * getLatency() to the host for delay compensation.
+     *
+     * @param ms Lookahead in milliseconds, clamped to [0, 10]. Non-finite
+     *           values are ignored.
+     */
+    void setLookahead(T ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        lookaheadMs_.store(std::clamp(ms, T(0), static_cast<T>(kMaxLookaheadMs)), std::memory_order_relaxed);
+    }
+
+    /** @brief Returns the lookahead in milliseconds. */
+    [[nodiscard]] T getLookahead() const noexcept { return lookaheadMs_.load(std::memory_order_relaxed); }
+
+    /** @brief Latency in samples (the lookahead), correct right after setLookahead(). */
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        return lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
+    }
+
     // -- Queries -------------------------------------------------------------
 
     /** @return The current state of the expander's logic gate.
@@ -260,6 +297,7 @@ public:
 
         std::fill(scHpfState_.begin(), scHpfState_.end(), T(0));
         std::fill(scHpfPrev_.begin(), scHpfPrev_.end(), T(0));
+        for (auto& line : lookahead_) line.reset();
     }
 
 
@@ -278,6 +316,7 @@ public:
         w.write("rangeDb", static_cast<float>(rangeDb_.load(std::memory_order_relaxed)));
         w.write("scHpf", scHpfEnabled_.load(std::memory_order_relaxed));
         w.write("scHpfFreq", static_cast<float>(scHpfFreqHz_.load(std::memory_order_relaxed)));
+        w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -295,6 +334,7 @@ public:
         setRange(static_cast<T>(r.read("rangeDb", -80.0f)));
         setSidechainHPF(r.read("scHpf", false),
                         static_cast<double>(r.read("scHpfFreq", 80.0f)));
+        setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         return true;
     }
 
@@ -313,6 +353,14 @@ protected:
         cachedDetRelCoeff_  = detRelCoeff_.load(std::memory_order_relaxed);
         cachedScHpfCoeff_   = scHpfCoeff_.load(std::memory_order_relaxed);
         cachedScHpfA0_      = scHpfA0_.load(std::memory_order_relaxed);
+        cachedLookahead_    = lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
+    }
+
+    /** Lookahead in samples for a ms value (shared by cacheParams() and getLatency()). */
+    [[nodiscard]] int lookaheadSamplesFor(T ms) const noexcept
+    {
+        const double samples = std::round(static_cast<double>(ms) * sampleRate_ / 1000.0);
+        return std::clamp(static_cast<int>(std::min(samples, 1.0e9)), 0, maxLookaheadSamples_);
     }
 
     /**
@@ -368,10 +416,17 @@ protected:
             updateStateMachine(levelDb);
             T gain = computeGain(levelDb);
 
-            // 4. Apply Gain
+            // 4. Apply Gain (to the lookahead-delayed audio when enabled)
             for (int ch = 0; ch < nCh; ++ch)
             {
-                buffer.getChannel(ch)[i] *= gain;
+                T& x = buffer.getChannel(ch)[i];
+                if (cachedLookahead_ > 0 && ch < lookaheadChannels_)
+                {
+                    auto& line = lookahead_[static_cast<size_t>(ch)];
+                    line.push(x);
+                    x = line.read(cachedLookahead_);
+                }
+                x *= gain;
             }
         }
 
@@ -495,6 +550,14 @@ protected:
     static constexpr int MAX_CHANNELS = 16;
     std::array<T, MAX_CHANNELS> scHpfState_{};
     std::array<T, MAX_CHANNELS> scHpfPrev_{};
+
+    // Lookahead (audio delayed; detection runs on the undelayed signal).
+    static constexpr double kMaxLookaheadMs = 10.0;
+    std::atomic<T> lookaheadMs_ { T(0) };
+    int cachedLookahead_ = 0;        ///< Audio-side samples (per block).
+    int maxLookaheadSamples_ = 0;    ///< Allocated delay (0 before prepare()).
+    int lookaheadChannels_ = 0;      ///< Channels with a prepared delay line.
+    std::array<RingBuffer<T>, MAX_CHANNELS> lookahead_ {};
 
     std::atomic<T> attackCoeff_ { T(0) };
     std::atomic<T> releaseCoeff_ { T(0) };

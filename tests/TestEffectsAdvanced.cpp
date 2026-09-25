@@ -767,6 +767,46 @@ DSPARK_TEST(DynamicEQ_oversampling_is_configurable_and_reported)
 // detector froze at zero and the WHOLE programme was muted to the range
 // (-40 dB measured on loud bursts), and processing before prepare() hard-muted
 // (smoothing coefficients were zero, freezing the gain at 0).
+// Same onset problem as the gate: from the expanded (closed) state the gain
+// climbs with the attack only once the burst is detected, so its first
+// millisecond is chopped. Lookahead delays the audio past that ramp.
+DSPARK_TEST(Expander_lookahead_keeps_the_transient_onset)
+{
+    auto onsetDb = [](float lookaheadMs, int& latency) {
+        Expander<float> e;
+        e.prepare(48000.0, 1);
+        e.setThreshold(-40.0f);
+        e.setRatio(8.0f);
+        e.setAttack(1.0f);
+        e.setLookahead(lookaheadMs);
+        latency = e.getLatency();
+        const int n0 = 9600, n = 14400;
+        std::vector<float> x(static_cast<size_t>(n), 0.0f);
+        for (int i = n0; i < n; ++i)
+            x[static_cast<size_t>(i)] = 0.5f * std::sin(6.2831853f * 1000.0f * (i - n0) / 48000.0f);
+        std::vector<float> y = x;
+        for (int off = 0; off < n; off += 256)
+        {
+            float* p[1] = { y.data() + off };
+            e.processBlock(AudioBufferView<float>(p, 1, std::min(256, n - off)));
+        }
+        double eIn = 0.0, eOut = 0.0;
+        for (int k = 0; k < 48; ++k)
+        {
+            eIn += static_cast<double>(x[static_cast<size_t>(n0 + k)]) * x[static_cast<size_t>(n0 + k)];
+            eOut += static_cast<double>(y[static_cast<size_t>(n0 + latency + k)]) * y[static_cast<size_t>(n0 + latency + k)];
+        }
+        return 10.0 * std::log10(eOut / eIn);
+    };
+    int latency = -1;
+    const double without = onsetDb(0.0f, latency);
+    EXPECT_EQ(latency, 0);
+    const double with = onsetDb(3.0f, latency);
+    EXPECT_EQ(latency, 144);
+    EXPECT_LT(without, -3.0);
+    EXPECT_GT(with, -0.5);
+}
+
 DSPARK_TEST(Expander_invalid_inputs_are_ignored)
 {
     // Before prepare: pass-through, not mute.

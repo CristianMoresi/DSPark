@@ -1747,10 +1747,9 @@ DSPARK_TEST(ModulationRouter_holds_last_value_on_nonfinite_source)
     EXPECT_EQ(out, good); // held, not poisoned
 }
 
-// WaveshapeTable is a memoryless nonlinearity (no ADAA); its docs now state
-// honestly that aliasing is only reduced by oversampling, not by
-// the Hermite table interpolation. Behavioral guard: enabling oversampling must
-// drop the alias floor. Probe: a 9 kHz tone's 5th harmonic (45 kHz) folds to
+// Without ADAA WaveshapeTable is a memoryless nonlinearity: the Hermite table
+// interpolation does not reduce aliasing, oversampling does. Behavioral
+// guard: enabling oversampling must drop the alias floor. Probe: a 9 kHz tone's 5th harmonic (45 kHz) folds to
 // exactly 3 kHz, a bin no true harmonic occupies - pure aliasing there.
 DSPARK_TEST(WaveshapeTable_oversampling_reduces_alias)
 {
@@ -1777,4 +1776,50 @@ DSPARK_TEST(WaveshapeTable_oversampling_reduces_alias)
     };
     const double d1 = aliasDb(1), d4 = aliasDb(4);
     EXPECT_LT(d4, d1 - 6.0);   // oversampling drops the alias bin by >6 dB
+}
+
+// First-order ADAA with a tabulated antiderivative. On the identity curve it
+// must reduce to the exact two-sample mean (which pins the tabulation), start
+// cleanly after a reset, and on a driven hard clip it must lower the 3 kHz
+// alias bin well below what 2x oversampling alone reaches.
+DSPARK_TEST(WaveshapeTable_adaa_is_exact_and_lowers_the_alias_floor)
+{
+    WaveshapeTable<double> id;
+    id.buildFromFunction([](double x) { return x; });
+    id.setAntialiasing(true);
+    EXPECT_TRUE(id.isAntialiasingEnabled());
+    std::vector<double> in(64), out(64);
+    for (int i = 0; i < 64; ++i) in[static_cast<size_t>(i)] = 0.7 * std::sin(0.9 * i) + 0.2 * std::cos(2.3 * i);
+    out = in;
+    double* p[1] = { out.data() };
+    id.processBlock(AudioBufferView<double>(p, 1, 64));
+    EXPECT_NEAR(out[0], in[0], 1e-12);     // primed: no average with a stale zero
+    double worst = 0.0;
+    for (int i = 1; i < 64; ++i)
+        worst = std::max(worst, std::abs(out[static_cast<size_t>(i)]
+                                         - 0.5 * (in[static_cast<size_t>(i)] + in[static_cast<size_t>(i - 1)])));
+    EXPECT_LT(worst, 1e-9);
+
+    const double fs = 48000.0, f0 = 9000.0, amp = 0.9;
+    const int N = 48000;
+    auto aliasDb = [&](bool adaa) {
+        WaveshapeTable<double> ws; ws.buildHardClip(0.8);
+        ws.prepare(spec(fs, 512, 1));
+        ws.setOversampling(2);
+        ws.setAntialiasing(adaa);
+        std::vector<double> x(static_cast<size_t>(N));
+        for (int i = 0; i < N; ++i) x[static_cast<size_t>(i)] = amp * std::sin(twoPi<double> * f0 * i / fs);
+        for (int off = 0; off < N; off += 512)
+        {
+            double* ch[1] = { x.data() + off };
+            ws.processBlock(AudioBufferView<double>(ch, 1, std::min(512, N - off)), 4.0);
+        }
+        const double w = twoPi<double> * 3000.0 / fs, c = 2.0 * std::cos(w);
+        double s1 = 0, s2 = 0;
+        for (int i = 4800; i < N; ++i) { const double s0 = x[static_cast<size_t>(i)] + c * s1 - s2; s2 = s1; s1 = s0; }
+        const double mag = 2.0 * std::sqrt((s1 - s2 * std::cos(w)) * (s1 - s2 * std::cos(w)) + (s2 * std::sin(w)) * (s2 * std::sin(w))) / (N - 4800);
+        return 20.0 * std::log10(std::max(mag / amp, 1e-12));
+    };
+    const double plain = aliasDb(false), adaa = aliasDb(true);
+    EXPECT_LT(adaa, plain - 10.0);
 }

@@ -571,7 +571,8 @@
  * @section oversampling Integrated Oversampling
  *
  * `Saturation` and `WaveshapeTable` support integrated oversampling to reduce
- * aliasing from harmonic generation. Just call `setOversampling()`:
+ * aliasing from harmonic generation. Just call `setOversampling()`; both also
+ * offer first-order antiderivative anti-aliasing (`setAntialiasing()`) on top:
  *
  * ```cpp
  * dspark::Saturation<float> sat;
@@ -580,10 +581,11 @@
  * sat.process(buffer);     // Automatically upsamples -> saturates -> downsamples
  *
  * dspark::WaveshapeTable<float> shaper;
- * shaper.buildTanh(3.0f);
+ * shaper.buildTanh();
  * shaper.prepare(spec);
  * shaper.setOversampling(4);
- * shaper.processBlock(buffer);  // Same: upsample -> shape -> downsample
+ * shaper.setAntialiasing(true);
+ * shaper.processBlock(buffer, 3.0f);  // drive 3: upsample -> shape -> downsample
  * ```
  *
  * @section progressive_disclosure Progressive Disclosure API

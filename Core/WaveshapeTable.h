@@ -15,12 +15,16 @@
  * curve creates harmonics above Nyquist that fold back as aliasing exactly
  * like any waveshaper. The Hermite interpolation only reduces the error of
  * reading BETWEEN table entries (table-interpolation/quantization noise) - it
- * does NOT and cannot reduce harmonic aliasing, and this class carries no ADAA
- * (antiderivative anti-aliasing) term. To suppress aliasing, enable the built
- * in oversampling (setOversampling: factor 1 = off, and 2/4/8/16 supported;
- * getLatency() reports the group delay it adds, 0 when off) or oversample the
- * surrounding chain. A finer table lowers interpolation noise but leaves the
- * alias floor unchanged.
+ * does NOT reduce harmonic aliasing. Two tools do, and they combine:
+ * - the built-in oversampling (setOversampling: factor 1 = off, and 2/4/8/16
+ *   supported; getLatency() reports the group delay it adds, 0 when off);
+ * - first-order antiderivative anti-aliasing on processBlock()
+ *   (setAntialiasing(), after Parker et al. DAFx-16 and Bilbao et al. 2017,
+ *   with the antiderivative tabulated exactly from the interpolated curve so
+ *   it works for any function, cf. Chowdhury, "Practical Considerations for
+ *   Antiderivative Anti-Aliasing", 2020).
+ * A finer table lowers interpolation noise but leaves the alias floor
+ * unchanged.
  *
  * @note **Thread Safety & Real-Time Constraints:**
  * The `build...()` and `setOversampling()` methods allocate memory. They MUST
@@ -41,6 +45,7 @@
 #include "Interpolation.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <functional>
@@ -111,6 +116,16 @@ public:
         table_[0] = table_[1];
         table_[static_cast<size_t>(tableSize + 1)] = table_[static_cast<size_t>(tableSize)];
         table_[static_cast<size_t>(tableSize + 2)] = table_[static_cast<size_t>(tableSize)];
+
+        // Antiderivative at every knot, integrating the interpolated curve
+        // segment by segment (exact for the Hermite cubic), in double: the
+        // ADAA difference quotient cancels most of its digits.
+        step_ = 2.0 * static_cast<double>(xMax_) / static_cast<double>(tableSize - 1);
+        integral_.assign(static_cast<size_t>(tableSize), 0.0);
+        for (int i = 0; i + 1 < tableSize; ++i)
+            integral_[static_cast<size_t>(i + 1)] = integral_[static_cast<size_t>(i)]
+                                                  + step_ * segmentIntegral(i + 1, 1.0);
+        resetAntialiasing();
     }
 
     /**
@@ -255,27 +270,59 @@ public:
      */
     void processBlock(AudioBufferView<T> buffer, T preGain = T(1), T postGain = T(1)) noexcept
     {
+        const bool adaa = antialias_;
+
+        auto shape = [&](T* data, int n, int ch) {
+            if (adaa && ch < kAntialiasChannels)
+                processAntialiased(data, n, preGain, postGain, ch);
+            else
+                process(data, n, preGain, postGain);
+        };
+
         if (oversamplingFactor_ > 1 && oversampler_)
         {
             auto upView = oversampler_->upsample(buffer);
             for (int ch = 0; ch < upView.getNumChannels(); ++ch)
-            {
-                process(upView.getChannel(ch), upView.getNumSamples(), preGain, postGain);
-            }
+                shape(upView.getChannel(ch), upView.getNumSamples(), ch);
             oversampler_->downsample(buffer);
         }
         else
         {
             for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
-            {
-                process(buffer.getChannel(ch), buffer.getNumSamples(), preGain, postGain);
-            }
+                shape(buffer.getChannel(ch), buffer.getNumSamples(), ch);
         }
     }
+
+    /**
+     * @brief Enables first-order antiderivative anti-aliasing (ADAA) in
+     *        processBlock().
+     *
+     * Each output is the mean of the curve over the segment between two
+     * consecutive (driven) inputs, (F(x[n]) - F(x[n-1])) / (x[n] - x[n-1]),
+     * which suppresses the harmonics that would fold back. It shifts the
+     * signal by half a sample at the processing rate (not reported by
+     * getLatency()) and, like any first-order ADAA, averages adjacent samples:
+     * at 1x that rolls off the top octave (-11.7 dB at 20 kHz @ 48 kHz), so
+     * combine it with setOversampling(2) or more (-2.0 dB at 2x, -0.5 dB at
+     * 4x). The first 16 channels are anti-aliased; further channels run the
+     * plain memoryless curve. The per-sample process() overloads stay
+     * memoryless. Owner-managed like the other setters: call it from the
+     * processing thread or while no process call is running. Enabling starts
+     * each channel from its next input (no stale history, no click).
+     */
+    void setAntialiasing(bool enabled) noexcept
+    {
+        if (enabled && !antialias_) resetAntialiasing();
+        antialias_ = enabled;
+    }
+
+    /** @brief True when processBlock() applies ADAA. */
+    [[nodiscard]] bool isAntialiasingEnabled() const noexcept { return antialias_; }
 
     void reset() noexcept
     {
         if (oversampler_) oversampler_->reset();
+        resetAntialiasing();
     }
 
     [[nodiscard]] int getTableSize() const noexcept { return tableSize_; }
@@ -295,7 +342,83 @@ public:
     }
 
 private:
+    static constexpr int kAntialiasChannels = 16;
+
+    /** Integral over [0, u] (u in [0, 1]) of the Hermite segment starting at
+     *  padded table index i (knot i - 1), in units of one table step. */
+    [[nodiscard]] double segmentIntegral(int i, double u) const noexcept
+    {
+        const double y0 = table_[static_cast<size_t>(i - 1)];
+        const double y1 = table_[static_cast<size_t>(i)];
+        const double y2 = table_[static_cast<size_t>(i + 1)];
+        const double y3 = table_[static_cast<size_t>(i + 2)];
+        // Same coefficients as interpolateHermite(): ((a u - b) u + c) u + y1.
+        const double c = (y2 - y0) * 0.5;
+        const double v = y1 - y2;
+        const double w = c + v;
+        const double a = w + v + (y3 - y1) * 0.5;
+        const double b = w + a;
+        return (((a * 0.25 * u - b / 3.0) * u + c * 0.5) * u + y1) * u;
+    }
+
+    /** Antiderivative of the effective curve f(clamp(x, -xMax, xMax)): the
+     *  tabulated integral inside the table, linear continuation outside. */
+    [[nodiscard]] double antiderivative(double x) const noexcept
+    {
+        const double xMax = static_cast<double>(xMax_);
+        const int last = tableSize_ - 1;
+        if (x >= xMax)
+            return integral_[static_cast<size_t>(last)]
+                 + static_cast<double>(table_[static_cast<size_t>(last + 1)]) * (x - xMax);
+        if (x <= -xMax)
+            return static_cast<double>(table_[1]) * (x + xMax);
+        const double pos = (x + xMax) / step_;
+        const int idx = std::min(static_cast<int>(pos), last - 1);
+        return integral_[static_cast<size_t>(idx)] + step_ * segmentIntegral(idx + 1, pos - idx);
+    }
+
+    void processAntialiased(T* data, int numSamples, T preGain, T postGain, int ch) noexcept
+    {
+        // Out-of-range drive keeps its finite linear continuation; NaN lands
+        // on the upper edge, as in process().
+        const double limit = 1.0e3 * static_cast<double>(xMax_);
+        const auto c = static_cast<size_t>(ch);
+        double x0 = adaaX_[c];
+        double f0 = adaaF_[c];
+        const double post = static_cast<double>(postGain);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const double x = std::max(-limit, std::min(limit, static_cast<double>(data[i] * preGain)));
+            const double f = antiderivative(x);
+            if (!adaaPrimed_[c]) // first input after a reset: nothing to average with yet
+            {
+                x0 = x;
+                f0 = f;
+                adaaPrimed_[c] = true;
+            }
+            const double dx = x - x0;
+            double y;
+            if (std::abs(dx) > 1.0e-6)
+                y = (f - f0) / dx;
+            else // ill-conditioned: the mean over a vanishing segment is its midpoint value
+                y = static_cast<double>(process(static_cast<T>(0.5 * (x + x0))));
+            data[i] = static_cast<T>(y * post);
+            x0 = x;
+            f0 = f;
+        }
+        adaaX_[c] = x0;
+        adaaF_[c] = f0;
+    }
+
+    void resetAntialiasing() noexcept { adaaPrimed_.fill(false); }
+
     std::vector<T> table_;
+    std::vector<double> integral_;  ///< Antiderivative at each knot (ADAA).
+    double step_ = 1.0;             ///< Knot spacing in input units.
+    bool antialias_ = false;
+    std::array<double, kAntialiasChannels> adaaX_ {};   ///< Previous driven input per channel.
+    std::array<double, kAntialiasChannels> adaaF_ {};   ///< Its antiderivative.
+    std::array<bool, kAntialiasChannels> adaaPrimed_ {};
     int tableSize_ = 0;
     T xMax_ = T(8);                 ///< Half-range of the table input domain.
     T invRange_ = T(1) / T(16);     ///< Precomputed 1 / (2 * xMax).

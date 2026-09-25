@@ -249,7 +249,9 @@ public:
         StateReader r(data, size);
         if (!r.isValid() || r.processorId() != stateId("DEES")) return false;
         setFrequency(static_cast<T>(r.read("frequency", 7000.0f)));
-        setBandwidth(static_cast<T>(r.read("bandwidth", 2.0f)));
+        // Missing key: the constructor default, Q = 2 (0.714 octaves). The
+        // fallback used to be 2 octaves, a different filter.
+        setBandwidth(static_cast<T>(r.read("bandwidth", 0.7140373f)));
         setThreshold(static_cast<T>(r.read("threshold", -20.0f)));
         setReduction(static_cast<T>(r.read("reduction", 12.0f)));
         setAttack(static_cast<T>(r.read("attack", 0.5f)));

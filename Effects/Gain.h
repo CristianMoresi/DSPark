@@ -62,7 +62,7 @@ public:
      */
     void prepare(double sampleRate, double rampTimeMs = 10.0)
     {
-        if (!(sampleRate > 0.0) || !std::isfinite(rampTimeMs)) return;
+        if (!(sampleRate > 0.0) || !std::isfinite(sampleRate) || !std::isfinite(rampTimeMs)) return;
         sampleRate_ = sampleRate;
         rampTimeMs_.store(std::max(0.0, rampTimeMs), std::memory_order_relaxed);
 

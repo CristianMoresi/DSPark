@@ -105,6 +105,7 @@ public:
         delays_.resize(numChannels_);
         phasors_.resize(numChannels_);
         modPhasors_.resize(numChannels_);
+        readPos_.assign(static_cast<size_t>(numChannels_), T(-1));
 
         for (int ch = 0; ch < numChannels_; ++ch)
         {
@@ -135,11 +136,11 @@ public:
         const T modRate = modRate_.load(std::memory_order_relaxed);
         const T targetModDepth = modDepth_.load(std::memory_order_relaxed);
 
-        // Parameter smoothing increments (linear ramp over the block). The FM
-        // depth is smoothed too: it scales the instantaneous rate, and the
-        // deviation and centre follow that rate, so an unsmoothed step would
-        // jump the delay-line read position by hundreds of samples (a hard
-        // click). The FM rate needs no smoothing: it only changes the speed
+        // Parameter smoothing increments (linear ramp over the block). Rate
+        // and depth set the width and centre of the delay sweep; the read
+        // position slew limit below turns even a large change into a brief
+        // glide. The FM depth is ramped too, so the LFO speed changes
+        // smoothly. The FM rate needs no smoothing: it only changes the speed
         // of a continuous phase, which cannot produce a discontinuity.
         const T rateInc = (targetRate - currentRate_) / static_cast<T>(numSamples);
         const T depthInc = (targetDepth - currentDepth_) / static_cast<T>(numSamples);
@@ -176,49 +177,47 @@ public:
 
                 delay.push(data[i]);
 
-                T effectiveRate = std::max(smoothRate, T(0.01));
+                // Sweep geometry from the smoothed base rate only: a sinusoidal
+                // delay centre + D * sin(phase) peaks at a pitch excursion of
+                // D * 2*pi*f/fs, so D = depth * deviationScaler / rate gives
+                // the set depth at the base rate, and the centre sits one
+                // deviation above the offset so the trough never dips below
+                // it. FM used to feed its instantaneous rate into D and the
+                // centre (D ~ rate^-1.5): at deep or fast FM the rate neared
+                // the floor and the read point leapt by hundreds of samples
+                // per sample (noise, not vibrato).
+                const T baseRate = std::max(smoothRate, T(0.1));
+                const T deviation = (smoothDepth * deviationScaler) / baseRate;
+                const T centre = deviation + kCentreOffset;
 
-                // Secondary LFO (FM)
-                T fmMod = T(0);
+                // FM varies only the speed of the LFO, between (1 - modDepth)
+                // and (1 + modDepth) times the rate, so the pitch excursion
+                // follows the instantaneous speed: up to twice the depth at
+                // full FM, and never a jump.
+                T speed = T(1);
                 if (fmActive)
-                {
-                    T modPhase = modPhasor.advance();
-                    fmMod = fastSin(modPhase * kTwoPi) * smoothModDepth;
-                }
+                    speed += fastSin(modPhasor.advance() * kTwoPi) * smoothModDepth;
+                phasor.setFrequency(baseRate * std::max(speed, T(0)));
+                const T lfo = fastSin(phasor.advance() * kTwoPi);
 
-                // Floor at 0.1 Hz - the same minimum the delay-line sizing in
-                // prepare() assumes. A lower floor (0.01) let deep FM request
-                // deviations ~100x the allocated buffer (wrapped garbage audio).
-                T instantRate = std::max(effectiveRate * (T(1) + fmMod), T(0.1));
+                // Safety clamp: the 4-point interpolator reads one sample
+                // earlier and two later, hence [1, cap - 4].
+                const T delaySamples = std::clamp(centre + lfo * deviation, T(1.0),
+                                                  static_cast<T>(delay.getCapacity() - 4));
 
-                // Advance primary phasor manually using the instantaneous FM rate
-                phasor.setFrequency(instantRate);
-                T phase = phasor.advance();
+                // Read-position slew limit. Depth and rate scale the deviation
+                // and centre, so a parameter change moves the read point;
+                // ramped per block, a small block moved it by hundreds of
+                // samples at once (a click, or a backwards read). Limiting the
+                // motion to 0.5 samples per sample bounds any parameter jump
+                // to a brief pitch glide, and never touches the vibrato itself
+                // (its steepest motion, 4 semitones at full FM, is
+                // 2 * 4 * ln2 / 12 = 0.46 samples per sample).
+                T& pos = readPos_[static_cast<size_t>(ch)];
+                pos = (pos < T(0)) ? delaySamples
+                                   : pos + std::clamp(delaySamples - pos, -kMaxReadSlope, kMaxReadSlope);
 
-                // Inverse square-root coupling: the peak pitch excursion is
-                // proportional to deviation * instantRate, so dividing the
-                // depth by sqrt(instantRate / effectiveRate) lets the
-                // perceived depth shrink gently (as 1/sqrt) while FM raises
-                // the rate, instead of staying rigidly constant or growing
-                // wildly. The per-sample sqrt is the price of that coupling.
-                T ratioSqrt = std::sqrt(instantRate / effectiveRate);
-                T adjustedDepth = smoothDepth / ratioSqrt;
-
-                // Final deviation; the centre sits one deviation above the
-                // offset so the trough of the sweep never dips below it.
-                T deviation = (adjustedDepth * deviationScaler) / instantRate;
-                T centre = deviation + kCentreOffset;
-
-                T lfo = fastSin(phase * kTwoPi);
-
-                // Safety clamp: deep FM can still push the deviation past the
-                // allocation (it grows with sqrt(effectiveRate / instantRate),
-                // unbounded in the primary rate). The 4-point interpolator
-                // reads one sample earlier and two later, hence [1, cap - 4].
-                T delaySamples = std::clamp(centre + lfo * deviation, T(1.0),
-                                            static_cast<T>(delay.getCapacity() - 4));
-
-                data[i] = delay.readInterpolated(delaySamples);
+                data[i] = delay.readInterpolated(pos);
             }
         }
 
@@ -241,6 +240,7 @@ public:
             phasors_[ch].reset();
             modPhasors_[ch].reset();
         }
+        std::fill(readPos_.begin(), readPos_.end(), T(-1)); // re-seed on the next sample
     }
 
     /**
@@ -286,10 +286,11 @@ public:
     /**
      * @brief Sets the intensity of the FM modulation on the primary LFO.
      *
-     * Smoothed internally: the FM depth scales the instantaneous rate (and
-     * with it the deviation and centre of the delay sweep), so an unsmoothed
-     * step would jump the read position audibly. While the depth is zero the
-     * FM oscillator holds its phase.
+     * FM varies the speed of the vibrato LFO between (1 - amount) and
+     * (1 + amount) times the rate; the delay sweep keeps the width that depth
+     * and rate set, so the pitch excursion follows the instantaneous speed
+     * (up to twice the depth at full FM). Smoothed internally. While the
+     * depth is zero the FM oscillator holds its phase.
      *
      * @param amount 0.0 (off) to 1.0 (full modulation), clamped. Non-finite
      * values are ignored.
@@ -334,6 +335,8 @@ private:
     /// Headroom below the sweep trough so the 4-point interpolator's earliest
     /// tap always reads a written sample.
     static constexpr T kCentreOffset = T(4);
+    /// Largest read-position change per sample (see processBlock()).
+    static constexpr T kMaxReadSlope = T(0.5);
 
     double sampleRate_ = 44100.0;
     int numChannels_ = 0;
@@ -353,6 +356,7 @@ private:
     std::vector<RingBuffer<T>> delays_;
     std::vector<Phasor<T>> phasors_;
     std::vector<Phasor<T>> modPhasors_;
+    std::vector<T> readPos_;   ///< Slew-limited read position per channel (-1 = unseeded).
 };
 
 } // namespace dspark

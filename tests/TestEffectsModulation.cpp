@@ -1026,6 +1026,50 @@ DSPARK_TEST(Vibrato_mod_depth_change_is_click_free)
     EXPECT_TRUE(down < 0.15f); // old build: 1.18
 }
 
+DSPARK_TEST(Vibrato_read_point_never_jumps)
+{
+    // Deep or fast FM fed its instantaneous rate into the sweep width and
+    // centre (width ~ rate^-1.5): near the rate floor the read point leapt by
+    // hundreds of samples per sample (measured 530 at depth 4, full FM at
+    // 8 Hz: noise, not vibrato). And a rate change ramped per block moved the
+    // centre by thousands of samples within one small block. Now FM only
+    // varies the LFO speed, and the read point moves at most 0.5 samples per
+    // sample, so a 100 Hz tone can never step by more than 1.5x its own slope.
+    auto maxStep = [](auto configure, auto change) {
+        Vibrato<float> vib;
+        configure(vib);
+        vib.prepare(spec(48000.0, 32, 1));
+        std::vector<float> x(32);
+        float prev = 0.0f, worst = 0.0f;
+        for (int b = 0; b < 3 * 1500; ++b)          // 3 s in 32-sample blocks
+        {
+            if (b == 1500) change(vib);
+            for (int i = 0; i < 32; ++i)
+                x[static_cast<size_t>(i)] = 0.5f * std::sin(6.2831853f * 100.0f * static_cast<float>(b * 32 + i) / 48000.0f);
+            float* p[1] = { x.data() };
+            vib.processBlock(AudioBufferView<float>(p, 1, 32));
+            for (int i = 0; i < 32; ++i)
+            {
+                if (b > 200) worst = std::max(worst, std::abs(x[static_cast<size_t>(i)] - prev));
+                prev = x[static_cast<size_t>(i)];
+            }
+        }
+        return worst;
+    };
+    const float toneSlope = 0.5f * 6.2831853f * 100.0f / 48000.0f;   // 0.0065
+
+    // Depth 4 at full FM: the pitch sweep peaks at 8 semitones (speed 1.46).
+    const float fm = maxStep([](auto& v) { v.setRate(5.0f); v.setDepth(4.0f);
+                                           v.setModRate(8.0f); v.setModDepth(1.0f); },
+                             [](auto&) {});
+    EXPECT_LT(fm, toneSlope * 1.5f);
+
+    // A rate jump 5 Hz -> 0.2 Hz moves the sweep centre by ~4200 samples.
+    const float jump = maxStep([](auto& v) { v.setRate(5.0f); v.setDepth(2.0f); },
+                               [](auto& v) { v.setRate(0.2f); });
+    EXPECT_LT(jump, toneSlope * 1.55f);
+}
+
 // ============================================================================
 // RingModulator
 // ============================================================================

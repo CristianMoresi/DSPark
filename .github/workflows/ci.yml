@@ -526,7 +526,7 @@ jobs:
 
       # Concurrency claims come from the named threaded tests printed by this
       # exact run; executing a single-threaded case under TSan is not presented
-      # as proof of a hand-off. The ordinary suite authority is currently 911
+      # as proof of a hand-off. The ordinary suite authority is currently 912
       # named cases, with specialized allocation and Reverb publication tests
       # kept in separate CTest executables so their process-wide hooks do not
       # weaken sanitizer coverage in the ordinary suite.

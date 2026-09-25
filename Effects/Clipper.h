@@ -21,6 +21,9 @@
  *    unprepared instance passes audio through untouched.
  *  - Parameter setters/getters (setMode, setCeiling, ...): std::atomic based,
  *    safe from any thread during playback. Non-finite values are ignored.
+ *    Input gain and ceiling glide linearly over 20 ms at the processing rate
+ *    (they used to step once per block, zippering under automation); values
+ *    set before prepare() apply from the first sample.
  *  - getState()/setState(): setup/UI threads (getState allocates).
  *  - getGainReductionDb(): metering-style read, safe from any thread.
  *
@@ -34,7 +37,7 @@
  * when broadcast compliance is required.
  *
  * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/DspMath.h,
- * Core/DryWetMixer.h, Core/Oversampling.h, Core/StateBlob.h.
+ * Core/DryWetMixer.h, Core/Oversampling.h, Core/SmoothedValue.h, Core/StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -42,9 +45,11 @@
 #include "../Core/DspMath.h"
 #include "../Core/DryWetMixer.h"
 #include "../Core/Oversampling.h"
+#include "../Core/SmoothedValue.h"
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cmath>
@@ -112,6 +117,15 @@ public:
         // dry/wet blend below 100% does not comb-filter.
         mixer_.setLatencyCompensation(oversampler_ ? oversampler_->getLatency() : 0);
 
+        // Parameter glides run at the processing (possibly oversampled) rate.
+        const double procRate = spec.sampleRate * (oversampler_ ? oversampler_->getFactor() : 1);
+        for (auto* sm : { &stageGainSm_, &ceilingSm_ })
+        {
+            sm->prepare(procRate, kParamRampMs);
+            sm->setSmoothingType(SmoothedValue<T>::SmoothingType::Linear);
+        }
+        snapParameters();
+
         for (int ch = 0; ch < kMaxChannels; ++ch)
             slewPrev_[ch] = T(0);
 
@@ -130,6 +144,7 @@ public:
         if (oversampler_) oversampler_->reset();
         for (int ch = 0; ch < kMaxChannels; ++ch)
             slewPrev_[ch] = T(0);
+        snapParameters();
         gainReductionDb_.store(T(0), std::memory_order_relaxed);
     }
 
@@ -322,29 +337,38 @@ protected:
         int numStages  = stages_.load(std::memory_order_relaxed);
         T slewMs       = slewLimitMs_.load(std::memory_order_relaxed);
 
-        T ceiling      = dbToLinear(ceilDb);
-        T totalGainLin = dbToLinear(gainDb);
+        ceilingSm_.setTargetValue(dbToLinear(ceilDb));
+        stageGainSm_.setTargetValue(stageGainFor(dbToLinear(gainDb), numStages));
 
-        // Split gain logarithmically across cascaded stages
-        T stageGain    = (numStages > 1)
-                           ? std::pow(totalGainLin, T(1) / static_cast<T>(numStages))
-                           : totalGainLin;
-
-        // Calculate maximum allowed delta per sample based on the physical sample rate
-        T maxSlewDelta = T(0);
-        if (slewMs > T(0)) {
-            maxSlewDelta = (ceiling / (slewMs * T(0.001))) / static_cast<T>(currentSampleRate);
-        }
+        // Maximum slew per sample is ceiling * slewScale (time-aware).
+        const T slewScale = (slewMs > T(0))
+            ? T(1) / (slewMs * T(0.001)) / static_cast<T>(currentSampleRate)
+            : T(0);
 
         // The mode switch is resolved once per block, outside the sample loop.
         switch (modeVal)
         {
-            case Mode::Hard:        dispatchClipping<Mode::Hard>(buffer, totalGainLin, stageGain, numStages, ceiling, maxSlewDelta); break;
-            case Mode::Soft:        dispatchClipping<Mode::Soft>(buffer, totalGainLin, stageGain, numStages, ceiling, maxSlewDelta); break;
-            case Mode::Analog:      dispatchClipping<Mode::Analog>(buffer, totalGainLin, stageGain, numStages, ceiling, maxSlewDelta); break;
-            case Mode::GoldenRatio: dispatchClipping<Mode::GoldenRatio>(buffer, totalGainLin, stageGain, numStages, ceiling, maxSlewDelta); break;
-            default:                dispatchClipping<Mode::Hard>(buffer, totalGainLin, stageGain, numStages, ceiling, maxSlewDelta); break;
+            case Mode::Hard:        dispatchClipping<Mode::Hard>(buffer, numStages, slewScale); break;
+            case Mode::Soft:        dispatchClipping<Mode::Soft>(buffer, numStages, slewScale); break;
+            case Mode::Analog:      dispatchClipping<Mode::Analog>(buffer, numStages, slewScale); break;
+            case Mode::GoldenRatio: dispatchClipping<Mode::GoldenRatio>(buffer, numStages, slewScale); break;
+            default:                dispatchClipping<Mode::Hard>(buffer, numStages, slewScale); break;
         }
+    }
+
+    /** Gain per stage: the total split logarithmically across the cascade. */
+    [[nodiscard]] static T stageGainFor(T totalGainLin, int numStages) noexcept
+    {
+        return (numStages > 1) ? std::pow(totalGainLin, T(1) / static_cast<T>(numStages))
+                               : totalGainLin;
+    }
+
+    /** Jumps both parameter glides to the current targets (prepare/reset). */
+    void snapParameters() noexcept
+    {
+        ceilingSm_.reset(dbToLinear(ceilingDb_.load(std::memory_order_relaxed)));
+        stageGainSm_.reset(stageGainFor(dbToLinear(inputGainDb_.load(std::memory_order_relaxed)),
+                                        stages_.load(std::memory_order_relaxed)));
     }
 
     /**
@@ -352,7 +376,7 @@ protected:
      * slew state and peak metering keep the loop serial per channel).
      */
     template <Mode M>
-    void dispatchClipping(AudioBufferView<T>& buffer, T totalGainLin, T stageGain, int numStages, T ceiling, T maxSlewDelta) noexcept
+    void dispatchClipping(AudioBufferView<T>& buffer, int numStages, T slewScale) noexcept
     {
         const int nCh = std::min(buffer.getNumChannels(), kMaxChannels);
         const int nS  = buffer.getNumSamples();
@@ -360,34 +384,55 @@ protected:
         T peakIn  = T(0);
         T peakOut = T(0);
 
-        for (int ch = 0; ch < nCh; ++ch)
+        // Chunks: the parameter glides are computed once per sample and shared
+        // by every channel; settled, both are plain constants.
+        for (int start = 0; start < nS; start += kChunk)
         {
-            T* data = buffer.getChannel(ch);
-            for (int i = 0; i < nS; ++i)
+            const int n = std::min(kChunk, nS - start);
+            const bool gliding = stageGainSm_.isSmoothing() || ceilingSm_.isSmoothing();
+            if (gliding)
+                for (int j = 0; j < n; ++j)
+                {
+                    gainRamp_[static_cast<size_t>(j)] = stageGainSm_.getNextValue();
+                    ceilRamp_[static_cast<size_t>(j)] = ceilingSm_.getNextValue();
+                }
+            const T gainConst = stageGainSm_.getCurrentValue();
+            const T ceilConst = ceilingSm_.getCurrentValue();
+
+            for (int ch = 0; ch < nCh; ++ch)
             {
-                T sample = data[i];
-                T driven = sample * totalGainLin;
-
-                // Compiler will unroll this loop for small bounded N
-                for (int s = 0; s < numStages; ++s)
+                T* data = buffer.getChannel(ch) + start;
+                for (int j = 0; j < n; ++j)
                 {
-                    sample *= stageGain;
-                    sample = processSample<M>(sample, ceiling);
+                    const T stageGain = gliding ? gainRamp_[static_cast<size_t>(j)] : gainConst;
+                    const T ceiling   = gliding ? ceilRamp_[static_cast<size_t>(j)] : ceilConst;
+                    T sample = data[j];
+                    T totalGain = stageGain;
+                    for (int s = 1; s < numStages; ++s) totalGain *= stageGain;
+                    const T driven = sample * totalGain;
+
+                    // Compiler will unroll this loop for small bounded N
+                    for (int s = 0; s < numStages; ++s)
+                    {
+                        sample *= stageGain;
+                        sample = processSample<M>(sample, ceiling);
+                    }
+
+                    // Slew Limiter processing (branch highly predictable if static)
+                    const T maxSlewDelta = ceiling * slewScale;
+                    if (maxSlewDelta > T(0))
+                    {
+                        T delta = sample - slewPrev_[ch];
+                        if (std::abs(delta) > maxSlewDelta)
+                            sample = slewPrev_[ch] + std::copysign(maxSlewDelta, delta);
+                    }
+
+                    slewPrev_[ch] = sample;
+
+                    peakIn  = std::max(peakIn, std::abs(driven));
+                    peakOut = std::max(peakOut, std::abs(sample));
+                    data[j] = sample;
                 }
-
-                // Slew Limiter processing (branch highly predictable if static)
-                if (maxSlewDelta > T(0))
-                {
-                    T delta = sample - slewPrev_[ch];
-                    if (std::abs(delta) > maxSlewDelta)
-                        sample = slewPrev_[ch] + std::copysign(maxSlewDelta, delta);
-                }
-
-                slewPrev_[ch] = sample;
-
-                peakIn  = std::max(peakIn, std::abs(driven));
-                peakOut = std::max(peakOut, std::abs(sample));
-                data[i] = sample;
             }
         }
 
@@ -465,6 +510,14 @@ protected:
 
     // History states per channel
     T slewPrev_[kMaxChannels] {};
+
+    // Parameter glides (processing rate) and their per-chunk ramps.
+    static constexpr double kParamRampMs = 20.0;
+    static constexpr int kChunk = 256;
+    SmoothedValue<T> stageGainSm_;
+    SmoothedValue<T> ceilingSm_;
+    std::array<T, kChunk> gainRamp_ {};
+    std::array<T, kChunk> ceilRamp_ {};
 
     // Metering state
     std::atomic<T> gainReductionDb_ { T(0) };

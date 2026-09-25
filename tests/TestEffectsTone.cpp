@@ -2423,6 +2423,39 @@ DSPARK_TEST(Clipper_modes_clip_to_ceiling_and_pass_quiet)
     }
 }
 
+// Input gain and ceiling used to step once per block (a +12 dB drive move
+// jumped straight to 4x at the block edge, zippering under automation). They
+// now glide linearly over 20 ms at the processing rate.
+DSPARK_TEST(Clipper_input_gain_glides_instead_of_stepping)
+{
+    auto c = std::make_unique<Clipper<float>>();
+    c->setMode(Clipper<float>::Mode::Hard);
+    c->prepare(spec(48000.0, 512, 1));
+    auto tb = makeBuffer(1, 512);
+    for (int blk = 0; blk < 12; ++blk)
+    {
+        if (blk == 10) c->setInputGain(12.0f);   // +12 dB, far below clipping
+        for (int i = 0; i < 512; ++i)
+            tb.ch(0)[i] = 0.05f * std::sin(6.2831853f * 441.0f * static_cast<float>(blk * 512 + i) / 48000.0f);
+        std::vector<float> in(tb.ch(0), tb.ch(0) + 512);
+        c->processBlock(tb.view());
+        if (blk == 10)
+        {
+            // Effective gain early in the block: barely moved (old: ~3.98).
+            double num = 0.0, den = 0.0;
+            for (int i = 0; i < 48; ++i) { num += tb.ch(0)[i] * in[static_cast<size_t>(i)]; den += in[static_cast<size_t>(i)] * in[static_cast<size_t>(i)]; }
+            EXPECT_LT(num / den, 1.3);
+        }
+        if (blk == 11)
+        {
+            // 20 ms later (960 samples) the full +12 dB is reached.
+            double num = 0.0, den = 0.0;
+            for (int i = 500; i < 512; ++i) { num += tb.ch(0)[i] * in[static_cast<size_t>(i)]; den += in[static_cast<size_t>(i)] * in[static_cast<size_t>(i)]; }
+            EXPECT_NEAR(num / den, std::pow(10.0, 12.0 / 20.0), 1e-3);
+        }
+    }
+}
+
 // ============================================================================
 // Oversampling-transparency pins and nonlinear defect regression pins
 // ============================================================================

@@ -3293,10 +3293,13 @@ DSPARK_TEST(AlgoReverb_flat_decay_is_exact_in_every_band)
         rev.setDecay(2.0f);
         rev.setHighDecayMultiplier(1.0f);
         rev.setBassDecayMultiplier(1.0f);
-        const auto ir = algoReverbIR(rev, fs, 5.0);
+        std::vector<float> right;
+        const auto ir = algoReverbIR(rev, fs, 5.0, false, &right);
         EXPECT_NEAR(algoReverbT60(ir, fs, 0.0), 2.0, 0.1);
+        // Both channels averaged: a single channel's band estimate varies by
+        // about 10% at 125 Hz (few modes per band), the decay itself does not.
         for (const double band : { 125.0, 1000.0, 4000.0 })
-            EXPECT_NEAR(algoReverbT60(ir, fs, band), 2.0, 0.2);
+            EXPECT_NEAR(0.5 * (algoReverbT60(ir, fs, band) + algoReverbT60(right, fs, band)), 2.0, 0.2);
     }
 }
 
@@ -3422,34 +3425,150 @@ DSPARK_TEST(AlgoReverb_size_changes_glide_without_clicks)
     EXPECT_LT(maxD2, 0.01);
 }
 
+namespace {
+// Normalised squared-envelope of x in a band: a band-pass run forward and
+// backward (zero phase, so the filter's own group delay, much longer at low
+// frequencies, cannot mask the arrival times), a 2 ms moving average, then
+// zero mean and unit variance.
+std::vector<double> algoReverbBandEnvelope(const std::vector<float>& x, double fc)
+{
+    const auto c = BiquadCoeffs::makeBandPass(48000.0, fc, 2.0);
+    std::vector<float> y(x);
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        Biquad<float, 1> f;
+        f.setCoeffsNow(c);
+        for (auto& v : y) v = f.processSample(v, 0);
+        std::reverse(y.begin(), y.end());
+    }
+    std::vector<double> e(x.size());
+    double acc = 0.0;
+    std::vector<double> sq(x.size());
+    for (size_t i = 0; i < x.size(); ++i)
+    {
+        sq[i] = static_cast<double>(y[i]) * y[i];
+        acc += sq[i];
+        if (i >= 96) acc -= sq[i - 96];
+        e[i] = acc;
+    }
+    double mean = 0.0, var = 0.0;
+    for (const double v : e) mean += v;
+    mean /= static_cast<double>(e.size());
+    for (auto& v : e) { v -= mean; var += v * v; }
+    const double sd = std::sqrt(var / static_cast<double>(e.size())) + 1e-30;
+    for (auto& v : e) v /= sd;
+    return e;
+}
+} // namespace
+
 DSPARK_TEST(AlgoReverb_spring_is_dispersive)
 {
-    // Type::Spring is a dispersive spring-tank model: on each round trip
-    // the band edge (~4 kHz) arrives well after the midrange (the chirp).
+    // Type::Spring is a dispersive spring-tank model: on each round trip the
+    // band edge (~4 kHz) arrives after the midrange (the chirp). With six
+    // springs per side the arrivals overlap, so the delay is read from the
+    // cross-correlation of the band envelopes (measured 6.0 ms).
     ARevF rev;
     rev.prepare(spec(48000.0, 256, 2));
     rev.setType(ARevF::Type::Spring);
     rev.setMix(1.0f);
-    const auto ir = algoReverbIR(rev, 48000.0, 0.2);
-    // First-pass envelope peak per band, in the first round trip window.
-    const auto peakMs = [&](double fc)
+    const auto ir = algoReverbIR(rev, 48000.0, 0.15);
+    const auto lo = algoReverbBandEnvelope(ir, 500.0);
+    const auto hi = algoReverbBandEnvelope(ir, 4000.0);
+    const int n = static_cast<int>(ir.size());
+    int bestLag = 0;
+    double best = -1e30;
+    for (int lag = -960; lag <= 960; ++lag)
     {
-        Biquad<float, 1> a, b;
-        const auto c = BiquadCoeffs::makeBandPass(48000.0, fc, 4.0);
-        a.setCoeffsNow(c);
-        b.setCoeffsNow(c);
-        double best = 0.0;
-        int at = 0;
-        double env = 0.0;
-        for (int i = 0; i < static_cast<int>(0.062 * 48000.0); ++i)
+        double c = 0.0;
+        for (int i = std::max(0, -lag); i < std::min(n, n - lag); ++i)
+            c += lo[static_cast<size_t>(i)] * hi[static_cast<size_t>(i + lag)];
+        if (c > best) { best = c; bestLag = lag; }
+    }
+    EXPECT_GT(1000.0 * bestLag / 48000.0, 3.0);
+}
+
+DSPARK_TEST(AlgoReverb_spring_long_decay_is_not_metallic)
+{
+    // A spring loop is a sparse comb, and a long decay lets each mode ring
+    // on its own (the metallic tone). Six jittered springs per side keep the
+    // tail spectrum far smoother: over 200 Hz - 4 kHz of a 4 s tail, the
+    // deviation from its 1/4-octave average measured 25.3 dB rms with a
+    // mode 82 dB proud for two springs, 12.5 dB and 32 dB now.
+    ARevF rev;
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setType(ARevF::Type::Spring);
+    rev.setMix(1.0f);
+    {
+        auto w = makeBuffer(2, 64);
+        rev.processBlock(w.view());
+    }
+    rev.setDecay(4.0f);
+    const auto ir = algoReverbIR(rev, 48000.0, 2.3);
+    constexpr int kN = 131072;
+    std::vector<double> seg(kN, 0.0);
+    const int a = static_cast<int>(0.2 * 48000.0), len = 2 * 48000;
+    for (int i = 0; i < len; ++i)
+    {
+        const double w = 0.5 - 0.5 * std::cos(6.283185307179586 * i / len);
+        seg[static_cast<size_t>(i)] = ir[static_cast<size_t>(a + i)] * w
+            * std::exp(6.907755 * i / 48000.0 / 4.0);   // undo the decay
+    }
+    FFTReal<double> fft(kN);
+    std::vector<double> spec(kN + 2);
+    fft.forward(seg.data(), spec.data());
+    const double df = 48000.0 / kN;
+    const int b0 = static_cast<int>(200.0 / df), b1 = static_cast<int>(4000.0 / df);
+    std::vector<double> db(static_cast<size_t>(b1 + 1));
+    for (int k = b0 / 2; k <= b1; ++k)
+        db[static_cast<size_t>(k)] = 10.0 * std::log10(spec[2 * static_cast<size_t>(k)] * spec[2 * static_cast<size_t>(k)]
+                                    + spec[2 * static_cast<size_t>(k) + 1] * spec[2 * static_cast<size_t>(k) + 1] + 1e-30);
+    // Running 1/4-octave mean in dB (prefix sums).
+    std::vector<double> pre(db.size() + 1, 0.0);
+    for (size_t k = 0; k < db.size(); ++k) pre[k + 1] = pre[k] + db[k];
+    double sq = 0.0, top = -1e30;
+    int count = 0;
+    for (int k = b0; k <= b1; k += 7)
+    {
+        const int lo = std::max(b0 / 2, static_cast<int>(k / 1.09)), hi = std::min(b1, static_cast<int>(k * 1.09));
+        const double mean = (pre[static_cast<size_t>(hi) + 1] - pre[static_cast<size_t>(lo)]) / (hi - lo + 1);
+        const double d = db[static_cast<size_t>(k)] - mean;
+        sq += d * d;
+        top = std::max(top, d);
+        ++count;
+    }
+    EXPECT_LT(std::sqrt(sq / count), 17.0);
+    EXPECT_LT(top, 45.0);
+}
+
+DSPARK_TEST(AlgoReverb_late_bass_is_coherent_between_channels)
+{
+    // A diffuse field is coherent between the ears at low frequencies (the
+    // wavelength dwarfs the head) and decorrelated at high ones. The late
+    // tail's side signal is high-passed at 220 Hz, so the L/R correlation of
+    // the tail measured 0.98 below 100 Hz (0.03 before) and 0.02 above 1 kHz.
+    ARevF rev;
+    algoReverbLateHall(rev, 48000.0);
+    std::vector<float> right;
+    const auto left = algoReverbIR(rev, 48000.0, 1.6, false, &right);
+    const auto corr = [&](bool low)
+    {
+        Biquad<float, 2> f1, f2;
+        const auto c = low ? BiquadCoeffs::makeLowPass(48000.0, 100.0)
+                           : BiquadCoeffs::makeHighPass(48000.0, 1000.0);
+        f1.setCoeffsNow(c);
+        f2.setCoeffsNow(c);
+        double lr = 0.0, ll = 0.0, rr = 0.0;
+        for (size_t i = 0; i < left.size(); ++i)
         {
-            const double y = b.processSample(a.processSample(ir[static_cast<size_t>(i)], 0), 0);
-            env += (y * y - env) * 0.01;
-            if (i > static_cast<int>(0.025 * 48000.0) && env > best) { best = env; at = i; }
+            const double l = f2.processSample(f1.processSample(left[i], 0), 0);
+            const double r = f2.processSample(f1.processSample(right[i], 1), 1);
+            if (i < 4800) continue;
+            lr += l * r; ll += l * l; rr += r * r;
         }
-        return 1000.0 * at / 48000.0;
+        return lr / std::sqrt(ll * rr + 1e-30);
     };
-    EXPECT_GT(peakMs(4000.0) - peakMs(500.0), 5.0);
+    EXPECT_GT(corr(true), 0.8);
+    EXPECT_LT(std::abs(corr(false)), 0.2);
 }
 
 // ============================================================================

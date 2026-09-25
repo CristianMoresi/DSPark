@@ -14,13 +14,13 @@
  *   |                               |
  * [Pre-delay]                     [Pre-delay]
  *   |                               |
+ *   +--> [Early reflections: velvet-noise taps per side, density rising
+ *   |     with time; the first few discrete (raw input), the rest from the
+ *   |     diffused feed; ipsilateral early, diffuse later; grouped air/wall
+ *   |     absorption]
+ *   |
  * [Input diffusion: 4 allpass]    [Input diffusion: 4 allpass, other delays]
  *   |                               |
- *   +---- diffused rings (L, R) ----+
- *   |                               |
- *   +--> [Early reflections: ipsilateral + contralateral taps per side,
- *   |     grouped air/wall absorption, lateralised early, diffuse late]
- *   |
  *   +--> [Late injection: one tap per line, L/R interleaved, after the
  *   |     ER-to-late gap]
  *   |       |
@@ -34,17 +34,23 @@
  *   |      +- safety soft limit, write back + injection
  *   |       |
  *   |       v
- *   |    [Output: orthogonal L/R sign sums -> output diffusion -> width]
+ *   |    [Output: orthogonal L/R sign sums -> coherent low band -> width]
  *   v
  * [Early + late] -> [DC block] -> [Tone EQ] -> DryWetMixer -> Output
  * ```
- * Type::Spring replaces the FDN with two spring tanks (see runSprings()).
+ * Type::Spring replaces the FDN with twelve spring tanks (see runSprings()).
  *
  * Design notes:
  * - **True stereo.** Each input channel has its own pre-delay, diffusion and
  *   early reflections, so a left source stays on the left in the early field
  *   while the late tail becomes diffuse (early taps start lateralised and
  *   blend toward equal L/R as they get later, like a real room).
+ * - **Realistic early field.** The early reflections are a velvet-noise
+ *   sequence (Valimaki et al.): sparse +-1 taps whose density rises with
+ *   time, like a room's echo density, spectrally flat and free of the
+ *   periodic ring of chained allpasses. setDiffusion() moves the split
+ *   between the first discrete reflections (crisp, localisable) and the
+ *   smooth diffuse ones.
  * - **Exact decay per band.** Each line carries two first-order shelves
  *   designed by the bilinear transform: the Jot shelf pins the loop gain at
  *   DC to the mid T60 and at Nyquist to the HF T60 (midpoint at the high
@@ -59,7 +65,13 @@
  *   matrix feeds every line from every other with equal weight, and the
  *   rotation that follows it spreads the eigenvalues over the unit circle.
  *   The in-loop allpasses are short (1-5 ms, fixed in time), so their
- *   group-delay ripple barely modulates the decay across frequency.
+ *   group-delay ripple barely modulates the decay across frequency. In
+ *   every octave the tail's envelope fluctuates like Gaussian noise.
+ * - **Natural stereo bass.** A diffuse field is coherent between the ears
+ *   at low frequencies. The late tail's side signal is high-passed (2nd
+ *   order at 220 Hz), so its L/R correlation is 0.98 below 100 Hz, about
+ *   0.35 at 250-500 Hz and 0 above 1 kHz: no phasey low end, full width on
+ *   top.
  * - **Transparent modulation.** Each line's length wanders with its own
  *   smooth random LFO (Lexicon style), updated at control rate with a
  *   per-sample linear ramp and read through a first-order allpass
@@ -71,15 +83,22 @@
  *   (Plate, lusher by design, about 25 dB).
  * - **Smooth size changes.** setSize() glides the line lengths (a short
  *   tape-style Doppler) instead of jumping, so it can be automated.
- * - **Spring tanks.** Type::Spring models two springs as dispersive loops
- *   (Valimaki, Parker & Abel 2010): stretched-allpass cascades make every
- *   round trip a chirp whose band edge arrives last, re-dispersed on each
- *   pass, band-limited like a real tank. setDiffusion() sets the chirp
- *   strength for this type.
+ * - **Spring tanks.** Type::Spring models six springs per side as
+ *   dispersive loops (Valimaki, Parker & Abel 2010): stretched-allpass
+ *   cascades make every round trip a chirp whose band edge arrives last,
+ *   re-dispersed on each pass, band-limited like a real tank. Six springs
+ *   of different lengths with a little round-trip jitter keep long decays
+ *   from ringing metallic (the tail spectrum's ripple is half that of a
+ *   two-spring tank). The springs run in SIMD lanes side by side.
+ *   setDiffusion() sets the chirp strength for this type.
+ * - **Efficient.** The sparse early-reflection FIR runs tap by tap over
+ *   64-sample chunks on contiguous memory; the per-line state is laid out
+ *   for SIMD, and the delay lines are padded so their streams do not
+ *   collide in the cache.
  * - **Eco quality** (setQuality): 8 lines, no in-loop allpasses, 2 input
- *   diffusers per channel, 12 early taps per side, 1 output diffuser and a
- *   40-stage spring cascade, with the same decay calibration and loudness
- *   (within 0.2 dB), at about a third of the CPU.
+ *   diffusers per channel, 40 early taps per side and one spring per side,
+ *   with the same decay calibration and loudness (within 0.5 dB), at about
+ *   a third of the CPU.
  *
  * Threading: prepare() belongs to the setup thread (allocates). processBlock(),
  * processSample() and reset() belong to the audio thread. All setters are
@@ -201,13 +220,13 @@ public:
         const auto samples = [sr](double ms) { return static_cast<int>(ms * sr / 1000.0) + 8; };
         for (int c = 0; c < 2; ++c)
         {
-            preDelay_[c].prepare(samples(kMaxPreDelayMs));
+            // The early taps read the raw input straight from here.
+            preDelay_[c].prepare(samples(kMaxPreDelayMs + kMaxErMs));
             // The diffused ring feeds the early taps (up to 170 ms, their
             // contralateral copies up to 1.3x that) and the late injection
             // (ER-to-late gap plus the injection spread).
-            ring_[c].prepare(samples(kMaxErToLateMs + kMaxInjectMs + 2.0 * kMaxErMs));
+            ring_[c].prepare(samples(kMaxErToLateMs + kMaxInjectMs));
             for (auto& ap : inAP_[c]) ap.prepare(samples(kMaxInDiffMs));
-            for (auto& ap : outAP_[c]) ap.prepare(samples(kMaxOutDiffMs));
         }
         const int maxLine = samples(kBaseDelaysMs_[kMaxLines - 1] + kModMaxMs) + 4;
         lines_.prepare(kMaxLines, maxLine);
@@ -233,6 +252,7 @@ public:
 
         const T srT = static_cast<T>(sr);
         dcR_ = T(1) - T(6.283185307179586) * T(kDcCutHz) / srT;
+        cohCoeff_ = static_cast<T>(1.0 - std::exp(-6.283185307179586 * kCoherenceHz / sr));
         maxReadPos_ = static_cast<T>(maxLine - 2);
 
         eco_ = quality_.load(std::memory_order_relaxed) == Quality::Eco;
@@ -283,19 +303,21 @@ public:
 
         T* chL = buffer.getChannel(0);
         T* chR = nCh >= 2 ? buffer.getChannel(1) : nullptr;
-        for (int i = 0; i < nS; ++i)
+        alignas(64) T outL[kChunk];
+        alignas(64) T outR[kChunk];
+        for (int start = 0; start < nS; start += kChunk)
         {
-            const T inL = chL[i];
-            const T inR = chR ? chR[i] : inL;
-            auto [outL, outR] = processSampleInternal(inL, inR);
+            const int n = std::min(kChunk, nS - start);
+            processChunk(chL + start, (chR ? chR : chL) + start, outL, outR, n);
             if (chR)
             {
-                chL[i] = outL;
-                chR[i] = outR;
+                std::copy(outL, outL + n, chL + start);
+                std::copy(outR, outR + n, chR + start);
             }
             else
             {
-                chL[i] = (outL + outR) * T(0.5);
+                for (int i = 0; i < n; ++i)
+                    chL[start + i] = (outL[i] + outR[i]) * T(0.5);
             }
         }
 
@@ -320,7 +342,9 @@ public:
         refreshCachedParams();
         // Front-door non-finite guard (see processBlock).
         if (!std::isfinite(input)) input = T(0);
-        return processSampleInternal(input, input);
+        T outL = T(0), outR = T(0);
+        processChunk(&input, &input, &outL, &outR, 1);
+        return { outL, outR };
     }
 
     /**
@@ -334,12 +358,12 @@ public:
             preDelay_[c].clear();
             ring_[c].clear();
             for (auto& ap : inAP_[c]) ap.clear();
-            for (auto& ap : outAP_[c]) ap.clear();
             erLP_[c].fill(T(0));
             dcX1_[c] = dcY1_[c] = T(0);
         }
         lines_.clear();
         loopAP_.clear();
+        cohLP_.fill(T(0));
         std::fill(springHist_.begin(), springHist_.end(), T(0));
         springW_ = 0;
         for (auto& st : springLPState_) st.fill(T(0));
@@ -400,9 +424,9 @@ public:
      * - no in-loop allpasses (lower echo density in the first ~100 ms of
      *   the tail)
      * - 2 input diffusion allpasses per channel instead of 4
-     * - early reflections capped at 12 taps per side, 1 output diffuser
-     * - a 40-stage spring dispersion cascade instead of 72 (with a stronger
-     *   coefficient, so the chirp spread matches)
+     * - 40 early-reflection taps per side instead of 96
+     * - one spring per side instead of six, with a 40-stage dispersion
+     *   cascade instead of 72 (a stronger coefficient keeps the chirp)
      *
      * The audible difference is a grainier build-up on sharp transients
      * and more modal coloration on long, exposed tails; sustained material
@@ -482,9 +506,11 @@ public:
     }
 
     /**
-     * @brief Diffusion (0 - 1): the strength of the input, in-loop and output
-     *        allpass diffusers. High values give a smooth, dense onset; low
-     *        values keep discrete early echoes audible.
+     * @brief Diffusion (0 - 1): the strength of the input and in-loop
+     *        allpass diffusers, and how many of the first early reflections
+     *        stay discrete (7 at 0, 1 at 1). High values give a smooth,
+     *        dense onset; low values keep crisp, localisable early echoes.
+     *        For Type::Spring it sets the strength of the chirp.
      */
     void setDiffusion(T amount) noexcept
     {
@@ -511,7 +537,8 @@ public:
      * @brief Sets stereo width of the late reverb tail.
      *
      * Uses M/S processing: 0 = mono, 1 = natural stereo, 2 = extra wide.
-     * Applied after output diffusion, before combining with early reflections.
+     * Applied to the late tail (its low band stays coherent), before the
+     * early reflections are added.
      *
      * @param width Stereo width (0.0 - 2.0). Default: 1.0.
      */
@@ -753,22 +780,22 @@ protected:
 
     static constexpr int kMaxLines   = 32;
     static constexpr int kEcoLines   = 8;
-    static constexpr int kInStages   = 4;   ///< input diffusers per channel (Full)
+    static constexpr int kInStages   = 4;   ///< input diffusers per channel feeding the late field (Full)
     static constexpr int kEcoInStages = 2;
-    static constexpr int kOutStages  = 2;   ///< output diffusers per channel (Full)
-    static constexpr int kEcoOutStages = 1;
-    static constexpr int kMaxERTaps  = 24;  ///< early taps per side (Full)
-    static constexpr int kEcoERTaps  = 12;
+    static constexpr int kMaxERTaps  = 96;  ///< velvet early-reflection taps per side (Full)
+    static constexpr int kEcoERTaps  = 40;
+    static constexpr int kMaxDiscreteER = 7; ///< raw (discrete) early taps at diffusion 0
     static constexpr int kERGroups   = 4;   ///< absorption groups (early -> late)
     static constexpr int kCtrl       = 16;  ///< modulation control period (samples)
+    static constexpr int kChunk      = 64;  ///< sparse-FIR processing chunk (samples)
 
     static constexpr double kMaxPreDelayMs = 200.0;
     static constexpr double kMaxErToLateMs = 200.0;
     static constexpr double kMaxErMs       = 170.0;
     static constexpr double kMaxInjectMs   = 8.0;
     static constexpr double kMaxInDiffMs   = 6.0;
-    static constexpr double kMaxOutDiffMs  = 3.0;
     static constexpr double kMaxLoopApMs   = 5.5;
+    static constexpr double kCoherenceHz   = 220.0; ///< late field coherent below this
     static constexpr double kModMaxMs      = 2.0;   ///< peak line wander at modulation 1, size 1
     static constexpr double kGlideMs       = 60.0;  ///< size-change glide time constant
     static constexpr double kMaxGlideSpeed = 0.04;  ///< max length change per sample (4% Doppler)
@@ -799,6 +826,14 @@ protected:
         2.69, 4.78, 3.67, 1.71, 2.20, 1.59, 2.82, 3.31
     };
 
+    // Input diffusion allpass delays (ms) of the late-field feed,
+    // decorrelated between channels.
+    static constexpr double kInDiffMs_[2][kInStages] = {
+        { 1.03, 1.97, 3.13, 4.71 },
+        { 1.21, 2.29, 3.43, 5.11 }
+    };
+    static constexpr double kInDiffCoeffs_[kInStages] = { 0.75, 0.72, 0.68, 0.64 };
+
     // Late injection taps (ms after the ER-to-late gap), one per line.
     static constexpr double kInjectMs_[kMaxLines] = {
         7.14, 3.31, 0.76, 0.25, 5.86, 2.04, 4.84, 5.35,
@@ -828,26 +863,21 @@ protected:
          1, -1, -1,  1, -1,  1, -1, -1
     };
 
-    // Spring tanks (Type::Spring): two springs of different lengths.
-    static constexpr int    kSprings          = 2;
+    // Spring tanks (Type::Spring): six springs per side (even = left), all
+    // of different lengths; Eco keeps one per side.
+    static constexpr int    kSprings          = 12;
+    static constexpr int    kEcoSprings       = 2;
     static constexpr int    kSpringStages     = 72;   ///< dispersion allpasses per spring (Full)
     static constexpr int    kEcoSpringStages  = 40;
-    static constexpr double kSpringBaseMs_[kSprings] = { 35.3, 43.8 };
+    static constexpr double kSpringJitterMs   = 3.0;     ///< delay jitter at modulation 1
+    /// Round-trip time of spring s at the reference size: spread over
+    /// 33-60 ms with a little irregularity, interleaved between the sides.
+    static double springBaseMs(int s) noexcept
+    {
+        return 33.0 + 27.0 * s / (kSprings - 1) + 1.3 * (hash01(s, 90) - 0.5);
+    }
     static constexpr double kSpringCutHz      = 4400.0;  ///< dispersion band edge (transition frequency)
     static constexpr T      kSpringOutGain    = T(2);
-
-    // Input diffusion allpass delays (ms), decorrelated between channels.
-    static constexpr double kInDiffMs_[2][kInStages] = {
-        { 1.03, 1.97, 3.13, 4.71 },
-        { 1.21, 2.29, 3.43, 5.11 }
-    };
-    static constexpr double kInDiffCoeffs_[kInStages] = { 0.75, 0.72, 0.68, 0.64 };
-
-    // Output diffusion allpass delays (ms, decorrelated L/R).
-    static constexpr double kOutDiffMs_[2][kOutStages] = {
-        { 1.47, 2.31 },
-        { 1.63, 2.47 }
-    };
 
     // =========================================================================
     // Building blocks
@@ -882,6 +912,7 @@ protected:
     {
         std::vector<T> buf;
         int size = 0;
+        int stride = 0;
         int mask = 0;
         int w = 0;
 
@@ -890,24 +921,19 @@ protected:
             size = 1;
             while (size < maxDelay + 2) size <<= 1;
             mask = size - 1;
-            buf.assign(static_cast<std::size_t>(size) * static_cast<std::size_t>(numLines), T(0));
+            // One cache line of padding per line: with a power-of-two stride
+            // every line would start in the same L1 set, and the 32 streams
+            // read each sample would keep evicting each other.
+            stride = size + 64 / static_cast<int>(sizeof(T));
+            buf.assign(static_cast<std::size_t>(stride) * static_cast<std::size_t>(numLines), T(0));
             w = 0;
         }
         void clear() noexcept { std::fill(buf.begin(), buf.end(), T(0)); w = 0; }
         [[nodiscard]] T at(int i, int k) const noexcept
-        { return buf[static_cast<std::size_t>(i * size + ((w - k) & mask))]; }
-        void write(int i, T x) noexcept { buf[static_cast<std::size_t>(i * size + w)] = x; }
+        { return buf[static_cast<std::size_t>(i * stride + ((w - k) & mask))]; }
+        void write(int i, T x) noexcept { buf[static_cast<std::size_t>(i * stride + w)] = x; }
         void advance() noexcept { w = (w + 1) & mask; }
     };
-
-    /** @brief Schroeder allpass of m samples: (-g + z^-m) / (1 - g z^-m). */
-    static T allpass(Line& l, int m, T g, T x) noexcept
-    {
-        const T d = l.at(m);
-        const T v = x + g * d;
-        l.push(v);
-        return d - g * v;
-    }
 
     /**
      * @brief Hermite-interpolated random noise generator for organic modulation.
@@ -1003,12 +1029,14 @@ protected:
     std::array<std::array<Line, kInStages>, 2> inAP_;
     std::array<std::array<int, kInStages>, 2> inAPLen_ {};
     std::array<T, kInStages> inAPCoeff_ {};
-    std::array<Line, 2> ring_;             ///< diffused input, feeds ER + injection
+    std::array<Line, 2> ring_;             ///< allpass-diffused input, feeds the late field
 
-    // Early reflections (per side): ipsilateral and contralateral taps
+    // Early reflections (per side): velvet taps, each reading its own side
+    // (erChan_ 0) or the other (1)
     int numERTaps_ = 0;
-    std::array<std::array<int, kMaxERTaps>, 2> erTapI_ {}, erTapC_ {};
-    std::array<std::array<T, kMaxERTaps>, 2> erGainI_ {}, erGainC_ {};
+    Type erType_ = Type::Room;
+    std::array<std::array<int, kMaxERTaps>, 2> erTap_ {}, erChan_ {};
+    std::array<std::array<T, kMaxERTaps>, 2> erGain_ {};
     std::array<int, kERGroups + 1> erGroupStart_ {};
     std::array<T, kERGroups> erLPCoeff_ {};
     std::array<std::array<T, kERGroups>, 2> erLP_ {};
@@ -1040,21 +1068,20 @@ protected:
     int springStages_ = kSpringStages;
     T springA_ = T(0.5);
     std::array<std::array<T, 5>, 2> springLP_ {};              ///< b0 b1 b2 a1 a2, two sections
-    std::array<std::array<T, 4>, kSprings> springLPState_ {};
-
-    // Absorption: Jot shelf (mid/high) and bass shelf, per line
-    std::array<T, kMaxLines> jotB0_ {}, jotB1_ {}, jotA1_ {}, jotX1_ {}, jotY1_ {};
-    std::array<T, kMaxLines> bassB0_ {}, bassB1_ {}, bassA1_ {}, bassX1_ {}, bassY1_ {};
+    std::array<std::array<T, kSprings>, 4> springLPState_ {};   ///< [section * 2 + state][spring]
 
     // In-loop allpasses
     DelayBank loopAP_;
     std::array<int, kMaxLines> loopAPLen_ {};
     T loopAPCoeff_ = T(0.4);
 
+    // Absorption: Jot shelf (mid/high) and bass shelf, per line
+    std::array<T, kMaxLines> jotB0_ {}, jotB1_ {}, jotA1_ {}, jotX1_ {}, jotY1_ {};
+    std::array<T, kMaxLines> bassB0_ {}, bassB1_ {}, bassA1_ {}, bassX1_ {}, bassY1_ {};
+
     // Output stage
-    std::array<std::array<Line, kOutStages>, 2> outAP_;
-    std::array<std::array<int, kOutStages>, 2> outAPLen_ {};
-    T outAPCoeff_ = T(0.4);
+    std::array<T, 2> cohLP_ {};            ///< states of the two side high-passes (coherent low band)
+    T cohCoeff_ = T(0);
     std::array<T, 2> dcX1_ {}, dcY1_ {};
     T dcR_ = T(0.999);
 
@@ -1152,7 +1179,6 @@ protected:
                 eco_ = eco;
                 refreshTopology();
                 updateAll();
-                generateERTapsForType(type_.load(std::memory_order_relaxed));
                 reset();   // engine topology changed: old state is stale
             }
         }
@@ -1220,15 +1246,38 @@ protected:
         }
     }
 
+    /// In-place unnormalised fast Walsh-Hadamard transform of N values
+    /// (in-vector strides scalar, the rest in SIMD).
+    template <int N, int W, typename O>
+    static void fwht(T* x) noexcept
+    {
+        using V = typename O::V;
+        for (int h = 1; h < W; h <<= 1)
+            for (int i = 0; i < N; i += h << 1)
+                for (int j = i; j < i + h; ++j)
+                {
+                    const T a = x[j], b = x[j + h];
+                    x[j] = a + b;
+                    x[j + h] = a - b;
+                }
+        for (int h = W; h < N; h <<= 1)
+            for (int i = 0; i < N; i += h << 1)
+                for (int j = i; j < i + h; j += W)
+                {
+                    const V a = O::load(x + j), b = O::load(x + j + h);
+                    O::store(x + j, O::add(a, b));
+                    O::store(x + j + h, O::sub(a, b));
+                }
+    }
+
     /**
      * @brief One sample of the N-line FDN (compile-time N so the per-line
      *        stages vectorize): allpass-interpolated modulated reads, the
      *        L/R output sums, Hadamard mix plus rotation, absorption
      *        shelves, in-loop allpass, safety limiter, injection, write.
-     *        The Hadamard normalization is folded into the Jot shelf.
      */
     template <int N, bool LoopAllpass>
-    void runFdn(T& lateL, T& lateR, int gap) noexcept
+    void runFdn(T& lateL, T& lateR, int injLag) noexcept
     {
         constexpr int W = std::min(simd::kVecWidth<T>, N);
         using O = simd::Vec<T, W>;
@@ -1268,31 +1317,18 @@ protected:
             for (int k = 0; k < W; ++k) { lateL += v[k]; lateR += tmp[k]; }
         }
 
-        // Unnormalized Hadamard butterflies (the 1/sqrt(N) is folded into
-        // the Jot shelf): in-vector strides scalar, the rest in SIMD.
-        for (int h = 1; h < W; h <<= 1)
-            for (int i = 0; i < N; i += h << 1)
-                for (int j = i; j < i + h; ++j)
-                {
-                    const T a = r[j], b = r[j + h];
-                    r[j] = a + b;
-                    r[j + h] = a - b;
-                }
-        for (int h = W; h < N; h <<= 1)
-            for (int i = 0; i < N; i += h << 1)
-                for (int j = i; j < i + h; j += W)
-                {
-                    const V a = O::load(r.data() + j), b = O::load(r.data() + j + h);
-                    O::store(r.data() + j, O::add(a, b));
-                    O::store(r.data() + j + h, O::sub(a, b));
-                }
+        // Hadamard mix, rotation of the lines by one, normalisation.
+        const V norm = O::set1(T(1) / std::sqrt(static_cast<T>(N)));
+        fwht<N, W, O>(r.data());
         r[N] = r[0];
+        for (int i = 0; i < N; i += W)
+            O::store(v.data() + i, O::mul(norm, O::load(r.data() + i + 1)));
 
-        // Rotate the lines by one, then absorb: Jot mid/high shelf and bass
-        // shelf, y = b0 x + b1 x1 - a1 y1 each.
+        // Absorption: Jot mid/high shelf, then bass shelf,
+        // y = b0 x + b1 x1 - a1 y1 each.
         for (int i = 0; i < N; i += W)
         {
-            const V x = O::load(r.data() + i + 1);
+            const V x = O::load(v.data() + i);
             const V j = O::sub(O::madd(O::load(jotB0_.data() + i), x,
                                        O::mul(O::load(jotB1_.data() + i), O::load(jotX1_.data() + i))),
                                O::mul(O::load(jotA1_.data() + i), O::load(jotY1_.data() + i)));
@@ -1333,13 +1369,14 @@ protected:
                 const T over = std::abs(x) - kSoftLimit;
                 x = std::copysign(kSoftLimit + over / (T(1) + over), x);
             }
-            lines_.write(i, x + injGain_[i] * ring_[(i >> 1) & 1].at(gap + injTap_[i]));
+            lines_.write(i, x + injGain_[i] * ring_[(i >> 1) & 1].at(injLag + injTap_[i]));
         }
         lines_.advance();
     }
 
     /**
-     * @brief One sample of the two spring tanks (Type::Spring).
+     * @brief One sample of the spring tanks (Type::Spring): six springs
+     *        per side (one in Eco), all of different lengths.
      *
      * Each spring is a feedback loop after Valimaki, Parker & Abel (2010):
      * the round-trip delay line (modulated, allpass-interpolated like the
@@ -1347,153 +1384,249 @@ protected:
      * (a + z^-K) / (1 + a z^-K) whose group delay rises from DC to the
      * transition frequency fs / (2K) (the characteristic chirp, re-dispersed
      * on every round trip), a 4th-order band limit just below fs / (2K), and
-     * the same exact-T60 absorption shelves as the FDN. Left mostly drives
-     * spring 0 and right spring 1; each spring's band-limited chirp train is
-     * its output. setDiffusion() sets the chirp strength here.
+     * the same exact-T60 absorption shelves as the FDN. Even springs feed
+     * the left output and hear mostly the left input, odd ones the right;
+     * six springs of different lengths per side, with a little round-trip
+     * jitter, keep the sparse modes of a single loop (the metallic ring of
+     * long decays) from dominating. Each spring's band-limited chirp train
+     * is its output. setDiffusion() sets the chirp strength here.
      */
-    template <int Stages>
-    void runSprings(T& lateL, T& lateR, int gap) noexcept
+    template <int Springs, int Stages>
+    void runSprings(T& lateL, T& lateR, const T (&raw)[2]) noexcept
     {
+        // The springs are independent, so the stage cascade runs across
+        // them: one SIMD lane per spring, the history laid out as
+        // [stage][slot][spring].
+        constexpr int NW = simd::kVecNarrowWidth<T>;
+        constexpr int W = (Springs % NW == 0) ? NW : 1;
+        using O = simd::Vec<T, W>;
+        using V = typename O::V;
+
         const int P = springP_;
         const int mask = P - 1;
         const int iw = springW_;
         const int ik = (springW_ - springK_) & mask;
-        const T a = springA_;
-        T out[kSprings];
-        // Each spring hears mostly its own side (a mono input drives both).
-        const T inL = ring_[0].at(gap + 1), inR = ring_[1].at(gap + 1);
-        const T drive[kSprings] = { T(0.75) * inL + T(0.25) * inR,
-                                    T(0.25) * inL + T(0.75) * inR };
+        // Each spring hears mostly its own side (a mono input drives both);
+        // the raw transducer signal, since any diffusion would blur the chirps.
+        const T drive[2] = { T(0.75) * raw[0] + T(0.25) * raw[1],
+                             T(0.25) * raw[0] + T(0.75) * raw[1] };
 
-        for (int s = 0; s < kSprings; ++s)
+        alignas(64) std::array<T, Springs> x;
+        for (int s = 0; s < Springs; ++s)
         {
             const T p = pos_[s] += posInc_[s];
             const int M = static_cast<int>(p - T(0.5));
             const T h = (p - static_cast<T>(M) - T(1)) * T(0.5);
             const T eta = -h * (T(1) - h * (T(1) - h * (T(1) - h)));
-            T x = eta * (lines_.at(s, M) - apY1_[s]) + lines_.at(s, M + 1);
-            apY1_[s] = x;
+            const T y = eta * (lines_.at(s, M) - apY1_[s]) + lines_.at(s, M + 1);
+            apY1_[s] = y;
+            x[s] = y;
+        }
 
-            // Dispersion: y = a (x - y[n-K]) + x[n-K], stage by stage.
-            T* hist = springHist_.data() + static_cast<std::size_t>(s * (kSpringStages + 1) * P);
-            for (int m = 0; m < Stages; ++m)
+        // Dispersion: y = a (x - y[n-K]) + x[n-K], stage by stage.
+        const V a = O::set1(springA_);
+        T* hist = springHist_.data();
+        const std::size_t stageStride = static_cast<std::size_t>(P) * kSprings;
+        const std::size_t wOff = static_cast<std::size_t>(iw) * kSprings;
+        const std::size_t kOff = static_cast<std::size_t>(ik) * kSprings;
+        for (int g = 0; g < Springs; g += W)
+        {
+            V xv = O::load(x.data() + g);
+            T* hin = hist + g;
+            for (int m = 0; m < Stages; ++m, hin += stageStride)
             {
-                T* hin = hist + m * P;
-                const T* hout = hin + P;
-                hin[iw] = x;
-                x = a * (x - hout[ik]) + hin[ik];
+                O::store(hin + wOff, xv);
+                xv = O::madd(a, O::sub(xv, O::load(hin + stageStride + kOff)), O::load(hin + kOff));
             }
-            hist[Stages * P + iw] = x;
+            O::store(hin + wOff, xv);
+            O::store(x.data() + g, xv);
+        }
 
-            // Band limit: two TDF-II Butterworth sections.
-            auto& st = springLPState_[s];
-            for (int k = 0; k < 2; ++k)
+        // Band limit: two TDF-II Butterworth sections.
+        for (int k = 0; k < 2; ++k)
+        {
+            const auto& c = springLP_[static_cast<std::size_t>(k)];
+            const V b0 = O::set1(c[0]), b1 = O::set1(c[1]), b2 = O::set1(c[2]);
+            const V a1 = O::set1(c[3]), a2 = O::set1(c[4]);
+            T* s1 = springLPState_[static_cast<std::size_t>(2 * k)].data();
+            T* s2 = springLPState_[static_cast<std::size_t>(2 * k + 1)].data();
+            for (int g = 0; g < Springs; g += W)
             {
-                const auto& c = springLP_[k];
-                const T y = c[0] * x + st[2 * k];
-                st[2 * k] = c[1] * x - c[3] * y + st[2 * k + 1];
-                st[2 * k + 1] = c[2] * x - c[4] * y;
-                x = y;
+                const V xv = O::load(x.data() + g);
+                const V y = O::madd(b0, xv, O::load(s1 + g));
+                O::store(s1 + g, O::sub(O::madd(b1, xv, O::load(s2 + g)), O::mul(a1, y)));
+                O::store(s2 + g, O::sub(O::mul(b2, xv), O::mul(a2, y)));
+                O::store(x.data() + g, y);
             }
-            out[s] = x;
+        }
 
-            // Absorption shelves (exact per-band T60), limiter, injection.
-            const T j = jotB0_[s] * x + jotB1_[s] * jotX1_[s] - jotA1_[s] * jotY1_[s];
-            jotX1_[s] = x;
-            jotY1_[s] = j;
-            T v = bassB0_[s] * j + bassB1_[s] * bassX1_[s] - bassA1_[s] * bassY1_[s];
-            bassX1_[s] = j;
-            bassY1_[s] = v;
+        T out[2] = { T(0), T(0) };
+        for (int s = 0; s < Springs; ++s) out[s & 1] += x[s];
+
+        // Absorption shelves (exact per-band T60), limiter, injection.
+        for (int g = 0; g < Springs; g += W)
+        {
+            const V xv = O::load(x.data() + g);
+            const V j = O::sub(O::madd(O::load(jotB0_.data() + g), xv,
+                                       O::mul(O::load(jotB1_.data() + g), O::load(jotX1_.data() + g))),
+                               O::mul(O::load(jotA1_.data() + g), O::load(jotY1_.data() + g)));
+            O::store(jotX1_.data() + g, xv);
+            O::store(jotY1_.data() + g, j);
+            const V b = O::sub(O::madd(O::load(bassB0_.data() + g), j,
+                                       O::mul(O::load(bassB1_.data() + g), O::load(bassX1_.data() + g))),
+                               O::mul(O::load(bassA1_.data() + g), O::load(bassY1_.data() + g)));
+            O::store(bassX1_.data() + g, j);
+            O::store(bassY1_.data() + g, b);
+            O::store(x.data() + g, b);
+        }
+        for (int s = 0; s < Springs; ++s)
+        {
+            T v = x[s];
             if (std::abs(v) > kSoftLimit) [[unlikely]]
             {
                 const T over = std::abs(v) - kSoftLimit;
                 v = std::copysign(kSoftLimit + over / (T(1) + over), v);
             }
-            lines_.write(s, v + drive[s]);
+            lines_.write(s, v + drive[s & 1]);
         }
         lines_.advance();
         springW_ = (springW_ + 1) & mask;
-        lateL += out[0] * kSpringOutGain;
-        lateR += out[1] * kSpringOutGain;
+        const T og = kSpringOutGain / std::sqrt(static_cast<T>(Springs / 2));
+        lateL += out[0] * og;
+        lateR += out[1] * og;
     }
 
-    /// Line count of the active engine: 2 springs, or the FDN size.
+    /// Line count of the active engine: the springs, or the FDN size.
     void refreshTopology() noexcept
     {
-        nLines_ = spring_ ? kSprings : eco_ ? kEcoLines : kMaxLines;
+        nLines_ = spring_ ? (eco_ ? kEcoSprings : kSprings) : eco_ ? kEcoLines : kMaxLines;
     }
 
-    /// Core per-sample processing: stereo in, wet stereo out.
-    std::pair<T, T> processSampleInternal(T inL, T inR) noexcept
+    /// Sum of gain * line.at(lag0 - n) over n in [0, count): a sparse-FIR
+    /// tap applied to a whole chunk, reading contiguous ring memory.
+    static void addTap(T* acc, const Line& l, int lag0, T gain, int count) noexcept
     {
-        if (ctrlPhase_ == 0) controlTick();
-        ctrlPhase_ = (ctrlPhase_ + 1) & (kCtrl - 1);
+        const T* b = l.buf.data();
+        const int base = l.w - lag0;
+        for (int n = 0; n < count; ++n)
+            acc[n] += gain * b[static_cast<std::size_t>((base + n) & l.mask)];
+    }
 
-        // A spring tank is driven by the raw transducer signal and has no
-        // output diffusers: both would blur the chirps.
-        const int nIn = spring_ ? 0 : eco_ ? kEcoInStages : kInStages;
-        const int nOut = spring_ ? 0 : eco_ ? kEcoOutStages : kOutStages;
+    /**
+     * @brief Core processing of up to kChunk samples: stereo in, wet stereo out.
+     *
+     * The sparse FIRs (velvet pre-diffuser and early field) run tap by tap
+     * over the whole chunk, on contiguous ring memory; the late field and the
+     * output stage run per sample.
+     */
+    void processChunk(const T* inL, const T* inR, T* outL, T* outR, int count) noexcept
+    {
         const int pd = cachedParams_.preDelaySamples;
         const int gap = cachedParams_.erToLateSamples;
+        const int last = count - 1;
 
-        // --- Pre-delay and input diffusion, per channel ---
-        const T in[2] = { inL, inR };
+        // --- Pre-delay, then the allpass diffusers of the late-field feed ---
+        alignas(64) T raw[2][kChunk];
+        const int nIn = eco_ ? kEcoInStages : kInStages;
         for (int c = 0; c < 2; ++c)
         {
-            T x = pd > 0 ? preDelay_[c].at(pd) : in[c];
-            preDelay_[c].push(in[c]);
-            for (int s = 0; s < nIn; ++s)
-                x = allpass(inAP_[c][s], inAPLen_[c][s], inAPCoeff_[s], x);
-            ring_[c].push(x);
-        }
-
-        // --- Early reflections: ipsilateral + contralateral taps, grouped
-        //     absorption (later groups darker) ---
-        T early[2] = { T(0), T(0) };
-        for (int s = 0; s < 2; ++s)
-        {
-            const Line& ipsi = ring_[s];
-            const Line& contra = ring_[1 - s];
-            auto& lp = erLP_[s];
-            for (int g = 0; g < kERGroups; ++g)
+            Line& pre = preDelay_[static_cast<std::size_t>(c)];
+            const T* in = c == 0 ? inL : inR;
+            for (int n = 0; n < count; ++n) pre.push(in[n]);
+            std::fill(raw[c], raw[c] + count, T(0));
+            addTap(raw[c], pre, pd + 1 + last, T(1), count);
+            Line& ring = ring_[static_cast<std::size_t>(c)];
+            auto& aps = inAP_[static_cast<std::size_t>(c)];
+            for (int n = 0; n < count; ++n)
             {
-                T acc = T(0);
-                for (int k = erGroupStart_[g]; k < erGroupStart_[g + 1]; ++k)
-                    acc += erGainI_[s][k] * ipsi.at(erTapI_[s][k])
-                         + erGainC_[s][k] * contra.at(erTapC_[s][k]);
-                lp[g] += erLPCoeff_[g] * (acc - lp[g]);
-                early[s] += lp[g];
+                T x = raw[c][n];
+                for (int st = 0; st < nIn; ++st)
+                {
+                    Line& ap = aps[static_cast<std::size_t>(st)];
+                    const T g = inAPCoeff_[static_cast<std::size_t>(st)];
+                    const T d = ap.at(inAPLen_[static_cast<std::size_t>(c)][static_cast<std::size_t>(st)]);
+                    const T w = x + g * d;
+                    ap.push(w);
+                    x = d - g * w;
+                }
+                ring.push(x);
             }
         }
 
-        // --- FDN ---
-        T lateL = T(0), lateR = T(0);
-        if (spring_)
+        // --- Early reflections: velvet taps with rising density, each on its
+        //     own side or the other; the first few read the raw input (crisp
+        //     discrete reflections), the rest the diffused feed (each a short
+        //     dense burst); grouped absorption, later groups darker ---
+        alignas(64) T early[2][kChunk];
+        for (int s = 0; s < 2; ++s)
         {
-            if (eco_) runSprings<kEcoSpringStages>(lateL, lateR, gap);
-            else      runSprings<kSpringStages>(lateL, lateR, gap);
+            const Line* src[4] = { &ring_[static_cast<std::size_t>(s)], &ring_[static_cast<std::size_t>(1 - s)],
+                                   &preDelay_[static_cast<std::size_t>(s)], &preDelay_[static_cast<std::size_t>(1 - s)] };
+            const int lagOff[4] = { last, last, pd + last, pd + last };
+            std::fill(early[s], early[s] + count, T(0));
+            auto& lp = erLP_[static_cast<std::size_t>(s)];
+            for (int g = 0; g < kERGroups; ++g)
+            {
+                alignas(64) T acc[kChunk] = {};
+                for (int k = erGroupStart_[g]; k < erGroupStart_[g + 1]; ++k)
+                    addTap(acc, *src[erChan_[s][k]], erTap_[s][k] + lagOff[erChan_[s][k]], erGain_[s][k], count);
+                const T c = erLPCoeff_[g];
+                T y = lp[g];
+                for (int n = 0; n < count; ++n)
+                {
+                    y += c * (acc[n] - y);
+                    early[s][n] += y;
+                }
+                lp[g] = y;
+            }
         }
-        else if (eco_) runFdn<kEcoLines, false>(lateL, lateR, gap);
-        else           runFdn<kMaxLines, true>(lateL, lateR, gap);
 
-        // --- Output: diffusion, width, early + late, DC block, tone ---
+        for (int n = 0; n < count; ++n)
+        {
+            if (ctrlPhase_ == 0) controlTick();
+            ctrlPhase_ = (ctrlPhase_ + 1) & (kCtrl - 1);
+
+            // --- Late field ---
+            T lateL = T(0), lateR = T(0);
+            if (spring_)
+            {
+                const T rawN[2] = { raw[0][n], raw[1][n] };
+                if (eco_) runSprings<kEcoSprings, kEcoSpringStages>(lateL, lateR, rawN);
+                else      runSprings<kSprings, kSpringStages>(lateL, lateR, rawN);
+            }
+            else if (eco_) runFdn<kEcoLines, false>(lateL, lateR, gap + last - n);
+            else           runFdn<kMaxLines, true>(lateL, lateR, gap + last - n);
+
+            const auto [yl, yr] = outputStage(lateL, lateR, early[0][n], early[1][n]);
+            outL[n] = yl;
+            outR[n] = yr;
+        }
+    }
+
+    /// Per-sample output stage: coherent low band, width, early + late, DC
+    /// block, tone EQ.
+    std::pair<T, T> outputStage(T lateL, T lateR, T earlyL, T earlyR) noexcept
+    {
+        // --- Output: coherent low band, width, early + late, DC block, tone ---
         const T lateLvl = cachedParams_.lateLevel * kOutGain;
         lateL *= lateLvl;
         lateR *= lateLvl;
-        for (int s = 0; s < nOut; ++s)
         {
-            lateL = allpass(outAP_[0][s], outAPLen_[0][s], outAPCoeff_, lateL);
-            lateR = allpass(outAP_[1][s], outAPLen_[1][s], outAPCoeff_, lateR);
-        }
-        {
+            // A diffuse field is coherent between the ears at low frequencies
+            // (the wavelength dwarfs the head): the side signal is high-passed
+            // (2 poles at kCoherenceHz), so the bass is not phasey.
             const T mid  = (lateL + lateR) * T(0.5);
-            const T side = (lateL - lateR) * T(0.5) * cachedParams_.width;
+            T side = (lateL - lateR) * T(0.5);
+            cohLP_[0] += cohCoeff_ * (side - cohLP_[0]);
+            const T hp1 = side - cohLP_[0];                 // first-order high-pass
+            cohLP_[1] += cohCoeff_ * (hp1 - cohLP_[1]);
+            side = (hp1 - cohLP_[1]) * cachedParams_.width;  // and a second one
             lateL = mid + side;
             lateR = mid - side;
         }
 
-        T out[2] = { early[0] * cachedParams_.earlyLevel + lateL,
-                     early[1] * cachedParams_.earlyLevel + lateR };
+        T out[2] = { earlyL * cachedParams_.earlyLevel + lateL,
+                     earlyR * cachedParams_.earlyLevel + lateR };
         for (int c = 0; c < 2; ++c)
         {
             const T y = out[c] - dcX1_[c] + dcR_ * dcY1_[c];
@@ -1529,6 +1662,7 @@ protected:
         damping_.store(std::clamp((T(1) - hd) / T(0.9), T(0), T(1)), std::memory_order_relaxed);
         erToLateSamples_.store(msToSamples(erToLateMs_.load(std::memory_order_relaxed)),
                                std::memory_order_relaxed);
+        generateERTapsForType(erType_);   // the discrete/diffuse split follows the diffusion
     }
 
     /// Size factor: size 0 -> 0.35, size 1 -> 1.
@@ -1557,34 +1691,33 @@ protected:
         }
         if (spring_)
         {
-            const double springScale = 0.6 + 2.6 * static_cast<double>(size_.load(std::memory_order_relaxed));
-            for (int s = 0; s < kSprings; ++s)
-                lenTarget_[s] = nearestPrime(ms(kSpringBaseMs_[s] * springScale));
+            // Round trips of 27-49 ms at the preset size (0.11), up to
+            // 156 ms at size 1 (within the line capacity).
+            const double springScale = 0.6 + 2.0 * static_cast<double>(size_.load(std::memory_order_relaxed));
+            for (int s = 0; s < nLines_; ++s)
+                lenTarget_[s] = nearestPrime(ms(springBaseMs(s) * springScale));
         }
         for (int c = 0; c < 2; ++c)
-        {
-            for (int s = 0; s < kInStages; ++s)
-                inAPLen_[c][s] = nearestPrime(ms(kInDiffMs_[c][s]));
-            for (int s = 0; s < kOutStages; ++s)
-                outAPLen_[c][s] = nearestPrime(ms(kOutDiffMs_[c][s]));
-        }
+            for (int st = 0; st < kInStages; ++st)
+                inAPLen_[static_cast<std::size_t>(c)][static_cast<std::size_t>(st)]
+                    = nearestPrime(ms(kInDiffMs_[c][st]));
     }
 
     void updateDiffCoeffs() noexcept
     {
-        const T diff = diffusion_.load(std::memory_order_relaxed);
-        for (int s = 0; s < kInStages; ++s)
-            inAPCoeff_[s] = static_cast<T>(kInDiffCoeffs_[s]) * diff;
-        loopAPCoeff_ = T(0.15) + T(0.35) * diff;
-        outAPCoeff_ = T(0.45) * diff;
-        // Spring chirp strength: the group-delay rise per stage is
-        // (1 + a) / (1 - a) - (1 - a) / (1 + a); Eco's shorter cascade gets
-        // a larger coefficient so the total dispersion matches Full's.
+        const double diff = static_cast<double>(diffusion_.load(std::memory_order_relaxed));
+        for (int st = 0; st < kInStages; ++st)
+            inAPCoeff_[static_cast<std::size_t>(st)] = static_cast<T>(kInDiffCoeffs_[st] * diff);
+        loopAPCoeff_ = static_cast<T>(0.15 + 0.35 * diff);
+
+        // Spring chirp strength        // Spring chirp strength: the group-delay rise per stage is
+        // (1 + a) / (1 - a) - (1 - a) / (1 + a). The total dispersion is
+        // that of a 72-stage cascade at a = 0.3 + 0.5 x diffusion; shorter
+        // cascades get a larger coefficient to match it.
         {
-            const double aFull = 0.3 + 0.5 * static_cast<double>(diff);
+            const double aRef = 0.3 + 0.5 * diff;
             springStages_ = eco_ ? kEcoSpringStages : kSpringStages;
-            const double f = static_cast<double>(kSpringStages) / springStages_
-                             * (1.0 + aFull) / (1.0 - aFull);
+            const double f = 72.0 / springStages_ * (1.0 + aRef) / (1.0 - aRef);
             springA_ = static_cast<T>((f - 1.0) / (f + 1.0));
         }
     }
@@ -1595,8 +1728,12 @@ protected:
         const T rate = modRate_.load(std::memory_order_relaxed);
         for (int i = 0; i < kMaxLines; ++i)
             lfo_[i].setRate(rate * lfoRateFactor(i), sr);
+        // Springs jitter by a fixed time (the random round-trip variation of
+        // spring models, which smears their sparse modes); the FDN wanders
+        // in proportion to the room size.
         modDepthSamples_ = modDepth_.load(std::memory_order_relaxed)
-                           * static_cast<T>(kModMaxMs * sr / 1000.0) * sizeFactor();
+                           * (spring_ ? static_cast<T>(kSpringJitterMs * sr / 1000.0)
+                                      : static_cast<T>(kModMaxMs * sr / 1000.0) * sizeFactor());
         glideCoeff_ = static_cast<T>(1.0 - std::exp(-kCtrl / (kGlideMs * sr / 1000.0)));
         maxGlideStep_ = static_cast<T>(kMaxGlideSpeed * kCtrl);
     }
@@ -1629,9 +1766,6 @@ protected:
             bassCrossover_.load(std::memory_order_relaxed)), 10.0, 0.45 * sr);
         const double Kh = std::tan(kPi * fh / sr);
         const double Kb = std::tan(kPi * fb / sr);
-        // The FDN runs unnormalized Hadamard butterflies; 1/sqrt(N) lives here.
-        const double hadNorm = spring_ ? 1.0 : 1.0 / std::sqrt(static_cast<double>(nLines_));
-
         for (int i = 0; i < kMaxLines; ++i)
         {
             // Loop length: line + group delay of the in-loop allpasses. The
@@ -1652,8 +1786,8 @@ protected:
             {
                 const double ratio = std::sqrt(gM / gH);
                 const double a = Kh * ratio, b = Kh / ratio, inv = 1.0 / (1.0 + b);
-                jotB0_[i] = static_cast<T>(hadNorm * gH * (1.0 + a) * inv);
-                jotB1_[i] = static_cast<T>(hadNorm * gH * (a - 1.0) * inv);
+                jotB0_[i] = static_cast<T>(gH * (1.0 + a) * inv);
+                jotB1_[i] = static_cast<T>(gH * (a - 1.0) * inv);
                 jotA1_[i] = static_cast<T>((b - 1.0) * inv);
             }
             {
@@ -1684,13 +1818,17 @@ protected:
     }
 
     /**
-     * @brief Lays out numTaps early reflections per side between minMs and
-     *        maxMs (exponential spacing, jittered per side). Each tap reads
-     *        its own channel (ipsilateral) and, slightly later and weaker,
-     *        the other channel (contralateral); the contralateral share grows
-     *        from 25% to 85% across the window, so the early field starts
-     *        lateralised and turns diffuse. Amplitudes fall as (t0/t)^0.8
-     *        and later tap groups pass darker absorption low-passes.
+     * @brief Velvet-noise early field (Valimaki et al.): numTaps sparse +-1
+     *        impulses per side between minMs and maxMs, one per slot at a
+     *        random position, denser as time goes on (density ~ t^0.6, like
+     *        the rising echo density of a room). The first four are positive
+     *        discrete reflections. Each tap reads its own side (probability
+     *        falling from 0.85 to 0.5 over the window, so the field starts
+     *        lateralised and turns diffuse) or the other. Amplitudes follow a
+     *        decaying envelope normalised by the local density, so the energy
+     *        flows smoothly into the late field; later tap groups pass darker
+     *        absorption low-passes. The taps read the pre-diffused signal, so
+     *        each reflection is itself a short dense burst.
      */
     void generateERTaps(double minMs, double maxMs, int numTaps) noexcept
     {
@@ -1700,30 +1838,34 @@ protected:
         if (numERTaps_ == 0) return;
 
         const double sr = spec_.sampleRate;
-        const double ratio = maxMs / minMs;
+        constexpr double p = 1.6;
+        // Diffusion sets how many of the first reflections stay discrete
+        // (crisp, room-like) instead of reading the diffused feed (smooth).
+        const int discrete = 1 + static_cast<int>(std::lround(
+            (kMaxDiscreteER - 1) * (1.0 - static_cast<double>(diffusion_.load(std::memory_order_relaxed)))));
         for (int s = 0; s < 2; ++s)
         {
             double energy = 0.0;
-            std::array<double, kMaxERTaps> gi {}, gc {};
+            std::array<double, kMaxERTaps> gv {};
             for (int k = 0; k < numERTaps_; ++k)
             {
-                const double frac = numERTaps_ > 1 ? static_cast<double>(k) / (numERTaps_ - 1) : 0.0;
-                const double jitter = 1.0 + 0.16 * (hash01(k, s) - 0.5);
-                const double ms = std::clamp(minMs * std::pow(ratio, frac) * jitter, 0.5, kMaxErMs);
-                const double msC = std::min(ms * (1.06 + 0.1 * hash01(k, s + 2)) + 0.3, 1.3 * kMaxErMs);
-                erTapI_[s][k] = std::max(1, static_cast<int>(ms * sr / 1000.0));
-                erTapC_[s][k] = std::max(1, static_cast<int>(msC * sr / 1000.0));
-                const double amp = std::pow(minMs / ms, 0.8);
-                gi[k] = amp;
-                gc[k] = amp * (0.25 + 0.6 * frac);
-                energy += gi[k] * gi[k] + gc[k] * gc[k];
+                const double u = (k + 0.15 + 0.7 * hash01(k, s + 20)) / numERTaps_;
+                // Warped time in [0, 1): a floor of uniform density plus a
+                // share rising like t^(p - 1).
+                const double w = 0.3 * u + 0.7 * std::pow(u, 1.0 / p);
+                const double ms = minMs + (maxMs - minMs) * w;
+                erTap_[s][k] = std::max(1, static_cast<int>(ms * sr / 1000.0));
+                erChan_[s][k] = (hash01(k, s + 30) < 0.85 - 0.35 * w ? 0 : 1) + (k < discrete ? 2 : 0);
+                const double density = 1.0 / (0.3 + 0.7 / p * std::pow(std::max(u, 1e-3), 1.0 / p - 1.0));   // dk/dw
+                const double sign = k < 4 || hash01(k, s + 40) < 0.5 ? 1.0 : -1.0;
+                // Energy per unit time follows the envelope: sparse taps are
+                // individually louder.
+                gv[k] = sign * std::exp(-1.6 * w) / std::sqrt(density);
+                energy += gv[k] * gv[k];
             }
             const double norm = std::sqrt(static_cast<double>(kErEnergy) / energy);
             for (int k = 0; k < numERTaps_; ++k)
-            {
-                erGainI_[s][k] = static_cast<T>(gi[k] * norm);
-                erGainC_[s][k] = static_cast<T>(gc[k] * norm);
-            }
+                erGain_[s][k] = static_cast<T>(gv[k] * norm);
         }
 
         static constexpr double kGroupCutHz[kERGroups] = { 14000.0, 9000.0, 5500.0, 3200.0 };
@@ -1834,12 +1976,10 @@ protected:
         }
 
         spring_ = type == Type::Spring;
+        erType_ = type;
         refreshTopology();
         if (prepared_)
-        {
             updateAll();
-            generateERTapsForType(type);
-        }
     }
 };
 

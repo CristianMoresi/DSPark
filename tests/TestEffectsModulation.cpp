@@ -838,6 +838,55 @@ DSPARK_TEST(Tremolo_zero_depth_passthrough)
         EXPECT_NEAR(tb.ch(0)[i], ref.ch(0)[i], 1e-5f);
 }
 
+DSPARK_TEST(Tremolo_shape_and_stereo_changes_crossfade)
+{
+    // A shape or stereo-mode change applied at once and stepped the gain:
+    // Sine -> Square at depth 1 jumped it by 0.21 here, and the right LFO
+    // jumping half a cycle by 0.59. Both now crossfade over 5 ms and land
+    // exactly on the new law (same LFO phase as a twin set up that way).
+    auto run = [](bool changeLater, auto change, std::vector<float>& lastL,
+                  std::vector<float>& lastR) {
+        Tremolo<float> t;
+        t.setRate(3.0f);
+        t.setDepth(1.0f);
+        if (!changeLater) change(t);
+        t.prepare(spec(48000.0, 32, 2));
+        std::vector<float> l(32), r(32);
+        float prevL = -1.0f, prevR = -1.0f, worst = 0.0f;
+        for (int b = 0; b < 1500; ++b)
+        {
+            if (changeLater && b == 700) change(t);   // LFO phase 0.4
+            std::fill(l.begin(), l.end(), 1.0f);      // DC in: the output is the gain
+            std::fill(r.begin(), r.end(), 1.0f);
+            float* p[2] = { l.data(), r.data() };
+            t.processBlock(AudioBufferView<float>(p, 2, 32));
+            for (int i = 0; i < 32; ++i)
+            {
+                if (prevL >= 0.0f)
+                    worst = std::max({ worst, std::abs(l[static_cast<size_t>(i)] - prevL),
+                                       std::abs(r[static_cast<size_t>(i)] - prevR) });
+                prevL = l[static_cast<size_t>(i)];
+                prevR = r[static_cast<size_t>(i)];
+            }
+        }
+        lastL = l;
+        lastR = r;
+        return worst;
+    };
+    auto check = [&](auto change) {
+        std::vector<float> l1, r1, l2, r2;
+        const float worst = run(true, change, l1, r1);
+        EXPECT_LT(worst, 0.01f);          // square edges alone move 0.003 per sample
+        run(false, change, l2, r2);
+        float diff = 0.0f;
+        for (size_t i = 0; i < l1.size(); ++i)
+            diff = std::max({ diff, std::abs(l1[i] - l2[i]), std::abs(r1[i] - r2[i]) });
+        EXPECT_LT(diff, 1e-6f);
+    };
+    check([](auto& t) { t.setShape(Tremolo<float>::Shape::Square); });
+    check([](auto& t) { t.setStereo(true); });
+}
+
 // ============================================================================
 // Vibrato
 // ============================================================================

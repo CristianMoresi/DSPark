@@ -423,7 +423,7 @@
  * |--------------------------|------------------|-------------------------------------------------|
  * | `AudioFile`              | IO/AudioFile.h   | Abstract reader/writer interface + AudioFileInfo metadata |
  * | `WavFile`                | IO/WavFile.h     | Read/write WAV files (PCM 8/16/24/32, float 32/64) |
- * | `Mp3File`                | IO/Mp3File.h     | MPEG-1 Layer III codec - read (CBR/VBR) + write (CBR encoder) |
+ * | `Mp3File`                | IO/Mp3File.h     | MPEG-1 Layer III codec - read (CBR/VBR) + write (CBR), gapless |
  * | `MidiFile`               | IO/MidiFile.h    | Validating Standard MIDI File 0/1/2 reader and 0/1 writer |
  * | `FlacFile`               | IO/FlacFile.h    | Native FLAC reader with eager integrity validation and indexed decode |
  *

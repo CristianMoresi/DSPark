@@ -13,6 +13,11 @@
  * - Sample rates: 32000, 44100, 48000 Hz
  * - Mono and stereo (including joint stereo with M/S and intensity)
  * - CBR and VBR, ID3v2 tag skipping
+ * - Gapless: a Xing/Info (or VBRI) tag frame is skipped rather than decoded
+ *   as 1152 samples of silence, and when it carries a LAME-format tag from
+ *   LAME, FFmpeg (Lavf/Lavc) or DSPark, the encoder delay plus the 529-sample
+ *   decoder delay is trimmed from the start and the padding from the end, so
+ *   the output lines up with the encoder's input sample for sample
  * - getInfo() reports the delivery format (32-bit float); MP3 itself has
  *   no PCM bit depth
  *
@@ -22,6 +27,10 @@
  * - Mono and stereo; the sample rate snaps to 32000/44100/48000 Hz
  * - Analysis polyphase filterbank + MDCT + Huffman coding, rate-controlled
  *   by a uniform global-gain search (no psychoacoustic model)
+ * - Gapless: close() flushes the codec delay (the last input samples used to
+ *   be cut off) and the first frame is an Info tag frame with a LAME-format
+ *   tag (encoder "DSPark", delay 528, exact padding, frame and byte counts),
+ *   which this decoder uses to return exactly the samples written
  * - Produces standard-compliant MP3 playable by any decoder
  *
  * @warning DECODE-ALL ARCHITECTURE: Because MP3 uses a backward-referencing
@@ -98,6 +107,7 @@ public:
             decodedSamplesFlat_.clear();
             return false;
         }
+        applyGaplessTrim();
 
         fileData_.clear(); // Free raw memory after full planar extraction
         isOpen_ = true;
@@ -133,6 +143,18 @@ public:
         for (int ch = 0; ch < kChannelsMax; ++ch) encState_[ch] = {};
         encFrameBuf_.clear();
         encInputPos_ = 0;
+        encPaddingAccum_ = 0;
+        encSamplesIn_ = 0;
+        encFramesOut_ = 0;
+        encAudioBytes_ = 0;
+        encMusicCrc_ = 0;
+
+        // Reserve the Info tag frame; close() writes it once the counts are
+        // known.
+        encChooseTagFrame();
+        const std::vector<char> placeholder(static_cast<size_t>(encTagFrameSize_), 0);
+        outFile_.write(placeholder.data(), static_cast<std::streamsize>(placeholder.size()));
+
         isWriting_ = true;
         isOpen_ = true;
         return true;
@@ -181,6 +203,7 @@ public:
                 encInput_[ch][encInputPos_] = static_cast<double>(val);
             }
             ++encInputPos_;
+            ++encSamplesIn_;
 
             if (encInputPos_ >= kSamplesPerFrame)
             {
@@ -195,13 +218,21 @@ public:
     {
         if (isWriting_ && outFile_.is_open())
         {
-            if (encInputPos_ > 0)
+            // Flush the codec delay: sample i of the input decodes at output
+            // index i + kEncoderDelay + kDecoderDelay, so frames are added
+            // until the decoded stream covers the last input sample (only
+            // the partial frame used to be encoded, which cut the last
+            // ~230 samples off).
+            const int64_t needed = encSamplesIn_ + kEncoderDelay + kDecoderDelay;
+            while (encInputPos_ > 0 || encFramesOut_ * kSamplesPerFrame < needed)
             {
                 for (int ch = 0; ch < static_cast<int>(info_.numChannels); ++ch)
                     for (int i = encInputPos_; i < kSamplesPerFrame; ++i)
                         encInput_[ch][i] = 0.0;
                 encEncodeFrame();
+                encInputPos_ = 0;
             }
+            encWriteTagFrame();
             outFile_.close();
         }
         isWriting_ = false;
@@ -228,6 +259,11 @@ private:
     static constexpr int kSubbands     = 32;
     static constexpr int kSynthSlots   = 16;
     static constexpr int kMaxReservoir = 8192; // Bit reservoir maximum bytes
+    /// Delay of a standard Layer III decoder (the synthesis filterbank), the
+    /// value the LAME tag convention assumes: 528 + 1.
+    static constexpr int kDecoderDelay = 529;
+    /// Delay of this encoder's analysis filterbank and MDCT (measured).
+    static constexpr int kEncoderDelay = 528;
     static constexpr int kMaxPart23Bits = 4095; // part2_3_length is 12 bits
 
     // ========================================================================
@@ -1074,6 +1110,12 @@ private:
     std::vector<size_t> frameOffsets_;
     std::vector<float> decodedSamplesFlat_; // Planar contiguous buffer [channel][sample]
 
+    // Gapless information from a Xing/Info tag frame (decoder).
+    bool gapless_ = false;
+    int gaplessDelay_ = 0;       ///< Encoder delay from the LAME-format tag.
+    int gaplessPadding_ = 0;     ///< Padding from the LAME-format tag.
+    int64_t tagFrames_ = 0;      ///< Audio frame count from the Xing fields (0 = absent).
+
     std::vector<uint8_t> reservoir_;
     size_t reservoirSize_ = 0;
     ChannelState channelState_[kChannelsMax] = {};
@@ -1096,6 +1138,12 @@ private:
     double encInput_[kChannelsMax][kSamplesPerFrame] = {};
     int encInputPos_ = 0;
     std::vector<uint8_t> encFrameBuf_;
+    int64_t encSamplesIn_ = 0;    ///< Input samples written.
+    int64_t encFramesOut_ = 0;    ///< Audio frames written (the tag frame excluded).
+    int64_t encAudioBytes_ = 0;   ///< Bytes of audio frames written.
+    uint16_t encMusicCrc_ = 0;    ///< CRC-16 of the audio frames (LAME tag field).
+    int encTagBitrateIdx_ = 0;    ///< Bitrate index of the Info tag frame.
+    int encTagFrameSize_ = 0;     ///< Size of the Info tag frame in bytes.
 
     // ========================================================================
     // Implementation Methods
@@ -1146,6 +1194,14 @@ private:
 
         if (frameOffsets_.empty()) return false;
 
+        // A Xing/Info/VBRI tag frame is metadata, not audio: decoding it
+        // added 1152 samples of silence ahead of the music.
+        gapless_ = false;
+        tagFrames_ = 0;
+        if (parseTagFrame(frameOffsets_.front()))
+            frameOffsets_.erase(frameOffsets_.begin());
+        if (frameOffsets_.empty()) return false;
+
         info_.sampleRate = static_cast<double>(sampleRate);
         info_.numChannels = channels;
         info_.numSamples = static_cast<int64_t>(frameOffsets_.size()) * kSamplesPerFrame;
@@ -1153,6 +1209,90 @@ private:
         info_.bitsPerSample = 32;
         info_.isFloatingPoint = true;
         return true;
+    }
+
+    /**
+     * @brief Recognizes a Xing/Info or VBRI tag frame at pos and reads its
+     *        gapless fields.
+     *
+     * The Xing fields sit right after the side info; a LAME-format tag
+     * follows the fields the flags declare. The delay and padding are only
+     * trusted from encoders known to write them (LAME, FFmpeg, DSPark).
+     *
+     * @return True if the frame is a tag frame (to be skipped).
+     */
+    bool parseTagFrame(size_t pos)
+    {
+        FrameHeader hdr {};
+        if (!parseFrameHeader(pos, hdr)) return false;
+        const size_t end = std::min(fileData_.size(), pos + static_cast<size_t>(hdr.frameSize));
+        const size_t headerSize = 4 + (hdr.crcProtect ? 2 : 0);
+        auto at = [&](size_t off) -> const uint8_t* {
+            return (off <= end) ? fileData_.data() + off : nullptr;
+        };
+        auto read32 = [&](size_t off) -> uint32_t {
+            const uint8_t* b = fileData_.data() + off;
+            return (static_cast<uint32_t>(b[0]) << 24) | (static_cast<uint32_t>(b[1]) << 16)
+                 | (static_cast<uint32_t>(b[2]) << 8) | static_cast<uint32_t>(b[3]);
+        };
+
+        // Fraunhofer VBRI: fixed at 32 bytes after the header. No gapless data used.
+        const size_t vbri = pos + headerSize + 32;
+        if (vbri + 4 <= end && std::memcmp(at(vbri), "VBRI", 4) == 0)
+            return true;
+
+        size_t x = pos + headerSize + static_cast<size_t>(hdr.sideInfoSize);
+        if (x + 8 > end) return false;
+        if (std::memcmp(at(x), "Xing", 4) != 0 && std::memcmp(at(x), "Info", 4) != 0)
+            return false;
+
+        const uint32_t flags = read32(x + 4);
+        x += 8;
+        if (flags & 1u) { if (x + 4 > end) return true; tagFrames_ = read32(x); x += 4; }
+        if (flags & 2u) x += 4;
+        if (flags & 4u) x += 100;
+        if (flags & 8u) x += 4;
+
+        if (x + 24 <= end)
+        {
+            const uint8_t* tag = at(x);
+            const bool known = std::memcmp(tag, "LAME", 4) == 0 || std::memcmp(tag, "Lavf", 4) == 0
+                            || std::memcmp(tag, "Lavc", 4) == 0 || std::memcmp(tag, "DSPark", 6) == 0;
+            if (known)
+            {
+                gaplessDelay_   = (tag[21] << 4) | (tag[22] >> 4);
+                gaplessPadding_ = ((tag[22] & 0x0F) << 8) | tag[23];
+                gapless_ = true;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * @brief Trims the decoded stream to the encoder's input: the encoder
+     *        delay plus the decoder delay at the start, the padding at the end
+     *        (the LAME tag convention; FFmpeg trims the same way).
+     */
+    void applyGaplessTrim()
+    {
+        if (!gapless_) return;
+        const int64_t decoded = info_.numSamples;
+        const int64_t frames = (tagFrames_ > 0) ? tagFrames_
+                                                : decoded / kSamplesPerFrame;
+        const int64_t start = static_cast<int64_t>(gaplessDelay_) + kDecoderDelay;
+        const int64_t stop = std::min(decoded, frames * kSamplesPerFrame
+                                               - gaplessPadding_ + kDecoderDelay);
+        if (start > stop) return;   // implausible values: keep the raw stream
+
+        const int64_t kept = stop - start;
+        const int nch = info_.numChannels;
+        std::vector<float> trimmed(static_cast<size_t>(nch * kept));
+        for (int ch = 0; ch < nch; ++ch)
+            std::memcpy(trimmed.data() + static_cast<size_t>(ch * kept),
+                        decodedSamplesFlat_.data() + static_cast<size_t>(ch * decoded + start),
+                        static_cast<size_t>(kept) * sizeof(float));
+        decodedSamplesFlat_ = std::move(trimmed);
+        info_.numSamples = kept;
     }
 
     bool parseFrameHeader(size_t pos, FrameHeader& hdr) const
@@ -2472,6 +2612,99 @@ private:
         bw.padToByte();
         encFrameBuf_.resize(static_cast<size_t>(frameSize), 0);
         outFile_.write(reinterpret_cast<const char*>(encFrameBuf_.data()), static_cast<std::streamsize>(frameSize));
+        encMusicCrc_ = crc16(encFrameBuf_.data(), static_cast<size_t>(frameSize), encMusicCrc_);
+        encAudioBytes_ += frameSize;
+        ++encFramesOut_;
+    }
+
+    /** @brief CRC-16/ARC (poly 0x8005 reflected, init 0), the LAME tag CRC. */
+    [[nodiscard]] static uint16_t crc16(const uint8_t* data, size_t size, uint16_t crc) noexcept
+    {
+        for (size_t i = 0; i < size; ++i)
+        {
+            crc = static_cast<uint16_t>(crc ^ data[i]);
+            for (int b = 0; b < 8; ++b)
+                crc = static_cast<uint16_t>((crc & 1u) ? (crc >> 1) ^ 0xA001u : (crc >> 1));
+        }
+        return crc;
+    }
+
+    /** @brief Bytes an Info tag frame needs: header, side info, the Xing
+     *  fields (flags, frames, bytes, 100-entry TOC, quality) and the LAME tag. */
+    [[nodiscard]] int encTagBytesNeeded() const noexcept
+    {
+        const int sideInfoSize = (info_.numChannels == 1) ? 17 : 32;
+        return 4 + sideInfoSize + 120 + 36;
+    }
+
+    /** @brief Picks the tag frame's bitrate: the stream's own when the tag
+     *  fits in its frame, otherwise the smallest legal bitrate that holds it. */
+    void encChooseTagFrame() noexcept
+    {
+        const int sr = static_cast<int>(info_.sampleRate);
+        const int needed = encTagBytesNeeded();
+        auto frameBytes = [sr](int idx) { return 144 * kBitrateTable[idx] * 1000 / sr; };
+        int streamIdx = 1;
+        for (int i = 1; i < 15; ++i)
+            if (kBitrateTable[i] == encBitrate_) streamIdx = i;
+        encTagBitrateIdx_ = streamIdx;
+        if (frameBytes(streamIdx) < needed)
+            for (int i = 1; i < 15; ++i)
+                if (frameBytes(i) >= needed) { encTagBitrateIdx_ = i; break; }
+        encTagFrameSize_ = frameBytes(encTagBitrateIdx_);
+    }
+
+    /** @brief Writes the Info tag frame over the placeholder at the start of
+     *  the file: a silent Layer III frame whose main data holds the Xing
+     *  fields and a LAME-format tag with the gapless delay and padding. */
+    void encWriteTagFrame()
+    {
+        const int nch = info_.numChannels;
+        const int sr = static_cast<int>(info_.sampleRate);
+        const int srIdx = (sr == 44100) ? 0 : (sr == 48000) ? 1 : 2;
+        const int sideInfoSize = (nch == 1) ? 17 : 32;
+
+        std::vector<uint8_t> f(static_cast<size_t>(encTagFrameSize_), 0);
+        f[0] = 0xFF;
+        f[1] = 0xFB;   // MPEG-1, Layer III, no CRC
+        f[2] = static_cast<uint8_t>((encTagBitrateIdx_ << 4) | (srIdx << 2));
+        f[3] = static_cast<uint8_t>(((nch == 1) ? 0xC0 : 0x00) | 0x04);   // mode, original
+
+        auto put32 = [&f](size_t at, uint32_t v) {
+            f[at] = static_cast<uint8_t>(v >> 24); f[at + 1] = static_cast<uint8_t>(v >> 16);
+            f[at + 2] = static_cast<uint8_t>(v >> 8); f[at + 3] = static_cast<uint8_t>(v);
+        };
+        size_t x = static_cast<size_t>(4 + sideInfoSize);
+        const char* id = "Info";   // Info = CBR (Xing marks VBR)
+        std::memcpy(&f[x], id, 4);
+        put32(x + 4, 0x0000000Fu);   // frames, bytes, TOC and quality present
+        put32(x + 8, static_cast<uint32_t>(encFramesOut_));
+        const int64_t streamBytes = encTagFrameSize_ + encAudioBytes_;
+        put32(x + 12, static_cast<uint32_t>(streamBytes));
+        for (int i = 0; i < 100; ++i)   // linear TOC: constant bitrate
+            f[x + 16 + static_cast<size_t>(i)] = static_cast<uint8_t>((i * 256) / 100);
+        put32(x + 116, 0);            // quality indicator: unspecified
+
+        // LAME-format tag.
+        const size_t t = x + 120;
+        const char* version = "DSPark   ";   // 9 bytes, the encoder's own name
+        std::memcpy(&f[t], version, 9);
+        f[t + 9] = 0x01;              // tag revision 0, CBR
+        f[t + 20] = static_cast<uint8_t>(std::min(encBitrate_, 255));
+        const int padding = static_cast<int>(encFramesOut_ * kSamplesPerFrame
+                                             - kEncoderDelay - encSamplesIn_);
+        f[t + 21] = static_cast<uint8_t>(kEncoderDelay >> 4);
+        f[t + 22] = static_cast<uint8_t>(((kEncoderDelay & 0xF) << 4) | ((padding >> 8) & 0xF));
+        f[t + 23] = static_cast<uint8_t>(padding & 0xFF);
+        put32(t + 28, static_cast<uint32_t>(streamBytes));   // music length
+        f[t + 32] = static_cast<uint8_t>(encMusicCrc_ >> 8);
+        f[t + 33] = static_cast<uint8_t>(encMusicCrc_ & 0xFF);
+        const uint16_t tagCrc = crc16(f.data(), t + 34, 0);
+        f[t + 34] = static_cast<uint8_t>(tagCrc >> 8);
+        f[t + 35] = static_cast<uint8_t>(tagCrc & 0xFF);
+
+        outFile_.seekp(0);
+        outFile_.write(reinterpret_cast<const char*>(f.data()), static_cast<std::streamsize>(f.size()));
     }
 
     bool decodeAll()

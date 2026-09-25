@@ -1246,7 +1246,7 @@ DSPARK_TEST(Mp3File_encoder_output_decodes_back_to_its_input)
     EXPECT_TRUE(r.openRead("dspark_test_rt.mp3"));
     auto info = r.getInfo();
     const int n = static_cast<int>(info.numSamples);
-    EXPECT_TRUE(n > N);
+    EXPECT_EQ(n, N);   // gapless: exactly the samples written
     AudioBuffer<float> dec;
     dec.resize(1, n);
     EXPECT_TRUE(r.readSamples(dec.toView()));
@@ -1338,6 +1338,95 @@ DSPARK_TEST(Mp3File_mono_high_bitrate_granules_fit_their_12_bit_length)
         }
         EXPECT_LT(worstDb, -20.0);   // old: 0 dB in the frames that hit 4096 bits
     }
+}
+
+// The encoder wrote only the frames its input filled, so its 528-sample delay
+// plus the decoder's 529 cut the last ~230 samples off, and the decoder
+// returned 1057 samples of codec delay ahead of the music (plus a frame of
+// silence for any Xing/Info tag frame, which it decoded as audio). The
+// encoder now flushes the delay and writes an Info frame with a LAME-format
+// tag, and the decoder trims by it: exactly the samples written come back,
+// time-aligned. Tags from LAME are honoured the same way; a tag from an
+// encoder not known to write the delay fields is skipped but not trusted.
+DSPARK_TEST(Mp3File_round_trip_is_gapless)
+{
+    FileCleanup cleanup { "dspark_test_gapless.mp3" };
+    constexpr int N = 30001;   // not a multiple of the 1152-sample frame
+    std::vector<float> l(N), r(N);
+    for (int i = 0; i < N; ++i)
+    {
+        const double t = static_cast<double>(i) / 44100.0;
+        l[static_cast<size_t>(i)] = static_cast<float>(0.3 * std::sin(2.0 * pi<double> * 330.0 * t)
+                                                      + 0.2 * std::sin(2.0 * pi<double> * 2710.0 * t));
+        r[static_cast<size_t>(i)] = static_cast<float>(0.3 * std::sin(2.0 * pi<double> * 470.0 * t)
+                                                      + 0.2 * std::sin(2.0 * pi<double> * 5130.0 * t));
+    }
+    {
+        Mp3File w;
+        AudioFileInfo info;
+        info.sampleRate = 44100.0;
+        info.numChannels = 2;
+        info.bitsPerSample = 192;
+        info.numSamples = N;
+        EXPECT_TRUE(w.openWrite("dspark_test_gapless.mp3", info));
+        AudioBuffer<float> buf;
+        buf.resize(2, N);
+        std::copy(l.begin(), l.end(), buf.getChannel(0));
+        std::copy(r.begin(), r.end(), buf.getChannel(1));
+        EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+        w.close();
+    }
+
+    auto decode = [](AudioBuffer<float>& dec) {
+        Mp3File rd;
+        if (!rd.openRead("dspark_test_gapless.mp3")) return -1;
+        const int n = static_cast<int>(rd.getInfo().numSamples);
+        dec.resize(2, n);
+        if (!rd.readSamples(dec.toView())) return -1;
+        return n;
+    };
+    auto residualDb = [&](const AudioBuffer<float>& dec, int lag, int from, int to) {
+        double e = 0.0, ref = 0.0;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = from; i < to; ++i)
+            {
+                const double x = (ch == 0 ? l : r)[static_cast<size_t>(i)];
+                const double y = dec.getChannel(ch)[i + lag];
+                e += (y - x) * (y - x);
+                ref += x * x;
+            }
+        return 10.0 * std::log10(e / ref);
+    };
+
+    AudioBuffer<float> dec;
+    EXPECT_EQ(decode(dec), N);                                 // exact length
+    EXPECT_LT(residualDb(dec, 0, 0, N), -25.0);                // aligned at lag 0
+    EXPECT_LT(residualDb(dec, 0, N - 500, N), -25.0);          // the tail is there
+    EXPECT_GT(residualDb(dec, 1, 1000, N - 1000), -10.0);      // and lag 1 is not it
+
+    // The first frame is the Info tag frame, naming this encoder.
+    std::vector<char> bytes;
+    {
+        std::ifstream in("dspark_test_gapless.mp3", std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const std::string head(bytes.begin(), bytes.begin() + std::min<size_t>(bytes.size(), 400));
+    const auto tag = head.find("DSPark");
+    EXPECT_TRUE(head.find("Info") != std::string::npos);
+    EXPECT_TRUE(tag != std::string::npos);
+
+    auto rewriteTagName = [&](const char* name) {
+        std::copy(name, name + 9, bytes.begin() + static_cast<std::ptrdiff_t>(tag));
+        std::ofstream out("dspark_test_gapless.mp3", std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    };
+    rewriteTagName("LAME3.100");                                // LAME's tag: same trim
+    EXPECT_EQ(decode(dec), N);
+    rewriteTagName("Unknown  ");                                // untrusted: raw stream
+    const int raw = decode(dec);
+    EXPECT_EQ(raw % 1152, 0);
+    EXPECT_GT(raw, N + 1057);
+    EXPECT_LT(residualDb(dec, 1057, 0, N), -25.0);              // the codec delay, untrimmed
 }
 
 // 8-bit WAV is unsigned with 128 as zero and the reader scales by 128, but the

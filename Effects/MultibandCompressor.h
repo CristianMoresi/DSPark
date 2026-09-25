@@ -91,9 +91,10 @@ public:
     /**
      * @brief Processes audio through the multi-band compressor.
      *
-     * Pass-through until prepare() succeeds. The processed span is clamped to
-     * the prepared maxBlockSize (trailing samples of an oversized block are
-     * left untouched); channels beyond the prepared count pass through.
+     * Pass-through until prepare() succeeds. A block longer than the prepared
+     * maxBlockSize is processed in consecutive chunks of that size (the tail
+     * of an oversized block used to be left unprocessed: dry, unfiltered);
+     * channels beyond the prepared count pass through.
      *
      * @param buffer In/Out audio buffer view.
      */
@@ -101,9 +102,20 @@ public:
     {
         if (!prepared_.load(std::memory_order_relaxed)) return;
 
+        const int total = buffer.getNumSamples();
+        const int chunk = bandBuffers_[0].getNumSamples();
+        if (chunk <= 0) return;
+        for (int offset = 0; offset < total; offset += chunk)
+            processChunk(buffer.getSubView(offset, std::min(chunk, total - offset)));
+    }
+
+private:
+    /** One chunk of at most the prepared maxBlockSize samples. */
+    void processChunk(AudioBufferView<T> buffer) noexcept
+    {
         // Clamp to the per-band buffers' geometry (allocated for the prepared
-        // spec): a wider or longer caller buffer must never index the band
-        // buffers out of bounds below.
+        // spec): a wider caller buffer must never index the band buffers out
+        // of bounds below.
         const int nCh = std::min(buffer.getNumChannels(), bandBuffers_[0].getNumChannels());
         const int nS  = std::min(buffer.getNumSamples(), bandBuffers_[0].getNumSamples());
         if (nCh <= 0 || nS <= 0) return;
@@ -154,6 +166,7 @@ public:
         }
     }
 
+public:
     // -- Configuration -------------------------------------------------------
 
     /**

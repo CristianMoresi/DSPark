@@ -1415,6 +1415,38 @@ DSPARK_TEST(MultibandCompressor_per_band_compression)
     EXPECT_LT(peakLow, peakHigh);
 }
 
+// A block longer than the prepared maxBlockSize used to leave its tail
+// unprocessed (dry and unfiltered past sample 256 here). It is now processed
+// in maxBlockSize chunks: bit-identical to a twin fed those chunks directly.
+DSPARK_TEST(MultibandCompressor_processes_oversized_blocks_in_chunks)
+{
+    MultibandCompressor<float> big, twin;
+    for (auto* m : { &big, &twin })
+    {
+        m->setNumBands(3);
+        for (int b = 0; b < 3; ++b)
+        {
+            m->getBandCompressor(b).setThreshold(-30.0f);
+            m->getBandCompressor(b).setRatio(4.0f);
+        }
+        m->prepare(spec(48000.0, 256, 2));
+    }
+    auto a = makeStereoBuffer(1000);
+    a.fillNoise(0.8f, 7u);
+    auto b = makeStereoBuffer(1000);
+    for (int c = 0; c < 2; ++c) std::copy(a.ch(c), a.ch(c) + 1000, b.ch(c));
+
+    big.processBlock(a.view());
+    for (int off = 0; off < 1000; off += 256)
+        twin.processBlock(b.view().getSubView(off, std::min(256, 1000 - off)));
+
+    int mismatches = 0;
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < 1000; ++i)
+            if (a.ch(c)[i] != b.ch(c)[i]) ++mismatches;
+    EXPECT_EQ(mismatches, 0);
+}
+
 DSPARK_TEST(MultibandCompressor_silence)
 {
     MultibandCompressor<float> mbc;

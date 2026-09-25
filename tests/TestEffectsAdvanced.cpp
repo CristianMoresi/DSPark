@@ -3582,6 +3582,37 @@ DSPARK_TEST(Granular_freeze_sustains_and_pitch_doubles)
     EXPECT_GT(mag(880.0), 3.0 * mag(440.0));   // +12 st: content doubled
 }
 
+DSPARK_TEST(Granular_grains_keep_high_frequencies_and_do_not_alias)
+{
+    // Grains read the ring with linear interpolation: a 10 kHz tone came out
+    // 1.2 dB below a 1 kHz one at unity pitch, and grains an octave up read
+    // a 15 kHz tone straight into a 30 kHz alias, folded to 18 kHz at -10 dB.
+    // The sinc reader keeps 10 kHz level, and the rate-stretched kernel of
+    // pitched-up grains stops what would fold (below -40 dB).
+    auto level = [](float hz, float semitones) {
+        GranularProcessor<float> g;
+        g.setPitch(semitones);
+        g.setSpread(0.0f);
+        g.prepare(spec(48000.0, 512, 2));
+        const int total = 512 * 200;
+        std::vector<float> l(static_cast<size_t>(total)), r(static_cast<size_t>(total));
+        for (int i = 0; i < total; ++i)
+            l[static_cast<size_t>(i)] = r[static_cast<size_t>(i)]
+                = 0.5f * std::sin(6.2831853f * hz * static_cast<float>(i) / 48000.0f);
+        for (int off = 0; off < total; off += 512)
+        {
+            float* p[2] = { l.data() + off, r.data() + off };
+            g.processBlock(AudioBufferView<float>(p, 2, 512));
+        }
+        double e = 0.0;
+        for (int i = total / 2; i < total; ++i)
+            e += static_cast<double>(l[static_cast<size_t>(i)]) * l[static_cast<size_t>(i)];
+        return std::sqrt(e / (total / 2)) / (0.5 / std::sqrt(2.0));
+    };
+    EXPECT_NEAR(20.0 * std::log10(level(10000.0f, 0.0f) / level(1000.0f, 0.0f)), 0.0, 0.5);
+    EXPECT_LT(20.0 * std::log10(level(15000.0f, 12.0f)), -40.0);
+}
+
 DSPARK_TEST(SpectralDenoiser_improves_snr_and_keeps_tone)
 {
     SpectralDenoiser<float> dn;

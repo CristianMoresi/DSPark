@@ -17,6 +17,14 @@
  * parameters are randomized per spawn with deterministic LCG state, and
  * everything is preallocated: zero allocation, zero latency.
  *
+ * Grains read the ring with the 32-tap windowed sinc of Core/Interpolation.h
+ * (linear interpolation used to err by -4 dB at 10 kHz, and pitched-up
+ * grains aliased: a 15 kHz tone an octave up came back at -10 dB). A grain
+ * pitched up reads with a sinc stretched by its rate (StretchedSincReader),
+ * whose cutoff sits at Nyquist / rate, so nothing folds back (-51 dB in the
+ * same test). That kernel grows with the rate, about 32 * rate taps (128 at
+ * +24 semitones), so dense clouds of high grains cost more CPU.
+ *
  * Threading model: parameter setters/getters are std::atomic based and safe
  * from any thread (non-finite values are ignored). prepare() is setup-thread
  * only (allocates; invalid specs are ignored and an unprepared instance
@@ -27,13 +35,14 @@
  * pass through untouched.
  *
  * Dependencies: Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h,
- * Core/DenormalGuard.h, Core/StateBlob.h.
+ * Core/DenormalGuard.h, Core/Interpolation.h, Core/StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
+#include "../Core/Interpolation.h"
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
@@ -268,9 +277,7 @@ public:
                 if (!g.active) continue;
 
                 const auto idx = static_cast<int64_t>(g.pos);
-                const T frac = static_cast<T>(g.pos - static_cast<double>(idx));
-                const int i0 = static_cast<int>(idx) & ringMask_;
-                const int i1 = (i0 + 1) & ringMask_;
+                const double frac = g.pos - static_cast<double>(idx);
 
                 const double wPos = g.phase * (kWindowSize - 1);
                 const auto wIdx = static_cast<int>(wPos);
@@ -279,10 +286,8 @@ public:
                           + (window_[static_cast<size_t>(std::min(wIdx + 1, kWindowSize - 1))]
                              - window_[static_cast<size_t>(wIdx)]) * wFrac;
 
-                const T sL = ring_[0][static_cast<size_t>(i0)]
-                           + (ring_[0][static_cast<size_t>(i1)] - ring_[0][static_cast<size_t>(i0)]) * frac;
-                const T sR = ring_[1][static_cast<size_t>(i0)]
-                           + (ring_[1][static_cast<size_t>(i1)] - ring_[1][static_cast<size_t>(i0)]) * frac;
+                T sL = T(0), sR = T(0);
+                readGrain(g, idx, frac, nCh > 1, sL, sR);
 
                 outL += sL * w * g.gainL;
                 outR += sR * w * g.gainR;
@@ -307,6 +312,9 @@ public:
 
 private:
     static constexpr int kWindowSize = 2048;
+    /// Distance kept between a grain's kernel and the ring's write edges.
+    static constexpr double kReadMargin =
+        static_cast<double>(StretchedSincReader<T>::kMaxTaps) + 32.0;
 
     struct Grain
     {
@@ -315,8 +323,25 @@ private:
         double rate = 1.0;      ///< Playback increment (pitch).
         double phase = 0.0;     ///< Envelope phase [0, 1).
         double phaseInc = 0.0;
+        int step = -1;          ///< Stretched-kernel step (rate > 1), else -1.
         T gainL = T(0), gainR = T(0);
     };
+
+    /** @brief Band-limited stereo read of one grain at ring position idx + frac. */
+    void readGrain(const Grain& g, int64_t idx, double frac, bool stereo,
+                   T& sL, T& sR) noexcept
+    {
+        const T* ringL = ring_[0].data();
+        const T* ringR = ring_[1].data();
+        if (g.step < 0)   // rate <= 1: the full-band kernel
+        {
+            sL = reader_.readRing(ringL, ringMask_, idx, frac);
+            sR = stereo ? reader_.readRing(ringR, ringMask_, idx, frac) : sL;
+            return;
+        }
+        sL = stretchedReader_.readRing(ringL, ringMask_, idx, frac, g.step);
+        sR = stereo ? stretchedReader_.readRing(ringR, ringMask_, idx, frac, g.step) : sL;
+    }
 
     [[nodiscard]] double frand() noexcept
     {
@@ -339,14 +364,16 @@ private:
             const double rate = std::exp2(st / 12.0);
 
             // Start far enough back that the grain never overtakes the write
-            // head even when pitched up: lead = length * max(rate, 1) + margin.
-            const double maxSpan = lenSamples * std::max(rate, 1.0) + 64.0;
-            const double jitterSpan = jit * 0.5 * static_cast<double>(ringMask_ + 1 - maxSpan - 64.0);
+            // head even when pitched up: lead = length * max(rate, 1) + margin,
+            // the margin covering the read kernel's reach on both ends.
+            const double maxSpan = lenSamples * std::max(rate, 1.0) + kReadMargin;
+            const double jitterSpan = jit * 0.5 * static_cast<double>(ringMask_ + 1 - maxSpan - kReadMargin);
             const double back = maxSpan + frand() * std::max(jitterSpan, 0.0);
             g.pos = static_cast<double>(writePos_) - back;
             while (g.pos < 0.0) g.pos += static_cast<double>(ringMask_ + 1);
 
             g.rate = rate;
+            g.step = rate > 1.0 ? StretchedSincReader<T>::stepFor(rate) : -1;
             g.phase = 0.0;
             g.phaseInc = 1.0 / lenSamples;
 
@@ -376,6 +403,8 @@ private:
 
     std::vector<T> window_;
     std::array<Grain, kMaxGrains> grains_;
+    SincInterpolator<T> reader_;                  ///< Reader for grains at rate <= 1.
+    StretchedSincReader<T> stretchedReader_;      ///< Band-limited reader for pitched-up grains.
     double spawnAcc_ = 0.0;
     uint32_t rng_ = 0x9E3779B9u;
     T currentMix_ = T(1);   ///< Audio-thread mix ramp state.

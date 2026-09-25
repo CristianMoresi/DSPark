@@ -11,7 +11,9 @@
  * interpolated reads, modulated delay lines). All of them are small scalar
  * helpers that inline into the caller's loop; none allocates or locks.
  * SincInterpolator is the high-fidelity reader for resampling a stream
- * (pitch shifting, varispeed); it owns a kernel table built on construction.
+ * (pitch shifting, varispeed), and StretchedSincReader its band-limited
+ * variant for read rates above 1; both own kernel tables built on
+ * construction.
  *
  * | Method    | Points | Quality       | CPU Cost  | Use case                     |
  * |-----------|--------|---------------|-----------|------------------------------|
@@ -39,8 +41,9 @@
  * Threading: all functions are pure and re-entrant; the Allpass state lives
  * in the caller. Real-time safe: no allocation, no locks, no modulo; the only
  * floating-point division is the Allpass coefficient (one per call).
- * SincInterpolator allocates its table in the constructor (setup thread);
- * its reads are const, allocation-free and safe from any thread.
+ * SincInterpolator and StretchedSincReader allocate their tables in the
+ * constructor (setup thread); their reads are const, allocation-free and
+ * safe from any thread.
  *
  * Dependencies: DspMath.h (FloatType concept), SimdOps.h (dot products).
  */
@@ -417,6 +420,152 @@ private:
     }
 
     std::vector<T> table_;   ///< (kPhases + 1) rows of kTaps coefficients.
+};
+
+/**
+ * @class StretchedSincReader
+ * @brief Band-limited fractional reader for read rates from 1 to 4.
+ *
+ * A read point that advances by r > 1 samples per output sample decimates:
+ * content above Nyquist / r folds back unless the kernel's cutoff drops to
+ * Nyquist / r. This reader tabulates such kernels (the sinc stretched by r
+ * under a Kaiser window, beta 10, about 32 r taps) for 16 rates in
+ * eighth-octave steps from 2^(1/8) to 4, at 64 phases each, and reads with
+ * the kernel of the nearest tabulated rate at or above the requested one:
+ * nothing folds back from beyond the output Nyquist, and the band gives up
+ * at most an eighth of an octave at the top. Passband error stays below
+ * -76 dB up to three quarters of the cutoff. For rates at or below 1 use
+ * SincInterpolator.
+ *
+ * Threading: the constructor builds about 60 k coefficients (allocates:
+ * setup thread); reads are const, allocation-free and safe from any thread.
+ *
+ * @tparam T Sample type (float or double).
+ */
+template <FloatType T>
+class StretchedSincReader
+{
+public:
+    static constexpr int kSteps = 16;          ///< Tabulated rates.
+    static constexpr int kStepsPerOctave = 8;  ///< Rate resolution.
+    static constexpr int kPhases = 64;         ///< Phases per rate.
+    static constexpr int kMaxTaps = 128;       ///< Kernel length at rate 4.
+
+    /** @brief Builds the kernel tables (allocates: construct on a setup thread). */
+    StretchedSincReader()
+    {
+        constexpr double kBeta = 10.0;
+        constexpr double kPi = 3.14159265358979323846;
+        const double invI0Beta = 1.0 / besselI0(kBeta);
+
+        size_t total = 0;
+        for (int k = 0; k < kSteps; ++k)
+        {
+            const double rate = std::exp2(static_cast<double>(k + 1) / kStepsPerOctave);
+            half_[k] = static_cast<int>(std::ceil(16.0 * rate));
+            offset_[k] = total;
+            total += static_cast<size_t>(kPhases + 1) * static_cast<size_t>(2 * half_[k]);
+        }
+        table_.assign(total, T(0));
+
+        std::vector<double> h;
+        for (int k = 0; k < kSteps; ++k)
+        {
+            const double rate = std::exp2(static_cast<double>(k + 1) / kStepsPerOctave);
+            const int taps = 2 * half_[k];
+            h.assign(static_cast<size_t>(taps), 0.0);
+            for (int p = 0; p <= kPhases; ++p)
+            {
+                const double phase = static_cast<double>(p) / kPhases;
+                double sum = 0.0;
+                for (int t = 0; t < taps; ++t)
+                {
+                    const double u = (static_cast<double>(t - (half_[k] - 1)) - phase) / rate;
+                    const double r = u / 16.0;
+                    const double window = (r * r < 1.0)
+                        ? besselI0(kBeta * std::sqrt(1.0 - r * r)) * invI0Beta
+                        : 0.0;
+                    const double sinc = (u == 0.0) ? 1.0 : std::sin(kPi * u) / (kPi * u);
+                    h[static_cast<size_t>(t)] = sinc * window;
+                    sum += h[static_cast<size_t>(t)];
+                }
+                T* row = table_.data() + offset_[k] + static_cast<size_t>(p) * static_cast<size_t>(taps);
+                for (int t = 0; t < taps; ++t)
+                    row[t] = static_cast<T>(h[static_cast<size_t>(t)] / sum);   // unit DC gain
+            }
+        }
+    }
+
+    /**
+     * @brief The table for a read rate: the nearest tabulated rate at or
+     *        above it. Costs a log2, so look it up once per constant rate.
+     * @param rate Read rate, clamped to [2^(1/8), 4].
+     * @return Step index in [0, kSteps).
+     */
+    [[nodiscard]] static int stepFor(double rate) noexcept
+    {
+        const double steps = std::ceil(std::log2(std::max(rate, 1.0)) * kStepsPerOctave - 1e-9);
+        return std::clamp(static_cast<int>(steps) - 1, 0, kSteps - 1);
+    }
+
+    /**
+     * @brief Reads a power-of-two ring buffer at intPos + frac with the kernel
+     *        of a rate step. It needs the samples intPos - reach(step) + 1
+     *        through intPos + reach(step).
+     * @param ring   Ring storage.
+     * @param mask   Ring size minus one (the size must be a power of two).
+     * @param intPos Integer read position (masked, so any value works).
+     * @param frac   Fractional position in [0, 1).
+     * @param step   Rate step from stepFor().
+     * @return Interpolated value.
+     */
+    [[nodiscard]] T readRing(const T* ring, int64_t mask, int64_t intPos, double frac, int step) const noexcept
+    {
+        const int half = half_[step];
+        const int taps = 2 * half;
+        const double p = frac * static_cast<double>(kPhases);
+        const int ip = std::clamp(static_cast<int>(p), 0, kPhases - 1);
+        const T t = static_cast<T>(p - static_cast<double>(ip));
+        const T* h0 = table_.data() + offset_[step] + static_cast<size_t>(ip) * static_cast<size_t>(taps);
+        const T* h1 = h0 + taps;
+
+        const int64_t first = intPos - (half - 1);
+        const auto start = static_cast<size_t>(first & mask);
+        const T* x = ring + start;
+        T window[kMaxTaps];
+        if (start + static_cast<size_t>(taps) > static_cast<size_t>(mask) + 1)
+        {
+            for (int k = 0; k < taps; ++k)
+                window[k] = ring[static_cast<size_t>((first + k) & mask)];
+            x = window;
+        }
+        const T a = simd::dotProductT(h0, x, taps);
+        const T b = simd::dotProductT(h1, x, taps);
+        return a + t * (b - a);
+    }
+
+    /** @return Samples a read of this step reaches on either side of intPos. */
+    [[nodiscard]] int reach(int step) const noexcept { return half_[step]; }
+
+private:
+    /** @brief Modified Bessel I0 (power series, converges for Kaiser betas). */
+    [[nodiscard]] static double besselI0(double x) noexcept
+    {
+        double sum = 1.0, term = 1.0;
+        const double halfX = x / 2.0;
+        for (int k = 1; k < 60; ++k)
+        {
+            const double f = halfX / static_cast<double>(k);
+            term *= f * f;
+            sum += term;
+            if (term < sum * 1e-17) break;
+        }
+        return sum;
+    }
+
+    std::vector<T> table_;     ///< Per step: (kPhases + 1) rows of 2 * half taps.
+    size_t offset_[kSteps] {}; ///< Start of each step's rows in table_.
+    int half_[kSteps] {};      ///< Half kernel length per step.
 };
 
 } // namespace dspark

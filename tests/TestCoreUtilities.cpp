@@ -538,6 +538,38 @@ DSPARK_TEST(Interpolation_sinc_is_exact_at_integers_and_transparent_to_18_khz)
     }
 }
 
+DSPARK_TEST(Interpolation_stretched_sinc_keeps_the_band_and_blocks_what_would_fold)
+{
+    // A reader advancing 2 samples per output sample needs a cutoff at half
+    // Nyquist: the rate-2 kernel reproduces 6 kHz (half its 12 kHz cutoff at
+    // 48 kHz) within -85 dB at every phase and blocks 16 kHz, which would
+    // fold back to 16 kHz at twice the speed, below -90 dB.
+    StretchedSincReader<double> reader;
+    EXPECT_EQ(StretchedSincReader<double>::stepFor(2.0), 7);
+    EXPECT_EQ(StretchedSincReader<double>::stepFor(2.001), 8);
+    EXPECT_EQ(StretchedSincReader<double>::stepFor(0.5), 0);
+    EXPECT_EQ(StretchedSincReader<double>::stepFor(9.0), StretchedSincReader<double>::kSteps - 1);
+
+    const int step = StretchedSincReader<double>::stepFor(2.0);
+    std::vector<double> ring(512);
+    auto worstError = [&](double hz, bool passband) {
+        const double w = 6.283185307179586 * hz / 48000.0;
+        for (size_t i = 0; i < ring.size(); ++i)
+            ring[i] = std::sin(w * static_cast<double>(i));
+        double worst = 0.0;
+        for (int k = 0; k < 64; ++k)
+        {
+            const double frac = k / 64.0;
+            const double got = reader.readRing(ring.data(), 511, 250, frac, step);
+            const double want = passband ? std::sin(w * (250.0 + frac)) : 0.0;
+            worst = std::max(worst, std::abs(got - want));
+        }
+        return 20.0 * std::log10(worst);
+    };
+    EXPECT_LT(worstError(6000.0, true), -85.0);
+    EXPECT_LT(worstError(16000.0, false), -90.0);
+}
+
 DSPARK_TEST(Interpolation_allpass_delay_magnitude_and_stability)
 {
     // frac = 1 -> coefficient is exactly 0 -> pure one-sample delay, bit-exact.

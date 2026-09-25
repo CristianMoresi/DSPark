@@ -439,7 +439,7 @@ public:
             const T grDepth = std::clamp(-smoothedGR_Db * T(0.1), T(0), T(1));
             output += colorAmt * kFetColorH2 * grDepth * (sq - dc);
         }
-        output *= decibelsToGain(makeup);
+        output *= makeupToGain(makeup);
 
         fbLastOutput_[channel] = output;
         gainReductionDb_.store(smoothedGR_Db, std::memory_order_relaxed);
@@ -962,6 +962,13 @@ protected:
                 if (levelDb > linkedLevel) linkedLevel = levelDb;
             }
 
+            // Makeup: shared by every channel of the frame, and usually
+            //    unchanged from the previous frame (the conversion is cached).
+            T makeupDb = mkupGain;
+            if (autoMkup == AutoMakeupMode::Adaptive && modeType == Mode::Downward)
+                makeupDb += -autoMakeupEnv_;
+            const T makeupLin = makeupToGain(makeupDb);
+
             // 2. Stereo Linking & Gain Application
             T blockGR = T(0);
             for (int ch = 0; ch < nCh; ++ch)
@@ -1000,12 +1007,8 @@ protected:
                     targetGR_Db = applyHoldAndRange(targetGR_Db, ch);
                     smoothedGR_Db = applyBallistics(targetGR_Db, ch, splitAdaptive);
                 }
-                T smoothedGainLinear = decibelsToGain(smoothedGR_Db);
-
-                // 4. Makeup & Mix
-                T makeup = mkupGain;
-                if (autoMkup == AutoMakeupMode::Adaptive && modeType == Mode::Downward)
-                    makeup += -autoMakeupEnv_;
+                // (0 dB is the common case below threshold: skip the exp.)
+                T smoothedGainLinear = (smoothedGR_Db == T(0)) ? T(1) : decibelsToGain(smoothedGR_Db);
 
                 T input;
                 if (activeLookahead > 0)
@@ -1033,7 +1036,7 @@ protected:
                     const T grDepth = std::clamp(-smoothedGR_Db * T(0.1), T(0), T(1));
                     wet += colorAmt * kFetColorH2 * grDepth * (sq - dc);
                 }
-                wet *= decibelsToGain(makeup);
+                wet *= makeupLin;
                 fbLastOutput_[ch] = wet; // feedback detector reads the compressed signal
 
                 // Parallel (New York) mix done inline: the dry reference is `input`,
@@ -1197,6 +1200,19 @@ protected:
      * @param detType Selected detector methodology.
      * @return Decibel representation of detected level.
      */
+    /** Makeup dB -> linear, cached: the makeup is shared by every channel of
+     *  a frame and constant unless automated or adaptive. Same value as a
+     *  direct decibelsToGain() call. */
+    [[nodiscard]] T makeupToGain(T makeupDb) noexcept
+    {
+        if (makeupDb != cachedMakeupDb_)
+        {
+            cachedMakeupDb_ = makeupDb;
+            cachedMakeupLin_ = decibelsToGain(makeupDb);
+        }
+        return cachedMakeupLin_;
+    }
+
     [[nodiscard]] T detectLevel(T sample, int ch, DetectorType detType) noexcept
     {
         T level = std::abs(sample);
@@ -1750,6 +1766,8 @@ protected:
     // Internal DSP Coefficients & State
     T autoMakeupCoeff_ = T(0.9995);     ///< Auto-makeup tracking factor.
     T autoMakeupEnv_ = T(0);            ///< Smoothed internal auto-makeup envelope.
+    T cachedMakeupDb_ = T(0);           ///< Last makeup converted by makeupToGain().
+    T cachedMakeupLin_ = T(1);          ///< Its linear gain.
 
     // Character ballistics coefficients (dB-domain one-poles, see
     // updateTimeConstants). charFastWeight_ == 1 selects the single-envelope

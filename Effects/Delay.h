@@ -18,6 +18,14 @@
  * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/DspMath.h,
  * Core/Smoothers.h, Core/StateBlob.h.
  *
+ * Two ways to use it:
+ * - As an insert, like every other effect: prepare(spec), set the delay,
+ *   feedback, filters and setMix(), then processBlock(buffer) writes the
+ *   dry/wet blend in place (the mix ramps over at least 20 ms).
+ * - As a raw delay line: processBlock(buffer, delayMs, feedback, lpHz, hpHz)
+ *   and the wet-buffer helpers return the delayed signal only, with the
+ *   per-call parameters published to the stored state.
+ *
  * Threading: prepare() belongs to the setup thread. The processing calls and
  * reset() belong to the audio thread. Parameter setters are safe from any
  * thread (atomics with a publish/apply handoff consumed at the top of the
@@ -78,6 +86,15 @@ public:
     // -- Lifecycle -----------------------------------------------------------
 
     /**
+     * @brief Prepares for insert use with the default capacity (4 seconds).
+     * @param spec The audio specification. An invalid spec is ignored.
+     */
+    void prepare(const AudioSpec& spec)
+    {
+        prepare(spec, kDefaultMaxDelaySeconds);
+    }
+
+    /**
      * @brief Prepares the delay structures and allocates memory. Must be called before processing.
      * @param spec The audio specification (sample rate, block size, etc.).
      *             An invalid spec (non-positive or NaN fields) is ignored.
@@ -116,6 +133,7 @@ public:
         }
 
         mixSmoother_.reset(spec.sampleRate, timeMs, 1.0f);
+        insertMixMaxStep_ = static_cast<SampleType>(1.0 / std::max(1.0, spec.sampleRate * 0.02));
         reset();
         
         prepared_.store(true, std::memory_order_release);
@@ -144,6 +162,7 @@ public:
             resetChannelState(states_[ch]);
         }
         mixSmoother_.skip();
+        insertMix_ = mix_.load(std::memory_order_relaxed); // no fade-in on start
     }
 
     // -- Configuration -------------------------------------------------------
@@ -256,6 +275,66 @@ public:
     }
 
     // -- Block processing ----------------------------------------------------
+
+    /**
+     * @brief Insert-style processing: the dry/wet blend, in place, with the
+     *        stored parameters (setDelayMs(), setFeedback(), the feedback
+     *        filters and mode, setMix()).
+     *
+     * Channels beyond the prepared count pass through. Zero latency.
+     *
+     * @param buffer The audio buffer to process in place.
+     */
+    void processBlock(AudioBufferView<SampleType> buffer) noexcept
+    {
+        if (!prepared_.load(std::memory_order_acquire)) return;
+        maybeUpdateSmoothers();
+
+        const int nS  = buffer.getNumSamples();
+        const int nCh = std::min(buffer.getNumChannels(), numChannels_);
+        const auto smoothType = smootherType_.load(std::memory_order_relaxed);
+        const SampleType targetDelay = globalDelay_.load(std::memory_order_relaxed);
+        const SampleType fb  = feedbackGain_.load(std::memory_order_relaxed);
+        const SampleType lpC = fbLpCoef_.load(std::memory_order_relaxed);
+        const SampleType hpC = fbHpCoef_.load(std::memory_order_relaxed);
+        const SampleType mixTarget = mix_.load(std::memory_order_relaxed);
+        const SampleType mixStart  = insertMix_;
+
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            SampleType* data = buffer.getChannel(ch);
+            auto& s = states_[ch];
+            for (int i = 0; i < nS; ++i)
+            {
+                const SampleType currentDelay = (smoothType == SmootherType::None)
+                                              ? targetDelay : advanceSmoother(s, smoothType);
+                const SampleType dry = data[i];
+                const SampleType wet = processSampleInternal(ch, dry, currentDelay, s, fb, lpC, hpC);
+                advanceWriteIndexUnchecked(ch);
+                const SampleType m = moveTowards(mixStart, mixTarget,
+                                                 insertMixMaxStep_ * static_cast<SampleType>(i + 1));
+                data[i] = dry + (wet - dry) * m;
+            }
+        }
+        insertMix_ = moveTowards(mixStart, mixTarget, insertMixMaxStep_ * static_cast<SampleType>(nS));
+    }
+
+    /**
+     * @brief Sets the dry/wet blend of the insert-style processBlock(buffer).
+     * @param mix 0 = dry only, 1 = delayed signal only (default 0.3).
+     *            Clamped to [0, 1]; non-finite values are ignored. Thread-safe.
+     */
+    void setMix(SampleType mix) noexcept
+    {
+        if (!std::isfinite(mix)) return;
+        mix_.store(std::clamp(mix, SampleType(0), SampleType(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief Returns the insert dry/wet blend. */
+    [[nodiscard]] SampleType getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
+
+    /** @brief Latency in samples: none (the delay is the effect, not a latency). */
+    [[nodiscard]] int getLatency() const noexcept { return 0; }
 
     /**
      * @brief Processes a multi-channel block in-place.
@@ -476,6 +555,7 @@ public:
         w.write("smoother", static_cast<int32_t>(smootherType_.load(std::memory_order_relaxed)));
         w.write("smoothingMs", smoothingTimeMs_.load(std::memory_order_relaxed));
         w.write("fbMode", static_cast<int32_t>(feedbackMode_.load(std::memory_order_relaxed)));
+        w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -495,11 +575,13 @@ public:
         setSmoothingTime(r.read("smoothingMs", 20.0f));
         setFeedbackMode(static_cast<FeedbackMode>(std::clamp(r.read("fbMode", 1), 0,
                         static_cast<int>(FeedbackMode::Analog))));
+        setMix(static_cast<SampleType>(r.read("mix", 0.3f)));
         return true;
     }
 
 protected:
     static constexpr int kMaxChannels = 16;
+    static constexpr double kDefaultMaxDelaySeconds = 4.0;
 
     struct ChannelState
     {
@@ -770,6 +852,9 @@ private:
     std::atomic<FeedbackMode> feedbackMode_ { FeedbackMode::Analog };
 
     Smoothers::LinearSmoother mixSmoother_;
+    std::atomic<SampleType> mix_ { SampleType(0.3) };            ///< Insert dry/wet blend.
+    SampleType insertMix_ = SampleType(0.3);                     ///< Audio-thread ramp state.
+    SampleType insertMixMaxStep_ = SampleType(1.0 / 960.0);      ///< Full scale per 20 ms.
 };
 
 } // namespace dspark

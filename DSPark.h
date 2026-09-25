@@ -354,7 +354,7 @@
  * | `Equalizer<T>`           | Effects/Equalizer.h   | Multi-band parametric EQ (Peak/Shelf/LP/HP/Notch, 1-16 bands)       |
  * | `FilterEngine<T>`        | Effects/Filters.h     | Multi-mode cascaded filter (LP/HP/BP/Peak/Shelf/Notch, 6-48 dB/oct) |
  * | `Saturation<T>`          | Effects/Saturation.h  | 10 saturation algorithms (tube, tape, transformer, wavefolder...)    |
- * | `Delay<T>`               | Effects/Delay.h       | Delay line with interpolation, feedback filters, ping-pong           |
+ * | `Delay<T>`               | Effects/Delay.h       | Echo insert / delay line: interpolation, feedback filters, ping-pong |
  * | `Reverb<T>`              | Effects/Reverb.h      | Convolution reverb with IR loading, pre-delay, dry/wet               |
  * | `Chorus<T>`              | Effects/Chorus.h      | Chorus/flanger with multi-voice LFO, stereo spread                   |
  * | `Phaser<T>`              | Effects/Phaser.h      | Allpass phaser with configurable stages, feedback, LFO               |

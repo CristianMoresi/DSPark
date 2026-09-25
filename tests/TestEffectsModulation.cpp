@@ -29,6 +29,41 @@ using namespace dspark::test;
 // Delay
 // ============================================================================
 
+// Delay used to be a raw delay line only: processBlock(buffer, delayMs, ...)
+// returned the delayed signal and reset every omitted parameter, and there
+// was no prepare(spec). As an insert it now works like every other effect:
+// prepare(spec), stored parameters, and a dry/wet blend written in place.
+DSPARK_TEST(Delay_insert_api_blends_dry_and_echo)
+{
+    Delay<float> d;
+    d.setMix(0.5f);
+    d.setSmoother(Delay<float>::SmootherType::None);
+    d.prepare(spec(48000.0, 512, 1));        // default capacity (4 s)
+    d.setDelayMs(10.0f);                     // 480 samples
+    d.setFeedback(0.5f);
+    d.setFeedbackMode(Delay<float>::FeedbackMode::Clean);
+    EXPECT_EQ(d.getLatency(), 0);
+    EXPECT_NEAR(d.getMix(), 0.5f, 0.0f);
+
+    std::vector<float> x(1024, 0.0f);
+    x[0] = 1.0f;
+    float* p[1] = { x.data() };
+    float* q[1] = { x.data() + 512 };
+    d.processBlock(AudioBufferView<float>(p, 1, 512));
+    d.processBlock(AudioBufferView<float>(q, 1, 512));
+    EXPECT_NEAR(x[0], 0.5f, 1e-6f);          // dry half
+    EXPECT_NEAR(x[480], 0.5f, 1e-6f);        // first echo, wet half
+    EXPECT_NEAR(x[960], 0.25f, 1e-6f);       // second echo through feedback 0.5
+    EXPECT_NEAR(x[100], 0.0f, 1e-6f);
+
+    // The stored parameters are not reset by processing (the per-call
+    // overload used to overwrite omitted ones with defaults).
+    auto blob = d.getState();
+    Delay<float> r;
+    EXPECT_TRUE(r.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(r.getMix(), 0.5f, 1e-6f);
+}
+
 DSPARK_TEST(Delay_exact_sample_delay)
 {
     constexpr int delaySamples = 100;

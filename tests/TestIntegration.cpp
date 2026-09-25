@@ -170,7 +170,7 @@ DSPARK_TEST(Integration_double_template_compiles)
 // ProcessorChain static_assert rejects anything that does not (Saturation
 // failed exactly this before its reset() was marked noexcept). Multi-buffer
 // or per-call-parameterised utilities (Crossfade, CrossoverFilter, MidSide,
-// AutoGain, Delay, Phasor) are intentionally out of contract; that scope is
+// AutoGain, Phasor) are intentionally out of contract; that scope is
 // documented in ProcessorTraits.h and not asserted here so they may adopt
 // the contract later without breaking this test.
 DSPARK_TEST(ProcessorTraits_insert_effects_satisfy_AudioProcessor)
@@ -181,6 +181,7 @@ DSPARK_TEST(ProcessorTraits_insert_effects_satisfy_AudioProcessor)
     EXPECT_TRUE((AudioProcessor<Compressor<float>, float>));
     EXPECT_TRUE((AudioProcessor<DCBlocker<float>, float>));
     EXPECT_TRUE((AudioProcessor<DeEsser<float>, float>));
+    EXPECT_TRUE((AudioProcessor<Delay<float>, float>));
     EXPECT_TRUE((AudioProcessor<DynamicEQ<float>, float>));
     EXPECT_TRUE((AudioProcessor<Equalizer<float>, float>));
     EXPECT_TRUE((AudioProcessor<Expander<float>, float>));

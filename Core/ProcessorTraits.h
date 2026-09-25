@@ -27,10 +27,11 @@
  *
  * Scope note: the contract targets in-place single-buffer inserts and
  * self-contained generators. Multi-buffer or per-call-parameterised
- * utilities (Crossfade, CrossoverFilter, MidSide, AutoGain, the Delay
- * building block, Phasor) intentionally do not model these concepts;
- * wrap them in a small insert class if you need them inside a
- * ProcessorChain.
+ * utilities (Crossfade, CrossoverFilter, MidSide, AutoGain, Phasor)
+ * intentionally do not model these concepts; wrap them in a small insert
+ * class if you need them inside a ProcessorChain. Delay models
+ * AudioProcessor through its insert API (prepare(spec), processBlock(buffer)
+ * with setMix()); its per-call overloads remain for raw delay-line use.
  *
  * Read-only analysers are outside the contract for the same reason and are
  * meant to be: BeatTracker, ChordDetector, EnvelopeFollower, LoudnessMeter,

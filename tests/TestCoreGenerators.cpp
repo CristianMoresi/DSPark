@@ -995,6 +995,58 @@ DSPARK_TEST(AnalogRandom_reseed_is_deterministic_across_move)
 }
 
 
+DSPARK_TEST(AnalogRandom_colored_targets_drift_and_smoothing_survives_prepare)
+{
+    using dspark::AnalogRandom::Generator;
+    using dspark::AnalogRandom::NoiseType;
+
+    // The pink/brown filters used to run once per audio sample while the
+    // targets were sampled at the LFO rate, so successive targets were
+    // uncorrelated for every noise type (measured at 2 Hz: lag-1
+    // autocorrelation -0.03 white, -0.02 pink, 0.01 brown) and Brown never
+    // drifted. The filters now advance once per target.
+    auto lag1 = [](NoiseType type) {
+        Generator<double> g(5);
+        g.prepare(48000.0);
+        g.setRange(-1.0, 1.0);
+        g.setRateHz(240.0);    // a new target every 200 samples
+        g.setNoiseType(type);
+        std::vector<double> targets;
+        double prev = 1e9;
+        for (int i = 0; i < 200 * 4000; ++i)
+        {
+            const double v = g.getNextSample();
+            if (std::abs(v - prev) > 1e-12) { targets.push_back(v); prev = v; }
+        }
+        double mean = 0.0;
+        for (double v : targets) mean += v;
+        mean /= static_cast<double>(targets.size());
+        double c0 = 0.0, c1 = 0.0;
+        for (size_t i = 0; i < targets.size(); ++i)
+        {
+            c0 += (targets[i] - mean) * (targets[i] - mean);
+            if (i > 0) c1 += (targets[i] - mean) * (targets[i - 1] - mean);
+        }
+        return c1 / c0;
+    };
+    EXPECT_LT(std::abs(lag1(NoiseType::White)), 0.1);
+    EXPECT_GT(lag1(NoiseType::Pink), 0.5);
+    EXPECT_GT(lag1(NoiseType::Brown), 0.9);
+
+    // setSmoothing() stores a time: set before prepare() (as setAnalogDefault()
+    // callers do), the coefficient used to stay at its 44.1 kHz value.
+    Generator<double> s(3);
+    s.setNoiseType(NoiseType::White);
+    s.setRange(-1.0, 1.0);
+    s.setRateHz(0.5);
+    s.setSmoothing(true, 50.0);
+    s.prepare(96000.0);
+    const double v0 = s.getNextSample();
+    const double v1 = s.getNextSample();
+    const double v2 = s.getNextSample();
+    EXPECT_NEAR((v2 - v1) / (v1 - v0), std::exp(-1.0 / (96000.0 * 0.05)), 1e-6);
+}
+
 // ============================================================================
 // Oscillator hard sync (table minBLEP corrected)
 // ============================================================================

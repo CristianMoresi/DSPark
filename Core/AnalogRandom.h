@@ -11,7 +11,10 @@
  * modulation. Supports white, pink, and brown noise types.
  *
  * Features:
- * - True audio-rate analog drift (continuous 1/f and 1/f^2 filtering).
+ * - Colored target sequences: every new sample-and-hold target is the next
+ *   step of a white, pink (1/f) or brown (1/f^2 random walk) sequence, so
+ *   Pink and Brown drift organically at any rate. At rate == sample rate
+ *   (a new target every sample) this is continuous audio-rate colored noise.
  * - Sample-and-Hold LFO behavior with 1-pole smoothing.
  * - Zero allocations, cache-friendly block processing.
  * - Lock-free cross-thread parameter and readout contract (see Threading).
@@ -204,6 +207,7 @@ namespace dspark
                   max_(other.max_.load(std::memory_order_relaxed)),
                   smoothingEnabled_(other.smoothingEnabled_.load(std::memory_order_relaxed)),
                   smoothingCoeff_(other.smoothingCoeff_.load(std::memory_order_relaxed)),
+                  smoothingTimeMs_(other.smoothingTimeMs_.load(std::memory_order_relaxed)),
                   quantizationStep_(other.quantizationStep_.load(std::memory_order_relaxed)),
                   pendingSeed_(other.pendingSeed_.load(std::memory_order_relaxed)),
                   publishedValue_(other.publishedValue_.load(std::memory_order_relaxed)),
@@ -233,6 +237,7 @@ namespace dspark
                 max_.store        (other.max_.load(std::memory_order_relaxed),               std::memory_order_relaxed);
                 smoothingEnabled_.store(other.smoothingEnabled_.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 smoothingCoeff_.store  (other.smoothingCoeff_.load(std::memory_order_relaxed),   std::memory_order_relaxed);
+                smoothingTimeMs_.store (other.smoothingTimeMs_.load(std::memory_order_relaxed),  std::memory_order_relaxed);
                 quantizationStep_.store(other.quantizationStep_.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 pendingSeed_.store(other.pendingSeed_.load(std::memory_order_relaxed),       std::memory_order_relaxed);
                 publishedValue_.store(other.publishedValue_.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -255,7 +260,11 @@ namespace dspark
              */
             void prepare(double sampleRate) noexcept
             {
-                if (sampleRate > 0.0) sampleRate_ = sampleRate;
+                if (sampleRate > 0.0 && std::isfinite(sampleRate)) sampleRate_ = sampleRate;
+                // The smoothing time is a time: re-derive its per-sample
+                // coefficient for this rate (setSmoothing() is usually called
+                // before prepare(), e.g. through setAnalogDefault()).
+                updateSmoothingCoeff();
                 reset();
             }
 
@@ -304,12 +313,11 @@ namespace dspark
                     reset();
                 }
 
-                const Real continuousNoise = tickContinuousNoise();
                 updatePhase();
 
                 if (triggerNext_.exchange(false, std::memory_order_acquire))
                 {
-                    generateNewTarget(continuousNoise);
+                    generateNewTarget(tickColoredNoise(noiseType_.load(std::memory_order_relaxed)));
                 }
 
                 if (smoothingEnabled_.load(std::memory_order_relaxed))
@@ -365,19 +373,14 @@ namespace dspark
 
                 for (Real& sample : outputBuffer)
                 {
-                    const Real white = static_cast<Real>(prng_.next_double() * 2.0 - 1.0);
-                    Real continuousNoise = white;
-
-                    if (noiseType == NoiseType::Pink) continuousNoise = tickPinkNoise(white);
-                    else if (noiseType == NoiseType::Brown) continuousNoise = tickBrownNoise(white);
-
                     updatePhase();
 
                     if (triggerNext_.exchange(false, std::memory_order_acquire))
                     {
                         // Clamp to [-1,1] before mapping, matching generateNewTarget()
                         // (pink noise can momentarily exceed unity).
-                        const Real cn = std::clamp(continuousNoise, static_cast<Real>(-1), static_cast<Real>(1));
+                        const Real cn = std::clamp(tickColoredNoise(noiseType),
+                                                   static_cast<Real>(-1), static_cast<Real>(1));
                         targetValue_ = currentMin + ((cn * static_cast<Real>(0.5)) + static_cast<Real>(0.5)) * (currentMax - currentMin);
                         if (quantStep > static_cast<Real>(0)) targetValue_ = std::round(targetValue_ / quantStep) * quantStep;
                     }
@@ -461,22 +464,18 @@ namespace dspark
                 max_.store(static_cast<Real>(max), std::memory_order_relaxed);
             }
 
+            /**
+             * @brief Enables one-pole smoothing of the held targets.
+             * @param timeInMs Time constant in ms; zero, negative or NaN means
+             *                 instantaneous. Stored as a time, so it stays
+             *                 correct across a later prepare() at another rate.
+             */
             void setSmoothing(bool shouldBeEnabled, Real timeInMs = static_cast<Real>(50.0)) noexcept
             {
                 smoothingEnabled_.store(shouldBeEnabled, std::memory_order_relaxed);
-                if (sampleRate_ > 0 && timeInMs > static_cast<Real>(0))
-                {
-                    const double coeff = std::exp(-1.0 / (sampleRate_ * (static_cast<double>(timeInMs) / 1000.0)));
-                    smoothingCoeff_.store(static_cast<Real>(1.0 - coeff), std::memory_order_relaxed);
-                }
-                else
-                {
-                    // A zero (or negative) smoothing time means instantaneous.
-                    // Keeping the previous coefficient here (possibly the
-                    // initial 0) would silently freeze the output short of
-                    // every new target while smoothing is enabled.
-                    smoothingCoeff_.store(static_cast<Real>(1), std::memory_order_relaxed);
-                }
+                smoothingTimeMs_.store(timeInMs > static_cast<Real>(0) ? static_cast<double>(timeInMs) : 0.0,
+                                       std::memory_order_relaxed);
+                updateSmoothingCoeff();
             }
 
             void setQuantization(Real step) noexcept
@@ -558,18 +557,34 @@ namespace dspark
                 isSafeToRun_ = std::atomic<Real>::is_always_lock_free
                             && std::atomic<float>::is_always_lock_free
                             && std::atomic<std::uint64_t>::is_always_lock_free
+                            && std::atomic<double>::is_always_lock_free
                             && std::atomic<NoiseType>::is_always_lock_free
                             && std::atomic<BpmDivision>::is_always_lock_free
                             && std::atomic<bool>::is_always_lock_free;
             }
 
+            /** Derives the one-pole coefficient from the stored smoothing time. */
+            void updateSmoothingCoeff() noexcept
+            {
+                const double timeMs = smoothingTimeMs_.load(std::memory_order_relaxed);
+                // A zero smoothing time means instantaneous. Keeping a previous
+                // coefficient here (possibly 0) would silently freeze the output
+                // short of every new target while smoothing is enabled.
+                const double coeff = (timeMs > 0.0)
+                    ? 1.0 - std::exp(-1.0 / (sampleRate_ * timeMs / 1000.0))
+                    : 1.0;
+                smoothingCoeff_.store(static_cast<Real>(coeff), std::memory_order_relaxed);
+            }
+
             /**
-             * @brief Ticks the continuous noise generators at audio rate to preserve mathematical 1/f structures.
+             * @brief Draws the next step of the colored sequence (one per new
+             *        target). Pink and brown are filtered sequences, so their
+             *        correlation spans successive targets whatever the rate.
              */
-            [[nodiscard]] Real tickContinuousNoise() noexcept
+            [[nodiscard]] Real tickColoredNoise(NoiseType type) noexcept
             {
                 const Real white = static_cast<Real>(prng_.next_double() * 2.0 - 1.0);
-                switch (noiseType_.load(std::memory_order_relaxed))
+                switch (type)
                 {
                     case NoiseType::White: return white;
                     case NoiseType::Pink:  return tickPinkNoise(white);
@@ -579,7 +594,7 @@ namespace dspark
             }
 
             /**
-             * @brief Maps the sampled audio-rate noise to the user boundaries.
+             * @brief Maps one step of the colored sequence to the user boundaries.
              */
             void generateNewTarget(Real sampledNoise) noexcept
             {
@@ -725,7 +740,8 @@ namespace dspark
             std::atomic<Real> min_{ static_cast<Real>(-1) };
             std::atomic<Real> max_{ static_cast<Real>(1) };
             std::atomic<bool> smoothingEnabled_{ false };
-            std::atomic<Real> smoothingCoeff_{ static_cast<Real>(0) };
+            std::atomic<Real> smoothingCoeff_{ static_cast<Real>(1) };
+            std::atomic<double> smoothingTimeMs_{ 0.0 };
             std::atomic<Real> quantizationStep_{ static_cast<Real>(0) };
             std::atomic<std::uint64_t> pendingSeed_{ 0 };
             // Cross-thread READOUT words (each a single independent

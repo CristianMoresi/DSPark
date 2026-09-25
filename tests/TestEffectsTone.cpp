@@ -2741,9 +2741,9 @@ DSPARK_TEST(FilterEngine_granular_shelf_slope_setter)
     EXPECT_TRUE(std::isfinite(feEnergy(b, 4)));
 
     Equalizer<float> eq;
+    EXPECT_TRUE(eq.isMatchedBells());   // matched bells are the default
+    eq.setMatchedBells(false);
     EXPECT_FALSE(eq.isMatchedBells());
-    eq.setMatchedBells(true);
-    EXPECT_TRUE(eq.isMatchedBells());
 }
 
 static double eqEnergy(dspark::Equalizer<float>& eq, int nblk)

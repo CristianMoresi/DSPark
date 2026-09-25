@@ -130,7 +130,7 @@ inline EffectSlot makeEqualizer()
     // Matched Bells selects the analog-matched de-cramped design for Peak bands
     // (audible on high-frequency bells; the curve follows).
     s.addChoice("Phase Mode", {"Minimum","Linear"}, 0);
-    s.addToggle("Matched Bells", false);
+    s.addToggle("Matched Bells", true);
     // Type index -> framework enum. The UI groups cuts after the shelves;
     // the enum orders LowPass/HighPass there, so the mapping is direct.
     auto toType = [](float v) {

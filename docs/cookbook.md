@@ -66,7 +66,7 @@ Generalize the same pattern to any parameter with `ModulationRouter`
 
 ```cpp
 Equalizer<float> eq;            eq.prepare(spec);
-eq.setMatchedBells(true);       // analog-matched (de-cramped) bells near Nyquist
+// Peak bands use analog-matched (de-cramped) bells by default.
 eq.setBand(0, 90.0f, -1.5f);
 eq.setBand(1, 12000.0f, 1.0f);
 

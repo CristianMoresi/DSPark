@@ -2437,11 +2437,20 @@ DSPARK_TEST(TubePreamp_oversampling_configurable_and_reported)
 
 // A transient NaN/Inf field must not poison the Jiles-Atherton core
 // forever - after the bad samples the output recovers to finite, bounded M.
+// Non-finite configuration is ignored too: prepare(NaN) used to pass the
+// `<= 0` test and a NaN parameter passed std::max/std::clamp, each silencing
+// the core for good.
 DSPARK_TEST(Hysteresis_survives_nonfinite_input)
 {
     Hysteresis<double> h;
     h.prepare(192000.0);
     h.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    h.prepare(nan);
+    h.prepare(std::numeric_limits<double>::infinity());
+    h.setParameters(nan, 2.2e4, 1.6e-3, 2.7e4, 0.17);
+    h.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, nan);
+    EXPECT_NEAR(h.getSaturation(), 3.5e5, 0.0);
     for (int i = 0; i < 500; ++i) (void)h.processSample(2.0e4 * std::sin(0.01 * i));
     (void)h.processSample(std::numeric_limits<double>::quiet_NaN());
     (void)h.processSample(std::numeric_limits<double>::infinity());

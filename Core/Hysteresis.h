@@ -57,10 +57,12 @@ template <FloatType T>
 class Hysteresis
 {
 public:
-    /** @brief Prepares the integrator for the given sample rate. */
+    /** @brief Prepares the integrator for the given sample rate. A
+     *  non-positive or non-finite rate is ignored (NaN used to pass the old
+     *  `<= 0` test and poison the integrator). */
     void prepare(double sampleRate)
     {
-        if (sampleRate <= 0.0) return;
+        if (!(sampleRate > 0.0) || !std::isfinite(sampleRate)) return;
         invFs2_ = 0.5 / sampleRate;
         fs2_ = 2.0 * sampleRate;
         reset();
@@ -85,9 +87,15 @@ public:
      * @param alpha Inter-domain coupling.                     [1.6e-3]
      * @param k     Coercivity / loop-loss parameter (A/m).    [2.7e4]
      * @param c     Reversible magnetization fraction [0, 1).  [1.7e-1]
+     *
+     * A call with any non-finite argument is ignored: std::max/std::clamp pass
+     * NaN through, and a NaN parameter would silence the core permanently.
      */
     void setParameters(double ms, double a, double alpha, double k, double c) noexcept
     {
+        if (!std::isfinite(ms) || !std::isfinite(a) || !std::isfinite(alpha)
+            || !std::isfinite(k) || !std::isfinite(c))
+            return;
         ms_    = std::max(ms, 1.0);
         a_     = std::max(a, 1.0);
         alpha_ = std::max(alpha, 0.0);

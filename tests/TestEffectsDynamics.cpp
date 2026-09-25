@@ -634,7 +634,7 @@ DSPARK_TEST(NoiseGate_block_matches_per_sample)
     // signal: with strong lows plus weak highs the adaptive hold diverged
     // (measured: maxDiff 0.005 between paths). Both paths now track the same
     // (filtered) signal and are bit-identical for mono.
-    for (int cfg = 0; cfg < 2; ++cfg)
+    for (int cfg = 0; cfg < 3; ++cfg)
     {
         NoiseGate<float> gb, gs;
         auto setup = [&](NoiseGate<float>& g) {
@@ -642,6 +642,7 @@ DSPARK_TEST(NoiseGate_block_matches_per_sample)
             g.setThreshold(-40.0f); g.setRelease(20.0f);
             if (cfg == 1) { g.setHold(0.0f); g.setSidechainHPF(true, 1000.0); g.setAdaptiveHold(true); }
             else          { g.setHold(10.0f); }
+            if (cfg == 2) g.setLookahead(2.0f); // the delay line rides along too
         };
         setup(gb); setup(gs);
 
@@ -672,6 +673,47 @@ DSPARK_TEST(NoiseGate_block_matches_per_sample)
         }
         EXPECT_TRUE(maxDiff == 0.0f); // bit-exact in both configurations
     }
+}
+
+// Without lookahead the gate opens only as a transient arrives, so the attack
+// ramp chops its first milliseconds (here the first millisecond of a burst
+// comes out ~8 dB down with a 1 ms attack). With lookahead the audio is
+// delayed, the gate is already open when the burst reaches the output, and
+// getLatency() reports the delay for compensation.
+DSPARK_TEST(NoiseGate_lookahead_keeps_the_transient_onset)
+{
+    auto onsetLossDb = [](float lookaheadMs, int& latency) {
+        NoiseGate<float> g;
+        g.prepare(48000.0, 1);
+        g.setThreshold(-40.0f);
+        g.setAttack(1.0f);
+        g.setLookahead(lookaheadMs);
+        latency = g.getLatency();
+        const int n0 = 9600, n = 14400;
+        std::vector<float> x(static_cast<size_t>(n), 0.0f);
+        for (int i = n0; i < n; ++i)
+            x[static_cast<size_t>(i)] = 0.5f * std::sin(6.2831853f * 1000.0f * (i - n0) / 48000.0f);
+        std::vector<float> y = x;
+        for (int off = 0; off < n; off += 256)
+        {
+            float* p[1] = { y.data() + off };
+            g.processBlock(AudioBufferView<float>(p, 1, std::min(256, n - off)));
+        }
+        double eIn = 0.0, eOut = 0.0;
+        for (int k = 0; k < 48; ++k)
+        {
+            eIn += static_cast<double>(x[static_cast<size_t>(n0 + k)]) * x[static_cast<size_t>(n0 + k)];
+            eOut += static_cast<double>(y[static_cast<size_t>(n0 + latency + k)]) * y[static_cast<size_t>(n0 + latency + k)];
+        }
+        return 10.0 * std::log10(eOut / eIn);
+    };
+    int latency = -1;
+    const double without = onsetLossDb(0.0f, latency);
+    EXPECT_EQ(latency, 0);
+    const double with = onsetLossDb(3.0f, latency);
+    EXPECT_EQ(latency, 144);            // 3 ms @ 48 kHz
+    EXPECT_LT(without, -3.0);           // the onset is chopped without lookahead
+    EXPECT_GT(with, -0.5);              // and kept with it
 }
 
 DSPARK_TEST(NoiseGate_sidechain_path_matches_mono_path)

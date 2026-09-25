@@ -25,6 +25,9 @@
  * - Stereo linked detection
  * - Smooth attack/release transitions
  * - Adaptive hold (holds at least one estimated signal period)
+ * - Optional lookahead (0-10 ms): the gate opens before a transient reaches
+ *   the output, so its first milliseconds are not chopped by the attack ramp
+ *   (the latency is reported by getLatency())
  *
  * Threading: prepare() belongs to the setup thread; processBlock(),
  * processSample() and reset() belong to the audio thread. All setters are
@@ -33,7 +36,7 @@
  * setter arguments are ignored.
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h,
- *               StateBlob.h.
+ *               RingBuffer.h, StateBlob.h.
  *
  * @code
  *   dspark::NoiseGate<float> gate;
@@ -53,6 +56,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/RingBuffer.h"
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
@@ -98,14 +102,21 @@ public:
      * @brief Prepares the noise gate for processing.
      *
      * Release-safe: a non-positive or non-finite sample rate makes this call
-     * a no-op (the previous state and rate are kept).
+     * a no-op (the previous state and rate are kept; +inf used to pass).
+     * Allocates the lookahead delay lines (setup thread only).
      *
-     * @param sampleRate Operating sample rate in Hz (must be > 0).
+     * @param sampleRate  Operating sample rate in Hz (must be > 0).
+     * @param numChannels Channels that receive the lookahead delay (clamped
+     *                    to [1, 16]); further channels are gated undelayed.
      */
-    void prepare(double sampleRate) noexcept
+    void prepare(double sampleRate, int numChannels = 2) noexcept
     {
-        if (!(sampleRate > 0.0)) return; // NaN-safe validity gate
+        if (!(sampleRate > 0.0) || !std::isfinite(sampleRate)) return; // NaN/inf-safe gate
         sampleRate_ = sampleRate;
+        lookaheadChannels_ = std::clamp(numChannels, 1, kMaxLookaheadChannels);
+        maxLookaheadSamples_ = static_cast<int>(std::ceil(sampleRate * kMaxLookaheadMs / 1000.0));
+        for (int ch = 0; ch < lookaheadChannels_; ++ch)
+            lookahead_[static_cast<size_t>(ch)].prepare(maxLookaheadSamples_ + 1);
         syncParams();
         reset();
     }
@@ -114,7 +125,7 @@ public:
      * @brief Prepares from AudioSpec (unified API).
      * @param spec AudioSpec containing format details.
      */
-    void prepare(const AudioSpec& spec) noexcept { prepare(spec.sampleRate); }
+    void prepare(const AudioSpec& spec) noexcept { prepare(spec.sampleRate, spec.numChannels); }
 
     /**
      * @brief Processes an AudioBufferView in-place.
@@ -164,10 +175,11 @@ public:
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* d = buffer.getChannel(ch);
+                const T x = delayed(d[i], ch);
                 // Frequency mode keeps per-channel filter state only for the first
                 // kMaxChannels; any extra channels fall back to amplitude gating.
-                d[i] = (freqMode && ch < kMaxChannels) ? applyFrequencyGate(d[i], ch)
-                                                       : d[i] * gain;
+                d[i] = (freqMode && ch < kMaxChannels) ? applyFrequencyGate(x, ch)
+                                                       : x * gain;
             }
         }
     }
@@ -229,8 +241,9 @@ public:
                 for (int ch = 0; ch < nCh; ++ch)
                 {
                     T* d = audio.getChannel(ch);
-                    d[i] = (freqMode && ch < kMaxChannels) ? applyFrequencyGate(d[i], ch)
-                                                           : d[i] * gain;
+                    const T x = delayed(d[i], ch);
+                    d[i] = (freqMode && ch < kMaxChannels) ? applyFrequencyGate(x, ch)
+                                                           : x * gain;
                 }
             }
         }
@@ -308,6 +321,33 @@ public:
         const int m = std::clamp(static_cast<int>(mode), 0, static_cast<int>(GateMode::Frequency));
         gateMode_.store(static_cast<GateMode>(m), std::memory_order_relaxed);
         paramsDirty_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief Sets the lookahead: the audio is delayed so the gate opens (and
+     *        closes) ahead of it. 0 (default) is latency-free.
+     *
+     * RT-safe publication, consumed at the next block; change it while
+     * stopped (a live change jumps the delay and may click). Report
+     * getLatency() to the host for delay compensation.
+     *
+     * @param ms Lookahead in milliseconds, clamped to [0, 10]. Non-finite
+     *           values are ignored.
+     */
+    void setLookahead(T ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        lookaheadMs_.store(std::clamp(ms, T(0), static_cast<T>(kMaxLookaheadMs)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Returns the lookahead in milliseconds. */
+    [[nodiscard]] T getLookahead() const noexcept { return lookaheadMs_.load(std::memory_order_relaxed); }
+
+    /** @brief Latency in samples (the lookahead), correct right after setLookahead(). */
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        return lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
     }
 
     /** @brief Toggles adaptive hold based on zero-crossing rate. */
@@ -389,6 +429,7 @@ public:
         zeroCrossSamples_ = 0;
         prevSign_ = false;
         estimatedPeriod_ = 0;
+        for (auto& line : lookahead_) line.reset();
     }
 
 
@@ -407,6 +448,7 @@ public:
         w.write("adaptiveHold", adaptiveHold_.load(std::memory_order_relaxed));
         w.write("scHpf", scHpfEnabled_.load(std::memory_order_relaxed));
         w.write("scHpfFreq", static_cast<float>(scHpfFreq_.load(std::memory_order_relaxed)));
+        w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -426,6 +468,7 @@ public:
         setAdaptiveHold(r.read("adaptiveHold", false));
         setSidechainHPF(r.read("scHpf", false),
                         static_cast<double>(r.read("scHpfFreq", 80.0f)));
+        setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         return true;
     }
 
@@ -485,6 +528,25 @@ protected:
 
         cachedNyquist_ = static_cast<T>(fs * 0.5);
         cachedFsInvPi2_ = static_cast<T>(std::numbers::pi * 2.0 / fs);
+
+        lookaheadSamples_ = lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
+    }
+
+    /** Lookahead in samples for a ms value (shared by syncParams() and getLatency()). */
+    [[nodiscard]] int lookaheadSamplesFor(T ms) const noexcept
+    {
+        const double samples = std::round(static_cast<double>(ms) * sampleRate_ / 1000.0);
+        return std::clamp(static_cast<int>(std::min(samples, 1.0e9)), 0, maxLookaheadSamples_);
+    }
+
+    /** The lookahead-delayed audio sample of a channel (pass-through when off
+     *  or beyond the prepared channels). */
+    [[nodiscard]] inline T delayed(T x, int ch) noexcept
+    {
+        if (lookaheadSamples_ <= 0 || ch >= lookaheadChannels_) return x;
+        auto& line = lookahead_[static_cast<size_t>(ch)];
+        line.push(x);
+        return line.read(lookaheadSamples_);
     }
 
     /**
@@ -617,6 +679,7 @@ protected:
 
         T envelope = computeEnvelopeFollower(rawLevel);
         updateStateMachine(envelope);
+        input = delayed(input, ch);
 
         if (cachedGateMode_ == GateMode::Frequency)
         {
@@ -642,6 +705,15 @@ protected:
 
     std::atomic<bool> scHpfEnabled_ { false };
     std::atomic<T> scHpfFreq_ { T(80) };
+
+    // Lookahead (audio delayed; detection runs on the undelayed signal).
+    static constexpr double kMaxLookaheadMs = 10.0;
+    static constexpr int kMaxLookaheadChannels = 16;
+    std::atomic<T> lookaheadMs_ { T(0) };
+    int lookaheadSamples_ = 0;      ///< Audio-side value (consumed in syncParams()).
+    int maxLookaheadSamples_ = 0;   ///< Allocated delay (0 before prepare()).
+    int lookaheadChannels_ = 0;     ///< Channels with a prepared delay line.
+    std::array<RingBuffer<T>, kMaxLookaheadChannels> lookahead_ {};
 
     // Cached internal variables
     T cachedThresholdLinear_ = T(0.01);

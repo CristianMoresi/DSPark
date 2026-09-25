@@ -461,7 +461,8 @@
  * | `RingBuffer<T>`          | Core/RingBuffer.h         | Power-of-two circular buffer with interp. read    |
  * | `SampleAndHold<T>`       | Core/SampleAndHold.h      | S&H for bit-crush and stepped modulation          |
  * | `WaveshapeTable<T>`      | Core/WaveshapeTable.h     | Table-lookup waveshaper with presets              |
- * | `Hilbert<T>`             | Core/Hilbert.h            | Allpass Hilbert transform for analytic signals    |
+ * | `Hilbert<T>`             | Core/Hilbert.h            | FIR Hilbert transform, sample-aligned analytic pair |
+ * | `HilbertIIR<T>`          | Core/Hilbert.h            | Zero-latency allpass analytic pair (envelopes)    |
  * | `TruePeakDetector<T>`    | Core/TruePeakDetector.h   | Shared ITU-R BS.1770-4 inter-sample peak detector |
  * | `AnalogConstants`        | Core/AnalogConstants.h    | Analog-hardware reference constants (zero runtime cost) |
  * | `SpinLock`               | Core/SpinLock.h           | RT-safe spinlock for thread-safe parameters       |

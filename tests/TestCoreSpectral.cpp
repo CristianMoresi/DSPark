@@ -587,6 +587,51 @@ DSPARK_TEST(Hilbert_real_branch_is_exact_delayed_input)
     }
 }
 
+// The zero-latency IIR pair: in quadrature from 20 Hz up to 20 kHz at every
+// supported rate (the analytic magnitude of a tone stays flat to 0.15 % peak
+// to peak), imag lags real like the Hilbert transform, and the block path is
+// bit-identical to the per-sample one.
+DSPARK_TEST(HilbertIIR_is_in_quadrature_from_20_hz_at_every_rate)
+{
+    for (double fs : { 44100.0, 96000.0, 192000.0 })
+    {
+        for (double f : { 20.0, 100.0, 1000.0, 10000.0, 19000.0 })
+        {
+            HilbertIIR<double> h;
+            const int n = static_cast<int>(fs);
+            double lo = 1e9, hi = 0.0, lastAngle = 0.0;
+            int backwards = 0;
+            for (int i = 0; i < n; ++i)
+            {
+                const auto r = h.process(std::cos(twoPi<double> * f * i / fs));
+                const double m = std::sqrt(r.real * r.real + r.imag * r.imag);
+                const double angle = std::atan2(r.imag, r.real);
+                if (i > n / 2)
+                {
+                    lo = std::min(lo, m);
+                    hi = std::max(hi, m);
+                    double d = angle - lastAngle;
+                    if (d > pi<double>) d -= twoPi<double>;
+                    if (d < -pi<double>) d += twoPi<double>;
+                    if (d <= 0.0) ++backwards;
+                }
+                lastAngle = angle;
+            }
+            EXPECT_LT((hi - lo) / hi, 1.5e-3);
+            EXPECT_EQ(backwards, 0);
+        }
+    }
+
+    HilbertIIR<float> a, b;
+    std::vector<float> x(1000), block(1000);
+    for (int i = 0; i < 1000; ++i) x[static_cast<size_t>(i)] = std::sin(0.05f * i) * std::exp(-0.002f * i) + 0.1f * std::cos(1.3f * i);
+    b.magnitudeBlock(x.data(), block.data(), 1000);
+    int mismatches = 0;
+    for (int i = 0; i < 1000; ++i)
+        if (a.magnitude(x[static_cast<size_t>(i)]) != block[static_cast<size_t>(i)]) ++mismatches;
+    EXPECT_EQ(mismatches, 0);
+}
+
 DSPARK_TEST(Hilbert_block_matches_per_sample_and_dc_rejection)
 {
     // processBlock must be bit-identical to the per-sample path.

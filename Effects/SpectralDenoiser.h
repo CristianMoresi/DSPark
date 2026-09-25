@@ -5,22 +5,24 @@
 
 /**
  * @file SpectralDenoiser.h
- * @brief Spectral gating denoiser with a learnable noise profile.
+ * @brief Spectral noise reduction with a learnable noise profile.
  *
- * Classic broadcast noise reduction on the SpectralProcessor STFT pipeline:
+ * Broadcast-style noise reduction on the SpectralProcessor STFT pipeline:
  *
- * 1. **Learn**: while learning is enabled, the per-bin magnitude of the
- *    incoming signal (noise only - e.g. a second of room tone) accumulates
- *    into a noise profile (running maximum with a soft average).
- * 2. **Gate**: each bin whose magnitude falls below `threshold *` profile is
- *    attenuated by up to `reduction` dB. Gains are smoothed over time per
- *    bin (fast attack, slow release) and across frequency (3-bin averaging),
- *    the standard defenses against musical noise.
+ * 1. **Learn**: while learning is enabled, the per-bin power of the incoming
+ *    signal (noise only - e.g. a second of room tone) accumulates into the
+ *    noise profile: the running mean noise power per bin.
+ * 2. **Reduce**: each bin gets the Wiener gain xi / (1 + xi), where the a
+ *    priori SNR xi is the decision-directed estimate of Ephraim and Malah
+ *    (weight 0.98 per hop) against the profile scaled by `threshold^2`.
+ *    Gains never fall below the `reduction` floor. The decision-directed
+ *    estimate follows onsets at once but ignores random noise flicker, so
+ *    the residual noise stays a smooth, attenuated copy of the noise instead
+ *    of the "musical noise" (isolated tones) a hard per-bin gate leaves.
  *
- * Latency is the STFT's (fftSize samples). All per-bin state is per channel.
- * The temporal release coefficient is per STFT hop, so the release time in
- * milliseconds scales with fftSize/sampleRate (about 70 ms at the 2048
- * default and 48 kHz).
+ * Latency is the STFT's (fftSize samples). All per-bin state is per channel;
+ * the profile is shared. The decision-directed weight is per STFT hop, so its
+ * memory in milliseconds scales with fftSize/sampleRate.
  *
  * Threading model: parameter setters/getters are std::atomic based and safe
  * from any thread (non-finite values are ignored). prepare() is setup-thread
@@ -51,7 +53,7 @@ namespace dspark {
 
 /**
  * @class SpectralDenoiser
- * @brief Learn-a-profile spectral gate (hiss/hum/room-tone reduction).
+ * @brief Learn-a-profile spectral noise reduction (hiss/hum/room-tone).
  *
  * @tparam T Sample type (float or double).
  */
@@ -81,9 +83,9 @@ public:
         numBins_ = stft_.getNumBins();
 
         profile_.assign(static_cast<size_t>(numBins_), 0.0f);
-        gains_.assign(static_cast<size_t>(numChannels_),
-                      std::vector<float>(static_cast<size_t>(numBins_), 1.0f));
-        smooth_.assign(static_cast<size_t>(numBins_), 1.0f);
+        learnFrames_ = 0;
+        cleanPower_.assign(static_cast<size_t>(numChannels_),
+                           std::vector<float>(static_cast<size_t>(numBins_), 0.0f));
 
         prepared_.store(true, std::memory_order_relaxed);
         reset();
@@ -94,8 +96,8 @@ public:
     {
         if (!prepared_.load(std::memory_order_relaxed)) return;
         stft_.reset();
-        for (auto& g : gains_)
-            std::fill(g.begin(), g.end(), 1.0f);
+        for (auto& c : cleanPower_)
+            std::fill(c.begin(), c.end(), 0.0f);
         callCounter_ = 0;
     }
 
@@ -103,6 +105,7 @@ public:
     void clearProfile() noexcept
     {
         std::fill(profile_.begin(), profile_.end(), 0.0f);
+        learnFrames_ = 0;
     }
 
     // -- Parameters (thread-safe) ---------------------------------------------------
@@ -113,16 +116,18 @@ public:
         learning_.store(learning, std::memory_order_relaxed);
     }
 
-    /** @brief Maximum attenuation of gated bins in dB [0, 40] (default 18).
-     *  Non-finite values are ignored. */
+    /** @brief Maximum attenuation of noise bins in dB [0, 40] (default 18):
+     *  the floor of the per-bin gain. Non-finite values are ignored. */
     void setReduction(T db) noexcept
     {
         if (!std::isfinite(db)) return;
         reduction_.store(std::clamp(db, T(0), T(40)), std::memory_order_relaxed);
     }
 
-    /** @brief Gate threshold over the learned profile [1, 8] (default 2).
-     *  Non-finite values are ignored. */
+    /** @brief Noise over-subtraction factor over the learned profile, in
+     *  magnitude [1, 8] (default 2): the gain rule sees the learned noise
+     *  scaled by it, so higher values remove more noise and more low-level
+     *  signal. Non-finite values are ignored. */
     void setThreshold(T factor) noexcept
     {
         if (!std::isfinite(factor)) return;
@@ -180,44 +185,54 @@ public:
         const int nChEff = std::max(1, std::min(buffer.getNumChannels(), numChannels_));
         callCounter_ = 0;
 
-        stft_.processBlock(buffer, [this, learning, floorGain, thresh, nChEff](T* bins, int numBins)
+        // Over-subtraction: the learned noise power is scaled by threshold^2.
+        const float overSub = thresh * thresh;
+
+        stft_.processBlock(buffer, [this, learning, floorGain, overSub, nChEff](T* bins, int numBins)
         {
-            auto& chGain = gains_[static_cast<size_t>(callCounter_ % nChEff)];
+            auto& clean = cleanPower_[static_cast<size_t>(callCounter_ % nChEff)];
             ++callCounter_;
 
-            // Per-bin raw gate decision.
+            // The profile is the running MEAN noise power per bin (the
+            // cumulative average over every learned frame, then an
+            // exponential average once kMaxLearnFrames are in).
+            float learnRate = 0.0f;
+            if (learning)
+            {
+                learnFrames_ = std::min(learnFrames_ + 1, kMaxLearnFrames);
+                learnRate = 1.0f / static_cast<float>(learnFrames_);
+            }
+
             for (int k = 0; k < numBins; ++k)
             {
                 const float re = static_cast<float>(bins[2 * k]);
                 const float im = static_cast<float>(bins[2 * k + 1]);
-                const float mag = std::sqrt(re * re + im * im);
+                const float power = re * re + im * im;
 
+                auto& noise = profile_[static_cast<size_t>(k)];
                 if (learning)
+                    noise += learnRate * (power - noise);
+
+                // Decision-directed Wiener gain (Ephraim-Malah a priori SNR):
+                // the a priori SNR mixes the previous frame's clean estimate
+                // with this frame's excess power, so it follows speech and
+                // music onsets at once while random noise flicker cannot open
+                // a bin (the hard per-bin gate did exactly that: musical noise).
+                float gain = 1.0f;
+                const float lambda = overSub * noise;
+                auto& prevClean = clean[static_cast<size_t>(k)];
+                if (lambda > 0.0f)
                 {
-                    // Profile: peak-hold with a gentle average pull-up.
-                    auto& p = profile_[static_cast<size_t>(k)];
-                    p = std::max(p * 0.995f + mag * 0.005f, std::max(p, mag * 0.8f));
+                    const float post = power / lambda;
+                    const float prio = std::max(kDDAlpha * prevClean / lambda
+                                                + (1.0f - kDDAlpha) * std::max(post - 1.0f, 0.0f),
+                                                kMinPrioriSnr);
+                    gain = std::max(prio / (1.0f + prio), floorGain);
                 }
+                prevClean = gain * gain * power;
 
-                const float open = profile_[static_cast<size_t>(k)] * thresh;
-                smooth_[static_cast<size_t>(k)] = (mag > open) ? 1.0f : floorGain;
-            }
-
-            // Frequency smoothing (3-bin average) defends against isolated
-            // flickering bins - the source of musical noise.
-            for (int k = 0; k < numBins; ++k)
-            {
-                const float a = smooth_[static_cast<size_t>(std::max(k - 1, 0))];
-                const float b = smooth_[static_cast<size_t>(k)];
-                const float c = smooth_[static_cast<size_t>(std::min(k + 1, numBins - 1))];
-                float target = (a + b + c) * (1.0f / 3.0f);
-
-                // Temporal smoothing: instant attack (open fast), slow release.
-                auto& g = chGain[static_cast<size_t>(k)];
-                g = (target > g) ? target : (g * 0.85f + target * 0.15f);
-
-                bins[2 * k] = static_cast<T>(static_cast<float>(bins[2 * k]) * g);
-                bins[2 * k + 1] = static_cast<T>(static_cast<float>(bins[2 * k + 1]) * g);
+                bins[2 * k] = static_cast<T>(re * gain);
+                bins[2 * k + 1] = static_cast<T>(im * gain);
             }
         });
     }
@@ -228,9 +243,13 @@ private:
     int numBins_ = 0;
     std::atomic<bool> prepared_ { false };
 
-    std::vector<float> profile_;               ///< Learned noise magnitude per bin.
-    std::vector<std::vector<float>> gains_;    ///< Per-channel smoothed gains.
-    std::vector<float> smooth_;                ///< Scratch raw/frequency-smoothed gains.
+    static constexpr float kDDAlpha = 0.98f;           ///< Decision-directed weight per hop.
+    static constexpr float kMinPrioriSnr = 0.003162f;  ///< -25 dB a priori SNR floor.
+    static constexpr int kMaxLearnFrames = 4096;       ///< Averaging horizon of the profile.
+
+    std::vector<float> profile_;                  ///< Learned mean noise power per bin.
+    int learnFrames_ = 0;                         ///< Frames in the running mean.
+    std::vector<std::vector<float>> cleanPower_;  ///< Per-channel previous clean power estimate.
     int callCounter_ = 0;
 
     std::atomic<bool> learning_ { false };

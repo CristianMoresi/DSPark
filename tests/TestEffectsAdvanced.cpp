@@ -3570,6 +3570,79 @@ DSPARK_TEST(SpectralDenoiser_improves_snr_and_keeps_tone)
 }
 
 
+DSPARK_TEST(SpectralDenoiser_leaves_no_musical_noise)
+{
+    // The hard per-bin gate opened whichever noise bins crossed the threshold:
+    // isolated tones flickering in the residual ("musical noise"). Measured as
+    // the mean peak-to-mean ratio of the residual's magnitude spectrum: 3.5,
+    // against 2.9 for the input noise itself. The decision-directed Wiener
+    // gain leaves a smooth, attenuated copy of the noise (2.9) at the same
+    // 20 dB reduction.
+    SpectralDenoiser<float> dn;
+    dn.prepare(spec(48000.0, 512, 1));
+    dn.setReduction(20.0f);
+    dn.setThreshold(2.0f);
+
+    uint32_t rng = 7u;
+    auto gauss = [&]() {   // Irwin-Hall: portable, about N(0, 0.03^2)
+        float sum = 0.0f;
+        for (int j = 0; j < 12; ++j)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            sum += static_cast<float>(rng >> 8) / 16777216.0f;
+        }
+        return 0.03f * (sum - 6.0f);
+    };
+    std::vector<float> in, out, blk(512);
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        dn.setLearning(pass == 0);
+        for (int b = 0; b < 190; ++b)
+        {
+            for (auto& v : blk) v = gauss();
+            if (pass == 1) in.insert(in.end(), blk.begin(), blk.end());
+            float* p[1] = { blk.data() };
+            dn.processBlock(AudioBufferView<float>(p, 1, 512));
+            if (pass == 1) out.insert(out.end(), blk.begin(), blk.end());
+        }
+    }
+
+    // Mean over frames of max/mean |X[k]| (Hann, 1024 points, bins 10..498).
+    auto peakToMean = [](const std::vector<float>& x) {
+        const int n = 1024;
+        double acc = 0.0;
+        int frames = 0;
+        for (size_t off = 48000; off + n <= x.size() && frames < 20; off += n, ++frames)
+        {
+            double peak = 0.0, mean = 0.0;
+            for (int k = 10; k < 500; k += 2)
+            {
+                double re = 0.0, im = 0.0;
+                for (int i = 0; i < n; ++i)
+                {
+                    const double w = 0.5 - 0.5 * std::cos(6.283185307179586 * i / n);
+                    const double ph = 6.283185307179586 * static_cast<double>(k) * i / n;
+                    re += w * x[off + static_cast<size_t>(i)] * std::cos(ph);
+                    im -= w * x[off + static_cast<size_t>(i)] * std::sin(ph);
+                }
+                const double m = std::sqrt(re * re + im * im);
+                peak = std::max(peak, m);
+                mean += m;
+            }
+            acc += peak / (mean / 245.0);
+        }
+        return acc / frames;
+    };
+    double eIn = 0.0, eOut = 0.0;
+    for (size_t i = 48000; i < out.size(); ++i)
+    {
+        eIn += static_cast<double>(in[i]) * in[i];
+        eOut += static_cast<double>(out[i]) * out[i];
+    }
+    EXPECT_NEAR(10.0 * std::log10(eOut / eIn), -20.0, 1.0);   // the floor still applies
+    EXPECT_LT(peakToMean(out), peakToMean(in) * 1.06);         // old: 1.2x the input's
+}
+
 DSPARK_TEST(PitchShifter_formant_preserve_keeps_envelope)
 {
     // 150 Hz glottal train through fixed 800/2400 Hz resonators, +7 st.

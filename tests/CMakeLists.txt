@@ -5,7 +5,7 @@
 #   ctest --test-dir build --output-on-failure
 #
 # Five targets:
-#   dspark_tests            the ordinary 918-case suite (zero dependencies)
+#   dspark_tests            the ordinary 919-case suite (zero dependencies)
 #   dspark_alloc_failure    allocation-failure injection, deliberately apart
 #   dspark_reverb_publication fixed-operation ownership/publication contract
 #   dspark_standalone       compile gate: umbrella header alone, float + double

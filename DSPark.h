@@ -385,7 +385,7 @@
  * | `TransformerModel<T>`    | Effects/TransformerModel.h | Audio transformer: flux-domain JA hysteresis, LF bloom, HF bell |
  * | `GranularProcessor<T>`   | Effects/GranularProcessor.h | Granular clouds/freeze: per-grain pitch, jitter, stereo spread |
  * | `SpectralFreeze<T>`      | Effects/SpectralFreeze.h | Tonal or diffuse STFT magnitude hold with deterministic transitions |
- * | `SpectralDenoiser<T>`    | Effects/SpectralDenoiser.h | Learnable-profile spectral gating noise reduction |
+ * | `SpectralDenoiser<T>`    | Effects/SpectralDenoiser.h | Learnable-profile spectral noise reduction (Wiener, decision-directed) |
  * | `PitchCorrector<T>`      | Effects/PitchCorrector.h | Monophonic scale-aware retune: detect, quantize, shift, with formant preservation |
  * | `ChordDetector<T>`       | Music/ChordDetector.h     | Goertzel chroma + template chord recognition with confidence |
  * | `KeyDetector<T>`         | Music/KeyDetector.h       | Musical key estimation: accumulated chroma against published key profiles |

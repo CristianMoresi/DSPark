@@ -569,6 +569,11 @@ private:
             ImGui::Separator();
         }
 
+        // Mirror parameters the processor moved itself (e.g. a preset load),
+        // unless the user is holding a widget right now.
+        if (sel->readbackFn && !ImGui::IsAnyItemActive())
+            sel->readbackFn(sel->values);
+
         for (int i = 0; i < static_cast<int>(sel->params.size()); ++i)
         {
             auto& pd = sel->params[i];

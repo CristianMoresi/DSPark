@@ -684,6 +684,10 @@ public:
     [[nodiscard]] T getBassDecayMultiplier() const noexcept { return bassDecayMult_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getHighCrossover() const noexcept { return highCrossover_.load(std::memory_order_relaxed); }
+    /** @brief Early reflections level in dB (as set, or the preset's). */
+    [[nodiscard]] T getEarlyLevel() const noexcept { return levelDb(earlyLevel_.load(std::memory_order_relaxed)); }
+    /** @brief Late tail level in dB (as set, or the preset's). */
+    [[nodiscard]] T getLateLevel() const noexcept { return levelDb(lateLevel_.load(std::memory_order_relaxed)); }
     [[nodiscard]] T getBassCrossover() const noexcept { return bassCrossover_.load(std::memory_order_relaxed); }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
@@ -706,10 +710,8 @@ public:
         w.write("bassDecay", bassDecayMult_.load(std::memory_order_relaxed));
         w.write("highXover", highCrossover_.load(std::memory_order_relaxed));
         w.write("bassXover", bassCrossover_.load(std::memory_order_relaxed));
-        w.write("earlyDb", static_cast<float>(20.0 * std::log10(std::max(
-            static_cast<double>(earlyLevel_.load(std::memory_order_relaxed)), 1e-6))));
-        w.write("lateDb", static_cast<float>(20.0 * std::log10(std::max(
-            static_cast<double>(lateLevel_.load(std::memory_order_relaxed)), 1e-6))));
+        w.write("earlyDb", static_cast<float>(getEarlyLevel()));
+        w.write("lateDb", static_cast<float>(getLateLevel()));
         w.write("toneLowCut", toneLowCutHz_.load(std::memory_order_relaxed));
         w.write("toneHighCut", toneHighCutHz_.load(std::memory_order_relaxed));
         return w.blob();
@@ -975,6 +977,12 @@ protected:
         const double v = std::sin(static_cast<double>(k) * 12.9898
                                   + static_cast<double>(s) * 78.233) * 43758.5453;
         return v - std::floor(v);
+    }
+
+    /// Linear gain to dB (a zero gain, a preset's muted early field, reads -120 dB).
+    static T levelDb(T gain) noexcept
+    {
+        return static_cast<T>(20.0 * std::log10(std::max(static_cast<double>(gain), 1e-6)));
     }
 
     int msToSamples(T ms) const noexcept

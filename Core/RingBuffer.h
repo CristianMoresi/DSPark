@@ -34,6 +34,10 @@
 #include <cstring>
 #include <memory>
 
+#if defined(_WIN32)
+    #include <malloc.h>   // _aligned_malloc / _aligned_free (MSVC and MinGW CRTs)
+#endif
+
 namespace dspark {
 
 /**
@@ -98,7 +102,9 @@ public:
 
         // Custom deleter for aligned allocation
         buffer_.reset(static_cast<T*>(
-            #if defined(_MSC_VER)
+            // The Windows CRT has no std::aligned_alloc, whatever the compiler
+            // (MSVC, clang-cl, MinGW GCC/Clang): it has _aligned_malloc.
+            #if defined(_WIN32)
                 _aligned_malloc(bytes, 32)
             #else
                 std::aligned_alloc(32, bytes)
@@ -253,7 +259,7 @@ public:
 private:
     struct AlignedDeleter {
         void operator()(T* ptr) const {
-            #if defined(_MSC_VER)
+            #if defined(_WIN32)
                 _aligned_free(ptr);
             #else
                 std::free(ptr);

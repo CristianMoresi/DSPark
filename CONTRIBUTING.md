@@ -138,8 +138,10 @@ is part of the repository precisely so this cannot drift.
 ## DSParkLab
 
 The interactive testing app is Windows-only: it is built on Win32 and Direct3D
-11. Build it with `DSParkLab/build.bat`. The framework, the test suite and the
-plugin layer are fully cross-platform; only the Lab is not.
+11. Build it with `DSParkLab/build.bat`, which finds Visual Studio 2019 or later
+(any edition, or the Build Tools) with the C++ x64 tools by itself. The
+framework, the test suite and the plugin layer are fully cross-platform; only
+the Lab is not.
 
 ## Licence
 

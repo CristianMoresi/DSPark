@@ -574,6 +574,7 @@ inline EffectSlot makeChorus()
     s.addSlider("Voices", 1, 6, 2, "");
     s.addSlider("Feedback", -0.95f, 0.95f, 0, "");
     s.addToggle("Auto Depth", false);
+    s.addSlider("Stereo Spread", 0, 1, 0.5f, "");
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -585,6 +586,7 @@ inline EffectSlot makeChorus()
             case 3: p->setVoices(static_cast<int>(v)); break;
             case 4: p->setFeedback(v); break;
             case 5: p->setAutoDepth(v > 0.5f); break;
+            case 6: p->setStereoSpread(v); break;
         }
     };
     return s;
@@ -600,6 +602,7 @@ inline EffectSlot makePhaser()
     s.addSlider("Mix", 0, 1, 0, "");               // Default 0 = dry only
     s.addSlider("Stages", 2, 12, 4, "");
     s.addSlider("Feedback", -0.95f, 0.95f, 0.3f, "");
+    s.addSlider("Stereo Spread", 0, 1, 0, "");
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -610,6 +613,7 @@ inline EffectSlot makePhaser()
             case 2: p->setMix(v); break;
             case 3: p->setStages(static_cast<int>(v)); break;
             case 4: p->setFeedback(v); break;
+            case 5: p->setStereoSpread(v); break;
         }
     };
     return s;
@@ -617,11 +621,15 @@ inline EffectSlot makePhaser()
 
 inline EffectSlot makeTremolo()
 {
-    auto p = std::make_shared<dspark::Tremolo<float>>();
+    using TR = dspark::Tremolo<float>;
+    auto p = std::make_shared<TR>();
     EffectSlot s;
     s.name = "Tremolo"; s.category = "Modulation";
     s.addSlider("Rate", 0.1f, 20, 4, "Hz");
     s.addSlider("Depth", 0, 1, 0, "");             // Default 0 = no modulation (neutral)
+    // Order MUST match Tremolo::Shape (Sine=0, Triangle=1, Square=2).
+    s.addChoice("Shape", {"Sine","Triangle","Square"}, 0);
+    s.addToggle("Stereo (auto-pan)", false);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -629,6 +637,8 @@ inline EffectSlot makeTremolo()
         switch(i) {
             case 0: p->setRate(v); break;
             case 1: p->setDepth(v); break;
+            case 2: p->setShape(static_cast<TR::Shape>(static_cast<int>(v))); break;
+            case 3: p->setStereo(v > 0.5f); break;
         }
     };
     return s;
@@ -705,54 +715,30 @@ inline EffectSlot makeFrequencyShifter()
 
 inline EffectSlot makeDelay()
 {
-    struct Params { float ms=250; float fb=0.4f; float lp=8000; float hp=80; float mix=0.0f; };
-    auto p = std::make_shared<dspark::Delay<float>>();
-    auto par = std::make_shared<Params>();
-    // Dry buffer for Mix (Delay::processBlock returns 100% wet).
-    auto dry = std::make_shared<dspark::AudioBuffer<float>>();
+    using DL = dspark::Delay<float>;
+    auto p = std::make_shared<DL>();
     EffectSlot s;
     s.name = "Delay"; s.category = "Spatial";
-    s.addSlider("Time", 1, 1000, 250, "ms");
-    s.addSlider("Feedback", 0, 0.95f, 0.4f, "");
-    s.addSlider("LP Filter", 200, 20000, 8000, "Hz", true);
-    s.addSlider("HP Filter", 20, 2000, 80, "Hz", true);
-    s.addSlider("Mix", 0, 1, 0, "");   // Default 0 = dry only (neutral at activation)
-    s.prepareFn = [p, dry](auto& sp) {
-        p->prepare(sp, 2.0);
-        dry->resize(sp.numChannels, sp.maxBlockSize);
-    };
-    s.processFn = [p, par, dry](auto b) {
-        const int nCh = b.getNumChannels();
-        const int nS  = b.getNumSamples();
-        const float mix = par->mix;
-
-        // Snapshot dry
-        for (int ch = 0; ch < nCh; ++ch)
-            std::copy(b.getChannel(ch), b.getChannel(ch) + nS, dry->getChannel(ch));
-
-        // Process delay (buffer now holds 100% wet)
-        p->processBlock(b, par->ms, par->fb, par->lp, par->hp);
-
-        // Linear dry/wet mix in place
-        if (mix < 0.999f) {
-            const float wetGain = mix;
-            const float dryGain = 1.0f - mix;
-            for (int ch = 0; ch < nCh; ++ch) {
-                float* wet = b.getChannel(ch);
-                const float* dryCh = dry->getChannel(ch);
-                for (int i = 0; i < nS; ++i)
-                    wet[i] = dryCh[i] * dryGain + wet[i] * wetGain;
-            }
-        }
-    };
+    s.addSlider("Time", 1, 2000, 250, "ms", true);                // 0
+    s.addSlider("Feedback", 0, 0.95f, 0.4f, "");                  // 1
+    s.addSlider("LP Filter", 200, 20000, 8000, "Hz", true);       // 2 (in the feedback path)
+    s.addSlider("HP Filter", 20, 2000, 80, "Hz", true);           // 3 (in the feedback path)
+    s.addSlider("Mix", 0, 1, 0, "");                              // 4 - default 0 = dry only
+    // Order MUST match Delay::FeedbackMode (Clean=0, Analog=1).
+    s.addChoice("Feedback Mode", {"Clean","Analog"}, 1);          // 5
+    // Insert use: the processor blends dry/wet itself (ramped mix) and
+    // smooths delay-time changes; 4 s of capacity.
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [par](int i, float v) {
+    s.setParamFn = [p](int i, float v) {
         switch(i) {
-            case 0: par->ms = v; break;
-            case 1: par->fb = v; break;
-            case 2: par->lp = v; break;
-            case 3: par->hp = v; break;
-            case 4: par->mix = v; break;
+            case 0: p->setDelayMs(v); break;
+            case 1: p->setFeedback(v); break;
+            case 2: p->setFeedbackLpHz(v); break;
+            case 3: p->setFeedbackHpHz(v); break;
+            case 4: p->setMix(v); break;
+            case 5: p->setFeedbackMode(static_cast<DL::FeedbackMode>(static_cast<int>(v))); break;
         }
     };
     return s;
@@ -760,57 +746,82 @@ inline EffectSlot makeDelay()
 
 inline EffectSlot makeAlgorithmicReverb()
 {
-    auto p = std::make_shared<dspark::AlgorithmicReverb<float>>();
+    using ARV = dspark::AlgorithmicReverb<float>;
+    auto p = std::make_shared<ARV>();
     EffectSlot s;
     s.name = "Reverb"; s.category = "Spatial";
+    // Defaults are the Room preset's own values, so the slot starts as the
+    // real preset (the Lab applies every default after Type). Picking another
+    // Type loads that preset in the processor; the read-back below then moves
+    // the sliders to it. Ranges are the processor's own clamps.
     s.addChoice("Type", {"Room","Hall","Chamber","Plate","Spring","Cathedral"}, 0); // 0
-    s.addSlider("Decay", 0.1f, 10, 1.5f, "s");              // 1
-    s.addSlider("Size", 0, 1, 0.5f, "");                     // 2
-    s.addSlider("Damping", 0, 1, 0.5f, "");                  // 3
-    s.addSlider("Pre-Delay", 0, 100, 10, "ms");              // 4
-    s.addSlider("Diffusion", 0, 1, 0.8f, "");                // 5
-    s.addSlider("Modulation", 0, 1, 0.15f, "");              // 6
-    s.addSlider("HF Decay", 0.1f, 2, 0.5f, "x");            // 7
-    s.addSlider("Bass Decay", 0.5f, 2, 1.2f, "x");          // 8
-    s.addSlider("HF Crossover", 500, 16000, 5000, "Hz", true); // 9 (log)
-    s.addSlider("Bass Crossover", 50, 1000, 200, "Hz", true);  // 10 (log)
-    s.addSlider("Tone Low Cut", 10, 500, 20, "Hz", true);    // 11 (log)
-    s.addSlider("Tone High Cut", 2000, 20000, 16000, "Hz", true); // 12 (log)
-    s.addSlider("ER-Late Gap", 0, 100, 10, "ms");             // 13
-    s.addSlider("Mod Rate", 0.1f, 5, 1, "Hz");               // 14
-    s.addSlider("Early Level", -20, 6, 0, "dB");             // 15
-    s.addSlider("Late Level", -20, 6, 0, "dB");              // 16
-    s.addSlider("Width", 0, 2, 1, "");                        // 17
-    s.addSlider("Mix", 0, 1, 0, "");                          // 18 - default 0 = dry only
-    s.addChoice("Quality", {"Full","Eco"}, 0);                // 19 (Eco = reduced engine)
+    s.addChoice("Quality", {"Full","Eco"}, 0);                   // 1 (Eco = 8-line engine, ~1/3 CPU)
+    s.addSlider("Mix", 0, 1, 0, "");                             // 2 - default 0 = dry only
+    s.addSlider("Decay", 0.1f, 30, 0.5f, "s", true);             // 3 (mid-band T60)
+    s.addSlider("Size", 0.01f, 1, 0.22f, "");                    // 4 (glides: automatable)
+    s.addSlider("Pre-Delay", 0, 200, 0, "ms");                   // 5
+    s.addSlider("Damping", 0, 1, 0.6667f, "");                   // 6 (drives HF Decay)
+    s.addSlider("HF Decay", 0.05f, 1, 0.40f, "x");               // 7 (HF T60 / mid T60)
+    s.addSlider("HF Crossover", 1000, 16000, 5000, "Hz", true);  // 8
+    s.addSlider("Bass Decay", 0.3f, 3, 1.1f, "x");               // 9 (bass T60 / mid T60)
+    s.addSlider("Bass Crossover", 50, 500, 250, "Hz", true);     // 10
+    s.addSlider("Diffusion", 0, 1, 0.72f, "");                   // 11 (Spring: chirp strength)
+    s.addSlider("Modulation", 0, 1, 0.14f, "");                  // 12
+    s.addSlider("Mod Rate", 0.1f, 5, 1.2f, "Hz", true);          // 13
+    s.addSlider("ER-Late Gap", 0, 200, 0, "ms");                 // 14
+    s.addSlider("Early Level", -60, 6, 0, "dB");                 // 15
+    s.addSlider("Late Level", -60, 6, -1.94f, "dB");             // 16
+    s.addSlider("Width", 0, 2, 1, "");                           // 17
+    s.addSlider("Low Cut (min = off)", 10, 500, 10, "Hz", true);       // 18
+    s.addSlider("High Cut (max = off)", 2000, 20000, 20000, "Hz", true); // 19
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p](int i, float v) {
         switch(i) {
-            case 0:  p->setType(static_cast<typename dspark::AlgorithmicReverb<float>::Type>(static_cast<int>(v))); break;
-            case 1:  p->setDecay(v); break;
-            case 2:  p->setSize(v); break;
-            case 3:  p->setDamping(v); break;
-            case 4:  p->setPreDelay(v); break;
-            case 5:  p->setDiffusion(v); break;
-            case 6:  p->setModulation(v); break;
+            case 0:  p->setType(static_cast<ARV::Type>(static_cast<int>(v))); break;
+            case 1:  p->setQuality(v > 0.5f ? ARV::Quality::Eco : ARV::Quality::Full); break;
+            case 2:  p->setMix(v); break;
+            case 3:  p->setDecay(v); break;
+            case 4:  p->setSize(v); break;
+            case 5:  p->setPreDelay(v); break;
+            case 6:  p->setDamping(v); break;
             case 7:  p->setHighDecayMultiplier(v); break;
-            case 8:  p->setBassDecayMultiplier(v); break;
-            case 9:  p->setHighCrossover(v); break;
+            case 8:  p->setHighCrossover(v); break;
+            case 9:  p->setBassDecayMultiplier(v); break;
             case 10: p->setBassCrossover(v); break;
-            case 11: p->setToneLowCut(v); break;
-            case 12: p->setToneHighCut(v); break;
-            case 13: p->setErToLateDelay(v); break;
-            case 14: p->setModRate(v); break;
+            case 11: p->setDiffusion(v); break;
+            case 12: p->setModulation(v); break;
+            case 13: p->setModRate(v); break;
+            case 14: p->setErToLateDelay(v); break;
             case 15: p->setEarlyLevel(v); break;
             case 16: p->setLateLevel(v); break;
             case 17: p->setWidth(v); break;
-            case 18: p->setMix(v); break;
-            case 19: p->setQuality(v > 0.5f
-                         ? dspark::AlgorithmicReverb<float>::Quality::Eco
-                         : dspark::AlgorithmicReverb<float>::Quality::Full); break;
+            case 18: p->setToneLowCut(v <= 10.5f ? 0.0f : v); break;       // 0 = off
+            case 19: p->setToneHighCut(v >= 19900.0f ? 0.0f : v); break;   // 0 = off
         }
+    };
+    // Mirror the processor: a Type change loads a whole preset (applied on
+    // the next audio block), and Damping / HF Decay drive each other.
+    s.readbackFn = [p](std::vector<float>& v) {
+        v[0]  = static_cast<float>(static_cast<int>(p->getType()));
+        v[1]  = p->getQuality() == ARV::Quality::Eco ? 1.0f : 0.0f;
+        v[2]  = p->getMix();
+        v[3]  = p->getDecay();
+        v[4]  = p->getSize();
+        v[5]  = p->getPreDelay();
+        v[6]  = p->getDamping();
+        v[7]  = p->getHighDecayMultiplier();
+        v[8]  = p->getHighCrossover();
+        v[9]  = p->getBassDecayMultiplier();
+        v[10] = p->getBassCrossover();
+        v[11] = p->getDiffusion();
+        v[12] = p->getModulation();
+        v[13] = p->getModRate();
+        v[14] = p->getErToLateDelay();
+        v[15] = std::max(p->getEarlyLevel(), -60.0f);   // a muted field shows as the floor
+        v[16] = std::max(p->getLateLevel(), -60.0f);
+        v[17] = p->getWidth();
     };
     return s;
 }
@@ -824,6 +835,8 @@ inline EffectSlot makePanner()
     s.addChoice("Algorithm", {"EqualPower","Binaural","MidPan","SidePan","Haas","Spectral"}, 0); // 1
     s.addSlider("Binaural ITD", 0.1f, 5, 0.66f, "ms");    // 2
     s.addSlider("Haas Delay", 0.1f, 40, 30, "ms");        // 3
+    s.addSlider("Spectral Freq", 200, 16000, 4000, "Hz", true); // 4 (Spectral algorithm)
+    s.addSlider("Spectral Gain", 0, 18, 6, "dB");         // 5 (Spectral algorithm)
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -833,6 +846,8 @@ inline EffectSlot makePanner()
             case 1: p->setAlgorithm(static_cast<typename dspark::Panner<float>::Algorithm>(static_cast<int>(v))); break;
             case 2: p->setBinauralMaxITD(v); break;
             case 3: p->setHaasMaxDelay(v); break;
+            case 4: p->setSpectralFrequency(v); break;
+            case 5: p->setSpectralMaxGain(v); break;
         }
     };
     return s;
@@ -1236,13 +1251,17 @@ inline EffectSlot makeTransformerModel()
 
 inline EffectSlot makePitchShifter()
 {
-    auto p = std::make_shared<dspark::PitchShifter<float>>();
+    using PS = dspark::PitchShifter<float>;
+    auto p = std::make_shared<PS>();
     EffectSlot s;
     s.name = "Pitch Shifter"; s.category = "Pitch";
     s.addSlider("Semitones", -12, 12, 0, "st");
     s.addSlider("Mix", 0, 1, 1, "");
     s.addToggle("Transient Preserve", true);
     s.addToggle("Formant Preserve", false);
+    // Order MUST match PitchShifter::Quality (Standard=0, High=1): High reads
+    // through a 32-tap windowed sinc (transparent top octave, same latency).
+    s.addChoice("Quality", {"Standard","High"}, 0);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -1252,6 +1271,7 @@ inline EffectSlot makePitchShifter()
             case 1: p->setMix(v); break;
             case 2: p->setTransientPreserve(v > 0.5f); break;
             case 3: p->setFormantPreserve(v > 0.5f); break;
+            case 4: p->setQuality(static_cast<PS::Quality>(static_cast<int>(v))); break;
         }
     };
     return s;

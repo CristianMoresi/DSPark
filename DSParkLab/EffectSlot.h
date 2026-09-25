@@ -137,6 +137,12 @@ public:
     struct CurveNode { int freqParam = -1; int gainParam = -1; int qParam = -1; };
     std::vector<CurveNode> curveNodes;
 
+    // Parameter read-back: refreshes values[] from the processor's getters, for
+    // processors whose own logic moves parameters (a reverb Type loads a whole
+    // preset, a damping knob drives the HF decay). Called by the interface
+    // every frame while the slot is shown and no widget is being dragged.
+    std::function<void(std::vector<float>& values)> readbackFn;
+
     // Impulse-response loader (Convolution Reverb): receives a WAV file path.
     std::function<void(const char* wavPath)> loadIRFn;
 

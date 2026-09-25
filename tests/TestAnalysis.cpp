@@ -736,6 +736,39 @@ DSPARK_TEST(PitchDetector_detects_440)
     EXPECT_GT(pd.getConfidence(), 0.7f);
 }
 
+DSPARK_TEST(PitchDetector_is_tuner_accurate_up_to_1760_hz)
+{
+    // The sub-sample parabola was fitted to the CMND, whose tau / running-sum
+    // weight tilts the dip: at 48 kHz a pure 1760 Hz tone read 0.99 cent off,
+    // 1 kHz 0.39 cent. On the raw difference function, with the raised-cosine
+    // bias inverted, pure tones stay within 0.02 cent, and a harmonic-rich
+    // tone at 1760 Hz within 0.5 cent (1.45 before).
+    auto worstCents = [](double hz, bool harmonic) {
+        PitchDetector<float> pd;
+        pd.prepare(48000.0);
+        std::vector<float> x(4096);
+        double ph = 0.0, worst = 0.0;
+        for (int b = 0; b < 30; ++b)
+        {
+            for (auto& v : x)
+            {
+                v = harmonic ? static_cast<float>(0.3 * std::sin(ph) + 0.25 * std::sin(2.0 * ph)
+                                                  + 0.2 * std::sin(3.0 * ph) + 0.1 * std::sin(4.0 * ph))
+                             : static_cast<float>(0.5 * std::sin(ph));
+                ph += 6.283185307179586 * hz / 48000.0;
+            }
+            pd.pushSamples(std::span<const float>(x.data(), x.size()));
+            if (b > 4)
+                worst = std::max(worst, std::abs(1200.0 * std::log2(pd.getFrequencyHz() / hz)));
+        }
+        return worst;
+    };
+    EXPECT_LT(worstCents(440.0, false), 0.05);
+    EXPECT_LT(worstCents(1000.0, false), 0.05);
+    EXPECT_LT(worstCents(1760.0, false), 0.05);
+    EXPECT_LT(worstCents(1760.0, true), 0.8);
+}
+
 DSPARK_TEST(PitchDetector_midi_note_A4)
 {
     PitchDetector<float> pd;

@@ -119,12 +119,15 @@ template <FloatType T>
  * @param from     Current value.
  * @param to       Target value.
  * @param maxDelta Largest allowed move (non-negative).
- * @return from + clamp(to - from, -maxDelta, maxDelta).
+ * @return to when |to - from| <= maxDelta, else from moved by maxDelta toward to.
  */
 template <FloatType T>
 [[nodiscard]] inline T moveTowards(T from, T to, T maxDelta) noexcept
 {
-    return from + std::clamp(to - from, -maxDelta, maxDelta);
+    // Return the target itself once within reach: from + (to - from) rounds
+    // off it in about 10% of float cases, leaving a settled ramp one ulp away.
+    const T delta = to - from;
+    return std::abs(delta) <= maxDelta ? to : from + std::clamp(delta, -maxDelta, maxDelta);
 }
 
 // ============================================================================

@@ -20,9 +20,9 @@
   },
   "counts": {
     "binary_exact": 184,
-    "first_party_ascii_text": 219,
+    "first_party_ascii_text": 220,
     "third_party_utf8_exact": 84,
-    "total": 487
+    "total": 488
   },
   "gitattributes_required_lines": [
     "* text=auto",
@@ -614,6 +614,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "docs/migration-v1.7.0.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "docs/migration-v1.8.0.md"
     },
     {
       "kind": "first_party_ascii_text",

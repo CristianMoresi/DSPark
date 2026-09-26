@@ -2,7 +2,7 @@
 
 All notable user-facing changes to DSPark are documented here.
 
-## [Unreleased]
+## [1.8.0] - 2026-09-26
 
 ### Added
 
@@ -41,6 +41,13 @@ All notable user-facing changes to DSPark are documented here.
   conversions run on exp/log at half the cost.
 - Mix, width, gain and shape changes across the effects glide over at least
   20 ms instead of stepping once per block.
+- VST3 `restartComponent` and AU `Latency` listeners are called on the host's
+  UI/main thread only: a latency change detected in the audio callback raises
+  an atomic flag that a ~30 Hz UI-thread tick hands to the host, with no host
+  call or allocation on the audio thread.
+- The Conan recipe installs under `include/dspark` like the CMake package, so
+  `#include <DSPark.h>` works with every package manager, and ships the plugin
+  layer with `dspark_add_plugin()`. Both recipes pin the 1.8.0 source.
 
 ### Fixed
 
@@ -59,6 +66,11 @@ All notable user-facing changes to DSPark are documented here.
   detection on the analytic magnitude.
 - The `wav_process` example compensates its chain latency, so the written
   file stays aligned with the source and keeps its tail.
+
+### Migration
+
+Changed defaults, plugin timing and packaging are covered in the
+[v1.8.0 migration guide](docs/migration-v1.8.0.md).
 
 ## [1.7.0] - 2026-08-21
 

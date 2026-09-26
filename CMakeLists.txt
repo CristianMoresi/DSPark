@@ -12,7 +12,7 @@
 #                             DSPark is the top-level project).
 
 cmake_minimum_required(VERSION 3.21)
-project(DSPark VERSION 1.7.0 LANGUAGES CXX)
+project(DSPark VERSION 1.8.0 LANGUAGES CXX)
 
 add_library(dspark INTERFACE)
 add_library(dspark::dspark ALIAS dspark)

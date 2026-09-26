@@ -670,6 +670,10 @@ struct Plugin
             size = sizeof(CFArrayRef);
             break;
         }
+        case kAudioUnitProperty_ParameterStringFromValue:
+            size = sizeof(AudioUnitParameterStringFromValue); break;
+        case kAudioUnitProperty_ParameterValueFromString:
+            size = sizeof(AudioUnitParameterValueFromString); break;
         case kAudioUnitProperty_Latency:
         case kAudioUnitProperty_TailTime:
             size = sizeof(Float64); break;
@@ -869,6 +873,45 @@ struct Plugin
             }
             *static_cast<CFArrayRef*>(outData) = strings;
             *ioSize = sizeof(CFArrayRef);
+            return noErr;
+        }
+        case kAudioUnitProperty_ParameterStringFromValue:
+        {
+            // Host display text (a choice's label, "3.50 dB"); caller releases.
+            if (*ioSize < sizeof(AudioUnitParameterStringFromValue))
+                return kAudioUnitErr_InvalidPropertyValue;
+            auto* request = static_cast<AudioUnitParameterStringFromValue*>(outData);
+            const int idx = indexOfParamId(request->inParamID);
+            if (idx < 0) return kAudioUnitErr_InvalidParameter;
+            const Param& spec = P::parameters[static_cast<size_t>(idx)];
+            const double plain = request->inValue != nullptr
+                ? static_cast<double>(*request->inValue)
+                : toPlain(spec, shadow[static_cast<size_t>(idx)].load(std::memory_order_relaxed));
+            char text[128];
+            formatValue(spec, plain, text, static_cast<int>(sizeof(text)));
+            request->outString = CFStringCreateWithCString(nullptr, text,
+                                                           kCFStringEncodingUTF8);
+            *ioSize = sizeof(AudioUnitParameterStringFromValue);
+            return noErr;
+        }
+        case kAudioUnitProperty_ParameterValueFromString:
+        {
+            // The inverse: labels, On/Off or a number; garbage is refused.
+            if (*ioSize < sizeof(AudioUnitParameterValueFromString))
+                return kAudioUnitErr_InvalidPropertyValue;
+            auto* request = static_cast<AudioUnitParameterValueFromString*>(outData);
+            const int idx = indexOfParamId(request->inParamID);
+            if (idx < 0) return kAudioUnitErr_InvalidParameter;
+            char text[128];
+            double plain = 0.0;
+            if (request->inString == nullptr
+                || !CFStringGetCString(request->inString, text,
+                                       static_cast<CFIndex>(sizeof(text)),
+                                       kCFStringEncodingUTF8)
+                || !parseValue(P::parameters[static_cast<size_t>(idx)], text, plain))
+                return kAudioUnitErr_InvalidPropertyValue;
+            request->outValue = static_cast<AudioUnitParameterValue>(plain);
+            *ioSize = sizeof(AudioUnitParameterValueFromString);
             return noErr;
         }
         case kAudioUnitProperty_Latency:

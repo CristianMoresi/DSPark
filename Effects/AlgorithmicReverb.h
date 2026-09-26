@@ -63,6 +63,14 @@
  *   periodic ring of chained allpasses. setDiffusion() moves the split
  *   between the first discrete reflections (crisp, localisable) and the
  *   smooth diffuse ones.
+ * - **One continuous decay.** The early field follows the room's own
+ *   decay: its energy density falls at the mid-band T60, its highs at the
+ *   HF T60 (a high shelf per absorption group), and its level is derived
+ *   from the late field's energy flow (exp(-t / tau) over the mean round
+ *   trip), not set apart. The two therefore join on one exponential, and
+ *   the early decay time matches the T30 (0.94-1.02 over the presets at
+ *   0.5-6 s of decay; measured rooms 0.84-1.03) without per-preset
+ *   tuning.
  * - **Exact decay per band.** Each line carries two first-order shelves
  *   designed by the bilinear transform: the Jot shelf pins the loop gain at
  *   DC to the mid T60 and at Nyquist to the HF T60 (midpoint at the high
@@ -79,7 +87,7 @@
  *   (within about 0.8 dB of the ideal at the 99.9th percentile, rooms
  *   0.4 dB), its envelope in every octave, its echo density (0.96 of
  *   Gaussian over 20-150 ms, rooms 0.98) and the shape of its decay (the
- *   early decay time is 0.93-1.05 of the T30, rooms 0.84-1.03). This rests
+ *   early decay time is 0.94-1.02 of the T30, rooms 0.84-1.03). This rests
  *   on five choices:
  *   - 32 lines with about 3.7 s of delay at full size: the modal density
  *     (modes per Hz equals the total delay in seconds) keeps the modes
@@ -111,10 +119,12 @@
  *   interpolator kept in its low-dispersion range ([0.5, 1.5) samples of
  *   fractional delay), so there is no cumulative HF loss. Depth is set in
  *   time and scales with the room size: the same chorus at every sample
- *   rate, and small rooms do not warble. The presets smear the tail's
- *   remaining resonances while keeping steady tones clean: over tones
+ *   rate, and small rooms do not warble. The dense network needs little
+ *   of it: the presets smear the tail's remaining resonances while
+ *   keeping steady tones as clean as unmodulated reverbs do: over tones
  *   from 400 Hz to 3 kHz, the energy more than 3 Hz from the tone is
- *   34-39 dB down (Plate, lusher by design, about 22 dB).
+ *   42 dB down in Hall and Cathedral, 54 dB in Room and Chamber (Plate,
+ *   lusher by design, about 22 dB).
  * - **Smooth size changes.** setSize() glides the line and in-loop allpass
  *   lengths (a short tape-style Doppler) instead of jumping, so it can be
  *   automated.
@@ -301,6 +311,7 @@ public:
                       static_cast<T>(c.a1), static_cast<T>(c.a2) };
         }
         shadowCoeff_ = static_cast<T>(1.0 - std::exp(-6.283185307179586 * kShadowHz / sr));
+        erGlidePerSample_ = static_cast<T>(1.0 / (0.02 * sr));
         maxReadPos_ = static_cast<T>(maxLine - 2);
 
         eco_ = quality_.load(std::memory_order_relaxed) == Quality::Eco;
@@ -409,6 +420,8 @@ public:
             for (auto& ap : outAP_[c]) ap.clear();
             erLP_[c].fill(T(0));
             erShadowLP_[c].fill(T(0));
+            erGain_[c] = erGainTarget_[c];
+            erShelfGain_ = erShelfGainTarget_;
             subZ_[c].fill(T(0));
         }
         lines_.clear();
@@ -696,7 +709,12 @@ public:
     // Level 3: Expert API - Tone & Levels
     // =========================================================================
 
-    /** @brief Early reflections level in dB (-60 to +6). */
+    /**
+     * @brief Early reflections level in dB (-60 to +6). 0 dB is the
+     *        physical balance: the early field then carries the late
+     *        field's energy density and decay, so the two join on one
+     *        exponential at any size and decay time.
+     */
     void setEarlyLevel(T dB) noexcept
     {
         if (!std::isfinite(dB)) return;
@@ -860,8 +878,6 @@ protected:
     /// Wet output scale: calibrated so the steady-state level matches the
     /// previous engine's (and Full matches Eco within a fraction of a dB).
     static constexpr T kOutGain = T(0.25);
-    /// Early-reflection energy per side before earlyLevel.
-    static constexpr T kErEnergy = T(0.0625);
 
     // FDN base delay times in ms (at size = 1); lengths are rounded to primes.
     // About 3.7 s of delay in all: the modal density (modes per Hz equals the
@@ -902,6 +918,7 @@ protected:
         { 1.31, 2.67 }
     };
 
+    static constexpr double kMeanInjectMs = 4.0;   ///< mean of kInjectMs_
     // Late injection taps (ms after the ER-to-late gap), one per line.
     static constexpr double kInjectMs_[kMaxLines] = {
         7.14, 3.31, 0.76, 0.25, 5.86, 2.04, 4.84, 5.35,
@@ -1101,18 +1118,22 @@ protected:
     std::array<std::array<Line, kOutStages>, 2> outAP_;   ///< late-field output diffusers
     std::array<std::array<int, kOutStages>, 2> outAPLen_ {};
     T outAPCoeff_ = T(0.5);
-    T lateComp_ = T(1);   ///< late level compensation for the output after absorption
 
     // Early reflections (per side): velvet taps, each reading its own side
     // (erChan_ 0) or the other (1)
     int numERTaps_ = 0;
     Type erType_ = Type::Room;
     std::array<std::array<int, kMaxERTaps>, 2> erTap_ {}, erChan_ {}, erBin_ {};
-    std::array<std::array<T, kMaxERTaps>, 2> erGain_ {};
+    std::array<std::array<T, kMaxERTaps>, 2> erGain_ {};         ///< current (gliding) tap gains
+    std::array<std::array<T, kMaxERTaps>, 2> erGainTarget_ {};   ///< gains for the current size/decay
+    std::array<T, kERGroups> erShelfGainTarget_ {};
+    T erGlidePerSample_ = T(0.001);                               ///< glide rate of the two (1 / samples)
     std::array<int, kERGroups + 1> erGroupStart_ {};
-    std::array<T, kERGroups> erLPCoeff_ {};
+    std::array<T, kERGroups> erShelfGain_ {};   ///< HF gain of each absorption group
+    T erShelfCoeff_ = T(0.5);                   ///< one-pole coefficient at the high crossover
     std::array<std::array<T, kERGroups>, 2> erLP_ {};
     std::array<std::array<T, kERGroups>, 2> erShadowLP_ {};
+    double meanLoopSec_ = 0.1;   ///< mean FDN round trip (s), for the early/late energy match
     T shadowCoeff_ = T(0);
 
     // FDN
@@ -1693,6 +1714,17 @@ protected:
             }
         }
 
+        // The early gains follow size and decay changes in a ~20 ms glide
+        // (per chunk), so automating them does not click.
+        {
+            const T gc = erGlidePerSample_ * static_cast<T>(count);
+            for (int s = 0; s < 2; ++s)
+                for (int k = 0; k < numERTaps_; ++k)
+                    erGain_[s][k] += gc * (erGainTarget_[s][k] - erGain_[s][k]);
+            for (int g = 0; g < kERGroups; ++g)
+                erShelfGain_[g] += gc * (erShelfGainTarget_[g] - erShelfGain_[g]);
+        }
+
         // --- Early reflections: velvet taps with rising density, each on its
         //     own side or the other; the first few read the raw input (crisp
         //     discrete reflections), the rest the diffused feed (each a short
@@ -1726,12 +1758,17 @@ protected:
                     }
                     erShadowLP_[static_cast<std::size_t>(s)][static_cast<std::size_t>(g)] = z;
                 }
-                const T c = erLPCoeff_[g];
+                // Frequency-dependent absorption: a first-order high shelf
+                // at the high crossover, the group's highs attenuated as the
+                // late field's are by that time (its HF T60).
+                const T c = erShelfCoeff_;
+                const T hg = erShelfGain_[static_cast<std::size_t>(g)];
                 T y = lp[g];
                 for (int n = 0; n < count; ++n)
                 {
-                    y += c * (acc[0][n] - y);
-                    early[s][n] += y;
+                    const T x = acc[0][n];
+                    y += c * (x - y);
+                    early[s][n] += y + hg * (x - y);
                 }
                 lp[g] = y;
             }
@@ -1764,7 +1801,7 @@ protected:
     std::pair<T, T> outputStage(T lateL, T lateR, T earlyL, T earlyR) noexcept
     {
         // --- Output: coherent low band, width, early + late, subsonic high-pass, tone ---
-        const T lateLvl = cachedParams_.lateLevel * kOutGain * lateComp_;
+        const T lateLvl = cachedParams_.lateLevel * kOutGain;
         lateL *= lateLvl;
         lateR *= lateLvl;
         if (!spring_)
@@ -1950,7 +1987,7 @@ protected:
             bassCrossover_.load(std::memory_order_relaxed)), 10.0, 0.45 * sr);
         const double Kh = std::tan(kPi * fh / sr);
         const double Kb = std::tan(kPi * fb / sr);
-        double passEnergy = 0.0;
+        double loopSum = 0.0;
         for (int i = 0; i < kMaxLines; ++i)
         {
             // Loop length: line + group delay of the in-loop allpasses. The
@@ -1963,7 +2000,7 @@ protected:
                       * (1.0 - static_cast<double>(springA_)) / (1.0 + static_cast<double>(springA_))
                 : static_cast<double>(lenTarget_[i] + loopAPLen_[i]);
             const double gM = std::pow(0.001, M / (decay * sr));
-            if (i < nLines_) passEnergy += gM * gM;
+            if (i < nLines_) loopSum += M;
             const double gH = std::min(std::pow(0.001, M / (t60H * sr)), gM);
             // Keep the bass loop gain below 1 so extreme settings ring out
             // instead of self-sustaining.
@@ -1984,11 +2021,7 @@ protected:
                 bassA1_[i] = static_cast<T>((b - 1.0) * inv);
             }
         }
-        // The FDN output is taken after the absorption, one round trip
-        // quieter than the lines' content; this restores the late level (so
-        // the early/late balance does not depend on the decay time).
-        lateComp_ = spring_ ? T(1)
-                            : static_cast<T>(1.0 / std::sqrt(passEnergy / std::max(1, nLines_)));
+        meanLoopSec_ = loopSum / std::max(1, nLines_) / sr;
     }
 
     // --- Early reflection generation -----------------------------------------
@@ -2036,6 +2069,8 @@ protected:
         const int discrete = 1 + static_cast<int>(std::lround(
             (kMaxDiscreteER - 1) * (1.0 - static_cast<double>(diffusion_.load(std::memory_order_relaxed)))));
 
+        const double decay = static_cast<double>(decayTime_.load(std::memory_order_relaxed));
+        constexpr double kLn1000 = 6.907755278982137;
         struct Tap { double ms; int chan; int bin; double gain; };
         std::array<std::array<Tap, kMaxERTaps>, 2> taps {};
         std::array<int, 2> used { 0, 0 };
@@ -2052,9 +2087,11 @@ protected:
                 msv[k] = minMs + (maxMs - minMs) * w;
                 const double density = 1.0 / (0.3 + 0.7 / p * std::pow(std::max(u, 1e-3), 1.0 / p - 1.0));   // dk/dw
                 const double sign = k < 4 || hash01(k, c + 40) < 0.5 ? 1.0 : -1.0;
-                // Energy per unit time follows the envelope: sparse taps are
-                // individually louder.
-                gv[k] = sign * std::exp(-1.6 * w) / std::sqrt(density);
+                // Energy per unit time follows the room's own decay (the
+                // late field's rate, so the two join without a swell or a
+                // dip at any decay time): sparse taps are individually
+                // louder.
+                gv[k] = sign * std::exp(-kLn1000 * msv[k] * 1e-3 / decay) / std::sqrt(density);
                 if (k >= discrete) dcSum += gv[k];
                 // Arrival direction as the lateral coordinate (sine of the
                 // lateral angle, uniform over a diffuse field), positive
@@ -2071,8 +2108,19 @@ protected:
                 for (int k = discrete; k < R; ++k) gv[k] -= dcSum / (R - discrete);
             double energy = 0.0;
             for (int k = 0; k < R; ++k) energy += gv[k] * gv[k];
-            // Half the early energy per input, so a mono source keeps it.
-            const double norm = std::sqrt(0.5 * static_cast<double>(kErEnergy) / energy);
+            // The early field joins the late one on a single exponential:
+            // the late field's energy flow at time t after its injection is
+            // exp(-t / tau) / (mean round trip) (the output taps follow the
+            // absorption, so even its first echoes sit on that curve), and
+            // the early reflections carry that same density over their
+            // window. Half per input, so a mono source keeps it.
+            const double tau = decay / (2.0 * kLn1000);
+            const double tInj = static_cast<double>(erToLateSamples_.load(std::memory_order_relaxed)) / sr
+                                + kMeanInjectMs * 1e-3;
+            const double target = static_cast<double>(kOutGain) * static_cast<double>(kOutGain)
+                                  * tau / meanLoopSec_
+                                  * (std::exp(-(minMs * 1e-3 - tInj) / tau) - std::exp(-(maxMs * 1e-3 - tInj) / tau));
+            const double norm = std::sqrt(0.5 * target / energy);
 
             // Every reflection reaches both outputs like both ears: the far
             // one later (Woodworth ITD, up to 0.66 ms), quieter (up to
@@ -2102,15 +2150,25 @@ protected:
                 erTap_[e][k] = std::max(1, static_cast<int>(taps[e][k].ms * sr / 1000.0));
                 erChan_[e][k] = taps[e][k].chan;
                 erBin_[e][k] = taps[e][k].bin;
-                erGain_[e][k] = static_cast<T>(taps[e][k].gain);
+                erGainTarget_[e][k] = static_cast<T>(taps[e][k].gain);
             }
         }
 
-        static constexpr double kGroupCutHz[kERGroups] = { 14000.0, 9000.0, 5500.0, 3200.0 };
+        // Each absorption group loses its highs as the late field does by
+        // the group's mean arrival time: 60 dB per HF T60 beyond the mid band.
+        const double fh = std::clamp(static_cast<double>(highCrossover_.load(std::memory_order_relaxed)),
+                                     100.0, 0.45 * sr);
+        erShelfCoeff_ = static_cast<T>(1.0 - std::exp(-6.283185307179586 * fh / sr));
+        const double t60H = std::max(0.05, decay * static_cast<double>(highDecayMult_.load(std::memory_order_relaxed)));
         for (int g = 0; g < kERGroups; ++g)
         {
-            const double fc = std::min(kGroupCutHz[g], 0.45 * sr);
-            erLPCoeff_[g] = static_cast<T>(1.0 - std::exp(-6.283185307179586 * fc / sr));
+            double tSum = 0.0;
+            int cnt = 0;
+            for (int e = 0; e < 2; ++e)
+                for (int k = erGroupStart_[g]; k < erGroupStart_[g + 1]; ++k, ++cnt)
+                    tSum += erTap_[e][k] / sr;
+            const double t = cnt > 0 ? tSum / cnt : 0.0;
+            erShelfGainTarget_[g] = static_cast<T>(std::pow(10.0, -3.0 * t * std::max(0.0, 1.0 / t60H - 1.0 / decay)));
         }
     }
 
@@ -2189,15 +2247,15 @@ protected:
         {
             case Type::Room:
                 commitPreset({T(0.22), T(0.5),  T(0.40), T(1.1),  T(5000), T(250),
-                              T(0.72), T(0.14), T(1.2),  T(1),    T(0.8),  T(0)});
+                              T(0.72), T(0.07), T(0.5),  T(1),    T(0.8),  T(0)});
                 break;
             case Type::Hall:
                 commitPreset({T(0.68), T(2.2),  T(0.32), T(1.3),  T(4500), T(200),
-                              T(0.84), T(0.18), T(0.55), T(0.7),  T(1),    T(15)});
+                              T(0.84), T(0.13), T(0.55), T(1),    T(1),    T(15)});
                 break;
             case Type::Chamber:
                 commitPreset({T(0.38), T(1.2),  T(0.38), T(1.1),  T(5000), T(250),
-                              T(0.78), T(0.14), T(0.8),  T(0.9),  T(0.9),  T(8)});
+                              T(0.78), T(0.08), T(0.6),  T(1),    T(0.9),  T(8)});
                 break;
             case Type::Plate:
                 commitPreset({T(0.14), T(1.5),  T(0.55), T(0.8),  T(7000), T(150),
@@ -2209,7 +2267,7 @@ protected:
                 break;
             case Type::Cathedral:
                 commitPreset({T(0.98), T(5.0),  T(0.24), T(1.5),  T(3500), T(150),
-                              T(0.91), T(0.22), T(0.35), T(0.5),  T(1),    T(25)});
+                              T(0.91), T(0.16), T(0.35), T(1),    T(1),    T(25)});
                 break;
         }
 

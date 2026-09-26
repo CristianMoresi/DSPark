@@ -3325,7 +3325,7 @@ DSPARK_TEST(AlgoReverb_left_source_stays_left_in_the_early_field)
 {
     // True stereo: a left-only impulse must produce a left-weighted early
     // field (the old engine summed the input to mono: 0.5 dB, i.e. no
-    // image). Measured 3.5-6.0 dB over the first 50 ms, now that every
+    // image). Measured 3.3-5.8 dB over the first 50 ms, now that every
     // reflection also reaches the far side (as it reaches the far ear).
     for (const auto type : { ARevF::Type::Room, ARevF::Type::Hall,
                              ARevF::Type::Chamber, ARevF::Type::Cathedral })
@@ -3409,6 +3409,41 @@ DSPARK_TEST(AlgoReverb_size_changes_glide_without_clicks)
     for (int k = 0; k < blocks; ++k)
     {
         if (k % 8 == 0) rev.setSize(((k / 8) & 1) ? 0.9f : 0.3f);
+        for (int i = 0; i < 256; ++i)
+        {
+            tb.ch(0)[i] = tb.ch(1)[i] = static_cast<float>(0.3 * std::sin(ph));
+            ph += 6.283185307179586 * 220.0 / 48000.0;
+        }
+        rev.processBlock(tb.view());
+        for (int i = 0; i < 256; ++i)
+        {
+            const float y = tb.ch(0)[i];
+            if (k > blocks / 3) maxD2 = std::max(maxD2, static_cast<double>(std::abs(y - 2.0f * y1 + y2)));
+            y2 = y1;
+            y1 = y;
+        }
+    }
+    EXPECT_LT(maxD2, 0.01);
+}
+
+DSPARK_TEST(AlgoReverb_decay_changes_glide_without_clicks)
+{
+    // The early reflections follow the decay time (their envelope and level
+    // join the late field's), so a decay change retunes them; the new gains
+    // glide over ~20 ms. Toggling the Hall decay 1 s <-> 3 s every 8 blocks
+    // under a 220 Hz tone gave a max second difference of 0.022 before (the
+    // step of the previous engine's early field), 0.0059 now.
+    ARevF rev;
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setType(ARevF::Type::Hall);
+    rev.setMix(1.0f);
+    auto tb = makeBuffer(2, 256);
+    double ph = 0.0, maxD2 = 0.0;
+    float y1 = 0.0f, y2 = 0.0f;
+    const int blocks = 6 * 48000 / 256;
+    for (int k = 0; k < blocks; ++k)
+    {
+        if (k % 8 == 0) rev.setDecay(((k / 8) & 1) ? 3.0f : 1.0f);
         for (int i = 0; i < 256; ++i)
         {
             tb.ch(0)[i] = tb.ch(1)[i] = static_cast<float>(0.3 * std::sin(ph));
@@ -3583,7 +3618,7 @@ DSPARK_TEST(AlgoReverb_stereo_image_matches_a_measured_hall_seat)
     // IACC 0.13 with a lead of 0.56 ms (each early reflection reached one
     // side only) and a late coherence of 0.80 at 125 Hz, 0.24 at 500 Hz;
     // with every reflection reaching both sides (ITD, head shadow) and the
-    // measured coherence curve: 0.26-0.33, 0.27 ms, 0.92-0.94 and 0.14-0.20.
+    // measured coherence curve: 0.30-0.41, 0.27 ms, 0.91-0.93 and 0.18-0.27.
     const auto band = [](const std::vector<float>& x, double fc) {
         Biquad<float, 1> f1, f2;
         const auto c = BiquadCoeffs::makeBandPass(48000.0, fc, 1.4);
@@ -3657,7 +3692,7 @@ DSPARK_TEST(AlgoReverb_echo_density_builds_like_a_room_in_both_qualities)
     // over 20-150 ms after the onset. Measured rooms (Detmold halls,
     // churches) sit at 0.93-1.02. The Hall preset measured 0.90 (Full) and
     // 0.38 (Eco: a grainy 8-line build-up) before the output diffusers and
-    // the 16-line Eco; 0.95 and 0.92 now.
+    // the 16-line Eco; 0.94 and 0.91 now.
     for (int q = 0; q < 2; ++q)
     {
         ARevF rev;
@@ -3708,7 +3743,7 @@ DSPARK_TEST(AlgoReverb_short_small_room_does_not_ring)
     // input diffusers and fixed in-loop allpasses the Room preset's tail
     // (50-300 ms) had narrow peaks 9.6 dB above the 1/3-octave average of
     // its short-time spectrum; with short diffusers and allpasses that
-    // scale with the room, 8.0 dB (a Gaussian tail gives about 6.5).
+    // scale with the room, 7.3 dB (a Gaussian tail gives about 6.5).
     ARevF rev;
     rev.prepare(spec(48000.0, 256, 2));
     rev.setType(ARevF::Type::Room);

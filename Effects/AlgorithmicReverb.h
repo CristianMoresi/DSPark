@@ -27,14 +27,15 @@
  *   |       v
  *   |    [FDN core: 32 lines]
  *   |      +- allpass-interpolated read at a smoothly modulated length
- *   |      +- Hadamard 32x32 mix + line rotation (lossless, dense)
  *   |      +- Jot absorption shelf (mid/high T60) per line
- *   |      +- bass shelf (bass/mid T60) per line
- *   |      +- short in-loop allpass (echo density)
+ *   |      +- bass shelf (bass/mid T60) per line   --> output taps
+ *   |      +- Hadamard 32x32 mix + line rotation (lossless, dense)
+ *   |      +- short in-loop allpass (echo density), scaled with the size
  *   |      +- safety soft limit, write back + injection
  *   |       |
  *   |       v
- *   |    [Output: orthogonal L/R sign sums -> coherent low band -> width]
+ *   |    [Output: orthogonal L/R sign sums of the taps -> 2 allpass
+ *   |     diffusers per side -> coherent low band -> width]
  *   v
  * [Early + late] -> [DC block] -> [Tone EQ] -> DryWetMixer -> Output
  * ```
@@ -60,13 +61,31 @@
  *   no DC blocker or smoothing filter in the loop, so nothing else bends the
  *   decay: measured T60s land within a few percent of the targets in every
  *   octave, at any sample rate.
- * - **Low modal coloration.** 32 lines (about 2.7 s of total delay at full
- *   size) double the modal density of a 16-line network; the Hadamard
- *   matrix feeds every line from every other with equal weight, and the
- *   rotation that follows it spreads the eigenvalues over the unit circle.
- *   The in-loop allpasses are short (1-5 ms, fixed in time), so their
- *   group-delay ripple barely modulates the decay across frequency. In
- *   every octave the tail's envelope fluctuates like Gaussian noise.
+ * - **Room-like statistics.** Benchmarked against measured halls, churches
+ *   and theatres (the Detmold SRIR database and CT-AudioLink) and against
+ *   an ideal diffuse field (Gaussian noise with the same decay per band),
+ *   the tail matches both: its fine spectrum, its sub-Hz modal peaks
+ *   (within about 0.8 dB of the ideal at the 99.9th percentile, rooms
+ *   0.4 dB), its envelope in every octave, its echo density (0.96 of
+ *   Gaussian over 20-150 ms, rooms 0.98) and the shape of its decay (the
+ *   early decay time is 0.93-1.05 of the T30, rooms 0.84-1.03). This rests
+ *   on five choices:
+ *   - 32 lines with about 3.7 s of delay at full size: the modal density
+ *     (modes per Hz equals the total delay in seconds) keeps the modes
+ *     overlapping, and the Hadamard matrix plus a line rotation feeds
+ *     every line from every other with equal weight;
+ *   - short input diffusers (0.4-1.8 ms): an allpass holds back some
+ *     frequencies longer than others, and in a short decay those would
+ *     be heard ringing on;
+ *   - in-loop allpasses scaled with the room size, so their group-delay
+ *     ripple stays a small share of every loop (no frequency lingers in a
+ *     small room);
+ *   - two output allpasses per side, so every echo of the tank leaves as
+ *     a short dense burst and the late field is smooth from its onset;
+ *   - the output taps follow the absorption, so even the first pass
+ *     through a line leaves attenuated by its own decay: the tail decays
+ *     exponentially from its first echoes instead of holding a plateau
+ *     for one round trip.
  * - **Natural stereo bass.** A diffuse field is coherent between the ears
  *   at low frequencies. The late tail's side signal is high-passed (2nd
  *   order at 220 Hz), so its L/R correlation is 0.98 below 100 Hz, about
@@ -79,10 +98,12 @@
  *   fractional delay), so there is no cumulative HF loss. Depth is set in
  *   time and scales with the room size: the same chorus at every sample
  *   rate, and small rooms do not warble. The presets smear the tail's
- *   resonances while keeping a steady tone's sidebands 45-55 dB down
- *   (Plate, lusher by design, about 25 dB).
- * - **Smooth size changes.** setSize() glides the line lengths (a short
- *   tape-style Doppler) instead of jumping, so it can be automated.
+ *   remaining resonances while keeping steady tones clean: over tones
+ *   from 400 Hz to 3 kHz, the energy more than 3 Hz from the tone is
+ *   34-39 dB down (Plate, lusher by design, about 22 dB).
+ * - **Smooth size changes.** setSize() glides the line and in-loop allpass
+ *   lengths (a short tape-style Doppler) instead of jumping, so it can be
+ *   automated.
  * - **Spring tanks.** Type::Spring models six springs per side as
  *   dispersive loops (Valimaki, Parker & Abel 2010): stretched-allpass
  *   cascades make every round trip a chirp whose band edge arrives last,
@@ -92,13 +113,13 @@
  *   two-spring tank). The springs run in SIMD lanes side by side.
  *   setDiffusion() sets the chirp strength for this type.
  * - **Efficient.** The sparse early-reflection FIR runs tap by tap over
- *   64-sample chunks on contiguous memory; the per-line state is laid out
- *   for SIMD, and the delay lines are padded so their streams do not
- *   collide in the cache.
- * - **Eco quality** (setQuality): 8 lines, no in-loop allpasses, 2 input
- *   diffusers per channel, 40 early taps per side and one spring per side,
- *   with the same decay calibration and loudness (within 0.5 dB), at about
- *   a third of the CPU.
+ *   64-sample chunks as SIMD multiply-adds on contiguous memory; the
+ *   per-line arithmetic runs in SIMD around the scalar delay-line reads,
+ *   and the delay lines are padded so their streams do not collide in the
+ *   cache. A stereo hall costs about 2% of one core at 48 kHz.
+ * - **Eco quality** (setQuality): 16 lines, 40 early taps per side and one
+ *   spring per side, with the same decay calibration and loudness (within
+ *   0.5 dB), at about 60% of the CPU.
  *
  * Threading: prepare() belongs to the setup thread (allocates). processBlock(),
  * processSample() and reset() belong to the audio thread. All setters are
@@ -227,6 +248,11 @@ public:
             // (ER-to-late gap plus the injection spread).
             ring_[c].prepare(samples(kMaxErToLateMs + kMaxInjectMs));
             for (auto& ap : inAP_[c]) ap.prepare(samples(kMaxInDiffMs));
+            for (int k = 0; k < kOutStages; ++k)
+            {
+                outAP_[c][k].prepare(samples(kOutDiffMs_[c][k]));
+                outAPLen_[c][k] = nearestPrime(std::max(1, static_cast<int>(kOutDiffMs_[c][k] * sr / 1000.0)));
+            }
         }
         const int maxLine = samples(kBaseDelaysMs_[kMaxLines - 1] + kModMaxMs) + 4;
         lines_.prepare(kMaxLines, maxLine);
@@ -358,6 +384,7 @@ public:
             preDelay_[c].clear();
             ring_[c].clear();
             for (auto& ap : inAP_[c]) ap.clear();
+            for (auto& ap : outAP_[c]) ap.clear();
             erLP_[c].fill(T(0));
             dcX1_[c] = dcY1_[c] = T(0);
         }
@@ -379,10 +406,12 @@ public:
         {
             lfo_[i].prepare(sr, rate * lfoRateFactor(i), lfoSeed(i));
             lenCur_[i] = static_cast<T>(lenTarget_[i]);
+            loopAPCur_[i] = static_cast<T>(loopAPLen_[i]);
             pos_[i] = std::max(lenCur_[i], T(kMinReadPos));
             posInc_[i] = T(0);
         }
         ctrlPhase_ = 0;
+        loopAPGliding_ = false;
 
         toneLPBiquad_.reset();
         toneHPBiquad_.reset();
@@ -416,21 +445,20 @@ public:
      * @brief Selects the engine quality / CPU cost trade-off.
      *
      * Quality::Full (default) runs the complete engine. Quality::Eco runs
-     * at about a third of the CPU for embedded and other constrained
-     * targets, with the same controls, decay calibration and loudness:
+     * at about 60% of its CPU for embedded and other constrained targets,
+     * with the same controls, decay calibration and loudness:
      *
-     * - 8 FDN lines instead of 32 (every fourth base delay, so the lines
-     *   still span 35-160 ms; per-line decay gains keep every T60 exact)
-     * - no in-loop allpasses (lower echo density in the first ~100 ms of
-     *   the tail)
-     * - 2 input diffusion allpasses per channel instead of 4
+     * - 16 FDN lines instead of 32 (every other base delay, so the lines
+     *   still span the full range; per-line decay gains keep every T60
+     *   exact)
      * - 40 early-reflection taps per side instead of 96
      * - one spring per side instead of six, with a 40-stage dispersion
      *   cascade instead of 72 (a stronger coefficient keeps the chirp)
      *
-     * The audible difference is a grainier build-up on sharp transients
-     * and more modal coloration on long, exposed tails; sustained material
-     * in short and mid rooms sounds almost the same.
+     * Half the modal density is the audible difference: long, exposed
+     * tails (a slow decay on sparse material) ring a little more, and the
+     * build-up is slightly less dense; short and mid rooms sound almost
+     * the same.
      *
      * Like setType(), this is an engine-mode switch, not an automation
      * target: it is applied at the start of the next processBlock() and
@@ -506,11 +534,11 @@ public:
     }
 
     /**
-     * @brief Diffusion (0 - 1): the strength of the input and in-loop
-     *        allpass diffusers, and how many of the first early reflections
-     *        stay discrete (7 at 0, 1 at 1). High values give a smooth,
-     *        dense onset; low values keep crisp, localisable early echoes.
-     *        For Type::Spring it sets the strength of the chirp.
+     * @brief Diffusion (0 - 1): the strength of the input, in-loop and
+     *        output allpass diffusers, and how many of the first early
+     *        reflections stay discrete (7 at 0, 1 at 1). High values give a
+     *        smooth, dense onset; low values keep crisp, localisable early
+     *        echoes. For Type::Spring it sets the strength of the chirp.
      */
     void setDiffusion(T amount) noexcept
     {
@@ -723,24 +751,24 @@ public:
         StateWriter w(stateId("ARVB"), 1);
         w.write("type", static_cast<int32_t>(type_.load(std::memory_order_relaxed)));
         w.write("quality", static_cast<int32_t>(quality_.load(std::memory_order_relaxed)));
-        w.write("decay", decayTime_.load(std::memory_order_relaxed));
-        w.write("size", size_.load(std::memory_order_relaxed));
-        w.write("damping", damping_.load(std::memory_order_relaxed));
-        w.write("diffusion", diffusion_.load(std::memory_order_relaxed));
-        w.write("modDepth", modDepth_.load(std::memory_order_relaxed));
-        w.write("modRate", modRate_.load(std::memory_order_relaxed));
-        w.write("preDelay", preDelayMs_.load(std::memory_order_relaxed));
-        w.write("erToLate", erToLateMs_.load(std::memory_order_relaxed));
-        w.write("mix", mix_.load(std::memory_order_relaxed));
-        w.write("width", width_.load(std::memory_order_relaxed));
-        w.write("highDecay", highDecayMult_.load(std::memory_order_relaxed));
-        w.write("bassDecay", bassDecayMult_.load(std::memory_order_relaxed));
-        w.write("highXover", highCrossover_.load(std::memory_order_relaxed));
-        w.write("bassXover", bassCrossover_.load(std::memory_order_relaxed));
+        w.write("decay", static_cast<float>(decayTime_.load(std::memory_order_relaxed)));
+        w.write("size", static_cast<float>(size_.load(std::memory_order_relaxed)));
+        w.write("damping", static_cast<float>(damping_.load(std::memory_order_relaxed)));
+        w.write("diffusion", static_cast<float>(diffusion_.load(std::memory_order_relaxed)));
+        w.write("modDepth", static_cast<float>(modDepth_.load(std::memory_order_relaxed)));
+        w.write("modRate", static_cast<float>(modRate_.load(std::memory_order_relaxed)));
+        w.write("preDelay", static_cast<float>(preDelayMs_.load(std::memory_order_relaxed)));
+        w.write("erToLate", static_cast<float>(erToLateMs_.load(std::memory_order_relaxed)));
+        w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
+        w.write("width", static_cast<float>(width_.load(std::memory_order_relaxed)));
+        w.write("highDecay", static_cast<float>(highDecayMult_.load(std::memory_order_relaxed)));
+        w.write("bassDecay", static_cast<float>(bassDecayMult_.load(std::memory_order_relaxed)));
+        w.write("highXover", static_cast<float>(highCrossover_.load(std::memory_order_relaxed)));
+        w.write("bassXover", static_cast<float>(bassCrossover_.load(std::memory_order_relaxed)));
         w.write("earlyDb", static_cast<float>(getEarlyLevel()));
         w.write("lateDb", static_cast<float>(getLateLevel()));
-        w.write("toneLowCut", toneLowCutHz_.load(std::memory_order_relaxed));
-        w.write("toneHighCut", toneHighCutHz_.load(std::memory_order_relaxed));
+        w.write("toneLowCut", static_cast<float>(toneLowCutHz_.load(std::memory_order_relaxed)));
+        w.write("toneHighCut", static_cast<float>(toneHighCutHz_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -779,9 +807,8 @@ protected:
     // --- Constants -----------------------------------------------------------
 
     static constexpr int kMaxLines   = 32;
-    static constexpr int kEcoLines   = 8;
+    static constexpr int kEcoLines   = 16;
     static constexpr int kInStages   = 4;   ///< input diffusers per channel feeding the late field (Full)
-    static constexpr int kEcoInStages = 2;
     static constexpr int kMaxERTaps  = 96;  ///< velvet early-reflection taps per side (Full)
     static constexpr int kEcoERTaps  = 40;
     static constexpr int kMaxDiscreteER = 7; ///< raw (discrete) early taps at diffusion 0
@@ -793,7 +820,7 @@ protected:
     static constexpr double kMaxErToLateMs = 200.0;
     static constexpr double kMaxErMs       = 170.0;
     static constexpr double kMaxInjectMs   = 8.0;
-    static constexpr double kMaxInDiffMs   = 6.0;
+    static constexpr double kMaxInDiffMs   = 2.0;
     static constexpr double kMaxLoopApMs   = 5.5;
     static constexpr double kCoherenceHz   = 220.0; ///< late field coherent below this
     static constexpr double kModMaxMs      = 2.0;   ///< peak line wander at modulation 1, size 1
@@ -810,11 +837,14 @@ protected:
     static constexpr T kErEnergy = T(0.0625);
 
     // FDN base delay times in ms (at size = 1); lengths are rounded to primes.
+    // About 3.7 s of delay in all: the modal density (modes per Hz equals the
+    // total delay in seconds) keeps the modes overlapping, so they do not
+    // ring out on their own.
     static constexpr double kBaseDelaysMs_[kMaxLines] = {
-         29.7,  31.0,  33.1,  34.9,  37.4,  39.3,  41.3,  43.5,
-         45.7,  49.1,  50.8,  53.2,  57.6,  59.9,  63.8,  67.5,
-         70.3,  75.0,  77.8,  84.3,  88.1,  93.7,  97.9, 102.7,
-        108.6, 117.2, 122.7, 128.5, 136.0, 145.7, 149.5, 160.1
+         44.5,  46.5,  49.7,  52.3,  56.1,  58.9,  61.9,  65.2,
+         68.6,  73.7,  76.2,  79.8,  86.4,  89.8,  95.7, 101.2,
+        105.4, 112.5, 116.7, 126.4, 132.1, 140.6, 146.9, 154.1,
+        162.9, 175.8, 184.1, 192.8, 204.0, 218.5, 224.2, 240.1
     };
 
     // In-loop allpass delays (ms): short and fixed in time, shuffled against
@@ -827,12 +857,23 @@ protected:
     };
 
     // Input diffusion allpass delays (ms) of the late-field feed,
-    // decorrelated between channels.
+    // decorrelated between channels. Short, so the frequencies an allpass
+    // holds back longest (its group-delay peaks) are not heard ringing on
+    // through a short decay.
     static constexpr double kInDiffMs_[2][kInStages] = {
-        { 1.03, 1.97, 3.13, 4.71 },
-        { 1.21, 2.29, 3.43, 5.11 }
+        { 0.36, 0.69, 1.10, 1.65 },
+        { 0.43, 0.80, 1.20, 1.79 }
     };
     static constexpr double kInDiffCoeffs_[kInStages] = { 0.75, 0.72, 0.68, 0.64 };
+
+    // Output diffusion allpass delays (ms) on the late sum, per channel: each
+    // echo of the tank leaves as a short dense burst, so the late field is
+    // smooth from its first milliseconds.
+    static constexpr int kOutStages = 2;
+    static constexpr double kOutDiffMs_[2][kOutStages] = {
+        { 1.13, 2.41 },
+        { 1.31, 2.67 }
+    };
 
     // Late injection taps (ms after the ER-to-late gap), one per line.
     static constexpr double kInjectMs_[kMaxLines] = {
@@ -1030,6 +1071,10 @@ protected:
     std::array<std::array<int, kInStages>, 2> inAPLen_ {};
     std::array<T, kInStages> inAPCoeff_ {};
     std::array<Line, 2> ring_;             ///< allpass-diffused input, feeds the late field
+    std::array<std::array<Line, kOutStages>, 2> outAP_;   ///< late-field output diffusers
+    std::array<std::array<int, kOutStages>, 2> outAPLen_ {};
+    T outAPCoeff_ = T(0.5);
+    T lateComp_ = T(1);   ///< late level compensation for the output after absorption
 
     // Early reflections (per side): velvet taps, each reading its own side
     // (erChan_ 0) or the other (1)
@@ -1072,7 +1117,9 @@ protected:
 
     // In-loop allpasses
     DelayBank loopAP_;
-    std::array<int, kMaxLines> loopAPLen_ {};
+    std::array<int, kMaxLines> loopAPLen_ {};   ///< in-loop allpass target lengths
+    std::array<T, kMaxLines> loopAPCur_ {};     ///< gliding lengths after a size change
+    bool loopAPGliding_ = false;
     T loopAPCoeff_ = T(0.4);
 
     // Absorption: Jot shelf (mid/high) and bass shelf, per line
@@ -1244,22 +1291,52 @@ protected:
             const T target = std::clamp(lenCur_[i] + m, kMinReadPos, maxReadPos_);
             posInc_[i] = (target - pos_[i]) * (T(1) / T(kCtrl));
         }
+        if (loopAPGliding_)
+        {
+            // The in-loop allpasses follow a size change with the lines.
+            bool moving = false;
+            for (int i = 0; i < n; ++i)
+            {
+                const T diff = static_cast<T>(loopAPLen_[i]) - loopAPCur_[i];
+                if (std::abs(diff) < T(0.01))
+                    loopAPCur_[i] = static_cast<T>(loopAPLen_[i]);
+                else
+                {
+                    loopAPCur_[i] += std::clamp(diff * glideCoeff_, -maxGlideStep_, maxGlideStep_);
+                    moving = true;
+                }
+            }
+            loopAPGliding_ = moving;
+        }
+    }
+
+    /// Unnormalised M-point Sylvester Hadamard transform in place, fully
+    /// unrolled at compile time (the halves, then one butterfly stage).
+    template <int M>
+    static void hadamardSmall(T* x) noexcept
+    {
+        if constexpr (M > 1)
+        {
+            hadamardSmall<M / 2>(x);
+            hadamardSmall<M / 2>(x + M / 2);
+            [x]<std::size_t... I>(std::index_sequence<I...>) {
+                ((void) [x] {
+                    const T a = x[I], b = x[I + M / 2];
+                    x[I] = a + b;
+                    x[I + M / 2] = a - b;
+                }(), ...);
+            }(std::make_index_sequence<M / 2> {});
+        }
     }
 
     /// In-place unnormalised fast Walsh-Hadamard transform of N values
-    /// (in-vector strides scalar, the rest in SIMD).
+    /// (in-vector strides unrolled scalar, the rest in SIMD).
     template <int N, int W, typename O>
     static void fwht(T* x) noexcept
     {
         using V = typename O::V;
-        for (int h = 1; h < W; h <<= 1)
-            for (int i = 0; i < N; i += h << 1)
-                for (int j = i; j < i + h; ++j)
-                {
-                    const T a = x[j], b = x[j + h];
-                    x[j] = a + b;
-                    x[j + h] = a - b;
-                }
+        for (int b = 0; b < N; b += W)
+            hadamardSmall<W>(x + b);
         for (int h = W; h < N; h <<= 1)
             for (int i = 0; i < N; i += h << 1)
                 for (int j = i; j < i + h; j += W)
@@ -1276,7 +1353,7 @@ protected:
      *        L/R output sums, Hadamard mix plus rotation, absorption
      *        shelves, in-loop allpass, safety limiter, injection, write.
      */
-    template <int N, bool LoopAllpass>
+    template <int N>
     void runFdn(T& lateL, T& lateR, int injLag) noexcept
     {
         constexpr int W = std::min(simd::kVecWidth<T>, N);
@@ -1287,48 +1364,42 @@ protected:
         alignas(64) std::array<T, N + 1> r;   // +1: wrap slot for the rotation
         alignas(64) std::array<T, N> v;
         alignas(64) std::array<T, N> tmp;
+        alignas(64) std::array<int, N> idx;
 
         // Allpass-interpolated modulated reads. eta = (1 - d) / (1 + d) for
         // the fractional part d in [0.5, 1.5), as the series -h / (1 + h) in
         // h = (d - 1) / 2, |h| <= 1/4: the error (< 1e-3) only nudges the
-        // fractional delay, the interpolator stays exactly allpass.
+        // fractional delay, the interpolator stays exactly allpass. The
+        // arithmetic runs in separate (vectorizable) passes around the
+        // scalar gather.
         for (int i = 0; i < N; ++i)
         {
             const T p = pos_[i] += posInc_[i];
             const int M = static_cast<int>(p - T(0.5));
             const T h = (p - static_cast<T>(M) - T(1)) * T(0.5);
-            const T eta = -h * (T(1) - h * (T(1) - h * (T(1) - h)));
-            const T y = eta * (lines_.at(i, M) - apY1_[i]) + lines_.at(i, M + 1);
-            apY1_[i] = y;
-            r[i] = y;
+            v[i] = -h * (T(1) - h * (T(1) - h * (T(1) - h)));
+            idx[i] = M;
         }
-
-        // Orthogonal L/R output sums.
+        for (int i = 0; i < N; ++i)
         {
-            V aL = O::set1(T(0)), aR = aL;
-            for (int i = 0; i < N; i += W)
-            {
-                const V x = O::load(r.data() + i);
-                aL = O::madd(O::load(outSignL_.data() + i), x, aL);
-                aR = O::madd(O::load(outSignR_.data() + i), x, aR);
-            }
-            O::store(v.data(), aL);
-            O::store(tmp.data(), aR);
-            for (int k = 0; k < W; ++k) { lateL += v[k]; lateR += tmp[k]; }
+            r[i] = lines_.at(i, idx[i]);
+            tmp[i] = lines_.at(i, idx[i] + 1);
         }
-
-        // Hadamard mix, rotation of the lines by one, normalisation.
-        const V norm = O::set1(T(1) / std::sqrt(static_cast<T>(N)));
-        fwht<N, W, O>(r.data());
-        r[N] = r[0];
-        for (int i = 0; i < N; i += W)
-            O::store(v.data() + i, O::mul(norm, O::load(r.data() + i + 1)));
-
-        // Absorption: Jot mid/high shelf, then bass shelf,
-        // y = b0 x + b1 x1 - a1 y1 each.
         for (int i = 0; i < N; i += W)
         {
-            const V x = O::load(v.data() + i);
+            const V y = O::madd(O::load(v.data() + i),
+                                O::sub(O::load(r.data() + i), O::load(apY1_.data() + i)),
+                                O::load(tmp.data() + i));
+            O::store(apY1_.data() + i, y);
+            O::store(r.data() + i, y);
+        }
+
+        // Absorption of what each line delivers (its own round trip: the
+        // in-loop allpass that fed it plus the line): Jot mid/high shelf,
+        // then bass shelf, y = b0 x + b1 x1 - a1 y1 each.
+        for (int i = 0; i < N; i += W)
+        {
+            const V x = O::load(r.data() + i);
             const V j = O::sub(O::madd(O::load(jotB0_.data() + i), x,
                                        O::mul(O::load(jotB1_.data() + i), O::load(jotX1_.data() + i))),
                                O::mul(O::load(jotA1_.data() + i), O::load(jotY1_.data() + i)));
@@ -1339,13 +1410,50 @@ protected:
                                O::mul(O::load(bassA1_.data() + i), O::load(bassY1_.data() + i)));
             O::store(bassX1_.data() + i, j);
             O::store(bassY1_.data() + i, b);
-            O::store(v.data() + i, b);
+            O::store(r.data() + i, b);
         }
 
-        if constexpr (LoopAllpass)
+        // Orthogonal L/R output sums, taken after the absorption: even the
+        // first pass through a line leaves attenuated by that line's own
+        // decay, so the tail decays exponentially from its first echoes
+        // instead of holding a plateau for one round trip.
         {
-            for (int i = 0; i < N; ++i)
-                tmp[i] = loopAP_.at(i, loopAPLen_[i]);
+            V aL = O::set1(T(0)), aR = aL;
+            for (int i = 0; i < N; i += W)
+            {
+                const V x = O::load(r.data() + i);
+                aL = O::madd(O::load(outSignL_.data() + i), x, aL);
+                aR = O::madd(O::load(outSignR_.data() + i), x, aR);
+            }
+            alignas(64) std::array<T, W> sumL, sumR;
+            O::store(sumL.data(), aL);
+            O::store(sumR.data(), aR);
+            for (int k = 0; k < W; ++k) { lateL += sumL[k]; lateR += sumR[k]; }
+        }
+
+        // Hadamard mix, rotation of the lines by one, normalisation.
+        const V norm = O::set1(T(1) / std::sqrt(static_cast<T>(N)));
+        fwht<N, W, O>(r.data());
+        r[N] = r[0];
+        for (int i = 0; i < N; i += W)
+            O::store(v.data() + i, O::mul(norm, O::load(r.data() + i + 1)));
+
+        {
+            if (loopAPGliding_) [[unlikely]]
+            {
+                for (int i = 0; i < N; ++i)
+                {
+                    const int k = static_cast<int>(loopAPCur_[i]);
+                    const T f = loopAPCur_[i] - static_cast<T>(k);
+                    const T a = loopAP_.at(i, k);
+                    tmp[i] = a + f * (loopAP_.at(i, k + 1) - a);
+                }
+            }
+            else
+            {
+                for (int i = 0; i < N; ++i)
+                    tmp[i] = loopAP_.at(i, loopAPLen_[i]);
+            }
             const V g = O::set1(loopAPCoeff_);
             for (int i = 0; i < N; i += W)
             {
@@ -1506,10 +1614,14 @@ protected:
     /// tap applied to a whole chunk, reading contiguous ring memory.
     static void addTap(T* acc, const Line& l, int lag0, T gain, int count) noexcept
     {
+        // The span is contiguous in the ring except across its wrap: split it
+        // there so both parts run as SIMD multiply-adds.
         const T* b = l.buf.data();
-        const int base = l.w - lag0;
-        for (int n = 0; n < count; ++n)
-            acc[n] += gain * b[static_cast<std::size_t>((base + n) & l.mask)];
+        const int start = (l.w - lag0) & l.mask;
+        const int first = std::min(count, l.mask + 1 - start);
+        simd::addWithGain(acc, b + start, gain, first);
+        if (first < count)
+            simd::addWithGain(acc + first, b, gain, count - first);
     }
 
     /**
@@ -1527,7 +1639,6 @@ protected:
 
         // --- Pre-delay, then the allpass diffusers of the late-field feed ---
         alignas(64) T raw[2][kChunk];
-        const int nIn = eco_ ? kEcoInStages : kInStages;
         for (int c = 0; c < 2; ++c)
         {
             Line& pre = preDelay_[static_cast<std::size_t>(c)];
@@ -1540,7 +1651,7 @@ protected:
             for (int n = 0; n < count; ++n)
             {
                 T x = raw[c][n];
-                for (int st = 0; st < nIn; ++st)
+                for (int st = 0; st < kInStages; ++st)
                 {
                     Line& ap = aps[static_cast<std::size_t>(st)];
                     const T g = inAPCoeff_[static_cast<std::size_t>(st)];
@@ -1594,8 +1705,8 @@ protected:
                 if (eco_) runSprings<kEcoSprings, kEcoSpringStages>(lateL, lateR, rawN);
                 else      runSprings<kSprings, kSpringStages>(lateL, lateR, rawN);
             }
-            else if (eco_) runFdn<kEcoLines, false>(lateL, lateR, gap + last - n);
-            else           runFdn<kMaxLines, true>(lateL, lateR, gap + last - n);
+            else if (eco_) runFdn<kEcoLines>(lateL, lateR, gap + last - n);
+            else           runFdn<kMaxLines>(lateL, lateR, gap + last - n);
 
             const auto [yl, yr] = outputStage(lateL, lateR, early[0][n], early[1][n]);
             outL[n] = yl;
@@ -1608,9 +1719,28 @@ protected:
     std::pair<T, T> outputStage(T lateL, T lateR, T earlyL, T earlyR) noexcept
     {
         // --- Output: coherent low band, width, early + late, DC block, tone ---
-        const T lateLvl = cachedParams_.lateLevel * kOutGain;
+        const T lateLvl = cachedParams_.lateLevel * kOutGain * lateComp_;
         lateL *= lateLvl;
         lateR *= lateLvl;
+        if (!spring_)
+        {
+            // Output diffusion (the springs' chirps stay crisp).
+            T* lr[2] = { &lateL, &lateR };
+            const T g = outAPCoeff_;
+            for (int c = 0; c < 2; ++c)
+            {
+                T x = *lr[c];
+                for (int k = 0; k < kOutStages; ++k)
+                {
+                    Line& ap = outAP_[static_cast<std::size_t>(c)][static_cast<std::size_t>(k)];
+                    const T d = ap.at(outAPLen_[static_cast<std::size_t>(c)][static_cast<std::size_t>(k)]);
+                    const T w = x + g * d;
+                    ap.push(w);
+                    x = d - g * w;
+                }
+                *lr[c] = x;
+            }
+        }
         {
             // A diffuse field is coherent between the ears at low frequencies
             // (the wavelength dwarfs the head): the side signal is high-passed
@@ -1679,11 +1809,15 @@ protected:
 
         for (int i = 0; i < kMaxLines; ++i)
         {
-            // Eco picks every other base delay, so its 8 lines still span
+            // Eco picks every other base delay, so its 16 lines still span
             // the full range (even mode density).
-            const int src = eco_ ? std::min(i * 4 + 3, kMaxLines - 1) : i;
+            const int src = eco_ ? std::min(i * (kMaxLines / kEcoLines) + 1, kMaxLines - 1) : i;
             lenTarget_[i] = nearestPrime(ms(kBaseDelaysMs_[src] * sz));
-            loopAPLen_[i] = nearestPrime(ms(kLoopApMs_[i]));
+            // The in-loop allpasses scale with the room like the lines, so
+            // their group-delay ripple stays a small, size-independent share
+            // of each loop: no frequency lingers longer in a small room.
+            loopAPLen_[i] = nearestPrime(ms(kLoopApMs_[i] * sz));
+            loopAPGliding_ = true;
             injTap_[i] = std::max(1, ms(kInjectMs_[i]));
             injGain_[i] = static_cast<T>(kInjectSign_[i]) / std::sqrt(static_cast<T>(nLines_));
             outSignL_[i] = static_cast<T>(kOutSignL_[i]);
@@ -1708,9 +1842,10 @@ protected:
         const double diff = static_cast<double>(diffusion_.load(std::memory_order_relaxed));
         for (int st = 0; st < kInStages; ++st)
             inAPCoeff_[static_cast<std::size_t>(st)] = static_cast<T>(kInDiffCoeffs_[st] * diff);
-        loopAPCoeff_ = static_cast<T>(0.15 + 0.35 * diff);
+        loopAPCoeff_ = static_cast<T>(0.075 + 0.175 * diff);
+        outAPCoeff_ = static_cast<T>(0.6 * diff);
 
-        // Spring chirp strength        // Spring chirp strength: the group-delay rise per stage is
+        // Spring chirp strength: the group-delay rise per stage is
         // (1 + a) / (1 - a) - (1 - a) / (1 + a). The total dispersion is
         // that of a 72-stage cascade at a = 0.3 + 0.5 x diffusion; shorter
         // cascades get a larger coefficient to match it.
@@ -1766,6 +1901,7 @@ protected:
             bassCrossover_.load(std::memory_order_relaxed)), 10.0, 0.45 * sr);
         const double Kh = std::tan(kPi * fh / sr);
         const double Kb = std::tan(kPi * fb / sr);
+        double passEnergy = 0.0;
         for (int i = 0; i < kMaxLines; ++i)
         {
             // Loop length: line + group delay of the in-loop allpasses. The
@@ -1776,8 +1912,9 @@ protected:
             const double M = spring_
                 ? static_cast<double>(lenTarget_[i]) + springStages_ * springK_
                       * (1.0 - static_cast<double>(springA_)) / (1.0 + static_cast<double>(springA_))
-                : static_cast<double>(lenTarget_[i] + (eco_ ? 0 : loopAPLen_[i]));
+                : static_cast<double>(lenTarget_[i] + loopAPLen_[i]);
             const double gM = std::pow(0.001, M / (decay * sr));
+            if (i < nLines_) passEnergy += gM * gM;
             const double gH = std::min(std::pow(0.001, M / (t60H * sr)), gM);
             // Keep the bass loop gain below 1 so extreme settings ring out
             // instead of self-sustaining.
@@ -1798,6 +1935,11 @@ protected:
                 bassA1_[i] = static_cast<T>((b - 1.0) * inv);
             }
         }
+        // The FDN output is taken after the absorption, one round trip
+        // quieter than the lines' content; this restores the late level (so
+        // the early/late balance does not depend on the decay time).
+        lateComp_ = spring_ ? T(1)
+                            : static_cast<T>(1.0 / std::sqrt(passEnergy / std::max(1, nLines_)));
     }
 
     // --- Early reflection generation -----------------------------------------

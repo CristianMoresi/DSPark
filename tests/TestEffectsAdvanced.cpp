@@ -2600,8 +2600,8 @@ DSPARK_TEST(Reverb_default_quality_is_full)
 
 DSPARK_TEST(Reverb_eco_quality_tail_matches_full_calibration)
 {
-    // Eco (8 lines, no in-loop allpasses, lighter diffusion) must keep the
-    // Full engine's calibration: same decay-time law, tail loudness within
+    // Eco (16 lines, fewer early taps) must keep the Full engine's
+    // calibration: same decay-time law, tail loudness within
     // 0.5 dB, stereo decorrelation preserved, everything finite. The burst
     // is broadband noise: a single sine lands on a random point of each
     // engine's modal response, whose level swings by +/-10 dB between
@@ -3569,6 +3569,116 @@ DSPARK_TEST(AlgoReverb_late_bass_is_coherent_between_channels)
     };
     EXPECT_GT(corr(true), 0.8);
     EXPECT_LT(std::abs(corr(false)), 0.2);
+}
+
+DSPARK_TEST(AlgoReverb_echo_density_builds_like_a_room_in_both_qualities)
+{
+    // Normalized echo density (Abel & Huang: the share of samples beyond one
+    // standard deviation in a 20 ms window, 1 for Gaussian noise) averaged
+    // over 20-150 ms after the onset. Measured rooms (Detmold halls,
+    // churches) sit at 0.93-1.02. The Hall preset measured 0.90 (Full) and
+    // 0.38 (Eco: a grainy 8-line build-up) before the output diffusers and
+    // the 16-line Eco; 0.95 and 0.92 now.
+    for (int q = 0; q < 2; ++q)
+    {
+        ARevF rev;
+        rev.prepare(spec(48000.0, 256, 2));
+        rev.setType(ARevF::Type::Hall);
+        if (q == 1) rev.setQuality(ARevF::Quality::Eco);
+        rev.setMix(1.0f);
+        {
+            auto w = makeBuffer(2, 64);
+            rev.processBlock(w.view());
+        }
+        const auto ir = algoReverbIR(rev, 48000.0, 0.6);
+        float peak = 0.0f;
+        for (const float v : ir) peak = std::max(peak, std::abs(v));
+        int on = 0;
+        while (std::abs(ir[static_cast<size_t>(on)]) <= 0.1f * peak) ++on;
+        constexpr int kW = 961;   // 20 ms
+        std::vector<double> win(kW);
+        double wsum = 0.0;
+        for (int i = 0; i < kW; ++i)
+            wsum += win[static_cast<size_t>(i)] = 0.5 - 0.5 * std::cos(6.283185307179586 * (i + 1) / (kW + 1));
+        double sum = 0.0;
+        int count = 0;
+        for (int c = on + 960; c < on + 7200; c += 240, ++count)
+        {
+            const int s0 = c - kW / 2;
+            double var = 0.0;
+            for (int i = 0; i < kW; ++i)
+            {
+                const double x = ir[static_cast<size_t>(s0 + i)];
+                var += win[static_cast<size_t>(i)] / wsum * x * x;
+            }
+            const double sd = std::sqrt(var);
+            double above = 0.0;
+            for (int i = 0; i < kW; ++i)
+                if (std::abs(ir[static_cast<size_t>(s0 + i)]) > sd) above += win[static_cast<size_t>(i)] / wsum;
+            sum += above / 0.3173105;
+        }
+        EXPECT_GT(sum / count, 0.8);
+    }
+}
+
+DSPARK_TEST(AlgoReverb_short_small_room_does_not_ring)
+{
+    // An allpass holds some frequencies back longer than others (its
+    // group-delay peaks); in a short decay those frequencies are still
+    // sounding after the rest has died away, a metallic ring. With 1-5 ms
+    // input diffusers and fixed in-loop allpasses the Room preset's tail
+    // (50-300 ms) had narrow peaks 9.6 dB above the 1/3-octave average of
+    // its short-time spectrum; with short diffusers and allpasses that
+    // scale with the room, 8.0 dB (a Gaussian tail gives about 6.5).
+    ARevF rev;
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setType(ARevF::Type::Room);
+    rev.setMix(1.0f);
+    {
+        auto w = makeBuffer(2, 64);
+        rev.processBlock(w.view());
+    }
+    const auto ir = algoReverbIR(rev, 48000.0, 0.5);
+    float peak = 0.0f;
+    for (const float v : ir) peak = std::max(peak, std::abs(v));
+    int on = 0;
+    while (std::abs(ir[static_cast<size_t>(on)]) <= 0.1f * peak) ++on;
+    constexpr int kN = 4096;
+    const double df = 48000.0 / kN;
+    const int b0 = static_cast<int>(200.0 / df) + 1, b1 = static_cast<int>(8000.0 / df);
+    const int nb = b1 - b0 + 1;
+    std::vector<double> avg(static_cast<size_t>(nb), 0.0), db(static_cast<size_t>(nb));
+    std::vector<double> seg(kN), spec2(kN + 2);
+    FFTReal<double> fft(kN);
+    constexpr int kFrames = 4;
+    for (int f = 0; f < kFrames; ++f)
+    {
+        const int a = on + 2400 + f * kN / 2;
+        for (int i = 0; i < kN; ++i)
+            seg[static_cast<size_t>(i)] = ir[static_cast<size_t>(a + i)]
+                * (0.5 - 0.5 * std::cos(6.283185307179586 * i / kN));
+        fft.forward(seg.data(), spec2.data());
+        for (int k = 0; k < nb; ++k)
+        {
+            const size_t b = static_cast<size_t>(b0 + k);
+            db[static_cast<size_t>(k)] = 10.0 * std::log10(spec2[2 * b] * spec2[2 * b]
+                                                          + spec2[2 * b + 1] * spec2[2 * b + 1] + 1e-30);
+        }
+        // Deviation from the running 1/3-octave mean, accumulated in power.
+        for (int k = 0; k < nb; ++k)
+        {
+            const double fk = (b0 + k) * df;
+            const int lo = std::max(0, static_cast<int>(std::ceil(fk * 0.8908987 / df)) - b0);
+            const int hi = std::min(nb - 1, static_cast<int>(std::floor(fk * 1.1224620 / df)) - b0);
+            double m = 0.0;
+            for (int j = lo; j <= hi; ++j) m += db[static_cast<size_t>(j)];
+            m /= (hi - lo + 1);
+            avg[static_cast<size_t>(k)] += std::pow(10.0, (db[static_cast<size_t>(k)] - m) / 10.0) / kFrames;
+        }
+    }
+    double top = 0.0;
+    for (const double v : avg) top = std::max(top, 10.0 * std::log10(v));
+    EXPECT_LT(top, 8.8);
 }
 
 // ============================================================================

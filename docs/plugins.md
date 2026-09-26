@@ -202,8 +202,13 @@ virtual; nothing else is required.**
   DSPark setters still smooth on top. (Opt out per plugin, see above.)
 - **Latency changes**: after parameter motion the wrapper re-reads
   `getLatency()` and notifies the host through the native channel
-  (`restartComponent(kLatencyChanged)`, `clap_host_latency` on the main
-  thread, the AU `Latency` property listeners) so projects re-compensate.
+  (`restartComponent(kLatencyChanged)`, `clap_host_latency`, the AU
+  `Latency` property listeners) so projects re-compensate - always from the
+  host's main/UI thread, as every format requires. A change detected in the
+  audio callback (automation moving a lookahead) only raises an atomic flag
+  there; a ~30 Hz main-thread tick hands it to the host (VST3: a Windows
+  thread timer, a macOS main-queue timer, or the host's Linux `IRunLoop`;
+  CLAP: `request_callback`; AU: a main-queue timer).
 - **State container**: versioned, tolerant (unknown parameters are skipped,
   missing ones keep defaults) and **identical across formats** - a preset
   saved by the VST3 build loads in the CLAP and AU builds byte-for-byte.

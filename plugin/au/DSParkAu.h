@@ -72,6 +72,9 @@
 #include <objc/runtime.h>
 #endif
 
+#include <dispatch/dispatch.h>
+#include <pthread.h>
+
 #include <atomic>
 #include <cstring>
 #include <new>
@@ -331,6 +334,7 @@ struct Plugin
 
     ~Plugin() noexcept
     {
+        stopLatencyTick(false);   // disposing: no listener call from here
 #if defined(DSPARK_PLUGIN_WEBVIEW)
         teardownEditor();
 #endif
@@ -355,7 +359,10 @@ struct Plugin
     }
 
     /** Re-reads the plugin latency after parameter motion; on a change,
-     *  updates the cache and tells kAudioUnitProperty_Latency listeners. */
+     *  updates the cache and tells kAudioUnitProperty_Latency listeners -
+     *  on the main thread. A change detected in render() (automation moved
+     *  a lookahead) only raises a flag; the main-queue tick below calls the
+     *  host's listeners, which must never run on the render thread. */
     void refreshLatency() noexcept
     {
         if constexpr (HasLatency<P>)
@@ -364,10 +371,58 @@ struct Plugin
             if (initialized && now != cachedLatency.load(std::memory_order_relaxed))
             {
                 cachedLatency.store(now, std::memory_order_relaxed);
-                notifyProperty(kAudioUnitProperty_Latency,
-                               kAudioUnitScope_Global, 0);
+                if (pthread_main_np() != 0
+                    || !latencyTickRunning.load(std::memory_order_acquire))
+                    notifyProperty(kAudioUnitProperty_Latency,
+                                   kAudioUnitScope_Global, 0);
+                else
+                    latencyNotifyPending.store(true, std::memory_order_release);
             }
         }
+    }
+
+    // --- main-queue latency tick (~30 Hz, main thread) ---------------------------------
+
+    std::atomic<bool> latencyNotifyPending { false };
+    std::atomic<bool> latencyTickRunning { false };
+    dispatch_source_t latencyTick = nullptr;
+
+    static void onLatencyTick(void* self)
+    {
+        auto* plugin = static_cast<Plugin*>(self);
+        if (plugin->latencyNotifyPending.exchange(false, std::memory_order_acq_rel))
+            plugin->notifyProperty(kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0);
+    }
+
+    void startLatencyTick() noexcept
+    {
+        if constexpr (HasLatency<P>)
+        {
+            if (latencyTick != nullptr) return;
+            latencyTick = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                 dispatch_get_main_queue());
+            if (latencyTick == nullptr) return;
+            dispatch_set_context(latencyTick, this);
+            dispatch_source_set_event_handler_f(latencyTick, &onLatencyTick);
+            dispatch_source_set_timer(latencyTick,
+                                      dispatch_time(DISPATCH_TIME_NOW, 33 * 1000000),
+                                      33u * 1000000u, 5u * 1000000u);
+            dispatch_resume(latencyTick);
+            latencyTickRunning.store(true, std::memory_order_release);
+        }
+    }
+
+    /** Main thread (uninitialize/close): no tick runs after this returns;
+     *  a still-pending change is delivered first when @p flush is set. */
+    void stopLatencyTick(bool flush = true) noexcept
+    {
+        if (latencyTick == nullptr) return;
+        latencyTickRunning.store(false, std::memory_order_release);
+        dispatch_source_cancel(latencyTick);
+        dispatch_release(latencyTick);
+        latencyTick = nullptr;
+        if (latencyNotifyPending.exchange(false, std::memory_order_acq_rel) && flush)
+            notifyProperty(kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0);
     }
 
     void notifyProperty(AudioUnitPropertyID id, AudioUnitScope scope,
@@ -553,6 +608,7 @@ struct Plugin
                              static_cast<int>(maxFrames));
         }
         scheduledCount = 0;
+        startLatencyTick();
         initialized = true;
         return noErr;
     }
@@ -560,6 +616,7 @@ struct Plugin
     OSStatus uninitialize() noexcept
     {
         initialized = false;
+        stopLatencyTick();
         return noErr;
     }
 

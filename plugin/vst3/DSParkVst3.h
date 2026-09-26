@@ -67,10 +67,205 @@
 #include "vst3_c_api.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <new>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#if defined(__APPLE__)
+    #include <dispatch/dispatch.h>   // libSystem: no extra link flag
+#elif defined(_WIN32)
+// The two user32 calls the UI tick needs, declared exactly as <windows.h>
+// declares them (so either include order compiles) instead of pulling the
+// whole Windows header - and its macros - into every plugin translation unit.
+struct HWND__;
+extern "C" __declspec(dllimport) std::uintptr_t __stdcall SetTimer(
+    HWND__* window, std::uintptr_t id, unsigned int milliseconds,
+    void (__stdcall* callback)(HWND__*, unsigned int, std::uintptr_t, unsigned long));
+extern "C" __declspec(dllimport) int __stdcall KillTimer(HWND__* window, std::uintptr_t id);
+#if defined(_MSC_VER)
+#pragma comment(lib, "user32.lib")
+#endif
+#endif
 
 namespace dspark::plugin::vst3 {
+
+// -- UI-thread tick ------------------------------------------------------------------
+
+/**
+ * @brief A ~30 Hz tick on the host's UI thread.
+ *
+ * VST3 allows IComponentHandler::restartComponent() from the UI thread only,
+ * but a latency change is usually detected on the audio thread (automation
+ * moved a lookahead parameter). The audio thread therefore only raises a
+ * flag - no host call, no allocation - and this tick hands the request to
+ * the host. Windows: a thread timer (SetTimer) on the UI thread that
+ * started it; macOS: a libdispatch timer on the main queue; Linux: the
+ * host's IRunLoop, when the initialize() context offers one. start() and
+ * stop() run on the UI thread; running() may be read from any thread.
+ */
+class UiTicker
+{
+public:
+    using Callback = void (*)(void* context) noexcept;
+
+    UiTicker() noexcept = default;
+    UiTicker(const UiTicker&) = delete;
+    UiTicker& operator=(const UiTicker&) = delete;
+    ~UiTicker() { stop(); }
+
+    /** Starts ticking @p callback(@p context); false when this platform or
+     *  host offers no UI-thread tick (callers then fall back). */
+    bool start(Steinberg_FUnknown* hostContext, Callback callback, void* context) noexcept
+    {
+        if (running_.load(std::memory_order_relaxed)) return true;
+        callback_ = callback;
+        context_ = context;
+#if defined(__APPLE__)
+        (void) hostContext;
+        source_ = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                         dispatch_get_main_queue());
+        if (source_ == nullptr) return false;
+        dispatch_set_context(source_, this);
+        dispatch_source_set_event_handler_f(source_, &onDispatchTick);
+        dispatch_source_set_timer(source_,
+                                  dispatch_time(DISPATCH_TIME_NOW,
+                                                static_cast<int64_t>(kPeriodMs) * 1000000),
+                                  static_cast<uint64_t>(kPeriodMs) * 1000000u,
+                                  5u * 1000000u);
+        dispatch_resume(source_);
+#elif defined(_WIN32)
+        (void) hostContext;
+        timerId_ = SetTimer(nullptr, 0, kPeriodMs, &onWindowsTick);
+        if (timerId_ == 0) return false;
+        registry().emplace_back(timerId_, this);
+#elif defined(__linux__)
+        if (hostContext == nullptr) return false;
+        void* loop = nullptr;
+        if (hostContext->lpVtbl->queryInterface(hostContext, Steinberg_Linux_IRunLoop_iid,
+                                                &loop) != Steinberg_kResultOk
+            || loop == nullptr)
+            return false;
+        runLoop_ = static_cast<Steinberg_Linux_IRunLoop*>(loop);
+        if (runLoop_->lpVtbl->registerTimer(
+                runLoop_, reinterpret_cast<Steinberg_Linux_ITimerHandler*>(&timer_),
+                kPeriodMs) != Steinberg_kResultOk)
+        {
+            reinterpret_cast<Steinberg_FUnknown*>(runLoop_)->lpVtbl->release(runLoop_);
+            runLoop_ = nullptr;
+            return false;
+        }
+#else
+        (void) hostContext;
+        return false;
+#endif
+        running_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    /** Stops the tick; no callback runs after it returns (UI thread). */
+    void stop() noexcept
+    {
+        if (!running_.load(std::memory_order_relaxed)) return;
+        running_.store(false, std::memory_order_release);
+#if defined(__APPLE__)
+        // Cancel on the main queue's own thread: no handler is mid-flight,
+        // and none is invoked after cancellation.
+        dispatch_source_cancel(source_);
+        dispatch_release(source_);
+        source_ = nullptr;
+#elif defined(_WIN32)
+        KillTimer(nullptr, timerId_);
+        auto& entries = registry();
+        for (size_t i = 0; i < entries.size(); ++i)
+            if (entries[i].first == timerId_)
+            {
+                entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+        timerId_ = 0;
+#elif defined(__linux__)
+        runLoop_->lpVtbl->unregisterTimer(
+            runLoop_, reinterpret_cast<Steinberg_Linux_ITimerHandler*>(&timer_));
+        reinterpret_cast<Steinberg_FUnknown*>(runLoop_)->lpVtbl->release(runLoop_);
+        runLoop_ = nullptr;
+#endif
+    }
+
+    [[nodiscard]] bool running() const noexcept
+    {
+        return running_.load(std::memory_order_acquire);
+    }
+
+private:
+    static constexpr unsigned int kPeriodMs = 33;
+
+    void tick() noexcept
+    {
+        if (running_.load(std::memory_order_relaxed) && callback_ != nullptr)
+            callback_(context_);
+    }
+
+    std::atomic<bool> running_ { false };
+    Callback callback_ = nullptr;
+    void* context_ = nullptr;
+
+#if defined(__APPLE__)
+    dispatch_source_t source_ = nullptr;
+    static void onDispatchTick(void* self) { static_cast<UiTicker*>(self)->tick(); }
+#elif defined(_WIN32)
+    std::uintptr_t timerId_ = 0;
+    // Thread timers carry no user pointer: map the id back (UI thread only).
+    static std::vector<std::pair<std::uintptr_t, UiTicker*>>& registry()
+    {
+        static std::vector<std::pair<std::uintptr_t, UiTicker*>> entries;
+        return entries;
+    }
+    static void __stdcall onWindowsTick(HWND__*, unsigned int, std::uintptr_t id,
+                                        unsigned long)
+    {
+        for (const auto& entry : registry())
+            if (entry.first == id)
+            {
+                entry.second->tick();
+                return;
+            }
+    }
+#elif defined(__linux__)
+    // A minimal ITimerHandler (static lifetime: owned by this ticker).
+    struct TimerObject
+    {
+        const Steinberg_Linux_ITimerHandlerVtbl* vtbl;
+        UiTicker* owner;
+    };
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE timerQuery(void* self_,
+        const Steinberg_TUID iid, void** obj)
+    {
+        if (obj == nullptr) return Steinberg_kInvalidArgument;
+        if (std::memcmp(iid, Steinberg_FUnknown_iid, sizeof(Steinberg_TUID)) == 0
+            || std::memcmp(iid, Steinberg_Linux_ITimerHandler_iid,
+                           sizeof(Steinberg_TUID)) == 0)
+        {
+            *obj = self_;
+            return Steinberg_kResultOk;
+        }
+        *obj = nullptr;
+        return Steinberg_kNoInterface;
+    }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE timerRef(void*) { return 1; }
+    static void SMTG_STDMETHODCALLTYPE timerTick(void* self_)
+    {
+        static_cast<TimerObject*>(self_)->owner->tick();
+    }
+    inline static const Steinberg_Linux_ITimerHandlerVtbl kTimerVtbl = {
+        &timerQuery, &timerRef, &timerRef, &timerTick
+    };
+    TimerObject timer_ { &kTimerVtbl, this };
+    Steinberg_Linux_IRunLoop* runLoop_ = nullptr;
+#endif
+};
 
 // -- small helpers -------------------------------------------------------------
 
@@ -235,6 +430,14 @@ struct Plugin
     // so the atomic removes the formally torn read without needing a lock.
     std::atomic<Steinberg_Vst_IComponentHandler*> handler { nullptr };
 
+    // restartComponent() is a UI-thread call. The thread that creates and
+    // initializes the plugin is the host's UI thread; requests raised on any
+    // other thread (the audio thread, when automation moves the latency)
+    // wait in pendingRestart until the UI tick delivers them.
+    std::atomic<std::thread::id> uiThread { std::this_thread::get_id() };
+    std::atomic<Steinberg_int32> pendingRestart { 0 };
+    UiTicker uiTicker;
+
     Plugin() noexcept
     {
         componentVtbl  = &kComponentVtbl;
@@ -369,10 +572,16 @@ struct Plugin
                                 0, kNumPresets - 1);
     }
 
+    ~Plugin()
+    {
+        uiTicker.stop();
+        if (auto* h = handler.exchange(nullptr, std::memory_order_relaxed); h != nullptr)
+            reinterpret_cast<Steinberg_FUnknown*>(h)->lpVtbl->release(h);
+    }
+
     /** Re-reads the plugin latency; on a change, updates the cache and asks
-     *  the host to re-fetch it. Mainstream hosts accept the restart request
-     *  from the audio thread (they defer internally); extraFlags lets the
-     *  caller batch kParamValuesChanged from a preset load into one call. */
+     *  the host to re-fetch it. extraFlags lets the caller batch
+     *  kParamValuesChanged from a preset load into the same request. */
     void refreshLatency(Steinberg_int32 extraFlags = 0) noexcept
     {
         Steinberg_int32 flags = extraFlags;
@@ -385,9 +594,60 @@ struct Plugin
                 flags |= Steinberg_Vst_RestartFlags_kLatencyChanged;
             }
         }
+        if (flags != 0) requestRestart(flags);
+    }
+
+    [[nodiscard]] bool onUiThread() const noexcept
+    {
+        return std::this_thread::get_id() == uiThread.load(std::memory_order_relaxed);
+    }
+
+    /** Hands @p flags to the host on the UI thread: at once when called
+     *  there, otherwise through the UI tick. Without a tick (a Linux host
+     *  whose context offers no IRunLoop) the request goes out directly - the
+     *  behaviour those hosts accept. Audio-thread safe: an atomic OR only. */
+    void requestRestart(Steinberg_int32 flags) noexcept
+    {
+        if (onUiThread() || !uiTicker.running())
+        {
+            flags |= pendingRestart.exchange(0, std::memory_order_acq_rel);
+            if (auto* h = handler.load(std::memory_order_relaxed); h != nullptr)
+                h->lpVtbl->restartComponent(h, flags);
+            return;
+        }
+        pendingRestart.fetch_or(flags, std::memory_order_release);
+    }
+
+    /** UI thread: delivers any restart request the audio thread raised. */
+    void deliverPendingRestart() noexcept
+    {
+        if (!onUiThread()) return;
+        const Steinberg_int32 flags = pendingRestart.exchange(0, std::memory_order_acq_rel);
         if (flags != 0)
             if (auto* h = handler.load(std::memory_order_relaxed); h != nullptr)
                 h->lpVtbl->restartComponent(h, flags);
+    }
+
+    static void onUiTick(void* self) noexcept
+    {
+        static_cast<Plugin*>(self)->deliverPendingRestart();
+    }
+
+    /** initialize() of either interface: the calling thread IS the UI thread;
+     *  start the tick when anything can raise a restart off that thread. */
+    void attachToHost(Steinberg_FUnknown* context) noexcept
+    {
+        uiThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        if constexpr (HasLatency<P> || kNumPresets > 0)
+            uiTicker.start(context, &onUiTick, this);
+        else
+            (void) context;
+    }
+
+    void detachFromHost() noexcept
+    {
+        deliverPendingRestart();
+        uiTicker.stop();
     }
 
     // --- block event plumbing -------------------------------------------------------
@@ -566,11 +826,18 @@ struct Plugin
     // Lens 0 - IComponent (+ IPluginBase)
     // ==========================================================================
 
-    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sInitialize(void*, Steinberg_FUnknown*)
-    { return Steinberg_kResultOk; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sInitialize(void* self_,
+                                                                Steinberg_FUnknown* context)
+    {
+        fromLens(self_, 0)->attachToHost(context);
+        return Steinberg_kResultOk;
+    }
 
-    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sTerminate(void*)
-    { return Steinberg_kResultOk; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sTerminate(void* self_)
+    {
+        fromLens(self_, 0)->detachFromHost();
+        return Steinberg_kResultOk;
+    }
 
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sGetControllerClassId(void*, Steinberg_TUID)
     { return Steinberg_kResultFalse; }   // single component: no separate controller
@@ -1066,11 +1333,18 @@ struct Plugin
     // Lens 2 - IEditController (+ IPluginBase)
     // ==========================================================================
 
-    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sCtrlInitialize(void*, Steinberg_FUnknown*)
-    { return Steinberg_kResultOk; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sCtrlInitialize(void* self_,
+                                                                    Steinberg_FUnknown* context)
+    {
+        fromLens(self_, 2)->attachToHost(context);
+        return Steinberg_kResultOk;
+    }
 
-    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sCtrlTerminate(void*)
-    { return Steinberg_kResultOk; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sCtrlTerminate(void* self_)
+    {
+        fromLens(self_, 2)->detachFromHost();
+        return Steinberg_kResultOk;
+    }
 
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sSetComponentState(void* self_,
                                                                        Steinberg_IBStream* state)
@@ -1267,6 +1541,7 @@ struct Plugin
         Steinberg_Vst_ParamID id)
     {
         auto* p = fromLens(self_, 2);
+        p->deliverPendingRestart();   // hosts poll this from the UI thread
         if (id == kBypassParamId)
             return p->bypass.load(std::memory_order_relaxed) ? 1.0 : 0.0;
         if (kNumPresets > 0 && id == kProgramParamId)
@@ -1331,6 +1606,7 @@ struct Plugin
         auto* old = p->handler.exchange(handler, std::memory_order_relaxed);
         if (old != nullptr)
             reinterpret_cast<Steinberg_FUnknown*>(old)->lpVtbl->release(old);
+        p->deliverPendingRestart();
         return Steinberg_kResultOk;
     }
 
@@ -1603,7 +1879,9 @@ struct View
 
     static void SMTG_STDMETHODCALLTYPE sOnTimer(void* self_)
     {
-        fromLens(self_, 2)->editor.pump();
+        View* view = fromLens(self_, 2);
+        view->editor.pump();
+        view->owner->deliverPendingRestart();   // the frame's run loop ticks too
     }
 
 #endif // __linux__

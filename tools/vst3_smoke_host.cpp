@@ -24,10 +24,24 @@
 
 #include "../plugin/vst3/vst3_c_api.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+    #ifndef NOMINMAX
+    #define NOMINMAX
+    #endif
+    #include <windows.h>
+    #if defined(_MSC_VER)
+    #pragma comment(lib, "user32.lib")
+    #endif
+#elif defined(__APPLE__)
+    #include <dlfcn.h>
+#endif
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -134,6 +148,9 @@ struct HostHandler
     const Steinberg_Vst_IComponentHandlerVtbl* vtbl;
     Steinberg_int32 restartFlags = 0;
     int restartCalls = 0;
+    // VST3 allows restartComponent on the UI thread only: count violations.
+    std::thread::id uiThread = std::this_thread::get_id();
+    int offThreadRestarts = 0;
 
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void* self_,
         const Steinberg_TUID iid, void** o)
@@ -163,6 +180,7 @@ struct HostHandler
         auto* h = static_cast<HostHandler*>(self_);
         h->restartFlags |= flags;
         ++h->restartCalls;
+        if (std::this_thread::get_id() != h->uiThread) ++h->offThreadRestarts;
         return Steinberg_kResultOk;
     }
 
@@ -171,6 +189,118 @@ struct HostHandler
     };
     HostHandler() : vtbl(&kVtbl) {}
 };
+
+// -- host application context with a Linux IRunLoop ----------------------------------
+//
+// Offered through initialize(): the UI-thread tick a plugin uses to hand the
+// host restart requests raised on the audio thread. pumpUiThread() plays
+// the host's event loop on every platform.
+
+struct HostRunLoop
+{
+    const Steinberg_Linux_IRunLoopVtbl* vtbl;
+    Steinberg_Linux_ITimerHandler* timer = nullptr;
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void* self_, const Steinberg_TUID iid,
+                                                      void** o)
+    {
+        if (o == nullptr) return Steinberg_kInvalidArgument;
+        if (std::memcmp(iid, Steinberg_FUnknown_iid, 16) == 0
+            || std::memcmp(iid, Steinberg_Linux_IRunLoop_iid, 16) == 0)
+        {
+            *o = self_;
+            return Steinberg_kResultOk;
+        }
+        *o = nullptr;
+        return Steinberg_kNoInterface;
+    }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE ar(void*) { return 100; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE rel(void*) { return 100; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE regEvent(void*,
+        Steinberg_Linux_IEventHandler*, Steinberg_Linux_FileDescriptor)
+    { return Steinberg_kNotImplemented; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE unregEvent(void*,
+        Steinberg_Linux_IEventHandler*)
+    { return Steinberg_kNotImplemented; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE regTimer(void* self_,
+        Steinberg_Linux_ITimerHandler* handler, Steinberg_Linux_TimerInterval)
+    {
+        static_cast<HostRunLoop*>(self_)->timer = handler;
+        return Steinberg_kResultOk;
+    }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE unregTimer(void* self_,
+        Steinberg_Linux_ITimerHandler* handler)
+    {
+        auto* loop = static_cast<HostRunLoop*>(self_);
+        if (loop->timer == handler) loop->timer = nullptr;
+        return Steinberg_kResultOk;
+    }
+    inline static const Steinberg_Linux_IRunLoopVtbl kVtbl = {
+        &q, &ar, &rel, &regEvent, &unregEvent, &regTimer, &unregTimer
+    };
+    HostRunLoop() : vtbl(&kVtbl) {}
+};
+
+struct HostContext
+{
+    const Steinberg_FUnknownVtbl* vtbl;
+    HostRunLoop* runLoop = nullptr;
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void* self_, const Steinberg_TUID iid,
+                                                      void** o)
+    {
+        if (o == nullptr) return Steinberg_kInvalidArgument;
+        auto* context = static_cast<HostContext*>(self_);
+        if (std::memcmp(iid, Steinberg_Linux_IRunLoop_iid, 16) == 0)
+        {
+            *o = context->runLoop;
+            return Steinberg_kResultOk;
+        }
+        if (std::memcmp(iid, Steinberg_FUnknown_iid, 16) == 0)
+        {
+            *o = self_;
+            return Steinberg_kResultOk;
+        }
+        *o = nullptr;
+        return Steinberg_kNoInterface;
+    }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE ar(void*) { return 100; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE rel(void*) { return 100; }
+    inline static const Steinberg_FUnknownVtbl kVtbl = { &q, &ar, &rel };
+    HostContext() : vtbl(&kVtbl) {}
+};
+
+/** One slice of the host's UI event loop: Windows messages (thread timers),
+ *  the macOS main run loop (main-queue sources), the Linux IRunLoop timer. */
+void pumpUiThread(HostRunLoop& runLoop)
+{
+#if defined(_WIN32)
+    (void) runLoop;
+    MSG message {};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+    {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    Sleep(5);
+#elif defined(__APPLE__)
+    (void) runLoop;
+    // CoreFoundation resolved at runtime: the host links no framework.
+    using RunInMode = int (*)(const void*, double, unsigned char);
+    static void* cf = dlopen(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_LAZY);
+    static auto run = cf ? reinterpret_cast<RunInMode>(dlsym(cf, "CFRunLoopRunInMode"))
+                         : nullptr;
+    static auto mode = cf ? static_cast<const void* const*>(
+                                dlsym(cf, "kCFRunLoopDefaultMode"))
+                          : nullptr;
+    if (run != nullptr && mode != nullptr) run(*mode, 0.005, 0);
+    else std::this_thread::sleep_for(std::chrono::milliseconds(5));
+#else
+    if (runLoop.timer != nullptr) runLoop.timer->lpVtbl->onTimer(runLoop.timer);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+#endif
+}
 
 // -- host-side IParamValueQueue / IParameterChanges --------------------------------
 
@@ -360,7 +490,12 @@ int main(int argc, char** argv)
     if (!raw) return 1;
     auto* comp = static_cast<Steinberg_Vst_IComponent*>(raw);
 
-    expect(comp->lpVtbl->initialize(comp, nullptr) == Steinberg_kResultOk, "initialize");
+    HostRunLoop hostRunLoop;
+    HostContext hostContext;
+    hostContext.runLoop = &hostRunLoop;
+    expect(comp->lpVtbl->initialize(comp,
+               reinterpret_cast<Steinberg_FUnknown*>(&hostContext)) == Steinberg_kResultOk,
+           "initialize");
 
     void* rawProc = nullptr;
     expect(comp->lpVtbl->queryInterface(comp, Steinberg_Vst_IAudioProcessor_iid, &rawProc)
@@ -906,6 +1041,31 @@ int main(int argc, char** argv)
                    "mono input bus feeds both output channels");
             inputBuses[0].Steinberg_Vst_AudioBusBuffers_channelBuffers32 = inCh;
             inputBuses[0].numChannels = 2;
+        }
+
+        // 12) Latency change detected on the AUDIO thread (automation moves
+        //     the lookahead): VST3 allows restartComponent on the UI thread
+        //     only, so the plugin must defer it to its UI tick - never call
+        //     the host from process(), yet still deliver promptly.
+        {
+            handler.restartFlags = 0;
+            handler.offThreadRestarts = 0;
+            changes.add(lookaheadId).points.push_back({ 0, 1.0 });
+            std::thread audioThread([&] { processOnce(); });
+            audioThread.join();
+            expect(handler.offThreadRestarts == 0,
+                   "no restartComponent from the audio thread");
+            const auto deadline = std::chrono::steady_clock::now()
+                                + std::chrono::seconds(2);
+            while ((handler.restartFlags & Steinberg_Vst_RestartFlags_kLatencyChanged) == 0
+                   && std::chrono::steady_clock::now() < deadline)
+                pumpUiThread(hostRunLoop);
+            expect((handler.restartFlags & Steinberg_Vst_RestartFlags_kLatencyChanged) != 0
+                       && handler.offThreadRestarts == 0,
+                   "audio-thread latency change reaches the host on the UI thread");
+            expect(proc->lpVtbl->getLatencySamples(proc) == 64,
+                   "deferred latency is reported");
+            ctrl->lpVtbl->setParamNormalized(ctrl, lookaheadId, 0.0);   // UI thread
         }
         data.processContext = nullptr;
         context.state = 0;

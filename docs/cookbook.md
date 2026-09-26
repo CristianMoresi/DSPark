@@ -26,7 +26,7 @@ duck.setAttack(5.0f);
 duck.setRelease(250.0f);
 
 // callback: music in `bus`, narration in `voice`
-duck.processBlockWithSidechain(bus, voice);   // music ducks under the voice
+duck.processBlock(bus, voice);   // music ducks under the voice (key = voice)
 ```
 
 ## 2. De-esser for vocals

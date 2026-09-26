@@ -26,6 +26,7 @@ for exactly one capability:
 ```cpp
 #include "plugin/vst3/DSParkVst3.h"
 #include "plugin/clap/DSParkClap.h"
+#include "plugin/au/DSParkAu.h"     // self-disables off macOS
 
 struct MyPlugin
 {
@@ -82,13 +83,24 @@ MyPlugin/
 ```cmake
 cmake_minimum_required(VERSION 3.21)
 project(MyPlugin CXX)
-include("${CMAKE_CURRENT_SOURCE_DIR}/DSPark/plugin/cmake/DSParkPlugin.cmake")
+add_subdirectory(DSPark)                # defines dspark_add_plugin()
 dspark_add_plugin(MyPlugin
     SOURCES     myplugin.cpp
     FORMATS     VST3 CLAP AU            # AU materialises on macOS, ignored elsewhere
     EDITOR_HTML ui/editor.html          # omit for the host's generic UI
+    VERSION     1.0.0                   # bundle + AU component version
+    BUNDLE_ID   com.yourcompany.myplugin
     AU_SUBTYPE  Subt AU_MANUFACTURER Manu)
 ```
+
+`FetchContent_MakeAvailable(dspark)` and a `cmake --install`ed package
+(`find_package(dspark CONFIG REQUIRED)`) define `dspark_add_plugin()` the
+same way: the package ships the
+plugin layer - format wrappers, vendored SDK headers with their licenses,
+WebView editor - next to its installed headers. `include()` of
+`DSPark/plugin/cmake/DSParkPlugin.cmake` still works for trees that are not
+CMake subprojects. Set `BUNDLE_ID` to your own reverse-domain identifier
+before shipping on macOS (the default is only a placeholder).
 
 Includes in `myplugin.cpp` then start at the subfolder
 (`#include "DSPark/plugin/vst3/DSParkVst3.h"`), and the one-line compiler

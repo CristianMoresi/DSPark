@@ -40,11 +40,11 @@ There are also CMake presets:
 cmake --workflow --preset ninja    # configure, build and test in one step
 ```
 
-That builds and runs four things:
+That builds and runs, among the registered ctest entries:
 
 | Test | What it covers |
 |---|---|
-| `suite` | The test suite proper: 630+ cases across every module |
+| `suite` | The test suite proper: 940+ cases across every module and the plugin layer |
 | `smoke` | Every effect at default settings, checked for NaN/Inf and runaway output |
 | `standalone` | Compile gate: the umbrella header alone, every template at float **and** double |
 | `conformance` | The public conformance suite, including EBU R128 validation |
@@ -77,7 +77,12 @@ Every push and pull request runs, across Windows (MSVC x64 and ARM64), Linux
 - the single-header amalgamation, compiled after generation
 - EBU R128 conformance against the official Tech 3341/3342 test vectors
 - the example plugins in all three formats, through `pluginval`,
-  `clap-validator` and Apple's `auval`
+  `clap-validator` and Apple's `auval`, plus DSPark's own VST3/CLAP smoke
+  hosts (bypass latency alignment, oversize blocks, parameter text round trips)
+- the standalone examples and the benchmark harness, warning-free on every
+  compiler, and the example programs run to completion
+- an installed package consumed through `find_package(dspark)`, building an
+  application and a plugin with `dspark_add_plugin()`
 
 A change is ready when all of it is green.
 

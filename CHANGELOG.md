@@ -2,6 +2,64 @@
 
 All notable user-facing changes to DSPark are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Plugin parameters: `choice()` (named positions whose labels hosts list,
+  display and parse, including AU value strings and VST3 list / CLAP enum
+  flags) and `stepped()` (evenly spaced discrete positions shown as whole
+  numbers). Unparsable host text is refused instead of guessed.
+- The installed CMake package (`find_package(dspark)`) now ships the plugin
+  layer and defines `dspark_add_plugin()`, as `add_subdirectory()` and
+  `FetchContent` do; the helper gains `VERSION` and `BUNDLE_ID`.
+- `HilbertIIR`, a zero-latency analytic pair in quadrature from 20 Hz;
+  `SincInterpolator` (32-tap windowed sinc) and `StretchedSincReader`;
+  `PitchShifter` `Quality::High`; NoiseGate and Expander lookahead with
+  reported latency; first-order ADAA in `WaveshapeTable`; fractional
+  `SampleAndHold` periods; `FilterEngine::setShelfSlope()`.
+- `Delay` insert API (`prepare(spec)`, `setMix()`, in-place dry/wet
+  `processBlock`), `Crossfade` equal-power sine law with curve glides and
+  `gainsFor()`.
+- Gapless MP3 round trips: codec-delay flush, an Info frame with a
+  LAME-format tag, and trimming by LAME, FFmpeg or DSPark tags on decode.
+
+### Changed
+
+- `AlgorithmicReverb` rebuilt as a true-stereo 32-line FDN (16 in Eco) with
+  exact per-band decay, a velvet-noise early field joined to the late field
+  on one physical decay, a binaural stereo image with directional early
+  reflections, and a dispersive spring model - at about half the CPU.
+- The FFT is a split-format Stockham radix-4 engine (2x faster on SSE2, 4x
+  with AVX2); `Oversampling` runs a true polyphase decimator on the shared
+  `SimdOps` layer (about 2x faster).
+- `Oscillator` waveforms are minBLEP band-limited by default; `Equalizer`
+  bells default to the analog-matched design; `SpectralDenoiser` uses a
+  decision-directed Wiener gain instead of a hard gate.
+- The `Limiter` gain computer turns peaks down before the hard-clip
+  backstop; AutoGain matches integrated K-weighted loudness; decibel
+  conversions run on exp/log at half the cost.
+- Mix, width, gain and shape changes across the effects glide over at least
+  20 ms instead of stepping once per block.
+
+### Fixed
+
+- Plugin wrappers: the soft bypass is delayed by the reported latency so a
+  bypassed track stays aligned; blocks larger than the announced maximum
+  are processed in chunks instead of passed through; input buses narrower
+  than the output are read within bounds; the VST3 component handler is
+  swapped without a use-after-free window.
+- WebView editor: the Linux GTK pump is bounded so an always-ready source
+  cannot stall the host UI thread.
+- Delay read-position wrap under moving Binaural/Haas pans; Vibrato sweep
+  leaps under FM; MultibandCompressor oversize blocks left dry; PitchDetector
+  period interpolation (1760 Hz error from 1 cent to 0.02); MP3 encoder
+  granules over 4095 bits; non-finite samples in integer WAV and MP3 output;
+  Saturation ADAA precision in float; DynamicEQ and TransientDesigner
+  detection on the analytic magnitude.
+- The `wav_process` example compensates its chain latency, so the written
+  file stays aligned with the source and keeps its tail.
+
 ## [1.7.0] - 2026-08-21
 
 ### Added

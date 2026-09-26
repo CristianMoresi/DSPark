@@ -63,7 +63,9 @@ target_link_libraries(app PRIVATE dspark::dspark)
 ```
 
 A CMake installation is consumed with `find_package(dspark CONFIG REQUIRED)`
-and the same `dspark::dspark` target.
+and the same `dspark::dspark` target. Every route (subdirectory,
+`FetchContent`, installed package) also provides the plugin layer and the
+`dspark_add_plugin()` bundle helper described in [docs/plugins.md](docs/plugins.md).
 
 Or fetch the v1.7.0 release tag:
 

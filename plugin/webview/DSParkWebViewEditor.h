@@ -133,7 +133,7 @@ inline void debugLog(const char* format, ...) noexcept
 {
     static std::FILE* file = []() -> std::FILE* {
         char enabled[8] {};
-#if defined(_WIN32)
+#if DSPARK_WEBVIEW_BACKEND == 1
         if (GetEnvironmentVariableA("DSPARK_WEBVIEW_LOG", enabled,
                                     sizeof(enabled)) == 0)
             return nullptr;
@@ -145,6 +145,11 @@ inline void debugLog(const char* format, ...) noexcept
                       dir, dir[0] != '\0' ? "\\" : "");
         std::FILE* f = nullptr;
         fopen_s(&f, path, "a");
+#elif defined(_WIN32)
+        // Stub backend on Windows (exceptions off): no <windows.h> here and
+        // no editor to trace, so the log stays off.
+        (void) enabled;
+        std::FILE* f = nullptr;
 #else
         const char* env = std::getenv("DSPARK_WEBVIEW_LOG");
         if (env == nullptr || env[0] == '\0') return nullptr;
@@ -867,6 +872,16 @@ private:
             appendJsonString(json, p.unit);
             json += ",\"steps\":";
             appendJsonNumber(json, p.steps);
+            if (p.labels != nullptr)
+            {
+                json += ",\"labels\":[";
+                for (int k = 0; k <= p.steps; ++k)
+                {
+                    if (k > 0) json += ',';
+                    appendJsonString(json, p.labels[k]);
+                }
+                json += ']';
+            }
             json += ",\"value\":";
             appendJsonNumber(json, plainOf(i));
             json += '}';
@@ -1494,9 +1509,14 @@ private:
     {
         const auto& gtk = gtk_glue::api();
         if (!gtk.ok) return;
-        while (gtk.mainContextPending(nullptr) != 0)
+        // Bounded: a source that is always ready (an idle handler re-arming
+        // itself, an animation) must not trap the host's UI thread here -
+        // whatever is left runs on the next host tick.
+        for (int i = 0; i < kMaxPumpIterations && gtk.mainContextPending(nullptr) != 0; ++i)
             gtk.mainContextIteration(nullptr, 0);
     }
+
+    static constexpr int kMaxPumpIterations = 256;
 
     // ==============================================================================
     // Other platforms - stub (hosts fall back to their generic editor)

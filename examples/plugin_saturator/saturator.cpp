@@ -30,9 +30,14 @@ struct DSParkSaturator
         .category  = dspark::plugin::Category::Fx,
     };
 
+    // Saturation::Algorithm, in enum order: hosts show and accept the names.
+    static constexpr const char* kAlgorithms[] = {
+        "Tube", "Tape", "Transformer", "Soft Clip", "Hard Clip",
+        "Exciter", "Wavefolder", "Bitcrusher", "Downsample", "Multi-Stage" };
+
     static constexpr auto parameters = dspark::plugin::params(
         dspark::plugin::param("drive",  "Drive",  -12.0f, 36.0f, 0.0f, "dB"),
-        dspark::plugin::param("algo",   "Algorithm", 0.0f, 9.0f, 3.0f, ""),  // Saturation::Algorithm
+        dspark::plugin::choice("algo",  "Algorithm", kAlgorithms, 3),
         dspark::plugin::param("mix",    "Mix",      0.0f,  1.0f, 1.0f, ""),
         dspark::plugin::param("output", "Output", -24.0f, 12.0f, 0.0f, "dB"));
 

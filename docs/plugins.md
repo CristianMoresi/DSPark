@@ -148,7 +148,7 @@ virtual; nothing else is required.**
 | Member | Called from | What it must do |
 |---|---|---|
 | `static constexpr Descriptor descriptor` | scan time | Identity. `productId` derives the VST3 class UID and IS the CLAP id - **never change it after a release** (it orphans saved sessions). `name`, `vendor`, `version`, `url`, `email` feed the hosts' plugin browsers. `category` selects effect or **instrument** (see "Instruments & MIDI"). |
-| `static constexpr auto parameters` | scan time | The automatable parameter table, built with `params(param(...), toggle(...))`. The **text ids are the stable identity** of each parameter (state + automation): you may reorder/insert parameters freely between versions, but never rename an id. |
+| `static constexpr auto parameters` | scan time | The automatable parameter table, built with `params(...)` from four helpers: `param(...)` (continuous, with a display unit), `toggle(...)` (on/off), `stepped(...)` (N+1 evenly spaced positions, e.g. 1..8 voices) and `choice(id, name, labels, default)` (named positions from a `static constexpr const char* labels[]` array; `setParameter` receives the index, hosts list and accept the names). The **text ids are the stable identity** of each parameter (state + automation): you may reorder/insert parameters freely between versions, but never rename an id. |
 | `void prepare(const AudioSpec&)` | main thread, before audio | Allocate and configure for `sampleRate` / `maxBlockSize` / `numChannels` - the channel count is whatever the host negotiated (1 or 2, see `channels` below). Maps to VST3 `setActive(true)` (after `setupProcessing`) and CLAP `activate`. May allocate. |
 | `void setParameter(int index, float plain) noexcept` | **any thread** | Receive a plain-range value for `parameters[index]`. Forward to your DSPark setters - they are atomic and smoothed by contract, which is what makes this callable from UI and audio threads alike. Never allocate or lock. |
 | `void processBlock(AudioBufferView<float>) noexcept` | audio thread | In-place processing at the negotiated width (`io.getNumChannels()`), exactly like every DSPark effect. Never allocate, lock or block. (For a sidechain, implement the two-buffer form INSTEAD - see Optional below.) |
@@ -174,7 +174,15 @@ virtual; nothing else is required.**
 
 - **Bypass**: a host-integrated bypass parameter (VST3 `kIsBypass`, CLAP
   `CLAP_PARAM_IS_BYPASS`, AU `BypassEffect`) with a click-free crossfade
-  against the dry input (toward silence for an instrument).
+  against the dry input (toward silence for an instrument). The dry path is
+  delayed by the reported latency: hosts keep compensating a bypassed
+  plugin, so the bypassed track stays sample-aligned instead of jumping
+  early by the lookahead.
+- **Block sizes**: a VST3/CLAP host that hands over more frames than it
+  announced at activation still gets the whole block processed, in chunks
+  no longer than the size your `prepare()` saw (AU reports
+  `TooManyFramesToProcess`, per its contract). An input bus narrower than
+  the output (a host ignoring the arrangement) is read within its bounds.
 - **Sample-accurate automation**: every timestamped event the host sends -
   parameter points, bypass, MIDI - lands in one time-ordered stream and
   processing splits at 32-frame quantum boundaries, so fast automation
@@ -190,7 +198,9 @@ virtual; nothing else is required.**
 - **Buses**: mono/stereo negotiation per the declared `ChannelSupport`
   (default both), instrument layouts without audio inputs, the sidechain
   following the main width, and the right answers to every arrangement
-  negotiation. Value formatting/parsing for host displays. Factory metadata.
+  negotiation. Value formatting/parsing for host displays - choice labels,
+  On/Off, whole numbers for stepped values, units - with text the host
+  cannot parse refused rather than guessed. Factory metadata.
 - **Denormals**: `process()`/`render()` run under DSPark's `DenormalGuard`
   (FTZ/DAZ), so your own DSP is protected even in hosts that don't set it.
 - **Entry points** per platform and format, from the macros.
@@ -339,7 +349,7 @@ text ids** as state and automation, in **plain** values:
 
 | Call | Direction | Notes |
 |---|---|---|
-| `dspark.onReady(cb)` | native -> UI | fires once with the parameter table + current values: `[{id, name, min, max, def, unit, steps, value}, ...]` (replayed if already received) |
+| `dspark.onReady(cb)` | native -> UI | fires once with the parameter table + current values: `[{id, name, min, max, def, unit, steps, value, labels?}, ...]` - `labels` (the position names) only on `choice` parameters (replayed if already received) |
 | `dspark.setParam(id, v)` | UI -> DSP + host | applied to the DSP immediately and forwarded to the host for automation recording |
 | `dspark.onParam(id, cb)` | DSP -> UI | fires on host automation, preset/state restore and your own edits; cached value replays on registration |
 | `dspark.beginEdit(id)` / `dspark.endEdit(id)` | UI -> host | automation gesture around a drag (host undo / touch automation); a bare `setParam` outside a gesture gets a one-shot gesture automatically |

@@ -37,9 +37,11 @@ struct SynthPlugin : dspark::plugin::PluginBase<SynthPlugin>
         .category  = dspark::plugin::Category::Instrument,
     };
 
+    // A named choice: setParameter() gets the index, hosts show the names.
+    static constexpr const char* kWaves[] = { "Sine", "Saw", "Square" };
+
     static constexpr auto parameters = dspark::plugin::params(
-        // 3-position discrete control (steps = 2): Sine / Saw / Square.
-        dspark::plugin::Param { "wave", "Waveform", 0.0f, 2.0f, 1.0f, "", 2 },
+        dspark::plugin::choice("wave",   "Waveform", kWaves, 1),
         dspark::plugin::param("attack",  "Attack",   1.0f,  500.0f,    5.0f, "ms"),
         dspark::plugin::param("decay",   "Decay",    1.0f, 1000.0f,  120.0f, "ms"),
         dspark::plugin::param("sustain", "Sustain",  0.0f,    1.0f,    0.7f, ""),

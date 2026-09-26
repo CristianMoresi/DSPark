@@ -289,6 +289,7 @@ struct Plugin
     UInt32 inputConnectionBus[2] = { 0, 0 };
 
     std::vector<float> pullL, pullR, dryL, dryR, scL, scR;
+    DryDelay dryDelay;   // latency-aligned dry path of the bypass
 
     // Host transport callbacks (kAudioUnitProperty_HostCallbacks).
     HostCallbackInfo hostCallbacks {};
@@ -545,7 +546,12 @@ struct Plugin
         }
         bypassMix = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
         if constexpr (HasLatency<P>)
-            cachedLatency.store(user.getLatency(), std::memory_order_relaxed);
+        {
+            const int latency = user.getLatency();
+            cachedLatency.store(latency, std::memory_order_relaxed);
+            dryDelay.prepare(std::max(2 * latency, kDryDelayMinCapacity),
+                             static_cast<int>(maxFrames));
+        }
         scheduledCount = 0;
         initialized = true;
         return noErr;
@@ -561,6 +567,7 @@ struct Plugin
     {
         if constexpr (HasReset<P>)
             user.reset();
+        dryDelay.reset();
         bypassMix = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
         return noErr;
     }
@@ -655,6 +662,14 @@ struct Plugin
             break;
         case kAudioUnitProperty_ParameterInfo:
             size = sizeof(AudioUnitParameterInfo); break;
+        case kAudioUnitProperty_ParameterValueStrings:
+        {
+            const int idx = indexOfParamId(element);
+            if (idx < 0 || P::parameters[static_cast<size_t>(idx)].labels == nullptr)
+                return kAudioUnitErr_InvalidProperty;
+            size = sizeof(CFArrayRef);
+            break;
+        }
         case kAudioUnitProperty_Latency:
         case kAudioUnitProperty_TailTime:
             size = sizeof(Float64); break;
@@ -817,14 +832,43 @@ struct Plugin
             std::snprintf(info->name, sizeof(info->name), "%s", spec.name);
             info->cfNameString = CFStringCreateWithCString(
                 nullptr, spec.name, kCFStringEncodingUTF8);
-            info->unit = spec.steps == 1 ? kAudioUnitParameterUnit_Boolean
+            info->unit = isToggle(spec) ? kAudioUnitParameterUnit_Boolean
+                       : spec.steps > 0 && spec.minValue == 0.0f
+                             && spec.maxValue == static_cast<float>(spec.steps)
+                           ? kAudioUnitParameterUnit_Indexed   // 0..N, choices
                        : (std::strcmp(spec.unit, "dB") == 0
                               ? kAudioUnitParameterUnit_Decibels
                               : kAudioUnitParameterUnit_Generic);
+            if (spec.labels != nullptr)
+                info->flags |= kAudioUnitParameterFlag_ValuesHaveStrings;
             info->minValue = spec.minValue;
             info->maxValue = spec.maxValue;
             info->defaultValue = spec.defValue;
             *ioSize = sizeof(AudioUnitParameterInfo);
+            return noErr;
+        }
+        case kAudioUnitProperty_ParameterValueStrings:
+        {
+            // A choice's labels, one CFString per position (caller releases).
+            const int idx = indexOfParamId(element);
+            if (idx < 0) return kAudioUnitErr_InvalidParameter;
+            const Param& spec = P::parameters[static_cast<size_t>(idx)];
+            if (spec.labels == nullptr) return kAudioUnitErr_InvalidProperty;
+            if (*ioSize < sizeof(CFArrayRef)) return kAudioUnitErr_InvalidPropertyValue;
+            CFMutableArrayRef strings = CFArrayCreateMutable(
+                nullptr, static_cast<CFIndex>(spec.steps + 1), &kCFTypeArrayCallBacks);
+            if (strings == nullptr) return kAudioUnitErr_InvalidProperty;
+            for (int i = 0; i <= spec.steps; ++i)
+            {
+                const char* label = spec.labels[i] != nullptr ? spec.labels[i] : "";
+                CFStringRef text = CFStringCreateWithCString(nullptr, label,
+                                                             kCFStringEncodingUTF8);
+                if (text == nullptr) continue;
+                CFArrayAppendValue(strings, text);
+                CFRelease(text);
+            }
+            *static_cast<CFArrayRef*>(outData) = strings;
+            *ioSize = sizeof(CFArrayRef);
             return noErr;
         }
         case kAudioUnitProperty_Latency:
@@ -1366,6 +1410,7 @@ struct Plugin
         const UInt32 width = static_cast<UInt32>(currentChannels);
         const UInt32 outCh = ioData->mNumberBuffers < width
                            ? ioData->mNumberBuffers : width;
+        if (outCh < 1) return noErr;
 
         // Pull the main input through the registered callback or connection
         // into our own buffers (instruments have no input: silence), then
@@ -1400,6 +1445,9 @@ struct Plugin
             if (out[ch] != pull[ch])
                 std::memcpy(out[ch], pull[ch], frames * sizeof(float));
         }
+        if constexpr (HasLatency<P> && !kIsInstrument)
+            dryDelay.process(dry, static_cast<int>(outCh), static_cast<int>(frames),
+                             cachedLatency.load(std::memory_order_relaxed));
 
         // Sidechain: input element 1; a missing or failing source must
         // never take the main path down - fall back to silence.

@@ -380,6 +380,32 @@ int main(int argc, char** argv)
         if (!params->get_info(plugin, i, &pi)) { expect(false, "get_info"); break; }
         if (pi.flags & CLAP_PARAM_IS_BYPASS) sawBypass = true;
         if (i == 0) p0 = pi;
+        // Every position of a discrete parameter must survive the host's
+        // value -> text -> value round-trip (labels, On/Off, whole numbers).
+        if (pi.flags & CLAP_PARAM_IS_STEPPED)
+        {
+            const int positions = static_cast<int>(pi.max_value - pi.min_value + 0.5) + 1;
+            for (int k = 0; k < positions && k < 64; ++k)
+            {
+                const double v = pi.min_value
+                    + (pi.max_value - pi.min_value) * k / (positions > 1 ? positions - 1 : 1);
+                char text[128] {};
+                double back = -1.0;
+                if (!params->value_to_text(plugin, pi.id, v, text, sizeof(text))
+                    || !params->text_to_value(plugin, pi.id, text, &back)
+                    || std::fabs(back - v) > 1e-9)
+                {
+                    std::printf("      %s: %.3f -> \"%s\" -> %.3f\n", pi.name, v, text, back);
+                    expect(false, "stepped parameter text round-trips");
+                    break;
+                }
+            }
+        }
+    }
+    {
+        double junk = 0.0;
+        expect(!params->text_to_value(plugin, p0.id, "not a number", &junk),
+               "unparsable parameter text is refused");
     }
     expect(sawBypass, "bypass parameter present");
 
@@ -704,6 +730,85 @@ int main(int argc, char** argv)
             expect(smokeHost.presetLoadedSeen, "preset load reports loaded()");
             presetLoad->from_location(plugin,
                 CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr, "0");
+        }
+
+        // 9) Bypass under latency: with the lookahead engaged the probe
+        //    delays its input by 64 samples. Hosts keep compensating that
+        //    latency while the plugin is bypassed, so the bypassed output -
+        //    and every sample of the crossfade - must stay exactly as late.
+        constexpr uint32_t bypassId = 0x42595053u;   // 'BYPS'
+        events.paramValue(gainId, 1.0, 0);
+        events.paramValue(lookaheadId, 1.0, 0);
+        std::vector<float> fed, got;
+        int k = 0;
+        for (int block = 0; block < 7; ++block)
+        {
+            for (int i = 0; i < 512; ++i, ++k)
+            {
+                const float v = 0.5f * std::sin(0.0113f * static_cast<float>(k))
+                              + 0.2f * std::sin(0.171f * static_cast<float>(k));
+                inL[static_cast<size_t>(i)] = v;
+                inR[static_cast<size_t>(i)] = v;
+                fed.push_back(v);
+            }
+            if (block == 2) events.paramValue(bypassId, 1.0, 100);
+            if (block == 4) events.paramValue(bypassId, 0.0, 300);
+            processOnce();
+            got.insert(got.end(), outR.begin(), outR.end());
+        }
+        double worstLag = 0.0;
+        for (size_t i = 512; i < got.size(); ++i)   // block 0 re-reports the latency
+            worstLag = std::fmax(worstLag, std::fabs(got[i] - fed[i - 64]));
+        std::printf("      bypass under latency: worst misalignment %.2g\n", worstLag);
+        expect(worstLag < 1e-6, "bypassed output stays latency-aligned");
+        events.paramValue(lookaheadId, 0.0, 0);
+        processOnce();
+
+        // 10) Oversize block: more frames than activate()'s maximum must
+        //     still be processed whole, automation included (the step lands
+        //     in the third chunk). Out of contract, but a wrapper must not
+        //     leave host garbage in the output.
+        {
+            constexpr int kBig = 1200;
+            std::vector<float> bigInL(kBig, 1.0f), bigInR(kBig, 1.0f),
+                               bigOutL(kBig, -7.0f), bigOutR(kBig, -7.0f);
+            inCh[0] = bigInL.data(); inCh[1] = bigInR.data();
+            outCh[0] = bigOutL.data(); outCh[1] = bigOutR.data();
+            proc.frames_count = kBig;
+            events.paramValue(gainId, 0.0, 0);
+            events.paramValue(gainId, 1.0, 1024);
+            expect(processOnce(), "oversize block processes");
+            bool ok = true;
+            for (int i = 0; i < kBig; ++i)
+            {
+                const float want = i < 1024 ? 0.0f : 1.0f;
+                ok = ok && std::fabs(bigOutL[static_cast<size_t>(i)] - want) < 1e-6f
+                        && std::fabs(bigOutR[static_cast<size_t>(i)] - want) < 1e-6f;
+            }
+            expect(ok, "oversize block is processed whole, automation at its sample");
+            inCh[0] = inL.data(); inCh[1] = inR.data();
+            outCh[0] = outL.data(); outCh[1] = outR.data();
+            proc.frames_count = 512;
+            events.paramValue(gainId, 1.0, 0);
+            processOnce();
+        }
+
+        // 11) Narrower input port than output: the wrapper must not read
+        //     past the input's channel array, and the missing channel
+        //     repeats the one given.
+        {
+            float* monoIn[1] = { inL.data() };
+            inBufs[0].data32 = monoIn;
+            inBufs[0].channel_count = 1;
+            fillInput(0.5f);
+            processOnce();
+            processOnce();
+            double meanR = 0.0;
+            for (int i = 0; i < 512; ++i) meanR += outR[static_cast<size_t>(i)];
+            expect(std::fabs(outMean() - 0.5) < 1e-3 && std::fabs(meanR / 512.0 - 0.5) < 1e-3,
+                   "mono input port feeds both output channels");
+            inBufs[0].data32 = inCh;
+            inBufs[0].channel_count = 2;
         }
         proc.transport = nullptr;
     }

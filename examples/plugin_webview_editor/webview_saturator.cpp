@@ -36,9 +36,14 @@ struct DSParkWebSaturator
         .category  = dspark::plugin::Category::Fx,
     };
 
+    // Saturation::Algorithm, in enum order: hosts show and accept the names.
+    static constexpr const char* kAlgorithms[] = {
+        "Tube", "Tape", "Transformer", "Soft Clip", "Hard Clip",
+        "Exciter", "Wavefolder", "Bitcrusher", "Downsample", "Multi-Stage" };
+
     static constexpr auto parameters = dspark::plugin::params(
         dspark::plugin::param("drive",  "Drive",  -12.0f, 36.0f, 0.0f, "dB"),
-        dspark::plugin::Param { "algo", "Algorithm", 0.0f, 9.0f, 0.0f, "", 9 },
+        dspark::plugin::choice("algo",  "Algorithm", kAlgorithms, 0),
         dspark::plugin::param("mix",    "Mix",      0.0f,  1.0f, 1.0f, ""),
         dspark::plugin::param("output", "Output", -24.0f, 12.0f, 0.0f, "dB"));
 
@@ -165,13 +170,7 @@ const char* DSParkWebSaturator::editorHtml()
   </div>
   <div class="algo">
     <label>Algorithm</label>
-    <select id="algo">
-      <option value="0">Tube</option><option value="1">Tape</option>
-      <option value="2">Transformer</option><option value="3">Soft Clip</option>
-      <option value="4">Hard Clip</option><option value="5">Exciter</option>
-      <option value="6">Wavefolder</option><option value="7">Bitcrusher</option>
-      <option value="8">Downsample</option><option value="9">Multi-Stage</option>
-    </select>
+    <select id="algo"></select>
   </div>
 </main>
 <footer>same parameter ids as automation &amp; state &mdash; presets stay portable</footer>
@@ -224,8 +223,19 @@ const char* DSParkWebSaturator::editorHtml()
   }
 
   function initSelect(sel, p) {
+    // The options come from the parameter's own labels (one source of truth).
+    for (var i = 0; i < p.labels.length; i++) {
+      var opt = document.createElement('option');
+      opt.value = String(i);
+      opt.textContent = p.labels[i];
+      sel.appendChild(opt);
+    }
     dspark.onParam(p.id, function (v) { sel.value = String(Math.round(v)); });
-    sel.addEventListener('change', function () { dspark.setParam(p.id, +sel.value); });
+    sel.addEventListener('change', function () {
+      dspark.beginEdit(p.id);   // one undoable host gesture
+      dspark.setParam(p.id, +sel.value);
+      dspark.endEdit(p.id);
+    });
   }
 
   dspark.onReady(function (params) {

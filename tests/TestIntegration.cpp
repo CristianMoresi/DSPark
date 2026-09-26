@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 using namespace dspark;
@@ -361,6 +362,36 @@ DSPARK_TEST(PluginLayer_normalisation_and_hashing)
     EXPECT_EQ(parseToggleText("off"), 0);
     EXPECT_EQ(parseToggleText("0.5"), -1);
     EXPECT_EQ(parseToggleText(nullptr), -1);
+
+    // Named choices and stepped parameters display and parse their own text
+    // (hosts round-trip it through automation lanes and typed values).
+    static constexpr const char* kModes[] = { "Clean", "Warm", "Hot" };
+    constexpr Param mode = choice("mode", "Mode", kModes, 1);
+    static_assert(mode.steps == 2 && mode.maxValue == 2.0f && mode.defValue == 1.0f);
+    char text[32] {};
+    formatValue(mode, 2.0, text, sizeof(text));
+    EXPECT_TRUE(std::strcmp(text, "Hot") == 0);
+    double plain = -1.0;
+    EXPECT_TRUE(parseValue(mode, "warm", plain));
+    EXPECT_NEAR(plain, 1.0, 1e-12);
+    EXPECT_TRUE(parseValue(mode, "2", plain));
+    EXPECT_NEAR(plain, 2.0, 1e-12);
+    EXPECT_TRUE(!parseValue(mode, "Loud", plain));
+
+    constexpr Param voices = stepped("voices", "Voices", 1.0f, 8.0f, 4.0f, 7);
+    formatValue(voices, 5.0, text, sizeof(text));
+    EXPECT_TRUE(std::strcmp(text, "5") == 0);
+    EXPECT_TRUE(parseValue(voices, "6.4", plain));
+    EXPECT_NEAR(plain, 6.0, 1e-12);   // snapped to the nearest position
+
+    // Garbage and NaN are refused; numbers clamp; toggles take On/Off.
+    EXPECT_TRUE(!parseValue(g, "abc", plain));
+    EXPECT_TRUE(!parseValue(g, "nan", plain));
+    EXPECT_TRUE(parseValue(g, "100 dB", plain));
+    EXPECT_NEAR(plain, 24.0, 1e-12);
+    EXPECT_TRUE(parseValue(t, "OFF", plain));
+    EXPECT_NEAR(plain, 0.0, 1e-12);
+    EXPECT_NEAR(toNormalized(g, std::nan("")), 0.0, 1e-12);
 
     // Ids hash uniquely and clash with no reserved state id - compile-time.
     static_assert(paramIdsUnique<MiniPlug>());

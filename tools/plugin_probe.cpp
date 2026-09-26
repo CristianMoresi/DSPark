@@ -9,9 +9,10 @@
 //                   negative under offline rendering)
 //   - MIDI          one monophonic sine voice: note on/off (honouring the
 //                   sample offset), pitch bend (+/-2 st), CC1 adds 0.1 DC
-//   - lookahead     a toggle that flips getLatency() 0 <-> 64 so the smokes
-//                   can watch the latency-changed notification (the probe
-//                   does NOT actually delay: contract instrumentation only)
+//   - lookahead     a toggle that flips getLatency() 0 <-> 64 and delays the
+//                   input by exactly those 64 samples, so the smokes can
+//                   watch the latency-changed notification and check that
+//                   the bypassed output stays latency-aligned
 //   - presets       two factory presets ("Unity", "Half") differing in gain
 //   - channels      mono+stereo (the default), every channel identical
 //
@@ -21,6 +22,7 @@
 #include "../plugin/vst3/DSParkVst3.h"
 #include "../plugin/clap/DSParkClap.h"
 
+#include <array>
 #include <atomic>
 #include <cmath>
 
@@ -89,7 +91,7 @@ struct ProbePlugin
 
     [[nodiscard]] int getLatency() const noexcept
     {
-        return lookahead_.load(std::memory_order_relaxed) ? 64 : 0;
+        return lookahead_.load(std::memory_order_relaxed) ? kLookahead : 0;
     }
 
     void processBlock(dspark::AudioBufferView<float> io) noexcept
@@ -104,8 +106,9 @@ struct ProbePlugin
         const double freq = noteFreq_ * std::pow(2.0, bendSemis_ / 12.0);
         const double phaseInc = 6.283185307179586 * freq / sampleRate_;
 
+        const bool delayed = lookahead_.load(std::memory_order_relaxed);
         const int n = io.getNumSamples();
-        const int channels = io.getNumChannels();
+        const int channels = io.getNumChannels() < 2 ? io.getNumChannels() : 2;
         for (int i = 0; i < n; ++i)
         {
             float voice = 0.0f;
@@ -119,12 +122,21 @@ struct ProbePlugin
             for (int ch = 0; ch < channels; ++ch)
             {
                 float* data = io.getChannel(ch);
-                data[i] = data[i] * gain + dc + voice;
+                // The line always runs, so its history is in place the
+                // moment the lookahead engages.
+                auto& line = delay_[static_cast<size_t>(ch)];
+                const float late = line[static_cast<size_t>(delayPos_)];
+                line[static_cast<size_t>(delayPos_)] = data[i];
+                const float x = delayed ? late : data[i];
+                data[i] = x * gain + dc + voice;
             }
+            delayPos_ = (delayPos_ + 1) % kLookahead;
         }
     }
 
 private:
+    static constexpr int kLookahead = 64;
+
     std::atomic<float> gain_ { 1.0f };
     std::atomic<bool>  lookahead_ { false };
     std::atomic<double> tempo_ { 0.0 };
@@ -139,6 +151,8 @@ private:
     float  mod_ = 0.0f;
     double phase_ = 0.0;
     double sampleRate_ = 48000.0;
+    std::array<std::array<float, kLookahead>, 2> delay_ {};
+    int delayPos_ = 0;
 };
 
 DSPARK_VST3_PLUGIN(ProbePlugin)

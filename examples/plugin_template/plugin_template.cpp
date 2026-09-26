@@ -45,10 +45,11 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
     // =========================================================================
     // REQUIRED 2/5 - the parameter table. The TEXT IDS are the stable
     // identity (state + automation). Reorder or insert freely in future
-    // versions; never rename an id. Three kinds:
+    // versions; never rename an id. Four kinds:
     //   param(...)            continuous, with unit for host display
     //   toggle(...)           on/off (hosts render a button)
-    //   param(... ) + steps   discrete N+1 positions (set .steps yourself)
+    //   stepped(...)          discrete N+1 evenly spaced positions (1..8 voices)
+    //   choice(...)           named positions from a label array (hosts list them)
     // =========================================================================
     static constexpr auto parameters = dspark::plugin::params(
         dspark::plugin::param ("mix",      "Mix",        0.0f,  1.0f, 0.3f, ""),

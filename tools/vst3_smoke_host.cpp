@@ -437,6 +437,24 @@ int main(int argc, char** argv)
             expect(false, "param normalization round-trip");
             break;
         }
+        // Every position of a discrete parameter must survive the host's
+        // value -> string -> value round-trip (labels, On/Off, whole numbers).
+        for (Steinberg_int32 k = 0; pi.stepCount > 0 && k <= pi.stepCount && k < 64; ++k)
+        {
+            const double v = static_cast<double>(k) / pi.stepCount;
+            Steinberg_Vst_String128 text {};
+            Steinberg_Vst_ParamValue back = -1.0;
+            if (ctrl->lpVtbl->getParamStringByValue(ctrl, pi.id, v, text) != Steinberg_kResultOk
+                || ctrl->lpVtbl->getParamValueByString(ctrl, pi.id, text, &back)
+                       != Steinberg_kResultOk
+                || std::fabs(back - v) > 1e-9)
+            {
+                std::printf("      param %u position %d does not round-trip (%.3f)\n",
+                            static_cast<unsigned>(pi.id), static_cast<int>(k), back);
+                expect(false, "stepped parameter text round-trips");
+                break;
+            }
+        }
     }
     expect(sawBypass, "bypass parameter present");
 
@@ -810,6 +828,84 @@ int main(int argc, char** argv)
                        < 1e-9,
                    "program selection survives the state round-trip");
             ctrl->lpVtbl->setParamNormalized(ctrl, programId, 0.0);
+        }
+
+        // 9) Bypass under latency: with the lookahead engaged the probe
+        //    delays its input by 64 samples. Hosts keep compensating that
+        //    latency while the plugin is bypassed, so the bypassed output -
+        //    and every sample of the crossfade - must stay exactly as late.
+        constexpr Steinberg_Vst_ParamID bypassId = 0x42595053u;   // 'BYPS'
+        changes.add(gainId).points.push_back({ 0, 1.0 });
+        changes.add(lookaheadId).points.push_back({ 0, 1.0 });
+        std::vector<float> fed, got;
+        int k = 0;
+        for (int block = 0; block < 7; ++block)
+        {
+            for (int i = 0; i < 512; ++i, ++k)
+            {
+                const float v = 0.5f * std::sin(0.0113f * static_cast<float>(k))
+                              + 0.2f * std::sin(0.171f * static_cast<float>(k));
+                inL[static_cast<size_t>(i)] = v;
+                inR[static_cast<size_t>(i)] = v;
+                fed.push_back(v);
+            }
+            if (block == 2) changes.add(bypassId).points.push_back({ 100, 1.0 });
+            if (block == 4) changes.add(bypassId).points.push_back({ 300, 0.0 });
+            processOnce();
+            got.insert(got.end(), outR.begin(), outR.end());
+        }
+        double worstLag = 0.0;
+        for (size_t i = 512; i < got.size(); ++i)   // block 0 re-reports the latency
+            worstLag = std::fmax(worstLag, std::fabs(got[i] - fed[i - 64]));
+        std::printf("      bypass under latency: worst misalignment %.2g\n", worstLag);
+        expect(worstLag < 1e-6, "bypassed output stays latency-aligned");
+        changes.add(lookaheadId).points.push_back({ 0, 0.0 });
+        processOnce();
+
+        // 10) Oversize block: a host passing more frames than
+        //     maxSamplesPerBlock must still get the whole block processed,
+        //     automation included (the step lands in the third chunk).
+        {
+            constexpr int kBig = 1200;
+            std::vector<float> bigInL(kBig, 1.0f), bigInR(kBig, 1.0f),
+                               bigOutL(kBig, -7.0f), bigOutR(kBig, -7.0f);
+            inCh[0] = bigInL.data(); inCh[1] = bigInR.data();
+            outCh[0] = bigOutL.data(); outCh[1] = bigOutR.data();
+            data.numSamples = kBig;
+            changes.add(gainId).points.push_back({ 0, 0.0 });
+            changes.add(gainId).points.push_back({ 1024, 1.0 });
+            expect(processOnce(), "oversize block processes");
+            bool ok = true;
+            for (int i = 0; i < kBig; ++i)
+            {
+                const float want = i < 1024 ? 0.0f : 1.0f;
+                ok = ok && std::fabs(bigOutL[static_cast<size_t>(i)] - want) < 1e-6f
+                        && std::fabs(bigOutR[static_cast<size_t>(i)] - want) < 1e-6f;
+            }
+            expect(ok, "oversize block is processed whole, automation at its sample");
+            inCh[0] = inL.data(); inCh[1] = inR.data();
+            outCh[0] = outL.data(); outCh[1] = outR.data();
+            data.numSamples = 512;
+            changes.add(gainId).points.push_back({ 0, 1.0 });
+            processOnce();
+        }
+
+        // 11) Narrower input bus than output (a host ignoring the
+        //     arrangement): the wrapper must not read past the input's
+        //     channel array, and the missing channel repeats the one given.
+        {
+            float* monoIn[1] = { inL.data() };
+            inputBuses[0].Steinberg_Vst_AudioBusBuffers_channelBuffers32 = monoIn;
+            inputBuses[0].numChannels = 1;
+            fillInput(0.5f);
+            processOnce();
+            processOnce();
+            double meanR = 0.0;
+            for (int i = 0; i < 512; ++i) meanR += outR[static_cast<size_t>(i)];
+            expect(std::fabs(outMean() - 0.5) < 1e-3 && std::fabs(meanR / 512.0 - 0.5) < 1e-3,
+                   "mono input bus feeds both output channels");
+            inputBuses[0].Steinberg_Vst_AudioBusBuffers_channelBuffers32 = inCh;
+            inputBuses[0].numChannels = 2;
         }
         data.processContext = nullptr;
         context.state = 0;

@@ -59,10 +59,12 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
 
+#include <algorithm>
 #include <array>
 #include <concepts>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -112,6 +114,9 @@ struct Descriptor
  * @brief One automatable parameter. Plain values run [min, max]; hosts see
  * the normalized [0, 1] projection. `steps == 0` means continuous,
  * `steps == 1` a toggle, `steps == N` an N+1-position discrete control.
+ * A discrete control may name its positions (`labels`, steps+1 entries):
+ * hosts then display and accept those names. Build these with the helpers
+ * below - param(), toggle(), stepped(), choice().
  */
 struct Param
 {
@@ -122,6 +127,7 @@ struct Param
     float defValue   = 0.0f;
     const char* unit = "";     ///< Display unit ("dB", "Hz", "%", ...).
     int steps        = 0;      ///< 0 continuous, 1 toggle, N discrete.
+    const char* const* labels = nullptr;   ///< steps+1 position names, or null.
 };
 
 /** @brief Continuous parameter helper. */
@@ -138,6 +144,47 @@ constexpr Param toggle(const char* id, const char* name, bool defaultOn) noexcep
     return Param { id, name, 0.0f, 1.0f, defaultOn ? 1.0f : 0.0f, "", 1 };
 }
 
+/**
+ * @brief Discrete parameter helper: @p steps + 1 evenly spaced positions from
+ * @p minValue to @p maxValue, e.g. `stepped("voices", "Voices", 1, 8, 4, 7)`
+ * for 1..8 (hosts show whole numbers when the positions are integers).
+ */
+constexpr Param stepped(const char* id, const char* name,
+                        float minValue, float maxValue, float defValue,
+                        int steps, const char* unit = "") noexcept
+{
+    return Param { id, name, minValue, maxValue, defValue, unit,
+                   steps > 1 ? steps : 1, nullptr };
+}
+
+/**
+ * @brief Named-choice helper: one position per label, plain values 0..N-1
+ * (the label index), e.g.
+ * ```cpp
+ * static constexpr const char* kWaves[] = { "Sine", "Saw", "Square" };
+ * static constexpr auto parameters = params(choice("wave", "Waveform", kWaves, 1));
+ * ```
+ * setParameter() receives the index as a float; hosts show and accept the
+ * labels. The label array must outlive the table (a static constexpr array).
+ */
+template <size_t N>
+constexpr Param choice(const char* id, const char* name,
+                       const char* const (&labels)[N], int defaultIndex = 0) noexcept
+{
+    static_assert(N >= 2, "a choice needs at least two labels");
+    const int def = defaultIndex < 0 ? 0
+                  : (defaultIndex > static_cast<int>(N) - 1 ? static_cast<int>(N) - 1
+                                                            : defaultIndex);
+    return Param { id, name, 0.0f, static_cast<float>(N - 1), static_cast<float>(def),
+                   "", static_cast<int>(N - 1), labels };
+}
+
+/** @brief True for an on/off parameter (two unnamed positions). */
+constexpr bool isToggle(const Param& p) noexcept
+{
+    return p.steps == 1 && p.labels == nullptr;
+}
+
 /** @brief Builds the parameter table (use inside `static constexpr auto`). */
 template <typename... Ps>
 constexpr std::array<Param, sizeof...(Ps)> params(Ps... ps) noexcept
@@ -152,8 +199,10 @@ constexpr double toNormalized(const Param& p, double plain) noexcept
 {
     const double range = static_cast<double>(p.maxValue) - p.minValue;
     if (range <= 0.0) return 0.0;
-    double n = (plain - p.minValue) / range;
-    return n < 0.0 ? 0.0 : (n > 1.0 ? 1.0 : n);
+    const double n = (plain - p.minValue) / range;
+    // Written so a NaN (a host's text-to-value on garbage, say) lands on 0
+    // rather than passing through: NaN compares false against both bounds.
+    return !(n > 0.0) ? 0.0 : (n > 1.0 ? 1.0 : n);
 }
 
 /** @brief Normalized [0, 1] -> plain [min, max], snapped for stepped params. */
@@ -188,19 +237,106 @@ inline int parseToggleText(const char* text) noexcept
     return -1;
 }
 
-/** @brief Formats a plain value for host display ("3.5 dB", "On", "440 Hz"). */
+/** @brief Position index (0..steps) of a plain value of a discrete parameter. */
+constexpr int stepIndex(const Param& p, double plain) noexcept
+{
+    if (p.steps <= 0) return 0;
+    const double scaled = toNormalized(p, plain) * p.steps + 0.5;
+    const int idx = static_cast<int>(scaled);
+    return idx < 0 ? 0 : (idx > p.steps ? p.steps : idx);
+}
+
+/** @brief Formats a plain value for host display ("3.5 dB", "On", "Saw", "4"). */
 inline void formatValue(const Param& p, double plain, char* out, int outSize) noexcept
 {
-    if (p.steps == 1)
+    if (out == nullptr || outSize <= 0) return;
+    const size_t cap = static_cast<size_t>(outSize);
+    if (p.labels != nullptr && p.steps > 0)
     {
-        std::snprintf(out, static_cast<size_t>(outSize), "%s",
+        const char* label = p.labels[stepIndex(p, plain)];
+        std::snprintf(out, cap, "%s", label != nullptr ? label : "");
+        return;
+    }
+    if (isToggle(p))
+    {
+        std::snprintf(out, cap, "%s",
                       plain >= 0.5 * (p.minValue + p.maxValue) ? "On" : "Off");
         return;
     }
-    if (p.unit && p.unit[0] != '\0')
-        std::snprintf(out, static_cast<size_t>(outSize), "%.2f %s", plain, p.unit);
+    // Whole-number positions (a stepped 1..8, say) display without decimals.
+    bool whole = false;
+    if (p.steps > 1)
+    {
+        const double step = (static_cast<double>(p.maxValue) - p.minValue) / p.steps;
+        auto isWhole = [](double v) {
+            const double r = static_cast<double>(static_cast<long long>(v < 0.0 ? v - 0.5
+                                                                             : v + 0.5));
+            return v - r < 1e-9 && r - v < 1e-9;
+        };
+        whole = isWhole(step) && isWhole(p.minValue);
+    }
+    char number[48];
+    if (whole)
+        std::snprintf(number, sizeof(number), "%.0f", plain);
     else
-        std::snprintf(out, static_cast<size_t>(outSize), "%.2f", plain);
+        std::snprintf(number, sizeof(number), "%.2f", plain);
+    // "<number> <unit>", cut to the host's buffer (always terminated).
+    size_t n = 0;
+    auto put = [&](const char* text) noexcept {
+        for (; text != nullptr && *text != '\0' && n + 1 < cap; ++text) out[n++] = *text;
+    };
+    put(number);
+    if (p.unit != nullptr && p.unit[0] != '\0')
+    {
+        put(" ");
+        put(p.unit);
+    }
+    out[n] = '\0';
+}
+
+/**
+ * @brief Host text -> plain value, the inverse of formatValue(): a choice's
+ * label (any case), "On"/"Off" for a toggle, or a number (a trailing unit
+ * is ignored). The result is clamped to the range and snapped for discrete
+ * parameters. Returns false, leaving @p plain untouched, for text that is
+ * none of these (hosts then keep the current value).
+ */
+inline bool parseValue(const Param& p, const char* text, double& plain) noexcept
+{
+    if (text == nullptr) return false;
+    while (*text == ' ' || *text == '\t') ++text;
+    if (p.labels != nullptr && p.steps > 0)
+    {
+        auto lower = [](char c) {
+            return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c;
+        };
+        for (int i = 0; i <= p.steps; ++i)
+        {
+            const char* label = p.labels[i];
+            if (label == nullptr) continue;
+            size_t k = 0;
+            while (label[k] != '\0' && lower(label[k]) == lower(text[k])) ++k;
+            if (label[k] == '\0' && text[k] == '\0')
+            {
+                plain = toPlain(p, static_cast<double>(i) / p.steps);
+                return true;
+            }
+        }
+    }
+    if (isToggle(p))
+    {
+        const int toggle = parseToggleText(text);
+        if (toggle >= 0)
+        {
+            plain = toggle != 0 ? p.maxValue : p.minValue;
+            return true;
+        }
+    }
+    char* end = nullptr;
+    const double v = std::strtod(text, &end);
+    if (end == text || v != v) return false;   // not a number, or NaN
+    plain = toPlain(p, toNormalized(p, v));     // clamp + snap
+    return true;
 }
 
 // -- Stable hashing (parameter ids, class UIDs) -------------------------------
@@ -626,6 +762,80 @@ inline void sortBlockEvents(BlockEvent* events, int count) noexcept
         events[j + 1] = key;
     }
 }
+
+// -- Bypass dry path -------------------------------------------------------------
+
+/**
+ * @brief The dry signal of the wrappers' soft bypass, delayed by the plugin's
+ * latency.
+ *
+ * Hosts keep compensating a bypassed plugin's reported latency (delaying
+ * every other track by it), so the bypassed output must arrive exactly as
+ * late as the processed one: blending the raw input instead would shift the
+ * track early by the latency and comb the crossfade. Every input sample is
+ * written into a per-channel ring whether or not the bypass is engaged, so
+ * the delayed history is already in place when it is. Allocated in
+ * prepare() (host setup thread); process() is allocation-free.
+ */
+class DryDelay
+{
+public:
+    /** Allocates for latencies up to @p maxLatency with blocks up to
+     *  @p maxBlock frames (both clamped to sane bounds). */
+    void prepare(int maxLatency, int maxBlock)
+    {
+        const int need = (maxLatency > 0 ? maxLatency : 0) + (maxBlock > 0 ? maxBlock : 0) + 1;
+        size_ = 1;
+        while (size_ < need) size_ <<= 1;
+        for (auto& b : buf_) b.assign(static_cast<size_t>(size_), 0.0f);
+        write_ = 0;
+    }
+
+    /** Clears the history (transport jumps). */
+    void reset() noexcept
+    {
+        for (auto& b : buf_) std::fill(b.begin(), b.end(), 0.0f);
+        write_ = 0;
+    }
+
+    /** Largest latency the ring can reproduce for an @p n-frame block. */
+    [[nodiscard]] int capacity(int n) const noexcept { return size_ - 1 - n; }
+
+    /**
+     * Replaces the @p n frames of each dry channel by the input of
+     * @p latency frames earlier (clamped to the capacity: a latency that grew
+     * past what prepare() sized for stays as aligned as the ring allows).
+     */
+    void process(float* const* dry, int numChannels, int n, int latency) noexcept
+    {
+        if (size_ == 0 || n <= 0) return;
+        const int mask = size_ - 1;
+        const int cap = capacity(n);
+        const int d = latency < 0 ? 0 : (latency > cap ? (cap > 0 ? cap : 0) : latency);
+        for (int ch = 0; ch < numChannels && ch < 2; ++ch)
+        {
+            float* ring = buf_[static_cast<size_t>(ch)].data();
+            float* x = dry[ch];
+            for (int i = 0; i < n; ++i)
+            {
+                const int w = (write_ + i) & mask;
+                ring[w] = x[i];
+                x[i] = ring[(w - d) & mask];
+            }
+        }
+        write_ = (write_ + n) & mask;
+    }
+
+private:
+    std::array<std::vector<float>, 2> buf_;
+    int size_ = 0;
+    int write_ = 0;
+};
+
+/** @brief Ring headroom of the bypass dry path: latencies up to this (or
+ *  twice the latency at activation, if larger) stay sample-aligned when a
+ *  plugin's lookahead grows while running. */
+inline constexpr int kDryDelayMinCapacity = 8192;
 
 // -- Editor contract (used by plugin/webview/DSParkWebViewEditor.h) -------------
 

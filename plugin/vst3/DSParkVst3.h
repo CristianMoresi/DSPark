@@ -227,6 +227,7 @@ struct Plugin
     float bypassMix = 0.0f;            // audio-thread crossfade state
     std::vector<float> dryL, dryR;     // pre-process copy for the bypass blend
     std::vector<float> silence;        // stand-in sidechain when not connected
+    DryDelay dryDelay;                 // latency-aligned dry path of the bypass
 
     // Atomic pointer: refreshLatency() reads it from the audio thread while
     // setComponentHandler writes it from the main thread. Per the VST3
@@ -658,7 +659,11 @@ struct Plugin
                 p->silence.assign(static_cast<size_t>(maxBlock), 0.0f);
             p->bypassMix = p->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
             if constexpr (HasLatency<P>)
-                p->cachedLatency.store(p->user.getLatency(), std::memory_order_relaxed);
+            {
+                const int latency = p->user.getLatency();
+                p->cachedLatency.store(latency, std::memory_order_relaxed);
+                p->dryDelay.prepare(std::max(2 * latency, kDryDelayMinCapacity), maxBlock);
+            }
             p->prepared = true;
         }
         return Steinberg_kResultOk;
@@ -880,40 +885,17 @@ struct Plugin
 
         const bool haveIn = !kIsInstrument
             && data->numInputs >= 1 && data->inputs != nullptr
-            && data->inputs[0].Steinberg_Vst_AudioBusBuffers_channelBuffers32 != nullptr;
+            && data->inputs[0].Steinberg_Vst_AudioBusBuffers_channelBuffers32 != nullptr
+            && data->inputs[0].numChannels >= 1;
         float** in = haveIn
             ? data->inputs[0].Steinberg_Vst_AudioBusBuffers_channelBuffers32 : nullptr;
-
-        if (static_cast<size_t>(n) > p->dryL.size())
-            return Steinberg_kResultOk;   // oversize block: pass through
-
-        // Keep the dry signal for the bypass blend, then process the output
-        // buffers in place (copying input over first when distinct). An
-        // instrument has no input: its output starts cleared (voices ADD)
-        // and its bypass blends toward silence (the dry vectors stay zero).
-        float* dry[2] = { p->dryL.data(), p->dryR.data() };
-        const size_t bytes = sizeof(float) * static_cast<size_t>(n);
-        for (int ch = 0; ch < nCh; ++ch)
-        {
-            if (kIsInstrument)
-            {
-                std::memset(out[ch], 0, bytes);
-                continue;
-            }
-            const float* src = (haveIn && in[ch] != nullptr) ? in[ch] : out[ch];
-            std::memcpy(dry[ch], src, bytes);
-            if (out[ch] != src)
-                std::memcpy(out[ch], src, bytes);
-        }
+        const int inCh = haveIn ? static_cast<int>(data->inputs[0].numChannels) : 0;
 
         // Sidechain: aux bus 1, pre-allocated silence when nothing is
         // routed (same frame count, no branches user-side). Read-only.
-        float* scPtrs[2] = { nullptr, nullptr };
+        float* scHost[2] = { nullptr, nullptr };
         if constexpr (HasSidechain<P>)
         {
-            if (static_cast<size_t>(n) > p->silence.size())
-                return Steinberg_kResultOk;
-            scPtrs[0] = scPtrs[1] = p->silence.data();
             if (data->numInputs >= 2 && data->inputs != nullptr
                 && data->inputs[1].Steinberg_Vst_AudioBusBuffers_channelBuffers32
                        != nullptr)
@@ -922,79 +904,127 @@ struct Plugin
                 float** sc = scBus.Steinberg_Vst_AudioBusBuffers_channelBuffers32;
                 const int scCh = scBus.numChannels < 2 ? scBus.numChannels : 2;
                 for (int ch = 0; ch < scCh; ++ch)
-                    if (sc[ch] != nullptr)
-                        scPtrs[ch] = sc[ch];
-                if (scCh == 1 && sc[0] != nullptr)
-                    scPtrs[1] = sc[0];   // mono key feeds both detector ears
+                    scHost[ch] = sc[ch];
+                if (scCh == 1)
+                    scHost[1] = sc[0];   // mono key feeds both detector ears
             }
         }
 
-        // Process in sub-blocks split at quantum-aligned event positions
-        // (sample-accurate default); without splitting, apply everything up
-        // front and run the block in one call.
-        auto processSegment = [&](int start, int length) noexcept {
-            float* sub[2] = { out[0] + start,
-                              nCh > 1 ? out[1] + start : out[0] + start };
-            dspark::AudioBufferView<float> view(sub, nCh, length);
-            if constexpr (HasSidechain<P>)
+        // A block longer than the prepared maximum (hosts that ignore
+        // maxSamplesPerBlock) runs as consecutive chunks of at most that
+        // size: the user DSP never sees more frames than it prepared for.
+        const int chunkMax = static_cast<int>(p->dryL.size());
+        if (chunkMax < 1) return Steinberg_kResultOk;
+        float* dry[2] = { p->dryL.data(), p->dryR.data() };
+        int evIdx = 0;
+
+        for (int c0 = 0; c0 < n; c0 += chunkMax)
+        {
+            const int len = n - c0 < chunkMax ? n - c0 : chunkMax;
+            const int cEnd = c0 + len;
+
+            // Keep the dry signal for the bypass blend, then process the
+            // output buffers in place (copying input over first when
+            // distinct). An instrument has no input: its output starts
+            // cleared (voices ADD) and its bypass blends toward silence (the
+            // dry vectors stay zero). Output channels past a narrower input
+            // bus (a host that ignored the arrangement) repeat its last one.
+            const size_t bytes = sizeof(float) * static_cast<size_t>(len);
+            for (int ch = 0; ch < nCh; ++ch)
             {
-                // The key view mirrors the main width (mono main, mono key).
-                float* scSub[2] = { scPtrs[0] + start, scPtrs[1] + start };
-                dspark::AudioBufferView<float> scView(scSub, nCh, length);
-                p->user.processBlock(view, scView);
+                if (kIsInstrument)
+                {
+                    std::memset(out[ch] + c0, 0, bytes);
+                    continue;
+                }
+                const float* src = out[ch];
+                if (haveIn)
+                {
+                    const float* s = in[ch < inCh ? ch : inCh - 1];
+                    if (s != nullptr) src = s;
+                }
+                std::memcpy(dry[ch], src + c0, bytes);
+                if (out[ch] != src)
+                    std::memcpy(out[ch] + c0, src + c0, bytes);
+            }
+            if constexpr (HasLatency<P> && !kIsInstrument)
+                p->dryDelay.process(dry, nCh, len,
+                                    p->cachedLatency.load(std::memory_order_relaxed));
+
+            float* scChunk[2] = { nullptr, nullptr };
+            if constexpr (HasSidechain<P>)
+                for (int ch = 0; ch < 2; ++ch)
+                    scChunk[ch] = scHost[ch] != nullptr ? scHost[ch] + c0
+                                                        : p->silence.data();
+
+            // Process in sub-blocks split at quantum-aligned event positions
+            // (sample-accurate default); without splitting, apply the
+            // chunk's events up front and run it in one call.
+            auto processSegment = [&](int start, int length) noexcept {
+                float* sub[2] = { out[0] + start,
+                                  nCh > 1 ? out[1] + start : out[0] + start };
+                dspark::AudioBufferView<float> view(sub, nCh, length);
+                if constexpr (HasSidechain<P>)
+                {
+                    // The key view mirrors the main width (mono main, mono key).
+                    float* scSub[2] = { scChunk[0] + (start - c0),
+                                        scChunk[1] + (start - c0) };
+                    dspark::AudioBufferView<float> scView(scSub, nCh, length);
+                    p->user.processBlock(view, scView);
+                }
+                else
+                    p->user.processBlock(view);
+            };
+
+            if (!sampleAccurateOf<P>())
+            {
+                for (; evIdx < eventCount && events[evIdx].offset < cEnd; ++evIdx)
+                    paramsChanged |= p->applyBlockEvent(events[evIdx], c0, programChanged);
+                processSegment(c0, len);
             }
             else
-                p->user.processBlock(view);
-        };
-
-        int evIdx = 0;
-        if (!sampleAccurateOf<P>())
-        {
-            for (; evIdx < eventCount; ++evIdx)
-                paramsChanged |= p->applyBlockEvent(events[evIdx], 0, programChanged);
-            processSegment(0, n);
-        }
-        else
-        {
-            int pos = 0;
-            while (pos < n)
             {
-                while (evIdx < eventCount
-                       && (events[evIdx].offset / kAutomationQuantum)
-                              * kAutomationQuantum <= pos)
-                    paramsChanged |= p->applyBlockEvent(events[evIdx++], pos,
-                                                        programChanged);
-                int next = n;
-                if (evIdx < eventCount)
+                int pos = c0;
+                while (pos < cEnd)
                 {
-                    const int snapped = (events[evIdx].offset / kAutomationQuantum)
-                                      * kAutomationQuantum;
-                    if (snapped < next) next = snapped;
+                    while (evIdx < eventCount
+                           && (events[evIdx].offset / kAutomationQuantum)
+                                  * kAutomationQuantum <= pos)
+                        paramsChanged |= p->applyBlockEvent(events[evIdx++], pos,
+                                                            programChanged);
+                    int next = cEnd;
+                    if (evIdx < eventCount)
+                    {
+                        const int snapped = (events[evIdx].offset / kAutomationQuantum)
+                                          * kAutomationQuantum;
+                        if (snapped < next) next = snapped;
+                    }
+                    if (next <= pos) next = pos + kAutomationQuantum < cEnd
+                                          ? pos + kAutomationQuantum : cEnd;
+                    processSegment(pos, next - pos);
+                    pos = next;
                 }
-                if (next <= pos) next = pos + kAutomationQuantum < n
-                                      ? pos + kAutomationQuantum : n;
-                processSegment(pos, next - pos);
-                pos = next;
             }
-            for (; evIdx < eventCount; ++evIdx)   // safety: events at block end
-                paramsChanged |= p->applyBlockEvent(events[evIdx], n, programChanged);
-        }
 
-        // Soft bypass: short linear crossfade toward the dry signal.
-        const float target = p->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
-        if (p->bypassMix != target || target > 0.0f)
-        {
-            const float step = 1.0f / static_cast<float>(kBypassRampSamples);
-            float mix = p->bypassMix;
-            for (Steinberg_int32 i = 0; i < n; ++i)
+            // Soft bypass: short linear crossfade toward the (latency-
+            // aligned) dry signal.
+            const float target = p->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+            if (p->bypassMix != target || target > 0.0f)
             {
-                mix += (target > mix) ? step : ((target < mix) ? -step : 0.0f);
-                mix = mix < 0.0f ? 0.0f : (mix > 1.0f ? 1.0f : mix);
-                for (int ch = 0; ch < nCh; ++ch)
-                    out[ch][i] += (dry[ch][i] - out[ch][i]) * mix;
+                const float step = 1.0f / static_cast<float>(kBypassRampSamples);
+                float mix = p->bypassMix;
+                for (int i = 0; i < len; ++i)
+                {
+                    mix += (target > mix) ? step : ((target < mix) ? -step : 0.0f);
+                    mix = mix < 0.0f ? 0.0f : (mix > 1.0f ? 1.0f : mix);
+                    for (int ch = 0; ch < nCh; ++ch)
+                        out[ch][c0 + i] += (dry[ch][i] - out[ch][c0 + i]) * mix;
+                }
+                p->bypassMix = mix;
             }
-            p->bypassMix = mix;
         }
+        for (; evIdx < eventCount; ++evIdx)   // safety: events at block end
+            paramsChanged |= p->applyBlockEvent(events[evIdx], n, programChanged);
 
         if (paramsChanged || programChanged)
             p->refreshLatency(programChanged
@@ -1123,6 +1153,8 @@ struct Plugin
         info->stepCount = spec.steps;
         info->defaultNormalizedValue = toNormalized(spec, spec.defValue);
         info->flags = Steinberg_Vst_ParameterInfo_ParameterFlags_kCanAutomate;
+        if (spec.labels != nullptr)   // named choice: hosts offer a list
+            info->flags |= Steinberg_Vst_ParameterInfo_ParameterFlags_kIsList;
         return Steinberg_kResultOk;
     }
 
@@ -1203,10 +1235,9 @@ struct Plugin
         const int idx = indexOfParamId(id);
         if (idx < 0) return Steinberg_kInvalidArgument;
         const Param& spec = P::parameters[static_cast<size_t>(idx)];
-        if (spec.steps == 1 && toggle >= 0)
-            *normalized = toggle;
-        else
-            *normalized = toNormalized(spec, std::strtod(ascii, nullptr));
+        double plain = 0.0;
+        if (!parseValue(spec, ascii, plain)) return Steinberg_kResultFalse;
+        *normalized = toNormalized(spec, plain);
         return Steinberg_kResultOk;
     }
 
@@ -1293,12 +1324,13 @@ struct Plugin
         Steinberg_Vst_IComponentHandler* handler)
     {
         auto* p = fromLens(self_, 2);
-        auto* old = p->handler.load(std::memory_order_relaxed);
-        if (old != nullptr)
-            reinterpret_cast<Steinberg_FUnknown*>(old)->lpVtbl->release(old);
-        p->handler.store(handler, std::memory_order_relaxed);
+        // Take the new reference before dropping the old one: a host that
+        // re-sets the same handler must not see it released to zero first.
         if (handler != nullptr)
             reinterpret_cast<Steinberg_FUnknown*>(handler)->lpVtbl->addRef(handler);
+        auto* old = p->handler.exchange(handler, std::memory_order_relaxed);
+        if (old != nullptr)
+            reinterpret_cast<Steinberg_FUnknown*>(old)->lpVtbl->release(old);
         return Steinberg_kResultOk;
     }
 

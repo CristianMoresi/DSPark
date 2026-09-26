@@ -114,6 +114,7 @@ struct Plugin
     float bypassMix = 0.0f;
     std::vector<float> dryL, dryR;
     std::vector<float> silence;   // stand-in sidechain when not connected
+    DryDelay dryDelay;            // latency-aligned dry path of the bypass
 
 #if defined(DSPARK_PLUGIN_WEBVIEW)
     // --- editor state + UI -> host event queue (single producer: main thread;
@@ -476,7 +477,12 @@ struct Plugin
             s->silence.assign(maxFrames, 0.0f);
         s->bypassMix = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
         if constexpr (HasLatency<P>)
-            s->cachedLatency.store(s->user.getLatency(), std::memory_order_relaxed);
+        {
+            const int latency = s->user.getLatency();
+            s->cachedLatency.store(latency, std::memory_order_relaxed);
+            s->dryDelay.prepare(std::max(2 * latency, kDryDelayMinCapacity),
+                                static_cast<int>(maxFrames));
+        }
         s->prepared = true;
         return true;
     }
@@ -490,6 +496,7 @@ struct Plugin
         auto* s = self(p);
         if constexpr (HasReset<P>)
             s->user.reset();
+        s->dryDelay.reset();
         s->bypassMix = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
     }
 
@@ -538,34 +545,15 @@ struct Plugin
         if (nCh < 1) return CLAP_PROCESS_CONTINUE;
 
         const bool haveIn = !kIsInstrument && process->audio_inputs_count >= 1
-                         && process->audio_inputs[0].data32 != nullptr;
+                         && process->audio_inputs[0].data32 != nullptr
+                         && process->audio_inputs[0].channel_count >= 1;
         float** in = haveIn ? process->audio_inputs[0].data32 : nullptr;
-
-        if (n > s->dryL.size()) return CLAP_PROCESS_CONTINUE;   // oversize block
-
-        // Dry copy for the bypass blend; instruments start cleared (voices
-        // ADD) and bypass toward silence (their dry vectors stay zero).
-        float* dry[2] = { s->dryL.data(), s->dryR.data() };
-        const size_t bytes = sizeof(float) * n;
-        for (uint32_t ch = 0; ch < nCh; ++ch)
-        {
-            if (kIsInstrument)
-            {
-                std::memset(out[ch], 0, bytes);
-                continue;
-            }
-            const float* src = (haveIn && in[ch] != nullptr) ? in[ch] : out[ch];
-            std::memcpy(dry[ch], src, bytes);
-            if (out[ch] != src)
-                std::memcpy(out[ch], src, bytes);
-        }
+        const uint32_t inCh = haveIn ? process->audio_inputs[0].channel_count : 0;
 
         // Sidechain: input port 1, pre-allocated silence when not routed.
-        float* scPtrs[2] = { nullptr, nullptr };
+        float* scHost[2] = { nullptr, nullptr };
         if constexpr (HasSidechain<P>)
         {
-            if (n > s->silence.size()) return CLAP_PROCESS_CONTINUE;
-            scPtrs[0] = scPtrs[1] = s->silence.data();
             if (process->audio_inputs_count >= 2
                 && process->audio_inputs[1].data32 != nullptr)
             {
@@ -573,78 +561,124 @@ struct Plugin
                 const uint32_t scCh = scPort.channel_count < 2
                                     ? scPort.channel_count : 2;
                 for (uint32_t ch = 0; ch < scCh; ++ch)
-                    if (scPort.data32[ch] != nullptr)
-                        scPtrs[ch] = scPort.data32[ch];
-                if (scCh == 1 && scPort.data32[0] != nullptr)
-                    scPtrs[1] = scPort.data32[0];   // mono key feeds both ears
+                    scHost[ch] = scPort.data32[ch];
+                if (scCh == 1)
+                    scHost[1] = scPort.data32[0];   // mono key feeds both ears
             }
         }
 
-        // Sub-block processing at quantum-aligned event positions (the
-        // sample-accurate default); opted out, everything applies up front.
-        auto processSegment = [&](int start, int length) noexcept {
-            float* sub[2] = { out[0] + start,
-                              nCh > 1 ? out[1] + start : out[0] + start };
-            dspark::AudioBufferView<float> view(sub, static_cast<int>(nCh), length);
-            if constexpr (HasSidechain<P>)
+        // A block longer than the activated maximum runs as consecutive
+        // chunks of at most that size: the user DSP never sees more frames
+        // than it prepared for.
+        const int total = static_cast<int>(n);
+        const int chunkMax = static_cast<int>(s->dryL.size());
+        if (chunkMax < 1) return CLAP_PROCESS_CONTINUE;
+        float* dry[2] = { s->dryL.data(), s->dryR.data() };
+        int evIdx = 0;
+
+        for (int c0 = 0; c0 < total; c0 += chunkMax)
+        {
+            const int len = total - c0 < chunkMax ? total - c0 : chunkMax;
+            const int cEnd = c0 + len;
+
+            // Dry copy for the bypass blend; instruments start cleared (voices
+            // ADD) and bypass toward silence (their dry vectors stay zero).
+            // Output channels past a narrower input port repeat its last one.
+            const size_t bytes = sizeof(float) * static_cast<size_t>(len);
+            for (uint32_t ch = 0; ch < nCh; ++ch)
             {
-                // The key view mirrors the main width (mono main, mono key).
-                float* scSub[2] = { scPtrs[0] + start, scPtrs[1] + start };
-                dspark::AudioBufferView<float> scView(scSub,
-                                                      static_cast<int>(nCh), length);
-                s->user.processBlock(view, scView);
+                if (kIsInstrument)
+                {
+                    std::memset(out[ch] + c0, 0, bytes);
+                    continue;
+                }
+                const float* src = out[ch];
+                if (haveIn)
+                {
+                    const float* x = in[ch < inCh ? ch : inCh - 1];
+                    if (x != nullptr) src = x;
+                }
+                std::memcpy(dry[ch], src + c0, bytes);
+                if (out[ch] != src)
+                    std::memcpy(out[ch] + c0, src + c0, bytes);
+            }
+            if constexpr (HasLatency<P> && !kIsInstrument)
+                s->dryDelay.process(dry, static_cast<int>(nCh), len,
+                                    s->cachedLatency.load(std::memory_order_relaxed));
+
+            float* scChunk[2] = { nullptr, nullptr };
+            if constexpr (HasSidechain<P>)
+                for (int ch = 0; ch < 2; ++ch)
+                    scChunk[ch] = scHost[ch] != nullptr ? scHost[ch] + c0
+                                                        : s->silence.data();
+
+            // Sub-block processing at quantum-aligned event positions (the
+            // sample-accurate default); opted out, the chunk's events apply
+            // up front.
+            auto processSegment = [&](int start, int length) noexcept {
+                float* sub[2] = { out[0] + start,
+                                  nCh > 1 ? out[1] + start : out[0] + start };
+                dspark::AudioBufferView<float> view(sub, static_cast<int>(nCh), length);
+                if constexpr (HasSidechain<P>)
+                {
+                    // The key view mirrors the main width (mono main, mono key).
+                    float* scSub[2] = { scChunk[0] + (start - c0),
+                                        scChunk[1] + (start - c0) };
+                    dspark::AudioBufferView<float> scView(scSub,
+                                                          static_cast<int>(nCh), length);
+                    s->user.processBlock(view, scView);
+                }
+                else
+                    s->user.processBlock(view);
+            };
+
+            if (!sampleAccurateOf<P>())
+            {
+                for (; evIdx < eventCount && events[evIdx].offset < cEnd; ++evIdx)
+                    paramsChanged |= s->applyBlockEvent(events[evIdx], c0);
+                processSegment(c0, len);
             }
             else
-                s->user.processBlock(view);
-        };
-
-        const int total = static_cast<int>(n);
-        int evIdx = 0;
-        if (!sampleAccurateOf<P>())
-        {
-            for (; evIdx < eventCount; ++evIdx)
-                paramsChanged |= s->applyBlockEvent(events[evIdx], 0);
-            processSegment(0, total);
-        }
-        else
-        {
-            int pos = 0;
-            while (pos < total)
             {
-                while (evIdx < eventCount
-                       && (events[evIdx].offset / kAutomationQuantum)
-                              * kAutomationQuantum <= pos)
-                    paramsChanged |= s->applyBlockEvent(events[evIdx++], pos);
-                int next = total;
-                if (evIdx < eventCount)
+                int pos = c0;
+                while (pos < cEnd)
                 {
-                    const int snapped = (events[evIdx].offset / kAutomationQuantum)
-                                      * kAutomationQuantum;
-                    if (snapped < next) next = snapped;
+                    while (evIdx < eventCount
+                           && (events[evIdx].offset / kAutomationQuantum)
+                                  * kAutomationQuantum <= pos)
+                        paramsChanged |= s->applyBlockEvent(events[evIdx++], pos);
+                    int next = cEnd;
+                    if (evIdx < eventCount)
+                    {
+                        const int snapped = (events[evIdx].offset / kAutomationQuantum)
+                                          * kAutomationQuantum;
+                        if (snapped < next) next = snapped;
+                    }
+                    if (next <= pos) next = pos + kAutomationQuantum < cEnd
+                                          ? pos + kAutomationQuantum : cEnd;
+                    processSegment(pos, next - pos);
+                    pos = next;
                 }
-                if (next <= pos) next = pos + kAutomationQuantum < total
-                                      ? pos + kAutomationQuantum : total;
-                processSegment(pos, next - pos);
-                pos = next;
             }
-            for (; evIdx < eventCount; ++evIdx)
-                paramsChanged |= s->applyBlockEvent(events[evIdx], total);
-        }
 
-        const float target = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
-        if (s->bypassMix != target || target > 0.0f)
-        {
-            const float step = 1.0f / static_cast<float>(kBypassRampSamples);
-            float mix = s->bypassMix;
-            for (uint32_t i = 0; i < n; ++i)
+            // Soft bypass toward the (latency-aligned) dry signal.
+            const float target = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+            if (s->bypassMix != target || target > 0.0f)
             {
-                mix += (target > mix) ? step : ((target < mix) ? -step : 0.0f);
-                mix = mix < 0.0f ? 0.0f : (mix > 1.0f ? 1.0f : mix);
-                for (uint32_t ch = 0; ch < nCh; ++ch)
-                    out[ch][i] += (dry[ch][i] - out[ch][i]) * mix;
+                const float step = 1.0f / static_cast<float>(kBypassRampSamples);
+                float mix = s->bypassMix;
+                for (int i = 0; i < len; ++i)
+                {
+                    mix += (target > mix) ? step : ((target < mix) ? -step : 0.0f);
+                    mix = mix < 0.0f ? 0.0f : (mix > 1.0f ? 1.0f : mix);
+                    for (uint32_t ch = 0; ch < nCh; ++ch)
+                        out[ch][c0 + i] += (dry[ch][i] - out[ch][c0 + i]) * mix;
+                }
+                s->bypassMix = mix;
             }
-            s->bypassMix = mix;
         }
+        for (; evIdx < eventCount; ++evIdx)   // safety: events at block end
+            paramsChanged |= s->applyBlockEvent(events[evIdx], total);
 
         if (paramsChanged) s->refreshLatency();
         return CLAP_PROCESS_CONTINUE;
@@ -920,6 +954,7 @@ struct Plugin
         std::snprintf(info->name, sizeof(info->name), "%s", spec.name);
         info->flags = CLAP_PARAM_IS_AUTOMATABLE;
         if (spec.steps > 0) info->flags |= CLAP_PARAM_IS_STEPPED;
+        if (spec.labels != nullptr) info->flags |= CLAP_PARAM_IS_ENUM;
         info->min_value = spec.minValue;
         info->max_value = spec.maxValue;
         info->default_value = spec.defValue;
@@ -971,18 +1006,9 @@ struct Plugin
         }
         const int idx = indexOfParamId(id);
         if (idx < 0) return false;
-        const Param& spec = P::parameters[static_cast<size_t>(idx)];
-        if (spec.steps == 1 && toggle >= 0)
-            *out = toggle != 0 ? spec.maxValue : spec.minValue;
-        else
-        {
-            // min/max ordered so a "nan" string resolves to a bound instead
-            // of passing NaN through to the host.
-            const double v = std::strtod(text, nullptr);
-            *out = std::max(static_cast<double>(spec.minValue),
-                            std::min(static_cast<double>(spec.maxValue), v));
-        }
-        return true;
+        // Labels, On/Off or a number, clamped and snapped; "nan" and other
+        // garbage are refused rather than passed through to the host.
+        return parseValue(P::parameters[static_cast<size_t>(idx)], text, *out);
     }
 
     static void sParamFlush(const clap_plugin_t* p, const clap_input_events_t* in,

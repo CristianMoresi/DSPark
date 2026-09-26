@@ -83,6 +83,10 @@ struct SynthPlugin : dspark::plugin::PluginBase<SynthPlugin>
         case 5: gainDb_.store(value, std::memory_order_relaxed);    break;
         default: break;
         }
+        // Sounding voices follow the knobs too: the audio thread re-applies
+        // the voice settings at its next block (setParameter may run on any
+        // thread, the voices belong to the audio thread).
+        voiceSettingsDirty_.store(true, std::memory_order_release);
     }
 
     void handleMidiEvent(const dspark::plugin::MidiEvent& ev) noexcept
@@ -147,6 +151,15 @@ struct SynthPlugin : dspark::plugin::PluginBase<SynthPlugin>
         if (n <= 0 || static_cast<size_t>(n) > scratch_.size()) return;
         const float gain = std::pow(10.0f,
             gainDb_.load(std::memory_order_relaxed) / 20.0f);
+        if (voiceSettingsDirty_.exchange(false, std::memory_order_acquire))
+        {
+            const auto waveform = waveformOf(wave_.load(std::memory_order_relaxed));
+            for (auto& voice : voices_)
+            {
+                applyEnvelopeTo(voice);
+                voice.osc.setWaveform(waveform);
+            }
+        }
 
         for (auto& voice : voices_)
         {
@@ -237,6 +250,7 @@ private:
     std::atomic<float> sustain_ { 0.7f };
     std::atomic<float> releaseMs_ { 150.0f };
     std::atomic<float> gainDb_ { -6.0f };
+    std::atomic<bool>  voiceSettingsDirty_ { false };
 };
 
 DSPARK_VST3_PLUGIN(SynthPlugin)

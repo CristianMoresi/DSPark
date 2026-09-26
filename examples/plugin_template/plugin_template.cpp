@@ -196,9 +196,10 @@ struct TemplatePlugin : dspark::plugin::PluginBase<TemplatePlugin>
         return true;
     }
 
-    // OPTIONAL - hasEditor: inherited from PluginBase as false. Hosts show
-    // their generic parameter UI. The WebView editor layer will claim this
-    // hook; see docs/plugins.md.
+    // OPTIONAL - hasEditor: inherited from PluginBase as false, so hosts
+    // show their generic parameter UI. For a custom HTML/CSS/JS editor, set
+    // it true with editorHtml() and include the WebView editor layer first
+    // (examples/plugin_webview_editor/, docs/plugins.md "Custom UIs").
 
 private:
     static constexpr double kIrSeconds = 1.5;

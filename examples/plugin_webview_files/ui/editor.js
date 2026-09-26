@@ -30,17 +30,27 @@
       dspark.setParam(p.id, clamp(
         startV + (startY - e.clientY) * (p.max - p.min) / pixelsForFullRange));
     });
-    el.addEventListener('pointerup', function (e) {
+    // A cancelled pointer (lost capture, OS gesture) must close the host
+    // gesture too, or the host keeps the parameter "touched".
+    function finish(e) {
       if (!dragging) { return; }
       dragging = false;
       dspark.endEdit(p.id);
-      el.releasePointerCapture(e.pointerId);
-    });
-    el.addEventListener('dblclick', function () { dspark.setParam(p.id, p.def); });
+      if (el.hasPointerCapture(e.pointerId)) { el.releasePointerCapture(e.pointerId); }
+    }
+    el.addEventListener('pointerup', finish);
+    el.addEventListener('pointercancel', finish);
+    // One-shot edits are gestures of their own (host undo + automation write).
+    function jumpTo(v) {
+      dspark.beginEdit(p.id);
+      dspark.setParam(p.id, v);
+      dspark.endEdit(p.id);
+    }
+    el.addEventListener('dblclick', function () { jumpTo(p.def); });
     el.addEventListener('wheel', function (e) {
       e.preventDefault();
       var step = (p.max - p.min) / (e.shiftKey ? 400 : 80);
-      dspark.setParam(p.id, clamp(dspark.getParam(p.id) - Math.sign(e.deltaY) * step));
+      jumpTo(clamp(dspark.getParam(p.id) - Math.sign(e.deltaY) * step));
     }, { passive: false });
   }
 

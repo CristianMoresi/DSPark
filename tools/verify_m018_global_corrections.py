@@ -27,28 +27,28 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_DIRECTORIES = ("Core", "Effects", "Analysis", "IO", "Music")
 EXPECTED_INSTALLED_HEADERS = 102
 EXPECTED_ORDINARY_TESTS = 943
-PRODUCT_P7_COMMIT = "5a47d959de4b3d48445a8850960f74377999faf9"
-PRODUCT_P7_PARENT = "ff56759f0d12e9bfad20a77b5b8c80b642ffe5f2"
+PRODUCT_P7_COMMIT = "d8a98a6cf3a7c88af7e57a442f34b88fe869885a"
+PRODUCT_P7_PARENT = "e1913513e424a5ae0dbf24fbe9ac42980d2876a3"
 PACKAGE_SOURCE_URL_PREFIX = (
     "https://codeload.github.com/CristianMoresi/DSPark/tar.gz/"
 )
 PACKAGE_SOURCE_SHA256 = (
-    "3b6d44a863ab97749f1b4131c255689c2fbdf00b891bdaa9329aadc1a1e00ce2"
+    "e01c8918b8d8293f0b310dcf5a81b47609e4ad8056a8236f1b7c75a941c90f00"
 )
-PACKAGE_SOURCE_FILENAME = "dspark-1.7.0.tar.gz"
+PACKAGE_SOURCE_FILENAME = "dspark-1.8.0.tar.gz"
 PACKAGE_SOURCE_SHA512 = (
-    "b7382dc3e0247fbf93e0a5555750deda74798809d4c3d8154a08bb517faf9cf0"
-    "46cabdd04d88fc6e7895a7a6666e7017eeed719ea2582edca5363bba8ef9383f"
+    "f8f1fff5e561a7405a4704dcedaef8fa935845cc373787bedff69c19b21db44a"
+    "b50c42ffe2e375c5f6624788c61c42f77f5198471988067312481255e847bbd5"
 )
 EXPECTED_PACKAGE_HASHES = {
-    "packaging/conan/conanfile.py": "fe14207493ecdecc7fcefcc4eccda4cdd09f88c9755db576133bfff3bdfa74f0",
-    "packaging/vcpkg/portfile.cmake": "c2b5f8c0c30518e220c1f85abed9cbe7bdcaa26608f153821be99f5785d10815",
-    "packaging/vcpkg/vcpkg.json": "08fd9782597218b0f6ddbfc4720ebe83a4a710cff6758f76752833f491e99bdd",
+    "packaging/conan/conanfile.py": "939790d0748c28f0c0d9d5cd1bfada328f3053a064737a1a65b632ea1325498b",
+    "packaging/vcpkg/portfile.cmake": "4e1b40d0e18fad4be214bdc9039cf66bb336450bd32cab23224c6510bcf1e200",
+    "packaging/vcpkg/vcpkg.json": "ad8b6771946a7a88a1105a01887f5385132163f9a09c0f8b33796a0381671571",
 }
 EXPECTED_SEMANTIC_HASHES = {
-    "packaging/conan/conanfile.py": "4eabfe4a38cd593eb73789313dea018e2a9ba022339ec566125c2aeb178a832d",
-    "packaging/vcpkg/portfile.cmake": "9dfe0b00f07741b1308546e76f0985d277952ed3f3aaa6864d31a2ef9e2a9048",
-    "packaging/vcpkg/vcpkg.json": "987800079ee1d7556da43c2ff8cea3fb08553eb3e1bd3e7142e8fb342255093e",
+    "packaging/conan/conanfile.py": "c8804aa53674d5609c10d58e19c028506956e00ac3256fb1e11d93d334b7f947",
+    "packaging/vcpkg/portfile.cmake": "de41508e9c91d8f09bfc42737a86d3d29f216ae3be6bf4afbccabc20893b1db7",
+    "packaging/vcpkg/vcpkg.json": "8b1b26eed0ee2aaf52f56f6ab65829b79967aa8f87069b53c9e346c9baaa6539",
 }
 PACKAGE_FIELD_MUTANT_IDS = (
     "MUT-R-CONAN-COMMENT",
@@ -88,11 +88,11 @@ PACKAGE_FIELD_MUTANT_INVENTORY_SHA256 = (
 )
 PACKAGE_FIELD_MUTANT_SUBCASE_COUNTS = (
     1, 1, 1, 1, 1, 1, 12, 5, 1, 2,
-    3, 1, 1, 1, 2, 1, 1, 2, 5, 1,
+    3, 2, 1, 1, 2, 1, 1, 2, 5, 1,
     1, 3, 2, 2, 1, 2, 1, 1, 2, 5,
     2,
 )
-EXPECTED_PACKAGE_FIELD_MUTANT_SUBCASES = 66
+EXPECTED_PACKAGE_FIELD_MUTANT_SUBCASES = 67
 
 
 def digest(data: bytes) -> str:
@@ -749,7 +749,7 @@ def conan_field_errors(data: bytes) -> list[str]:
     recipe = classes[0]
     for field, expected in (
         ("name", "dspark"),
-        ("version", "1.7.0"),
+        ("version", "1.8.0"),
         ("package_type", "header-library"),
         ("homepage", "https://github.com/CristianMoresi/DSPark"),
     ):
@@ -829,10 +829,24 @@ def conan_field_errors(data: bytes) -> list[str]:
         and call.args[1].value == "DSPark.h"
     ]
     if module_destinations != [
-            "os.path.join(self.package_folder, 'include', 'DSPark', module)"
+            "os.path.join(self.package_folder, 'include', 'dspark', module)"
     ] or umbrella_destinations != [
-            "os.path.join(self.package_folder, 'include', 'DSPark')"
+            "os.path.join(self.package_folder, 'include', 'dspark')"
     ]:
+        errors.append("PACKAGE_R_CONAN_FIELD:include_destination")
+    # The include root the consumer sees must be the one the CMake package
+    # exports (include/dspark), so one #include <DSPark.h> fits both.
+    include_roots: list[object] = []
+    package_info_node = class_method(recipe, "package_info")
+    if package_info_node is not None:
+        for node in package_info_node.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                    and ast.unparse(node.targets[0]) == "self.cpp_info.includedirs":
+                try:
+                    include_roots.append(ast.literal_eval(node.value))
+                except (TypeError, ValueError):
+                    include_roots.append(None)
+    if include_roots != [["include/dspark"]]:
         errors.append("PACKAGE_R_CONAN_FIELD:include_destination")
 
     package_info = class_method(recipe, "package_info")
@@ -1084,7 +1098,7 @@ def manifest_field_errors(data: bytes) -> list[str]:
         errors.append("PACKAGE_R_MANIFEST_FIELD:object_shape")
     if value.get("name") != "dspark":
         errors.append("PACKAGE_R_MANIFEST_FIELD:name")
-    if value.get("version") != "1.7.0":
+    if value.get("version") != "1.8.0":
         errors.append("PACKAGE_R_MANIFEST_FIELD:version")
     if value.get("homepage") != "https://github.com/CristianMoresi/DSPark" \
             or value.get("license") != "MIT":
@@ -1174,7 +1188,7 @@ def package_mutant_cases(
         replace_package_bytes(conan, b'name = "dspark"', b'name = "DSPark"'),
         "PACKAGE_R_CONAN_FIELD:name")
     add("MUT-R-CONAN-VERSION", "next-patch", conan_path,
-        replace_package_bytes(conan, b'version = "1.7.0"', b'version = "1.7.1"'),
+        replace_package_bytes(conan, b'version = "1.8.0"', b'version = "1.8.1"'),
         "PACKAGE_R_CONAN_FIELD:version")
     add("MUT-R-CONAN-PACKAGE-TYPE", "static-library", conan_path,
         replace_package_bytes(
@@ -1190,7 +1204,7 @@ def package_mutant_cases(
         replace_package_bytes(
             conan,
             (PACKAGE_SOURCE_URL_PREFIX + PRODUCT_P7_COMMIT).encode("ascii"),
-            b"https://github.com/CristianMoresi/DSPark/archive/refs/tags/v1.7.0.tar.gz"),
+            b"https://github.com/CristianMoresi/DSPark/archive/refs/tags/v1.8.0.tar.gz"),
         "PACKAGE_R_CONAN_FIELD:source_url")
     filename_anchor = (
         b'            filename="' + PACKAGE_SOURCE_FILENAME.encode("ascii")
@@ -1200,13 +1214,13 @@ def package_mutant_cases(
         replace_package_bytes(conan, filename_anchor, b""),
         "PACKAGE_R_CONAN_FIELD:filename")
     for case, replacement in (
-        ("extensionless", "dspark-1.7.0"),
-        ("zip", "dspark-1.7.0.zip"),
-        ("posix-path", "archive/dspark-1.7.0.tar.gz"),
-        ("windows-path", r"archive\\dspark-1.7.0.tar.gz"),
-        ("url", "https://example.invalid/dspark-1.7.0.tar.gz"),
-        ("version-drift", "dspark-1.7.1.tar.gz"),
-        ("tag-ref", "dspark-v1.7.0.tar.gz"),
+        ("extensionless", "dspark-1.8.0"),
+        ("zip", "dspark-1.8.0.zip"),
+        ("posix-path", "archive/dspark-1.8.0.tar.gz"),
+        ("windows-path", r"archive\\dspark-1.8.0.tar.gz"),
+        ("url", "https://example.invalid/dspark-1.8.0.tar.gz"),
+        ("version-drift", "dspark-1.8.1.tar.gz"),
+        ("tag-ref", "dspark-v1.8.0.tar.gz"),
         ("branch-ref", "dspark-main.tar.gz"),
         ("short-ref", "dspark-" + PRODUCT_P7_COMMIT[:12] + ".tar.gz"),
         ("r-placeholder", "dspark-" + "R" * 40 + ".tar.gz"),
@@ -1225,7 +1239,7 @@ def package_mutant_cases(
     for case, reference in (
         ("parent", PRODUCT_P7_PARENT),
         ("short", PRODUCT_P7_COMMIT[:12]),
-        ("tag", "v1.7.0"),
+        ("tag", "v1.8.0"),
         ("branch", "main"),
         ("r-placeholder", "R" * 40),
     ):
@@ -1255,10 +1269,15 @@ def package_mutant_cases(
         add("MUT-R-CONAN-MODULES", case, conan_path,
             replace_package_bytes(conan, module_tuple, replacement),
             "PACKAGE_R_CONAN_FIELD:modules")
-    add("MUT-R-CONAN-INCLUDE-DESTINATION", "lowercase", conan_path,
+    add("MUT-R-CONAN-INCLUDE-DESTINATION", "uppercase", conan_path,
         replace_package_bytes(
-            conan, b'"include", "DSPark"', b'"include", "dspark"',
-            expected_count=2),
+            conan, b'"include", "dspark"', b'"include", "DSPark"',
+            expected_count=3),
+        "PACKAGE_R_CONAN_FIELD:include_destination")
+    add("MUT-R-CONAN-INCLUDE-DESTINATION", "include-root", conan_path,
+        replace_package_bytes(
+            conan, b'self.cpp_info.includedirs = ["include/dspark"]',
+            b'self.cpp_info.includedirs = ["include"]'),
         "PACKAGE_R_CONAN_FIELD:include_destination")
     add("MUT-R-CONAN-CMAKE-FILE", "uppercase", conan_path,
         replace_package_bytes(
@@ -1297,7 +1316,7 @@ def package_mutant_cases(
             "PACKAGE_R_VCPKG_FIELD:repo")
     for case, reference in (
         ("parent", PRODUCT_P7_PARENT),
-        ("tag", "v1.7.0"),
+        ("tag", "v1.8.0"),
         ("branch", "main"),
         ("short", PRODUCT_P7_COMMIT[:12]),
         ("r-placeholder", "R" * 40),
@@ -1369,7 +1388,7 @@ def package_mutant_cases(
     add("MUT-R-MANIFEST-NAME", "uppercase", manifest_path,
         dumped_manifest(changed), "PACKAGE_R_MANIFEST_FIELD:name")
     changed = dict(manifest_value)
-    changed["version"] = "1.7.1"
+    changed["version"] = "1.8.1"
     add("MUT-R-MANIFEST-VERSION", "next-patch", manifest_path,
         dumped_manifest(changed), "PACKAGE_R_MANIFEST_FIELD:version")
     for case, key, value in (
@@ -1402,8 +1421,8 @@ def package_mutant_cases(
         add("MUT-R-MANIFEST-DEPENDENCIES", case, manifest_path,
             dumped_manifest(changed), "PACKAGE_R_MANIFEST_FIELD:dependencies")
     duplicate = replace_package_bytes(
-        manifest, b'  "version": "1.7.0",\n',
-        b'  "version": "1.7.0",\n  "version": "1.7.0",\n')
+        manifest, b'  "version": "1.8.0",\n',
+        b'  "version": "1.8.0",\n  "version": "1.8.0",\n')
     add("MUT-R-MANIFEST-DUPLICATE-OR-EXTRA", "duplicate", manifest_path,
         duplicate, "PACKAGE_R_MANIFEST_FIELD:object_shape")
     changed = dict(manifest_value)

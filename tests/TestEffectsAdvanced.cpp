@@ -3348,49 +3348,59 @@ DSPARK_TEST(AlgoReverb_left_source_stays_left_in_the_early_field)
 
 DSPARK_TEST(AlgoReverb_modulation_does_not_detune_a_steady_tone)
 {
-    // The tail's line modulation must smear resonances without audible
-    // pitch wobble: a steady 1 kHz tone through the Hall keeps all but a
-    // tiny fraction of its energy within +/-3 Hz (measured -47 dB outside).
-    ARevF rev;
-    rev.prepare(spec(48000.0, 256, 2));
-    rev.setType(ARevF::Type::Hall);
-    rev.setMix(1.0f);
-    rev.setEarlyLevel(-60.0f);
-    const int lead = 4 * 48000, n = 2 * 48000;
-    std::vector<double> x(static_cast<size_t>(n));
-    auto tb = makeBuffer(2, 256);
-    double ph = 0.0;
-    for (int off = 0; off < lead + n; off += 256)
-    {
-        for (int i = 0; i < 256; ++i)
+    // The tail's modulation must smear resonances without audible pitch
+    // wobble: a steady tone keeps all but a tiny fraction of its energy
+    // within +/-3 Hz. Delay-line modulation spreads a tone in proportion to
+    // its frequency, which is why the treble is the hard case: with the
+    // line wander alone the Hall let -33 dB (Cathedral -31 dB) of a 3 kHz
+    // tone out of that band; the slow rotation of the mixing matrix, which
+    // spreads every frequency alike, lets the lines wander less and brings
+    // it to -44 dB (-45 dB) while 1 kHz stays near -55 dB.
+    const auto spreadDb = [](ARevF::Type type, double f0) {
+        ARevF rev;
+        rev.prepare(spec(48000.0, 256, 2));
+        rev.setType(type);
+        rev.setMix(1.0f);
+        rev.setEarlyLevel(-60.0f);
+        const int lead = 4 * 48000, n = 2 * 48000;
+        std::vector<double> x(static_cast<size_t>(n));
+        auto tb = makeBuffer(2, 256);
+        double ph = 0.0;
+        for (int off = 0; off < lead + n; off += 256)
         {
-            tb.ch(0)[i] = tb.ch(1)[i] = static_cast<float>(0.3 * std::sin(ph));
-            ph += 6.283185307179586 * 1000.0 / 48000.0;
-        }
-        rev.processBlock(tb.view());
-        for (int i = 0; i < 256; ++i)
-            if (off + i >= lead)
+            for (int i = 0; i < 256; ++i)
             {
-                const int k = off + i - lead;
-                x[static_cast<size_t>(k)] = tb.ch(0)[i]
-                    * (0.5 - 0.5 * std::cos(6.283185307179586 * k / n));
+                tb.ch(0)[i] = tb.ch(1)[i] = static_cast<float>(0.3 * std::sin(ph));
+                ph += 6.283185307179586 * f0 / 48000.0;
             }
-    }
-    double total = 0.0, inBand = 0.0;
-    for (const double v : x) total += v * v;
-    for (double f = 997.0; f <= 1003.0; f += 0.5)   // DFT bins at 0.5 Hz spacing
-    {
-        double re = 0.0, im = 0.0;
-        const double w = 6.283185307179586 * f / 48000.0;
-        for (int i = 0; i < n; ++i)
-        {
-            re += x[static_cast<size_t>(i)] * std::cos(w * i);
-            im += x[static_cast<size_t>(i)] * std::sin(w * i);
+            rev.processBlock(tb.view());
+            for (int i = 0; i < 256; ++i)
+                if (off + i >= lead)
+                {
+                    const int k = off + i - lead;
+                    x[static_cast<size_t>(k)] = tb.ch(0)[i]
+                        * (0.5 - 0.5 * std::cos(6.283185307179586 * k / n));
+                }
         }
-        inBand += 2.0 * (re * re + im * im) / n;
-    }
-    EXPECT_GT(total, 1e-6);
-    EXPECT_LT(10.0 * std::log10(std::max(total - inBand, 1e-30) / total), -35.0);
+        double total = 0.0, inBand = 0.0;
+        for (const double v : x) total += v * v;
+        for (double f = f0 - 3.0; f <= f0 + 3.0; f += 0.5)   // DFT bins at 0.5 Hz spacing
+        {
+            double re = 0.0, im = 0.0;
+            const double w = 6.283185307179586 * f / 48000.0;
+            for (int i = 0; i < n; ++i)
+            {
+                re += x[static_cast<size_t>(i)] * std::cos(w * i);
+                im += x[static_cast<size_t>(i)] * std::sin(w * i);
+            }
+            inBand += 2.0 * (re * re + im * im) / n;
+        }
+        if (!(total > 1e-6)) return 0.0;   // silent output fails the checks below
+        return 10.0 * std::log10(std::max(total - inBand, 1e-30) / total);
+    };
+    EXPECT_LT(spreadDb(ARevF::Type::Hall, 1000.0), -45.0);
+    EXPECT_LT(spreadDb(ARevF::Type::Hall, 3000.0), -40.0);
+    EXPECT_LT(spreadDb(ARevF::Type::Cathedral, 3000.0), -40.0);
 }
 
 DSPARK_TEST(AlgoReverb_size_changes_glide_without_clicks)

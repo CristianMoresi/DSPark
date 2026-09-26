@@ -31,6 +31,7 @@
  *   |      +- Jot absorption shelf (mid/high T60) per line
  *   |      +- bass shelf (bass/mid T60) per line   --> output taps
  *   |      +- Hadamard 32x32 mix + line rotation (lossless, dense)
+ *   |      +- slowly turning Givens rotations of line pairs (lossless)
  *   |      +- short in-loop allpass (echo density), scaled with the size
  *   |      +- safety soft limit, write back + injection
  *   |       |
@@ -92,7 +93,8 @@
  *   - 32 lines with about 3.7 s of delay at full size: the modal density
  *     (modes per Hz equals the total delay in seconds) keeps the modes
  *     overlapping, and the Hadamard matrix plus a line rotation feeds
- *     every line from every other with equal weight;
+ *     every line from every other with equal weight (a slow pairwise
+ *     rotation keeps that mix moving, see Transparent modulation);
  *   - short input diffusers (0.4-1.8 ms): an allpass holds back some
  *     frequencies longer than others, and in a short decay those would
  *     be heard ringing on;
@@ -113,18 +115,26 @@
  *   0.97, 0.92, 0.54-0.79, 0.07-0.24): no phasey low end, full width on
  *   top. Below 20 Hz, where no room rings, a high-pass removes what is
  *   left.
- * - **Transparent modulation.** Each line's length wanders with its own
- *   smooth random LFO (Lexicon style), updated at control rate with a
+ * - **Transparent modulation.** Two mechanisms share the work of smearing
+ *   the tail's remaining resonances. Each line's length wanders with its
+ *   own smooth random LFO (Lexicon style), updated at control rate with a
  *   per-sample linear ramp and read through a first-order allpass
  *   interpolator kept in its low-dispersion range ([0.5, 1.5) samples of
- *   fractional delay), so there is no cumulative HF loss. Depth is set in
- *   time and scales with the room size: the same chorus at every sample
- *   rate, and small rooms do not warble. The dense network needs little
- *   of it: the presets smear the tail's remaining resonances while
- *   keeping steady tones as clean as unmodulated reverbs do: over tones
- *   from 400 Hz to 3 kHz, the energy more than 3 Hz from the tone is
- *   42 dB down in Hall and Cathedral, 54 dB in Room and Chamber (Plate,
- *   lusher by design, about 22 dB).
+ *   fractional delay), so there is no cumulative HF loss; depth is set in
+ *   time and scales with the room size, so small rooms do not warble. A
+ *   wandering delay spreads a tone in proportion to its frequency, so the
+ *   line wander is kept light and the mixing matrix itself moves too:
+ *   after the Hadamard mix, each pair of lines (i, i XOR 4) turns through a
+ *   slow Givens rotation (0.3-0.6 Hz, about 1 rad in the Hall; Schlecht and
+ *   Habets' time-varying feedback matrix). The matrix stays orthogonal, so
+ *   the loop stays lossless and every T60 exact, and modes trade energy
+ *   with a spread that is the same at every frequency. The pairs are
+ *   chosen so both lines weigh the same in the stereo output: the
+ *   rotation cannot tilt the late field's interaural coherence. A steady
+ *   tone keeps all but this fraction of its energy within +/-3 Hz (1 kHz /
+ *   3 kHz): Room -51 / -50 dB, Chamber -69 / -48 dB, Hall -55 / -44 dB,
+ *   Cathedral -54 / -45 dB (line wander alone: Hall -33 dB, Cathedral
+ *   -31 dB at 3 kHz); Plate, lusher by design, -29 / -11 dB.
  * - **Smooth size changes.** setSize() glides the line and in-loop allpass
  *   lengths (a short tape-style Doppler) instead of jumping, so it can be
  *   automated.
@@ -441,6 +451,12 @@ public:
         for (int i = 0; i < kMaxLines; ++i)
         {
             lfo_[i].prepare(sr, rate * lfoRateFactor(i), lfoSeed(i));
+            if (i < kMaxLines / 2)
+            {
+                rotLfo_[i].prepare(sr, rotRate() * rotRateFactor(i), rotSeed(i));
+                rotC_[i] = T(1);
+                rotS_[i] = T(0);
+            }
             lenCur_[i] = static_cast<T>(lenTarget_[i]);
             loopAPCur_[i] = static_cast<T>(loopAPLen_[i]);
             pos_[i] = std::max(lenCur_[i], T(kMinReadPos));
@@ -869,6 +885,16 @@ protected:
     static constexpr double kShadowHz      = 1000.0; ///< head-shadow corner of the early taps
     static constexpr double kShadowHF      = 0.5;    ///< high-frequency gain of a shadowed (far-ear) tap
     static constexpr double kModMaxMs      = 2.0;   ///< peak line wander at modulation 1, size 1
+    /// Time-varying mixing matrix: Givens rotations of line pairs, their
+    /// angle scaled by the modulation amount (the Hall's 0.10 gives 1 rad)
+    /// at a fixed slow rate - a rotation spreads every frequency alike, so
+    /// it stays slow whatever the line-wander rate.
+    static constexpr double kRotMaxRad     = 10.0;  ///< peak rotation angle at modulation 1 (rad)
+    static constexpr double kRotRateHz     = 0.35;  ///< base rate of the pair rotations
+    /// Rotation partner of line i is i XOR 4: both carry the same L*R sign
+    /// in the output sums and the same input side, so turning them never
+    /// tilts the stereo image (checked in the test suite).
+    static constexpr int kRotPairStride = 4;
     static constexpr double kGlideMs       = 60.0;  ///< size-change glide time constant
     static constexpr double kMaxGlideSpeed = 0.04;  ///< max length change per sample (4% Doppler)
     static constexpr double kSubsonicHz    = 20.0;  ///< wet-output high-pass (2nd order): no room rings below it
@@ -1081,6 +1107,15 @@ protected:
     {
         return static_cast<uint32_t>(i) * 7919u + 1u;
     }
+    static constexpr T rotRate() noexcept { return static_cast<T>(kRotRateHz); }
+    static constexpr T rotRateFactor(int i) noexcept
+    {
+        return T(0.83) + T(0.051) * static_cast<T>(i);
+    }
+    static constexpr uint32_t rotSeed(int i) noexcept
+    {
+        return static_cast<uint32_t>(i) * 104729u + 7u;
+    }
 
     /// Deterministic hash in [0, 1) for the early-reflection layout.
     static double hash01(int k, int s) noexcept
@@ -1147,6 +1182,13 @@ protected:
     std::array<T, kMaxLines> injGain_ {};        ///< sign / sqrt(lines)
     std::array<T, kMaxLines> outSignL_ {}, outSignR_ {};
     std::array<SmoothRandomLFO, kMaxLines> lfo_;
+    // Time-varying mixing: one slow Givens rotation per line pair after the
+    // Hadamard mix (orthogonal, so the loop stays lossless).
+    std::array<SmoothRandomLFO, kMaxLines / 2> rotLfo_;
+    alignas(64) std::array<T, kMaxLines / 2> rotC_ {};
+    alignas(64) std::array<T, kMaxLines / 2> rotS_ {};
+    T rotDepth_ = T(0);
+    unsigned rotTick_ = 0;
     T modDepthSamples_ = T(0);
     T glideCoeff_ = T(0);
     T maxGlideStep_ = T(0);
@@ -1333,6 +1375,15 @@ protected:
     void controlTick() noexcept
     {
         const int n = nLines_;
+        // The pair angles move by under 0.005 rad per 64 samples: refresh
+        // their sine and cosine every fourth control tick.
+        if ((++rotTick_ & 3) == 0)
+            for (int k = 0; k < n / 2; ++k)
+            {
+                const T theta = rotLfo_[k].nextStride(4 * kCtrl) * rotDepth_;
+                rotC_[k] = std::cos(theta);
+                rotS_[k] = std::sin(theta);
+            }
         for (int i = 0; i < n; ++i)
         {
             const T diff = static_cast<T>(lenTarget_[i]) - lenCur_[i];
@@ -1487,6 +1538,26 @@ protected:
         r[N] = r[0];
         for (int i = 0; i < N; i += W)
             O::store(v.data() + i, O::mul(norm, O::load(r.data() + i + 1)));
+        // Slow Givens rotation of each line pair: the mixing matrix drifts
+        // while staying orthogonal (lossless), so modes exchange energy
+        // without the pitch deviation of delay modulation, whose spread
+        // grows with frequency.
+        // Pairs (i, i + 4) inside each block of 8: contiguous, branch-free,
+        // so the four rotations of a block run as one vector operation.
+        static_assert(kRotPairStride == 4 && N % 8 == 0, "rotation pairs are (i, i + 4) in blocks of 8");
+        for (int blk = 0; blk < N; blk += 8)
+        {
+            T* lo = v.data() + blk;
+            T* hi = lo + 4;
+            const T* c = rotC_.data() + blk / 2;
+            const T* sn = rotS_.data() + blk / 2;
+            for (int q = 0; q < 4; ++q)
+            {
+                const T a = lo[q], b = hi[q];
+                lo[q] = c[q] * a - sn[q] * b;
+                hi[q] = sn[q] * a + c[q] * b;
+            }
+        }
 
         {
             if (loopAPGliding_) [[unlikely]]
@@ -1955,6 +2026,10 @@ protected:
         modDepthSamples_ = modDepth_.load(std::memory_order_relaxed)
                            * (spring_ ? static_cast<T>(kSpringJitterMs * sr / 1000.0)
                                       : static_cast<T>(kModMaxMs * sr / 1000.0) * sizeFactor());
+        rotDepth_ = spring_ ? T(0)
+                            : modDepth_.load(std::memory_order_relaxed) * static_cast<T>(kRotMaxRad);
+        for (int k = 0; k < kMaxLines / 2; ++k)
+            rotLfo_[k].setRate(rotRate() * rotRateFactor(k), sr);
         glideCoeff_ = static_cast<T>(1.0 - std::exp(-kCtrl / (kGlideMs * sr / 1000.0)));
         maxGlideStep_ = static_cast<T>(kMaxGlideSpeed * kCtrl);
     }
@@ -2251,7 +2326,7 @@ protected:
                 break;
             case Type::Hall:
                 commitPreset({T(0.68), T(2.2),  T(0.32), T(1.3),  T(4500), T(200),
-                              T(0.84), T(0.13), T(0.55), T(1),    T(1),    T(15)});
+                              T(0.84), T(0.10), T(0.55), T(1),    T(1),    T(15)});
                 break;
             case Type::Chamber:
                 commitPreset({T(0.38), T(1.2),  T(0.38), T(1.1),  T(5000), T(250),
@@ -2267,7 +2342,7 @@ protected:
                 break;
             case Type::Cathedral:
                 commitPreset({T(0.98), T(5.0),  T(0.24), T(1.5),  T(3500), T(150),
-                              T(0.91), T(0.16), T(0.35), T(1),    T(1),    T(25)});
+                              T(0.91), T(0.12), T(0.35), T(1),    T(1),    T(25)});
                 break;
         }
 

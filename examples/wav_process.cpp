@@ -10,6 +10,8 @@
 
 #include "DSPark.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 
 int main(int argc, char** argv)
@@ -65,27 +67,47 @@ int main(int argc, char** argv)
     meter.prepare(info.sampleRate, static_cast<int>(info.numChannels));
 
     // --- stream -------------------------------------------------------------
+    // The limiter's lookahead (and a lookahead compressor, if enabled) delay
+    // the signal. An offline render compensates, so the file stays aligned
+    // with its source: drop the first `latency` output frames, and feed as
+    // many frames of silence past the end so the tail is not cut off.
+    const int latency = comp.getLatency() + limiter.getLatency();
+
     dspark::AudioBuffer<float> buf;
     buf.resize(static_cast<int>(info.numChannels), kBlock);
 
-    int64_t remaining = info.numSamples;
+    int64_t toSkip = latency;
+    int64_t remaining = info.numSamples + latency;
     int64_t offset = 0;
     while (remaining > 0)
     {
         const int n = static_cast<int>(std::min<int64_t>(remaining, kBlock));
         auto view = buf.toView().getSubView(0, n);
-        if (!in.readSamples(view, offset, n))
-            break;
+        const int fromFile = static_cast<int>(
+            std::clamp<int64_t>(info.numSamples - offset, 0, n));
+        if (fromFile > 0 && !in.readSamples(view.getSubView(0, fromFile), offset, fromFile))
+        {
+            std::printf("read failed\n");
+            return 1;
+        }
+        if (fromFile < n)
+            view.getSubView(fromFile, n - fromFile).clear();   // flush silence
 
         eq.processBlock(view);
         comp.processBlock(view);
         limiter.processBlock(view);
-        meter.processBlock(view);
 
-        if (!out.writeSamples(view))
+        const int skip = static_cast<int>(std::min<int64_t>(toSkip, n));
+        toSkip -= skip;
+        if (skip < n)
         {
-            std::printf("write failed\n");
-            return 1;
+            auto written = view.getSubView(skip, n - skip);
+            meter.processBlock(written);
+            if (!out.writeSamples(written))
+            {
+                std::printf("write failed\n");
+                return 1;
+            }
         }
         offset += n;
         remaining -= n;

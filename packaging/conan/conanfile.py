@@ -56,7 +56,8 @@ class DSParkConan(ConanFile):
         # CMakeDeps loads it with the package: dspark_add_plugin() and
         # dspark_embed_editor(), rooted at the packaged headers.
         self.cpp_info.set_property(
-            "cmake_build_modules", ["include/dspark/plugin/cmake/DSParkPlugin.cmake"])
+            "cmake_build_modules",
+            [os.path.join("include", "dspark", "plugin", "cmake", "DSParkPlugin.cmake")])
 
     def package_id(self):
         self.info.clear()

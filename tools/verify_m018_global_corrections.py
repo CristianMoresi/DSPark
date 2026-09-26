@@ -41,12 +41,12 @@ PACKAGE_SOURCE_SHA512 = (
     "b50c42ffe2e375c5f6624788c61c42f77f5198471988067312481255e847bbd5"
 )
 EXPECTED_PACKAGE_HASHES = {
-    "packaging/conan/conanfile.py": "939790d0748c28f0c0d9d5cd1bfada328f3053a064737a1a65b632ea1325498b",
+    "packaging/conan/conanfile.py": "97bfaa58bc1c3ce33e1e9eacf3369dd7ddcf50bc923e5b718defeff679756fb3",
     "packaging/vcpkg/portfile.cmake": "4e1b40d0e18fad4be214bdc9039cf66bb336450bd32cab23224c6510bcf1e200",
     "packaging/vcpkg/vcpkg.json": "ad8b6771946a7a88a1105a01887f5385132163f9a09c0f8b33796a0381671571",
 }
 EXPECTED_SEMANTIC_HASHES = {
-    "packaging/conan/conanfile.py": "c8804aa53674d5609c10d58e19c028506956e00ac3256fb1e11d93d334b7f947",
+    "packaging/conan/conanfile.py": "cde80c0e9c38855fd27160b1d752fa3522a12ab801be19bf16be608771f5ef7e",
     "packaging/vcpkg/portfile.cmake": "de41508e9c91d8f09bfc42737a86d3d29f216ae3be6bf4afbccabc20893b1db7",
     "packaging/vcpkg/vcpkg.json": "8b1b26eed0ee2aaf52f56f6ab65829b79967aa8f87069b53c9e346c9baaa6539",
 }
@@ -1272,7 +1272,7 @@ def package_mutant_cases(
     add("MUT-R-CONAN-INCLUDE-DESTINATION", "uppercase", conan_path,
         replace_package_bytes(
             conan, b'"include", "dspark"', b'"include", "DSPark"',
-            expected_count=3),
+            expected_count=4),
         "PACKAGE_R_CONAN_FIELD:include_destination")
     add("MUT-R-CONAN-INCLUDE-DESTINATION", "include-root", conan_path,
         replace_package_bytes(

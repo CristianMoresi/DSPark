@@ -755,7 +755,7 @@ inline EffectSlot makeAlgorithmicReverb()
     // Type loads that preset in the processor; the read-back below then moves
     // the sliders to it. Ranges are the processor's own clamps.
     s.addChoice("Type", {"Room","Hall","Chamber","Plate","Spring","Cathedral"}, 0); // 0
-    s.addChoice("Quality", {"Full","Eco"}, 0);                   // 1 (Eco = 16-line engine, ~60% CPU)
+    s.addChoice("Quality", {"Full","Eco"}, 0);                   // 1 (Eco = 16-line engine, ~55% CPU)
     s.addSlider("Mix", 0, 1, 0, "");                             // 2 - default 0 = dry only
     s.addSlider("Decay", 0.1f, 30, 0.5f, "s", true);             // 3 (mid-band T60)
     s.addSlider("Size", 0.01f, 1, 0.22f, "");                    // 4 (glides: automatable)

@@ -3325,7 +3325,8 @@ DSPARK_TEST(AlgoReverb_left_source_stays_left_in_the_early_field)
 {
     // True stereo: a left-only impulse must produce a left-weighted early
     // field (the old engine summed the input to mono: 0.5 dB, i.e. no
-    // image). Measured 5.4-9.7 dB over the first 50 ms.
+    // image). Measured 3.5-6.0 dB over the first 50 ms, now that every
+    // reflection also reaches the far side (as it reaches the far ear).
     for (const auto type : { ARevF::Type::Room, ARevF::Type::Hall,
                              ARevF::Type::Chamber, ARevF::Type::Cathedral })
     {
@@ -3569,6 +3570,84 @@ DSPARK_TEST(AlgoReverb_late_bass_is_coherent_between_channels)
     };
     EXPECT_GT(corr(true), 0.8);
     EXPECT_LT(std::abs(corr(false)), 0.2);
+}
+
+DSPARK_TEST(AlgoReverb_stereo_image_matches_a_measured_hall_seat)
+{
+    // Dummy-head impulse responses of the Detmold Konzerthaus (35 seats,
+    // sources across the stage), direct sound removed, give: early
+    // interaural cross-correlation (IACC over 0-80 ms, mean of the 500 Hz,
+    // 1 kHz and 2 kHz octaves) 0.22-0.42; late interaural coherence 0.84-0.96
+    // at 125 Hz and 0.06-0.24 at 500 Hz; for a source on the left the
+    // left ear leads the early field by 0.15-0.40 ms. The Hall preset gave
+    // IACC 0.13 with a lead of 0.56 ms (each early reflection reached one
+    // side only) and a late coherence of 0.80 at 125 Hz, 0.24 at 500 Hz;
+    // with every reflection reaching both sides (ITD, head shadow) and the
+    // measured coherence curve: 0.26-0.33, 0.27 ms, 0.92-0.94 and 0.14-0.20.
+    const auto band = [](const std::vector<float>& x, double fc) {
+        Biquad<float, 1> f1, f2;
+        const auto c = BiquadCoeffs::makeBandPass(48000.0, fc, 1.4);
+        f1.setCoeffsNow(c);
+        f2.setCoeffsNow(c);
+        std::vector<double> y(x.size());
+        for (size_t i = 0; i < x.size(); ++i) y[i] = f2.processSample(f1.processSample(x[i], 0), 0);
+        return y;
+    };
+    // Peak |normalised cross-correlation| within +-1 ms over [a, b); lagOut
+    // > 0 when the left channel leads.
+    const auto iacc = [](const std::vector<double>& l, const std::vector<double>& r, int a, int b, int* lagOut) {
+        double el = 0.0, er = 0.0;
+        for (int i = a; i < b; ++i) { el += l[static_cast<size_t>(i)] * l[static_cast<size_t>(i)]; er += r[static_cast<size_t>(i)] * r[static_cast<size_t>(i)]; }
+        double best = 0.0;
+        int bestLag = 0;
+        for (int lag = -48; lag <= 48; ++lag)
+        {
+            double s = 0.0;
+            for (int i = a; i < b; ++i) s += l[static_cast<size_t>(i)] * r[static_cast<size_t>(i + lag)];
+            s /= std::sqrt(el * er + 1e-30);
+            if (std::abs(s) > std::abs(best)) { best = s; bestLag = lag; }
+        }
+        if (lagOut) *lagOut = bestLag;
+        return std::abs(best);
+    };
+    for (int leftOnly = 0; leftOnly < 2; ++leftOnly)
+    {
+        ARevF rev;
+        rev.prepare(spec(48000.0, 256, 2));
+        rev.setType(ARevF::Type::Hall);
+        rev.setMix(1.0f);
+        {
+            auto w = makeBuffer(2, 64);
+            rev.processBlock(w.view());
+        }
+        std::vector<float> right;
+        const auto left = algoReverbIR(rev, 48000.0, 1.0, leftOnly == 1, &right);
+        int on = 0;
+        while (std::abs(left[static_cast<size_t>(on)]) + std::abs(right[static_cast<size_t>(on)]) <= 1e-4f) ++on;
+        const int early = on + 3840, late = on + 19200;   // 80 ms, 400 ms
+        double iaccE = 0.0;
+        for (const double fc : { 500.0, 1000.0, 2000.0 })
+            iaccE += iacc(band(left, fc), band(right, fc), on, early, nullptr) / 3.0;
+        EXPECT_GT(iaccE, 0.2);
+        EXPECT_LT(iaccE, 0.5);
+        EXPECT_GT(iacc(band(left, 125.0), band(right, 125.0), early, late, nullptr), 0.88);
+        EXPECT_LT(iacc(band(left, 500.0), band(right, 500.0), early, late, nullptr), 0.3);
+        if (leftOnly == 1)
+        {
+            const std::vector<double> l(left.begin(), left.end()), r(right.begin(), right.end());
+            int lag = 0;
+            iacc(l, r, on, early, &lag);
+            EXPECT_GT(lag, 4);    // at least 0.1 ms
+            EXPECT_LT(lag, 21);   // at most 0.42 ms
+            double eL = 0.0, eR = 0.0;
+            for (int i = on; i < early; ++i)
+            {
+                eL += static_cast<double>(left[static_cast<size_t>(i)]) * left[static_cast<size_t>(i)];
+                eR += static_cast<double>(right[static_cast<size_t>(i)]) * right[static_cast<size_t>(i)];
+            }
+            EXPECT_GT(10.0 * std::log10(eL / eR), 0.5);
+        }
+    }
 }
 
 DSPARK_TEST(AlgoReverb_echo_density_builds_like_a_room_in_both_qualities)

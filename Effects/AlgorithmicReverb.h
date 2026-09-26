@@ -14,10 +14,11 @@
  *   |                               |
  * [Pre-delay]                     [Pre-delay]
  *   |                               |
- *   +--> [Early reflections: velvet-noise taps per side, density rising
- *   |     with time; the first few discrete (raw input), the rest from the
- *   |     diffused feed; ipsilateral early, diffuse later; grouped air/wall
- *   |     absorption]
+ *   +--> [Early reflections: 64 velvet-noise reflections per input, density
+ *   |     rising with time; the first few discrete (raw input), the rest
+ *   |     from the diffused feed; each reaches both outputs with the time
+ *   |     and level differences of its direction (ITD, head shadow);
+ *   |     grouped air/wall absorption]
  *   |
  * [Input diffusion: 4 allpass]    [Input diffusion: 4 allpass, other delays]
  *   |                               |
@@ -37,15 +38,25 @@
  *   |    [Output: orthogonal L/R sign sums of the taps -> 2 allpass
  *   |     diffusers per side -> coherent low band -> width]
  *   v
- * [Early + late] -> [DC block] -> [Tone EQ] -> DryWetMixer -> Output
+ * [Early + late] -> [20 Hz high-pass] -> [Tone EQ] -> DryWetMixer -> Output
  * ```
  * Type::Spring replaces the FDN with twelve spring tanks (see runSprings()).
  *
  * Design notes:
- * - **True stereo.** Each input channel has its own pre-delay, diffusion and
- *   early reflections, so a left source stays on the left in the early field
- *   while the late tail becomes diffuse (early taps start lateralised and
- *   blend toward equal L/R as they get later, like a real room).
+ * - **True stereo, like a listener's ears.** Each input channel is a
+ *   source with its own pre-delay, diffusion and early reflections. Every
+ *   reflection arrives from a direction and reaches both outputs as it
+ *   reaches both ears: the far side later (Woodworth ITD, up to 0.66 ms),
+ *   quieter and, beyond 17 degrees, duller (head shadow). The floor and
+ *   ceiling reflections share the source's direction (30 degrees for a
+ *   hard-panned input), the next ones come mostly from its side of the
+ *   room, the later ones from everywhere. Measured against dummy-head
+ *   responses of the Detmold Konzerthaus (35 seats, sources across the
+ *   stage, direct sound removed), the early field matches the hall's:
+ *   interaural cross-correlation 0.25-0.35 (hall 0.22-0.42), and for a
+ *   source on the left the left side leads by 0.27 ms (hall 0.15-0.40)
+ *   and is 2-3 dB louder over 80 ms (hall 0.7-4.9 dB), while the late
+ *   tail is centred.
  * - **Realistic early field.** The early reflections are a velvet-noise
  *   sequence (Valimaki et al.): sparse +-1 taps whose density rises with
  *   time, like a room's echo density, spectrally flat and free of the
@@ -86,11 +97,14 @@
  *     through a line leaves attenuated by its own decay: the tail decays
  *     exponentially from its first echoes instead of holding a plateau
  *     for one round trip.
- * - **Natural stereo bass.** A diffuse field is coherent between the ears
- *   at low frequencies. The late tail's side signal is high-passed (2nd
- *   order at 220 Hz), so its L/R correlation is 0.98 below 100 Hz, about
- *   0.35 at 250-500 Hz and 0 above 1 kHz: no phasey low end, full width on
- *   top.
+ * - **Measured interaural coherence.** A diffuse field is coherent between
+ *   the ears at low frequencies and incoherent above about 500 Hz. The late
+ *   tail's side signal is high-passed (2nd order, 355 Hz, Q 0.74, fitted
+ *   to the Konzerthaus seats), so its L/R coherence is 1.0 at 63 Hz, 0.95
+ *   at 125 Hz, 0.55-0.7 at 250 Hz and about 0.1 from 500 Hz up (hall:
+ *   0.97, 0.92, 0.54-0.79, 0.07-0.24): no phasey low end, full width on
+ *   top. Below 20 Hz, where no room rings, a high-pass removes what is
+ *   left.
  * - **Transparent modulation.** Each line's length wanders with its own
  *   smooth random LFO (Lexicon style), updated at control rate with a
  *   per-sample linear ramp and read through a first-order allpass
@@ -116,10 +130,10 @@
  *   64-sample chunks as SIMD multiply-adds on contiguous memory; the
  *   per-line arithmetic runs in SIMD around the scalar delay-line reads,
  *   and the delay lines are padded so their streams do not collide in the
- *   cache. A stereo hall costs about 2% of one core at 48 kHz.
- * - **Eco quality** (setQuality): 16 lines, 40 early taps per side and one
+ *   cache. A stereo hall costs about 2.5% of one core at 48 kHz.
+ * - **Eco quality** (setQuality): 16 lines, 24 early reflections per input and one
  *   spring per side, with the same decay calibration and loudness (within
- *   0.5 dB), at about 60% of the CPU.
+ *   0.5 dB), at about 55% of the CPU.
  *
  * Threading: prepare() belongs to the setup thread (allocates). processBlock(),
  * processSample() and reset() belong to the audio thread. All setters are
@@ -276,9 +290,17 @@ public:
             }
         }
 
-        const T srT = static_cast<T>(sr);
-        dcR_ = T(1) - T(6.283185307179586) * T(kDcCutHz) / srT;
-        cohCoeff_ = static_cast<T>(1.0 - std::exp(-6.283185307179586 * kCoherenceHz / sr));
+        {
+            const auto c = BiquadCoeffs::makeHighPass(sr, kSubsonicHz);
+            subC_ = { static_cast<T>(c.b0), static_cast<T>(c.b1), static_cast<T>(c.b2),
+                      static_cast<T>(c.a1), static_cast<T>(c.a2) };
+        }
+        {
+            const auto c = BiquadCoeffs::makeHighPass(sr, std::min(kCoherenceHz, 0.45 * sr), kCoherenceQ);
+            cohC_ = { static_cast<T>(c.b0), static_cast<T>(c.b1), static_cast<T>(c.b2),
+                      static_cast<T>(c.a1), static_cast<T>(c.a2) };
+        }
+        shadowCoeff_ = static_cast<T>(1.0 - std::exp(-6.283185307179586 * kShadowHz / sr));
         maxReadPos_ = static_cast<T>(maxLine - 2);
 
         eco_ = quality_.load(std::memory_order_relaxed) == Quality::Eco;
@@ -386,11 +408,12 @@ public:
             for (auto& ap : inAP_[c]) ap.clear();
             for (auto& ap : outAP_[c]) ap.clear();
             erLP_[c].fill(T(0));
-            dcX1_[c] = dcY1_[c] = T(0);
+            erShadowLP_[c].fill(T(0));
+            subZ_[c].fill(T(0));
         }
         lines_.clear();
         loopAP_.clear();
-        cohLP_.fill(T(0));
+        cohZ_.fill(T(0));
         std::fill(springHist_.begin(), springHist_.end(), T(0));
         springW_ = 0;
         for (auto& st : springLPState_) st.fill(T(0));
@@ -445,13 +468,13 @@ public:
      * @brief Selects the engine quality / CPU cost trade-off.
      *
      * Quality::Full (default) runs the complete engine. Quality::Eco runs
-     * at about 60% of its CPU for embedded and other constrained targets,
+     * at about 55% of its CPU for embedded and other constrained targets,
      * with the same controls, decay calibration and loudness:
      *
      * - 16 FDN lines instead of 32 (every other base delay, so the lines
      *   still span the full range; per-line decay gains keep every T60
      *   exact)
-     * - 40 early-reflection taps per side instead of 96
+     * - 24 early reflections per input instead of 64
      * - one spring per side instead of six, with a 40-stage dispersion
      *   cascade instead of 72 (a stronger coefficient keeps the chirp)
      *
@@ -809,8 +832,9 @@ protected:
     static constexpr int kMaxLines   = 32;
     static constexpr int kEcoLines   = 16;
     static constexpr int kInStages   = 4;   ///< input diffusers per channel feeding the late field (Full)
-    static constexpr int kMaxERTaps  = 96;  ///< velvet early-reflection taps per side (Full)
-    static constexpr int kEcoERTaps  = 40;
+    static constexpr int kMaxERTaps  = 128; ///< early taps per output side: 64 reflections per input (Full)
+    static constexpr int kEcoERTaps  = 48;
+    static constexpr int kShadowBins = 2;   ///< head-shadow classes of the early taps (open, shadowed)
     static constexpr int kMaxDiscreteER = 7; ///< raw (discrete) early taps at diffusion 0
     static constexpr int kERGroups   = 4;   ///< absorption groups (early -> late)
     static constexpr int kCtrl       = 16;  ///< modulation control period (samples)
@@ -822,11 +846,14 @@ protected:
     static constexpr double kMaxInjectMs   = 8.0;
     static constexpr double kMaxInDiffMs   = 2.0;
     static constexpr double kMaxLoopApMs   = 5.5;
-    static constexpr double kCoherenceHz   = 220.0; ///< late field coherent below this
+    static constexpr double kCoherenceHz   = 355.0; ///< side high-pass of the late field (2nd order, Q 0.74)
+    static constexpr double kCoherenceQ    = 0.74;
+    static constexpr double kShadowHz      = 1000.0; ///< head-shadow corner of the early taps
+    static constexpr double kShadowHF      = 0.5;    ///< high-frequency gain of a shadowed (far-ear) tap
     static constexpr double kModMaxMs      = 2.0;   ///< peak line wander at modulation 1, size 1
     static constexpr double kGlideMs       = 60.0;  ///< size-change glide time constant
     static constexpr double kMaxGlideSpeed = 0.04;  ///< max length change per sample (4% Doppler)
-    static constexpr double kDcCutHz       = 5.0;   ///< wet-output DC blocker
+    static constexpr double kSubsonicHz    = 20.0;  ///< wet-output high-pass (2nd order): no room rings below it
     static constexpr T      kMinReadPos    = T(2);
     static constexpr T      kSoftLimit     = T(2);  ///< in-loop safety limiter threshold
 
@@ -1080,11 +1107,13 @@ protected:
     // (erChan_ 0) or the other (1)
     int numERTaps_ = 0;
     Type erType_ = Type::Room;
-    std::array<std::array<int, kMaxERTaps>, 2> erTap_ {}, erChan_ {};
+    std::array<std::array<int, kMaxERTaps>, 2> erTap_ {}, erChan_ {}, erBin_ {};
     std::array<std::array<T, kMaxERTaps>, 2> erGain_ {};
     std::array<int, kERGroups + 1> erGroupStart_ {};
     std::array<T, kERGroups> erLPCoeff_ {};
     std::array<std::array<T, kERGroups>, 2> erLP_ {};
+    std::array<std::array<T, kERGroups>, 2> erShadowLP_ {};
+    T shadowCoeff_ = T(0);
 
     // FDN
     DelayBank lines_;
@@ -1127,10 +1156,10 @@ protected:
     std::array<T, kMaxLines> bassB0_ {}, bassB1_ {}, bassA1_ {}, bassX1_ {}, bassY1_ {};
 
     // Output stage
-    std::array<T, 2> cohLP_ {};            ///< states of the two side high-passes (coherent low band)
-    T cohCoeff_ = T(0);
-    std::array<T, 2> dcX1_ {}, dcY1_ {};
-    T dcR_ = T(0.999);
+    std::array<T, 2> cohZ_ {};             ///< side high-pass state (coherent low band)
+    std::array<T, 5> cohC_ {};             ///< its coefficients b0 b1 b2 a1 a2
+    std::array<std::array<T, 2>, 2> subZ_ {};   ///< subsonic high-pass states per channel
+    std::array<T, 5> subC_ {};
 
     // Tone correction EQ (Biquad 12 dB/oct)
     Biquad<T, 2> toneLPBiquad_;
@@ -1678,14 +1707,30 @@ protected:
             auto& lp = erLP_[static_cast<std::size_t>(s)];
             for (int g = 0; g < kERGroups; ++g)
             {
-                alignas(64) T acc[kChunk] = {};
+                // Each tap lands in its head-shadow class: open (the ear
+                // facing the reflection) or shadowed (the far ear).
+                alignas(64) T acc[kShadowBins][kChunk];
+                for (auto& a : acc) std::fill(a, a + count, T(0));
                 for (int k = erGroupStart_[g]; k < erGroupStart_[g + 1]; ++k)
-                    addTap(acc, *src[erChan_[s][k]], erTap_[s][k] + lagOff[erChan_[s][k]], erGain_[s][k], count);
+                    addTap(acc[erBin_[s][k]], *src[erChan_[s][k]], erTap_[s][k] + lagOff[erChan_[s][k]],
+                           erGain_[s][k], count);
+                {
+                    // The shadowed class keeps its lows, loses half its highs.
+                    constexpr T hf = static_cast<T>(kShadowHF) - T(1);
+                    T z = erShadowLP_[static_cast<std::size_t>(s)][static_cast<std::size_t>(g)];
+                    for (int n = 0; n < count; ++n)
+                    {
+                        const T x = acc[1][n];
+                        z += shadowCoeff_ * (x - z);
+                        acc[0][n] += x + hf * (x - z);
+                    }
+                    erShadowLP_[static_cast<std::size_t>(s)][static_cast<std::size_t>(g)] = z;
+                }
                 const T c = erLPCoeff_[g];
                 T y = lp[g];
                 for (int n = 0; n < count; ++n)
                 {
-                    y += c * (acc[n] - y);
+                    y += c * (acc[0][n] - y);
                     early[s][n] += y;
                 }
                 lp[g] = y;
@@ -1718,7 +1763,7 @@ protected:
     /// block, tone EQ.
     std::pair<T, T> outputStage(T lateL, T lateR, T earlyL, T earlyR) noexcept
     {
-        // --- Output: coherent low band, width, early + late, DC block, tone ---
+        // --- Output: coherent low band, width, early + late, subsonic high-pass, tone ---
         const T lateLvl = cachedParams_.lateLevel * kOutGain * lateComp_;
         lateL *= lateLvl;
         lateR *= lateLvl;
@@ -1743,14 +1788,17 @@ protected:
         }
         {
             // A diffuse field is coherent between the ears at low frequencies
-            // (the wavelength dwarfs the head): the side signal is high-passed
-            // (2 poles at kCoherenceHz), so the bass is not phasey.
+            // (the wavelength dwarfs the head) and incoherent above about
+            // 500 Hz. The side signal is high-passed (Butterworth-like at
+            // kCoherenceHz), which reproduces the interaural coherence of a
+            // measured concert hall seat: about 0.97 at 125 Hz, 0.65 at
+            // 250 Hz, under 0.1 from 500 Hz up.
             const T mid  = (lateL + lateR) * T(0.5);
             T side = (lateL - lateR) * T(0.5);
-            cohLP_[0] += cohCoeff_ * (side - cohLP_[0]);
-            const T hp1 = side - cohLP_[0];                 // first-order high-pass
-            cohLP_[1] += cohCoeff_ * (hp1 - cohLP_[1]);
-            side = (hp1 - cohLP_[1]) * cachedParams_.width;  // and a second one
+            const T hp = cohC_[0] * side + cohZ_[0];         // TDF-II biquad
+            cohZ_[0] = cohC_[1] * side - cohC_[3] * hp + cohZ_[1];
+            cohZ_[1] = cohC_[2] * side - cohC_[4] * hp;
+            side = hp * cachedParams_.width;
             lateL = mid + side;
             lateR = mid - side;
         }
@@ -1759,9 +1807,10 @@ protected:
                      earlyR * cachedParams_.earlyLevel + lateR };
         for (int c = 0; c < 2; ++c)
         {
-            const T y = out[c] - dcX1_[c] + dcR_ * dcY1_[c];
-            dcX1_[c] = out[c];
-            dcY1_[c] = y;
+            auto& z = subZ_[static_cast<std::size_t>(c)];
+            const T y = subC_[0] * out[c] + z[0];
+            z[0] = subC_[1] * out[c] - subC_[3] * y + z[1];
+            z[1] = subC_[2] * out[c] - subC_[4] * y;
             out[c] = y;
         }
         if (toneHPActive_)
@@ -1974,40 +2023,87 @@ protected:
      */
     void generateERTaps(double minMs, double maxMs, int numTaps) noexcept
     {
-        numERTaps_ = std::clamp(numTaps, 0, kMaxERTaps);
+        numERTaps_ = std::clamp(numTaps, 0, kMaxERTaps) / 2 * 2;
         for (int g = 0; g <= kERGroups; ++g)
             erGroupStart_[g] = numERTaps_ * g / kERGroups;
         if (numERTaps_ == 0) return;
 
         const double sr = spec_.sampleRate;
+        const int R = numERTaps_ / 2;   // reflections per input channel
         constexpr double p = 1.6;
         // Diffusion sets how many of the first reflections stay discrete
         // (crisp, room-like) instead of reading the diffused feed (smooth).
         const int discrete = 1 + static_cast<int>(std::lround(
             (kMaxDiscreteER - 1) * (1.0 - static_cast<double>(diffusion_.load(std::memory_order_relaxed)))));
-        for (int s = 0; s < 2; ++s)
+
+        struct Tap { double ms; int chan; int bin; double gain; };
+        std::array<std::array<Tap, kMaxERTaps>, 2> taps {};
+        std::array<int, 2> used { 0, 0 };
+        for (int c = 0; c < 2; ++c)   // input channel: a source on that side
         {
-            double energy = 0.0;
-            std::array<double, kMaxERTaps> gv {};
-            for (int k = 0; k < numERTaps_; ++k)
+            std::array<double, kMaxERTaps / 2> gv {}, msv {}, lat {};
+            double dcSum = 0.0;
+            for (int k = 0; k < R; ++k)
             {
-                const double u = (k + 0.15 + 0.7 * hash01(k, s + 20)) / numERTaps_;
+                const double u = (k + 0.15 + 0.7 * hash01(k, c + 20)) / R;
                 // Warped time in [0, 1): a floor of uniform density plus a
                 // share rising like t^(p - 1).
                 const double w = 0.3 * u + 0.7 * std::pow(u, 1.0 / p);
-                const double ms = minMs + (maxMs - minMs) * w;
-                erTap_[s][k] = std::max(1, static_cast<int>(ms * sr / 1000.0));
-                erChan_[s][k] = (hash01(k, s + 30) < 0.85 - 0.35 * w ? 0 : 1) + (k < discrete ? 2 : 0);
+                msv[k] = minMs + (maxMs - minMs) * w;
                 const double density = 1.0 / (0.3 + 0.7 / p * std::pow(std::max(u, 1e-3), 1.0 / p - 1.0));   // dk/dw
-                const double sign = k < 4 || hash01(k, s + 40) < 0.5 ? 1.0 : -1.0;
+                const double sign = k < 4 || hash01(k, c + 40) < 0.5 ? 1.0 : -1.0;
                 // Energy per unit time follows the envelope: sparse taps are
                 // individually louder.
                 gv[k] = sign * std::exp(-1.6 * w) / std::sqrt(density);
-                energy += gv[k] * gv[k];
+                if (k >= discrete) dcSum += gv[k];
+                // Arrival direction as the lateral coordinate (sine of the
+                // lateral angle, uniform over a diffuse field), positive
+                // toward the source's side: the first two (floor and
+                // ceiling) share the source's own direction (30 degrees, a
+                // hard-panned input), the next come mostly from the source's
+                // side of the room, the later ones from everywhere.
+                const double side = hash01(k, c + 50) < 0.92 - 0.42 * w ? 1.0 : -1.0;
+                lat[k] = k < 2 ? 0.5 : side * (0.25 + 0.75 * hash01(k, c + 60));
             }
-            const double norm = std::sqrt(static_cast<double>(kErEnergy) / energy);
-            for (int k = 0; k < numERTaps_; ++k)
-                erGain_[s][k] = static_cast<T>(gv[k] * norm);
+            // No DC: the early field's low end is left to the (coherent) late
+            // field, and the output high-pass never has to drain a step.
+            if (R > discrete)
+                for (int k = discrete; k < R; ++k) gv[k] -= dcSum / (R - discrete);
+            double energy = 0.0;
+            for (int k = 0; k < R; ++k) energy += gv[k] * gv[k];
+            // Half the early energy per input, so a mono source keeps it.
+            const double norm = std::sqrt(0.5 * static_cast<double>(kErEnergy) / energy);
+
+            // Every reflection reaches both outputs like both ears: the far
+            // one later (Woodworth ITD, up to 0.66 ms), quieter (up to
+            // -6 dB) and, beyond a lateral angle of 17 degrees, duller (half
+            // its highs); the near one up to 1.6 dB louder.
+            for (int e = 0; e < 2; ++e)
+            {
+                for (int k = 0; k < R; ++k)
+                {
+                    const double x = e == c ? lat[k] : -lat[k];   // toward this ear
+                    const double phi = std::asin(std::min(1.0, std::abs(x)));
+                    const double itdMs = x < 0.0 ? 1000.0 * 0.0875 / 343.0 * (phi + std::sin(phi)) : 0.0;
+                    const int bin = x < -0.3 ? 1 : 0;
+                    const double ild = x > 0.0 ? 1.0 + 0.2 * x : 1.0 + 0.5 * x;
+                    taps[e][used[e]++] = { msv[k] + itdMs, (e == c ? 0 : 1) + (k < discrete ? 2 : 0),
+                                           bin, gv[k] * norm * ild };
+                }
+            }
+        }
+        for (int e = 0; e < 2; ++e)
+        {
+            // Time order, so the absorption groups run from early to late.
+            std::sort(taps[e].begin(), taps[e].begin() + used[e],
+                      [](const Tap& a, const Tap& b) { return a.ms < b.ms; });
+            for (int k = 0; k < used[e]; ++k)
+            {
+                erTap_[e][k] = std::max(1, static_cast<int>(taps[e][k].ms * sr / 1000.0));
+                erChan_[e][k] = taps[e][k].chan;
+                erBin_[e][k] = taps[e][k].bin;
+                erGain_[e][k] = static_cast<T>(taps[e][k].gain);
+            }
         }
 
         static constexpr double kGroupCutHz[kERGroups] = { 14000.0, 9000.0, 5500.0, 3200.0 };

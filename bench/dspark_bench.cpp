@@ -102,7 +102,7 @@ int main()
     {
         printRow("memcpy baseline", medianNsPerFrame([&] {
             fill();
-            g_sink += stereo.getChannel(0)[0];
+            g_sink = g_sink + (stereo.getChannel(0)[0]);
         }, kBlock));
     }
     {
@@ -113,7 +113,7 @@ int main()
         printRow("Biquad low-pass (mono)", medianNsPerFrame([&] {
             std::memcpy(mono.getChannel(0), src.data.data(), kBlock * sizeof(float));
             bq.processBlock(mono.toView());
-            g_sink += mono.getChannel(0)[0];
+            g_sink = g_sink + (mono.getChannel(0)[0]);
         }, kBlock));
     }
     {
@@ -129,7 +129,7 @@ int main()
         printRow("FIRFilter 63-tap LP (mono)", medianNsPerFrame([&] {
             std::memcpy(mono.getChannel(0), src.data.data(), kBlock * sizeof(float));
             fir.processBlock(mono.toView());
-            g_sink += mono.getChannel(0)[0];
+            g_sink = g_sink + (mono.getChannel(0)[0]);
         }, kBlock));
     }
     {
@@ -142,7 +142,7 @@ int main()
         printRow("FFTReal 2048 fwd+inv (mono)", medianNsPerFrame([&] {
             fft.forward(td.data(), fd.data());
             fft.inverse(fd.data(), td.data());
-            g_sink += td[0];
+            g_sink = g_sink + (td[0]);
         }, 2048));
     }
     {
@@ -152,7 +152,7 @@ int main()
         printRow("FilterEngine LP 24 dB/oct", medianNsPerFrame([&] {
             fill();
             fe.processBlock(stereo.toView());
-            g_sink += stereo.getChannel(0)[0];
+            g_sink = g_sink + (stereo.getChannel(0)[0]);
         }, kBlock));
     }
     {
@@ -165,7 +165,7 @@ int main()
         printRow("Equalizer 4 bands", medianNsPerFrame([&] {
             fill();
             eq.processBlock(stereo.toView());
-            g_sink += stereo.getChannel(0)[0];
+            g_sink = g_sink + (stereo.getChannel(0)[0]);
         }, kBlock));
     }
     {
@@ -176,7 +176,7 @@ int main()
         printRow("Compressor", medianNsPerFrame([&] {
             fill();
             comp.processBlock(stereo.toView());
-            g_sink += stereo.getChannel(0)[0];
+            g_sink = g_sink + (stereo.getChannel(0)[0]);
         }, kBlock));
     }
     {
@@ -185,7 +185,7 @@ int main()
         printRow("AlgorithmicReverb", medianNsPerFrame([&] {
             fill();
             rev.processBlock(stereo.toView());
-            g_sink += stereo.getChannel(0)[0];
+            g_sink = g_sink + (stereo.getChannel(0)[0]);
         }, kBlock));
     }
     {
@@ -195,7 +195,7 @@ int main()
             fill();
             (void)os.upsample(stereo.toView());
             os.downsample(stereo.toView());
-            g_sink += stereo.getChannel(0)[0];
+            g_sink = g_sink + (stereo.getChannel(0)[0]);
         }, kBlock));
     }
     for (const int irLen : { 4800, 48000 })
@@ -213,7 +213,7 @@ int main()
         printRow(name, medianNsPerFrame([&] {
             std::memcpy(mono.getChannel(0), src.data.data(), kBlock * sizeof(float));
             conv.processInPlace(mono.getChannel(0), kBlock);
-            g_sink += mono.getChannel(0)[0];
+            g_sink = g_sink + (mono.getChannel(0)[0]);
         }, kBlock));
     }
     {
@@ -224,7 +224,7 @@ int main()
             in[i] = std::sin(2.0 * kPiBench * 1000.0 * static_cast<double>(i) / 44100.0);
         printRow("Resampler 44.1->48 High (mono, dbl)", medianNsPerFrame([&] {
             auto out = rs.process(in.data(), static_cast<int>(in.size()));
-            g_sink += out.empty() ? 0.0 : out[0];
+            g_sink = g_sink + (out.empty() ? 0.0 : out[0]);
         }, 48000.0));
     }
     {
@@ -252,7 +252,7 @@ int main()
             printRow(correctorCase.name, medianNsPerFrame([&] {
                 fill();
                 corrector.processBlock(stereo.toView());
-                g_sink += stereo.getChannel(0)[0];
+                g_sink = g_sink + (stereo.getChannel(0)[0]);
             }, kBlock));
         }
     }
@@ -287,7 +287,7 @@ int main()
             printRow(freezeCase.name, medianNsPerFrame([&] {
                 fill();
                 freeze.processBlock(stereo.toView());
-                g_sink += stereo.getChannel(0)[0];
+                g_sink = g_sink + (stereo.getChannel(0)[0]);
             }, kBlock));
         }
     }
@@ -332,7 +332,7 @@ int main()
         const double nsPerPair = medianNsPerFrame([&] {
             const auto result = finder.find(view, startRange, endRange,
                                             24576, 40960, settings);
-            g_sink += static_cast<double>(result.seamCost);
+            g_sink = g_sink + (static_cast<double>(result.seamCost));
         }, pairsPerCall);
         std::printf("| candidate pairs scored per second    | %.0f |\n",
                     1e9 / nsPerPair);
@@ -351,7 +351,7 @@ int main()
         {
             const double nsPerSample = medianNsPerFrame([&] {
                 (void)dspark::LoopFinder<float>::renderLoop(view, loop, output);
-                g_sink += rendered[0][0];
+                g_sink = g_sink + (rendered[0][0]);
             }, static_cast<double>(rendered[0].size()));
             std::printf("| seam render Msample/s (per channel)  | %.1f |\n",
                         1000.0 / nsPerSample);
@@ -373,7 +373,7 @@ int main()
         const double nsPerPair = medianNsPerFrame([&] {
             fft.forward(t.data(), f.data());
             fft.inverse(f.data(), t.data());
-            g_sink += t[0];
+            g_sink = g_sink + (t[0]);
         }, 1.0);
         std::printf("| FFTReal %-22d | %9.2f | %9.0f |\n", size, nsPerPair / 1000.0, 1e9 / nsPerPair);
     }

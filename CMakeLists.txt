@@ -1,8 +1,9 @@
 # DSPark - header-only audio DSP framework (C++20, zero dependencies)
 #
 # Consumption:
-#   add_subdirectory(DSPark)            # or FetchContent
+#   add_subdirectory(DSPark)            # or FetchContent / find_package(dspark)
 #   target_link_libraries(app PRIVATE dspark::dspark)
+#   dspark_add_plugin(MyPlugin SOURCES myplugin.cpp FORMATS VST3 CLAP AU ...)
 #
 # Options:
 #   DSPARK_BUILD_CONFORMANCE  Build the public conformance suite (default: ON
@@ -20,6 +21,11 @@ target_compile_features(dspark INTERFACE cxx_std_20)
 target_include_directories(dspark INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:include/dspark>)
+
+# dspark_add_plugin() / dspark_embed_editor(): plugin bundles in one call
+# (see docs/plugins.md). Functions are global, so the parent project can
+# call them straight after add_subdirectory()/FetchContent.
+include("${CMAKE_CURRENT_SOURCE_DIR}/plugin/cmake/DSParkPlugin.cmake")
 
 # ------------------------------------------------------------------------------
 # Public conformance suite
@@ -90,6 +96,12 @@ install(DIRECTORY Core Effects Analysis IO Music
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dspark
         FILES_MATCHING PATTERN "*.h")
 install(FILES DSPark.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dspark)
+# The plugin layer: format wrappers, the vendored format SDK headers with
+# their licenses, the WebView editor, and the CMake helper the package
+# config loads (it finds the headers two levels above itself).
+install(DIRECTORY plugin
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dspark
+        FILES_MATCHING PATTERN "*.h" PATTERN "*.cmake" PATTERN "LICENSE*")
 install(TARGETS dspark EXPORT dsparkTargets)
 install(EXPORT dsparkTargets
         NAMESPACE dspark::
@@ -98,9 +110,11 @@ install(EXPORT dsparkTargets
 # Package config, so find_package(dspark CONFIG) works from any install or
 # package manager (vcpkg/Conan). ARCH_INDEPENDENT: header-only.
 include(CMakePackageConfigHelpers)
+set(DSPARK_INSTALL_PLUGIN_CMAKE_DIR "${CMAKE_INSTALL_INCLUDEDIR}/dspark/plugin/cmake")
 configure_package_config_file(cmake/dsparkConfig.cmake.in
     "${CMAKE_CURRENT_BINARY_DIR}/dsparkConfig.cmake"
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dspark)
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dspark
+    PATH_VARS DSPARK_INSTALL_PLUGIN_CMAKE_DIR)
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/dsparkConfigVersion.cmake"
     VERSION ${PROJECT_VERSION}

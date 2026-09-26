@@ -2,4 +2,8 @@
 
 include("${CMAKE_CURRENT_LIST_DIR}/dsparkTargets.cmake")
 
+# dspark_add_plugin() / dspark_embed_editor(), rooted at the installed headers.
+set_and_check(_dspark_plugin_cmake_dir "@PACKAGE_DSPARK_INSTALL_PLUGIN_CMAKE_DIR@")
+include("${_dspark_plugin_cmake_dir}/DSParkPlugin.cmake")
+
 check_required_components(dspark)

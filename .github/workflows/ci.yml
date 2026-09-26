@@ -103,6 +103,46 @@ jobs:
         shell: bash
         run: ./dspark_conformance*
 
+      # The standalone examples and the benchmark harness are documentation
+      # users copy from: they must keep compiling warning-free on every
+      # compiler here, not only under the Linux GCC "Examples + bench" job.
+      - name: Build + run the standalone examples, build the benchmark (MSVC)
+        if: matrix.compiler == 'msvc'
+        shell: cmd
+        run: |
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . examples\wav_process.cpp /Fe:wav_process.exe || exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . examples\channel_strip.cpp /Fe:channel_strip.exe || exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . examples\pitch_tracking_eq.cpp /Fe:pitch_tracking_eq.exe || exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . bench\dspark_bench.cpp /Fe:dspark_bench.exe || exit /b 1
+          channel_strip.exe || exit /b 1
+          pitch_tracking_eq.exe > nul || exit /b 1
+
+      - name: Build + run the standalone examples, build the benchmark (GCC/Clang)
+        if: matrix.compiler != 'msvc'
+        run: |
+          for example in wav_process channel_strip pitch_tracking_eq; do
+            ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . \
+              examples/$example.cpp -o $example
+          done
+          ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . \
+            bench/dspark_bench.cpp -o dspark_bench
+          ./channel_strip
+          ./pitch_tracking_eq > /dev/null
+
+      # The installed package must carry the plugin layer: find_package(dspark)
+      # then builds an app AND a plugin through dspark_add_plugin().
+      - name: Install the package + build a find_package consumer (app + plugin)
+        if: matrix.name == 'Linux GCC x64' || matrix.name == 'macOS Clang arm64'
+        run: |
+          cmake -S . -B build_install -DDSPARK_BUILD_TESTS=OFF -DDSPARK_BUILD_CONFORMANCE=OFF \
+                -DCMAKE_INSTALL_PREFIX="$PWD/dspark_prefix"
+          cmake --install build_install
+          cmake -S tests/package_consumer -B build_consumer -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_PREFIX_PATH="$PWD/dspark_prefix" \
+                -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          cmake --build build_consumer
+          ./build_consumer/consumer_app
+
       # Default x64 builds stay on the SSE2 baseline, so the AVX2/FMA kernel
       # paths would never execute in CI without a second pass. All GitHub
       # hosted x64 runners provide AVX2.

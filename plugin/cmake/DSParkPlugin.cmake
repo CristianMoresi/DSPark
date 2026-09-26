@@ -7,6 +7,8 @@
 #       EDITOR_HTML     ui/editor.html      # optional: WebView editor page
 #       AU_SUBTYPE      Subt                # required with AU: unique 4-char
 #       AU_MANUFACTURER Manu                # required with AU: unique 4-char
+#       VERSION         1.2.0               # optional: bundle + AU version
+#       BUNDLE_ID       com.acme.saturator  # optional: macOS bundle identifier
 #   )
 #
 # Produces the platform-correct bundle layouts:
@@ -22,12 +24,19 @@
 #   #include "<Target>_editor_html.h"        // defines kDsparkEditorHtml
 #   static const char* editorHtml() { return kDsparkEditorHtml; }
 #
-# DSPARK_DIR defaults to the directory two levels above this file.
+# DSPARK_DIR (the directory holding DSPark.h) defaults to two levels above
+# this file - right for the source tree and for an installed package alike.
+# Available after include() of this file, add_subdirectory()/FetchContent of
+# DSPark, or find_package(dspark).
 
 if(NOT DEFINED DSPARK_DIR)
     get_filename_component(DSPARK_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 endif()
-set(_DSPARK_EMBED_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/DSParkEmbedEditor.cmake")
+# Global properties, not variables: the functions below run in the CALLER's
+# scope, which never sees variables set in DSPark's own directory scope.
+set_property(GLOBAL PROPERTY DSPARK_PLUGIN_ROOT "${DSPARK_DIR}")
+set_property(GLOBAL PROPERTY DSPARK_EMBED_SCRIPT
+             "${CMAKE_CURRENT_LIST_DIR}/DSParkEmbedEditor.cmake")
 
 # -- dspark_embed_editor ----------------------------------------------------------
 #
@@ -71,12 +80,13 @@ function(dspark_embed_editor TARGET)
         endif()
     endforeach()
 
+    get_property(embed_script GLOBAL PROPERTY DSPARK_EMBED_SCRIPT)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/${EMB_HEADER}")
     add_custom_command(OUTPUT "${header}"
         COMMAND ${CMAKE_COMMAND}
             -DINPUT=${page} -DOUTPUT=${header} -DVARIABLE=${EMB_VARIABLE}
-            -P "${_DSPARK_EMBED_SCRIPT}"
-        DEPENDS "${page}" ${assets} "${_DSPARK_EMBED_SCRIPT}"
+            -P "${embed_script}"
+        DEPENDS "${page}" ${assets} "${embed_script}"
         COMMENT "dspark_embed_editor: ${EMB_HEADER}")
     target_sources(${TARGET} PRIVATE "${header}")
     target_include_directories(${TARGET} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -86,13 +96,38 @@ endfunction()
 
 function(dspark_add_plugin TARGET)
     cmake_parse_arguments(ARG ""
-        "EDITOR_HTML;AU_TYPE;AU_SUBTYPE;AU_MANUFACTURER;AU_NAME"
+        "EDITOR_HTML;AU_TYPE;AU_SUBTYPE;AU_MANUFACTURER;AU_NAME;VERSION;BUNDLE_ID"
         "SOURCES;FORMATS" ${ARGN})
     if(NOT ARG_SOURCES)
         message(FATAL_ERROR "dspark_add_plugin(${TARGET}): SOURCES is required")
     endif()
     if(NOT ARG_FORMATS)
         set(ARG_FORMATS VST3)
+    endif()
+    get_property(dspark_root GLOBAL PROPERTY DSPARK_PLUGIN_ROOT)
+
+    # Bundle metadata: VERSION feeds every Info.plist and the AU component
+    # version (major << 16 | minor << 8 | patch); BUNDLE_ID should be YOUR
+    # reverse-domain identifier (the default is only a placeholder).
+    if(NOT ARG_VERSION)
+        set(ARG_VERSION "1.0.0")
+    endif()
+    if(NOT ARG_VERSION MATCHES "^([0-9]+)(\\.([0-9]+))?(\\.([0-9]+))?$")
+        message(FATAL_ERROR "dspark_add_plugin(${TARGET}): VERSION must be "
+                            "MAJOR[.MINOR[.PATCH]], got '${ARG_VERSION}'")
+    endif()
+    set(v_major "${CMAKE_MATCH_1}")
+    set(v_minor "${CMAKE_MATCH_3}")
+    set(v_patch "${CMAKE_MATCH_5}")
+    if(v_minor STREQUAL "")
+        set(v_minor 0)
+    endif()
+    if(v_patch STREQUAL "")
+        set(v_patch 0)
+    endif()
+    math(EXPR au_version "(${v_major} << 16) | (${v_minor} << 8) | ${v_patch}")
+    if(NOT ARG_BUNDLE_ID)
+        set(ARG_BUNDLE_ID "com.dspark.${TARGET}")
     endif()
 
     set(want_clap FALSE)
@@ -109,7 +144,7 @@ function(dspark_add_plugin TARGET)
     endforeach()
 
     add_library(${TARGET} MODULE ${ARG_SOURCES})
-    target_include_directories(${TARGET} PRIVATE "${DSPARK_DIR}")
+    target_include_directories(${TARGET} PRIVATE "${dspark_root}")
     target_compile_features(${TARGET} PRIVATE cxx_std_20)
     set_target_properties(${TARGET} PROPERTIES
         PREFIX ""
@@ -150,13 +185,22 @@ function(dspark_add_plugin TARGET)
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
 <plist version=\"1.0\"><dict>
   <key>CFBundleExecutable</key><string>${TARGET}</string>
-  <key>CFBundleIdentifier</key><string>com.dspark.${TARGET}</string>
+  <key>CFBundleIdentifier</key><string>${ARG_BUNDLE_ID}</string>
   <key>CFBundleName</key><string>${TARGET}</string>
   <key>CFBundlePackageType</key><string>BNDL</string>
-  <key>CFBundleVersion</key><string>1.0.0</string>
+  <key>CFBundleVersion</key><string>${ARG_VERSION}</string>
+  <key>CFBundleShortVersionString</key><string>${ARG_VERSION}</string>
 </dict></plist>
 ")
+        # Seal the bundle like the CLAP and AU ones below (ad-hoc signature;
+        # release signing + notarisation remain a distribution step).
+        add_custom_command(TARGET ${TARGET} POST_BUILD
+            COMMAND codesign --force -s - "${CMAKE_BINARY_DIR}/${TARGET}.vst3"
+            COMMENT "dspark_add_plugin: ${TARGET}.vst3 (ad-hoc codesign)")
     else()
+        # The Linux WebView editor resolves WebKitGTK through dlopen (a
+        # separate libdl before glibc 2.34; empty where it is built in).
+        target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS})
         string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" arch_lower)
         if(arch_lower MATCHES "aarch64|arm64")
             set(arch_dir "aarch64-linux")
@@ -180,10 +224,11 @@ function(dspark_add_plugin TARGET)
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
 <plist version=\"1.0\"><dict>
   <key>CFBundleExecutable</key><string>${TARGET}</string>
-  <key>CFBundleIdentifier</key><string>com.dspark.${TARGET}.clap</string>
+  <key>CFBundleIdentifier</key><string>${ARG_BUNDLE_ID}.clap</string>
   <key>CFBundleName</key><string>${TARGET}</string>
   <key>CFBundlePackageType</key><string>BNDL</string>
-  <key>CFBundleVersion</key><string>1.0.0</string>
+  <key>CFBundleVersion</key><string>${ARG_VERSION}</string>
+  <key>CFBundleShortVersionString</key><string>${ARG_VERSION}</string>
 </dict></plist>
 ")
             add_custom_command(TARGET ${TARGET} POST_BUILD
@@ -228,15 +273,15 @@ function(dspark_add_plugin TARGET)
   <key>CFBundleExecutable</key>
   <string>${TARGET}</string>
   <key>CFBundleIdentifier</key>
-  <string>com.dspark.${TARGET}.au</string>
+  <string>${ARG_BUNDLE_ID}.au</string>
   <key>CFBundleName</key>
   <string>${TARGET}</string>
   <key>CFBundlePackageType</key>
   <string>BNDL</string>
   <key>CFBundleVersion</key>
-  <string>1.0.0</string>
+  <string>${ARG_VERSION}</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0.0</string>
+  <string>${ARG_VERSION}</string>
   <key>AudioComponents</key>
   <array>
     <dict>
@@ -253,7 +298,7 @@ function(dspark_add_plugin TARGET)
       <key>type</key>
       <string>${ARG_AU_TYPE}</string>
       <key>version</key>
-      <integer>65536</integer>
+      <integer>${au_version}</integer>
     </dict>
   </array>
 </dict>

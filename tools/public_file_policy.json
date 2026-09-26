@@ -20,9 +20,9 @@
   },
   "counts": {
     "binary_exact": 184,
-    "first_party_ascii_text": 216,
+    "first_party_ascii_text": 219,
     "third_party_utf8_exact": 84,
-    "total": 484
+    "total": 487
   },
   "gitattributes_required_lines": [
     "* text=auto",
@@ -2150,6 +2150,18 @@
     {
       "kind": "first_party_ascii_text",
       "path": "tests/main.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/package_consumer/CMakeLists.txt"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/package_consumer/app.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/package_consumer/plugin.cpp"
     },
     {
       "kind": "first_party_ascii_text",

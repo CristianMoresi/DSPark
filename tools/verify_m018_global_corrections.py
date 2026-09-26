@@ -46,7 +46,7 @@ EXPECTED_PACKAGE_HASHES = {
     "packaging/vcpkg/vcpkg.json": "ad8b6771946a7a88a1105a01887f5385132163f9a09c0f8b33796a0381671571",
 }
 EXPECTED_SEMANTIC_HASHES = {
-    "packaging/conan/conanfile.py": "cde80c0e9c38855fd27160b1d752fa3522a12ab801be19bf16be608771f5ef7e",
+    "packaging/conan/conanfile.py": "34fe13938de0a86ebeb79d9484cf8939d671af61e435722e76d350910b6ca20f",
     "packaging/vcpkg/portfile.cmake": "de41508e9c91d8f09bfc42737a86d3d29f216ae3be6bf4afbccabc20893b1db7",
     "packaging/vcpkg/vcpkg.json": "8b1b26eed0ee2aaf52f56f6ab65829b79967aa8f87069b53c9e346c9baaa6539",
 }
@@ -198,7 +198,10 @@ def conan_semantics(data: bytes) -> bytes:
     options = {"annotate_fields": True, "include_attributes": False}
     if sys.version_info >= (3, 13):
         options["show_empty"] = True
-    return ast.dump(tree, **options).encode("ascii")
+    # Python 3.12 added an always-empty type_params field to function and
+    # class nodes; dropping it gives every supported interpreter one
+    # canonical form (a recipe never declares PEP 695 type parameters).
+    return ast.dump(tree, **options).replace(", type_params=[]", "").encode("ascii")
 
 
 def cmake_noncomment_semantics(data: bytes) -> bytes:

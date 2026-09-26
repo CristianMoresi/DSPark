@@ -3649,7 +3649,7 @@ def threading_external_live(root: Path) -> list[str]:
         ["git", "ls-files", "-z"], cwd=root, check=False,
         capture_output=True, timeout=30).stdout.split(b"\0")
     tracked_paths = [item.decode("utf-8") for item in tracked if item]
-    if len(tracked_paths) != 484 or len(tracked_paths) != len(set(tracked_paths)):
+    if len(tracked_paths) != 487 or len(tracked_paths) != len(set(tracked_paths)):
         return ["THREADING_EXTERNAL_TRACKED_CENSUS:{}".format(
             len(tracked_paths))]
 
@@ -3686,7 +3686,7 @@ def threading_external_live(root: Path) -> list[str]:
                 item for item in indexed_paths.stdout.split(b"\0") if item
             ])
             if setup.returncode != 0 or indexed.returncode != 0 \
-                    or indexed_paths.returncode != 0 or indexed_count != 484:
+                    or indexed_paths.returncode != 0 or indexed_count != 487:
                 errors.append("THREADING_EXTERNAL_FIXTURE:{}".format(name))
                 observed.append(name)
                 continue

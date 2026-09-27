@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <thread>
@@ -549,6 +550,143 @@ DSPARK_TEST(LoudnessMeter_true_peak_recovers_after_non_finite_sample)
     EXPECT_LT(tp, 0.0f);              // a -6 dBFS tone tops out well under 0 dBTP
     EXPECT_GT(tp, -12.0f);
 }
+
+// ----------------------------------------------------------------------------
+// Loudness range (EBU Tech 3342)
+// ----------------------------------------------------------------------------
+
+namespace {
+
+double lraOf(const std::vector<float>& L, const std::vector<float>& R)
+{
+    LoudnessMeter<float> m;
+    m.prepare(48000.0, 2);
+    for (size_t i = 0; i < L.size(); i += 512)
+    {
+        const int n = static_cast<int>(std::min<size_t>(512, L.size() - i));
+        m.process(L.data() + i, R.data() + i, n);
+    }
+    return static_cast<double>(m.getLoudnessRange());
+}
+
+/// Tech 3342 table 1 tone: 1 kHz, in phase on both channels, `db` dBFS peak.
+void appendTone(std::vector<float>& L, std::vector<float>& R, double db, double seconds)
+{
+    const double a = std::pow(10.0, db / 20.0);
+    const auto n = static_cast<size_t>(seconds * 48000.0);
+    const size_t base = L.size();
+    for (size_t i = 0; i < n; ++i)
+    {
+        const auto s = static_cast<float>(a * std::sin(2.0 * 3.141592653589793 * 1000.0
+                                                       * static_cast<double>(base + i) / 48000.0));
+        L.push_back(s); R.push_back(s);
+    }
+}
+
+// Deterministic music-like programme: drums, bass and chords under a
+// section-by-section level plan (verse / chorus / breakdown), 48 kHz stereo.
+void lraMusicFragment(double seconds, std::vector<float>& L, std::vector<float>& R)
+{
+    const int fs = 48000;
+    const auto n = static_cast<size_t>(seconds * fs);
+    L.assign(n, 0.0f); R.assign(n, 0.0f);
+    const double pi = 3.141592653589793;
+    const double sectionDb[] = { -14, -12, -20, -22, -10, -9, -17, -26, -11, -13, -19, -15 };
+    const double bpm = 124.0, beat = 60.0 / bpm;
+    uint32_t lcg = 12345u;
+    auto noise = [&]() { lcg = lcg * 1664525u + 1013904223u; return (static_cast<double>(lcg >> 8) / 8388608.0) - 1.0; };
+    const double chordHz[4][3] = { {261.63, 329.63, 392.0}, {220.0, 261.63, 329.63},
+                                   {174.61, 220.0, 261.63}, {196.0, 246.94, 293.66} };
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double t = static_cast<double>(i) / fs;
+        // Section level, 3.5 s sections with 0.5 s linear crossfades.
+        const double secLen = 3.5;
+        const int sIdx = static_cast<int>(t / secLen);
+        const double frac = t - sIdx * secLen;
+        const double dbA = sectionDb[sIdx % 12], dbB = sectionDb[(sIdx + 1) % 12];
+        const double w = frac > secLen - 0.5 ? (frac - (secLen - 0.5)) / 0.5 : 0.0;
+        const double gain = std::pow(10.0, ((1.0 - w) * dbA + w * dbB) / 20.0);
+        const double bt = std::fmod(t, beat);
+        const int beatIdx = static_cast<int>(t / beat);
+        double kick = std::sin(2.0 * pi * (50.0 * bt + 30.0 * 0.03 * (1.0 - std::exp(-bt / 0.03))))
+                    * std::exp(-bt / 0.15);
+        double snare = (beatIdx % 2 == 1) ? noise() * std::exp(-bt / 0.08) * 0.6 : 0.0;
+        double hat = noise() * std::exp(-std::fmod(t, beat * 0.5) / 0.02) * 0.15;
+        const int chord = (beatIdx / 8) % 4;
+        double pad = 0.0;
+        for (double f : chordHz[chord]) pad += std::sin(2.0 * pi * f * t) * 0.12;
+        const double bassF = chordHz[chord][0] * 0.25;
+        double bass = std::sin(2.0 * pi * bassF * t) * 0.3 * std::exp(-bt / 0.4);
+        const double mid = gain * (kick * 0.7 + snare + bass);
+        L[i] = static_cast<float>(mid + gain * (pad * 1.1 + hat));
+        R[i] = static_cast<float>(mid + gain * (pad * 0.9 - hat));
+    }
+}
+
+}   // namespace
+
+// A steady programme has no loudness range at any length. Below 10 gated
+// short-term values the 10th percentile used to resolve to rank 0 before
+// any value was counted and read the relative-gate threshold - 20 LU below
+// the programme - so a 5 s or 10 s steady tone read LRA 20.
+DSPARK_TEST(LoudnessMeter_LRA_steady_tone_is_zero_at_every_length)
+{
+    for (double seconds : { 2.0, 3.0, 4.0, 5.0, 10.0, 12.0, 30.0 })
+    {
+        std::vector<float> L, R;
+        appendTone(L, R, -23.0, seconds);
+        EXPECT_NEAR(lraOf(L, R), 0.0, 0.05);
+    }
+}
+
+// EBU Tech 3342-2023 table 1, cases 1-4 (the tone cases; 5 and 6 are
+// programme files, covered by the conformance suite when the official set
+// is available). The standard accepts +-1 LU; the meter is held to 0.1.
+DSPARK_TEST(LoudnessMeter_LRA_EBU_3342_tone_vectors)
+{
+    struct Case { std::vector<double> levels; double lra; };
+    const Case cases[] = {
+        { { -20.0, -30.0 }, 10.0 },
+        { { -20.0, -15.0 }, 5.0 },
+        { { -40.0, -20.0 }, 20.0 },
+        { { -50.0, -35.0, -20.0, -35.0, -50.0 }, 15.0 },
+    };
+    for (const auto& c : cases)
+    {
+        std::vector<float> L, R;
+        for (double db : c.levels) appendTone(L, R, db, 20.0);
+        EXPECT_NEAR(lraOf(L, R), c.lra, 0.1);
+    }
+}
+
+// A music-like programme against two external references on the same
+// samples. `spec` applies the Tech 3342 reference code verbatim - rank
+// round((n - 1) * p) - to short-term values taken every 100 ms from
+// libebur128 1.2.6; `ffmpeg` is the ebur128 filter of FFmpeg 5.1 (printed to
+// 0.1 LU). The spec reference binds at 0.1 LU (the meter holds values at
+// 0.1 LU resolution). FFmpeg ranks its percentiles differently - the
+// round(0.1 n)-th value counted from 1, and the 95th counted down from the
+// top - which moves its reading by up to about 0.25 LU on a spread
+// distribution, so it is held at 0.15 here, where the two rules agree.
+DSPARK_TEST(LoudnessMeter_LRA_music_fragment_matches_the_references)
+{
+    struct Case { double seconds; double spec; double ffmpeg; };
+    const Case cases[] = {
+        { 8.0,  1.640, 1.7 },
+        { 35.2, 12.356, 12.4 },
+        { 42.0, 11.926, 12.0 },
+    };
+    for (const auto& c : cases)
+    {
+        std::vector<float> L, R;
+        lraMusicFragment(c.seconds, L, R);
+        const double lra = lraOf(L, R);
+        EXPECT_NEAR(lra, c.spec, 0.1);
+        EXPECT_NEAR(lra, c.ffmpeg, 0.15);
+    }
+}
+
 
 // ============================================================================
 // Goertzel

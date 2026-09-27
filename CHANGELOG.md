@@ -16,6 +16,34 @@ All notable user-facing changes to DSPark are documented here.
   better (500 Hz coherence 0.17 instead of 0.20) and the CPU cost is
   unchanged. The Hall preset's modulation depth is 0.10 (was 0.13) and the
   Cathedral's 0.12 (was 0.16).
+- `AlgorithmicReverb::setDecay()` is now the ISO 3382-1 mid-frequency
+  reverberation time T_mid (mean of the 500 Hz and 1 kHz octave T60s). The
+  loop's DC anchor is solved so that T_mid lands on the setting; before, the
+  first-order absorption shelves left it 3-12% short (Cathedral at 12 s
+  measured 10.6 s, now 11.8 s; Spring at 1.5 s measured 1.37 s, now
+  1.46 s). Tails are correspondingly longer at the same setting.
+- `BeatTracker::analyze()` on dense mixes: the metrical level is decided on
+  a register-balanced onset envelope, correlation noise bumps are no longer
+  tempo candidates, and the grid is chosen among a moving-period, a steady
+  and a tighter steady reading by how much of that envelope each explains.
+  `tempoBpm` is fitted to the grid with skipped or extra beats counted as
+  such. On 46 synthetic pop masters (92-150 BPM) the level is right on all
+  46 (35 before) and `tempoBpm` agrees with the grid's median interval
+  within 0.55% (up to 17.7% before). `OnsetDetector::OdfFrame` gains
+  `registers`, the flux per register group.
+- `Compressor` `AutoMakeupMode::Static` keeps its textbook, program-
+  independent offset, which also lifts passages that never reach the
+  threshold; the behaviour is now pinned by a test and the documentation
+  points to `Adaptive` for makeup only where gain is reduced.
+
+### Fixed
+
+- `LoudnessMeter::getLoudnessRange()` percentiles follow EBU Tech 3342:
+  0-based rank round((n - 1) * p), never the relative-gate threshold, and
+  short-term values sampled at 10 Hz (the minimum Tech 3342 has required
+  since V3). A steady tone below 12 s read LRA 20 LU and now reads 0; on a
+  music fragment the reading matches the Tech 3342 reference code within
+  0.06 LU and FFmpeg's ebur128 within 0.1 LU.
 
 ## [1.8.0] - 2026-09-26
 

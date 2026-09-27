@@ -525,7 +525,15 @@ public:
         qualityDirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Mid-band decay time T60 in seconds (0.1 - 30). */
+    /**
+     * @brief Mid-frequency reverberation time in seconds (0.1 - 30).
+     *
+     * The ISO 3382-1 T_mid: the mean of the 500 Hz and 1 kHz octave-band T60s,
+     * the figure a hall is quoted by. The bass and high bands decay at the
+     * multiples setBassDecayMultiplier() and setHighDecayMultiplier() set,
+     * relative to the same calibration. Measured over the six types at their
+     * default damping, T_mid lands within 3% of this value.
+     */
     void setDecay(T seconds) noexcept
     {
         if (!std::isfinite(seconds)) return;
@@ -2050,7 +2058,7 @@ protected:
     void updateDecayParams() noexcept
     {
         const double sr = spec_.sampleRate;
-        const double decay = static_cast<double>(decayTime_.load(std::memory_order_relaxed));
+        const double decay = calibratedMidDecay();
         const double t60H = std::max(0.05, decay * static_cast<double>(
             highDecayMult_.load(std::memory_order_relaxed)));
         const double t60B = std::max(0.05, decay * static_cast<double>(
@@ -2097,6 +2105,80 @@ protected:
             }
         }
         meanLoopSec_ = loopSum / std::max(1, nLines_) / sr;
+    }
+
+    /**
+     * @brief The loop's DC decay that puts the ISO 3382 mid-frequency
+     *        reverberation time on the decay setting.
+     *
+     * setDecay() promises T_mid, the mean of the 500 Hz and 1 kHz octave
+     * T60s (ISO 3382-1, the number a room is quoted by). The absorption
+     * shelves are anchored at DC and at Nyquist, and a first-order shelf
+     * spans several octaves: the HF shelf already shortens 1 kHz and the bass
+     * shelf still lengthens 500 Hz. With the DC anchor at the setting, T_mid
+     * measured 11.7% short on Cathedral and 3 to 9% short elsewhere. So the
+     * DC anchor is solved for instead: the loop T60 at 500 Hz and 1 kHz is
+     * evaluated from the exact shelf responses at the mean loop length, and
+     * the DC decay is rescaled until their mean equals the setting (the HF
+     * and bass targets stay proportional to it, as the multipliers say).
+     * Four fixed-point steps converge to far below a percent.
+     */
+    [[nodiscard]] double calibratedMidDecay() const noexcept
+    {
+        const double sr = spec_.sampleRate;
+        const double target = static_cast<double>(decayTime_.load(std::memory_order_relaxed));
+        if (!(sr > 0.0) || nLines_ < 1) return target;
+        const double hd = static_cast<double>(highDecayMult_.load(std::memory_order_relaxed));
+        const double bd = static_cast<double>(bassDecayMult_.load(std::memory_order_relaxed));
+        const double kPi = 3.14159265358979323846;
+        const double Kh = std::tan(kPi * std::clamp(static_cast<double>(
+            highCrossover_.load(std::memory_order_relaxed)), 100.0, 0.45 * sr) / sr);
+        const double Kb = std::tan(kPi * std::clamp(static_cast<double>(
+            bassCrossover_.load(std::memory_order_relaxed)), 10.0, 0.45 * sr) / sr);
+        auto loopLen = [&](int i) {
+            return spring_
+                ? static_cast<double>(lenTarget_[i]) + springStages_ * springK_
+                      * (1.0 - static_cast<double>(springA_)) / (1.0 + static_cast<double>(springA_))
+                : static_cast<double>(lenTarget_[i] + loopAPLen_[i]);
+        };
+
+        // |H(e^jw)| of ((1 + a) + (a - 1) z^-1) / ((1 + b) + (b - 1) z^-1).
+        auto shelf = [](double a, double b, double w) {
+            const double c = std::cos(w), sn = std::sin(w);
+            const double nr = (1.0 + a) + (a - 1.0) * c, ni = -(a - 1.0) * sn;
+            const double dr = (1.0 + b) + (b - 1.0) * c, di = -(b - 1.0) * sn;
+            return std::sqrt((nr * nr + ni * ni) / (dr * dr + di * di));
+        };
+        // Decay rate (1/T60) of the line mix at hz: each line's shelves are
+        // designed from its own length, so the rate between the anchors
+        // differs from line to line; the tail decays at their mean rate.
+        auto t60At = [&](double d, double hz) {
+            const double w = 2.0 * kPi * hz / sr;
+            double rate = 0.0;
+            int used = 0;
+            for (int i = 0; i < nLines_; ++i)
+            {
+                const double M = loopLen(i);
+                if (!(M > 0.0)) continue;
+                const double gM = std::pow(0.001, M / (d * sr));
+                const double gH = std::min(std::pow(0.001, M / (std::max(0.05, d * hd) * sr)), gM);
+                const double gB = std::min(std::pow(0.001, M / (std::max(0.05, d * bd) * sr)), 0.9995);
+                const double rh = std::sqrt(gM / gH), rb = std::sqrt(gB / gM);
+                const double g = gH * shelf(Kh * rh, Kh / rh, w) * shelf(Kb * rb, Kb / rb, w);
+                if (!(g > 0.0 && g < 1.0)) continue;
+                rate += -sr * std::log10(g) / (3.0 * M);
+                ++used;
+            }
+            return (used > 0 && rate > 0.0) ? used / rate : d;
+        };
+        double d = target;
+        for (int it = 0; it < 4; ++it)
+        {
+            const double tm = 0.5 * (t60At(d, 500.0) + t60At(d, 1000.0));
+            if (!(tm > 0.0)) break;
+            d *= target / tm;
+        }
+        return std::clamp(d, 0.05, 120.0);
     }
 
     // --- Early reflection generation -----------------------------------------
@@ -2234,7 +2316,8 @@ protected:
         const double fh = std::clamp(static_cast<double>(highCrossover_.load(std::memory_order_relaxed)),
                                      100.0, 0.45 * sr);
         erShelfCoeff_ = static_cast<T>(1.0 - std::exp(-6.283185307179586 * fh / sr));
-        const double t60H = std::max(0.05, decay * static_cast<double>(highDecayMult_.load(std::memory_order_relaxed)));
+        const double t60H = std::max(0.05, calibratedMidDecay()
+                                             * static_cast<double>(highDecayMult_.load(std::memory_order_relaxed)));
         for (int g = 0; g < kERGroups; ++g)
         {
             double tSum = 0.0;

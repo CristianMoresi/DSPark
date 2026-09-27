@@ -283,9 +283,16 @@ public:
     /**
      * @brief Computes the EBU R128 Loudness Range (EBU Tech 3342).
      *
-     * Short-term (3 s) loudness sampled once per second, gated at -70 LUFS
-     * absolute and -20 LU relative; LRA is the spread between the 10th and
+     * Short-term (3 s) loudness sampled at 10 Hz (every 100 ms, as Tech 3342
+     * V3 and later require), gated at -70 LUFS absolute and -20 LU relative; LRA is the spread between the 10th and
      * 95th percentiles. O(bins) and real-time safe like the integrated gate.
+     *
+     * Percentiles follow the Tech 3342 reference code (and libebur128):
+     * among the n gated short-term values sorted ascending, P is the value
+     * at 0-based rank round((n - 1) * P). Values are held at 0.1 LU
+     * resolution. The first short-term value exists after 3 s of input, so a
+     * programme shorter than that reads 0; a steady programme reads 0 at any
+     * length.
      *
      * @return Loudness range in LU (0 if not enough material yet).
      */
@@ -315,21 +322,28 @@ public:
             gatedCount += lraHistogram_[i].load(std::memory_order_relaxed);
         if (gatedCount == 0) return T(0);
 
-        const auto target10 = static_cast<uint64_t>(0.10 * gatedCount);
-        const auto target95 = static_cast<uint64_t>(0.95 * gatedCount);
+        // Percentiles by the libebur128 rule: the value of 0-based rank
+        // round((n - 1) * p) among the n gated values. Both ranks are always
+        // measured values - never the gate threshold - and every n is
+        // covered: with one value, or with n equal values, the range is 0.
+        const auto rank10 = static_cast<uint64_t>(std::llround(0.10 * static_cast<double>(gatedCount - 1)));
+        const auto rank95 = static_cast<uint64_t>(std::llround(0.95 * static_cast<double>(gatedCount - 1)));
 
-        double p10 = kMinHistogramLUFS, p95 = kMaxHistogramLUFS;
+        double p10 = 0.0, p95 = 0.0;
         uint64_t running = 0;
         bool have10 = false;
         for (int i = gateBin; i < kNumBins; ++i)
         {
-            running += lraHistogram_[i].load(std::memory_order_relaxed);
-            if (!have10 && running >= target10)
+            const uint32_t c = lraHistogram_[i].load(std::memory_order_relaxed);
+            if (c == 0) continue;
+            running += c;
+            // `running` values sit at or below this bin: ranks 0 .. running-1.
+            if (!have10 && running > rank10)
             {
                 p10 = kMinHistogramLUFS + i * kBinWidth;
                 have10 = true;
             }
-            if (running >= target95)
+            if (running > rank95)
             {
                 p95 = kMinHistogramLUFS + i * kBinWidth;
                 break;
@@ -477,9 +491,11 @@ private:
             }
         }
 
-        // EBU Tech 3342 loudness range: short-term (3 s) values sampled every
-        // 1 s (10 sub-blocks), absolute-gated at -70 LUFS into a histogram.
-        if (totalCommittedBlocks_ >= 30 && (totalCommittedBlocks_ % 10) == 0)
+        // EBU Tech 3342 loudness range: short-term (3 s) values sampled at
+        // 10 Hz - every 100 ms sub-block, the 2.9 s minimum window overlap
+        // Tech 3342 has required since V3 (2016) - absolute-gated at -70 LUFS
+        // into a histogram.
+        if (totalCommittedBlocks_ >= 30)
         {
             const double stLufs = static_cast<double>(calculateLUFSFromBlocks(30));
             if (!std::isfinite(stLufs))

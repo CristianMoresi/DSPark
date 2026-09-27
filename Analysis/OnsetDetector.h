@@ -97,6 +97,7 @@
 #include "../Core/AudioSpec.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -458,11 +459,23 @@ public:
      * the events that clear the threshold. This is that curve, one frame at a
      * time.
      */
+    /// Register groups the SuperFlux bands are split into for the
+    /// per-register readout: below 200 Hz (kick, bass), 200-800 Hz, 800 Hz to
+    /// 3.2 kHz, and above (hats, consonants). Two octaves each above the first.
+    static constexpr int kNumRegisters = 4;
+
     struct OdfFrame
     {
         T value = T(0);              ///< ODF value of the most recent frame.
         int64_t referenceSample = 0; ///< Sample index the frame localises to.
         int64_t frameIndex = 0;      ///< Frames computed since the last reset.
+        /// The same flux restricted to each register group (mean over the
+        /// group's bands; SuperFlux only, zero for the other methods). A
+        /// consumer that wants every register to count - a beat tracker, for
+        /// which a kick is as much evidence as a dense hi-hat - normalises
+        /// these separately instead of reading `value`, where the upper
+        /// registers own most of the bands and so most of the mean.
+        std::array<T, kNumRegisters> registers {};
     };
 
     /**
@@ -489,7 +502,7 @@ public:
      */
     [[nodiscard]] OdfFrame getLastOdfFrame() const noexcept
     {
-        return OdfFrame { lastOdfValue_, lastOdfRef_, frameIndex_ };
+        return OdfFrame { lastOdfValue_, lastOdfRef_, frameIndex_, lastRegisters_ };
     }
 
     /**
@@ -715,6 +728,7 @@ private:
         if (whiten) applyWhitening();
 
         T odf = T(0);
+        curRegisters_.fill(T(0));
         switch (m)
         {
             case Method::SpectralFlux:
@@ -760,13 +774,23 @@ private:
                 // kWhitenFloor, so those bins keep the linear-in-N growth --
                 // the residual rate dependence documented at prepare().
                 filterLogBands(bandCur_, whiten ? T(1) : odfScale_);
+                curRegisters_.fill(T(0));
                 for (int b = 0; b < numBands_; ++b)
                 {
                     const T d = bandCur_[static_cast<size_t>(b)]
                               - bandMaxPrev_[static_cast<size_t>(b)];
-                    if (d > T(0)) odf += d;
+                    if (d > T(0))
+                    {
+                        odf += d;
+                        if (b < static_cast<int>(bandRegister_.size()))
+                            curRegisters_[static_cast<size_t>(bandRegister_[static_cast<size_t>(b)])] += d;
+                    }
                 }
                 odf /= static_cast<T>(numBands_);
+                for (int g = 0; g < kNumRegisters; ++g)
+                    if (registerBands_[static_cast<size_t>(g)] > 0)
+                        curRegisters_[static_cast<size_t>(g)]
+                            /= static_cast<T>(registerBands_[static_cast<size_t>(g)]);
                 // Rotate: previous <- current, and rebuild the max-filtered
                 // reference from the (new) previous frame.
                 bandPrev_ = bandCur_;
@@ -807,6 +831,7 @@ private:
         // decided from it would: one definition of frame time, not two.
         lastOdfValue_ = value;
         lastOdfRef_ = referenceSample(totalSamples_);
+        lastRegisters_ = curRegisters_;
 
         // Causal peak-pick with a single-frame confirmation: we decide whether
         // the PREVIOUS frame was a maximum now that we have the current one.
@@ -882,6 +907,8 @@ private:
         fbStart_.clear();
         fbWeights_.clear();
         fbOffset_.clear();
+        bandRegister_.clear();
+        registerBands_.fill(0);
 
         const double binHz = sampleRate_ / static_cast<double>(fftSize_);
         const double fMax = std::min(kFMaxHz, sampleRate_ * 0.5 * 0.999);
@@ -908,6 +935,12 @@ private:
             const int hi = centres[j + 1];
             if (!(lo < ce && ce < hi)) continue;
 
+            {
+                const double fc = static_cast<double>(ce) * binHz;
+                const int g = fc < 200.0 ? 0 : fc < 800.0 ? 1 : fc < 3200.0 ? 2 : 3;
+                bandRegister_.push_back(g);
+                ++registerBands_[static_cast<size_t>(g)];
+            }
             fbStart_.push_back(lo);
             fbOffset_.push_back(static_cast<int>(fbWeights_.size()));
             for (int k = lo; k <= hi; ++k)
@@ -998,6 +1031,8 @@ private:
         odfWrite_ = 0;
         lastOdfValue_ = T(0);
         lastOdfRef_ = 0;
+        lastRegisters_.fill(T(0));
+        curRegisters_.fill(T(0));
         lastConfirmOdf_ = T(0);
         lastOnsetFrame_ = -kBig;
         pendingHead_ = 0;
@@ -1053,6 +1088,10 @@ private:
     int64_t frameIndex_ = 0;
     T lastOdfValue_ = T(0);   ///< Envelope readout (stream owner only).
     int64_t lastOdfRef_ = 0;  ///< Reference sample of lastOdfValue_'s frame.
+    std::array<T, kNumRegisters> lastRegisters_ {};  ///< Per-register readout.
+    std::array<T, kNumRegisters> curRegisters_ {};   ///< This frame's registers.
+    std::vector<int> bandRegister_;                  ///< Band -> register group.
+    std::array<int, kNumRegisters> registerBands_ {}; ///< Bands per register.
     T lastConfirmOdf_ = T(0);
     int64_t lastOnsetFrame_ = -kBig;
 

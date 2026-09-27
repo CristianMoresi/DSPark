@@ -49,6 +49,25 @@
  * supporting it. Together they take the grid F-measure on clean clicks from
  * 0.9315 to 1.0000 and the worst beat error from 29.1 ms to 5.4 ms.
  *
+ * DENSE MIXES. On a loud modern master the onset envelope is mostly strums,
+ * hats and syllables, because they own most of its quarter-tone bands, while
+ * the kick that states the beat lights a handful of bands below 200 Hz. Two
+ * things keep the answer on the beat there. The metrical level is decided on a
+ * REGISTER-BALANCED envelope - the front end's flux split into four registers
+ * (below 200 Hz, to 800 Hz, to 3.2 kHz, above), each conditioned on its own
+ * and weighted by its own periodicity - so the kick counts as much as the
+ * hats. And the grid is chosen among three readings - the moving-period grid
+ * above, a steady-period grid, and a steady grid held four times tighter - by
+ * how much of that balanced envelope each explains, the moving one only when
+ * it explains half as much again: a steady groove under a syncopated guitar
+ * otherwise drew the moving grid onto the off-accents. Measured on 46
+ * synthetic pop masters from 92 to 150 BPM (kick on every beat, snare on two
+ * and four, strummed 3-3-2 guitar, syncopated bass, syllabic vocal,
+ * saturation and limiting), the delivered level is right on all 46 against
+ * 35 before, and tempoBpm agrees with the grid's median interval within its
+ * frame quantisation (0.55%) against up to 17.7% before. Correlation lags that
+ * are only bumps of its noise floor are no longer candidates at all.
+ *
  * TIGHTNESS. The default is 25, chosen by measurement on this implementation
  * rather than inherited. The published values disagree with each other by most
  * of an order of magnitude -- the paper names 400 as its default (Figure 5
@@ -225,6 +244,7 @@
 #include "OnsetDetector.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -471,7 +491,10 @@ public:
         // at least a quarter octave apart so that the runner-up is a different
         // metrical reading and not the same peak one lag over.
         double tau1 = 0.0, tau2 = 0.0;
+        const bool balanced = (envBal_.size() == env_.size());
+        if (balanced) env_.swap(envBal_);
         pickCandidates(iLo, iHi, tau1, tau2);
+        if (balanced) env_.swap(envBal_);
         if (!(tau1 > 0.0)) { resetState(); return out; }
 
         // The metrical level is decided against one period for the whole
@@ -484,15 +507,54 @@ public:
         // the delivered grid with it: measured at 96 BPM on 160 BPM material
         // searched over 60 to 100, where the answer a listener would give is
         // the 80 BPM the correlation points at.
+        //
+        // Both grids are built - one against the moving period, one against
+        // the steady one - and the one that explains the envelope better is
+        // delivered. A per-frame period is the right model for a tempo that
+        // moves, and the wrong one for a steady tempo under a syncopated
+        // part: there the resonator sweep is drawn, bar by bar, towards the
+        // syncopation's own period, and the grid it drives falls off the beat
+        // and onto the off-accents. Measured on a limited pop master at 120
+        // BPM over a dotted-eighth guitar, the moving-period grid put 18 of 74
+        // intervals at three quarters or five quarters of a beat; the steady
+        // grid has none, and explains more of the envelope, so it is the one
+        // delivered. On a tempo ramp the steady grid drifts off the beats and
+        // the moving one wins by the same measure.
         std::vector<int64_t> win;
         localPeriod_.clear();
+        std::vector<int64_t> moving;
+        bool haveMoving = false;
         if (coherence(tau1) >= kMinFundamentalCoherence)
-            computeLocalPeriods(tau1);
-        const bool ok = (buildGrid(tau1, win) && win.size() >= 2);
-        localPeriod_.clear();
-        if (!ok)
         {
-            if (!buildGrid(tau1, win) || win.size() < 2) { resetState(); return out; }
+            computeLocalPeriods(tau1);
+            haveMoving = buildGrid(tau1, moving) && moving.size() >= 2;
+        }
+        localPeriod_.clear();
+        bool haveSteady = buildGrid(tau1, win) && win.size() >= 2;
+        // A third reading: the steady period held kStrictTightnessFactor times
+        // more tightly. The tightness in force is tuned for rubato, where it
+        // must let an interval stretch; under a steady beat with a strong
+        // syncopated part the same slack lets single intervals jump onto the
+        // off-accents. Whichever grid explains the envelope best is kept, so
+        // rubato keeps its loose grid and a steady groove gets a steady one.
+        {
+            std::vector<int64_t> strict;
+            alphaScale_ = kStrictTightnessFactor;
+            const bool haveStrict = buildGrid(tau1, strict) && strict.size() >= 2;
+            alphaScale_ = 1.0;
+            if (haveStrict && (!haveSteady || gridCoherence(strict) > gridCoherence(win)))
+            {
+                win.swap(strict);
+                haveSteady = true;
+            }
+        }
+        if (haveMoving && (!haveSteady
+                           || gridCoherence(moving) > kMovingGridMargin * gridCoherence(win)))
+            win.swap(moving);
+        else if (!haveSteady)
+        {
+            resetState();
+            return out;
         }
 
         // The delivered tempo is fitted to the delivered grid, not read off
@@ -801,6 +863,22 @@ private:
     /// count as different readings; a quarter octave admits the half and
     /// double levels and rejects a neighbouring lag of the same peak.
     static constexpr double kCandidateSeparationOctaves = 0.25;
+
+    /// Smallest prior-weighted correlation peak, as a fraction of the tallest,
+    /// that is ranked as a tempo candidate (see pickCandidates()).
+    static constexpr double kCandidatePeakFloor = 0.25;
+
+    /// Half-width, in bank bins, of the band the per-frame period may move in
+    /// around the global one (see computeLocalPeriods()).
+    /// Tightness multiplier of the strict steady-period grid analyze() also
+    /// tries (see there).
+    static constexpr double kStrictTightnessFactor = 4.0;
+
+    /// How much more of the envelope the moving-period grid must explain
+    /// before it is preferred to a steady one (see analyze()).
+    static constexpr double kMovingGridMargin = 1.5;
+
+    static constexpr int kLocalPeriodSpan = kBinsPerOctave / 6;
 
     /// Shortest signal analyze() will fit a tempo to, in beats at the slowest
     /// searched tempo.
@@ -1200,12 +1278,14 @@ private:
     {
         env_.clear();
         envRef_.clear();
+        for (auto& r : envReg_) r.clear();
 
         const int n = whole.getNumSamples();
         const T* x = whole.getChannel(0);
         const size_t frames = static_cast<size_t>(n / std::max(1, hop_) + 2);
         env_.reserve(frames);
         envRef_.reserve(frames);
+        for (auto& r : envReg_) r.reserve(frames);
 
         onset_.reset();
         int64_t pos = 0;
@@ -1221,6 +1301,11 @@ private:
                                      ? static_cast<double>(f.value) : 0.0;
                 env_.push_back(std::max(0.0, v));
                 envRef_.push_back(f.referenceSample);
+                for (int g = 0; g < kRegisters; ++g)
+                {
+                    const double r = static_cast<double>(f.registers[static_cast<size_t>(g)]);
+                    envReg_[static_cast<size_t>(g)].push_back(std::isfinite(r) ? std::max(0.0, r) : 0.0);
+                }
             }
         }
         onset_.reset();
@@ -1242,12 +1327,73 @@ private:
         const int n = static_cast<int>(env_.size());
         if (n < 1) return;
 
+        // Register balance. The onset function is a mean over quarter-tone
+        // bands, and the upper registers own most of them: a kick lights a
+        // handful of bands below 200 Hz while hats, strums and consonants light
+        // a hundred. On a dense master the pulse the kick states then barely
+        // shows in the mean, and the backbeat and syllable rhythm decide the
+        // metrical level instead. So the level is decided on a second,
+        // register-balanced envelope: each register conditioned on its own -
+        // floor removed, scaled to unit spread - and the four summed, so that
+        // a register carries evidence in proportion to how regular it is, not
+        // to how many bands it spans. The grid itself is still laid on the
+        // plain envelope, where every onset keeps its own weight. Measured on a limited pop master at 135
+        // BPM (kick on every beat, snare on two and four, strummed guitar and
+        // a syllabic vocal on top), the coherence at half the tempo falls from
+        // 0.88 of the coherence at the beat to 0.38.
+        envBal_.clear();
+        bool haveRegisters = false;
+        for (const auto& r : envReg_)
+            if (static_cast<int>(r.size()) == n)
+                for (const double v : r)
+                    if (v > 0.0) { haveRegisters = true; break; }
+        if (haveRegisters)
+        {
+            // A register counts in proportion to how periodic it is: its
+            // normalised autocorrelation peak over the searched lags. A
+            // register holding one isolated event - a tone switching on - or
+            // unpatterned material has no such peak and adds nothing, where
+            // plain unit-spread scaling would have amplified it to equal voice.
+            int iLo = 0, iHi = 0;
+            unpackRange(activeRange_.load(std::memory_order_relaxed), iLo, iHi);
+            const int lagLo = std::max(1, static_cast<int>(std::floor(bankPeriod_[static_cast<size_t>(iLo)])));
+            const int lagHi = std::min(n / 2, static_cast<int>(std::ceil(bankPeriod_[static_cast<size_t>(iHi)])));
+            envBal_.assign(static_cast<size_t>(n), 0.0);
+            for (auto& r : envReg_)
+            {
+                conditionSeries(r, true);
+                double zero = 0.0;
+                for (const double v : r) zero += v * v;
+                zero /= static_cast<double>(n);
+                double peak = 0.0;
+                if (zero > 0.0)
+                    for (int lag = lagLo; lag <= lagHi; ++lag)
+                    {
+                        double acc = 0.0;
+                        for (int i = 0; i + lag < n; ++i)
+                            acc += r[static_cast<size_t>(i)] * r[static_cast<size_t>(i + lag)];
+                        peak = std::max(peak, acc / static_cast<double>(n - lag) / zero);
+                    }
+                const double w = std::clamp(peak, 0.0, 1.0);
+                for (int i = 0; i < n; ++i) envBal_[static_cast<size_t>(i)] += w * r[static_cast<size_t>(i)];
+            }
+            conditionSeries(envBal_, false);   // already floor-free: rescale only
+        }
+        conditionSeries(env_, true);
+    }
+
+    /** @brief Floor removal by a centred slow mean (optional), then unit RMS. */
+    void conditionSeries(std::vector<double>& e, bool removeFloor)
+    {
+        const int n = static_cast<int>(e.size());
+        if (n < 1) return;
+
         const int half = std::max(1, static_cast<int>(std::lround(0.5 * kBaselineSeconds
                                                                   * frameRate_)));
         scratchA_.assign(static_cast<size_t>(n) + 1, 0.0);
         for (int i = 0; i < n; ++i)
             scratchA_[static_cast<size_t>(i) + 1] = scratchA_[static_cast<size_t>(i)]
-                                                  + env_[static_cast<size_t>(i)];
+                                                  + e[static_cast<size_t>(i)];
 
         double sumSq = 0.0;
         for (int i = 0; i < n; ++i)
@@ -1257,8 +1403,9 @@ private:
             const double mean = (scratchA_[static_cast<size_t>(hi)]
                                  - scratchA_[static_cast<size_t>(lo)])
                               / static_cast<double>(hi - lo);
-            const double v = std::max(0.0, env_[static_cast<size_t>(i)] - mean);
-            env_[static_cast<size_t>(i)] = v;
+            const double v = removeFloor ? std::max(0.0, e[static_cast<size_t>(i)] - mean)
+                                         : e[static_cast<size_t>(i)];
+            e[static_cast<size_t>(i)] = v;
             sumSq += v * v;
         }
 
@@ -1266,7 +1413,7 @@ private:
         if (rms > 0.0)
         {
             const double g = 1.0 / rms;
-            for (int i = 0; i < n; ++i) env_[static_cast<size_t>(i)] *= g;
+            for (int i = 0; i < n; ++i) e[static_cast<size_t>(i)] *= g;
         }
     }
 
@@ -1379,6 +1526,24 @@ private:
         }
         if (candidates_.empty()) return;
 
+        // A candidate is a lag at which the envelope actually repeats. Local
+        // maxima of the correlation's noise floor between its real peaks - a
+        // hundredth of their height - are lags at which it does not, and the
+        // coherence ranking below cannot tell them apart from real pulses on
+        // dense material, where every coherence is small: measured on a
+        // limited 92 BPM master, a 141 BPM bump at 0.3% of the tallest peak
+        // outranked the 92 BPM peak itself. Only peaks within a fixed ratio
+        // of the tallest are ranked.
+        {
+            double top = 0.0;
+            for (const int lag : candidates_) top = std::max(top, acf_[static_cast<size_t>(lag)]);
+            size_t w = 0;
+            for (const int lag : candidates_)
+                if (acf_[static_cast<size_t>(lag)] >= kCandidatePeakFloor * top)
+                    candidates_[w++] = lag;
+            candidates_.resize(w);
+        }
+
         // Rank by the octave discriminator, not by correlation height. Two
         // scores per candidate, for the two questions of scoreAt(): the
         // adjudicated one decides the level, the explanatory one is what the
@@ -1483,10 +1648,12 @@ private:
      * possible offline, and it is the whole reason the offline path can follow
      * a tempo the causal path can only chase.
      *
-     * The sweep is confined to half an octave either side of the period the
-     * global analysis settled on: the metrical level has already been decided
-     * by then, and letting a local estimate re-open it would let one bar of
-     * dense playing move the grid to double time.
+     * The sweep is confined to a sixth of an octave (about 12%) either side
+     * of the period the global analysis settled on: the metrical level has
+     * already been decided by then, and a local estimate free to move further
+     * is drawn, bar by bar, to the period of a syncopated part - a
+     * dotted-eighth guitar pulled it to three quarters of the beat. A 100 to
+     * 140 BPM ramp still tracks to within 1.03% at this width.
      */
     void computeLocalPeriods(double globalTau)
     {
@@ -1494,10 +1661,10 @@ private:
         localPeriod_.assign(static_cast<size_t>(n), globalTau);
         if (n < 8 || bankSize_ < 2) return;
 
-        // Confined twice over: to half an octave either side of the period the
-        // global analysis settled on, AND to the range the caller asked to be
-        // searched. The first keeps one dense bar from moving the grid to
-        // double time; the second is the caller's contract, and a local
+        // Confined twice over: to kLocalPeriodSpan either side of the period
+        // the global analysis settled on, AND to the range the caller asked to
+        // be searched. The first keeps a syncopated part from moving the grid
+        // off the beat; the second is the caller's contract, and a local
         // estimate that escaped it would deliver a tempo outside the range
         // that was asked for -- measured at 110 BPM on 160 BPM material
         // searched over 60 to 100 before this clamp existed.
@@ -1507,8 +1674,8 @@ private:
         aHi = std::clamp(aHi, aLo, bankSize_ - 1);
 
         const int gi = periodToIndex(globalTau);
-        int lo = std::clamp(gi - kBinsPerOctave / 2, aLo, aHi);
-        int hi = std::clamp(gi + kBinsPerOctave / 2, aLo, aHi);
+        int lo = std::clamp(gi - kLocalPeriodSpan, aLo, aHi);
+        int hi = std::clamp(gi + kLocalPeriodSpan, aLo, aHi);
         if (hi < lo) std::swap(lo, hi);
         if (hi <= lo) return;
 
@@ -1640,7 +1807,7 @@ private:
 
         buildLocalScore(periodFrames);
 
-        const double alpha = tightness_.load(std::memory_order_relaxed);
+        const double alpha = tightness_.load(std::memory_order_relaxed) * alphaScale_;
         cumScore_.assign(static_cast<size_t>(n), 0.0);
         backlink_.assign(static_cast<size_t>(n), -1);
 
@@ -1904,19 +2071,72 @@ private:
         return base + static_cast<int64_t>(std::llround(d * static_cast<double>(hop_)));
     }
 
-    /** @brief Least-squares samples-per-beat through the delivered grid. */
-    [[nodiscard]] static double fitBeatSlope(const std::vector<int64_t>& beats) noexcept
+    /**
+     * @brief How much of the conditioned envelope a (possibly non-uniform)
+     *        grid explains: the in-phase share of onset mass, with the phase
+     *        of each frame read off the grid itself (0 on a beat, advancing
+     *        linearly to 1 at the next). The uniform-period coherence() is the
+     *        special case of an isochronous grid; frames outside the grid's
+     *        span do not count.
+     */
+    [[nodiscard]] double gridCoherence(const std::vector<int64_t>& beats) const noexcept
+    {
+        if (beats.size() < 2) return 0.0;
+        // Judged on the register-balanced envelope when there is one, for the
+        // reason the metrical level is: on a dense mix the plain envelope is
+        // mostly strums and syllables, and a grid that chases them "explains"
+        // it better than the grid on the kick does.
+        const std::vector<double>& e = (envBal_.size() == env_.size()) ? envBal_ : env_;
+        double re = 0.0, mass = 0.0;
+        size_t k = 0;
+        for (size_t i = 0; i < e.size(); ++i)
+        {
+            const int64_t r = envRef_[i];
+            if (r < beats.front()) continue;
+            while (k + 1 < beats.size() && beats[k + 1] <= r) ++k;
+            if (k + 1 >= beats.size()) break;
+            const double span = static_cast<double>(beats[k + 1] - beats[k]);
+            if (!(span > 0.0)) continue;
+            const double phase = static_cast<double>(r - beats[k]) / span;
+            const double o = e[i];
+            re += o * std::cos(2.0 * pi<double> * phase);
+            mass += o;
+        }
+        return (mass > kMassFloor) ? re / mass : 0.0;
+    }
+
+    /**
+     * @brief Least-squares samples-per-beat through the delivered grid.
+     *
+     * Each beat is numbered by how many median intervals lie between it and
+     * its predecessor (at least one), not by its position in the list, so a
+     * beat the grid skipped or an extra one it inserted moves the fit by one
+     * interval's worth of residual instead of tilting the whole line. The
+     * tempo reported is therefore the grid's own: measured over 46 synthetic
+     * pop masters from 92 to 150 BPM, it never differs from the tempo of the
+     * grid's median interval by more than 0.55%, which is the frame
+     * quantisation of that median itself.
+     */
+    [[nodiscard]] static double fitBeatSlope(const std::vector<int64_t>& beats)
     {
         const size_t n = beats.size();
         if (n < 2) return 0.0;
-        const double dn = static_cast<double>(n);
-        double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+        std::vector<double> ibi;
+        ibi.reserve(n - 1);
+        for (size_t k = 1; k < n; ++k) ibi.push_back(static_cast<double>(beats[k] - beats[k - 1]));
+        std::vector<double> sorted = ibi;
+        std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(sorted.size() / 2), sorted.end());
+        const double med = sorted[sorted.size() / 2];
+        if (!(med > 0.0)) return 0.0;
+
+        double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0, index = 0.0;
         for (size_t k = 0; k < n; ++k)
         {
-            const double x = static_cast<double>(k);
+            if (k > 0) index += std::max(1.0, std::round(ibi[k - 1] / med));
             const double y = static_cast<double>(beats[k]);
-            sx += x; sy += y; sxx += x * x; sxy += x * y;
+            sx += index; sy += y; sxx += index * index; sxy += index * y;
         }
+        const double dn = static_cast<double>(n);
         const double den = dn * sxx - sx * sx;
         if (!(std::abs(den) > 0.0)) return 0.0;
         return (dn * sxy - sx * sy) / den;
@@ -1984,6 +2204,10 @@ private:
     // Offline scratch (analyze only).
     std::vector<double> env_;
     std::vector<int64_t> envRef_;
+    static constexpr int kRegisters = OnsetDetector<T>::kNumRegisters;
+    std::array<std::vector<double>, kRegisters> envReg_;   ///< Per-register envelopes (offline).
+    std::vector<double> envBal_;   ///< Register-balanced envelope: decides the metrical level.
+    double alphaScale_ = 1.0;      ///< Tightness multiplier for the grid being built.
     std::vector<double> local_, cumScore_, acf_, scratchA_, kernel_;
     std::vector<double> localPeriod_, sweepA_, sweepB_;
     std::vector<int> backlink_;

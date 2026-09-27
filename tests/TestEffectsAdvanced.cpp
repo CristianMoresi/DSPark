@@ -3182,9 +3182,12 @@ DSPARK_TEST(AlgoReverb_high_crossover_is_honoured)
     // than when it sits at 16 kHz (measured 0.81 s vs 1.38 s = 1.71x; the
     // inert parameter gave exactly 1.00x).
     EXPECT_GT(mid16k / mid2k, 1.3);
-    // The low anchor barely moves with the crossover (first-order skirt).
-    EXPECT_GT(lo16k / lo2k, 0.85);
-    EXPECT_LT(lo16k / lo2k, 1.25);
+    // The band below the crossover is no longer an anchor: the decay setting
+    // is the mid-frequency T60 (ISO 3382 T_mid), and the loop's DC gain is
+    // re-solved for every crossover to hold it - see
+    // AlgoReverb_decay_is_the_ISO_3382_mid_frequency_T60.
+    EXPECT_GT(lo2k, 0.0);
+    EXPECT_GT(lo16k, 0.0);
 }
 
 DSPARK_TEST(AlgoReverb_processSample_applies_pending_changes)
@@ -3278,6 +3281,65 @@ void algoReverbLateHall(ARevF& rev, double fs)
     rev.processBlock(w.view());
 }
 } // namespace
+
+namespace
+{
+// ISO 3382-1 T_mid of a reverb's impulse response: the mean of the 500 Hz and
+// 1 kHz octave-band T60s, each averaged over both output channels.
+double algoReverbTmid(ARevF& rev, double fs, double seconds)
+{
+    std::vector<float> right;
+    const auto left = algoReverbIR(rev, fs, seconds, false, &right);
+    double sum = 0.0;
+    for (const double band : { 500.0, 1000.0 })
+        sum += 0.5 * (algoReverbT60(left, fs, band) + algoReverbT60(right, fs, band));
+    return 0.5 * sum;
+}
+} // namespace
+
+// setDecay() is the ISO 3382 mid-frequency reverberation time. It used to be
+// the loop's DC anchor, which the first-order absorption shelves bend away
+// from over the mid band: T_mid measured 11.7% short on Cathedral at 12 s,
+// 8.9% short on Spring at 1.5 s, 3.7% short on Hall at 6.5 s. Each type is
+// checked at its default damping, with setDecay() after setType() as the
+// preset contract requires, against a 5% tolerance; and the calibration must
+// hold wherever the high crossover is put.
+DSPARK_TEST(AlgoReverb_decay_is_the_ISO_3382_mid_frequency_T60)
+{
+    const double fs = 48000.0;
+    struct Case { ARevF::Type type; float decay; };
+    const Case cases[] = {
+        { ARevF::Type::Room, 3.0f },      { ARevF::Type::Hall, 6.5f },
+        { ARevF::Type::Chamber, 2.5f },   { ARevF::Type::Plate, 3.0f },
+        { ARevF::Type::Spring, 1.5f },    { ARevF::Type::Cathedral, 12.0f },
+        { ARevF::Type::Room, 0.8f },      { ARevF::Type::Hall, 2.0f },
+    };
+    for (const auto& c : cases)
+    {
+        ARevF rev;
+        rev.prepare(spec(fs, 256, 2));
+        rev.setType(c.type);
+        rev.setMix(1.0f);
+        auto w = makeBuffer(2, 64);
+        rev.processBlock(w.view());    // commits the preset
+        rev.setDecay(c.decay);
+        const double tmid = algoReverbTmid(rev, fs, 2.2 * c.decay + 1.0);
+        std::cout << "  type " << static_cast<int>(c.type) << " decay " << c.decay
+                  << " s: T_mid " << tmid << " s\n";
+        EXPECT_NEAR(tmid, static_cast<double>(c.decay), 0.05 * c.decay);
+    }
+    for (const float xover : { 2000.0f, 16000.0f })
+    {
+        ARevF rev;
+        algoReverbLateHall(rev, fs);
+        rev.setDecay(2.0f);
+        rev.setHighDecayMultiplier(0.3f);
+        rev.setHighCrossover(xover);
+        const double tmid = algoReverbTmid(rev, fs, 5.0);
+        std::cout << "  high crossover " << xover << " Hz: T_mid " << tmid << " s\n";
+        EXPECT_NEAR(tmid, 2.0, 0.1);
+    }
+}
 
 DSPARK_TEST(AlgoReverb_flat_decay_is_exact_in_every_band)
 {

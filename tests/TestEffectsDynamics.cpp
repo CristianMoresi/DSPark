@@ -1421,6 +1421,36 @@ DSPARK_TEST(Compressor_static_automakeup_is_program_independent)
     }
 }
 
+// The policy, pinned where it is most visible: a passage that never reaches
+// the threshold. Static is a constant, curve-derived offset - that is what
+// makes it free of pumping and click-free under parameter automation - so it
+// lifts this passage by the full +7.5 dB it adds everywhere (-20 dB, 4:1).
+// A caller who wants makeup only where the compressor actually works selects
+// Adaptive, which leaves the passage untouched; Off leaves it untouched too.
+DSPARK_TEST(Compressor_automakeup_policy_below_threshold)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 2.0);
+    const int tail = static_cast<int>(fs * 0.5);
+    using Mode = Compressor<float>::AutoMakeupMode;
+    const struct { Mode mode; float gainDb; } cases[] = {
+        { Mode::Off, 0.0f }, { Mode::Static, 7.5f }, { Mode::Adaptive, 0.0f } };
+    for (const auto& c : cases)
+    {
+        auto tb = makeBuffer(1, n);
+        generateSine(tb.ch(0), n, 440.0f, static_cast<float>(fs), 0.01f);   // -40 dBFS peak
+        const float inDb = measureRMSDb(tb.ch(0) + (n - tail), tail);
+        Compressor<float> comp;
+        comp.prepare(spec(fs, n, 1));
+        comp.setThreshold(-20.0f);
+        comp.setRatio(4.0f);
+        comp.setAutoMakeup(c.mode);
+        comp.processBlock(tb.view());
+        const float gain = measureRMSDb(tb.ch(0) + (n - tail), tail) - inDb;
+        EXPECT_NEAR(gain, c.gainDb, 0.1f);
+    }
+}
+
 // ============================================================================
 // Compressor feedback calibration + FET colour (2026-07 P3)
 // ============================================================================

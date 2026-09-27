@@ -327,6 +327,106 @@ void addNoiseBed(std::vector<float>& x, float rms, uint32_t seed)
 // Scoring
 // ---------------------------------------------------------------------------
 
+// A dense, loud pop master - the material a beat tracker meets in practice and
+// clicks do not model. Kick on every beat, snare on two and four, eighth
+// hats, a syncopated bass on sixteenths 0 3 6 10 12 14, a sidechained pad, a
+// strummed guitar on sixteenths 0 3 6 8 11 14 (the 3-3-2 pattern), a syllabic
+// vocal on syncopated sixteenths, then saturation and a fast limiter. The
+// kick states the beat; everything above it has more onsets. Ground truth is
+// the kick. Deterministic for a given seed.
+Corpus denseMaster(double bpm, double seconds, uint32_t seed = 41u)
+{
+    Corpus c;
+    c.bpm = bpm;
+    rngState = seed;
+    const int64_t n = static_cast<int64_t>(seconds * kFs);
+    std::vector<double> x(static_cast<size_t>(n), 0.0);
+    const double beat = 60.0 / bpm, s16 = beat / 4.0, t0 = 0.1;
+    auto put = [&](double at, double len, auto&& fn) {
+        const int64_t i0 = static_cast<int64_t>(at * kFs);
+        const int64_t m = static_cast<int64_t>(len * kFs);
+        for (int64_t k = 0; k < m && i0 + k < n; ++k)
+            if (i0 + k >= 0) x[static_cast<size_t>(i0 + k)] += fn(static_cast<double>(k) / kFs);
+    };
+    const double chords[4] = { 220.0, 174.6, 261.6, 196.0 };
+    for (int b = 0; t0 + b * beat < seconds; ++b)
+    {
+        const double t = t0 + b * beat;
+        c.beats.push_back(static_cast<int64_t>(std::llround(t * kFs)));
+        put(t, 0.35, [](double u) {
+            return std::sin(twoPi<double> * (50.0 * u + 110.0 * 0.03 * (1.0 - std::exp(-u / 0.03))))
+                 * std::exp(-u / 0.18); });
+        if (b % 2 == 1)
+            put(t, 0.3, [](double u) {
+                return (0.5 * std::sin(twoPi<double> * 190.0 * u) * std::exp(-u / 0.06)
+                        + nrand() * std::exp(-u / 0.1)) * 0.6; });
+        for (int e = 0; e < 2; ++e)
+        {
+            double prev = 0.0;
+            put(t + e * beat / 2.0, 0.08, [&](double u) {
+                const double w = nrand(); const double d = w - prev; prev = w;
+                return d * std::exp(-u / 0.02) * 0.15; });
+        }
+    }
+    const int bassPos[6] = { 0, 3, 6, 10, 12, 14 };
+    const int strumPos[6] = { 0, 3, 6, 8, 11, 14 };
+    for (int i = 0; t0 + i * s16 < seconds; ++i)
+    {
+        const double t = t0 + i * s16;
+        const double f = chords[(i / 16) % 4];
+        for (const int p : bassPos)
+            if (i % 16 == p)
+                put(t, 0.2, [&](double u) {
+                    double v = 0.0;
+                    for (int k = 1; k <= 5; ++k) v += std::sin(twoPi<double> * f / 4.0 * k * u) / k;
+                    return v * std::exp(-u / 0.12) * 0.3; });
+        for (const int p : strumPos)
+            if (i % 16 == p)
+            {
+                const double ph = urand() * 6.0;
+                put(t, 0.3, [&](double u) {
+                    double v = 0.0;
+                    for (const double g : { 330.0, 392.0, 494.0, 659.0, 784.0 })
+                        v += std::sin(twoPi<double> * g * u + ph);
+                    return v * std::exp(-u / 0.15) * 0.25 + nrand() * std::exp(-u / 0.01) * 0.3; });
+            }
+    }
+    for (double t = t0; t < seconds; )
+    {
+        const int steps[7] = { 1, 1, 2, 2, 3, 3, 4 };
+        const double step = s16 * steps[static_cast<int>(urand() * 7.0) % 7];
+        const double f = 180.0 * std::pow(2.0, static_cast<int>(urand() * 5.0) / 12.0);
+        put(t, std::min(step, 0.25), [&](double u) {
+            double v = 0.0;
+            for (int k = 1; k < 12; ++k) v += std::sin(twoPi<double> * f * k * u) / k;
+            v *= std::min(1.0, u / 0.01) * std::exp(-u / 0.2) * 0.35;
+            if (u < 0.012) v += nrand() * 0.4;
+            return v; });
+        t += step;
+    }
+    for (int64_t i = 0; i < n; ++i)
+    {
+        const double u = static_cast<double>(i) / kFs;
+        const double ph = std::fmod(u - t0 + 100.0 * beat, beat) / beat;
+        const double pump = 0.3 + 0.7 * std::clamp(ph / 0.5, 0.0, 1.0);
+        x[static_cast<size_t>(i)] += 0.12 * pump * (std::sin(twoPi<double> * 220.0 * u)
+                                                    + std::sin(twoPi<double> * 277.0 * u)
+                                                    + std::sin(twoPi<double> * 330.0 * u));
+    }
+    double pk = 0.0;
+    for (const double v : x) pk = std::max(pk, std::abs(v));
+    const double drive = 6.0, rel = std::exp(-1.0 / (0.05 * kFs));
+    double env = 0.0;
+    c.x.resize(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i)
+    {
+        const double y = std::tanh(x[static_cast<size_t>(i)] / pk * drive) / std::tanh(drive);
+        env = std::max(std::abs(y), env * rel);
+        c.x[static_cast<size_t>(i)] = static_cast<float>(y * std::min(1.0, 0.5 / std::max(env, 1e-9)));
+    }
+    return c;
+}
+
 struct BeatScore
 {
     double f = 0.0, precision = 0.0, recall = 0.0, cemgil = 0.0;
@@ -1361,4 +1461,33 @@ DSPARK_TEST(Beat_reset_clears_the_causal_state)
     std::cout << "  after 180 BPM: " << afterFast << "; after reset and 70 BPM: "
               << afterSlow << "; a fresh instance on the same 70 BPM: " << reference << "\n";
     EXPECT_NEAR(afterSlow, reference, 1e-9);
+}
+
+// Dense, limited pop masters, where the kick states the beat and the strums,
+// syllables and syncopated bass have more onsets than it does. Before the
+// register-balanced level decision the tracker delivered half the tempo at
+// 135 BPM and 148 BPM at 92, and the delivered tempoBpm disagreed with its
+// own grid by up to 17.7%. Now the level must be right at every tempo, and
+// tempoBpm must be the grid's tempo (the median interval's, within its 5 ms
+// frame quantisation).
+DSPARK_TEST(Beat_dense_masters_get_the_kick_tempo_and_a_consistent_grid)
+{
+    for (const double bpm : { 92.0, 100.0, 120.0, 128.0, 135.0 })
+    {
+        const Corpus c = denseMaster(bpm, 35.0);
+        const auto r = analyzeCorpus(c);
+        std::vector<double> ibi;
+        for (size_t k = 1; k < r.beatSamples.size(); ++k)
+            ibi.push_back(static_cast<double>(r.beatSamples[k] - r.beatSamples[k - 1]));
+        std::sort(ibi.begin(), ibi.end());
+        const double gridBpm = ibi.empty() ? 0.0 : 60.0 * kFs / ibi[ibi.size() / 2];
+        const double tempo = static_cast<double>(r.tempoBpm);
+        std::cout << "  " << bpm << " BPM master: tempoBpm " << tempo << " ("
+                  << levelName(classify(tempo, bpm)) << "), grid " << gridBpm
+                  << ", confidence " << r.confidence << ", secondary "
+                  << r.secondaryTempoBpm << "\n";
+        EXPECT_TRUE(classify(tempo, bpm, 2.0) == Level::Correct);
+        EXPECT_NEAR(gridBpm, bpm, bpm * 0.02);
+        EXPECT_NEAR(tempo, gridBpm, gridBpm * 0.01);
+    }
 }

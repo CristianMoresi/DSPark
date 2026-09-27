@@ -168,13 +168,15 @@ public:
     enum class AutoMakeupMode
     {
         Off,      ///< Manual makeup only (setMakeupGain).
-        Static,   ///< Textbook auto makeup: a constant offset equal to half the static
-                  ///< gain reduction of a 0 dBFS signal, derived from the (smoothed)
-                  ///< threshold/ratio/knee. No program dependence: being constant,
-                  ///< it also lifts material that never reaches the threshold
-                  ///< (+7.5 dB at -20 dB / 4:1 / hard knee, even on a quiet
-                  ///< passage). Choose Adaptive to compensate only the reduction
-                  ///< actually applied.
+        Static,   ///< Textbook auto makeup (Giannoulis, Massberg & Reiss, JAES 2012):
+                  ///< a constant offset equal to half the static gain reduction of a
+                  ///< 0 dBFS signal, derived from the (smoothed) threshold/ratio/knee.
+                  ///< Being constant it never pumps and follows curve automation
+                  ///< without clicks - and, by the same token, it lifts material that
+                  ///< never reaches the threshold (+7.5 dB at -20 dB / 4:1 / hard knee,
+                  ///< even on a -40 dBFS passage). That is the defined behaviour, not a
+                  ///< side effect: to add makeup only where gain is actually reduced,
+                  ///< choose Adaptive.
         Adaptive  ///< Loudness matching: tracks the smoothed gain reduction (~300 ms)
                   ///< and compensates it in full, keeping the average output level
                   ///< matched to the input (quiet passages are lifted).

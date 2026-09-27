@@ -899,10 +899,13 @@ std::vector<double> resamplerStreamTone(double srcRate, double dstRate,
 
 } // namespace
 
-// The streaming path delays the signal by exactly sincPoints/2 input samples;
-// getLatency() must report it. At integer output ratios the impulse peak index
-// is exact; at fractional ratios the peak may land one sample off the rounded
-// getter (the true delay is fractional in output samples).
+// The streaming path delays the signal by exactly half the kernel length in
+// input samples; getLatency() must report it. At integer output ratios the
+// impulse peak index is exact; at fractional ratios the peak may land one
+// sample off the rounded getter (the true delay is fractional in output
+// samples). The peak of an on-grid impulse is the kernel's centre tap, which
+// is 1 only at ratio 1: elsewhere the stopband starts at Nyquist, so the
+// kernel is narrower than a half-band sinc and its centre tap below 1.
 DSPARK_TEST(Resampler_streaming_latency_matches_getter)
 {
     using Q = Resampler<float>::Quality;
@@ -938,7 +941,8 @@ DSPARK_TEST(Resampler_streaming_latency_matches_getter)
             if (c.exact)
             {
                 EXPECT_NEAR(measured, static_cast<double>(r.getLatency()), 1e-9);
-                EXPECT_NEAR(vmax, 1.0f, 1e-5f); // on-grid impulse passes intact
+                if (c.src == c.dst)
+                    EXPECT_NEAR(vmax, 1.0f, 1e-6f); // ratio 1: the impulse passes intact
             }
             else
             {
@@ -1016,18 +1020,19 @@ DSPARK_TEST(Resampler_offline_matches_streaming_shifted)
     EXPECT_TRUE(maxDiff == 0.0f);
 }
 
-// Upsampling image rejection per quality tier (the numbers documented in the
-// class table, with margin). A 20 kHz tone at 48->96 kHz leaves its image at
-// 28 kHz; fit-and-subtract of the fundamental exposes everything else.
+// Upsampling image rejection per quality tier, on the float instantiation. A
+// 20 kHz tone at 48->96 kHz leaves its image at 28 kHz; fit-and-subtract of
+// the fundamental exposes everything else. Before the kernels were designed
+// from a stopband specification: Draft -12, Normal -56, High -142, Ultra -139.
 DSPARK_TEST(Resampler_quality_tiers_reject_upsampling_images)
 {
     using Q = Resampler<float>::Quality;
     struct Tier { Q q; double maxResidualDb; };
     const Tier tiers[] = {
-        { Q::Draft,  -9.0 },   // measured -12 dB
-        { Q::Normal, -50.0 },  // measured -56 dB
-        { Q::High,   -120.0 }, // measured -142 dB
-        { Q::Ultra,  -120.0 }, // measured -139 dB
+        { Q::Draft,  -70.0 },  // measured -76.9 dB
+        { Q::Normal, -115.0 }, // measured -122.5 dB
+        { Q::High,   -130.0 }, // measured -137.9 dB
+        { Q::Ultra,  -140.0 }, // measured -145.8 dB (float arithmetic's floor)
     };
 
     for (const auto& t : tiers)
@@ -1054,16 +1059,17 @@ DSPARK_TEST(Resampler_quality_tiers_reject_upsampling_images)
 
 // Downsampling: a 26 kHz tone at 96->44.1 kHz sits above the target Nyquist
 // and must be rejected (it would alias to 18.1 kHz), while an in-band 10 kHz
-// tone must pass at unity. The 26 kHz case probes the transition band right
-// at the band edge: only Ultra's kernel keeps it in the deep stopband.
+// tone must pass at unity. The stopband starts at the target Nyquist, so the
+// tone is in every tier's stopband (before: Normal -27, High -69, Ultra -143).
 DSPARK_TEST(Resampler_downsampling_rejects_aliases)
 {
     using Q = Resampler<float>::Quality;
     struct Tier { Q q; double maxAliasDb; };
     const Tier tiers[] = {
-        { Q::Normal, -20.0 },  // measured -27 dB
-        { Q::High,   -55.0 },  // measured -69 dB (inside its transition band)
-        { Q::Ultra,  -120.0 }, // measured -143 dB
+        { Q::Draft,  -60.0 },  // measured -68.8 dB
+        { Q::Normal, -110.0 }, // measured -119.2 dB
+        { Q::High,   -150.0 }, // measured -159.5 dB
+        { Q::Ultra,  -150.0 }, // measured -159.3 dB (float arithmetic's floor)
     };
 
     for (const auto& t : tiers)
@@ -1083,6 +1089,39 @@ DSPARK_TEST(Resampler_downsampling_rejects_aliases)
     }
 }
 
+
+// The double instantiation reaches Ultra's specification: at 44.1 <-> 48 kHz
+// and at an irrational ratio (the 512-phase table read with cubic
+// interpolation) a 19 kHz tone comes out at unity gain and everything else
+// more than 200 dB below it. The exact polyphase path measured -218.8 and
+// -220.8 dB, the table path -217.1 dB; the previous fixed 128-tap kernel
+// with linear phase interpolation stopped at -105 dB.
+DSPARK_TEST(Resampler_ultra_double_reaches_its_specification)
+{
+    using R = Resampler<double>;
+    const std::pair<double, double> pairs[] = {
+        { 44100.0, 48000.0 }, { 48000.0, 44100.0 }, { 44100.0, 48000.0 * 1.0000371 },
+    };
+    for (const auto& [src, dst] : pairs)
+    {
+        constexpr int n = 1 << 16;
+        std::vector<double> in(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            in[static_cast<size_t>(i)] = 0.5 * std::sin(2.0 * 3.14159265358979323846 * 19000.0 * i / src);
+        R r;
+        r.prepare(src, dst, R::Quality::Ultra);
+        auto out = r.process(in.data(), n);
+        const int n0 = 4096;
+        const int len = static_cast<int>(out.size()) - 8192;
+        const double fund = resamplerFitTone(out, n0, len, 19000.0, dst, true);
+        double rms = 0.0;
+        for (int i = 0; i < len; ++i)
+            rms += out[static_cast<size_t>(n0 + i)] * out[static_cast<size_t>(n0 + i)];
+        rms = std::sqrt(rms / len);
+        EXPECT_NEAR(fund, 0.5, 1e-8);
+        EXPECT_LT(20.0 * std::log10(rms / (fund / std::sqrt(2.0)) + 1e-300), -200.0);
+    }
+}
 
 // ============================================================================
 // ZeroLatencyConvolver (Gardner non-uniform partitioning)

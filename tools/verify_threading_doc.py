@@ -377,6 +377,7 @@ CENSUS_EXPECTED = {
         "Effects/SpectralFreeze.h",
         "Effects/TimeStretch.h",
         "Effects/detail/PhaseVocoderEngine.h",
+        "Effects/detail/StudioVocoder.h",
         "Music/KeyDetector.h",
     ],
     "template": [
@@ -394,6 +395,7 @@ CENSUS_EXPECTED = {
         "Effects/SpectralFreeze.h",
         "Effects/TimeStretch.h",
         "Effects/detail/PhaseVocoderEngine.h",
+        "Effects/detail/StudioVocoder.h",
         "Music/KeyDetector.h",
     ],
     "overlap": [
@@ -558,7 +560,7 @@ def build_census_controls(text, source):
         stale_census = remove_census_member(
             stale_census, "concrete", "Analysis/BeatTracker.h")
         controls.extend((
-            ("stale-10-5-7-2", stale_census, "SOURCE_SET_MISMATCH:"),
+            ("stale-11-5-8-2", stale_census, "SOURCE_SET_MISMATCH:"),
             ("block-absent", text.replace(CENSUS_BEGIN, "", 1),
              "DOC_CENSUS_BLOCK_CARDINALITY"),
             ("block-duplicate", text + "\n" + text.split(CENSUS_BEGIN, 1)[1]
@@ -592,8 +594,8 @@ census_controls, census_control_construction_issues = \
     build_census_controls(doc, pin_census)
 failures.extend(
     "D: " + issue for issue in census_control_construction_issues)
-if len(census_controls) != 33:
-    failures.append("D: threading census control cardinality is {}, expected 33"
+if len(census_controls) != 35:
+    failures.append("D: threading census control cardinality is {}, expected 35"
                     .format(len(census_controls)))
 for name, mutant, expected_prefix in census_controls:
     issues = validate_pin_census(mutant, pin_census)

@@ -5,66 +5,71 @@
 
 /**
  * @file PitchShifter.h
- * @brief Phase-vocoder pitch shifter with identity phase locking.
+ * @brief Real-time pitch shifter: a phase vocoder stretches, a sinc reader
+ *        resamples the stretched stream back to the original duration.
  *
- * Time-stretches the signal with a phase vocoder and resamples the stretched
- * stream back to the original duration, shifting pitch by the same ratio.
- * Quality rests on three techniques:
+ * Two engines sit behind setQuality():
  *
- * - **Identity phase locking** (Laroche & Dolson 1999): spectral peaks are
- *   detected each frame and every bin in a peak's region of influence is
- *   rotated by the *same* phase increment as its peak, preserving the vertical
- *   phase coherence whose loss causes the classic phase-vocoder "phasiness".
- * - **Transient phase reset**: onsets (energy rising > 6 dB over the tracked
- *   envelope) re-initialise synthesis phases to the analysis phases, keeping
- *   attacks sharp instead of smeared. Peaks with no history (new partials)
- *   are reset individually even without a global onset.
- * - **Spectral anti-alias cut**: shifting up reads the synthesis stream
- *   faster, so content above Nyquist/ratio would alias; those bins are
- *   tapered to zero in the frequency domain before synthesis.
+ * - **Quality::Studio (default)**, Effects/detail/StudioVocoder.h:
+ *   phase-gradient heap integration (Prusa & Holighaus 2017) on a reference
+ *   summed over every channel, instantaneous frequency from a second
+ *   transform 16 samples on, and a time map anchored on strikes found by a
+ *   look-ahead spectral-flux detector. The stretched stream is read back at
+ *   the pitch ratio with the 32-tap windowed sinc of Core/Interpolation.h.
+ * - **Quality::Standard / Quality::High**, the 1.8 engine
+ *   (Effects/detail/PhaseVocoderEngine.h): identity phase locking (Laroche &
+ *   Dolson 1999) with phase reset on energy onsets, decided on the FIRST
+ *   channel. Standard reads with a 4-point Catmull-Rom interpolator and is
+ *   the 1.8 rendering, pinned by stored references; High reads with the
+ *   32-tap sinc at the same latency.
  *
- * Architecture (per block, streaming, zero allocation):
+ * Measured against the ideal (each source re-synthesised at the shifted
+ * pitch) at -12, -5, -2, +3, +7 and +12 semitones, stereo, 48 kHz: spectral
+ * scores over a chord, a bass line and a sung vowel, strike scores over a
+ * drum pattern and a mix:
  *
- *   input ring -> analysis hop Ra (variable, fractional-accumulator exact)
- *     -> FFT -> peak picking & phase propagation (reference channel)
- *     -> per-channel rigid phase rotation per region -> IFFT
- *     -> overlap-add at fixed synthesis hop Rs = N/4 (exact COLA)
- *     -> fractional reader at rate `ratio` -> output
+ *   engine                    LSD dB  conv dB  attack dB  pre-echo dB  onset ms
+ *   Studio, 2048 (default)     1.96   -14.22     -2.84      -94.1       0.68
+ *   Studio, 4096               1.47   -18.66     -2.84      -79.5       0.89
+ *   1.8 engine, Standard       2.50   -12.16     -4.74      -78.4      13.18
  *
- * The analysis/synthesis stages up to the OLA ring are the shared vocoder
- * engine (Effects/detail/PhaseVocoderEngine.h); this class owns the
- * resample-back stage and the latency-compensated dry path.
+ * (LSD: multi-resolution log-spectral distance; conv: spectral convergence;
+ * attack: energy of the first 5 ms against the ideal's, closer to 0 is
+ * better; pre-echo: energy in the 20 ms before each strike above the
+ * ideal's, relative to the strike; onset: median error of the unaligned
+ * onset time. Lower is better elsewhere.)
  *
- * Resample-back quality (setQuality()): Quality::Standard reads the
- * synthesis stream with a 4-point Catmull-Rom interpolator, the published
- * rendering (a stored-reference test pins it). Its error changes with the
- * fractional read position, which sweeps whenever the pitch moves, so it
- * surfaces as HF modulation noise: a 12 kHz tone shifted by +0.3 semitones
- * comes out 0.55 dB low over a -23.5 dB residual (16 kHz: 1.5 dB low, -14.5
- * dB). Quality::High reads it with the 32-tap windowed sinc of
- * Core/Interpolation.h: exact amplitude and a -50 dB residual at 12 kHz
- * (-46 to -72 dB at 16 kHz), at the same latency. High is recommended for
- * new work; Standard stays the default so existing renders do not move.
+ * The 1.8 engine's reader trails a write head that advances at the pitch
+ * ratio, so its real delay drifts with the pitch: a tone burst's energy
+ * centroid lands 64 ms late at -12 semitones and 32 ms early at +12 against
+ * one reported latency, and a source absent from the first channel (panned
+ * hard right) comes out 48 dB down. Studio steers its timeline so the reader
+ * stands a fixed latency behind the input at every pitch (a mean 1.6 ms off
+ * at -12 semitones, within 0.2 ms from -1 to +12) and shifts a source panned
+ * to either side exactly.
  *
- * The analysis hop carries a fractional accumulator so the average stretch is
- * exactly Rs/(Rs/ratio) = ratio: tuning is exact for arbitrary ratios, with
- * no cumulative drift. Channels share the reference channel's peak/phase
- * decisions (rigid per-region rotation), which preserves inter-channel phase
- * differences exactly - the stereo image does not wander.
+ * Studio's latency, 1.5 frames plus the onset look-ahead, a quarter frame of
+ * anchor lead and the sinc's reach, is fixed for every pitch: 5184 samples
+ * (108 ms) at the default 2048 frame and 48 kHz. The 1.8 engine's is 2 *
+ * fftSize (4096). The dry path of the mix control is delay-compensated to
+ * the reported value, so partial mixes stay comb-free. Crossing between
+ * Studio and the 1.8 engine restarts the stream on the next block (their
+ * latencies differ); Standard and High cross-fade into each other live.
+ * Channels beyond the prepared count pass through untouched.
  *
- * Latency: 2 * fftSize samples (reported by getLatency(), measured exact at
- * unity ratio: reader offset fftSize + fftSize/4 behind the write head plus
- * the fftSize - fftSize/4 window/OLA delay of the analysis-synthesis chain).
- * The dry path of the mix control is delay-compensated to the same value, so
- * partial mixes stay comb-free. Channels beyond the prepared count pass
- * through untouched (and therefore uncompensated).
+ * Both engines glide the active shift toward the target at up to 0.5
+ * semitones per analysis hop, keep the average stretch exactly equal to the
+ * ratio (a fractional-accumulator hop, no cumulative drift), taper the bins
+ * an upward shift would fold above Nyquist, and share one rotation across
+ * channels, which keeps the stereo image from wandering.
  *
  * Threading model: parameter setters/getters are std::atomic based and safe
  * from any thread (non-finite values are ignored); prepare() is setup-thread
  * only (allocates; invalid specs are ignored); reset() belongs to the owner
  * of the stream; getState()/setState() are setup/UI threads.
  *
- * Dependencies: Effects/detail/PhaseVocoderEngine.h, Core/AudioSpec.h,
+ * Dependencies: Effects/detail/PhaseVocoderEngine.h,
+ * Effects/detail/StudioVocoder.h, Core/AudioSpec.h,
  * Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h,
  * Core/Interpolation.h, Core/StateBlob.h.
  */
@@ -76,6 +81,7 @@
 #include "../Core/Interpolation.h"
 #include "../Core/StateBlob.h"
 #include "detail/PhaseVocoderEngine.h"
+#include "detail/StudioVocoder.h"
 
 #include <algorithm>
 #include <atomic>
@@ -107,19 +113,30 @@ public:
      * stays pass-through.
      *
      * @param spec    Audio environment specification.
-     * @param fftSize STFT frame size, power of two (default 2048). Smaller
-     *                sizes lower latency and favour transients; larger sizes
-     *                favour low-pitched material.
+     * @param fftSize STFT frame size, a power of two, used by whichever
+     *                engine is selected. 0 (the default) selects 2048 for
+     *                Standard and High, and the power of two nearest 43 ms
+     *                for Studio (2048 at 44.1 and 48 kHz, 4096 at 88.2 and
+     *                96 kHz). Smaller sizes lower latency and favour
+     *                transients; larger sizes favour low-pitched material
+     *                (Studio at 4096: lower spectral error, see the file
+     *                overview, at 1.5 times the latency).
      */
-    void prepare(const AudioSpec& spec, int fftSize = 2048)
+    void prepare(const AudioSpec& spec, int fftSize = 0)
     {
-        if (!spec.isValid() || (fftSize & (fftSize - 1)) != 0
-            || fftSize < 256 || fftSize > (1 << 20))
+        if (!spec.isValid()) return;
+        if (fftSize != 0 && ((fftSize & (fftSize - 1)) != 0
+                             || fftSize < 256 || fftSize > (1 << 20)))
             return;
 
         prepared_.store(false, std::memory_order_relaxed);
 
         numChannels_ = std::max(1, spec.numChannels);
+        // 0 selects each engine's default frame: 2048 for Standard/High (the
+        // published rendering), about 43 ms for Studio (2048 at 44.1 and
+        // 48 kHz, 4096 at 88.2 and 96 kHz).
+        const int fftStudio = fftSize != 0 ? fftSize : studioDefaultFrame(spec.sampleRate);
+        if (fftSize == 0) fftSize = 2048;
 
         // The reader trails the write head by readOffset_; the window/OLA
         // chain adds another fftSize - synthHop, so the measured wet latency
@@ -129,8 +146,22 @@ public:
         const int synthHop = fftSize / 4;
         readOffset_ = fftSize + synthHop;
         latency_    = readOffset_ + fftSize - synthHop;
+        // Studio: the resample reader runs at the pitch ratio behind the
+        // completed stream. At ratio a an input sample reaches the completed
+        // stream after half a frame, a frame of analysis, the onset
+        // lookahead and one analysis hop, and the reader needs its sinc
+        // reach beyond that; the worst case is the lowest ratio, 0.5:
+        // N/(2a) + N/2 + lookahead + taps/a = 1.5 N + lookahead + 32. A
+        // strike anchor may move an analysis frame ahead of the nominal
+        // timeline by up to a quarter frame at that ratio, which the last
+        // term covers. One fixed latency for every ratio, so the dry path
+        // and host compensation hold at any pitch.
+        studio_.prepare(spec.sampleRate, numChannels_, fftStudio, true);
+        studio_.setAnchorLeadLimit(static_cast<double>(fftStudio / 4));
+        latencyStudio_ = fftStudio + fftStudio / 2 + studio_.lookahead() + fftStudio / 4 + 64;
+        latencyLegacy_ = latency_;
         drySize_ = 1;
-        while (drySize_ < latency_ + 1) drySize_ <<= 1;
+        while (drySize_ < std::max(latencyLegacy_, latencyStudio_) + 1) drySize_ <<= 1;
         dryMask_ = drySize_ - 1;
 
         // The engine owns the analysis rings, spectral state and OLA ring;
@@ -168,35 +199,49 @@ public:
     void reset() noexcept
     {
         if (!prepared_.load(std::memory_order_relaxed)) return;
+        studioActive_ = quality_.load(std::memory_order_relaxed) == Quality::Studio;
+        latency_ = studioActive_ ? latencyStudio_ : latencyLegacy_;
         engine_.reset();
+        studio_.reset();
         for (auto& r : dryRing_) std::fill(r.begin(), r.end(), T(0));
+        studioOut_ = 0;
+        {
+            // The reader starts where output 0 shows input -latency, and
+            // advances at the pitch ratio from there.
+            const double start = studio_.streamPositionOf(-static_cast<double>(latencyStudio_));
+            studioReadInt_ = static_cast<int64_t>(std::floor(start));
+            studioReadFrac_ = start - static_cast<double>(studioReadInt_);
+        }
 
         dryPos_ = 0;
         readPosInt_ = engine_.writeHead() - readOffset_;
         readPosFrac_ = 0.0;
         currentMix_ = mix_.load(std::memory_order_relaxed);
-        highReader_ = quality_.load(std::memory_order_relaxed) == Quality::High;
+        highReader_ = quality_.load(std::memory_order_relaxed) != Quality::Standard;
         readerFadeLeft_ = 0;   // start settled on the selected reader
     }
 
     // -- Parameters (thread-safe) -----------------------------------------------
 
-    /** @brief Resample-back reader quality (see the file overview). */
+    /** @brief Engine and resample-back reader (see the file overview). */
     enum class Quality
     {
-        Standard,   ///< 4-point Catmull-Rom reader: the published rendering (default).
-        High        ///< 32-tap windowed-sinc reader: transparent HF, same latency.
+        Standard,   ///< 1.8 engine, 4-point Catmull-Rom reader: the 1.8 default rendering.
+        High,       ///< 1.8 engine, 32-tap windowed-sinc reader: transparent HF.
+        Studio      ///< Studio engine (default): see the file overview.
     };
 
     /**
-     * @brief Selects the resample-back reader. Thread-safe; a change
-     *        crossfades between the two readers over 64 samples.
-     * @param quality Reader quality. Out-of-range values clamp to High.
+     * @brief Selects the engine and reader. Thread-safe. Standard and High
+     *        crossfade into each other over 64 samples; crossing to or from
+     *        Studio restarts the stream at the next block (the latencies
+     *        differ), so a host should re-read getLatency() after it.
+     * @param quality Engine and reader. Out-of-range values clamp to Studio.
      */
     void setQuality(Quality quality) noexcept
     {
         quality = static_cast<Quality>(std::clamp(static_cast<int>(quality), 0,
-                                                  static_cast<int>(Quality::High)));
+                                                  static_cast<int>(Quality::Studio)));
         quality_.store(quality, std::memory_order_relaxed);
     }
 
@@ -284,8 +329,10 @@ public:
         return formantPreserve_.load(std::memory_order_relaxed);
     }
 
-    /** @brief Reports total latency in samples (2 * fftSize, measured exact at
-     *  unity ratio; ~85 ms at the default 2048 frame and 48 kHz). */
+    /** @brief Reports total latency in samples. Studio: 1.5 * fftSize +
+     *  lookahead + fftSize / 4 + 64 (5184, 108 ms, at the default frame and
+     *  48 kHz), held at every pitch. Standard and High: 2 * fftSize, exact at
+     *  unity only (their real delay drifts with the pitch; file overview). */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
@@ -330,6 +377,15 @@ public:
 
         const int nCh = std::min(buffer.getNumChannels(), numChannels_);
         const int nS  = buffer.getNumSamples();
+        // Crossing between Studio and the 1.8 engine restarts the stream:
+        // the two run different latencies, so no crossfade can join them.
+        if ((quality_.load(std::memory_order_relaxed) == Quality::Studio) != studioActive_)
+            reset();
+        if (studioActive_)
+        {
+            processStudio(buffer, nCh, nS);
+            return;
+        }
 
         // Rate-limited mix ramp (moveTowards, exact landing; settled it
         // reduces to the constant, bit-identically). A per-block ramp landed
@@ -441,6 +497,104 @@ public:
     }
 
 private:
+    /**
+     * @brief The Studio path: stream the input into the engine, read its
+     *        stretched stream back at the pitch ratio with the 32-tap sinc.
+     *
+     * The reader's rate is the engine's glided ratio, so the pitch is exactly
+     * that ratio; its position is steered, not free: before each frame the
+     * engine is told where on the input timeline the reader will stand when
+     * it reaches that frame, so the latency stays latencyStudio_ through
+     * pitch changes instead of drifting with them.
+     */
+    void processStudio(AudioBufferView<T> buffer, int nCh, int nS) noexcept
+    {
+        const T mixTarget = mix_.load(std::memory_order_relaxed);
+        const T mixStart  = currentMix_;
+        const int64_t mask = studio_.olaMask();
+        int i = 0;
+        while (i < nS)
+        {
+            const int need = studio_.samplesToNextHop();
+            if (need == 0)
+            {
+                studio_.commitInput(0, nCh);
+                continue;
+            }
+            const int chunk = std::min(nS - i, need);
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                const T* in = buffer.getChannel(ch) + i;
+                studio_.pushInput(ch, in, chunk);
+                auto& dry = dryRing_[static_cast<size_t>(ch)];
+                int dp = dryPos_;
+                for (int k = 0; k < chunk; ++k)
+                {
+                    dry[static_cast<size_t>(dp)] = in[k];
+                    dp = (dp + 1) & dryMask_;
+                }
+            }
+
+            const double ratio = studio_.activeRatio();
+            int64_t rpEnd = studioReadInt_;
+            double rfEnd = studioReadFrac_;
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* out = buffer.getChannel(ch) + i;
+                const T* acc = studio_.olaData(ch);
+                const auto& dry = dryRing_[static_cast<size_t>(ch)];
+                int64_t rp = studioReadInt_;
+                double rf = studioReadFrac_;
+                int dp = dryPos_;
+                for (int k = 0; k < chunk; ++k)
+                {
+                    const T wet = reader_.readRing(acc, mask, rp, rf);
+                    const T drySample = dry[static_cast<size_t>((dp - latency_) & dryMask_)];
+                    const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + k + 1));
+                    out[k] = drySample * (T(1) - mixVal) + wet * mixVal;
+                    rf += ratio;
+                    const auto adv = static_cast<int64_t>(rf);
+                    rp += adv;
+                    rf -= static_cast<double>(adv);
+                    dp = (dp + 1) & dryMask_;
+                }
+                if (ch == 0) { rpEnd = rp; rfEnd = rf; }
+            }
+            if (nCh == 0)
+            {
+                for (int k = 0; k < chunk; ++k)
+                {
+                    rfEnd += ratio;
+                    const auto adv = static_cast<int64_t>(rfEnd);
+                    rpEnd += adv;
+                    rfEnd -= static_cast<double>(adv);
+                }
+            }
+            studioReadInt_ = rpEnd;
+            studioReadFrac_ = rfEnd;
+            dryPos_ = (dryPos_ + chunk) & dryMask_;
+            studioOut_ += chunk;
+
+            // Steer the frame after the next one: where the reader will stand
+            // on the input timeline when it reaches that frame's centre.
+            const double c = studio_.nextStreamCentre() + static_cast<double>(studio_.synthHop());
+            const double here = static_cast<double>(studioReadInt_) + studioReadFrac_;
+            studio_.steerTimeline(static_cast<double>(studioOut_) + (c - here) / ratio
+                                  - static_cast<double>(latencyStudio_));
+            studio_.commitInput(chunk, nCh);
+            i += chunk;
+        }
+        currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS));
+    }
+
+    /** @brief Studio's default frame: the power of two nearest 43 ms. */
+    [[nodiscard]] static int studioDefaultFrame(double sampleRate) noexcept
+    {
+        int n = 256;
+        while (n < (1 << 16) && static_cast<double>(n) * 1.5 < 0.0427 * sampleRate) n <<= 1;
+        return n;
+    }
+
     /** @brief Reads the synthesis stream with the selected reader. */
     [[nodiscard]] T readWet(bool high, const T* acc, int64_t ip, double frac) const noexcept
     {
@@ -471,6 +625,11 @@ private:
         p.transientPreserve = transientPreserve_.load(std::memory_order_relaxed);
         p.formantPreserve = formantPreserve_.load(std::memory_order_relaxed);
         engine_.publishParams(p);
+        typename detail::StudioVocoder<T>::Params q;
+        q.targetSemitones = p.targetSemitones;
+        q.transientPreserve = p.transientPreserve;
+        q.formantPreserve = p.formantPreserve;
+        studio_.publishParams(q);
     }
 
     // -- Members -----------------------------------------------------------------
@@ -483,7 +642,14 @@ private:
     int dryMask_ = 8191;
     int64_t accumMask_ = 8191;   ///< Cached engine OLA ring mask.
 
-    detail::PhaseVocoderEngine<T> engine_;   ///< Shared analysis/synthesis core.
+    detail::PhaseVocoderEngine<T> engine_;   ///< 1.8 engine (Standard / High).
+    detail::StudioVocoder<T> studio_;        ///< Studio engine.
+    bool studioActive_ = true;               ///< Engine in force since reset().
+    int latencyStudio_ = 5184;               ///< Studio's fixed latency.
+    int latencyLegacy_ = 4096;               ///< 1.8 engine's latency (2 * fftSize).
+    int64_t studioReadInt_ = 0;              ///< Studio reader position (integer part).
+    double studioReadFrac_ = 0.0;            ///< Studio reader position (fraction).
+    int64_t studioOut_ = 0;                  ///< Output samples since reset().
     SincInterpolator<T> reader_;             ///< High-quality reader (it trails the
                                              ///< OLA write head by far more than
                                              ///< its 16-sample reach).
@@ -503,7 +669,7 @@ private:
     std::atomic<T> mix_ { T(1) };
     std::atomic<bool> transientPreserve_ { true };
     std::atomic<bool> formantPreserve_ { false };
-    std::atomic<Quality> quality_ { Quality::Standard };
+    std::atomic<Quality> quality_ { Quality::Studio };
 };
 
 } // namespace dspark

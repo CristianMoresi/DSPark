@@ -4,7 +4,50 @@ All notable user-facing changes to DSPark are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `TimeStretch::Quality::Studio` and `PitchShifter::Quality::Studio`, a new
+  engine and the default for new instances: phase-gradient heap integration
+  on a reference summed over every channel, an unambiguous
+  instantaneous-frequency estimate, and a time map anchored on strikes found
+  by a look-ahead spectral-flux detector; inside a strike's lock the bins
+  the strike rises into are copied unrotated, so it carries no pre-echo.
+  Scored against an ideal rendering of the same scenes: time stretch
+  spectral distance 4.12 dB (1.8 engine 5.01), strike timing 0.59 ms median
+  (4.16); pitch shift spectral distance 1.96 dB at the default frame and
+  1.47 at 4096 (1.8 engine 2.50), strike timing 0.68 ms (13.18).
+- The Studio pitch shifter's latency is the same at every pitch (the 1.8
+  engine's real delay drifted 64 ms late at -12 semitones and 32 ms early
+  at +12 against one reported latency), and it shifts a source panned hard
+  to either side exactly (the 1.8 engine, deciding phases on the first
+  channel, attenuated a right-only source by 48 dB).
+- `Resampler` kernels are designed per conversion from a specification - a
+  passband edge and a stopband attenuation per quality tier, with the
+  stopband starting at the lower Nyquist frequency - and every rational
+  ratio (all common audio rates) uses exact polyphase phases with integer
+  position arithmetic; other ratios read a 512-phase table with cubic
+  interpolation across phases. In double precision, worst over six common
+  conversions, Ultra leaves a -220 dB residual and a -214 dB stopband
+  (before: -105 dB and -53 dB) with a flat passband to 0.915 of Nyquist.
+  `getFilterLength()` reports the kernel length.
+
 ### Changed
+
+- `Resampler` quality tiers are now specifications (Draft 0.80 of Nyquist
+  and 60 dB, Normal 0.90 and 100 dB, High 0.91 and 140 dB, Ultra 0.915 and
+  210 dB), so kernels are longer than the former fixed 8/32/64/128 taps and
+  latencies grow accordingly (High 44.1 -> 48 kHz: 112 output samples, was
+  35). A ratio of exactly 1 is a one-sample delay. Draft's passband now ends
+  at 0.80 of Nyquist.
+- New `TimeStretch` and `PitchShifter` instances use Studio. Latencies at
+  the default frames and 48 kHz: `PitchShifter` 5184 samples (was 4096),
+  `TimeStretch`'s fixed-rate adaptor 5632 (was 2048). `prepare()`'s frame
+  argument now defaults to 0, each engine's own frame. `setQuality()`
+  selects the 1.8 renderings (`Standard`, and `High` for the pitch
+  shifter), bit-exact as before; state blobs saved by 1.8 restore them.
+  `PitchCorrector` keeps the 1.8 engine, whose retune dynamics it is tuned
+  to. Crossing between Studio and a 1.8 engine in `PitchShifter` restarts
+  the stream at the next block.
 
 - `AlgorithmicReverb` mixes its tail through a time-varying feedback matrix:
   after the Hadamard mix, line pairs turn through slow Givens rotations
@@ -43,7 +86,7 @@ All notable user-facing changes to DSPark are documented here.
   short-term values sampled at 10 Hz (the minimum Tech 3342 has required
   since V3). A steady tone below 12 s read LRA 20 LU and now reads 0; on a
   music fragment the reading matches the Tech 3342 reference code within
-  0.06 LU and FFmpeg's ebur128 within 0.1 LU.
+  0.06 LU.
 
 ## [1.8.0] - 2026-09-26
 

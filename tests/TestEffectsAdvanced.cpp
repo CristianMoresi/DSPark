@@ -4105,7 +4105,8 @@ DSPARK_TEST(PitchShifter_high_quality_reader_is_transparent_at_high_frequencies)
     // samples and then matches a twin that ran High from the start exactly.
     auto render = [](bool high, int switchAt) {
         PitchShifter<double> ps;
-        if (high) ps.setQuality(PitchShifter<double>::Quality::High);
+        ps.setQuality(high ? PitchShifter<double>::Quality::High
+                           : PitchShifter<double>::Quality::Standard);
         ps.prepare(spec(48000.0, 256, 1));
         ps.setSemitones(0.3);
         std::vector<double> x(static_cast<size_t>(300 * 256));
@@ -4612,6 +4613,147 @@ DSPARK_TEST(PitchShifter_wet_and_dry_are_time_aligned)
         EXPECT_GT(gain, 0.9);   // old header: 0.0000 (full cancellation)
         EXPECT_LT(gain, 1.1);
     }
+}
+
+// The 1.8 engine's resample reader trails a write head that moves at the
+// pitch ratio, so its real delay drifts with the pitch: the energy centroid
+// of a 40 ms tone burst lands 64 ms late at -12 semitones and 32 ms early at
+// +12, against one reported latency. Studio steers its timeline so the
+// reader always stands a fixed latency behind the input: measured 1.6 ms
+// mean at -12 semitones and within 0.2 ms from -1 to +12, under random
+// block sizes.
+DSPARK_TEST(PitchShifter_studio_latency_holds_at_every_pitch)
+{
+    using PS = PitchShifter<float>;
+    constexpr int period = 12000, len = 1920, bursts = 12;
+    constexpr int n = period * (bursts + 2);
+    std::vector<float> x(static_cast<size_t>(n), 0.0f);
+    for (int b = 0; b < bursts; ++b)
+    {
+        const int s0 = period * (b + 1) - len / 2;
+        for (int k = 0; k < len; ++k)
+        {
+            const double w = 0.5 - 0.5 * std::cos(6.283185307179586 * k / len);
+            x[static_cast<size_t>(s0 + k)] = static_cast<float>(
+                0.5 * w * std::sin(6.283185307179586 * 440.0 * (s0 + k) / 48000.0));
+        }
+    }
+    for (const float st : { -12.0f, -7.0f, 0.0f, 7.0f, 12.0f })
+    {
+        auto ps = std::make_unique<PS>();
+        ps->prepare(spec(48000.0, 512, 1));
+        ps->setSemitones(st);
+        ps->reset();
+        const int L = ps->getLatency();
+        std::vector<float> y = x;
+        uint32_t seed = 7u;
+        for (int i = 0; i < n;)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            const int m = std::min(n - i, 1 + static_cast<int>((seed >> 8) % 512u));
+            float* p[1] = { y.data() + i };
+            ps->processBlock(AudioBufferView<float>(p, 1, m));
+            i += m;
+        }
+        double meanDev = 0.0, worstDev = 0.0;
+        for (int b = 1; b < bursts - 1; ++b)
+        {
+            const int c = period * (b + 1);
+            double num = 0.0, den = 0.0;
+            for (int i = c + L - period / 2; i < c + L + period / 2; ++i)
+            {
+                const double e = static_cast<double>(y[static_cast<size_t>(i)]) * y[static_cast<size_t>(i)];
+                num += e * i;
+                den += e;
+            }
+            const double dev = num / den - static_cast<double>(c + L);
+            meanDev += dev / (bursts - 2);
+            worstDev = std::max(worstDev, std::abs(dev));
+        }
+        EXPECT_LT(std::abs(meanDev), 96.0);   // 2 ms (1.8 engine: 3064 at -12)
+        EXPECT_LT(worstDev, 192.0);           // 4 ms
+    }
+}
+
+// Studio decides peaks and phases on the channels' summed power, so a source
+// panned hard to either side is shifted as well as a centred one. The 1.8
+// engine decides them on the first channel alone.
+DSPARK_TEST(PitchShifter_studio_shifts_a_hard_panned_source)
+{
+    using PS = PitchShifter<float>;
+    for (const int side : { 0, 1 })
+    {
+        auto ps = std::make_unique<PS>();
+        ps->prepare(spec(48000.0, 512, 2));
+        ps->setSemitones(7.0f);
+        const int total = 48000 * 3 / 512 * 512;
+        std::vector<float> outSide(static_cast<size_t>(total)), outOther(static_cast<size_t>(total));
+        auto buf = makeStereoBuffer(512);
+        int n = 0;
+        for (int b = 0; b < total / 512; ++b)
+        {
+            for (int i = 0; i < 512; ++i, ++n)
+            {
+                buf.ch(side)[i] = 0.5f * std::sin(dspark::twoPi<float> * 440.0f * static_cast<float>(n) / 48000.0f);
+                buf.ch(1 - side)[i] = 0.0f;
+            }
+            ps->processBlock(buf.view());
+            for (int i = 0; i < 512; ++i)
+            {
+                outSide[static_cast<size_t>(b * 512 + i)] = buf.ch(side)[i];
+                outOther[static_cast<size_t>(b * 512 + i)] = buf.ch(1 - side)[i];
+            }
+        }
+        const int tail = 16384;
+        const double got = measureDominantHz(outSide.data() + total - tail, tail, 48000.0);
+        EXPECT_NEAR(1200.0 * std::log2(got / (440.0 * std::exp2(7.0 / 12.0))), 0.0, 2.0);
+        double eSide = 0.0, eOther = 0.0;
+        for (int i = total - tail; i < total; ++i)
+        {
+            eSide += double(outSide[static_cast<size_t>(i)]) * outSide[static_cast<size_t>(i)];
+            eOther += double(outOther[static_cast<size_t>(i)]) * outOther[static_cast<size_t>(i)];
+        }
+        const double rms = std::sqrt(eSide / tail);
+        EXPECT_GT(rms, 0.5 / std::sqrt(2.0) * 0.9);
+        EXPECT_LT(rms, 0.5 / std::sqrt(2.0) * 1.1);
+        EXPECT_LT(eOther, 1e-12);
+    }
+}
+
+// Studio and the 1.8 engine run different latencies, so crossing between
+// them mid-stream restarts the stream on the next block instead of joining
+// two timelines: the reported latency follows the engine, the output stays
+// finite, and the pitch is exact again once the new engine has filled.
+DSPARK_TEST(PitchShifter_engine_switch_restarts_the_stream)
+{
+    using PS = PitchShifter<float>;
+    auto ps = std::make_unique<PS>();
+    ps->prepare(spec(48000.0, 512, 1));
+    ps->setSemitones(7.0f);
+    EXPECT_EQ(static_cast<int>(ps->getQuality()), static_cast<int>(PS::Quality::Studio));
+    const int studioLatency = ps->getLatency();
+    auto buf = makeBuffer(1, 512);
+    int n = 0;
+    std::vector<float> out;
+    bool finite = true;
+    for (int b = 0; b < 400; ++b)
+    {
+        if (b == 100) ps->setQuality(PS::Quality::Standard);
+        for (int i = 0; i < 512; ++i, ++n)
+            buf.ch(0)[i] = 0.5f * std::sin(dspark::twoPi<float> * 440.0f * static_cast<float>(n) / 48000.0f);
+        ps->processBlock(buf.view());
+        for (int i = 0; i < 512; ++i)
+        {
+            finite = finite && std::isfinite(buf.ch(0)[i]);
+            out.push_back(buf.ch(0)[i]);
+        }
+        if (b == 100) EXPECT_EQ(ps->getLatency(), 4096);
+    }
+    EXPECT_NE(studioLatency, 4096);
+    EXPECT_TRUE(finite);
+    const int tail = 16384;
+    const double got = measureDominantHz(out.data() + out.size() - tail, tail, 48000.0);
+    EXPECT_NEAR(1200.0 * std::log2(got / (440.0 * std::exp2(7.0 / 12.0))), 0.0, 2.0);
 }
 
 // A hard mix flip on the decorrelated wet stream used to jump 3.7x the
@@ -5134,6 +5276,7 @@ DSPARK_TEST(PitchShifter_rendering_matches_its_stored_reference)
     for (int c = 0; c < 4; ++c)
     {
         auto ps = std::make_unique<PitchShifter<float>>();
+        ps->setQuality(PitchShifter<float>::Quality::Standard);   // the 1.8 rendering
         ps->prepare(spec(static_cast<double>(refRate), refBlock, 1), refFft);
         ps->setSemitones(refSemitones[c]);
         ps->setMix(1.0f);
@@ -5344,6 +5487,7 @@ DSPARK_TEST(PitchShifter_rendering_matches_its_stored_reference)
     for (int c = 0; c < 2; ++c)
     {
         auto ps = std::make_unique<PitchShifter<float>>();
+        ps->setQuality(PitchShifter<float>::Quality::Standard);   // the 1.8 rendering
         ps->setMix(ref2Mix[c]);           // settled by prepare(): no ramp
         ps->prepare(spec(static_cast<double>(refRate), refBlock, 2), refFft);
         ps->setSemitones(ref2Semitones[c]);
@@ -5506,10 +5650,12 @@ struct TsAcct
 /// partial trailing block is never handed to the device, so the caller can
 /// count over exactly the samples the adaptor wrote.
 std::vector<float> tsAdaptor(const std::vector<float>& in, double ratio, int block,
-                             std::vector<TsAcct>* acct = nullptr, int fftSize = 2048)
+                             std::vector<TsAcct>* acct = nullptr, int fftSize = 2048,
+                             TimeStretch<float>::Quality quality = TimeStretch<float>::Quality::Studio)
 {
     TimeStretch<float> ts;
     AudioSpec sp; sp.sampleRate = 48000.0; sp.maxBlockSize = 4096; sp.numChannels = 1;
+    ts.setQuality(quality);
     ts.prepare(sp, fftSize);
     ts.setTimeRatio(static_cast<float>(ratio));
     ts.reset();   // adopt the ratio at once rather than gliding into it
@@ -5690,10 +5836,12 @@ double tsWorstOnsetError(const std::vector<float>& out, const std::vector<int>& 
 
 /// Offline stretch of a mono signal.
 std::vector<float> tsOffline(const std::vector<float>& in, double ratio, int fftSize,
-                             bool transientPreserve = true)
+                             bool transientPreserve = true,
+                             TimeStretch<float>::Quality quality = TimeStretch<float>::Quality::Studio)
 {
     TimeStretch<float> ts;
     AudioSpec sp; sp.sampleRate = 48000.0; sp.maxBlockSize = 512; sp.numChannels = 1;
+    ts.setQuality(quality);
     ts.prepare(sp, fftSize);
     ts.setTransientPreserve(transientPreserve);
     ts.setTimeRatio(static_cast<float>(ratio));
@@ -5720,18 +5868,64 @@ DSPARK_TEST(TimeStretch_strikes_keep_the_input_s_own_concentration)
     const double kIn = tsConcentration(bed, onsets, 1.0);
     EXPECT_GT(kIn, 0.99);
 
-    for (int fftSize : { 256, 512, 1024, 2048, 4096 })
-    {
-        for (double r : { 0.926, 0.95, 1.05, 1.081 })
+    using Q = TimeStretch<float>::Quality;
+    for (const Q q : { Q::Standard, Q::Studio })
+        for (int fftSize : { 256, 512, 1024, 2048, 4096 })
         {
-            const auto out = tsOffline(bed, r, fftSize);
-            EXPECT_GT(tsConcentration(out, onsets, r), 0.95 * kIn);
+            for (double r : { 0.926, 0.95, 1.05, 1.081 })
+            {
+                const auto out = tsOffline(bed, r, fftSize, true, q);
+                EXPECT_GT(tsConcentration(out, onsets, r), 0.95 * kIn);
+            }
+        }
+
+    // Control, on the Standard engine: without the transient path the same
+    // strike smears badly. (Studio's phase-gradient propagation keeps a
+    // strike's vertical coherence even with its anchors off - measured 0.91
+    // of the input's concentration here - so it is not a control.)
+    const auto loose = tsOffline(bed, 0.926, 2048, false, Q::Standard);
+    EXPECT_LT(tsConcentration(loose, onsets, 0.926), 0.90 * kIn);
+}
+
+// Inside a strike's lock Studio copies the bins the strike rises into with no
+// rotation. The heap alone gave them one rigid, non-zero rotation, and a
+// constant phase turn of an impulse carries its Hilbert transform's 1/t tail
+// ahead of it: 20 to 27 dB below the strike in the 20 ms before it, at every
+// ratio. Copied unrotated, nothing precedes the strike but rounding.
+DSPARK_TEST(TimeStretch_studio_strikes_carry_no_pre_echo)
+{
+    const int n = 48000 * 6;
+    std::vector<float> x(static_cast<size_t>(n), 0.0f);
+    std::vector<int> onsets;
+    uint32_t seed = 7u;
+    for (int c = 12000; c + 24000 < n; c += 24000)
+    {
+        onsets.push_back(c);
+        for (int k = 0; k < 12000; ++k)
+        {
+            const double t = k / 48000.0;
+            seed = seed * 1664525u + 1013904223u;
+            const double noise = static_cast<double>(seed >> 8) / 8388608.0 - 1.0;
+            x[static_cast<size_t>(c + k)] += static_cast<float>(
+                0.6 * std::sin(6.283185307179586 * (50.0 + 110.0 * std::exp(-t / 0.03)) * t)
+                    * std::exp(-t / 0.18)
+                + 0.3 * noise * std::exp(-t / 0.003));
         }
     }
-
-    // Control: without the transient path the same strike smears badly.
-    const auto loose = tsOffline(bed, 0.926, 2048, false);
-    EXPECT_LT(tsConcentration(loose, onsets, 0.926), 0.90 * kIn);
+    for (double r : { 0.8, 1.25, 2.0 })
+    {
+        const auto y = tsOffline(x, r, 0);
+        double worst = -300.0;
+        for (int c : onsets)
+        {
+            const auto e = static_cast<long>(std::lround(c * r));
+            double pre = 0.0, hit = 0.0;
+            for (long i = e - 960; i < e - 48; ++i) pre += double(y[static_cast<size_t>(i)]) * y[static_cast<size_t>(i)];
+            for (long i = e; i < e + 960; ++i) hit += double(y[static_cast<size_t>(i)]) * y[static_cast<size_t>(i)];
+            worst = std::max(worst, 10.0 * std::log10(pre / hit + 1e-30));
+        }
+        EXPECT_LT(worst, -60.0);   // measured below -144 dB; -19.5 dB unrotated
+    }
 }
 
 // The bed that actually needs an onset detector: strikes over a sustained
@@ -6000,6 +6194,18 @@ DSPARK_TEST(TimeStretch_adaptor_reports_the_input_it_refuses)
             if (r <= 1.0) EXPECT_EQ(last.discarded, 0LL);
             EXPECT_EQ(got.size(), static_cast<size_t>(last.offered));
         }
+
+    // Strikes are what bend Studio's hop below the synthesis hop; below unity
+    // that input is queued for the longer hops that follow, never refused
+    // (a window cut at the short hop refused 2.47 percent at 0.8).
+    std::vector<int> onsets;
+    const auto strikes = tsClicks(10.0, 120.0, onsets);
+    for (double r : { 0.8, 0.926, 0.95 })
+    {
+        std::vector<TsAcct> acct;
+        tsAdaptor(strikes, r, 512, &acct);
+        EXPECT_EQ(acct.back().discarded, 0LL);
+    }
 }
 
 // Which input the adaptor refuses is a function of the cumulative stream
@@ -6162,41 +6368,62 @@ DSPARK_TEST(TimeStretch_only_one_streaming_path_owns_an_instance)
 // Nothing the adaptor keeps may be displaced. Above unity it refuses input at
 // the head rather than letting a queue fill and splice the stream, so a
 // strike still comes out where the fixed-rate slot puts it: at its own
-// position plus the reported latency.
+// position plus the reported latency. Studio holds that exactly at and below
+// unity (it once refused 3.7 percent of the input at 0.926 and put strikes
+// 486 samples late); above unity its lookahead of fftSize / 2 + lookahead
+// kept samples spans `ratio` times as much of the offered stream, so every
+// strike carries that one constant offset, (ratio - 1) * (fftSize / 2 +
+// lookahead), and no drift.
 DSPARK_TEST(TimeStretch_strikes_keep_their_place_through_the_adaptor)
 {
     std::vector<int> onsets;
     const auto bed = tsClicks(5.0, 120.0, onsets);
     const int period = 24000;
+    using Q = TimeStretch<float>::Quality;
 
-    for (double r : { 0.926, 1.0, 1.081 })
-    {
-        TimeStretch<float> probe;
-        AudioSpec sp; sp.sampleRate = 48000.0; sp.maxBlockSize = 4096; sp.numChannels = 1;
-        probe.prepare(sp, 2048);
-        const int latency = probe.getLatency();
-
-        const auto got = tsAdaptor(bed, r, 512);
-        double worst = 0.0;
-        int used = 0;
-        for (size_t i = 0; i < onsets.size(); ++i)
+    for (const Q q : { Q::Standard, Q::Studio })
+        for (double r : { 0.926, 1.0, 1.081 })
         {
-            const auto want = static_cast<long long>(onsets[i]) + latency;
-            const long long lo = std::max(0LL, want - period / 2);
-            const long long hi = std::min(static_cast<long long>(got.size()),
-                                          want + period / 2);
-            if (hi - lo < 4) continue;
-            long long peak = lo;
-            double best = 0.0;
-            for (long long j = lo; j < hi; ++j)
-                if (std::fabs(static_cast<double>(got[static_cast<size_t>(j)])) > best)
-                { best = std::fabs(static_cast<double>(got[static_cast<size_t>(j)])); peak = j; }
-            worst = std::max(worst, std::fabs(static_cast<double>(peak - want)));
-            ++used;
+            TimeStretch<float> probe;
+            AudioSpec sp; sp.sampleRate = 48000.0; sp.maxBlockSize = 4096; sp.numChannels = 1;
+            probe.setQuality(q);
+            probe.prepare(sp, 2048);
+            const int latency = probe.getLatency();
+
+            const auto got = tsAdaptor(bed, r, 512, nullptr, 2048, q);
+            double worst = 0.0, lo = 1e9, hi = -1e9;
+            int used = 0;
+            for (size_t i = 0; i < onsets.size(); ++i)
+            {
+                const auto want = static_cast<long long>(onsets[i]) + latency;
+                const long long a = std::max(0LL, want - period / 2);
+                const long long b = std::min(static_cast<long long>(got.size()),
+                                             want + period / 2);
+                if (b - a < 4) continue;
+                long long peak = a;
+                double best = 0.0;
+                for (long long j = a; j < b; ++j)
+                    if (std::fabs(static_cast<double>(got[static_cast<size_t>(j)])) > best)
+                    { best = std::fabs(static_cast<double>(got[static_cast<size_t>(j)])); peak = j; }
+                // A strike the adaptor refused (ratio above 1) has no peak
+                // near its slot; it is counted by the refusal tests instead.
+                if (best < 0.1) continue;
+                const double off = static_cast<double>(peak - want);
+                worst = std::max(worst, std::fabs(off));
+                lo = std::min(lo, off); hi = std::max(hi, off);
+                ++used;
+            }
+            EXPECT_GT(used, 5);
+            if (q == Q::Standard || r <= 1.0)
+                EXPECT_LT(worst, 96.0);   // 2 ms at 48 kHz
+            else
+            {
+                // Measured 204 to 207 samples at 1.081 against 207.4.
+                const double expected = (r - 1.0) * (1024.0 + (latency - 2048));
+                EXPECT_LT(hi - lo, 96.0);
+                EXPECT_LT(std::abs(0.5 * (lo + hi) - expected), 48.0);
+            }
         }
-        EXPECT_GT(used, 7);
-        EXPECT_LT(worst, 96.0);   // 2 ms at 48 kHz
-    }
 }
 
 // The analysis hop carries a fractional accumulator so that the average
@@ -6252,33 +6479,40 @@ DSPARK_TEST(TimeStretch_realised_ratio_does_not_drift)
 // that was never measured.
 DSPARK_TEST(TimeStretch_reported_latency_is_the_measured_one)
 {
-    for (int fftSize : { 512, 2048, 8192 })
-    {
-        const int n = 96000;
-        const auto src = tsBroadband(n, 0xD00Du);
-        TimeStretch<float> ts;
-        ts.prepare(spec(48000.0, 512, 1), fftSize);
-        EXPECT_EQ(ts.getLatency(), fftSize);
-        const auto got = tsStream(ts, src, { 512 });
-
-        double best = 1e300;
-        int bestLag = -1;
-        for (int lag = fftSize - 64; lag <= fftSize + 64; ++lag)
+    using Q = TimeStretch<float>::Quality;
+    for (const Q q : { Q::Standard, Q::Studio })
+        for (int fftSize : { 512, 2048, 8192 })
         {
-            double num = 0.0, den = 0.0;
-            for (size_t i = static_cast<size_t>(lag) + 32000; i < got.size(); ++i)
+            const int n = 96000;
+            const auto src = tsBroadband(n, 0xD00Du);
+            TimeStretch<float> ts;
+            ts.setQuality(q);
+            ts.prepare(spec(48000.0, 512, 1), fftSize);
+            // Standard: one frame. Studio: one frame plus the onset
+            // detector's lookahead, which is the same at every frame size.
+            const int latency = ts.getLatency();
+            if (q == Q::Standard) EXPECT_EQ(latency, fftSize);
+            else { EXPECT_GT(latency, fftSize); EXPECT_LT(latency, fftSize + 2048); }
+            const auto got = tsStream(ts, src, { 512 });
+
+            double best = 1e300;
+            int bestLag = -1;
+            for (int lag = latency - 64; lag <= latency + 64; ++lag)
             {
-                const double d = got[i] - src[i - static_cast<size_t>(lag)];
-                num += d * d;
-                den += static_cast<double>(src[i - static_cast<size_t>(lag)])
-                     * src[i - static_cast<size_t>(lag)];
+                double num = 0.0, den = 0.0;
+                for (size_t i = static_cast<size_t>(lag) + 32000; i < got.size(); ++i)
+                {
+                    const double d = got[i] - src[i - static_cast<size_t>(lag)];
+                    num += d * d;
+                    den += static_cast<double>(src[i - static_cast<size_t>(lag)])
+                         * src[i - static_cast<size_t>(lag)];
+                }
+                const double v = 10.0 * std::log10(num / den + 1e-300);
+                if (v < best) { best = v; bestLag = lag; }
             }
-            const double v = 10.0 * std::log10(num / den + 1e-300);
-            if (v < best) { best = v; bestLag = lag; }
+            EXPECT_EQ(bestLag, latency);
+            EXPECT_LT(best, -60.0);
         }
-        EXPECT_EQ(bestLag, fftSize);
-        EXPECT_LT(best, -60.0);
-    }
 }
 
 // The harmonic/percussive split's median filters walk a history ring and a

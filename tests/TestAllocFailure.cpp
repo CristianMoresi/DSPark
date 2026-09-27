@@ -384,14 +384,14 @@ DSPARK_TEST(Resampler_prepare_is_transactional_and_reset_does_not_allocate)
         {
             EXPECT_EQ(observedAllocations, failIndex - 1);
             EXPECT_NEAR(candidate.getRatio(), 48000.0 / 44100.0, 0.0);
-            EXPECT_EQ(candidate.getLatency(), 35);
+            EXPECT_EQ(candidate.getLatency(), 112);
             firstMonoSweepDone = true;
             break;
         }
         ++firstMonoFailures;
         EXPECT_EQ(observedAllocations, failIndex);
         EXPECT_NEAR(candidate.getRatio(), 1.0, 0.0);
-        EXPECT_EQ(candidate.getLatency(), 16);
+        EXPECT_EQ(candidate.getLatency(), 1);
         EXPECT_TRUE(candidate.process(offlineInput.data(),
                                       static_cast<int>(offlineInput.size())).empty());
         EXPECT_EQ(renderMonoBlock(candidate, offlineInput).produced, 0);
@@ -435,7 +435,7 @@ DSPARK_TEST(Resampler_prepare_is_transactional_and_reset_does_not_allocate)
         {
             EXPECT_EQ(observedAllocations, failIndex - 1);
             EXPECT_NEAR(candidate.getRatio(), 44100.0 / 96000.0, 0.0);
-            EXPECT_EQ(candidate.getLatency(), 29);
+            EXPECT_EQ(candidate.getLatency(), 166);
             monoReprepareSweepDone = true;
             break;
         }
@@ -489,7 +489,7 @@ DSPARK_TEST(Resampler_prepare_is_transactional_and_reset_does_not_allocate)
         {
             EXPECT_EQ(observedAllocations, failIndex - 1);
             EXPECT_NEAR(candidate.getRatio(), 48000.0 / 44100.0, 0.0);
-            EXPECT_EQ(candidate.getLatency(), 35);
+            EXPECT_EQ(candidate.getLatency(), 112);
             const auto rendered = renderMultiBlock(candidate, threeChannelInput);
             EXPECT_GT(rendered.produced, 0);
             firstSpecSweepDone = true;
@@ -498,7 +498,7 @@ DSPARK_TEST(Resampler_prepare_is_transactional_and_reset_does_not_allocate)
         ++firstSpecFailures;
         EXPECT_EQ(observedAllocations, failIndex);
         EXPECT_NEAR(candidate.getRatio(), 1.0, 0.0);
-        EXPECT_EQ(candidate.getLatency(), 16);
+        EXPECT_EQ(candidate.getLatency(), 1);
         EXPECT_TRUE(candidate.process(offlineInput.data(),
                                       static_cast<int>(offlineInput.size())).empty());
         EXPECT_EQ(renderMonoBlock(candidate, offlineInput).produced, 0);
@@ -547,7 +547,7 @@ DSPARK_TEST(Resampler_prepare_is_transactional_and_reset_does_not_allocate)
         {
             EXPECT_EQ(observedAllocations, failIndex - 1);
             EXPECT_NEAR(candidate.getRatio(), 44100.0 / 96000.0, 0.0);
-            EXPECT_EQ(candidate.getLatency(), 29);
+            EXPECT_EQ(candidate.getLatency(), 166);
             const auto rendered = renderMultiBlock(candidate, fourChannelInput);
             EXPECT_GT(rendered.produced, 0);
             for (const auto& channel : rendered.samples)

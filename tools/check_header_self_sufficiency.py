@@ -4,7 +4,7 @@
 The inventory is derived from the install directories in CMakeLists.txt and
 the includes in DSPark.h.  No second list of public headers is maintained by
 this tool.  The release counters are scalar assertions over that derived
-inventory: 100 umbrella-facing headers and 101 installed library headers.
+inventory: 100 umbrella-facing headers and 102 installed library headers.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import tempfile
 
 
 EXPECTED_UMBRELLA_HEADERS = 100
-EXPECTED_INSTALLED_HEADERS = 101
+EXPECTED_INSTALLED_HEADERS = 102
 SHUFFLE_SEED = 0xD5A170
 WARNING_FLAGS = ("-Wall", "-Wextra", "-Wpedantic", "-Werror")
 

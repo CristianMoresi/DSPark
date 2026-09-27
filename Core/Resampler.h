@@ -7,11 +7,23 @@
  * @file Resampler.h
  * @brief High-quality sample rate converter for audio signals.
  *
- * Converts audio between different sample rates (e.g., 44100 <-> 48000 <->
- * 96000 Hz) with configurable quality. Uses polyphase windowed-sinc
- * interpolation (Kaiser window, 256 tabulated phases + linear phase
- * interpolation, SIMD dot-product kernels) -- the method used in
- * professional DAWs and mastering tools.
+ * Converts audio between sample rates (44100 <-> 48000 <-> 96000 Hz and any
+ * other pair) with a Kaiser-windowed sinc designed for each conversion:
+ *
+ * - **Designed, not fixed, kernels.** Each quality tier is a specification -
+ *   a passband edge as a fraction of the lower Nyquist frequency and a
+ *   stopband attenuation - and the kernel length and Kaiser beta are derived
+ *   from it (Kaiser's design formulas). The stopband starts exactly at the
+ *   lower Nyquist frequency, so nothing above it survives at more than the
+ *   stated attenuation: no image when upsampling, no alias when downsampling.
+ * - **Exact polyphase phases.** When the rate ratio is rational with a
+ *   manageable number of phases (every common audio pair: 44.1 <-> 48 kHz
+ *   has 160 or 147) each output phase has its own kernel, computed once, and
+ *   positions advance in integer arithmetic, so there is no phase
+ *   interpolation error and no drift. Other ratios read a 512-phase table
+ *   with cubic interpolation across phases, whose error lies below the
+ *   Ultra stopband.
+ * - **Identity at equal rates.** A ratio of exactly 1 is a pure delay.
  *
  * Two modes:
  *
@@ -37,6 +49,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <numbers>
 #include <type_traits>
@@ -49,20 +62,22 @@ namespace dspark {
  * @class Resampler
  * @brief Windowed-sinc sample rate converter optimized for real-time DSP.
  *
- * Quality tiers trade CPU for image/alias rejection and passband flatness.
- * Measured on the float instantiation (each column states its test):
+ * Quality tiers are filter specifications; the kernel length follows from
+ * them and from the ratio (a downsampler's kernel is longer by the ratio,
+ * since its band edge is lower relative to the input rate):
  *
- * | Quality | Taps | 20 kHz image (48->96) | 26 kHz alias (96->44.1) | 20 kHz gain (44.1->48) |
- * |---------|------|-----------------------|-------------------------|------------------------|
- * | Draft   | 8    | -12 dB                | -10 dB                  | -3.3 dB                |
- * | Normal  | 32   | -56 dB                | -27 dB                  | -0.6 dB                |
- * | High    | 64   | -140 dB               | -69 dB                  | -0.02 dB               |
- * | Ultra   | 128  | -139 dB               | -143 dB                 | flat                   |
+ * | Quality | Passband edge | Stopband | Taps, 44.1 <-> 48 kHz |
+ * |---------|---------------|----------|-----------------------|
+ * | Draft   | 0.80 Nyquist  | 60 dB    | 38 / 40               |
+ * | Normal  | 0.90 Nyquist  | 100 dB   | 130 / 140             |
+ * | High    | 0.91 Nyquist  | 140 dB   | 206 / 224             |
+ * | Ultra   | 0.915 Nyquist | 210 dB   | 332 / 362             |
  *
- * The middle column probes the transition band right at the target Nyquist:
- * only Ultra's kernel is long enough to keep it in the deep stopband. For
- * extreme downsampling ratios (beyond ~8:1) no fixed tap count can hold the
- * anti-alias transition band; cascade two resamplers instead.
+ * "Nyquist" is the lower of the two rates' Nyquist frequencies; Ultra's
+ * passband reaches 20.2 kHz at 44.1 kHz. The float instantiation is limited
+ * by float arithmetic to roughly -140 dB; the double one reaches the table.
+ * Kernels are capped at kMaxTaps taps, which binds only for downsampling
+ * beyond about 25:1 at Ultra: past it the transition band widens.
  *
  * @tparam T Sample type (float or double).
  */
@@ -72,11 +87,14 @@ class Resampler
 public:
     enum class Quality
     {
-        Draft,   ///< 8-point sinc, fastest (previews; HF response drops early)
-        Normal,  ///< 32-point sinc, balanced (~-56 dB worst-case images)
-        High,    ///< 64-point sinc, high quality (~-140 dB beyond the transition band)
-        Ultra    ///< 128-point sinc, mastering grade (deep stopband even at the band edge)
+        Draft,   ///< Passband 0.80 of Nyquist, 60 dB stopband: previews.
+        Normal,  ///< Passband 0.90 of Nyquist, 100 dB stopband.
+        High,    ///< Passband 0.91 of Nyquist (20 kHz at 44.1), 140 dB stopband.
+        Ultra    ///< Passband 0.915 of Nyquist, 210 dB stopband: mastering.
     };
+
+    /** @brief Longest kernel, in input samples (see the class note). */
+    static constexpr int kMaxTaps = 8192;
 
     /**
      * @brief Prepares the resampler for a given rate conversion.
@@ -85,7 +103,7 @@ public:
      *
      * @param sourceRate      Source sample rate in Hz.
      * @param targetRate      Target sample rate in Hz.
-     * @param quality         Interpolation quality (default: Normal).
+     * @param quality         Filter specification (default: Normal).
      */
     void prepare(double sourceRate, double targetRate,
                  Quality quality = Quality::Normal)
@@ -101,7 +119,7 @@ public:
      *
      * @param spec       Audio environment (sampleRate, numChannels used).
      * @param targetRate Target sample rate in Hz.
-     * @param quality    Interpolation quality (default: Normal).
+     * @param quality    Filter specification (default: Normal).
      */
     void prepare(const AudioSpec& spec, double targetRate,
                  Quality quality = Quality::Normal)
@@ -139,7 +157,7 @@ public:
      */
     [[nodiscard]] std::vector<T> process(const T* input, int inputLength)
     {
-        if (sincTable_.empty()) return {}; // not prepared
+        if (table_.empty()) return {}; // not prepared
 
         // Clamp through double before the int cast: huge ratios could
         // otherwise overflow the cast itself (undefined behaviour).
@@ -149,20 +167,28 @@ public:
             std::min(outLenD, static_cast<double>(std::numeric_limits<int>::max())));
 
         std::vector<T> output(static_cast<size_t>(outputLength));
-        const int halfSinc = sincPoints_ / 2;
-
         for (int outIdx = 0; outIdx < outputLength; ++outIdx)
         {
-            // Calculate absolute source position to avoid float drift accumulation
-            double srcPos = static_cast<double>(outIdx) / ratio_;
-            if (srcPos >= inputLength) break;
-
-            int intPos = static_cast<int>(srcPos);
-            double frac = srcPos - static_cast<double>(intPos);
-
-            output[static_cast<size_t>(outIdx)] = interpolateOffline(input, inputLength, intPos, frac, halfSinc);
+            int64_t intPos;
+            int64_t phase = 0;
+            double frac = 0.0;
+            if (exact_)
+            {
+                // Integer position arithmetic: output k reads input k*M/L.
+                const int64_t num = static_cast<int64_t>(outIdx) * stepM_;
+                intPos = num / phasesL_;
+                phase = num % phasesL_;
+            }
+            else
+            {
+                const double srcPos = static_cast<double>(outIdx) / ratio_;
+                intPos = static_cast<int64_t>(srcPos);
+                frac = srcPos - static_cast<double>(intPos);
+            }
+            if (intPos >= inputLength) break;
+            output[static_cast<size_t>(outIdx)] =
+                interpolateOffline(input, inputLength, static_cast<int>(intPos), phase, frac);
         }
-
         return output;
     }
 
@@ -226,28 +252,39 @@ public:
     /** @brief Returns the conversion ratio (targetRate / sourceRate). */
     [[nodiscard]] double getRatio() const noexcept { return ratio_; }
 
+    /** @brief Kernel length in input samples (1 at a ratio of exactly 1). */
+    [[nodiscard]] int getFilterLength() const noexcept { return taps_; }
+
     /**
      * @brief Returns the streaming latency in output samples.
      *
-     * The streaming path (processBlock) delays the signal by exactly
-     * sincPoints/2 input samples -- the sinc kernel's group delay -- which
+     * The streaming path (processBlock) delays the signal by exactly half the
+     * kernel length in input samples -- the kernel's group delay -- which
      * this getter reports rounded to the nearest output sample. The offline
      * process() path is already time-aligned and has zero latency.
      */
     [[nodiscard]] int getLatency() const noexcept
     {
-        return static_cast<int>(std::round(static_cast<double>(sincPoints_ / 2) * ratio_));
+        return static_cast<int>(std::round(static_cast<double>(halfTaps_) * ratio_));
     }
 
 private:
-    static constexpr int kOversample = 256;
+    /// Phases of the table read with cubic interpolation (non-rational ratios).
+    static constexpr int kTablePhases = 512;
+    /// Most exact phases, and most exact-table coefficients, before a ratio
+    /// falls back to the interpolated table.
+    static constexpr int64_t kMaxExactPhases = 4096;
+    static constexpr int64_t kMaxExactCoefficients = int64_t(1) << 21;
 
     struct ChannelState
     {
         std::vector<T> history;
         int writePos = 0;
-        double fractionalPos = 0.0;
+        double fractionalPos = 0.0;   ///< Next output's position (table mode).
+        int64_t phase = 0;            ///< Next output's phase, 0..L-1 (exact mode).
     };
+
+    struct Spec { double passband; double attenuationDb; };
 
     static_assert(std::is_nothrow_copy_assignable_v<T>,
                   "Resampler sample storage must be reset without throwing");
@@ -258,128 +295,161 @@ private:
     static_assert(std::is_nothrow_swappable_v<std::vector<ChannelState>>,
                   "Resampler channel commit must be no-throw");
 
-    static int qualityToSincPoints(Quality q) noexcept
+    static Spec qualitySpec(Quality q) noexcept
     {
         switch (q)
         {
-            case Quality::Draft:  return 8;
-            case Quality::Normal: return 32;
-            case Quality::High:   return 64;
-            case Quality::Ultra:  return 128;
+            case Quality::Draft:  return { 0.80, 60.0 };
+            case Quality::Normal: return { 0.90, 100.0 };
+            case Quality::High:   return { 0.91, 140.0 };
+            case Quality::Ultra:  return { 0.915, 210.0 };
         }
-        return 32;
+        return { 0.90, 100.0 };
     }
 
-    /**
-     * @brief Kaiser beta per quality tier.
-     *
-     * The window's sidelobe level caps the achievable image rejection no
-     * matter how many taps the kernel has (beta 10 caps near -100 dB), so
-     * beta must scale with the tap budget: the longer kernels spend their
-     * extra taps on a deeper stopband, while the 8-tap Draft trades stopband
-     * depth for less passband droop. A single beta for all tiers would leave
-     * Ultra performing exactly like High, and Draft 4 dB down at 20 kHz.
-     */
-    static double qualityToKaiserBeta(Quality q) noexcept
+    /** @brief Kaiser's beta for a stopband attenuation (Kaiser 1974). */
+    [[nodiscard]] static double kaiserBeta(double a) noexcept
     {
-        switch (q)
-        {
-            case Quality::Draft:  return 6.0;
-            case Quality::Normal: return 10.0;
-            case Quality::High:   return 12.5;
-            case Quality::Ultra:  return 14.5;
-        }
-        return 10.0;
+        if (a > 50.0) return 0.1102 * (a - 8.7);
+        if (a >= 21.0) return 0.5842 * std::pow(a - 21.0, 0.4) + 0.07886 * (a - 21.0);
+        return 0.0;
     }
 
     /** @brief Modified Bessel I0 for the continuous Kaiser window. */
     [[nodiscard]] static double besselI0(double x) noexcept
     {
         double sum = 1.0, term = 1.0;
-        for (int k = 1; k <= 50; ++k)
+        for (int k = 1; k <= 200; ++k)
         {
             const double half = x / (2.0 * k);
             term *= half * half;
             sum += term;
-            if (term < 1e-15 * sum) break;
+            if (term < 1e-17 * sum) break;
         }
         return sum;
     }
 
-    [[nodiscard]] static std::vector<T> buildSincTable(
-        double ratio, int sincPoints, double kaiserBeta)
+    /** @brief Kernel parameters of one conversion. */
+    struct Design
     {
-        // kOversample + 1 phases: the extra phase holds the frac = 1.0 kernel,
-        // so the 2-point phase interpolation in the read path never has to
-        // clamp or wrap (exact at both ends of the fractional range).
-        std::vector<T> table(
-            static_cast<size_t>((kOversample + 1) * sincPoints));
+        int taps = 2;          ///< Even kernel length, in input samples.
+        double cutoff = 1.0;   ///< Sinc cutoff, 1 = input Nyquist.
+        double beta = 0.0;     ///< Kaiser beta.
+        bool identity = false; ///< Ratio exactly 1: a pure delay.
+    };
 
-        const int halfSinc = sincPoints / 2;
-        constexpr double kPi = std::numbers::pi;
-        const double beta = kaiserBeta;
-        const double i0Beta = besselI0(beta);
-
-        // Apply 0.95 margin on downsampling to prevent transition-band aliasing.
-        double cutoff = (ratio < 1.0) ? (ratio * 0.95) : 1.0;
-
-        for (int phase = 0; phase <= kOversample; ++phase)
+    [[nodiscard]] static Design design(double ratio, Quality quality) noexcept
+    {
+        Design d;
+        if (ratio == 1.0)
         {
-            const double frac = static_cast<double>(phase) / static_cast<double>(kOversample);
-            const int base = phase * sincPoints;
-            double sum = 0.0;
-
-            for (int tap = 0; tap < sincPoints; ++tap)
-            {
-                // Tap alignment: tap j weighs source sample intPos-halfSinc+1+j,
-                // so its position relative to the interpolation point
-                // intPos + frac is t = (j - halfSinc + 1) - frac. This is the
-                // symmetric placement for an even-length kernel: every tap
-                // stays inside the open window support (-halfSinc, halfSinc)
-                // for frac in (0, 1). Shifting the window one tap earlier
-                // would pin the first tap at |t| >= halfSinc where the Kaiser
-                // window is exactly zero (a dead tap in every phase) and
-                // shorten the group delay to halfSinc-1, breaking getLatency().
-                // The MINUS sign on frac is essential: `+ frac` would sample
-                // the kernel time-reversed (heavy zipper distortion).
-                const double t = static_cast<double>(tap - halfSinc + 1) - frac;
-                const double x = t * cutoff;
-
-                double sincVal = (std::abs(x) < 1e-10)
-                    ? cutoff
-                    : cutoff * std::sin(kPi * x) / (kPi * x);
-
-                // Continuous Kaiser window evaluated at the SAME shifted
-                // position as the sinc (a per-tap fixed window leaves a small
-                // phase-dependent ripple in the passband).
-                const double wx = t / static_cast<double>(halfSinc);
-                const double win = (std::abs(wx) >= 1.0)
-                    ? 0.0
-                    : besselI0(beta * std::sqrt(1.0 - wx * wx)) / i0Beta;
-
-                const double v = sincVal * win;
-                table[static_cast<size_t>(base + tap)] = static_cast<T>(v);
-                sum += v;
-            }
-
-            // Normalise each polyphase branch to unity DC gain so the passband
-            // is flat (otherwise the windowed sinc leaves a small gain ripple).
-            if (std::abs(sum) > 1e-12)
-            {
-                const T inv = static_cast<T>(1.0 / sum);
-                for (int tap = 0; tap < sincPoints; ++tap)
-                    table[static_cast<size_t>(base + tap)] *= inv;
-            }
+            d.identity = true;
+            return d;
         }
-
-        return table;
+        const Spec spec = qualitySpec(quality);
+        const double scale = std::min(1.0, ratio);   // lower Nyquist / input Nyquist
+        // Band edges in cycles per input sample: the passband ends at
+        // passband * lower Nyquist, the stopband begins at the lower Nyquist.
+        const double transition = 0.5 * scale * (1.0 - spec.passband);
+        d.cutoff = scale * 0.5 * (1.0 + spec.passband);
+        d.beta = kaiserBeta(spec.attenuationDb);
+        // Kaiser's length estimate, N = (A - 7.95) / (14.36 * df).
+        const double n = (spec.attenuationDb - 7.95) / (14.36 * transition);
+        const double capped = std::min(n, static_cast<double>(kMaxTaps));
+        d.taps = 2 * static_cast<int>(std::ceil(0.5 * capped));
+        d.taps = std::max(d.taps, 4);
+        return d;
     }
 
-    static void initialiseChannelState(ChannelState& state, int sincPoints)
+    /**
+     * @brief The kernel for one fractional position `frac` of the output
+     * between two input samples, normalised to unity DC gain.
+     *
+     * Tap j weighs source sample intPos-halfTaps+1+j, so its distance from
+     * the interpolation point intPos + frac is t = (j - halfTaps + 1) - frac:
+     * the symmetric placement for an even-length kernel. The MINUS sign on
+     * frac is essential: `+ frac` would sample the kernel time-reversed.
+     */
+    static void buildPhase(T* dst, const Design& d, double frac)
     {
-        state.history.assign(static_cast<size_t>(sincPoints * 2), T(0));
+        const int half = d.taps / 2;
+        if (d.identity)
+        {
+            for (int j = 0; j < d.taps; ++j)
+                dst[j] = (j == half - 1) ? T(1) : T(0);
+            return;
+        }
+        constexpr double kPi = std::numbers::pi;
+        const double i0Beta = besselI0(d.beta);
+        double sum = 0.0;
+        // Accumulate in double; the table stores T.
+        for (int j = 0; j < d.taps; ++j)
+        {
+            const double t = static_cast<double>(j - half + 1) - frac;
+            const double x = t * d.cutoff;
+            const double sincVal = (std::abs(x) < 1e-12)
+                ? d.cutoff
+                : d.cutoff * std::sin(kPi * x) / (kPi * x);
+            const double wx = t / static_cast<double>(half);
+            const double win = (std::abs(wx) >= 1.0)
+                ? 0.0
+                : besselI0(d.beta * std::sqrt(1.0 - wx * wx)) / i0Beta;
+            dst[j] = static_cast<T>(sincVal * win);
+            sum += sincVal * win;
+        }
+        if (std::abs(sum) > 1e-12)
+        {
+            const double inv = 1.0 / sum;
+            for (int j = 0; j < d.taps; ++j)
+                dst[j] = static_cast<T>(static_cast<double>(dst[j]) * inv);
+        }
+    }
+
+    /**
+     * @brief The rate ratio as L / M in lowest terms, when both are small
+     * enough for an exact phase table; {0, 0} otherwise.
+     */
+    [[nodiscard]] static std::pair<int64_t, int64_t> rationalRatio(
+        double sourceRate, double targetRate) noexcept
+    {
+        // Integer rates (every standard one) reduce exactly.
+        const double rs = std::round(sourceRate), rt = std::round(targetRate);
+        if (std::abs(rs - sourceRate) < 1e-9 && std::abs(rt - targetRate) < 1e-9
+            && rs < 1e12 && rt < 1e12)
+        {
+            int64_t a = static_cast<int64_t>(rt), b = static_cast<int64_t>(rs);
+            int64_t x = a, y = b;
+            while (y != 0) { const int64_t r = x % y; x = y; y = r; }
+            if (x > 0) return { a / x, b / x };
+        }
+        // Otherwise a continued-fraction approximation that is exact to
+        // double precision.
+        const double r = targetRate / sourceRate;
+        int64_t h0 = 0, h1 = 1, k0 = 1, k1 = 0;
+        double v = r;
+        for (int it = 0; it < 64; ++it)
+        {
+            const double fl = std::floor(v);
+            if (fl > 1e12) break;
+            const auto an = static_cast<int64_t>(fl);
+            const int64_t h2 = an * h1 + h0, k2 = an * k1 + k0;
+            if (k2 > (int64_t(1) << 32) || h2 > (int64_t(1) << 32)) break;
+            h0 = h1; h1 = h2; k0 = k1; k1 = k2;
+            if (std::abs(static_cast<double>(h1) / static_cast<double>(k1) - r) <= 1e-15 * r)
+                return { h1, k1 };
+            const double rem = v - fl;
+            if (rem < 1e-15) break;
+            v = 1.0 / rem;
+        }
+        return { 0, 0 };
+    }
+
+    static void initialiseChannelState(ChannelState& state, int taps)
+    {
+        state.history.assign(static_cast<size_t>(taps * 2), T(0));
         state.writePos = 0;
         state.fractionalPos = 0.0;
+        state.phase = 0;
     }
 
     void prepareTransactional(double sourceRate, double targetRate,
@@ -391,20 +461,41 @@ private:
         const double stagedSourceRate = std::max(sourceRate, 1.0);
         const double stagedTargetRate = std::max(targetRate, 1.0);
         const double stagedRatio = stagedTargetRate / stagedSourceRate;
-        const double stagedSrcStep = 1.0 / stagedRatio;
-        const int stagedSincPoints = qualityToSincPoints(quality);
-        const double stagedKaiserBeta = qualityToKaiserBeta(quality);
+        const Design d = design(stagedRatio, quality);
+
+        auto [l, m] = rationalRatio(stagedSourceRate, stagedTargetRate);
+        const bool exact = d.identity
+            || (l > 0 && l <= kMaxExactPhases
+                && l * static_cast<int64_t>(d.taps) <= kMaxExactCoefficients);
+        if (d.identity) { l = 1; m = 1; }
 
         // Every potentially throwing allocation belongs to local state. A
         // failure therefore destroys only the candidate and leaves the live
         // conversion, histories and streaming positions untouched.
-        auto stagedSincTable = buildSincTable(
-            stagedRatio, stagedSincPoints, stagedKaiserBeta);
+        std::vector<T> stagedTable;
+        if (exact)
+        {
+            // Phase p is the kernel for fractional position p / L.
+            stagedTable.resize(static_cast<size_t>(l * d.taps));
+            for (int64_t p = 0; p < l; ++p)
+                buildPhase(stagedTable.data() + p * d.taps, d,
+                           static_cast<double>(p) / static_cast<double>(l));
+        }
+        else
+        {
+            // kTablePhases + 3 phases: one guard phase before position 0 and
+            // two after the last, so cubic interpolation across phases never
+            // reads outside the table.
+            stagedTable.resize(static_cast<size_t>((kTablePhases + 3) * d.taps));
+            for (int p = 0; p < kTablePhases + 3; ++p)
+                buildPhase(stagedTable.data() + static_cast<size_t>(p) * static_cast<size_t>(d.taps), d,
+                           static_cast<double>(p - 1) / static_cast<double>(kTablePhases));
+        }
         ChannelState stagedMono;
-        initialiseChannelState(stagedMono, stagedSincPoints);
+        initialiseChannelState(stagedMono, d.taps);
         std::vector<ChannelState> stagedChannels(channelCount);
         for (auto& state : stagedChannels)
-            initialiseChannelState(state, stagedSincPoints);
+            initialiseChannelState(state, d.taps);
 
         // Scalar assignment and the mechanically checked swaps below cannot
         // throw. Once commit starts, observers can only see the complete new
@@ -412,81 +503,63 @@ private:
         sourceRate_ = stagedSourceRate;
         targetRate_ = stagedTargetRate;
         ratio_ = stagedRatio;
-        srcStep_ = stagedSrcStep;
-        kaiserBeta_ = stagedKaiserBeta;
-        sincPoints_ = stagedSincPoints;
-        sincTable_.swap(stagedSincTable);
+        srcStep_ = 1.0 / stagedRatio;
+        taps_ = d.taps;
+        halfTaps_ = d.taps / 2;
+        exact_ = exact;
+        phasesL_ = exact ? l : 0;
+        stepM_ = exact ? m : 0;
+        table_.swap(stagedTable);
         using std::swap;
         swap(mono_, stagedMono);
         channelStates_.swap(stagedChannels);
     }
 
-    /**
-     * @brief Offline interpolation with boundary checks.
-     *
-     * Linear interpolation between two adjacent table phases: with 256 phases
-     * (plus the explicit frac=1 phase) the phase-quantisation images sit
-     * below -90 dB. The in-range fast path dispatches both kernels to the
-     * SIMD dot product.
-     */
-    T interpolateOffline(const T* data, int length, int intPos, double frac, int halfSinc) const noexcept
+    /** @brief One output from `taps_` contiguous samples at `src`. */
+    T interpolateContiguous(const T* src, int64_t phase, double frac) const noexcept
     {
-        const double exactPhase = frac * static_cast<double>(kOversample);
+        if (exact_)
+            return simd::dotProduct(table_.data() + phase * taps_, src, taps_);
+
+        // Cubic (Lagrange) interpolation across the four phases around the
+        // position: error ~ (pi / (2 * kTablePhases))^4, below every stopband.
+        const double exactPhase = frac * static_cast<double>(kTablePhases);
         int p0 = static_cast<int>(exactPhase);
-        if (p0 > kOversample - 1) p0 = kOversample - 1; // frac is < 1 by contract
-        const T pf = static_cast<T>(exactPhase - static_cast<double>(p0));
-
-        const T* k0 = sincTable_.data() + static_cast<size_t>(p0) * sincPoints_;
-        const T* k1 = k0 + sincPoints_; // safe: table holds kOversample+1 phases
-
-        // Tap j weighs data[intPos - halfSinc + 1 + j] (see buildSincTable).
-        const int firstSrc = intPos - halfSinc + 1;
-        if (firstSrc >= 0 && firstSrc + sincPoints_ <= length)
-        {
-            // Fully in range: two SIMD dot products + one lerp.
-            const T* src = data + firstSrc;
-            const T s0 = simd::dotProduct(k0, src, sincPoints_);
-            const T s1 = simd::dotProduct(k1, src, sincPoints_);
-            return s0 + pf * (s1 - s0);
-        }
-
-        // Edge path: zero-pad outside the buffer.
-        T result = T(0);
-        for (int tap = 0; tap < sincPoints_; ++tap)
-        {
-            const int srcIdx = firstSrc + tap;
-            if (srcIdx < 0 || srcIdx >= length) continue;
-            const T kernel = k0[tap] + pf * (k1[tap] - k0[tap]);
-            result += data[srcIdx] * kernel;
-        }
-        return result;
+        if (p0 > kTablePhases - 1) p0 = kTablePhases - 1;   // frac is < 1 by contract
+        const double u = exactPhase - static_cast<double>(p0);
+        const T* k = table_.data() + static_cast<size_t>(p0) * static_cast<size_t>(taps_);
+        // Table phase index p0 + 1 holds position p0 / P (one guard phase first).
+        const T sm = simd::dotProduct(k, src, taps_);
+        const T s0 = simd::dotProduct(k + taps_, src, taps_);
+        const T s1 = simd::dotProduct(k + 2 * taps_, src, taps_);
+        const T s2 = simd::dotProduct(k + 3 * taps_, src, taps_);
+        const double wm = -u * (u - 1.0) * (u - 2.0) / 6.0;
+        const double w0 = (u + 1.0) * (u - 1.0) * (u - 2.0) / 2.0;
+        const double w1 = -(u + 1.0) * u * (u - 2.0) / 2.0;
+        const double w2 = (u + 1.0) * u * (u - 1.0) / 6.0;
+        return static_cast<T>(wm * sm + w0 * s0 + w1 * s1 + w2 * s2);
     }
 
-    /**
-     * @brief High-performance contiguous memory interpolator.
-     *
-     * Relies on the double-buffered history allowing linear SIMD loading:
-     * two SIMD dot products against adjacent table phases plus one lerp.
-     * The window holds the last sincPoints_ input samples (oldest first);
-     * the kernel peaks at tap halfSinc-1+frac, so the output stream is
-     * delayed by exactly halfSinc input samples (see getLatency()).
-     */
-    T interpolateFromHistory(const T* historyPtr, int readPos, double frac) const noexcept
+    /** @brief Offline interpolation with boundary checks (zero padding). */
+    T interpolateOffline(const T* data, int length, int intPos,
+                         int64_t phase, double frac)
     {
-        const double exactPhase = frac * static_cast<double>(kOversample);
-        int p0 = static_cast<int>(exactPhase);
-        if (p0 > kOversample - 1) p0 = kOversample - 1; // frac is < 1 by contract
-        const T pf = static_cast<T>(exactPhase - static_cast<double>(p0));
+        // Tap j weighs data[intPos - halfTaps + 1 + j] (see buildPhase).
+        const int firstSrc = intPos - halfTaps_ + 1;
+        if (firstSrc >= 0 && firstSrc + taps_ <= length)
+            return interpolateContiguous(data + firstSrc, phase, frac);
 
-        const T* k0 = sincTable_.data() + static_cast<size_t>(p0) * sincPoints_;
-        const T* k1 = k0 + sincPoints_; // safe: table holds kOversample+1 phases
-
-        // Linear memory read from 'readPos'. No modulo required.
-        const T* histPtr = &historyPtr[readPos];
-
-        const T s0 = simd::dotProduct(k0, histPtr, sincPoints_);
-        const T s1 = simd::dotProduct(k1, histPtr, sincPoints_);
-        return s0 + pf * (s1 - s0);
+        // Edge path: gather into a zero-padded window. The kernel is read
+        // exactly as in the fast path, so both agree bit for bit.
+        std::vector<T>& w = edgeScratch_;
+        w.assign(static_cast<size_t>(taps_), T(0));
+        for (int j = 0; j < taps_; ++j)
+        {
+            const int srcIdx = firstSrc + j;
+            if (srcIdx >= 0 && srcIdx < length)
+                w[static_cast<size_t>(j)] = data[srcIdx];
+        }
+        return interpolateContiguous(w.data(), phase, frac);
     }
 
     static void resetChannelState(ChannelState& cs) noexcept
@@ -494,6 +567,7 @@ private:
         std::fill(cs.history.begin(), cs.history.end(), T(0));
         cs.writePos = 0;
         cs.fractionalPos = 0.0;
+        cs.phase = 0;
     }
 
     int processChannel(const T* input, int inputLength, T* output,
@@ -503,35 +577,61 @@ private:
 
         // Hot state lives in locals for the duration of the block: this both
         // tells the compiler the fields cannot alias the output writes (no
-        // per-sample reloads) and keeps them in registers.
+        // per-sample reloads) and keeps them in registers. The window
+        // [writePos, writePos + n) holds the last n inputs, oldest first; the
+        // kernel peaks at tap halfTaps-1+frac, so the output stream is
+        // delayed by exactly halfTaps input samples (see getLatency()).
         T* const hist = state.history.data();
-        const int n = sincPoints_;
-        const double step = srcStep_;
+        const int n = taps_;
         int writePos = state.writePos;
-        double frac = state.fractionalPos;
         int outIdx = 0;
 
-        for (int i = 0; i < inputLength; ++i)
+        if (exact_)
         {
-            // Double-buffered push: mirror write keeps the read window
-            // [writePos, writePos + n) contiguous (no modulo).
-            const T x = input[i];
-            hist[writePos] = x;
-            hist[writePos + n] = x;
-            if (++writePos >= n)
-                writePos = 0;
-
-            while (frac < 1.0)
+            const int64_t l = phasesL_, m = stepM_;
+            int64_t phase = state.phase;
+            for (int i = 0; i < inputLength; ++i)
             {
-                output[outIdx++] = interpolateFromHistory(hist, writePos, frac);
-                frac += step;
-            }
+                // Double-buffered push: the mirror write keeps the read
+                // window contiguous (no modulo).
+                const T x = input[i];
+                hist[writePos] = x;
+                hist[writePos + n] = x;
+                if (++writePos >= n)
+                    writePos = 0;
 
-            frac -= 1.0;
+                while (phase < l)
+                {
+                    output[outIdx++] = interpolateContiguous(hist + writePos, phase, 0.0);
+                    phase += m;
+                }
+                phase -= l;
+            }
+            state.phase = phase;
+        }
+        else
+        {
+            const double step = srcStep_;
+            double frac = state.fractionalPos;
+            for (int i = 0; i < inputLength; ++i)
+            {
+                const T x = input[i];
+                hist[writePos] = x;
+                hist[writePos + n] = x;
+                if (++writePos >= n)
+                    writePos = 0;
+
+                while (frac < 1.0)
+                {
+                    output[outIdx++] = interpolateContiguous(hist + writePos, 0, frac);
+                    frac += step;
+                }
+                frac -= 1.0;
+            }
+            state.fractionalPos = frac;
         }
 
         state.writePos = writePos;
-        state.fractionalPos = frac;
         return outIdx;
     }
 
@@ -539,11 +639,15 @@ private:
     double targetRate_ = 48000.0;
     double ratio_ = 1.0;
     double srcStep_ = 1.0;
-    double kaiserBeta_ = 10.0;
 
-    int sincPoints_ = 32;
+    int taps_ = 2;
+    int halfTaps_ = 1;
+    bool exact_ = true;
+    int64_t phasesL_ = 0;   ///< Exact mode: phases per input sample (L).
+    int64_t stepM_ = 0;     ///< Exact mode: phase advance per output (M).
 
-    std::vector<T> sincTable_;
+    std::vector<T> table_;
+    std::vector<T> edgeScratch_;   ///< Offline edge window (process() allocates anyway).
     ChannelState mono_;
     std::vector<ChannelState> channelStates_;
 };

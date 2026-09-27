@@ -62,14 +62,14 @@ exact. These are header sets, not assertion counts; a header that pins both
 kinds appears once in each applicable set.
 
 <!-- THREADING_PIN_CENSUS_BEGIN -->
-- All local pin headers (11): `Analysis/BeatTracker.h`, `Analysis/SpectrumAnalyzer.h`, `Effects/AutoGain.h`, `Effects/DynamicEQ.h`, `Effects/Equalizer.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`, `Effects/SpectralFreeze.h`, `Effects/TimeStretch.h`, `Effects/detail/PhaseVocoderEngine.h`, `Music/KeyDetector.h`.
+- All local pin headers (12): `Analysis/BeatTracker.h`, `Analysis/SpectrumAnalyzer.h`, `Effects/AutoGain.h`, `Effects/DynamicEQ.h`, `Effects/Equalizer.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`, `Effects/SpectralFreeze.h`, `Effects/TimeStretch.h`, `Effects/detail/PhaseVocoderEngine.h`, `Effects/detail/StudioVocoder.h`, `Music/KeyDetector.h`.
 - Template-parameter pin headers (5): `Analysis/SpectrumAnalyzer.h`, `Effects/AutoGain.h`, `Effects/DynamicEQ.h`, `Effects/Equalizer.h`, `Effects/PitchCorrector.h`.
-- Concrete-word pin headers (8): `Analysis/BeatTracker.h`, `Analysis/SpectrumAnalyzer.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`, `Effects/SpectralFreeze.h`, `Effects/TimeStretch.h`, `Effects/detail/PhaseVocoderEngine.h`, `Music/KeyDetector.h`.
+- Concrete-word pin headers (9): `Analysis/BeatTracker.h`, `Analysis/SpectrumAnalyzer.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`, `Effects/SpectralFreeze.h`, `Effects/TimeStretch.h`, `Effects/detail/PhaseVocoderEngine.h`, `Effects/detail/StudioVocoder.h`, `Music/KeyDetector.h`.
 - Overlap headers (2): `Analysis/SpectrumAnalyzer.h`, `Effects/PitchCorrector.h`.
 <!-- THREADING_PIN_CENSUS_END -->
 
 The overlap is the exact set intersection, so the union identity is
-`11 = 5 + 8 - 2`. Every count and every named membership is checked against
+`12 = 5 + 9 - 2`. Every count and every named membership is checked against
 the headers rather than inferred from another number in this paragraph. The
 concrete pins remain useful because a compile-time assertion at the declaration
 is a stronger statement than a run-time one in another file, and the

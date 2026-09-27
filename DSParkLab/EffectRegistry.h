@@ -1259,9 +1259,11 @@ inline EffectSlot makePitchShifter()
     s.addSlider("Mix", 0, 1, 1, "");
     s.addToggle("Transient Preserve", true);
     s.addToggle("Formant Preserve", false);
-    // Order MUST match PitchShifter::Quality (Standard=0, High=1): High reads
-    // through a 32-tap windowed sinc (transparent top octave, same latency).
-    s.addChoice("Quality", {"Standard","High"}, 0);
+    // Order MUST match PitchShifter::Quality (Standard=0, High=1, Studio=2):
+    // High reads the 1.8 engine through a 32-tap windowed sinc (transparent
+    // top octave, same latency); Studio is the default engine. Crossing
+    // between Studio and the other two restarts the stream.
+    s.addChoice("Quality", {"Standard","High","Studio"}, 2);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };

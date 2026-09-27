@@ -17,43 +17,75 @@
  * squeezes the stretched stream back to the original duration, which is why
  * that one moves pitch and this one does not.)
  *
- * How it keeps its quality:
+ * Two engines sit behind setQuality():
  *
- * - **Identity phase locking** (Laroche & Dolson, "Improved phase vocoder
- *   time-scale modification of audio", IEEE Trans. Speech and Audio
- *   Processing 7(3), 1999): the spectral peaks are found each frame and
- *   every bin in a peak's region of influence is rotated by the SAME phase
- *   increment as its peak, so the partial stays vertically coherent instead
- *   of dissolving into the hollow, chorused sound a plain vocoder makes.
- * - **Onset detection and a transient-locked hop.** Attacks are found with
- *   half-wave-rectified spectral flux over a log-frequency filterbank, which
- *   sees a strike over a sustained bed where a broadband energy test cannot:
- *   on a drum strike over a 110 Hz harmonic bed the weakest onset frame
- *   carries 14.46 dB more flux than the median frame and only 0.13 dB more
- *   energy. Across a detected attack the synthesis phases are reset to the
- *   analysis phases AND the analysis hop is held at the synthesis hop for
- *   one whole window, so every frame that sees the strike places it at the
- *   same offset. Without that hold, a stretch spreads one strike over
- *   `fftSize * |ratio - 1|` samples and the attack audibly doubles; with it,
- *   the strike measures as concentrated as the input's own, at every frame
- *   size from 256 to 4096 and every ratio. The input the hold does not
- *   consume is repaid over the following hops, so the timeline stays exact:
- *   measured over 30 s, no onset lands more than 1.71 ms from where the
- *   stretched timeline puts it, at 120, 480 and 960 strikes per minute
- *   alike.
+ * - **Quality::Studio (default)**, Effects/detail/StudioVocoder.h:
+ *   phase-gradient heap integration (Prusa & Holighaus, "Phase Vocoder Done
+ *   Right", EUSIPCO 2017) on a reference summed over every channel,
+ *   instantaneous frequency from a second transform 16 samples on, and a
+ *   time map anchored on strikes: a log-frequency spectral-flux detector
+ *   runs ahead of the analysis, places each onset to the sample, and the
+ *   time map is bent to slope 1 across the strike's window so every frame
+ *   that sees the strike sees it at the offset the stretched timeline puts
+ *   it at, and the bins the strike rises into are copied unrotated, so
+ *   nothing of it arrives early. Measured over 30 s of strikes at 120 to
+ *   600 per minute and ratios 0.8 and 1.25, no strike lands more than 0.08
+ *   ms from its place on the stretched timeline, and isolated strikes carry
+ *   no pre-echo above rounding at ratios 0.8 to 2. Default frame: the power
+ *   of two nearest 85 ms (4096 at 44.1 and 48 kHz).
+ * - **Quality::Standard**, the 1.8 engine (Effects/detail/PhaseVocoderEngine.h):
+ *   identity phase locking (Laroche & Dolson, IEEE Trans. Speech and Audio
+ *   Processing 7(3), 1999) over the first channel's peaks and a
+ *   transient-locked hop, described below. Default frame 2048. Kept
+ *   bit-exact for renders already made with it; a state blob that predates
+ *   the quality field restores it.
  *
- * Peaks are grouped by the plain magnitude valley between them; no
- * perceptual band table is involved anywhere in this file.
+ * Measured against the ideal (each source re-synthesised at the stretched
+ * duration) at ratios 0.5, 0.75, 1.25, 1.5 and 2, stereo, 48 kHz: spectral
+ * scores over a chord, a bass line, a sung vowel, a drum pattern and a mix,
+ * strike scores over the last two:
+ *
+ *   engine                   LSD dB  conv dB  attack dB  pre-echo dB  onset ms
+ *   Studio, 4096 (default)    4.12   -12.59     -0.64      -66.8        0.59
+ *   Studio, 2048              4.56   -10.12     -0.53      -69.7        0.54
+ *   1.8 engine (Standard)     5.01    -8.08     -1.60      -77.7        4.16
+ *
+ * (LSD: multi-resolution log-spectral distance; conv: spectral convergence;
+ * attack: energy of the first 5 ms against the ideal's, closer to 0 is
+ * better; pre-echo: energy in the 20 ms before each strike above the
+ * ideal's, relative to the strike; onset: median error of the unaligned
+ * onset time. Lower is better elsewhere.) On the drum scene alone Studio
+ * leaves -74.8 dB ahead of a strike and the 1.8 engine -67.6; averaged with
+ * the mix, where the 20 ms before a strike also hold the chord and the bass,
+ * the 1.8 engine comes out lower.
+ *
+ * **The Standard engine in detail.** Peaks are found each frame and every
+ * bin in a peak's region of influence is rotated by the SAME phase
+ * increment as its peak, so a partial stays vertically coherent. Attacks
+ * are found with half-wave-rectified spectral flux over a log-frequency
+ * filterbank, which sees a strike over a sustained bed where a broadband
+ * energy test cannot: on a drum strike over a 110 Hz harmonic bed the
+ * weakest onset frame carries 14.46 dB more flux than the median frame and
+ * only 0.13 dB more energy. Across a detected attack the synthesis phases
+ * are reset to the analysis phases AND the analysis hop is held at the
+ * synthesis hop for one whole window, so every frame that sees the strike
+ * places it at the same offset. Without that hold, a stretch spreads one
+ * strike over `fftSize * |ratio - 1|` samples and the attack audibly
+ * doubles. The input the hold does not consume is repaid over the following
+ * hops, so the timeline stays exact: measured over 30 s, no onset lands more
+ * than 1.71 ms from where the stretched timeline puts it, at 120, 480 and
+ * 960 strikes per minute alike. Peaks are grouped by the plain magnitude
+ * valley between them; no perceptual band table is involved.
  *
  * Everything is implemented here from those papers. No third-party code.
  *
  * Hops: the synthesis hop is fixed at `fftSize / 4` (75% overlap, which the
  * sqrt-Hann analysis and synthesis windows overlap-add to a constant), and
- * the analysis hop is `round(Rs / ratio)` carried through a fractional
- * accumulator, so the realised stretch is exactly the requested ratio for
- * arbitrary ratios and never drifts, however long the stream runs. The
- * transient hold above is the one exception, and it borrows rather than
- * skips: what it does not consume it repays.
+ * the analysis hop follows the time map through a fractional accumulator,
+ * so the realised stretch is exactly the requested ratio for arbitrary
+ * ratios and never drifts, however long the stream runs. A strike bends
+ * the hop locally - Standard's hold, Studio's anchor - and borrows rather
+ * than skips: what it does not consume it repays.
  *
  * Latency and the three processing paths:
  *
@@ -62,8 +94,10 @@
  *   no throw. It carries no compensation latency - what comes out IS the
  *   stretched timeline - but it primes (see below).
  * - `processBlock()` is the fixed-rate playback adaptor: same block in, same
- *   block in-place out, real-time safe, latency `fftSize` samples as reported
- *   by `getLatency()`. Exact at ratio 1; away from unity it pays a cost that
+ *   block in-place out, real-time safe, latency as reported by
+ *   `getLatency()`: `fftSize` for Standard, `fftSize` plus the onset
+ *   detector's lookahead for Studio (5632 samples, 117 ms, at the default
+ *   frame and 48 kHz). Exact at ratio 1; away from unity it pays a cost that
  *   is stated in samples below.
  * - `process()` is the offline path for a whole signal. It returns a buffer
  *   of `round(inputLength * ratio)` samples aligned with the input - the
@@ -88,13 +122,17 @@
  * subtract: output sample `k` is sample `k` of the stretched signal. What
  * there is instead is a priming requirement: `pullOutput()` returns 0 until
  * the overlap-add's first complete sample exists, which takes 1024 to 3072
- * input samples at the default 2048-sample frame, over ratios 0.5 to 2.
- * After that, cumulative output is `ratio *` cumulative input fed, less an
- * offset that has two parts. One is the overlap-add's own incomplete tail,
- * which nothing the caller does can remove: it measures 1152 to 2091 samples at
- * the default frame size over ratios 0.5 to 2 once a stream has been fed to its
- * end and drained, and up to 3840 mid-stream on percussive material, where the
- * transient-locked hop varies how much of a frame stands incomplete. The other
+ * input samples for Standard at its default 2048-sample frame and 4608 to
+ * 6656 for Studio at its default 4096 frame (the frame plus the detector's
+ * lookahead), over ratios 0.5 to 2. After that, cumulative output is
+ * `ratio *` cumulative input fed, less an offset that has two parts. One is
+ * the overlap-add's own incomplete tail, which nothing the caller does can
+ * remove: once a stream has been fed to its end and drained it measures 1152
+ * to 2091 samples for Standard and 2944 to 8704 for Studio at their default
+ * frames over ratios 0.5 to 2 - Studio's grows with the ratio, its lookahead
+ * being stretched with everything else - and for Standard up to 3840
+ * mid-stream on percussive material, where the transient-locked hop varies
+ * how much of a frame stands incomplete. The other
  * is whatever has been fed and not yet pulled back. That part is the caller's
  * own doing, and the caller can read it at any moment: it is `ratio *`
  * `getQueuedInputSamples()` plus `getAvailableOutput()`, and pulling until
@@ -120,27 +158,40 @@
  *   at 0.95, worst error 0.03 percentage points over durations of 5 to 30 s
  *   and host blocks of 64 to 4096 samples. It arrives as gaps of at most one
  *   block - at a 512-sample block, one gap every 11 to 13 ms of output - so
- *   it is audible, and this is not a usable real-time stretch.
+ *   it is audible, and this is not a usable real-time stretch. No input is
+ *   refused below unity, and every strike comes out where the fixed-rate
+ *   slot puts it (Studio: within 2 samples from 0.8 to 0.99 on a strike
+ *   train).
  * - `ratio > 1` (slower): the stretched stream is longer than the input, so
  *   the block physically cannot carry all of it and something must be lost.
  *   The choice made here is to lose it at the input head and say so: the
  *   adaptor refuses the fraction `1 - 1/ratio` of the input, spread evenly
  *   across the stream, and counts every refused sample in
  *   `getDiscardedInput()`. What it does carry keeps its place: measured on a
- *   strike train at ratio 1.081, no strike lands more than 38 samples
- *   (0.79 ms) from where the fixed-rate slot puts it, over runs of 5 to 30 s.
+ *   strike train at ratio 1.081, no Standard strike lands more than 38
+ *   samples (0.79 ms) from where the fixed-rate slot puts it, over runs of 5
+ *   to 30 s. Studio's lookahead - fftSize / 2 plus the detector's reach, in
+ *   kept samples - spans `ratio` times as much of the offered stream when
+ *   one sample in `ratio` is kept, so its strikes carry one constant offset,
+ *   `(ratio - 1) * (fftSize / 2 + lookahead)`, and no drift: 206 samples at
+ *   1.081 at a 2048 frame, 3564 (74 ms) at ratio 2 at the default 4096.
  *   A caller therefore detects the degradation in one call instead of by
  *   listening. What refusing input cannot preserve is the shape of a strike:
  *   an even refusal is a decimation, and it costs strike height. Measured on a
  *   120 BPM strike train over 30 s, matched onset by onset with no search
- *   window, the mean strike height as a fraction of this class's own ratio-1
+ *   window, Standard's mean strike height as a fraction of its own ratio-1
  *   rendering is 1.00 at every ratio at or below 1, then 0.85 at 1.01, 0.79 at
  *   1.02, 0.38 at 1.05, 0.82 at 1.081, 0.89 at 1.25, 0.56 at 1.5 and 0.11 at
  *   2. That cost is NOT monotonic in the ratio - 1.05 is far worse than 1.081,
  *   and 1.25 is better than either - so do not take two of these figures and
  *   interpolate between them. Counting instead the strikes that arrive at half
  *   height or better: four in five at ratio 1.081, fewer than one in three at
- *   1.05, none at ratio 2. Keeping the input instead, and letting the surplus
+ *   1.05, none at ratio 2. Studio, whose anchor keeps a strike's own frames
+ *   whole, falls steadily instead: the energy within 2 ms of each strike,
+ *   against its own ratio-1 rendering, averages 0.89 at 1.01, 0.78 at 1.02,
+ *   0.75 at 1.05, 0.83 at 1.081, 0.71 at 1.25, 0.53 at 1.5 and 0.05 at 2,
+ *   with 43 of 59 strikes at half energy or better at 1.05 (Standard: 18)
+ *   and none at 2. Keeping the input instead, and letting the surplus
  *   output be spliced away, is not the better trade: that keeps every strike
  *   at full height up to ratio 1.081, but it displaces the stream by 150 ms at
  *   ratio 1.01, 359 ms at 1.081 and up to 10.7 s at ratio 2, and from ratio
@@ -173,13 +224,19 @@
  * different trade at a different rate: 2048 spans 42.7 ms at 48 kHz and
  * 21.3 ms at 96 kHz. Low material wants the longer window (partials must be
  * resolved into separate bins), percussive material the shorter one -
- * though the transient hold above is what actually protects a strike, and it
- * measures the same at every frame size from 256 to 4096. One consequence of
- * the frame size is worth stating: the hold needs an unlocked hop between
- * strikes to repay in, so the strike density it can serve scales as
- * `sampleRate / fftSize`. At 2048 and 48 kHz the 1.71 ms figure above holds
- * measured from 100 to 1040 strikes per minute and breaks down past about
- * 1060, where per-onset timing degrades to roughly 3.9 ms.
+ * though the strike handling above is what actually protects a strike, and
+ * it measures the same at every frame size from 256 to 4096. One
+ * consequence of the frame size is worth stating: a hold or an anchor needs
+ * an unlocked stretch between strikes to repay in, so the strike density it
+ * can serve scales as `sampleRate / fftSize`. For Standard at 2048 and 48
+ * kHz the 1.71 ms figure above holds measured from 100 to 1040 strikes per
+ * minute and breaks down past about 1060, where per-onset timing degrades
+ * to roughly 3.9 ms. Studio's 0.08 ms holds to 600 strikes per minute at
+ * its default 4096 frame and to 1060 at 2048; past that a strike its anchor
+ * cannot serve is smeared over the frame, and the worst strike lands 9 to
+ * 20 ms off at 4096 (720 to 2000 per minute, ratios 0.8 and 1.25) and up to
+ * 6.6 ms off at 2048 (2000 per minute). Dense rolls and fast hi-hats want
+ * the 2048 frame.
  *
  * Threading (single control thread + single audio thread):
  * - `processBlock()`, `feedInput()`, `pullOutput()`, `reset()`: audio thread
@@ -199,12 +256,13 @@
  * - `getState()` and the getters read the control-side values and are safe
  *   from any thread.
  *
- * Dependencies: Effects/detail/PhaseVocoderEngine.h, Core/AudioSpec.h,
- * Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h, Core/StateBlob.h.
+ * Dependencies: Effects/detail/PhaseVocoderEngine.h,
+ * Effects/detail/StudioVocoder.h, Core/AudioSpec.h, Core/AudioBuffer.h,
+ * Core/DspMath.h, Core/DenormalGuard.h, Core/StateBlob.h.
  *
  * @code
  * dspark::TimeStretch<float> ts;
- * ts.prepare(spec);                       // 2048-sample frame by default
+ * ts.prepare(spec);                       // Studio, ~85 ms frame by default
  * ts.setTempoChangePercent(-8.3f);        // 120 BPM played at 110 BPM
  * dspark::AudioBuffer<float> stretched;
  * ts.process(source.toView(), stretched); // exact, whole-signal
@@ -217,6 +275,7 @@
 #include "../Core/DspMath.h"
 #include "../Core/StateBlob.h"
 #include "detail/PhaseVocoderEngine.h"
+#include "detail/StudioVocoder.h"
 
 #include <algorithm>
 #include <atomic>
@@ -246,6 +305,38 @@ public:
     static constexpr T kMinRatio = T(0.5);
     static constexpr T kMaxRatio = T(2);
 
+    /**
+     * @brief The engine that renders the stretch (see the file overview).
+     *
+     * - `Studio` (default): phase-gradient propagation over a channel-summed
+     *   reference and a strike-anchored time map
+     *   (Effects/detail/StudioVocoder.h). Default frame about 85 ms; the
+     *   fixed-rate adaptor's latency is that frame plus the onset
+     *   detector's lookahead (about 32 ms).
+     * - `Standard`: the 1.8 engine, identity phase locking over the first
+     *   channel's peaks and a transient-locked hop; default frame 2048.
+     *   Kept bit-exact for renders already made with it; a state blob that
+     *   predates the quality field restores it.
+     *
+     * The choice takes effect at the next prepare() or reset(), because the
+     * two engines have different latencies and different stream geometry;
+     * getLatency() reports the engine in force.
+     */
+    enum class Quality { Standard, Studio };
+
+    /** @brief Selects the engine (applied at the next prepare()/reset()). */
+    void setQuality(Quality q) noexcept
+    {
+        quality_.store(q == Quality::Standard ? Quality::Standard : Quality::Studio,
+                       std::memory_order_relaxed);
+    }
+
+    /** @return The engine selected for the next prepare()/reset(). */
+    [[nodiscard]] Quality getQuality() const noexcept
+    {
+        return quality_.load(std::memory_order_relaxed);
+    }
+
     // -- Lifecycle ---------------------------------------------------------------
 
     /**
@@ -257,33 +348,37 @@ public:
      * stays pass-through.
      *
      * @param spec    Audio environment specification.
-     * @param fftSize STFT frame size, power of two (default 2048). Larger
-     *                favours low-pitched and sustained material, smaller
-     *                favours transients and lowers latency.
+     * @param fftSize STFT frame size, a power of two, used by whichever
+     *                engine is selected. 0 (the default) selects each
+     *                engine's own: 2048 for Standard, the power of two
+     *                nearest 85 ms for Studio (4096 at 44.1 and 48 kHz,
+     *                8192 at 88.2 and 96 kHz). Larger favours low-pitched
+     *                and sustained material, smaller favours dense strikes
+     *                and lowers latency.
      */
-    void prepare(const AudioSpec& spec, int fftSize = 2048)
+    void prepare(const AudioSpec& spec, int fftSize = 0)
     {
-        if (!spec.isValid() || (fftSize & (fftSize - 1)) != 0
-            || fftSize < 256 || fftSize > (1 << 20))
+        if (!spec.isValid()) return;
+        if (fftSize != 0 && ((fftSize & (fftSize - 1)) != 0
+                             || fftSize < 256 || fftSize > (1 << 20)))
             return;
 
         prepared_.store(false, std::memory_order_relaxed);
 
         numChannels_ = std::max(1, spec.numChannels);
-        fftSize_  = fftSize;
-        synthHop_ = fftSize / 4;
-
-        // The reader trails the completed frontier of the synthesis stream by
-        // one synthesis hop. The analysis-synthesis chain itself accounts for
-        // fftSize - synthHop samples of delay, so that trailing distance puts
-        // the reported latency at exactly one frame.
-        latency_ = fftSize_;
+        // 0 selects each engine's own default frame: 2048 for Standard (its
+        // published rendering) and about 85 ms for Studio (4096 at 44.1 and
+        // 48 kHz, 8192 at 88.2 and 96 kHz), the span its measurements use.
+        fftStandard_ = fftSize != 0 ? fftSize : 2048;
+        fftStudio_ = fftSize != 0 ? fftSize : studioDefaultFrame(spec.sampleRate);
 
         // The input queue holds what the stretch has not consumed yet. It
         // needs room for one whole analysis hop (which can be as long as a
-        // frame), for one host block, and for the surplus a ratio above 1
-        // accumulates until the caller stops or the queue refuses more.
-        int capacity = 4 * fftSize_ + std::max(1, spec.maxBlockSize);
+        // frame, and for Studio as long as a frame plus its lookahead), for
+        // one host block, and for the surplus a ratio above 1 accumulates
+        // until the caller stops or the queue refuses more.
+        const int widest = std::max(fftStandard_, fftStudio_);
+        int capacity = 4 * widest + 4 * studioDefaultFrame(spec.sampleRate) + std::max(1, spec.maxBlockSize);
         queueSize_ = 1;
         while (queueSize_ < capacity) queueSize_ <<= 1;
         queueMask_ = queueSize_ - 1;
@@ -293,13 +388,13 @@ public:
         // asked for, because this owner reads the synthesis stream directly
         // and its hop schedule has to act on strikes the frame-energy test
         // cannot see over sustained material.
-        engine_.prepare(spec.sampleRate, numChannels_, fftSize_, false, false, true, true);
-        accumMask_ = engine_.olaMask();
+        engine_.prepare(spec.sampleRate, numChannels_, fftStandard_, false, false, true, true);
+        studio_.prepare(spec.sampleRate, numChannels_, fftStudio_, false);
 
         queue_.assign(static_cast<size_t>(numChannels_), {});
         for (int ch = 0; ch < numChannels_; ++ch)
             queue_[static_cast<size_t>(ch)].assign(static_cast<size_t>(queueSize_), T(0));
-        feed_.assign(static_cast<size_t>(fftSize_), T(0));
+        feed_.assign(static_cast<size_t>(capacity), T(0));
 
         publishEngineParams();
         prepared_.store(true, std::memory_order_relaxed);
@@ -311,7 +406,29 @@ public:
     void reset() noexcept
     {
         if (!prepared_.load(std::memory_order_relaxed)) return;
+        studioActive_ = quality_.load(std::memory_order_relaxed) == Quality::Studio;
         engine_.reset();
+        studio_.reset();
+        if (studioActive_)
+        {
+            fftSize_ = fftStudio_;
+            // One frame of analysis-synthesis delay plus the onset
+            // detector's lookahead.
+            latency_ = fftStudio_ + studio_.lookahead();
+            accumMask_ = studio_.olaMask();
+        }
+        else
+        {
+            fftSize_ = fftStandard_;
+            // The reader trails the completed frontier of the synthesis
+            // stream by one synthesis hop. The analysis-synthesis chain
+            // itself accounts for fftSize - synthHop samples of delay, so
+            // that trailing distance puts the reported latency at exactly
+            // one frame.
+            latency_ = fftStandard_;
+            accumMask_ = engine_.olaMask();
+        }
+        synthHop_ = fftSize_ / 4;
         for (auto& q : queue_) std::fill(q.begin(), q.end(), T(0));
 
         queueWrite_ = 0;
@@ -322,7 +439,7 @@ public:
         // Start one synthesis hop behind the write head: those cells are
         // still silent, which is the latency the class reports, and from
         // there the reader stays exactly that far behind.
-        readPos_ = engine_.writeHead() - static_cast<int64_t>(synthHop_);
+        readPos_ = eWriteHead() - static_cast<int64_t>(latency_ - fftSize_ + synthHop_);
         openIntake();
     }
 
@@ -442,7 +559,7 @@ public:
     {
         if (!prepared_.load(std::memory_order_relaxed) || path_ != Path::Pull)
             return 0;
-        return static_cast<int>(engine_.writeHead() - readPos_);
+        return static_cast<int>(std::max<int64_t>(0, eWriteHead() - readPos_));
     }
 
     /**
@@ -503,7 +620,7 @@ public:
 
         const int nCh   = std::min(out.getNumChannels(), numChannels_);
         const int count = std::min(std::max(0, out.getNumSamples()),
-                                   static_cast<int>(engine_.writeHead() - readPos_));
+                                   static_cast<int>(std::max<int64_t>(0, eWriteHead() - readPos_)));
         if (count > 0)
         {
             readSynthesis(out, nCh, 0, count);
@@ -534,6 +651,7 @@ public:
         w.write("ratio", static_cast<float>(timeRatio_.load(std::memory_order_relaxed)));
         w.write("transient", transientPreserve_.load(std::memory_order_relaxed));
         w.write("phaselock", phaseLock_.load(std::memory_order_relaxed));
+        w.write("quality", static_cast<int32_t>(quality_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -545,6 +663,9 @@ public:
         setTimeRatio(static_cast<T>(r.read("ratio", 1.0f)));
         setTransientPreserve(r.read("transient", true));
         setPhaseLock(r.read("phaselock", true));
+        // A blob written before the quality field existed was rendered by the
+        // Standard engine, so that is what it restores.
+        setQuality(static_cast<Quality>(std::clamp(r.read("quality", 0), 0, 1)));
         return true;
     }
 
@@ -588,7 +709,7 @@ public:
         {
             takeInput(buffer, nCh, taken, i);
 
-            const int64_t avail = engine_.writeHead() - readPos_;
+            const int64_t avail = eWriteHead() - readPos_;
             if (avail > 0)
             {
                 const int take = static_cast<int>(
@@ -605,7 +726,7 @@ public:
             // and no amount of buffering invents it: the output waits, in
             // silence, for exactly as many samples as are missing, and picks
             // up where it left off.
-            const int need = engine_.samplesToNextHop();
+            const int need = eSamplesToNextHop();
             if (need > queued_)
             {
                 const int silence = std::min(need - queued_, nS - i);
@@ -622,9 +743,9 @@ public:
             for (int ch = 0; ch < nCh; ++ch)
             {
                 dequeueInto(ch, need);
-                engine_.pushInput(ch, feed_.data(), need);
+                ePushInput(ch, feed_.data(), need);
             }
-            engine_.commitInput(need, nCh);
+            eCommitInput(need, nCh);
             queueRead_ = (queueRead_ + need) & queueMask_;
             queued_ -= need;
             openIntake();
@@ -660,7 +781,7 @@ public:
         path_ = Path::Adaptor;   // this path drives the same reader as the adaptor
 
         const int nCh = std::min(inCh, numChannels_);
-        const double ratio = engine_.activeRatio();
+        const double ratio = studioActive_ ? studio_.activeRatio() : engine_.activeRatio();
         const auto outLen = static_cast<int>(
             std::lround(static_cast<double>(inLen) * ratio));
         out.resize(inCh, std::max(0, outLen));
@@ -669,7 +790,9 @@ public:
         // A frame carries its content at its centre, so the first output
         // sample that lines up with input sample 0 sits half an input frame
         // plus half a stretched frame into the synthesis stream.
-        const int64_t skip = std::lround(0.5 * static_cast<double>(fftSize_) * (1.0 + ratio));
+        const int64_t skip = studioActive_
+            ? std::llround(studio_.streamPositionOf(0.0)) - readPos_
+            : std::lround(0.5 * static_cast<double>(fftSize_) * (1.0 + ratio));
         const int64_t stop = skip + outLen;
 
         int64_t streamPos = 0;    // position in the synthesis stream
@@ -677,12 +800,12 @@ public:
 
         while (streamPos < stop)
         {
-            const int64_t avail = engine_.writeHead() - readPos_;
+            const int64_t avail = eWriteHead() - readPos_;
             if (avail <= 0)
             {
                 // Offline has the whole signal, so nothing rations the input;
                 // past its end the engine is flushed with silence.
-                const int need = engine_.samplesToNextHop();
+                const int need = eSamplesToNextHop();
                 for (int ch = 0; ch < nCh; ++ch)
                 {
                     const T* src = in.getChannel(ch);
@@ -692,9 +815,9 @@ public:
                         feed_[static_cast<size_t>(k)] =
                             (p < inLen) ? src[static_cast<size_t>(p)] : T(0);
                     }
-                    engine_.pushInput(ch, feed_.data(), need);
+                    ePushInput(ch, feed_.data(), need);
                 }
-                engine_.commitInput(need, nCh);
+                eCommitInput(need, nCh);
                 inPos += need;
                 continue;
             }
@@ -706,7 +829,7 @@ public:
             {
                 for (int ch = 0; ch < nCh; ++ch)
                 {
-                    const T* acc = engine_.olaData(ch);
+                    const T* acc = eOla(ch);
                     T* dst = out.getChannel(ch) + (from - skip);
                     int64_t rp = readPos_ + (from - streamPos);
                     for (int64_t k = 0; k < count; ++k)
@@ -745,6 +868,12 @@ private:
         p.phaseLock = phaseLock_.load(std::memory_order_relaxed);
         p.percussiveSplit = false;   // no public switch selects the split here
         engine_.publishParams(p);
+
+        typename detail::StudioVocoder<T>::Params q;
+        q.targetSemitones = p.targetSemitones;
+        q.transientPreserve = p.transientPreserve;
+        q.formantPreserve = false;
+        studio_.publishParams(q);
     }
 
     /**
@@ -758,17 +887,27 @@ private:
      * shorter of the two and the difference is what cannot be carried; the
      * window is what refuses it, evenly across the hop, so that the refusal
      * falls at a position in the stream and not where a block boundary
-     * happens to land. At and below unity the analysis hop is the longer of
-     * the two, the window is over-subscribed and nothing is ever refused.
+     * happens to land. At and below unity the analysis hop is on average
+     * the longer of the two, and the window takes everything the queue has
+     * room for: Studio's strike anchors run a frame's hop below the
+     * synthesis hop now and then even below unity (a lock repays the input
+     * it ran ahead by), and a window cut at that hop refused 2.5 to 3.9
+     * percent of the input at ratios 0.8 to 0.95. Queued instead, that
+     * input feeds the longer hops that follow. The Standard engine's hop
+     * never falls below the synthesis hop at or below unity, so its window
+     * was never cut there and its output does not move.
      */
     void openIntake() noexcept
     {
         intakeSpan_  = std::max(1, synthHop_);
-        // Never wider than the queue: the window is bounded by one analysis
-        // hop and the queue holds several frames, so this cannot bind, and
-        // stating it is what keeps the loop below total.
-        intakeWant_  = std::clamp(engine_.samplesToNextHop() - queued_,
-                                  0, queueSize_ - queued_);
+        const double ratio = studioActive_ ? studio_.activeRatio() : engine_.activeRatio();
+        // Never wider than the queue: above unity the window is bounded by
+        // one analysis hop and the queue holds several frames, so this
+        // cannot bind there, and stating it is what keeps the loop below
+        // total.
+        intakeWant_  = ratio <= 1.0
+                     ? queueSize_ - queued_
+                     : std::clamp(eSamplesToNextHop() - queued_, 0, queueSize_ - queued_);
         intakeTaken_ = 0;
         intakeErr_   = 0;
     }
@@ -828,8 +967,9 @@ private:
         // frame past the write head, less the analysis hop the first frame
         // consumes. Nothing has been fed yet, so that hop is the one the
         // engine reports now.
-        readPos_ = engine_.writeHead()
-                 + static_cast<int64_t>(fftSize_ - engine_.samplesToNextHop());
+        readPos_ = studioActive_
+            ? static_cast<int64_t>(std::llround(studio_.streamPositionOf(0.0)))
+            : eWriteHead() + static_cast<int64_t>(fftSize_ - eSamplesToNextHop());
         return true;
     }
 
@@ -839,20 +979,20 @@ private:
     {
         for (;;)
         {
-            const int need = engine_.samplesToNextHop();
+            const int need = eSamplesToNextHop();
             if (queued_ < need) return;
             // A frame writes one whole window ahead of the head; stop before
             // it would reach unread output.
-            if (engine_.writeHead() + static_cast<int64_t>(fftSize_) - readPos_
+            if (eWriteHead() + static_cast<int64_t>(fftSize_) - readPos_
                 > static_cast<int64_t>(accumMask_) + 1)
                 return;
 
             for (int ch = 0; ch < numChannels_; ++ch)
             {
                 dequeueInto(ch, need);
-                engine_.pushInput(ch, feed_.data(), need);
+                ePushInput(ch, feed_.data(), need);
             }
-            engine_.commitInput(need, numChannels_);
+            eCommitInput(need, numChannels_);
             queueRead_ = (queueRead_ + need) & queueMask_;
             queued_ -= need;
         }
@@ -877,12 +1017,45 @@ private:
     {
         for (int ch = 0; ch < nCh; ++ch)
         {
-            const T* acc = engine_.olaData(ch);
+            const T* acc = eOla(ch);
             T* dst = buffer.getChannel(ch) + offset;
             const int64_t rp = readPos_;
             for (int k = 0; k < count; ++k)
                 dst[k] = acc[static_cast<size_t>((rp + k) & accumMask_)];
         }
+    }
+
+    // -- Engine dispatch (the engine in force is chosen at reset()) ---------------
+
+    [[nodiscard]] int64_t eWriteHead() const noexcept
+    {
+        return studioActive_ ? studio_.writeHead() : engine_.writeHead();
+    }
+    [[nodiscard]] int eSamplesToNextHop() const noexcept
+    {
+        return studioActive_ ? studio_.samplesToNextHop() : engine_.samplesToNextHop();
+    }
+    void ePushInput(int ch, const T* src, int count) noexcept
+    {
+        if (studioActive_) studio_.pushInput(ch, src, count);
+        else engine_.pushInput(ch, src, count);
+    }
+    void eCommitInput(int count, int nCh) noexcept
+    {
+        if (studioActive_) studio_.commitInput(count, nCh);
+        else engine_.commitInput(count, nCh);
+    }
+    [[nodiscard]] const T* eOla(int ch) const noexcept
+    {
+        return studioActive_ ? studio_.olaData(ch) : engine_.olaData(ch);
+    }
+
+    /** @brief Studio's default frame: the power of two nearest 85 ms. */
+    [[nodiscard]] static int studioDefaultFrame(double sampleRate) noexcept
+    {
+        int n = 256;
+        while (n < (1 << 16) && static_cast<double>(n) * 1.5 < 0.085 * sampleRate) n <<= 1;
+        return n;
     }
 
     // -- Members -------------------------------------------------------------------
@@ -894,7 +1067,11 @@ private:
     int latency_ = 2048;
     int64_t accumMask_ = 8191;     ///< Cached engine OLA ring mask.
 
-    detail::PhaseVocoderEngine<T> engine_;   ///< Shared analysis/synthesis core.
+    detail::PhaseVocoderEngine<T> engine_;   ///< Standard engine (the 1.8 rendering).
+    detail::StudioVocoder<T> studio_;        ///< Studio engine.
+    bool studioActive_ = true;               ///< Engine in force since reset().
+    int fftStandard_ = 2048;                 ///< Standard engine frame.
+    int fftStudio_ = 4096;                   ///< Studio engine frame.
 
     std::vector<std::vector<T>> queue_;   ///< Per-channel input queue.
     std::vector<T> feed_;                 ///< One analysis hop, laid out flat.
@@ -916,6 +1093,7 @@ private:
 
     int64_t readPos_ = 0;       ///< Reader position in the synthesis stream.
 
+    std::atomic<Quality> quality_ { Quality::Studio };
     std::atomic<T> timeRatio_ { T(1) };
     std::atomic<bool> transientPreserve_ { true };
     std::atomic<bool> phaseLock_ { true };

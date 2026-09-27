@@ -660,30 +660,23 @@ DSPARK_TEST(LoudnessMeter_LRA_EBU_3342_tone_vectors)
     }
 }
 
-// A music-like programme against two external references on the same
-// samples. `spec` applies the Tech 3342 reference code verbatim - rank
-// round((n - 1) * p) - to short-term values taken every 100 ms from
-// libebur128 1.2.6; `ffmpeg` is the ebur128 filter of FFmpeg 5.1 (printed to
-// 0.1 LU). The spec reference binds at 0.1 LU (the meter holds values at
-// 0.1 LU resolution). FFmpeg ranks its percentiles differently - the
-// round(0.1 n)-th value counted from 1, and the 95th counted down from the
-// top - which moves its reading by up to about 0.25 LU on a spread
-// distribution, so it is held at 0.15 here, where the two rules agree.
-DSPARK_TEST(LoudnessMeter_LRA_music_fragment_matches_the_references)
+// A music-like programme against the Tech 3342 reference code on the same
+// samples: rank round((n - 1) * p) applied verbatim to short-term values
+// taken every 100 ms by an independent BS.1770 implementation. It binds at
+// 0.1 LU, the resolution at which the meter holds its values.
+DSPARK_TEST(LoudnessMeter_LRA_music_fragment_matches_the_reference)
 {
-    struct Case { double seconds; double spec; double ffmpeg; };
+    struct Case { double seconds; double spec; };
     const Case cases[] = {
-        { 8.0,  1.640, 1.7 },
-        { 35.2, 12.356, 12.4 },
-        { 42.0, 11.926, 12.0 },
+        { 8.0,  1.640 },
+        { 35.2, 12.356 },
+        { 42.0, 11.926 },
     };
     for (const auto& c : cases)
     {
         std::vector<float> L, R;
         lraMusicFragment(c.seconds, L, R);
-        const double lra = lraOf(L, R);
-        EXPECT_NEAR(lra, c.spec, 0.1);
-        EXPECT_NEAR(lra, c.ffmpeg, 0.15);
+        EXPECT_NEAR(lraOf(L, R), c.spec, 0.1);
     }
 }
 

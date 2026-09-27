@@ -287,7 +287,7 @@ public:
      * V3 and later require), gated at -70 LUFS absolute and -20 LU relative; LRA is the spread between the 10th and
      * 95th percentiles. O(bins) and real-time safe like the integrated gate.
      *
-     * Percentiles follow the Tech 3342 reference code (and libebur128):
+     * Percentiles follow the Tech 3342 reference code:
      * among the n gated short-term values sorted ascending, P is the value
      * at 0-based rank round((n - 1) * P). Values are held at 0.1 LU
      * resolution. The first short-term value exists after 3 s of input, so a
@@ -322,7 +322,7 @@ public:
             gatedCount += lraHistogram_[i].load(std::memory_order_relaxed);
         if (gatedCount == 0) return T(0);
 
-        // Percentiles by the libebur128 rule: the value of 0-based rank
+        // Percentiles by the Tech 3342 reference rule: the value of 0-based rank
         // round((n - 1) * p) among the n gated values. Both ranks are always
         // measured values - never the gate threshold - and every n is
         // covered: with one value, or with n equal values, the range is 0.

@@ -14,8 +14,8 @@
  * - Mono and stereo (including joint stereo with M/S and intensity)
  * - CBR and VBR, ID3v2 tag skipping
  * - Gapless: a Xing/Info (or VBRI) tag frame is skipped rather than decoded
- *   as 1152 samples of silence, and when it carries a LAME-format tag from
- *   LAME, FFmpeg (Lavf/Lavc) or DSPark, the encoder delay plus the 529-sample
+ *   as 1152 samples of silence, and when it carries a gapless tag whose
+ *   CRC checks out, the encoder delay plus the 529-sample
  *   decoder delay is trimmed from the start and the padding from the end, so
  *   the output lines up with the encoder's input sample for sample
  * - getInfo() reports the delivery format (32-bit float); MP3 itself has
@@ -28,7 +28,7 @@
  * - Analysis polyphase filterbank + MDCT + Huffman coding, rate-controlled
  *   by a uniform global-gain search (no psychoacoustic model)
  * - Gapless: close() flushes the codec delay (the last input samples used to
- *   be cut off) and the first frame is an Info tag frame with a LAME-format
+ *   be cut off) and the first frame is an Info tag frame with a gapless
  *   tag (encoder "DSPark", delay 528, exact padding, frame and byte counts),
  *   which this decoder uses to return exactly the samples written
  * - Produces standard-compliant MP3 playable by any decoder
@@ -263,7 +263,7 @@ private:
     static constexpr int kSynthSlots   = 16;
     static constexpr int kMaxReservoir = 8192; // Bit reservoir maximum bytes
     /// Delay of a standard Layer III decoder (the synthesis filterbank), the
-    /// value the LAME tag convention assumes: 528 + 1.
+    /// value the gapless tag convention assumes: 528 + 1.
     static constexpr int kDecoderDelay = 529;
     /// Delay of this encoder's analysis filterbank and MDCT (measured).
     static constexpr int kEncoderDelay = 528;
@@ -962,7 +962,7 @@ private:
 
     struct Count1Code { uint8_t len; uint8_t code; uint8_t v, w, x, y; };
 
-    // ISO 11172-3 count1 table A (quadruples). Values per ffmpeg mpa_quad_{codes,bits}[0];
+    // ISO 11172-3 count1 table A (quadruples), as tabulated in the standard;
     // verified prefix-free with Kraft sum == 1.
     static constexpr Count1Code kCount1A[] = {
         {1, 0b1, 0, 0, 0, 0}, {4, 0b0101, 0, 0, 0, 1}, {4, 0b0100, 0, 0, 1, 0}, {5, 0b00101, 0, 0, 1, 1},
@@ -1115,8 +1115,8 @@ private:
 
     // Gapless information from a Xing/Info tag frame (decoder).
     bool gapless_ = false;
-    int gaplessDelay_ = 0;       ///< Encoder delay from the LAME-format tag.
-    int gaplessPadding_ = 0;     ///< Padding from the LAME-format tag.
+    int gaplessDelay_ = 0;       ///< Encoder delay from the gapless tag.
+    int gaplessPadding_ = 0;     ///< Padding from the gapless tag.
     int64_t tagFrames_ = 0;      ///< Audio frame count from the Xing fields (0 = absent).
 
     std::vector<uint8_t> reservoir_;
@@ -1144,7 +1144,7 @@ private:
     int64_t encSamplesIn_ = 0;    ///< Input samples written.
     int64_t encFramesOut_ = 0;    ///< Audio frames written (the tag frame excluded).
     int64_t encAudioBytes_ = 0;   ///< Bytes of audio frames written.
-    uint16_t encMusicCrc_ = 0;    ///< CRC-16 of the audio frames (LAME tag field).
+    uint16_t encMusicCrc_ = 0;    ///< CRC-16 of the audio frames (gapless tag field).
     int encTagBitrateIdx_ = 0;    ///< Bitrate index of the Info tag frame.
     int encTagFrameSize_ = 0;     ///< Size of the Info tag frame in bytes.
 
@@ -1218,9 +1218,12 @@ private:
      * @brief Recognizes a Xing/Info or VBRI tag frame at pos and reads its
      *        gapless fields.
      *
-     * The Xing fields sit right after the side info; a LAME-format tag
-     * follows the fields the flags declare. The delay and padding are only
-     * trusted from encoders known to write them (LAME, FFmpeg, DSPark).
+     * The Xing fields sit right after the side info; the gapless tag
+     * follows the fields the flags declare. Its delay and padding are
+     * trusted only when the tag's own CRC-16 checks out - taken over the
+     * frame up to the CRC field, or over the frame's first 190 bytes, the
+     * two conventions encoders use - so a tag written by an encoder that
+     * does not fill those fields is skipped but not trusted.
      *
      * @return True if the frame is a tag frame (to be skipped).
      */
@@ -1256,12 +1259,14 @@ private:
         if (flags & 4u) x += 100;
         if (flags & 8u) x += 4;
 
-        if (x + 24 <= end)
+        if (x + 36 <= end)
         {
             const uint8_t* tag = at(x);
-            const bool known = std::memcmp(tag, "LAME", 4) == 0 || std::memcmp(tag, "Lavf", 4) == 0
-                            || std::memcmp(tag, "Lavc", 4) == 0 || std::memcmp(tag, "DSPark", 6) == 0;
-            if (known)
+            const uint16_t stored = static_cast<uint16_t>((tag[34] << 8) | tag[35]);
+            const size_t upToField = x + 34 - pos;
+            const bool valid = crc16(fileData_.data() + pos, upToField, 0) == stored
+                            || (pos + 190 <= end && crc16(fileData_.data() + pos, 190, 0) == stored);
+            if (valid)
             {
                 gaplessDelay_   = (tag[21] << 4) | (tag[22] >> 4);
                 gaplessPadding_ = ((tag[22] & 0x0F) << 8) | tag[23];
@@ -1274,7 +1279,7 @@ private:
     /**
      * @brief Trims the decoded stream to the encoder's input: the encoder
      *        delay plus the decoder delay at the start, the padding at the end
-     *        (the LAME tag convention; FFmpeg trims the same way).
+     *        (the gapless tag's convention).
      */
     void applyGaplessTrim()
     {
@@ -2620,7 +2625,7 @@ private:
         ++encFramesOut_;
     }
 
-    /** @brief CRC-16/ARC (poly 0x8005 reflected, init 0), the LAME tag CRC. */
+    /** @brief CRC-16/ARC (poly 0x8005 reflected, init 0), the gapless tag CRC. */
     [[nodiscard]] static uint16_t crc16(const uint8_t* data, size_t size, uint16_t crc) noexcept
     {
         for (size_t i = 0; i < size; ++i)
@@ -2633,7 +2638,7 @@ private:
     }
 
     /** @brief Bytes an Info tag frame needs: header, side info, the Xing
-     *  fields (flags, frames, bytes, 100-entry TOC, quality) and the LAME tag. */
+     *  fields (flags, frames, bytes, 100-entry TOC, quality) and the gapless tag. */
     [[nodiscard]] int encTagBytesNeeded() const noexcept
     {
         const int sideInfoSize = (info_.numChannels == 1) ? 17 : 32;
@@ -2659,7 +2664,7 @@ private:
 
     /** @brief Writes the Info tag frame over the placeholder at the start of
      *  the file: a silent Layer III frame whose main data holds the Xing
-     *  fields and a LAME-format tag with the gapless delay and padding. */
+     *  fields and a gapless tag with the gapless delay and padding. */
     void encWriteTagFrame()
     {
         const int nch = info_.numChannels;
@@ -2688,7 +2693,7 @@ private:
             f[x + 16 + static_cast<size_t>(i)] = static_cast<uint8_t>((i * 256) / 100);
         put32(x + 116, 0);            // quality indicator: unspecified
 
-        // LAME-format tag.
+        // gapless tag.
         const size_t t = x + 120;
         const char* version = "DSPark   ";   // 9 bytes, the encoder's own name
         std::memcpy(&f[t], version, 9);

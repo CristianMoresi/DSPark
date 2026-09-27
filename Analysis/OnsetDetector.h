@@ -12,8 +12,7 @@
  * maximum filter that suppresses vibrato/tremolo false positives, and a
  * half-wave-rectified spectral flux to the mu-th previous frame. The onset
  * strength envelope (ODF) is peak-picked with the online-capable rule of
- * Boeck, Krebs & Schedl (ISMIR 2012) -- the same recipe used by
- * librosa.util.peak_pick. Two simpler ODFs are also provided:
+ * Boeck, Krebs & Schedl (ISMIR 2012). Two simpler ODFs are also provided:
  * plain SpectralFlux and a rectified ComplexDomain function (Dixon, DAFx-06).
  *
  * The STFT front-end is built directly on FFTReal + WindowFunctions with a

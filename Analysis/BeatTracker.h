@@ -72,8 +72,8 @@
  * rather than inherited. The published values disagree with each other by most
  * of an order of magnitude -- the paper names 400 as its default (Figure 5
  * caption) and hard-codes it (beat2.m line 56, beatdyn.m line 56), its own
- * best score on its own tuning set is at alpha = 680 (section 4.2), and
- * librosa shipped 400 through 0.3.x and 100 from 0.4.0 onward. All use the
+ * best score on its own tuning set is at alpha = 680 (section 4.2), and 100
+ * is also in common use. All use the
  * natural logarithm and the same cost, so the numbers are comparable and the
  * disagreement is real rather than a change of units -- but none of them
  * decides anything here. Measured on material where the term is actually live

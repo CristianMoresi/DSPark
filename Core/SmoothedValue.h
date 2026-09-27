@@ -65,7 +65,7 @@ public:
         Exponential,  ///< One-pole IIR. Natural, musical interpolation.
         Linear,       ///< Rate-limited ramp. Constant velocity, exact target arrival.
         Disabled,     ///< Instant snapping, no smoothing applied.
-        Chase         ///< Adaptive speed (Airwindows style). Gentle start after a jump, accelerating settle.
+        Chase         ///< Adaptive speed. Gentle start after a jump, accelerating settle.
     };
 
     /** @brief Prevents accidental copying of stateful DSP objects. */

@@ -74,26 +74,6 @@
  * };
  * ```
  *
- * @subsection integration_juce JUCE Plugin
- *
- * ```cpp
- * #include "DSPark/DSPark.h"
- *
- * void MyPlugin::prepareToPlay(double sampleRate, int maxBlockSize) {
- *     dspark::AudioSpec spec { sampleRate, maxBlockSize, getTotalNumOutputChannels() };
- *     myFilter_.prepare(spec);
- * }
- *
- * void MyPlugin::processBlock(juce::AudioBuffer<float>& buffer, ...) {
- *     // Wrap JUCE buffer in a DSPark view (zero-copy):
- *     dspark::AudioBufferView<float> view(
- *         buffer.getArrayOfWritePointers(),
- *         buffer.getNumChannels(),
- *         buffer.getNumSamples());
- *     myFilter_.processBlock(view);
- * }
- * ```
- *
  * ---
  *
  * @section lifecycle Processor Lifecycle
@@ -132,7 +112,7 @@
  * @subsection concept_buffer AudioBuffer / AudioBufferView - Carry Audio Data
  *
  * - **AudioBufferView\<T\>**: A lightweight, non-owning wrapper around existing audio
- *   data (e.g., your audio driver's buffers, JUCE's AudioBuffer, or raw float**).
+ *   data (e.g., your audio driver's or host's buffers, or raw float**).
  *   This is what processors receive. Cheap to create, zero-copy.
  *
  * - **AudioBuffer\<T\>**: An owning buffer that manages its own memory. Allocates once

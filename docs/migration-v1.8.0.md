@@ -68,8 +68,8 @@ CMakeDeps.
 
 ## MP3 round trips
 
-Files written by `Mp3File` now carry an Info frame with a LAME-format tag,
-and decoding trims the encoder delay and padding it announces (LAME, FFmpeg
-or DSPark tags). A decoded file therefore has exactly the length of the
+Files written by `Mp3File` now carry an Info frame with a gapless tag, and
+decoding trims the encoder delay and padding such a tag announces when its
+CRC checks out. A decoded file therefore has exactly the length of the
 source instead of carrying the encoder delay and end padding; code that
 compensated for the codec delay by hand must stop doing so.

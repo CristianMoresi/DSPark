@@ -107,8 +107,8 @@ All notable user-facing changes to DSPark are documented here.
 - `Delay` insert API (`prepare(spec)`, `setMix()`, in-place dry/wet
   `processBlock`), `Crossfade` equal-power sine law with curve glides and
   `gainsFor()`.
-- Gapless MP3 round trips: codec-delay flush, an Info frame with a
-  LAME-format tag, and trimming by LAME, FFmpeg or DSPark tags on decode.
+- Gapless MP3 round trips: codec-delay flush, an Info frame with a gapless
+  tag, and trimming by the tags of other encoders on decode.
 
 ### Changed
 

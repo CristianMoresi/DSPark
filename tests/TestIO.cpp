@@ -1344,10 +1344,10 @@ DSPARK_TEST(Mp3File_mono_high_bitrate_granules_fit_their_12_bit_length)
 // plus the decoder's 529 cut the last ~230 samples off, and the decoder
 // returned 1057 samples of codec delay ahead of the music (plus a frame of
 // silence for any Xing/Info tag frame, which it decoded as audio). The
-// encoder now flushes the delay and writes an Info frame with a LAME-format
-// tag, and the decoder trims by it: exactly the samples written come back,
-// time-aligned. Tags from LAME are honoured the same way; a tag from an
-// encoder not known to write the delay fields is skipped but not trusted.
+// encoder now flushes the delay and writes an Info frame with a gapless tag,
+// and the decoder trims by it: exactly the samples written come back,
+// time-aligned. Any encoder's tag is honoured the same way when its CRC-16
+// checks out; a tag whose CRC does not is skipped but not trusted.
 DSPARK_TEST(Mp3File_round_trip_is_gapless)
 {
     FileCleanup cleanup { "dspark_test_gapless.mp3" };
@@ -1415,14 +1415,26 @@ DSPARK_TEST(Mp3File_round_trip_is_gapless)
     EXPECT_TRUE(head.find("Info") != std::string::npos);
     EXPECT_TRUE(tag != std::string::npos);
 
-    auto rewriteTagName = [&](const char* name) {
+    // The tag CRC covers the frame up to the CRC field, 34 bytes into the tag.
+    const size_t crcAt = tag + 34;
+    auto rewriteTagName = [&](const char* name, bool fixCrc) {
         std::copy(name, name + 9, bytes.begin() + static_cast<std::ptrdiff_t>(tag));
+        uint16_t crc = 0;
+        for (size_t i = 0; i < crcAt; ++i)
+        {
+            crc = static_cast<uint16_t>(crc ^ static_cast<uint8_t>(bytes[i]));
+            for (int b = 0; b < 8; ++b)
+                crc = static_cast<uint16_t>((crc & 1u) ? (crc >> 1) ^ 0xA001u : (crc >> 1));
+        }
+        if (!fixCrc) crc = static_cast<uint16_t>(crc ^ 0x5A5Au);
+        bytes[crcAt] = static_cast<char>(crc >> 8);
+        bytes[crcAt + 1] = static_cast<char>(crc & 0xFF);
         std::ofstream out("dspark_test_gapless.mp3", std::ios::binary | std::ios::trunc);
         out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     };
-    rewriteTagName("LAME3.100");                                // LAME's tag: same trim
+    rewriteTagName("Other1.00", true);                          // another encoder, valid CRC: same trim
     EXPECT_EQ(decode(dec), N);
-    rewriteTagName("Unknown  ");                                // untrusted: raw stream
+    rewriteTagName("Other1.00", false);                         // CRC broken: untrusted, raw stream
     const int raw = decode(dec);
     EXPECT_EQ(raw % 1152, 0);
     EXPECT_GT(raw, N + 1057);
@@ -2055,7 +2067,7 @@ DSPARK_TEST(Mp3File_encoder_decoder_cascade_has_unity_gain)
 // begins where the long region ends, at longBands[8] == 3*shortBands[3] == 36,
 // and band sfb sits at the CUMULATIVE offset 36 + 3*(shortBands[sfb] -
 // shortBands[3]) - the same cumulative rule the non-mixed path uses, offset by
-// the long region. LAME never emits mixed blocks, so no recorded fixture reaches
+// the long region. Common encoders never emit mixed blocks, so no recorded fixture reaches
 // this path and it has to be crafted. This frame puts one value at bitstream
 // index 240, which is band 10 window 0 line 0 at 48 kHz: frequency line 80, i.e.
 // subband 13, 9750..10500 Hz. Scaling the band index by the current band's width

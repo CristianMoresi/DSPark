@@ -1491,3 +1491,55 @@ DSPARK_TEST(Beat_dense_masters_get_the_kick_tempo_and_a_consistent_grid)
         EXPECT_NEAR(tempo, gridBpm, gridBpm * 0.01);
     }
 }
+
+// The incremental offline session must deliver exactly what analyze() does over
+// the concatenation, whatever the blocking: a caller decoding a file block by
+// block gets the same tempo, grid and confidence as one holding it whole. The
+// block sizes include one sample, sizes coprime to the hop, a power of two and
+// sizes larger than the hop, and a session is reused afterwards to show that
+// finishOffline() leaves nothing behind.
+DSPARK_TEST(Beat_offline_session_matches_analyze_at_every_block_size)
+{
+    const Corpus c = denseMaster(120.0, 20.0);
+    BeatTracker<float> bt;
+    bt.prepare(AudioSpec{ kFs, 512, 1 });
+    const float* p = c.x.data();
+    const auto whole = bt.analyze(AudioBufferView<const float>(&p, 1, static_cast<int>(c.x.size())));
+    EXPECT_TRUE(whole.beatSamples.size() > 10);
+
+    for (const size_t block : { size_t(1), size_t(97), size_t(240), size_t(512), size_t(4096),
+                                size_t(44100), c.x.size() })
+    {
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            bt.beginOffline(pass == 0 ? static_cast<int64_t>(c.x.size()) : 0);
+            // Uneven blocks on the second pass: the size grows by one each time.
+            size_t off = 0, len = block;
+            while (off < c.x.size())
+            {
+                const size_t take = std::min(len, c.x.size() - off);
+                bt.pushOffline(std::span<const float>(c.x.data() + off, take));
+                off += take;
+                if (pass == 1) ++len;
+            }
+            const auto r = bt.finishOffline();
+            EXPECT_TRUE(r.beatSamples == whole.beatSamples);
+            EXPECT_TRUE(r.tempoBpm == whole.tempoBpm);
+            EXPECT_TRUE(r.secondaryTempoBpm == whole.secondaryTempoBpm);
+            EXPECT_TRUE(r.confidence == whole.confidence);
+        }
+    }
+
+    // Outside a session nothing is kept: a stray push is ignored and a finish
+    // without a begin returns the empty Result.
+    bt.pushOffline(std::span<const float>(c.x.data(), 4096));
+    const auto none = bt.finishOffline();
+    EXPECT_TRUE(none.beatSamples.empty());
+    EXPECT_TRUE(none.tempoBpm == 0.0f);
+
+    // reset() abandons an open session.
+    bt.beginOffline();
+    bt.pushOffline(std::span<const float>(c.x.data(), c.x.size()));
+    bt.reset();
+    EXPECT_TRUE(bt.finishOffline().beatSamples.empty());
+}

@@ -81,7 +81,13 @@
  * - setMethod() / setThreshold() / setAdaptiveWhitening(): control thread
  *   (independent single-word relaxed atomics; non-finite thresholds are
  *   ignored).
- * - detectOffline(): offline convenience (allocates); not an audio-thread call.
+ * - getMethod() / getThreshold() / getAdaptiveWhitening(): any thread,
+ *   lock-free (the same relaxed atomics the setters write).
+ * - detectOffline() / detectOfflineOnsets() and the incremental session
+ *   beginOffline() / pushOffline() / finishOffline() / finishOfflineOnsets():
+ *   offline (allocates); not an audio-thread call. A session drives the same
+ *   analysis state as the streaming path, so it must not be interleaved with
+ *   pushSamples() or run while the audio path is running.
  *
  * Embedded/wasm: compiles under -fno-exceptions -fno-rtti (no throw on any
  * path); no file I/O, so it is unaffected by DSPARK_NO_FILE_IO.
@@ -341,6 +347,24 @@ public:
         whitening_.store(on, std::memory_order_relaxed);
     }
 
+    /** @brief ODF family in force. */
+    [[nodiscard]] Method getMethod() const noexcept
+    {
+        return method_.load(std::memory_order_relaxed);
+    }
+
+    /** @brief Peak-pick delta in force, after setThreshold()'s clamping. */
+    [[nodiscard]] T getThreshold() const noexcept
+    {
+        return threshold_.load(std::memory_order_relaxed);
+    }
+
+    /** @brief True when adaptive whitening is on. */
+    [[nodiscard]] bool getAdaptiveWhitening() const noexcept
+    {
+        return whitening_.load(std::memory_order_relaxed);
+    }
+
     // -- Audio path (causal, RT-safe) ---------------------------------------
 
     /**
@@ -549,7 +573,14 @@ public:
         return fftSize_ / 2 - localizationOffset_;
     }
 
-    // -- Offline convenience -------------------------------------------------
+    // -- Offline -------------------------------------------------------------
+
+    /** @brief One offline onset: where it is and how strong it was. */
+    struct Onset
+    {
+        int64_t sample = 0; ///< Reference sample (frame centre).
+        T strength = T(0);  ///< ODF value at the peak, the scale getOnsetStrength() reports.
+    };
 
     /**
      * @brief Offline detection over a whole mono buffer (channel 0).
@@ -557,46 +588,97 @@ public:
      * Runs the same ODF with the symmetric (post_max/post_avg > 0) picker for
      * slightly higher F, and returns onset sample positions (frame-centre
      * references, ascending). Allocates -- not an audio-thread call. Resets
-     * the streaming state on entry.
+     * the streaming state on entry. Identical to beginOffline(), one
+     * pushOffline() of the whole buffer, finishOffline().
      */
     std::vector<int64_t> detectOffline(AudioBufferView<const T> whole)
     {
-        std::vector<int64_t> out;
-        if (fft_ == nullptr || whole.getNumChannels() < 1) return out;
+        return positionsOf(detectOfflineOnsets(whole));
+    }
 
-        const int n = whole.getNumSamples();
-        const T* x = whole.getChannel(0);
+    /** @brief detectOffline() with each onset's strength alongside its position. */
+    std::vector<Onset> detectOfflineOnsets(AudioBufferView<const T> whole)
+    {
+        if (fft_ == nullptr || whole.getNumChannels() < 1) return {};
+        const int n = std::max(0, whole.getNumSamples());
+        beginOffline(n);
+        pushOffline(std::span<const T>(whole.getChannel(0), static_cast<size_t>(n)));
+        return finishOfflineOnsets();
+    }
 
-        // Build the full ODF envelope (offline: allocation allowed).
-        std::vector<T> odf;
-        std::vector<int64_t> odfRef; // reference sample per frame
-        odf.reserve(static_cast<size_t>(n / std::max(1, hop_) + 2));
-        odfRef.reserve(odf.capacity());
-
-        resetState();
-        const Method m = method_.load(std::memory_order_relaxed);
-        const bool whiten = whitening_.load(std::memory_order_relaxed);
-
-        int64_t total = 0;
-        int hopc = 0;
-        for (int i = 0; i < n; ++i)
+    /**
+     * @brief Opens an incremental offline analysis.
+     *
+     * For material that arrives in pieces -- a file decoded block by block, a
+     * recording too long to hold -- without concatenating it first. Feed it
+     * with pushOffline() in blocks of any size and close it with
+     * finishOffline(); the result is bit-identical to detectOffline() over the
+     * concatenation, whatever the blocking. Only the onset-strength envelope
+     * is kept between calls (one value and one position per hop), not the
+     * audio.
+     *
+     * Resets the streaming state and latches the method and whitening in force
+     * for the whole session; the threshold is read when the session finishes.
+     * @param expectedSamples Optional length hint, used only to reserve the
+     *        envelope up front.
+     */
+    void beginOffline(int64_t expectedSamples = 0)
+    {
+        offOdf_.clear();
+        offRef_.clear();
+        offlineOpen_ = false;
+        if (fft_ == nullptr) return;
+        if (expectedSamples > 0)
         {
-            const T v = std::isfinite(x[i]) ? x[i] : T(0);
+            const size_t frames = static_cast<size_t>(expectedSamples / std::max(1, hop_) + 2);
+            offOdf_.reserve(frames);
+            offRef_.reserve(frames);
+        }
+        resetState();
+        offMethod_ = method_.load(std::memory_order_relaxed);
+        offWhiten_ = whitening_.load(std::memory_order_relaxed);
+        offTotal_ = 0;
+        offHop_ = 0;
+        offlineOpen_ = true;
+    }
+
+    /** @brief Feeds the next piece of an offline session. No-op outside one. */
+    void pushOffline(std::span<const T> samples)
+    {
+        if (!offlineOpen_) return;
+        for (const T s : samples)
+        {
+            const T v = std::isfinite(s) ? s : T(0);
             ring_[static_cast<size_t>(writePos_)] = v;
             ring_[static_cast<size_t>(writePos_ + fftSize_)] = v;
             if (++writePos_ >= fftSize_) writePos_ = 0;
-            ++total;
-            if (++hopc >= hop_)
+            ++offTotal_;
+            if (++offHop_ >= hop_)
             {
-                hopc = 0;
-                const T value = computeOdf(m, whiten);
-                odf.push_back(value);
-                odfRef.push_back(referenceSample(total));
+                offHop_ = 0;
+                offOdf_.push_back(computeOdf(offMethod_, offWhiten_));
+                offRef_.push_back(referenceSample(offTotal_));
             }
         }
+    }
+
+    /** @brief Closes the session and returns onset positions, as detectOffline().
+     *         Empty when no session is open. */
+    std::vector<int64_t> finishOffline()
+    {
+        return positionsOf(finishOfflineOnsets());
+    }
+
+    /** @brief Closes the session and returns onsets with their strengths. */
+    std::vector<Onset> finishOfflineOnsets()
+    {
+        std::vector<Onset> out;
+        if (!offlineOpen_) return out;
+        offlineOpen_ = false;
 
         // Symmetric peak-pick over the whole envelope.
         const T delta = threshold_.load(std::memory_order_relaxed);
+        const std::vector<T>& odf = offOdf_;
         const int nf = static_cast<int>(odf.size());
         int64_t lastFrame = -kBig;
         for (int f = 0; f < nf; ++f)
@@ -620,18 +702,33 @@ public:
             if (odf[static_cast<size_t>(f)] < mean + delta) continue;
             if (f - lastFrame <= waitFrames_) continue;
 
-            out.push_back(odfRef[static_cast<size_t>(f)]);
+            out.push_back(Onset { offRef_[static_cast<size_t>(f)], odf[static_cast<size_t>(f)] });
             lastFrame = f;
         }
 
+        offOdf_.clear();
+        offRef_.clear();
         resetState();
         return out;
     }
 
-    /** @brief Clears all streaming state. Not concurrent with pushSamples(). */
-    void reset() noexcept { resetState(); }
+    /** @brief Clears all streaming state and abandons an open offline
+     *         session. Not concurrent with pushSamples(). */
+    void reset() noexcept
+    {
+        offlineOpen_ = false;
+        resetState();
+    }
 
 private:
+    [[nodiscard]] static std::vector<int64_t> positionsOf(const std::vector<Onset>& onsets)
+    {
+        std::vector<int64_t> out;
+        out.reserve(onsets.size());
+        for (const Onset& o : onsets) out.push_back(o.sample);
+        return out;
+    }
+
     // -- Constants -----------------------------------------------------------
     static constexpr int kMinFft = 64;
     static constexpr int kMaxFft = 1 << 16;
@@ -1112,6 +1209,15 @@ private:
     std::atomic<T> onsetStrength_ { T(0) };
     std::atomic<int64_t> lastOnsetSample_ { -1 };
     std::atomic<int64_t> latencySamples_ { 2269 };
+
+    // Offline session (beginOffline() .. finishOffline()).
+    std::vector<T> offOdf_;
+    std::vector<int64_t> offRef_;
+    int64_t offTotal_ = 0;
+    int offHop_ = 0;
+    Method offMethod_ = Method::SuperFlux;
+    bool offWhiten_ = false;
+    bool offlineOpen_ = false;
 };
 
 } // namespace dspark

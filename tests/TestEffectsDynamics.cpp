@@ -39,6 +39,48 @@ DSPARK_TEST(Gain_0dB_passthrough)
         EXPECT_NEAR(tb.ch(0)[i], original[i], 1e-5f);
 }
 
+// A ramp time of zero is a jump: the new gain is in force from the first
+// sample of the next block. And prepare(spec) keeps the ramp time the caller
+// set, so re-preparing a host's Gain at a new rate does not quietly restore
+// the 10 ms default under it.
+DSPARK_TEST(Gain_zero_ramp_is_instant_and_prepare_keeps_the_ramp)
+{
+    auto stepResponse = [](Gain<float>& g) {
+        g.setGainDb(-6.0206f);
+        auto tb = makeMonoBuffer(512);
+        generateDC(tb.ch(0), 512, 1.0f);
+        g.processBlock(tb.view());
+        return std::vector<float>(tb.ch(0), tb.ch(0) + 512);
+    };
+
+    Gain<float> jump;
+    jump.prepare(48000.0);
+    jump.setGainDb(0.0f);
+    jump.skipRamp();
+    jump.setRampTime(0.0);
+    const auto y = stepResponse(jump);
+    EXPECT_NEAR(y[0], 0.5f, 1e-4f);
+    EXPECT_NEAR(y[511], 0.5f, 1e-4f);
+
+    // 50 ms set before prepare(spec): after one 512-sample block (10.7 ms)
+    // the gain is still far from its target, as a 50 ms ramp must be and a
+    // 10 ms one would not be.
+    Gain<float> slow;
+    slow.setRampTime(50.0);
+    slow.prepare(AudioSpec{ 48000.0, 512, 1 });
+    slow.setGainDb(0.0f);
+    slow.skipRamp();
+    const auto z = stepResponse(slow);
+    EXPECT_GT(z[511], 0.6f);
+
+    Gain<float> ref;
+    ref.prepare(AudioSpec{ 48000.0, 512, 1 });   // default 10 ms
+    ref.setGainDb(0.0f);
+    ref.skipRamp();
+    const auto r = stepResponse(ref);
+    EXPECT_LT(r[511], z[511]);
+}
+
 DSPARK_TEST(Gain_minus6dB_halves)
 {
     Gain<float> g;

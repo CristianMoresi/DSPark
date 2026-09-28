@@ -140,6 +140,22 @@ knows what the tolerance is protecting.
 Any change to a public API must update the tests in the same commit. The suite
 is part of the repository precisely so this cannot drift.
 
+## Releases and history
+
+Downstream projects pin DSPark by commit or by tag, so both must stay
+fetchable for as long as the repository exists:
+
+- **Published history is never rewritten.** No force-push, rebase or amend on
+  `main` once a commit has been pushed there. A mistake in a published commit
+  is corrected by a new commit on top of it.
+- **Every release is an annotated tag**, `vMAJOR.MINOR.PATCH`, on the commit
+  that carries the release's version bump, changelog entry and package
+  recipes. A tag is never moved or deleted once pushed; a fix to a release is
+  the next patch release.
+- The package recipes in `packaging/` pin an immutable source commit and its
+  archive checksum, so a published recipe keeps building the exact source it
+  was written for.
+
 ## DSParkLab
 
 The interactive testing app is Windows-only: it is built on Win32 and Direct3D

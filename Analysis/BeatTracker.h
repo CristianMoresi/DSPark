@@ -231,6 +231,9 @@
  *   only selects which part of it is searched.
  * - analyze() / reset(): setup thread. analyze() allocates and CLEARS the
  *   causal state, so it must not run while the audio path is running.
+ * - beginOffline() / pushOffline() / finishOffline(): setup thread, the
+ *   incremental form of analyze() with the same rules: allocates, clears the
+ *   causal state, and must not be interleaved with the audio path.
  *
  * Embedded/wasm: compiles under -fno-exceptions -fno-rtti (no throw on any
  * path); no file I/O, so it is unaffected by DSPARK_NO_FILE_IO.
@@ -467,12 +470,79 @@ public:
      */
     Result analyze(AudioBufferView<const T> whole)
     {
-        Result out;
-        if (!prepared_.load(std::memory_order_relaxed)) return out;
-        if (whole.getNumChannels() < 1 || whole.getNumSamples() <= 0) return out;
+        if (!prepared_.load(std::memory_order_relaxed)) return {};
+        if (whole.getNumChannels() < 1 || whole.getNumSamples() <= 0) return {};
+        const int n = whole.getNumSamples();
+        beginOffline(n);
+        pushOffline(std::span<const T>(whole.getChannel(0), static_cast<size_t>(n)));
+        return finishOffline();
+    }
+
+    /**
+     * @brief Opens an incremental offline analysis.
+     *
+     * For material that arrives in pieces -- a file decoded block by block, a
+     * recording too long to hold -- without concatenating it first. Feed it
+     * with pushOffline() in blocks of any size and close it with
+     * finishOffline(); the Result is bit-identical to analyze() over the
+     * concatenation, whatever the blocking. Only the onset envelope is kept
+     * between calls (a few values per 5 ms hop), not the audio.
+     *
+     * Same threading as analyze(): it drives the shared front end, so it
+     * clears the causal state on entry and must not be interleaved with
+     * processBlock() / pushSamples() or run while the audio path is running.
+     * @param expectedSamples Optional length hint, used only to reserve the
+     *        envelope up front.
+     */
+    void beginOffline(int64_t expectedSamples = 0)
+    {
+        env_.clear();
+        envRef_.clear();
+        for (auto& r : envReg_) r.clear();
+        offlineOpen_ = false;
+        if (!prepared_.load(std::memory_order_relaxed)) return;
 
         resetState();
-        buildEnvelope(whole);
+        if (expectedSamples > 0)
+        {
+            const size_t frames = static_cast<size_t>(expectedSamples / std::max(1, hop_) + 2);
+            env_.reserve(frames);
+            envRef_.reserve(frames);
+            for (auto& r : envReg_) r.reserve(frames);
+        }
+        offlinePushed_ = 0;
+        offlineOpen_ = true;
+    }
+
+    /** @brief Feeds the next piece of an offline session (channel-0 samples).
+     *         No-op outside one. */
+    void pushOffline(std::span<const T> samples)
+    {
+        if (!offlineOpen_) return;
+        size_t off = 0;
+        while (off < samples.size())
+        {
+            // Pieces end on the front end's frame boundaries, so each frame's
+            // envelope value is read as the frame is computed.
+            const int64_t since = offlinePushed_ % static_cast<int64_t>(hop_);
+            const size_t take = std::min(samples.size() - off,
+                                         static_cast<size_t>(static_cast<int64_t>(hop_) - since));
+            onset_.pushSamples(samples.subspan(off, take));
+            offlinePushed_ += static_cast<int64_t>(take);
+            off += take;
+            if (offlinePushed_ % static_cast<int64_t>(hop_) == 0) appendEnvelopeFrame();
+        }
+    }
+
+    /** @brief Closes the session and tracks tempo and beats over everything
+     *         pushed, as analyze() does. All-zero Result when no session is
+     *         open. */
+    Result finishOffline()
+    {
+        Result out;
+        if (!offlineOpen_) return out;
+        offlineOpen_ = false;
+        onset_.reset();
 
         int iLo = 0, iHi = 0;
         unpackRange(activeRange_.load(std::memory_order_relaxed), iLo, iHi);
@@ -760,8 +830,13 @@ public:
         return onset_;
     }
 
-    /** @brief Clears all streaming state. Not concurrent with pushSamples(). */
-    void reset() noexcept { resetState(); }
+    /** @brief Clears all streaming state and abandons an open offline
+     *         session. Not concurrent with pushSamples(). */
+    void reset() noexcept
+    {
+        offlineOpen_ = false;
+        resetState();
+    }
 
 private:
     // -- Constants -----------------------------------------------------------
@@ -1274,41 +1349,19 @@ private:
 
     /** @brief Runs the shared front end over the whole buffer and keeps the
      *  envelope with each frame's position in the caller's timeline. */
-    void buildEnvelope(AudioBufferView<const T> whole)
+    /** @brief Appends the frame the front end just computed to the offline
+     *         envelopes. */
+    void appendEnvelopeFrame()
     {
-        env_.clear();
-        envRef_.clear();
-        for (auto& r : envReg_) r.clear();
-
-        const int n = whole.getNumSamples();
-        const T* x = whole.getChannel(0);
-        const size_t frames = static_cast<size_t>(n / std::max(1, hop_) + 2);
-        env_.reserve(frames);
-        envRef_.reserve(frames);
-        for (auto& r : envReg_) r.reserve(frames);
-
-        onset_.reset();
-        int64_t pos = 0;
-        while (pos < static_cast<int64_t>(n))
+        const typename OnsetDetector<T>::OdfFrame f = onset_.getLastOdfFrame();
+        const double v = std::isfinite(f.value) ? static_cast<double>(f.value) : 0.0;
+        env_.push_back(std::max(0.0, v));
+        envRef_.push_back(f.referenceSample);
+        for (int g = 0; g < kRegisters; ++g)
         {
-            const int64_t take = std::min<int64_t>(hop_, static_cast<int64_t>(n) - pos);
-            onset_.pushSamples(std::span<const T>(x + pos, static_cast<size_t>(take)));
-            pos += take;
-            if (take == static_cast<int64_t>(hop_))
-            {
-                const typename OnsetDetector<T>::OdfFrame f = onset_.getLastOdfFrame();
-                const double v = std::isfinite(f.value)
-                                     ? static_cast<double>(f.value) : 0.0;
-                env_.push_back(std::max(0.0, v));
-                envRef_.push_back(f.referenceSample);
-                for (int g = 0; g < kRegisters; ++g)
-                {
-                    const double r = static_cast<double>(f.registers[static_cast<size_t>(g)]);
-                    envReg_[static_cast<size_t>(g)].push_back(std::isfinite(r) ? std::max(0.0, r) : 0.0);
-                }
-            }
+            const double r = static_cast<double>(f.registers[static_cast<size_t>(g)]);
+            envReg_[static_cast<size_t>(g)].push_back(std::isfinite(r) ? std::max(0.0, r) : 0.0);
         }
-        onset_.reset();
     }
 
     /**
@@ -2201,7 +2254,9 @@ private:
     int lastBestIndex_ = -1;
     bool havePhase_ = false;
 
-    // Offline scratch (analyze only).
+    // Offline scratch (analyze() and the offline session only).
+    int64_t offlinePushed_ = 0;
+    bool offlineOpen_ = false;
     std::vector<double> env_;
     std::vector<int64_t> envRef_;
     static constexpr int kRegisters = OnsetDetector<T>::kNumRegisters;

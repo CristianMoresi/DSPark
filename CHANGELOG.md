@@ -38,6 +38,24 @@ All notable user-facing changes to DSPark are documented here.
   intermodulation -74.2 instead of -62.4 dB, for 0.21 dB of integrated
   loudness on a dense mix driven 12 dB over the ceiling. State blobs saved
   before the field existed restore a hold of 0.
+- Incremental offline analysis for material that arrives in pieces:
+  `BeatTracker::beginOffline()` / `pushOffline()` / `finishOffline()` and
+  the same trio on `OnsetDetector`. Blocks may be any size; the result is
+  bit-identical to `analyze()` / `detectOffline()` over the concatenation,
+  and only the onset envelope is kept between calls, not the audio.
+- `OnsetDetector::detectOfflineOnsets()` and `finishOfflineOnsets()` return
+  each onset's strength with its position, on the scale
+  `getOnsetStrength()` reports; `getMethod()`, `getThreshold()` and
+  `getAdaptiveWhitening()` echo the settings in force.
+- `FilterEngine::setDriftSeed()`: a non-zero seed makes the analog drift
+  reproducible - the same seed renders the same output, and `reset()` or
+  `prepare()` restarts the drift from it. Zero keeps the per-instance
+  unique seed.
+
+### Policy
+
+- Published history on `main` is never rewritten, and every release is an
+  annotated tag that is never moved; see CONTRIBUTING.
 
 ### Changed
 

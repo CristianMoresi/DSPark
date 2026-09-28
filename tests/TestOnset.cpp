@@ -10,8 +10,10 @@
 #include "TestSignals.h"
 #include "../Analysis/OnsetDetector.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <span>
 #include <vector>
@@ -638,4 +640,79 @@ DSPARK_TEST(Onset_odf_scale_is_rate_invariant_at_equal_span)
             EXPECT_EQ(s.tp, firstTp);
         }
     }
+}
+
+// The incremental offline session must find exactly the onsets detectOffline()
+// finds over the concatenation, at the same strengths, whatever the blocking,
+// and detectOfflineOnsets() must report each onset's peak ODF value on the
+// scale getOnsetStrength() uses.
+DSPARK_TEST(Onset_offline_session_matches_detectOffline_at_every_block_size)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 6.0);
+    std::vector<float> sig = makeNoise(n, fs, 1, 0.01f, 5u);
+    for (int k = 0; k < 20; ++k)
+        addClick(sig, static_cast<int64_t>((0.2 + 0.28 * k) * fs), fs, 25.0,
+                 (k % 3 == 0) ? 1.0f : 0.4f, 9u);
+
+    for (const auto method : { OnsetDetector<float>::Method::SuperFlux,
+                               OnsetDetector<float>::Method::SpectralFlux,
+                               OnsetDetector<float>::Method::ComplexDomain })
+    {
+        OnsetDetector<float> od;
+        od.prepare(AudioSpec{ fs, 512, 1 });
+        od.setMethod(method);
+        od.setAdaptiveWhitening(method == OnsetDetector<float>::Method::SpectralFlux);
+        float* ptr = sig.data();
+        AudioBufferView<float> view(&ptr, 1, n);
+        const auto positions = od.detectOffline(view);
+        const auto onsets = od.detectOfflineOnsets(view);
+        EXPECT_TRUE(positions.size() >= 18);
+        EXPECT_EQ(onsets.size(), positions.size());
+        for (size_t i = 0; i < onsets.size() && i < positions.size(); ++i)
+        {
+            EXPECT_EQ(onsets[i].sample, positions[i]);
+            EXPECT_TRUE(onsets[i].strength >= od.getThreshold());
+        }
+        // Strength tracks level: the full-scale clicks outrank the quiet ones.
+        if (method == OnsetDetector<float>::Method::SuperFlux && onsets.size() >= 3)
+            EXPECT_TRUE(onsets[0].strength > onsets[1].strength);
+
+        for (const size_t block : { size_t(1), size_t(33), size_t(240), size_t(1024), size_t(48000) })
+        {
+            od.beginOffline();
+            for (size_t off = 0; off < sig.size(); off += block)
+                od.pushOffline(std::span<const float>(sig.data() + off,
+                                                      std::min(block, sig.size() - off)));
+            const auto r = od.finishOfflineOnsets();
+            EXPECT_EQ(r.size(), onsets.size());
+            for (size_t i = 0; i < r.size() && i < onsets.size(); ++i)
+            {
+                EXPECT_EQ(r[i].sample, onsets[i].sample);
+                EXPECT_TRUE(r[i].strength == onsets[i].strength);
+            }
+        }
+        EXPECT_TRUE(od.finishOffline().empty());   // no session open
+    }
+}
+
+// The configuration getters echo what the setters stored, after clamping.
+DSPARK_TEST(Onset_config_getters_echo_the_settings_in_force)
+{
+    OnsetDetector<float> od;
+    od.prepare(AudioSpec{ 48000.0, 512, 1 });
+    EXPECT_TRUE(od.getMethod() == OnsetDetector<float>::Method::SuperFlux);
+    EXPECT_FALSE(od.getAdaptiveWhitening());
+    const float def = od.getThreshold();
+    EXPECT_TRUE(def > 0.0f);
+    od.setMethod(OnsetDetector<float>::Method::ComplexDomain);
+    od.setAdaptiveWhitening(true);
+    od.setThreshold(0.25f);
+    EXPECT_TRUE(od.getMethod() == OnsetDetector<float>::Method::ComplexDomain);
+    EXPECT_TRUE(od.getAdaptiveWhitening());
+    EXPECT_NEAR(od.getThreshold(), 0.25f, 0.0f);
+    od.setThreshold(-1.0f);
+    EXPECT_NEAR(od.getThreshold(), 0.0f, 0.0f);
+    od.setThreshold(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_NEAR(od.getThreshold(), 0.0f, 0.0f);
 }

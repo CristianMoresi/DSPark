@@ -2851,3 +2851,65 @@ DSPARK_TEST(Equalizer_concurrent_setBand_is_never_torn)
     EXPECT_EQ(torn.load(), 0LL);                 // the invariant
     EXPECT_GT(adoptions.load(), 1000LL);         // liveness: no vacuous pass
 }
+
+// A pinned drift seed makes the analog drift reproducible: two instances with
+// the same seed render identical output, a reset() instance replays its own
+// first render, and a different seed or the default unique seed drifts
+// differently. Without the seed every instance draws its own sequence and no
+// render of a drifting filter could be repeated.
+DSPARK_TEST(FilterEngine_drift_seed_makes_renders_reproducible)
+{
+    constexpr int kBlock = 512, kBlocks = 40;
+    auto input = [](int n) {
+        std::vector<float> x(static_cast<size_t>(n));
+        uint32_t s = 12345u;
+        for (auto& v : x) { s = s * 1664525u + 1013904223u; v = static_cast<float>(s >> 8) / 16777216.0f - 0.5f; }
+        return x;
+    };
+    const std::vector<float> x = input(kBlock * kBlocks);
+    auto render = [&](FilterEngine<float>& f) {
+        std::vector<float> out;
+        auto tb = makeStereoBuffer(kBlock);
+        for (int b = 0; b < kBlocks; ++b)
+        {
+            for (int c = 0; c < 2; ++c)
+                std::copy_n(x.data() + b * kBlock, kBlock, tb.ch(c));
+            f.processBlock(tb.view());
+            out.insert(out.end(), tb.ch(0), tb.ch(0) + kBlock);
+        }
+        return out;
+    };
+    auto make = [](std::unique_ptr<FilterEngine<float>>& f, std::uint64_t seed) {
+        f = std::make_unique<FilterEngine<float>>();
+        f->prepare(defaultSpec());
+        f->setLowPass(1200.0f, 2.0f, 24);
+        f->enableAnalogDrift(AnalogRandom::AnalogComponent::TapeMachine, 1.0f);
+        f->setDriftSeed(seed);
+    };
+
+    std::unique_ptr<FilterEngine<float>> a, b, c, d;
+    make(a, 42u); make(b, 42u); make(c, 7u); make(d, 0u);
+    EXPECT_TRUE(a->getDriftSeed() == 42u);
+    EXPECT_TRUE(d->getDriftSeed() == 0u);
+    const auto ya = render(*a), yb = render(*b), yc = render(*c), yd = render(*d);
+    EXPECT_TRUE(ya == yb);
+    EXPECT_FALSE(ya == yc);
+    EXPECT_FALSE(ya == yd);
+
+    // The drift is audible in the output, so the equalities above test it.
+    std::unique_ptr<FilterEngine<float>> still;
+    make(still, 42u);
+    still->disableAnalogDrift();
+    EXPECT_FALSE(render(*still) == ya);
+
+    // reset() restarts a pinned drift whatever ran before it: an instance
+    // that has rendered once and one that has rendered three times replay the
+    // same output after a reset.
+    std::unique_ptr<FilterEngine<float>> e;
+    make(e, 42u);
+    for (int k = 0; k < 3; ++k) (void)render(*e);
+    a->reset();
+    e->reset();
+    const auto ra = render(*a);
+    EXPECT_TRUE(render(*e) == ra);
+}

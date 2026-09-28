@@ -22,8 +22,9 @@
  *
  * Threading: prepare(), enableAnalogDrift() and setState() belong to the setup
  * thread; processBlock()/processSample()/reset() to the audio thread. The
- * remaining parameter setters are safe from any thread (relaxed atomics read
- * once per block); non-finite setter values are ignored. The shape helpers
+ * remaining parameter setters, setDriftSeed() among them, are safe from any
+ * thread (relaxed atomics read once per block); non-finite setter values are
+ * ignored. The shape helpers
  * (setLowPass()/setShape()/...) write several atomics non-atomically as a
  * group: the audio thread may see the new topology with the previous targets
  * for one block (smoothed, click-free).
@@ -114,6 +115,9 @@ public:
     void reset() noexcept
     {
         for (auto& stage : stages_) stage.reset();
+        // A pinned drift restarts from its seed, so a reset render replays it.
+        if (const std::uint64_t seed = driftSeed_.load(std::memory_order_relaxed); seed != 0)
+            driftGen_.reseed(seed);
         freqSmoother_.skip();
         resSmoother_.skip();
         gainSmoother_.skip();
@@ -435,6 +439,32 @@ public:
      * @brief Disables analog-style drift modulation. Thread-safe.
      */
     void disableAnalogDrift() noexcept { driftEnabled_.store(false, std::memory_order_relaxed); }
+
+    /**
+     * @brief Makes the analog drift reproducible.
+     *
+     * By default every instance draws its drift from its own unique seed, so
+     * two filters never wander together and no two renders of the same
+     * session drift alike. A non-zero seed pins the drift instead: from the
+     * next block, and again after every reset() and prepare(), the drift
+     * sequence restarts from that seed, so rendering the same input twice
+     * with the same settings produces the same output sample for sample.
+     * Zero returns to the default unique seed, and the drift carries on from
+     * wherever it is. Thread-safe, lock free; applied on the audio thread's
+     * next block.
+     */
+    void setDriftSeed(std::uint64_t seed) noexcept
+    {
+        driftSeed_.store(seed, std::memory_order_relaxed);
+        if (seed != 0) driftGen_.reseed(seed);
+    }
+
+    /** @brief The drift seed set by setDriftSeed(); 0 when the drift uses the
+     *         instance's own unique seed. */
+    [[nodiscard]] std::uint64_t getDriftSeed() const noexcept
+    {
+        return driftSeed_.load(std::memory_order_relaxed);
+    }
 
     // -- Processing ----------------------------------------------------------
 
@@ -811,6 +841,7 @@ protected:
     // from the setup thread, as enableAnalogDrift documents).
     std::atomic<bool> driftEnabled_ { false };
     std::atomic<float> driftIntensity_ { 0.0f };
+    std::atomic<std::uint64_t> driftSeed_ { 0 };   ///< 0 = the instance's unique seed.
     AnalogRandom::Generator<float> driftGen_;
 
     // Static-path coefficient cache (skip rebuilds when nothing changed).

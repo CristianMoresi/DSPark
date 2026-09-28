@@ -25,8 +25,8 @@ from check_public_text import canonical_text_bytes
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_DIRECTORIES = ("Core", "Effects", "Analysis", "IO", "Music")
-EXPECTED_INSTALLED_HEADERS = 103
-EXPECTED_ORDINARY_TESTS = 962
+EXPECTED_INSTALLED_HEADERS = 104
+EXPECTED_ORDINARY_TESTS = 970
 PRODUCT_P7_COMMIT = "d8a98a6cf3a7c88af7e57a442f34b88fe869885a"
 PRODUCT_P7_PARENT = "e1913513e424a5ae0dbf24fbe9ac42980d2876a3"
 PACKAGE_SOURCE_URL_PREFIX = (
@@ -1547,8 +1547,8 @@ def stale_truth_errors(root: Path) -> list[str]:
         content = (root / path).read_text(encoding="ascii")
         errors.extend(stale_truth_errors_for_text(path, content))
     ci = (root / ".github/workflows/ci.yml").read_text(encoding="ascii")
-    if "ordinary suite authority is currently 962" not in ci:
-        errors.append("CURRENT_TEST_AUTHORITY_MISSING 962")
+    if "ordinary suite authority is currently 970" not in ci:
+        errors.append("CURRENT_TEST_AUTHORITY_MISSING 970")
     return errors
 
 
@@ -1710,7 +1710,7 @@ LIVE_REVERB_MUTATION_ANCHOR = (
     "                                   irSampleRate_, spec_, fftBlockSize_, ds, st);\n"
 )
 LIVE_REVERB_BASELINE_HASH = (
-    "294a1053756adc86d84ab22240afdc4a55a706bef5e09a890ba6e084f4f6a80f"
+    "a4396cc5d2c58467ed07836e9df56bde08c968c678c981efce6fab348b4403d7"
 )
 LIVE_REVERB_SUBJECT_HASH = (
     "ebf743a9e67d0236682043d679dc624cce2f82cc6977d0f0ee81da4bb8cefca4"
@@ -1729,8 +1729,8 @@ LIVE_REVERB_VARIANTS = (
     {
         "id": "early-mix",
         "insertion": "        mix_.store(mix, std::memory_order_relaxed);\n",
-        "source_sha256": "a92a17baa0dee3618acf0a0de08a2e70b74fe479c73fd0bbf53c7dde4ec6ccfa",
-        "patch_sha256": "39400ede7f92730ec68e02599d8d0c125e066b571573422d036aaefaaa3222e9",
+        "source_sha256": "d6f96da9fb015f8e0345a1676de6d887551f7bdc973730d037b3651cf1e0be6e",
+        "patch_sha256": "4caedaada600cc08190502ad9961189a581cf51abb79e60ddb59383295715c84",
         "oracle": "EXPECTED_RED",
     },
     {
@@ -1739,15 +1739,15 @@ LIVE_REVERB_VARIANTS = (
             "        preDelayMs_.store(preDelay, std::memory_order_relaxed);\n"
             "        preDelaySamples_.store(preDelaySamples, std::memory_order_relaxed);\n"
         ),
-        "source_sha256": "2bfc9fc8137ea9c214c740e0e953b4c1f9a5e13b096c5fcd0a4967c64cca23b6",
-        "patch_sha256": "42f1bb61861e677382493a2675f5d387959dab2af11aabca81bc1572ce977aff",
+        "source_sha256": "ee939a1fa7024fd148720eca8a05c262fba8e3cc5e16e5f2e91dd335acb93781",
+        "patch_sha256": "fd3e424035f705b7d31b4c4879f8b9e2acceb2e750dc72a8eeb089030a79b468",
         "oracle": "EXPECTED_RED",
     },
     {
         "id": "partial-shaping-publication",
         "insertion": "        decayScale_.store(ds, std::memory_order_relaxed);\n",
-        "source_sha256": "1f6af93ae51eeaead1cb4c929641ecaa7817d687b36ee7ff7fb6441cce6b2010",
-        "patch_sha256": "557fbc4018cef7d9f91ffc8c9aee972a0b7218e24b210238f25f33834a8fdadc",
+        "source_sha256": "b60d7b94209defe324ee26629efd2ed4edeaf117a33ae888d07e3bd3ca302de8",
+        "patch_sha256": "4a3b98574684f98ab7cfd33fccc935f0acf23324c4cc95e7162603963ea2e044",
         "oracle": "EXPECTED_RED",
     },
 )

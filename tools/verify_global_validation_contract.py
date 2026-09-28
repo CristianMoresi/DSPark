@@ -64,10 +64,10 @@ EXPECTED_ROWS = (
     ("reverb::clang18::sanitizer::partial-shaping-publication", "clang18", "sanitizer", "partial-shaping-publication", "EXPECTED_RED"),
 )
 EXPECTED_SOURCE_HASHES = {
-    "baseline": "294a1053756adc86d84ab22240afdc4a55a706bef5e09a890ba6e084f4f6a80f",
-    "early-mix": "a92a17baa0dee3618acf0a0de08a2e70b74fe479c73fd0bbf53c7dde4ec6ccfa",
-    "early-predelay": "2bfc9fc8137ea9c214c740e0e953b4c1f9a5e13b096c5fcd0a4967c64cca23b6",
-    "partial-shaping-publication": "1f6af93ae51eeaead1cb4c929641ecaa7817d687b36ee7ff7fb6441cce6b2010",
+    "baseline": "a4396cc5d2c58467ed07836e9df56bde08c968c678c981efce6fab348b4403d7",
+    "early-mix": "d6f96da9fb015f8e0345a1676de6d887551f7bdc973730d037b3651cf1e0be6e",
+    "early-predelay": "ee939a1fa7024fd148720eca8a05c262fba8e3cc5e16e5f2e91dd335acb93781",
+    "partial-shaping-publication": "b60d7b94209defe324ee26629efd2ed4edeaf117a33ae888d07e3bd3ca302de8",
 }
 EXPECTED_INSERTION_HASHES = {
     "baseline": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -77,9 +77,9 @@ EXPECTED_INSERTION_HASHES = {
 }
 EXPECTED_PATCH_HASHES = {
     "baseline": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "early-mix": "39400ede7f92730ec68e02599d8d0c125e066b571573422d036aaefaaa3222e9",
-    "early-predelay": "42f1bb61861e677382493a2675f5d387959dab2af11aabca81bc1572ce977aff",
-    "partial-shaping-publication": "557fbc4018cef7d9f91ffc8c9aee972a0b7218e24b210238f25f33834a8fdadc",
+    "early-mix": "4caedaada600cc08190502ad9961189a581cf51abb79e60ddb59383295715c84",
+    "early-predelay": "fd3e424035f705b7d31b4c4879f8b9e2acceb2e750dc72a8eeb089030a79b468",
+    "partial-shaping-publication": "4a3b98574684f98ab7cfd33fccc935f0acf23324c4cc95e7162603963ea2e044",
 }
 BASELINE_STDOUT = (
     "PASS reverb-slot-state-machine\n"
@@ -3651,7 +3651,7 @@ def threading_external_live(root: Path) -> list[str]:
         ["git", "ls-files", "-z"], cwd=root, check=False,
         capture_output=True, timeout=30).stdout.split(b"\0")
     tracked_paths = [item.decode("utf-8") for item in tracked if item]
-    if len(tracked_paths) != 489 or len(tracked_paths) != len(set(tracked_paths)):
+    if len(tracked_paths) != 490 or len(tracked_paths) != len(set(tracked_paths)):
         return ["THREADING_EXTERNAL_TRACKED_CENSUS:{}".format(
             len(tracked_paths))]
 
@@ -3688,7 +3688,7 @@ def threading_external_live(root: Path) -> list[str]:
                 item for item in indexed_paths.stdout.split(b"\0") if item
             ])
             if setup.returncode != 0 or indexed.returncode != 0 \
-                    or indexed_paths.returncode != 0 or indexed_count != 489:
+                    or indexed_paths.returncode != 0 or indexed_count != 490:
                 errors.append("THREADING_EXTERNAL_FIXTURE:{}".format(name))
                 observed.append(name)
                 continue

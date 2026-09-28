@@ -6,6 +6,16 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Sampler`: a polyphonic multi-zone sampler. Zones map a recording over key
+  and velocity ranges with root key, tuning, gain, pan and loop (continuous
+  or sustain, with a crossfade baked at load); overlapping zones layer. The
+  interpolator is a 64-tap Kaiser sinc (100 dB) whose kernel follows the
+  playback rate - gathered at or below the recording's rate, scattered in
+  output time above it - so transposition is clean both ways and nothing
+  above the output Nyquist frequency folds: -118 to -130 dB THD+N from -12
+  to +19 semitones, -110 dB of alias for an 18 kHz tone an octave up.
+  Stolen voices fade over 3 ms, events are sample-accurate at any block
+  size, and zones are replaced while playing through a lock-free handover.
 - `TimeStretch::Quality::Studio` and `PitchShifter::Quality::Studio`, a new
   engine and the default for new instances: phase-gradient heap integration
   on a reference summed over every channel, an unambiguous

@@ -378,6 +378,7 @@
  * | `Oscillator<T>`          | Core/Oscillator.h     | PolyBLEP oscillator (sine, saw, square, triangle; minBLEP hard sync)|
  * | `MinBlepTable<T>`        | Core/MinBlepTable.h   | Minimum-phase band-limited step residual (cepstral, FFT-built)      |
  * | `WavetableOscillator<T>` | Core/WavetableOscillator.h | Mipmapped wavetable oscillator (bandlimited)                   |
+ * | `Sampler<T>`             | Core/Sampler.h        | Polyphonic multi-zone sampler: alias-free transposition, loops      |
  * | `DryWetMixer<T>`         | Core/DryWetMixer.h    | Dry/wet parallel mix for effects                                    |
  *
  * @subsection classes_analysis Analysis & Metering
@@ -678,6 +679,7 @@
 #include "Core/RingBuffer.h"
 #include "Core/WaveshapeTable.h"
 #include "Core/WavetableOscillator.h"
+#include "Core/Sampler.h"
 #include "Core/Hilbert.h"
 #include "Core/LadderFilter.h"
 #include "Core/StateVariableFilter.h"

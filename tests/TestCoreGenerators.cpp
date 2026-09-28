@@ -8,6 +8,7 @@
 #include "../Core/Phasor.h"
 #include "../Core/WavetableOscillator.h"
 #include "../Core/EnvelopeGenerator.h"
+#include "../Core/Sampler.h"
 #include "../Core/AnalogRandom.h"
 #include "../Core/FFT.h"
 #include "../Core/WindowFunctions.h"
@@ -1629,4 +1630,360 @@ DSPARK_TEST(AnalogRandom_concurrent_readout_is_published_and_bounded)
         std::cerr << "    NOTE: AnalogRandom concurrent overlap thin this run ("
                   << distinct << " distinct published values in " << reads
                   << " reads); correctness assertions unaffected.\n";
+}
+
+// ============================================================================
+// Sampler
+// ============================================================================
+
+namespace {
+
+constexpr double kSmpFs = 48000.0;
+using Smp = Sampler<double>;
+
+std::vector<double> smpTone(double f, double seconds, double amp = 0.5)
+{
+    std::vector<double> x(static_cast<size_t>(kSmpFs * seconds));
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = amp * std::sin(2.0 * pi<double> * f * static_cast<double>(i) / kSmpFs);
+    return x;
+}
+
+// Renders `seconds` of mono output after a note-on at sample 0.
+std::vector<double> smpPlay(Smp& s, int key, double seconds, int block = 512, double velocity = 1.0)
+{
+    std::vector<double> y(static_cast<size_t>(kSmpFs * seconds));
+    s.noteOn(key, velocity, 0);
+    for (size_t p = 0; p < y.size(); p += static_cast<size_t>(block))
+    {
+        double* ch[1] = { y.data() + p };
+        s.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(block, y.size() - p))));
+    }
+    return y;
+}
+
+// Residual after a least-squares fit of a tone at f over [a, b), in dB
+// relative to the tone; `amp` receives the fitted amplitude.
+double smpResidualDb(const std::vector<double>& y, size_t a, size_t b, double f, double* amp = nullptr)
+{
+    double ss = 0, sc = 0, cc = 0, ys = 0, yc = 0;
+    for (size_t n = a; n < b; ++n)
+    {
+        const double s = std::sin(2.0 * pi<double> * f * static_cast<double>(n) / kSmpFs);
+        const double c = std::cos(2.0 * pi<double> * f * static_cast<double>(n) / kSmpFs);
+        ss += s * s; sc += s * c; cc += c * c; ys += y[n] * s; yc += y[n] * c;
+    }
+    const double det = ss * cc - sc * sc;
+    const double A = (ys * cc - yc * sc) / det, B = (yc * ss - ys * sc) / det;
+    double e = 0, sig = 0;
+    for (size_t n = a; n < b; ++n)
+    {
+        const double fit = A * std::sin(2.0 * pi<double> * f * static_cast<double>(n) / kSmpFs)
+                         + B * std::cos(2.0 * pi<double> * f * static_cast<double>(n) / kSmpFs);
+        e += (y[n] - fit) * (y[n] - fit);
+        sig += fit * fit;
+    }
+    if (amp != nullptr) *amp = std::sqrt(A * A + B * B);
+    return 10.0 * std::log10(e / sig);
+}
+
+void smpLoad(Smp& s, const std::vector<double>& x, int root, int voices = 8)
+{
+    s.prepare(AudioSpec{ kSmpFs, 512, 1 }, voices);
+    s.setVelocityRange(0.0);
+    s.setEnvelope(0.1, 1.0, 1.0, 50.0);
+    const double* p = x.data();
+    EXPECT_TRUE(s.loadSample(AudioBufferView<const double>(&p, 1, static_cast<int>(x.size())), kSmpFs, root));
+}
+
+} // namespace
+
+// Transposition is exact and clean in both directions: the played tone is at
+// the equal-tempered frequency with the recording's amplitude, and the
+// interpolation leaves less than -110 dB of error (measured -118 to -130 dB
+// from -12 to +19 semitones). Notes played down use the gather form, notes
+// played up the scatter form.
+DSPARK_TEST(Sampler_transposes_exactly_and_cleanly)
+{
+    const auto x = smpTone(1000.0, 3.0);
+    for (const int st : { -12, -5, 1, 7, 19 })
+    {
+        Smp s;
+        smpLoad(s, x, 69);
+        const auto y = smpPlay(s, 69 + st, 1.0);
+        double amp = 0.0;
+        const double r = smpResidualDb(y, 4800, 40000, 1000.0 * std::pow(2.0, st / 12.0), &amp);
+        std::cout << "  " << st << " st: THD+N " << r << " dB, amplitude " << amp << "\n";
+        EXPECT_LT(r, -110.0);
+        EXPECT_NEAR(amp, 0.5, 1e-4);
+    }
+}
+
+// Played up, whatever the recording holds above the output Nyquist frequency
+// is removed before it can fold: an 18 kHz tone an octave up (36 kHz) and a
+// 20 kHz tone a fifth up (30 kHz) leave less than -100 dB (measured -110 and
+// -115 dB) at 48 kHz.
+DSPARK_TEST(Sampler_transposing_up_does_not_alias)
+{
+    const std::pair<double, int> cases[] = { { 18000.0, 12 }, { 20000.0, 7 }, { 15000.0, 12 } };
+    for (const auto& [f0, st] : cases)
+    {
+        const auto x = smpTone(f0, 1.0);
+        Smp s;
+        smpLoad(s, x, 60);
+        const auto y = smpPlay(s, 60 + st, 0.5);
+        double e = 0.0;
+        for (size_t i = 4800; i < 20000; ++i) e += y[i] * y[i];
+        const double db = 10.0 * std::log10(e / 15200.0 / 0.125);
+        std::cout << "  " << f0 << " Hz +" << st << " st: " << db << " dB\n";
+        EXPECT_LT(db, -100.0);
+    }
+}
+
+// A loop of a whole number of periods plays as one continuous tone, untouched
+// by the jumps, whether played at its own rate or transposed. A Sustain loop
+// lets go at note-off and plays on into what follows the loop.
+DSPARK_TEST(Sampler_loops_seamlessly_and_releases_a_sustain_loop)
+{
+    auto x = smpTone(1000.0, 1.0);
+    const double* p = x.data();
+    Smp::ZoneSpec z;
+    z.audio = AudioBufferView<const double>(&p, 1, static_cast<int>(x.size()));
+    z.sampleRate = kSmpFs;
+    z.rootKey = 60;
+    z.loopMode = Smp::LoopMode::Continuous;
+    z.loopStart = 4800;
+    z.loopEnd = 9600;   // 100 periods
+    for (const int key : { 60, 67, 53 })
+    {
+        Smp s;
+        s.prepare(AudioSpec{ kSmpFs, 512, 1 }, 4);
+        s.setVelocityRange(0.0);
+        EXPECT_TRUE(s.setZones(std::span<const Smp::ZoneSpec>(&z, 1)));
+        const auto y = smpPlay(s, key, 3.0);
+        const double r = smpResidualDb(y, 4800, y.size() - 100, 1000.0 * std::pow(2.0, (key - 60) / 12.0));
+        std::cout << "  loop at key " << key << ": THD+N " << r << " dB\n";
+        EXPECT_LT(r, -110.0);
+    }
+
+    // Sustain loop over a 1 kHz head; the recording turns to 3 kHz after it.
+    std::vector<double> w(static_cast<size_t>(kSmpFs * 1.0));
+    for (size_t i = 0; i < w.size(); ++i)
+        w[i] = 0.5 * std::sin(2.0 * pi<double> * (i < 9600 ? 1000.0 : 3000.0) * static_cast<double>(i) / kSmpFs);
+    const double* pw = w.data();
+    z.audio = AudioBufferView<const double>(&pw, 1, static_cast<int>(w.size()));
+    z.loopMode = Smp::LoopMode::Sustain;
+    Smp s;
+    s.prepare(AudioSpec{ kSmpFs, 512, 1 }, 4);
+    s.setVelocityRange(0.0);
+    s.setEnvelope(0.1, 1.0, 1.0, 2000.0);
+    EXPECT_TRUE(s.setZones(std::span<const Smp::ZoneSpec>(&z, 1)));
+    std::vector<double> y(static_cast<size_t>(kSmpFs * 1.5));
+    s.noteOn(60, 1.0, 0);
+    for (size_t q = 0; q < y.size(); q += 512)
+    {
+        if (q == 24064) s.noteOff(60, 0);   // ~0.5 s
+        double* ch[1] = { y.data() + q };
+        s.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(512, y.size() - q))));
+    }
+    double held = 0.0, after = 0.0;
+    (void)smpResidualDb(y, 12000, 24000, 1000.0, &held);   // looping: 1 kHz
+    (void)smpResidualDb(y, 40000, 60000, 3000.0, &after);  // released: the tail's 3 kHz
+    std::cout << "  sustain loop: 1 kHz while held " << held << ", 3 kHz after release " << after << "\n";
+    EXPECT_GT(held, 0.45);
+    EXPECT_GT(after, 0.2);
+}
+
+// Zones answer their key and velocity ranges, overlapping zones layer, and
+// velocity scales the level by the configured range.
+DSPARK_TEST(Sampler_zones_select_by_key_and_velocity_and_layer)
+{
+    const auto lo = smpTone(500.0, 1.0);
+    const auto hi = smpTone(2000.0, 1.0);
+    const double* pl = lo.data();
+    const double* ph = hi.data();
+    std::array<Smp::ZoneSpec, 2> zs;
+    zs[0].audio = AudioBufferView<const double>(&pl, 1, static_cast<int>(lo.size()));
+    zs[0].sampleRate = kSmpFs; zs[0].rootKey = 60; zs[0].keyLow = 48; zs[0].keyHigh = 72;
+    zs[0].velocityHigh = 0.5;
+    zs[1] = zs[0];
+    zs[1].audio = AudioBufferView<const double>(&ph, 1, static_cast<int>(hi.size()));
+    zs[1].velocityLow = 0.5; zs[1].velocityHigh = 1.0;
+
+    bool loaded = true;
+    auto render = [&](int key, double vel) {
+        Smp s;
+        s.prepare(AudioSpec{ kSmpFs, 512, 1 }, 8);
+        s.setVelocityRange(20.0);
+        loaded = loaded && s.setZones(std::span<const Smp::ZoneSpec>(zs.data(), zs.size()));
+        return smpPlay(s, key, 0.5, 512, vel);
+    };
+    double a500 = 0, a2000 = 0;
+    const auto soft = render(60, 0.25);
+    (void)smpResidualDb(soft, 4800, 20000, 500.0, &a500);
+    (void)smpResidualDb(soft, 4800, 20000, 2000.0, &a2000);
+    EXPECT_NEAR(a500, 0.5 * std::pow(10.0, -15.0 / 20.0), 1e-3);   // 20 dB range, velocity 0.25
+    EXPECT_LT(a2000, 1e-3);
+    const auto loud = render(60, 1.0);
+    (void)smpResidualDb(loud, 4800, 20000, 2000.0, &a2000);
+    (void)smpResidualDb(loud, 4800, 20000, 500.0, &a500);
+    EXPECT_NEAR(a2000, 0.5, 1e-3);
+    EXPECT_LT(a500, 1e-3);   // the fit's leakage from the 2 kHz tone
+    const auto both = render(60, 0.5);   // both ranges include 0.5: layered
+    (void)smpResidualDb(both, 4800, 20000, 500.0, &a500);
+    (void)smpResidualDb(both, 4800, 20000, 2000.0, &a2000);
+    EXPECT_GT(a500, 0.1);
+    EXPECT_GT(a2000, 0.1);
+    const auto outside = render(80, 1.0);
+    EXPECT_TRUE(loaded);
+    double e = 0.0;
+    for (const double v : outside) e += v * v;
+    EXPECT_EQ(e, 0.0);
+}
+
+// Events land on the sample they name, and the output does not depend on how
+// the stream is blocked.
+DSPARK_TEST(Sampler_events_are_sample_accurate_at_any_block_size)
+{
+    const std::vector<double> dc(48000, 0.5);
+    auto render = [&](int block) {
+        Smp s;
+        smpLoad(s, dc, 60);
+        s.setEnvelope(0.01, 1.0, 1.0, 5.0);
+        std::vector<double> y(9600);
+        const int noteAt = 1000, offAt = 5000, bendAt = 3000;
+        for (int p = 0; p < 9600; p += block)
+        {
+            const int len = std::min(block, 9600 - p);
+            if (noteAt >= p && noteAt < p + len) s.noteOn(60, 1.0, noteAt - p);
+            if (bendAt >= p && bendAt < p + len) s.setPitchBend(2.0, bendAt - p);
+            if (offAt >= p && offAt < p + len) s.noteOff(60, offAt - p);
+            double* ch[1] = { y.data() + p };
+            s.processBlock(AudioBufferView<double>(ch, 1, len));
+        }
+        return y;
+    };
+    const auto a = render(512), b = render(37), c = render(9600);
+    EXPECT_TRUE(a == b);
+    EXPECT_TRUE(a == c);
+    EXPECT_EQ(a[999], 0.0);
+    EXPECT_GT(std::abs(a[1000]), 0.0);
+    EXPECT_GT(std::abs(a[4999]), 0.4);
+    EXPECT_LT(std::abs(a[5000 + 480]), 0.01);   // 5 ms release, well past it
+}
+
+// With every voice busy a new note steals one, and the stolen voice fades
+// out over 3 ms instead of being cut: the output never steps further in one
+// sample than the tones themselves do.
+DSPARK_TEST(Sampler_steals_voices_without_clicks)
+{
+    const auto x = smpTone(220.0, 3.0);
+    Smp s;
+    s.prepare(AudioSpec{ kSmpFs, 64, 1 }, 2);
+    s.setVelocityRange(0.0);
+    s.setEnvelope(5.0, 1.0, 1.0, 300.0);
+    const double* p = x.data();
+    EXPECT_TRUE(s.loadSample(AudioBufferView<const double>(&p, 1, static_cast<int>(x.size())), kSmpFs, 60));
+    const int n = static_cast<int>(kSmpFs);
+    std::vector<double> y(static_cast<size_t>(n));
+    int maxVoices = 0;
+    for (int q = 0; q < n; q += 64)
+    {
+        if (q % 2400 == 0) s.noteOn(60 + (q / 2400) % 12, 1.0, 0);
+        if (q % 2400 == 1152) s.noteOff(60 + (q / 2400) % 12, 0);
+        double* ch[1] = { y.data() + q };
+        s.processBlock(AudioBufferView<double>(ch, 1, 64));
+        maxVoices = std::max(maxVoices, s.getActiveVoiceCount());
+    }
+    double maxStep = 0.0;
+    for (int i = 1; i < n; ++i) maxStep = std::max(maxStep, std::abs(y[static_cast<size_t>(i)] - y[static_cast<size_t>(i - 1)]));
+    // Two voices of a 0.5 tone at up to 440 Hz step at most 2 * 0.5 * 2 pi 440 / fs.
+    std::cout << "  max step " << maxStep << ", voices at most " << maxVoices << "\n";
+    EXPECT_LT(maxStep, 2.0 * 0.5 * 2.0 * pi<double> * 440.0 / kSmpFs);
+    EXPECT_TRUE(maxVoices <= 2 + 2 / 4 + 2);
+}
+
+// The pedal holds released keys until it lifts; a bend of +12 semitones
+// doubles the frequency of every voice, and a voice started above its root
+// and bent below it stays clean.
+DSPARK_TEST(Sampler_pedal_and_pitch_bend)
+{
+    const auto x = smpTone(1000.0, 3.0);
+    Smp s;
+    smpLoad(s, x, 60);
+    std::vector<double> y(static_cast<size_t>(kSmpFs));
+    s.noteOn(60, 1.0, 0);
+    s.setSustainPedal(true, 0);
+    s.noteOff(60, 100);
+    for (size_t q = 0; q < y.size(); q += 512)
+    {
+        if (q == 24064) s.setPitchBend(12.0, 0);
+        double* ch[1] = { y.data() + q };
+        s.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(512, y.size() - q))));
+    }
+    double held = 0.0, bent = 0.0;
+    (void)smpResidualDb(y, 10000, 24000, 1000.0, &held);
+    const double r = smpResidualDb(y, 30000, 47000, 2000.0, &bent);
+    EXPECT_NEAR(held, 0.5, 1e-3);
+    EXPECT_NEAR(bent, 0.5, 1e-3);
+    EXPECT_LT(r, -100.0);
+    s.setSustainPedal(false, 0);
+    for (int k = 0; k < 20; ++k)
+    {
+        double* ch[1] = { y.data() };
+        s.processBlock(AudioBufferView<double>(ch, 1, 512));
+    }
+    EXPECT_EQ(s.getActiveVoiceCount(), 0);
+
+    // Started a fifth up (scatter form), bent an octave down: 1000 * 2^(-5/12).
+    Smp t;
+    smpLoad(t, x, 60);
+    t.setPitchBend(0.0, 0);
+    std::vector<double> z(static_cast<size_t>(kSmpFs));
+    t.noteOn(67, 1.0, 0);
+    for (size_t q = 0; q < z.size(); q += 512)
+    {
+        if (q == 4608) t.setPitchBend(-12.0, 0);
+        double* ch[1] = { z.data() + q };
+        t.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(512, z.size() - q))));
+    }
+    const double rz = smpResidualDb(z, 10000, 47000, 1000.0 * std::pow(2.0, -5.0 / 12.0));
+    std::cout << "  scatter voice bent below its root: THD+N " << rz << " dB\n";
+    EXPECT_LT(rz, -100.0);
+}
+
+// Zones can be replaced while notes sound: the sounding note finishes on the
+// set it started with, new notes use the new set, and nothing blocks.
+DSPARK_TEST(Sampler_replaces_zones_while_playing)
+{
+    const auto a = smpTone(500.0, 2.0);
+    const auto b = smpTone(1500.0, 2.0);
+    const double* pa = a.data();
+    const double* pb = b.data();
+    Smp s;
+    s.prepare(AudioSpec{ kSmpFs, 512, 1 }, 8);
+    s.setVelocityRange(0.0);
+    EXPECT_TRUE(s.loadSample(AudioBufferView<const double>(&pa, 1, static_cast<int>(a.size())), kSmpFs, 60));
+    std::vector<double> y(static_cast<size_t>(kSmpFs));
+    s.noteOn(60, 1.0, 0);
+    for (size_t q = 0; q < y.size(); q += 512)
+    {
+        if (q == 12288)
+        {
+            EXPECT_TRUE(s.loadSample(AudioBufferView<const double>(&pb, 1, static_cast<int>(b.size())), kSmpFs, 60));
+            s.noteOn(72, 1.0, 0);   // on the new set: 3 kHz
+        }
+        double* ch[1] = { y.data() + q };
+        s.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(512, y.size() - q))));
+    }
+    double old500 = 0.0, new3k = 0.0;
+    (void)smpResidualDb(y, 20000, 47000, 500.0, &old500);
+    (void)smpResidualDb(y, 20000, 47000, 3000.0, &new3k);
+    EXPECT_NEAR(old500, 0.5, 1e-3);
+    EXPECT_NEAR(new3k, 0.5, 1e-3);
+    // A second replacement reclaims the drained first set; clearing empties it.
+    s.clearZones();
+    EXPECT_FALSE(s.setZones(std::span<const Smp::ZoneSpec>()) == false);
+    Smp::ZoneSpec bad;
+    EXPECT_FALSE(s.setZones(std::span<const Smp::ZoneSpec>(&bad, 1)));   // no audio
 }

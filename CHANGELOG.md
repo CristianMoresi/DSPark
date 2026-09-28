@@ -6,6 +6,14 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `DelayEstimator`: the delay between two recordings of the same material
+  (a delivery against its reference), found by GCC-PHAT on a cross-spectrum
+  averaged over the whole program and refined on its phase slope to a
+  fraction of a sample, with a confidence and polarity. Memory is a few
+  frames whatever the program's length; blocks of any size give the
+  whole-signal answer. Measured over 11 s at 48 kHz: within 0.0005 samples
+  on white noise down to 0 dB SNR and 0.003 on coloured noise at 20 dB, for
+  delays from -250.4 to 4000.25 samples.
 - `Delay::setPingPong()`: the insert-style `processBlock(buffer)` runs as a
   ping-pong delay (the first two channels cross their echoes) with the
   insert's blend, so one call serves both modes. Fully wet it matches the

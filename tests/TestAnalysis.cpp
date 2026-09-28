@@ -11,10 +11,14 @@
 #include "../Analysis/PitchDetector.h"
 #include "../Analysis/PitchFollower.h"
 #include "../Analysis/PhaseCorrelation.h"
+#include "../Analysis/DelayEstimator.h"
+#include "../Core/FFT.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <complex>
+#include <iostream>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -1965,4 +1969,152 @@ DSPARK_TEST(Goertzel_semitone_selectivity_follows_the_rate_law)
                   << " semitone rejection=" << r << " dB\n";
         EXPECT_GT(r, 6.0);
     }
+}
+
+// ============================================================================
+// DelayEstimator
+// ============================================================================
+
+namespace {
+
+// Delays x by d samples exactly (band-limited, circular) in the frequency
+// domain; x's length is a power of two.
+std::vector<double> exactDelay(const std::vector<double>& x, double d)
+{
+    const size_t n = x.size();
+    FFTReal<double> f(n);
+    std::vector<double> b(n + 2);
+    f.forward(x.data(), b.data());
+    for (size_t k = 0; k <= n / 2; ++k)
+    {
+        std::complex<double> c(b[2 * k], b[2 * k + 1]);
+        c *= std::polar(1.0, -2.0 * pi<double> * static_cast<double>(k) * d / static_cast<double>(n));
+        if (k == n / 2) c = std::complex<double>(c.real(), 0.0);
+        b[2 * k] = c.real();
+        b[2 * k + 1] = c.imag();
+    }
+    std::vector<double> y(n);
+    f.inverse(b.data(), y.data());
+    double sx = 0.0, sy = 0.0;
+    for (size_t i = 0; i < n; ++i) { sx += x[i] * x[i]; sy += y[i] * y[i]; }
+    const double g = std::sqrt(sx / sy);   // undo the transform pair's scale
+    for (auto& v : y) v *= g;
+    return y;
+}
+
+struct DelayCase { std::vector<float> ref, del; };
+
+DelayCase makeDelayCase(bool coloured, double delay, double snrDb, double gain, uint32_t seed)
+{
+    const size_t n = size_t(1) << 18;   // 5.5 s at 48 kHz
+    uint32_t s = seed;
+    auto gauss = [&s]() {
+        double acc = 0.0;
+        for (int k = 0; k < 12; ++k) { s = s * 1664525u + 1013904223u; acc += static_cast<double>(s >> 8) / 16777216.0; }
+        return acc - 6.0;
+    };
+    std::vector<double> x(n);
+    double lp = 0.0, lp2 = 0.0;
+    for (auto& v : x)
+    {
+        const double w = gauss();
+        lp = 0.95 * lp + 0.05 * w;
+        lp2 = 0.9 * lp2 + 0.1 * lp;
+        v = coloured ? 8.0 * lp2 : 0.1 * w;
+    }
+    auto y = exactDelay(x, delay);
+    double p = 0.0;
+    for (const double v : y) p += v * v;
+    const double noise = std::sqrt(p / static_cast<double>(n) * std::pow(10.0, -snrDb / 10.0));
+    for (auto& v : y) v = gain * (v + noise * gauss());
+    return { std::vector<float>(x.begin(), x.end()), std::vector<float>(y.begin(), y.end()) };
+}
+
+DelayEstimator<float>::Result estimateDelay(const DelayCase& c, int maxDelay)
+{
+    const float* a = c.ref.data();
+    const float* b = c.del.data();
+    return DelayEstimator<float>::estimate(
+        AudioBufferView<const float>(&a, 1, static_cast<int>(c.ref.size())),
+        AudioBufferView<const float>(&b, 1, static_cast<int>(c.del.size())), 48000.0, maxDelay);
+}
+
+} // namespace
+
+// Known whole and fractional delays, either way, on white and on coloured
+// material, with noise and a gain difference, are recovered to a small
+// fraction of a sample (measured within 0.0005 samples on white noise down
+// to 0 dB SNR, within 0.003 on coloured noise at 20 dB).
+DSPARK_TEST(DelayEstimator_recovers_known_delays_to_a_fraction_of_a_sample)
+{
+    for (const bool coloured : { false, true })
+        for (const double d : { 0.0, 0.5, 12.37, 37.0, -250.4, 4000.25 })
+            for (const double snr : { 60.0, 20.0 })
+            {
+                const auto c = makeDelayCase(coloured, d, snr, 0.5, 11u);
+                const auto r = estimateDelay(c, 6000);
+                const double err = r.delaySamples - d;
+                std::cout << "  " << (coloured ? "coloured" : "white") << " delay " << d << " at "
+                          << snr << " dB: " << r.delaySamples << " (" << err << "), confidence "
+                          << r.confidence << "\n";
+                EXPECT_TRUE(r.valid);
+                EXPECT_FALSE(r.inverted);
+                EXPECT_LT(std::abs(err), coloured ? 0.01 : 0.002);
+                EXPECT_GT(r.confidence, 0.95);
+                EXPECT_NEAR(r.delaySeconds, r.delaySamples / 48000.0, 1e-12);
+            }
+}
+
+// Noise as loud as the signal still leaves one delay to find; an inverted
+// delivery is reported as inverted, not as another delay; unrelated material
+// reads as having no delay to speak of.
+DSPARK_TEST(DelayEstimator_noise_polarity_and_unrelated_material)
+{
+    const auto noisy = makeDelayCase(false, 12.37, 0.0, 1.0, 21u);
+    const auto r = estimateDelay(noisy, 1000);
+    EXPECT_LT(std::abs(r.delaySamples - 12.37), 0.005);
+
+    const auto inv = makeDelayCase(false, 100.3, 60.0, -0.1, 23u);
+    const auto ri = estimateDelay(inv, 1000);
+    EXPECT_TRUE(ri.inverted);
+    EXPECT_LT(std::abs(ri.delaySamples - 100.3), 0.002);
+    EXPECT_GT(ri.confidence, 0.95);
+
+    const auto a = makeDelayCase(false, 0.0, 60.0, 1.0, 31u);
+    const auto b = makeDelayCase(false, 0.0, 60.0, 1.0, 97u);
+    DelayCase unrelated { a.ref, b.ref };
+    const auto ru = estimateDelay(unrelated, 1000);
+    std::cout << "  unrelated: confidence " << ru.confidence << "\n";
+    EXPECT_LT(ru.confidence, 0.1);
+}
+
+// Pushed in blocks of any size, the estimate is the one the whole-signal
+// call gives: memory is a few frames, not the program.
+DSPARK_TEST(DelayEstimator_block_feeding_matches_the_whole_signal_call)
+{
+    const auto c = makeDelayCase(true, 37.25, 30.0, 0.7, 5u);
+    const auto whole = estimateDelay(c, 2000);
+    for (const int block : { 1, 64, 1000, 4096 })
+    {
+        DelayEstimator<float> est;
+        est.prepare(48000.0, 2000);
+        const int n = static_cast<int>(c.ref.size());
+        for (int p = 0; p < n; p += block)
+        {
+            const float* a = c.ref.data() + p;
+            const float* b = c.del.data() + p;
+            const int len = std::min(block, n - p);
+            est.push(AudioBufferView<const float>(&a, 1, len), AudioBufferView<const float>(&b, 1, len));
+        }
+        std::vector<float> z(static_cast<size_t>(est.getFrameSize() + 4000), 0.0f);
+        const float* zp = z.data();
+        est.push(AudioBufferView<const float>(&zp, 1, static_cast<int>(z.size())),
+                 AudioBufferView<const float>(&zp, 1, static_cast<int>(z.size())));
+        const auto r = est.estimate();
+        EXPECT_NEAR(r.delaySamples, whole.delaySamples, 1e-9);
+        EXPECT_NEAR(r.confidence, whole.confidence, 1e-9);
+    }
+    DelayEstimator<float> idle;
+    idle.prepare(48000.0, 100);
+    EXPECT_FALSE(idle.estimate().valid);
 }

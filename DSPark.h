@@ -392,6 +392,7 @@
  * | `PitchDetector<T>`       | Analysis/PitchDetector.h  | YIN monophonic pitch detection with MIDI/cents output |
  * | `PitchFollower<T>`       | Analysis/PitchFollower.h  | Gated, octave-safe, glide-smoothed pitch tracking source |
  * | `PhaseCorrelation<T>`    | Analysis/PhaseCorrelation.h | Stereo correlation/balance meter + goniometer feed |
+ * | `DelayEstimator<T>`      | Analysis/DelayEstimator.h | Delay between two recordings: GCC-PHAT, sub-sample, confidence |
  * | `EnvelopeFollower<T>`    | Analysis/EnvelopeFollower.h | Peak/RMS envelope source with per-channel readouts |
  * | `OnsetDetector<T>`       | Analysis/OnsetDetector.h  | Causal SuperFlux onset detection (Boeck-2012 picker, shared beat front-end) |
  * | `BeatTracker<T>`         | Analysis/BeatTracker.h    | Tempo and beat tracking: offline dynamic programming plus a causal resonator bank |
@@ -736,6 +737,7 @@
 #include "Analysis/PitchDetector.h"
 #include "Analysis/PitchFollower.h"
 #include "Analysis/PhaseCorrelation.h"
+#include "Analysis/DelayEstimator.h"
 #include "Analysis/EnvelopeFollower.h"
 #include "Analysis/OnsetDetector.h"
 #include "Analysis/BeatTracker.h"

@@ -592,6 +592,13 @@ protected:
     struct ConvolverBank
     {
         std::vector<Convolver<T>> convolvers;
+        /// Samples of the converted response that precede the IR's own first
+        /// instant (the kernel's ringing before it; see buildBank()). The
+        /// wet path carries them, so the dry path is delayed by as many.
+        int extraDelay = 0;
+        std::vector<RingBuffer<T>> dryDelay;   ///< Per channel, extraDelay deep.
+        std::vector<T> dryScratch;             ///< Channel-major, one block per channel.
+        int scratchLength = 0;
     };
 
 #if defined(DSPARK_REVERB_TEST_GENERATION_MAX)
@@ -703,7 +710,31 @@ public:
                                  static_cast<int>(bank->convolvers.size()));
         const int nS  = buffer.getNumSamples();
 
-        mixer_.pushDry(buffer);
+        if (bank->extraDelay > 0 && nS <= bank->scratchLength
+            && buffer.getNumChannels() <= static_cast<int>(bank->dryDelay.size()))
+        {
+            // The dry path waits for the wet path's extra samples too.
+            const int dCh = buffer.getNumChannels();
+            std::array<T*, 64> ptrs {};
+            for (int ch = 0; ch < dCh && ch < 64; ++ch)
+            {
+                auto& ring = bank->dryDelay[static_cast<size_t>(ch)];
+                T* dst = bank->dryScratch.data()
+                       + static_cast<size_t>(ch) * static_cast<size_t>(bank->scratchLength);
+                const T* src = buffer.getChannel(ch);
+                for (int i = 0; i < nS; ++i)
+                {
+                    ring.push(src[i]);
+                    dst[i] = ring.read(bank->extraDelay);
+                }
+                ptrs[static_cast<size_t>(ch)] = dst;
+            }
+            mixer_.pushDry(AudioBufferView<T>(ptrs.data(), std::min(dCh, 64), nS));
+        }
+        else
+        {
+            mixer_.pushDry(buffer);
+        }
 
         int preDelSamp = preDelaySamples_.load(std::memory_order_relaxed);
         T mixVal = mix_.load(std::memory_order_relaxed);
@@ -740,8 +771,12 @@ public:
         // Reset the snapshot we can see; if a concurrent load publishes a
         // replacement bank it arrives freshly zeroed anyway.
         if (ConvolverBank* const bank = bankPublisher_.adoptAtBoundary())
+        {
             for (auto& conv : bank->convolvers)
                 conv.reset();
+            for (auto& ring : bank->dryDelay)
+                ring.reset();
+        }
         for (auto& rb : preDelayBuffers_)
             rb.reset();
         mixer_.reset();
@@ -1026,9 +1061,14 @@ public:
      * @brief Returns the convolution latency in samples.
      *
      * 0 without an IR (the audio passes through untouched); the convolver's
-     * partition latency once an IR is loaded. The dry path is internally
-     * delayed by the same amount, so this is the whole effect's latency.
-     * Hosts must re-read it after loading an IR.
+     * partition latency once an IR is loaded, plus - for an IR converted
+     * from another rate or stretched - the kernel's ringing ahead of the
+     * IR's first sample wherever the IR's own leading silence cannot hold
+     * it (the direct sound of a unit impulse at 44.1 kHz played at 48 kHz
+     * lands exactly here; an IR with a few milliseconds of pre-delay adds
+     * nothing). The dry path is internally delayed by the same amount, so
+     * this is the whole effect's latency. Hosts must re-read it after
+     * loading an IR or changing the stretch.
      */
     [[nodiscard]] int getLatency() const noexcept
     {
@@ -1186,6 +1226,22 @@ protected:
         std::vector<T> shaped;   // lazy decay-shaped copy of one IR channel
         int shapedCh = -1;
 
+        // An IR at another rate (or stretched) is converted offline, time
+        // aligned, over the whole span the kernel reaches, and scaled by the
+        // rate ratio: a sampled impulse response scales with the sampling
+        // period, so a response held at twice the rate carries half the
+        // weight per sample. The span includes the kernel's ringing BEFORE
+        // the IR's first sample, which an IR that starts at full level (a
+        // trimmed recording, a unit impulse) needs: cut off, it takes a
+        // share of the direct sound's gain with it. Those leading samples
+        // are kept only where the IR's own leading silence cannot hold
+        // them, and the dry path is delayed by as many, so dry and wet stay
+        // aligned and the direct sound falls exactly at getLatency().
+        const bool convert = std::abs(effIrRate - processingSpec.sampleRate) > 1e-9 * effIrRate;
+        std::vector<std::vector<T>> converted(static_cast<size_t>(processingSpec.numChannels));
+        std::vector<int> zeroIndex(static_cast<size_t>(processingSpec.numChannels), 0);
+        int extra = 0;
+
         for (int ch = 0; ch < processingSpec.numChannels; ++ch)
         {
             // Pick IR channel: use corresponding channel if available, else mono (ch 0)
@@ -1209,26 +1265,52 @@ protected:
                 }
             }
 
-            auto& conv = newBank->convolvers[static_cast<size_t>(ch)];
-
-            // Resample if the (stretch-adjusted) IR rate differs from the engine
-            if (std::abs(effIrRate - processingSpec.sampleRate) > 1.0)
+            auto& out = converted[static_cast<size_t>(ch)];
+            if (!convert)
             {
-                Resampler<T> resampler;
-                resampler.prepare(effIrRate, processingSpec.sampleRate);
-                // Size from the resampler's own bound (INT_MAX-safe): direct
-                // floor(n*ratio)+1 arithmetic could overflow the int cast with
-                // an extreme rate ratio.
-                std::vector<T> resampled(
-                    static_cast<size_t>(resampler.getMaxOutputSamples(irLen)));
-                const int produced = resampler.processBlock(
-                    irData, irLen, resampled.data());
-                conv.prepare(fftBlock, resampled.data(), produced);
+                out.assign(irData, irData + irLen);
+                continue;
             }
+            Resampler<T> resampler;
+            resampler.prepare(effIrRate, processingSpec.sampleRate, Resampler<T>::Quality::High);
+            const int64_t reach = resampler.getReach();
+            const int64_t body = static_cast<int64_t>(
+                std::ceil(static_cast<double>(irLen) * resampler.getRatio()));
+            out = resampler.processRange(irData, irLen, -reach, body + 2 * reach);
+            const T scale = static_cast<T>(effIrRate / processingSpec.sampleRate);
+            for (auto& v : out) v *= scale;
+            // Leading samples that are exactly zero carry nothing; the ones
+            // before the IR's first instant that are not become extra delay.
+            int first = 0;
+            while (first < static_cast<int>(out.size()) && out[static_cast<size_t>(first)] == T(0)) ++first;
+            zeroIndex[static_cast<size_t>(ch)] = static_cast<int>(reach);
+            extra = std::max(extra, static_cast<int>(reach) - first);
+            while (!out.empty() && out.back() == T(0)) out.pop_back();
+        }
+
+        for (int ch = 0; ch < processingSpec.numChannels; ++ch)
+        {
+            auto& conv = newBank->convolvers[static_cast<size_t>(ch)];
+            const auto& out = converted[static_cast<size_t>(ch)];
+            const int start = convert ? zeroIndex[static_cast<size_t>(ch)] - extra : 0;
+            const int len = static_cast<int>(out.size()) - start;
+            if (len > 0)
+                conv.prepare(fftBlock, out.data() + start, len);
             else
             {
-                conv.prepare(fftBlock, irData, irLen);
+                const T silence = T(0);
+                conv.prepare(fftBlock, &silence, 1);
             }
+        }
+
+        if (extra > 0)
+        {
+            newBank->extraDelay = extra;
+            newBank->scratchLength = std::max(1, processingSpec.maxBlockSize);
+            newBank->dryDelay.resize(static_cast<size_t>(processingSpec.numChannels));
+            for (auto& ring : newBank->dryDelay) ring.prepare(extra + 1);
+            newBank->dryScratch.assign(static_cast<size_t>(processingSpec.numChannels)
+                                       * static_cast<size_t>(newBank->scratchLength), T(0));
         }
         return newBank;
     }
@@ -1238,7 +1320,7 @@ protected:
     {
         if (bank.convolvers.empty()) return 0u;
         return static_cast<std::uint32_t>(
-            std::max(0, bank.convolvers.front().getLatency()));
+            std::max(0, bank.convolvers.front().getLatency() + bank.extraDelay));
     }
 
     /**

@@ -6,6 +6,9 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Resampler::processRange()` and `getReach()`: offline, time-aligned
+  conversion of any span of output samples, including the kernel's ringing
+  before the first input sample and after the last.
 - `Sampler`: a polyphonic multi-zone sampler. Zones map a recording over key
   and velocity ranges with root key, tuning, gain, pan and loop (continuous
   or sustain, with a crossfade baked at load); overlapping zones layer. The
@@ -129,6 +132,19 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `Reverb` (convolution) converts an impulse response held at another rate,
+  or stretched, without changing what it does. The IR was streamed through
+  the resampler: its gain moved with the rate ratio (+6.02 dB for a 48 kHz
+  IR at 96 kHz, -6.02 dB the other way), the resampler's latency stayed
+  inside the response (the direct sound 71 samples late from 44.1 to 48
+  kHz) and was never flushed, so a short IR came out as a fragment (-18.2
+  dB). It is now converted offline and time aligned over the kernel's
+  whole reach, and scaled by the rate ratio: a unit impulse keeps a DC gain
+  of 1.000000 with its peak exactly on `getLatency()`, for every rate pair,
+  IR length and stretch. The kernel's ringing ahead of an IR that starts at
+  full level is kept and declared as latency (112 samples for 44.1 into 48
+  kHz), with the dry path delayed to match; an IR with pre-delay holds it
+  in its own silence and adds none.
 - `LoudnessMeter::getLoudnessRange()` percentiles follow EBU Tech 3342:
   0-based rank round((n - 1) * p), never the relative-gate threshold, and
   short-term values sampled at 10 Hz (the minimum Tech 3342 has required

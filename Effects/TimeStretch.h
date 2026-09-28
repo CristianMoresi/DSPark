@@ -38,7 +38,11 @@
  *   Processing 7(3), 1999) over the first channel's peaks and a
  *   transient-locked hop, described below. Default frame 2048. Kept
  *   bit-exact for renders already made with it; a state blob that predates
- *   the quality field restores it.
+ *   the quality field restores it. Because its phase locking follows the
+ *   first channel, a source absent from that channel keeps its level only
+ *   approximately: a tone panned hard right measures -2.8 dB at ratio 0.8
+ *   and -0.3 dB at 1.25, where Studio, which decides phases on the sum of
+ *   the channels, measures 0.0 dB at both.
  *
  * Measured against the ideal (each source re-synthesised at the stretched
  * duration) at ratios 0.5, 0.75, 1.25, 1.5 and 2, stereo, 48 kHz: spectral

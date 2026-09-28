@@ -193,6 +193,65 @@ public:
     }
 
     /**
+     * @brief Offline, time-aligned conversion of any span of output samples.
+     *
+     * Output sample k, for k in [firstOutput, firstOutput + count), is the
+     * input interpolated at position k / getRatio(), with the input taken as
+     * zero outside [0, inputLength). Unlike process(), which stops at the
+     * input's last sample, the span may start before 0 and run past the end,
+     * so it can hold the kernel's whole response to the signal: the ringing
+     * before its first sample and after its last. For an impulse response,
+     * whose first sample is often its loudest, that ringing is part of the
+     * converted response. getReach() gives the span that holds all of it.
+     * Allocates the output vector -- offline use only.
+     */
+    [[nodiscard]] std::vector<T> processRange(const T* input, int inputLength,
+                                              int64_t firstOutput, int64_t count)
+    {
+        if (table_.empty() || input == nullptr || inputLength <= 0 || count <= 0) return {};
+        std::vector<T> output(static_cast<size_t>(count));
+        for (int64_t i = 0; i < count; ++i)
+        {
+            const int64_t outIdx = firstOutput + i;
+            int64_t intPos;
+            int64_t phase = 0;
+            double frac = 0.0;
+            if (exact_)
+            {
+                // Floor division: negative positions are ordinary here.
+                const int64_t num = outIdx * stepM_;
+                intPos = num / phasesL_;
+                if (num % phasesL_ != 0 && num < 0) --intPos;
+                phase = num - intPos * phasesL_;
+            }
+            else
+            {
+                const double srcPos = static_cast<double>(outIdx) / ratio_;
+                const double fl = std::floor(srcPos);
+                intPos = static_cast<int64_t>(fl);
+                frac = srcPos - fl;
+            }
+            // A window that misses the input entirely is exactly zero.
+            const int64_t firstTap = intPos - halfTaps_ + 1;
+            if (firstTap + taps_ <= 0 || firstTap >= inputLength) continue;
+            output[static_cast<size_t>(i)] =
+                interpolateOffline(input, inputLength, static_cast<int>(intPos), phase, frac);
+        }
+        return output;
+    }
+
+    /**
+     * @brief How far, in output samples, the kernel reaches before an input
+     *        sample and after it: processRange() over
+     *        [-getReach(), ceil(inputLength * getRatio()) + getReach()) holds
+     *        the whole converted signal.
+     */
+    [[nodiscard]] int64_t getReach() const noexcept
+    {
+        return static_cast<int64_t>(std::ceil((taps_ - halfTaps_ + 1) * ratio_)) + 1;
+    }
+
+    /**
      * @brief Resamples a block of audio in single-channel streaming mode.
      *
      * @param input       Input audio samples.

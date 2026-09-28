@@ -2927,6 +2927,97 @@ DSPARK_TEST(ConvReverb_dry_and_wet_are_time_aligned)
     EXPECT_GT(std::abs(out[static_cast<size_t>(impPos + lat)]), 0.9f);   // aligned dry + wet
 }
 
+// An IR held at another rate than the engine's is converted without changing
+// what it does: a unit impulse stays a unit impulse. Measured before the
+// conversion was rebuilt: DC gain +0.74 dB (44.1 kHz IR at 48 kHz, 4096
+// samples), -18.20 dB (the same with 64 samples, truncated by the streaming
+// latency), +6.02 dB (48 into 96 kHz) and -6.02 dB (96 into 48), with the
+// peak 70 to 130 samples after the declared latency. Now the DC gain is 1
+// and the peak sits exactly on getLatency() for every pair, length and
+// stretch.
+DSPARK_TEST(ConvReverb_ir_at_another_rate_keeps_unit_gain_and_alignment)
+{
+    const std::pair<double, double> rates[] = {
+        { 48000.0, 48000.0 }, { 44100.0, 48000.0 }, { 48000.0, 44100.0 },
+        { 48000.0, 96000.0 }, { 96000.0, 48000.0 } };
+    for (const auto& [irRate, fs] : rates)
+        for (const int len : { 64, 4096 })
+            for (const float stretch : { 1.0f, 1.25f })
+            {
+                std::vector<float> ir(static_cast<size_t>(len), 0.0f);
+                ir[0] = 1.0f;
+                Reverb<float> rev;
+                rev.prepare(spec(fs, 512, 1));
+                rev.setMix(1.0f);
+                EXPECT_TRUE(rev.loadIR(ir.data(), len, irRate));
+                if (stretch != 1.0f) rev.setStretch(stretch);
+                const int lat = rev.getLatency();
+
+                std::vector<float> y;
+                const int blocks = static_cast<int>(fs * 0.25 / 512) + 2;
+                for (int b = 0; b < blocks; ++b)
+                {
+                    auto tb = makeBuffer(1, 512);
+                    tb.fillSilence();
+                    if (b == 0) tb.ch(0)[0] = 1.0f;
+                    rev.processBlock(tb.view());
+                    y.insert(y.end(), tb.ch(0), tb.ch(0) + 512);
+                }
+                double sum = 0.0;
+                size_t peak = 0;
+                for (size_t i = 0; i < y.size(); ++i)
+                {
+                    sum += y[i];
+                    if (std::abs(y[i]) > std::abs(y[peak])) peak = i;
+                }
+                std::cout << "  IR " << irRate << " Hz x" << len << " at " << fs << " Hz, stretch "
+                          << stretch << ": DC " << sum << ", peak at " << peak
+                          << ", latency " << lat << "\n";
+                EXPECT_NEAR(sum, 1.0, 5e-4);
+                EXPECT_EQ(static_cast<int>(peak), lat);
+                EXPECT_TRUE(lat >= 512 && lat < 512 + 400);
+            }
+
+    // An IR with a pre-delay holds the kernel's ringing in its own silence:
+    // converting it adds no latency.
+    std::vector<float> ir(4096, 0.0f);
+    ir[200] = 1.0f;
+    Reverb<float> rev;
+    rev.prepare(spec(48000.0, 512, 1));
+    rev.setMix(1.0f);
+    EXPECT_TRUE(rev.loadIR(ir.data(), 4096, 44100.0));
+    EXPECT_EQ(rev.getLatency(), 512);
+}
+
+// Dry and wet stay aligned when the conversion adds latency: at mix 0.5 an
+// impulse comes out as ONE event at the declared latency, not two.
+DSPARK_TEST(ConvReverb_converted_ir_keeps_dry_and_wet_aligned)
+{
+    std::vector<float> ir(64, 0.0f);
+    ir[0] = 1.0f;
+    Reverb<float> rev;
+    rev.prepare(spec(48000.0, 256, 2));
+    EXPECT_TRUE(rev.loadIR(ir.data(), 64, 44100.0));
+    rev.setMix(0.5f);
+    const int lat = rev.getLatency();
+    EXPECT_GT(lat, 256);
+    std::vector<float> out;
+    for (int b = 0; b < 48; ++b)
+    {
+        auto tb = makeStereoBuffer(256);
+        tb.fillSilence();
+        if (b == 40) { tb.ch(0)[0] = 1.0f; tb.ch(1)[0] = 1.0f; }
+        rev.processBlock(tb.view());
+        out.insert(out.end(), tb.ch(0), tb.ch(0) + 256);
+    }
+    size_t peak = 0;
+    for (size_t i = 0; i < out.size(); ++i)
+        if (std::abs(out[i]) > std::abs(out[peak])) peak = i;
+    EXPECT_EQ(static_cast<int>(peak), 40 * 256 + lat);
+    EXPECT_LT(std::abs(out[static_cast<size_t>(40 * 256 + 256)]), 0.05f);   // no early dry spike
+    EXPECT_GT(std::abs(out[peak]), 0.9f);
+}
+
 // A multi-channel IR held in memory loads like one read from a file: one
 // convolver per channel, so a stereo IR whose right channel is a half-level
 // delta 100 samples late puts exactly that on the right output, and the left

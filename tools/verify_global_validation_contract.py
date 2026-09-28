@@ -64,10 +64,10 @@ EXPECTED_ROWS = (
     ("reverb::clang18::sanitizer::partial-shaping-publication", "clang18", "sanitizer", "partial-shaping-publication", "EXPECTED_RED"),
 )
 EXPECTED_SOURCE_HASHES = {
-    "baseline": "a4396cc5d2c58467ed07836e9df56bde08c968c678c981efce6fab348b4403d7",
-    "early-mix": "d6f96da9fb015f8e0345a1676de6d887551f7bdc973730d037b3651cf1e0be6e",
-    "early-predelay": "ee939a1fa7024fd148720eca8a05c262fba8e3cc5e16e5f2e91dd335acb93781",
-    "partial-shaping-publication": "b60d7b94209defe324ee26629efd2ed4edeaf117a33ae888d07e3bd3ca302de8",
+    "baseline": "7af9f198e6b71149f42bf0bfe177412d1740dd8b7a5cf8081cb40637597878c9",
+    "early-mix": "25f3871f38478aaf88394791d0537b68860f9afa3f56c41fccce85d0f66a3ec7",
+    "early-predelay": "eef86233d1523875eb4f4975b8b3e8ab69ca262939052d2c536f297c6818427a",
+    "partial-shaping-publication": "8c67bf4d558e5845f01a7b0adcf066d1b0e5ad1d7591e713236cd0961724cfb9",
 }
 EXPECTED_INSERTION_HASHES = {
     "baseline": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -77,9 +77,9 @@ EXPECTED_INSERTION_HASHES = {
 }
 EXPECTED_PATCH_HASHES = {
     "baseline": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "early-mix": "4caedaada600cc08190502ad9961189a581cf51abb79e60ddb59383295715c84",
-    "early-predelay": "fd3e424035f705b7d31b4c4879f8b9e2acceb2e750dc72a8eeb089030a79b468",
-    "partial-shaping-publication": "4a3b98574684f98ab7cfd33fccc935f0acf23324c4cc95e7162603963ea2e044",
+    "early-mix": "34e902aa1b5a1956c4f126e5f5094eeeaeeeedbc81de4356f0f268e2f9af82e6",
+    "early-predelay": "76cefc24f91ccc184685d918f32dee55df4a42c9bfea7bf049d74cc74871772f",
+    "partial-shaping-publication": "60e0e58220734c7616982ca7cd3c9005ff0f1611f34e798262e575f7b697d9d2",
 }
 BASELINE_STDOUT = (
     "PASS reverb-slot-state-machine\n"

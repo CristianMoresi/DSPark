@@ -26,7 +26,7 @@ from check_public_text import canonical_text_bytes
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_DIRECTORIES = ("Core", "Effects", "Analysis", "IO", "Music")
 EXPECTED_INSTALLED_HEADERS = 104
-EXPECTED_ORDINARY_TESTS = 970
+EXPECTED_ORDINARY_TESTS = 972
 PRODUCT_P7_COMMIT = "d8a98a6cf3a7c88af7e57a442f34b88fe869885a"
 PRODUCT_P7_PARENT = "e1913513e424a5ae0dbf24fbe9ac42980d2876a3"
 PACKAGE_SOURCE_URL_PREFIX = (
@@ -1547,8 +1547,8 @@ def stale_truth_errors(root: Path) -> list[str]:
         content = (root / path).read_text(encoding="ascii")
         errors.extend(stale_truth_errors_for_text(path, content))
     ci = (root / ".github/workflows/ci.yml").read_text(encoding="ascii")
-    if "ordinary suite authority is currently 970" not in ci:
-        errors.append("CURRENT_TEST_AUTHORITY_MISSING 970")
+    if "ordinary suite authority is currently 972" not in ci:
+        errors.append("CURRENT_TEST_AUTHORITY_MISSING 972")
     return errors
 
 
@@ -1560,7 +1560,7 @@ def reverb_errors(root: Path) -> list[str]:
         "pendingToken_.exchange", "Phase::exhausted", "pinLatest",
         "publicationMetadata_", "std::unique_ptr<Bank>",
         "Resampler<T> resampler", "resampler.prepare(effIrRate",
-        "resampler.getMaxOutputSamples(irLen)", "resampler.processBlock(",
+        "resampler.getReach()", "resampler.processRange(",
     )
     for marker in required:
         if marker not in source:
@@ -1569,6 +1569,9 @@ def reverb_errors(root: Path) -> list[str]:
         "std::shared_ptr", "atomic_flag", "while (bankLock_",
         "resampleImpulseResponse", "reverbBesselI0",
         "same 32-tap/256-phase", "first-use history resize",
+        # Streaming conversion of an IR keeps the resampler's latency inside
+        # the response and never flushes it (a delayed, truncated IR).
+        "resampler.processBlock(",
     ):
         if marker in source:
             errors.append(f"REVERB_FORBIDDEN_IMPLEMENTATION {marker}")
@@ -1710,10 +1713,10 @@ LIVE_REVERB_MUTATION_ANCHOR = (
     "                                   irSampleRate_, spec_, fftBlockSize_, ds, st);\n"
 )
 LIVE_REVERB_BASELINE_HASH = (
-    "a4396cc5d2c58467ed07836e9df56bde08c968c678c981efce6fab348b4403d7"
+    "7af9f198e6b71149f42bf0bfe177412d1740dd8b7a5cf8081cb40637597878c9"
 )
 LIVE_REVERB_SUBJECT_HASH = (
-    "ebf743a9e67d0236682043d679dc624cce2f82cc6977d0f0ee81da4bb8cefca4"
+    "c1a3310d57121761d25d63d98e7f9c429f0231168ff4b8fdd4a405e5b2fcbb4a"
 )
 LIVE_REVERB_ANCHOR_HASH = (
     "6cf8d8b452439b4a8b12e6a4e3cf68c962f315bb4fcc4060af68f4aad031c616"
@@ -1729,8 +1732,8 @@ LIVE_REVERB_VARIANTS = (
     {
         "id": "early-mix",
         "insertion": "        mix_.store(mix, std::memory_order_relaxed);\n",
-        "source_sha256": "d6f96da9fb015f8e0345a1676de6d887551f7bdc973730d037b3651cf1e0be6e",
-        "patch_sha256": "4caedaada600cc08190502ad9961189a581cf51abb79e60ddb59383295715c84",
+        "source_sha256": "25f3871f38478aaf88394791d0537b68860f9afa3f56c41fccce85d0f66a3ec7",
+        "patch_sha256": "34e902aa1b5a1956c4f126e5f5094eeeaeeeedbc81de4356f0f268e2f9af82e6",
         "oracle": "EXPECTED_RED",
     },
     {
@@ -1739,15 +1742,15 @@ LIVE_REVERB_VARIANTS = (
             "        preDelayMs_.store(preDelay, std::memory_order_relaxed);\n"
             "        preDelaySamples_.store(preDelaySamples, std::memory_order_relaxed);\n"
         ),
-        "source_sha256": "ee939a1fa7024fd148720eca8a05c262fba8e3cc5e16e5f2e91dd335acb93781",
-        "patch_sha256": "fd3e424035f705b7d31b4c4879f8b9e2acceb2e750dc72a8eeb089030a79b468",
+        "source_sha256": "eef86233d1523875eb4f4975b8b3e8ab69ca262939052d2c536f297c6818427a",
+        "patch_sha256": "76cefc24f91ccc184685d918f32dee55df4a42c9bfea7bf049d74cc74871772f",
         "oracle": "EXPECTED_RED",
     },
     {
         "id": "partial-shaping-publication",
         "insertion": "        decayScale_.store(ds, std::memory_order_relaxed);\n",
-        "source_sha256": "b60d7b94209defe324ee26629efd2ed4edeaf117a33ae888d07e3bd3ca302de8",
-        "patch_sha256": "4a3b98574684f98ab7cfd33fccc935f0acf23324c4cc95e7162603963ea2e044",
+        "source_sha256": "8c67bf4d558e5845f01a7b0adcf066d1b0e5ad1d7591e713236cd0961724cfb9",
+        "patch_sha256": "60e0e58220734c7616982ca7cd3c9005ff0f1611f34e798262e575f7b697d9d2",
         "oracle": "EXPECTED_RED",
     },
 )

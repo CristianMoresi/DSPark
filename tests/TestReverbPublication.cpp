@@ -549,6 +549,18 @@ void adoptReverbPublication(dspark::Reverb<float>& reverb)
 void testSetStateStrongTransaction()
 {
     const auto requested = makeReverbState(0.875f, 37.0f, 0.5f, 1.5f);
+    // The latency a clean restore of the same state publishes: the stretched
+    // IR is converted, and a converted IR that starts at full level declares
+    // the kernel's leading ringing on top of the partition.
+    int expectedLatency = 0;
+    {
+        dspark::Reverb<float> reference;
+        configureTransactionalReverb(reference);
+        require(reference.setState(requested.data(), requested.size()),
+                "reference setState failed");
+        expectedLatency = reference.getLatency();
+        require(expectedLatency >= 64, "reference latency below the partition");
+    }
     std::ptrdiff_t sweptFailures = 0;
     for (std::ptrdiff_t failurePoint = 0;; ++failurePoint)
     {
@@ -594,7 +606,7 @@ void testSetStateStrongTransaction()
                     && subject.getDecayScale() == 0.5f
                     && subject.getStretch() == 1.5f,
                 "successful setState committed incoherent parameters");
-        require(subject.isLoaded() && subject.getLatency() == 64,
+        require(subject.isLoaded() && subject.getLatency() == expectedLatency,
                 "successful setState committed incoherent metadata");
 
         dspark::Reverb<float> successfulControl;

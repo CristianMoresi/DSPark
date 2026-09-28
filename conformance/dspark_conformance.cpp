@@ -1914,6 +1914,124 @@ std::vector<MetricsCase> buildMetricsCases()
     return cases;
 }
 
+// Residual of a least-squares fit of one tone at f (Hz) over y[a, b), in dB
+// relative to the tone: everything the processing added to it.
+double toneResidualDb(const std::vector<double>& y, size_t a, size_t b, double f, double fs)
+{
+    double ss = 0, sc = 0, cc = 0, ys = 0, yc = 0;
+    for (size_t n = a; n < b; ++n)
+    {
+        const double s = std::sin(2.0 * kPiConf * f * static_cast<double>(n) / fs);
+        const double c = std::cos(2.0 * kPiConf * f * static_cast<double>(n) / fs);
+        ss += s * s; sc += s * c; cc += c * c; ys += y[n] * s; yc += y[n] * c;
+    }
+    const double det = ss * cc - sc * sc;
+    const double A = (ys * cc - yc * sc) / det, B = (yc * ss - ys * sc) / det;
+    double e = 0, sig = 0;
+    for (size_t n = a; n < b; ++n)
+    {
+        const double fit = A * std::sin(2.0 * kPiConf * f * static_cast<double>(n) / fs)
+                         + B * std::cos(2.0 * kPiConf * f * static_cast<double>(n) / fs);
+        e += (y[n] - fit) * (y[n] - fit);
+        sig += fit * fit;
+    }
+    return 10.0 * std::log10(e / sig);
+}
+
+// Rate conversion, sample playback and low-frequency dynamics: figures that
+// the fixed 1 kHz / 10.1 kHz probes of the processor table cannot show,
+// because what they owe is a clean change of rate or pitch, or a gain that
+// does not follow the waveform.
+void writeConversionAccuracy(FILE* out)
+{
+    std::fprintf(out,
+        "\n## Rate conversion, sample playback and low-frequency dynamics\n\n"
+        "Measured in double precision by this same run. THD+N is the residual of a\n"
+        "least-squares fit of the tone, relative to the tone; alias is the output\n"
+        "energy of a tone that has no place below the output Nyquist frequency,\n"
+        "relative to its input energy.\n\n"
+        "| Component | Settings | Quantity | Result |\n"
+        "|---|---|---|---:|\n");
+
+    auto tone = [](double f, double fs, double seconds) {
+        std::vector<double> x(static_cast<size_t>(fs * seconds));
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = 0.5 * std::sin(2.0 * kPiConf * f * static_cast<double>(i) / fs);
+        return x;
+    };
+    auto energyDb = [](const std::vector<double>& y, size_t a, size_t b) {
+        double e = 0.0;
+        for (size_t i = a; i < b; ++i) e += y[i] * y[i];
+        return 10.0 * std::log10(e / static_cast<double>(b - a) / 0.125 + 1e-300);
+    };
+
+    using R = dspark::Resampler<double>;
+    const char* tier[] = { "Draft", "Normal", "High", "Ultra" };
+    for (int q = 0; q < 4; ++q)
+    {
+        R up;
+        up.prepare(44100.0, 48000.0, static_cast<R::Quality>(q));
+        const auto x = tone(1000.0, 44100.0, 1.0);
+        const auto y = up.process(x.data(), static_cast<int>(x.size()));
+        std::fprintf(out, "| `Resampler` | %s, 44.1 to 48 kHz | THD+N, 1 kHz | %.1f dB |\n",
+                     tier[q], toneResidualDb(y, 4800, y.size() - 4800, 1000.0, 48000.0));
+        R down;
+        down.prepare(48000.0, 44100.0, static_cast<R::Quality>(q));
+        const auto z = tone(23000.0, 48000.0, 1.0);
+        const auto w = down.process(z.data(), static_cast<int>(z.size()));
+        std::fprintf(out, "| `Resampler` | %s, 48 to 44.1 kHz | alias of a 23 kHz tone | %.1f dB |\n",
+                     tier[q], energyDb(w, 4410, w.size() - 4410));
+    }
+
+    using S = dspark::Sampler<double>;
+    auto play = [&](double f, int transpose) {
+        const auto x = tone(f, 48000.0, 4.0);   // outlasts one second at 3x
+        S s;
+        s.prepare(dspark::AudioSpec{ 48000.0, 512, 1 }, 4);
+        s.setVelocityRange(0.0);
+        const double* p = x.data();
+        (void)s.loadSample(dspark::AudioBufferView<const double>(&p, 1, static_cast<int>(x.size())),
+                           48000.0, 60);
+        std::vector<double> y(48000);
+        s.noteOn(60 + transpose, 1.0, 0);
+        for (size_t k = 0; k < y.size(); k += 512)
+        {
+            double* ch[1] = { y.data() + k };
+            s.processBlock(dspark::AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(512, y.size() - k))));
+        }
+        return y;
+    };
+    for (const int st : { -12, 7, 19 })
+    {
+        const auto y = play(1000.0, st);
+        std::fprintf(out, "| `Sampler` | 1 kHz recording, %+d semitones | THD+N | %.1f dB |\n",
+                     st, toneResidualDb(y, 4800, 40000, 1000.0 * std::pow(2.0, st / 12.0), 48000.0));
+    }
+    {
+        const auto y = play(18000.0, 12);
+        std::fprintf(out, "| `Sampler` | 18 kHz recording, +12 semitones | alias | %.1f dB |\n",
+                     energyDb(y, 4800, 40000));
+    }
+
+    using C = dspark::Compressor<double>;
+    for (const auto det : { C::DetectorType::Peak, C::DetectorType::Hilbert })
+    {
+        C c;
+        c.prepare(dspark::AudioSpec{ 48000.0, 512, 1 });
+        c.setThreshold(-20.0); c.setRatio(4.0); c.setAttack(5.0); c.setRelease(100.0);
+        c.setDetector(det);
+        auto y = tone(30.0, 48000.0, 3.0);
+        for (size_t k = 0; k < y.size(); k += 512)
+        {
+            double* ch[1] = { y.data() + k };
+            c.processBlock(dspark::AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(512, y.size() - k))));
+        }
+        std::fprintf(out, "| `Compressor` | %s detector, 30 Hz 14 dB over 4:1, 5/100 ms | THD+N | %.1f dB |\n",
+                     det == C::DetectorType::Peak ? "Peak" : "Hilbert",
+                     toneResidualDb(y, y.size() / 2, y.size(), 30.0, 48000.0));
+    }
+}
+
 // Accuracy of the analysis readouts, measured on synthetic material whose
 // answer is known exactly. Written into the same generated page as the
 // processor table: a reader looking up what a component is worth should not
@@ -2237,6 +2355,7 @@ int runMetricsTable(const char* outPath)
     // say nothing about them. What they owe a caller is that the number is
     // right, so that is what is measured here, on the same run.
     writeAnalysisAccuracy(out);
+    writeConversionAccuracy(out);
 
     std::fclose(out);
     std::printf("\nMetrics table written to %s\n", outPath);

@@ -255,8 +255,10 @@
  *   set up at the next frame boundary through a bounded read that gives up
  *   and keeps the set already in use rather than ever waiting on the control
  *   thread. Non-finite values are ignored.
- * - `prepare()`, `setState()`, `process()`: setup thread only; they allocate
- *   and must not run concurrently with processing.
+ * - `prepare()`, `setState()`, `process()` and the offline session
+ *   (`beginOffline()`, `pushOffline()`, `finishOffline()`, `pullOffline()`,
+ *   `getOfflineAvailable()`): setup thread only; they allocate and must not
+ *   run concurrently with processing.
  * - `getState()` and the getters read the control-side values and are safe
  *   from any thread.
  *
@@ -764,6 +766,8 @@ public:
      * removed here, so no compensation is needed on this path. The ratio in
      * force is adopted immediately rather than glided, and the streaming
      * state is reset. An unprepared instance copies the input through.
+     * Identical to beginOffline(), one pushOffline() of the whole signal,
+     * finishOffline() and pulling everything.
      *
      * @param in  Source signal.
      * @param out Destination; resized by this call.
@@ -781,68 +785,19 @@ public:
             return;
         }
 
-        reset();
-        path_ = Path::Adaptor;   // this path drives the same reader as the adaptor
-
         const int nCh = std::min(inCh, numChannels_);
-        const double ratio = studioActive_ ? studio_.activeRatio() : engine_.activeRatio();
-        const auto outLen = static_cast<int>(
-            std::lround(static_cast<double>(inLen) * ratio));
+        beginOffline(nCh);
+        pushOffline(in.getSubView(0, inLen));
+        finishOffline();
+        const int outLen = static_cast<int>(offlineStop_ - offlineSkip_);
         out.resize(inCh, std::max(0, outLen));
-        if (outLen <= 0) return;
-
-        // A frame carries its content at its centre, so the first output
-        // sample that lines up with input sample 0 sits half an input frame
-        // plus half a stretched frame into the synthesis stream.
-        const int64_t skip = studioActive_
-            ? std::llround(studio_.streamPositionOf(0.0)) - readPos_
-            : std::lround(0.5 * static_cast<double>(fftSize_) * (1.0 + ratio));
-        const int64_t stop = skip + outLen;
-
-        int64_t streamPos = 0;    // position in the synthesis stream
-        int64_t inPos = 0;        // input samples handed to the engine
-
-        while (streamPos < stop)
+        if (outLen > 0)
         {
-            const int64_t avail = eWriteHead() - readPos_;
-            if (avail <= 0)
-            {
-                // Offline has the whole signal, so nothing rations the input;
-                // past its end the engine is flushed with silence.
-                const int need = eSamplesToNextHop();
-                for (int ch = 0; ch < nCh; ++ch)
-                {
-                    const T* src = in.getChannel(ch);
-                    for (int k = 0; k < need; ++k)
-                    {
-                        const int64_t p = inPos + k;
-                        feed_[static_cast<size_t>(k)] =
-                            (p < inLen) ? src[static_cast<size_t>(p)] : T(0);
-                    }
-                    ePushInput(ch, feed_.data(), need);
-                }
-                eCommitInput(need, nCh);
-                inPos += need;
-                continue;
-            }
-
-            const int64_t take = std::min(avail, stop - streamPos);
-            const int64_t from = std::max(streamPos, skip);
-            const int64_t count = streamPos + take - from;
-            if (count > 0)
-            {
-                for (int ch = 0; ch < nCh; ++ch)
-                {
-                    const T* acc = eOla(ch);
-                    T* dst = out.getChannel(ch) + (from - skip);
-                    int64_t rp = readPos_ + (from - streamPos);
-                    for (int64_t k = 0; k < count; ++k)
-                        dst[k] = acc[static_cast<size_t>((rp + k) & accumMask_)];
-                }
-            }
-            readPos_ += take;
-            streamPos += take;
+            std::vector<T*> ptrs(static_cast<size_t>(nCh));
+            for (int ch = 0; ch < nCh; ++ch) ptrs[static_cast<size_t>(ch)] = out.getChannel(ch);
+            (void)pullOffline(AudioBufferView<T>(ptrs.data(), nCh, outLen));
         }
+        offlineOpen_ = false;
 
         // Channels the stretch does not cover would otherwise be left at the
         // zero resize() gives them; carry them through instead, truncated or
@@ -854,6 +809,177 @@ public:
             const int n = std::min(outLen, inLen);
             std::copy(src, src + n, dst);
             std::fill(dst + n, dst + outLen, T(0));
+        }
+    }
+
+    /**
+     * @brief Opens an offline stretch fed in blocks (setup thread; allocates).
+     *
+     * For a signal too long to hold whole, or one decoded as it goes: push it
+     * with pushOffline() in blocks of any size, take the stretched signal as
+     * it becomes ready with pullOffline(), and close with finishOffline(),
+     * after which the rest can be pulled. The concatenated output is
+     * bit-identical to process() over the concatenated input - the same
+     * `round(inputLength * ratio)` samples, aligned with the input - whatever
+     * the blocking. Memory holds only what has not been fed to the engine
+     * yet (under one hop) and what has not been pulled.
+     *
+     * Resets the streaming state and adopts the ratio in force immediately.
+     * @param numChannels Channels the session carries, at most the prepared
+     *        count (clamped; channels beyond it are ignored by pushOffline()).
+     */
+    void beginOffline(int numChannels)
+    {
+        offlineOpen_ = false;
+        if (!prepared_.load(std::memory_order_relaxed)) return;
+        reset();
+        path_ = Path::Adaptor;   // this path drives the same reader as the adaptor
+        offlineChannels_ = std::clamp(numChannels, 1, numChannels_);
+        offlineRatio_ = studioActive_ ? studio_.activeRatio() : engine_.activeRatio();
+        // A frame carries its content at its centre, so the first output
+        // sample that lines up with input sample 0 sits half an input frame
+        // plus half a stretched frame into the synthesis stream.
+        offlineSkip_ = studioActive_
+            ? std::llround(studio_.streamPositionOf(0.0)) - readPos_
+            : std::lround(0.5 * static_cast<double>(fftSize_) * (1.0 + offlineRatio_));
+        offlineStreamPos_ = 0;
+        offlineReceived_ = 0;
+        offlineStop_ = offlineSkip_;
+        offlineFinished_ = false;
+        offlineStaged_.assign(static_cast<size_t>(offlineChannels_), std::vector<T> {});
+        offlineStagedHead_ = 0;
+        offlineOut_.assign(static_cast<size_t>(offlineChannels_), std::vector<T> {});
+        offlineOutHead_ = 0;
+        offlineOpen_ = true;
+    }
+
+    /** @brief Feeds the next block of an offline session. No-op outside one. */
+    void pushOffline(AudioBufferView<const T> in)
+    {
+        if (!offlineOpen_ || offlineFinished_) return;
+        const int n = in.getNumSamples();
+        if (n <= 0) return;
+        for (int ch = 0; ch < offlineChannels_; ++ch)
+        {
+            auto& q = offlineStaged_[static_cast<size_t>(ch)];
+            if (ch < in.getNumChannels())
+                q.insert(q.end(), in.getChannel(ch), in.getChannel(ch) + n);
+            else
+                q.insert(q.end(), static_cast<size_t>(n), T(0));
+        }
+        offlineReceived_ += n;
+        runOffline();
+    }
+
+    /** @brief Ends the input of an offline session; everything left becomes
+     *         available to pullOffline(). */
+    void finishOffline()
+    {
+        if (!offlineOpen_ || offlineFinished_) return;
+        offlineFinished_ = true;
+        offlineStop_ = offlineSkip_ + static_cast<int64_t>(
+            std::lround(static_cast<double>(offlineReceived_) * offlineRatio_));
+        runOffline();
+    }
+
+    /** @brief Stretched samples ready to pull in an offline session. */
+    [[nodiscard]] int getOfflineAvailable() const noexcept
+    {
+        if (!offlineOpen_ || offlineOut_.empty()) return 0;
+        return static_cast<int>(offlineOut_[0].size() - offlineOutHead_);
+    }
+
+    /**
+     * @brief Writes up to out.getNumSamples() stretched samples of an
+     *        offline session and returns how many it wrote. Channels of
+     *        `out` beyond the session's are left untouched.
+     */
+    int pullOffline(AudioBufferView<T> out)
+    {
+        const int n = std::min(out.getNumSamples(), getOfflineAvailable());
+        if (n <= 0) return 0;
+        for (int ch = 0; ch < offlineChannels_ && ch < out.getNumChannels(); ++ch)
+        {
+            const T* src = offlineOut_[static_cast<size_t>(ch)].data() + offlineOutHead_;
+            std::copy(src, src + n, out.getChannel(ch));
+        }
+        offlineOutHead_ += static_cast<size_t>(n);
+        if (offlineOutHead_ > 65536 && offlineOutHead_ * 2 > offlineOut_[0].size())
+        {
+            for (auto& q : offlineOut_)
+                q.erase(q.begin(), q.begin() + static_cast<std::ptrdiff_t>(offlineOutHead_));
+            offlineOutHead_ = 0;
+        }
+        return n;
+    }
+
+private:
+    /**
+     * @brief Advances an offline session as far as its input allows.
+     *
+     * The same sequence of engine calls as a whole-signal pass: output is read
+     * until none is left, and only then is the next hop of input fed. Until
+     * the input's length is known the reads stop at the shortest output the
+     * session can end with, skip + round(received * ratio), which the final
+     * stop can only exceed; that bound has never bound in practice, because
+     * the engine's output trails its input by half a frame.
+     */
+    void runOffline()
+    {
+        const int nCh = offlineChannels_;
+        for (;;)
+        {
+            if (offlineFinished_ && offlineStreamPos_ >= offlineStop_) break;
+            const int64_t avail = eWriteHead() - readPos_;
+            if (avail <= 0)
+            {
+                const int need = eSamplesToNextHop();
+                const int64_t staged = static_cast<int64_t>(offlineStaged_[0].size() - offlineStagedHead_);
+                if (!offlineFinished_ && staged < need) break;   // wait for input
+                // Past the input's end the engine is flushed with silence.
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    const auto& q = offlineStaged_[static_cast<size_t>(ch)];
+                    for (int k = 0; k < need; ++k)
+                    {
+                        const size_t idx = offlineStagedHead_ + static_cast<size_t>(k);
+                        feed_[static_cast<size_t>(k)] = (idx < q.size()) ? q[idx] : T(0);
+                    }
+                    ePushInput(ch, feed_.data(), need);
+                }
+                eCommitInput(need, nCh);
+                offlineStagedHead_ = std::min(offlineStagedHead_ + static_cast<size_t>(need),
+                                              offlineStaged_[0].size());
+                if (offlineStagedHead_ > 65536)
+                {
+                    for (auto& q : offlineStaged_)
+                        q.erase(q.begin(), q.begin() + static_cast<std::ptrdiff_t>(offlineStagedHead_));
+                    offlineStagedHead_ = 0;
+                }
+                continue;
+            }
+
+            const int64_t limit = offlineFinished_
+                ? offlineStop_
+                : offlineSkip_ + static_cast<int64_t>(
+                      std::lround(static_cast<double>(offlineReceived_) * offlineRatio_));
+            const int64_t take = std::min(avail, limit - offlineStreamPos_);
+            if (take <= 0) break;
+            const int64_t from = std::max(offlineStreamPos_, offlineSkip_);
+            const int64_t count = offlineStreamPos_ + take - from;
+            if (count > 0)
+            {
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    const T* acc = eOla(ch);
+                    auto& q = offlineOut_[static_cast<size_t>(ch)];
+                    const int64_t rp = readPos_ + (from - offlineStreamPos_);
+                    for (int64_t k = 0; k < count; ++k)
+                        q.push_back(acc[static_cast<size_t>((rp + k) & accumMask_)]);
+                }
+            }
+            readPos_ += take;
+            offlineStreamPos_ += take;
         }
     }
 
@@ -1101,6 +1227,20 @@ private:
     std::atomic<T> timeRatio_ { T(1) };
     std::atomic<bool> transientPreserve_ { true };
     std::atomic<bool> phaseLock_ { true };
+
+    // Offline session (beginOffline() .. finishOffline(), pullOffline()).
+    bool offlineOpen_ = false;
+    bool offlineFinished_ = false;
+    int offlineChannels_ = 0;
+    double offlineRatio_ = 1.0;
+    int64_t offlineSkip_ = 0;
+    int64_t offlineStop_ = 0;
+    int64_t offlineStreamPos_ = 0;
+    int64_t offlineReceived_ = 0;
+    std::vector<std::vector<T>> offlineStaged_;   ///< Input not yet fed, per channel.
+    size_t offlineStagedHead_ = 0;
+    std::vector<std::vector<T>> offlineOut_;      ///< Output not yet pulled, per channel.
+    size_t offlineOutHead_ = 0;
 };
 
 } // namespace dspark

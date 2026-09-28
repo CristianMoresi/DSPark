@@ -5997,6 +5997,72 @@ std::vector<float> tsOffline(const std::vector<float>& in, double ratio, int fft
                               out.getChannel(0) + out.getNumSamples());
 }
 
+// The offline stretch fed in blocks: pushing the program in blocks of any
+// size and pulling the output as it comes gives, sample for sample, what
+// process() gives over the whole program, on both engines and on either
+// side of unity; memory holds only unfed input and unpulled output.
+DSPARK_TEST(TimeStretch_offline_blocks_match_the_whole_signal_pass)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 1.5);
+    AudioBuffer<float> src;
+    src.resize(2, n);
+    uint32_t rng = 99u;
+    for (int i = 0; i < n; ++i)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        const float noise = static_cast<float>(rng >> 8) / 16777216.0f - 0.5f;
+        const float strike = (i % 12000 < 300) ? noise : 0.0f;
+        src.getChannel(0)[i] = 0.3f * std::sin(2.0f * pi<float> * 220.0f * i / 48000.0f) + strike;
+        src.getChannel(1)[i] = 0.3f * std::sin(2.0f * pi<float> * 330.0f * i / 48000.0f) - strike;
+    }
+    for (const auto q : { TimeStretch<float>::Quality::Studio, TimeStretch<float>::Quality::Standard })
+        for (const float ratio : { 0.8f, 1.25f })
+        {
+            TimeStretch<float> ts;
+            ts.setQuality(q);
+            ts.prepare(spec(fs, 512, 2));
+            ts.setTimeRatio(ratio);
+            AudioBuffer<float> whole;
+            ts.process(src.toView(), whole);
+            EXPECT_EQ(whole.getNumSamples(), static_cast<int>(std::lround(n * static_cast<double>(ratio))));
+
+            for (const int block : { 1, 64, 1000, 4096 })
+            {
+                std::vector<float> l, r;
+                std::vector<float> bl(8192), br(8192);
+                auto drain = [&]() {
+                    for (;;)
+                    {
+                        float* o[2] = { bl.data(), br.data() };
+                        const int got = ts.pullOffline(AudioBufferView<float>(o, 2, 8192));
+                        if (got <= 0) break;
+                        l.insert(l.end(), bl.begin(), bl.begin() + got);
+                        r.insert(r.end(), br.begin(), br.begin() + got);
+                    }
+                };
+                ts.beginOffline(2);
+                for (int p = 0; p < n; p += block)
+                {
+                    const float* in[2] = { src.getChannel(0) + p, src.getChannel(1) + p };
+                    ts.pushOffline(AudioBufferView<const float>(in, 2, std::min(block, n - p)));
+                    drain();
+                }
+                ts.finishOffline();
+                drain();
+                const bool same = static_cast<int>(l.size()) == whole.getNumSamples()
+                    && std::equal(l.begin(), l.end(), whole.getChannel(0))
+                    && std::equal(r.begin(), r.end(), whole.getChannel(1));
+                if (!same)
+                    std::cout << "  mismatch: quality " << static_cast<int>(q) << " ratio " << ratio
+                              << " block " << block << " (" << l.size() << " vs "
+                              << whole.getNumSamples() << ")\n";
+                EXPECT_TRUE(same);
+            }
+        }
+}
+
+
 }   // namespace
 
 // A stretch spreads one strike over fftSize * |ratio - 1| samples unless the

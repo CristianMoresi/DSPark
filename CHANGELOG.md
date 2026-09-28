@@ -56,6 +56,11 @@ All notable user-facing changes to DSPark are documented here.
   intermodulation -74.2 instead of -62.4 dB, for 0.21 dB of integrated
   loudness on a dense mix driven 12 dB over the ceiling. State blobs saved
   before the field existed restore a hold of 0.
+- `TimeStretch::beginOffline()` / `pushOffline()` / `finishOffline()` with
+  `pullOffline()`: the offline stretch fed and drained in blocks of any
+  size, bit-identical to `process()` over the whole signal, holding only
+  unfed input and unpulled output. `process()` is now that session run
+  over one block.
 - Incremental offline analysis for material that arrives in pieces:
   `BeatTracker::beginOffline()` / `pushOffline()` / `finishOffline()` and
   the same trio on `OnsetDetector`. Blocks may be any size; the result is

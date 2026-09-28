@@ -476,6 +476,51 @@ DSPARK_TEST(Limiter_close_peaks_with_fast_release_are_never_hard_clipped)
             EXPECT_EQ(limiterClampHits(x, releaseMs, truePeak), 0);
 }
 
+// Without a hold the gain recovers between the crests of a low tone and dips
+// again at the next one: a 50 Hz sine driven 6 dB over the ceiling measured
+// -56.8 dB THD+N (5 ms lookahead, 50 ms release). The default 10 ms hold
+// keeps the reduction across the crests: -149.6 dB, and 40 Hz -149.7 dB.
+DSPARK_TEST(Limiter_hold_keeps_low_tones_clean)
+{
+    auto thdn = [](double hz, bool hold) {
+        Limiter<double> lim;
+        lim.prepare(48000.0, 1, 5.0);
+        lim.setCeiling(-1.0);
+        lim.setRelease(50.0);
+        if (!hold) lim.setHold(0.0);
+        const double amp = 2.0 * std::pow(10.0, -1.0 / 20.0);
+        std::vector<double> y(48000 * 2);
+        for (size_t n = 0; n < y.size(); ++n)
+            y[n] = amp * std::sin(2.0 * 3.14159265358979 * hz * static_cast<double>(n) / 48000.0);
+        double* ch[1] = { y.data() };
+        lim.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(y.size())));
+        // Least-squares fit of the tone over the second second; the rest is
+        // distortion and noise.
+        double cc = 0, ss = 0, cs = 0, xc = 0, xs = 0;
+        for (size_t n = 48000; n < y.size(); ++n)
+        {
+            const double ph = 2.0 * 3.14159265358979 * hz * static_cast<double>(n) / 48000.0;
+            const double c = std::cos(ph), s = std::sin(ph);
+            cc += c * c; ss += s * s; cs += c * s; xc += y[n] * c; xs += y[n] * s;
+        }
+        const double det = cc * ss - cs * cs;
+        const double a = (xc * ss - xs * cs) / det, b = (xs * cc - xc * cs) / det;
+        double res = 0, sig = 0;
+        for (size_t n = 48000; n < y.size(); ++n)
+        {
+            const double ph = 2.0 * 3.14159265358979 * hz * static_cast<double>(n) / 48000.0;
+            const double fit = a * std::cos(ph) + b * std::sin(ph);
+            res += (y[n] - fit) * (y[n] - fit);
+            sig += fit * fit;
+        }
+        return 10.0 * std::log10(res / sig + 1e-300);
+    };
+    EXPECT_NEAR(Limiter<double>().getHold(), 10.0, 1e-12);
+    EXPECT_LT(thdn(50.0, true), -120.0);
+    EXPECT_LT(thdn(40.0, true), -120.0);
+    EXPECT_GT(thdn(50.0, false), -70.0);   // control: no hold
+}
+
 DSPARK_TEST(Limiter_dense_material_is_never_hard_clipped)
 {
     // Drum-like material: noise bursts every 3000 samples over a noise bed.

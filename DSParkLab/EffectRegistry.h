@@ -320,6 +320,7 @@ inline EffectSlot makeLimiter()
     s.addSlider("Lookahead", 0, 10, 5, "ms");
     s.addToggle("Safety Clip", true);
     s.addToggle("Adaptive Release", true);
+    s.addSlider("Hold", 0, 50, 10, "ms");
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p, inputGainDb](auto b) {
         // Input Gain MUST be applied BEFORE the limiter - otherwise
@@ -343,6 +344,7 @@ inline EffectSlot makeLimiter()
             case 3: p->setLookahead(v); break;
             case 4: p->setSafetyClip(v > 0.5f); break;
             case 5: p->setAdaptiveRelease(v > 0.5f); break;
+            case 6: p->setHold(v); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

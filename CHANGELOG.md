@@ -31,6 +31,14 @@ All notable user-facing changes to DSPark are documented here.
   (before: -105 dB and -53 dB) with a flat passband to 0.915 of Nyquist.
   `getFilterLength()` reports the kernel length.
 
+- `Limiter::setHold()`: the reduction is held after the last peak that
+  asked for it before the release starts (default 10 ms, 0 to 50 ms). A
+  50 Hz sine driven 6 dB over the ceiling measures -149.6 dB THD+N instead
+  of -56.8 dB, 40 Hz -149.7 instead of -47.4, and 60 Hz + 7 kHz
+  intermodulation -74.2 instead of -62.4 dB, for 0.21 dB of integrated
+  loudness on a dense mix driven 12 dB over the ceiling. State blobs saved
+  before the field existed restore a hold of 0.
+
 ### Changed
 
 - `Resampler` quality tiers are now specifications (Draft 0.80 of Nyquist

@@ -2927,6 +2927,59 @@ DSPARK_TEST(ConvReverb_dry_and_wet_are_time_aligned)
     EXPECT_GT(std::abs(out[static_cast<size_t>(impPos + lat)]), 0.9f);   // aligned dry + wet
 }
 
+// A multi-channel IR held in memory loads like one read from a file: one
+// convolver per channel, so a stereo IR whose right channel is a half-level
+// delta 100 samples late puts exactly that on the right output, and the left
+// output stays a plain delta. A one-channel view is duplicated across both.
+DSPARK_TEST(ConvReverb_loads_a_multichannel_ir_from_memory)
+{
+    std::vector<float> left(256, 0.0f), right(256, 0.0f);
+    left[0] = 1.0f;
+    right[100] = 0.5f;
+    const float* chans[2] = { left.data(), right.data() };
+
+    auto impulseResponse = [](Reverb<float>& rev) {
+        std::array<std::vector<float>, 2> out;
+        for (int b = 0; b < 48; ++b)
+        {
+            auto tb = makeStereoBuffer(256);
+            tb.fillSilence();
+            if (b == 40) { tb.ch(0)[0] = 1.0f; tb.ch(1)[0] = 1.0f; }
+            rev.processBlock(tb.view());
+            for (int c = 0; c < 2; ++c) out[static_cast<size_t>(c)].insert(
+                out[static_cast<size_t>(c)].end(), tb.ch(c), tb.ch(c) + 256);
+        }
+        return out;
+    };
+
+    Reverb<float> rev;
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setMix(1.0f);
+    EXPECT_TRUE(rev.loadIR(AudioBufferView<const float>(chans, 2, 256), 48000.0));
+    EXPECT_TRUE(rev.isLoaded());
+    const auto y = impulseResponse(rev);
+    const size_t at = static_cast<size_t>(40 * 256 + rev.getLatency());
+    EXPECT_NEAR(y[0][at], 1.0f, 1e-3f);
+    EXPECT_NEAR(y[1][at], 0.0f, 1e-3f);
+    EXPECT_NEAR(y[1][at + 100], 0.5f, 1e-3f);
+    EXPECT_NEAR(y[0][at + 100], 0.0f, 1e-3f);
+
+    // One channel: duplicated, so both outputs carry the left IR.
+    Reverb<float> mono;
+    mono.prepare(spec(48000.0, 256, 2));
+    mono.setMix(1.0f);
+    EXPECT_TRUE(mono.loadIR(AudioBufferView<const float>(chans, 1, 256), 48000.0));
+    const auto m = impulseResponse(mono);
+    EXPECT_NEAR(m[0][at], 1.0f, 1e-3f);
+    EXPECT_NEAR(m[1][at], 1.0f, 1e-3f);
+
+    // Rejected: no channels, no samples, an invalid rate. The loaded IR stays.
+    EXPECT_FALSE(rev.loadIR(AudioBufferView<const float>(chans, 0, 256), 48000.0));
+    EXPECT_FALSE(rev.loadIR(AudioBufferView<const float>(chans, 2, 0), 48000.0));
+    EXPECT_FALSE(rev.loadIR(AudioBufferView<const float>(chans, 2, 256), 0.0));
+    EXPECT_TRUE(rev.isLoaded());
+}
+
 DSPARK_TEST(ConvReverb_reset_keeps_ir_loaded)
 {
     // reset() used to drop the convolver bank entirely: a host reset on

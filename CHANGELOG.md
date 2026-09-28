@@ -51,6 +51,10 @@ All notable user-facing changes to DSPark are documented here.
   reproducible - the same seed renders the same output, and `reset()` or
   `prepare()` restarts the drift from it. Zero keeps the per-instance
   unique seed.
+- `Reverb::loadIR(AudioBufferView<const T>, double)`: a multi-channel
+  impulse response from memory, for hosts that keep IRs in their own asset
+  store - the same resampling, per-channel convolvers and atomic
+  publication as loading from a file.
 
 ### Policy
 

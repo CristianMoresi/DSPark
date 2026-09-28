@@ -830,6 +830,39 @@ public:
     }
 
     /**
+     * @brief Loads a multi-channel IR from memory.
+     *
+     * The in-memory counterpart of loadIR(path), for a host that keeps its
+     * impulse responses in its own asset store rather than as files: the same
+     * resampling, the same one-convolver-per-channel layout (a one-channel
+     * view is duplicated across all channels) and the same atomic publication.
+     * The samples are copied, so the view need not outlive the call.
+     *
+     * @param ir           One IR channel per view channel, all the same length.
+     * @param irSampleRate Sample rate of the IR data (must be > 0 and finite).
+     * @return True if the IR was accepted (an empty view or an invalid rate is
+     *         rejected).
+     */
+    bool loadIR(AudioBufferView<const T> ir, double irSampleRate)
+    {
+        const int nextChannels = ir.getNumChannels();
+        const int nextLength = ir.getNumSamples();
+        if (nextChannels <= 0 || nextLength <= 0
+            || !std::isfinite(irSampleRate) || !(irSampleRate > 0.0))
+            return false;
+        for (int ch = 0; ch < nextChannels; ++ch)
+            if (ir.getChannel(ch) == nullptr) return false;
+
+        std::vector<T> nextStorage(
+            static_cast<size_t>(nextChannels) * static_cast<size_t>(nextLength));
+        for (int ch = 0; ch < nextChannels; ++ch)
+            std::copy_n(ir.getChannel(ch), nextLength,
+                        nextStorage.data() + static_cast<size_t>(ch) * static_cast<size_t>(nextLength));
+        return commitImpulseResponse(std::move(nextStorage), nextLength,
+                                     nextChannels, irSampleRate);
+    }
+
+    /**
      * @brief Sets the pre-delay time in milliseconds.
      *
      * Pre-delay adds a gap before the reverb tail starts, creating a sense

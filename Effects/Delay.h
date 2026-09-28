@@ -299,8 +299,37 @@ public:
         const SampleType hpC = fbHpCoef_.load(std::memory_order_relaxed);
         const SampleType mixTarget = mix_.load(std::memory_order_relaxed);
         const SampleType mixStart  = insertMix_;
+        const bool pingPong = pingPong_.load(std::memory_order_relaxed) && nCh >= 2;
 
-        for (int ch = 0; ch < nCh; ++ch)
+        if (pingPong)
+        {
+            // The first two channels cross their feedback (the same wiring as
+            // processPingPong()); the blend is the insert's.
+            const bool analogFb = feedbackMode_.load(std::memory_order_relaxed) == FeedbackMode::Analog;
+            SampleType* L = buffer.getChannel(0);
+            SampleType* R = buffer.getChannel(1);
+            auto& sL = states_[0];
+            auto& sR = states_[1];
+            for (int i = 0; i < nS; ++i)
+            {
+                const SampleType currentDelay = (smoothType == SmootherType::None)
+                                              ? targetDelay : advanceSmoother(sL, smoothType);
+                advanceSmoother(sR, smoothType);   // kept in step, as in processPingPong()
+                const SampleType dryL = L[i], dryR = R[i];
+                const SampleType outL = processSampleInternal(0, dryL + sL.pingPongFb, currentDelay, sL, SampleType(0), lpC, hpC);
+                const SampleType outR = processSampleInternal(1, dryR + sR.pingPongFb, currentDelay, sR, SampleType(0), lpC, hpC);
+                sR.pingPongFb = saturateFeedback(processFbFilters(1, outL * fb, lpC, hpC), analogFb);
+                sL.pingPongFb = saturateFeedback(processFbFilters(0, outR * fb, lpC, hpC), analogFb);
+                advanceWriteIndexUnchecked(0);
+                advanceWriteIndexUnchecked(1);
+                const SampleType m = moveTowards(mixStart, mixTarget,
+                                                 insertMixMaxStep_ * static_cast<SampleType>(i + 1));
+                L[i] = dryL + (outL - dryL) * m;
+                R[i] = dryR + (outR - dryR) * m;
+            }
+        }
+
+        for (int ch = pingPong ? 2 : 0; ch < nCh; ++ch)
         {
             SampleType* data = buffer.getChannel(ch);
             auto& s = states_[ch];
@@ -332,6 +361,19 @@ public:
 
     /** @brief Returns the insert dry/wet blend. */
     [[nodiscard]] SampleType getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Ping-pong for the insert-style processBlock(buffer): the first
+     *        two channels feed their echoes to each other (left to right,
+     *        right to left), with the same wiring as processPingPong() and
+     *        the insert's blend, dry + (wet - dry) * mix. Further channels
+     *        keep a plain delay. Off by default; needs two or more channels.
+     *        Thread-safe.
+     */
+    void setPingPong(bool on) noexcept { pingPong_.store(on, std::memory_order_relaxed); }
+
+    /** @brief True when the insert path runs as a ping-pong delay. */
+    [[nodiscard]] bool getPingPong() const noexcept { return pingPong_.load(std::memory_order_relaxed); }
 
     /** @brief Latency in samples: none (the delay is the effect, not a latency). */
     [[nodiscard]] int getLatency() const noexcept { return 0; }
@@ -556,6 +598,7 @@ public:
         w.write("smoothingMs", smoothingTimeMs_.load(std::memory_order_relaxed));
         w.write("fbMode", static_cast<int32_t>(feedbackMode_.load(std::memory_order_relaxed)));
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
+        w.write("pingPong", static_cast<int32_t>(pingPong_.load(std::memory_order_relaxed) ? 1 : 0));
         return w.blob();
     }
 
@@ -576,6 +619,7 @@ public:
         setFeedbackMode(static_cast<FeedbackMode>(std::clamp(r.read("fbMode", 1), 0,
                         static_cast<int>(FeedbackMode::Analog))));
         setMix(static_cast<SampleType>(r.read("mix", 0.3f)));
+        setPingPong(r.read("pingPong", 0) != 0);
         return true;
     }
 
@@ -869,6 +913,7 @@ private:
 
     Smoothers::LinearSmoother mixSmoother_;
     std::atomic<SampleType> mix_ { SampleType(0.3) };            ///< Insert dry/wet blend.
+    std::atomic<bool> pingPong_ { false };                          ///< Insert path cross-feeds L and R.
     SampleType insertMix_ = SampleType(0.3);                     ///< Audio-thread ramp state.
     SampleType insertMixMaxStep_ = SampleType(1.0 / 960.0);      ///< Full scale per 20 ms.
 };

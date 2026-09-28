@@ -29,6 +29,81 @@ using namespace dspark::test;
 // Delay
 // ============================================================================
 
+// Ping-pong joins the insert contract: one processBlock(buffer) serves both
+// modes with one blend, dry + (wet - dry) * mix. Fully wet it is sample for
+// sample the wet-buffer sequence (pushDryToWet, processPingPong); an impulse
+// on the left alone returns first on the left, then on the right, then on
+// the left again; and the setting travels in the state blob.
+DSPARK_TEST(Delay_insert_ping_pong_matches_the_wet_path_and_crosses)
+{
+    auto setup = [](Delay<float>& d, float mix) {
+        d.setMix(mix);
+        d.setSmoother(Delay<float>::SmootherType::None);
+        d.prepare(spec(48000.0, 512, 2));
+        d.setDelayMs(10.0f);                  // 480 samples
+        d.setFeedback(0.5f);
+        d.setFeedbackMode(Delay<float>::FeedbackMode::Clean);
+    };
+    std::vector<float> l(2048, 0.0f), r(2048, 0.0f);
+    l[0] = 1.0f;
+    r[3] = 0.25f;
+
+    Delay<float> insert, wetPath;
+    setup(insert, 1.0f);
+    setup(wetPath, 1.0f);
+    insert.setPingPong(true);
+    EXPECT_TRUE(insert.getPingPong());
+    std::vector<float> il = l, ir = r, wl = l, wr = r;
+    for (int p = 0; p < 2048; p += 512)
+    {
+        float* a[2] = { il.data() + p, ir.data() + p };
+        insert.processBlock(AudioBufferView<float>(a, 2, 512));
+        float* b[2] = { wl.data() + p, wr.data() + p };
+        wetPath.pushDryToWet(AudioBufferView<float>(b, 2, 512));
+        wetPath.processPingPong(10.0f, 0.5f);
+        wetPath.mixWetToDry(AudioBufferView<float>(b, 2, 512), 1.0f);
+    }
+    EXPECT_TRUE(il == wl);
+    EXPECT_TRUE(ir == wr);
+
+    // The echoes cross: L at 480, R at 961, L at 1442 (the cross-feed enters
+    // the other line on the next sample, as in processPingPong()).
+    Delay<float> d;
+    setup(d, 1.0f);
+    d.setPingPong(true);
+    std::vector<float> xl(2048, 0.0f), xr(2048, 0.0f);
+    xl[0] = 1.0f;
+    for (int p = 0; p < 2048; p += 512)
+    {
+        float* a[2] = { xl.data() + p, xr.data() + p };
+        d.processBlock(AudioBufferView<float>(a, 2, 512));
+    }
+    EXPECT_NEAR(xl[480], 1.0f, 1e-6f);
+    EXPECT_NEAR(xr[480], 0.0f, 1e-6f);
+    EXPECT_NEAR(xr[961], 0.5f, 1e-6f);
+    EXPECT_NEAR(xl[961], 0.0f, 1e-6f);
+    EXPECT_NEAR(xl[1442], 0.25f, 1e-6f);
+    EXPECT_NEAR(xr[1442], 0.0f, 1e-6f);
+
+    // Half wet: the insert blend.
+    Delay<float> h;
+    setup(h, 0.5f);
+    h.setPingPong(true);
+    std::vector<float> hl(1024, 0.0f), hr(1024, 0.0f);
+    hl[0] = 1.0f;
+    float* a[2] = { hl.data(), hr.data() };
+    h.processBlock(AudioBufferView<float>(a, 2, 512));
+    EXPECT_NEAR(hl[0], 0.5f, 1e-6f);
+    EXPECT_NEAR(hl[480], 0.5f, 1e-6f);
+
+    // The state carries it; a blob without the field restores it off.
+    Delay<float> restored;
+    setup(restored, 1.0f);
+    const auto blob = d.getState();
+    EXPECT_TRUE(restored.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(restored.getPingPong());
+}
+
 // Delay used to be a raw delay line only: processBlock(buffer, delayMs, ...)
 // returned the delayed signal and reset every omitted parameter, and there
 // was no prepare(spec). As an insert it now works like every other effect:

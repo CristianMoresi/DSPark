@@ -6,6 +6,11 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Delay::setPingPong()`: the insert-style `processBlock(buffer)` runs as a
+  ping-pong delay (the first two channels cross their echoes) with the
+  insert's blend, so one call serves both modes. Fully wet it matches the
+  wet-buffer sequence sample for sample; the setting is saved in the state
+  (older blobs restore it off).
 - `Resampler::processRange()` and `getReach()`: offline, time-aligned
   conversion of any span of output samples, including the kernel's ringing
   before the first input sample and after the last.

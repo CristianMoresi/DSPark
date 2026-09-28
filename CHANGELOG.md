@@ -63,6 +63,14 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `Compressor::DetectorType::Hilbert` detects on the zero-latency allpass
+  pair (`HilbertIIR`), backed by the rectified input at onsets, instead of
+  the 191-tap FIR. The FIR was blind below about 200 Hz, so low tones were
+  modulated at their own frequency exactly as with the peak detector; now a
+  30 Hz tone 14 dB into 4:1 at 5/100 ms measures -96 dB THD+N (before -35
+  dB) and 20 Hz -107 dB, the static curve holds within 0.02 dB, and the
+  detector adds no latency (it reported 95 samples). A step escapes as it
+  does with the peak detector.
 - `Resampler` quality tiers are now specifications (Draft 0.80 of Nyquist
   and 60 dB, Normal 0.90 and 100 dB, High 0.91 and 140 dB, Ultra 0.915 and
   210 dB), so kernels are longer than the former fixed 8/32/64/128 taps and

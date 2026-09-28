@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <vector>
 
@@ -1422,11 +1423,13 @@ DSPARK_TEST(Compressor_upward_taper_follows_sustained_level)
 // Compressor detector alignment and static makeup (2026-07 P2)
 // ============================================================================
 
-DSPARK_TEST(Compressor_hilbert_detector_is_latency_compensated)
+DSPARK_TEST(Compressor_hilbert_detector_catches_steps_without_latency)
 {
-    // The Hilbert FIR detects ~95 samples late; the audio path is delayed by
-    // the same amount, so a hot step must leave already gain-reduced instead
-    // of escaping unprocessed for 2 ms (the pre-P2 behaviour).
+    // The detector used to be a 191-tap FIR, 95 samples late, with the audio
+    // delayed to match. It is now a zero-latency allpass pair, and the
+    // rectified input backs it up at onsets, so a hot step leaves already
+    // gain-reduced with no latency to report. Measured: the step escapes at
+    // 0.317, as with the peak detector; the pair alone let 0.720 through.
     const double fs = 48000.0;
     const int pre = static_cast<int>(fs * 0.1);
     const int n = pre + static_cast<int>(fs * 0.3);
@@ -1451,15 +1454,71 @@ DSPARK_TEST(Compressor_hilbert_detector_is_latency_compensated)
         comp.processBlock(view);
     }
 
-    EXPECT_EQ(comp.getLatency(), 95); // Hilbert<float>::getLatencySamples()
+    EXPECT_EQ(comp.getLatency(), 0);
     const float escape = measurePeak(tb.ch(0) + pre, 600);
-    EXPECT_LT(escape, 0.35f); // uncompensated, the full 1.0 step leaked through
+    EXPECT_LT(escape, 0.35f);
+}
+
+// A low tone driven into the compressor must come out as a tone, not
+// modulated at its own frequency. The peak detector's gain follows every
+// half-cycle (THD+N -35 dB at 30 Hz with 5/100 ms); the Hilbert detector's
+// envelope is flat, so the gain is too. Measured -96 dB at 30 Hz, -107 dB at
+// 20 Hz; the FIR detector it replaced measured -35 dB, no better than Peak.
+// The static curve holds within 0.02 dB (14 dB over a 4:1 threshold).
+DSPARK_TEST(Compressor_hilbert_detector_leaves_low_tones_undistorted)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 3.0);
+    for (const double f : { 20.0, 30.0, 50.0 })
+    {
+        Compressor<double> comp;
+        comp.prepare(AudioSpec{ fs, 512, 1 });
+        comp.setThreshold(-20.0);
+        comp.setRatio(4.0);
+        comp.setAttack(5.0);
+        comp.setRelease(100.0);
+        comp.setDetector(Compressor<double>::DetectorType::Hilbert);
+
+        std::vector<double> y(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            y[static_cast<size_t>(i)] = 0.5 * std::sin(2.0 * pi<double> * f * i / fs);
+        for (int pos = 0; pos < n; pos += 512)
+        {
+            double* chans[1] = { y.data() + pos };
+            comp.processBlock(AudioBufferView<double>(chans, 1, std::min(512, n - pos)));
+        }
+
+        // Least-squares fit of the tone over the second half; the residual
+        // is everything the gain modulation added.
+        double ss = 0, sc = 0, cc = 0, ys = 0, yc = 0;
+        for (int i = n / 2; i < n; ++i)
+        {
+            const double s = std::sin(2.0 * pi<double> * f * i / fs);
+            const double c = std::cos(2.0 * pi<double> * f * i / fs);
+            const double v = y[static_cast<size_t>(i)];
+            ss += s * s; sc += s * c; cc += c * c; ys += v * s; yc += v * c;
+        }
+        const double det = ss * cc - sc * sc;
+        const double a = (ys * cc - yc * sc) / det, b = (yc * ss - ys * sc) / det;
+        double err = 0, sig = 0;
+        for (int i = n / 2; i < n; ++i)
+        {
+            const double fit = a * std::sin(2.0 * pi<double> * f * i / fs)
+                             + b * std::cos(2.0 * pi<double> * f * i / fs);
+            const double e = y[static_cast<size_t>(i)] - fit;
+            err += e * e; sig += fit * fit;
+        }
+        const double thdn = 10.0 * std::log10(err / sig);
+        const double outDb = 20.0 * std::log10(std::sqrt(a * a + b * b));
+        std::cout << "  " << f << " Hz: THD+N " << thdn << " dB, level " << outDb << " dBFS\n";
+        EXPECT_LT(thdn, -85.0);
+        EXPECT_NEAR(outDb, -16.5051, 0.03);   // -6.02 dBFS in, 4:1 above -20
+    }
 }
 
 DSPARK_TEST(Compressor_getLatency_matches_active_configuration)
 {
-    // Latency must reflect lookahead + Hilbert alignment immediately after a
-    // setter (hosts re-read it before the next block), and feedback operation
+    // Latency must reflect the lookahead immediately after a setter (hosts re-read it before the next block), and feedback operation
     // (FeedBack topology or the FET character) must always report 0.
     const double fs = 48000.0;
     Compressor<float> comp;
@@ -1469,7 +1528,7 @@ DSPARK_TEST(Compressor_getLatency_matches_active_configuration)
     comp.setLookahead(5.0f);
     EXPECT_EQ(comp.getLatency(), 240);
     comp.setDetector(Compressor<float>::DetectorType::Hilbert);
-    EXPECT_EQ(comp.getLatency(), 335);
+    EXPECT_EQ(comp.getLatency(), 240);   // the detector adds no latency
     comp.setTopology(Compressor<float>::Topology::FeedBack);
     EXPECT_EQ(comp.getLatency(), 0);
     comp.setTopology(Compressor<float>::Topology::FeedForward);

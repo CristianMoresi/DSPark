@@ -650,8 +650,8 @@ DSPARK_TEST(Hilbert_no_NaN)
 
 DSPARK_TEST(Hilbert_real_branch_is_exact_delayed_input)
 {
-    // The alignment contract the Compressor's Hilbert-detector compensation
-    // relies on: real[n] == x[n - getLatencySamples()] BIT-exactly.
+    // The alignment contract a caller mixing the analytic pair against a dry
+    // path relies on: real[n] == x[n - getLatencySamples()] BIT-exactly.
     Hilbert<float> h;
     h.prepare(48000.0);
     const int lat = Hilbert<float>::getLatencySamples();

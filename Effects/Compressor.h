@@ -95,14 +95,15 @@ public:
         Peak,           ///< Instantaneous absolute value tracking. Fast and standard.
         Rms,            ///< Sliding-window Root-Mean-Square. Smoother, responds to average energy.
         TruePeak,       ///< 4x oversampled peak detection (ITU-R BS.1770-4 compliant).
-        SplitPolarity,  ///< Asymmetric positive/negative half-wave tracking (ButterComp2 style).
-        Hilbert         ///< Analytic-signal magnitude: ripple-free envelope (lowest THD on
-                        ///< sustained material). The 191-tap FIR detects ~95 samples late,
-                        ///< so the audio path is delayed by the same amount to stay aligned
-                        ///< with the gain (transients are caught; the delay is reported by
-                        ///< getLatency()). Feedback operation keeps its loop causal, so the
-                        ///< alignment delay is disabled there; processSample() (documented
-                        ///< as lookahead-free) does not apply it either.
+        SplitPolarity,  ///< Separate envelopes for the positive and negative half-waves.
+        Hilbert         ///< Analytic-signal magnitude from a zero-latency allpass pair
+                        ///< (HilbertIIR): a ripple-free envelope on sustained tones from
+                        ///< 20 Hz up, so the static curve holds exactly and low tones are
+                        ///< not modulated at their own frequency (THD+N of a 30 Hz tone
+                        ///< 14 dB into 4:1 at 5/100 ms: -96 dB, against -35 dB with Peak).
+                        ///< The larger of that magnitude and the rectified input is
+                        ///< used, so an onset is caught as fast as with Peak. Adds no
+                        ///< latency.
     };
 
     /** @brief Signal routing topology for the detector sidechain. */
@@ -222,17 +223,14 @@ public:
         colorSmooth_.reset(characterColor_.load(std::memory_order_relaxed));
 
         // Pre-allocate and initialize per-channel instances. Capacity covers
-        // the 10 ms user lookahead plus the Hilbert detector's group delay
-        // (the audio is delayed by it to stay aligned with the envelope).
-        // Every channel slot gets a delay line, not just spec.numChannels:
+        // the 10 ms user lookahead. Every channel slot gets a delay line, not just spec.numChannels:
         // a view wider than the spec would otherwise read an unprepared ring
         // (silence) on the extra channels whenever lookahead is active.
-        int maxLaSamples = static_cast<int>(sampleRate_ * 0.01) + 1
-                         + Hilbert<T>::getLatencySamples();
+        int maxLaSamples = static_cast<int>(sampleRate_ * 0.01) + 1;
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
             lookaheadBuffers_[ch].prepare(maxLaSamples);
-            hilbertDetectors_[ch].prepare(sampleRate_);
+            hilbertDetectors_[ch].reset();
         }
         
         lookaheadSamples_ = static_cast<int>(fs * std::clamp(
@@ -295,8 +293,8 @@ public:
      *       cost); per-sample callers are expected to guard their own processing
      *       loop with a single DenormalGuard, exactly as the block path does once
      *       per block. This matches Limiter/NoiseGate processSample().
-     * @note getLatency() reports the processBlock() path (lookahead + Hilbert
-     *       alignment). This per-sample path BYPASSES the lookahead delay line,
+     * @note getLatency() reports the processBlock() path (its lookahead).
+     *       This per-sample path BYPASSES the lookahead delay line,
      *       so it adds no lookahead latency regardless of setLookahead().
      *
      * @note Shared state (parameter smoothers, auto-makeup envelope) advances
@@ -745,10 +743,9 @@ public:
     /**
      * @brief Returns total processing latency in samples.
      *
-     * Lookahead plus the Hilbert detector's alignment delay when that
-     * detector is active. Feedback operation (Topology::FeedBack, or the
-     * FET character, which always detects in feedback) disables both, so
-     * latency is 0 there. The plugin layer re-reads this after parameter
+     * The lookahead. Feedback operation (Topology::FeedBack, or the FET
+     * character, which always detects in feedback) disables it, so latency
+     * is 0 there. The plugin layer re-reads this after parameter
      * changes and re-notifies the host when it moves.
      */
     [[nodiscard]] int getLatency() const noexcept
@@ -757,15 +754,12 @@ public:
             topology_.load(std::memory_order_relaxed) == Topology::FeedBack
             || character_.load(std::memory_order_relaxed) == Character::FET;
         if (feedback) return 0;
-        const int hilbertComp =
-            (detectorType_.load(std::memory_order_relaxed) == DetectorType::Hilbert)
-            ? Hilbert<T>::getLatencySamples() : 0;
         // Derive the lookahead from the published parameter rather than the
         // audio-thread cache: hosts re-read the latency right after a setter,
         // before the next block has consumed the coefficient-update flag.
         const int lookNow = static_cast<int>(static_cast<T>(sampleRate_) * std::clamp(
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
-        return lookNow + hilbertComp;
+        return lookNow;
     }
 
 
@@ -912,16 +906,11 @@ protected:
                              && modeType == Mode::Downward
                              && detTypeEff == DetectorType::Peak;
 
-        // The Hilbert detector reports the envelope kCenter samples late;
-        // delaying the audio by the same amount re-aligns gain and signal.
-        const int hilbertComp = (detTypeEff == DetectorType::Hilbert)
-                              ? Hilbert<T>::getLatencySamples() : 0;
         const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity;
 
-        // Lookahead (and the Hilbert alignment delay) break causal logic in
-        // Feedback mode, so both are strictly disabled there.
-        int activeLookahead = (topoEff == Topology::FeedBack) ? 0
-                            : lookaheadSamples_ + hilbertComp;
+        // Lookahead breaks causal logic in Feedback mode, so it is strictly
+        // disabled there.
+        int activeLookahead = (topoEff == Topology::FeedBack) ? 0 : lookaheadSamples_;
 
         for (int i = 0; i < nS; ++i)
         {
@@ -1277,10 +1266,13 @@ protected:
 
             case DetectorType::Hilbert:
             {
-                auto res = hilbertDetectors_[ch].process(sample);
-                // Direct euclidean distance for magnitude calculation.
-                // Assuming bounded audio signal [-1.0, 1.0], std::sqrt is safe and faster than std::hypot.
-                level = std::sqrt(res.real * res.real + res.imag * res.imag);
+                // The analytic magnitude is the envelope of a sustained tone,
+                // but the allpass pair takes part of a cycle to form it after
+                // an onset; the rectified input is never above the envelope of
+                // a steady tone, so the larger of the two keeps the ripple-free
+                // level and catches a step as fast as the peak detector.
+                const double mag = hilbertDetectors_[ch].magnitude(static_cast<double>(sample));
+                level = static_cast<T>(std::max(mag, std::abs(static_cast<double>(sample))));
                 break;
             }
         }
@@ -1809,7 +1801,7 @@ protected:
     std::array<RingBuffer<T>, kMaxChannels> lookaheadBuffers_ {}; ///< Lookahead delay lines.
     int lookaheadSamples_ = 0; ///< Active lookahead latency in samples.
 
-    std::array<Hilbert<T>, kMaxChannels> hilbertDetectors_ {}; ///< Analytic signal generators for detection.
+    std::array<HilbertIIR<double>, kMaxChannels> hilbertDetectors_ {}; ///< Zero-latency analytic pairs for detection.
 
     // Sidechain Filtering
     std::atomic<bool> scHpfEnabled_ { false }; ///< HPF toggle.

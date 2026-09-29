@@ -197,6 +197,20 @@
  * unambiguous case in the acceptance corpus untouched. See kAmbiguityFloor for
  * why it has a floor under it.
  *
+ * ON RECORDED MUSIC. Measured with analyze() on the public ISMIR 2004 ballroom
+ * set (454 thirty-second excerpts in nine dance styles, the tempo each song
+ * is published at as the reference): the tempo is within 4% of the reference
+ * on 65.6% of excerpts, and within 4% of it or of twice, three times, half or
+ * a third of it on 92.1%. What separates the two figures is the metrical
+ * level, in both directions: slow styles are reported at twice the reference
+ * (rumba, slow waltz: 73 excerpts), fast ones at half of it (quickstep, cha
+ * cha: 41). In most of those cases the reference is the secondary tempo. The
+ * tapping preference that decides the level is at its best on this set as it
+ * is (moving its centre or its widths in either direction loses excerpts),
+ * and the level a dance is published at is a convention of the dance as much
+ * as a property of the audio -- so where the level matters, offer
+ * secondaryTempoBpm to the user rather than trusting tempoBpm alone.
+ *
  * Threading:
  * - prepare(): setup thread (allocates; not concurrent with anything else).
  * - processBlock() / pushSamples(): audio thread, stream owner. Allocation

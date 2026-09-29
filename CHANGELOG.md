@@ -87,11 +87,6 @@ All notable user-facing changes to DSPark are documented here.
   store - the same resampling, per-channel convolvers and atomic
   publication as loading from a file.
 
-### Policy
-
-- Published history on `main` is never rewritten, and every release is an
-  annotated tag that is never moved; see CONTRIBUTING.
-
 ### Changed
 
 - `BeatTracker::analyze()` settles the metrical level with a model fitted to

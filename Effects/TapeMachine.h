@@ -19,7 +19,7 @@
  *    speeds, exactly as on hardware.
  * 2. **Magnetic hysteresis with REAL AC bias** at 4x oversampling by DEFAULT
  *    (configurable, and switchable off, see setOversampling): an
- *    ultrasonic carrier (0.375 * internal rate, exact 8-phase table) is
+ *    ultrasonic carrier (a quarter of the internal rate, exact table) is
  *    summed with the signal into a push-pull pair of JA instances per
  *    channel (+carrier / -carrier, output averaged, like a centre-tapped
  *    record head). The carrier erases the loop's branch memory exactly as
@@ -74,12 +74,12 @@
  * **Oversampling transparency.** setOversampling(int) (setup thread only;
  * it reallocates and re-calibrates like prepare()) selects the internal
  * oversampling factor in {1,2,4,8,16}; the DEFAULT is 4. The AC-bias
- * carrier is always 0.375 * the internal rate, so the factor sets how far
- * the carrier sits above the audio band: at 4x/48k it is ultrasonic
- * (72 kHz) and its even folds die in the downsampler; CPU scales ~linearly
- * with the factor. factor = 1 means OFF - no internal resampling and zero
- * added oversampler latency, but then the carrier lands at 0.375 * the base
- * rate (18 kHz at 48k), i.e. IN-BAND, so 1x is only sensible when the host
+ * carrier is always a quarter of the internal rate, so the factor sets how
+ * far the carrier sits above the audio band: at 4x/48k it is ultrasonic
+ * (48 kHz) and its folds die in the downsampler; CPU scales ~linearly with
+ * the factor. factor = 1 means OFF - no internal resampling and zero added
+ * oversampler latency, but then the carrier lands at a quarter of the base
+ * rate (12 kHz at 48k), i.e. IN-BAND, so 1x is only sensible when the host
  * runs a high sample rate or the surrounding chain is already oversampled
  * (the AC-bias model needs ultrasonic headroom). getLatency() always
  * reflects the active factor (oversampler group delay + loss FIR + transport
@@ -143,7 +143,7 @@ public:
         maxBlock_ = std::max(spec.maxBlockSize, 1);
 
         // The hysteresis core runs at the active oversampling factor (4x
-        // default) so the 0.375 * internal-rate AC bias carrier and its
+        // default) so the quarter-internal-rate AC bias carrier and its
         // sidebands stay clear of the audio band. factor = 1 = OFF: no
         // resampling and zero added latency; the carrier is then in-band.
         const double osRate = sampleRate_ * static_cast<double>(osFactor_);
@@ -289,7 +289,7 @@ public:
      *
      * @param factor Power-of-two multiplier in {1,2,4,8,16}. DEFAULT 4. 1 = OFF
      *  (no internal resampling, zero added oversampler latency; the AC-bias
-     *  carrier then lands in-band at 0.375 * the base rate, so 1x is only
+     *  carrier then lands in-band at a quarter of the base rate, so 1x is only
      *  sensible under host/chain oversampling). CPU scales ~linearly with the
      *  factor. Invalid/non-power-of-two values are ignored. getLatency()
      *  reflects the new factor after this call.
@@ -950,12 +950,20 @@ private:
     Hysteresis<T> calib_;    ///< Scratch +carrier instance for makeup calibration.
     Hysteresis<T> calib2_;   ///< Scratch -carrier instance for makeup calibration.
 
-    /// AC bias carrier at 0.375 * internal rate: sin(2*pi*3k/8), one exact
-    /// 8-phase period (3 carrier cycles), shared by all channels like a
-    /// machine's single bias oscillator.
+    /// AC bias carrier at a quarter of the internal rate, sampled 45 degrees
+    /// off its zero crossings: sqrt(2) * sin(pi * k / 2 + pi / 4), so every
+    /// sample sits at the carrier amplitude; two periods per 8-phase cycle,
+    /// shared by all channels like a machine's single bias oscillator. At a
+    /// quarter of the rate every harmonic the hysteresis draws from the
+    /// carrier folds back onto 0, the carrier itself or the internal Nyquist
+    /// frequency, so its products with the programme stay a quarter of the
+    /// internal rate, less the audio band, away from 0 - above what the
+    /// downsampler keeps. At 0.375 of the rate its third harmonic folded
+    /// onto the base-rate Nyquist frequency and mirrored the programme about
+    /// a quarter of the base rate: a 10.1 kHz tone at -30 dBFS came out with
+    /// a 13.9 kHz image 9.9 dB down, and 80 dB down now.
     static constexpr double kBiasTable[8] = {
-        0.0,  0.70710678118654752, -1.0,  0.70710678118654752,
-        0.0, -0.70710678118654752,  1.0, -0.70710678118654752
+        1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0
     };
 
     std::vector<ShelfSection> recordHF_, recordLF_, playHF_, playLF_;

@@ -150,6 +150,15 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `TapeMachine` no longer mirrors the programme about a quarter of the
+  sample rate. Its AC-bias carrier sat at 0.375 of the internal rate, where
+  the carrier's third harmonic folds onto the base-rate Nyquist frequency:
+  every tone came out with an image at 24 kHz minus its frequency (9.9 dB
+  below a 10.1 kHz tone at -30 dBFS, 22 dB below a 5 kHz one at 48 kHz).
+  The carrier now runs at a quarter of the internal rate, where all its
+  harmonics fold onto 0, itself or the internal Nyquist frequency: the image
+  measures 80 dB down, and the reference-level response, the odd-dominant
+  saturation and the drive law are unchanged within their tests.
 - `Reverb` (convolution) converts an impulse response held at another rate,
   or stretched, without changing what it does. The IR was streamed through
   the resampler: its gain moved with the rate ratio (+6.02 dB for a 48 kHz

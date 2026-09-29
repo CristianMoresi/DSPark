@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -2019,6 +2020,26 @@ DSPARK_TEST(TubePreamp_drive_knob_is_alive_and_monotonic)
     const double hotMid = levelAt(0.0f, 0.32f);
     const double hotMax = levelAt(36.0f, 0.32f);
     EXPECT_GT(hotMax, hotMid - 3.0);
+}
+
+// The bias carrier's own harmonics must not mirror the programme into the
+// audio band. At 0.375 of the internal rate the carrier's third harmonic
+// folded onto the base-rate Nyquist frequency and every tone came out with
+// an image at 24 kHz minus its frequency: 9.9 dB below a 10.1 kHz tone at
+// -30 dBFS, 22 dB below a 5 kHz one. At a quarter of the internal rate the
+// image measures 80 dB down.
+DSPARK_TEST(TapeMachine_bias_carrier_leaves_no_mirror_image)
+{
+    for (const double f : { 10100.0, 5000.0 })
+    {
+        TapeMachine<float> tape;
+        tape.prepare(spec(48000.0, 512, 2));
+        tape.setWowFlutter(0.0f);
+        auto out = runTapeSine(tape, f, 0.0316f, 1.0);
+        const double image = 20.0 * std::log10(tapeToneMag(out, 24000.0 - f) / tapeToneMag(out, f));
+        std::cout << "  " << f << " Hz: image at " << 24000.0 - f << " Hz " << image << " dB\n";
+        EXPECT_LT(image, -60.0);
+    }
 }
 
 DSPARK_TEST(TapeMachine_drive_knob_is_alive_and_monotonic)

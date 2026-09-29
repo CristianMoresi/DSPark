@@ -94,6 +94,19 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `BeatTracker::analyze()` settles the metrical level with a model fitted to
+  three public tempo-annotated collections: the proposed reading, its half
+  and its double are scored on how each one's pulse sits in the full, the
+  register-balanced and the four register envelopes, and at what rate it
+  would be tapped. Cross-validated, the level is right on 73.8% of the ISMIR
+  2004 ballroom set, 66.4% of the Salsa Dataset and 48.9% of Freesound
+  Loops 4k (63.2%, 50.0% and 43.7% before). End to end, tempo within 4% on
+  75.8%, 68.9% and 49.9% (65.6%, 50.0%, 44.1% before). The model is not
+  consulted where the proposal's alternate beats cannot be told apart, so
+  clicks, swing and quiet subdivisions keep their level; when it moves the
+  level, the reading it moved from is `secondaryTempoBpm`. On the ballroom
+  set the half/double/triple-tolerant figure goes from 92.1% to 89.9%:
+  Viennese waltzes read at one beat per bar are moved to two.
 - `Saturation` oversamples 2x by default (it was 1x, the one saturator in
   the framework that did not): at 1x a 10.1 kHz tone at -6 dBFS through
   the default SoftClip left an alias at 17.7 kHz only 34 dB down, at 2x it

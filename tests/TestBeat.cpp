@@ -1492,6 +1492,30 @@ DSPARK_TEST(Beat_dense_masters_get_the_kick_tempo_and_a_consistent_grid)
     }
 }
 
+// The level model at work (see BeatTracker::chooseMetricalLevel()). On the
+// 85 BPM master the tapping preference alone proposes the hi-hat level, 170,
+// and the relations between the envelopes' pulses move it to the kick. The
+// reading it moved from must be the alternative offered, and a range that
+// excludes the kick tempo must hold the answer at the proposal: the model
+// never leaves the range in force.
+DSPARK_TEST(Beat_level_model_moves_to_the_kick_tempo_inside_the_range)
+{
+    const Corpus c = denseMaster(85.0, 30.0);
+    const auto r = analyzeCorpus(c);
+    std::cout << "  85 BPM master: tempo " << static_cast<double>(r.tempoBpm)
+              << ", secondary " << static_cast<double>(r.secondaryTempoBpm) << "\n";
+    EXPECT_TRUE(classify(static_cast<double>(r.tempoBpm), 85.0, 2.0) == Level::Correct);
+    EXPECT_TRUE(classify(static_cast<double>(r.secondaryTempoBpm), 85.0, 2.0) == Level::Double);
+
+    BeatTracker<float> narrow;
+    narrow.prepare(AudioSpec{ kFs, 512, 1 });
+    narrow.setTempoRange(100.0f, 240.0f);
+    const float* p = c.x.data();
+    const auto rn = narrow.analyze(AudioBufferView<const float>(&p, 1, static_cast<int>(c.x.size())));
+    std::cout << "  searched over 100..240 BPM: tempo " << static_cast<double>(rn.tempoBpm) << "\n";
+    EXPECT_TRUE(classify(static_cast<double>(rn.tempoBpm), 85.0, 2.0) == Level::Double);
+}
+
 // The incremental offline session must deliver exactly what analyze() does over
 // the concatenation, whatever the blocking: a caller decoding a file block by
 // block gets the same tempo, grid and confidence as one holding it whole. The

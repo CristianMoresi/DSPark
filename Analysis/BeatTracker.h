@@ -197,18 +197,28 @@
  * unambiguous case in the acceptance corpus untouched. See kAmbiguityFloor for
  * why it has a floor under it.
  *
- * ON RECORDED MUSIC. Measured with analyze() on the public ISMIR 2004 ballroom
- * set (454 thirty-second excerpts in nine dance styles, the tempo each song
- * is published at as the reference): the tempo is within 4% of the reference
- * on 65.6% of excerpts, and within 4% of it or of twice, three times, half or
- * a third of it on 92.1%. What separates the two figures is the metrical
- * level, in both directions: slow styles are reported at twice the reference
- * (rumba, slow waltz: 73 excerpts), fast ones at half of it (quickstep, cha
- * cha: 41). In most of those cases the reference is the secondary tempo. The
- * tapping preference that decides the level is at its best on this set as it
- * is (moving its centre or its widths in either direction loses excerpts),
- * and the level a dance is published at is a convention of the dance as much
- * as a property of the audio -- so where the level matters, offer
+ * ON RECORDED MUSIC. Measured with analyze() against the tempo each
+ * recording is annotated with, counting an estimate within 4% of it (and, in
+ * the second figure, within 4% of twice, three times, half or a third of it):
+ *
+ *   ISMIR 2004 ballroom set, 454 excerpts   75.8%   89.9%
+ *   Salsa Dataset, 122 recordings           68.9%   81.1%
+ *   Freesound Loops 4k, 3008 loops (*)      49.9%   67.1%
+ *
+ *   (*) each loop repeated to 20 s: many are shorter than the four beats
+ *       at the slowest tempo searched that analyze() needs to fit a tempo.
+ *
+ * What separates the two figures is the metrical level, and the level is
+ * decided by a model fitted to these three collections (see
+ * chooseMetricalLevel()); the figures above are therefore the fitted ones.
+ * Cross-validated, which is what to expect of recordings the fit has not
+ * seen, the level is right on 73.8%, 66.4% and 48.9% of them, against 63.2%,
+ * 50.0% and 43.7% for the tapping preference that decided it before. The
+ * cost is in the second figure on the ballroom set (92.1% before): a
+ * Viennese waltz read at one beat per bar is moved to two, which is no level
+ * of a three-beat bar, and the reading it moved from stays the secondary
+ * tempo. The level a dance is published at is a convention of the dance as
+ * much as a property of the audio -- so where the level matters, offer
  * secondaryTempoBpm to the user rather than trusting tempoBpm alone.
  *
  * Threading:
@@ -581,6 +591,12 @@ public:
         if (balanced) env_.swap(envBal_);
         if (!(tau1 > 0.0)) { resetState(); return out; }
 
+        // The ranking above proposes a reading; which multiple of it is the
+        // beat is settled by the level model (see chooseMetricalLevel()). Only
+        // where the signal has a pulse of its own in the range: otherwise the
+        // correlation decided on its own, and so it stays.
+        if (fundamentalFound_) chooseMetricalLevel(iLo, iHi, tau1, tau2);
+
         // The metrical level is decided against one period for the whole
         // signal, which is the stable model, and only then is the grid laid
         // down against a period that is allowed to move.
@@ -911,12 +927,78 @@ private:
     /// half of it, which is why the width above the centre tempo is the tight
     /// one and the width below it is the search prior's own.
     ///
-    /// The two widths are the only free parameters in the level decision and
-    /// they were chosen by measurement over both directions of the metrical
-    /// corpus, not by citation; the frontier they produce is stated as a
-    /// measured amplitude in setTightness()'s neighbour, getConfidence().
+    /// The two widths are the only free parameters in the level the ranking
+    /// proposes, and they were chosen by measurement over both directions of
+    /// the metrical corpus, not by citation; the frontier they produce is
+    /// stated as a measured amplitude in setTightness()'s neighbour,
+    /// getConfidence(). On recorded music the proposal is then revisited by
+    /// the level model (see kLevelWeights).
     static constexpr double kTactusFastOctaves = 0.45;
     static constexpr double kTactusSlowOctaves = kPriorWidthOctaves;
+
+    /// The metrical-level model (see chooseMetricalLevel()): three readings,
+    /// the proposed period halved, as proposed and doubled, each scored as a
+    /// weighted sum of eighteen measurements, of the same eighteen less the
+    /// proposed reading's, and of its log tempo squared, plus a bias per
+    /// reading; the highest score is the beat.
+    ///
+    /// The eighteen, in order: log2 of the tempo over 120 BPM; the pulse share
+    /// (pulseShare()) at the period of the full envelope, of the
+    /// register-balanced envelope and of the four register envelopes; the
+    /// share at twice the period of the full envelope and of the four
+    /// registers; the repetition (repetition()) of the full and of the balanced
+    /// envelope at the period; the share at three times the period of the full
+    /// envelope and of the lowest register; the share of the balanced envelope
+    /// at twice and at three times the period.
+    ///
+    /// Fitted by multinomial logistic regression (L2 penalty 0.003 on
+    /// standardised measurements, folded back into these weights; a reading
+    /// outside 40..240 BPM excluded from the softmax as it is from the choice)
+    /// to three public tempo-annotated collections, each weighted equally
+    /// whatever its size: the ISMIR 2004 ballroom set (454 excerpts), the
+    /// Salsa Dataset (122 recordings, tempo from the beat annotations) and
+    /// Freesound Loops 4k (3008 loops). Five-fold cross-validated, with the
+    /// contrast floor below in force, the reading chosen is within 4% of the
+    /// annotation on 73.8%, 66.4% and 48.9% of them respectively, where the
+    /// tapping preference alone chose 63.2%, 50.0% and 43.7%.
+    static constexpr int kLevelCandidates = 3;
+    static constexpr int kLevelMiddle = 1;
+    static constexpr size_t kLevelRawFeatures = 18;
+    static constexpr size_t kLevelShareAtPeriod = 1;   ///< Full envelope, at the period.
+    static constexpr size_t kLevelShareAtDouble = 7;   ///< Full envelope, at twice it.
+    static constexpr std::array<double, kLevelCandidates> kLevelMultiples = { 0.5, 1.0, 2.0 };
+    static constexpr std::array<double, kLevelCandidates> kLevelBias = {
+        -0.975336646, +0.092188351, +0.883148294 };
+    static constexpr std::array<double, 2 * kLevelRawFeatures + 1> kLevelWeights = {
+        // Each reading on its own:
+        -0.542395096, -0.584902910, +0.498236961,
+        +2.173179030, +0.290865194, +0.064019696,
+        -0.056958253, -1.551139582, +2.419398334,
+        +0.999335380, +1.771192530, +1.715518634,
+        -0.269329648, -0.242521186, +0.512883972,
+        +2.417326254, -4.177049390, -0.658688841,
+        // The same, relative to the proposed reading:
+        -0.740402303, -0.614477620, +0.536878776,
+        +2.283943101, +0.321349606, +0.070567309,
+        -0.060601959, -1.661774996, +2.331723324,
+        +1.031193638, +1.895745003, +1.908437878,
+        -0.571387423, -0.456177537, +0.860604058,
+        +4.361899112, -4.360371230, -0.993521862,
+        // Log tempo squared: the tapping preference.
+        -2.979577030 };
+    /// Least contrast between alternate beats of the proposed reading --
+    /// pulseShare() at twice its period over pulseShare() at its period --
+    /// for the level model to be consulted at all. The model reads the
+    /// relations between metrical levels, and where alternate beats are
+    /// indistinguishable there are none to read: the level above the proposal
+    /// has no accent to find, and the level below it adds events the signal
+    /// does not have. Every signal of the acceptance corpus (clicks, swing,
+    /// quiet subdivisions) measures 0.07 or less, where the proposal is right
+    /// by construction; 98% of the ballroom and salsa recordings and 85% of
+    /// the loops measure more. Below the floor the proposal stands.
+    static constexpr double kLevelContrastFloor = 0.1;
+    /// Window of pulseShare(), in periods of the pulse it measures.
+    static constexpr double kLevelWindowBeats = 8.0;
 
     /// Dynamic-programming tightness. See setTightness() for what the number
     /// is, where it comes from and why it is a default rather than a constant.
@@ -1559,6 +1641,7 @@ private:
         tau1 = 0.0;
         tau2 = 0.0;
         secondaryShare_ = 0.0;
+        fundamentalFound_ = false;
 
         const int n = static_cast<int>(env_.size());
         const int lagLo = std::max(1, static_cast<int>(std::floor(
@@ -1650,6 +1733,7 @@ private:
         for (size_t k = 0; k < candidates_.size(); ++k)
             if (coherence(refineLag(candidates_[k])) >= kMinFundamentalCoherence)
             { anyFundamental = true; break; }
+        fundamentalFound_ = anyFundamental;
         if (!anyFundamental)
         {
             k1 = 0;
@@ -1701,6 +1785,134 @@ private:
         if (!(std::abs(den) > 0.0)) return static_cast<double>(lag);
         const double d = std::clamp(0.5 * (a - c) / den, -0.5, 0.5);
         return static_cast<double>(lag) + d;
+    }
+
+    /**
+     * @brief Settles the metrical level: which of the proposed period, its
+     *        half and its double is the beat.
+     *
+     * The three readings explain the same events, so what separates them is
+     * how each one's pulse sits in the signal -- whether the bass and the
+     * cymbals keep it too, whether the level above it is as regular as it
+     * is -- and at what rate a listener taps. A hand-tuned tapping preference
+     * gets the level right on 63% of the ballroom set and can be moved
+     * nowhere that gets more right; the relations between these measurements
+     * carry what the preference alone does not, and their weights are fitted
+     * to annotated recordings rather than chosen (see kLevelWeights).
+     *
+     * Nothing moves where the proposal's alternate beats cannot be told apart
+     * (kLevelContrastFloor). A reading outside the range in force is never
+     * chosen. When the level moves, the reading it moved from becomes the
+     * reported alternative.
+     */
+    void chooseMetricalLevel(int iLo, int iHi, double& tau1, double& tau2) const
+    {
+        const double pMin = bankPeriod_[static_cast<size_t>(iLo)];
+        const double pMax = bankPeriod_[static_cast<size_t>(iHi)];
+        const std::vector<double>& bal = (envBal_.size() == env_.size()) ? envBal_ : env_;
+
+        std::array<std::array<double, kLevelRawFeatures>, kLevelCandidates> raw {};
+        for (int c = 0; c < kLevelCandidates; ++c)
+        {
+            const double p = tau1 * kLevelMultiples[static_cast<size_t>(c)];
+            auto& f = raw[static_cast<size_t>(c)];
+            size_t k = 0;
+            f[k++] = std::log2(periodToBpm(p) / 120.0);
+            f[k++] = pulseShare(env_, p);
+            f[k++] = pulseShare(bal, p);
+            for (const auto& r : envReg_) f[k++] = pulseShare(r, p);
+            f[k++] = pulseShare(env_, 2.0 * p);
+            for (const auto& r : envReg_) f[k++] = pulseShare(r, 2.0 * p);
+            f[k++] = repetition(env_, p);
+            f[k++] = repetition(bal, p);
+            f[k++] = pulseShare(env_, 3.0 * p);
+            f[k++] = pulseShare(envReg_[0], 3.0 * p);
+            f[k++] = pulseShare(bal, 2.0 * p);
+            f[k++] = pulseShare(bal, 3.0 * p);
+        }
+
+        const auto& m = raw[static_cast<size_t>(kLevelMiddle)];
+        if (!(m[kLevelShareAtPeriod] > 0.0)
+            || m[kLevelShareAtDouble] < kLevelContrastFloor * m[kLevelShareAtPeriod])
+            return;
+
+        int best = -1;
+        double bestScore = 0.0;
+        for (int c = 0; c < kLevelCandidates; ++c)
+        {
+            const double p = tau1 * kLevelMultiples[static_cast<size_t>(c)];
+            if (c != kLevelMiddle && (p < pMin || p > pMax)) continue;
+            const auto& f = raw[static_cast<size_t>(c)];
+            double s = kLevelBias[static_cast<size_t>(c)];
+            for (size_t j = 0; j < kLevelRawFeatures; ++j)
+                s += kLevelWeights[j] * f[j]
+                   + kLevelWeights[kLevelRawFeatures + j] * (f[j] - m[j]);
+            s += kLevelWeights[2 * kLevelRawFeatures] * f[0] * f[0];
+            if (best < 0 || s > bestScore) { best = c; bestScore = s; }
+        }
+        if (best != kLevelMiddle)
+        {
+            tau2 = tau1;
+            tau1 *= kLevelMultiples[static_cast<size_t>(best)];
+        }
+    }
+
+    /**
+     * @brief Share of an envelope's mass in phase with a pulse of the given
+     *        period, over half-overlapping windows of kLevelWindowBeats.
+     *
+     * The level model's own measure, deliberately not coherence(): it weights
+     * each window by its mass rather than counting windows equally, so quiet
+     * passages do not speak as loudly as the groove, and it clips at zero
+     * rather than reading the conditioned envelope's dips as anti-phase
+     * pulses. The weights were fitted to exactly this measure.
+     */
+    [[nodiscard]] static double pulseShare(const std::vector<double>& e,
+                                           double periodFrames) noexcept
+    {
+        const int n = static_cast<int>(e.size());
+        const int win = static_cast<int>(kLevelWindowBeats * periodFrames);
+        if (win < 4) return 0.0;
+        const double w = 2.0 * static_cast<double>(pi<double>) / periodFrames;
+        const double dc = std::cos(w), ds = std::sin(w);
+        double acc = 0.0, mass = 0.0;
+        for (int start = 0; start + win <= n; start += win / 2)
+        {
+            // The phasor is seeded exactly at each window start and rotated
+            // within it; over one window the rotation's rounding is far
+            // below anything the features resolve.
+            double c = std::cos(w * static_cast<double>(start));
+            double s = std::sin(w * static_cast<double>(start));
+            double re = 0.0, im = 0.0, m = 0.0;
+            for (int i = start; i < start + win; ++i)
+            {
+                const double v = std::max(0.0, e[static_cast<size_t>(i)]);
+                re += v * c;
+                im += v * s;
+                m += v;
+                const double cn = c * dc - s * ds;
+                s = s * dc + c * ds;
+                c = cn;
+            }
+            if (m > 0.0) { acc += std::sqrt(re * re + im * im); mass += m; }
+        }
+        return (mass > 0.0) ? acc / mass : 0.0;
+    }
+
+    /** @brief Normalised autocorrelation of an envelope at the nearest whole
+     *         lag to the period, unbiased for the overlap it is taken over. */
+    [[nodiscard]] static double repetition(const std::vector<double>& e,
+                                           double periodFrames) noexcept
+    {
+        const int n = static_cast<int>(e.size());
+        const int lag = static_cast<int>(std::lround(periodFrames));
+        if (lag <= 0 || lag >= n) return 0.0;
+        double s0 = 0.0, s = 0.0;
+        for (int i = 0; i < n; ++i) s0 += e[static_cast<size_t>(i)] * e[static_cast<size_t>(i)];
+        for (int i = 0; i + lag < n; ++i)
+            s += e[static_cast<size_t>(i)] * e[static_cast<size_t>(i + lag)];
+        return (s0 > 0.0) ? s / s0 * static_cast<double>(n) / static_cast<double>(n - lag)
+                          : 0.0;
     }
 
     /**
@@ -2274,6 +2486,7 @@ private:
     std::vector<double> env_;
     std::vector<int64_t> envRef_;
     static constexpr int kRegisters = OnsetDetector<T>::kNumRegisters;
+    static_assert(kRegisters == 4, "the level model (kLevelWeights) reads four register envelopes");
     std::array<std::vector<double>, kRegisters> envReg_;   ///< Per-register envelopes (offline).
     std::vector<double> envBal_;   ///< Register-balanced envelope: decides the metrical level.
     double alphaScale_ = 1.0;      ///< Tightness multiplier for the grid being built.
@@ -2283,6 +2496,7 @@ private:
     std::vector<int> candidates_;
     std::vector<double> candScore_, candExplains_;
     double secondaryShare_ = 0.0;
+    bool fundamentalFound_ = false;   ///< Last ranking had a pulse in range.
 
     // Published state.
     std::atomic<bool> prepared_ { false };

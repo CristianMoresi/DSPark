@@ -241,8 +241,8 @@ public:
      *  1x). The model itself is minimum-phase IIR and memoryless NR. */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
 
-    /** @brief Alias of getLatency() under the framework-wide latency-reporter
-     *  name, so ProcessorChain::getLatency() includes this stage. */
+    /** @brief Same value as getLatency(), under the name Saturation and the
+     *  analysis classes use. ProcessorChain::getLatency() reads getLatency(). */
     [[nodiscard]] int getLatencySamples() const noexcept { return latency_; }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */

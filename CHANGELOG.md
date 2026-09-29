@@ -110,8 +110,8 @@ All notable user-facing changes to DSPark are documented here.
   down at +24 dB; at 2x the worst fold below 20 kHz over 1-15 kHz tones is
   83.4 and 59.4 dB down. `getLatency()` is no longer a static constant: it
   reports the oversampler's delay (64 samples at 2x, 0 at 1x),
-  `getLatencySamples()` is added for chains, the dry path of the mix is
-  delayed to match, and blocks longer than the prepared maximum are
+  `getLatencySamples()` returns the same value as on TapeMachine and
+  TubePreamp, the dry path of the mix is delayed to match, and blocks longer than the prepared maximum are
   processed in pieces. DSParkLab's Saturation and Transformer slots start at
   the library's 2x.
 - `Saturation` oversamples 2x by default (it was 1x, the one saturator in

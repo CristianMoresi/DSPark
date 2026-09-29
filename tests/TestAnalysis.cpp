@@ -2027,7 +2027,12 @@ DelayCase makeDelayCase(bool coloured, double delay, double snrDb, double gain, 
     for (const double v : y) p += v * v;
     const double noise = std::sqrt(p / static_cast<double>(n) * std::pow(10.0, -snrDb / 10.0));
     for (auto& v : y) v = gain * (v + noise * gauss());
-    return { std::vector<float>(x.begin(), x.end()), std::vector<float>(y.begin(), y.end()) };
+    auto toFloat = [](const std::vector<double>& v) {
+        std::vector<float> f(v.size());
+        for (size_t i = 0; i < v.size(); ++i) f[i] = static_cast<float>(v[i]);
+        return f;
+    };
+    return { toFloat(x), toFloat(y) };
 }
 
 DelayEstimator<float>::Result estimateDelay(const DelayCase& c, int maxDelay)

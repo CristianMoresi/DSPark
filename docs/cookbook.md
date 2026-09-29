@@ -220,12 +220,18 @@ default to internal oversampling and expose the same control (`setOversampling`
 is setup-thread only on both - it reallocates and re-calibrates like
 `prepare()`):
 
-- `TapeMachine` **defaults to 4x**. The AC-bias carrier sits at 0.375x the
-  internal rate, so 4x/48k puts it ultrasonic (72 kHz) with its even folds
-  killed by the downsampler. CPU scales ~linearly with the factor (4x is the
-  reference cost of physical AC bias). `setOversampling(1)` turns the resampler
-  off (zero added latency) but then drops the carrier in-band (18 kHz at 48k) -
-  use 1x only under a high host rate or an already-oversampled section.
+- `TapeMachine` **defaults to 4x**. The AC-bias carrier sits at a quarter of
+  the internal rate, so 4x/48k puts it ultrasonic (48 kHz), and every harmonic
+  the hysteresis draws from it folds onto 0, the carrier or the internal
+  Nyquist frequency, where the downsampler removes its products with the
+  programme. CPU scales ~linearly with the factor (4x is the reference cost of
+  physical AC bias). `setOversampling(1)` turns the resampler off (zero added
+  latency) but then drops the carrier in-band (12 kHz at 48k) - use 1x only
+  under a high host rate or an already-oversampled section.
+- `Saturation` **defaults to 2x**: at 1x its curves fold their harmonics back
+  into the band (a 10.1 kHz tone at -6 dBFS through the default SoftClip left
+  an alias 34 dB down; 124 dB down at 2x). `setOversampling(1)` gives zero
+  latency for material that never reaches the curve's knee.
 - `TubePreamp` **defaults to 2x**. The triode + WDF tone solve runs `factor`x
   oversampled; 4x roughly doubles the 2x CPU, 1x is the cheapest and adds zero
   latency but lets the grid nonlinearity alias in-band. `getLatency()` reports
@@ -235,8 +241,8 @@ is setup-thread only on both - it reallocates and re-calibrates like
   drops to 0. Always query `getLatency()` for the active factor rather than
   assuming a value.
 
-`Saturation`, `Clipper` and `Core/WaveshapeTable` also expose `setOversampling`
-(all defaulting to 1x=off); `WaveshapeTable` is a memoryless table (no ADAA), so
+`Clipper` and `Core/WaveshapeTable` also expose `setOversampling` (both
+defaulting to 1x=off); `WaveshapeTable` is a memoryless table (no ADAA), so
 its Hermite interpolation reduces table noise but not aliasing - oversample it
 to suppress alias products.
 The `Compressor` does NOT run an internal audio-path resampler: its optional

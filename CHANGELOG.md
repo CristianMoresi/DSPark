@@ -94,6 +94,12 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `Saturation` oversamples 2x by default (it was 1x, the one saturator in
+  the framework that did not): at 1x a 10.1 kHz tone at -6 dBFS through
+  the default SoftClip left an alias at 17.7 kHz only 34 dB down, at 2x it
+  measures 124 dB down. The oversampler adds 64 samples of latency at 48
+  kHz, reported by `getLatency()`; `setOversampling(1)` restores zero
+  latency.
 - `Compressor::DetectorType::Hilbert` detects on the zero-latency allpass
   pair (`HilbertIIR`), backed by the rectified input at onsets, instead of
   the 191-tap FIR. The FIR was blind below about 200 Hz, so low tones were

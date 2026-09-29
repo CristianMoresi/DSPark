@@ -17,15 +17,18 @@
  * Threading: prepare(), reset(), the integer queries and processBlock() belong
  * to the stream owner. setFrozen(), isFrozen(), setPhaseMode() and
  * getPhaseMode() are lock-free and may be called from any thread. Processing,
- * setters and queries allocate no memory after prepare().
+ * setters and queries allocate no memory after prepare(). getState() and
+ * setState() belong to the setup/UI threads (they allocate).
  *
- * Dependencies: AudioBuffer.h, AudioSpec.h, DspMath.h, SpectralProcessor.h.
+ * Dependencies: AudioBuffer.h, AudioSpec.h, DspMath.h, SpectralProcessor.h,
+ * StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/DspMath.h"
 #include "../Core/SpectralProcessor.h"
+#include "../Core/StateBlob.h"
 
 #include <algorithm>
 #include <array>
@@ -165,6 +168,29 @@ public:
         return (requested_.load(std::memory_order_relaxed) & kDiffuseBit) != 0u
                    ? PhaseMode::Diffuse
                    : PhaseMode::Tonal;
+    }
+
+    /** @brief Serializes the requested freeze state and phase mode
+     *  (setup/UI threads; allocates). The FFT and hop sizes are prepare()
+     *  arguments and are not part of it. */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("SFRZ"), 1);
+        w.write("frozen", isFrozen());
+        w.write("diffuse", getPhaseMode() == PhaseMode::Diffuse);
+        return w.blob();
+    }
+
+    /** @brief Restores the freeze request and phase mode from a blob (tolerant;
+     *  rejects foreign ids). A restored freeze behaves exactly as
+     *  setFrozen(true) does. */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("SFRZ")) return false;
+        setFrozen(r.read("frozen", false));
+        setPhaseMode(r.read("diffuse", false) ? PhaseMode::Diffuse : PhaseMode::Tonal);
+        return true;
     }
 
     /** @brief Returns the exact input-signal latency, or zero before prepare. */

@@ -226,6 +226,51 @@ DSPARK_TEST(State_roundtrip_new_effects)
     })));
 }
 
+// The two effects that had no state: every setting survives the trip, a blob
+// from another effect is refused, and a refused blob changes nothing.
+DSPARK_TEST(State_roundtrip_pitch_corrector_and_spectral_freeze)
+{
+    const AudioSpec sp = spec(48000.0, 512, 2);
+    {
+        auto a = std::make_unique<PitchCorrector<float>>();
+        auto b = std::make_unique<PitchCorrector<float>>();
+        a->prepare(sp);
+        b->prepare(sp);
+        a->setScale(0x0AB5, 9);   // major mask rooted at A
+        a->setRetuneSpeedMs(60.0f);
+        a->setFormantPreserve(true);
+        const auto blob = a->getState();
+        EXPECT_TRUE(b->setState(blob.data(), blob.size()));
+        EXPECT_EQ(static_cast<int>(b->getScaleMask()), 0x0AB5);
+        EXPECT_EQ(b->getRootPitchClass(), 9);
+        EXPECT_NEAR(b->getRetuneSpeedMs(), 60.0f, 1e-6f);
+        EXPECT_TRUE(b->getFormantPreserve());
+        EXPECT_TRUE(blobsEqual(blob, b->getState()));
+
+        Chorus<float> other;
+        const auto foreign = other.getState();
+        EXPECT_FALSE(b->setState(foreign.data(), foreign.size()));
+        EXPECT_EQ(b->getRootPitchClass(), 9);
+    }
+    {
+        SpectralFreeze<float> a, b;
+        a.prepare(sp);
+        b.prepare(sp);
+        a.setFrozen(true);
+        a.setPhaseMode(SpectralFreeze<float>::PhaseMode::Diffuse);
+        const auto blob = a.getState();
+        EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+        EXPECT_TRUE(b.isFrozen());
+        EXPECT_TRUE(b.getPhaseMode() == SpectralFreeze<float>::PhaseMode::Diffuse);
+        EXPECT_TRUE(blobsEqual(blob, b.getState()));
+
+        Chorus<float> other;
+        const auto foreign = other.getState();
+        EXPECT_FALSE(b.setState(foreign.data(), foreign.size()));
+        EXPECT_TRUE(b.isFrozen());
+    }
+}
+
 DSPARK_TEST(State_multiband_nested_blobs)
 {
     const AudioSpec sp = spec(48000.0, 512, 2);

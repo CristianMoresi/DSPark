@@ -210,7 +210,8 @@
  * getters are lock-free single-word atomics and may be called from any thread,
  * with one non-audio writer as everywhere in DSPark; the scale mask and its
  * root travel packed in one word, so a torn mask/root pair cannot exist.
- * prepare() belongs to the setup thread (it allocates). processBlock(),
+ * prepare() belongs to the setup thread (it allocates), and so do
+ * getState()/setState(), which allocate. processBlock(),
  * reset() and getLatency() belong to the stream owner. The inner detector and
  * shifter are private members whose control entry points are driven only by
  * the stream owner inside processBlock() and reset(); their own control-to-
@@ -219,7 +220,7 @@
  *
  * Dependencies: Analysis/PitchDetector.h, Effects/PitchShifter.h,
  * Music/HarmonyConstants.h, Core/AudioBuffer.h, Core/AudioSpec.h,
- * Core/DenormalGuard.h, Core/DspMath.h.
+ * Core/DenormalGuard.h, Core/DspMath.h, Core/StateBlob.h.
  */
 
 #include "../Analysis/PitchDetector.h"
@@ -227,6 +228,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
+#include "../Core/StateBlob.h"
 #include "../Music/HarmonyConstants.h"
 #include "PitchShifter.h"
 
@@ -235,6 +237,7 @@
 #include <cmath>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace dspark {
 
@@ -394,6 +397,31 @@ public:
     [[nodiscard]] bool getFormantPreserve() const noexcept
     {
         return formantPreserve_.load(std::memory_order_relaxed);
+    }
+
+    /** @brief Serializes the parameter state (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        StateWriter w(stateId("PCOR"), 1);
+        w.write("scaleMask", static_cast<int32_t>(getScaleMask()));
+        w.write("root", static_cast<int32_t>(getRootPitchClass()));
+        w.write("retuneMs", static_cast<float>(getRetuneSpeedMs()));
+        w.write("formant", getFormantPreserve());
+        return w.blob();
+    }
+
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids).
+     *  A missing field restores its default: chromatic from C, hard snap,
+     *  formants off. */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("PCOR")) return false;
+        setScale(static_cast<std::uint16_t>(r.read("scaleMask", int32_t(0x0FFF)) & 0x0FFF),
+                 r.read("root", int32_t(0)));
+        setRetuneSpeedMs(static_cast<T>(r.read("retuneMs", 0.0f)));
+        setFormantPreserve(r.read("formant", false));
+        return true;
     }
 
     /** @brief Reports the signal latency in samples: twice the analysis frame,

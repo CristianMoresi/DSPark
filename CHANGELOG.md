@@ -6,6 +6,10 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `PitchCorrector::getState()` / `setState()` (scale, root, retune speed,
+  formant preservation) and `SpectralFreeze::getState()` / `setState()`
+  (freeze request, phase mode): they were the two effects with settings
+  that a host could not save with a session.
 - `DelayEstimator`: the delay between two recordings of the same material
   (a delivery against its reference), found by GCC-PHAT on a cross-spectrum
   averaged over the whole program and refined on its phase slope to a

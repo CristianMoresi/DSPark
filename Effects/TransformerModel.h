@@ -38,7 +38,18 @@
  *   are ramped (~50 ms), which matters doubly here because the model
  *   differentiates its output.
  *
- * Zero latency. The Saturation effect's lightweight Transformer algorithm
+ * The core runs at 2x oversampling by DEFAULT, configurable with
+ * setOversampling(int) (setup thread only; it reallocates and re-calibrates
+ * like prepare()): 1 = off, zero latency; 2, 4, 8, 16 = the oversampler's
+ * group delay (64 samples at 2x, 96 at 4x), reported by getLatency(), with
+ * the dry path of the mix delayed to match. The loop's harmonics fall with
+ * frequency as flux does, but at the top of the band they are not small:
+ * over tones from 1 to 15 kHz at -6 and -18 dBFS and every core size, the
+ * worst harmonic folded back below 20 kHz at 48 kHz measures -61.3 dB at the
+ * default drive and -37.5 dB at +24 dB at 1x (a 10.1 kHz tone's third, at
+ * 17.7 kHz), -83.4 and -59.4 dB at 2x, -71 dB at +24 dB at 4x. Cost at 48
+ * kHz stereo on a desktop core: 1.9% at 1x, 4.4% at 2x, 8.4% at 4x.
+ * The Saturation effect's lightweight Transformer algorithm
  * remains as the cheap alternative; this is the physical one. Unlike the
  * biased tape core, the leaky flux integrator continuously re-centres the
  * loop, so the response is history-independent by construction (verified:
@@ -53,7 +64,7 @@
  * ramped at no more than full scale per 20 ms, whatever the block size. Channels beyond the prepared count pass through
  * untouched.
  *
- * Dependencies: Core/Hysteresis.h, Core/Biquad.h, Core/AudioSpec.h,
+ * Dependencies: Core/Hysteresis.h, Core/Oversampling.h, Core/Biquad.h, Core/AudioSpec.h,
  * Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h, Core/StateBlob.h.
  */
 
@@ -63,6 +74,7 @@
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/Hysteresis.h"
+#include "../Core/Oversampling.h"
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
@@ -70,6 +82,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <numbers>
 #include <vector>
 
@@ -95,9 +108,30 @@ public:
     {
         if (!spec.isValid()) return;
         prepared_.store(false, std::memory_order_relaxed);
-        sampleRate_ = spec.sampleRate;
-        mixMaxStep_ = static_cast<T>(1.0 / std::max(1.0, sampleRate_ * 0.02));
+        spec_ = spec;
+        // Everything but the mix runs at the internal rate: the active
+        // oversampling factor times the base rate.
+        sampleRate_ = static_cast<double>(osFactor_) * spec.sampleRate;
+        mixMaxStep_ = static_cast<T>(1.0 / std::max(1.0, spec.sampleRate * 0.02));
         numChannels_ = spec.numChannels;
+        maxBlock_ = std::max(spec.maxBlockSize, 1);
+
+        if (osFactor_ > 1)
+        {
+            oversampler_ = std::make_unique<Oversampling<T>>(
+                osFactor_, Oversampling<T>::Quality::High);
+            oversampler_->prepare(spec);
+        }
+        else
+        {
+            oversampler_.reset();
+        }
+        latency_ = oversampler_ ? oversampler_->getLatency() : 0;
+        drySize_ = 1;
+        while (drySize_ < latency_ + maxBlock_ + 1) drySize_ <<= 1;
+        dryRing_.assign(static_cast<size_t>(numChannels_),
+                        std::vector<T>(static_cast<size_t>(drySize_), T(0)));
+        dryPos_ = 0;
 
         channels_.assign(static_cast<size_t>(numChannels_), {});
         for (auto& ch : channels_)
@@ -127,6 +161,10 @@ public:
             ch.hpX = ch.hpY = 0.0;
             ch.bell = {};
         }
+        for (auto& d : dryRing_)
+            std::fill(d.begin(), d.end(), T(0));
+        dryPos_ = 0;
+        if (oversampler_) oversampler_->reset();
         // Seed the anti-zipper ramps at their targets: no fade-in on start.
         hScaleSm_ = -1.0;
         mScaleSm_ = -1.0;
@@ -163,8 +201,9 @@ public:
         dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Dry/wet mix [0, 1]; ramped over at least 20 ms. Zero
-     *  latency: no compensation needed. Non-finite values are ignored. */
+    /** @brief Dry/wet mix [0, 1]; the dry path is delayed to getLatency()
+     *  and the mix is ramped over at least 20 ms. Non-finite values are
+     *  ignored. */
     void setMix(T mix) noexcept
     {
         if (!std::isfinite(mix)) return;
@@ -176,23 +215,54 @@ public:
     [[nodiscard]] T getResonance() const noexcept { return resonance_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
 
-    /** @brief Zero - the model is all minimum-phase IIR and memoryless NR. */
-    [[nodiscard]] static constexpr int getLatency() noexcept { return 0; }
+    /**
+     * @brief Configures internal oversampling of the core. SETUP THREAD ONLY:
+     *  it reallocates the filters and re-runs the calibration exactly like
+     *  prepare(); never call it concurrently with processBlock().
+     *
+     * @param factor Power of two in {1, 2, 4, 8, 16}. 1 = off (zero latency;
+     *  the loop's harmonics above the base Nyquist then fold into the band).
+     *  2 is the default. Other values are ignored. getLatency() reflects the
+     *  new factor after this call.
+     */
+    void setOversampling(int factor)
+    {
+        if (factor < 1 || factor > 16 || (factor & (factor - 1)) != 0) return;
+        if (factor == osFactor_) return;
+        osFactor_ = factor;
+        if (prepared_.load(std::memory_order_relaxed))
+            prepare(spec_);
+    }
+
+    /** @brief Active oversampling factor (1 = off, 2 = default). */
+    [[nodiscard]] int getOversamplingFactor() const noexcept { return osFactor_; }
+
+    /** @brief Latency in samples: the active oversampler's group delay (0 at
+     *  1x). The model itself is minimum-phase IIR and memoryless NR. */
+    [[nodiscard]] int getLatency() const noexcept { return latency_; }
+
+    /** @brief Alias of getLatency() under the framework-wide latency-reporter
+     *  name, so ProcessorChain::getLatency() includes this stage. */
+    [[nodiscard]] int getLatencySamples() const noexcept { return latency_; }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
-        StateWriter w(stateId("XFMR"), 1);
+        StateWriter w(stateId("XFMR"), 2);
         // Explicit float casts: the blob stores float, and with T = double the
         // unqualified write(key, double) would be ambiguous (float/int32/bool).
         w.write("drive", static_cast<float>(driveDb_.load(std::memory_order_relaxed)));
         w.write("coreSize", static_cast<float>(coreSize_.load(std::memory_order_relaxed)));
         w.write("resonance", static_cast<float>(resonance_.load(std::memory_order_relaxed)));
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
+        w.write("oversampling", osFactor_);
         return w.blob();
     }
 
-    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids). */
+    /** @brief Restores parameters from a blob (tolerant; rejects foreign ids).
+     *  Setup thread: a stored oversampling factor other than the active one
+     *  re-prepares, as setOversampling() does. Blobs from before the factor
+     *  was stored restore the default, 2. */
     bool setState(const uint8_t* data, size_t size)
     {
         StateReader r(data, size);
@@ -201,12 +271,14 @@ public:
         setCoreSize(static_cast<T>(r.read("coreSize", 0.5f)));
         setResonance(static_cast<T>(r.read("resonance", 0.3f)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
+        setOversampling(r.read("oversampling", 2));
         return true;
     }
 
     // -- Processing -------------------------------------------------------------------
 
-    /** @brief Processes a block in-place. Pass-through until prepare() succeeds. */
+    /** @brief Processes a block in-place. Pass-through until prepare() succeeds.
+     *  Blocks longer than the prepared maximum are processed in pieces. */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
         if (!prepared_.load(std::memory_order_relaxed)) return;
@@ -222,6 +294,27 @@ public:
             && dirty_.exchange(false, std::memory_order_acquire))
             recompute();
 
+        for (int off = 0; off < nS; off += maxBlock_)
+            processChunk(buffer.getSubView(off, std::min(maxBlock_, nS - off)), nCh);
+    }
+
+private:
+    void processChunk(AudioBufferView<T> buffer, int nCh) noexcept
+    {
+        const int nS = buffer.getNumSamples();
+
+        // Non-finite guard: a NaN/Inf input would poison the leaky
+        // integrator (flux/vPrev), the algebraic inverse (vPrev2/mPrev), the
+        // DC-blocker (hpX/hpY), the bell and the oversampler permanently.
+        // Replace the bad sample with silence (dry too) so a transient glitch
+        // cannot kill the channel for the rest of the stream.
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* d = buffer.getChannel(ch);
+            for (int i = 0; i < nS; ++i)
+                if (!std::isfinite(d[i])) d[i] = T(0);
+        }
+
         // Rate-limited mix ramp (moveTowards, exact landing; settled it
         // reduces to the constant, bit-identically). A per-block ramp landed
         // in 0.7 ms with 32-sample blocks.
@@ -229,6 +322,23 @@ public:
         // steady-state sample delta.
         const T mixTarget = mix_.load(std::memory_order_relaxed);
         const T mixStart  = currentMix_;
+
+        // Dry snapshot, read back delayed to the oversampler's latency.
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            const T* in = buffer.getChannel(ch);
+            auto& dry = dryRing_[static_cast<size_t>(ch)];
+            int dp = dryPos_;
+            for (int i = 0; i < nS; ++i)
+            {
+                dry[static_cast<size_t>(dp)] = in[i];
+                dp = (dp + 1) & (drySize_ - 1);
+            }
+        }
+
+        const bool osOn = (oversampler_ != nullptr);
+        auto osView = osOn ? oversampler_->upsample(buffer) : buffer;
+        const int osN = osView.getNumSamples();
 
         // Anti-zipper: GEOMETRIC in-block ramps toward the recompute()
         // targets (~50 ms across blocks), shared by all channels. Two
@@ -239,29 +349,23 @@ public:
         // measured mid-drag), while power-law interpolation keeps the pair
         // on the calibration curve m ~ C/h^g throughout the transition.
         if (hScaleSm_ <= 0.0) { hScaleSm_ = hScale_; mScaleSm_ = mScale_; }
-        const double kSm = 1.0 - std::exp(-static_cast<double>(nS) / (0.050 * sampleRate_));
+        const double kSm = 1.0 - std::exp(-static_cast<double>(osN) / (0.050 * sampleRate_));
         const double hEnd = hScaleSm_ * std::pow(hScale_ / hScaleSm_, kSm);
         const double mEnd = mScaleSm_ * std::pow(mScale_ / mScaleSm_, kSm);
-        const double hRat = std::pow(hEnd / hScaleSm_, 1.0 / static_cast<double>(nS));
-        const double mRat = std::pow(mEnd / mScaleSm_, 1.0 / static_cast<double>(nS));
+        const double hRat = std::pow(hEnd / hScaleSm_, 1.0 / static_cast<double>(osN));
+        const double mRat = std::pow(mEnd / mScaleSm_, 1.0 / static_cast<double>(osN));
 
         for (int ch = 0; ch < nCh; ++ch)
         {
-            T* d = buffer.getChannel(ch);
+            T* d = osView.getChannel(ch);
             auto& st = channels_[static_cast<size_t>(ch)];
             double hSm = hScaleSm_, mSm = mScaleSm_;
 
-            for (int i = 0; i < nS; ++i)
+            for (int i = 0; i < osN; ++i)
             {
                 hSm *= hRat;
                 mSm *= mRat;
-                // Non-finite guard: a NaN/Inf input would poison the leaky
-                // integrator (flux/vPrev), the algebraic inverse (vPrev2/mPrev),
-                // the DC-blocker (hpX/hpY) and the bell permanently. Replace the
-                // bad sample with silence (dry too) so a transient glitch cannot
-                // kill the channel for the rest of the stream.
-                double x = static_cast<double>(d[i]);
-                if (!std::isfinite(x)) { x = 0.0; d[i] = T(0); }
+                const double x = static_cast<double>(d[i]);
 
                 // Leaky trapezoidal integrator: winding voltage -> flux.
                 const double fluxNew = leak_ * st.flux + halfT_ * (x + st.vPrev);
@@ -288,19 +392,29 @@ public:
                 st.hpY = hp;
 
                 // Leakage/capacitance bell.
-                const double y = st.bell.process(hp);
+                d[i] = static_cast<T>(st.bell.process(hp));
+            }
+        }
+        hScaleSm_ = hEnd;
+        mScaleSm_ = mEnd;
+        if (osOn) oversampler_->downsample(buffer);
 
-                const T wet = static_cast<T>(y);
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* d = buffer.getChannel(ch);
+            const auto& dry = dryRing_[static_cast<size_t>(ch)];
+            for (int i = 0; i < nS; ++i)
+            {
+                const int idx = (dryPos_ + i - latency_) & (drySize_ - 1);
+                const T drySample = dry[static_cast<size_t>(idx)];
                 const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + 1));
-                d[i] = d[i] + (wet - d[i]) * mixVal;
+                d[i] = drySample + (d[i] - drySample) * mixVal;
             }
         }
         currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS));
-        hScaleSm_ = hEnd;
-        mScaleSm_ = mEnd;
+        dryPos_ = (dryPos_ + nS) & (drySize_ - 1);
     }
 
-private:
     static constexpr double kDiffRho = 0.974;   ///< Differentiator pole damping.
 
     struct BellSection
@@ -398,8 +512,16 @@ private:
     }
 
     // -- Members --------------------------------------------------------------------
-    double sampleRate_ = 48000.0;
+    AudioSpec spec_ {};         ///< Last valid spec, for setOversampling().
+    double sampleRate_ = 48000.0;   ///< INTERNAL rate: factor x base rate.
     int numChannels_ = 0;
+    int maxBlock_ = 1;
+    int osFactor_ = 2;          ///< Oversampling factor (setup thread; 1 = off).
+    int latency_ = 0;
+    std::unique_ptr<Oversampling<T>> oversampler_;
+    std::vector<std::vector<T>> dryRing_;   ///< Per-channel dry history.
+    int drySize_ = 1;
+    int dryPos_ = 0;
     std::atomic<bool> prepared_ { false };
 
     std::vector<ChannelState> channels_;

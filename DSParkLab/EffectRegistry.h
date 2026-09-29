@@ -467,8 +467,8 @@ inline EffectSlot makeSaturation()
     // it reallocates the polyphase filters, which is not safe to do concurrently
     // with process() from the UI thread. osWanted is set by the UI, osApplied is
     // reconciled inside process() where nothing else touches the processor.
-    auto osWanted  = std::make_shared<std::atomic<int>>(1);
-    auto osApplied = std::make_shared<std::atomic<int>>(1);
+    auto osWanted  = std::make_shared<std::atomic<int>>(2);   // the library default
+    auto osApplied = std::make_shared<std::atomic<int>>(2);
     EffectSlot s;
     s.name = "Saturation"; s.category = "Distortion";
     // Algorithm indices MUST match dspark::Saturation<float>::Algorithm enum order.
@@ -483,7 +483,7 @@ inline EffectSlot makeSaturation()
     s.addSlider("Output", -24, 12, 0, "dB");
     s.addToggle("Adaptive Blend", false);
     s.addSlider("Slew Sensitivity", 0, 1, 0, "");
-    s.addChoice("Oversampling", {"Off","2x","4x","8x","16x"}, 0);  // index 6
+    s.addChoice("Oversampling", {"Off","2x","4x","8x","16x"}, 1);  // index 6
     s.prepareFn = [p, osApplied](auto& sp) {
         p->setOversampling(osApplied->load(std::memory_order_relaxed));
         p->prepare(sp);
@@ -1227,21 +1227,38 @@ inline EffectSlot makeTubePreamp()
 inline EffectSlot makeTransformerModel()
 {
     auto p = std::make_shared<dspark::TransformerModel<float>>();
+    // setOversampling() re-prepares, which is not safe concurrently with
+    // process() from the UI thread: the UI sets osWanted and process()
+    // reconciles it, as the Saturation slot does.
+    auto osWanted  = std::make_shared<std::atomic<int>>(2);   // the library default
+    auto osApplied = std::make_shared<std::atomic<int>>(2);
     EffectSlot s;
     s.name = "Transformer"; s.category = "Analog";
     s.addSlider("Drive", -12, 24, 0, "dB");
     s.addSlider("Core Size", 0, 1, 0.5f, "");
     s.addSlider("Resonance", 0, 1, 0.3f, "");
     s.addSlider("Mix", 0, 1, 1, "");
-    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
-    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.addChoice("Oversampling", {"Off","2x","4x","8x","16x"}, 1);  // index 4
+    s.prepareFn = [p, osApplied](auto& sp) {
+        p->setOversampling(osApplied->load(std::memory_order_relaxed));
+        p->prepare(sp);
+    };
+    s.processFn = [p, osWanted, osApplied](auto b) {
+        const int want = osWanted->load(std::memory_order_relaxed);
+        if (want != osApplied->load(std::memory_order_relaxed)) {
+            p->setOversampling(want);   // re-prepares - safe here (audio thread, no concurrent process)
+            osApplied->store(want, std::memory_order_relaxed);
+        }
+        p->processBlock(b);
+    };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p](int i, float v) {
+    s.setParamFn = [p, osWanted](int i, float v) {
         switch (i) {
             case 0: p->setDrive(v); break;
             case 1: p->setCoreSize(v); break;
             case 2: p->setResonance(v); break;
             case 3: p->setMix(v); break;
+            case 4: { static constexpr int f[] = {1,2,4,8,16}; osWanted->store(f[std::clamp(static_cast<int>(v),0,4)], std::memory_order_relaxed); break; }
         }
     };
     return s;

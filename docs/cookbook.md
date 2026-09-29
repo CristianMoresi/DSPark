@@ -114,7 +114,10 @@ tape.processBlock(buffer);
 
 All three are physical models (Koren triode + WDF FMV tone stack;
 flux-domain and tape-calibrated Jiles-Atherton hysteresis), loudness-
-compensated: drive moves saturation, not volume.
+compensated: drive moves saturation, not volume. Each oversamples its own
+nonlinear core (tube and transformer 2x, tape 4x by default;
+`setOversampling(1)` turns it off), so report the sum of the three
+`getLatency()` values to the host.
 
 ## 6. Synth voice (sync lead with granular air)
 

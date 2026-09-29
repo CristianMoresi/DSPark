@@ -1816,7 +1816,8 @@ std::vector<MetricsCase> buildMetricsCases()
 
     { auto p = std::make_shared<dspark::TransformerModel<float>>();
       p->prepare(spec); p->setDrive(0.0f);
-      add("TransformerModel", "drive 0 dB", "", [p](V b){ p->processBlock(b); }); }
+      add("TransformerModel", "drive 0 dB", "", [p](V b){ p->processBlock(b); },
+          [p]{ return p->getLatency(); }); }
 
     { auto p = std::make_shared<dspark::Chorus<float>>();
       p->prepare(spec); p->setRate(0.8f); p->setMix(0.5f);

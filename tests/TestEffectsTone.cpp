@@ -1870,6 +1870,86 @@ DSPARK_TEST(TransformerModel_program_level_transparent)
     EXPECT_NEAR(20.0 * std::log10(g), 0.0, 2.0);
 }
 
+// The loop's third harmonic of a 10.1 kHz tone is at 30.3 kHz: at 1x it
+// folds to 17.7 kHz, at the 2x default it is removed by the downsampler. One
+// second of a tone on a whole number of hertz puts both on exact DFT bins.
+DSPARK_TEST(TransformerModel_oversampling_keeps_folded_harmonics_out)
+{
+    auto foldedDb = [](int factor, int& latency) {
+        TransformerModel<double> tr;
+        tr.setOversampling(factor);
+        tr.prepare(AudioSpec{ 48000.0, 512, 1 });
+        tr.setDrive(24.0);
+        tr.setCoreSize(0.0);
+        latency = tr.getLatency();
+        std::vector<double> x(96000);
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = 0.5 * std::sin(2.0 * 3.14159265358979 * 10103.0 * static_cast<double>(i) / 48000.0);
+        for (size_t off = 0; off < x.size(); off += 512)
+        {
+            double* p = x.data() + off;
+            tr.processBlock(AudioBufferView<double>(&p, 1, static_cast<int>(std::min<size_t>(512, x.size() - off))));
+        }
+        auto bin = [&](double f) {
+            double re = 0.0, im = 0.0;
+            for (size_t i = 48000; i < 96000; ++i)
+            {
+                const double ph = 2.0 * 3.14159265358979 * f * static_cast<double>(i - 48000) / 48000.0;
+                re += x[i] * std::cos(ph);
+                im += x[i] * std::sin(ph);
+            }
+            return std::sqrt(re * re + im * im);
+        };
+        return 20.0 * std::log10(bin(17691.0) / bin(10103.0));
+    };
+    int lat1 = -1, lat2 = -1;
+    const double at1x = foldedDb(1, lat1);
+    const double at2x = foldedDb(2, lat2);
+    std::cout << "  10.1 kHz third folded to 17.7 kHz: " << at1x << " dB at 1x (latency "
+              << lat1 << "), " << at2x << " dB at 2x (latency " << lat2 << ")\n";
+    EXPECT_GT(at1x, -45.0);    // the defect the default removes: -37.5 dB
+    EXPECT_LT(at2x, -90.0);
+    EXPECT_EQ(lat1, 0);
+    EXPECT_GT(lat2, 0);
+}
+
+// Fully dry, the output is the input delayed by exactly getLatency(), at
+// every factor and whatever the blocking; the factor travels in the state.
+DSPARK_TEST(TransformerModel_dry_path_matches_the_reported_latency)
+{
+    for (const int factor : { 1, 2, 4 })
+    {
+        TransformerModel<float> tr;
+        tr.setOversampling(factor);
+        tr.setMix(0.0f);   // before prepare(), which seeds the mix ramp at its target
+        tr.prepare(AudioSpec{ 48000.0, 256, 1 });
+        const int lat = tr.getLatency();
+        std::vector<float> x(4000), y;
+        for (size_t i = 0; i < x.size(); ++i) x[i] = 0.3f * std::sin(0.037f * static_cast<float>(i));
+        y = x;
+        size_t off = 0;
+        for (const int len : { 1, 700, 256, 33, 2000, 1010 })   // 700 and 2000 exceed the prepared maximum
+        {
+            float* p = y.data() + off;
+            tr.processBlock(AudioBufferView<float>(&p, 1, len));
+            off += static_cast<size_t>(len);
+        }
+        double worst = 0.0;
+        for (size_t i = static_cast<size_t>(lat); i < x.size(); ++i)
+            worst = std::max(worst, std::abs(static_cast<double>(y[i] - x[i - static_cast<size_t>(lat)])));
+        EXPECT_LT(worst, 1e-7);
+        EXPECT_EQ(tr.getOversamplingFactor(), factor);
+    }
+
+    TransformerModel<float> a, b;
+    a.setOversampling(4);
+    b.prepare(AudioSpec{ 48000.0, 512, 2 });
+    const auto blob = a.getState();
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_EQ(b.getOversamplingFactor(), 4);
+    EXPECT_EQ(b.getLatency(), b.getLatencySamples());
+}
+
 DSPARK_TEST(TransformerModel_stable_under_bursts)
 {
     TransformerModel<float> tr;

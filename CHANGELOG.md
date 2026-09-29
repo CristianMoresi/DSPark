@@ -107,6 +107,18 @@ All notable user-facing changes to DSPark are documented here.
   level, the reading it moved from is `secondaryTempoBpm`. On the ballroom
   set the half/double/triple-tolerant figure goes from 92.1% to 89.9%:
   Viennese waltzes read at one beat per bar are moved to two.
+- `TransformerModel` oversamples its core 2x by default, with
+  `setOversampling()` (1, 2, 4, 8, 16), `getOversamplingFactor()` and the
+  factor saved in the state (older blobs restore 2x). At 1x the loop's
+  harmonics of high tones folded back into the band: a 10.1 kHz tone at -6
+  dBFS put its third at 17.7 kHz 61 dB down at the default drive and 37.5 dB
+  down at +24 dB; at 2x the worst fold below 20 kHz over 1-15 kHz tones is
+  83.4 and 59.4 dB down. `getLatency()` is no longer a static constant: it
+  reports the oversampler's delay (64 samples at 2x, 0 at 1x),
+  `getLatencySamples()` is added for chains, the dry path of the mix is
+  delayed to match, and blocks longer than the prepared maximum are
+  processed in pieces. DSParkLab's Saturation and Transformer slots start at
+  the library's 2x.
 - `Saturation` oversamples 2x by default (it was 1x, the one saturator in
   the framework that did not): at 1x a 10.1 kHz tone at -6 dBFS through
   the default SoftClip left an alias at 17.7 kHz only 34 dB down, at 2x it

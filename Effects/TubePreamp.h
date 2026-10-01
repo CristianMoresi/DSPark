@@ -44,45 +44,60 @@
  * The nonlinear core runs at 2x oversampling by DEFAULT, and the factor is
  * configurable via setOversampling(int) (setup thread only, since it
  * reallocates and re-calibrates like prepare()): 1 = OFF (no internal
- * resampling, zero added latency, but the triode/grid nonlinearity then
+ * resampling or ADAA, zero added latency, but the triode/grid nonlinearity then
  * aliases in-band unless you oversample the surrounding chain yourself), 2 =
  * default (group-delay latency reported by getLatency()/getLatencySamples()),
- * 4/8/16 = progressively lower alias floor with higher processing cost. The
- * whole circuit runs at the selected factor; the interpolation speeds up
- * the load-line calculation but does not itself remove aliasing.
+ * 4/8/16 = progressively lower alias floor with higher processing cost.
+ * At factors >= 2, each stage antialiases the grid clamp and the implicit
+ * plate-current interpolant with antiderivative antialiasing: the grid uses
+ * the second-order divided difference (Bilbao et al., IEEE SPL 2017), and
+ * the current uses the exact first integral of its bicubic surface.
+ * Supply and cathode history are held fixed across each current
+ * integral; the averaged current advances the cathode and sag states.
+ * Out-of-table voltages use the analytic midpoint solve. This is a discrete
+ * circuit approximation, not exact integration of all coupled state motion.
+ *
+ * A bounded linear-phase Core FIR compensates the ADAA small-signal droop:
+ * the minimax inverse of (1-u)*(1-4u/3)^stages, u = sin(w/2)^2, includes
+ * the one-stage path's extra half-sample alignment filter. It avoids the
+ * unit-circle poles of an exact inverse. FIR residual error is <0.05 dB
+ * over the entire base-rate Nyquist band at factors >= 2. Stage-count
+ * padding and whole-sample padding keep wet and dry
+ * aligned. Total latency for 1/2/4/8/16x is 0/73/98/113/121 base samples,
+ * independent of setStages(). At 1x the original point circuit is retained:
+ * inverting an ADAA null at the audio Nyquist would require unbounded gain.
+ * Use 1x only when the surrounding host chain supplies a suitable high rate.
  * getLatency() always reflects the ACTIVE
  * factor (0 at 1x) so hosts get correct PDC. Measured at 48 kHz over tones
- * from 1 to 15 kHz in 1 kHz steps, at -6 and -18 dBFS: each tone is moved
- * to the nearest odd bin of a 16384-point FFT. After settling, a Hann
- * window excludes DC and legitimate harmonics (+/-2 bins). The worst
- * remaining component below 20 kHz, in dB relative to the tone, is:
+ * from 1 to 20 kHz in 1 kHz steps, plus 12.75/15.25/19.25 kHz, at -6 and
+ * -18 dBFS: each tone is moved to the nearest odd bin of a 16384-point FFT.
+ * After settling, coherent rectangular DFT measurements exclude only DC
+ * and exact physical harmonic bins. In particular, adjacent folded lines
+ * are retained. The worst component below 20 kHz, relative to the tone, is:
  *
  *   stages, drive     2x (default)   4x          8x
- *   1, -12 dB         -86.9         -113.4       -139.3
- *   1, 0 dB           -60.5          -88.5       -116.1
- *   1, +12 dB         -40.2          -57.7       -87.1
- *   1, +24 dB         -21.1          -35.3       -50.8
- *   1, +36 dB         -17.1          -23.3       -31.5
- *   2, -12 dB         -70.4          -97.5       -123.3
- *   2, 0 dB           -47.9          -68.6       -96.5
- *   2, +12 dB         -21.9          -42.3       -61.6
- *   2, +24 dB         -15.1          -22.9       -36.9
- *   2, +36 dB         -14.4          -20.7       -28.0
+ *   1, -12 dB        -102.9         -137.9       -135.6
+ *   1, 0 dB           -77.3         -118.4       -115.9
+ *   1, +12 dB         -56.4          -89.3       -102.3
+ *   1, +24 dB         -42.5          -56.2        -79.3
+ *   1, +36 dB         -22.5          -38.9        -48.5
+ *   2, -12 dB         -96.2         -129.7       -123.0
+ *   2, 0 dB           -71.2         -106.2       -104.7
+ *   2, +12 dB         -53.6          -78.0        -95.0
+ *   2, +24 dB         -36.2          -50.4        -70.4
+ *   2, +36 dB         -19.2          -34.2        -44.9
  *
  * A high-gain triode turns a loud top-octave sine into a nearly square wave
  * whose harmonics fall slowly. The worst frequency varies with the setting;
- * testing only 15 kHz missed the two-stage 2x peaks near 14 kHz.
+ * testing only 15 kHz misses worse components at other frequencies.
  * High-drive aliasing remains a limitation even at the higher factors:
  * choose a factor from measurements at the intended drive and sample rate.
  *
- * The current table is 149768 bytes shared by all channels in an instance.
- * On an x64 Release build, processing at 2x was 4.0-5.9 times faster than
- * the previous iterative solver at the SAME factor (stereo double, 48 kHz,
- * 256-frame blocks, 997/15013 Hz two-tone at 0.25 peak each, 0/12/24 dB
- * drive, one/two stages, median of five runs). Same-factor waveform error
- * stayed below -172 dB RMS relative to the original across 2x/4x/8x.
- * This is a solver optimization; the aliasing above is not resolved by it.
- * THD signature verified in the
+ * The current/primitive table is 235016 bytes shared by all channels in an
+ * instance. Preparation builds the table and calibrates the circuit;
+ * processing and stage changes allocate no memory. The antialiased circuit
+ * has a different waveform from the former point-sampled solver. The
+ * small-signal transfer and THD signature are verified in the
  * suite: single-stage distortion is 2nd-harmonic dominant (asymmetric
  * triode), DC operating point matches an independent high-precision solve
  * of the same circuit equations (the check SPICE would perform).
@@ -98,7 +113,7 @@
  * ramp landed in 0.7 ms with 32-sample blocks and clicked). Channels beyond the prepared count pass through
  * untouched.
  *
- * Dependencies: Core/WDF.h, Core/Oversampling.h, Core/Biquad.h,
+ * Dependencies: Core/WDF.h, Core/Oversampling.h, Core/Biquad.h, Core/FIRFilter.h,
  * Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h,
  * Core/SmoothedValue.h, Core/StateBlob.h.
  */
@@ -108,10 +123,12 @@
 #include "../Core/Biquad.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
+#include "../Core/FIRFilter.h"
 #include "../Core/Oversampling.h"
 #include "../Core/SmoothedValue.h"
 #include "../Core/StateBlob.h"
 #include "../Core/WDF.h"
+#include "../Core/detail/LogCosh.h"
 
 #include <algorithm>
 #include <array>
@@ -128,6 +145,184 @@ namespace dspark {
 
 /// @cond DSPARK_INTERNAL
 namespace detail {
+    struct TubePreampCompensation
+    {
+        std::array<std::vector<double>, 2> taps;
+        int latency;
+
+        explicit TubePreampCompensation(int factor)
+        {
+            // 1x retains the explicitly unresampled point circuit. Inverting
+            // the ADAA null at that same Nyquist would be unbounded; the
+            // compensated ADAA path requires the selected factor to be >= 2.
+            if (factor == 1)
+            {
+                latency = 0;
+                return;
+            }
+            // Bounded minimax inverse of (1-u)*(1-4u/3)^stages.
+            // Banks store center-out symmetric coefficients. Unity DC is
+            // constrained; passband relative error is <0.05 dB. The maximum
+            // correction over all internal frequencies is <=12.001/36.001
+            // at 2x (one/two stages), <=4.001 at higher factors. No pole or
+            // gain singularity is introduced outside the audio passband.
+            // The extra half-sample average in the one-stage path makes
+            // its phase equal to three internal samples after integer pad.
+            const int order = factor == 2 ? 14 : (factor == 4 ? 4 : 2);
+            latency = (order + 3 + factor - 1) / factor;
+            const int pad = latency * factor - (order + 3);
+            std::array<std::vector<double>, 2> banks;
+            switch (factor)
+            {
+            case 2:
+                banks[0] = {
+                    1.9235629963970406, 0.44648231230742969, -1.5580934002318299,
+                    0.27439449777428138, 0.95396435999096119, -0.27851755188567112,
+                    -1.547981227472137, 2.6229978502006257, -2.1323567229872782,
+                    0.81377578397761241, 0.21025863734304612, -0.50457523628053735,
+                    0.34120770592379895, -0.12455765609373881, 0.021219149234916305
+                };
+                banks[1] = {
+                    4.1949350794813807, 0.44755626226910095, -3.5513262161664114,
+                    -0.059683685251895137, 3.4543837933883861, -1.0019140998285381,
+                    -3.4140408147555226, 3.1993666390142548, 1.9031788564870777,
+                    -6.6025711322194587, 7.1102262654542958, -4.4409762973601534,
+                    1.6511735090435748, -0.29177768662331721, -0.0010629331920828475
+                };
+                break;
+            case 4:
+                banks[0] = {
+                    1.6916530526685123, 0.22926948453401663, -1.0131494471944595,
+                    0.53918417640406124, -0.10113074007787473
+                };
+                banks[1] = {
+                    1.2261507380985748, 0.83046321660400191, -1.3670690928381859,
+                    0.41953678339599815, 0.0039937237888984208
+                };
+                break;
+            case 8:
+                banks[0] = {
+                    2.431527180594093, -0.75, 0.034236409702953496
+                };
+                banks[1] = {
+                    2.6249087461926157, -0.75, -0.062454373096307858
+                };
+                break;
+            case 16:
+                banks[0] = {
+                    2.4201719089187108, -0.75, 0.039914045540644594
+                };
+                banks[1] = {
+                    2.5931625075732305, -0.75, -0.046581253786615262
+                };
+                break;
+            default: break;
+            }
+            for (int stages = 1; stages <= 2; ++stages)
+            {
+                auto& out = taps[static_cast<size_t>(stages - 1)];
+                const auto& bank = banks[static_cast<size_t>(stages - 1)];
+                out.assign(static_cast<size_t>(2 * order + 1 + pad + (stages == 1 ? 2 : 0)), 0.0);
+                for (int j = 0; j <= 2 * order; ++j)
+                {
+                    const double v = bank[static_cast<size_t>(std::abs(j - order))];
+                    const auto index = static_cast<size_t>(j + pad + (stages == 1 ? 1 : 0));
+                    out[index] += stages == 1 ? 0.5 * v : v;
+                    if (stages == 1) out[index + 1] += 0.5 * v;
+                }
+            }
+        }
+    };
+
+    struct TubePreampGridClamp
+    {
+        static double value(double v) noexcept
+        {
+            return v > 0.0 ? 0.7 * std::tanh(v / 0.7) : v;
+        }
+
+        static double primitive(double v) noexcept
+        {
+            return v <= 0.0 ? 0.5 * v * v : 0.49 * logCosh(v / 0.7);
+        }
+
+        static double primitive2(double v) noexcept
+        {
+            return v <= 0.0 ? v * v * v / 6.0 : 0.343 * integralLogCosh(v / 0.7);
+        }
+
+        // Twice the symmetric second divided difference (Bilbao et al.,
+        // IEEE SPL 2017). Sorting keeps the outer denominator well separated.
+        static double divided(double a, double b, double c, double ga, double gb, double gc) noexcept
+        {
+            if (a > b) { std::swap(a, b); std::swap(ga, gb); }
+            if (b > c) { std::swap(b, c); std::swap(gb, gc); }
+            if (a > b) { std::swap(a, b); std::swap(ga, gb); }
+            if (c <= 0.0) return (a + b + c) / 3.0;
+            const double center = (a + b + c) / 3.0;
+            const double span = c - a;
+            if (span < 0.001 && a < 0.0)
+            {
+                // Across zero, the cubic correction exists only on the
+                // positive branch. Integrate it against the exact simplex
+                // density. Three Gauss nodes integrate this quartic exactly;
+                // the omitted fifth-power correction is below 6e-16 V.
+                constexpr double t[] = {0.1127016653792583, 0.5, 0.8872983346207417};
+                constexpr double w[] = {5.0 / 18.0, 4.0 / 9.0, 5.0 / 18.0};
+                double correction = 0.0;
+                for (int half = 0; half < 2; ++half)
+                {
+                    const double lo = half == 0 ? a : b;
+                    const double hi = half == 0 ? b : c;
+                    const double start = std::max(lo, 0.0);
+                    if (hi <= start) continue;
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        const double x = start + t[k] * (hi - start);
+                        const double density = 2.0 * (half == 0 ? x - a : c - x)
+                            / ((hi - lo) * span);
+                        correction -= (hi - start) * w[k] * density * x * x * x / 1.47;
+                    }
+                }
+                return center + correction;
+            }
+            if (span < 0.001 && a >= 0.0)
+            {
+                // Moments of the uniform simplex give a stable local limit,
+                // including curvature instead of flattening tiny variations.
+                const double t = std::tanh(center / 0.7), q = 1.0 - t * t;
+                const double da = a - center, db = b - center, dc = c - center;
+                const double p2 = da * da + db * db + dc * dc;
+                const double p3 = da * da * da + db * db * db + dc * dc * dc;
+                const double f2 = -2.0 * t * q / 0.7;
+                const double f3 = -2.0 * q * (1.0 - 3.0 * t * t) / 0.49;
+                const double f4 = 8.0 * t * q * (2.0 - 3.0 * t * t) / 0.343;
+                return 0.7 * t + f2 * p2 / 24.0 + f3 * p3 / 180.0
+                    + f4 * p2 * p2 / 1440.0;
+            }
+            const double tolerance = 1e-6 * std::max({1.0, std::abs(a), std::abs(c)});
+            if (b - a < tolerance)
+            {
+                const double mid = 0.5 * (a + b), d = c - mid;
+                return 2.0 * ((gc - primitive2(mid)) / d - primitive(mid)) / d;
+            }
+            if (c - b < tolerance)
+            {
+                const double mid = 0.5 * (b + c), d = mid - a;
+                return 2.0 * (primitive(mid) - (primitive2(mid) - ga) / d) / d;
+            }
+            return 2.0 * ((gc - gb) / (c - b) - (gb - ga) / (b - a)) / (c - a);
+        }
+        static double average(double a, double b, double fa, double fb) noexcept
+        {
+            const double mid = 0.5 * (a + b);
+            if ((a <= 0.0 && b <= 0.0)
+                || std::abs(b - a) < 1e-6 * std::max({1.0, std::abs(a), std::abs(b)}))
+                return value(mid);
+            return (fb - fa) / (b - a);
+        }
+    };
+
     struct TubePreampCurrentTable
     {
         static constexpr double kMu = 100.0, kEx = 1.4, kKg1 = 1060.0;
@@ -175,14 +370,18 @@ namespace detail {
         // equation Vk = A + B*Ip leaves a TWO-dimensional implicit load line:
         // Ip = Koren(S - (RL+B)*Ip, G - B*Ip). B is fixed by prepare's rate.
         // Use R = G/S to align the cutoff knee across supply voltages. This
-        // needs 149768 bytes per instance instead of 994088 for a uniform
-        // (S,G) grid, with <5e-10 A error in the independent load-line check.
+        // needs 235016 bytes including its primitive, with <5e-10 A error
+        // in the independent load-line check.
         // Tabulate the root and implicit derivatives without quantizing the
         // capacitor or dropping its feedback. Bicubic Hermite interpolation
         // keeps current and both first derivatives continuous at cell edges.
         // Every channel and both calibration passes share this instance.
-        struct Node { double y, ds, dg, dsg; };
-        static constexpr int kNS = 18, kNG = 260;
+        struct Node
+        {
+            double y, ds, dg, dsg;
+            double integral = 0.0, integralS = 0.0;
+        };
+        static constexpr int kNS = 18, kNG = 272;
         std::array<Node, kNS * kNG> nodes;
         double kb;
 
@@ -194,11 +393,12 @@ namespace detail {
                 {
                     const double s = si <= 6 ? 80.0 + 8.0 * si
                                              : 128.0 + 16.0 * (si - 6);
-                    // The exponential cutoff tail needs fewer knots than
-                    // the conducting region. All segment edges are knots.
-                    const double r = gi <= 4 ? -0.08 + gi * 0.01
-                        : (gi <= 19 ? -0.04 + (gi - 4) * 0.001
-                                    : -0.025 + (gi - 19) / 6400.0);
+                    // Tail cells must still resolve the exponential enough
+                    // to keep the cubic nonnegative; integrating a cubic
+                    // and then clipping its point evaluation would disagree.
+                    const double r = gi <= 16 ? -0.08 + gi * 0.0025
+                        : (gi <= 31 ? -0.04 + (gi - 16) * 0.001
+                                    : -0.025 + (gi - 31) / 6400.0);
                     Node n = solve(s, s * r);
                     n.ds += r * n.dg;             // dI/dS with R held fixed
                     n.dg *= s;                   // dI/dR with S held fixed
@@ -207,6 +407,18 @@ namespace detail {
                     n.dsg = ((s + 0.001) * solve(s + 0.001, (s + 0.001) * r).dg
                            - (s - 0.001) * solve(s - 0.001, (s - 0.001) * r).dg) / 0.002;
                     nodes[static_cast<size_t>(si * kNG + gi)] = n;
+                }
+            // Hermite interpolation is linear in the node data. Accumulate
+            // the exact R-integral and its S derivative along each row;
+            // the same S interpolation then integrates the entire surface.
+            for (int si = 0; si < kNS; ++si)
+                for (int gi = 1; gi < kNG; ++gi)
+                {
+                    const auto& a = nodes[static_cast<size_t>(si * kNG + gi - 1)];
+                    auto& b = nodes[static_cast<size_t>(si * kNG + gi)];
+                    const double h = gi <= 16 ? 0.0025 : (gi <= 31 ? 0.001 : 1.0 / 6400.0);
+                    b.integral = a.integral + h * (0.5 * (a.y + b.y) + h * (a.dg - b.dg) / 12.0);
+                    b.integralS = a.integralS + h * (0.5 * (a.ds + b.ds) + h * (a.dsg - b.dsg) / 12.0);
                 }
         }
 
@@ -221,7 +433,10 @@ namespace detail {
             {
                 koren(supply - (kRL + kb) * y, grid - kb * y, p, dp, dg);
                 const double f = y - p;
-                if (std::abs(f) <= 1e-15) break;
+                // An absolute 1e-15 A stop leaves arbitrary residuals in
+                // cutoff nodes whose true current is much smaller. Those
+                // inconsistent values/slopes can make their cubic negative.
+                if (std::abs(f) <= std::max(1e-30, 1e-13 * std::max(y, p))) break;
                 if (f > 0.0) high = y;
                 else low = y;
                 const double slope = 1.0 + (kRL + kb) * dp + kb * dg;
@@ -244,33 +459,90 @@ namespace detail {
             return s >= 80.0 && s < 304.0 && std::isfinite(g) && g < 1.0;
         }
 
-        [[nodiscard]] double eval(double s, double g) const noexcept
+        struct Cell
         {
-            // At R <= -0.08, Koren's positive plate current is below 1e-27 A
-            // throughout the supply range. Do not pin deep cutoff to a
-            // finite table endpoint or send it through an iterative solver.
-            if (g <= -0.08 * s) return 0.0;
+            int si, gi;
+            double st, gt, step, rstep;
+        };
+
+        static Cell locate(double s, double g) noexcept
+        {
             const double step = s < 128.0 ? 8.0 : 16.0;
             const double r = g / s;
-            const double rstep = r < -0.04 ? 0.01 : (r < -0.025 ? 0.001 : 1.0 / 6400.0);
+            const double rstep = r < -0.04 ? 0.0025 : (r < -0.025 ? 0.001 : 1.0 / 6400.0);
             const double sp = s < 128.0 ? (s - 80.0) / 8.0 : 6.0 + (s - 128.0) / 16.0;
-            const double gp = r < -0.04 ? (r + 0.08) * 100.0
-                : (r < -0.025 ? 4.0 + (r + 0.04) * 1000.0
-                              : 19.0 + (r + 0.025) * 6400.0);
+            const double gp = r < -0.04 ? (r + 0.08) * 400.0
+                : (r < -0.025 ? 16.0 + (r + 0.04) * 1000.0
+                              : 31.0 + (r + 0.025) * 6400.0);
             // Adding the grid offset can round a value just below the upper
             // edge onto that edge. Use the final CELL, with t = 1, there.
             const int si = std::min(static_cast<int>(sp), kNS - 2);
             const int gi = std::min(static_cast<int>(gp), kNG - 2);
-            const double st = sp - si, gt = gp - gi;
-            const Node& a = nodes[static_cast<size_t>(si * kNG + gi)];
-            const Node& b = nodes[static_cast<size_t>((si + 1) * kNG + gi)];
-            const Node& c = nodes[static_cast<size_t>(si * kNG + gi + 1)];
-            const Node& d = nodes[static_cast<size_t>((si + 1) * kNG + gi + 1)];
-            const double p0 = cubic(a.y, b.y, a.ds * step, b.ds * step, st);
-            const double p1 = cubic(c.y, d.y, c.ds * step, d.ds * step, st);
-            const double m0 = cubic(a.dg, b.dg, a.dsg * step, b.dsg * step, st);
-            const double m1 = cubic(c.dg, d.dg, c.dsg * step, d.dsg * step, st);
-            return std::max(0.0, cubic(p0, p1, m0 * rstep, m1 * rstep, gt));
+            return {si, gi, sp - si, gp - gi, step, rstep};
+        }
+
+        // Coefficients in ascending powers of the normalized R coordinate.
+        [[nodiscard]] std::array<double, 4> polynomial(const Cell& q) const noexcept
+        {
+            const Node& a = nodes[static_cast<size_t>(q.si * kNG + q.gi)];
+            const Node& b = nodes[static_cast<size_t>((q.si + 1) * kNG + q.gi)];
+            const Node& c = nodes[static_cast<size_t>(q.si * kNG + q.gi + 1)];
+            const Node& d = nodes[static_cast<size_t>((q.si + 1) * kNG + q.gi + 1)];
+            const double p0 = cubic(a.y, b.y, a.ds * q.step, b.ds * q.step, q.st);
+            const double p1 = cubic(c.y, d.y, c.ds * q.step, d.ds * q.step, q.st);
+            const double m0 = q.rstep * cubic(a.dg, b.dg, a.dsg * q.step, b.dsg * q.step, q.st);
+            const double m1 = q.rstep * cubic(c.dg, d.dg, c.dsg * q.step, d.dsg * q.step, q.st);
+            const double diff = p1 - p0;
+            return {p0, m0, 3.0 * diff - 2.0 * m0 - m1, m0 + m1 - 2.0 * diff};
+        }
+
+        [[nodiscard]] double eval(double s, double g) const noexcept
+        {
+            // Below this cutoff the unloaded Koren current is < 1e-27 A.
+            if (g <= -0.08 * s) return 0.0;
+            const auto q = locate(s, g);
+            const auto p = polynomial(q);
+            return std::max(0.0, ((p[3] * q.gt + p[2]) * q.gt + p[1]) * q.gt + p[0]);
+        }
+
+        /** Integral along G at fixed S, with zero in deep cutoff. */
+        [[nodiscard]] double primitive(double s, double g) const noexcept
+        {
+            if (g <= -0.08 * s) return 0.0;
+            return primitive(s, locate(s, g));
+        }
+
+        [[nodiscard]] double primitive(double s, const Cell& q) const noexcept
+        {
+            const auto p = polynomial(q);
+            const auto& a = nodes[static_cast<size_t>(q.si * kNG + q.gi)];
+            const auto& b = nodes[static_cast<size_t>((q.si + 1) * kNG + q.gi)];
+            const double base = cubic(a.integral, b.integral,
+                a.integralS * q.step, b.integralS * q.step, q.st);
+            const double t = q.gt;
+            const double part = (((p[3] * 0.25 * t + p[2] / 3.0) * t + p[1] * 0.5) * t + p[0]) * t;
+            return s * (base + q.rstep * part);
+        }
+
+        /** Exact cell average; a local expression avoids primitive cancellation. */
+        [[nodiscard]] double average(double s, double g0, double g1) const noexcept
+        {
+            if (std::max(g0, g1) <= -0.08 * s) return 0.0;
+            if (std::min(g0, g1) > -0.08 * s)
+            {
+                const auto a = locate(s, g0), b = locate(s, g1);
+                if (a.gi == b.gi)
+                {
+                    const auto p = polynomial(a);
+                    const double m = 0.5 * (a.gt + b.gt), d = b.gt - a.gt;
+                    return std::max(0.0, ((p[3] * m + p[2]) * m + p[1]) * m + p[0]
+                        + (3.0 * p[3] * m + p[2]) * d * d / 12.0);
+                }
+                if (std::abs(g1 - g0) < 1e-6) return eval(s, 0.5 * (g0 + g1));
+                return std::max(0.0, (primitive(s, b) - primitive(s, a)) / (g1 - g0));
+            }
+            if (std::abs(g1 - g0) < 1e-6) return eval(s, 0.5 * (g0 + g1));
+            return std::max(0.0, (primitive(s, g1) - primitive(s, g0)) / (g1 - g0));
         }
     };
 } // namespace detail
@@ -308,6 +580,7 @@ public:
         outputLogSmoother_.prepare(fs2_, 30.0);
         for (auto& ramp : gainRamps_)
             ramp.resize(static_cast<size_t>(maxBlock_) * static_cast<size_t>(osFactor_));
+        compensationScratch_.resize(static_cast<size_t>(maxBlock_) * static_cast<size_t>(osFactor_));
 
         if (osFactor_ > 1)
         {
@@ -321,12 +594,13 @@ public:
         }
 
         loadTable_ = std::make_unique<LoadTable>(fs2_);
+        compensation_ = std::make_unique<detail::TubePreampCompensation>(osFactor_);
         channels_.clear();
         channels_.resize(static_cast<size_t>(numChannels_));
         for (auto& ch : channels_)
-            ch = std::make_unique<ChannelState>(fs2_, loadTable_.get());
+            ch = std::make_unique<ChannelState>(fs2_, loadTable_.get(), compensation_.get());
 
-        latency_ = oversampler_ ? oversampler_->getLatency() : 0;
+        latency_ = (oversampler_ ? oversampler_->getLatency() : 0) + compensation_->latency;
         drySize_ = 1;
         while (drySize_ < latency_ + maxBlock_ + 1) drySize_ <<= 1;
         dryRing_.assign(static_cast<size_t>(numChannels_),
@@ -401,7 +675,8 @@ public:
         dirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Number of triode stages (1 = clean/edge, 2 = high gain). */
+    /** @brief Number of triode stages (1 = clean/edge, 2 = high gain).
+     *  RT-safe; the prepared latency does not change. */
     void setStages(int stages) noexcept
     {
         stages_.store(std::clamp(stages, 1, 2), std::memory_order_relaxed);
@@ -611,11 +886,25 @@ public:
                 auto& state = *channels_[static_cast<size_t>(ch)];
                 for (int i = 0; i < osN; ++i)
                 {
-                    const double g = outputRamping ? gainRamps_[1][static_cast<size_t>(i)] : outGain;
                     const double h = driveRamping ? gainRamps_[0][static_cast<size_t>(i)] : hScale_;
-                    d[i] = static_cast<T>(g
-                        * state.processSample(h * static_cast<double>(d[i]),
-                                              numStagesActive_, sagR_));
+                    const double value = state.template processSample<false>(
+                        h * static_cast<double>(d[i]), numStagesActive_, sagR_);
+                    if (osOn)
+                        compensationScratch_[static_cast<size_t>(i)] = value;
+                    else
+                    {
+                        const double g = outputRamping ? gainRamps_[1][static_cast<size_t>(i)] : outGain;
+                        d[i] = static_cast<T>(g * value);
+                    }
+                }
+                if (osOn)
+                {
+                    state.compensateBlock(compensationScratch_.data(), osN, numStagesActive_);
+                    for (int i = 0; i < osN; ++i)
+                    {
+                        const double g = outputRamping ? gainRamps_[1][static_cast<size_t>(i)] : outGain;
+                        d[i] = static_cast<T>(g * compensationScratch_[static_cast<size_t>(i)]);
+                    }
                 }
             }
             if (osOn) oversampler_->downsample(buffer);
@@ -666,6 +955,9 @@ private:
         double vk = 1.2;           ///< Cathode voltage (bypass cap state).
         double fPrev = 0.0;        ///< Previous net capacitor current (A).
         double vpDC = 200.0;       ///< Plate voltage at the operating point.
+        double previousGrid = 0.0, previousClamped = 0.0;
+        double previousPrimitive2 = 0.0, olderGrid = 0.0, olderPrimitive2 = 0.0;
+        bool antialias = true;
 
         void settleDC(double bplus) noexcept
         {
@@ -688,14 +980,31 @@ private:
             vk = i * kRk;
             fPrev = 0.0;
             vpDC = bplus - i * kRL;
+            previousGrid = previousClamped = 0.0;
+            previousPrimitive2 = olderGrid = olderPrimitive2 = 0.0;
         }
 
         /** @brief Processes one grid-volt sample, returns AC plate voltage. */
         [[nodiscard]] double processSample(double vg, double bplusEff) noexcept
         {
-            // Soft grid-conduction clamp toward +0.7 V.
-            if (vg > 0.0)
-                vg = 0.7 * std::tanh(vg / 0.7);
+            // Antialias BOTH nonlinearities. Averaging only the triode cannot
+            // remove aliases that were already generated by the grid clamp.
+            double clamped = 0.0, oldClamped = 0.0;
+            if (antialias)
+            {
+                const double primitive2 = detail::TubePreampGridClamp::primitive2(vg);
+                clamped = detail::TubePreampGridClamp::divided(olderGrid, previousGrid, vg,
+                    olderPrimitive2, previousPrimitive2, primitive2);
+                olderGrid = previousGrid;
+                olderPrimitive2 = previousPrimitive2;
+                previousGrid = vg;
+                previousPrimitive2 = primitive2;
+                oldClamped = previousClamped;
+                previousClamped = clamped;
+                vg = 0.5 * (oldClamped + clamped);
+            }
+            else
+                vg = oldClamped = clamped = detail::TubePreampGridClamp::value(vg);
 
             // Trapezoidal cathode bypass: Ck dVk/dt = Ip - Vk/Rk, with fPrev
             // holding the previous NET CURRENT (Ip - Vk/Rk), so the update is
@@ -710,8 +1019,10 @@ private:
 
             // Outside the prepared supply/grid range, retain the analytic
             // circuit solve. The table includes a bounded deep-cutoff limit.
-            if (table->covers(bplusEff - kA, vg - kA))
-                i = table->eval(bplusEff - kA, vg - kA);
+            if (table->covers(bplusEff - kA, oldClamped - kA)
+                && table->covers(bplusEff - kA, clamped - kA))
+                i = antialias ? table->average(bplusEff - kA, oldClamped - kA, clamped - kA)
+                              : table->eval(bplusEff - kA, vg - kA);
             else for (int it = 0; it < 8; ++it)
             {
                 const double vkN = kA + kB * i;
@@ -739,15 +1050,19 @@ private:
     /** @brief Full per-channel circuit: two stages + FMV tone stack + sag. */
     struct ChannelState
     {
-        explicit ChannelState(double fs2In, const LoadTable* table)
-            : fmv(38e3, 1e6)   // fixed source-impedance approximation
+        explicit ChannelState(double fs2In, const LoadTable* table,
+                              const detail::TubePreampCompensation* compensationIn)
+            : compensation(compensationIn), fmv(38e3, 1e6) // fixed source impedance
         {
             stage1.table = table;
             stage2.table = table;
             stage1.fs2 = fs2In;
             stage2.fs2 = fs2In;
+            stage1.antialias = stage2.antialias = compensation->latency > 0;
             fs2 = fs2In;
             fmv.prepare(fs2In);
+            if (compensation->latency > 0)
+                antiAliasEq.prepare(static_cast<int>(compensation->taps[0].size()), 1);
         }
 
         /** Settles the DC operating point CONSISTENTLY with the sagged
@@ -780,6 +1095,8 @@ private:
             for (auto& set : flatten)
                 for (auto& f : set)
                     f.reset();
+            antiAliasEq.reset();
+            compensationStages = 0;
         }
 
         /** Installs the reference-flattening EQ for one stage count. */
@@ -796,6 +1113,7 @@ private:
             fmv.setControls(t, b, m);   // rebuilds the R-type scattering
         }
 
+        template <bool Compensate = true>
         [[nodiscard]] double processSample(double vgIn, int numStages, double sagR) noexcept
         {
             // Supply sag: B+ droops with smoothed total plate current.
@@ -827,7 +1145,28 @@ private:
             out = fl[0].processSample(out, 0);
             out = fl[1].processSample(out, 0);
             out = fl[2].processSample(out, 0);
-            return out;
+            if constexpr (!Compensate) return out;
+            if (compensation->latency == 0) return out;
+            selectCompensation(numStages);
+            return antiAliasEq.processSample(out, 0);
+        }
+
+        void selectCompensation(int numStages) noexcept
+        {
+            if (compensationStages != numStages)
+            {
+                // Fixed prepared coefficients; no allocation on stage changes.
+                antiAliasEq.setCoefficients(compensation->taps[static_cast<size_t>(numStages - 1)]);
+                compensationStages = numStages;
+            }
+        }
+
+        void compensateBlock(double* data, int count, int numStages) noexcept
+        {
+            selectCompensation(numStages);
+            // Core block processing hoists coefficient publication/atomics
+            // out of the inner loop. The calibration uses the same FIR.
+            antiAliasEq.processBlock(AudioBufferView<double>(&data, 1, count));
         }
 
         double fs2 = 96000.0;
@@ -835,6 +1174,9 @@ private:
         double ipLP = 1.6e-3;
         double outHpX = 0.0, outHpY = 0.0;
         std::array<std::array<Biquad<double, 1>, 3>, 2> flatten;   ///< Per stage count.
+        const detail::TubePreampCompensation* compensation;
+        FIRFilter<double> antiAliasEq;
+        int compensationStages = 0;
 
         wdf::ToneStackFMV<double> fmv;   ///< Exact Bassman stack (R-type WDF).
     };
@@ -925,7 +1267,7 @@ private:
 
         for (int st = 1; st <= 2; ++st)
         {
-            ChannelState cal(fs2_, loadTable_.get());   // fresh: flattener is passthrough here
+            ChannelState cal(fs2_, loadTable_.get(), compensation_.get());
             cal.setToneControls(0.5, 0.5, 0.5);
             cal.reset(kSagRef, st);
 
@@ -982,7 +1324,7 @@ private:
             // level) before its measurement window. recompute() interpolates
             // this LUT, so the loudness link tracks the circuit's actual
             // compression - the fix for the level falling at high drive.
-            ChannelState sweep(fs2_, loadTable_.get());
+            ChannelState sweep(fs2_, loadTable_.get(), compensation_.get());
             sweep.setToneControls(0.5, 0.5, 0.5);
             sweep.setFlattenCoeffs(st, fc);
             sweep.reset(kSagRef, st);
@@ -1025,6 +1367,7 @@ private:
     int osFactor_ = 2;                  ///< Oversampling factor (setup thread; 1 = off, 2 default).
 
     std::unique_ptr<LoadTable> loadTable_;
+    std::unique_ptr<detail::TubePreampCompensation> compensation_;
     std::unique_ptr<Oversampling<T>> oversampler_;
     std::vector<std::unique_ptr<ChannelState>> channels_;
 
@@ -1045,6 +1388,7 @@ private:
           { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 } } };
     SmoothedValue<double> driveLogSmoother_, outputLogSmoother_;
     std::array<std::vector<double>, 2> gainRamps_;
+    std::vector<double> compensationScratch_;
     bool gainsInitialized_ = false;
     T currentMix_ = T(1);                       ///< Audio-thread mix ramp state.
     T mixMaxStep_ = T(1.0 / 960.0);             ///< Mix ramp rate: full scale per 20 ms.

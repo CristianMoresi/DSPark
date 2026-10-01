@@ -21,6 +21,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <array>
 #include <atomic>
 #include <thread>
@@ -1764,46 +1765,54 @@ DSPARK_TEST(TubePreamp_stable_at_max_drive)
 DSPARK_TEST(TubePreamp_default_rejects_high_gain_foldback)
 {
     // At 2x the 15 kHz, -6 dBFS tone folded 18.2 dB below its fundamental
-    // through two stages at +24 dB. Check the audio, not only the factor.
-    TubePreamp<double> amp;
-    amp.setStages(2);
-    amp.setDrive(24.0);
-    amp.prepare(spec(48000.0, 256, 2));
-    AudioBuffer<double> audio;
-    audio.resize(2, 256);
-    constexpr int length = 48000;
-    std::vector<double> tail;
-    tail.reserve(length / 2);
-    for (int pos = 0; pos < length; pos += 256)
+    // through two stages at +24 dB. Also cover the worse neighboring tones.
+    for (double sourceFrequency : {14000.0, 15000.0, 18000.0})
     {
-        const int count = std::min(256, length - pos);
-        for (int i = 0; i < count; ++i)
-            audio.getChannel(0)[i] = audio.getChannel(1)[i] =
-                std::pow(10.0, -6.0 / 20.0)
-                * std::sin(2.0 * 3.14159265358979323846 * 15000.0 * (pos + i) / 48000.0);
-        amp.processBlock(audio.toView().getSubView(0, count));
-        for (int i = 0; i < count; ++i)
-            if (pos + i >= length / 2) tail.push_back(audio.getChannel(0)[i]);
-    }
-    const auto amplitude = [&](double frequency) {
-        double re = 0.0, im = 0.0;
-        for (size_t i = 0; i < tail.size(); ++i)
+        TubePreamp<double> amp;
+        amp.setStages(2);
+        amp.setDrive(24.0);
+        amp.prepare(spec(48000.0, 256, 2));
+        AudioBuffer<double> audio;
+        audio.resize(2, 256);
+        constexpr int length = 48000;
+        std::vector<double> tail;
+        tail.reserve(length / 2);
+        for (int pos = 0; pos < length; pos += 256)
         {
-            const double phase = 2.0 * 3.14159265358979323846 * frequency
-                               * static_cast<double>(i) / 48000.0;
-            re += tail[i] * std::cos(phase);
-            im += tail[i] * std::sin(phase);
+            const int count = std::min(256, length - pos);
+            for (int i = 0; i < count; ++i)
+                audio.getChannel(0)[i] = audio.getChannel(1)[i] =
+                    std::pow(10.0, -6.0 / 20.0)
+                    * std::sin(2.0 * 3.14159265358979323846 * sourceFrequency * (pos + i) / 48000.0);
+            amp.processBlock(audio.toView().getSubView(0, count));
+            for (int i = 0; i < count; ++i)
+                if (pos + i >= length / 2) tail.push_back(audio.getChannel(0)[i]);
         }
-        return std::hypot(re, im);
-    };
-    const double fundamental = amplitude(15000.0);
-    double folded = 0.0;
-    for (double frequency : {3000.0, 6000.0, 9000.0, 12000.0, 18000.0})
-        folded = std::max(folded, amplitude(frequency));
-    EXPECT_GT(fundamental, 1.0);
-    EXPECT_LT(20.0 * std::log10(folded / fundamental), -32.0);
-    EXPECT_EQ(amp.getOversamplingFactor(), 2);
-    EXPECT_EQ(amp.getLatency(), 64);
+        const auto amplitude = [&](double frequency) {
+            double re = 0.0, im = 0.0;
+            for (size_t i = 0; i < tail.size(); ++i)
+            {
+                const double phase = 2.0 * 3.14159265358979323846 * frequency
+                                   * static_cast<double>(i) / 48000.0;
+                re += tail[i] * std::cos(phase);
+                im += tail[i] * std::sin(phase);
+            }
+            return std::hypot(re, im);
+        };
+        const double fundamental = amplitude(sourceFrequency);
+        double folded = 0.0;
+        const int spacing = std::gcd(static_cast<int>(sourceFrequency), 48000);
+        for (int frequency = spacing; frequency <= 20000; frequency += spacing)
+        {
+            const double harmonic = frequency / sourceFrequency;
+            if (harmonic >= 1.0 && std::abs(harmonic - std::round(harmonic)) < 1e-9) continue;
+            folded = std::max(folded, amplitude(frequency));
+        }
+        EXPECT_GT(fundamental, 1.0);
+        EXPECT_LT(20.0 * std::log10(folded / fundamental), -32.0);
+        EXPECT_EQ(amp.getOversamplingFactor(), 2);
+        EXPECT_EQ(amp.getLatency(), 73);
+    }
 }
 
 namespace {
@@ -1885,6 +1894,288 @@ DSPARK_TEST(TubePreamp_current_surface_matches_implicit_circuit)
     }
 }
 
+DSPARK_TEST(TubePreamp_antiderivatives_match_numerical_integration)
+{
+    // Four-point Gauss-Legendre, subdivided on the nonlinear branch. This
+    // oracle evaluates the curve, not the production primitive.
+    constexpr long double nodes[] = {-0.8611363115940525752L, -0.3399810435848562648L,
+                                      0.3399810435848562648L, 0.8611363115940525752L};
+    constexpr long double weights[] = {0.3478548451374538574L, 0.6521451548625461426L,
+                                       0.6521451548625461426L, 0.3478548451374538574L};
+    for (double a : {-100.0, -1.0, -1e-7, 0.0, 1e-7, 0.1, 1.0, 20.0})
+        for (double b : {-40.0, -0.1, 0.0, 1e-8, 0.100000001, 0.7, 10.0, 100.0})
+        {
+            const long double lo = std::min(a, b), hi = std::max(a, b);
+            long double area = 0.0L;
+            if (lo < 0.0L)
+            {
+                const long double end = std::min(hi, 0.0L);
+                area = (end - lo) * (end + lo) * 0.5L;
+            }
+            if (hi > 0.0L)
+            {
+                long double positiveArea = 0.0L;
+                const long double start = std::max(lo, 0.0L);
+                const int cells = std::max(1, static_cast<int>(std::ceil((hi - start) / 0.02L)));
+                const long double h = (hi - start) / cells;
+                for (int c = 0; c < cells; ++c)
+                    for (int q = 0; q < 4; ++q)
+                    {
+                        const long double v = start + h * (c + 0.5L + 0.5L * nodes[q]);
+                        positiveArea += h * 0.5L * weights[q] * 0.7L * std::tanh(v / 0.7L);
+                    }
+                area += positiveArea;
+            }
+            const double expected = hi > lo ? static_cast<double>(area / (hi - lo)) : a;
+            const double actual = detail::TubePreampGridClamp::average(a, b,
+                detail::TubePreampGridClamp::primitive(a), detail::TubePreampGridClamp::primitive(b));
+            EXPECT_NEAR(actual, expected, 2e-12);
+        }
+
+    for (double rate : {44100.0, 96000.0, 384000.0})
+    {
+        auto table = std::make_unique<detail::TubePreampCurrentTable>(rate);
+        for (double supply : {80.0, 127.999, 128.0, 220.7, 303.999})
+            for (double a : {-100.0, -16.0, -6.0, -2.0, -1.03, 0.0, 0.999})
+                for (double b : {-24.0, -8.0, -1.1, -0.01, 0.7, 0.999999})
+                {
+                    const double lo = std::min(a, b), hi = std::max(a, b);
+                    // Split at every R knot. Two Gaussian samples integrate
+                    // each cubic exactly, without using its coefficients.
+                    std::vector<double> edges{lo, hi};
+                    for (int k = 0; k < 272; ++k)
+                    {
+                        const double r = k <= 16 ? -0.08 + k * 0.0025
+                            : (k <= 31 ? -0.04 + (k - 16) * 0.001 : -0.025 + (k - 31) / 6400.0);
+                        if (r * supply > lo && r * supply < hi) edges.push_back(r * supply);
+                    }
+                    std::sort(edges.begin(), edges.end());
+                    long double area = 0.0L;
+                    for (size_t j = 1; j < edges.size(); ++j)
+                    {
+                        const double mid = 0.5 * (edges[j - 1] + edges[j]);
+                        const double half = 0.5 * (edges[j] - edges[j - 1]);
+                        area += half * (table->eval(supply, mid - half / std::sqrt(3.0))
+                                     + table->eval(supply, mid + half / std::sqrt(3.0)));
+                    }
+                    const double expected = static_cast<double>(area / (hi - lo));
+                    EXPECT_NEAR(table->average(supply, a, b), expected, 2e-16);
+                    const double pa = table->primitive(supply, a), pb = table->primitive(supply, b);
+                    // Direct subtraction of cumulative primitives has a
+                    // roundoff bound proportional to their magnitudes. Test
+                    // the integral itself; the stable average above retains
+                    // its stricter current tolerance even for tiny intervals.
+                    const double roundoff = 16.0 * std::numeric_limits<double>::epsilon()
+                        * (std::abs(pa) + std::abs(pb) + 1e-6);
+                    EXPECT_NEAR(pb - pa, static_cast<double>(area) * (b > a ? 1.0 : -1.0), roundoff);
+                }
+        // Local divided differences must remain accurate at tiny amplitudes.
+        for (double grid : {-6.0, -2.0, -1.03, -0.01, 0.7})
+            for (double delta : {0.0, 1e-13, -1e-11, 1e-8, -1e-6})
+                EXPECT_NEAR(table->average(279.31, grid, grid + delta),
+                            table->eval(279.31, grid + 0.5 * delta), 2e-16);
+    }
+}
+
+DSPARK_TEST(TubePreamp_second_antiderivative_matches_independent_quadrature)
+{
+    // A second divided difference is a triangular density in value space.
+    // Integrate the original clamp, never its production antiderivatives.
+    constexpr double nodes[] = {-0.8611363115940525752, -0.3399810435848562648,
+                                0.3399810435848562648, 0.8611363115940525752};
+    constexpr double weights[] = {0.3478548451374538574, 0.6521451548625461426,
+                                   0.6521451548625461426, 0.3478548451374538574};
+    const auto curve = [](long double x) { return x <= 0.0L ? x : 0.7L * std::tanh(x / 0.7L); };
+    for (double x : {-100.0, -0.1, -1e-8, 0.0, 1e-8, 0.01, 0.699999, 0.7, 0.700001, 10.0, 100.0})
+    {
+        long double expected = 0.0L;
+        if (x <= 0.0) expected = static_cast<long double>(x) * x * x / 6.0L;
+        else
+        {
+            const int count = std::max(1, static_cast<int>(std::ceil(x / 0.01)));
+            const long double h = static_cast<long double>(x) / count;
+            for (int j = 0; j < count; ++j)
+                for (int k = 0; k < 4; ++k)
+                {
+                    const long double u = h * (j + 0.5L + 0.5L * nodes[k]);
+                    expected += 0.5L * h * weights[k] * (x - u) * curve(u);
+                }
+        }
+        EXPECT_NEAR(detail::TubePreampGridClamp::primitive2(x), static_cast<double>(expected),
+                    2e-12 * std::max(1.0, std::abs(static_cast<double>(expected))));
+    }
+    for (double a : {-40.0, -0.1, -1e-5, 0.0, 0.1, 1.0, 30.0})
+        for (double b : {-10.0, -1e-5, 0.0, 1e-7, 0.100000001, 0.7, 30.0})
+            for (double c : {a, b, 0.0, 0.10000000001, 20.0})
+            {
+                std::array<double, 3> sorted{a, b, c};
+                std::sort(sorted.begin(), sorted.end());
+                const double lo = sorted[0], mid = sorted[1], hi = sorted[2];
+                long double expected = curve(lo);
+                if (hi > lo)
+                {
+                    expected = 0.0L;
+                    for (int half = 0; half < 2; ++half)
+                    {
+                        const double begin = half == 0 ? lo : mid;
+                        const double end = half == 0 ? mid : hi;
+                        if (end <= begin) continue;
+                        std::vector<double> edges{begin, end};
+                        if (begin < 0.0 && end > 0.0) edges.insert(edges.begin() + 1, 0.0);
+                        for (size_t segment = 1; segment < edges.size(); ++segment)
+                        {
+                            const int count = std::max(1, static_cast<int>(std::ceil((edges[segment] - edges[segment - 1]) / 0.02)));
+                            const long double h = (static_cast<long double>(edges[segment]) - edges[segment - 1]) / count;
+                            for (int j = 0; j < count; ++j)
+                                for (int k = 0; k < 4; ++k)
+                                {
+                                    const long double u = edges[segment - 1] + h * (j + 0.5L + 0.5L * nodes[k]);
+                                    const long double density = 2.0L * (half == 0 ? u - lo : hi - u)
+                                        / ((static_cast<long double>(end) - begin) * (hi - lo));
+                                    expected += 0.5L * h * weights[k] * density * curve(u);
+                                }
+                        }
+                    }
+                }
+                const double actual = detail::TubePreampGridClamp::divided(a, b, c,
+                    detail::TubePreampGridClamp::primitive2(a), detail::TubePreampGridClamp::primitive2(b),
+                    detail::TubePreampGridClamp::primitive2(c));
+                EXPECT_NEAR(actual, static_cast<double>(expected), 2e-11);
+            }
+}
+
+DSPARK_TEST(TubePreamp_coherent_sweep_resolves_aliases_next_to_fundamental)
+{
+    constexpr int size = 16384, block = 256;
+    FFTReal<double> fft(size);
+    AudioBuffer<double> audio;
+    audio.resize(1, block);
+    std::vector<double> capture(size), spectrum(size + 2);
+    // Exact coherent bins: a +/-2-bin Hann mask would hide the fifth-harmonic
+    // alias next to 16 kHz. Include between-kHz failures from independent QA.
+    for (double nominal : {1000., 2000., 3000., 4000., 5000., 6000., 7000., 8000.,
+                           9000., 10000., 11000., 12000., 12750., 13000., 14000.,
+                           15000., 15250., 16000., 17000., 18000., 19000., 19250., 20000.})
+    {
+        int bin = static_cast<int>(nominal * size / 48000.0 + 0.5);
+        if ((bin & 1) == 0) ++bin;
+        TubePreamp<double> amp;
+        amp.setStages(2);
+        amp.setDrive(24.0);
+        amp.prepare(spec(48000.0, block, 1));
+        for (int pos = 0; pos < 6 * size; pos += block)
+        {
+            for (int j = 0; j < block; ++j)
+                audio.getChannel(0)[j] = std::pow(10.0, -6.0 / 20.0)
+                    * std::sin(2.0 * std::numbers::pi * bin * (pos + j) / size);
+            amp.processBlock(audio.toView());
+            if (pos >= 5 * size)
+                std::copy_n(audio.getChannel(0), block, capture.data() + pos - 5 * size);
+        }
+        fft.forward(capture.data(), spectrum.data());
+        const auto magnitude = [&](int k) {
+            return std::hypot(spectrum[static_cast<size_t>(2 * k)], spectrum[static_cast<size_t>(2 * k + 1)]);
+        };
+        double folded = 0.0;
+        for (int k = 1; k * 48000 < 20000 * size; ++k)
+            if (k % bin != 0) folded = std::max(folded, magnitude(k));
+        const double ratio = 20.0 * std::log10(folded / magnitude(bin));
+        if (ratio >= -32.0) std::cerr << "TubePreamp tone " << 48000.0 * bin / size << " Hz: " << ratio << " dBc\n";
+        EXPECT_LT(ratio, -32.0);
+    }
+}
+
+DSPARK_TEST(TubePreamp_adaa_compensation_is_flat_and_delay_aligned)
+{
+    for (int factor : {2, 4, 8, 16})
+    {
+        detail::TubePreampCompensation compensation(factor);
+        for (int stages : {1, 2})
+        {
+            FIRFilter<double> eq;
+            const auto& taps = compensation.taps[static_cast<size_t>(stages - 1)];
+            eq.prepare(static_cast<int>(taps.size()), 1);
+            eq.setCoefficients(taps);
+            std::vector<double> impulse(128);
+            std::array<double, 6> previous{};
+            for (int n = 0; n < 128; ++n)
+            {
+                double x = n == 0 ? 1.0 : 0.0;
+                // Grid ADAA2: (1 + z^-1 + z^-2)/3. The plate-current
+                // ADAA1 contributes (1 + z^-1)/2 in each active stage.
+                for (int j = 0; j < stages; ++j)
+                {
+                    const size_t k = static_cast<size_t>(3 * j);
+                    const double old = x;
+                    x = (x + previous[k] + previous[k + 1]) / 3.0;
+                    previous[k + 1] = previous[k];
+                    previous[k] = old;
+                    const double grid = x;
+                    x = 0.5 * (x + previous[k + 2]);
+                    previous[k + 2] = grid;
+                }
+                impulse[static_cast<size_t>(n)] = eq.processSample(x, 0);
+            }
+            // Covers the WHOLE base-rate Nyquist band, not just the tone
+            // calibration's 6.4 kHz ceiling. The delay is stage independent.
+            for (int k = 0; k <= 200; ++k)
+            {
+                const double w = std::numbers::pi * k / (200.0 * factor);
+                double re = 0.0, im = 0.0;
+                for (int n = 0; n < 128; ++n)
+                {
+                    const double phase = w * (n - compensation.latency * factor);
+                    re += impulse[static_cast<size_t>(n)] * std::cos(phase);
+                    im += impulse[static_cast<size_t>(n)] * std::sin(phase);
+                }
+                EXPECT_LT(std::abs(20.0 * std::log10(re)), 0.10);
+                EXPECT_NEAR(im, 0.0, 2e-13);
+            }
+        }
+    }
+}
+
+DSPARK_TEST(TubePreamp_dry_mix_and_stage_changes_keep_reported_latency)
+{
+    constexpr int total = 513;
+    for (int factor : {1, 2, 4, 8, 16})
+    {
+        TubePreamp<double> dry, wet, mixed;
+        for (auto* amp : {&dry, &wet, &mixed})
+        {
+            amp->setOversampling(factor);
+            amp->prepare(spec(48000.0, 64, 1));
+        }
+        dry.setMix(0.0); mixed.setMix(0.5);
+        dry.reset(); mixed.reset();
+        const int latency = dry.getLatency();
+        std::array<double, total> source{};
+        for (int n = 0; n < total; ++n)
+            source[static_cast<size_t>(n)] = 0.05 * std::sin(0.7 * n) + (n == 7 ? 0.4 : 0.0);
+        AudioBuffer<double> d, w, m;
+        d.resize(1, 37); w.resize(1, 37); m.resize(1, 37);
+        for (int pos = 0; pos < total; pos += 37)
+        {
+            const int count = std::min(37, total - pos);
+            const int stages = (pos / 111) % 2 + 1;
+            for (auto* amp : {&dry, &wet, &mixed}) amp->setStages(stages);
+            for (int j = 0; j < count; ++j)
+                d.getChannel(0)[j] = w.getChannel(0)[j] = m.getChannel(0)[j] = source[static_cast<size_t>(pos + j)];
+            dry.processBlock(d.toView().getSubView(0, count));
+            wet.processBlock(w.toView().getSubView(0, count));
+            mixed.processBlock(m.toView().getSubView(0, count));
+            EXPECT_EQ(dry.getLatency(), latency);
+            EXPECT_EQ(wet.getLatency(), latency);
+            for (int j = 0; j < count; ++j)
+            {
+                const double expected = pos + j >= latency ? source[static_cast<size_t>(pos + j - latency)] : 0.0;
+                EXPECT_NEAR(d.getChannel(0)[j], expected, 1e-14);
+                EXPECT_NEAR(m.getChannel(0)[j], 0.5 * (expected + w.getChannel(0)[j]), 1e-13);
+            }
+        }
+    }
+}
+
 DSPARK_TEST(TubePreamp_dc_operating_point_and_legacy_state)
 {
     for (int stages : {1, 2})
@@ -1919,7 +2210,7 @@ DSPARK_TEST(TubePreamp_dc_operating_point_and_legacy_state)
         const auto oldState = legacy.blob();
         EXPECT_TRUE(amp.setState(oldState.data(), oldState.size()));
         EXPECT_EQ(amp.getOversamplingFactor(), 2);
-        EXPECT_EQ(amp.getLatency(), 64);
+        EXPECT_EQ(amp.getLatency(), 73);
     }
 }
 
@@ -2855,14 +3146,14 @@ DSPARK_TEST(TapeMachine_oversampling_configurable_and_reported)
 }
 
 // Transparency: TubePreamp gains a configurable oversampling factor incl.
-// 1x=off (zero added latency), reported per factor and persisted in state.
+// 1x disables internal resampling/ADAA; latency is persisted by factor.
 DSPARK_TEST(TubePreamp_oversampling_configurable_and_reported)
 {
     TubePreamp<float> t;
     t.prepare(spec(48000.0, 512, 2));
     t.setOversampling(1); const int l1 = t.getLatency();
     EXPECT_EQ(t.getOversamplingFactor(), 1);
-    EXPECT_EQ(l1, 0);                                   // 1x = off, no added latency
+    EXPECT_EQ(l1, 0);
     t.setOversampling(2); const int l2 = t.getLatency();
     EXPECT_EQ(t.getOversamplingFactor(), 2);
     t.setOversampling(4); const int l4 = t.getLatency();

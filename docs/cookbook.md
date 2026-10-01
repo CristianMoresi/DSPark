@@ -252,7 +252,7 @@ custom waveshaping hard, not for dynamics alone.
 
 Transparency: every processor that oversamples internally
 exposes the factor via `setOversampling(int)` with **factor = 1 meaning OFF**
-(no internal resampling, zero added latency), supports at least {1, 2, 4}, and
+(no internal resampling), supports at least {1, 2, 4}, and
 reports the added latency through `getLatency()` so the host can compensate.
 `DynamicEQ` embeds such a stage and **defaults to 1x (off)**: turn it up to 2x
 or 4x only when a band's detector needs the extra alias suppression, and leave
@@ -277,10 +277,14 @@ is setup-thread only - it reallocates and may re-calibrate like
   into the band (a 10.1 kHz tone at -6 dBFS through the default SoftClip left
   an alias 34 dB down; 124 dB down at 2x). `setOversampling(1)` gives zero
   latency for material that never reaches the curve's knee.
-- `TubePreamp` **defaults to 2x**. The triode + WDF tone solve runs `factor`x
-  oversampled; 4x roughly doubles the 2x CPU, 1x is the cheapest and adds zero
-  latency but lets the grid nonlinearity alias in-band. `getLatency()` reports
-  0 at 1x for TubePreamp (its only latency source is the oversampler). For
+- `TubePreamp` **defaults to 2x**. At factors 2/4/8/16, each triode uses ADAA2
+  on the grid clamp and ADAA1 on the plate-current interpolant, followed by a
+  bounded linear-phase FIR to compensate the small-signal treble loss.
+  `getLatency()` reports 73/98/113/121 samples respectively, independent of
+  the active stage count; the dry path includes the same delay. Factor 1
+  retains the point circuit without resampling or ADAA and reports zero:
+  use it inside an already oversampled host chain. Extreme-drive aliasing
+  remains measurable; consult the frequency/drive sweep in the header. For
   TapeMachine `getLatency()` at 1x is NOT zero: it still reports the loss-FIR
   centre + transport delay (127 at 48k); only the oversampler contribution
   drops to 0. Always query `getLatency()` for the active factor rather than

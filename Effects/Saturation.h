@@ -53,6 +53,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include "../Core/detail/LogCosh.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -66,14 +68,6 @@ namespace dspark {
 template <typename SampleType> class Saturation;
 
 namespace detail {
-
-/** Numerically stable log(cosh(x)) for the antiderivative anti-aliasing of tanh-based curves. */
-template <typename T>
-inline T logCosh(T x) noexcept
-{
-    T a = std::abs(x);
-    return a + std::log1p(std::exp(T(-2) * a)) - T(0.6931471805599453); // ln 2
-}
 
 template <typename T>
 class SaturationAlgorithm

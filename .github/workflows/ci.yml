@@ -302,18 +302,28 @@ jobs:
 
       - name: X11 WebView editor smoke (Linux)
         if: matrix.name == 'Linux GCC x64'
+        timeout-minutes: 15
         shell: bash
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q xvfb libwebkit2gtk-4.1-0 \
-            || sudo apt-get install -y -q xvfb libwebkit2gtk-4.0-37
+          # The runner's Azure mirror stalled before the editor test began.
+          # Use Ubuntu's archive for that entry and bound package operations.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i -E 's|https?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          sudo timeout --kill-after=10s 180s apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update -q
+          sudo timeout --kill-after=10s 180s apt-get "${apt_options[@]}" install -y -q xvfb libwebkit2gtk-4.1-0 \
+            || sudo timeout --kill-after=10s 180s apt-get "${apt_options[@]}" install -y -q xvfb libwebkit2gtk-4.0-37
           g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . tools/x11_editor_smoke.cpp \
             -o x11_editor_smoke -ldl
           # No GPU/DRI on CI runners: keep WebKit on the software paths.
           export WEBKIT_DISABLE_COMPOSITING_MODE=1
           export WEBKIT_DISABLE_DMABUF_RENDERER=1
-          xvfb-run -a ./x11_editor_smoke ./DSParkSaturator.vst3 --expect-no-editor
-          xvfb-run -a ./x11_editor_smoke ./DSParkWebSaturator.vst3 --expect-editor 560x330
+          export GDK_BACKEND=x11
+          # Keep a stalled external WebKit process observable and bounded.
+          # A timeout fails the job; it never substitutes for the handshake.
+          timeout --kill-after=10s 120s xvfb-run -a stdbuf -oL -eL ./x11_editor_smoke ./DSParkSaturator.vst3 --expect-no-editor
+          timeout --kill-after=10s 120s xvfb-run -a stdbuf -oL -eL ./x11_editor_smoke ./DSParkWebSaturator.vst3 --expect-editor 560x330
 
       - name: AUv2 bundle + auval (macOS)
         if: matrix.name == 'macOS Clang arm64'
@@ -574,6 +584,9 @@ jobs:
           # Sanitized template-heavy units need substantially more compiler
           # memory. Bound concurrent compilers instead of make's unlimited -j.
           cmake --build build-san --parallel 2
+          # Catch the circuit regression before starting the lengthy suite.
+          # The unfiltered CTest run below remains mandatory after this passes.
+          ./build-san/tests/dspark_tests --prefix TubePreamp_
           ctest --test-dir build-san --output-on-failure --test-output-size-failed 0
 
   # ---------------------------------------------------------------------------
@@ -607,7 +620,7 @@ jobs:
 
       # Concurrency claims come from the named threaded tests printed by this
       # exact run; executing a single-threaded case under TSan is not presented
-      # as proof of a hand-off. The ordinary suite authority is currently 1156
+      # as proof of a hand-off. The ordinary suite authority is currently 1165
       # named cases, with specialized allocation and Reverb publication tests
       # kept in separate CTest executables so their process-wide hooks do not
       # weaken sanitizer coverage in the ordinary suite.
@@ -632,6 +645,7 @@ jobs:
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -Wno-error=tsan"
           # Keep compiler memory bounded while retaining the complete suite.
           cmake --build build-tsan --parallel 2
+          ./build-tsan/tests/dspark_tests --prefix TubePreamp_
           ctest --test-dir build-tsan -V --timeout 5400
 
   # ---------------------------------------------------------------------------

@@ -45,21 +45,30 @@ struct AutoRegister
 // Runner
 // ============================================================================
 
-inline int runAll()
+inline int runAll(const std::string& prefix = {})
 {
     auto& tests = registry();
     int passed = 0;
     int failed = 0;
+    size_t selected = 0;
+    for (const auto& tc : tests)
+        if (tc.name.starts_with(prefix)) ++selected;
+    if (selected == 0)
+    {
+        std::cerr << "No tests match prefix: " << prefix << '\n';
+        return 1;
+    }
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
     for (auto& tc : tests)
     {
+        if (!tc.name.starts_with(prefix)) continue;
         // Named and flushed before the case runs, so a hard crash (signal,
         // stack exhaustion, an assertion firing) still identifies the culprit.
         // CTest buffers this and only prints it when the test fails, so a
         // green run stays silent.
-        std::cout << "[ " << (passed + failed + 1) << "/" << tests.size() << " ] "
+        std::cout << "[ " << (passed + failed + 1) << "/" << selected << " ] "
                   << tc.name << std::endl;
 
         currentTestFailed() = false;
@@ -93,7 +102,7 @@ inline int runAll()
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
     std::cout << "\n========================================\n";
-    std::cout << "  " << tests.size() << " tests | "
+    std::cout << "  " << selected << " tests | "
               << passed << " passed | "
               << failed << " failed | "
               << ms << " ms\n";

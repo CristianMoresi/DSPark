@@ -2366,6 +2366,109 @@ DSPARK_TEST(TubePreamp_drive_drag_is_click_free)
     EXPECT_LT(drag, 2.0 * stat + 1e-4);
 }
 
+namespace {
+template <class Sample>
+std::array<std::vector<Sample>, 2> renderTubeAutomation(int factor, int partition,
+                                                       int control)
+{
+    constexpr int frames = 4096, boundary = 173, maximumBlock = 257;
+    TubePreamp<Sample> amp;
+    amp.setOversampling(factor);
+    amp.setDrive(Sample(0));
+    amp.setOutput(Sample(-3));
+    amp.setStages(1);
+    amp.prepare({ 48000.0, maximumBlock, 2 });
+    std::array<std::vector<Sample>, 2> result;
+    for (auto& channel : result) channel.resize(frames);
+    for (int ch = 0; ch < 2; ++ch)
+        for (int i = 0; i < frames; ++i)
+            result[static_cast<size_t>(ch)][static_cast<size_t>(i)] =
+                static_cast<Sample>(0.12 * std::sin(2.0 * std::numbers::pi
+                    * (317.0 + ch * 701.0) * i / 48000.0));
+
+    constexpr std::array<int, 6> irregular { 7, 89, 1, 113, 53, 257 };
+    int position = 0;
+    size_t block = 0;
+    while (position < frames)
+    {
+        if (position == boundary)
+        {
+            if (control == 0) amp.setDrive(Sample(24));
+            if (control == 1) amp.setOutput(Sample(12));
+            if (control == 2) amp.setStages(2);
+        }
+        const int requested = partition == 0 ? maximumBlock
+                            : partition == 1 ? irregular[block++ % irregular.size()] : 1;
+        int count = std::min(requested, frames - position);
+        if (position < boundary) count = std::min(count, boundary - position);
+        Sample* channels[] = { result[0].data() + position, result[1].data() + position };
+        amp.processBlock({ channels, 2, count });
+        position += count;
+    }
+    return result;
+}
+
+template <class Sample>
+void verifyTubeAutomationPartitions()
+{
+    for (int factor : { 1, 2, 16 })
+        for (int control = 0; control < 3; ++control)
+        {
+            const auto reference = renderTubeAutomation<Sample>(factor, 0, control);
+            for (int partition : { 1, 2 })
+            {
+                const auto actual = renderTubeAutomation<Sample>(factor, partition, control);
+                double maximumDifference = 0.0;
+                for (size_t ch = 0; ch < actual.size(); ++ch)
+                    for (size_t i = 0; i < actual[ch].size(); ++i)
+                        maximumDifference = std::max(maximumDifference,
+                            std::abs(static_cast<double>(actual[ch][i])
+                                   - static_cast<double>(reference[ch][i])));
+                EXPECT_NEAR(maximumDifference, 0.0, 1e-11);
+            }
+        }
+}
+} // namespace
+
+DSPARK_TEST(TubePreamp_gain_automation_is_independent_of_block_partition)
+{
+    verifyTubeAutomationPartitions<float>();
+    verifyTubeAutomationPartitions<double>();
+}
+
+DSPARK_TEST(TubePreamp_output_automation_follows_the_sample_clock)
+{
+    constexpr int frames = 4096, boundary = 173;
+    TubePreamp<double> reference, automated;
+    for (auto* amp : { &reference, &automated })
+    {
+        amp->setOversampling(1);
+        amp->setDrive(12.0);
+        amp->setOutput(-3.0);
+        amp->prepare({ 48000.0, frames, 1 });
+    }
+    std::array<double, frames> baseline{}, output{};
+    for (int i = 0; i < frames; ++i)
+        baseline[static_cast<size_t>(i)] = output[static_cast<size_t>(i)] =
+            0.1 * std::sin(2.0 * std::numbers::pi * 997.0 * i / 48000.0);
+    double* a[] = { baseline.data() };
+    double* b[] = { output.data() };
+    reference.processBlock({ a, 1, frames });
+    automated.processBlock({ b, 1, boundary });
+    automated.setOutput(12.0);
+    b[0] += boundary;
+    automated.processBlock({ b, 1, frames - boundary });
+    double maximumError = 0.0;
+    for (int i = boundary; i < frames; ++i)
+    {
+        // Independent closed-form response of a 30 ms one-pole in dB.
+        const double db = 15.0 * (1.0 - std::exp(-(i - boundary + 1.0) / (0.030 * 48000.0)));
+        const double expected = baseline[static_cast<size_t>(i)] * std::pow(10.0, db / 20.0);
+        maximumError = std::max(maximumError, std::abs(output[static_cast<size_t>(i)] - expected));
+    }
+    EXPECT_LT(maximumError, 1e-11);
+}
+
 DSPARK_TEST(TransformerModel_drive_drag_is_click_free)
 {
     // The model differentiates its output (x 2*fs): any gain step becomes a

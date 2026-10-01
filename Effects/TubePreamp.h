@@ -100,7 +100,7 @@
  *
  * Dependencies: Core/WDF.h, Core/Oversampling.h, Core/Biquad.h,
  * Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h,
- * Core/StateBlob.h.
+ * Core/SmoothedValue.h, Core/StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -109,6 +109,7 @@
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/Oversampling.h"
+#include "../Core/SmoothedValue.h"
 #include "../Core/StateBlob.h"
 #include "../Core/WDF.h"
 
@@ -120,6 +121,7 @@
 #include <cstdint>
 #include <memory>
 #include <numbers>
+#include <span>
 #include <vector>
 
 namespace dspark {
@@ -302,6 +304,10 @@ public:
         fs2_ = static_cast<double>(osFactor_) * sampleRate_;
         numChannels_ = spec.numChannels;
         maxBlock_ = std::max(spec.maxBlockSize, 1);
+        driveLogSmoother_.prepare(fs2_, 30.0);
+        outputLogSmoother_.prepare(fs2_, 30.0);
+        for (auto& ramp : gainRamps_)
+            ramp.resize(static_cast<size_t>(maxBlock_) * static_cast<size_t>(osFactor_));
 
         if (osFactor_ > 1)
         {
@@ -347,8 +353,7 @@ public:
         dryPos_ = 0;
         if (oversampler_) oversampler_->reset();
         // Seed the anti-zipper ramps at their targets: no fade-in on start.
-        hScaleSm_ = -1.0;
-        outGainSm_ = -1.0;
+        gainsInitialized_ = false;
         currentMix_ = mix_.load(std::memory_order_relaxed);
     }
 
@@ -563,37 +568,56 @@ public:
             auto osView = osOn ? oversampler_->upsample(buffer) : buffer;
             const int osN = osView.getNumSamples();
 
-            // Anti-zipper: GEOMETRIC in-block ramps toward the current
-            // targets (~30 ms across blocks), shared by all channels. A flat
-            // per-block step clicked while dragging drive; and since
-            // (hScale, outGain) is a compensation pair spanning orders of
-            // magnitude (outGain ~ 1/drive), linear interpolation transits
-            // through over-gained states - power-law interpolation keeps
-            // the pair on the calibration curve.
-            if (outGainSm_ <= 0.0) outGainSm_ = outGain;
-            if (hScaleSm_ <= 0.0)  hScaleSm_ = hScale_;
-            const double kSm = 1.0 - std::exp(-static_cast<double>(osN) / (0.030 * fs2_));
-            const double outEnd = outGainSm_ * std::pow(outGain / outGainSm_, kSm);
-            const double hEnd   = hScaleSm_ * std::pow(hScale_ / hScaleSm_, kSm);
-            const double outRat = std::pow(outEnd / outGainSm_, 1.0 / static_cast<double>(osN));
-            const double hRat   = std::pow(hEnd / hScaleSm_, 1.0 / static_cast<double>(osN));
+            // Smooth the compensation pair in logarithmic gain at the
+            // internal sample clock. Interpolating between block endpoints
+            // changes the trajectory when a host changes its block size.
+            // Core's sample-exact one-pole retains the 30 ms time constant.
+            const double driveLog = std::log(hScale_);
+            const double outputLog = std::log(outGain);
+            if (!gainsInitialized_)
+            {
+                driveLogSmoother_.reset(driveLog);
+                outputLogSmoother_.reset(outputLog);
+                gainsInitialized_ = true;
+            }
+            driveLogSmoother_.setTargetValue(driveLog);
+            outputLogSmoother_.setTargetValue(outputLog);
+            const bool driveRamping = driveLogSmoother_.isSmoothing();
+            const bool outputRamping = outputLogSmoother_.isSmoothing();
+            if (driveRamping)
+            {
+                driveLogSmoother_.processBlock(
+                    std::span<double>(gainRamps_[0].data(), static_cast<size_t>(osN)));
+                for (int i = 0; i < osN; ++i)
+                {
+                    auto& value = gainRamps_[0][static_cast<size_t>(i)];
+                    value = value == driveLog ? hScale_ : std::exp(value);
+                }
+            }
+            if (outputRamping)
+            {
+                outputLogSmoother_.processBlock(
+                    std::span<double>(gainRamps_[1].data(), static_cast<size_t>(osN)));
+                for (int i = 0; i < osN; ++i)
+                {
+                    auto& value = gainRamps_[1][static_cast<size_t>(i)];
+                    value = value == outputLog ? outGain : std::exp(value);
+                }
+            }
 
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* d = osView.getChannel(ch);
                 auto& state = *channels_[static_cast<size_t>(ch)];
-                double g = outGainSm_, h = hScaleSm_;
                 for (int i = 0; i < osN; ++i)
                 {
-                    g *= outRat;
-                    h *= hRat;
+                    const double g = outputRamping ? gainRamps_[1][static_cast<size_t>(i)] : outGain;
+                    const double h = driveRamping ? gainRamps_[0][static_cast<size_t>(i)] : hScale_;
                     d[i] = static_cast<T>(g
                         * state.processSample(h * static_cast<double>(d[i]),
                                               numStagesActive_, sagR_));
                 }
             }
-            outGainSm_ = outEnd;
-            hScaleSm_ = hEnd;
             if (osOn) oversampler_->downsample(buffer);
             supplyNow_.store(static_cast<T>(kBplus - sagR_ * channels_[0]->ipLP),
                              std::memory_order_relaxed);
@@ -1019,8 +1043,9 @@ private:
     std::array<std::array<double, kDriveLutN>, 2> gProgLut_ {
         { { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 },
           { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 } } };
-    double hScaleSm_ = -1.0;                    ///< Anti-zipper ramp states (-1 = seed on
-    double outGainSm_ = -1.0;                   ///<  first block after prepare/reset).
+    SmoothedValue<double> driveLogSmoother_, outputLogSmoother_;
+    std::array<std::vector<double>, 2> gainRamps_;
+    bool gainsInitialized_ = false;
     T currentMix_ = T(1);                       ///< Audio-thread mix ramp state.
     T mixMaxStep_ = T(1.0 / 960.0);             ///< Mix ramp rate: full scale per 20 ms.
 

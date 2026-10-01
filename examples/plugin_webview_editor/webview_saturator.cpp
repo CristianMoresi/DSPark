@@ -74,7 +74,7 @@ struct DSParkWebSaturator
 
     [[nodiscard]] int getLatency() const noexcept
     {
-        return saturation_.getLatencySamples();
+        return saturation_.getLatency();
     }
 
     // --- the editor ---------------------------------------------------------------

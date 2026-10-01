@@ -14,6 +14,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <concepts>
 #include <numbers>
@@ -27,6 +28,14 @@ namespace dspark {
 /** @brief Constrains a type to IEEE floating-point (float or double). */
 template <typename T>
 concept FloatType = std::floating_point<T>;
+
+namespace detail {
+// Shared coefficients of the existing reduced-range odd sine polynomial.
+// Nonlinear offline kernels also use its exact slope and residual bounds.
+template <FloatType T> inline constexpr std::array<T, 5> fastSinPolynomial{
+    T(0.99999997408724855), T(-0.16666646026660671), T(0.0083328727116396326),
+    T(-0.00019799239565814083), T(2.5871610835732768e-6)};
+} // namespace detail
 
 // ============================================================================
 // Constants
@@ -253,11 +262,8 @@ template <FloatType T>
     // Endpoint-constrained Remez minimax coefficients for sin on [-pi/2, pi/2]
     // (equiripple error 3.73e-9, p(pi/2) == 1). Near-Taylor coefficients of
     // the same degree leave ~3e-6 of error: a -110 dB harmonic floor.
-    return x * (T(0.99999997408724855)
-         + x2 * (T(-0.16666646026660671)
-         + x2 * (T(0.0083328727116396326)
-         + x2 * (T(-0.00019799239565814083)
-         + x2 *  T(2.5871610835732768e-6)))));
+    constexpr auto c = detail::fastSinPolynomial<T>;
+    return x * (c[0] + x2 * (c[1] + x2 * (c[2] + x2 * (c[3] + x2 * c[4]))));
 }
 
 /**

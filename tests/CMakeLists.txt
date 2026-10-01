@@ -5,7 +5,7 @@
 #   ctest --test-dir build --output-on-failure
 #
 # Five targets:
-#   dspark_tests            the ordinary 982-case suite (zero dependencies)
+#   dspark_tests            the ordinary 1156-case suite (zero dependencies)
 #   dspark_alloc_failure    allocation-failure injection, deliberately apart
 #   dspark_reverb_publication fixed-operation ownership/publication contract
 #   dspark_standalone       compile gate: umbrella header alone, float + double
@@ -25,6 +25,7 @@ endforeach()
 add_executable(dspark_tests
     main.cpp
     TestAnalysis.cpp
+    TestAudioInterval.cpp
     TestCoreFilters.cpp
     TestCoreFoundation.cpp
     TestCoreGenerators.cpp
@@ -34,6 +35,7 @@ add_executable(dspark_tests
     TestEffectsDynamics.cpp
     TestEffectsModulation.cpp
     TestEffectsStereo.cpp
+    TestStereoGenerator.cpp
     TestEffectsTone.cpp
     TestIO.cpp
     TestIntegration.cpp
@@ -41,6 +43,16 @@ add_executable(dspark_tests
     TestBeat.cpp
     TestKey.cpp
     TestLoudnessNormalizer.cpp
+    TestOfflineLeveler.cpp
+    TestOfflinePeak.cpp
+    TestOfflinePunch.cpp
+    TestOfflineProduct.cpp
+    TestOfflineGainRender.cpp
+    TestOfflineTransient.cpp
+    TestOfflineTempo.cpp
+    TestOfflineBeat.cpp
+    TestOfflineClip.cpp
+    TestOfflineStereo.cpp
     TestOnset.cpp
     TestSpectralFreeze.cpp
     TestLoopFinder.cpp

@@ -108,6 +108,7 @@ Exits 1 and lists every offending line, or 2 if a tracked file cannot be read.
 """
 
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -425,7 +426,10 @@ def resolves(token, base, tracked_set, directories):
     segments happened to coincide with a file here."""
     candidates = {token}
     if base:
-        candidates.add(os.path.normpath(os.path.join(base, token)))
+        # Git's inventory and path_claims() use forward slashes on every OS.
+        # Native Windows normalization changed valid relative references to
+        # backslashes and reported 17 tracked paths as missing.
+        candidates.add(posixpath.normpath(posixpath.join(base, token)))
     if token.startswith(INSTALL_PREFIX):
         candidates.add(token[len(INSTALL_PREFIX):])
     return any(c in tracked_set or c in directories for c in candidates)

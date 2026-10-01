@@ -59,6 +59,8 @@ namespace dspark {
  *
  * Uses the windowed-sinc method: an ideal (sinc) impulse response is
  * multiplied by a window function to produce a realisable FIR filter.
+ * Coefficient factories allocate during setup. With exceptions enabled,
+ * allocation failures propagate to the caller without publishing partial results.
  *
  * All methods return a vector of filter coefficients (taps). The number
  * of taps determines the filter's steepness and stopband attenuation.
@@ -85,7 +87,7 @@ public:
      * @return Vector of filter coefficients.
      */
     [[nodiscard]] static std::vector<T> lowPass(double sampleRate, double cutoffHz,
-                                                 int numTaps, T beta = T(5)) noexcept
+                                                 int numTaps, T beta = T(5))
     {
         assert(numTaps >= 3 && (numTaps % 2 == 1));
         numTaps = sanitizeTaps(numTaps);
@@ -104,7 +106,7 @@ public:
      * @return Vector of filter coefficients.
      */
     [[nodiscard]] static std::vector<T> highPass(double sampleRate, double cutoffHz,
-                                                  int numTaps, T beta = T(5)) noexcept
+                                                  int numTaps, T beta = T(5))
     {
         assert(numTaps >= 3 && (numTaps % 2 == 1));
         numTaps = sanitizeTaps(numTaps);
@@ -125,7 +127,7 @@ public:
      */
     [[nodiscard]] static std::vector<T> bandPass(double sampleRate, double lowCutoffHz,
                                                   double highCutoffHz, int numTaps,
-                                                  T beta = T(5)) noexcept
+                                                  T beta = T(5))
     {
         assert(numTaps >= 3 && (numTaps % 2 == 1));
         assert(lowCutoffHz < highCutoffHz);
@@ -152,7 +154,7 @@ public:
      */
     [[nodiscard]] static std::vector<T> bandStop(double sampleRate, double lowCutoffHz,
                                                   double highCutoffHz, int numTaps,
-                                                  T beta = T(5)) noexcept
+                                                  T beta = T(5))
     {
         assert(numTaps >= 3 && (numTaps % 2 == 1));
         // Sanitise HERE too: bandPass() sanitises its own copy, so an even
@@ -233,7 +235,7 @@ private:
      * @return Coefficient vector.
      */
     [[nodiscard]] static std::vector<T> designSinc(double normFreq, int numTaps,
-                                                    T beta, bool invert) noexcept
+                                                    T beta, bool invert)
     {
         std::vector<double> design(static_cast<size_t>(numTaps));
         std::vector<double> window(static_cast<size_t>(numTaps));

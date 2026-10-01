@@ -16,6 +16,8 @@
 #include "../Core/DryWetMixer.h"
 #include "../Core/ProcessorChain.h"
 #include "../Core/ProcessorTraits.h"
+#include "../Core/detail/RationalKnee.h"
+#include "../Core/detail/ContinuousClip.h"
 #include "../Effects/Gain.h" // For ProcessorChain test
 
 #include "../Core/ModulationRouter.h"
@@ -1882,4 +1884,195 @@ DSPARK_TEST(WaveshapeTable_adaa_is_exact_and_lowers_the_alias_floor)
     };
     const double plain = aliasDb(false), adaa = aliasDb(true);
     EXPECT_LT(adaa, plain - 10.0);
+}
+
+DSPARK_TEST(RationalKnee_body_continuity_and_limits)
+{
+    for (const auto knees : { std::array<double, 2>{0.96, 0.78},
+                              std::array<double, 2>{0.9, 0.9} })
+    {
+        for (double sign : {-1.0, 1.0})
+        {
+            const double knee = sign > 0 ? knees[0] : knees[1];
+            for (double fraction : {0.0, 0.25, 0.75, 1.0})
+            {
+                const double x = sign * knee * fraction;
+                EXPECT_EQ(detail::rationalKneeShape(x, knees[0], knees[1]), x);
+            }
+            const double h = 1e-8;
+            const double next = detail::rationalKneeShape(sign * (knee + h), knees[0], knees[1]);
+            EXPECT_NEAR((sign * next - knee) / h, 1.0, 1e-6);
+            EXPECT_NEAR(detail::rationalKneeShape(sign * 1e150, knees[0], knees[1]), sign, 1e-15);
+        }
+    }
+    EXPECT_EQ(detail::rationalKneeMagnitude(1.0, 0.5, 1.0), 0.75);
+    EXPECT_EQ(detail::rationalKneeMagnitude(1.0f, 0.5f, 1.0f), 0.75f);
+}
+
+DSPARK_TEST(RationalKnee_integral_matches_independent_quadrature)
+{
+    // Composite Simpson on each smooth side of the knee; the reference uses
+    // direct division of the transfer curve, independently of its logarithmic
+    // antiderivative. Include both asymmetric voicings and reversed integration.
+    for (const auto knees : { std::array<double, 2>{0.96, 0.78},
+                              std::array<double, 2>{0.9, 0.9} })
+    {
+        for (double sign : {-1.0, 1.0})
+        {
+            const double k = sign > 0 ? knees[0] : knees[1];
+            for (double extent : {0.25, k, k + 1e-5, k + 0.04, 2.0, 7.0})
+            {
+                double integral = 0.5 * std::min(extent, k) * std::min(extent, k);
+                if (extent > k)
+                {
+                    constexpr int intervals = 16384;
+                    const double step = (extent - k) / intervals;
+                    long double sum = 0;
+                    for (int i = 0; i <= intervals; ++i)
+                    {
+                        const double x = k + step * i;
+                        const double value = 1.0 - (1.0 - k) * (1.0 - k) / (x + 1.0 - 2.0 * k);
+                        const int weight = (i == 0 || i == intervals) ? 1 : (i & 1) ? 4 : 2;
+                        sum += static_cast<long double>(weight) * value;
+                    }
+                    integral += static_cast<double>(sum * step / 3);
+                }
+                EXPECT_NEAR(detail::rationalKneeIntegral(sign * extent, knees[0], knees[1]),
+                            integral, 1e-11);
+            }
+        }
+    }
+}
+
+DSPARK_TEST(Oversampling_small_channel_capacity_preserves_views_and_output)
+{
+    static_assert(std::is_convertible_v<AudioBufferView<float, 2>, AudioBufferView<float>>);
+    static_assert(std::is_convertible_v<AudioBufferView<float, 2>, AudioBufferView<const float>>);
+    static_assert(!std::is_convertible_v<AudioBufferView<const float, 2>, AudioBufferView<float>>);
+    static_assert(!std::is_convertible_v<AudioBufferView<float>, AudioBufferView<float, 2>>);
+    for (int factor : {1, 2, 4, 8, 16})
+    {
+        Oversampling<double, 2> compact(factor);
+        Oversampling<double> standard(factor);
+        compact.prepare({48000, 127, 2});
+        standard.prepare({48000, 127, 2});
+        AudioBuffer<double, 2> input, left, right;
+        input.resize(2, 127); left.resize(2, 127); right.resize(2, 127);
+        for (int block = 0; block < 17; ++block)
+        {
+            const int count = block % 2 == 0 ? 127 : 31;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < count; ++i)
+                    input.getChannel(ch)[i] = std::sin(0.013 * (block * 127 + i) + ch);
+            const auto source = input.toView().getSubView(0, count);
+            const auto up = compact.upsample(source);
+            const auto ref = standard.upsample(source);
+            EXPECT_EQ(up.getNumChannels(), 2);
+            EXPECT_EQ(up.getNumSamples(), count * factor);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < up.getNumSamples(); ++i)
+                    EXPECT_EQ(up.getChannel(ch)[i], ref.getChannel(ch)[i]);
+            compact.downsample(left.toView().getSubView(0, count));
+            standard.downsample(right.toView().getSubView(0, count));
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < count; ++i)
+                    EXPECT_EQ(left.getChannel(ch)[i], right.getChannel(ch)[i]);
+        }
+    }
+}
+
+DSPARK_TEST(ContinuousClip_rational_moments_match_independent_quadrature)
+{
+    const auto verify = []<detail::ClipperCurve Curve>(double positive, double negative) {
+        for (double ceiling : {1e-6, 0.08, 4.0})
+        {
+            detail::continuous_clip::Interval<Curve, 11> integral(ceiling);
+            for (const auto endpoints :
+                 {std::array<double, 2>{-1.5, 1.8}, std::array<double, 2>{1.2, 2.1},
+                  std::array<double, 2>{-2.1, -0.6},
+                  std::array<double, 2>{positive - 1e-8, positive + 1e-8},
+                  std::array<double, 2>{0, 0}, std::array<double, 2>{1.2, 1.2},
+                  std::array<double, 2>{-1.2, -1.2}})
+            {
+                const double start = ceiling * endpoints[0];
+                const double slope = ceiling * (endpoints[1] - endpoints[0]);
+                std::array<double, 12> samples{};
+                for (int i = 0; i < 12; ++i)
+                    samples[i] = start + slope * (i - 5);
+                const auto actual = integral(samples);
+                std::vector<double> splits{0, 1};
+                if (slope != 0)
+                    for (double knee : {-negative * ceiling, positive * ceiling})
+                    {
+                        const double t = (knee - start) / slope;
+                        if (t > 0 && t < 1)
+                            splits.push_back(t);
+                    }
+                std::sort(splits.begin(), splits.end());
+                std::array<long double, 4> reference{};
+                // Independent Simpson integration of a known linear input.
+                // The reference uses c-w*w/(a+c-2*k), not the kernel's shape
+                // evaluation, interpolation, quadrature or knee isolation.
+                constexpr int count = 16384;
+                for (std::size_t segment = 1; segment < splits.size(); ++segment)
+                {
+                    const long double a = splits[segment - 1], b = splits[segment];
+                    const long double step = (b - a) / count;
+                    for (int i = 0; i <= count; ++i)
+                    {
+                        const long double t = a + i * step;
+                        const long double x = start + slope * t, magnitude = std::abs(x);
+                        const long double k = (x >= 0 ? positive : negative) * ceiling;
+                        const long double width = ceiling - k;
+                        const long double shaped =
+                            magnitude <= k
+                                ? x
+                                : std::copysign(
+                                      ceiling - width * width / (magnitude + ceiling - 2 * k), x);
+                        const int weight = i == 0 || i == count ? 1 : (i & 1) ? 4 : 2;
+                        long double value = weight * step / 3 * (shaped - x);
+                        for (int moment = 0; moment < 4; ++moment)
+                        {
+                            reference[moment] += value;
+                            value *= t;
+                        }
+                    }
+                }
+                for (int moment = 0; moment < 4; ++moment)
+                    EXPECT_NEAR(actual[moment], static_cast<double>(reference[moment]),
+                                1e-11 * std::max(1.0, ceiling));
+            }
+        }
+    };
+    verify.template operator()<detail::ClipperCurve::SymmetricKnee>(0.9, 0.9);
+    verify.template operator()<detail::ClipperCurve::AsymmetricKnee>(0.96, 0.78);
+}
+
+DSPARK_TEST(ContinuousClip_stream_reset_and_numerical_error_contract)
+{
+    using Curve = detail::ClipperCurve;
+    detail::continuous_clip::Residual<Curve::AsymmetricKnee> stream;
+    static_assert(noexcept(stream.process(0.0)));
+    static_assert(noexcept(stream.reset(0.08)));
+    std::array<double, 513> first{};
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        stream.reset(0.08);
+        for (int i = 0; i < 513; ++i)
+        {
+            const double value = stream.process(0.2 * std::sin(0.73 * i) + 0.04);
+            EXPECT_TRUE(std::isfinite(value));
+            if (pass == 0)
+                first[i] = value;
+            else
+                EXPECT_EQ(value, first[i]);
+        }
+    }
+    detail::continuous_clip::Interval<Curve::AsymmetricKnee, 11> integral(0.08);
+    std::array<double, 12> invalid{};
+    invalid[5] = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(std::isfinite(integral(invalid)[0]));
+    stream.reset(0.08);
+    for (int i = 0; i < 32; ++i)
+        EXPECT_EQ(stream.process(0.0), 0.0);
 }

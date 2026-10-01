@@ -127,10 +127,11 @@ for complete programs.
 |---|---|
 | Filters and equalization | `Biquad`, `StateVariableFilter`, `LadderFilter`, `FilterEngine`, `Equalizer`, `CrossoverFilter` |
 | Dynamics and level control | `Compressor`, `Limiter`, `NoiseGate`, `Expander`, `DynamicEQ`, `MultibandCompressor`, `DeEsser` |
+| Offline dynamics, clipping, stereo and analysis | `OfflineLeveler`, `OfflineBeatCompressor`, `OfflinePeakCompressor`, `OfflinePunch`, `OfflineSoftClipper`, `OfflineHardClipper`, `OfflineStereoGenerator`, `OfflineEnergyAnalyzer`, `OfflineTransientAnalyzer`, `OfflineTempoAnalyzer` ([worker API](docs/offline-processing.md)) |
 | Nonlinear and analog modeling | `Saturation`, `Clipper`, `TapeMachine`, `TubePreamp`, `TransformerModel`, `wdf::*` |
 | Time, pitch, and spatial processing | `Delay`, `AlgorithmicReverb`, `Reverb`, `PitchShifter`, `TimeStretch`, `PitchCorrector`, `GranularProcessor` |
 | Spectral processing | `FFTReal`, `Convolver`, `ZeroLatencyConvolver`, `SpectralProcessor`, `SpectralFreeze`, `SpectralDenoiser` |
-| Analysis and metering | `SpectrumAnalyzer`, `LoudnessMeter`, `LoudnessNormalizer`, `PitchDetector`, `OnsetDetector`, `BeatTracker`, `LoopFinder`, `DelayEstimator` |
+| Analysis and metering | `SpectrumAnalyzer`, `LoudnessMeter`, `AudioIntervalAnalyzer`, `LoudnessNormalizer`, `PitchDetector`, `OnsetDetector`, `BeatTracker`, `LoopFinder`, `DelayEstimator` |
 | Synthesis and music | `Oscillator`, `WavetableOscillator`, `Sampler`, `ADSREnvelope`, `ChordDetector`, `KeyDetector`, `harmony::*` |
 | Infrastructure | `AudioBuffer`, `ProcessorChain`, `Resampler`, `Oversampling`, `Dither`, `SpscQueue`, versioned state blobs |
 | File I/O | WAV and MP3 read/write, Standard MIDI File read/write, native FLAC decode |

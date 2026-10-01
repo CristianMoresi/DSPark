@@ -478,6 +478,170 @@ DSPARK_TEST(LoudnessMeter_silence)
     EXPECT_LT(lufs, -70.0f); // Should be very low
 }
 
+namespace {
+template <class T>
+void checkLoudnessFloor()
+{
+    // Steady 1 kHz powers below, across and above both the former power-domain
+    // switch and the actual -100 LUFS floor. The first two reported levels are
+    // -100.70 and -100.69 LUFS before flooring; neither may fall below -100.
+    constexpr double base = 1.3037063414911167e-5;
+    constexpr double steps[] = { -20, -1, -0.01, 0, 0.01, 0.1, 0.69, 0.70,
+                                 0.71, 0.8, 1, 2 };
+    std::vector<T> tone(6 * 48000);
+    T previousMomentary = T(-100), previousShortTerm = T(-100);
+    for (double step : steps)
+    {
+        const double amplitude = base * std::pow(10.0, step / 20.0);
+        for (size_t i = 0; i < tone.size(); ++i)
+            tone[i] = static_cast<T>(amplitude * std::sin(
+                twoPi<double> * 1000.0 * static_cast<double>(i) / 48000.0));
+        LoudnessMeter<T> meter;
+        meter.prepare(48000.0, 1);
+        meter.process(tone.data(), static_cast<int>(tone.size()));
+        const T momentary = meter.getMomentaryLUFS();
+        const T shortTerm = meter.getShortTermLUFS();
+        EXPECT_TRUE(momentary >= previousMomentary);
+        EXPECT_TRUE(shortTerm >= previousShortTerm);
+        EXPECT_NEAR(momentary, std::max(-100.0, -100.70 + step), 0.00002);
+        EXPECT_NEAR(shortTerm, std::max(-100.0, -100.70 + step), 0.00002);
+        if (step <= 0.69)
+        {
+            EXPECT_EQ(momentary, T(-100));
+            EXPECT_EQ(shortTerm, T(-100));
+        }
+        previousMomentary = momentary;
+        previousShortTerm = shortTerm;
+    }
+}
+
+template <class T>
+void checkFiniteTruePeak()
+{
+    // Test mono, then stereo with the hard ending on either channel alone.
+    for (int layout = 0; layout < 3; ++layout)
+    {
+        LoudnessMeter<T> meter;
+        meter.finalizeTruePeak(); // Unprepared is a no-op.
+        const T silence = meter.getTruePeakDb();
+        meter.prepare(48000.0, layout == 0 ? 1 : 2);
+        meter.finalizeTruePeak();
+        EXPECT_EQ(meter.getTruePeakDb(), silence);
+        std::vector<T> hardEnd(48000, T(0.05)), quiet(48000, T(0.05));
+        hardEnd[47998] = T(0.9);
+        hardEnd[47999] = T(-0.9);
+        if (layout == 0) meter.process(hardEnd.data(), 48000);
+        else if (layout == 1) meter.process(hardEnd.data(), quiet.data(), 48000);
+        else meter.process(quiet.data(), hardEnd.data(), 48000);
+        EXPECT_NEAR(meter.getTruePeakDb(), -0.9151498112135024, 0.000002);
+        const T momentary = meter.getMomentaryLUFS();
+        const T shortTerm = meter.getShortTermLUFS();
+        const T integrated = meter.getIntegratedLUFS();
+        const T range = meter.getLoudnessRange();
+        meter.finalizeTruePeak();
+        // Direct Annex 2 interpolation of the finite hard ending: the largest
+        // phase evaluates to 0.972222900390625 for double-valued input.
+        EXPECT_NEAR(meter.getTruePeakDb(), 20.0 * std::log10(0.972222900390625), 0.000002);
+        const T finalPeak = meter.getTruePeakDb();
+        meter.finalizeTruePeak();
+        EXPECT_EQ(meter.getTruePeakDb(), finalPeak);
+        EXPECT_EQ(meter.getMomentaryLUFS(), momentary);
+        EXPECT_EQ(meter.getShortTermLUFS(), shortTerm);
+        EXPECT_EQ(meter.getIntegratedLUFS(), integrated);
+        EXPECT_EQ(meter.getLoudnessRange(), range);
+        EXPECT_TRUE(meter.isMeasurementValid());
+        meter.reset();
+        meter.finalizeTruePeak();
+        EXPECT_EQ(meter.getTruePeakDb(), silence);
+        EXPECT_EQ(meter.getMomentaryLUFS(), T(-100));
+        EXPECT_TRUE(meter.isMeasurementValid());
+    }
+}
+
+template <class T>
+void checkFinalizerLoudnessHistory()
+{
+    LoudnessMeter<T> finalized, untouched;
+    finalized.prepare(48000.0, 1);
+    untouched.prepare(48000.0, 1);
+    std::vector<T> audio(7 * 48000 - 3);
+    for (size_t i = 0; i < audio.size(); ++i)
+        audio[i] = static_cast<T>((0.03 + 0.02 * ((i / 48000) % 4)) *
+            std::sin(twoPi<double> * 1000.0 * static_cast<double>(i) / 48000.0));
+    finalized.process(audio.data(), static_cast<int>(audio.size()));
+    untouched.process(audio.data(), static_cast<int>(audio.size()));
+    finalized.finalizeTruePeak();
+    // Three samples from the next 100 ms commit. A whole-meter zero flush
+    // would shift this boundary and all subsequent overlapping windows.
+    const T next = T(0.125);
+    for (int i = 0; i < 4800 + 3; ++i)
+    {
+        EXPECT_EQ(finalized.getMomentaryLUFS(), untouched.getMomentaryLUFS());
+        EXPECT_EQ(finalized.getShortTermLUFS(), untouched.getShortTermLUFS());
+        if (i < 5 || i == 4800)
+        {
+            EXPECT_EQ(finalized.getIntegratedLUFS(), untouched.getIntegratedLUFS());
+            EXPECT_EQ(finalized.getLoudnessRange(), untouched.getLoudnessRange());
+        }
+        finalized.process(&next, 1);
+        untouched.process(&next, 1);
+    }
+}
+} // namespace
+
+DSPARK_TEST(LoudnessMeter_floor_is_monotone_for_float_and_double)
+{
+    checkLoudnessFloor<float>();
+    checkLoudnessFloor<double>();
+}
+
+DSPARK_TEST(LoudnessMeter_finite_true_peak_finalization)
+{
+    checkFiniteTruePeak<float>();
+    checkFiniteTruePeak<double>();
+}
+
+DSPARK_TEST(LoudnessMeter_true_peak_finalization_preserves_loudness_clock)
+{
+    checkFinalizerLoudnessHistory<float>();
+    checkFinalizerLoudnessHistory<double>();
+}
+
+DSPARK_TEST(TruePeakDetector_tail_query_preserves_live_channel_history)
+{
+    const auto check = []<class T>()
+    {
+        TruePeakDetector<T, 2> detector, liveReference, drained;
+        for (int n = 0; n < 100; ++n)
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                const T input = static_cast<T>((n % 17 - 8) * (ch == 0 ? 0.125 : -0.0625));
+                (void)detector.processSample(input, ch);
+                (void)liveReference.processSample(input, ch);
+                (void)drained.processSample(input, ch);
+            }
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            T tail = T(0);
+            for (int n = 0; n < drained.getTaps() - 1; ++n)
+                tail = std::max(tail, drained.processSample(T(0), ch));
+            EXPECT_EQ(detector.getTailPeak(ch), tail);
+            EXPECT_EQ(detector.getTailPeak(ch), tail);
+        }
+        for (int n = 0; n < 100; ++n)
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                const T input = static_cast<T>((n % 13 - 6) * 0.0625);
+                EXPECT_EQ(detector.processSample(input, ch), liveReference.processSample(input, ch));
+            }
+        detector.reset();
+        EXPECT_EQ(detector.getTailPeak(0), T(0));
+        EXPECT_EQ(detector.getTailPeak(1), T(0));
+    };
+    check.template operator()<float>();
+    check.template operator()<double>();
+}
+
 DSPARK_TEST(LoudnessMeter_louder_signal_higher_LUFS)
 {
     LoudnessMeter<float> m1, m2;

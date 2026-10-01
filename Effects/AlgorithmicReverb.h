@@ -1389,8 +1389,11 @@ protected:
             for (int k = 0; k < n / 2; ++k)
             {
                 const T theta = rotLfo_[k].nextStride(4 * kCtrl) * rotDepth_;
-                rotC_[k] = std::cos(theta);
-                rotS_[k] = std::sin(theta);
+                // Form the rotation in double before rounding coefficients to T.
+                // Single-precision libm differences are otherwise recirculated
+                // through the feedback network on every sample.
+                rotC_[k] = static_cast<T>(std::cos(static_cast<double>(theta)));
+                rotS_[k] = static_cast<T>(std::sin(static_cast<double>(theta)));
             }
         for (int i = 0; i < n; ++i)
         {

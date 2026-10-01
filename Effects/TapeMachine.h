@@ -390,9 +390,8 @@ public:
      *  transport delay); reflects the current factor for host PDC. */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
 
-    /** @brief Same value as getLatency(), under the name Saturation and the
-     *  analysis classes use. ProcessorChain::getLatency() reads getLatency(). */
-    [[nodiscard]] int getLatencySamples() const noexcept { return latency_; }
+    /** @brief Compatibility alias of getLatency(), in prepared-rate samples. */
+    [[nodiscard]] int getLatencySamples() const noexcept { return getLatency(); }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const

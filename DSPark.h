@@ -78,13 +78,18 @@
  *
  * @section lifecycle Processor Lifecycle
  *
- * Every processor in this framework follows the same three-step pattern:
+ * Real-time processors follow this three-step pattern:
  *
  * 1. **Create** - Construct the processor (stack or heap, your choice).
  * 2. **Prepare** - Call `prepare(AudioSpec)` once before processing. This is the
  *    only step that may allocate memory. Call again if sample rate or block size changes.
  * 3. **Process** - Call `process()` / `processBlock()` / `processSample()` in your
  *    audio callback. These methods are real-time safe (zero allocations, no locks).
+ *
+ * Complete-source offline processors use worker-thread analysis and render calls
+ * instead. @ref dspark::OfflineLeveler and @ref dspark::OfflineEnergyAnalyzer
+ * must not run in an audio callback. See docs/offline-processing.md for their
+ * source, plan and sink APIs.
  *
  * ```
  * +----------+     +-------------------+     +----------------------------+
@@ -344,6 +349,7 @@
  * | `DCBlocker<T>`           | Effects/DCBlocker.h   | DC offset removal (1-pole or Butterworth order 2-10)                |
  * | `Crossfade<T>`           | Effects/Crossfade.h   | Crossfade with linear, equal-power, S-curve                         |
  * | `StereoWidth<T>`         | Effects/StereoWidth.h | Stereo width via M/S with bass-mono option                          |
+ * | `StereoGenerator<T>`     | Effects/StereoGenerator.h | Twenty-band processed-copy stereo generation with rational color |
  * | `Compressor<T>`          | Effects/Compressor.h  | Modular compressor (3 detectors, 2 topologies, 4 characters, ext. sidechain) |
  * | `Limiter<T>`             | Effects/Limiter.h     | ISP true-peak brickwall limiter with adaptive release                |
  * | `NoiseGate<T>`           | Effects/NoiseGate.h   | Noise gate with hysteresis, hold, duck mode, ext. sidechain         |
@@ -352,6 +358,13 @@
  * | `MultibandCompressor<T>` | Effects/MultibandCompressor.h | Multi-band compressor (crossover split + per-band Compressor) |
  * | `DynamicEQ<T>`           | Effects/DynamicEQ.h   | Per-band dynamic EQ (above/below threshold, ext. sidechain)        |
  * | `TransientDesigner<T>`   | Effects/TransientDesigner.h | Dual-envelope transient shaper (attack/sustain control)       |
+ * | `OfflineBeatCompressor<T>` | Effects/OfflineBeatCompressor.h | Pulse peak leveling with local tempo release; offline worker only |
+ * | `OfflineLeveler<T>`      | Effects/OfflineLeveler.h | Complete-source upward RMS leveling; offline worker only |
+ * | `OfflinePeakCompressor<T>` | Effects/OfflinePeakCompressor.h | Source-aligned automatic peak reduction with local transient hold; offline worker only |
+ * | `OfflineSoftClipper<T>` | Effects/OfflineSoftClipper.h | Calibrated complete-source soft clipping; offline worker only |
+ * | `OfflineHardClipper<T>` | Effects/OfflineHardClipper.h | Calibrated complete-source hard clipping; offline worker only |
+ * | `OfflineStereoGenerator<T>` | Effects/OfflineStereoGenerator.h | Source-bound stereo generation and reusable delta cache; offline worker only |
+ * | `OfflinePunch<T>`        | Effects/OfflinePunch.h | Equal transient boost from a complete-source attack map; offline worker only |
  * | `AlgorithmicReverb<T>`   | Effects/AlgorithmicReverb.h | True-stereo FDN reverb with spring model: Room/Hall/Chamber/Plate/Spring/Cathedral |
  * | `NoiseGenerator<T>`      | Effects/NoiseGenerator.h | White/pink/brown noise generator (AudioProcessor contract)        |
  * | `Tremolo<T>`             | Effects/Tremolo.h     | LFO amplitude modulation with stereo auto-pan option                |
@@ -388,6 +401,7 @@
  * | `LevelFollower<T>`       | Analysis/LevelFollower.h  | Peak and RMS envelope follower               |
  * | `SpectrumAnalyzer<T>`    | Analysis/SpectrumAnalyzer.h | Real-time FFT spectrum analyser with peak hold |
  * | `LoudnessMeter<T>`       | Analysis/LoudnessMeter.h  | EBU R128 LUFS metering (momentary/short/integrated) |
+ * | `AudioIntervalAnalyzer<T>` | Analysis/AudioIntervalAnalyzer.h | Exact sample intervals with scoped loudness, validity and finite true peak |
  * | `Goertzel<T>`            | Analysis/Goertzel.h       | Single-frequency O(N) magnitude detection    |
  * | `PitchDetector<T>`       | Analysis/PitchDetector.h  | YIN monophonic pitch detection with MIDI/cents output |
  * | `PitchFollower<T>`       | Analysis/PitchFollower.h  | Gated, octave-safe, glide-smoothed pitch tracking source |
@@ -397,6 +411,9 @@
  * | `OnsetDetector<T>`       | Analysis/OnsetDetector.h  | Causal SuperFlux onset detection (Boeck-2012 picker, shared beat front-end) |
  * | `BeatTracker<T>`         | Analysis/BeatTracker.h    | Tempo and beat tracking: offline dynamic programming plus a causal resonator bank |
  * | `LoudnessNormalizer<T>`  | Analysis/LoudnessNormalizer.h | Offline LUFS-target normalisation under a BS.1770 true-peak ceiling |
+ * | `OfflineEnergyAnalyzer<T>` | Analysis/OfflineEnergyAnalyzer.h | Complete-source linked RMS/peak map, bounded input blocks |
+ * | `OfflineTransientAnalyzer<T>` | Analysis/OfflineTransientAnalyzer.h | Complete-source attack/pulse maps with stereo energy pooling and time refinement |
+ * | `OfflineTempoAnalyzer<T>` | Analysis/OfflineTempoAnalyzer.h | Complete-source tempo and anchored beat intervals from shared features |
  * | `LoopFinder<T>`          | Analysis/LoopFinder.h     | Bounded offline loop-point search and normalized equal-power seam rendering |
  *
  * @subsection classes_io File I/O
@@ -435,7 +452,7 @@
  * | `Resampler<T>`           | Core/Resampler.h          | Polyphase windowed-sinc sample rate converter     |
  * | `WindowFunctions<T>`     | Core/WindowFunctions.h    | 8 window functions (Hann, Kaiser, Blackman...)    |
  * | `Smoothers`              | Core/Smoothers.h          | 9 parameter smoothing algorithms                  |
- * | `EnvelopeGenerator<T>`   | Core/EnvelopeGenerator.h  | ADSR envelope for synthesis and dynamics          |
+ * | `ADSREnvelope<T>`        | Core/EnvelopeGenerator.h  | ADSR envelope for synthesis and dynamics          |
  * | `Dither<T>`              | Core/Dither.h             | TPDF dithering with noise shaping                 |
  * | `DenormalGuard`          | Core/DenormalGuard.h      | RAII denormal flush (SSE FTZ/DAZ, ARM FZ)         |
  * | `Interpolation`          | Core/Interpolation.h      | Linear to Lagrange, allpass, 32-tap sinc reader   |
@@ -461,7 +478,7 @@
  * @section design Design Principles
  *
  * - **Zero external dependencies** - C++20 standard library only.
- * - **Real-time safe** - No allocations, no locks, no syscalls in process().
+ * - **Real-time interfaces** - No allocations, locks or syscalls in audio-callback processing; explicitly offline jobs run on workers.
  * - **Thread-safe** - All parameter setters use `std::atomic` with `memory_order_relaxed`, callable from any thread with zero contention.
  * - **Cache-friendly** - Contiguous memory, 32-byte aligned buffers (SIMD-ready).
  * - **Multiplatform** - Windows, macOS, Linux, WebAssembly, iOS, Android.
@@ -497,7 +514,8 @@
  * concept GeneratorProcessor = ...;
  * ```
  *
- * Every in-place insert in this framework satisfies `AudioProcessor`. The
+ * Every real-time in-place insert satisfies `AudioProcessor`. Offline processors
+ * deliberately do not satisfy that callback contract. The
  * read-only analysers do not, and must not: they take an
  * `AudioBufferView<const T>` and return measurements rather than audio, so
  * they have nothing to hand the next stage of a chain. Run them beside a
@@ -573,7 +591,7 @@
  *
  * @section progressive_disclosure Progressive Disclosure API
  *
- * Every processor uses a **single API** with three levels of depth:
+ * Real-time effects offer a **single API** with three levels of depth:
  *
  * - **Level 1 (desktop developer):** Use basic setters with sensible defaults.
  *   No DSP knowledge required.
@@ -672,6 +690,7 @@
 #include "Core/Dither.h"
 #include "Core/SmoothedValue.h"
 #include "Core/ProcessorTraits.h"
+#include "Core/OfflineProcessing.h"
 #include "Core/ProcessorChain.h"
 #include "Core/DenormalGuard.h"
 #include "Core/Interpolation.h"
@@ -697,6 +716,7 @@
 #include "Effects/DCBlocker.h"
 #include "Effects/Crossfade.h"
 #include "Effects/StereoWidth.h"
+#include "Effects/StereoGenerator.h"
 #include "Effects/Compressor.h"
 #include "Effects/Limiter.h"
 #include "Effects/NoiseGate.h"
@@ -715,6 +735,13 @@
 #include "Effects/CrossoverFilter.h"
 #include "Effects/Expander.h"
 #include "Effects/TransientDesigner.h"
+#include "Effects/OfflineBeatCompressor.h"
+#include "Effects/OfflineLeveler.h"
+#include "Effects/OfflinePeakCompressor.h"
+#include "Effects/OfflinePunch.h"
+#include "Effects/OfflineSoftClipper.h"
+#include "Effects/OfflineHardClipper.h"
+#include "Effects/OfflineStereoGenerator.h"
 #include "Effects/DynamicEQ.h"
 #include "Effects/MultibandCompressor.h"
 #include "Effects/Clipper.h"
@@ -733,6 +760,7 @@
 #include "Analysis/LevelFollower.h"
 #include "Analysis/SpectrumAnalyzer.h"
 #include "Analysis/LoudnessMeter.h"
+#include "Analysis/AudioIntervalAnalyzer.h"
 #include "Analysis/Goertzel.h"
 #include "Analysis/PitchDetector.h"
 #include "Analysis/PitchFollower.h"
@@ -742,6 +770,9 @@
 #include "Analysis/OnsetDetector.h"
 #include "Analysis/BeatTracker.h"
 #include "Analysis/LoudnessNormalizer.h"
+#include "Analysis/OfflineEnergyAnalyzer.h"
+#include "Analysis/OfflineTransientAnalyzer.h"
+#include "Analysis/OfflineTempoAnalyzer.h"
 #include "Analysis/LoopFinder.h"
 
 // === I/O ====================================================================

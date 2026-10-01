@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "../Core/detail/BoxAverage.h"
+
 /**
  * @file Limiter.h
  * @brief Brickwall lookahead limiter with optional ISP (true-peak) detection
@@ -679,10 +681,11 @@ protected:
         // click-free ramp spanning exactly the window the hold covers.
         const size_t w = static_cast<size_t>(frame_ & histMask_);
         eHist_[w] = envelope_;
-        sum1_ += envelope_ - eHist_[static_cast<size_t>((frame_ - boxA_) & histMask_)];
-        const double avg1 = sum1_ * invBoxA_;
+        const double avg1 = detail::advanceBoxAverage(envelope_,
+            eHist_[static_cast<size_t>((frame_ - boxA_) & histMask_)], sum1_, invBoxA_);
         avgHist_[w] = avg1;
-        sum2_ += avg1 - avgHist_[static_cast<size_t>((frame_ - boxB_) & histMask_)];
+        (void)detail::advanceBoxAverage(avg1,
+            avgHist_[static_cast<size_t>((frame_ - boxB_) & histMask_)], sum2_, invBoxB_);
         ++frame_;
 
         // Periodic exact re-summation keeps the running sums drift-free.

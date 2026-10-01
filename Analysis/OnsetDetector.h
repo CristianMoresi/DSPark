@@ -92,12 +92,11 @@
  * Embedded/wasm: compiles under -fno-exceptions -fno-rtti (no throw on any
  * path); no file I/O, so it is unaffected by DSPARK_NO_FILE_IO.
  *
- * Dependencies: DspMath.h, FFT.h, WindowFunctions.h, AudioBuffer.h, AudioSpec.h.
+ * Dependencies: DspMath.h, detail/OnsetFeatures.h, AudioBuffer.h, AudioSpec.h.
  */
 
 #include "../Core/DspMath.h"
-#include "../Core/FFT.h"
-#include "../Core/WindowFunctions.h"
+#include "detail/OnsetFeatures.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 
@@ -218,7 +217,7 @@ public:
         if (!(spec.sampleRate > 0.0) || !std::isfinite(spec.sampleRate))
             return;
 
-        fft_.reset(); // gate OFF: the audio path is a no-op while rebuilding
+        prepared_ = false; // gate OFF: the audio path is a no-op while rebuilding
 
         sampleRate_ = spec.sampleRate;
 
@@ -229,10 +228,7 @@ public:
             // filterbank's quarter-tone floor are both fs/fftSize, so a
             // constant span pins them -- and with them the usable low register
             // -- instead of letting them widen as fs rises.
-            const double target = sampleRate_ * (kAutoSpanRef / kAutoSpanRate);
-            int n = kAutoMinFft;
-            while (n < kAutoMaxFft && static_cast<double>(n) < target) n <<= 1;
-            fftSize_ = n;
+            fftSize_ = detail::OnsetSpectrum<T>::defaultFrameSize(sampleRate_);
         }
         else
         {
@@ -241,7 +237,6 @@ public:
             while (pow2 < fs) pow2 <<= 1;
             fftSize_ = pow2;
         }
-        numBins_ = fftSize_ / 2 + 1;
 
         if (hop <= 0)
             hop_ = std::max(1, static_cast<int>(std::lround(sampleRate_ / 200.0)));
@@ -259,39 +254,13 @@ public:
         // onsets localise slightly late but stay within the acceptance window).
         localizationOffset_ = static_cast<int>(std::lround(kLocalizationLead
                                                            * static_cast<double>(fftSize_)));
-        // ODF scale invariance: cancel the linear growth of |X| with the
-        // frame length so the peak-pick delta means the same thing at every
-        // rate. Exactly 1.0 at the 2048-sample reference; an exact power of
-        // two at every other frame (fftSize is a power of two).
-        odfScale_ = static_cast<T>(kOdfRefFrame / static_cast<double>(fftSize_));
         // Warm-up: suppress onsets until the analysis ring is fully primed so
         // the silence->first-input ramp cannot fire a spurious onset.
         primeFrames_ = fftSize_ / hop_ + 2;
 
-        // Analysis window (periodic Hann) and its ring (mirrored for a
-        // contiguous most-recent-fftSize window without a modulo).
-        window_.assign(static_cast<size_t>(fftSize_), T(0));
-        WindowFunctions<T>::hann(window_.data(), fftSize_, true);
         ring_.assign(static_cast<size_t>(fftSize_) * 2, T(0));
-
-        fft_time_.assign(static_cast<size_t>(fftSize_), T(0));
-        fft_spec_.assign(static_cast<size_t>(fftSize_) + 2, T(0));
-        mag_.assign(static_cast<size_t>(numBins_), T(0));
-        phase_.assign(static_cast<size_t>(numBins_), T(0));
-        prevPhase_.assign(static_cast<size_t>(numBins_), T(0));
-        prevPhase2_.assign(static_cast<size_t>(numBins_), T(0));
-        prevMag_.assign(static_cast<size_t>(numBins_), T(0));
-        whitenPeak_.assign(static_cast<size_t>(numBins_), T(0));
-
-        buildFilterBank();
-
-        // Band history for the SuperFlux flux-to-mu-th-previous-frame. mu is
-        // one hop by construction (adjacent frames at 200 fps), so two frames
-        // of history are enough; keep a small ring keyed on frame index.
-        muFrames_ = 1;
-        bandCur_.assign(static_cast<size_t>(numBands_), T(0));
-        bandPrev_.assign(static_cast<size_t>(numBands_), T(0));
-        bandMaxPrev_.assign(static_cast<size_t>(numBands_), T(0));
+        spectrum_.prepare(fftSize_);
+        novelty_.prepare(sampleRate_, fftSize_);
 
         // Peak-picker windows in frames (derived from the ms defaults above).
         preMaxFrames_  = msToFrames(30.0);
@@ -322,7 +291,7 @@ public:
         threshold_.store(kDefaultDelta, std::memory_order_relaxed);
         whitening_.store(false, std::memory_order_relaxed);
 
-        fft_ = std::make_unique<FFTReal<T>>(static_cast<size_t>(fftSize_)); // gate ON
+        prepared_ = true; // gate ON
     }
 
     /** @brief Selects the ODF family. Lock-free. */
@@ -374,7 +343,7 @@ public:
      */
     void processBlock(AudioBufferView<const T> in) noexcept
     {
-        if (fft_ == nullptr || in.getNumChannels() < 1) return;
+        if (!prepared_ || in.getNumChannels() < 1) return;
         const T* ch0 = in.getChannel(0);
         pushSamples(std::span<const T>(ch0, static_cast<size_t>(in.getNumSamples())));
     }
@@ -388,7 +357,7 @@ public:
      */
     void pushSamples(std::span<const T> samples) noexcept
     {
-        if (fft_ == nullptr) return;
+        if (!prepared_) return;
 
         bool firedThisCall = false;
 
@@ -468,7 +437,7 @@ public:
 
     /** @brief Number of log-frequency filterbank bands built for the resolved
      *         frame; a direct readout of the analysis resolution in force. */
-    [[nodiscard]] int getNumBands() const noexcept { return numBands_; }
+    [[nodiscard]] int getNumBands() const noexcept { return novelty_.getNumBands(); }
 
     // -- Onset-strength envelope (stream owner only) -------------------------
 
@@ -485,7 +454,7 @@ public:
     /// Register groups the SuperFlux bands are split into for the
     /// per-register readout: below 200 Hz (kick, bass), 200-800 Hz, 800 Hz to
     /// 3.2 kHz, and above (hats, consonants). Two octaves each above the first.
-    static constexpr int kNumRegisters = 4;
+    static constexpr int kNumRegisters = detail::OnsetNovelty<T>::kNumRegisters;
 
     struct OdfFrame
     {
@@ -599,7 +568,7 @@ public:
     /** @brief detectOffline() with each onset's strength alongside its position. */
     std::vector<Onset> detectOfflineOnsets(AudioBufferView<const T> whole)
     {
-        if (fft_ == nullptr || whole.getNumChannels() < 1) return {};
+        if (!prepared_ || whole.getNumChannels() < 1) return {};
         const int n = std::max(0, whole.getNumSamples());
         beginOffline(n);
         pushOffline(std::span<const T>(whole.getChannel(0), static_cast<size_t>(n)));
@@ -627,7 +596,7 @@ public:
         offOdf_.clear();
         offRef_.clear();
         offlineOpen_ = false;
-        if (fft_ == nullptr) return;
+        if (!prepared_) return;
         if (expectedSamples > 0)
         {
             const size_t frames = static_cast<size_t>(expectedSamples / std::max(1, hop_) + 2);
@@ -679,31 +648,16 @@ public:
         // Symmetric peak-pick over the whole envelope.
         const T delta = threshold_.load(std::memory_order_relaxed);
         const std::vector<T>& odf = offOdf_;
-        const int nf = static_cast<int>(odf.size());
-        int64_t lastFrame = -kBig;
-        for (int f = 0; f < nf; ++f)
+        detail::OnsetPeakPicker<T> picker;
+        const typename detail::OnsetPeakPicker<T>::Windows windows {
+            static_cast<size_t>(preMaxFrames_), static_cast<size_t>(postMaxFrames_),
+            static_cast<size_t>(preAvgFrames_), static_cast<size_t>(postAvgFrames_),
+            static_cast<size_t>(waitFrames_)
+        };
+        for (size_t f = static_cast<size_t>(primeFrames_); f < odf.size(); ++f)
         {
-            if (f < primeFrames_) continue; // warm-up guard (ring priming)
-            bool isMax = true;
-            for (int j = f - preMaxFrames_; j <= f + postMaxFrames_; ++j)
-            {
-                if (j < 0 || j >= nf) continue;
-                if (odf[static_cast<size_t>(j)] > odf[static_cast<size_t>(f)]) { isMax = false; break; }
-            }
-            if (!isMax) continue;
-
-            T sum = T(0); int cnt = 0;
-            for (int j = f - preAvgFrames_; j <= f + postAvgFrames_; ++j)
-            {
-                if (j < 0 || j >= nf) continue;
-                sum += odf[static_cast<size_t>(j)]; ++cnt;
-            }
-            const T mean = (cnt > 0) ? sum / static_cast<T>(cnt) : T(0);
-            if (odf[static_cast<size_t>(f)] < mean + delta) continue;
-            if (f - lastFrame <= waitFrames_) continue;
-
-            out.push_back(Onset { offRef_[static_cast<size_t>(f)], odf[static_cast<size_t>(f)] });
-            lastFrame = f;
+            if (picker.accept(f, odf.size(), [&](size_t i) { return odf[i]; }, windows, delta))
+                out.push_back(Onset { offRef_[f], odf[f] });
         }
 
         offOdf_.clear();
@@ -734,29 +688,9 @@ private:
     static constexpr int kMaxFft = 1 << 16;
     /// Automatic-frame policy: the span 2048 samples cover at 48 kHz, resolved
     /// inside [512, 16384] (covers 8 kHz .. 384 kHz without hitting a clamp).
-    static constexpr double kAutoSpanRef = 2048.0;
-    static constexpr double kAutoSpanRate = 48000.0;
-    static constexpr int kAutoMinFft = 512;
-    static constexpr int kAutoMaxFft = 16384;
     static constexpr int64_t kBig = int64_t(1) << 60;
     static constexpr T kDefaultDelta = T(0.03);
-    /// ODF magnitude reference frame. Un-normalised |X| grows linearly with
-    /// the frame length, so the SuperFlux filterbank accumulation is scaled
-    /// by kOdfRefFrame / fftSize before the log10(x + 1) compression: the
-    /// growth cancels and a given peak-pick delta selects the same
-    /// quiet-onset sensitivity at every frame length (and therefore at every
-    /// rate under the automatic frame). 2048 is the frame kDefaultDelta was
-    /// tuned at, so the factor is exactly 1 at the 44.1/48 kHz reference --
-    /// and because fftSize is always a power of two the factor is an exact
-    /// power of two everywhere: the scaling introduces no rounding at all.
-    /// The compensation must sit on the magnitude (inside the log), not on
-    /// the delta: log10(x + 1) is not affine, so no post-log delta rescale
-    /// could keep the reference behaviour unchanged.
-    static constexpr double kOdfRefFrame = 2048.0;
     static constexpr double kLocalizationLead = 0.34; ///< Flux-to-energy lead (fraction of N).
-    static constexpr double kFMin = 27.5;      ///< Filterbank low edge (Hz).
-    static constexpr double kFMaxHz = 16000.0; ///< Filterbank high edge (Hz).
-    static constexpr int kBandsPerOctave = 24; ///< Quarter-tone resolution.
 
     struct PendingOnset
     {
@@ -783,131 +717,19 @@ private:
 
     // -- STFT + ODF ----------------------------------------------------------
 
-    /** @brief Windows the current most-recent-fftSize ring window, FFTs it,
-     *  and fills mag_/phase_. */
-    void computeSpectrum() noexcept
+    /** @brief Evaluates the shared spectral and novelty kernels for one frame. */
+    T computeOdf(Method method, bool whiten) noexcept
     {
-        const T* w = window_.data();
-        const T* r = &ring_[static_cast<size_t>(writePos_)]; // oldest..newest, contiguous
-        for (int k = 0; k < fftSize_; ++k)
-            fft_time_[static_cast<size_t>(k)] = r[k] * w[k];
-
-        fft_->forward(fft_time_.data(), fft_spec_.data());
-
-        for (int k = 0; k < numBins_; ++k)
-        {
-            const T re = fft_spec_[static_cast<size_t>(2 * k)];
-            const T im = fft_spec_[static_cast<size_t>(2 * k + 1)];
-            mag_[static_cast<size_t>(k)] = std::sqrt(re * re + im * im);
-            phase_[static_cast<size_t>(k)] = std::atan2(im, re);
-        }
-    }
-
-    /** @brief Applies per-bin adaptive whitening (Stowell-Plumbley) to mag_. */
-    void applyWhitening() noexcept
-    {
-        for (int k = 0; k < numBins_; ++k)
-        {
-            T& pk = whitenPeak_[static_cast<size_t>(k)];
-            const T decayed = pk * kWhitenDecay;
-            const T m = mag_[static_cast<size_t>(k)];
-            pk = std::max({ m, kWhitenFloor, decayed });
-            mag_[static_cast<size_t>(k)] = m / pk;
-        }
-    }
-
-    /** @brief Computes the ODF value for the current frame and rotates the
-     *  per-frame history buffers. Assumes computeSpectrum() was called. */
-    T computeOdf(Method m, bool whiten) noexcept
-    {
-        computeSpectrum();
-        if (whiten) applyWhitening();
-
-        T odf = T(0);
-        curRegisters_.fill(T(0));
-        switch (m)
-        {
-            case Method::SpectralFlux:
-            {
-                for (int k = 0; k < numBins_; ++k)
-                {
-                    const T d = mag_[static_cast<size_t>(k)] - prevMag_[static_cast<size_t>(k)];
-                    if (d > T(0)) odf += d;
-                }
-                odf /= static_cast<T>(numBins_);
-                break;
-            }
-            case Method::ComplexDomain:
-            {
-                // Rectified complex-domain deviation (Dixon 2006): phase-predict
-                // each bin, sum |X - Xhat| where magnitude increased.
-                for (int k = 0; k < numBins_; ++k)
-                {
-                    const T target = princArg(T(2) * prevPhase_[static_cast<size_t>(k)]
-                                              - prevPhase2_[static_cast<size_t>(k)]);
-                    const T pm = prevMag_[static_cast<size_t>(k)];
-                    const T cm = mag_[static_cast<size_t>(k)];
-                    const T re = cm * std::cos(phase_[static_cast<size_t>(k)])
-                               - pm * std::cos(target);
-                    const T im = cm * std::sin(phase_[static_cast<size_t>(k)])
-                               - pm * std::sin(target);
-                    if (cm >= pm) odf += std::sqrt(re * re + im * im);
-                }
-                odf /= static_cast<T>(numBins_);
-                break;
-            }
-            case Method::SuperFlux:
-            {
-                // Log-filtered magnitude bands, flux to the mu-th previous
-                // frame after a frequency maximum filter on the reference.
-                // The frame-invariant magnitude scale (kOdfRefFrame/fftSize)
-                // applies to the raw spectrum only: adaptive whitening
-                // already divides each bin by its running peak, which
-                // carries the same linear-in-N growth, so above kWhitenFloor
-                // the whitened spectrum is dimensionless and scaling it
-                // again would INVERT the rate dependence instead of removing
-                // it. Below the floor the divisor is the absolute constant
-                // kWhitenFloor, so those bins keep the linear-in-N growth --
-                // the residual rate dependence documented at prepare().
-                filterLogBands(bandCur_, whiten ? T(1) : odfScale_);
-                curRegisters_.fill(T(0));
-                for (int b = 0; b < numBands_; ++b)
-                {
-                    const T d = bandCur_[static_cast<size_t>(b)]
-                              - bandMaxPrev_[static_cast<size_t>(b)];
-                    if (d > T(0))
-                    {
-                        odf += d;
-                        if (b < static_cast<int>(bandRegister_.size()))
-                            curRegisters_[static_cast<size_t>(bandRegister_[static_cast<size_t>(b)])] += d;
-                    }
-                }
-                odf /= static_cast<T>(numBands_);
-                for (int g = 0; g < kNumRegisters; ++g)
-                    if (registerBands_[static_cast<size_t>(g)] > 0)
-                        curRegisters_[static_cast<size_t>(g)]
-                            /= static_cast<T>(registerBands_[static_cast<size_t>(g)]);
-                // Rotate: previous <- current, and rebuild the max-filtered
-                // reference from the (new) previous frame.
-                bandPrev_ = bandCur_;
-                maxFilterFreq(bandPrev_, bandMaxPrev_);
-                break;
-            }
-        }
-
-        // Rotate per-bin history (prevPhase2_ <- prevPhase_ <- phase_) and the
-        // previous magnitude, used by SpectralFlux/ComplexDomain next frame.
-        rotatePhaseHistory();
-        std::copy(mag_.begin(), mag_.end(), prevMag_.begin());
-
-        return odf;
-    }
-
-    /** @brief prevPhase2_ <- prevPhase_ <- phase_ (correct 2-frame ring). */
-    void rotatePhaseHistory() noexcept
-    {
-        std::copy(prevPhase_.begin(), prevPhase_.end(), prevPhase2_.begin());
-        std::copy(phase_.begin(), phase_.end(), prevPhase_.begin());
+        spectrum_.compute(&ring_[static_cast<size_t>(writePos_)]);
+        using FeatureMethod = typename detail::OnsetNovelty<T>::Method;
+        const auto selected = method == Method::SpectralFlux ? FeatureMethod::SpectralFlux
+                            : method == Method::ComplexDomain ? FeatureMethod::ComplexDomain
+                            : method == Method::SuperFlux ? FeatureMethod::SuperFlux
+                            : static_cast<FeatureMethod>(-1);
+        const auto result = novelty_.process(spectrum_.magnitudes(), spectrum_.phases(),
+            selected, whiten);
+        curRegisters_ = result.registers;
+        return result.value;
     }
 
     /** @brief One causal analysis frame: ODF + online peak-pick + scheduling. */
@@ -993,131 +815,10 @@ private:
         ++pendingCount_;
     }
 
-    // -- Filterbank ----------------------------------------------------------
-
-    /** @brief Builds the log-frequency triangular filterbank (quarter-tone,
-     *  peak-normalised, not area-normalised). Filter count depends on
-     *  fftSize/fs; ~138 at 44.1 kHz / 2048. */
-    void buildFilterBank()
-    {
-        fbStart_.clear();
-        fbWeights_.clear();
-        fbOffset_.clear();
-        bandRegister_.clear();
-        registerBands_.fill(0);
-
-        const double binHz = sampleRate_ / static_cast<double>(fftSize_);
-        const double fMax = std::min(kFMaxHz, sampleRate_ * 0.5 * 0.999);
-
-        // Quarter-tone centre bins, strictly increasing and unique.
-        std::vector<int> centres;
-        for (int i = 0; ; ++i)
-        {
-            const double f = kFMin * std::pow(2.0, static_cast<double>(i)
-                                              / static_cast<double>(kBandsPerOctave));
-            if (f > fMax) break;
-            int bin = static_cast<int>(std::lround(f / binHz));
-            bin = std::clamp(bin, 0, numBins_ - 1);
-            if (centres.empty() || bin > centres.back())
-                centres.push_back(bin);
-        }
-
-        // Triangular filters over consecutive triples (b[j-1], b[j], b[j+1]).
-        numBands_ = 0;
-        for (size_t j = 1; j + 1 < centres.size(); ++j)
-        {
-            const int lo = centres[j - 1];
-            const int ce = centres[j];
-            const int hi = centres[j + 1];
-            if (!(lo < ce && ce < hi)) continue;
-
-            {
-                const double fc = static_cast<double>(ce) * binHz;
-                const int g = fc < 200.0 ? 0 : fc < 800.0 ? 1 : fc < 3200.0 ? 2 : 3;
-                bandRegister_.push_back(g);
-                ++registerBands_[static_cast<size_t>(g)];
-            }
-            fbStart_.push_back(lo);
-            fbOffset_.push_back(static_cast<int>(fbWeights_.size()));
-            for (int k = lo; k <= hi; ++k)
-            {
-                T wv;
-                if (k <= ce)
-                    wv = static_cast<T>(static_cast<double>(k - lo)
-                                        / static_cast<double>(ce - lo));
-                else
-                    wv = static_cast<T>(static_cast<double>(hi - k)
-                                        / static_cast<double>(hi - ce));
-                fbWeights_.push_back(wv);
-            }
-            ++numBands_;
-        }
-        fbCount_.clear();
-        for (int b = 0; b < numBands_; ++b)
-        {
-            const int off = fbOffset_[static_cast<size_t>(b)];
-            const int nextOff = (b + 1 < numBands_)
-                                ? fbOffset_[static_cast<size_t>(b + 1)]
-                                : static_cast<int>(fbWeights_.size());
-            fbCount_.push_back(nextOff - off);
-        }
-        if (numBands_ < 1) numBands_ = 1; // degenerate guard (tiny fftSize)
-    }
-
-    /** @brief Applies the filterbank to mag_ and takes log10(scale*x + 1)
-     *  per band. @p scale is the frame-invariance factor kOdfRefFrame /
-     *  fftSize (see the constant), or exactly 1 under adaptive whitening;
-     *  scaling the accumulated band is identical to scaling the spectrum
-     *  before the filterbank (the filterbank is linear) and touches the
-     *  other ODF families not at all. */
-    void filterLogBands(std::vector<T>& out, T scale) noexcept
-    {
-        for (int b = 0; b < numBands_ && b < static_cast<int>(fbStart_.size()); ++b)
-        {
-            const int start = fbStart_[static_cast<size_t>(b)];
-            const int off = fbOffset_[static_cast<size_t>(b)];
-            const int cnt = fbCount_[static_cast<size_t>(b)];
-            T acc = T(0);
-            for (int i = 0; i < cnt; ++i)
-            {
-                const int k = start + i;
-                if (k >= 0 && k < numBins_)
-                    acc += mag_[static_cast<size_t>(k)]
-                         * fbWeights_[static_cast<size_t>(off + i)];
-            }
-            out[static_cast<size_t>(b)] = std::log10(acc * scale + T(1));
-        }
-    }
-
-    /** @brief 3-neighbour frequency maximum filter (SuperFlux vibrato guard). */
-    void maxFilterFreq(const std::vector<T>& in, std::vector<T>& out) const noexcept
-    {
-        for (int b = 0; b < numBands_; ++b)
-        {
-            T mx = in[static_cast<size_t>(b)];
-            if (b > 0) mx = std::max(mx, in[static_cast<size_t>(b - 1)]);
-            if (b + 1 < numBands_) mx = std::max(mx, in[static_cast<size_t>(b + 1)]);
-            out[static_cast<size_t>(b)] = mx;
-        }
-    }
-
-    static T princArg(T x) noexcept
-    {
-        // Wrap to (-pi, pi].
-        const T twoPiT = twoPi<T>;
-        T y = x - twoPiT * std::floor(x / twoPiT + T(0.5));
-        return y;
-    }
-
     void resetState() noexcept
     {
         std::fill(ring_.begin(), ring_.end(), T(0));
-        std::fill(prevMag_.begin(), prevMag_.end(), T(0));
-        std::fill(prevPhase_.begin(), prevPhase_.end(), T(0));
-        std::fill(prevPhase2_.begin(), prevPhase2_.end(), T(0));
-        std::fill(whitenPeak_.begin(), whitenPeak_.end(), T(0));
-        std::fill(bandPrev_.begin(), bandPrev_.end(), T(0));
-        std::fill(bandMaxPrev_.begin(), bandMaxPrev_.end(), T(0));
+        novelty_.reset();
         std::fill(odfHist_.begin(), odfHist_.end(), T(0));
 
         writePos_ = 0;
@@ -1139,38 +840,16 @@ private:
         lastOnsetSample_.store(-1, std::memory_order_relaxed);
     }
 
-    // -- Whitening constants -------------------------------------------------
-    static constexpr T kWhitenDecay = T(0.9995);
-    static constexpr T kWhitenFloor = T(1e-4);
-
     // -- Members -------------------------------------------------------------
     double sampleRate_ = 44100.0;
     int fftSize_ = 2048;
-    int numBins_ = 1025;
     int hop_ = 221;
-    int numBands_ = 1;
-    int muFrames_ = 1;
     int localizationOffset_ = 0;
     int primeFrames_ = 12;
-    T odfScale_ = T(1); ///< kOdfRefFrame / fftSize (ODF frame invariance).
-
-    std::unique_ptr<FFTReal<T>> fft_; // doubles as the "prepared" gate
-
-    std::vector<T> window_;
-    std::vector<T> ring_;      // size 2*fftSize
-    std::vector<T> fft_time_;  // size fftSize
-    std::vector<T> fft_spec_;  // size fftSize+2
-    std::vector<T> mag_;       // numBins
-    std::vector<T> phase_;     // numBins
-    std::vector<T> prevPhase_, prevPhase2_, prevMag_, whitenPeak_;
-
-    // Filterbank (CSR-style: start bin, flat weights, per-band offset/count).
-    std::vector<int> fbStart_;
-    std::vector<T> fbWeights_;
-    std::vector<int> fbOffset_;
-    std::vector<int> fbCount_;
-
-    std::vector<T> bandCur_, bandPrev_, bandMaxPrev_;
+    bool prepared_ = false;
+    detail::OnsetSpectrum<T> spectrum_;
+    detail::OnsetNovelty<T> novelty_;
+    std::vector<T> ring_; // Mirrored chronological input, size 2*fftSize.
 
     // Peak-picker windows (frames).
     int preMaxFrames_ = 6, postMaxFrames_ = 6;
@@ -1186,8 +865,6 @@ private:
     int64_t lastOdfRef_ = 0;  ///< Reference sample of lastOdfValue_'s frame.
     std::array<T, kNumRegisters> lastRegisters_ {};  ///< Per-register readout.
     std::array<T, kNumRegisters> curRegisters_ {};   ///< This frame's registers.
-    std::vector<int> bandRegister_;                  ///< Band -> register group.
-    std::array<int, kNumRegisters> registerBands_ {}; ///< Bands per register.
     T lastConfirmOdf_ = T(0);
     int64_t lastOnsetFrame_ = -kBig;
 

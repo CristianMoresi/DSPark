@@ -716,3 +716,119 @@ DSPARK_TEST(Onset_config_getters_echo_the_settings_in_force)
     od.setThreshold(std::numeric_limits<float>::quiet_NaN());
     EXPECT_NEAR(od.getThreshold(), 0.0f, 0.0f);
 }
+
+namespace {
+template <typename T>
+void verifySharedSpectrum()
+{
+    constexpr int size=1024;
+    const double tolerance=std::is_same_v<T,float> ? 3e-4 : 1e-9;
+    AudioBuffer<T> audio;
+    audio.resize(2,size);
+    for (int i=0;i<size;++i)
+        audio.getChannel(0)[i]=static_cast<T>(0.4*std::cos(twoPi<double>*32*i/size));
+    detail::OnsetSpectrum<T> spectrum;
+    EXPECT_FALSE(spectrum.computePooled(audio.toView()));
+    spectrum.prepare(size);
+    spectrum.compute(audio.getChannel(0));
+    const auto mono=std::vector<T>(spectrum.magnitudes().begin(),spectrum.magnitudes().end());
+    // Independent DFT oracle for a coherent cosine under a periodic Hann window.
+    EXPECT_NEAR(mono[32],0.4*size/4,tolerance);
+    EXPECT_NEAR(mono[31],0.4*size/8,tolerance);
+    EXPECT_NEAR(mono[33],0.4*size/8,tolerance);
+    EXPECT_EQ(spectrum.phases().size(),std::size_t(size/2+1));
+    for (int polarity:{1,-1})
+    {
+        for (int i=0;i<size;++i)
+            audio.getChannel(1)[i]=static_cast<T>(polarity)*audio.getChannel(0)[i];
+        EXPECT_TRUE(spectrum.computePooled(audio.toView()));
+        EXPECT_TRUE(spectrum.phases().empty());
+        for (std::size_t i=0;i<mono.size();++i) EXPECT_EQ(spectrum.magnitudes()[i],mono[i]);
+    }
+    for (int i=0;i<size;++i)
+    {
+        audio.getChannel(1)[i]=audio.getChannel(0)[i];
+        audio.getChannel(0)[i]=0;
+    }
+    EXPECT_TRUE(spectrum.computePooled(audio.toView()));
+    const auto rightOnly=std::vector<T>(spectrum.magnitudes().begin(),spectrum.magnitudes().end());
+    EXPECT_NEAR(rightOnly[32],mono[32]*invSqrt2<T>,tolerance);
+    for (int i=0;i<size;++i) std::swap(audio.getChannel(0)[i],audio.getChannel(1)[i]);
+    EXPECT_TRUE(spectrum.computePooled(audio.toView()));
+    for (std::size_t i=0;i<mono.size();++i) EXPECT_EQ(spectrum.magnitudes()[i],rightOnly[i]);
+    for (int i=0;i<size;++i)
+        audio.getChannel(1)[i]=static_cast<T>(0.6*std::cos(twoPi<double>*73*i/size));
+    EXPECT_TRUE(spectrum.computePooled(audio.toView()));
+    EXPECT_NEAR(spectrum.magnitudes()[32],0.4*size/4*invSqrt2<double>,tolerance);
+    EXPECT_NEAR(spectrum.magnitudes()[73],0.6*size/4*invSqrt2<double>,tolerance);
+    spectrum.compute(audio.getChannel(0),false);
+    EXPECT_TRUE(spectrum.phases().empty());
+    spectrum.compute(audio.getChannel(0),true);
+    EXPECT_FALSE(spectrum.phases().empty());
+}
+
+template <typename T>
+void verifyCombinedNovelty()
+{
+    using Novelty=detail::OnsetNovelty<T>;
+    using Method=typename Novelty::Method;
+    constexpr int size=512;
+    std::vector<T> window(size),raw(size/2+1),flux(raw.size()),super(raw.size()),both(raw.size());
+    detail::OnsetSpectrum<T> spectrum;
+    spectrum.prepare(size);
+    for (bool whiten:{false,true})
+    {
+        Novelty a,b,combined;
+        a.prepare(48000,size); b.prepare(48000,size); combined.prepare(48000,size);
+        bool changed=false;
+        for (int frame=0;frame<15;++frame)
+        {
+            for (int i=0;i<size;++i)
+                window[static_cast<std::size_t>(i)]=static_cast<T>((0.01+frame*0.025)
+                    *std::sin(twoPi<double>*(11+frame/4)*i/size));
+            spectrum.compute(window.data(),false);
+            std::copy(spectrum.magnitudes().begin(),spectrum.magnitudes().end(),raw.begin());
+            flux=super=both=raw;
+            const auto x=a.process(flux,{},Method::SpectralFlux,whiten);
+            const auto y=b.process(super,{},Method::SuperFlux,whiten);
+            EXPECT_FALSE(combined.process(both,{},Method::ComplexDomain,whiten).valid);
+            const auto together=combined.process(both,{},Method::BothFlux,whiten);
+            EXPECT_TRUE(x.valid && y.valid && together.valid);
+            EXPECT_EQ(together.spectralFlux,x.value);
+            EXPECT_EQ(together.value,y.value);
+            EXPECT_TRUE(together.registers==y.registers);
+            changed=changed || together.value>0;
+        }
+        EXPECT_TRUE(changed);
+        combined.reset();
+        a.reset(); b.reset();
+        flux=super=both=raw;
+        const auto together=combined.process(both,{},Method::BothFlux,whiten);
+        EXPECT_EQ(together.spectralFlux,a.process(flux,{},Method::SpectralFlux,whiten).value);
+        EXPECT_EQ(together.value,b.process(super,{},Method::SuperFlux,whiten).value);
+    }
+}
+} // namespace
+
+DSPARK_TEST(Onset_shared_spectrum_analytic_pooling_float) { verifySharedSpectrum<float>(); }
+DSPARK_TEST(Onset_shared_spectrum_analytic_pooling_double) { verifySharedSpectrum<double>(); }
+DSPARK_TEST(Onset_shared_two_novelties_share_one_spectrum)
+{
+    verifyCombinedNovelty<float>();
+    verifyCombinedNovelty<double>();
+}
+DSPARK_TEST(Onset_shared_complex_flux_rejects_missing_phase_history)
+{
+    using Novelty=detail::OnsetNovelty<double>;
+    using Method=Novelty::Method;
+    Novelty novelty;
+    std::vector<double> magnitudes(33,1),phases(33,0);
+    EXPECT_FALSE(novelty.process(magnitudes,phases,Method::ComplexDomain).valid);
+    novelty.prepare(48000,64);
+    EXPECT_TRUE(novelty.process(magnitudes,phases,Method::ComplexDomain).valid);
+    EXPECT_TRUE(novelty.process(magnitudes,{},Method::SuperFlux).valid);
+    EXPECT_FALSE(novelty.process(magnitudes,phases,Method::ComplexDomain).valid);
+    novelty.reset();
+    EXPECT_TRUE(novelty.process(magnitudes,phases,Method::ComplexDomain).valid);
+    EXPECT_FALSE(novelty.process(magnitudes,std::span<const double>(phases.data(),3),Method::ComplexDomain).valid);
+}

@@ -71,7 +71,7 @@ int main(int argc, char** argv)
     // the signal. An offline render compensates, so the file stays aligned
     // with its source: drop the first `latency` output frames, and feed as
     // many frames of silence past the end so the tail is not cut off.
-    const int latency = comp.getLatency() + limiter.getLatency();
+    const int latency = eq.getLatency() + comp.getLatency() + limiter.getLatency();
 
     dspark::AudioBuffer<float> buf;
     buf.resize(static_cast<int>(info.numChannels), kBlock);

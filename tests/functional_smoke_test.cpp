@@ -139,6 +139,8 @@ int testAll()
     slots.push_back(make("Panner",         std::make_shared<Panner<float>>()));
     slots.push_back(make("StereoWidth",    std::make_shared<StereoWidth<float>>()));
 
+    slots.push_back(make("StereoGenerator", std::make_shared<StereoGenerator<float>>()));
+
     // Pitch
     slots.push_back(make("PitchCorrector", std::make_shared<PitchCorrector<float>>()));
 

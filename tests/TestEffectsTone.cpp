@@ -1761,6 +1761,168 @@ DSPARK_TEST(TubePreamp_stable_at_max_drive)
     }
 }
 
+DSPARK_TEST(TubePreamp_default_rejects_high_gain_foldback)
+{
+    // At 2x the 15 kHz, -6 dBFS tone folded 18.2 dB below its fundamental
+    // through two stages at +24 dB. Check the audio, not only the factor.
+    TubePreamp<double> amp;
+    amp.setStages(2);
+    amp.setDrive(24.0);
+    amp.prepare(spec(48000.0, 256, 2));
+    AudioBuffer<double> audio;
+    audio.resize(2, 256);
+    constexpr int length = 48000;
+    std::vector<double> tail;
+    tail.reserve(length / 2);
+    for (int pos = 0; pos < length; pos += 256)
+    {
+        const int count = std::min(256, length - pos);
+        for (int i = 0; i < count; ++i)
+            audio.getChannel(0)[i] = audio.getChannel(1)[i] =
+                std::pow(10.0, -6.0 / 20.0)
+                * std::sin(2.0 * 3.14159265358979323846 * 15000.0 * (pos + i) / 48000.0);
+        amp.processBlock(audio.toView().getSubView(0, count));
+        for (int i = 0; i < count; ++i)
+            if (pos + i >= length / 2) tail.push_back(audio.getChannel(0)[i]);
+    }
+    const auto amplitude = [&](double frequency) {
+        double re = 0.0, im = 0.0;
+        for (size_t i = 0; i < tail.size(); ++i)
+        {
+            const double phase = 2.0 * 3.14159265358979323846 * frequency
+                               * static_cast<double>(i) / 48000.0;
+            re += tail[i] * std::cos(phase);
+            im += tail[i] * std::sin(phase);
+        }
+        return std::hypot(re, im);
+    };
+    const double fundamental = amplitude(15000.0);
+    double folded = 0.0;
+    for (double frequency : {3000.0, 6000.0, 9000.0, 12000.0, 18000.0})
+        folded = std::max(folded, amplitude(frequency));
+    EXPECT_GT(fundamental, 1.0);
+    EXPECT_LT(20.0 * std::log10(folded / fundamental), -32.0);
+    EXPECT_EQ(amp.getOversamplingFactor(), 2);
+    EXPECT_EQ(amp.getLatency(), 64);
+}
+
+namespace {
+// Direct current law, with no production derivatives or interpolation. The
+// circuit reference below bisects Kirchhoff's equation to a unique root.
+long double referenceTriodeCurrent(long double vp, long double vg)
+{
+    vp = std::max(vp, 0.0L);
+    const long double z = 600.0L * (0.01L + vg / std::sqrt(300.0L + vp * vp));
+    const long double e = vp / 600.0L * std::log1p(std::exp(z));
+    return 2.0L / 1060.0L * std::pow(e, 1.4L);
+}
+
+long double referenceTriodeLoad(double supply, double grid, double cathodeR)
+{
+    long double lo = 0.0L, hi = supply / (100000.0L + cathodeR);
+    for (int i = 0; i < 65; ++i)
+    {
+        const long double mid = 0.5L * (lo + hi);
+        const long double cathode = cathodeR * mid;
+        if (mid > referenceTriodeCurrent(supply - 100000.0L * mid - cathode, grid - cathode))
+            hi = mid;
+        else
+            lo = mid;
+    }
+    return 0.5L * (lo + hi);
+}
+} // namespace
+
+DSPARK_TEST(TubePreamp_current_surface_matches_implicit_circuit)
+{
+    // The most curved cells are at low supply near cutoff. A nearest or
+    // bilinear lookup fails this tolerance; it also protects the capacitor
+    // feedback term, which changes with the internal sample rate.
+    for (double rate : {8000.0, 44100.0, 96000.0, 384000.0, 3072000.0})
+    {
+        auto table = std::make_unique<detail::TubePreampCurrentTable>(rate);
+        const double h = 0.5 / (rate * 22e-6);
+        const double cathodeR = h / (1.0 + h / 1500.0);
+        uint32_t seed = 51;
+        for (int n = 0; n < 6000; ++n)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            const double supply = 80.0 + 224.0 * (static_cast<double>(seed) / 4294967296.0);
+            seed = seed * 1664525u + 1013904223u;
+            const double grid = -16.0 + 17.0 * (static_cast<double>(seed) / 4294967296.0);
+            const double measured = table->eval(supply, grid);
+            const double expected = static_cast<double>(referenceTriodeLoad(supply, grid, cathodeR));
+            EXPECT_NEAR(measured, expected, 5e-10); // < 50 uV at the plate load
+            EXPECT_TRUE(measured >= 0.0);
+        }
+        // Rounded coordinates at the final grid edge used to risk reading
+        // past the surface even though covers() accepted the input.
+        for (double supply : {80.0, 192.0, std::nextafter(304.0, 0.0)})
+            for (double grid : {-16.0, -1.03125, std::nextafter(1.0, 0.0)})
+            {
+                EXPECT_TRUE(table->covers(supply, grid));
+                EXPECT_NEAR(table->eval(supply, grid),
+                    static_cast<double>(referenceTriodeLoad(supply, grid, cathodeR)), 5e-10);
+            }
+        // Deep cutoff is bounded by the unloaded Koren current; substituting
+        // zero here is below 1e-27 A, unlike clamping to a nonzero endpoint.
+        for (double supply : {80.0, 128.0, 192.0, 303.999})
+        {
+            EXPECT_LT(referenceTriodeCurrent(supply, -0.08L * supply), 1e-27L);
+            EXPECT_TRUE(table->covers(supply, -1000.0));
+            EXPECT_NEAR(table->eval(supply, -1000.0), 0.0, 1e-30);
+            for (double ratio : {-0.04, -0.025})
+            {
+                const double grid = supply * ratio;
+                for (double offset : {-1e-8, 0.0, 1e-8})
+                    EXPECT_NEAR(table->eval(supply, grid + offset),
+                        static_cast<double>(referenceTriodeLoad(supply, grid + offset, cathodeR)), 5e-10);
+            }
+        }
+        EXPECT_FALSE(table->covers(304.0, 0.0));
+        EXPECT_FALSE(table->covers(300.0, std::numeric_limits<double>::quiet_NaN()));
+        EXPECT_FALSE(table->covers(300.0, -std::numeric_limits<double>::infinity()));
+    }
+}
+
+DSPARK_TEST(TubePreamp_dc_operating_point_and_legacy_state)
+{
+    for (int stages : {1, 2})
+    {
+        TubePreamp<double> amp;
+        amp.setStages(stages);
+        amp.setSag(0.3);
+        amp.prepare(spec(48000.0, 256, 1));
+        AudioBuffer<double> audio;
+        audio.resize(1, 256);
+        for (int n = 0; n < 50; ++n)
+        {
+            std::fill_n(audio.getChannel(0), 256, 0.0);
+            amp.processBlock(audio.toView());
+        }
+        // At DC, the cathode is Ip*Rk and the common supply is
+        // 300 - stages*Rsag*Ip. Solve that complete circuit independently.
+        long double lo = 0.0L, hi = 0.003L;
+        for (int n = 0; n < 65; ++n)
+        {
+            const long double ip = 0.5L * (lo + hi);
+            const long double current = referenceTriodeCurrent(
+                300.0L - (101500.0L + stages * 12000.0L) * ip, -1500.0L * ip);
+            if (ip > current) hi = ip;
+            else lo = ip;
+        }
+        const double expectedSupply = static_cast<double>(300.0L - stages * 12000.0L * (lo + hi) * 0.5L);
+        EXPECT_NEAR(amp.getSupplyVoltage(), expectedSupply, 2e-5);
+
+        StateWriter legacy(stateId("TUBE"), 1);
+        legacy.write("drive", 0.0f);
+        const auto oldState = legacy.blob();
+        EXPECT_TRUE(amp.setState(oldState.data(), oldState.size()));
+        EXPECT_EQ(amp.getOversamplingFactor(), 2);
+        EXPECT_EQ(amp.getLatency(), 64);
+    }
+}
+
 
 // ============================================================================
 // TransformerModel

@@ -47,6 +47,7 @@
 #include "../Core/Oversampling.h"
 #include "../Core/SmoothedValue.h"
 #include "../Core/StateBlob.h"
+#include "../Core/detail/ClipperShape.h"
 
 #include <algorithm>
 #include <array>
@@ -452,39 +453,13 @@ protected:
     [[nodiscard]] static inline T processSample(T sample, T ceiling) noexcept
     {
         if constexpr (M == Mode::Hard)
-        {
-            return std::clamp(sample, -ceiling, ceiling);
-        }
+            return detail::clipperShape<detail::ClipperCurve::Hard>(sample, ceiling);
         else if constexpr (M == Mode::Soft)
-        {
-            return ceiling * std::tanh(sample / ceiling);
-        }
+            return detail::clipperShape<detail::ClipperCurve::Tanh>(sample, ceiling);
         else if constexpr (M == Mode::Analog)
-        {
-            // Unity-slope sine shaper: sin(x/ceiling) has derivative 1 at the
-            // origin, so quiet material passes at exactly 0 dB like the other
-            // modes (the old pre-scaled form had slope pi/2, a +3.9 dB jump
-            // when switching modes). The knee spans |x| in [~ceiling*0.5,
-            // ceiling*pi/2] and lands exactly on the ceiling.
-            constexpr T halfPi = static_cast<T>(std::numbers::pi * 0.5);
-            return ceiling * fastSin(std::clamp(sample / ceiling, -halfPi, halfPi));
-        }
+            return detail::clipperShape<detail::ClipperCurve::Sine>(sample, ceiling);
         else // Mode::GoldenRatio (the mode switch instantiates no other value)
-        {
-            // True mathematical Golden Ratio soft-knee
-            T threshold = ceiling / kPhi;
-            T absSample = std::abs(sample);
-
-            if (absSample <= threshold)
-                return sample;
-
-            // Rational asymptotic curve to the ceiling
-            T sign = std::copysign(T(1), sample);
-            T excess = absSample - threshold;
-            T range = ceiling - threshold;
-
-            return sign * (threshold + (range * excess) / (excess + range));
-        }
+            return detail::clipperShape<detail::ClipperCurve::GoldenRatio>(sample, ceiling);
     }
 
     // Mathematical utility helpers

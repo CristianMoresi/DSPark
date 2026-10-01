@@ -10,6 +10,8 @@
  * Provides conversion between Left/Right and Mid/Side representations.
  * Useful for stereo processing where independent control over the centre
  * image (mid) and stereo width (side) is needed.
+ * Static operations need no prepare(), reset() or serialized state and add
+ * no audio-path delay. The caller owns the input/output buffers.
  *
  * Convention: M = (L + R) / 2, S = (L - R) / 2 on encode; L = M + S,
  * R = M - S on decode. The 0.5 lives on the encode side so a full-scale

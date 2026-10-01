@@ -710,6 +710,44 @@ DSPARK_TEST(Beat_grid_follows_a_tempo_ramp)
     EXPECT_LT(worstMedian, 25.0);
 }
 
+// An isolated phase change is not a tempo change. A least-squares fit that
+// numbers every new grid event as an integer beat reports 88.36, 103.99 and
+// 145.61 BPM for these 85, 100 and 140 BPM trains. Three separated half-beat
+// advances or delays must leave the tempo within 0.25%, including when the
+// grid bridges the delayed transition with an extra event.
+DSPARK_TEST(Beat_tempo_survives_isolated_half_beat_phase_changes)
+{
+    double worst = 0.0;
+    for (double bpm : { 85.0, 100.0, 140.0 })
+        for (double direction : { -1.0, 1.0 })
+        {
+            const double period = 60.0 * kFs / bpm;
+            std::vector<float> x(static_cast<size_t>(56.0 * period), 0.0f);
+            double phase = 0.0;
+            for (int k = 0; k < 52; ++k)
+            {
+                if (k == 18 || k == 30 || k == 38) phase += direction * 0.5;
+                const int64_t at = static_cast<int64_t>(std::llround(
+                    kLeadSeconds * kFs + (static_cast<double>(k) + phase) * period));
+                addClick(x, at, kFs);
+            }
+            BeatTracker<float> tracker;
+            tracker.prepare({ kFs, 512, 1 });
+            tracker.setTempoRange(static_cast<float>(bpm * 0.8),
+                                  static_cast<float>(bpm * 1.2));
+            tracker.beginOffline(static_cast<int64_t>(x.size()));
+            tracker.pushOffline(x);
+            const auto result = tracker.finishOffline();
+            EXPECT_GT(result.beatSamples.size(), size_t(48));
+            const double error = std::abs(static_cast<double>(result.tempoBpm) / bpm - 1.0);
+            worst = std::max(worst, error);
+            std::cout << "  phase " << direction << " at " << bpm
+                      << " BPM: tempo " << result.tempoBpm << '\n';
+        }
+    std::cout << "  isolated phase change worst tempo error " << worst * 100.0 << "%\n";
+    EXPECT_LT(worst, 0.0025);
+}
+
 // Swung eighths. The quarter-note grid must be recovered within 15 ms, and
 // the tracker must not lock onto the swung off-beat -- which is why the
 // metrical level is asserted as well as the timing.

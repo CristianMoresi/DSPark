@@ -6,6 +6,65 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `AudioIntervalAnalyzer`: bounded block-stream analysis of exact sample
+  intervals, with RMS/peak/finite true peak, scoped loudness, explicit validity,
+  optional continuous observations and no retained PCM. Reuses existing meters
+  and the scaled-energy kernel shared with `OfflineEnergyAnalyzer`.
+- `LoudnessMeter::finalizeTruePeak()` completes a finite interpolation tail
+  without advancing loudness windows or gates; `getMeasurementInfo()` exposes
+  complete-hop coverage and absolute-gate counts to the stream owner.
+  `TruePeakDetector::getTailPeak()` preserves live channel history.
+
+- `OfflineStereoGenerator`: complete-source rendering through `StereoGenerator`,
+  with explicit mono duplication, exact exclusions, compensated latency and
+  measured output headroom. A host-owned canonical delta cache supports new
+  widths/exclusions while validating source, clock, settings and cached PCM.
+  Worker scratch is bounded independently of duration; output is transactional.
+
+- `StereoGenerator`: twenty moving bands and rational color on a parallel copy,
+  with delta add-back preserving the delayed original mid. Includes width
+  smoothing, optional delta-only low cut, explicit local oversampling, source
+  clock/reset contracts, presets, latency reporting and numerical-error status.
+  Shares Core conversion and clipping kernels; processing allocates nothing.
+
+- `OfflineSoftClipper` and `OfflineHardClipper`: full-source automatic sample-peak
+  reduction using shared Clipper curves, continuous-interval antialiasing and
+  finite-source sinc reconstruction through Core convolution and Cauchy maps.
+  Actual rounded PCM calibrates the ceiling, with explicit local oversampling,
+  original sample alignment, exact exclusions, bounded PCM caches and
+  transactional output. Coarse maps scale with duration and reuse storage across
+  calibration passes. No master gain trim or extra limiter.
+
+- `OfflineBeatCompressor`: complete-source pulse peak leveling, upper-median
+  reference, capped reduction, local tempo release and explicit unknown-tempo
+  fallback, reusing shared analysis and the bandlimited gain renderer.
+- `OfflineTempoAnalyzer`: source-bound beat intervals and ambiguity diagnostics
+  using retained pooled-channel features and the existing `BeatTracker` engine.
+  Adds per-job allocation accounting and cancellation without another FFT;
+  unsupported pulse intervals return no reliable local tempo.
+- `OfflinePunch`: source-aligned transient boost with a bounded, stereo-linked
+  gain envelope; shared smoothing, exclusions, verified rendering and source
+  analysis. The attack map also recovers quiet restarts masked by global novelty
+  and rejects end-padding attacks, with sample-clock minimum spacing.
+- `OfflinePeakCompressor`: automatic complete-source peak reduction, event-local
+  holds, anticipatory smoothing and stereo-linked amplitude recovery. Reuses the
+  transient analyzer, envelope follower and gain transport shared with Leveler.
+  Requested reduction is capped by measured sustained headroom; exclusions and
+  achieved sample-peak reduction are explicit, with no hidden audio clipping.
+- `OfflineTransientAnalyzer`: separate attack and pulse maps from a shared pooled
+  stereo spectrum, complete-source normalization, refined source-frame intervals,
+  optional reusable novelty features and bounded worker memory. Reuses the same
+  FFT, filterbank, novelty and peak-picking kernels as `OnsetDetector`.
+- `OfflineLeveler`: automatic, stereo-linked upward macro RMS leveling with
+  exact source-frame exclusions, reusable immutable plans, cancellation and
+  transactional offline rendering. Reports output sample/true peak without
+  imposing hidden limiting or attenuation. Shared exclusion feathers have three
+  zero edge derivatives and smooth overlapping masks, avoiding gain cusps between
+  neighboring protected regions.
+- `OfflineEnergyAnalyzer` and shared offline source/sink/job contracts: complete
+  mono/stereo analysis in bounded blocks, 64-bit source positions, actual final-bin
+  duration, content/revision checks and payload-memory budgets. Maps retain energy
+  features rather than PCM. See `docs/offline-processing.md`.
 - `PitchCorrector::getState()` / `setState()` (scale, root, retune speed,
   formant preservation) and `SpectralFreeze::getState()` / `setState()`
   (freeze request, phase mode): they were the two effects with settings
@@ -93,19 +152,31 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `TubePreamp` tabulates the implicit Koren load line, including cathode
+  feedback, instead of iterating the usual operating range per sample.
+  The shared per-instance table occupies 149768 bytes; the independent
+  current reference stays within 5e-10 A over five internal rates. A stereo
+  two-tone benchmark at 2x is 4.0-5.9 times faster than the previous solver
+  at the same factor, with the measurement conditions in the header.
+  The default remains 2x. This does not solve high-drive aliasing: the
+  updated spectral sweep includes +36 dB and finds worse 2x cases near
+  14 kHz than the previous sparse measurements.
+- `processBlock()` and `getLatency()` are the canonical in-place and audio
+  delay names. Saturation's `process()` and the analog effects'
+  `getLatencySamples()` remain compatible aliases. The cookbook documents
+  separate-input utilities, analysis delay, branch alignment and setup-only
+  configuration. The channel-strip example uses ProcessorChain to report
+  the complete chain latency.
 - `BeatTracker::analyze()` settles the metrical level with a model fitted to
   three public tempo-annotated collections: the proposed reading, its half
   and its double are scored on how each one's pulse sits in the full, the
   register-balanced and the four register envelopes, and at what rate it
-  would be tapped. Cross-validated, the level is right on 73.8% of the ISMIR
-  2004 ballroom set, 66.4% of the Salsa Dataset and 48.9% of Freesound
-  Loops 4k (63.2%, 50.0% and 43.7% before). End to end, tempo within 4% on
-  75.8%, 68.9% and 49.9% (65.6%, 50.0%, 44.1% before). The model is not
+  would be tapped. The header records the measured accuracy and distinguishes
+  reuse of fitting material from the additional evaluation excerpts. The model is not
   consulted where the proposal's alternate beats cannot be told apart, so
   clicks, swing and quiet subdivisions keep their level; when it moves the
-  level, the reading it moved from is `secondaryTempoBpm`. On the ballroom
-  set the half/double/triple-tolerant figure goes from 92.1% to 89.9%:
-  Viennese waltzes read at one beat per bar are moved to two.
+  level, the reading it moved from is `secondaryTempoBpm`. Viennese waltzes
+  read at one beat per bar can still be moved to two; that limitation remains.
 - `TransformerModel` oversamples its core 2x by default, with
   `setOversampling()` (1, 2, 4, 8, 16), `getOversamplingFactor()` and the
   factor saved in the state (older blobs restore 2x). At 1x the loop's
@@ -180,6 +251,33 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `LoudnessMeter`: the -100 LUFS floor is monotone across its former power-domain
+  discontinuity, including positive sub-floor powers in float and double.
+- `AlgorithmicReverb`: compute feedback rotation sine/cosine in double before
+  rounding to the sample type, avoiding amplified float-libm discrepancies.
+  Full-signal x64 MSVC/GCC/Clang fixtures now gate numerical agreement across
+  three sample rates and static, preset and maximum modulation.
+
+- Widening `AudioBufferView` conversions now retain small-capacity channel views,
+  allowing `Oversampling<T, 2>` and other compact Core buffers to use the common
+  processing API. Const sample access remains const; implicit capacity narrowing
+  stays prohibited.
+
+- `FIRDesign` propagates allocation failures from its coefficient factories,
+  allowing callers to recover instead of terminating the process. Successful
+  designs produce the same coefficients.
+- `BeatTracker` no longer counts an isolated half-beat phase transition as
+  a full beat when stable intervals surround it. The worst tempo error on
+  six 85/100/140 BPM phase-change trains falls from 4.01% to below 0.003%.
+  With the level model and beat positions unchanged, tempo accuracy on the
+  same 454 ballroom excerpts rises from 75.8% to 76.0%, Salsa stays at 68.9%,
+  and the expanded 3223-loop evaluation rises from 49.7% to 50.5%. On 242
+  additional ballroom excerpts kept apart from the original fit and the
+  slope development, accuracy rises from 73.6% to 74.8%.
+- Cookbook synthesis recipe and umbrella class index use `ADSREnvelope`,
+  the declared type. Windows comment-path checks normalize Git paths with
+  forward slashes; the VST3 smoke host avoids a shadowed local rejected by
+  strict compiler warnings.
 - `TapeMachine` no longer mirrors the programme about a quarter of the
   sample rate. Its AC-bias carrier sat at 0.375 of the internal rate, where
   the carrier's third harmonic folds onto the base-rate Nyquist frequency:

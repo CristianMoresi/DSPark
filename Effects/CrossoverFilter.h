@@ -11,6 +11,10 @@
  * crossover filters. Supports three slope options (LR12, LR24, LR48) and
  * two processing modes: minimum-phase IIR with allpass phase correction,
  * and linear-phase FFT-based processing with zero phase distortion.
+ * Its processBlock(input, bandOutputs, count) writes separate caller-owned
+ * band buffers, rather than replacing input with one band. It therefore
+ * needs explicit routing and is not an in-place ProcessorChain slot. Sum
+ * getLatency() once for the split, not once for each parallel band.
  *
  * Linkwitz-Riley crossovers guarantee that all bands sum to an allpass
  * (flat magnitude response) at every frequency, making them the standard

@@ -1029,8 +1029,8 @@ int main(int argc, char** argv)
         //     arrangement): the wrapper must not read past the input's
         //     channel array, and the missing channel repeats the one given.
         {
-            float* monoIn[1] = { inL.data() };
-            inputBuses[0].Steinberg_Vst_AudioBusBuffers_channelBuffers32 = monoIn;
+            float* monoChannels[1] = { inL.data() };
+            inputBuses[0].Steinberg_Vst_AudioBusBuffers_channelBuffers32 = monoChannels;
             inputBuses[0].numChannels = 1;
             fillInput(0.5f);
             processOnce();

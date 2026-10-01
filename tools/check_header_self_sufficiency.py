@@ -4,7 +4,7 @@
 The inventory is derived from the install directories in CMakeLists.txt and
 the includes in DSPark.h.  No second list of public headers is maintained by
 this tool.  The release counters are scalar assertions over that derived
-inventory: 102 umbrella-facing headers and 104 installed library headers.
+inventory: 115 umbrella-facing headers and 142 installed library headers.
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ import sys
 import tempfile
 
 
-EXPECTED_UMBRELLA_HEADERS = 102
-EXPECTED_INSTALLED_HEADERS = 104
+EXPECTED_UMBRELLA_HEADERS = 115
+EXPECTED_INSTALLED_HEADERS = 142
 SHUFFLE_SEED = 0xD5A170
 WARNING_FLAGS = ("-Wall", "-Wextra", "-Wpedantic", "-Werror")
 
@@ -185,6 +185,43 @@ int main()
 '''
 
 
+def _offline_enabled_source() -> str:
+    return r'''#include "DSPark.h"
+static_assert(DSPARK_HAS_OFFLINE == 1);
+int main()
+{
+    dspark::OfflineLeveler<float> leveler;
+    dspark::OfflineSoftClipper<float> soft;
+    dspark::OfflineHardClipper<float> hard;
+    dspark::OfflineStereoGenerator<float> stereo;
+    dspark::OfflineStereoGenerator<float>::Options stereoOptions;
+    stereoOptions.duplicateMono = true;
+    dspark::OfflineEnergyAnalyzer<double> analyzer;
+    dspark::OfflineTransientAnalyzer<float> transients;
+    dspark::OfflineTempoAnalyzer<double> tempo;
+    dspark::AudioBuffer<float> input, output;
+    input.resize(1, 1);
+    return leveler.run(input, output, 48000).succeeded()
+        && soft.run(input, output, 48000).succeeded()
+        && hard.run(input, output, 48000).succeeded()
+        && stereo.run(input, output, 48000, stereoOptions).succeeded()
+        && sizeof(analyzer) > 0 && sizeof(transients) > 0 && sizeof(tempo) > 0 ? 0 : 1;
+}
+'''
+
+
+def _check_offline_profiles(repo: Path, compiler: str, scratch: Path) -> None:
+    _compile(compiler, repo, scratch, "offline_enabled", _offline_enabled_source(),
+             extra_flags=("-fno-rtti",))
+    _compile(compiler, repo, scratch, "offline_disabled",
+             "#define DSPARK_NO_OFFLINE\n" + _umbrella_source()
+             + "static_assert(DSPARK_HAS_OFFLINE == 0);\n")
+    _compile(compiler, repo, scratch, "offline_disabled_negative",
+             '#define DSPARK_NO_OFFLINE\n#include "DSPark.h"\n'
+             'dspark::OfflineLeveler<float> unavailable;\n',
+             expect_success=False, expected_diagnostic="OfflineLeveler")
+
+
 def run_full(repo: Path, compiler: str) -> None:
     umbrella, installed = derive_inventory(repo)
     with tempfile.TemporaryDirectory(prefix="dspark-header-audit-") as directory:
@@ -221,12 +258,13 @@ def run_full(repo: Path, compiler: str) -> None:
             repo,
             scratch,
             "umbrella_embedded",
-            _umbrella_source(no_file_io=True),
+            _umbrella_source(no_file_io=True) + "static_assert(DSPARK_HAS_OFFLINE == 0);\n",
             extra_flags=("-fno-exceptions", "-fno-rtti"),
         )
+        _check_offline_profiles(repo, compiler, scratch)
     print(
         "header self-sufficiency: PASS compiler=%s umbrella=%d installed=%d "
-        "standalone=%d include_orders=3 profiles=3"
+        "standalone=%d include_orders=3 profiles=3 offline_controls=3"
         % (compiler, len(umbrella), len(installed), len(installed))
     )
 
@@ -239,7 +277,7 @@ def run_embedded(repo: Path, compiler: str) -> None:
             repo,
             Path(directory),
             "umbrella_embedded",
-            _umbrella_source(no_file_io=True),
+            _umbrella_source(no_file_io=True) + "static_assert(DSPARK_HAS_OFFLINE == 0);\n",
             extra_flags=("-fno-exceptions", "-fno-rtti"),
         )
     print(f"header self-sufficiency: PASS compiler={compiler} profile=embedded")

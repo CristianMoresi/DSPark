@@ -20,9 +20,9 @@
   },
   "counts": {
     "binary_exact": 184,
-    "first_party_ascii_text": 223,
+    "first_party_ascii_text": 279,
     "third_party_utf8_exact": 84,
-    "total": 491
+    "total": 547
   },
   "gitattributes_required_lines": [
     "* text=auto",
@@ -85,6 +85,18 @@
     },
     {
       "kind": "first_party_ascii_text",
+      "path": "Analysis/OfflineEnergyAnalyzer.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/OfflineTempoAnalyzer.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/OfflineTransientAnalyzer.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
       "path": "Analysis/OnsetDetector.h"
     },
     {
@@ -102,6 +114,14 @@
     {
       "kind": "first_party_ascii_text",
       "path": "Analysis/SpectrumAnalyzer.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/detail/OfflineBeatEngine.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/detail/OnsetFeatures.h"
     },
     {
       "kind": "first_party_ascii_text",
@@ -197,6 +217,10 @@
     },
     {
       "kind": "first_party_ascii_text",
+      "path": "Core/OfflineProcessing.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
       "path": "Core/Oscillator.h"
     },
     {
@@ -286,6 +310,94 @@
     {
       "kind": "first_party_ascii_text",
       "path": "Core/ZeroLatencyConvolver.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/AccountedAllocator.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/BoxAverage.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/ClipperShape.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/ContinuousClip.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/ConvolutionRate.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/DcBlock.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflineAttenuation.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflineBoxSmoother.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflineClip.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflineClipProjection.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflineConvolutionWindow.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflineGain.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflineGainSource.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflineProduct.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflinePunchEnvelope.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflineSinc.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflineStereo.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/OfflineWorker.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/RationalKnee.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/RetimedDcBlock.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/StereoColor.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/TptSvf.h"
     },
     {
       "kind": "first_party_ascii_text",
@@ -484,6 +596,34 @@
     },
     {
       "kind": "first_party_ascii_text",
+      "path": "Effects/OfflineBeatCompressor.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/OfflineHardClipper.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/OfflineLeveler.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/OfflinePeakCompressor.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/OfflinePunch.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/OfflineSoftClipper.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/OfflineStereoGenerator.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
       "path": "Effects/Panner.h"
     },
     {
@@ -517,6 +657,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "Effects/SpectralFreeze.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/StereoGenerator.h"
     },
     {
       "kind": "first_party_ascii_text",
@@ -630,6 +774,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "docs/migration-v1.8.0.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "docs/offline-processing.md"
     },
     {
       "kind": "first_party_ascii_text",
@@ -1190,6 +1338,46 @@
     },
     {
       "kind": "first_party_ascii_text",
+      "path": "tests/TestOfflineBeat.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestOfflineClip.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestOfflineGainRender.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestOfflineLeveler.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestOfflinePeak.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestOfflineProduct.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestOfflinePunch.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestOfflineStereo.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestOfflineTempo.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestOfflineTransient.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
       "path": "tests/TestOnset.cpp"
     },
     {
@@ -1215,6 +1403,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "tests/TestState.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestStereoGenerator.cpp"
     },
     {
       "kind": "first_party_ascii_text",
@@ -2169,6 +2361,10 @@
     },
     {
       "kind": "first_party_ascii_text",
+      "path": "tests/offline_gain_reference.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
       "path": "tests/package_consumer/CMakeLists.txt"
     },
     {
@@ -2266,6 +2462,34 @@
     {
       "kind": "first_party_ascii_text",
       "path": "tools/x11_editor_smoke.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Analysis/AudioIntervalAnalyzer.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/ScaledSumSquares.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "docs/interval-analysis.md"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "examples/interval_analysis.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/TestAudioInterval.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tests/reverb_numeric_fixture.cpp"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/check_reverb_numerics.py"
     }
   ],
   "schema": "dspark.public-file-policy.v1"

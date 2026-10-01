@@ -25,6 +25,9 @@
  * single-sample call), which suits offline and per-sample callers. Either way
  * the first processing call after construction, prepare() or reset() starts
  * settled on the current position and curve.
+ * This utility keeps smoothing history; it is not stateless. It adds no
+ * audio-path delay and has no serialized state blob: the caller stores the
+ * requested position and curve and restores them with the setters.
  *
  * Dependencies: Core/AudioSpec.h, Core/DspMath.h.
  *

@@ -83,6 +83,10 @@ void instantiate()
     Saturation<T> sat;
     SpectralDenoiser<T> denoiser;
     StereoWidth<T> sw;
+    StereoGenerator<T> stereoGenerator;
+#if DSPARK_HAS_OFFLINE
+    [[maybe_unused]] OfflineStereoGenerator<T> offlineStereo;
+#endif
     TapeMachine<T> tape;
     TransformerModel<T> xfmr;
     TransientDesigner<T> td;
@@ -95,6 +99,7 @@ void instantiate()
     Goertzel<T> goe;
     LevelFollower<T> lvl;
     LoudnessMeter<T> ldm;
+    [[maybe_unused]] AudioIntervalAnalyzer<T> intervals;
     LoudnessNormalizer<T> ldn;
     PhaseCorrelation<T> phaseCorr;
     PitchDetector<T> pd;
@@ -130,7 +135,7 @@ void instantiate()
     (void)lim; (void)mbc;
     (void)ngt; (void)ng; (void)pan; (void)phr; (void)pitchShift; (void)rev;
     (void)rm; (void)sat; (void)denoiser; (void)pitchCorrect; (void)sw;
-    (void)tape; (void)xfmr;
+    (void)tape; (void)xfmr; (void)stereoGenerator;
     (void)td; (void)tr; (void)tube; (void)vib;
     (void)envFollow; (void)goe; (void)lvl; (void)ldm; (void)ldn;
     (void)phaseCorr;

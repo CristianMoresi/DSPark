@@ -9,13 +9,14 @@
  *
  * Circuit-level preamp modelling, not a waveshaper:
  *
- * - **Triode stages** (1 or 2) solved per sample with Newton-Raphson on the
- *   plate current. The tube follows Koren's improved SPICE model (Koren
+ * - **Triode stages** (1 or 2) use a tabulated implicit plate-current
+ *   solution with bicubic interpolation; an analytic Newton solve handles
+ *   voltages outside the table. The tube follows Koren's SPICE model (Koren
  *   1996; published 12AX7 parameters MU=100, EX=1.4, KG1=1060, KP=600,
  *   KVB=300) in a classic common-cathode stage: 300 V supply, 100 k ohm plate
  *   load, 1.5 k ohm cathode resistor with its 22 uF bypass capacitor
  *   integrated trapezoidally - the capacitor state is folded into the
- *   Newton equation, so each sample solves the true implicit system. Grid
+ *   load-line equation, so the table retains the capacitor feedback. Grid
  *   conduction is approximated by a soft clamp toward +0.7 V (full blocking
  *   distortion needs the input-coupling state and is left for a later pass).
  * - **Supply sag**: the effective B+ droops with smoothed plate current
@@ -25,15 +26,15 @@
  *   network, solved exactly as a 12-port WDF R-type adaptor
  *   (wdf::ToneStackFMV - verified sample-exact against the symbolic
  *   transfer function of Yeh & Smith, DAFx-06). The stack sits between the
- *   stages and is driven by the first stage's real ~38 k ohm output impedance,
- *   so it loads the tube exactly like the hardware. Controls interact
+ *   stages and uses a fixed 38 k ohm source-impedance approximation; its
+ *   load is not fed back into the triode solve. Controls interact
  *   non-orthogonally - that is the circuit, not a bug.
  * - Output level: the circuit's program response at the reference tone
  *   setting is measured once in prepare() (settled channel, pink-weighted
  *   multitone). A 3-section EQ designed from that measurement flattens the
  *   FMV stack's fixed ~10 dB mid-scoop envelope - neutral knobs sound
  *   neutral, the tone controls act relative to flat, and the triode's
- *   harmonic character is untouched. Loudness divides out the program gain
+ *   nonlinear harmonic generation is retained. Loudness divides out the program gain
  *   MEASURED AT EACH DRIVE (prepare-time sweep LUT, so the link tracks the
  *   circuit's real compression) plus a +0.25 dB/dB residual slope: backing
  *   off is audible, pushing raises density at a gently rising level - the
@@ -46,28 +47,41 @@
  * resampling, zero added latency, but the triode/grid nonlinearity then
  * aliases in-band unless you oversample the surrounding chain yourself), 2 =
  * default (group-delay latency reported by getLatency()/getLatencySamples()),
- * 4/8 = progressively lower alias floor at ~linearly higher CPU. Cost scales
- * with the factor: the whole per-sample Newton-Raphson triode + WDF tone
- * solve runs factor x oversampled samples, so 4x is ~2x the CPU of the 2x
- * default and 1x is the cheapest. getLatency() always reflects the ACTIVE
+ * 4/8/16 = progressively lower alias floor with higher processing cost. The
+ * whole circuit runs at the selected factor; the interpolation speeds up
+ * the load-line calculation but does not itself remove aliasing.
+ * getLatency() always reflects the ACTIVE
  * factor (0 at 1x) so hosts get correct PDC. Measured at 48 kHz over tones
- * from 1 to 15 kHz at -6 and -18 dBFS, the worst harmonic folded back below
- * 20 kHz (dB re the tone), with the cost of one stereo instance on a desktop
- * core:
+ * from 1 to 15 kHz in 1 kHz steps, at -6 and -18 dBFS: each tone is moved
+ * to the nearest odd bin of a 16384-point FFT. After settling, a Hann
+ * window excludes DC and legitimate harmonics (+/-2 bins). The worst
+ * remaining component below 20 kHz, in dB relative to the tone, is:
  *
  *   stages, drive     2x (default)   4x          8x
- *   1, 0 dB           -60.6          -88.5       -116.2
- *   1, +12 dB         -40.3          -57.7       -87.2
- *   1, +24 dB         -21.2          -35.4       -50.9
+ *   1, -12 dB         -86.9         -113.4       -139.3
+ *   1, 0 dB           -60.5          -88.5       -116.1
+ *   1, +12 dB         -40.2          -57.7       -87.1
+ *   1, +24 dB         -21.1          -35.3       -50.8
+ *   1, +36 dB         -17.1          -23.3       -31.5
+ *   2, -12 dB         -70.4          -97.5       -123.3
  *   2, 0 dB           -47.9          -68.6       -96.5
- *   2, +12 dB         -24.3          -42.3       -61.6
- *   2, +24 dB         -17.5          -23.0       -36.9
- *   CPU, 1 / 2 stages 9% / 17%       18% / 31%   36% / 60%
+ *   2, +12 dB         -21.9          -42.3       -61.6
+ *   2, +24 dB         -15.1          -22.9       -36.9
+ *   2, +36 dB         -14.4          -20.7       -28.0
  *
- * The worst case is always the 15 kHz tone: a high-gain triode turns a loud
- * top-octave sine into a nearly square wave whose harmonics fall slowly, and
- * material with less energy up there folds correspondingly less. Where a
- * high-gain setting meets bright material, 4x or 8x is the setting to use.
+ * A high-gain triode turns a loud top-octave sine into a nearly square wave
+ * whose harmonics fall slowly. The worst frequency varies with the setting;
+ * testing only 15 kHz missed the two-stage 2x peaks near 14 kHz.
+ * High-drive aliasing remains a limitation even at the higher factors:
+ * choose a factor from measurements at the intended drive and sample rate.
+ *
+ * The current table is 149768 bytes shared by all channels in an instance.
+ * On an x64 Release build, processing at 2x was 4.0-5.9 times faster than
+ * the previous iterative solver at the SAME factor (stereo double, 48 kHz,
+ * 256-frame blocks, 997/15013 Hz two-tone at 0.25 peak each, 0/12/24 dB
+ * drive, one/two stages, median of five runs). Same-factor waveform error
+ * stayed below -172 dB RMS relative to the original across 2x/4x/8x.
+ * This is a solver optimization; the aliasing above is not resolved by it.
  * THD signature verified in the
  * suite: single-stage distortion is 2nd-harmonic dominant (asymmetric
  * triode), DC operating point matches an independent high-precision solve
@@ -110,6 +124,156 @@
 
 namespace dspark {
 
+/// @cond DSPARK_INTERNAL
+namespace detail {
+    struct TubePreampCurrentTable
+    {
+        static constexpr double kMu = 100.0, kEx = 1.4, kKg1 = 1060.0;
+        static constexpr double kKp = 600.0, kKvb = 300.0;
+        static constexpr double kRL = 100e3, kRk = 1.5e3, kCk = 22e-6;
+
+        /** @brief Koren plate current and its partial derivatives. */
+        static void koren(double vpk, double vgk, double& ip,
+                          double& dIpdVpk, double& dIpdVgk) noexcept
+        {
+            vpk = std::max(vpk, 0.0);
+            const double s = std::sqrt(kKvb + vpk * vpk);
+            const double u = kKp * (1.0 / kMu + vgk / s);
+
+            double sp = 0.0, sig = 0.0;                  // softplus(u), logistic(u)
+            if (u > 30.0)       { sp = u; sig = 1.0; }
+            else if (u < -30.0) { sp = std::exp(u); sig = sp; }
+            else
+            {
+                const double eu = std::exp(u);
+                sp = std::log1p(eu);
+                sig = eu / (1.0 + eu);
+            }
+
+            const double e1 = (vpk / kKp) * sp;
+            if (e1 <= 0.0)
+            {
+                ip = 0.0;
+                dIpdVpk = 0.0;
+                dIpdVgk = 0.0;
+                return;
+            }
+            const double e1ex1 = std::pow(e1, kEx - 1.0);
+            ip = 2.0 * e1ex1 * e1 / kKg1;
+            const double dIpdE1 = 2.0 * kEx * e1ex1 / kKg1;
+
+            const double dUdVpk = -kKp * vgk * vpk / (s * s * s);
+            const double dE1dVpk = sp / kKp + (vpk / kKp) * sig * dUdVpk;
+            const double dE1dVgk = vpk * sig / s;
+            dIpdVpk = dIpdE1 * dE1dVpk;
+            dIpdVgk = dIpdE1 * dE1dVgk;
+        }
+
+        // With S = B+ - A and G = Vgrid - A, the trapezoidal cathode
+        // equation Vk = A + B*Ip leaves a TWO-dimensional implicit load line:
+        // Ip = Koren(S - (RL+B)*Ip, G - B*Ip). B is fixed by prepare's rate.
+        // Use R = G/S to align the cutoff knee across supply voltages. This
+        // needs 149768 bytes per instance instead of 994088 for a uniform
+        // (S,G) grid, with <5e-10 A error in the independent load-line check.
+        // Tabulate the root and implicit derivatives without quantizing the
+        // capacitor or dropping its feedback. Bicubic Hermite interpolation
+        // keeps current and both first derivatives continuous at cell edges.
+        // Every channel and both calibration passes share this instance.
+        struct Node { double y, ds, dg, dsg; };
+        static constexpr int kNS = 18, kNG = 260;
+        std::array<Node, kNS * kNG> nodes;
+        double kb;
+
+        explicit TubePreampCurrentTable(double rate)
+            : kb((0.5 / (rate * kCk)) / (1.0 + 0.5 / (rate * kCk * kRk)))
+        {
+            for (int si = 0; si < kNS; ++si)
+                for (int gi = 0; gi < kNG; ++gi)
+                {
+                    const double s = si <= 6 ? 80.0 + 8.0 * si
+                                             : 128.0 + 16.0 * (si - 6);
+                    // The exponential cutoff tail needs fewer knots than
+                    // the conducting region. All segment edges are knots.
+                    const double r = gi <= 4 ? -0.08 + gi * 0.01
+                        : (gi <= 19 ? -0.04 + (gi - 4) * 0.001
+                                    : -0.025 + (gi - 19) / 6400.0);
+                    Node n = solve(s, s * r);
+                    n.ds += r * n.dg;             // dI/dS with R held fixed
+                    n.dg *= s;                   // dI/dR with S held fixed
+                    // Differentiate the implicit dI/dR, not sampled currents;
+                    // 0.001 V is much smaller than the 8/16 V supply cells.
+                    n.dsg = ((s + 0.001) * solve(s + 0.001, (s + 0.001) * r).dg
+                           - (s - 0.001) * solve(s - 0.001, (s - 0.001) * r).dg) / 0.002;
+                    nodes[static_cast<size_t>(si * kNG + gi)] = n;
+                }
+        }
+
+        [[nodiscard]] Node solve(double supply, double grid) const noexcept
+        {
+            // Positive current is bounded by the plate load. Safeguard Newton
+            // with that bracket: setup converges faster than pure bisection
+            // without accepting a root on an unphysical branch.
+            double low = 0.0, high = supply / (kRL + kb);
+            double y = 0.5 * high, p = 0.0, dp = 0.0, dg = 0.0;
+            for (int k = 0; k < 60; ++k)
+            {
+                koren(supply - (kRL + kb) * y, grid - kb * y, p, dp, dg);
+                const double f = y - p;
+                if (std::abs(f) <= 1e-15) break;
+                if (f > 0.0) high = y;
+                else low = y;
+                const double slope = 1.0 + (kRL + kb) * dp + kb * dg;
+                const double next = y - f / slope;
+                y = next >= low && next <= high ? next : 0.5 * (low + high);
+            }
+            koren(supply - (kRL + kb) * y, grid - kb * y, p, dp, dg);
+            const double den = 1.0 + (kRL + kb) * dp + kb * dg;
+            return {y, dp / den, dg / den, 0.0};
+        }
+
+        static double cubic(double a, double b, double da, double db, double t) noexcept
+        {
+            const double diff = b - a;
+            return (((da + db - 2.0 * diff) * t + (3.0 * diff - 2.0 * da - db)) * t + da) * t + a;
+        }
+
+        [[nodiscard]] bool covers(double s, double g) const noexcept
+        {
+            return s >= 80.0 && s < 304.0 && std::isfinite(g) && g < 1.0;
+        }
+
+        [[nodiscard]] double eval(double s, double g) const noexcept
+        {
+            // At R <= -0.08, Koren's positive plate current is below 1e-27 A
+            // throughout the supply range. Do not pin deep cutoff to a
+            // finite table endpoint or send it through an iterative solver.
+            if (g <= -0.08 * s) return 0.0;
+            const double step = s < 128.0 ? 8.0 : 16.0;
+            const double r = g / s;
+            const double rstep = r < -0.04 ? 0.01 : (r < -0.025 ? 0.001 : 1.0 / 6400.0);
+            const double sp = s < 128.0 ? (s - 80.0) / 8.0 : 6.0 + (s - 128.0) / 16.0;
+            const double gp = r < -0.04 ? (r + 0.08) * 100.0
+                : (r < -0.025 ? 4.0 + (r + 0.04) * 1000.0
+                              : 19.0 + (r + 0.025) * 6400.0);
+            // Adding the grid offset can round a value just below the upper
+            // edge onto that edge. Use the final CELL, with t = 1, there.
+            const int si = std::min(static_cast<int>(sp), kNS - 2);
+            const int gi = std::min(static_cast<int>(gp), kNG - 2);
+            const double st = sp - si, gt = gp - gi;
+            const Node& a = nodes[static_cast<size_t>(si * kNG + gi)];
+            const Node& b = nodes[static_cast<size_t>((si + 1) * kNG + gi)];
+            const Node& c = nodes[static_cast<size_t>(si * kNG + gi + 1)];
+            const Node& d = nodes[static_cast<size_t>((si + 1) * kNG + gi + 1)];
+            const double p0 = cubic(a.y, b.y, a.ds * step, b.ds * step, st);
+            const double p1 = cubic(c.y, d.y, c.ds * step, d.ds * step, st);
+            const double m0 = cubic(a.dg, b.dg, a.dsg * step, b.dsg * step, st);
+            const double m1 = cubic(c.dg, d.dg, c.dsg * step, d.dsg * step, st);
+            return std::max(0.0, cubic(p0, p1, m0 * rstep, m1 * rstep, gt));
+        }
+    };
+} // namespace detail
+/// @endcond
+
 /**
  * @class TubePreamp
  * @brief One/two 12AX7 stages with sag and a WDF tone circuit.
@@ -150,10 +314,11 @@ public:
             oversampler_.reset();
         }
 
+        loadTable_ = std::make_unique<LoadTable>(fs2_);
         channels_.clear();
         channels_.resize(static_cast<size_t>(numChannels_));
         for (auto& ch : channels_)
-            ch = std::make_unique<ChannelState>(fs2_);
+            ch = std::make_unique<ChannelState>(fs2_, loadTable_.get());
 
         latency_ = oversampler_ ? oversampler_->getLatency() : 0;
         drySize_ = 1;
@@ -294,9 +459,8 @@ public:
      *  reflects the current factor, so hosts can compensate (PDC). */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
 
-    /** @brief Same value as getLatency(), under the name Saturation and the
-     *  analysis classes use. ProcessorChain::getLatency() reads getLatency(). */
-    [[nodiscard]] int getLatencySamples() const noexcept { return latency_; }
+    /** @brief Compatibility alias of getLatency(), in prepared-rate samples. */
+    [[nodiscard]] int getLatencySamples() const noexcept { return getLatency(); }
 
     /** @brief Effective B+ supply voltage of channel 0 (sag meter readout). */
     [[nodiscard]] T getSupplyVoltage() const noexcept
@@ -455,58 +619,28 @@ public:
 
 private:
     // -- Circuit constants (classic 12AX7 common-cathode stage) -------------------
-    static constexpr double kMu = 100.0, kEx = 1.4, kKg1 = 1060.0;
-    static constexpr double kKp = 600.0, kKvb = 300.0;
     static constexpr double kBplus = 300.0;
-    static constexpr double kRL = 100e3;
-    static constexpr double kRk = 1.5e3;
-    static constexpr double kCk = 22e-6;
+    static constexpr double kRL = detail::TubePreampCurrentTable::kRL;
+    static constexpr double kRk = detail::TubePreampCurrentTable::kRk;
+    static constexpr double kCk = detail::TubePreampCurrentTable::kCk;
     static constexpr double kInterstage = 0.12;   ///< Divider into stage 2.
 
-    /** @brief Koren plate current and its partial derivatives. */
+    using LoadTable = detail::TubePreampCurrentTable;
+
     static void koren(double vpk, double vgk, double& ip,
                       double& dIpdVpk, double& dIpdVgk) noexcept
     {
-        vpk = std::max(vpk, 0.0);
-        const double s = std::sqrt(kKvb + vpk * vpk);
-        const double u = kKp * (1.0 / kMu + vgk / s);
-
-        double sp = 0.0, sig = 0.0;                  // softplus(u), logistic(u)
-        if (u > 30.0)       { sp = u; sig = 1.0; }
-        else if (u < -30.0) { sp = std::exp(u); sig = sp; }
-        else
-        {
-            const double eu = std::exp(u);
-            sp = std::log1p(eu);
-            sig = eu / (1.0 + eu);
-        }
-
-        const double e1 = (vpk / kKp) * sp;
-        if (e1 <= 0.0)
-        {
-            ip = 0.0;
-            dIpdVpk = 0.0;
-            dIpdVgk = 0.0;
-            return;
-        }
-        const double e1ex1 = std::pow(e1, kEx - 1.0);
-        ip = 2.0 * e1ex1 * e1 / kKg1;
-        const double dIpdE1 = 2.0 * kEx * e1ex1 / kKg1;
-
-        const double dUdVpk = -kKp * vgk * vpk / (s * s * s);
-        const double dE1dVpk = sp / kKp + (vpk / kKp) * sig * dUdVpk;
-        const double dE1dVgk = vpk * sig / s;
-        dIpdVpk = dIpdE1 * dE1dVpk;
-        dIpdVgk = dIpdE1 * dE1dVgk;
+        LoadTable::koren(vpk, vgk, ip, dIpdVpk, dIpdVgk);
     }
 
     /** @brief One common-cathode stage with trapezoidal cathode bypass. */
     struct TriodeStage
     {
+        const LoadTable* table = nullptr;
         double fs2 = 96000.0;
         double ip = 8e-4;          ///< Plate current state / NR seed.
         double vk = 1.2;           ///< Cathode voltage (bypass cap state).
-        double fPrev = 0.0;        ///< Previous dVk/dt for the trapezoid.
+        double fPrev = 0.0;        ///< Previous net capacitor current (A).
         double vpDC = 200.0;       ///< Plate voltage at the operating point.
 
         void settleDC(double bplus) noexcept
@@ -550,7 +684,11 @@ private:
             const double iMax = bplusEff / kRL + 1e-3;
             double i = std::clamp(ip, 0.0, iMax);
 
-            for (int it = 0; it < 8; ++it)
+            // Outside the prepared supply/grid range, retain the analytic
+            // circuit solve. The table includes a bounded deep-cutoff limit.
+            if (table->covers(bplusEff - kA, vg - kA))
+                i = table->eval(bplusEff - kA, vg - kA);
+            else for (int it = 0; it < 8; ++it)
             {
                 const double vkN = kA + kB * i;
                 const double vpk = bplusEff - i * kRL - vkN;
@@ -577,9 +715,11 @@ private:
     /** @brief Full per-channel circuit: two stages + FMV tone stack + sag. */
     struct ChannelState
     {
-        explicit ChannelState(double fs2In)
-            : fmv(38e3, 1e6)   // driven by the stage's real output impedance
+        explicit ChannelState(double fs2In, const LoadTable* table)
+            : fmv(38e3, 1e6)   // fixed source-impedance approximation
         {
+            stage1.table = table;
+            stage2.table = table;
             stage1.fs2 = fs2In;
             stage2.fs2 = fs2In;
             fs2 = fs2In;
@@ -658,7 +798,7 @@ private:
             // at the neutral tone setting (designed in calibrateReference
             // from the measured response), so neutral knobs sound neutral
             // and the tone controls act RELATIVE to flat. The triode's
-            // harmonic character is untouched (this stage is linear).
+            // waveform is filtered here; this linear stage adds no harmonics.
             auto& fl = flatten[numStages > 1 ? 1 : 0];
             out = fl[0].processSample(out, 0);
             out = fl[1].processSample(out, 0);
@@ -761,7 +901,7 @@ private:
 
         for (int st = 1; st <= 2; ++st)
         {
-            ChannelState cal(fs2_);   // fresh: flattener is passthrough here
+            ChannelState cal(fs2_, loadTable_.get());   // fresh: flattener is passthrough here
             cal.setToneControls(0.5, 0.5, 0.5);
             cal.reset(kSagRef, st);
 
@@ -818,7 +958,7 @@ private:
             // level) before its measurement window. recompute() interpolates
             // this LUT, so the loudness link tracks the circuit's actual
             // compression - the fix for the level falling at high drive.
-            ChannelState sweep(fs2_);
+            ChannelState sweep(fs2_, loadTable_.get());
             sweep.setToneControls(0.5, 0.5, 0.5);
             sweep.setFlattenCoeffs(st, fc);
             sweep.reset(kSagRef, st);
@@ -860,6 +1000,7 @@ private:
     int drySize_ = 1;
     int osFactor_ = 2;                  ///< Oversampling factor (setup thread; 1 = off, 2 default).
 
+    std::unique_ptr<LoadTable> loadTable_;
     std::unique_ptr<Oversampling<T>> oversampler_;
     std::vector<std::unique_ptr<ChannelState>> channels_;
 

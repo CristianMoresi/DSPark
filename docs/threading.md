@@ -33,6 +33,13 @@ that sentence.
 
 ## Which words must be atomic
 
+`AudioIntervalAnalyzer` has one owner for setup, block feeding and finalization.
+Publish a copy of its finished `Result` to readers. `LoudnessMeter` scalar
+readouts remain concurrent; `finalizeTruePeak()` runs on its stream owner and
+`getMeasurementInfo()` requires that owner or a stopped measurement. The Core
+`TruePeakDetector::getTailPeak()` copies writer-owned history and must not run
+concurrently with processing/reset on that detector.
+
 Any word that both threads can reach concurrently is `std::atomic`, or it
 travels through `Core/SpscQueue.h`. No plain scalar, struct or array is read on
 one thread while another writes it -- including inside a seqlock's critical
@@ -62,14 +69,14 @@ exact. These are header sets, not assertion counts; a header that pins both
 kinds appears once in each applicable set.
 
 <!-- THREADING_PIN_CENSUS_BEGIN -->
-- All local pin headers (12): `Analysis/BeatTracker.h`, `Analysis/SpectrumAnalyzer.h`, `Effects/AutoGain.h`, `Effects/DynamicEQ.h`, `Effects/Equalizer.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`, `Effects/SpectralFreeze.h`, `Effects/TimeStretch.h`, `Effects/detail/PhaseVocoderEngine.h`, `Effects/detail/StudioVocoder.h`, `Music/KeyDetector.h`.
+- All local pin headers (13): `Analysis/BeatTracker.h`, `Analysis/SpectrumAnalyzer.h`, `Effects/AutoGain.h`, `Effects/DynamicEQ.h`, `Effects/Equalizer.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`, `Effects/SpectralFreeze.h`, `Effects/StereoGenerator.h`, `Effects/TimeStretch.h`, `Effects/detail/PhaseVocoderEngine.h`, `Effects/detail/StudioVocoder.h`, `Music/KeyDetector.h`.
 - Template-parameter pin headers (5): `Analysis/SpectrumAnalyzer.h`, `Effects/AutoGain.h`, `Effects/DynamicEQ.h`, `Effects/Equalizer.h`, `Effects/PitchCorrector.h`.
-- Concrete-word pin headers (9): `Analysis/BeatTracker.h`, `Analysis/SpectrumAnalyzer.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`, `Effects/SpectralFreeze.h`, `Effects/TimeStretch.h`, `Effects/detail/PhaseVocoderEngine.h`, `Effects/detail/StudioVocoder.h`, `Music/KeyDetector.h`.
+- Concrete-word pin headers (10): `Analysis/BeatTracker.h`, `Analysis/SpectrumAnalyzer.h`, `Effects/PitchCorrector.h`, `Effects/Reverb.h`, `Effects/SpectralFreeze.h`, `Effects/StereoGenerator.h`, `Effects/TimeStretch.h`, `Effects/detail/PhaseVocoderEngine.h`, `Effects/detail/StudioVocoder.h`, `Music/KeyDetector.h`.
 - Overlap headers (2): `Analysis/SpectrumAnalyzer.h`, `Effects/PitchCorrector.h`.
 <!-- THREADING_PIN_CENSUS_END -->
 
 The overlap is the exact set intersection, so the union identity is
-`12 = 5 + 9 - 2`. Every count and every named membership is checked against
+`13 = 5 + 10 - 2`. Every count and every named membership is checked against
 the headers rather than inferred from another number in this paragraph. The
 concrete pins remain useful because a compile-time assertion at the declaration
 is a stronger statement than a run-time one in another file, and the
@@ -317,13 +324,15 @@ publication for what another thread legitimately needs. `Music/ChordDetector.h`
 does that with `getChroma()` / `getChord()`, and `Music/KeyDetector.h` with
 `chroma()` / `getKey()`.
 
-**The owner-managed offline case.** A reference into an offline document does
-not need an atomic publication when the owning object forbids concurrent
-access. `IO/MidiFile.h`'s `tracks()` is the exact current case. It carries the
-marker `owner-thread reference view` both at the method and in the class's
-`Threading:` block. The reference is valid only while its `MidiFile` owner
+**The owner-managed offline case.** A reference into an offline document or result
+does not need an atomic publication when the owning object forbids concurrent
+mutable access. `IO/MidiFile.h`'s `tracks()` and
+`Analysis/OfflineTransientAnalyzer.h`'s `Analysis::energy()` are the exact current
+cases. Each carries the marker `owner-thread reference view` both at the method
+and in the class's `Threading:` block. The reference is valid only while its owner
 remains alive and until the next non-const operation that can replace or mutate
-the document. No thread may read the view while another thread accesses the
+the data. Const readers may share a completed immutable transient analysis while
+it remains alive and unmoved. No thread may read the view while another thread accesses the
 same instance mutably. This is owner-managed use, not atomic publication, and
 it does not satisfy the processing-thread rule above: a processing component
 must still provide a separate atomic publication for foreign-thread readout.
@@ -493,8 +502,8 @@ deliberate negative (an unrelated class, call, namespace object, parameter or
 other non-member) remains an ordinary 0/0 exclusion. Its production-policy
 mutation matrix checks every spelling, overload association, scope and binding,
 isolated marker deletion, and value/temporary/parameter/local near miss on every
-run. It currently finds nine: the two stream-owner marked sites above, one
-owner-thread view and six explicit legacy warnings whose component audits must
+run. It currently finds ten: the two stream-owner marked sites above, two
+owner-thread views and six explicit legacy warnings whose component audits must
 document them. A new unmarked site fails the check, so the warning set cannot
 grow silently. `Core/Biquad.h`'s `getCoeffs()` illustrates the hazard:
 it returns a reference straight into the active coefficient set, which the
@@ -613,3 +622,18 @@ to plain moves, so they can prove the absence of plain-word conflicts and
 nothing more. A hand-off that no concurrent test exercises is unverified no
 matter how green the run looks, so a new hand-off ships with a concurrent case
 that fails against the unfixed code.
+
+The automatic `OfflineSoftClipper` and `OfflineHardClipper` share the worker
+contract in [offline processing](offline-processing.md). Analysis, calibration
+and render are synchronous worker calls. A plan is immutable and owns its
+exclusions; its source must remain immutable during every read pass. Independent
+jobs own independent filter state. Neither class exposes a real-time processing
+callback, and neither satisfies `AudioProcessor`.
+
+`OfflineStereoGenerator` has the same synchronous worker/source/sink contract.
+Its plans and delta-cache certificates are immutable while alive and unmoved;
+cached PCM remains caller-owned and immutable during reads. Each direct render
+owns a separate `StereoGenerator` stream. Cached rendering reads both complete
+PCM sources and commits only after checking their fingerprints. It has no
+real-time callback; only the underlying `StereoGenerator` has one. Optional
+delta capture in that callback writes to caller-owned, nonoverlapping storage.

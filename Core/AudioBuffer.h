@@ -76,10 +76,12 @@ public:
     }
 
     /**
-     * @brief Converting constructor allowing mutable to const view conversions.
+     * @brief Converts compatible sample types and widens pointer-array capacity.
      *
      * Enables passing AudioBufferView<float> to functions expecting
      * AudioBufferView<const float>. The reverse never compiles.
+     * A view with fewer pointer slots can also convert to a larger-capacity
+     * view, preserving every active channel. Capacity narrowing is not implicit.
      *
      * The direction is a constraint rather than a body check, because the two
      * say different things to the type system. A body check makes an illegal
@@ -91,11 +93,12 @@ public:
      * asking about and what callers and concepts already assume they get.
      *
      * @tparam U Source sample type.
+     * @tparam OtherChannels Source pointer-array capacity, no greater than this view's.
      * @param other The view to convert from.
      */
-    template <typename U>
-        requires std::is_convertible_v<U*, T*>
-    AudioBufferView(const AudioBufferView<U, MaxViewChannels>& other) noexcept
+    template <typename U, int OtherChannels>
+        requires (std::is_convertible_v<U*, T*> && OtherChannels <= MaxViewChannels)
+    AudioBufferView(const AudioBufferView<U, OtherChannels>& other) noexcept
         : numChannels_(other.getNumChannels()), numSamples_(other.getNumSamples())
     {
         for (int ch = 0; ch < numChannels_; ++ch)

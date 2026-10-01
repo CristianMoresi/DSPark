@@ -39,6 +39,9 @@
  * `AudioBufferView<const T>` and return measurements, so they have nothing
  * to contribute to a chain that expects each stage to hand the next one its
  * output. Run them beside a chain, on the same buffer, not inside it.
+ * Complete-source offline operations, including OfflineLeveler, OfflineSoftClipper, OfflineHardClipper and
+ * OfflineEnergyAnalyzer, also deliberately do not satisfy these real-time
+ * concepts. Call their analysis/render APIs on a worker thread.
  *
  * Dependencies: AudioSpec.h, AudioBuffer.h.
  */
@@ -67,6 +70,10 @@ namespace dspark {
  * constness of the SAMPLES, not of the handle: a processor declared
  * `processBlock(const AudioBufferView<T>&)` is in-place and still satisfies
  * this concept.
+ *
+ * Complete-source operations such as @ref dspark::OfflineLeveler and
+ * @ref dspark::OfflineEnergyAnalyzer deliberately lack this callback lifecycle;
+ * call their analysis/render operations on a worker thread.
  *
  * @tparam P Processor type.
  * @tparam T Sample type (float or double).

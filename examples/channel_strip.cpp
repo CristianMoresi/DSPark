@@ -25,31 +25,36 @@ int main()
     const dspark::AudioSpec spec { kRate, kBlock, 2 };
 
     // --- prepare (allocation happens here, never in the loop) ---------------
-    dspark::NoiseGate<float> gate;
-    gate.prepare(spec);
+    dspark::ProcessorChain<float, dspark::NoiseGate<float>, dspark::Equalizer<float>,
+        dspark::Compressor<float>, dspark::DeEsser<float>, dspark::Limiter<float>> chain;
+    chain.prepare(spec);
+
+    auto& gate = chain.get<0>();
     gate.setThreshold(-45.0f);
 
-    dspark::Equalizer<float> eq;
-    eq.prepare(spec);
+    auto& eq = chain.get<1>();
     eq.setBand(0, 110.0f, -2.0f);   // rumble / proximity
     eq.setBand(1, 350.0f, -1.5f);   // boxiness
     eq.setBand(2, 3500.0f, 2.0f);   // presence
     eq.setBand(3, 11000.0f, 1.5f);  // air
 
-    dspark::Compressor<float> comp;
-    comp.prepare(spec);
+    auto& comp = chain.get<2>();
     comp.setThreshold(-22.0f);
     comp.setRatio(3.0f);
 
-    dspark::DeEsser<float> deEsser;
-    deEsser.prepare(spec);
+    auto& deEsser = chain.get<3>();
     deEsser.setFrequency(6500.0f);
     deEsser.setThreshold(-28.0f);
 
-    dspark::Limiter<float> limiter;
-    limiter.prepare(spec);
+    auto& limiter = chain.get<4>();
     limiter.setCeiling(-1.0f);
     limiter.setTruePeak(true);
+
+    // A plugin exposes this sum from its getLatency() contract method so
+    // the format wrapper can report it to the host. Re-query after changes
+    // to lookahead or filter mode; do not count the meter's analysis window.
+    const int latency = chain.getLatency();
+    std::printf("chain latency: %d samples\n", latency);
 
     dspark::LoudnessMeter<float> meter;
     meter.prepare(kRate, 2);
@@ -88,11 +93,7 @@ int main()
         }
 
         auto view = buf.toView();
-        gate.processBlock(view);
-        eq.processBlock(view);
-        comp.processBlock(view);
-        deEsser.processBlock(view);
-        limiter.processBlock(view);
+        chain.processBlock(view);
         meter.processBlock(view);
     }
 

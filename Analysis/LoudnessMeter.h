@@ -16,8 +16,8 @@
  * Threading:
  * - prepare() / reset(): setup thread / stream owner (not concurrent with
  *   the process calls or the readers).
- * - process() / processBlock(): audio thread (stream owner). No-op before
- *   prepare().
+ * - process() / processBlock() / finalizeTruePeak(): audio thread (stream owner).
+ *   No-op before prepare(). getMeasurementInfo() also requires the stream owner.
  * - All readouts (getMomentaryLUFS, getShortTermLUFS, getIntegratedLUFS,
  *   getLoudnessRange, getTruePeakDb, isMeasurementValid): any thread,
  *   lock-free; values are approximate while a block is in flight (metering).
@@ -49,8 +49,9 @@ namespace dspark {
  * Utilizes a constant-memory histogram for infinite integrated loudness tracking
  * without memory allocation or O(N) CPU scaling, ensuring strict RT compliance.
  *
- * All readout methods (`getMomentaryLUFS`, etc.) are lock-free and thread-safe
- * to be called from GUI threads while the audio thread is processing.
+ * Scalar readouts (`getMomentaryLUFS`, etc.) are lock-free and thread-safe
+ * for GUI threads while audio is processing. getMeasurementInfo() instead
+ * requires the stream owner or a stopped measurement.
  *
  * @tparam T Sample type (float or double).
  */
@@ -58,6 +59,42 @@ template <FloatType T>
 class LoudnessMeter
 {
 public:
+    /** @brief Window/gate coverage for a stopped or stream-owner measurement.
+     * Durations use the existing floor(sampleRate / 10) sample hop (minimum 1).
+     * The last partial hop contributes to neither windows nor histograms yet.
+     * Gate counts include complete windows surviving the absolute -70 LUFS gate,
+     * before each metric's relative gate. A zero count is not valid loudness.
+     */
+    struct MeasurementInfo
+    {
+        std::int64_t committedFrames = 0;
+        int pendingFrames = 0;
+        int hopFrames = 0;
+        std::uint64_t integratedBlocks = 0;
+        std::uint64_t rangeBlocks = 0;
+    };
+
+    /** @brief Returns window coverage without modifying any state.
+     * Call from the stream owner, or after processing has stopped. Unlike the
+     * scalar GUI readouts, this reads the writer-owned hop counters. Bounded
+     * O(histogram bins) work and no allocation. Invalid measurements must also
+     * be rejected using isMeasurementValid().
+     */
+    [[nodiscard]] MeasurementInfo getMeasurementInfo() const noexcept
+    {
+        MeasurementInfo info;
+        if (!prepared_.load(std::memory_order_relaxed)) return info;
+        info.committedFrames = totalCommittedBlocks_ * blockSamples_;
+        info.pendingFrames = currentBlockSamples_;
+        info.hopFrames = blockSamples_;
+        for (int i = 0; i < kNumBins; ++i)
+        {
+            info.integratedBlocks += histogram_[i].load(std::memory_order_relaxed);
+            info.rangeBlocks += lraHistogram_[i].load(std::memory_order_relaxed);
+        }
+        return info;
+    }
+
     /**
      * @brief Prepares the meter and pre-calculates filter coefficients.
      *
@@ -278,6 +315,30 @@ public:
     [[nodiscard]] T getTruePeakDb() const noexcept
     {
         return gainToDecibels(truePeakMax_.load(std::memory_order_relaxed));
+    }
+
+    /** @brief Includes the final interpolation tail of a finite programme.
+     * Call after the last input block, from the stream owner; readers may remain
+     * concurrent. Repeated calls are idempotent. The Core detector evaluates
+     * zero extension on copied state: programme duration, loudness windows,
+     * integrated/LRA gates and live filter history are unchanged. No allocation.
+     * Do not call after each block of one continuous programme: the zero-ended
+     * prefix peak would then be retained in the maximum. reset() starts a new
+     * measurement as usual.
+     */
+    void finalizeTruePeak() noexcept
+    {
+        if (!prepared_.load(std::memory_order_relaxed)) return;
+        T peak = truePeakMax_.load(std::memory_order_relaxed);
+        for (int channel = 0; channel < kMaxChannels; ++channel)
+        {
+            const T tail = truePeak_.getTailPeak(channel);
+            if (std::isfinite(tail))
+                peak = std::max(peak, tail);
+            else
+                invalidateMeasurement();
+        }
+        truePeakMax_.store(peak, std::memory_order_relaxed);
     }
 
     /**
@@ -546,7 +607,7 @@ private:
     [[nodiscard]] static double powerToLUFS(double meanPower) noexcept
     {
         if (meanPower <= 1e-10) return -100.0; // Prevent log10(0)
-        return -0.691 + 10.0 * std::log10(meanPower);
+        return std::max(-100.0, -0.691 + 10.0 * std::log10(meanPower));
     }
 
     [[nodiscard]] static double lufsToPower(double lufs) noexcept
@@ -572,7 +633,7 @@ private:
     // O(1) Histogram for Integrated Loudness
     std::array<std::atomic<uint32_t>, kNumBins> histogram_;
 
-    // EBU Tech 3342 loudness-range histogram (short-term values, 1 s hop)
+    // EBU Tech 3342 loudness-range histogram (short-term values, 100 ms hop)
     std::array<std::atomic<uint32_t>, kNumBins> lraHistogram_;
 
     // Sticky for one reset-to-reset measurement transaction.

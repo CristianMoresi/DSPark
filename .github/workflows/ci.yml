@@ -12,6 +12,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  reverb-numerics:
+    name: Reverb cross-toolchain numerical agreement
+    needs: conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reverb-numerics-*
+          path: reverb-numerics
+      - name: Compare all 18 fixtures across the three x64 toolchains
+        run: |
+          python3 tools/check_reverb_numerics.py --self-test
+          python3 tools/check_reverb_numerics.py "reverb-numerics/reverb-numerics-Windows MSVC x64" "reverb-numerics/reverb-numerics-Linux GCC x64" "reverb-numerics/reverb-numerics-Linux Clang x64"
+
   # ---------------------------------------------------------------------------
   # Documentation must be self-contained and must match the code it describes.
   # Both checks are cheap and need no build, so they run first on every push.
@@ -103,6 +118,27 @@ jobs:
         shell: bash
         run: ./dspark_conformance*
 
+      - name: Render reverb numerical fixtures (MSVC x64)
+        if: matrix.name == 'Windows MSVC x64'
+        shell: cmd
+        run: |
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . tests\reverb_numeric_fixture.cpp /Fe:reverb_numeric_fixture.exe || exit /b 1
+          reverb_numeric_fixture.exe reverb-numerics
+
+      - name: Render reverb numerical fixtures (GCC/Clang x64)
+        if: matrix.name == 'Linux GCC x64' || matrix.name == 'Linux Clang x64'
+        run: |
+          ${{ matrix.compiler }} -std=c++20 -O3 -DNDEBUG -Wall -Wextra -Wpedantic -Werror -I . tests/reverb_numeric_fixture.cpp -o reverb_numeric_fixture
+          ./reverb_numeric_fixture reverb-numerics
+
+      - name: Upload reverb numerical fixtures
+        if: matrix.name == 'Windows MSVC x64' || matrix.name == 'Linux GCC x64' || matrix.name == 'Linux Clang x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: reverb-numerics-${{ matrix.name }}
+          path: reverb-numerics
+          if-no-files-found: error
+
       # The standalone examples and the benchmark harness are documentation
       # users copy from: they must keep compiling warning-free on every
       # compiler here, not only under the Linux GCC "Examples + bench" job.
@@ -113,14 +149,16 @@ jobs:
           cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . examples\wav_process.cpp /Fe:wav_process.exe || exit /b 1
           cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . examples\channel_strip.cpp /Fe:channel_strip.exe || exit /b 1
           cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . examples\pitch_tracking_eq.cpp /Fe:pitch_tracking_eq.exe || exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . examples\interval_analysis.cpp /Fe:interval_analysis.exe || exit /b 1
           cl /nologo /std:c++20 /EHsc /W4 /WX /O2 /wd4324 /I . bench\dspark_bench.cpp /Fe:dspark_bench.exe || exit /b 1
           channel_strip.exe || exit /b 1
           pitch_tracking_eq.exe > nul || exit /b 1
+          interval_analysis.exe || exit /b 1
 
       - name: Build + run the standalone examples, build the benchmark (GCC/Clang)
         if: matrix.compiler != 'msvc'
         run: |
-          for example in wav_process channel_strip pitch_tracking_eq; do
+          for example in wav_process channel_strip pitch_tracking_eq interval_analysis; do
             ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . \
               examples/$example.cpp -o $example
           done
@@ -128,6 +166,7 @@ jobs:
             bench/dspark_bench.cpp -o dspark_bench
           ./channel_strip
           ./pitch_tracking_eq > /dev/null
+          ./interval_analysis
 
       # The installed package must carry the plugin layer: find_package(dspark)
       # then builds an app AND a plugin through dspark_add_plugin().
@@ -566,7 +605,7 @@ jobs:
 
       # Concurrency claims come from the named threaded tests printed by this
       # exact run; executing a single-threaded case under TSan is not presented
-      # as proof of a hand-off. The ordinary suite authority is currently 982
+      # as proof of a hand-off. The ordinary suite authority is currently 1156
       # named cases, with specialized allocation and Reverb publication tests
       # kept in separate CTest executables so their process-wide hooks do not
       # weaken sanitizer coverage in the ordinary suite.

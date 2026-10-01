@@ -1199,7 +1199,7 @@ inline EffectSlot makeTubePreamp()
     EffectSlot s;
     s.name = "Tube Preamp"; s.category = "Analog";
     s.addSlider("Drive", -12, 36, 0, "dB");
-    s.addChoice("Stages", {"1 (clean)","2 (crunch)","3 (lead)"}, 0);
+    s.addChoice("Stages", {"1 (clean)","2 (crunch)"}, 0);
     s.addSlider("Treble", 0, 1, 0.5f, "");
     s.addSlider("Middle", 0, 1, 0.5f, "");
     s.addSlider("Bass", 0, 1, 0.5f, "");

@@ -27,6 +27,10 @@
  *   myEffect.processBlock(buffer);    // apply your processing
  *   autoGain.compensate(buffer);      // adjust output to match input level
  * @endcode
+ * The two calls bracket the effect intentionally: a single in-place
+ * processBlock() could not measure its input and its processed output.
+ * AutoGain adds no sample delay. Report the enclosed effect's latency to
+ * the host; the integration window is a meter response, not audio latency.
  *
  * Threading: prepare() belongs to the setup thread; pushReference(),
  * compensate() and reset() belong to the audio thread. Setters are lock-free

@@ -29,8 +29,9 @@
  * Effects/DCBlocker.h, Effects/MidSide.h.
  *
  * Threading: prepare(), setOversampling() and setState() belong to the setup
- * thread; process() and reset() to the audio thread; the remaining setters and
- * getters may be called from any thread (snapshot queue / relaxed atomics).
+ * thread; processBlock()/process() and reset() to the audio thread. The
+ * remaining setters and getters may be called from any thread (snapshot
+ * queue / relaxed atomics).
  *
  * @tparam SampleType The floating-point precision to use (must be `float` or `double`).
  */
@@ -779,24 +780,25 @@ public:
     // -- Audio Processing ----------------------------------------------------
 
     /**
-     * @brief Processes an audio block in-place (AudioProcessor standard contract).
+     * @brief Compatibility alias of processBlock(), with the same thread and
+     * preparation contract. Prefer processBlock() in new code.
      * @param buffer Mutable view of the audio data.
      */
-    void processBlock(AudioBufferView<SampleType> buffer) noexcept { if (!prepared_) return; process(buffer); }
+    void process(AudioBufferView<SampleType> buffer) noexcept { processBlock(buffer); }
 
     /**
-     * @brief The core audio processing pipeline.
+     * @brief Processes an audio block in-place (AudioProcessor standard contract).
      *
      * Executes the following sequence: parameter updates (lock-free) -> Mid/Side Encoding ->
      * Pre-filtering -> Slew detection -> Drift generation -> Saturation -> Adaptive Blend ->
      * Mid/Side Decoding -> Post-filtering -> DC Blocking -> Dry/Wet Mix.
      *
      * @note **Real-Time Safe.** Call this inside your audio callback.
-     * @pre `prepare()` must have been called successfully prior to execution.
+     * @note Pass-through until prepare() succeeds.
      * 
      * @param buffer Mutable view of the audio data. Will be modified in-place.
      */
-    void process(AudioBufferView<SampleType> buffer) noexcept
+    void processBlock(AudioBufferView<SampleType> buffer) noexcept
     {
         if (!prepared_) return;
         handleParameterChanges();
@@ -1116,14 +1118,13 @@ public:
      * @note Equals the oversampler group delay (0 when oversampling is off).
      *       Report this to the host for plugin delay compensation (PDC).
      */
-    [[nodiscard]] int getLatencySamples() const noexcept
+    [[nodiscard]] int getLatency() const noexcept
     {
         return (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0;
     }
 
-    /** @brief Alias of getLatencySamples() following the framework-wide latency
-     *  reporting name, so ProcessorChain::getLatency() includes this stage. */
-    [[nodiscard]] int getLatency() const noexcept { return getLatencySamples(); }
+    /** @brief Compatibility alias of getLatency(), in prepared-rate samples. */
+    [[nodiscard]] int getLatencySamples() const noexcept { return getLatency(); }
 
     /** 
      * @brief Retrieves the currently active underlying algorithm.

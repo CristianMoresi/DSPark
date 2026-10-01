@@ -9,9 +9,36 @@ using namespace dspark;
 AudioSpec spec { 48000.0, 512, 2 };   // rate, max block, channels
 ```
 
-All processors follow the same lifecycle: construct -> `prepare(spec)` once
-(allocates) -> `processBlock(view)` in the callback (allocation-free,
-lock-free parameter setters from any thread).
+Most in-place effects use construct -> `prepare(spec)` on the setup thread
+-> `processBlock(view)` in the audio callback. Preparation may allocate;
+processing does not. Each header states which setters can run concurrently:
+structural changes such as oversampling can allocate and require processing
+to be stopped. `reset()` clears processing history when the stream restarts.
+
+Use `getLatency()` for audio-path delay, in samples at the prepared rate.
+`ProcessorChain` sums that name; `getLatencySamples()` on Saturation,
+TapeMachine, TubePreamp and TransformerModel remains a compatibility alias.
+OnsetDetector and BeatTracker use `getLatencySamples()` for the delay of an
+analysis result: that does not delay the audio and is not added to host PDC.
+`Saturation::process(view)` remains a compatibility alias; new in-place code
+uses `processBlock(view)`. The pointer overloads on Gain and StereoWidth,
+and the whole-signal TimeStretch call, have different purposes.
+
+For a plugin, expose the sum of serial audio-stage latencies from its
+`getLatency() const noexcept` method; DSPark's format wrappers report it to
+the host. Re-query after changes that affect latency. Parallel branches
+need alignment to the longest branch before summing. ProcessorChain's hard
+bypass skips a slot without inserting a delay, so use the effect's
+latency-compensated dry/wet path when the bypass must retain alignment.
+
+Some utilities require different routing:
+
+| Utility | Processing contract |
+|---|---|
+| AutoGain | `pushReference(view)` before an effect, `compensate(view)` after it; no added sample delay. |
+| CrossoverFilter | `processBlock(input, bandOutputs, count)` writes separate bands; report the split latency once. |
+| MidSide | Static `encode(view)` / `decode(view)`; no preparation, history or state blob. |
+| Crossfade | Two inputs and one output, with smoothing history; optional `prepare(spec)` enables a 20 ms glide. No state blob; store position and curve in the enclosing processor. |
 
 ---
 
@@ -79,6 +106,9 @@ limiter.setTruePeak(true);
 
 LoudnessMeter<float> meter;     meter.prepare(spec.sampleRate, 2);
 
+const int latency = eq.getLatency() + mb.getLatency() + limiter.getLatency();
+// Expose `latency` to the host; the meter adds no audio-path delay.
+
 // callback:
 eq.processBlock(buffer);
 mb.processBlock(buffer);
@@ -89,6 +119,12 @@ meter.processBlock(buffer);
 
 The LoudnessMeter passes the official EBU R128 vectors (Tech 3341/3342:
 integrated, LRA and true peak) - see `conformance/`.
+
+For a finite delivery, call `meter.finalizeTruePeak()` after its last block and
+then read `getTruePeakDb()`. This includes the interpolation tail without adding
+silence to loudness windows. For exact source-frame selections, use
+[`AudioIntervalAnalyzer`](interval-analysis.md); it reports complete-window
+validity and distinguishes regional loudness from continuous observations.
 
 ## 5. Analog console color (tape + transformer + tube)
 
@@ -105,6 +141,9 @@ TapeMachine<float> tape;        tape.prepare(spec);
 tape.setSpeed(TapeMachine<float>::Speed::IPS_15);
 tape.setDrive(4.0f);
 tape.setWowFlutter(0.1f);
+
+const int latency = pre.getLatency() + iron.getLatency() + tape.getLatency();
+// Expose `latency` to the host, or drop/flush it for an aligned offline render.
 
 // callback:
 pre.processBlock(buffer);
@@ -128,7 +167,7 @@ osc.setWaveform(Oscillator<float>::Waveform::Saw);
 osc.setFrequency(110.0f);
 osc.setSyncRatio(2.7f);          // band-limited hard sync
 
-EnvelopeGenerator<float> env;    env.prepare(spec);
+ADSREnvelope<float> env;          env.prepare(spec);
 LadderFilter<float> ladder;      ladder.prepare(spec);
 ladder.setCutoff(1200.0f);
 ladder.setResonance(0.4f);
@@ -188,7 +227,10 @@ os.prepare(spec);
 // Stages inside the section are prepared at the oversampled rate. Time
 // constants are in milliseconds, so their behaviour does not change.
 AudioSpec spec4x { spec.sampleRate * 4, spec.maxBlockSize * 4, spec.numChannels };
-myShaper.prepare(spec4x);          // e.g. a hot custom waveshaper
+Saturation<float> myShaper;
+myShaper.setOversampling(1);       // the enclosing section already oversamples
+myShaper.prepare(spec4x);
+Compressor<float> comp;
 comp.prepare(spec4x);
 
 // callback:
@@ -218,9 +260,9 @@ it at 1x when you already oversample the whole section (above) to avoid
 cascaded resamplers. Cost scales roughly linearly with the factor; the exact
 per-factor latency is whatever `getLatency()` returns for the active setting.
 
-The two nonlinear-modelling stages that generate aliasing *inside* the model
+The nonlinear stages that generate aliasing *inside* the model
 default to internal oversampling and expose the same control (`setOversampling`
-is setup-thread only on both - it reallocates and re-calibrates like
+is setup-thread only - it reallocates and may re-calibrate like
 `prepare()`):
 
 - `TapeMachine` **defaults to 4x**. The AC-bias carrier sits at a quarter of
@@ -660,3 +702,94 @@ whatever the key. Correction holds through consonants and breaths instead of
 sagging back to the sung pitch, and it is monophonic by construction: one
 voice, one fundamental. On chords the detector reports whichever periodicity
 wins, and the correction follows that.
+
+## 17. Level-match an effect for comparison
+
+```cpp
+AutoGain<float> match;
+match.prepare(spec);
+Equalizer<float> effect;
+effect.prepare(spec);
+effect.setBand(0, 2000.0f, 4.0f);
+
+// callback: both measurements must bracket the same processing block.
+match.pushReference(buffer);
+effect.processBlock(buffer);
+match.compensate(buffer);
+```
+
+AutoGain adds no audio-path latency. Its 400 ms level integration is a
+measurement response; the effect's `getLatency()` still belongs in the host
+report. Compensation is bounded and smoothed, so transients need not match
+instantaneously, especially around a delayed effect or a reverb tail.
+
+## 18. Split, process and recombine bands
+
+```cpp
+CrossoverFilter<float> split;
+split.setNumBands(2);
+split.setCrossoverFrequency(0, 1200.0f);
+split.prepare(spec);
+AudioBuffer<float> bands[2];
+for (auto& band : bands) band.resize(spec.numChannels, spec.maxBlockSize);
+
+// callback: views cover this block, not the entire scratch allocation.
+const int frames = buffer.getNumSamples();  // at most spec.maxBlockSize
+AudioBufferView<float> outputs[] = {
+    bands[0].toView().getSubView(0, frames),
+    bands[1].toView().getSubView(0, frames)
+};
+const int written = split.processBlock(buffer, outputs, 2);
+if (written > 0)
+{
+    // Process each outputs[b] here, aligning any added branch delays.
+    buffer.clear();
+    for (int b = 0; b < written; ++b)
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+            for (int i = 0; i < frames; ++i)
+                buffer.getChannel(ch)[i] += outputs[b].getChannel(ch)[i];
+}
+```
+
+Report `split.getLatency()` once, plus the longest aligned branch delay.
+Keep the configured band count equal to the number of allocated outputs.
+The return value names the bands actually written; unused views retain old
+data. Minimum-phase bands sum to an allpass response, so a parallel raw dry
+path also needs phase matching. Linear-phase mode adds FIR delay; switching
+mode resets history and requires updating the host's latency report.
+
+## 19. Generate stereo from a parallel processed copy
+
+```cpp
+StereoGenerator<float> generator;
+generator.setWidth(.25f);
+const bool prepared = generator.prepare(spec, {4, 175.0f});
+const int latency = generator.getLatency();
+// Publish latency to the host before starting playback.
+(void)latency;
+if (prepared)
+{
+    // Callback: writable, nonoverlapping stereo channels.
+    const bool processed = generator.processBlock(buffer);
+    // A host should report getStatus() when processed is false.
+    (void)processed;
+}
+```
+
+Use a stereo `spec` at 8 to 384 kHz. Duplicate mono into two channels explicitly
+when needed. The second option is a low cut on the generated delta only: zero
+disables it; otherwise use 20 to 5000 Hz. The original mid and original side
+remain present. Width zero gives exact delayed identity; automation takes 5 ms
+and does not alter the reported latency. No limiter or output gain trim is added.
+
+The local color factor accepts 2, 4, 8 or 16. Its FIR transition spans 0.45 to
+0.50 times the source sample rate; factor 2 trades antialias rejection for CPU.
+Options require setup-time preparation. Presets store parameters, not filter
+history. After a seek, use `resetAtFrame()` and replay preceding input when
+history continuity is required; this method alone is not a saved-state restore.
+Flush with zeros when rendering a tail. Alignment latency is not tail duration.
+
+For complete-source jobs, `OfflineStereoGenerator` handles alignment, bounded
+reads, exact exclusions, peak measurement and transactional output. Its optional
+host-owned delta cache avoids regenerating bands/color for each width change.
+See [offline stereo generation](offline-processing.md).

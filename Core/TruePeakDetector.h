@@ -72,28 +72,23 @@ public:
         // out-of-range index to channel 0 would corrupt that channel's
         // history with a foreign stream.)
         channel = std::clamp(channel, 0, MaxChannels - 1);
-        auto& tp = states_[static_cast<size_t>(channel)];
+        return processState(sample, states_[static_cast<size_t>(channel)]);
+    }
 
-        // Mirrored write: every sample lands at writePos and writePos + 16,
-        // so the latest 12-tap window is always contiguous in memory and each
-        // phase collapses to one linear dot product (SIMD) instead of a
-        // masked ring walk per tap.
-        tp.history[static_cast<size_t>(tp.writePos)] = sample;
-        tp.history[static_cast<size_t>(tp.writePos + kHistSize)] = sample;
-        const int newest = tp.writePos;
-        tp.writePos = (tp.writePos + 1) & kHistMask;
-
-        // Window holding x[n-11] .. x[n] in forward (oldest-first) order.
-        const T* window = &tp.history[static_cast<size_t>(newest + kHistSize - (kTaps - 1))];
-
-        T peak = std::abs(sample);
-        for (int phase = 0; phase < kPhases; ++phase)
-        {
-            const T interp = simd::dotProduct(
-                kReversedCoeffs[static_cast<size_t>(phase)].data(), window, kTaps);
-            const T a = std::abs(interp);
-            if (a > peak) peak = a;
-        }
+    /** @brief Measures the zero-extended interpolation tail of one channel.
+     * Evaluates getTaps()-1 zero frames on a stack copy of that channel's state.
+     * Does not advance or clear live history. Call from the stream owner, not
+     * concurrently with processing/reset. Allocation-free and bounded work.
+     * Returns only the tail peak; combine with the maximum already observed.
+     */
+    [[nodiscard]] T getTailPeak(int channel) const noexcept
+    {
+        assert(channel >= 0 && channel < MaxChannels);
+        channel = std::clamp(channel, 0, MaxChannels - 1);
+        auto state = states_[static_cast<size_t>(channel)];
+        T peak = T(0);
+        for (int i = 0; i < kTaps - 1; ++i)
+            peak = std::max(peak, processState(T(0), state));
         return peak;
     }
 
@@ -123,6 +118,25 @@ private:
         T history[kHistSize * 2] = {};
         int writePos = 0;
     };
+
+    [[nodiscard]] static T processState(T sample, State& tp) noexcept
+    {
+        // Mirroring makes the latest FIR window contiguous for the shared dot product.
+        tp.history[static_cast<size_t>(tp.writePos)] = sample;
+        tp.history[static_cast<size_t>(tp.writePos + kHistSize)] = sample;
+        const int newest = tp.writePos;
+        tp.writePos = (tp.writePos + 1) & kHistMask;
+        const T* window = &tp.history[static_cast<size_t>(newest + kHistSize - (kTaps - 1))];
+        T peak = std::abs(sample);
+        for (int phase = 0; phase < kPhases; ++phase)
+        {
+            const T interp = simd::dotProduct(
+                kReversedCoeffs[static_cast<size_t>(phase)].data(), window, kTaps);
+            const T a = std::abs(interp);
+            if (a > peak) peak = a;
+        }
+        return peak;
+    }
 
     /** @brief Official ITU-R BS.1770-5 Annex 2 polyphase interpolator.
      *

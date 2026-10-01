@@ -30,9 +30,20 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <span>
 
 namespace dspark {
+
+namespace detail {
+// Unwindowed discrete Hilbert impulse, shared by finite-source operators and
+// the real-time windowed FIR. Keep the parity test in the integer source clock.
+[[nodiscard]] inline double hilbertIdealImpulse(std::int64_t index) noexcept
+{
+    constexpr double kPi = 3.14159265358979323846;
+    return index % 2 == 0 ? 0.0 : 2.0 / (kPi * static_cast<double>(index));
+}
+} // namespace detail
 
 /**
  * @class Hilbert
@@ -171,7 +182,7 @@ private:
                 // Ideal Hilbert kernel h[n] = 2/(pi*n) for odd n, 0 for even n,
                 // windowed with Blackman to control ripple / sideband leakage.
                 const int n = i - kCenter;
-                double ideal = ((n == 0) || (n % 2 == 0)) ? 0.0 : (2.0 / (kPi * static_cast<double>(n)));
+                double ideal = detail::hilbertIdealImpulse(n);
                 double w = 0.42
                          - 0.5  * std::cos(2.0 * kPi * static_cast<double>(i) / static_cast<double>(kTaps - 1))
                          + 0.08 * std::cos(4.0 * kPi * static_cast<double>(i) / static_cast<double>(kTaps - 1));

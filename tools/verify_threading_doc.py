@@ -375,6 +375,7 @@ CENSUS_EXPECTED = {
         "Effects/PitchCorrector.h",
         "Effects/Reverb.h",
         "Effects/SpectralFreeze.h",
+        "Effects/StereoGenerator.h",
         "Effects/TimeStretch.h",
         "Effects/detail/PhaseVocoderEngine.h",
         "Effects/detail/StudioVocoder.h",
@@ -393,6 +394,7 @@ CENSUS_EXPECTED = {
         "Effects/PitchCorrector.h",
         "Effects/Reverb.h",
         "Effects/SpectralFreeze.h",
+        "Effects/StereoGenerator.h",
         "Effects/TimeStretch.h",
         "Effects/detail/PhaseVocoderEngine.h",
         "Effects/detail/StudioVocoder.h",
@@ -594,8 +596,8 @@ census_controls, census_control_construction_issues = \
     build_census_controls(doc, pin_census)
 failures.extend(
     "D: " + issue for issue in census_control_construction_issues)
-if len(census_controls) != 35:
-    failures.append("D: threading census control cardinality is {}, expected 35"
+if len(census_controls) != 37:
+    failures.append("D: threading census control cardinality is {}, expected 37"
                     .format(len(census_controls)))
 for name, mutant, expected_prefix in census_controls:
     issues = validate_pin_census(mutant, pin_census)
@@ -911,9 +913,11 @@ STREAM_OWNER_FOREIGN_READOUT = {
 # cannot be pasted onto an arbitrary reference accessor as an exemption.
 OWNER_THREAD_REFERENCE_VIEWS = {
     ("IO/MidiFile.h", "tracks"),
+    ("Analysis/OfflineTransientAnalyzer.h", "energy"),
 }
 EXPECTED_OWNER_THREAD_REFERENCE_VIEWS = {
     ("IO/MidiFile.h", "tracks"),
+    ("Analysis/OfflineTransientAnalyzer.h", "energy"),
 }
 
 def reference_accessors(path):

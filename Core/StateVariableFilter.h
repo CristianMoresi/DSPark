@@ -61,6 +61,7 @@
 #include "AudioSpec.h"
 #include "AudioBuffer.h"
 #include "DenormalGuard.h"
+#include "detail/TptSvf.h"
 
 #include <algorithm>
 #include <array>
@@ -295,11 +296,7 @@ public:
 protected:
     static constexpr int kMaxChannels = 16;
 
-    struct ChannelState
-    {
-        T ic1eq = T(0); ///< First integrator state.
-        T ic2eq = T(0); ///< Second integrator state.
-    };
+    using ChannelState = detail::TptSvfState<T>;
 
     std::array<ChannelState, kMaxChannels> state_ {};
     AudioSpec spec_ {};
@@ -401,16 +398,9 @@ private:
      */
     [[nodiscard]] MultiOutput processCore(T input, int channel) noexcept
     {
-        auto& s = state_[channel];
-
-        const T v3 = input - s.ic2eq;
-        const T v1 = a1_ * s.ic1eq + a2_ * v3;
-        const T v2 = s.ic2eq + a2_ * s.ic1eq + a3_ * v3;
-
-        s.ic1eq = T(2) * v1 - s.ic1eq;
-        s.ic2eq = T(2) * v2 - s.ic2eq;
-
-        return { v2, input - T(2) * effR_ * v1 - v2, v1 };
+        const auto output = detail::tptSvfStep(input, state_[channel], a1_, a2_, a3_);
+        return { output.lowpass, input - T(2) * effR_ * output.bandpass - output.lowpass,
+                 output.bandpass };
     }
 
     [[nodiscard]] T selectOutput(T input, T lp, T hp, T bp) const noexcept

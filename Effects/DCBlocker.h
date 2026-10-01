@@ -51,6 +51,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/StateBlob.h"
+#include "../Core/detail/DcBlock.h"
 
 #include <algorithm>
 #include <array>
@@ -362,7 +363,7 @@ protected:
 
     // -- Double-precision filter core -----------------------------------------
 
-    struct OnePoleState { double x1 = 0.0, y1 = 0.0; };
+    using OnePoleState = detail::DcBlockState;
     struct SectionState { double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0; };
 
     /** @brief Second-order section: b0 * (1 - z^-1)^2 / (1 + a1 z^-1 + a2 z^-2). */
@@ -375,10 +376,7 @@ protected:
     /** @brief y[n] = (x[n] - x[n-1]) + R*y[n-1]; the difference zeroes DC exactly. */
     static double stepOnePole(double r, OnePoleState& z, double x) noexcept
     {
-        const double y = (x - z.x1) + r * z.y1;
-        z.x1 = x;
-        z.y1 = y;
-        return y;
+        return detail::dcBlockStep(r, z, x);
     }
 
     /** @brief Direct Form I with the numerator applied as a second difference. */

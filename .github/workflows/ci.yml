@@ -308,7 +308,7 @@ jobs:
           # The runner's Azure mirror stalled before the editor test began.
           # Use Ubuntu's archive for that entry and bound package operations.
           if [[ -f /etc/apt/apt-mirrors.txt ]]; then
-            sudo sed -i -E 's|https?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+            sudo sed -i -E 's|https?://azure[.]archive[.]ubuntu[.]com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
           fi
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
           sudo timeout --kill-after=10s 180s apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update -q

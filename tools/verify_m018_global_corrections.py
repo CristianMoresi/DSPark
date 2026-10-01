@@ -1541,6 +1541,13 @@ def stale_truth_errors_for_text(path: str, content: str) -> list[str]:
     ]
 
 
+def concurrent_test_authority_errors(content: str) -> list[str]:
+    counts = re.findall(r"^_EXPECTED_SUITE_TESTS = ([0-9]+)$", content, re.MULTILINE)
+    if counts != [str(EXPECTED_ORDINARY_TESTS)]:
+        return [f"CONCURRENT_TEST_AUTHORITY_DRIFT {counts!r}"]
+    return []
+
+
 def stale_truth_errors(root: Path) -> list[str]:
     errors: list[str] = []
     for path in STALE_PUBLIC_PHRASES:
@@ -1549,6 +1556,8 @@ def stale_truth_errors(root: Path) -> list[str]:
     ci = (root / ".github/workflows/ci.yml").read_text(encoding="ascii")
     if f"ordinary suite authority is currently {EXPECTED_ORDINARY_TESTS}" not in ci:
         errors.append(f"CURRENT_TEST_AUTHORITY_MISSING {EXPECTED_ORDINARY_TESTS}")
+    runner = (root / "tools/run_concurrent_test_suites.py").read_text(encoding="ascii")
+    errors.extend(concurrent_test_authority_errors(runner))
     return errors
 
 
@@ -2342,6 +2351,15 @@ def self_test(root: Path, doxygen: str | None,
             name,
             bool(stale_truth_errors_for_text(path, original + "\n" + phrase + "\n")),
         ))
+    runner = (root / "tools/run_concurrent_test_suites.py").read_text(encoding="ascii")
+    count_line = f"_EXPECTED_SUITE_TESTS = {EXPECTED_ORDINARY_TESTS}"
+    checks.extend((
+        ("concurrent-suite-count-positive", not concurrent_test_authority_errors(runner)),
+        ("concurrent-suite-count-stale", bool(concurrent_test_authority_errors(
+            runner.replace(count_line, f"_EXPECTED_SUITE_TESTS = {EXPECTED_ORDINARY_TESTS - 1}")))),
+        ("concurrent-suite-count-missing", bool(concurrent_test_authority_errors(
+            runner.replace(count_line, "")))),
+    ))
     if doxygen:
         checks.append((
             "duplicate-mainpage-restored",

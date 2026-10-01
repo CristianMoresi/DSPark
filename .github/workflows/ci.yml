@@ -571,7 +571,9 @@ jobs:
             -DDSPARK_BUILD_TESTS=ON -DDSPARK_BUILD_CONFORMANCE=ON \
             -DDSPARK_VERIFY_FLOAT_CAST_OVERFLOW_SANITIZER=ON \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all"
-          cmake --build build-san --parallel
+          # Sanitized template-heavy units need substantially more compiler
+          # memory. Bound concurrent compilers instead of make's unlimited -j.
+          cmake --build build-san --parallel 2
           ctest --test-dir build-san --output-on-failure --test-output-size-failed 0
 
   # ---------------------------------------------------------------------------
@@ -628,7 +630,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DDSPARK_BUILD_TESTS=ON -DDSPARK_BUILD_CONFORMANCE=OFF \
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -Wno-error=tsan"
-          cmake --build build-tsan --parallel
+          # Keep compiler memory bounded while retaining the complete suite.
+          cmake --build build-tsan --parallel 2
           ctest --test-dir build-tsan -V --timeout 5400
 
   # ---------------------------------------------------------------------------

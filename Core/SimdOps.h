@@ -1356,7 +1356,9 @@ struct Vec<float, 4>
     static V mul(V a, V b) noexcept { return vmulq_f32(a, b); }
     static V mulSub(V a, V b, V c, V d) noexcept { return vsubq_f32(vmulq_f32(a, b), vmulq_f32(c, d)); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return vaddq_f32(vmulq_f32(a, b), vmulq_f32(c, d)); }
-    static V madd(V a, V b, V c) noexcept { return vaddq_f32(vmulq_f32(a, b), c); }
+    // Explicit fusion keeps vector and broadcast tails identical even when
+    // GCC otherwise contracts their multiply/add expressions differently.
+    static V madd(V a, V b, V c) noexcept { return vfmaq_f32(c, a, b); }
     static V reverse(V v) noexcept { const V r = vrev64q_f32(v); return vextq_f32(r, r, 2); }
     static void loadDeinterleave(const float* p, V& re, V& im) noexcept
     {
@@ -1387,7 +1389,7 @@ struct Vec<double, 2>
     static V mul(V a, V b) noexcept { return vmulq_f64(a, b); }
     static V mulSub(V a, V b, V c, V d) noexcept { return vsubq_f64(vmulq_f64(a, b), vmulq_f64(c, d)); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return vaddq_f64(vmulq_f64(a, b), vmulq_f64(c, d)); }
-    static V madd(V a, V b, V c) noexcept { return vaddq_f64(vmulq_f64(a, b), c); }
+    static V madd(V a, V b, V c) noexcept { return vfmaq_f64(c, a, b); }
     static V reverse(V v) noexcept { return vextq_f64(v, v, 1); }
     static void loadDeinterleave(const double* p, V& re, V& im) noexcept
     {

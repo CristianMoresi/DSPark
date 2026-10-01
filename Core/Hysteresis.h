@@ -88,8 +88,8 @@ public:
      * @param k     Coercivity / loop-loss parameter (A/m).    [2.7e4]
      * @param c     Reversible magnetization fraction [0, 1).  [1.7e-1]
      *
-     * A call with any non-finite argument is ignored: std::max/std::clamp pass
-     * NaN through, and a NaN parameter would silence the core permanently.
+     * A call with any non-finite argument is ignored. Range clamping alone
+     * does not reject NaN, which would otherwise poison the integrator.
      */
     void setParameters(double ms, double a, double alpha, double k, double c) noexcept
     {

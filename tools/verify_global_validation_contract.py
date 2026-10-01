@@ -745,6 +745,7 @@ EXPECTED_THREADING_EXTERNAL_IDS = (
     "member-total-10",
     "member-total-11",
     "member-total-12",
+    "member-total-13",
     "member-template-01",
     "member-template-02",
     "member-template-03",
@@ -759,6 +760,7 @@ EXPECTED_THREADING_EXTERNAL_IDS = (
     "member-concrete-07",
     "member-concrete-08",
     "member-concrete-09",
+    "member-concrete-10",
     "member-overlap-01",
     "member-overlap-02",
     "stale-11-5-8-2",
@@ -3368,7 +3370,7 @@ def self_test(root: Path) -> int:
             "build_census_controls(doc, pin_census)", "([], [])", 1))))
     controls.append((
         "threading-external-missing-row",
-        "THREADING_EXTERNAL_CARDINALITY:34"
+        "THREADING_EXTERNAL_CARDINALITY:36"
         in threading_external_inventory_errors(
             list(EXPECTED_THREADING_EXTERNAL_IDS[:-1]))))
     workflow_paths = (
@@ -3651,7 +3653,7 @@ def threading_external_live(root: Path) -> list[str]:
         ["git", "ls-files", "-z"], cwd=root, check=False,
         capture_output=True, timeout=30).stdout.split(b"\0")
     tracked_paths = [item.decode("utf-8") for item in tracked if item]
-    if len(tracked_paths) != 491 or len(tracked_paths) != len(set(tracked_paths)):
+    if len(tracked_paths) != 547 or len(tracked_paths) != len(set(tracked_paths)):
         return ["THREADING_EXTERNAL_TRACKED_CENSUS:{}".format(
             len(tracked_paths))]
 
@@ -3688,7 +3690,7 @@ def threading_external_live(root: Path) -> list[str]:
                 item for item in indexed_paths.stdout.split(b"\0") if item
             ])
             if setup.returncode != 0 or indexed.returncode != 0 \
-                    or indexed_paths.returncode != 0 or indexed_count != 491:
+                    or indexed_paths.returncode != 0 or indexed_count != 547:
                 errors.append("THREADING_EXTERNAL_FIXTURE:{}".format(name))
                 observed.append(name)
                 continue
@@ -5484,7 +5486,7 @@ def live_mode(root: Path) -> int:
             return 1
     print("PASS global validation contract live: 2 primary discovery, "
           "1 generic GCC13 fallback, 4 Reverb sources, 16 Reverb rows, "
-          "35 threading mutations, 2484 TimeStretch rows "
+          "37 threading mutations, 2484 TimeStretch rows "
           "(1544 faults, 460 crashes, 40 mutations, 8 baselines, "
           "36 legacy, 12 inherited outer mutants, 144 coherence pairs, "
           "128 coherence transitions, 72 coherence metadata mutations, "

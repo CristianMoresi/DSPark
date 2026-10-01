@@ -655,7 +655,7 @@ DSPARK_TEST(OfflineBeat_linked_control_blocks_are_identical_after_arbitrary_relo
 DSPARK_TEST(OfflineBeat_truncated_rising_pulses_keep_their_onset_and_full_reduction)
 {
     const auto check = []<class T>() {
-        for (const auto configuration : std::array<std::pair<int, double>, 3>{
+        for (const auto& configuration : std::array<std::pair<int, double>, 3>{
                  {{8000, .499}, {48000, .25}, {192000, .499}}})
         {
             const int rate = configuration.first, period = rate / 2;

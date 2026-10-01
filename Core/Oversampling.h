@@ -410,7 +410,12 @@ private:
             for (; k + W <= outLen; k += W)
                 O::store(dst + k, O::madd(c, O::load(centre + k), O::load(dst + k)));
             for (; k < outLen; ++k)
-                dst[k] += centerTap * centre[k];
+            {
+                // Keep the vector multiply-add rounding at block tails too.
+                T lanes[W];
+                O::store(lanes, O::madd(c, O::set1(centre[k]), O::set1(dst[k])));
+                dst[k] = lanes[0];
+            }
 
             std::memmove(even, even + outLen, static_cast<std::size_t>(halfOrder) * sizeof(T));
             std::memmove(odd, odd + outLen, static_cast<std::size_t>(halfOrder) * sizeof(T));

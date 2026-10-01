@@ -1578,10 +1578,15 @@ void firCorrelate(const T* x, const T* h, int taps, T* DSPARK_RESTRICT y, int n,
     }
     for (; i < n; ++i)
     {
-        T a = T(0);
+        // Use the same multiply-add policy as the full vectors. A scalar
+        // expression may contract differently, making the result depend on
+        // which samples happen to fall in the tail of a host block.
+        V a = O::set1(T(0));
         for (int j = 0; j < taps; ++j)
-            a += h[j] * x[i + j];
-        y[i] = a * gain;
+            a = O::madd(O::set1(h[j]), O::set1(x[i + j]), a);
+        T lanes[W];
+        O::store(lanes, O::mul(a, g));
+        y[i] = lanes[0];
     }
 }
 

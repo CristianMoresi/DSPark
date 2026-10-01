@@ -1337,6 +1337,55 @@ DSPARK_TEST(Oversampling_variable_block_roundtrip)
     }
 }
 
+template <typename T>
+static void checkOversamplingPartitions()
+{
+    constexpr int frames = 1031, maximumBlock = 137;
+    using OS = Oversampling<T>;
+    for (int factor : { 2, 4, 8, 16 })
+        for (auto quality : { OS::Quality::Low, OS::Quality::High, OS::Quality::Maximum })
+        {
+            auto render = [&](int partition) {
+                OS processor(factor, quality);
+                processor.prepare({ 48000.0, maximumBlock, 1 });
+                std::vector<T> result(frames);
+                unsigned int rng = 123u;
+                for (auto& value : result)
+                {
+                    rng = rng * 1664525u + 1013904223u;
+                    value = static_cast<T>(static_cast<double>(rng >> 8) / 8388608.0 - 1.0);
+                }
+                constexpr int irregular[] = { 1, 5, 16, 31, 7, 137 };
+                int position = 0, block = 0;
+                while (position < frames)
+                {
+                    const int requested = partition == 0 ? maximumBlock
+                                        : partition == 1 ? irregular[block++ % 6] : 1;
+                    const int count = std::min(requested, frames - position);
+                    T* channel[] = { result.data() + position };
+                    AudioBufferView<T> view(channel, 1, count);
+                    (void)processor.upsample(view);
+                    processor.downsample(view);
+                    position += count;
+                }
+                return result;
+            };
+            const auto reference = render(0);
+            for (int partition : { 1, 2 })
+            {
+                const auto actual = render(partition);
+                for (size_t i = 0; i < actual.size(); ++i)
+                    EXPECT_EQ(actual[i], reference[i]);
+            }
+        }
+}
+
+DSPARK_TEST(Oversampling_is_exact_across_block_partitions)
+{
+    checkOversamplingPartitions<float>();
+    checkOversamplingPartitions<double>();
+}
+
 // getLatency() must match the REAL group delay: an impulse fed through the
 // up/down round-trip has to peak exactly getLatency() samples late, for every
 // factor and for both tap-count extremes. This also pins the polyphase phase

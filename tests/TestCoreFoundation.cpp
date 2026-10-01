@@ -832,6 +832,43 @@ DSPARK_TEST(SimdOps_fir_correlate_matches_the_direct_sum)
     checkFirCorrelate<double>(1e-14);
 }
 
+template <typename T>
+static void checkFirCorrelatePartitions()
+{
+    constexpr int count = 137, width = simd::kVecWidth<T>;
+    unsigned int rng = 19u;
+    auto uniform = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<T>(static_cast<double>(rng >> 8) / 8388608.0 - 1.0);
+    };
+    for (int taps : { 1, 2, 7, 64, 65, 127 })
+    {
+        std::vector<T> x(static_cast<size_t>(count + taps - 1));
+        std::vector<T> h(static_cast<size_t>(taps));
+        for (auto& value : x) value = uniform();
+        for (auto& value : h) value = uniform();
+        std::vector<T> reference(count);
+        simd::firCorrelate(x.data(), h.data(), taps, reference.data(), count, T(0.7));
+        for (int block : { 1, std::max(1, width - 1), width, width + 1,
+                           4 * width - 1, 4 * width + 1 })
+        {
+            std::vector<T> actual(count + 1, T(-7));
+            for (int offset = 0; offset < count; offset += block)
+                simd::firCorrelate(x.data() + offset, h.data(), taps,
+                                  actual.data() + offset, std::min(block, count - offset), T(0.7));
+            for (int i = 0; i < count; ++i)
+                EXPECT_EQ(actual[static_cast<size_t>(i)], reference[static_cast<size_t>(i)]);
+            EXPECT_EQ(actual[count], T(-7));
+        }
+    }
+}
+
+DSPARK_TEST(SimdOps_fir_correlate_is_exact_across_block_partitions)
+{
+    checkFirCorrelatePartitions<float>();
+    checkFirCorrelatePartitions<double>();
+}
+
 DSPARK_TEST(SimdOps_peak_level_ignores_nan)
 {
     const float  nanF = std::numeric_limits<float>::quiet_NaN();

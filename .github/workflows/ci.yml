@@ -465,6 +465,7 @@ jobs:
   tests:
     name: Tests - ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -546,6 +547,7 @@ jobs:
   sanitizers:
     name: ASan + UBSan + float-cast-overflow (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -601,11 +603,9 @@ jobs:
   tsan:
     name: ThreadSanitizer (Linux GCC)
     runs-on: ubuntu-latest
-    # Bounds a pathological hang; a healthy full run fits well inside it
-    # (run 30712892449: tests 1-143 of the suite took ~8.6 min, dominated by
-    # the two seqlock stress cases; the remaining 547 cases are
-    # single-threaded and lighter).
-    timeout-minutes: 150
+    # A watchdog, not a performance target. Keep failures observable even if a
+    # hosted runner slows down; never reduce stress iterations to meet it.
+    timeout-minutes: 60
     env:
       TSAN_OPTIONS: halt_on_error=1
     steps:
@@ -621,32 +621,45 @@ jobs:
       # Concurrency claims come from the named threaded tests printed by this
       # exact run; executing a single-threaded case under TSan is not presented
       # as proof of a hand-off. The ordinary suite authority is currently 1165
-      # named cases, with specialized allocation and Reverb publication tests
-      # kept in separate CTest executables so their process-wide hooks do not
-      # weaken sanitizer coverage in the ordinary suite.
-      #
-      # Timeout: run 30712892449's first 143 cases taking about 8.6 minutes is
-      # retained only as a historical observation, not extrapolated to the
-      # current inventory. The 5400-second value is solely a hard watchdog and
-      # must be validated by each fresh exact-commit TSan terminal; it is not a
-      # performance or worst-case-duration claim. Never trim tests to fit the
-      # watchdog: raise it when an evidenced exact-commit run requires that.
+      # named cases. The separate Reverb publication executable also runs here.
+      # The allocation injector is synchronous: its exhaustive failure sweep
+      # runs unchanged in every native job and both ASan/UBSan jobs. Repeating
+      # it under TSan added 51 minutes without exercising a concurrent handoff.
+      # The guard below rejects thread facilities in its local include graph
+      # and protects the unfiltered native/ASan commands. If the injector gains
+      # concurrent work, revise this partition before excluding it from TSan.
       #
       # ctest -V, not --output-on-failure: on success
       # --output-on-failure suppresses the harness's per-case listing, so a
       # green log was not self-evidencing. -V surfaces every
       # "[ i/N ] case_name" line and the final "N tests | N passed" summary,
       # making the green verdict checkable against the case inventory.
-      - name: Build + run the test suite under ThreadSanitizer
+      - name: Verify sanitizer coverage partition
+        run: python3 tools/verify_m018_global_corrections.py --sanitizer-partition
+
+      - name: Build the test suite under ThreadSanitizer
         run: |
           cmake -S . -B build-tsan \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DDSPARK_BUILD_TESTS=ON -DDSPARK_BUILD_CONFORMANCE=OFF \
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -Wno-error=tsan"
-          # Keep compiler memory bounded while retaining the complete suite.
-          cmake --build build-tsan --parallel 2
-          ./build-tsan/tests/dspark_tests --prefix TubePreamp_
-          ctest --test-dir build-tsan -V --timeout 5400
+          # Bound compiler memory and build every executable used by this job.
+          cmake --build build-tsan --parallel 2 --target \
+            dspark_tests dspark_reverb_publication dspark_standalone dspark_smoke
+
+      - name: Check TubePreamp under ThreadSanitizer
+        run: ./build-tsan/tests/dspark_tests --prefix TubePreamp_
+
+      - name: Run the ordinary suite and publication checks under ThreadSanitizer
+        run: ctest --test-dir build-tsan -V --timeout 5400 -E '^alloc_failure$'
+
+      - name: Preserve ThreadSanitizer test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thread-sanitizer-results
+          path: build-tsan/**/LastTest.log
+          if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
   # WebAssembly (Emscripten) - compile and execute with node

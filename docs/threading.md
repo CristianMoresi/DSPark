@@ -623,6 +623,15 @@ nothing more. A hand-off that no concurrent test exercises is unverified no
 matter how green the run looks, so a new hand-off ships with a concurrent case
 that fails against the unfixed code.
 
+The ordinary suite and the separate Reverb publication checks run in full under
+ThreadSanitizer. The separate `alloc_failure` executable is synchronous and runs
+its complete failure-injection sweep in every native test job and in both GCC
+and Clang ASan/UBSan jobs. It is the only CTest executable omitted from the TSan
+job. A source guard checks its local include graph for thread facilities and
+protects the unfiltered native and ASan/UBSan commands. Adding concurrent work
+to that executable requires revisiting this partition. No DSP acceptance limit
+or failure-injection index changes between these jobs.
+
 The automatic `OfflineSoftClipper` and `OfflineHardClipper` share the worker
 contract in [offline processing](offline-processing.md). Analysis, calibration
 and render are synchronous worker calls. A plan is immutable and owns its

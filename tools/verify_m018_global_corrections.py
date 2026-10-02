@@ -1548,6 +1548,129 @@ def concurrent_test_authority_errors(content: str) -> list[str]:
     return []
 
 
+def allocation_thread_errors(root: Path, overrides: dict[str, str] | None = None) -> list[str]:
+    """Conservatively audit the injector's local includes, including inactive branches."""
+    overrides = overrides or {}
+    pending = [root / "tests/main.cpp", root / "tests/TestAllocFailure.cpp"]
+    visited: set[Path] = set()
+    errors: list[str] = []
+    literals_and_comments = re.compile(
+        r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*[\s\S]*?\*/')
+    facilities = re.compile(
+        r"\bstd\s*::\s*(?:thread|jthread|async|this_thread|execution)\b|"
+        r"\b(?:pthread_create|thrd_create|CreateThread|CreateRemoteThread|"
+        r"_beginthread|_beginthreadex|QueueUserWorkItem|CreateThreadpoolWork|"
+        r"dispatch_async|parallel_for|task_group|task_arena)\b|"
+        r"^\s*#\s*pragma\s+(?:omp|acc)\b", re.MULTILINE)
+    while pending:
+        path = pending.pop().resolve()
+        if path in visited:
+            continue
+        visited.add(path)
+        if not path.is_relative_to(root):
+            errors.append("ALLOC_THREAD_GRAPH_OUTSIDE_ROOT")
+            continue
+        relative = path.relative_to(root).as_posix()
+        try:
+            text = overrides[relative] if relative in overrides else path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            errors.append(f"ALLOC_THREAD_GRAPH_UNREADABLE {relative}")
+            continue
+        # Translation-phase line splicing precedes comment removal.
+        text = re.sub(r"\\\r?\n", "", text)
+        text = literals_and_comments.sub(
+            lambda match: " " if match[0].startswith(("//", "/*")) else match[0], text)
+        if facilities.search(text):
+            errors.append(f"ALLOC_THREAD_FACILITY {relative}")
+        directives = re.findall(r"^\s*#\s*include\s+([^\n]+)", text, re.MULTILINE)
+        for directive in directives:
+            match = re.fullmatch(r'([<"])([^>"]+)[>"]\s*', directive)
+            if not match:
+                errors.append(f"ALLOC_THREAD_GRAPH_DYNAMIC_INCLUDE {relative}")
+                continue
+            delimiter, name = match.groups()
+            if name in ("thread", "future", "execution", "pthread.h", "threads.h", "omp.h") \
+                    or name.startswith(("boost/thread", "boost/asio", "tbb/", "oneapi/tbb/")):
+                errors.append(f"ALLOC_THREAD_HEADER {relative}: {name}")
+            local = next((candidate for candidate in (path.parent / name, root / name)
+                          if candidate.is_file() or candidate.resolve().is_relative_to(root)
+                          and candidate.resolve().relative_to(root).as_posix() in overrides), None)
+            if local is not None:
+                pending.append(local)
+            elif delimiter == '"':
+                errors.append(f"ALLOC_THREAD_GRAPH_MISSING_INCLUDE {relative}: {name}")
+    return errors
+
+
+def sanitizer_workflow_errors(ci: str, cmake: str) -> list[str]:
+    errors: list[str] = []
+    for job in ("tests", "sanitizers", "tsan"):
+        section = re.search(r"(?ms)^  " + job + r":\n(.*?)(?=^  [\w-]+:|\Z)", ci)
+        limits = re.findall(r"^    timeout-minutes: ([0-9]+)$", section[1], re.MULTILINE) if section else []
+        if limits != ["60"]:
+            errors.append(f"SANITIZER_JOB_WATCHDOG {job}")
+    # Exact commands deliberately disallow a second filter or a shell suffix
+    # that could turn a failed test into a successful step.
+    commands = re.findall(r"^\s*(?:run:\s*)?(ctest [^\n]+)", ci, re.MULTILINE)
+    expected = {
+        "build-san": "ctest --test-dir build-san --output-on-failure --test-output-size-failed 0",
+        "build-tsan": "ctest --test-dir build-tsan -V --timeout 5400 -E '^alloc_failure$'",
+    }
+    for directory, command in expected.items():
+        actual = [line.strip() for line in commands
+                  if re.search(r"--test-dir " + directory + r"(?:\s|$)", line)]
+        if actual != [command]:
+            errors.append(f"SANITIZER_TEST_COMMAND {directory}")
+    native = re.findall(
+        r"^\s*ctest --test-dir build --build-config Release\s*\n"
+        r"\s*--output-on-failure --test-output-size-failed 0\s*$", ci, re.MULTILINE)
+    if len(native) != 1:
+        errors.append("SANITIZER_NATIVE_COVERAGE")
+    for compiler in ("{ name: GCC, compiler: g++ }", "{ name: Clang, compiler: clang++ }"):
+        if compiler not in ci:
+            errors.append("SANITIZER_COMPILER_COVERAGE")
+    registrations = cmake_commands("\n".join(re.findall(
+        r"add_test\s*\(\s*NAME\s+alloc_failure\b[^)]*\)|"
+        r"add_executable\s*\(\s*dspark_alloc_failure\b[^)]*\)",
+        strip_cmake_comments(cmake), re.MULTILINE)).encode("ascii"))
+    if registrations.count(("add_test", ["NAME", "alloc_failure", "COMMAND", "dspark_alloc_failure"])) != 1:
+        errors.append("SANITIZER_ALLOCATION_TEST_REGISTRATION")
+    if registrations.count(("add_executable", ["dspark_alloc_failure", "main.cpp", "TestAllocFailure.cpp"])) != 1:
+        errors.append("SANITIZER_ALLOCATION_SOURCE_GRAPH")
+    if re.search(r"target_sources\s*\(\s*dspark_alloc_failure\b", strip_cmake_comments(cmake)):
+        errors.append("SANITIZER_ALLOCATION_EXTRA_SOURCES")
+    return errors
+
+
+def sanitizer_partition_errors(root: Path) -> list[str]:
+    ci = (root / ".github/workflows/ci.yml").read_text(encoding="ascii")
+    cmake = (root / "tests/CMakeLists.txt").read_text(encoding="ascii")
+    errors = allocation_thread_errors(root) + sanitizer_workflow_errors(ci, cmake)
+    # Mutation controls run with the normal cheap gate, not only an optional
+    # self-test. No real source files are modified.
+    source = (root / "tests/TestAllocFailure.cpp").read_text(encoding="ascii")
+    for label, changed in (
+        ("thread-header", '#include <thread>\n' + source),
+        ("thread-api", source + '\nvoid probe() { std::thread([] {}).join(); }\n'),
+        ("dynamic-include", '#include THREAD_HELPER\n' + source),
+        ("missing-include", '#include "missing-thread-helper.h"\n' + source),
+    ):
+        if not allocation_thread_errors(root, {"tests/TestAllocFailure.cpp": changed}):
+            errors.append(f"SANITIZER_PARTITION_CONTROL {label}")
+    if not allocation_thread_errors(root, {"Core/detail/OfflineClip.h": '#include <future>\n'}):
+        errors.append("SANITIZER_PARTITION_CONTROL indirect-thread-header")
+    for label, changed in (
+        ("asan-filter", ci.replace("ctest --test-dir build-san ", "ctest --test-dir build-san -E alloc_failure ")),
+        ("tsan-extra-filter", ci.replace("'^alloc_failure$'", "'^(alloc_failure|suite)$'")),
+        ("native-filter", ci.replace("--build-config Release\n", "--build-config Release -E alloc_failure\n")),
+        ("missing-clang", ci.replace("{ name: Clang, compiler: clang++ }", "")),
+        ("unbounded-job", ci.replace("    timeout-minutes: 60\n", "")),
+    ):
+        if not sanitizer_workflow_errors(changed, cmake):
+            errors.append(f"SANITIZER_PARTITION_CONTROL {label}")
+    return errors
+
+
 def stale_truth_errors(root: Path) -> list[str]:
     errors: list[str] = []
     for path in STALE_PUBLIC_PHRASES:
@@ -1558,6 +1681,7 @@ def stale_truth_errors(root: Path) -> list[str]:
         errors.append(f"CURRENT_TEST_AUTHORITY_MISSING {EXPECTED_ORDINARY_TESTS}")
     runner = (root / "tools/run_concurrent_test_suites.py").read_text(encoding="ascii")
     errors.extend(concurrent_test_authority_errors(runner))
+    errors.extend(sanitizer_partition_errors(root))
     return errors
 
 
@@ -2415,10 +2539,18 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--skip-public-text", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--sanitizer-partition", action="store_true")
     parser.add_argument("--machine-json", type=Path)
     parser.add_argument("--doxygen", default=shutil.which("doxygen"))
     arguments = parser.parse_args()
     root = arguments.root.resolve()
+    if arguments.sanitizer_partition:
+        errors = sanitizer_partition_errors(root)
+        for error in errors:
+            print("ERROR " + error, file=sys.stderr)
+        if not errors:
+            print("PASS sanitizer partition: allocation include graph, complete native/ASan coverage, mutation controls")
+        return 1 if errors else 0
     package_r_bootstrap = globals().get(
         "package_r_executable_bootstrap_errors")
     if not callable(package_r_bootstrap):

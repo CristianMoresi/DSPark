@@ -84,12 +84,12 @@ using namespace dspark::test;
 // assumed: under ASan+UBSan this target is green with this case injecting
 // real bad_allocs, and the executable's own _Znwm/_ZdlPv definitions preempt
 // the sanitizer runtime's (ELF global-scope precedence) in the ASan AND the
-// TSan link, confirmed from the linked binaries' symbol tables. Running the
-// suite under ThreadSanitizer is CI's job, so the RUN under TSan is proven
-// there rather than here; if the
+// TSan link, confirmed from the linked binaries' symbol tables. If the
 // replacement ever failed to take effect the case would fail loudly on
-// EXPECT_GT(injected, 10) with injected == 0, never pass silently. It
-// therefore runs UNGUARDED under every sanitizer.
+// EXPECT_GT(injected, 10) with injected == 0, never pass silently. The target
+// remains runnable under every sanitizer. CI runs this synchronous exhaustive
+// sweep in every native job and both ASan/UBSan jobs; the TSan job checks its
+// local include graph for thread facilities before omitting this one executable.
 namespace dspark_test_failing_alloc {
 // constinit, so "no dynamic initialization" is compiler-checked: these words
 // are touched by allocations made during the static init of other TUs, which

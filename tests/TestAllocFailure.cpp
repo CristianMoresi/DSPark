@@ -1365,6 +1365,7 @@ template <class Processor> void clipAllocationFailures(int factor, int channels)
 DSPARK_TEST(StereoGenerator_prepare_failures_preserve_stream_and_callbacks_do_not_allocate)
 {
     namespace fa = dspark_test_failing_alloc;
+    for (int factor : {1, 8})
     for (bool prepared : {false, true})
     {
         bool finished = false;
@@ -1390,7 +1391,7 @@ DSPARK_TEST(StereoGenerator_prepare_failures_preserve_stream_and_callbacks_do_no
             }
             int allocations = 0;
             const bool failed = injectResamplerAllocationFailure(index, [&] {
-                (void)effect.prepare({96000, 1024, 2}, {8, 175});
+                (void)effect.prepare({96000, 1024, 2}, {factor, 175});
             }, allocations);
             if (!failed)
             {
@@ -1400,7 +1401,7 @@ DSPARK_TEST(StereoGenerator_prepare_failures_preserve_stream_and_callbacks_do_no
             ++injected;
             EXPECT_EQ(effect.getLatency(), prepared ? reference.getLatency() : 0);
             EXPECT_EQ(effect.getSourceFrame(), prepared ? 1024u : 0u);
-            EXPECT_EQ(effect.getOptions().oversampling, 4);
+            EXPECT_EQ(effect.getOptions().oversampling, 1);
             EXPECT_EQ(effect.getOptions().lowCutHz, 0.f);
             if (prepared)
             {
@@ -1419,7 +1420,7 @@ DSPARK_TEST(StereoGenerator_prepare_failures_preserve_stream_and_callbacks_do_no
             }
             else
                 EXPECT_FALSE(effect.processBlock({channels, 2, 1024}));
-            EXPECT_TRUE(effect.prepare({96000, 1024, 2}, {8, 175}));
+            EXPECT_TRUE(effect.prepare({96000, 1024, 2}, {factor, 175}));
         }
         EXPECT_TRUE(finished);
         EXPECT_GT(injected, 50);
@@ -1438,7 +1439,7 @@ DSPARK_TEST(StereoGenerator_memory_bound_covers_actual_setup_at_supported_endpoi
     namespace fa = dspark_test_failing_alloc;
     const auto check = [&]<typename T>() {
         for (double rate : {8000., 44100., 48000., 96000., 192000., 384000.})
-            for (int factor : {2, 4, 8, 16})
+            for (int factor : {1, 2, 4, 8, 16})
                 for (float cut : {0.f, 20.f, 175.f, 5000.f})
                 {
                     StereoGenerator<T> effect;
@@ -1452,6 +1453,10 @@ DSPARK_TEST(StereoGenerator_memory_bound_covers_actual_setup_at_supported_endpoi
                     fa::failAt.store(-1, std::memory_order_relaxed);
                     EXPECT_TRUE(prepared);
                     EXPECT_EQ(queryAllocations, 0);
+                    if (payload > bound)
+                        std::cerr << "Stereo prepare bytes=" << payload << " bound=" << bound
+                                  << " rate=" << rate << " factor=" << factor << " cut=" << cut
+                                  << " sampleBytes=" << sizeof(T) << '\n';
                     EXPECT_TRUE(payload <= bound);
                 }
     };

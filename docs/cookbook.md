@@ -767,7 +767,7 @@ mode resets history and requires updating the host's latency report.
 ```cpp
 StereoGenerator<float> generator;
 generator.setWidth(.25f);
-const bool prepared = generator.prepare(spec, {4, 175.0f});
+const bool prepared = generator.prepare(spec, {1, 175.0f});
 const int latency = generator.getLatency();
 // Publish latency to the host before starting playback.
 (void)latency;
@@ -786,8 +786,19 @@ disables it; otherwise use 20 to 5000 Hz. The original mid and original side
 remain present. Width zero gives exact delayed identity; automation takes 5 ms
 and does not alter the reported latency. No limiter or output gain trim is added.
 
-The local color factor accepts 2, 4, 8 or 16. Its FIR transition spans 0.45 to
-0.50 times the source sample rate; factor 2 trades antialias rejection for CPU.
+The local color factor accepts 1, 2, 4, 8 or 16 and defaults to 1. At 1x,
+continuous polynomial reconstruction and nonlinear moment integration run at
+the source rate, followed by FIR projection. There is no upsampled audio stream.
+It retains antialias filtering and the original source-clock DC response;
+1x does not mean an unfiltered memoryless waveshaper. Its FIR transition spans
+0.45 to 0.50 times the source sample rate at every factor. Without the optional
+low cut, 1x reports 256 samples of latency (5.33 ms at 48 kHz); the established
+explicit 4x path reports 392 samples at that rate. Factor 2 trades antialias
+rejection for CPU; a larger factor does not automatically outperform the
+different algorithm used at 1x. Both paths use the shared Core clipping curves,
+integration, FIR and DC kernels. The fixed 1x coefficient bank is shared across
+instances (82496 bytes of read-only doubles); all mutable filter state is private.
+
 Options require setup-time preparation. Presets store parameters, not filter
 history. After a seek, use `resetAtFrame()` and replay preceding input when
 history continuity is required; this method alone is not a saved-state restore.

@@ -36,9 +36,13 @@ namespace dspark
  * automatic gain trim. Only the generated delta receives the optional low cut.
  *
  * The color branch uses an explicit 0.45 Fs to 0.50 Fs FIR transition. The
- * default local factor is 4; 2, 4, 8 and 16 are selectable at prepare time.
- * Factor 2 has lower antialias rejection. This topology does not claim analog
- * device equivalence. Factor 1 is unsupported by the DC transfer correction.
+ * default factor is 1: continuous polynomial reconstruction, shared nonlinear
+ * integration and FIR moment projection all run at the source sample rate.
+ * Factors 2, 4, 8 and 16 select the oversampled color implementation at prepare
+ * time; factor 2 has lower measured antialias rejection than the 1x path.
+ * The source-clock DC response is retained at every factor. At 1x the alignment
+ * delay is 256 samples before an optional low cut. This is a mathematical
+ * source-topology model, not a claim of physical-device equivalence.
  *
  * Width defaults to zero (exact delayed identity). Automation ramps for 5 ms
  * using Core SmoothedValue and keeps latency constant. Input must be stereo;
@@ -62,7 +66,7 @@ template <typename T> class StereoGenerator final
     /** @brief Configuration applied by prepare(), never by the audio callback. */
     struct Options
     {
-        int oversampling = 4; ///< Local color-branch factor: 2, 4, 8 or 16.
+        int oversampling = 1; ///< Local color-branch factor: 1, 2, 4, 8 or 16.
         float lowCutHz = 0;   ///< Generated delta only: off, or 20 to 5000 Hz.
         bool operator==(const Options &) const noexcept = default;
     };
@@ -519,7 +523,7 @@ template <typename T> class StereoGenerator final
     }
     static bool validOptions(Options options) noexcept
     {
-        return options.oversampling >= 2 && options.oversampling <= 16 &&
+        return options.oversampling >= 1 && options.oversampling <= 16 &&
                (options.oversampling & (options.oversampling - 1)) == 0 &&
                std::isfinite(options.lowCutHz) &&
                (options.lowCutHz == 0 || (options.lowCutHz >= 20 && options.lowCutHz <= 5000));

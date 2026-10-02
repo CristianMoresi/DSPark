@@ -20,9 +20,9 @@
   },
   "counts": {
     "binary_exact": 184,
-    "first_party_ascii_text": 280,
+    "first_party_ascii_text": 283,
     "third_party_utf8_exact": 84,
-    "total": 548
+    "total": 551
   },
   "gitattributes_required_lines": [
     "* text=auto",
@@ -2494,6 +2494,18 @@
     {
       "kind": "first_party_ascii_text",
       "path": "tools/check_reverb_numerics.py"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/ContinuousStereoColor.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/StereoColorCoefficients.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "tools/generate_stereo_color.cpp"
     }
   ],
   "schema": "dspark.public-file-policy.v1"

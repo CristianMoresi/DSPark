@@ -569,8 +569,9 @@ rational color, original subtraction and delta add-back as
 @ref dspark::StereoGenerator. It accepts complete sources at 8..384 kHz and
 produces exactly two channels with the original frame count. A mono source
 requires `duplicateMono = true`. Width is 0..1, with default zero. The local
-color oversampling factor is explicitly 2, 4, 8 or 16 (default 4); other
-effects' settings are unchanged. `lowCutHz` optionally filters only the delta.
+color factor accepts 1, 2, 4, 8 or 16 and defaults to 1. The default uses the
+core's continuous source-rate integration with antialias filtering and no
+upsampled audio stream. `lowCutHz` optionally filters only the delta.
 See the [stereo recipe](cookbook.md) for the core's frequency
 transition, source behavior and latency tradeoffs.
 

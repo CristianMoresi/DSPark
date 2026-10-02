@@ -222,10 +222,11 @@ template <class T> void neutralAndOwning()
 
 DSPARK_TEST(OfflineStereo_matches_continuous_core_and_source_clock)
 {
-    for (const auto rate : {8000., 48000., 192000., 384000.})
-        for (int factor : {2, 4, 8, 16})
+    for (const auto rate : {8000., 48000., 96000., 192000., 384000.})
+        for (int factor : {1, 2, 4, 8, 16})
             compareCore<double>(rate, factor, 0, 2, 1025, 127, 9007199254741041ll);
     compareCore<float>(44100, 4, 175, 2, 8193, 251, 63);
+    compareCore<float>(44100, 1, 175, 2, 8193, 251, 63);
     compareCore<float>(96000, 8, 5000, 1, 513, 1, 17);
     compareCore<double>(8000, 2, 5000, 2, 7, 3, 19);
 }
@@ -234,7 +235,8 @@ DSPARK_TEST(OfflineStereo_short_sources_flush_once_and_clock_never_wraps)
 {
     for (int size : {1, 2, 17, 257})
         for (int block : {1, 127, 4096})
-            compareCore<double>(48000, 4, 175, 1, size, block,
+        for (int factor : {1, 4})
+            compareCore<double>(48000, factor, 175, 1, size, block,
                                 std::numeric_limits<std::int64_t>::max() - size);
 }
 
@@ -368,7 +370,7 @@ DSPARK_TEST(OfflineStereo_cache_rejects_content_configuration_and_provenance_cha
     options.oversamplingFactor = 8;
     const auto factor = effect.replan(source, plan.plan, options);
     reject(factor.plan);
-    options.oversamplingFactor = 4;
+    options.oversamplingFactor = 1;
     options.lowCutHz = 175;
     const auto highPass = effect.replan(source, plan.plan, options);
     reject(highPass.plan);
@@ -424,9 +426,9 @@ DSPARK_TEST(OfflineStereo_analysis_reuse_moves_and_validation)
         EXPECT_TRUE(effect.analyze(source, options).status == OfflineStatus::InvalidInput);
     }
     options.width = 1;
-    options.oversamplingFactor = 1;
+    options.oversamplingFactor = 3;
     EXPECT_TRUE(effect.analyze(source, options).status == OfflineStatus::InvalidInput);
-    options.oversamplingFactor = 4;
+    options.oversamplingFactor = 1;
     options.lowCutHz = 19;
     EXPECT_TRUE(effect.analyze(source, options).status == OfflineStatus::InvalidInput);
     options.lowCutHz = 0;

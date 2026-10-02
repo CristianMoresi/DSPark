@@ -45,7 +45,7 @@ template <FloatType T> class OfflineStereoGenerator final
     struct Options
     {
         float width = 0; ///< 0..1; zero returns exact original PCM, optionally duplicated.
-        int oversamplingFactor = 4; ///< Local color factor: 2, 4, 8 or 16.
+        int oversamplingFactor = 1; ///< Local color factor: 1, 2, 4, 8 or 16.
         float lowCutHz = 0;         ///< Generated delta only; off or 20..5000 Hz.
         bool duplicateMono = false; ///< Explicit permission to turn mono into two channels.
         std::span<const OfflineRegion> exclusions{}; ///< Copied source-relative regions.

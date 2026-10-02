@@ -60,9 +60,13 @@ template <int N> struct Gauss
     }
 };
 
-template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = true> class Interval
+template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = true,
+          int MomentCount = 4> class Interval
 {
     static_assert(Degree >= 1 && Degree <= 11 && Degree % 2 == 1);
+    static_assert(MomentCount >= 1 && MomentCount <= 8);
+    static_assert(Degree + MomentCount <= 16); // Eight-point exact polynomial quadrature.
+    using Moments = std::array<double, MomentCount>;
     static constexpr bool rational =
         C == Curve::GoldenRatio || C == Curve::SymmetricKnee || C == Curve::AsymmetricKnee;
     static constexpr int count = Degree + 1;
@@ -92,7 +96,7 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
     }
     static void add(Moments &a, const Moments &b)
     {
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < MomentCount; ++i)
             a[i] += b[i];
     }
     template <int N>
@@ -106,7 +110,7 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
             const double reference = SubtractLinear ? referenceSlope * x : 0.;
             double v = (b - a) * q.weights[i] *
                        (fixed ? fixedValue - reference : clipperShape<C>(x, ceiling_) - reference);
-            for (int j = 0; j < 4; ++j)
+            for (int j = 0; j < MomentCount; ++j)
             {
                 out[j] += v;
                 v *= t;
@@ -122,7 +126,7 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
             1 + std::abs(value(p, a)) + std::abs(value(p, b)) + std::abs(value(p, (a + b) / 2));
         const double tolerance = (b - a) * 1e-13 * scale;
         double error = 0;
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < MomentCount; ++i)
             error = std::max(error, std::abs(fine[i] - coarse[i]));
         if (error <= tolerance)
             return fine;
@@ -132,6 +136,30 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
         add(out, adaptive(p, (a + b) / 2, b, depth + 1));
         return out;
     }
+    Moments linearMoments(const Poly &p, double a, double b) const
+    {
+        // Integrate a complete, provably linear interval algebraically. Retain
+        // the established four-moment arithmetic for existing callers.
+        if constexpr (MomentCount != 4)
+        {
+            if (a == 0 && b == 1)
+            {
+                static constexpr auto weights = [] {
+                    std::array<Poly, MomentCount> result{};
+                    for (int j = 0; j < MomentCount; ++j)
+                        for (int k = 0; k < count; ++k)
+                            result[j][k] = 1. / (j + k + 1);
+                    return result;
+                }();
+                Moments out{};
+                for (int j = 0; j < MomentCount; ++j)
+                    for (int k = 0; k < count; ++k)
+                        out[j] += p[k] * weights[j][k];
+                return out;
+            }
+        }
+        return quadrature(p, a, b, linearQuadrature_);
+    }
     Moments segment(const Poly &p, double a, double b) const
     {
         const double x = value(p, (a + b) / 2);
@@ -140,7 +168,7 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
             if (std::abs(x) <= ceiling_)
             {
                 if constexpr (SubtractLinear) return {};
-                else return quadrature(p, a, b, linearQuadrature_);
+                else return linearMoments(p, a, b);
             }
             return quadrature(p, a, b, linearQuadrature_, true, std::copysign(ceiling_, x));
         }
@@ -155,7 +183,7 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
             if (x >= limits[0] && x <= limits[1])
             {
                 if constexpr (SubtractLinear) return {};
-                else return quadrature(p, a, b, linearQuadrature_);
+                else return linearMoments(p, a, b);
             }
         }
         else if constexpr (C == Curve::Tanh)
@@ -208,7 +236,7 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
             if (low >= -ceiling_ && high <= ceiling_)
             {
                 if constexpr (SubtractLinear) return {};
-                else return quadrature(p, a, b, linearQuadrature_);
+                else return linearMoments(p, a, b);
             }
         }
         if constexpr (rational)
@@ -217,7 +245,7 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
             if (low >= limits[0] && high <= limits[1])
             {
                 if constexpr (SubtractLinear) return {};
-                else return quadrature(p, a, b, linearQuadrature_);
+                else return linearMoments(p, a, b);
             }
         }
         bool crosses = false;
@@ -276,6 +304,7 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
   public:
     std::vector<double> linearKernel() const
     {
+        static_assert(MomentCount == 4); // Cubic B-spline synthesis below.
         constexpr std::array<Moments, 4> kernels{
             {{1, -3, 3, -1}, {4, 0, -6, 3}, {1, 3, 3, -3}, {0, 0, 0, 1}}};
         std::vector<double> result(Degree + 4);
@@ -371,6 +400,25 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
     [[nodiscard]] double reconstructionBound() const noexcept
     {
         return reconstructionBound_;
+    }
+    /** @brief Integrates an already reconstructed power polynomial on [0,1].
+     * Returns integral(t^j * shape(p(t)), dt), j = 0 .. MomentCount-1,
+     * subtracting the linear reference when SubtractLinear is enabled.
+     * Shares knee isolation and quadrature with the sample interpolator.
+     * Nonfinite coefficients or failed convergence produce NaN.
+     */
+    [[nodiscard]] Moments polynomial(const Poly &power) const noexcept
+    {
+        Poly bernstein{};
+        for (double coefficient : power)
+            if (!std::isfinite(coefficient))
+                return {std::numeric_limits<double>::quiet_NaN()};
+        if (std::all_of(power.begin(), power.end(), [](double value) { return value == 0; }))
+            return {};
+        for (int i = 0; i < count; ++i)
+            for (int j = 0; j <= i; ++j)
+                bernstein[i] += power[j] * bernsteinMatrix_[i][j];
+        return recurse(power, bernstein, 0, 1, 0);
     }
     Moments operator()(const std::array<double, count> &samples) const noexcept
     {

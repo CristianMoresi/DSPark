@@ -5,6 +5,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -82,9 +83,10 @@ DSPARK_TEST(StereoGenerator_prepare_validation_preserves_active_stream)
     EXPECT_TRUE(effect.getStatus() == StereoGenerator<double>::Status::NotPrepared);
     EXPECT_TRUE(effect.setWidth(.5f));
     EXPECT_TRUE(effect.prepare({48000, 1024, 2}));
-    EXPECT_EQ(effect.getLatency(), 392);
+    EXPECT_EQ(effect.getOptions().oversampling, 1);
+    EXPECT_EQ(effect.getLatency(), 256);
     EXPECT_TRUE(effect.processBlock(buffer.toView()));
-    for (const int factor : {0, 1, 3, 32})
+    for (const int factor : {0, 3, 5, 32})
         EXPECT_FALSE(effect.prepare({48000, 1024, 2}, {factor, 0}));
     for (const float cut : {-1.f, 1.f, 19.f, 5001.f, std::numeric_limits<float>::infinity()})
         EXPECT_FALSE(effect.prepare({48000, 1024, 2}, {4, cut}));
@@ -95,7 +97,7 @@ DSPARK_TEST(StereoGenerator_prepare_validation_preserves_active_stream)
                                  {48000, 128, 1},
                                  {48000, 128, 3}})
         EXPECT_FALSE(effect.prepare(spec));
-    EXPECT_EQ(effect.getLatency(), 392);
+    EXPECT_EQ(effect.getLatency(), 256);
     EXPECT_EQ(effect.getSourceFrame(), 128u);
     EXPECT_EQ(effect.getWidth(), .5f);
     EXPECT_FALSE(effect.setWidth(std::numeric_limits<float>::quiet_NaN()));
@@ -136,13 +138,15 @@ DSPARK_TEST(StereoGenerator_delta_capture_matches_addback_and_rejects_aliases)
     }
     EXPECT_GT(largest, .001);
     EXPECT_EQ(StereoGenerator<double>::getPrepareMemoryBound({48000, 127, 1}, {4, 0}), 0u);
-    EXPECT_EQ(StereoGenerator<double>::getPrepareMemoryBound({48000, 127, 2}, {1, 0}), 0u);
+    EXPECT_EQ(StereoGenerator<double>::getPrepareMemoryBound({48000, 127, 2}, {3, 0}), 0u);
 }
 
 DSPARK_TEST(StereoGenerator_zero_width_exact_delayed_pcm)
 {
     for (double rate : {8000., 44100., 48000., 96000., 192000., 384000.})
     {
+        EXPECT_TRUE(identity<float>(rate, 1, 0));
+        EXPECT_TRUE(identity<double>(rate, 1, 0));
         EXPECT_TRUE(identity<float>(rate, 4, 0));
         EXPECT_TRUE(identity<double>(rate, 4, 0));
     }
@@ -298,7 +302,7 @@ DSPARK_TEST(StereoGenerator_presets_validate_before_publication)
         if (variant == 2)
             invalid.write("width", std::numeric_limits<float>::infinity());
         if (variant == 3)
-            invalid.write("oversampling", 1);
+            invalid.write("oversampling", 3);
         if (variant == 4)
             invalid.write("width", 1);
         if (variant == 5)
@@ -317,6 +321,84 @@ DSPARK_TEST(StereoGenerator_presets_validate_before_publication)
     EXPECT_TRUE(restored.setState(bytes.data(), bytes.size()));
     EXPECT_EQ(restored.getWidth(), .25f);
     EXPECT_TRUE(restored.getOptions() == original.getOptions());
+}
+
+DSPARK_TEST(ContinuousClip_power_moments_match_exact_integrals)
+{
+    using Integral = detail::continuous_clip::Interval<detail::ClipperCurve::Hard, 7, false, false, 8>;
+    Integral integral(1);
+    // p(t) = t^7 never leaves the linear region. All eight integrals are 1/(8+j).
+    std::array<double, 8> polynomial{};
+    polynomial[7] = 1;
+    const auto linear = integral.polynomial(polynomial);
+    for (int j = 0; j < 8; ++j) EXPECT_NEAR(linear[j], 1. / (8 + j), 2e-15);
+    // clamp(4t-2,-1,1): exact knee crossings at 1/4 and 3/4.
+    polynomial = {-2, 4, 0, 0, 0, 0, 0, 0};
+    const auto clipped = integral.polynomial(polynomial);
+    for (int j = 0; j < 8; ++j)
+    {
+        const double low = std::pow(.25, j + 1), high = std::pow(.75, j + 1);
+        const double expected = -low / (j + 1) +
+                                4 * (std::pow(.75, j + 2) - std::pow(.25, j + 2)) / (j + 2) -
+                                2 * (high - low) / (j + 1) + (1 - high) / (j + 1);
+        EXPECT_NEAR(clipped[j], expected, 3e-15);
+    }
+    polynomial.fill(0);
+    EXPECT_TRUE((integral.polynomial(polynomial) == std::array<double, 8>{}));
+    polynomial[0] = std::numeric_limits<double>::infinity();
+    EXPECT_TRUE(std::isnan(integral.polynomial(polynomial)[0]));
+}
+
+DSPARK_TEST(StereoGenerator_source_rate_color_rejects_foldback_and_retains_source_dc)
+{
+    // Independent direct-curve Fourier integrals, converged at 2^19/2^20
+    // phase points. At these coherent frequencies all harmonics above the
+    // fundamental lie outside Nyquist. Thus the complete steady-state reference
+    // is one sinusoid multiplied by the original source-clock DC transfer.
+    // The 0.475 Fs guard's passband error here is below this -120 dB input-relative
+    // error budget. Include the low-level, low-frequency linear DC case separately.
+    const auto check = [&]<detail::ClipperCurve C>(std::array<double, 3> fundamentals) {
+        for (int source : {1, 2, 4, 8})
+        for (int level = 0; level < 3; ++level)
+        for (int bin : {5123, 6827})
+        {
+            constexpr int length = 16384, block = 127;
+            const int frequencyBin = level == 0 ? 107 : bin;
+            const double amplitude = std::array<double, 3>{.03, .1, .3}[level];
+            const double omega = twoPi<double> * frequencyBin / length;
+            const auto z = std::exp(std::complex<double>(0, -omega / source));
+            const auto transfer = (1. - z) / (1. - .9995 * z);
+            const int warm = source == 1 ? 65536 : source == 2 ? 32768 : 16384;
+            detail::StereoColor<C> color(1, source);
+            EXPECT_EQ(color.latency(), 256);
+            std::array<double, block> samples{};
+            double error = 0;
+            int measured = 0;
+            for (int first = 0; first < warm + length + color.latency(); first += block)
+            {
+                const int count = std::min(block, warm + length + color.latency() - first);
+                for (int i = 0; i < count; ++i)
+                    samples[i] = amplitude * std::cos(omega * (first + i));
+                auto *channel = samples.data();
+                color.process({&channel, 1, count});
+                for (int i = 0; i < count; ++i)
+                {
+                    const int frame = first + i - color.latency();
+                    if (frame < warm) continue;
+                    const double reference = fundamentals[level] *
+                        std::real(transfer * std::exp(std::complex<double>(0, omega * frame)));
+                    error += (samples[i] - reference) * (samples[i] - reference);
+                    ++measured;
+                }
+            }
+            EXPECT_EQ(measured, length);
+            EXPECT_LT(std::sqrt(error / length) / (amplitude / std::sqrt(2.)), 1e-6);
+        }
+    };
+    check.template operator()<detail::ClipperCurve::SymmetricKnee>(
+        {.03, .087663081431628861, .10005984701175599});
+    check.template operator()<detail::ClipperCurve::AsymmetricKnee>(
+        {.03, .086451374133307807, .099419622996524501});
 }
 
 DSPARK_TEST(StereoGenerator_float_matches_rounded_double_path)
@@ -371,7 +453,7 @@ DSPARK_TEST(StereoGenerator_matches_independent_complete_signal_reference)
     // direct rational curves and separately designed Kaiser FIRs. The 128x/256x
     // whole-signal convergence is below -145 dBFS RMS for all six fixtures.
     // These are reference values, not captured DSPark output. The public absolute
-    // tolerance includes reference and four-times color reconstruction error.
+    // tolerance covers the source-rate and explicit four-times color paths.
     constexpr int length = 16384;
     constexpr std::array<int, 16> positions{0,    1,    126,  127,  128,  255,  256,   512,
                                             1024, 4095, 4096, 4097, 7000, 8192, 12000, 16383};
@@ -426,11 +508,13 @@ DSPARK_TEST(StereoGenerator_matches_independent_complete_signal_reference)
         }
         }
     };
+    for (int factor : {1, 4})
     for (int which = 0; which < 6; ++which)
     {
         StereoGenerator<double> effect;
         EXPECT_TRUE(effect.setWidth(1));
-        EXPECT_TRUE(effect.prepare({48000, 127, 2}));
+        EXPECT_TRUE(factor == 1 ? effect.prepare({48000, 127, 2})
+                               : effect.prepare({48000, 127, 2}, {factor, 0}));
         const int latency = effect.getLatency();
         AudioBuffer<double> buffer;
         buffer.resize(2, 127);

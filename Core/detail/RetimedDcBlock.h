@@ -9,7 +9,8 @@
  * Setup allocates. Processing/reset are allocation-free and stream-owned.
  * Power-of-two working/source factors must lie in [1,16]. Factors below the
  * source clock use a finite half-angle FIR correction, not just a retuned pole.
- * The stereo path requires a working factor of at least 2 for that correction.
+ * The oversampled stereo path uses a working factor of at least 2 here.
+ * Its 1x path folds the correction into continuous FIR moment projection.
  */
 #include "../FIRFilter.h"
 #include "ContinuousClip.h"

@@ -196,15 +196,17 @@
  * confidence from 0.52 to between 0.02 and 0.38, while leaving every
  * unambiguous case in the acceptance corpus untouched. See kAmbiguityFloor for
  * why it has a floor under it.
+ * An offline level change retains the displaced reading as its secondary
+ * hypothesis and reevaluates ambiguity against the selected period.
  *
  * ON RECORDED MUSIC. Measured with analyze() against the tempo each
  * recording is annotated with, counting an estimate within 4% of it (and, in
  * the second figure, within 4% of twice, three times, half or a third of it):
  *
- *   ISMIR 2004 ballroom, original 454       76.0%   90.1%
+ *   ISMIR 2004 ballroom, original 454       76.2%   90.3%
  *   Salsa Dataset, 122 recordings          68.9%   81.1%
- *   Freesound Loops 4k, 3223 loops (*)      50.5%   66.7%
- *   Ballroom, additional 242 excerpts (**) 74.8%   88.4%
+ *   Freesound Loops 4k, 3223 loops (*)      51.0%   69.7%
+ *   Ballroom, additional 242 excerpts (**) 74.8%   88.8%
  *
  * Native-rate mono input; whole ballroom excerpts and the first 30 s of
  * Salsa (two recordings have too few annotated beats in that span).
@@ -214,19 +216,27 @@
  *   (**) absent from the original fit; two further excerpts matching its
  *        recordings are excluded. Reserved while developing the slope fix.
  *
- * The level weights are unchanged and were fitted to the original 454/122/
- * 3008 subsets. The first three rows therefore reuse training material;
- * they are descriptive results, not independent generalisation estimates.
- * On these SAME evaluation excerpts, the phase-aware slope fit moves the
- * two figures from 75.8/89.9 to 76.0/90.1, leaves Salsa unchanged, and moves
- * the loops from 49.7/65.9 to 50.5/66.7. The additional ballroom excerpts
- * move from 73.6/87.2 to 74.8/88.4. All delivered beat positions are unchanged.
- * A remaining metrical limitation: a Viennese waltz read at one beat per bar
- * can be moved to two, which is no level of a three-beat bar; the reading
- * it moved from stays the secondary tempo. The level a dance is published
- * at is a convention of the dance as
- * much as a property of the audio -- so where the level matters, offer
- * secondaryTempoBpm to the user rather than trusting tempoBpm alone.
+ * The binary level weights retain their original 454/122/3008 fit. The
+ * rational alternatives use the reconstructed 454/122/3223 collections, with
+ * recording/loop-pack groups kept together in five folds and equal dataset
+ * weights. The first three rows reuse training material: they are descriptive
+ * results, not independent generalisation estimates. The additional ballroom
+ * excerpts were excluded from both fits but were used for earlier slope
+ * validation; they are not a new untouched product-level test set.
+ *
+ * Grouped validation of the added scorer retains the binary coefficients.
+ * Exact loop matches increase from 1630 to 1634 of 3223 and metrical-tolerance
+ * matches from 2150 to 2224; ballroom and Salsa counts are unchanged. This
+ * validates the extension only, since the binary scorer has training overlap.
+ * The small exact-tempo change does not establish a general accuracy gain.
+ * The five fold models are averaged as logits into one scorer before the
+ * additional ballroom check: exact matches stay 181/242, metrical matches
+ * increase from 214 to 215. The descriptive table uses this final scorer.
+ *
+ * Rational period alternatives include 1/3, 2/3, 3/2 and 3 of the proposal,
+ * subject to range and pulse support. They do not identify a time signature.
+ * The level a dance is published at is partly a convention, so callers should
+ * offer secondaryTempoBpm when choosing the metrical level matters.
  *
  * Threading:
  * - prepare(): setup thread (allocates; not concurrent with anything else).
@@ -998,14 +1008,15 @@ private:
     /// whatever its size: the ISMIR 2004 ballroom set (454 excerpts), the
     /// Salsa Dataset (122 recordings, tempo from the beat annotations) and
     /// Freesound Loops 4k (3008 loops). These are the original fit's subsets,
-    /// not the expanded evaluation set documented above. The three-candidate
-    /// model does not identify a ternary metre; that limitation remains in
-    /// the recorded-music results above.
+    /// not the expanded evaluation set documented above. This binary ranking
+    /// is retained as the reference for the rational alternatives below.
     static constexpr int kLevelCandidates = 3;
     static constexpr int kLevelMiddle = 1;
     static constexpr size_t kLevelRawFeatures = 18;
     static constexpr size_t kLevelShareAtPeriod = 1;   ///< Full envelope, at the period.
+    static constexpr size_t kLevelBalancedShareAtPeriod = 2; ///< Balanced envelope.
     static constexpr size_t kLevelShareAtDouble = 7;   ///< Full envelope, at twice it.
+    static constexpr size_t kLevelShareAtTriple = 14;  ///< Full envelope, at three times it.
     static constexpr std::array<double, kLevelCandidates> kLevelMultiples = { 0.5, 1.0, 2.0 };
     static constexpr std::array<double, kLevelCandidates> kLevelBias = {
         -0.975336646, +0.092188351, +0.883148294 };
@@ -1026,16 +1037,46 @@ private:
         +4.361899112, -4.360371230, -0.993521862,
         // Log tempo squared: the tapping preference.
         -2.979577030 };
+    /// Rational alternatives compare against the retained binary winner.
+    /// A positive logit predicts an advantage in exact-tempo correctness;
+    /// equal-correctness pairs contribute no preference to the fit. The same
+    /// 37 features use differences from that binary winner, not the proposal.
+    /// Five recording/loop-pack-grouped fits, with equal dataset weights and
+    /// L2=0.003, are averaged as logits and folded into one runtime scorer.
+    /// The reconstructed 454/122/3223 datasets and separate validation are
+    /// described in the file documentation. No new signal buffer is needed.
+    static constexpr std::array<double, 4> kTernaryMultiples = {
+        1.0 / 3.0, 2.0 / 3.0, 1.5, 3.0 };
+    static constexpr std::array<double, 4> kTernaryBias = {
+        0.53602663631392855, -0.44218443943636193, -0.98844100123510192,
+        -4.3780218173667675 };
+    static constexpr std::array<double, 2 * kLevelRawFeatures + 1> kTernaryWeights = {
+        0.135530296867787, 1.516476106187614, 0.50512741958750595,
+        -3.2226909770906635, 0.76647827698580318, -0.5179245237669392,
+        1.354793380662362, -2.8513739655680381, -2.7957191619709669,
+        -0.93155463697868401, -0.59124401355810241, 0.57664680014957181,
+        -0.83331592757939144, -0.92868430654211009, 0.72147135283011565,
+        1.342529710852844, -0.78142066296951229, 2.2830394447846869,
+        -0.71810354059356818, 0.89986068541218478, 0.41744186276874551,
+        1.3685809837441467, 1.8839328472219159, -0.48244306625392142,
+        0.89516613728223393, -0.60386251174497119, 1.8096407974850166,
+        2.9213215771564656, 4.4113655210180074, 3.2066836727020585,
+        2.0230309593047608, 2.7743701263252531, -2.8072203231223085,
+        -0.60235479209693188, 0.10118126378289685, -2.5817564678948961,
+        -0.67204847147376856 };
+
     /// Least contrast between alternate beats of the proposed reading --
     /// pulseShare() at twice its period over pulseShare() at its period --
-    /// for the level model to be consulted at all. The model reads the
+    /// for the binary model to be consulted. The model reads the
     /// relations between metrical levels, and where alternate beats are
     /// indistinguishable there are none to read: the level above the proposal
     /// has no accent to find, and the level below it adds events the signal
     /// does not have. Every signal of the acceptance corpus (clicks, swing,
     /// quiet subdivisions) measures 0.07 or less, where the proposal is right
     /// by construction; 98% of the ballroom and salsa recordings and 85% of
-    /// the loops measure more. Below the floor the proposal stands.
+    /// the loops measure more. The rational alternatives can also use the
+    /// corresponding contrast at three times the period, and require their
+    /// own pulse support before challenging the retained binary reading.
     static constexpr double kLevelContrastFloor = 0.1;
     /// Window of pulseShare(), in periods of the pulse it measures.
     static constexpr double kLevelWindowBeats = 8.0;
@@ -1620,33 +1661,40 @@ private:
      */
     [[nodiscard]] double coherence(double periodFrames) const
     {
-        const int n = static_cast<int>(env_.size());
+        return coherence(env_, periodFrames);
+    }
+
+    [[nodiscard]] double coherence(const WorkVector<double>& envelope,
+                                    double periodFrames) const
+    {
+        const int n = static_cast<int>(envelope.size());
         if (n < 2 || !(periodFrames > 1.0)) return 0.0;
 
         const int win = std::max(4, static_cast<int>(std::lround(kCoherenceWindowBeats
                                                                  * periodFrames)));
-        if (win > n) return coherenceWindow(0, n, periodFrames);
+        if (win > n) return coherenceWindow(envelope, 0, n, periodFrames);
 
         const int step = std::max(1, win / 2);
         double acc = 0.0;
         int count = 0;
         for (int start = 0; start + win <= n; start += step)
         {
-            acc += coherenceWindow(start, start + win, periodFrames);
+            acc += coherenceWindow(envelope, start, start + win, periodFrames);
             ++count;
         }
-        if (count == 0) return coherenceWindow(0, n, periodFrames);
+        if (count == 0) return coherenceWindow(envelope, 0, n, periodFrames);
         return acc / static_cast<double>(count);
     }
 
-    [[nodiscard]] double coherenceWindow(int from, int to, double periodFrames) const
+    [[nodiscard]] double coherenceWindow(const WorkVector<double>& envelope,
+                                          int from, int to, double periodFrames) const
     {
         const double w = 2.0 * static_cast<double>(pi<double>) / periodFrames;
         double re = 0.0, im = 0.0, mass = 0.0;
         for (int i = from; i < to; ++i)
         {
             if ((i & 4095) == 0) checkOfflineWork();
-            const double v = env_[static_cast<size_t>(i)];
+            const double v = envelope[static_cast<size_t>(i)];
             const double a = w * static_cast<double>(i);
             re += v * std::cos(a);
             im -= v * std::sin(a);
@@ -1654,6 +1702,23 @@ private:
         }
         if (!(mass > kMassFloor)) return 0.0;
         return std::min(1.0, std::sqrt(re * re + im * im) / mass);
+    }
+
+    /** @brief Adjudicated and explanatory scores over the same envelope. */
+    [[nodiscard]] std::array<double, 2> offlineCandidateScores(
+        const WorkVector<double>& envelope, double period) const
+    {
+        const double centre = kPriorCentreSeconds * frameRate_;
+        const double lg = std::log2(period / centre) / kPriorWidthOctaves;
+        const double base = std::exp(-0.5 * lg * lg) * coherence(envelope, period);
+        double adjudicated = base, explains = base;
+        for (const double multiple : kHarmonicDivisors)
+        {
+            const double share = coherence(envelope, multiple * period);
+            adjudicated *= (1.0 - std::min(1.0, levelRatio(period, multiple) * share));
+            explains *= (1.0 - std::min(1.0, share));
+        }
+        return { adjudicated, explains };
     }
 
     /**
@@ -1757,17 +1822,9 @@ private:
         for (size_t k = 0; k < candidates_.size(); ++k)
         {
             const double tau = refineLag(candidates_[k]);
-            const double lg = std::log2(tau / centre) / kPriorWidthOctaves;
-            const double base = std::exp(-0.5 * lg * lg) * coherence(tau);
-            double adjudicated = base, explains = base;
-            for (const double m : kHarmonicDivisors)
-            {
-                const double c = coherence(m * tau);
-                adjudicated *= (1.0 - std::min(1.0, levelRatio(tau, m) * c));
-                explains *= (1.0 - std::min(1.0, c));
-            }
-            candScore_[k] = adjudicated;
-            candExplains_[k] = explains;
+            const auto scores = offlineCandidateScores(env_, tau);
+            candScore_[k] = scores[0];
+            candExplains_[k] = scores[1];
         }
 
         size_t k1 = 0;
@@ -1841,74 +1898,137 @@ private:
         return static_cast<double>(lag) + d;
     }
 
+    /** @brief Shared measurements for a proposed metrical period. */
+    [[nodiscard]] std::array<double, kLevelRawFeatures> levelFeatures(
+        double period, const WorkVector<double>& balanced) const noexcept
+    {
+        std::array<double, kLevelRawFeatures> features {};
+        size_t k = 0;
+        features[k++] = std::log2(periodToBpm(period) / 120.0);
+        features[k++] = pulseShare(env_, period);
+        features[k++] = pulseShare(balanced, period);
+        for (const auto& r : envReg_) features[k++] = pulseShare(r, period);
+        features[k++] = pulseShare(env_, 2.0 * period);
+        for (const auto& r : envReg_) features[k++] = pulseShare(r, 2.0 * period);
+        features[k++] = repetition(env_, period);
+        features[k++] = repetition(balanced, period);
+        features[k++] = pulseShare(env_, 3.0 * period);
+        features[k++] = pulseShare(envReg_[0], 3.0 * period);
+        features[k++] = pulseShare(balanced, 2.0 * period);
+        features[k++] = pulseShare(balanced, 3.0 * period);
+        return features;
+    }
+
     /**
-     * @brief Settles the metrical level: which of the proposed period, its
-     *        half and its double is the beat.
+     * @brief Selects the binary metrical reading, then considers rational
+     *        alternatives supported by a pulse of their own.
      *
-     * The three readings explain the same events, so what separates them is
-     * how each one's pulse sits in the signal -- whether the bass and the
-     * cymbals keep it too, whether the level above it is as regular as it
-     * is -- and at what rate a listener taps. A hand-tuned tapping preference
-     * gets the level right on 63% of the ballroom set and can be moved
-     * nowhere that gets more right; the relations between these measurements
-     * carry what the preference alone does not, and their weights are fitted
-     * to annotated recordings rather than chosen (see kLevelWeights).
+     * The binary scorer retains its coefficients and alternate-beat gate.
+     * Third/triple and two-against-three periods can then challenge its winner
+     * when binary or ternary accents exist. A new reading also needs coherent
+     * register-balanced pulse support: autocorrelation alone can favor an
+     * interval whose pulses cancel, such as half the triplet rate.
      *
-     * Nothing moves where the proposal's alternate beats cannot be told apart
-     * (kLevelContrastFloor). A reading outside the range in force is never
-     * chosen. When the level moves, the reading it moved from becomes the
-     * reported alternative.
+     * Candidates stay within the active period range. A winning rational
+     * alternative reports the binary winner as secondary; otherwise the
+     * original binary decision and its secondary are preserved.
      */
-    void chooseMetricalLevel(int iLo, int iHi, double& tau1, double& tau2) const
+    void chooseMetricalLevel(int iLo, int iHi, double& tau1, double& tau2)
     {
         const double pMin = bankPeriod_[static_cast<size_t>(iLo)];
         const double pMax = bankPeriod_[static_cast<size_t>(iHi)];
-        const WorkVector<double>& bal = (envBal_.size() == env_.size()) ? envBal_ : env_;
-
+        const WorkVector<double>& balanced = (envBal_.size() == env_.size()) ? envBal_ : env_;
         std::array<std::array<double, kLevelRawFeatures>, kLevelCandidates> raw {};
         for (int c = 0; c < kLevelCandidates; ++c)
+            raw[static_cast<size_t>(c)] = levelFeatures(
+                tau1 * kLevelMultiples[static_cast<size_t>(c)], balanced);
+
+        const auto& proposed = raw[static_cast<size_t>(kLevelMiddle)];
+        if (!(proposed[kLevelShareAtPeriod] > 0.0)) return;
+        const double contrastFloor = kLevelContrastFloor * proposed[kLevelShareAtPeriod];
+        int best = kLevelMiddle;
+        if (proposed[kLevelShareAtDouble] >= contrastFloor)
         {
-            const double p = tau1 * kLevelMultiples[static_cast<size_t>(c)];
-            auto& f = raw[static_cast<size_t>(c)];
-            size_t k = 0;
-            f[k++] = std::log2(periodToBpm(p) / 120.0);
-            f[k++] = pulseShare(env_, p);
-            f[k++] = pulseShare(bal, p);
-            for (const auto& r : envReg_) f[k++] = pulseShare(r, p);
-            f[k++] = pulseShare(env_, 2.0 * p);
-            for (const auto& r : envReg_) f[k++] = pulseShare(r, 2.0 * p);
-            f[k++] = repetition(env_, p);
-            f[k++] = repetition(bal, p);
-            f[k++] = pulseShare(env_, 3.0 * p);
-            f[k++] = pulseShare(envReg_[0], 3.0 * p);
-            f[k++] = pulseShare(bal, 2.0 * p);
-            f[k++] = pulseShare(bal, 3.0 * p);
+            best = -1;
+            double bestScore = 0.0;
+            for (int c = 0; c < kLevelCandidates; ++c)
+            {
+                const double period = tau1 * kLevelMultiples[static_cast<size_t>(c)];
+                if (c != kLevelMiddle && (period < pMin || period > pMax)) continue;
+                const auto& f = raw[static_cast<size_t>(c)];
+                double score = kLevelBias[static_cast<size_t>(c)];
+                for (size_t j = 0; j < kLevelRawFeatures; ++j)
+                    score += kLevelWeights[j] * f[j]
+                           + kLevelWeights[kLevelRawFeatures + j] * (f[j] - proposed[j]);
+                score += kLevelWeights[2 * kLevelRawFeatures] * f[0] * f[0];
+                if (best < 0 || score > bestScore) { best = c; bestScore = score; }
+            }
         }
 
-        const auto& m = raw[static_cast<size_t>(kLevelMiddle)];
-        if (!(m[kLevelShareAtPeriod] > 0.0)
-            || m[kLevelShareAtDouble] < kLevelContrastFloor * m[kLevelShareAtPeriod])
-            return;
-
-        int best = -1;
-        double bestScore = 0.0;
-        for (int c = 0; c < kLevelCandidates; ++c)
+        const double binaryPeriod = tau1 * kLevelMultiples[static_cast<size_t>(best)];
+        double chosenPeriod = binaryPeriod;
+        bool ternaryChosen = false;
+        std::array<double, kTernaryMultiples.size()> supportedPeriods {};
+        size_t supportedCount = 0;
+        if (std::max(proposed[kLevelShareAtDouble], proposed[kLevelShareAtTriple]) >= contrastFloor)
         {
-            const double p = tau1 * kLevelMultiples[static_cast<size_t>(c)];
-            if (c != kLevelMiddle && (p < pMin || p > pMax)) continue;
-            const auto& f = raw[static_cast<size_t>(c)];
-            double s = kLevelBias[static_cast<size_t>(c)];
-            for (size_t j = 0; j < kLevelRawFeatures; ++j)
-                s += kLevelWeights[j] * f[j]
-                   + kLevelWeights[kLevelRawFeatures + j] * (f[j] - m[j]);
-            s += kLevelWeights[2 * kLevelRawFeatures] * f[0] * f[0];
-            if (best < 0 || s > bestScore) { best = c; bestScore = s; }
+            const auto& reference = raw[static_cast<size_t>(best)];
+            double bestGain = 0.0;
+            for (size_t c = 0; c < kTernaryMultiples.size(); ++c)
+            {
+                const double period = tau1 * kTernaryMultiples[c];
+                if (period < pMin || period > pMax) continue;
+                const auto f = levelFeatures(period, balanced);
+                if (f[kLevelBalancedShareAtPeriod] < kMinFundamentalCoherence) continue;
+                supportedPeriods[supportedCount++] = period;
+                double gain = kTernaryBias[c];
+                for (size_t j = 0; j < kLevelRawFeatures; ++j)
+                    gain += kTernaryWeights[j] * f[j]
+                          + kTernaryWeights[kLevelRawFeatures + j] * (f[j] - reference[j]);
+                gain += kTernaryWeights[2 * kLevelRawFeatures] * f[0] * f[0];
+                if (gain > bestGain)
+                {
+                    bestGain = gain;
+                    chosenPeriod = period;
+                    ternaryChosen = true;
+                }
+            }
         }
-        if (best != kLevelMiddle)
+        if (ternaryChosen)
+        {
+            tau2 = binaryPeriod;
+            tau1 = chosenPeriod;
+        }
+        else if (best != kLevelMiddle)
         {
             tau2 = tau1;
-            tau1 *= kLevelMultiples[static_cast<size_t>(best)];
+            tau1 = binaryPeriod;
         }
+        if (ternaryChosen || best != kLevelMiddle)
+            refreshMetricalAmbiguity(balanced, tau1, tau2,
+                                    { supportedPeriods.data(), supportedCount });
+    }
+
+    /** @brief Rebase ambiguity with explanatory scores after a level change. */
+    void refreshMetricalAmbiguity(const WorkVector<double>& envelope,
+                                  double chosen, double displaced,
+                                  std::span<const double> addedPeriods)
+    {
+        const double top = offlineCandidateScores(envelope, chosen)[1];
+        double bestOther = 0.0;
+        for (size_t k = 0; k < candidates_.size(); ++k)
+            if (std::abs(std::log2(refineLag(candidates_[k]) / chosen))
+                    >= kCandidateSeparationOctaves)
+                bestOther = std::max(bestOther, candExplains_[k]);
+        const auto consider = [&](double period) {
+            if (period > 0.0 && std::abs(std::log2(period / chosen))
+                                  >= kCandidateSeparationOctaves)
+                bestOther = std::max(bestOther, offlineCandidateScores(envelope, period)[1]);
+        };
+        consider(displaced);
+        for (const double period : addedPeriods) consider(period);
+        secondaryShare_ = top > 0.0 ? std::clamp(bestOther / top, 0.0, 1.0)
+                                   : (bestOther > 0.0 ? 1.0 : 0.0);
     }
 
     /**

@@ -1605,3 +1605,104 @@ DSPARK_TEST(Beat_offline_session_matches_analyze_at_every_block_size)
     bt.reset();
     EXPECT_TRUE(bt.finishOffline().beatSamples.empty());
 }
+
+// A low drum states the beat; three broadband attacks divide every beat.
+// Both the drum rate and its triple are supported readings. A half-subdivision
+// between those attacks can have strong autocorrelation but no coherent pulse.
+namespace {
+Corpus compoundBeatTrain(double bpm)
+{
+    Corpus c;
+    c.bpm = bpm;
+    c.x.assign(static_cast<size_t>(31.0 * kFs), 0.0f);
+    const double period = 60.0 / bpm;
+    for (int beat = 0; 0.5 + beat * period < 30.0; ++beat)
+    {
+        const auto at = static_cast<int64_t>((0.5 + beat * period) * kFs);
+        c.beats.push_back(at);
+        for (int i = 0; i < static_cast<int>(0.25 * kFs)
+                        && at + i < static_cast<int64_t>(c.x.size()); ++i)
+        {
+            const double t = i / kFs;
+            const double phase = 55.0 * t + 2.0 * (1.0 - std::exp(-t / 0.02));
+            c.x[static_cast<size_t>(at + i)] += static_cast<float>(
+                std::sin(twoPi<double> * phase) * std::exp(-t / 0.06));
+        }
+        for (int sub = 0; sub < 3; ++sub)
+            addClick(c.x, at + static_cast<int64_t>(sub * period / 3.0 * kFs),
+                     kFs, sub == 0 ? 1.0f : 0.8f, 83u + static_cast<uint32_t>(sub));
+    }
+    return c;
+}
+} // namespace
+
+DSPARK_TEST(Beat_ternary_readings_follow_real_pulses_and_keep_a_secondary)
+{
+    const Corpus c = compoundBeatTrain(75.0);
+    const auto r = analyzeCorpus(c);
+    const double tempo = static_cast<double>(r.tempoBpm);
+    std::cout << "  compound 75 BPM: tempo " << tempo
+              << ", secondary " << r.secondaryTempoBpm
+              << ", confidence " << r.confidence << '\n';
+    EXPECT_TRUE(std::abs(tempo - 75.0) < 1.0 || std::abs(tempo - 225.0) < 1.0);
+    EXPECT_GT(r.confidence, 0.9f);
+    EXPECT_GT(r.beatSamples.size(), size_t(25));
+    EXPECT_TRUE(r.secondaryTempoBpm >= 40.0f && r.secondaryTempoBpm <= 240.0f);
+    EXPECT_GT(std::abs(std::log2(tempo / static_cast<double>(r.secondaryTempoBpm))), 0.25);
+
+    // A 150 BPM reading inserts beats between the real triplet attacks.
+    size_t aligned = 0;
+    const double attackPeriod = 60.0 / 225.0 * kFs;
+    for (const int64_t sample : r.beatSamples)
+    {
+        const double phase = (static_cast<double>(sample) - 0.5 * kFs) / attackPeriod;
+        if (std::abs(phase - std::round(phase)) * attackPeriod < 0.030 * kFs)
+            ++aligned;
+    }
+    EXPECT_GT(static_cast<double>(aligned) / static_cast<double>(r.beatSamples.size()), 0.95);
+
+    BeatTracker<double> precise;
+    precise.prepare({ kFs, 512, 1 });
+    const std::vector<double> samples(c.x.begin(), c.x.end());
+    const double* preciseAudio = samples.data();
+    const auto rd = precise.analyze(AudioBufferView<const double>(
+        &preciseAudio, 1, static_cast<int>(samples.size())));
+    EXPECT_TRUE(std::abs(rd.tempoBpm - 75.0) < 1.0 || std::abs(rd.tempoBpm - 225.0) < 1.0);
+    EXPECT_GT(rd.confidence, 0.9);
+
+    BeatTracker<float> narrowed;
+    narrowed.prepare({ kFs, 512, 1 });
+    narrowed.setTempoRange(40.0f, 200.0f);
+    const float* audio = c.x.data();
+    const auto restricted = narrowed.analyze(
+        AudioBufferView<const float>(&audio, 1, static_cast<int>(c.x.size())));
+    EXPECT_TRUE(restricted.tempoBpm >= 40.0f && restricted.tempoBpm <= 200.0f);
+    EXPECT_TRUE(restricted.secondaryTempoBpm >= 0.0f && restricted.secondaryTempoBpm <= 200.0f);
+
+    // At 90 BPM the triple is outside the default range. Its half, 135 BPM,
+    // is a repeating interval but has almost no pulse coherence. Keep one
+    // of the supported drum readings instead of promoting that residual.
+    const auto unsupported = analyzeCorpus(compoundBeatTrain(90.0));
+    EXPECT_TRUE(std::abs(unsupported.tempoBpm - 90.0f) < 1.0f
+                || std::abs(unsupported.tempoBpm - 180.0f) < 1.0f);
+}
+
+DSPARK_TEST(Beat_ternary_selection_is_independent_of_offline_blocks)
+{
+    const Corpus c = compoundBeatTrain(75.0);
+    const auto whole = analyzeCorpus(c);
+    BeatTracker<float> tracker;
+    tracker.prepare({ kFs, 512, 1 });
+    for (const size_t block : { size_t(97), size_t(512), size_t(4096) })
+    {
+        tracker.beginOffline(static_cast<int64_t>(c.x.size()));
+        for (size_t at = 0; at < c.x.size(); at += block)
+            tracker.pushOffline(std::span<const float>(
+                c.x.data() + at, std::min(block, c.x.size() - at)));
+        const auto actual = tracker.finishOffline();
+        EXPECT_EQ(actual.tempoBpm, whole.tempoBpm);
+        EXPECT_EQ(actual.secondaryTempoBpm, whole.secondaryTempoBpm);
+        EXPECT_EQ(actual.confidence, whole.confidence);
+        EXPECT_TRUE(actual.beatSamples == whole.beatSamples);
+    }
+}

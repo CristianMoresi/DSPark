@@ -32,6 +32,7 @@ _SYNC_ROOT = "DSPARK_TESTIO_COLLISION_SYNC_ROOT"
 _SYNC_IDENTITY = "DSPARK_TESTIO_COLLISION_SYNC_IDENTITY"
 _SYNC_PARTICIPANTS = "DSPARK_TESTIO_COLLISION_SYNC_PARTICIPANTS"
 _SYNC_TIMEOUT = "DSPARK_TESTIO_COLLISION_SYNC_TIMEOUT_MS"
+_SYNC_ARRIVAL_TIMEOUT = "DSPARK_TESTIO_COLLISION_ARRIVAL_TIMEOUT_MS"
 _SYNC_MUTANT = "DSPARK_TESTIO_COLLISION_SYNC_MUTANT"
 _SYNC_DIAGNOSTICS = {
     "missing-readiness": "DSPARK_TESTIO_SYNC_TIMEOUT: readiness",
@@ -652,14 +653,16 @@ def _start_owned_process(
 def _launch(executable: Path, copies: int, shared: Path,
             temporary_parent: Path, log_directory: Path,
             timeout_seconds: int, synchronization_root: Path | None,
-            synchronization_mutant: str | None
+            synchronization_mutant: str | None,
+            arguments: tuple[str, ...] = (),
             ) -> dict[str, object]:
     base_environment = dict(os.environ)
     base_environment.update(
         {variable: os.fspath(temporary_parent) for variable in ("TMPDIR", "TMP", "TEMP")}
     )
     for variable in (
-        _SYNC_ROOT, _SYNC_IDENTITY, _SYNC_PARTICIPANTS, _SYNC_TIMEOUT, _SYNC_MUTANT
+        _SYNC_ROOT, _SYNC_IDENTITY, _SYNC_PARTICIPANTS, _SYNC_TIMEOUT,
+        _SYNC_ARRIVAL_TIMEOUT, _SYNC_MUTANT
     ):
         base_environment.pop(variable, None)
 
@@ -688,6 +691,9 @@ def _launch(executable: Path, copies: int, shared: Path,
                 environment[_SYNC_IDENTITY] = str(identity)
                 environment[_SYNC_PARTICIPANTS] = str(copies)
                 environment[_SYNC_TIMEOUT] = "1000" if synchronization_mutant else "30000"
+                # Arrival is not a short collision-protocol phase. The whole
+                # process tree is still bounded by the unchanged run deadline.
+                environment[_SYNC_ARRIVAL_TIMEOUT] = str(min(timeout_seconds * 1000, 2**31 - 1))
                 if (synchronization_mutant in ("missing-readiness", "missing-attempted")
                         and index == copies - 1):
                     environment[_SYNC_MUTANT] = synchronization_mutant
@@ -695,7 +701,7 @@ def _launch(executable: Path, copies: int, shared: Path,
             stderr_path = log_directory / f"copy-{index}.stderr"
             with stdout_path.open("wb") as stdout_stream, stderr_path.open("wb") as stderr_stream:
                 process = _start_owned_process(
-                    [os.fspath(executable)], shared, environment,
+                    [os.fspath(executable), *arguments], shared, environment,
                     stdout_stream, stderr_stream,
                     log_directory / f"copy-{index}.release",
                 )
@@ -1170,6 +1176,145 @@ def _windows_process_tree_self_test() -> int:
     return 0 if record["status"] == "PASS" else 1
 
 
+def _collision_rendezvous_self_test() -> int:
+    """Exercise the real TestIO barrier with delayed and missing participants."""
+    record: dict[str, object] = {"status": "FAIL", "cases": [], "build_commands": []}
+    repo = Path(__file__).resolve().parents[1]
+    root = Path(tempfile.mkdtemp(prefix="dspark-collision-rendezvous-")).resolve()
+    # The cleanup target is exactly this freshly owned temporary directory.
+    if root.parent != Path(tempfile.gettempdir()).resolve():
+        raise RuntimeError("unexpected rendezvous scratch parent")
+    try:
+        source = (repo / "tests/TestIO.cpp").read_text(encoding="ascii")
+        call = "    waitForTestIOArrival(sync);"
+        if source.count(call) != 1:
+            raise RuntimeError("arrival negative-control anchor changed")
+        (root / "TestIO-no-arrival.cpp").write_text(source.replace(
+            call, "    if (sync.participants == 0) waitForTestIOArrival(sync);"), encoding="ascii")
+        fixture = r'''#include "tests/TestIO.cpp"
+int main(int argc, char** argv)
+{
+    const auto sync = testIOCollisionSynchronization();
+    const std::string scenario = argc > 1 ? argv[1] : "aligned";
+    // Shorten only this standalone regression fixture, never the full suite.
+#if defined(_WIN32)
+    if (_putenv_s(testIOSyncTimeoutVariable, "500") != 0) return 2;
+#else
+    if (setenv(testIOSyncTimeoutVariable, "500", 1) != 0) return 2;
+#endif
+    if (sync.identity == 2 && (scenario == "delayed" || scenario == "stalled"))
+    {
+        // Wait until both early peers are inside the real barrier. The mutant
+        // has no arrival gate, so its readiness markers establish entry.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (countTestIOSyncDirectories(sync, "arrived-", "arrival") < 2
+               && countTestIOReady(sync) < 2)
+        {
+            if (std::chrono::steady_clock::now() >= deadline) return 3;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(scenario == "stalled" ? 60000 : 1500));
+    }
+    return dspark::test::runAll("TestIO_process_temporary_root_is_exclusive");
+}
+'''
+        (root / "candidate.cpp").write_text(fixture, encoding="ascii")
+        (root / "legacy.cpp").write_text(fixture.replace(
+            '#include "tests/TestIO.cpp"', '#include "TestIO-no-arrival.cpp"'), encoding="ascii")
+        (root / "CMakeLists.txt").write_text('''cmake_minimum_required(VERSION 3.20)
+project(TestIORendezvous LANGUAGES CXX)
+find_package(Threads REQUIRED)
+foreach(target candidate legacy)
+  add_executable(${target} ${target}.cpp)
+  target_compile_features(${target} PRIVATE cxx_std_20)
+  target_compile_definitions(${target} PRIVATE DSPARK_TESTIO_FIXED_NAME_MUTANT=1
+                            DSPARK_TEST_FIXTURE_DIR="$REPO/tests/fixtures")
+  target_include_directories(${target} PRIVATE "$REPO" "$REPO/tests")
+  target_link_libraries(${target} PRIVATE Threads::Threads)
+  if(MSVC)
+    target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(${target} PRIVATE /W4 /WX /wd4324 /bigobj)
+  else()
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  endif()
+endforeach()
+'''.replace("$REPO", repo.as_posix()), encoding="ascii")
+        build = root / "build"
+        compiler = os.environ.get("CXX", "cl" if os.name == "nt" else "c++")
+        configure = ["cmake", "-S", str(root), "-B", str(build),
+                     "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_CXX_COMPILER={compiler}"]
+        if shutil.which("ninja"):
+            configure.extend(("-G", "Ninja"))
+        history = record["build_commands"]
+        assert isinstance(history, list)
+        _run(configure, configure, root, "configure", history)
+        command = ["cmake", "--build", str(build), "--config", "Release", "--parallel", "2"]
+        _run(command, command, root, "build", history)
+        binaries: dict[str, Path] = {}
+        for name in ("candidate", "legacy"):
+            matches = list(build.rglob(name + (".exe" if os.name == "nt" else "")))
+            if len(matches) != 1:
+                raise RuntimeError(f"expected one {name} executable")
+            binaries[name] = matches[0]
+        cases = [
+            ("aligned", "candidate", "aligned", None, 15),
+            ("delayed", "candidate", "delayed", None, 15),
+            ("no-arrival-negative-control", "legacy", "delayed", None, 15),
+            ("missing-readiness", "candidate", "aligned", "missing-readiness", 15),
+            ("missing-attempted", "candidate", "aligned", "missing-attempted", 15),
+            ("duplicate-identity", "candidate", "aligned", "duplicate-identity", 15),
+            ("stalled-arrival-watchdog", "candidate", "stalled", None, 2),
+        ]
+        for name, binary, scenario, mutant, budget in cases:
+            directory = root / name
+            shared, temporary, logs, sync = (directory / n for n in ("shared", "temporary", "logs", "sync"))
+            for path in (shared, temporary, logs, sync):
+                path.mkdir(parents=True)
+            outcome = _launch(binaries[binary], 3, shared, temporary, logs,
+                              budget, sync, mutant, (scenario,))
+            _validate_process_cleanup({"results": outcome["results"]})
+            if outcome["launch_error"] is not None:
+                raise RuntimeError(str(outcome["launch_error"]))
+            errors = "\n".join(path.read_text(encoding="utf-8", errors="replace")
+                               for _, path in outcome["log_paths"])
+            if name == "stalled-arrival-watchdog":
+                if not outcome["timed_out"]:
+                    raise RuntimeError("stalled participant escaped the run watchdog")
+            elif outcome["timed_out"]:
+                raise RuntimeError(f"unexpected run timeout: {name}")
+            elif mutant:
+                if _SYNC_DIAGNOSTICS[mutant] not in str(outcome["early_diagnostic"]):
+                    raise RuntimeError(f"missing synchronization diagnostic: {name}")
+            elif binary == "legacy":
+                if "DSPARK_TESTIO_SYNC_TIMEOUT: readiness" not in errors:
+                    raise RuntimeError("arrival-race negative control did not fail")
+            else:
+                outcomes = _synchronization_outcomes(sync, 3)
+                if list(outcomes.values()).count("winner") != 1:
+                    raise RuntimeError(f"expected exactly one atomic winner: {outcomes}")
+                for child in outcome["results"]:
+                    winner = outcomes[child["identity"]] == "winner"
+                    suite = child["suite"]
+                    summary = suite["summary"]
+                    if (summary is None or summary["total"] != 1
+                            or summary["passed"] != int(winner)
+                            or summary["failed"] != int(not winner)
+                            or child["exit"] != int(not winner)
+                            or suite["exception_tests"]
+                            or suite["failed_tests"] != ([] if winner else [_ATOMIC_CLAIM_TEST])):
+                        raise RuntimeError(f"unexpected rendezvous result: {child}")
+                if any(temporary.iterdir()) or any(shared.iterdir()):
+                    raise RuntimeError("successful rendezvous left temporary files")
+            record["cases"].append({"name": name, "status": "PASS"})
+        record["status"] = "PASS"
+    except BaseException as error:
+        record["terminal"] = f"{type(error).__name__}: {error}"
+    finally:
+        _remove_tree_patiently(root)
+    print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+    return 0 if record["status"] == "PASS" else 1
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     if args.copies < 3 or args.copies > _MAX_COPIES:
         _reject(f"copies must be in [3, {_MAX_COPIES}]")
@@ -1197,6 +1342,8 @@ def _parse_args() -> argparse.Namespace:
         "--self-test-windows-process-tree", action="store_true",
         help="run the bounded native-Windows Job Object ownership control",
     )
+    parser.add_argument("--self-test-collision-rendezvous", action="store_true",
+                        help="prove delayed arrivals, protocol faults and the run watchdog")
     parser.add_argument("--copies", type=int, default=3)
     parser.add_argument("--working-directory", choices=("shared",), default="shared")
     parser.add_argument("--mutant", choices=("fixed-testio-names",))
@@ -1423,6 +1570,11 @@ def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == _WINDOWS_SELF_TEST_DESCENDANT:
         return _windows_self_test_descendant(sys.argv[2:])
     args = _parse_args()
+    if args.self_test_collision_rendezvous:
+        if len(sys.argv) != 2:
+            print("--self-test-collision-rendezvous accepts no other options", file=sys.stderr)
+            return 1
+        return _collision_rendezvous_self_test()
     if args.self_test_windows_process_tree:
         if len(sys.argv) != 2:
             print(json.dumps({

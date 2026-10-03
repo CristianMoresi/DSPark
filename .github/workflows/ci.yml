@@ -531,6 +531,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Prove collision synchronization with delayed arrivals
+        run: python3 tools/run_concurrent_test_suites.py --self-test-collision-rendezvous
       - name: Run three complete suites from one working directory
         run: >
           python3 tools/run_concurrent_test_suites.py

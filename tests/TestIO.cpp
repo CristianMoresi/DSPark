@@ -110,6 +110,8 @@ constexpr const char* testIOSyncParticipantsVariable =
     "DSPARK_TESTIO_COLLISION_SYNC_PARTICIPANTS";
 constexpr const char* testIOSyncTimeoutVariable =
     "DSPARK_TESTIO_COLLISION_SYNC_TIMEOUT_MS";
+constexpr const char* testIOArrivalTimeoutVariable =
+    "DSPARK_TESTIO_COLLISION_ARRIVAL_TIMEOUT_MS";
 constexpr const char* testIOSyncMutantVariable =
     "DSPARK_TESTIO_COLLISION_SYNC_MUTANT";
 
@@ -119,6 +121,7 @@ struct TestIOCollisionSynchronization
     uint64_t identity = 0;
     uint64_t participants = 0;
     std::chrono::milliseconds timeout { 0 };
+    std::chrono::milliseconds arrivalTimeout { 0 };
     std::string mutant;
 };
 
@@ -157,11 +160,16 @@ TestIOCollisionSynchronization testIOCollisionSynchronization()
         testIOSyncParticipantsVariable);
     const uint64_t timeoutMilliseconds = parseTestIOSyncUnsigned(
         std::getenv(testIOSyncTimeoutVariable), testIOSyncTimeoutVariable);
+    const uint64_t arrivalMilliseconds = parseTestIOSyncUnsigned(
+        std::getenv(testIOArrivalTimeoutVariable), testIOArrivalTimeoutVariable);
     if (sync.participants < 2 || sync.participants > 64
         || sync.identity >= sync.participants
-        || timeoutMilliseconds == 0 || timeoutMilliseconds > 60000)
+        || timeoutMilliseconds == 0 || timeoutMilliseconds > 60000
+        || arrivalMilliseconds == 0
+        || arrivalMilliseconds > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()))
         throw std::runtime_error("DSPARK_TESTIO_SYNC_ERROR: invalid synchronization bounds");
     sync.timeout = std::chrono::milliseconds(timeoutMilliseconds);
+    sync.arrivalTimeout = std::chrono::milliseconds(arrivalMilliseconds);
     if (const char* mutant = std::getenv(testIOSyncMutantVariable))
         sync.mutant = mutant;
     if (!sync.mutant.empty() && sync.mutant != "missing-readiness"
@@ -195,16 +203,22 @@ bool testIOSyncDirectoryExists(const std::filesystem::path& path,
                              + " scan failed: " + ec.message());
 }
 
-size_t countTestIOReady(const TestIOCollisionSynchronization& sync)
+size_t countTestIOSyncDirectories(const TestIOCollisionSynchronization& sync,
+                                  const char* prefix, const char* phase)
 {
     size_t observed = 0;
     for (uint64_t id = 0; id < sync.participants; ++id)
     {
         const bool exists = testIOSyncDirectoryExists(
-            sync.root / ("ready-" + std::to_string(id)), "readiness");
+            sync.root / (prefix + std::to_string(id)), phase);
         if (exists) ++observed;
     }
     return observed;
+}
+
+size_t countTestIOReady(const TestIOCollisionSynchronization& sync)
+{
+    return countTestIOSyncDirectories(sync, "ready-", "readiness");
 }
 
 size_t countTestIOAttempted(const TestIOCollisionSynchronization& sync)
@@ -227,9 +241,9 @@ size_t countTestIOAttempted(const TestIOCollisionSynchronization& sync)
 
 template <typename Counter>
 size_t waitForTestIOSyncPhase(const TestIOCollisionSynchronization& sync,
-                              Counter counter)
+                              Counter counter, std::chrono::milliseconds timeout)
 {
-    const auto deadline = std::chrono::steady_clock::now() + sync.timeout;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;)
     {
         const size_t observed = counter(sync);
@@ -237,6 +251,27 @@ size_t waitForTestIOSyncPhase(const TestIOCollisionSynchronization& sync,
         if (std::chrono::steady_clock::now() >= deadline) return observed;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+}
+
+void waitForTestIOArrival(const TestIOCollisionSynchronization& sync)
+{
+    // Earlier tests can finish at different times in each process. Arrival
+    // uses the runner's existing whole-suite budget; its process-tree watchdog
+    // remains the outer limit. Start the short protocol deadlines only after
+    // all participants have reached this test, including deliberate mutants.
+    publishTestIOSyncDirectory(
+        sync.root / ("arrived-" + std::to_string(sync.identity)),
+        "DSPARK_TESTIO_SYNC_ERROR: duplicate process identity "
+            + std::to_string(sync.identity));
+    const size_t arrived = waitForTestIOSyncPhase(sync,
+        [](const auto& context) {
+            return countTestIOSyncDirectories(context, "arrived-", "arrival");
+        }, sync.arrivalTimeout);
+    if (arrived != sync.participants)
+        throw std::runtime_error(
+            "DSPARK_TESTIO_SYNC_TIMEOUT: arrival expected="
+            + std::to_string(sync.participants) + " observed="
+            + std::to_string(arrived));
 }
 
 } // namespace
@@ -257,12 +292,13 @@ DSPARK_TEST(TestIO_process_temporary_root_is_exclusive)
     // the winner's claim live until every participant has attempted it.
 #if defined(DSPARK_TESTIO_FIXED_NAME_MUTANT)
     const TestIOCollisionSynchronization sync = testIOCollisionSynchronization();
+    waitForTestIOArrival(sync);
     if (sync.mutant != "missing-readiness")
         publishTestIOSyncDirectory(
             sync.root / ("ready-" + std::to_string(sync.identity)),
             "DSPARK_TESTIO_SYNC_ERROR: duplicate process identity "
                 + std::to_string(sync.identity));
-    const size_t ready = waitForTestIOSyncPhase(sync, countTestIOReady);
+    const size_t ready = waitForTestIOSyncPhase(sync, countTestIOReady, sync.timeout);
     if (ready != sync.participants)
         throw std::runtime_error(
             "DSPARK_TESTIO_SYNC_TIMEOUT: readiness expected="
@@ -290,7 +326,7 @@ DSPARK_TEST(TestIO_process_temporary_root_is_exclusive)
             sync.root / ("attempted-" + std::to_string(sync.identity)
                          + (acquired ? "-winner" : "-loser")),
             "DSPARK_TESTIO_SYNC_ERROR: duplicate attempted publication");
-    const size_t attempted = waitForTestIOSyncPhase(sync, countTestIOAttempted);
+    const size_t attempted = waitForTestIOSyncPhase(sync, countTestIOAttempted, sync.timeout);
     if (acquired)
     {
         std::filesystem::remove(claim, ec);

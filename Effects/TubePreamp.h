@@ -5,7 +5,7 @@
 
 /**
  * @file TubePreamp.h
- * @brief Tube preamp: Koren 12AX7 stages, WDF tone circuit, supply sag.
+ * @brief Tube preamp: Koren 12AX7 stages, Bassman FMV tone circuit, supply sag.
  *
  * Circuit-level preamp modelling, not a waveshaper:
  *
@@ -14,21 +14,18 @@
  *   voltages outside the table. The tube follows Koren's SPICE model (Koren
  *   1996; published 12AX7 parameters MU=100, EX=1.4, KG1=1060, KP=600,
  *   KVB=300) in a classic common-cathode stage: 300 V supply, 100 k ohm plate
- *   load, 1.5 k ohm cathode resistor with its 22 uF bypass capacitor
- *   integrated trapezoidally - the capacitor state is folded into the
- *   load-line equation, so the table retains the capacitor feedback. Grid
+ *   load, 1.5 k ohm cathode resistor with its 22 uF bypass capacitor. Grid
  *   conduction is approximated by a soft clamp toward +0.7 V (full blocking
  *   distortion needs the input-coupling state and is left for a later pass).
  * - **Supply sag**: the effective B+ droops with smoothed plate current
  *   (one-pole, ~70 ms) times a sag resistance - drive into the stage and
  *   the headroom breathes back, the classic touch response.
  * - **Tone stack**: the full Fender '59 Bassman FMV treble/bass/middle
- *   network, solved exactly as a 12-port WDF R-type adaptor
- *   (wdf::ToneStackFMV - verified sample-exact against the symbolic
- *   transfer function of Yeh & Smith, DAFx-06). The stack sits between the
- *   stages and uses a fixed 38 k ohm source-impedance approximation; its
- *   load is not fed back into the triode solve. Controls interact
- *   non-orthogonally - that is the circuit, not a bug.
+ *   network (wdf::ToneStackFMV, verified against the symbolic transfer
+ *   function of Yeh & Smith, DAFx-06). It sits between the stages with a
+ *   fixed 38 k ohm source-impedance approximation; its load is not fed back
+ *   into the triode solve. Controls interact non-orthogonally - that is the
+ *   circuit, not a bug.
  * - Output level: the circuit's program response at the reference tone
  *   setting is measured once in prepare() (settled channel, pink-weighted
  *   multitone). A 3-section EQ designed from that measurement flattens the
@@ -44,63 +41,88 @@
  * The nonlinear core runs at 2x oversampling by DEFAULT, and the factor is
  * configurable via setOversampling(int) (setup thread only, since it
  * reallocates and re-calibrates like prepare()): 1 = OFF (no internal
- * resampling or ADAA, zero added latency, but the triode/grid nonlinearity then
- * aliases in-band unless you oversample the surrounding chain yourself), 2 =
- * default (group-delay latency reported by getLatency()/getLatencySamples()),
- * 4/8/16 = progressively lower alias floor with higher processing cost.
- * At factors >= 2, each stage antialiases the grid clamp and the implicit
- * plate-current interpolant with antiderivative antialiasing: the grid uses
- * the second-order divided difference (Bilbao et al., IEEE SPL 2017), and
- * the current uses the exact first integral of its bicubic surface.
- * Supply and cathode history are held fixed across each current
- * integral; the averaged current advances the cathode and sag states.
- * Out-of-table voltages use the analytic midpoint solve. This is a discrete
- * circuit approximation, not exact integration of all coupled state motion.
+ * resampling, zero added latency, the original point-sampled circuit; the
+ * triode/grid nonlinearity then aliases in-band unless you oversample the
+ * surrounding chain yourself), 2 = default, 4/8/16 = lower residual error at
+ * higher processing cost. getLatency()/getLatencySamples() report the active
+ * total.
  *
- * A bounded linear-phase Core FIR compensates the ADAA small-signal droop:
- * the minimax inverse of (1-u)*(1-4u/3)^stages, u = sin(w/2)^2, includes
- * the one-stage path's extra half-sample alignment filter. It avoids the
- * unit-circle poles of an exact inverse. FIR residual error is <0.05 dB
- * over the entire base-rate Nyquist band at factors >= 2. Stage-count
- * padding and whole-sample padding keep wet and dry
- * aligned. Total latency for 1/2/4/8/16x is 0/73/98/113/121 base samples,
- * independent of setStages(). At 1x the original point circuit is retained:
- * inverting an ADAA null at the audio Nyquist would require unbounded gain.
- * Use 1x only when the surrounding host chain supplies a suitable high rate.
- * getLatency() always reflects the ACTIVE
- * factor (0 at 1x) so hosts get correct PDC. Measured at 48 kHz over tones
- * from 1 to 20 kHz in 1 kHz steps, plus 12.75/15.25/19.25 kHz, at -6 and
- * -18 dBFS: each tone is moved to the nearest odd bin of a 16384-point FFT.
- * After settling, coherent rectangular DFT measurements exclude only DC
- * and exact physical harmonic bins. In particular, adjacent folded lines
- * are retained. The worst component below 20 kHz, relative to the tone, is:
+ * At factors >= 2 the circuit is solved in continuous time inside each
+ * internal sample interval, and the analog plate voltage is band-limited
+ * ONCE, at the output:
+ * - The stage-1 grid input between internal samples is a least-squares
+ *   Farrow polynomial fitted to the oversampled band (reconstruction error
+ *   about -83 dB at the top of the 2x band).
+ * - Supply and cathode states are held at their predicted interval midpoint
+ *   (their time constants are tens of milliseconds) and advanced exactly
+ *   with the interval-average current.
+ * - Each interval is split where the grid crosses the triode's cutoff,
+ *   conduction and grid-clamp knees; saturated parts are integrated in
+ *   closed form and the rest with Gauss-Legendre nodes, so the cost follows
+ *   the signal rather than a fixed sub-step grid.
+ * - The tone circuit is propagated exactly in its analog modal form
+ *   (wdf::ToneStackFMV::analogStateSpace), including the stiff mode that
+ *   appears near bass 0 / middle 1. The interstage voltage seen by stage 2
+ *   is therefore the continuous circuit trajectory, not an interpolation of
+ *   samples. Stage 2 is split at its own knees in the same way.
+ * - The output projection is an order-6 B-spline kernel, applied through
+ *   per-interval moments, followed by a fixed linear-phase FIR that
+ *   compensates its passband droop. Because the kernel acts only on the
+ *   final output, the compensation is exact at every signal level.
+ *
+ * Total latency for 1/2/4/8/16x is 0/71/99/113/121 base samples,
+ * independent of setStages(); the dry path includes the same delay.
+ * getLatency() always reflects the ACTIVE factor (0 at 1x) so hosts get
+ * correct PDC. At 1x the original point circuit is retained: use 1x only
+ * when the surrounding host chain supplies a suitable high rate.
+ *
+ * Measured at 48 kHz over tones from 1 to 20 kHz in 1 kHz steps, plus
+ * 12.75/15.25/19.25 kHz, at -6 and -18 dBFS: each tone is moved to the
+ * nearest odd bin of a 16384-point FFT. After settling, coherent
+ * rectangular DFT measurements exclude only DC and exact physical harmonic
+ * bins. In particular, adjacent folded lines are retained. The worst
+ * component below 20 kHz, relative to the tone, is:
  *
  *   stages, drive     2x (default)   4x          8x
- *   1, -12 dB        -102.9         -137.9       -135.6
- *   1, 0 dB           -77.3         -118.4       -115.9
- *   1, +12 dB         -56.4          -89.3       -102.3
- *   1, +24 dB         -42.5          -56.2        -79.3
- *   1, +36 dB         -22.5          -38.9        -48.5
- *   2, -12 dB         -96.2         -129.7       -123.0
- *   2, 0 dB           -71.2         -106.2       -104.7
- *   2, +12 dB         -53.6          -78.0        -95.0
- *   2, +24 dB         -36.2          -50.4        -70.4
- *   2, +36 dB         -19.2          -34.2        -44.9
+ *   1, -12 dB        -121.5         -134.3       -134.3
+ *   1, 0 dB           -96.7         -115.0       -115.0
+ *   1, +12 dB         -87.7         -101.4       -101.4
+ *   1, +24 dB         -80.6          -96.4        -96.8
+ *   1, +36 dB         -80.6          -96.4        -96.6
+ *   2, -12 dB        -104.7         -120.8       -120.8
+ *   2, 0 dB           -86.9         -101.5       -103.1
+ *   2, +12 dB         -83.0          -93.9        -96.9
+ *   2, +24 dB         -83.0          -93.9        -96.4
+ *   2, +36 dB         -84.8          -96.4        -96.4
  *
- * A high-gain triode turns a loud top-octave sine into a nearly square wave
- * whose harmonics fall slowly. The worst frequency varies with the setting;
- * testing only 15 kHz misses worse components at other frequencies.
- * High-drive aliasing remains a limitation even at the higher factors:
- * choose a factor from measurements at the intended drive and sample rate.
+ * On the same sweep the former antiderivative-antialiased core reached
+ * -19.2 dBc (two stages, +36 dB, 2x). At 2x the worst value over all
+ * drives is -81.8 dBc at 44.1 kHz and -96.1 dBc at 96 kHz.
  *
- * The current/primitive table is 235016 bytes shared by all channels in an
- * instance. Preparation builds the table and calibrates the circuit;
- * processing and stage changes allocate no memory. The antialiased circuit
- * has a different waveform from the former point-sampled solver. The
- * small-signal transfer and THD signature are verified in the
- * suite: single-stage distortion is 2nd-harmonic dominant (asymmetric
- * triode), DC operating point matches an independent high-precision solve
- * of the same circuit equations (the check SPICE would perform).
+ * Against independent dense solutions of the same circuit equations (the
+ * point circuit at 512x and 1024x the base rate, 78 settings of drive,
+ * level, tone controls and frequency up to 19.9 kHz, including +36 dB),
+ * the 2x waveform error is at most -73.5 dB (median -84.7 dB) with
+ * fundamental errors below 0.002 dB; 4x/8x/16x reach -83.4/-88.8/-93.7 dB.
+ * These figures concern the mathematical circuit model, not measurements of
+ * a physical amplifier.
+ *
+ * Cost follows the signal: intervals are split only where a stage crosses
+ * a knee. For the whole effect, stereo at 48 kHz and 2x, the development
+ * machine measured 3.4-4.6 % of one core without drive or with low-level
+ * or low-frequency material, and 9-11 % for high-frequency or broadband
+ * material at +12..+36 dB: 1.1-2.9x the former core at 2x, and less than
+ * that core needed at 8x. At 4x, 8x and 16x the cost is 1.2-2.1x,
+ * 1.2-1.6x and about 1.4x the former core at the same factor.
+ *
+ * The plate-current table is 156672 bytes shared by all channels in an
+ * instance. Preparation builds the table, designs the modal tone circuit
+ * and calibrates the circuit; processing, tone changes and stage changes
+ * allocate no memory. The suite checks the 2x output against the point
+ * circuit run at 32x the base rate, the 2nd-harmonic dominant single-stage
+ * signature, and the DC operating point against an independent
+ * high-precision solve of the same circuit equations (the check SPICE
+ * would perform).
  *
  * Threading model: parameter setters/getters are std::atomic based and safe
  * from any thread (non-finite values are ignored; changes are published with
@@ -128,7 +150,6 @@
 #include "../Core/SmoothedValue.h"
 #include "../Core/StateBlob.h"
 #include "../Core/WDF.h"
-#include "../Core/detail/LogCosh.h"
 
 #include <algorithm>
 #include <array>
@@ -136,190 +157,26 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <numbers>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace dspark {
 
 /// @cond DSPARK_INTERNAL
 namespace detail {
-    struct TubePreampCompensation
-    {
-        std::array<std::vector<double>, 2> taps;
-        int latency;
-
-        explicit TubePreampCompensation(int factor)
-        {
-            // 1x retains the explicitly unresampled point circuit. Inverting
-            // the ADAA null at that same Nyquist would be unbounded; the
-            // compensated ADAA path requires the selected factor to be >= 2.
-            if (factor == 1)
-            {
-                latency = 0;
-                return;
-            }
-            // Bounded minimax inverse of (1-u)*(1-4u/3)^stages.
-            // Banks store center-out symmetric coefficients. Unity DC is
-            // constrained; passband relative error is <0.05 dB. The maximum
-            // correction over all internal frequencies is <=12.001/36.001
-            // at 2x (one/two stages), <=4.001 at higher factors. No pole or
-            // gain singularity is introduced outside the audio passband.
-            // The extra half-sample average in the one-stage path makes
-            // its phase equal to three internal samples after integer pad.
-            const int order = factor == 2 ? 14 : (factor == 4 ? 4 : 2);
-            latency = (order + 3 + factor - 1) / factor;
-            const int pad = latency * factor - (order + 3);
-            std::array<std::vector<double>, 2> banks;
-            switch (factor)
-            {
-            case 2:
-                banks[0] = {
-                    1.9235629963970406, 0.44648231230742969, -1.5580934002318299,
-                    0.27439449777428138, 0.95396435999096119, -0.27851755188567112,
-                    -1.547981227472137, 2.6229978502006257, -2.1323567229872782,
-                    0.81377578397761241, 0.21025863734304612, -0.50457523628053735,
-                    0.34120770592379895, -0.12455765609373881, 0.021219149234916305
-                };
-                banks[1] = {
-                    4.1949350794813807, 0.44755626226910095, -3.5513262161664114,
-                    -0.059683685251895137, 3.4543837933883861, -1.0019140998285381,
-                    -3.4140408147555226, 3.1993666390142548, 1.9031788564870777,
-                    -6.6025711322194587, 7.1102262654542958, -4.4409762973601534,
-                    1.6511735090435748, -0.29177768662331721, -0.0010629331920828475
-                };
-                break;
-            case 4:
-                banks[0] = {
-                    1.6916530526685123, 0.22926948453401663, -1.0131494471944595,
-                    0.53918417640406124, -0.10113074007787473
-                };
-                banks[1] = {
-                    1.2261507380985748, 0.83046321660400191, -1.3670690928381859,
-                    0.41953678339599815, 0.0039937237888984208
-                };
-                break;
-            case 8:
-                banks[0] = {
-                    2.431527180594093, -0.75, 0.034236409702953496
-                };
-                banks[1] = {
-                    2.6249087461926157, -0.75, -0.062454373096307858
-                };
-                break;
-            case 16:
-                banks[0] = {
-                    2.4201719089187108, -0.75, 0.039914045540644594
-                };
-                banks[1] = {
-                    2.5931625075732305, -0.75, -0.046581253786615262
-                };
-                break;
-            default: break;
-            }
-            for (int stages = 1; stages <= 2; ++stages)
-            {
-                auto& out = taps[static_cast<size_t>(stages - 1)];
-                const auto& bank = banks[static_cast<size_t>(stages - 1)];
-                out.assign(static_cast<size_t>(2 * order + 1 + pad + (stages == 1 ? 2 : 0)), 0.0);
-                for (int j = 0; j <= 2 * order; ++j)
-                {
-                    const double v = bank[static_cast<size_t>(std::abs(j - order))];
-                    const auto index = static_cast<size_t>(j + pad + (stages == 1 ? 1 : 0));
-                    out[index] += stages == 1 ? 0.5 * v : v;
-                    if (stages == 1) out[index + 1] += 0.5 * v;
-                }
-            }
-        }
-    };
-
     struct TubePreampGridClamp
     {
+        /** Identity below 0 V, 0.7*tanh(v/0.7) above (soft clamp toward +0.7 V). */
         static double value(double v) noexcept
         {
-            return v > 0.0 ? 0.7 * std::tanh(v / 0.7) : v;
-        }
-
-        static double primitive(double v) noexcept
-        {
-            return v <= 0.0 ? 0.5 * v * v : 0.49 * logCosh(v / 0.7);
-        }
-
-        static double primitive2(double v) noexcept
-        {
-            return v <= 0.0 ? v * v * v / 6.0 : 0.343 * integralLogCosh(v / 0.7);
-        }
-
-        // Twice the symmetric second divided difference (Bilbao et al.,
-        // IEEE SPL 2017). Sorting keeps the outer denominator well separated.
-        static double divided(double a, double b, double c, double ga, double gb, double gc) noexcept
-        {
-            if (a > b) { std::swap(a, b); std::swap(ga, gb); }
-            if (b > c) { std::swap(b, c); std::swap(gb, gc); }
-            if (a > b) { std::swap(a, b); std::swap(ga, gb); }
-            if (c <= 0.0) return (a + b + c) / 3.0;
-            const double center = (a + b + c) / 3.0;
-            const double span = c - a;
-            if (span < 0.001 && a < 0.0)
-            {
-                // Across zero, the cubic correction exists only on the
-                // positive branch. Integrate it against the exact simplex
-                // density. Three Gauss nodes integrate this quartic exactly;
-                // the omitted fifth-power correction is below 6e-16 V.
-                constexpr double t[] = {0.1127016653792583, 0.5, 0.8872983346207417};
-                constexpr double w[] = {5.0 / 18.0, 4.0 / 9.0, 5.0 / 18.0};
-                double correction = 0.0;
-                for (int half = 0; half < 2; ++half)
-                {
-                    const double lo = half == 0 ? a : b;
-                    const double hi = half == 0 ? b : c;
-                    const double start = std::max(lo, 0.0);
-                    if (hi <= start) continue;
-                    for (int k = 0; k < 3; ++k)
-                    {
-                        const double x = start + t[k] * (hi - start);
-                        const double density = 2.0 * (half == 0 ? x - a : c - x)
-                            / ((hi - lo) * span);
-                        correction -= (hi - start) * w[k] * density * x * x * x / 1.47;
-                    }
-                }
-                return center + correction;
-            }
-            if (span < 0.001 && a >= 0.0)
-            {
-                // Moments of the uniform simplex give a stable local limit,
-                // including curvature instead of flattening tiny variations.
-                const double t = std::tanh(center / 0.7), q = 1.0 - t * t;
-                const double da = a - center, db = b - center, dc = c - center;
-                const double p2 = da * da + db * db + dc * dc;
-                const double p3 = da * da * da + db * db * db + dc * dc * dc;
-                const double f2 = -2.0 * t * q / 0.7;
-                const double f3 = -2.0 * q * (1.0 - 3.0 * t * t) / 0.49;
-                const double f4 = 8.0 * t * q * (2.0 - 3.0 * t * t) / 0.343;
-                return 0.7 * t + f2 * p2 / 24.0 + f3 * p3 / 180.0
-                    + f4 * p2 * p2 / 1440.0;
-            }
-            const double tolerance = 1e-6 * std::max({1.0, std::abs(a), std::abs(c)});
-            if (b - a < tolerance)
-            {
-                const double mid = 0.5 * (a + b), d = c - mid;
-                return 2.0 * ((gc - primitive2(mid)) / d - primitive(mid)) / d;
-            }
-            if (c - b < tolerance)
-            {
-                const double mid = 0.5 * (b + c), d = mid - a;
-                return 2.0 * (primitive(mid) - (primitive2(mid) - ga) / d) / d;
-            }
-            return 2.0 * ((gc - gb) / (c - b) - (gb - ga) / (b - a)) / (c - a);
-        }
-        static double average(double a, double b, double fa, double fb) noexcept
-        {
-            const double mid = 0.5 * (a + b);
-            if ((a <= 0.0 && b <= 0.0)
-                || std::abs(b - a) < 1e-6 * std::max({1.0, std::abs(a), std::abs(b)}))
-                return value(mid);
-            return (fb - fa) / (b - a);
+            if (v <= 0.0) return v;
+            if (v >= 13.0) return 0.7;   // 0.7*(1 - 2e^-37) rounds to 0.7
+            const double e = std::expm1(v * (-2.0 / 0.7));
+            return -0.7 * e / (2.0 + e);
         }
     };
 
@@ -368,18 +225,17 @@ namespace detail {
 
         // With S = B+ - A and G = Vgrid - A, the trapezoidal cathode
         // equation Vk = A + B*Ip leaves a TWO-dimensional implicit load line:
-        // Ip = Koren(S - (RL+B)*Ip, G - B*Ip). B is fixed by prepare's rate.
-        // Use R = G/S to align the cutoff knee across supply voltages. This
-        // needs 235016 bytes including its primitive, with <5e-10 A error
-        // in the independent load-line check.
-        // Tabulate the root and implicit derivatives without quantizing the
-        // capacitor or dropping its feedback. Bicubic Hermite interpolation
-        // keeps current and both first derivatives continuous at cell edges.
+        // Ip = Koren(S - (RL+B)*Ip, G - B*Ip). B is fixed by the rate given
+        // to the constructor: the 1x point circuit passes its sample rate,
+        // the continuous core passes infinity (B = 0) and freezes A per
+        // interval. Use R = G/S to align the cutoff knee across supply
+        // voltages. The 156672-byte table has <5e-10 A error in the
+        // independent load-line check. Bicubic Hermite interpolation keeps
+        // current and both first derivatives continuous at cell edges.
         // Every channel and both calibration passes share this instance.
         struct Node
         {
             double y, ds, dg, dsg;
-            double integral = 0.0, integralS = 0.0;
         };
         static constexpr int kNS = 18, kNG = 272;
         std::array<Node, kNS * kNG> nodes;
@@ -394,8 +250,7 @@ namespace detail {
                     const double s = si <= 6 ? 80.0 + 8.0 * si
                                              : 128.0 + 16.0 * (si - 6);
                     // Tail cells must still resolve the exponential enough
-                    // to keep the cubic nonnegative; integrating a cubic
-                    // and then clipping its point evaluation would disagree.
+                    // to keep the cubic nonnegative.
                     const double r = gi <= 16 ? -0.08 + gi * 0.0025
                         : (gi <= 31 ? -0.04 + (gi - 16) * 0.001
                                     : -0.025 + (gi - 31) / 6400.0);
@@ -407,18 +262,6 @@ namespace detail {
                     n.dsg = ((s + 0.001) * solve(s + 0.001, (s + 0.001) * r).dg
                            - (s - 0.001) * solve(s - 0.001, (s - 0.001) * r).dg) / 0.002;
                     nodes[static_cast<size_t>(si * kNG + gi)] = n;
-                }
-            // Hermite interpolation is linear in the node data. Accumulate
-            // the exact R-integral and its S derivative along each row;
-            // the same S interpolation then integrates the entire surface.
-            for (int si = 0; si < kNS; ++si)
-                for (int gi = 1; gi < kNG; ++gi)
-                {
-                    const auto& a = nodes[static_cast<size_t>(si * kNG + gi - 1)];
-                    auto& b = nodes[static_cast<size_t>(si * kNG + gi)];
-                    const double h = gi <= 16 ? 0.0025 : (gi <= 31 ? 0.001 : 1.0 / 6400.0);
-                    b.integral = a.integral + h * (0.5 * (a.y + b.y) + h * (a.dg - b.dg) / 12.0);
-                    b.integralS = a.integralS + h * (0.5 * (a.ds + b.ds) + h * (a.dsg - b.dsg) / 12.0);
                 }
         }
 
@@ -459,14 +302,10 @@ namespace detail {
             return s >= 80.0 && s < 304.0 && std::isfinite(g) && g < 1.0;
         }
 
-        struct Cell
+        [[nodiscard]] double eval(double s, double g) const noexcept
         {
-            int si, gi;
-            double st, gt, step, rstep;
-        };
-
-        static Cell locate(double s, double g) noexcept
-        {
+            // Below this cutoff the unloaded Koren current is < 1e-27 A.
+            if (g <= -0.08 * s) return 0.0;
             const double step = s < 128.0 ? 8.0 : 16.0;
             const double r = g / s;
             const double rstep = r < -0.04 ? 0.0025 : (r < -0.025 ? 0.001 : 1.0 / 6400.0);
@@ -478,73 +317,367 @@ namespace detail {
             // edge onto that edge. Use the final CELL, with t = 1, there.
             const int si = std::min(static_cast<int>(sp), kNS - 2);
             const int gi = std::min(static_cast<int>(gp), kNG - 2);
-            return {si, gi, sp - si, gp - gi, step, rstep};
+            const double st = sp - si, gt = gp - gi;
+            const Node& a = nodes[static_cast<size_t>(si * kNG + gi)];
+            const Node& b = nodes[static_cast<size_t>((si + 1) * kNG + gi)];
+            const Node& c = nodes[static_cast<size_t>(si * kNG + gi + 1)];
+            const Node& d = nodes[static_cast<size_t>((si + 1) * kNG + gi + 1)];
+            const double p0 = cubic(a.y, b.y, a.ds * step, b.ds * step, st);
+            const double p1 = cubic(c.y, d.y, c.ds * step, d.ds * step, st);
+            const double m0 = rstep * cubic(a.dg, b.dg, a.dsg * step, b.dsg * step, st);
+            const double m1 = rstep * cubic(c.dg, d.dg, c.dsg * step, d.dsg * step, st);
+            return std::max(0.0, cubic(p0, p1, m0, m1, gt));
         }
 
-        // Coefficients in ascending powers of the normalized R coordinate.
-        [[nodiscard]] std::array<double, 4> polynomial(const Cell& q) const noexcept
+        /** @brief The surface restricted to one supply S: the S blend weights
+         *  are computed once, so repeated grid evaluations at a frozen supply
+         *  cost one R cell each. Bit-for-bit the same value as eval(). */
+        struct Slice
         {
-            const Node& a = nodes[static_cast<size_t>(q.si * kNG + q.gi)];
-            const Node& b = nodes[static_cast<size_t>((q.si + 1) * kNG + q.gi)];
-            const Node& c = nodes[static_cast<size_t>(q.si * kNG + q.gi + 1)];
-            const Node& d = nodes[static_cast<size_t>((q.si + 1) * kNG + q.gi + 1)];
-            const double p0 = cubic(a.y, b.y, a.ds * q.step, b.ds * q.step, q.st);
-            const double p1 = cubic(c.y, d.y, c.ds * q.step, d.ds * q.step, q.st);
-            const double m0 = q.rstep * cubic(a.dg, b.dg, a.dsg * q.step, b.dsg * q.step, q.st);
-            const double m1 = q.rstep * cubic(c.dg, d.dg, c.dsg * q.step, d.dsg * q.step, q.st);
-            const double diff = p1 - p0;
-            return {p0, m0, 3.0 * diff - 2.0 * m0 - m1, m0 + m1 - 2.0 * diff};
-        }
+            const Node* row0 = nullptr;
+            const Node* row1 = nullptr;
+            double s = 0.0, invS = 0.0, cut = 0.0;
+            double h00 = 0.0, h01 = 0.0, h10 = 0.0, h11 = 0.0;
+            bool inside = false;
 
-        [[nodiscard]] double eval(double s, double g) const noexcept
-        {
-            // Below this cutoff the unloaded Koren current is < 1e-27 A.
-            if (g <= -0.08 * s) return 0.0;
-            const auto q = locate(s, g);
-            const auto p = polynomial(q);
-            return std::max(0.0, ((p[3] * q.gt + p[2]) * q.gt + p[1]) * q.gt + p[0]);
-        }
-
-        /** Integral along G at fixed S, with zero in deep cutoff. */
-        [[nodiscard]] double primitive(double s, double g) const noexcept
-        {
-            if (g <= -0.08 * s) return 0.0;
-            return primitive(s, locate(s, g));
-        }
-
-        [[nodiscard]] double primitive(double s, const Cell& q) const noexcept
-        {
-            const auto p = polynomial(q);
-            const auto& a = nodes[static_cast<size_t>(q.si * kNG + q.gi)];
-            const auto& b = nodes[static_cast<size_t>((q.si + 1) * kNG + q.gi)];
-            const double base = cubic(a.integral, b.integral,
-                a.integralS * q.step, b.integralS * q.step, q.st);
-            const double t = q.gt;
-            const double part = (((p[3] * 0.25 * t + p[2] / 3.0) * t + p[1] * 0.5) * t + p[0]) * t;
-            return s * (base + q.rstep * part);
-        }
-
-        /** Exact cell average; a local expression avoids primitive cancellation. */
-        [[nodiscard]] double average(double s, double g0, double g1) const noexcept
-        {
-            if (std::max(g0, g1) <= -0.08 * s) return 0.0;
-            if (std::min(g0, g1) > -0.08 * s)
+            void set(const TubePreampCurrentTable& table, double supply) noexcept
             {
-                const auto a = locate(s, g0), b = locate(s, g1);
-                if (a.gi == b.gi)
-                {
-                    const auto p = polynomial(a);
-                    const double m = 0.5 * (a.gt + b.gt), d = b.gt - a.gt;
-                    return std::max(0.0, ((p[3] * m + p[2]) * m + p[1]) * m + p[0]
-                        + (3.0 * p[3] * m + p[2]) * d * d / 12.0);
-                }
-                if (std::abs(g1 - g0) < 1e-6) return eval(s, 0.5 * (g0 + g1));
-                return std::max(0.0, (primitive(s, b) - primitive(s, a)) / (g1 - g0));
+                s = supply;
+                inside = supply >= 80.0 && supply < 304.0;
+                if (!inside) return;
+                invS = 1.0 / supply;
+                cut = -0.08 * supply;
+                const double step = supply < 128.0 ? 8.0 : 16.0;
+                const double sp = supply < 128.0 ? (supply - 80.0) / 8.0
+                                                 : 6.0 + (supply - 128.0) / 16.0;
+                const int si = std::min(static_cast<int>(sp), kNS - 2);
+                const double t = sp - si;
+                h00 = (2.0 * t - 3.0) * t * t + 1.0;
+                h01 = (3.0 - 2.0 * t) * t * t;
+                h10 = step * ((t - 2.0) * t + 1.0) * t;
+                h11 = step * (t - 1.0) * t * t;
+                row0 = table.nodes.data() + si * kNG;
+                row1 = row0 + kNG;
             }
-            if (std::abs(g1 - g0) < 1e-6) return eval(s, 0.5 * (g0 + g1));
-            return std::max(0.0, (primitive(s, g1) - primitive(s, g0)) / (g1 - g0));
+
+            /** @pre inside and g < 1. */
+            [[nodiscard]] double eval(double g) const noexcept
+            {
+                if (g <= cut) return 0.0;
+                const double r = g * invS;
+                double gp, rstep;
+                if (r < -0.04) { gp = (r + 0.08) * 400.0; rstep = 0.0025; }
+                else if (r < -0.025) { gp = 16.0 + (r + 0.04) * 1000.0; rstep = 0.001; }
+                else { gp = 31.0 + (r + 0.025) * 6400.0; rstep = 1.0 / 6400.0; }
+                const int gi = std::min(static_cast<int>(gp), kNG - 2);
+                const double gt = gp - gi;
+                const Node& a = row0[gi];
+                const Node& c = row0[gi + 1];
+                const Node& b = row1[gi];
+                const Node& d = row1[gi + 1];
+                const double p0 = h00 * a.y + h01 * b.y + h10 * a.ds + h11 * b.ds;
+                const double p1 = h00 * c.y + h01 * d.y + h10 * c.ds + h11 * d.ds;
+                const double m0 = rstep * (h00 * a.dg + h01 * b.dg + h10 * a.dsg + h11 * b.dsg);
+                const double m1 = rstep * (h00 * c.dg + h01 * d.dg + h10 * c.dsg + h11 * d.dsg);
+                const double diff = p1 - p0;
+                const double v = (((m0 + m1 - 2.0 * diff) * gt + (3.0 * diff - 2.0 * m0 - m1)) * gt
+                                  + m0) * gt + p0;
+                return v > 0.0 ? v : 0.0;
+            }
+        };
+    };
+
+    /** Fixed coefficients of the continuous-time core for one factor. */
+    struct TubePreampCoreDesign
+    {
+        static constexpr int kKernelOrder = 6;   ///< Order of the output B-spline.
+        int taps = 0;                ///< Farrow taps: x[n-taps/2+1] .. x[n+taps/2].
+        int degree = 0;              ///< Polynomial degree in the interval coordinate.
+        const double* farrow = nullptr;          ///< taps x (degree+1), monomial in tau.
+        /// B-spline piece for output m = n + k, k = -2..3, in powers of (tau - 1/2).
+        std::array<std::array<double, kKernelOrder>, kKernelOrder> kernel {};
+        std::vector<double> compensation;       ///< Linear-phase droop FIR plus padding.
+        int latency = 0;             ///< Base-rate samples added by the core.
+
+        explicit TubePreampCoreDesign(int factor)
+        {
+            // Least-squares Farrow fits over 0..22 kHz at 48 kHz (scaled with
+            // the base rate), interpolating the two interval samples. Max
+            // error vs the ideal band-limited interpolant: -82.8 dB (2x),
+            // -104.2 dB (4x), -108.2 dB (8x), -104.6 dB (16x). The droop
+            // compensation inverts sinc(f)^6 over the same band to better
+            // than 2e-6 dB.
+            static constexpr std::array<double, 100> kFarrow2 = {
+                4.2321905086886495e-10, 0.0059466381516058153, -0.002278523941500805,
+                -0.0054952548957599556, -0.014968825413515578, 0.054109227099701757,
+                -0.078269013079604377, 0.062385435811858708, -0.025290994449854602,
+                0.0038613094605228345, -2.2707239900454428e-09, -0.04509673531374573,
+                0.02130560198974633, 0.044927139987920424, 0.068139628956554815,
+                -0.29034355992063943, 0.41888697256651169, -0.33093026606533477,
+                0.13329150667830314, -0.020180282199047366, 6.3151437033992178e-09,
+                0.19516443759783259, -0.125629932201473, -0.18510777189666724,
+                -0.11518179249706405, 0.79144728674092368, -1.1628931982523558,
+                0.91250354516673049, -0.36515236023089487, 0.0548497671327925,
+                -1.1679462053512646e-08, -0.73810415625364523, 0.8470174584244009,
+                0.17008113400299396, 0.090159156301663379, -1.4018192300222059,
+                2.141392397438906, -1.6757774481811469, 0.66635226461915309,
+                -0.099301542452499336, 1.0000000156560307, -0.15092152990607394,
+                -1.4813400355254824, 0.32501007016593614, -0.10665904644708368,
+                1.7796410825385522, -2.8452200456412218, 2.2313784198552291,
+                -0.8823072013373332, 0.13041824116835923, -1.5700830890361179e-08,
+                1.0030991668852851, 0.84865934877928584, -0.74002126985840833,
+                0.25444017376234029, -1.7071024411426592, 2.8159173504397854,
+                -2.2212010942574856, 0.87438979546714801, -0.12818098509269454,
+                1.1781332260547313e-08, -0.37253030413198274, -0.12785657025701674,
+                0.56505142242672013, -0.33848444021117219, 1.2561039702068575,
+                -2.0800938843434165, 1.6517199081920575, -0.64812744525532984,
+                0.094217309828563259, -6.4097566291092411e-09, 0.13220572975363162,
+                0.022984358585025653, -0.23015119647358298, 0.23722601584356839,
+                -0.68523256280710365, 1.1138842977913868, -0.88863883259602172,
+                0.3478529827090574, -0.050130774674655959, 2.3207754129408065e-09,
+                -0.034616695799025515, -0.0030424597428906587, 0.06570936592805314,
+                -0.092489611102646821, 0.25062568572871546, -0.39729342975322812,
+                0.31732189085987816, -0.12390188239748591, 0.017687129761438363,
+                -4.3623536317367461e-10, 0.0049101708741372896, 0.00017308418349044246,
+                -0.010091070767974901, 0.017824294982185494, -0.04733411530281835,
+                0.073532096156291082, -0.058588400350969086, 0.022788475313836876,
+                -0.0032145338738844057
+            };
+            static constexpr std::array<double, 8> kComp2 = {
+                2.71867910879388, -1.2024111681479335, 0.46738582076148377,
+                -0.16331116573163179, 0.048832017855856398, -0.011604018931486495,
+                0.0019406397776269202, -0.00017174220997273029
+            };
+            static constexpr std::array<double, 64> kFarrow4 = {
+                -1.2900536553478881e-06, -0.0080151506262985533, -0.17777590204833338,
+                1.3139119710287313, -4.0413832196153869, 6.3642884759250222,
+                -4.992867908276553, 1.5418432994555842, 7.9871493323757734e-06,
+                0.088046779796333074, 1.0604467092541447, -8.1687752563172111,
+                25.099313210118467, -39.488286729375986, 30.975170253454831,
+                -9.5659246558470752, -2.2105953216776039e-05, -0.55815096062851943,
+                -2.3938696401524284, 22.40917634184877, -69.6019865941457,
+                109.51192256668676, -85.894556644533552, 26.527491731519852,
+                1.0000353884966167, -0.33265191629960283, 3.674166593014272,
+                -35.4328783727806, 111.52063276854375, -175.64384089126642,
+                137.76206099998669, -42.547532060929456, -3.5359293796327108e-05,
+                1.098889851519979, -4.2836042287146743, 35.135653508220415,
+                -111.44779322067839, 175.80749233768327, -137.90312082065205,
+                42.592525392586815, 2.205090483678061e-05, -0.37161767694349446,
+                3.0655130552579171, -21.923092860130158, 69.500034073335797,
+                -109.8183373403734, 86.15979318327652, -26.612319122360798,
+                -7.9535630817034395e-06, 0.095783904254697808, -1.1276037484567922,
+                7.9530205187897351, -25.075497255063709, 39.67283956818612,
+                -31.136230566192772, 9.6176971986688393, 1.2822935194890068e-06,
+                -0.012285737644740915, 0.18272380080694042, -1.2870126749889277,
+                4.0467156665242037, -6.4061717578660602, 5.0298415014987468,
+                -1.5538123482944795
+            };
+            static constexpr std::array<double, 7> kComp4 = {
+                0.77932253944179963, 0.48450011964418033, -0.63543552895607291,
+                0.36687547570613865, -0.13057476517676106, 0.027680644656114826,
+                -0.0027072253534879587
+            };
+            static constexpr std::array<double, 36> kFarrow8 = {
+                2.1428912092597181e-06, -0.068053152547346507, 0.82615315111595389,
+                -2.25344764450442, 2.3863455617383647, -0.89100287142393453,
+                -1.0400687109947751e-05, 0.076025067275552194, -3.5474940938342541,
+                10.692630341379365, -11.548180887960177, 4.3270436164777122,
+                1.0000204893461682, -1.474312011333621, 7.0561524197541718,
+                -20.727998495189027, 22.674059266177732, -8.5279485269151927,
+                -2.0475134054884214e-05, 2.1464836357794721, -7.6380358894712534,
+                20.54461472771839, -22.577478060052183, 8.5244628827979447,
+                1.0378974319923476e-05, -0.83433580274857921, 4.1702488442657986,
+                -10.417228839352022, 11.403009710027204, -4.3217178780150958,
+                -2.1353801282180795e-06, 0.15419278048117258, -0.8670223096885199,
+                2.1614225669978211, -2.3377483222244333, 0.88916021323615935
+            };
+            static constexpr std::array<double, 4> kComp8 = {
+                2.0670375203804419, -0.6482179311307088, 0.12681513715972098,
+                -0.012115968043045313
+            };
+            static constexpr std::array<double, 16> kFarrow16 = {
+                -4.7274945894591747e-08, -0.33475471468652312, 0.50168301501965318,
+                -0.16692822036410673, 1.0000001518786812, -0.49831699527905698,
+                -1.0024720850935107, 0.50078884218257014, -1.6291311300334343e-07,
+                1.0008871433692914, 0.4999030230846026, -0.50078992841108072,
+                5.8345140851491506e-08, -0.16782377216653666, 0.00089437399553421448,
+                0.16692931835075694
+            };
+            static constexpr std::array<double, 4> kComp16 = {
+                2.2958105734077243, -0.82005508291669238, 0.19585990127822545,
+                -0.023710110331518937
+            };
+            switch (factor)
+            {
+            case 2:  taps = 10; farrow = kFarrow2.data();  setCompensation(kComp2, 0); break;
+            case 4:  taps = 8;  farrow = kFarrow4.data();  setCompensation(kComp4, 0); break;
+            case 8:  taps = 6;  farrow = kFarrow8.data();  setCompensation(kComp8, 0); break;
+            default: taps = 4;  farrow = kFarrow16.data(); setCompensation(kComp16, 9); break;
+            }
+            degree = taps - 1;
+            // Interval n is processed when x[n + taps/2] arrives; its output
+            // moments complete z[n - 2]; the FIR centre adds its half length.
+            const int delay = taps / 2 + 2 + compensationHalf_ + padding_;
+            latency = delay / factor;
+            // Order-6 B-spline: B(u) = sum_j (-1)^j C(6,j) (u + 3 - j)_+^5 / 120.
+            // For output m = n + k and tau = 1/2 + d, u = k - 1/2 - d; every
+            // truncated power keeps one sign over the interval, so each piece
+            // is an exact polynomial in d.
+            constexpr double binom6[7] = {1, 6, 15, 20, 15, 6, 1};
+            constexpr double binom5[6] = {1, 5, 10, 10, 5, 1};
+            for (int ko = 0; ko < kKernelOrder; ++ko)
+            {
+                const int k = ko - 2;
+                for (int j = 0; j <= 6; ++j)
+                {
+                    const double c = k + 2.5 - j;
+                    if (c <= 0.0) continue;
+                    const double sign = (j & 1) ? -1.0 : 1.0;
+                    for (int p = 0; p <= 5; ++p)
+                    {
+                        const double term = sign * binom6[j] * binom5[p] * std::pow(c, 5 - p)
+                                          * ((p & 1) ? -1.0 : 1.0) / 120.0;
+                        kernel[static_cast<size_t>(ko)][static_cast<size_t>(p)] += term;
+                    }
+                }
+            }
+        }
+
+    private:
+        int padding_ = 0, compensationHalf_ = 0;
+
+        template <size_t N>
+        void setCompensation(const std::array<double, N>& half, int padding)
+        {
+            // half[0] is the centre tap; mirror, then delay by `padding`.
+            const int h = static_cast<int>(N) - 1;
+            padding_ = padding;
+            compensationHalf_ = h;
+            compensation.assign(static_cast<size_t>(2 * h + 1 + padding), 0.0);
+            for (int q = 0; q <= h; ++q)
+            {
+                compensation[static_cast<size_t>(padding + h + q)] = half[static_cast<size_t>(q)];
+                compensation[static_cast<size_t>(padding + h - q)] = half[static_cast<size_t>(q)];
+            }
         }
     };
+
+    /** Modal form of the FMV analog state space (symmetric similarity). */
+    struct TubePreampToneModes
+    {
+        double lambda[3] {};      ///< Poles per internal sample (lambda * T).
+        double beta[3] {};        ///< Input gain per internal sample.
+        double gamma[3] {};       ///< Output gain.
+        double direct = 0.0;      ///< Feedthrough.
+        double toModal[3][3] {};
+        double toPhysical[3][3] {};
+
+        void design(const wdf::ToneStackFMV<double>::AnalogStateSpace& ss,
+                    double sampleRate) noexcept
+        {
+            // a = -C^-1 G with symmetric G: S = C^(1/2) a C^(-1/2) is symmetric.
+            double r[3], ri[3];
+            for (int i = 0; i < 3; ++i)
+            {
+                r[i] = std::sqrt(ss.capacitance[i]);
+                ri[i] = 1.0 / r[i];
+            }
+            double s[3][3], q[3][3] {};
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                    s[i][j] = r[i] * ss.a[i][j] * ri[j];
+            for (int i = 0; i < 3; ++i)
+                for (int j = i + 1; j < 3; ++j)
+                    s[i][j] = s[j][i] = 0.5 * (s[i][j] + s[j][i]);
+            for (int i = 0; i < 3; ++i) q[i][i] = 1.0;
+            // Cyclic Jacobi rotations; robust also for coincident eigenvalues.
+            for (int sweep = 0; sweep < 32; ++sweep)
+            {
+                double off = 0.0, norm = 0.0;
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                    {
+                        norm += s[i][j] * s[i][j];
+                        if (i != j) off += s[i][j] * s[i][j];
+                    }
+                if (off <= 1e-30 * norm) break;
+                for (int p = 0; p < 2; ++p)
+                    for (int k = p + 1; k < 3; ++k)
+                    {
+                        if (s[p][k] == 0.0) continue;
+                        const double theta = 0.5 * (s[k][k] - s[p][p]) / s[p][k];
+                        const double t = (theta >= 0.0 ? 1.0 : -1.0)
+                            / (std::abs(theta) + std::sqrt(theta * theta + 1.0));
+                        const double c = 1.0 / std::sqrt(t * t + 1.0), sn = t * c;
+                        for (int i = 0; i < 3; ++i)
+                        {
+                            const double sip = s[i][p], sik = s[i][k];
+                            s[i][p] = c * sip - sn * sik;
+                            s[i][k] = sn * sip + c * sik;
+                        }
+                        for (int i = 0; i < 3; ++i)
+                        {
+                            const double spi = s[p][i], ski = s[k][i];
+                            s[p][i] = c * spi - sn * ski;
+                            s[k][i] = sn * spi + c * ski;
+                        }
+                        for (int i = 0; i < 3; ++i)
+                        {
+                            const double qip = q[i][p], qik = q[i][k];
+                            q[i][p] = c * qip - sn * qik;
+                            q[i][k] = sn * qip + c * qik;
+                        }
+                    }
+            }
+            const double period = 1.0 / sampleRate;
+            for (int m = 0; m < 3; ++m)
+            {
+                lambda[m] = s[m][m] * period;
+                double bm = 0.0, gm = 0.0;
+                for (int i = 0; i < 3; ++i)
+                {
+                    toModal[m][i] = q[i][m] * r[i];      // Q^T C^(1/2)
+                    toPhysical[i][m] = ri[i] * q[i][m];  // C^(-1/2) Q
+                    bm += toModal[m][i] * ss.b[i];
+                    gm += ss.c[i] * toPhysical[i][m];
+                }
+                beta[m] = bm * period;
+                gamma[m] = gm;
+            }
+            direct = ss.d;
+        }
+    };
+
+    /** phi_k(w) = sum_j w^j/(j+k)!, k = 0..4 (phi_0 = exp). Small |w|: a
+     *  length-adapted Taylor series of phi_4 and the exact downward
+     *  recurrence; otherwise the upward recurrence from exp. */
+    inline void tubePreampPhi(double w, double* p) noexcept
+    {
+        const double aw = std::abs(w);
+        if (aw < 0.5)
+        {
+            static constexpr double inv[16] = {1.0, 1.0, 1.0 / 2, 1.0 / 6, 1.0 / 24, 1.0 / 120,
+                1.0 / 720, 1.0 / 5040, 1.0 / 40320, 1.0 / 362880, 1.0 / 3628800,
+                1.0 / 39916800, 1.0 / 479001600, 1.0 / 6227020800.0,
+                1.0 / 87178291200.0, 1.0 / 1307674368000.0};
+            const int n = aw < 1e-3 ? 3 : (aw < 0.02 ? 5 : (aw < 0.1 ? 7 : 10));
+            double v = inv[4 + n];
+            for (int j = n - 1; j >= 0; --j) v = v * w + inv[4 + j];
+            p[4] = v;
+            p[3] = w * v + inv[3];
+            p[2] = w * p[3] + inv[2];
+            p[1] = w * p[2] + 1.0;
+            p[0] = w * p[1] + 1.0;
+        }
+        else
+        {
+            p[0] = std::exp(w);
+            p[1] = (p[0] - 1.0) / w;
+            p[2] = (p[1] - 1.0) / w;
+            p[3] = (p[2] - 0.5) / w;
+            p[4] = (p[3] - 1.0 / 6.0) / w;
+        }
+    }
 } // namespace detail
 /// @endcond
 
@@ -587,20 +720,24 @@ public:
             oversampler_ = std::make_unique<Oversampling<T>>(
                 osFactor_, Oversampling<T>::Quality::High);
             oversampler_->prepare(spec);
+            design_ = std::make_unique<detail::TubePreampCoreDesign>(osFactor_);
         }
         else
         {
             oversampler_.reset();
+            design_.reset();
         }
 
-        loadTable_ = std::make_unique<LoadTable>(fs2_);
-        compensation_ = std::make_unique<detail::TubePreampCompensation>(osFactor_);
+        // The continuous core freezes the cathode per interval (B = 0); the
+        // 1x point circuit keeps the trapezoidal cathode coupling.
+        loadTable_ = std::make_unique<LoadTable>(
+            design_ ? std::numeric_limits<double>::infinity() : fs2_);
         channels_.clear();
         channels_.resize(static_cast<size_t>(numChannels_));
         for (auto& ch : channels_)
-            ch = std::make_unique<ChannelState>(fs2_, loadTable_.get(), compensation_.get());
+            ch = std::make_unique<ChannelState>(fs2_, loadTable_.get(), design_.get());
 
-        latency_ = (oversampler_ ? oversampler_->getLatency() : 0) + compensation_->latency;
+        latency_ = (oversampler_ ? oversampler_->getLatency() : 0) + (design_ ? design_->latency : 0);
         drySize_ = 1;
         while (drySize_ < latency_ + maxBlock_ + 1) drySize_ <<= 1;
         dryRing_.assign(static_cast<size_t>(numChannels_),
@@ -692,8 +829,8 @@ public:
      * @param factor Power-of-two multiplier in {1,2,4,8,16}. 1 = OFF (no
      *  internal resampling, zero added latency; the triode/grid nonlinearity
      *  then aliases in-band unless the surrounding chain is oversampled). 2 is
-     *  the default. Higher factors lower the alias floor at ~linearly higher
-     *  CPU. Invalid or non-power-of-two values are ignored. getLatency()
+     *  the default. Higher factors lower the residual error at higher CPU.
+     *  Invalid or non-power-of-two values are ignored. getLatency()
      *  reflects the new factor after this call (0 at 1x).
      */
     void setOversampling(int factor)
@@ -735,8 +872,9 @@ public:
     [[nodiscard]] T getOutput() const noexcept { return outputDb_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
 
-    /** @brief Latency in samples the active oversampler adds (0 at 1x = off);
-     *  reflects the current factor, so hosts can compensate (PDC). */
+    /** @brief Latency in prepared-rate samples added by the oversampler and the
+     *  continuous core (0 at 1x = off); reflects the current factor, so hosts
+     *  can compensate (PDC). */
     [[nodiscard]] int getLatency() const noexcept { return latency_; }
 
     /** @brief Compatibility alias of getLatency(), in prepared-rate samples. */
@@ -798,9 +936,9 @@ public:
         if (nCh == 0 || nS == 0) return;
 
         // Front-door non-finite guard: a single NaN/Inf input sample would
-        // poison the recursive triode Newton-Raphson / WDF tone stack / supply
-        // sag / output DC-blocker / flatten-EQ state PERMANENTLY (only reset()
-        // clears it, not clean input). Replace bad samples with silence before
+        // poison the recursive circuit, tone-circuit, supply sag, output
+        // DC-blocker and flatten-EQ state PERMANENTLY (only reset() clears
+        // it, not clean input). Replace bad samples with silence before
         // they reach any state, so a transient upstream glitch cannot corrupt
         // the channel for the rest of the stream.
         for (int ch = 0; ch < nCh; ++ch)
@@ -899,7 +1037,7 @@ public:
                 }
                 if (osOn)
                 {
-                    state.compensateBlock(compensationScratch_.data(), osN, numStagesActive_);
+                    state.compensateBlock(compensationScratch_.data(), osN);
                     for (int i = 0; i < osN; ++i)
                     {
                         const double g = outputRamping ? gainRamps_[1][static_cast<size_t>(i)] : outGain;
@@ -908,7 +1046,7 @@ public:
                 }
             }
             if (osOn) oversampler_->downsample(buffer);
-            supplyNow_.store(static_cast<T>(kBplus - sagR_ * channels_[0]->ipLP),
+            supplyNow_.store(static_cast<T>(kBplus - sagR_ * channels_[0]->supplyCurrent()),
                              std::memory_order_relaxed);
         }
 
@@ -939,6 +1077,7 @@ private:
     static constexpr double kInterstage = 0.12;   ///< Divider into stage 2.
 
     using LoadTable = detail::TubePreampCurrentTable;
+    using Clamp = detail::TubePreampGridClamp;
 
     static void koren(double vpk, double vgk, double& ip,
                       double& dIpdVpk, double& dIpdVgk) noexcept
@@ -946,7 +1085,28 @@ private:
         LoadTable::koren(vpk, vgk, ip, dIpdVpk, dIpdVgk);
     }
 
-    /** @brief One common-cathode stage with trapezoidal cathode bypass. */
+    /** @brief Static operating point: Vk = Ip*Rk (capacitor fully charged). */
+    static double settleCurrent(double bplus) noexcept
+    {
+        double i = 8e-4;
+        for (int it = 0; it < 60; ++it)
+        {
+            const double vkS = i * kRk;
+            const double vpk = bplus - i * kRL - vkS;
+            double ipK = 0.0, dVpk = 0.0, dVgk = 0.0;
+            koren(vpk, -vkS, ipK, dVpk, dVgk);
+            const double f = i - ipK;
+            const double fp = 1.0 - (dVpk * (-(kRL + kRk)) + dVgk * (-kRk));
+            const double di = f / fp;
+            i -= di;
+            i = std::clamp(i, 0.0, bplus / (kRL + kRk));
+            if (std::abs(di) < 1e-15) break;
+        }
+        return i;
+    }
+
+    /** @brief Point-sampled common-cathode stage (1x path) with trapezoidal
+     *  cathode bypass. */
     struct TriodeStage
     {
         const LoadTable* table = nullptr;
@@ -955,57 +1115,19 @@ private:
         double vk = 1.2;           ///< Cathode voltage (bypass cap state).
         double fPrev = 0.0;        ///< Previous net capacitor current (A).
         double vpDC = 200.0;       ///< Plate voltage at the operating point.
-        double previousGrid = 0.0, previousClamped = 0.0;
-        double previousPrimitive2 = 0.0, olderGrid = 0.0, olderPrimitive2 = 0.0;
-        bool antialias = true;
 
         void settleDC(double bplus) noexcept
         {
-            // Static operating point: Vk = Ip*Rk (capacitor fully charged).
-            double i = 8e-4;
-            for (int it = 0; it < 60; ++it)
-            {
-                const double vkS = i * kRk;
-                const double vpk = bplus - i * kRL - vkS;
-                double ipK = 0.0, dVpk = 0.0, dVgk = 0.0;
-                koren(vpk, -vkS, ipK, dVpk, dVgk);
-                const double f = i - ipK;
-                const double fp = 1.0 - (dVpk * (-(kRL + kRk)) + dVgk * (-kRk));
-                const double di = f / fp;
-                i -= di;
-                i = std::clamp(i, 0.0, bplus / (kRL + kRk));
-                if (std::abs(di) < 1e-15) break;
-            }
-            ip = i;
-            vk = i * kRk;
+            ip = settleCurrent(bplus);
+            vk = ip * kRk;
             fPrev = 0.0;
-            vpDC = bplus - i * kRL;
-            previousGrid = previousClamped = 0.0;
-            previousPrimitive2 = olderGrid = olderPrimitive2 = 0.0;
+            vpDC = bplus - ip * kRL;
         }
 
         /** @brief Processes one grid-volt sample, returns AC plate voltage. */
         [[nodiscard]] double processSample(double vg, double bplusEff) noexcept
         {
-            // Antialias BOTH nonlinearities. Averaging only the triode cannot
-            // remove aliases that were already generated by the grid clamp.
-            double clamped = 0.0, oldClamped = 0.0;
-            if (antialias)
-            {
-                const double primitive2 = detail::TubePreampGridClamp::primitive2(vg);
-                clamped = detail::TubePreampGridClamp::divided(olderGrid, previousGrid, vg,
-                    olderPrimitive2, previousPrimitive2, primitive2);
-                olderGrid = previousGrid;
-                olderPrimitive2 = previousPrimitive2;
-                previousGrid = vg;
-                previousPrimitive2 = primitive2;
-                oldClamped = previousClamped;
-                previousClamped = clamped;
-                vg = 0.5 * (oldClamped + clamped);
-            }
-            else
-                vg = oldClamped = clamped = detail::TubePreampGridClamp::value(vg);
-
+            vg = Clamp::value(vg);
             // Trapezoidal cathode bypass: Ck dVk/dt = Ip - Vk/Rk, with fPrev
             // holding the previous NET CURRENT (Ip - Vk/Rk), so the update is
             //   Vk_n = Vk_{n-1} + (T/2Ck)(I_n + I_{n-1}) = kA + kB * Ip_n.
@@ -1016,13 +1138,10 @@ private:
 
             const double iMax = bplusEff / kRL + 1e-3;
             double i = std::clamp(ip, 0.0, iMax);
-
             // Outside the prepared supply/grid range, retain the analytic
             // circuit solve. The table includes a bounded deep-cutoff limit.
-            if (table->covers(bplusEff - kA, oldClamped - kA)
-                && table->covers(bplusEff - kA, clamped - kA))
-                i = antialias ? table->average(bplusEff - kA, oldClamped - kA, clamped - kA)
-                              : table->eval(bplusEff - kA, vg - kA);
+            if (table->covers(bplusEff - kA, vg - kA))
+                i = table->eval(bplusEff - kA, vg - kA);
             else for (int it = 0; it < 8; ++it)
             {
                 const double vkN = kA + kB * i;
@@ -1047,37 +1166,703 @@ private:
         }
     };
 
+    /**
+     * @brief Continuous-time two-stage core (factors >= 2). One call per
+     *  internal sample; returns the kernel-projected plate voltage of the
+     *  output stage, delayed by taps/2 + 2 internal samples.
+     */
+    struct ContinuousCore
+    {
+        static constexpr int kLevels = 5;       ///< cutoff, A-3, A-1, +1 V, +6 V
+        static constexpr int kMaxPieces = 48;
+        static constexpr int kOrder = detail::TubePreampCoreDesign::kKernelOrder;
+        static constexpr double kKneeRange = 1.0;   ///< Volts of x needed to split at knees.
+        static constexpr double kSmallZ = 0.3, kStiffZ = 40.0;
+        static constexpr double kLongPiece = 0.5;    ///< Samples; longer stage-2 pieces use 4 nodes.
+        static constexpr double kShortPiece = 0.03;  ///< Samples; shorter stage-2 pieces use 2 nodes.
+
+        const LoadTable* table = nullptr;
+        const detail::TubePreampCoreDesign* design = nullptr;
+        double period = 1.0 / 96000.0, cathodeDecay = 0.0, sagDecay = 0.0;
+        detail::TubePreampToneModes modes;
+        std::array<double, 16> ring {};
+        int ringPos = 0;
+        double q[3] {};                         ///< Modal tone-circuit state.
+        double vk1 = 0.0, vk2 = 0.0, ipLP = 0.0, i1Prev = 0.0, i2Prev = 0.0;
+        double vp1 = 0.0, vp2 = 0.0;
+        double out[kOrder] {};                  ///< Pending outputs z[n-2] .. z[n+3].
+        double cutSupply[2] = {-1.0, -1.0}, cutVgk[2] {};
+        // Interval scratch
+        typename LoadTable::Slice slice1, slice2;
+        double supply = 0.0, a1 = 0.0, a2 = 0.0, s1 = 0.0, s2 = 0.0;
+        double lev1[kLevels] {}, lev2[kLevels] {};
+        double integral1 = 0.0, integral2 = 0.0, moments[kOrder] {};
+        double hi1 = 0.0, hi2 = 0.0;
+        bool haveHi1 = false, haveHi2 = false;
+        int stages = 2;
+        // Gauss-Legendre rules on [0, 1]
+        static constexpr double kG4x[4] = {0.069431844202973713, 0.33000947820757187,
+                                           0.66999052179242813, 0.93056815579702629};
+        static constexpr double kG4w[4] = {0.17392742256872692, 0.32607257743127308,
+                                           0.32607257743127308, 0.17392742256872692};
+        static constexpr double kG3x[3] = {0.11270166537925831, 0.5, 0.88729833462074169};
+        static constexpr double kG3w[3] = {5.0 / 18.0, 4.0 / 9.0, 5.0 / 18.0};
+        double lagrange4[4][4] {};              ///< Monomial coefficients of the node basis.
+        double lagrange3[3][3] {};
+
+        void init(double sampleRate, const LoadTable* tableIn,
+                  const detail::TubePreampCoreDesign* designIn) noexcept
+        {
+            table = tableIn;
+            design = designIn;
+            period = 1.0 / sampleRate;
+            cathodeDecay = std::exp(-period / (kRk * kCk));
+            sagDecay = std::exp(-period / 0.07);
+            for (int k = 0; k < 4; ++k)
+            {
+                double poly[4] = {1.0, 0.0, 0.0, 0.0};
+                double den = 1.0;
+                int deg = 0;
+                for (int o = 0; o < 4; ++o)
+                {
+                    if (o == k) continue;
+                    double next[4] = {0.0, 0.0, 0.0, 0.0};
+                    for (int e = 0; e <= deg; ++e)
+                    {
+                        next[e + 1] += poly[e];
+                        next[e] -= kG4x[o] * poly[e];
+                    }
+                    ++deg;
+                    for (int e = 0; e < 4; ++e) poly[e] = next[e];
+                    den *= kG4x[k] - kG4x[o];
+                }
+                for (int e = 0; e < 4; ++e) lagrange4[k][e] = poly[e] / den;
+            }
+            for (int k = 0; k < 3; ++k)
+            {
+                const int o1 = (k + 1) % 3, o2 = (k + 2) % 3;
+                const double den = (kG3x[k] - kG3x[o1]) * (kG3x[k] - kG3x[o2]);
+                lagrange3[k][0] = kG3x[o1] * kG3x[o2] / den;
+                lagrange3[k][1] = -(kG3x[o1] + kG3x[o2]) / den;
+                lagrange3[k][2] = 1.0 / den;
+            }
+        }
+
+        /** Re-designs the modal tone circuit, keeping capacitor voltages. */
+        void setTone(const wdf::ToneStackFMV<double>::AnalogStateSpace& ss) noexcept
+        {
+            double physical[3] = {0.0, 0.0, 0.0};
+            for (int i = 0; i < 3; ++i)
+                for (int m = 0; m < 3; ++m)
+                    physical[i] += modes.toPhysical[i][m] * q[m];
+            modes.design(ss, 1.0 / period);
+            for (int m = 0; m < 3; ++m)
+            {
+                q[m] = 0.0;
+                for (int i = 0; i < 3; ++i) q[m] += modes.toModal[m][i] * physical[i];
+            }
+        }
+
+        void reset(double sagR, int numStages) noexcept
+        {
+            double bp = kBplus, i1 = 0.0, i2 = 0.0, iTotal = 0.0;
+            for (int it = 0; it < 40; ++it)
+            {
+                i1 = settleCurrent(bp);
+                i2 = i1;
+                iTotal = i1 + (numStages > 1 ? i2 : 0.0);
+                const double next = kBplus - sagR * iTotal;
+                if (std::abs(next - bp) < 1e-12) { bp = next; break; }
+                bp = next;
+            }
+            vk1 = vk2 = i1 * kRk;
+            vp1 = vp2 = bp - i1 * kRL;
+            ipLP = iTotal;
+            i1Prev = i2Prev = i1;
+            q[0] = q[1] = q[2] = 0.0;
+            ring.fill(0.0);
+            ringPos = 0;
+            for (double& v : out) v = 0.0;
+            cutSupply[0] = cutSupply[1] = -1.0;
+        }
+
+        static double cutoffVgk(double s) noexcept
+        {
+            // Grid voltage relative to the cathode below which the plate
+            // current is < 1e-10 A (plate effect < 10 uV) at vpk ~= s.
+            constexpr double eps = 1e-10;
+            const double e1 = std::pow(eps * LoadTable::kKg1 / 2.0, 1.0 / LoadTable::kEx);
+            const double u = std::log(std::expm1(e1 * LoadTable::kKp / s));
+            return std::sqrt(LoadTable::kKvb + s * s) * (u / LoadTable::kKp - 1.0 / LoadTable::kMu);
+        }
+
+        static double currentSlow(double s, double g) noexcept
+        {
+            // Frozen-cathode load line outside the table: Ip = Koren(s - RL Ip, g).
+            double i = 0.5 * std::max(s, 0.0) / kRL, p = 0.0, dp = 0.0, dg = 0.0;
+            for (int it = 0; it < 60; ++it)
+            {
+                koren(s - kRL * i, g, p, dp, dg);
+                const double next = std::clamp(i - (i - p) / (1.0 + kRL * dp), 0.0,
+                                               std::max(s, 0.0) / kRL);
+                if (std::abs(next - i) < 1e-16) { i = next; break; }
+                i = next;
+            }
+            return i;
+        }
+
+        template <int N>
+        void currents(const typename LoadTable::Slice& sl, double cathode,
+                      const double* x, double* result) const noexcept
+        {
+            double g[N];
+            for (int j = 0; j < N; ++j) g[j] = Clamp::value(x[j]) - cathode;
+            for (int j = 0; j < N; ++j)
+                result[j] = (sl.inside && g[j] < 1.0) ? sl.eval(g[j]) : currentSlow(sl.s, g[j]);
+        }
+
+        double current(const typename LoadTable::Slice& sl, double cathode, double x) const noexcept
+        {
+            double r;
+            currents<1>(sl, cathode, &x, &r);
+            return r;
+        }
+
+        static int classify(const double* lev, double v) noexcept
+        {
+            int k = 0;
+            while (k < kLevels && v > lev[k]) ++k;
+            return k;
+        }
+        static int classifyEdges(const double* lev, double v) noexcept
+        {
+            return v <= lev[0] ? 0 : (v > lev[kLevels - 1] ? kLevels : 1);
+        }
+
+        void addMoments(double tau, double weight, double y) noexcept
+        {
+            const double d = tau - 0.5;
+            double t = weight * y;
+            for (int p = 0; p < kOrder; ++p) { moments[p] += t; t *= d; }
+        }
+        void addConstantMoments(double a, double b, double y) noexcept
+        {
+            const double pa = a - 0.5, pb = b - 0.5;
+            double ea = pa, eb = pb;
+            for (int p = 0; p < kOrder; ++p)
+            {
+                moments[p] += y * (eb - ea) / (p + 1);
+                ea *= pa;
+                eb *= pb;
+            }
+        }
+        /// Moments of sum_e c[e] xi^e over the piece [a, a + h].
+        void addPolynomialMoments(double a, double h, const double* c, int degree) noexcept
+        {
+            static constexpr double inv[16] = {1.0, 1.0 / 2, 1.0 / 3, 1.0 / 4, 1.0 / 5, 1.0 / 6,
+                1.0 / 7, 1.0 / 8, 1.0 / 9, 1.0 / 10, 1.0 / 11, 1.0 / 12, 1.0 / 13, 1.0 / 14,
+                1.0 / 15, 1.0 / 16};
+            static constexpr double binom[kOrder][kOrder] = {{1}, {1, 1}, {1, 2, 1},
+                {1, 3, 3, 1}, {1, 4, 6, 4, 1}, {1, 5, 10, 10, 5, 1}};
+            double sums[kOrder], hk = 1.0, dk[kOrder];
+            dk[0] = 1.0;
+            for (int k = 1; k < kOrder; ++k) dk[k] = dk[k - 1] * (a - 0.5);
+            for (int k = 0; k < kOrder; ++k)
+            {
+                double acc = 0.0;
+                for (int e = 0; e <= degree; ++e) acc += c[e] * inv[e + k];
+                sums[k] = acc * hk;
+                hk *= h;
+            }
+            for (int p = 0; p < kOrder; ++p)
+            {
+                double acc = 0.0;
+                for (int k = 0; k <= p; ++k) acc += binom[p][k] * dk[p - k] * sums[k];
+                moments[p] += h * acc;
+            }
+        }
+
+        /// Interstage voltage on one piece: a degree-5 polynomial in the piece
+        /// coordinate plus exact terms for modes of intermediate stiffness.
+        struct Trajectory
+        {
+            double c[6] {};
+            int exactCount = 0;
+            double q0[3] {}, z[3] {}, bt[3] {}, g[3] {};
+            double u[4] {};
+            int uTerms = 1;
+
+            double exactTerm(int k, double xi, double& derivative) const noexcept
+            {
+                double p[5];
+                detail::tubePreampPhi(z[k] * xi, p);
+                static constexpr double fact[4] = {1.0, 1.0, 2.0, 6.0};
+                double forced = 0.0, xp = xi, ui = 0.0, xe = 1.0;
+                for (int e = 0; e < uTerms; ++e)
+                {
+                    forced += u[e] * fact[e] * xp * p[e + 1];
+                    xp *= xi;
+                    ui += u[e] * xe;
+                    xe *= xi;
+                }
+                const double qv = p[0] * q0[k] + bt[k] * forced;
+                derivative = g[k] * (z[k] * qv + bt[k] * ui);
+                return g[k] * qv;
+            }
+            double operator()(double xi) const noexcept
+            {
+                double v = ((((c[5] * xi + c[4]) * xi + c[3]) * xi + c[2]) * xi + c[1]) * xi + c[0];
+                for (int k = 0; k < exactCount; ++k)
+                {
+                    double dq;
+                    v += exactTerm(k, xi, dq);
+                }
+                return v;
+            }
+            double eval(double xi, double& derivative) const noexcept
+            {
+                double v = c[5], d = 0.0;
+                for (int p = 4; p >= 0; --p)
+                {
+                    d = d * xi + v;
+                    v = v * xi + c[p];
+                }
+                for (int k = 0; k < exactCount; ++k)
+                {
+                    double dq;
+                    v += exactTerm(k, xi, dq);
+                    d += dq;
+                }
+                derivative = d;
+                return v;
+            }
+        };
+
+        /// Propagates the modal state over a piece of length h (internal
+        /// samples) whose stage-1 plate voltage is sum_e u[e] xi^e, and
+        /// returns the tone-circuit output on the piece.
+        void propagate(double h, const double* u, int terms, Trajectory& tr) noexcept
+        {
+            static constexpr double fact[4] = {1.0, 1.0, 2.0, 6.0};
+            tr.exactCount = 0;
+            tr.uTerms = terms;
+            for (int e = 0; e < 4; ++e) tr.u[e] = e < terms ? u[e] : 0.0;
+            for (double& x : tr.c) x = 0.0;
+            const double u0 = u[0], u0p = terms > 1 ? u[1] : 0.0;
+            double u1 = 0.0, u1p = 0.0;
+            for (int e = 0; e < terms; ++e)
+            {
+                u1 += u[e];
+                u1p += e * u[e];
+            }
+            // Non-stiff modal sum: exact values and first/second derivatives
+            // at both ends (from dq/dxi = z q + bt u), then a quintic Hermite.
+            double h0 = 0.0, h0p = 0.0, h0pp = 0.0, h1 = 0.0, h1p = 0.0, h1pp = 0.0;
+            for (int m = 0; m < 3; ++m)
+            {
+                const double z = modes.lambda[m] * h, bt = modes.beta[m] * h, g = modes.gamma[m];
+                const double az = std::abs(z);
+                if (az >= kStiffZ)
+                {
+                    // Slow manifold of dq/dxi = z q + bt u:
+                    // q = -(bt/z) sum_k u^(k)(xi) / z^k (boundary layer < e^-40).
+                    const double iz = 1.0 / z;
+                    double der[4] = {0.0, 0.0, 0.0, 0.0};
+                    for (int e = 0; e < terms; ++e) der[e] = u[e];
+                    double izp = 1.0, endValue = 0.0;
+                    for (int k = 0; k < terms; ++k)
+                    {
+                        double sumAtEnd = 0.0;
+                        for (int e = 0; e < 4; ++e)
+                        {
+                            tr.c[e] += -g * bt * iz * izp * der[e];
+                            sumAtEnd += der[e];
+                        }
+                        endValue += izp * sumAtEnd;
+                        for (int e = 0; e < 3; ++e) der[e] = der[e + 1] * (e + 1);
+                        der[3] = 0.0;
+                        izp *= iz;
+                    }
+                    q[m] = -bt * iz * endValue;
+                    continue;
+                }
+                double p[5];
+                detail::tubePreampPhi(z, p);
+                double forced = 0.0;
+                for (int e = 0; e < terms; ++e) forced += u[e] * fact[e] * p[e + 1];
+                const double qEnd = p[0] * q[m] + bt * forced;
+                if (az > kSmallZ)
+                {
+                    const int k = tr.exactCount++;
+                    tr.q0[k] = q[m];
+                    tr.z[k] = z;
+                    tr.bt[k] = bt;
+                    tr.g[k] = g;
+                    q[m] = qEnd;
+                    continue;
+                }
+                const double d0 = z * q[m] + bt * u0, d1 = z * qEnd + bt * u1;
+                h0 += g * q[m];
+                h0p += g * d0;
+                h0pp += g * (z * d0 + bt * u0p);
+                h1 += g * qEnd;
+                h1p += g * d1;
+                h1pp += g * (z * d1 + bt * u1p);
+                q[m] = qEnd;
+            }
+            const double quad = 0.5 * h0pp;
+            const double r0 = h1 - (h0 + h0p + quad), r1 = h1p - (h0p + 2.0 * quad), r2 = h1pp - 2.0 * quad;
+            tr.c[0] += h0;
+            tr.c[1] += h0p;
+            tr.c[2] += quad;
+            tr.c[3] += 10.0 * r0 - 4.0 * r1 + 0.5 * r2;
+            tr.c[4] += -15.0 * r0 + 7.0 * r1 - r2;
+            tr.c[5] += 6.0 * r0 - 3.0 * r1 + 0.5 * r2;
+            for (int e = 0; e < terms; ++e) tr.c[e] += modes.direct * u[e];
+        }
+
+        /// Stage 2 over the piece [a, a + h] (interval coordinates).
+        void stage2(double a, double h, const Trajectory& tr) noexcept
+        {
+            double cuts[16];
+            int count = 0;
+            cuts[count++] = 0.0;
+            const int samples = h > 0.5 ? 4 : 2;
+            double sv[5];
+            double lo = std::numeric_limits<double>::max(), hi = -lo;
+            for (int k = 0; k <= samples; ++k)
+            {
+                sv[k] = kInterstage * tr(double(k) / samples);
+                lo = std::min(lo, sv[k]);
+                hi = std::max(hi, sv[k]);
+            }
+            const bool edges = hi - lo < kKneeRange;
+            const auto cls = [&](double v) { return edges ? classifyEdges(lev2, v) : classify(lev2, v); };
+            double pt = 0.0, pv = sv[0];
+            int pc = cls(pv);
+            const int first = pc;
+            bool changed = false;
+            for (int k = 1; k <= samples; ++k)
+            {
+                const double t = double(k) / samples, v = sv[k];
+                const int cc = cls(v);
+                if (cc != pc)
+                {
+                    changed = true;
+                    const int low = std::min(cc, pc), high = std::max(cc, pc);
+                    for (int r = 0; r < high - low; ++r)
+                    {
+                        int li = cc > pc ? low + r : high - 1 - r;
+                        if (edges) li = li == 0 ? 0 : kLevels - 1;
+                        const double level = lev2[li];
+                        double tt = pt + (t - pt) * (pv - level) / (pv - v);
+                        for (int it = 0; it < 2; ++it)
+                        {
+                            double dv;
+                            const double f = kInterstage * tr.eval(tt, dv) - level;
+                            dv *= kInterstage;
+                            if (dv == 0.0) break;
+                            const double next = tt - f / dv;
+                            if (!(next > pt && next < t)) break;
+                            tt = next;
+                        }
+                        if (tt > cuts[count - 1] + 1e-12 && count < 14) cuts[count++] = tt;
+                    }
+                }
+                pt = t;
+                pv = v;
+                pc = cc;
+            }
+            cuts[count++] = 1.0;
+            for (int k = 0; k + 1 < count; ++k)
+            {
+                const double xa = cuts[k], xb = cuts[k + 1], len = xb - xa;
+                if (len <= 0.0) continue;
+                const int cm = changed ? cls(kInterstage * tr(0.5 * (xa + xb))) : first;
+                if (cm == 0 || cm == kLevels)
+                {
+                    double i2 = 0.0;
+                    if (cm == kLevels)
+                    {
+                        if (!haveHi2) { hi2 = current(slice2, a2, 1e3); haveHi2 = true; }
+                        i2 = hi2;
+                    }
+                    integral2 += h * len * i2;
+                    addConstantMoments(a + h * xa, a + h * xb, supply - kRL * i2 - vp2);
+                    continue;
+                }
+                if (h * len > kLongPiece)
+                {
+                    // Long smooth piece: a cubic interpolant keeps harmonics
+                    // near 0.8 cycles/sample from leaking past the kernel.
+                    double xs[4], is[4], y[4], poly[4];
+                    for (int j = 0; j < 4; ++j) xs[j] = kInterstage * tr(xa + len * kG4x[j]);
+                    currents<4>(slice2, a2, xs, is);
+                    for (int j = 0; j < 4; ++j)
+                    {
+                        integral2 += h * len * kG4w[j] * is[j];
+                        y[j] = supply - kRL * is[j] - vp2;
+                    }
+                    for (int e = 0; e < 4; ++e)
+                        poly[e] = lagrange4[0][e] * y[0] + lagrange4[1][e] * y[1]
+                                + lagrange4[2][e] * y[2] + lagrange4[3][e] * y[3];
+                    addPolynomialMoments(a + h * xa, h * len, poly, 3);
+                    continue;
+                }
+                if (h * len < kShortPiece)
+                {
+                    // Short piece: two nodes and the exact moments of their
+                    // linear interpolant.
+                    constexpr double g0 = 0.21132486540518713, g1 = 0.78867513459481287;
+                    double xs[2] = {kInterstage * tr(xa + len * g0), kInterstage * tr(xa + len * g1)}, is[2];
+                    currents<2>(slice2, a2, xs, is);
+                    integral2 += h * len * 0.5 * (is[0] + is[1]);
+                    const double y0 = supply - kRL * is[0] - vp2, y1 = supply - kRL * is[1] - vp2;
+                    double poly[2];
+                    poly[1] = (y1 - y0) / (g1 - g0);
+                    poly[0] = y0 - poly[1] * g0;
+                    addPolynomialMoments(a + h * xa, h * len, poly, 1);
+                    continue;
+                }
+                double xs[3], is[3];
+                for (int j = 0; j < 3; ++j) xs[j] = kInterstage * tr(xa + len * kG3x[j]);
+                currents<3>(slice2, a2, xs, is);
+                // Exact moments of the plate interpolant through the three
+                // nodes: Gauss weights alone are not exact for the quintic
+                // kernel weights times a curved plate trajectory.
+                double y[3], poly[3];
+                for (int j = 0; j < 3; ++j)
+                {
+                    integral2 += h * len * kG3w[j] * is[j];
+                    y[j] = supply - kRL * is[j] - vp2;
+                }
+                for (int e = 0; e < 3; ++e)
+                    poly[e] = lagrange3[0][e] * y[0] + lagrange3[1][e] * y[1] + lagrange3[2][e] * y[2];
+                addPolynomialMoments(a + h * xa, h * len, poly, 2);
+            }
+        }
+
+        void plate(double a, double h, const double* u, int terms) noexcept
+        {
+            Trajectory tr;
+            propagate(h, u, terms, tr);
+            if (stages > 1)
+                stage2(a, h, tr);
+            else if (tr.exactCount == 0)
+                addPolynomialMoments(a, h, tr.c, 5);
+            else
+            {
+                // Intermediate-stiffness mode present: interpolate the
+                // tone-circuit output at the nodes, then take exact moments.
+                const double y[3] = {tr(kG3x[0]), tr(kG3x[1]), tr(kG3x[2])};
+                double poly[3];
+                for (int e = 0; e < 3; ++e)
+                    poly[e] = lagrange3[0][e] * y[0] + lagrange3[1][e] * y[1] + lagrange3[2][e] * y[2];
+                addPolynomialMoments(a, h, poly, 2);
+            }
+        }
+
+        double process(double x, int numStages, double sagR) noexcept
+        {
+            stages = numStages;
+            const int taps = design->taps;
+            ring[static_cast<size_t>(ringPos)] = x;
+            ringPos = ringPos + 1 == taps ? 0 : ringPos + 1;
+            interval(sagR);
+            const double result = out[0];
+            for (int k = 0; k + 1 < kOrder; ++k) out[k] = out[k + 1];
+            out[kOrder - 1] = 0.0;
+            return result;
+        }
+
+        void interval(double sagR) noexcept
+        {
+            // Stage-1 grid polynomial on the interval [n, n+1].
+            const int taps = design->taps, deg = design->degree;
+            double c[16] {};
+            int idx = ringPos;
+            for (int j = 0; j < taps; ++j)
+            {
+                const double v = ring[static_cast<size_t>(idx)];
+                idx = idx + 1 == taps ? 0 : idx + 1;
+                const double* row = design->farrow + j * (deg + 1);
+                for (int p = 0; p <= deg; ++p) c[p] += row[p] * v;
+            }
+            const auto xAt = [&](double tau) {
+                double v = c[deg];
+                for (int p = deg - 1; p >= 0; --p) v = v * tau + c[p];
+                return v;
+            };
+            // Slow states frozen at the predicted interval midpoint.
+            const double iPrev = i1Prev + (stages > 1 ? i2Prev : 0.0);
+            supply = kBplus - sagR * (ipLP + 0.5 * (1.0 - sagDecay) * (iPrev - ipLP));
+            a1 = vk1 + 0.5 * (1.0 - cathodeDecay) * (i1Prev * kRk - vk1);
+            a2 = vk2 + 0.5 * (1.0 - cathodeDecay) * (i2Prev * kRk - vk2);
+            s1 = supply - a1;
+            s2 = supply - a2;
+            slice1.set(*table, s1);
+            slice2.set(*table, s2);
+            if (std::abs(s1 - cutSupply[0]) > 0.05) { cutSupply[0] = s1; cutVgk[0] = cutoffVgk(s1); }
+            if (std::abs(s2 - cutSupply[1]) > 0.05) { cutSupply[1] = s2; cutVgk[1] = cutoffVgk(s2); }
+            lev1[0] = a1 + cutVgk[0]; lev1[1] = a1 - 3.0; lev1[2] = a1 - 1.0; lev1[3] = 1.0; lev1[4] = 6.0;
+            lev2[0] = a2 + cutVgk[1]; lev2[1] = a2 - 3.0; lev2[2] = a2 - 1.0; lev2[3] = 1.0; lev2[4] = 6.0;
+            for (int j = 1; j < kLevels; ++j)
+            {
+                lev1[j] = std::max(lev1[j], lev1[j - 1] + 1e-6);
+                lev2[j] = std::max(lev2[j], lev2[j - 1] + 1e-6);
+            }
+            // Split the interval where the grid crosses the stage-1 levels;
+            // interior knees only when the interval spans at least 1 V.
+            double qv[5];
+            double lo = std::numeric_limits<double>::max(), hi = -lo;
+            for (int k = 0; k <= 4; ++k)
+            {
+                qv[k] = xAt(0.25 * k);
+                lo = std::min(lo, qv[k]);
+                hi = std::max(hi, qv[k]);
+            }
+            const bool edges = hi - lo < kKneeRange;
+            const auto cls = [&](double v) { return edges ? classifyEdges(lev1, v) : classify(lev1, v); };
+            double cuts[kMaxPieces];
+            int count = 0;
+            cuts[count++] = 0.0;
+            double pt = 0.0, pv = qv[0];
+            int pc = cls(pv);
+            const int first = pc;
+            bool changed = false;
+            for (int k = 1; k <= 4; ++k)
+            {
+                const double t = 0.25 * k, v = qv[k];
+                const int cc = cls(v);
+                if (cc != pc)
+                {
+                    changed = true;
+                    const int low = std::min(cc, pc), high = std::max(cc, pc);
+                    for (int r = 0; r < high - low; ++r)
+                    {
+                        int li = cc > pc ? low + r : high - 1 - r;
+                        if (edges) li = li == 0 ? 0 : kLevels - 1;
+                        const double level = lev1[li];
+                        double tt = pt + (t - pt) * (pv - level) / (pv - v);
+                        for (int it = 0; it < 2; ++it)
+                        {
+                            double f = c[deg], df = 0.0;
+                            for (int p = deg - 1; p >= 0; --p) { df = df * tt + f; f = f * tt + c[p]; }
+                            f -= level;
+                            if (df == 0.0) break;
+                            const double next = tt - f / df;
+                            if (!(next > pt && next < t)) break;
+                            tt = next;
+                        }
+                        if (tt > cuts[count - 1] + 1e-12 && count < kMaxPieces - 2) cuts[count++] = tt;
+                    }
+                }
+                pt = t;
+                pv = v;
+                pc = cc;
+            }
+            cuts[count++] = 1.0;
+            integral1 = integral2 = 0.0;
+            for (double& m : moments) m = 0.0;
+            haveHi1 = haveHi2 = false;
+            for (int k = 0; k + 1 < count; ++k)
+            {
+                const double a = cuts[k], b = cuts[k + 1], h = b - a;
+                if (h <= 0.0) continue;
+                const int cm = changed ? cls(xAt(0.5 * (a + b))) : first;
+                if (cm == 0 || cm == kLevels)
+                {
+                    // Stage 1 saturated: constant plate voltage on the piece.
+                    double i1 = 0.0;
+                    if (cm == kLevels)
+                    {
+                        if (!haveHi1) { hi1 = current(slice1, a1, 1e3); haveHi1 = true; }
+                        i1 = hi1;
+                    }
+                    integral1 += h * i1;
+                    const double u[1] = {supply - kRL * i1 - vp1};
+                    plate(a, h, u, 1);
+                    continue;
+                }
+                double xs[4], is[4];
+                {
+                    double t0 = a + h * kG4x[0], t1 = a + h * kG4x[1];
+                    double t2 = a + h * kG4x[2], t3 = a + h * kG4x[3];
+                    double v0 = c[deg], v1 = c[deg], v2 = c[deg], v3 = c[deg];
+                    for (int p = deg - 1; p >= 0; --p)
+                    {
+                        v0 = v0 * t0 + c[p];
+                        v1 = v1 * t1 + c[p];
+                        v2 = v2 * t2 + c[p];
+                        v3 = v3 * t3 + c[p];
+                    }
+                    xs[0] = v0; xs[1] = v1; xs[2] = v2; xs[3] = v3;
+                }
+                currents<4>(slice1, a1, xs, is);
+                double y[4];
+                for (int j = 0; j < 4; ++j)
+                {
+                    y[j] = supply - kRL * is[j] - vp1;
+                    integral1 += h * kG4w[j] * is[j];
+                }
+                double u[4];
+                for (int e = 0; e < 4; ++e)
+                    u[e] = lagrange4[0][e] * y[0] + lagrange4[1][e] * y[1]
+                         + lagrange4[2][e] * y[2] + lagrange4[3][e] * y[3];
+                plate(a, h, u, 4);
+            }
+            // Exact exponential updates with the interval-average currents.
+            vk1 = vk1 * cathodeDecay + (1.0 - cathodeDecay) * kRk * integral1;
+            if (stages > 1)
+            {
+                vk2 = vk2 * cathodeDecay + (1.0 - cathodeDecay) * kRk * integral2;
+                i2Prev = integral2;
+            }
+            ipLP = ipLP * sagDecay + (1.0 - sagDecay) * (integral1 + (stages > 1 ? integral2 : 0.0));
+            i1Prev = integral1;
+            for (int k = 0; k < kOrder; ++k)
+            {
+                const auto& piece = design->kernel[static_cast<size_t>(k)];
+                double acc = 0.0;
+                for (int p = 0; p < kOrder; ++p) acc += piece[static_cast<size_t>(p)] * moments[p];
+                out[k] += acc;
+            }
+        }
+    };
+
     /** @brief Full per-channel circuit: two stages + FMV tone stack + sag. */
     struct ChannelState
     {
         explicit ChannelState(double fs2In, const LoadTable* table,
-                              const detail::TubePreampCompensation* compensationIn)
-            : compensation(compensationIn), fmv(38e3, 1e6) // fixed source impedance
+                              const detail::TubePreampCoreDesign* designIn)
+            : design(designIn), fmv(38e3, 1e6) // fixed source impedance
         {
             stage1.table = table;
             stage2.table = table;
             stage1.fs2 = fs2In;
             stage2.fs2 = fs2In;
-            stage1.antialias = stage2.antialias = compensation->latency > 0;
             fs2 = fs2In;
             fmv.prepare(fs2In);
-            if (compensation->latency > 0)
-                antiAliasEq.prepare(static_cast<int>(compensation->taps[0].size()), 1);
+            if (design)
+            {
+                core.init(fs2In, table, design);
+                core.setTone(fmv.analogStateSpace());
+                compensation.prepare(static_cast<int>(design->compensation.size()), 1);
+                compensation.setCoefficients(design->compensation);
+            }
         }
 
         /** Settles the DC operating point CONSISTENTLY with the sagged
          *  supply: fixed point on B+ = kBplus - sagR*(Ip1+Ip2). Settling at
-         *  the stiff kBplus while processSample() immediately applies the
+         *  the stiff kBplus while processing immediately applies the
          *  sag drop produced a ~19 V supply step at sag 0.3 - an audible
-         *  activation thump, and worse: it sat inside the old 10 ms
-         *  calibration window, inflating outSq and burying the whole wet
-         *  path ~20 dB under unity. */
+         *  activation thump, and it sat inside the old 10 ms calibration
+         *  window, burying the whole wet path ~20 dB under unity. */
         void reset(double sagR, int numStages) noexcept
         {
-            // Fixed point over the ACTIVE stage count: processSample only
+            // Fixed point over the ACTIVE stage count: processing only
             // draws current from the stages in use, so seeding ipLP with both
-            // stages' current at 1-stage settings left a ~70 ms sag transient
-            // (audible activation drift, and it polluted the noise floor).
+            // stages' current at 1-stage settings left a ~70 ms sag transient.
             double bp = kBplus;
             double iTotal = 0.0;
             for (int it = 0; it < 8; ++it)
@@ -1095,8 +1880,11 @@ private:
             for (auto& set : flatten)
                 for (auto& f : set)
                     f.reset();
-            antiAliasEq.reset();
-            compensationStages = 0;
+            if (design)
+            {
+                core.reset(sagR, numStages);
+                compensation.reset();
+            }
         }
 
         /** Installs the reference-flattening EQ for one stage count. */
@@ -1111,22 +1899,31 @@ private:
         void setToneControls(double t, double b, double m) noexcept
         {
             fmv.setControls(t, b, m);   // rebuilds the R-type scattering
+            if (design) core.setTone(fmv.analogStateSpace());
         }
+
+        /** Total plate current behind the sag meter. */
+        [[nodiscard]] double supplyCurrent() const noexcept { return design ? core.ipLP : ipLP; }
 
         template <bool Compensate = true>
         [[nodiscard]] double processSample(double vgIn, int numStages, double sagR) noexcept
         {
-            // Supply sag: B+ droops with smoothed total plate current.
-            const double sagAlpha = 1.0 - std::exp(-1.0 / (0.07 * fs2));
-            const double iTotal = stage1.ip + (numStages > 1 ? stage2.ip : 0.0);
-            ipLP += sagAlpha * (iTotal - ipLP);
-            const double bplusEff = kBplus - sagR * ipLP;
-
-            // Stage 1 -> FMV tone stack -> (stage 2) -> output high-pass.
-            double v = stage1.processSample(vgIn, bplusEff);
-            v = fmv.processSample(v);
-            if (numStages > 1)
-                v = stage2.processSample(v * kInterstage, bplusEff);
+            double v;
+            if (design)
+                v = core.process(vgIn, numStages, sagR);
+            else
+            {
+                // Supply sag: B+ droops with smoothed total plate current.
+                const double sagAlpha = 1.0 - std::exp(-1.0 / (0.07 * fs2));
+                const double iTotal = stage1.ip + (numStages > 1 ? stage2.ip : 0.0);
+                ipLP += sagAlpha * (iTotal - ipLP);
+                const double bplusEff = kBplus - sagR * ipLP;
+                // Stage 1 -> FMV tone stack -> (stage 2).
+                v = stage1.processSample(vgIn, bplusEff);
+                v = fmv.processSample(v);
+                if (numStages > 1)
+                    v = stage2.processSample(v * kInterstage, bplusEff);
+            }
 
             // Output coupling high-pass (~8 Hz, removes residual sag drift).
             const double a = 1.0 - 2.0 * std::numbers::pi * 8.0 / fs2;
@@ -1139,34 +1936,22 @@ private:
             // Reference-flattening EQ: undoes the FMV stack's fixed envelope
             // at the neutral tone setting (designed in calibrateReference
             // from the measured response), so neutral knobs sound neutral
-            // and the tone controls act RELATIVE to flat. The triode's
-            // waveform is filtered here; this linear stage adds no harmonics.
+            // and the tone controls act RELATIVE to flat. This linear stage
+            // adds no harmonics.
             auto& fl = flatten[numStages > 1 ? 1 : 0];
             out = fl[0].processSample(out, 0);
             out = fl[1].processSample(out, 0);
             out = fl[2].processSample(out, 0);
             if constexpr (!Compensate) return out;
-            if (compensation->latency == 0) return out;
-            selectCompensation(numStages);
-            return antiAliasEq.processSample(out, 0);
+            if (!design) return out;
+            return compensation.processSample(out, 0);
         }
 
-        void selectCompensation(int numStages) noexcept
+        void compensateBlock(double* data, int count) noexcept
         {
-            if (compensationStages != numStages)
-            {
-                // Fixed prepared coefficients; no allocation on stage changes.
-                antiAliasEq.setCoefficients(compensation->taps[static_cast<size_t>(numStages - 1)]);
-                compensationStages = numStages;
-            }
-        }
-
-        void compensateBlock(double* data, int count, int numStages) noexcept
-        {
-            selectCompensation(numStages);
             // Core block processing hoists coefficient publication/atomics
             // out of the inner loop. The calibration uses the same FIR.
-            antiAliasEq.processBlock(AudioBufferView<double>(&data, 1, count));
+            compensation.processBlock(AudioBufferView<double>(&data, 1, count));
         }
 
         double fs2 = 96000.0;
@@ -1174,11 +1959,11 @@ private:
         double ipLP = 1.6e-3;
         double outHpX = 0.0, outHpY = 0.0;
         std::array<std::array<Biquad<double, 1>, 3>, 2> flatten;   ///< Per stage count.
-        const detail::TubePreampCompensation* compensation;
-        FIRFilter<double> antiAliasEq;
-        int compensationStages = 0;
+        const detail::TubePreampCoreDesign* design;
+        ContinuousCore core;
+        FIRFilter<double> compensation;
 
-        wdf::ToneStackFMV<double> fmv;   ///< Exact Bassman stack (R-type WDF).
+        wdf::ToneStackFMV<double> fmv;   ///< Bassman stack (R-type WDF / analog form).
     };
 
     /** @brief Applies parameter changes: stack controls, sag R, calibration. */
@@ -1267,7 +2052,7 @@ private:
 
         for (int st = 1; st <= 2; ++st)
         {
-            ChannelState cal(fs2_, loadTable_.get(), compensation_.get());
+            ChannelState cal(fs2_, loadTable_.get(), design_.get());
             cal.setToneControls(0.5, 0.5, 0.5);
             cal.reset(kSagRef, st);
 
@@ -1324,7 +2109,7 @@ private:
             // level) before its measurement window. recompute() interpolates
             // this LUT, so the loudness link tracks the circuit's actual
             // compression - the fix for the level falling at high drive.
-            ChannelState sweep(fs2_, loadTable_.get(), compensation_.get());
+            ChannelState sweep(fs2_, loadTable_.get(), design_.get());
             sweep.setToneControls(0.5, 0.5, 0.5);
             sweep.setFlattenCoeffs(st, fc);
             sweep.reset(kSagRef, st);
@@ -1367,7 +2152,7 @@ private:
     int osFactor_ = 2;                  ///< Oversampling factor (setup thread; 1 = off, 2 default).
 
     std::unique_ptr<LoadTable> loadTable_;
-    std::unique_ptr<detail::TubePreampCompensation> compensation_;
+    std::unique_ptr<detail::TubePreampCoreDesign> design_;   ///< Continuous core (factor >= 2).
     std::unique_ptr<Oversampling<T>> oversampler_;
     std::vector<std::unique_ptr<ChannelState>> channels_;
 

@@ -6,6 +6,14 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `wdf::ToneStackFMV::analogStateSpace()`: the continuous-time state space
+  of the Bassman tone network (capacitor voltages as states), from nodal
+  analysis of the same element values and topology as the R-type adaptor.
+  With an ideal source and load it matches the published analog transfer
+  function to 1e-8 relative.
+  `wdf::Resistor::getResistance()` and `wdf::Capacitor::getCapacitance()`
+  report element values.
+
 - `AudioIntervalAnalyzer`: bounded block-stream analysis of exact sample
   intervals, with RMS/peak/finite true peak, scoped loudness, explicit validity,
   optional continuous observations and no retained PCM. Reuses existing meters
@@ -152,15 +160,24 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
-- `TubePreamp` tabulates the implicit Koren load line, including cathode
-  feedback, instead of iterating the usual operating range per sample.
-  The shared per-instance table occupies 149768 bytes; the independent
-  current reference stays within 5e-10 A over five internal rates. A stereo
-  two-tone benchmark at 2x is 4.0-5.9 times faster than the previous solver
-  at the same factor, with the measurement conditions in the header.
-  The default remains 2x. This does not solve high-drive aliasing: the
-  updated spectral sweep includes +36 dB and finds worse 2x cases near
-  14 kHz than the previous sparse measurements.
+- `TubePreamp` tabulates the implicit Koren load line instead of iterating
+  it per sample (the independent current reference stays within 5e-10 A
+  over five internal rates), and at factors 2/4/8/16 solves the circuit in
+  continuous time inside each internal sample interval: a Farrow polynomial
+  reconstructs the grid input, intervals are split at the triode knees
+  (closed form where a stage is saturated, Gauss-Legendre nodes elsewhere),
+  the tone circuit is propagated exactly in its analog modal form and the
+  plate voltage is band-limited once, at the output, with an exact
+  compensation of the projection droop. At the 2x default the worst alias
+  component below 20 kHz of a 23-tone sweep up to +36 dB drive is
+  -80.6 dBc; 1.8.0 measured -9.8 dBc for two stages at +36 dB on the same
+  measurement. Against independent dense solutions of the same circuit
+  equations the 2x waveform error is at most -73.5 dB. Reported latency is
+  71/99/113/121 samples at 2/4/8/16x; 1x keeps the point circuit and zero
+  latency. The shared per-instance table occupies 156672 bytes. Stereo
+  processing at 2x costs 0.5-1.7 times 1.8.0 at the same factor (less for
+  clean and moderate settings, more for top-octave tones at +36 dB), with
+  the measurement conditions in the header. The default remains 2x.
 - `processBlock()` and `getLatency()` are the canonical in-place and audio
   delay names. Saturation's `process()` and the analog effects'
   `getLatencySamples()` remain compatible aliases. The cookbook documents

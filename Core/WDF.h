@@ -86,6 +86,9 @@ public:
 
     void setResistance(T ohms) noexcept { value_ = std::max(ohms, T(1e-9)); }
 
+    /** @brief Current resistance in ohms. */
+    [[nodiscard]] T getResistance() const noexcept { return value_; }
+
     void prepare(double) noexcept {}
     void updatePorts() noexcept { R_ = static_cast<double>(value_); }
     void reset() noexcept { a_ = 0; }
@@ -116,6 +119,9 @@ public:
     explicit Capacitor(T farads) noexcept : value_(farads) {}
 
     void setCapacitance(T farads) noexcept { value_ = std::max(farads, T(1e-18)); }
+
+    /** @brief Current capacitance in farads. */
+    [[nodiscard]] T getCapacitance() const noexcept { return value_; }
 
     void prepare(double sampleRate) noexcept { fs_ = sampleRate; }
     void updatePorts() noexcept { R_ = 1.0 / (2.0 * fs_ * static_cast<double>(value_)); }
@@ -875,6 +881,113 @@ public:
         root_.setVoltage(input);
         root_.process();
         return rLoad_.getVoltage();
+    }
+
+    /**
+     * @brief Continuous-time state space of the same network.
+     *
+     * States are the capacitor voltages (C1: input to treble pot, C2: slope
+     * node to bass rheostat, C3: slope node to middle wiper), the input is the
+     * source voltage and the output is the wiper voltage:
+     * dx/dt = a x + b u, y = c x + d u. The matrices are obtained by nodal
+     * analysis of the identical element values and topology used by the
+     * R-type adaptor, with each capacitor replaced by a voltage source.
+     * a = -diag(capacitance)^-1 G for a symmetric positive definite G.
+     * Allocation free; cost of a 10x10 elimination.
+     */
+    struct AnalogStateSpace
+    {
+        double a[3][3];
+        double b[3];
+        double c[3];
+        double d;
+        double capacitance[3];
+    };
+
+    [[nodiscard]] AnalogStateSpace analogStateSpace() const noexcept
+    {
+        // Unknowns: node voltages kVi..kW (7) then the three capacitor currents.
+        constexpr int kN = 10;
+        struct Element { int p, m; double value; bool capacitor; };
+        const Element elements[] = {
+            { kSrc, kVi, static_cast<double>(rOut_.getResistance()), false },
+            { kVi, kA, static_cast<double>(c1_.getCapacitance()), true },
+            { kA, kVo, static_cast<double>(r1Top_.getResistance()), false },
+            { kVo, kB, static_cast<double>(r1Bot_.getResistance()), false },
+            { kVi, kS, static_cast<double>(r4_.getResistance()), false },
+            { kS, kB, static_cast<double>(c2_.getCapacitance()), true },
+            { kB, kC, static_cast<double>(r2_.getResistance()), false },
+            { kS, kW, static_cast<double>(c3_.getCapacitance()), true },
+            { kC, kW, static_cast<double>(r3Top_.getResistance()), false },
+            { kW, -1, static_cast<double>(r3Bot_.getResistance()), false },
+            { kVo, -1, static_cast<double>(rLoad_.getResistance()), false } };
+        double m[kN][kN] {};
+        double rhs[kN][4] {};   // columns: unit C1, C2, C3 voltages, unit source
+        int capIndex = 0;
+        AnalogStateSpace out {};
+        for (const auto& e : elements)
+        {
+            const int p = e.p - 1, q = e.m < 0 ? -1 : e.m - 1;   // kSrc maps to -1
+            if (e.capacitor)
+            {
+                const int row = 7 + capIndex;
+                if (p >= 0) { m[p][row] += 1.0; m[row][p] += 1.0; }
+                if (q >= 0) { m[q][row] -= 1.0; m[row][q] -= 1.0; }
+                rhs[row][capIndex] = 1.0;
+                out.capacitance[capIndex] = e.value;
+                ++capIndex;
+                continue;
+            }
+            const double g = 1.0 / e.value;
+            if (e.p == kSrc)
+            {
+                // Source node is driven: its conductance stamps the RHS.
+                m[q][q] += g;
+                rhs[q][3] += g;
+                continue;
+            }
+            if (p >= 0) m[p][p] += g;
+            if (q >= 0) m[q][q] += g;
+            if (p >= 0 && q >= 0) { m[p][q] -= g; m[q][p] -= g; }
+        }
+        // Gaussian elimination with partial pivoting, four right-hand sides.
+        for (int k = 0; k < kN; ++k)
+        {
+            int piv = k;
+            for (int i = k + 1; i < kN; ++i)
+                if (std::abs(m[i][k]) > std::abs(m[piv][k])) piv = i;
+            if (piv != k)
+                for (int j = 0; j < kN; ++j) std::swap(m[piv][j], m[k][j]);
+            if (piv != k)
+                for (int j = 0; j < 4; ++j) std::swap(rhs[piv][j], rhs[k][j]);
+            for (int i = k + 1; i < kN; ++i)
+            {
+                const double f = m[i][k] / m[k][k];
+                if (f == 0.0) continue;
+                for (int j = k; j < kN; ++j) m[i][j] -= f * m[k][j];
+                for (int j = 0; j < 4; ++j) rhs[i][j] -= f * rhs[k][j];
+            }
+        }
+        for (int i = kN - 1; i >= 0; --i)
+            for (int j = 0; j < 4; ++j)
+            {
+                double v = rhs[i][j];
+                for (int k = i + 1; k < kN; ++k) v -= m[i][k] * rhs[k][j];
+                rhs[i][j] = v / m[i][i];
+            }
+        // Capacitor current flows from its first node to its second node.
+        for (int j = 0; j < 4; ++j)
+        {
+            for (int k = 0; k < 3; ++k)
+            {
+                const double dv = rhs[7 + k][j] / out.capacitance[k];
+                if (j < 3) out.a[k][j] = dv;
+                else out.b[k] = dv;
+            }
+            if (j < 3) out.c[j] = rhs[kVo - 1][j];
+            else out.d = rhs[kVo - 1][j];
+        }
+        return out;
     }
 
 private:

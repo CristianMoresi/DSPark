@@ -1625,10 +1625,11 @@ namespace {
 
 void yehCoeffs(double t, double l, double m,
                double& b1, double& b2, double& b3,
-               double& a1, double& a2, double& a3)
+               double& a1, double& a2, double& a3,
+               double R1 = 250e3, double R3 = 25e3)
 {
     const double C1 = 0.25e-9, C2 = 20e-9, C3 = 20e-9;
-    const double R1 = 250e3, R2 = 1e6, R3 = 25e3, R4 = 56e3;
+    const double R2 = 1e6, R4 = 56e3;
     const double R3sq = R3 * R3;
 
     b1 = t * C1 * R1 + m * C3 * R3 + l * (C1 * R2 + C2 * R2) + (C1 * R3 + C2 * R3);
@@ -1707,6 +1708,80 @@ DSPARK_TEST(WDF_RType_FMV_matches_Yeh_transfer_function)
             for (double m : { 0.1, 0.9 })
                 EXPECT_LT(fmvResidualDb(t, l, m), -80.0);
     EXPECT_LT(fmvResidualDb(0.5, 0.5, 0.5), -80.0);
+}
+
+namespace {
+
+std::complex<double> stateSpaceResponse(const wdf::ToneStackFMV<double>::AnalogStateSpace& ss,
+                                        std::complex<double> s)
+{
+    // c (sI - a)^-1 b + d by complex elimination with partial pivoting.
+    std::complex<double> m[3][4];
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = 0; j < 3; ++j) m[i][j] = (i == j ? s : 0.0) - ss.a[i][j];
+        m[i][3] = ss.b[i];
+    }
+    for (int k = 0; k < 3; ++k)
+    {
+        int pivot = k;
+        for (int i = k + 1; i < 3; ++i)
+            if (std::abs(m[i][k]) > std::abs(m[pivot][k])) pivot = i;
+        for (int j = 0; j < 4; ++j) std::swap(m[pivot][j], m[k][j]);
+        for (int i = k + 1; i < 3; ++i)
+        {
+            const std::complex<double> f = m[i][k] / m[k][k];
+            for (int j = k; j < 4; ++j) m[i][j] -= f * m[k][j];
+        }
+    }
+    std::complex<double> x[3];
+    for (int i = 2; i >= 0; --i)
+    {
+        std::complex<double> v = m[i][3];
+        for (int k = i + 1; k < 3; ++k) v -= m[i][k] * x[k];
+        x[i] = v / m[i][i];
+    }
+    return ss.c[0] * x[0] + ss.c[1] * x[1] + ss.c[2] * x[2] + ss.d;
+}
+
+} // namespace
+
+DSPARK_TEST(WDF_FMV_analog_state_space_matches_Yeh_transfer_function)
+{
+    // The continuous-time form must equal the published ANALOG transfer
+    // function, not only its bilinear image. The 0.5 ohm end resistances of
+    // every pot are part of the network, so the pot totals are R + 1 ohm.
+    // With a near-ideal source and load the residual is 8e-9; the wrong pot
+    // totals alone leave 4e-5.
+    constexpr double kRmin = 0.5;
+    for (double t : {0.0, 0.1, 0.5, 0.9, 1.0})
+        for (double l : {0.0, 0.1, 0.5, 0.9, 1.0})
+            for (double m : {0.0, 0.1, 0.5, 0.9, 1.0})
+            {
+                wdf::ToneStackFMV<double> stack(1e-6, 1e14);
+                stack.prepare(48000.0);
+                stack.setControls(t, std::sqrt(l), m);
+                const auto ss = stack.analogStateSpace();
+                const double tEff = (t * 250e3 + kRmin) / (250e3 + 2.0 * kRmin);
+                const double lEff = (l * 1e6 + kRmin) / 1e6;
+                const double mEff = (m * 25e3 + kRmin) / (25e3 + 2.0 * kRmin);
+                double b1, b2, b3, a1, a2, a3;
+                yehCoeffs(tEff, lEff, mEff, b1, b2, b3, a1, a2, a3,
+                          250e3 + 2.0 * kRmin, 25e3 + 2.0 * kRmin);
+                for (double f : {10.0, 100.0, 1000.0, 10000.0, 40000.0})
+                {
+                    const std::complex<double> s(0.0, 2.0 * 3.14159265358979323846 * f);
+                    const auto expected = (b1 * s + b2 * s * s + b3 * s * s * s)
+                                        / (1.0 + a1 * s + a2 * s * s + a3 * s * s * s);
+                    EXPECT_LT(std::abs(stateSpaceResponse(ss, s) - expected) / std::abs(expected), 1e-7);
+                }
+                // a = -C^-1 G with G symmetric: C a is symmetric.
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                        EXPECT_NEAR(ss.capacitance[i] * ss.a[i][j], ss.capacitance[j] * ss.a[j][i],
+                                    1e-10 * std::max(std::abs(ss.capacitance[i] * ss.a[i][i]),
+                                                     std::abs(ss.capacitance[j] * ss.a[j][j])));
+            }
 }
 
 

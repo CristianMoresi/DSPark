@@ -24,6 +24,8 @@
 #include <numeric>
 #include <array>
 #include <atomic>
+#include <complex>
+#include <numbers>
 #include <thread>
 #include <vector>
 
@@ -1766,6 +1768,8 @@ DSPARK_TEST(TubePreamp_default_rejects_high_gain_foldback)
 {
     // At 2x the 15 kHz, -6 dBFS tone folded 18.2 dB below its fundamental
     // through two stages at +24 dB. Also cover the worse neighboring tones.
+    // The ADAA core reached -36.2 dBc here; the continuous-time core
+    // measures -95.8 / -97.4 / -98.9 dBc.
     for (double sourceFrequency : {14000.0, 15000.0, 18000.0})
     {
         TubePreamp<double> amp;
@@ -1809,9 +1813,9 @@ DSPARK_TEST(TubePreamp_default_rejects_high_gain_foldback)
             folded = std::max(folded, amplitude(frequency));
         }
         EXPECT_GT(fundamental, 1.0);
-        EXPECT_LT(20.0 * std::log10(folded / fundamental), -32.0);
+        EXPECT_LT(20.0 * std::log10(folded / fundamental), -80.0);
         EXPECT_EQ(amp.getOversamplingFactor(), 2);
-        EXPECT_EQ(amp.getLatency(), 73);
+        EXPECT_EQ(amp.getLatency(), 71);
     }
 }
 
@@ -1894,244 +1898,383 @@ DSPARK_TEST(TubePreamp_current_surface_matches_implicit_circuit)
     }
 }
 
-DSPARK_TEST(TubePreamp_antiderivatives_match_numerical_integration)
+DSPARK_TEST(TubePreamp_phi_functions_match_their_definition)
 {
-    // Four-point Gauss-Legendre, subdivided on the nonlinear branch. This
-    // oracle evaluates the curve, not the production primitive.
-    constexpr long double nodes[] = {-0.8611363115940525752L, -0.3399810435848562648L,
-                                      0.3399810435848562648L, 0.8611363115940525752L};
-    constexpr long double weights[] = {0.3478548451374538574L, 0.6521451548625461426L,
-                                       0.6521451548625461426L, 0.3478548451374538574L};
-    for (double a : {-100.0, -1.0, -1e-7, 0.0, 1e-7, 0.1, 1.0, 20.0})
-        for (double b : {-40.0, -0.1, 0.0, 1e-8, 0.100000001, 0.7, 10.0, 100.0})
-        {
-            const long double lo = std::min(a, b), hi = std::max(a, b);
-            long double area = 0.0L;
-            if (lo < 0.0L)
-            {
-                const long double end = std::min(hi, 0.0L);
-                area = (end - lo) * (end + lo) * 0.5L;
-            }
-            if (hi > 0.0L)
-            {
-                long double positiveArea = 0.0L;
-                const long double start = std::max(lo, 0.0L);
-                const int cells = std::max(1, static_cast<int>(std::ceil((hi - start) / 0.02L)));
-                const long double h = (hi - start) / cells;
-                for (int c = 0; c < cells; ++c)
-                    for (int q = 0; q < 4; ++q)
-                    {
-                        const long double v = start + h * (c + 0.5L + 0.5L * nodes[q]);
-                        positiveArea += h * 0.5L * weights[q] * 0.7L * std::tanh(v / 0.7L);
-                    }
-                area += positiveArea;
-            }
-            const double expected = hi > lo ? static_cast<double>(area / (hi - lo)) : a;
-            const double actual = detail::TubePreampGridClamp::average(a, b,
-                detail::TubePreampGridClamp::primitive(a), detail::TubePreampGridClamp::primitive(b));
-            EXPECT_NEAR(actual, expected, 2e-12);
-        }
-
-    for (double rate : {44100.0, 96000.0, 384000.0})
+    // phi_k(w) = sum_j w^j / (j + k)! weights the exact forced response of
+    // each tone-circuit mode. Independent evaluation: a 60-term series for
+    // |w| < 1, otherwise (e^w - sum_{j<k} w^j / j!) / w^k. The points cover
+    // both production branches and the stiff range of the stack.
+    for (double w : {-2000.0, -1042.0, -40.0, -7.5, -1.0, -0.5000001, -0.4999999, -0.3,
+                     -0.1, -0.02, -1e-3, -1e-9, 0.0, 1e-9, 1e-3, 0.02, 0.1, 0.3,
+                     0.4999999, 0.5000001, 1.0, 3.0})
     {
-        auto table = std::make_unique<detail::TubePreampCurrentTable>(rate);
-        for (double supply : {80.0, 127.999, 128.0, 220.7, 303.999})
-            for (double a : {-100.0, -16.0, -6.0, -2.0, -1.03, 0.0, 0.999})
-                for (double b : {-24.0, -8.0, -1.1, -0.01, 0.7, 0.999999})
+        double p[5];
+        detail::tubePreampPhi(w, p);
+        for (int k = 0; k <= 4; ++k)
+        {
+            long double expected = 0.0L;
+            if (std::abs(w) < 1.0)
+            {
+                long double term = 1.0L;
+                for (int j = 1; j <= k; ++j) term /= j;
+                for (int j = 0; j < 60; ++j)
                 {
-                    const double lo = std::min(a, b), hi = std::max(a, b);
-                    // Split at every R knot. Two Gaussian samples integrate
-                    // each cubic exactly, without using its coefficients.
-                    std::vector<double> edges{lo, hi};
-                    for (int k = 0; k < 272; ++k)
-                    {
-                        const double r = k <= 16 ? -0.08 + k * 0.0025
-                            : (k <= 31 ? -0.04 + (k - 16) * 0.001 : -0.025 + (k - 31) / 6400.0);
-                        if (r * supply > lo && r * supply < hi) edges.push_back(r * supply);
-                    }
-                    std::sort(edges.begin(), edges.end());
-                    long double area = 0.0L;
-                    for (size_t j = 1; j < edges.size(); ++j)
-                    {
-                        const double mid = 0.5 * (edges[j - 1] + edges[j]);
-                        const double half = 0.5 * (edges[j] - edges[j - 1]);
-                        area += half * (table->eval(supply, mid - half / std::sqrt(3.0))
-                                     + table->eval(supply, mid + half / std::sqrt(3.0)));
-                    }
-                    const double expected = static_cast<double>(area / (hi - lo));
-                    EXPECT_NEAR(table->average(supply, a, b), expected, 2e-16);
-                    const double pa = table->primitive(supply, a), pb = table->primitive(supply, b);
-                    // Direct subtraction of cumulative primitives has a
-                    // roundoff bound proportional to their magnitudes. Test
-                    // the integral itself; the stable average above retains
-                    // its stricter current tolerance even for tiny intervals.
-                    const double roundoff = 16.0 * std::numeric_limits<double>::epsilon()
-                        * (std::abs(pa) + std::abs(pb) + 1e-6);
-                    EXPECT_NEAR(pb - pa, static_cast<double>(area) * (b > a ? 1.0 : -1.0), roundoff);
+                    expected += term;
+                    term *= static_cast<long double>(w) / (j + k + 1);
                 }
-        // Local divided differences must remain accurate at tiny amplitudes.
-        for (double grid : {-6.0, -2.0, -1.03, -0.01, 0.7})
-            for (double delta : {0.0, 1e-13, -1e-11, 1e-8, -1e-6})
-                EXPECT_NEAR(table->average(279.31, grid, grid + delta),
-                            table->eval(279.31, grid + 0.5 * delta), 2e-16);
+            }
+            else
+            {
+                long double partial = 0.0L, term = 1.0L;
+                for (int j = 0; j < k; ++j)
+                {
+                    partial += term;
+                    term *= static_cast<long double>(w) / (j + 1);
+                }
+                expected = (std::exp(static_cast<long double>(w)) - partial)
+                         / std::pow(static_cast<long double>(w), k);
+            }
+            EXPECT_NEAR(p[k], static_cast<double>(expected),
+                        1e-12 * std::abs(static_cast<double>(expected)));
+        }
     }
 }
 
-DSPARK_TEST(TubePreamp_second_antiderivative_matches_independent_quadrature)
+namespace {
+std::complex<double> tubeStackResponse(const wdf::ToneStackFMV<double>::AnalogStateSpace& ss,
+                                       std::complex<double> s)
 {
-    // A second divided difference is a triangular density in value space.
-    // Integrate the original clamp, never its production antiderivatives.
-    constexpr double nodes[] = {-0.8611363115940525752, -0.3399810435848562648,
-                                0.3399810435848562648, 0.8611363115940525752};
-    constexpr double weights[] = {0.3478548451374538574, 0.6521451548625461426,
-                                   0.6521451548625461426, 0.3478548451374538574};
-    const auto curve = [](long double x) { return x <= 0.0L ? x : 0.7L * std::tanh(x / 0.7L); };
-    for (double x : {-100.0, -0.1, -1e-8, 0.0, 1e-8, 0.01, 0.699999, 0.7, 0.700001, 10.0, 100.0})
+    // c (sI - a)^-1 b + d by complex elimination with partial pivoting.
+    std::complex<double> m[3][4];
+    for (int i = 0; i < 3; ++i)
     {
-        long double expected = 0.0L;
-        if (x <= 0.0) expected = static_cast<long double>(x) * x * x / 6.0L;
-        else
-        {
-            const int count = std::max(1, static_cast<int>(std::ceil(x / 0.01)));
-            const long double h = static_cast<long double>(x) / count;
-            for (int j = 0; j < count; ++j)
-                for (int k = 0; k < 4; ++k)
-                {
-                    const long double u = h * (j + 0.5L + 0.5L * nodes[k]);
-                    expected += 0.5L * h * weights[k] * (x - u) * curve(u);
-                }
-        }
-        EXPECT_NEAR(detail::TubePreampGridClamp::primitive2(x), static_cast<double>(expected),
-                    2e-12 * std::max(1.0, std::abs(static_cast<double>(expected))));
+        for (int j = 0; j < 3; ++j) m[i][j] = (i == j ? s : 0.0) - ss.a[i][j];
+        m[i][3] = ss.b[i];
     }
-    for (double a : {-40.0, -0.1, -1e-5, 0.0, 0.1, 1.0, 30.0})
-        for (double b : {-10.0, -1e-5, 0.0, 1e-7, 0.100000001, 0.7, 30.0})
-            for (double c : {a, b, 0.0, 0.10000000001, 20.0})
+    for (int k = 0; k < 3; ++k)
+    {
+        int pivot = k;
+        for (int i = k + 1; i < 3; ++i)
+            if (std::abs(m[i][k]) > std::abs(m[pivot][k])) pivot = i;
+        for (int j = 0; j < 4; ++j) std::swap(m[pivot][j], m[k][j]);
+        for (int i = k + 1; i < 3; ++i)
+        {
+            const std::complex<double> f = m[i][k] / m[k][k];
+            for (int j = k; j < 4; ++j) m[i][j] -= f * m[k][j];
+        }
+    }
+    std::complex<double> x[3];
+    for (int i = 2; i >= 0; --i)
+    {
+        std::complex<double> v = m[i][3];
+        for (int k = i + 1; k < 3; ++k) v -= m[i][k] * x[k];
+        x[i] = v / m[i][i];
+    }
+    return ss.c[0] * x[0] + ss.c[1] * x[1] + ss.c[2] * x[2] + ss.d;
+}
+} // namespace
+
+DSPARK_TEST(TubePreamp_tone_modes_reproduce_the_analog_state_space)
+{
+    // The modal form propagated by the continuous core must keep the
+    // transfer function of the analog state space over the whole control
+    // cube, including bass 0 / middle 1, where one mode is so fast that a
+    // single 96 kHz interval spans about a thousand of its time constants.
+    constexpr double rate = 96000.0;
+    double stiffest = 0.0;
+    for (double t : {0.0, 0.5, 1.0})
+        for (double b : {0.0, 0.5, 1.0})
+            for (double m : {0.0, 0.5, 1.0})
             {
-                std::array<double, 3> sorted{a, b, c};
-                std::sort(sorted.begin(), sorted.end());
-                const double lo = sorted[0], mid = sorted[1], hi = sorted[2];
-                long double expected = curve(lo);
-                if (hi > lo)
+                wdf::ToneStackFMV<double> stack(38e3, 1e6);
+                stack.prepare(rate);
+                stack.setControls(t, b, m);
+                const auto ss = stack.analogStateSpace();
+                detail::TubePreampToneModes modes;
+                modes.design(ss, rate);
+                for (int k = 0; k < 3; ++k)
                 {
-                    expected = 0.0L;
-                    for (int half = 0; half < 2; ++half)
-                    {
-                        const double begin = half == 0 ? lo : mid;
-                        const double end = half == 0 ? mid : hi;
-                        if (end <= begin) continue;
-                        std::vector<double> edges{begin, end};
-                        if (begin < 0.0 && end > 0.0) edges.insert(edges.begin() + 1, 0.0);
-                        for (size_t segment = 1; segment < edges.size(); ++segment)
-                        {
-                            const int count = std::max(1, static_cast<int>(std::ceil((edges[segment] - edges[segment - 1]) / 0.02)));
-                            const long double h = (static_cast<long double>(edges[segment]) - edges[segment - 1]) / count;
-                            for (int j = 0; j < count; ++j)
-                                for (int k = 0; k < 4; ++k)
-                                {
-                                    const long double u = edges[segment - 1] + h * (j + 0.5L + 0.5L * nodes[k]);
-                                    const long double density = 2.0L * (half == 0 ? u - lo : hi - u)
-                                        / ((static_cast<long double>(end) - begin) * (hi - lo));
-                                    expected += 0.5L * h * weights[k] * density * curve(u);
-                                }
-                        }
-                    }
+                    EXPECT_LT(modes.lambda[k], 0.0);
+                    stiffest = std::min(stiffest, modes.lambda[k]);
                 }
-                const double actual = detail::TubePreampGridClamp::divided(a, b, c,
-                    detail::TubePreampGridClamp::primitive2(a), detail::TubePreampGridClamp::primitive2(b),
-                    detail::TubePreampGridClamp::primitive2(c));
-                EXPECT_NEAR(actual, static_cast<double>(expected), 2e-11);
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                    {
+                        double product = 0.0;
+                        for (int k = 0; k < 3; ++k) product += modes.toModal[i][k] * modes.toPhysical[k][j];
+                        EXPECT_NEAR(product, i == j ? 1.0 : 0.0, 1e-12);
+                    }
+                for (double f : {20.0, 200.0, 2000.0, 20000.0, 45000.0})
+                {
+                    const std::complex<double> s(0.0, 2.0 * std::numbers::pi * f);
+                    std::complex<double> modal = modes.direct;
+                    for (int k = 0; k < 3; ++k)
+                        modal += modes.gamma[k] * modes.beta[k] * rate / (s - modes.lambda[k] * rate);
+                    const auto expected = tubeStackResponse(ss, s);
+                    EXPECT_LT(std::abs(modal - expected) / std::abs(expected), 1e-9);
+                }
             }
+    EXPECT_LT(stiffest, -500.0);
 }
 
-DSPARK_TEST(TubePreamp_coherent_sweep_resolves_aliases_next_to_fundamental)
+DSPARK_TEST(TubePreamp_core_reconstruction_and_projection_are_accurate)
+{
+    // Input reconstruction: the Farrow polynomial of each internal interval
+    // reproduces every complex tone up to 22 kHz at 48 kHz (scaled with the
+    // factor) at all interval positions. Output projection: the order-6
+    // B-spline pieces form a partition of unity, and the linear-phase FIR
+    // inverts their sinc^6 droop over the same band.
+    constexpr double bounds[] = {-80.0, -100.0, -104.0, -100.0};
+    int index = 0;
+    for (int factor : {2, 4, 8, 16})
+    {
+        const detail::TubePreampCoreDesign design(factor);
+        const int taps = design.taps, degree = design.degree;
+        const double band = 22000.0 / (48000.0 * factor);
+        double worst = 0.0;
+        for (int iw = 0; iw <= 200; ++iw)
+        {
+            const double w = 2.0 * std::numbers::pi * band * iw / 200.0;
+            for (int it = 0; it <= 100; ++it)
+            {
+                const double tau = it / 100.0;
+                std::complex<double> value = 0.0;
+                for (int j = 0; j < taps; ++j)
+                {
+                    const double* row = design.farrow + j * (degree + 1);
+                    double c = row[degree];
+                    for (int p = degree - 1; p >= 0; --p) c = c * tau + row[p];
+                    value += c * std::polar(1.0, w * (j - taps / 2 + 1));
+                }
+                worst = std::max(worst, std::abs(value - std::polar(1.0, w * tau)));
+            }
+        }
+        EXPECT_LT(20.0 * std::log10(worst), bounds[index]);
+
+        for (int i = 0; i <= 100; ++i)
+        {
+            const double d = -0.5 + i / 100.0;
+            double sum = 0.0;
+            for (const auto& piece : design.kernel)
+            {
+                double v = 0.0;
+                for (int p = detail::TubePreampCoreDesign::kKernelOrder - 1; p >= 0; --p)
+                    v = v * d + piece[static_cast<size_t>(p)];
+                EXPECT_GT(v, -1e-15);
+                sum += v;
+            }
+            EXPECT_NEAR(sum, 1.0, 1e-13);
+        }
+
+        const auto& c = design.compensation;
+        size_t first = 0;
+        while (first < c.size() && c[first] == 0.0) ++first;
+        const size_t half = (c.size() - 1 - first) / 2, centre = first + half;
+        for (size_t q = 1; q <= half; ++q) EXPECT_EQ(c[centre - q], c[centre + q]);
+        for (int i = 0; i <= 400; ++i)
+        {
+            const double f = band * i / 400.0;
+            double response = 0.0;
+            for (size_t n = 0; n < c.size(); ++n)
+                response += c[n] * std::cos(2.0 * std::numbers::pi * f
+                                            * (static_cast<double>(n) - static_cast<double>(centre)));
+            const double sinc = f == 0.0 ? 1.0 : std::sin(std::numbers::pi * f) / (std::numbers::pi * f);
+            EXPECT_LT(std::abs(20.0 * std::log10(response * std::pow(sinc, 6))), 1e-4);
+        }
+        ++index;
+    }
+}
+
+namespace {
+// Worst component below 20 kHz other than DC and the exact harmonics, in dB
+// relative to the tone. Coherent 16384-point measurement at an odd bin.
+// The caller prepares the amp once per setting; reset() restores the settled
+// operating point before every tone.
+double tubeCoherentSpurDbc(TubePreamp<double>& amp, double nominal, double level)
 {
     constexpr int size = 16384, block = 256;
-    FFTReal<double> fft(size);
+    int bin = static_cast<int>(nominal * size / 48000.0 + 0.5);
+    if ((bin & 1) == 0) ++bin;
+    amp.reset();
     AudioBuffer<double> audio;
     audio.resize(1, block);
     std::vector<double> capture(size), spectrum(size + 2);
+    for (int pos = 0; pos < 6 * size; pos += block)
+    {
+        for (int j = 0; j < block; ++j)
+            audio.getChannel(0)[j] = std::pow(10.0, level / 20.0)
+                * std::sin(2.0 * std::numbers::pi * bin * (pos + j) / size);
+        amp.processBlock(audio.toView());
+        if (pos >= 5 * size)
+            std::copy_n(audio.getChannel(0), block, capture.data() + pos - 5 * size);
+    }
+    FFTReal<double> fft(size);
+    fft.forward(capture.data(), spectrum.data());
+    const auto magnitude = [&](int k) {
+        return std::hypot(spectrum[static_cast<size_t>(2 * k)], spectrum[static_cast<size_t>(2 * k + 1)]);
+    };
+    double folded = 0.0;
+    for (int k = 1; k * 48000 < 20000 * size; ++k)
+        if (k % bin != 0) folded = std::max(folded, magnitude(k));
+    return 20.0 * std::log10(folded / magnitude(bin));
+}
+} // namespace
+
+DSPARK_TEST(TubePreamp_coherent_sweep_resolves_aliases_next_to_fundamental)
+{
     // Exact coherent bins: a +/-2-bin Hann mask would hide the fifth-harmonic
     // alias next to 16 kHz. Include between-kHz failures from independent QA.
-    for (double nominal : {1000., 2000., 3000., 4000., 5000., 6000., 7000., 8000.,
-                           9000., 10000., 11000., 12000., 12750., 13000., 14000.,
-                           15000., 15250., 16000., 17000., 18000., 19000., 19250., 20000.})
+    // The published ADAA core measured -36.2 dBc at +24 dB (two stages) and
+    // -19.2 / -22.5 dBc at +36 dB (two / one stage) on this sweep.
+    struct Setting { int stages; double drive, bound; };
+    for (const Setting setting : {Setting{2, 24.0, -75.0}, Setting{2, 36.0, -75.0},
+                                  Setting{1, 36.0, -75.0}})
     {
-        int bin = static_cast<int>(nominal * size / 48000.0 + 0.5);
-        if ((bin & 1) == 0) ++bin;
         TubePreamp<double> amp;
-        amp.setStages(2);
-        amp.setDrive(24.0);
-        amp.prepare(spec(48000.0, block, 1));
-        for (int pos = 0; pos < 6 * size; pos += block)
+        amp.setStages(setting.stages);
+        amp.setDrive(setting.drive);
+        amp.prepare(spec(48000.0, 256, 1));
+        for (double nominal : {1000., 2000., 3000., 4000., 5000., 6000., 7000., 8000.,
+                               9000., 10000., 11000., 12000., 12750., 13000., 14000.,
+                               15000., 15250., 16000., 17000., 18000., 19000., 19250., 20000.})
         {
-            for (int j = 0; j < block; ++j)
-                audio.getChannel(0)[j] = std::pow(10.0, -6.0 / 20.0)
-                    * std::sin(2.0 * std::numbers::pi * bin * (pos + j) / size);
-            amp.processBlock(audio.toView());
-            if (pos >= 5 * size)
-                std::copy_n(audio.getChannel(0), block, capture.data() + pos - 5 * size);
+            const double ratio = tubeCoherentSpurDbc(amp, nominal, -6.0);
+            if (ratio >= setting.bound)
+                std::cerr << "TubePreamp " << setting.stages << " stage(s) +" << setting.drive
+                          << " dB tone " << nominal << " Hz: " << ratio << " dBc\n";
+            EXPECT_LT(ratio, setting.bound);
         }
-        fft.forward(capture.data(), spectrum.data());
-        const auto magnitude = [&](int k) {
-            return std::hypot(spectrum[static_cast<size_t>(2 * k)], spectrum[static_cast<size_t>(2 * k + 1)]);
-        };
-        double folded = 0.0;
-        for (int k = 1; k * 48000 < 20000 * size; ++k)
-            if (k % bin != 0) folded = std::max(folded, magnitude(k));
-        const double ratio = 20.0 * std::log10(folded / magnitude(bin));
-        if (ratio >= -32.0) std::cerr << "TubePreamp tone " << 48000.0 * bin / size << " Hz: " << ratio << " dBc\n";
-        EXPECT_LT(ratio, -32.0);
     }
 }
 
-DSPARK_TEST(TubePreamp_adaa_compensation_is_flat_and_delay_aligned)
+DSPARK_TEST(TubePreamp_wet_path_latency_matches_point_circuit)
 {
-    for (int factor : {2, 4, 8, 16})
+    // The point circuit at 1x has no resampler and no core delay: its wet
+    // phase anchors the reported latency of every oversampled factor. At
+    // -12 dB drive the stages are nearly linear; the remaining difference is
+    // the bilinear warping of the 1x circuit (0.014 samples, 0.025 dB measured).
+    constexpr int size = 8192, block = 256;
+    constexpr std::array<int, 4> bins {171, 853, 1707, 2561};   // about 1, 5, 10, 15 kHz
+    std::array<std::array<std::array<std::complex<double>, 4>, 5>, 2> phasor {};
+    int row = 0;
+    for (int factor : {1, 2, 4, 8, 16})
     {
-        detail::TubePreampCompensation compensation(factor);
+        TubePreamp<double> amp;
+        amp.setOversampling(factor);
+        amp.setDrive(-12.0);
+        amp.setSag(0.0);
+        amp.prepare(spec(48000.0, block, 1));
+        const int latency = amp.getLatency();
+        AudioBuffer<double> audio;
+        audio.resize(1, block);
         for (int stages : {1, 2})
         {
-            FIRFilter<double> eq;
-            const auto& taps = compensation.taps[static_cast<size_t>(stages - 1)];
-            eq.prepare(static_cast<int>(taps.size()), 1);
-            eq.setCoefficients(taps);
-            std::vector<double> impulse(128);
-            std::array<double, 6> previous{};
-            for (int n = 0; n < 128; ++n)
+            amp.setStages(stages);
+            for (size_t column = 0; column < bins.size(); ++column)
             {
-                double x = n == 0 ? 1.0 : 0.0;
-                // Grid ADAA2: (1 + z^-1 + z^-2)/3. The plate-current
-                // ADAA1 contributes (1 + z^-1)/2 in each active stage.
-                for (int j = 0; j < stages; ++j)
+                const int bin = bins[column];
+                amp.reset();
+                std::complex<double> sum = 0.0;
+                const int total = 2 * size + latency;
+                for (int pos = 0; pos < total; pos += block)
                 {
-                    const size_t k = static_cast<size_t>(3 * j);
-                    const double old = x;
-                    x = (x + previous[k] + previous[k + 1]) / 3.0;
-                    previous[k + 1] = previous[k];
-                    previous[k] = old;
-                    const double grid = x;
-                    x = 0.5 * (x + previous[k + 2]);
-                    previous[k + 2] = grid;
+                    const int count = std::min(block, total - pos);
+                    for (int j = 0; j < count; ++j)
+                        audio.getChannel(0)[j] = 0.1 * std::sin(2.0 * std::numbers::pi * bin * (pos + j) / size);
+                    amp.processBlock(audio.toView().getSubView(0, count));
+                    for (int j = 0; j < count; ++j)
+                    {
+                        const int n = pos + j - latency - size;
+                        if (n >= 0)
+                            sum += audio.getChannel(0)[j] * std::polar(1.0, -2.0 * std::numbers::pi * bin * n / size);
+                    }
                 }
-                impulse[static_cast<size_t>(n)] = eq.processSample(x, 0);
-            }
-            // Covers the WHOLE base-rate Nyquist band, not just the tone
-            // calibration's 6.4 kHz ceiling. The delay is stage independent.
-            for (int k = 0; k <= 200; ++k)
-            {
-                const double w = std::numbers::pi * k / (200.0 * factor);
-                double re = 0.0, im = 0.0;
-                for (int n = 0; n < 128; ++n)
-                {
-                    const double phase = w * (n - compensation.latency * factor);
-                    re += impulse[static_cast<size_t>(n)] * std::cos(phase);
-                    im += impulse[static_cast<size_t>(n)] * std::sin(phase);
-                }
-                EXPECT_LT(std::abs(20.0 * std::log10(re)), 0.10);
-                EXPECT_NEAR(im, 0.0, 2e-13);
+                phasor[static_cast<size_t>(stages - 1)][static_cast<size_t>(row)][column] = sum;
             }
         }
+        ++row;
+    }
+    for (const auto& stage : phasor)
+        for (size_t factor = 1; factor < stage.size(); ++factor)
+            for (size_t k = 0; k < bins.size(); ++k)
+            {
+                const auto ratio = stage[factor][k] / stage[0][k];
+                const double delay = -std::arg(ratio) * size / (2.0 * std::numbers::pi * bins[k]);
+                EXPECT_LT(std::abs(delay), 0.05);
+                EXPECT_LT(std::abs(20.0 * std::log10(std::abs(ratio))), 0.1);
+            }
+}
+
+namespace {
+std::vector<double> renderTubeTone(int factor, double rate, int stages, double drive,
+                                   double treble, double bass, double middle, double hz)
+{
+    TubePreamp<double> amp;
+    amp.setOversampling(factor);
+    amp.setStages(stages);
+    amp.setDrive(drive);
+    amp.setTreble(treble);
+    amp.setBass(bass);
+    amp.setMiddle(middle);
+    amp.prepare(spec(rate, 4096, 1));
+    const int latency = amp.getLatency();
+    const size_t total = static_cast<size_t>(0.15 * rate) + static_cast<size_t>(latency);
+    std::vector<double> y(total);
+    for (size_t i = 0; i < total; ++i)
+        y[i] = 0.25 * std::sin(2.0 * std::numbers::pi * hz * static_cast<double>(i) / rate);
+    for (size_t pos = 0; pos < total; pos += 4096)
+    {
+        const int count = static_cast<int>(std::min<size_t>(4096, total - pos));
+        double* channels[] = { y.data() + pos };
+        amp.processBlock({ channels, 1, count });
+    }
+    y.erase(y.begin(), y.begin() + latency);
+    return y;
+}
+
+std::complex<double> tubeHarmonic(const std::vector<double>& y, double rate, double hz, int harmonic)
+{
+    // The last 30 periods (an integer number of samples at both rates used).
+    const size_t count = static_cast<size_t>(30.0 * rate / hz + 0.5), from = y.size() - count;
+    std::complex<double> sum = 0.0;
+    for (size_t i = from; i < y.size(); ++i)
+        sum += y[i] * std::polar(1.0, -2.0 * std::numbers::pi * harmonic * hz
+                                     * static_cast<double>(i - from) / rate);
+    return 2.0 * sum / static_cast<double>(count);
+}
+} // namespace
+
+DSPARK_TEST(TubePreamp_continuous_core_matches_independent_point_circuit)
+{
+    // Independent reference: the point-sampled circuit (factor 1: implicit
+    // current table with trapezoidal cathode, WDF tone stack and sag) run at
+    // 32x the base rate, where it agrees with a 64x run. At the default 2x
+    // the continuous core must reproduce the reference gain and harmonic
+    // structure (each harmonic below 20 kHz relative to the fundamental,
+    // with the fundamental's phase removed). The published ADAA core
+    // measured -15.1 / -39.3 dBc and -2.36 / -0.35 dB on these two cases.
+    struct Case { int stages; double drive, treble, bass, middle, hz, bound; };
+    for (const Case c : {Case{2, 36.0, 1.0, 1.0, 1.0, 3000.0, -55.0},
+                         Case{2, 24.0, 0.5, 0.0, 1.0, 1000.0, -70.0}})
+    {
+        const double referenceRate = 48000.0 * 32.0;
+        const auto reference = renderTubeTone(1, referenceRate, c.stages, c.drive,
+                                              c.treble, c.bass, c.middle, c.hz);
+        const auto actual = renderTubeTone(2, 48000.0, c.stages, c.drive,
+                                           c.treble, c.bass, c.middle, c.hz);
+        const auto r1 = tubeHarmonic(reference, referenceRate, c.hz, 1);
+        const auto a1 = tubeHarmonic(actual, 48000.0, c.hz, 1);
+        EXPECT_LT(std::abs(20.0 * std::log10(std::abs(a1) / std::abs(r1))), 0.05);
+        double worst = 0.0;
+        for (int h = 2; h * c.hz <= 20000.0; ++h)
+        {
+            const auto r = tubeHarmonic(reference, referenceRate, c.hz, h)
+                         / std::pow(r1 / std::abs(r1), h) / std::abs(r1);
+            const auto a = tubeHarmonic(actual, 48000.0, c.hz, h)
+                         / std::pow(a1 / std::abs(a1), h) / std::abs(a1);
+            worst = std::max(worst, std::abs(a - r));
+        }
+        EXPECT_LT(20.0 * std::log10(worst), c.bound);
     }
 }
 
@@ -2210,7 +2353,7 @@ DSPARK_TEST(TubePreamp_dc_operating_point_and_legacy_state)
         const auto oldState = legacy.blob();
         EXPECT_TRUE(amp.setState(oldState.data(), oldState.size()));
         EXPECT_EQ(amp.getOversamplingFactor(), 2);
-        EXPECT_EQ(amp.getLatency(), 73);
+        EXPECT_EQ(amp.getLatency(), 71);
     }
 }
 

@@ -650,6 +650,12 @@ def _start_owned_process(
     return owned
 
 
+def _synchronization_diagnostic(stderr: bytes, mutant: str) -> str | None:
+    expected = _SYNC_DIAGNOSTICS[mutant]
+    return next((line.strip() for line in stderr.decode("utf-8", errors="replace").splitlines()
+                 if expected in line), None)
+
+
 def _launch(executable: Path, copies: int, shared: Path,
             temporary_parent: Path, log_directory: Path,
             timeout_seconds: int, synchronization_root: Path | None,
@@ -710,15 +716,9 @@ def _launch(executable: Path, copies: int, shared: Path,
         while any(_group_alive(process) for process in processes):
             observe_roots()
             if synchronization_mutant is not None:
-                expected = _SYNC_DIAGNOSTICS[synchronization_mutant]
                 for _, stderr_path in log_paths:
-                    stderr = stderr_path.read_text(
-                        encoding="utf-8", errors="replace")
-                    matching = next(
-                        (line.strip() for line in stderr.splitlines()
-                         if expected in line),
-                        None,
-                    )
+                    matching = _synchronization_diagnostic(
+                        stderr_path.read_bytes(), synchronization_mutant)
                     if matching is not None:
                         early_diagnostic = matching
                         break
@@ -765,6 +765,10 @@ def _launch(executable: Path, copies: int, shared: Path,
             stop_state["wait_failed_after_kill"] = True
         stdout = paths[0].read_bytes()
         stderr = paths[1].read_bytes()
+        # A short-lived child can emit its diagnostic and exit between polls.
+        # Its final stderr is authoritative even when no live sweep saw it.
+        if synchronization_mutant is not None and early_diagnostic is None:
+            early_diagnostic = _synchronization_diagnostic(stderr, synchronization_mutant)
         exit_code = process.returncode if process.returncode is not None else -1
         results.append(
             {
@@ -1178,6 +1182,8 @@ def _windows_process_tree_self_test() -> int:
 
 def _collision_rendezvous_self_test() -> int:
     """Exercise the real TestIO barrier with delayed and missing participants."""
+    from unittest.mock import patch
+
     record: dict[str, object] = {"status": "FAIL", "cases": [], "build_commands": []}
     repo = Path(__file__).resolve().parents[1]
     root = Path(tempfile.mkdtemp(prefix="dspark-collision-rendezvous-")).resolve()
@@ -1262,6 +1268,7 @@ endforeach()
             ("no-arrival-negative-control", "legacy", "delayed", None, 15),
             ("missing-readiness", "candidate", "aligned", "missing-readiness", 15),
             ("missing-attempted", "candidate", "aligned", "missing-attempted", 15),
+            ("completed-diagnostic", "candidate", "aligned", "missing-attempted", 15),
             ("duplicate-identity", "candidate", "aligned", "duplicate-identity", 15),
             ("stalled-arrival-watchdog", "candidate", "stalled", None, 2),
         ]
@@ -1270,8 +1277,18 @@ endforeach()
             shared, temporary, logs, sync = (directory / n for n in ("shared", "temporary", "logs", "sync"))
             for path in (shared, temporary, logs, sync):
                 path.mkdir(parents=True)
-            outcome = _launch(binaries[binary], 3, shared, temporary, logs,
-                              budget, sync, mutant, (scenario,))
+            original_group_alive = _group_alive
+
+            def query_after_exit(process: _OwnedProcess) -> bool:
+                # Force all leaders to finish before the first monitor sweep,
+                # reproducing completion between polls without timing guesses.
+                process.wait(timeout=budget)
+                return original_group_alive(process)
+
+            query = query_after_exit if name == "completed-diagnostic" else original_group_alive
+            with patch.dict(globals(), _group_alive=query):
+                outcome = _launch(binaries[binary], 3, shared, temporary, logs,
+                                  budget, sync, mutant, (scenario,))
             _validate_process_cleanup({"results": outcome["results"]})
             if outcome["launch_error"] is not None:
                 raise RuntimeError(str(outcome["launch_error"]))
@@ -1284,7 +1301,7 @@ endforeach()
                 raise RuntimeError(f"unexpected run timeout: {name}")
             elif mutant:
                 if _SYNC_DIAGNOSTICS[mutant] not in str(outcome["early_diagnostic"]):
-                    raise RuntimeError(f"missing synchronization diagnostic: {name}")
+                    raise RuntimeError(f"missing synchronization diagnostic: {name}; stderr={errors}")
             elif binary == "legacy":
                 if "DSPARK_TESTIO_SYNC_TIMEOUT: readiness" not in errors:
                     raise RuntimeError("arrival-race negative control did not fail")

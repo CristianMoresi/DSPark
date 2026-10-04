@@ -11,7 +11,9 @@
  * kernels. Two complete bounded source scans produce separate SuperFlux attack
  * and spectral pulse maps. Spectra pool channel power, not L+R. A 1 ms power
  * map refines timing, recovers isolated quiet restarts, and follows each event
- * into its local body. Zero padding
+ * into its local body. Upper-band evidence recovers attacks masked by decaying
+ * bass without interpreting the high-pass filter's bass leakage as new onsets.
+ * Zero padding
  * covers both source boundaries; returned event positions are source-relative
  * int64 frames.
  *
@@ -22,7 +24,8 @@
  *
  * Threading: analyze() is a synchronous worker call, never an audio callback.
  * Analysis owns immutable, move-only results; borrowed spans require its
- * lifetime. Dependencies: OfflineEnergyAnalyzer.h and detail/OnsetFeatures.h.
+ * lifetime. Dependencies: OfflineEnergyAnalyzer.h, detail/OnsetFeatures.h and
+ * Core/Biquad.h.
  */
 
 #include "OfflineEnergyAnalyzer.h"
@@ -30,6 +33,7 @@
 #if DSPARK_HAS_OFFLINE
 
 #include "detail/OnsetFeatures.h"
+#include "../Core/Biquad.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -47,7 +51,7 @@ namespace dspark
 template <FloatType T> class OfflineTransientAnalyzer final
 {
   public:
-    static constexpr std::uint32_t algorithmRevision = 3;
+    static constexpr std::uint32_t algorithmRevision = 4;
     struct Options
     {
         bool attacks = true;
@@ -69,6 +73,7 @@ template <FloatType T> class OfflineTransientAnalyzer final
         bool endLimited = false;  ///< Body transition not resolved before the search boundary.
         bool overlapsNext = false;
         bool energyRestart = false; ///< Source-energy restart instead of a spectral candidate.
+        bool bandRefined = false; ///< Attack/body localized above 800 Hz under a lower-frequency bed.
     };
 
     /** @brief Distinct novelty functions and SuperFlux registers from one
@@ -211,6 +216,13 @@ template <FloatType T> class OfflineTransientAnalyzer final
                 // Charge all length-dependent feature work before scanning any PCM.
                 job.charge(detail::offlineBytes(microCount, sizeof(MicroBin)));
                 job.charge(detail::offlineBytes(featureCount, sizeof(FeatureFrame)));
+                if (options.attacks)
+                {
+                    job.charge(detail::offlineBytes(microCount, sizeof(double)));
+                    job.charge(detail::offlineBytes(featureCount, sizeof(bool)));
+                    job.charge(detail::offlineBytes(
+                        static_cast<std::uint64_t>(candidate.frameSize_ / 2 + 1), sizeof(double)));
+                }
                 job.charge(detail::offlineBytes(static_cast<std::uint64_t>(candidate.frameSize_) *
                                                     2 * spec.channels,
                                                 sizeof(T)));
@@ -230,17 +242,28 @@ template <FloatType T> class OfflineTransientAnalyzer final
                 auto micro = std::make_unique<MicroBin[]>(static_cast<std::size_t>(microCount));
                 auto features =
                     std::make_unique<FeatureFrame[]>(static_cast<std::size_t>(featureCount));
+                auto highPower = options.attacks
+                                     ? std::make_unique<double[]>(static_cast<std::size_t>(microCount))
+                                     : nullptr;
+                auto highEvidence = options.attacks
+                                        ? std::make_unique<bool[]>(static_cast<std::size_t>(featureCount))
+                                        : nullptr;
                 candidate.featureCount_ = static_cast<std::size_t>(featureCount);
-                scanFeatures(source, spec, candidate, microHop, micro.get(), features.get(), job,
-                             jobOptions.blockFrames);
+                scanFeatures(source, spec, candidate, microHop, micro.get(), highPower.get(),
+                             highEvidence.get(), features.get(), job, jobOptions.blockFrames);
                 const auto microView =
                     std::span<const MicroBin>(micro.get(), static_cast<std::size_t>(microCount));
                 const auto featureView =
                     std::span<const FeatureFrame>(features.get(), candidate.featureCount_);
+                const auto highView = std::span<const double>(
+                    highPower.get(), highPower ? static_cast<std::size_t>(microCount) : 0);
+                const auto evidenceView = std::span<const bool>(
+                    highEvidence.get(), highEvidence ? candidate.featureCount_ : 0);
                 if (options.attacks)
-                    buildEvents(candidate, featureView, microView, microHop, false, job);
+                    buildEvents(candidate, featureView, microView, highView, evidenceView,
+                                microHop, false, job);
                 if (options.pulses)
-                    buildEvents(candidate, featureView, microView, microHop, true, job);
+                    buildEvents(candidate, featureView, microView, {}, {}, microHop, true, job);
                 if (options.retainFeatures)
                     candidate.features_ = std::move(features);
             }
@@ -266,8 +289,26 @@ template <FloatType T> class OfflineTransientAnalyzer final
         std::int64_t peakFrame = 0;
     };
 
+    // The same refinement and body tracker serve full-band and high-band power.
+    // Peak samples always come from the original linked source, not the filter.
+    struct PowerView
+    {
+        std::span<const MicroBin> source;
+        std::span<const double> high;
+        PowerView(std::span<const MicroBin> full, std::span<const double> band = {}) noexcept
+            : source(full), high(band)
+        {
+        }
+        [[nodiscard]] std::size_t size() const noexcept { return source.size(); }
+        [[nodiscard]] double operator[](std::size_t i) const noexcept
+        {
+            return high.empty() ? source[i].power : high[i];
+        }
+    };
+
     static void scanFeatures(OfflineAudioSource<T> &source, const OfflineAudioSpec &spec,
                              const Analysis &analysis, int microHop, MicroBin *micro,
+                             double *highPower, bool *highEvidence,
                              FeatureFrame *features, detail::OfflineSession &job, int blockFrames)
     {
         const int size = analysis.frameSize_, hop = analysis.hop_;
@@ -277,6 +318,20 @@ template <FloatType T> class OfflineTransientAnalyzer final
         spectrum.prepare(size);
         novelty.prepare(spec.sampleRate, size, true);
         detail::OfflineBlock<T> scratch(job, spec, blockFrames);
+        Biquad<double> highPass;
+        std::unique_ptr<double[]> highGains;
+        if (highPower)
+        {
+            const auto coefficients = BiquadCoeffs::makeHighPass(spec.sampleRate, 800);
+            highPass.setCoeffsNow(coefficients);
+            highGains = std::make_unique<double[]>(static_cast<std::size_t>(size / 2 + 1));
+            for (int k = 0; k <= size / 2; ++k)
+            {
+                const double gain = coefficients.getMagnitude(
+                    static_cast<double>(k) * spec.sampleRate / size, spec.sampleRate);
+                highGains[static_cast<std::size_t>(k)] = gain * gain;
+            }
+        }
         OfflineFingerprint fingerprint;
         int write = 0, inHop = 0;
         std::size_t frame = 0;
@@ -299,6 +354,7 @@ template <FloatType T> class OfflineTransientAnalyzer final
             const auto magnitudes = spectrum.magnitudes();
             double windowPower = 0;
             double lowPower = 0;
+            double filteredLow = 0, filteredHigh = 0;
             for (std::size_t k = 0; k < magnitudes.size(); ++k)
             {
                 const double magnitude = static_cast<double>(magnitudes[k]) / size;
@@ -306,12 +362,23 @@ template <FloatType T> class OfflineTransientAnalyzer final
                     magnitude * magnitude * (k == 0 || k + 1 == magnitudes.size() ? 1 : 2);
                 windowPower += power;
                 if (static_cast<double>(k) * spec.sampleRate / size < 800)
+                {
                     lowPower += power;
+                    if (highGains)
+                        filteredLow += power * highGains[k];
+                }
+                else if (highGains)
+                    filteredHigh += power * highGains[k];
             }
             const auto value = novelty.process(spectrum.magnitudes(), {},
                                                detail::OnsetNovelty<T>::Method::BothFlux);
             if (!value.valid || !std::isfinite(value.value) || !std::isfinite(value.spectralFlux))
                 detail::offlineFail(OfflineStatus::NumericalFailure);
+            // A finite-order high-pass still passes some bass. Require a majority
+            // of its predicted spectral power above the split before using the
+            // band for timing; residual bass cycles alone are not new attacks.
+            if (highEvidence)
+                highEvidence[frame] = filteredHigh > 0 && filteredHigh >= filteredLow;
             features[frame++] = {value.value, value.spectralFlux, value.registers, windowPower,
                                  windowPower > 0 ? lowPower / windowPower : 0};
         };
@@ -326,6 +393,7 @@ template <FloatType T> class OfflineTransientAnalyzer final
             {
                 std::array<T, 2> values{};
                 double power = 0;
+                double high = 0;
                 for (int c = 0; c < spec.channels; ++c)
                 {
                     const T raw = block.getChannel(c)[f];
@@ -337,11 +405,19 @@ template <FloatType T> class OfflineTransientAnalyzer final
                         detail::offlineFail(OfflineStatus::SourceMismatch);
                     values[static_cast<std::size_t>(c)] = static_cast<T>(value);
                     power += value * value;
+                    if (highPower)
+                    {
+                        const double filtered = highPass.processSample(value, c);
+                        high += filtered * filtered;
+                    }
                 }
                 power /= spec.channels;
                 const auto position = first + f;
                 auto &bin = micro[static_cast<std::size_t>(position / microHop)];
                 bin.power += power / microHop;
+                if (highPower)
+                    highPower[static_cast<std::size_t>(position / microHop)] +=
+                        high / spec.channels / microHop;
                 if (power > bin.peakPower)
                 {
                     bin.peakPower = power;
@@ -360,18 +436,19 @@ template <FloatType T> class OfflineTransientAnalyzer final
             detail::offlineFail(OfflineStatus::NumericalFailure);
     }
 
-    [[nodiscard]] static double meanPower(std::span<const MicroBin> micro, std::int64_t begin,
+    [[nodiscard]] static double meanPower(PowerView micro, std::int64_t begin,
                                           std::int64_t end) noexcept
     {
         double sum = 0;
         for (auto i = std::max<std::int64_t>(0, begin);
              i < std::min<std::int64_t>(static_cast<std::int64_t>(micro.size()), end); ++i)
-            sum += micro[static_cast<std::size_t>(i)].power;
-        return end > begin ? std::min(1.0, sum / static_cast<double>(end - begin)) : 0;
+            sum += micro[static_cast<std::size_t>(i)];
+        const double mean = end > begin ? sum / static_cast<double>(end - begin) : 0;
+        return micro.high.empty() ? std::min(1.0, mean) : mean;
     }
 
     [[nodiscard]] static bool refine(Event &event, std::int64_t reference,
-                                     std::span<const MicroBin> micro, int microHop,
+                                     PowerView micro, int microHop,
                                      const OfflineAudioSpec &spec, bool bass) noexcept
     {
         const auto radius =
@@ -437,12 +514,12 @@ template <FloatType T> class OfflineTransientAnalyzer final
             const double quiet = after * 1e-6;
             const auto earliest = std::max<std::int64_t>(2, selected - 40);
             for (auto i = selected - 1; i >= earliest; --i)
-                if (micro[static_cast<std::size_t>(i)].power <= quiet &&
-                    micro[static_cast<std::size_t>(i - 1)].power <= quiet &&
-                    micro[static_cast<std::size_t>(i - 2)].power <= quiet)
+                if (micro[static_cast<std::size_t>(i)] <= quiet &&
+                    micro[static_cast<std::size_t>(i - 1)] <= quiet &&
+                    micro[static_cast<std::size_t>(i - 2)] <= quiet)
                 {
                     auto onset = i + 1;
-                    while (onset < selected && micro[static_cast<std::size_t>(onset)].power <= quiet)
+                    while (onset < selected && micro[static_cast<std::size_t>(onset)] <= quiet)
                         ++onset;
                     if (onset < selected)
                     {
@@ -458,9 +535,9 @@ template <FloatType T> class OfflineTransientAnalyzer final
         const double floor = before + 0.05 * best;
         auto begin = selected;
         while (begin > 0 && begin > selected - 5 &&
-               micro[static_cast<std::size_t>(begin - 1)].power > floor)
+               micro[static_cast<std::size_t>(begin - 1)] > floor)
             --begin;
-        while (begin < to && micro[static_cast<std::size_t>(begin)].power <= floor)
+        while (begin < to && micro[static_cast<std::size_t>(begin)] <= floor)
             ++begin;
         // A waveform half-cycle can rise sharply without a new attack. Check
         // the enclosing energy step as well as the 3 ms localization gradient.
@@ -475,17 +552,17 @@ template <FloatType T> class OfflineTransientAnalyzer final
         const double broadAfter = meanPower(micro, begin, std::min(begin + 20, availableEnd));
         if (broadAfter - broadBefore < 0.08 * broadAfter)
             return false;
-        const auto &bin = micro[static_cast<std::size_t>(begin)];
+        const auto &bin = micro.source[static_cast<std::size_t>(begin)];
         event.begin = begin * microHop;
         // Preserve the exact position of an isolated single-frame impulse.
-        if (bin.peakPower > 0.95 * bin.power * microHop)
+        if (micro.high.empty() && bin.peakPower > 0.95 * bin.power * microHop)
             event.begin = bin.peakFrame;
         event.peak = event.begin;
         event.end = event.begin + 1;
         return true;
     }
 
-    [[nodiscard]] static double maximumPower(std::span<const MicroBin> micro, std::int64_t begin,
+    [[nodiscard]] static double maximumPower(PowerView micro, std::int64_t begin,
                                              std::int64_t end) noexcept
     {
         double maximum = 0;
@@ -495,6 +572,7 @@ template <FloatType T> class OfflineTransientAnalyzer final
     }
 
     static void followBody(Event &event, const Event *next, std::span<const MicroBin> micro,
+                           std::span<const double> highPower,
                            int microHop, const OfflineAudioSpec &spec, double scale) noexcept
     {
         const auto begin = event.begin / microHop;
@@ -505,12 +583,13 @@ template <FloatType T> class OfflineTransientAnalyzer final
         const auto horizon = (next ? std::min(limitFrame, next->begin) : limitFrame);
         const auto stop = std::max(begin + 1, (horizon - 1) / microHop + 1);
         const auto tailBegin = std::max(begin, stop - 25);
-        const double sustain = meanPower(micro, tailBegin, stop);
+        const PowerView body(micro, event.bandRefined ? highPower : std::span<const double>{});
+        const double sustain = meanPower(body, tailBegin, stop);
         double crest = 0;
         auto crestBin = begin;
         for (auto i = begin; i < std::min(stop, begin + 40); ++i)
         {
-            const double power = meanPower(micro, i - 1, i + 2);
+            const double power = meanPower(body, i - 1, i + 2);
             if (power > crest)
             {
                 crest = power;
@@ -522,7 +601,7 @@ template <FloatType T> class OfflineTransientAnalyzer final
         {
             const double floor = sustain + 0.1 * (crest - sustain);
             for (auto i = crestBin + 1; i < stop; ++i)
-                if (meanPower(micro, i - 1, i + 2) <= floor && meanPower(micro, i, i + 3) <= floor)
+                if (meanPower(body, i - 1, i + 2) <= floor && meanPower(body, i, i + 3) <= floor)
                 {
                     end = i;
                     break;
@@ -533,7 +612,7 @@ template <FloatType T> class OfflineTransientAnalyzer final
         event.endLimited = end == stop && horizon < spec.frames;
         event.overlapsNext = event.endLimited && next && horizon == next->begin;
         event.end = std::min(horizon, std::max(event.begin + 1, end * microHop));
-        event.sustainRms = std::sqrt(sustain) * scale;
+        event.sustainRms = std::sqrt(meanPower(micro, tailBegin, stop)) * scale;
         double peak = 0;
         for (auto i = begin; i < stop && i * microHop < event.end; ++i)
         {
@@ -548,7 +627,8 @@ template <FloatType T> class OfflineTransientAnalyzer final
     }
 
     static void buildEvents(Analysis &analysis, std::span<const FeatureFrame> features,
-                            std::span<const MicroBin> micro, int microHop, bool pulse,
+                            std::span<const MicroBin> micro, std::span<const double> highPower,
+                            std::span<const bool> highEvidence, int microHop, bool pulse,
                             detail::OfflineSession &job)
     {
         const auto spec = analysis.energy_.getSpec();
@@ -577,10 +657,10 @@ template <FloatType T> class OfflineTransientAnalyzer final
                 if ((i & 1023u) == 0)
                     job.checkpoint(OfflinePhase::Plan, static_cast<std::int64_t>(i),
                                    static_cast<std::int64_t>(features.size()));
-                // Ending a tone spreads its spectrum but loses total windowed
-                // energy. Do not spend the picker gap on that offset or relocate
-                // it onto an earlier waveform cycle during time refinement.
-                if (i > 0 && features[i].windowPower <= features[i - 1].windowPower)
+                // Preserve the separate pulse policy. An attack may add upper
+                // frequencies while a louder bass body loses total energy;
+                // source-domain refinement below decides whether it is real.
+                if (pulse && i > 0 && features[i].windowPower <= features[i - 1].windowPower)
                     continue;
                 // A padded spectrum can turn the file's ending into novelty.
                 // Events there require source-domain evidence, supplied below.
@@ -592,9 +672,24 @@ template <FloatType T> class OfflineTransientAnalyzer final
                 // Source energy, not novelty energy: stopping a bass note spreads
                 // its novelty into high bands without changing the source register.
                 const bool bass = features[i].lowEnergyShare > 0.8;
-                if (!refine(event, analysis.featureCenter(i) + offset, micro, microHop, spec,
-                            bass) ||
-                    (last >= 0 && event.begin - last < gapFrames))
+                if (!refine(event, analysis.featureCenter(i) + offset, micro, microHop, spec, bass))
+                {
+                    if (pulse || highPower.empty() ||
+                        !refine(event, analysis.featureCenter(i) + offset,
+                                PowerView(micro, highPower), microHop, spec, false))
+                        continue;
+                    // The novelty window precedes the actual onset. Check the
+                    // nearest window to the refined source position, not that
+                    // earlier window dominated by the preceding bass body.
+                    const auto evidence = static_cast<std::size_t>(std::clamp<std::int64_t>(
+                        (event.begin + analysis.frameSize_ / 2 + analysis.hop_ / 2) /
+                                analysis.hop_ - 1,
+                        0, static_cast<std::int64_t>(features.size() - 1)));
+                    if (!highEvidence[evidence])
+                        continue;
+                    event.bandRefined = true;
+                }
+                if (last >= 0 && event.begin - last < gapFrames)
                     continue;
                 event.strength =
                     static_cast<double>((pulse ? features[i].pulse : features[i].attack) / maximum);
@@ -684,8 +779,8 @@ template <FloatType T> class OfflineTransientAnalyzer final
         visit([&](Event event) { events[at++] = event; });
         for (std::size_t i = 0; i < count; ++i)
         {
-            followBody(events[i], i + 1 < count ? &events[i + 1] : nullptr, micro, microHop, spec,
-                       analysis.energy_.samplePeak());
+            followBody(events[i], i + 1 < count ? &events[i + 1] : nullptr, micro, highPower,
+                       microHop, spec, analysis.energy_.samplePeak());
             job.checkpoint(OfflinePhase::Plan, static_cast<std::int64_t>(i + 1),
                            static_cast<std::int64_t>(count));
         }

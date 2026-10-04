@@ -26,7 +26,7 @@ from check_public_text import canonical_text_bytes
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_DIRECTORIES = ("Core", "Effects", "Analysis", "IO", "Music")
 EXPECTED_INSTALLED_HEADERS = 147
-EXPECTED_ORDINARY_TESTS = 1191
+EXPECTED_ORDINARY_TESTS = 1193
 PRODUCT_P7_COMMIT = "d8a98a6cf3a7c88af7e57a442f34b88fe869885a"
 PRODUCT_P7_PARENT = "e1913513e424a5ae0dbf24fbe9ac42980d2876a3"
 PACKAGE_SOURCE_URL_PREFIX = (

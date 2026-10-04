@@ -239,6 +239,21 @@ eight annotated 9-100 ms bursts at six rates, dense attacks and soft bass over a
 sustained bed. The burst fixtures require starts within 2 ms and ends within 4 ms;
 the soft bass fixture requires starts within 10 ms and no extra note-off events.
 
+A new upper-register attack can occur while a louder bass body is losing energy.
+Attack selection therefore does not require the whole spectral window to grow.
+When full-band timing refinement fails, an above-800-Hz power map reuses Core's
+`Biquad` and the same refinement checks. The shared source spectrum must confirm
+that a majority of the predicted filtered power lies above 800 Hz, evaluated at
+the refined onset. This rejects residual bass cycles passed by the finite-order
+filter. It does not accept a spectral timestamp without source-power evidence.
+Regression fixtures cover weak attacks over decaying bass, six sample rates,
+float/double, block partitioning and the corresponding no-attack controls.
+
+`Event::bandRefined` marks this path. Its body follows the upper-band decay;
+`peakAmplitude` and `sustainRms` still measure the original linked source. The
+separate pulse map and retained spectral features do not use this additional
+attack policy. Host caches should distinguish detector `algorithmRevision = 4`.
+
 Event bodies follow local smoothed power into a sustain reference. The search ends
 at the next onset, 250 ms, or the source end. `endLimited` marks an unresolved body
 transition at a search boundary; `overlapsNext` identifies that boundary as the next
@@ -254,6 +269,10 @@ spans. `featureCenter(i)` gives the Hann window center, including padding outsid
 the source; this is distinct from a refined event position. Features include both
 novelty curves, four SuperFlux registers, window power and low-band energy share.
 Disable both maps and feature retention to perform just the energy scan.
+When attacks are enabled, temporary upper-band evidence adds one double per
+1 ms bin, one boolean per spectral frame and one double per nonnegative FFT bin.
+It is included in the job's memory budget and is released after map construction.
+Pulse-only or feature-only analysis does not allocate this additional evidence.
 
 The same source identity, revision, fingerprint, cancellation and memory contracts
 apply. Changed PCM between scans produces `SourceMismatch` and no analysis.

@@ -94,7 +94,8 @@ bool sameEvents(std::span<const typename OfflineTransientAnalyzer<T>::Event> a,
         if (a[i].begin != b[i].begin || a[i].peak != b[i].peak || a[i].end != b[i].end ||
             a[i].strength != b[i].strength || a[i].contrast != b[i].contrast ||
             a[i].peakAmplitude != b[i].peakAmplitude || a[i].sustainRms != b[i].sustainRms ||
-            a[i].endLimited != b[i].endLimited || a[i].overlapsNext != b[i].overlapsNext)
+            a[i].endLimited != b[i].endLimited || a[i].overlapsNext != b[i].overlapsNext ||
+            a[i].energyRestart != b[i].energyRestart || a[i].bandRefined != b[i].bandRefined)
             return false;
     return true;
 }
@@ -488,4 +489,113 @@ DSPARK_TEST(OfflineTransient_Soft_Bass_Notes_Over_Sustained_Bed)
                 EXPECT_NEAR(double(detected[e]) / rate, 0.2 + 0.45 * static_cast<double>(e), 0.010);
         }
     }
+}
+
+namespace
+{
+// Independent additive components: the bass loses more power than a new quiet
+// upper-register hit adds. Both attack clocks are known before any analysis.
+template <class T> AudioBuffer<T> maskedAttacks(int rate, double amplitude)
+{
+    AudioBuffer<T> input;
+    input.resize(2, rate);
+    const std::array<double, 3> frequencies =
+        rate == 8000 ? std::array<double, 3>{1733, 2521, 3313}
+                     : std::array<double, 3>{3251, 5099, 7027};
+    for (int i = 0; i < rate; ++i)
+    {
+        const double time = static_cast<double>(i) / rate;
+        const double beat = time - .5 * std::floor(time / .5);
+        double value = .6 * std::exp(-beat / .12) * std::sin(twoPi<double> * 83 * beat);
+        for (int attack = 1; attack < 8; ++attack)
+        {
+            const auto onset = static_cast<int>(std::llround(attack * .125 * rate));
+            const double elapsed = static_cast<double>(i - onset) / rate;
+            if (elapsed >= 0 && elapsed < .06)
+                value += amplitude * (1 - std::exp(-elapsed / .0003)) * std::exp(-elapsed / .01) *
+                         (.5 * std::cos(twoPi<double> * frequencies[0] * elapsed) +
+                          .3 * std::cos(twoPi<double> * frequencies[1] * elapsed) +
+                          .2 * std::cos(twoPi<double> * frequencies[2] * elapsed));
+        }
+        input.getChannel(0)[i] = static_cast<T>(value);
+        input.getChannel(1)[i] = -static_cast<T>(value);
+    }
+    return input;
+}
+} // namespace
+
+DSPARK_TEST(OfflineTransient_MaskedHighAttacks_And_Bodies)
+{
+    const auto verify = []<class T>() {
+        for (const int rate : {8000, 44100, 48000, 96000, 192000, 384000})
+            for (const double amplitude : {0.0, .015, .06})
+            {
+                const auto input = maskedAttacks<T>(rate, amplitude);
+                OfflineBufferSource<T> source(input.toView(), rate);
+                const auto result = OfflineTransientAnalyzer<T>{}.analyze(source);
+                EXPECT_TRUE(result.succeeded());
+                const auto events = result.analysis.attacks();
+                EXPECT_EQ(events.size(), amplitude == 0 ? std::size_t(2) : std::size_t(8));
+                if (events.size() != (amplitude == 0 ? 2u : 8u))
+                    continue;
+                std::size_t refined = 0;
+                for (std::size_t i = 0; i < events.size(); ++i)
+                {
+                    const double expected = static_cast<double>(i) * (amplitude == 0 ? .5 : .125);
+                    EXPECT_NEAR(static_cast<double>(events[i].begin) / rate, expected, .002);
+                    EXPECT_TRUE(events[i].begin <= events[i].peak && events[i].peak < events[i].end);
+                    if (events[i].bandRefined)
+                    {
+                        ++refined;
+                        const double body = static_cast<double>(events[i].end - events[i].begin) / rate;
+                        // The upper component decays in about 15 ms. Following
+                        // the unrelated bass instead would extend the hold.
+                        EXPECT_GT(body, .005);
+                        EXPECT_LT(body, .035);
+                    }
+                }
+                EXPECT_TRUE(amplitude == 0 ? refined == 0 : refined >= 6);
+            }
+    };
+    verify.template operator()<float>();
+    verify.template operator()<double>();
+}
+
+DSPARK_TEST(OfflineTransient_MaskedAttacks_Partitions_And_PulseIndependence)
+{
+    auto input = maskedAttacks<double>(48000, .015);
+    OfflineBufferSource<double> source(input.toView(), 48000);
+    OfflineTransientAnalyzer<double> analyzer;
+    const auto reference = analyzer.analyze(source, {true, true, true});
+    EXPECT_TRUE(reference.succeeded());
+    for (const int block : {1, 17, 4093})
+    {
+        OfflineJobOptions job;
+        job.blockFrames = block;
+        const auto result = analyzer.analyze(source, {true, true, true}, job);
+        EXPECT_TRUE(result.succeeded());
+        EXPECT_TRUE(sameEvents<double>(reference.analysis.attacks(), result.analysis.attacks()));
+        EXPECT_TRUE(sameEvents<double>(reference.analysis.pulses(), result.analysis.pulses()));
+    }
+    const auto pulses = analyzer.analyze(source, {false, true, true});
+    EXPECT_TRUE(pulses.succeeded());
+    EXPECT_TRUE(pulses.analysis.attacks().empty());
+    EXPECT_TRUE(sameEvents<double>(reference.analysis.pulses(), pulses.analysis.pulses()));
+    EXPECT_LT(pulses.memoryBytes, reference.memoryBytes);
+    const auto original = reference.analysis.features();
+    const auto separate = pulses.analysis.features();
+    EXPECT_EQ(original.size(), separate.size());
+    if (original.size() == separate.size())
+        for (std::size_t i = 0; i < original.size(); ++i)
+        {
+            EXPECT_EQ(original[i].attack, separate[i].attack);
+            EXPECT_EQ(original[i].pulse, separate[i].pulse);
+            EXPECT_TRUE(original[i].registers == separate[i].registers);
+            EXPECT_EQ(original[i].windowPower, separate[i].windowPower);
+            EXPECT_EQ(original[i].lowEnergyShare, separate[i].lowEnergyShare);
+        }
+    for (int i = 0; i < input.getNumSamples(); ++i)
+        input.getChannel(1)[i] = input.getChannel(0)[i];
+    const auto dualMono = analyzer.analyze(source);
+    EXPECT_TRUE(sameEvents<double>(reference.analysis.attacks(), dualMono.analysis.attacks()));
 }

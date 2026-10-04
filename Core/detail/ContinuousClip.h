@@ -118,10 +118,53 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
         }
         return out;
     }
+    std::array<Moments, 2> tanhQuadrature(const Poly &p, double a, double b) const
+    {
+        // Embedded G7/K15 rules reuse seven evaluations in the error estimate.
+        // Symmetric abscissae and weights are defined on [-1,1]. This changes
+        // neither the curve nor the adaptive tolerance below.
+        static constexpr std::array<double, 8> nodes{
+            .99145537112081263921, .94910791234275852453, .86486442335976907279,
+            .74153118559939443986, .58608723546769113029, .40584515137739716691,
+            .20778495500789846760, 0.};
+        static constexpr std::array<double, 8> fineWeights{
+            .02293532201052922496, .06309209262997855329, .10479001032225018384,
+            .14065325971552591875, .16900472663926790283, .19035057806478540991,
+            .20443294007529889241, .20948214108472782801};
+        static constexpr std::array<double, 4> coarseWeights{
+            .12948496616886969327, .27970539148927666790,
+            .38183005050511894495, .41795918367346938776};
+        std::array<Moments, 2> result{};
+        const double half = (b - a) * .5, center = a + half;
+        const auto accumulate = [&](double t, double fineWeight, double coarseWeight)
+        {
+            const double x = value(p, t);
+            const double reference = SubtractLinear ? referenceSlope * x : 0.;
+            double v = half * (clipperShape<C>(x, ceiling_) - reference);
+            for (int j = 0; j < MomentCount; ++j)
+            {
+                result[1][j] += fineWeight * v;
+                if (coarseWeight != 0.) result[0][j] += coarseWeight * v;
+                v *= t;
+            }
+        };
+        accumulate(center, fineWeights[7], coarseWeights[3]);
+        for (int i = 0; i < 7; ++i)
+        {
+            const double coarseWeight = i % 2 ? coarseWeights[i / 2] : 0.;
+            accumulate(center - half * nodes[i], fineWeights[i], coarseWeight);
+            accumulate(center + half * nodes[i], fineWeights[i], coarseWeight);
+        }
+        return result;
+    }
     Moments adaptive(const Poly &p, double a, double b, int depth = 0) const
     {
-        const auto coarse = quadrature(p, a, b, linearQuadrature_);
-        const auto fine = quadrature(p, a, b, nonlinearQuadrature_);
+        const auto estimates = [&] {
+            if constexpr (C == Curve::Tanh) return tanhQuadrature(p, a, b);
+            else return std::array<Moments, 2>{quadrature(p, a, b, linearQuadrature_),
+                                             quadrature(p, a, b, nonlinearQuadrature_)};
+        }();
+        const auto &coarse = estimates[0], &fine = estimates[1];
         const double scale =
             1 + std::abs(value(p, a)) + std::abs(value(p, b)) + std::abs(value(p, (a + b) / 2));
         const double tolerance = (b - a) * 1e-13 * scale;

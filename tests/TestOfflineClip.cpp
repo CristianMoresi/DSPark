@@ -573,6 +573,54 @@ DSPARK_TEST(OfflineClip_DirectMomentsRemainScaledAtTinyCeilings)
         }
 }
 
+DSPARK_TEST(OfflineClip_TanhMomentsMatchAnalyticIntegrals)
+{
+    using detail::ClipperCurve;
+    using detail::continuous_clip::Interval;
+    // A constant has known moments. An affine input's zeroth moment follows
+    // from integral(tanh(x), dx) = log(cosh(x)), independently of quadrature.
+    const auto logCosh = [](long double x)
+    {
+        const auto magnitude = std::abs(x);
+        return magnitude + std::log1p(std::exp(-2 * magnitude)) - std::log(2.L);
+    };
+    for (double ceiling : {1e-8, .1, 1., 4., 1e4})
+    {
+        Interval<ClipperCurve::Tanh, 11, false, false> direct(ceiling);
+        Interval<ClipperCurve::Tanh, 11, true, true> residual(ceiling);
+        for (double value : {-32., -4., -.01, 0., .25, 4., 32.})
+        {
+            std::array<double, 12> polynomial{};
+            polynomial[0] = ceiling * value;
+            const auto shaped = direct.polynomial(polynomial);
+            const auto delta = residual.polynomial(polynomial);
+            const long double exact = std::tanh(static_cast<long double>(value));
+            for (int moment = 0; moment < 4; ++moment)
+            {
+                EXPECT_NEAR(shaped[moment] / ceiling,
+                            static_cast<double>(exact / (moment + 1)), 5e-13);
+                EXPECT_NEAR(delta[moment] / ceiling,
+                            static_cast<double>((exact - value) / (moment + 1)), 5e-13);
+            }
+        }
+        for (const auto &ends : {std::array{-30., 17.}, std::array{-3., .4},
+                                 std::array{-.01, .02}, std::array{.7, 4.},
+                                 std::array{5., -2.}, std::array{26., 32.}})
+        {
+            std::array<double, 12> polynomial{};
+            polynomial[0] = ceiling * ends[0];
+            polynomial[1] = ceiling * (ends[1] - ends[0]);
+            const long double a = static_cast<long double>(polynomial[0]) / ceiling;
+            const long double slope = static_cast<long double>(polynomial[1]) / ceiling;
+            const auto exact = (logCosh(a + slope) - logCosh(a)) / slope;
+            const auto shaped = direct.polynomial(polynomial);
+            const auto delta = residual.polynomial(polynomial);
+            EXPECT_NEAR(shaped[0] / ceiling, static_cast<double>(exact), 5e-13);
+            EXPECT_NEAR(delta[0] / ceiling, static_cast<double>(exact - a - slope / 2), 5e-13);
+        }
+    }
+}
+
 DSPARK_TEST(OfflineClip_NativeSineSlopeUsesTheExistingCurve)
 {
     constexpr double ceiling = .8;

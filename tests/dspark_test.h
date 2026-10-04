@@ -172,7 +172,7 @@ inline int runAll(const std::string& prefix = {})
 #define EXPECT_NEAR(a, b, tol)                                                   \
     do {                                                                          \
         auto _a = (a); auto _b = (b);                                             \
-        if (std::abs(_a - _b) > (tol)) {                                          \
+        if (!(std::abs(_a - _b) <= (tol))) {                                      \
             std::cerr << "    EXPECT_NEAR failed: |" #a " - " #b "| <= " #tol     \
                       << "  (got " << _a << " vs " << _b                          \
                       << ", diff=" << std::abs(_a - _b) << ")"                    \

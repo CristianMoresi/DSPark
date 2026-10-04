@@ -14,17 +14,51 @@
 #include "../Core/TruePeakDetector.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <type_traits>
+#include <utility>
 
 using namespace dspark;
 using namespace dspark::test;
+
+DSPARK_TEST(TestHarness_NearRejectsUnorderedValues)
+{
+    const auto fails = [](double actual, double expected, double tolerance)
+    {
+        std::ostringstream diagnostic;
+        struct Restore
+        {
+            bool failure;
+            std::streambuf *buffer;
+            ~Restore()
+            {
+                currentTestFailed() = failure;
+                std::cerr.rdbuf(buffer);
+            }
+        } restore{currentTestFailed(), std::cerr.rdbuf(diagnostic.rdbuf())};
+        currentTestFailed() = false;
+        const auto check = [&] { EXPECT_NEAR(actual, expected, tolerance); };
+        check();
+        return std::pair{currentTestFailed(), !diagnostic.str().empty()};
+    };
+    EXPECT_TRUE((fails(1., 1.0001, .001) == std::pair{false, false}));
+    EXPECT_TRUE((fails(1., 2., .001) == std::pair{true, true}));
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double infinity = std::numeric_limits<double>::infinity();
+    for (const auto &values : {std::array{nan, 1., .001}, std::array{1., nan, .001},
+                              std::array{1., 1., nan}, std::array{infinity, infinity, .001},
+                              std::array{infinity, 1., .001}, std::array{1., 1., -1.}})
+        EXPECT_TRUE((fails(values[0], values[1], values[2]) == std::pair{true, true}));
+    EXPECT_FALSE(currentTestFailed());
+}
 
 // ============================================================================
 // DspMath

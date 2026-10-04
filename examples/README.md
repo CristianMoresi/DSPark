@@ -9,6 +9,7 @@
 | [`pitch_tracking_eq.cpp`](pitch_tracking_eq.cpp) | analysis driving DSP: PitchFollower steering a tracking low-cut |
 | [`interval_analysis.cpp`](https://github.com/CristianMoresi/DSPark/blob/main/examples/interval_analysis.cpp) | exact sample intervals measured from a stream of blocks |
 | [`offline_chain.cpp`](https://github.com/CristianMoresi/DSPark/blob/main/examples/offline_chain.cpp) | complete-source Dynamics, clipping and stereo processing with protected PCM, cancellation and reports |
+| [`stereo_mix.cpp`](https://github.com/CristianMoresi/DSPark/blob/main/examples/stereo_mix.cpp) | real-time StereoGenerator with aligned dry/wet mixing, source-clock reset and block-partition checks |
 
 ## Building plugins (VST3 / CLAP / AU)
 

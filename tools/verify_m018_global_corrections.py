@@ -1614,7 +1614,7 @@ def sanitizer_workflow_errors(ci: str, cmake: str) -> list[str]:
     commands = re.findall(r"^\s*(?:run:\s*)?(ctest [^\n]+)", ci, re.MULTILINE)
     expected = {
         "build-san": "ctest --test-dir build-san --output-on-failure --test-output-size-failed 0",
-        "build-tsan": "ctest --test-dir build-tsan -V --timeout 5400 -E '^alloc_failure$'",
+        "build-tsan": "ctest --test-dir build-tsan -V --parallel 2 --timeout 5400 -E '^alloc_failure$'",
     }
     for directory, command in expected.items():
         actual = [line.strip() for line in commands
@@ -1690,6 +1690,8 @@ def sanitizer_partition_errors(root: Path) -> list[str]:
         ("missing-clang", ci.replace("{ name: Clang, compiler: clang++ }", "")),
         ("unbounded-job", ci.replace("    timeout-minutes: 60\n", "")),
         ("unbuilt-offline-chain", ci.replace("dspark_offline_chain", "")),
+        ("unbuilt-stereo-mix", ci.replace("dspark_stereo_mix", "")),
+        ("unbounded-tsan-parallelism", ci.replace("-V --parallel 2 --timeout", "-V --parallel --timeout")),
     ):
         if not sanitizer_workflow_errors(changed, cmake):
             errors.append(f"SANITIZER_PARTITION_CONTROL {label}")

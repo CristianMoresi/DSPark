@@ -807,6 +807,19 @@ history. After a seek, use `resetAtFrame()` and replay preceding input when
 history continuity is required; this method alone is not a saved-state restore.
 Flush with zeros when rendering a tail. Alignment latency is not tail duration.
 
+For parallel dry/wet processing, prepare `DryWetMixer` with the same stereo spec,
+select `MixRule::Linear`, and call `setLatencyCompensation(generator.getLatency())`
+during setup. In each callback, call `pushDry()` with the original input, process
+the generator, and then call `mixWet()`. The mixer delays its dry copy internally;
+adding another dry delay would misalign the paths. Linear mixing preserves the
+level of the mid component shared by both paths. Reset both histories on a seek
+or stream restart.
+
+The compiled [stereo mixing example](https://github.com/CristianMoresi/DSPark/blob/main/examples/stereo_mix.cpp)
+checks delayed identity, preserved mid, source-clock advancement and equal output
+across block partitions, using float/double, two rates, factors 1/4 and the optional
+low cut. It reports the latency of each prepared configuration.
+
 For complete-source jobs, `OfflineStereoGenerator` handles alignment, bounded
 reads, exact exclusions, peak measurement and transactional output. Its optional
 host-owned delta cache avoids regenerating bands/color for each width change.

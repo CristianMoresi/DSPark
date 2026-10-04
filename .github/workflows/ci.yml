@@ -648,13 +648,16 @@ jobs:
           # Bound compiler memory and build every executable used by this job.
           cmake --build build-tsan --parallel 2 --target \
             dspark_tests dspark_reverb_publication dspark_standalone dspark_smoke \
-            dspark_offline_chain
+            dspark_offline_chain dspark_stereo_mix
 
       - name: Check TubePreamp under ThreadSanitizer
         run: ./build-tsan/tests/dspark_tests --prefix TubePreamp_
 
       - name: Run the ordinary suite and publication checks under ThreadSanitizer
-        run: ctest --test-dir build-tsan -V --timeout 5400 -E '^alloc_failure$'
+        # Separate executables own their buffers and fixtures. Keep both slots
+        # bounded while overlapping the complete ordinary suite with the other
+        # checks, instead of appending their runtime to the longest test.
+        run: ctest --test-dir build-tsan -V --parallel 2 --timeout 5400 -E '^alloc_failure$'
 
       - name: Preserve ThreadSanitizer test output
         if: always()

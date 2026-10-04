@@ -943,7 +943,7 @@ def binding_errors(root: Path,
         cmake, re.S)
     if test_match is None:
         errors.append("VALIDATION_OUTER_BINDING_CTEST")
-    if len(re.findall(r"add_test\(NAME", cmake)) != 14:
+    if len(re.findall(r"add_test\(NAME", cmake)) != 15:
         errors.append("VALIDATION_OUTER_CTEST_LOCAL_CARDINALITY")
     root_cmake = (root / "CMakeLists.txt").read_text(encoding="ascii")
     if len(re.findall(r"add_test\(NAME", root_cmake)) != 2:
@@ -3653,7 +3653,7 @@ def threading_external_live(root: Path) -> list[str]:
         ["git", "ls-files", "-z"], cwd=root, check=False,
         capture_output=True, timeout=30).stdout.split(b"\0")
     tracked_paths = [item.decode("utf-8") for item in tracked if item]
-    if len(tracked_paths) != 553 or len(tracked_paths) != len(set(tracked_paths)):
+    if len(tracked_paths) != 554 or len(tracked_paths) != len(set(tracked_paths)):
         return ["THREADING_EXTERNAL_TRACKED_CENSUS:{}".format(
             len(tracked_paths))]
 
@@ -3690,7 +3690,7 @@ def threading_external_live(root: Path) -> list[str]:
                 item for item in indexed_paths.stdout.split(b"\0") if item
             ])
             if setup.returncode != 0 or indexed.returncode != 0 \
-                    or indexed_paths.returncode != 0 or indexed_count != 553:
+                    or indexed_paths.returncode != 0 or indexed_count != 554:
                 errors.append("THREADING_EXTERNAL_FIXTURE:{}".format(name))
                 observed.append(name)
                 continue

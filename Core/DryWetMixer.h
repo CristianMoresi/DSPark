@@ -13,8 +13,9 @@
  * supports both Linear and Equal Power mixing laws.
  *
  * @note If your effect introduces algorithmic latency (e.g., FIR filters),
- * ensure the dry signal is delayed (Latency Compensation) before calling pushDry()
- * to prevent phase cancellation (comb filtering).
+ * call setLatencyCompensation(effectLatency) during setup. Then pass the original,
+ * undelayed input to pushDry(); the mixer delays its own copy to align both paths
+ * and prevent phase cancellation (comb filtering).
  *
  * Threading (SPSC model, see docs/threading.md): pushDry() / mixWet() /
  * reset() belong to the processing thread (single stream owner), and so do

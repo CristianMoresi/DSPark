@@ -647,7 +647,8 @@ jobs:
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -Wno-error=tsan"
           # Bound compiler memory and build every executable used by this job.
           cmake --build build-tsan --parallel 2 --target \
-            dspark_tests dspark_reverb_publication dspark_standalone dspark_smoke
+            dspark_tests dspark_reverb_publication dspark_standalone dspark_smoke \
+            dspark_offline_chain
 
       - name: Check TubePreamp under ThreadSanitizer
         run: ./build-tsan/tests/dspark_tests --prefix TubePreamp_

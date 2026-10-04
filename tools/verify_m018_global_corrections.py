@@ -1639,6 +1639,30 @@ def sanitizer_workflow_errors(ci: str, cmake: str) -> list[str]:
         errors.append("SANITIZER_ALLOCATION_SOURCE_GRAPH")
     if re.search(r"target_sources\s*\(\s*dspark_alloc_failure\b", strip_cmake_comments(cmake)):
         errors.append("SANITIZER_ALLOCATION_EXTRA_SOURCES")
+    # CTest also runs examples registered as tests. Every selected executable
+    # must be built by the explicit TSan target list, including future additions.
+    declarations = "\n".join(re.findall(
+        r"add_(?:executable|test)\s*\([^)]*\)", strip_cmake_comments(cmake)))
+    test_commands = cmake_commands(declarations.encode("ascii"))
+    executables = {args[0] for name, args in test_commands
+                   if name == "add_executable" and args}
+    required = set()
+    for name, args in test_commands:
+        if name != "add_test" or "NAME" not in args or "COMMAND" not in args:
+            continue
+        test_name = args[args.index("NAME") + 1]
+        target = args[args.index("COMMAND") + 1]
+        if test_name != "alloc_failure" and target in executables:
+            required.add(target)
+    builds = re.findall(
+        r"^\s*cmake --build build-tsan --parallel 2 --target ([^\n]+)$",
+        ci.replace("\\\n", " "), re.MULTILINE)
+    if len(builds) != 1:
+        errors.append("SANITIZER_TSAN_BUILD_COMMAND")
+    else:
+        missing = required - set(builds[0].split())
+        if missing:
+            errors.append("SANITIZER_TSAN_UNBUILT_TESTS " + ",".join(sorted(missing)))
     return errors
 
 
@@ -1665,9 +1689,16 @@ def sanitizer_partition_errors(root: Path) -> list[str]:
         ("native-filter", ci.replace("--build-config Release\n", "--build-config Release -E alloc_failure\n")),
         ("missing-clang", ci.replace("{ name: Clang, compiler: clang++ }", "")),
         ("unbounded-job", ci.replace("    timeout-minutes: 60\n", "")),
+        ("unbuilt-offline-chain", ci.replace("dspark_offline_chain", "")),
     ):
         if not sanitizer_workflow_errors(changed, cmake):
             errors.append(f"SANITIZER_PARTITION_CONTROL {label}")
+    future_test = cmake + (
+        "\nadd_executable(dspark_future_tests future.cpp)\n"
+        "add_test(NAME future COMMAND dspark_future_tests)\n")
+    if not any(error.startswith("SANITIZER_TSAN_UNBUILT_TESTS")
+               for error in sanitizer_workflow_errors(ci, future_test)):
+        errors.append("SANITIZER_PARTITION_CONTROL unbuilt-future-test")
     return errors
 
 

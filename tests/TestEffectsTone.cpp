@@ -2831,10 +2831,20 @@ std::array<std::vector<Sample>, 2> renderTubeAutomation(int factor, int partitio
             if (control == 1) amp.setOutput(Sample(12));
             if (control == 2) amp.setStages(2);
         }
+        if (control == 2)
+        {
+            // Revert during warm-up, request again, reverse an audible fade,
+            // and finally settle. These events also split inside host blocks.
+            if (position == 311 || position == 1907) amp.setStages(1);
+            if (position == 503 || position == 2341) amp.setStages(2);
+        }
         const int requested = partition == 0 ? maximumBlock
                             : partition == 1 ? irregular[block++ % irregular.size()] : 1;
         int count = std::min(requested, frames - position);
         if (position < boundary) count = std::min(count, boundary - position);
+        if (control == 2)
+            for (int event : {311, 503, 1907, 2341})
+                if (position < event) count = std::min(count, event - position);
         Sample* channels[] = { result[0].data() + position, result[1].data() + position };
         amp.processBlock({ channels, 2, count });
         position += count;
@@ -2868,6 +2878,113 @@ DSPARK_TEST(TubePreamp_gain_automation_is_independent_of_block_partition)
 {
     verifyTubeAutomationPartitions<float>();
     verifyTubeAutomationPartitions<double>();
+}
+
+DSPARK_TEST(TubePreamp_stage_switch_preserves_silence_and_latency)
+{
+    for (int factor : {1, 2, 16})
+      for (double input : {0.0, 0.1})
+    {
+        TubePreamp<double> amp;
+        amp.setOversampling(factor);
+        amp.setDrive(36.0);
+        amp.setSag(1.0);
+        amp.prepare({44100.0, 257, 1});
+        const int latency = amp.getLatencySamples();
+        std::array<double, 257> samples {};
+        double peak = 0.0;
+        // Let the constant-input response settle before checking topology
+        // changes. Its physical start-up transient is not a switching click.
+        for (int block = input == 0.0 ? 0 : -96; block < 100; ++block)
+        {
+            // Covers both directions, a warm-up cancellation, an in-flight
+            // reversal and returning to a previously dormant path.
+            if (block == 8 || block == 10 || block == 48) amp.setStages(2);
+            if (block == 9 || block == 13 || block == 80) amp.setStages(1);
+            samples.fill(input);
+            double* p = samples.data();
+            amp.processBlock({&p, 1, static_cast<int>(samples.size())});
+            for (double x : samples)
+            {
+                EXPECT_TRUE(std::isfinite(x));
+                if (block >= 0) peak = std::max(peak, std::abs(x));
+            }
+            EXPECT_EQ(amp.getLatencySamples(), latency);
+        }
+        // A topology change must not turn its changed quiescent plate load
+        // into a signal. The former absolute-state copy produced -34 dBFS.
+        EXPECT_LT(peak, input == 0.0 ? 1e-7 : 1e-6);
+    }
+}
+
+DSPARK_TEST(TubePreamp_stage_switch_is_smooth_and_reaches_the_requested_circuit)
+{
+    constexpr int frameCount = 24576, change = 8197, maxBlock = 257;
+    constexpr double sampleRate = 48000.0;
+    for (double drive : {-12.0, 36.0})
+    {
+        std::array<std::vector<double>, 4> output;
+        for (int run = 0; run < 4; ++run)
+        {
+            auto& samples = output[static_cast<size_t>(run)];
+            samples.resize(frameCount);
+            for (int i = 0; i < frameCount; ++i)
+                samples[static_cast<size_t>(i)] = 0.2 * std::sin(
+                    2.0 * std::numbers::pi * 40.0 * i / sampleRate);
+            TubePreamp<double> amp;
+            const int initial = run % 2 + 1;
+            amp.setStages(initial);
+            amp.setDrive(drive);
+            amp.setSag(1.0);
+            amp.prepare({sampleRate, maxBlock, 1});
+            int pos = 0;
+            while (pos < frameCount)
+            {
+                if (run >= 2)
+                {
+                    if (pos == change || pos == change + 911) amp.setStages(3 - initial);
+                    if (pos == change + 733) amp.setStages(initial);
+                }
+                int count = std::min(maxBlock, frameCount - pos);
+                for (int event : {change, change + 733, change + 911})
+                    if (pos < event) count = std::min(count, event - pos);
+                double* p = samples.data() + pos;
+                amp.processBlock({&p, 1, count});
+                pos += count;
+            }
+        }
+        double staticDelta = 0.0, movingDelta = 0.0;
+        for (int i = change; i < frameCount; ++i)
+        {
+            const auto n = static_cast<size_t>(i);
+            for (int mode = 0; mode < 2; ++mode)
+            {
+                const auto& fixed = output[static_cast<size_t>(mode)];
+                const auto& moving = output[static_cast<size_t>(mode + 2)];
+                staticDelta = std::max(staticDelta, std::abs(fixed[n] - fixed[n - 1]));
+                movingDelta = std::max(movingDelta, std::abs(moving[n] - moving[n - 1]));
+            }
+        }
+        // Compare against both actual circuits, including their nonlinear
+        // transients. The old switch exceeded this by orders of magnitude.
+        EXPECT_LT(movingDelta, 1.15 * staticDelta + 1e-6);
+        for (int mode = 0; mode < 2; ++mode)
+        {
+            const auto& target = output[static_cast<size_t>(1 - mode)];
+            const auto& moving = output[static_cast<size_t>(mode + 2)];
+            double error = 0.0, energy = 0.0;
+            for (int i = frameCount - 2048; i < frameCount; ++i)
+            {
+                const auto n = static_cast<size_t>(i);
+                error += (moving[n] - target[n]) * (moving[n] - target[n]);
+                energy += target[n] * target[n];
+            }
+            // The incoming circuit runs independently after the fade; it must
+            // approach the always-running requested circuit, without a mute,
+            // retained old path, or an arbitrary output gain correction.
+            EXPECT_LT(error, energy * 1e-5);
+        }
+    }
 }
 
 DSPARK_TEST(TubePreamp_output_automation_follows_the_sample_clock)

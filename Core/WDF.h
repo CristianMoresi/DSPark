@@ -127,6 +127,16 @@ public:
     void updatePorts() noexcept { R_ = 1.0 / (2.0 * fs_ * static_cast<double>(value_)); }
     void reset() noexcept { state_ = 0; a_ = 0; b_ = 0; }
 
+    /** @brief Shifts the voltage reference without changing capacitor current.
+     *  Stream-owner only; the finite offset is added to both wave variables
+     *  and the delayed wave, preserving their difference. */
+    void offsetVoltage(T offset) noexcept
+    {
+        state_ += offset;
+        a_ += offset;
+        b_ += offset;
+    }
+
     [[nodiscard]] double portResistance() const noexcept { return R_; }
     [[nodiscard]] T reflected() noexcept { b_ = state_; return b_; }
     void incident(T a) noexcept { a_ = a; state_ = a; }
@@ -567,6 +577,7 @@ private:
 template <FloatType T, typename... Children>
 class RType
 {
+    template <FloatType> friend class ToneStackFMV;
 public:
     static constexpr int kNumPorts = static_cast<int>(sizeof...(Children)) + 1;
     static constexpr int kMaxNodes = 12;
@@ -674,6 +685,28 @@ public:
     }
 
 private:
+    // Preserve a topology-proven zero-current voltage mode after the nodal
+    // solve: S*v = v. For the FMV network the source and three coupling
+    // capacitors share a common DC voltage; every resistor has zero voltage.
+    // Correcting only the final nonzero column removes factorization roundoff
+    // in this identity without adding arithmetic to sample processing.
+    void preserveDcMode(const std::array<double, static_cast<size_t>(kNumPorts)>& mode) noexcept
+    {
+        int pivot = kNumPorts - 1;
+        while (pivot > 0 && mode[static_cast<size_t>(pivot)] == 0.0) --pivot;
+        if (pivot == 0) return; // Keep the adapted up-port reflection at zero.
+        for (int i = 0; i < kNumPorts; ++i)
+        {
+            double remainder = 0.0;
+            for (int j = 0; j < kNumPorts; ++j)
+                if (j != pivot)
+                    remainder += s_[static_cast<size_t>(i)][static_cast<size_t>(j)]
+                               * mode[static_cast<size_t>(j)];
+            s_[static_cast<size_t>(i)][static_cast<size_t>(pivot)] =
+                (mode[static_cast<size_t>(i)] - remainder) / mode[static_cast<size_t>(pivot)];
+        }
+    }
+
     [[nodiscard]] double rowDot(int row) const noexcept
     {
         double acc = 0.0;
@@ -850,6 +883,28 @@ public:
     /** @brief Clears capacitor states. RT-safe. */
     void reset() noexcept { root_.reset(); }
 
+    /** @brief Copies the capacitor history from an identically prepared stack.
+     *
+     * Stream-owner only: neither stack may be processed concurrently. Both
+     * stacks must have the same sample rate and controls. Port connections
+     * remain owned by the destination; no allocation or scattering rebuild
+     * occurs. An optional input offset shifts all three coupling capacitors
+     * by the same DC voltage; the subsequent input must use that reference.
+     * The stack blocks DC, so this reference shift preserves its output.
+     */
+    void copyStateFrom(const ToneStackFMV& source, T inputOffset = T(0)) noexcept
+    {
+        c1_ = source.c1_;
+        c2_ = source.c2_;
+        c3_ = source.c3_;
+        if (inputOffset != T(0))
+        {
+            c1_.offsetVoltage(inputOffset);
+            c2_.offsetVoltage(inputOffset);
+            c3_.offsetVoltage(inputOffset);
+        }
+    }
+
     /**
      * @brief Sets the three controls, [0, 1] each.
      *
@@ -873,6 +928,7 @@ public:
         r3Top_.setResistance(static_cast<T>((1.0 - m) * 25e3 + kRmin));
         r3Bot_.setResistance(static_cast<T>(m * 25e3 + kRmin));
         rtype_.updatePorts();           // rebuild scattering, keep states
+        rtype_.preserveDcMode({1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0});
     }
 
     /** @brief Processes one sample (input volts -> wiper volts). */

@@ -75,6 +75,13 @@
  * getLatency() always reflects the ACTIVE factor (0 at 1x) so hosts get
  * correct PDC. At 1x the original point circuit is retained: use 1x only
  * when the surrounding host chain supplies a suitable high rate.
+ * Stage-count changes retain the current path while a prepared second path
+ * warms for 5 ms, followed by a 20 ms smooth crossfade. Both paths share the
+ * current table and resampler. The incoming circuit retains signal-dependent
+ * cathode, supply and tone-stack state relative to its new DC operating point;
+ * its output filters are primed separately. Rapid reversals reuse the running
+ * paths. Outside a transition only the selected circuit is evaluated. Initial
+ * selection and reset() select the requested topology without a fade.
  *
  * Measured at 48 kHz over tones from 1 to 20 kHz in 1 kHz steps, plus
  * 12.75/15.25/19.25 kHz, at -6 and -18 dBFS: each tone is moved to the
@@ -221,6 +228,17 @@ namespace detail {
             const double dE1dVgk = vpk * sig / s;
             dIpdVpk = dIpdE1 * dE1dVpk;
             dIpdVgk = dIpdE1 * dE1dVgk;
+        }
+
+        /** Inverse Koren grid voltage relative to the cathode, for a positive
+         *  plate-to-cathode voltage and plate current. The large-argument
+         *  branch avoids overflowing expm1 while retaining double precision. */
+        static double gridForCurrent(double plate, double current) noexcept
+        {
+            const double e1 = std::pow(current * kKg1 * 0.5, 1.0 / kEx);
+            const double z = e1 * kKp / plate;
+            const double u = z > 50.0 ? z : std::log(std::expm1(z));
+            return std::sqrt(kKvb + plate * plate) * (u / kKp - 1.0 / kMu);
         }
 
         // With S = B+ - A and G = Vgrid - A, the trapezoidal cathode
@@ -693,7 +711,7 @@ class TubePreamp
 public:
     // -- Lifecycle ---------------------------------------------------------------
 
-    /** @brief Allocates the chain (one circuit instance per channel) and runs
+    /** @brief Allocates both stage configurations per channel and runs
      *  the reference calibration. Invalid specs (non-positive or non-finite
      *  rate, block size or channel count) are ignored: the previous state is
      *  kept and an unprepared instance stays pass-through. */
@@ -710,10 +728,15 @@ public:
         numChannels_ = spec.numChannels;
         maxBlock_ = std::max(spec.maxBlockSize, 1);
         driveLogSmoother_.prepare(fs2_, 30.0);
-        outputLogSmoother_.prepare(fs2_, 30.0);
+        for (auto& smoother : outputLogSmoothers_)
+            smoother.prepare(fs2_, 30.0);
+        stageBlend_.setSmoothingType(SmoothedValue<double>::SmoothingType::Linear);
+        stageBlend_.prepare(fs2_, 20.0);
         for (auto& ramp : gainRamps_)
             ramp.resize(static_cast<size_t>(maxBlock_) * static_cast<size_t>(osFactor_));
-        compensationScratch_.resize(static_cast<size_t>(maxBlock_) * static_cast<size_t>(osFactor_));
+        for (auto& scratch : compensationScratch_)
+            scratch.resize(static_cast<size_t>(maxBlock_) * static_cast<size_t>(osFactor_));
+        stageRamp_.resize(static_cast<size_t>(maxBlock_) * static_cast<size_t>(osFactor_));
 
         if (osFactor_ > 1)
         {
@@ -732,10 +755,13 @@ public:
         // 1x point circuit keeps the trapezoidal cathode coupling.
         loadTable_ = std::make_unique<LoadTable>(
             design_ ? std::numeric_limits<double>::infinity() : fs2_);
-        channels_.clear();
-        channels_.resize(static_cast<size_t>(numChannels_));
-        for (auto& ch : channels_)
-            ch = std::make_unique<ChannelState>(fs2_, loadTable_.get(), design_.get());
+        for (auto& lane : channels_)
+        {
+            lane.clear();
+            lane.resize(static_cast<size_t>(numChannels_));
+            for (auto& ch : lane)
+                ch = std::make_unique<ChannelState>(fs2_, loadTable_.get(), design_.get());
+        }
 
         latency_ = (oversampler_ ? oversampler_->getLatency() : 0) + (design_ ? design_->latency : 0);
         drySize_ = 1;
@@ -757,8 +783,13 @@ public:
         if (!prepared_.load(std::memory_order_relaxed)) return;
         const double sagR = static_cast<double>(sag_.load(std::memory_order_relaxed)) * 40e3;
         const int stages = stages_.load(std::memory_order_relaxed);
-        for (auto& ch : channels_)
-            ch->reset(sagR, stages);
+        for (int st = 1; st <= 2; ++st)
+            for (auto& ch : channels_[static_cast<size_t>(st - 1)])
+                ch->reset(sagR, st);
+        numStagesActive_ = stages;
+        stageBlend_.reset(static_cast<double>(stages - 1));
+        stageWarmupRemaining_ = 0;
+        bothStagesActive_ = false;
         for (auto& d : dryRing_)
             std::fill(d.begin(), d.end(), T(0));
         dryPos_ = 0;
@@ -813,7 +844,9 @@ public:
     }
 
     /** @brief Number of triode stages (1 = clean/edge, 2 = high gain).
-     *  RT-safe; the prepared latency does not change. */
+     *  RT-safe; the prepared latency does not change. A running stream keeps
+     *  its circuit while the new path warms for 5 ms, then crossfades over
+     *  20 ms. Reversing a running fade preserves both circuit states. */
     void setStages(int stages) noexcept
     {
         stages_.store(std::clamp(stages, 1, 2), std::memory_order_relaxed);
@@ -880,7 +913,8 @@ public:
     /** @brief Compatibility alias of getLatency(), in prepared-rate samples. */
     [[nodiscard]] int getLatencySamples() const noexcept { return getLatency(); }
 
-    /** @brief Effective B+ supply voltage of channel 0 (sag meter readout). */
+    /** @brief Effective B+ supply voltage of channel 0 (sag meter readout).
+     *  During a stage transition, uses the same blend weights as the wet paths. */
     [[nodiscard]] T getSupplyVoltage() const noexcept
     {
         return supplyNow_.load(std::memory_order_relaxed);
@@ -958,8 +992,9 @@ public:
         // reduces to the constant, bit-identically).
         const T mixTarget = mix_.load(std::memory_order_relaxed);
         const T mixStart  = currentMix_;
-        const double outGain = mScale_
-            * std::pow(10.0, static_cast<double>(outputDb_.load(std::memory_order_relaxed)) / 20.0);
+        const double trim = std::pow(10.0,
+            static_cast<double>(outputDb_.load(std::memory_order_relaxed)) / 20.0);
+        const std::array<double, 2> outGain { mScale_[0] * trim, mScale_[1] * trim };
 
         // Dry snapshot.
         for (int ch = 0; ch < nCh; ++ch)
@@ -986,17 +1021,15 @@ public:
             // changes the trajectory when a host changes its block size.
             // Core's sample-exact one-pole retains the 30 ms time constant.
             const double driveLog = std::log(hScale_);
-            const double outputLog = std::log(outGain);
             if (!gainsInitialized_)
             {
                 driveLogSmoother_.reset(driveLog);
-                outputLogSmoother_.reset(outputLog);
+                for (size_t st = 0; st < 2; ++st)
+                    outputLogSmoothers_[st].reset(std::log(outGain[st]));
                 gainsInitialized_ = true;
             }
             driveLogSmoother_.setTargetValue(driveLog);
-            outputLogSmoother_.setTargetValue(outputLog);
             const bool driveRamping = driveLogSmoother_.isSmoothing();
-            const bool outputRamping = outputLogSmoother_.isSmoothing();
             if (driveRamping)
             {
                 driveLogSmoother_.processBlock(
@@ -1007,46 +1040,84 @@ public:
                     value = value == driveLog ? hScale_ : std::exp(value);
                 }
             }
-            if (outputRamping)
+            std::array<bool, 2> outputRamping {};
+            for (size_t st = 0; st < 2; ++st)
             {
-                outputLogSmoother_.processBlock(
-                    std::span<double>(gainRamps_[1].data(), static_cast<size_t>(osN)));
+                const double outputLog = std::log(outGain[st]);
+                auto& smoother = outputLogSmoothers_[st];
+                smoother.setTargetValue(outputLog);
+                outputRamping[st] = smoother.isSmoothing();
+                if (!outputRamping[st]) continue;
+                smoother.processBlock(
+                    std::span<double>(gainRamps_[st + 1].data(), static_cast<size_t>(osN)));
                 for (int i = 0; i < osN; ++i)
                 {
-                    auto& value = gainRamps_[1][static_cast<size_t>(i)];
-                    value = value == outputLog ? outGain : std::exp(value);
+                    auto& value = gainRamps_[st + 1][static_cast<size_t>(i)];
+                    value = value == outputLog ? outGain[st] : std::exp(value);
                 }
             }
 
+            // Advance the transition once per internal frame, shared by all
+            // channels. The inactive circuit stops at the exact ramp endpoint,
+            // even if the host's block extends beyond it.
+            int transitionSamples = 0;
+            while (bothStagesActive_ && transitionSamples < osN)
+            {
+                double w = stageBlend_.getCurrentValue();
+                if (stageWarmupRemaining_ > 0) --stageWarmupRemaining_;
+                else w = stageBlend_.getNextValue();
+                stageRamp_[static_cast<size_t>(transitionSamples++)] = w * w * (3.0 - 2.0 * w);
+                if (stageWarmupRemaining_ == 0 && !stageBlend_.isSmoothing())
+                    bothStagesActive_ = false;
+            }
+            const size_t target = static_cast<size_t>(numStagesActive_ - 1);
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* d = osView.getChannel(ch);
-                auto& state = *channels_[static_cast<size_t>(ch)];
                 for (int i = 0; i < osN; ++i)
                 {
                     const double h = driveRamping ? gainRamps_[0][static_cast<size_t>(i)] : hScale_;
-                    const double value = state.template processSample<false>(
-                        h * static_cast<double>(d[i]), numStagesActive_, sagR_);
-                    if (osOn)
-                        compensationScratch_[static_cast<size_t>(i)] = value;
-                    else
+                    const double x = h * static_cast<double>(d[i]);
+                    for (size_t st = 0; st < 2; ++st)
                     {
-                        const double g = outputRamping ? gainRamps_[1][static_cast<size_t>(i)] : outGain;
-                        d[i] = static_cast<T>(g * value);
+                        if (st != target && i >= transitionSamples) continue;
+                        compensationScratch_[st][static_cast<size_t>(i)] =
+                            channels_[st][static_cast<size_t>(ch)]->template processSample<false>(
+                                x, static_cast<int>(st) + 1, sagR_);
                     }
                 }
                 if (osOn)
                 {
-                    state.compensateBlock(compensationScratch_.data(), osN);
-                    for (int i = 0; i < osN; ++i)
+                    for (size_t st = 0; st < 2; ++st)
                     {
-                        const double g = outputRamping ? gainRamps_[1][static_cast<size_t>(i)] : outGain;
-                        d[i] = static_cast<T>(g * compensationScratch_[static_cast<size_t>(i)]);
+                        const int count = st == target ? osN : transitionSamples;
+                        if (count > 0)
+                            channels_[st][static_cast<size_t>(ch)]->compensateBlock(
+                                compensationScratch_[st].data(), count);
                     }
+                }
+                for (int i = 0; i < osN; ++i)
+                {
+                    const auto index = static_cast<size_t>(i);
+                    const double g = outputRamping[target] ? gainRamps_[target + 1][index] : outGain[target];
+                    double value = g * compensationScratch_[target][index];
+                    if (i < transitionSamples)
+                    {
+                        const size_t other = 1 - target;
+                        const double gOther = outputRamping[other] ? gainRamps_[other + 1][index] : outGain[other];
+                        const double alternate = gOther * compensationScratch_[other][index];
+                        const double w = target == 1 ? stageRamp_[index] : 1.0 - stageRamp_[index];
+                        value = alternate + w * (value - alternate);
+                    }
+                    d[i] = static_cast<T>(value);
                 }
             }
             if (osOn) oversampler_->downsample(buffer);
-            supplyNow_.store(static_cast<T>(kBplus - sagR_ * channels_[0]->supplyCurrent()),
+            const double position = stageBlend_.getCurrentValue();
+            const double w = position * position * (3.0 - 2.0 * position);
+            const double current = (1.0 - w) * channels_[0][0]->supplyCurrent()
+                                 + w * channels_[1][0]->supplyCurrent();
+            supplyNow_.store(static_cast<T>(kBplus - sagR_ * current),
                              std::memory_order_relaxed);
         }
 
@@ -1086,7 +1157,7 @@ private:
     }
 
     /** @brief Static operating point: Vk = Ip*Rk (capacitor fully charged). */
-    static double settleCurrent(double bplus) noexcept
+    static double settleCurrent(double bplus, double grid = 0.0) noexcept
     {
         double i = 8e-4;
         for (int it = 0; it < 60; ++it)
@@ -1094,7 +1165,7 @@ private:
             const double vkS = i * kRk;
             const double vpk = bplus - i * kRL - vkS;
             double ipK = 0.0, dVpk = 0.0, dVgk = 0.0;
-            koren(vpk, -vkS, ipK, dVpk, dVgk);
+            koren(vpk, grid - vkS, ipK, dVpk, dVgk);
             const double f = i - ipK;
             const double fp = 1.0 - (dVpk * (-(kRL + kRk)) + dVgk * (-kRk));
             const double di = f / fp;
@@ -1263,21 +1334,28 @@ private:
             }
         }
 
-        void reset(double sagR, int numStages) noexcept
+        static std::array<double, 3> dcBias(double sagR, int numStages, double grid = 0.0) noexcept
         {
             double bp = kBplus, i1 = 0.0, i2 = 0.0, iTotal = 0.0;
             for (int it = 0; it < 40; ++it)
             {
-                i1 = settleCurrent(bp);
-                i2 = i1;
+                i1 = settleCurrent(bp, grid);
+                i2 = numStages > 1 && grid != 0.0 ? settleCurrent(bp) : i1;
                 iTotal = i1 + (numStages > 1 ? i2 : 0.0);
                 const double next = kBplus - sagR * iTotal;
                 if (std::abs(next - bp) < 1e-12) { bp = next; break; }
                 bp = next;
             }
+            return {bp, i1, i2};
+        }
+
+        void reset(double sagR, int numStages) noexcept
+        {
+            const auto bias = dcBias(sagR, numStages);
+            const double bp = bias[0], i1 = bias[1];
             vk1 = vk2 = i1 * kRk;
             vp1 = vp2 = bp - i1 * kRL;
-            ipLP = iTotal;
+            ipLP = i1 * numStages;
             i1Prev = i2Prev = i1;
             q[0] = q[1] = q[2] = 0.0;
             ring.fill(0.0);
@@ -1290,10 +1368,7 @@ private:
         {
             // Grid voltage relative to the cathode below which the plate
             // current is < 1e-10 A (plate effect < 10 uV) at vpk ~= s.
-            constexpr double eps = 1e-10;
-            const double e1 = std::pow(eps * LoadTable::kKg1 / 2.0, 1.0 / LoadTable::kEx);
-            const double u = std::log(std::expm1(e1 * LoadTable::kKp / s));
-            return std::sqrt(LoadTable::kKvb + s * s) * (u / LoadTable::kKp - 1.0 / LoadTable::kMu);
+            return LoadTable::gridForCurrent(s, 1e-10);
         }
 
         static double currentSlow(double s, double g) noexcept
@@ -1887,6 +1962,65 @@ private:
             }
         }
 
+        /** Forks the signal-dependent state when a dormant path is requested.
+         *  Translate bias-relative state to the new topology's DC solution.
+         *  Copying absolute supply/cathode voltages would create a sag pulse
+         *  in silence when adding or removing the second triode's DC load.
+         *  Output history belongs to a different plate/polarity/EQ response;
+         *  it is primed while the previous path remains fully audible. */
+        void resumeFrom(const ChannelState& source, int numStages, double sagR) noexcept
+        {
+            // The bypass capacitor already measures mean plate current.
+            // Invert Koren at that operating point, then solve the requested
+            // load with the same effective grid bias. Using zero input as the
+            // reference would still produce a pulse with DC-biased audio.
+            const double current1 = (design ? source.core.vk1 : source.stage1.vk) / kRk;
+            const double current2 = numStages == 1
+                ? (design ? source.core.vk2 : source.stage2.vk) / kRk : 0.0;
+            const double supply = kBplus - sagR * (current1 + current2);
+            const double plate = std::max(1.0, supply - (kRL + kRk) * current1);
+            const double grid = kRk * current1
+                + LoadTable::gridForCurrent(plate, std::max(current1, 1e-18));
+            const auto after = ContinuousCore::dcBias(sagR, numStages, grid);
+            const double di = after[1] - current1;
+            const double dTotal = after[1] + (numStages == 2 ? after[2] : 0.0) - current1 - current2;
+            const double dPlate = after[0] - supply - kRL * di;
+            const double reference = after[0] - kRL * after[1];
+            const double previousReference = design ? source.core.vp1 : source.stage1.vpDC;
+            const double inputOffset = previousReference + dPlate - reference;
+            stage1 = source.stage1;
+            stage1.vk += kRk * di;
+            stage1.ip += di;
+            stage1.vpDC = reference;
+            stage2.ip = after[2];
+            stage2.vk = kRk * after[2];
+            stage2.vpDC = after[0] - kRL * after[2];
+            stage2.fPrev = 0.0;
+            ipLP = source.ipLP + dTotal;
+            if (!design) fmv.copyStateFrom(source.fmv, inputOffset);
+            core = source.core;
+            core.vk1 += kRk * di;
+            core.i1Prev += di;
+            core.vp1 = reference;
+            if (design)
+                for (int mode = 0; mode < 3; ++mode)
+                    for (int capacitor = 0; capacitor < 3; ++capacitor)
+                        core.q[mode] += core.modes.toModal[mode][capacitor] * inputOffset;
+            // A common DC shift of the three coupling-capacitor voltages
+            // exactly cancels the changed stage-1 voltage reference. Rebase
+            // that reference at each fork so repeated switches cannot drift
+            // it (and the compensating capacitor state) without bound.
+            core.ipLP += dTotal;
+            core.vk2 = stage2.vk;
+            core.vp2 = stage2.vpDC;
+            core.i2Prev = stage2.ip;
+            for (double& value : core.out) value = 0.0;
+            outHpX = outHpY = 0.0;
+            for (auto& filter : flatten[static_cast<size_t>(numStages - 1)])
+                filter.reset();
+            if (design) compensation.reset();
+        }
+
         /** Installs the reference-flattening EQ for one stage count. */
         void setFlattenCoeffs(int stageCount,
                               const std::array<BiquadCoeffs, 3>& c) noexcept
@@ -1975,7 +2109,7 @@ private:
         const double b = static_cast<double>(bass_.load(std::memory_order_relaxed));
         const double m = static_cast<double>(middle_.load(std::memory_order_relaxed));
         const double sag = static_cast<double>(sag_.load(std::memory_order_relaxed));
-        numStagesActive_ = stages_.load(std::memory_order_relaxed);
+        const int requestedStages = stages_.load(std::memory_order_relaxed);
 
         hScale_ = drive;                       // 0 dBFS -> 1 V grid at drive 0
         // Note on physics: a class-A preamp draws near-constant average
@@ -1984,8 +2118,39 @@ private:
         // this model comes from the cathode-bypass bias shift (modelled in
         // TriodeStage); the sag control changes voicing, not loudness.
         sagR_ = sag * 40e3;
-        for (auto& ch : channels_)
-            ch->setToneControls(t, b, m);
+        for (auto& lane : channels_)
+            for (auto& ch : lane)
+                ch->setToneControls(t, b, m);
+
+        if (!gainsInitialized_)
+        {
+            // A pre-stream edit selects the initial circuit, without a fade
+            // or a supply transient from the other topology's DC point.
+            for (auto& ch : channels_[static_cast<size_t>(requestedStages - 1)])
+                ch->reset(sagR_, requestedStages);
+            stageBlend_.reset(static_cast<double>(requestedStages - 1));
+            bothStagesActive_ = false;
+            stageWarmupRemaining_ = 0;
+        }
+        else if (requestedStages != numStagesActive_)
+        {
+            if (!bothStagesActive_)
+            {
+                auto& incoming = channels_[static_cast<size_t>(requestedStages - 1)];
+                const auto& outgoing = channels_[static_cast<size_t>(numStagesActive_ - 1)];
+                for (size_t ch = 0; ch < incoming.size(); ++ch)
+                    incoming[ch]->resumeFrom(*outgoing[ch], requestedStages, sagR_);
+                stageWarmupRemaining_ = std::max(1, static_cast<int>(std::ceil(0.005 * fs2_)));
+                bothStagesActive_ = true;
+            }
+            stageBlend_.setTargetValue(static_cast<double>(requestedStages - 1));
+            if (!stageBlend_.isSmoothing())
+            {
+                bothStagesActive_ = false;
+                stageWarmupRemaining_ = 0;
+            }
+        }
+        numStagesActive_ = requestedStages;
 
         // Loudness: divide out the circuit's program gain at the REFERENCE
         // tone setting (measured once in prepare on a settled channel) and
@@ -2007,8 +2172,9 @@ private:
         // ceiling, output stops growing with drive while the divisor keeps
         // rising, so the level FELL hard instead of holding.
         const double driveDbNow = static_cast<double>(driveDb_.load(std::memory_order_relaxed));
-        mScale_ = std::pow(drive, 0.25)
-                / std::max(programGainAt(driveDbNow, numStagesActive_), 1e-9);
+        for (int st = 1; st <= 2; ++st)
+            mScale_[static_cast<size_t>(st - 1)] = std::pow(drive, 0.25)
+                / std::max(programGainAt(driveDbNow, st), 1e-9);
     }
 
     /** @brief Program gain at a drive setting (log-interpolated prepare LUT). */
@@ -2100,8 +2266,9 @@ private:
                 BiquadCoeffs::makePeak(fs2_, 800.0, 0.55, -mid),
                 BiquadCoeffs::makeHighShelf(fs2_, 4500.0, -hi)
             };
-            for (auto& ch : channels_)
-                ch->setFlattenCoeffs(st, fc);
+            for (auto& lane : channels_)
+                for (auto& ch : lane)
+                    ch->setFlattenCoeffs(st, fc);
 
             // Phase 2: program gain vs DRIVE, on a chained scratch channel
             // with the flattener installed (the chain as it really sounds).
@@ -2154,7 +2321,7 @@ private:
     std::unique_ptr<LoadTable> loadTable_;
     std::unique_ptr<detail::TubePreampCoreDesign> design_;   ///< Continuous core (factor >= 2).
     std::unique_ptr<Oversampling<T>> oversampler_;
-    std::vector<std::unique_ptr<ChannelState>> channels_;
+    std::array<std::vector<std::unique_ptr<ChannelState>>, 2> channels_;
 
     std::vector<std::vector<T>> dryRing_;
     int dryPos_ = 0;
@@ -2164,16 +2331,21 @@ private:
     static constexpr double kDriveLutStepDb = 4.0;
 
     double hScale_ = 1.0;
-    double mScale_ = 1.0;
+    std::array<double, 2> mScale_ { 1.0, 1.0 };
     double sagR_ = 0.0;
     int numStagesActive_ = 1;
     /// Program gain vs drive, per stage count (prepare-time sweep).
     std::array<std::array<double, kDriveLutN>, 2> gProgLut_ {
         { { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 },
           { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 } } };
-    SmoothedValue<double> driveLogSmoother_, outputLogSmoother_;
-    std::array<std::vector<double>, 2> gainRamps_;
-    std::vector<double> compensationScratch_;
+    SmoothedValue<double> driveLogSmoother_;
+    std::array<SmoothedValue<double>, 2> outputLogSmoothers_;
+    std::array<std::vector<double>, 3> gainRamps_;
+    std::array<std::vector<double>, 2> compensationScratch_;
+    SmoothedValue<double> stageBlend_;
+    std::vector<double> stageRamp_;
+    int stageWarmupRemaining_ = 0;
+    bool bothStagesActive_ = false;
     bool gainsInitialized_ = false;
     T currentMix_ = T(1);                       ///< Audio-thread mix ramp state.
     T mixMaxStep_ = T(1.0 / 960.0);             ///< Mix ramp rate: full scale per 20 ms.

@@ -1659,6 +1659,39 @@ void yehCoeffs(double t, double l, double m,
        + l * C1 * C2 * C3 * R1 * R2 * R4 + C1 * C2 * C3 * R1 * R3 * R4;
 }
 
+DSPARK_TEST(WDF_FMV_state_fork_preserves_capacitors_without_sharing_ports)
+{
+    for (double sampleRate : {44100.0, 192000.0})
+        for (double tone : {0.0, 1.0})
+          for (double offset : {0.0, -173.0, 211.0})
+        {
+            wdf::ToneStackFMV<double> source(38e3, 1e6), twin(38e3, 1e6), fork(38e3, 1e6);
+            for (auto* stack : {&source, &twin, &fork})
+            {
+                stack->prepare(sampleRate);
+                stack->setControls(tone, 1.0 - tone, tone);
+            }
+            for (int i = 0; i < 3072; ++i)
+            {
+                const double x = 0.3 + std::sin(2.0 * std::numbers::pi * 173.0 * i / sampleRate);
+                (void)source.processSample(x);
+                (void)twin.processSample(x);
+            }
+            fork.copyStateFrom(source, offset);
+            // Changing the source after the copy must not modify the fork's
+            // controls, port connections or capacitor history.
+            source.setControls(0.25, 0.75, 0.5);
+            double error = 0.0;
+            for (int i = 3072; i < 6144; ++i)
+            {
+                const double x = 0.3 + std::sin(2.0 * std::numbers::pi * 173.0 * i / sampleRate);
+                (void)source.processSample(-x);
+                error = std::max(error, std::abs(fork.processSample(x + offset) - twin.processSample(x)));
+            }
+            EXPECT_NEAR(error, 0.0, offset == 0.0 ? 1e-14 : 1e-10);
+        }
+}
+
 double fmvResidualDb(double t, double l, double m)
 {
     const double fs = 48000.0;

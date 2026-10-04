@@ -4,12 +4,13 @@
 #   cmake --build build
 #   ctest --test-dir build --output-on-failure
 #
-# Five targets:
-#   dspark_tests            the ordinary 1175-case suite (zero dependencies)
+# Six targets:
+#   dspark_tests            the ordinary 1189-case suite (zero dependencies)
 #   dspark_alloc_failure    allocation-failure injection, deliberately apart
 #   dspark_reverb_publication fixed-operation ownership/publication contract
 #   dspark_standalone       compile gate: umbrella header alone, float + double
 #   dspark_smoke            every effect at defaults, checked for NaN/Inf/runaway
+#   dspark_offline_chain    compiling/running complete-source composition example
 
 # Assertions must survive an optimised build. A number of cases exercise the
 # debug-time contracts of the framework (bounds, ranges, preconditions), so
@@ -62,6 +63,7 @@ add_executable(dspark_tests
 
 add_executable(dspark_standalone standalone_compile_test.cpp)
 add_executable(dspark_smoke      functional_smoke_test.cpp)
+add_executable(dspark_offline_chain ../examples/offline_chain.cpp)
 
 target_compile_definitions(dspark_tests PRIVATE
     DSPARK_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
@@ -83,7 +85,8 @@ target_compile_definitions(dspark_reverb_publication PRIVATE
                            DSPARK_REVERB_TEST_GENERATION_MAX=1)
 
 set(dspark_test_targets dspark_tests dspark_alloc_failure
-                        dspark_reverb_publication dspark_standalone dspark_smoke)
+                        dspark_reverb_publication dspark_standalone dspark_smoke
+                        dspark_offline_chain)
 
 foreach(target IN LISTS dspark_test_targets)
     target_link_libraries(${target} PRIVATE dspark::dspark)
@@ -106,6 +109,7 @@ add_test(NAME alloc_failure COMMAND dspark_alloc_failure)
 add_test(NAME reverb_publication COMMAND dspark_reverb_publication)
 add_test(NAME smoke         COMMAND dspark_smoke)
 add_test(NAME standalone    COMMAND dspark_standalone)
+add_test(NAME offline_chain COMMAND dspark_offline_chain)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME dependent_comparisons

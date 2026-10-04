@@ -127,7 +127,7 @@ for complete programs.
 |---|---|
 | Filters and equalization | `Biquad`, `StateVariableFilter`, `LadderFilter`, `FilterEngine`, `Equalizer`, `CrossoverFilter` |
 | Dynamics and level control | `Compressor`, `Limiter`, `NoiseGate`, `Expander`, `DynamicEQ`, `MultibandCompressor`, `DeEsser` |
-| Offline dynamics, clipping, stereo and analysis | `OfflineLeveler`, `OfflineBeatCompressor`, `OfflinePeakCompressor`, `OfflinePunch`, `OfflineSoftClipper`, `OfflineHardClipper`, `OfflineStereoGenerator`, `OfflineEnergyAnalyzer`, `OfflineTransientAnalyzer`, `OfflineTempoAnalyzer` ([worker API](docs/offline-processing.md)) |
+| Offline dynamics, clipping, stereo and analysis | `OfflineLeveler`, `OfflineBeatCompressor`, `OfflinePeakCompressor`, `OfflinePunch`, `OfflineSoftClipper`, `OfflineHardClipper`, `OfflineStereoGenerator`, `OfflineStereoBalance`, `OfflineEnergyAnalyzer`, `OfflineTransientAnalyzer`, `OfflineTempoAnalyzer` ([worker API](docs/offline-processing.md)) |
 | Nonlinear and analog modeling | `Saturation`, `Clipper`, `TapeMachine`, `TubePreamp`, `TransformerModel`, `wdf::*` |
 | Time, pitch, and spatial processing | `Delay`, `AlgorithmicReverb`, `Reverb`, `PitchShifter`, `TimeStretch`, `PitchCorrector`, `GranularProcessor` |
 | Spectral processing | `FFTReal`, `Convolver`, `ZeroLatencyConvolver`, `SpectralProcessor`, `SpectralFreeze`, `SpectralDenoiser` |

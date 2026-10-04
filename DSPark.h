@@ -364,6 +364,7 @@
  * | `OfflineSoftClipper<T>` | Effects/OfflineSoftClipper.h | Calibrated complete-source soft clipping; offline worker only |
  * | `OfflineHardClipper<T>` | Effects/OfflineHardClipper.h | Calibrated complete-source hard clipping; offline worker only |
  * | `OfflineStereoGenerator<T>` | Effects/OfflineStereoGenerator.h | Source-bound stereo generation and reusable delta cache; offline worker only |
+ * | `OfflineStereoBalance<T>` | Effects/OfflineStereoBalance.h | Optional side-energy leveling and measured window-ratio guard; offline worker only |
  * | `OfflinePunch<T>`        | Effects/OfflinePunch.h | Equal transient boost from a complete-source attack map; offline worker only |
  * | `AlgorithmicReverb<T>`   | Effects/AlgorithmicReverb.h | True-stereo FDN reverb with spring model: Room/Hall/Chamber/Plate/Spring/Cathedral |
  * | `NoiseGenerator<T>`      | Effects/NoiseGenerator.h | White/pink/brown noise generator (AudioProcessor contract)        |
@@ -411,7 +412,7 @@
  * | `OnsetDetector<T>`       | Analysis/OnsetDetector.h  | Causal SuperFlux onset detection (Boeck-2012 picker, shared beat front-end) |
  * | `BeatTracker<T>`         | Analysis/BeatTracker.h    | Tempo and beat tracking: offline dynamic programming plus a causal resonator bank |
  * | `LoudnessNormalizer<T>`  | Analysis/LoudnessNormalizer.h | Offline LUFS-target normalisation under a BS.1770 true-peak ceiling |
- * | `OfflineEnergyAnalyzer<T>` | Analysis/OfflineEnergyAnalyzer.h | Complete-source linked RMS/peak map, bounded input blocks |
+ * | `OfflineEnergyAnalyzer<T>` | Analysis/OfflineEnergyAnalyzer.h | Complete-source linked or separate mid/side RMS/peak maps, bounded input blocks |
  * | `OfflineTransientAnalyzer<T>` | Analysis/OfflineTransientAnalyzer.h | Complete-source attack/pulse maps with stereo energy pooling and time refinement |
  * | `OfflineTempoAnalyzer<T>` | Analysis/OfflineTempoAnalyzer.h | Complete-source tempo and anchored beat intervals from shared features |
  * | `LoopFinder<T>`          | Analysis/LoopFinder.h     | Bounded offline loop-point search and normalized equal-power seam rendering |
@@ -742,6 +743,7 @@
 #include "Effects/OfflineSoftClipper.h"
 #include "Effects/OfflineHardClipper.h"
 #include "Effects/OfflineStereoGenerator.h"
+#include "Effects/OfflineStereoBalance.h"
 #include "Effects/DynamicEQ.h"
 #include "Effects/MultibandCompressor.h"
 #include "Effects/Clipper.h"

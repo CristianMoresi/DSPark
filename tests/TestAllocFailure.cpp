@@ -33,6 +33,7 @@
 #include "../Effects/OfflineSoftClipper.h"
 #include "../Effects/StereoGenerator.h"
 #include "../Effects/OfflineStereoGenerator.h"
+#include "../Effects/OfflineStereoBalance.h"
 
 #include <array>
 #include <atomic>
@@ -1624,4 +1625,64 @@ DSPARK_TEST(AudioInterval_setup_process_and_finish_allocate_nothing)
     };
     check.template operator()<float>();
     check.template operator()<double>();
+}
+
+DSPARK_TEST(OfflineStereoBalance_allocation_failures_and_exact_payload_budget)
+{
+    namespace fa = dspark_test_failing_alloc;
+    AudioBuffer<double> input, output;
+    input.resize(2, 1601);
+    for (int i = 0; i < 1601; ++i)
+    {
+        const double side = i < 800 ? .6 : .02;
+        input.getChannel(0)[i] = .25 + side;
+        input.getChannel(1)[i] = .25 - side;
+    }
+    OfflineBufferSource<double> source(input.toView(), 8000);
+    OfflineStereoBalance<double> effect;
+    OfflineStereoBalance<double>::Options options;
+    options.levelingAmount = 1;
+    options.targetSideShare = .2;
+    options.guard = true;
+    struct Measurement { int calls; std::size_t bytes; bool succeeded; };
+    const auto measure = [&](auto &&operation) {
+        fa::count.store(0, std::memory_order_relaxed);
+        fa::failAt.store(std::numeric_limits<int>::max(), std::memory_order_relaxed);
+        const auto result = operation();
+        const int calls = fa::count.load(std::memory_order_relaxed);
+        fa::failAt.store(-1, std::memory_order_relaxed);
+        return Measurement{calls, result.memoryBytes, result.succeeded()};
+    };
+    const auto energy = measure([&] { return OfflineEnergyAnalyzer<double>().analyzeMidSide(source); });
+    EXPECT_TRUE(energy.succeeded);
+    for (int i = 1; i <= energy.calls; ++i)
+    {
+        fa::count.store(0, std::memory_order_relaxed);
+        fa::failAt.store(i, std::memory_order_relaxed);
+        const auto result = OfflineEnergyAnalyzer<double>().analyzeMidSide(source);
+        fa::failAt.store(-1, std::memory_order_relaxed);
+        EXPECT_TRUE(result.status == OfflineStatus::AllocationFailure);
+        EXPECT_FALSE(result.analysis.isValid());
+    }
+    const auto own = measure([&] { return effect.run(input, output, 8000, options); });
+    EXPECT_TRUE(own.succeeded);
+    output.resize(1, 1);
+    output.getChannel(0)[0] = .123;
+    for (int i = 1; i <= own.calls; ++i)
+    {
+        fa::count.store(0, std::memory_order_relaxed);
+        fa::failAt.store(i, std::memory_order_relaxed);
+        const auto result = effect.run(input, output, 8000, options);
+        const int actual = fa::count.load(std::memory_order_relaxed);
+        fa::failAt.store(-1, std::memory_order_relaxed);
+        EXPECT_TRUE(result.status == OfflineStatus::AllocationFailure);
+        EXPECT_EQ(actual, i);
+        EXPECT_EQ(output.getNumSamples(), 1);
+        EXPECT_EQ(output.getChannel(0)[0], .123);
+    }
+    OfflineJobOptions job;
+    job.memoryBudgetBytes = own.bytes;
+    EXPECT_TRUE(effect.run(input, output, 8000, options, job).succeeded());
+    --job.memoryBudgetBytes;
+    EXPECT_TRUE(effect.run(input, output, 8000, options, job).status == OfflineStatus::MemoryLimit);
 }

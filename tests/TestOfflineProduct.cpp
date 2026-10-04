@@ -1,6 +1,14 @@
 // DSPark - Independent finite-source product and worker-resource contracts.
 // Copyright (c) 2026 Cristian Moresi - MIT License
 
+// Windows SDK macros must not prevent clients from including the DSP headers
+// after their platform headers. Keep the macros active for this compile test.
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include "../Core/detail/OfflineProduct.h"
 #include "dspark_test.h"
 #include <algorithm>

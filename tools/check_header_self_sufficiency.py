@@ -4,7 +4,7 @@
 The inventory is derived from the install directories in CMakeLists.txt and
 the includes in DSPark.h.  No second list of public headers is maintained by
 this tool.  The release counters are scalar assertions over that derived
-inventory: 115 umbrella-facing headers and 145 installed library headers.
+inventory: 116 umbrella-facing headers and 146 installed library headers.
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ import sys
 import tempfile
 
 
-EXPECTED_UMBRELLA_HEADERS = 115
-EXPECTED_INSTALLED_HEADERS = 145
+EXPECTED_UMBRELLA_HEADERS = 116
+EXPECTED_INSTALLED_HEADERS = 146
 SHUFFLE_SEED = 0xD5A170
 WARNING_FLAGS = ("-Wall", "-Wextra", "-Wpedantic", "-Werror")
 
@@ -194,6 +194,7 @@ int main()
     dspark::OfflineSoftClipper<float> soft;
     dspark::OfflineHardClipper<float> hard;
     dspark::OfflineStereoGenerator<float> stereo;
+    dspark::OfflineStereoBalance<float> balance;
     dspark::OfflineStereoGenerator<float>::Options stereoOptions;
     stereoOptions.duplicateMono = true;
     dspark::OfflineEnergyAnalyzer<double> analyzer;
@@ -205,6 +206,7 @@ int main()
         && soft.run(input, output, 48000).succeeded()
         && hard.run(input, output, 48000).succeeded()
         && stereo.run(input, output, 48000, stereoOptions).succeeded()
+        && balance.run(output, output, 48000).succeeded()
         && sizeof(analyzer) > 0 && sizeof(transients) > 0 && sizeof(tempo) > 0 ? 0 : 1;
 }
 '''

@@ -192,6 +192,16 @@ make repeated reads; every cache reload checks its saved PCM fingerprint.
 `blockFrames` bounds host read/write requests independently of the internal map
 partition. Repeated reads may have decoding/I/O cost in the host.
 
+## Complete offline chain
+
+The compilable [complete-chain example](https://github.com/CristianMoresi/DSPark/blob/main/examples/offline_chain.cpp) runs
+Leveler, Peak, Beat, Punch, both clippers, stereo generation and optional stereo
+balance for `float` and `double`. Each stage analyzes its actual input and
+reports its final peak and worker payload. The example checks finite output,
+unchanged frame count and exact protected PCM, and shows cancellation wiring.
+Its order and amounts illustrate API composition; later stages can change peaks
+established earlier. CTest builds and runs this example as `offline_chain`.
+
 ## Attack and pulse maps
 
 `OfflineTransientAnalyzer<T>` analyzes immutable mono/stereo sources at 8-384 kHz.
@@ -546,7 +556,10 @@ during calibration, remain subject to the payload budget.
 
 Calibration measures complete, rounded output PCM and adjusts only the curve
 ceiling. It permits at most 24 trial passes and requires a peak error within
-0.005 dB of the representable target. The final render must reproduce the measured
+the smaller of 0.005 dB and half the effective reduction. A representable positive
+request must actually reduce the peak; unchanged or increased peaks cannot satisfy
+it. The search retains a measured sign bracket, weights stagnant endpoints and
+bisects exact PCM plateaus. The final render must reproduce the measured
 peak before the sink can commit. `Report::calibrationPasses`, `normalizedCeiling`,
 `compensatedLatencyFrames`, `achievedReductionDb`, `targetErrorDb` and `targetMet`
 make this visible. Output sample and true peak are measured independently; a
@@ -626,3 +639,78 @@ not retain references to host storage. Cache construction still processes the
 unit-width path; its numerical representability is required even if a later
 composition requests zero width. Worker memory is independent of file duration;
 host cache storage requires eight bytes per source frame, excluding its metadata.
+
+## Optional offline stereo balance
+
+@ref dspark::OfflineStereoBalance is a separate stage applied to the actual
+stereo PCM after generation at the selected width. Generation alone does not
+invoke it. Its default settings preserve the input exactly; enable leveling,
+the guard, or both explicitly. It changes only side, preserving original mid
+up to floating-point output rounding. It performs no master trim or limiting.
+
+`OfflineEnergyAnalyzer::analyzeMidSide(source, job)` supplies reusable 10 ms
+mid/side RMS and peak bins. It requires stereo, retains source provenance and
+uses actual frame counts, including the final short bin. The existing
+`analyze(source, job)` remains the linked-channel 100 ms map. Neither map keeps
+PCM or infers musical genre. Mid/side conversion and RMS accumulation remain
+finite for finite extreme double input.
+
+```cpp
+#include "DSPark.h"
+
+bool balanceStereo(const dspark::AudioBuffer<float>& generated,
+                   dspark::AudioBuffer<float>& output, double sampleRate)
+{
+    dspark::OfflineStereoBalance<float>::Options options;
+    options.levelingAmount = 0.35;
+    options.guard = true;
+    // Without an explicit target, use this source's measured side-energy share,
+    // clamped to [0.001, 0.49]. This is an energy fraction, not perceived width.
+    const auto result = dspark::OfflineStereoBalance<float>().run(
+        generated, output, sampleRate, options);
+    return result.succeeded();
+}
+```
+
+`makePlan(midSideAnalysis, options, job)` reuses a complete analysis; `analyze`
+combines analysis and planning. Plans contain copied exclusions and source/side
+fingerprints. A different generated width, source PCM or source clock requires
+analysis of the resulting stereo signal. An old plan cannot silently process
+changed PCM even when only mid changed and side remained identical.
+
+Leveling applies 0..1 of the local log-gain correction. The ordinary-rate energy
+context spans 41 cells, followed by two centered 101-cell averages. Explicit
+`maximumBoostDb` and `maximumCutDb` bound scalar leveler controls, defaulting to
++12/-24 dB. `maximumGuardCutDb` independently caps additional guard attenuation,
+defaulting to 60 dB. These control limits are not sample-peak limits on the
+bandlimited result. Silent input and absent mid/side have separate report reasons;
+silence has no automatically inferred target. Attenuating side cannot recover
+missing mid information.
+
+The guard ceiling is `target/(1-target) * 10^(guardMarginDb/10)` for the side/mid
+power ratio. It measures forward windows of approximately 40 ms, starting on
+the analysis grid and shortened at the source end. `analysisHopFrames` and
+`guardWindowFrames` give their actual sizes. Side windows below the larger of
+-140 dBFS power and -60 dB relative to complete-source mean mid-plus-side power
+are inactive. This gate is fixed from the input, not raised after processing.
+These are window-energy constraints, not per-sample or per-frequency guarantees.
+
+Rendering reuses the Core bandlimited gain operator and measures the actual
+rounded stereo output. If needed, it adds local guard attenuation and rerenders;
+`guardCalibrationPasses` reports up to 16 verification passes. A final pass must
+meet the same bound before committing. `guardMeasured`, `guardTargetMet`,
+`guardWindows`, `violatedWindows` and `maximumWindowExcessDb` distinguish measured
+results from plans. A cap or exact exclusion can make the bound unreachable;
+`TargetUnreachable` publishes no output. If missing mid makes the guard unreachable, `Reason::NoMid`
+is retained alongside that status. A purely lateral signal can satisfy the guard
+only by bringing every side window below the fixed gate; this does not recreate
+mid information. Protected PCM remains exact, with 5 ms
+external feathers. Output retains the source frame count and clock, with no
+added latency. Sample and true peak readings describe the final stereo PCM,
+including only the true-peak detector's tail; they do not imply a peak ceiling.
+
+The worker reads bounded PCM blocks and retains controls/energy cells plus the
+shared interpolation maps, rather than a full-file PCM copy. All requested
+dynamic payload obeys the job budget. The owning `run` convenience method also
+stages an output buffer; use source/plan/sink for long files. Cancellation,
+allocation failures, source changes and sink failures cannot commit partial audio.

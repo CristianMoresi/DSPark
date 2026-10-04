@@ -7,6 +7,8 @@
 | [`wav_process.cpp`](wav_process.cpp) | offline file processing: WAV in -> mastering chain -> 24-bit WAV out |
 | [`channel_strip.cpp`](channel_strip.cpp) | the real-time block-processing pattern (prepare / per-block / setters) |
 | [`pitch_tracking_eq.cpp`](pitch_tracking_eq.cpp) | analysis driving DSP: PitchFollower steering a tracking low-cut |
+| [`interval_analysis.cpp`](https://github.com/CristianMoresi/DSPark/blob/main/examples/interval_analysis.cpp) | exact sample intervals measured from a stream of blocks |
+| [`offline_chain.cpp`](https://github.com/CristianMoresi/DSPark/blob/main/examples/offline_chain.cpp) | complete-source Dynamics, clipping and stereo processing with protected PCM, cancellation and reports |
 
 ## Building plugins (VST3 / CLAP / AU)
 

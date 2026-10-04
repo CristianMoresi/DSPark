@@ -646,3 +646,10 @@ owns a separate `StereoGenerator` stream. Cached rendering reads both complete
 PCM sources and commits only after checking their fingerprints. It has no
 real-time callback; only the underlying `StereoGenerator` has one. Optional
 delta capture in that callback writes to caller-owned, nonoverlapping storage.
+
+`OfflineStereoBalance` follows the same synchronous worker contract. It analyzes
+the already generated stereo source through `OfflineEnergyAnalyzer::analyzeMidSide`.
+Its plans own controls and exclusions; each render owns its side-gain maps,
+measurement state and provisional sink. It verifies the original stereo PCM as
+well as the side stream. No worker object is published implicitly to an audio
+thread, and the balance facade has no real-time processing callback.

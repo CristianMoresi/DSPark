@@ -59,6 +59,22 @@ struct OfflineClipCalibration
     bool converged = false, bracketed = false;
 };
 
+inline double offlineClipPeakErrorDb(double peak, double target) noexcept
+{
+    return peak > 0 ? (20 / std::log(10.)) * std::log1p((peak - target) / target)
+                    : -std::numeric_limits<double>::infinity();
+}
+
+// A fixed absolute dB tolerance can accept unity or even gain for a small
+// reduction request. Bound the error by half the representable reduction too.
+inline bool offlineClipTargetMet(double peak, double target, double errorDb) noexcept
+{
+    if (target == 1)
+        return peak == 1;
+    const double toleranceDb = std::min(.005, -(10 / std::log(10.)) * std::log1p(target - 1));
+    return peak < 1 && std::abs(errorDb) <= toleranceDb;
+}
+
 // Search the actual rounded output peak. The peak need not be monotone in the
 // ceiling: maintain a measured sign bracket and reset all DSP for every trial.
 // Neither a final limiter nor an output gain adjustment participates.
@@ -66,7 +82,6 @@ template <class Render>
 OfflineClipCalibration offlineCalibrateClip(double initialCeiling, double target, Render render)
 {
     constexpr int maximumPasses = 24;
-    constexpr double toleranceDb = .005;
     OfflineClipCalibration best;
     const auto trial = [&](double ceiling)
     {
@@ -74,15 +89,14 @@ OfflineClipCalibration offlineCalibrateClip(double initialCeiling, double target
         ++best.attempts;
         if (!(measured.peak >= 0) || !std::isfinite(measured.peak))
             offlineFail(OfflineStatus::NumericalFailure);
-        const double error = measured.peak > 0 ? 20 * std::log10(measured.peak / target)
-                                               : -std::numeric_limits<double>::infinity();
+        const double error = offlineClipPeakErrorDb(measured.peak, target);
         if (measured.representable && std::abs(error) < std::abs(best.errorDb))
         {
             best.ceiling = ceiling;
             best.peak = measured.peak;
             best.errorDb = error;
         }
-        best.converged = std::abs(best.errorDb) <= toleranceDb;
+        best.converged = offlineClipTargetMet(best.peak, target, best.errorDb);
         return measured.peak;
     };
     double lo = initialCeiling, hi = initialCeiling;
@@ -114,9 +128,18 @@ OfflineClipCalibration offlineCalibrateClip(double initialCeiling, double target
     best.bracketed = fl < target && fh > target;
     if (!best.bracketed)
         return best;
+    double lowWeight = 1, highWeight = 1;
+    int previousSide = 0;
+    bool flatEndpoint = false;
     while (best.attempts < maximumPasses)
     {
-        const double fraction = std::clamp((target - fl) / (fh - fl), .1, .9);
+        // Illinois weighting prevents a nearly flat unity endpoint from
+        // pinning false position. Keep the actual measured sign bracket.
+        const double lowResidual = lowWeight * (target - fl);
+        const double highResidual = highWeight * (fh - target);
+        const double fraction = flatEndpoint
+                                    ? .5
+                                    : std::clamp(lowResidual / (lowResidual + highResidual), .1, .9);
         const double ceiling = lo + fraction * (hi - lo);
         if (!(ceiling > lo && ceiling < hi))
             break;
@@ -125,13 +148,23 @@ OfflineClipCalibration offlineCalibrateClip(double initialCeiling, double target
             return best;
         if (peak > target)
         {
+            // Rounded PCM can have an exactly flat region. Bisect it rather
+            // than spending repeated complete renders on the same peak.
+            flatEndpoint = peak == fh;
             hi = ceiling;
             fh = peak;
+            lowWeight = previousSide == 1 ? lowWeight * .5 : 1;
+            highWeight = 1;
+            previousSide = 1;
         }
         else
         {
+            flatEndpoint = peak == fl;
             lo = ceiling;
             fl = peak;
+            highWeight = previousSide == -1 ? highWeight * .5 : 1;
+            lowWeight = 1;
+            previousSide = -1;
         }
     }
     return best;
@@ -693,8 +726,12 @@ template <FloatType T, bool Soft> class OfflineClipProcessor
                                                          : silence;
             report.achievedReductionDb =
                 state.inputPeak > 0 && final.peak > 0 ? -gainToDecibels(final.peak) : 0;
-            report.targetErrorDb = report.effectiveReductionDb - report.achievedReductionDb;
-            report.targetMet = state.inputPeak > 0 && std::abs(report.targetErrorDb) <= .005;
+            report.targetErrorDb = offlineClipPeakErrorDb(final.peak, state.targetGain);
+            report.targetMet = state.inputPeak > 0 &&
+                               offlineClipTargetMet(final.peak, state.targetGain,
+                                                    report.targetErrorDb);
+            if (state.active && !report.targetMet)
+                offlineFail(OfflineStatus::NumericalFailure);
             if (state.active)
                 report.reason = report.representabilityLimited ? Reason::RepresentabilityLimited
                                                                : Reason::Processed;

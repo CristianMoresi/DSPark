@@ -150,6 +150,75 @@ DSPARK_TEST(OfflineClip_SoftActualReduction_Double)
 {
     clipAmounts<OfflineSoftClipper<double>, double>();
 }
+namespace
+{
+template <class T> void clipSmallReductions()
+{
+    for (double rate : {8000., 48000.})
+    {
+        AudioBuffer<T> input, output;
+        input.resize(2, 257);
+        for (int c = 0; c < 2; ++c)
+            for (int i = 0; i < 257; ++i)
+                input.getChannel(c)[i] = static_cast<T>(
+                    (c ? .55 : .8) * std::cos(twoPi<double> * 20 * i / rate + .3 * c));
+        const auto exercise = [&](const auto &processor, auto options)
+        {
+            for (double amount : {1e-6, .001, .1})
+            {
+                options.reductionDb = amount;
+                const auto result = processor.run(input, output, rate, options);
+                if (!result.succeeded())
+                {
+                    std::cerr << "Small-reduction calibration: rate=" << rate
+                              << " requested=" << amount
+                              << " effective=" << result.report.effectiveReductionDb
+                              << " error=" << result.report.targetErrorDb
+                              << " passes=" << result.report.calibrationPasses;
+                    if constexpr (requires { options.curve; })
+                        std::cerr << " soft-curve=" << static_cast<int>(options.curve);
+                    std::cerr << '\n';
+                }
+                EXPECT_TRUE(result.succeeded());
+                EXPECT_TRUE(result.report.targetMet);
+                const double measured = 20 * std::log10(clipPeak(input) / clipPeak(output));
+                const double effective = result.report.effectiveReductionDb;
+                EXPECT_GT(effective, 0.);
+                EXPECT_GT(measured, 0.);
+                EXPECT_NEAR(measured, effective, std::min(.005, effective / 2) + 1e-12);
+                EXPECT_NEAR(result.report.achievedReductionDb, measured, 1e-12);
+            }
+            // A protected peak cannot satisfy a representable positive request,
+            // even when the request is smaller than the ordinary 0.005 dB bound.
+            const std::array<OfflineRegion, 1> regions{{{0, 257}}};
+            options.exclusions = regions;
+            options.reductionDb = .001;
+            const auto protectedResult = processor.run(input, output, rate, options);
+            EXPECT_TRUE(protectedResult.status == OfflineStatus::NoChange);
+            EXPECT_FALSE(protectedResult.report.targetMet);
+            for (int c = 0; c < 2; ++c)
+                EXPECT_EQ(std::memcmp(input.getChannel(c), output.getChannel(c), 257 * sizeof(T)),
+                          0);
+        };
+        exercise(OfflineHardClipper<T>(), typename OfflineHardClipper<T>::Options{});
+        for (auto curve : {OfflineSoftClipCurve::Sine, OfflineSoftClipCurve::Tanh,
+                           OfflineSoftClipCurve::GoldenRatio})
+        {
+            typename OfflineSoftClipper<T>::Options options;
+            options.curve = curve;
+            exercise(OfflineSoftClipper<T>(), options);
+        }
+    }
+}
+} // namespace
+DSPARK_TEST(OfflineClip_SmallReductionsAndProtectedPeaks_Float)
+{
+    clipSmallReductions<float>();
+}
+DSPARK_TEST(OfflineClip_SmallReductionsAndProtectedPeaks_Double)
+{
+    clipSmallReductions<double>();
+}
 DSPARK_TEST(OfflineClip_SoftCurvesAndExplicitFactors)
 {
     auto input = clipFixture<double>(1, 31);

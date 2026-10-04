@@ -175,13 +175,13 @@ class OfflineProductWorkspace final
             impulse_[i] = .5 * hilbertIdealImpulse(i - (2 * block_ - 1));
     }
 
-    void prepareNear(NearField &near)
+    void prepareNear(NearField &field)
     {
-        near.emplace(job_, block_, [this](int lag) { return impulse_[lag + 2 * block_ - 1]; });
+        field.emplace(job_, block_, [this](int lag) { return impulse_[lag + 2 * block_ - 1]; });
     }
 
     template <class Reader>
-    const double *near(std::size_t leaf, Reader &source, bool outer, bool cauchy = false,
+    const double *nearField(std::size_t leaf, Reader &source, bool outer, bool cauchy = false,
                        bool alternating = false)
     {
         if (cauchy)
@@ -358,23 +358,23 @@ class OfflineHilbertMap final
             offlineFail(OfflineStatus::InvalidInput);
         constexpr int order = OfflineProductWorkspace::order;
         const auto *coefficients = local_[leaf].data();
-        const auto *close = work.near(leaf, source, outer, cauchy, alternating);
+        const auto *close = work.nearField(leaf, source, outer, cauchy, alternating);
         for (int i = 0; i < block_; ++i)
         {
             const auto *c = coefficients + (1 - i % 2) * order;
             const double u = (i - (block_ - 1) * .5) / (block_ * .5);
-            double far = c[order - 1];
+            double distant = c[order - 1];
             for (int p = order - 2; p >= 0; --p)
-                far = far * u + c[p];
+                distant = distant * u + c[p];
             if (cauchy)
             {
                 const auto *same = coefficients + (i % 2) * order;
                 double other = same[order - 1];
                 for (int p = order - 2; p >= 0; --p)
                     other = other * u + same[p];
-                far = alternating ? (i % 2 ? far - other : other - far) : far + other;
+                distant = alternating ? (i % 2 ? distant - other : other - distant) : distant + other;
             }
-            output[i] = close[i] + far;
+            output[i] = close[i] + distant;
         }
     }
 

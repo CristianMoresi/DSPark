@@ -1,12 +1,12 @@
-# DSPark vcpkg port - submit to microsoft/vcpkg once a release tag exists.
+# DSPark vcpkg overlay port for local use; not published to the central registry.
 # REF pins the immutable source commit.
 # SHA512 authenticates the archive for that exact commit.
 
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO CristianMoresi/DSPark
-    REF d8a98a6cf3a7c88af7e57a442f34b88fe869885a
-    SHA512 f8f1fff5e561a7405a4704dcedaef8fa935845cc373787bedff69c19b21db44ab50c42ffe2e375c5f6624788c61c42f77f5198471988067312481255e847bbd5
+    REF a69cee3d5c2cfd1cfa9c11cfd67891227c1427ae
+    SHA512 3d7a4c6c07e50a31074a3e8435b291e30af1de6d0eb6f721ce0d711fbc7cde4b3620e0f7fe150827a7614a30d0f6716aa5d38556b1244f7013baa5d9f951dc6f
 )
 
 vcpkg_cmake_configure(

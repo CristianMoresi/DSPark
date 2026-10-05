@@ -27,28 +27,28 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_DIRECTORIES = ("Core", "Effects", "Analysis", "IO", "Music")
 EXPECTED_INSTALLED_HEADERS = 147
 EXPECTED_ORDINARY_TESTS = 1194
-PRODUCT_P7_COMMIT = "d8a98a6cf3a7c88af7e57a442f34b88fe869885a"
-PRODUCT_P7_PARENT = "e1913513e424a5ae0dbf24fbe9ac42980d2876a3"
+PACKAGE_SOURCE_COMMIT = "a69cee3d5c2cfd1cfa9c11cfd67891227c1427ae"
+PACKAGE_SOURCE_PARENT = "1504cb55326e8ee94bc403c8b6b44ea4eabf3da4"
 PACKAGE_SOURCE_URL_PREFIX = (
     "https://codeload.github.com/CristianMoresi/DSPark/tar.gz/"
 )
 PACKAGE_SOURCE_SHA256 = (
-    "e01c8918b8d8293f0b310dcf5a81b47609e4ad8056a8236f1b7c75a941c90f00"
+    "9bac2beec7f360a308f7cab8a454682eabd61d85c185516a00c52c66fa3447fe"
 )
 PACKAGE_SOURCE_FILENAME = "dspark-1.8.0.tar.gz"
 PACKAGE_SOURCE_SHA512 = (
-    "f8f1fff5e561a7405a4704dcedaef8fa935845cc373787bedff69c19b21db44a"
-    "b50c42ffe2e375c5f6624788c61c42f77f5198471988067312481255e847bbd5"
+    "3d7a4c6c07e50a31074a3e8435b291e30af1de6d0eb6f721ce0d711fbc7cde4b"
+    "3620e0f7fe150827a7614a30d0f6716aa5d38556b1244f7013baa5d9f951dc6f"
 )
 EXPECTED_PACKAGE_HASHES = {
-    "packaging/conan/conanfile.py": "97bfaa58bc1c3ce33e1e9eacf3369dd7ddcf50bc923e5b718defeff679756fb3",
-    "packaging/vcpkg/portfile.cmake": "4e1b40d0e18fad4be214bdc9039cf66bb336450bd32cab23224c6510bcf1e200",
-    "packaging/vcpkg/vcpkg.json": "ad8b6771946a7a88a1105a01887f5385132163f9a09c0f8b33796a0381671571",
+    "packaging/conan/conanfile.py": "858c1bf799fc39370fc3c6b17e883c2a0b992578c8408434afa8e0318b17bd0d",
+    "packaging/vcpkg/portfile.cmake": "042eae55206cd5ef0500ab50bf64d446dd7746c6e676a7ec635227720f941ca1",
+    "packaging/vcpkg/vcpkg.json": "4e2179969f7e87390e23f114da0d1a7d12829e8673ba52c89341cdd497c26519",
 }
 EXPECTED_SEMANTIC_HASHES = {
-    "packaging/conan/conanfile.py": "34fe13938de0a86ebeb79d9484cf8939d671af61e435722e76d350910b6ca20f",
-    "packaging/vcpkg/portfile.cmake": "de41508e9c91d8f09bfc42737a86d3d29f216ae3be6bf4afbccabc20893b1db7",
-    "packaging/vcpkg/vcpkg.json": "8b1b26eed0ee2aaf52f56f6ab65829b79967aa8f87069b53c9e346c9baaa6539",
+    "packaging/conan/conanfile.py": "f47c1927c71749405a9db2ff6a05c3548ae5d681851cb814170c41bc0555faef",
+    "packaging/vcpkg/portfile.cmake": "673a62c7c1edc2349c5b3caefa79c0c856b1316deb23cdfce7a4e69abffaf834",
+    "packaging/vcpkg/vcpkg.json": "d1066b6e44fdec396d814b626321d1066a57c136638142492f67bc2987020330",
 }
 PACKAGE_FIELD_MUTANT_IDS = (
     "MUT-R-CONAN-COMMENT",
@@ -777,7 +777,7 @@ def conan_field_errors(data: bytes) -> list[str]:
         if not isinstance(url, str) or not url.startswith(
                 PACKAGE_SOURCE_URL_PREFIX):
             errors.append("PACKAGE_R_CONAN_FIELD:source_url")
-        elif url[len(PACKAGE_SOURCE_URL_PREFIX):] != PRODUCT_P7_COMMIT:
+        elif url[len(PACKAGE_SOURCE_URL_PREFIX):] != PACKAGE_SOURCE_COMMIT:
             errors.append("PACKAGE_R_CONAN_FIELD:source_ref")
         keywords = {
             keyword.arg: keyword.value for keyword in call.keywords
@@ -1050,7 +1050,7 @@ def vcpkg_field_errors(data: bytes) -> list[str]:
     source = source_rows[0]
     if cmake_keyword(source, "REPO") != "CristianMoresi/DSPark":
         errors.append("PACKAGE_R_VCPKG_FIELD:repo")
-    if cmake_keyword(source, "REF") != PRODUCT_P7_COMMIT:
+    if cmake_keyword(source, "REF") != PACKAGE_SOURCE_COMMIT:
         errors.append("PACKAGE_R_VCPKG_FIELD:ref")
     if cmake_keyword(source, "SHA512") != PACKAGE_SOURCE_SHA512:
         errors.append("PACKAGE_R_VCPKG_FIELD:sha512")
@@ -1059,7 +1059,7 @@ def vcpkg_field_errors(data: bytes) -> list[str]:
     if source != [
         "OUT_SOURCE_PATH", "SOURCE_PATH",
         "REPO", "CristianMoresi/DSPark",
-        "REF", PRODUCT_P7_COMMIT,
+        "REF", PACKAGE_SOURCE_COMMIT,
         "SHA512", PACKAGE_SOURCE_SHA512,
     ]:
         errors.append("PACKAGE_R_VCPKG_FIELD:source_shape")
@@ -1206,7 +1206,7 @@ def package_mutant_cases(
     add("MUT-R-CONAN-SOURCE-URL", "tag-url", conan_path,
         replace_package_bytes(
             conan,
-            (PACKAGE_SOURCE_URL_PREFIX + PRODUCT_P7_COMMIT).encode("ascii"),
+            (PACKAGE_SOURCE_URL_PREFIX + PACKAGE_SOURCE_COMMIT).encode("ascii"),
             b"https://github.com/CristianMoresi/DSPark/archive/refs/tags/v1.8.0.tar.gz"),
         "PACKAGE_R_CONAN_FIELD:source_url")
     filename_anchor = (
@@ -1225,7 +1225,7 @@ def package_mutant_cases(
         ("version-drift", "dspark-1.8.1.tar.gz"),
         ("tag-ref", "dspark-v1.8.0.tar.gz"),
         ("branch-ref", "dspark-main.tar.gz"),
-        ("short-ref", "dspark-" + PRODUCT_P7_COMMIT[:12] + ".tar.gz"),
+        ("short-ref", "dspark-" + PACKAGE_SOURCE_COMMIT[:12] + ".tar.gz"),
         ("r-placeholder", "dspark-" + "R" * 40 + ".tar.gz"),
     ):
         replacement_line = (
@@ -1240,8 +1240,8 @@ def package_mutant_cases(
         "PACKAGE_R_CONAN_FIELD:filename")
 
     for case, reference in (
-        ("parent", PRODUCT_P7_PARENT),
-        ("short", PRODUCT_P7_COMMIT[:12]),
+        ("parent", PACKAGE_SOURCE_PARENT),
+        ("short", PACKAGE_SOURCE_COMMIT[:12]),
         ("tag", "v1.8.0"),
         ("branch", "main"),
         ("r-placeholder", "R" * 40),
@@ -1249,10 +1249,10 @@ def package_mutant_cases(
         add("MUT-R-CONAN-REF", case, conan_path,
             replace_package_bytes(
                 conan,
-                (PACKAGE_SOURCE_URL_PREFIX + PRODUCT_P7_COMMIT).encode("ascii"),
+                (PACKAGE_SOURCE_URL_PREFIX + PACKAGE_SOURCE_COMMIT).encode("ascii"),
                 (PACKAGE_SOURCE_URL_PREFIX + reference).encode("ascii")),
             "PACKAGE_R_CONAN_FIELD:source_ref")
-    changed_sha256 = ("4" + PACKAGE_SOURCE_SHA256[1:]).encode("ascii")
+    changed_sha256 = (("0" if PACKAGE_SOURCE_SHA256[0] != "0" else "1") + PACKAGE_SOURCE_SHA256[1:]).encode("ascii")
     add("MUT-R-CONAN-SHA256", "nibble", conan_path,
         replace_package_bytes(
             conan, PACKAGE_SOURCE_SHA256.encode("ascii"), changed_sha256),
@@ -1318,18 +1318,18 @@ def package_mutant_cases(
                 port, b"CristianMoresi/DSPark", replacement),
             "PACKAGE_R_VCPKG_FIELD:repo")
     for case, reference in (
-        ("parent", PRODUCT_P7_PARENT),
+        ("parent", PACKAGE_SOURCE_PARENT),
         ("tag", "v1.8.0"),
         ("branch", "main"),
-        ("short", PRODUCT_P7_COMMIT[:12]),
+        ("short", PACKAGE_SOURCE_COMMIT[:12]),
         ("r-placeholder", "R" * 40),
     ):
         add("MUT-R-VCPKG-REF", case, port_path,
             replace_package_bytes(
-                port, ("REF " + PRODUCT_P7_COMMIT).encode("ascii"),
+                port, ("REF " + PACKAGE_SOURCE_COMMIT).encode("ascii"),
                 ("REF " + reference).encode("ascii")),
             "PACKAGE_R_VCPKG_FIELD:ref")
-    changed_sha512 = ("7" + PACKAGE_SOURCE_SHA512[1:]).encode("ascii")
+    changed_sha512 = (("0" if PACKAGE_SOURCE_SHA512[0] != "0" else "1") + PACKAGE_SOURCE_SHA512[1:]).encode("ascii")
     add("MUT-R-VCPKG-SHA512", "nibble", port_path,
         replace_package_bytes(
             port, PACKAGE_SOURCE_SHA512.encode("ascii"), changed_sha512),

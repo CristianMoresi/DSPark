@@ -124,7 +124,7 @@ template <ClipperCurve C, class Reader> class BoundedClip
     } raw_{this, false}, difference_{this, true};
     std::optional<OfflineHilbertMap> rawMap_, differenceMap_;
     std::array<std::optional<SincPhase>, 16> phases_;
-    std::unique_ptr<double[]> native_, up_, shaped_, scratchA_, scratchB_, phaseWork_, output_;
+    OfflineScratchArray<double> native_, up_, shaped_, scratchA_, scratchB_, phaseWork_, output_;
     std::array<std::int64_t, 3> nativeLeaf_{-1, -1, -1};
     std::array<std::int64_t, 3> upLeaf_{-1, -1, -1}, shapedLeaf_{-1, -1, -1};
     ReconstructedStage<C> stage_;
@@ -290,7 +290,7 @@ template <ClipperCurve C, class Reader> class BoundedClip
     {
         if (!(ceiling > 0) || !std::isfinite(ceiling))
             offlineFail(OfflineStatus::InvalidInput);
-        native_ = job.allocate<double>(6 * static_cast<std::uint64_t>(block_));
+        native_ = job.allocateScratch<double>(6 * static_cast<std::uint64_t>(block_));
         rawMap_.emplace(work_, raw_);
         differenceMap_.emplace(work_, difference_);
         for (int p = 0; p < factor; ++p)
@@ -298,12 +298,12 @@ template <ClipperCurve C, class Reader> class BoundedClip
         filterSize_ = stage_.filterSize();
         delay_ = stage_.delay();
         left_ = filterSize_ - 1 - delay_;
-        up_ = job.allocate<double>(6 * static_cast<std::uint64_t>(highBlock_));
-        shaped_ = job.allocate<double>(6 * static_cast<std::uint64_t>(highBlock_));
-        scratchA_ = job.allocate<double>(static_cast<std::uint64_t>(highBlock_) + filterSize_ - 1);
-        scratchB_ = job.allocate<double>(static_cast<std::uint64_t>(highBlock_) + filterSize_ - 1);
-        phaseWork_ = job.allocate<double>(block_);
-        output_ = job.allocate<double>(block_);
+        up_ = job.allocateScratch<double>(6 * static_cast<std::uint64_t>(highBlock_));
+        shaped_ = job.allocateScratch<double>(6 * static_cast<std::uint64_t>(highBlock_));
+        scratchA_ = job.allocateScratch<double>(static_cast<std::uint64_t>(highBlock_) + filterSize_ - 1);
+        scratchB_ = job.allocateScratch<double>(static_cast<std::uint64_t>(highBlock_) + filterSize_ - 1);
+        phaseWork_ = job.allocateScratch<double>(block_);
+        output_ = job.allocateScratch<double>(block_);
     }
     BoundedClip(const BoundedClip &) = delete;
     BoundedClip &operator=(const BoundedClip &) = delete;

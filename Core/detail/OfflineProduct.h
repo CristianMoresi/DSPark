@@ -67,12 +67,12 @@ class OfflineProductWorkspace final
             if (count == 1)
                 break;
         }
-        moments_ = job.allocate<Coefficients>(nodes);
-        local_ = job.allocate<Coefficients>(leaves_);
-        matrices_ = job.allocate<Matrix>(8);
-        weights_ = job.allocate<double>(static_cast<std::uint64_t>(block) * order);
-        impulse_ = job.allocate<double>(4 * static_cast<std::uint64_t>(block) - 1);
-        input_ = job.allocate<double>(block);
+        moments_ = job.allocateScratch<Coefficients>(nodes);
+        local_ = job.allocateScratch<Coefficients>(leaves_);
+        matrices_ = job.allocateScratch<Matrix>(8);
+        weights_ = job.allocateScratch<double>(static_cast<std::uint64_t>(block) * order);
+        impulse_ = job.allocateScratch<double>(4 * static_cast<std::uint64_t>(block) - 1);
+        input_ = job.allocateScratch<double>(block);
         buildGeometry();
         // Existing product workers reserve both fields before opening a sink.
         // A caller supplying other near-field kernels can explicitly omit them.
@@ -208,9 +208,9 @@ class OfflineProductWorkspace final
     int block_;
     std::size_t leaves_ = 0, levelCount_ = 0;
     std::array<Level, 64> levels_{};
-    std::unique_ptr<Coefficients[]> moments_, local_;
-    std::unique_ptr<Matrix[]> matrices_;
-    std::unique_ptr<double[]> weights_, impulse_, input_;
+    OfflineScratchArray<Coefficients> moments_, local_;
+    OfflineScratchArray<Matrix> matrices_;
+    OfflineScratchArray<double> weights_, impulse_, input_;
     NearField near_, outerNear_, cauchyNear_;
 };
 
@@ -223,7 +223,7 @@ class OfflineHilbertMap final
   public:
     template <class Reader>
     OfflineHilbertMap(OfflineProductWorkspace &work, Reader &source)
-        : local_(work.job_.allocate<OfflineProductWorkspace::Coefficients>(work.leaves_)),
+        : local_(work.job_.allocateScratch<OfflineProductWorkspace::Coefficients>(work.leaves_)),
           leaves_(work.leaves_), block_(work.block_)
     {
         rebuild(work, source);
@@ -388,7 +388,7 @@ class OfflineHilbertMap final
                 dst[static_cast<std::size_t>(parity * order + p)] +=
                     simd::dotProduct(matrix[p].data(), src.data() + parity * order, order) * scale;
     }
-    std::unique_ptr<OfflineProductWorkspace::Coefficients[]> local_;
+    OfflineScratchArray<OfflineProductWorkspace::Coefficients> local_;
     std::size_t leaves_;
     int block_;
 };
@@ -400,7 +400,7 @@ class OfflineProductCombination final
     OfflineProductCombination(OfflineProductWorkspace &work, LeftReader &left, RightReader &right,
                               const OfflineHilbertMap &aLeft, const OfflineHilbertMap &aRight)
         : work_(work), left_(left), right_(right), aLeft_(aLeft), aRight_(aRight),
-          samples_(work.job().allocate<double>(15 * static_cast<std::uint64_t>(work.block())))
+          samples_(work.job().allocateScratch<double>(15 * static_cast<std::uint64_t>(work.block())))
     {
         leaves_.fill(-1);
     }
@@ -447,7 +447,7 @@ class OfflineProductCombination final
     LeftReader &left_;
     RightReader &right_;
     const OfflineHilbertMap &aLeft_, &aRight_;
-    std::unique_ptr<double[]> samples_;
+    OfflineScratchArray<double> samples_;
     std::array<std::int64_t, 3> leaves_{};
 };
 
@@ -470,7 +470,7 @@ inline void offlineBandlimitedProduct(OfflineSession &job, std::int64_t frames, 
     OfflineHilbertMap aLeft(work, left), aRight(work, right);
     OfflineProductCombination combination(work, left, right, aLeft, aRight);
     OfflineHilbertMap aCombined(work, combination);
-    auto output = job.allocate<double>(block);
+    auto output = job.allocateScratch<double>(block);
     job.checkpoint(OfflinePhase::Render, 0, frames);
     for (std::size_t leaf = 0; leaf < work.leaves(); ++leaf)
     {

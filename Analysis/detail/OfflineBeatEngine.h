@@ -19,83 +19,8 @@
 namespace dspark::detail
 {
 
-// Repeated local feature windows reuse bounded scratch blocks. Each block and
-// its bookkeeping are one charged allocation; failure cannot leave partially
-// published allocator metadata. Reuse requests no payload and needs no refund.
-class OfflineBeatMemory final : public std::pmr::memory_resource
-{
-  public:
-    explicit OfflineBeatMemory(OfflineSession &job) : job_(job) {}
-    ~OfflineBeatMemory() override
-    {
-        while (blocks_)
-        {
-            auto *block = blocks_;
-            blocks_ = block->next;
-            if (block->alignment > alignof(std::max_align_t))
-                ::operator delete(block, std::align_val_t{block->alignment});
-            else
-                ::operator delete(block);
-        }
-    }
-  private:
-    struct alignas(std::max_align_t) Block
-    {
-        Block *next;
-        void *data;
-        std::size_t capacity, alignment;
-        bool available;
-    };
-    void *do_allocate(std::size_t bytes, std::size_t alignment) override
-    {
-        Block *best = nullptr;
-        for (auto *b = blocks_; b; b = b->next)
-            if (b->available && b->capacity >= bytes && b->alignment >= alignment &&
-                (!best || b->capacity < best->capacity))
-                best = b;
-        if (best)
-        {
-            best->available = false;
-            return best->data;
-        }
-        std::size_t capacity = 1;
-        while (capacity < bytes)
-        {
-            if (capacity > std::numeric_limits<std::size_t>::max() / 2)
-                offlineFail(OfflineStatus::MemoryLimit);
-            capacity *= 2;
-        }
-        alignment = std::max(alignment, alignof(Block));
-        if (alignment > std::numeric_limits<std::size_t>::max() - sizeof(Block))
-            offlineFail(OfflineStatus::MemoryLimit);
-        const auto offset = (sizeof(Block) + alignment - 1) / alignment * alignment;
-        if (capacity > std::numeric_limits<std::size_t>::max() - offset)
-            offlineFail(OfflineStatus::MemoryLimit);
-        const auto total = offset + capacity;
-        job_.charge(total);
-        void *raw = alignment > alignof(std::max_align_t)
-                        ? ::operator new(total, std::align_val_t{alignment}) : ::operator new(total);
-        auto *block = new (raw) Block{blocks_, static_cast<std::byte *>(raw) + offset,
-                                     capacity, alignment, false};
-        blocks_ = block;
-        return block->data;
-    }
-    void do_deallocate(void *p, std::size_t, std::size_t) override
-    {
-        for (auto *b = blocks_; b; b = b->next)
-            if (b->data == p)
-            {
-                b->available = true;
-                return;
-            }
-    }
-    bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override
-    {
-        return this == &other;
-    }
-    OfflineSession &job_;
-    Block *blocks_ = nullptr;
-};
+// Keep the existing tempo-worker growth policy in the shared Core pool.
+using OfflineBeatMemory = OfflineMemoryPool;
 
 template <FloatType T> struct OfflineBeatEngine final
 {

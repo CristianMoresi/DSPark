@@ -4,6 +4,8 @@ All notable user-facing changes to DSPark are documented here.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-05
+
 ### Added
 
 - `wdf::ToneStackFMV::analogStateSpace()`: the continuous-time state space
@@ -28,6 +30,10 @@ All notable user-facing changes to DSPark are documented here.
   measured output headroom. A host-owned canonical delta cache supports new
   widths/exclusions while validating source, clock, settings and cached PCM.
   Worker scratch is bounded independently of duration; output is transactional.
+
+- `OfflineStereoBalance`: source-bound side-only leveling from shared mid/side
+  analysis, with an actual-render guard, exact exclusions and transactional
+  output. It preserves the original mid without a master gain trim or limiter.
 
 - `StereoGenerator`: twenty moving bands and rational color on a parallel copy,
   with delta add-back preserving the delayed original mid. Includes width
@@ -63,6 +69,9 @@ All notable user-facing changes to DSPark are documented here.
   stereo spectrum, complete-source normalization, refined source-frame intervals,
   optional reusable novelty features and bounded worker memory. Reuses the same
   FFT, filterbank, novelty and peak-picking kernels as `OnsetDetector`.
+  The attack map also recovers upper-register strikes masked by falling
+  low-frequency energy without extending bass holds. Corpus results include
+  the measured precision/recall tradeoff in `docs/offline-processing.md`.
 - `OfflineLeveler`: automatic, stereo-linked upward macro RMS leveling with
   exact source-frame exclusions, reusable immutable plans, cancellation and
   transactional offline rendering. Reports output sample/true peak without
@@ -110,13 +119,13 @@ All notable user-facing changes to DSPark are documented here.
   by a look-ahead spectral-flux detector; inside a strike's lock the bins
   the strike rises into are copied unrotated, so it carries no pre-echo.
   Scored against an ideal rendering of the same scenes: time stretch
-  spectral distance 4.12 dB (1.8 engine 5.01), strike timing 0.59 ms median
+  spectral distance 4.12 dB (Standard engine 5.01), strike timing 0.59 ms median
   (4.16); pitch shift spectral distance 1.96 dB at the default frame and
-  1.47 at 4096 (1.8 engine 2.50), strike timing 0.68 ms (13.18).
-- The Studio pitch shifter's latency is the same at every pitch (the 1.8
+  1.47 at 4096 (Standard engine 2.50), strike timing 0.68 ms (13.18).
+- The Studio pitch shifter's latency is the same at every pitch (the Standard
   engine's real delay drifted 64 ms late at -12 semitones and 32 ms early
   at +12 against one reported latency), and it shifts a source panned hard
-  to either side exactly (the 1.8 engine, deciding phases on the first
+  to either side exactly (the Standard engine, deciding phases on the first
   channel, attenuated a right-only source by 48 dB).
 - `Resampler` kernels are designed per conversion from a specification - a
   passband edge and a stopband attenuation per quality tier, with the
@@ -158,6 +167,24 @@ All notable user-facing changes to DSPark are documented here.
   store - the same resampling, per-channel convolvers and atomic
   publication as loading from a file.
 
+- Plugin parameters: `choice()` (named positions whose labels hosts list,
+  display and parse, including AU value strings and VST3 list / CLAP enum
+  flags) and `stepped()` (evenly spaced discrete positions shown as whole
+  numbers). Unparsable host text is refused instead of guessed.
+- The installed CMake package (`find_package(dspark)`) now ships the plugin
+  layer and defines `dspark_add_plugin()`, as `add_subdirectory()` and
+  `FetchContent` do; the helper gains `VERSION` and `BUNDLE_ID`.
+- `HilbertIIR`, a zero-latency analytic pair in quadrature from 20 Hz;
+  `SincInterpolator` (32-tap windowed sinc) and `StretchedSincReader`;
+  `PitchShifter` `Quality::High`; NoiseGate and Expander lookahead with
+  reported latency; first-order ADAA in `WaveshapeTable`; fractional
+  `SampleAndHold` periods; `FilterEngine::setShelfSlope()`.
+- `Delay` insert API (`prepare(spec)`, `setMix()`, in-place dry/wet
+  `processBlock`), `Crossfade` equal-power sine law with curve glides and
+  `gainsFor()`.
+- Gapless MP3 round trips: codec-delay flush, an Info frame with a gapless
+  tag, and trimming by the tags of other encoders on decode.
+
 ### Changed
 
 - `TubePreamp` tabulates the implicit Koren load line instead of iterating
@@ -170,14 +197,17 @@ All notable user-facing changes to DSPark are documented here.
   plate voltage is band-limited once, at the output, with an exact
   compensation of the projection droop. At the 2x default the worst alias
   component below 20 kHz of a 23-tone sweep up to +36 dB drive is
-  -80.6 dBc; 1.8.0 measured -9.8 dBc for two stages at +36 dB on the same
+  -80.6 dBc; the September 26 source (`d8a98a6`) measured -9.8 dBc for two
+  stages at +36 dB on the same
   measurement. Against independent dense solutions of the same circuit
   equations the 2x waveform error is at most -73.5 dB. Reported latency is
   71/99/113/121 samples at 2/4/8/16x; 1x keeps the point circuit and zero
   latency. The shared per-instance table occupies 156672 bytes. Stereo
-  processing at 2x costs 0.5-1.7 times 1.8.0 at the same factor (less for
+  processing at 2x costs 0.5-1.7 times that September 26 source at the same factor (less for
   clean and moderate settings, more for top-octave tones at +36 dB), with
   the measurement conditions in the header. The default remains 2x.
+  Stage changes prime a prepared second circuit for 5 ms and then crossfade
+  for 20 ms, preserving latency and avoiding callback allocations.
 - `processBlock()` and `getLatency()` are the canonical in-place and audio
   delay names. Saturation's `process()` and the analog effects'
   `getLatencySamples()` remain compatible aliases. The cookbook documents
@@ -192,8 +222,11 @@ All notable user-facing changes to DSPark are documented here.
   reuse of fitting material from the additional evaluation excerpts. The model is not
   consulted where the proposal's alternate beats cannot be told apart, so
   clicks, swing and quiet subdivisions keep their level; when it moves the
-  level, the reading it moved from is `secondaryTempoBpm`. Viennese waltzes
-  read at one beat per bar can still be moved to two; that limitation remains.
+  level, the reading it moved from is `secondaryTempoBpm`. Rational period
+  alternatives at 1/3, 2/3, 3/2 and 3 of the proposal now participate when
+  range and pulse support allow, with phase-aware scoring and the original
+  binary coefficients retained. These alternatives do not identify a time
+  signature; the header documents grouped validation and training overlap.
 - `TransformerModel` oversamples its core 2x by default, with
   `setOversampling()` (1, 2, 4, 8, 16), `getOversamplingFactor()` and the
   factor saved in the state (older blobs restore 2x). At 1x the loop's
@@ -230,11 +263,11 @@ All notable user-facing changes to DSPark are documented here.
   the default frames and 48 kHz: `PitchShifter` 5184 samples (was 4096),
   `TimeStretch`'s fixed-rate adaptor 5632 (was 2048). `prepare()`'s frame
   argument now defaults to 0, each engine's own frame. `setQuality()`
-  selects the 1.8 renderings (`Standard`, and `High` for the pitch
-  shifter), bit-exact as before; state blobs saved by 1.8 restore them.
-  `PitchCorrector` keeps the 1.8 engine, whose retune dynamics it is tuned
-  to. Crossing between Studio and a 1.8 engine in `PitchShifter` restarts
-  the stream at the next block.
+  selects the earlier renderings (`Standard`, and `High` for the pitch
+  shifter), bit-exact as before; state blobs without the quality field
+  restore Standard. `PitchCorrector` keeps the Standard engine, whose
+  retune dynamics it is tuned to. Crossing between Studio and Standard/High
+  in `PitchShifter` restarts the stream at the next block.
 
 - `AlgorithmicReverb` mixes its tail through a time-varying feedback matrix:
   after the Hadamard mix, line pairs turn through slow Givens rotations
@@ -266,7 +299,39 @@ All notable user-facing changes to DSPark are documented here.
   threshold; the behaviour is now pinned by a test and the documentation
   points to `Adaptive` for makeup only where gain is reduced.
 
+- `AlgorithmicReverb` rebuilt as a true-stereo 32-line FDN (16 in Eco) with
+  exact per-band decay, a velvet-noise early field joined to the late field
+  on one physical decay, a binaural stereo image with directional early
+  reflections, and a dispersive spring model - at about half the CPU.
+- The FFT is a split-format Stockham radix-4 engine (2x faster on SSE2, 4x
+  with AVX2); `Oversampling` runs a true polyphase decimator on the shared
+  `SimdOps` layer (about 2x faster).
+- `Oscillator` waveforms are minBLEP band-limited by default; `Equalizer`
+  bells default to the analog-matched design; `SpectralDenoiser` uses a
+  decision-directed Wiener gain instead of a hard gate.
+- The `Limiter` gain computer turns peaks down before the hard-clip
+  backstop; AutoGain matches integrated K-weighted loudness; decibel
+  conversions run on exp/log at half the cost.
+- Updated mix, width, gain and shape controls glide in sample time instead of
+  stepping once per block. Each class documents its transition duration.
+- VST3 `restartComponent` and AU `Latency` listeners are called on the host's
+  UI/main thread only: a latency change detected in the audio callback raises
+  an atomic flag that a ~30 Hz UI-thread tick hands to the host, with no host
+  call or allocation on the audio thread.
+- The Conan recipe installs under `include/dspark` like the CMake package, so
+  `#include <DSPark.h>` works with every package manager, and ships the plugin
+  layer with `dspark_add_plugin()`. Both recipes pin the 1.8.0 source.
+
 ### Fixed
+
+- Offline clipping reuses budgeted Core scratch storage when calibration changes
+  the projection geometry. Repeatedly allocating equivalent maps could exhaust
+  the cumulative job budget on long sources despite a smaller live workspace.
+  The memory budget, numerical processing and target tolerances are unchanged.
+
+- `OfflineBeatCompressor` compiles after the Windows SDK, whose `near` macro
+  previously erased a local helper name. Include-order coverage uses the real
+  SDK header; numerical processing is unchanged.
 
 - `LoudnessMeter`: the -100 LUFS floor is monotone across its former power-domain
   discontinuity, including positive sub-floor powers in float and double.
@@ -323,55 +388,6 @@ All notable user-facing changes to DSPark are documented here.
   since V3). A steady tone below 12 s read LRA 20 LU and now reads 0; on a
   music fragment the reading matches the Tech 3342 reference code within
   0.06 LU.
-
-## [1.8.0] - 2026-09-26
-
-### Added
-
-- Plugin parameters: `choice()` (named positions whose labels hosts list,
-  display and parse, including AU value strings and VST3 list / CLAP enum
-  flags) and `stepped()` (evenly spaced discrete positions shown as whole
-  numbers). Unparsable host text is refused instead of guessed.
-- The installed CMake package (`find_package(dspark)`) now ships the plugin
-  layer and defines `dspark_add_plugin()`, as `add_subdirectory()` and
-  `FetchContent` do; the helper gains `VERSION` and `BUNDLE_ID`.
-- `HilbertIIR`, a zero-latency analytic pair in quadrature from 20 Hz;
-  `SincInterpolator` (32-tap windowed sinc) and `StretchedSincReader`;
-  `PitchShifter` `Quality::High`; NoiseGate and Expander lookahead with
-  reported latency; first-order ADAA in `WaveshapeTable`; fractional
-  `SampleAndHold` periods; `FilterEngine::setShelfSlope()`.
-- `Delay` insert API (`prepare(spec)`, `setMix()`, in-place dry/wet
-  `processBlock`), `Crossfade` equal-power sine law with curve glides and
-  `gainsFor()`.
-- Gapless MP3 round trips: codec-delay flush, an Info frame with a gapless
-  tag, and trimming by the tags of other encoders on decode.
-
-### Changed
-
-- `AlgorithmicReverb` rebuilt as a true-stereo 32-line FDN (16 in Eco) with
-  exact per-band decay, a velvet-noise early field joined to the late field
-  on one physical decay, a binaural stereo image with directional early
-  reflections, and a dispersive spring model - at about half the CPU.
-- The FFT is a split-format Stockham radix-4 engine (2x faster on SSE2, 4x
-  with AVX2); `Oversampling` runs a true polyphase decimator on the shared
-  `SimdOps` layer (about 2x faster).
-- `Oscillator` waveforms are minBLEP band-limited by default; `Equalizer`
-  bells default to the analog-matched design; `SpectralDenoiser` uses a
-  decision-directed Wiener gain instead of a hard gate.
-- The `Limiter` gain computer turns peaks down before the hard-clip
-  backstop; AutoGain matches integrated K-weighted loudness; decibel
-  conversions run on exp/log at half the cost.
-- Mix, width, gain and shape changes across the effects glide over at least
-  20 ms instead of stepping once per block.
-- VST3 `restartComponent` and AU `Latency` listeners are called on the host's
-  UI/main thread only: a latency change detected in the audio callback raises
-  an atomic flag that a ~30 Hz UI-thread tick hands to the host, with no host
-  call or allocation on the audio thread.
-- The Conan recipe installs under `include/dspark` like the CMake package, so
-  `#include <DSPark.h>` works with every package manager, and ships the plugin
-  layer with `dspark_add_plugin()`. Both recipes pin the 1.8.0 source.
-
-### Fixed
 
 - Plugin wrappers: the soft bypass is delayed by the reported latency so a
   bypassed track stays aligned; blocks larger than the announced maximum

@@ -4759,7 +4759,7 @@ DSPARK_TEST(PitchShifter_wet_and_dry_are_time_aligned)
     }
 }
 
-// The 1.8 engine's resample reader trails a write head that moves at the
+// The Standard engine's resample reader trails a write head that moves at the
 // pitch ratio, so its real delay drifts with the pitch: the energy centroid
 // of a 40 ms tone burst lands 64 ms late at -12 semitones and 32 ms early at
 // +12, against one reported latency. Studio steers its timeline so the
@@ -4814,13 +4814,13 @@ DSPARK_TEST(PitchShifter_studio_latency_holds_at_every_pitch)
             meanDev += dev / (bursts - 2);
             worstDev = std::max(worstDev, std::abs(dev));
         }
-        EXPECT_LT(std::abs(meanDev), 96.0);   // 2 ms (1.8 engine: 3064 at -12)
+        EXPECT_LT(std::abs(meanDev), 96.0);   // 2 ms (Standard engine: 3064 at -12)
         EXPECT_LT(worstDev, 192.0);           // 4 ms
     }
 }
 
 // Studio decides peaks and phases on the channels' summed power, so a source
-// panned hard to either side is shifted as well as a centred one. The 1.8
+// panned hard to either side is shifted as well as a centred one. The Standard
 // engine decides them on the first channel alone.
 DSPARK_TEST(PitchShifter_studio_shifts_a_hard_panned_source)
 {
@@ -4864,7 +4864,7 @@ DSPARK_TEST(PitchShifter_studio_shifts_a_hard_panned_source)
     }
 }
 
-// Studio and the 1.8 engine run different latencies, so crossing between
+// Studio and the Standard engine run different latencies, so crossing between
 // them mid-stream restarts the stream on the next block instead of joining
 // two timelines: the reported latency follows the engine, the output stays
 // finite, and the pitch is exact again once the new engine has filled.
@@ -5420,7 +5420,7 @@ DSPARK_TEST(PitchShifter_rendering_matches_its_stored_reference)
     for (int c = 0; c < 4; ++c)
     {
         auto ps = std::make_unique<PitchShifter<float>>();
-        ps->setQuality(PitchShifter<float>::Quality::Standard);   // the 1.8 rendering
+        ps->setQuality(PitchShifter<float>::Quality::Standard);   // the earlier Standard rendering
         ps->prepare(spec(static_cast<double>(refRate), refBlock, 1), refFft);
         ps->setSemitones(refSemitones[c]);
         ps->setMix(1.0f);
@@ -5631,7 +5631,7 @@ DSPARK_TEST(PitchShifter_rendering_matches_its_stored_reference)
     for (int c = 0; c < 2; ++c)
     {
         auto ps = std::make_unique<PitchShifter<float>>();
-        ps->setQuality(PitchShifter<float>::Quality::Standard);   // the 1.8 rendering
+        ps->setQuality(PitchShifter<float>::Quality::Standard);   // the earlier Standard rendering
         ps->setMix(ref2Mix[c]);           // settled by prepare(): no ramp
         ps->prepare(spec(static_cast<double>(refRate), refBlock, 2), refFft);
         ps->setSemitones(ref2Semitones[c]);

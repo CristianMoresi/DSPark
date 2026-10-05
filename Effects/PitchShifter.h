@@ -16,11 +16,11 @@
  *   transform 16 samples on, and a time map anchored on strikes found by a
  *   look-ahead spectral-flux detector. The stretched stream is read back at
  *   the pitch ratio with the 32-tap windowed sinc of Core/Interpolation.h.
- * - **Quality::Standard / Quality::High**, the 1.8 engine
+ * - **Quality::Standard / Quality::High**, the Standard/High engine
  *   (Effects/detail/PhaseVocoderEngine.h): identity phase locking (Laroche &
  *   Dolson 1999) with phase reset on energy onsets, decided on the FIRST
  *   channel. Standard reads with a 4-point Catmull-Rom interpolator and is
- *   the 1.8 rendering, pinned by stored references; High reads with the
+ *   the earlier Standard rendering, pinned by stored references; High reads with the
  *   32-tap sinc at the same latency.
  *
  * Measured against the ideal (each source re-synthesised at the shifted
@@ -31,7 +31,7 @@
  *   engine                    LSD dB  conv dB  attack dB  pre-echo dB  onset ms
  *   Studio, 2048 (default)     1.96   -14.22     -2.84      -94.1       0.68
  *   Studio, 4096               1.47   -18.66     -2.84      -79.5       0.89
- *   1.8 engine, Standard       2.50   -12.16     -4.74      -78.4      13.18
+ *   Standard engine            2.50   -12.16     -4.74      -78.4      13.18
  *
  * (LSD: multi-resolution log-spectral distance; conv: spectral convergence;
  * attack: energy of the first 5 ms against the ideal's, closer to 0 is
@@ -39,7 +39,7 @@
  * ideal's, relative to the strike; onset: median error of the unaligned
  * onset time. Lower is better elsewhere.)
  *
- * The 1.8 engine's reader trails a write head that advances at the pitch
+ * The Standard/High engine's reader trails a write head that advances at the pitch
  * ratio, so its real delay drifts with the pitch: a tone burst's energy
  * centroid lands 64 ms late at -12 semitones and 32 ms early at +12 against
  * one reported latency, and a source absent from the first channel (panned
@@ -50,10 +50,10 @@
  *
  * Studio's latency, 1.5 frames plus the onset look-ahead, a quarter frame of
  * anchor lead and the sinc's reach, is fixed for every pitch: 5184 samples
- * (108 ms) at the default 2048 frame and 48 kHz. The 1.8 engine's is 2 *
+ * (108 ms) at the default 2048 frame and 48 kHz. The Standard/High engine's is 2 *
  * fftSize (4096). The dry path of the mix control is delay-compensated to
  * the reported value, so partial mixes stay comb-free. Crossing between
- * Studio and the 1.8 engine restarts the stream on the next block (their
+ * Studio and the Standard/High engine restarts the stream on the next block (their
  * latencies differ); Standard and High cross-fade into each other live.
  * Channels beyond the prepared count pass through untouched.
  *
@@ -226,8 +226,8 @@ public:
     /** @brief Engine and resample-back reader (see the file overview). */
     enum class Quality
     {
-        Standard,   ///< 1.8 engine, 4-point Catmull-Rom reader: the 1.8 default rendering.
-        High,       ///< 1.8 engine, 32-tap windowed-sinc reader: transparent HF.
+        Standard,   ///< Standard/High engine, 4-point Catmull-Rom reader: the earlier default rendering.
+        High,       ///< Standard/High engine, 32-tap windowed-sinc reader: transparent HF.
         Studio      ///< Studio engine (default): see the file overview.
     };
 
@@ -377,7 +377,7 @@ public:
 
         const int nCh = std::min(buffer.getNumChannels(), numChannels_);
         const int nS  = buffer.getNumSamples();
-        // Crossing between Studio and the 1.8 engine restarts the stream:
+        // Crossing between Studio and the Standard/High engine restarts the stream:
         // the two run different latencies, so no crossfade can join them.
         if ((quality_.load(std::memory_order_relaxed) == Quality::Studio) != studioActive_)
             reset();
@@ -642,11 +642,11 @@ private:
     int dryMask_ = 8191;
     int64_t accumMask_ = 8191;   ///< Cached engine OLA ring mask.
 
-    detail::PhaseVocoderEngine<T> engine_;   ///< 1.8 engine (Standard / High).
+    detail::PhaseVocoderEngine<T> engine_;   ///< Standard/High engine (Standard / High).
     detail::StudioVocoder<T> studio_;        ///< Studio engine.
     bool studioActive_ = true;               ///< Engine in force since reset().
     int latencyStudio_ = 5184;               ///< Studio's fixed latency.
-    int latencyLegacy_ = 4096;               ///< 1.8 engine's latency (2 * fftSize).
+    int latencyLegacy_ = 4096;               ///< Standard/High engine's latency (2 * fftSize).
     int64_t studioReadInt_ = 0;              ///< Studio reader position (integer part).
     double studioReadFrac_ = 0.0;            ///< Studio reader position (fraction).
     int64_t studioOut_ = 0;                  ///< Output samples since reset().

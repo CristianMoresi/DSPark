@@ -622,7 +622,7 @@ jobs:
 
       # Concurrency claims come from the named threaded tests printed by this
       # exact run; executing a single-threaded case under TSan is not presented
-      # as proof of a hand-off. The ordinary suite authority is currently 1193
+      # as proof of a hand-off. The ordinary suite authority is currently 1194
       # named cases. The separate Reverb publication executable also runs here.
       # The allocation injector is synchronous: its exhaustive failure sweep
       # runs unchanged in every native job and both ASan/UBSan jobs. Repeating

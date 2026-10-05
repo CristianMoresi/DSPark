@@ -497,6 +497,57 @@ DSPARK_TEST(OfflineClip_InvalidOptionsAndBudgetPreserveOutput)
     EXPECT_EQ(output.getChannel(0)[0], 123.f);
 }
 
+DSPARK_TEST(OfflineClip_GeometryChangesReuseBudgetedStorage)
+{
+    // Finite Nyquist PCM changes the certified exterior support as the ceiling
+    // is calibrated. A fresh allocation for every geometry exhausted these
+    // budgets even though the live projection workspace was much smaller.
+    const auto check = []<typename T>()
+    {
+        AudioBuffer<T> input;
+        input.resize(2, 257);
+        for (int i = 0; i < input.getNumSamples(); ++i)
+        {
+            input.getChannel(0)[i] = i % 2 ? T(-1) : T(1);
+            input.getChannel(1)[i] = T(-.93) * input.getChannel(0)[i];
+        }
+        for (double amount : {3., 12.})
+        {
+            typename OfflineHardClipper<T>::Options options;
+            options.reductionDb = amount;
+            AudioBuffer<T> reference, output;
+            const auto unrestricted = OfflineHardClipper<T>().run(input, reference, 48000, options);
+            EXPECT_TRUE(unrestricted.succeeded());
+            EXPECT_EQ(reference.getNumSamples(), 257);
+            EXPECT_EQ(reference.getNumChannels(), 2);
+            OfflineJobOptions job;
+            job.memoryBudgetBytes = amount == 3 ? 2 * 1024 * 1024 : 5 * 1024 * 1024 / 2;
+            const auto bounded = OfflineHardClipper<T>().run(input, output, 48000, options, job);
+            EXPECT_TRUE(bounded.succeeded());
+            EXPECT_TRUE(bounded.report.targetMet);
+            EXPECT_TRUE(bounded.memoryBytes <= job.memoryBudgetBytes);
+            EXPECT_NEAR(bounded.report.achievedReductionDb, amount, .005);
+            EXPECT_EQ(bounded.report.calibrationPasses, unrestricted.report.calibrationPasses);
+            EXPECT_EQ(output.getNumSamples(), reference.getNumSamples());
+            EXPECT_EQ(output.getNumChannels(), 2);
+            if (output.getNumSamples() == 257 && reference.getNumSamples() == 257 &&
+                output.getNumChannels() == 2 && reference.getNumChannels() == 2)
+                for (int c = 0; c < 2; ++c)
+                    EXPECT_EQ(std::memcmp(output.getChannel(c), reference.getChannel(c),
+                                          257 * sizeof(T)), 0);
+            output.resize(1, 1);
+            output.getChannel(0)[0] = T(.123);
+            job.memoryBudgetBytes = 1024 * 1024;
+            EXPECT_TRUE(OfflineHardClipper<T>().run(input, output, 48000, options, job).status ==
+                        OfflineStatus::MemoryLimit);
+            EXPECT_EQ(output.getNumSamples(), 1);
+            EXPECT_EQ(output.getChannel(0)[0], T(.123));
+        }
+    };
+    check.template operator()<float>();
+    check.template operator()<double>();
+}
+
 namespace
 {
 template <class T> void clipExtremes()

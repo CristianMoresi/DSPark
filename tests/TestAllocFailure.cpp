@@ -1258,18 +1258,20 @@ DSPARK_TEST(OfflineBeat_every_plan_and_render_allocation_failure_preserves_outpu
 
 namespace
 {
-template <class Processor> void clipAllocationFailures(int factor, int channels)
+template <class Processor>
+void clipAllocationFailures(int factor, int channels, bool changingGeometry = false)
 {
     namespace fa = dspark_test_failing_alloc;
     AudioBuffer<double> input;
     input.resize(channels, 257);
     for (int c = 0; c < channels; ++c)
         for (int i = 0; i < 257; ++i)
-            input.getChannel(c)[i] = (c ? -.8 : 1) * std::cos(.4 * twoPi<double> * i);
+            input.getChannel(c)[i] = (c ? -.8 : 1) *
+                (changingGeometry ? (i % 2 ? -1. : 1.) : std::cos(.4 * twoPi<double> * i));
     OfflineBufferSource<double> source(input.toView(), 48000);
     typename Processor::Options options;
     options.oversamplingFactor = factor;
-    options.reductionDb = 6;
+    options.reductionDb = changingGeometry ? 3 : 6;
     const OfflineRegion region{100, 101};
     // Copying a region is tested in plan construction. Render without constraints
     // here so all kernel/setup/output allocations belong to a feasible full job.
@@ -1433,6 +1435,11 @@ DSPARK_TEST(OfflineClip_every_allocation_is_accounted_and_failure_is_transaction
     clipAllocationFailures<OfflineHardClipper<double>>(4, 2);
     clipAllocationFailures<OfflineSoftClipper<double>>(1, 1);
     clipAllocationFailures<OfflineSoftClipper<double>>(16, 1);
+}
+
+DSPARK_TEST(OfflineClip_geometry_rebuild_pool_accounts_and_recovers_every_failure)
+{
+    clipAllocationFailures<OfflineHardClipper<double>>(4, 2, true);
 }
 
 DSPARK_TEST(StereoGenerator_memory_bound_covers_actual_setup_at_supported_endpoints)

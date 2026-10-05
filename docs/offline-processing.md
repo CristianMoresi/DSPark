@@ -571,7 +571,10 @@ source duration and exterior support; no complete upsampled PCM copy is retained
 The internal map block size is selected within 128..16384 source frames, with
 at most 65536 frames on the oversampled grid. The temporary energy analysis
 uses the existing 100 ms map. All allocation requests, including geometry changes
-during calibration, remain subject to the payload budget.
+during calibration, remain subject to the payload budget. Released projection
+scratch is reused across geometry changes through the same Core memory pool
+used by the tempo worker. Pool backing storage and bookkeeping are charged
+before allocation; reusing a block makes no new request and refunds no budget.
 
 Calibration measures complete, rounded output PCM and adjusts only the curve
 ceiling. It permits at most 24 trial passes and requires a peak error within
@@ -733,3 +736,169 @@ shared interpolation maps, rather than a full-file PCM copy. All requested
 dynamic payload obeys the job budget. The owning `run` convenience method also
 stages an output buffer; use source/plan/sink for long files. Cancellation,
 allocation failures, source changes and sink failures cannot commit partial audio.
+
+## Measured validation scope
+
+The October 2026 checks below characterize the implemented mathematical
+operators and their automatic decisions. They do not establish universal
+perceptual quality or perfect transient detection. Oversampling remains an
+explicit, per-processor choice; these results do not select a global factor.
+
+### Complete clipping waveforms
+
+Hard, Sine, Tanh and GoldenRatio each completed 512 independent-reference
+comparisons using finite, 257-frame stereo sources in float and double. The
+4x matrix covers 8, 44.1, 48, 96, 192 and 384 kHz, six signal families and
+0.001, 0.1, 1, 3, 6 and 12 dB requests. Signals include near-Nyquist tones,
+mixed tones with DC and transients. Additional cases cover factors 1/2/8/16
+at 48 kHz and two cascaded stages at 44.1/192 kHz. The reference evaluates
+the finite-source continuous operator independently, including its exterior
+tails, with convergence checks separate from the production approximation.
+
+All 1,984 comparisons at factors 4/8/16 met the unchanged -90 dB limit for
+`20 * log10(norm(output - reference) / norm(reference))`. The worst observed
+errors at the default 4x setting were:
+
+| Curve | Relative waveform error, dB |
+| --- | ---: |
+| Hard | -102.01 |
+| Sine | -102.87 |
+| Tanh | -103.90 |
+| GoldenRatio | -102.88 |
+
+These are complete-waveform errors against the model, not individual alias
+levels in dBc. The available 1x/2x paths have lower measured fidelity and are
+not covered by the 4x/8x/16x quality claim. Separate checks of cardinal
+reconstruction, projection and exterior-tail evaluation passed 162 component
+comparisons; they are not a formal roundoff certificate for every source.
+The source-bound workers also completed 512 resource renders across the four
+curves: all factors at 44.1/48/96 kHz and default 4x at 192 kHz. Those runs
+verify targets, memory and bounded reads, independently of waveform fidelity.
+
+### Annotated attack detection
+
+Algorithm revision 4 recovers upper-band attacks masked by a decaying bass
+body, using the shared Core filter and the existing timing/body estimator.
+The pulse detector and retained spectral features keep their previous policy.
+The following scores compare revision 3 (`ff7cf9a`) with revision 4 (`1504cb5`).
+Onsets are grouped only while the complete group spans at most 20 ms, using
+its earliest annotation as the reference. Predictions and references receive
+one-to-one, maximum-cardinality matches within 25 ms, with minimum total
+absolute timing error as the tie break. Precision counts unmatched predictions;
+recall counts missed references. Neither score measures a transient's end.
+
+| Corpus and detector | Matched | Unmatched predictions | Missed references | Precision | Recall | F1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| IDMT drum mixtures, revision 3 | 4853 | 67 | 1078 | 98.64% | 81.82% | 89.45% |
+| IDMT drum mixtures, revision 4 | 5262 | 85 | 669 | 98.41% | 88.72% | 93.31% |
+| GuitarSet microphone, revision 3 | 22956 | 2865 | 17028 | 88.90% | 57.41% | 69.77% |
+| GuitarSet microphone, revision 4 | 28135 | 5942 | 11849 | 82.56% | 70.37% | 75.98% |
+
+The [Fraunhofer IDMT drum corpus](https://www.idmt.fraunhofer.de/en/publications/datasets/drums.html)
+is development material for this correction. Its main aggregate has 94 verified
+MIX audio/annotation pairs. A 95th filename pair declares a different, absent
+audio filename in its XML and is excluded from that aggregate; its original
+data remains in the all-95 sensitivity result. Negative original annotation
+times are retained rather than clamped.
+
+[GuitarSet 1.1.0](https://zenodo.org/records/3371780) was evaluated after freezing
+the detector and scoring protocol, without retuning. All 360 original mono
+microphone recordings were processed at 44.1 kHz without gain, resampling or
+trimming. The six string annotations supply note onsets. The main aggregate
+excludes the two timing problems and one duplicate-note case identified in
+the [authors' repository](https://github.com/marl/GuitarSet), leaving 357 files;
+an all-360 sensitivity result is retained. Revision 4 gains 5,179 matches and
+adds 3,077 unmatched predictions. Its higher recall and F1 therefore come with
+a substantial precision tradeoff on this material, not uniform improvement.
+
+The evaluations also retain grouping widths 0/5/20 ms and tolerances
+5/10/25/50 ms. All 95 drum and 360 guitar sources produce exactly matching
+event fields and retained features with blocks of 257 and 4093 frames.
+Guitar note-onset scores must not be read as drum transcription accuracy,
+ground truth for body duration, or a substitute for listening to processing.
+
+### Shared planning cost
+
+The worker benchmark uses a Ryzen 9 9950X3D, MSVC 19.51, C++20 `/O2` and
+the SSE2 baseline. Independent and shared planning alternate on one pinned
+thread. A four-second deterministic bass/attack fixture supplies a longer
+source through bounded reads; the complete source is scanned, not retained
+as PCM. The 16 short configurations cover 10/60 seconds at
+44.1/48/96/192 kHz, float mono and double stereo, each with one warmup and
+five measured runs. Four capacity configurations process actual 10-minute
+or one-hour streams, once each. Long-source results are not five-run timing
+distributions or worst-case execution times.
+
+For a source of `N` frames, separate Leveler/Peak/Beat/Punch planning reads
+`12*N` frames per set of controls. Reusing one transient/energy/tempo analysis
+reads `(2 + 5*sets)*N`: `7*N` for one set and `22*N` for four, versus `48*N`
+independently. Leveler replanning and tempo-from-features read no PCM; Peak,
+Beat and Punch still perform their required source checks and measurements.
+In all 20 configurations, the two methods matched sampled plan gains at
+2,049 positions per plan, retained sizes and exact read accounting, with no
+residual measured heap allocation.
+
+At 48 kHz, for 3,600 seconds plus 17 frames:
+
+| Source | Control sets | Separate CPU, s | Shared CPU, s | Shared peak heap payload, MB |
+| --- | ---: | ---: | ---: | ---: |
+| Float mono | 1 | 32.688 | 16.312 | 147.89 |
+| Float mono | 4 | 130.078 | 33.641 | 147.89 |
+| Double stereo | 1 | 54.344 | 25.344 | 165.17 |
+| Double stereo | 4 | 214.406 | 46.922 | 165.17 |
+
+CPU is worker thread time, with the Windows timer's finite resolution. The
+measurements include source callbacks and plan inspection; fixture construction
+is outside the timed interval. Heap figures count requested worker allocation
+payload, excluding the host fixture, stack, allocator metadata and OS caches;
+MB means 1,000,000 bytes. All peaks fit the charged job budget. Other machine
+activity is not excluded. These figures measure planning, not audio rendering.
+
+### Complete-chain resource cost
+
+The same host also measured Leveler -> Peak -> Beat -> Punch -> Sine soft
+clip -> hard clip -> StereoGenerator -> StereoBalance. Each stage reads
+the preceding stage's actual committed output. Controls were Leveler
+`amount=0.4` with a 3 dB boost cap, 1 dB Peak/Beat reductions, 0.5 dB Punch,
+0.5 dB clipping reductions at 4x, stereo width 0.3 at 1x, and balance
+`levelingAmount=0.5` with its guard enabled. Mono is explicitly duplicated
+only at the stereo-generation stage. Frame count and source clock remain
+unchanged, including a timeline origin above 2^53.
+
+The 20 configurations completed 100 chains including warmups, or 800 stage
+renders. The 10/60-second configurations use five measured repetitions
+after one warmup; the 10-minute/hour configurations use one capacity run.
+Two single-thread workers ran concurrently on distinct physical cores,
+one for each sample type. Per-thread CPU and elapsed wall time are reported
+separately. The following table shows the one-minute and longer cases:
+
+| Rate, kHz | Duration, s | Source | CPU median [min,max], s | Wall median [min,max], s | Peak heap, MB |
+| ---: | ---: | --- | ---: | ---: | ---: |
+| 44.1 | 60 | Float mono | 26.28 [26.22,26.34] | 26.35 [26.32,26.39] | 11.63 |
+| 44.1 | 60 | Double stereo | 63.02 [62.67,63.41] | 63.25 [62.92,63.63] | 23.31 |
+| 48 | 60 | Float mono | 29.12 [28.97,29.89] | 29.18 [29.03,29.92] | 12.02 |
+| 48 | 60 | Double stereo | 67.02 [66.75,67.78] | 67.13 [66.92,68.42] | 24.09 |
+| 96 | 60 | Float mono | 58.33 [56.97,59.69] | 58.54 [57.15,59.80] | 16.89 |
+| 96 | 60 | Double stereo | 106.95 [106.00,107.92] | 107.08 [106.20,108.26] | 33.82 |
+| 192 | 60 | Float mono | 123.66 [121.27,126.02] | 124.26 [121.59,126.25] | 23.69 |
+| 192 | 60 | Double stereo | 200.38 [198.12,200.72] | 200.93 [198.75,201.85] | 47.41 |
+| 48 | 600 | Float mono | 291.03 [291.03,291.03] | 291.80 [291.80,291.80] | 38.36 |
+| 192 | 600 | Double stereo | 2087.58 [2087.58,2087.58] | 2097.31 [2097.31,2097.31] | 152.71 |
+| 48 | 3600 | Float mono | 1840.95 [1840.95,1840.95] | 1845.62 [1845.62,1845.62] | 147.43 |
+| 48 | 3600 | Double stereo | 4237.97 [4237.97,4237.97] | 4254.64 [4254.64,4254.64] | 182.95 |
+
+Each source additionally contains 17 frames to exercise partial blocks.
+The host keeps a four-second initial fixture and streams later stages
+through temporary raw PCM files with at most 4,096 frames per read. Timing
+excludes fixture construction and decoding; it includes raw PCM callbacks,
+output checks and hashing. Worker heap excludes that host storage, stack,
+allocator metadata and OS caches. These are concurrent-host throughput
+observations, not isolated kernel timings or guaranteed execution times.
+
+All repeated runs retain identical stage checksums and report fields.
+Every stage fits its charged memory bound and releases its measured
+allocations. Finite output, exact protected final samples, frame/clock
+preservation, measured-versus-reported peaks, clipping target error within
+0.005 dB and the actual balance guard all pass. The fixed job budget was
+512 MiB. Reference-waveform and musical endpoint checks establish separate
+properties; the synthetic throughput fixture does not substitute for them.

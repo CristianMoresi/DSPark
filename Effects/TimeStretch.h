@@ -33,7 +33,7 @@
  *   ms from its place on the stretched timeline, and isolated strikes carry
  *   no pre-echo above rounding at ratios 0.8 to 2. Default frame: the power
  *   of two nearest 85 ms (4096 at 44.1 and 48 kHz).
- * - **Quality::Standard**, the 1.8 engine (Effects/detail/PhaseVocoderEngine.h):
+ * - **Quality::Standard**, the Standard engine (Effects/detail/PhaseVocoderEngine.h):
  *   identity phase locking (Laroche & Dolson, IEEE Trans. Speech and Audio
  *   Processing 7(3), 1999) over the first channel's peaks and a
  *   transient-locked hop, described below. Default frame 2048. Kept
@@ -52,16 +52,16 @@
  *   engine                   LSD dB  conv dB  attack dB  pre-echo dB  onset ms
  *   Studio, 4096 (default)    4.12   -12.59     -0.64      -66.8        0.59
  *   Studio, 2048              4.56   -10.12     -0.53      -69.7        0.54
- *   1.8 engine (Standard)     5.01    -8.08     -1.60      -77.7        4.16
+ *   Standard engine          5.01    -8.08     -1.60      -77.7        4.16
  *
  * (LSD: multi-resolution log-spectral distance; conv: spectral convergence;
  * attack: energy of the first 5 ms against the ideal's, closer to 0 is
  * better; pre-echo: energy in the 20 ms before each strike above the
  * ideal's, relative to the strike; onset: median error of the unaligned
  * onset time. Lower is better elsewhere.) On the drum scene alone Studio
- * leaves -74.8 dB ahead of a strike and the 1.8 engine -67.6; averaged with
+ * leaves -74.8 dB ahead of a strike and the Standard engine -67.6; averaged with
  * the mix, where the 20 ms before a strike also hold the chord and the bass,
- * the 1.8 engine comes out lower.
+ * the Standard engine comes out lower.
  *
  * **The Standard engine in detail.** Peaks are found each frame and every
  * bin in a peak's region of influence is rotated by the SAME phase
@@ -319,7 +319,7 @@ public:
      *   (Effects/detail/StudioVocoder.h). Default frame about 85 ms; the
      *   fixed-rate adaptor's latency is that frame plus the onset
      *   detector's lookahead (about 32 ms).
-     * - `Standard`: the 1.8 engine, identity phase locking over the first
+     * - `Standard`: the Standard engine, identity phase locking over the first
      *   channel's peaks and a transient-locked hop; default frame 2048.
      *   Kept bit-exact for renders already made with it; a state blob that
      *   predates the quality field restores it.
@@ -1197,7 +1197,7 @@ private:
     int latency_ = 2048;
     int64_t accumMask_ = 8191;     ///< Cached engine OLA ring mask.
 
-    detail::PhaseVocoderEngine<T> engine_;   ///< Standard engine (the 1.8 rendering).
+    detail::PhaseVocoderEngine<T> engine_;   ///< Standard engine (the earlier rendering).
     detail::StudioVocoder<T> studio_;        ///< Studio engine.
     bool studioActive_ = true;               ///< Engine in force since reset().
     int fftStandard_ = 2048;                 ///< Standard engine frame.

@@ -43,6 +43,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <memory_resource>
 #include <new>
 #include <type_traits>
 
@@ -292,6 +293,24 @@ struct OfflineFailure
     return static_cast<std::size_t>(count) * size;
 }
 
+template <typename T> struct OfflineScratchDeleter
+{
+    std::pmr::memory_resource *resource = nullptr;
+    std::size_t count = 0;
+    void operator()(T *pointer) const noexcept
+    {
+        if (resource)
+        {
+            std::destroy_n(pointer, count);
+            resource->deallocate(pointer, count * sizeof(T), alignof(T));
+        }
+        else
+            delete[] pointer;
+    }
+};
+template <typename T>
+using OfflineScratchArray = std::unique_ptr<T[], OfflineScratchDeleter<T>>;
+
 class OfflineSession final
 {
   public:
@@ -310,6 +329,29 @@ class OfflineSession final
     {
         charge(offlineBytes(count, sizeof(U)));
         return std::make_unique<U[]>(static_cast<std::size_t>(count));
+    }
+    // A resource accounts for every upstream request itself and must outlive
+    // its scratch arrays. Without one, allocation preserves the original path.
+    void useScratchResource(std::pmr::memory_resource &resource) noexcept
+    {
+        scratch_ = &resource;
+    }
+    template <typename U> [[nodiscard]] OfflineScratchArray<U> allocateScratch(std::uint64_t count)
+    {
+        if (!scratch_)
+            return {allocate<U>(count).release(), {}};
+        const auto bytes = offlineBytes(count, sizeof(U));
+        auto *data = static_cast<U *>(scratch_->allocate(bytes, alignof(U)));
+        try
+        {
+            std::uninitialized_value_construct_n(data, static_cast<std::size_t>(count));
+        }
+        catch (...)
+        {
+            scratch_->deallocate(data, bytes, alignof(U));
+            throw;
+        }
+        return {data, {scratch_, static_cast<std::size_t>(count)}};
     }
     [[nodiscard]] std::size_t bytes() const noexcept
     {
@@ -338,6 +380,90 @@ class OfflineSession final
   private:
     const OfflineJobOptions &options_;
     std::size_t bytes_ = 0;
+    std::pmr::memory_resource *scratch_ = nullptr;
+};
+
+// Reuses released scratch blocks without refunding the cumulative job budget.
+// Both backing storage and pool metadata are charged before each new request.
+// Power-of-two capacity preserves the tempo worker's growth policy; exact
+// capacity avoids rounding large projection maps when only geometry changes.
+class OfflineMemoryPool final : public std::pmr::memory_resource
+{
+  public:
+    explicit OfflineMemoryPool(OfflineSession &job, bool roundCapacity = true)
+        : job_(job), roundCapacity_(roundCapacity) {}
+    OfflineMemoryPool(const OfflineMemoryPool &) = delete;
+    OfflineMemoryPool &operator=(const OfflineMemoryPool &) = delete;
+    ~OfflineMemoryPool() override
+    {
+        while (blocks_)
+        {
+            auto *block = blocks_;
+            blocks_ = block->next;
+            if (block->alignment > alignof(std::max_align_t))
+                ::operator delete(block, std::align_val_t{block->alignment});
+            else
+                ::operator delete(block);
+        }
+    }
+  private:
+    struct alignas(std::max_align_t) Block
+    {
+        Block *next;
+        void *data;
+        std::size_t capacity, alignment;
+        bool available;
+    };
+    void *do_allocate(std::size_t bytes, std::size_t alignment) override
+    {
+        Block *best = nullptr;
+        for (auto *b = blocks_; b; b = b->next)
+            if (b->available && b->capacity >= bytes && b->alignment >= alignment &&
+                (!best || b->capacity < best->capacity))
+                best = b;
+        if (best)
+        {
+            best->available = false;
+            return best->data;
+        }
+        std::size_t capacity = roundCapacity_ ? 1 : std::max(std::size_t(1), bytes);
+        while (capacity < bytes)
+        {
+            if (capacity > std::numeric_limits<std::size_t>::max() / 2)
+                offlineFail(OfflineStatus::MemoryLimit);
+            capacity *= 2;
+        }
+        alignment = std::max(alignment, alignof(Block));
+        if (alignment > std::numeric_limits<std::size_t>::max() - sizeof(Block))
+            offlineFail(OfflineStatus::MemoryLimit);
+        const auto offset = (sizeof(Block) + alignment - 1) / alignment * alignment;
+        if (capacity > std::numeric_limits<std::size_t>::max() - offset)
+            offlineFail(OfflineStatus::MemoryLimit);
+        const auto total = offset + capacity;
+        job_.charge(total);
+        void *raw = alignment > alignof(std::max_align_t)
+                        ? ::operator new(total, std::align_val_t{alignment}) : ::operator new(total);
+        auto *block = new (raw) Block{blocks_, static_cast<std::byte *>(raw) + offset,
+                                     capacity, alignment, false};
+        blocks_ = block;
+        return block->data;
+    }
+    void do_deallocate(void *p, std::size_t, std::size_t) override
+    {
+        for (auto *b = blocks_; b; b = b->next)
+            if (b->data == p)
+            {
+                b->available = true;
+                return;
+            }
+    }
+    bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override
+    {
+        return this == &other;
+    }
+    OfflineSession &job_;
+    bool roundCapacity_;
+    Block *blocks_ = nullptr;
 };
 
 [[nodiscard]] inline OfflineJobOptions offlineRemaining(const OfflineJobOptions &job,

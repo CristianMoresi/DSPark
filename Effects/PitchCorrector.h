@@ -291,7 +291,7 @@ public:
                                       : automaticFrame(spec.sampleRate);
 
         detector_.prepare(spec.sampleRate);
-        // The corrector keeps the 1.8 engine: its retune dynamics and the
+        // The corrector keeps the Standard engine: its retune dynamics and the
         // 2 * frame latency are tuned to it, and it moves the shift on every
         // control tick, where Studio's strike anchoring buys nothing.
         shifter_.setQuality(PitchShifter<T>::Quality::Standard);

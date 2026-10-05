@@ -1,6 +1,15 @@
 // DSPark - Offline beat compression and local release signal contracts.
 // Copyright (c) 2026 Cristian Moresi - MIT License
 
+// A Windows host may include the SDK before DSPark. Keep its legacy macros
+// active while compiling the public header to cover that include order.
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include "../Core/detail/OfflineAttenuation.h"
 #include "../Core/detail/OfflinePunchEnvelope.h"
 #include "../Core/ProcessorTraits.h"

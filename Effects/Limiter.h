@@ -449,7 +449,7 @@ public:
      * loudness on a dense mix driven 12 dB over the ceiling.
      *
      * @param ms Hold in milliseconds, clamped to [0, 50] (default 10; 0 is
-     *           the release-only behaviour of 1.8). Non-finite values are
+     *           the previous release-only behaviour). Non-finite values are
      *           ignored.
      */
     void setHold(T ms) noexcept

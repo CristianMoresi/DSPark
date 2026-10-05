@@ -493,10 +493,12 @@ template <FloatType T, bool Soft> class OfflineClipProcessor
                                                {OfflinePhase::Verify, 0, p.frames});
                 };
             }
-            // Keep the workspace and its accounting alive across calibration.
-            // An unchanged geometry rebuilds fields without another allocation;
-            // changed geometry is charged as another request before allocation.
+            // Keep allocation accounting and reusable storage alive across
+            // calibration. Geometry changes return their scratch to the same
+            // pool; only genuinely new upstream payload consumes the budget.
             OfflineSession passJob(passOptions);
+            OfflineMemoryPool scratch(passJob, false);
+            passJob.useScratchResource(scratch);
             std::array<std::optional<Projection>, 2> projections;
             const auto pass = [&](double ceiling, bool publish)
             {

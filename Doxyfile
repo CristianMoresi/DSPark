@@ -1,7 +1,7 @@
 # DSPark - Doxygen configuration (API reference for GitHub Pages)
 
 PROJECT_NAME           = "DSPark"
-PROJECT_BRIEF          = "Header-only audio DSP framework in pure C++20 - zero dependencies"
+PROJECT_BRIEF          = "Header-only C++20 DSP for real-time and offline audio"
 PROJECT_NUMBER         = 1.8.0
 
 INPUT                  = README.md CHANGELOG.md CONTRIBUTING.md \

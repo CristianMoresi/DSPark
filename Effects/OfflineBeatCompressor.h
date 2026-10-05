@@ -362,17 +362,17 @@ template <FloatType T> class OfflineBeatCompressor final
         const auto next = std::lower_bound(beats.begin(), beats.end(), frame,
             [](const auto &beat, auto p) { return beat.frame < p; });
         const double tolerance = .05 * tempo.getSpec().sampleRate;
-        const auto near = [&](auto beat) {
+        const auto withinTolerance = [&](auto beat) {
             return std::abs(static_cast<double>(beat->frame - frame)) <= tolerance;
         };
-        if (next != beats.end() && near(next) && next->reliable)
+        if (next != beats.end() && withinTolerance(next) && next->reliable)
             return next->nextIntervalBpm;
         if (next != beats.begin())
         {
             const auto previous = next - 1;
-            if (previous != beats.begin() && near(previous) && (previous - 1)->reliable)
+            if (previous != beats.begin() && withinTolerance(previous) && (previous - 1)->reliable)
                 return (previous - 1)->nextIntervalBpm;
-            if (next != beats.end() && near(next) && previous->reliable)
+            if (next != beats.end() && withinTolerance(next) && previous->reliable)
                 return previous->nextIntervalBpm;
         }
         // A boundary pulse may precede the first or follow the last grid point

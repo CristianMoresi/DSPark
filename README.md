@@ -232,10 +232,27 @@ Build it with `DSParkLab\build.bat` (Visual Studio 2019 or later, any edition).
 
 ## What's new in v1.8.0
 
+- Complete-source offline analysis and automatic Leveler, Peak/Beat compression,
+  Punch, soft/hard clipping, stereo generation and stereo balance. Immutable
+  plans, exact exclusions, source validation and bounded worker storage are
+  documented with [measured quality and resource costs](docs/offline-processing.md).
+- `StereoGenerator` also supports real-time stereo processing, preserving the
+  original mid through processed-copy delta add-back. It defaults to 1x; higher
+  oversampling factors remain explicit options.
+- `AudioIntervalAnalyzer` measures exact sample intervals from blocks without
+  retaining PCM, with explicit validity and independent/continuous loudness
+  context. See the [interval contract](docs/interval-analysis.md).
+- `TubePreamp` integrates the nonlinear circuit within each internal sample at
+  2x and above, retaining the 2x default and configurable 1x operation. The
+  documented tone sweeps include +36 dB drive; stage changes use a primed
+  crossfade without callback allocations.
+- Rational tempo alternatives in `BeatTracker`, a polyphonic multi-zone
+  `Sampler`, Studio time/pitch processing, and conversion-specific `Resampler`
+  filters with explicit latency and finite-source range conversion.
 - `AlgorithmicReverb` rebuilt as a true-stereo 32-line FDN (16 in Eco) with a
-  binaural early field, exact per-band decay and about half the CPU.
-- A split-format Stockham FFT (2x faster on SSE2, 4x with AVX2) and a
-  polyphase `Oversampling` decimator (about 2x faster).
+  binaural early field and frequency-dependent decay control.
+- A split-format Stockham FFT and a polyphase `Oversampling` decimator, with
+  SIMD paths and benchmark conditions documented in their headers.
 - Band-limited oscillators, analog-matched EQ bells, a Wiener-gain
   `SpectralDenoiser`, gapless MP3 round trips, and glided parameter changes
   across the effects.

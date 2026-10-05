@@ -89,7 +89,7 @@ template <class Reader> class SincProjection
         }
     } modulated_{this};
     std::optional<OfflineHilbertMap> map_;
-    std::unique_ptr<double[]> transform_, raw_, output_;
+    OfflineScratchArray<double> transform_, raw_, output_;
 
   public:
     SincProjection(OfflineSession &job, std::int64_t frames, int factor, Reader source, int block)
@@ -104,9 +104,9 @@ template <class Reader> class SincProjection
             sine_[p + factor] = -sine_[p];
         }
         map_.emplace(work_, modulated_);
-        transform_ = job.allocate<double>(block);
-        raw_ = job.allocate<double>(block);
-        output_ = job.allocate<double>(block / factor);
+        transform_ = job.allocateScratch<double>(block);
+        raw_ = job.allocateScratch<double>(block);
+        output_ = job.allocateScratch<double>(block / factor);
         work_.prepareCauchy();
     }
     SincProjection(const SincProjection &) = delete;

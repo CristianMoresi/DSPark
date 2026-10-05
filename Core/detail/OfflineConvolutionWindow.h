@@ -32,9 +32,9 @@ class OfflineConvolutionWindow final
         if (block < 128 || block > 65536 || (block & (block - 1)))
             offlineFail(OfflineStatus::InvalidInput);
         const auto size = 4 * static_cast<std::uint64_t>(block);
-        time_ = job.allocate<double>(size + 2);
-        spectrum_ = job.allocate<double>(size + 2);
-        kernel_ = job.allocate<double>(size + 2);
+        time_ = job.allocateScratch<double>(size + 2);
+        spectrum_ = job.allocateScratch<double>(size + 2);
+        kernel_ = job.allocateScratch<double>(size + 2);
         // The Core real FFT requests <4N doubles. Include cumulative Stockham
         // plan-vector growth and implementation-specific allocation bookkeeping.
         job.charge(offlineBytes(4 * size, sizeof(double)) + 2048);
@@ -73,7 +73,7 @@ class OfflineConvolutionWindow final
 
   private:
     int block_;
-    std::unique_ptr<double[]> time_, spectrum_, kernel_;
+    OfflineScratchArray<double> time_, spectrum_, kernel_;
     std::optional<FFTReal<double>> fft_;
 };
 } // namespace dspark::detail

@@ -515,6 +515,11 @@ template <FloatType T>
 class Synthesizer
 {
 public:
+    /** Maximum queued events between processBlock calls. Events beyond
+     *  this capacity are ignored; hosts must split dense spans beforehand.
+     *  Every event kind shares the same queue. */
+    static constexpr int kMaxEvents = 1024;
+
     using Engine = synthesizer::Engine;
     using VoiceMode = synthesizer::VoiceMode;
     using GlideMode = synthesizer::GlideMode;
@@ -621,6 +626,7 @@ public:
         timeHi_ = 0;
         heldCount_ = 0;
         lastPitch_ = -1.0;
+        haveLastPitch_ = false;
         for (int k = 0; k < 2; ++k)
         {
             freeLfo_[static_cast<size_t>(k)].anchorCycles = p(lfoParam(k, 6));
@@ -745,10 +751,24 @@ public:
      *  0..1 (0 is a note-off, as in MIDI). */
     void noteOn(int key, T velocity, int offset = 0) noexcept
     {
-        if (!std::isfinite(velocity)) return;
+        noteOnTuned(key, velocity, T(0), offset);
+    }
+
+    /** @brief Starts a note with individual fine tuning in cents, clamped to
+     *  -100..100. The tuned pitch is the glide target and combines with
+     *  master tuning, oscillators/zones and pitch bend. Key identity,
+     *  key modulation/tracking and sample-zone selection use the integer key.
+     *  Fixed-frequency FM operators and untracked sample sources ignore it. Mono/legato return
+     *  restores the tuning of the most recent key still held.
+     *  Non-finite velocity or tuning is ignored. Zero velocity is note-off.
+     *  Audio thread; the event applies at offset in the next block. */
+    void noteOnTuned(int key, T velocity, T tuningCents, int offset = 0) noexcept
+    {
+        if (!std::isfinite(velocity) || !std::isfinite(tuningCents)) return;
         if (velocity <= T(0)) { noteOff(key, T(0), offset); return; }
         push({ EventType::NoteOn, std::clamp(key, 0, 127),
-               std::clamp(static_cast<double>(velocity), 0.0, 1.0), offset });
+               std::clamp(static_cast<double>(velocity), 0.0, 1.0), offset,
+               std::clamp(static_cast<double>(tuningCents), -100.0, 100.0) });
     }
 
     /** @brief Releases a note; releaseVelocity 0..1 is a modulation source. */
@@ -946,6 +966,7 @@ private:
         uint64_t seed = 0;
         int64_t ageHi = 0;                 ///< Samples since note-on at the internal rate.
         double velocity = 1.0;
+        double tuningCents = 0.0;         ///< Latched per note, independent of key identity.
         double releaseVelocity = 0.0;
         double polyPressure = 0.0;
         double random = 0.0;
@@ -989,7 +1010,7 @@ private:
     };
 
     enum class EventType { NoteOn, NoteOff, Pedal, Bend, ModWheel, Pressure, PolyPressure, Expression, Breath, AllOff };
-    struct Event { EventType type; int key; double value; int offset; };
+    struct Event { EventType type; int key; double value; int offset; double tuningCents = 0.0; };
 
     struct FreeLfo
     {
@@ -1182,7 +1203,7 @@ private:
     {
         switch (e.type)
         {
-            case EventType::NoteOn:     noteOnNow(e.key, e.value); break;
+            case EventType::NoteOn:     noteOnNow(e.key, e.value, e.tuningCents); break;
             case EventType::NoteOff:    noteOffNow(e.key, e.value); break;
             case EventType::Bend:       bend_ = e.value; break;
             case EventType::ModWheel:   modWheel_ = e.value; break;
@@ -1213,10 +1234,11 @@ private:
         return static_cast<VoiceMode>(ip(Param::VoiceMode)) != VoiceMode::Poly;
     }
 
-    void noteOnNow(int key, double velocity) noexcept
+    void noteOnNow(int key, double velocity, double tuningCents) noexcept
     {
         const bool anyHeldBefore = heldCount_ > 0;
         pushHeld(key);
+        heldTuning_[static_cast<size_t>(key)] = tuningCents;
         if (monophonic())
         {
             for (auto& v : voices_)
@@ -1224,7 +1246,7 @@ private:
                 {
                     const bool legato = anyHeldBefore && v.held;
                     const bool retrigger = !(legato && static_cast<VoiceMode>(ip(Param::VoiceMode)) == VoiceMode::Legato);
-                    moveMonoVoice(v, key, velocity, retrigger, legato);
+                    moveMonoVoice(v, key, velocity, tuningCents, retrigger, legato);
                     return;
                 }
         }
@@ -1235,7 +1257,7 @@ private:
                 if (v.active && v.key == key && v.stealLeft < 0 && (v.held || v.sustained))
                     release(v);
         }
-        if (Voice* v = freeVoice()) startVoice(*v, key, velocity, anyHeldBefore);
+        if (Voice* v = freeVoice()) startVoice(*v, key, velocity, tuningCents, anyHeldBefore);
     }
 
     void noteOffNow(int key, double releaseVelocity) noexcept
@@ -1247,7 +1269,8 @@ private:
             if (monophonic() && heldCount_ > 0)
             {
                 // Back to the most recent key still held: no retrigger.
-                moveMonoVoice(v, held_[static_cast<size_t>(heldCount_ - 1)], v.velocity, false, true);
+                const int nextKey = held_[static_cast<size_t>(heldCount_ - 1)];
+                moveMonoVoice(v, nextKey, v.velocity, heldTuning_[static_cast<size_t>(nextKey)], false, true);
                 continue;
             }
             v.releaseVelocity = releaseVelocity;
@@ -1282,18 +1305,21 @@ private:
     }
 
     /** Mono and legato: the sounding voice moves to a new key. */
-    void moveMonoVoice(Voice& v, int key, double velocity, bool retrigger, bool legato) noexcept
+    void moveMonoVoice(Voice& v, int key, double velocity, double tuningCents, bool retrigger, bool legato) noexcept
     {
         const double glideMs = static_cast<double>(p(Param::Glide));
         const bool glide = glideMs > 0.0
             && (static_cast<GlideMode>(ip(Param::GlideMode)) == GlideMode::Always || legato);
-        v.glideFrom = glide ? v.pitch : static_cast<double>(key);
+        const double tunedPitch = static_cast<double>(key) + tuningCents / 100.0;
+        v.glideFrom = glide ? v.pitch : tunedPitch;
         v.glideTotal = glide ? glideMs * 0.001 * internalRate_ : 0.0;
         v.glideLeft = v.glideTotal;
         v.key = key;
+        v.tuningCents = tuningCents;
         v.held = true;
         v.sustained = false;
-        lastPitch_ = static_cast<double>(key);
+        lastPitch_ = tunedPitch;
+        haveLastPitch_ = true;
         if (!retrigger) return;
         v.velocity = velocity;
         v.releaseVelocity = 0.0;
@@ -1365,7 +1391,7 @@ private:
         return Lfo<double>::random(seed, stream);
     }
 
-    void startVoice(Voice& v, int key, double velocity, bool anyHeldBefore) noexcept
+    void startVoice(Voice& v, int key, double velocity, double tuningCents, bool anyHeldBefore) noexcept
     {
         v.active = true;
         v.held = true;
@@ -1373,6 +1399,7 @@ private:
         v.firstTick = true;
         v.stealLeft = -1;
         v.key = key;
+        v.tuningCents = tuningCents;
         v.velocity = velocity;
         v.releaseVelocity = 0.0;
         v.polyPressure = 0.0;
@@ -1388,13 +1415,15 @@ private:
 
         // Glide from the previous note.
         const double glideMs = static_cast<double>(p(Param::Glide));
-        const bool glide = glideMs > 0.0 && lastPitch_ >= 0.0
+        const bool glide = glideMs > 0.0 && haveLastPitch_
             && (static_cast<GlideMode>(ip(Param::GlideMode)) == GlideMode::Always || anyHeldBefore);
-        v.glideFrom = glide ? lastPitch_ : static_cast<double>(key);
+        const double tunedPitch = static_cast<double>(key) + tuningCents / 100.0;
+        v.glideFrom = glide ? lastPitch_ : tunedPitch;
         v.glideTotal = glide ? glideMs * 0.001 * internalRate_ : 0.0;
         v.glideLeft = v.glideTotal;
         v.pitch = v.glideFrom;
-        lastPitch_ = static_cast<double>(key);
+        lastPitch_ = tunedPitch;
+        haveLastPitch_ = true;
 
         // Sample zone: the first one answering the key and velocity.
         v.zone = nullptr;
@@ -1553,14 +1582,15 @@ private:
 
         // -- Glide: constant time, linear in semitones.
         const double keyPitch = static_cast<double>(v.key);
+        const double tunedPitch = keyPitch + v.tuningCents / 100.0;
         if (v.glideLeft > 0.0)
         {
-            v.pitch = keyPitch + (v.glideFrom - keyPitch) * (v.glideLeft / std::max(v.glideTotal, 1.0));
+            v.pitch = tunedPitch + (v.glideFrom - tunedPitch) * (v.glideLeft / std::max(v.glideTotal, 1.0));
             v.glideLeft = std::max(0.0, v.glideLeft - static_cast<double>(periodHi_));
         }
         else
         {
-            v.pitch = keyPitch;
+            v.pitch = tunedPitch;
         }
 
         // -- Sources.
@@ -2300,7 +2330,6 @@ private:
     // Members
     // ===================================================================================
 
-    static constexpr int kMaxEvents = 1024;
 
     std::array<std::atomic<float>, kNumParams> values_ {};
     std::array<float, kNumParams> params_ {};
@@ -2329,6 +2358,7 @@ private:
     std::array<Event, kMaxEvents> events_ {};
     int eventCount_ = 0;
     std::array<int, 128> held_ {};
+    std::array<double, 128> heldTuning_ {};
     int heldCount_ = 0;
     bool sustainPedal_ = false;
     double bend_ = 0.0;
@@ -2337,6 +2367,7 @@ private:
     double expression_ = 1.0;
     double breath_ = 0.0;
     double lastPitch_ = -1.0;
+    bool haveLastPitch_ = false;
     double masterGain_ = 0.5;
     uint64_t noteCounter_ = 0;
     uint64_t clock_ = 0;

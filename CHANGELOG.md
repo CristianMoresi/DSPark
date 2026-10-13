@@ -2,6 +2,19 @@
 
 All notable user-facing changes to DSPark are documented here.
 
+## [Unreleased]
+
+### Added
+
+- `Sampler::noteOnTuned` and `Synthesizer::noteOnTuned`: sample-offset
+  note events with individual tuning in cents (-100..100), added to
+  existing pitch controls. Integer keys still select zones and identify
+  note-off/retrigger events. Synthesizer glide follows tuned pitches and
+  mono/legato restores the tuning of the most recent held key. Existing
+  `noteOn` remains the zero-cent entry point.
+- Both instruments expose `kMaxEvents`, their shared per-block event queue
+  capacity, so hosts can split dense event streams before queuing them.
+
 ## [1.8.1] - 2026-10-13
 
 ### Added

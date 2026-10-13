@@ -961,3 +961,291 @@ DSPARK_TEST(Lfo_shapes_rates_sync_delay_and_seeds)
     EXPECT_NEAR(lfo.advance(12000), 1.0, 1e-12);   // sine at 0.25
     EXPECT_NEAR(lfo.value(), 0.0, 1e-12);          // half a cycle later... at 0.5
 }
+
+// ============================================================================
+// Individual note tuning
+// ============================================================================
+
+namespace {
+
+template <typename T, typename Player, typename Events>
+std::vector<double> tunedRender(Player& player, int total, int block, Events events)
+{
+    std::vector<double> out(static_cast<size_t>(total));
+    std::vector<T> l(static_cast<size_t>(block)), r(static_cast<size_t>(block));
+    for (int pos = 0; pos < total; pos += block)
+    {
+        const int n = std::min(block, total - pos);
+        events(player, pos, n);
+        T* channels[2] { l.data(), r.data() };
+        player.processBlock(AudioBufferView<T>(channels, 2, n));
+        for (int i = 0; i < n; ++i) out[static_cast<size_t>(pos + i)] = l[static_cast<size_t>(i)];
+    }
+    return out;
+}
+
+template <typename T>
+void tunedSine(Synthesizer<T>& s, int engine = 0)
+{
+    using Q = typename Synthesizer<T>::Param;
+    s.setParameter(Q::Engine, static_cast<float>(engine));
+    s.setParameter(Q::Osc1Wave, 0.0f);
+    s.setParameter(Q::FilterType, 0.0f);
+    s.setParameter(Q::Env1Attack, 0.0f);
+    s.setParameter(Q::MasterVolume, 0.0f);
+    s.prepare({ kFs, 256, 2 }, 8);
+}
+
+template <typename T>
+void tunedSample(Sampler<T>& s, double zoneCents = 0.0)
+{
+    std::vector<T> recording(48000);
+    for (size_t i = 0; i < recording.size(); ++i)
+        recording[i] = static_cast<T>(0.5 * std::sin(2.0 * pi<double> * 440.0 * static_cast<double>(i) / kFs));
+    const T* input[1] { recording.data() };
+    SampleZoneSpec<T> zone;
+    zone.audio = AudioBufferView<const T>(input, 1, 48000);
+    zone.sampleRate = kFs;
+    zone.rootKey = 69;
+    zone.tuneCents = zoneCents;
+    zone.loopMode = SampleLoopMode::Continuous;
+    zone.loopEnd = 48000;
+    s.prepare({ kFs, 256, 2 }, 8);
+    s.setEnvelope(T(0.01), T(1), T(1), T(10));
+    s.setVelocityRange(T(0));
+    EXPECT_TRUE(s.setZones(std::span<const SampleZoneSpec<T>>(&zone, 1)));
+}
+
+double tunedDifference(const std::vector<double>& a, const std::vector<double>& b)
+{
+    double error = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) error = std::max(error, std::abs(a[i] - b[i]));
+    return error;
+}
+
+} // namespace
+
+DSPARK_TEST(NoteTuning_synth_pitch_float_and_double_all_engines)
+{
+    auto run = []<typename T>() {
+        double worst = 0.0;
+        for (int engine : { 0, 1, 2 })
+            for (int key : { 33, 69, 93 })
+                for (double tuning : { -100.0, -37.5, 45.25, 100.0 })
+                {
+                    Synthesizer<T> s;
+                    tunedSine(s, engine);
+                    const auto x = tunedRender<T>(s, 40000, 256, [&](auto& sy, int pos, int n) {
+                        at(17, pos, n, [&](int o) { sy.noteOnTuned(key, T(1), static_cast<T>(tuning), o); });
+                    });
+                    const double f = 440.0 * std::exp2((key - 69 + tuning / 100.0) / 12.0);
+                    worst = std::max(worst, std::abs(cents(toneHz(x, 4000, f), f)));
+                    EXPECT_GT(rms(x, 4000, 39000), 0.1);
+                }
+        std::cout << "  tuned synth " << sizeof(T) << "-byte worst pitch error " << worst << " cents\n";
+        EXPECT_LT(worst, 0.01);
+    };
+    run.template operator()<float>();
+    run.template operator()<double>();
+}
+
+DSPARK_TEST(NoteTuning_sampler_pitch_adds_zone_tuning_and_bend)
+{
+    auto run = []<typename T>() {
+        double worst = 0.0;
+        for (int key : { 57, 69, 81 })
+            for (double tuning : { -100.0, -37.5, 45.25, 100.0 })
+            {
+                Sampler<T> s;
+                tunedSample(s, 13.0);
+                const auto x = tunedRender<T>(s, 40000, 127, [&](auto& sy, int pos, int n) {
+                    at(17, pos, n, [&](int o) {
+                        sy.setPitchBend(T(-0.5), o);
+                        sy.noteOnTuned(key, T(1), static_cast<T>(tuning), o);
+                    });
+                });
+                const double f = 440.0 * std::exp2((key - 69 + (13.0 + tuning) / 100.0 - 0.5) / 12.0);
+                worst = std::max(worst, std::abs(cents(toneHz(x, 4000, f), f)));
+                EXPECT_GT(rms(x, 4000, 39000), 0.2);
+            }
+        std::cout << "  tuned sampler " << sizeof(T) << "-byte worst pitch error " << worst << " cents\n";
+        EXPECT_LT(worst, 0.01);
+    };
+    run.template operator()<float>();
+    run.template operator()<double>();
+}
+
+DSPARK_TEST(NoteTuning_legacy_zero_and_event_partition_are_identical)
+{
+    auto run = []<typename T>() {
+        auto render = [&](bool sampler, int block, bool tuned, T tuning) {
+            auto events = [&](auto& s, int pos, int n) {
+                at(37, pos, n, [&](int o) {
+                    if (tuned) s.noteOnTuned(69, T(0.8), tuning, o);
+                    else s.noteOn(69, T(0.8), o);
+                });
+                at(1451, pos, n, [&](int o) { s.setSustainPedal(true, o); });
+                at(2103, pos, n, [&](int o) { s.noteOnTuned(69, T(0), T(70), o); });
+                at(3177, pos, n, [&](int o) { s.setSustainPedal(false, o); });
+            };
+            if (sampler) { Sampler<T> s; tunedSample(s); return tunedRender<T>(s, 4800, block, events); }
+            Synthesizer<T> s;
+            tunedSine(s);
+            s.setParameter(Synthesizer<T>::Param::Env1Release, 10.0f);
+            return tunedRender<T>(s, 4800, block, events);
+        };
+        for (bool sampler : { false, true })
+        {
+            const auto legacy = render(sampler, 256, false, T(0));
+            EXPECT_EQ(tunedDifference(legacy, render(sampler, 256, true, T(0))), 0.0);
+            const auto reference = render(sampler, 256, true, T(-62.5));
+            EXPECT_EQ(tunedDifference(reference, render(sampler, 1, true, T(-62.5))), 0.0);
+            EXPECT_EQ(tunedDifference(reference, render(sampler, 17, true, T(-62.5))), 0.0);
+            EXPECT_EQ(rms(reference, 0, 37), 0.0);
+            EXPECT_GT(rms(reference, 2200, 3000), 0.1);
+            EXPECT_EQ(rms(reference, 4400, 4800), 0.0);
+        }
+    };
+    run.template operator()<float>();
+    run.template operator()<double>();
+}
+
+DSPARK_TEST(NoteTuning_nonfinite_refused_and_cents_clamped)
+{
+    auto run = []<typename T>() {
+        for (bool sampler : { false, true })
+        {
+            auto render = [&](T tuning, T velocity = T(1)) {
+                auto events = [&](auto& s, int pos, int n) {
+                    at(0, pos, n, [&](int o) { s.noteOnTuned(69, velocity, tuning, o); });
+                };
+                if (sampler) { Sampler<T> s; tunedSample(s); return tunedRender<T>(s, 1000, 256, events); }
+                Synthesizer<T> s; tunedSine(s); return tunedRender<T>(s, 1000, 256, events);
+            };
+            EXPECT_EQ(tunedDifference(render(T(1000)), render(T(100))), 0.0);
+            EXPECT_EQ(tunedDifference(render(T(-1000)), render(T(-100))), 0.0);
+            for (T value : { std::numeric_limits<T>::infinity(), std::numeric_limits<T>::quiet_NaN() })
+            {
+                EXPECT_EQ(rms(render(value), 0, 1000), 0.0);
+                EXPECT_EQ(rms(render(T(0), value), 0, 1000), 0.0);
+            }
+        }
+    };
+    run.template operator()<float>();
+    run.template operator()<double>();
+}
+
+DSPARK_TEST(NoteTuning_mono_and_legato_restore_held_tuning)
+{
+    for (float mode : { 1.0f, 2.0f })
+    {
+        Synth s;
+        sineVoice(s);
+        s.setParameter(P::VoiceMode, mode);
+        s.setParameter(P::Glide, 20.0f);
+        s.prepare({ kFs, 256, 2 }, 4);
+        const auto x = left(renderStereo(s, 100000, 127, [&](Synth& sy, int pos, int n) {
+            at(0, pos, n, [&](int o) { sy.noteOnTuned(69, 1.0, -70.0, o); });
+            at(40000, pos, n, [&](int o) { sy.noteOnTuned(76, 1.0, 100.0, o); });
+            at(50000, pos, n, [&](int o) { sy.noteOff(76, 0.0, o); });
+        }));
+        const double f = 440.0 * std::exp2(-0.7 / 12.0);
+        EXPECT_NEAR(cents(toneHz(x, 4000, f), f), 0.0, 0.01);
+        EXPECT_NEAR(cents(toneHz(x, 55000, f), f), 0.0, 0.01);
+        EXPECT_EQ(s.getActiveVoiceCount(), 1);
+    }
+}
+
+DSPARK_TEST(NoteTuning_glide_accepts_pitch_below_key_zero)
+{
+    // A -100 cent note at key 0 is a valid previous pitch, not an unset
+    // sentinel. Adding +100 master cents is the independent equivalent.
+    auto render = [](bool tuned) {
+        Synth s;
+        sineVoice(s);
+        s.setParameter(P::MasterTune, tuned ? 100.0f : 0.0f);
+        s.setParameter(P::Glide, 100.0f);
+        s.setParameter(P::Env1Release, 0.0f);
+        s.prepare({ kFs, 256, 2 }, 4);
+        return left(renderStereo(s, 12000, 256, [&](Synth& sy, int pos, int n) {
+            at(0, pos, n, [&](int o) { sy.noteOnTuned(0, 1.0, tuned ? -100.0 : 0.0, o); });
+            at(800, pos, n, [&](int o) { sy.noteOff(0, 0.0, o); });
+            at(1000, pos, n, [&](int o) { sy.noteOnTuned(72, 1.0, tuned ? -100.0 : 0.0, o); });
+        }));
+    };
+    const double worst = tunedDifference(render(false), render(true));
+    std::cout << "  equivalent tuned glide residual " << worst << "\n";
+    EXPECT_LT(worst, 1e-10);
+}
+
+DSPARK_TEST(NoteTuning_polyphonic_notes_have_independent_pitch)
+{
+    auto render = [](int which) {
+        Synth s;
+        sineVoice(s);
+        s.prepare({ kFs, 256, 2 }, 4);
+        return left(renderStereo(s, 4000, 256, [&](Synth& sy, int pos, int n) {
+            if (which != 2) at(0, pos, n, [&](int o) { sy.noteOnTuned(60, 1.0, -100.0, o); });
+            if (which != 1) at(0, pos, n, [&](int o) { sy.noteOnTuned(69, 1.0, 65.0, o); });
+        }));
+    };
+    const auto a = render(1), b = render(2), sum = render(0);
+    double worst = 0.0;
+    for (size_t i = 0; i < sum.size(); ++i) worst = std::max(worst, std::abs(sum[i] - a[i] - b[i]));
+    EXPECT_LT(worst, 1e-12);
+}
+
+DSPARK_TEST(NoteTuning_sample_zone_selection_uses_integer_key)
+{
+    std::vector<double> rec(4096, 0.5);
+    const double* input[1] { rec.data() };
+    SampleZoneSpec<double> zone;
+    zone.audio = AudioBufferView<const double>(input, 1, 4096);
+    zone.sampleRate = kFs;
+    zone.rootKey = zone.keyLow = zone.keyHigh = 69;
+    Sampler<double> sampler;
+    sampler.prepare({ kFs, 256, 2 });
+    sampler.setEnvelope(0.01, 1.0, 1.0, 10.0);
+    EXPECT_TRUE(sampler.setZones(std::span<const SampleZoneSpec<double>>(&zone, 1)));
+    Synth synth;
+    sineVoice(synth);
+    synth.setParameter(P::Osc1Level, 0.0f);
+    synth.setParameter(P::SampleLevel, 1.0f);
+    synth.prepare({ kFs, 256, 2 });
+    EXPECT_TRUE(synth.setSampleZones(std::span<const SampleZoneSpec<double>>(&zone, 1)));
+    auto outside = [](auto& s, int pos, int n) {
+        at(0, pos, n, [&](int o) { s.noteOnTuned(68, 1.0, 100.0, o); });
+    };
+    EXPECT_EQ(rms(tunedRender<double>(sampler, 1000, 256, outside), 0, 1000), 0.0);
+    EXPECT_EQ(rms(tunedRender<double>(synth, 1000, 256, outside), 0, 1000), 0.0);
+    auto inside = [](auto& s, int pos, int n) {
+        at(0, pos, n, [&](int o) { s.noteOnTuned(69, 1.0, 100.0, o); });
+    };
+    EXPECT_GT(rms(tunedRender<double>(sampler, 1000, 256, inside), 100, 1000), 0.4);
+    EXPECT_GT(rms(tunedRender<double>(synth, 1000, 256, inside), 100, 1000), 0.4);
+}
+
+
+DSPARK_TEST(NoteTuning_published_event_capacity_is_usable_and_resets)
+{
+    auto check = []<typename Player>(Player& s) {
+        static_assert(Player::kMaxEvents >= 256);
+        for (int e = 0; e < Player::kMaxEvents - 1; ++e) s.setPitchBend(0.0, 0);
+        s.noteOnTuned(69, 1.0, -37.5, 17);
+        s.noteOnTuned(69, 0.0, 0.0, 18); // excess event must not corrupt the queue
+        const auto x = tunedRender<double>(s, 256, 256, [](auto&, int, int) {});
+        EXPECT_EQ(rms(x, 0, 17), 0.0);
+        EXPECT_GT(rms(x, 64, 256), 0.1);
+        EXPECT_EQ(s.getActiveVoiceCount(), 1);
+        s.allNotesOff(0);
+        const auto tail = tunedRender<double>(s, 48000, 256, [](auto&, int, int) {});
+        EXPECT_EQ(rms(tail, 47000, 48000), 0.0);
+        EXPECT_EQ(s.getActiveVoiceCount(), 0);
+    };
+    Synth synth;
+    tunedSine(synth);
+    Sampler<double> sampler;
+    tunedSample(sampler);
+    check(synth);
+    check(sampler);
+}

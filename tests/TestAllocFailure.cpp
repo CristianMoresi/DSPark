@@ -1663,6 +1663,7 @@ DSPARK_TEST(Synthesizer_audio_thread_allocates_nothing)
         for (int b = 0; b < 60; ++b)
         {
             if (b % 5 == 0) synth.noteOn(48 + b, T(0.7), b % 128);
+            if (b % 5 == 1) synth.noteOnTuned(48 + b, T(0.7), T(-37.5), b % 128);
             if (b % 7 == 3) synth.noteOff(48 + b - 3, T(0.2), 5);
             if (b == 20) synth.setParameter(Pr::Engine, 1.0f);
             if (b == 35) synth.setParameter(Pr::Engine, 2.0f);

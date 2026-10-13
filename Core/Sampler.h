@@ -56,7 +56,7 @@
  *   block the audio thread and the audio thread never frees memory.
  * - setEnvelope() / setVelocityRange() / setGain(): any thread, lock free
  *   (relaxed atomics read when a note starts or is released).
- * - noteOn() / noteOff() / setSustainPedal() / setPitchBend() / allNotesOff()
+ * - noteOn() / noteOnTuned() / noteOff() / setSustainPedal() / setPitchBend() / allNotesOff()
  *   and processBlock() / reset(): audio thread, the stream owner. Events are
  *   queued, allocation free, for the next processBlock().
  * - getActiveVoiceCount(): any thread, lock free.
@@ -110,6 +110,11 @@ template <FloatType T>
 class Sampler
 {
 public:
+    /** Maximum queued events between processBlock calls. Events beyond
+     *  this capacity are ignored; hosts must split dense spans beforehand.
+     *  Every event kind shares the same queue. */
+    static constexpr int kMaxEvents = 1024;
+
     /** @brief How a zone loops (see SampleLoopMode). */
     using LoopMode = SampleLoopMode;
 
@@ -242,10 +247,21 @@ public:
      *         is a note-off, as in MIDI. */
     void noteOn(int key, T velocity, int offset = 0) noexcept
     {
-        if (!std::isfinite(velocity)) return;
+        noteOnTuned(key, velocity, T(0), offset);
+    }
+
+    /** @brief Starts a note with individual fine tuning in cents, clamped to
+     *  -100..100. Tuning adds to the zone tuning and channel pitch bend;
+     *  key selection, retrigger and note-off identity remain the integer key.
+     *  Non-finite velocity or tuning is ignored. Zero velocity is note-off.
+     *  Audio thread; the event applies at offset in the next block. */
+    void noteOnTuned(int key, T velocity, T tuningCents, int offset = 0) noexcept
+    {
+        if (!std::isfinite(velocity) || !std::isfinite(tuningCents)) return;
         if (velocity <= T(0)) { noteOff(key, offset); return; }
         push({ EventType::NoteOn, std::clamp(key, 0, 127),
-               std::clamp(static_cast<double>(velocity), 0.0, 1.0), offset });
+               std::clamp(static_cast<double>(velocity), 0.0, 1.0), offset,
+               std::clamp(static_cast<double>(tuningCents), -100.0, 100.0) });
     }
 
     /** @brief Releases a note at `offset` samples into the next block. */
@@ -386,7 +402,7 @@ private:
     };
 
     enum class EventType { NoteOn, NoteOff, Pedal, Bend, AllOff };
-    struct Event { EventType type; int key; double value; int offset; };
+    struct Event { EventType type; int key; double value; int offset; double tuningCents = 0.0; };
 
     void push(const Event& e) noexcept
     {
@@ -406,7 +422,7 @@ private:
     {
         switch (e.type)
         {
-            case EventType::NoteOn:  startNote(e.key, e.value); break;
+            case EventType::NoteOn:  startNote(e.key, e.value, e.tuningCents); break;
             case EventType::NoteOff: releaseKey(e.key); break;
             case EventType::Bend:    pitchBend_ = e.value; break;
             case EventType::Pedal:
@@ -442,7 +458,7 @@ private:
             }
     }
 
-    void startNote(int key, double velocity) noexcept
+    void startNote(int key, double velocity, double tuningCents) noexcept
     {
         if (active_ == nullptr) return;
         // A retriggered key releases what it was playing.
@@ -462,7 +478,7 @@ private:
             v->set = active_;
             v->key = key;
             v->baseRatio = z.sampleRate / sampleRate_
-                         * std::pow(2.0, (key - z.rootKey + z.tuneCents / 100.0) / 12.0);
+                         * std::pow(2.0, (key - z.rootKey + (z.tuneCents + tuningCents) / 100.0) / 12.0);
             v->reader.start(z, v->baseRatio * std::pow(2.0, pitchBend_ / 12.0));
             v->held = true;
             v->sustained = false;
@@ -565,7 +581,6 @@ private:
 
     // -- Members ------------------------------------------------------------------------------
 
-    static constexpr int kMaxEvents = 1024;
 
     double sampleRate_ = 48000.0;
     int polyphony_ = 0;

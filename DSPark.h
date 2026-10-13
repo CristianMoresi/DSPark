@@ -389,10 +389,14 @@
  * | `LadderFilter<T>`        | Core/LadderFilter.h   | Moog-style 4-pole resonant filter (TPT, 6 modes, drive)            |
  * | `StateVariableFilter<T>` | Core/StateVariableFilter.h | TPT SVF: LP/HP/BP/Notch/AP/Bell/Shelf, multi-output, mod-friendly |
  * | `Oversampling<T>`        | Core/Oversampling.h   | 2x-16x oversampling with FIR half-band Kaiser filters (-80 dB+)   |
- * | `Oscillator<T>`          | Core/Oscillator.h     | PolyBLEP oscillator (sine, saw, square, triangle; minBLEP hard sync)|
- * | `MinBlepTable<T>`        | Core/MinBlepTable.h   | Minimum-phase band-limited step residual (cepstral, FFT-built)      |
- * | `WavetableOscillator<T>` | Core/WavetableOscillator.h | Mipmapped wavetable oscillator (bandlimited)                   |
+ * | `Oscillator<T>`          | Core/Oscillator.h     | minBLEP oscillator: sine, saw, pulse with PWM, triangle, hard sync  |
+ * | `MinBlepTable<T>`        | Core/MinBlepTable.h   | Minimum-phase band-limited step and ramp residuals (cepstral)       |
+ * | `WavetableOscillator<T>` | Core/WavetableOscillator.h | Band-limited wavetable oscillator over a WavetableBank         |
+ * | `WavetableBank`          | Core/WavetableBank.h  | Mipmapped multi-frame wavetables, optimal-interpolator morph reader |
  * | `Sampler<T>`             | Core/Sampler.h        | Polyphonic multi-zone sampler: alias-free transposition, loops      |
+ * | `SampleZoneSpec<T>`      | Core/SampleZone.h     | One sample zone: keys, velocities, tuning, gain, pan, loop          |
+ * | `Synthesizer<T>`         | Core/Synthesizer.h    | Polyphonic analog/FM/wavetable synth with samples and mod matrix    |
+ * | `Lfo<T>`                 | Core/Lfo.h            | Modulation LFO: 7 shapes, tempo sync, delay, fade-in, seeded random |
  * | `DryWetMixer<T>`         | Core/DryWetMixer.h    | Dry/wet parallel mix for effects                                    |
  *
  * @subsection classes_analysis Analysis & Metering
@@ -699,8 +703,12 @@
 #include "Core/SampleAndHold.h"
 #include "Core/RingBuffer.h"
 #include "Core/WaveshapeTable.h"
+#include "Core/WavetableBank.h"
 #include "Core/WavetableOscillator.h"
+#include "Core/SampleZone.h"
 #include "Core/Sampler.h"
+#include "Core/Lfo.h"
+#include "Core/Synthesizer.h"
 #include "Core/Hilbert.h"
 #include "Core/LadderFilter.h"
 #include "Core/StateVariableFilter.h"

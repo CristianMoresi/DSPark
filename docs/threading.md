@@ -599,11 +599,13 @@ up; the worst case is that many copies of one coefficient set -- measured at
 about 5 us for an 8192-tap FIR set, and proportional to the set size -- and it
 is set by DSPark's own instruction count, not by another thread's scheduling.
 `Analysis/SpectrumAnalyzer.h`'s `acquireLatestSlot()` is a lock-free CAS loop
-against a writer that holds nothing, so it cannot be made to wait either. Three
+against a writer that holds nothing, so it cannot be made to wait either. Five
 magic statics are reachable from a processing call (`Core/MinBlepTable.h`,
-`Effects/AlgorithmicReverb.h`'s prime table, `Core/Hilbert.h`); each is forced
-on the setup thread by `prepare()` or at construction, so the guard is already
-resolved when the audio thread arrives.
+`Effects/AlgorithmicReverb.h`'s prime table, `Core/Hilbert.h`, the
+interpolation kernel of `Core/detail/SampleReader.h` that Sampler and
+Synthesizer share, and `Core/WavetableBank.h`'s built-in banks); each is
+forced on the setup thread by `prepare()` or at construction, so the guard is
+already resolved when the audio thread arrives.
 
 That list is deliberately a list of named things rather than a sentence about
 everything else. An unqualified negative claim over ninety headers is one no

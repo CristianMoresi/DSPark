@@ -25,6 +25,7 @@
 #include "../Core/FIRFilter.h"
 #include "../Core/detail/OfflineProduct.h"
 #include "../Core/Resampler.h"
+#include "../Core/Synthesizer.h"
 #include "../Effects/OfflineLeveler.h"
 #include "../Effects/OfflinePeakCompressor.h"
 #include "../Effects/OfflinePunch.h"
@@ -1629,6 +1630,51 @@ DSPARK_TEST(AudioInterval_setup_process_and_finish_allocate_nothing)
         EXPECT_EQ(allocations, 0);
         EXPECT_TRUE(prepared && processed && result.complete());
         EXPECT_EQ(result.samplePeak.value, static_cast<double>(T(.2)));
+    };
+    check.template operator()<float>();
+    check.template operator()<double>();
+}
+
+DSPARK_TEST(Synthesizer_audio_thread_allocates_nothing)
+{
+    // Every engine, unison, the sample source, oversampling, events of every
+    // kind, stealing and a parameter change between blocks: once prepared,
+    // the audio thread never allocates.
+    const auto check = []<class T>()
+    {
+        using S = Synthesizer<T>;
+        using Pr = typename S::Param;
+        S synth;
+        synth.setParameter(Pr::Unison, 4.0f);
+        synth.setParameter(Pr::Polyphony, 3.0f);
+        synth.setParameter(Pr::SampleLevel, 0.5f);
+        synth.setParameter(Pr::Oversampling, 1.0f);
+        synth.setParameter(Pr::Drift, 0.5f);
+        synth.prepare({ 48000.0, 128, 2 }, 4);
+        std::vector<T> recording(4000, T(0.25));
+        const T* channels[1] = { recording.data() };
+        synth.loadSample(AudioBufferView<const T>(channels, 1, 4000), 44100.0, 60);
+        std::vector<T> left(128), right(128);
+        T* out[2] = { left.data(), right.data() };
+        synth.processBlock(AudioBufferView<T>(out, 2, 128));   // adopts the zone
+        namespace fa = dspark_test_failing_alloc;
+        fa::count.store(0, std::memory_order_relaxed);
+        fa::failAt.store(std::numeric_limits<int>::max(), std::memory_order_relaxed);
+        for (int b = 0; b < 60; ++b)
+        {
+            if (b % 5 == 0) synth.noteOn(48 + b, T(0.7), b % 128);
+            if (b % 7 == 3) synth.noteOff(48 + b - 3, T(0.2), 5);
+            if (b == 20) synth.setParameter(Pr::Engine, 1.0f);
+            if (b == 35) synth.setParameter(Pr::Engine, 2.0f);
+            synth.setPitchBend(T(0.1), 7);
+            synth.setController(1, T(0.5), 9);
+            synth.setPolyPressure(60, T(0.3), 11);
+            synth.processBlock(AudioBufferView<T>(out, 2, 128));
+        }
+        const int allocations = fa::count.load(std::memory_order_relaxed);
+        fa::failAt.store(-1, std::memory_order_relaxed);
+        EXPECT_EQ(allocations, 0);
+        EXPECT_GT(synth.getActiveVoiceCount(), 0);
     };
     check.template operator()<float>();
     check.template operator()<double>();

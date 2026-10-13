@@ -58,6 +58,10 @@ namespace dspark {
  *       high-rate samples the most recent upsample() left in the internal
  *       buffer, so call them once each per block, with the same block length.
  *
+ * A source that generates at the high rate (a synthesizer voice bank) skips
+ * the upsampling: it fills getHighRateBlock() and calls downsample(), and its
+ * delay is getDecimationDelay() high-rate samples.
+ *
  * Threading: prepare() and reset() belong to the setup thread (prepare
  * allocates). upsample() and downsample() belong to the audio thread and are
  * noexcept and allocation-free. There are no runtime setters -- factor and
@@ -163,6 +167,46 @@ public:
         // sample-exact against an impulse round-trip for factors 2/4/8/16 and all
         // quality presets. (halfOrder+1 and factor are powers of two -> exact.)
         return 2 * (halfOrder + 1) * (factor_ - 1) / factor_;
+    }
+
+    /**
+     * @brief Group delay of the decimation path alone, in HIGH-RATE samples.
+     *
+     * The delay of a source rendered directly at the high rate through
+     * getHighRateBlock() and downsample(): every half-band stage delays by its
+     * centre tap, halfOrder samples at its input rate, which sums to
+     * halfOrder * (factor - 1) high-rate samples. Divided by getFactor() it is
+     * generally fractional at the base rate (31.5 samples at 2x High), unlike
+     * the round trip of getLatency(); a source that must report an integer
+     * base-rate latency L starts its content L * getFactor() minus this value
+     * high-rate samples later. Measured against a band-limited sine for every
+     * factor and quality preset.
+     */
+    [[nodiscard]] int getDecimationDelay() const noexcept
+    {
+        if (numStages_ == 0) return 0;
+        const int halfOrder = (tapsForQuality(quality_) - 1) / 2;
+        return halfOrder * (factor_ - 1);
+    }
+
+    /**
+     * @brief Writable high-rate block for a source that renders directly at
+     *        the oversampled rate (a synthesizer, for example).
+     *
+     * The decimation-only counterpart of upsample(): no upsampling filter
+     * runs. Fill every sample of the returned view, then call downsample()
+     * with the same base block length. The path delays by
+     * getDecimationDelay() high-rate samples. Real-time safe.
+     *
+     * @param numSamples Base-rate block length, clamped to prepare()'s
+     *        maxBlockSize.
+     * @return View of the internal buffer, numSamples * getFactor() long,
+     *         with the prepared channel count.
+     */
+    [[nodiscard]] AudioBufferView<T> getHighRateBlock(int numSamples) noexcept
+    {
+        const int nS = std::clamp(numSamples, 0, baseSpec_.maxBlockSize);
+        return upBuffer_.toView().getSubView(0, nS * factor_);
     }
 
     /**

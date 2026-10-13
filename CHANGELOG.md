@@ -4,6 +4,71 @@ All notable user-facing changes to DSPark are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `Synthesizer`: a polyphonic synthesizer. Engines: analog (three
+  `Oscillator`s with pulse-width modulation and hard sync), four-operator FM
+  (eight algorithms, feedback, an envelope per operator) and wavetable (two
+  morphing `WavetableBank` oscillators). Every engine adds a sub-oscillator,
+  noise and a sample source that plays `SampleZoneSpec` zones through
+  Sampler's band-limited reader. Per voice: ladder or state-variable filter
+  with a per-sample cutoff, three ADSRs, two `Lfo`s, an eight-slot modulation
+  matrix, unison (1..8), glide, poly/mono/legato, seeded analog drift.
+  Sample-accurate events, Sampler's click-free stealing, a flat parameter
+  table shaped like the plugin layer's, state blobs, and optional 2x/4x
+  oversampling with an integer reported latency. Renders are bit-identical
+  for any block size. Measured: pitch within 0.0001 cent, FM sidebands within
+  1e-5 dB of the Bessel functions, the sample source within 2e-16 of
+  `Sampler`. Voices are filtered in pairs, two independent ZDF recursions in
+  flight, with an output identical to one voice at a time: 46 to 58 ns per
+  voice and output sample on the 1x benchmark patches (the analog patch 16%
+  faster than unpaired).
+- `Lfo`: seven shapes (sample-and-hold and smooth random drawn per cycle from
+  a seed), Hz or tempo divisions, delay and fade-in, rate modulation; every
+  shape is a pure function of the cycle position, so a free-running LFO can
+  be read at any instant.
+- `WavetableBank`: mipmapped multi-frame wavetables with a morphing reader
+  (Niemitalo's optimal 6-point interpolator over levels holding four samples
+  per period of their top harmonic, its droop pre-compensated), four built-in
+  banks and frames loaded from audio. Worst inharmonic component -151 dB with
+  every harmonic at full scale, about -165 dB for ordinary spectra.
+- `SampleZoneSpec` and `SampleLoopMode` (`Core/SampleZone.h`) describe a zone
+  for both `Sampler` and `Synthesizer`; `Sampler::ZoneSpec` and
+  `Sampler::LoopMode` remain as aliases.
+- `Oscillator::setPulseWidth()`: pulse-width modulation of the square, both
+  edges band-limited (also when they fall in one sample interval) and a
+  width change across the current phase corrected as an edge.
+- `Oversampling::getHighRateBlock()` and `getDecimationDelay()`: a
+  decimation-only path for sources that render at the high rate.
+- `MinBlepTable::addStep()`, `addDelayedStep()` and `addDelayedRamp()`: ring
+  corrections over contiguous rows, and a minimum-phase band-limited ramp
+  (minBLAMP) for slope changes against a delayed reference.
+
+### Changed
+
+- `MinBlepTable`: 128-tap Kaiser kernel and 2048 sub-sample rows refined from
+  the cepstral step with Niemitalo's 32x interpolator. The worst inharmonic
+  component of a saw or pulse from 110 Hz to 14 kHz goes from -89 dB
+  (44.1 kHz) and -94 dB (48 kHz) to -143 dB or better; the 64-tap kernel let
+  harmonics between 24.1 and 24.8 kHz fold below 20 kHz at 44.1 kHz. The rows
+  also make a 5 kHz saw about 25% cheaper. `kTaps` is now 128 and
+  `kOversample` 2048.
+- `Oscillator`: phase, increments and edge times run in double for both sample
+  types (a float accumulator detuned slow LFO rates); the hard-synced sine
+  also corrects its slope change (-82 to -160 dB at 220 Hz x 1.5, -58 to
+  -111 dB at 880 Hz x 1.5); the triangle's normalization follows a changing
+  pitch without a `std::pow` per sample.
+- `WavetableOscillator`: plays a `WavetableBank`, so its floor at 27.5 Hz goes
+  from -72 dB to about -165 dB; `setBank()` and `setPosition()` play any bank
+  with morphing.
+- `LadderFilter` and `Sampler` move their per-sample arithmetic to shared
+  kernels (`detail/LadderZdf.h`, `detail/SampleReader.h`); their output is
+  bit-identical.
+- `Sampler`: a mono zone's constant-power pan takes both gains from `cos`,
+  so a centred zone is exactly mono and opposite pans mirror exactly
+  (`sin` and `cos` of pi/4 round differently in glibc, leaving the centre one
+  ulp off mono on Linux).
+
 ## [1.8.0] - 2026-10-05
 
 ### Added

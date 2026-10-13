@@ -17,11 +17,26 @@
  * creates.
  *
  * Features:
- * - Sine / Saw / Square / Triangle, band-limited. Worst alias component in
- *   the audible band, 48 kHz saw: minBLEP -94 dB (110 Hz .. 7 kHz, measured)
+ * - Sine / Saw / Square / Triangle, band-limited. Worst inharmonic component
+ *   below 20 kHz, saw and pulse from 110 Hz to 14 kHz at 44.1 and 48 kHz:
+ *   minBLEP -143 dB or better (double; measured on exact-bin pitches),
  *   against PolyBLEP's -59 dB at 110 Hz falling to -23 dB at 7 kHz.
- * - Hard sync with table-minBLEP correction (alias floor ~-90 dB or better).
- * - Triangle integrator state kept in double (framework rule for recursive state).
+ * - Pulse-width modulation of the Square (setPulseWidth()): both edges of
+ *   every cycle are band-limited, including the case where they fall inside
+ *   one sample interval, and a width change that moves the falling edge
+ *   across the current phase is itself corrected as a band-limited edge. The
+ *   pulse is AC-coupled (zero mean at every width), like an analog
+ *   oscillator's output stage.
+ * - Hard sync with table-minBLEP correction: saw, square and triangle -139 dB
+ *   or better (220 Hz .. 2.5 kHz masters, ratios 1.5 .. 4.3). The synced
+ *   sine's slope change is corrected too (minimum-phase band-limited ramp):
+ *   -160 dB at 220 Hz x 1.5, -111 dB at 880 Hz x 1.5, and -47 dB at
+ *   2.5 kHz x 4.3, where its higher-order discontinuities remain.
+ * - Phase, increments and edge times in double whatever T, and the triangle
+ *   integrator too (framework rule for recursive state).
+ * - Pitch can change every sample: setFrequency() is cheap for every
+ *   waveform (the triangle's normalization follows its increment by a
+ *   first-order update, re-solved exactly beyond 0.1% of change).
  * - Zero allocations after prepare(); the shared minBLEP table builds once there.
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, MinBlepTable.h.
@@ -48,14 +63,15 @@ namespace dspark {
  * This oscillator provides high-quality waveform generation suitable for both
  * audio-rate synthesis and low-frequency modulation (LFO). Every discontinuity
  * of the Saw and Square waves is corrected with a table minBLEP (MinBlepTable)
- * -- a causal minimum-phase band-limited step whose alias rejection (~-90 dB
- * measured) is some 35-70 dB better than a 2-point PolyBLEP across the
- * keyboard. The Triangle wave is generated via a leaky integrator driven by
+ * -- a causal minimum-phase band-limited step whose alias rejection (-143 dB
+ * or better, measured) is some 80-120 dB better than a 2-point PolyBLEP
+ * across the keyboard. The Triangle wave is generated via a leaky integrator driven by
  * the band-limited square, providing an analog-style curve. Under hard sync
  * (setSyncRatio) the same kernel corrects the slave edges and the reset jumps.
- * Exception: a hard-synced Sine has no value discontinuity, only a derivative
- * kink at the reset, which the minBLEP does not address; its residual alias
- * floor is ~-64 dB (a minBLAMP table is the future direction).
+ * A hard-synced Sine also changes slope at every reset (a kink); it is
+ * rendered dcDelay() samples late and both its jump and its kink are
+ * corrected against that delayed reference (MinBlepTable's delayed step and
+ * minimum-phase band-limited ramp), so it is band-limited too.
  *
  * A band-limited step rings (Gibbs), and a minimum-phase one puts all of that
  * ringing after the edge: minBLEP saw and square peaks reach about 1.45x full
@@ -73,6 +89,12 @@ template <typename T>
 class Oscillator
 {
     static_assert(std::is_floating_point_v<T>, "Oscillator requires float or double");
+
+    /// Phase-domain arithmetic (phases, increments, edge times): double
+    /// whatever T, the framework rule for recursive state. A float phase
+    /// accumulator jitters every edge by its rounding and capped a float
+    /// oscillator's alias floor near -100 dB.
+    using Phase = double;
 
 public:
     enum class Waveform { Sine, Saw, Square, Triangle };
@@ -99,7 +121,7 @@ public:
         sampleRate_ = sampleRate;
         // Touch the shared minBLEP table here so its one-time FFT build runs
         // on the control thread, never inside the audio callback.
-        blepDelay_ = MinBlepTable<T>::instance().dcDelay();
+        blepDelay_ = static_cast<Phase>(MinBlepTable<T>::instance().dcDelay());
         setFrequency(frequency_);
         if (!syncOn_) primeMinBlep();
     }
@@ -137,6 +159,8 @@ public:
     {
         if (w == waveform_) return;
         waveform_ = w;
+        // The triangle's normalization is only kept current while it plays.
+        if (w == Waveform::Triangle) updateTriNorm();
         // The pending minBLEP tails belong to the previous waveform's edges.
         if (!syncOn_) primeMinBlep();
     }
@@ -189,6 +213,50 @@ public:
     }
 
     /**
+     * @brief Sets the Square's pulse width (duty cycle).
+     *
+     * The waveform is high for the first `width` of each cycle and low for the
+     * rest; 0.5 (the default) is the symmetric square and leaves the output
+     * unchanged from a waveform without pulse-width control. The pulse is
+     * AC-coupled: its DC, 2 * width - 1, is removed, so its mean is zero at
+     * every width and its peak rises toward 2 (minus the narrow side's share)
+     * as the pulse narrows -- leave headroom for narrow pulses.
+     *
+     * Only the Square is affected; the Triangle stays the integral of the
+     * symmetric square. Both edges are corrected with the minBLEP (or
+     * PolyBLEP, see setAntiAliasing()). A change that moves the falling edge
+     * across the current phase flips the output immediately, and on the
+     * minBLEP paths that flip is band-limited like any other edge, so the
+     * width can be modulated every sample.
+     *
+     * @param width Pulse width in [kMinPulseWidth, 1 - kMinPulseWidth];
+     *              values outside are clamped and NaN is ignored.
+     */
+    void setPulseWidth(T width) noexcept
+    {
+        if (width != width) return;
+        const T w = std::clamp(width, kMinPulseWidth, T(1) - kMinPulseWidth);
+        if (w == pulseWidth_) return;
+        const T old = pulseWidth_;
+        pulseWidth_ = w;
+        pulseDc_ = T(2) * w - T(1);
+        if (waveform_ != Waveform::Square) return;
+
+        // The falling edge moved across the current phase: the naive value
+        // flips at this very sample. Queue that flip as a minBLEP edge whose
+        // event time is the sample about to be emitted (age 0), so it is
+        // band-limited instead of an instantaneous step.
+        const Phase ph = syncOn_ ? slavePhase_ : phase_;
+        const bool wasHigh = ph < old;
+        const bool isHigh = ph < w;
+        if (wasHigh != isHigh && (syncOn_ || antiAliasing_ == AntiAliasing::MinBLEP))
+            scheduleMinBlep(isHigh ? T(2) : T(-2), T(0));
+    }
+
+    /** @brief Narrowest pulse width setPulseWidth() accepts (and 1 minus it the widest). */
+    static constexpr T kMinPulseWidth = T(0.01);
+
+    /**
      * @brief Forces the oscillator phase to a specific value.
      *
      * The triangle integrator is re-seeded at its steady-state value for the
@@ -204,8 +272,8 @@ public:
     {
         // Wrap (not clamp): a phase of exactly 1.0 must land on 0.0 so the
         // first sample is not a one-off discontinuity.
-        phase_ = phase - std::floor(phase);
-        if (phase_ >= T(1)) phase_ -= T(1);
+        phase_ = static_cast<Phase>(phase) - std::floor(static_cast<Phase>(phase));
+        if (phase_ >= 1.0) phase_ -= 1.0;
 
         if (syncOn_)
         {
@@ -229,10 +297,11 @@ public:
      * to (1+q)x the nominal level -- an audible +4 dB pop on note retrigger. */
     void reset() noexcept
     {
-        phase_ = T(0);
-        slavePhase_ = T(0);
+        phase_ = 0.0;
+        slavePhase_ = 0.0;
         corr_.fill(T(0));
         corrHead_ = 0;
+        resetAge_ = { kNoReset, kNoReset };
         if (!syncOn_) primeMinBlep();
         seedTriangle();
     }
@@ -257,35 +326,35 @@ public:
             case Waveform::Sine:
                 // fastSin: minimax error ~2e-7 in float / 4e-9 in double
                 // (-135 / -168 dB), 3-6x faster than std::sin.
-                out = fastSin(phase_ * twoPi<T>);
+                out = static_cast<T>(fastSin(phase_ * twoPi<Phase>));
                 break;
 
             case Waveform::Saw:
-                out = T(2) * phase_ - T(1);
-                out -= polyBlep(phase_, phaseInc_);
+                out = static_cast<T>(2.0 * phase_ - 1.0 - polyBlep(phase_, phaseInc_));
                 break;
 
             case Waveform::Square:
             {
-                T raw = (phase_ < T(0.5)) ? T(1) : T(-1);
+                Phase raw = (phase_ < pulseWidth_) ? 1.0 : -1.0;
                 raw += polyBlep(phase_, phaseInc_);
 
-                // Optimized phase shift without std::fmod
-                T halfPhase = phase_ + T(0.5);
-                if (halfPhase >= T(1)) halfPhase -= T(1);
+                // Phase relative to the falling edge at pulseWidth_ (optimized
+                // shift without std::fmod; 0.5 for the symmetric square).
+                Phase halfPhase = phase_ + (1.0 - static_cast<Phase>(pulseWidth_));
+                if (halfPhase >= 1.0) halfPhase -= 1.0;
 
                 raw -= polyBlep(halfPhase, phaseInc_);
-                out = raw;
+                out = static_cast<T>(raw - static_cast<Phase>(pulseDc_));
                 break;
             }
 
             case Waveform::Triangle:
             {
-                T raw = (phase_ < T(0.5)) ? T(1) : T(-1);
+                Phase raw = (phase_ < 0.5) ? 1.0 : -1.0;
                 raw += polyBlep(phase_, phaseInc_);
 
-                T halfPhase = phase_ + T(0.5);
-                if (halfPhase >= T(1)) halfPhase -= T(1);
+                Phase halfPhase = phase_ + 0.5;
+                if (halfPhase >= 1.0) halfPhase -= 1.0;
                 raw -= polyBlep(halfPhase, phaseInc_);
 
                 // Leaky integration for analog-style triangle. The recursion
@@ -300,7 +369,7 @@ public:
 
         // Fast phase wrap assuming positive frequencies only (enforced in setFrequency)
         phase_ += phaseInc_;
-        if (phase_ >= T(1)) phase_ -= T(1);
+        if (phase_ >= 1.0) phase_ -= 1.0;
 
         return out;
     }
@@ -348,21 +417,22 @@ public:
             std::copy_n(ch0, static_cast<size_t>(nS), buffer.getChannel(ch));
     }
 
-    [[nodiscard]] T getPhase() const noexcept { return phase_; }
+    [[nodiscard]] T getPhase() const noexcept { return static_cast<T>(phase_); }
     [[nodiscard]] T getFrequency() const noexcept { return frequency_; }
     [[nodiscard]] Waveform getWaveform() const noexcept { return waveform_; }
     [[nodiscard]] T getSyncRatio() const noexcept { return syncRatio_; }
+    [[nodiscard]] T getPulseWidth() const noexcept { return pulseWidth_; }
 
 private:
     /** @brief Raw (pre-BLEP) slave waveform value at a given phase. */
-    [[nodiscard]] T rawSlaveValue(T ph) const noexcept
+    [[nodiscard]] T rawSlaveValue(Phase ph) const noexcept
     {
         switch (waveform_)
         {
-            case Waveform::Sine:     return fastSin(ph * twoPi<T>);
-            case Waveform::Saw:      return T(2) * ph - T(1);
-            case Waveform::Square:
-            case Waveform::Triangle: return (ph < T(0.5)) ? T(1) : T(-1);
+            case Waveform::Sine:     return static_cast<T>(fastSin(ph * twoPi<Phase>));
+            case Waveform::Saw:      return static_cast<T>(2.0 * ph - 1.0);
+            case Waveform::Square:   return (ph < pulseWidth_) ? T(1) : T(-1);
+            case Waveform::Triangle: return (ph < 0.5) ? T(1) : T(-1);
         }
         return T(0);
     }
@@ -380,14 +450,15 @@ private:
      */
     void seedTriangle() noexcept
     {
-        T ph = syncOn_ ? slavePhase_ : phase_;
+        updateTriNorm();   // the seed needs the peak of the current increment
+        Phase ph = syncOn_ ? slavePhase_ : phase_;
         if (!syncOn_ && antiAliasing_ == AntiAliasing::MinBLEP)
         {
             ph -= phaseInc_ * blepDelay_;
             ph -= std::floor(ph);
         }
-        const T ideal = (ph < T(0.5)) ? (T(4) * ph - T(1)) : (T(3) - T(4) * ph);
-        triState_ = static_cast<double>(ideal * triExpectedPeak_);
+        const Phase ideal = (ph < 0.5) ? (4.0 * ph - 1.0) : (3.0 - 4.0 * ph);
+        triState_ = ideal * static_cast<Phase>(triExpectedPeak_);
     }
 
     /**
@@ -407,27 +478,34 @@ private:
         corr_.fill(T(0));
         corrHead_ = 0;
         if (antiAliasing_ != AntiAliasing::MinBLEP || waveform_ == Waveform::Sine
-            || !(phaseInc_ > T(0)))
+            || !(phaseInc_ > 0.0))
             return;
 
-        const T period = T(1) / phaseInc_;
-        const auto primeEdge = [&](T edgePhase, T jump) noexcept {
+        const Phase period = 1.0 / phaseInc_;
+        const auto primeEdge = [&](Phase edgePhase, T jump) noexcept {
             // Samples elapsed since the most recent edge at edgePhase, taken
             // relative to the sample about to be emitted.
-            T age = (phase_ - edgePhase) * period;
-            if (age < T(0)) age += period;
-            for (; age < static_cast<T>(kCorrLen); age += period)
+            Phase age = (phase_ - edgePhase) * period;
+            if (age < 0.0) age += period;
+            for (; age < static_cast<Phase>(kCorrLen); age += period)
                 scheduleMinBlep(jump, age);
         };
         if (waveform_ == Waveform::Saw)
         {
-            primeEdge(T(0), T(-2));
+            primeEdge(0.0, T(-2));
         }
         else
         {
-            primeEdge(T(0), T(2));
-            primeEdge(T(0.5), T(-2));
+            primeEdge(0.0, T(2));
+            primeEdge(fallingEdge(), T(-2));
         }
+    }
+
+    /** @brief Phase of the falling edge: the pulse width for the Square, the
+     *  symmetric 0.5 for the Triangle's internal square. */
+    [[nodiscard]] Phase fallingEdge() const noexcept
+    {
+        return waveform_ == Waveform::Square ? static_cast<Phase>(pulseWidth_) : 0.5;
     }
 
     /**
@@ -452,7 +530,11 @@ private:
             // band-limited jumps and the slope stay time-aligned (see
             // MinBlepTable::dcDelay): without this the saw carries a DC offset
             // of 2 * dcDelay * f0 / fs.
-            out -= T(2) * phaseInc_ * blepDelay_;
+            out -= static_cast<T>(2.0 * phaseInc_ * blepDelay_);
+        }
+        else if (waveform_ == Waveform::Square)
+        {
+            out -= pulseDc_;   // AC-coupled pulse (zero at the 0.5 default)
         }
         else if (waveform_ == Waveform::Triangle)
         {
@@ -463,23 +545,46 @@ private:
             out = static_cast<T>(triState_) * triNorm_;
         }
 
-        const T old = phase_;
+        const Phase old = phase_;
         phase_ += phaseInc_;
-        if (phaseInc_ > T(0))
+        if (phaseInc_ > 0.0)
         {
-            if (phase_ >= T(1))
+            if (waveform_ == Waveform::Saw)
             {
-                // Wrap: saw falls by 2, square/triangle drive rises by 2.
-                const T alpha = (T(1) - old) / phaseInc_;
-                scheduleMinBlep(waveform_ == Waveform::Saw ? T(-2) : T(2), T(1) - alpha);
+                if (phase_ >= 1.0)
+                {
+                    // Wrap: the saw falls by 2.
+                    const Phase alpha = (1.0 - old) / phaseInc_;
+                    scheduleMinBlep(T(-2), 1.0 - alpha);
+                }
             }
-            else if (waveform_ != Waveform::Saw && old < T(0.5) && phase_ >= T(0.5))
+            else
             {
-                const T alpha = (T(0.5) - old) / phaseInc_;
-                scheduleMinBlep(T(-2), T(1) - alpha);
+                // The square (or the triangle's drive) rises by 2 at the wrap
+                // and falls by 2 at its falling edge. A narrow or wide pulse
+                // can put both inside one interval -- the falling edge before
+                // the wrap (width near 1) or after it (width near 0) -- so the
+                // candidates are taken in time order. The symmetric square
+                // (increment <= 0.5) never reaches a second one.
+                const Phase edge = fallingEdge();
+                if (old < edge && phase_ >= edge)
+                {
+                    const Phase alpha = (edge - old) / phaseInc_;
+                    scheduleMinBlep(T(-2), 1.0 - alpha);
+                }
+                if (phase_ >= 1.0)
+                {
+                    const Phase alpha = (1.0 - old) / phaseInc_;
+                    scheduleMinBlep(T(2), 1.0 - alpha);
+                    if (phase_ >= 1.0 + edge)
+                    {
+                        const Phase alphaFall = (1.0 + edge - old) / phaseInc_;
+                        scheduleMinBlep(T(-2), 1.0 - alphaFall);
+                    }
+                }
             }
         }
-        if (phase_ >= T(1)) phase_ -= T(1);
+        if (phase_ >= 1.0) phase_ -= 1.0;
         return out;
     }
 
@@ -501,15 +606,25 @@ private:
             waveform_ == Waveform::Square || waveform_ == Waveform::Triangle;
 
         // --- emit: raw value plus the pending band-limiting correction ------
-        T raw = rawSlaveValue(slavePhase_) + corr_[static_cast<size_t>(corrHead_)];
+        // The sine is evaluated dcDelay() samples late (see delayedSinePhase).
+        const T naive = (waveform_ == Waveform::Sine)
+            ? static_cast<T>(fastSin(delayedSinePhase() * twoPi<Phase>))
+            : rawSlaveValue(slavePhase_);
+        T raw = naive + corr_[static_cast<size_t>(corrHead_)];
         corr_[static_cast<size_t>(corrHead_)] = T(0);
         corrHead_ = (corrHead_ + 1) & kCorrMask;   // now the NEXT sample's slot
+        resetAge_[0] += 1.0;
+        resetAge_[1] += 1.0;
 
         T out = raw;
         if (waveform_ == Waveform::Saw)
         {
             // Ramp aligned with the minBLEP delay (see nextMinBlepSample()).
-            out -= T(2) * slaveInc_ * blepDelay_;
+            out -= static_cast<T>(2.0 * slaveInc_ * blepDelay_);
+        }
+        else if (waveform_ == Waveform::Square)
+        {
+            out -= pulseDc_;   // the free-running pulse's DC (see setPulseWidth())
         }
         else if (waveform_ == Waveform::Triangle)
         {
@@ -524,47 +639,74 @@ private:
         }
 
         // --- advance both phases; schedule corrections in time order --------
-        const T masterOld = phase_;
-        const T slaveOld  = slavePhase_;
+        const Phase masterOld = phase_;
+        const Phase slaveOld  = slavePhase_;
         phase_      += phaseInc_;
         slavePhase_ += slaveInc_;
 
-        const bool masterWrap = phase_ >= T(1);
-        const T alphaSync = masterWrap ? (T(1) - masterOld) / phaseInc_ : T(2);
+        const bool masterWrap = phase_ >= 1.0;
+        const Phase alphaSync = masterWrap ? (1.0 - masterOld) / phaseInc_ : 2.0;
 
         // Natural slave edge inside this interval (at most one: slaveInc_ is
         // clamped to 0.5). It only happens if the reset does not pre-empt it;
         // on an exact tie the edge wins and the reset jump measures zero.
         if (waveform_ != Waveform::Sine)
         {
-            T alphaEdge = T(2), edgeJump = T(0);
-            if (slavePhase_ >= T(1))
+            const auto naturalEdge = [&](Phase at, T jump) noexcept {
+                const Phase alphaEdge = (at - slaveOld) / slaveInc_;
+                if (alphaEdge <= alphaSync && alphaEdge <= 1.0)
+                    scheduleMinBlep(jump, 1.0 - alphaEdge);
+            };
+            if (squareLike)
             {
-                alphaEdge = (T(1) - slaveOld) / slaveInc_;
-                edgeJump  = (waveform_ == Waveform::Saw) ? T(-2) : T(2);
+                // Falling edge, wrap, and (narrow pulse) the next falling edge,
+                // in time order; the symmetric square crosses at most one.
+                const Phase edge = fallingEdge();
+                if (slaveOld < edge && slavePhase_ >= edge)
+                    naturalEdge(edge, T(-2));
+                if (slavePhase_ >= 1.0)
+                {
+                    naturalEdge(1.0, T(2));
+                    if (slavePhase_ >= 1.0 + edge)
+                        naturalEdge(1.0 + edge, T(-2));
+                }
             }
-            else if (squareLike && slaveOld < T(0.5) && slavePhase_ >= T(0.5))
+            else if (slavePhase_ >= 1.0)
             {
-                alphaEdge = (T(0.5) - slaveOld) / slaveInc_;
-                edgeJump  = T(-2);
+                naturalEdge(1.0, T(-2));   // the saw falls by 2 at its wrap
             }
-            if (alphaEdge <= alphaSync && alphaEdge <= T(1))
-                scheduleMinBlep(edgeJump, T(1) - alphaEdge);
         }
-        if (slavePhase_ >= T(1)) slavePhase_ -= T(1);
+        if (slavePhase_ >= 1.0) slavePhase_ -= 1.0;
 
         if (masterWrap)
         {
             // Slave value the instant before the reset (wrap folded in); the
             // jump lands on the freshly seeded phase-0 value.
-            T atJump = slaveOld + alphaSync * slaveInc_;
+            Phase atJump = slaveOld + alphaSync * slaveInc_;
             atJump -= std::floor(atJump);
-            const T jump = rawSlaveValue(T(0)) - rawSlaveValue(atJump);
-            if (jump != T(0))
-                scheduleMinBlep(jump, T(1) - alphaSync);
+            const T jump = rawSlaveValue(0.0) - rawSlaveValue(atJump);
+            if (waveform_ == Waveform::Sine)
+            {
+                // Jump and kink, against the delayed naive sine: the slope
+                // per sample goes from 2 pi inc cos(2 pi atJump) to 2 pi inc.
+                const auto& table = MinBlepTable<T>::instance();
+                const Phase age = 1.0 - alphaSync;
+                const auto slopeJump = static_cast<T>(
+                    twoPi<Phase> * slaveInc_ * (1.0 - std::cos(twoPi<Phase> * atJump)));
+                table.addDelayedStep(corr_.data(), corrHead_, jump, static_cast<T>(age));
+                table.addDelayedRamp(corr_.data(), corrHead_, slopeJump, static_cast<T>(age));
+                resetAge_[1] = resetAge_[0];
+                prePhase_[1] = prePhase_[0];
+                resetAge_[0] = age;
+                prePhase_[0] = atJump;
+            }
+            else if (jump != T(0))
+            {
+                scheduleMinBlep(jump, 1.0 - alphaSync);
+            }
 
-            phase_ -= T(1);
-            slavePhase_ = (phase_ / std::max(phaseInc_, T(1e-12))) * slaveInc_;
+            phase_ -= 1.0;
+            slavePhase_ = (phase_ / std::max(phaseInc_, 1e-12)) * slaveInc_;
             slavePhase_ -= std::floor(slavePhase_);
         }
         return out;
@@ -577,12 +719,9 @@ private:
      *             `1 - alpha` of an event inside the just-finished interval
      *             (in [0, 1)), or an older event's age when priming the ring.
      */
-    void scheduleMinBlep(T jump, T frac) noexcept
+    void scheduleMinBlep(T jump, Phase frac) noexcept
     {
-        const auto& table = MinBlepTable<T>::instance();
-        for (int j = 0; j < kCorrLen; ++j)
-            corr_[static_cast<size_t>((corrHead_ + j) & kCorrMask)] +=
-                jump * table.residual(static_cast<T>(j) + frac);
+        MinBlepTable<T>::instance().addStep(corr_.data(), corrHead_, jump, static_cast<T>(frac));
     }
 
     /**
@@ -596,11 +735,31 @@ private:
      */
     void reseedSlave() noexcept
     {
-        const T r = slaveInc_ / std::max(phaseInc_, T(1e-12));
+        const Phase r = slaveInc_ / std::max(phaseInc_, 1e-12);
         slavePhase_ = phase_ * r;
         slavePhase_ -= std::floor(slavePhase_);
         corr_.fill(T(0));
         corrHead_ = 0;
+        resetAge_ = { kNoReset, kNoReset };
+    }
+
+    /**
+     * @brief Phase of the synced sine dcDelay() samples ago.
+     *
+     * The minimum-phase ramp correction settles only against a waveform that
+     * is that much late, so the synced sine is read on the segment the
+     * delayed instant falls in: the current one, or one of the two before it
+     * (resets are at least two samples apart: the master increment is at
+     * most 0.5).
+     */
+    [[nodiscard]] Phase delayedSinePhase() const noexcept
+    {
+        const Phase d = blepDelay_;
+        Phase ph;
+        if (resetAge_[0] >= d)      ph = slavePhase_ - slaveInc_ * d;
+        else if (resetAge_[1] >= d) ph = prePhase_[0] - slaveInc_ * (d - resetAge_[0]);
+        else                        ph = prePhase_[1] - slaveInc_ * (d - resetAge_[1]);
+        return ph - std::floor(ph);
     }
 
     /**
@@ -610,21 +769,21 @@ private:
      *            updatePhaseInc) or the two correction branches would overlap.
      * @return The polynomial correction value.
      */
-    static inline T polyBlep(T phase, T inc) noexcept
+    static inline Phase polyBlep(Phase phase, Phase inc) noexcept
     {
-        if (inc < T(1e-10)) return T(0);
+        if (inc < 1e-10) return 0.0;
 
         if (phase < inc)
         {
-            T t = phase / inc;
-            return t + t - t * t - T(1);
+            Phase t = phase / inc;
+            return t + t - t * t - 1.0;
         }
-        else if (phase > T(1) - inc)
+        else if (phase > 1.0 - inc)
         {
-            T t = (phase - T(1)) / inc;
-            return t * t + t + t + T(1);
+            Phase t = (phase - 1.0) / inc;
+            return t * t + t + t + 1.0;
         }
-        return T(0);
+        return 0.0;
     }
 
     /** @brief Centralized method to update phase increment and normalization. */
@@ -634,23 +793,23 @@ private:
         // can lower the sample rate afterwards (it re-clamps too), and the
         // T-cast Nyquist bound may round up by an ulp; polyBlep() and the
         // sync event logic both assume inc <= 0.5.
-        phaseInc_ = std::min(frequency_ / static_cast<T>(sampleRate_), T(0.5));
+        phaseInc_ = std::min(static_cast<Phase>(frequency_) / sampleRate_, 0.5);
         const bool wasOn = syncOn_;
-        syncOn_ = syncRatio_ > T(1.001) && phaseInc_ > T(0);
+        syncOn_ = syncRatio_ > T(1.001) && phaseInc_ > 0.0;
         // Clamp the slave below Nyquist like any oscillator frequency.
-        slaveInc_ = std::min(phaseInc_ * syncRatio_, T(0.5));
+        slaveInc_ = std::min(phaseInc_ * static_cast<Phase>(syncRatio_), 0.5);
 
         // DC of the hard-synced square (feeds the triangle integrator). The
         // slave always restarts in its +1 half, so its duty cycle is
         // asymmetric by construction: for an effective ratio r with
         // fractional part f, the +1 time per master cycle exceeds the -1
         // time by min(f, 0.5) - max(f - 0.5, 0) slave cycles.
-        syncSquareDc_ = T(0);
-        if (syncOn_ && phaseInc_ > T(0))
+        syncSquareDc_ = 0.0;
+        if (syncOn_ && phaseInc_ > 0.0)
         {
-            const T r = slaveInc_ / phaseInc_;   // effective (clamped) ratio
-            const T f = r - std::floor(r);
-            syncSquareDc_ = (std::min(f, T(0.5)) - std::max(f - T(0.5), T(0))) / r;
+            const Phase r = slaveInc_ / phaseInc_;   // effective (clamped) ratio
+            const Phase f = r - std::floor(r);
+            syncSquareDc_ = (std::min(f, 0.5) - std::max(f - 0.5, 0.0)) / r;
         }
 
         // Sync just (re-)engaged: the ring may hold corrections from a
@@ -658,7 +817,12 @@ private:
         if (syncOn_ && !wasOn)
             reseedSlave();
 
-        updateTriNorm();
+        // Only the Triangle reads the normalization, and its std::pow would
+        // otherwise run on every frequency change of every waveform: a voice
+        // modulating its pitch per sample calls setFrequency() per sample.
+        // setWaveform() and seedTriangle() refresh it when it is next needed,
+        // from the same pure function of the increment.
+        if (waveform_ == Waveform::Triangle) updateTriNorm();
     }
 
     /**
@@ -667,24 +831,40 @@ private:
     void updateTriNorm() noexcept
     {
         // Under hard sync the integrator runs at the slave rate.
-        const T inc = syncOn_ ? slaveInc_ : phaseInc_;
+        const Phase inc = syncOn_ ? slaveInc_ : phaseInc_;
         if (inc == triNormInc_)
-            return;   // unchanged increment: skip the std::pow below. Chorus
-                      // and Phaser call setFrequency() every block, and FM
-                      // callers may call it every sample.
+            return;   // unchanged increment
         triNormInc_ = inc;
-        if (inc > T(0) && inc < T(1))
+        if (inc > 0.0 && inc < 1.0)
         {
             // Steady-state peak of the leaky integrator driven by a +-1 square:
             // over a half period of n samples starting at -p, the state reaches
             // p = q*(-p) + (1 - q) with q = leak^n, so p = (1 - q) / (1 + q).
             // (Using just 1 - q under-normalised the triangle by ~4 dB.)
-            T leakCoeff = T(1) - inc;
-            T halfPeriodSamples = T(0.5) / inc;
-            T q = std::pow(leakCoeff, halfPeriodSamples);
-            T expectedPeak = (T(1) - q) / (T(1) + q);
-            triExpectedPeak_ = expectedPeak;
-            triNorm_ = (expectedPeak > T(0.001)) ? T(1) / expectedPeak : T(4);
+            //
+            // A pitch modulated every sample (vibrato, glide, a synthesizer
+            // voice) moves the increment every sample, and the exact form
+            // costs a std::pow each time. Within 0.1% of the increment the
+            // peak was last solved at, the first-order expansion around that
+            // anchor is used instead: its error is about 1e-7 of the peak.
+            Phase expectedPeak;
+            if (std::abs(inc - triAnchorInc_) <= 1e-3 * triAnchorInc_)
+            {
+                expectedPeak = triAnchorPeak_ + triAnchorSlope_ * (inc - triAnchorInc_);
+            }
+            else
+            {
+                const Phase lnQ = 0.5 * std::log1p(-inc) / inc;
+                const Phase q = std::exp(lnQ);
+                expectedPeak = (1.0 - q) / (1.0 + q);
+                // dp/dinc = dp/dq * q * dlnQ/dinc
+                const Phase dLnQ = 0.5 * (-inc / (1.0 - inc) - std::log1p(-inc)) / (inc * inc);
+                triAnchorInc_ = inc;
+                triAnchorPeak_ = expectedPeak;
+                triAnchorSlope_ = -2.0 / ((1.0 + q) * (1.0 + q)) * q * dLnQ;
+            }
+            triExpectedPeak_ = static_cast<T>(expectedPeak);
+            triNorm_ = (expectedPeak > 0.001) ? static_cast<T>(1.0 / expectedPeak) : T(4);
         }
         else
         {
@@ -695,15 +875,18 @@ private:
 
     double   sampleRate_ = 48000.0;
     T        frequency_  = T(440);
-    T        phase_      = T(0);
-    T        phaseInc_   = T(0);
+    Phase    phase_      = 0.0;
+    Phase    phaseInc_   = 0.0;
     double   triState_   = 0.0;      ///< Leaky-integrator state (double: recursive state rule).
     T        triNorm_    = T(4);
     T        triExpectedPeak_ = T(0.25); ///< Steady-state integrator peak (reset seed).
-    T        triNormInc_ = T(-1);    ///< Increment the tri norm was computed for (cache key).
+    Phase    triNormInc_ = -1.0;     ///< Increment the tri norm was computed for (cache key).
+    Phase    triAnchorInc_ = -1.0;   ///< Increment the peak was last solved exactly at.
+    Phase    triAnchorPeak_ = 0.25;  ///< That exact peak.
+    Phase    triAnchorSlope_ = 0.0;  ///< Its derivative with respect to the increment.
     Waveform waveform_   = Waveform::Sine;
     AntiAliasing antiAliasing_ = AntiAliasing::MinBLEP;
-    T        blepDelay_  = T(0);         ///< MinBlepTable::dcDelay(), cached by prepare().
+    Phase    blepDelay_  = 0.0;          ///< MinBlepTable::dcDelay(), cached by prepare().
 
     // Hard sync (slave) and minBLEP correction state.
     static constexpr int kCorrLen  = MinBlepTable<T>::kTaps;
@@ -712,9 +895,14 @@ private:
 
     bool     syncOn_     = false;
     T        syncRatio_  = T(0);
-    T        slavePhase_ = T(0);
-    T        slaveInc_   = T(0);
-    T        syncSquareDc_ = T(0);     ///< Analytic duty-cycle DC of the synced square.
+    Phase    slavePhase_ = 0.0;
+    Phase    slaveInc_   = 0.0;
+    Phase    syncSquareDc_ = 0.0;      ///< Analytic duty-cycle DC of the synced square.
+    static constexpr Phase kNoReset = 1e9;
+    std::array<Phase, 2> resetAge_{ kNoReset, kNoReset }; ///< Synced sine: samples since the last two resets.
+    std::array<Phase, 2> prePhase_{};  ///< Synced sine: slave phase just before those resets.
+    T        pulseWidth_ = T(0.5);     ///< Square duty cycle (setPulseWidth()).
+    T        pulseDc_    = T(0);       ///< 2 * pulseWidth_ - 1, removed from the Square.
     std::array<T, kCorrLen> corr_{};   ///< Pending causal minBLEP corrections.
     int      corrHead_   = 0;          ///< Ring slot of the next output sample.
 };

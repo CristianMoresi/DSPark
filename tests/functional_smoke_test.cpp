@@ -369,6 +369,40 @@ int testAll()
         ++failed;
     }
 
+    // Synthesizer: a four-note chord on each engine at its defaults, one
+    // second, finite and bounded.
+    for (int engine = 0; engine < 3; ++engine)
+    {
+        Synthesizer<float> synth;
+        synth.setParameter(Synthesizer<float>::Param::Engine, static_cast<float>(engine));
+        synth.prepare(spec, 8);
+        AudioBuffer<float> out;
+        out.resize(kChannels, kBlockSize);
+        float peak = 0.0f;
+        bool finite = true;
+        for (int b = 0; b < kSampleRate / kBlockSize; ++b)
+        {
+            if (b == 0)
+                for (int key : { 48, 55, 60, 64 }) synth.noteOn(key, 0.8f, 0);
+            synth.processBlock(out.toView());
+            auto view = out.toView();
+            for (int c = 0; c < kChannels; ++c)
+                for (int i = 0; i < kBlockSize; ++i)
+                {
+                    finite = finite && std::isfinite(view.getChannel(c)[i]);
+                    peak = std::max(peak, std::abs(view.getChannel(c)[i]));
+                }
+        }
+        const char* names[] = { "Synth analog", "Synth FM", "Synth wavetable" };
+        if (!finite || peak > 4.0f || peak < 0.01f)
+        {
+            std::printf("FAIL %-18s peak %.3f finite %d\n", names[engine], peak, finite ? 1 : 0);
+            ++failed;
+        }
+        else
+            std::printf("OK   %-18s (chord, peak %.3f)\n", names[engine], peak);
+    }
+
 #ifndef DSPARK_NO_FILE_IO
     // File codecs are exercised without a device. This smoke only pins their
     // public lifecycle; byte-exact corpora live in TestIO.

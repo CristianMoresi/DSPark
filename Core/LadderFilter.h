@@ -21,13 +21,16 @@
  * per-sample callers are expected to guard their own callback (framework
  * convention) - resonant tails decay through the denormal range otherwise.
  *
- * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h.
+ * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h,
+ * detail/LadderZdf.h (the per-sample arithmetic, shared with owners that
+ * modulate the cutoff every sample).
  */
 
 #include "DspMath.h"
 #include "AudioSpec.h"
 #include "AudioBuffer.h"
 #include "DenormalGuard.h"
+#include "detail/LadderZdf.h"
 
 #include <algorithm>
 #include <array>
@@ -277,23 +280,12 @@ private:
     }
 
     /** @brief g/res-derived coefficients, constant for the whole block. */
-    struct BlockCoeffs
-    {
-        T G, G2, G3, G4, ig, k, invFbDen;
-    };
+    using BlockCoeffs = detail::LadderCoeffs<T>;
 
     /** @brief Derives the block-constant coefficients from g and resonance. */
     [[nodiscard]] static BlockCoeffs makeBlockCoeffs(T g, T res) noexcept
     {
-        BlockCoeffs c;
-        c.G   = g / (T(1) + g);
-        c.G2  = c.G * c.G;
-        c.G3  = c.G2 * c.G;
-        c.G4  = c.G3 * c.G;
-        c.ig  = T(1) / (T(1) + g);
-        c.k   = res * T(4);                         // k = 4 -> self-oscillation
-        c.invFbDen = T(1) / (T(1) + c.k * c.G4);    // zero-delay loop denominator
-        return c;
+        return detail::makeLadderCoeffs(g, res);
     }
 
     /** @brief Per-mode block loop; the mode template kills per-sample branching. */
@@ -316,8 +308,23 @@ private:
         }
     }
 
+    /** @brief The tap mix of a mode, for the shared ladder step. */
+    [[nodiscard]] static constexpr detail::LadderTap tapOf(Mode mode) noexcept
+    {
+        switch (mode)
+        {
+            case Mode::LP6:  return detail::LadderTap::LP6;
+            case Mode::LP12: return detail::LadderTap::LP12;
+            case Mode::LP18: return detail::LadderTap::LP18;
+            case Mode::LP24: return detail::LadderTap::LP24;
+            case Mode::BP12: return detail::LadderTap::BP12;
+            case Mode::HP24: return detail::LadderTap::HP24;
+        }
+        return detail::LadderTap::LP24;
+    }
+
     /**
-     * @brief Core sample-processing DSP algorithm.
+     * @brief Core sample-processing DSP algorithm (detail::ladderStep()).
      *
      * The mode template parameter lets the compiler inline the tap mix and
      * remove every branch from the audio processing loop.
@@ -325,50 +332,7 @@ private:
     template <Mode FilterMode>
     [[nodiscard]] T processSampleInternal(T input, ChannelState& s, const BlockCoeffs& c, T drive) noexcept
     {
-        // Estimate the LP24 output from the integrator states (zero-delay logic)
-        const T Sest = c.G3 * c.ig * s.z[0]
-                     + c.G2 * c.ig * s.z[1]
-                     + c.G  * c.ig * s.z[2]
-                     +        c.ig * s.z[3];
-
-        // Saturate the estimated feedback (cheap ZDF nonlinearity: the state
-        // contribution is shaped, the direct G4*u term stays linear).
-        // fastTanh clamps its input, so the saturated loop stays bounded.
-        T fbSignal = Sest;
-        if (drive > T(1))
-            fbSignal = fastTanh(fbSignal * drive) / drive;
-
-        // Resolve zero-delay loop (denominator precomputed once per block)
-        const T u = (input - c.k * fbSignal) * c.invFbDen;
-
-        // Four cascaded TPT one-pole stages. Tap outputs carry no state
-        // between samples, so they stay in registers ({} avoids a spurious
-        // uninitialised-variable warning; the stores are dead after unroll).
-        std::array<T, 4> y {};
-        T x = u;
-        for (int i = 0; i < 4; ++i)
-        {
-            const T v = (x - s.z[i]) * c.G;
-            y[i] = v + s.z[i];
-            s.z[i] = y[i] + v;
-            x = y[i];
-        }
-
-        // Output tap mix (resolved at compile time per mode instantiation)
-        if constexpr (FilterMode == Mode::LP6)       return y[0];
-        else if constexpr (FilterMode == Mode::LP12) return y[1];
-        else if constexpr (FilterMode == Mode::LP18) return y[2];
-        else if constexpr (FilterMode == Mode::LP24) return y[3];
-        else if constexpr (FilterMode == Mode::BP12) return y[0] - y[2];
-        else
-        {
-            // HP24: apply the binomial (1-L)^4 to `u` (the ladder's true input,
-            // post feedback), NOT to `input`. With resonance, input = u*(1+k) at
-            // DC, so the input-based form leaked DC with gain k/(1+k) - e.g. 67%
-            // of the DC passed straight through a "high-pass" at resonance 0.5.
-            // With u the DC gain is exactly 0 and the resonant peak is preserved.
-            return u - T(4)*y[0] + T(6)*y[1] - T(4)*y[2] + y[3];
-        }
+        return detail::ladderStep<tapOf(FilterMode)>(input, s.z, c, drive);
     }
 };
 

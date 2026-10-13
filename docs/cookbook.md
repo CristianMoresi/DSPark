@@ -824,3 +824,69 @@ For complete-source jobs, `OfflineStereoGenerator` handles alignment, bounded
 reads, exact exclusions, peak measurement and transactional output. Its optional
 host-owned delta cache avoids regenerating bands/color for each width change.
 See [offline stereo generation](offline-processing.md).
+
+## 20. Polyphonic synthesizer (analog, FM, wavetable, samples)
+
+`Synthesizer` is a complete instrument: notes in, stereo out. Parameters are a
+flat table (`Synthesizer<T>::Param`, ids such as `filter.cutoff` for state and
+automation); set them from any thread, they apply at the next block. Events
+take a sample offset into the next block, so MIDI timing is exact.
+
+```cpp
+using Synth = Synthesizer<float>;
+using P = Synth::Param;
+Synth synth;
+synth.prepare(spec, 16);                        // 16 voices
+
+// A classic polysynth brass: two detuned saws, ladder, slow attack.
+synth.setParameter(P::Osc2Level, 0.8f);
+synth.setParameter(P::Osc2Fine, 9.0f);          // cents
+synth.setParameter(P::FilterCutoff, 700.0f);
+synth.setParameter(P::FilterEnvAmount, 3.0f);   // octaves of envelope 2
+synth.setParameter(P::Env2Attack, 120.0f);
+synth.setParameter(P::Env2Decay, 900.0f);
+synth.setParameter(P::Env2Sustain, 0.4f);
+synth.setParameter(P::Env1Attack, 60.0f);
+// Vibrato from LFO 1, opened by the mod wheel: 0.3 semitone.
+synth.setParameter(P::Mod1Source, float(Synth::ModSource::Lfo1));
+synth.setParameter(P::Mod1Via, float(Synth::ModSource::ModWheel));
+synth.setParameter(P::Mod1Destination, float(Synth::ModDest::Pitch));
+synth.setParameter(P::Mod1Amount, 0.3f);
+
+// Audio thread, per block:
+synth.noteOn(60, 0.8f, offsetInBlock);
+synth.setController(1, wheel, offsetInBlock);   // MIDI CC 1
+synth.processBlock(output);                     // overwrites the block
+```
+
+Other engines and sources:
+
+- **FM** (`engine` 1): four operators; `fm.algorithm` picks one of the eight
+  classic routings, `opN.ratio`, `opN.level` (modulation index up to 4 pi
+  radians), `opN.attack` .. `opN.release` and `fm.feedback`. A bright FM patch
+  aliases at 1x above a few hundred hertz: set `quality.oversampling` to 4x
+  (measured -24 dB at 1x, -142 dB at 4x for an 880 Hz cascade with feedback).
+- **Wavetable** (`engine` 2): `wt1.bank` (Basic, Harmonic, Formant, FM or the
+  User bank from `loadUserWavetable()`), `wt1.position` morphs across frames.
+- **Samples**, in every engine: load zones, then raise `sample.level`.
+
+```cpp
+// A recorded bass note at C2, played through the synth's filter and envelopes.
+synth.loadSample(bassRecording, 48000.0, 36);   // control thread
+synth.setParameter(P::Osc1Level, 0.0f);         // the sample alone
+synth.setParameter(P::SampleLevel, 1.0f);
+synth.setParameter(P::FilterCutoff, 400.0f);
+synth.setParameter(P::FilterEnvAmount, 2.5f);
+```
+
+For multisamples and velocity layers pass several `SampleZoneSpec` to
+`setSampleZones()`: a note plays the first zone whose key and velocity ranges
+contain it. Zones loop as in `Sampler`; `sample.keyTrack` off plays every key
+at the zone's own pitch (drum one-shots).
+
+`quality.oversampling` at 2x or 4x renders the voices at the higher rate and
+reports the delay through `getLatency()` (64 and 96 samples). It helps FM,
+the driven ladder (-88 dB at 1x, -166 dB at 2x for a 1.76 kHz saw with drive
+4 and resonance 0.9) and the hard-synced sine at high pitch; the linear
+oscillators are cleanest at 1x. Renders are deterministic: the same events,
+parameters and `voice.seed` give the same samples whatever the block size.

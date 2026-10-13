@@ -1,5 +1,5 @@
 // DSPark Tests -- Core Generators
-// Oscillator, Phasor, WavetableOscillator, EnvelopeGenerator, AnalogRandom
+// Oscillator, Phasor, WavetableOscillator, WavetableBank, EnvelopeGenerator, AnalogRandom
 
 #include "dspark_test.h"
 #include "TestSignals.h"
@@ -7,6 +7,7 @@
 #include "../Core/Oscillator.h"
 #include "../Core/Phasor.h"
 #include "../Core/WavetableOscillator.h"
+#include "../Core/WavetableBank.h"
 #include "../Core/EnvelopeGenerator.h"
 #include "../Core/Sampler.h"
 #include "../Core/AnalogRandom.h"
@@ -1221,16 +1222,20 @@ DSPARK_TEST(MinBlepTable_residual_shape)
     EXPECT_NEAR(tab.residual(0.0f), -1.0f, 1e-2f);
 
     // Settles to exactly zero at the end (pinned during construction) and
-    // beyond the table the step is considered settled.
-    EXPECT_NEAR(tab.residual(63.999f), 0.0f, 1e-6f);
-    EXPECT_EQ(tab.residual(64.0f), 0.0f);
+    // beyond the table the step is considered settled; before the event
+    // there is nothing to correct.
+    constexpr auto taps = static_cast<float>(MinBlepTable<float>::kTaps);
+    EXPECT_NEAR(tab.residual(taps - 0.001f), 0.0f, 1e-6f);
+    EXPECT_EQ(tab.residual(taps), 0.0f);
     EXPECT_EQ(tab.residual(1000.0f), 0.0f);
+    EXPECT_EQ(tab.residual(-0.5f), 0.0f);
 
-    // Tail decay: the last quarter of the kernel is residual ripple only.
+    // Tail decay: the last quarter of the kernel is residual ripple only
+    // (measured 1.1e-5 for the 128-tap Kaiser kernel).
     float tailMax = 0.0f;
-    for (float t = 48.0f; t < 64.0f; t += 1.0f / 64.0f)
+    for (float t = 0.75f * taps; t < taps; t += 1.0f / 64.0f)
         tailMax = std::max(tailMax, std::abs(tab.residual(t)));
-    EXPECT_LT(tailMax, 1e-4f);
+    EXPECT_LT(tailMax, 3e-5f);
 }
 
 // The float and double tables must agree to float precision everywhere:
@@ -1367,23 +1372,25 @@ DSPARK_TEST(Oscillator_sync_reengage_is_clean)
     // incoherent slave phase. After a sync -> off -> sync round trip the
     // stream must equal a freshly-phased oscillator with identical
     // parameters: both are pure functions of (master phase, increments)
-    // once the slave is re-seeded and the ring is clean.
-    Oscillator<float> a;
+    // once the slave is re-seeded and the ring is clean. The phase runs in
+    // double whatever T and getPhase() returns T, so the double oscillator
+    // is the one whose phase round-trips exactly through the getter.
+    Oscillator<double> a;
     a.prepare(48000.0);
-    a.setWaveform(Oscillator<float>::Waveform::Saw);
-    a.setFrequency(440.0f);
-    a.setSyncRatio(2.7f);
+    a.setWaveform(Oscillator<double>::Waveform::Saw);
+    a.setFrequency(440.0);
+    a.setSyncRatio(2.7);
     a.reset();
     for (int i = 0; i < 1000; ++i) (void) a.getNextSample();  // dirty the ring
-    a.setSyncRatio(0.0f);                                     // sync off
+    a.setSyncRatio(0.0);                                      // sync off
     for (int i = 0; i < 37; ++i) (void) a.getNextSample();    // free-run a bit
-    a.setSyncRatio(2.7f);                                     // re-engage
+    a.setSyncRatio(2.7);                                      // re-engage
 
-    Oscillator<float> b;
+    Oscillator<double> b;
     b.prepare(48000.0);
-    b.setWaveform(Oscillator<float>::Waveform::Saw);
-    b.setFrequency(440.0f);
-    b.setSyncRatio(2.7f);
+    b.setWaveform(Oscillator<double>::Waveform::Saw);
+    b.setFrequency(440.0);
+    b.setSyncRatio(2.7);
     b.setPhase(a.getPhase());   // same master phase -> same slave state
 
     int mismatches = 0;
@@ -1839,6 +1846,26 @@ DSPARK_TEST(Sampler_zones_select_by_key_and_velocity_and_layer)
     double e = 0.0;
     for (const double v : outside) e += v * v;
     EXPECT_EQ(e, 0.0);
+
+    // A centred mono zone is exactly mono, and opposite pans mirror exactly.
+    auto stereo = [&](double pan) -> std::array<std::vector<double>, 2> {
+        Smp::ZoneSpec z = zs[0];
+        z.pan = pan;
+        Smp s;
+        s.prepare(AudioSpec{ kSmpFs, 512, 2 }, 2);
+        loaded = loaded && s.setZones(std::span<const Smp::ZoneSpec>(&z, 1));
+        std::array<std::vector<double>, 2> lr { std::vector<double>(512), std::vector<double>(512) };
+        double* ch[2] = { lr[0].data(), lr[1].data() };
+        s.noteOn(60, 0.25, 0);
+        s.processBlock(AudioBufferView<double>(ch, 2, 512));
+        return lr;
+    };
+    const auto centre = stereo(0.0), right = stereo(0.3), left = stereo(-0.3);
+    EXPECT_TRUE(loaded);
+    EXPECT_GT(std::abs(centre[0][300]), 0.01);
+    EXPECT_TRUE(centre[0] == centre[1]);
+    EXPECT_TRUE(right[0] == left[1] && right[1] == left[0]);
+    EXPECT_FALSE(right[0] == right[1]);
 }
 
 // Events land on the sample they name, and the output does not depend on how
@@ -1986,4 +2013,474 @@ DSPARK_TEST(Sampler_replaces_zones_while_playing)
     EXPECT_FALSE(s.setZones(std::span<const Smp::ZoneSpec>()) == false);
     Smp::ZoneSpec bad;
     EXPECT_FALSE(s.setZones(std::span<const Smp::ZoneSpec>(&bad, 1)));   // no audio
+}
+
+// ============================================================================
+// Band-limited generators: measured alias floors
+// ============================================================================
+//
+// Pitches sit on an exact FFT bin (multiples of fs / 2^17), so every harmonic
+// is a single bin and the Blackman-Harris window's own leakage stays out of
+// the measurement: the floor read is the generator's, down to about -165 dB.
+
+namespace {
+
+constexpr size_t kFloorFft = 1 << 17;
+
+/** Nearest pitch to `hz` that falls on an exact bin at `fs`. */
+double binPitch(double hz, double fs)
+{
+    const double bin = fs / static_cast<double>(kFloorFft);
+    return std::round(hz / bin) * bin;
+}
+
+/** Worst inharmonic component below min(20 kHz, fs/2) relative to the
+ *  strongest harmonic, in dB, after a 4096-sample warm-up. */
+template <typename Gen>
+double inharmonicFloorDb(Gen&& gen, double f0, double fs, double guardHz = 0.0)
+{
+    std::vector<double> win(kFloorFft), t(kFloorFft), f(kFloorFft + 2);
+    WindowFunctions<double>::blackmanHarris(win.data(), static_cast<int>(kFloorFft), false);
+    for (int i = 0; i < 4096; ++i) (void)gen();
+    for (size_t i = 0; i < kFloorFft; ++i) t[i] = static_cast<double>(gen()) * win[i];
+    FFTReal<double> fft(kFloorFft);
+    fft.forward(t.data(), f.data());
+    const double bin = fs / static_cast<double>(kFloorFft);
+    const double guard = std::max(guardHz, 8.0 * bin);
+    double top = 0.0, worst = 0.0;
+    for (size_t k = 16; k <= static_cast<size_t>(std::min(20000.0, 0.5 * fs) / bin); ++k)
+    {
+        const double p = f[2 * k] * f[2 * k] + f[2 * k + 1] * f[2 * k + 1];
+        const double h = static_cast<double>(k) * bin / f0;
+        if (std::abs(h - std::round(h)) * f0 <= guard) top = std::max(top, p);
+        else worst = std::max(worst, p);
+    }
+    return 10.0 * std::log10((worst + 1e-300) / (top + 1e-300));
+}
+
+double oscillatorFloorDb(Oscillator<double>::Waveform wf, double hz, double fs,
+                         double width = 0.5, double syncRatio = 0.0)
+{
+    const double f0 = binPitch(hz, fs);
+    Oscillator<double> osc;
+    osc.prepare(fs);
+    osc.setWaveform(wf);
+    osc.setPulseWidth(width);
+    osc.setFrequency(f0);
+    osc.setSyncRatio(syncRatio);
+    osc.reset();
+    return inharmonicFloorDb([&] { return osc.getNextSample(); }, f0, fs);
+}
+
+} // namespace
+
+DSPARK_TEST(Oscillator_minblep_floor_at_both_common_rates)
+{
+    // The 128-tap Kaiser kernel ends its transition near 23.4 kHz at 44.1 kHz,
+    // below fs - 20 kHz, and 2048 sub-sample rows keep the interpolation
+    // error under it. The previous 64-tap Blackman-Harris table with 64
+    // positions measured -89 dB (14 kHz / 44.1 kHz) and -94 dB (9 kHz /
+    // 48 kHz) on this metric; this one -143 to -166 dB.
+    using WF = Oscillator<double>::Waveform;
+    double worst = -400.0;
+    for (double fs : { 44100.0, 48000.0 })
+        for (double hz : { 110.0, 440.0, 1000.0, 2500.0, 5000.0, 9000.0, 14000.0 })
+        {
+            worst = std::max(worst, oscillatorFloorDb(WF::Saw, hz, fs));
+            if (hz <= 9000.0)
+                worst = std::max(worst, oscillatorFloorDb(WF::Square, hz, fs, 0.25));
+        }
+    std::cout << "  worst saw/pulse floor " << worst << " dB\n";
+    EXPECT_LT(worst, -135.0);
+}
+
+DSPARK_TEST(Oscillator_hard_sync_floor_saw_square_triangle)
+{
+    using WF = Oscillator<double>::Waveform;
+    double worst = -400.0;
+    for (auto wf : { WF::Saw, WF::Square, WF::Triangle })
+        for (double hz : { 220.0, 880.0, 2500.0 })
+            for (double ratio : { 1.5, 2.7, 4.3 })
+                worst = std::max(worst, oscillatorFloorDb(wf, hz, 48000.0, 0.5, ratio));
+    std::cout << "  worst synced floor " << worst << " dB\n";
+    EXPECT_LT(worst, -130.0);
+}
+
+DSPARK_TEST(Oscillator_hard_synced_sine_corrects_jump_and_kink)
+{
+    // The synced sine changes value AND slope at every reset. With only the
+    // step corrected it measured -82 dB (220 Hz x 1.5), -58 dB (880 Hz x 1.5)
+    // and -36 dB (2.5 kHz x 4.3); the delayed-reference minBLAMP removes the
+    // kink's aliasing. What remains at high slave frequencies comes from the
+    // curvature and higher-order discontinuities, bounded here as measured.
+    using WF = Oscillator<double>::Waveform;
+    const double a = oscillatorFloorDb(WF::Sine, 220.0, 48000.0, 0.5, 1.5);
+    const double b = oscillatorFloorDb(WF::Sine, 220.0, 48000.0, 0.5, 2.7);
+    const double c = oscillatorFloorDb(WF::Sine, 880.0, 48000.0, 0.5, 1.5);
+    const double d = oscillatorFloorDb(WF::Sine, 2500.0, 48000.0, 0.5, 4.3);
+    std::cout << "  synced sine " << a << " / " << b << " / " << c << " / " << d << " dB\n";
+    EXPECT_LT(a, -150.0);
+    EXPECT_LT(b, -110.0);
+    EXPECT_LT(c, -105.0);
+    EXPECT_LT(d, -42.0);
+}
+
+DSPARK_TEST(MinBlepTable_delayed_ramp_settles_and_matches_the_integral)
+{
+    // The delayed-reference ramp correction must vanish at the kernel's end
+    // (it is truncated there) and equal the integral of the step residual
+    // plus dcDelay, plus the analytic early term t - dcDelay before dcDelay.
+    using Tab = MinBlepTable<double>;
+    const auto& tab = Tab::instance();
+    std::array<double, Tab::kTaps> ring {};
+    tab.addDelayedRamp(ring.data(), 0, 1.0, 0.0);
+    EXPECT_NEAR(ring[Tab::kTaps - 1], 0.0, 1e-7);
+    double integral = 0.0, prev = tab.residual(0.0);
+    const double dt = 1.0 / 4096.0;
+    for (int j = 0; j < 8; ++j)
+    {
+        if (j > 0)
+            for (int k = 1; k <= 4096; ++k)
+            {
+                const double r = tab.residual(static_cast<double>(j - 1) + k * dt);
+                integral += 0.5 * (prev + r) * dt;
+                prev = r;
+            }
+        const double t = static_cast<double>(j);
+        const double early = (t < tab.dcDelay()) ? t - tab.dcDelay() : 0.0;
+        EXPECT_NEAR(ring[static_cast<size_t>(j)], integral + tab.dcDelay() + early, 1e-5);
+    }
+}
+
+DSPARK_TEST(Oscillator_pulse_width_spectrum_follows_the_fourier_series)
+{
+    // A pulse of width w has harmonics |sin(pi n w)| / n. Bin-centred pitch,
+    // so each harmonic is one bin; the levels relative to the fundamental
+    // must match the series (the window gain cancels in the ratio).
+    const double fs = 48000.0, f0 = binPitch(750.0, fs);
+    for (double w : { 0.1, 0.25, 0.4 })
+    {
+        Oscillator<double> osc;
+        osc.prepare(fs);
+        osc.setWaveform(Oscillator<double>::Waveform::Square);
+        osc.setPulseWidth(w);
+        osc.setFrequency(f0);
+        osc.reset();
+        std::vector<double> win(kFloorFft), t(kFloorFft), f(kFloorFft + 2);
+        WindowFunctions<double>::blackmanHarris(win.data(), static_cast<int>(kFloorFft), false);
+        double dc = 0.0;
+        for (size_t i = 0; i < kFloorFft; ++i)
+        {
+            const double v = osc.getNextSample();
+            dc += v;
+            t[i] = v * win[i];
+        }
+        FFTReal<double> fft(kFloorFft);
+        fft.forward(t.data(), f.data());
+        auto mag = [&](int n) {
+            const auto k = static_cast<size_t>(std::llround(n * f0 / (fs / kFloorFft)));
+            return std::hypot(f[2 * k], f[2 * k + 1]);
+        };
+        const double ref = std::abs(std::sin(pi<double> * w));
+        double worst = 0.0;
+        for (int n = 2; n <= 12; ++n)
+        {
+            const double want = std::abs(std::sin(pi<double> * n * w)) / n / ref;
+            if (want < 1e-3) continue;
+            worst = std::max(worst, std::abs(20.0 * std::log10(mag(n) / mag(1) / want)));
+        }
+        EXPECT_LT(worst, 0.01);
+        EXPECT_NEAR(dc / static_cast<double>(kFloorFft), 0.0, 1e-4);   // AC-coupled
+    }
+}
+
+DSPARK_TEST(Oscillator_pulse_width_alias_floor)
+{
+    using WF = Oscillator<double>::Waveform;
+    double worst = -400.0;
+    for (double w : { 0.1, 0.25, 0.75, 0.9 })
+        for (double hz : { 750.0, 3000.0, 9000.0 })
+            worst = std::max(worst, oscillatorFloorDb(WF::Square, hz, 48000.0, w));
+    const double synced = oscillatorFloorDb(WF::Square, 880.0, 48000.0, 0.2, 2.7);
+    std::cout << "  worst pulse floor " << worst << " dB, synced pulse " << synced << " dB\n";
+    EXPECT_LT(worst, -125.0);
+    EXPECT_LT(synced, -125.0);
+}
+
+DSPARK_TEST(Oscillator_narrow_pulse_with_both_edges_in_one_interval_is_bounded)
+{
+    // At 12 kHz a 2% pulse puts its rising and falling edges inside one
+    // sample interval: both are corrected, the output stays finite and small.
+    for (double w : { 0.02, 0.98 })
+    {
+        Oscillator<double> osc;
+        osc.prepare(48000.0);
+        osc.setWaveform(Oscillator<double>::Waveform::Square);
+        osc.setPulseWidth(w);
+        osc.setFrequency(12000.0);
+        osc.reset();
+        double peak = 0.0;
+        bool finite = true;
+        for (int i = 0; i < 48000; ++i)
+        {
+            const double v = osc.getNextSample();
+            finite = finite && std::isfinite(v);
+            peak = std::max(peak, std::abs(v));
+        }
+        EXPECT_TRUE(finite);
+        EXPECT_LT(peak, 0.2);
+    }
+}
+
+DSPARK_TEST(Oscillator_pulse_width_modulated_every_sample_stays_band_limited)
+{
+    // A width change that moves the falling edge across the current phase is
+    // itself a band-limited edge: a 3 Hz, +-0.2 PWM at 2.95 kHz keeps its
+    // inharmonic floor (outside the modulation sidebands) low.
+    const double fs = 48000.0, f0 = binPitch(2950.0, fs);
+    Oscillator<double> osc;
+    osc.prepare(fs);
+    osc.setWaveform(Oscillator<double>::Waveform::Square);
+    osc.setFrequency(f0);
+    osc.reset();
+    long n = 0;
+    const double floorDb = inharmonicFloorDb([&] {
+        osc.setPulseWidth(0.5 + 0.2 * std::sin(2.0 * pi<double> * 3.0 * static_cast<double>(n++) / fs));
+        return osc.getNextSample();
+    }, f0, fs, 120.0);
+    std::cout << "  modulated pulse floor " << floorDb << " dB\n";
+    EXPECT_LT(floorDb, -95.0);
+}
+
+DSPARK_TEST(Oscillator_float_phase_keeps_slow_rates_exact)
+{
+    // The phase runs in double whatever T: a float accumulator rounds every
+    // step to the ulp of the phase, which detunes slow LFO rates. Count the
+    // cycles of a 0.37 Hz float saw over 200 s through its wraps.
+    Oscillator<float> osc;
+    osc.prepare(48000.0);
+    osc.setWaveform(Oscillator<float>::Waveform::Saw);
+    osc.setAntiAliasing(Oscillator<float>::AntiAliasing::PolyBLEP);
+    osc.setFrequency(0.37f);
+    osc.reset();
+    int wraps = 0;
+    float prev = osc.getNextSample();
+    long firstWrap = -1, lastWrap = -1;
+    for (long i = 1; i < 48000L * 200; ++i)
+    {
+        const float v = osc.getNextSample();
+        if (v < prev - 1.0f)
+        {
+            if (firstWrap < 0) firstWrap = i;
+            lastWrap = i;
+            ++wraps;
+        }
+        prev = v;
+    }
+    const double period = static_cast<double>(lastWrap - firstWrap) / (wraps - 1);
+    const double expected = 48000.0 / static_cast<double>(0.37f);
+    std::cout << "  0.37 Hz float saw period error " << (period / expected - 1.0) << "\n";
+    EXPECT_NEAR(period / expected, 1.0, 2e-6);
+}
+
+// ============================================================================
+// WavetableBank
+// ============================================================================
+
+DSPARK_TEST(WavetableBank_builtins_have_their_frames)
+{
+    using B = WavetableBank;
+    EXPECT_EQ(B::builtin(B::Builtin::Basic).getNumFrames(), 6);
+    EXPECT_EQ(B::builtin(B::Builtin::Harmonic).getNumFrames(), 8);
+    EXPECT_EQ(B::builtin(B::Builtin::Formant).getNumFrames(), 9);
+    EXPECT_EQ(B::builtin(B::Builtin::Fm).getNumFrames(), 8);
+    EXPECT_EQ(B::builtin(B::Builtin::Basic).getNumHarmonics(), B::kMaxHarmonics);
+    // 57344 table samples plus guards per frame, in float.
+    EXPECT_LT(B::builtin(B::Builtin::Basic).getMemoryBytes(), 6u * 230000u);
+}
+
+DSPARK_TEST(WavetableBank_floor_holds_from_lowest_to_highest_pitch)
+{
+    // The 4-point Hermite reader over 2048-sample levels measured -72 dB at
+    // 27.5 Hz (1/h spectrum) and -74 dB with every harmonic at full scale:
+    // its interpolation images, not the mip levels, set that floor. The
+    // optimal 6-point interpolator over levels with four samples per period
+    // of their top harmonic measures -151 dB or better for the flat spectrum
+    // and about -165 dB (float storage) for 1/h.
+    WavetableBank flat;
+    EXPECT_TRUE(flat.buildFromHarmonics(1, WavetableBank::kMaxHarmonics, [](int, int) {
+        return WavetableBank::Harmonic { 0.0, 1.0 };
+    }));
+    const auto& basic = WavetableBank::builtin(WavetableBank::Builtin::Basic);
+    double worstSaw = -400.0, worstFlat = -400.0;
+    for (double hz : { 27.5, 110.0, 440.0, 2500.0, 9000.0 })
+    {
+        const double fs = 48000.0, f0 = binPitch(hz, fs);
+        for (int c = 0; c < 2; ++c)
+        {
+            const WavetableBank& bank = (c == 0) ? basic : flat;
+            const auto mip = bank.selectMip(f0, fs);
+            const double pos = (c == 0) ? 2.0 : 0.0;   // Basic frame 2 is the saw
+            double ph = 0.0;
+            const double db = inharmonicFloorDb([&] {
+                const double v = bank.read<double>(ph, pos, mip);
+                ph += f0 / fs;
+                if (ph >= 1.0) ph -= 1.0;
+                return v;
+            }, f0, fs);
+            (c == 0 ? worstSaw : worstFlat) = std::max(c == 0 ? worstSaw : worstFlat, db);
+        }
+    }
+    std::cout << "  worst floor: saw " << worstSaw << " dB, flat spectrum " << worstFlat << " dB\n";
+    EXPECT_LT(worstSaw, -150.0);
+    EXPECT_LT(worstFlat, -140.0);
+}
+
+DSPARK_TEST(WavetableBank_pre_emphasis_restores_exact_harmonic_levels)
+{
+    // The interpolator droops up to 0.4 dB at the top of a level's band; the
+    // build divides each harmonic by the interpolator's response there, so
+    // the played saw keeps 1/h exactly on the harmonics both levels share.
+    const auto& basic = WavetableBank::builtin(WavetableBank::Builtin::Basic);
+    EXPECT_NEAR(WavetableBank::interpolatorResponse(0.0), 1.0, 1e-8);
+    EXPECT_LT(WavetableBank::interpolatorResponse(0.125), 0.999);   // the droop is real
+    const double fs = 48000.0, f0 = binPitch(55.0, fs);
+    const auto mip = basic.selectMip(f0, fs);
+    std::vector<double> win(kFloorFft), t(kFloorFft), f(kFloorFft + 2);
+    WindowFunctions<double>::blackmanHarris(win.data(), static_cast<int>(kFloorFft), false);
+    double ph = 0.0;
+    for (size_t i = 0; i < kFloorFft; ++i)
+    {
+        t[i] = basic.read<double>(ph, 2.0, mip) * win[i];
+        ph += f0 / fs;
+        if (ph >= 1.0) ph -= 1.0;
+    }
+    FFTReal<double> fft(kFloorFft);
+    fft.forward(t.data(), f.data());
+    auto mag = [&](int n) {
+        const auto k = static_cast<size_t>(std::llround(n * f0 / (fs / kFloorFft)));
+        return std::hypot(f[2 * k], f[2 * k + 1]);
+    };
+    // At 55 Hz the pair is the 362- and 256-harmonic levels: harmonics above
+    // 256 fade with the crossfade by design, those below are in both levels
+    // (the 256-harmonic one at the 0.125 cycles/sample band edge).
+    double worst = 0.0;
+    for (int n = 2; n <= 256; ++n)
+        worst = std::max(worst, std::abs(20.0 * std::log10(mag(n) * n / mag(1))));
+    std::cout << "  worst harmonic error " << worst << " dB\n";
+    EXPECT_LT(worst, 0.002);
+}
+
+DSPARK_TEST(WavetableBank_loadFrames_round_trips_power_of_two_and_odd_sizes)
+{
+    for (int size : { 2048, 600 })
+    {
+        std::vector<float> cycle(static_cast<size_t>(2 * size));
+        for (int i = 0; i < size; ++i)
+        {
+            const double x = 2.0 * pi<double> * i / size;
+            cycle[static_cast<size_t>(i)] = static_cast<float>(0.3 + std::sin(x) + 0.5 * std::cos(3.0 * x));
+            cycle[static_cast<size_t>(size + i)] = static_cast<float>(std::sin(2.0 * x));
+        }
+        WavetableBank bank;
+        EXPECT_TRUE(bank.loadFrames(cycle.data(), size, 2));
+        EXPECT_EQ(bank.getNumFrames(), 2);
+        EXPECT_EQ(bank.getNumHarmonics(), std::min((size - 1) / 2, WavetableBank::kMaxHarmonics));
+        // Bank normalisation keeps the frames' relative levels: frame 1 is a
+        // plain unit sine, frame 0 peaks above 1 before scaling.
+        const double fs = 48000.0, f0 = binPitch(375.0, fs);
+        const auto mip = bank.selectMip(f0, fs);
+        double ph = 0.0, peak0 = 0.0, peak1 = 0.0, mean = 0.0;
+        for (int i = 0; i < 48000; ++i)
+        {
+            const double a = bank.read<double>(ph, 0.0, mip);
+            const double b = bank.read<double>(ph, 1.0, mip);
+            peak0 = std::max(peak0, std::abs(a));
+            peak1 = std::max(peak1, std::abs(b));
+            mean += a;
+            ph += f0 / fs;
+            if (ph >= 1.0) ph -= 1.0;
+        }
+        EXPECT_NEAR(peak0, 1.0, 1e-3);
+        EXPECT_GT(peak0 / peak1, 1.2);
+        EXPECT_NEAR(mean / 48000.0, 0.0, 1e-3);   // DC discarded
+    }
+}
+
+DSPARK_TEST(WavetableBank_rejects_invalid_builds_and_keeps_the_previous_bank)
+{
+    WavetableBank bank;
+    EXPECT_FALSE(bank.loadFrames(static_cast<const float*>(nullptr), 64, 1));
+    EXPECT_EQ(bank.getNumFrames(), 0);
+    EXPECT_EQ(bank.read<float>(0.3, 0.0, {}), 0.0f);
+    std::vector<float> silent(256, 0.0f);
+    EXPECT_FALSE(bank.loadFrames(silent.data(), 256, 1));
+    std::vector<float> sine(256);
+    for (int i = 0; i < 256; ++i) sine[static_cast<size_t>(i)] = static_cast<float>(std::sin(2.0 * pi<double> * i / 256));
+    EXPECT_TRUE(bank.loadFrames(sine.data(), 256, 1));
+    EXPECT_FALSE(bank.buildFromHarmonics(1, 4, [](int, int) {
+        return WavetableBank::Harmonic { std::numeric_limits<double>::quiet_NaN(), 0.0 };
+    }));
+    EXPECT_FALSE(bank.loadFrames(sine.data(), 2, 1));
+    EXPECT_FALSE(bank.loadFrames(sine.data(), 256, 0));
+    EXPECT_EQ(bank.getNumFrames(), 1);   // the sine survived every refusal
+    // Non-finite and out-of-range reads are clamped, never out of bounds.
+    const auto mip = bank.selectMip(440.0, 48000.0);
+    EXPECT_TRUE(std::isfinite(bank.read<double>(std::numeric_limits<double>::quiet_NaN(), 5.0, mip)));
+    EXPECT_TRUE(std::isfinite(bank.read<double>(-3.25, -1.0, WavetableBank::Mip { 99, -4, 7.0f })));
+}
+
+DSPARK_TEST(WavetableBank_morph_is_continuous)
+{
+    // Sweeping the position across all six Basic frames at 220 Hz never
+    // steps further than the static saw's own largest sample step.
+    const auto& basic = WavetableBank::builtin(WavetableBank::Builtin::Basic);
+    const auto mip = basic.selectMip(220.0, 48000.0);
+    double ph = 0.0, prev = 0.0, sweepStep = 0.0, staticStep = 0.0;
+    for (int i = 0; i < 480000; ++i)
+    {
+        const double v = basic.read<double>(ph, 5.0 * i / 480000.0, mip);
+        if (i) sweepStep = std::max(sweepStep, std::abs(v - prev));
+        prev = v;
+        ph += 220.0 / 48000.0;
+        if (ph >= 1.0) ph -= 1.0;
+    }
+    ph = 0.0;
+    for (int i = 0; i < 48000; ++i)
+    {
+        const double v = basic.read<double>(ph, 2.0, mip);
+        if (i) staticStep = std::max(staticStep, std::abs(v - prev));
+        prev = v;
+        ph += 220.0 / 48000.0;
+        if (ph >= 1.0) ph -= 1.0;
+    }
+    EXPECT_LT(sweepStep, staticStep * 1.01);
+}
+
+DSPARK_TEST(WavetableOsc_low_pitch_floor_and_external_bank_morph)
+{
+    // The oscillator plays WavetableBank levels: the 27.5 Hz saw that measured
+    // -72 dB with the previous reader now sits at the float storage floor.
+    WavetableOscillator<double> wt;
+    wt.prepare(48000.0);
+    wt.buildSaw();
+    const double f0 = binPitch(27.5, 48000.0);
+    wt.setFrequency(f0);
+    wt.reset();
+    const double db = inharmonicFloorDb([&] { return wt.getSample(); }, f0, 48000.0);
+    std::cout << "  27.5 Hz saw floor " << db << " dB\n";
+    EXPECT_LT(db, -150.0);
+
+    // An external bank and a position: frame 0 of Basic is a sine.
+    wt.setBank(&WavetableBank::builtin(WavetableBank::Builtin::Basic));
+    wt.setPosition(0.0);
+    wt.setFrequency(1000.0);
+    wt.reset();
+    std::vector<double> buf(48000);
+    for (auto& v : buf) v = wt.getSample();
+    double peak = 0.0;
+    for (double v : buf) peak = std::max(peak, std::abs(v));
+    EXPECT_NEAR(peak, 1.0, 1e-3);
+    wt.setBank(nullptr);   // back to the own saw
+    EXPECT_TRUE(std::isfinite(wt.getSample()));
 }

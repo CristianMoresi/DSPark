@@ -1427,6 +1427,46 @@ DSPARK_TEST(Oversampling_impulse_roundtrip_latency_is_exact)
     }
 }
 
+// A source that renders at the high rate (a synthesizer voice bank) fills
+// getHighRateBlock() and decimates. That one-way path delays by the half-band
+// centre taps alone, halfOrder * (factor - 1) high-rate samples: generally a
+// fractional base-rate delay (31.5 samples at 2x High), not half of the
+// round trip. Measured by the quadrature phase of a 50 Hz sine, for every
+// factor and preset.
+DSPARK_TEST(Oversampling_decimation_only_delay_is_exact)
+{
+    using OS = Oversampling<double, 1>;
+    const double fs = 48000.0, f = 50.0;
+    for (int factor : { 2, 4, 8, 16 })
+        for (auto q : { OS::Quality::Low, OS::Quality::Medium, OS::Quality::High, OS::Quality::Maximum })
+        {
+            OS os(factor, q);
+            os.prepare(spec(fs, 64, 1));
+            std::vector<double> out;
+            double base[64];
+            for (int b = 0; b < 400; ++b)
+            {
+                auto hi = os.getHighRateBlock(64);
+                EXPECT_EQ(hi.getNumSamples(), 64 * factor);
+                for (int i = 0; i < hi.getNumSamples(); ++i)
+                    hi.getChannel(0)[i] = std::sin(2.0 * pi<double> * f
+                        * static_cast<double>(b * 64 * factor + i) / (fs * factor));
+                double* ch[1] = { base };
+                os.downsample(AudioBufferView<double>(ch, 1, 64));
+                out.insert(out.end(), base, base + 64);
+            }
+            double sn = 0.0, cs = 0.0;
+            for (size_t m = 4800; m < 4800 + 19200; ++m)
+            {
+                sn += out[m] * std::sin(2.0 * pi<double> * f * static_cast<double>(m) / fs);
+                cs += out[m] * std::cos(2.0 * pi<double> * f * static_cast<double>(m) / fs);
+            }
+            const double delay = std::atan2(-cs, sn) / (2.0 * pi<double> * f / fs);
+            EXPECT_NEAR(delay, os.getDecimationDelay() / static_cast<double>(factor), 1e-6);
+            EXPECT_NEAR(2.0 * std::hypot(sn, cs) / 19200.0, 1.0, 1e-5);   // unity in-band gain
+        }
+}
+
 // The Quality enum promises a stopband depth per preset (~-40/-60/-80/-100 dB).
 // Feed a tone INSIDE the decimator's stopband at the high rate (the situation a
 // nonlinear stage creates) and measure what leaks back, aliased, into the base

@@ -362,6 +362,52 @@ int main()
         }
     }
 
+    // Synthesizer: eight sustained voices with a vibrato, cost per voice and
+    // output sample.
+    std::printf("\n| Synthesizer (float, 8 voices, vibrato)  | ns / voice-sample | voices per 1%% of a core |\n");
+    std::printf("|------------------------------------------|-------------------|-------------------------|\n");
+    {
+        using S = dspark::Synthesizer<float>;
+        using P = S::Param;
+        struct SynthCase { const char* name; int engine; int unison; int oversampling; int filter; };
+        const SynthCase synthCases[] = {
+            { "Analog 2 saws + sub, ladder", 0, 1, 0, 1 },
+            { "Analog 2 saws + sub, ladder, unison 4", 0, 4, 0, 1 },
+            { "Analog 2 saws + sub, ladder, 2x", 0, 1, 1, 1 },
+            { "FM 4 operators, no filter", 1, 1, 0, 0 },
+            { "FM 4 operators, 4x", 1, 1, 2, 0 },
+            { "Wavetable 2 oscillators, SVF", 2, 1, 0, 5 },
+        };
+        for (const auto& c : synthCases)
+        {
+            S synth;
+            synth.setParameter(P::Engine, static_cast<float>(c.engine));
+            synth.setParameter(P::Unison, static_cast<float>(c.unison));
+            synth.setParameter(P::Oversampling, static_cast<float>(c.oversampling));
+            synth.setParameter(P::FilterType, static_cast<float>(c.filter));
+            synth.setParameter(P::FilterCutoff, 3000.0f);
+            synth.setParameter(P::Osc2Level, 0.5f);
+            synth.setParameter(P::Osc2Fine, 7.0f);
+            synth.setParameter(P::SubLevel, 0.3f);
+            synth.setParameter(P::Op2Level, 0.2f);
+            synth.setParameter(P::Op3Level, 0.1f);
+            synth.setParameter(P::Op4Level, 0.1f);
+            synth.setParameter(P::Wt2Level, 0.5f);
+            synth.setParameter(P::Wt1Position, 0.4f);
+            synth.setParameter(P::Mod1Source, static_cast<float>(S::ModSource::Lfo1));
+            synth.setParameter(P::Mod1Destination, static_cast<float>(S::ModDest::Pitch));
+            synth.setParameter(P::Mod1Amount, 0.2f);
+            synth.prepare(spec, 16);
+            for (int k = 0; k < 8; ++k) synth.noteOn(48 + 3 * k, 0.8f);
+            for (int b = 0; b < 8; ++b) synth.processBlock(stereo.toView());
+            const double ns = medianNsPerFrame([&] {
+                synth.processBlock(stereo.toView());
+                g_sink = g_sink + (stereo.getChannel(0)[0]);
+            }, kBlock * 8.0);
+            std::printf("| %-40s | %17.1f | %23.0f |\n", c.name, ns, 0.01e9 / (ns * kRate));
+        }
+    }
+
     std::printf("\n| FFT (float, forward + inverse) | us / pair | pairs / s |\n");
     std::printf("|--------------------------------|-----------|-----------|\n");
     for (const int size : { 1024, 4096, 8192 })

@@ -65,13 +65,19 @@
  * path); no file I/O. The shared interpolation tables (about 1 MB) are
  * built once per process, on the first prepare().
  *
- * Dependencies: DspMath.h, AudioBuffer.h, AudioSpec.h, EnvelopeGenerator.h.
+ * The zone description (SampleZone.h) and the band-limited reader
+ * (detail/SampleReader.h) are shared with Synthesizer's sample source.
+ *
+ * Dependencies: DspMath.h, AudioBuffer.h, AudioSpec.h, EnvelopeGenerator.h,
+ * SampleZone.h, detail/SampleReader.h.
  */
 
 #include "DspMath.h"
 #include "AudioBuffer.h"
 #include "AudioSpec.h"
 #include "EnvelopeGenerator.h"
+#include "SampleZone.h"
+#include "detail/SampleReader.h"
 
 #include <algorithm>
 #include <array>
@@ -104,35 +110,12 @@ template <FloatType T>
 class Sampler
 {
 public:
-    /** @brief How a zone loops. */
-    enum class LoopMode
-    {
-        None,        ///< Play once to the end of the recording.
-        Continuous,  ///< Loop for as long as the voice sounds, release included.
-        Sustain      ///< Loop while the key is held, then play on past the loop end.
-    };
+    /** @brief How a zone loops (see SampleLoopMode). */
+    using LoopMode = SampleLoopMode;
 
-    /** @brief One zone, as the caller describes it. The audio is copied. */
-    struct ZoneSpec
-    {
-        AudioBufferView<const T> audio;  ///< The recording (1 or more channels).
-        double sampleRate = 48000.0;     ///< Its sample rate.
-        int rootKey = 60;                ///< MIDI key that plays it untransposed.
-        double tuneCents = 0.0;          ///< Fine tuning added to every note.
-        int keyLow = 0;                  ///< Lowest key it answers (inclusive).
-        int keyHigh = 127;               ///< Highest key it answers (inclusive).
-        double velocityLow = 0.0;        ///< Lowest velocity it answers, 0..1 (inclusive).
-        double velocityHigh = 1.0;       ///< Highest velocity it answers, 0..1 (inclusive).
-        double gainDb = 0.0;             ///< Zone gain.
-        double pan = 0.0;                ///< -1 left .. +1 right (balance for multichannel).
-        int64_t startOffset = 0;         ///< First sample played.
-        LoopMode loopMode = LoopMode::None;
-        int64_t loopStart = 0;           ///< First sample of the loop.
-        int64_t loopEnd = 0;             ///< One past the last sample of the loop.
-        int64_t loopCrossfade = 0;       ///< Crossfade length in samples (0 = hard loop).
-        bool equalPowerCrossfade = false;///< Equal-power fade (uncorrelated material)
-                                         ///< instead of linear (phase-matched material).
-    };
+    /** @brief One zone, as the caller describes it (see SampleZoneSpec). The
+     *         audio is copied. */
+    using ZoneSpec = SampleZoneSpec<T>;
 
     Sampler() = default;
     ~Sampler()
@@ -163,10 +146,10 @@ public:
         for (auto& v : voices_)
         {
             v.env.prepare(sampleRate_);
-            for (auto& a : v.acc) a.assign(static_cast<size_t>(kAccLength), T(0));
+            v.reader.allocate();
         }
-        weights_.assign(static_cast<size_t>(2 * kMaxHalfTaps + 2), T(0));
-        (void)polyphaseTable();   // build the shared tables here, never on the audio thread
+        weights_.assign(static_cast<size_t>(Reader::kWeightsLength), T(0));
+        (void)Reader::polyphaseTable();   // build the shared tables here, never on the audio thread
         stealFadeSamples_ = std::max(1, static_cast<int>(std::lround(0.003 * sampleRate_)));
         reset();
         prepared_ = true;
@@ -202,7 +185,7 @@ public:
         for (const ZoneSpec& z : zones)
         {
             ZoneData d;
-            if (!buildZone(z, d)) return false;
+            if (!detail::buildSampleZone(z, d)) return false;
             set->zones.push_back(std::move(d));
         }
         publish(set.release());
@@ -345,165 +328,10 @@ public:
     [[nodiscard]] int getPolyphony() const noexcept { return polyphony_; }
 
 private:
-    // -- Interpolation kernel -------------------------------------------------------
-
-    /// Zero crossings on each side of the kernel at unit rate: 64 taps.
-    static constexpr int kHalfTaps = 32;
-    /// Table points per zero crossing (linear interpolation between them).
-    static constexpr int kTablePerUnit = 2048;
-    /// Highest playback rate; the kernel then spans 8 x 64 taps.
-    static constexpr double kMaxRate = 8.0;
-    static constexpr int kMaxHalfTaps = static_cast<int>(kHalfTaps * kMaxRate);
-    /// Cutoff at 0.45 of the sample rate (normalised to Nyquist): passband to
-    /// 0.40, stopband from 0.50, the width a 64-tap Kaiser needs for 100 dB.
-    static constexpr double kCutoff = 0.9;
-    static constexpr double kBeta = 10.06;
-
-    /** Kernel h(t) for t >= 0 in zero crossings, sampled kTablePerUnit per unit. */
-    static const std::vector<double>& kernelTable()
-    {
-        static const std::vector<double> table = [] {
-            std::vector<double> t(static_cast<size_t>(kHalfTaps * kTablePerUnit + 2), 0.0);
-            auto i0 = [](double x) {
-                double sum = 1.0, term = 1.0;
-                for (int k = 1; k < 64; ++k)
-                {
-                    term *= (x / (2.0 * k)) * (x / (2.0 * k));
-                    sum += term;
-                    if (term < sum * 1e-17) break;
-                }
-                return sum;
-            };
-            const double norm = i0(kBeta);
-            for (size_t j = 0; j + 1 < t.size(); ++j)
-            {
-                const double x = static_cast<double>(j) / kTablePerUnit;
-                if (x >= kHalfTaps) break;
-                const double arg = pi<double> * kCutoff * x;
-                const double sinc = (x == 0.0) ? 1.0 : std::sin(arg) / arg;
-                const double r = x / kHalfTaps;
-                t[j] = kCutoff * sinc * i0(kBeta * std::sqrt(std::max(0.0, 1.0 - r * r))) / norm;
-            }
-            return t;
-        }();
-        return table;
-    }
-
-    /// Phases of the unit-rate polyphase table (rows interpolated linearly).
-    static constexpr int kPhases = 2048;
-    static constexpr int kTaps = 2 * kHalfTaps;
-
-    /**
-     * The unit-rate kernel as rows: row q holds the 64 tap weights for a
-     * fractional position q / kPhases, taps k = -31 .. 32 at distance k - frac.
-     * A voice at or below the recording's rate blends two adjacent rows, which
-     * is the same kernel as the scalar table read tap by tap, laid out so the
-     * blend and the dot products run over contiguous memory.
-     */
-    static const std::vector<T>& polyphaseTable()
-    {
-        static const std::vector<T> rows = [] {
-            const auto& h = kernelTable();
-            std::vector<T> r(static_cast<size_t>((kPhases + 1) * kTaps), T(0));
-            for (int q = 0; q <= kPhases; ++q)
-                for (int t = 0; t < kTaps; ++t)
-                {
-                    // |k - frac| in table units, exactly: (t - 31) * P - q.
-                    const long u = std::labs(static_cast<long>(t - (kHalfTaps - 1)) * kTablePerUnit - q);
-                    r[static_cast<size_t>(q * kTaps + t)] =
-                        (static_cast<size_t>(u) < h.size()) ? static_cast<T>(h[static_cast<size_t>(u)]) : T(0);
-                }
-            return r;
-        }();
-        return rows;
-    }
-
-    // -- Zones -----------------------------------------------------------------------
-
-    struct ZoneData
-    {
-        std::vector<T> audio;        ///< Channel-major, `length` per channel.
-        std::vector<T> baked;        ///< Crossfaded copy of [loopEnd - xfade, loopEnd).
-        int channels = 0;
-        int64_t length = 0;
-        double sampleRate = 48000.0;
-        int rootKey = 60;
-        double tuneCents = 0.0;
-        int keyLow = 0, keyHigh = 127;
-        double velLow = 0.0, velHigh = 1.0;
-        double gain = 1.0;
-        double pan = 0.0;
-        int64_t start = 0;
-        LoopMode loop = LoopMode::None;
-        int64_t loopStart = 0, loopEnd = 0, xfade = 0;
-    };
+    using Reader = detail::SampleReader<T>;
+    using ZoneData = detail::SampleZoneData<T>;
 
     struct ZoneSet { std::vector<ZoneData> zones; };
-
-    static bool buildZone(const ZoneSpec& z, ZoneData& d)
-    {
-        const int ch = z.audio.getNumChannels();
-        const int64_t len = z.audio.getNumSamples();
-        if (ch < 1 || len < 1 || !(z.sampleRate > 0.0) || !std::isfinite(z.sampleRate))
-            return false;
-        for (int c = 0; c < ch; ++c)
-            if (z.audio.getChannel(c) == nullptr) return false;
-        if (z.keyLow > z.keyHigh || z.velocityLow > z.velocityHigh
-            || !std::isfinite(z.tuneCents) || !std::isfinite(z.gainDb) || !std::isfinite(z.pan))
-            return false;
-
-        d.channels = ch;
-        d.length = len;
-        d.sampleRate = z.sampleRate;
-        d.rootKey = z.rootKey;
-        d.tuneCents = z.tuneCents;
-        d.keyLow = std::clamp(z.keyLow, 0, 127);
-        d.keyHigh = std::clamp(z.keyHigh, 0, 127);
-        d.velLow = std::clamp(z.velocityLow, 0.0, 1.0);
-        d.velHigh = std::clamp(z.velocityHigh, 0.0, 1.0);
-        d.gain = std::pow(10.0, std::clamp(z.gainDb, -120.0, 24.0) / 20.0);
-        d.pan = std::clamp(z.pan, -1.0, 1.0);
-        d.start = std::clamp<int64_t>(z.startOffset, 0, len - 1);
-        d.audio.resize(static_cast<size_t>(ch) * static_cast<size_t>(len));
-        for (int c = 0; c < ch; ++c)
-        {
-            const T* src = z.audio.getChannel(c);
-            T* dst = d.audio.data() + static_cast<size_t>(c) * static_cast<size_t>(len);
-            for (int64_t i = 0; i < len; ++i)
-                dst[i] = std::isfinite(src[i]) ? src[i] : T(0);
-        }
-
-        d.loop = z.loopMode;
-        d.loopStart = std::clamp<int64_t>(z.loopStart, 0, len);
-        d.loopEnd = std::clamp<int64_t>(z.loopEnd, 0, len);
-        if (d.loop != LoopMode::None && d.loopEnd - d.loopStart < 2)
-            d.loop = LoopMode::None;
-        if (d.loop == LoopMode::None) return true;
-
-        d.xfade = std::clamp<int64_t>(z.loopCrossfade, 0,
-                                      std::min(d.loopStart, d.loopEnd - d.loopStart));
-        if (d.xfade > 0)
-        {
-            d.baked.resize(static_cast<size_t>(ch) * static_cast<size_t>(d.xfade));
-            for (int c = 0; c < ch; ++c)
-            {
-                const T* src = d.audio.data() + static_cast<size_t>(c) * static_cast<size_t>(len);
-                T* dst = d.baked.data() + static_cast<size_t>(c) * static_cast<size_t>(d.xfade);
-                for (int64_t i = 0; i < d.xfade; ++i)
-                {
-                    // Fade the loop's tail out into the audio that precedes the
-                    // loop start, so the jump lands on continuous material.
-                    const double x = (static_cast<double>(i) + 0.5) / static_cast<double>(d.xfade);
-                    const double fin = z.equalPowerCrossfade ? std::sin(0.5 * pi<double> * x) : x;
-                    const double fout = z.equalPowerCrossfade ? std::cos(0.5 * pi<double> * x) : 1.0 - x;
-                    const double tail = static_cast<double>(src[d.loopEnd - d.xfade + i]);
-                    const double lead = static_cast<double>(src[d.loopStart - d.xfade + i]);
-                    dst[i] = static_cast<T>(fout * tail + fin * lead);
-                }
-            }
-        }
-        return true;
-    }
 
     // -- Publication -------------------------------------------------------------------
 
@@ -546,28 +374,15 @@ private:
     {
         bool active = false;
         const ZoneSet* set = nullptr;
-        const ZoneData* zone = nullptr;
         int key = 0;
-        double pos = 0.0;         ///< Read position in recording samples.
         double baseRatio = 1.0;   ///< Rate before pitch bend.
-        bool loopEngaged = false;
-        bool releaseLoop = false; ///< Sustain loop: disengage once clear of the fade.
         bool held = true;         ///< Key down.
         bool sustained = false;   ///< Released while the pedal was down.
         double gainL = 1.0, gainR = 1.0, gainMono = 1.0;
         int stealLeft = -1;       ///< Stealing fade samples left; -1 when not stealing.
         uint64_t age = 0;
         ADSREnvelope<double> env;
-        // Scatter form: the next recording sample to spread, the output time
-        // it falls on (relative to the next output sample), and the output
-        // accumulators it is spread into.
-        bool scatter = false;
-        bool inputDone = false;
-        int drainLeft = 0;
-        int64_t jIn = 0;
-        double tNext = 0.0;
-        int accPos = 0;
-        std::array<std::vector<T>, 2> acc;
+        Reader reader;            ///< Read position in the zone.
     };
 
     enum class EventType { NoteOn, NoteOff, Pedal, Bend, AllOff };
@@ -614,7 +429,7 @@ private:
         v.sustained = false;
         v.env.setRelease(static_cast<double>(releaseMs_.load(std::memory_order_relaxed)));
         v.env.noteOff();
-        if (v.zone->loop == LoopMode::Sustain) v.releaseLoop = true;
+        v.reader.release();
     }
 
     void releaseKey(int key) noexcept
@@ -645,39 +460,17 @@ private:
             if (v == nullptr) return;
             v->active = true;
             v->set = active_;
-            v->zone = &z;
             v->key = key;
-            v->pos = static_cast<double>(z.start);
             v->baseRatio = z.sampleRate / sampleRate_
                          * std::pow(2.0, (key - z.rootKey + z.tuneCents / 100.0) / 12.0);
-            v->scatter = v->baseRatio * std::pow(2.0, pitchBend_ / 12.0) > 1.0;
-            v->inputDone = false;
-            v->drainLeft = 0;
-            v->jIn = z.start;
-            v->tNext = 0.0;
-            v->accPos = 0;
-            if (v->scatter)
-                for (auto& a : v->acc) std::fill(a.begin(), a.end(), T(0));
-            v->loopEngaged = z.loop != LoopMode::None;
-            v->releaseLoop = false;
+            v->reader.start(z, v->baseRatio * std::pow(2.0, pitchBend_ / 12.0));
             v->held = true;
             v->sustained = false;
             v->stealLeft = -1;
             v->age = ++clock_;
-            const double g = z.gain * velGain;
-            const double theta = 0.25 * pi<double> * (z.pan + 1.0);
-            v->gainMono = g;
-            if (z.channels == 1)
-            {
-                // Constant power, unity at centre.
-                v->gainL = g * std::cos(theta) * sqrt2<double>;
-                v->gainR = g * std::sin(theta) * sqrt2<double>;
-            }
-            else
-            {
-                v->gainL = g * std::min(1.0, 1.0 - z.pan);
-                v->gainR = g * std::min(1.0, 1.0 + z.pan);
-            }
+            // Constant power for a mono zone (unity at centre), balance otherwise.
+            detail::sampleZonePanGains(z.pan, z.channels, z.gain * velGain,
+                                       v->gainL, v->gainR, v->gainMono);
             v->env.setParameters(attackMs_.load(std::memory_order_relaxed),
                                  decayMs_.load(std::memory_order_relaxed),
                                  sustain_.load(std::memory_order_relaxed),
@@ -723,69 +516,6 @@ private:
 
     // -- Rendering --------------------------------------------------------------------------
 
-    /** Dot product over eight independent partial sums: a single running sum
-     *  is one long dependency chain the compiler may not reorder. */
-    [[nodiscard]] static double dot(const T* w, const T* x, int n) noexcept
-    {
-        T a[8] = { T(0), T(0), T(0), T(0), T(0), T(0), T(0), T(0) };
-        int t = 0;
-        for (; t + 8 <= n; t += 8)
-            for (int l = 0; l < 8; ++l)
-                a[l] += w[t + l] * x[t + l];
-        T sum = ((a[0] + a[4]) + (a[1] + a[5])) + ((a[2] + a[6]) + (a[3] + a[7]));
-        for (; t < n; ++t) sum += w[t] * x[t];
-        return static_cast<double>(sum);
-    }
-
-    /** Reads sample j of channel c through the loop and the baked crossfade. */
-    [[nodiscard]] static double fetch(const ZoneData& z, const T* chan, const T* baked,
-                                      int64_t j, bool loopEngaged) noexcept
-    {
-        if (loopEngaged && j >= z.loopEnd)
-            j = z.loopStart + (j - z.loopEnd) % (z.loopEnd - z.loopStart);
-        if (j < 0 || j >= z.length) return 0.0;
-        if (loopEngaged && baked != nullptr && j >= z.loopEnd - z.xfade && j < z.loopEnd)
-            return static_cast<double>(baked[j - (z.loopEnd - z.xfade)]);
-        return static_cast<double>(chan[j]);
-    }
-
-    /** Fills weights_ with the kernel at scale fc for taps k = -half+1 .. half
-     *  at distance (k - frac); returns the tap count. */
-    int kernelWeights(double frac, double fc, int half) noexcept
-    {
-        if (fc >= 1.0)
-        {
-            const T* rows = polyphaseTable().data();
-            const double qf = frac * kPhases;
-            const int q = std::min(static_cast<int>(qf), kPhases - 1);
-            const T g = static_cast<T>(qf - static_cast<double>(q));
-            const T* r0 = rows + static_cast<size_t>(q) * kTaps;
-            const T* r1 = r0 + kTaps;
-            T* w = weights_.data();
-            for (int t = 0; t < kTaps; ++t)
-                w[t] = r0[t] + g * (r1[t] - r0[t]);
-            return kTaps;
-        }
-        // Stretched kernel: |k - frac| * fc in table units, one step of fc per tap.
-        const auto& table = kernelTable();
-        const double step = fc * kTablePerUnit;
-        double x = (static_cast<double>(-half + 1) - frac) * step;
-        const size_t last = table.size() - 1;
-        for (int t = 0; t < 2 * half; ++t, x += step)
-        {
-            const double u = std::abs(x);
-            const size_t iu = static_cast<size_t>(u);
-            double w = 0.0;
-            if (iu < last)
-            {
-                const double f = u - static_cast<double>(iu);
-                w = table[iu] + f * (table[iu + 1] - table[iu]);
-            }
-            weights_[static_cast<size_t>(t)] = static_cast<T>(w * fc);
-        }
-        return 2 * half;
-    }
-
     /** Envelope and stealing fade for the output sample about to be emitted;
      *  false when the voice has just ended. */
     static bool advanceGain(Voice& v, int stealFade, double& gain) noexcept
@@ -808,177 +538,34 @@ private:
         else
         {
             out.getChannel(0)[s] += static_cast<T>(a0 * v.gainL * gain);
-            out.getChannel(1)[s] += static_cast<T>((v.zone->channels == 1 ? a0 : a1) * v.gainR * gain);
+            out.getChannel(1)[s] += static_cast<T>((v.reader.zone()->channels == 1 ? a0 : a1) * v.gainR * gain);
         }
     }
 
     void render(AudioBufferView<T> out, int from, int to) noexcept
     {
         const double bendRatio = std::pow(2.0, pitchBend_ / 12.0);
+        const int nCh = out.getNumChannels();
         for (auto& v : voices_)
         {
             if (!v.active) continue;
-            const double ratio = std::clamp(v.baseRatio * bendRatio, 1.0 / kMaxRate, kMaxRate);
-            if (v.scatter) renderScatter(v, out, from, to, ratio);
-            else renderGather(v, out, from, to, ratio);
-        }
-    }
-
-    /**
-     * Gather form, for voices that start at or below the recording's rate:
-     * each output sample is a dot product of the recording with the kernel
-     * centred on the read position. At a rate r above 1 (a bend upwards) the
-     * kernel is stretched by r.
-     */
-    void renderGather(Voice& v, AudioBufferView<T> out, int from, int to, double ratio) noexcept
-    {
-        const ZoneData& z = *v.zone;
-        const int nCh = out.getNumChannels();
-        const double fc = std::min(1.0, 1.0 / ratio);
-        const int half = static_cast<int>(std::ceil(kHalfTaps / fc));
-        const double loopLen = static_cast<double>(z.loopEnd - z.loopStart);
-        const int zc = z.channels;
-        const int used = (nCh == 1) ? zc : std::min(zc, 2);
-
-        for (int s = from; s < to; ++s)
-        {
-            // Sustain loop released: leave the loop once the kernel is clear
-            // of the crossfade region, so no read jumps sources.
-            if (v.releaseLoop && v.pos + half < static_cast<double>(z.loopEnd - z.xfade))
+            const double ratio = std::clamp(v.baseRatio * bendRatio, 1.0 / Reader::kMaxRate, Reader::kMaxRate);
+            for (int s = from; s < to; ++s)
             {
-                v.loopEngaged = false;
-                v.releaseLoop = false;
+                double a0 = 0.0, a1 = 0.0;
+                const auto frame = v.reader.next(ratio, nCh, weights_.data(), a0, a1);
+                if (frame == Reader::Frame::Ended) { v.active = false; break; }
+                double gain = 0.0;
+                if (!advanceGain(v, stealFadeSamples_, gain)) break;
+                emit(out, s, v, a0, a1, gain);
+                if (frame == Reader::Frame::Last) { v.active = false; break; }
             }
-            if (!v.loopEngaged && v.pos >= static_cast<double>(z.length)) { v.active = false; return; }
-
-            const double fl = std::floor(v.pos);
-            const int64_t ip = static_cast<int64_t>(fl);
-            const int taps = kernelWeights(v.pos - fl, fc, half);
-
-            double gain = 0.0;
-            if (!advanceGain(v, stealFadeSamples_, gain)) return;
-
-            const int64_t first = ip - half + 1;
-            const bool direct = first >= 0 && first + taps <= z.length
-                             && (!v.loopEngaged || first + taps <= z.loopEnd - z.xfade);
-            double acc[2] = { 0.0, 0.0 };
-            for (int c = 0; c < used; ++c)
-            {
-                const T* chan = z.audio.data() + static_cast<size_t>(c) * static_cast<size_t>(z.length);
-                const T* baked = z.baked.empty() ? nullptr
-                               : z.baked.data() + static_cast<size_t>(c) * static_cast<size_t>(z.xfade);
-                double sum = 0.0;
-                if (direct)
-                    sum = dot(weights_.data(), chan + first, taps);
-                else
-                    for (int t = 0; t < taps; ++t)
-                        sum += static_cast<double>(weights_[static_cast<size_t>(t)])
-                             * fetch(z, chan, baked, first + t, v.loopEngaged);
-                if (nCh == 1) acc[0] += sum / zc;
-                else acc[c] = sum;
-            }
-            emit(out, s, v, acc[0], acc[1], gain);
-
-            v.pos += ratio;
-            if (v.loopEngaged && v.pos >= static_cast<double>(z.loopEnd))
-                v.pos -= loopLen;
-        }
-    }
-
-    /**
-     * Scatter (transposed) form, for voices that start above the recording's
-     * rate: each recording sample is spread over the output samples around
-     * the instant it falls on, with the kernel laid out in OUTPUT time. Its
-     * stopband therefore starts at the output Nyquist frequency - exactly
-     * the anti-aliasing a note played up needs - and the weights come from
-     * the same contiguous polyphase rows as the gather form, so the cost is
-     * r times that of an untransposed voice instead of a stretched gather.
-     * Loop jumps happen at whole recording samples. At a rate below 1 (a
-     * bend downwards) the output-time kernel is stretched by 1 / r, which
-     * keeps the stopband at the recording's Nyquist frequency.
-     */
-    void renderScatter(Voice& v, AudioBufferView<T> out, int from, int to, double ratio) noexcept
-    {
-        const ZoneData& z = *v.zone;
-        const int nCh = out.getNumChannels();
-        const double fc = std::min(1.0, ratio);          // output-time kernel scale
-        const int half = static_cast<int>(std::ceil(kHalfTaps / fc));
-        const double spacing = 1.0 / ratio;             // output samples per input sample
-        const int zc = z.channels;
-        const int used = (nCh == 1) ? zc : std::min(zc, 2);
-        const int rings = (nCh == 1 || zc == 1) ? 1 : 2;
-
-        for (int s = from; s < to; ++s)
-        {
-            // Spread every input whose support reaches this output sample.
-            while (!v.inputDone && v.tNext < static_cast<double>(half))
-            {
-                if (v.releaseLoop && v.jIn < z.loopEnd - z.xfade)
-                {
-                    v.loopEngaged = false;
-                    v.releaseLoop = false;
-                }
-                double x[2] = { 0.0, 0.0 };
-                for (int c = 0; c < used; ++c)
-                {
-                    const T* chan = z.audio.data() + static_cast<size_t>(c) * static_cast<size_t>(z.length);
-                    const T* baked = z.baked.empty() ? nullptr
-                                   : z.baked.data() + static_cast<size_t>(c) * static_cast<size_t>(z.xfade);
-                    const double sample = fetch(z, chan, baked, v.jIn, v.loopEngaged);
-                    if (rings == 1) x[0] += sample / used;
-                    else x[c] = sample;
-                }
-                const double fl = std::floor(v.tNext);
-                const int taps = kernelWeights(v.tNext - fl, fc, half);
-                const int base = v.accPos + static_cast<int>(fl) - half + 1;
-                for (int r = 0; r < rings; ++r)
-                {
-                    const T xs = static_cast<T>(x[r] * spacing);
-                    T* acc = v.acc[static_cast<size_t>(r)].data();
-                    const T* w = weights_.data();
-                    for (int t = 0; t < taps; ++t)
-                    {
-                        const int idx = base + t;
-                        if (idx >= v.accPos) acc[idx] += w[t] * xs;   // earlier outputs are gone
-                    }
-                }
-                ++v.jIn;
-                if (v.loopEngaged && v.jIn >= z.loopEnd) v.jIn = z.loopStart;
-                if (!v.loopEngaged && v.jIn >= z.length) { v.inputDone = true; v.drainLeft = 2 * half; }
-                v.tNext += spacing;
-            }
-
-            double gain = 0.0;
-            if (!advanceGain(v, stealFadeSamples_, gain)) return;
-            const double a0 = static_cast<double>(v.acc[0][static_cast<size_t>(v.accPos)]);
-            const double a1 = (rings == 2) ? static_cast<double>(v.acc[1][static_cast<size_t>(v.accPos)]) : a0;
-            emit(out, s, v, a0, a1, gain);
-
-            // Advance the output: the accumulator slides once it nears its end.
-            for (int r = 0; r < rings; ++r) v.acc[static_cast<size_t>(r)][static_cast<size_t>(v.accPos)] = T(0);
-            ++v.accPos;
-            v.tNext -= 1.0;
-            if (v.accPos + 2 * kMaxHalfTaps + 2 >= kAccLength)
-            {
-                const int keep = kAccLength - v.accPos;
-                for (int r = 0; r < rings; ++r)
-                {
-                    T* acc = v.acc[static_cast<size_t>(r)].data();
-                    std::copy(acc + v.accPos, acc + kAccLength, acc);
-                    std::fill(acc + keep, acc + kAccLength, T(0));
-                }
-                v.accPos = 0;
-            }
-            if (v.inputDone && --v.drainLeft <= 0) { v.active = false; return; }
         }
     }
 
     // -- Members ------------------------------------------------------------------------------
 
     static constexpr int kMaxEvents = 1024;
-    /// Scatter accumulator per channel: room for the widest kernel plus a
-    /// stretch of output before it slides back.
-    static constexpr int kAccLength = 4 * kMaxHalfTaps + 256;
 
     double sampleRate_ = 48000.0;
     int polyphony_ = 0;

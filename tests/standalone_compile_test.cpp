@@ -50,6 +50,11 @@ void instantiate()
     WaveshapeTable<T> ws;
     WavetableOscillator<T> wto;
     ZeroLatencyConvolver<T> zlc;
+    WavetableBank wavetableBank;
+    SampleZoneSpec<T> zoneSpec;
+    Sampler<T> sampler;
+    Lfo<T> lfo;
+    Synthesizer<T> synth;
 
     // -- Effects --------------------------------------------------------------
     AlgorithmicReverb<T> ar;
@@ -129,6 +134,7 @@ void instantiate()
     (void)ladder; (void)modRouter; (void)osc; (void)ov; (void)ph; (void)rs;
     (void)ring; (void)sh; (void)smv; (void)linSm; (void)expSm; (void)specProc;
     (void)svf; (void)tpd; (void)ws; (void)wto; (void)zlc;
+    (void)wavetableBank; (void)zoneSpec; (void)sampler; (void)lfo; (void)synth;
     (void)ar; (void)ag; (void)ch; (void)clip; (void)cmp; (void)xfade; (void)cf;
     (void)dcb; (void)dee; (void)dly; (void)deq; (void)eq; (void)ex;
     (void)filterEngine; (void)fs; (void)g; (void)gran; (void)spectralFreeze;
@@ -151,5 +157,15 @@ template void instantiate<float>();
 template void instantiate<double>();
 
 } // namespace standalone_compile_audit
+
+// Every member of the synthesis classes, at both sample types.
+template class dspark::Synthesizer<float>;
+template class dspark::Synthesizer<double>;
+template class dspark::Lfo<float>;
+template class dspark::Lfo<double>;
+template class dspark::Sampler<float>;
+template class dspark::Sampler<double>;
+template class dspark::WavetableOscillator<float>;
+template class dspark::WavetableOscillator<double>;
 
 int main() { return 0; }

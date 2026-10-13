@@ -132,7 +132,7 @@ for complete programs.
 | Time, pitch, and spatial processing | `Delay`, `AlgorithmicReverb`, `Reverb`, `PitchShifter`, `TimeStretch`, `PitchCorrector`, `GranularProcessor` |
 | Spectral processing | `FFTReal`, `Convolver`, `ZeroLatencyConvolver`, `SpectralProcessor`, `SpectralFreeze`, `SpectralDenoiser` |
 | Analysis and metering | `SpectrumAnalyzer`, `LoudnessMeter`, `AudioIntervalAnalyzer`, `LoudnessNormalizer`, `PitchDetector`, `OnsetDetector`, `BeatTracker`, `LoopFinder`, `DelayEstimator` |
-| Synthesis and music | `Oscillator`, `WavetableOscillator`, `Sampler`, `ADSREnvelope`, `ChordDetector`, `KeyDetector`, `harmony::*` |
+| Synthesis and music | `Synthesizer` (analog, FM and wavetable engines, samples, filters, envelopes, LFOs, modulation matrix), `Oscillator`, `WavetableOscillator`, `WavetableBank`, `Sampler`, `Lfo`, `ADSREnvelope`, `ChordDetector`, `KeyDetector`, `harmony::*` |
 | Infrastructure | `AudioBuffer`, `ProcessorChain`, `Resampler`, `Oversampling`, `Dither`, `SpscQueue`, versioned state blobs |
 | File I/O | WAV and MP3 read/write, Standard MIDI File read/write, native FLAC decode |
 | Plugin development | Native VST3 and CLAP adapters, macOS Audio Unit v2, instruments, sidechains, automation, state, and optional WebView editors |

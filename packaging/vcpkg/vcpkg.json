@@ -1,6 +1,6 @@
 {
   "name": "dspark",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "Header-only C++20 audio DSP for real-time and offline processing: effects, analog circuit models, automatic dynamics, stereo tools and EBU R128 metering. No external DSP dependencies.",
   "homepage": "https://github.com/CristianMoresi/DSPark",
   "license": "MIT",

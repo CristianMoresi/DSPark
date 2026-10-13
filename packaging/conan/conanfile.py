@@ -7,7 +7,7 @@ import os
 
 class DSParkConan(ConanFile):
     name = "dspark"
-    version = "1.8.0"
+    version = "1.8.1"
     description = ("Header-only C++20 audio DSP for real-time and offline processing: "
                    "effects, analog circuit models, automatic dynamics, stereo tools "
                    "and EBU R128 metering. No external DSP dependencies.")
@@ -24,9 +24,9 @@ class DSParkConan(ConanFile):
 
     def source(self):
         get(self,
-            "https://codeload.github.com/CristianMoresi/DSPark/tar.gz/a69cee3d5c2cfd1cfa9c11cfd67891227c1427ae",
-            filename="dspark-1.8.0.tar.gz",
-            sha256="9bac2beec7f360a308f7cab8a454682eabd61d85c185516a00c52c66fa3447fe", strip_root=True)
+            "https://codeload.github.com/CristianMoresi/DSPark/tar.gz/816766a14e04804ba3425d789e8bb384866067ea",
+            filename="dspark-1.8.1.tar.gz",
+            sha256="b5a48337f17f0d45f492bfb7f4aa7cdc6742b3076dabd09e0cb68288e547af14", strip_root=True)
 
     def package(self):
         copy(self, "LICENSE", self.source_folder,

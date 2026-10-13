@@ -15,6 +15,15 @@ All notable user-facing changes to DSPark are documented here.
 - Both instruments expose `kMaxEvents`, their shared per-block event queue
   capacity, so hosts can split dense event streams before queuing them.
 
+### Fixed
+
+- `AlgorithmicReverb<float>` now uses the shared double-precision `Biquad`
+  core for its subsonic and stereo-coherence output high-pass filters.
+  The former float recursions amplified one-ULP input perturbations into
+  approximately -105 dBFS residuals in a 48 kHz Room fixture. The correction
+  preserves the filter design, delay network, controls and latency; float
+  output bytes change. Double processing retains its existing arithmetic.
+
 ## [1.8.1] - 2026-10-13
 
 ### Added

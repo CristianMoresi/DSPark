@@ -310,16 +310,9 @@ public:
             }
         }
 
-        {
-            const auto c = BiquadCoeffs::makeHighPass(sr, kSubsonicHz);
-            subC_ = { static_cast<T>(c.b0), static_cast<T>(c.b1), static_cast<T>(c.b2),
-                      static_cast<T>(c.a1), static_cast<T>(c.a2) };
-        }
-        {
-            const auto c = BiquadCoeffs::makeHighPass(sr, std::min(kCoherenceHz, 0.45 * sr), kCoherenceQ);
-            cohC_ = { static_cast<T>(c.b0), static_cast<T>(c.b1), static_cast<T>(c.b2),
-                      static_cast<T>(c.a1), static_cast<T>(c.a2) };
-        }
+        subsonicFilter_.setCoeffsNow(BiquadCoeffs::makeHighPass(sr, kSubsonicHz));
+        coherenceFilter_.setCoeffsNow(BiquadCoeffs::makeHighPass(
+            sr, std::min(kCoherenceHz, 0.45 * sr), kCoherenceQ));
         shadowCoeff_ = static_cast<T>(1.0 - std::exp(-6.283185307179586 * kShadowHz / sr));
         erGlidePerSample_ = static_cast<T>(1.0 / (0.02 * sr));
         maxReadPos_ = static_cast<T>(maxLine - 2);
@@ -432,11 +425,11 @@ public:
             erShadowLP_[c].fill(T(0));
             erGain_[c] = erGainTarget_[c];
             erShelfGain_ = erShelfGainTarget_;
-            subZ_[c].fill(T(0));
         }
         lines_.clear();
         loopAP_.clear();
-        cohZ_.fill(T(0));
+        subsonicFilter_.reset();
+        coherenceFilter_.reset();
         std::fill(springHist_.begin(), springHist_.end(), T(0));
         springW_ = 0;
         for (auto& st : springLPState_) st.fill(T(0));
@@ -1227,10 +1220,10 @@ protected:
     std::array<T, kMaxLines> bassB0_ {}, bassB1_ {}, bassA1_ {}, bassX1_ {}, bassY1_ {};
 
     // Output stage
-    std::array<T, 2> cohZ_ {};             ///< side high-pass state (coherent low band)
-    std::array<T, 5> cohC_ {};             ///< its coefficients b0 b1 b2 a1 a2
-    std::array<std::array<T, 2>, 2> subZ_ {};   ///< subsonic high-pass states per channel
-    std::array<T, 5> subC_ {};
+    // These low-frequency recursions need the shared double-precision core.
+    // Coefficients are owned by prepare(); no cross-thread publications.
+    Biquad<T, 1> coherenceFilter_;
+    Biquad<T, 2> subsonicFilter_;
 
     // Tone correction EQ (Biquad 12 dB/oct)
     Biquad<T, 2> toneLPBiquad_;
@@ -1914,10 +1907,8 @@ protected:
             // 250 Hz, under 0.1 from 500 Hz up.
             const T mid  = (lateL + lateR) * T(0.5);
             T side = (lateL - lateR) * T(0.5);
-            const T hp = cohC_[0] * side + cohZ_[0];         // TDF-II biquad
-            cohZ_[0] = cohC_[1] * side - cohC_[3] * hp + cohZ_[1];
-            cohZ_[1] = cohC_[2] * side - cohC_[4] * hp;
-            side = hp * cachedParams_.width;
+            const double hp = coherenceFilter_.processSampleCore(static_cast<double>(side), 0);
+            side = static_cast<T>(hp * static_cast<double>(cachedParams_.width));
             lateL = mid + side;
             lateR = mid - side;
         }
@@ -1925,13 +1916,7 @@ protected:
         T out[2] = { earlyL * cachedParams_.earlyLevel + lateL,
                      earlyR * cachedParams_.earlyLevel + lateR };
         for (int c = 0; c < 2; ++c)
-        {
-            auto& z = subZ_[static_cast<std::size_t>(c)];
-            const T y = subC_[0] * out[c] + z[0];
-            z[0] = subC_[1] * out[c] - subC_[3] * y + z[1];
-            z[1] = subC_[2] * out[c] - subC_[4] * y;
-            out[c] = y;
-        }
+            out[c] = subsonicFilter_.processSample(out[c], c);
         if (toneHPActive_)
         {
             out[0] = toneHPBiquad_.processSample(out[0], 0);

@@ -5,7 +5,7 @@
 #   ctest --test-dir build --output-on-failure
 #
 # Seven targets:
-#   dspark_tests            the ordinary 1241-case suite (zero dependencies)
+#   dspark_tests            the ordinary test suite (zero dependencies)
 #   dspark_alloc_failure    allocation-failure injection, deliberately apart
 #   dspark_reverb_publication fixed-operation ownership/publication contract
 #   dspark_standalone       compile gate: umbrella header alone, float + double
@@ -34,6 +34,7 @@ add_executable(dspark_tests
     TestCoreSpectral.cpp
     TestCoreUtilities.cpp
     TestEffectsAdvanced.cpp
+    TestReverbPrecision.cpp
     TestEffectsDynamics.cpp
     TestEffectsModulation.cpp
     TestEffectsStereo.cpp

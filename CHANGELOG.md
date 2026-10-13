@@ -2,7 +2,7 @@
 
 All notable user-facing changes to DSPark are documented here.
 
-## [Unreleased]
+## [1.8.1] - 2026-10-13
 
 ### Added
 

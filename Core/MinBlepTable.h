@@ -170,6 +170,8 @@ public:
      *        dcDelay() samples late: the minimum-phase band-limited ramp
      *        (minBLAMP) minus the ideal ramp delayed by dcDelay().
      *
+     * @param ring      A kTaps-long ring of pending corrections.
+     * @param head      Ring slot of the output sample the correction starts at.
      * @param slopeJump Change of the derivative at the event, per sample
      *                  (new slope minus old slope).
      * @param frac      Time from the event to the ring's head sample (>= 0).

@@ -284,8 +284,9 @@ public:
      * @param outChannels Output channels: 1 mixes the zone's channels to one,
      *                    2 or more read its first two.
      * @param weights     Scratch of kWeightsLength values.
-     * @param a0, a1      The frame (a1 is the second channel's; for one
-     *                    output channel or a mono zone in scatter form, a0).
+     * @param a0          The frame's first (or only) channel.
+     * @param a1          The frame's second channel; not meaningful for one
+     *                    output channel or a mono zone, where a0 is used.
      */
     Frame next(double ratio, int outChannels, T* weights, double& a0, double& a1) noexcept
     {

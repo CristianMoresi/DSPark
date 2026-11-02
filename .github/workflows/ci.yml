@@ -20,8 +20,8 @@ jobs:
     needs: conformance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: reverb-numerics-*
           path: reverb-numerics
@@ -38,7 +38,7 @@ jobs:
     name: Comment style
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check for unresolvable reference codes
         run: python3 tools/check_comment_style.py
       - name: Check the threading page against the code
@@ -52,7 +52,7 @@ jobs:
     name: Public text and documentation quality
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install documentation tools
         run: sudo apt-get update && sudo apt-get install -y doxygen graphviz g++-13 clang-18
       - name: Check the closed public-text policy and correction contract
@@ -73,7 +73,7 @@ jobs:
       matrix:
         compiler: [g++, clang++]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Compile every installed header and umbrella profile
         run: >
           python3 tools/check_header_self_sufficiency.py
@@ -95,12 +95,14 @@ jobs:
           # Native Windows-on-ARM: the one target where MSVC compiles the
           # NEON kernel paths (its arm64_neon.h, not the GCC/Clang one).
           - { name: "Windows MSVC arm64", os: windows-11-arm,   compiler: msvc, msvc_arch: arm64 }
-          - { name: "Linux GCC x64",      os: ubuntu-latest,    compiler: g++   }
-          - { name: "Linux Clang x64",    os: ubuntu-latest,    compiler: clang++ }
+          # The x64 baseline is stated, not inherited: a runner image's compiler
+          # may default to wider code, which would silently stop covering SSE2.
+          - { name: "Linux GCC x64",      os: ubuntu-latest,    compiler: g++,     arch: -march=x86-64 }
+          - { name: "Linux Clang x64",    os: ubuntu-latest,    compiler: clang++, arch: -march=x86-64 }
           - { name: "Linux GCC arm64",    os: ubuntu-24.04-arm, compiler: g++   }
           - { name: "macOS Clang arm64",  os: macos-latest,     compiler: clang++ }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up MSVC environment
         if: matrix.compiler == 'msvc'
@@ -115,7 +117,7 @@ jobs:
 
       - name: Build (GCC/Clang)
         if: matrix.compiler != 'msvc'
-        run: ${{ matrix.compiler }} -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . conformance/dspark_conformance.cpp -o dspark_conformance
+        run: ${{ matrix.compiler }} -std=c++20 -O2 ${{ matrix.arch }} -Wall -Wextra -Wpedantic -Werror -I . conformance/dspark_conformance.cpp -o dspark_conformance
 
       - name: Run conformance suite
         shell: bash
@@ -131,12 +133,12 @@ jobs:
       - name: Render reverb numerical fixtures (GCC/Clang x64)
         if: matrix.name == 'Linux GCC x64' || matrix.name == 'Linux Clang x64'
         run: |
-          ${{ matrix.compiler }} -std=c++20 -O3 -DNDEBUG -Wall -Wextra -Wpedantic -Werror -I . tests/reverb_numeric_fixture.cpp -o reverb_numeric_fixture
+          ${{ matrix.compiler }} -std=c++20 -O3 -DNDEBUG ${{ matrix.arch }} -Wall -Wextra -Wpedantic -Werror -I . tests/reverb_numeric_fixture.cpp -o reverb_numeric_fixture
           ./reverb_numeric_fixture reverb-numerics
 
       - name: Upload reverb numerical fixtures
         if: matrix.name == 'Windows MSVC x64' || matrix.name == 'Linux GCC x64' || matrix.name == 'Linux Clang x64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: reverb-numerics-${{ matrix.name }}
           path: reverb-numerics
@@ -452,7 +454,7 @@ jobs:
 
       - name: Upload metrics table
         if: matrix.name == 'Linux GCC x64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dspark-metrics-table
           path: metrics.md
@@ -473,14 +475,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: "Windows MSVC x64",   os: windows-latest,   msvc_arch: x64   }
-          - { name: "Windows MSVC arm64", os: windows-11-arm,   msvc_arch: arm64 }
-          - { name: "Linux GCC x64",      os: ubuntu-latest,    cxx: g++     }
-          - { name: "Linux Clang x64",    os: ubuntu-latest,    cxx: clang++ }
+          - { name: "Windows MSVC x64",   os: windows-latest,   msvc_arch: x64,   msvc_platform: x64 }
+          - { name: "Windows MSVC arm64", os: windows-11-arm,   msvc_arch: arm64, msvc_platform: ARM64 }
+          # A 32-bit size_t, as on WebAssembly: lengths that fit 64 bits can wrap.
+          - { name: "Windows MSVC x86",   os: windows-latest,   msvc_arch: x86,   msvc_platform: Win32 }
+          - { name: "Linux GCC x64",      os: ubuntu-latest,    cxx: g++,     flags: -march=x86-64 }
+          - { name: "Linux Clang x64",    os: ubuntu-latest,    cxx: clang++, flags: -march=x86-64 }
+          # The whole suite on the AVX2/FMA kernels, which also contract ordinary
+          # float arithmetic: block-size and precision claims must survive that.
+          - { name: "Linux GCC x64 AVX2", os: ubuntu-latest,    cxx: g++,     flags: -march=x86-64-v3 }
           - { name: "Linux GCC arm64",    os: ubuntu-24.04-arm, cxx: g++     }
           - { name: "macOS Clang arm64",  os: macos-latest,     cxx: clang++ }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Prove Windows process-tree ownership and cleanup
         if: matrix.msvc_arch != ''
@@ -499,7 +506,7 @@ jobs:
         shell: bash
         run: >
           cmake -S . -B build
-          -A ${{ matrix.msvc_arch == 'arm64' && 'ARM64' || 'x64' }}
+          -A ${{ matrix.msvc_platform }}
           -DDSPARK_BUILD_TESTS=ON
           -DDSPARK_BUILD_CONFORMANCE=OFF
           -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
@@ -510,13 +517,16 @@ jobs:
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DCMAKE_CXX_FLAGS="${{ matrix.flags }}"
           -DDSPARK_BUILD_TESTS=ON
           -DDSPARK_BUILD_CONFORMANCE=OFF
           -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
 
+      # Bounded: an unnumbered --parallel is an unlimited make -j, and these
+      # template-heavy units exhaust the runner's memory, which kills the job.
       - name: Build
         shell: bash
-        run: cmake --build build --config Release --parallel
+        run: cmake --build build --config Release --parallel 3
 
       # --test-output-size-failed 0: do not truncate the output of a failing
       # test, so the case the runner died on is always identifiable.
@@ -533,7 +543,7 @@ jobs:
     name: TestIO concurrent process isolation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Prove collision synchronization with delayed arrivals
         run: python3 tools/run_concurrent_test_suites.py --self-test-collision-rendezvous
       - name: Run three complete suites from one working directory
@@ -560,7 +570,7 @@ jobs:
           - { name: GCC, compiler: g++ }
           - { name: Clang, compiler: clang++ }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build with sanitizers
         run: >
           ${{ matrix.compiler }} -std=c++20 -O1 -g
@@ -614,7 +624,7 @@ jobs:
     env:
       TSAN_OPTIONS: halt_on_error=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build with ThreadSanitizer
         run: >
           g++ -std=c++20 -O1 -g -Wall -Wextra -Wpedantic -Werror -Wno-error=tsan
@@ -625,7 +635,7 @@ jobs:
 
       # Concurrency claims come from the named threaded tests printed by this
       # exact run; executing a single-threaded case under TSan is not presented
-      # as proof of a hand-off. The ordinary suite authority is currently 1247
+      # as proof of a hand-off. The ordinary suite authority is currently 1248
       # named cases. The separate Reverb publication executable also runs here.
       # The allocation injector is synchronous: its exhaustive failure sweep
       # runs unchanged in every native job and both ASan/UBSan jobs. Repeating
@@ -664,7 +674,7 @@ jobs:
 
       - name: Preserve ThreadSanitizer test output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: thread-sanitizer-results
           path: build-tsan/**/LastTest.log
@@ -677,10 +687,10 @@ jobs:
     name: WebAssembly (Emscripten)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Pinned for the same reason as the validators below: an upstream release
       # must not turn this gate red on its own. Moving it is a deliberate upgrade.
-      - uses: mymindstorm/setup-emsdk@v14
+      - uses: mymindstorm/setup-emsdk@v16
         with:
           version: 6.0.12
       - name: Build
@@ -707,7 +717,7 @@ jobs:
     name: Embedded profile (no exceptions / no RTTI / no file IO)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Compile umbrella with embedded flags
         run: |
           cat > embedded_check.cpp << 'EOF'
@@ -736,7 +746,7 @@ jobs:
     name: Single-header amalgamation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Generate
         run: python3 tools/amalgamate.py dspark_single_header.hpp
       - name: Compile the amalgamated header
@@ -754,7 +764,7 @@ jobs:
           EOF
           g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror amalgam_check.cpp -o amalgam_check
           ./amalgam_check
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dspark_single_header
           path: dspark_single_header.hpp
@@ -766,7 +776,7 @@ jobs:
     name: Examples + bench (compile)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build examples
         run: |
           for src in examples/*.cpp; do
@@ -795,10 +805,10 @@ jobs:
     name: EBU R128 official vectors (best effort)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cache EBU test set
         id: cache-ebu
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ebu-test-set
           key: ebu-loudness-test-set-v05

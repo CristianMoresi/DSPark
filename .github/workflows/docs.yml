@@ -25,7 +25,7 @@ jobs:
   build-docs:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Doxygen
         run: sudo apt-get update && sudo apt-get install -y doxygen graphviz g++-13 clang-18
       - name: Check the closed public-text policy and correction contract
@@ -38,7 +38,7 @@ jobs:
           doxygen Doxyfile
           python3 tools/check_generated_docs.py --html-root docs/api --repair-doxygen-indexes
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs/api
 
@@ -63,7 +63,7 @@ jobs:
       - name: Deploy to GitHub Pages (attempt 1)
         id: deploy1
         continue-on-error: true
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
       - name: Wait before attempt 2
         if: steps.deploy1.outcome == 'failure'
@@ -73,7 +73,7 @@ jobs:
         id: deploy2
         if: steps.deploy1.outcome == 'failure'
         continue-on-error: true
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
       - name: Wait before attempt 3
         if: steps.deploy1.outcome == 'failure' && steps.deploy2.outcome == 'failure'
@@ -82,4 +82,4 @@ jobs:
       - name: Deploy to GitHub Pages (attempt 3, final)
         id: deploy3
         if: steps.deploy1.outcome == 'failure' && steps.deploy2.outcome == 'failure'
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

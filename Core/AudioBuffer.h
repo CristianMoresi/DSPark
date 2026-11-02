@@ -27,7 +27,10 @@
 #include <bit>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <type_traits>
 #include <utility>
@@ -352,9 +355,16 @@ public:
         numChannels = std::clamp(numChannels, 0, MaxChannels);
         if (numSamples < 0) numSamples = 0;
 
-        const auto samplesBytes = static_cast<std::size_t>(numSamples) * sizeof(T);
-        const auto stride       = alignUp(samplesBytes, kAlignment);
-        const auto totalBytes   = stride * static_cast<std::size_t>(numChannels);
+        // Computed in 64 bits: with a 32-bit size_t (WebAssembly, x86) these
+        // products of in-range arguments can wrap into a small allocation that
+        // the channel pointers below would then overrun.
+        const auto samplesBytes = static_cast<std::uint64_t>(numSamples) * sizeof(T);
+        const auto stride64     = (samplesBytes + (kAlignment - 1)) & ~static_cast<std::uint64_t>(kAlignment - 1);
+        const auto totalBytes64 = stride64 * static_cast<std::uint64_t>(numChannels);
+        if (totalBytes64 > std::numeric_limits<std::size_t>::max())
+            failAllocation();
+        const auto stride     = static_cast<std::size_t>(stride64);
+        const auto totalBytes = static_cast<std::size_t>(totalBytes64);
 
         // Smart re-allocation: reuse memory if requested size fits in capacity
         if (totalBytes > allocatedBytes_)
@@ -436,9 +446,14 @@ public:
     }
 
 private:
-    [[nodiscard]] static constexpr std::size_t alignUp(std::size_t value, std::size_t alignment) noexcept
+    /// A request the address space cannot hold fails like any other allocation.
+    [[noreturn]] static void failAllocation()
     {
-        return (value + alignment - 1) & ~(alignment - 1);
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+        throw std::bad_alloc();
+#else
+        std::abort();
+#endif
     }
 
     void deallocate() noexcept

@@ -48,7 +48,7 @@ class OfflineConvolutionWindow final
             time_[i] = value;
         }
         fft_->forward(time_.get(), kernel_.get());
-        for (std::uint64_t i = 0; i < size + 2; ++i)
+        for (int i = 0; i < 4 * block + 2; ++i)
             if (!std::isfinite(kernel_[i]))
                 offlineFail(OfflineStatus::NumericalFailure);
     }

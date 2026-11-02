@@ -10,8 +10,11 @@
  * Momentary (400 ms), short-term (3 s), integrated (two-pass gated),
  * loudness range (EBU Tech 3342) and true peak (BS.1770 4x estimate).
  * Integrated loudness and LRA use constant-memory histograms: no allocation
- * and O(bins) readout, real-time safe. Verified against the official EBU
- * Tech 3341/3342 conformance vectors (CI gate).
+ * and O(bins) readout, real-time safe. Integrated loudness keeps the exact
+ * energy of every bin, so it reads the block energies themselves rather than
+ * a 0.1 LU grid. Tech 3341/3342 tone programmes are checked by the conformance
+ * suite on every target, and the official EBU files when DSPARK_EBU_TEST_SET
+ * points at them.
  *
  * Threading:
  * - prepare() / reset(): setup thread / stream owner (not concurrent with
@@ -256,13 +259,8 @@ public:
 
         for (int i = 0; i < kNumBins; ++i)
         {
-            uint32_t binCount = histogram_[i].load(std::memory_order_relaxed);
-            if (binCount > 0)
-            {
-                double binPower = lufsToPower(kMinHistogramLUFS + static_cast<double>(i) * kBinWidth);
-                sumPowerUngated += binPower * binCount;
-                countUngated += binCount;
-            }
+            sumPowerUngated += histogramPower_[i].load(std::memory_order_relaxed);
+            countUngated += histogram_[i].load(std::memory_order_relaxed);
         }
 
         if (countUngated == 0) return T(-100);
@@ -272,21 +270,15 @@ public:
 
         // Pass 2: Relative Gate (-10 LU below ungated mean)
         double relativeGateLUFS = ungatedLUFS - 10.0;
-        int relativeGateBin = static_cast<int>(std::floor((relativeGateLUFS - kMinHistogramLUFS) / kBinWidth));
-        relativeGateBin = std::clamp(relativeGateBin, 0, kNumBins - 1);
+        const int relativeGateBin = firstBinAtOrAbove(relativeGateLUFS);
 
         double sumPowerGated = 0.0;
         uint64_t countGated = 0;
 
         for (int i = relativeGateBin; i < kNumBins; ++i)
         {
-            uint32_t binCount = histogram_[i].load(std::memory_order_relaxed);
-            if (binCount > 0)
-            {
-                double binPower = lufsToPower(kMinHistogramLUFS + static_cast<double>(i) * kBinWidth);
-                sumPowerGated += binPower * binCount;
-                countGated += binCount;
-            }
+            sumPowerGated += histogramPower_[i].load(std::memory_order_relaxed);
+            countGated += histogram_[i].load(std::memory_order_relaxed);
         }
 
         if (countGated == 0) return T(-100);
@@ -374,8 +366,7 @@ public:
         if (count == 0) return T(0);
 
         const double relGateLUFS = powerToLUFS(sumPower / count) - 20.0;
-        int gateBin = static_cast<int>(std::floor((relGateLUFS - kMinHistogramLUFS) / kBinWidth));
-        gateBin = std::clamp(gateBin, 0, kNumBins - 1);
+        const int gateBin = firstBinAtOrAbove(relGateLUFS);
 
         // Pass 2: 10th / 95th percentiles above the relative gate.
         uint64_t gatedCount = 0;
@@ -433,6 +424,8 @@ public:
 
         for (auto& bin : histogram_)
             bin.store(0, std::memory_order_relaxed);
+        for (auto& energy : histogramPower_)
+            energy.store(0.0, std::memory_order_relaxed);
         for (auto& bin : lraHistogram_)
             bin.store(0, std::memory_order_relaxed);
 
@@ -549,6 +542,9 @@ private:
                     invalidateMeasurement();
                 binIndex = std::clamp(binIndex, 0, kNumBins - 1);
                 incrementHistogram(histogram_[binIndex]);
+                auto& energy = histogramPower_[static_cast<size_t>(binIndex)];
+                energy.store(energy.load(std::memory_order_relaxed) + gating400,
+                             std::memory_order_relaxed);
             }
         }
 
@@ -604,6 +600,14 @@ private:
         return static_cast<T>(powerToLUFS(sum / numBlocks));
     }
 
+    /// First histogram bin whose centre is at or above `lufs`: a block stands
+    /// for its bin, so a bin takes part in a gate when its centre clears it.
+    [[nodiscard]] static int firstBinAtOrAbove(double lufs) noexcept
+    {
+        const double position = std::ceil((lufs - kMinHistogramLUFS) / kBinWidth);
+        return static_cast<int>(std::clamp(position, 0.0, static_cast<double>(kNumBins - 1)));
+    }
+
     [[nodiscard]] static double powerToLUFS(double meanPower) noexcept
     {
         if (meanPower <= 1e-10) return -100.0; // Prevent log10(0)
@@ -630,8 +634,10 @@ private:
     std::atomic<int> blockWritePos_{0};
     int64_t totalCommittedBlocks_ = 0;
 
-    // O(1) Histogram for Integrated Loudness
+    // Constant-memory histogram for integrated loudness. The count decides the
+    // gates; the energy beside it is the exact sum of the blocks in that bin.
     std::array<std::atomic<uint32_t>, kNumBins> histogram_;
+    std::array<std::atomic<double>, kNumBins> histogramPower_;
 
     // EBU Tech 3342 loudness-range histogram (short-term values, 100 ms hop)
     std::array<std::atomic<uint32_t>, kNumBins> lraHistogram_;

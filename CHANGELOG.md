@@ -17,6 +17,12 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `LoudnessMeter::getIntegratedLUFS()` now sums the exact energy of the blocks
+  in each histogram bin instead of the bin centre, so a reading is no longer
+  held to a 0.1 LU grid: it agrees with libebur128's exact block mode to four
+  decimals on steady tones and within 0.004 LU on the programmes measured. The
+  relative gates keep a bin only when its centre clears the threshold. The
+  meter grows by 8 KB and stays allocation-free.
 - `AlgorithmicReverb<float>` now uses the shared double-precision `Biquad`
   core for its subsonic and stereo-coherence output high-pass filters.
   The former float recursions amplified one-ULP input perturbations into

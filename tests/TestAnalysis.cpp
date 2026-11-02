@@ -385,10 +385,70 @@ DSPARK_TEST(LoudnessMeter_sine_997Hz_reference)
         meter.processBlock(std::as_const(buf).toView());
     }
 
-    float lufs = meter.getIntegratedLUFS();
-    // Should be approximately -23 LUFS (within +/-2 LU due to K-weighting)
-    EXPECT_GT(lufs, -27.0f);
-    EXPECT_LT(lufs, -19.0f);
+    // K-weighting at 997 Hz adds the 0.691 dB the LUFS constant removes, so the
+    // tone reads its own per-channel peak level. Tech 3341 allows +/-0.1 LU.
+    EXPECT_NEAR(meter.getIntegratedLUFS(), -23.0f, 0.05f);
+}
+
+// Integrated loudness reads the block energies themselves, not a 0.1 LU grid.
+// Holding only a count per bin read -23.00 for a -23.04 tone and -30.10 for a
+// -30.07 tone; libebur128's exact block mode reads the input level on all three.
+DSPARK_TEST(LoudnessMeter_integrated_is_not_quantized_to_the_histogram_grid)
+{
+    for (double level : { -23.04, -18.33, -30.07 })
+    {
+        LoudnessMeter<float> meter;
+        meter.prepare(48000.0, 2);
+        const double gain = std::pow(10.0, level / 20.0);
+        std::vector<float> block(1024);
+        std::int64_t position = 0;
+        for (int b = 0; b < 200; ++b)
+        {
+            for (float& sample : block)
+            {
+                sample = static_cast<float>(gain * std::sin(2.0 * 3.141592653589793 * 997.0
+                                                            * static_cast<double>(position++) / 48000.0));
+            }
+            meter.process(block.data(), block.data(), static_cast<int>(block.size()));
+        }
+        EXPECT_NEAR(meter.getIntegratedLUFS(), level, 0.002);
+    }
+}
+
+// The relative gate keeps a bin when its centre clears the threshold, as
+// libebur128 does. Rounding the gate position down kept the bin below it.
+DSPARK_TEST(LoudnessMeter_relative_gate_tests_each_bin_at_its_centre)
+{
+    // 20 s at -20 and 2 s at q: the first pass means about -20.3, which puts the
+    // relative gate near -30.3, between the bin centres -30.4 and -30.3.
+    auto integrated = [](double quietDb)
+    {
+        LoudnessMeter<double> meter;
+        meter.prepare(48000.0, 2);
+        std::vector<double> block(1024);
+        std::int64_t position = 0;
+        auto run = [&](double db, double seconds)
+        {
+            const double gain = std::pow(10.0, db / 20.0);
+            for (auto left = static_cast<std::int64_t>(seconds * 48000.0); left > 0; left -= 1024)
+            {
+                for (double& sample : block)
+                    sample = gain * std::sin(2.0 * 3.141592653589793 * 997.0
+                                             * static_cast<double>(position++) / 48000.0);
+                meter.process(block.data(), block.data(), 1024);
+            }
+        };
+        run(-20.0, 20.0);
+        run(quietDb, 2.0);
+        return static_cast<double>(meter.getIntegratedLUFS());
+    };
+    // Well below the gate the quiet segment cannot move the reading.
+    EXPECT_NEAR(integrated(-45.0), -20.0, 0.05);
+    // The bin at -30.4 is below the gate. Rounding the position down kept it and
+    // read about -20.3.
+    EXPECT_NEAR(integrated(-30.4), -20.0, 0.05);
+    // The bin at -30.2 clears the gate, so it counts and pulls the mean down.
+    EXPECT_LT(integrated(-30.2), -20.2);
 }
 
 DSPARK_TEST(LoudnessMeter_invalid_inputs_are_ignored)

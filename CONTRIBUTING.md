@@ -75,7 +75,8 @@ Every push and pull request runs, across Windows (MSVC x64 and ARM64), Linux
   SSE2 baseline build would never reach
 - an exceptions-free, RTTI-free, file-IO-free embedded profile
 - the single-header amalgamation, compiled after generation
-- EBU R128 conformance against the official Tech 3341/3342 test vectors
+- EBU R128 tone programmes from Tech 3341/3342 on every target, and the official
+  test vectors whenever a runner can obtain them
 - the example plugins in all three formats, through `pluginval`,
   `clap-validator` and Apple's `auval`, plus DSPark's own VST3/CLAP smoke
   hosts (bypass latency alignment, oversize blocks, parameter text round trips)

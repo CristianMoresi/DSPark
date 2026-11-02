@@ -12,6 +12,9 @@
 //             delay-compensated dry path
 //   [metrics] objective quality numbers (resampler SNR, EQ linear-phase
 //             level, oscillator levels, filter DC rejection, ...)
+//   [r128]    EBU R128 tone programmes generated here from the levels and
+//             durations of Tech 3341 and Tech 3342 table 1, so gating, windows
+//             and true peak are measured on every target
 //   [ebu]     EBU R128 conformance against the official EBU loudness test
 //             set: integrated loudness (Tech 3341-2023 table 1), loudness
 //             range (Tech 3342-2023 table 1) and true peak (Tech 3341 cases
@@ -1359,6 +1362,180 @@ void runMetricTests()
 }
 
 // -----------------------------------------------------------------------------
+// [r128] - EBU R128 tone programmes, generated here
+//
+// The official set cannot be redistributed and its host refuses most automated
+// downloads, so [ebu] skips on most runners. These programmes rebuild the sine
+// cases of Tech 3341 and Tech 3342 table 1 from their published levels and
+// durations, which keeps the gates, the windows and the true-peak path under
+// test on every target. Cases built from recorded programme still need the
+// official files.
+// -----------------------------------------------------------------------------
+
+struct ToneSegment
+{
+    double dbfs;
+    double seconds;
+};
+
+struct ToneMeasurement
+{
+    double momentary = 0;
+    double shortTerm = 0;
+    double integrated = 0;
+    double range = 0;
+};
+
+// 1 kHz at 48 kHz, in phase on both channels, peak level per channel. The sine
+// comes from the sample index, so its period is exact whatever the programme.
+ToneMeasurement measureToneProgramme(const std::vector<ToneSegment>& programme)
+{
+    constexpr int kRate = 48000;
+    constexpr int kBlock = 1024;
+    dspark::LoudnessMeter<float> meter;
+    meter.prepare(static_cast<double>(kRate), 2);
+
+    std::vector<float> block(static_cast<size_t>(kBlock));
+    std::int64_t position = 0;
+    for (const ToneSegment& segment : programme)
+    {
+        const double gain = std::pow(10.0, segment.dbfs / 20.0);
+        auto remaining = static_cast<std::int64_t>(std::llround(segment.seconds * kRate));
+        while (remaining > 0)
+        {
+            const int n = static_cast<int>(std::min<std::int64_t>(remaining, kBlock));
+            for (int i = 0; i < n; ++i)
+            {
+                const auto phase = static_cast<double>((position + i) % 48) / 48.0;
+                block[static_cast<size_t>(i)] = static_cast<float>(
+                    gain * std::sin(dspark::twoPi<double> * phase));
+            }
+            meter.process(block.data(), block.data(), n);
+            position += n;
+            remaining -= n;
+        }
+    }
+
+    ToneMeasurement result;
+    result.momentary = static_cast<double>(meter.getMomentaryLUFS());
+    result.shortTerm = static_cast<double>(meter.getShortTermLUFS());
+    result.integrated = static_cast<double>(meter.getIntegratedLUFS());
+    result.range = static_cast<double>(meter.getLoudnessRange());
+    return result;
+}
+
+// Peak of a sine whose samples straddle its crest: the sample peak reads low and
+// only the interpolator can recover the true level. The tone fades in, because a
+// step at the first sample really does reconstruct above the steady amplitude.
+double tonePeakDb(double cyclesPerSample, double phaseRadians, double truePeakDb)
+{
+    dspark::LoudnessMeter<float> meter;
+    meter.prepare(48000.0, 2);
+    const double gain = std::pow(10.0, truePeakDb / 20.0);
+    constexpr int kBlock = 1024;
+    constexpr int kFade = 2048;
+    std::vector<float> block(static_cast<size_t>(kBlock));
+    for (int b = 0; b < 48; ++b)
+    {
+        for (int i = 0; i < kBlock; ++i)
+        {
+            const int n = b * kBlock + i;
+            const double cycles = cyclesPerSample * static_cast<double>(n);
+            const double fraction = cycles - std::floor(cycles);
+            const double fade = n < kFade
+                ? 0.5 - 0.5 * std::cos(dspark::pi<double> * static_cast<double>(n) / kFade)
+                : 1.0;
+            block[static_cast<size_t>(i)] = static_cast<float>(
+                fade * gain * std::sin(dspark::twoPi<double> * fraction + phaseRadians));
+        }
+        meter.process(block.data(), block.data(), kBlock);
+    }
+    return static_cast<double>(meter.getTruePeakDb());
+}
+
+void runR128ToneTests()
+{
+    // Tech 3341 allows +/-0.1 LU and Tech 3342 allows +/-1 LU. A steady tone has
+    // no measurement noise to absorb, so both are held to 0.1 here.
+    constexpr double kToleranceLu = 0.1;
+    char d[96];
+
+    struct Case
+    {
+        const char* name;
+        std::vector<ToneSegment> programme;
+        double integrated;
+    };
+    const Case integratedCases[] = {
+        { "3341-1 tones integrated -23 LUFS", { { -23.0, 20.0 } }, -23.0 },
+        { "3341-2 tones integrated -33 LUFS", { { -33.0, 20.0 } }, -33.0 },
+        { "3341-3 tones relative gate", { { -36.0, 10.0 }, { -23.0, 60.0 }, { -36.0, 10.0 } }, -23.0 },
+        { "3341-4 tones absolute gate",
+          { { -72.0, 10.0 }, { -36.0, 10.0 }, { -23.0, 60.0 }, { -36.0, 10.0 }, { -72.0, 10.0 } },
+          -23.0 },
+        { "3341-5 tones energy mean", { { -26.0, 20.0 }, { -20.0, 20.1 }, { -26.0, 20.0 } }, -23.0 },
+    };
+    for (const Case& c : integratedCases)
+    {
+        const ToneMeasurement m = measureToneProgramme(c.programme);
+        std::snprintf(d, sizeof(d), "(got %.3f LUFS, expected %.1f)", m.integrated, c.integrated);
+        check(std::abs(m.integrated - c.integrated) <= kToleranceLu, "r128", c.name, d);
+    }
+
+    const ToneMeasurement steady = measureToneProgramme({ { -23.0, 20.0 } });
+    std::snprintf(d, sizeof(d), "(got %.3f LUFS)", steady.momentary);
+    check(std::abs(steady.momentary + 23.0) <= kToleranceLu, "r128", "3341-1 tones momentary", d);
+    std::snprintf(d, sizeof(d), "(got %.3f LUFS)", steady.shortTerm);
+    check(std::abs(steady.shortTerm + 23.0) <= kToleranceLu, "r128", "3341-1 tones short term", d);
+
+    struct RangeCase
+    {
+        const char* name;
+        std::vector<double> levels;
+        double range;
+    };
+    const RangeCase rangeCases[] = {
+        { "3342-1 tones LRA 10 LU", { -20.0, -30.0 }, 10.0 },
+        { "3342-2 tones LRA 5 LU", { -20.0, -15.0 }, 5.0 },
+        { "3342-3 tones LRA 20 LU", { -40.0, -20.0 }, 20.0 },
+        { "3342-4 tones LRA 15 LU", { -50.0, -35.0, -20.0, -35.0, -50.0 }, 15.0 },
+    };
+    for (const RangeCase& c : rangeCases)
+    {
+        std::vector<ToneSegment> programme;
+        for (double level : c.levels)
+            programme.push_back({ level, 20.0 });
+        const ToneMeasurement m = measureToneProgramme(programme);
+        std::snprintf(d, sizeof(d), "(got %.2f LU, expected %.1f)", m.range, c.range);
+        check(std::abs(m.range - c.range) <= kToleranceLu, "r128", c.name, d);
+    }
+
+    // Tech 3341 true-peak tolerance is +0.2/-0.4 dB. Each sine reaches its true
+    // peak between samples, at the worst phase for its rate.
+    struct PeakCase
+    {
+        const char* name;
+        double cyclesPerSample;
+        double phaseDegrees;
+        double truePeakDb;
+    };
+    const PeakCase peakCases[] = {
+        { "true peak fs/4 at 0 degrees", 0.25, 0.0, -6.0 },
+        { "true peak fs/4 at 45 degrees", 0.25, 45.0, -6.0 },
+        { "true peak fs/6 at 60 degrees", 1.0 / 6.0, 60.0, -6.0 },
+        { "true peak fs/8 at 67.5 degrees", 0.125, 67.5, -6.0 },
+        { "true peak fs/4 at 45 degrees over full scale", 0.25, 45.0, 3.0 },
+    };
+    for (const PeakCase& c : peakCases)
+    {
+        const double got = tonePeakDb(c.cyclesPerSample, c.phaseDegrees * dspark::twoPi<double> / 360.0,
+                                      c.truePeakDb);
+        std::snprintf(d, sizeof(d), "(got %.2f dBTP, expected %.1f)", got, c.truePeakDb);
+        check(got >= c.truePeakDb - 0.4 && got <= c.truePeakDb + 0.2, "r128", c.name, d);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // [ebu] - official EBU R128 test set (optional)
 // -----------------------------------------------------------------------------
 
@@ -2385,6 +2562,7 @@ int main(int argc, char** argv)
     runSmokeTests();
     runPdcNullTests();
     runMetricTests();
+    runR128ToneTests();
     runEbuTests();
 
     std::printf("\n================================\n");

@@ -7,6 +7,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -622,7 +625,7 @@ jobs:
 
       # Concurrency claims come from the named threaded tests printed by this
       # exact run; executing a single-threaded case under TSan is not presented
-      # as proof of a hand-off. The ordinary suite authority is currently 1245
+      # as proof of a hand-off. The ordinary suite authority is currently 1247
       # named cases. The separate Reverb publication executable also runs here.
       # The allocation injector is synchronous: its exhaustive failure sweep
       # runs unchanged in every native job and both ASan/UBSan jobs. Repeating
@@ -675,7 +678,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Pinned for the same reason as the validators below: an upstream release
+      # must not turn this gate red on its own. Moving it is a deliberate upgrade.
       - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.12
       - name: Build
         run: >
           em++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I .
@@ -779,10 +786,13 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # EBU R128 conformance against the official EBU loudness test set
-  # (downloaded from tech.ebu.ch with caching; never redistributed in-repo)
+  # (downloaded from tech.ebu.ch with caching; never redistributed in-repo).
+  # Best effort: GitHub runners are usually refused, so this job normally
+  # reports skips. The tone programmes of the [r128] section are the real gate
+  # and run in the conformance suite on every target.
   # ---------------------------------------------------------------------------
   ebu-r128:
-    name: EBU R128 conformance (official test set)
+    name: EBU R128 official vectors (best effort)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

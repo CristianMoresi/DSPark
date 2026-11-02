@@ -541,8 +541,15 @@ DSPARK_TEST(Ladder_invalid_inputs_ignored_and_getters_honest)
 
 DSPARK_TEST(Ladder_block_matches_per_sample)
 {
-    // The block path must be bit-identical to the per-sample path (same
-    // snapshot, same coefficients, same FP order), across modes and drive.
+    // The block path must match the per-sample path (same snapshot, same
+    // coefficients, same step) across modes and drive. The match is bit-exact
+    // unless the compiler contracts multiply-adds: it may fuse the two inlined
+    // copies differently, and then the last bits move but nothing else may.
+#if defined(__FP_FAST_FMAF) || defined(__AVX2__)
+    constexpr float kTolerance = 4e-6f;
+#else
+    constexpr float kTolerance = 0.0f;
+#endif
     using M = LadderFilter<float>::Mode;
     for (M mode : { M::LP24, M::HP24, M::BP12 })
     {
@@ -571,7 +578,8 @@ DSPARK_TEST(Ladder_block_matches_per_sample)
             }
             blockF.processBlock(tb.view());
             for (int i = 0; i < blockSize; ++i)
-                if (tb.ch(0)[i] != sampleF.processSample(in[static_cast<size_t>(i)], 0)) ++mismatches;
+                if (std::abs(tb.ch(0)[i] - sampleF.processSample(in[static_cast<size_t>(i)], 0)) > kTolerance)
+                    ++mismatches;
         }
         EXPECT_EQ(mismatches, 0);
     }

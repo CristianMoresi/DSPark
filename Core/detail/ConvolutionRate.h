@@ -25,7 +25,6 @@ class ConvolutionRate final
     Convolver<double> up_, referenceUp_, down_;
     AudioBuffer<double> buffer_, reference_;
     int factor_, latency_ = 0;
-    bool withReference_;
 
   public:
     struct Settings
@@ -74,7 +73,7 @@ class ConvolutionRate final
     }
 
     ConvolutionRate(int factor, Settings settings, bool withReference)
-        : factor_(factor), withReference_(withReference)
+        : factor_(factor)
     {
         assert(valid(factor, settings));
         buffer_.resize(1, 256 * factor);
@@ -109,7 +108,7 @@ class ConvolutionRate final
 
     double *upsampleReference(const double *input, int count) noexcept
     {
-        assert(withReference_ && count >= 0 && count <= 256);
+        assert(reference_.getNumChannels() == 1 && count >= 0 && count <= 256);
         auto *out = reference_.getChannel(0);
         std::fill_n(out, count * factor_, 0.);
         for (int i = 0; i < count; ++i)

@@ -703,16 +703,16 @@ DSPARK_TEST(OfflineClip_NativeSineSlopeUsesTheExistingCurve)
 DSPARK_TEST(OfflineClip_SincPhaseHandlesEndpointShifts)
 {
     constexpr int frames = 257, block = 128;
-    std::array<double, frames> input{};
+    std::vector<double> input(frames);
     std::array<double, block> output{};
     for (int i = 0; i < frames; ++i)
-        input[i] = .3 * std::sin(.217 * i) + .2 * std::cos(.763 * i);
+        input[static_cast<std::size_t>(i)] = .3 * std::sin(.217 * i) + .2 * std::cos(.763 * i);
     const OfflineJobOptions options;
     detail::OfflineSession job(options);
     detail::OfflineProductWorkspace work(job, frames, block,
                                          detail::OfflineProductWorkspace::NearFields::External);
     auto reader = [&](std::int64_t first, int count, double *out) {
-        std::copy_n(input.data() + first, count, out);
+        std::copy_n(input.data() + first, std::min<std::int64_t>(count, frames - first), out);
     };
     detail::OfflineHilbertMap map(work, reader);
     for (double shift : {std::nextafter(-1., 0.), -.9375, -.5, 0., .5, .9375,

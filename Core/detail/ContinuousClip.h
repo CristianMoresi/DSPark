@@ -321,7 +321,16 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
                     edges[n++] = crossing;
                 }
             edges[n++] = b;
-            std::sort(edges.begin(), edges.begin() + n);
+            // A handful of edges that arrive monotonic, whichever way the
+            // segment runs: insertion is the cheapest correct order here.
+            for (int i = 1; i < n; ++i)
+            {
+                const double edge = edges[i];
+                int j = i;
+                for (; j > 0 && edges[j - 1] > edge; --j)
+                    edges[j] = edges[j - 1];
+                edges[j] = edge;
+            }
             Moments out{};
             for (int i = 0; i + 1 < n; ++i)
                 add(out, segment(p, edges[i], edges[i + 1]));

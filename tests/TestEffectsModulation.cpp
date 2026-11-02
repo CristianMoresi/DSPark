@@ -17,9 +17,12 @@
 #include "../Effects/NoiseGenerator.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <vector>
 
 using namespace dspark;
@@ -2152,4 +2155,51 @@ DSPARK_TEST(AlgoReverb_batched_params_survive_setType)
     r.processBlock(b.view());          // drain applies preset + overrides
     EXPECT_NEAR(r.getDecay(), 3.0f, 1e-4f);
     EXPECT_NEAR(r.getHighCrossover(), 8000.0f, 1e-3f);
+}
+
+// The modulation phase and the read position are double whatever the sample
+// type is. In float, the phase accumulator rounded every step and drifted in
+// rate, and a line thousands of samples long resolved its position to about
+// 0.001 samples, which left AlgorithmicReverb<float> only 28 dB under the signal
+// away from the double result, with error peaks at signal level.
+DSPARK_TEST(AlgoReverb_float_tracks_double_at_full_modulation)
+{
+    using namespace dspark;
+    auto render = []<typename T>(T)
+    {
+        auto reverb = std::make_unique<AlgorithmicReverb<T>>();
+        reverb->setType(AlgorithmicReverb<T>::Type::Chamber);
+        reverb->setDecay(T(2.5));
+        reverb->setSize(T(0.7));
+        reverb->setPreDelay(T(20));
+        reverb->setMix(T(1));
+        reverb->setModulation(T(1));
+        reverb->prepare(spec(48000.0, 512, 2));
+        std::array<T, 512> left {}, right {};
+        T* channels[] = { left.data(), right.data() };
+        std::vector<double> out;
+        std::uint32_t state = 0x1badb002u;
+        for (int offset = 0; offset < 4 * 48000; offset += 512)
+        {
+            for (int n = 0; n < 512; ++n)
+                for (int ch = 0; ch < 2; ++ch)
+                {
+                    state = state * 1664525u + 1013904223u;
+                    const int value = static_cast<int>(state >> 16) - 32768;
+                    channels[ch][n] = offset < 48000 ? static_cast<T>(value) * T(1.0 / 262144.0) : T(0);
+                }
+            reverb->processBlock({ channels, 2, 512 });
+            out.insert(out.end(), left.begin(), left.end());
+        }
+        return out;
+    };
+    const auto single = render(float {});
+    const auto reference = render(double {});
+    double error = 0.0, signal = 0.0;
+    for (std::size_t i = 0; i < reference.size(); ++i)
+    {
+        error += (single[i] - reference[i]) * (single[i] - reference[i]);
+        signal += reference[i] * reference[i];
+    }
+    EXPECT_LT(10.0 * std::log10(error / signal), -45.0);
 }

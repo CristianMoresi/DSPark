@@ -23,6 +23,10 @@ All notable user-facing changes to DSPark are documented here.
   decimals on steady tones and within 0.004 LU on the programmes measured. The
   relative gates keep a bin only when its centre clears the threshold. The
   meter grows by 8 KB and stays allocation-free.
+- `AlgorithmicReverb<float>` now keeps its modulation phase and read positions
+  in double. The float versions drifted in rate and resolved a long line to
+  about 0.001 samples, which put the float output only 28 dB under the signal
+  away from the double result; it is now 50 to 80 dB under it.
 - `AlgorithmicReverb<float>` now uses the shared double-precision `Biquad`
   core for its subsonic and stereo-coherence output high-pass filters.
   The former float recursions amplified one-ULP input perturbations into

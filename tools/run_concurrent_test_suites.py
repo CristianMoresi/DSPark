@@ -44,7 +44,7 @@ _TAIL_LINE_CHARACTERS = 320
 _MAX_COPIES = 64
 _TERMINATE_GRACE_SECONDS = 5.0
 _PR_SET_CHILD_SUBREAPER = 36
-_EXPECTED_SUITE_TESTS = 1247
+_EXPECTED_SUITE_TESTS = 1248
 _ATOMIC_CLAIM_TEST = "TestIO_process_temporary_root_is_exclusive"
 _WINDOWS_TRAMPOLINE = "--windows-trampoline"
 _WINDOWS_SELF_TEST_SUBJECT = "--windows-self-test-subject"
@@ -338,7 +338,7 @@ def _build(repo: Path, root: Path, mutant: str | None,
         "$REPO" if item == os.fspath(repo) else item
     )
     _run(configure, [display(item) for item in configure], repo, "configure", history)
-    build_command = ["cmake", "--build", os.fspath(build), "--target", "dspark_tests", "--parallel"]
+    build_command = ["cmake", "--build", os.fspath(build), "--target", "dspark_tests", "--parallel", "3"]
     _run(build_command, [display(item) for item in build_command], repo, "build", history)
     names = ("dspark_tests", "dspark_tests.exe")
     candidates = [path for name in names for path in build.rglob(name) if path.is_file()]

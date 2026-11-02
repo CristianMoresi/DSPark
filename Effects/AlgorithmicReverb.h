@@ -452,8 +452,8 @@ public:
             }
             lenCur_[i] = static_cast<T>(lenTarget_[i]);
             loopAPCur_[i] = static_cast<T>(loopAPLen_[i]);
-            pos_[i] = std::max(lenCur_[i], T(kMinReadPos));
-            posInc_[i] = T(0);
+            pos_[i] = static_cast<double>(std::max(lenCur_[i], T(kMinReadPos)));
+            posInc_[i] = 0.0;
         }
         ctrlPhase_ = 0;
         loopAPGliding_ = false;
@@ -1056,47 +1056,50 @@ protected:
      */
     struct SmoothRandomLFO
     {
-        T h0_ = T(0), h1_ = T(0), h2_ = T(0), h3_ = T(0);
-        T phase_ = T(0);
-        T phaseInc_ = T(0);
+        // Double state whatever T is: the increment is tiny against the phase,
+        // so a float accumulator rounds every step and drifts in rate, and a
+        // rotation of up to kRotMaxRad turns that drift into an audible change.
+        double h0_ = 0.0, h1_ = 0.0, h2_ = 0.0, h3_ = 0.0;
+        double phase_ = 0.0;
+        double phaseInc_ = 0.0;
         uint32_t state_ = 1;
 
         void prepare(double sr, T rate, uint32_t seed) noexcept
         {
-            phaseInc_ = rate / static_cast<T>(sr);
+            phaseInc_ = static_cast<double>(rate) / sr;
             state_ = seed ? seed : 1;
             h0_ = nextRandom(); h1_ = nextRandom();
             h2_ = nextRandom(); h3_ = nextRandom();
-            phase_ = T(0);
+            phase_ = 0.0;
         }
 
-        void setRate(T rate, double sr) noexcept { phaseInc_ = rate / static_cast<T>(sr); }
+        void setRate(T rate, double sr) noexcept { phaseInc_ = static_cast<double>(rate) / sr; }
 
         /// Advances by `stride` samples (rates stay far below sr / stride, so
         /// at most one new target is drawn per call).
         T nextStride(int stride) noexcept
         {
-            phase_ += phaseInc_ * static_cast<T>(stride);
-            if (phase_ >= T(1))
+            phase_ += phaseInc_ * static_cast<double>(stride);
+            if (phase_ >= 1.0)
             {
-                phase_ -= T(1);
+                phase_ -= 1.0;
                 h0_ = h1_; h1_ = h2_; h2_ = h3_;
                 h3_ = nextRandom();
             }
-            const T d = phase_;
-            const T c1 = T(0.5) * (h2_ - h0_);
-            const T c2 = h0_ - T(2.5) * h1_ + T(2) * h2_ - T(0.5) * h3_;
-            const T c3 = T(0.5) * (h3_ - h0_) + T(1.5) * (h1_ - h2_);
-            return ((c3 * d + c2) * d + c1) * d + h1_;
+            const double d = phase_;
+            const double c1 = 0.5 * (h2_ - h0_);
+            const double c2 = h0_ - 2.5 * h1_ + 2.0 * h2_ - 0.5 * h3_;
+            const double c3 = 0.5 * (h3_ - h0_) + 1.5 * (h1_ - h2_);
+            return static_cast<T>(((c3 * d + c2) * d + c1) * d + h1_);
         }
 
     private:
-        T nextRandom() noexcept
+        double nextRandom() noexcept
         {
             state_ ^= state_ << 13;
             state_ ^= state_ >> 17;
             state_ ^= state_ << 5;
-            return static_cast<T>(state_) / static_cast<T>(0xFFFFFFFFu) * T(2) - T(1);
+            return static_cast<double>(state_) / static_cast<double>(0xFFFFFFFFu) * 2.0 - 1.0;
         }
     };
 
@@ -1176,8 +1179,10 @@ protected:
     DelayBank lines_;
     std::array<int, kMaxLines> lenTarget_ {};    ///< prime line lengths (samples)
     std::array<T, kMaxLines> lenCur_ {};         ///< gliding length
-    std::array<T, kMaxLines> pos_ {};            ///< current read position
-    std::array<T, kMaxLines> posInc_ {};         ///< per-sample ramp
+    // Double whatever T is: a float position on a line thousands of samples long
+    // resolves only about 0.001 samples, which is jitter on every modulated read.
+    std::array<double, kMaxLines> pos_ {};       ///< current read position
+    std::array<double, kMaxLines> posInc_ {};    ///< per-sample ramp
     std::array<T, kMaxLines> apY1_ {};           ///< allpass interpolator state
     std::array<int, kMaxLines> injTap_ {};
     std::array<T, kMaxLines> injGain_ {};        ///< sign / sqrt(lines)
@@ -1393,8 +1398,10 @@ protected:
             const T diff = static_cast<T>(lenTarget_[i]) - lenCur_[i];
             lenCur_[i] += std::clamp(diff * glideCoeff_, -maxGlideStep_, maxGlideStep_);
             const T m = lfo_[i].nextStride(kCtrl) * modDepthSamples_;
-            const T target = std::clamp(lenCur_[i] + m, kMinReadPos, maxReadPos_);
-            posInc_[i] = (target - pos_[i]) * (T(1) / T(kCtrl));
+            const double target = std::clamp(static_cast<double>(lenCur_[i]) + static_cast<double>(m),
+                                             static_cast<double>(kMinReadPos),
+                                             static_cast<double>(maxReadPos_));
+            posInc_[i] = (target - pos_[i]) * (1.0 / static_cast<double>(kCtrl));
         }
         if (loopAPGliding_)
         {
@@ -1479,9 +1486,9 @@ protected:
         // scalar gather.
         for (int i = 0; i < N; ++i)
         {
-            const T p = pos_[i] += posInc_[i];
-            const int M = static_cast<int>(p - T(0.5));
-            const T h = (p - static_cast<T>(M) - T(1)) * T(0.5);
+            const double p = pos_[i] += posInc_[i];
+            const int M = static_cast<int>(p - 0.5);
+            const T h = static_cast<T>((p - static_cast<double>(M) - 1.0) * 0.5);
             v[i] = -h * (T(1) - h * (T(1) - h * (T(1) - h)));
             idx[i] = M;
         }
@@ -1647,9 +1654,9 @@ protected:
         alignas(64) std::array<T, Springs> x;
         for (int s = 0; s < Springs; ++s)
         {
-            const T p = pos_[s] += posInc_[s];
-            const int M = static_cast<int>(p - T(0.5));
-            const T h = (p - static_cast<T>(M) - T(1)) * T(0.5);
+            const double p = pos_[s] += posInc_[s];
+            const int M = static_cast<int>(p - 0.5);
+            const T h = static_cast<T>((p - static_cast<double>(M) - 1.0) * 0.5);
             const T eta = -h * (T(1) - h * (T(1) - h * (T(1) - h)));
             const T y = eta * (lines_.at(s, M) - apY1_[s]) + lines_.at(s, M + 1);
             apY1_[s] = y;

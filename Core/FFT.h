@@ -17,7 +17,9 @@
  * - **Split complex layout inside**: the real and imaginary parts live in
  *   separate arrays while the passes run, so every butterfly is plain vector
  *   arithmetic (no shuffles in the complex multiplies). The interleaved API
- *   layout is converted once on the way in and once on the way out.
+ *   layout is read by the first pass and written by the last, so converting it
+ *   costs no pass over memory of its own. The closing pass needs no table
+ *   twiddles.
  * - **SIMD at the widest width a pass allows**: AVX (8 float / 4 double
  *   lanes, with FMA when enabled) where the build targets it, SSE2 on every
  *   x86-64, NEON on ARM64, scalar otherwise. The first pass, whose stride is
@@ -96,6 +98,71 @@ struct TwiddleSpan
     const T* w3r; const T* w3i;
 };
 
+/// Where the first pass reads its input from, and where the last pass writes.
+/// Reading interleaved data directly in the first pass, and writing it directly
+/// in the last, saves one full pass over memory in each direction.
+template <typename T, int W>
+struct SplitSource
+{
+    using O = Vec<T, W>;
+    const T* re;
+    const T* im;
+    void read(size_t i, typename O::V& r, typename O::V& m) const noexcept
+    {
+        r = O::load(re + i);
+        m = O::load(im + i);
+    }
+};
+
+template <typename T, int W>
+struct InterleavedSource
+{
+    using O = Vec<T, W>;
+    const T* data;
+    void read(size_t i, typename O::V& r, typename O::V& m) const noexcept
+    {
+        O::loadDeinterleave(data + 2 * i, r, m);
+    }
+};
+
+template <typename T, int W>
+struct ConjugatedSource
+{
+    using O = Vec<T, W>;
+    const T* data;
+    void read(size_t i, typename O::V& r, typename O::V& m) const noexcept
+    {
+        O::loadDeinterleave(data + 2 * i, r, m);
+        m = O::sub(O::set1(T(0)), m);
+    }
+};
+
+template <typename T, int W>
+struct SplitSink
+{
+    using O = Vec<T, W>;
+    T* re;
+    T* im;
+    void write(size_t i, typename O::V r, typename O::V m) const noexcept
+    {
+        O::store(re + i, r);
+        O::store(im + i, m);
+    }
+};
+
+template <typename T, int W>
+struct InterleavedSink
+{
+    using O = Vec<T, W>;
+    T* data;
+    typename O::V scaleRe;
+    typename O::V scaleIm;
+    void write(size_t i, typename O::V r, typename O::V m) const noexcept
+    {
+        O::storeInterleave2(data + 2 * i, O::mul(r, scaleRe), O::mul(m, scaleIm));
+    }
+};
+
 /**
  * @brief One Stockham radix-4 DIF pass with stride s >= W, vectorised over
  *        the stride (twiddles broadcast per butterfly group).
@@ -154,8 +221,8 @@ void radix4Strided(const T* xr, const T* xi, T* yr, T* yi,
  *        contiguous in p, and the four outputs of each butterfly are adjacent,
  *        written through a 4-way interleave.
  */
-template <typename T, int W>
-void radix4First(const T* xr, const T* xi, T* yr, T* yi,
+template <typename T, int W, typename Source>
+void radix4First(const Source& input, T* yr, T* yi,
                  size_t n, const TwiddleSpan<T>& tw) noexcept
 {
     using O = Vec<T, W>;
@@ -166,10 +233,11 @@ void radix4First(const T* xr, const T* xi, T* yr, T* yi,
         const V w1r = O::load(tw.w1r + p), w1i = O::load(tw.w1i + p);
         const V w2r = O::load(tw.w2r + p), w2i = O::load(tw.w2i + p);
         const V w3r = O::load(tw.w3r + p), w3i = O::load(tw.w3i + p);
-        const V a_r = O::load(xr + p),          a_i = O::load(xi + p);
-        const V b_r = O::load(xr + p + n1),     b_i = O::load(xi + p + n1);
-        const V c_r = O::load(xr + p + 2 * n1), c_i = O::load(xi + p + 2 * n1);
-        const V d_r = O::load(xr + p + 3 * n1), d_i = O::load(xi + p + 3 * n1);
+        V a_r, a_i, b_r, b_i, c_r, c_i, d_r, d_i;
+        input.read(p, a_r, a_i);
+        input.read(p + n1, b_r, b_i);
+        input.read(p + 2 * n1, c_r, c_i);
+        input.read(p + 3 * n1, d_r, d_i);
         const V apcR = O::add(a_r, c_r), apcI = O::add(a_i, c_i);
         const V amcR = O::sub(a_r, c_r), amcI = O::sub(a_i, c_i);
         const V bpdR = O::add(b_r, d_r), bpdI = O::add(b_i, d_i);
@@ -188,19 +256,40 @@ void radix4First(const T* xr, const T* xi, T* yr, T* yi,
     }
 }
 
+/// The closing radix-4 pass (n = 4, stride s = N / 4): its only twiddles are 1.
+template <typename T, int W, typename Sink>
+void radix4Last(const T* xr, const T* xi, const Sink& output, size_t s) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    for (size_t q = 0; q < s; q += W)
+    {
+        const V a_r = O::load(xr + q),         a_i = O::load(xi + q);
+        const V b_r = O::load(xr + q + s),     b_i = O::load(xi + q + s);
+        const V c_r = O::load(xr + q + 2 * s), c_i = O::load(xi + q + 2 * s);
+        const V d_r = O::load(xr + q + 3 * s), d_i = O::load(xi + q + 3 * s);
+        const V apcR = O::add(a_r, c_r), apcI = O::add(a_i, c_i);
+        const V amcR = O::sub(a_r, c_r), amcI = O::sub(a_i, c_i);
+        const V bpdR = O::add(b_r, d_r), bpdI = O::add(b_i, d_i);
+        const V bmdR = O::sub(b_r, d_r), bmdI = O::sub(b_i, d_i);
+        output.write(q,         O::add(apcR, bpdR), O::add(apcI, bpdI));
+        output.write(q + s,     O::add(amcR, bmdI), O::sub(amcI, bmdR));
+        output.write(q + 2 * s, O::sub(apcR, bpdR), O::sub(apcI, bpdI));
+        output.write(q + 3 * s, O::sub(amcR, bmdI), O::add(amcI, bmdR));
+    }
+}
+
 /// The closing radix-2 pass (n = 2, stride s = N / 2): no twiddles.
-template <typename T, int W>
-void radix2Last(const T* xr, const T* xi, T* yr, T* yi, size_t s) noexcept
+template <typename T, int W, typename Sink>
+void radix2Last(const T* xr, const T* xi, const Sink& output, size_t s) noexcept
 {
     using O = Vec<T, W>;
     for (size_t q = 0; q < s; q += W)
     {
         const auto a_r = O::load(xr + q), a_i = O::load(xi + q);
         const auto b_r = O::load(xr + q + s), b_i = O::load(xi + q + s);
-        O::store(yr + q, O::add(a_r, b_r));
-        O::store(yi + q, O::add(a_i, b_i));
-        O::store(yr + q + s, O::sub(a_r, b_r));
-        O::store(yi + q + s, O::sub(a_i, b_i));
+        output.write(q, O::add(a_r, b_r), O::add(a_i, b_i));
+        output.write(q + s, O::sub(a_r, b_r), O::sub(a_i, b_i));
     }
 }
 
@@ -264,49 +353,168 @@ public:
      */
     void run(const T*& outRe, const T*& outIm) noexcept
     {
-        T* xr = bufA_.data(); T* xi = xr + n_;
-        T* yr = bufB_.data(); T* yi = yr + n_;
-        for (const Pass& pass : passes_)
-        {
-            if (pass.radix2)
-                runRadix2(xr, xi, yr, yi, pass.stride);
-            else
-                runRadix4(xr, xi, yr, yi, pass);
-            std::swap(xr, yr);
-            std::swap(xi, yi);
-        }
-        outRe = xr;
-        outIm = xi;
+        Buffers b = buffers();
+        runPasses(b, 0, passes_.size());
+        outRe = b.xr;
+        outIm = b.xi;
+    }
+
+    /**
+     * @brief Transforms interleaved (re, im) pairs, conjugated if asked, without
+     *        first copying them into the input buffers.
+     * @param data      N interleaved complex values.
+     * @param conjugate Conjugates the input.
+     * @param outRe     Receives the pointer to the N output real parts.
+     * @param outIm     Receives the pointer to the N output imaginary parts.
+     */
+    void runFrom(const T* data, bool conjugate, const T*& outRe, const T*& outIm) noexcept
+    {
+        Buffers b = buffers();
+        const size_t done = readInput(data, conjugate, b);
+        runPasses(b, done, passes_.size());
+        outRe = b.xr;
+        outIm = b.xi;
+    }
+
+    /**
+     * @brief Transforms the input buffers and writes interleaved output directly.
+     * @param out     Receives N interleaved complex values.
+     * @param scaleRe Factor applied to the real parts.
+     * @param scaleIm Factor applied to the imaginary parts.
+     */
+    void runTo(T* out, T scaleRe, T scaleIm) noexcept
+    {
+        Buffers b = buffers();
+        runPasses(b, 0, passes_.size() - 1);
+        closing<InterleavedSink>(passes_.back(), b.xr, b.xi, out, scaleRe, scaleIm);
+    }
+
+    /// runFrom() and runTo() together. A transform of one pass cannot do both
+    /// in that pass, so it reads through the input buffers.
+    void runFromTo(const T* data, bool conjugate, T* out, T scaleRe, T scaleIm) noexcept
+    {
+        Buffers b = buffers();
+        const size_t done = readInput(data, conjugate, b);
+        runPasses(b, done, passes_.size() - 1);
+        closing<InterleavedSink>(passes_.back(), b.xr, b.xi, out, scaleRe, scaleIm);
     }
 
 private:
     struct Pass { size_t len; size_t stride; size_t twOffset; bool radix2; };
+    struct Buffers { T* xr; T* xi; T* yr; T* yi; };
 
-    void runRadix4(const T* xr, const T* xi, T* yr, T* yi, const Pass& pass) const noexcept
+    [[nodiscard]] Buffers buffers() noexcept
+    {
+        return { bufA_.data(), bufA_.data() + n_, bufB_.data(), bufB_.data() + n_ };
+    }
+
+    [[nodiscard]] TwiddleSpan<T> twiddleSpan(const Pass& pass) const noexcept
     {
         const size_t n1 = pass.len / 4;
         const T* w = twiddles_.data() + pass.twOffset;
-        const TwiddleSpan<T> tw { w, w + n1, w + 2 * n1, w + 3 * n1, w + 4 * n1, w + 5 * n1 };
-        constexpr int wide = kWide<T>;
-        constexpr int narrow = kNarrow<T>;
-        if (pass.stride == 1)
-        {
-            if (n1 % wide == 0)        radix4First<T, wide>(xr, xi, yr, yi, pass.len, tw);
-            else if (n1 % narrow == 0) radix4First<T, narrow>(xr, xi, yr, yi, pass.len, tw);
-            else                       radix4First<T, 1>(xr, xi, yr, yi, pass.len, tw);
-        }
-        else if (pass.stride % wide == 0)   radix4Strided<T, wide>(xr, xi, yr, yi, pass.len, pass.stride, tw);
-        else if (pass.stride % narrow == 0) radix4Strided<T, narrow>(xr, xi, yr, yi, pass.len, pass.stride, tw);
-        else                                radix4Strided<T, 1>(xr, xi, yr, yi, pass.len, pass.stride, tw);
+        return { w, w + n1, w + 2 * n1, w + 3 * n1, w + 4 * n1, w + 5 * n1 };
     }
 
-    static void runRadix2(const T* xr, const T* xi, T* yr, T* yi, size_t s) noexcept
+    void runPasses(Buffers& b, size_t begin, size_t end) const noexcept
+    {
+        for (size_t i = begin; i < end; ++i)
+        {
+            const Pass& pass = passes_[i];
+            if (pass.radix2 || pass.len == 4)
+                closing<SplitSink>(pass, b.xr, b.xi, b.yr, b.yi);
+            else if (pass.stride == 1)
+                first<SplitSource>(pass, b.yr, b.yi, b.xr, b.xi);
+            else
+                strided(pass, b);
+            std::swap(b.xr, b.yr);
+            std::swap(b.xi, b.yi);
+        }
+    }
+
+    /// Reads the input; returns the number of passes that consumed it.
+    size_t readInput(const T* data, bool conjugate, Buffers& b) const noexcept
+    {
+        if (passes_.size() < 2)
+        {
+            for (size_t i = 0; i < n_; ++i)
+            {
+                b.xr[i] = data[2 * i];
+                b.xi[i] = conjugate ? -data[2 * i + 1] : data[2 * i + 1];
+            }
+            return 0;
+        }
+        if (conjugate)
+            first<ConjugatedSource>(passes_.front(), b.yr, b.yi, data);
+        else
+            first<InterleavedSource>(passes_.front(), b.yr, b.yi, data);
+        std::swap(b.xr, b.yr);
+        std::swap(b.xi, b.yi);
+        return 1;
+    }
+
+    /// Runs the first pass at the widest vector its length allows.
+    template <template <typename, int> class Source, typename... Args>
+    void first(const Pass& pass, T* yr, T* yi, Args... input) const noexcept
+    {
+        const size_t n1 = pass.len / 4;
+        const TwiddleSpan<T> tw = twiddleSpan(pass);
+        constexpr int wide = kWide<T>;
+        constexpr int narrow = kNarrow<T>;
+        if (n1 % wide == 0)
+            radix4First<T, wide>(Source<T, wide> { input... }, yr, yi, pass.len, tw);
+        else if (n1 % narrow == 0)
+            radix4First<T, narrow>(Source<T, narrow> { input... }, yr, yi, pass.len, tw);
+        else
+            radix4First<T, 1>(Source<T, 1> { input... }, yr, yi, pass.len, tw);
+    }
+
+    void strided(const Pass& pass, const Buffers& b) const noexcept
+    {
+        const TwiddleSpan<T> tw = twiddleSpan(pass);
+        constexpr int wide = kWide<T>;
+        constexpr int narrow = kNarrow<T>;
+        if (pass.stride % wide == 0)
+            radix4Strided<T, wide>(b.xr, b.xi, b.yr, b.yi, pass.len, pass.stride, tw);
+        else if (pass.stride % narrow == 0)
+            radix4Strided<T, narrow>(b.xr, b.xi, b.yr, b.yi, pass.len, pass.stride, tw);
+        else
+            radix4Strided<T, 1>(b.xr, b.xi, b.yr, b.yi, pass.len, pass.stride, tw);
+    }
+
+    /// Runs a pass that needs no twiddles, at the widest vector its stride allows.
+    template <template <typename, int> class Sink, typename... Args>
+    void closing(const Pass& pass, const T* xr, const T* xi, Args... output) const noexcept
     {
         constexpr int wide = kWide<T>;
         constexpr int narrow = kNarrow<T>;
-        if (s % wide == 0)        radix2Last<T, wide>(xr, xi, yr, yi, s);
-        else if (s % narrow == 0) radix2Last<T, narrow>(xr, xi, yr, yi, s);
-        else                      radix2Last<T, 1>(xr, xi, yr, yi, s);
+        if (pass.stride % wide == 0)
+            closingAt<wide, Sink>(pass, xr, xi, output...);
+        else if (pass.stride % narrow == 0)
+            closingAt<narrow, Sink>(pass, xr, xi, output...);
+        else
+            closingAt<1, Sink>(pass, xr, xi, output...);
+    }
+
+    template <int W, template <typename, int> class Sink, typename... Args>
+    static void closingAt(const Pass& pass, const T* xr, const T* xi, Args... output) noexcept
+    {
+        const Sink<T, W> sink = makeSink<W, Sink>(output...);
+        if (pass.radix2)
+            radix2Last<T, W>(xr, xi, sink, pass.stride);
+        else
+            radix4Last<T, W>(xr, xi, sink, pass.stride);
+    }
+
+    template <int W, template <typename, int> class Sink>
+    static Sink<T, W> makeSink(T* re, T* im) noexcept
+    {
+        return { re, im };
+    }
+
+    template <int W, template <typename, int> class Sink>
+    static Sink<T, W> makeSink(T* data, T scaleRe, T scaleIm) noexcept
+    {
+        return { data, Vec<T, W>::set1(scaleRe), Vec<T, W>::set1(scaleIm) };
     }
 
     size_t n_;
@@ -384,42 +592,10 @@ private:
 
     void transform(T* data, bool inverse) noexcept
     {
-        constexpr int W = detail::fft::kWide<T>;
-        using O = detail::fft::Vec<T, W>;
-        using O1 = detail::fft::Vec<T, 1>;
-        const size_t n = engine_.size();
-        T* re = engine_.inRe();
-        T* im = engine_.inIm();
-
-        // Split the interleaved input; the inverse conjugates on the way in.
-        size_t i = 0;
-        for (; i + W <= n; i += W)
-        {
-            typename O::V r, m;
-            O::loadDeinterleave(data + 2 * i, r, m);
-            O::store(re + i, r);
-            O::store(im + i, inverse ? O::sub(O::set1(T(0)), m) : m);
-        }
-        for (; i < n; ++i)
-        {
-            re[i] = data[2 * i];
-            im[i] = inverse ? -data[2 * i + 1] : data[2 * i + 1];
-        }
-
-        const T* outRe = nullptr;
-        const T* outIm = nullptr;
-        engine_.run(outRe, outIm);
-
-        // Interleave back; the inverse conjugates again and scales by 1/N.
-        const T scale = inverse ? T(1) / static_cast<T>(n) : T(1);
-        const T imScale = inverse ? -scale : scale;
-        const auto vs = O::set1(scale), vis = O::set1(imScale);
-        i = 0;
-        for (; i + W <= n; i += W)
-            O::storeInterleave2(data + 2 * i, O::mul(O::load(outRe + i), vs),
-                                O::mul(O::load(outIm + i), vis));
-        for (; i < n; ++i)
-            O1::storeInterleave2(data + 2 * i, outRe[i] * scale, outIm[i] * imScale);
+        // The inverse conjugates on the way in, and on the way out scales by 1/N
+        // and conjugates again.
+        const T scale = inverse ? T(1) / static_cast<T>(engine_.size()) : T(1);
+        engine_.runFromTo(data, inverse, data, scale, inverse ? -scale : scale);
     }
 
     detail::fft::SplitFFT<T> engine_;
@@ -481,30 +657,10 @@ public:
      */
     void forward(const T* timeData, T* freqData) noexcept
     {
-        constexpr int W = detail::fft::kWide<T>;
-        using O = detail::fft::Vec<T, W>;
-        const size_t m = halfSize_;
-        T* re = engine_.inRe();
-        T* im = engine_.inIm();
-
-        // (even, odd) sample pairs are the complex input: a deinterleave.
-        size_t i = 0;
-        for (; i + W <= m; i += W)
-        {
-            typename O::V r, q;
-            O::loadDeinterleave(timeData + 2 * i, r, q);
-            O::store(re + i, r);
-            O::store(im + i, q);
-        }
-        for (; i < m; ++i)
-        {
-            re[i] = timeData[2 * i];
-            im[i] = timeData[2 * i + 1];
-        }
-
+        // (even, odd) sample pairs are the complex input.
         const T* zr = nullptr;
         const T* zi = nullptr;
-        engine_.run(zr, zi);
+        engine_.runFrom(timeData, false, zr, zi);
         unpackForward(zr, zi, freqData);
     }
 
@@ -515,28 +671,11 @@ public:
      */
     void inverse(const T* freqData, T* timeData) noexcept
     {
-        constexpr int W = detail::fft::kWide<T>;
-        using O = detail::fft::Vec<T, W>;
-        const size_t m = halfSize_;
-
         // Pack into the conjugated half-size spectrum, run the forward engine,
         // conjugate back and scale by 1/(N/2): ifft = conj(fft(conj)) / M.
         packInverseConj(freqData, engine_.inRe(), engine_.inIm());
-        const T* zr = nullptr;
-        const T* zi = nullptr;
-        engine_.run(zr, zi);
-
-        const T scale = T(1) / static_cast<T>(m);
-        const auto vs = O::set1(scale), vis = O::set1(-scale);
-        size_t i = 0;
-        for (; i + W <= m; i += W)
-            O::storeInterleave2(timeData + 2 * i, O::mul(O::load(zr + i), vs),
-                                O::mul(O::load(zi + i), vis));
-        for (; i < m; ++i)
-        {
-            timeData[2 * i]     = zr[i] * scale;
-            timeData[2 * i + 1] = -zi[i] * scale;
-        }
+        const T scale = T(1) / static_cast<T>(halfSize_);
+        engine_.runTo(timeData, scale, -scale);
     }
 
     /**

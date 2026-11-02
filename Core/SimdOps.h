@@ -18,7 +18,8 @@
  */
 
 // --- Platform SIMD detection ------------------------------------------------
-#if defined(_M_AMD64) || defined(_M_X64) || defined(__x86_64__) || defined(__amd64__)
+#if defined(_M_AMD64) || defined(_M_X64) || defined(__x86_64__) || defined(__amd64__) \
+    || (defined(_M_IX86_FP) && _M_IX86_FP >= 2) || (defined(__i386__) && defined(__SSE2__))
     #define DSPARK_SIMD_SSE2 1
     #include <emmintrin.h>           // SSE2
     #if defined(__AVX__)

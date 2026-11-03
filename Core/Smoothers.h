@@ -51,6 +51,10 @@ namespace Constants
  * @brief Linear ramp smoother for predictable, uniform interpolation.
  *
  * Use for: Gains, mix/dry-wet, pans, or most faders where exact timing is needed.
+ *
+ * Internal state is double precision (the public API stays float): a float
+ * accumulator rounded every step and drifted, so a 5 s ramp at 192 kHz ended
+ * with a 1.3% jump onto the target instead of its 1e-6 step.
  */
 struct LinearSmoother
 {
@@ -61,8 +65,8 @@ public:
     void setTargetValue(float newTarget) noexcept;
     float getNextValue() noexcept;
 
-    [[nodiscard]] float getCurrentValue() const noexcept { return current; }
-    [[nodiscard]] float getTargetValue() const noexcept { return target; }
+    [[nodiscard]] float getCurrentValue() const noexcept { return static_cast<float>(current); }
+    [[nodiscard]] float getTargetValue() const noexcept { return static_cast<float>(target); }
 
     void setCurrentAndTargetValue(float value) noexcept;
     [[nodiscard]] bool isSmoothing() const noexcept;
@@ -77,9 +81,9 @@ public:
     void processBlock(float* buffer, int numSamples, bool multiply = false) noexcept;
 
 private:
-    float current     = 0.0f;
-    float target      = 0.0f;
-    float step        = 0.0f;
+    double current    = 0.0;
+    double target     = 0.0;
+    double step       = 0.0;
     int   stepsToGo   = 0;
     int   totalSteps  = 0;
 };
@@ -89,6 +93,12 @@ private:
  * @brief Exponential (multiplicative) smoother for natural, perceptual responses.
  *
  * Use for: Filter cutoffs, frequencies, volumes in dB.
+ *
+ * Internal state and coefficient are double precision (the public API stays
+ * float). In float the per-step coefficient rounds by up to 1e-7, a large
+ * fraction of log(ratio)/steps for long ramps: a delay time smoothed from
+ * 96000 to 91200 samples over 200 ms (Delay's default smoother) ended with a
+ * 19.8-sample jump instead of its 0.5-sample step.
  *
  * @warning Geometric smoothing is only defined for same-sign transitions. If
  * the new target's sign differs from the current value (ratio <= 0), or the
@@ -106,17 +116,17 @@ public:
     void setTargetValue(float newTarget) noexcept;
     float getNextValue() noexcept;
 
-    [[nodiscard]] float getCurrentValue() const noexcept { return current; }
-    [[nodiscard]] float getTargetValue() const noexcept { return target; }
+    [[nodiscard]] float getCurrentValue() const noexcept { return static_cast<float>(current); }
+    [[nodiscard]] float getTargetValue() const noexcept { return static_cast<float>(target); }
 
     void setCurrentAndTargetValue(float value) noexcept;
     [[nodiscard]] bool isSmoothing() const noexcept;
     void skip() noexcept;
 
 private:
-    float current    = 1.0f;
-    float target     = 1.0f;
-    float coeff      = 0.0f;
+    double current   = 1.0;
+    double target    = 1.0;
+    double coeff     = 0.0;
     int   stepsToGo  = 0;
     int   totalSteps = 0;
 };
@@ -211,6 +221,10 @@ private:
 /**
  * @class SlewLimiter
  * @brief Rate limiter to cap maximum change per sample.
+ *
+ * Internal state is double precision (the public API stays float): in float
+ * a step below half an ulp of the value was lost, and a limiter at 10000 with
+ * a 20 units/s rate at 48 kHz never moved.
  */
 struct SlewLimiter
 {
@@ -221,15 +235,15 @@ public:
     void setTargetValue(float newTarget) noexcept;
     float getNextValue() noexcept;
 
-    [[nodiscard]] float getCurrentValue() const noexcept { return current; }
-    [[nodiscard]] float getTargetValue() const noexcept { return target; }
+    [[nodiscard]] float getCurrentValue() const noexcept { return static_cast<float>(current); }
+    [[nodiscard]] float getTargetValue() const noexcept { return static_cast<float>(target); }
     [[nodiscard]] bool isSmoothing() const noexcept;
     void skip() noexcept;
 
 private:
-    float maxDelta = 0.0f;
-    float current  = 0.0f;
-    float target   = 0.0f;
+    double maxDelta = 0.0;
+    double current  = 0.0;
+    double target   = 0.0;
 };
 
 /**
@@ -339,25 +353,25 @@ inline void Smoothers::LinearSmoother::setTargetValue(float newTarget) noexcept
     target = newTarget;
     stepsToGo = totalSteps;
     if (stepsToGo > 0)
-        step = (target - current) / static_cast<float>(stepsToGo);
+        step = (target - current) / static_cast<double>(stepsToGo);
     else
         current = target;
 }
 
 inline float Smoothers::LinearSmoother::getNextValue() noexcept
 {
-    if (stepsToGo <= 0) return current;
+    if (stepsToGo <= 0) return static_cast<float>(current);
     current += step;
     --stepsToGo;
     if (stepsToGo == 0) current = target;
-    return current;
+    return static_cast<float>(current);
 }
 
 inline void Smoothers::LinearSmoother::setCurrentAndTargetValue(float value) noexcept
 {
     current   = value;
     target    = value;
-    step      = 0.0f;
+    step      = 0.0;
     stepsToGo = 0;
 }
 
@@ -368,7 +382,9 @@ inline bool Smoothers::LinearSmoother::isSmoothing() const noexcept
 
 inline void Smoothers::LinearSmoother::skip() noexcept
 {
-    setCurrentAndTargetValue(target);
+    current   = target;
+    step      = 0.0;
+    stepsToGo = 0;
 }
 
 inline void Smoothers::LinearSmoother::processBlock(float* buffer, int numSamples, bool multiply) noexcept
@@ -383,7 +399,8 @@ inline void Smoothers::LinearSmoother::processBlock(float* buffer, int numSample
     for (; i < stepsToProcess; ++i)
     {
         current += step;
-        buffer[i] = multiply ? buffer[i] * current : buffer[i] + current;
+        const float value = static_cast<float>(current);
+        buffer[i] = multiply ? buffer[i] * value : buffer[i] + value;
     }
 
     stepsToGo -= stepsToProcess;
@@ -392,7 +409,8 @@ inline void Smoothers::LinearSmoother::processBlock(float* buffer, int numSample
     // Settled section
     for (; i < numSamples; ++i)
     {
-        buffer[i] = multiply ? buffer[i] * target : buffer[i] + target;
+        const float value = static_cast<float>(target);
+        buffer[i] = multiply ? buffer[i] * value : buffer[i] + value;
     }
 }
 
@@ -402,7 +420,7 @@ inline void Smoothers::ExponentialSmoother::reset(double sampleRate, float timeC
 {
     totalSteps = static_cast<int>(sampleRate * timeConstantMilliseconds / 1000.0);
     stepsToGo  = 0;
-    coeff      = 1.0f;
+    coeff      = 1.0;
     current    = initialValue;
     target     = initialValue;
 }
@@ -417,13 +435,13 @@ inline void Smoothers::ExponentialSmoother::setTargetValue(float newTarget) noex
 
     if (totalSteps > 0 && std::abs(current) > epsilon)
     {
-        float safeCur = (current > 0.0f) ? std::max(current, epsilon)
-                                         : std::min(current, -epsilon);
-        float ratio = target / safeCur;
-        if (ratio > 0.0f)
+        const double eps = static_cast<double>(epsilon);
+        const double safeCur = (current > 0.0) ? std::max(current, eps) : std::min(current, -eps);
+        const double ratio = target / safeCur;
+        if (ratio > 0.0)
         {
             stepsToGo = totalSteps;
-            coeff = std::exp(std::log(ratio) / static_cast<float>(stepsToGo));
+            coeff = std::exp(std::log(ratio) / static_cast<double>(stepsToGo));
             return;
         }
     }
@@ -433,24 +451,24 @@ inline void Smoothers::ExponentialSmoother::setTargetValue(float newTarget) noex
     // for a whole ramp and then jumping back (a sign flip after a 1 -> 2 ramp
     // went -1 -> -1.997 -> -1).
     current   = target;
-    coeff     = 1.0f;
+    coeff     = 1.0;
     stepsToGo = 0;
 }
 
 inline float Smoothers::ExponentialSmoother::getNextValue() noexcept
 {
-    if (stepsToGo <= 0) return current;
+    if (stepsToGo <= 0) return static_cast<float>(current);
     current *= coeff;
     --stepsToGo;
     if (stepsToGo == 0) current = target;
-    return current;
+    return static_cast<float>(current);
 }
 
 inline void Smoothers::ExponentialSmoother::setCurrentAndTargetValue(float value) noexcept
 {
     current   = value;
     target    = value;
-    coeff     = 1.0f;
+    coeff     = 1.0;
     stepsToGo = 0;
 }
 
@@ -461,7 +479,9 @@ inline bool Smoothers::ExponentialSmoother::isSmoothing() const noexcept
 
 inline void Smoothers::ExponentialSmoother::skip() noexcept
 {
-    setCurrentAndTargetValue(target);
+    current   = target;
+    coeff     = 1.0;
+    stepsToGo = 0;
 }
 
 // --- OnePoleSmoother ---
@@ -592,7 +612,7 @@ inline void Smoothers::SlewLimiter::reset(double sampleRate, float maxRatePerSec
     // Clamp at zero: a negative rate would flip the clamp bounds below
     // (std::clamp with lo > hi is undefined behaviour). Zero legitimately
     // means "frozen": the value is not allowed to move at all.
-    maxDelta = std::max(0.0f, maxRatePerSecond / static_cast<float>(sampleRate));
+    maxDelta = std::max(0.0, static_cast<double>(maxRatePerSecond) / sampleRate);
     current = initialValue;
     target = initialValue;
 }
@@ -604,10 +624,10 @@ inline void Smoothers::SlewLimiter::setTargetValue(float newTarget) noexcept
 
 inline float Smoothers::SlewLimiter::getNextValue() noexcept
 {
-    float delta = target - current;
+    double delta = target - current;
     delta = std::clamp(delta, -maxDelta, maxDelta);
     current += delta;
-    return current;
+    return static_cast<float>(current);
 }
 
 inline bool Smoothers::SlewLimiter::isSmoothing() const noexcept

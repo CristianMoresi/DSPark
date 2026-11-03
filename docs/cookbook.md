@@ -885,7 +885,7 @@ contain it. Zones loop as in `Sampler`; `sample.keyTrack` off plays every key
 at the zone's own pitch (drum one-shots).
 
 `quality.oversampling` at 2x or 4x renders the voices at the higher rate and
-reports the delay through `getLatency()` (64 and 96 samples). It helps FM,
+reports the delay through `getLatency()` (64 and 68 samples). It helps FM,
 the driven ladder (-88 dB at 1x, -166 dB at 2x for a 1.76 kHz saw with drive
 4 and resonance 0.9) and the hard-synced sine at high pitch; the linear
 oscillators are cleanest at 1x. Renders are deterministic: the same events,

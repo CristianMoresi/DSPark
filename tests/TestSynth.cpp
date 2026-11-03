@@ -833,7 +833,7 @@ DSPARK_TEST(Synth_oversampling_reports_its_latency_exactly)
     const double c1 = crossing(0, l1), c2 = crossing(1, l2), c4 = crossing(2, l4);
     EXPECT_EQ(l1, 0);
     EXPECT_EQ(l2, 64);
-    EXPECT_EQ(l4, 96);
+    EXPECT_EQ(l4, 68);
     EXPECT_NEAR(c2 - c1, l2, 1.0);
     EXPECT_NEAR(c4 - c1, l4, 1.0);
 }

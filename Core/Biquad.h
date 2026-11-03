@@ -60,6 +60,7 @@
 
 #include "AudioBuffer.h"
 #include "DenormalGuard.h"
+#include "SimdOps.h"
 
 // Keeps a cold path out of a hot caller's stack frame. Needed exactly once here
 // (see Biquad::adoptStagedCoeffs), where inlining the coefficient adoption into
@@ -302,6 +303,108 @@ struct alignas(32) BiquadCoeffs
         c.a1 = a1;
         c.a2 = a2;
         return c;
+    }
+
+
+    /**
+     * @brief Analog-matched second-order low-pass (Vicanek, "Matched Second
+     * Order Digital Filters", 2016).
+     *
+     * Impulse-invariant poles of H(s) = 1 / (s^2 + s/Q + 1) and a numerator
+     * solved for unity gain at DC and the prototype's gain Q at the cutoff.
+     * Unlike makeLowPass() it does not pin a zero at Nyquist, so a high
+     * cutoff keeps its analog shape. Worst deviation from the prototype over
+     * 20 Hz - 20 kHz at 48 kHz, cutoff 15 kHz, Q 0.707: 0.58 dB (bilinear
+     * 9.4 dB). Opt-in: the response is not a bilinear design, so it differs
+     * from makeLowPass() near Nyquist by design.
+     */
+    [[nodiscard]] static BiquadCoeffs makeLowPassMatched(double sampleRate, double freq,
+                                                         double Q = 0.7071067811865476) noexcept
+    {
+        freq = std::clamp(freq, 1.0, std::max(1.0, sampleRate * 0.499));
+        Q = std::max(Q, 0.001);
+        const MatchedPoles m = matchedPoles(2.0 * std::numbers::pi * freq / sampleRate, 1.0 / (2.0 * Q));
+        const double R1 = (m.A0 * m.phi0 + m.A1 * m.phi1 + m.A2 * m.phi2) * Q * Q;
+        const double B0 = m.A0;
+        const double B1 = (R1 - B0 * m.phi0) / m.phi1;
+        BiquadCoeffs c;
+        c.b0 = 0.5 * (std::sqrt(B0) + std::sqrt(std::max(0.0, B1)));
+        c.b1 = std::sqrt(B0) - c.b0;
+        c.b2 = 0.0;
+        c.a1 = m.a1;
+        c.a2 = m.a2;
+        return c;
+    }
+
+    /**
+     * @brief Analog-matched second-order high-pass (Vicanek 2016).
+     *
+     * Impulse-invariant poles of H(s) = s^2 / (s^2 + s/Q + 1); a double zero
+     * at DC with the gain set to the prototype's Q at the cutoff. Worst
+     * deviation over 20 Hz - 20 kHz at 48 kHz, cutoff 18 kHz, Q 0.707:
+     * 0.39 dB (bilinear 12.5 dB). Opt-in.
+     */
+    [[nodiscard]] static BiquadCoeffs makeHighPassMatched(double sampleRate, double freq,
+                                                          double Q = 0.7071067811865476) noexcept
+    {
+        freq = std::clamp(freq, 1.0, std::max(1.0, sampleRate * 0.499));
+        Q = std::max(Q, 0.001);
+        const MatchedPoles m = matchedPoles(2.0 * std::numbers::pi * freq / sampleRate, 1.0 / (2.0 * Q));
+        BiquadCoeffs c;
+        c.b0 = std::sqrt(std::max(0.0, m.A0 * m.phi0 + m.A1 * m.phi1 + m.A2 * m.phi2)) * Q / (4.0 * m.phi1);
+        c.b1 = -2.0 * c.b0;
+        c.b2 = c.b0;
+        c.a1 = m.a1;
+        c.a2 = m.a2;
+        return c;
+    }
+
+    /**
+     * @brief Analog-matched band-pass, 0 dB at the centre (Vicanek 2016).
+     *
+     * Impulse-invariant poles of H(s) = (s/Q) / (s^2 + s/Q + 1); a zero at DC
+     * and a numerator matching unity gain and a response extremum at the
+     * centre. Worst deviation over 20 Hz - 20 kHz at 48 kHz, centre 5 kHz,
+     * Q 0.707: 0.92 dB (bilinear 8.6 dB). Opt-in.
+     */
+    [[nodiscard]] static BiquadCoeffs makeBandPassMatched(double sampleRate, double freq,
+                                                          double Q = 0.7071067811865476) noexcept
+    {
+        freq = std::clamp(freq, 1.0, std::max(1.0, sampleRate * 0.499));
+        Q = std::max(Q, 0.001);
+        const MatchedPoles m = matchedPoles(2.0 * std::numbers::pi * freq / sampleRate, 1.0 / (2.0 * Q));
+        const double R1 = m.A0 * m.phi0 + m.A1 * m.phi1 + m.A2 * m.phi2;
+        const double R2 = -m.A0 + m.A1 + 4.0 * (m.phi0 - m.phi1) * m.A2;
+        const double B2 = (R1 - R2 * m.phi1) / (4.0 * m.phi1 * m.phi1);
+        const double B1 = R2 + 4.0 * (m.phi1 - m.phi0) * B2;
+        BiquadCoeffs c;
+        c.b1 = -0.5 * std::sqrt(std::max(0.0, B1));
+        c.b0 = 0.5 * (std::sqrt(std::max(0.0, B2 + c.b1 * c.b1)) - c.b1);
+        c.b2 = -c.b0 - c.b1;
+        c.a1 = m.a1;
+        c.a2 = m.a2;
+        return c;
+    }
+
+    /**
+     * @brief Analog-matched Butterworth low shelf (Vicanek, "Matched Two-Pole
+     * Digital Shelving Filters", 2024).
+     *
+     * The prototype is the cookbook shelf with slope S = 1 (Q = 1/sqrt(2)),
+     * half the gain at freq. The design matches DC, Nyquist and two further
+     * points of the analog magnitude. Worst deviation over 20 Hz - 20 kHz at
+     * 44.1/48 kHz, centres up to 18 kHz, gains -12..+12 dB: 0.40 dB
+     * (bilinear 3.9 dB). Falls back to identity for |gain| < 0.01 dB. Opt-in.
+     */
+    [[nodiscard]] static BiquadCoeffs makeLowShelfMatched(double sampleRate, double freq, double gainDb) noexcept
+    {
+        return matchedShelf(sampleRate, freq, gainDb, true);
+    }
+
+    /** @brief Analog-matched Butterworth high shelf (see makeLowShelfMatched()). */
+    [[nodiscard]] static BiquadCoeffs makeHighShelfMatched(double sampleRate, double freq, double gainDb) noexcept
+    {
+        return matchedShelf(sampleRate, freq, gainDb, false);
     }
 
     /**
@@ -597,6 +700,73 @@ struct alignas(32) BiquadCoeffs
     }
 
 private:
+    /** @brief Impulse-invariant poles of s^2 + 2 q w0 s + w0^2 (q = 1 / (2 Q_pole))
+     *  and the A / phi terms of Vicanek's magnitude-matching form. */
+    struct MatchedPoles { double a1, a2, A0, A1, A2, phi0, phi1, phi2; };
+    [[nodiscard]] static MatchedPoles matchedPoles(double w0, double q) noexcept
+    {
+        MatchedPoles m {};
+        m.a2 = std::exp(-2.0 * q * w0);
+        if (q <= 1.0)
+            m.a1 = -2.0 * std::exp(-q * w0) * std::cos(std::sqrt(1.0 - q * q) * w0);
+        else
+        {
+            // Two real poles, evaluated one by one (each <= 1); -q + r as
+            // -1/(q + r) avoids the cancellation (see makePeakMatched()).
+            const double r = std::sqrt(q * q - 1.0);
+            m.a1 = -(std::exp(-w0 / (q + r)) + std::exp(-(q + r) * w0));
+        }
+        m.A0 = (1.0 + m.a1 + m.a2) * (1.0 + m.a1 + m.a2);
+        m.A1 = (1.0 - m.a1 + m.a2) * (1.0 - m.a1 + m.a2);
+        m.A2 = -4.0 * m.a2;
+        const double s = std::sin(0.5 * w0);
+        m.phi1 = s * s;
+        m.phi0 = 1.0 - m.phi1;
+        m.phi2 = 4.0 * m.phi0 * m.phi1;
+        return m;
+    }
+
+    /** @brief Vicanek's two-pole Butterworth shelf. A high shelf of gain G is
+     *  designed directly; a low shelf is the high shelf of 1/G with the
+     *  numerator scaled by G (unity at Nyquist, G at DC). */
+    [[nodiscard]] static BiquadCoeffs matchedShelf(double sampleRate, double freq, double gainDb, bool low) noexcept
+    {
+        freq = std::clamp(freq, 1.0, std::max(1.0, sampleRate * 0.499));
+        if (!(std::abs(gainDb) >= 0.01)) return { 1.0, 0.0, 0.0, 0.0, 0.0 };
+        constexpr double kPi = std::numbers::pi;
+        const double G = std::pow(10.0, (low ? -gainDb : gainDb) / 20.0);
+        const double fc = freq / (0.5 * sampleRate);          // in units of Nyquist
+        const double fc2 = fc * fc, fc4 = fc2 * fc2;
+        const double hNy = (fc4 + G) / (fc4 + 1.0 / G);       // |H|^2 at Nyquist
+        const double f1 = fc / std::sqrt(0.160 + 1.543 * fc2);
+        const double f2 = fc / std::sqrt(0.947 + 3.806 * fc2);
+        double ph1 = std::sin(0.5 * kPi * f1); ph1 *= ph1;
+        double ph2 = std::sin(0.5 * kPi * f2); ph2 *= ph2;
+        const double f14 = f1 * f1 * f1 * f1, f24 = f2 * f2 * f2 * f2;
+        const double h1 = (fc4 + f14 * G) / (fc4 + f14 / G);
+        const double h2 = (fc4 + f24 * G) / (fc4 + f24 / G);
+        const double d1 = (h1 - 1.0) * (1.0 - ph1), d2 = (h2 - 1.0) * (1.0 - ph2);
+        const double c11 = -ph1 * d1, c21 = -ph2 * d2;
+        const double c12 = (hNy - h1) * ph1 * ph1, c22 = (hNy - h2) * ph2 * ph2;
+        const double alpha1 = (c22 * d1 - c12 * d2) / (c11 * c22 - c12 * c21);
+        const double alpha2 = (d1 - c11 * alpha1) / c12;
+        const double beta1 = alpha1, beta2 = hNy * alpha2;
+        const double A1 = alpha2, A2 = 0.25 * (alpha1 - alpha2);
+        const double B1 = beta2, B2 = 0.25 * (beta1 - beta2);
+        const double V = 0.5 * (1.0 + std::sqrt(std::max(0.0, A1)));
+        const double Wn = 0.5 * (1.0 + std::sqrt(std::max(0.0, B1)));
+        const double a0 = 0.5 * (V + std::sqrt(std::max(0.0, V * V + A2)));
+        const double b0 = 0.5 * (Wn + std::sqrt(std::max(0.0, Wn * Wn + B2)));
+        const double scale = low ? std::pow(10.0, gainDb / 20.0) : 1.0;
+        BiquadCoeffs c;
+        c.b0 = scale * b0 / a0;
+        c.b1 = scale * (1.0 - Wn) / a0;
+        c.b2 = scale * (-0.25 * B2 / b0) / a0;
+        c.a1 = (1.0 - V) / a0;
+        c.a2 = (-0.25 * A2 / a0) / a0;
+        return c;
+    }
+
     /** @brief Normalises a raw coefficient set by a0 (divides b* and a* by a0).
      * Takes the raw values one by one rather than a BiquadCoeffs by value: the
      * struct is over-aligned, and passing it through a register-class boundary
@@ -886,7 +1056,16 @@ public:
      * than routing every sample through processSample()).
      *
      * Channels beyond MaxChannels are left untouched (pass-through): only
-     * the first min(numChannels, MaxChannels) channels are filtered.
+     * the first min(numChannels, MaxChannels) channels are filtered. Pairs of
+     * channels run in lock step in one two-lane register where the target has
+     * one: the recursion is latency bound, so the second channel is almost
+     * free (stereo 4.04 -> 1.96 ns per frame measured, SSE2). The lanes do the
+     * scalar loop's operations in its order, so the output is the same.
+     *
+     * A non-finite filter state (a NaN or Inf sample reached the recursion)
+     * is cleared at the end of the block, so the channel recovers on the next
+     * block instead of producing NaN until reset(). processSample() callers
+     * that never call processBlock() own that check.
      *
      * @param buffer Audio buffer to process in-place.
      */
@@ -904,7 +1083,13 @@ public:
         // (updates land at the next block boundary), and register-friendly.
         const BiquadCoeffs c = activeCoeffs_;
 
-        for (int ch = 0; ch < numChannels; ++ch)
+        int ch = 0;
+        if constexpr (simd::kVecDoubleNarrow == 2)
+            for (; ch + 1 < numChannels; ch += 2)
+                processPair<simd::kVecDoubleNarrow>(buffer.getChannel(ch), buffer.getChannel(ch + 1),
+                                                    numSamples, c, state_[ch], state_[ch + 1]);
+
+        for (; ch < numChannels; ++ch)
         {
             T* data = buffer.getChannel(ch);
             auto& s = state_[ch];
@@ -920,6 +1105,7 @@ public:
                 data[i] = static_cast<T>(output);
             }
 
+            recoverState(z1, z2);
             s.z1 = z1;
             s.z2 = z2;
         }
@@ -1016,6 +1202,38 @@ private:
         double z1 = 0.0;
         double z2 = 0.0;
     };
+
+    /** @brief Clears a state that a NaN or Inf sample has poisoned. */
+    static void recoverState(double& z1, double& z2) noexcept
+    {
+        if (!std::isfinite(z1 + z2)) { z1 = 0.0; z2 = 0.0; }
+    }
+
+    /** @brief Two channels of the block loop in the lanes of one register. */
+    template <int W>
+    static void processPair(T* left, T* right, int numSamples, const BiquadCoeffs& c,
+                            State& sl, State& sr) noexcept
+    {
+        using O = simd::Vec<double, W>;
+        const auto b0 = O::set1(c.b0), b1 = O::set1(c.b1), b2 = O::set1(c.b2);
+        const auto a1 = O::set1(c.a1), a2 = O::set1(c.a2);
+        auto z1 = O::set2(sl.z1, sr.z1);
+        auto z2 = O::set2(sl.z2, sr.z2);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const auto x = O::set2(static_cast<double>(left[i]), static_cast<double>(right[i]));
+            const auto y = O::add(O::mul(b0, x), z1);
+            z1 = O::add(O::sub(O::mul(b1, x), O::mul(a1, y)), z2);
+            z2 = O::sub(O::mul(b2, x), O::mul(a2, y));
+            left[i]  = static_cast<T>(O::lane0(y));
+            right[i] = static_cast<T>(O::lane1(y));
+        }
+        double l1 = O::lane0(z1), l2 = O::lane0(z2), r1 = O::lane1(z1), r2 = O::lane1(z2);
+        recoverState(l1, l2);
+        recoverState(r1, r2);
+        sl.z1 = l1; sl.z2 = l2;
+        sr.z1 = r1; sr.z2 = r2;
+    }
 
     // Shared staging slot for the seqlock publish: written word-by-word by the
     // control thread inside the odd/even critical section and read word-by-word

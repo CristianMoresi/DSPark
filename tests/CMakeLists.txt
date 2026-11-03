@@ -34,6 +34,7 @@ add_executable(dspark_tests
     TestCoreGenerators.cpp
     TestCoreSpectral.cpp
     TestCoreUtilities.cpp
+    TestCoreRegressions.cpp
     TestEffectsAdvanced.cpp
     TestReverbPrecision.cpp
     TestEffectsDynamics.cpp

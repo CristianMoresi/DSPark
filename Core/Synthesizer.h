@@ -62,7 +62,7 @@
  * stopband) through its decimation-only path. It suppresses the aliasing of
  * FM, of the ladder's saturation and of the hard-synced sine at high pitch.
  * The voices start their content a fraction of a sample later so the
- * reported latency (getLatency()) is an integer: 64 samples at 2x and 96 at
+ * reported latency (getLatency()) is an integer: 64 samples at 2x and 68 at
  * 4x. Changing the factor stops the sounding voices.
  *
  * Output: stereo on the first two channels of the view (a single channel
@@ -643,7 +643,7 @@ public:
         activeVoices_.store(0, std::memory_order_relaxed);
     }
 
-    /** @brief Output delay in base-rate samples (0 at 1x; 64 at 2x, 96 at 4x). */
+    /** @brief Output delay in base-rate samples (0 at 1x; 64 at 2x, 68 at 4x). */
     [[nodiscard]] int getLatency() const noexcept { return latency_.load(std::memory_order_relaxed); }
 
     /** @brief Voices sounding after the last block, stealing fades included. */

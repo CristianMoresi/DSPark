@@ -39,7 +39,7 @@
  * - Audio thread (the one stream owner): processBlock(), processSample(),
  *   reset().
  * - Control thread (one writer): setBand(), setNumBands(), setBandEnabled(),
- *   setFilterMode(), setSoftMode(), setMatchedBells(). Each band is published
+ *   setFilterMode(), setSoftMode(), setMatchedBells(), setMatchedFilters(). Each band is published
  *   through its own seqlock over std::atomic words, so the audio thread adopts
  *   a whole band configuration or none of it; a change is consumed at the next
  *   block (or the next processSample()). Non-finite band fields are replaced
@@ -464,6 +464,30 @@ public:
     }
 
     /**
+     * @brief Switches LowPass/HighPass, BandPass and slope-1 shelf bands to
+     *        the analog-matched designs.
+     *
+     * The counterpart of setMatchedBells() for the other band types
+     * (BiquadCoeffs::make*Matched, after Vicanek): near Nyquist they keep the
+     * analog prototype's shape (48 kHz worst deviation, 20 Hz - 20 kHz: LP at
+     * 15 kHz 0.58 dB vs 9.4 dB bilinear, shelves 0.40 dB vs 3.9 dB). LP/HP
+     * first-order sections, shelves whose Q maps to a slope below 1, Notch
+     * and Tilt stay bilinear. Applies to the IIR engines, the linear-phase
+     * kernel and the analysis curve alike. Off by default (bit-compatible).
+     */
+    void setMatchedFilters(bool enabled) noexcept
+    {
+        matchedFilters_.store(enabled, std::memory_order_relaxed);
+        configDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Returns whether non-bell bands use the matched designs (setMatchedFilters()). */
+    [[nodiscard]] bool isMatchedFilters() const noexcept
+    {
+        return matchedFilters_.load(std::memory_order_relaxed);
+    }
+
+    /**
      * @brief Returns the current configuration of a band.
      *
      * Safe from any thread: the band is read through its seqlock into a private
@@ -639,6 +663,7 @@ public:
         const int n = numBands_.load(std::memory_order_relaxed);
         w.write("numBands", n);
         w.write("matchedBells", matchedBells_.load(std::memory_order_relaxed));
+        w.write("matchedFilters", matchedFilters_.load(std::memory_order_relaxed));
         w.write("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)));
         w.write("softMode", softMode_.load(std::memory_order_relaxed));
         char key[24];
@@ -668,6 +693,7 @@ public:
         if (!r.isValid() || r.processorId() != stateId("PEQZ")) return false;
         const int n = std::clamp(r.read("numBands", 0), 0, MaxBands);
         setMatchedBells(r.read("matchedBells", true));
+        setMatchedFilters(r.read("matchedFilters", false));   // older blobs: bilinear, as before
         // Older blobs carry no mode keys: keep the instance's current modes.
         setFilterMode(static_cast<FilterMode>(
             r.read("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)))));
@@ -731,6 +757,7 @@ protected:
     void updateActiveFilters() noexcept
     {
         const bool matched = matchedBells_.load(std::memory_order_relaxed);
+        const bool matchedOthers = matchedFilters_.load(std::memory_order_relaxed);
         int activeBands = numBands_.load(std::memory_order_relaxed);
 
         for (int i = 0; i < activeBands; ++i)
@@ -750,6 +777,7 @@ protected:
             float q    = static_cast<float>(effectiveQ(cfg));
 
             filter.setMatchedPeak(matched);
+            filter.setMatchedFilters(matchedOthers);
             switch (cfg.type)
             {
                 case BandType::Peak:      filter.setPeaking(freq, gain, q); break;
@@ -797,6 +825,7 @@ protected:
         double f  = static_cast<double>(cfg.frequency);
         double g  = static_cast<double>(cfg.gain);
         double q  = static_cast<double>(cfg.q);
+        const bool mf = matchedFilters_.load(std::memory_order_relaxed);
 
         switch (cfg.type)
         {
@@ -804,12 +833,24 @@ protected:
                 return matchedBells_.load(std::memory_order_relaxed)
                     ? BiquadCoeffs::makePeakMatched(sr, f, q, g)
                     : BiquadCoeffs::makePeak(sr, f, q, g);
-            case BandType::LowShelf:  return BiquadCoeffs::makeLowShelf(sr, f, g, shelfSlopeFromQ(q, g));
-            case BandType::HighShelf: return BiquadCoeffs::makeHighShelf(sr, f, g, shelfSlopeFromQ(q, g));
-            case BandType::LowPass:   return BiquadCoeffs::makeLowPass(sr, f, q);
-            case BandType::HighPass:  return BiquadCoeffs::makeHighPass(sr, f, q);
+            case BandType::LowShelf:
+            case BandType::HighShelf:
+            {
+                const double slope = shelfSlopeFromQ(q, g);
+                const bool lowShelf = cfg.type == BandType::LowShelf;
+                if (mf && slope >= 1.0)
+                    return lowShelf ? BiquadCoeffs::makeLowShelfMatched(sr, f, g)
+                                    : BiquadCoeffs::makeHighShelfMatched(sr, f, g);
+                return lowShelf ? BiquadCoeffs::makeLowShelf(sr, f, g, slope)
+                                : BiquadCoeffs::makeHighShelf(sr, f, g, slope);
+            }
+            case BandType::LowPass:   return mf ? BiquadCoeffs::makeLowPassMatched(sr, f, q)
+                                                : BiquadCoeffs::makeLowPass(sr, f, q);
+            case BandType::HighPass:  return mf ? BiquadCoeffs::makeHighPassMatched(sr, f, q)
+                                                : BiquadCoeffs::makeHighPass(sr, f, q);
             case BandType::Notch:     return BiquadCoeffs::makeNotch(sr, f, q);
-            case BandType::BandPass:  return BiquadCoeffs::makeBandPass(sr, f, q);
+            case BandType::BandPass:  return mf ? BiquadCoeffs::makeBandPassMatched(sr, f, q)
+                                                : BiquadCoeffs::makeBandPass(sr, f, q);
             case BandType::Tilt:      return BiquadCoeffs::makeTilt(sr, f, g);
         }
         return {};
@@ -843,11 +884,16 @@ public:
             if (casc.hasFirstOrder)
                 stages[n++] = lp ? BiquadCoeffs::makeFirstOrderLowPass(sr, f)
                                  : BiquadCoeffs::makeFirstOrderHighPass(sr, f);
+            const bool mf = matchedFilters_.load(std::memory_order_relaxed);
             for (int s = 0; s < casc.numSecondOrder; ++s)
             {
                 const double stageQ = static_cast<double>(casc.qValues[s]);
-                stages[n++] = lp ? BiquadCoeffs::makeLowPass(sr, f, stageQ)
-                                 : BiquadCoeffs::makeHighPass(sr, f, stageQ);
+                if (mf)
+                    stages[n++] = lp ? BiquadCoeffs::makeLowPassMatched(sr, f, stageQ)
+                                     : BiquadCoeffs::makeHighPassMatched(sr, f, stageQ);
+                else
+                    stages[n++] = lp ? BiquadCoeffs::makeLowPass(sr, f, stageQ)
+                                     : BiquadCoeffs::makeHighPass(sr, f, stageQ);
             }
             return n;
         }
@@ -1421,6 +1467,7 @@ protected:
     std::atomic<bool> softMode_ { false };
     std::atomic<bool> configDirty_ { false };
     std::atomic<bool> matchedBells_ { true };  ///< Matched (de-cramped) bells by default.
+    std::atomic<bool> matchedFilters_ { false }; ///< Matched LP/HP/BP/shelves: opt-in.
 
     // Linear-phase state
     std::atomic<FilterMode> filterMode_ { FilterMode::MinimumPhase };

@@ -140,6 +140,11 @@ public:
 
     /**
      * @brief Processes an audio buffer in-place using the selected Mode.
+     *
+     * A non-finite integrator state (a NaN or Inf input reached the
+     * recursion) is cleared at the end of the block, so the channel recovers
+     * on the next block instead of producing NaN until reset().
+     *
      * @param buffer Audio data.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
@@ -148,13 +153,21 @@ public:
         const int nCh = std::min(buffer.getNumChannels(), kMaxChannels);
         const int nS  = buffer.getNumSamples();
 
-        // Channel-outer / sample-inner: keeps one channel's state and buffer hot
-        // in cache for the whole inner loop (cache-friendly, matches LadderFilter).
-        for (int ch = 0; ch < nCh; ++ch)
+        // One loop per mode with the coefficients and the state in locals: the
+        // compiler can no longer assume the sample pointer aliases the members,
+        // so nothing is reloaded per sample (measured: MSVC x64 LP 4.74 ->
+        // 2.41 ns/sample; GCC 15 at the default parameters 6.0 -> 2.3).
+        // Same arithmetic as processSample(), same output.
+        switch (mode_)
         {
-            T* data = buffer.getChannel(ch);
-            for (int i = 0; i < nS; ++i)
-                data[i] = processOne(data[i], ch);
+            case Mode::LowPass:   processBlockMode<Mode::LowPass>(buffer, nCh, nS); break;
+            case Mode::HighPass:  processBlockMode<Mode::HighPass>(buffer, nCh, nS); break;
+            case Mode::BandPass:  processBlockMode<Mode::BandPass>(buffer, nCh, nS); break;
+            case Mode::Notch:     processBlockMode<Mode::Notch>(buffer, nCh, nS); break;
+            case Mode::AllPass:   processBlockMode<Mode::AllPass>(buffer, nCh, nS); break;
+            case Mode::Bell:      processBlockMode<Mode::Bell>(buffer, nCh, nS); break;
+            case Mode::LowShelf:  processBlockMode<Mode::LowShelf>(buffer, nCh, nS); break;
+            case Mode::HighShelf: processBlockMode<Mode::HighShelf>(buffer, nCh, nS); break;
         }
     }
 
@@ -374,6 +387,45 @@ private:
         a1_ = T(1) / (T(1) + T(2) * effR_ * gEff + gEff * gEff);
         a2_ = gEff * a1_;
         a3_ = gEff * a2_;
+    }
+
+    /** @brief Block loop of one mode (see processBlock()). The mixing terms
+     *  are the products selectOutput() forms, precomputed with the same
+     *  association, so both paths produce the same samples. */
+    template <Mode M>
+    void processBlockMode(AudioBufferView<T> buffer, int nCh, int nS) noexcept
+    {
+        const T a1 = a1_, a2 = a2_, a3 = a3_;
+        const T twoEffR = T(2) * effR_;
+        const T twoR = T(2) * R_;
+        const T As = (gainDb_ >= T(0)) ? A_ : T(1) / A_;
+        const T shelf0 = As * As, shelf1 = As * twoR;
+        const T k = T(2) * Rbell_;
+        const T bell = (gainDb_ >= T(0)) ? (A_ * A_ - T(1)) * k : (T(1) / (A_ * A_) - T(1)) * k;
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* data = buffer.getChannel(ch);
+            ChannelState st = state_[ch];
+            for (int i = 0; i < nS; ++i)
+            {
+                const T x = data[i];
+                const auto o = detail::tptSvfStep(x, st, a1, a2, a3);
+                const T lp = o.lowpass, bp = o.bandpass;
+                const T hp = x - twoEffR * bp - lp;
+                T y;
+                if constexpr (M == Mode::LowPass)        y = lp;
+                else if constexpr (M == Mode::HighPass)  y = hp;
+                else if constexpr (M == Mode::BandPass)  y = bp;
+                else if constexpr (M == Mode::Notch)     y = lp + hp;
+                else if constexpr (M == Mode::AllPass)   y = lp + hp - twoR * bp;
+                else if constexpr (M == Mode::Bell)      y = x + bell * bp;
+                else if constexpr (M == Mode::LowShelf)  y = shelf0 * lp + shelf1 * bp + hp;
+                else                                     y = lp + shelf1 * bp + shelf0 * hp;
+                data[i] = y;
+            }
+            if (!std::isfinite(st.ic1eq + st.ic2eq)) st = ChannelState {};
+            state_[ch] = st;
+        }
     }
 
     /** @brief Selected-mode output for one sample; no bounds check (internal). */

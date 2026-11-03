@@ -431,11 +431,15 @@ private:
  * Nyquist / r. This reader tabulates such kernels (the sinc stretched by r
  * under a Kaiser window, beta 10, about 32 r taps) for 16 rates in
  * eighth-octave steps from 2^(1/8) to 4, at 64 phases each, and reads with
- * the kernel of the nearest tabulated rate at or above the requested one:
- * nothing folds back from beyond the output Nyquist, and the band gives up
- * at most an eighth of an octave at the top. Passband error stays below
- * -76 dB up to three quarters of the cutoff. For rates at or below 1 use
- * SincInterpolator.
+ * the kernel of the nearest tabulated rate at or above the requested one.
+ * The kernel's cutoff sits at kCutoff = 0.85 of the output Nyquist, so its
+ * transition band ends near the output Nyquist: content at the output
+ * Nyquist folds back at about -46 dB and content from 1.05x upward below
+ * -100 dB. (With the cutoff AT the output Nyquist the fold was -6 dB at
+ * Nyquist, -13 dB at 1.05x and -26 dB at 1.1x.) The response is flat to
+ * 0.7 of the output Nyquist and -2 dB at 0.8, and the band gives up at most
+ * a further eighth of an octave to the rate table. For rates at or below 1
+ * use SincInterpolator.
  *
  * Threading: the constructor builds about 60 k coefficients (allocates:
  * setup thread); reads are const, allocation-free and safe from any thread.
@@ -450,6 +454,7 @@ public:
     static constexpr int kStepsPerOctave = 8;  ///< Rate resolution.
     static constexpr int kPhases = 64;         ///< Phases per rate.
     static constexpr int kMaxTaps = 128;       ///< Kernel length at rate 4.
+    static constexpr double kCutoff = 0.85;    ///< Kernel cutoff, fraction of the output Nyquist.
 
     /** @brief Builds the kernel tables (allocates: construct on a setup thread). */
     StretchedSincReader()
@@ -485,7 +490,8 @@ public:
                     const double window = (r * r < 1.0)
                         ? besselI0(kBeta * std::sqrt(1.0 - r * r)) * invI0Beta
                         : 0.0;
-                    const double sinc = (u == 0.0) ? 1.0 : std::sin(kPi * u) / (kPi * u);
+                    const double uc = u * kCutoff;
+                    const double sinc = (uc == 0.0) ? 1.0 : std::sin(kPi * uc) / (kPi * uc);
                     h[static_cast<size_t>(t)] = sinc * window;
                     sum += h[static_cast<size_t>(t)];
                 }

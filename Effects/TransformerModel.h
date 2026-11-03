@@ -44,7 +44,7 @@
  * The core runs at 2x oversampling by DEFAULT, configurable with
  * setOversampling(int) (setup thread only; it reallocates and re-calibrates
  * like prepare()): 1 = off, zero latency; 2, 4, 8, 16 = the oversampler's
- * group delay (64 samples at 2x, 96 at 4x), reported by getLatency(), with
+ * group delay (64 samples at 2x, 70 at 4x), reported by getLatency(), with
  * the dry path of the mix delayed to match. The loop's harmonics fall with
  * frequency as flux does, but at the top of the band they are not small:
  * over tones from 1 to 15 kHz at -6 and -18 dBFS and every core size, the

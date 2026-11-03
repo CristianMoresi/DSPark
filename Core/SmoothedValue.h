@@ -40,7 +40,9 @@ namespace dspark {
  *   whatever its size or unit (a gain, a frequency in Hz), arrives exactly on
  *   target after rampTimeMs.
  * - **Chase**: adaptive (not clocked): gentle right after a target change,
- *   accelerating as it settles.
+ *   accelerating as it settles. Its speed is defined in seconds, so it
+ *   settles in the same time at every sample rate; rampTimeMs only switches
+ *   it off (<= 0 snaps like the other curves).
  *
  * The recursion state is double regardless of T (the framework rule for
  * recursive state): in float the one-pole stalls hundreds of epsilons short
@@ -99,10 +101,14 @@ public:
         rampSamples_ = std::max(1.0, rampTimeMs_ * sampleRate_ / 1000.0);
         updateLinearRate();
 
-        // Chase: Sample-rate correction ratio relative to 44.1kHz base
+        // Chase: the speed constants are tuned at 44.1 kHz in samples. The
+        // decay of the speed and the speed itself both scale with the rate,
+        // so the curve takes the same time at any rate (unscaled, 0 -> 0.99
+        // took 171 ms at 44.1 kHz but 53 ms at 192 kHz).
         const double srRatio = 44100.0 / sampleRate_;
         chaseMultDecay_ = std::pow(0.9999, srRatio);
         chaseAddDecay_ = 0.01 * srRatio;
+        chaseRateScale_ = 1.0 / srRatio;
     }
 
     /** @brief Sets the smoothing algorithm. */
@@ -117,12 +123,13 @@ public:
 
     /**
      * @brief Updates the target value. Safe to call continuously (e.g., from host automation).
-     * @param newTarget The destination value. NaN is ignored (it would poison
-     *                  the recursion and the arrival checks permanently).
+     * @param newTarget The destination value. NaN and infinities are ignored:
+     *                  an infinite target turned the recursion into NaN that
+     *                  no later target could recover.
      */
     void setTargetValue(T newTarget) noexcept
     {
-        if (newTarget != newTarget) return; // NaN guard
+        if (!std::isfinite(newTarget)) return;
         if (newTarget != target_)
         {
             target_ = newTarget;
@@ -163,8 +170,10 @@ public:
             }
             case SmoothingType::Chase:
             {
+                if (rampTimeMs_ <= 0.0) { current_ = target; break; }
                 chaseSpeed_ = std::max(350.0, std::min(2500.0, chaseSpeed_ * chaseMultDecay_ - chaseAddDecay_));
-                current_ = (current_ * chaseSpeed_ + target) / (chaseSpeed_ + 1.0);
+                const double speed = chaseSpeed_ * chaseRateScale_;
+                current_ = (current_ * speed + target) / (speed + 1.0);
                 break;
             }
         }
@@ -241,13 +250,16 @@ public:
 
             case SmoothingType::Chase:
             {
+                if (rampTimeMs_ <= 0.0) { current = target; break; }
                 double speed = chaseSpeed_;
                 const double multDecay = chaseMultDecay_;
                 const double addDecay  = chaseAddDecay_;
+                const double rateScale = chaseRateScale_;
                 for (; i < n; ++i)
                 {
                     speed = std::max(350.0, std::min(2500.0, speed * multDecay - addDecay));
-                    current = (current * speed + target) / (speed + 1.0);
+                    const double scaled = speed * rateScale;
+                    current = (current * scaled + target) / (scaled + 1.0);
                     if (std::abs(current - target) < eps) { current = target; break; }
                     buffer[i] = static_cast<T>(current);
                 }
@@ -308,6 +320,7 @@ private:
     double chaseSpeed_{ 350.0 };
     double chaseMultDecay_{ 0.9999 };
     double chaseAddDecay_{ 0.01 };
+    double chaseRateScale_{ 1.0 };    ///< sampleRate / 44100: the speed in samples at this rate.
 
     double sampleRate_{ 44100.0 };
     double rampTimeMs_{ 20.0 };

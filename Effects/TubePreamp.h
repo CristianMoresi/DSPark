@@ -72,7 +72,7 @@
  *   compensates its passband droop. Because the kernel acts only on the
  *   final output, the compensation is exact at every signal level.
  *
- * Total latency for 1/2/4/8/16x is 0/71/99/113/121 base samples,
+ * Total latency for 1/2/4/8/16x is 0/71/73/74/75 base samples,
  * independent of setStages(); the dry path includes the same delay.
  * getLatency() always reflects the ACTIVE factor (0 at 1x) so hosts get
  * correct PDC. At 1x the original point circuit is retained: use 1x only

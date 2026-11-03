@@ -791,51 +791,47 @@ inline void copyWithGain(double* DSPARK_RESTRICT dst, const double* DSPARK_RESTR
  * the ramp covers [gainStart, gainEnd) across the block: the last sample sits
  * one step below gainEnd. For a continuous fade across consecutive blocks,
  * start the next block at gainEnd. count <= 0 is a no-op.
+ *
+ * Every gain is computed from its own index, never accumulated: an
+ * accumulated ramp drifted by 1.3e-3 over 4.8M samples and stepped at the
+ * seam between the vector body and the scalar tail. Here the vector lanes
+ * and the tail evaluate the same expression and agree exactly.
  */
 inline void applyGainRamp(float* DSPARK_RESTRICT data, float gainStart, float gainEnd, int count) noexcept
 {
     if (count <= 0) return;
     const float step = (gainEnd - gainStart) / static_cast<float>(count);
-#if defined(DSPARK_SIMD_AVX)
-    const __m256 vStep = _mm256_set1_ps(step * 8.0f);
-    __m256 vGain = _mm256_setr_ps(gainStart,            gainStart + step,
-                                  gainStart + 2 * step, gainStart + 3 * step,
-                                  gainStart + 4 * step, gainStart + 5 * step,
-                                  gainStart + 6 * step, gainStart + 7 * step);
     int i = 0;
+#if defined(DSPARK_SIMD_AVX)
+    const __m256 vStart = _mm256_set1_ps(gainStart), vStep = _mm256_set1_ps(step), vInc = _mm256_set1_ps(8.0f);
+    __m256 vIdx = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f);
     for (; i + 7 < count; i += 8)
     {
+        const __m256 vGain = _mm256_add_ps(vStart, _mm256_mul_ps(vStep, vIdx));
         _mm256_storeu_ps(data + i, _mm256_mul_ps(_mm256_loadu_ps(data + i), vGain));
-        vGain = _mm256_add_ps(vGain, vStep);
+        vIdx = _mm256_add_ps(vIdx, vInc);
     }
-    for (; i < count; ++i) data[i] *= gainStart + step * static_cast<float>(i);
-
 #elif defined(DSPARK_SIMD_SSE2)
-    const __m128 vStep = _mm_set1_ps(step * 4.0f);
-    __m128 vGain = _mm_setr_ps(gainStart, gainStart + step, gainStart + 2 * step, gainStart + 3 * step);
-    int i = 0;
+    const __m128 vStart = _mm_set1_ps(gainStart), vStep = _mm_set1_ps(step), vInc = _mm_set1_ps(4.0f);
+    __m128 vIdx = _mm_setr_ps(0.0f, 1.0f, 2.0f, 3.0f);
     for (; i + 3 < count; i += 4)
     {
+        const __m128 vGain = _mm_add_ps(vStart, _mm_mul_ps(vStep, vIdx));
         _mm_storeu_ps(data + i, _mm_mul_ps(_mm_loadu_ps(data + i), vGain));
-        vGain = _mm_add_ps(vGain, vStep);
+        vIdx = _mm_add_ps(vIdx, vInc);
     }
-    for (; i < count; ++i) data[i] *= gainStart + step * static_cast<float>(i);
-
 #elif defined(DSPARK_SIMD_NEON)
-    const float32x4_t vStep = vdupq_n_f32(step * 4.0f);
-    const float init[4] = { gainStart, gainStart + step, gainStart + 2 * step, gainStart + 3 * step };
-    float32x4_t vGain = vld1q_f32(init);
-    int i = 0;
+    const float32x4_t vStart = vdupq_n_f32(gainStart), vStep = vdupq_n_f32(step), vInc = vdupq_n_f32(4.0f);
+    const float init[4] = { 0.0f, 1.0f, 2.0f, 3.0f };
+    float32x4_t vIdx = vld1q_f32(init);
     for (; i + 3 < count; i += 4)
     {
+        const float32x4_t vGain = vaddq_f32(vStart, vmulq_f32(vStep, vIdx));
         vst1q_f32(data + i, vmulq_f32(vld1q_f32(data + i), vGain));
-        vGain = vaddq_f32(vGain, vStep);
+        vIdx = vaddq_f32(vIdx, vInc);
     }
-    for (; i < count; ++i) data[i] *= gainStart + step * static_cast<float>(i);
-
-#else
-    for (int i = 0; i < count; ++i) data[i] *= gainStart + step * static_cast<float>(i);
 #endif
+    for (; i < count; ++i) data[i] *= gainStart + step * static_cast<float>(i);
 }
 
 /** @brief Double overload. */
@@ -843,44 +839,37 @@ inline void applyGainRamp(double* DSPARK_RESTRICT data, double gainStart, double
 {
     if (count <= 0) return;
     const double step = (gainEnd - gainStart) / static_cast<double>(count);
-#if defined(DSPARK_SIMD_AVX)
-    const __m256d vStep = _mm256_set1_pd(step * 4.0);
-    __m256d vGain = _mm256_setr_pd(gainStart,            gainStart + step,
-                                   gainStart + 2 * step, gainStart + 3 * step);
     int i = 0;
+#if defined(DSPARK_SIMD_AVX)
+    const __m256d vStart = _mm256_set1_pd(gainStart), vStep = _mm256_set1_pd(step), vInc = _mm256_set1_pd(4.0);
+    __m256d vIdx = _mm256_setr_pd(0.0, 1.0, 2.0, 3.0);
     for (; i + 3 < count; i += 4)
     {
+        const __m256d vGain = _mm256_add_pd(vStart, _mm256_mul_pd(vStep, vIdx));
         _mm256_storeu_pd(data + i, _mm256_mul_pd(_mm256_loadu_pd(data + i), vGain));
-        vGain = _mm256_add_pd(vGain, vStep);
+        vIdx = _mm256_add_pd(vIdx, vInc);
     }
-    for (; i < count; ++i) data[i] *= gainStart + step * static_cast<double>(i);
-
 #elif defined(DSPARK_SIMD_SSE2)
-    const __m128d vStep = _mm_set1_pd(step * 2.0);
-    __m128d vGain = _mm_setr_pd(gainStart, gainStart + step);
-    int i = 0;
+    const __m128d vStart = _mm_set1_pd(gainStart), vStep = _mm_set1_pd(step), vInc = _mm_set1_pd(2.0);
+    __m128d vIdx = _mm_setr_pd(0.0, 1.0);
     for (; i + 1 < count; i += 2)
     {
+        const __m128d vGain = _mm_add_pd(vStart, _mm_mul_pd(vStep, vIdx));
         _mm_storeu_pd(data + i, _mm_mul_pd(_mm_loadu_pd(data + i), vGain));
-        vGain = _mm_add_pd(vGain, vStep);
+        vIdx = _mm_add_pd(vIdx, vInc);
     }
-    for (; i < count; ++i) data[i] *= gainStart + step * static_cast<double>(i);
-
 #elif defined(DSPARK_SIMD_NEON)
-    const float64x2_t vStep = vdupq_n_f64(step * 2.0);
-    const double init[2] = { gainStart, gainStart + step };
-    float64x2_t vGain = vld1q_f64(init);
-    int i = 0;
+    const float64x2_t vStart = vdupq_n_f64(gainStart), vStep = vdupq_n_f64(step), vInc = vdupq_n_f64(2.0);
+    const double init[2] = { 0.0, 1.0 };
+    float64x2_t vIdx = vld1q_f64(init);
     for (; i + 1 < count; i += 2)
     {
+        const float64x2_t vGain = vaddq_f64(vStart, vmulq_f64(vStep, vIdx));
         vst1q_f64(data + i, vmulq_f64(vld1q_f64(data + i), vGain));
-        vGain = vaddq_f64(vGain, vStep);
+        vIdx = vaddq_f64(vIdx, vInc);
     }
-    for (; i < count; ++i) data[i] *= gainStart + step * static_cast<double>(i);
-
-#else
-    for (int i = 0; i < count; ++i) data[i] *= gainStart + step * static_cast<double>(i);
 #endif
+    for (; i < count; ++i) data[i] *= gainStart + step * static_cast<double>(i);
 }
 
 // ============================================================================
@@ -892,22 +881,21 @@ inline void applyGainRamp(double* DSPARK_RESTRICT data, double gainStart, double
  *
  * Same ramp convention as applyGainRamp: sample i uses
  * `gainStart + i * (gainEnd - gainStart) / count`, spanning [gainStart,
- * gainEnd) across the block. count <= 0 is a no-op.
+ * gainEnd) across the block, each gain computed from its index (no drift).
+ * count <= 0 is a no-op.
  */
 inline void addWithGainRamp(float* DSPARK_RESTRICT dst, const float* DSPARK_RESTRICT src,
                             float gainStart, float gainEnd, int count) noexcept
 {
     if (count <= 0) return;
     const float step = (gainEnd - gainStart) / static_cast<float>(count);
-#if defined(DSPARK_SIMD_AVX)
-    const __m256 vStep = _mm256_set1_ps(step * 8.0f);
-    __m256 vGain = _mm256_setr_ps(gainStart,            gainStart + step,
-                                  gainStart + 2 * step, gainStart + 3 * step,
-                                  gainStart + 4 * step, gainStart + 5 * step,
-                                  gainStart + 6 * step, gainStart + 7 * step);
     int i = 0;
+#if defined(DSPARK_SIMD_AVX)
+    const __m256 vStart = _mm256_set1_ps(gainStart), vStep = _mm256_set1_ps(step), vInc = _mm256_set1_ps(8.0f);
+    __m256 vIdx = _mm256_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f);
     for (; i + 7 < count; i += 8)
     {
+        const __m256 vGain = _mm256_add_ps(vStart, _mm256_mul_ps(vStep, vIdx));
         const __m256 vDst = _mm256_loadu_ps(dst + i);
         const __m256 vSrc = _mm256_loadu_ps(src + i);
         #if defined(DSPARK_SIMD_FMA)
@@ -915,16 +903,14 @@ inline void addWithGainRamp(float* DSPARK_RESTRICT dst, const float* DSPARK_REST
         #else
             _mm256_storeu_ps(dst + i, _mm256_add_ps(vDst, _mm256_mul_ps(vSrc, vGain)));
         #endif
-        vGain = _mm256_add_ps(vGain, vStep);
+        vIdx = _mm256_add_ps(vIdx, vInc);
     }
-    for (; i < count; ++i) dst[i] += src[i] * (gainStart + step * static_cast<float>(i));
-
 #elif defined(DSPARK_SIMD_SSE2)
-    const __m128 vStep = _mm_set1_ps(step * 4.0f);
-    __m128 vGain = _mm_setr_ps(gainStart, gainStart + step, gainStart + 2 * step, gainStart + 3 * step);
-    int i = 0;
+    const __m128 vStart = _mm_set1_ps(gainStart), vStep = _mm_set1_ps(step), vInc = _mm_set1_ps(4.0f);
+    __m128 vIdx = _mm_setr_ps(0.0f, 1.0f, 2.0f, 3.0f);
     for (; i + 3 < count; i += 4)
     {
+        const __m128 vGain = _mm_add_ps(vStart, _mm_mul_ps(vStep, vIdx));
         const __m128 vDst = _mm_loadu_ps(dst + i);
         const __m128 vSrc = _mm_loadu_ps(src + i);
         #if defined(DSPARK_SIMD_FMA)
@@ -932,25 +918,20 @@ inline void addWithGainRamp(float* DSPARK_RESTRICT dst, const float* DSPARK_REST
         #else
             _mm_storeu_ps(dst + i, _mm_add_ps(vDst, _mm_mul_ps(vSrc, vGain)));
         #endif
-        vGain = _mm_add_ps(vGain, vStep);
+        vIdx = _mm_add_ps(vIdx, vInc);
     }
-    for (; i < count; ++i) dst[i] += src[i] * (gainStart + step * static_cast<float>(i));
-
 #elif defined(DSPARK_SIMD_NEON)
-    const float32x4_t vStep = vdupq_n_f32(step * 4.0f);
-    const float init[4] = { gainStart, gainStart + step, gainStart + 2 * step, gainStart + 3 * step };
-    float32x4_t vGain = vld1q_f32(init);
-    int i = 0;
+    const float32x4_t vStart = vdupq_n_f32(gainStart), vStep = vdupq_n_f32(step), vInc = vdupq_n_f32(4.0f);
+    const float init[4] = { 0.0f, 1.0f, 2.0f, 3.0f };
+    float32x4_t vIdx = vld1q_f32(init);
     for (; i + 3 < count; i += 4)
     {
+        const float32x4_t vGain = vaddq_f32(vStart, vmulq_f32(vStep, vIdx));
         vst1q_f32(dst + i, vfmaq_f32(vld1q_f32(dst + i), vld1q_f32(src + i), vGain));
-        vGain = vaddq_f32(vGain, vStep);
+        vIdx = vaddq_f32(vIdx, vInc);
     }
-    for (; i < count; ++i) dst[i] += src[i] * (gainStart + step * static_cast<float>(i));
-
-#else
-    for (int i = 0; i < count; ++i) dst[i] += src[i] * (gainStart + step * static_cast<float>(i));
 #endif
+    for (; i < count; ++i) dst[i] += src[i] * (gainStart + step * static_cast<float>(i));
 }
 
 /** @brief Double overload. */
@@ -959,13 +940,13 @@ inline void addWithGainRamp(double* DSPARK_RESTRICT dst, const double* DSPARK_RE
 {
     if (count <= 0) return;
     const double step = (gainEnd - gainStart) / static_cast<double>(count);
-#if defined(DSPARK_SIMD_AVX)
-    const __m256d vStep = _mm256_set1_pd(step * 4.0);
-    __m256d vGain = _mm256_setr_pd(gainStart,            gainStart + step,
-                                   gainStart + 2 * step, gainStart + 3 * step);
     int i = 0;
+#if defined(DSPARK_SIMD_AVX)
+    const __m256d vStart = _mm256_set1_pd(gainStart), vStep = _mm256_set1_pd(step), vInc = _mm256_set1_pd(4.0);
+    __m256d vIdx = _mm256_setr_pd(0.0, 1.0, 2.0, 3.0);
     for (; i + 3 < count; i += 4)
     {
+        const __m256d vGain = _mm256_add_pd(vStart, _mm256_mul_pd(vStep, vIdx));
         const __m256d vDst = _mm256_loadu_pd(dst + i);
         const __m256d vSrc = _mm256_loadu_pd(src + i);
         #if defined(DSPARK_SIMD_FMA)
@@ -973,16 +954,14 @@ inline void addWithGainRamp(double* DSPARK_RESTRICT dst, const double* DSPARK_RE
         #else
             _mm256_storeu_pd(dst + i, _mm256_add_pd(vDst, _mm256_mul_pd(vSrc, vGain)));
         #endif
-        vGain = _mm256_add_pd(vGain, vStep);
+        vIdx = _mm256_add_pd(vIdx, vInc);
     }
-    for (; i < count; ++i) dst[i] += src[i] * (gainStart + step * static_cast<double>(i));
-
 #elif defined(DSPARK_SIMD_SSE2)
-    const __m128d vStep = _mm_set1_pd(step * 2.0);
-    __m128d vGain = _mm_setr_pd(gainStart, gainStart + step);
-    int i = 0;
+    const __m128d vStart = _mm_set1_pd(gainStart), vStep = _mm_set1_pd(step), vInc = _mm_set1_pd(2.0);
+    __m128d vIdx = _mm_setr_pd(0.0, 1.0);
     for (; i + 1 < count; i += 2)
     {
+        const __m128d vGain = _mm_add_pd(vStart, _mm_mul_pd(vStep, vIdx));
         const __m128d vDst = _mm_loadu_pd(dst + i);
         const __m128d vSrc = _mm_loadu_pd(src + i);
         #if defined(DSPARK_SIMD_FMA)
@@ -990,25 +969,20 @@ inline void addWithGainRamp(double* DSPARK_RESTRICT dst, const double* DSPARK_RE
         #else
             _mm_storeu_pd(dst + i, _mm_add_pd(vDst, _mm_mul_pd(vSrc, vGain)));
         #endif
-        vGain = _mm_add_pd(vGain, vStep);
+        vIdx = _mm_add_pd(vIdx, vInc);
     }
-    for (; i < count; ++i) dst[i] += src[i] * (gainStart + step * static_cast<double>(i));
-
 #elif defined(DSPARK_SIMD_NEON)
-    const float64x2_t vStep = vdupq_n_f64(step * 2.0);
-    const double init[2] = { gainStart, gainStart + step };
-    float64x2_t vGain = vld1q_f64(init);
-    int i = 0;
+    const float64x2_t vStart = vdupq_n_f64(gainStart), vStep = vdupq_n_f64(step), vInc = vdupq_n_f64(2.0);
+    const double init[2] = { 0.0, 1.0 };
+    float64x2_t vIdx = vld1q_f64(init);
     for (; i + 1 < count; i += 2)
     {
+        const float64x2_t vGain = vaddq_f64(vStart, vmulq_f64(vStep, vIdx));
         vst1q_f64(dst + i, vfmaq_f64(vld1q_f64(dst + i), vld1q_f64(src + i), vGain));
-        vGain = vaddq_f64(vGain, vStep);
+        vIdx = vaddq_f64(vIdx, vInc);
     }
-    for (; i < count; ++i) dst[i] += src[i] * (gainStart + step * static_cast<double>(i));
-
-#else
-    for (int i = 0; i < count; ++i) dst[i] += src[i] * (gainStart + step * static_cast<double>(i));
 #endif
+    for (; i < count; ++i) dst[i] += src[i] * (gainStart + step * static_cast<double>(i));
 }
 
 // ============================================================================
@@ -1322,6 +1296,9 @@ struct Vec<double, 2>
     static V madd(V a, V b, V c) noexcept { return _mm_add_pd(_mm_mul_pd(a, b), c); }
 #endif
     static V reverse(V v) noexcept { return _mm_shuffle_pd(v, v, 1); }
+    static V set2(double lane0Value, double lane1Value) noexcept { return _mm_set_pd(lane1Value, lane0Value); }
+    static double lane0(V v) noexcept { return _mm_cvtsd_f64(v); }
+    static double lane1(V v) noexcept { return _mm_cvtsd_f64(_mm_unpackhi_pd(v, v)); }
     static void loadDeinterleave(const double* p, V& re, V& im) noexcept
     {
         const V a = _mm_loadu_pd(p), b = _mm_loadu_pd(p + 2);
@@ -1392,6 +1369,9 @@ struct Vec<double, 2>
     static V mulAdd(V a, V b, V c, V d) noexcept { return vfmaq_f64(vmulq_f64(a, b), c, d); }
     static V madd(V a, V b, V c) noexcept { return vfmaq_f64(c, a, b); }
     static V reverse(V v) noexcept { return vextq_f64(v, v, 1); }
+    static V set2(double lane0Value, double lane1Value) noexcept { return vsetq_lane_f64(lane1Value, vdupq_n_f64(lane0Value), 1); }
+    static double lane0(V v) noexcept { return vgetq_lane_f64(v, 0); }
+    static double lane1(V v) noexcept { return vgetq_lane_f64(v, 1); }
     static void loadDeinterleave(const double* p, V& re, V& im) noexcept
     {
         const float64x2x2_t v = vld2q_f64(p);

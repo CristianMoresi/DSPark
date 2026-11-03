@@ -15,7 +15,10 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
+#include <cstdint>
+#include <type_traits>
 #include <concepts>
 #include <numbers>
 
@@ -146,7 +149,7 @@ template <FloatType T>
 /**
  * @brief Fast tanh approximation using Pade rational function.
  *
- * Approximately 5x faster than std::tanh. Optimized for SIMD without branching.
+ * About 4x faster than std::tanh (MSVC x64, float, measured).
  * Input is clamped to [-3, 3] maintaining C0 continuity to prevent aliasing.
  * Max output amplitude is ~0.9954.
  *
@@ -191,9 +194,11 @@ template <FloatType T>
 }
 
 /**
- * @brief Fast approximation of e^x via std::exp2 (~2x faster than std::exp on MSVC).
+ * @brief e^x via std::exp2, using the identity e^x = 2^(x * log2(e)).
  *
- * Uses the identity e^x = 2^(x * log2(e)).
+ * Not faster than std::exp everywhere: measured on MSVC x64 it is 0.76x the
+ * speed of std::exp in float and 1.2x in double. Accuracy is that of exp2
+ * plus one rounding of the scaled argument.
  *
  * @param x Exponent. No range clamping is applied.
  * @return Approximation of e^x.
@@ -213,7 +218,7 @@ template <FloatType T>
  *
  * Useful for the bilinear-transform `tan(pi*f/Fs)` term: with this accuracy a
  * 20 kHz cutoff at 44.1 kHz lands within a fraction of a cent of the target.
- * Roughly 3x faster than std::tan on MSVC.
+ * About 2x (float) and 3.5x (double) faster than std::tan on MSVC x64.
  *
  * @param x Argument in radians.
  * @return Approximation of tan(x).
@@ -237,7 +242,8 @@ template <FloatType T>
  * overshoots the unit circle in double. Maximum absolute error is ~3.7e-9 in
  * double (about -168 dB) and float-rounding-limited (~1.8e-7, about -135 dB)
  * in float: a pure sine rendered with it is cleaner than a 24-bit converter.
- * About 3-6x faster than std::sin depending on platform. The input is
+ * Speed is close to the platform libm: 1.0-1.4x std::sin on MSVC x64; its
+ * value is the bounded, reproducible error on every platform. The input is
  * range-reduced internally (two-term Cody-Waite), so any finite argument
  * within a few thousand periods of zero stays accurate.
  *
@@ -281,10 +287,13 @@ template <FloatType T>
 /**
  * @brief Fast natural logarithm approximation.
  *
- * Splits the input into exponent and mantissa via std::frexp, then evaluates
- * the classic 4-term atanh series (Cephes style) for ln of the mantissa,
- * centred on [sqrt(0.5), sqrt(2)). Relative error is below 2e-7: ample for
- * envelope/dB work. Roughly 2-4x faster than std::log.
+ * Splits the input into exponent and mantissa (read from the IEEE bit
+ * pattern for normal float/double inputs, std::frexp otherwise), then
+ * evaluates the classic 4-term atanh series (Cephes style) for ln of the
+ * mantissa, centred on [sqrt(0.5), sqrt(2)). Relative error is below 2e-7:
+ * ample for envelope/dB work. Measured on MSVC x64 in a dependent sum: float
+ * 1.6 ns (std::log 1.3 ns), double 1.7 ns (std::log 2.4 ns). The bit split
+ * replaced a frexp call that cost 2.9 ns in float, with identical results.
  *
  * @param x Input value. Must be > 0 (no guard: matches std::log contract).
  * @return Approximation of ln(x).
@@ -293,7 +302,31 @@ template <FloatType T>
 [[nodiscard]] inline T fastLog(T x) noexcept
 {
     int e = 0;
-    T m = std::frexp(x, &e);             // x = m * 2^e, m in [0.5, 1)
+    T m;                                 // x = m * 2^e, m in [0.5, 1)
+    if constexpr (std::is_same_v<T, float>)
+    {
+        const std::uint32_t bits = std::bit_cast<std::uint32_t>(x);
+        if (bits - 0x00800000u < 0x7F000000u)  // positive, normal, finite
+        {
+            e = static_cast<int>(bits >> 23) - 126;
+            m = std::bit_cast<float>((bits & 0x007FFFFFu) | 0x3F000000u);
+        }
+        else m = std::frexp(x, &e);
+    }
+    else if constexpr (std::is_same_v<T, double>)
+    {
+        const std::uint64_t bits = std::bit_cast<std::uint64_t>(x);
+        if (bits - 0x0010000000000000ull < 0x7FE0000000000000ull)
+        {
+            e = static_cast<int>(bits >> 52) - 1022;
+            m = std::bit_cast<double>((bits & 0x000FFFFFFFFFFFFFull) | 0x3FE0000000000000ull);
+        }
+        else m = std::frexp(x, &e);
+    }
+    else
+    {
+        m = std::frexp(x, &e);
+    }
     // Normalise mantissa into [sqrt(0.5), sqrt(2)) so the series is centred.
     if (m < T(0.70710678118654752440)) { m *= T(2); --e; }
 

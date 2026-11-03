@@ -296,7 +296,8 @@ public:
      *   values outside [1,4] are clamped.
      * - CPU/latency cost per factor (relative to 1x=off): 2x roughly doubles the
      *   per-band detector+filter work and adds the half-band polyphase group
-     *   delay; 4x roughly quadruples it and adds ~2x that group delay. The exact
+     *   delay (64 samples); 4x roughly quadruples it and adds 70 (the second
+     *   stage runs a much shorter half-band). The exact
      *   added latency for the active factor is reported by getLatency() so the
      *   host can apply correct PDC. Prefer 1x and oversample the whole nonlinear
      *   section once (docs/cookbook.md) when a chain already oversamples.

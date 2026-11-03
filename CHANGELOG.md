@@ -33,6 +33,17 @@ All notable user-facing changes to DSPark are documented here.
   Hermite stays the default.
 - `Delay::getDelayMs()`, and `Panner::getLatency()`: 4 samples for Binaural
   and Haas, 0 for the other algorithms.
+- `Oversampling::Mode::PolyphaseIir` (opt-in; FIR stays the default):
+  elliptic allpass half-bands designed in the class. 2x High delays 3 samples
+  instead of 64 at -99 dB alias rejection; the phase is not linear and
+  `getRoundTripDelay(hz)` reports the delay per frequency (3.07 at 1 kHz,
+  4.23 at 18 kHz).
+- Analog-matched designs: `BiquadCoeffs::makeLowPassMatched`, `makeHighPassMatched`,
+  `makeBandPassMatched`, `makeLowShelfMatched` and `makeHighShelfMatched`, and
+  an opt-in `setMatchedFilters()` on `FilterEngine` and `Equalizer`. At 48 kHz
+  a 15 kHz low-pass deviates 0.58 dB from the analog prototype (9.4 dB bilinear).
+- `Dither::setShaper(Shaper::Lipshitz5)`: a five-tap noise shaper, 4.9 dB less
+  noise than the first-order shaper in 1-5 kHz. The default is unchanged.
 
 ### Changed
 
@@ -42,6 +53,18 @@ All notable user-facing changes to DSPark are documented here.
   `paramIdsUnique()` also rejects ids that hash into that 0x4D44xxxx range.
 - Plugin layer: parameter id lookups use a compile-time id table (a block of
   128 automation points: 12.8 to 4.9 us).
+- `Oversampling`: stages after the first use shorter half-bands, so 4x/8x/16x
+  High delay 70/73/74 samples (was 96/112/120) and cost half to a quarter as
+  much. Alias rejection is unchanged. Effect latencies follow: 197 for
+  `TapeMachine` at its default 4x (was 223), 73 for `TubePreamp` and 68 for
+  `Synthesizer` at 4x, 70 for the other effects at 4x.
+- Faster block paths with unchanged output: `Biquad` runs channel pairs
+  together (stereo about 2x faster), `StateVariableFilter` 2x on MSVC (GCC
+  and Clang already ran most modes at that speed) and `LadderFilter` 13%
+  faster; `FIRFilter::processBlock` 1.5x (rounding-level differences from
+  `processSample()`); `Hilbert` skips its zero taps (SSE2: 1.6x float, 2.7x
+  double; AVX2: 2.2x double, float unchanged); `fastLog` reads the exponent
+  bits (1.3x GCC, 1.75x MSVC, float).
 
 ### Fixed
 
@@ -396,6 +419,22 @@ All notable user-facing changes to DSPark are documented here.
 - The `TapeMachine` documentation no longer claims that bias-carrier
   products always stay out of band. At the default 4x and 48 kHz, a
   19.25 kHz tone at -6 dBFS leaves a 255 Hz product at -46 dBc.
+- `Smoothers` Linear, Exponential and SlewLimiter keep double state. In float
+  a `Delay` time glide jumped 19.8 samples at its end, a 5 s ramp at 192 kHz
+  jumped 1.3e-2, and a slew limiter at 10000 never moved.
+- `Biquad`, `StateVariableFilter` and `LadderFilter` block paths recover from
+  one NaN or Inf sample; before, every later sample came out NaN until
+  `reset()`.
+- `SmoothedValue` ignores infinite targets (which left it NaN), Chase runs at
+  the same speed at every sample rate (it was 3.2x faster at 192 kHz than at
+  44.1 kHz), and a 0 ms ramp snaps for every curve.
+- `Dither`: one NaN input no longer turns every later output NaN.
+- `StretchedSincReader` folds content above the output Nyquist below -100 dB
+  (was -13 dB at 1.05x Nyquist): the kernel cutoff moves to 0.85 of Nyquist.
+- `simd::applyGainRamp` and `addWithGainRamp` compute the gain from the sample
+  index, so long ramps no longer drift (1.3e-3 over 4.8 M samples).
+- `DspMath` documents the measured speed of `fastTanh`, `fastExp`, `fastTan`,
+  `fastSin` and `fastLog` (some were overstated).
 
 - `Equalizer` LinearPhase runs one fixed kernel through a partitioned
   convolution, so the response no longer depends on the host block. A 100 Hz,

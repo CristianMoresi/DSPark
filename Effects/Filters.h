@@ -289,6 +289,29 @@ public:
     }
 
     /**
+     * @brief Selects the analog-matched designs for the other shapes.
+     *
+     * The counterpart of setMatchedPeak() for LowPass/HighPass (their
+     * second-order sections), BandPass and the shelves at slope 1
+     * (BiquadCoeffs::make*Matched, after Vicanek): high corners keep their
+     * analog shape instead of cramping toward Nyquist. First-order sections,
+     * shelves with a slope below 1, Notch, AllPass and Tilt keep the bilinear
+     * design. Off by default (bit-compatible with previous output).
+     * Thread-safe. Not serialized by getState()/setState(); owners that
+     * persist it must re-apply it on restore (Equalizer does).
+     */
+    void setMatchedFilters(bool enabled) noexcept
+    {
+        matchedFilters_.store(enabled, std::memory_order_relaxed);
+    }
+
+    /** @brief Returns whether the non-bell shapes use the matched designs. */
+    [[nodiscard]] bool isMatchedFilters() const noexcept
+    {
+        return matchedFilters_.load(std::memory_order_relaxed);
+    }
+
+    /**
      * @brief Sets the shelf slope S on its own (LowShelf/HighShelf shapes).
      *
      * The granular counterpart of the slope argument of setLowShelf() /
@@ -544,14 +567,16 @@ public:
                 const Shape sh = shape_.load(std::memory_order_relaxed);
                 const int sdb  = slopeDb_.load(std::memory_order_relaxed);
                 const bool mp  = matchedPeak_.load(std::memory_order_relaxed);
+                const bool mf  = matchedFilters_.load(std::memory_order_relaxed);
                 const float ssl = shelfSlope_.load(std::memory_order_relaxed);
                 if (f != lastFreq_ || q != lastQ_ || g != lastGain_ ||
                     sh != lastShape_ || sdb != lastSlopeDb_ || mp != lastMatched_ ||
-                    ssl != lastShelfSlope_)
+                    mf != lastMatchedFilters_ || ssl != lastShelfSlope_)
                 {
                     updateCoefficients(f, q, g);
                     lastFreq_ = f; lastQ_ = q; lastGain_ = g;
                     lastShape_ = sh; lastSlopeDb_ = sdb; lastMatched_ = mp;
+                    lastMatchedFilters_ = mf;
                     lastShelfSlope_ = ssl;
                 }
 
@@ -686,6 +711,7 @@ public:
         lastShape_ = shape_.load(std::memory_order_relaxed);
         lastSlopeDb_ = slopeDb_.load(std::memory_order_relaxed);
         lastMatched_ = matchedPeak_.load(std::memory_order_relaxed);
+        lastMatchedFilters_ = matchedFilters_.load(std::memory_order_relaxed);
         lastShelfSlope_ = shelfSlope_.load(std::memory_order_relaxed);
     }
 
@@ -793,6 +819,7 @@ protected:
         const int sdb  = slopeDb_.load(std::memory_order_relaxed);
         const double ssl = static_cast<double>(shelfSlope_.load(std::memory_order_relaxed));
 
+        const bool mf = matchedFilters_.load(std::memory_order_relaxed);
         auto cascade = computeCascade(sdb);
         int stageIdx = 0;
 
@@ -833,16 +860,31 @@ protected:
             BiquadCoeffs c;
             switch (sh)
             {
-                case Shape::LowPass:   c = BiquadCoeffs::makeLowPass(sr, f, stageQ);  break;
-                case Shape::HighPass:  c = BiquadCoeffs::makeHighPass(sr, f, stageQ); break;
-                case Shape::BandPass:  c = BiquadCoeffs::makeBandPass(sr, f, stageQ); break;
+                case Shape::LowPass:
+                    c = mf ? BiquadCoeffs::makeLowPassMatched(sr, f, stageQ)
+                           : BiquadCoeffs::makeLowPass(sr, f, stageQ);
+                    break;
+                case Shape::HighPass:
+                    c = mf ? BiquadCoeffs::makeHighPassMatched(sr, f, stageQ)
+                           : BiquadCoeffs::makeHighPass(sr, f, stageQ);
+                    break;
+                case Shape::BandPass:
+                    c = mf ? BiquadCoeffs::makeBandPassMatched(sr, f, stageQ)
+                           : BiquadCoeffs::makeBandPass(sr, f, stageQ);
+                    break;
                 case Shape::Peak:
                     c = matchedPeak_.load(std::memory_order_relaxed)
                         ? BiquadCoeffs::makePeakMatched(sr, f, stageQ, gainDb)
                         : BiquadCoeffs::makePeak(sr, f, stageQ, gainDb);
                     break;
-                case Shape::LowShelf:  c = BiquadCoeffs::makeLowShelf(sr, f, gainDb, ssl); break;
-                case Shape::HighShelf: c = BiquadCoeffs::makeHighShelf(sr, f, gainDb, ssl); break;
+                case Shape::LowShelf:
+                    c = (mf && ssl >= 1.0) ? BiquadCoeffs::makeLowShelfMatched(sr, f, gainDb)
+                                           : BiquadCoeffs::makeLowShelf(sr, f, gainDb, ssl);
+                    break;
+                case Shape::HighShelf:
+                    c = (mf && ssl >= 1.0) ? BiquadCoeffs::makeHighShelfMatched(sr, f, gainDb)
+                                           : BiquadCoeffs::makeHighShelf(sr, f, gainDb, ssl);
+                    break;
                 case Shape::Notch:     c = BiquadCoeffs::makeNotch(sr, f, stageQ);  break;
                 case Shape::AllPass:   c = BiquadCoeffs::makeAllPass(sr, f, stageQ); break;
                 case Shape::Tilt:      c = BiquadCoeffs::makeTilt(sr, f, gainDb); break;
@@ -862,6 +904,7 @@ protected:
     std::atomic<int> slopeDb_ { 12 };
     std::atomic<float> shelfSlope_ { 1.0f };
     std::atomic<bool> matchedPeak_ { false };
+    std::atomic<bool> matchedFilters_ { false };
 
     std::array<Biquad<T, MaxChannels>, kMaxStages> stages_ {};
 
@@ -889,6 +932,7 @@ protected:
     Shape lastShape_ = Shape::LowPass;
     int lastSlopeDb_ = -1;
     bool lastMatched_ = false;
+    bool lastMatchedFilters_ = false;
     float lastShelfSlope_ = -1.0f;   ///< Shelf S: a slope-only change must rebuild coeffs.
     bool snapNext_ = true;           ///< Next block skips the smoothers to their targets.
     unsigned chunkPhase_ = 0;        ///< Stream position in the 16-sample refresh grid.

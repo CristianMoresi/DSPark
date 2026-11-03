@@ -22,7 +22,7 @@
  *   laid out in OUTPUT time, so its stopband starts at the output Nyquist
  *   frequency: whatever the recording holds above it is removed before it
  *   can fold. The weights come from the same contiguous polyphase rows, so a
- *   voice costs about r times an untransposed one. Transposition is capped
+ *   voice costs about r times an untransposed one. Transposition up is capped
  *   at 8x (+36 semitones).
  *
  * Measured at 48 kHz: -118 to -130 dB THD+N on a 1 kHz tone from -12 to +19
@@ -31,16 +31,20 @@
  * that carries a voice across its recording's rate keeps the same guarantees.
  *
  * Loops are read through: a read past the loop end wraps to the loop start,
- * so a loop point needs no alignment to the kernel and no unrolled copy. A
- * loop crossfade is baked once, at load, into a separate copy of the region
- * that precedes the loop end, so the first pass and a release in Sustain mode
- * still play the recording untouched.
+ * and once the loop has wrapped a read behind its start continues its end, so
+ * a loop point needs no alignment to the kernel and no unrolled copy. A loop
+ * crossfade is baked once, at load, into a separate copy of the region that
+ * precedes the loop end. Every pass of an engaged loop reads that copy, the
+ * first included, so the jump lands on continuous material; a release in
+ * Sustain mode leaves the loop and plays on the recording untouched.
  *
  * Voices: prepare() fixes the polyphony. A note that finds every voice busy
  * steals one - the oldest released voice, else the quietest, else the oldest
  * - and the stolen voice fades out over 3 ms in one of the spare voices kept
- * for that purpose instead of being cut, so stealing never clicks. A note
- * already sounding on the same key is released, not cut, when it retriggers.
+ * for that purpose instead of being cut. There is a spare for every voice, so
+ * replacing the whole polyphony at one sample does not click; only a second
+ * such burst inside the 3 ms cuts a fade short. A note already sounding on
+ * the same key is released, not cut, when it retriggers.
  *
  * Events carry a sample offset into the next processBlock() and are applied
  * at that sample, so a host passes its MIDI through unchanged and timing is
@@ -55,7 +59,8 @@
  *   back to be freed by the next control call (or the destructor). They never
  *   block the audio thread and the audio thread never frees memory.
  * - setEnvelope() / setVelocityRange() / setGain(): any thread, lock free
- *   (relaxed atomics read when a note starts or is released).
+ *   (relaxed atomics: the envelope and range are read when a note starts or
+ *   is released, the gain at every block).
  * - noteOn() / noteOnTuned() / noteOff() / setSustainPedal() / setPitchBend() / allNotesOff()
  *   and processBlock() / reset(): audio thread, the stream owner. Events are
  *   queued, allocation free, for the next processBlock().
@@ -147,7 +152,7 @@ public:
             return;
         sampleRate_ = spec.sampleRate;
         polyphony_ = std::clamp(maxVoices, 1, 256);
-        voices_.assign(static_cast<size_t>(polyphony_ + polyphony_ / 4 + 2), Voice {});
+        voices_.assign(static_cast<size_t>(2 * polyphony_ + 2), Voice {});
         for (auto& v : voices_)
         {
             v.env.prepare(sampleRate_);
@@ -156,6 +161,7 @@ public:
         weights_.assign(static_cast<size_t>(Reader::kWeightsLength), T(0));
         (void)Reader::polyphaseTable();   // build the shared tables here, never on the audio thread
         stealFadeSamples_ = std::max(1, static_cast<int>(std::lround(0.003 * sampleRate_)));
+        gainCoeff_ = 1.0 - std::exp(-1.0 / (0.010 * sampleRate_));
         reset();
         prepared_ = true;
     }
@@ -167,6 +173,7 @@ public:
         eventCount_ = 0;
         sustainPedal_ = false;
         pitchBend_ = 0.0;
+        currentGain_ = outputGain_.load(std::memory_order_relaxed);
         activeVoices_.store(0, std::memory_order_relaxed);
     }
 
@@ -233,7 +240,7 @@ public:
                                std::memory_order_relaxed);
     }
 
-    /** @brief Output gain in dB. */
+    /** @brief Output gain in dB, smoothed over about 10 ms. */
     void setGain(T dB) noexcept
     {
         if (!std::isfinite(dB)) return;
@@ -306,7 +313,8 @@ public:
         const int nCh = out.getNumChannels();
         for (int c = 0; c < nCh; ++c)
             std::fill_n(out.getChannel(c), n, T(0));
-        if (!prepared_ || n <= 0) { eventCount_ = 0; return; }
+        if (!prepared_) { eventCount_ = 0; return; }
+        if (n <= 0) return;   // a host flush: the queued events wait for real samples
 
         adoptPending();
 
@@ -320,13 +328,7 @@ public:
         eventCount_ = 0;
         if (cursor < n) render(out, cursor, n);
 
-        const double g = outputGain_.load(std::memory_order_relaxed);
-        if (g != 1.0)
-            for (int c = 0; c < std::min(nCh, 2); ++c)
-            {
-                T* d = out.getChannel(c);
-                for (int i = 0; i < n; ++i) d[i] = static_cast<T>(d[i] * g);
-            }
+        applyOutputGain(out, n);
 
         retireFadedSet();
         int count = 0;
@@ -532,6 +534,31 @@ private:
 
     // -- Rendering --------------------------------------------------------------------------
 
+    /** Applies the output gain: per sample while it moves to its target, so a
+     *  change never steps and no block boundary shows, then as one constant. */
+    void applyOutputGain(AudioBufferView<T> out, int n) noexcept
+    {
+        const double target = outputGain_.load(std::memory_order_relaxed);
+        const int channels = std::min(out.getNumChannels(), 2);
+        int i = 0;
+        for (; i < n && currentGain_ != target; ++i)
+        {
+            currentGain_ += (target - currentGain_) * gainCoeff_;
+            if (std::abs(target - currentGain_) < 1e-9) currentGain_ = target;
+            for (int c = 0; c < channels; ++c)
+            {
+                T* d = out.getChannel(c);
+                d[i] = static_cast<T>(d[i] * currentGain_);
+            }
+        }
+        if (currentGain_ == 1.0) return;
+        for (int c = 0; c < channels; ++c)
+        {
+            T* d = out.getChannel(c);
+            for (int s = i; s < n; ++s) d[s] = static_cast<T>(d[s] * currentGain_);
+        }
+    }
+
     /** Envelope and stealing fade for the output sample about to be emitted;
      *  false when the voice has just ended. */
     static bool advanceGain(Voice& v, int stealFade, double& gain) noexcept
@@ -549,6 +576,7 @@ private:
     void emit(AudioBufferView<T> out, int s, const Voice& v, double a0, double a1, double gain) noexcept
     {
         const int nCh = out.getNumChannels();
+        if (nCh < 1) return;
         if (nCh == 1)
             out.getChannel(0)[s] += static_cast<T>(a0 * v.gainMono * gain);
         else
@@ -565,7 +593,7 @@ private:
         for (auto& v : voices_)
         {
             if (!v.active) continue;
-            const double ratio = std::clamp(v.baseRatio * bendRatio, 1.0 / Reader::kMaxRate, Reader::kMaxRate);
+            const double ratio = std::clamp(v.baseRatio * bendRatio, v.reader.minRate(), Reader::kMaxRate);
             for (int s = from; s < to; ++s)
             {
                 double a0 = 0.0, a1 = 0.0;
@@ -587,6 +615,8 @@ private:
     bool prepared_ = false;
     int stealFadeSamples_ = 144;
     uint64_t clock_ = 0;
+    double gainCoeff_ = 0.002;    ///< One-pole coefficient of the output gain.
+    double currentGain_ = 1.0;    ///< Output gain reached, audio thread.
 
     std::vector<Voice> voices_;
     std::vector<T> weights_;

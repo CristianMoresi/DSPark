@@ -164,6 +164,11 @@ public:
     static constexpr int kTablePerUnit = 2048;
     /// Highest playback rate; the kernel then spans 8 x 64 taps.
     static constexpr double kMaxRate = 8.0;
+    /// Lowest rate of the scatter form, whose kernel widens as the rate falls.
+    static constexpr double kMinScatterRate = 1.0 / kMaxRate;
+    /// Lowest rate of the gather form, whose kernel keeps its width: only a
+    /// guard against a stopped read, 13 octaves down.
+    static constexpr double kMinGatherRate = 1.0 / 8192.0;
     static constexpr int kMaxHalfTaps = static_cast<int>(kHalfTaps * kMaxRate);
     /// Cutoff at 0.45 of the sample rate (normalised to Nyquist): passband to
     /// 0.40, stopband from 0.50, the width a 64-tap Kaiser needs for 100 dB.
@@ -257,6 +262,8 @@ public:
         zone_ = &z;
         pos_ = static_cast<double>(z.start);
         scatter_ = ratio > 1.0;
+        wrapped_ = false;
+        justWrapped_ = false;
         inputDone_ = false;
         drainLeft_ = 0;
         jIn_ = z.start;
@@ -274,13 +281,19 @@ public:
         if (zone_ != nullptr && zone_->loop == SampleLoopMode::Sustain) releaseLoop_ = true;
     }
 
+    /** @brief True when this reader scatters (it started above the recording's rate). */
+    [[nodiscard]] bool scatters() const noexcept { return scatter_; }
+
+    /** @brief Lowest rate next() accepts for this reader. */
+    [[nodiscard]] double minRate() const noexcept { return scatter_ ? kMinScatterRate : kMinGatherRate; }
+
     /** @brief The zone being read (null before start()). */
     [[nodiscard]] const SampleZoneData<T>* zone() const noexcept { return zone_; }
 
     /**
      * @brief One output frame at `ratio` recording samples per output sample.
      *
-     * @param ratio       Playback rate, within [1 / kMaxRate, kMaxRate].
+     * @param ratio       Playback rate, within [minRate(), kMaxRate].
      * @param outChannels Output channels: 1 mixes the zone's channels to one,
      *                    2 or more read its first two.
      * @param weights     Scratch of kWeightsLength values.
@@ -309,12 +322,15 @@ private:
         return static_cast<double>(sum);
     }
 
-    /** Reads sample j of channel c through the loop and the baked crossfade. */
+    /** Reads sample j of channel c through the loop and the baked crossfade.
+     *  Once the loop has wrapped, what precedes its start is its own end. */
     [[nodiscard]] static double fetch(const SampleZoneData<T>& z, const T* chan, const T* baked,
-                                      int64_t j, bool loopEngaged) noexcept
+                                      int64_t j, bool loopEngaged, bool wrapped = false) noexcept
     {
         if (loopEngaged && j >= z.loopEnd)
             j = z.loopStart + (j - z.loopEnd) % (z.loopEnd - z.loopStart);
+        else if (loopEngaged && wrapped && j < z.loopStart)
+            j = z.loopEnd - 1 - (z.loopStart - 1 - j) % (z.loopEnd - z.loopStart);
         if (j < 0 || j >= z.length) return 0.0;
         if (loopEngaged && baked != nullptr && j >= z.loopEnd - z.xfade && j < z.loopEnd)
             return static_cast<double>(baked[j - (z.loopEnd - z.xfade)]);
@@ -373,12 +389,16 @@ private:
         const int used = (nCh == 1) ? zc : std::min(zc, 2);
 
         // Sustain loop released: leave the loop once the kernel is clear
-        // of the crossfade region, so no read jumps sources.
-        if (releaseLoop_ && pos_ + half < static_cast<double>(z.loopEnd - z.xfade))
+        // of the crossfade region, so no read jumps sources. A loop with no
+        // such position leaves at its wrap, where the baked region starts on
+        // the recording itself.
+        if (releaseLoop_ && (pos_ + half < static_cast<double>(z.loopEnd - z.xfade) || justWrapped_))
         {
             loopEngaged_ = false;
             releaseLoop_ = false;
+            wrapped_ = false;
         }
+        justWrapped_ = false;
         if (!loopEngaged_ && pos_ >= static_cast<double>(z.length)) return Frame::Ended;
 
         const double fl = std::floor(pos_);
@@ -387,7 +407,8 @@ private:
 
         const int64_t first = ip - half + 1;
         const bool direct = first >= 0 && first + taps <= z.length
-                         && (!loopEngaged_ || first + taps <= z.loopEnd - z.xfade);
+                         && (!loopEngaged_ || (first + taps <= z.loopEnd - z.xfade
+                                               && (!wrapped_ || first >= z.loopStart)));
         double acc[2] = { 0.0, 0.0 };
         for (int c = 0; c < used; ++c)
         {
@@ -400,7 +421,7 @@ private:
             else
                 for (int t = 0; t < taps; ++t)
                     sum += static_cast<double>(weights[t])
-                         * fetch(z, chan, baked, first + t, loopEngaged_);
+                         * fetch(z, chan, baked, first + t, loopEngaged_, wrapped_);
             if (nCh == 1) acc[0] += sum / zc;
             else acc[c] = sum;
         }
@@ -409,7 +430,11 @@ private:
 
         pos_ += ratio;
         if (loopEngaged_ && pos_ >= static_cast<double>(z.loopEnd))
+        {
             pos_ -= loopLen;
+            wrapped_ = true;
+            justWrapped_ = z.loopEnd - z.xfade - half <= z.loopStart;
+        }
         return Frame::Produced;
     }
 
@@ -438,7 +463,7 @@ private:
         // Spread every input whose support reaches this output sample.
         while (!inputDone_ && tNext_ < static_cast<double>(half))
         {
-            if (releaseLoop_ && jIn_ < z.loopEnd - z.xfade)
+            if (releaseLoop_ && (jIn_ < z.loopEnd - z.xfade || jIn_ == z.loopStart))
             {
                 loopEngaged_ = false;
                 releaseLoop_ = false;
@@ -461,11 +486,10 @@ private:
                 const T xs = static_cast<T>(x[r] * spacing);
                 T* acc = acc_[static_cast<size_t>(r)].data();
                 const T* w = weights;
-                for (int t = 0; t < taps; ++t)
-                {
-                    const int idx = base + t;
-                    if (idx >= accPos_) acc[idx] += w[t] * xs;   // earlier outputs are gone
-                }
+                // Taps before the current output are gone.
+                T* out = acc + base;
+                for (int t = std::max(accPos_ - base, 0); t < taps; ++t)
+                    out[t] += w[t] * xs;
             }
             ++jIn_;
             if (loopEngaged_ && jIn_ >= z.loopEnd) jIn_ = z.loopStart;
@@ -499,6 +523,8 @@ private:
     double pos_ = 0.0;            ///< Read position in recording samples (gather form).
     bool loopEngaged_ = false;
     bool releaseLoop_ = false;    ///< Sustain loop: disengage once clear of the fade.
+    bool wrapped_ = false;        ///< The loop has wrapped: reads behind it continue its end.
+    bool justWrapped_ = false;    ///< Just wrapped a loop with no position clear of the fade.
     // Scatter form: the next recording sample to spread, the output time it
     // falls on (relative to the next output sample), and the output
     // accumulators it is spread into.

@@ -86,7 +86,7 @@ public:
         r.depth.store(depth, std::memory_order_relaxed);
         r.base = base;
         r.smoothMs = std::max(smoothMs, T(0));
-        r.state = T(0);
+        r.state = 0.0;
         r.primed = false;
         return numRoutes_++;
     }
@@ -131,21 +131,22 @@ public:
             // last good value instead, matching DryWetMixer's isnan guard.
             if (!std::isfinite(value))
             {
-                r.target(r.state);
+                r.target(static_cast<T>(r.state));
                 continue;
             }
-            if (!r.primed || r.smoothMs <= T(0))
+            if (!r.primed || !(r.smoothMs > T(0)))
             {
-                r.state = value;     // no sweep-in from zero on the first hit
+                r.state = static_cast<double>(value);   // no sweep-in from zero on the first hit
                 r.primed = true;
             }
             else
             {
+                // A non-finite block time (NaN rate) holds the state.
                 const double a = std::exp(-dt * 1000.0 / static_cast<double>(r.smoothMs));
-                r.state = static_cast<T>(a * static_cast<double>(r.state)
-                                         + (1.0 - a) * static_cast<double>(value));
+                if (a >= 0.0 && a <= 1.0)
+                    r.state = a * r.state + (1.0 - a) * static_cast<double>(value);
             }
-            r.target(r.state);
+            r.target(static_cast<T>(r.state));
         }
     }
 
@@ -157,7 +158,7 @@ private:
         std::atomic<T> depth { T(1) };
         T base = T(0);
         T smoothMs = T(20);
-        T state = T(0);
+        double state = 0.0;   // double: a float one-pole stalls short of its target
         bool primed = false;
     };
 

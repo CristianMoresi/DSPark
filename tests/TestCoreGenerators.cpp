@@ -9,6 +9,7 @@
 #include "../Core/WavetableOscillator.h"
 #include "../Core/WavetableBank.h"
 #include "../Core/EnvelopeGenerator.h"
+#include "../Core/ModulationRouter.h"
 #include "../Core/Sampler.h"
 #include "../Core/AnalogRandom.h"
 #include "../Core/FFT.h"
@@ -2483,4 +2484,292 @@ DSPARK_TEST(WavetableOsc_low_pitch_floor_and_external_bank_morph)
     EXPECT_NEAR(peak, 1.0, 1e-3);
     wt.setBank(nullptr);   // back to the own saw
     EXPECT_TRUE(std::isfinite(wt.getSample()));
+}
+
+// ============================================================================
+// Sampler and generators: regressions from the voice generator audit
+// ============================================================================
+
+namespace {
+
+// Largest fourth difference: a low tone has almost none, a cut has plenty.
+double smpClick(const std::vector<double>& x, size_t a, size_t b)
+{
+    double peak = 0.0;
+    for (size_t i = std::max<size_t>(a, 4); i < b; ++i)
+        peak = std::max(peak, std::abs(x[i] - 4.0 * x[i - 1] + 6.0 * x[i - 2] - 4.0 * x[i - 3] + x[i - 4]));
+    return peak;
+}
+
+// Amplitude of a tone at f over [a, b).
+double smpToneAmp(const std::vector<double>& y, size_t a, size_t b, double f)
+{
+    double amp = 0.0;
+    (void)smpResidualDb(y, a, b, f, &amp);
+    return amp;
+}
+
+} // namespace
+
+// A gather read just after a loop wrap reaches behind the loop start, and those
+// taps must continue the loop's end. They read the audio before the loop, or
+// zeros for a loop from sample 0, so the note ticked at the loop rate: -77 dB
+// for a whole-file loop and -45 dB after a noisy pre-roll (-243 dB expected).
+DSPARK_TEST(Sampler_loop_reads_through_its_start)
+{
+    const auto cycle = smpTone(1000.0, 0.1);        // 100 periods
+    auto preRoll = smpTone(1000.0, 0.3);
+    uint32_t noise = 12345u;
+    for (size_t i = 0; i < 4800; ++i)
+    {
+        noise = noise * 1664525u + 1013904223u;
+        preRoll[i] = (static_cast<double>(noise >> 8) / 8388608.0 - 1.0) * 0.3;
+    }
+    struct Case { const std::vector<double>* audio; int64_t start, end; };
+    const Case cases[] = { { &cycle, 0, 4800 }, { &preRoll, 4800, 9600 } };
+    for (const Case& c : cases)
+        for (const int key : { 60, 53 })
+        {
+            const double* p = c.audio->data();
+            Smp::ZoneSpec z;
+            z.audio = AudioBufferView<const double>(&p, 1, static_cast<int>(c.audio->size()));
+            z.sampleRate = kSmpFs;
+            z.rootKey = 60;
+            z.loopMode = Smp::LoopMode::Continuous;
+            z.loopStart = c.start;
+            z.loopEnd = c.end;
+            Smp s;
+            s.prepare(AudioSpec{ kSmpFs, 512, 1 }, 4);
+            s.setVelocityRange(0.0);
+            EXPECT_TRUE(s.setZones(std::span<const Smp::ZoneSpec>(&z, 1)));
+            const auto y = smpPlay(s, key, 0.5);
+            const double f = 1000.0 * std::pow(2.0, (key - 60) / 12.0);
+            EXPECT_LT(smpResidualDb(y, 12000, y.size() - 100, f), -110.0);
+        }
+}
+
+// The 1/8 rate floor belongs to the scatter form. Applied to every voice, it
+// held a note at -36 semitones: 249.8 Hz for the 62.5 Hz wanted at -60, so the
+// fit at the wanted pitch left +45 dB of residual.
+DSPARK_TEST(Sampler_stays_in_tune_far_below_the_root)
+{
+    const auto x = smpTone(2000.0, 1.0);
+    for (const int st : { -48, -60 })
+    {
+        Smp s;
+        smpLoad(s, x, 84);
+        const auto y = smpPlay(s, 84 + st, 0.5);
+        double amp = 0.0;
+        const double r = smpResidualDb(y, 2400, 23000, 2000.0 * std::pow(2.0, st / 12.0), &amp);
+        EXPECT_LT(r, -90.0);
+        EXPECT_NEAR(amp, 0.5, 1e-3);
+    }
+}
+
+// A host flush with no samples dropped the queued events: the note-off below
+// was lost and 1 voice kept sounding.
+DSPARK_TEST(Sampler_zero_sample_block_keeps_its_events)
+{
+    const auto x = smpTone(1000.0, 1.0);
+    Smp s;
+    smpLoad(s, x, 60);
+    std::vector<double> y(512);
+    double* ch[1] = { y.data() };
+    s.noteOn(60, 1.0, 0);
+    s.processBlock(AudioBufferView<double>(ch, 1, 512));
+    s.noteOff(60, 0);
+    s.processBlock(AudioBufferView<double>(ch, 1, 0));
+    for (int b = 0; b < 20; ++b) s.processBlock(AudioBufferView<double>(ch, 1, 512));
+    EXPECT_EQ(s.getActiveVoiceCount(), 0);
+}
+
+// A view with no channels reached channel 0 of an empty view: a segfault
+// (exit 139) as soon as a voice sounded. The voice must run on silently.
+DSPARK_TEST(Sampler_view_with_no_channels_is_safe)
+{
+    const auto x = smpTone(1000.0, 1.0);
+    Smp s;
+    smpLoad(s, x, 60);
+    s.noteOn(60, 1.0, 0);
+    double* ch[1] = { nullptr };
+    s.processBlock(AudioBufferView<double>(ch, 0, 64));
+    EXPECT_EQ(s.getActiveVoiceCount(), 1);
+}
+
+// Replacing every voice at one sample ran out of spare voices and cut the
+// rest at full level: 4 of 4 stolen measured a click of 1.33, against the
+// 0.006 of a 3 ms fade.
+DSPARK_TEST(Sampler_replacing_every_voice_still_fades)
+{
+    const auto x = smpTone(55.0, 2.0);
+    const double* p = x.data();
+    Smp s;
+    s.prepare(AudioSpec{ kSmpFs, 512, 1 }, 4);
+    s.setVelocityRange(0.0);
+    s.setEnvelope(20.0, 1.0, 1.0, 50.0);
+    EXPECT_TRUE(s.loadSample(AudioBufferView<const double>(&p, 1, static_cast<int>(x.size())), kSmpFs, 60));
+    std::vector<double> y(12288);
+    for (int k = 0; k < 4; ++k) s.noteOn(60 + 2 * k, 1.0, 0);
+    for (size_t q = 0; q < y.size(); q += 512)
+    {
+        if (q == 9216)
+            for (int k = 0; k < 4; ++k) s.noteOn(72 + 2 * k, 1.0, 100);
+        double* ch[1] = { y.data() + q };
+        s.processBlock(AudioBufferView<double>(ch, 1, 512));
+    }
+    EXPECT_LT(smpClick(y, 9316, 9600), 0.05);
+}
+
+// A released Sustain loop waited for a position with the kernel clear of the
+// crossfade, and a crossfade as long as the loop, or a loop shorter than the
+// kernel, has none: the tail played at 0.0001 instead of 0.17.
+DSPARK_TEST(Sampler_sustain_loop_always_lets_go)
+{
+    std::vector<double> w(72000);
+    for (size_t i = 0; i < w.size(); ++i)
+        w[i] = 0.5 * std::sin(2.0 * pi<double> * (i < 19200 ? 1000.0 : 3000.0) * static_cast<double>(i) / kSmpFs);
+    const double* p = w.data();
+    struct Case { int64_t length, crossfade; int key; };
+    const Case cases[] = { { 4800, 4800, 60 }, { 4800, 4800, 67 }, { 24, 0, 60 } };
+    for (const Case& c : cases)
+    {
+        Smp::ZoneSpec z;
+        z.audio = AudioBufferView<const double>(&p, 1, static_cast<int>(w.size()));
+        z.sampleRate = kSmpFs;
+        z.rootKey = 60;
+        z.loopMode = Smp::LoopMode::Sustain;
+        z.loopStart = 9600;
+        z.loopEnd = 9600 + c.length;
+        z.loopCrossfade = c.crossfade;
+        Smp s;
+        s.prepare(AudioSpec{ kSmpFs, 512, 1 }, 4);
+        s.setVelocityRange(0.0);
+        s.setEnvelope(0.1, 1.0, 1.0, 3000.0);
+        EXPECT_TRUE(s.setZones(std::span<const Smp::ZoneSpec>(&z, 1)));
+        std::vector<double> y(40960);
+        s.noteOn(c.key, 1.0, 0);
+        for (size_t q = 0; q < y.size(); q += 512)
+        {
+            if (q == 12288) s.noteOff(c.key, 0);
+            double* ch[1] = { y.data() + q };
+            s.processBlock(AudioBufferView<double>(ch, 1, 512));
+        }
+        const double f = 3000.0 * std::pow(2.0, (c.key - 60) / 12.0);
+        EXPECT_GT(smpToneAmp(y, 28000, 40000, f), 0.1);
+    }
+}
+
+// setGain stepped at the block edge: 0.27 on a tone moving 0.0065 per sample.
+// It now moves per sample, and so the same whatever the block size.
+DSPARK_TEST(Sampler_gain_change_is_smooth_at_any_block_size)
+{
+    const auto x = smpTone(100.0, 1.0);
+    auto render = [&](int block) {
+        Smp s;
+        smpLoad(s, x, 60);
+        std::vector<double> y(14400);
+        s.noteOn(60, 1.0, 0);
+        for (size_t q = 0; q < y.size(); q += static_cast<size_t>(block))
+        {
+            if (q == 4608) s.setGain(-24.0);
+            double* ch[1] = { y.data() + q };
+            s.processBlock(AudioBufferView<double>(ch, 1, std::min<int>(block, static_cast<int>(y.size() - q))));
+        }
+        return y;
+    };
+    const auto a = render(512);
+    const auto b = render(64);
+    double step = 0.0, different = 0.0;
+    for (size_t i = 4600; i < 4900; ++i) step = std::max(step, std::abs(a[i] - a[i - 1]));
+    for (size_t i = 0; i < a.size(); ++i) different = std::max(different, std::abs(a[i] - b[i]));
+    EXPECT_LT(step, 0.02);
+    EXPECT_EQ(different, 0.0);
+    EXPECT_NEAR(smpToneAmp(a, 9600, 14300, 100.0), 0.5 * std::pow(10.0, -24.0 / 20.0), 1e-4);
+}
+
+// One NaN reached the envelope's recursive stages and held the output at NaN
+// until reset(): 48000 of 48000 samples.
+DSPARK_TEST(ADSREnvelope_ignores_nonfinite_parameters)
+{
+    const double bad = std::numeric_limits<double>::quiet_NaN();
+    const std::function<void(ADSREnvelope<double>&)> poisons[] = {
+        [&](ADSREnvelope<double>& e) { e.setAttack(bad); },
+        [&](ADSREnvelope<double>& e) { e.setDecay(bad); },
+        [&](ADSREnvelope<double>& e) { e.setSustain(bad); },
+        [&](ADSREnvelope<double>& e) { e.setRelease(bad); },
+        [&](ADSREnvelope<double>& e) { e.setParameters(10.0, bad, 0.5, 10.0); },
+        [&](ADSREnvelope<double>& e) { e.setCurvature(bad); },
+        [&](ADSREnvelope<double>& e) { e.setCurvature(bad, 3.0, 3.0); },
+        [&](ADSREnvelope<double>& e) { e.prepare(bad); },
+    };
+    for (const auto& poison : poisons)
+    {
+        ADSREnvelope<double> e;
+        e.prepare(48000.0);
+        e.noteOn();
+        for (int i = 0; i < 100; ++i) (void)e.getNextValue();
+        poison(e);
+        int nonFinite = 0;
+        for (int i = 0; i < 4800; ++i) nonFinite += std::isfinite(e.getNextValue()) ? 0 : 1;
+        e.noteOff();
+        for (int i = 0; i < 48000; ++i) nonFinite += std::isfinite(e.getNextValue()) ? 0 : 1;
+        EXPECT_EQ(nonFinite, 0);
+    }
+}
+
+// setPhase(NaN) stuck in the phase accumulator: 4800 of 4800 samples NaN.
+DSPARK_TEST(Oscillator_ignores_nonfinite_phase)
+{
+    Oscillator<double> o;
+    o.setWaveform(Oscillator<double>::Waveform::Saw);
+    o.prepare(48000.0);
+    o.setFrequency(440.0);
+    o.setPhase(std::numeric_limits<double>::quiet_NaN());
+    o.setPhase(std::numeric_limits<double>::infinity());
+    int nonFinite = 0;
+    for (int i = 0; i < 4800; ++i) nonFinite += std::isfinite(o.getNextSample()) ? 0 : 1;
+    EXPECT_EQ(nonFinite, 0);
+}
+
+// An infinite increment wrapped to NaN on every other sample (500 of 1000).
+DSPARK_TEST(Phasor_wraps_infinity_into_its_range)
+{
+    Phasor<double> p;
+    p.prepare(48000.0);
+    p.setFrequency(std::numeric_limits<double>::infinity());
+    int outside = 0;
+    for (int i = 0; i < 1000; ++i)
+    {
+        const double v = p.advance();
+        outside += (v >= 0.0 && v < 1.0) ? 0 : 1;
+    }
+    EXPECT_EQ(outside, 0);
+    p.setPhase(std::numeric_limits<double>::infinity());
+    EXPECT_EQ(p.getPhase(), 0.0);
+}
+
+// A NaN smoothing time or sample rate stuck in the route's one-pole, and a
+// float state stalled 0.229 short of 1000 after 60 time constants.
+DSPARK_TEST(ModulationRouter_settles_and_survives_nonfinite_timing)
+{
+    float value = 0.0f, source = 0.0f;
+    ModulationRouter<float> settling;
+    settling.addRoute([&] { return source; }, [&](float v) { value = v; }, 1.0f, 0.0f, 5000.0f);
+    settling.update(32, 48000.0);
+    source = 1000.0f;
+    for (int i = 0; i < 450000; ++i) settling.update(32, 48000.0);
+    EXPECT_NEAR(value, 1000.0f, 1e-3f);
+
+    ModulationRouter<float> nanTime;
+    nanTime.addRoute([] { return 1.0f; }, [&](float v) { value = v; }, 1.0f, 0.0f,
+                     std::numeric_limits<float>::quiet_NaN());
+    for (int i = 0; i < 3; ++i) nanTime.update(32, 48000.0);
+    EXPECT_EQ(value, 1.0f);
+
+    ModulationRouter<float> nanRate;
+    nanRate.addRoute([] { return 1.0f; }, [&](float v) { value = v; }, 1.0f, 0.0f, 20.0f);
+    nanRate.update(32, 48000.0);
+    nanRate.update(32, std::numeric_limits<double>::quiet_NaN());
+    nanRate.update(32, 48000.0);
+    EXPECT_EQ(value, 1.0f);
 }

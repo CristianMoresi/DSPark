@@ -118,6 +118,7 @@ public:
     void prepare(double sampleRate) noexcept
     {
         assert(sampleRate > 0.0);
+        if (!(sampleRate > 0.0) || !std::isfinite(sampleRate)) return;
         sampleRate_ = sampleRate;
         // Touch the shared minBLEP table here so its one-time FFT build runs
         // on the control thread, never inside the audio callback.
@@ -266,10 +267,12 @@ public:
      * hard sync the slave is re-phased coherently and pending minBLEP
      * corrections are discarded.
      *
-     * @param phase Normalized phase in the range [0.0, 1.0).
+     * @param phase Normalized phase in the range [0.0, 1.0); a non-finite
+     *              value is ignored.
      */
     void setPhase(T phase) noexcept
     {
+        if (!std::isfinite(phase)) return;
         // Wrap (not clamp): a phase of exactly 1.0 must land on 0.0 so the
         // first sample is not a one-off discontinuity.
         phase_ = static_cast<Phase>(phase) - std::floor(static_cast<Phase>(phase));

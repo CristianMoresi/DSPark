@@ -40,8 +40,11 @@
  *   the amplifier's gain factor).
  * - **Voices**: polyphonic, mono or legato; constant-time glide; Sampler's
  *   stealing policy (the oldest released voice, else the quietest, else the
- *   oldest) with a 3 ms fade in a spare voice, so stealing never clicks;
- *   sustain pedal; analog drift (AnalogRandom) of pitch and cutoff.
+ *   oldest) with a 3 ms fade in a spare voice, one spare per voice, so that
+ *   replacing the whole polyphony at one sample does not click; a mono move
+ *   that retriggers or changes sample zone restarts the sample source through
+ *   the same fade; sustain pedal; analog drift (AnalogRandom) of pitch and
+ *   cutoff.
  *
  * Timing and determinism: events carry a sample offset into the next block
  * and apply at that sample. Modulation is evaluated every kControlPeriod
@@ -144,7 +147,9 @@ enum class ModSource
 inline constexpr int kNumModSources = 15;
 
 /** @brief Modulation destinations. OscN Pitch and OscN Level reach analog
- *  oscillator N and wavetable oscillator N; FM operators have their own. */
+ *  oscillator N and wavetable oscillator N; FM operators have their own.
+ *  LFO Rate acts on retriggered LFOs only (a free LFO is shared by every
+ *  voice) and sees an LFO source one control period late. */
 enum class ModDest
 {
     None, Pitch, Osc1Pitch, Osc2Pitch, Osc3Pitch, Osc1Level, Osc2Level, Osc3Level,
@@ -589,7 +594,7 @@ public:
         baseRate_ = spec.sampleRate;
         maxBlock_ = spec.maxBlockSize;
         maxVoices_ = std::clamp(maxVoices, 1, kMaxPolyphony);
-        voices_ = std::vector<Voice>(static_cast<size_t>(maxVoices_ + maxVoices_ / 4 + 2));
+        voices_ = std::vector<Voice>(static_cast<size_t>(2 * maxVoices_ + 2));
         for (auto& v : voices_)
             for (auto& u : v.uni) u.reader.allocate();
         weights_.assign(static_cast<size_t>(Reader::kWeightsLength), T(0));
@@ -840,7 +845,8 @@ public:
         const int nCh = out.getNumChannels();
         for (int c = 0; c < nCh; ++c)
             std::fill_n(out.getChannel(c), n, T(0));
-        if (!prepared_ || n <= 0) { eventCount_ = 0; return; }
+        if (!prepared_) { eventCount_ = 0; return; }
+        if (n <= 0) return;   // a host flush: the queued events wait for real samples
 
         adoptPending();
         snapshotParameters(false);
@@ -984,6 +990,7 @@ private:
         ADSREnvelope<double> env2, env3;   ///< Control rate.
         std::array<ADSREnvelope<double>, 4> opEnv;
         std::array<Lfo<double>, 2> lfo;
+        std::array<double, 2> lfoValue {};  ///< Last tick's outputs (LFO Rate sources).
         std::array<double, kNumSmoothed> smooth {};   ///< 10 ms smoothed parameters.
         std::array<Ramp, 3> oscLevel;
         Ramp subLevel, noiseLevel, sampleLevel;
@@ -1111,6 +1118,7 @@ private:
         latency_.store(latency, std::memory_order_relaxed);
         smoothAlpha_ = 1.0 - std::exp(-static_cast<double>(kControlPeriod) / (0.010 * baseRate_));
         stealFade_ = std::max(1, static_cast<int>(std::lround(0.003 * internalRate_)));
+        noiseScale_ = std::sqrt(static_cast<double>(factor_));   // decimation keeps 1 / factor of its power
         const double controlRate = baseRate_ / kControlPeriod;
         for (auto& v : voices_)
         {
@@ -1246,6 +1254,11 @@ private:
                 {
                     const bool legato = anyHeldBefore && v.held;
                     const bool retrigger = !(legato && static_cast<VoiceMode>(ip(Param::VoiceMode)) == VoiceMode::Legato);
+                    if (moveRestartsSample(v, key, velocity, retrigger))
+                    {
+                        v.stealLeft = stealFade_;
+                        break;
+                    }
                     moveMonoVoice(v, key, velocity, tuningCents, retrigger, legato);
                     return;
                 }
@@ -1270,13 +1283,49 @@ private:
             {
                 // Back to the most recent key still held: no retrigger.
                 const int nextKey = held_[static_cast<size_t>(heldCount_ - 1)];
-                moveMonoVoice(v, nextKey, v.velocity, heldTuning_[static_cast<size_t>(nextKey)], false, true);
+                const double nextTuning = heldTuning_[static_cast<size_t>(nextKey)];
+                if (moveRestartsSample(v, nextKey, v.velocity, false))
+                {
+                    v.stealLeft = stealFade_;
+                    if (Voice* next = freeVoice()) startVoice(*next, nextKey, v.velocity, nextTuning, true);
+                    continue;
+                }
+                moveMonoVoice(v, nextKey, v.velocity, nextTuning, false, true);
                 continue;
             }
             v.releaseVelocity = releaseVelocity;
             if (sustainPedal_) { v.held = false; v.sustained = true; }
             else release(v);
         }
+    }
+
+    /** The first zone of the active content answering a key and velocity. */
+    [[nodiscard]] const ZoneData* zoneFor(int key, double velocity) const noexcept
+    {
+        if (active_ != nullptr && active_->zones != nullptr)
+            for (const auto& z : *active_->zones)
+                if (key >= z.keyLow && key <= z.keyHigh && velocity >= z.velLow && velocity <= z.velHigh)
+                    return &z;
+        return nullptr;
+    }
+
+    /** The sample source can sound: its level, or a matrix slot aimed at it. */
+    [[nodiscard]] bool sampleSourceInUse() const noexcept
+    {
+        if (p(Param::SampleLevel) > 0.0f) return true;
+        for (int s = 0; s < kModSlots; ++s)
+            if (static_cast<ModDest>(ip(modParam(s, 2))) == ModDest::SampleLevel) return true;
+        return false;
+    }
+
+    /** A mono move cannot carry a playing sample when it retriggers or lands
+     *  in another zone: a reader jump would click and a finished one-shot
+     *  would stay silent, so a new voice takes over while this one fades. */
+    [[nodiscard]] bool moveRestartsSample(const Voice& v, int key, double velocity, bool retrigger) const noexcept
+    {
+        if (!sampleSourceInUse()) return false;
+        const ZoneData* next = zoneFor(key, velocity);
+        return next != v.zone || (retrigger && next != nullptr);
     }
 
     void pushHeld(int key) noexcept
@@ -1426,14 +1475,7 @@ private:
         haveLastPitch_ = true;
 
         // Sample zone: the first one answering the key and velocity.
-        v.zone = nullptr;
-        if (v.content != nullptr && v.content->zones != nullptr)
-            for (const auto& z : *v.content->zones)
-                if (key >= z.keyLow && key <= z.keyHigh && velocity >= z.velLow && velocity <= z.velHigh)
-                {
-                    v.zone = &z;
-                    break;
-                }
+        v.zone = zoneFor(key, velocity);
         if (v.zone != nullptr)
         {
             double mono = 1.0;
@@ -1448,8 +1490,10 @@ private:
         const double detuneCents = static_cast<double>(p(Param::UnisonDetune));
         const double drift = static_cast<double>(p(Param::Drift));
         const double norm = 1.0 / std::sqrt(static_cast<double>(U));
+        // A multichannel or panned zone is stereo whatever its level is now:
+        // the level can arrive later, or from the matrix.
         v.stereo = (U > 1 && spread > 0.0)
-                || (v.zone != nullptr && v.zone->channels > 1 && p(Param::SampleLevel) > 0.0f);
+                || (v.zone != nullptr && (v.zone->channels > 1 || v.zone->pan != 0.0));
         for (int u = 0; u < U; ++u)
         {
             auto& uv = v.uni[static_cast<size_t>(u)];
@@ -1486,6 +1530,7 @@ private:
             auto& l = v.lfo[static_cast<size_t>(k)];
             l.setSeed(mix64(v.seed + 200u + static_cast<uint64_t>(k)));
             l.reset();
+            v.lfoValue[static_cast<size_t>(k)] = 0.0;
         }
         v.ladder = {};
         v.svf = {};
@@ -1608,9 +1653,12 @@ private:
         source(ModSource::Env2) = v.env2.getNextValue();
         source(ModSource::Env3) = v.env3.getNextValue();
         source(ModSource::Random) = v.random;
+        source(ModSource::Lfo1) = v.lfoValue[0];
+        source(ModSource::Lfo2) = v.lfoValue[1];
 
         // -- Matrix: the LFO rate destinations first, since they shape the
-        //    LFOs' advance, then everything else with the LFOs as sources.
+        //    LFOs' advance (an LFO source is last tick's value there), then
+        //    everything else with this tick's LFOs as sources.
         std::array<double, synthesizer::kNumModDests> dst {};
         auto runMatrix = [&](bool rateOnly) noexcept {
             for (int s = 0; s < kModSlots; ++s)
@@ -1643,6 +1691,7 @@ private:
                 value = Lfo<double>::valueAt(shape, freeCycles(k, now), seed) * l.depthAt(v.ageHi);
             }
             source(k == 0 ? ModSource::Lfo1 : ModSource::Lfo2) = value;
+            v.lfoValue[static_cast<size_t>(k)] = value;
         }
         runMatrix(false);
 
@@ -1686,23 +1735,27 @@ private:
         const double limitHz = 0.499 * internalRate_;
         auto clampHz = [&](double hz) noexcept { return std::clamp(hz, 0.0, limitHz); };
 
+        // Only the latched engine reads its pitches.
         std::array<double, 3> oscRatio {};
-        for (int k = 0; k < 3; ++k)
-            oscRatio[static_cast<size_t>(k)] = std::exp2((12.0 * p(oscParam(k, 2)) + p(oscParam(k, 3))
-                + p(oscParam(k, 4)) / 100.0 + mod(dest(ModDest::Osc1Pitch, k))) / 12.0);
+        if (v.engine == Engine::Analog)
+            for (int k = 0; k < 3; ++k)
+                oscRatio[static_cast<size_t>(k)] = std::exp2((12.0 * p(oscParam(k, 2)) + p(oscParam(k, 3))
+                    + p(oscParam(k, 4)) / 100.0 + mod(dest(ModDest::Osc1Pitch, k))) / 12.0);
         std::array<double, 2> wtRatio {};
-        for (int k = 0; k < 2; ++k)
-            wtRatio[static_cast<size_t>(k)] = std::exp2((12.0 * p(wtParam(k, 3)) + p(wtParam(k, 4))
-                + p(wtParam(k, 5)) / 100.0 + mod(dest(ModDest::Osc1Pitch, k))) / 12.0);
+        if (v.engine == Engine::Wavetable)
+            for (int k = 0; k < 2; ++k)
+                wtRatio[static_cast<size_t>(k)] = std::exp2((12.0 * p(wtParam(k, 3)) + p(wtParam(k, 4))
+                    + p(wtParam(k, 5)) / 100.0 + mod(dest(ModDest::Osc1Pitch, k))) / 12.0);
         std::array<double, 4> opHz {};
         std::array<bool, 4> opFixed {};
-        for (int k = 0; k < 4; ++k)
-        {
-            opFixed[static_cast<size_t>(k)] = ip(opParam(k, 2)) != 0;
-            opHz[static_cast<size_t>(k)] = opFixed[static_cast<size_t>(k)]
-                ? static_cast<double>(p(opParam(k, 3)))
-                : static_cast<double>(p(opParam(k, 0))) * std::exp2(static_cast<double>(p(opParam(k, 1))) / 1200.0);
-        }
+        if (v.engine == Engine::Fm)
+            for (int k = 0; k < 4; ++k)
+            {
+                opFixed[static_cast<size_t>(k)] = ip(opParam(k, 2)) != 0;
+                opHz[static_cast<size_t>(k)] = opFixed[static_cast<size_t>(k)]
+                    ? static_cast<double>(p(opParam(k, 3)))
+                    : static_cast<double>(p(opParam(k, 0))) * std::exp2(static_cast<double>(p(opParam(k, 1))) / 1200.0);
+            }
 
         const double driftAmount = static_cast<double>(p(Param::Drift));
         constexpr double centRatio = std::numbers::ln2 / 1200.0;   // 2^(c/1200) ~ 1 + c ln2 / 1200
@@ -1743,7 +1796,9 @@ private:
                 const double st = played + offset - static_cast<double>(z.rootKey) + z.tuneCents / 100.0;
                 const double ratio = z.sampleRate / internalRate_ * std::exp2(st / 12.0) * uv.detune
                                    * (1.0 + uv.driftCents * centRatio);
-                setRamp(uv.sampleRatio, std::clamp(ratio, 1.0 / Reader::kMaxRate, Reader::kMaxRate));
+                const bool scatters = first ? ratio > 1.0 : uv.reader.scatters();
+                setRamp(uv.sampleRatio, std::clamp(ratio, scatters ? Reader::kMinScatterRate : Reader::kMinGatherRate,
+                                                   Reader::kMaxRate));
             }
         }
         setRamp(v.subFreq, clampHz(baseHz * (ip(Param::SubOctave) == 1 ? 0.25 : 0.5)));
@@ -1764,14 +1819,15 @@ private:
             setRamp(v.wtLevel[static_cast<size_t>(k)], unit(sm(kWt1Level + k) + mod(dest(ModDest::Osc1Level, k))));
         }
         const double keyOctaves = (keyPitch - 60.0) / 12.0;
-        for (int k = 0; k < 4; ++k)
-        {
-            const double velSens = static_cast<double>(p(opParam(k, 5)));
-            const double keyDb = 6.0 * static_cast<double>(p(opParam(k, 6))) * keyOctaves;
-            const double level = unit(sm(kOp1Level + k) + mod(dest(ModDest::Op1Level, k)))
-                               * (1.0 - velSens * (1.0 - v.velocity)) * std::pow(10.0, keyDb / 20.0);
-            setRamp(v.opLevel[static_cast<size_t>(k)], level);
-        }
+        if (v.engine == Engine::Fm)
+            for (int k = 0; k < 4; ++k)
+            {
+                const double velSens = static_cast<double>(p(opParam(k, 5)));
+                const double keyDb = 6.0 * static_cast<double>(p(opParam(k, 6))) * keyOctaves;
+                const double level = unit(sm(kOp1Level + k) + mod(dest(ModDest::Op1Level, k)))
+                                   * (1.0 - velSens * (1.0 - v.velocity)) * std::pow(10.0, keyDb / 20.0);
+                setRamp(v.opLevel[static_cast<size_t>(k)], level);
+            }
         setRamp(v.feedback, unit(sm(kFeedback) + mod(ModDest::FmFeedback)));
 
         // -- Wavetable mip levels for this period's highest frequency.
@@ -1791,11 +1847,16 @@ private:
                              + static_cast<double>(p(Param::FilterKeyTrack)) * keyOctaves
                              + static_cast<double>(p(Param::FilterEnvAmount)) * envScale * source(ModSource::Env2)
                              + mod(ModDest::Cutoff) + cutDrift;
-        const double cutoff = std::clamp(std::exp2(octaves), 10.0, std::min(0.49 * internalRate_, 40000.0));
-        setRamp(v.g, std::tan(pi<double> * cutoff / internalRate_));
+        const auto filterType = static_cast<FilterType>(ip(Param::FilterType));
+        if (filterType != FilterType::Off || first)
+        {
+            const double cutoff = std::clamp(std::exp2(octaves), 10.0, std::min(0.49 * internalRate_, 40000.0));
+            setRamp(v.g, std::tan(pi<double> * cutoff / internalRate_));
+        }
         const double resonance = unit(sm(kResonance) + mod(ModDest::Resonance));
         setRamp(v.resonance, resonance);
-        setRamp(v.svfK, 2.0 / std::pow(100.0, resonance));   // Q from 0.5 to 50
+        if (filterType >= FilterType::SvfLp || first)
+            setRamp(v.svfK, 2.0 / std::pow(100.0, resonance));   // Q from 0.5 to 50
         setRamp(v.drive, std::max(sm(kDrive), 1.01));
 
         // -- Amplifier and pan (MIDI expression scales the level).
@@ -2193,7 +2254,8 @@ private:
                 x ^= x >> 17;
                 x ^= x << 5;
                 v.noise = x;
-                const double s = (static_cast<double>(x) * (2.0 / 4294967296.0) - 1.0) * v.noiseLevel.at(pos0 + j);
+                const double s = (static_cast<double>(x) * (2.0 / 4294967296.0) - 1.0)
+                               * noiseScale_ * v.noiseLevel.at(pos0 + j);
                 L[j] += s;
                 R[j] += s;
             }
@@ -2276,8 +2338,11 @@ private:
         constexpr int kMax = kControlPeriod * 4;
         const int algorithm = std::clamp(ip(Param::FmAlgorithm), 0, 7);
 
-        // Operator amplitudes (level times envelope), shared by the unison copies.
+        // Operator amplitudes (level times envelope), shared by the unison
+        // copies. A silent operator costs no sine; its phase keeps running.
         std::array<std::array<double, kMax>, 4> amp;   // every used entry is written below
+        std::array<bool, 4> live {};
+        for (int k = 0; k < 4; ++k) live[static_cast<size_t>(k)] = v.opLevel[static_cast<size_t>(k)].live();
         for (int j = 0; j < m; ++j)
             for (int k = 0; k < 4; ++k)
                 amp[static_cast<size_t>(k)][static_cast<size_t>(j)] =
@@ -2290,8 +2355,10 @@ private:
             {
                 const int pos = pos0 + j;
                 auto op = [&](int k, double pm) noexcept {
-                    return amp[static_cast<size_t>(k)][static_cast<size_t>(j)]
-                         * fastSin(twoPi<double> * uv.opPhase[static_cast<size_t>(k)] + pm);
+                    return live[static_cast<size_t>(k)]
+                        ? amp[static_cast<size_t>(k)][static_cast<size_t>(j)]
+                              * fastSin(twoPi<double> * uv.opPhase[static_cast<size_t>(k)] + pm)
+                        : 0.0;
                 };
                 // Operator 4 feeds back the mean of its last two outputs.
                 const double o4 = op(3, v.feedback.at(pos) * pi<double> * 0.5 * (uv.fb1 + uv.fb2));
@@ -2345,6 +2412,7 @@ private:
     double invPeriod_ = 1.0 / kControlPeriod;
     int shift_ = 0;
     int stealFade_ = 144;
+    double noiseScale_ = 1.0;
     double smoothAlpha_ = 0.03;
     bool prepared_ = false;
 

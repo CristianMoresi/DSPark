@@ -211,10 +211,10 @@ private:
     static double wrapUnit(double p) noexcept
     {
         if (p >= 0.0 && p < 1.0) return p; // Fast exit
-        // Slow path (rare): sanitise NaN here, where it costs nothing in the
-        // common case - otherwise a single NaN input would stick in the
-        // recursive accumulator until the next reset.
-        if (p != p) return 0.0;
+        // Slow path (rare): sanitise NaN and infinity here, where it costs
+        // nothing in the common case - otherwise a single such input would
+        // stick in the recursive accumulator until the next reset.
+        if (!std::isfinite(p)) return 0.0;
         // std::trunc instead of a cast to int: casting is UB once |p| exceeds
         // INT_MAX, which extreme FM excursions can reach.
         double wrapped = p - std::trunc(p);

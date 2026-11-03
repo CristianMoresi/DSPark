@@ -66,7 +66,7 @@ public:
      */
     void prepare(double sampleRate) noexcept
     {
-        if (sampleRate <= 0.0) return;
+        if (!(sampleRate > 0.0) || !std::isfinite(sampleRate)) return;
         sampleRate_ = sampleRate;
         recalculate();
     }
@@ -79,17 +79,38 @@ public:
 
     // -- Parameters (in milliseconds) ------------------------------------------
 
+    // Non-finite values are ignored: the stages are recursive, so one NaN
+    // would hold the output at NaN until reset().
+
     /** @brief Sets attack time in milliseconds (0 -> 1). */
-    void setAttack(T ms) noexcept  { attackMs_ = std::max(ms, T(0.01)); recalculate(); }
+    void setAttack(T ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        attackMs_ = std::max(ms, T(0.01));
+        recalculate();
+    }
 
     /** @brief Sets decay time in milliseconds (1 -> sustain). */
-    void setDecay(T ms) noexcept   { decayMs_ = std::max(ms, T(0.01)); recalculate(); }
+    void setDecay(T ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        decayMs_ = std::max(ms, T(0.01));
+        recalculate();
+    }
 
     /** @brief Sets sustain level (0.0 to 1.0). */
-    void setSustain(T level) noexcept { sustainLevel_ = std::clamp(level, T(0), T(1)); }
+    void setSustain(T level) noexcept
+    {
+        if (std::isfinite(level)) sustainLevel_ = std::clamp(level, T(0), T(1));
+    }
 
     /** @brief Sets release time in milliseconds (full scale -> silence). */
-    void setRelease(T ms) noexcept { releaseMs_ = std::max(ms, T(0.01)); recalculate(); }
+    void setRelease(T ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        releaseMs_ = std::max(ms, T(0.01));
+        recalculate();
+    }
 
     /**
      * @brief Sets all ADSR parameters at once.
@@ -100,6 +121,8 @@ public:
      */
     void setParameters(T attackMs, T decayMs, T sustain, T releaseMs) noexcept
     {
+        if (!std::isfinite(attackMs) || !std::isfinite(decayMs)
+            || !std::isfinite(sustain) || !std::isfinite(releaseMs)) return;
         attackMs_     = std::max(attackMs, T(0.01));
         decayMs_      = std::max(decayMs, T(0.01));
         sustainLevel_ = std::clamp(sustain, T(0), T(1));
@@ -113,6 +136,7 @@ public:
      */
     void setCurvature(T curve) noexcept
     {
+        if (!std::isfinite(curve)) return;
         curve = std::clamp(curve, T(0.1), T(10));
         attackCurve_ = decayCurve_ = releaseCurve_ = curve;
         recalculate();
@@ -130,6 +154,8 @@ public:
      */
     void setCurvature(T attackCurve, T decayCurve, T releaseCurve) noexcept
     {
+        if (!std::isfinite(attackCurve) || !std::isfinite(decayCurve)
+            || !std::isfinite(releaseCurve)) return;
         attackCurve_  = std::clamp(attackCurve,  T(0.1), T(10));
         decayCurve_   = std::clamp(decayCurve,   T(0.1), T(10));
         releaseCurve_ = std::clamp(releaseCurve, T(0.1), T(10));

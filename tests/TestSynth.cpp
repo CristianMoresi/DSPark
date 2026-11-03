@@ -1249,3 +1249,279 @@ DSPARK_TEST(NoteTuning_published_event_capacity_is_usable_and_resets)
     check(synth);
     check(sampler);
 }
+
+// ============================================================================
+// Regressions from the voice generator audit
+// ============================================================================
+
+namespace {
+
+/** A voice that plays the sample source alone, filter and master out of the way. */
+void sampleVoice(Synth& s, int oversampling = 0)
+{
+    s.setParameter(P::Osc1Level, 0.0f);
+    s.setParameter(P::SampleLevel, 1.0f);
+    s.setParameter(P::FilterType, 0.0f);
+    s.setParameter(P::MasterVolume, 0.0f);
+    s.setParameter(P::Env1Attack, 1.0f);
+    s.setParameter(P::Oversampling, static_cast<float>(oversampling));
+}
+
+std::vector<double> sineTable(double hz, int length)
+{
+    std::vector<double> x(static_cast<size_t>(length));
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = 0.5 * std::sin(2.0 * pi<double> * hz * static_cast<double>(i) / kFs);
+    return x;
+}
+
+/** Amplitude of the component at `hz` over [from, to), by correlation. */
+double toneLevel(const std::vector<double>& x, size_t from, size_t to, double hz)
+{
+    double re = 0.0, im = 0.0;
+    for (size_t i = from; i < to; ++i)
+    {
+        const double w = 2.0 * pi<double> * hz * static_cast<double>(i) / kFs;
+        re += x[i] * std::cos(w);
+        im += x[i] * std::sin(w);
+    }
+    return 2.0 * std::hypot(re, im) / static_cast<double>(to - from);
+}
+
+/** Largest fourth difference: a low tone has almost none, a cut has plenty. */
+double clickOf(const std::vector<double>& x, size_t from, size_t to)
+{
+    double peak = 0.0;
+    for (size_t i = std::max<size_t>(from, 4); i < to; ++i)
+        peak = std::max(peak, std::abs(x[i] - 4.0 * x[i - 1] + 6.0 * x[i - 2] - 4.0 * x[i - 3] + x[i - 4]));
+    return peak;
+}
+
+} // namespace
+
+// The 1/8 rate floor applied to the internal rate, so oversampling moved it:
+// 999.8 Hz for the 500 Hz wanted at -24 st at 4x, and 500.2 for 250 at -36 st at 2x.
+DSPARK_TEST(Synth_sample_stays_in_tune_at_every_oversampling)
+{
+    const auto x = sineTable(2000.0, 48000);
+    const double* p = x.data();
+    SampleZoneSpec<double> z;
+    z.audio = AudioBufferView<const double>(&p, 1, 48000);
+    z.sampleRate = kFs;
+    z.rootKey = 84;
+    const std::pair<int, int> cases[] = { { 0, -36 }, { 1, -36 }, { 2, -24 } };
+    for (const auto& [oversampling, st] : cases)
+    {
+        Synth s;
+        sampleVoice(s, oversampling);
+        s.prepare({ kFs, 512, 2 }, 2);
+        EXPECT_TRUE(s.setSampleZones(std::span<const SampleZoneSpec<double>>(&z, 1)));
+        const int key = 84 + st;
+        const auto y = left(renderStereo(s, 24000, 512, [key](Synth& sy, int pos, int) {
+            if (pos == 0) sy.noteOn(key, 1.0, 0);
+        }));
+        EXPECT_NEAR(toneLevel(y, 4800, 23800, 2000.0 * std::pow(2.0, st / 12.0)), 0.5, 0.02);
+    }
+}
+
+// A host flush with no samples dropped the queued events: the note-off was
+// lost and 1 voice kept sounding.
+DSPARK_TEST(Synth_zero_sample_block_keeps_its_events)
+{
+    Synth s;
+    s.setParameter(P::Env1Release, 5.0f);
+    s.prepare({ kFs, 512, 2 }, 4);
+    std::vector<double> l(512), r(512);
+    double* ch[2] = { l.data(), r.data() };
+    s.noteOn(60, 1.0);
+    s.processBlock(AudioBufferView<double>(ch, 2, 512));
+    s.noteOff(60);
+    s.processBlock(AudioBufferView<double>(ch, 2, 0));
+    for (int b = 0; b < 20; ++b) s.processBlock(AudioBufferView<double>(ch, 2, 512));
+    EXPECT_EQ(s.getActiveVoiceCount(), 0);
+}
+
+// A mono move kept the reader of the note before it. A finished one-shot stayed
+// silent after a retrigger (rms 0.00000 against 0.35), and a move kept the old
+// zone (its 1 kHz at 0.5, the new zone's 3 kHz at 0.0001).
+DSPARK_TEST(Synth_mono_moves_restart_the_sample_source)
+{
+    const auto shot = sineTable(1000.0, 2400);
+    const double* ps = shot.data();
+    SampleZoneSpec<double> oneShot;
+    oneShot.audio = AudioBufferView<const double>(&ps, 1, 2400);
+    oneShot.sampleRate = kFs;
+    oneShot.rootKey = 60;
+    {
+        Synth s;
+        sampleVoice(s);
+        s.setParameter(P::VoiceMode, 1.0f);
+        s.prepare({ kFs, 512, 2 }, 4);
+        EXPECT_TRUE(s.setSampleZones(std::span<const SampleZoneSpec<double>>(&oneShot, 1)));
+        const auto y = left(renderStereo(s, 24576, 512, [](Synth& sy, int pos, int) {
+            if (pos == 0) sy.noteOn(60, 1.0, 0);
+            if (pos == 12288) sy.noteOn(62, 1.0, 0);
+        }));
+        EXPECT_GT(rms(y, 12800, 14000), 0.2);
+    }
+    const auto low = sineTable(500.0, 96000);
+    const auto high = sineTable(3000.0, 96000);
+    const double* pl = low.data();
+    const double* ph = high.data();
+    std::array<SampleZoneSpec<double>, 2> zones;
+    zones[0].audio = AudioBufferView<const double>(&pl, 1, 96000);
+    zones[0].sampleRate = kFs;
+    zones[0].rootKey = 60;
+    zones[0].keyHigh = 64;
+    zones[1].audio = AudioBufferView<const double>(&ph, 1, 96000);
+    zones[1].sampleRate = kFs;
+    zones[1].rootKey = 72;
+    zones[1].keyLow = 65;
+    for (const float mode : { 1.0f, 2.0f })   // Mono retriggers, Legato does not
+    {
+        Synth s;
+        sampleVoice(s);
+        s.setParameter(P::VoiceMode, mode);
+        s.prepare({ kFs, 512, 2 }, 4);
+        EXPECT_TRUE(s.setSampleZones(std::span<const SampleZoneSpec<double>>(zones.data(), 2)));
+        const auto y = left(renderStereo(s, 24576, 512, [](Synth& sy, int pos, int) {
+            if (pos == 0) sy.noteOn(60, 1.0, 0);
+            if (pos == 12288) sy.noteOn(72, 1.0, 0);
+        }));
+        EXPECT_NEAR(toneLevel(y, 14400, 24400, 3000.0), 0.5, 0.02);
+        EXPECT_LT(toneLevel(y, 14400, 24400, 1000.0), 0.01);
+    }
+}
+
+// Without unison a mono zone rendered one channel for both outputs, carrying
+// the left gain: pan +1 was silent and pan -1 sounded in both. A stereo zone
+// reached through the matrix lost its right channel the same way (0.001 for
+// the 0.5 wanted).
+DSPARK_TEST(Synth_zone_pan_and_stereo_match_the_sampler)
+{
+    const auto x = sineTable(440.0, 48000);
+    const double* p = x.data();
+    for (const double pan : { -1.0, 1.0 })
+    {
+        SampleZoneSpec<double> z;
+        z.audio = AudioBufferView<const double>(&p, 1, 48000);
+        z.sampleRate = kFs;
+        z.rootKey = 69;
+        z.pan = pan;
+        Synth s;
+        sampleVoice(s);
+        s.prepare({ kFs, 512, 2 }, 2);
+        EXPECT_TRUE(s.setSampleZones(std::span<const SampleZoneSpec<double>>(&z, 1)));
+        const auto y = renderStereo(s, 12000, 512, [](Synth& sy, int pos, int) {
+            if (pos == 0) sy.noteOn(69, 1.0, 0);
+        });
+        double l = 0.0, r = 0.0;
+        for (size_t i = 4800; i < 12000; ++i)
+        {
+            l += y[2 * i] * y[2 * i];
+            r += y[2 * i + 1] * y[2 * i + 1];
+        }
+        EXPECT_GT(pan < 0.0 ? l : r, 1000.0);
+        EXPECT_LT(pan < 0.0 ? r : l, 1e-3);
+    }
+    const auto y2 = sineTable(880.0, 48000);
+    const double* both[2] = { x.data(), y2.data() };
+    SampleZoneSpec<double> z;
+    z.audio = AudioBufferView<const double>(both, 2, 48000);
+    z.sampleRate = kFs;
+    z.rootKey = 69;
+    Synth s;
+    sampleVoice(s);
+    s.setParameter(P::SampleLevel, 0.0f);
+    s.setParameter(P::Mod1Source, static_cast<float>(static_cast<int>(Synth::ModSource::Velocity)));
+    s.setParameter(P::Mod1Destination, static_cast<float>(static_cast<int>(Synth::ModDest::SampleLevel)));
+    s.setParameter(P::Mod1Amount, 1.0f);
+    s.prepare({ kFs, 512, 2 }, 2);
+    EXPECT_TRUE(s.setSampleZones(std::span<const SampleZoneSpec<double>>(&z, 1)));
+    const auto out = renderStereo(s, 12000, 512, [](Synth& sy, int pos, int) {
+        if (pos == 0) sy.noteOn(69, 1.0, 0);
+    });
+    std::vector<double> right(out.size() / 2);
+    for (size_t i = 0; i < right.size(); ++i) right[i] = out[2 * i + 1];
+    EXPECT_NEAR(toneLevel(right, 4800, 11800, 880.0), 0.5, 0.01);
+}
+
+// Replacing every voice at one sample ran out of spare voices and cut the
+// rest at full level: 4 of 4 stolen measured a click of 1.35, against the
+// 0.01 of a 3 ms fade.
+DSPARK_TEST(Synth_replacing_every_voice_still_fades)
+{
+    Synth s;
+    s.setParameter(P::Osc1Wave, 0.0f);
+    s.setParameter(P::FilterType, 0.0f);
+    s.setParameter(P::MasterVolume, 0.0f);
+    s.setParameter(P::AmpVelocity, 0.0f);
+    s.setParameter(P::Env1Attack, 200.0f);
+    s.prepare({ kFs, 512, 2 }, 4);
+    const auto y = left(renderStereo(s, 26112, 512, [](Synth& sy, int pos, int) {
+        if (pos == 0) for (int k = 0; k < 4; ++k) sy.noteOn(36 + 2 * k, 0.25, 0);
+        if (pos == 24064) for (int k = 0; k < 4; ++k) sy.noteOn(70 + k, 0.25, 100);
+    }));
+    EXPECT_LT(clickOf(y, 24164, 24600), 0.05);
+}
+
+// Noise is white at the internal rate and the decimator keeps 1 / factor of
+// its power, so `noise.level` fell with the quality setting: -4.76, -7.82 and
+// -10.85 dB at 1x, 2x and 4x.
+DSPARK_TEST(Synth_noise_level_is_independent_of_oversampling)
+{
+    double reference = 0.0;
+    for (const int oversampling : { 0, 1, 2 })
+    {
+        Synth s;
+        s.setParameter(P::Osc1Level, 0.0f);
+        s.setParameter(P::NoiseLevel, 1.0f);
+        s.setParameter(P::FilterType, 0.0f);
+        s.setParameter(P::MasterVolume, 0.0f);
+        s.setParameter(P::Oversampling, static_cast<float>(oversampling));
+        s.prepare({ kFs, 512, 2 }, 2);
+        const auto y = left(renderStereo(s, 24000, 512, [](Synth& sy, int pos, int) {
+            if (pos == 0) sy.noteOn(60, 1.0, 0);
+        }));
+        const double level = 20.0 * std::log10(rms(y, 4800, 24000));
+        if (oversampling == 0) reference = level;
+        EXPECT_NEAR(level, reference, 0.25);
+    }
+}
+
+// The rate slots run before the LFOs, so an LFO source read zero there: LFO 2
+// aimed two octaves at LFO 1's rate left it at 5 Hz instead of 20.
+DSPARK_TEST(Synth_lfo_source_reaches_lfo_rate)
+{
+    Synth s;
+    sineVoice(s);
+    s.setParameter(P::Lfo1Rate, 5.0f);
+    s.setParameter(P::Lfo2Rate, 0.2f);
+    s.setParameter(P::Lfo2Shape, 4.0f);   // square: +1 for the first 2.5 s
+    s.setParameter(P::Mod1Source, static_cast<float>(static_cast<int>(Synth::ModSource::Lfo1)));
+    s.setParameter(P::Mod1Destination, static_cast<float>(static_cast<int>(Synth::ModDest::Pitch)));
+    s.setParameter(P::Mod1Amount, 2.0f);
+    s.setParameter(P::Mod2Source, static_cast<float>(static_cast<int>(Synth::ModSource::Lfo2)));
+    s.setParameter(P::Mod2Destination, static_cast<float>(static_cast<int>(Synth::ModDest::Lfo1Rate)));
+    s.setParameter(P::Mod2Amount, 2.0f);
+    s.prepare({ kFs, 512, 2 }, 2);
+    const auto y = left(renderStereo(s, 48000, 512, [](Synth& sy, int pos, int) {
+        if (pos == 0) sy.noteOn(69, 1.0, 0);
+    }));
+    // Vibrato rate: upward crossings of the mean of the tone's periods.
+    std::vector<double> periods;
+    size_t last = 0;
+    for (size_t i = 1; i < y.size(); ++i)
+        if (y[i - 1] <= 0.0 && y[i] > 0.0)
+        {
+            if (last != 0) periods.push_back(static_cast<double>(i - last));
+            last = i;
+        }
+    double mean = 0.0;
+    for (const double v : periods) mean += v;
+    mean /= static_cast<double>(periods.size());
+    int cycles = 0;
+    for (size_t i = 1; i < periods.size(); ++i)
+        cycles += (periods[i - 1] < mean && periods[i] >= mean) ? 1 : 0;
+    EXPECT_NEAR(static_cast<double>(cycles), 20.0, 2.0);
+}

@@ -17,6 +17,41 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- Looped zones no longer tick at the loop rate at or below the recording's
+  rate. After a wrap the kernel read the audio before the loop, or zeros for a
+  loop from sample 0, instead of the loop's end: -77 dB and -45 dB, now below
+  -110 dB.
+- Sample zones stay in tune far below their root key. The 1/8 rate floor, which
+  only the scatter form needs, held `Sampler` at -36 semitones and
+  `Synthesizer`'s sample source at -24 semitones at 2x and -12 at 4x, up to an
+  octave and more sharp.
+- `Sampler` and `Synthesizer` keep queued events across a zero-sample block.
+  Dropping them left a released note sounding forever.
+- `Synthesizer` mono and legato moves restart the sample source on a retrigger
+  or a change of zone, through a 3 ms fade. A one-shot stayed silent after a
+  retrigger and a move kept the previous key's zone.
+- `Synthesizer` honours a mono zone's pan (+1 was silent, -1 centred) and keeps
+  a stereo zone's right channel when its level comes from the matrix.
+- Replacing the whole polyphony at one sample now fades every stolen voice:
+  both instruments keep one spare voice per voice. They cut the voices that
+  found no spare slot, about 47 dB louder at the edge, and use about 1.5x the
+  memory now.
+- `Sampler::processBlock()` no longer crashes on a view with no channels.
+- `Synthesizer` noise keeps its level at every oversampling factor; it lost
+  3 dB per doubling.
+- A released Sustain loop now leaves a loop that has no read position clear of
+  its crossfade, such as a crossfade as long as the loop. It used to loop on
+  until the envelope ended.
+- An LFO source in an LFO Rate matrix slot now works, one control period late;
+  it read zero. Free LFOs still ignore LFO Rate, as documented.
+- `Sampler::setGain()` is smoothed over about 10 ms instead of stepping at a
+  block edge.
+- `ADSREnvelope` and `Oscillator` ignore non-finite parameters and rates,
+  `Phasor` wraps infinity to 0, and `ModulationRouter` survives a NaN smoothing
+  time or sample rate; each used to hold NaN until reset. Its state is now
+  double, so a float route settles instead of stalling 0.02% short.
+- `Sampler.h` no longer claims the first pass of a crossfaded loop is the
+  untouched recording: every pass of an engaged loop reads the baked region.
 - `LoudnessMeter::getIntegratedLUFS()` now sums the exact energy of the blocks
   in each histogram bin instead of the bin centre, so a reading is no longer
   held to a 0.1 LU grid: it agrees with libebur128's exact block mode to four

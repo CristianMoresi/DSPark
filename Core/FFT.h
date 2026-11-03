@@ -21,10 +21,12 @@
  *   costs no pass over memory of its own. The closing pass needs no table
  *   twiddles.
  * - **SIMD at the widest width a pass allows**: AVX (8 float / 4 double
- *   lanes, with FMA when enabled) where the build targets it, SSE2 on every
- *   x86-64, NEON on ARM64, scalar otherwise. The first pass, whose stride is
- *   1, runs across butterflies and writes its outputs through an in-register
- *   4-way interleave.
+ *   lanes, with FMA when enabled) where the build targets it, and in x86-64
+ *   builds below AVX on CPUs with AVX2 and FMA through the run-time dispatch
+ *   (simd::setRuntimeDispatch()); SSE2 on every other x86-64, NEON on ARM64,
+ *   scalar otherwise. The first pass, whose stride is 1, runs across
+ *   butterflies and writes its outputs through an in-register 4-way
+ *   interleave.
  * - **Twiddles in double**: every factor is computed directly with cos/sin in
  *   double precision (no recurrences), so the error stays at the level of the
  *   arithmetic itself.
@@ -36,8 +38,8 @@
  *   noexcept and accept pointers of any alignment.
  *
  * Measured on one core of a 2.1 GHz Xeon, float: a 1024-point real FFT takes
- * about 2.0 us on the SSE2 baseline and 1.0 us with AVX2/FMA enabled
- * (-march=x86-64-v3 or /arch:AVX2), against 3.9 us and 4.6 us for the
+ * about 2.0 us on SSE2 and 1.0 us with AVX2/FMA (-march=x86-64-v3, /arch:AVX2
+ * or the run-time dispatch), against 3.9 us and 4.6 us for the
  * radix-2 engine this replaced; sizes past the L2 cache gain about 2.5x.
  *
  * Threading: an instance keeps work buffers, so one instance serves one
@@ -79,14 +81,13 @@ namespace dspark {
 namespace detail {
 namespace fft {
 
-/// The shared SIMD vector abstraction (SimdOps.h) and its widths.
-template <typename T, int W> using Vec = simd::Vec<T, W>;
-template <typename T> inline constexpr int kWide = simd::kVecWidth<T>;
-template <typename T> inline constexpr int kNarrow = simd::kVecNarrowWidth<T>;
-
 // ============================================================================
 // Kernels
 // ============================================================================
+
+// The plan types live in a namespace with no functions, so argument-dependent
+// lookup on them cannot reach the baseline passes from the AVX2 copy.
+namespace plan {
 
 /// Twiddles of one radix-4 pass, split by factor: w1, w2, w3 (re, im) for
 /// p = 0 .. n/4 - 1.
@@ -98,200 +99,50 @@ struct TwiddleSpan
     const T* w3r; const T* w3i;
 };
 
-/// Where the first pass reads its input from, and where the last pass writes.
-/// Reading interleaved data directly in the first pass, and writing it directly
-/// in the last, saves one full pass over memory in each direction.
-template <typename T, int W>
-struct SplitSource
-{
-    using O = Vec<T, W>;
-    const T* re;
-    const T* im;
-    void read(size_t i, typename O::V& r, typename O::V& m) const noexcept
-    {
-        r = O::load(re + i);
-        m = O::load(im + i);
-    }
-};
+/// One pass of the plan: its length, stride and twiddle offset.
+struct Pass { size_t len; size_t stride; size_t twOffset; bool radix2; };
 
-template <typename T, int W>
-struct InterleavedSource
-{
-    using O = Vec<T, W>;
-    const T* data;
-    void read(size_t i, typename O::V& r, typename O::V& m) const noexcept
-    {
-        O::loadDeinterleave(data + 2 * i, r, m);
-    }
-};
+/// The two ping-pong buffers, [re | im] each: x is read, y is written.
+template <typename T>
+struct Buffers { T* xr; T* xi; T* yr; T* yi; };
 
-template <typename T, int W>
-struct ConjugatedSource
-{
-    using O = Vec<T, W>;
-    const T* data;
-    void read(size_t i, typename O::V& r, typename O::V& m) const noexcept
-    {
-        O::loadDeinterleave(data + 2 * i, r, m);
-        m = O::sub(O::set1(T(0)), m);
-    }
-};
+} // namespace plan
 
-template <typename T, int W>
-struct SplitSink
-{
-    using O = Vec<T, W>;
-    T* re;
-    T* im;
-    void write(size_t i, typename O::V r, typename O::V m) const noexcept
-    {
-        O::store(re + i, r);
-        O::store(im + i, m);
-    }
-};
+using plan::TwiddleSpan;
+using plan::Pass;
+using plan::Buffers;
 
-template <typename T, int W>
-struct InterleavedSink
-{
-    using O = Vec<T, W>;
-    T* data;
-    typename O::V scaleRe;
-    typename O::V scaleIm;
-    void write(size_t i, typename O::V r, typename O::V m) const noexcept
-    {
-        O::storeInterleave2(data + 2 * i, O::mul(r, scaleRe), O::mul(m, scaleIm));
-    }
-};
+// The passes, compiled for the build's baseline (detail/FftKernels.inl).
+template <typename T, int W> using Vec = simd::Vec<T, W>;
+template <typename T> inline constexpr int kWide = simd::kVecWidth<T>;
+template <typename T> inline constexpr int kNarrow = simd::kVecNarrowWidth<T>;
+#include "detail/FftKernels.inl"
 
-/**
- * @brief One Stockham radix-4 DIF pass with stride s >= W, vectorised over
- *        the stride (twiddles broadcast per butterfly group).
- *
- * y[q + s(4p + k)] = w^(kp) * (radix-4 butterfly of x[q + s(p + k n/4)]).
- */
-template <typename T, int W>
-void radix4Strided(const T* xr, const T* xi, T* yr, T* yi,
-                   size_t n, size_t s, const TwiddleSpan<T>& tw) noexcept
-{
-    using O = Vec<T, W>;
-    using V = typename O::V;
-    const size_t n1 = n / 4;
-    for (size_t p = 0; p < n1; ++p)
-    {
-        const V w1r = O::set1(tw.w1r[p]), w1i = O::set1(tw.w1i[p]);
-        const V w2r = O::set1(tw.w2r[p]), w2i = O::set1(tw.w2i[p]);
-        const V w3r = O::set1(tw.w3r[p]), w3i = O::set1(tw.w3i[p]);
-        const T* ar = xr + s * p;            const T* ai = xi + s * p;
-        const T* br = xr + s * (p + n1);     const T* bi = xi + s * (p + n1);
-        const T* cr = xr + s * (p + 2 * n1); const T* ci = xi + s * (p + 2 * n1);
-        const T* dr = xr + s * (p + 3 * n1); const T* di = xi + s * (p + 3 * n1);
-        T* y0r = yr + s * (4 * p);     T* y0i = yi + s * (4 * p);
-        T* y1r = y0r + s;              T* y1i = y0i + s;
-        T* y2r = y0r + 2 * s;          T* y2i = y0i + 2 * s;
-        T* y3r = y0r + 3 * s;          T* y3i = y0i + 3 * s;
-        for (size_t q = 0; q < s; q += W)
-        {
-            const V a_r = O::load(ar + q), a_i = O::load(ai + q);
-            const V b_r = O::load(br + q), b_i = O::load(bi + q);
-            const V c_r = O::load(cr + q), c_i = O::load(ci + q);
-            const V d_r = O::load(dr + q), d_i = O::load(di + q);
-            const V apcR = O::add(a_r, c_r), apcI = O::add(a_i, c_i);
-            const V amcR = O::sub(a_r, c_r), amcI = O::sub(a_i, c_i);
-            const V bpdR = O::add(b_r, d_r), bpdI = O::add(b_i, d_i);
-            const V bmdR = O::sub(b_r, d_r), bmdI = O::sub(b_i, d_i);
-            // t1 = amc - j bmd, t2 = apc - bpd, t3 = amc + j bmd
-            const V t1R = O::add(amcR, bmdI), t1I = O::sub(amcI, bmdR);
-            const V t2R = O::sub(apcR, bpdR), t2I = O::sub(apcI, bpdI);
-            const V t3R = O::sub(amcR, bmdI), t3I = O::add(amcI, bmdR);
-            O::store(y0r + q, O::add(apcR, bpdR));
-            O::store(y0i + q, O::add(apcI, bpdI));
-            O::store(y1r + q, O::mulSub(t1R, w1r, t1I, w1i));
-            O::store(y1i + q, O::mulAdd(t1R, w1i, t1I, w1r));
-            O::store(y2r + q, O::mulSub(t2R, w2r, t2I, w2i));
-            O::store(y2i + q, O::mulAdd(t2R, w2i, t2I, w2r));
-            O::store(y3r + q, O::mulSub(t3R, w3r, t3I, w3i));
-            O::store(y3i + q, O::mulAdd(t3R, w3i, t3I, w3r));
-        }
-    }
-}
+} // namespace fft
+} // namespace detail
+} // namespace dspark
 
-/**
- * @brief The first (stride-1) radix-4 pass, vectorised across W butterflies
- *        (n/4 must be a multiple of W): the inputs and twiddles are
- *        contiguous in p, and the four outputs of each butterfly are adjacent,
- *        written through a 4-way interleave.
- */
-template <typename T, int W, typename Source>
-void radix4First(const Source& input, T* yr, T* yi,
-                 size_t n, const TwiddleSpan<T>& tw) noexcept
-{
-    using O = Vec<T, W>;
-    using V = typename O::V;
-    const size_t n1 = n / 4;
-    for (size_t p = 0; p < n1; p += W)
-    {
-        const V w1r = O::load(tw.w1r + p), w1i = O::load(tw.w1i + p);
-        const V w2r = O::load(tw.w2r + p), w2i = O::load(tw.w2i + p);
-        const V w3r = O::load(tw.w3r + p), w3i = O::load(tw.w3i + p);
-        V a_r, a_i, b_r, b_i, c_r, c_i, d_r, d_i;
-        input.read(p, a_r, a_i);
-        input.read(p + n1, b_r, b_i);
-        input.read(p + 2 * n1, c_r, c_i);
-        input.read(p + 3 * n1, d_r, d_i);
-        const V apcR = O::add(a_r, c_r), apcI = O::add(a_i, c_i);
-        const V amcR = O::sub(a_r, c_r), amcI = O::sub(a_i, c_i);
-        const V bpdR = O::add(b_r, d_r), bpdI = O::add(b_i, d_i);
-        const V bmdR = O::sub(b_r, d_r), bmdI = O::sub(b_i, d_i);
-        const V t1R = O::add(amcR, bmdI), t1I = O::sub(amcI, bmdR);
-        const V t2R = O::sub(apcR, bpdR), t2I = O::sub(apcI, bpdI);
-        const V t3R = O::sub(amcR, bmdI), t3I = O::add(amcI, bmdR);
-        O::storeInterleave4(yr + 4 * p, O::add(apcR, bpdR),
-                            O::mulSub(t1R, w1r, t1I, w1i),
-                            O::mulSub(t2R, w2r, t2I, w2i),
-                            O::mulSub(t3R, w3r, t3I, w3i));
-        O::storeInterleave4(yi + 4 * p, O::add(apcI, bpdI),
-                            O::mulAdd(t1R, w1i, t1I, w1r),
-                            O::mulAdd(t2R, w2i, t2I, w2r),
-                            O::mulAdd(t3R, w3i, t3I, w3r));
-    }
-}
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+// The same passes compiled for AVX2+FMA, run when isRuntimeDispatchActive().
+DSPARK_SIMD_AVX2_BEGIN
+namespace dspark {
+namespace detail {
+namespace fft {
+namespace avx2 {
+template <typename T, int W> using Vec = simd::avx2::Vec<T, W>;
+template <typename T> inline constexpr int kWide = simd::avx2::kVecWidth<T>;
+template <typename T> inline constexpr int kNarrow = simd::avx2::kVecNarrowWidth<T>;
+#include "detail/FftKernels.inl"
+} // namespace avx2
+} // namespace fft
+} // namespace detail
+} // namespace dspark
+DSPARK_SIMD_AVX2_END
+#endif
 
-/// The closing radix-4 pass (n = 4, stride s = N / 4): its only twiddles are 1.
-template <typename T, int W, typename Sink>
-void radix4Last(const T* xr, const T* xi, const Sink& output, size_t s) noexcept
-{
-    using O = Vec<T, W>;
-    using V = typename O::V;
-    for (size_t q = 0; q < s; q += W)
-    {
-        const V a_r = O::load(xr + q),         a_i = O::load(xi + q);
-        const V b_r = O::load(xr + q + s),     b_i = O::load(xi + q + s);
-        const V c_r = O::load(xr + q + 2 * s), c_i = O::load(xi + q + 2 * s);
-        const V d_r = O::load(xr + q + 3 * s), d_i = O::load(xi + q + 3 * s);
-        const V apcR = O::add(a_r, c_r), apcI = O::add(a_i, c_i);
-        const V amcR = O::sub(a_r, c_r), amcI = O::sub(a_i, c_i);
-        const V bpdR = O::add(b_r, d_r), bpdI = O::add(b_i, d_i);
-        const V bmdR = O::sub(b_r, d_r), bmdI = O::sub(b_i, d_i);
-        output.write(q,         O::add(apcR, bpdR), O::add(apcI, bpdI));
-        output.write(q + s,     O::add(amcR, bmdI), O::sub(amcI, bmdR));
-        output.write(q + 2 * s, O::sub(apcR, bpdR), O::sub(apcI, bpdI));
-        output.write(q + 3 * s, O::sub(amcR, bmdI), O::add(amcI, bmdR));
-    }
-}
-
-/// The closing radix-2 pass (n = 2, stride s = N / 2): no twiddles.
-template <typename T, int W, typename Sink>
-void radix2Last(const T* xr, const T* xi, const Sink& output, size_t s) noexcept
-{
-    using O = Vec<T, W>;
-    for (size_t q = 0; q < s; q += W)
-    {
-        const auto a_r = O::load(xr + q), a_i = O::load(xi + q);
-        const auto b_r = O::load(xr + q + s), b_i = O::load(xi + q + s);
-        output.write(q, O::add(a_r, b_r), O::add(a_i, b_i));
-        output.write(q + s, O::sub(a_r, b_r), O::sub(a_i, b_i));
-    }
-}
+namespace dspark {
+namespace detail {
+namespace fft {
 
 /**
  * @class SplitFFT
@@ -353,8 +204,8 @@ public:
      */
     void run(const T*& outRe, const T*& outIm) noexcept
     {
-        Buffers b = buffers();
-        runPasses(b, 0, passes_.size());
+        Buffers<T> b = buffers();
+        passes(b, 0, passes_.size());
         outRe = b.xr;
         outIm = b.xi;
     }
@@ -369,9 +220,9 @@ public:
      */
     void runFrom(const T* data, bool conjugate, const T*& outRe, const T*& outIm) noexcept
     {
-        Buffers b = buffers();
-        const size_t done = readInput(data, conjugate, b);
-        runPasses(b, done, passes_.size());
+        Buffers<T> b = buffers();
+        const size_t done = input(data, conjugate, b);
+        passes(b, done, passes_.size());
         outRe = b.xr;
         outIm = b.xi;
     }
@@ -384,137 +235,61 @@ public:
      */
     void runTo(T* out, T scaleRe, T scaleIm) noexcept
     {
-        Buffers b = buffers();
-        runPasses(b, 0, passes_.size() - 1);
-        closing<InterleavedSink>(passes_.back(), b.xr, b.xi, out, scaleRe, scaleIm);
+        Buffers<T> b = buffers();
+        passes(b, 0, passes_.size() - 1);
+        close(b, out, scaleRe, scaleIm);
     }
 
     /// runFrom() and runTo() together. A transform of one pass cannot do both
     /// in that pass, so it reads through the input buffers.
     void runFromTo(const T* data, bool conjugate, T* out, T scaleRe, T scaleIm) noexcept
     {
-        Buffers b = buffers();
-        const size_t done = readInput(data, conjugate, b);
-        runPasses(b, done, passes_.size() - 1);
-        closing<InterleavedSink>(passes_.back(), b.xr, b.xi, out, scaleRe, scaleIm);
+        Buffers<T> b = buffers();
+        const size_t done = input(data, conjugate, b);
+        passes(b, done, passes_.size() - 1);
+        close(b, out, scaleRe, scaleIm);
     }
 
 private:
-    struct Pass { size_t len; size_t stride; size_t twOffset; bool radix2; };
-    struct Buffers { T* xr; T* xi; T* yr; T* yi; };
-
-    [[nodiscard]] Buffers buffers() noexcept
+    [[nodiscard]] Buffers<T> buffers() noexcept
     {
         return { bufA_.data(), bufA_.data() + n_, bufB_.data(), bufB_.data() + n_ };
     }
 
-    [[nodiscard]] TwiddleSpan<T> twiddleSpan(const Pass& pass) const noexcept
+    // Each step runs on the AVX2+FMA copy of the passes when it is active.
+    void passes(Buffers<T>& b, size_t begin, size_t end) const noexcept
     {
-        const size_t n1 = pass.len / 4;
-        const T* w = twiddles_.data() + pass.twOffset;
-        return { w, w + n1, w + 2 * n1, w + 3 * n1, w + 4 * n1, w + 5 * n1 };
-    }
-
-    void runPasses(Buffers& b, size_t begin, size_t end) const noexcept
-    {
-        for (size_t i = begin; i < end; ++i)
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
         {
-            const Pass& pass = passes_[i];
-            if (pass.radix2 || pass.len == 4)
-                closing<SplitSink>(pass, b.xr, b.xi, b.yr, b.yi);
-            else if (pass.stride == 1)
-                first<SplitSource>(pass, b.yr, b.yi, b.xr, b.xi);
-            else
-                strided(pass, b);
-            std::swap(b.xr, b.yr);
-            std::swap(b.xi, b.yi);
+            avx2::runPasses(passes_.data(), begin, end, twiddles_.data(), b);
+            return;
         }
+#endif
+        fft::runPasses(passes_.data(), begin, end, twiddles_.data(), b);
     }
 
-    /// Reads the input; returns the number of passes that consumed it.
-    size_t readInput(const T* data, bool conjugate, Buffers& b) const noexcept
+    size_t input(const T* data, bool conjugate, Buffers<T>& b) const noexcept
     {
-        if (passes_.size() < 2)
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            return avx2::readInput(passes_.data(), passes_.size(), n_, twiddles_.data(), data,
+                                   conjugate, b);
+#endif
+        return fft::readInput(passes_.data(), passes_.size(), n_, twiddles_.data(), data,
+                              conjugate, b);
+    }
+
+    void close(const Buffers<T>& b, T* out, T scaleRe, T scaleIm) const noexcept
+    {
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
         {
-            for (size_t i = 0; i < n_; ++i)
-            {
-                b.xr[i] = data[2 * i];
-                b.xi[i] = conjugate ? -data[2 * i + 1] : data[2 * i + 1];
-            }
-            return 0;
+            avx2::closeInterleaved(passes_.back(), b.xr, b.xi, out, scaleRe, scaleIm);
+            return;
         }
-        if (conjugate)
-            first<ConjugatedSource>(passes_.front(), b.yr, b.yi, data);
-        else
-            first<InterleavedSource>(passes_.front(), b.yr, b.yi, data);
-        std::swap(b.xr, b.yr);
-        std::swap(b.xi, b.yi);
-        return 1;
-    }
-
-    /// Runs the first pass at the widest vector its length allows.
-    template <template <typename, int> class Source, typename... Args>
-    void first(const Pass& pass, T* yr, T* yi, Args... input) const noexcept
-    {
-        const size_t n1 = pass.len / 4;
-        const TwiddleSpan<T> tw = twiddleSpan(pass);
-        constexpr int wide = kWide<T>;
-        constexpr int narrow = kNarrow<T>;
-        if (n1 % wide == 0)
-            radix4First<T, wide>(Source<T, wide> { input... }, yr, yi, pass.len, tw);
-        else if (n1 % narrow == 0)
-            radix4First<T, narrow>(Source<T, narrow> { input... }, yr, yi, pass.len, tw);
-        else
-            radix4First<T, 1>(Source<T, 1> { input... }, yr, yi, pass.len, tw);
-    }
-
-    void strided(const Pass& pass, const Buffers& b) const noexcept
-    {
-        const TwiddleSpan<T> tw = twiddleSpan(pass);
-        constexpr int wide = kWide<T>;
-        constexpr int narrow = kNarrow<T>;
-        if (pass.stride % wide == 0)
-            radix4Strided<T, wide>(b.xr, b.xi, b.yr, b.yi, pass.len, pass.stride, tw);
-        else if (pass.stride % narrow == 0)
-            radix4Strided<T, narrow>(b.xr, b.xi, b.yr, b.yi, pass.len, pass.stride, tw);
-        else
-            radix4Strided<T, 1>(b.xr, b.xi, b.yr, b.yi, pass.len, pass.stride, tw);
-    }
-
-    /// Runs a pass that needs no twiddles, at the widest vector its stride allows.
-    template <template <typename, int> class Sink, typename... Args>
-    void closing(const Pass& pass, const T* xr, const T* xi, Args... output) const noexcept
-    {
-        constexpr int wide = kWide<T>;
-        constexpr int narrow = kNarrow<T>;
-        if (pass.stride % wide == 0)
-            closingAt<wide, Sink>(pass, xr, xi, output...);
-        else if (pass.stride % narrow == 0)
-            closingAt<narrow, Sink>(pass, xr, xi, output...);
-        else
-            closingAt<1, Sink>(pass, xr, xi, output...);
-    }
-
-    template <int W, template <typename, int> class Sink, typename... Args>
-    static void closingAt(const Pass& pass, const T* xr, const T* xi, Args... output) noexcept
-    {
-        const Sink<T, W> sink = makeSink<W, Sink>(output...);
-        if (pass.radix2)
-            radix2Last<T, W>(xr, xi, sink, pass.stride);
-        else
-            radix4Last<T, W>(xr, xi, sink, pass.stride);
-    }
-
-    template <int W, template <typename, int> class Sink>
-    static Sink<T, W> makeSink(T* re, T* im) noexcept
-    {
-        return { re, im };
-    }
-
-    template <int W, template <typename, int> class Sink>
-    static Sink<T, W> makeSink(T* data, T scaleRe, T scaleIm) noexcept
-    {
-        return { data, Vec<T, W>::set1(scaleRe), Vec<T, W>::set1(scaleIm) };
+#endif
+        fft::closeInterleaved(passes_.back(), b.xr, b.xi, out, scaleRe, scaleIm);
     }
 
     size_t n_;
@@ -779,104 +554,30 @@ private:
         }
     }
 
-    /**
-     * @brief Splits the half-size spectrum Z into the real spectrum X:
-     *        X[k] = (Z[k] + conj(Z[M-k])) / 2 - j w^k (Z[k] - conj(Z[M-k])) / 2.
-     */
+    /// Splits the half-size spectrum into the real one (FftKernels.inl).
     void unpackForward(const T* zr, const T* zi, T* out) const noexcept
     {
-        constexpr int W = detail::fft::kWide<T>;
-        using O = detail::fft::Vec<T, W>;
-        const size_t m = halfSize_;
-
-        const T dc = zr[0] + zi[0];
-        const T ny = zr[0] - zi[0];
-
-        const auto half = O::set1(T(0.5));
-        size_t k = 1;
-        for (; k + W <= m; k += W)   // k .. k+W-1 against M-k .. M-k-W+1
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
         {
-            const auto hkR = O::load(zr + k), hkI = O::load(zi + k);
-            const auto hcR = O::reverse(O::load(zr + (m - k - (W - 1))));
-            const auto hcI = O::reverse(O::load(zi + (m - k - (W - 1))));
-            const auto xeR = O::mul(half, O::add(hkR, hcR));
-            const auto xeI = O::mul(half, O::sub(hkI, hcI));
-            const auto xoR = O::mul(half, O::sub(hkR, hcR));
-            const auto xoI = O::mul(half, O::add(hkI, hcI));
-            // -j * xo = (xoI, -xoR), times w = (wr, wi)
-            const auto wr = O::load(twRe_.data() + k), wi = O::load(twIm_.data() + k);
-            const auto tR = O::mulAdd(wr, xoI, wi, xoR);   // wr*xoI - wi*(-xoR)
-            const auto tI = O::mulSub(wi, xoI, wr, xoR);   // wr*(-xoR) + wi*xoI
-            O::storeInterleave2(out + 2 * k, O::add(xeR, tR), O::add(xeI, tI));
+            detail::fft::avx2::unpackRealForward(zr, zi, out, halfSize_, twRe_.data(), twIm_.data());
+            return;
         }
-        for (; k < m; ++k)
-        {
-            const size_t c = m - k;
-            const T xeR = T(0.5) * (zr[k] + zr[c]);
-            const T xeI = T(0.5) * (zi[k] - zi[c]);
-            const T xoR = T(0.5) * (zr[k] - zr[c]);
-            const T xoI = T(0.5) * (zi[k] + zi[c]);
-            const T wr = twRe_[k], wi = twIm_[k];
-            out[2 * k]     = xeR + (wr * xoI + wi * xoR);
-            out[2 * k + 1] = xeI + (wi * xoI - wr * xoR);
-        }
-        // Written last: in-place use shares the buffer with the input pairs,
-        // which the engine has already consumed.
-        out[0] = dc;
-        out[1] = T(0);
-        out[2 * m] = ny;
-        out[2 * m + 1] = T(0);
+#endif
+        detail::fft::unpackRealForward(zr, zi, out, halfSize_, twRe_.data(), twIm_.data());
     }
 
-    /**
-     * @brief Packs the real spectrum X into the CONJUGATED half-size spectrum
-     *        conj(Z), Z[k] = Xe[k] + j conj(w^k) Xd[k] (see unpackForward()).
-     */
+    /// Packs the real spectrum into the conjugated half-size one (FftKernels.inl).
     void packInverseConj(const T* in, T* zr, T* zi) const noexcept
     {
-        constexpr int W = detail::fft::kWide<T>;
-        using O = detail::fft::Vec<T, W>;
-        const size_t m = halfSize_;
-
-        const T dc = in[0];
-        const T ny = in[2 * m];
-        zr[0] = T(0.5) * (dc + ny);
-        zi[0] = -T(0.5) * (dc - ny);
-
-        const auto half = O::set1(T(0.5));
-        const auto zero = O::set1(T(0));
-        size_t k = 1;
-        for (; k + W <= m; k += W)
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
         {
-            typename O::V xkR, xkI, xcR, xcI;
-            O::loadDeinterleave(in + 2 * k, xkR, xkI);
-            O::loadDeinterleave(in + 2 * (m - k - (W - 1)), xcR, xcI);
-            xcR = O::reverse(xcR);
-            xcI = O::reverse(xcI);
-            const auto xeR = O::mul(half, O::add(xkR, xcR));
-            const auto xeI = O::mul(half, O::sub(xkI, xcI));
-            const auto dR = O::mul(half, O::sub(xkR, xcR));
-            const auto dI = O::mul(half, O::add(xkI, xcI));
-            // conj(w) * d, then j * that: (-(tI), tR)
-            const auto wr = O::load(twRe_.data() + k), wi = O::load(twIm_.data() + k);
-            const auto tR = O::mulAdd(wr, dR, wi, dI);    // wr*dR - (-wi)*dI
-            const auto tI = O::mulSub(wr, dI, wi, dR);    // wr*dI + (-wi)*dR
-            O::store(zr + k, O::sub(xeR, tI));
-            O::store(zi + k, O::sub(zero, O::add(xeI, tR)));   // conjugated
+            detail::fft::avx2::packRealInverseConj(in, zr, zi, halfSize_, twRe_.data(), twIm_.data());
+            return;
         }
-        for (; k < m; ++k)
-        {
-            const size_t c = m - k;
-            const T xeR = T(0.5) * (in[2 * k] + in[2 * c]);
-            const T xeI = T(0.5) * (in[2 * k + 1] - in[2 * c + 1]);
-            const T dR = T(0.5) * (in[2 * k] - in[2 * c]);
-            const T dI = T(0.5) * (in[2 * k + 1] + in[2 * c + 1]);
-            const T wr = twRe_[k], wi = twIm_[k];
-            const T tR = wr * dR + wi * dI;
-            const T tI = wr * dI - wi * dR;
-            zr[k] = xeR - tI;
-            zi[k] = -(xeI + tR);
-        }
+#endif
+        detail::fft::packRealInverseConj(in, zr, zi, halfSize_, twRe_.data(), twIm_.data());
     }
 
     size_t realSize_;

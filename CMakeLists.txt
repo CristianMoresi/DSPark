@@ -94,7 +94,7 @@ endif()
 include(GNUInstallDirs)
 install(DIRECTORY Core Effects Analysis IO Music
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dspark
-        FILES_MATCHING PATTERN "*.h")
+        FILES_MATCHING PATTERN "*.h" PATTERN "*.inl")
 install(FILES DSPark.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dspark)
 # The plugin layer: format wrappers, the vendored format SDK headers with
 # their licenses, the WebView editor, and the CMake helper the package

@@ -11,6 +11,7 @@
 #include "../Core/SpscQueue.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/SimdOps.h"
+#include "../Core/FFT.h"
 #include "../Core/TruePeakDetector.h"
 
 #include <algorithm>
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <vector>
 #include <type_traits>
 #include <utility>
 
@@ -1225,4 +1227,131 @@ DSPARK_TEST(swept_atomic_word_types_are_lock_free)
     EXPECT_TRUE(std::atomic<float>::is_always_lock_free);
     EXPECT_TRUE(std::atomic<double>::is_always_lock_free);
     // std::atomic_flag (SpinLock) is lock-free by definition ([atomics.flag]).
+}
+
+namespace {
+
+// Restores the dispatch selection when a test leaves.
+struct DispatchScope
+{
+    bool saved = dspark::simd::isRuntimeDispatchActive();
+    ~DispatchScope() { dspark::simd::setRuntimeDispatch(saved); }
+};
+
+template <typename T, typename Run>
+double dispatchMismatch(Run&& run)
+{
+    // Runs the same work on the AVX2+FMA copy and on the baseline and returns
+    // their largest difference relative to the output's peak.
+    dspark::simd::setRuntimeDispatch(true);
+    const std::vector<T> wide = run();
+    dspark::simd::setRuntimeDispatch(false);
+    const std::vector<T> base = run();
+    double peak = 0, diff = 0;
+    for (size_t i = 0; i < wide.size(); ++i)
+    {
+        if (!std::isfinite(static_cast<double>(wide[i])))
+            return std::numeric_limits<double>::infinity();
+        peak = std::max(peak, std::abs(static_cast<double>(base[i])));
+        diff = std::max(diff, std::abs(static_cast<double>(wide[i]) - static_cast<double>(base[i])));
+    }
+    return peak > 0 ? diff / peak : diff;
+}
+
+template <typename T>
+std::vector<T> dispatchNoise(size_t n, std::uint32_t seed)
+{
+    std::vector<T> v(n);
+    for (auto& x : v)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        x = static_cast<T>(static_cast<double>(seed >> 8) / 8388608.0 - 1.0);
+    }
+    return v;
+}
+
+template <typename T>
+void checkDispatchedKernels(double tolerance)
+{
+    using namespace dspark;
+    for (int n : { 1, 3, 7, 8, 9, 31, 32, 33, 300 })
+    {
+        const auto a = dispatchNoise<T>(static_cast<size_t>(n), 1u + static_cast<std::uint32_t>(n));
+        const auto b = dispatchNoise<T>(static_cast<size_t>(n), 7u + static_cast<std::uint32_t>(n));
+        EXPECT_LT(dispatchMismatch<T>([&] { return std::vector<T>{ simd::dotProduct(a.data(), b.data(), n) }; }),
+                  tolerance * n);
+    }
+    for (int taps : { 1, 7, 16, 63 })
+        for (int n : { 0, 1, 5, 8, 33, 70 })
+        {
+            const auto x = dispatchNoise<T>(static_cast<size_t>(n + taps), 3u + static_cast<std::uint32_t>(taps));
+            const auto h = dispatchNoise<T>(static_cast<size_t>(taps), 5u);
+            EXPECT_LT(dispatchMismatch<T>([&] {
+                          std::vector<T> y(static_cast<size_t>(n) + 1, T(0));
+                          simd::firCorrelate(x.data(), h.data(), taps, y.data(), n, T(0.5));
+                          return y;
+                      }),
+                      tolerance * taps);
+        }
+    for (size_t size : { size_t(4), size_t(8), size_t(32), size_t(128), size_t(2048), size_t(8192) })
+    {
+        const auto x = dispatchNoise<T>(size, 11u + static_cast<std::uint32_t>(size));
+        FFTReal<T> real(size);
+        EXPECT_LT(dispatchMismatch<T>([&] {
+                      std::vector<T> spectrum(size + 2);
+                      real.forward(x.data(), spectrum.data());
+                      return spectrum;
+                  }),
+                  tolerance * 16);
+        std::vector<T> spectrum(size + 2);
+        real.forward(x.data(), spectrum.data());
+        EXPECT_LT(dispatchMismatch<T>([&] {
+                      std::vector<T> back(size);
+                      real.inverse(spectrum.data(), back.data());
+                      return back;
+                  }),
+                  tolerance * 16);
+        FFTComplex<T> complex(size);
+        const auto z = dispatchNoise<T>(2 * size, 13u + static_cast<std::uint32_t>(size));
+        EXPECT_LT(dispatchMismatch<T>([&] {
+                      std::vector<T> data = z;
+                      complex.forward(data.data());
+                      complex.inverse(data.data());
+                      return data;
+                  }),
+                  tolerance * 16);
+    }
+}
+
+} // namespace
+
+DSPARK_TEST(SimdOps_runtime_dispatch_matches_the_baseline)
+{
+    // x86-64 builds below AVX carry AVX2+FMA copies of the wide kernels and
+    // pick them at run time. Both copies must agree to rounding: the FMA copy
+    // only fuses roundings and sums in a different order.
+    using namespace dspark;
+    DispatchScope scope;
+    if (!simd::runtimeDispatchSupported())
+    {
+        simd::setRuntimeDispatch(true);
+        EXPECT_FALSE(simd::isRuntimeDispatchActive());
+        return;
+    }
+    simd::setRuntimeDispatch(false);
+    EXPECT_FALSE(simd::isRuntimeDispatchActive());
+    simd::setRuntimeDispatch(true);
+    EXPECT_TRUE(simd::isRuntimeDispatchActive());
+    checkDispatchedKernels<float>(4e-7);
+    checkDispatchedKernels<double>(1e-15);
+    for (int bins : { 0, 1, 3, 4, 5, 67 })
+    {
+        const auto a = dispatchNoise<float>(2 * 67, 17u), b = dispatchNoise<float>(2 * 67, 19u);
+        EXPECT_LT(dispatchMismatch<float>([&] {
+                      std::vector<float> acc(2 * 67, 0.25f);
+                      simd::complexMulAccum(acc.data(), a.data(), b.data(), bins);
+                      return acc;
+                  }),
+                  1e-6);
+    }
 }

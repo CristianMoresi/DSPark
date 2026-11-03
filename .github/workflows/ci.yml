@@ -479,8 +479,10 @@ jobs:
           - { name: "Windows MSVC arm64", os: windows-11-arm,   msvc_arch: arm64, msvc_platform: ARM64 }
           # A 32-bit size_t, as on WebAssembly: lengths that fit 64 bits can wrap.
           - { name: "Windows MSVC x86",   os: windows-latest,   msvc_arch: x86,   msvc_platform: Win32 }
+          # The x64 baseline selects the AVX2+FMA kernel copies at run time on
+          # these runners; the Clang job keeps the whole suite on the SSE2 copy.
           - { name: "Linux GCC x64",      os: ubuntu-latest,    cxx: g++,     flags: -march=x86-64 }
-          - { name: "Linux Clang x64",    os: ubuntu-latest,    cxx: clang++, flags: -march=x86-64 }
+          - { name: "Linux Clang x64",    os: ubuntu-latest,    cxx: clang++, flags: -march=x86-64 -DDSPARK_NO_RUNTIME_DISPATCH }
           # The whole suite on the AVX2/FMA kernels, which also contract ordinary
           # float arithmetic: block-size and precision claims must survive that.
           - { name: "Linux GCC x64 AVX2", os: ubuntu-latest,    cxx: g++,     flags: -march=x86-64-v3 }
@@ -635,7 +637,7 @@ jobs:
 
       # Concurrency claims come from the named threaded tests printed by this
       # exact run; executing a single-threaded case under TSan is not presented
-      # as proof of a hand-off. The ordinary suite authority is currently 1422
+      # as proof of a hand-off. The ordinary suite authority is currently 1423
       # named cases. The separate Reverb publication executable also runs here.
       # The allocation injector is synchronous: its exhaustive failure sweep
       # runs unchanged in every native job and both ASan/UBSan jobs. Repeating

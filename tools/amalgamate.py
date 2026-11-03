@@ -61,6 +61,13 @@ def main():
             elif ENDIF_DIRECTIVE.match(line):
                 if_depth -= 1
             lm = INCLUDE_LOCAL.match(line)
+            if lm and lm.group(1).endswith(".inl"):
+                # An .inl is included once per instruction set, inside the
+                # namespace the includer opened: paste it here, every time.
+                inl = (path.parent / lm.group(1)).resolve()
+                body_lines.append(f"// ----- {inl.relative_to(ROOT).as_posix()} -----")
+                body_lines.extend(inl.read_text(encoding="utf-8").splitlines())
+                continue
             if lm:
                 # Resolve relative to the including header, emit dependency first
                 dep = (path.parent / lm.group(1)).resolve().relative_to(ROOT)

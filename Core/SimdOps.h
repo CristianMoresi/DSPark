@@ -10,11 +10,17 @@
  * Kernels use FMA (fused multiply-add) where the target enables it, and
  * restrict-qualified pointers so compilers can unroll aggressively.
  *
- * Build flags: binaries compiled for a generic x64 baseline stay on the SSE2
- * paths. Enable the wider kernels with /arch:AVX2 (MSVC) or -march=x86-64-v3
- * (GCC/Clang) when you control the deployment target. WebAssembly: compile
- * with -msimd128 -msse2 so Emscripten lowers the SSE2 paths to Wasm SIMD128;
- * otherwise the scalar fallbacks are used.
+ * Build flags: an x86-64 build for the generic baseline also carries AVX2+FMA
+ * copies of the kernels that gain from them (the Vec abstraction, firCorrelate,
+ * dotProduct, complexMulAccum and the FFT passes) and selects them at run time
+ * on CPUs that support them (see setRuntimeDispatch()). /arch:AVX2 (MSVC) or
+ * -march=x86-64-v3 (GCC/Clang) still widens the rest of the code when you
+ * control the deployment target. WebAssembly: compile with -msimd128 -msse2 so
+ * Emscripten lowers the SSE2 paths to Wasm SIMD128; otherwise the scalar
+ * fallbacks are used.
+ *
+ * Measured on MSVC x64 (SSE2 baseline -> AVX2 copies): FFTReal 2048 1.5x,
+ * 4x oversampling 1.5x, uniform convolution 1.8-2.2x faster.
  */
 
 // --- Platform SIMD detection ------------------------------------------------
@@ -45,6 +51,36 @@
     #include <emmintrin.h>
 #endif
 
+// --- Run-time AVX2 dispatch -------------------------------------------------
+// x86-64 builds below AVX compile a second copy of the wide kernels inside an
+// AVX2+FMA target region and pick it at run time after a CPU check. Define
+// DSPARK_NO_RUNTIME_DISPATCH to compile the baseline paths only. clang-cl is
+// left out: its target-attribute and CPU-query support differ from both
+// clang and MSVC.
+#if defined(DSPARK_SIMD_SSE2) && !defined(DSPARK_SIMD_AVX) && !defined(DSPARK_NO_RUNTIME_DISPATCH) \
+    && (defined(_M_AMD64) || defined(_M_X64) || defined(__x86_64__) || defined(__amd64__))     \
+    && !(defined(_MSC_VER) && defined(__clang__))
+    #define DSPARK_SIMD_DISPATCH_AVX2 1
+    #include <immintrin.h>
+    #if defined(_MSC_VER)
+        #include <intrin.h>
+    #else
+        #include <cpuid.h>
+    #endif
+    #if defined(__clang__)
+        #define DSPARK_SIMD_AVX2_BEGIN \
+            _Pragma("clang attribute push (__attribute__((target(\"avx2,fma\"))), apply_to = function)")
+        #define DSPARK_SIMD_AVX2_END _Pragma("clang attribute pop")
+    #elif defined(__GNUC__)
+        #define DSPARK_SIMD_AVX2_BEGIN _Pragma("GCC push_options") _Pragma("GCC target(\"avx2,fma\")")
+        #define DSPARK_SIMD_AVX2_END _Pragma("GCC pop_options")
+    #else
+        // MSVC accepts AVX2/FMA intrinsics in any function.
+        #define DSPARK_SIMD_AVX2_BEGIN
+        #define DSPARK_SIMD_AVX2_END
+    #endif
+#endif
+
 // --- Restrict Macro for Pointer Aliasing Optimization -----------------------
 // NOTE: restrict constrains WRITTEN ranges only. A range written through one
 // DSPARK_RESTRICT pointer must not overlap any other range accessed in the
@@ -62,8 +98,149 @@
   #endif
 #endif
 
+#include <atomic>
 #include <cstdint>
 #include <type_traits>
+
+// --- Vec<T, W> and the kernels written on it --------------------------------
+// detail/SimdVec.inl defines Vec<T, W> (W lanes of T; W = 1 is scalar code),
+// kVecWidth / kVecNarrowWidth and the wide kernels, for the feature set named
+// by the DSPARK_VEC_* macros. The baseline copy lives in dspark::simd and is
+// what FFT.h, Oversampling.h and the effects use directly.
+#if defined(DSPARK_SIMD_SSE2)
+    #define DSPARK_VEC_SSE2 1
+#endif
+#if defined(DSPARK_SIMD_NEON)
+    #define DSPARK_VEC_NEON 1
+#endif
+#if defined(DSPARK_SIMD_AVX)
+    #define DSPARK_VEC_AVX 1
+#endif
+#if defined(DSPARK_SIMD_FMA)
+    #define DSPARK_VEC_FMA 1
+#endif
+namespace dspark {
+namespace simd {
+#include "detail/SimdVec.inl"
+} // namespace simd
+} // namespace dspark
+#undef DSPARK_VEC_SSE2
+#undef DSPARK_VEC_NEON
+#undef DSPARK_VEC_AVX
+#undef DSPARK_VEC_FMA
+
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+// The AVX2+FMA copy, compiled for that target and called only after the check.
+DSPARK_SIMD_AVX2_BEGIN
+#define DSPARK_VEC_SSE2 1
+#define DSPARK_VEC_AVX 1
+#define DSPARK_VEC_FMA 1
+namespace dspark {
+namespace simd {
+namespace avx2 {
+#include "detail/SimdVec.inl"
+} // namespace avx2
+} // namespace simd
+} // namespace dspark
+#undef DSPARK_VEC_SSE2
+#undef DSPARK_VEC_AVX
+#undef DSPARK_VEC_FMA
+DSPARK_SIMD_AVX2_END
+
+namespace dspark {
+namespace simd {
+namespace dispatch {
+
+/// True when the CPU executes AVX2 and FMA and the OS saves the YMM state.
+inline bool cpuSupportsAvx2Fma() noexcept
+{
+#if defined(_MSC_VER)
+    int r[4] = {};
+    __cpuid(r, 0);
+    if (r[0] < 7) return false;
+    __cpuid(r, 1);
+    const unsigned ecx = static_cast<unsigned>(r[2]);
+    const bool fma = (ecx & (1u << 12)) != 0, osxsave = (ecx & (1u << 27)) != 0,
+               avx = (ecx & (1u << 28)) != 0;
+    if (!fma || !osxsave || !avx) return false;
+    if ((_xgetbv(0) & 6u) != 6u) return false;   // XMM and YMM state enabled
+    __cpuidex(r, 7, 0);
+    return (static_cast<unsigned>(r[1]) & (1u << 5)) != 0;   // AVX2
+#else
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (__get_cpuid_max(0, nullptr) < 7) return false;
+    if (!__get_cpuid(1, &a, &b, &c, &d)) return false;
+    const bool fma = (c & (1u << 12)) != 0, osxsave = (c & (1u << 27)) != 0,
+               avx = (c & (1u << 28)) != 0;
+    if (!fma || !osxsave || !avx) return false;
+    unsigned xcr0 = 0, xcr0High = 0;
+    // xgetbv, as bytes: the mnemonic needs the xsave target feature in clang.
+    __asm__ volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(xcr0), "=d"(xcr0High) : "c"(0));
+    (void)xcr0High;
+    if ((xcr0 & 6u) != 6u) return false;
+    __cpuid_count(7, 0, a, b, c, d);
+    return (b & (1u << 5)) != 0;   // AVX2
+#endif
+}
+
+/// Whether the AVX2 copies are in use. Zero-initialised (false) until the
+/// dynamic initialiser runs, so code that runs earlier takes the baseline.
+inline std::atomic<bool> avx2Active { cpuSupportsAvx2Fma() };
+
+} // namespace dispatch
+} // namespace simd
+} // namespace dspark
+#endif
+
+namespace dspark {
+namespace simd {
+
+/**
+ * @brief Whether this build carries AVX2+FMA kernels and the CPU can run them.
+ *
+ * True only in x86-64 builds below AVX (see DSPARK_NO_RUNTIME_DISPATCH) on a
+ * CPU with AVX2, FMA and OS support for the YMM state. Builds that target AVX2
+ * at compile time use those kernels everywhere and return false here.
+ */
+[[nodiscard]] inline bool runtimeDispatchSupported() noexcept
+{
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    return dispatch::cpuSupportsAvx2Fma();
+#else
+    return false;
+#endif
+}
+
+/** @brief Whether the AVX2+FMA kernels are selected now (see setRuntimeDispatch()). */
+[[nodiscard]] inline bool isRuntimeDispatchActive() noexcept
+{
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    return dispatch::avx2Active.load(std::memory_order_relaxed);
+#else
+    return false;
+#endif
+}
+
+/**
+ * @brief Selects or deselects the AVX2+FMA kernels (on by default where
+ *        runtimeDispatchSupported()).
+ *
+ * The two kernel sets round differently (FMA, wider sums), so output can differ
+ * between machines in the last bits. Disable it before processing when renders
+ * must be bit-identical on every CPU. Enabling it on a CPU without AVX2 and FMA
+ * has no effect. Thread-safe; calls in progress finish on the set they began.
+ */
+inline void setRuntimeDispatch(bool enabled) noexcept
+{
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    dispatch::avx2Active.store(enabled && dispatch::cpuSupportsAvx2Fma(), std::memory_order_relaxed);
+#else
+    (void)enabled;
+#endif
+}
+
+} // namespace simd
+} // namespace dspark
 
 namespace dspark {
 namespace simd {
@@ -420,48 +597,11 @@ inline double peakLevel(const double* DSPARK_RESTRICT data, int count) noexcept
 inline float dotProduct(const float* DSPARK_RESTRICT a, const float* DSPARK_RESTRICT b, int count) noexcept
 {
 #if defined(DSPARK_SIMD_AVX)
-    // Four independent accumulators break the FMA latency chain (4-5 cycles),
-    // letting long FIR kernels run at full multiply throughput (~2-4x faster).
-    __m256 vSum0 = _mm256_setzero_ps();
-    __m256 vSum1 = _mm256_setzero_ps();
-    __m256 vSum2 = _mm256_setzero_ps();
-    __m256 vSum3 = _mm256_setzero_ps();
-    int i = 0;
-    for (; i + 31 < count; i += 32)
-    {
-        #if defined(DSPARK_SIMD_FMA)
-            vSum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      vSum0);
-            vSum1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  vSum1);
-            vSum2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), vSum2);
-            vSum3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), vSum3);
-        #else
-            vSum0 = _mm256_add_ps(vSum0, _mm256_mul_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i)));
-            vSum1 = _mm256_add_ps(vSum1, _mm256_mul_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8)));
-            vSum2 = _mm256_add_ps(vSum2, _mm256_mul_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16)));
-            vSum3 = _mm256_add_ps(vSum3, _mm256_mul_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24)));
-        #endif
-    }
-    for (; i + 7 < count; i += 8)
-    {
-        #if defined(DSPARK_SIMD_FMA)
-            vSum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), vSum0);
-        #else
-            vSum0 = _mm256_add_ps(vSum0, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
-        #endif
-    }
-    __m256 vSum = _mm256_add_ps(_mm256_add_ps(vSum0, vSum1), _mm256_add_ps(vSum2, vSum3));
-    __m128 hi = _mm256_extractf128_ps(vSum, 1);
-    __m128 lo = _mm256_castps256_ps128(vSum);
-    __m128 sum4 = _mm_add_ps(lo, hi);
-    __m128 shuf = _mm_movehl_ps(sum4, sum4);
-    __m128 sum2 = _mm_add_ps(sum4, shuf);
-    __m128 sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 1));
-    float sum = _mm_cvtss_f32(sum1);
-
-    for (; i < count; ++i) sum += a[i] * b[i];
-    return sum;
-
+    return dotProductWide(a, b, count);
 #elif defined(DSPARK_SIMD_SSE2)
+  #if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (isRuntimeDispatchActive()) return avx2::dotProductWide(a, b, count);
+  #endif
     // Two accumulators hide the add/FMA latency on SSE-class hardware.
     __m128 vSum0 = _mm_setzero_ps();
     __m128 vSum1 = _mm_setzero_ps();
@@ -518,37 +658,11 @@ inline float dotProduct(const float* DSPARK_RESTRICT a, const float* DSPARK_REST
 inline double dotProduct(const double* DSPARK_RESTRICT a, const double* DSPARK_RESTRICT b, int count) noexcept
 {
 #if defined(DSPARK_SIMD_AVX)
-    __m256d vSum0 = _mm256_setzero_pd();
-    __m256d vSum1 = _mm256_setzero_pd();
-    int i = 0;
-    for (; i + 7 < count; i += 8)
-    {
-        #if defined(DSPARK_SIMD_FMA)
-            vSum0 = _mm256_fmadd_pd(_mm256_loadu_pd(a + i),     _mm256_loadu_pd(b + i),     vSum0);
-            vSum1 = _mm256_fmadd_pd(_mm256_loadu_pd(a + i + 4), _mm256_loadu_pd(b + i + 4), vSum1);
-        #else
-            vSum0 = _mm256_add_pd(vSum0, _mm256_mul_pd(_mm256_loadu_pd(a + i),     _mm256_loadu_pd(b + i)));
-            vSum1 = _mm256_add_pd(vSum1, _mm256_mul_pd(_mm256_loadu_pd(a + i + 4), _mm256_loadu_pd(b + i + 4)));
-        #endif
-    }
-    for (; i + 3 < count; i += 4)
-    {
-        #if defined(DSPARK_SIMD_FMA)
-            vSum0 = _mm256_fmadd_pd(_mm256_loadu_pd(a + i), _mm256_loadu_pd(b + i), vSum0);
-        #else
-            vSum0 = _mm256_add_pd(vSum0, _mm256_mul_pd(_mm256_loadu_pd(a + i), _mm256_loadu_pd(b + i)));
-        #endif
-    }
-    __m256d vSum = _mm256_add_pd(vSum0, vSum1);
-    __m128d lo = _mm256_castpd256_pd128(vSum);
-    __m128d hi = _mm256_extractf128_pd(vSum, 1);
-    __m128d s2 = _mm_add_pd(lo, hi);
-    double sum = _mm_cvtsd_f64(_mm_add_sd(s2, _mm_unpackhi_pd(s2, s2)));
-
-    for (; i < count; ++i) sum += a[i] * b[i];
-    return sum;
-
+    return dotProductWide(a, b, count);
 #elif defined(DSPARK_SIMD_SSE2)
+  #if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (isRuntimeDispatchActive()) return avx2::dotProductWide(a, b, count);
+  #endif
     __m128d vSum0 = _mm_setzero_pd();
     __m128d vSum1 = _mm_setzero_pd();
     int i = 0;
@@ -1015,37 +1129,11 @@ inline void complexMulAccum(float* DSPARK_RESTRICT accum, const float* DSPARK_RE
                             const float* DSPARK_RESTRICT b, int bins) noexcept
 {
 #if defined(DSPARK_SIMD_AVX)
-    // 4 complex bins per iteration. vpermilps builds the [re,re] / [im,im]
-    // duplicates and the [im,re] swap within each 128-bit lane; the
-    // alternating subtract/add of the two partial products comes straight
-    // from (fm)addsub, so no sign mask is needed on this path.
-    int k = 0;
-    for (; k + 3 < bins; k += 4)
-    {
-        const __m256 va   = _mm256_loadu_ps(a + 2 * k);
-        const __m256 vb   = _mm256_loadu_ps(b + 2 * k);
-        const __m256 vacc = _mm256_loadu_ps(accum + 2 * k);
-
-        const __m256 aRe   = _mm256_permute_ps(va, _MM_SHUFFLE(2, 2, 0, 0));
-        const __m256 aIm   = _mm256_permute_ps(va, _MM_SHUFFLE(3, 3, 1, 1));
-        const __m256 bSwap = _mm256_permute_ps(vb, _MM_SHUFFLE(2, 3, 0, 1));
-
-        #if defined(DSPARK_SIMD_FMA)
-            const __m256 prod = _mm256_fmaddsub_ps(aRe, vb, _mm256_mul_ps(aIm, bSwap));
-        #else
-            const __m256 prod = _mm256_addsub_ps(_mm256_mul_ps(aRe, vb), _mm256_mul_ps(aIm, bSwap));
-        #endif
-
-        _mm256_storeu_ps(accum + 2 * k, _mm256_add_ps(vacc, prod));
-    }
-    for (; k < bins; ++k)
-    {
-        const float re1 = a[2 * k], im1 = a[2 * k + 1];
-        const float re2 = b[2 * k], im2 = b[2 * k + 1];
-        accum[2 * k]     += re1 * re2 - im1 * im2;
-        accum[2 * k + 1] += re1 * im2 + im1 * re2;
-    }
+    complexMulAccumWide(accum, a, b, bins);
 #elif defined(DSPARK_SIMD_SSE2)
+  #if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (isRuntimeDispatchActive()) { avx2::complexMulAccumWide(accum, a, b, bins); return; }
+  #endif
     // Sign mask: negate real positions for (re1*re2 - im1*im2)
     const __m128 negMask = _mm_castsi128_ps(_mm_setr_epi32(
         static_cast<int>(0x80000000u), 0,
@@ -1203,312 +1291,8 @@ void addWithGainRampT(T* DSPARK_RESTRICT dst, const T* DSPARK_RESTRICT src, T ga
 }
 
 // ============================================================================
-// Vec<T, W>: W lanes of T for kernels written once for every target. W = 1 is
-// plain scalar code and exists everywhere; 4/2 lanes (float/double) exist on
-// SSE2 and NEON, 8/4 lanes with AVX. Used by FFT.h, Oversampling.h and
-// firCorrelate() below.
+// firCorrelate -- block FIR on the vector abstraction (detail/SimdVec.inl)
 // ============================================================================
-
-template <typename T, int W> struct Vec;
-
-template <typename T>
-struct Vec<T, 1>
-{
-    using V = T;
-    static V load(const T* p) noexcept { return *p; }
-    static void store(T* p, V v) noexcept { *p = v; }
-    static V set1(T x) noexcept { return x; }
-    static V add(V a, V b) noexcept { return a + b; }
-    static V sub(V a, V b) noexcept { return a - b; }
-    static V mul(V a, V b) noexcept { return a * b; }
-    static V mulSub(V a, V b, V c, V d) noexcept { return a * b - c * d; }
-    static V mulAdd(V a, V b, V c, V d) noexcept { return a * b + c * d; }
-    static V madd(V a, V b, V c) noexcept { return a * b + c; }
-    static V reverse(V v) noexcept { return v; }
-    static void loadDeinterleave(const T* p, V& re, V& im) noexcept { re = p[0]; im = p[1]; }
-    static void storeInterleave2(T* p, V re, V im) noexcept { p[0] = re; p[1] = im; }
-    static void storeInterleave4(T* p, V a, V b, V c, V d) noexcept
-    {
-        p[0] = a; p[1] = b; p[2] = c; p[3] = d;
-    }
-};
-
-#if defined(DSPARK_SIMD_SSE2)
-inline constexpr int kVecFloatNarrow = 4;
-inline constexpr int kVecDoubleNarrow = 2;
-
-template <>
-struct Vec<float, 4>
-{
-    using V = __m128;
-    static V load(const float* p) noexcept { return _mm_loadu_ps(p); }
-    static void store(float* p, V v) noexcept { _mm_storeu_ps(p, v); }
-    static V set1(float x) noexcept { return _mm_set1_ps(x); }
-    static V add(V a, V b) noexcept { return _mm_add_ps(a, b); }
-    static V sub(V a, V b) noexcept { return _mm_sub_ps(a, b); }
-    static V mul(V a, V b) noexcept { return _mm_mul_ps(a, b); }
-#if defined(DSPARK_SIMD_FMA)
-    static V mulSub(V a, V b, V c, V d) noexcept { return _mm_fmsub_ps(a, b, _mm_mul_ps(c, d)); }
-    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_fmadd_ps(a, b, _mm_mul_ps(c, d)); }
-    static V madd(V a, V b, V c) noexcept { return _mm_fmadd_ps(a, b, c); }
-#else
-    static V mulSub(V a, V b, V c, V d) noexcept { return _mm_sub_ps(_mm_mul_ps(a, b), _mm_mul_ps(c, d)); }
-    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_add_ps(_mm_mul_ps(a, b), _mm_mul_ps(c, d)); }
-    static V madd(V a, V b, V c) noexcept { return _mm_add_ps(_mm_mul_ps(a, b), c); }
-#endif
-    static V reverse(V v) noexcept { return _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 1, 2, 3)); }
-    static void loadDeinterleave(const float* p, V& re, V& im) noexcept
-    {
-        const V a = _mm_loadu_ps(p), b = _mm_loadu_ps(p + 4);
-        re = _mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0));
-        im = _mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1));
-    }
-    static void storeInterleave2(float* p, V re, V im) noexcept
-    {
-        _mm_storeu_ps(p, _mm_unpacklo_ps(re, im));
-        _mm_storeu_ps(p + 4, _mm_unpackhi_ps(re, im));
-    }
-    static void storeInterleave4(float* p, V a, V b, V c, V d) noexcept
-    {
-        _MM_TRANSPOSE4_PS(a, b, c, d);
-        _mm_storeu_ps(p, a); _mm_storeu_ps(p + 4, b);
-        _mm_storeu_ps(p + 8, c); _mm_storeu_ps(p + 12, d);
-    }
-};
-
-template <>
-struct Vec<double, 2>
-{
-    using V = __m128d;
-    static V load(const double* p) noexcept { return _mm_loadu_pd(p); }
-    static void store(double* p, V v) noexcept { _mm_storeu_pd(p, v); }
-    static V set1(double x) noexcept { return _mm_set1_pd(x); }
-    static V add(V a, V b) noexcept { return _mm_add_pd(a, b); }
-    static V sub(V a, V b) noexcept { return _mm_sub_pd(a, b); }
-    static V mul(V a, V b) noexcept { return _mm_mul_pd(a, b); }
-#if defined(DSPARK_SIMD_FMA)
-    static V mulSub(V a, V b, V c, V d) noexcept { return _mm_fmsub_pd(a, b, _mm_mul_pd(c, d)); }
-    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_fmadd_pd(a, b, _mm_mul_pd(c, d)); }
-    static V madd(V a, V b, V c) noexcept { return _mm_fmadd_pd(a, b, c); }
-#else
-    static V mulSub(V a, V b, V c, V d) noexcept { return _mm_sub_pd(_mm_mul_pd(a, b), _mm_mul_pd(c, d)); }
-    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_add_pd(_mm_mul_pd(a, b), _mm_mul_pd(c, d)); }
-    static V madd(V a, V b, V c) noexcept { return _mm_add_pd(_mm_mul_pd(a, b), c); }
-#endif
-    static V reverse(V v) noexcept { return _mm_shuffle_pd(v, v, 1); }
-    static V set2(double lane0Value, double lane1Value) noexcept { return _mm_set_pd(lane1Value, lane0Value); }
-    static double lane0(V v) noexcept { return _mm_cvtsd_f64(v); }
-    static double lane1(V v) noexcept { return _mm_cvtsd_f64(_mm_unpackhi_pd(v, v)); }
-    static void loadDeinterleave(const double* p, V& re, V& im) noexcept
-    {
-        const V a = _mm_loadu_pd(p), b = _mm_loadu_pd(p + 2);
-        re = _mm_unpacklo_pd(a, b);
-        im = _mm_unpackhi_pd(a, b);
-    }
-    static void storeInterleave2(double* p, V re, V im) noexcept
-    {
-        _mm_storeu_pd(p, _mm_unpacklo_pd(re, im));
-        _mm_storeu_pd(p + 2, _mm_unpackhi_pd(re, im));
-    }
-    static void storeInterleave4(double* p, V a, V b, V c, V d) noexcept
-    {
-        _mm_storeu_pd(p,     _mm_unpacklo_pd(a, b));
-        _mm_storeu_pd(p + 2, _mm_unpacklo_pd(c, d));
-        _mm_storeu_pd(p + 4, _mm_unpackhi_pd(a, b));
-        _mm_storeu_pd(p + 6, _mm_unpackhi_pd(c, d));
-    }
-};
-#elif defined(DSPARK_SIMD_NEON)
-inline constexpr int kVecFloatNarrow = 4;
-inline constexpr int kVecDoubleNarrow = 2;
-
-template <>
-struct Vec<float, 4>
-{
-    using V = float32x4_t;
-    static V load(const float* p) noexcept { return vld1q_f32(p); }
-    static void store(float* p, V v) noexcept { vst1q_f32(p, v); }
-    static V set1(float x) noexcept { return vdupq_n_f32(x); }
-    static V add(V a, V b) noexcept { return vaddq_f32(a, b); }
-    static V sub(V a, V b) noexcept { return vsubq_f32(a, b); }
-    static V mul(V a, V b) noexcept { return vmulq_f32(a, b); }
-    static V mulSub(V a, V b, V c, V d) noexcept { return vfmsq_f32(vmulq_f32(a, b), c, d); }
-    static V mulAdd(V a, V b, V c, V d) noexcept { return vfmaq_f32(vmulq_f32(a, b), c, d); }
-    // Explicit fusion keeps vector and broadcast tails identical even when
-    // GCC otherwise contracts their multiply/add expressions differently.
-    static V madd(V a, V b, V c) noexcept { return vfmaq_f32(c, a, b); }
-    static V reverse(V v) noexcept { const V r = vrev64q_f32(v); return vextq_f32(r, r, 2); }
-    static void loadDeinterleave(const float* p, V& re, V& im) noexcept
-    {
-        const float32x4x2_t v = vld2q_f32(p);
-        re = v.val[0]; im = v.val[1];
-    }
-    static void storeInterleave2(float* p, V re, V im) noexcept
-    {
-        float32x4x2_t v; v.val[0] = re; v.val[1] = im;
-        vst2q_f32(p, v);
-    }
-    static void storeInterleave4(float* p, V a, V b, V c, V d) noexcept
-    {
-        float32x4x4_t v; v.val[0] = a; v.val[1] = b; v.val[2] = c; v.val[3] = d;
-        vst4q_f32(p, v);
-    }
-};
-
-template <>
-struct Vec<double, 2>
-{
-    using V = float64x2_t;
-    static V load(const double* p) noexcept { return vld1q_f64(p); }
-    static void store(double* p, V v) noexcept { vst1q_f64(p, v); }
-    static V set1(double x) noexcept { return vdupq_n_f64(x); }
-    static V add(V a, V b) noexcept { return vaddq_f64(a, b); }
-    static V sub(V a, V b) noexcept { return vsubq_f64(a, b); }
-    static V mul(V a, V b) noexcept { return vmulq_f64(a, b); }
-    static V mulSub(V a, V b, V c, V d) noexcept { return vfmsq_f64(vmulq_f64(a, b), c, d); }
-    static V mulAdd(V a, V b, V c, V d) noexcept { return vfmaq_f64(vmulq_f64(a, b), c, d); }
-    static V madd(V a, V b, V c) noexcept { return vfmaq_f64(c, a, b); }
-    static V reverse(V v) noexcept { return vextq_f64(v, v, 1); }
-    static V set2(double lane0Value, double lane1Value) noexcept { return vsetq_lane_f64(lane1Value, vdupq_n_f64(lane0Value), 1); }
-    static double lane0(V v) noexcept { return vgetq_lane_f64(v, 0); }
-    static double lane1(V v) noexcept { return vgetq_lane_f64(v, 1); }
-    static void loadDeinterleave(const double* p, V& re, V& im) noexcept
-    {
-        const float64x2x2_t v = vld2q_f64(p);
-        re = v.val[0]; im = v.val[1];
-    }
-    static void storeInterleave2(double* p, V re, V im) noexcept
-    {
-        float64x2x2_t v; v.val[0] = re; v.val[1] = im;
-        vst2q_f64(p, v);
-    }
-    static void storeInterleave4(double* p, V a, V b, V c, V d) noexcept
-    {
-        float64x2x4_t v; v.val[0] = a; v.val[1] = b; v.val[2] = c; v.val[3] = d;
-        vst4q_f64(p, v);
-    }
-};
-#else
-inline constexpr int kVecFloatNarrow = 1;
-inline constexpr int kVecDoubleNarrow = 1;
-#endif
-
-#if defined(DSPARK_SIMD_AVX)
-inline constexpr int kVecFloatWide = 8;
-inline constexpr int kVecDoubleWide = 4;
-
-template <>
-struct Vec<float, 8>
-{
-    using V = __m256;
-    static V load(const float* p) noexcept { return _mm256_loadu_ps(p); }
-    static void store(float* p, V v) noexcept { _mm256_storeu_ps(p, v); }
-    static V set1(float x) noexcept { return _mm256_set1_ps(x); }
-    static V add(V a, V b) noexcept { return _mm256_add_ps(a, b); }
-    static V sub(V a, V b) noexcept { return _mm256_sub_ps(a, b); }
-    static V mul(V a, V b) noexcept { return _mm256_mul_ps(a, b); }
-#if defined(DSPARK_SIMD_FMA)
-    static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_fmsub_ps(a, b, _mm256_mul_ps(c, d)); }
-    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_fmadd_ps(a, b, _mm256_mul_ps(c, d)); }
-    static V madd(V a, V b, V c) noexcept { return _mm256_fmadd_ps(a, b, c); }
-#else
-    static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_sub_ps(_mm256_mul_ps(a, b), _mm256_mul_ps(c, d)); }
-    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_add_ps(_mm256_mul_ps(a, b), _mm256_mul_ps(c, d)); }
-    static V madd(V a, V b, V c) noexcept { return _mm256_add_ps(_mm256_mul_ps(a, b), c); }
-#endif
-    static V reverse(V v) noexcept
-    {
-        const V swapped = _mm256_permute2f128_ps(v, v, 1);
-        return _mm256_permute_ps(swapped, _MM_SHUFFLE(0, 1, 2, 3));
-    }
-    static void loadDeinterleave(const float* p, V& re, V& im) noexcept
-    {
-        const V a = _mm256_loadu_ps(p), b = _mm256_loadu_ps(p + 8);
-        const V lo = _mm256_permute2f128_ps(a, b, 0x20);
-        const V hi = _mm256_permute2f128_ps(a, b, 0x31);
-        re = _mm256_shuffle_ps(lo, hi, _MM_SHUFFLE(2, 0, 2, 0));
-        im = _mm256_shuffle_ps(lo, hi, _MM_SHUFFLE(3, 1, 3, 1));
-    }
-    static void storeInterleave2(float* p, V re, V im) noexcept
-    {
-        const V lo = _mm256_unpacklo_ps(re, im);
-        const V hi = _mm256_unpackhi_ps(re, im);
-        _mm256_storeu_ps(p,     _mm256_permute2f128_ps(lo, hi, 0x20));
-        _mm256_storeu_ps(p + 8, _mm256_permute2f128_ps(lo, hi, 0x31));
-    }
-    static void storeInterleave4(float* p, V a, V b, V c, V d) noexcept
-    {
-        const V t0 = _mm256_unpacklo_ps(a, b), t1 = _mm256_unpackhi_ps(a, b);
-        const V t2 = _mm256_unpacklo_ps(c, d), t3 = _mm256_unpackhi_ps(c, d);
-        const V u0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
-        const V u1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
-        const V u2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
-        const V u3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
-        _mm256_storeu_ps(p,      _mm256_permute2f128_ps(u0, u1, 0x20));
-        _mm256_storeu_ps(p + 8,  _mm256_permute2f128_ps(u2, u3, 0x20));
-        _mm256_storeu_ps(p + 16, _mm256_permute2f128_ps(u0, u1, 0x31));
-        _mm256_storeu_ps(p + 24, _mm256_permute2f128_ps(u2, u3, 0x31));
-    }
-};
-
-template <>
-struct Vec<double, 4>
-{
-    using V = __m256d;
-    static V load(const double* p) noexcept { return _mm256_loadu_pd(p); }
-    static void store(double* p, V v) noexcept { _mm256_storeu_pd(p, v); }
-    static V set1(double x) noexcept { return _mm256_set1_pd(x); }
-    static V add(V a, V b) noexcept { return _mm256_add_pd(a, b); }
-    static V sub(V a, V b) noexcept { return _mm256_sub_pd(a, b); }
-    static V mul(V a, V b) noexcept { return _mm256_mul_pd(a, b); }
-#if defined(DSPARK_SIMD_FMA)
-    static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_fmsub_pd(a, b, _mm256_mul_pd(c, d)); }
-    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_fmadd_pd(a, b, _mm256_mul_pd(c, d)); }
-    static V madd(V a, V b, V c) noexcept { return _mm256_fmadd_pd(a, b, c); }
-#else
-    static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_sub_pd(_mm256_mul_pd(a, b), _mm256_mul_pd(c, d)); }
-    static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_add_pd(_mm256_mul_pd(a, b), _mm256_mul_pd(c, d)); }
-    static V madd(V a, V b, V c) noexcept { return _mm256_add_pd(_mm256_mul_pd(a, b), c); }
-#endif
-    static V reverse(V v) noexcept
-    {
-        const V swapped = _mm256_permute2f128_pd(v, v, 1);
-        return _mm256_permute_pd(swapped, 0x5);
-    }
-    static void loadDeinterleave(const double* p, V& re, V& im) noexcept
-    {
-        const V a = _mm256_loadu_pd(p), b = _mm256_loadu_pd(p + 4);
-        const V lo = _mm256_permute2f128_pd(a, b, 0x20);
-        const V hi = _mm256_permute2f128_pd(a, b, 0x31);
-        re = _mm256_unpacklo_pd(lo, hi);
-        im = _mm256_unpackhi_pd(lo, hi);
-    }
-    static void storeInterleave2(double* p, V re, V im) noexcept
-    {
-        const V lo = _mm256_unpacklo_pd(re, im);
-        const V hi = _mm256_unpackhi_pd(re, im);
-        _mm256_storeu_pd(p,     _mm256_permute2f128_pd(lo, hi, 0x20));
-        _mm256_storeu_pd(p + 4, _mm256_permute2f128_pd(lo, hi, 0x31));
-    }
-    static void storeInterleave4(double* p, V a, V b, V c, V d) noexcept
-    {
-        const V t0 = _mm256_unpacklo_pd(a, b), t1 = _mm256_unpackhi_pd(a, b);
-        const V t2 = _mm256_unpacklo_pd(c, d), t3 = _mm256_unpackhi_pd(c, d);
-        _mm256_storeu_pd(p,      _mm256_permute2f128_pd(t0, t2, 0x20));
-        _mm256_storeu_pd(p + 4,  _mm256_permute2f128_pd(t1, t3, 0x20));
-        _mm256_storeu_pd(p + 8,  _mm256_permute2f128_pd(t0, t2, 0x31));
-        _mm256_storeu_pd(p + 12, _mm256_permute2f128_pd(t1, t3, 0x31));
-    }
-};
-#else
-inline constexpr int kVecFloatWide = kVecFloatNarrow;
-inline constexpr int kVecDoubleWide = kVecDoubleNarrow;
-#endif
-
-/// Widest vector width for T on this target (1 = scalar).
-template <typename T> inline constexpr int kVecWidth = std::is_same_v<T, float> ? kVecFloatWide : kVecDoubleWide;
-/// The next width down (the SSE2/NEON width in AVX builds).
-template <typename T> inline constexpr int kVecNarrowWidth = std::is_same_v<T, float> ? kVecFloatNarrow : kVecDoubleNarrow;
 
 /**
  * @brief Block FIR as a valid correlation: y[i] = gain * sum_j h[j] * x[i + j]
@@ -1517,7 +1301,8 @@ template <typename T> inline constexpr int kVecNarrowWidth = std::is_same_v<T, f
  * Register-blocked over outputs (four vectors at a time, the taps in the
  * inner loop), so no output pays a horizontal sum: for the 16..256-tap
  * kernels of oversamplers and resamplers it runs several times faster than
- * one dotProduct() per output. y must not overlap x or h.
+ * one dotProduct() per output. y must not overlap x or h. Runs on the AVX2+FMA
+ * copy when isRuntimeDispatchActive().
  *
  * @param x     Input, n + taps - 1 samples.
  * @param h     Kernel, taps coefficients (h[0] meets x[i]).
@@ -1530,47 +1315,14 @@ template <typename T>
 void firCorrelate(const T* x, const T* h, int taps, T* DSPARK_RESTRICT y, int n, T gain) noexcept
 {
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
-    constexpr int W = kVecWidth<T>;
-    using O = Vec<T, W>;
-    using V = typename O::V;
-    const V g = O::set1(gain);
-    int i = 0;
-    for (; i + 4 * W <= n; i += 4 * W)
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (isRuntimeDispatchActive())
     {
-        V a0 = O::set1(T(0)), a1 = a0, a2 = a0, a3 = a0;
-        const T* xp = x + i;
-        for (int j = 0; j < taps; ++j)
-        {
-            const V hj = O::set1(h[j]);
-            a0 = O::madd(hj, O::load(xp + j), a0);
-            a1 = O::madd(hj, O::load(xp + j + W), a1);
-            a2 = O::madd(hj, O::load(xp + j + 2 * W), a2);
-            a3 = O::madd(hj, O::load(xp + j + 3 * W), a3);
-        }
-        O::store(y + i, O::mul(a0, g));
-        O::store(y + i + W, O::mul(a1, g));
-        O::store(y + i + 2 * W, O::mul(a2, g));
-        O::store(y + i + 3 * W, O::mul(a3, g));
+        avx2::firCorrelateKernel(x, h, taps, y, n, gain);
+        return;
     }
-    for (; i + W <= n; i += W)
-    {
-        V a = O::set1(T(0));
-        for (int j = 0; j < taps; ++j)
-            a = O::madd(O::set1(h[j]), O::load(x + i + j), a);
-        O::store(y + i, O::mul(a, g));
-    }
-    for (; i < n; ++i)
-    {
-        // Use the same multiply-add policy as the full vectors. A scalar
-        // expression may contract differently, making the result depend on
-        // which samples happen to fall in the tail of a host block.
-        V a = O::set1(T(0));
-        for (int j = 0; j < taps; ++j)
-            a = O::madd(O::set1(h[j]), O::set1(x[i + j]), a);
-        T lanes[W];
-        O::store(lanes, O::mul(a, g));
-        y[i] = lanes[0];
-    }
+#endif
+    firCorrelateKernel(x, h, taps, y, n, gain);
 }
 
 } // namespace simd

@@ -71,8 +71,10 @@ Every push and pull request runs, across Windows (MSVC x64 and ARM64), Linux
 
 - the test suite and the conformance suite on all six native targets
 - AddressSanitizer and UndefinedBehaviorSanitizer over both suites
-- the conformance suite a second time on the AVX2/FMA kernel paths, which the
-  SSE2 baseline build would never reach
+- the conformance suite a second time compiled for AVX2/FMA, and the test suite
+  once on the SSE2-only kernel copy (`DSPARK_NO_RUNTIME_DISPATCH`), the path a
+  CPU without AVX2 takes; the x64 baseline jobs select the AVX2+FMA copies at
+  run time
 - an exceptions-free, RTTI-free, file-IO-free embedded profile
 - the single-header amalgamation, compiled after generation
 - EBU R128 tone programmes from Tech 3341/3342 on every target, and the official

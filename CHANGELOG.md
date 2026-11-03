@@ -6,6 +6,13 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- Run-time AVX2 dispatch: x86-64 builds for the generic baseline also compile
+  AVX2+FMA copies of the vector kernels (the FFT passes, `firCorrelate`,
+  `dotProduct`, `complexMulAccum`) and select them on CPUs that support them.
+  Measured on MSVC x64 against the SSE2 build: FFTReal 2048 1.5x, uniform
+  convolution 1.8-2.2x, 4x oversampling 1.5x. `simd::setRuntimeDispatch(false)`
+  keeps renders bit-identical across CPUs; `DSPARK_NO_RUNTIME_DISPATCH` compiles
+  the baseline only.
 - `Mp3File` decodes MPEG-2 and MPEG-2.5 Layer III (16, 22.05, 24, 8, 11.025
   and 12 kHz, ISO 13818-3), with LSF scalefactors and intensity stereo. LAME
   files at every rate match minimp3 at 131 dB or better.

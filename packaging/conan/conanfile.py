@@ -33,8 +33,13 @@ class DSParkConan(ConanFile):
              os.path.join(self.package_folder, "licenses"))
         # The same layout as the CMake install: include/dspark is the include
         # root, so #include <DSPark.h> works with every package manager.
+        # The .inl files are kernel copies the headers include once per
+        # instruction set; they ship next to the headers that include them.
         for module in ("Core", "Effects", "Analysis", "IO", "Music"):
             copy(self, "*.h",
+                 os.path.join(self.source_folder, module),
+                 os.path.join(self.package_folder, "include", "dspark", module))
+            copy(self, "*.inl",
                  os.path.join(self.source_folder, module),
                  os.path.join(self.package_folder, "include", "dspark", module))
         copy(self, "DSPark.h", self.source_folder,

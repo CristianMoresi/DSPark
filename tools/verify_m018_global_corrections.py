@@ -26,7 +26,7 @@ from check_public_text import canonical_text_bytes
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_DIRECTORIES = ("Core", "Effects", "Analysis", "IO", "Music")
 EXPECTED_INSTALLED_HEADERS = 153
-EXPECTED_ORDINARY_TESTS = 1422
+EXPECTED_ORDINARY_TESTS = 1423
 PACKAGE_SOURCE_COMMIT = "816766a14e04804ba3425d789e8bb384866067ea"
 PACKAGE_SOURCE_PARENT = "6885f80e21264298c7e73f44dd05a73f3ddb4210"
 PACKAGE_SOURCE_URL_PREFIX = (
@@ -41,12 +41,12 @@ PACKAGE_SOURCE_SHA512 = (
     "14684a9ba1c93f6d73546bfa19f67a67525a3a1cd5f4bf483d441800d6c5833c"
 )
 EXPECTED_PACKAGE_HASHES = {
-    "packaging/conan/conanfile.py": "6c7145e731de27a2ee195868c38c1e8195c6ee077933c09f5d4a1d76361c3086",
+    "packaging/conan/conanfile.py": "7789c64e2f61045db82a8a6af9177e9ca0dba3750a80e02ac326ad313acce27d",
     "packaging/vcpkg/portfile.cmake": "ae4c7718463cc39d08f56d125153ece3f5949a8759982f9ed9028169d06cce2a",
     "packaging/vcpkg/vcpkg.json": "3df1e4047b20af1e0a4dd27dd093563e6d465e950131f3950c2fdac6165b539f",
 }
 EXPECTED_SEMANTIC_HASHES = {
-    "packaging/conan/conanfile.py": "f5b6ca8c550c892057fcd2118b9e7f948beb17d6e7ebc951c61f57f98765f675",
+    "packaging/conan/conanfile.py": "e1eeb9e9ba554481293e36dbf14ffc62f4aafa25fd680b4c65e78f545c5430ab",
     "packaging/vcpkg/portfile.cmake": "d9032a1bc936ec7a98247abd49c9f291ab4010603797e82e6e82af955f70fca1",
     "packaging/vcpkg/vcpkg.json": "0e45394af21c357d2194677082298e51d23557008552ddacb94ce4bae832860e",
 }
@@ -823,19 +823,19 @@ def conan_field_errors(data: bytes) -> list[str]:
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name) and node.func.id == "copy"
     ]
-    module_destinations = [
-        ast.unparse(call.args[3]) for call in copy_calls
-        if len(call.args) == 4 and isinstance(call.args[1], ast.Constant)
-        and call.args[1].value == "*.h"
-    ]
-    umbrella_destinations = [
-        ast.unparse(call.args[3]) for call in copy_calls
-        if len(call.args) == 4 and isinstance(call.args[1], ast.Constant)
-        and call.args[1].value == "DSPark.h"
-    ]
-    if module_destinations != [
-            "os.path.join(self.package_folder, 'include', 'dspark', module)"
-    ] or umbrella_destinations != [
+    def destinations(pattern: str) -> list[str]:
+        return [
+            ast.unparse(call.args[3]) for call in copy_calls
+            if len(call.args) == 4 and isinstance(call.args[1], ast.Constant)
+            and call.args[1].value == pattern
+        ]
+
+    module_destination = "os.path.join(self.package_folder, 'include', 'dspark', module)"
+    # Headers and the .inl kernel copies they include land in the same module
+    # directory, or an installed SimdOps.h/FFT.h cannot find its includes.
+    if destinations("*.h") != [module_destination] \
+            or destinations("*.inl") != [module_destination] \
+            or destinations("DSPark.h") != [
             "os.path.join(self.package_folder, 'include', 'dspark')"
     ]:
         errors.append("PACKAGE_R_CONAN_FIELD:include_destination")
@@ -1277,7 +1277,7 @@ def package_mutant_cases(
     add("MUT-R-CONAN-INCLUDE-DESTINATION", "uppercase", conan_path,
         replace_package_bytes(
             conan, b'"include", "dspark"', b'"include", "DSPark"',
-            expected_count=4),
+            expected_count=5),
         "PACKAGE_R_CONAN_FIELD:include_destination")
     add("MUT-R-CONAN-INCLUDE-DESTINATION", "include-root", conan_path,
         replace_package_bytes(

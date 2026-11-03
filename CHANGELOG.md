@@ -6,6 +6,13 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Mp3File` decodes MPEG-2 and MPEG-2.5 Layer III (16, 22.05, 24, 8, 11.025
+  and 12 kHz, ISO 13818-3), with LSF scalefactors and intensity stereo. LAME
+  files at every rate match minimp3 at 131 dB or better.
+- `WavFile` reads RF64 and BW64. `setRf64Mode()` writes RF64 always, or
+  promotes the file only when it outgrows 4 GiB.
+- `AudioFile::hasWriteError()` reports a failed write or header finalisation,
+  including after `close()`.
 - `Sampler::noteOnTuned` and `Synthesizer::noteOnTuned`: sample-offset
   note events with individual tuning in cents (-100..100), added to
   existing pitch controls. Integer keys still select zones and identify
@@ -53,6 +60,32 @@ All notable user-facing changes to DSPark are documented here.
   compiles.
 - `RingBuffer` stays unprepared when its byte size does not fit a 32-bit
   `size_t`; a 2^30-sample float ring got a zero-size block and wrote past it.
+- `Mp3File` accepts a frame only when the next header confirms it, so tags,
+  cover art and other binary data no longer decode as full-scale noise, and
+  non-MP3 files are rejected.
+- `Mp3File` intensity stereo starts above the right channel's last non-zero
+  band. FhG files at 48-64 kbps matched the reference decoders at 32.8 dB.
+- `Mp3File` bounds decoded PCM at `kMaxDecodedPcmBytes` and computes the size
+  in 64 bits. A 32-bit `size_t` used to wrap and overrun the buffer.
+- `Mp3File` mutes a frame whose bit reservoir is missing instead of decoding
+  noise. It drops a count1 quad that overruns `part2_3_length`.
+- `Mp3File` trims only the start when a gapless tag counts fewer frames than
+  the file holds; concatenated files kept one copy. It also accepts tag CRCs
+  taken over 190 bytes with the field zeroed, as FFmpeg writes them.
+- `Mp3File` decodes 2.3 to 6.5 times faster (Huffman trees, a fast DCT-32 and
+  a symmetric IMDCT), and the encoder runs 7 times faster with byte-identical
+  output.
+- `Mp3File::readSamples()` returns false on a writer, which used to crash.
+  `Mp3File` and `WavFile` range checks no longer overflow int64.
+- `Mp3File::writeSamples()` and `MidiFile::write()` report I/O failures; a
+  short MIDI file returned true with nothing on disk.
+- `FlacFile` decodes pre-2007 variable-block streams (RFC 9639 B.1) and fixed
+  streams with unequal STREAMINFO bounds. It reads 5.4 times faster with
+  identical PCM, and skips MD5 work when the stored digest is zero.
+- `WavFile` pads an odd-sized data chunk to a word boundary.
+- `stateFromJson()` round-trips +-FLT_MAX, rejects trailing text, and rejects
+  more than 65535 parameters or keys over 255 bytes. `StateWriter::blob()`
+  returns an empty blob in those cases instead of wrapping its entry count.
 - `TimeStretch` and `PitchShifter`, Studio engine: one NaN or Inf input sample
   wrote a byte before a heap block and left the output NaN until `reset()`.
   Non-finite samples now read as silence, and a spectrum that overflowed

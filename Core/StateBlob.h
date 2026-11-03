@@ -90,9 +90,10 @@ public:
     /** @brief Writes a nested blob (composite processors: bands, slots...). */
     void write(const char* key, const std::vector<uint8_t>& nested)
     {
-        const size_t len = std::min<size_t>(std::strlen(key), 255);
-        assert(len == std::strlen(key) && "state key longer than 255 chars is truncated");
+        const size_t len = std::strlen(key);
+        assert(len <= 255 && "state key longer than 255 chars");
         assert(count_ < 0xFFFF && "state entry count overflows u16");
+        if (len > 255 || count_ == 0xFFFF) { overflow_ = true; return; }
         blob_.push_back(static_cast<uint8_t>(len));
         append(key, len);
         blob_.push_back(3);
@@ -101,9 +102,16 @@ public:
         ++count_;
     }
 
-    /** @brief Finalizes and returns the blob. */
+    /**
+     * @brief Finalizes and returns the blob.
+     *
+     * Returns an empty vector (which StateReader reports as invalid) when an
+     * entry did not fit the format: more than 65535 entries, or a key longer
+     * than 255 bytes. The u16 count used to wrap silently and drop entries.
+     */
     [[nodiscard]] std::vector<uint8_t> blob() const
     {
+        if (overflow_) return {};
         std::vector<uint8_t> out = blob_;
         out[countPos_] = static_cast<uint8_t>(count_ & 0xFF);
         out[countPos_ + 1] = static_cast<uint8_t>((count_ >> 8) & 0xFF);
@@ -115,9 +123,10 @@ private:
 
     void writeEntry(const char* key, uint8_t type, uint32_t payload)
     {
-        const size_t len = std::min<size_t>(std::strlen(key), 255);
-        assert(len == std::strlen(key) && "state key longer than 255 chars is truncated");
+        const size_t len = std::strlen(key);
+        assert(len <= 255 && "state key longer than 255 chars");
         assert(count_ < 0xFFFF && "state entry count overflows u16");
+        if (len > 255 || count_ == 0xFFFF) { overflow_ = true; return; }
         blob_.push_back(static_cast<uint8_t>(len));
         append(key, len);
         blob_.push_back(type);
@@ -143,6 +152,7 @@ private:
     std::vector<uint8_t> blob_;
     size_t countPos_ = 0;
     uint16_t count_ = 0;
+    bool overflow_ = false;
 };
 
 // ============================================================================
@@ -570,11 +580,16 @@ inline std::vector<uint8_t> stateFromJsonImpl(const std::string& json, int depth
                         // Integers without fraction round-trip as int32 too;
                         // store as float (type 0) plus int mirror when exact.
                         // Beyond the float range the double->float conversion
-                        // is undefined: reject such text as malformed.
-                        if (!(std::abs(num) <= static_cast<double>(
-                                  std::numeric_limits<float>::max())))
+                        // is undefined: reject such text as malformed. "%.9g"
+                        // prints FLT_MAX as 3.40282347e+38, a hair above
+                        // FLT_MAX, and every double below FLT_MAX plus half
+                        // an ulp denotes FLT_MAX: accept that band and clamp.
+                        constexpr double kFloatMax = static_cast<double>(
+                            std::numeric_limits<float>::max());
+                        constexpr double kFloatLimit = 3.4028235677973366e38;
+                        if (!(std::abs(num) < kFloatLimit))
                             return {};
-                        const auto f = static_cast<float>(num);
+                        const auto f = static_cast<float>(std::clamp(num, -kFloatMax, kFloatMax));
                         std::memcpy(&prm.payload, &f, 4);
                         prm.type = 0;
                         if (num >= -2147483648.0 && num <= 2147483647.0
@@ -599,6 +614,12 @@ inline std::vector<uint8_t> stateFromJsonImpl(const std::string& json, int depth
         break;
     }
     if (!expect(p, '}')) return {};
+    skipWs(p);
+    if (p != json.size()) return {};   // trailing text is malformed input
+    // The binary format holds at most 65535 entries with keys of 255 bytes.
+    if (params.size() > 0xFFFF) return {};
+    for (const auto& prm : params)
+        if (prm.key.size() > 255) return {};
 
     StateWriter w(id, version);
     for (const auto& prm : params)

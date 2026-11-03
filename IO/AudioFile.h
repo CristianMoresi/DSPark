@@ -179,14 +179,27 @@ public:
      * @brief Finalizes file headers and releases system handles.
      *
      * Safe to call multiple times. Implementations invoke this from their
-     * destructor, so an open file is always finalized; call it explicitly
-     * when you need the write error-checked (a destructor cannot report
-     * failure) or the file released before the object dies.
+     * destructor, so an open file is always finalized; call it explicitly,
+     * then hasWriteError(), when you need to know that a written file is
+     * complete (a destructor cannot report failure), or to release the file
+     * before the object dies.
      */
     virtual void close() = 0;
 
     /** @brief Checks if a valid file handle is currently open. */
     [[nodiscard]] virtual bool isOpen() const noexcept = 0;
+
+    /**
+     * @brief Reports whether the current or most recent writer hit an I/O
+     *        failure.
+     *
+     * Covers every writeSamples() call and the header finalisation that
+     * close() performs, so checking it after close() tells whether the file
+     * on disk is complete. The status survives close() and is cleared by the
+     * next openRead() or openWrite(). Readers, and implementations that never
+     * write, report false.
+     */
+    [[nodiscard]] virtual bool hasWriteError() const noexcept { return false; }
 };
 
 } // namespace dspark

@@ -3263,3 +3263,762 @@ DSPARK_TEST(FlacFile_hostile_mutation_campaign_20000)
               << accepted << " rejected=" << rejected << " corpus-fnv64="
               << mutationHash << " worst-us=" << worstMicros << "\n";
 }
+
+// ============================================================================
+// 2026-11 IO audit: regression pins. Each case failed on the headers before
+// the fixes it names; the comment states the defect and the measured number.
+// ============================================================================
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <csignal>
+#include <sys/resource.h>
+#endif
+#include <tuple>
+
+namespace io_audit {
+
+// A Layer III frame of any version: 3 = MPEG-1, 2 = MPEG-2, 0 = MPEG-2.5.
+// mode 3 is mono, 1 joint stereo. The side info and main data come from the
+// callbacks; the header is written here and the frame zero-padded to size.
+template <typename SideFn, typename MainFn>
+std::vector<uint8_t> craftFrame(int version, int bitrateIndex, int rateIndex, int mode,
+                                int modeExt, SideFn side, MainFn main)
+{
+    static constexpr int kMpeg1[16] = {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0};
+    static constexpr int kLsf[16] = {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0};
+    static constexpr int kRates[4][3] = { {11025,12000,8000}, {0,0,0},
+                                          {22050,24000,16000}, {44100,48000,32000} };
+    const bool lsf = version != 3;
+    const int rate = kRates[version][rateIndex];
+    const int bytes = (lsf ? 72 : 144) * (lsf ? kLsf : kMpeg1)[bitrateIndex] * 1000 / rate;
+    const int sideBytes = lsf ? (mode == 3 ? 9 : 17) : (mode == 3 ? 17 : 32);
+    Mp3TestBits b;
+    b.put(0x7FF, 11); b.put(uint32_t(version), 2); b.put(1, 2); b.put(1, 1);
+    b.put(uint32_t(bitrateIndex), 4); b.put(uint32_t(rateIndex), 2); b.put(0, 1); b.put(0, 1);
+    b.put(uint32_t(mode), 2); b.put(uint32_t(modeExt), 2); b.put(0, 1); b.put(1, 1); b.put(0, 2);
+    side(b);
+    while (b.bitPos < size_t(4 + sideBytes) * 8) b.put(0, 1);
+    main(b);
+    std::vector<uint8_t> frame = b.bytes;
+    frame.resize(size_t(bytes), 0);
+    return frame;
+}
+
+void writeFrames(const std::filesystem::path& path, const std::vector<std::vector<uint8_t>>& frames)
+{
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    for (const auto& frame : frames)
+        f.write(reinterpret_cast<const char*>(frame.data()), std::streamsize(frame.size()));
+}
+
+struct Decoded
+{
+    bool ok = false;
+    double rate = 0.0;
+    int channels = 0;
+    std::vector<std::vector<float>> pcm;
+};
+
+Decoded decode(const std::filesystem::path& path)
+{
+    Decoded d;
+    Mp3File r;
+    if (!r.openRead(path)) return d;
+    const auto info = r.getInfo();
+    d.rate = info.sampleRate;
+    d.channels = int(info.numChannels);
+    AudioBuffer<float> buf;
+    buf.resize(d.channels, int(info.numSamples));
+    d.ok = r.readSamples(buf.toView());
+    for (int ch = 0; ch < d.channels; ++ch)
+        d.pcm.emplace_back(buf.getChannel(ch), buf.getChannel(ch) + info.numSamples);
+    return d;
+}
+
+double energy(const std::vector<float>& v)
+{
+    double e = 0.0;
+    for (float s : v) e += double(s) * double(s);
+    return e;
+}
+
+// MPEG-1 granule side info (59 bits) or LSF granule side info (63 bits) for a
+// long block whose region 0 covers the lines written with Huffman table 1.
+void longGranule(Mp3TestBits& b, bool lsf, int part23, int bigValues, int gain,
+                 int scalefacCompress, int table = 1, int count1Table = 0)
+{
+    b.put(uint32_t(part23), 12); b.put(uint32_t(bigValues), 9); b.put(uint32_t(gain), 8);
+    b.put(uint32_t(scalefacCompress), lsf ? 9 : 4); b.put(0, 1);
+    b.put(uint32_t(table), 5); b.put(uint32_t(table), 5); b.put(uint32_t(table), 5);
+    b.put(15, 4); b.put(7, 3);
+    if (!lsf) b.put(0, 1);              // preflag (LSF derives it)
+    b.put(0, 1); b.put(uint32_t(count1Table), 1);
+}
+
+// Huffman table 1 pairs for `lines` (values -1, 0, 1); returns the bit count.
+int table1Pairs(Mp3TestBits& b, const std::vector<int>& lines)
+{
+    int n = 0;
+    for (size_t i = 0; i < lines.size(); i += 2)
+    {
+        const int x = lines[i], y = lines[i + 1];
+        const int ax = x < 0 ? -x : x, ay = y < 0 ? -y : y;
+        if (ax == 0 && ay == 0) { b.put(1, 1); n += 1; }
+        else if (ax == 0) { b.put(0b001, 3); n += 3; }
+        else if (ay == 0) { b.put(0b01, 2); n += 2; }
+        else { b.put(0b000, 3); n += 3; }
+        if (ax) { b.put(x < 0 ? 1u : 0u, 1); ++n; }
+        if (ay) { b.put(y < 0 ? 1u : 0u, 1); ++n; }
+    }
+    return n;
+}
+
+int table1Bits(const std::vector<int>& lines)
+{
+    Mp3TestBits scratch;
+    return table1Pairs(scratch, lines);
+}
+
+uint16_t crc16Arc(const uint8_t* data, size_t size, uint16_t crc)
+{
+    for (size_t i = 0; i < size; ++i)
+    {
+        crc = uint16_t(crc ^ data[i]);
+        for (int k = 0; k < 8; ++k) crc = uint16_t((crc & 1u) ? (crc >> 1) ^ 0xA001u : (crc >> 1));
+    }
+    return crc;
+}
+
+void encodeTone(const std::filesystem::path& path, int channels, int frames)
+{
+    Mp3File w;
+    AudioFileInfo info;
+    info.sampleRate = 44100.0;
+    info.numChannels = uint32_t(channels);
+    info.bitsPerSample = 128;
+    (void)w.openWrite(path, info);
+    AudioBuffer<float> buf;
+    buf.resize(channels, frames);
+    for (int ch = 0; ch < channels; ++ch)
+        for (int i = 0; i < frames; ++i)
+            buf.getChannel(ch)[i] = 0.4f * std::sin(0.031f * float(i) + float(ch));
+    (void)w.writeSamples(std::as_const(buf).toView());
+    w.close();
+}
+
+// Makes the next file writes of this process fail: on Windows another handle
+// locks the file's first gigabyte, elsewhere the file-size limit drops to
+// 4 KiB (with SIGXFSZ ignored, so write() reports EFBIG).
+class WriteFailure
+{
+public:
+    explicit WriteFailure(const std::filesystem::path& path)
+    {
+#if defined(_WIN32)
+        handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ != INVALID_HANDLE_VALUE)
+        {
+            OVERLAPPED region {};
+            active_ = LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                                 0, 0x40000000, 0, &region) != 0;
+        }
+#else
+        (void)path;
+        previousHandler_ = std::signal(SIGXFSZ, SIG_IGN);
+        if (getrlimit(RLIMIT_FSIZE, &previous_) == 0)
+        {
+            rlimit limited = previous_;
+            limited.rlim_cur = 4096;
+            active_ = setrlimit(RLIMIT_FSIZE, &limited) == 0;
+        }
+#endif
+    }
+
+    ~WriteFailure()
+    {
+#if defined(_WIN32)
+        if (active_)
+        {
+            OVERLAPPED region {};
+            UnlockFileEx(handle_, 0, 0x40000000, 0, &region);
+        }
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+#else
+        if (active_) setrlimit(RLIMIT_FSIZE, &previous_);
+        std::signal(SIGXFSZ, previousHandler_);
+#endif
+    }
+
+    WriteFailure(const WriteFailure&) = delete;
+    WriteFailure& operator=(const WriteFailure&) = delete;
+
+    [[nodiscard]] bool active() const noexcept { return active_; }
+
+private:
+    bool active_ = false;
+#if defined(_WIN32)
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    rlimit previous_ {};
+    void (*previousHandler_)(int) = SIG_DFL;
+#endif
+};
+
+} // namespace io_audit
+
+// Any 12-bit sync pattern with plausible header bits was decoded as a frame,
+// so tags, cover art and other binary data after the audio became bursts of
+// noise. A 300 KB binary APEv2 item measured 17 phantom frames ending in a
+// full-scale burst (peak 1.0, RMS 0.98), and a file of random bytes "opened"
+// as 27648 samples. The frame below is silent, so any phantom is visible.
+DSPARK_TEST(Mp3File_binary_data_is_not_decoded_as_frames)
+{
+    midi_test::TempDirectory temp("mp3-phantom");
+    auto silent = [](Mp3TestBits& b) {
+        for (int gr = 0; gr < 2; ++gr) io_audit::longGranule(b, false, 0, 0, 210, 0);
+    };
+    const auto frame = mp3CraftFrame(silent, [](Mp3TestBits&) {});
+    std::vector<uint8_t> bytes;
+    for (int i = 0; i < 40; ++i) bytes.insert(bytes.end(), frame.begin(), frame.end());
+    uint32_t lcg = 12345u;
+    std::vector<uint8_t> noise(1u << 18);
+    for (auto& v : noise) { lcg = lcg * 1664525u + 1013904223u; v = uint8_t(lcg >> 24); }
+    bytes.insert(bytes.end(), noise.begin(), noise.end());
+    const auto withTail = temp.file("tail.mp3");
+    EXPECT_TRUE(midi_test::writeBytes(withTail, bytes));
+
+    const auto d = io_audit::decode(withTail);
+    EXPECT_TRUE(d.ok);
+    EXPECT_EQ(d.pcm.empty() ? size_t(0) : d.pcm[0].size(), size_t(40 * 1152));
+    EXPECT_NEAR(d.pcm.empty() ? -1.0 : io_audit::energy(d.pcm[0]), 0.0, 1e-12);
+
+    const auto random = temp.file("random.mp3");
+    EXPECT_TRUE(midi_test::writeBytes(random, noise));
+    Mp3File r;
+    EXPECT_FALSE(r.openRead(random));
+}
+
+// Intensity stereo applies only ABOVE the highest band where the right
+// channel has a non-zero line. Every all-zero right band was treated as
+// intensity coded instead, so a left band below that bound was panned by a
+// position the encoder never meant (here position 0 moved it entirely into
+// the right channel: the left output measured exactly 0). FhG-encoded files
+// at 48-64 kbps matched ffmpeg and minimp3 at only 32.8 dB because of it.
+// With no left content above the bound, the intensity frame must decode
+// exactly like the same frame without intensity stereo.
+DSPARK_TEST(Mp3File_intensity_stereo_starts_above_the_right_channel_bound)
+{
+    midi_test::TempDirectory temp("mp3-intensity");
+    std::vector<int> left(24, 0), right(54, 0);
+    for (int i = 20; i < 24; ++i) left[size_t(i)] = (i & 1) ? -1 : 1;   // sfb 5 at 48 kHz
+    for (int i = 50; i < 54; ++i) right[size_t(i)] = 1;                  // sfb 10
+    const int lBits = io_audit::table1Bits(left), rBits = io_audit::table1Bits(right);
+    auto make = [&](int modeExt) {
+        return io_audit::craftFrame(3, 9, 1, 1, modeExt,      // MPEG-1 128 kbps 48 kHz joint
+            [&](Mp3TestBits& b) {
+                b.put(0, 9); b.put(0, 3); b.put(0, 4); b.put(0, 4);
+                io_audit::longGranule(b, false, lBits, 12, 180, 0);
+                io_audit::longGranule(b, false, rBits, 27, 180, 0);
+                io_audit::longGranule(b, false, 0, 0, 210, 0);
+                io_audit::longGranule(b, false, 0, 0, 210, 0);
+            },
+            [&](Mp3TestBits& b) { io_audit::table1Pairs(b, left); io_audit::table1Pairs(b, right); });
+    };
+    const auto isPath = temp.file("is.mp3"), lrPath = temp.file("lr.mp3");
+    io_audit::writeFrames(isPath, { make(1), make(1), make(1) });
+    io_audit::writeFrames(lrPath, { make(0), make(0), make(0) });
+    const auto is = io_audit::decode(isPath), lr = io_audit::decode(lrPath);
+    EXPECT_TRUE(is.ok && lr.ok && is.channels == 2 && lr.channels == 2);
+    if (!is.ok || !lr.ok || is.channels != 2 || lr.channels != 2) return;
+    EXPECT_GT(io_audit::energy(lr.pcm[0]), 1e-6);
+    double maxDiff = 0.0;
+    for (int ch = 0; ch < 2; ++ch)
+        for (size_t i = 0; i < is.pcm[size_t(ch)].size(); ++i)
+            maxDiff = std::max(maxDiff, double(std::fabs(is.pcm[size_t(ch)][i] - lr.pcm[size_t(ch)][i])));
+    EXPECT_LT(maxDiff, 1e-9);   // before the fix the left channel was silent
+}
+
+// MPEG-2 and MPEG-2.5 Layer III (ISO 13818-3 low sampling frequencies) were
+// not decoded: an LSF file was either rejected or, when MPEG-1 false syncs
+// turned up in it, "opened" as noise (22.05 kHz LAME file: SNR -13 dB, 45%
+// clipped). Three properties are pinned:
+//  1. An LSF granule decodes to exactly what the same spectral lines decode
+//     to in an MPEG-1 granule (the filterbank is shared), at 22.05 kHz and at
+//     the MPEG-2.5 8 kHz rate.
+//  2. LSF scalefactors use the ISO 13818-3 partitions: scalefactor 1 in band
+//     0 with scalefac_scale 0 halves the energy of that band.
+//  3. LSF intensity positions: position 3 scales the left channel by
+//     i0^2, i0 = 2^-1/4 (intensity_scale 0) or 2^-1/2 (intensity_scale 1),
+//     so the left/right energy ratio is 1/2 or 1/4.
+DSPARK_TEST(Mp3File_decodes_mpeg2_and_mpeg25_layer3)
+{
+    midi_test::TempDirectory temp("mp3-lsf");
+    std::vector<int> lines = { 1, 0, -1, 1, 0, 1, 1, -1 };
+    const int bits = io_audit::table1Bits(lines);
+
+    // 1. Equivalence with MPEG-1 (44.1 kHz mono, 128 kbps; granule 1 silent).
+    const auto mpeg1 = io_audit::craftFrame(3, 9, 0, 3, 0,
+        [&](Mp3TestBits& b) {
+            b.put(0, 9); b.put(0, 5); b.put(0, 4);
+            io_audit::longGranule(b, false, bits, 4, 190, 0);
+            io_audit::longGranule(b, false, 0, 0, 210, 0);
+        },
+        [&](Mp3TestBits& b) { io_audit::table1Pairs(b, lines); });
+    const auto p1 = temp.file("mpeg1.mp3");
+    io_audit::writeFrames(p1, { mpeg1 });
+    const auto ref = io_audit::decode(p1);
+    EXPECT_TRUE(ref.ok);
+    for (const auto [version, rateIndex, rate] : { std::tuple { 2, 0, 22050.0 },
+                                                   std::tuple { 0, 2, 8000.0 } })
+    {
+        auto lsfFrame = [&](bool data) {
+            return io_audit::craftFrame(version, 8, rateIndex, 3, 0,
+                [&](Mp3TestBits& b) {
+                    b.put(0, 8); b.put(0, 1);
+                    io_audit::longGranule(b, true, data ? bits : 0, data ? 4 : 0, data ? 190 : 210, 0);
+                },
+                [&](Mp3TestBits& b) { if (data) io_audit::table1Pairs(b, lines); });
+        };
+        const auto p = temp.file("lsf" + std::to_string(version) + ".mp3");
+        io_audit::writeFrames(p, { lsfFrame(true), lsfFrame(false) });
+        const auto d = io_audit::decode(p);
+        EXPECT_TRUE(d.ok);
+        if (!d.ok || !ref.ok) continue;
+        EXPECT_NEAR(d.rate, rate, 1e-9);
+        EXPECT_EQ(d.pcm[0].size(), ref.pcm[0].size());
+        double maxDiff = 0.0;
+        for (size_t i = 0; i < std::min(d.pcm[0].size(), ref.pcm[0].size()); ++i)
+            maxDiff = std::max(maxDiff, double(std::fabs(d.pcm[0][i] - ref.pcm[0][i])));
+        EXPECT_LT(maxDiff, 1e-7);
+        EXPECT_GT(io_audit::energy(d.pcm[0]), 1e-6);
+    }
+
+    // 2. LSF scalefactors: scalefac_compress 80 -> slen 1,0,0,0 (six 1-bit
+    //    scalefactors for bands 0..5). Lines 0..1 lie in band 0.
+    std::vector<int> pair = { 1, 1 };
+    const int pairBits = io_audit::table1Bits(pair);
+    auto scaled = [&](uint32_t scalefactor) {
+        return io_audit::craftFrame(2, 8, 0, 3, 0,
+            [&](Mp3TestBits& b) {
+                b.put(0, 8); b.put(0, 1);
+                io_audit::longGranule(b, true, 6 + pairBits, 1, 190, 80);
+            },
+            [&](Mp3TestBits& b) {
+                b.put(scalefactor, 1);
+                for (int i = 0; i < 5; ++i) b.put(0, 1);
+                io_audit::table1Pairs(b, pair);
+            });
+    };
+    const auto s0 = temp.file("sf0.mp3"), s1 = temp.file("sf1.mp3");
+    io_audit::writeFrames(s0, { scaled(0), scaled(0) });
+    io_audit::writeFrames(s1, { scaled(1), scaled(1) });
+    const auto d0 = io_audit::decode(s0), d1 = io_audit::decode(s1);
+    EXPECT_TRUE(d0.ok && d1.ok);
+    if (d0.ok && d1.ok)
+        EXPECT_NEAR(io_audit::energy(d1.pcm[0]) / io_audit::energy(d0.pcm[0]), 0.5, 1e-6);
+
+    // 3. LSF intensity stereo. The right channel carries no lines, so every
+    //    band is intensity coded; its scalefac_compress 258/259 selects the
+    //    intensity partition table 3 with three 3-bit fields (21 positions).
+    for (const auto [intensityScale, expected] : { std::pair { 0, 0.5 }, std::pair { 1, 0.25 } })
+    {
+        auto frame = [&](bool data) {
+            return io_audit::craftFrame(2, 8, 0, 1, 1,
+                [&](Mp3TestBits& b) {
+                    b.put(0, 8); b.put(0, 2);
+                    io_audit::longGranule(b, true, data ? bits : 0, data ? 4 : 0, 190, 0);
+                    io_audit::longGranule(b, true, 63, 0, 190, 258 + intensityScale);
+                },
+                [&](Mp3TestBits& b) {
+                    if (data) io_audit::table1Pairs(b, lines);
+                    for (int i = 0; i < 21; ++i) b.put(3, 3);
+                });
+        };
+        const auto p = temp.file("is" + std::to_string(intensityScale) + ".mp3");
+        io_audit::writeFrames(p, { frame(true), frame(false) });
+        const auto d = io_audit::decode(p);
+        EXPECT_TRUE(d.ok && d.channels == 2);
+        if (!d.ok || d.channels != 2) continue;
+        EXPECT_NEAR(io_audit::energy(d.pcm[0]) / io_audit::energy(d.pcm[1]), expected, 1e-6);
+    }
+}
+
+// A gapless tag counting fewer frames than the stream holds (concatenated or
+// re-muxed files) cut the end of the audio: two concatenated copies decoded
+// to the length of one (1,323,000 samples where ffmpeg returns 2,648,495),
+// and ffmpeg's mp3_mf output lost 72% of its frames.
+DSPARK_TEST(Mp3File_stale_gapless_frame_count_keeps_the_audio)
+{
+    midi_test::TempDirectory temp("mp3-stale-tag");
+    const auto one = temp.file("one.mp3");
+    io_audit::encodeTone(one, 1, 22050);
+    auto bytes = midi_test::readBytes(one);
+    const auto twice = bytes;
+    bytes.insert(bytes.end(), twice.begin(), twice.end());
+    const auto both = temp.file("both.mp3");
+    EXPECT_TRUE(midi_test::writeBytes(both, bytes));
+    const auto a = io_audit::decode(one), b = io_audit::decode(both);
+    EXPECT_TRUE(a.ok && b.ok);
+    if (!a.ok || !b.ok) return;
+    EXPECT_EQ(a.pcm[0].size(), size_t(22050));
+    EXPECT_GT(b.pcm[0].size(), size_t(2 * 22050));
+}
+
+// A frame whose main data begins in a bit reservoir that is not in the file (a
+// stream cut in the middle) used to be decoded from the start of whatever
+// bytes were there, every field read from the wrong position: a noise burst
+// at program level (error RMS 0.24 against the uncut decode, where ffmpeg
+// mutes). Such a frame must decode as silence.
+DSPARK_TEST(Mp3File_frame_without_its_reservoir_is_muted)
+{
+    midi_test::TempDirectory temp("mp3-reservoir");
+    auto orphan = io_audit::craftFrame(3, 5, 1, 3, 0,          // 64 kbps 48 kHz mono
+        [](Mp3TestBits& b) {
+            b.put(120, 9); b.put(0, 5); b.put(0, 4);           // main_data_begin = 120
+            io_audit::longGranule(b, false, 900, 200, 200, 15);
+            io_audit::longGranule(b, false, 900, 200, 200, 15);
+        },
+        [](Mp3TestBits& b) {
+            uint32_t lcg = 7u;
+            for (int i = 0; i < 160; ++i) { lcg = lcg * 1664525u + 1013904223u; b.put(lcg >> 24, 8); }
+        });
+    auto silent = mp3CraftFrame(
+        [](Mp3TestBits& b) { for (int gr = 0; gr < 2; ++gr) io_audit::longGranule(b, false, 0, 0, 210, 0); },
+        [](Mp3TestBits&) {});
+    const auto p = temp.file("orphan.mp3");
+    io_audit::writeFrames(p, { orphan, silent, silent, silent });
+    const auto d = io_audit::decode(p);
+    EXPECT_TRUE(d.ok);
+    EXPECT_NEAR(d.ok ? io_audit::energy(d.pcm[0]) : -1.0, 0.0, 1e-12);
+}
+
+// The decoded size follows from the frame count alone: 96-byte frames (32
+// kbps, 48 kHz, stereo) decode to 96 times their size, so a 4 MB file peaked
+// at 393 MB and the 256 MB input cap allowed about 25 GB. On a 32-bit size_t
+// (x86, WASM) nch * numSamples also wrapped, and the decoder wrote past a
+// short buffer (a 182 MB file crashed). 932,068 such frames need just over
+// kMaxDecodedPcmBytes (8 GiB) of float PCM: openRead must refuse them.
+DSPARK_TEST(Mp3File_decoded_size_is_bounded)
+{
+    midi_test::TempDirectory temp("mp3-bound");
+    std::vector<uint8_t> frame(96, 0);
+    frame[0] = 0xFF; frame[1] = 0xFB; frame[2] = 0x14; frame[3] = 0x00;
+    const auto p = temp.file("flood.mp3");
+    {
+        std::ofstream f(p, std::ios::binary | std::ios::trunc);
+        std::vector<uint8_t> chunk;
+        for (int i = 0; i < 4096; ++i) chunk.insert(chunk.end(), frame.begin(), frame.end());
+        int written = 0;
+        while (written < 932068)
+        {
+            const int n = std::min(4096, 932068 - written);
+            f.write(reinterpret_cast<const char*>(chunk.data()), std::streamsize(n * 96));
+            written += n;
+        }
+    }
+    Mp3File r;
+    EXPECT_FALSE(r.openRead(p));
+    EXPECT_FALSE(r.isOpen());
+}
+
+// readSamples() on a writer copied from the empty decode buffer (a crash),
+// and the range check startFrame + numFrames > numSamples overflowed int64:
+// readSamples(view, INT64_MAX - 5, 100) returned true, reading outside the
+// buffer (MP3) or from the RIFF header (WAV).
+DSPARK_TEST(AudioFile_readers_reject_invalid_ranges_and_writers)
+{
+    midi_test::TempDirectory temp("io-ranges");
+    AudioBuffer<float> buf;
+    buf.resize(2, 256);
+    constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+    {
+        const auto p = temp.file("w.mp3");
+        Mp3File w;
+        AudioFileInfo info;
+        info.sampleRate = 44100.0; info.numChannels = 2; info.bitsPerSample = 128;
+        info.numSamples = 1000;
+        EXPECT_TRUE(w.openWrite(p, info));
+        EXPECT_FALSE(w.readSamples(buf.toView(), 0, 100));
+        w.close();
+    }
+    {
+        const auto p = temp.file("r.mp3");
+        io_audit::encodeTone(p, 2, 4410);
+        Mp3File r;
+        EXPECT_TRUE(r.openRead(p));
+        EXPECT_FALSE(r.readSamples(buf.toView(), kMax - 5, 100));
+        EXPECT_FALSE(r.readSamples(buf.toView(), int64_t(1) << 62, kMax));
+    }
+    {
+        const auto p = temp.file("r.wav");
+        WavFile w;
+        AudioFileInfo info;
+        info.sampleRate = 48000.0; info.numChannels = 2; info.bitsPerSample = 16;
+        EXPECT_TRUE(w.openWrite(p, info));
+        EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+        w.close();
+        WavFile r;
+        EXPECT_TRUE(r.openRead(p));
+        EXPECT_FALSE(r.readSamples(buf.toView(), kMax - 5, 100));
+        EXPECT_FALSE(r.readSamples(buf.toView(), int64_t(1) << 62, kMax));
+    }
+}
+
+// Writers reported success while nothing reached the disk: Mp3File::
+// writeSamples() never checked its stream (0 of 8 failed writes reported),
+// MidiFile::write() returned true with a 0-byte file (good() was read before
+// the buffered bytes were flushed), and close() gave no way to learn that
+// the header patch failed. hasWriteError() now carries that status.
+DSPARK_TEST(AudioFile_write_failures_are_reported)
+{
+    midi_test::TempDirectory temp("io-write-failure");
+    AudioBuffer<float> buf;
+    buf.resize(2, 44100);
+    for (int i = 0; i < 44100; ++i) buf.getChannel(0)[i] = buf.getChannel(1)[i] = 0.25f;
+    AudioFileInfo info;
+    info.sampleRate = 44100.0; info.numChannels = 2;
+    {
+        const auto p = temp.file("fail.mp3");
+        Mp3File w;
+        info.bitsPerSample = 320;
+        EXPECT_TRUE(w.openWrite(p, info));
+        io_audit::WriteFailure failure(p);
+        EXPECT_TRUE(failure.active());
+        bool reported = false;
+        for (int k = 0; k < 4; ++k) reported = !w.writeSamples(std::as_const(buf).toView()) || reported;
+        w.close();
+        EXPECT_TRUE(reported);
+        EXPECT_TRUE(w.hasWriteError());
+    }
+    {
+        const auto p = temp.file("fail.wav");
+        WavFile w;
+        info.bitsPerSample = 16;
+        EXPECT_TRUE(w.openWrite(p, info));
+        io_audit::WriteFailure failure(p);
+        EXPECT_TRUE(failure.active());
+        EXPECT_FALSE(w.writeSamples(std::as_const(buf).toView()));
+        w.close();
+        EXPECT_TRUE(w.hasWriteError());
+    }
+    {
+        const auto p = temp.file("ok.wav");
+        WavFile w;
+        EXPECT_TRUE(w.openWrite(p, info));
+        EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+        w.close();
+        EXPECT_FALSE(w.hasWriteError());
+    }
+    {
+        const auto p = temp.file("fail.mid");
+        MidiFile m;
+        EXPECT_TRUE(m.create(0, 480, 1));
+        for (int i = 0; i < 2000; ++i)
+            EXPECT_TRUE(m.addChannelEvent(0, 10, 0x90, uint8_t(i % 128), 100));
+        io_audit::WriteFailure failure(p);
+        EXPECT_TRUE(failure.active());
+        EXPECT_FALSE(m.write(p));
+    }
+}
+
+// The last count1 quad of a granule must end within part2_3_length; one that
+// runs past it is discarded by ISO 11172-3 and the reference decoders. A
+// two-bit tolerance kept such a quad as a spurious coefficient (a shine file
+// matched ffmpeg and minimp3 at 77.7 dB instead of 136.7 dB). Here
+// part2_3_length is 3 bits and the only quad needs 5.
+DSPARK_TEST(Mp3File_count1_quad_past_part2_3_length_is_discarded)
+{
+    midi_test::TempDirectory temp("mp3-count1");
+    auto side = [](Mp3TestBits& b) {
+        io_audit::longGranule(b, false, 3, 0, 200, 0);
+        io_audit::longGranule(b, false, 0, 0, 210, 0);
+    };
+    const auto frame = mp3CraftFrame(side, [](Mp3TestBits& b) { b.put(0b01110, 5); });
+    const auto p = temp.file("count1.mp3");
+    io_audit::writeFrames(p, { frame, frame, frame });
+    const auto d = io_audit::decode(p);
+    EXPECT_TRUE(d.ok);
+    EXPECT_NEAR(d.ok ? io_audit::energy(d.pcm[0]) : -1.0, 0.0, 1e-12);
+}
+
+// The gapless tag CRC was accepted only as LAME computes it (over the frame
+// up to the CRC field). FFmpeg checksums 190 bytes with the field still zero;
+// when the tag lies early in the frame (mono, MPEG-2/2.5) that span includes
+// the field, so the tag of every such file was rejected and the delay and
+// padding kept (ffmpeg-made LAME mono files decoded 1152 samples too long,
+// MPEG-2 ones 1476).
+DSPARK_TEST(Mp3File_gapless_tag_with_zeroed_crc_span_is_trusted)
+{
+    midi_test::TempDirectory temp("mp3-tag-crc");
+    const auto p = temp.file("mono.mp3");
+    io_audit::encodeTone(p, 1, 22050);
+    auto bytes = midi_test::readBytes(p);
+    // Info tag of this writer: header 4 + side info 17 + Xing fields 120;
+    // the gapless tag's CRC field sits 34 bytes further, at offset 175.
+    EXPECT_TRUE(bytes.size() > 200);
+    if (bytes.size() <= 200) return;
+    bytes[175] = 0; bytes[176] = 0;
+    const uint16_t crc = io_audit::crc16Arc(bytes.data(), 190, 0);
+    bytes[175] = uint8_t(crc >> 8); bytes[176] = uint8_t(crc & 0xFF);
+    EXPECT_TRUE(midi_test::writeBytes(p, bytes));
+    const auto d = io_audit::decode(p);
+    EXPECT_TRUE(d.ok);
+    EXPECT_EQ(d.ok ? d.pcm[0].size() : size_t(0), size_t(22050));
+}
+
+// RF64/BW64 (EBU Tech 3306) files were rejected, and the writer could not go
+// past 4 GiB. A ds64 chunk now supplies the 64-bit data size on read, and
+// Rf64Mode::Always writes RF64; Auto keeps small files classic RIFF.
+DSPARK_TEST(WavFile_rf64_is_read_and_written)
+{
+    midi_test::TempDirectory temp("wav-rf64");
+    std::vector<uint8_t> bytes;
+    auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) bytes.push_back(uint8_t(v >> (8 * i))); };
+    auto u64 = [&](uint64_t v) { u32(uint32_t(v)); u32(uint32_t(v >> 32)); };
+    auto tag = [&](const char* t) { bytes.insert(bytes.end(), t, t + 4); };
+    const int16_t samples[4] = { 16384, -16384, 8192, -32768 };
+    tag("RF64"); u32(0xFFFFFFFFu); tag("WAVE");
+    tag("ds64"); u32(28); u64(0); u64(8); u64(4); u32(0);
+    tag("fmt "); u32(16); u32(0x00010001u); u32(48000); u32(96000); u32(0x00100002u);
+    tag("data"); u32(0xFFFFFFFFu);
+    for (int16_t s : samples) { bytes.push_back(uint8_t(s & 0xFF)); bytes.push_back(uint8_t((s >> 8) & 0xFF)); }
+    const auto crafted = temp.file("crafted.wav");
+    EXPECT_TRUE(midi_test::writeBytes(crafted, bytes));
+    {
+        WavFile r;
+        EXPECT_TRUE(r.openRead(crafted));
+        EXPECT_EQ(r.getInfo().numSamples, int64_t(4));
+        AudioBuffer<float> buf;
+        buf.resize(1, 4);
+        EXPECT_TRUE(r.readSamples(buf.toView()));
+        EXPECT_NEAR(buf.getChannel(0)[0], 0.5f, 0.0f);
+        EXPECT_NEAR(buf.getChannel(0)[3], -1.0f, 0.0f);
+    }
+    for (const auto mode : { WavFile::Rf64Mode::Always, WavFile::Rf64Mode::Auto })
+    {
+        const auto p = temp.file(mode == WavFile::Rf64Mode::Always ? "always.wav" : "auto.wav");
+        WavFile w;
+        w.setRf64Mode(mode);
+        AudioFileInfo info;
+        info.sampleRate = 48000.0; info.numChannels = 1; info.bitsPerSample = 24;
+        EXPECT_TRUE(w.openWrite(p, info));
+        AudioBuffer<float> buf;
+        buf.resize(1, 101);
+        for (int i = 0; i < 101; ++i) buf.getChannel(0)[i] = float(i - 50) / 64.0f;
+        EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+        w.close();
+        const auto out = midi_test::readBytes(p);
+        EXPECT_TRUE(out.size() > 12);
+        if (out.size() <= 12) continue;
+        EXPECT_EQ(std::memcmp(out.data(), mode == WavFile::Rf64Mode::Always ? "RF64" : "RIFF", 4), 0);
+        WavFile r;
+        EXPECT_TRUE(r.openRead(p));
+        EXPECT_EQ(r.getInfo().numSamples, int64_t(101));
+        AudioBuffer<float> back;
+        back.resize(1, 101);
+        EXPECT_TRUE(r.readSamples(back.toView()));
+        for (int i = 0; i < 101; ++i) EXPECT_NEAR(back.getChannel(0)[i], buf.getChannel(0)[i], 1e-6f);
+    }
+}
+
+// RIFF chunks are word-aligned, but the writer ended an odd-sized data chunk
+// (8-bit or 24-bit mono with an odd frame count) without its pad byte: three
+// 8-bit frames made a 47-byte file whose RIFF size was odd.
+DSPARK_TEST(WavFile_odd_data_chunk_gets_its_pad_byte)
+{
+    midi_test::TempDirectory temp("wav-pad");
+    const auto p = temp.file("odd.wav");
+    WavFile w;
+    AudioFileInfo info;
+    info.sampleRate = 48000.0; info.numChannels = 1; info.bitsPerSample = 8;
+    EXPECT_TRUE(w.openWrite(p, info));
+    AudioBuffer<float> buf;
+    buf.resize(1, 3);
+    EXPECT_TRUE(w.writeSamples(std::as_const(buf).toView()));
+    w.close();
+    const auto bytes = midi_test::readBytes(p);
+    EXPECT_EQ(bytes.size(), size_t(48));
+    if (bytes.size() < 8) return;
+    const uint32_t riffSize = uint32_t(bytes[4]) | (uint32_t(bytes[5]) << 8)
+                            | (uint32_t(bytes[6]) << 16) | (uint32_t(bytes[7]) << 24);
+    EXPECT_EQ(riffSize, 40u);
+    WavFile r;
+    EXPECT_TRUE(r.openRead(p));
+    EXPECT_EQ(r.getInfo().numSamples, int64_t(3));
+}
+
+// RFC 9639 B.1: before 2007 a variable-block stream was marked only by
+// STREAMINFO min != max, with the strategy bit 0 and sample numbers coded;
+// such frames were rejected (IETF vector subset/27 was the only one of 62 not
+// decoded). A modern fixed stream whose STREAMINFO lists unequal bounds is
+// legal too and was rejected as well. Both are built here from the
+// declarative variable fixture (blocks of 16 and 17 samples) and must decode
+// to its reference PCM.
+DSPARK_TEST(FlacFile_legacy_variable_and_unequal_bound_fixed_streams_decode)
+{
+    const auto original = midi_test::readBytes(flac_test::root() / "decl-variable-uncommon-rate.flac");
+    EXPECT_TRUE(original.size() > 44);
+    if (original.size() <= 44) return;
+    // Frames start after "fLaC" + one 34-byte STREAMINFO block: offset 42.
+    std::vector<size_t> starts { 42 };
+    for (size_t e = 44; e + 2 <= original.size() && starts.size() < 2; ++e)
+    {
+        const uint16_t stored = uint16_t((original[e] << 8) | original[e + 1]);
+        if (flac_test::crc16(std::span<const uint8_t>(original.data() + 42, e - 42)) == stored
+            && e + 2 < original.size() && original[e + 2] == 0xFF)
+            starts.push_back(e + 2);
+    }
+    EXPECT_EQ(starts.size(), size_t(2));
+    if (starts.size() != 2) return;
+    const std::vector<size_t> ends { starts[1], original.size() };
+
+    FlacFile reference;
+    EXPECT_TRUE(reference.openRead(flac_test::root() / "decl-variable-uncommon-rate.flac"));
+    AudioBuffer<float> expected;
+    expected.resize(1, int(reference.getInfo().numSamples));
+    EXPECT_TRUE(reference.readSamples(expected.toView()));
+
+    // codedSecond: the coded number of frame 1 (16 = sample number, 1 = frame number)
+    for (const uint8_t codedSecond : { uint8_t(16), uint8_t(1) })
+    {
+        auto bytes = original;
+        for (size_t f = 0; f < 2; ++f)
+        {
+            const size_t s = starts[f];
+            bytes[s + 1] = 0xF8;                                   // strategy bit 0
+            if (f == 1) bytes[s + 4] = codedSecond;
+            // Header: sync and codes (4 bytes), a one-byte coded number, the
+            // optional block size and sample rate fields, then the CRC-8.
+            size_t crcPos = s + 5;
+            const uint8_t blockCode = uint8_t(bytes[s + 2] >> 4), rateCode = uint8_t(bytes[s + 2] & 15);
+            if (blockCode == 6) crcPos += 1; else if (blockCode == 7) crcPos += 2;
+            if (rateCode == 12) crcPos += 1; else if (rateCode == 13 || rateCode == 14) crcPos += 2;
+            bytes[crcPos] = flac_test::crc8(std::span<const uint8_t>(bytes.data() + s, crcPos - s));
+            const uint16_t crc = flac_test::crc16(std::span<const uint8_t>(bytes.data() + s, ends[f] - 2 - s));
+            bytes[ends[f] - 2] = uint8_t(crc >> 8);
+            bytes[ends[f] - 1] = uint8_t(crc & 0xFF);
+        }
+        midi_test::TempDirectory temp("flac-legacy-" + std::to_string(codedSecond));
+        const auto p = temp.file("legacy.flac");
+        EXPECT_TRUE(midi_test::writeBytes(p, bytes));
+        FlacFile file;
+        EXPECT_TRUE(file.openRead(p));
+        EXPECT_EQ(file.getInfo().numSamples, reference.getInfo().numSamples);
+        AudioBuffer<float> got;
+        got.resize(1, int(std::max<int64_t>(1, file.getInfo().numSamples)));
+        if (!file.isOpen()) continue;
+        EXPECT_TRUE(file.readSamples(got.toView()));
+        for (int i = 0; i < int(reference.getInfo().numSamples); ++i)
+            EXPECT_NEAR(got.getChannel(0)[i], expected.getChannel(0)[i], 0.0f);
+    }
+}

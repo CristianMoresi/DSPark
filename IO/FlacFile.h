@@ -26,8 +26,10 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -179,14 +181,16 @@ public:
             const size_t count = static_cast<size_t>(overlapEnd - overlapBegin);
             const size_t destinationOffset = static_cast<size_t>(overlapBegin - first);
 
+            // A power-of-two scale is exact, so this matches ldexp() bit
+            // for bit; restored samples always fit int32.
+            const float scale = std::ldexp(1.0f, 1 - static_cast<int>(stream_.bitsPerSample));
             for (int channel = 0; channel < channelsToCopy; ++channel)
             {
                 float* output = dest.getChannel(channel) + destinationOffset;
                 const int64_t* source = pcm.data()
                     + static_cast<size_t>(channel) * it->blockSize + sourceOffset;
                 for (size_t i = 0; i < count; ++i)
-                    output[i] = std::ldexp(static_cast<float>(source[i]),
-                                           1 - static_cast<int>(stream_.bitsPerSample));
+                    output[i] = static_cast<float>(static_cast<int32_t>(source[i])) * scale;
             }
             written += static_cast<int64_t>(count);
             ++it;
@@ -245,7 +249,9 @@ private:
     {
         size_t endOffset = 0;
         uint32_t blockSize = 0;
-        bool variableBlock = false;
+        bool variableBlock = false;       ///< Blocking strategy bit.
+        bool numberIsSample = false;      ///< Coded number matched the first sample.
+        bool numberIsFrame = false;       ///< Coded number matched the frame index.
     };
 
     struct OpenState
@@ -334,11 +340,24 @@ private:
             value = 0;
             if (count > 64 || static_cast<uint64_t>(count) > remainingBits())
                 return false;
+            if (count == 0)
+                return true;
+            const size_t byte = bitPos_ >> 3;
+            const unsigned offset = static_cast<unsigned>(bitPos_ & 7u);
+            // One 64-bit big-endian load serves any field that fits in it;
+            // the bit-at-a-time loop remains for the last bytes of the buffer
+            // and for 58..64-bit fields that straddle nine bytes.
+            if (count + offset <= 64 && byte + 8 <= bytes_.size())
+            {
+                value = (loadBigEndian64(bytes_.data() + byte) << offset) >> (64u - count);
+                bitPos_ += count;
+                return true;
+            }
             for (unsigned i = 0; i < count; ++i)
             {
-                const uint8_t byte = bytes_[bitPos_ / 8];
+                const uint8_t b = bytes_[bitPos_ / 8];
                 const unsigned shift = 7u - static_cast<unsigned>(bitPos_ & 7u);
-                value = (value << 1) | ((byte >> shift) & 1u);
+                value = (value << 1) | ((b >> shift) & 1u);
                 ++bitPos_;
             }
             return true;
@@ -370,6 +389,30 @@ private:
             zeros = 0;
             for (;;)
             {
+                // Count leading zeros 56 bits at a time while a whole word
+                // is available inside both the buffer and the read bound.
+                const size_t byte = bitPos_ >> 3;
+                if (byte + 8 <= bytes_.size() && endBit_ - bitPos_ >= 64)
+                {
+                    const unsigned offset = static_cast<unsigned>(bitPos_ & 7u);
+                    const uint64_t window = (loadBigEndian64(bytes_.data() + byte) << offset)
+                                          & ~uint64_t { 0xff };
+                    if (window != 0)
+                    {
+                        const unsigned run = static_cast<unsigned>(std::countl_zero(window));
+                        if (zeros + run > limit) return false;
+                        zeros += run;
+                        bitPos_ += run + 1u;
+                        return true;
+                    }
+                    const unsigned run = 56u - offset;
+                    if (zeros + run <= limit)
+                    {
+                        zeros += run;
+                        bitPos_ += run;
+                        continue;
+                    }
+                }
                 uint64_t bit = 0;
                 if (!readBits(1, bit)) return false;
                 if (bit != 0) return true;
@@ -392,6 +435,21 @@ private:
         const std::vector<uint8_t>& bytes_;
         size_t bitPos_ = 0;
         size_t endBit_ = 0;
+
+        static uint64_t loadBigEndian64(const uint8_t* p) noexcept
+        {
+            uint64_t word = 0;
+            std::memcpy(&word, p, sizeof(word));
+            if constexpr (std::endian::native == std::endian::little)
+            {
+#if defined(_MSC_VER) && !defined(__clang__)
+                word = _byteswap_uint64(word);
+#else
+                word = __builtin_bswap64(word);
+#endif
+            }
+            return word;
+        }
     };
 
     class Md5
@@ -531,15 +589,25 @@ private:
 
     static uint16_t crc16(std::span<const uint8_t> data) noexcept
     {
+        // Byte-wise table of the same polynomial (x^16 + x^15 + x^2 + 1, MSB
+        // first, initial value 0): the frame CRC covers every byte of the
+        // file, and the bitwise form spent eight iterations on each.
+        static constexpr auto kTable = [] {
+            std::array<uint16_t, 256> table {};
+            for (unsigned i = 0; i < 256; ++i)
+            {
+                uint16_t crc = static_cast<uint16_t>(i << 8);
+                for (unsigned bit = 0; bit < 8; ++bit)
+                    crc = static_cast<uint16_t>((crc & 0x8000u) != 0
+                        ? static_cast<uint16_t>((crc << 1) ^ 0x8005u)
+                        : static_cast<uint16_t>(crc << 1));
+                table[i] = crc;
+            }
+            return table;
+        }();
         uint16_t crc = 0;
         for (uint8_t byte : data)
-        {
-            crc ^= static_cast<uint16_t>(byte) << 8;
-            for (unsigned bit = 0; bit < 8; ++bit)
-                crc = static_cast<uint16_t>((crc & 0x8000u) != 0
-                    ? static_cast<uint16_t>((crc << 1) ^ 0x8005u)
-                    : static_cast<uint16_t>(crc << 1));
-        }
+            crc = static_cast<uint16_t>((crc << 8) ^ kTable[(crc >> 8) ^ byte]);
         return crc;
     }
 
@@ -832,18 +900,17 @@ private:
                 { 0, 0, 0, 0 }, { 1, 0, 0, 0 }, { 2, -1, 0, 0 },
                 { 3, -3, 1, 0 }, { 4, -6, 4, -1 }
             };
+            // Every earlier sample is within `depth` <= 33 bits (checked as
+            // it is produced) and the coefficients are at most 6 in magnitude,
+            // so the prediction stays below 2^37 and the residual below 2^31:
+            // plain int64 arithmetic cannot overflow here.
             for (size_t i = predictorOrder; i < output.size(); ++i)
             {
                 int64_t prediction = 0;
                 for (unsigned j = 0; j < predictorOrder; ++j)
-                {
-                    int64_t product = 0;
-                    if (!checkedMultiply(output[i - j - 1], coefficients[predictorOrder][j], product)
-                        || !checkedAdd(prediction, product, prediction))
-                        return false;
-                }
-                if (!checkedAdd(prediction, output[i], output[i])
-                    || !sampleInDepth(output[i], depth))
+                    prediction += output[i - j - 1] * coefficients[predictorOrder][j];
+                output[i] += prediction;
+                if (!sampleInDepth(output[i], depth))
                     return false;
             }
         }
@@ -864,20 +931,18 @@ private:
                 if (!bits.readSigned(precision, coefficients[i])) return false;
             if (!decodeResidual(bits, blockSize, predictorOrder, output))
                 return false;
+            // |coefficient| < 2^14, every earlier sample is within `depth`
+            // <= 33 bits (checked as it is produced) and the order is at most
+            // 32, so the sum stays below 2^52 and cannot overflow int64. An
+            // arithmetic right shift is the floor division RFC 9639 asks for
+            // (C++20 defines >> on negative values as arithmetic).
             for (size_t i = predictorOrder; i < output.size(); ++i)
             {
                 int64_t sum = 0;
                 for (unsigned j = 0; j < predictorOrder; ++j)
-                {
-                    int64_t product = 0;
-                    if (!checkedMultiply(coefficients[j], output[i - j - 1], product)
-                        || !checkedAdd(sum, product, sum))
-                        return false;
-                }
-                int64_t prediction = 0;
-                if (!floorDividePowerOfTwo(sum, static_cast<unsigned>(shift), prediction)
-                    || !checkedAdd(prediction, output[i], output[i])
-                    || !sampleInDepth(output[i], depth))
+                    sum += coefficients[j] * output[i - j - 1];
+                output[i] += sum >> static_cast<unsigned>(shift);
+                if (!sampleInDepth(output[i], depth))
                     return false;
             }
         }
@@ -962,9 +1027,16 @@ private:
             || first != 0xff || (second & 0xfeu) != 0xf8u
             || (fourth & 1u) != 0)
             return false;
+        // The strategy bit chooses what the coded number counts. RFC 9639
+        // B.1: before the bit existed (2007) a variable stream was marked
+        // only by STREAMINFO min != max, with the bit at 0 and sample
+        // numbers coded, so such a frame may carry either kind; a modern
+        // fixed stream whose STREAMINFO lists unequal bounds is also legal.
+        // (Encoders also write the bit with min == max; reference decoders
+        // accept that, and so does this one.)
         const bool variable = (second & 1u) != 0;
-        if (variable == (stream.minBlockSize == stream.maxBlockSize))
-            return false;
+        const bool legacyCandidate = !variable
+            && stream.minBlockSize != stream.maxBlockSize;
         const uint8_t blockCode = third >> 4;
         const uint8_t rateCode = third & 0x0fu;
         const uint8_t channelCode = fourth >> 4;
@@ -979,10 +1051,12 @@ private:
             return false;
 
         uint64_t codedNumber = 0;
-        if (!parseCodedNumber(cursor, variable, codedNumber))
+        if (!parseCodedNumber(cursor, variable || legacyCandidate, codedNumber))
             return false;
-        if ((variable && codedNumber != expectedFirstSample)
-            || (!variable && codedNumber != expectedFrameNumber))
+        decoded.numberIsSample = (variable || legacyCandidate)
+            && codedNumber == expectedFirstSample;
+        decoded.numberIsFrame = !variable && codedNumber == expectedFrameNumber;
+        if (!decoded.numberIsSample && !decoded.numberIsFrame)
             return false;
 
         uint32_t blockSize = 0, sampleRate = 0;
@@ -1037,30 +1111,27 @@ private:
 
     static bool updateMd5(Md5& md5, const std::vector<int64_t>& pcm,
                           uint8_t channels, uint8_t bitsPerSample,
-                          uint32_t blockSize) noexcept
+                          uint32_t blockSize, std::vector<uint8_t>& scratch)
     {
+        // Interleaved little-endian samples of ceil(depth / 8) bytes (RFC
+        // 9639 8.2), built for the whole block and hashed in one call.
         const unsigned bytesPerSample = (bitsPerSample + 7u) / 8u;
-        uint8_t encoded[4] = {};
-        for (uint32_t sample = 0; sample < blockSize; ++sample)
+        if (bytesPerSample < 1 || bytesPerSample > 4)
+            return false;
+        const size_t stride = static_cast<size_t>(channels) * bytesPerSample;
+        scratch.resize(static_cast<size_t>(blockSize) * stride);
+        for (uint8_t channel = 0; channel < channels; ++channel)
         {
-            for (uint8_t channel = 0; channel < channels; ++channel)
+            const int64_t* source = pcm.data() + static_cast<size_t>(channel) * blockSize;
+            uint8_t* out = scratch.data() + static_cast<size_t>(channel) * bytesPerSample;
+            for (uint32_t sample = 0; sample < blockSize; ++sample, out += stride)
             {
-                const int64_t value = pcm[static_cast<size_t>(channel) * blockSize + sample];
-                const uint64_t representation = static_cast<uint64_t>(value);
-                encoded[0] = static_cast<uint8_t>(representation);
-                encoded[1] = static_cast<uint8_t>(representation >> 8);
-                encoded[2] = static_cast<uint8_t>(representation >> 16);
-                encoded[3] = static_cast<uint8_t>(representation >> 24);
-                switch (bytesPerSample)
-                {
-                    case 1: md5.update(std::span<const uint8_t>(encoded, 1)); break;
-                    case 2: md5.update(std::span<const uint8_t>(encoded, 2)); break;
-                    case 3: md5.update(std::span<const uint8_t>(encoded, 3)); break;
-                    case 4: md5.update(std::span<const uint8_t>(encoded, 4)); break;
-                    default: return false;
-                }
+                const auto value = static_cast<uint32_t>(static_cast<uint64_t>(source[sample]));
+                for (unsigned k = 0; k < bytesPerSample; ++k)
+                    out[k] = static_cast<uint8_t>(value >> (8 * k));
             }
         }
+        md5.update(std::span<const uint8_t>(scratch.data(), scratch.size()));
         return true;
     }
 
@@ -1109,19 +1180,20 @@ private:
             return false;
 
         Md5 md5;
+        // A zero digest means "not computed": there is nothing to compare,
+        // so the work is skipped (it dominated the open time of large files).
+        const bool checkMd5 = !allZero(state.stream.md5);
+        std::vector<uint8_t> md5Scratch;
         uint64_t coverage = 0;
         bool haveStrategy = false;
         bool strategy = false;
+        int numbering = 0;          // 0 undecided, 1 frame numbers, 2 sample numbers
+        uint32_t firstBlockSize = 0;
         uint32_t previousBlockSize = 0;
         std::vector<int64_t> pcm;
         while (cursor.remaining() > 0)
         {
             if (state.frames.size() >= kMaxFrames)
-                return false;
-            if (haveStrategy && previousBlockSize < state.stream.minBlockSize)
-                return false;
-            if (haveStrategy && !strategy
-                && previousBlockSize != state.stream.minBlockSize)
                 return false;
 
             DecodedFrame decoded;
@@ -1133,6 +1205,28 @@ private:
                 return false;
             if (haveStrategy && decoded.variableBlock != strategy)
                 return false;
+            // The first frame numbers both ways (0); the first frame that
+            // tells them apart fixes the numbering for the whole stream.
+            const int frameNumbering = decoded.numberIsFrame == decoded.numberIsSample
+                ? 0 : (decoded.numberIsFrame ? 1 : 2);
+            if (frameNumbering != 0)
+            {
+                if (numbering != 0 && numbering != frameNumbering)
+                    return false;
+                numbering = frameNumbering;
+            }
+            // Rules for every frame but the last, checked now that a later
+            // frame exists: at least the STREAMINFO minimum, and in a
+            // frame-numbered (fixed) stream the size of the first frame.
+            if (haveStrategy)
+            {
+                if (previousBlockSize < state.stream.minBlockSize)
+                    return false;
+                if (numbering == 1 && previousBlockSize != firstBlockSize)
+                    return false;
+            }
+            if (!haveStrategy)
+                firstBlockSize = decoded.blockSize;
             haveStrategy = true;
             strategy = decoded.variableBlock;
             previousBlockSize = decoded.blockSize;
@@ -1150,8 +1244,9 @@ private:
             if (coverage > kMaxDecodedPcmBytes
                 / (static_cast<uint64_t>(state.stream.channels) * bytesPerSample))
                 return false;
-            if (!updateMd5(md5, pcm, state.stream.channels,
-                           state.stream.bitsPerSample, decoded.blockSize))
+            if (checkMd5 && !updateMd5(md5, pcm, state.stream.channels,
+                                       state.stream.bitsPerSample, decoded.blockSize,
+                                       md5Scratch))
                 return false;
             state.frames.push_back({ frameOffset, frameSize, firstSample,
                                      decoded.blockSize });
@@ -1163,8 +1258,7 @@ private:
             || (state.stream.declaredSamples != 0
                 && state.stream.declaredSamples != coverage))
             return false;
-        const std::array<uint8_t, 16> digest = md5.finish();
-        if (!allZero(state.stream.md5) && digest != state.stream.md5)
+        if (checkMd5 && md5.finish() != state.stream.md5)
             return false;
 
         state.info.sampleRate = static_cast<double>(state.stream.sampleRate);

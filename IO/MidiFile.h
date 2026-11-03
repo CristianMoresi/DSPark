@@ -255,7 +255,8 @@ public:
      * @brief Writes a validated format 0 or 1 document.
      *
      * A missing EOT is emitted with delta zero without changing tracks(). The
-     * complete output is built before the destination is opened.
+     * complete output is built before the destination is opened, and false is
+     * returned when writing, flushing or closing the destination fails.
      */
     [[nodiscard]] bool write(const std::filesystem::path& path) const
     {
@@ -334,7 +335,14 @@ public:
             return false;
         destination.write(reinterpret_cast<const char*>(output.data()),
                           static_cast<std::streamsize>(output.size()));
-        return destination.good();
+        // The stream buffers: a short file is only written by the flush in
+        // close(), so good() right after write() reported success even when
+        // nothing reached the disk.
+        destination.flush();
+        if (!destination.good())
+            return false;
+        destination.close();
+        return !destination.fail();
     }
 
     /** @brief Returns 0, 1, or 2; returns -1 for an empty object. */

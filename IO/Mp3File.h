@@ -5,21 +5,31 @@
 
 /**
  * @file Mp3File.h
- * @brief Pure C++20 MPEG-1 Layer III (MP3) codec - decoder and encoder.
+ * @brief Pure C++20 MPEG Layer III (MP3) codec - decoder and encoder.
  *
  * Full MP3 codec supporting both reading and writing:
  *
- * **Decoder**: Decodes MPEG-1 Layer III to normalised float [-1, 1].
- * - Sample rates: 32000, 44100, 48000 Hz
+ * **Decoder**: Decodes Layer III to normalised float [-1, 1].
+ * - MPEG-1 (32000, 44100, 48000 Hz), MPEG-2 LSF (16000, 22050, 24000 Hz,
+ *   ISO 13818-3) and MPEG-2.5 (8000, 11025, 12000 Hz)
  * - Mono and stereo (including joint stereo with M/S and intensity)
  * - CBR and VBR, ID3v2 tag skipping
+ * - A frame is accepted only when the next frame header confirms it, when it
+ *   continues the chain of accepted frames, or when it ends exactly at the end
+ *   of the file. Tags, cover art and unrelated data between or after frames
+ *   are skipped instead of being decoded as audio, and a file that holds no
+ *   such chain is rejected.
+ * - A granule whose bit reservoir is missing (a stream cut in the middle) is
+ *   decoded as silence rather than from the wrong bit position.
  * - Gapless: a Xing/Info (or VBRI) tag frame is skipped rather than decoded
- *   as 1152 samples of silence, and when it carries a gapless tag whose
- *   CRC checks out, the encoder delay plus the 529-sample
- *   decoder delay is trimmed from the start and the padding from the end, so
- *   the output lines up with the encoder's input sample for sample
+ *   as silence, and when it carries a gapless tag whose CRC checks out, the
+ *   encoder delay plus the 529-sample decoder delay is trimmed from the start
+ *   and the padding from the end, so the output lines up with the encoder's
+ *   input sample for sample. A tag whose frame count is smaller than the
+ *   stream (concatenated or re-muxed files) only trims the start.
  * - getInfo() reports the delivery format (32-bit float); MP3 itself has
  *   no PCM bit depth
+ * - Layer I/II and free-format bitrates are not decoded.
  *
  * **Encoder**: Encodes float audio to MPEG-1 Layer III CBR.
  * - Bitrates: 32-320 kbps (CBR); AudioFileInfo::bitsPerSample carries the
@@ -35,9 +45,9 @@
  *
  * @warning DECODE-ALL ARCHITECTURE: Because MP3 uses a backward-referencing
  * Bit Reservoir, random-access streaming is non-trivial. openRead() decodes
- * the ENTIRE FILE into RAM (input capped at 256 MB). This operation takes
- * time and blocks the thread. NEVER call openRead() from the real-time
- * audio thread.
+ * the ENTIRE FILE into RAM (input capped at kMaxInputBytes, decoded PCM at
+ * kMaxDecodedPcmBytes). This operation takes time and blocks the thread.
+ * NEVER call openRead() from the real-time audio thread.
  *
  * Threading: owner-managed. One instance serves one file from one thread at
  * a time; no internal synchronization (see AudioFile.h).
@@ -53,6 +63,8 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
+#include <new>
 #include <vector>
 #include <filesystem>
 
@@ -65,6 +77,11 @@ namespace dspark {
 class Mp3File : public AudioFile
 {
 public:
+    /** @brief Largest input file openRead() accepts. */
+    static constexpr uint64_t kMaxInputBytes = 256ull * 1024 * 1024;
+    /** @brief Largest decoded float PCM openRead() allocates (all channels). */
+    static constexpr uint64_t kMaxDecodedPcmBytes = 8ull << 30;
+
     ~Mp3File() override { close(); }
 
     // -- AudioFile interface ---------------------------------------------------
@@ -72,15 +89,14 @@ public:
     [[nodiscard]] bool openRead(const std::filesystem::path& path) override
     {
         close();
+        writeError_ = false;
 
         std::ifstream in(path, std::ios::binary | std::ios::ate);
         if (!in.is_open()) return false;
 
-        auto fileSize = static_cast<size_t>(in.tellg());
-        if (fileSize < 10) return false;
-
-        constexpr size_t kMaxMp3FileSize = 256 * 1024 * 1024;  // 256 MB bounds check
-        if (fileSize > kMaxMp3FileSize) return false;
+        const std::streamoff end = static_cast<std::streamoff>(in.tellg());
+        if (end < 10 || static_cast<uint64_t>(end) > kMaxInputBytes) return false;
+        const auto fileSize = static_cast<size_t>(end);
         in.seekg(0, std::ios::beg);
 
         fileData_.resize(fileSize);
@@ -98,6 +114,7 @@ public:
         if (!scanFrames())
         {
             fileData_.clear();
+            info_ = {};
             return false;
         }
 
@@ -105,6 +122,7 @@ public:
         {
             fileData_.clear();
             decodedSamplesFlat_.clear();
+            info_ = {};
             return false;
         }
         applyGaplessTrim();
@@ -117,6 +135,7 @@ public:
     [[nodiscard]] bool openWrite(const std::filesystem::path& path, const AudioFileInfo& info) override
     {
         close();
+        writeError_ = false;
         outFile_.open(path, std::ios::binary | std::ios::trunc);
         if (!outFile_.is_open()) return false;
 
@@ -124,7 +143,7 @@ public:
         if (info_.numChannels < 1) info_.numChannels = 1;
         if (info_.numChannels > 2) info_.numChannels = 2;
 
-        encBitrate_ = info_.bitsPerSample;
+        encBitrate_ = static_cast<int>(info_.bitsPerSample);
         if (encBitrate_ < 32) encBitrate_ = 128;
 
         static constexpr int validBr[] = {32,40,48,56,64,80,96,112,128,160,192,224,256,320};
@@ -154,6 +173,13 @@ public:
         encChooseTagFrame();
         const std::vector<char> placeholder(static_cast<size_t>(encTagFrameSize_), 0);
         outFile_.write(placeholder.data(), static_cast<std::streamsize>(placeholder.size()));
+        if (!outFile_.good())
+        {
+            writeError_ = true;
+            outFile_.close();
+            info_ = {};
+            return false;
+        }
 
         isWriting_ = true;
         isOpen_ = true;
@@ -170,18 +196,25 @@ public:
     [[nodiscard]] bool readSamples(AudioBufferView<float> dest,
                                    int64_t startFrame, int64_t numFrames) override
     {
-        if (!isOpen_) return false;
+        // A writer holds no decoded PCM: reading it used to copy from an
+        // empty buffer.
+        if (!isOpen_ || isWriting_) return false;
         if (startFrame < 0 || numFrames <= 0) return false;
-        if (startFrame + numFrames > info_.numSamples) return false;
+        // Subtraction form: startFrame + numFrames can overflow int64.
+        if (startFrame > info_.numSamples || numFrames > info_.numSamples - startFrame)
+            return false;
 
         const int nCh = std::min(dest.getNumChannels(), static_cast<int>(info_.numChannels));
         const int64_t toCopy = std::min(numFrames, static_cast<int64_t>(dest.getNumSamples()));
+        if (toCopy <= 0) return true;
         const size_t bytesToCopy = static_cast<size_t>(toCopy) * sizeof(float);
 
         for (int ch = 0; ch < nCh; ++ch)
         {
             float* dst = dest.getChannel(ch);
-            const float* src = decodedSamplesFlat_.data() + static_cast<size_t>(ch * info_.numSamples + startFrame);
+            const float* src = decodedSamplesFlat_.data()
+                             + static_cast<size_t>(ch) * static_cast<size_t>(info_.numSamples)
+                             + static_cast<size_t>(startFrame);
             std::memcpy(dst, src, bytesToCopy);
         }
 
@@ -214,6 +247,14 @@ public:
                 encInputPos_ = 0;
             }
         }
+        // The frames go through a buffered stream: a failed write sets its
+        // failbit, which used to be ignored, so a full disk still reported
+        // success.
+        if (!outFile_.good())
+        {
+            writeError_ = true;
+            return false;
+        }
         return true;
     }
 
@@ -236,7 +277,10 @@ public:
                 encInputPos_ = 0;
             }
             encWriteTagFrame();
+            outFile_.flush();
+            if (!outFile_.good()) writeError_ = true;
             outFile_.close();
+            if (outFile_.fail()) writeError_ = true;
         }
         isWriting_ = false;
 
@@ -250,15 +294,23 @@ public:
 
     [[nodiscard]] bool isOpen() const noexcept override { return isOpen_; }
 
+    /**
+     * @brief True when a write, the codec flush or the Info tag patch of the
+     *        current or most recent writer failed.
+     *
+     * Remains readable after close() until the next open call.
+     */
+    [[nodiscard]] bool hasWriteError() const noexcept override { return writeError_; }
+
 private:
     // ========================================================================
     // Constants
     // ========================================================================
 
-    static constexpr int kGranules     = 2;
+    static constexpr int kGranules     = 2;     // MPEG-1 granules per frame
     static constexpr int kChannelsMax  = 2;
     static constexpr int kSamplesPerGranule = 576;
-    static constexpr int kSamplesPerFrame   = 1152; // MPEG-1 Layer III
+    static constexpr int kSamplesPerFrame   = 1152; // MPEG-1 Layer III (encoder)
     static constexpr int kSubbands     = 32;
     static constexpr int kSynthSlots   = 16;
     static constexpr int kMaxReservoir = 8192; // Bit reservoir maximum bytes
@@ -275,7 +327,7 @@ private:
 
     struct FrameHeader
     {
-        int version     = 0;
+        int version     = 0;     // 3 = MPEG-1, 2 = MPEG-2, 0 = MPEG-2.5
         int layer       = 0;
         bool crcProtect = false;
         int bitrateIdx  = 0;
@@ -291,6 +343,10 @@ private:
         int channels    = 0;
         int frameSize   = 0;
         int sideInfoSize = 0;
+        bool lsf        = false; // MPEG-2 / MPEG-2.5 low sampling frequency syntax
+        int granules    = 2;
+        int samplesPerFrame = 1152;
+        int bandIndex   = 0;     // row of kBandTables
     };
 
     struct GranuleChannel
@@ -330,37 +386,43 @@ private:
         void init(const uint8_t* data, size_t sizeBytes)
         {
             data_ = data;
+            bytes_ = sizeBytes;
             size_ = sizeBytes * 8;
             pos_  = 0;
         }
 
+        /// Returns the next n bits (1..24) without consuming them. Bits past
+        /// the end of the buffer read as zero.
+        [[nodiscard]] uint32_t peekBits(int n) const noexcept
+        {
+            const size_t byte = pos_ >> 3;
+            uint32_t w = 0;
+            if (byte + 4 <= bytes_)
+            {
+                w = (static_cast<uint32_t>(data_[byte]) << 24)
+                  | (static_cast<uint32_t>(data_[byte + 1]) << 16)
+                  | (static_cast<uint32_t>(data_[byte + 2]) << 8)
+                  |  static_cast<uint32_t>(data_[byte + 3]);
+            }
+            else
+            {
+                for (size_t i = 0; i < 4; ++i)
+                    w = (w << 8) | ((byte + i < bytes_) ? data_[byte + i] : 0u);
+            }
+            return (w << static_cast<unsigned>(pos_ & 7)) >> (32 - n);
+        }
+
+        void skip(int n) noexcept { pos_ += static_cast<size_t>(n); }
+
         uint32_t readBits(int n)
         {
             if (n == 0) return 0;
-            uint32_t val = 0;
-            for (int i = 0; i < n; ++i)
-            {
-                val <<= 1;
-                if (pos_ < size_)
-                {
-                    size_t byteIdx = pos_ >> 3;
-                    int    bitIdx  = 7 - static_cast<int>(pos_ & 7);
-                    val |= (data_[byteIdx] >> bitIdx) & 1u;
-                }
-                ++pos_;
-            }
-            return val;
+            const uint32_t v = peekBits(n);
+            pos_ += static_cast<size_t>(n);
+            return v;
         }
 
-        int readBit()
-        {
-            if (pos_ >= size_) { ++pos_; return 0; }
-            size_t byteIdx = pos_ >> 3;
-            int    bitIdx  = 7 - static_cast<int>(pos_ & 7);
-            int val = (data_[byteIdx] >> bitIdx) & 1;
-            ++pos_;
-            return val;
-        }
+        int readBit() { return static_cast<int>(readBits(1)); }
 
         [[nodiscard]] size_t getPos() const { return pos_; }
         void setPos(size_t p) { pos_ = p; }
@@ -368,17 +430,23 @@ private:
 
     private:
         const uint8_t* data_ = nullptr;
+        size_t bytes_ = 0;
         size_t size_ = 0;
         size_t pos_  = 0;
     };
 
     // ========================================================================
-    // Bitrate and sample rate tables (MPEG-1)
+    // Bitrate and sample rate tables
     // ========================================================================
 
-    static constexpr int kBitrateTable[16] = {
+    static constexpr int kBitrateTable[16] = {          // MPEG-1 Layer III
         0, 32, 40, 48, 56, 64, 80, 96,
         112, 128, 160, 192, 224, 256, 320, 0
+    };
+
+    static constexpr int kBitrateTableLsf[16] = {       // MPEG-2/2.5 Layer III
+        0, 8, 16, 24, 32, 40, 48, 56,
+        64, 80, 96, 112, 128, 144, 160, 0
     };
 
     static constexpr int kSampleRateTable[4] = {
@@ -386,69 +454,71 @@ private:
     };
 
     // ========================================================================
-    // Scalefactor band tables (MPEG-1 Layer III)
+    // Scalefactor band tables (ISO 11172-3 Table B.8, ISO 13818-3 Table B.2)
     // ========================================================================
 
+    // No default member initializers: the tables below are initialised inside
+    // this class, where a nested class's initializers are not yet usable.
     struct BandTable
     {
-        int longBands[23]  = {};
-        int shortBands[14] = {};
-        int longCount       = 0;
-        int shortCount      = 0;
+        int longBands[23];
+        int shortBands[14];
+        int mixedLongBands;   // long bands ahead of a mixed block's short part
+        int longCount;
+        int shortCount;
     };
 
-    // The two invariants reorder() relies on, checked at compile time for every
-    // table below instead of guarded at run time:
-    //   sb[13] == 192  -- the three windows of the short bands span exactly
-    //                     3*192 == 576 coefficients, so the reordering cannot
-    //                     run past the granule;
-    //   lb[8] == 3*sb[3] -- a mixed block's short region begins exactly where
-    //                     its long region ends.
-    // A table edit that breaks either one is a build failure, not silent data
-    // loss.
-#define DSPARK_MP3_CHECK_BAND_TABLE(lbArr, sbArr)                                   \
-    static_assert((sbArr)[13] == 192,                                               \
-        "short scalefactor bands must span 192 coefficients per window");           \
-    static_assert((lbArr)[8] == 3 * (sbArr)[3],                                     \
-        "mixed blocks: the short region must begin where the long region ends")
+    // Rows: 44100, 48000, 32000 (MPEG-1), 22050, 24000, 16000 (MPEG-2),
+    // 11025, 12000, 8000 (MPEG-2.5).
+    static constexpr BandTable kBandTables[9] = {
+        { {0,4,8,12,16,20,24,30,36,44,52,62,74,90,110,134,162,196,238,288,342,418,576},
+          {0,4,8,12,16,22,30,40,52,66,84,106,136,192}, 8, 22, 13 },
+        { {0,4,8,12,16,20,24,30,36,42,50,60,72,88,106,128,156,190,230,276,330,384,576},
+          {0,4,8,12,16,22,28,38,50,64,80,100,126,192}, 8, 22, 13 },
+        { {0,4,8,12,16,20,24,30,36,44,54,66,82,102,126,156,194,240,296,364,448,550,576},
+          {0,4,8,12,16,22,30,42,58,78,104,138,180,192}, 8, 22, 13 },
+        { {0,6,12,18,24,30,36,44,54,66,80,96,116,140,168,200,238,284,336,396,464,522,576},
+          {0,4,8,12,18,24,32,42,56,74,100,132,174,192}, 6, 22, 13 },
+        { {0,6,12,18,24,30,36,44,54,66,80,96,114,136,162,194,232,278,332,394,464,540,576},
+          {0,4,8,12,18,26,36,48,62,80,104,136,180,192}, 6, 22, 13 },
+        { {0,6,12,18,24,30,36,44,54,66,80,96,116,140,168,200,238,284,336,396,464,522,576},
+          {0,4,8,12,18,26,36,48,62,80,104,134,174,192}, 6, 22, 13 },
+        { {0,6,12,18,24,30,36,44,54,66,80,96,116,140,168,200,238,284,336,396,464,522,576},
+          {0,4,8,12,18,26,36,48,62,80,104,134,174,192}, 6, 22, 13 },
+        { {0,6,12,18,24,30,36,44,54,66,80,96,116,140,168,200,238,284,336,396,464,522,576},
+          {0,4,8,12,18,26,36,48,62,80,104,134,174,192}, 6, 22, 13 },
+        { {0,12,24,36,48,60,72,88,108,132,160,192,232,280,336,400,476,566,568,570,572,574,576},
+          {0,8,16,24,36,52,72,96,124,160,162,164,166,192}, 6, 22, 13 },
+    };
 
-    static BandTable getBandTable(int sampleRate)
+    // The invariants reorder(), requantize() and stereoProcess() rely on,
+    // checked at compile time for every table instead of guarded at run time:
+    // the three windows of the short bands span exactly 3*192 == 576 lines,
+    // the long bands end at 576, and a mixed block's short part begins
+    // exactly where its long part ends (3 * shortBands[3]).
+    static constexpr bool bandTablesConsistent() noexcept
     {
-        BandTable t {};
-        if (sampleRate == 44100)
+        for (const BandTable& t : kBandTables)
         {
-            static constexpr int lb[] = {0,4,8,12,16,20,24,30,36,44,52,62,74,90,110,134,162,196,238,288,342,418,576};
-            static constexpr int sb[] = {0,4,8,12,16,22,30,40,52,66,84,106,136,192};
-            DSPARK_MP3_CHECK_BAND_TABLE(lb, sb);
-            std::memcpy(t.longBands, lb, sizeof(lb));
-            std::memcpy(t.shortBands, sb, sizeof(sb));
-            t.longCount = 22;
-            t.shortCount = 13;
+            if (t.shortBands[13] != 192 || t.longBands[22] != 576) return false;
+            if (t.longBands[t.mixedLongBands] != 3 * t.shortBands[3]) return false;
+            if (t.longBands[t.mixedLongBands] % 18 != 0) return false;
+            for (int i = 0; i < 22; ++i) if (t.longBands[i] >= t.longBands[i + 1]) return false;
+            for (int i = 0; i < 13; ++i) if (t.shortBands[i] >= t.shortBands[i + 1]) return false;
         }
-        else if (sampleRate == 48000)
-        {
-            static constexpr int lb[] = {0,4,8,12,16,20,24,30,36,42,50,60,72,88,106,128,156,190,230,276,330,384,576};
-            static constexpr int sb[] = {0,4,8,12,16,22,28,38,50,64,80,100,126,192};
-            DSPARK_MP3_CHECK_BAND_TABLE(lb, sb);
-            std::memcpy(t.longBands, lb, sizeof(lb));
-            std::memcpy(t.shortBands, sb, sizeof(sb));
-            t.longCount = 22;
-            t.shortCount = 13;
-        }
-        else
-        {
-            static constexpr int lb[] = {0,4,8,12,16,20,24,30,36,44,54,66,82,102,126,156,194,240,296,364,448,550,576};
-            static constexpr int sb[] = {0,4,8,12,16,22,30,42,58,78,104,138,180,192};
-            DSPARK_MP3_CHECK_BAND_TABLE(lb, sb);
-            std::memcpy(t.longBands, lb, sizeof(lb));
-            std::memcpy(t.shortBands, sb, sizeof(sb));
-            t.longCount = 22;
-            t.shortCount = 13;
-        }
-        return t;
+        return true;
+    }
+    static const BandTable& bandTable(int index) noexcept
+    {
+        static_assert(bandTablesConsistent(), "MP3 scalefactor band table invariant broken");
+        return kBandTables[index];
     }
 
-#undef DSPARK_MP3_CHECK_BAND_TABLE
+    /// Band table of an MPEG-1 rate (the encoder only writes MPEG-1).
+    static const BandTable& getBandTable(int sampleRate) noexcept
+    {
+        return kBandTables[(sampleRate == 44100) ? 0 : (sampleRate == 48000) ? 1 : 2];
+    }
 
     static constexpr int kSlen1[16] = {0,0,0,0,3,1,1,1,2,2,2,3,3,3,4,4};
     static constexpr int kSlen2[16] = {0,1,2,3,0,1,2,3,1,2,3,1,2,3,2,3};
@@ -1109,15 +1179,18 @@ private:
     size_t filePos_ = 0;
     AudioFileInfo info_ {};
     bool isOpen_ = false;
+    bool writeError_ = false;
 
     std::vector<size_t> frameOffsets_;
     std::vector<float> decodedSamplesFlat_; // Planar contiguous buffer [channel][sample]
+    std::vector<uint8_t> mainData_;         // Reservoir + frame main data, reused per frame
 
     // Gapless information from a Xing/Info tag frame (decoder).
     bool gapless_ = false;
     int gaplessDelay_ = 0;       ///< Encoder delay from the gapless tag.
     int gaplessPadding_ = 0;     ///< Padding from the gapless tag.
     int64_t tagFrames_ = 0;      ///< Audio frame count from the Xing fields (0 = absent).
+    int samplesPerFrame_ = kSamplesPerFrame; ///< Of the stream being decoded.
 
     std::vector<uint8_t> reservoir_;
     size_t reservoirSize_ = 0;
@@ -1167,47 +1240,70 @@ private:
         }
     }
 
+    /// Two headers can belong to one elementary stream.
+    static bool sameStream(const FrameHeader& a, const FrameHeader& b) noexcept
+    {
+        return a.version == b.version && a.layer == b.layer
+            && a.srateIdx == b.srateIdx && a.channels == b.channels;
+    }
+
     bool scanFrames()
     {
         frameOffsets_.clear();
+        const size_t size = fileData_.size();
         size_t pos = filePos_;
-        int sampleRate = 0;
-        int channels = 0;
+        size_t chainEnd = std::numeric_limits<size_t>::max();
+        FrameHeader first {};
+        bool haveFirst = false;
 
-        while (pos + 4 <= fileData_.size())
+        while (pos + 4 <= size)
         {
-            if ((fileData_[pos] & 0xFF) != 0xFF || (fileData_[pos + 1] & 0xE0) != 0xE0)
+            if (fileData_[pos] != 0xFF || (fileData_[pos + 1] & 0xE0) != 0xE0)
             {
                 ++pos; continue;
             }
 
             FrameHeader hdr {};
-            if (!parseFrameHeader(pos, hdr)) { ++pos; continue; }
-            if (hdr.version != 3 || hdr.layer != 1) { ++pos; continue; }
-
-            if (frameOffsets_.empty())
+            if (!parseFrameHeader(pos, hdr) || (haveFirst && !sameStream(first, hdr)))
             {
-                sampleRate = hdr.sampleRate;
-                channels = hdr.channels;
+                ++pos; continue;
             }
 
+            // A 12-bit sync pattern with plausible header bits turns up by
+            // chance in tags, cover art and any other binary data (the scan
+            // used to decode each one as a frame of full-scale noise). Accept
+            // a frame only where the previous one ended, where it is
+            // confirmed by a compatible header right after it, or where it
+            // ends exactly at the end of the file.
+            const size_t next = pos + static_cast<size_t>(hdr.frameSize);
+            bool accept = (pos == chainEnd) || next == size;
+            if (!accept && next + 4 <= size)
+            {
+                FrameHeader nextHdr {};
+                accept = parseFrameHeader(next, nextHdr) && sameStream(hdr, nextHdr);
+            }
+            if (!accept) { ++pos; continue; }
+
+            if (!haveFirst) { first = hdr; haveFirst = true; }
             frameOffsets_.push_back(pos);
-            pos += static_cast<size_t>(hdr.frameSize);
+            pos = next;
+            chainEnd = next;
         }
 
         if (frameOffsets_.empty()) return false;
 
         // A Xing/Info/VBRI tag frame is metadata, not audio: decoding it
-        // added 1152 samples of silence ahead of the music.
+        // added a frame of silence ahead of the music.
         gapless_ = false;
         tagFrames_ = 0;
         if (parseTagFrame(frameOffsets_.front()))
             frameOffsets_.erase(frameOffsets_.begin());
         if (frameOffsets_.empty()) return false;
 
-        info_.sampleRate = static_cast<double>(sampleRate);
-        info_.numChannels = channels;
-        info_.numSamples = static_cast<int64_t>(frameOffsets_.size()) * kSamplesPerFrame;
+        samplesPerFrame_ = first.samplesPerFrame;
+        info_.sampleRate = static_cast<double>(first.sampleRate);
+        info_.numChannels = static_cast<uint32_t>(first.channels);
+        info_.numSamples = static_cast<int64_t>(frameOffsets_.size()) * samplesPerFrame_;
         // MP3 has no PCM bit depth; report the delivery format (32-bit float).
         info_.bitsPerSample = 32;
         info_.isFloatingPoint = true;
@@ -1263,9 +1359,28 @@ private:
         {
             const uint8_t* tag = at(x);
             const uint16_t stored = static_cast<uint16_t>((tag[34] << 8) | tag[35]);
-            const size_t upToField = x + 34 - pos;
-            const bool valid = crc16(fileData_.data() + pos, upToField, 0) == stored
-                            || (pos + 190 <= end && crc16(fileData_.data() + pos, 190, 0) == stored);
+            const size_t field = x + 34;
+            const uint8_t* frame = fileData_.data() + pos;
+            const uint16_t upToField = crc16(frame, field - pos, 0);
+            bool valid = upToField == stored
+                      || (pos + 190 <= end && crc16(frame, 190, 0) == stored);
+            // When the tag sits early in the frame (mono, MPEG-2/2.5) its
+            // CRC field falls inside the first 190 bytes, and writers that
+            // checksum a 190-byte span do so while the field is still zero
+            // and with any bytes past a short frame's end read as zero
+            // (FFmpeg does). Without this form the gapless data of such
+            // files was never trusted.
+            if (!valid && field + 2 <= pos + 190)
+            {
+                static constexpr uint8_t kZero[2] = { 0, 0 };
+                uint16_t c = crc16(kZero, 2, upToField);
+                const size_t realEnd = std::min(end, pos + 190);
+                if (realEnd > field + 2)
+                    c = crc16(fileData_.data() + field + 2, realEnd - (field + 2), c);
+                for (size_t i = std::max(realEnd, field + 2); i < pos + 190; ++i)
+                    c = crc16(kZero, 1, c);
+                valid = c == stored;
+            }
             if (valid)
             {
                 gaplessDelay_   = (tag[21] << 4) | (tag[22] >> 4);
@@ -1280,24 +1395,31 @@ private:
      * @brief Trims the decoded stream to the encoder's input: the encoder
      *        delay plus the decoder delay at the start, the padding at the end
      *        (the gapless tag's convention).
+     *
+     * A tag that counts fewer frames than the stream holds is stale (the file
+     * was concatenated or re-muxed after tagging). Its end position would cut
+     * off every frame it does not know about, so only the start is trimmed.
      */
     void applyGaplessTrim()
     {
         if (!gapless_) return;
+        const int64_t spf = samplesPerFrame_;
         const int64_t decoded = info_.numSamples;
-        const int64_t frames = (tagFrames_ > 0) ? tagFrames_
-                                                : decoded / kSamplesPerFrame;
+        const int64_t actualFrames = decoded / spf;
+        const int64_t frames = (tagFrames_ > 0) ? tagFrames_ : actualFrames;
         const int64_t start = static_cast<int64_t>(gaplessDelay_) + kDecoderDelay;
-        const int64_t stop = std::min(decoded, frames * kSamplesPerFrame
-                                               - gaplessPadding_ + kDecoderDelay);
+        const int64_t stop = (frames + 1 < actualFrames)
+                           ? decoded
+                           : std::min(decoded, frames * spf - gaplessPadding_ + kDecoderDelay);
         if (start > stop) return;   // implausible values: keep the raw stream
 
         const int64_t kept = stop - start;
-        const int nch = info_.numChannels;
-        std::vector<float> trimmed(static_cast<size_t>(nch * kept));
-        for (int ch = 0; ch < nch; ++ch)
-            std::memcpy(trimmed.data() + static_cast<size_t>(ch * kept),
-                        decodedSamplesFlat_.data() + static_cast<size_t>(ch * decoded + start),
+        const size_t nch = info_.numChannels;
+        std::vector<float> trimmed(nch * static_cast<size_t>(kept));
+        for (size_t ch = 0; ch < nch; ++ch)
+            std::memcpy(trimmed.data() + ch * static_cast<size_t>(kept),
+                        decodedSamplesFlat_.data() + ch * static_cast<size_t>(decoded)
+                            + static_cast<size_t>(start),
                         static_cast<size_t>(kept) * sizeof(float));
         decodedSamplesFlat_ = std::move(trimmed);
         info_.numSamples = kept;
@@ -1325,29 +1447,55 @@ private:
         hdr.original   = ((header >> 2) & 1) != 0;
         hdr.emphasis   = static_cast<int>(header & 3);
 
-        if (hdr.version != 3 || hdr.layer != 1) return false;
+        // Layer III only; version 1 is reserved. Free format (index 0) is
+        // not supported.
+        if (hdr.version == 1 || hdr.layer != 1) return false;
         if (hdr.bitrateIdx == 0 || hdr.bitrateIdx == 15) return false;
         if (hdr.srateIdx >= 3) return false;
 
-        hdr.bitrate    = kBitrateTable[hdr.bitrateIdx] * 1000;
-        hdr.sampleRate = kSampleRateTable[hdr.srateIdx];
+        static constexpr int kRates[3][3] = {
+            { 11025, 12000, 8000 }, { 22050, 24000, 16000 }, { 44100, 48000, 32000 }
+        };
+        const int family = (hdr.version == 3) ? 2 : (hdr.version == 2) ? 1 : 0;
+        hdr.lsf        = family != 2;
+        hdr.bitrate    = (hdr.lsf ? kBitrateTableLsf : kBitrateTable)[hdr.bitrateIdx] * 1000;
+        hdr.sampleRate = kRates[family][hdr.srateIdx];
+        hdr.bandIndex  = ((family == 2) ? 0 : (family == 1) ? 3 : 6) + hdr.srateIdx;
+        hdr.granules   = hdr.lsf ? 1 : 2;
+        hdr.samplesPerFrame = kSamplesPerGranule * hdr.granules;
         hdr.channels   = (hdr.channelMode == 3) ? 1 : 2;
-        hdr.sideInfoSize = (hdr.channels == 1) ? 17 : 32;
-        hdr.frameSize = (144 * hdr.bitrate) / hdr.sampleRate + (hdr.padding ? 1 : 0);
+        hdr.sideInfoSize = hdr.lsf ? ((hdr.channels == 1) ? 9 : 17)
+                                   : ((hdr.channels == 1) ? 17 : 32);
+        hdr.frameSize = ((hdr.lsf ? 72 : 144) * hdr.bitrate) / hdr.sampleRate + (hdr.padding ? 1 : 0);
 
         if (hdr.frameSize < 4 + (hdr.crcProtect ? 2 : 0) + hdr.sideInfoSize) return false;
         return true;
     }
 
+    /// The right channel of an intensity-stereo LSF frame codes intensity
+    /// positions with its own scalefactor tables (ISO 13818-3 2.4.3.2).
+    static bool isIntensityChannel(const FrameHeader& hdr, int ch) noexcept
+    {
+        return ch == 1 && hdr.channelMode == 1 && (hdr.modeExt & 1) != 0;
+    }
+
     bool parseSideInfo(BitReader& br, const FrameHeader& hdr, SideInfo& si) const
     {
         int nch = hdr.channels;
-        si.main_data_begin = static_cast<int>(br.readBits(9));
-        br.readBits((nch == 1) ? 5 : 3);
+        if (hdr.lsf)
+        {
+            si.main_data_begin = static_cast<int>(br.readBits(8));
+            br.readBits((nch == 1) ? 1 : 2);
+            si.scfsi[0] = si.scfsi[1] = 0;
+        }
+        else
+        {
+            si.main_data_begin = static_cast<int>(br.readBits(9));
+            br.readBits((nch == 1) ? 5 : 3);
+            for (int ch = 0; ch < nch; ++ch) si.scfsi[ch] = static_cast<int>(br.readBits(4));
+        }
 
-        for (int ch = 0; ch < nch; ++ch) si.scfsi[ch] = static_cast<int>(br.readBits(4));
-
-        for (int gr = 0; gr < kGranules; ++gr)
+        for (int gr = 0; gr < hdr.granules; ++gr)
         {
             for (int ch = 0; ch < nch; ++ch)
             {
@@ -1355,7 +1503,7 @@ private:
                 g.part2_3_length     = static_cast<int>(br.readBits(12));
                 g.big_values         = static_cast<int>(br.readBits(9));
                 g.global_gain        = static_cast<int>(br.readBits(8));
-                g.scalefac_compress  = static_cast<int>(br.readBits(4));
+                g.scalefac_compress  = static_cast<int>(br.readBits(hdr.lsf ? 9 : 4));
                 g.window_switching   = br.readBits(1) != 0;
 
                 if (g.window_switching)
@@ -1386,7 +1534,11 @@ private:
                     g.region1_count   = static_cast<int>(br.readBits(3));
                 }
 
-                g.preflag          = static_cast<int>(br.readBits(1));
+                // LSF frames carry no preflag bit: it is implied by the
+                // scalefactor partition (scalefac_compress >= 500).
+                g.preflag = hdr.lsf
+                    ? ((!isIntensityChannel(hdr, ch) && g.scalefac_compress >= 500) ? 1 : 0)
+                    : static_cast<int>(br.readBits(1));
                 g.scalefac_scale   = static_cast<int>(br.readBits(1));
                 g.count1table_select = static_cast<int>(br.readBits(1));
             }
@@ -1394,36 +1546,62 @@ private:
         return true;
     }
 
+    // ------------------------------------------------------------------------
+    // Huffman decoding. Each code table is held as a binary tree built once
+    // from the ISO tables above; a code is resolved in at most its length in
+    // steps instead of a scan of every code at every length.
+    // ------------------------------------------------------------------------
+
+    struct HuffTree { std::array<int16_t, 512> node {}; };  // pairs; <0 leaf, 0 absent
+
+    static int huffTreeSlot(int tableIdx) noexcept
+    {
+        static constexpr int8_t kSlot[32] = { -1, 0, 1, 2, -1, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, 12,
+                                              13, 13, 13, 13, 13, 13, 13, 13,
+                                              14, 14, 14, 14, 14, 14, 14, 14 };
+        return kSlot[tableIdx & 31];
+    }
+
+    static const std::array<HuffTree, 15>& huffTrees()
+    {
+        static const std::array<HuffTree, 15> trees = [] {
+            std::array<HuffTree, 15> t {};
+            for (int table = 1; table < 32; ++table)
+            {
+                const int slot = huffTreeSlot(table);
+                if (slot < 0 || (table > 16 && table < 24) || table > 24) continue;
+                const HuffCode* codes = nullptr;
+                int count = 0;
+                encGetTable(table, codes, count);
+                int used = 1;
+                for (int i = 0; i < count; ++i)
+                {
+                    int node = 0;
+                    for (int b = codes[i].len - 1; b >= 0; --b)
+                    {
+                        int16_t& entry = t[static_cast<size_t>(slot)].node[
+                            static_cast<size_t>(node) * 2 + ((codes[i].code >> b) & 1u)];
+                        if (b == 0)
+                        {
+                            entry = static_cast<int16_t>(-1 - ((codes[i].x << 4) | codes[i].y));
+                            break;
+                        }
+                        if (entry == 0) entry = static_cast<int16_t>(used++);
+                        node = entry;
+                    }
+                }
+            }
+            return t;
+        }();
+        return trees;
+    }
+
     bool decodePair(BitReader& br, int tableIdx, int& x, int& y) const
     {
         if (tableIdx == 0 || tableIdx == 4 || tableIdx == 14) { x = 0; y = 0; return true; }
-        int linbits = kHuffLinbits[tableIdx];
-        const HuffCode* codes = nullptr;
-        int codeCount = 0;
+        const int linbits = kHuffLinbits[tableIdx];
 
-        switch (tableIdx)
-        {
-            case 1:  codes = kHuff01; codeCount = sizeof(kHuff01)/sizeof(HuffCode); break;
-            case 2:  codes = kHuff02; codeCount = sizeof(kHuff02)/sizeof(HuffCode); break;
-            case 3:  codes = kHuff03; codeCount = sizeof(kHuff03)/sizeof(HuffCode); break;
-            case 5:  codes = kHuff05; codeCount = sizeof(kHuff05)/sizeof(HuffCode); break;
-            case 6:  codes = kHuff06; codeCount = sizeof(kHuff06)/sizeof(HuffCode); break;
-            case 7:  codes = kHuff07; codeCount = sizeof(kHuff07)/sizeof(HuffCode); break;
-            case 8:  codes = kHuff08; codeCount = sizeof(kHuff08)/sizeof(HuffCode); break;
-            case 9:  codes = kHuff09; codeCount = sizeof(kHuff09)/sizeof(HuffCode); break;
-            case 10: codes = kHuff10; codeCount = sizeof(kHuff10)/sizeof(HuffCode); break;
-            case 11: codes = kHuff11; codeCount = sizeof(kHuff11)/sizeof(HuffCode); break;
-            case 12: codes = kHuff12; codeCount = sizeof(kHuff12)/sizeof(HuffCode); break;
-            case 13: codes = kHuff13; codeCount = sizeof(kHuff13)/sizeof(HuffCode); break;
-            case 15: codes = kHuff15; codeCount = sizeof(kHuff15)/sizeof(HuffCode); break;
-            case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23:
-                codes = kHuff16; codeCount = sizeof(kHuff16)/sizeof(HuffCode); break;
-            case 24: case 25: case 26: case 27: case 28: case 29: case 30: case 31:
-                codes = kHuff24; codeCount = sizeof(kHuff24)/sizeof(HuffCode); break;
-            default: x = 0; y = 0; return true;
-        }
-
-        if (!decodeHuffSymbol(br, codes, codeCount, x, y)) return false;
+        if (!decodeHuffSymbol(br, tableIdx, x, y)) return false;
 
         // ISO 11172-3 2.4.1.7 orders each pair as hcod, then linbits(x),
         // sign(x), then linbits(y), sign(y). Reading both escapes before both
@@ -1438,55 +1616,58 @@ private:
         return true;
     }
 
-    bool decodeHuffSymbol(BitReader& br, const HuffCode* codes, int count, int& xOut, int& yOut) const
+    bool decodeHuffSymbol(BitReader& br, int tableIdx, int& xOut, int& yOut) const
     {
-        uint32_t acc = 0;
-        int maxLen = 0;
-        for (int i = 0; i < count; ++i) if (codes[i].len > maxLen) maxLen = codes[i].len;
-        size_t startPos = br.getPos();
-
-        for (int len = 1; len <= maxLen; ++len)
+        const int slot = huffTreeSlot(tableIdx);
+        if (slot < 0) { xOut = 0; yOut = 0; return false; }
+        const HuffTree& tree = huffTrees()[static_cast<size_t>(slot)];
+        const uint32_t bits = br.peekBits(24);   // longest code is 19 bits
+        int node = 0;
+        for (int used = 0; used < 24; ++used)
         {
-            acc = (acc << 1) | static_cast<uint32_t>(br.readBit());
-            for (int i = 0; i < count; ++i)
+            const int16_t v = tree.node[static_cast<size_t>(node) * 2 + ((bits >> (23 - used)) & 1u)];
+            if (v < 0)
             {
-                if (codes[i].len == len && codes[i].code == acc)
-                {
-                    xOut = codes[i].x; yOut = codes[i].y;
-                    return true;
-                }
+                const int leaf = -1 - v;
+                xOut = leaf >> 4; yOut = leaf & 15;
+                br.skip(used + 1);
+                return true;
             }
+            if (v == 0) break;
+            node = v;
         }
-        br.setPos(startPos);
         xOut = 0; yOut = 0;
         return false;
     }
 
     bool decodeCount1(BitReader& br, int tableSelect, int& v, int& w, int& x, int& y) const
     {
-        const Count1Code* codes = (tableSelect == 0) ? kCount1A : kCount1B;
-        int count = 16;
-        uint32_t acc = 0;
-        int maxLen = (tableSelect == 0) ? 6 : 4;
-
-        for (int len = 1; len <= maxLen; ++len)
+        if (tableSelect == 0)
         {
-            acc = (acc << 1) | static_cast<uint32_t>(br.readBit());
-            for (int i = 0; i < count; ++i)
-            {
-                if (codes[i].len == len && codes[i].code == acc)
-                {
-                    v = codes[i].v; w = codes[i].w; x = codes[i].x; y = codes[i].y;
-                    if (v && br.readBit()) v = -1;
-                    if (w && br.readBit()) w = -1;
-                    if (x && br.readBit()) x = -1;
-                    if (y && br.readBit()) y = -1;
-                    return true;
-                }
-            }
+            // Table A: at most 6 bits, resolved by one 64-entry lookup.
+            struct Quad { uint8_t len = 0, v = 0, w = 0, x = 0, y = 0; };
+            static const auto lut = [] {
+                std::array<Quad, 64> t {};
+                for (const Count1Code& c : kCount1A)
+                    for (int s = 0; s < (1 << (6 - c.len)); ++s)
+                        t[static_cast<size_t>((c.code << (6 - c.len)) | s)] = { c.len, c.v, c.w, c.x, c.y };
+                return t;
+            }();
+            const Quad& q = lut[br.peekBits(6)];
+            br.skip(q.len);
+            v = q.v; w = q.w; x = q.x; y = q.y;
         }
-        v = w = x = y = 0;
-        return false;
+        else
+        {
+            // Table B: the four bits are the complemented flags.
+            const uint32_t code = ~br.readBits(4) & 15u;
+            v = (code >> 3) & 1; w = (code >> 2) & 1; x = (code >> 1) & 1; y = code & 1;
+        }
+        if (v && br.readBit()) v = -1;
+        if (w && br.readBit()) w = -1;
+        if (x && br.readBit()) x = -1;
+        if (y && br.readBit()) y = -1;
+        return true;
     }
 
     // part2_3_end is the ABSOLUTE bit position where this granule-channel's
@@ -1499,12 +1680,12 @@ private:
                        int is[576], size_t part2_3_end) const
     {
         std::memset(is, 0, 576 * sizeof(int));
-        BandTable bands = getBandTable(hdr.sampleRate);
+        const BandTable& bands = bandTable(hdr.bandIndex);
 
         int region1Start, region2Start;
         if (gc.window_switching && gc.block_type == 2)
         {
-            region1Start = 36;
+            region1Start = 3 * bands.shortBands[3];   // 36, or 72 at 8 kHz
             region2Start = kSamplesPerGranule;
         }
         else
@@ -1534,7 +1715,11 @@ private:
         {
             int v = 0, w = 0, x = 0, y = 0;
             if (!decodeCount1(br, gc.count1table_select, v, w, x, y)) break;
-            if (br.getPos() > part2_3_end + 2) break;
+            // A quad that runs past part2_3_length is not part of the
+            // granule: ISO 11172-3 and the reference decoders discard it.
+            // A two-bit tolerance here used to keep one such quad and code a
+            // spurious coefficient near the top of the spectrum.
+            if (br.getPos() > part2_3_end) break;
 
             is[idx] = v; is[idx + 1] = w; is[idx + 2] = x; is[idx + 3] = y;
             idx += 4;
@@ -1542,22 +1727,97 @@ private:
         br.setPos(part2_3_end);
     }
 
-    void decodeScalefactors(BitReader& br, const GranuleChannel& gc, int gr, int /*ch*/,
-                            int scfsi, int scalefac[39], size_t& bitsRead) const
+    /**
+     * @brief Reads one granule-channel's scalefactors.
+     *
+     * isIllegal receives, per scalefactor index, the value that marks an
+     * illegal intensity position, or -1 when every value is legal.
+     */
+    void decodeScalefactors(BitReader& br, const GranuleChannel& gc, const FrameHeader& hdr,
+                            int gr, int ch, int scfsi, int scalefac[39], int isIllegal[39]) const
     {
+        const bool shortBlock = gc.window_switching && gc.block_type == 2;
+        for (int i = 0; i < 39; ++i) isIllegal[i] = 7;
+
+        if (hdr.lsf)
+        {
+            // ISO 13818-3 2.4.3.2: scalefac_compress selects one of six
+            // partitions of the scalefactors into four groups, each with its
+            // own field width. The intensity channel uses tables 3..5.
+            static constexpr uint8_t kPartitions[6][3][4] = {
+                { { 6, 5, 5, 5 }, { 9, 9, 9, 9 },   { 6, 9, 9, 9 } },
+                { { 6, 5, 7, 3 }, { 9, 9, 12, 6 },  { 6, 9, 12, 6 } },
+                { { 11, 10, 0, 0 }, { 18, 18, 0, 0 }, { 15, 18, 0, 0 } },
+                { { 7, 7, 7, 0 }, { 12, 12, 12, 0 }, { 6, 15, 12, 0 } },
+                { { 6, 6, 6, 3 }, { 12, 9, 9, 6 },  { 6, 12, 9, 6 } },
+                { { 8, 8, 5, 0 }, { 15, 12, 9, 0 }, { 6, 18, 9, 0 } }
+            };
+            int slen[4] = {};
+            int table = 0;
+            const int sc = gc.scalefac_compress;
+            if (!isIntensityChannel(hdr, ch))
+            {
+                if (sc < 400)
+                {
+                    slen[0] = (sc >> 4) / 5; slen[1] = (sc >> 4) % 5;
+                    slen[2] = (sc & 15) >> 2; slen[3] = sc & 3; table = 0;
+                }
+                else if (sc < 500)
+                {
+                    const int s = sc - 400;
+                    slen[0] = (s >> 2) / 5; slen[1] = (s >> 2) % 5; slen[2] = s & 3; table = 1;
+                }
+                else
+                {
+                    const int s = sc - 500;
+                    slen[0] = s / 3; slen[1] = s % 3; table = 2;
+                }
+            }
+            else
+            {
+                const int s = sc >> 1;
+                if (s < 180)
+                {
+                    slen[0] = s / 36; slen[1] = (s % 36) / 6; slen[2] = (s % 36) % 6; table = 3;
+                }
+                else if (s < 244)
+                {
+                    const int t = s - 180;
+                    slen[0] = (t & 63) >> 4; slen[1] = (t & 15) >> 2; slen[2] = t & 3; table = 4;
+                }
+                else
+                {
+                    const int t = s - 244;
+                    slen[0] = t / 3; slen[1] = t % 3; table = 5;
+                }
+            }
+            const int kind = shortBlock ? (gc.mixed_block ? 2 : 1) : 0;
+            int idx = 0;
+            for (int part = 0; part < 4; ++part)
+            {
+                const int count = kPartitions[table][kind][part];
+                const int bits = slen[part];
+                for (int k = 0; k < count && idx < 39; ++k, ++idx)
+                {
+                    scalefac[idx] = bits ? static_cast<int>(br.readBits(bits)) : 0;
+                    isIllegal[idx] = bits ? (1 << bits) - 1 : -1;
+                }
+            }
+            for (; idx < 39; ++idx) { scalefac[idx] = 0; isIllegal[idx] = -1; }
+            return;
+        }
+
         // scfsi (ISO 11172-3 2.4.2.7) lets granule 1 REUSE granule 0's
         // scalefactors for a band group instead of re-sending them, and the
         // caller seeds `scalefac` with granule 0's values for exactly that
         // reason. Clearing the whole array first threw those values away and
         // requantised the inherited bands with a scalefactor of 0, i.e. with no
         // attenuation at all. Short blocks never inherit, so they still reset.
-        const bool shortBlock = gc.window_switching && gc.block_type == 2;
         if (gr == 0 || shortBlock) std::memset(scalefac, 0, 39 * sizeof(int));
         int slen1 = kSlen1[gc.scalefac_compress];
         int slen2 = kSlen2[gc.scalefac_compress];
-        size_t startBits = br.getPos();
 
-        if (gc.window_switching && gc.block_type == 2)
+        if (shortBlock)
         {
             if (gc.mixed_block)
             {
@@ -1608,7 +1868,6 @@ private:
             // silently darken the transient's top octave.
             for (int sfb = 21; sfb < 39; ++sfb) scalefac[sfb] = 0;
         }
-        bitsRead = br.getPos() - startBits;
     }
 
     void requantize(const int is[576], const int scalefac[39], const GranuleChannel& gc,
@@ -1629,7 +1888,7 @@ private:
             return (v < 0) ? -kPow43[a] : kPow43[a];
         };
 
-        BandTable bands = getBandTable(hdr.sampleRate);
+        const BandTable& bands = bandTable(hdr.bandIndex);
         double globalGainFactor = std::exp2((static_cast<double>(gc.global_gain) - 210.0) / 4.0);
         double scalefacMult = (gc.scalefac_scale) ? 1.0 : 0.5;
 
@@ -1637,8 +1896,12 @@ private:
         {
             if (gc.mixed_block)
             {
-                int longEnd = bands.longBands[8];
-                for (int sfb = 0; sfb < 8; ++sfb)
+                // Long bands 0..nl-1 (8 for MPEG-1, 6 for LSF) cover the two
+                // lowest subbands (four at 8 kHz); the short part starts at
+                // short band 3, which begins exactly there.
+                const int nl = bands.mixedLongBands;
+                const int longEnd = bands.longBands[nl];
+                for (int sfb = 0; sfb < nl; ++sfb)
                 {
                     int start = bands.longBands[sfb];
                     int end   = bands.longBands[sfb + 1];
@@ -1658,7 +1921,7 @@ private:
                     for (int win = 0; win < 3; ++win)
                     {
                         double sbGain = std::exp2(-2.0 * gc.subblock_gain[win]);
-                        int sfIdx = std::max(0, sfb * 3 + win - 1);
+                        const int sfIdx = nl + (sfb - 3) * 3 + win;
                         double sfPow = std::exp2(-scalefacMult * scalefac[sfIdx]);
                         double mult = globalGainFactor * sbGain * sfPow;
 
@@ -1709,93 +1972,131 @@ private:
         }
     }
 
-    void stereoProcess(double xr[2][576], const GranuleChannel gc[2], const FrameHeader& hdr, const int scalefac[2][39]) const
+    /**
+     * @brief Joint stereo: mid/side and intensity.
+     *
+     * Intensity stereo (ISO 11172-3 2.4.3.4.9.3, ISO 13818-3 2.4.3.2) applies
+     * only ABOVE the highest band where the right channel carries a non-zero
+     * line (per window for short blocks); every band below it is mid/side
+     * (when enabled) or plain L/R. The top band has no scalefactor of its own
+     * and reuses the position of the band beneath it when that band is
+     * intensity coded. Illegal positions (7 for MPEG-1, the largest value of
+     * the scalefactor field for LSF) fall back to mid/side or L/R.
+     */
+    void stereoProcess(double xr[2][576], const GranuleChannel gc[2], const FrameHeader& hdr,
+                       const int scalefac[2][39], const int isIllegal[39]) const
     {
-        if (hdr.channels < 2) return;
-        bool msStereo = (hdr.channelMode == 1) && ((hdr.modeExt & 2) != 0);
-        bool iStereo  = (hdr.channelMode == 1) && ((hdr.modeExt & 1) != 0);
+        if (hdr.channels < 2 || hdr.channelMode != 1) return;
+        const bool ms = (hdr.modeExt & 2) != 0;
+        const bool is = (hdr.modeExt & 1) != 0;
+        static constexpr double kInvSqrt2 = 0.7071067811865476;
 
-        if (msStereo)
-        {
-            static constexpr double kInvSqrt2 = 0.7071067811865476;
-            int isEnd = 576;
-            if (iStereo)
+        auto msSpan = [&](int b, int e) {
+            if (!ms) return;
+            for (int i = b; i < e; ++i)
             {
-                isEnd = 0;
-                for (int i = 575; i >= 0; --i)
-                    if (xr[1][i] != 0.0) { isEnd = i + 1; break; }
-            }
-            for (int i = 0; i < isEnd; ++i)
-            {
-                double m = xr[0][i], s = xr[1][i];
+                const double m = xr[0][i], s = xr[1][i];
                 xr[0][i] = (m + s) * kInvSqrt2;
                 xr[1][i] = (m - s) * kInvSqrt2;
             }
+        };
+        if (!is) { msSpan(0, 576); return; }
+
+        // MPEG-1: is_ratio = tan(pos * pi / 12), left = r / (1 + r), right =
+        // 1 / (1 + r). LSF: i0 = 2^(-1/4), or 2^(-1/2) when the right
+        // channel's intensity_scale bit is set; position 0 keeps both at
+        // unity, an odd position scales left by i0^((pos + 1) / 2), an even
+        // one scales right by i0^(pos / 2).
+        static constexpr double kTanRatio[6] = {
+            0.0, 0.2679491924311228, 0.5773502691896257, 1.0, 1.7320508075688772, 3.7320508075688772
+        };
+        const double lsfStep = (gc[1].scalefac_compress & 1) ? 0.5 : 0.25;
+        auto legal = [&](int idx, int pos) {
+            return hdr.lsf ? (pos != isIllegal[idx]) : (pos < 7);
+        };
+        auto isSpan = [&](int b, int e, int pos) {
+            double kl = 1.0, kr = 1.0;
+            if (!hdr.lsf)
+            {
+                if (pos == 6) { kl = 1.0; kr = 0.0; }
+                else { const double r = kTanRatio[pos]; kl = r / (1.0 + r); kr = 1.0 / (1.0 + r); }
+            }
+            else if (pos & 1) kl = std::exp2(-lsfStep * ((pos + 1) >> 1));
+            else if (pos != 0) kr = std::exp2(-lsfStep * (pos >> 1));
+            for (int i = b; i < e; ++i)
+            {
+                xr[1][i] = xr[0][i] * kr;
+                xr[0][i] = xr[0][i] * kl;
+            }
+        };
+        auto rightIsZero = [&](int b, int e) {
+            for (int i = b; i < e; ++i) if (xr[1][i] != 0.0) return false;
+            return true;
+        };
+
+        const BandTable& bands = bandTable(hdr.bandIndex);
+        const GranuleChannel& r = gc[1];
+        if (!(r.window_switching && r.block_type == 2))
+        {
+            const int top = bands.longCount - 1;
+            int bound = 0;
+            for (int sfb = top; sfb >= 0; --sfb)
+                if (!rightIsZero(bands.longBands[sfb], bands.longBands[sfb + 1])) { bound = sfb + 1; break; }
+            for (int sfb = 0; sfb <= top; ++sfb)
+            {
+                const int st = bands.longBands[sfb], en = bands.longBands[sfb + 1];
+                const int src = (sfb == top) ? top - 1 : sfb;
+                const int pos = scalefac[1][src];
+                if (sfb >= bound && src >= bound && legal(src, pos)) isSpan(st, en, pos);
+                else msSpan(st, en);
+            }
+            return;
         }
 
-        if (iStereo)
+        const bool mixed = r.mixed_block != 0;
+        const int nl = mixed ? bands.mixedLongBands : 0;
+        const int first = mixed ? 3 : 0;
+        const int longEnd = mixed ? bands.longBands[nl] : 0;
+        const int top = bands.shortCount - 1;
+        bool shortPartSilent = true;
+        for (int win = 0; win < 3; ++win)
         {
-            BandTable bands = getBandTable(hdr.sampleRate);
-            static constexpr double kISRatio[7] = { 0.0, 0.267949192, 0.577350269, 1.0, 1.732050808, 3.732050808, 1e10 };
-
-            if (gc[1].window_switching && gc[1].block_type == 2)
+            auto start = [&](int sfb) {
+                const int width = bands.shortBands[sfb + 1] - bands.shortBands[sfb];
+                return longEnd + 3 * (bands.shortBands[sfb] - bands.shortBands[first]) + win * width;
+            };
+            auto width = [&](int sfb) { return bands.shortBands[sfb + 1] - bands.shortBands[sfb]; };
+            int bound = first;
+            for (int sfb = top; sfb >= first; --sfb)
+                if (!rightIsZero(start(sfb), start(sfb) + width(sfb))) { bound = sfb + 1; break; }
+            if (bound > first) shortPartSilent = false;
+            for (int sfb = first; sfb <= top; ++sfb)
             {
-                for (int sfb = 0; sfb < bands.shortCount; ++sfb)
-                {
-                    int width = bands.shortBands[sfb + 1] - bands.shortBands[sfb];
-                    for (int win = 0; win < 3; ++win)
-                    {
-                        int sfIdx = sfb * 3 + win;
-                        if (sfIdx >= 36) break;
-                        int sf = scalefac[1][sfIdx];
-                        if (sf >= 7) continue;
-
-                        bool allZero = true;
-                        // Cumulative base, as in requantize() and reorder().
-                        const int baseIdx = 3 * bands.shortBands[sfb] + win * width;
-                        for (int k = 0; k < width; ++k)
-                            if (xr[1][baseIdx + k] != 0.0) { allZero = false; break; }
-
-                        if (allZero)
-                        {
-                            double ratio = kISRatio[sf];
-                            double kl = ratio / (1.0 + ratio);
-                            double kr = 1.0 / (1.0 + ratio);
-                            for (int k = 0; k < width; ++k)
-                            {
-                                const int i = baseIdx + k;
-                                xr[1][i] = xr[0][i] * kr;
-                                xr[0][i] = xr[0][i] * kl;
-                            }
-                        }
-                    }
-                }
+                const int src = (sfb == top) ? top - 1 : sfb;
+                const int idx = nl + (src - first) * 3 + win;
+                const int pos = scalefac[1][idx];
+                if (sfb >= bound && src >= bound && legal(idx, pos))
+                    isSpan(start(sfb), start(sfb) + width(sfb), pos);
+                else
+                    msSpan(start(sfb), start(sfb) + width(sfb));
             }
-            else
+        }
+        if (mixed)
+        {
+            // The long part is intensity coded only when every window of the
+            // short part is, and then only above its own last non-zero band.
+            int bound = nl;
+            if (shortPartSilent)
             {
-                for (int sfb = 0; sfb < bands.longCount; ++sfb)
-                {
-                    int start = bands.longBands[sfb];
-                    int end   = bands.longBands[sfb + 1];
-                    int sf = scalefac[1][sfb];
-                    if (sf >= 7) continue;
-
-                    bool allZero = true;
-                    for (int i = start; i < end; ++i)
-                        if (xr[1][i] != 0.0) { allZero = false; break; }
-
-                    if (allZero)
-                    {
-                        double ratio = kISRatio[sf];
-                        double kl = ratio / (1.0 + ratio);
-                        double kr = 1.0 / (1.0 + ratio);
-                        for (int i = start; i < end; ++i)
-                        {
-                            xr[1][i] = xr[0][i] * kr;
-                            xr[0][i] = xr[0][i] * kl;
-                        }
-                    }
-                }
+                bound = 0;
+                for (int sfb = nl - 1; sfb >= 0; --sfb)
+                    if (!rightIsZero(bands.longBands[sfb], bands.longBands[sfb + 1])) { bound = sfb + 1; break; }
+            }
+            for (int sfb = 0; sfb < nl; ++sfb)
+            {
+                const int pos = scalefac[1][sfb];
+                if (sfb >= bound && legal(sfb, pos)) isSpan(bands.longBands[sfb], bands.longBands[sfb + 1], pos);
+                else msSpan(bands.longBands[sfb], bands.longBands[sfb + 1]);
             }
         }
     }
@@ -1803,11 +2104,11 @@ private:
     void reorder(double xr[576], const GranuleChannel& gc, const FrameHeader& hdr) const
     {
         if (!gc.window_switching || gc.block_type != 2) return;
-        BandTable bands = getBandTable(hdr.sampleRate);
+        const BandTable& bands = bandTable(hdr.bandIndex);
         double tmp[576] = {};
 
         int startBand = gc.mixed_block ? 3 : 0;
-        int startIdx = gc.mixed_block ? bands.longBands[8] : 0;
+        int startIdx = gc.mixed_block ? bands.longBands[bands.mixedLongBands] : 0;
 
         if (gc.mixed_block)
             for (int i = 0; i < startIdx; ++i) tmp[i] = xr[i];
@@ -1821,11 +2122,11 @@ private:
         // 10..12 computed bases of 660/990/2016 that a `< 576` guard then threw
         // away - the top three short bands were zeroed on every short block.
         //
-        // No guard is used here now. getBandTable() static_asserts that
-        // shortBands[13] == 192 and that startIdx == 3*shortBands[startBand],
-        // so the last index touched is 3*192 - 1 == 575 by construction. A
-        // guard would only convert a future table error back into the silent
-        // data loss this fix removes.
+        // No guard is used here now. bandTablesConsistent() static_asserts
+        // that shortBands[13] == 192 and that startIdx == 3*shortBands[3], so
+        // the last index touched is 3*192 - 1 == 575 by construction. A guard
+        // would only convert a future table error back into the silent data
+        // loss this fix removes.
         for (int sfb = startBand; sfb < bands.shortCount; ++sfb)
         {
             const int width = bands.shortBands[sfb + 1] - bands.shortBands[sfb];
@@ -1838,15 +2139,24 @@ private:
         std::memcpy(xr, tmp, sizeof(tmp));
     }
 
-    void aliasReduction(double xr[576], const GranuleChannel& gc) const
+    /// Subbands transformed with long windows in a mixed block: 2, or 4 at
+    /// the 8 kHz rate whose long bands are twice as wide.
+    static int mixedLongSubbands(const FrameHeader& hdr) noexcept
+    {
+        const BandTable& bands = bandTable(hdr.bandIndex);
+        return bands.longBands[bands.mixedLongBands] / 18;
+    }
+
+    void aliasReduction(double xr[576], const GranuleChannel& gc, const FrameHeader& hdr) const
     {
         if (gc.window_switching && gc.block_type == 2 && !gc.mixed_block) return;
         static const AliasCoeffs ac = getAliasCoeffs();
-        // Only a MIXED short block restricts alias reduction to the single
-        // long/long boundary it still has. block_type 1 and 3 (start/stop) are
-        // ordinary long blocks and set window_switching too, so keying the
-        // limit off window_switching left 30 of their 31 butterflies undone.
-        int sbLimit = (gc.window_switching && gc.block_type == 2) ? 1 : 31;
+        // Only a MIXED short block restricts alias reduction to the
+        // long/long boundaries it still has. block_type 1 and 3 (start/stop)
+        // are ordinary long blocks and set window_switching too, so keying
+        // the limit off window_switching left 30 of their 31 butterflies
+        // undone.
+        int sbLimit = (gc.window_switching && gc.block_type == 2) ? mixedLongSubbands(hdr) - 1 : 31;
 
         for (int sb = 0; sb < sbLimit; ++sb)
         {
@@ -1864,80 +2174,50 @@ private:
         }
     }
 
-    void imdct(const double xr[576], const GranuleChannel& gc, int ch, double output[576])
+    void imdct(const double xr[576], const GranuleChannel& gc, const FrameHeader& hdr,
+               int ch, double output[576])
     {
         ChannelState& state = channelState_[ch];
 
         if (gc.window_switching && gc.block_type == 2)
         {
-            if (gc.mixed_block)
+            const int longSb = gc.mixed_block ? mixedLongSubbands(hdr) : 0;
+            for (int sb = 0; sb < longSb; ++sb)
             {
-                for (int sb = 0; sb < 2; ++sb)
+                double in[18], out36[36];
+                for (int i = 0; i < 18; ++i) in[i] = xr[sb * 18 + i];
+                imdct36(in, out36);
+                applyWindow(out36, 0);
+                for (int i = 0; i < 18; ++i)
                 {
-                    double in[18], out36[36];
-                    for (int i = 0; i < 18; ++i) in[i] = xr[sb * 18 + i];
-                    imdct36(in, out36);
-                    applyWindow(out36, 0);
-                    for (int i = 0; i < 18; ++i)
-                    {
-                        output[sb * 18 + i] = out36[i] + state.prevBlock[sb * 18 + i];
-                        state.prevBlock[sb * 18 + i] = out36[i + 18];
-                    }
-                }
-                for (int sb = 2; sb < 32; ++sb)
-                {
-                    double tmp[36] = {};
-                    for (int win = 0; win < 3; ++win)
-                    {
-                        double in[6], out12[12];
-                        // reorder() leaves the three windows INTERLEAVED, as the
-                        // standard requires (ISO 11172-3 2.4.3.4.9 reads
-                        // in[win + 3*m]). Reading each window's six coefficients
-                        // contiguously fed every 12-point IMDCT a mixture of all
-                        // three windows.
-                        for (int i = 0; i < 6; ++i) in[i] = xr[sb * 18 + win + 3 * i];
-                        imdct12(in, out12);
-                        // The three short windows occupy samples 6..29 of the
-                        // 36-sample block, not 0..23: emitting them six samples
-                        // early left their TDAC overlap with the neighbouring
-                        // start/stop blocks uncancelled.
-                        for (int i = 0; i < 12; ++i)
-                            tmp[6 * win + i + 6] += out12[i] * kShortWindow[i];
-                    }
-                    for (int i = 0; i < 18; ++i)
-                    {
-                        output[sb * 18 + i] = tmp[i] + state.prevBlock[sb * 18 + i];
-                        state.prevBlock[sb * 18 + i] = tmp[i + 18];
-                    }
+                    output[sb * 18 + i] = out36[i] + state.prevBlock[sb * 18 + i];
+                    state.prevBlock[sb * 18 + i] = out36[i + 18];
                 }
             }
-            else
+            for (int sb = longSb; sb < 32; ++sb)
             {
-                for (int sb = 0; sb < 32; ++sb)
+                double tmp[36] = {};
+                for (int win = 0; win < 3; ++win)
                 {
-                    double tmp[36] = {};
-                    for (int win = 0; win < 3; ++win)
-                    {
-                        double in[6], out12[12];
-                        // reorder() leaves the three windows INTERLEAVED, as the
-                        // standard requires (ISO 11172-3 2.4.3.4.9 reads
-                        // in[win + 3*m]). Reading each window's six coefficients
-                        // contiguously fed every 12-point IMDCT a mixture of all
-                        // three windows.
-                        for (int i = 0; i < 6; ++i) in[i] = xr[sb * 18 + win + 3 * i];
-                        imdct12(in, out12);
-                        // The three short windows occupy samples 6..29 of the
-                        // 36-sample block, not 0..23: emitting them six samples
-                        // early left their TDAC overlap with the neighbouring
-                        // start/stop blocks uncancelled.
-                        for (int i = 0; i < 12; ++i)
-                            tmp[6 * win + i + 6] += out12[i] * kShortWindow[i];
-                    }
-                    for (int i = 0; i < 18; ++i)
-                    {
-                        output[sb * 18 + i] = tmp[i] + state.prevBlock[sb * 18 + i];
-                        state.prevBlock[sb * 18 + i] = tmp[i + 18];
-                    }
+                    double in[6], out12[12];
+                    // reorder() leaves the three windows INTERLEAVED, as the
+                    // standard requires (ISO 11172-3 2.4.3.4.9 reads
+                    // in[win + 3*m]). Reading each window's six coefficients
+                    // contiguously fed every 12-point IMDCT a mixture of all
+                    // three windows.
+                    for (int i = 0; i < 6; ++i) in[i] = xr[sb * 18 + win + 3 * i];
+                    imdct12(in, out12);
+                    // The three short windows occupy samples 6..29 of the
+                    // 36-sample block, not 0..23: emitting them six samples
+                    // early left their TDAC overlap with the neighbouring
+                    // start/stop blocks uncancelled.
+                    for (int i = 0; i < 12; ++i)
+                        tmp[6 * win + i + 6] += out12[i] * kShortWindow[i];
+                }
+                for (int i = 0; i < 18; ++i)
+                {
+                    output[sb * 18 + i] = tmp[i] + state.prevBlock[sb * 18 + i];
+                    state.prevBlock[sb * 18 + i] = tmp[i + 18];
                 }
             }
         }
@@ -1970,11 +2250,19 @@ private:
             return t;
         }();
 
-        for (int k = 0; k < 36; ++k)
+        // Most subbands above the coded bandwidth are silent.
+        bool any = false;
+        for (int n = 0; n < 18; ++n) if (in[n] != 0.0) { any = true; break; }
+        if (!any) { std::memset(out, 0, 36 * sizeof(double)); return; }
+
+        // The 36-point IMDCT has 18 independent outputs: out[17 - k] = -out[k]
+        // for k = 0..8 and out[35 - k] = out[18 + k] for k = 0..8.
+        for (int k = 0; k < 9; ++k)
         {
-            double sum = 0.0;
-            for (int n = 0; n < 18; ++n) sum += in[n] * kCos[k][n];
-            out[k] = sum;
+            double a = 0.0, b = 0.0;
+            for (int n = 0; n < 18; ++n) { a += in[n] * kCos[k][n]; b += in[n] * kCos[k + 18][n]; }
+            out[k] = a;      out[17 - k] = -a;
+            out[k + 18] = b; out[35 - k] = b;
         }
     }
 
@@ -2010,17 +2298,46 @@ private:
                 output[sb * 18 + i] = -output[sb * 18 + i];
     }
 
-    void synthesize(const double input[576], int ch, float pcm[576])
+    /// In-place 32-point DCT-II, x[m] = sum_k x[k] cos(pi (2k + 1) m / 64), by
+    /// the recursive even/odd split of B. G. Lee (IEEE Trans. ASSP 32(6),
+    /// 1984): 80 multiplications instead of the 1024 of the direct sum.
+    static void dct32(double x[32])
     {
-        static const auto kMatrixCos = [] {
-            std::array<std::array<double, 32>, 64> t{};
+        static const auto kTwiddle = [] {
+            std::array<double, 32> t {};
             constexpr double kPi = 3.14159265358979323846;
-            for (int i = 0; i < 64; ++i)
-                for (int k = 0; k < 32; ++k)
-                    t[i][k] = std::cos(kPi / 64.0 * (16.0 + static_cast<double>(i)) * (2.0 * k + 1.0));
+            for (int n = 2; n <= 32; n *= 2)
+                for (int i = 0; i < n / 2; ++i)
+                    t[static_cast<size_t>(n / 2 + i)] = 0.5 / std::cos(kPi * (2 * i + 1) / (2.0 * n));
             return t;
         }();
+        double scratch[32];
+        dctLevel(x, scratch, 32, kTwiddle.data());
+    }
 
+    static void dctLevel(double* x, double* t, int n, const double* twiddle)
+    {
+        if (n == 1) return;
+        const int h = n / 2;
+        for (int i = 0; i < h; ++i)
+        {
+            const double a = x[i], b = x[n - 1 - i];
+            t[i] = a + b;
+            t[h + i] = (a - b) * twiddle[h + i];
+        }
+        dctLevel(t, x, h, twiddle);
+        dctLevel(t + h, x + h, h, twiddle);
+        for (int i = 0; i < h - 1; ++i)
+        {
+            x[2 * i] = t[i];
+            x[2 * i + 1] = t[h + i] + t[h + i + 1];
+        }
+        x[2 * h - 2] = t[h - 1];
+        x[2 * h - 1] = t[2 * h - 1];
+    }
+
+    void synthesize(const double input[576], int ch, float pcm[576])
+    {
         ChannelState& state = channelState_[ch];
 
         for (int ss = 0; ss < 18; ++ss)
@@ -2028,14 +2345,17 @@ private:
             double S[32];
             for (int sb = 0; sb < 32; ++sb) S[sb] = input[sb * 18 + ss];
 
+            // Matrixing V[i] = sum_k S[k] cos((16 + i)(2k + 1) pi / 64) needs
+            // only the 32 DCT-II outputs C[m]: V[i] = C[16 + i] for i < 16,
+            // V[16] = 0, V[16 + i] = -C[32 - i], V[48 - i] = -C[i] and
+            // V[48 + i] = V[48 - i].
+            dct32(S);
             double V[64];
-            for (int i = 0; i < 64; ++i)
-            {
-                double sum = 0.0;
-                const auto& row = kMatrixCos[i];
-                for (int k = 0; k < 32; ++k) sum += S[k] * row[k];
-                V[i] = sum;
-            }
+            for (int i = 0; i < 16; ++i) V[i] = S[16 + i];
+            V[16] = 0.0;
+            for (int i = 1; i <= 16; ++i) V[16 + i] = -S[32 - i];
+            for (int i = 0; i < 16; ++i) V[48 - i] = -S[i];
+            for (int i = 1; i < 16; ++i) V[48 + i] = V[48 - i];
 
             state.synthOffset = (state.synthOffset - 64) & 1023;
             for (int i = 0; i < 64; ++i) state.synthBuf[(state.synthOffset + i) & 1023] = V[i];
@@ -2101,19 +2421,33 @@ private:
             for (int j = 0; j < 8; ++j)
                 Y[i] += st.analysisBuf[i + j * 64] * (kSynthWindow[i + j * 64] / 32.0);
 
-        static constexpr double kPi = 3.14159265358979323846;
+        static const auto kAnalysisCos = [] {
+            std::array<std::array<double, 64>, 32> t {};
+            constexpr double kPi = 3.14159265358979323846;
+            for (int k = 0; k < 32; ++k)
+                for (int i = 0; i < 64; ++i)
+                    t[k][i] = std::cos(kPi / 64.0 * (2.0 * k + 1.0) * (i - 16.0));
+            return t;
+        }();
         for (int k = 0; k < 32; ++k)
         {
             double sum = 0.0;
             for (int i = 0; i < 64; ++i)
-                sum += Y[i] * std::cos(kPi / 64.0 * (2.0 * k + 1.0) * (i - 16.0));
+                sum += Y[i] * kAnalysisCos[k][i];
             S[k] = sum;
         }
     }
 
     static void encMdct36(const double z[36], double X[18])
     {
-        static constexpr double kPi = 3.14159265358979323846;
+        static const auto kMdctCos = [] {
+            std::array<std::array<double, 36>, 18> t {};
+            constexpr double kPi = 3.14159265358979323846;
+            for (int k = 0; k < 18; ++k)
+                for (int n = 0; n < 36; ++n)
+                    t[k][n] = std::cos(kPi / 72.0 * (2.0 * n + 19.0) * (2.0 * k + 1.0));
+            return t;
+        }();
         double zw[36];
         for (int n = 0; n < 36; ++n) zw[n] = z[n] * kNormalWindow[n];
 
@@ -2125,7 +2459,7 @@ private:
         {
             double sum = 0.0;
             for (int n = 0; n < 36; ++n)
-                sum += zw[n] * std::cos(kPi / 72.0 * (2.0 * n + 19.0) * (2.0 * k + 1.0));
+                sum += zw[n] * kMdctCos[k][n];
             X[k] = sum * (2.0 / 18.0);
         }
     }
@@ -2203,16 +2537,24 @@ private:
             int xBase = (linbits > 0 && x > 14) ? 15 : x;
             int yBase = (linbits > 0 && y > 14) ? 15 : y;
 
-            int cLen = 0;
-            bool found = false;
-            for (int c = 0; c < codeCount; ++c)
-            {
-                if (codes[c].x == xBase && codes[c].y == yBase)
+            // Code lengths by (table, x, y), built once: the rate-control
+            // search prices every granule at every candidate gain.
+            static const auto kCodeLength = [] {
+                std::array<std::array<uint8_t, 256>, 32> t {};
+                for (int tb = 1; tb < 32; ++tb)
                 {
-                    cLen = codes[c].len; found = true; break;
+                    const HuffCode* cc = nullptr;
+                    int n = 0;
+                    encGetTable(tb, cc, n);
+                    for (int c = 0; c < n; ++c)
+                        t[static_cast<size_t>(tb)][static_cast<size_t>((cc[c].x << 4) | cc[c].y)] = cc[c].len;
                 }
-            }
-            if (!found) return 999999;
+                return t;
+            }();
+            (void)codes; (void)codeCount;
+            if (xBase > 15 || yBase > 15) return 999999;
+            const int cLen = kCodeLength[static_cast<size_t>(tableIdx)][static_cast<size_t>((xBase << 4) | yBase)];
+            if (cLen == 0) return 999999;
 
             totalBits += cLen;
             if (linbits > 0 && x > 14) totalBits += linbits;
@@ -2717,14 +3059,31 @@ private:
 
     bool decodeAll()
     {
-        int nch = info_.numChannels;
-        int64_t totalSamples = info_.numSamples;
+        const int nch = static_cast<int>(info_.numChannels);
+        const int64_t totalSamples = info_.numSamples;
 
-        decodedSamplesFlat_.resize(static_cast<size_t>(nch * totalSamples), 0.0f);
+        // The decoded size follows from the frame count alone, so a small
+        // file of tiny frames can ask for a hundred times its own size. Bound
+        // it, and compute it in 64 bits: nch * totalSamples used to wrap a
+        // 32-bit size_t (WASM, x86) into a short buffer that the decode loop
+        // then wrote past.
+        const uint64_t floats = static_cast<uint64_t>(nch) * static_cast<uint64_t>(totalSamples);
+        if (floats > kMaxDecodedPcmBytes / sizeof(float)
+            || floats > std::numeric_limits<size_t>::max() / sizeof(float))
+            return false;
+        try
+        {
+            decodedSamplesFlat_.assign(static_cast<size_t>(floats), 0.0f);
+            reservoir_.assign(kMaxReservoir, 0);
+            mainData_.reserve(kMaxReservoir + 2048);
+        }
+        catch (const std::bad_alloc&)
+        {
+            decodedSamplesFlat_.clear();
+            return false;
+        }
 
         for (int ch = 0; ch < kChannelsMax; ++ch) channelState_[ch] = {};
-
-        reservoir_.resize(kMaxReservoir, 0);
         reservoirSize_ = 0;
 
         int prevScalefac[2][39] = {};
@@ -2735,10 +3094,10 @@ private:
         {
             size_t frameStart = frameOffsets_[frameIdx];
 
-            // A frame that fails to parse leaves its 1152-sample slot silent
-            // instead of shifting the rest of the file earlier in time.
+            // A frame that fails to parse leaves its slot silent instead of
+            // shifting the rest of the file earlier in time.
             FrameHeader hdr {};
-            if (!parseFrameHeader(frameStart, hdr)) { sampleIdx += kSamplesPerFrame; continue; }
+            if (!parseFrameHeader(frameStart, hdr)) { sampleIdx += samplesPerFrame_; continue; }
 
             size_t headerSize = 4 + (hdr.crcProtect ? 2 : 0);
 
@@ -2750,7 +3109,7 @@ private:
             // silent, exactly like a frame whose header fails to parse.
             if (frameStart + headerSize + static_cast<size_t>(hdr.sideInfoSize) > fileData_.size())
             {
-                sampleIdx += kSamplesPerFrame;
+                sampleIdx += samplesPerFrame_;
                 continue;
             }
 
@@ -2758,26 +3117,44 @@ private:
             siBr.init(fileData_.data() + frameStart + headerSize, static_cast<size_t>(hdr.sideInfoSize));
 
             SideInfo si {};
-            if (!parseSideInfo(siBr, hdr, si)) { sampleIdx += kSamplesPerFrame; continue; }
+            if (!parseSideInfo(siBr, hdr, si)) { sampleIdx += samplesPerFrame_; continue; }
 
             size_t mainDataStart = frameStart + headerSize + static_cast<size_t>(hdr.sideInfoSize);
             size_t mainDataSize  = static_cast<size_t>(hdr.frameSize) - headerSize - static_cast<size_t>(hdr.sideInfoSize);
 
             size_t mainDataBegin = static_cast<size_t>(si.main_data_begin);
-            std::vector<uint8_t> mainData;
+            mainData_.clear();
+
+            if (mainDataBegin > reservoirSize_)
+            {
+                // The bytes this frame's main data starts in are not here (a
+                // stream cut in the middle, or a lost frame). Decoding from
+                // the start of the available bytes instead read every field
+                // from the wrong position and produced a burst of noise at
+                // program level; the frame is muted as the reference decoders
+                // do, while its main data still feeds the reservoir and its
+                // block types keep the overlap consistent.
+                for (int gr = 0; gr < hdr.granules; ++gr)
+                    for (int ch = 0; ch < hdr.channels; ++ch)
+                    {
+                        si.gr[gr][ch].part2_3_length = 0;
+                        si.gr[gr][ch].big_values = 0;
+                        si.gr[gr][ch].scalefac_compress = 0;
+                    }
+                mainDataBegin = 0;
+            }
 
             if (mainDataBegin > 0)
             {
-                if (mainDataBegin > reservoirSize_) mainDataBegin = reservoirSize_;
                 size_t resStart = reservoirSize_ - mainDataBegin;
-                mainData.insert(mainData.end(),
+                mainData_.insert(mainData_.end(),
                     reservoir_.begin() + static_cast<ptrdiff_t>(resStart),
                     reservoir_.begin() + static_cast<ptrdiff_t>(reservoirSize_));
             }
 
             if (mainDataStart + mainDataSize <= fileData_.size())
             {
-                mainData.insert(mainData.end(),
+                mainData_.insert(mainData_.end(),
                     fileData_.begin() + static_cast<ptrdiff_t>(mainDataStart),
                     fileData_.begin() + static_cast<ptrdiff_t>(mainDataStart + mainDataSize));
             }
@@ -2801,11 +3178,12 @@ private:
             }
 
             BitReader mainBr;
-            mainBr.init(mainData.data(), mainData.size());
+            mainBr.init(mainData_.data(), mainData_.size());
 
             int scalefac[2][39] = {};
+            int isIllegal[2][39] = {};
 
-            for (int gr = 0; gr < kGranules; ++gr)
+            for (int gr = 0; gr < hdr.granules; ++gr)
             {
                 double xr[2][576] = {};
 
@@ -2818,9 +3196,8 @@ private:
                         for (int i = 0; i < 39; ++i) scalefac[ch][i] = prevScalefac[ch][i];
                     }
 
-                    size_t sfBits = 0;
                     size_t posBeforeSf = mainBr.getPos();
-                    decodeScalefactors(mainBr, gc, gr, ch, si.scfsi[ch], scalefac[ch], sfBits);
+                    decodeScalefactors(mainBr, gc, hdr, gr, ch, si.scfsi[ch], scalefac[ch], isIllegal[ch]);
 
                     // part2_3_length spans scalefactors + Huffman data, so the
                     // end position anchors at posBeforeSf. huffmanDecode also
@@ -2837,25 +3214,27 @@ private:
                     }
                 }
 
-                if (nch == 2) stereoProcess(xr, si.gr[gr], hdr, scalefac);
+                if (nch == 2) stereoProcess(xr, si.gr[gr], hdr, scalefac, isIllegal[1]);
 
                 for (int ch = 0; ch < nch; ++ch)
                 {
                     reorder(xr[ch], si.gr[gr][ch], hdr);
-                    aliasReduction(xr[ch], si.gr[gr][ch]);
+                    aliasReduction(xr[ch], si.gr[gr][ch], hdr);
 
                     double imdctOut[576];
-                    imdct(xr[ch], si.gr[gr][ch], ch, imdctOut);
+                    imdct(xr[ch], si.gr[gr][ch], hdr, ch, imdctOut);
                     frequencyInversion(imdctOut);
 
                     float pcm[576];
                     synthesize(imdctOut, ch, pcm);
 
+                    float* out = decodedSamplesFlat_.data()
+                               + static_cast<size_t>(ch) * static_cast<size_t>(totalSamples);
                     for (int i = 0; i < kSamplesPerGranule; ++i)
                     {
-                        int64_t outIdx = sampleIdx + i;
+                        const int64_t outIdx = sampleIdx + i;
                         if (outIdx < totalSamples)
-                            decodedSamplesFlat_[static_cast<size_t>(ch * totalSamples + outIdx)] = pcm[i];
+                            out[static_cast<size_t>(outIdx)] = pcm[i];
                     }
                 }
 

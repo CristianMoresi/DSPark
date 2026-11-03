@@ -24,9 +24,17 @@
  * truncation. Endianness is handled safely via byte-wise reconstruction to
  * avoid Undefined Behavior (UB) on non-x86 architectures.
  *
- * The writer targets classic RIFF/WAVE, whose 32-bit sizes cap a file at
- * 4 GiB: writeSamples() refuses (returns false) any write that would
- * overflow that limit instead of silently corrupting the header.
+ * RF64 and BW64 files (EBU Tech 3306, ITU-R BS.2088: a ds64 chunk carries
+ * the 64-bit sizes) are read like classic RIFF/WAVE files.
+ *
+ * The writer produces classic RIFF/WAVE by default, whose 32-bit sizes cap
+ * a file at 4 GiB: writeSamples() then refuses (returns false) any write that
+ * would overflow that limit instead of silently corrupting the header.
+ * setRf64Mode() selects RF64 output instead: Rf64Mode::Auto reserves the
+ * space for a ds64 chunk (as a JUNK chunk) and promotes the file to RF64 on
+ * close() only when it outgrows classic RIFF; Rf64Mode::Always writes RF64
+ * regardless of size. An odd-sized data chunk is followed by the RIFF pad
+ * byte.
  *
  * @warning File operations allocate memory internally (for chunk buffers)
  * and block the thread pending disk I/O. NEVER call open, read, or write
@@ -66,7 +74,21 @@ namespace dspark {
 class WavFile : public AudioFile
 {
 public:
+    /** @brief Container used by the next openWrite(). */
+    enum class Rf64Mode
+    {
+        Never,  ///< Classic RIFF/WAVE, at most 4 GiB (the default).
+        Auto,   ///< RIFF with a reserved ds64 slot, promoted to RF64 beyond 4 GiB.
+        Always  ///< RF64 whatever the size.
+    };
+
     ~WavFile() override { close(); }
+
+    /** @brief Chooses the container of files opened for writing from now on. */
+    void setRf64Mode(Rf64Mode mode) noexcept { rf64Mode_ = mode; }
+
+    /** @brief Container chosen for files opened for writing. */
+    [[nodiscard]] Rf64Mode getRf64Mode() const noexcept { return rf64Mode_; }
 
     // -- AudioFile interface ---------------------------------------------------
 
@@ -78,6 +100,7 @@ public:
     [[nodiscard]] bool openRead(const std::filesystem::path& path) override
     {
         close();
+        writeError_ = false;
         file_.open(path, std::ios::binary | std::ios::in);
         if (!file_.is_open()) return false;
 
@@ -124,16 +147,19 @@ public:
             return false;
         }
 
+        writeError_ = false;
         file_.open(path, std::ios::binary | std::ios::out | std::ios::trunc);
         if (!file_.is_open()) return false;
 
         info_ = info;
         mode_ = Mode::Write;
         totalFramesWritten_ = 0;
+        writeContainer_ = rf64Mode_;
 
         // Write placeholder header (sizes will be patched on close)
         if (!writeHeader())
         {
+            writeError_ = true;
             close();
             return false;
         }
@@ -158,7 +184,10 @@ public:
     {
         if (mode_ != Mode::Read || !file_.is_open()) return false;
         if (startFrame < 0 || numFrames <= 0) return false;
-        if (startFrame + numFrames > info_.numSamples) return false;
+        // Subtraction form: startFrame + numFrames can overflow int64, and
+        // the wrapped sum used to pass this check and seek into the header.
+        if (startFrame > info_.numSamples || numFrames > info_.numSamples - startFrame)
+            return false;
 
         const int frameSize = static_cast<int>(info_.bitsPerSample / 8 * info_.numChannels);
 
@@ -198,9 +227,13 @@ public:
         const int frameSize = static_cast<int>(info_.bitsPerSample / 8) * nCh;
 
         // Classic RIFF sizes are 32-bit: refuse a write that would push the
-        // data chunk past what the header can describe (header <= 128 bytes).
+        // data chunk past what the header can describe (header <= 128 bytes,
+        // plus the pad byte). RF64 sizes are 64-bit.
         const int64_t dataAfter = (totalFramesWritten_ + nS) * static_cast<int64_t>(frameSize);
-        if (dataAfter > static_cast<int64_t>(0xFFFFFFFFu) - 128) return false;
+        const int64_t limit = (writeContainer_ == Rf64Mode::Never)
+                            ? static_cast<int64_t>(0xFFFFFFFFu) - 128
+                            : (int64_t { 1 } << 62);
+        if (dataAfter > limit) return false;
 
         int framesRemaining = nS;
         int srcOffset = 0;
@@ -213,7 +246,11 @@ public:
 
             auto rawBytes = static_cast<std::streamsize>(static_cast<int64_t>(toWrite) * frameSize);
             file_.write(reinterpret_cast<const char*>(ioBuffer_.data()), rawBytes);
-            if (!file_.good()) return false;
+            if (!file_.good())
+            {
+                writeError_ = true;
+                return false;
+            }
 
             srcOffset += toWrite;
             framesRemaining -= toWrite;
@@ -228,9 +265,13 @@ public:
         if (!file_.is_open()) { mode_ = Mode::Closed; info_ = {}; return; }
 
         if (mode_ == Mode::Write)
+        {
             finaliseHeader();
+            if (!file_.good()) writeError_ = true;
+        }
 
         file_.close();
+        if (file_.fail()) writeError_ = true;
         ioBuffer_.clear();
         ioBuffer_.shrink_to_fit();
         mode_ = Mode::Closed;
@@ -241,6 +282,14 @@ public:
     {
         return file_.is_open() && mode_ != Mode::Closed;
     }
+
+    /**
+     * @brief True when a write or the header finalisation of the current or
+     *        most recent writer failed.
+     *
+     * Remains readable after close() until the next open call.
+     */
+    [[nodiscard]] bool hasWriteError() const noexcept override { return writeError_; }
 
 private:
     // -- RIFF/WAV constants ----------------------------------------------------
@@ -260,8 +309,15 @@ private:
 
     std::streamoff dataChunkOffset_ = 0;
     std::streamoff dataChunkSizeOffset_ = 0;
-    uint32_t dataChunkSize_ = 0;
+    uint64_t dataChunkSize_ = 0;
     int64_t totalFramesWritten_ = 0;
+    Rf64Mode rf64Mode_ = Rf64Mode::Never;       // for the next openWrite()
+    Rf64Mode writeContainer_ = Rf64Mode::Never; // of the file being written
+    bool writeError_ = false;
+
+    static constexpr uint32_t kRf64Unknown = 0xFFFFFFFFu;
+    static constexpr std::streamoff kDs64Offset = 12;   // right after "WAVE"
+    static constexpr uint32_t kDs64Size = 28;           // without a chunk table
 
     void resizeIoBuffer()
     {
@@ -277,7 +333,9 @@ private:
     {
         char riffId[4];
         if (!readBytes(riffId, 4)) return false;
-        if (std::memcmp(riffId, "RIFF", 4) != 0) return false;
+        const bool rf64 = std::memcmp(riffId, "RF64", 4) == 0
+                       || std::memcmp(riffId, "BW64", 4) == 0;
+        if (!rf64 && std::memcmp(riffId, "RIFF", 4) != 0) return false;
 
         uint32_t riffSize = 0;
         if (!readLE32(riffSize)) return false;
@@ -287,24 +345,43 @@ private:
         if (!readBytes(waveId, 4)) return false;
         if (std::memcmp(waveId, "WAVE", 4) != 0) return false;
 
+        // RF64/BW64: the ds64 chunk comes first and holds the 64-bit sizes
+        // that the 32-bit fields mark with 0xFFFFFFFF.
+        uint64_t ds64DataSize = 0;
+        if (rf64)
+        {
+            char ds64Id[4];
+            uint32_t ds64Size = 0;
+            uint64_t riffSize64 = 0;
+            if (!readBytes(ds64Id, 4) || std::memcmp(ds64Id, "ds64", 4) != 0) return false;
+            if (!readLE32(ds64Size) || ds64Size < 24) return false;
+            if (!readLE64(riffSize64) || !readLE64(ds64DataSize)) return false;
+            (void)riffSize64;
+            file_.seekg(static_cast<std::streamoff>(ds64Size) - 16 + (ds64Size & 1), std::ios::cur);
+            if (!file_.good()) return false;
+        }
+
         bool hasFmt = false, hasData = false;
 
         while (file_.good() && !(hasFmt && hasData))
         {
             char chunkId[4];
-            uint32_t chunkSize = 0;
+            uint32_t chunkSize32 = 0;
             if (!readBytes(chunkId, 4)) break;
-            if (!readLE32(chunkSize)) break;
+            if (!readLE32(chunkSize32)) break;
+            uint64_t chunkSize = chunkSize32;
+            if (rf64 && chunkSize32 == kRf64Unknown && std::memcmp(chunkId, "data", 4) == 0)
+                chunkSize = ds64DataSize;
 
             // RIFF chunks are word-aligned: an odd-sized chunk is followed by
             // one pad byte that is not part of the declared size. All skips
             // below must account for it (in 64-bit arithmetic, so a corrupt
             // size near UINT32_MAX cannot wrap the seek to zero).
-            const std::streamoff pad = (chunkSize & 1);
+            const std::streamoff pad = static_cast<std::streamoff>(chunkSize & 1);
 
             if (std::memcmp(chunkId, "fmt ", 4) == 0)
             {
-                if (!parseFmtChunk(chunkSize)) return false;
+                if (chunkSize > 0xFFFFu || !parseFmtChunk(static_cast<uint32_t>(chunkSize))) return false;
                 if (pad) file_.seekg(pad, std::ios::cur);
                 hasFmt = true;
             }
@@ -315,9 +392,10 @@ private:
                 auto fileEnd = file_.tellg();
                 file_.seekg(currentPos);
 
-                auto remaining = fileEnd - currentPos;
-                if (static_cast<std::streamoff>(chunkSize) > remaining)
-                    chunkSize = static_cast<uint32_t>(remaining);
+                const auto remaining = static_cast<std::streamoff>(fileEnd - currentPos);
+                if (remaining < 0) return false;
+                if (chunkSize > static_cast<uint64_t>(remaining))
+                    chunkSize = static_cast<uint64_t>(remaining);
 
                 dataChunkOffset_ = file_.tellg();
                 dataChunkSize_ = chunkSize;
@@ -341,7 +419,7 @@ private:
         {
             const int bytesPerFrame = static_cast<int>(info_.bitsPerSample / 8 * info_.numChannels);
             if (bytesPerFrame > 0)
-                info_.numSamples = static_cast<int64_t>(dataChunkSize_) / bytesPerFrame;
+                info_.numSamples = static_cast<int64_t>(dataChunkSize_ / static_cast<uint64_t>(bytesPerFrame));
         }
 
         return hasFmt && hasData;
@@ -442,9 +520,18 @@ private:
         const auto byteRate = static_cast<uint32_t>(
             std::min<uint64_t>(byteRate64, 0xFFFFFFFFu));
 
-        writeBytes("RIFF", 4);
+        writeBytes(writeContainer_ == Rf64Mode::Always ? "RF64" : "RIFF", 4);
         writeLE32(0); // Patched on close
         writeBytes("WAVE", 4);
+
+        if (writeContainer_ != Rf64Mode::Never)
+        {
+            // ds64 slot (EBU Tech 3306): a JUNK chunk of the same size that
+            // close() turns into ds64 when the file becomes RF64.
+            writeBytes(writeContainer_ == Rf64Mode::Always ? "ds64" : "JUNK", 4);
+            writeLE32(kDs64Size);
+            for (uint32_t i = 0; i < kDs64Size; ++i) file_.put('\0');
+        }
 
         writeBytes("fmt ", 4);
         writeLE32(fmtChunkSize);
@@ -488,17 +575,42 @@ private:
         file_.clear();
 
         const int bytesPerSample = static_cast<int>(info_.bitsPerSample / 8);
-        const auto dataSize = static_cast<uint32_t>(
-            totalFramesWritten_ * info_.numChannels * bytesPerSample);
+        const uint64_t dataSize = static_cast<uint64_t>(totalFramesWritten_)
+                                * info_.numChannels * static_cast<uint64_t>(bytesPerSample);
 
-        file_.seekp(dataChunkSizeOffset_, std::ios::beg);
-        writeLE32(dataSize);
-
+        // RIFF chunks are word-aligned: an odd data chunk (8-bit or 24-bit
+        // with an odd frame count) is followed by one pad byte, counted in
+        // the RIFF size but not in the data size.
         file_.seekp(0, std::ios::end);
-        auto fileSize = static_cast<uint32_t>(file_.tellp());
-        uint32_t riffSize = fileSize - 8;
-        file_.seekp(4, std::ios::beg);
-        writeLE32(riffSize);
+        if ((dataSize & 1u) != 0) file_.put('\0');
+        const auto fileSize = static_cast<uint64_t>(static_cast<std::streamoff>(file_.tellp()));
+        const uint64_t riffSize = fileSize - 8;
+
+        const bool asRf64 = writeContainer_ == Rf64Mode::Always
+            || (writeContainer_ == Rf64Mode::Auto && riffSize > 0xFFFFFFFFull);
+        if (asRf64)
+        {
+            const int frameBytes = bytesPerSample * static_cast<int>(info_.numChannels);
+            file_.seekp(0, std::ios::beg);
+            writeBytes("RF64", 4);
+            writeLE32(kRf64Unknown);
+            file_.seekp(kDs64Offset, std::ios::beg);
+            writeBytes("ds64", 4);
+            writeLE32(kDs64Size);
+            writeLE64(riffSize);
+            writeLE64(dataSize);
+            writeLE64(frameBytes > 0 ? dataSize / static_cast<uint64_t>(frameBytes) : 0);
+            writeLE32(0);                       // no chunk size table
+            file_.seekp(dataChunkSizeOffset_, std::ios::beg);
+            writeLE32(kRf64Unknown);
+        }
+        else
+        {
+            file_.seekp(dataChunkSizeOffset_, std::ios::beg);
+            writeLE32(static_cast<uint32_t>(dataSize));
+            file_.seekp(4, std::ios::beg);
+            writeLE32(static_cast<uint32_t>(riffSize));
+        }
 
         file_.flush();
     }
@@ -669,6 +781,14 @@ private:
         return true;
     }
 
+    bool readLE64(uint64_t& val)
+    {
+        uint32_t lo = 0, hi = 0;
+        if (!readLE32(lo) || !readLE32(hi)) return false;
+        val = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+        return true;
+    }
+
     bool readLE32(uint32_t& val)
     {
         uint8_t b[4];
@@ -693,6 +813,12 @@ private:
             static_cast<uint8_t>((val >> 8) & 0xFF)
         };
         file_.write(reinterpret_cast<const char*>(b), 2);
+    }
+
+    void writeLE64(uint64_t val)
+    {
+        writeLE32(static_cast<uint32_t>(val));
+        writeLE32(static_cast<uint32_t>(val >> 32));
     }
 
     void writeLE32(uint32_t val)

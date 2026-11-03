@@ -538,3 +538,38 @@ DSPARK_TEST(State_json_out_of_range_numbers_never_convert_undefined)
     EXPECT_TRUE(stateFromJson("{\"id\":1,\"version\":70000,\"params\":{}}").empty());
     EXPECT_TRUE(stateFromJson("{\"id\":1,\"version\":1,\"params\":{\"x\":1e300}}").empty());
 }
+
+DSPARK_TEST(State_json_float_limits_and_malformed_text)
+{
+    // "%.9g" prints FLT_MAX as 3.40282347e+38, a hair above FLT_MAX itself,
+    // and the parser rejected that text: any preset holding +-FLT_MAX (a
+    // common "no limit" sentinel) failed its JSON round trip (empty blob).
+    StateWriter w(0x4C494D54u, 1);
+    w.write("hi", std::numeric_limits<float>::max());
+    w.write("lo", -std::numeric_limits<float>::max());
+    const auto back = stateFromJson(stateToJson(w.blob()));
+    EXPECT_TRUE(!back.empty());
+    StateReader r(back.data(), back.size());
+    EXPECT_TRUE(r.isValid());
+    EXPECT_EQ(r.read("hi", 0.0f), std::numeric_limits<float>::max());
+    EXPECT_EQ(r.read("lo", 0.0f), -std::numeric_limits<float>::max());
+
+    // Text after the closing brace is malformed input; it was accepted.
+    EXPECT_TRUE(stateFromJson("{\"id\":1,\"version\":2,\"params\":{\"a\":1.5}} junk").empty());
+    EXPECT_TRUE(!stateFromJson("{\"id\":1,\"version\":2,\"params\":{\"a\":1.5}} \n").empty());
+
+    // The blob counts entries in a u16 and stores keys of at most 255 bytes.
+    // 70000 parameters wrapped the count to 4464 entries and still read as
+    // valid; a 300-byte key was truncated. Both are rejected now.
+    std::string many = "{\"id\":1,\"version\":2,\"params\":{";
+    for (int i = 0; i < 70000; ++i)
+    {
+        if (i) many += ',';
+        many += "\"k" + std::to_string(i) + "\":true";
+    }
+    many += "}}";
+    EXPECT_TRUE(stateFromJson(many).empty());
+    const std::string longKey = "{\"id\":1,\"version\":2,\"params\":{\""
+                              + std::string(300, 'x') + "\":true}}";
+    EXPECT_TRUE(stateFromJson(longKey).empty());
+}

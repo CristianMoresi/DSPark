@@ -26,7 +26,7 @@ from check_public_text import canonical_text_bytes
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_DIRECTORIES = ("Core", "Effects", "Analysis", "IO", "Music")
 EXPECTED_INSTALLED_HEADERS = 153
-EXPECTED_ORDINARY_TESTS = 1248
+EXPECTED_ORDINARY_TESTS = 1266
 PACKAGE_SOURCE_COMMIT = "816766a14e04804ba3425d789e8bb384866067ea"
 PACKAGE_SOURCE_PARENT = "6885f80e21264298c7e73f44dd05a73f3ddb4210"
 PACKAGE_SOURCE_URL_PREFIX = (
@@ -199,9 +199,11 @@ def conan_semantics(data: bytes) -> bytes:
     if sys.version_info >= (3, 13):
         options["show_empty"] = True
     # Python 3.12 added an always-empty type_params field to function and
-    # class nodes; dropping it gives every supported interpreter one
-    # canonical form (a recipe never declares PEP 695 type parameters).
-    return ast.dump(tree, **options).replace(", type_params=[]", "").encode("ascii")
+    # class nodes, and 3.15 an is_lazy flag to imports; dropping both gives
+    # every supported interpreter one canonical form (a recipe never declares
+    # PEP 695 type parameters or PEP 810 lazy imports).
+    dump = ast.dump(tree, **options)
+    return dump.replace(", type_params=[]", "").replace(", is_lazy=0", "").encode("ascii")
 
 
 def cmake_noncomment_semantics(data: bytes) -> bytes:

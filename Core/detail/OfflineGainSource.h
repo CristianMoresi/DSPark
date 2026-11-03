@@ -341,6 +341,13 @@ template <FloatType T, class Cursor> class OfflineGainSource final
     std::unique_ptr<double[]> gain_;
 };
 
+// GCC 15 with sanitizer instrumentation cannot see that the optionals below
+// are disengaged when the constructor emplaces into them, and reports the
+// destructor emplace() would skip as reading uninitialized storage.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 template <FloatType T, class Cursor> class OfflineGainProduct final
 {
     using Source = OfflineGainSource<T, Cursor>;
@@ -506,5 +513,8 @@ template <FloatType T, class Cursor> class OfflineGainProduct final
     int boundaryCount_ = 0;
     std::unique_ptr<double[]> output_;
 };
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 } // namespace dspark::detail
 #endif // DSPARK_HAS_OFFLINE

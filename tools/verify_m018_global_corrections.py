@@ -1881,7 +1881,7 @@ LIVE_REVERB_MUTATION_ANCHOR = (
     "                                   irSampleRate_, spec_, fftBlockSize_, ds, st);\n"
 )
 LIVE_REVERB_BASELINE_HASH = (
-    "78740e25e47733b019650810925cefedf04727fa6a2fcec28add63f3e57aa867"
+    "e424e35a199761d0ce51b5063993d5c346e327506ec112e3c663801318ef05ff"
 )
 LIVE_REVERB_SUBJECT_HASH = (
     "c1a3310d57121761d25d63d98e7f9c429f0231168ff4b8fdd4a405e5b2fcbb4a"
@@ -1900,7 +1900,7 @@ LIVE_REVERB_VARIANTS = (
     {
         "id": "early-mix",
         "insertion": "        mix_.store(mix, std::memory_order_relaxed);\n",
-        "source_sha256": "10fa4d38861c752bfd4c38fc31ea4d1f63e5a7361bab8b6b5847ba30865ad524",
+        "source_sha256": "7666e73842bf0ee375361af8e90a9c91a480e67a411673e1855c5b30c219d408",
         "patch_sha256": "cf52f7b71a2001696ecbc045799d3682308b643b55394b95abefa5d97a0c3d7a",
         "oracle": "EXPECTED_RED",
     },
@@ -1910,14 +1910,14 @@ LIVE_REVERB_VARIANTS = (
             "        preDelayMs_.store(preDelay, std::memory_order_relaxed);\n"
             "        preDelaySamples_.store(preDelaySamples, std::memory_order_relaxed);\n"
         ),
-        "source_sha256": "d45b3eeaae54d73e99cffa7a0627c5fb740228998945ff16bf6f70931ecab449",
+        "source_sha256": "f5fa46e27ea6dc246a0900a99e354fb4503932598889c5cd814d71b1c4e2a85f",
         "patch_sha256": "a05fa0ddc94c9b82e31891c5b10d81660fd7f007de7ba7345e2136f7f5081a79",
         "oracle": "EXPECTED_RED",
     },
     {
         "id": "partial-shaping-publication",
         "insertion": "        decayScale_.store(ds, std::memory_order_relaxed);\n",
-        "source_sha256": "bbae94dd82c6b2cd73733be9de5a5badf77dd8dcf1b5a00b6a2e708d831b4c14",
+        "source_sha256": "8ff463aa497d901ec5cbe6e3738d7b026f9cb06064407d01080a50eb9cb81c43",
         "patch_sha256": "998438b2995e32b3cd2e4f33370dc9b0596d72366b4a1d8d5d82edb65ff3b976",
         "oracle": "EXPECTED_RED",
     },

@@ -1148,6 +1148,8 @@ protected:
     /**
      * @brief One conforming part (at most maxBlockSize samples) of a block.
      *
+     * @param bank        Convolver bank that renders the wet signal.
+     * @param buffer      The part, processed in place.
      * @param fadeOutAt   Offset of this part in a block whose wet signal fades
      *                    out to 0 at its end (a bank swap follows), or -1.
      * @param blockLength Length of that whole block.

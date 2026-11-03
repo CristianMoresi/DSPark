@@ -1256,6 +1256,10 @@ protected:
 
     // ---- Detectors ----
 
+    /** @brief A non-finite sample reads as silence in the detector: it would
+     *  otherwise latch in the recursive detector, filter and envelope state. */
+    [[nodiscard]] static T detectorSafe(T x) noexcept { return std::isfinite(x) ? x : T(0); }
+
     /**
      * @brief Computes level detection in Decibels.
      * @param sample Input sample.
@@ -1263,10 +1267,6 @@ protected:
      * @param detType Selected detector methodology.
      * @return Decibel representation of detected level.
      */
-    /** @brief A non-finite sample reads as silence in the detector: it would
-     *  otherwise latch in the recursive detector, filter and envelope state. */
-    [[nodiscard]] static T detectorSafe(T x) noexcept { return std::isfinite(x) ? x : T(0); }
-
     [[nodiscard]] T detectLevel(T sample, int ch, DetectorType detType) noexcept
     {
         T level = std::abs(sample);

@@ -64,10 +64,10 @@ EXPECTED_ROWS = (
     ("reverb::clang18::sanitizer::partial-shaping-publication", "clang18", "sanitizer", "partial-shaping-publication", "EXPECTED_RED"),
 )
 EXPECTED_SOURCE_HASHES = {
-    "baseline": "78740e25e47733b019650810925cefedf04727fa6a2fcec28add63f3e57aa867",
-    "early-mix": "10fa4d38861c752bfd4c38fc31ea4d1f63e5a7361bab8b6b5847ba30865ad524",
-    "early-predelay": "d45b3eeaae54d73e99cffa7a0627c5fb740228998945ff16bf6f70931ecab449",
-    "partial-shaping-publication": "bbae94dd82c6b2cd73733be9de5a5badf77dd8dcf1b5a00b6a2e708d831b4c14",
+    "baseline": "e424e35a199761d0ce51b5063993d5c346e327506ec112e3c663801318ef05ff",
+    "early-mix": "7666e73842bf0ee375361af8e90a9c91a480e67a411673e1855c5b30c219d408",
+    "early-predelay": "f5fa46e27ea6dc246a0900a99e354fb4503932598889c5cd814d71b1c4e2a85f",
+    "partial-shaping-publication": "8ff463aa497d901ec5cbe6e3738d7b026f9cb06064407d01080a50eb9cb81c43",
 }
 EXPECTED_INSERTION_HASHES = {
     "baseline": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",

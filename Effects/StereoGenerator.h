@@ -9,6 +9,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/Convolver.h"
+#include "../Core/DenormalGuard.h"
 #include "../Core/DryWetMixer.h"
 #include "../Core/FIRFilter.h"
 #include "../Core/SmoothedValue.h"
@@ -49,6 +50,9 @@ namespace dspark
  * to generate stereo from mono, the caller duplicates mono into two channels.
  * Feed zero input to flush a tail; getLatency() is alignment delay, not tail
  * length. Reset clears history and snaps width to its current target.
+ * processBlock() flushes subnormals for its duration (Core DenormalGuard), so
+ * the decaying band, color and DC recursions reach exact zero after the input
+ * stops instead of settling into a subnormal limit cycle.
  *
  * Threading: prepare(), getOptions(), getState() and setState() require exclusive
  * setup access. processBlock(), reset(), resetAtFrame() and getSourceFrame()
@@ -207,6 +211,7 @@ template <typename T> class StereoGenerator final
      */
     bool processBlock(AudioBufferView<T> buffer, std::span<double> generatedDelta) noexcept
     {
+        DenormalGuard denormalGuard;
         if (!state_)
             return publish(Status::NotPrepared);
         const int count = buffer.getNumSamples();

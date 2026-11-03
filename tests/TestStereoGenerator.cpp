@@ -1,4 +1,5 @@
 // DSPark Tests - Stereo generator lifecycle and signal contracts
+#include "../Core/DenormalGuard.h"
 #include "../Core/ProcessorTraits.h"
 #include "../Effects/StereoGenerator.h"
 #include "dspark_test.h"
@@ -537,5 +538,53 @@ DSPARK_TEST(StereoGenerator_matches_independent_complete_signal_reference)
                 }
         }
         EXPECT_EQ(checked, positions.size());
+    }
+}
+
+DSPARK_TEST(StereoGenerator_silent_tail_settles_to_exact_zero)
+{
+    // The band filters and DC block decay exponentially after the input stops.
+    // Without flush-to-zero the recursions settle into a subnormal limit cycle:
+    // every delta sample stays near 1e-321, so a silent tail never returns to
+    // exact digital silence and each operation pays the subnormal penalty.
+    StereoGenerator<double> effect;
+    EXPECT_TRUE(effect.setWidth(.5f));
+    EXPECT_TRUE(effect.prepare({48000, 256, 2}));
+    AudioBuffer<double> buffer;
+    buffer.resize(2, 256);
+    std::vector<double> delta(256);
+    std::uint32_t state = 12345;
+    const auto noise = [&state] {
+        state = state * 1664525u + 1013904223u;
+        return (static_cast<double>(state >> 8) / 16777216.0 - .5) * 1e-300;
+    };
+    double tailPeak = 0, deltaPeak = 0;
+    const int blocks = 4 * 48000 / 256;
+    for (int block = 0; block < blocks; ++block)
+    {
+        const bool signalBlock = block < 48000 / 4 / 256;
+        for (int i = 0; i < 256; ++i)
+        {
+            buffer.getChannel(0)[i] = signalBlock ? noise() : 0.;
+            buffer.getChannel(1)[i] = signalBlock ? noise() : 0.;
+        }
+        EXPECT_TRUE(effect.processBlock(buffer.toView(), {delta.data(), delta.size()}));
+        if (block < blocks - 48000 / 2 / 256)
+            continue;
+        for (int i = 0; i < 256; ++i)
+        {
+            deltaPeak = std::max(deltaPeak, std::abs(delta[i]));
+            tailPeak = std::max({tailPeak, std::abs(buffer.getChannel(0)[i]),
+                                 std::abs(buffer.getChannel(1)[i])});
+        }
+    }
+    if constexpr (DenormalGuard::isActive())
+    {
+        EXPECT_EQ(deltaPeak, 0.0);
+        EXPECT_EQ(tailPeak, 0.0);
+    }
+    else
+    {
+        EXPECT_TRUE(std::isfinite(deltaPeak) && std::isfinite(tailPeak));
     }
 }

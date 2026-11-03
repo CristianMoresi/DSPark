@@ -68,6 +68,10 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `StereoGenerator`: a silent tail reaches exact zero. The band, color and
+  DC recursions settled into a subnormal limit cycle near 1e-321 after the
+  input stopped, so the output never returned to digital silence and the
+  CPU cost rose 15-30% in silence.
 - Plugin layer: a block with more than 256 events no longer loses events.
   Intermediate parameter points give way, so final parameter values and
   note-offs survive (VST3, CLAP, AU; a stuck note before).

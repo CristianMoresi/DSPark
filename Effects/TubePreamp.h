@@ -36,7 +36,9 @@
  *   circuit's real compression) plus a +0.25 dB/dB residual slope: backing
  *   off is audible, pushing raises density at a gently rising level - the
  *   same contract as TapeMachine/TransformerModel. Use setOutput() for
- *   static trim; gain changes are ramped (~30 ms) so drags stay click-free.
+ *   static trim; gain and sag changes are ramped (~30 ms) so drags stay
+ *   click-free. Blocks longer than the prepared maximum are processed in
+ *   pieces.
  *
  * The nonlinear core runs at 2x oversampling by DEFAULT, and the factor is
  * configurable via setOversampling(int) (setup thread only, since it
@@ -737,6 +739,8 @@ public:
         for (auto& scratch : compensationScratch_)
             scratch.resize(static_cast<size_t>(maxBlock_) * static_cast<size_t>(osFactor_));
         stageRamp_.resize(static_cast<size_t>(maxBlock_) * static_cast<size_t>(osFactor_));
+        sagRamp_.resize(static_cast<size_t>(maxBlock_) * static_cast<size_t>(osFactor_));
+        sagSmoother_.prepare(fs2_, 30.0);
 
         if (osFactor_ > 1)
         {
@@ -988,6 +992,14 @@ public:
             && dirty_.exchange(false, std::memory_order_acquire))
             recompute();
 
+        for (int off = 0; off < nS; off += maxBlock_)
+            processChunk(buffer.getSubView(off, std::min(maxBlock_, nS - off)), nCh);
+    }
+
+private:
+    void processChunk(AudioBufferView<T> buffer, int nCh) noexcept
+    {
+        const int nS = buffer.getNumSamples();
         // Rate-limited mix ramp (moveTowards, exact landing; settled it
         // reduces to the constant, bit-identically).
         const T mixTarget = mix_.load(std::memory_order_relaxed);
@@ -1026,6 +1038,7 @@ public:
                 driveLogSmoother_.reset(driveLog);
                 for (size_t st = 0; st < 2; ++st)
                     outputLogSmoothers_[st].reset(std::log(outGain[st]));
+                sagSmoother_.reset(sagR_);
                 gainsInitialized_ = true;
             }
             driveLogSmoother_.setTargetValue(driveLog);
@@ -1057,6 +1070,15 @@ public:
                 }
             }
 
+            // Supply sag resistance, ramped like the gains: a step moved the
+            // supply (and so the plate DC) at once and thumped (a 0.3 -> 1
+            // sag change gave a 0.0975 step on a -20 dBFS tone).
+            sagSmoother_.setTargetValue(sagR_);
+            const bool sagRamping = sagSmoother_.isSmoothing();
+            if (sagRamping)
+                sagSmoother_.processBlock(
+                    std::span<double>(sagRamp_.data(), static_cast<size_t>(osN)));
+
             // Advance the transition once per internal frame, shared by all
             // channels. The inactive circuit stops at the exact ramp endpoint,
             // even if the host's block extends beyond it.
@@ -1083,7 +1105,8 @@ public:
                         if (st != target && i >= transitionSamples) continue;
                         compensationScratch_[st][static_cast<size_t>(i)] =
                             channels_[st][static_cast<size_t>(ch)]->template processSample<false>(
-                                x, static_cast<int>(st) + 1, sagR_);
+                                x, static_cast<int>(st) + 1,
+                                sagRamping ? sagRamp_[static_cast<size_t>(i)] : sagR_);
                     }
                 }
                 if (osOn)
@@ -1117,7 +1140,7 @@ public:
             const double w = position * position * (3.0 - 2.0 * position);
             const double current = (1.0 - w) * channels_[0][0]->supplyCurrent()
                                  + w * channels_[1][0]->supplyCurrent();
-            supplyNow_.store(static_cast<T>(kBplus - sagR_ * current),
+            supplyNow_.store(static_cast<T>(kBplus - sagSmoother_.getCurrentValue() * current),
                              std::memory_order_relaxed);
         }
 
@@ -1139,7 +1162,6 @@ public:
         dryPos_ = (dryPos_ + nS) & (drySize_ - 1);
     }
 
-private:
     // -- Circuit constants (classic 12AX7 common-cathode stage) -------------------
     static constexpr double kBplus = 300.0;
     static constexpr double kRL = detail::TubePreampCurrentTable::kRL;
@@ -2344,6 +2366,8 @@ private:
     std::array<std::vector<double>, 2> compensationScratch_;
     SmoothedValue<double> stageBlend_;
     std::vector<double> stageRamp_;
+    SmoothedValue<double> sagSmoother_;         ///< Sag resistance ramp (internal clock).
+    std::vector<double> sagRamp_;
     int stageWarmupRemaining_ = 0;
     bool bothStagesActive_ = false;
     bool gainsInitialized_ = false;

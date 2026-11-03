@@ -58,6 +58,10 @@
  * Scope note: nonlinear roots cover one-port nonlinearities; multi-port
  * nonlinear roots (triode inside the WDF tree) remain future work.
  *
+ * A non-finite incident wave at a root (a NaN or infinite source voltage)
+ * resets the tree instead of being scattered, so it cannot stay in the
+ * reactive states; the next finite input continues from rest.
+ *
  * Dependencies: DspMath.h.
  */
 
@@ -385,6 +389,13 @@ public:
     void process() noexcept
     {
         const T a = tree_.reflected();
+        // A non-finite source or wave would stay in the reactive states for
+        // good: clear the tree instead, so the next finite input recovers.
+        if (!std::isfinite(a) || !std::isfinite(vs_)) [[unlikely]]
+        {
+            tree_.reset();
+            return;
+        }
         tree_.incident(T(2) * vs_ - a);
     }
 
@@ -471,6 +482,14 @@ public:
     void process() noexcept
     {
         const double a = static_cast<double>(tree_.reflected());
+        // Non-finite wave (a NaN/Inf source): clear the tree rather than
+        // leave it in the capacitor states forever.
+        if (!std::isfinite(a)) [[unlikely]]
+        {
+            tree_.reset();
+            v_ = 0.0;
+            return;
+        }
         const double k = 2.0 * tree_.portResistance() * static_cast<double>(is_);
         const double nvt = static_cast<double>(nvt_);
 
@@ -529,6 +548,12 @@ public:
     void process() noexcept
     {
         const double a = static_cast<double>(tree_.reflected());
+        if (!std::isfinite(a)) [[unlikely]]
+        {
+            tree_.reset();
+            v_ = 0.0;
+            return;
+        }
         const double k = tree_.portResistance() * static_cast<double>(is_);
         const double nvt = static_cast<double>(nvt_);
 

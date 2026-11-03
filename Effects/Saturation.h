@@ -119,11 +119,16 @@ public:
     {
         T x    = sample * drive;
         T bias = character * T(0.3);
+        const int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
         if (!this->antialias_.load(std::memory_order_relaxed))
+        {
+            // Keep the ADAA history current, so enabling ADAA mid-stream
+            // starts from the real previous input (a stale one glitched).
+            prevX_[static_cast<size_t>(c)] = static_cast<double>(x);
             return fastTanh(x + bias) - fastTanh(bias);
+        }
 
         // ADAA of f(x) = tanh(x+bias) - tanh(bias); antiderivative log(cosh(x+bias)) - tanh(bias)*x.
-        const int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
         const double xd = static_cast<double>(x);
         const double b  = static_cast<double>(bias);
         const double x0 = prevX_[static_cast<size_t>(c)];
@@ -137,15 +142,19 @@ public:
 };
 
 // -- Tube (12AX7-style asymmetric triode model) -----------------------------
+// A biased tanh, DC-free at rest and normalised to unit small-signal slope:
+// f(x) = (tanh(x + b) - tanh(b)) / (1 - tanh(b)^2). The bias moves the
+// operating point, so the curve is smooth everywhere and its even harmonics
+// grow with level as a triode's do. (The previous form switched between
+// tanh(x) and tanh(1.15 x) at x = 0: a slope kink that left a 2nd harmonic of
+// -30.6 dBc at every level down to -60 dBFS and aliased at -42.7 dBc at 2x.)
+// b = -0.7 * (asym - 1), asym = 1.15 + 0.5 * character, matches the former
+// 2nd harmonic at -6 dBFS; negative excursions still compress first.
 template <typename T>
 class TubeAlgorithm final : public SaturationAlgorithm<T>
 {
     std::array<double, SaturationAlgorithm<T>::kAaCh> prevX_ {};
 
-    static inline double f1(double x, double asym) noexcept
-    {
-        return (x >= 0.0) ? logCosh(x) : logCosh(x * asym) / asym;
-    }
 public:
     void prepare(const AudioSpec&) noexcept override { reset(); }
     void reset() noexcept override { prevX_.fill(0.0); }
@@ -153,61 +162,70 @@ public:
 
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
-        T x = sample * drive;
-        T asym = T(1.15) + character * T(0.5);
-        if (!this->antialias_.load(std::memory_order_relaxed))
-            return (x >= T(0)) ? fastTanh(x) : fastTanh(x * asym);
-
-        // ADAA of the asymmetric triode curve; antiderivative is piecewise log(cosh).
+        const T x = sample * drive;
+        const T b = T(-0.7) * (T(0.15) + character * T(0.5));
         const int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
+        if (!this->antialias_.load(std::memory_order_relaxed))
+        {
+            prevX_[static_cast<size_t>(c)] = static_cast<double>(x);
+            const T tb = fastTanh(b);
+            return (fastTanh(x + b) - tb) / (T(1) - tb * tb);
+        }
+
+        // ADAA: antiderivative (log(cosh(x + b)) - tanh(b) * x) / (1 - tanh(b)^2).
         const double xd = static_cast<double>(x);
-        const double a  = static_cast<double>(asym);
+        const double bd = static_cast<double>(b);
+        const double tb = std::tanh(bd);
+        const double norm = 1.0 / (1.0 - tb * tb);
         const double x0 = prevX_[static_cast<size_t>(c)];
         prevX_[static_cast<size_t>(c)] = xd;
         const double dx = xd - x0;
         if (std::abs(dx) > 1e-7)
-            return static_cast<T>((f1(xd, a) - f1(x0, a)) / dx);
-        const double m = 0.5 * (xd + x0);
-        return static_cast<T>((m >= 0.0) ? std::tanh(m) : std::tanh(m * a));
+            return static_cast<T>(((logCosh(xd + bd) - logCosh(x0 + bd)) / dx - tb) * norm);
+        return static_cast<T>((std::tanh(0.5 * (xd + x0) + bd) - tb) * norm);
     }
 };
 
 // -- HardClip ----------------------------------------------------------------
+// First-order ADAA over every sample, in double. (A "linear body" shortcut
+// used to pass unclipped pairs through un-averaged: it switched between a 0
+// and a 0.5 sample delay at every clip edge, and that made the antialiased
+// path alias MORE than the plain one, e.g. -51.6 vs -135.2 dBc at 2x, +6 dB.)
 template <typename T>
 class HardClipAlgorithm final : public SaturationAlgorithm<T>
 {
-    std::array<T, SaturationAlgorithm<T>::kAaCh> prevX_ {};
+    std::array<double, SaturationAlgorithm<T>::kAaCh> prevX_ {};
 
     /** Antiderivative of clamp(u,-1,1): u^2/2 inside, |u|-1/2 outside. */
-    static inline T g(T u) noexcept
+    static inline double g(double u) noexcept
     {
-        T a = std::abs(u);
-        return (a <= T(1)) ? T(0.5) * u * u : a - T(0.5);
+        const double a = std::abs(u);
+        return (a <= 1.0) ? 0.5 * u * u : a - 0.5;
     }
 public:
     void prepare(const AudioSpec&) noexcept override { reset(); }
-    void reset() noexcept override { prevX_.fill(T(0)); }
+    void reset() noexcept override { prevX_.fill(0.0); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::HardClip; }
 
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
-        T bias = character * T(0.3);
-        T cb = std::clamp(bias, T(-1), T(1));
-        T d = sample * drive;
+        const T bias = character * T(0.3);
+        const T cb = std::clamp(bias, T(-1), T(1));
+        const T d = sample * drive;
+        const int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
         if (!this->antialias_.load(std::memory_order_relaxed))
+        {
+            prevX_[static_cast<size_t>(c)] = static_cast<double>(d);
             return std::clamp(d + bias, T(-1), T(1)) - cb;
+        }
 
-        // ADAA of the hard clip; antiderivative is the piecewise quadratic g().
-        int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
-        T d0 = prevX_[c];
-        prevX_[c] = d;
-        T u = d + bias, u0 = d0 + bias;
-        if (u >= T(-1) && u <= T(1) && u0 >= T(-1) && u0 <= T(1))
-            return u - cb;     // linear body (below the clip point): pass through, no averaging (no HF roll-off)
-        T dd = d - d0;
-        if (std::abs(dd) > T(1e-5))
-            return (g(u) - g(u0)) / dd - cb;
-        return std::clamp(T(0.5) * (d + d0) + bias, T(-1), T(1)) - cb;
+        const double dd = static_cast<double>(d), b = static_cast<double>(bias);
+        const double d0 = prevX_[static_cast<size_t>(c)];
+        prevX_[static_cast<size_t>(c)] = dd;
+        const double u = dd + b, u0 = d0 + b, diff = dd - d0;
+        if (std::abs(diff) > 1e-7)
+            return static_cast<T>((g(u) - g(u0)) / diff - static_cast<double>(cb));
+        return static_cast<T>(std::clamp(0.5 * (u + u0), -1.0, 1.0) - static_cast<double>(cb));
     }
 };
 
@@ -575,12 +593,14 @@ public:
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
         // Inter-stage makeup undoes each stage's fixed small-signal factor
-        // (1/0.5, 1/0.6) so the cascade is gain-staged: roughly transparent
+        // (1/0.5, 1/0.6, 1/0.8) so the cascade is gain-staged: transparent
         // at neutral drive instead of a flat -15 dB drop, and every stage
-        // keeps receiving a healthy level.
+        // keeps receiving a healthy level. (The last stage's 0.8 used to be
+        // left in, a -1.9 dB loss that the old Tube curve's +0.6 dB kink gain
+        // partly hid.)
         T tubeOut  = tube_.processSample(sample,  drive * T(0.5), character, ch) * T(2);
         T tapeOut  = tape_.processSample(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
-        return       xfmr_.processSample(tapeOut, drive * T(0.8), character, ch);
+        return       xfmr_.processSample(tapeOut, drive * T(0.8), character, ch) * (T(1) / T(0.8));
     }
 };
 
@@ -699,32 +719,39 @@ public:
         tempBuffer_.resize(spec.numChannels, spec.maxBlockSize * std::max(1, oversamplingFactor_));
         driftBuffer_.resize(spec.numChannels, spec.maxBlockSize * std::max(1, oversamplingFactor_));
         msKeepBuffer_.resize(1, spec.maxBlockSize * std::max(1, oversamplingFactor_));
+        driveRamp_.assign(static_cast<size_t>(spec.maxBlockSize * std::max(1, oversamplingFactor_)), SampleType(1));
+        charRamp_.assign(static_cast<size_t>(spec.maxBlockSize * std::max(1, oversamplingFactor_)), SampleType(0));
 
         // Keep the dry path aligned with the (latent) oversampled wet path so the
         // dry/wet, Delta and adaptive-blend mixes do not comb-filter.
         dryWetMixer_.setLatencyCompensation(
             (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0);
 
+        // Base-rate smoothers (consumed once per base sample).
         auto sr = spec.sampleRate;
-        driveSmoother_.reset(sr, 20.0f, 0.707f, 0.0f);
         mixSmoother_.reset(sr, 20.0f, 1.0f);
-        characterSmoother_.reset(sr, 20.0f, 0.0f);
-        driftSmoother_.reset(sr, 500.0f, 0.0f);
         preHpSmoother_.reset(sr, 30.0f, 0.707f, 20.0f);
         postTiltFreqSmoother_.reset(sr, 30.0f, 0.707f, 1000.0f);
         postTiltGainSmoother_.reset(sr, 30.0f, 0.0f);
         outputGainSmoother_.reset(sr, 20.0f, 0.0f);
-        crossfader_.reset(sr, 10.0f, 1.0f);
+        // Processing-rate state (drive, character, drift, crossfade).
+        configureProcessingRate(false);
 
-        leftDrift_.prepare(sr);
-        rightDrift_.prepare(sr);
-        leftDrift_.reseed(0x9E3779B97F4A7C15ULL);
-        rightDrift_.reseed(0xBF58476D1CE4E5B9ULL);
-        // Smooth the random drift targets (~100 ms): without smoothing the
-        // generators step once per second, modulating the drive in audible
-        // jumps instead of an analog-style slow wander.
-        leftDrift_.setSmoothing(true, SampleType(100));
-        rightDrift_.setSmoothing(true, SampleType(100));
+        // Re-apply the parameters: the smoother resets above restored the
+        // defaults, and a second prepare() (a host re-activation) used to
+        // drop every setting until the next setter (-9.8 dB measured for
+        // drive +24, mix 0.5, output -6 while getState() still reported them).
+        {
+            Params pending;
+            while (paramQueue_.pop(pending)) {}
+            paramsPending_.store(false, std::memory_order_relaxed);
+            Params current;
+            {
+                SpinLock::ScopedLock guard(paramsLock_);
+                current = lastParams_;
+            }
+            applyParamSnapshot(current);
+        }
 
         reset();
         prepared_ = true;
@@ -797,6 +824,17 @@ public:
         if (!prepared_) return;
         handleParameterChanges();
 
+        // Blocks longer than the prepared maximum are processed in pieces
+        // (the scratch buffers and the oversampler hold one maximum block).
+        const int total = buffer.getNumSamples();
+        const int maxBlock = std::max(1, spec_.maxBlockSize);
+        for (int off = 0; off < total; off += maxBlock)
+            processChunk(buffer.getSubView(off, std::min(maxBlock, total - off)));
+    }
+
+private:
+    void processChunk(AudioBufferView<SampleType> buffer) noexcept
+    {
         dryWetMixer_.pushDry(buffer);
 
         // Pre-filter
@@ -926,7 +964,7 @@ public:
         }
     }
 
-    // -- Thread-Safe Setters (GUI / Automation Thread) -----------------------
+public:
 
     /**
      * @brief Sets the saturation algorithm topology.
@@ -999,7 +1037,7 @@ public:
     void setOutputGain(SampleType dB)       { pushParam([&](auto& p){ p.outputGain = dB; }); }
 
     /**
-     * @brief Enables or disables the fixed 10Hz DC Blocker.
+     * @brief Enables or disables the fixed 5 Hz DC blocker.
      * @note Thread-Safe.
      * @param on True to enable DC blocking (default).
      */
@@ -1064,6 +1102,7 @@ public:
      * must be called immediately after.
      * 
      * @param factor The oversampling multiplier. Must be a power of 2 (1, 2, 4, 8, 16). 1 = Off.
+     *        Other values are ignored.
      *        Default 2: at 1x the curves fold their harmonics back into the
      *        band - a 10.1 kHz tone at -6 dBFS through the default SoftClip
      *        left an alias at 17.7 kHz only 34 dB down (46 dB with ADAA);
@@ -1072,7 +1111,7 @@ public:
      */
     void setOversampling(int factor)
     {
-        if (factor < 1 || (factor & (factor - 1)) != 0) return;
+        if (factor < 1 || factor > 16 || (factor & (factor - 1)) != 0) return;
         oversamplingFactor_ = factor;
         if (factor > 1)
         {
@@ -1096,6 +1135,10 @@ public:
 
             dryWetMixer_.setLatencyCompensation(
                 (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0);
+
+            // The drive/character/drift/crossfade clocks follow the factor.
+            configureProcessingRate(true);
+            reset();
         }
     }
 
@@ -1190,6 +1233,39 @@ public:
     }
 
 protected:
+    /** Prepares the state that runs at the processing (oversampled) rate:
+     *  the drive, character and drift smoothers, the algorithm crossfade and
+     *  the drift generators. They were prepared at the base rate, so their
+     *  times shrank by the factor (drive t63 18.7 ms instead of 36 at 2x,
+     *  crossfade 5.3 ms instead of 10, drift retriggering at 2 Hz).
+     *  keepTargets snaps each smoother to its current target. Setup thread. */
+    void configureProcessingRate(bool keepTargets)
+    {
+        const double pr = spec_.sampleRate * static_cast<double>(std::max(1, oversamplingFactor_));
+        driveSmoother_.reset(pr, 20.0f, 0.707f, keepTargets ? driveSmoother_.getTargetValue() : 0.0f);
+        characterSmoother_.reset(pr, 20.0f, keepTargets ? characterSmoother_.getTargetValue() : 0.0f);
+        driftSmoother_.reset(pr, 500.0f, keepTargets ? driftSmoother_.getTargetValue() : 0.0f);
+        crossfader_.reset(pr, 10.0f, 1.0f);
+
+        leftDrift_.prepare(pr);
+        rightDrift_.prepare(pr);
+        leftDrift_.reseed(0x9E3779B97F4A7C15ULL);
+        rightDrift_.reseed(0xBF58476D1CE4E5B9ULL);
+        // Smooth the random drift targets (~100 ms): without smoothing the
+        // generators step once per second, modulating the drive in audible
+        // jumps instead of an analog-style slow wander.
+        leftDrift_.setSmoothing(true, SampleType(100));
+        rightDrift_.setSmoothing(true, SampleType(100));
+
+        // Slew sensitivity is defined per sample at 96 kHz (48 kHz at the
+        // default 2x): a raw sample delta halves with every doubling of rate.
+        slewRateScale_ = static_cast<SampleType>(pr / 96000.0);
+
+        const auto up = static_cast<size_t>(std::max(1, spec_.maxBlockSize) * std::max(1, oversamplingFactor_));
+        if (driveRamp_.size() < up) driveRamp_.assign(up, SampleType(1));
+        if (charRamp_.size() < up) charRamp_.assign(up, SampleType(0));
+    }
+
     struct Params
     {
         Algorithm      algorithm      = Algorithm::SoftClip;
@@ -1376,7 +1452,7 @@ protected:
                 SampleType* data = buffer.getChannel(ch);
                 for (int i = 0; i < nS; ++i) {
                     SampleType dry = data[i];
-                    SampleType delta = dry - prevSlewSample_[ch];
+                    SampleType delta = (dry - prevSlewSample_[ch]) * slewRateScale_;
                     data[i] += std::tanh(std::abs(delta)) * slewAmt * dry;
                     prevSlewSample_[ch] = dry;
                 }
@@ -1405,7 +1481,18 @@ protected:
             }
         }
 
-        // 3. Primary Saturation (and secondary if xfade)
+        // 3. Drive and character trajectories, advanced ONCE per sample and
+        //    shared by both algorithms of a crossfade (each used to advance
+        //    the smoothers again, so a preset change depended on the host's
+        //    block partition by up to 0.45 of full scale).
+        for (int i = 0; i < nS; ++i)
+        {
+            driveRamp_[static_cast<size_t>(i)] =
+                decibelsToGain(static_cast<SampleType>(driveSmoother_.getNextValue()));
+            charRamp_[static_cast<size_t>(i)] = static_cast<SampleType>(characterSmoother_.getNextValue());
+        }
+
+        // 4. Primary Saturation (and secondary if xfade)
         if (xfading)
         {
             auto tempView = tempBuffer_.toView().getSubView(0, nS);
@@ -1519,8 +1606,8 @@ protected:
 
         for (int i = 0; i < nS; ++i)
         {
-            auto driveGainS = decibelsToGain(static_cast<SampleType>(driveSmoother_.getNextValue()));
-            auto charS      = static_cast<SampleType>(characterSmoother_.getNextValue());
+            const SampleType driveGainS = driveRamp_[static_cast<size_t>(i)];
+            const SampleType charS      = charRamp_[static_cast<size_t>(i)];
 
             for (int ch = 0; ch < nCh; ++ch)
             {
@@ -1598,6 +1685,8 @@ protected:
     std::array<SampleType, kMaxCh> prevBlendSample_ {};
 
     std::atomic<SampleType> slewSensitivity_ { SampleType(0) };
+    SampleType slewRateScale_ = SampleType(1);   ///< Processing rate / 96 kHz.
+    std::vector<SampleType> driveRamp_, charRamp_;   ///< Per-sample drive/character (processing rate).
     std::array<SampleType, kMaxCh> prevSlewSample_ {};
 
     float lastPreHpFreq_    = -1.0f;

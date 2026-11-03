@@ -188,6 +188,97 @@ All notable user-facing changes to DSPark are documented here.
   19.9 ns per stereo frame. Readings change by rounding only (under 2e-7);
   the scalar path (double, other targets) is unchanged.
 
+- `TapeMachine` and `TransformerModel` no longer run their makeup
+  calibration inside one callback. Drive automation cost 126% of a
+  64-sample block at 48 kHz stereo (976% at 192 kHz with 128-sample
+  blocks); it is now 14% and 80%. The calibration runs over the next
+  24 ms (tape) or 40 ms (transformer) of audio, and the new
+  drive/makeup/bias set is adopted when it finishes. `TapeMachine` now
+  ramps that set geometrically over about 30 ms instead of stepping it,
+  so a 0 to +24 dB drive step no longer clicks. Default audio: a
+  parameter change now takes effect after the calibration plus the
+  ramp; settled output is unchanged.
+- `Hysteresis` uses a damped alpha transform (a = 0.9) for both the
+  field derivative and the magnetization integral. The plain trapezoid
+  left a permanent alternating dH/dt after any transient. A 0.001*a
+  field tick erased the remanence (now 1.5%), the integration stayed
+  7.5 dB off after an abrupt onset (now -67.6 dB), and `TapeMachine`
+  at 1x fell silent (-221 dB) after 5 s of noise at 96 kHz. Default
+  audio: the default `TapeMachine` output moves at -77 dB relative to
+  the signal (+0.03 dB at 18 kHz, same level), and `TransformerModel`
+  at -98 dB.
+- `TapeMachine` scales its loss FIR with the sample rate (63 taps at
+  48 kHz, 127 at 96 kHz, 255 at 192 kHz). 18 kHz read 2.1 dB lower at
+  192 kHz than at 48 kHz; it is now within 0.2 dB. Default audio at
+  44.1 and 48 kHz: unchanged. At 88.2 to 96 kHz latency grows by 32
+  samples, and at 192 kHz by 96.
+- The `TapeMachine` over-bias roll-off (bias above about 0.57) uses a
+  first-order low-pass whose zero matches the analog gain at Nyquist,
+  and it starts from the signal when it switches on. At bias 1, 18 kHz
+  now reads -5.2 dB at 48 kHz and -4.8 dB at 192 kHz; it was -2.6 and
+  -6.7 dB. The default bias is unaffected.
+- `TapeMachine::setNoise()` gives the requested RMS level. It was
+  13.9 dB low, so hiss that is switched on is now 13.9 dB louder.
+- `TapeMachine`, `TubePreamp`, `Saturation` and `Clipper` process
+  blocks longer than the prepared maximum in pieces. The oversampled
+  paths left the tail of such a block unprocessed. The 1x paths of
+  `TubePreamp` and of `Saturation` (with drift or a crossfade active)
+  overflowed their scratch buffers.
+- `Saturation::prepare()` re-applies the stored parameters. A second
+  `prepare()` reset drive, mix, output gain and the filters to their
+  defaults (-9.8 dB measured) while `getState()` still reported them.
+- `Saturation` runs its drive, character and drift smoothers, its drift
+  generators and its algorithm crossfade at the processing rate, so
+  their times no longer shrink with oversampling. During a crossfade
+  the two algorithms share one drive and character trajectory, so a
+  preset change no longer depends on the host block size (up to 0.28 of
+  full scale before). Slew sensitivity is defined at 96 kHz. Default
+  audio at the default 2x: the drive t63 is 36 ms (was 18.7 ms), the
+  character ramp 20 ms (was 10.7 ms) and an algorithm crossfade 10 ms
+  (was 5.3 ms), as at 1x. Drift wanders at half its former speed.
+  Settled output and slew at 48 kHz/2x are unchanged.
+- The `Saturation` Tube curve (also the first stage of `MultiStage`) is
+  a smooth biased tanh normalised to unit small-signal slope. The
+  former switch between tanh(x) and tanh(1.15x) at zero left a 2nd
+  harmonic of -30.6 dBc at every level. Default audio for Tube: H2 is
+  -85.5 dBc at -60 dBFS and -32.5 dBc at -6 dBFS (was -30.6 and
+  -33.0). The gain is 0 dB at -50 dBFS (was +0.63 dB) and -0.50 dB at
+  -9 dBFS (was +0.03 dB). The ceilings are +1.11/-0.91 at character 0
+  (were +1/-1). The worst alias at 2x and drive 0 falls from -42.7 to
+  -60.6 dBc. `MultiStage` now also undoes its last stage's 0.8 drive
+  factor, as its comment always claimed, so its gain is +0.01 dB at
+  -50 dBFS and -0.84 dB at -9 dBFS (was -1.29 and -2.28 dB).
+- `Saturation` HardClip antialiasing averages every sample in double. Its
+  "linear body" shortcut switched delay at clip edges and aliased more
+  than the plain curve (-24.6 against -30.1 dBc at +12 dB, 2x). Turning
+  antialiasing on mid-stream no longer averages against a stale input
+  (a 0.031 step on a -20 dBFS tone). Antialiasing is off by default.
+- `Saturation::setOversampling()` ignores factors above 16. It used to
+  report them while running at 16x. The DC blocker is documented at its
+  real 5 Hz.
+- `Clipper` keeps its total gain continuous when the stage count
+  changes. Going from 1 to 4 stages at +18 dB drove a -20 dBFS tone to
+  the ceiling for 20 ms.
+- `TubePreamp` ramps supply sag over about 30 ms. A 0.3 to 1 sag change
+  stepped a -20 dBFS tone by 0.0975.
+- `TransformerModel::reset()` keeps the resonance bell. It wiped the
+  coefficients, so at resonance 1 a 15 kHz tone lost 2.2 dB until the
+  next parameter change.
+- `AnalogRandom::Generator` reads its reseed flag with a relaxed load
+  before exchanging it, and keeps its retrigger flag as a plain member,
+  since only the stream owner touches it. With identical output, a
+  per-sample drift read drops from 9.6 to 2.4 ns and the audio-rate path
+  that `NoiseGenerator` uses from 11.2 to 4.7 ns. Non-finite rates, BPM,
+  ranges and quantization steps are ignored; a NaN or infinite value
+  used to latch the phase or the output at NaN. `getNextDiscreteInt()`
+  over the full int range no longer overflows (it returned `INT_MIN`
+  every time).
+- `wdf` roots reset the tree on a non-finite incident wave or source
+  voltage. One NaN source sample used to keep a diode clipper or the
+  FMV stack at NaN.
+- The `TapeMachine` documentation no longer claims that bias-carrier
+  products always stay out of band. At the default 4x and 48 kHz, a
+  19.25 kHz tone at -6 dBFS leaves a 255 Hz product at -46 dBc.
 
 ## [1.8.1] - 2026-10-13
 

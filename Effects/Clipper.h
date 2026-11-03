@@ -30,6 +30,7 @@
  * Channel handling: without oversampling up to 16 channels are clipped; the
  * dry/wet blend and the oversampled path cover only the prepared channel
  * count, so keep the view within the prepared spec for consistent behaviour.
+ * Blocks longer than the prepared maximum are processed in pieces.
  *
  * @note The ceiling is enforced sample-exactly in the processing (high) rate.
  * With oversampling, the downsampling filter can reconstruct small
@@ -164,6 +165,17 @@ public:
         if (!prepared_.load(std::memory_order_relaxed)) return;
         if (buffer.getNumSamples() == 0 || buffer.getNumChannels() == 0) return;
 
+        // The oversampler and the dry mixer hold one maximum block: longer
+        // blocks used to leave their tail unclipped.
+        const int total = buffer.getNumSamples();
+        const int maxBlock = std::max(1, spec_.maxBlockSize);
+        for (int off = 0; off < total; off += maxBlock)
+            processChunk(buffer.getSubView(off, std::min(maxBlock, total - off)));
+    }
+
+private:
+    void processChunk(AudioBufferView<T> buffer) noexcept
+    {
         T mixVal = mix_.load(std::memory_order_relaxed);
         mixer_.pushDry(buffer);
 
@@ -181,7 +193,7 @@ public:
         mixer_.mixWet(buffer, mixVal);
     }
 
-    // -- Parameters (Thread-Safe Setters/Getters) -------------------------------
+public:
 
     /**
      * @brief Sets the clipping algorithm.
@@ -338,6 +350,15 @@ protected:
         int numStages  = stages_.load(std::memory_order_relaxed);
         T slewMs       = slewLimitMs_.load(std::memory_order_relaxed);
 
+        if (numStages != lastStages_)
+        {
+            // Keep the running TOTAL gain continuous: the per-stage gain of
+            // the old count, applied numStages times, jumped (1 -> 4 stages
+            // at +18 dB drove a -20 dBFS tone to the ceiling for 20 ms).
+            const T total = std::pow(stageGainSm_.getCurrentValue(), static_cast<T>(lastStages_));
+            stageGainSm_.reset(stageGainFor(total, numStages));
+            lastStages_ = numStages;
+        }
         ceilingSm_.setTargetValue(dbToLinear(ceilDb));
         stageGainSm_.setTargetValue(stageGainFor(dbToLinear(gainDb), numStages));
 
@@ -367,6 +388,7 @@ protected:
     /** Jumps both parameter glides to the current targets (prepare/reset). */
     void snapParameters() noexcept
     {
+        lastStages_ = stages_.load(std::memory_order_relaxed);
         ceilingSm_.reset(dbToLinear(ceilingDb_.load(std::memory_order_relaxed)));
         stageGainSm_.reset(stageGainFor(dbToLinear(inputGainDb_.load(std::memory_order_relaxed)),
                                         stages_.load(std::memory_order_relaxed)));
@@ -491,6 +513,7 @@ protected:
     static constexpr int kChunk = 256;
     SmoothedValue<T> stageGainSm_;
     SmoothedValue<T> ceilingSm_;
+    int lastStages_ = 1;   ///< Stage count the stage-gain glide refers to.
     std::array<T, kChunk> gainRamp_ {};
     std::array<T, kChunk> ceilRamp_ {};
 

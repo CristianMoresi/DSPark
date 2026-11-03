@@ -22,11 +22,22 @@
  * The gate dltM zeroes the irreversible term whenever magnetization would
  * move unphysically against the drive direction at reversal points.
  *
- * Integration is trapezoidal (matching the WDF/bilinear convention used
- * throughout the framework) solved per sample with a Newton-Raphson
- * iteration on M_n, seeded by an explicit Euler predictor -- converges in
- * 1-3 iterations at audio rates. All internal state is double regardless of
- * T: the model mixes quantities spanning ~9 orders of magnitude.
+ * Integration uses the alpha transform (a damped trapezoid) for BOTH the field
+ * derivative and the magnetization integral:
+ *
+ *   dH_n = (1+a) fs (H_n - H_{n-1}) - a dH_{n-1}
+ *   M_n  = M_{n-1} + T/(1+a) * (W_n + a W_{n-1}),   a = 0.9
+ *
+ * The pair is exact on the linear part (the derivative and the integral
+ * cancel), and the derivative's pole sits at z = -a instead of on the unit
+ * circle. With the plain trapezoid (a = 1) any transient left a permanent
+ * alternating dH/dt that erased the loop's remanence (a 0.001*a field tick
+ * erased all of it within 50 ms; now 1.5%), kept a -7.5 dB error after any
+ * abrupt onset, and at 1x in TapeMachine could pin the core silent. Solved
+ * per sample by Newton-Raphson on M_n, seeded by an explicit Euler predictor;
+ * converges in 1-3 iterations at audio rates. All internal state is double
+ * regardless of T: the model mixes quantities spanning ~9 orders of
+ * magnitude.
  *
  * Verified by the test suite on first principles: odd symmetry of the B-H
  * loop, monotone loop area vs the loss parameter k, remanence after field
@@ -133,18 +144,21 @@ public:
         if (!std::isfinite(fieldH)) return static_cast<T>(m_);
 
         const double h = static_cast<double>(fieldH);
-        const double hDot = fs2_ * (h - hPrev_) - hDotPrev_;
+        const double hDot = (1.0 + kAlpha) * 0.5 * fs2_ * (h - hPrev_) - kAlpha * hDotPrev_;
 
-        // Explicit predictor, then trapezoidal corrector with Newton steps.
+        // Explicit predictor, then the matching alpha-transform corrector
+        // with Newton steps.
+        constexpr double kGain = 1.0 / (1.0 + kAlpha);
+        const double step = 2.0 * invFs2_ * kGain;          // T / (1 + a)
         double m = m_ + 2.0 * invFs2_ * wPrev_;
-        const double rhs = m_ + invFs2_ * wPrev_;
+        const double rhs = m_ + step * kAlpha * wPrev_;
 
         double w = 0.0, dwdm = 0.0;
         for (int it = 0; it < 4; ++it)
         {
             evaluate(m, h, hDot, w, dwdm);
-            const double g  = m - rhs - invFs2_ * w;
-            const double gp = 1.0 - invFs2_ * dwdm;
+            const double g  = m - rhs - step * w;
+            const double gp = 1.0 - step * dwdm;
             const double dm = g / gp;
             m -= dm;
             if (std::abs(dm) < 1e-9 * ms_)
@@ -245,6 +259,10 @@ private:
         const double dDen  = -alpha_ * c_ * chi_ * dLp;
         dwdm = hDot * (dNum * den - num * dDen) / (den * den);
     }
+
+    /// Damping of the alpha transform: the derivative's homogeneous mode
+    /// decays by 0.9 per sample (it was undamped at 1).
+    static constexpr double kAlpha = 0.9;
 
     // -- Members ----------------------------------------------------------------
     double ms_ = 3.5e5, a_ = 2.2e4, alpha_ = 1.6e-3, k_ = 2.7e4, c_ = 1.7e-1;

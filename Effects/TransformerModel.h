@@ -36,7 +36,10 @@
  *   the flux regime music drives the core into; same convention as
  *   TapeMachine/TubePreamp): drive changes iron, not volume. Gain changes
  *   are ramped (~50 ms), which matters doubly here because the model
- *   differentiates its output.
+ *   differentiates its output. A parameter change re-calibrates on a
+ *   scratch core spread over the following blocks (one internal sample per
+ *   internal sample of audio, about 40 ms of audio) instead of inside one
+ *   callback; the new (drive, makeup) pair is adopted when it completes.
  *
  * The core runs at 2x oversampling by DEFAULT, configurable with
  * setOversampling(int) (setup thread only; it reallocates and re-calibrates
@@ -142,8 +145,15 @@ public:
             ch.hyst.setParameters(3.5e5, 2.2e4, 1.6e-3, 3.2e4, 0.25);
         }
 
+        // The first calibration runs here, on the setup thread; later
+        // parameter changes calibrate incrementally inside processBlock().
+        dirty_.store(false, std::memory_order_relaxed);
+        recomputeLinear();
+        calActive_ = false;
+        calRestart_ = false;
+        startCalibration();
+        stepCalibration(calN_);
         prepared_.store(true, std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_release);
         reset();
     }
 
@@ -159,7 +169,9 @@ public:
             ch.vPrev2 = 0.0;
             ch.mPrev = 0.0;
             ch.hpX = ch.hpY = 0.0;
-            ch.bell = {};
+            // State only: assigning {} also wiped the bell coefficients, which
+            // removed the resonance until the next parameter change.
+            ch.bell.z1 = ch.bell.z2 = 0.0;
         }
         for (auto& d : dryRing_)
             std::fill(d.begin(), d.end(), T(0));
@@ -291,7 +303,11 @@ public:
         // always sees the values published before the flag.
         if (dirty_.load(std::memory_order_relaxed)
             && dirty_.exchange(false, std::memory_order_acquire))
-            recompute();
+        {
+            recomputeLinear();
+            if (calActive_) calRestart_ = true;
+            else startCalibration();
+        }
 
         for (int off = 0; off < nS; off += maxBlock_)
             processChunk(buffer.getSubView(off, std::min(maxBlock_, nS - off)), nCh);
@@ -396,6 +412,9 @@ private:
         }
         hScaleSm_ = hEnd;
         mScaleSm_ = mEnd;
+        // Advance a pending calibration by as many internal samples as this
+        // chunk has: bounded work per callback.
+        if (calActive_) stepCalibration(osN);
         if (osOn) oversampler_->downsample(buffer);
 
         for (int ch = 0; ch < nCh; ++ch)
@@ -441,7 +460,9 @@ private:
         BellSection bell;
     };
 
-    void recompute() noexcept
+    /** @brief Applies the linear parameters and records the calibration
+     *  request for the (drive, makeup) pair. */
+    void recomputeLinear() noexcept
     {
         const double drive = std::pow(10.0, static_cast<double>(
             driveDb_.load(std::memory_order_relaxed)) / 20.0);
@@ -461,41 +482,8 @@ private:
         // nominal core; bigger cores take proportionally more flux.
         const double fluxRef = 1.0 / (2.0 * std::numbers::pi * 30.0);
         const double headroom = 0.6 + 0.8 * size;
-        hScale_ = drive * 1.1 * 2.2e4 / (fluxRef * headroom);
-
-        // Loudness calibration at PROGRAM level: 100 Hz at -12 dBFS, the
-        // flux regime music actually drives the core into (flux ~ V/f, so
-        // lows dominate). Calibrating small-signal (the old 0.05 @ 1 kHz)
-        // probed the JA virgin curve, whose susceptibility is an order of
-        // magnitude below the major loop's mean slope - at high drive the
-        // output then came out ~+21 dB over the input (measured x11),
-        // heard as violent level jumps while dragging the drive slider.
-        {
-            Hysteresis<T> cal;
-            cal.prepare(sampleRate_);
-            cal.setParameters(3.5e5, 2.2e4, 1.6e-3, 3.2e4, 0.25);
-            double flux = 0.0, vPrev = 0.0, mPrev = 0.0, vPrev2 = 0.0;
-            double inSq = 0.0, outSq = 0.0;
-            const int n = static_cast<int>(0.04 * sampleRate_);   // 2+2 cycles of 100 Hz
-            for (int i = 0; i < n; ++i)
-            {
-                const double x = 0.25 * std::sin(2.0 * std::numbers::pi * 100.0 * i / sampleRate_);
-                const double fluxNew = leak_ * flux + halfT_ * (x + vPrev);
-                vPrev = x;
-                const double m = static_cast<double>(
-                    cal.processSample(static_cast<T>(hScale_ * fluxNew)));
-                double v = (m - leak_ * mPrev) * invHalfT_ - kDiffRho * vPrev2;
-                vPrev2 = v;
-                mPrev = m;
-                flux = fluxNew;
-                if (i >= n / 2)
-                {
-                    inSq += x * x;
-                    outSq += v * v;
-                }
-            }
-            mScale_ = (outSq > 0.0) ? std::sqrt(inSq / outSq) : 1.0;
-        }
+        calReqH_ = drive * 1.1 * 2.2e4 / (fluxRef * headroom);
+        calReqLeak_ = leak_;
 
         // HF bell: Jensen-style leakage resonance mapped into the top octave.
         const double bellHz = std::min(12000.0 + 6000.0 * res, 0.42 * sampleRate_);
@@ -507,6 +495,59 @@ private:
             ch.bell = BellSection { bc.b0, bc.b1, bc.b2, bc.a1, bc.a2, 0.0, 0.0 };
             ch.bell.z1 = pz1;
             ch.bell.z2 = pz2;
+        }
+    }
+
+    /** Loudness calibration at PROGRAM level: 100 Hz at -12 dBFS, the flux
+     *  regime music actually drives the core into (flux ~ V/f, so lows
+     *  dominate). Calibrating small-signal (the old 0.05 @ 1 kHz) probed the
+     *  JA virgin curve, whose susceptibility is an order of magnitude below
+     *  the major loop's mean slope - at high drive the output then came out
+     *  ~+21 dB over the input (measured x11). */
+    void startCalibration() noexcept
+    {
+        calH_ = calReqH_;
+        calLeak_ = calReqLeak_;
+        cal_.prepare(sampleRate_);
+        cal_.setParameters(3.5e5, 2.2e4, 1.6e-3, 3.2e4, 0.25);
+        calFlux_ = calVPrev_ = calMPrev_ = calVPrev2_ = 0.0;
+        calInSq_ = calOutSq_ = 0.0;
+        calN_ = static_cast<int>(0.04 * sampleRate_);   // 2+2 cycles of 100 Hz
+        calI_ = 0;
+        calActive_ = true;
+    }
+
+    /** @brief Runs up to `budget` calibration samples; adopts the (drive,
+     *  makeup) pair when the calibration completes. */
+    void stepCalibration(int budget) noexcept
+    {
+        const int stop = std::min(calN_, calI_ + std::max(budget, 0));
+        for (; calI_ < stop; ++calI_)
+        {
+            const int i = calI_;
+            const double x = 0.25 * std::sin(2.0 * std::numbers::pi * 100.0 * i / sampleRate_);
+            const double fluxNew = calLeak_ * calFlux_ + halfT_ * (x + calVPrev_);
+            calVPrev_ = x;
+            const double m = static_cast<double>(
+                cal_.processSample(static_cast<T>(calH_ * fluxNew)));
+            const double v = (m - calLeak_ * calMPrev_) * invHalfT_ - kDiffRho * calVPrev2_;
+            calVPrev2_ = v;
+            calMPrev_ = m;
+            calFlux_ = fluxNew;
+            if (i >= calN_ / 2)
+            {
+                calInSq_ += x * x;
+                calOutSq_ += v * v;
+            }
+        }
+        if (calI_ < calN_) return;
+        mScale_ = (calOutSq_ > 0.0) ? std::sqrt(calInSq_ / calOutSq_) : 1.0;
+        hScale_ = calH_;
+        calActive_ = false;
+        if (calRestart_)
+        {
+            calRestart_ = false;
+            startCalibration();
         }
     }
 
@@ -541,6 +582,14 @@ private:
     std::atomic<T> resonance_ { T(0.3) };
     std::atomic<T> mix_ { T(1) };
     std::atomic<bool> dirty_ { true };
+
+    // Incremental calibration (audio thread after prepare()).
+    Hysteresis<T> cal_;
+    double calReqH_ = 1.0, calReqLeak_ = 0.999, calH_ = 1.0, calLeak_ = 0.999;
+    double calFlux_ = 0.0, calVPrev_ = 0.0, calMPrev_ = 0.0, calVPrev2_ = 0.0;
+    double calInSq_ = 0.0, calOutSq_ = 0.0;
+    int calN_ = 0, calI_ = 0;
+    bool calActive_ = false, calRestart_ = false;
 };
 
 } // namespace dspark

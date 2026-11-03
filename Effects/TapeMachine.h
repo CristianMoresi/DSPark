@@ -33,8 +33,9 @@
  * 3. **Playback loss effects** with the physical formulas (Kadis): spacing
  *    loss 54.6*d/lambda dB, gap loss sinc(pi*g/lambda), thickness loss
  *    (1-e^(-4*pi*delta/lambda))/(4*pi*delta/lambda), with lambda =
- *    speed/frequency - rendered into a 63-tap linear-phase FIR per speed,
- *    plus the speed-dependent head-bump resonance (45/90/180 Hz at
+ *    speed/frequency - rendered into a linear-phase FIR per speed (63 taps
+ *    at 48 kHz, scaled with the rate so the response is the same at every
+ *    rate), plus the speed-dependent head-bump resonance (45/90/180 Hz at
  *    7.5/15/30 ips).
  * 4. **Wow & flutter**: one shared transport modulation (slow drift random
  *    walk + 0.55 Hz wow + 8.3/23 Hz flutter + scrape band) driving a
@@ -60,9 +61,14 @@
  * published with a release store and consumed at the next block). prepare()
  * is setup-thread only (allocates; invalid specs are ignored and an
  * unprepared instance passes audio through). reset() belongs to the stream
- * owner. getState()/setState() are setup/UI threads. The recompute on a
- * parameter change runs a short scratch calibration on the audio thread
- * (allocation-free, a few thousand samples of model time).
+ * owner. getState()/setState() are setup/UI threads. A parameter change
+ * re-calibrates the drive makeup on a scratch push-pull pair, spread over
+ * the following blocks (one internal sample of calibration per internal
+ * sample of audio, about 24 ms of audio, allocation-free) instead of running
+ * it all inside one callback. The calibrated (drive, makeup, bias) set is
+ * adopted when its calibration completes and reached through a ~30 ms
+ * geometric ramp, so automation neither overruns the callback nor clicks.
+ * Blocks longer than the prepared maximum are processed in pieces.
  *
  * Cost: the push-pull biased core runs two JA solvers at the active
  * oversampling factor (4x default), ~11% of one core at 48 kHz stereo on a
@@ -191,10 +197,28 @@ public:
                 h = PeakSection { hc.b0, hc.b1, hc.b2, hc.a1, hc.a2, 0.0, 0.0 };
         }
 
+        // Loss FIR: 63 taps at 48 kHz, scaled with the rate so the design
+        // grid keeps the same frequency spacing (a fixed 63 taps at 192 kHz
+        // smeared the reproduce-gap cut: -3.67 dB at 18 kHz instead of -1.57).
+        firLen_ = std::max(kFirLenAt48k,
+                           64 * static_cast<int>(std::lround(sampleRate_ / 48000.0)) - 1);
+        firCenter_ = (firLen_ - 1) / 2;
+        firHalf_ = 1;
+        while (firHalf_ < firLen_ + 1) firHalf_ <<= 1;
         firState_.assign(static_cast<size_t>(numChannels_),
-                         std::vector<T>(static_cast<size_t>(kFirRing), T(0)));
+                         std::vector<T>(static_cast<size_t>(2 * firHalf_), T(0)));
         firPos_ = 0;
-        firTaps_.assign(static_cast<size_t>(kFirLen), T(0));
+        firTaps_.assign(static_cast<size_t>(firLen_), T(0));
+        {
+            const int grid = firLen_ + 1;
+            cosTable_.resize(static_cast<size_t>(grid));
+            for (int m = 0; m < grid; ++m)
+                cosTable_[static_cast<size_t>(m)] =
+                    std::cos(2.0 * std::numbers::pi * m / static_cast<double>(grid));
+            designMags_.assign(static_cast<size_t>(grid / 2 + 1), 0.0);
+            designTaps_.assign(static_cast<size_t>(firLen_), 0.0);
+        }
+        overBiasX1_.assign(static_cast<size_t>(numChannels_), 0.0);
 
         // Transport delay scales with the rate so the wow excursion (sized in
         // samples at 48k, scaled by fs/48k) always fits under the centre.
@@ -212,15 +236,25 @@ public:
         scrapeA1_ = std::exp(-2.0 * std::numbers::pi * 90.0 * dt);
         scrapeA2_ = std::exp(-2.0 * std::numbers::pi * 40.0 * dt);
 
-        latency_ = (oversampler_ ? oversampler_->getLatency() : 0) + kFirCenter + delayCenter_;
+        latency_ = (oversampler_ ? oversampler_->getLatency() : 0) + firCenter_ + delayCenter_;
         drySize_ = 1;
         while (drySize_ < latency_ + maxBlock_ + 1) drySize_ <<= 1;
         dryRing_.assign(static_cast<size_t>(numChannels_),
                         std::vector<T>(static_cast<size_t>(drySize_), T(0)));
         dryPos_ = 0;
 
+        // The first calibration runs here, on the setup thread; later
+        // parameter changes calibrate incrementally inside processBlock().
+        dirty_.store(false, std::memory_order_relaxed);
+        recomputeLinear();
+        calActive_ = false;
+        calRestart_ = false;
+        startCalibration();
+        stepCalibration(calN_);
+        hSm_ = hScale_;
+        mSm_ = mScale_;
+        bSm_ = biasAmp_;
         prepared_.store(true, std::memory_order_relaxed);
-        dirty_.store(true, std::memory_order_release);
         reset();
     }
 
@@ -238,6 +272,7 @@ public:
         for (auto& s : playHF_) s.clear();
         for (auto& s : playLF_) s.clear();
         for (auto& v : overBiasLp_) v = 0.0;
+        for (auto& v : overBiasX1_) v = 0.0;
         // Clear STATE only: wiping coefficients here used to leave the head
         // bump at identity until the next parameter change re-ran recompute.
         for (auto& b : headBump_) b.clear();
@@ -254,6 +289,9 @@ public:
         scrapeLp1_ = scrapeLp2_ = 0.0;
         rng_ = 0x1357feedu;
         rngNoise_ = 0x2468beefu;
+        hSm_ = hScale_;   // no fade-in on start; a running calibration continues
+        mSm_ = mScale_;
+        bSm_ = biasAmp_;
         if (oversampler_) oversampler_->reset();
     }
 
@@ -354,8 +392,9 @@ public:
         wowFlutter_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
-    /** @brief Tape hiss level in dBFS (e.g. -55 for audible vintage hiss);
-     *  values <= -120 disable it (default). Non-finite values are ignored. */
+    /** @brief Tape hiss RMS level in dBFS (e.g. -55 for audible vintage
+     *  hiss); values <= -120 disable it (default). Non-finite values are
+     *  ignored. The level was 13.9 dB below the setting before. */
     void setNoise(T dbfs) noexcept
     {
         if (!std::isfinite(dbfs)) return;
@@ -458,11 +497,24 @@ public:
         }
 
         // Acquire pairs with the setters' release stores so the recompute
-        // always sees the values published before the flag.
+        // always sees the values published before the flag. Linear stages
+        // change at once; the drive makeup calibrates over the next blocks.
         if (dirty_.load(std::memory_order_relaxed)
             && dirty_.exchange(false, std::memory_order_acquire))
-            recompute();
+        {
+            recomputeLinear();
+            if (calActive_) calRestart_ = true;
+            else startCalibration();
+        }
 
+        for (int off = 0; off < nS; off += maxBlock_)
+            processChunk(buffer.getSubView(off, std::min(maxBlock_, nS - off)), nCh);
+    }
+
+private:
+    void processChunk(AudioBufferView<T> buffer, int nCh) noexcept
+    {
+        const int nS = buffer.getNumSamples();
         const T mixTarget = mix_.load(std::memory_order_relaxed);
         const T mixStart  = currentMix_;
         const double noiseAmp = std::pow(10.0, static_cast<double>(
@@ -503,28 +555,66 @@ public:
             auto osView = osOn ? oversampler_->upsample(buffer) : buffer;
             const int osN = osView.getNumSamples();
             const int phaseStart = biasPhase_;
+            // Geometric ramps of the calibrated set (drive, makeup, bias):
+            // the pair spans orders of magnitude, so power-law interpolation
+            // keeps it on its calibration curve (as in TransformerModel).
+            double hRat = 1.0, mRat = 1.0, bRat = 1.0;
+            double hEnd = hSm_, mEnd = mSm_, bEnd = bSm_;
+            if (osN > 0 && (hSm_ != hScale_ || mSm_ != mScale_ || bSm_ != biasAmp_))
+            {
+                const double kSm = 1.0 - std::exp(-static_cast<double>(osN)
+                    / (kGainRampSeconds * sampleRate_ * static_cast<double>(osFactor_)));
+                const auto glide = [kSm](double from, double to) noexcept
+                {
+                    const double e = from * std::pow(to / from, kSm);
+                    return std::abs(std::log(e / to)) < 1e-9 ? to : e;
+                };
+                hEnd = glide(hSm_, hScale_);
+                mEnd = glide(mSm_, mScale_);
+                bEnd = glide(bSm_, biasAmp_);
+                const double inv = 1.0 / static_cast<double>(osN);
+                hRat = std::pow(hEnd / hSm_, inv);
+                mRat = std::pow(mEnd / mSm_, inv);
+                bRat = std::pow(bEnd / bSm_, inv);
+            }
+            const bool ramping = hRat != 1.0 || mRat != 1.0 || bRat != 1.0;
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* d = osView.getChannel(ch);
                 auto& hp = hysteresis_[static_cast<size_t>(ch)];
                 auto& hn = hysteresisN_[static_cast<size_t>(ch)];
-                const double inScale = hScale_;
-                const double outScale = mScale_ * 0.5;
-                const double B = biasAmp_;
+                double inScale = hSm_, mS = mSm_, B = bSm_;
                 int phase = phaseStart;
                 for (int i = 0; i < osN; ++i)
                 {
+                    if (ramping)
+                    {
+                        inScale *= hRat;
+                        mS *= mRat;
+                        B *= bRat;
+                    }
                     const double x = inScale * static_cast<double>(d[i]);
                     const double c = B * kBiasTable[static_cast<size_t>(phase)];
                     phase = (phase + 1) & 7;
                     const double mp = static_cast<double>(hp.processSample(static_cast<T>(x + c)));
                     const double mn = static_cast<double>(hn.processSample(static_cast<T>(x - c)));
-                    d[i] = static_cast<T>(outScale * (mp + mn));
+                    d[i] = static_cast<T>((mS * 0.5) * (mp + mn));
                 }
             }
+            hSm_ = hEnd;
+            mSm_ = mEnd;
+            bSm_ = bEnd;
             biasPhase_ = (phaseStart + osN) & 7;
+            // Advance a pending makeup calibration by as many internal
+            // samples as this block has: bounded work per callback.
+            if (calActive_) stepCalibration(osN);
             if (osOn) oversampler_->downsample(buffer);
         }
+
+        // The over-bias low-pass starts from the signal it receives, not from
+        // rest: switching it on with a zero state stepped the output.
+        const bool overBiasStart = overBiasOn_ && !overBiasActive_;
+        overBiasActive_ = overBiasOn_;
 
         // 4-6. Loss FIR + head bump, transport modulation, playback EQ, noise, mix.
         for (int i = 0; i < nS; ++i)
@@ -540,12 +630,12 @@ public:
             {
                 T* d = buffer.getChannel(ch);
 
-                // Loss FIR (linear phase, 63 taps) on a per-channel ring.
+                // Loss FIR (linear phase) on a per-channel mirrored ring.
                 auto& fir = firState_[static_cast<size_t>(ch)];
                 fir[static_cast<size_t>(firPos_)] = d[i];
-                fir[static_cast<size_t>(firPos_ + kFirRing / 2)] = d[i]; // mirrored
-                const T* win = &fir[static_cast<size_t>(firPos_ + kFirRing / 2 - (kFirLen - 1))];
-                T y = simd::dotProduct(firTaps_.data(), win, kFirLen);
+                fir[static_cast<size_t>(firPos_ + firHalf_)] = d[i]; // mirrored
+                const T* win = &fir[static_cast<size_t>(firPos_ + firHalf_ - (firLen_ - 1))];
+                T y = simd::dotProduct(firTaps_.data(), win, firLen_);
 
                 // Head bump resonance.
                 y = headBump_[static_cast<size_t>(ch)].process(y);
@@ -570,12 +660,19 @@ public:
                         playHF_[static_cast<size_t>(ch)].process(static_cast<double>(w))));
 
                 // Over-bias self-erasure: wider recording zone partially
-                // erases short wavelengths (one-pole LP engaged above nominal
-                // bias only; identity at or below nominal).
-                if (overBiasA_ > 0.0)
+                // erases short wavelengths (first-order low-pass engaged above
+                // nominal bias only; identity at or below nominal). Its zero
+                // matches the analog magnitude at Nyquist, so the roll-off is
+                // the same at every rate (the plain one-pole fell 4 dB short
+                // at 18 kHz at 48 kHz).
+                if (overBiasOn_)
                 {
                     auto& lp = overBiasLp_[static_cast<size_t>(ch)];
-                    lp += overBiasA_ * (static_cast<double>(w) - lp);
+                    auto& x1 = overBiasX1_[static_cast<size_t>(ch)];
+                    const double xin = static_cast<double>(w);
+                    if (overBiasStart && i == 0) { lp = xin; x1 = xin; }
+                    lp = obB0_ * xin + obB1_ * x1 + obP_ * lp;
+                    x1 = xin;
                     w = static_cast<T>(lp);
                 }
 
@@ -589,7 +686,7 @@ public:
                 {
                     rngNoise_ = rngNoise_ * 1664525u + 1013904223u;
                     const double n1 = static_cast<double>(rngNoise_ >> 8) / 8388608.0 - 1.0;
-                    w += static_cast<T>(noiseAmp * n1 * 0.35);
+                    w += static_cast<T>(noiseAmp * n1 * kUniformToUnitRms);
                 }
 
                 // Latency-compensated mix.
@@ -600,14 +697,13 @@ public:
                 d[i] = drySample + (w - drySample) * mixVal;
             }
 
-            firPos_ = (firPos_ + 1) & (kFirRing / 2 - 1);
+            firPos_ = (firPos_ + 1) & (firHalf_ - 1);
             delayPos_ = (delayPos_ + 1) & delayMask_;
         }
         dryPos_ = (dryPos_ + nS) & (drySize_ - 1);
         currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS));
     }
 
-private:
     // -- Building blocks -----------------------------------------------------------
 
     /** @brief One-pole/one-zero section with its exact inverse (double state). */
@@ -663,8 +759,9 @@ private:
         return { n0 / d0, n1 / d0, d1 / d0, 0.0, 0.0 };
     }
 
-    /** @brief Rebuilds everything affected by drive/bias/speed/standard/loss. */
-    void recompute() noexcept
+    /** @brief Rebuilds the linear stages (EQ, losses, head bump, over-bias)
+     *  and records the calibration request for drive, bias and emphasis. */
+    void recomputeLinear() noexcept
     {
         const double driveDbV = static_cast<double>(driveDb_.load(std::memory_order_relaxed));
         const double drive = std::pow(10.0, driveDbV / 20.0);
@@ -685,17 +782,24 @@ private:
         // adds the self-erasure of short wavelengths (wider recording zone)
         // as a one-pole roll-off.
         const double biasB = std::min(6.0, 3.0 * std::pow(9.0, bias - 0.5));
-        biasAmp_ = biasB * 2.2e4;
+        calReq_.biasAmp = biasB * 2.2e4;
         if (biasB > 3.5)
         {
-            // Gentle self-erasure: ~-1.5 dB at 10 kHz per +1 B/a over nominal
-            // (one-pole corner gliding 22 kHz -> ~12.8 kHz at full over-bias).
+            // Gentle self-erasure (corner gliding 22 kHz -> ~12.8 kHz at full
+            // over-bias): first-order low-pass with its pole at the analog
+            // corner and a zero that matches the analog gain at Nyquist.
             const double fc = 22000.0 * (3.5 / biasB);
-            overBiasA_ = 1.0 - std::exp(-2.0 * std::numbers::pi * fc / sampleRate_);
+            const double pole = std::exp(-2.0 * std::numbers::pi * fc / sampleRate_);
+            const double r = 0.5 * sampleRate_ / fc;
+            const double nyq = 1.0 / std::sqrt(1.0 + r * r);
+            obP_ = pole;
+            obB0_ = 0.5 * ((1.0 - pole) + nyq * (1.0 + pole));
+            obB1_ = 0.5 * ((1.0 - pole) - nyq * (1.0 + pole));
+            overBiasOn_ = true;
         }
         else
         {
-            overBiasA_ = 0.0;
+            overBiasOn_ = false;
         }
 
         // --- EQ time constants per standard and speed --------------------------
@@ -725,7 +829,7 @@ private:
         // chain on two scratch instances (a few thousand model samples, only
         // on parameter changes). Quieter material reads slightly low, hotter
         // material blooms into compression - like tape.
-        hScale_ = drive * 1.2 * 2.2e4;
+        calReq_.hScale = drive * 1.2 * 2.2e4;
         {
             // -12 dBFS reference, seen through the record emphasis: at 1 kHz
             // the HF emphasis already lifts the level (about +3.7 dB NAB-15),
@@ -736,50 +840,8 @@ private:
             const double w1 = 2.0 * std::numbers::pi * 1000.0 * t2;
             const double emph1k = std::sqrt((1.0 + kHiCap * kHiCap * w1 * w1)
                                             / (1.0 + w1 * w1));
-            const double kCalAmp = 0.25 * emph1k;
-            // Calibrate through the same internal rate the biased chain runs at.
-            const double fs4 = sampleRate_ * static_cast<double>(osFactor_);
-            // 16 ms settle + 8 ms measured: the biased loop's mean state
-            // needs a few hundred carrier cycles to reach its steady branch.
-            const int calN = static_cast<int>(0.024 * fs4);
-            const int calFrom = (calN * 2) / 3;
-            calib_.prepare(fs4);
-            calib_.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
-            calib2_.prepare(fs4);
-            calib2_.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
-            // Measure the FUNDAMENTAL of the averaged pair (Goertzel-style
-            // correlation), not the raw RMS: the raw output still carries the
-            // even-order carrier residue that the downsampler removes in the
-            // real path, and it would inflate the measurement.
-            const double wCal = 2.0 * std::numbers::pi * 1000.0 / fs4;
-            double outRe = 0.0, outIm = 0.0;
-            int meas = 0;
-            for (int i = 0; i < calN; ++i)
-            {
-                const double s = std::sin(wCal * i);
-                const double x = hScale_ * kCalAmp * s;
-                const double c = biasAmp_ * kBiasTable[static_cast<size_t>(i & 7)];
-                const double m = 0.5
-                    * (static_cast<double>(calib_.processSample(static_cast<T>(x + c)))
-                     + static_cast<double>(calib2_.processSample(static_cast<T>(x - c))));
-                if (i >= calFrom)
-                {
-                    outRe += m * std::cos(wCal * i);
-                    outIm += m * std::sin(wCal * i);
-                    ++meas;
-                }
-            }
-            const double fund = 2.0 * std::sqrt(outRe * outRe + outIm * outIm)
-                              / std::max(1, meas);
-            mScale_ = (fund > 0.0) ? kCalAmp / fund : 1.0;
-
-            // Partial loudness link: the per-drive calibration above pins the
-            // reference level EXACTLY, which kills the drive knob (inaudible
-            // below 0 dB where tape stays clean, a pure attenuator above as
-            // compression eats level). A +0.25 dB/dB residual slope keeps it
-            // alive: backing off cleans AND drops slightly, pushing holds
-            // level while the tape density grows.
-            mScale_ *= std::pow(drive, 0.25);
+            calReq_.calAmp = 0.25 * emph1k;
+            calReq_.drive = drive;
         }
 
         for (int ch = 0; ch < numChannels_; ++ch)
@@ -814,11 +876,11 @@ private:
         constexpr double spacing = 0.5e-6;        // head-tape spacing (m)
         constexpr double thickness = 1.0e-6;      // effective coating depth (m)
 
-        constexpr int kGrid = kFirLen + 1;        // 64-point design grid
-        double mags[kGrid / 2 + 1];
-        for (int kBin = 0; kBin <= kGrid / 2; ++kBin)
+        const int grid = firLen_ + 1;             // design grid (64 points at 48 kHz)
+        double* mags = designMags_.data();
+        for (int kBin = 0; kBin <= grid / 2; ++kBin)
         {
-            const double f = kBin * sampleRate_ / kGrid;
+            const double f = kBin * sampleRate_ / grid;
             double mag = 1.0;
             if (f > 1.0)
             {
@@ -837,41 +899,44 @@ private:
             // amount); it also removes the last even-order bias
             // intermodulation sidebands just below the base-rate Nyquist.
             // Raised-cosine transition 19.5k -> 21.5k avoids the passband
-            // Gibbs ripple of a hard step on the 64-point design grid.
+            // Gibbs ripple of a hard step on the design grid.
             if (f >= 21500.0)
                 mags[kBin] = 0.0;
             else if (f > 19500.0)
                 mags[kBin] *= 0.5 + 0.5 * std::cos(std::numbers::pi * (f - 19500.0) / 2000.0);
         }
-        double taps[kFirLen];
-        for (int n = 0; n < kFirLen; ++n)
+        double* taps = designTaps_.data();
+        for (int n = 0; n < firLen_; ++n)
         {
+            // Frequency sampling with the cosines taken from a table built in
+            // prepare(): the design stays cheap at any FIR length.
+            const int offset = n - firCenter_;
             double acc = mags[0];
-            for (int kBin = 1; kBin < kGrid / 2; ++kBin)
-                acc += 2.0 * mags[kBin]
-                     * std::cos(2.0 * std::numbers::pi * kBin * (n - kFirCenter)
-                                / static_cast<double>(kGrid));
-            acc += mags[kGrid / 2] * std::cos(std::numbers::pi * (n - kFirCenter));
-            const double hann = 0.5 - 0.5 * std::cos(2.0 * std::numbers::pi * (n + 1)
-                                                     / (kFirLen + 1));
-            taps[n] = acc * hann / kGrid;
+            for (int kBin = 1; kBin < grid / 2; ++kBin)
+            {
+                const int idx = ((kBin * offset) % grid + grid) % grid;
+                acc += 2.0 * mags[kBin] * cosTable_[static_cast<size_t>(idx)];
+            }
+            acc += mags[grid / 2] * ((offset & 1) ? -1.0 : 1.0);
+            const double hann = 0.5 - 0.5 * cosTable_[static_cast<size_t>((n + 1) % grid)];
+            taps[n] = acc * hann / grid;
         }
         // Normalize to exact unity at the 1 kHz calibration frequency so the
         // windowing/gap-cut of the design never shifts the calibrated level.
         {
             const double w1k = 2.0 * std::numbers::pi * 1000.0 / sampleRate_;
             double re = 0.0, im = 0.0;
-            for (int n = 0; n < kFirLen; ++n)
+            for (int n = 0; n < firLen_; ++n)
             {
                 re += taps[n] * std::cos(w1k * n);
                 im -= taps[n] * std::sin(w1k * n);
             }
             const double g = std::sqrt(re * re + im * im);
             const double norm = (g > 1e-9) ? 1.0 / g : 1.0;
-            for (int n = 0; n < kFirLen; ++n) taps[n] *= norm;
+            for (int n = 0; n < firLen_; ++n) taps[n] *= norm;
         }
-        for (int n = 0; n < kFirLen; ++n)
-            firTaps_[static_cast<size_t>(kFirLen - 1 - n)] =
+        for (int n = 0; n < firLen_; ++n)
+            firTaps_[static_cast<size_t>(firLen_ - 1 - n)] =
                 static_cast<T>(taps[n]);              // reversed for dotProduct
 
         // --- head bump ----------------------------------------------------------
@@ -885,6 +950,76 @@ private:
             b = PeakSection { bc.b0, bc.b1, bc.b2, bc.a1, bc.a2, 0.0, 0.0 };
             b.z1 = pz1;
             b.z2 = pz2;
+        }
+    }
+
+    /** @brief Starts the drive-makeup calibration for the latest request.
+     *  0 dBFS at nominal drive maps to H = 1.2a. Tape gain is
+     *  level-dependent, so unity can only be defined at one operating point:
+     *  the makeup is measured at -12 dBFS programme level by running a 1 kHz
+     *  burst through the same push-pull biased chain on two scratch
+     *  instances. Quieter material reads slightly low, hotter material blooms
+     *  into compression - like tape. */
+    void startCalibration() noexcept
+    {
+        calRun_ = calReq_;
+        const double fs4 = sampleRate_ * static_cast<double>(osFactor_);
+        // 16 ms settle + 8 ms measured: the biased loop's mean state needs a
+        // few hundred carrier cycles to reach its steady branch.
+        calN_ = static_cast<int>(0.024 * fs4);
+        calFrom_ = (calN_ * 2) / 3;
+        calW_ = 2.0 * std::numbers::pi * 1000.0 / fs4;
+        calib_.prepare(fs4);
+        calib_.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
+        calib2_.prepare(fs4);
+        calib2_.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
+        calI_ = 0;
+        calRe_ = calIm_ = 0.0;
+        calMeas_ = 0;
+        calActive_ = true;
+    }
+
+    /** @brief Runs up to `budget` calibration samples; adopts the result
+     *  (drive, makeup and bias together) when the calibration completes. */
+    void stepCalibration(int budget) noexcept
+    {
+        const int stop = std::min(calN_, calI_ + std::max(budget, 0));
+        for (; calI_ < stop; ++calI_)
+        {
+            const int i = calI_;
+            const double s = std::sin(calW_ * i);
+            const double x = calRun_.hScale * calRun_.calAmp * s;
+            const double c = calRun_.biasAmp * kBiasTable[static_cast<size_t>(i & 7)];
+            const double m = 0.5
+                * (static_cast<double>(calib_.processSample(static_cast<T>(x + c)))
+                 + static_cast<double>(calib2_.processSample(static_cast<T>(x - c))));
+            // Measure the FUNDAMENTAL of the averaged pair (Goertzel-style
+            // correlation), not the raw RMS: the raw output still carries the
+            // even-order carrier residue that the downsampler removes in the
+            // real path, and it would inflate the measurement.
+            if (i >= calFrom_)
+            {
+                calRe_ += m * std::cos(calW_ * i);
+                calIm_ += m * s;
+                ++calMeas_;
+            }
+        }
+        if (calI_ < calN_) return;
+        const double fund = 2.0 * std::sqrt(calRe_ * calRe_ + calIm_ * calIm_)
+                          / std::max(1, calMeas_);
+        // Partial loudness link: a calibration that pins the reference level
+        // EXACTLY kills the drive knob (inaudible below 0 dB where tape stays
+        // clean, a pure attenuator above as compression eats level). A
+        // +0.25 dB/dB residual slope keeps it alive: backing off cleans AND
+        // drops slightly, pushing holds level while the tape density grows.
+        mScale_ = ((fund > 0.0) ? calRun_.calAmp / fund : 1.0) * std::pow(calRun_.drive, 0.25);
+        hScale_ = calRun_.hScale;
+        biasAmp_ = calRun_.biasAmp;
+        calActive_ = false;
+        if (calRestart_)
+        {
+            calRestart_ = false;
+            startCalibration();
         }
     }
 
@@ -930,9 +1065,9 @@ private:
     }
 
     // -- Members --------------------------------------------------------------------
-    static constexpr int kFirLen = 63;
-    static constexpr int kFirCenter = 31;
-    static constexpr int kFirRing = 128;        // double-write mirrored ring
+    static constexpr int kFirLenAt48k = 63;
+    static constexpr double kGainRampSeconds = 0.03;
+    static constexpr double kUniformToUnitRms = 1.7320508075688772;  ///< sqrt(3)
 
     AudioSpec spec_ {};              ///< Last valid spec, for setOversampling re-prepare.
     double sampleRate_ = 48000.0;
@@ -955,9 +1090,13 @@ private:
     /// shared by all channels like a machine's single bias oscillator. At a
     /// quarter of the rate every harmonic the hysteresis draws from the
     /// carrier folds back onto 0, the carrier itself or the internal Nyquist
-    /// frequency, so its products with the programme stay a quarter of the
-    /// internal rate, less the audio band, away from 0 - above what the
-    /// downsampler keeps. At 0.375 of the rate its third harmonic folded
+    /// frequency, so its products with the programme itself stay a quarter of
+    /// the internal rate, less the audio band, away from 0 - above what the
+    /// downsampler keeps. Products of the programme's own HARMONICS with twice
+    /// the carrier are not covered by that argument: with bright material and
+    /// drive they reach the band (measured at the default 4x, 48 kHz: a
+    /// 19.25 kHz tone at -6 dBFS leaves a 255 Hz product (5f - 2fc) at
+    /// -46 dBc at drive 0 and -6 dBc at +12 dB; 8x moves it to -98 dBc). At 0.375 of the rate its third harmonic folded
     /// onto the base-rate Nyquist frequency and mirrored the programme about
     /// a quarter of the base rate: a 10.1 kHz tone at -30 dBFS came out with
     /// a 13.9 kHz image 9.9 dB down, and 80 dB down now.
@@ -968,10 +1107,15 @@ private:
     std::vector<ShelfSection> recordHF_, recordLF_, playHF_, playLF_;
     std::vector<PeakSection> headBump_;
     std::vector<PeakSection> outHp_;        ///< AC-coupling 24 Hz high-pass.
-    std::vector<double> overBiasLp_;        ///< Over-bias self-erasure LP state.
+    std::vector<double> overBiasLp_;        ///< Over-bias self-erasure LP output state.
+    std::vector<double> overBiasX1_;        ///< Over-bias LP input state.
 
     std::vector<T> firTaps_;
     std::vector<std::vector<T>> firState_;
+    std::vector<double> cosTable_, designMags_, designTaps_;  ///< FIR design scratch (prepare).
+    int firLen_ = kFirLenAt48k;
+    int firCenter_ = (kFirLenAt48k - 1) / 2;
+    int firHalf_ = 64;                      ///< Half of the double-write mirrored ring.
     int firPos_ = 0;
 
     std::vector<std::vector<T>> delayRing_;
@@ -983,9 +1127,21 @@ private:
     std::vector<std::vector<T>> dryRing_;
     int dryPos_ = 0;
 
-    double hScale_ = 1.0, mScale_ = 1.0;
-    double biasAmp_ = 3.0 * 2.2e4;   ///< Carrier amplitude in H units.
-    double overBiasA_ = 0.0;         ///< Over-bias LP coefficient (0 = off).
+    double hScale_ = 1.0, mScale_ = 1.0;   ///< Calibrated targets.
+    double biasAmp_ = 3.0 * 2.2e4;   ///< Carrier amplitude target in H units.
+    double hSm_ = 1.0, mSm_ = 1.0, bSm_ = 3.0 * 2.2e4;   ///< Ramped values (audio thread).
+    bool overBiasOn_ = false;
+    bool overBiasActive_ = false;   ///< overBiasOn_ as of the previous block (audio thread).
+    double obB0_ = 1.0, obB1_ = 0.0, obP_ = 0.0;   ///< Over-bias LP coefficients.
+
+    struct CalibrationRequest
+    {
+        double hScale = 1.0, biasAmp = 3.0 * 2.2e4, calAmp = 0.25, drive = 1.0;
+    };
+    CalibrationRequest calReq_, calRun_;
+    bool calActive_ = false, calRestart_ = false;
+    int calN_ = 0, calFrom_ = 0, calI_ = 0, calMeas_ = 0;
+    double calW_ = 0.0, calRe_ = 0.0, calIm_ = 0.0;
     int biasPhase_ = 0;              ///< Shared carrier phase (audio thread).
 
     double modPhaseWow_ = 0.0, modPhaseFlut_ = 0.0, modPhaseFlut2_ = 0.0;

@@ -26,6 +26,7 @@ endforeach()
 
 add_executable(dspark_tests
     main.cpp
+    TestAnalogAudit.cpp
     TestAnalysis.cpp
     TestAudioInterval.cpp
     TestCoreFilters.cpp

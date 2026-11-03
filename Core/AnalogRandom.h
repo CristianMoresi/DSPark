@@ -40,8 +40,8 @@
  *   a single independent word).
  *
  * Dependencies: AnalogConstants.h and the C++20 standard-library `algorithm`,
- * `array`, `atomic`, `chrono`, `cmath`, `cstdint`, `span`, and `type_traits`
- * headers.
+ * `array`, `atomic`, `chrono`, `cmath`, `cstdint`, `span`, `type_traits` and
+ * `utility` headers.
  */
 
 #include <algorithm>
@@ -52,6 +52,7 @@
 #include <cstdint>
 #include <span>
 #include <type_traits>
+#include <utility>
 
 #include "AnalogConstants.h"
 
@@ -195,7 +196,7 @@ namespace dspark
                   prng_(other.prng_),
                   sampleRate_(other.sampleRate_),
                   phaseAccumulator_(other.phaseAccumulator_),
-                  triggerNext_(other.triggerNext_.load(std::memory_order_relaxed)),
+                  triggerNext_(other.triggerNext_),
                   currentValue_(other.currentValue_),
                   targetValue_(other.targetValue_),
                   noiseType_(other.noiseType_.load(std::memory_order_relaxed)),
@@ -225,7 +226,7 @@ namespace dspark
                 prng_              = other.prng_;
                 sampleRate_        = other.sampleRate_;
                 phaseAccumulator_  = other.phaseAccumulator_;
-                triggerNext_.store(other.triggerNext_.load(std::memory_order_relaxed),       std::memory_order_relaxed);
+                triggerNext_       = other.triggerNext_;
                 currentValue_      = other.currentValue_;
                 targetValue_       = other.targetValue_;
                 noiseType_.store  (other.noiseType_.load(std::memory_order_relaxed),         std::memory_order_relaxed);
@@ -274,7 +275,7 @@ namespace dspark
             void reset() noexcept
             {
                 phaseAccumulator_ = 0.0;
-                triggerNext_.store(true, std::memory_order_relaxed);
+                triggerNext_ = true;
                 currentValue_ = static_cast<Real>(0);
                 targetValue_ = static_cast<Real>(0);
                 brownNoiseState_ = static_cast<Real>(0);
@@ -306,7 +307,10 @@ namespace dspark
             {
                 if (!isSafeToRun_) [[unlikely]] return static_cast<Real>(0);
 
-                const auto pending = pendingSeed_.exchange(0, std::memory_order_acq_rel);
+                // Relaxed load first: the exchange (a locked read-modify-write)
+                // only runs when a reseed was actually published.
+                const auto pending = pendingSeed_.load(std::memory_order_relaxed) != 0
+                    ? pendingSeed_.exchange(0, std::memory_order_acq_rel) : std::uint64_t { 0 };
                 if (pending != 0)
                 {
                     prng_.reseed(pending);
@@ -315,7 +319,7 @@ namespace dspark
 
                 updatePhase();
 
-                if (triggerNext_.exchange(false, std::memory_order_acquire))
+                if (std::exchange(triggerNext_, false))
                 {
                     generateNewTarget(tickColoredNoise(noiseType_.load(std::memory_order_relaxed)));
                 }
@@ -354,7 +358,8 @@ namespace dspark
             {
                 if (!isSafeToRun_ || outputBuffer.empty()) [[unlikely]] return;
 
-                const auto pending = pendingSeed_.exchange(0, std::memory_order_acq_rel);
+                const auto pending = pendingSeed_.load(std::memory_order_relaxed) != 0
+                    ? pendingSeed_.exchange(0, std::memory_order_acq_rel) : std::uint64_t { 0 };
                 if (pending != 0)
                 {
                     prng_.reseed(pending);
@@ -375,7 +380,7 @@ namespace dspark
                 {
                     updatePhase();
 
-                    if (triggerNext_.exchange(false, std::memory_order_acquire))
+                    if (std::exchange(triggerNext_, false))
                     {
                         // Clamp to [-1,1] before mapping, matching generateNewTarget()
                         // (pink noise can momentarily exceed unity).
@@ -434,14 +439,19 @@ namespace dspark
                 noiseType_.store(type, std::memory_order_relaxed);
             }
 
+            /** @brief Free-running retrigger rate in Hz; non-finite values are
+             *  ignored (a NaN or infinite rate froze the phase as NaN for
+             *  good). */
             void setRateHz(Real rateInHz) noexcept
             {
+                if (!std::isfinite(rateInHz)) return;
                 useBpmSync_.store(false, std::memory_order_relaxed);
                 rateHz_.store(static_cast<float>(rateInHz), std::memory_order_relaxed);
             }
 
             void setRateBPM(double bpm, BpmDivision division) noexcept
             {
+                if (!std::isfinite(bpm)) return;
                 bpm_.store(static_cast<float>(bpm), std::memory_order_relaxed);
                 bpmDivision_.store(division, std::memory_order_relaxed);
                 useBpmSync_.store(true, std::memory_order_relaxed);
@@ -449,6 +459,7 @@ namespace dspark
 
             void updateBPM(double newBpm) noexcept
             {
+                if (!std::isfinite(newBpm)) return;
                 bpm_.store(static_cast<float>(newBpm), std::memory_order_relaxed);
             }
 
@@ -459,6 +470,8 @@ namespace dspark
             void setRange(T min, T max) noexcept
             {
                 static_assert(std::is_floating_point_v<T>, "setRange only accepts floating-point types.");
+                // A NaN bound reached the smoothed output and stayed there.
+                if (!std::isfinite(min) || !std::isfinite(max)) return;
                 if (min > max) std::swap(min, max);
                 min_.store(static_cast<Real>(min), std::memory_order_relaxed);
                 max_.store(static_cast<Real>(max), std::memory_order_relaxed);
@@ -481,7 +494,8 @@ namespace dspark
 
             void setQuantization(Real step) noexcept
             {
-                if (std::isnan(step) || step < static_cast<Real>(0)) step = static_cast<Real>(0);
+                // An infinite step made every target 0 * inf = NaN.
+                if (!std::isfinite(step) || step < static_cast<Real>(0)) step = static_cast<Real>(0);
                 quantizationStep_.store(step, std::memory_order_relaxed);
             }
 
@@ -535,7 +549,10 @@ namespace dspark
                 if (maxVal == minVal) return imin;
 
                 const double t = static_cast<double>((value - minVal) / (maxVal - minVal));
-                const double mapped = t * static_cast<double>(imax - imin) + static_cast<double>(imin);
+                // The span in double: imax - imin overflowed Int (undefined)
+                // for full-range requests and returned imin every time.
+                const double span = static_cast<double>(imax) - static_cast<double>(imin);
+                const double mapped = t * span + static_cast<double>(imin);
                 // llround/long long, not lround/long: on LLP64 platforms
                 // (Windows) long is 32-bit and would truncate 64-bit Int.
                 return static_cast<Int>(std::clamp(std::llround(mapped),
@@ -641,7 +658,7 @@ namespace dspark
                     // sample rate the fixed decrement would let the
                     // accumulator grow without bound.
                     phaseAccumulator_ -= std::floor(phaseAccumulator_);
-                    triggerNext_.store(true, std::memory_order_release);
+                    triggerNext_ = true;
                 }
             }
 
@@ -727,7 +744,11 @@ namespace dspark
             Detail::Xoshiro256pp prng_;
             double sampleRate_{ 44100.0 };
             double phaseAccumulator_{ 0.0 };
-            std::atomic<bool> triggerNext_{ true };
+            // Written and read only by the stream owner (updatePhase(),
+            // reset(), the generation calls): a plain flag. It used to be an
+            // atomic exchanged on every sample, a locked read-modify-write
+            // that cost more than the generation itself.
+            bool triggerNext_{ true };
             Real currentValue_{ static_cast<Real>(0) };
             Real targetValue_{ static_cast<Real>(0) };
             std::atomic<NoiseType> noiseType_{ NoiseType::Pink };

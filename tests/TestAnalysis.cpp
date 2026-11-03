@@ -392,7 +392,7 @@ DSPARK_TEST(LoudnessMeter_sine_997Hz_reference)
 
 // Integrated loudness reads the block energies themselves, not a 0.1 LU grid.
 // Holding only a count per bin read -23.00 for a -23.04 tone and -30.10 for a
-// -30.07 tone; libebur128's exact block mode reads the input level on all three.
+// -30.07 tone; an exact block-mode reference reads the input level on all three.
 DSPARK_TEST(LoudnessMeter_integrated_is_not_quantized_to_the_histogram_grid)
 {
     for (double level : { -23.04, -18.33, -30.07 })
@@ -415,8 +415,9 @@ DSPARK_TEST(LoudnessMeter_integrated_is_not_quantized_to_the_histogram_grid)
     }
 }
 
-// The relative gate keeps a bin when its centre clears the threshold, as
-// libebur128 does. Rounding the gate position down kept the bin below it.
+// The relative gate keeps a bin when its centre clears the threshold, as an
+// exact block-mode reference does. Rounding the gate position down kept the
+// bin below it.
 DSPARK_TEST(LoudnessMeter_relative_gate_tests_each_bin_at_its_centre)
 {
     // 20 s at -20 and 2 s at q: the first pass means about -20.3, which puts the

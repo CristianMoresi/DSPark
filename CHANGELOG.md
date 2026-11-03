@@ -14,8 +14,9 @@ All notable user-facing changes to DSPark are documented here.
   keeps renders bit-identical across CPUs; `DSPARK_NO_RUNTIME_DISPATCH` compiles
   the baseline only.
 - `Mp3File` decodes MPEG-2 and MPEG-2.5 Layer III (16, 22.05, 24, 8, 11.025
-  and 12 kHz, ISO 13818-3), with LSF scalefactors and intensity stereo. LAME
-  files at every rate match minimp3 at 131 dB or better.
+  and 12 kHz, ISO 13818-3), with LSF scalefactors and intensity stereo.
+  Encoded files at every rate null against a reference decoder at 131 dB or
+  better.
 - `WavFile` reads RF64 and BW64. `setRf64Mode()` writes RF64 always, or
   promotes the file only when it outgrows 4 GiB.
 - `AudioFile::hasWriteError()` reports a failed write or header finalisation,
@@ -237,7 +238,7 @@ All notable user-facing changes to DSPark are documented here.
   untouched recording: every pass of an engaged loop reads the baked region.
 - `LoudnessMeter::getIntegratedLUFS()` now sums the exact energy of the blocks
   in each histogram bin instead of the bin centre, so a reading is no longer
-  held to a 0.1 LU grid: it agrees with libebur128's exact block mode to four
+  held to a 0.1 LU grid: it agrees with an exact block-mode reference to four
   decimals on steady tones and within 0.004 LU on the programmes measured. The
   relative gates keep a bin only when its centre clears the threshold. The
   meter grows by 8 KB and stays allocation-free.

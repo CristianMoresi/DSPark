@@ -872,7 +872,7 @@ struct Plugin
         // deactivate/activate cycle then lets activate() report the new
         // value. The old code called changed() here, outside activation,
         // which a conforming host ignores - the delay compensation never
-        // followed a lookahead change. (nih-plug and DPF request a restart.)
+        // followed a lookahead change.
         auto* s = self(p);
         if (!s->latencyDirty.exchange(false, std::memory_order_acq_rel)) return;
         if (s->active.load(std::memory_order_acquire))

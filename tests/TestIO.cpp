@@ -3512,8 +3512,9 @@ DSPARK_TEST(Mp3File_binary_data_is_not_decoded_as_frames)
 // channel has a non-zero line. Every all-zero right band was treated as
 // intensity coded instead, so a left band below that bound was panned by a
 // position the encoder never meant (here position 0 moved it entirely into
-// the right channel: the left output measured exactly 0). FhG-encoded files
-// at 48-64 kbps matched ffmpeg and minimp3 at only 32.8 dB because of it.
+// the right channel: the left output measured exactly 0). Files from another
+// common encoder at 48-64 kbps matched the reference decoders at only 32.8 dB
+// because of it.
 // With no left content above the bound, the intensity frame must decode
 // exactly like the same frame without intensity stereo.
 DSPARK_TEST(Mp3File_intensity_stereo_starts_above_the_right_channel_bound)
@@ -3655,8 +3656,8 @@ DSPARK_TEST(Mp3File_decodes_mpeg2_and_mpeg25_layer3)
 
 // A gapless tag counting fewer frames than the stream holds (concatenated or
 // re-muxed files) cut the end of the audio: two concatenated copies decoded
-// to the length of one (1,323,000 samples where ffmpeg returns 2,648,495),
-// and ffmpeg's mp3_mf output lost 72% of its frames.
+// to the length of one (1,323,000 samples where a reference decoder returns
+// 2,648,495), and the output of one encoder lost 72% of its frames.
 DSPARK_TEST(Mp3File_stale_gapless_frame_count_keeps_the_audio)
 {
     midi_test::TempDirectory temp("mp3-stale-tag");
@@ -3677,8 +3678,8 @@ DSPARK_TEST(Mp3File_stale_gapless_frame_count_keeps_the_audio)
 // A frame whose main data begins in a bit reservoir that is not in the file (a
 // stream cut in the middle) used to be decoded from the start of whatever
 // bytes were there, every field read from the wrong position: a noise burst
-// at program level (error RMS 0.24 against the uncut decode, where ffmpeg
-// mutes). Such a frame must decode as silence.
+// at program level (error RMS 0.24 against the uncut decode, where a
+// reference decoder mutes). Such a frame must decode as silence.
 DSPARK_TEST(Mp3File_frame_without_its_reservoir_is_muted)
 {
     midi_test::TempDirectory temp("mp3-reservoir");
@@ -3833,8 +3834,9 @@ DSPARK_TEST(AudioFile_write_failures_are_reported)
 
 // The last count1 quad of a granule must end within part2_3_length; one that
 // runs past it is discarded by ISO 11172-3 and the reference decoders. A
-// two-bit tolerance kept such a quad as a spurious coefficient (a shine file
-// matched ffmpeg and minimp3 at 77.7 dB instead of 136.7 dB). Here
+// two-bit tolerance kept such a quad as a spurious coefficient (a file from
+// a fixed-point encoder matched the reference decoders at 77.7 dB instead of
+// 136.7 dB). Here
 // part2_3_length is 3 bits and the only quad needs 5.
 DSPARK_TEST(Mp3File_count1_quad_past_part2_3_length_is_discarded)
 {

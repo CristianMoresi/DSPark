@@ -2165,3 +2165,27 @@ DSPARK_TEST(ContinuousClip_stream_reset_and_numerical_error_contract)
     for (int i = 0; i < 32; ++i)
         EXPECT_EQ(stream.process(0.0), 0.0);
 }
+
+// With a 32-bit size_t (x86, WebAssembly) the byte count of a 2^30-sample
+// float ring wrapped to 0: the allocator returned a valid zero-size block and
+// the ring wrote past it (old header: segmentation fault on the first pushes,
+// x86). The ring must stay unprepared instead. On 64-bit targets the byte
+// count always fits, and 2^30 samples would be a 4 GiB request, so the case
+// runs on 32-bit targets only.
+DSPARK_TEST(RingBuffer_unrepresentable_byte_size_leaves_it_unprepared)
+{
+    if constexpr (sizeof(std::size_t) == 4)
+    {
+        RingBuffer<float> rb;
+        rb.prepare((1 << 29) + 1);
+        EXPECT_EQ(rb.getCapacity(), 0);
+        for (int i = 0; i < (1 << 20); ++i) rb.push(1.0f);   // must stay a no-op
+        EXPECT_EQ(rb.read(0), 0.0f);
+    }
+    else
+    {
+        RingBuffer<float> rb;
+        rb.prepare(1000);
+        EXPECT_EQ(rb.getCapacity(), 1024);
+    }
+}

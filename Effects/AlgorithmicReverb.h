@@ -119,8 +119,12 @@
  *   the tail's remaining resonances. Each line's length wanders with its
  *   own smooth random LFO (Lexicon style), updated at control rate with a
  *   per-sample linear ramp and read through a first-order allpass
- *   interpolator kept in its low-dispersion range ([0.5, 1.5) samples of
- *   fractional delay), so there is no cumulative HF loss; depth is set in
+ *   interpolator, so there is no cumulative HF loss. Its fractional delay
+ *   covers [0.1, 1.1): where the read index steps, the two configurations
+ *   that meet there have nearly the same response (they would be identical
+ *   at an offset of 0), so the step leaves little noise. With the usual
+ *   [0.5, 1.5) range each step changed the high-frequency phase delay and
+ *   left a noise floor 15-20 dB higher. Depth is set in
  *   time and scales with the room size, so small rooms do not warble. A
  *   wandering delay spreads a tone in proportion to its frequency, so the
  *   line wander is kept light and the mixing matrix itself moves too:
@@ -262,7 +266,11 @@ public:
         if (!spec.isValid()) return; // release-safe: keep previous state
 
         spec_ = spec;
-        mixer_.prepare(spec);
+        // A stereo buffer is reverberated in true stereo even on a mono spec,
+        // so the mixer keeps a dry copy of both channels it blends.
+        AudioSpec mixSpec = spec;
+        mixSpec.numChannels = std::max(spec.numChannels, 2);
+        mixer_.prepare(mixSpec);
         const double sr = spec.sampleRate;
 
         // Re-derive the sample counts stored at set-time: after a re-prepare
@@ -338,7 +346,9 @@ public:
      *
      * Stereo buffers are reverberated in true stereo; a mono buffer feeds
      * both inputs and receives the average of the two outputs. Extra
-     * channels beyond two are left untouched.
+     * channels beyond two are left untouched. A block longer than the
+     * prepared maxBlockSize is processed as consecutive blocks of at most
+     * that size, with the same result.
      *
      * @param buffer View of the audio buffers (mono or stereo).
      */
@@ -348,6 +358,15 @@ public:
         const int nCh = std::min(buffer.getNumChannels(), 2);
         const int nS  = buffer.getNumSamples();
         if (nCh == 0 || nS == 0 || !prepared_) return;
+
+        // The dry copy holds maxBlockSize samples, so a longer block would
+        // lose its dry signal past that point: split it.
+        if (nS > spec_.maxBlockSize)
+        {
+            for (int start = 0; start < nS; start += spec_.maxBlockSize)
+                processBlock(buffer.getSubView(start, std::min(spec_.maxBlockSize, nS - start)));
+            return;
+        }
 
         // Front-door non-finite guard: the FDN is fully recursive, so a single
         // NaN/Inf input would poison the tail forever. No-op on finite input.
@@ -456,7 +475,12 @@ public:
             posInc_[i] = 0.0;
         }
         ctrlPhase_ = 0;
+        rotTick_ = 0;   // the rotation refresh phase restarts with the LFOs
         loopAPGliding_ = false;
+
+        // Parameter glides snap to their targets with the state.
+        snapGlides();
+        fresh_ = true;
 
         toneLPBiquad_.reset();
         toneHPBiquad_.reset();
@@ -471,8 +495,10 @@ public:
      * @brief Loads the selected preset baseline.
      *
      * Call setDecay(), setSize() and other parameter setters after setType()
-     * when those values should override the selected preset. Applied at the
-     * start of the next processBlock(); the running tail is cleared.
+     * when those values should override the selected preset. The preset's
+     * parameter values are written here, on the calling thread, so a setter
+     * called afterwards always overrides them. The engine change is applied
+     * at the start of the next processBlock(); the running tail is cleared.
      */
     void setType(Type type) noexcept
     {
@@ -483,6 +509,7 @@ public:
         // A preset load re-establishes the baseline: forget prior overrides so
         // the preset's own values apply, unless a setter is called AFTER this.
         userParamMask_.store(0u, std::memory_order_relaxed);
+        commitPreset(presetValues(static_cast<Type>(t)));
         presetDirty_.store(true, std::memory_order_release);
     }
 
@@ -592,6 +619,7 @@ public:
      *        reflections stay discrete (7 at 0, 1 at 1). High values give a
      *        smooth, dense onset; low values keep crisp, localisable early
      *        echoes. For Type::Spring it sets the strength of the chirp.
+     *        The allpass coefficients glide over about 20 ms.
      */
     void setDiffusion(T amount) noexcept
     {
@@ -619,7 +647,7 @@ public:
      *
      * Uses M/S processing: 0 = mono, 1 = natural stereo, 2 = extra wide.
      * Applied to the late tail (its low band stays coherent), before the
-     * early reflections are added.
+     * early reflections are added. Changes glide over about 20 ms.
      *
      * @param width Stereo width (0.0 - 2.0). Default: 1.0.
      */
@@ -730,7 +758,8 @@ public:
      * @brief Early reflections level in dB (-60 to +6). 0 dB is the
      *        physical balance: the early field then carries the late
      *        field's energy density and decay, so the two join on one
-     *        exponential at any size and decay time.
+     *        exponential at any size and decay time. Changes glide over
+     *        about 20 ms.
      */
     void setEarlyLevel(T dB) noexcept
     {
@@ -739,7 +768,7 @@ public:
         markUserParam(kUserEarly);
     }
 
-    /** @brief Late tail level in dB (-60 to +6). */
+    /** @brief Late tail level in dB (-60 to +6). Changes glide over about 20 ms. */
     void setLateLevel(T dB) noexcept
     {
         if (!std::isfinite(dB)) return;
@@ -758,6 +787,9 @@ public:
 
     /**
      * @brief Sets a post-reverb low-cut filter on the wet signal (12 dB/oct).
+     *
+     * Cutoff changes glide over about 20 ms, and switching the filter on or
+     * off crossfades, so it can be automated.
      * @param hz Cutoff in Hz (0 = off, 20-500 typical).
      */
     void setToneLowCut(T hz) noexcept
@@ -769,6 +801,9 @@ public:
 
     /**
      * @brief Sets a post-reverb high-cut filter on the wet signal (12 dB/oct).
+     *
+     * Cutoff changes glide over about 20 ms, and switching the filter on or
+     * off crossfades, so it can be automated.
      * @param hz Cutoff in Hz (0 = off, 2000-16000 typical).
      */
     void setToneHighCut(T hz) noexcept
@@ -854,10 +889,10 @@ public:
         setBassCrossover(static_cast<T>(r.read("bassXover", 200.0f)));
         setEarlyLevel(static_cast<T>(r.read("earlyDb", 0.0f)));
         setLateLevel(static_cast<T>(r.read("lateDb", 0.0f)));
-        const float lo = r.read("toneLowCut", -1.0f);
-        const float hi = r.read("toneHighCut", -1.0f);
-        if (lo > 0.0f) setToneLowCut(static_cast<T>(lo));
-        if (hi > 0.0f) setToneHighCut(static_cast<T>(hi));
+        // A missing or non-positive cutoff restores the filter as off, like
+        // the blob's source instance.
+        setToneLowCut(static_cast<T>(r.read("toneLowCut", -1.0f)));
+        setToneHighCut(static_cast<T>(r.read("toneHighCut", -1.0f)));
         return true;
     }
 
@@ -871,6 +906,11 @@ protected:
     static constexpr int kEcoERTaps  = 48;
     static constexpr int kShadowBins = 2;   ///< head-shadow classes of the early taps (open, shadowed)
     static constexpr int kMaxDiscreteER = 7; ///< raw (discrete) early taps at diffusion 0
+    /// Early-tap slots per output side: every reflection, plus a second slot
+    /// for each of the first kMaxDiscreteER per input, so the raw and the
+    /// diffused reading of those both exist and setDiffusion() crossfades
+    /// between them instead of switching the source.
+    static constexpr int kMaxERSlots = kMaxERTaps + 2 * kMaxDiscreteER;
     static constexpr int kERGroups   = 4;   ///< absorption groups (early -> late)
     static constexpr int kCtrl       = 16;  ///< modulation control period (samples)
     static constexpr int kChunk      = 64;  ///< sparse-FIR processing chunk (samples)
@@ -900,6 +940,19 @@ protected:
     static constexpr double kMaxGlideSpeed = 0.04;  ///< max length change per sample (4% Doppler)
     static constexpr double kSubsonicHz    = 20.0;  ///< wet-output high-pass (2nd order): no room rings below it
     static constexpr T      kMinReadPos    = T(2);
+    /// The modulated reads cover the fractional delay [kApLow, kApLow + 1).
+    /// Where the read index steps, (M, kApLow + 1) hands over to
+    /// (M + 1, kApLow). At kApLow = 0 those would be the same filter (a pure
+    /// one-sample delay against an allpass with eta = 1, which cancels to
+    /// unity), so near 0 the handover changes the phase delay very little at
+    /// any frequency; with [0.5, 1.5) it changed by up to a sample near
+    /// Nyquist and every step left high-frequency noise in the tail. At 0.1
+    /// the pole stays at |eta| <= 0.82 (at most 10 samples of group delay,
+    /// at Nyquist only).
+    static constexpr double kApLow = 0.1;
+    /// First-order allpass coefficient for a fractional delay d in
+    /// [kApLow, kApLow + 1): (eta + z^-1) / (1 + eta z^-1) delays d at DC.
+    static T allpassCoeff(double d) noexcept { return static_cast<T>((1.0 - d) / (1.0 + d)); }
     static constexpr T      kSoftLimit     = T(2);  ///< in-loop safety limiter threshold
 
     /// Wet output scale: calibrated so the steady-state level matches the
@@ -1153,21 +1206,24 @@ protected:
     std::array<std::array<Line, kInStages>, 2> inAP_;
     std::array<std::array<int, kInStages>, 2> inAPLen_ {};
     std::array<T, kInStages> inAPCoeff_ {};
+    std::array<T, kInStages> inAPCoeffTarget_ {};   ///< inAPCoeff_ glides here (setDiffusion)
     std::array<Line, 2> ring_;             ///< allpass-diffused input, feeds the late field
     std::array<std::array<Line, kOutStages>, 2> outAP_;   ///< late-field output diffusers
     std::array<std::array<int, kOutStages>, 2> outAPLen_ {};
     T outAPCoeff_ = T(0.5);
+    T outAPCoeffTarget_ = T(0.5);
 
     // Early reflections (per side): velvet taps, each reading its own side
     // (erChan_ 0) or the other (1)
-    int numERTaps_ = 0;
+    int numERTaps_ = 0;    ///< reflections per output side
+    int numERSlots_ = 0;   ///< tap slots per output side (see kMaxERSlots)
     Type erType_ = Type::Room;
-    std::array<std::array<int, kMaxERTaps>, 2> erTap_ {}, erChan_ {}, erBin_ {};
-    std::array<std::array<T, kMaxERTaps>, 2> erGain_ {};         ///< current (gliding) tap gains
-    std::array<std::array<T, kMaxERTaps>, 2> erGainTarget_ {};   ///< gains for the current size/decay
+    std::array<std::array<int, kMaxERSlots>, 2> erTap_ {}, erChan_ {}, erBin_ {};
+    std::array<std::array<T, kMaxERSlots>, 2> erGain_ {};         ///< current (gliding) tap gains
+    std::array<std::array<T, kMaxERSlots>, 2> erGainTarget_ {};   ///< gains for the current size/decay
     std::array<T, kERGroups> erShelfGainTarget_ {};
     T erGlidePerSample_ = T(0.001);                               ///< glide rate of the two (1 / samples)
-    std::array<int, kERGroups + 1> erGroupStart_ {};
+    std::array<std::array<int, kERGroups + 1>, 2> erGroupStart_ {};   ///< slot index per side
     std::array<T, kERGroups> erShelfGain_ {};   ///< HF gain of each absorption group
     T erShelfCoeff_ = T(0.5);                   ///< one-pole coefficient at the high crossover
     std::array<std::array<T, kERGroups>, 2> erLP_ {};
@@ -1219,6 +1275,7 @@ protected:
     std::array<T, kMaxLines> loopAPCur_ {};     ///< gliding lengths after a size change
     bool loopAPGliding_ = false;
     T loopAPCoeff_ = T(0.4);
+    T loopAPCoeffTarget_ = T(0.4);
 
     // Absorption: Jot shelf (mid/high) and bass shelf, per line
     std::array<T, kMaxLines> jotB0_ {}, jotB1_ {}, jotA1_ {}, jotX1_ {}, jotY1_ {};
@@ -1233,8 +1290,18 @@ protected:
     // Tone correction EQ (Biquad 12 dB/oct)
     Biquad<T, 2> toneLPBiquad_;
     Biquad<T, 2> toneHPBiquad_;
-    bool toneLPActive_ = false;
+    bool toneLPActive_ = false;   ///< filter running (on, or still fading out)
     bool toneHPActive_ = false;
+    // Cutoff changes glide in the log domain, chunk by chunk; switching a
+    // filter on or off crossfades between the filtered and the plain signal.
+    double toneLPCurHz_ = 0.0, toneLPTargetHz_ = 0.0;
+    double toneHPCurHz_ = 0.0, toneHPTargetHz_ = 0.0;
+    bool toneLPOn_ = false, toneHPOn_ = false;
+    T toneLPMix_ = T(0), toneHPMix_ = T(0);   ///< share of the filtered signal
+
+    // Gliding output gains (setEarlyLevel/setLateLevel/setWidth targets).
+    T earlyCur_ = T(1), lateCur_ = T(1), widthCur_ = T(1);
+    bool fresh_ = true;   ///< no sample processed since prepare()/reset()
 
     DryWetMixer<T> mixer_;
 
@@ -1244,6 +1311,8 @@ protected:
     // and raises a dirty flag; the audio thread drains the flags at the top of
     // processBlock()/processSample() and rebuilds the non-atomic coefficient
     // arrays there, so nothing on the audio path is written from other threads.
+    // The parameter atomics have one writer, the control thread: setType()
+    // writes the preset's values itself, and the audio thread only reads them.
 
     std::atomic<Type> type_      { Type::Room };
     std::atomic<T> decayTime_    { T(1) };
@@ -1276,11 +1345,12 @@ protected:
     std::atomic<T> toneLowCutHz_  { T(-1) };    // <= 0 = off
     std::atomic<T> toneHighCutHz_ { T(-1) };
 
-    // Per-param user-override mask. setType() clears it so the preset
-    // re-establishes the baseline; each param setter marks its bit;
-    // commitPreset() skips any atomic the user overrode, so a setter issued
-    // after setType() always wins regardless of drain timing (the documented
-    // quick-start is `setType(Hall); setDecay(2.0f);`).
+    // Per-param user-override mask. setType() clears it and writes the preset
+    // on the calling thread, so a setter issued after it simply overwrites the
+    // preset's value (the documented quick-start is
+    // `setType(Hall); setDecay(2.0f);`). prepare() re-applies the selected
+    // preset and skips every atomic whose bit is set, so the values configured
+    // before prepare() survive it.
     enum : uint32_t {
         kUserDecay = 1u, kUserSize = 2u, kUserDamping = 4u, kUserDiffusion = 8u,
         kUserBassDecay = 16u, kUserHighXover = 32u, kUserBassXover = 64u,
@@ -1331,7 +1401,8 @@ protected:
         if (presetDirty_.load(std::memory_order_acquire)
             && presetDirty_.exchange(false, std::memory_order_acquire))
         {
-            applyPreset(type_.load(std::memory_order_relaxed));
+            // setType() already wrote the preset's values; build the engine.
+            applyTopology(type_.load(std::memory_order_relaxed));
             reset();       // new room: drop the old tail, snap the lengths
             paramsDirty_.store(false, std::memory_order_relaxed);
         }
@@ -1344,6 +1415,29 @@ protected:
         }
 
         drainTone();
+        // Before the first sample after prepare() or reset() there is nothing
+        // to glide from: settings made then apply at once.
+        if (fresh_) snapGlides();
+    }
+
+    /// Puts every gliding parameter (levels, width, diffusion, tone) at its target.
+    void snapGlides() noexcept
+    {
+        earlyCur_ = earlyLevel_.load(std::memory_order_relaxed);
+        lateCur_  = lateLevel_.load(std::memory_order_relaxed);
+        widthCur_ = width_.load(std::memory_order_relaxed);
+        inAPCoeff_ = inAPCoeffTarget_;
+        loopAPCoeff_ = loopAPCoeffTarget_;
+        outAPCoeff_ = outAPCoeffTarget_;
+        snapTone();
+    }
+
+    /// One chunk of the shared parameter glide (about 20 ms): returns the
+    /// value at the end of the chunk, exactly the target once within 1e-6.
+    static T glideTo(T cur, T target, T amount) noexcept
+    {
+        const T next = cur + amount * (target - cur);
+        return std::abs(target - next) <= T(1e-6) * std::max(T(1), std::abs(target)) ? target : next;
     }
 
     void drainTone() noexcept
@@ -1351,16 +1445,89 @@ protected:
         if (!(toneDirty_.load(std::memory_order_acquire)
               && toneDirty_.exchange(false, std::memory_order_acquire)))
             return;
+        if (!(spec_.sampleRate > 0)) return;
         const T hpHz = toneLowCutHz_.load(std::memory_order_relaxed);
         const T lpHz = toneHighCutHz_.load(std::memory_order_relaxed);
-        toneHPActive_ = hpHz > T(0) && spec_.sampleRate > 0;
+        toneHPOn_ = hpHz > T(0);
+        if (toneHPOn_)
+        {
+            toneHPTargetHz_ = static_cast<double>(std::clamp(hpHz, T(20), T(500)));
+            if (!toneHPActive_)
+            {
+                // Off before: start at the target, from a clean state, while
+                // the crossfade brings the filtered signal in.
+                toneHPActive_ = true;
+                toneHPCurHz_ = toneHPTargetHz_;
+                toneHPBiquad_.setCoeffsNow(BiquadCoeffs::makeHighPass(spec_.sampleRate, toneHPCurHz_));
+                toneHPBiquad_.reset();
+            }
+        }
+        toneLPOn_ = lpHz > T(0);
+        if (toneLPOn_)
+        {
+            toneLPTargetHz_ = static_cast<double>(std::clamp(lpHz, T(2000), T(16000)));
+            if (!toneLPActive_)
+            {
+                toneLPActive_ = true;
+                toneLPCurHz_ = toneLPTargetHz_;
+                toneLPBiquad_.setCoeffsNow(BiquadCoeffs::makeLowPass(spec_.sampleRate, toneLPCurHz_));
+                toneLPBiquad_.reset();
+            }
+        }
+    }
+
+    /// One glide step of a running cutoff toward its target (log domain).
+    static void glideHz(double& cur, double target, double amount) noexcept
+    {
+        const double ratio = target / cur;
+        if (std::abs(ratio - 1.0) < 1e-4) cur = target;
+        else cur *= std::pow(ratio, amount);
+    }
+
+    /// Moves the tone cutoffs and on/off crossfades by one chunk (audio
+    /// thread); the crossfade values at the chunk's start are returned
+    /// through hp0/lp0 for the per-sample ramp.
+    void advanceTone(T amount, T& hp0, T& lp0) noexcept
+    {
+        hp0 = toneHPMix_;
+        lp0 = toneLPMix_;
+        const double a = static_cast<double>(amount);
         if (toneHPActive_)
-            toneHPBiquad_.setCoeffsNow(BiquadCoeffs::makeHighPass(
-                spec_.sampleRate, static_cast<double>(std::clamp(hpHz, T(20), T(500)))));
-        toneLPActive_ = lpHz > T(0) && spec_.sampleRate > 0;
+        {
+            if (toneHPOn_ && toneHPCurHz_ != toneHPTargetHz_)
+            {
+                glideHz(toneHPCurHz_, toneHPTargetHz_, a);
+                toneHPBiquad_.setCoeffsNow(BiquadCoeffs::makeHighPass(spec_.sampleRate, toneHPCurHz_));
+            }
+            toneHPMix_ = glideTo(toneHPMix_, toneHPOn_ ? T(1) : T(0), amount);
+            if (!toneHPOn_ && toneHPMix_ == T(0) && hp0 == T(0)) toneHPActive_ = false;
+        }
         if (toneLPActive_)
-            toneLPBiquad_.setCoeffsNow(BiquadCoeffs::makeLowPass(
-                spec_.sampleRate, static_cast<double>(std::clamp(lpHz, T(2000), T(16000)))));
+        {
+            if (toneLPOn_ && toneLPCurHz_ != toneLPTargetHz_)
+            {
+                glideHz(toneLPCurHz_, toneLPTargetHz_, a);
+                toneLPBiquad_.setCoeffsNow(BiquadCoeffs::makeLowPass(spec_.sampleRate, toneLPCurHz_));
+            }
+            toneLPMix_ = glideTo(toneLPMix_, toneLPOn_ ? T(1) : T(0), amount);
+            if (!toneLPOn_ && toneLPMix_ == T(0) && lp0 == T(0)) toneLPActive_ = false;
+        }
+    }
+
+    /// Puts the tone filters at their targets at once (prepare, reset).
+    void snapTone() noexcept
+    {
+        if (!(spec_.sampleRate > 0)) return;
+        toneHPActive_ = toneHPOn_;
+        toneHPMix_ = toneHPOn_ ? T(1) : T(0);
+        toneHPCurHz_ = toneHPTargetHz_;
+        if (toneHPActive_)
+            toneHPBiquad_.setCoeffsNow(BiquadCoeffs::makeHighPass(spec_.sampleRate, toneHPCurHz_));
+        toneLPActive_ = toneLPOn_;
+        toneLPMix_ = toneLPOn_ ? T(1) : T(0);
+        toneLPCurHz_ = toneLPTargetHz_;
+        if (toneLPActive_)
+            toneLPBiquad_.setCoeffsNow(BiquadCoeffs::makeLowPass(spec_.sampleRate, toneLPCurHz_));
     }
 
     /// Pulls the atomic parameters into the block-local cache (audio thread).
@@ -1466,7 +1633,7 @@ protected:
      *        shelves, in-loop allpass, safety limiter, injection, write.
      */
     template <int N>
-    void runFdn(T& lateL, T& lateR, int injLag) noexcept
+    void runFdn(T& lateL, T& lateR, int injLag, T loopAPCoeff) noexcept
     {
         constexpr int W = std::min(simd::kVecWidth<T>, N);
         using O = simd::Vec<T, W>;
@@ -1478,18 +1645,15 @@ protected:
         alignas(64) std::array<T, N> tmp;
         alignas(64) std::array<int, N> idx;
 
-        // Allpass-interpolated modulated reads. eta = (1 - d) / (1 + d) for
-        // the fractional part d in [0.5, 1.5), as the series -h / (1 + h) in
-        // h = (d - 1) / 2, |h| <= 1/4: the error (< 1e-3) only nudges the
-        // fractional delay, the interpolator stays exactly allpass. The
-        // arithmetic runs in separate (vectorizable) passes around the
+        // Allpass-interpolated modulated reads: eta = (1 - d) / (1 + d) for
+        // the fractional delay d in [kApLow, kApLow + 1) (see allpassRead).
+        // The arithmetic runs in separate (vectorizable) passes around the
         // scalar gather.
         for (int i = 0; i < N; ++i)
         {
             const double p = pos_[i] += posInc_[i];
-            const int M = static_cast<int>(p - 0.5);
-            const T h = static_cast<T>((p - static_cast<double>(M) - 1.0) * 0.5);
-            v[i] = -h * (T(1) - h * (T(1) - h * (T(1) - h)));
+            const int M = static_cast<int>(p - kApLow);
+            v[i] = allpassCoeff(p - static_cast<double>(M));
             idx[i] = M;
         }
         for (int i = 0; i < N; ++i)
@@ -1586,7 +1750,7 @@ protected:
                 for (int i = 0; i < N; ++i)
                     tmp[i] = loopAP_.at(i, loopAPLen_[i]);
             }
-            const V g = O::set1(loopAPCoeff_);
+            const V g = O::set1(loopAPCoeff);
             for (int i = 0; i < N; i += W)
             {
                 const V d = O::load(tmp.data() + i);
@@ -1655,9 +1819,8 @@ protected:
         for (int s = 0; s < Springs; ++s)
         {
             const double p = pos_[s] += posInc_[s];
-            const int M = static_cast<int>(p - 0.5);
-            const T h = static_cast<T>((p - static_cast<double>(M) - 1.0) * 0.5);
-            const T eta = -h * (T(1) - h * (T(1) - h * (T(1) - h)));
+            const int M = static_cast<int>(p - kApLow);
+            const T eta = allpassCoeff(p - static_cast<double>(M));
             const T y = eta * (lines_.at(s, M) - apY1_[s]) + lines_.at(s, M + 1);
             apY1_[s] = y;
             x[s] = y;
@@ -1769,6 +1932,26 @@ protected:
         const int gap = cachedParams_.erToLateSamples;
         const int last = count - 1;
 
+        // One step of the ~20 ms parameter glides for this chunk: diffusion
+        // coefficients and tone cutoffs per chunk, output gains per sample
+        // (ramped below), so automating them does not click.
+        const T gc = std::min(T(1), erGlidePerSample_ * static_cast<T>(count));
+        const std::array<T, kInStages> inAP0 = inAPCoeff_;
+        const T loopAP0 = loopAPCoeff_, outAP0 = outAPCoeff_;
+        for (int st = 0; st < kInStages; ++st)
+            inAPCoeff_[static_cast<std::size_t>(st)] = glideTo(inAPCoeff_[static_cast<std::size_t>(st)],
+                                                             inAPCoeffTarget_[static_cast<std::size_t>(st)], gc);
+        loopAPCoeff_ = glideTo(loopAPCoeff_, loopAPCoeffTarget_, gc);
+        outAPCoeff_ = glideTo(outAPCoeff_, outAPCoeffTarget_, gc);
+        T toneHP0 = T(0), toneLP0 = T(0);
+        advanceTone(gc, toneHP0, toneLP0);
+        const T early0 = earlyCur_, late0 = lateCur_, width0 = widthCur_;
+        earlyCur_ = glideTo(early0, cachedParams_.earlyLevel, gc);
+        lateCur_  = glideTo(late0, cachedParams_.lateLevel, gc);
+        widthCur_ = glideTo(width0, cachedParams_.width, gc);
+        const T rampStep = T(1) / static_cast<T>(count);
+        fresh_ = false;
+
         // --- Pre-delay, then the allpass diffusers of the late-field feed ---
         alignas(64) T raw[2][kChunk];
         for (int c = 0; c < 2; ++c)
@@ -1783,10 +1966,12 @@ protected:
             for (int n = 0; n < count; ++n)
             {
                 T x = raw[c][n];
+                const T a = static_cast<T>(n + 1) * rampStep;
                 for (int st = 0; st < kInStages; ++st)
                 {
                     Line& ap = aps[static_cast<std::size_t>(st)];
-                    const T g = inAPCoeff_[static_cast<std::size_t>(st)];
+                    const T g0 = inAP0[static_cast<std::size_t>(st)];
+                    const T g = g0 + (inAPCoeff_[static_cast<std::size_t>(st)] - g0) * a;
                     const T d = ap.at(inAPLen_[static_cast<std::size_t>(c)][static_cast<std::size_t>(st)]);
                     const T w = x + g * d;
                     ap.push(w);
@@ -1799,10 +1984,9 @@ protected:
         // The early gains follow size and decay changes in a ~20 ms glide
         // (per chunk), so automating them does not click.
         {
-            const T gc = erGlidePerSample_ * static_cast<T>(count);
             for (int s = 0; s < 2; ++s)
-                for (int k = 0; k < numERTaps_; ++k)
-                    erGain_[s][k] += gc * (erGainTarget_[s][k] - erGain_[s][k]);
+                for (int k = 0; k < numERSlots_; ++k)
+                    erGain_[s][k] = glideTo(erGain_[s][k], erGainTarget_[s][k], gc);
             for (int g = 0; g < kERGroups; ++g)
                 erShelfGain_[g] += gc * (erShelfGainTarget_[g] - erShelfGain_[g]);
         }
@@ -1825,9 +2009,10 @@ protected:
                 // facing the reflection) or shadowed (the far ear).
                 alignas(64) T acc[kShadowBins][kChunk];
                 for (auto& a : acc) std::fill(a, a + count, T(0));
-                for (int k = erGroupStart_[g]; k < erGroupStart_[g + 1]; ++k)
-                    addTap(acc[erBin_[s][k]], *src[erChan_[s][k]], erTap_[s][k] + lagOff[erChan_[s][k]],
-                           erGain_[s][k], count);
+                for (int k = erGroupStart_[s][g]; k < erGroupStart_[s][g + 1]; ++k)
+                    if (erGain_[s][k] != T(0))   // an idle crossfade slot adds nothing
+                        addTap(acc[erBin_[s][k]], *src[erChan_[s][k]], erTap_[s][k] + lagOff[erChan_[s][k]],
+                               erGain_[s][k], count);
                 {
                     // The shadowed class keeps its lows, loses half its highs.
                     constexpr T hf = static_cast<T>(kShadowHF) - T(1);
@@ -1869,10 +2054,21 @@ protected:
                 if (eco_) runSprings<kEcoSprings, kEcoSpringStages>(lateL, lateR, rawN);
                 else      runSprings<kSprings, kSpringStages>(lateL, lateR, rawN);
             }
-            else if (eco_) runFdn<kEcoLines>(lateL, lateR, gap + last - n);
-            else           runFdn<kMaxLines>(lateL, lateR, gap + last - n);
+            const T a = static_cast<T>(n + 1) * rampStep;
+            if (!spring_)
+            {
+                const T loopG = loopAP0 + (loopAPCoeff_ - loopAP0) * a;
+                if (eco_) runFdn<kEcoLines>(lateL, lateR, gap + last - n, loopG);
+                else      runFdn<kMaxLines>(lateL, lateR, gap + last - n, loopG);
+            }
 
-            const auto [yl, yr] = outputStage(lateL, lateR, early[0][n], early[1][n]);
+            const auto [yl, yr] = outputStage(lateL, lateR, early[0][n], early[1][n],
+                                              early0 + (earlyCur_ - early0) * a,
+                                              late0 + (lateCur_ - late0) * a,
+                                              width0 + (widthCur_ - width0) * a,
+                                              toneHP0 + (toneHPMix_ - toneHP0) * a,
+                                              toneLP0 + (toneLPMix_ - toneLP0) * a,
+                                              outAP0 + (outAPCoeff_ - outAP0) * a);
             outL[n] = yl;
             outR[n] = yr;
         }
@@ -1880,17 +2076,19 @@ protected:
 
     /// Per-sample output stage: coherent low band, width, early + late, DC
     /// block, tone EQ.
-    std::pair<T, T> outputStage(T lateL, T lateR, T earlyL, T earlyR) noexcept
+    std::pair<T, T> outputStage(T lateL, T lateR, T earlyL, T earlyR,
+                                T earlyLevel, T lateLevel, T width,
+                                T toneHPMix, T toneLPMix, T outAPCoeff) noexcept
     {
         // --- Output: coherent low band, width, early + late, subsonic high-pass, tone ---
-        const T lateLvl = cachedParams_.lateLevel * kOutGain;
+        const T lateLvl = lateLevel * kOutGain;
         lateL *= lateLvl;
         lateR *= lateLvl;
         if (!spring_)
         {
             // Output diffusion (the springs' chirps stay crisp).
             T* lr[2] = { &lateL, &lateR };
-            const T g = outAPCoeff_;
+            const T g = outAPCoeff;
             for (int c = 0; c < 2; ++c)
             {
                 T x = *lr[c];
@@ -1915,25 +2113,29 @@ protected:
             const T mid  = (lateL + lateR) * T(0.5);
             T side = (lateL - lateR) * T(0.5);
             const double hp = coherenceFilter_.processSampleCore(static_cast<double>(side), 0);
-            side = static_cast<T>(hp * static_cast<double>(cachedParams_.width));
+            side = static_cast<T>(hp * static_cast<double>(width));
             lateL = mid + side;
             lateR = mid - side;
         }
 
-        T out[2] = { earlyL * cachedParams_.earlyLevel + lateL,
-                     earlyR * cachedParams_.earlyLevel + lateR };
+        T out[2] = { earlyL * earlyLevel + lateL,
+                     earlyR * earlyLevel + lateR };
         for (int c = 0; c < 2; ++c)
             out[c] = subsonicFilter_.processSample(out[c], c);
+        // Tone EQ, crossfaded in and out when it is switched (a settled
+        // filter's share is exactly 1 or 0).
         if (toneHPActive_)
-        {
-            out[0] = toneHPBiquad_.processSample(out[0], 0);
-            out[1] = toneHPBiquad_.processSample(out[1], 1);
-        }
+            for (int c = 0; c < 2; ++c)
+            {
+                const T f = toneHPBiquad_.processSample(out[c], c);
+                out[c] = toneHPMix == T(1) ? f : out[c] + toneHPMix * (f - out[c]);
+            }
         if (toneLPActive_)
-        {
-            out[0] = toneLPBiquad_.processSample(out[0], 0);
-            out[1] = toneLPBiquad_.processSample(out[1], 1);
-        }
+            for (int c = 0; c < 2; ++c)
+            {
+                const T f = toneLPBiquad_.processSample(out[c], c);
+                out[c] = toneLPMix == T(1) ? f : out[c] + toneLPMix * (f - out[c]);
+            }
         return { out[0], out[1] };
     }
 
@@ -1948,10 +2150,8 @@ protected:
         updateDiffCoeffs();
         updateModulation();
         updateDecayParams();
-        const T hd = highDecayMult_.load(std::memory_order_relaxed);
-        damping_.store(std::clamp((T(1) - hd) / T(0.9), T(0), T(1)), std::memory_order_relaxed);
-        erToLateSamples_.store(msToSamples(erToLateMs_.load(std::memory_order_relaxed)),
-                               std::memory_order_relaxed);
+        // damping_ and erToLateSamples_ are kept current by their setters and
+        // by commitPreset(): the audio thread only reads parameter atomics.
         generateERTapsForType(erType_);   // the discrete/diffuse split follows the diffusion
     }
 
@@ -2000,10 +2200,12 @@ protected:
     void updateDiffCoeffs() noexcept
     {
         const double diff = static_cast<double>(diffusion_.load(std::memory_order_relaxed));
+        // Targets: the running coefficients glide to them chunk by chunk
+        // (processChunk), and snap with reset().
         for (int st = 0; st < kInStages; ++st)
-            inAPCoeff_[static_cast<std::size_t>(st)] = static_cast<T>(kInDiffCoeffs_[st] * diff);
-        loopAPCoeff_ = static_cast<T>(0.075 + 0.175 * diff);
-        outAPCoeff_ = static_cast<T>(0.6 * diff);
+            inAPCoeffTarget_[static_cast<std::size_t>(st)] = static_cast<T>(kInDiffCoeffs_[st] * diff);
+        loopAPCoeffTarget_ = static_cast<T>(0.075 + 0.175 * diff);
+        outAPCoeffTarget_ = static_cast<T>(0.6 * diff);
 
         // Spring chirp strength: the group-delay rise per stage is
         // (1 + a) / (1 - a) - (1 - a) / (1 + a). The total dispersion is
@@ -2209,8 +2411,8 @@ protected:
     void generateERTaps(double minMs, double maxMs, int numTaps) noexcept
     {
         numERTaps_ = std::clamp(numTaps, 0, kMaxERTaps) / 2 * 2;
-        for (int g = 0; g <= kERGroups; ++g)
-            erGroupStart_[g] = numERTaps_ * g / kERGroups;
+        numERSlots_ = 0;
+        for (auto& side : erGroupStart_) side.fill(0);
         if (numERTaps_ == 0) return;
 
         const double sr = spec_.sampleRate;
@@ -2223,7 +2425,9 @@ protected:
 
         const double decay = static_cast<double>(decayTime_.load(std::memory_order_relaxed));
         constexpr double kLn1000 = 6.907755278982137;
-        struct Tap { double ms; int chan; int bin; double gain; };
+        // One record per reflection; a candidate for the discrete set keeps
+        // two slots (raw and diffused feed), weighted by `raw`.
+        struct Tap { double ms; int chan; int bin; double gain; bool candidate; bool raw; };
         std::array<std::array<Tap, kMaxERTaps>, 2> taps {};
         std::array<int, 2> used { 0, 0 };
         for (int c = 0; c < 2; ++c)   // input channel: a source on that side
@@ -2287,8 +2491,8 @@ protected:
                     const double itdMs = x < 0.0 ? 1000.0 * 0.0875 / 343.0 * (phi + std::sin(phi)) : 0.0;
                     const int bin = x < -0.3 ? 1 : 0;
                     const double ild = x > 0.0 ? 1.0 + 0.2 * x : 1.0 + 0.5 * x;
-                    taps[e][used[e]++] = { msv[k] + itdMs, (e == c ? 0 : 1) + (k < discrete ? 2 : 0),
-                                           bin, gv[k] * norm * ild };
+                    taps[e][used[e]++] = { msv[k] + itdMs, e == c ? 0 : 1, bin, gv[k] * norm * ild,
+                                           k < kMaxDiscreteER, k < discrete };
                 }
             }
         }
@@ -2297,13 +2501,36 @@ protected:
             // Time order, so the absorption groups run from early to late.
             std::sort(taps[e].begin(), taps[e].begin() + used[e],
                       [](const Tap& a, const Tap& b) { return a.ms < b.ms; });
+            // Slots in time order. The absorption groups split the
+            // reflections (not the slots) evenly, as before the crossfade
+            // slots existed, so a crossfade slot shares its reflection's group.
+            int slot = 0, group = 1;
+            erGroupStart_[e][0] = 0;
             for (int k = 0; k < used[e]; ++k)
             {
-                erTap_[e][k] = std::max(1, static_cast<int>(taps[e][k].ms * sr / 1000.0));
-                erChan_[e][k] = taps[e][k].chan;
-                erBin_[e][k] = taps[e][k].bin;
-                erGainTarget_[e][k] = static_cast<T>(taps[e][k].gain);
+                while (group < kERGroups && k == used[e] * group / kERGroups)
+                    erGroupStart_[e][group++] = slot;
+                const Tap& t = taps[e][k];
+                const int lag = std::max(1, static_cast<int>(t.ms * sr / 1000.0));
+                const auto put = [&](int chan, double gain) {
+                    erTap_[e][slot] = lag;
+                    erChan_[e][slot] = chan;
+                    erBin_[e][slot] = t.bin;
+                    erGainTarget_[e][slot] = static_cast<T>(gain);
+                    ++slot;
+                };
+                if (t.candidate)
+                {
+                    put(t.chan + 2, t.raw ? t.gain : 0.0);   // raw input: discrete
+                    put(t.chan, t.raw ? 0.0 : t.gain);       // diffused feed
+                }
+                else
+                {
+                    put(t.chan, t.gain);
+                }
             }
+            while (group <= kERGroups) erGroupStart_[e][group++] = slot;
+            numERSlots_ = slot;   // the same on both sides
         }
 
         // Each absorption group loses its highs as the late field does by
@@ -2317,9 +2544,21 @@ protected:
         {
             double tSum = 0.0;
             int cnt = 0;
+            // Mean arrival time of the group's reflections (each counted
+            // once, whatever its slots).
             for (int e = 0; e < 2; ++e)
-                for (int k = erGroupStart_[g]; k < erGroupStart_[g + 1]; ++k, ++cnt)
+            {
+                int last = -1;
+                for (int k = erGroupStart_[e][g]; k < erGroupStart_[e][g + 1]; ++k)
+                {
+                    const bool second = k > erGroupStart_[e][g] && erTap_[e][k] == last
+                                        && erChan_[e][k] + 2 == erChan_[e][k - 1];
+                    last = erTap_[e][k];
+                    if (second) continue;
                     tSum += erTap_[e][k] / sr;
+                    ++cnt;
+                }
+            }
             const double t = cnt > 0 ? tSum / cnt : 0.0;
             erShelfGainTarget_[g] = static_cast<T>(std::pow(10.0, -3.0 * t * std::max(0.0, 1.0 / t60H - 1.0 / decay)));
         }
@@ -2373,14 +2612,21 @@ protected:
         T diff, modDepth, modRate, earlyLvl, lateLvl, erToLate;
     };
 
+    /// Writes the preset's values into the parameter atomics, skipping every
+    /// one whose user bit is set. Control or setup thread only: the audio
+    /// thread never writes parameter atomics, so nothing it does can override
+    /// a setter that follows setType().
     void commitPreset(const PresetValues& p) noexcept
     {
-        // Only write the atomics the user did NOT override since the last
-        // setType(). The acquire-read pairs with the release-mark in each setter.
         const uint32_t m = userParamMask_.load(std::memory_order_acquire);
         if (!(m & kUserSize))      size_.store(p.size, std::memory_order_relaxed);
         if (!(m & kUserDecay))     decayTime_.store(p.decay, std::memory_order_relaxed);
-        if (!(m & kUserDamping))   highDecayMult_.store(p.hdMult, std::memory_order_relaxed);
+        if (!(m & kUserDamping))
+        {
+            highDecayMult_.store(p.hdMult, std::memory_order_relaxed);
+            damping_.store(std::clamp((T(1) - p.hdMult) / T(0.9), T(0), T(1)),
+                           std::memory_order_relaxed);
+        }
         if (!(m & kUserBassDecay)) bassDecayMult_.store(p.bdMult, std::memory_order_relaxed);
         if (!(m & kUserHighXover)) highCrossover_.store(p.hxover, std::memory_order_relaxed);
         if (!(m & kUserBassXover)) bassCrossover_.store(p.bxover, std::memory_order_relaxed);
@@ -2390,45 +2636,57 @@ protected:
         if (!(m & kUserEarly))     earlyLevel_.store(p.earlyLvl, std::memory_order_relaxed);
         if (!(m & kUserLate))      lateLevel_.store(p.lateLvl, std::memory_order_relaxed);
         if (!(m & kUserErToLate))  erToLateMs_.store(p.erToLate, std::memory_order_relaxed);
+        if (spec_.sampleRate > 0)
+            erToLateSamples_.store(msToSamples(erToLateMs_.load(std::memory_order_relaxed)),
+                                   std::memory_order_relaxed);
     }
 
-    void applyPreset(Type type) noexcept
+    /// The parameter values of each preset.
+    static PresetValues presetValues(Type type) noexcept
     {
-        //                          size     decay    hdMult   bdMult   hxover   bxover
-        //                          diff     modDep   modRate  early    late     erToLate
+        //               size     decay    hdMult   bdMult   hxover   bxover
+        //               diff     modDep   modRate  early    late     erToLate
         switch (type)
         {
             case Type::Room:
-                commitPreset({T(0.22), T(0.5),  T(0.40), T(1.1),  T(5000), T(250),
-                              T(0.72), T(0.07), T(0.5),  T(1),    T(0.8),  T(0)});
-                break;
+                return { T(0.22), T(0.5),  T(0.40), T(1.1),  T(5000), T(250),
+                         T(0.72), T(0.07), T(0.5),  T(1),    T(0.8),  T(0) };
             case Type::Hall:
-                commitPreset({T(0.68), T(2.2),  T(0.32), T(1.3),  T(4500), T(200),
-                              T(0.84), T(0.10), T(0.55), T(1),    T(1),    T(15)});
-                break;
+                return { T(0.68), T(2.2),  T(0.32), T(1.3),  T(4500), T(200),
+                         T(0.84), T(0.10), T(0.55), T(1),    T(1),    T(15) };
             case Type::Chamber:
-                commitPreset({T(0.38), T(1.2),  T(0.38), T(1.1),  T(5000), T(250),
-                              T(0.78), T(0.08), T(0.6),  T(1),    T(0.9),  T(8)});
-                break;
+                return { T(0.38), T(1.2),  T(0.38), T(1.1),  T(5000), T(250),
+                         T(0.78), T(0.08), T(0.6),  T(1),    T(0.9),  T(8) };
             case Type::Plate:
-                commitPreset({T(0.14), T(1.5),  T(0.55), T(0.8),  T(7000), T(150),
-                              T(0.94), T(0.16), T(1.4),  T(0),    T(1),    T(0)});
-                break;
+                return { T(0.14), T(1.5),  T(0.55), T(0.8),  T(7000), T(150),
+                         T(0.94), T(0.16), T(1.4),  T(0),    T(1),    T(0) };
             case Type::Spring:
-                commitPreset({T(0.11), T(0.9),  T(0.28), T(1.0),  T(4000), T(200),
-                              T(0.6),  T(0.08), T(0.35), T(0.5),  T(1),    T(0)});
-                break;
+                return { T(0.11), T(0.9),  T(0.28), T(1.0),  T(4000), T(200),
+                         T(0.6),  T(0.08), T(0.35), T(0.5),  T(1),    T(0) };
             case Type::Cathedral:
-                commitPreset({T(0.98), T(5.0),  T(0.24), T(1.5),  T(3500), T(150),
-                              T(0.91), T(0.12), T(0.35), T(1),    T(1),    T(25)});
                 break;
         }
+        return { T(0.98), T(5.0),  T(0.24), T(1.5),  T(3500), T(150),
+                 T(0.91), T(0.12), T(0.35), T(1),    T(1),    T(25) };
+    }
 
+    /// Engine structure of a preset: spring tanks or FDN, its early field,
+    /// and the coefficients (audio thread at the drain, or prepare()).
+    void applyTopology(Type type) noexcept
+    {
         spring_ = type == Type::Spring;
         erType_ = type;
         refreshTopology();
         if (prepared_)
             updateAll();
+    }
+
+    /// Setup-thread preset load: values (keeping the user's overrides), then
+    /// the engine.
+    void applyPreset(Type type) noexcept
+    {
+        commitPreset(presetValues(type));
+        applyTopology(type);
     }
 };
 

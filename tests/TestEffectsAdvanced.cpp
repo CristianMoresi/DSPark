@@ -32,6 +32,7 @@
 #include "../Effects/RingModulator.h"
 #include "../Effects/FrequencyShifter.h"
 #include "../Core/FFT.h"
+#include "../Core/ZeroLatencyConvolver.h"
 
 #include <algorithm>
 #include <cmath>
@@ -41,6 +42,7 @@
 #include <vector>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 using namespace dspark;
@@ -7159,4 +7161,530 @@ DSPARK_TEST(Pitch_effects_latency_readout_is_race_free)
     running.store(false, std::memory_order_relaxed);
     reader.join();
     EXPECT_EQ(foreign.load(std::memory_order_relaxed), 0);
+}
+
+// ============================================================================
+// Reverb audit regressions (November 2026). Each case states the defect it
+// pins and the number the unfixed header gave.
+// ============================================================================
+
+namespace reverb_audit {
+
+// Steady 300 Hz tone through a Hall at mix 1, 64-sample blocks; one change is
+// applied halfway. Returns the largest sample-to-sample step right at the
+// change over the largest step in the 200 ms before it.
+template <class Apply>
+double stepRatioAtChange(Apply&& apply)
+{
+    AlgorithmicReverb<float> rev;
+    rev.setType(AlgorithmicReverb<float>::Type::Hall);
+    rev.prepare(spec(48000.0, 64, 2));
+    rev.setMix(1.0f);
+    std::vector<float> out;
+    std::vector<float> L(64), R(64);
+    float* ch[2] = { L.data(), R.data() };
+    double phase = 0.0;
+    const int total = 1500, at = 750;
+    for (int b = 0; b < total; ++b)
+    {
+        if (b == at) apply(rev);
+        for (int i = 0; i < 64; ++i)
+        {
+            L[i] = R[i] = 0.25f * static_cast<float>(std::sin(phase));
+            phase += 6.283185307179586 * 300.0 / 48000.0;
+        }
+        rev.processBlock(AudioBufferView<float>(ch, 2, 64));
+        out.insert(out.end(), L.begin(), L.end());
+    }
+    auto maxStep = [&](int from, int count) {
+        double m = 0.0;
+        for (int i = from + 1; i < from + count; ++i)
+            m = std::max(m, static_cast<double>(std::abs(out[static_cast<size_t>(i)] - out[static_cast<size_t>(i - 1)])));
+        return m;
+    };
+    const int a = at * 64;
+    return maxStep(a - 4, 256) / maxStep(a - 9600, 9600);
+}
+
+// Renders `n` samples of a fixed stereo noise burst through `rev` in blocks of
+// `block` (0 = random lengths 1..700) and returns the interleaved output.
+std::vector<float> renderBurst(AlgorithmicReverb<float>& rev, int n, int block)
+{
+    std::vector<float> L(static_cast<size_t>(n)), R(static_cast<size_t>(n));
+    uint32_t rng = 12345u;
+    for (int i = 0; i < n; ++i)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        L[static_cast<size_t>(i)] = i < n / 2 ? static_cast<float>(static_cast<int32_t>(rng)) * 2e-11f : 0.0f;
+        rng = rng * 1664525u + 1013904223u;
+        R[static_cast<size_t>(i)] = i < n / 2 ? static_cast<float>(static_cast<int32_t>(rng)) * 2e-11f : 0.0f;
+    }
+    uint32_t lengths = 99u;
+    for (int i = 0; i < n;)
+    {
+        lengths = lengths * 1664525u + 1013904223u;
+        const int k = std::min(block > 0 ? block : 1 + static_cast<int>(lengths % 700u), n - i);
+        float* ch[2] = { L.data() + i, R.data() + i };
+        rev.processBlock(AudioBufferView<float>(ch, 2, k));
+        i += k;
+    }
+    std::vector<float> out(static_cast<size_t>(2 * n));
+    for (int i = 0; i < n; ++i)
+    {
+        out[static_cast<size_t>(2 * i)] = L[static_cast<size_t>(i)];
+        out[static_cast<size_t>(2 * i + 1)] = R[static_cast<size_t>(i)];
+    }
+    return out;
+}
+
+double maxAbsDiff(const std::vector<float>& a, const std::vector<float>& b)
+{
+    double m = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+        m = std::max(m, static_cast<double>(std::abs(a[i] - b[i])));
+    return m;
+}
+
+// T60 of the tail only (Schroeder T20 from `skipSeconds` on), so a strong
+// direct sound cannot bias it.
+double tailT60(const std::vector<float>& x, double fs, double skipSeconds)
+{
+    const size_t a = static_cast<size_t>(skipSeconds * fs);
+    std::vector<double> e(x.size() - a);
+    for (size_t i = a; i < x.size(); ++i) e[i - a] = static_cast<double>(x[i]) * x[i];
+    for (size_t i = e.size() - 1; i > 0; --i) e[i - 1] += e[i];
+    const double total = e[0];
+    int i5 = -1, i25 = -1;
+    for (size_t i = 0; i < e.size(); ++i)
+    {
+        const double db = 10.0 * std::log10(e[i] / total);
+        if (i5 < 0 && db <= -5.0) i5 = static_cast<int>(i);
+        if (db <= -25.0) { i25 = static_cast<int>(i); break; }
+    }
+    if (i5 < 0 || i25 <= i5) return 0.0;
+    return 3.0 * (i25 - i5) / fs;
+}
+
+// White noise under an exponential decay with a direct sound `drrDb` above
+// the reverberant energy.
+std::vector<float> hallWithDirect(double fs, double seconds, double t60, double drrDb, uint32_t seed)
+{
+    const int n = static_cast<int>(fs * seconds);
+    std::vector<float> h(static_cast<size_t>(n));
+    double energy = 0.0;
+    for (int i = 1; i < n; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        const double white = static_cast<double>(static_cast<int32_t>(seed)) / 2147483648.0;
+        h[static_cast<size_t>(i)] = static_cast<float>(0.05 * white * std::exp(-6.907755 * i / (fs * t60)));
+        energy += static_cast<double>(h[static_cast<size_t>(i)]) * h[static_cast<size_t>(i)];
+    }
+    h[0] = static_cast<float>(std::sqrt(energy) * std::pow(10.0, drrDb / 20.0));
+    return h;
+}
+
+// Wet impulse response of one channel of a convolution reverb (mix 1).
+std::vector<float> convolutionIR(Reverb<float>& rev, int n, int channel)
+{
+    rev.reset();
+    std::vector<float> L(static_cast<size_t>(n), 0.0f), R(static_cast<size_t>(n), 0.0f);
+    L[0] = 1.0f;
+    R[0] = 1.0f;
+    for (int i = 0; i < n; i += 512)
+    {
+        const int k = std::min(512, n - i);
+        float* ch[2] = { L.data() + i, R.data() + i };
+        rev.processBlock(AudioBufferView<float>(ch, 2, k));
+    }
+    return channel == 0 ? L : R;
+}
+
+} // namespace reverb_audit
+
+// setType() used to leave the preset's values to the audio thread, which
+// wrote them while draining the change: a setter issued right after
+// setType() was lost whenever that drain was in flight. Old header: lost in
+// 8471 of 120048 trials (7%) of this stress.
+DSPARK_TEST(AlgoReverb_setter_after_setType_survives_the_drain)
+{
+    struct Probe : AlgorithmicReverb<float>
+    {
+        bool presetPending() const { return presetDirty_.load(std::memory_order_seq_cst); }
+    };
+    auto rev = std::make_unique<Probe>();
+    rev->prepare(spec(48000.0, 16, 2));
+    std::atomic<bool> stop { false };
+    std::atomic<long> blocks { 0 };
+    std::thread audio([&] {
+        std::vector<float> L(16, 0.0f), R(16, 0.0f);
+        float* ch[2] = { L.data(), R.data() };
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            rev->processBlock(AudioBufferView<float>(ch, 2, 16));
+            blocks.fetch_add(1, std::memory_order_release);
+        }
+    });
+    int lost = 0, trials = 0;
+    const auto start = std::chrono::steady_clock::now();
+    while (trials < 3000 && std::chrono::steady_clock::now() - start < std::chrono::seconds(4))
+    {
+        const float value = 0.7f + 0.001f * static_cast<float>(trials % 500);
+        rev->setType(trials % 2 ? AlgorithmicReverb<float>::Type::Hall : AlgorithmicReverb<float>::Type::Room);
+        while (rev->presetPending()) {}   // the audio thread has just taken the change
+        rev->setDecay(value);             // documented to override the preset
+        const long seen = blocks.load(std::memory_order_acquire);
+        while (blocks.load(std::memory_order_acquire) < seen + 3) {}
+        if (rev->getDecay() != value) ++lost;
+        ++trials;
+    }
+    stop = true;
+    audio.join();
+    EXPECT_GT(trials, 200);
+    EXPECT_EQ(lost, 0);
+}
+
+// The modulated reads switch their integer index many times a second. With
+// the allpass covering [0.5, 1.5) of fractional delay, each switch changed
+// the high-frequency phase delay and left noise across the band: energy more
+// than 200 Hz away from a steady 8 kHz tone was -50.0 dBc (-65 dBc with the
+// range at [0.1, 1.1)).
+DSPARK_TEST(AlgoReverb_modulated_read_switches_leave_little_noise)
+{
+    AlgorithmicReverb<float> rev;
+    rev.setType(AlgorithmicReverb<float>::Type::Hall);
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setMix(1.0f);
+    const int N = 1 << 17, settle = 48000 * 4;
+    std::vector<float> L(256), R(256);
+    float* ch[2] = { L.data(), R.data() };
+    std::vector<double> y(static_cast<size_t>(N));
+    double phase = 0.0;
+    for (int s = 0; s < settle + N; s += 256)
+    {
+        for (int i = 0; i < 256; ++i)
+        {
+            L[static_cast<size_t>(i)] = R[static_cast<size_t>(i)] = static_cast<float>(0.25 * std::sin(phase));
+            phase += 6.283185307179586 * 8000.0 / 48000.0;
+            if (phase > 6.283185307179586) phase -= 6.283185307179586;
+        }
+        rev.processBlock(AudioBufferView<float>(ch, 2, 256));
+        for (int i = 0; i < 256; ++i)
+            if (s + i >= settle && s + i < settle + N) y[static_cast<size_t>(s + i - settle)] = L[static_cast<size_t>(i)];
+    }
+    std::vector<double> in(static_cast<size_t>(N)), spectrum(static_cast<size_t>(N + 2));
+    for (int i = 0; i < N; ++i)
+    {
+        const double a = 6.283185307179586 * i / N;   // 4-term Blackman-Harris
+        in[static_cast<size_t>(i)] = y[static_cast<size_t>(i)]
+            * (0.35875 - 0.48829 * std::cos(a) + 0.14128 * std::cos(2 * a) - 0.01168 * std::cos(3 * a));
+    }
+    FFTReal<double> fft(N);
+    fft.forward(in.data(), spectrum.data());
+    double total = 0.0, far = 0.0;
+    for (int k = 1; k < N / 2; ++k)
+    {
+        const double p = spectrum[static_cast<size_t>(2 * k)] * spectrum[static_cast<size_t>(2 * k)]
+                       + spectrum[static_cast<size_t>(2 * k + 1)] * spectrum[static_cast<size_t>(2 * k + 1)];
+        total += p;
+        if (std::abs(k * 48000.0 / N - 8000.0) > 200.0) far += p;
+    }
+    EXPECT_LT(10.0 * std::log10(far / total), -58.0);
+}
+
+// A stereo buffer on a mono-prepared reverb is reverberated in true stereo,
+// but the mixer held a dry copy of one channel only: the right channel lost
+// its dry signal. Old header: first-block RMS L 0.2447, R 0.0042.
+DSPARK_TEST(AlgoReverb_stereo_buffer_on_mono_spec_keeps_both_dry_channels)
+{
+    AlgorithmicReverb<float> rev;
+    rev.setType(AlgorithmicReverb<float>::Type::Hall);
+    rev.prepare(spec(48000.0, 512, 1));
+    rev.setMix(0.3f);
+    std::vector<float> L(512), R(512);
+    for (int i = 0; i < 512; ++i)
+        L[static_cast<size_t>(i)] = R[static_cast<size_t>(i)] = 0.5f * static_cast<float>(std::sin(6.283185307179586 * 440.0 * i / 48000.0));
+    float* ch[2] = { L.data(), R.data() };
+    rev.processBlock(AudioBufferView<float>(ch, 2, 512));
+    double l = 0.0, r = 0.0;
+    for (int i = 0; i < 512; ++i) { l += L[static_cast<size_t>(i)] * L[static_cast<size_t>(i)]; r += R[static_cast<size_t>(i)] * R[static_cast<size_t>(i)]; }
+    EXPECT_GT(std::sqrt(r / 512), 0.2);
+    EXPECT_NEAR(std::sqrt(r / 512), std::sqrt(l / 512), 0.02);
+}
+
+// A block longer than maxBlockSize lost its dry signal past that length (the
+// mixer's dry copy holds maxBlockSize samples). Old header: up to 0.52 of
+// difference to the same audio processed in conforming blocks.
+DSPARK_TEST(AlgoReverb_oversize_block_matches_conforming_blocks)
+{
+    AlgorithmicReverb<float> a, b;
+    for (auto* r : { &a, &b })
+    {
+        r->setType(AlgorithmicReverb<float>::Type::Hall);
+        r->prepare(spec(48000.0, 256, 2));
+        r->setMix(0.3f);
+    }
+    const auto big = reverb_audit::renderBurst(a, 24000, 1024);
+    const auto small = reverb_audit::renderBurst(b, 24000, 256);
+    EXPECT_EQ(reverb_audit::maxAbsDiff(big, small), 0.0);
+}
+
+// setState() left the tone filters as they were when the blob had them off,
+// so recalling a preset did not undo a high cut. Old header: 0.044 of
+// difference to the blob's source instance.
+DSPARK_TEST(AlgoReverb_state_restores_tone_filters_off)
+{
+    AlgorithmicReverb<float> source, target;
+    source.setType(AlgorithmicReverb<float>::Type::Hall);
+    target.setType(AlgorithmicReverb<float>::Type::Hall);
+    source.prepare(spec(48000.0, 512, 2));
+    target.prepare(spec(48000.0, 512, 2));
+    target.setToneHighCut(2000.0f);
+    const auto blob = source.getState();
+    EXPECT_TRUE(target.setState(blob.data(), blob.size()));
+    source.setMix(1.0f);
+    target.setMix(1.0f);
+    const auto x = reverb_audit::renderBurst(source, 24000, 512);
+    const auto y = reverb_audit::renderBurst(target, 24000, 512);
+    EXPECT_LT(reverb_audit::maxAbsDiff(x, y), 1e-6);
+}
+
+// reset() restarted the modulation but not the phase of its rotation
+// refresh, so a reset instance did not render like a fresh one. Old header:
+// 6.6e-7 of difference.
+DSPARK_TEST(AlgoReverb_reset_renders_like_a_fresh_instance)
+{
+    for (int prior : { 16, 48, 80 })
+    {
+        AlgorithmicReverb<float> fresh, used;
+        for (auto* r : { &fresh, &used })
+        {
+            r->setType(AlgorithmicReverb<float>::Type::Hall);
+            r->prepare(spec(48000.0, 64, 2));
+            r->setMix(1.0f);
+        }
+        std::vector<float> L(static_cast<size_t>(prior), 0.1f), R(static_cast<size_t>(prior), 0.1f);
+        float* ch[2] = { L.data(), R.data() };
+        used.processBlock(AudioBufferView<float>(ch, 2, prior));
+        used.reset();
+        const auto x = reverb_audit::renderBurst(fresh, 48000, 64);
+        const auto y = reverb_audit::renderBurst(used, 48000, 64);
+        EXPECT_EQ(reverb_audit::maxAbsDiff(x, y), 0.0);
+    }
+}
+
+// Width, early and late level, diffusion and the tone filters changed in one
+// step at a block boundary. Old header, step at the change over the steady
+// steps of a 300 Hz tone: width 3.8, late -24 dB 6.4, early -60 dB 13.6,
+// high cut 2 kHz 24.0, diffusion 0 5.5.
+DSPARK_TEST(AlgoReverb_level_width_diffusion_and_tone_changes_are_click_free)
+{
+    using R = AlgorithmicReverb<float>;
+    EXPECT_LT(reverb_audit::stepRatioAtChange([](R& r) { r.setWidth(0.0f); }), 1.5);
+    EXPECT_LT(reverb_audit::stepRatioAtChange([](R& r) { r.setLateLevel(-24.0f); }), 1.5);
+    EXPECT_LT(reverb_audit::stepRatioAtChange([](R& r) { r.setEarlyLevel(-60.0f); }), 1.5);
+    EXPECT_LT(reverb_audit::stepRatioAtChange([](R& r) { r.setToneHighCut(2000.0f); }), 1.5);
+    EXPECT_LT(reverb_audit::stepRatioAtChange([](R& r) { r.setToneLowCut(300.0f); }), 1.5);
+    EXPECT_LT(reverb_audit::stepRatioAtChange([](R& r) { r.setDiffusion(0.0f); }), 1.5);
+}
+
+// setDecayScale() fitted the IR's decay through its direct sound, whose
+// energy is a step at the top of the decay curve: the fitted slope was off
+// by the direct-to-reverberant ratio, and each channel got its own fit. Old
+// header: a 2 s hall with a +20 dB direct sound scaled by 0.5 measured
+// 0.40 s, and a stereo IR (+12 dB direct on one side) 1.00 s / 0.79 s.
+DSPARK_TEST(ConvReverb_decay_scale_ignores_the_direct_sound)
+{
+    const double fs = 48000.0;
+    {
+        const auto h = reverb_audit::hallWithDirect(fs, 5.0, 2.0, 20.0, 1u);
+        Reverb<float> rev;
+        rev.prepare(spec(fs, 512, 2));
+        rev.setMix(1.0f);
+        EXPECT_TRUE(rev.loadIR(h.data(), static_cast<int>(h.size()), fs));
+        rev.setDecayScale(0.5f);
+        const double base = reverb_audit::tailT60(h, fs, 0.05);
+        auto y = reverb_audit::convolutionIR(rev, static_cast<int>(fs * 6), 0);
+        y.erase(y.begin(), y.begin() + rev.getLatency());
+        EXPECT_NEAR(reverb_audit::tailT60(y, fs, 0.05), 0.5 * base, 0.05 * base);
+    }
+    {
+        const auto a = reverb_audit::hallWithDirect(fs, 5.0, 2.0, -100.0, 1u);
+        const auto b = reverb_audit::hallWithDirect(fs, 5.0, 2.0, 12.0, 2u);
+        const float* channels[2] = { a.data(), b.data() };
+        Reverb<float> rev;
+        rev.prepare(spec(fs, 512, 2));
+        rev.setMix(1.0f);
+        EXPECT_TRUE(rev.loadIR(AudioBufferView<const float>(channels, 2, static_cast<int>(a.size())), fs));
+        rev.setDecayScale(0.5f);
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            auto y = reverb_audit::convolutionIR(rev, static_cast<int>(fs * 5), ch);
+            y.erase(y.begin(), y.begin() + rev.getLatency());
+            EXPECT_NEAR(reverb_audit::tailT60(y, fs, 0.05), 1.0, 0.05);
+        }
+    }
+}
+
+// Reverb convolved in uniform partitions of the block size: a long IR at a
+// small block cost a multiple of a non-uniform engine. Old header: a 6 s IR
+// at 64-sample blocks, stereo, cost 16x two ZeroLatencyConvolvers (242 us
+// against 15 us per block); 20 s exceeded real time. The latency stays one
+// block.
+DSPARK_TEST(ConvReverb_long_ir_costs_like_a_non_uniform_engine)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(6 * fs);
+    std::vector<float> ir(static_cast<size_t>(n));
+    uint32_t seed = 3u;
+    for (int i = 0; i < n; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        ir[static_cast<size_t>(i)] = static_cast<float>(static_cast<int32_t>(seed)) * 2e-11f
+                                     * static_cast<float>(std::exp(-6.907755 * i / (3.0 * fs)));
+    }
+    ir[0] = 1.0f;
+    Reverb<float> rev;
+    rev.prepare(spec(fs, 64, 2));
+    rev.setMix(0.5f);
+    EXPECT_TRUE(rev.loadIR(ir.data(), n, fs));
+    EXPECT_EQ(rev.getLatency(), 64);
+    ZeroLatencyConvolver<float> zl, zr;
+    zl.prepare(ir.data(), n);
+    zr.prepare(ir.data(), n);
+    std::vector<float> L(64), R(64);
+    float* ch[2] = { L.data(), R.data() };
+    auto fill = [&](int b) {
+        for (int i = 0; i < 64; ++i)
+        {
+            L[static_cast<size_t>(i)] = 0.1f * static_cast<float>(std::sin(0.01 * (b * 64 + i)));
+            R[static_cast<size_t>(i)] = 0.1f * static_cast<float>(std::cos(0.013 * (b * 64 + i)));
+        }
+    };
+    const int blocks = 3000;
+    double tReverb = 0.0, tZl = 0.0;
+    for (int round = 0; round < 2; ++round)
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int b = 0; b < blocks; ++b) { fill(b); rev.processBlock(AudioBufferView<float>(ch, 2, 64)); }
+        auto t1 = std::chrono::steady_clock::now();
+        for (int b = 0; b < blocks; ++b) { fill(b); zl.processInPlace(L.data(), 64); zr.processInPlace(R.data(), 64); }
+        auto t2 = std::chrono::steady_clock::now();
+        if (round == 1)
+        {
+            tReverb = std::chrono::duration<double>(t1 - t0).count();
+            tZl = std::chrono::duration<double>(t2 - t1).count();
+        }
+    }
+    EXPECT_LT(tReverb, 4.0 * tZl);
+}
+
+// A block longer than maxBlockSize lost its dry signal past that length.
+// Old header: up to 0.87 of difference to conforming blocks.
+DSPARK_TEST(ConvReverb_oversize_block_matches_conforming_blocks)
+{
+    const double fs = 48000.0;
+    const auto h = reverb_audit::hallWithDirect(fs, 1.0, 0.5, 0.0, 1u);
+    Reverb<float> a, b;
+    for (auto* r : { &a, &b })
+    {
+        r->prepare(spec(fs, 256, 2));
+        r->setMix(0.5f);
+        EXPECT_TRUE(r->loadIR(h.data(), static_cast<int>(h.size()), fs));
+    }
+    std::vector<float> x(8192), y(8192), u(8192), v(8192);
+    uint32_t seed = 9u;
+    for (size_t i = 0; i < x.size(); ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        x[i] = y[i] = u[i] = v[i] = static_cast<float>(static_cast<int32_t>(seed)) * 2e-11f;
+    }
+    for (int i = 0; i < 8192; i += 1024)
+    {
+        float* ch[2] = { x.data() + i, y.data() + i };
+        a.processBlock(AudioBufferView<float>(ch, 2, 1024));
+    }
+    for (int i = 0; i < 8192; i += 256)
+    {
+        float* ch[2] = { u.data() + i, v.data() + i };
+        b.processBlock(AudioBufferView<float>(ch, 2, 256));
+    }
+    double m = 0.0;
+    for (size_t i = 0; i < x.size(); ++i) m = std::max(m, static_cast<double>(std::abs(x[i] - u[i])));
+    EXPECT_LT(m, 1e-6);
+}
+
+// With an IR from another rate the dry path waits for the resampler's
+// leading ringing too; a buffer with one channel more than prepared skipped
+// that wait for every channel. Old header: the dry impulse at +512, half a
+// millisecond before the wet one at +624.
+DSPARK_TEST(ConvReverb_extra_channel_keeps_the_dry_alignment)
+{
+    std::vector<float> ir(1024, 0.0f);
+    ir[0] = 1.0f;
+    Reverb<float> rev;
+    rev.prepare(spec(48000.0, 512, 2));
+    rev.setMix(0.5f);
+    EXPECT_TRUE(rev.loadIR(ir.data(), 1024, 44100.0));
+    const int latency = rev.getLatency();
+    EXPECT_GT(latency, 512);
+    std::vector<float> a(4096, 0.0f), b(4096, 0.0f), c(4096, 0.0f);
+    a[100] = 1.0f;
+    b[100] = 1.0f;
+    for (int i = 0; i < 4096; i += 512)
+    {
+        float* ch[3] = { a.data() + i, b.data() + i, c.data() + i };
+        rev.processBlock(AudioBufferView<float>(ch, 3, 512));
+    }
+    EXPECT_LT(std::abs(a[100 + 512]), 0.05f);
+    EXPECT_GT(a[static_cast<size_t>(100 + latency)], 0.9f);
+    EXPECT_EQ(c[100], 0.0f);   // the extra channel passes through untouched
+}
+
+// Reverb<double>::getState() did not compile: the double parameters matched
+// none of the StateWriter overloads exactly (C2668, ambiguous call).
+DSPARK_TEST(ConvReverb_double_state_round_trips)
+{
+    Reverb<double> a, b;
+    a.prepare(spec(48000.0, 64, 2));
+    b.prepare(spec(48000.0, 64, 2));
+    a.setMix(0.25);
+    a.setPreDelay(12.0);
+    const auto blob = a.getState();
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(b.getMix(), 0.25, 1e-6);
+    EXPECT_NEAR(b.getPreDelay(), 12.0, 1e-6);
+}
+
+// Loading an IR while audio ran switched to a bank whose tail starts from
+// silence, at once: a step in the wet signal. Old header, steady 300 Hz
+// tone: a step of 0.68 against 0.11 between steady samples.
+DSPARK_TEST(ConvReverb_ir_swap_while_running_is_click_free)
+{
+    const double fs = 48000.0;
+    const auto h1 = reverb_audit::hallWithDirect(fs, 3.0, 2.0, 0.0, 1u);
+    const auto h2 = reverb_audit::hallWithDirect(fs, 3.0, 2.0, 0.0, 5u);
+    Reverb<float> rev;
+    rev.prepare(spec(fs, 256, 2));
+    rev.setMix(1.0f);
+    EXPECT_TRUE(rev.loadIR(h1.data(), static_cast<int>(h1.size()), fs));
+    std::vector<float> L(256), R(256), out;
+    float* ch[2] = { L.data(), R.data() };
+    double phase = 0.0;
+    for (int b = 0; b < 800; ++b)
+    {
+        if (b == 400) EXPECT_TRUE(rev.loadIR(h2.data(), static_cast<int>(h2.size()), fs));
+        for (int i = 0; i < 256; ++i)
+        {
+            L[static_cast<size_t>(i)] = R[static_cast<size_t>(i)] = 0.25f * static_cast<float>(std::sin(phase));
+            phase += 6.283185307179586 * 300.0 / fs;
+        }
+        rev.processBlock(AudioBufferView<float>(ch, 2, 256));
+        out.insert(out.end(), L.begin(), L.end());
+    }
+    double steady = 0.0, swap = 0.0;
+    for (int i = 1; i < 400 * 256; ++i)
+        steady = std::max(steady, static_cast<double>(std::abs(out[static_cast<size_t>(i)] - out[static_cast<size_t>(i - 1)])));
+    for (int i = 400 * 256 - 2; i < 403 * 256; ++i)
+        swap = std::max(swap, static_cast<double>(std::abs(out[static_cast<size_t>(i)] - out[static_cast<size_t>(i - 1)])));
+    EXPECT_LT(swap, 1.5 * steady);
 }

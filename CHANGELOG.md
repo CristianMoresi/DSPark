@@ -14,9 +14,45 @@ All notable user-facing changes to DSPark are documented here.
   `noteOn` remains the zero-cent entry point.
 - Both instruments expose `kMaxEvents`, their shared per-block event queue
   capacity, so hosts can split dense event streams before queuing them.
+- `Convolver::Partitioning::NonUniform`: the latency stays one block, while
+  a long IR's tail runs in larger partitions whose work is spread over the
+  samples. `getTailBlockSize()` reports the tail partition.
 
 ### Fixed
 
+- `AlgorithmicReverb`: the modulated reads cover a fractional delay of
+  [0.1, 1.1) instead of [0.5, 1.5). Where the read index steps, the old range
+  changed the high-frequency phase delay and left noise: energy beyond 200 Hz
+  of a steady 8 kHz tone fell from -50 to -65 dBc. Default audio changes for
+  every type and quality, FDN and spring; level and T60 are unchanged.
+- `AlgorithmicReverb`: `setType()` writes the preset's values on the calling
+  thread. A setter called right after it was lost when the audio thread was
+  applying the preset (7% of trials in a stress test).
+- `AlgorithmicReverb`: width, early and late level, diffusion (including the
+  discrete/diffuse split of the early taps) and the tone filters glide over
+  about 20 ms instead of stepping at a block edge; the tone filters crossfade
+  when switched. A change before the first block after `prepare()` or
+  `reset()` still applies at once. Audio changes only while these move.
+- `AlgorithmicReverb` keeps the dry signal of a stereo buffer on a mono spec
+  and of a block longer than `maxBlockSize`, which it now processes in
+  conforming parts; `reset()` renders like a fresh instance (it differed by
+  6.6e-7); and `setState()` switches the tone filters off when the blob has
+  them off.
+- `Reverb` runs non-uniform partitions. A 6 s IR at 64-sample blocks costs
+  0.96% of a core instead of 18%, and 20 s 2.3% instead of 248%; the latency
+  is unchanged and the output changes at rounding level only.
+- `Reverb::setDecayScale()` fits the IR's decay on its tail, after the direct
+  sound, with one fit for all channels. A hall with a +20 dB direct sound
+  scaled by 0.5 measured 0.40 instead of 1.0 of the expected T60, and the two
+  channels of a stereo IR drifted apart. IRs with a strong direct sound sound
+  different at scales other than 1.
+- `Reverb` fades the wet signal across an IR replacement made while audio runs
+  (it stepped by 6x the steady sample-to-sample change), keeps the dry delay
+  of a converted IR on buffers with more channels than prepared, keeps the dry
+  signal of blocks longer than `maxBlockSize`, and `Reverb<double>::getState()`
+  compiles.
+- `RingBuffer` stays unprepared when its byte size does not fit a 32-bit
+  `size_t`; a 2^30-sample float ring got a zero-size block and wrote past it.
 - `TimeStretch` and `PitchShifter`, Studio engine: one NaN or Inf input sample
   wrote a byte before a heap block and left the output NaN until `reset()`.
   Non-finite samples now read as silence, and a spectrum that overflowed

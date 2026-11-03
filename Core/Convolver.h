@@ -16,6 +16,14 @@
  * For a 2-second reverb IR at 48 kHz (96000 samples), direct convolution would
  * require ~96000 multiplies per sample. FFT-based convolution needs ~20.
  *
+ * Partitioning::NonUniform keeps the latency at the block size but convolves
+ * the late part of a long IR in larger partitions (after Gardner, "Efficient
+ * Convolution without Input-Output Delay", JAES 1995): a uniform head of
+ * block-size partitions covers the first 2 x tail - block samples, and the
+ * tail's partitions are processed with their work spread evenly over the
+ * samples of each tail block. A long IR at a small block size then costs a
+ * fraction of the uniform engine, with no spike in any block.
+ *
  * Dependencies: FFT.h, AudioBuffer.h, AudioSpec.h, SimdOps.h.
  *
  * @code
@@ -44,6 +52,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -67,6 +77,13 @@ template <typename T>
 class Convolver
 {
 public:
+    /** @brief How the impulse response is partitioned (see the file notes). */
+    enum class Partitioning
+    {
+        Uniform,    ///< Every partition the block size (default).
+        NonUniform  ///< Block-size head, larger time-distributed tail partitions.
+    };
+
     /**
      * @brief Prepares the convolver with an impulse response.
      *
@@ -78,8 +95,13 @@ public:
      *                    Typical: 128, 256, 512.
      * @param irData      Pointer to the impulse response samples.
      * @param irLength    Number of samples in the impulse response.
+     * @param partitioning Uniform (default) or NonUniform. The latency is the
+     *                    block size either way, and the output the same
+     *                    convolution up to rounding. NonUniform only splits an
+     *                    IR long enough for it to pay.
      */
-    void prepare(int blockSize, const T* irData, int irLength)
+    void prepare(int blockSize, const T* irData, int irLength,
+                 Partitioning partitioning = Partitioning::Uniform)
     {
         assert(blockSize >= 2 && (blockSize & (blockSize - 1)) == 0);
         assert(irLength > 0);
@@ -96,11 +118,15 @@ public:
         fftSize_ = bs * 2;
         numBins_ = fftSize_ + 2; // (N/2 + 1) complex bins, interleaved = N+2 scalars
 
+        // NonUniform: the head takes h[0, 2 x tail - bs), the tail the rest.
+        tailBlock_ = partitioning == Partitioning::NonUniform ? chooseTailBlock(bs, irLength) : 0;
+        const int headLength = tailBlock_ > 0 ? 2 * tailBlock_ - bs : irLength;
+
         // Create FFT processor
         fft_ = std::make_unique<FFTReal<T>>(fftSize_);
 
         // Partition the IR into blocks
-        numPartitions_ = (irLength + bs - 1) / bs;
+        numPartitions_ = (headLength + bs - 1) / bs;
 
         // Pre-transform each IR partition
         irPartitions_.resize(static_cast<size_t>(numPartitions_));
@@ -109,7 +135,7 @@ public:
         for (int p = 0; p < numPartitions_; ++p)
         {
             int offset = p * bs;
-            int remaining = std::min(bs, irLength - offset);
+            int remaining = std::min(bs, headLength - offset);
 
             // Zero-pad the block to fftSize
             std::fill(paddedBlock.begin(), paddedBlock.end(), T(0));
@@ -131,8 +157,11 @@ public:
         for (auto& fdl : fdlBuffer_)
             fdl.assign(static_cast<size_t>(numBins_), T(0));
 
+        prepareTail(irData + headLength, irLength - headLength);
+
         fdlIndex_ = 0;
         inputPos_ = 0;
+        resetTail();
     }
 
     /** @brief Resets the convolution state (clears delay lines and buffers). */
@@ -145,6 +174,7 @@ public:
             std::fill(fdl.begin(), fdl.end(), T(0));
         fdlIndex_ = 0;
         inputPos_ = 0;
+        resetTail();
     }
 
     /**
@@ -180,7 +210,12 @@ public:
             // full in-place (input == output) legal.
             std::copy_n(input + i, run,
                         inputBuffer_.begin() + blockSize_ + inputPos_);
+            if (tailBlock_ > 0)
+                for (int k = 0; k < run; ++k)
+                    inRing_[static_cast<size_t>((absPos_ + k) & inMask_)] = input[i + k];
             std::copy_n(overlapBuffer_.begin() + inputPos_, run, output + i);
+            if (tailBlock_ > 0)
+                addTail(output + i, run);
 
             inputPos_ += run;
             i += run;
@@ -247,10 +282,171 @@ public:
     /** @brief Returns the block size. */
     [[nodiscard]] int getBlockSize() const noexcept { return blockSize_; }
 
-    /** @brief Returns the number of IR partitions. */
-    [[nodiscard]] int getNumPartitions() const noexcept { return numPartitions_; }
+    /** @brief Returns the number of IR partitions: the block-size head
+     *  partitions, plus the larger tail partitions in NonUniform mode. */
+    [[nodiscard]] int getNumPartitions() const noexcept { return numPartitions_ + numTailParts_; }
+
+    /** @brief Tail partition size in NonUniform mode, 0 when the IR is
+     *  convolved in block-size partitions only. */
+    [[nodiscard]] int getTailBlockSize() const noexcept { return tailBlock_; }
 
 private:
+    /**
+     * @brief Tail partition size for a block size and IR length, or 0 when
+     *        the uniform engine is as cheap.
+     *
+     * Per sample, the head costs about one complex multiply per head
+     * partition and the tail about one per tail partition, plus the tail's
+     * two FFTs spread over its block (weighed here as 1.5 x log2 of their
+     * size, close to their measured cost). The tail block is the power of two
+     * of at least 4 x the block size that minimises the sum.
+     */
+    static int chooseTailBlock(int bs, int irLength) noexcept
+    {
+        const double uniform = static_cast<double>(irLength) / bs;
+        double best = 0.8 * uniform;   // only split where it clearly pays
+        int choice = 0;
+        for (int t = 4 * bs; t <= kMaxTailBlock; t <<= 1)
+        {
+            const int head = 2 * t - bs;
+            if (irLength <= head + t) break;   // fewer than two tail partitions
+            const double tailParts = std::ceil(static_cast<double>(irLength - head) / t);
+            const double cost = static_cast<double>(head) / bs + tailParts
+                                + 1.5 * std::log2(2.0 * t);
+            if (cost < best) { best = cost; choice = t; }
+        }
+        return choice;
+    }
+
+    /** @brief Builds the tail partitions (and their buffers) for h[head, end). */
+    void prepareTail(const T* tailIr, int tailLength)
+    {
+        numTailParts_ = 0;
+        totalUnits_ = 0;
+        if (tailBlock_ == 0 || tailLength <= 0)
+        {
+            tailBlock_ = 0;
+            tailFft_.reset();
+            tailIR_.clear(); tailFdl_.clear(); tailAccum_.clear();
+            tailScratch_.clear(); tailOut_.clear(); inRing_.clear();
+            return;
+        }
+        const int tb = tailBlock_;
+        const std::size_t spec = static_cast<std::size_t>(2 * tb + 2);
+        numTailParts_ = (tailLength + tb - 1) / tb;
+        totalUnits_ = numTailParts_ + 3;   // FFT + K MACs + IFFT + scatter
+
+        tailFft_ = std::make_unique<FFTReal<T>>(2 * tb);
+        tailIR_.assign(static_cast<std::size_t>(numTailParts_) * spec, T(0));
+        tailFdl_.assign(static_cast<std::size_t>(numTailParts_) * spec, T(0));
+        tailAccum_.assign(spec, T(0));
+        tailScratch_.assign(static_cast<std::size_t>(2 * tb), T(0));
+        tailOut_.assign(static_cast<std::size_t>(8 * tb), T(0));
+        inRing_.assign(static_cast<std::size_t>(4 * tb), T(0));
+        outMask_ = 8 * tb - 1;
+        inMask_ = 4 * tb - 1;
+
+        std::vector<T> padded(static_cast<std::size_t>(2 * tb), T(0));
+        for (int p = 0; p < numTailParts_; ++p)
+        {
+            const int len = std::min(tb, tailLength - p * tb);
+            std::fill(padded.begin(), padded.end(), T(0));
+            std::copy_n(tailIr + static_cast<std::size_t>(p) * tb, len, padded.begin());
+            tailFft_->forward(padded.data(), &tailIR_[static_cast<std::size_t>(p) * spec]);
+        }
+    }
+
+    void resetTail() noexcept
+    {
+        std::fill(tailFdl_.begin(), tailFdl_.end(), T(0));
+        std::fill(tailOut_.begin(), tailOut_.end(), T(0));
+        std::fill(inRing_.begin(), inRing_.end(), T(0));
+        absPos_ = static_cast<std::int64_t>(inRing_.size());   // keep indices positive
+        cyclePos_ = 0;
+        tailFdlIndex_ = 0;
+        taskPhase_ = totalUnits_;   // idle until the first tail block is in
+        taskStart_ = 0;
+    }
+
+    /**
+     * @brief Adds the tail's contribution to `count` output samples and runs
+     *        this run's share of the pending tail task.
+     *
+     * The tail is computed on the block-delayed timeline: its partitions hold
+     * h[2 x tail - block, end), i.e. the IR shifted by the block latency
+     * starts exactly two tail blocks in, which is the scheduling slack of the
+     * time-distributed scheme. The runs never cross a tail-block boundary,
+     * because the tail block is a multiple of the block size.
+     */
+    void addTail(T* out, int count) noexcept
+    {
+        for (int k = 0; k < count; ++k)
+        {
+            T& slot = tailOut_[static_cast<size_t>((absPos_ + k) & outMask_)];
+            out[k] += slot;
+            slot = T(0);   // clear-on-read keeps the ring self-cleaning
+        }
+        absPos_ += count;
+        cyclePos_ += count;
+        // This cycle's proportional share of the task (64-bit product).
+        runTaskUnits(static_cast<int>((static_cast<std::int64_t>(totalUnits_) * cyclePos_
+                                       + tailBlock_ - 1) / tailBlock_));
+        if (cyclePos_ >= tailBlock_)
+        {
+            cyclePos_ = 0;   // the task is fully drained (quota == total)
+            taskStart_ = absPos_;
+            tailFdlIndex_ = (tailFdlIndex_ + 1) % numTailParts_;
+            taskPhase_ = 0;
+        }
+    }
+
+    /**
+     * @brief Runs pending tail units until `target` are done. Unit 0: FFT of
+     *        the task's input block into the FDL; units 1..K: one partition's
+     *        spectral multiply-accumulate each; unit K+1: inverse FFT; unit
+     *        K+2: overlap-add into the output ring at [start + tail, start + 3 tail).
+     */
+    void runTaskUnits(int target) noexcept
+    {
+        const int tb = tailBlock_;
+        const std::size_t spec = static_cast<std::size_t>(2 * tb + 2);
+        target = std::min(target, totalUnits_);
+        while (taskPhase_ < target)
+        {
+            const int unit = taskPhase_++;
+            if (unit == 0)
+            {
+                const std::int64_t blockStart = taskStart_ - tb;
+                const int s0 = static_cast<int>(blockStart & inMask_);
+                const int first = std::min(tb, inMask_ + 1 - s0);
+                std::copy_n(&inRing_[static_cast<size_t>(s0)], first, tailScratch_.begin());
+                if (first < tb)
+                    std::copy_n(inRing_.data(), tb - first, tailScratch_.begin() + first);
+                std::fill(tailScratch_.begin() + tb, tailScratch_.end(), T(0));
+                tailFft_->forward(tailScratch_.data(),
+                                  &tailFdl_[static_cast<size_t>(tailFdlIndex_) * spec]);
+                std::fill(tailAccum_.begin(), tailAccum_.end(), T(0));
+            }
+            else if (unit <= numTailParts_)
+            {
+                const int p = unit - 1;
+                const int slot = (tailFdlIndex_ - p + numTailParts_) % numTailParts_;
+                simd::complexMulAccum(tailAccum_.data(), &tailFdl_[static_cast<size_t>(slot) * spec],
+                                      &tailIR_[static_cast<size_t>(p) * spec], tb + 1);
+            }
+            else if (unit == numTailParts_ + 1)
+            {
+                tailFft_->inverse(tailAccum_.data(), tailScratch_.data());
+            }
+            else
+            {
+                const std::int64_t dst = taskStart_ + tb;
+                for (int m = 0; m < 2 * tb; ++m)
+                    tailOut_[static_cast<size_t>((dst + m) & outMask_)] += tailScratch_[static_cast<size_t>(m)];
+            }
+        }
+    }
+
     /**
      * @brief Processes one complete block through the frequency-domain convolution.
      *
@@ -293,6 +489,8 @@ private:
         fdlIndex_ = (fdlIndex_ + 1) % numPartitions_;
     }
 
+    static constexpr int kMaxTailBlock = 65536;
+
     int blockSize_ = 0;
     int fftSize_ = 0;
     int numBins_ = 0;
@@ -313,6 +511,25 @@ private:
     std::vector<T> outputBuffer_;
     std::vector<T> overlapBuffer_;
     std::vector<T> fftAccum_;
+
+    // NonUniform tail (empty in Uniform mode)
+    int tailBlock_ = 0;
+    int numTailParts_ = 0;
+    int totalUnits_ = 0;
+    std::unique_ptr<FFTReal<T>> tailFft_;
+    std::vector<T> tailIR_;       ///< K partition spectra (contiguous)
+    std::vector<T> tailFdl_;      ///< K input spectra (frequency-domain delay line)
+    std::vector<T> tailAccum_;
+    std::vector<T> tailScratch_;
+    std::vector<T> tailOut_;      ///< tail overlap-add output ring (clear-on-read)
+    std::vector<T> inRing_;       ///< input history for the tail transforms
+    int outMask_ = 0;
+    int inMask_ = 0;
+    std::int64_t absPos_ = 0;
+    std::int64_t taskStart_ = 0;
+    int cyclePos_ = 0;
+    int tailFdlIndex_ = 0;
+    int taskPhase_ = 0;
 };
 
 } // namespace dspark

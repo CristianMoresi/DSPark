@@ -23,6 +23,15 @@
  * - **Stretch** resamples the IR (tape-speed style): above 1 the space
  *   gets larger and darker, below 1 smaller and brighter.
  *
+ * The convolution runs in non-uniform partitions (Convolver::Partitioning::
+ * NonUniform): the latency stays one partition of the block size, while a
+ * long IR's tail is convolved in larger, time-distributed partitions.
+ *
+ * Replacing the IR while audio runs (loadIR, setDecayScale, setStretch,
+ * setState) fades the old bank's wet signal out over the block in which the
+ * replacement is adopted, and the new bank's in over 10 ms. The new bank
+ * starts from silence, so a running tail is replaced, not continued.
+ *
  * Three levels of API complexity:
  *
  * - **Level 1 (simple):** `reverb.loadIR("hall.wav"); reverb.setMix(0.3f);`
@@ -76,6 +85,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -310,6 +320,21 @@ public:
             }
         }
 
+        return activeToken_ == emptyToken
+            ? nullptr
+            : slots_[tokenIndex(activeToken_)].bank.get();
+    }
+
+    /** Audio owner: true while a published bank waits for adoption. A hint
+     *  only (one load); the adoption itself is still one exchange. */
+    [[nodiscard]] bool hasPending() const noexcept
+    {
+        return pendingToken_.load(std::memory_order_relaxed) != emptyToken;
+    }
+
+    /** Audio owner: the active bank, without adopting anything. */
+    [[nodiscard]] Bank* activeBank() const noexcept
+    {
         return activeToken_ == emptyToken
             ? nullptr
             : slots_[tokenIndex(activeToken_)].bank.get();
@@ -658,9 +683,12 @@ public:
             rb.prepare(maxDelaySamples);
         const int nextPreDelaySamples = calculatePreDelaySamples(spec);
 
+        const int nextSwapFade = std::max(1, static_cast<int>(spec.sampleRate * 0.01));
         if (irStorage_.empty())
         {
             spec_ = spec;
+            swapFadeLength_ = nextSwapFade;
+            swapFadePos_ = nextSwapFade;
             fftBlockSize_ = fftBlock;
             mixer_ = std::move(nextMixer);
             preDelayBuffers_ = std::move(nextPreDelayBuffers);
@@ -678,6 +706,8 @@ public:
             std::move(candidate), latency,
             [&]() noexcept {
                 spec_ = spec;
+                swapFadeLength_ = nextSwapFade;
+                swapFadePos_ = nextSwapFade;
                 fftBlockSize_ = fftBlock;
                 mixer_ = std::move(nextMixer);
                 preDelayBuffers_ = std::move(nextPreDelayBuffers);
@@ -692,7 +722,9 @@ public:
      * Flow: pushDry -> pre-delay -> convolve -> mixWet (with the dry delayed
      * by the convolution latency so both paths stay aligned). Without a
      * loaded IR the audio passes through untouched (and getLatency() is 0).
-     * Channels beyond the prepared count pass through untouched.
+     * Channels beyond the prepared count pass through untouched. A block
+     * longer than the prepared maxBlockSize is processed as consecutive
+     * blocks of at most that size, with the same result.
      *
      * Thread-safety: a fixed four-slot ownership handoff adopts at most one
      * complete bank at the block boundary. The audio path performs one atomic
@@ -703,60 +735,29 @@ public:
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        ConvolverBank* const bank = bankPublisher_.adoptAtBoundary();
+        // A replacement bank waiting at this boundary: render this block on
+        // the current bank while its wet signal fades out, and adopt at its
+        // end, so the swap does not step (the new bank starts from silence).
+        ConvolverBank* bank = bankPublisher_.activeBank();
+        const bool swapAfter = bank != nullptr && bankPublisher_.hasPending();
+        if (!swapAfter) bank = bankPublisher_.adoptAtBoundary();
         if (!bank || bank->convolvers.empty()) return;
 
-        const int nCh = std::min(buffer.getNumChannels(),
-                                 static_cast<int>(bank->convolvers.size()));
-        const int nS  = buffer.getNumSamples();
+        // The dry copies hold maxBlockSize samples: run a longer block as
+        // several conforming ones, with the same result.
+        const int nS = buffer.getNumSamples();
+        const int maxBlock = std::max(1, spec_.maxBlockSize);
+        for (int start = 0; start < nS; start += maxBlock)
+            processPart(*bank, buffer.getSubView(start, std::min(maxBlock, nS - start)),
+                        swapAfter ? start : -1, nS);
 
-        if (bank->extraDelay > 0 && nS <= bank->scratchLength
-            && buffer.getNumChannels() <= static_cast<int>(bank->dryDelay.size()))
+        if (swapAfter)
         {
-            // The dry path waits for the wet path's extra samples too.
-            const int dCh = buffer.getNumChannels();
-            std::array<T*, 64> ptrs {};
-            for (int ch = 0; ch < dCh && ch < 64; ++ch)
-            {
-                auto& ring = bank->dryDelay[static_cast<size_t>(ch)];
-                T* dst = bank->dryScratch.data()
-                       + static_cast<size_t>(ch) * static_cast<size_t>(bank->scratchLength);
-                const T* src = buffer.getChannel(ch);
-                for (int i = 0; i < nS; ++i)
-                {
-                    ring.push(src[i]);
-                    dst[i] = ring.read(bank->extraDelay);
-                }
-                ptrs[static_cast<size_t>(ch)] = dst;
-            }
-            mixer_.pushDry(AudioBufferView<T>(ptrs.data(), std::min(dCh, 64), nS));
+            (void)bankPublisher_.adoptAtBoundary();
+            // Fade the adopted bank in from where its output starts: a fresh
+            // convolver is silent for its partition latency.
+            swapFadePos_ = -fftBlockSize_;
         }
-        else
-        {
-            mixer_.pushDry(buffer);
-        }
-
-        int preDelSamp = preDelaySamples_.load(std::memory_order_relaxed);
-        T mixVal = mix_.load(std::memory_order_relaxed);
-
-        for (int ch = 0; ch < nCh; ++ch)
-        {
-            T* data = buffer.getChannel(ch);
-
-            if (preDelSamp > 0)
-            {
-                auto& ring = preDelayBuffers_[static_cast<size_t>(ch)];
-                for (int i = 0; i < nS; ++i)
-                {
-                    ring.push(data[i]);
-                    data[i] = ring.read(preDelSamp);
-                }
-            }
-
-            bank->convolvers[static_cast<size_t>(ch)].processInPlace(data, nS);
-        }
-
-        mixer_.mixWet(buffer, mixVal);
     }
 
     /**
@@ -780,6 +781,7 @@ public:
         for (auto& rb : preDelayBuffers_)
             rb.reset();
         mixer_.reset();
+        swapFadePos_ = swapFadeLength_;
     }
 
     // -- Level 1: Simple API ----------------------------------------------------
@@ -1081,10 +1083,10 @@ public:
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
         StateWriter w(stateId("CRVB"), 1);
-        w.write("mix", mix_.load(std::memory_order_relaxed));
-        w.write("preDelay", preDelayMs_.load(std::memory_order_relaxed));
-        w.write("decayScale", decayScale_.load(std::memory_order_relaxed));
-        w.write("stretch", stretch_.load(std::memory_order_relaxed));
+        w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
+        w.write("preDelay", static_cast<float>(preDelayMs_.load(std::memory_order_relaxed)));
+        w.write("decayScale", static_cast<float>(decayScale_.load(std::memory_order_relaxed)));
+        w.write("stretch", static_cast<float>(stretch_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -1143,6 +1145,93 @@ public:
     }
 
 protected:
+    /**
+     * @brief One conforming part (at most maxBlockSize samples) of a block.
+     *
+     * @param fadeOutAt   Offset of this part in a block whose wet signal fades
+     *                    out to 0 at its end (a bank swap follows), or -1.
+     * @param blockLength Length of that whole block.
+     */
+    void processPart(ConvolverBank& bank, AudioBufferView<T> buffer, int fadeOutAt,
+                     int blockLength) noexcept
+    {
+        const int nCh = std::min(buffer.getNumChannels(),
+                                 static_cast<int>(bank.convolvers.size()));
+        const int nS  = buffer.getNumSamples();
+
+        if (bank.extraDelay > 0 && nS <= bank.scratchLength)
+        {
+            // The dry path waits for the wet path's extra samples too. Only
+            // the prepared channels have a dry path; further ones pass
+            // through untouched.
+            const int dCh = std::min({ buffer.getNumChannels(),
+                                       static_cast<int>(bank.dryDelay.size()), 64 });
+            std::array<T*, 64> ptrs {};
+            for (int ch = 0; ch < dCh; ++ch)
+            {
+                auto& ring = bank.dryDelay[static_cast<size_t>(ch)];
+                T* dst = bank.dryScratch.data()
+                       + static_cast<size_t>(ch) * static_cast<size_t>(bank.scratchLength);
+                const T* src = buffer.getChannel(ch);
+                for (int i = 0; i < nS; ++i)
+                {
+                    ring.push(src[i]);
+                    dst[i] = ring.read(bank.extraDelay);
+                }
+                ptrs[static_cast<size_t>(ch)] = dst;
+            }
+            mixer_.pushDry(AudioBufferView<T>(ptrs.data(), dCh, nS));
+        }
+        else
+        {
+            mixer_.pushDry(buffer);
+        }
+
+        int preDelSamp = preDelaySamples_.load(std::memory_order_relaxed);
+        T mixVal = mix_.load(std::memory_order_relaxed);
+
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* data = buffer.getChannel(ch);
+
+            if (preDelSamp > 0)
+            {
+                auto& ring = preDelayBuffers_[static_cast<size_t>(ch)];
+                for (int i = 0; i < nS; ++i)
+                {
+                    ring.push(data[i]);
+                    data[i] = ring.read(preDelSamp);
+                }
+            }
+
+            bank.convolvers[static_cast<size_t>(ch)].processInPlace(data, nS);
+        }
+
+        // Bank-swap fades of the wet signal (raised cosine).
+        if (fadeOutAt >= 0)
+        {
+            const double scale = 3.141592653589793 / static_cast<double>(blockLength);
+            for (int i = 0; i < nS; ++i)
+            {
+                const T g = static_cast<T>(0.5 + 0.5 * std::cos(scale * (fadeOutAt + i + 1)));
+                for (int ch = 0; ch < nCh; ++ch) buffer.getChannel(ch)[i] *= g;
+            }
+        }
+        else if (swapFadePos_ < swapFadeLength_)
+        {
+            const double scale = 3.141592653589793 / static_cast<double>(swapFadeLength_);
+            for (int i = 0; i < nS; ++i)
+            {
+                const int pos = std::clamp(swapFadePos_ + i + 1, 0, swapFadeLength_);
+                const T g = static_cast<T>(0.5 - 0.5 * std::cos(scale * pos));
+                for (int ch = 0; ch < nCh; ++ch) buffer.getChannel(ch)[i] *= g;
+            }
+            swapFadePos_ = std::min(swapFadePos_ + nS, swapFadeLength_);
+        }
+
+        mixer_.mixWet(buffer, mixVal);
+    }
+
     [[nodiscard]] int calculatePreDelaySamples(const AudioSpec& spec) const noexcept
     {
         return calculatePreDelaySamples(
@@ -1225,6 +1314,12 @@ protected:
 
         std::vector<T> shaped;   // lazy decay-shaped copy of one IR channel
         int shapedCh = -1;
+        // One decay estimate for the whole IR, so every channel is reshaped
+        // by the same envelope (per-channel fits differ with each channel's
+        // direct sound and would pull the channels' decays apart).
+        DecayEstimate decayFit {};
+        if (doShape)
+            decayFit = estimateDecay(source.data(), sourceLength, sourceChannels, sourceSampleRate);
 
         // An IR at another rate (or stretched) is converted offline, time
         // aligned, over the whole span the kernel reaches, and scaled by the
@@ -1255,7 +1350,7 @@ protected:
             {
                 if (shapedCh != irCh)
                 {
-                    shaped = shapeDecay(irData, sourceLength, dScale);
+                    shaped = shapeDecay(irData, sourceLength, dScale, decayFit);
                     shapedCh = irCh;
                 }
                 if (!shaped.empty())
@@ -1295,7 +1390,8 @@ protected:
             const int start = convert ? zeroIndex[static_cast<size_t>(ch)] - extra : 0;
             const int len = static_cast<int>(out.size()) - start;
             if (len > 0)
-                conv.prepare(fftBlock, out.data() + start, len);
+                conv.prepare(fftBlock, out.data() + start, len,
+                             Convolver<T>::Partitioning::NonUniform);
             else
             {
                 const T silence = T(0);
@@ -1323,53 +1419,80 @@ protected:
             std::max(0, bank.convolvers.front().getLatency() + bank.extraDelay));
     }
 
-    /**
-     * @brief Returns a decay-scaled copy of one IR channel (see setDecayScale).
-     *
-     * Estimates the source decay rate from the Schroeder backward-energy
-     * curve (T20 fit: -5 dB to -25 dB crossings of the EDC), then applies
-     * exp(-k * (n - peak)) so the result decays at `factor` times the
-     * original T60. The direct sound (up to the peak) is untouched.
-     * Returns an empty vector when the IR has no measurable exponential
-     * decay (too short, or gated); the caller then uses the original data.
-     */
-    [[nodiscard]] std::vector<T> shapeDecay(const T* ir, int len,
-                                            double factor) const
+    /** Decay of an IR: amplitude decay rate per sample and the direct peak. */
+    struct DecayEstimate
     {
-        if (!ir || len < 64) return {};
-
-        // Total energy + direct-sound peak (double accumulation).
-        double total = 0.0;
-        double peakMag = 0.0;
+        double beta = 0.0;   ///< 0 when the IR has no usable exponential decay
         int peak = 0;
-        for (int n = 0; n < len; ++n)
+    };
+
+    /**
+     * @brief Estimates the decay rate of a (multichannel) IR.
+     *
+     * Schroeder backward-energy curve of the channels' summed energy, from
+     * 5 ms after the direct-sound peak, T20 fit between its -5 dB and -25 dB
+     * crossings. Starting after the direct sound matters: its energy is a step
+     * at the top of the curve, and a fit through that step misreads the slope
+     * by the direct-to-reverberant ratio. Returns beta 0 when the IR has no
+     * measurable exponential decay (too short, or gated).
+     */
+    [[nodiscard]] static DecayEstimate estimateDecay(const T* source, int len, int channels,
+                                                     double rate)
+    {
+        DecayEstimate fit {};
+        if (!source || len < 64 || channels <= 0) return fit;
+        std::vector<double> energy(static_cast<size_t>(len), 0.0);
+        double peakMag = 0.0;
+        for (int ch = 0; ch < channels; ++ch)
         {
-            const double v = static_cast<double>(ir[n]);
-            total += v * v;
-            const double m = std::abs(v);
-            if (m > peakMag) { peakMag = m; peak = n; }
+            const T* ir = source + static_cast<size_t>(ch) * static_cast<size_t>(len);
+            for (int n = 0; n < len; ++n)
+            {
+                const double v = static_cast<double>(ir[n]);
+                energy[static_cast<size_t>(n)] += v * v;
+                if (std::abs(v) > peakMag) { peakMag = std::abs(v); fit.peak = n; }
+            }
         }
-        if (total <= 1e-30 || peakMag <= 0.0) return {};
+        if (peakMag <= 0.0) return fit;
+        const int start = std::min(len - 1, fit.peak + std::max(1, static_cast<int>(0.005 * rate)));
+        double total = 0.0;
+        for (int n = start; n < len; ++n) total += energy[static_cast<size_t>(n)];
+        if (total <= 1e-30) return fit;
 
         // Schroeder EDC crossings at -5 dB and -25 dB (energy ratios).
         constexpr double r5  = 0.31622776601683794;    // 10^(-5/10)
         constexpr double r25 = 0.0031622776601683794;  // 10^(-25/10)
         int t5 = -1, t25 = -1;
         double tail = total;
-        for (int n = 0; n < len; ++n)
+        for (int n = start; n < len; ++n)
         {
             const double ratio = tail / total;
-            if (t5 < 0 && ratio <= r5 && n > peak) t5 = n;
-            if (ratio <= r25 && n > peak) { t25 = n; break; }
-            const double v = static_cast<double>(ir[n]);
-            tail -= v * v;
+            if (t5 < 0 && ratio <= r5) t5 = n;
+            if (ratio <= r25) { t25 = n; break; }
+            tail -= energy[static_cast<size_t>(n)];
         }
-        if (t5 < 0 || t25 < 0 || t25 - t5 < 32) return {};  // no usable slope
+        if (t5 < 0 || t25 < 0 || t25 - t5 < 32) return fit;  // no usable slope
 
         // Amplitude decay rate: the EDC drops 20 dB over (t25 - t5) samples,
         // so exp(-beta * t) with beta = ln(10) / (t25 - t5).
-        const double beta = 2.302585092994046 / static_cast<double>(t25 - t5);
-        const double k = beta * (1.0 / factor - 1.0);
+        fit.beta = 2.302585092994046 / static_cast<double>(t25 - t5);
+        return fit;
+    }
+
+    /**
+     * @brief Returns a decay-scaled copy of one IR channel (see setDecayScale).
+     *
+     * Applies exp(-k * (n - peak)) so the result decays at `factor` times the
+     * original T60 (`fit` from estimateDecay()). The direct sound (up to the
+     * peak) is untouched. Returns an empty vector when the fit found no
+     * usable decay; the caller then uses the original data.
+     */
+    [[nodiscard]] std::vector<T> shapeDecay(const T* ir, int len,
+                                            double factor, const DecayEstimate& fit) const
+    {
+        if (!ir || len < 64 || !(fit.beta > 0.0)) return {};
+        const int peak = std::min(fit.peak, len - 1);
+        const double k = fit.beta * (1.0 / factor - 1.0);
 
         std::vector<T> out(static_cast<size_t>(len));
         const double gStep = std::exp(-k);
@@ -1424,6 +1547,8 @@ protected:
 
     AudioSpec spec_ {};
     int fftBlockSize_ = 0; ///< Convolver partition size = engine latency (set in prepare()).
+    int swapFadeLength_ = 480;   ///< Fade-in after a bank swap (10 ms).
+    int swapFadePos_ = 480;      ///< Audio owner: progress of that fade-in.
     std::atomic<T> mix_ { T(0.3) };
     std::atomic<T> preDelayMs_ { T(0) };
     std::atomic<int> preDelaySamples_ { 0 };

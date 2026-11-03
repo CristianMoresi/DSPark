@@ -30,8 +30,10 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 
 #if defined(_WIN32)
@@ -77,7 +79,9 @@ public:
      *
      * @param maxSamples Maximum number of samples to store. Clamped
      * release-safe to [1, 2^30] (non-positive requests allocate a single
-     * sample; larger ones would overflow the power-of-two round-up).
+     * sample; larger ones would overflow the power-of-two round-up). A
+     * capacity whose byte size does not fit size_t (32-bit targets) leaves
+     * the buffer unprepared, capacity 0, like a failed allocation.
      */
     void prepare(int maxSamples) noexcept
     {
@@ -97,8 +101,18 @@ public:
         // Ensure 32-byte alignment for SIMD operations. std::aligned_alloc
         // additionally requires the size to be an integral multiple of the
         // alignment (UB / nullptr otherwise on POSIX), so round bytes up to 32.
-        size_t bytes = static_cast<size_t>(capacity_) * sizeof(T);
-        bytes = (bytes + 31u) & ~static_cast<size_t>(31u);
+        // The byte count is formed in 64 bits: with a 32-bit size_t (x86,
+        // WebAssembly) 2^30 floats wrap to 0 bytes, and the allocator then
+        // hands back a valid zero-size block that the ring would overrun.
+        const std::uint64_t bytes64 =
+            (static_cast<std::uint64_t>(capacity_) * sizeof(T) + 31u) & ~static_cast<std::uint64_t>(31u);
+        if (bytes64 > static_cast<std::uint64_t>(std::numeric_limits<size_t>::max()))
+        {
+            buffer_.reset();
+            capacity_ = 0; mask_ = 0; writePos_ = 0;
+            return;
+        }
+        const size_t bytes = static_cast<size_t>(bytes64);
 
         // Custom deleter for aligned allocation
         buffer_.reset(static_cast<T*>(

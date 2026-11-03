@@ -1389,3 +1389,61 @@ DSPARK_TEST(Resampler_ignores_unusable_rates)
     EXPECT_EQ(resampler.processBlock(in.data(), 16, out.data()), 32);
     EXPECT_EQ(resampler.process(in.data(), 16).size(), size_t(32));
 }
+
+// Convolver::Partitioning::NonUniform (used by Reverb): the same convolution
+// as the uniform engine, with the same block latency, for every block size
+// and run length, across reset(). The option did not exist before; Reverb
+// convolved long IRs in block-size partitions only (6 s at 64 samples: 16x
+// the cost of a non-uniform engine).
+DSPARK_TEST(Convolver_non_uniform_nulls_against_direct_convolution)
+{
+    uint32_t seed = 11u;
+    auto next = [&seed](uint32_t mod) { seed = seed * 1664525u + 1013904223u; return (seed >> 8) % mod; };
+    auto gauss = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<double>(static_cast<int32_t>(seed)) / 2147483648.0;
+    };
+    int split = 0;
+    for (int trial = 0; trial < 24; ++trial)
+    {
+        const int bs = 1 << (1 + static_cast<int>(next(7)));
+        const int len = trial < 4 ? 1 + static_cast<int>(next(3000)) : 4000 + static_cast<int>(next(40000));
+        std::vector<double> ir(static_cast<size_t>(len));
+        double env = 1.0;
+        const double a = std::pow(10.0, -3.0 / (len + 1.0));
+        for (auto& v : ir) { v = gauss() * env; env *= a; }
+        const int n = len + 4000;
+        std::vector<double> x(static_cast<size_t>(n), 0.0), ref(static_cast<size_t>(n), 0.0);
+        for (int i = 0; i < 4000; ++i) x[static_cast<size_t>(i)] = 0.1 * gauss();
+        for (int i = 0; i < 4000; ++i)
+            for (int k = 0; k < len && i + k < n; ++k)
+                ref[static_cast<size_t>(i + k)] += x[static_cast<size_t>(i)] * ir[static_cast<size_t>(k)];
+        std::vector<float> irf(ir.size());
+        std::transform(ir.begin(), ir.end(), irf.begin(), [](double v) { return static_cast<float>(v); });
+        Convolver<float> conv;
+        conv.prepare(bs, irf.data(), len, Convolver<float>::Partitioning::NonUniform);
+        if (conv.getTailBlockSize() > 0) ++split;
+        EXPECT_EQ(conv.getLatency(), bs);
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            if (pass == 1) conv.reset();
+            std::vector<float> y(x.size());
+            std::transform(x.begin(), x.end(), y.begin(), [](double v) { return static_cast<float>(v); });
+            for (int i = 0; i < n;)
+            {
+                const int k = std::min(1 + static_cast<int>(next(1u << next(12))), n - i);
+                conv.processInPlace(y.data() + i, k);
+                i += k;
+            }
+            double err = 0.0, sig = 0.0;
+            for (int i = bs; i < n; ++i)
+            {
+                const double d = y[static_cast<size_t>(i)] - ref[static_cast<size_t>(i - bs)];
+                err += d * d;
+                sig += ref[static_cast<size_t>(i - bs)] * ref[static_cast<size_t>(i - bs)];
+            }
+            EXPECT_LT(10.0 * std::log10(err / sig), -110.0);
+        }
+    }
+    EXPECT_GT(split, 10);
+}

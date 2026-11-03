@@ -24,6 +24,15 @@
  * distortion on sustained low notes (measured THD+N on a steady 60 Hz tone,
  * -30 dB threshold, 3:1: 0.22% bell, 0.30% low shelf; now below 0.001%).
  *
+ * Bells use BiquadCoeffs::makePeakMatched() (Vicanek's matched design): the
+ * width follows the analog prototype up to Nyquist instead of cramping (a
+ * +12 dB bell at 16 kHz gives +10.0 dB at 20 kHz at 48 kHz, prototype +9.65;
+ * the cookbook form gave +3.4), and a centre above Nyquist is clamped
+ * instead of producing an unstable filter.
+ *
+ * Non-finite samples read as silence in the detectors and bypass the gain
+ * filters for that sample, so one NaN or Inf cannot latch in their state.
+ *
  * Threading model (per method; the model is docs/threading.md):
  * - prepare() / reset() / setOversampling() / setState(): setup or UI threads
  *   only, never concurrently with processBlock().
@@ -207,12 +216,21 @@ public:
             // Each Oversampling instance owns one internal high-rate buffer, so
             // we cannot share one between the two streams; processing them
             // separately keeps each stream's polyphase filter state consistent.
-            auto upAudio = oversampler_->upsample(audio);
-            auto upSc    = oversamplerSc_->upsample(sidechain);
+            // The oversamplers hold at most maxBlockSize base samples, so a
+            // longer block runs in chunks (its tail used to pass dry).
+            const int total = audio.getNumSamples();
+            const int chunk = std::max(1, spec_.maxBlockSize);
+            for (int off = 0; off < total; off += chunk)
+            {
+                const int m = std::min(chunk, total - off);
+                auto audioChunk = audio.getSubView(off, m);
+                auto upAudio = oversampler_->upsample(audioChunk);
+                auto upSc    = oversamplerSc_->upsample(sidechain.getSubView(off, m));
 
-            processCore(upAudio, upSc, sampleRate_ * oversamplingFactor_);
+                processCore(upAudio, upSc, sampleRate_ * oversamplingFactor_);
 
-            oversampler_->downsample(audio);
+                oversampler_->downsample(audioChunk);
+            }
         }
         else
         {
@@ -227,7 +245,9 @@ public:
      * Fields are sanitized on the way in: non-finite values keep the band's
      * previously published value (a NaN frequency/Q/time used to poison the
      * detector or the gain ballistics permanently), wild shape enums are
-     * clamped, and the range fields are floored at 0.
+     * clamped, and the range fields are floored at 0. Configuring a band at or
+     * beyond the current band count raises the count to band + 1 (it used to
+     * leave the band silent until setNumBands()).
      */
     void setBand(int band, const BandConfig& config) noexcept
     {
@@ -255,6 +275,9 @@ public:
         masterConfigs_[static_cast<size_t>(band)] = c;
         staged_[static_cast<size_t>(band)].publish(c);
         paramsDirty_[band].store(true, std::memory_order_release);
+        // Single control writer: a plain load/store pair cannot lose a write.
+        if (numBands_.load(std::memory_order_relaxed) < band + 1)
+            numBands_.store(band + 1, std::memory_order_relaxed);
     }
 
     void setNumBands(int n) noexcept
@@ -331,6 +354,14 @@ public:
         }
         for (int ch = 0; ch < kMaxChannels; ++ch)
             lookaheadBuf_[ch].reset();
+        // The analytic detectors and the oversamplers hold signal history
+        // too: leaving it made reset() replay the old programme (a silent
+        // input produced a 0.84 peak at 2x and a -13 dB gain reading).
+        for (auto& a : analytic_) a.reset();
+        if (oversampler_) oversampler_->reset();
+        if (oversamplerSc_) oversamplerSc_->reset();
+        refreshCounter_ = 0;
+        lastNumBands_ = MaxBands;
     }
 
 
@@ -340,6 +371,7 @@ public:
         StateWriter w(stateId("DYEQ"), 1);
         const int n = numBands_.load(std::memory_order_relaxed);
         w.write("numBands", n);
+        w.write("lookahead", static_cast<float>(lookaheadMs_));
         char key[28];
         for (int i = 0; i < n; ++i)
         {
@@ -424,6 +456,8 @@ public:
             setBand(i, c);
         }
         setNumBands(n);
+        // Blobs written before the key existed were rendered without lookahead.
+        setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         return true;
     }
 
@@ -447,6 +481,21 @@ private:
         if (scCh <= 0) return; // a 0-channel sidechain would index getChannel(-1)
         const int nb   = numBands_.load(std::memory_order_relaxed);
         const int laSamples = lookaheadSamples_.load(std::memory_order_relaxed);
+
+        // Bands re-activated by a band-count increase start clean: they would
+        // otherwise replay the gain and filter state from when they were last
+        // active (a boosted band re-added on a 0.001 tone peaked at 5.4).
+        if (nb > lastNumBands_)
+            for (int b = lastNumBands_; b < nb; ++b)
+            {
+                bandDetector_[b].reset();
+                bandFilter_[b].reset();
+                currentGainDb_[b] = T(0);
+                meterGainDb_[b].store(T(0), std::memory_order_relaxed);
+                for (int ch = 0; ch < kMaxChannels; ++ch)
+                    analytic_[static_cast<size_t>(b * kMaxChannels + ch)].reset();
+            }
+        lastNumBands_ = nb;
 
         // 1. Thread-Safe State Update
         for (int b = 0; b < nb; ++b)
@@ -474,8 +523,8 @@ private:
                 {
                     const T* sc = sidechain.getChannel(std::min(ch, scCh - 1)) + chunkStart;
                     for (int j = 0; j < chunkLen; ++j)
-                        detBand_[static_cast<size_t>(j)] =
-                            static_cast<double>(bandDetector_[b].processSample(sc[j], ch));
+                        detBand_[static_cast<size_t>(j)] = static_cast<double>(bandDetector_[b].processSample(
+                            std::isfinite(sc[j]) ? sc[j] : T(0), ch)); // non-finite would latch
                     analytic_[static_cast<size_t>(b * kMaxChannels + ch)].magnitudeBlock(
                         detBand_.data(), detMag_.data(), chunkLen);
                     for (int j = 0; j < chunkLen; ++j)
@@ -519,20 +568,23 @@ private:
 
                     // Refresh gain-filter coefficients every 16 samples - the gain
                     // envelope is slow enough that this granularity is inaudible.
-                    // Bells use the precomputed freq/Q trig, so a refresh costs
-                    // one pow() instead of a full sin/cos/pow redesign; shelves
-                    // run their full design, which at 1/16th rate stays negligible.
+                    // The grid is a free-running counter, not the block index, so
+                    // the output does not depend on how the host cuts the stream.
+                    // Bells run the matched design; at 1/16th rate it stays
+                    // negligible (+1.6% CPU over the cookbook form).
                     // Stream-owner direct writes (setCoeffsNow): these values are
                     // computed HERE, on the audio thread, for this thread's own
                     // use, so they never touch the staged cross-thread channel.
-                    if ((i & 15) == 0)
+                    if ((refreshCounter_ & 15u) == 0u)
                     {
                         if (std::abs(currentGain) > T(0.01))
                         {
                             switch (states_[b].cfg.shape)
                             {
                             case BandShape::Bell:
-                                updateDynamicPeakCoeffs(b, currentGain);
+                                bandFilter_[b].setCoeffsNow(BiquadCoeffs::makePeakMatched(
+                                    currentFs, static_cast<double>(states_[b].cfg.frequency),
+                                    static_cast<double>(states_[b].cfg.q), static_cast<double>(currentGain)));
                                 break;
                             case BandShape::LowShelf:
                                 bandFilter_[b].setCoeffsNow(BiquadCoeffs::makeLowShelf(
@@ -550,9 +602,10 @@ private:
                             bandFilter_[b].setCoeffsNow(BiquadCoeffs{}); // Bypass
                     }
 
-                    if ((i & 63) == 0) // Sub-sample metering update
+                    if ((refreshCounter_ & 63u) == 0u) // Sub-sample metering update
                         meterGainDb_[b].store(currentGain, std::memory_order_relaxed);
                 }
+                ++refreshCounter_;
 
                 // Apply Filters
                 for (int ch = 0; ch < nCh; ++ch)
@@ -564,11 +617,14 @@ private:
                         audioSample = lookaheadBuf_[ch].read(laSamples);
                     }
 
-                    for (int b = 0; b < nb; ++b) {
-                        if (states_[b].cfg.enabled) {
-                            audioSample = bandFilter_[b].processSample(audioSample, ch);
+                    // A non-finite sample passes without entering the filter
+                    // state, where it would latch for good.
+                    if (std::isfinite(audioSample))
+                        for (int b = 0; b < nb; ++b) {
+                            if (states_[b].cfg.enabled) {
+                                audioSample = bandFilter_[b].processSample(audioSample, ch);
+                            }
                         }
-                    }
                     audio.getChannel(ch)[i] = audioSample;
                 }
             }
@@ -647,14 +703,6 @@ private:
             break;
         }
 
-        // Precompute the freq/Q-dependent peak-EQ terms ONCE per parameter change
-        // (cos w0 and alpha), so the per-block dynamic update needs only a pow().
-        // Double, like the rest of the coefficient path: the design is only
-        // ever as good as the arithmetic that builds it.
-        const double w0 = 2.0 * 3.14159265358979323846 * static_cast<double>(cfg.frequency) / fs;
-        precomputedCos_[b]   = std::cos(w0);
-        precomputedAlpha_[b] = std::sin(w0) / (2.0 * std::max(static_cast<double>(cfg.q), 0.001));
-
         auto calcCoeff = [fs](T ms) -> T {
             const double tauSec = std::max(static_cast<double>(ms), 0.01) / 1000.0;
             return static_cast<T>(1.0 - std::exp(-1.0 / (fs * tauSec)));
@@ -664,25 +712,6 @@ private:
         states_[b].aboveRelCoeff = calcCoeff(cfg.aboveReleaseMs);
         states_[b].belowAtkCoeff = calcCoeff(cfg.belowAttackMs);
         states_[b].belowRelCoeff = calcCoeff(cfg.belowReleaseMs);
-    }
-
-    /** @brief Fast peak-EQ coefficient update from precomputed cos/alpha + gain. */
-    void updateDynamicPeakCoeffs(int b, T gainDb) noexcept
-    {
-        const double A     = std::pow(10.0, static_cast<double>(gainDb) / 40.0);
-        const double cosw  = precomputedCos_[b];
-        const double alpha = precomputedAlpha_[b];
-        const double a0Inv = 1.0 / (1.0 + alpha / A);
-
-        BiquadCoeffs c;
-        c.b0 = (1.0 + alpha * A) * a0Inv;
-        c.b1 = (-2.0 * cosw)     * a0Inv;
-        c.b2 = (1.0 - alpha * A) * a0Inv;
-        c.a1 = (-2.0 * cosw)     * a0Inv;
-        c.a2 = (1.0 - alpha / A) * a0Inv;
-        // Stream-owner direct write: computed on the audio thread for its
-        // own use, so it bypasses the staged cross-thread channel.
-        bandFilter_[b].setCoeffsNow(c);
     }
 
     void updateLookahead() noexcept
@@ -874,10 +903,8 @@ private:
     std::array<BandConfig, MaxBands> masterConfigs_ {};
     std::array<std::atomic<bool>, MaxBands> paramsDirty_ {};
     std::array<BandState, MaxBands> states_ {};
-    // Precomputed freq/Q-dependent peak-EQ trig terms (per band) so the per-block
-    // dynamic gain update needs only a pow(), not cos/sin/pow every sample.
-    std::array<double, MaxBands> precomputedCos_ {};
-    std::array<double, MaxBands> precomputedAlpha_ {};
+    unsigned refreshCounter_ = 0;   ///< Free-running coefficient-refresh grid (audio thread).
+    int lastNumBands_ = MaxBands;   ///< Audio-thread tracker for band re-activation resets.
 
     // Biquads must span the class's full channel capacity (kMaxChannels); the
     // default Biquad<T> is only 8 channels, which would index its per-channel state

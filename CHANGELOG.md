@@ -125,6 +125,69 @@ All notable user-facing changes to DSPark are documented here.
   21), matching `allChords`, and an invalid degree returns -1 for every interval.
 - `KeyDetector::getKeyName()` writes C#m and G#m, not Dbm and Abm.
   `ChordDetector::getChordName()` spells roots by key, so Bb is no longer A#.
+- `DynamicEQ` and `DeEsser` build their bells with
+  `BiquadCoeffs::makePeakMatched()`. A band above Nyquist was unstable (a
+  30 kHz band at 44.1 kHz reached 3e37, then NaN), and bells near Nyquist were
+  cramped (+12 dB at 16 kHz gave +3.4 dB at 20 kHz; the prototype is +9.65,
+  now +10.0). Default audio changes: bell shapes move to the prototype, by up
+  to 0.05 dB for a 1 kHz bell, 2.8 dB at 20 kHz for an 8 kHz bell and 1.0 dB
+  near 9.6 kHz for the default 7 kHz de-esser cut. DynamicEQ CPU +1.6%.
+- `DynamicEQ`: a band re-added by `setNumBands()` starts clean (a boosted band
+  peaked at 5.37 on a 0.001 tone); with oversampling, blocks longer than
+  `maxBlockSize` are processed in chunks (the tail passed dry); `reset()`
+  clears the analytic detectors and the oversamplers (silence after a reset
+  came out at a 0.84 peak); `setBand()` raises the band count to cover the
+  band (alone it did nothing); the state blob stores the lookahead (latency
+  240 came back as 0).
+- `DynamicEQ` and `DeEsser`: the 16-sample coefficient refresh runs on a
+  free-running counter, so the output no longer depends on the host's block
+  partition (it differed by up to 2.1e-2 and 4.6e-2). Unchanged for block
+  sizes that are multiples of 16.
+- One NaN or Inf input sample no longer latches. It reads as silence in the
+  detectors and skips recursive filter state; the sample itself still passes.
+  Before: Inf poisoned `Compressor` for good (every detector but
+  SplitPolarity), NaN froze its mono Hilbert and SplitPolarity detectors and
+  the FET colour, Inf muted `Expander` for good, `NoiseGate::processSample()`
+  stuck open and Frequency mode went NaN, and `DynamicEQ`, `DeEsser`,
+  `TransientDesigner` and the IIR `CrossoverFilter` (hence
+  `MultibandCompressor`) stayed NaN.
+- `NoiseGate`: an external sidechain shorter than the audio block was read past
+  its end; it now falls back to the internal key.
+- `CrossoverFilter`: band views with fewer channels than the input were written
+  through a null pointer; the channel count now clamps to the narrowest view.
+  Exact Butterworth Q values flatten the band sum to 1e-6 dB (3.4e-4 for
+  LR24, 1.1e-3 for LR48). Default audio changes by 2e-6.
+- `Compressor`, FeedBack with RMS, TruePeak or Hilbert detection: the
+  detector read the signal after makeup, so +12 dB of makeup gave 22.5 dB of
+  reduction instead of 13.5 and adaptive auto makeup ran away to -52 dB.
+  Upward + FeedBack now lands on the panel ratio (8:1 observed 1.87:1), and the
+  feedback attack compensation covers Upward too.
+- `Compressor`: `processSample()` applies a sidechain HPF cutoff set after
+  `prepare()` (it kept the old one); a live character change no longer steps
+  the gain (Clean to Opto jumped 5.9 dB in one sample); the dB envelopes are
+  double (a 3 s release at 192 kHz parked 0.57 dB short of its target).
+  Default audio changes by up to 2.4e-6 (Opto 8e-6). The FET aliasing note
+  states the measured -41 to -55 dBc; it claimed -72 dBc or better.
+- `Limiter`: adaptive release counts the time peaks ask for reduction, so it
+  slows after sustained limiting (2 s of limiting: 239 ms to recover instead
+  of 87 ms, the same as without it). Off by default.
+- `Expander`: the detector follows max(|x|, analytic magnitude) with an
+  instant attack. The old smoothed rectifier read a tone about 1.07 dB low, so
+  the gain below the threshold was (R - 1) x 1.07 dB under the documented law
+  (-22.15 dB instead of -20 at ratio 3, 1 kHz), and a 30 Hz tone had -30.7 dB
+  THD+N (now -87). Default audio changes: up to 3.2 dB more gain below the
+  threshold at the default ratio 4. CPU 5.8 to 42 ns per stereo frame.
+- `TransientDesigner`: attack and sustain changes ramp at one unit per 10 ms
+  (`setAttack(100)` at an onset stepped the output by 3.56 in one sample).
+  Default audio unchanged.
+- `DeEsser` installs a `DenormalGuard` (silence after signal cost 20.1 instead
+  of 10.6 ns per stereo frame) and writes its own coefficients with
+  `setCoeffsNow()`.
+- `TruePeakDetector<float>` runs the four phases as one 4-lane pass on SSE2 and
+  NEON: 12.4 to 3.45 ns per sample, and `Limiter` with true peak 37.4 to
+  19.9 ns per stereo frame. Readings change by rounding only (under 2e-7);
+  the scalar path (double, other targets) is unchanged.
+
 
 ## [1.8.1] - 2026-10-13
 

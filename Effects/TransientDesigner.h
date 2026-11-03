@@ -25,6 +25,8 @@
  *   never concurrently with processBlock().
  * - setAttack / setSustain / setCharacter / setOutputDepRecovery: RT-safe
  *   atomic publications from any thread (non-finite values are ignored).
+ *   The applied amounts ramp to the published ones at a unit per 10 ms.
+ * - Non-finite input samples read as silence in the detector.
  * - Channels beyond the 16-channel state cap are left untouched.
  * - Before prepare() the envelope coefficients are zero, which makes
  *   processBlock() an exact pass-through by construction.
@@ -115,6 +117,24 @@ public:
         const T susAmt = sustainAmount_.load(std::memory_order_relaxed);
         const bool odr = outputDepRecovery_.load(std::memory_order_relaxed);
 
+        // Amount changes ramp at a fixed rate (a unit change over 10 ms) so a
+        // setAttack()/setSustain() during a transient cannot step the gain by
+        // up to 24 dB in one sample. The ramp is closed-form in the samples
+        // elapsed since the change, so every channel sees the same values and
+        // the result does not depend on the block partition.
+        if (attAmt != rampToAttack_ || susAmt != rampToSustain_)
+        {
+            const T done = static_cast<T>(rampStep_ * rampPos_);
+            rampFromAttack_ = moveTowards(rampFromAttack_, rampToAttack_, done);
+            rampFromSustain_ = moveTowards(rampFromSustain_, rampToSustain_, done);
+            rampToAttack_ = attAmt;
+            rampToSustain_ = susAmt;
+            rampPos_ = 0.0;
+        }
+        const bool ramping = (rampFromAttack_ != attAmt) || (rampFromSustain_ != susAmt);
+        const T att0 = rampFromAttack_, sus0 = rampFromSustain_;
+        const double pos0 = rampPos_;
+
         // Constants for VCA log-domain emulation
         constexpr T noiseFloor = T(1e-5);     // -100 dB floor avoids log(0) and denormals
         constexpr T maxGainLog = T(2.77258);  // approx +24dB max gain change
@@ -135,12 +155,19 @@ public:
                 if (i % kDetChunk == 0)
                 {
                     const int n = std::min(kDetChunk, nS - i);
-                    for (int j = 0; j < n; ++j) detIn_[static_cast<size_t>(j)] = static_cast<double>(channelData[i + j]);
+                    for (int j = 0; j < n; ++j)
+                    {
+                        // Non-finite samples read as silence in the detector
+                        // (they would latch in the envelopes and the allpasses).
+                        const T x = channelData[i + j];
+                        detIn_[static_cast<size_t>(j)] = std::isfinite(x) ? static_cast<double>(x) : 0.0;
+                    }
                     analytic.magnitudeBlock(detIn_.data(), detMag_.data(), n);
                 }
                 T sample = channelData[i];
                 const T envelopeLevel = std::max(
-                    std::abs(sample), static_cast<T>(detMag_[static_cast<size_t>(i % kDetChunk)]));
+                    static_cast<T>(std::abs(detIn_[static_cast<size_t>(i % kDetChunk)])),
+                    static_cast<T>(detMag_[static_cast<size_t>(i % kDetChunk)]));
                 T absSample = envelopeLevel + noiseFloor;
 
                 // 1. Fast envelope (Peak)
@@ -165,20 +192,34 @@ public:
                 T diffLog = fastLog(fast) - fastLog(slow);
 
                 // Attack kicks in when fast > slow (diffLog > 0). Sustain when slow > fast (diffLog < 0)
-                T gainLog = (diffLog > T(0)) ? (diffLog * attAmt) : (-diffLog * susAmt);
+                const T stepNow = static_cast<T>(rampStep_ * (pos0 + static_cast<double>(i + 1)));
+                const T att = ramping ? moveTowards(att0, attAmt, stepNow) : attAmt;
+                const T sus = ramping ? moveTowards(sus0, susAmt, stepNow) : susAmt;
+                T gainLog = (diffLog > T(0)) ? (diffLog * att) : (-diffLog * sus);
 
                 gainLog = std::clamp(gainLog, -maxGainLog, maxGainLog);
 
                 T gain = fastExp(gainLog);
 
-                lastOut = sample * gain;
-                channelData[i] = lastOut;
+                const T out = sample * gain;
+                lastOut = std::isfinite(out) ? out : T(0);
+                channelData[i] = out;
             }
 
             // Save state
             envFast_[ch] = fast;
             envSlow_[ch] = slow;
             lastOutput_[ch] = lastOut;
+        }
+        if (ramping)
+        {
+            rampPos_ += static_cast<double>(nS);
+            if (rampStep_ * rampPos_ >= 2.0) // the whole [-1, 1] span has elapsed
+            {
+                rampFromAttack_ = attAmt;
+                rampFromSustain_ = susAmt;
+                rampPos_ = 0.0;
+            }
         }
     }
 
@@ -238,6 +279,9 @@ public:
         envSlow_.fill(T(1e-5));
         lastOutput_.fill(T(0));
         for (auto& a : analytic_) a.reset();
+        rampFromAttack_ = rampToAttack_ = attackAmount_.load(std::memory_order_relaxed);
+        rampFromSustain_ = rampToSustain_ = sustainAmount_.load(std::memory_order_relaxed);
+        rampPos_ = 0.0;
     }
 
 
@@ -275,6 +319,7 @@ private:
         fastReleaseCoeff_ = T(1) - std::exp(T(-1) / (fs * T(0.005)));
         slowAttackCoeff_  = T(1) - std::exp(T(-1) / (fs * T(0.020)));
         slowReleaseCoeff_ = T(1) - std::exp(T(-1) / (fs * T(0.200)));
+        rampStep_ = 1.0 / (sampleRate_ * 0.010); // a unit amount change over 10 ms
     }
 
     double sampleRate_ = 48000.0;
@@ -288,6 +333,11 @@ private:
     // setup thread, read by the audio thread)
     T fastAttackCoeff_ = T(0), fastReleaseCoeff_ = T(0);
     T slowAttackCoeff_ = T(0), slowReleaseCoeff_ = T(0);
+    // Amount ramp (audio thread): from/to values and samples since the change.
+    double rampStep_ = 1.0;      ///< Amount change per sample (instant before prepare()).
+    double rampPos_ = 0.0;
+    T rampFromAttack_ = T(0), rampToAttack_ = T(0);
+    T rampFromSustain_ = T(0), rampToSustain_ = T(0);
 
     // Per-channel state (scalar recursion; no SIMD kernel touches these)
     std::array<T, kMaxChannels> envFast_ {};

@@ -15,14 +15,21 @@
  * Architecture:
  * 1. Bandpass sidechain (Biquad) isolates the sibilant band.
  * 2. Envelope follower (peak with attack/release) tracks maximum stereo sibilance.
- * 3. Fast-math Biquad Peak cut applies gain reduction with precomputed trig terms.
+ * 3. A matched peak-cut bell (BiquadCoeffs::makePeakMatched, Vicanek) applies
+ *    the reduction; its width follows the analog prototype up to Nyquist (a
+ *    -12 dB, one-octave cut at 16 kHz reads -9.4 dB at 20 kHz at 48 kHz,
+ *    prototype -8.25; the cookbook form read -2.1).
+ *
+ * Non-finite samples read as silence in the detector and bypass the cut for
+ * that sample, so one NaN or Inf cannot latch in the filter state.
  *
  * Threading: prepare() belongs to the setup thread; processBlock() and reset()
  * belong to the audio thread. Setters are lock-free atomic publications, safe
  * from any thread, consumed at the next processBlock(). Non-finite setter
  * arguments are ignored.
  *
- * Dependencies: Biquad.h, DspMath.h, AudioSpec.h, AudioBuffer.h, StateBlob.h.
+ * Dependencies: Biquad.h, DenormalGuard.h, DspMath.h, AudioSpec.h,
+ *               AudioBuffer.h, StateBlob.h.
  *
  * @code
  *   dspark::DeEsser<float> deesser;
@@ -37,6 +44,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/Biquad.h"
+#include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/StateBlob.h"
 
@@ -103,6 +111,7 @@ public:
         int numCh = std::min(buffer.getNumChannels(), std::min(numChannels_, kMaxChannels));
         int numSamples = buffer.getNumSamples();
         if (numSamples == 0 || numCh == 0) return;
+        DenormalGuard guard;
 
         updateFiltersIfDirty();
 
@@ -141,6 +150,7 @@ public:
             derivShift_[ch].fill(T(0));
         }
         envelope_ = T(0);
+        refreshCounter_ = 0;
         gainReduction_.store(T(0), std::memory_order_relaxed);
     }
 
@@ -273,6 +283,7 @@ private:
             for (int ch = 0; ch < numCh; ++ch)
             {
                 T dataIn = buffer.getChannel(ch)[i];
+                if (!std::isfinite(dataIn)) dataIn = T(0); // would latch in the detector
                 T level = T(0);
 
                 if constexpr (IsDerivative)
@@ -307,20 +318,29 @@ private:
 
             if (-grDb > blockMaxGr) blockMaxGr = -grDb;
 
-            // 4. Apply processing per channel
+            // 4. Apply processing per channel. The refresh grid is a
+            //    free-running counter (not the block index), so the output
+            //    does not depend on how the host cuts the stream.
+            const bool refresh = (refreshCounter_ & static_cast<unsigned>(refreshInterval - 1)) == 0u;
+            ++refreshCounter_;
             for (int ch = 0; ch < numCh; ++ch)
             {
                 T& smoothedGr = smoothedGrDb_[ch];
                 smoothedGr += coefSmooth * (grDb - smoothedGr);
 
-                // Refresh coefficients without trig functions
-                if ((i & (refreshInterval - 1)) == 0)
+                if (refresh)
                 {
-                    updateDynamicPeakCoeffs(ch, smoothedGr);
+                    // Channels share the linked gain: design once per frame.
+                    if (ch > 0 && smoothedGr == smoothedGrDb_[0])
+                        reduction_[ch].setCoeffsNow(reduction_[0].getCoeffs());
+                    else
+                        updateDynamicPeakCoeffs(ch, smoothedGr);
                 }
 
                 T* channelData = buffer.getChannel(ch);
-                channelData[i] = reduction_[ch].processSample(channelData[i], 0);
+                const T x = channelData[i];
+                // A non-finite sample passes without entering the filter state.
+                channelData[i] = std::isfinite(x) ? reduction_[ch].processSample(x, 0) : x;
             }
         }
     }
@@ -344,46 +364,28 @@ private:
         const double fEff = std::clamp(static_cast<double>(freq), 1.0,
                                        std::max(1.0, sampleRate_ * 0.499));
 
+        // Stream-owner direct writes (setCoeffsNow): prepare() and the audio
+        // thread are the only callers, and the coefficients are for their own
+        // use (docs/threading.md, the origin rule).
         auto c = BiquadCoeffs::makeBandPass(sampleRate_, fEff, static_cast<double>(bw));
         for (int ch = 0; ch < kMaxChannels; ++ch)
-            detector_[ch].setCoeffs(c);
+            detector_[ch].setCoeffsNow(c);
 
-        // Precompute trig terms for the Peak filter to avoid math in the inner
-        // loop. Double, like the rest of the coefficient path: the design is
-        // only ever as good as the arithmetic that builds it.
-        double w0 = twoPi<double> * fEff / sampleRate_;
-        precomputedCos_ = std::cos(w0);
-        precomputedAlpha_ = std::sin(w0) / (2.0 * static_cast<double>(bw));
+        peakFreq_ = fEff;
+        peakQ_ = static_cast<double>(bw);
     }
 
     /**
-     * @brief Calculates fast Peak EQ coefficients dynamically using precomputed trig.
+     * @brief Designs the dynamic cut bell for the given gain (matched design).
      * @param ch Channel index.
      * @param gainDb Gain to apply (negative).
      */
     void updateDynamicPeakCoeffs(int ch, T gainDb) noexcept
     {
-        // A = 10^(gainDb / 40)
-        const double A = std::pow(10.0, static_cast<double>(gainDb) / 40.0);
-
-        const double b0 = 1.0 + precomputedAlpha_ * A;
-        const double b1 = -2.0 * precomputedCos_;
-        const double b2 = 1.0 - precomputedAlpha_ * A;
-        const double a0 = 1.0 + precomputedAlpha_ / A;
-        const double a1 = -2.0 * precomputedCos_;
-        const double a2 = 1.0 - precomputedAlpha_ / A;
-
-        // Normalization
-        const double a0Inv = 1.0 / a0;
-
-        BiquadCoeffs coeffs;
-        coeffs.b0 = b0 * a0Inv;
-        coeffs.b1 = b1 * a0Inv;
-        coeffs.b2 = b2 * a0Inv;
-        coeffs.a1 = a1 * a0Inv;
-        coeffs.a2 = a2 * a0Inv;
-
-        reduction_[ch].setCoeffs(coeffs);
+        // Stream-owner direct write: computed on the audio thread for its own
+        // use, so it bypasses the staged cross-thread channel.
+        reduction_[ch].setCoeffsNow(BiquadCoeffs::makePeakMatched(
+            sampleRate_, peakFreq_, peakQ_, static_cast<double>(gainDb)));
     }
 
     void updateEnvelopeCoeffs() noexcept
@@ -425,9 +427,10 @@ private:
 
     std::array<std::array<T, kDerivLen>, kMaxChannels> derivShift_ {};
 
-    // Precomputed components for fast Biquad Peak modulation
-    double precomputedCos_ = 0.0;
-    double precomputedAlpha_ = 0.0;
+    // Bell design inputs (clamped centre and Q), set with the detector.
+    double peakFreq_ = 7000.0;
+    double peakQ_ = 2.0;
+    unsigned refreshCounter_ = 0; ///< Free-running coefficient-refresh grid.
 };
 
 } // namespace dspark

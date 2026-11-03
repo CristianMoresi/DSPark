@@ -8,9 +8,15 @@
  * @brief Downward expander with configurable ratio, hysteresis, and sidechain.
  *
  * A generalization of the noise gate: instead of fully closing (infinite ratio),
- * the expander applies a configurable ratio below the threshold. Includes an
- * integrated envelope detector to prevent low-frequency intermodulation
- * distortion, a true-stereo sidechain high-pass filter, and an external
+ * the expander applies a configurable ratio below the threshold. The level
+ * detector follows max(|x|, analytic magnitude) from a zero-latency IIR Hilbert
+ * pair (Core/Hilbert.h) with instant attack and a 5 ms release, so a steady
+ * tone reads as its peak amplitude at every frequency (the static curve and
+ * the threshold hold to 0.01 dB from 30 Hz to 19 kHz) and low tones are not
+ * modulated at their own frequency (a 30 Hz tone 10 dB under the threshold:
+ * THD+N -87 dB). The previous smoothed rectifier under-read by about 1 dB,
+ * which a ratio R turned into (R - 1) dB of error. Includes a true-stereo
+ * sidechain high-pass filter, and an external
  * sidechain input (processBlock(audio, sidechain) keys the detector from the
  * sidechain signal; a sidechain shorter than the audio block falls back to the
  * internal key so the caller's buffer is never over-read).
@@ -32,14 +38,18 @@
  * rises before a transient reaches the output instead of chopping its onset;
  * getLatency() reports the delay.
  *
+ * Non-finite detector samples read as silence (they would latch in the
+ * detector state); they still pass to the output for that sample.
+ *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h,
- *               RingBuffer.h, StateBlob.h.
+ *               Hilbert.h, RingBuffer.h, StateBlob.h.
  */
 
 #include "../Core/DspMath.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/Hilbert.h"
 #include "../Core/RingBuffer.h"
 #include "../Core/StateBlob.h"
 
@@ -298,6 +308,7 @@ public:
         std::fill(scHpfState_.begin(), scHpfState_.end(), T(0));
         std::fill(scHpfPrev_.begin(), scHpfPrev_.end(), T(0));
         for (auto& line : lookahead_) line.reset();
+        for (auto& a : analytic_) a.reset();
     }
 
 
@@ -349,7 +360,6 @@ protected:
         cachedReleaseCoeff_ = releaseCoeff_.load(std::memory_order_relaxed);
         cachedHoldSamples_  = holdSamples_.load(std::memory_order_relaxed);
         cachedScHpfEnabled_ = scHpfEnabled_.load(std::memory_order_relaxed);
-        cachedDetAttCoeff_  = detAttCoeff_.load(std::memory_order_relaxed);
         cachedDetRelCoeff_  = detRelCoeff_.load(std::memory_order_relaxed);
         cachedScHpfCoeff_   = scHpfCoeff_.load(std::memory_order_relaxed);
         cachedScHpfA0_      = scHpfA0_.load(std::memory_order_relaxed);
@@ -381,15 +391,20 @@ protected:
         const int detCh = UseSc ? std::min(sidechain->getNumChannels(), MAX_CHANNELS)
                                 : std::min(nCh, MAX_CHANNELS);
 
-        for (int i = 0; i < nS; ++i)
+        for (int c0 = 0; c0 < nS; c0 += kDetChunk)
         {
-            T sc = T(0);
+        const int m = std::min(kDetChunk, nS - c0);
+        std::fill(detLevel_.begin(), detLevel_.begin() + m, T(0));
 
-            // 1. Calculate Sidechain Signal
-            for (int ch = 0; ch < detCh; ++ch)
+        // 1. Detector key per channel: sanitised, high-passed, then the larger
+        //    of the rectified sample and the analytic magnitude (computed
+        //    section by section over the chunk, like DynamicEQ).
+        for (int ch = 0; ch < detCh; ++ch)
+        {
+            const T* src = (UseSc ? sidechain->getChannel(ch) : buffer.getChannel(ch)) + c0;
+            for (int j = 0; j < m; ++j)
             {
-                T input = UseSc ? sidechain->getChannel(ch)[i]
-                                : buffer.getChannel(ch)[i];
+                T input = std::isfinite(src[j]) ? src[j] : T(0); // non-finite would latch
                 if constexpr (UseHPF)
                 {
                     // One-pole HPF on the raw bipolar signal per channel,
@@ -400,15 +415,27 @@ protected:
                     scHpfState_[ch] = output;
                     input = output;
                 }
-                sc = std::max(sc, std::abs(input));
+                detIn_[static_cast<size_t>(j)] = static_cast<double>(input);
             }
+            analytic_[static_cast<size_t>(ch)].magnitudeBlock(detIn_.data(), detMag_.data(), m);
+            for (int j = 0; j < m; ++j)
+            {
+                const T level = static_cast<T>(std::max(std::abs(detIn_[static_cast<size_t>(j)]),
+                                                        detMag_[static_cast<size_t>(j)]));
+                if (level > detLevel_[static_cast<size_t>(j)]) detLevel_[static_cast<size_t>(j)] = level;
+            }
+        }
 
-            // 2. Smoothed-peak envelope detector (prevents LF intermodulation).
-            // Coefficients are derived from the sample rate in
-            // updateCoefficients() - fixed per-sample constants made the
-            // detector 4x faster at 192 kHz than at 44.1 kHz.
-            T envCoeff = sc > envelope_ ? cachedDetAttCoeff_ : cachedDetRelCoeff_;
-            envelope_ += envCoeff * (sc - envelope_);
+        for (int j = 0; j < m; ++j)
+        {
+            const int i = c0 + j;
+            const T sc = detLevel_[static_cast<size_t>(j)];
+
+            // 2. Peak envelope: instant attack (the analytic magnitude is
+            // already ripple-free on steady tones), sample-rate derived 5 ms
+            // release.
+            if (sc > envelope_) envelope_ = sc;
+            else envelope_ += cachedDetRelCoeff_ * (sc - envelope_);
 
             // 3. Gain Calculation (Converting envelope to dB only once)
             T levelDb = gainToDecibels(envelope_ + T(1e-9));
@@ -428,6 +455,7 @@ protected:
                 }
                 x *= gain;
             }
+        }
         }
 
         publishMeters();
@@ -513,8 +541,7 @@ protected:
         releaseCoeff_.store(T(1) - std::exp(T(-1) / (fs * releaseMs_.load(std::memory_order_relaxed) / T(1000))),
                             std::memory_order_relaxed);
 
-        // Detector ballistics (~0.5 ms attack, ~5 ms release), sample-rate aware.
-        detAttCoeff_.store(T(1) - std::exp(T(-1) / (fs * T(0.0005))), std::memory_order_relaxed);
+        // Detector release (~5 ms), sample-rate aware; the attack is instant.
         detRelCoeff_.store(T(1) - std::exp(T(-1) / (fs * T(0.005))),  std::memory_order_relaxed);
 
         // Recompute the sidechain HPF for the (possibly new) sample rate.
@@ -561,7 +588,6 @@ protected:
 
     std::atomic<T> attackCoeff_ { T(0) };
     std::atomic<T> releaseCoeff_ { T(0) };
-    std::atomic<T> detAttCoeff_ { T(0.01) };
     std::atomic<T> detRelCoeff_ { T(0.001) };
     std::atomic<int> holdSamples_ { 0 };
 
@@ -572,7 +598,6 @@ protected:
     T cachedRangeLinear_ = T(0.0001);
     T cachedAttackCoeff_ = T(0);
     T cachedReleaseCoeff_ = T(0);
-    T cachedDetAttCoeff_ = T(0.01);
     T cachedDetRelCoeff_ = T(0.001);
     T cachedScHpfCoeff_ = T(0.995);
     T cachedScHpfA0_ = T(0.9975);
@@ -586,6 +611,13 @@ protected:
     std::atomic<T> publishedGateGain_ { T(0) };
     T envelope_ = T(0);
     int holdCounter_ = 0;
+
+    // Analytic detector (per detector channel) and its chunk scratch.
+    static constexpr int kDetChunk = 64;
+    std::array<HilbertIIR<double>, MAX_CHANNELS> analytic_ {};
+    std::array<double, kDetChunk> detIn_ {};
+    std::array<double, kDetChunk> detMag_ {};
+    std::array<T, kDetChunk> detLevel_ {};
 };
 
 } // namespace dspark

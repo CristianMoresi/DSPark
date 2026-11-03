@@ -33,7 +33,9 @@
  * processSample() and reset() belong to the audio thread. All setters are
  * lock-free atomic publications, safe from any thread; they are consumed at
  * the start of the next block (or the next processSample() call). Non-finite
- * setter arguments are ignored.
+ * setter arguments are ignored. Non-finite signal samples read as silence in
+ * the detector and leave the Frequency-mode filters untouched. An external
+ * sidechain shorter than the audio block falls back to the internal key.
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h,
  *               RingBuffer.h, StateBlob.h.
@@ -157,7 +159,7 @@ public:
             T det0 = T(0);
             for (int ch = 0; ch < nCh; ++ch)
             {
-                T s = buffer.getChannel(ch)[i];
+                T s = detectorSafe(buffer.getChannel(ch)[i]);
                 if (cachedScHpfEnabled_ && ch < kMaxScChannels)
                     s = applyScHpf(s, ch);
                 if (ch == 0) det0 = s;
@@ -196,6 +198,14 @@ public:
      */
     void processBlock(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
     {
+        // A sidechain shorter than the audio block (or with no channels)
+        // would be read past its end: key from the audio itself instead.
+        if (sidechain.getNumChannels() <= 0 || sidechain.getNumSamples() < audio.getNumSamples())
+        {
+            processBlock(audio);
+            return;
+        }
+
         DenormalGuard guard;
         syncParamsIfDirty();
 
@@ -224,7 +234,7 @@ public:
                 T det0 = T(0);
                 for (int c = 0; c < scCh; ++c)
                 {
-                    T s = sidechain.getChannel(c)[i];
+                    T s = detectorSafe(sidechain.getChannel(c)[i]);
                     if (cachedScHpfEnabled_ && c < kMaxScChannels)
                         s = applyScHpf(s, c);
                     if (c == 0) det0 = s;
@@ -637,6 +647,9 @@ protected:
 
     [[nodiscard]] T applyFrequencyGate(T input, int ch) noexcept
     {
+        // A non-finite sample passes through without touching the filter
+        // state, where it would latch for good.
+        if (!std::isfinite(input)) return input;
         T gateOpenness = gateGain_;
 
         T targetLp = T(20) + (cachedNyquist_ - T(20)) * gateOpenness;
@@ -667,8 +680,13 @@ protected:
         return output;
     }
 
+    /** @brief Non-finite detector samples read as silence (they would latch
+     *  in the envelope and filter state). */
+    [[nodiscard]] static T detectorSafe(T x) noexcept { return std::isfinite(x) ? x : T(0); }
+
     [[nodiscard]] T processSampleInternal(T input, T sidechain, int ch) noexcept
     {
+        sidechain = detectorSafe(sidechain);
         if (cachedScHpfEnabled_ && ch < kMaxScChannels)
             sidechain = applyScHpf(sidechain, ch);
 

@@ -432,7 +432,9 @@ public:
         lookaheadDirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Enables program-dependent adaptive release. RT-Safe. */
+    /** @brief Enables program-dependent adaptive release. RT-Safe.
+     *  The release time grows with how long peaks have been asking for
+     *  reduction: up to 3x after 200 ms of sustained limiting. */
     void setAdaptiveRelease(bool enabled) noexcept { adaptiveRelease_.store(enabled, std::memory_order_relaxed); }
 
     /**
@@ -655,7 +657,6 @@ protected:
         // Release: the envelope follows reductions at once (the moving
         // averages below shape the attack) and recovers with the one-pole.
         // min() selects between the two without a data-dependent branch.
-        const bool attacking = held < envelope_;
         double coeff = static_cast<double>(releaseCoeff_);
         if (adaptive)
         {
@@ -674,8 +675,12 @@ protected:
         if (held <= envelope_) holdLeft_ = holdSamples_;
         else if (holdLeft_ > 0) { --holdLeft_; coeff = 0.0; }
         envelope_ = std::min(held, envelope_ + coeff * (held - envelope_));
-        limitingDuration_ = attacking ? std::min(limitingDuration_ + 1, maxLimitSamples_)
-                                      : (envelope_ > 0.999 ? 0 : limitingDuration_);
+        // Program memory: count every frame on which a peak in the hold
+        // window asks for reduction (counting only frames where the envelope
+        // was still falling missed sustained limiting, which barely ever pushes
+        // the envelope lower, so the release never slowed).
+        limitingDuration_ = (held < 0.999) ? std::min(limitingDuration_ + 1, maxLimitSamples_)
+                                           : (envelope_ > 0.999 ? 0 : limitingDuration_);
 
         // Two cascaded moving averages (lengths boxA_, boxB_): an S-shaped,
         // click-free ramp spanning exactly the window the hold covers.

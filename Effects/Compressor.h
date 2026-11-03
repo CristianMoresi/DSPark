@@ -35,7 +35,9 @@
  * owns the stream. All setters and getState() are safe from any thread
  * (atomic publication; the audio thread consumes changes at block/sample
  * boundaries). Invalid setter values (NaN/Inf, wild enums) are ignored or
- * clamped, so no control-thread input can poison the audio path.
+ * clamped, so no control-thread input can poison the audio path. A
+ * non-finite input sample reads as silence in the detector and cannot latch
+ * in its state; it still passes to the output for that sample.
  * getGainReductionDb()/getLatency() are metering/host reads (relaxed).
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, SmoothedValue.h,
@@ -73,13 +75,16 @@ namespace dspark {
  * smoothed to prevent audio artifacts. Processing is strictly allocation-free
  * after the initial prepare() call.
  *
- * @note The gain path runs at the host rate on purpose: worst-case
- *       gain-modulation aliasing measures <= -72 dBc (FET character at its
- *       minimum attack), inaudible on real material. Products that oversample
- *       a nonlinear section can wrap this compressor in that section like any
- *       other stage with Core/Oversampling: one resampler for the whole
- *       section instead of one per module (see docs/cookbook.md,
- *       "Oversampling a nonlinear section").
+ * @note The gain path runs at the host rate on purpose. Its gain-modulation
+ *       aliasing grows with speed and depth: with the Hilbert or RMS detector
+ *       it stays near -94 dBc, the Peak detector at a 0.1 ms attack reaches
+ *       -53 dBc, and the FET character at its 20 us minimum attack measures
+ *       -55 dBc (ratio 4, 6 dB over the threshold) to -41 dBc (ratio 20,
+ *       30 dB over), worst on tones near 18 kHz. Products that need less can
+ *       wrap this compressor in an oversampled section like any other stage
+ *       with Core/Oversampling: one resampler for the whole section instead
+ *       of one per module (see docs/cookbook.md, "Oversampling a nonlinear
+ *       section").
  *
  * @tparam T Floating-point sample type (float or double).
  */
@@ -237,6 +242,7 @@ public:
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
 
         updateHpfCoefficients();
+        scHpfDirty_.store(false, std::memory_order_relaxed);
 
         // RMS Buffer pre-allocation (Max 500ms to ensure zero real-time allocation)
         int maxRmsSamples = static_cast<int>(sampleRate_ * 0.5) + 1;
@@ -375,12 +381,17 @@ public:
                              && modeType == Mode::Downward
                              && detTypeEff == DetectorType::Peak;
 
+        if (channel == 0
+            && scHpfDirty_.load(std::memory_order_relaxed)
+            && scHpfDirty_.exchange(false, std::memory_order_acquire))
+            updateHpfCoefficients();
+
         // The sidechain filter must process whatever the detector consumes:
         // in FeedBack that is the compressed output (previous sample on the
         // explicit path; on the semi-implicit path the loop equation supplies
         // the gain, so the current input feeds the filter directly).
-        T detectorIn = (topoEff == Topology::FeedBack && !fbImplicit)
-                     ? fbLastOutput_[channel] : input;
+        T detectorIn = detectorSafe((topoEff == Topology::FeedBack && !fbImplicit)
+                     ? fbLastOutput_[channel] : input);
         if (scHpf) detectorIn = applySidechainHPF(detectorIn, channel);
 
         T levelDb = detectLevel(detectorIn, channel, detTypeEff);
@@ -405,6 +416,12 @@ public:
         else if (topoEff == Topology::FeedBack && modeType == Mode::Downward)
         {
             const auto law = computeGainFeedback(levelDb, thresh, ratio, knee, charType);
+            const T targetGR_Db = applyHoldAndRange(law.target, channel);
+            smoothedGR_Db = applyBallistics(targetGR_Db, channel, splitAdaptive, law.slope);
+        }
+        else if (topoEff == Topology::FeedBack)
+        {
+            const auto law = computeGainFeedbackUpward(levelDb, thresh, ratio, knee, guardDb);
             const T targetGR_Db = applyHoldAndRange(law.target, channel);
             smoothedGR_Db = applyBallistics(targetGR_Db, channel, splitAdaptive, law.slope);
         }
@@ -435,13 +452,15 @@ public:
             // Same 2nd-order FET channel modulation as the block path.
             const T sq = output * output;
             T& dc = fetDcState_[channel];
-            dc += fetDcCoeff_ * (sq - dc);
+            if (std::isfinite(sq)) dc += fetDcCoeff_ * (sq - dc); // a non-finite sample would latch
             const T grDepth = std::clamp(-smoothedGR_Db * T(0.1), T(0), T(1));
             output += colorAmt * kFetColorH2 * grDepth * (sq - dc);
         }
-        output *= makeupToGain(makeup);
-
+        // The feedback detector reads the compressed signal BEFORE makeup:
+        // makeup is applied after the element, so feeding it back would shift
+        // the static curve by the makeup (and run away with auto makeup).
         fbLastOutput_[channel] = output;
+        output *= makeupToGain(makeup);
         gainReductionDb_.store(smoothedGR_Db, std::memory_order_relaxed);
         return output;
     }
@@ -453,8 +472,8 @@ public:
     {
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
-            envFastDb_[ch] = T(0); // 0 dB gain change = neutral
-            envSlowDb_[ch] = T(0);
+            envFastDb_[ch] = 0.0; // 0 dB gain change = neutral
+            envSlowDb_[ch] = 0.0;
             upwardGuardDb_[ch] = T(-200);
             fbLastOutput_[ch] = T(0);
             fetDcState_[ch] = T(0);
@@ -706,6 +725,8 @@ public:
         scHpfEnabled_.store(enabled, std::memory_order_relaxed);
         if (std::isfinite(cutoffHz) && cutoffHz > T(0))
             scHpfFreq_.store(cutoffHz, std::memory_order_relaxed);
+        // Consumed by processBlock() and by processSample() (channel 0).
+        scHpfDirty_.store(true, std::memory_order_release);
     }
 
     /**
@@ -873,7 +894,9 @@ protected:
 
         if (timeConstantsDirty_.exchange(false, std::memory_order_acquire))
             updateTimeConstants(static_cast<T>(sampleRate_));
-        updateHpfCoefficients();
+        if (scHpfDirty_.load(std::memory_order_relaxed)
+            && scHpfDirty_.exchange(false, std::memory_order_acquire))
+            updateHpfCoefficients();
 
         // Apply a pending RMS window change here, on the audio thread.
         if (rmsWindowDirty_.exchange(false, std::memory_order_acquire))
@@ -945,6 +968,7 @@ protected:
                     detectorIn = fbImplicit ? audio.getChannel(ch)[i] : fbLastOutput_[ch];
                 else
                     detectorIn = sample;
+                detectorIn = detectorSafe(detectorIn);
                 if (scHpf) detectorIn = applySidechainHPF(detectorIn, ch);
 
                 T levelDb = detectLevel(detectorIn, ch, detTypeEff);
@@ -992,6 +1016,14 @@ protected:
                     const T targetGR_Db = applyHoldAndRange(law.target, ch);
                     smoothedGR_Db = applyBallistics(targetGR_Db, ch, splitAdaptive, law.slope);
                 }
+                else if (topoEff == Topology::FeedBack)
+                {
+                    // Upward feedback: the element law inverted from the
+                    // output level, so the loop settles on the panel ratio.
+                    const auto law = computeGainFeedbackUpward(inputDb, thresh, ratio, knee, guardDb);
+                    const T targetGR_Db = applyHoldAndRange(law.target, ch);
+                    smoothedGR_Db = applyBallistics(targetGR_Db, ch, splitAdaptive, law.slope);
+                }
                 else
                 {
                     T targetGR_Db = computeGain(inputDb, thresh, ratio, knee, charType, modeType, guardDb);
@@ -1023,12 +1055,15 @@ protected:
                     // line amp after the element is clean.
                     const T sq = wet * wet;
                     T& dc = fetDcState_[ch];
-                    dc += fetDcCoeff_ * (sq - dc);
+                    if (std::isfinite(sq)) dc += fetDcCoeff_ * (sq - dc); // a non-finite sample would latch
                     const T grDepth = std::clamp(-smoothedGR_Db * T(0.1), T(0), T(1));
                     wet += colorAmt * kFetColorH2 * grDepth * (sq - dc);
                 }
+                // The feedback detector reads the compressed signal before
+                // makeup (makeup sits after the element; feeding it back
+                // would shift the static curve and run away with auto makeup).
+                fbLastOutput_[ch] = wet;
                 wet *= makeupLin;
-                fbLastOutput_[ch] = wet; // feedback detector reads the compressed signal
 
                 // Parallel (New York) mix done inline: the dry reference is `input`,
                 // which carries the SAME lookahead delay as the wet, so dry and wet
@@ -1059,8 +1094,11 @@ protected:
         T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
         autoMakeupCoeff_ = std::exp(T(-1) / (fs * T(0.3)));
 
-        // One-pole coefficient for a time constant given in milliseconds.
-        auto tc = [fs](T ms) { return std::exp(T(-1) / (fs * ms / T(1000))); };
+        // One-pole coefficient for a time constant given in milliseconds
+        // (double, like the envelopes it drives: a float one-pole stalls short
+        // of its target once the per-sample step drops below an ulp).
+        auto tc = [fs](T ms) { return std::exp(-1.0 / (static_cast<double>(fs) * static_cast<double>(ms) / 1000.0)); };
+        const T prevWeight = charFastWeight_;
 
         // Character ballistics: time constants of the dB-domain envelopes.
         // The default arm backs up the setter's enum clamp: falling through
@@ -1110,24 +1148,41 @@ protected:
             }
         }
 
-        // Downward feedback closes its loop around the attack stage, which
-        // multiplies the raw ballistics speed by (1 + loop gain). Re-derive
-        // the coefficient from rho = coeff/(1 + w beta A) so the OBSERVED
-        // attack t63 stays on the knob, exactly like the hardware panels
-        // (the 1176's 20-800 us figures are measured results, not RC values).
-        // A is the linear-region loop gain (R - 1); Varimu uses its base
-        // ratio (the progressive part is level-dependent).
+        // A live character change moves the fast/slow blend weight. Re-seat
+        // the envelopes so the gain shown before and after the change is the
+        // same (otherwise the blend jumps by up to the full reduction).
+        if (charFastWeight_ != prevWeight)
+        {
+            const double w0 = static_cast<double>(prevWeight);
+            const double w1 = static_cast<double>(charFastWeight_);
+            for (int ch = 0; ch < kMaxChannels; ++ch)
+            {
+                double& f = envFastDb_[static_cast<size_t>(ch)];
+                double& s = envSlowDb_[static_cast<size_t>(ch)];
+                const double shown = (w0 < 1.0) ? w0 * f + (1.0 - w0) * s : f;
+                if (w1 >= 1.0) { f = shown; continue; }
+                if (w0 >= 1.0) s = shown;
+                f = (shown - (1.0 - w1) * s) / w1;
+            }
+        }
+
+        // A feedback loop closes around the attack stage, which multiplies the
+        // raw ballistics speed by (1 + loop gain). Re-derive the coefficient
+        // from rho = coeff/(1 + w beta A) so the OBSERVED attack t63 stays on
+        // the knob, exactly like the hardware panels (the 1176's 20-800 us
+        // figures are measured results, not RC values). A is the
+        // linear-region loop gain (R - 1) in both directions; Varimu uses its
+        // base ratio (the progressive part is level-dependent).
         {
             const auto charNow = character_.load(std::memory_order_relaxed);
-            const bool fbLoop = (charNow == Character::FET
-                              || topology_.load(std::memory_order_relaxed) == Topology::FeedBack)
-                             && mode_.load(std::memory_order_relaxed) == Mode::Downward;
+            const bool fbLoop = charNow == Character::FET
+                             || topology_.load(std::memory_order_relaxed) == Topology::FeedBack;
             if (fbLoop)
             {
-                const T loopGain = charFastWeight_
-                                 * (std::max(ratio_.load(std::memory_order_relaxed), T(1)) - T(1));
-                const T rho = charAttCoeff_;
-                charAttCoeff_ = T(1) - (T(1) - rho) / (T(1) + rho * loopGain);
+                const double loopGain = static_cast<double>(charFastWeight_)
+                                      * (static_cast<double>(std::max(ratio_.load(std::memory_order_relaxed), T(1))) - 1.0);
+                const double rho = charAttCoeff_;
+                charAttCoeff_ = 1.0 - (1.0 - rho) / (1.0 + rho * loopGain);
             }
         }
 
@@ -1208,6 +1263,10 @@ protected:
      * @param detType Selected detector methodology.
      * @return Decibel representation of detected level.
      */
+    /** @brief A non-finite sample reads as silence in the detector: it would
+     *  otherwise latch in the recursive detector, filter and envelope state. */
+    [[nodiscard]] static T detectorSafe(T x) noexcept { return std::isfinite(x) ? x : T(0); }
+
     [[nodiscard]] T detectLevel(T sample, int ch, DetectorType detType) noexcept
     {
         T level = std::abs(sample);
@@ -1467,6 +1526,47 @@ protected:
         return law;
     }
 
+    /**
+     * @brief Upward element law for feedback detection, per output level.
+     *
+     * The inverse of the feed-forward upward curve, as elementLaw() is for
+     * the downward one: with the detector on the output, a raw feed-forward
+     * law could never observe more than 2:1. Below the knee the boost is
+     * (R - 1) * (threshold - out), so the settled loop lands on the panel
+     * ratio; the soft knee is inverted in closed form. The silence guard
+     * reads the (output) level the detector sees.
+     *
+     * @param outDb   Detected output level (dB).
+     * @param thresh  Threshold in dB.
+     * @param ratio   Configured ratio (>= 1).
+     * @param knee    Knee width in dB (>= 0).
+     * @param guardDb Sustained level for the silence guard.
+     */
+    [[nodiscard]] static FeedbackLaw computeGainFeedbackUpward(T outDb, T thresh, T ratio, T knee,
+                                                               T guardDb) noexcept
+    {
+        const T r = std::max(ratio, T(1));
+        const T a = r - T(1);
+        const T guard = std::clamp((guardDb - (thresh - T(60))) / T(20), T(0), T(1));
+        if (knee <= T(0))
+        {
+            const T e = thresh - outDb;
+            if (e <= T(0)) return { T(0), T(0) };
+            return { a * e * guard, a * guard };
+        }
+        const T s = a / r;
+        const T eu = thresh + knee / T(2) - outDb;   // distance below the knee top
+        if (eu <= T(0)) return { T(0), T(0) };
+        if (eu >= knee * (T(1) - s / T(2)))
+            return { a * (thresh - outDb) * guard, a * guard };
+        // Knee: invert upper - out = v - s v^2 / (2W) for the input-side
+        // depth v in (0, W) (cancellation-free root).
+        const T z = std::min(T(2) * s * eu / knee, T(1));
+        const T v = std::min(T(2) * eu / (T(1) + std::sqrt(T(1) - z)), knee);
+        const T sv = s * v / knee;
+        return { s * v * v / (T(2) * knee) * guard, sv / std::max(T(1) - sv, T(1) / r) * guard };
+    }
+
     /** @brief Semi-implicit solve result: stepped gain and the law's target. */
     struct FeedbackSolve
     {
@@ -1546,10 +1646,10 @@ protected:
     [[nodiscard]] T applyBallisticsFeedbackImplicit(T inDb, int ch, Character charType,
                                                     T thresh, T ratio, T knee) noexcept
     {
-        T& fast = envFastDb_[ch];
-        T& slow = envSlowDb_[ch];
-        const T wFast = charFastWeight_;
-        const bool dual = wFast < T(1);
+        double& fast = envFastDb_[ch];
+        double& slow = envSlowDb_[ch];
+        const double wFast = static_cast<double>(charFastWeight_);
+        const bool dual = wFast < 1.0;
 
         if (dual)
         {
@@ -1564,26 +1664,28 @@ protected:
             const T slowTarget = std::clamp(
                 computeGain(inDb, thresh, ratio, knee, charType, Mode::Downward, T(0)),
                 -range, range);
-            const bool charging = slowTarget < slow;
-            slow = slowTarget + (charging ? charChargeCoeff_ : charSlowRelCoeff_) * (slow - slowTarget);
-            if (std::abs(slow) < T(1e-4)) slow = T(0);
+            const double st = static_cast<double>(slowTarget);
+            const bool charging = st < slow;
+            slow = st + (charging ? charChargeCoeff_ : charSlowRelCoeff_) * (slow - st);
+            if (std::abs(slow) < 1e-4) slow = 0.0;
         }
 
         // Branch on the direction the loop is about to move: attack while
         // the reduction deepens at the previous gain, release otherwise.
-        const T shownPrev = dual ? wFast * fast + (T(1) - wFast) * slow : fast;
+        const T shownPrev = static_cast<T>(dual ? wFast * fast + (1.0 - wFast) * slow : fast);
         const T probe = computeGainFeedback(inDb + shownPrev, thresh, ratio, knee, charType).target;
-        const bool engaging = probe < fast;
-        const T coeff = engaging ? charAttCoeff_ : charRelCoeff_;
-        const T beta = T(1) - coeff;
+        const bool engaging = static_cast<double>(probe) < fast;
+        const double coeff = engaging ? charAttCoeff_ : charRelCoeff_;
+        const double beta = 1.0 - coeff;
 
-        const T k = dual ? wFast * coeff * fast + (T(1) - wFast) * slow : coeff * fast;
-        const T effB = dual ? wFast * beta : beta;
+        const T k = static_cast<T>(dual ? wFast * coeff * fast + (1.0 - wFast) * slow : coeff * fast);
+        const T effB = static_cast<T>(dual ? wFast * beta : beta);
         const auto sol = solveFeedbackGain(inDb, k, effB, thresh, ratio, knee, charType);
 
-        fast = sol.target + coeff * (fast - sol.target);
-        if (std::abs(fast) < T(1e-4)) fast = T(0);
-        T shown = dual ? wFast * fast + (T(1) - wFast) * slow : fast;
+        const double solT = static_cast<double>(sol.target);
+        fast = solT + coeff * (fast - solT);
+        if (std::abs(fast) < 1e-4) fast = 0.0;
+        T shown = static_cast<T>(dual ? wFast * fast + (1.0 - wFast) * slow : fast);
 
         // Hold and range act on the OBSERVED gain: the element's internal
         // target is loop-amplified by up to (R - 1) during transients, so
@@ -1594,7 +1696,8 @@ protected:
         if (bounded != shown)
         {
             shown = bounded;
-            fast = dual ? (shown - (T(1) - wFast) * slow) / wFast : shown;
+            const double sh = static_cast<double>(shown);
+            fast = dual ? (sh - (1.0 - wFast) * slow) / wFast : sh;
         }
         return shown;
     }
@@ -1630,11 +1733,14 @@ protected:
         // output halves the release time constant. Halving tau squares the
         // one-pole coefficient, so blending between the two valid endpoints
         // keeps the modulation on the exponential curve.
-        T attCoeff = charAttCoeff_;
-        T relCoeff = charRelCoeff_;
+        double attCoeff = charAttCoeff_;
+        double relCoeff = charRelCoeff_;
         if (splitAdaptive)
         {
-            const T outputLevel = std::min(std::abs(fbLastOutput_[ch]), T(1));
+            // Written so a non-finite previous output reads as full scale
+            // instead of turning the coefficient (and the envelope) into NaN.
+            const double lastOut = std::abs(static_cast<double>(fbLastOutput_[ch]));
+            const double outputLevel = (lastOut < 1.0) ? lastOut : 1.0;
             relCoeff += outputLevel * (relCoeff * relCoeff - relCoeff);
         }
         if (loopSlope > T(0))
@@ -1642,7 +1748,7 @@ protected:
             // Cap the per-sample loop advance at 0.5 (half-deadbeat): the
             // one-sample delay then converges monotonically instead of
             // sustaining a marginal dance on the detector's residual ripple.
-            const T floorCoeff = T(1) - T(0.5) / (T(1) + loopSlope);
+            const double floorCoeff = 1.0 - 0.5 / (1.0 + static_cast<double>(loopSlope));
             attCoeff = std::max(attCoeff, floorCoeff);
             relCoeff = std::max(relCoeff, floorCoeff);
         }
@@ -1651,23 +1757,25 @@ protected:
         // or less upward boost); release acts while it recovers upward. A
         // magnitude comparison would invert the two in Upward mode and make
         // the envelope chase the huge boosts of the waveform's zero crossings.
-        T& fast = envFastDb_[ch];
-        const bool engaging = targetGrDb < fast;
-        fast = targetGrDb + (engaging ? attCoeff : relCoeff) * (fast - targetGrDb);
-        if (std::abs(fast) < T(1e-4)) fast = T(0); // kill the asymptotic dB tail
+        double& fast = envFastDb_[ch];
+        const double tgt = static_cast<double>(targetGrDb);
+        const bool engaging = tgt < fast;
+        fast = tgt + (engaging ? attCoeff : relCoeff) * (fast - tgt);
+        if (std::abs(fast) < 1e-4) fast = 0.0; // kill the asymptotic dB tail
 
         if (charFastWeight_ >= T(1)) // Clean / Varimu: single envelope
-            return fast;
+            return static_cast<T>(fast);
 
         // Opto / FET memory stage: charges toward the target over the history
         // time constant and discharges with the slow release, so its level
         // encodes how long (and how deep) the compressor has been working.
-        T& slow = envSlowDb_[ch];
-        const bool charging = targetGrDb < slow;
-        slow = targetGrDb + (charging ? charChargeCoeff_ : charSlowRelCoeff_) * (slow - targetGrDb);
-        if (std::abs(slow) < T(1e-4)) slow = T(0);
+        double& slow = envSlowDb_[ch];
+        const bool charging = tgt < slow;
+        slow = tgt + (charging ? charChargeCoeff_ : charSlowRelCoeff_) * (slow - tgt);
+        if (std::abs(slow) < 1e-4) slow = 0.0;
 
-        return charFastWeight_ * fast + (T(1) - charFastWeight_) * slow;
+        const double w = static_cast<double>(charFastWeight_);
+        return static_cast<T>(w * fast + (1.0 - w) * slow);
     }
 
     // ---- Sidechain HPF ----
@@ -1771,10 +1879,10 @@ protected:
     // updateTimeConstants). charFastWeight_ == 1 selects the single-envelope
     // path (Clean/Varimu); Opto/FET blend fast and slow memory envelopes.
     std::atomic<bool> timeConstantsDirty_ { true }; ///< Coefficients need a recompute.
-    T charAttCoeff_     = T(0); ///< Attack coefficient of the fast envelope.
-    T charRelCoeff_     = T(0); ///< Release coefficient (fast stage).
-    T charSlowRelCoeff_ = T(0); ///< Release coefficient of the memory stage.
-    T charChargeCoeff_  = T(0); ///< History charge coefficient of the memory stage.
+    double charAttCoeff_     = 0.0; ///< Attack coefficient of the fast envelope.
+    double charRelCoeff_     = 0.0; ///< Release coefficient (fast stage).
+    double charSlowRelCoeff_ = 0.0; ///< Release coefficient of the memory stage.
+    double charChargeCoeff_  = 0.0; ///< History charge coefficient of the memory stage.
     T charFastWeight_   = T(1); ///< Fast/slow blend (1 = single envelope).
 
     SmoothedValue<T> thresholdSmooth_;  ///< De-zippered threshold.
@@ -1791,8 +1899,10 @@ protected:
     T fetDcCoeff_ = T(0);                        ///< ~10 Hz DC-tracking coefficient.
     std::array<T, kMaxChannels> fetDcState_ {};  ///< Per-channel DC estimate of wet^2.
 
-    std::array<T, kMaxChannels> envFastDb_ {};      ///< Fast gain envelope per channel (dB).
-    std::array<T, kMaxChannels> envSlowDb_ {};      ///< Slow memory envelope per channel (dB).
+    // Recursive dB envelopes are double for every T: in float a 3 s release
+    // at 192 kHz parked 0.57 dB short of its target.
+    std::array<double, kMaxChannels> envFastDb_ {}; ///< Fast gain envelope per channel (dB).
+    std::array<double, kMaxChannels> envSlowDb_ {}; ///< Slow memory envelope per channel (dB).
     std::array<T, kMaxChannels> upwardGuardDb_ {};  ///< Peak-held sustained level (Upward guard).
     T upwardGuardDecay_ = T(0.00125);               ///< Guard decay per sample (60 dB/s).
     std::array<T, kMaxChannels> fbLastOutput_ {};   ///< Feedback topology history buffer.
@@ -1806,6 +1916,7 @@ protected:
     // Sidechain Filtering
     std::atomic<bool> scHpfEnabled_ { false }; ///< HPF toggle.
     std::atomic<T> scHpfFreq_ { T(80) };       ///< HPF Cutoff frequency.
+    std::atomic<bool> scHpfDirty_ { true };    ///< Coefficients need a recompute.
     T scHpfB1_ = T(0);                         ///< HPF internal feedback coefficient.
     T scHpfA0_ = T(0);                         ///< HPF normalized feedforward coefficient.
     std::array<T, kMaxChannels> scHpfState_ {};///< HPF y[n-1] state.

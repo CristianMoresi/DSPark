@@ -142,12 +142,12 @@ private:
 
         // 4. Compress each band independently.
         // IMPORTANT: bands are summed directly, so every band must share the
-        // SAME latency. Compressors default to 0 lookahead (latency 0) and a
-        // latency-free detector -> coherent sum. If you enable lookahead or
-        // the Hilbert detector (feed-forward adds its compensation delay),
-        // apply the SAME setting to every band via getBandCompressor(b); a
-        // divergent per-band latency would phase-cancel at the crossover
-        // regions (this class does not auto-delay-compensate).
+        // SAME latency. Compressors default to 0 lookahead (latency 0), and
+        // every detector is latency-free -> coherent sum. If you enable
+        // lookahead, apply the SAME setting to every band via
+        // getBandCompressor(b); a divergent per-band latency would
+        // phase-cancel at the crossover regions (this class does not
+        // auto-delay-compensate).
         for (int b = 0; b < nb; ++b)
             compressors_[b].processBlock(views_[b]);
 

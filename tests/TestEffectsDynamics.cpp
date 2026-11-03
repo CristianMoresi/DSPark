@@ -1,5 +1,7 @@
 // DSPark Tests - Effects Dynamics
-// Compressor, Limiter, NoiseGate, Gain, AutoGain
+// Compressor, Limiter, NoiseGate, Gain, AutoGain, and the dynamics audit
+// regression cases (DynamicEQ, DeEsser, Expander, TransientDesigner,
+// CrossoverFilter) at the end of the file.
 
 #include "dspark_test.h"
 #include "TestSignals.h"
@@ -9,11 +11,19 @@
 #include "../Effects/NoiseGate.h"
 #include "../Effects/Gain.h"
 #include "../Effects/AutoGain.h"
+#include "../Effects/CrossoverFilter.h"
+#include "../Effects/DeEsser.h"
+#include "../Effects/DynamicEQ.h"
+#include "../Effects/Expander.h"
+#include "../Effects/TransientDesigner.h"
+#include "../Core/FFT.h"
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <vector>
 
 using namespace dspark;
@@ -2148,4 +2158,820 @@ DSPARK_TEST(AutoGain_invalid_inputs_are_ignored)
         ep.compensate(big.view());
     }
     EXPECT_NEAR(ep.getCompensationDb(), before, 1.0f); // old: drifts to -12
+}
+
+// ============================================================================
+// Dynamics audit regressions (2026-11). Each case pins a defect; its comment
+// states the defect and the number the unfixed code produced.
+// ============================================================================
+
+namespace {
+
+using Vec = std::vector<float>;
+constexpr double kPiD = 3.14159265358979323846;
+
+Vec makeSine(double freq, double amp, double fs, int n)
+{
+    Vec v(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+        v[static_cast<size_t>(i)] = static_cast<float>(amp * std::sin(2.0 * kPiD * freq * i / fs));
+    return v;
+}
+
+// Feeds every channel through `fn` in blocks of `block` samples.
+template <class F>
+void processInBlocks(std::vector<Vec>& ch, int block, F&& fn)
+{
+    const int n = static_cast<int>(ch[0].size());
+    const int nc = static_cast<int>(ch.size());
+    std::vector<float*> ptr(static_cast<size_t>(nc));
+    for (int off = 0; off < n; off += block)
+    {
+        const int m = std::min(block, n - off);
+        for (int c = 0; c < nc; ++c) ptr[static_cast<size_t>(c)] = ch[static_cast<size_t>(c)].data() + off;
+        AudioBufferView<float> v(ptr.data(), nc, m);
+        fn(v);
+    }
+}
+
+// Coherent (Hann-weighted) amplitude of a tone.
+double toneAmplitude(const float* x, int n, double freq, double fs)
+{
+    double c = 0, s = 0, w = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        const double wi = 0.5 - 0.5 * std::cos(2.0 * kPiD * (i + 0.5) / n);
+        const double p = 2.0 * kPiD * freq * i / fs;
+        c += wi * x[i] * std::cos(p);
+        s += wi * x[i] * std::sin(p);
+        w += wi;
+    }
+    return 2.0 * std::sqrt(c * c + s * s) / w;
+}
+
+double toDb(double x) { return 20.0 * std::log10(std::max(x, 1e-30)); }
+
+double rmsOf(const float* x, int n)
+{
+    double s = 0;
+    for (int i = 0; i < n; ++i) s += static_cast<double>(x[i]) * x[i];
+    return std::sqrt(s / n);
+}
+
+double peakOf(const float* x, int n)
+{
+    double p = 0;
+    for (int i = 0; i < n; ++i) p = std::max(p, std::abs(static_cast<double>(x[i])));
+    return p;
+}
+
+bool allFinite(const float* x, int n)
+{
+    for (int i = 0; i < n; ++i)
+        if (!std::isfinite(x[i])) return false;
+    return true;
+}
+
+// Cookbook analog bell, H(s) = (s^2 + s A/Q + 1) / (s^2 + s/(A Q) + 1).
+double analogBellDb(double f, double f0, double q, double gainDb)
+{
+    const double a = std::pow(10.0, gainDb / 40.0);
+    const std::complex<double> s(0.0, f / f0);
+    return 20.0 * std::log10(std::abs((s * s + s * (a / q) + 1.0) / (s * s + s / (a * q) + 1.0)));
+}
+
+// Steady single-band DynamicEQ, held at its range by an external key at the
+// band centre; returns the gain (dB) the audio path applies to a probe tone.
+double dynamicEqProbeGainDb(double fs, double f0, double probeHz, float rangeDb, bool boost)
+{
+    using DE = DynamicEQ<float>;
+    auto d = std::make_unique<DE>();
+    d->prepare(AudioSpec{ fs, 512, 1 });
+    d->setNumBands(1);
+    DE::BandConfig c;
+    c.frequency = static_cast<float>(f0); c.q = 1.0f; c.threshold = -60.0f;
+    c.aboveRatio = 1000.0f; c.aboveRangeDb = rangeDb; c.aboveBoost = boost;
+    c.aboveAttackMs = 1.0f; c.aboveReleaseMs = 2000.0f;
+    d->setBand(0, c);
+    const int n = 36000;
+    Vec probe = makeSine(probeHz, 0.01, fs, n);
+    Vec key = makeSine(f0, 0.5, fs, n);
+    for (int off = 0; off < n; off += 512)
+    {
+        const int m = std::min(512, n - off);
+        float* a = probe.data() + off;
+        float* k = key.data() + off;
+        AudioBufferView<float> va(&a, 1, m), vk(&k, 1, m);
+        d->processBlock(va, vk);
+    }
+    return toDb(toneAmplitude(probe.data() + n - 9600, 9600, probeHz, fs) / 0.01);
+}
+
+} // namespace
+
+// ============================================================================
+// DynamicEQ
+// ============================================================================
+
+// Defect: the precomputed bell terms used the raw centre frequency, so a band
+// above Nyquist got a negative alpha and an unstable filter. Old: a 30 kHz cut
+// band at 44.1 kHz on an 18 kHz tone peaked at 3.3e37 and went NaN.
+DSPARK_TEST(DynamicEQ_bell_above_nyquist_stays_bounded)
+{
+    using DE = DynamicEQ<float>;
+    for (float f : { 22060.0f, 30000.0f, 40000.0f })
+    {
+        auto d = std::make_unique<DE>();
+        d->prepare(AudioSpec{ 44100.0, 512, 2 });
+        DE::BandConfig c;
+        c.frequency = f; c.threshold = -60.0f; c.aboveRatio = 8.0f;
+        c.aboveAttackMs = 1.0f; c.aboveReleaseMs = 30.0f; c.aboveRangeDb = 18.0f;
+        d->setNumBands(1);
+        d->setBand(0, c);
+        Vec s = makeSine(18000.0, 0.5, 44100.0, 44100);
+        std::vector<Vec> x { s, s };
+        processInBlocks(x, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        EXPECT_TRUE(allFinite(x[0].data(), 44100));
+        EXPECT_LT(peakOf(x[0].data(), 44100), 1.0);
+    }
+}
+
+// Defect: cookbook bells cramp towards Nyquist. Old: a +12 dB bell at 16 kHz
+// (Q 1, 48 kHz) gave +3.42 dB at 20 kHz against +9.65 dB for the prototype.
+DSPARK_TEST(DynamicEQ_bell_follows_analog_prototype_near_nyquist)
+{
+    const double g = dynamicEqProbeGainDb(48000.0, 16000.0, 20000.0, 12.0f, true);
+    EXPECT_NEAR(g, analogBellDb(20000.0, 16000.0, 1.0, 12.0), 1.0);
+    EXPECT_NEAR(dynamicEqProbeGainDb(48000.0, 16000.0, 16000.0, 12.0f, true), 12.0, 0.1);
+}
+
+// Defect: a band count increase replayed the stale filter and gain state of
+// the re-activated band. Old: a boosted band re-added on a 0.001 tone peaked at
+// 5.37 (cut band: 0.20).
+DSPARK_TEST(DynamicEQ_reactivated_band_starts_clean)
+{
+    using DE = DynamicEQ<float>;
+    for (bool boost : { false, true })
+    {
+        auto d = std::make_unique<DE>();
+        d->prepare(AudioSpec{ 48000.0, 512, 2 });
+        d->setNumBands(2);
+        DE::BandConfig b0; b0.frequency = 200.0f; b0.aboveRatio = 1.0f;
+        d->setBand(0, b0);
+        DE::BandConfig c; c.frequency = 1000.0f; c.q = 8.0f; c.threshold = -40.0f; c.aboveRatio = 8.0f;
+        c.aboveAttackMs = 2.0f; c.aboveReleaseMs = 50.0f; c.aboveRangeDb = 18.0f; c.aboveBoost = boost;
+        d->setBand(1, c);
+        std::vector<Vec> loud { makeSine(1000.0, 0.8, 48000.0, 24000), makeSine(1000.0, 0.8, 48000.0, 24000) };
+        processInBlocks(loud, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        d->setNumBands(1);
+        std::vector<Vec> q1 { makeSine(1000.0, 0.001, 48000.0, 2048), makeSine(1000.0, 0.001, 48000.0, 2048) };
+        processInBlocks(q1, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        d->setNumBands(2);
+        std::vector<Vec> q2 { makeSine(1000.0, 0.001, 48000.0, 4096), makeSine(1000.0, 0.001, 48000.0, 4096) };
+        processInBlocks(q2, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        EXPECT_LT(peakOf(q2[0].data(), 4096), 0.0015);
+    }
+}
+
+// Defect: with oversampling the samples past maxBlockSize passed dry. Old:
+// 1024-sample blocks on a 256 spec left the tail at rms 0.355 (processed 0.045).
+DSPARK_TEST(DynamicEQ_oversampled_oversize_block_is_fully_processed)
+{
+    using DE = DynamicEQ<float>;
+    auto d = std::make_unique<DE>();
+    d->setOversampling(2);
+    d->prepare(AudioSpec{ 48000.0, 256, 2 });
+    DE::BandConfig c; c.frequency = 1000.0f; c.threshold = -30.0f; c.aboveRatio = 8.0f; c.aboveRangeDb = 18.0f;
+    d->setNumBands(1);
+    d->setBand(0, c);
+    std::vector<Vec> x { makeSine(1000.0, 0.5, 48000.0, 24576), makeSine(1000.0, 0.5, 48000.0, 24576) };
+    processInBlocks(x, 1024, [&](AudioBufferView<float> v) { d->processBlock(v); });
+    const double head = rmsOf(x[0].data() + 1024 * 20 + 64, 128);
+    const double tail = rmsOf(x[0].data() + 1024 * 20 + 640, 256);
+    EXPECT_LT(tail, 0.1);
+    EXPECT_NEAR(tail, head, 0.01);
+}
+
+// Defect: reset() kept the analytic detectors and the oversamplers. Old: at
+// 2x, silence after reset() came out with a 0.84 peak and a -13 dB gain.
+DSPARK_TEST(DynamicEQ_reset_clears_detector_and_oversampler)
+{
+    using DE = DynamicEQ<float>;
+    for (int os : { 1, 2 })
+    {
+        auto d = std::make_unique<DE>();
+        d->setOversampling(os);
+        d->prepare(AudioSpec{ 48000.0, 512, 2 });
+        DE::BandConfig c; c.frequency = 1000.0f; c.threshold = -20.0f; c.aboveRatio = 8.0f;
+        c.aboveAttackMs = 0.1f; c.aboveReleaseMs = 5.0f; c.aboveRangeDb = 24.0f;
+        d->setNumBands(1);
+        d->setBand(0, c);
+        std::vector<Vec> x { makeSine(1000.0, 0.9, 48000.0, 4096), makeSine(1000.0, 0.9, 48000.0, 4096) };
+        processInBlocks(x, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        d->reset();
+        std::vector<Vec> z(2, Vec(512, 0.0f));
+        processInBlocks(z, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        EXPECT_LT(peakOf(z[0].data(), 512), 1e-6);
+        EXPECT_NEAR(d->getBandGainDb(0), 0.0f, 0.01f);
+    }
+}
+
+// Defect: the band count started at 0, so setBand() alone did nothing. Old:
+// 0.00 dB of action from a band configured for 24 dB of cut.
+DSPARK_TEST(DynamicEQ_setBand_without_setNumBands_is_active)
+{
+    using DE = DynamicEQ<float>;
+    auto d = std::make_unique<DE>();
+    d->prepare(AudioSpec{ 48000.0, 512, 2 });
+    DE::BandConfig c; c.frequency = 1000.0f; c.threshold = -40.0f; c.aboveRatio = 8.0f;
+    c.aboveAttackMs = 1.0f; c.aboveRangeDb = 24.0f;
+    d->setBand(0, c);
+    std::vector<Vec> x { makeSine(1000.0, 0.5, 48000.0, 24000), makeSine(1000.0, 0.5, 48000.0, 24000) };
+    processInBlocks(x, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+    EXPECT_LT(toDb(rmsOf(x[0].data() + 19200, 4800) / (0.5 / std::sqrt(2.0))), -20.0);
+}
+
+// Defect: getState() did not store the lookahead. Old: latency 240 came back as 0.
+DSPARK_TEST(DynamicEQ_state_round_trip_keeps_lookahead)
+{
+    using DE = DynamicEQ<float>;
+    auto a = std::make_unique<DE>();
+    a->prepare(AudioSpec{ 48000.0, 512, 2 });
+    a->setLookahead(5.0f);
+    a->setNumBands(1);
+    const auto blob = a->getState();
+    auto b = std::make_unique<DE>();
+    b->prepare(AudioSpec{ 48000.0, 512, 2 });
+    EXPECT_TRUE(b->setState(blob.data(), blob.size()));
+    EXPECT_EQ(b->getLatency(), a->getLatency());
+    EXPECT_EQ(b->getLatency(), 240);
+}
+
+// Defect: the 16-sample coefficient refresh restarted at every block, so the
+// audio depended on the host's block partition. Old: 7.6e-3 (attack 5 ms) and
+// 2.1e-2 (attack 1 ms) between 7- and 512-sample blocks.
+DSPARK_TEST(DynamicEQ_output_does_not_depend_on_block_partition)
+{
+    using DE = DynamicEQ<float>;
+    const int n = 48000;
+    Vec a(static_cast<size_t>(n));
+    uint32_t seed = 5u;
+    for (int i = 0; i < n; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        const double t = i / 48000.0;
+        const double env = 0.15 + 0.6 * std::exp(-std::fmod(t, 0.25) * 18.0);
+        a[static_cast<size_t>(i)] = static_cast<float>(env * (0.5 * std::sin(2.0 * kPiD * 1730.3 * t)
+                                  + 0.1 * (static_cast<double>(seed) / 4294967296.0 - 0.5)));
+    }
+    auto run = [&](int block) {
+        auto d = std::make_unique<DE>();
+        d->prepare(AudioSpec{ 48000.0, 512, 2 });
+        DE::BandConfig c; c.frequency = 1700.0f; c.q = 2.0f; c.threshold = -30.0f; c.aboveRatio = 4.0f; c.aboveAttackMs = 1.0f;
+        d->setNumBands(1);
+        d->setBand(0, c);
+        std::vector<Vec> x { a, a };
+        processInBlocks(x, block, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        return x[0];
+    };
+    const Vec ref = run(512);
+    for (int block : { 7, 33, 100 })
+    {
+        const Vec x = run(block);
+        double md = 0;
+        for (int i = 0; i < n; ++i) md = std::max(md, std::abs(static_cast<double>(x[static_cast<size_t>(i)]) - ref[static_cast<size_t>(i)]));
+        EXPECT_EQ(md, 0.0);
+    }
+}
+
+// Defect: one NaN sample latched in the detector and filter state. Old: the
+// output stayed NaN for the remaining 38000 samples.
+DSPARK_TEST(DynamicEQ_non_finite_sample_does_not_latch)
+{
+    using DE = DynamicEQ<float>;
+    auto make = [] {
+        auto d = std::make_unique<DE>();
+        d->prepare(AudioSpec{ 48000.0, 512, 2 });
+        DE::BandConfig c; c.frequency = 1000.0f; c.threshold = -30.0f; c.aboveRatio = 4.0f;
+        d->setNumBands(1);
+        d->setBand(0, c);
+        return d;
+    };
+    auto d = make(), twin = make();
+    const int n = 48000;
+    Vec s = makeSine(997.0, 0.5, 48000.0, n);
+    std::vector<Vec> x { s, s }, y { s, s };
+    x[0][10000] = std::numeric_limits<float>::quiet_NaN();
+    x[1][10000] = std::numeric_limits<float>::infinity();
+    processInBlocks(x, 256, [&](AudioBufferView<float> v) { d->processBlock(v); });
+    processInBlocks(y, 256, [&](AudioBufferView<float> v) { twin->processBlock(v); });
+    for (int c = 0; c < 2; ++c)
+    {
+        EXPECT_TRUE(allFinite(x[static_cast<size_t>(c)].data() + 12000, n - 12000));
+        double md = 0;
+        for (int i = n - 4800; i < n; ++i) md = std::max(md, std::abs(static_cast<double>(x[static_cast<size_t>(c)][static_cast<size_t>(i)]) - y[static_cast<size_t>(c)][static_cast<size_t>(i)]));
+        EXPECT_LT(md, 1e-4);
+    }
+}
+
+// ============================================================================
+// DeEsser
+// ============================================================================
+
+// Defect: cookbook bell cramping. Old: a -12 dB, one-octave cut at 16 kHz read
+// -2.11 dB at 20 kHz (48 kHz) against -8.25 dB for the prototype.
+DSPARK_TEST(DeEsser_bell_follows_analog_prototype_near_nyquist)
+{
+    auto d = std::make_unique<DeEsser<float>>();
+    d->prepare(AudioSpec{ 48000.0, 512, 2 });
+    d->setFrequency(16000.0f);
+    d->setBandwidth(1.0f);
+    d->setThreshold(-60.0f);
+    d->setReduction(12.0f);
+    const int n = 24000;
+    std::vector<Vec> x { makeSine(16000.0, 0.3, 48000.0, n), makeSine(20000.0, 0.01, 48000.0, n) };
+    processInBlocks(x, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+    const double q = 1.0 / (2.0 * std::sinh(0.34657359));
+    const double g = toDb(toneAmplitude(x[1].data() + n - 9600, 9600, 20000.0, 48000.0) / 0.01);
+    EXPECT_NEAR(d->getGainReductionDb(), 12.0f, 0.1f);
+    EXPECT_NEAR(g, analogBellDb(20000.0, 16000.0, q, -12.0), 1.5);
+}
+
+// Defect: block-relative refresh grid. Old: 4.6e-2 between 7- and 512-sample blocks.
+DSPARK_TEST(DeEsser_output_does_not_depend_on_block_partition)
+{
+    const int n = 48000;
+    Vec a(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = i / 48000.0;
+        const double env = 0.1 + 0.8 * std::exp(-std::fmod(t, 0.2) * 25.0);
+        a[static_cast<size_t>(i)] = static_cast<float>(env * (0.4 * std::sin(2.0 * kPiD * 7100.0 * t) + 0.2 * std::sin(2.0 * kPiD * 300.0 * t)));
+    }
+    auto run = [&](int block) {
+        auto d = std::make_unique<DeEsser<float>>();
+        d->prepare(AudioSpec{ 48000.0, 512, 2 });
+        d->setFrequency(7000.0f);
+        d->setThreshold(-40.0f);
+        d->setReduction(12.0f);
+        std::vector<Vec> x { a, a };
+        processInBlocks(x, block, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        return x[0];
+    };
+    const Vec ref = run(512);
+    for (int block : { 7, 33, 100 })
+    {
+        const Vec x = run(block);
+        double md = 0;
+        for (int i = 0; i < n; ++i) md = std::max(md, std::abs(static_cast<double>(x[static_cast<size_t>(i)]) - ref[static_cast<size_t>(i)]));
+        EXPECT_EQ(md, 0.0);
+    }
+}
+
+// Defect: one NaN latched in the detector and the cut filter. Old: NaN for the
+// remaining 38000 samples.
+DSPARK_TEST(DeEsser_non_finite_sample_does_not_latch)
+{
+    auto make = [] {
+        auto d = std::make_unique<DeEsser<float>>();
+        d->prepare(AudioSpec{ 48000.0, 512, 2 });
+        d->setFrequency(1000.0f);
+        d->setThreshold(-30.0f);
+        return d;
+    };
+    auto d = make(), twin = make();
+    const int n = 48000;
+    Vec s = makeSine(997.0, 0.5, 48000.0, n);
+    std::vector<Vec> x { s, s }, y { s, s };
+    x[0][10000] = std::numeric_limits<float>::quiet_NaN();
+    processInBlocks(x, 256, [&](AudioBufferView<float> v) { d->processBlock(v); });
+    processInBlocks(y, 256, [&](AudioBufferView<float> v) { twin->processBlock(v); });
+    EXPECT_TRUE(allFinite(x[0].data() + 12000, n - 12000));
+    double md = 0;
+    for (int i = n - 4800; i < n; ++i) md = std::max(md, std::abs(static_cast<double>(x[0][static_cast<size_t>(i)]) - y[0][static_cast<size_t>(i)]));
+    EXPECT_LT(md, 1e-4);
+}
+
+// ============================================================================
+// NoiseGate
+// ============================================================================
+
+// Defect: an external sidechain shorter than the audio was read past its end.
+// Here the 16-sample view sits at the start of a loud buffer, so the old
+// over-read opened the gate (output = input) where the key is silent.
+DSPARK_TEST(NoiseGate_short_sidechain_falls_back_to_internal_key)
+{
+    NoiseGate<float> g;
+    g.setThreshold(-40.0f);
+    g.prepare(48000.0, 1);
+    Vec keyStorage(512, 0.9f);
+    std::fill(keyStorage.begin(), keyStorage.begin() + 16, 0.0f);
+    double inRms = 0, outRms = 0;
+    for (int b = 0; b < 40; ++b)
+    {
+        Vec a = makeSine(1000.0, 0.001, 48000.0, 512); // -60 dBFS: below the threshold
+        const double r = rmsOf(a.data(), 512);
+        float* pa = a.data();
+        float* pk = keyStorage.data();
+        AudioBufferView<float> va(&pa, 1, 512), vk(&pk, 1, 16);
+        g.processBlock(va, vk);
+        if (b >= 20) { inRms += r; outRms += rmsOf(a.data(), 512); }
+    }
+    EXPECT_LT(outRms, 0.1 * inRms);
+}
+
+// Defect: processSample() latched a NaN in the envelope. Old: stuck open,
+// passing a -60 dBFS tone at 0.001 where a closed gate gives about 1e-7.
+DSPARK_TEST(NoiseGate_processSample_non_finite_does_not_stick_open)
+{
+    NoiseGate<float> g;
+    g.setThreshold(-30.0f);
+    g.setRelease(10.0f);
+    g.setHold(5.0f);
+    g.prepare(48000.0, 1);
+    Vec s = makeSine(997.0, 0.5, 48000.0, 4800);
+    for (float v : s) (void)g.processSample(v);
+    (void)g.processSample(std::numeric_limits<float>::quiet_NaN());
+    float o = 0.0f;
+    for (int i = 0; i < 48000; ++i) o = g.processSample((i % 2) ? 0.001f : -0.001f);
+    EXPECT_LT(std::abs(o), 1e-5f);
+}
+
+// Defect: Frequency mode latched a NaN in its filters. Old: NaN for the
+// remaining 38000 samples.
+DSPARK_TEST(NoiseGate_frequency_mode_non_finite_does_not_latch)
+{
+    auto make = [] {
+        auto g = std::make_unique<NoiseGate<float>>();
+        g->setThreshold(-30.0f);
+        g->setGateMode(NoiseGate<float>::GateMode::Frequency);
+        g->prepare(48000.0, 2);
+        return g;
+    };
+    auto g = make(), twin = make();
+    const int n = 48000;
+    Vec s = makeSine(997.0, 0.5, 48000.0, n);
+    std::vector<Vec> x { s, s }, y { s, s };
+    x[0][10000] = std::numeric_limits<float>::quiet_NaN();
+    processInBlocks(x, 256, [&](AudioBufferView<float> v) { g->processBlock(v); });
+    processInBlocks(y, 256, [&](AudioBufferView<float> v) { twin->processBlock(v); });
+    EXPECT_TRUE(allFinite(x[0].data() + 10001, n - 10001));
+    double md = 0;
+    for (int i = n - 4800; i < n; ++i) md = std::max(md, std::abs(static_cast<double>(x[0][static_cast<size_t>(i)]) - y[0][static_cast<size_t>(i)]));
+    EXPECT_LT(md, 1e-4);
+}
+
+// ============================================================================
+// Compressor
+// ============================================================================
+
+// Defect: one Inf sample made the dB envelope inf - inf; one NaN froze the
+// Hilbert detector (mono) and the FET colour state. Old: NaN output for the
+// remaining 38000 samples (Peak + Inf, FET colour + NaN), no compression at all
+// afterwards (Hilbert + NaN).
+DSPARK_TEST(Compressor_non_finite_sample_does_not_latch)
+{
+    using C = Compressor<float>;
+    struct Case { C::DetectorType det; C::Character ch; float bad; };
+    const Case cases[] = {
+        { C::DetectorType::Peak, C::Character::Clean, std::numeric_limits<float>::infinity() },
+        { C::DetectorType::Hilbert, C::Character::Clean, std::numeric_limits<float>::quiet_NaN() },
+        { C::DetectorType::SplitPolarity, C::Character::Clean, std::numeric_limits<float>::quiet_NaN() },
+        { C::DetectorType::Peak, C::Character::FET, std::numeric_limits<float>::quiet_NaN() },
+    };
+    for (const auto& k : cases)
+    {
+        auto make = [&] {
+            auto c = std::make_unique<C>();
+            c->setThreshold(-24.0f);
+            c->setDetector(k.det);
+            c->setCharacter(k.ch);
+            c->setCharacterColor(1.0f);
+            c->prepare(AudioSpec{ 48000.0, 512, 1 });
+            return c;
+        };
+        auto c = make(), twin = make();
+        const int n = 48000;
+        Vec s = makeSine(997.0, 0.5, 48000.0, n);
+        std::vector<Vec> x { s }, y { s };
+        x[0][10000] = k.bad;
+        processInBlocks(x, 256, [&](AudioBufferView<float> v) { c->processBlock(v); });
+        processInBlocks(y, 256, [&](AudioBufferView<float> v) { twin->processBlock(v); });
+        EXPECT_TRUE(allFinite(x[0].data() + 10001, n - 10001));
+        double md = 0;
+        for (int i = n - 4800; i < n; ++i) md = std::max(md, std::abs(static_cast<double>(x[0][static_cast<size_t>(i)]) - y[0][static_cast<size_t>(i)]));
+        EXPECT_LT(md, 1e-4);
+    }
+}
+
+// Defect: the explicit feedback loop fed the detector after makeup. Old: RMS
+// detector, makeup +12 dB: -16.5 dB out instead of -7.5 (22.5 dB of reduction
+// instead of 13.5).
+DSPARK_TEST(Compressor_feedback_detector_excludes_makeup)
+{
+    using C = Compressor<float>;
+    for (auto det : { C::DetectorType::Rms, C::DetectorType::TruePeak })
+    {
+        auto c = std::make_unique<C>();
+        c->setThreshold(-24.0f); c->setRatio(4.0f); c->setTopology(C::Topology::FeedBack);
+        c->setDetector(det); c->setMakeupGain(12.0f); c->setAttack(5.0f); c->setRelease(50.0f);
+        c->prepare(AudioSpec{ 48000.0, 512, 2 });
+        const float v = static_cast<float>(std::pow(10.0, -6.0 / 20.0));
+        std::vector<Vec> x(2, Vec(96000, v));
+        processInBlocks(x, 256, [&](AudioBufferView<float> b) { c->processBlock(b); });
+        EXPECT_NEAR(toDb(std::abs(x[0][95999])), -7.5, 0.1);
+    }
+}
+
+// Defect: Upward + FeedBack applied the feed-forward law to the output, which
+// caps the observed ratio near 2:1. Old: in -40 dB, threshold -20, ratio 8:
+// out -30.67 dB (observed 1.87:1) instead of -22.5.
+DSPARK_TEST(Compressor_upward_feedback_honours_ratio)
+{
+    using C = Compressor<float>;
+    for (float knee : { 0.0f, 6.0f })
+    {
+        auto c = std::make_unique<C>();
+        c->setThreshold(-20.0f); c->setRatio(8.0f); c->setKnee(knee); c->setMode(C::Mode::Upward);
+        c->setTopology(C::Topology::FeedBack); c->setAttack(5.0f); c->setRelease(100.0f);
+        c->prepare(AudioSpec{ 48000.0, 512, 2 });
+        const float v = static_cast<float>(std::pow(10.0, -40.0 / 20.0));
+        std::vector<Vec> x(2, Vec(96000, v));
+        processInBlocks(x, 256, [&](AudioBufferView<float> b) { c->processBlock(b); });
+        EXPECT_NEAR(toDb(std::abs(x[0][95999])), -22.5, 0.05);
+    }
+}
+
+// Defect: processSample() never recomputed the sidechain filter, so a cutoff
+// set after prepare() stayed at the old value. Old: HPF 2 kHz on a 100 Hz tone
+// left rms 0.043 (strong reduction) instead of 0.354.
+DSPARK_TEST(Compressor_processSample_applies_sidechain_hpf_set_after_prepare)
+{
+    Compressor<float> c;
+    c.setThreshold(-30.0f); c.setRatio(8.0f); c.setAttack(1.0f); c.setRelease(20.0f);
+    c.prepare(AudioSpec{ 48000.0, 512, 2 });
+    c.setSidechainHPF(true, 2000.0f);
+    const int n = 48000;
+    Vec s = makeSine(100.0, 0.5, 48000.0, n);
+    double e = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        const float o = c.processSample(s[static_cast<size_t>(i)], 0);
+        if (i >= n / 2) e += static_cast<double>(o) * o;
+    }
+    EXPECT_GT(std::sqrt(e / (n / 2)), 0.3);
+}
+
+// Defect: float dB envelopes stall once the per-sample step drops below an
+// ulp. Old: a 3 s release at 192 kHz parked at -26.82 dB, target -26.25.
+DSPARK_TEST(Compressor_long_release_settles_on_target)
+{
+    const double fs = 192000.0;
+    Compressor<float> c;
+    c.setThreshold(-40.0f); c.setRatio(8.0f); c.setAttack(1.0f); c.setRelease(3000.0f);
+    c.prepare(AudioSpec{ fs, 4096, 1 });
+    const float l1 = static_cast<float>(std::pow(10.0, -4.0 / 20.0));
+    const float l2 = static_cast<float>(std::pow(10.0, -10.0 / 20.0));
+    Vec buf(4096);
+    const int total = static_cast<int>(fs * 30.0);
+    for (int off = 0; off < total; off += 4096)
+    {
+        std::fill(buf.begin(), buf.end(), off < fs * 0.5 ? l1 : l2);
+        float* p = buf.data();
+        AudioBufferView<float> v(&p, 1, 4096);
+        c.processBlock(v);
+    }
+    EXPECT_NEAR(c.getGainReductionDb(), -26.25f, 0.05f);
+}
+
+// Defect: a live character change re-weighted the fast/slow envelopes without
+// re-seating them. Old: Clean to Opto at a steady -14.66 dB stepped to -8.79 dB
+// in one sample.
+DSPARK_TEST(Compressor_live_character_change_is_click_free)
+{
+    using C = Compressor<float>;
+    for (auto ch : { C::Character::Opto, C::Character::FET })
+    {
+        Compressor<float> c;
+        c.setThreshold(-30.0f); c.setRatio(4.0f); c.setAttack(5.0f); c.setRelease(100.0f);
+        c.prepare(AudioSpec{ 48000.0, 512, 2 });
+        std::vector<Vec> x(2, Vec(512 * 120, 0.3f));
+        int cnt = 0;
+        processInBlocks(x, 512, [&](AudioBufferView<float> v) { if (++cnt == 100) c.setCharacter(ch); c.processBlock(v); });
+        const int at = 99 * 512;
+        EXPECT_NEAR(toDb(x[0][static_cast<size_t>(at)] / 0.3), toDb(x[0][static_cast<size_t>(at - 1)] / 0.3), 0.1);
+    }
+}
+
+// ============================================================================
+// Limiter
+// ============================================================================
+
+// Defect: adaptive release only counted frames where the envelope was still
+// falling, which sustained limiting barely produces. Old: 87 ms recovery with
+// and without adaptive release after 2 s of limiting.
+DSPARK_TEST(Limiter_adaptive_release_slows_after_sustained_limiting)
+{
+    auto recovery = [](bool adaptive) {
+        Limiter<float> l;
+        l.setCeiling(-6.0f); l.setRelease(50.0f); l.setAdaptiveRelease(adaptive);
+        l.prepare(48000.0, 1);
+        const int n = static_cast<int>(48000 * 2.6);
+        Vec x(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+        {
+            const double t = i / 48000.0;
+            x[static_cast<size_t>(i)] = static_cast<float>((t < 2.0 ? 1.0 : 0.05) * std::sin(2.0 * kPiD * 1000.0 * t));
+        }
+        std::vector<Vec> c { x };
+        processInBlocks(c, 256, [&](AudioBufferView<float> v) { l.processBlock(v); });
+        const int k = 96000 + l.getLatency();
+        for (int i = k; i + 48 < n; i += 48)
+            if (toDb(rmsOf(c[0].data() + i, 48)) > toDb(0.05 / std::sqrt(2.0)) - 1.0) return i - k;
+        return n;
+    };
+    EXPECT_GT(recovery(true), 2 * recovery(false));
+}
+
+// ============================================================================
+// Expander
+// ============================================================================
+
+// Defect: the smoothed rectifier under-read a steady tone by about 1 dB, which
+// the ratio multiplied. Old: R = 3, 10 dB under the threshold: -21.31 dB at
+// 100 Hz, -22.15 dB at 1 kHz, -22.36 dB at 10 kHz instead of -20.
+DSPARK_TEST(Expander_static_curve_holds_across_frequency)
+{
+    for (double f : { 100.0, 1000.0, 10000.0 })
+    {
+        Expander<float> x;
+        x.setThreshold(-30.0f); x.setRatio(3.0f); x.setHysteresis(0.0f); x.setAttack(5.0f);
+        x.setRelease(50.0f); x.setHold(0.0f); x.setRange(-80.0f);
+        x.prepare(AudioSpec{ 48000.0, 512, 2 });
+        const int n = 96000;
+        const double a = std::pow(10.0, -40.0 / 20.0);
+        std::vector<Vec> c { makeSine(f, a, 48000.0, n), makeSine(f, a, 48000.0, n) };
+        processInBlocks(c, 256, [&](AudioBufferView<float> v) { x.processBlock(v); });
+        const int len = static_cast<int>(std::round(24000.0 * f / 48000.0) * 48000.0 / f);
+        EXPECT_NEAR(toDb(toneAmplitude(c[0].data() + n - len, len, f, 48000.0) / a), -20.0, 0.1);
+    }
+}
+
+// Defect: one Inf sample made the envelope inf - inf. Old: muted for good
+// (output rms 0.0005 against 0.41).
+DSPARK_TEST(Expander_non_finite_sample_does_not_mute)
+{
+    auto make = [] {
+        auto x = std::make_unique<Expander<float>>();
+        x->setThreshold(-30.0f);
+        x->prepare(AudioSpec{ 48000.0, 512, 2 });
+        return x;
+    };
+    auto e = make(), twin = make();
+    const int n = 48000;
+    Vec s = makeSine(997.0, 0.5, 48000.0, n);
+    std::vector<Vec> x { s, s }, y { s, s };
+    x[0][10000] = std::numeric_limits<float>::infinity();
+    processInBlocks(x, 256, [&](AudioBufferView<float> v) { e->processBlock(v); });
+    processInBlocks(y, 256, [&](AudioBufferView<float> v) { twin->processBlock(v); });
+    EXPECT_NEAR(rmsOf(x[0].data() + n - 4800, 4800), rmsOf(y[0].data() + n - 4800, 4800), 1e-3);
+}
+
+// ============================================================================
+// TransientDesigner
+// ============================================================================
+
+// Defect: amounts applied per block without smoothing. Old: setAttack(100) one
+// block into a burst stepped the output from -0.241 to -3.80 in one sample.
+DSPARK_TEST(TransientDesigner_amount_change_is_click_free)
+{
+    TransientDesigner<float> t;
+    t.prepare(AudioSpec{ 48000.0, 512, 1 });
+    const int n = 4096;
+    Vec x(static_cast<size_t>(n), 0.0f);
+    for (int i = 1024; i < n; ++i) x[static_cast<size_t>(i)] = static_cast<float>(0.25 * std::sin(2.0 * kPiD * 300.0 * i / 48000.0));
+    std::vector<Vec> c { x };
+    int cnt = 0;
+    processInBlocks(c, 64, [&](AudioBufferView<float> v) { if (++cnt == 18) t.setAttack(100.0f); t.processBlock(v); });
+    const int at = 17 * 64;
+    EXPECT_LT(std::abs(static_cast<double>(c[0][static_cast<size_t>(at)]) - c[0][static_cast<size_t>(at - 1)]), 0.02);
+}
+
+// Defect: one NaN latched in the envelopes and the analytic detector. Old: NaN
+// for the remaining 38000 samples.
+DSPARK_TEST(TransientDesigner_non_finite_sample_does_not_latch)
+{
+    auto make = [] {
+        auto t = std::make_unique<TransientDesigner<float>>();
+        t->prepare(AudioSpec{ 48000.0, 512, 2 });
+        t->setAttack(50.0f);
+        return t;
+    };
+    auto t = make(), twin = make();
+    const int n = 48000;
+    Vec s = makeSine(997.0, 0.5, 48000.0, n);
+    std::vector<Vec> x { s, s }, y { s, s };
+    x[0][10000] = std::numeric_limits<float>::quiet_NaN();
+    processInBlocks(x, 256, [&](AudioBufferView<float> v) { t->processBlock(v); });
+    processInBlocks(y, 256, [&](AudioBufferView<float> v) { twin->processBlock(v); });
+    EXPECT_TRUE(allFinite(x[0].data() + 10001, n - 10001));
+    double md = 0;
+    for (int i = n - 4800; i < n; ++i) md = std::max(md, std::abs(static_cast<double>(x[0][static_cast<size_t>(i)]) - y[0][static_cast<size_t>(i)]));
+    EXPECT_LT(md, 1e-4);
+}
+
+// ============================================================================
+// CrossoverFilter
+// ============================================================================
+
+// Defect: band views with fewer channels than the input were written through
+// a null channel pointer. Old: stereo input with mono band views crashed.
+DSPARK_TEST(CrossoverFilter_narrow_band_views_are_safe)
+{
+    for (auto mode : { CrossoverFilter<float>::FilterMode::MinimumPhase, CrossoverFilter<float>::FilterMode::LinearPhase })
+    {
+        CrossoverFilter<float> x;
+        x.setNumBands(2);
+        x.setFilterMode(mode);
+        x.prepare(AudioSpec{ 48000.0, 256, 2 });
+        Vec l(256, 0.25f), r(256, 0.25f), o0(256), o1(256);
+        float* ip[2] = { l.data(), r.data() };
+        AudioBufferView<float> in(ip, 2, 256);
+        float* p0 = o0.data();
+        float* p1 = o1.data();
+        AudioBufferView<float> out[2] = { AudioBufferView<float>(&p0, 1, 256), AudioBufferView<float>(&p1, 1, 256) };
+        EXPECT_EQ(x.processBlock(in, out, 2), 2);
+        EXPECT_TRUE(allFinite(o0.data(), 256));
+        EXPECT_TRUE(allFinite(o1.data(), 256));
+    }
+}
+
+// Defect: one NaN latched in the IIR sections of every band. Old: 92060
+// non-finite samples per band over the next 100k.
+DSPARK_TEST(CrossoverFilter_non_finite_input_does_not_latch)
+{
+    CrossoverFilter<float> x;
+    x.setNumBands(3);
+    x.prepare(AudioSpec{ 48000.0, 512, 2 });
+    Vec s = makeSine(997.0, 0.5, 48000.0, 512 * 40);
+    bool lateBad = false;
+    for (int b = 0; b < 40; ++b)
+    {
+        Vec l(s.begin() + b * 512, s.begin() + (b + 1) * 512), r = l;
+        if (b == 10) l[100] = std::numeric_limits<float>::quiet_NaN();
+        Vec o[3][2];
+        float* pp[3][2];
+        std::vector<AudioBufferView<float>> views;
+        for (int k = 0; k < 3; ++k)
+        {
+            o[k][0].assign(512, 0.0f); o[k][1].assign(512, 0.0f);
+            pp[k][0] = o[k][0].data(); pp[k][1] = o[k][1].data();
+            views.emplace_back(pp[k], 2, 512);
+        }
+        float* ip[2] = { l.data(), r.data() };
+        AudioBufferView<float> in(ip, 2, 512);
+        x.processBlock(in, views.data(), 3);
+        if (b > 10)
+            for (int k = 0; k < 3; ++k)
+                if (!allFinite(o[k][0].data(), 512)) lateBad = true;
+    }
+    EXPECT_FALSE(lateBad);
+}
+
+// Defect: rounded Butterworth Q values (0.7071, 0.5412, 1.3066). Old: the
+// 8-band sum deviated 3.35e-4 dB (LR24) and 1.05e-3 dB (LR48) from flat.
+DSPARK_TEST(CrossoverFilter_band_sum_is_flat)
+{
+    for (int order : { 24, 48 })
+    {
+        CrossoverFilter<float> x;
+        x.setNumBands(8);
+        x.setOrder(order);
+        x.prepare(AudioSpec{ 48000.0, 4096, 1 });
+        const int n = 1 << 15;
+        Vec in(static_cast<size_t>(n), 0.0f);
+        in[8] = 1.0f;
+        std::vector<Vec> o(8, Vec(static_cast<size_t>(n)));
+        for (int off = 0; off < n; off += 4096)
+        {
+            float* ip = in.data() + off;
+            AudioBufferView<float> iv(&ip, 1, 4096);
+            float* p[8];
+            std::vector<AudioBufferView<float>> views;
+            for (int b = 0; b < 8; ++b) { p[b] = o[static_cast<size_t>(b)].data() + off; views.emplace_back(&p[b], 1, 4096); }
+            x.processBlock(iv, views.data(), 8);
+        }
+        std::vector<double> sum(static_cast<size_t>(n), 0.0), spec(static_cast<size_t>(n) + 2);
+        for (int b = 0; b < 8; ++b)
+            for (int i = 0; i < n; ++i) sum[static_cast<size_t>(i)] += o[static_cast<size_t>(b)][static_cast<size_t>(i)];
+        FFTReal<double> fft(n);
+        fft.forward(sum.data(), spec.data());
+        double worst = 0;
+        for (int k = 0; k <= n / 2; ++k)
+        {
+            const double re = spec[static_cast<size_t>(2 * k)], im = spec[static_cast<size_t>(2 * k + 1)];
+            worst = std::max(worst, std::abs(10.0 * std::log10(re * re + im * im)));
+        }
+        EXPECT_LT(worst, 1e-5);
+    }
 }

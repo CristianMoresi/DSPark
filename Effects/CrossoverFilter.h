@@ -12,7 +12,8 @@
  * two processing modes: minimum-phase IIR with allpass phase correction,
  * and linear-phase FFT-based processing with zero phase distortion.
  * Its processBlock(input, bandOutputs, count) writes separate caller-owned
- * band buffers, rather than replacing input with one band. It therefore
+ * band buffers, rather than replacing input with one band. Non-finite input
+ * samples enter the filters as silence (they would latch in the IIR state). It therefore
  * needs explicit routing and is not an in-place ProcessorChain slot. Sum
  * getLatency() once for the split, not once for each parallel band.
  *
@@ -29,7 +30,11 @@
  *
  * The linear-phase FIR length equals the prepared maxBlockSize, so its
  * low-frequency resolution scales with the block size: very low crossover
- * frequencies need large blocks to be resolved. Kernel recomputation after
+ * frequencies need large blocks to be resolved. Measured on band 0 of a
+ * 200 Hz LR24 split at 48 kHz (ideal -0.26 dB at 100 Hz, -24.6 dB at 400 Hz):
+ * maxBlockSize 64 gives -12.6 / -13.7 dB, 512 gives -1.7 / -21.1 dB and 4096
+ * gives -0.56 / -24.6 dB. The bands always sum to a pure delay. Prepare with
+ * the largest block the host allows when splitting low. Kernel recomputation after
  * a frequency/order/band-count change runs on the audio thread from
  * pre-allocated scratch (no allocation, but it is a CPU spike of
  * 2 x numBands FFTs for that block).
@@ -249,18 +254,24 @@ public:
         if (n < 2) return 0;
 
         // Defensive span clamp: never index past the prepared work buffers
-        // (fixed maxBlockSize stride) or past any output view.
+        // (fixed maxBlockSize stride) or past any output view. The channel
+        // count is clamped to the narrowest band view too: a view with fewer
+        // channels used to be written through a null channel pointer.
         int nS = std::min(input.getNumSamples(), spec_.maxBlockSize);
+        int nCh = std::min(input.getNumChannels(), numChannels_);
         for (int b = 0; b < n; ++b)
+        {
             nS = std::min(nS, bandOutputs[b].getNumSamples());
+            nCh = std::min(nCh, bandOutputs[b].getNumChannels());
+        }
         if (nS <= 0) return 0;
 
         if (lpActive)
-            processLinearPhase(input, bandOutputs, n, nS);
+            processLinearPhase(input, bandOutputs, n, nS, nCh);
         else
-            processIIR(input, bandOutputs, n, nS);
+            processIIR(input, bandOutputs, n, nS, nCh);
 
-        passExtraChannels(input, bandOutputs, n, nS);
+        passExtraChannels(input, bandOutputs, n, nS, nCh);
         return n;
     }
 
@@ -560,9 +571,12 @@ private:
                 for (int s = 0; s < numSplits; ++s)
                 {
                     double f = clampSplitFreq(static_cast<double>(frequencies_[s]), sr);
-                    auto lpC = BiquadCoeffs::makeLowPass(sr, f, 0.7071);
-                    auto hpC = BiquadCoeffs::makeHighPass(sr, f, 0.7071);
-                    auto apC = BiquadCoeffs::makeAllPass(sr, f, 0.7071);
+                    // Exact Butterworth Q: the rounded 0.7071 left the band sum
+                    // 3.4e-4 dB off flat (now 1e-6).
+                    constexpr double qB = 0.70710678118654752440;
+                    auto lpC = BiquadCoeffs::makeLowPass(sr, f, qB);
+                    auto hpC = BiquadCoeffs::makeHighPass(sr, f, qB);
+                    auto apC = BiquadCoeffs::makeAllPass(sr, f, qB);
 
                     for (int st = 0; st < 2; ++st)
                     {
@@ -578,8 +592,11 @@ private:
             {
                 numStagesPerFilter_ = 4;
                 numStagesAllpass_   = 2;
-                constexpr double q1 = 0.5412;
-                constexpr double q2 = 1.3066;
+                // Exact 4th-order Butterworth section Qs, 1/(2 cos(pi/8)) and
+                // 1/(2 cos(3 pi/8)): the rounded values left the band sum
+                // 1.1e-3 dB off flat (now 1.5e-6).
+                constexpr double q1 = 0.54119610014619698440;
+                constexpr double q2 = 1.30656296487637652786;
                 const double qArr[4] = { q1, q2, q1, q2 };
 
                 for (int s = 0; s < numSplits; ++s)
@@ -605,10 +622,9 @@ private:
         }
     }
 
-    void processIIR(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands, int nS) noexcept
+    void processIIR(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands, int nS, int nCh) noexcept
     {
         DenormalGuard guard;
-        const int nCh = std::min(input.getNumChannels(), numChannels_);
         const int numSplits = numBands - 1;
 
         bool anySmoothing = false;
@@ -648,11 +664,14 @@ private:
     {
         const int numSplits = numBands - 1;
 
+        // Non-finite input samples enter as silence: in the recursive
+        // sections they would latch for good.
         for (int ch = 0; ch < nCh; ++ch)
         {
             const T* src = input.getChannel(ch) + offset;
             T* dst = getWorkBufChannel(ch);
-            std::copy(src, src + blockLen, dst);
+            for (int i = 0; i < blockLen; ++i)
+                dst[i] = std::isfinite(src[i]) ? src[i] : T(0);
         }
 
         for (int s = 0; s < numSplits; ++s)
@@ -708,10 +727,11 @@ private:
     /// Input channels beyond the processed count get band 0 = input,
     /// remaining bands = silence, so the band sum still equals the input
     /// (leaving caller buffers untouched would hand back garbage).
-    void passExtraChannels(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands, int nS) noexcept
+    void passExtraChannels(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands, int nS,
+                           int firstCh) noexcept
     {
         const int inCh = input.getNumChannels();
-        for (int ch = numChannels_; ch < inCh; ++ch)
+        for (int ch = firstCh; ch < inCh; ++ch)
         {
             for (int b = 0; b < numBands; ++b)
             {
@@ -826,11 +846,11 @@ private:
         return lpPrevBlockFlat_.data() + static_cast<size_t>(ch) * static_cast<size_t>(firLength_);
     }
 
-    void processLinearPhase(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands, int nS) noexcept
+    void processLinearPhase(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands, int nS,
+                            int nCh) noexcept
     {
         recomputeLinearPhaseMagnitudes();
 
-        const int nCh = std::min(input.getNumChannels(), numChannels_);
         const int numBins = lpFftSize_ / 2 + 1;
         const int overlapSize = firLength_ - 1;
 
@@ -844,19 +864,17 @@ private:
                 lpFftIn_[static_cast<size_t>(i)] = prev[i];
 
             for (int i = 0; i < nS; ++i)
-                lpFftIn_[static_cast<size_t>(overlapSize + i)] = channelData[i];
+            {
+                const T x = channelData[i];
+                lpFftIn_[static_cast<size_t>(overlapSize + i)] = std::isfinite(x) ? x : T(0);
+            }
 
             for (int i = overlapSize + nS; i < lpFftSize_; ++i)
                 lpFftIn_[static_cast<size_t>(i)] = T(0);
 
-            // Save tail for next block
+            // Save tail for next block (the sanitised frame, so it holds no NaN)
             for (int i = 0; i < overlapSize; ++i)
-            {
-                if (nS - overlapSize + i >= 0)
-                    prev[i] = channelData[nS - overlapSize + i];
-                else
-                    prev[i] = lpFftIn_[static_cast<size_t>(nS + i)]; // Handle block size < overlap
-            }
+                prev[i] = lpFftIn_[static_cast<size_t>(nS + i)];
 
             lpFft_->forward(lpFftIn_.data(), lpFftOut_.data());
 

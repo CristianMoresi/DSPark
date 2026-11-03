@@ -3578,7 +3578,7 @@ DSPARK_TEST(Mp3File_decodes_mpeg2_and_mpeg25_layer3)
     io_audit::writeFrames(p1, { mpeg1 });
     const auto ref = io_audit::decode(p1);
     EXPECT_TRUE(ref.ok);
-    for (const auto [version, rateIndex, rate] : { std::tuple { 2, 0, 22050.0 },
+    for (const auto& [version, rateIndex, rate] : { std::tuple { 2, 0, 22050.0 },
                                                    std::tuple { 0, 2, 8000.0 } })
     {
         auto lsfFrame = [&](bool data) {
@@ -3630,7 +3630,7 @@ DSPARK_TEST(Mp3File_decodes_mpeg2_and_mpeg25_layer3)
     // 3. LSF intensity stereo. The right channel carries no lines, so every
     //    band is intensity coded; its scalefac_compress 258/259 selects the
     //    intensity partition table 3 with three 3-bit fields (21 positions).
-    for (const auto [intensityScale, expected] : { std::pair { 0, 0.5 }, std::pair { 1, 0.25 } })
+    for (const auto& [intensityScale, expected] : { std::pair { 0, 0.5 }, std::pair { 1, 0.25 } })
     {
         auto frame = [&](bool data) {
             return io_audit::craftFrame(2, 8, 0, 1, 1,

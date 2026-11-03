@@ -3637,6 +3637,12 @@ def threading_census_mutations(
     return mutations
 
 
+def public_policy_total(root: Path) -> int:
+    """Tracked-file count the public file policy records (its counts sum)."""
+    policy = json.loads((root / "tools/public_file_policy.json").read_text(encoding="utf-8"))
+    return int(policy["counts"]["total"])
+
+
 def threading_external_live(root: Path) -> list[str]:
     errors: list[str] = []
     baseline_doc = (root / "docs/threading.md").read_text(encoding="ascii")
@@ -3653,7 +3659,8 @@ def threading_external_live(root: Path) -> list[str]:
         ["git", "ls-files", "-z"], cwd=root, check=False,
         capture_output=True, timeout=30).stdout.split(b"\0")
     tracked_paths = [item.decode("utf-8") for item in tracked if item]
-    if len(tracked_paths) != 562 or len(tracked_paths) != len(set(tracked_paths)):
+    expected_tracked = public_policy_total(root)
+    if len(tracked_paths) != expected_tracked or len(tracked_paths) != len(set(tracked_paths)):
         return ["THREADING_EXTERNAL_TRACKED_CENSUS:{}".format(
             len(tracked_paths))]
 
@@ -3690,7 +3697,7 @@ def threading_external_live(root: Path) -> list[str]:
                 item for item in indexed_paths.stdout.split(b"\0") if item
             ])
             if setup.returncode != 0 or indexed.returncode != 0 \
-                    or indexed_paths.returncode != 0 or indexed_count != 562:
+                    or indexed_paths.returncode != 0 or indexed_count != expected_tracked:
                 errors.append("THREADING_EXTERNAL_FIXTURE:{}".format(name))
                 observed.append(name)
                 continue

@@ -832,3 +832,52 @@ DSPARK_TEST(Onset_shared_complex_flux_rejects_missing_phase_history)
     EXPECT_TRUE(novelty.process(magnitudes,phases,Method::ComplexDomain).valid);
     EXPECT_FALSE(novelty.process(magnitudes,std::span<const double>(phases.data(),3),Method::ComplexDomain).valid);
 }
+
+// prepare() reinstated the defaults, so anything configured before it, or before
+// a re-prepare at a new rate, was lost: the old code reads threshold 0.03 here.
+DSPARK_TEST(Onset_configuration_survives_prepare)
+{
+    using Method = OnsetDetector<float>::Method;
+    OnsetDetector<float> od;
+    od.setThreshold(0.25f);
+    od.setAdaptiveWhitening(true);
+    od.setMethod(Method::ComplexDomain);
+    od.prepare(AudioSpec{ 48000.0, 512, 1 });
+    od.prepare(AudioSpec{ 44100.0, 512, 1 });
+    EXPECT_NEAR(od.getThreshold(), 0.25f, 0.0f);
+    EXPECT_TRUE(od.getAdaptiveWhitening());
+    EXPECT_TRUE(od.getMethod() == Method::ComplexDomain);
+}
+
+namespace {
+// The readout is new, so this also builds against a detector without it.
+template <typename Detector>
+bool readsBinPhases(const Detector& detector)
+{
+    if constexpr (requires { detector.computesBinPhases(); })
+        return detector.computesBinPhases();
+    else
+        return true;
+}
+} // namespace
+
+// Every frame ran atan2 on every bin although only ComplexDomain reads a phase:
+// 71% of the old detector's CPU (2.89 against 0.84 ms per second of audio), with
+// bit-identical SuperFlux output without it. Phases must come back the moment
+// ComplexDomain is selected on a running stream.
+DSPARK_TEST(Onset_phases_are_computed_only_for_complex_domain)
+{
+    using Method = OnsetDetector<float>::Method;
+    OnsetDetector<float> od;
+    od.prepare(AudioSpec{ 48000.0, 512, 1 });
+    std::vector<float> x(9600);
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = 0.3f * static_cast<float>(i % 400 < 8) + 0.1f * std::sin(0.05f * static_cast<float>(i));
+    od.pushSamples(std::span<const float>(x.data(), x.size()));
+    EXPECT_FALSE(readsBinPhases(od));
+
+    od.setMethod(Method::ComplexDomain);
+    od.pushSamples(std::span<const float>(x.data(), x.size()));
+    EXPECT_TRUE(readsBinPhases(od));
+    EXPECT_GT(od.getLastOdfFrame().value, 0.0f);
+}

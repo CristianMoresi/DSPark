@@ -864,3 +864,43 @@ DSPARK_TEST(Key_chroma_is_normalised_and_names_are_written)
     EXPECT_EQ(KeyDetector<float>::getKeyName(nothing, name, sizeof name), 0);
     EXPECT_EQ(KeyDetector<float>::getKeyName(nothing, name, 0), 0);
 }
+
+// Frames voted with chroma energy, so a note three times louder than another
+// counted nine times over and the loudest bass note decided the frame: the old
+// code reads this 3:1 pair as 9.0:1.
+DSPARK_TEST(Key_votes_are_magnitudes_not_energies)
+{
+    const double fs = 48000.0;
+    std::vector<float> x(static_cast<size_t>(2.0 * fs));
+    for (size_t i = 0; i < x.size(); ++i)
+    {
+        const double t = static_cast<double>(i) / fs;
+        x[i] = static_cast<float>(0.3 * std::sin(twoPi<double> * 261.6256 * t)
+                                  + 0.1 * std::sin(twoPi<double> * 391.9954 * t));
+    }
+    KeyDetector<float> kd;
+    kd.prepare(AudioSpec{ fs, 512, 1 });
+    kd.pushSamples(std::span<const float>(x.data(), x.size()));
+    EXPECT_NEAR(static_cast<double>(kd.chroma()[0]) / static_cast<double>(kd.chroma()[7]), 3.0, 0.3);
+}
+
+// A minor tonic took the spelling of the major key on the same pitch class. The
+// old code wrote C# minor as "Dbm" and G# minor as "Abm", keys of 8 and 7 flats.
+DSPARK_TEST(Key_minor_tonics_use_their_standard_spelling)
+{
+    const auto name = [](int tonic, bool minor) {
+        KeyDetector<float>::Key key;
+        key.tonicPitchClass = tonic;
+        key.isMinor = minor;
+        char text[8] = {};
+        KeyDetector<float>::getKeyName(key, text, sizeof text);
+        return std::string(text);
+    };
+    EXPECT_TRUE(name(1, true) == "C#m");
+    EXPECT_TRUE(name(8, true) == "G#m");
+    EXPECT_TRUE(name(3, true) == "Ebm");
+    EXPECT_TRUE(name(6, true) == "F#m");
+    EXPECT_TRUE(name(10, true) == "Bbm");
+    EXPECT_TRUE(name(1, false) == "Db");
+    EXPECT_TRUE(name(8, false) == "Ab");
+}

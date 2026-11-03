@@ -235,8 +235,11 @@ public:
         DelayEstimator est;
         est.prepare(sampleRate, maxDelaySamples);
         est.push(reference, delivery);
-        // Flush: the last frames need the tail of the delivery.
-        const int flush = est.frame_ + 2 * est.maxDelay_;
+        // Flush only a programme too short for one frame. Both signals stop
+        // on the same sample, so zeros after a longer programme add a step at
+        // lag 0 in both, and that shared click outvotes the true delay wherever
+        // the material itself has no highs.
+        const int flush = est.frames_ >= 1 ? 0 : est.frame_ + 2 * est.maxDelay_;
         std::vector<T> zeros(static_cast<size_t>(std::min(flush, 1 << 16)), T(0));
         const T* z = zeros.data();
         for (int left = flush; left > 0; left -= static_cast<int>(zeros.size()))

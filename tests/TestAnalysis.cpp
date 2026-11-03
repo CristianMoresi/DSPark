@@ -2318,7 +2318,8 @@ DSPARK_TEST(DelayEstimator_noise_polarity_and_unrelated_material)
 }
 
 // Pushed in blocks of any size, the estimate is the one the whole-signal
-// call gives: memory is a few frames, not the program.
+// call gives: memory is a few frames, not the program. Neither path appends
+// zeros after a programme of at least one frame.
 DSPARK_TEST(DelayEstimator_block_feeding_matches_the_whole_signal_call)
 {
     const auto c = makeDelayCase(true, 37.25, 30.0, 0.7, 5u);
@@ -2335,10 +2336,6 @@ DSPARK_TEST(DelayEstimator_block_feeding_matches_the_whole_signal_call)
             const int len = std::min(block, n - p);
             est.push(AudioBufferView<const float>(&a, 1, len), AudioBufferView<const float>(&b, 1, len));
         }
-        std::vector<float> z(static_cast<size_t>(est.getFrameSize() + 4000), 0.0f);
-        const float* zp = z.data();
-        est.push(AudioBufferView<const float>(&zp, 1, static_cast<int>(z.size())),
-                 AudioBufferView<const float>(&zp, 1, static_cast<int>(z.size())));
         const auto r = est.estimate();
         EXPECT_NEAR(r.delaySamples, whole.delaySamples, 1e-9);
         EXPECT_NEAR(r.confidence, whole.confidence, 1e-9);
@@ -2459,4 +2456,44 @@ DSPARK_TEST(PitchFollower_interval_latency_does_not_depend_on_block_size)
     const int reference = intervalArrival(64);
     for (const int block : { 512, 4096, 8192 })
         EXPECT_LT(intervalArrival(block), reference + block + 64);
+}
+
+// The whole-signal call flushed zeros after the programme. Both signals stop on
+// the same sample, so that adds a step at lag 0 in both, and on a bass stem,
+// which has no highs of its own, the shared click wins: the old code read this
+// 2000-sample delay as -11.9 samples, confidence 0.02.
+DSPARK_TEST(DelayEstimator_programme_end_is_not_a_shared_event)
+{
+    const int n = 48000 * 11;
+    uint32_t s = 7u;
+    auto gauss = [&s]() {
+        double acc = 0.0;
+        for (int k = 0; k < 12; ++k) { s = s * 1664525u + 1013904223u; acc += static_cast<double>(s >> 8) / 16777216.0; }
+        return acc - 6.0;
+    };
+    constexpr int delay = 2000;
+    std::vector<double> bass(static_cast<size_t>(n + delay));
+    double a = 0.0, b = 0.0, c = 0.0;
+    for (auto& v : bass)
+    {
+        a += 0.025 * (gauss() - a);
+        b += 0.025 * (a - b);
+        c += 0.025 * (b - c);
+        v = c;
+    }
+    std::vector<float> ref(static_cast<size_t>(n)), del(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        ref[static_cast<size_t>(i)] = static_cast<float>(bass[static_cast<size_t>(i + delay)]);
+        del[static_cast<size_t>(i)] = static_cast<float>(bass[static_cast<size_t>(i)] + 2e-5 * gauss());
+    }
+    const float* rp = ref.data();
+    const float* dp = del.data();
+    const auto r = DelayEstimator<float>::estimate(AudioBufferView<const float>(&rp, 1, n),
+                                                   AudioBufferView<const float>(&dp, 1, n),
+                                                   48000.0, 4800);
+    EXPECT_TRUE(r.valid);
+    EXPECT_NEAR(r.delaySamples, static_cast<double>(delay), 0.05);
+    EXPECT_GT(r.confidence, 0.9);
+    EXPECT_FALSE(r.inverted);
 }

@@ -736,3 +736,38 @@ DSPARK_TEST(ChordDetector_above_ceiling_fill_transient_latches_and_persists)
     EXPECT_EQ(afterReset.rootPitchClass, -1);
     EXPECT_TRUE(afterReset.type == CT::None);
 }
+
+// Extensions were stacked as simple intervals, 2, 5 and 9, against the 14, 17 and
+// 21 of allChords and of the documented R-3-5-7-9-11-13, so diatonicChordToMidi()
+// placed the ninth below the third (the old code: 60 64 67 71 62 65 69). An
+// invalid degree came back with interval 0, not the documented -1 for absent.
+DSPARK_TEST(Harmony_diatonic_extensions_are_compound_intervals)
+{
+    const auto chord = diatonicChord(allScales[0], 0, ChordLevel::Triads791113);
+    const Chord& major13 = allChords[14];
+    for (std::size_t i = 0; i < 7; ++i)
+        EXPECT_EQ(chord.intervals[i], major13.intervals[i]);
+    const auto notes = diatonicChordToMidi(chord, 60);
+    EXPECT_EQ(notes[4], 74);
+
+    const auto invalid = diatonicChord(allScales[0], 7, ChordLevel::Triads791113);
+    for (const int interval : invalid.intervals)
+        EXPECT_EQ(interval, -1);
+}
+
+// getChordName() spelled every root with sharps, so the "Bbsus4" its own
+// documentation promises came out as "A#sus4".
+DSPARK_TEST(ChordDetector_names_follow_the_key_spelling)
+{
+    using CT = ChordDetector<float>::ChordType;
+    ChordDetector<float>::Result r;
+    r.rootPitchClass = 10;
+    r.type = CT::Sus4;
+    char name[8];
+    ChordDetector<float>::getChordName(r, name, 8);
+    EXPECT_TRUE(std::string_view(name) == "Bbsus4");
+    r.rootPitchClass = 6;
+    r.type = CT::Minor7;
+    ChordDetector<float>::getChordName(r, name, 8);
+    EXPECT_TRUE(std::string_view(name) == "F#m7");
+}

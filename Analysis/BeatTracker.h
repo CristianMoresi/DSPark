@@ -344,7 +344,7 @@ public:
         T tempoBpm = T(0);           ///< Delivered tempo, fitted to the grid.
         T confidence = T(0);         ///< Coherence of the envelope with the grid, [0,1].
         T secondaryTempoBpm = T(0);  ///< The competing hypothesis that lost.
-        std::vector<int64_t> beatSamples; ///< Beat positions, ascending, in samples.
+        std::vector<int64_t> beatSamples; ///< Beat positions, ascending, in samples, never negative.
     };
 
     // -- Lifecycle -----------------------------------------------------------
@@ -361,6 +361,9 @@ public:
      * control thread while audio runs. The span reaches an octave BELOW the
      * slowest searchable tempo on purpose: the octave discriminator needs the
      * candidate's own subharmonic, which is a resonator that must exist.
+     *
+     * The tempo range and tightness survive it, whether they were set before
+     * the first prepare() or between two.
      */
     void prepare(const AudioSpec& spec)
     {
@@ -381,8 +384,7 @@ public:
                               std::memory_order_relaxed);
 
         buildBank();
-        setTempoRange(T(kDefaultMinBpm), T(kDefaultMaxBpm));
-        tightness_.store(kDefaultTightness, std::memory_order_relaxed);
+        applyTempoRange();
 
         // Offline scratch that does not depend on the signal length.
         candidates_.reserve(64);
@@ -397,18 +399,30 @@ public:
      * Clamped into the bank's supported span and to min <= max; a non-finite
      * or inverted request is ignored and the previous range kept. Takes effect
      * on the next analysis frame for the causal path and on the next call for
-     * analyze().
+     * analyze(). The published running tempo stays inside it.
      */
     void setTempoRange(T minBpm, T maxBpm) noexcept
     {
         if (!std::isfinite(minBpm) || !std::isfinite(maxBpm)) return;
         if (!(minBpm > T(0)) || !(maxBpm > T(0)) || !(minBpm <= maxBpm)) return;
-        if (bankSize_ < 2) return;
 
         const double lo = std::clamp(static_cast<double>(minBpm),
                                      kBankMinBpm, kBankMaxBpm);
         const double hi = std::clamp(static_cast<double>(maxBpm),
                                      kBankMinBpm, kBankMaxBpm);
+        requestedRange_.store(packTempo(static_cast<float>(lo), static_cast<float>(hi)),
+                              std::memory_order_relaxed);
+        applyTempoRange();
+    }
+
+    /// Selects the part of the bank the requested range covers.
+    void applyTempoRange() noexcept
+    {
+        if (bankSize_ < 2) return;
+        float requestedLo = 0.0f, requestedHi = 0.0f;
+        unpackTempo(requestedRange_.load(std::memory_order_relaxed), requestedLo, requestedHi);
+        const double lo = static_cast<double>(requestedLo);
+        const double hi = static_cast<double>(requestedHi);
 
         // Bank index runs with PERIOD, so the fastest tempo is the lowest
         // index: the high BPM bound selects the low index bound.
@@ -1397,7 +1411,12 @@ private:
         const double conf = std::clamp(bankCoherence_[ub] * ambiguityDiscount(share),
                                        0.0, 1.0);
 
-        tempoAndConfidence_.store(packTempo(static_cast<float>(periodToBpm(period)),
+        // The walk onto the coherence peak can step past the end of the range
+        // it was searched in; the published reading stays inside what was asked.
+        float rangeLo = 0.0f, rangeHi = 0.0f;
+        unpackTempo(requestedRange_.load(std::memory_order_relaxed), rangeLo, rangeHi);
+        tempoAndConfidence_.store(packTempo(std::clamp(static_cast<float>(periodToBpm(period)),
+                                                       rangeLo, rangeHi),
                                             static_cast<float>(conf)),
                                   std::memory_order_relaxed);
 
@@ -1422,7 +1441,7 @@ private:
         {
             const int64_t backFrames = static_cast<int64_t>(std::lround(sinceBeat));
             const int64_t ref = lastFrameRef_ - backFrames * static_cast<int64_t>(hop_);
-            lastBeatSample_.store(ref, std::memory_order_relaxed);
+            lastBeatSample_.store(std::max<int64_t>(0, ref), std::memory_order_relaxed);
             framesSinceBeat_ = 0;
             beat = true;
         }
@@ -2520,14 +2539,14 @@ private:
     {
         const int n = static_cast<int>(env_.size());
         const int64_t base = envRef_[static_cast<size_t>(f)];
-        if (f <= 0 || f >= n - 1) return base;
+        if (f <= 0 || f >= n - 1) return std::max<int64_t>(0, base);
         const double a = env_[static_cast<size_t>(f - 1)];
         const double b = env_[static_cast<size_t>(f)];
         const double c = env_[static_cast<size_t>(f + 1)];
         const double den = a - 2.0 * b + c;
-        if (!(den < 0.0)) return base;   // not a peak: nothing to interpolate
+        if (!(den < 0.0)) return std::max<int64_t>(0, base);   // not a peak: nothing to interpolate
         const double d = std::clamp(0.5 * (a - c) / den, -0.5, 0.5);
-        return base + static_cast<int64_t>(std::llround(d * static_cast<double>(hop_)));
+        return std::max<int64_t>(0, base + static_cast<int64_t>(std::llround(d * static_cast<double>(hop_))));
     }
 
     /**
@@ -2728,6 +2747,9 @@ private:
     std::atomic<bool> prepared_ { false };
     std::atomic<std::uint64_t> tempoAndConfidence_ { 0 };
     std::atomic<std::uint32_t> activeRange_ { 0 };
+    /// Range in BPM as asked for, kept so prepare() can rebuild activeRange_.
+    std::atomic<std::uint64_t> requestedRange_ {
+        packTempo(static_cast<float>(kDefaultMinBpm), static_cast<float>(kDefaultMaxBpm)) };
     std::atomic<double> tightness_ { kDefaultTightness };
     std::atomic<bool> beatLatched_ { false };
     std::atomic<std::int64_t> lastBeatSample_ { -1 };

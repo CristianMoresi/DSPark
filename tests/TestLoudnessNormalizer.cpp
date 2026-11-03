@@ -889,3 +889,29 @@ DSPARK_TEST(LoudnessNorm_float_and_double_agree)
     EXPECT_NEAR(static_cast<double>(rf.outLUFS), rd.outLUFS, 0.01);
     EXPECT_NEAR(static_cast<double>(rf.appliedGainDb), rd.appliedGainDb, 0.01);
 }
+
+// Loudness does not scale with gain near the absolute gate: the -72 LUFS
+// sections below it at the input clear it at the output and pull the gated mean
+// down. One pass from the input measurement left the old code at -25.48 LUFS for
+// a -23 target, with no ceiling involved.
+DSPARK_TEST(LoudnessNormalizer_reaches_the_target_across_the_absolute_gate)
+{
+    const int n = static_cast<int>(24.0 * kFs);
+    AudioBuffer<float> audio;
+    audio.resize(2, n);
+    Rng rng;
+    float lp = 0.0f;
+    for (int i = 0; i < n; ++i)
+    {
+        lp += 0.1f * (rng.gauss() - lp);
+        const float level = (i / static_cast<int>(4.0 * kFs)) % 2 == 0 ? 1.0e-3f : 2.5e-4f;
+        audio.getChannel(0)[i] = audio.getChannel(1)[i] = 2.2f * level * lp;
+    }
+    LoudnessNormalizer<float> normalizer;
+    normalizer.setTargetLUFS(-23.0f);
+    const auto result = normalizer.normalize(audio, kFs);
+    EXPECT_TRUE(result.status == LoudnessNormalizer<float>::Status::Success);
+    EXPECT_FALSE(result.ceilingLimited);
+    EXPECT_TRUE(result.targetReached);
+    EXPECT_NEAR(result.outLUFS, -23.0f, 0.1f);
+}

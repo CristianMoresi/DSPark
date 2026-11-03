@@ -96,6 +96,35 @@ All notable user-facing changes to DSPark are documented here.
   approximately -105 dBFS residuals in a 48 kHz Room fixture. The correction
   preserves the filter design, delay network, controls and latency; float
   output bytes change. Double processing retains its existing arithmetic.
+- `LoopFinder` now scores a seam at the lag `renderLoop()` overlaps,
+  period - crossfadeLength, not period - comparisonLength. With the default
+  settings a tone could score near zero and render a crossfade in antiphase
+  (RMS min/max 0.28, now 0.99). Chosen loop points change. Loops too close to
+  the file edges are scored at the nearest lag that fits.
+- `DelayEstimator::estimate()` over whole buffers no longer flushes zeros after
+  a programme long enough for one frame. The shared step at lag 0 misread a
+  2000-sample delay on a bass stem by about 2005 samples.
+- `OfflineTempoAnalyzer` beats now carry the same localization as `BeatTracker`.
+  They sat 13.6 ms early at 48 kHz and 22 ms early at 8 kHz, which marked every
+  interval unreliable at 400 BPM on low sample rates. `algorithmRevision` is 3.
+- `KeyDetector` frames now vote with chroma magnitude rather than energy, so a
+  loud bass note no longer decides a frame: exact keys rise from 44.4% to 55.6%
+  on a 216-piece synthetic bed. Keep the bed in mind: no recorded corpus was run.
+- `BeatTracker` keeps its tempo range and tightness, and `OnsetDetector` its
+  method, threshold and whitening, across `prepare()`, including values set
+  before the first one.
+- `BeatTracker` positions are no longer negative, and its running tempo stays
+  inside the requested range.
+- `LoudnessNormalizer` confirms its gain by measuring through it, so quiet
+  programmes near the absolute gate reach the target: -25.48 LUFS became -23.00
+  in the measured case. Programmes clear of the gate get the same gain as
+  before, at the cost of one more measurement pass.
+- `OnsetDetector` computes bin phases only for `ComplexDomain`: 71% less CPU
+  with bit-identical SuperFlux output. `computesBinPhases()` reports it.
+- `harmony::diatonicChord()` returns extensions as compound intervals (14, 17,
+  21), matching `allChords`, and an invalid degree returns -1 for every interval.
+- `KeyDetector::getKeyName()` writes C#m and G#m, not Dbm and Abm.
+  `ChordDetector::getChordName()` spells roots by key, so Bb is no longer A#.
 
 ## [1.8.1] - 2026-10-13
 

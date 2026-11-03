@@ -10,8 +10,12 @@
  * find() scores candidate loop endpoints over explicit inclusive ranges
  * with a waveform/derivative/spectral seam cost and pre-counted work
  * bounds; renderLoop() writes one seamless cycle using the normalized
- * equal-power overlap. Failure is always explicit: a non-success result
- * carries the neutral payload and renders nothing.
+ * equal-power overlap. The cost compares the source at the lag that overlap
+ * renders, period - crossfadeLength, with the comparison window centred on the
+ * crossfade. A loop too close to the file edges for that window is scored at
+ * the nearest lag that keeps both windows inside the file. Failure is always
+ * explicit: a non-success result carries the neutral payload and renders
+ * nothing.
  *
  * Threading: offline, owner-managed. One caller owns an instance for the
  * duration of a find(); renderLoop() is a stateless static call. Neither
@@ -546,6 +550,17 @@ private:
     {
         const int channels = audio.getNumChannels();
         const int window = settings.comparisonLength;
+        // renderLoop() overlaps source[end - fade + i] with source[start + i],
+        // so that lag, not period - window, is the one the seam must match.
+        // The window is centred on the overlap. A loop whose windows would
+        // leave the file takes the largest lag that fits.
+        const std::int64_t fade = settings.crossfadeLength;
+        const std::int64_t room =
+            static_cast<std::int64_t>(audio.getNumSamples()) - window;
+        const std::int64_t lag = std::min(end - start - fade, room);
+        const std::int64_t head = std::clamp<std::int64_t>(
+            start - (window - fade) / 2, 0, room - lag);
+        const std::int64_t tail = head + lag;
         long double scale = 0.0L;
         for (int ch = 0; ch < channels; ++ch)
         {
@@ -553,9 +568,9 @@ private:
             for (int i = 0; i < window; ++i)
             {
                 scale = std::max(scale, std::abs(static_cast<long double>(
-                    source[end - window + i])));
+                    source[tail + i])));
                 scale = std::max(scale, std::abs(static_cast<long double>(
-                    source[start + i])));
+                    source[head + i])));
             }
         }
         if (scale == 0.0L) return ScoreState::Inactive;
@@ -575,19 +590,19 @@ private:
             for (int i = 0; i < window; ++i)
             {
                 meanA[static_cast<std::size_t>(ch)] +=
-                    static_cast<long double>(source[end - window + i]) / scale;
+                    static_cast<long double>(source[tail + i]) / scale;
                 meanB[static_cast<std::size_t>(ch)] +=
-                    static_cast<long double>(source[start + i]) / scale;
+                    static_cast<long double>(source[head + i]) / scale;
             }
             meanA[static_cast<std::size_t>(ch)] /= window;
             meanB[static_cast<std::size_t>(ch)] /= window;
             for (int i = 0; i < window; ++i)
             {
                 const long double a =
-                    static_cast<long double>(source[end - window + i]) / scale
+                    static_cast<long double>(source[tail + i]) / scale
                     - meanA[static_cast<std::size_t>(ch)];
                 const long double b =
-                    static_cast<long double>(source[start + i]) / scale
+                    static_cast<long double>(source[head + i]) / scale
                     - meanB[static_cast<std::size_t>(ch)];
                 varianceA[static_cast<std::size_t>(ch)] += a * a;
                 varianceB[static_cast<std::size_t>(ch)] += b * b;
@@ -638,9 +653,9 @@ private:
             for (int i = 0; i < window; ++i)
             {
                 const long double a =
-                    static_cast<long double>(source[end - window + i]) / scale;
+                    static_cast<long double>(source[tail + i]) / scale;
                 const long double b =
-                    static_cast<long double>(source[start + i]) / scale;
+                    static_cast<long double>(source[head + i]) / scale;
                 const long double difference = a - b;
                 d0Numerator += difference * difference;
                 d0Denominator += a * a + b * b;

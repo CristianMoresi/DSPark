@@ -325,8 +325,12 @@ int testAll()
                 * std::sin(2.0f * 3.14159265f * 0.019f * static_cast<float>(i))
                 + 0.1f * std::sin(2.0f * 3.14159265f * 0.077f
                                   * static_cast<float>(i) + 0.3f);
-        std::copy_n(loopSource.begin() + plantedStart, contextLength,
-                    loopSource.begin() + plantedEnd - contextLength);
+        // Planted at the lag renderLoop() overlaps, period - crossfade, with
+        // the comparison window centred on the crossfade.
+        constexpr int plantedHead = plantedStart - (contextLength - 64) / 2;
+        constexpr int plantedTail = plantedHead + (plantedEnd - plantedStart - 64);
+        std::copy_n(loopSource.begin() + plantedHead, contextLength,
+                    loopSource.begin() + plantedTail);
 
         LoopFinder<float> finder;
         LoopFinder<float>::Settings settings;

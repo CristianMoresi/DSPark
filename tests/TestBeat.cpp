@@ -1706,3 +1706,62 @@ DSPARK_TEST(Beat_ternary_selection_is_independent_of_offline_blocks)
         EXPECT_TRUE(actual.beatSamples == whole.beatSamples);
     }
 }
+
+// prepare() reinstated the defaults and setTempoRange() before it was dropped,
+// so a host re-preparing at a new rate silently searched another range: the old
+// code read tightness 25 here and tracked these clicks at 160 BPM.
+DSPARK_TEST(Beat_range_and_tightness_survive_prepare)
+{
+    BeatTracker<float> bt;
+    bt.setTightness(5.0f);
+    bt.setTempoRange(60.0f, 100.0f);
+    bt.prepare(AudioSpec{ 48000.0, 512, 1 });
+    bt.prepare(AudioSpec{ kFs, 512, 1 });
+    EXPECT_NEAR(bt.getTightness(), 5.0f, 0.0f);
+
+    const Corpus c = clickTrain(160.0, 16.0);
+    const float* p = c.x.data();
+    AudioBufferView<const float> v(&p, 1, static_cast<int>(c.x.size()));
+    const auto r = bt.analyze(v);
+    EXPECT_GT(r.tempoBpm, 59.0f);
+    EXPECT_TRUE(r.tempoBpm < 101.0f);
+}
+
+// A transient on the first sample localised before it (the old code returned
+// beat -2 at 8 kHz, an index into nothing), and the walk onto the coherence peak
+// could step past the searched range (the old code published 119.5 BPM here).
+DSPARK_TEST(Beat_positions_stay_in_the_file_and_tempo_in_the_range)
+{
+    const double fs = 8000.0;
+    std::vector<float> x(static_cast<size_t>(12.0 * fs), 0.0f);
+    for (int beat = 0; beat < 23; ++beat)
+    {
+        const int at = static_cast<int>(beat * 0.5 * fs);
+        for (int i = 0; i < 400; ++i)
+        {
+            const double t = i / fs;
+            x[static_cast<size_t>(at + i)] += static_cast<float>(
+                0.5 * std::exp(-80.0 * t) * (std::cos(twoPi<double> * 113.0 * t)
+                                             + 0.5 * std::cos(twoPi<double> * 2113.0 * t)));
+        }
+    }
+    BeatTracker<float> offline;
+    offline.prepare(AudioSpec{ fs, 512, 1 });
+    const float* p = x.data();
+    AudioBufferView<const float> v(&p, 1, static_cast<int>(x.size()));
+    const auto r = offline.analyze(v);
+    EXPECT_FALSE(r.beatSamples.empty());
+    if (!r.beatSamples.empty()) EXPECT_TRUE(r.beatSamples.front() >= 0);
+
+    const Corpus c = clickTrain(120.0, 12.0);
+    BeatTracker<float> causal;
+    causal.prepare(AudioSpec{ kFs, 512, 1 });
+    causal.setTempoRange(60.0f, 118.0f);
+    float highest = 0.0f;
+    for (size_t i = 0; i + 512 <= c.x.size(); i += 512)
+    {
+        causal.pushSamples(std::span<const float>(c.x.data() + i, 512));
+        highest = std::max(highest, causal.getRunningTempoBpm());
+    }
+    EXPECT_TRUE(highest <= 118.0f);
+}

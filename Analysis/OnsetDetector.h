@@ -136,8 +136,10 @@ public:
      * @brief Allocates all state and configures the STFT front-end.
      *
      * Not real-time safe (allocates). Any previous stream state is cleared.
-     * An invalid spec (non-finite or non-positive sample rate) is ignored,
-     * preserving the previous configuration.
+     * The method, threshold and whitening survive it, whether they were set
+     * before the first prepare() or between two. An invalid spec (non-finite or
+     * non-positive sample rate) is ignored, preserving the previous
+     * configuration.
      *
      * @param spec    Audio environment (only sampleRate is used; the detector
      *                is mono -- feed channel 0, or mix down before pushing).
@@ -285,12 +287,6 @@ public:
 
         resetState();
 
-        method_.store(Method::SuperFlux, std::memory_order_relaxed);
-        // A conservative default delta, tuned against a synthetic corpus of
-        // clicks, soft onsets and noise beds. Callers override per material.
-        threshold_.store(kDefaultDelta, std::memory_order_relaxed);
-        whitening_.store(false, std::memory_order_relaxed);
-
         prepared_ = true; // gate ON
     }
 
@@ -333,6 +329,10 @@ public:
     {
         return whitening_.load(std::memory_order_relaxed);
     }
+
+    /** @brief True when the last analysis frame computed bin phases. Only
+     *         ComplexDomain reads them; stream owner, like getLastOdfFrame(). */
+    [[nodiscard]] bool computesBinPhases() const noexcept { return binPhases_; }
 
     // -- Audio path (causal, RT-safe) ---------------------------------------
 
@@ -691,6 +691,7 @@ private:
     static constexpr int64_t kBig = int64_t(1) << 60;
     static constexpr T kDefaultDelta = T(0.03);
     static constexpr double kLocalizationLead = 0.34; ///< Flux-to-energy lead (fraction of N).
+    static constexpr int kPhaseRestartFrames = 3; ///< Frames phase prediction needs after a restart.
 
     struct PendingOnset
     {
@@ -720,7 +721,18 @@ private:
     /** @brief Evaluates the shared spectral and novelty kernels for one frame. */
     T computeOdf(Method method, bool whiten) noexcept
     {
-        spectrum_.compute(&ring_[static_cast<size_t>(writePos_)]);
+        // Phases cost more than the FFT, and only ComplexDomain reads them.
+        // Frames without them leave nothing to predict from, so selecting
+        // ComplexDomain mid-stream restarts the history, and its first frames
+        // are held back from the picker: they measure the restart, not audio.
+        const bool phases = method == Method::ComplexDomain;
+        if (phases && !binPhases_)
+        {
+            novelty_.reset();
+            lastOnsetFrame_ = frameIndex_ + kPhaseRestartFrames;
+        }
+        binPhases_ = phases;
+        spectrum_.compute(&ring_[static_cast<size_t>(writePos_)], phases);
         using FeatureMethod = typename detail::OnsetNovelty<T>::Method;
         const auto selected = method == Method::SpectralFlux ? FeatureMethod::SpectralFlux
                             : method == Method::ComplexDomain ? FeatureMethod::ComplexDomain
@@ -832,6 +844,7 @@ private:
         curRegisters_.fill(T(0));
         lastConfirmOdf_ = T(0);
         lastOnsetFrame_ = -kBig;
+        binPhases_ = true;
         pendingHead_ = 0;
         pendingCount_ = 0;
 
@@ -847,6 +860,7 @@ private:
     int localizationOffset_ = 0;
     int primeFrames_ = 12;
     bool prepared_ = false;
+    bool binPhases_ = true; ///< Nothing to restart until a frame skips them.
     detail::OnsetSpectrum<T> spectrum_;
     detail::OnsetNovelty<T> novelty_;
     std::vector<T> ring_; // Mirrored chronological input, size 2*fftSize.

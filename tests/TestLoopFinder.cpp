@@ -43,6 +43,11 @@ std::vector<std::vector<T>> plantedSource(int channels = 2)
     constexpr int start = 96;
     constexpr int end = 417;
     constexpr int window = 64;
+    constexpr int fade = 16;
+    // The seam is scored at the lag the render overlaps, period - fade, with
+    // the window centred on the overlap.
+    constexpr int head = start - (window - fade) / 2;
+    constexpr int tail = head + (end - start - fade);
     std::vector<std::vector<T>> audio(
         static_cast<std::size_t>(channels),
         std::vector<T>(samples, T(0)));
@@ -56,9 +61,9 @@ std::vector<std::vector<T>> plantedSource(int channels = 2)
                 static_cast<T>(0.24L * std::sin(phase)
                                + 0.08L * std::sin(2.17L * phase + 0.3L));
         }
-        std::copy_n(audio[static_cast<std::size_t>(ch)].begin() + start,
+        std::copy_n(audio[static_cast<std::size_t>(ch)].begin() + head,
                     window,
-                    audio[static_cast<std::size_t>(ch)].begin() + end - window);
+                    audio[static_cast<std::size_t>(ch)].begin() + tail);
     }
     return audio;
 }
@@ -105,19 +110,25 @@ struct ScalarCost
 template <typename T>
 ScalarCost<T> independentCost(const std::vector<std::vector<T>>& audio,
                               std::int64_t start, std::int64_t end,
-                              int window, long double activityFloor)
+                              int window, int fade, long double activityFloor)
 {
     const int channels = static_cast<int>(audio.size());
+    const std::int64_t room =
+        static_cast<std::int64_t>(audio.front().size()) - window;
+    const std::int64_t lag = std::min<std::int64_t>(end - start - fade, room);
+    const std::int64_t head = std::clamp<std::int64_t>(
+        start - (window - fade) / 2, 0, room - lag);
+    const std::int64_t tail = head + lag;
     long double scale = 0.0L;
     for (int ch = 0; ch < channels; ++ch)
         for (int i = 0; i < window; ++i)
         {
             scale = std::max(scale, std::abs(static_cast<long double>(
                 audio[static_cast<std::size_t>(ch)]
-                     [static_cast<std::size_t>(end - window + i)])));
+                     [static_cast<std::size_t>(tail + i)])));
             scale = std::max(scale, std::abs(static_cast<long double>(
                 audio[static_cast<std::size_t>(ch)]
-                     [static_cast<std::size_t>(start + i)])));
+                     [static_cast<std::size_t>(head + i)])));
         }
     if (scale == 0.0L) return {};
 
@@ -136,10 +147,10 @@ ScalarCost<T> independentCost(const std::vector<std::vector<T>>& audio,
         {
             a[static_cast<std::size_t>(i)] = static_cast<long double>(
                 audio[static_cast<std::size_t>(ch)]
-                     [static_cast<std::size_t>(end - window + i)]) / scale;
+                     [static_cast<std::size_t>(tail + i)]) / scale;
             b[static_cast<std::size_t>(i)] = static_cast<long double>(
                 audio[static_cast<std::size_t>(ch)]
-                     [static_cast<std::size_t>(start + i)]) / scale;
+                     [static_cast<std::size_t>(head + i)]) / scale;
             meanA += a[static_cast<std::size_t>(i)];
             meanB += b[static_cast<std::size_t>(i)];
         }
@@ -648,7 +659,7 @@ DSPARK_TEST(LoopFinder_exhaustive_oracle_matches_independent_scalar)
             if (period < minimumPeriod || period < minLoop || period > maxLoop)
                 continue;
             const auto scored = independentCost<double>(
-                audio, s, e, settings.comparisonLength,
+                audio, s, e, settings.comparisonLength, settings.crossfadeLength,
                 static_cast<long double>(settings.minimumActivityRms));
             if (!scored.admissible) continue;
             if (!found || scored.cost < bestCost
@@ -812,4 +823,56 @@ DSPARK_TEST(LoopFinder_determinism_and_monotonic_supersets)
     EXPECT_EQ(narrowed.end, reference.end);
     EXPECT_NEAR(narrowed.seamCost, reference.seamCost,
                 8.0 * std::numeric_limits<double>::epsilon());
+}
+
+// The seam was scored at lag period - comparisonLength while renderLoop()
+// overlaps at period - crossfadeLength, so the two differed by 192 samples here:
+// 4.5 periods of this tone. The old code reported a cost near zero for a loop
+// crossfading in antiphase (RMS min/max 0.28 at the default 1024/256 and
+// 1281.25 Hz, residual -22 dB). A loop filling the file has no room for the
+// render lag and is still scored, at the nearest lag that fits.
+DSPARK_TEST(LoopFinder_seam_is_scored_at_the_lag_the_render_overlaps)
+{
+    using Finder = LoopFinder<double>;
+    constexpr int samples = 24000;
+    std::vector<std::vector<double>> audio(1, std::vector<double>(samples));
+    for (int i = 0; i < samples; ++i)
+        audio[0][static_cast<std::size_t>(i)] =
+            0.5 * std::sin(2.0 * std::numbers::pi * 1125.0 * i / 48000.0);
+
+    Finder::Settings settings;
+    settings.comparisonLength = 256;
+    settings.crossfadeLength = 64;
+    settings.coarseStride = 16;
+    settings.refinementRadius = 15;
+    Finder finder;
+    const auto loop = finder.find(constView(audio), { 2048, 2303 }, { 16000, 16255 },
+                                  1, samples, settings);
+    EXPECT_TRUE(static_cast<bool>(loop));
+    const auto length = static_cast<std::size_t>(loop.renderedLength());
+    std::vector<std::vector<double>> cycle(1, std::vector<double>(length));
+    EXPECT_TRUE(Finder::renderLoop(constView(audio), loop, mutableView(cycle))
+                == Finder::Status::Success);
+
+    // RMS over three periods of the tone, around the repeating cycle.
+    constexpr std::size_t span = 128;
+    double lowest = std::numeric_limits<double>::max(), highest = 0.0;
+    for (std::size_t first = 0; first < length; first += 8)
+    {
+        double energy = 0.0;
+        for (std::size_t i = 0; i < span; ++i)
+        {
+            const double v = cycle[0][(first + i) % length];
+            energy += v * v;
+        }
+        lowest = std::min(lowest, energy);
+        highest = std::max(highest, energy);
+    }
+    EXPECT_GT(std::sqrt(lowest / highest), 0.95);
+
+    settings.maximumCost = 1.0;
+    const auto whole = finder.find(constView(audio), { 0, 0 }, { samples, samples },
+                                   1, samples, settings);
+    EXPECT_TRUE(static_cast<bool>(whole));
+    EXPECT_EQ(whole.end - whole.start, std::int64_t(samples));
 }

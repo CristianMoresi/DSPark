@@ -25,6 +25,8 @@
  * Frames are accumulated with EQUAL WEIGHT, not by energy. Krumhansl's input
  * vector is the total DURATION each pitch class sounds, so a loud passage must
  * not outvote a long one; each analysis frame is normalized before it is added.
+ * Within a frame the vote is the pitch class's MAGNITUDE, the square root of
+ * the front end's energy: energy would hand the frame to the loudest bass note.
  * Frames far below the loudest frame seen are dropped instead of normalized,
  * because normalizing near-silence turns its noise floor into a full-strength
  * chroma vote.
@@ -307,7 +309,8 @@ public:
      * @return Characters written, excluding the terminator.
      *
      * Spelling follows the framework's own convention for the tonic, so a key
-     * whose tonic is usually written flat is written flat.
+     * whose tonic is usually written flat is written flat. C# and G# minor keep
+     * their sharps: Db minor and Ab minor would need 8 and 7 flats.
      */
     static int getKeyName(const Key& key, char* dest, int size) noexcept
     {
@@ -319,8 +322,10 @@ public:
             dest[0] = '\0';
             return 0;
         }
+        const bool sharpMinor =
+            key.isMinor && (key.tonicPitchClass == 1 || key.tonicPitchClass == 8);
         const std::string_view root =
-            harmony::noteName(key.tonicPitchClass, key.tonicPitchClass);
+            harmony::noteName(key.tonicPitchClass, sharpMinor ? 0 : key.tonicPitchClass);
         int len = 0;
         for (char c : root)
         {
@@ -414,10 +419,20 @@ private:
 
         // Equal weight per frame: the input to the method is how LONG each
         // pitch class sounds, so a frame's own level must not scale its vote.
-        const double inv = 1.0 / total;
+        // Magnitudes, not energies: squared, one loud bass note outvotes the
+        // whole chord above it.
+        std::array<double, 12> magnitude {};
+        double magnitudeTotal = 0.0;
+        for (int pc = 0; pc < 12; ++pc)
+        {
+            magnitude[static_cast<std::size_t>(pc)] =
+                std::sqrt(static_cast<double>(frame[static_cast<std::size_t>(pc)]));
+            magnitudeTotal += magnitude[static_cast<std::size_t>(pc)];
+        }
+        const double inv = 1.0 / magnitudeTotal;
         for (int pc = 0; pc < 12; ++pc)
             accum_[static_cast<std::size_t>(pc)] +=
-                static_cast<double>(frame[static_cast<std::size_t>(pc)]) * inv;
+                magnitude[static_cast<std::size_t>(pc)] * inv;
         ++framesUsed_;
 
         estimate();

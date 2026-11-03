@@ -302,3 +302,40 @@ DSPARK_TEST(OfflineTempo_SearchEndpointsAndLocalTimingAvoidSpuriousFallback)
             }
         }
 }
+
+// Beats were read off the spectral window centre, without the flux-to-energy
+// lead OnsetDetector adds, so they sat early by 0.34 of a frame: -13.6 ms at
+// 48 kHz and -22.1 ms at 8 kHz, against +2.1 ms from BeatTracker on the same
+// audio. At 8 kHz and 400 BPM that shift alone failed the pulse anchors: the old
+// code marked 0 of 98 intervals reliable.
+DSPARK_TEST(OfflineTempo_beats_are_localized_like_the_tracker)
+{
+    for (const int rate : {8000, 48000})
+    {
+        auto audio = tempoFixture<float>(rate);
+        OfflineBufferSource<float> source(audio.toView(), rate, 1, 1, 0);
+        const auto result = OfflineTempoAnalyzer<float>().analyze(source);
+        EXPECT_TRUE(result.succeeded());
+        if (!result.succeeded())
+            continue;
+        double sum = 0;
+        int count = 0;
+        for (const auto &beat : result.analysis.beats())
+        {
+            const double beats = (static_cast<double>(beat.frame) / rate - 0.25) * 2;
+            sum += (beats - std::round(beats)) * 500;
+            ++count;
+        }
+        EXPECT_GT(count, 20);
+        EXPECT_NEAR(sum / std::max(1, count), 0.0, 5.0);
+    }
+
+    auto fast = tempoFixture<float>(8000, 2, false, 400);
+    OfflineBufferSource<float> source(fast.toView(), 8000, 1, 1, 0);
+    OfflineTempoAnalyzer<float>::Options options;
+    options.maximumBpm = 480;
+    const auto result = OfflineTempoAnalyzer<float>().analyze(source, options);
+    EXPECT_TRUE(result.succeeded());
+    if (result.succeeded())
+        EXPECT_GT(result.analysis.getReport().reliableIntervals, std::size_t(50));
+}

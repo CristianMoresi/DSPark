@@ -10,8 +10,9 @@
  * OFFLINE ONLY. Reuses BeatTracker's conditioning, metrical ranking and beat-grid
  * engine. Retained OfflineTransientAnalyzer features avoid another source scan
  * or FFT. This analyzer never owns audio. Beat positions are interpolated
- * spectral-feature centers, not exact acoustic attack boundaries; the separate
- * pulse map remains the source of event-local processing positions.
+ * spectral-feature positions, localized like BeatTracker's so both report the
+ * same grid, not exact acoustic attack boundaries; the separate pulse map
+ * remains the source of event-local processing positions.
  *
  * Threading: synchronous worker calls. Completed Analysis is immutable and
  * move-only; borrowed spans remain valid while its owner is alive and unmoved.
@@ -37,7 +38,7 @@ namespace dspark
 template <FloatType T> class OfflineTempoAnalyzer final
 {
   public:
-    static constexpr std::uint32_t algorithmRevision = 2;
+    static constexpr std::uint32_t algorithmRevision = 3;
     struct Options
     {
         double minimumBpm = 40, maximumBpm = 240; ///< Search range within 20..480 BPM.
@@ -130,7 +131,7 @@ template <FloatType T> class OfflineTempoAnalyzer final
                     typename OnsetDetector<T>::OdfFrame frame;
                     frame.value = frames[i].attack;
                     frame.registers = frames[i].registers;
-                    frame.referenceSample = features.featureCenter(i);
+                    frame.referenceSample = featureReference(features, i);
                     return frame;
                 },
                 options.minimumBpm, options.maximumBpm, 25, job);
@@ -217,6 +218,14 @@ template <FloatType T> class OfflineTempoAnalyzer final
     }
 
   private:
+    /** @brief Where a spectral frame localizes: its window center plus the
+     *  flux-to-energy lead the onset front end also adds. */
+    [[nodiscard]] static std::int64_t featureReference(
+        const typename OfflineTransientAnalyzer<T>::Analysis &features, std::size_t index) noexcept
+    {
+        return features.featureCenter(index) + std::llround(0.34 * features.frameSize());
+    }
+
     static void confirmLocalIntervals(
         const typename OfflineTransientAnalyzer<T>::Analysis &features, Analysis &candidate,
         detail::OfflineSession &job)
@@ -238,7 +247,7 @@ template <FloatType T> class OfflineTempoAnalyzer final
                     typename OnsetDetector<T>::OdfFrame frame;
                     frame.value = frames[begin + i].attack;
                     frame.registers = frames[begin + i].registers;
-                    frame.referenceSample = features.featureCenter(begin + i);
+                    frame.referenceSample = featureReference(features, begin + i);
                     return frame;
                 }, candidate.options_.minimumBpm, candidate.options_.maximumBpm, 25, job, &workspace);
             ++candidate.report_.localWindows;

@@ -539,7 +539,8 @@ namespace harmony
      * @brief Generates the diatonic chord built upon a specific degree of a scale.
      * @param sc Scale definition (assumes root=C internally).
      * @param degree The 0-based degree index inside the scale (0..6).
-     *               Out-of-range degrees return an empty DiatonicChord.
+     *               Out-of-range degrees return an empty DiatonicChord with
+     *               every interval -1.
      * @param level Which chord extensions to include.
      * @return A DiatonicChord object with the dynamically evaluated intervals and symbol.
      *
@@ -560,14 +561,21 @@ namespace harmony
     diatonicChord(const Scale& sc, Degree degree, ChordLevel level) noexcept
     {
         const auto deg = detail::activeDegrees(sc.mask);
-        if (degree < 0 || degree >= 7) return {}; // Invalid input protection
+        if (degree < 0 || degree >= 7) // Invalid input protection
+        {
+            DiatonicChord empty{};
+            empty.intervals.fill(-1);
+            return empty;
+        }
 
         const int third      = detail::interval(deg, degree, 2);
         const int fifth      = detail::interval(deg, degree, 4);
         const int seventh    = detail::interval(deg, degree, 6);
-        const int ninth      = detail::interval(deg, degree, 1);
-        const int eleventh   = detail::interval(deg, degree, 3);
-        const int thirteenth = detail::interval(deg, degree, 5);
+        // Compound intervals, the same convention as allChords: a ninth sits
+        // an octave above the second, not below the third.
+        const int ninth      = detail::interval(deg, degree, 1) + 12;
+        const int eleventh   = detail::interval(deg, degree, 3) + 12;
+        const int thirteenth = detail::interval(deg, degree, 5) + 12;
 
         DiatonicChord c{};
         c.intervals = {0, third, fifth,

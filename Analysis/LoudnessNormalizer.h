@@ -10,7 +10,10 @@
  * `normalize()` measures the complete programme, chooses one constant gain and
  * multiplies every sample of every channel by that same value exactly once.
  * A constant gain preserves the waveform, crest factor and spectral balance;
- * there is no limiter, envelope, lookahead, release or iterative processing.
+ * there is no limiter, envelope, lookahead, release or iterative processing of
+ * the audio. The absolute -70 LUFS gate means the loudness of quiet programmes
+ * does not scale with gain, so the gain is confirmed by measuring through it
+ * before anything is written, and corrected if the gate moved the result.
  * When the requested loudness and the true-peak ceiling conflict, the ceiling
  * wins and the result reports the signed loudness miss through `outLUFS`, the
  * requested and applied gains, and `ceilingLimited`.
@@ -32,7 +35,8 @@
  * non-finite rejection preserves NaN payloads and signs bit for bit.
  *
  * OFFLINE ONLY. The algorithm makes full-programme validation, measurement,
- * gain and verification passes. It uses zero bytes of programme-length scratch
+ * gain and verification passes, plus up to four measurement passes through the
+ * candidate gain. It uses zero bytes of programme-length scratch
  * and performs no allocation. Its fixed measurement state is
  * O(`MaxChannels * Annex2Taps`) for true-peak histories plus one constant-size
  * loudness meter, independent of programme duration.
@@ -202,7 +206,7 @@ public:
 
         const T target = targetLUFS_.load(std::memory_order_relaxed);
         const T ceilingDb = ceilingDb_.load(std::memory_order_relaxed);
-        const T requestedGainDb = target - measured;
+        const T requestedGainDb = gainReachingTarget(audio, sampleRate, target, measured);
         const T requestedLinear = decibelsToLinear(requestedGainDb);
         const T ceilingLinear = decibelsToLinear(ceilingDb);
         const T ceilingSafeLinear = static_cast<T>(
@@ -248,6 +252,9 @@ private:
     static constexpr T kMeterFloorLUFS = T(-99);
     static constexpr T kTargetToleranceLU = T(0.1);
     static constexpr double kCeilingAimMargin = 1.0e-4;
+    static constexpr T kGainSettledLU = T(0.01);
+    static constexpr int kMaxGainPasses = 4;
+    static constexpr int kProbeFrames = 1024;
 
     [[nodiscard]] static T decibelsToLinear(T decibels) noexcept
     {
@@ -274,6 +281,65 @@ private:
                            audio.getNumSamples());
         else
             meter_.process(audio.getChannel(0), audio.getNumSamples());
+        return meter_.getIntegratedLUFS();
+    }
+
+    /**
+     * @brief The gain that lands on the target, confirmed through the gate.
+     *
+     * Blocks below the absolute gate at the input can clear it at the output
+     * and pull the gated mean down, so target - measured is only a first
+     * guess. The best of a few measured candidates is returned; a programme
+     * clear of the gate settles on the first pass, unchanged.
+     */
+    template <int MaxChannels>
+    [[nodiscard]] T gainReachingTarget(const AudioBuffer<T, MaxChannels>& audio,
+                                       double sampleRate, T target, T measured) noexcept
+    {
+        T gainDb = target - measured;
+        T bestGainDb = gainDb;
+        T bestMiss = std::numeric_limits<T>::infinity();
+        for (int pass = 0; pass < kMaxGainPasses; ++pass)
+        {
+            const T level = measureIntegrated(audio, sampleRate, decibelsToLinear(gainDb));
+            if (!std::isfinite(level) || level <= kMeterFloorLUFS) break;
+            const T miss = target - level;
+            if (std::abs(miss) < bestMiss)
+            {
+                bestMiss = std::abs(miss);
+                bestGainDb = gainDb;
+            }
+            if (std::abs(miss) <= kGainSettledLU) break;
+            gainDb += miss;
+        }
+        return bestGainDb;
+    }
+
+    /** @brief Integrated loudness of the programme as if scaled by @p gain. */
+    template <int MaxChannels>
+    [[nodiscard]] T measureIntegrated(const AudioBuffer<T, MaxChannels>& audio,
+                                      double sampleRate, T gain) noexcept
+    {
+        const int numChannels = audio.getNumChannels();
+        const int numSamples = audio.getNumSamples();
+        meter_.prepare(sampleRate, std::min(numChannels, 2));
+        meter_.reset();
+        T left[kProbeFrames];
+        T right[kProbeFrames];
+        for (int first = 0; first < numSamples; first += kProbeFrames)
+        {
+            const int count = std::min(kProbeFrames, numSamples - first);
+            for (int i = 0; i < count; ++i)
+                left[i] = audio.getChannel(0)[first + i] * gain;
+            if (numChannels >= 2)
+            {
+                for (int i = 0; i < count; ++i)
+                    right[i] = audio.getChannel(1)[first + i] * gain;
+                meter_.process(left, right, count);
+            }
+            else
+                meter_.process(left, count);
+        }
         return meter_.getIntegratedLUFS();
     }
 

@@ -347,15 +347,12 @@ public:
             dest[0] = '\0';
             return 0;
         }
-        static constexpr const char* kRoots[12] = {
-            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
-        };
         static constexpr const char* kSuffix[11] = {
             "", "", "m", "dim", "aug", "sus2", "sus4", "7", "maj7", "m7", "m7b5"
         };
         int len = 0;
-        for (const char* p = kRoots[result.rootPitchClass]; *p && len < size - 1; ++p)
-            dest[len++] = *p;
+        for (const char c : harmony::noteName(result.rootPitchClass, result.rootPitchClass))
+            if (len < size - 1) dest[len++] = c;
         for (const char* p = kSuffix[static_cast<int>(result.type)]; *p && len < size - 1; ++p)
             dest[len++] = *p;
         dest[len] = '\0';

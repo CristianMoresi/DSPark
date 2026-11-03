@@ -683,9 +683,13 @@ void runSmokeTests()
             source[static_cast<size_t>(i)] = static_cast<float>(
                 0.4 * std::sin(2.0 * kPiConf * 0.019 * i)
                 + 0.1 * std::sin(2.0 * kPiConf * 0.077 * i + 0.3));
+        // Planted at the lag renderLoop() overlaps, period - crossfade, with
+        // the comparison window centred on the crossfade.
+        constexpr int plantedHead = plantedStart - (contextLength - 64) / 2;
+        constexpr int plantedTail = plantedHead + (plantedEnd - plantedStart - 64);
         for (int i = 0; i < contextLength; ++i)
-            source[static_cast<size_t>(plantedEnd - contextLength + i)] =
-                source[static_cast<size_t>(plantedStart + i)];
+            source[static_cast<size_t>(plantedTail + i)] =
+                source[static_cast<size_t>(plantedHead + i)];
 
         dspark::LoopFinder<float> finder;
         dspark::LoopFinder<float>::Settings settings;
@@ -2317,9 +2321,13 @@ void writeAnalysisAccuracy(FILE* out)
                 0.30 * std::sin(2.0 * kPiConf * 0.0173 * i)
                 + 0.12 * std::sin(2.0 * kPiConf * 0.0611 * i + 0.7)
                 + 0.05 * std::sin(2.0 * kPiConf * 0.1937 * i + 1.9));
+        // Planted at the lag renderLoop() overlaps, period - crossfade, with
+        // the comparison window centred on the crossfade.
+        constexpr int plantedHead = plantedStart - (contextLength - 128) / 2;
+        constexpr int plantedTail = plantedHead + (plantedEnd - plantedStart - 128);
         for (int i = 0; i < contextLength; ++i)
-            source[static_cast<size_t>(plantedEnd - contextLength + i)] =
-                source[static_cast<size_t>(plantedStart + i)];
+            source[static_cast<size_t>(plantedTail + i)] =
+                source[static_cast<size_t>(plantedHead + i)];
 
         dspark::LoopFinder<float> finder;
         dspark::LoopFinder<float>::Settings settings;

@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1060,4 +1061,31 @@ DSPARK_TEST(OfflineClip_LongLogicalSourceAndInvalidFormat)
     source.spec.channels = 3;
     EXPECT_TRUE(OfflineHardClipper<float>().analyze(source).status ==
                 OfflineStatus::UnsupportedLayout);
+}
+
+DSPARK_TEST(OfflineClip_float_tail_tolerance_shortens_padding)
+{
+    // Float output sizes its analysis padding for a 1e-9 omitted tail, double
+    // for 1e-10. On bright material the looser float bound needs less padding,
+    // which is where the soft curves spend their time.
+    using detail::ClipperCurve;
+    using FloatProcessor = detail::OfflineClipProcessor<float, true>;
+    using DoubleProcessor = detail::OfflineClipProcessor<double, true>;
+    EXPECT_EQ(FloatProcessor::kTailTolerance, 1e-9);
+    EXPECT_EQ(DoubleProcessor::kTailTolerance, 1e-10);
+    const double ceiling = std::pow(10., -12. / 20.);
+    std::uint32_t state = 7;
+    detail::offline_clip::TailCertificate source, shape;
+    for (int i = 0; i < 48000; ++i)
+    {
+        state = state * 1664525u + 1013904223u;
+        const double x = static_cast<double>(state >> 8) / 8388608. - 1.;
+        source.append(x);
+        shape.append(detail::clipperShape<ClipperCurve::Sine>(x, ceiling));
+    }
+    const detail::offline_clip::TailPolicy<ClipperCurve::Sine> policy(4);
+    const auto loose = policy.choose(ceiling, source, shape, FloatProcessor::kTailTolerance);
+    const auto tight = policy.choose(ceiling, source, shape, DoubleProcessor::kTailTolerance);
+    EXPECT_LT(loose.padding, tight.padding);
+    EXPECT_TRUE(loose.bound <= FloatProcessor::kTailTolerance);
 }

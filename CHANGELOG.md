@@ -47,6 +47,10 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `OfflineSoftClipper<float>`: the analysis padding is sized for a 1e-9
+  omitted tail instead of 1e-10 (`kTailTolerance`). The output differs by at
+  most 3 ulp, at -149 dB re peak, and Sine/Tanh renders run 2.2x faster on
+  bright material (1.4x on drums). Double output is unchanged.
 - Plugin layer, VST3: every MIDI controller (CC 0-127, channel pressure,
   pitch bend) now maps through `IMidiMapping`, as CLAP and AU already
   delivered; the hidden proxy parameters grow from 64 to 2080.

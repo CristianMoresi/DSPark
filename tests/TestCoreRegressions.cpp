@@ -51,7 +51,8 @@ constexpr bool kTimingReliable = true;
 constexpr bool kTimingReliable = true;
 #endif
 
-volatile double gRegSink = 0.0;
+// Only the timing checks read it, and those compile out in instrumented builds.
+[[maybe_unused]] volatile double gRegSink = 0.0;
 
 template <class F>
 double minNanoseconds(F&& f, int rounds = 15)

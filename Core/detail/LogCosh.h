@@ -2,24 +2,30 @@
 // Copyright (c) 2026 Cristian Moresi - MIT License
 #pragma once
 
+/** @file LogCosh.h
+ * @brief log(cosh(x)) and its integral, the antiderivatives the tanh
+ *        antialiasing (ADAA) kernels difference.
+ * Double only: the large-argument identity subtracts ln 2 from a value near
+ * it, which costs about 14 bits just above the series range; double keeps
+ * the absolute error near 1e-16 there, float would not.
+ * Threading: pure functions. Dependencies: C++20 standard library only.
+ */
 #include <cmath>
 
 namespace dspark::detail {
 
-/** Stable log(cosh(x)), shared by the tanh antiderivative kernels. */
-template <typename T>
-inline T logCosh(T x) noexcept
+/** @brief Stable log(cosh(x)), shared by the tanh antiderivative kernels. */
+inline double logCosh(double x) noexcept
 {
-    const T a = std::abs(x);
+    const double a = std::abs(x);
     // The usual large-argument identity subtracts nearly equal numbers
     // around zero. This series also preserves small-signal ADAA accuracy.
-    if (a < T(0.01))
+    if (a < 0.01)
     {
-        const T z = x * x;
-        return z * (T(0.5) + z * (T(-1.0 / 12.0)
-            + z * (T(1.0 / 45.0) + z * T(-17.0 / 2520.0))));
+        const double z = x * x;
+        return z * (0.5 + z * (-1.0 / 12.0 + z * (1.0 / 45.0 + z * (-17.0 / 2520.0))));
     }
-    return a + std::log1p(std::exp(T(-2) * a)) - T(0.6931471805599453);
+    return a + std::log1p(std::exp(-2.0 * a)) - 0.6931471805599453;
 }
 
 /** Integral of log(cosh(x)), with value zero at the origin.

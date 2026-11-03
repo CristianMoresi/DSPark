@@ -339,3 +339,45 @@ DSPARK_TEST(OfflineTempo_beats_are_localized_like_the_tracker)
     if (result.succeeded())
         EXPECT_GT(result.analysis.getReport().reliableIntervals, std::size_t(50));
 }
+
+DSPARK_TEST(OfflineTempo_AccountingAllocatorUsesCustomSourceOnlyAsAPair)
+{
+    // Memory from a custom allocate callback must be freed by the matching
+    // deallocate callback. An account that supplies only one of the two falls
+    // back to operator new and delete for both, so they still pair.
+    struct Source
+    {
+        int allocations = 0, deallocations = 0;
+    } source;
+    const auto allocate = [](void *context, std::size_t bytes, std::size_t) -> void * {
+        ++static_cast<Source *>(context)->allocations;
+        return ::operator new(bytes);
+    };
+    const auto deallocate = [](void *context, void *pointer, std::size_t, std::size_t) {
+        ++static_cast<Source *>(context)->deallocations;
+        ::operator delete(pointer);
+    };
+    {
+        detail::AllocationAccount onlyAllocate{&source, nullptr, allocate, nullptr};
+        std::vector<double, detail::AccountedAllocator<double>> values{
+            detail::AccountedAllocator<double>{&onlyAllocate}};
+        values.resize(64);
+    }
+    EXPECT_EQ(source.allocations, 0);
+    {
+        detail::AllocationAccount onlyDeallocate{&source, nullptr, nullptr, deallocate};
+        std::vector<double, detail::AccountedAllocator<double>> values{
+            detail::AccountedAllocator<double>{&onlyDeallocate}};
+        values.resize(64);
+    }
+    EXPECT_EQ(source.deallocations, 0);
+    {
+        detail::AllocationAccount pair{&source, nullptr, allocate, deallocate};
+        std::vector<double, detail::AccountedAllocator<double>> values{
+            detail::AccountedAllocator<double>{&pair}};
+        values.resize(64);
+        values.resize(4096);
+    }
+    EXPECT_GT(source.allocations, 0);
+    EXPECT_EQ(source.allocations, source.deallocations);
+}

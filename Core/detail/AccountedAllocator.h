@@ -28,6 +28,13 @@ struct AllocationAccount final
         if (request)
             request(context, bytes);
     }
+
+    /// A custom allocation source is used only as a pair: memory from one
+    /// allocate callback must never reach operator delete, or the reverse.
+    [[nodiscard]] bool hasSource() const noexcept
+    {
+        return allocate != nullptr && deallocate != nullptr;
+    }
 };
 
 // Charges the actual requested payload before allocating. Accounting may reject
@@ -58,7 +65,7 @@ template <typename T> class AccountedAllocator
         if (account_)
         {
             account_->charge(bytes);
-            if (account_->allocate)
+            if (account_->hasSource())
                 return static_cast<T *>(account_->allocate(account_->context, bytes, alignof(T)));
         }
         // Use the matching allocation primitive directly: some std::allocator
@@ -71,7 +78,7 @@ template <typename T> class AccountedAllocator
     }
     void deallocate(T *pointer, std::size_t count) noexcept
     {
-        if (account_ && account_->deallocate)
+        if (account_ && account_->hasSource())
         {
             account_->deallocate(account_->context, pointer, count * sizeof(T), alignof(T));
             return;

@@ -36,8 +36,15 @@
  *   and raw MIDI (notes, pitch bend, CC, pressure).
  * - HasTransport plugins receive the per-block clap transport as a
  *   TransportInfo; HasOfflineMode plugins get the render extension; a
- *   latency change after parameter motion notifies the host through
- *   clap_host_latency on the main thread (request_callback).
+ *   latency change after parameter motion asks the host for a restart
+ *   (request_callback, then request_restart on the main thread, as the
+ *   CLAP latency extension requires while active) and the new value is
+ *   reported through clap_host_latency from the next activate().
+ * - Threading: while active, main-thread edits (editor, state, presets)
+ *   are handed to the audio thread, which calls the user's setParameter at
+ *   its next process()/flush() - one writer, as DSPark setters require.
+ * - Notes: a NOTE_OFF/NOTE_CHOKE addressed with wildcards (-1) becomes one
+ *   NoteOff per matching note the plugin was told is sounding.
  * - Factory presets publish through preset-load + preset-discovery (the
  *   plugin DSO itself is the preset container; load keys are indices).
  * - process() runs under a DenormalGuard (FTZ/DAZ) so user DSP outside
@@ -55,6 +62,12 @@
 #include "../DSParkPlugin.h"
 
 #include "clap/clap.h"
+
+// Survive a <windows.h> included earlier without NOMINMAX (restored at the end).
+#pragma push_macro("min")
+#pragma push_macro("max")
+#undef min
+#undef max
 
 #include <algorithm>
 #include <atomic>
@@ -107,6 +120,17 @@ struct Plugin
     int currentChannels = defaultChannelCount<P>();   // selected ports config
     bool offlineRender = false;          // last render-extension setting
     std::atomic<bool> latencyDirty { false };   // audio -> main thread notify
+    int latencyAtActivate = 0;           // what the host last learned in activate()
+
+    /// True between activate() and deactivate(): process()/flush() may then
+    /// run on the audio thread at any moment, so main-thread edits (editor,
+    /// state, presets) go through `pending` and the audio thread calls the
+    /// user's setParameter - DSPark setters such as Equalizer::setBand allow
+    /// exactly one writer.
+    std::atomic<bool> active { false };
+    PendingParams<kNumParams> pending;
+    BlockEventList blockEvents;          // one block of host events (audio thread)
+    ActiveNotes sounding;                // for CLAP's wildcard note-off / choke
 
     std::atomic<double> shadow[kNumParams == 0 ? 1 : kNumParams] {};
     std::atomic<bool>   bypass { false };
@@ -166,20 +190,57 @@ struct Plugin
 
     static int indexOfParamId(uint32_t id) noexcept
     {
-        for (size_t i = 0; i < kNumParams; ++i)
-            if (hash32(P::parameters[i].id) == id) return static_cast<int>(i);
-        return -1;
+        return paramIndexOf<P>(id);
     }
 
-    /** Applies one factory preset: every parameter, by normalized value. */
+    /**
+     * A change made on the main thread (editor, state load, preset). While
+     * active only the shadow is written and the parameter is marked; the
+     * audio thread applies it at its next process() or flush(). The old code
+     * called setParameter here, concurrently with process(). Returns true
+     * when the change reached the DSP immediately.
+     */
+    bool applyFromUi(int index, double normalized) noexcept
+    {
+        if (normalized != normalized) return false;
+        if (active.load(std::memory_order_acquire))
+        {
+            shadow[static_cast<size_t>(index)].store(normalized, std::memory_order_relaxed);
+            pending.mark(static_cast<size_t>(index));
+            return false;
+        }
+        applyNormalized(index, normalized);
+        return true;
+    }
+
+    bool drainPending() noexcept
+    {
+        return pending.drain([this](int i) {
+            user.setParameter(i, static_cast<float>(toPlain(
+                P::parameters[static_cast<size_t>(i)],
+                shadow[static_cast<size_t>(i)].load(std::memory_order_relaxed))));
+        });
+    }
+
+    /** Asks the host for a process()/flush() so deferred values land even
+     *  while the transport is stopped. */
+    void requestParamFlush() noexcept
+    {
+        if (hostParams != nullptr && hostParams->request_flush != nullptr && host != nullptr)
+            hostParams->request_flush(host);
+    }
+
+    /** Applies one factory preset (main thread). */
     void applyFactoryPresetIdx(int idx) noexcept
     {
         if constexpr (kNumPresets > 0)
         {
             if (idx < 0 || idx >= kNumPresets) return;
+            bool direct = true;
             for (size_t i = 0; i < kNumParams; ++i)
-                applyNormalized(static_cast<int>(i), presetNormalized<P>(idx, i));
+                direct &= applyFromUi(static_cast<int>(i), presetNormalized<P>(idx, i));
             currentProgram.store(idx, std::memory_order_relaxed);
+            if (!direct) requestParamFlush();
         }
         else
             (void) idx;
@@ -187,7 +248,8 @@ struct Plugin
 
     /** Re-reads the plugin latency after parameter motion. The CLAP host
      *  must hear about it on the main thread, so a change only flags it and
-     *  requests a callback; sOnMainThread delivers clap_host_latency. */
+     *  requests a callback; sOnMainThread then asks for a restart (see
+     *  there) and activate() reports the new value. */
     void refreshLatency() noexcept
     {
         if constexpr (HasLatency<P>)
@@ -207,7 +269,7 @@ struct Plugin
      *  param events carry PLAIN values; raw MIDI covers what note events
      *  don't (pitch bend, CC, pressure). */
     void collectEvent(const clap_event_header_t* ev, uint32_t numSamples,
-                      BlockEvent* events, int& count) noexcept
+                      BlockEventList& events) noexcept
     {
         if (ev == nullptr || ev->space_id != CLAP_CORE_EVENT_SPACE_ID) return;
         BlockEvent out {};
@@ -222,6 +284,7 @@ struct Plugin
             if (pv->param_id == kBypassParamId)
             {
                 out.kind = BlockEvent::Kind::Bypass;
+                out.paramId = kBypassParamId;
                 out.value = pv->value;
             }
             else
@@ -236,17 +299,57 @@ struct Plugin
         }
         else if constexpr (HasMidi<P>)
         {
-            if (ev->type == CLAP_EVENT_NOTE_ON || ev->type == CLAP_EVENT_NOTE_OFF)
+            out.kind = BlockEvent::Kind::Midi;
+            if (ev->type == CLAP_EVENT_NOTE_ON || ev->type == CLAP_EVENT_NOTE_OFF
+                || ev->type == CLAP_EVENT_NOTE_CHOKE)
             {
                 const auto* note = reinterpret_cast<const clap_event_note_t*>(ev);
-                out.kind = BlockEvent::Kind::Midi;
-                out.midi.type = ev->type == CLAP_EVENT_NOTE_ON
-                              ? MidiEvent::Type::NoteOn : MidiEvent::Type::NoteOff;
-                out.midi.channel = static_cast<uint8_t>(
-                    note->channel >= 0 ? note->channel & 0x0F : 0);
-                out.midi.note = static_cast<uint8_t>(
-                    note->key >= 0 ? note->key & 0x7F : 0);
-                out.midi.value = static_cast<float>(note->velocity);
+                if (ev->type == CLAP_EVENT_NOTE_ON)
+                {
+                    if ((note->key < 0) || (note->key > 127)) return;   // no voice to start
+                    const int ch = note->channel >= 0 ? (note->channel & 0x0F) : 0;
+                    out.midi.type = MidiEvent::Type::NoteOn;
+                    out.midi.channel = static_cast<uint8_t>(ch);
+                    out.midi.note = static_cast<uint8_t>(note->key);
+                    out.midi.value = static_cast<float>(note->velocity);
+                    sounding.noteOn(ch, note->key, note->note_id);
+                }
+                else
+                {
+                    // NOTE_OFF and NOTE_CHOKE address notes by (channel, key,
+                    // note id), each part possibly the wildcard -1. Every
+                    // sounding note the address matches gets its NoteOff (a
+                    // choke too: the closest MidiEvent says "stop this
+                    // voice"). The old code read -1 as channel 0 / key 0 and
+                    // dropped chokes, so a wildcard note-off released nothing
+                    // and choked voices rang on.
+                    const float velocity = ev->type == CLAP_EVENT_NOTE_OFF
+                                         ? static_cast<float>(note->velocity) : 0.0f;
+                    const bool exact = note->channel >= 0 && note->key >= 0;
+                    if (exact)
+                    {
+                        // A precise off is delivered even for a note the
+                        // tracker never saw (its on may predate an overflow).
+                        sounding.noteOff(note->channel & 0x0F, note->key & 0x7F);
+                        out.midi.type = MidiEvent::Type::NoteOff;
+                        out.midi.channel = static_cast<uint8_t>(note->channel & 0x0F);
+                        out.midi.note = static_cast<uint8_t>(note->key & 0x7F);
+                        out.midi.value = velocity;
+                    }
+                    else
+                    {
+                        sounding.releaseMatching(note->channel, note->key, note->note_id,
+                            [&](int c, int k) {
+                                BlockEvent off = out;
+                                off.midi.type = MidiEvent::Type::NoteOff;
+                                off.midi.channel = static_cast<uint8_t>(c);
+                                off.midi.note = static_cast<uint8_t>(k);
+                                off.midi.value = velocity;
+                                events.add(off);
+                            });
+                        return;
+                    }
+                }
             }
             else if (ev->type == CLAP_EVENT_MIDI)
             {
@@ -255,7 +358,6 @@ struct Plugin
                 const uint8_t channel = midi->data[0] & 0x0Fu;
                 const uint8_t d1 = midi->data[1] & 0x7Fu;
                 const uint8_t d2 = midi->data[2] & 0x7Fu;
-                out.kind = BlockEvent::Kind::Midi;
                 out.midi.channel = channel;
                 switch (status)
                 {
@@ -264,11 +366,14 @@ struct Plugin
                                            : MidiEvent::Type::NoteOff;
                     out.midi.note = d1;
                     out.midi.value = static_cast<float>(d2) / 127.0f;
+                    if (d2 > 0) sounding.noteOn(channel, d1, -1);
+                    else sounding.noteOff(channel, d1);
                     break;
                 case 0x80:
                     out.midi.type = MidiEvent::Type::NoteOff;
                     out.midi.note = d1;
                     out.midi.value = static_cast<float>(d2) / 127.0f;
+                    sounding.noteOff(channel, d1);
                     break;
                 case 0xA0:
                     out.midi.type = MidiEvent::Type::PolyPressure;
@@ -299,17 +404,19 @@ struct Plugin
         else
             return;
 
-        if (count < kMaxBlockEvents) events[count++] = out;
-        else events[kMaxBlockEvents - 1] = out;
+        // Past the capacity an intermediate parameter point gives way; the
+        // old code overwrote the last slot, losing every event but the final
+        // one - note-offs and final parameter values included.
+        events.add(out);
     }
 
     void collectEvents(const clap_input_events_t* in, uint32_t numSamples,
-                       BlockEvent* events, int& count) noexcept
+                       BlockEventList& events) noexcept
     {
         if (in == nullptr) return;
         const uint32_t n = in->size(in);
         for (uint32_t i = 0; i < n; ++i)
-            collectEvent(in->get(in, i), numSamples, events, count);
+            collectEvent(in->get(in, i), numSamples, events);
     }
 
     /** Applies one event; @p blockStart rebases MIDI offsets onto the next
@@ -467,6 +574,7 @@ struct Plugin
         s->user.prepare(spec);
         if constexpr (HasOfflineMode<P>)
             s->user.setOfflineRendering(s->offlineRender);
+        s->pending.drain([](int) {});   // every value is re-applied right below
         for (size_t i = 0; i < kNumParams; ++i)
             s->user.setParameter(static_cast<int>(i),
                 static_cast<float>(toPlain(P::parameters[i],
@@ -476,18 +584,33 @@ struct Plugin
         if constexpr (HasSidechain<P>)
             s->silence.assign(maxFrames, 0.0f);
         s->bypassMix = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        s->sounding.clear();
         if constexpr (HasLatency<P>)
         {
             const int latency = s->user.getLatency();
             s->cachedLatency.store(latency, std::memory_order_relaxed);
             s->dryDelay.prepare(std::max(2 * latency, kDryDelayMinCapacity),
                                 static_cast<int>(maxFrames));
+            // clap_host_latency.changed is [main-thread & being-activated]:
+            // this is the one place it may be called.
+            s->latencyDirty.store(false, std::memory_order_relaxed);
+            if (latency != s->latencyAtActivate && s->hostLatency != nullptr
+                && s->hostLatency->changed != nullptr)
+                s->hostLatency->changed(s->host);
+            s->latencyAtActivate = latency;
         }
         s->prepared = true;
+        s->active.store(true, std::memory_order_release);
         return true;
     }
 
-    static void sDeactivate(const clap_plugin_t*) noexcept {}
+    static void sDeactivate(const clap_plugin_t* p) noexcept
+    {
+        auto* s = self(p);
+        s->active.store(false, std::memory_order_release);
+        s->drainPending();   // no process()/flush() can run now (main thread)
+    }
+
     static bool sStartProcessing(const clap_plugin_t*) noexcept { return true; }
     static void sStopProcessing(const clap_plugin_t*) noexcept {}
 
@@ -497,7 +620,27 @@ struct Plugin
         if constexpr (HasReset<P>)
             s->user.reset();
         s->dryDelay.reset();
+        s->sounding.clear();
         s->bypassMix = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+    }
+
+    /** Crossfades @p length output frames (from @p outStart) toward the dry
+     *  copy (from @p dryStart) at the current bypass target. */
+    void blendBypass(float* const* out, float* const* dry, uint32_t nCh, int outStart,
+                     int dryStart, int length) noexcept
+    {
+        const float target = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        if (bypassMix == target && target == 0.0f) return;
+        const float step = 1.0f / static_cast<float>(kBypassRampSamples);
+        float mix = bypassMix;
+        for (int i = 0; i < length; ++i)
+        {
+            mix += (target > mix) ? step : ((target < mix) ? -step : 0.0f);
+            mix = mix < 0.0f ? 0.0f : (mix > 1.0f ? 1.0f : mix);
+            for (uint32_t ch = 0; ch < nCh; ++ch)
+                out[ch][outStart + i] += (dry[ch][dryStart + i] - out[ch][outStart + i]) * mix;
+        }
+        bypassMix = mix;
     }
 
     static clap_process_status sProcess(const clap_plugin_t* p,
@@ -515,17 +658,34 @@ struct Plugin
 
         const uint32_t n = process->frames_count;
 
-        BlockEvent events[kMaxBlockEvents];
-        int eventCount = 0;
-        s->collectEvents(process->in_events, n, events, eventCount);
-        sortBlockEvents(events, eventCount);
+        // Main-thread edits handed over since the last block go first, so
+        // the host's own events below still win.
+        bool paramsChanged = s->drainPending();
 
-        bool paramsChanged = false;
+        BlockEventList& events = s->blockEvents;
+        events.clear();
+        s->collectEvents(process->in_events, n, events);
+        events.sort();
+        const int eventCount = events.size();
 
-        const bool canRender = n > 0 && s->prepared
-            && process->audio_outputs_count >= 1
-            && process->audio_outputs[0].data32 != nullptr
-            && process->audio_outputs[0].channel_count >= 1;
+        const clap_audio_buffer_t* outPort =
+            process->audio_outputs_count >= 1 && process->audio_outputs != nullptr
+                ? &process->audio_outputs[0] : nullptr;
+        float** out = outPort != nullptr ? outPort->data32 : nullptr;
+        const uint32_t width = static_cast<uint32_t>(s->currentChannels);
+        uint32_t nCh = out == nullptr ? 0u
+                     : (outPort->channel_count < width ? outPort->channel_count : width);
+        // Degenerate hosts: stop at the first missing channel pointer (the
+        // old trim only looked at the last one and wrote through a null left
+        // channel next to a valid right one).
+        for (uint32_t ch = 0; ch < nCh; ++ch)
+            if (out[ch] == nullptr)
+            {
+                nCh = ch;
+                break;
+            }
+
+        const bool canRender = n > 0 && s->prepared && nCh >= 1;
         if (!canRender)
         {
             for (int i = 0; i < eventCount; ++i)
@@ -536,15 +696,8 @@ struct Plugin
 
         s->forwardTransport(process->transport);
 
-        auto& outPort = process->audio_outputs[0];
-        float** out = outPort.data32;
-        const uint32_t width = static_cast<uint32_t>(s->currentChannels);
-        uint32_t nCh = outPort.channel_count < width
-                     ? outPort.channel_count : width;
-        while (nCh > 0 && out[nCh - 1] == nullptr) --nCh;   // degenerate hosts
-        if (nCh < 1) return CLAP_PROCESS_CONTINUE;
-
         const bool haveIn = !kIsInstrument && process->audio_inputs_count >= 1
+                         && process->audio_inputs != nullptr
                          && process->audio_inputs[0].data32 != nullptr
                          && process->audio_inputs[0].channel_count >= 1;
         float** in = haveIn ? process->audio_inputs[0].data32 : nullptr;
@@ -584,19 +737,20 @@ struct Plugin
             // Dry copy for the bypass blend; instruments start cleared (voices
             // ADD) and bypass toward silence (their dry vectors stay zero).
             // Output channels past a narrower input port repeat its last one.
+            // An effect whose input is missing processes silence: the old
+            // code fell back to the output buffer, feeding the host's stale
+            // output back in as input.
             const size_t bytes = sizeof(float) * static_cast<size_t>(len);
             for (uint32_t ch = 0; ch < nCh; ++ch)
             {
-                if (kIsInstrument)
+                const float* src = nullptr;
+                if (!kIsInstrument && haveIn)
+                    src = in[ch < inCh ? ch : inCh - 1];
+                if (src == nullptr)
                 {
                     std::memset(out[ch] + c0, 0, bytes);
+                    if (!kIsInstrument) std::memset(dry[ch], 0, bytes);
                     continue;
-                }
-                const float* src = out[ch];
-                if (haveIn)
-                {
-                    const float* x = in[ch < inCh ? ch : inCh - 1];
-                    if (x != nullptr) src = x;
                 }
                 std::memcpy(dry[ch], src + c0, bytes);
                 if (out[ch] != src)
@@ -630,6 +784,10 @@ struct Plugin
                 }
                 else
                     s->user.processBlock(view);
+                // Soft bypass toward the (latency-aligned) dry signal, per
+                // segment: the crossfade starts where the bypass event lands
+                // (the old once-per-block blend started it at sample 0).
+                s->blendBypass(out, dry, nCh, start, start - c0, length);
             };
 
             if (!sampleAccurateOf<P>())
@@ -659,22 +817,6 @@ struct Plugin
                     processSegment(pos, next - pos);
                     pos = next;
                 }
-            }
-
-            // Soft bypass toward the (latency-aligned) dry signal.
-            const float target = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
-            if (s->bypassMix != target || target > 0.0f)
-            {
-                const float step = 1.0f / static_cast<float>(kBypassRampSamples);
-                float mix = s->bypassMix;
-                for (int i = 0; i < len; ++i)
-                {
-                    mix += (target > mix) ? step : ((target < mix) ? -step : 0.0f);
-                    mix = mix < 0.0f ? 0.0f : (mix > 1.0f ? 1.0f : mix);
-                    for (uint32_t ch = 0; ch < nCh; ++ch)
-                        out[ch][c0 + i] += (dry[ch][i] - out[ch][c0 + i]) * mix;
-                }
-                s->bypassMix = mix;
             }
         }
         for (; evIdx < eventCount; ++evIdx)   // safety: events at block end
@@ -725,10 +867,20 @@ struct Plugin
     static void sOnMainThread(const clap_plugin_t* p) noexcept
     {
         // Deferred latency notification (the audio thread only flags it).
+        // clap_host_latency.changed is [main-thread & being-activated]: while
+        // active the plugin must ask for a restart instead, and the host's
+        // deactivate/activate cycle then lets activate() report the new
+        // value. The old code called changed() here, outside activation,
+        // which a conforming host ignores - the delay compensation never
+        // followed a lookahead change. (nih-plug and DPF request a restart.)
         auto* s = self(p);
-        if (s->latencyDirty.exchange(false, std::memory_order_acq_rel)
-            && s->hostLatency != nullptr && s->hostLatency->changed != nullptr)
-            s->hostLatency->changed(s->host);
+        if (!s->latencyDirty.exchange(false, std::memory_order_acq_rel)) return;
+        if (s->active.load(std::memory_order_acquire))
+        {
+            if (s->host != nullptr && s->host->request_restart != nullptr)
+                s->host->request_restart(s->host);
+        }
+        // Inactive: the next activate() reports the latency itself.
     }
 
     // --- ext: audio ports ---------------------------------------------------------
@@ -933,6 +1085,20 @@ struct Plugin
         return static_cast<uint32_t>(kNumParams) + 1;   // + Bypass
     }
 
+    /** True when every position of a discrete parameter is a whole number
+     *  and neighbours are exactly one apart (what CLAP_PARAM_IS_STEPPED
+     *  promises a host). */
+    static constexpr bool isIntegerGrid(const Param& spec) noexcept
+    {
+        auto whole = [](double v) {
+            const double r = static_cast<double>(static_cast<long long>(v < 0.0 ? v - 0.5
+                                                                             : v + 0.5));
+            return v - r < 1e-9 && r - v < 1e-9;
+        };
+        const double step = (static_cast<double>(spec.maxValue) - spec.minValue) / spec.steps;
+        return whole(spec.minValue) && step > 1.0 - 1e-9 && step < 1.0 + 1e-9;
+    }
+
     static bool sParamInfo(const clap_plugin_t*, uint32_t index,
                            clap_param_info_t* info) noexcept
     {
@@ -953,7 +1119,12 @@ struct Plugin
         info->id = hash32(spec.id);
         std::snprintf(info->name, sizeof(info->name), "%s", spec.name);
         info->flags = CLAP_PARAM_IS_AUTOMATABLE;
-        if (spec.steps > 0) info->flags |= CLAP_PARAM_IS_STEPPED;
+        // CLAP_PARAM_IS_STEPPED means "integer values only": hosts truncate.
+        // Only a grid of whole numbers one apart qualifies (toggles, choices,
+        // stepped 1..8). A finer or coarser grid stays continuous for the
+        // host and is snapped by the wrapper; flagging it (the old code)
+        // made a 5-position 0..1 control offer two positions.
+        if (spec.steps > 0 && isIntegerGrid(spec)) info->flags |= CLAP_PARAM_IS_STEPPED;
         if (spec.labels != nullptr) info->flags |= CLAP_PARAM_IS_ENUM;
         info->min_value = spec.minValue;
         info->max_value = spec.maxValue;
@@ -1015,12 +1186,15 @@ struct Plugin
                             const clap_output_events_t* out) noexcept
     {
         auto* s = self(p);
-        BlockEvent events[kMaxBlockEvents];
-        int eventCount = 0;
-        s->collectEvents(in, 0, events, eventCount);
-        sortBlockEvents(events, eventCount);
-        bool paramsChanged = false;
-        for (int i = 0; i < eventCount; ++i)
+        // [active ? audio-thread : main-thread], never concurrent with
+        // process(): the place deferred main-thread edits land while the
+        // transport is stopped.
+        bool paramsChanged = s->drainPending();
+        BlockEventList& events = s->blockEvents;
+        events.clear();
+        s->collectEvents(in, 0, events);
+        events.sort();
+        for (int i = 0; i < events.size(); ++i)
             paramsChanged |= s->applyBlockEvent(events[i], events[i].offset);
         if (paramsChanged) s->refreshLatency();
 #if defined(DSPARK_PLUGIN_WEBVIEW)
@@ -1069,23 +1243,30 @@ struct Plugin
             if (got < 0) return false;
             if (got == 0) break;
             blob.insert(blob.end(), chunk, chunk + got);
-            if (blob.size() > (16u << 20)) return false;
+            // Only an endless hostile stream is refused: the old 16 MiB cap
+            // rejected states this plugin's own save() had written.
+            if (blob.size() > kMaxStateBytes) return false;
         }
+        // Parameters the blob does not carry take their DEFAULTS (the old
+        // code kept whatever value the instance happened to hold).
         double norm[kNumParams == 0 ? 1 : kNumParams];
-        for (size_t i = 0; i < kNumParams; ++i)
-            norm[i] = s->shadow[i].load(std::memory_order_relaxed);
+        loadDefaultNormalized<P>(norm);
         int program = -1;
         int bypassState = -1;
         if (!applyState(s->user, blob.data(), blob.size(), norm, &program,
                         &bypassState))
             return false;
+        bool direct = true;
         for (size_t i = 0; i < kNumParams; ++i)
-            s->applyNormalized(static_cast<int>(i), norm[i]);
+            direct &= s->applyFromUi(static_cast<int>(i), norm[i]);
         if (kNumPresets > 0 && program >= 0 && program < kNumPresets)
             s->currentProgram.store(program, std::memory_order_relaxed);
         if (bypassState >= 0)
             s->bypass.store(bypassState != 0, std::memory_order_relaxed);
-        s->refreshLatency();   // restored state may imply a new lookahead
+        if (direct)
+            s->refreshLatency();   // restored state may imply a new lookahead
+        else
+            s->requestParamFlush();   // the audio thread applies it, then re-reads
         return true;
     }
 
@@ -1145,7 +1326,11 @@ struct Plugin
         auto* s = static_cast<Plugin*>(context);
         const Param& spec = P::parameters[static_cast<size_t>(index)];
         const double normalized = toNormalized(spec, plain);
-        s->applyNormalized(index, normalized);
+        // While active the audio thread applies the edit (and re-reads the
+        // latency there); inactive, it lands now - and the latency must be
+        // re-read here, which the old code never did for editor edits.
+        if (s->applyFromUi(index, normalized))
+            s->refreshLatency();
         const double snapped = toPlain(spec, normalized);
         const uint32_t id = hash32(spec.id);
         if (s->guiEditActive[static_cast<size_t>(index)])
@@ -1617,3 +1802,6 @@ struct Factory
         &dspark::plugin::clap_backend::Factory<PluginClass>::sEntryDeinit,         \
         &dspark::plugin::clap_backend::Factory<PluginClass>::sEntryGetFactory      \
     };
+
+#pragma pop_macro("max")
+#pragma pop_macro("min")

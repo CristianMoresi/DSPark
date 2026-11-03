@@ -484,7 +484,7 @@
  *
  * - **Zero external dependencies** - C++20 standard library only.
  * - **Real-time interfaces** - No allocations, locks or syscalls in audio-callback processing; explicitly offline jobs run on workers.
- * - **Thread-safe** - All parameter setters use `std::atomic` with `memory_order_relaxed`, callable from any thread with zero contention.
+ * - **Thread-safe** - Parameter setters publish through atomics (relaxed single words, or a seqlock for multi-word sets such as an EQ band) from ONE control thread while the audio thread processes; see docs/threading.md for the per-method contract.
  * - **Cache-friendly** - Contiguous memory, 32-byte aligned buffers (SIMD-ready).
  * - **Multiplatform** - Windows, macOS, Linux, WebAssembly, iOS, Android.
  * - **Header-only** - No build system, no compilation, just `#include`.
@@ -664,6 +664,15 @@
  *
  */
 
+// <windows.h> included without NOMINMAX defines function-like min/max
+// macros that break every std::min/std::max and numeric_limits<T>::max()
+// in the headers below. Park them for the length of the umbrella and
+// restore them at its end, so `#include <windows.h>` first keeps working.
+#pragma push_macro("min")
+#pragma push_macro("max")
+#undef min
+#undef max
+
 // === Core ===================================================================
 
 #include "Core/SimdOps.h"
@@ -803,3 +812,6 @@
 #include "Music/HarmonyConstants.h"
 #include "Music/ChordDetector.h"
 #include "Music/KeyDetector.h"
+
+#pragma pop_macro("max")
+#pragma pop_macro("min")

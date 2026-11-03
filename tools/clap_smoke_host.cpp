@@ -70,6 +70,11 @@ struct SmokeHost
     bool latencyChangedSeen = false;
     bool presetLoadedSeen = false;
     bool callbackRequested = false;
+    // clap_host_latency.changed is [main-thread & being-activated]: count
+    // calls made outside activate() (a conforming host ignores them).
+    bool activating = false;
+    int latencyChangedOutsideActivate = 0;
+    bool restartRequested = false;
 
     static SmokeHost* self(const clap_host_t* h)
     {
@@ -79,6 +84,7 @@ struct SmokeHost
     static void sLatencyChanged(const clap_host_t* h)
     {
         self(h)->latencyChangedSeen = true;
+        if (!self(h)->activating) ++self(h)->latencyChangedOutsideActivate;
     }
     static void sParamsRescan(const clap_host_t*, clap_param_rescan_flags) {}
     static void sParamsClear(const clap_host_t*, clap_id, clap_param_clear_flags) {}
@@ -108,7 +114,7 @@ struct SmokeHost
             return &kPresetLoad;
         return nullptr;
     }
-    static void sRequestRestart(const clap_host_t*) {}
+    static void sRequestRestart(const clap_host_t* h) { self(h)->restartRequested = true; }
     static void sRequestProcess(const clap_host_t*) {}
     static void sRequestCallback(const clap_host_t* h)
     {
@@ -212,6 +218,21 @@ struct EventList
         ev.note_id = -1;
         ev.port_index = 0;
         ev.channel = 0;
+        ev.key = key;
+        ev.velocity = 0.0;
+        push(ev);
+    }
+    /// A note event with an explicit (channel, key) address, -1 = wildcard.
+    void note(uint16_t type, int16_t channel, int16_t key, uint32_t time)
+    {
+        clap_event_note_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = type;
+        ev.note_id = -1;
+        ev.port_index = -1;
+        ev.channel = channel;
         ev.key = key;
         ev.velocity = 0.0;
         push(ev);
@@ -416,7 +437,13 @@ int main(int argc, char** argv)
         plugin->get_extension(plugin, CLAP_EXT_LATENCY));
     expect(latency != nullptr, "latency extension");
 
-    expect(plugin->activate(plugin, 48000.0, 32, 512), "activate");
+    auto activatePlugin = [&]() {
+        smokeHost.activating = true;
+        const bool ok = plugin->activate(plugin, 48000.0, 32, 512);
+        smokeHost.activating = false;
+        return ok;
+    };
+    expect(activatePlugin(), "activate");
     expect(plugin->start_processing(plugin), "start_processing");
 
     std::vector<float> inL(512), inR(512), outL(512), outR(512);
@@ -664,15 +691,26 @@ int main(int argc, char** argv)
         events.noteOff(69, 0);
         processOnce();
 
-        // 6) Latency change: flipping the lookahead toggle must request a
-        //    main-thread callback and notify clap_host_latency.
+        // 6) Latency change while active: the CLAP latency extension allows
+        //    clap_host_latency.changed only inside activate(), so the plugin
+        //    must request a restart; the host's deactivate/activate cycle
+        //    then reports the new value. The old wrapper called changed()
+        //    from on_main_thread while active, which conforming hosts ignore.
         expect(latency->get(plugin) == 0, "initial latency is 0");
         smokeHost.latencyChangedSeen = false;
+        smokeHost.latencyChangedOutsideActivate = 0;
+        smokeHost.restartRequested = false;
         events.paramValue(lookaheadId, 1.0, 0);
         processOnce();
         expect(smokeHost.callbackRequested, "latency change requests a callback");
-        expect(smokeHost.latencyChangedSeen,
-               "latency change notifies clap_host_latency");
+        expect(smokeHost.restartRequested && smokeHost.latencyChangedOutsideActivate == 0,
+               "latency change while active requests a restart, not latency.changed");
+        plugin->stop_processing(plugin);
+        plugin->deactivate(plugin);
+        expect(activatePlugin(), "re-activate after the restart request");
+        plugin->start_processing(plugin);
+        expect(smokeHost.latencyChangedSeen && smokeHost.latencyChangedOutsideActivate == 0,
+               "the new latency is reported from activate()");
         expect(latency->get(plugin) == 64, "new latency is reported");
         events.paramValue(lookaheadId, 0.0, 0);
         processOnce();
@@ -695,7 +733,7 @@ int main(int argc, char** argv)
             expect(ports->get(plugin, 0, true, &monoInfo)
                        && monoInfo.channel_count == 1,
                    "ports report mono after select");
-            expect(plugin->activate(plugin, 48000.0, 32, 512), "re-activate mono");
+            expect(activatePlugin(), "re-activate mono");
             plugin->start_processing(plugin);
             inBufs[0].channel_count = 1;
             outBuf.channel_count = 1;
@@ -709,7 +747,7 @@ int main(int argc, char** argv)
             portsConfig->select(plugin, 2);   // back to stereo
             inBufs[0].channel_count = 2;
             outBuf.channel_count = 2;
-            plugin->activate(plugin, 48000.0, 32, 512);
+            activatePlugin();
             plugin->start_processing(plugin);
         }
 
@@ -809,6 +847,126 @@ int main(int argc, char** argv)
                    "mono input port feeds both output channels");
             inBufs[0].data32 = inCh;
             inBufs[0].channel_count = 2;
+        }
+        // 12) More than 256 events in one block: 300 gain points, a note-off
+        //     and a later gain point. Every note event and every parameter's
+        //     final value must survive. The old list overwrote its last slot
+        //     on overflow, so the note-off was replaced by the gain point
+        //     after it and the voice rang on.
+        {
+            fillInput(1.0f);
+            events.paramValue(gainId, 1.0, 0);
+            events.noteOn(60, 1.0, 0);
+            processOnce();
+            for (uint32_t t = 0; t < 300; ++t) events.paramValue(gainId, 0.25, t);
+            events.noteOff(60, 400);
+            events.paramValue(gainId, 0.75, 450);
+            processOnce();
+            processOnce();
+            double worst = 0.0;
+            for (int i = 0; i < 512; ++i)
+                worst = std::fmax(worst, std::fabs(outL[static_cast<size_t>(i)] - 0.75));
+            std::printf("      overflow block: mean %.4f (expected 0.75), worst deviation %.3g\n",
+                        outMean(), worst);
+            expect(std::fabs(outMean() - 0.75) < 1e-3,
+                   "event overflow keeps every parameter's final value");
+            expect(worst < 1e-3, "event overflow keeps the note-off (no stuck voice)");
+        }
+
+        // 13) Wildcard NOTE_OFF (channel -1, key -1) releases every sounding
+        //     note; NOTE_CHOKE stops its note. The old wrapper read -1 as
+        //     channel 0 / key 0 and ignored chokes, so both voices rang on.
+        {
+            fillInput(0.0f);
+            auto voiceEnergy = [&]() {
+                double e = 0.0;
+                for (int i = 0; i < 512; ++i)
+                    e += static_cast<double>(outL[static_cast<size_t>(i)]) * outL[static_cast<size_t>(i)];
+                return e;
+            };
+            events.noteOn(64, 1.0, 0);
+            processOnce();
+            const double sounding = voiceEnergy();
+            events.note(CLAP_EVENT_NOTE_OFF, -1, -1, 0);
+            processOnce();
+            processOnce();
+            std::printf("      wildcard note-off: energy %.3g -> %.3g\n", sounding, voiceEnergy());
+            expect(sounding > 1.0 && voiceEnergy() < 1e-9,
+                   "wildcard NOTE_OFF releases the sounding note");
+            events.noteOn(67, 1.0, 0);
+            processOnce();
+            events.note(CLAP_EVENT_NOTE_CHOKE, 0, 67, 0);
+            processOnce();
+            processOnce();
+            expect(voiceEnergy() < 1e-9, "NOTE_CHOKE stops the note");
+        }
+
+        // 14) An effect given no input port processes silence (the old code
+        //     processed the host's stale output buffer as input).
+        {
+            proc.audio_inputs = nullptr;
+            proc.audio_inputs_count = 0;
+            for (int i = 0; i < 512; ++i)
+            {
+                outL[static_cast<size_t>(i)] = 0.7f;
+                outR[static_cast<size_t>(i)] = 0.7f;
+            }
+            events.paramValue(gainId, 1.0, 0);
+            processOnce();
+            std::printf("      no input port: output mean %.4f (expected 0)\n", outMean());
+            expect(std::fabs(outMean()) < 1e-6, "missing input port processes silence");
+            proc.audio_inputs = inBufs;
+            proc.audio_inputs_count = expectedInPorts;
+        }
+
+        // 15) Sample-accurate bypass: with the wet path silent (gain 0) a
+        //     bypass event at time 384 starts the crossfade there (the old
+        //     once-per-block blend began it at sample 0).
+        {
+            fillInput(1.0f);
+            events.paramValue(gainId, 0.0, 0);
+            processOnce();
+            events.paramValue(bypassId, 1.0, 384);
+            processOnce();
+            int first = -1;
+            for (int i = 0; i < 512; ++i)
+                if (outL[static_cast<size_t>(i)] != 0.0f)
+                {
+                    first = i;
+                    break;
+                }
+            std::printf("      bypass at 384: crossfade starts at sample %d\n", first);
+            expect(first >= 352 && outL[511] > 0.0f, "bypass crossfade starts at its event");
+            events.paramValue(bypassId, 0.0, 0);
+            events.paramValue(gainId, 1.0, 0);
+            processOnce();
+            processOnce();
+        }
+
+        // 16) A state without some parameter (saved before it existed)
+        //     restores that parameter's DEFAULT; the old code kept the value
+        //     the instance held (0.3 here).
+        {
+            events.paramValue(gainId, 0.3, 0);
+            processOnce();
+            ByteIStream older;
+            auto put32 = [&](uint32_t v) {
+                for (int b = 0; b < 4; ++b)
+                    older.bytes.push_back(static_cast<uint8_t>(v >> (8 * b)));
+            };
+            put32(0x4453504Bu);   // "DSPK"
+            put32(1u);            // version
+            put32(1u);            // one entry: the lookahead only
+            put32(lookaheadId);
+            put32(0u);            // 0.0 as a double
+            put32(0u);
+            put32(0u);            // no user section
+            expect(state->load(plugin, &older.iface), "state load accepts an older state");
+            double gainNow = 0.0;
+            params->get_value(plugin, gainId, &gainNow);
+            expect(std::fabs(gainNow - 1.0) < 1e-9,
+                   "a parameter missing from the state takes its default");
+            processOnce();
         }
         proc.transport = nullptr;
     }

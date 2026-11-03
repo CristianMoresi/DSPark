@@ -25,8 +25,47 @@ All notable user-facing changes to DSPark are documented here.
   a long IR's tail runs in larger partitions whose work is spread over the
   samples. `getTailBlockSize()` reports the tail partition.
 
+### Changed
+
+- Plugin layer, VST3: every MIDI controller (CC 0-127, channel pressure,
+  pitch bend) now maps through `IMidiMapping`, as CLAP and AU already
+  delivered; the hidden proxy parameters grow from 64 to 2080.
+  `paramIdsUnique()` also rejects ids that hash into that 0x4D44xxxx range.
+- Plugin layer: parameter id lookups use a compile-time id table (a block of
+  128 automation points: 12.8 to 4.9 us).
+
 ### Fixed
 
+- Plugin layer: a block with more than 256 events no longer loses events.
+  Intermediate parameter points give way, so final parameter values and
+  note-offs survive (VST3, CLAP, AU; a stuck note before).
+- Plugin layer: the plugin's `setParameter` has one caller at a time. UI
+  edits, state loads and presets are applied by the audio thread while the
+  host processes; two writers tore single-writer setters such as
+  `Equalizer::setBand`.
+- Plugin layer: a bypass crossfade starts at the bypass point, not at the
+  block start; parameters missing from a loaded state take their defaults;
+  states over 16 MiB load back; an effect whose input is missing processes
+  silence instead of the host's stale output buffer.
+- VST3: `restartComponent` is never called off the UI thread;
+  `setProcessing(false)` calls the plugin's `reset()`; `terminate()` releases
+  the component handler; UTF-8 names and units reach hosts as UTF-16; a null
+  left output channel is no longer written; the pitch-bend proxy rests at its
+  centre.
+- CLAP: a latency change while active requests a host restart and is
+  reported from `activate()`, the only place `latency.changed` is allowed;
+  wildcard note-offs and chokes release the matching sounding notes;
+  `CLAP_PARAM_IS_STEPPED` is set only for whole-number grids; editor edits
+  re-read the latency.
+- AU: raising `MaximumFramesPerSlice` while initialized no longer overruns the
+  render buffers; ramped parameter events follow their line instead of
+  jumping to the end value; a sidechain stream format no longer changes the
+  main width; state and preset loads notify parameter listeners; the
+  Objective-C editor classes carry a per-binary name.
+- WebView editor: a poll reply in flight no longer moves a knob back during a
+  drag.
+- `DSPark.h` and the plugin headers compile after `<windows.h>` without
+  `NOMINMAX`.
 - `AlgorithmicReverb`: the modulated reads cover a fractional delay of
   [0.1, 1.1) instead of [0.5, 1.5). Where the read index steps, the old range
   changed the high-frequency phase delay and left noise: energy beyond 200 Hz

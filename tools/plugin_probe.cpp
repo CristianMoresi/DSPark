@@ -8,7 +8,9 @@
 //   - transport     while playing, adds a DC of tempo/1000 (sign flips to
 //                   negative under offline rendering)
 //   - MIDI          one monophonic sine voice: note on/off (honouring the
-//                   sample offset), pitch bend (+/-2 st), CC1 adds 0.1 DC
+//                   sample offset; a note off releases only the sounding
+//                   key, so a wrongly addressed off is audible), pitch
+//                   bend (+/-2 st), CC1 adds 0.1 DC
 //   - lookahead     a toggle that flips getLatency() 0 <-> 64 and delays the
 //                   input by exactly those 64 samples, so the smokes can
 //                   watch the latency-changed notification and check that
@@ -73,10 +75,11 @@ struct ProbePlugin
             noteFreq_ = 440.0 * std::pow(2.0, (ev.note - 69) / 12.0);
             noteAmp_ = ev.value;
             noteDelay_ = ev.sampleOffset;
+            noteKey_ = ev.note;
             phase_ = 0.0;
             break;
         case Type::NoteOff:
-            noteAmp_ = 0.0f;
+            if (ev.note == noteKey_) noteAmp_ = 0.0f;
             break;
         case Type::PitchBend:
             bendSemis_ = ev.value * 2.0f;
@@ -147,6 +150,7 @@ private:
     double noteFreq_ = 0.0;
     float  noteAmp_ = 0.0f;
     int    noteDelay_ = 0;
+    int    noteKey_ = -1;
     float  bendSemis_ = 0.0f;
     float  mod_ = 0.0f;
     double phase_ = 0.0;

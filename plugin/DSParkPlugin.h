@@ -55,12 +55,22 @@
  * blob - e.g. DSPark's StateBlob - rides along as an extra section.
  */
 
+// <windows.h> without NOMINMAX defines function-like min/max macros that
+// break every std::min/std::max and numeric_limits<T>::max() below. Park
+// them for the length of this header and restore them at its end.
+#pragma push_macro("min")
+#pragma push_macro("max")
+#undef min
+#undef max
+
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <concepts>
 #include <cstdint>
 #include <cstdio>
@@ -367,9 +377,11 @@ constexpr uint64_t hash64(const char* s, uint64_t salt) noexcept
 
 /**
  * @brief Compile-time guarantee that every parameter id hashes uniquely and
- * collides with neither reserved state id ('PRGM', 'BYPS'). A collision would
- * silently cross-wire automation and state between two parameters, so the
- * backends refuse to build: `static_assert(paramIdsUnique<MyPlugin>());`.
+ * collides with no id the wrappers reserve: the state ids 'PRGM' and 'BYPS',
+ * and the 0x4D44xxxx range the VST3 backend uses for its hidden MIDI
+ * controller parameters. A collision would silently cross-wire automation
+ * and state, so the backends refuse to build:
+ * `static_assert(paramIdsUnique<MyPlugin>());`.
  */
 template <typename P>
 constexpr bool paramIdsUnique() noexcept
@@ -379,10 +391,31 @@ constexpr bool paramIdsUnique() noexcept
     {
         const uint32_t h = hash32(P::parameters[i].id);
         if (h == 0x5052474Du || h == 0x42595053u) return false; // 'PRGM'/'BYPS'
+        if ((h & 0xFFFF0000u) == 0x4D440000u) return false;     // VST3 MIDI proxies
         for (size_t j = i + 1; j < n; ++j)
             if (hash32(P::parameters[j].id) == h) return false;
     }
     return true;
+}
+
+/** @brief The hash32 of every parameter id of @p P, computed at compile time
+ *  (table order), so id lookups on the audio thread compare integers instead
+ *  of re-hashing every id string for every event. */
+template <typename P>
+inline constexpr auto paramIdTable = [] {
+    std::array<uint32_t, P::parameters.size()> ids {};
+    for (size_t i = 0; i < P::parameters.size(); ++i)
+        ids[i] = hash32(P::parameters[i].id);
+    return ids;
+}();
+
+/** @brief Table index of the parameter whose host id is @p id, or -1. */
+template <typename P>
+constexpr int paramIndexOf(uint32_t id) noexcept
+{
+    for (size_t i = 0; i < P::parameters.size(); ++i)
+        if (paramIdTable<P>[i] == id) return static_cast<int>(i);
+    return -1;
 }
 
 /**
@@ -726,8 +759,11 @@ constexpr bool sampleAccurateOf() noexcept
  *  (bounds the per-call overhead; ~0.7 ms at 48 kHz is inaudible). */
 inline constexpr int kAutomationQuantum = 32;
 
-/** @brief Hard cap of timestamped events handled per block; the (very
- *  unlikely) excess applies at the position of the last captured event. */
+/** @brief Capacity of the per-block event list. Past it the list merges
+ *  rather than drops: an intermediate parameter point gives up its slot
+ *  (the newest point of every parameter and every MIDI event are kept), so
+ *  only a block carrying more than this many distinct parameters plus MIDI
+ *  events loses anything. See BlockEventList. */
 inline constexpr int kMaxBlockEvents = 256;
 
 /**
@@ -741,20 +777,22 @@ struct BlockEvent
     enum class Kind : uint8_t { Param, Bypass, Midi };
     int32_t  offset = 0;        ///< Frame position within the block.
     Kind     kind = Kind::Param;
-    uint32_t paramId = 0;       ///< hash32 id (Kind::Param only).
+    uint32_t paramId = 0;       ///< hash32 id (Kind::Param), bypass id (Kind::Bypass).
     double   value = 0.0;       ///< Normalized value / bypass >= 0.5.
     MidiEvent midi {};          ///< Kind::Midi payload.
+    uint32_t order = 0;         ///< Arrival order: the tie-break of the sort.
 };
 
-/** @brief Stable insertion sort by offset (tiny N, allocation-free -
- *  audio-thread safe; equal offsets keep arrival order). */
+/** @brief Insertion sort by (offset, arrival order) - tiny N,
+ *  allocation-free, audio-thread safe; equal offsets keep arrival order. */
 inline void sortBlockEvents(BlockEvent* events, int count) noexcept
 {
     for (int i = 1; i < count; ++i)
     {
         BlockEvent key = events[i];
         int j = i - 1;
-        while (j >= 0 && events[j].offset > key.offset)
+        while (j >= 0 && (events[j].offset > key.offset
+                          || (events[j].offset == key.offset && events[j].order > key.order)))
         {
             events[j + 1] = events[j];
             --j;
@@ -762,6 +800,242 @@ inline void sortBlockEvents(BlockEvent* events, int count) noexcept
         events[j + 1] = key;
     }
 }
+
+/**
+ * @brief The fixed-capacity, allocation-free event list one block of host
+ * events is collected into (a member of each backend's plugin object, so
+ * nothing large lives on the audio thread's stack).
+ *
+ * Within capacity every event is kept. Once the list is full it merges
+ * instead of dropping blindly: a parameter or bypass point overwrites the
+ * newest stored point of the SAME parameter (a later point supersedes it),
+ * and any other event takes the slot of a parameter point that a newer
+ * point of its own parameter has already superseded. The final value of
+ * every parameter and every MIDI event therefore survive whenever the block
+ * holds at most kMaxBlockEvents distinct parameters plus MIDI events; what
+ * is given up first is intermediate automation, which only loses its exact
+ * position inside the block. dropped() counts what still could not fit.
+ *
+ * Every operation is O(1) amortised (a small open-addressed table maps a
+ * parameter id to its newest slot; the table is invalidated by a generation
+ * counter, not cleared). Not thread-safe: one block, one thread.
+ */
+class BlockEventList
+{
+public:
+    /** Empties the list for the next block. */
+    void clear() noexcept
+    {
+        count_ = 0;
+        freeCount_ = 0;
+        dropped_ = 0;
+        nextOrder_ = 0;
+        if (++generation_ == 0)   // wrapped: make every stale entry unreachable
+        {
+            for (auto& slot : table_) slot.generation = 0;
+            generation_ = 1;
+        }
+    }
+
+    /** Adds one event (see the class notes for the merge rule). */
+    void add(const BlockEvent& event) noexcept
+    {
+        BlockEvent ev = event;
+        ev.order = nextOrder_++;
+        const bool isPoint = ev.kind != BlockEvent::Kind::Midi;
+        TableSlot* entry = isPoint ? find(ev.paramId) : nullptr;
+        const bool known = entry != nullptr && entry->generation == generation_;
+        if (count_ < kMaxBlockEvents)
+        {
+            const int index = count_++;
+            events_[index] = ev;
+            if (isPoint)
+            {
+                if (known) freeList_[freeCount_++] = static_cast<int16_t>(entry->index);
+                remember(entry, ev.paramId, index);
+            }
+            return;
+        }
+        if (known)
+        {
+            events_[entry->index] = ev;   // the newer point supersedes the stored one
+            return;
+        }
+        if (freeCount_ > 0)
+        {
+            const int index = freeList_[--freeCount_];
+            events_[index] = ev;
+            if (isPoint) remember(entry, ev.paramId, index);
+            return;
+        }
+        ++dropped_;
+    }
+
+    /** Sorts by (offset, arrival order). */
+    void sort() noexcept { sortBlockEvents(events_.data(), count_); }
+
+    [[nodiscard]] int size() const noexcept { return count_; }
+    [[nodiscard]] int dropped() const noexcept { return dropped_; }
+    BlockEvent& operator[](int i) noexcept { return events_[static_cast<size_t>(i)]; }
+    const BlockEvent& operator[](int i) const noexcept { return events_[static_cast<size_t>(i)]; }
+
+private:
+    struct TableSlot
+    {
+        uint32_t key = 0;
+        uint32_t generation = 0;
+        int      index = 0;
+    };
+    static constexpr int kTableSize = 2 * kMaxBlockEvents;   // power of two, load <= 1/2
+
+    /** The live entry for @p key, or the empty slot it would occupy. */
+    TableSlot* find(uint32_t key) noexcept
+    {
+        uint32_t h = key * 2654435761u;
+        for (int probe = 0; probe < kTableSize; ++probe)
+        {
+            TableSlot& slot = table_[(h + static_cast<uint32_t>(probe)) & (kTableSize - 1)];
+            if (slot.generation != generation_ || slot.key == key) return &slot;
+        }
+        return nullptr;   // unreachable: the table never fills past one half
+    }
+
+    void remember(TableSlot* entry, uint32_t key, int index) noexcept
+    {
+        if (entry == nullptr) return;
+        entry->key = key;
+        entry->generation = generation_;
+        entry->index = index;
+    }
+
+    std::array<BlockEvent, kMaxBlockEvents> events_ {};
+    std::array<TableSlot, kTableSize> table_ {};
+    std::array<int16_t, kMaxBlockEvents> freeList_ {};
+    int count_ = 0;
+    int freeCount_ = 0;
+    int dropped_ = 0;
+    uint32_t nextOrder_ = 0;
+    uint32_t generation_ = 1;
+};
+
+/**
+ * @brief Parameter changes made OFF the audio thread, handed to it.
+ *
+ * The plugin's setParameter forwards to DSPark setters, and several of those
+ * (Equalizer, DynamicEQ, FIRFilter, Biquad coefficient sets) are seqlocks
+ * with exactly ONE writer: two threads publishing into one of them can leave
+ * a torn configuration in force. While the host processes, a backend
+ * therefore never calls setParameter from the UI thread: an editor edit, a
+ * state load or a preset stores the new normalized value in the shadow and
+ * marks it here, and the audio thread applies every marked parameter at the
+ * start of its next block. mark() runs on any one control thread, drain()
+ * on the audio thread; both are lock-free and allocation-free.
+ */
+template <size_t NumParams>
+class PendingParams
+{
+public:
+    void mark(size_t index) noexcept
+    {
+        words_[index >> 5].fetch_or(1u << (index & 31u), std::memory_order_release);
+        any_.store(true, std::memory_order_release);
+    }
+
+    /** Calls @p apply(index) for every marked parameter; true if any. */
+    template <typename Apply>
+    bool drain(Apply&& apply) noexcept
+    {
+        if (!any_.exchange(false, std::memory_order_acquire)) return false;
+        bool applied = false;
+        for (size_t w = 0; w < kWords; ++w)
+        {
+            uint32_t bits = words_[w].exchange(0u, std::memory_order_acquire);
+            while (bits != 0u)
+            {
+                const int b = std::countr_zero(bits);
+                bits &= bits - 1u;
+                const size_t index = w * 32u + static_cast<size_t>(b);
+                if (index < NumParams)
+                {
+                    apply(static_cast<int>(index));
+                    applied = true;
+                }
+            }
+        }
+        return applied;
+    }
+
+private:
+    static constexpr size_t kWords = NumParams == 0 ? 1 : (NumParams + 31) / 32;
+    std::array<std::atomic<uint32_t>, kWords> words_ {};
+    std::atomic<bool> any_ { false };
+};
+
+/**
+ * @brief The notes a backend has delivered as sounding, per channel and key,
+ * with the host note id each started with.
+ *
+ * CLAP addresses notes by (channel, key, note id) where any part may be the
+ * wildcard -1: a NOTE_OFF or NOTE_CHOKE with key -1 means "every matching
+ * voice". MidiEvent carries one key, so the backend expands such an event
+ * into one NoteOff per sounding note it matches - exactly the notes the
+ * plugin was told about. Not thread-safe: the audio thread owns it.
+ */
+class ActiveNotes
+{
+public:
+    void clear() noexcept
+    {
+        for (auto& row : on_) row = {};
+    }
+
+    void noteOn(int channel, int key, int32_t noteId) noexcept
+    {
+        if (!valid(channel, key)) return;
+        on_[static_cast<size_t>(channel)][static_cast<size_t>(key) >> 6]
+            |= uint64_t { 1 } << (key & 63);
+        id_[static_cast<size_t>(channel)][static_cast<size_t>(key)] = noteId;
+    }
+
+    void noteOff(int channel, int key) noexcept
+    {
+        if (!valid(channel, key)) return;
+        on_[static_cast<size_t>(channel)][static_cast<size_t>(key) >> 6]
+            &= ~(uint64_t { 1 } << (key & 63));
+    }
+
+    /** Calls @p off(channel, key) for every sounding note matching the
+     *  (channel, key, noteId) address, each part -1 for "any", and forgets
+     *  those notes. */
+    template <typename Off>
+    void releaseMatching(int channel, int key, int32_t noteId, Off&& off) noexcept
+    {
+        for (int c = 0; c < 16; ++c)
+        {
+            if (channel >= 0 && channel != c) continue;
+            for (int k = 0; k < 128; ++k)
+            {
+                if (key >= 0 && key != k) continue;
+                const uint64_t bit = uint64_t { 1 } << (k & 63);
+                if ((on_[static_cast<size_t>(c)][static_cast<size_t>(k) >> 6] & bit) == 0)
+                    continue;
+                if (noteId >= 0 && id_[static_cast<size_t>(c)][static_cast<size_t>(k)] >= 0
+                    && id_[static_cast<size_t>(c)][static_cast<size_t>(k)] != noteId)
+                    continue;
+                on_[static_cast<size_t>(c)][static_cast<size_t>(k) >> 6] &= ~bit;
+                off(c, k);
+            }
+        }
+    }
+
+private:
+    static constexpr bool valid(int channel, int key) noexcept
+    {
+        return channel >= 0 && channel < 16 && key >= 0 && key < 128;
+    }
+    std::array<std::array<uint64_t, 2>, 16> on_ {};
+    std::array<std::array<int32_t, 128>, 16> id_ {};
+};
 
 // -- Bypass dry path -------------------------------------------------------------
 
@@ -1044,8 +1318,9 @@ struct PluginBase
 {
     /**
      * Clears processing history (delay lines, envelopes, reverb tails) on
-     * transport jumps. CLAP hosts call this directly; VST3 hosts re-activate
-     * (your `prepare()` runs again) instead.
+     * transport jumps. CLAP and AU hosts call this directly; the VST3
+     * wrapper calls it when the host stops processing (setProcessing(false)),
+     * and re-activation runs your `prepare()` again.
      * Default: nothing to clear.
      */
     void reset() noexcept {}
@@ -1120,6 +1395,11 @@ struct PluginBase
 inline constexpr uint32_t kStateMagic   = 0x4453504Bu;   // "DSPK"
 inline constexpr uint32_t kStateVersion = 1u;
 
+/** @brief Largest state a backend reads back (1 GiB). It only bounds a
+ *  hostile, endless host stream: getState() itself has no size limit, so
+ *  any cap a real state could exceed would break the save/load round trip. */
+inline constexpr size_t kMaxStateBytes = size_t { 1 } << 30;
+
 /** @brief Reserved entry id persisting the active factory-preset index
  *  ('PRGM'); never a user parameter. Older builds skip it (unknown id). */
 inline constexpr uint32_t kProgramStateId = 0x5052474Du;
@@ -1181,8 +1461,19 @@ inline std::vector<uint8_t> buildState(const P& user, const double* normalized,
     return blob;
 }
 
+/** @brief Fills @p normalized with every parameter's DEFAULT (normalized):
+ *  what a state load starts from, so a parameter the blob does not carry
+ *  (added in a later version) takes its default rather than whatever value
+ *  the instance happened to hold. */
+template <typename P>
+inline void loadDefaultNormalized(double* normalized) noexcept
+{
+    for (size_t i = 0; i < P::parameters.size(); ++i)
+        normalized[i] = toNormalized(P::parameters[i], P::parameters[i].defValue);
+}
+
 /** @brief Parses a state blob; fills `normalized` (defaults pre-loaded by the
- *  caller), reports a persisted program index / bypass through
+ *  caller, see loadDefaultNormalized), reports a persisted program index / bypass through
  *  @p programIndex and @p bypassState (left untouched when absent) and
  *  forwards the user section. Returns false on a foreign blob. */
 template <typename P>
@@ -1263,3 +1554,6 @@ inline bool applyState(P& user, const uint8_t* data, size_t size, double* normal
 }
 
 } // namespace dspark::plugin
+
+#pragma pop_macro("max")
+#pragma pop_macro("min")

@@ -111,6 +111,7 @@
     #include <objc/message.h>
     #include <objc/runtime.h>
     #include <dlfcn.h>
+    #include <cstdint>
 #elif defined(__linux__)
     #define DSPARK_WEBVIEW_BACKEND 3
     #include <dlfcn.h>
@@ -389,7 +390,7 @@ inline bool parsePostArgs(const char* s, PostArgs& out) noexcept
 inline constexpr const char* kBridgeJs =
     "(function(){'use strict';"
     "if(window.dspark){return;}"
-    "var ls={},vals={},meta=null,readyCbs=[];"
+    "var ls={},vals={},meta=null,readyCbs=[],seq=0,lastSet={};"
     "function fire(id,v){var c=ls[id];if(c){for(var i=0;i<c.length;i++){c[i](v);}}}"
     "window.__dsparkRecv=function(m){"
       "if(m.type==='params'){"
@@ -416,13 +417,17 @@ inline constexpr const char* kBridgeJs =
         "for(var j=0;j<rc.length;j++){rc[j](meta);}"
         "for(var k=0;k<meta.length;k++){fire(meta[k].id,meta[k].value);}"
         "if(!window.__dsparkTimer){"
-          "window.__dsparkTimer=setInterval(function(){window.__dsparkPost('poll');},33);}"
+          "window.__dsparkTimer=setInterval(function(){window.__dsparkPost('poll','',seq);},33);}"
       "}else if(m.type==='values'){"
         "for(var id in m.values){"
+          // A reply snapshotted before this page's latest edit of an id
+          // must not move it back (a knob jumping to its previous value
+          // mid-drag).
+          "if(lastSet[id]!==undefined&&lastSet[id]>(m.seq||0)){continue;}"
           "if(vals[id]!==m.values[id]){vals[id]=m.values[id];fire(id,m.values[id]);}}"
       "}};"
     "window.dspark={"
-      "setParam:function(id,v){v=+v;vals[id]=v;window.__dsparkPost('set',id,v);fire(id,v);},"
+      "setParam:function(id,v){v=+v;lastSet[id]=++seq;vals[id]=v;window.__dsparkPost('set',id,v);fire(id,v);},"
       "getParam:function(id){return vals[id];},"
       "beginEdit:function(id){window.__dsparkPost('begin',id);},"
       "endEdit:function(id){window.__dsparkPost('end',id);},"
@@ -486,6 +491,20 @@ inline ObjId nsString(const char* utf8) noexcept
 
 struct Rect { double x = 0, y = 0, w = 0, h = 0; };   // CGRect-compatible
 
+/**
+ * @brief An Objective-C class name unique to THIS binary: @p base plus the
+ * address of an object inside this image. Runtime-registered classes are
+ * process-wide, so a fixed name let the first DSPark plugin loaded register
+ * it and every later plugin binary run that binary's methods - another
+ * DSPark version's code, or code in an image the host has since unloaded.
+ */
+inline void imageUniqueClassName(const char* base, char* out, size_t cap) noexcept
+{
+    static const char anchor = 0;   // one per image (inline: merged within it)
+    std::snprintf(out, cap, "%s_%llx", base,
+                  static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(&anchor)));
+}
+
 struct MessageSink
 {
     void (*fn)(void* context, const char* json) = nullptr;
@@ -511,10 +530,11 @@ inline void onScriptMessage(ObjId self, SEL, ObjId, ObjId message) noexcept
 inline Class relayClass() noexcept
 {
     static Class registered = [] {
-        Class c = objc_allocateClassPair(objc_getClass("NSObject"),
-                                         "DSParkWebViewMessageRelay", 0);
-        if (c == nullptr)   // another DSPark plugin in this process won the race
-            return objc_getClass("DSParkWebViewMessageRelay");
+        static char name[96];
+        imageUniqueClassName("DSParkWebViewMessageRelay", name, sizeof(name));
+        Class c = objc_allocateClassPair(objc_getClass("NSObject"), name, 0);
+        if (c == nullptr)   // this image registered it already
+            return objc_getClass(name);
         class_addIvar(c, "dsparkSink", sizeof(void*), alignof(void*) == 8 ? 3 : 2, "^v");
         class_addMethod(c, sel_registerName("userContentController:didReceiveScriptMessage:"),
                         reinterpret_cast<IMP>(&onScriptMessage), "v@:@@");
@@ -816,7 +836,7 @@ private:
         if (!parsePostArgs(json, msg)) return;
         if (std::strcmp(msg.op, "poll") == 0)
         {
-            sendValues();
+            sendValues(msg.tokens >= 3 ? msg.value : 0.0);
         }
         else if (std::strcmp(msg.op, "set") == 0)
         {
@@ -896,9 +916,16 @@ private:
         sendRecv(json);
     }
 
-    void sendValues()
+    /** Answers a poll. @p seq is the number of edits the page had posted
+     *  when it polled; posts arrive in order, so every one of them is in
+     *  this snapshot and the page skips ids it edited after the poll. The
+     *  old reply carried no such count: a reply in flight during a drag
+     *  snapped the knob back to its previous value for one poll. */
+    void sendValues(double seq)
     {
-        std::string json = "{\"type\":\"values\",\"values\":{";
+        std::string json = "{\"type\":\"values\",\"seq\":";
+        appendJsonNumber(json, seq);
+        json += ",\"values\":{";
         for (size_t i = 0; i < kNumParams; ++i)
         {
             if (i > 0) json += ',';

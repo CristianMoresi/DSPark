@@ -1,16 +1,34 @@
 // DSPark Tests - Integration
 // ProcessorChain composed, full signal chain, dual-type, processor concepts
 
-#include "dspark_test.h"
-#include "TestSignals.h"
+// <windows.h> FIRST and without NOMINMAX, as a desktop application includes
+// it: its function-like min/max macros must not break the umbrella or the
+// plugin headers. Before the umbrella parked them, this translation unit did
+// not compile (81 errors, the first in Core/DspMath.h).
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include "../DSPark.h" // full umbrella: the concept matrix below touches everything
 #include "../plugin/DSParkPlugin.h"
+#include "../plugin/vst3/DSParkVst3.h"
+#include "../plugin/clap/DSParkClap.h"
 
+#if defined(_WIN32)
+#undef min   // the rest of this file uses std::min/std::max freely
+#undef max
+#endif
+
+#include "dspark_test.h"
+#include "TestSignals.h"
+
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <thread>
+#include <utility>
 #include <vector>
 
 using namespace dspark;
@@ -503,4 +521,383 @@ DSPARK_TEST(PluginLayer_editor_size_policy)
     constrainEditorSize<AspectPlug>(w, h, 1.0);
     EXPECT_NEAR(w, 200.0, 1e-9);
     EXPECT_NEAR(h, 150.0, 1e-9);
+}
+
+// ============================================================================
+// Plugin format wrappers (plugin/vst3, plugin/clap) driven through their C
+// vtables with minimal host objects. Each case names the defect it pins and
+// what the old wrapper did.
+// ============================================================================
+
+namespace {
+
+struct WrapPlug
+{
+    static constexpr const char* kWaves[] = { "Sine", "Saw" };
+    static constexpr auto descriptor = dspark::plugin::Descriptor {
+        .name = "Wrap", .vendor = "T", .url = "", .email = "",
+        .productId = "com.dspark.test.wrap", .version = "1.0.0",
+    };
+    // A UTF-8 name and unit (U+00F6 U+00DF, U+00B5) and a five-position
+    // stepped control on a 0..1 range.
+    static constexpr auto parameters = dspark::plugin::params(
+        dspark::plugin::param("size", "Gr\xC3\xB6\xC3\x9F" "e", 0.0f, 1.0f, 0.5f, "\xC2\xB5s"),
+        dspark::plugin::toggle("look", "Lookahead", false),
+        dspark::plugin::stepped("frac", "Frac", 0.0f, 1.0f, 0.5f, 4),
+        dspark::plugin::choice("wave", "Wave", kWaves, 0));
+
+    std::atomic<std::thread::id> lastSetter {};
+    std::atomic<bool> look { false };
+    std::atomic<int> resets { 0 };
+    std::atomic<int> lastCc { -1 };
+    std::atomic<float> lastCcValue { 0.0f };
+    size_t userStateBytes = 0;
+    bool userStateRestored = false;
+
+    void prepare(const dspark::AudioSpec&) {}
+    void setParameter(int index, float value) noexcept
+    {
+        lastSetter.store(std::this_thread::get_id());
+        if (index == 1) look.store(value >= 0.5f);
+    }
+    void processBlock(dspark::AudioBufferView<float>) noexcept {}
+    void reset() noexcept { ++resets; }
+    void handleMidiEvent(const dspark::plugin::MidiEvent& e) noexcept
+    {
+        if (e.type == dspark::plugin::MidiEvent::Type::ControlChange)
+        {
+            lastCcValue.store(e.value);
+            lastCc.store(e.note);
+        }
+    }
+    [[nodiscard]] int getLatency() const noexcept { return look.load() ? 64 : 0; }
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    { return std::vector<uint8_t>(userStateBytes, uint8_t { 0x5A }); }
+    bool setState(const uint8_t*, size_t n)
+    {
+        userStateRestored = n == userStateBytes;
+        return true;
+    }
+};
+
+using Vst3Wrap = dspark::plugin::vst3::Plugin<WrapPlug>;
+
+struct MockQueue
+{
+    Steinberg_Vst_IParamValueQueueVtbl* vtbl;
+    uint32_t id = 0;
+    std::vector<std::pair<Steinberg_int32, double>> points;
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void*, const Steinberg_TUID, void** o)
+    { *o = nullptr; return Steinberg_kNoInterface; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE ref(void*) { return 1; }
+    static Steinberg_Vst_ParamID SMTG_STDMETHODCALLTYPE getId(void* s)
+    { return static_cast<MockQueue*>(s)->id; }
+    static Steinberg_int32 SMTG_STDMETHODCALLTYPE count(void* s)
+    { return static_cast<Steinberg_int32>(static_cast<MockQueue*>(s)->points.size()); }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE get(void* s, Steinberg_int32 i,
+                                                        Steinberg_int32* offset,
+                                                        Steinberg_Vst_ParamValue* value)
+    {
+        const auto& p = static_cast<MockQueue*>(s)->points[static_cast<size_t>(i)];
+        *offset = p.first;
+        *value = p.second;
+        return Steinberg_kResultOk;
+    }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE add(void*, Steinberg_int32,
+                                                        Steinberg_Vst_ParamValue, Steinberg_int32*)
+    { return Steinberg_kResultFalse; }
+    static inline Steinberg_Vst_IParamValueQueueVtbl kVtbl = { &q, &ref, &ref, &getId, &count, &get, &add };
+    MockQueue() : vtbl(&kVtbl) {}
+};
+
+struct MockChanges
+{
+    Steinberg_Vst_IParameterChangesVtbl* vtbl;
+    std::vector<MockQueue> queues;
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void*, const Steinberg_TUID, void** o)
+    { *o = nullptr; return Steinberg_kNoInterface; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE ref(void*) { return 1; }
+    static Steinberg_int32 SMTG_STDMETHODCALLTYPE count(void* s)
+    { return static_cast<Steinberg_int32>(static_cast<MockChanges*>(s)->queues.size()); }
+    static Steinberg_Vst_IParamValueQueue* SMTG_STDMETHODCALLTYPE get(void* s, Steinberg_int32 i)
+    {
+        return reinterpret_cast<Steinberg_Vst_IParamValueQueue*>(
+            &static_cast<MockChanges*>(s)->queues[static_cast<size_t>(i)]);
+    }
+    static Steinberg_Vst_IParamValueQueue* SMTG_STDMETHODCALLTYPE add(void*, const Steinberg_Vst_ParamID*,
+                                                                      Steinberg_int32*)
+    { return nullptr; }
+    static inline Steinberg_Vst_IParameterChangesVtbl kVtbl = { &q, &ref, &ref, &count, &get, &add };
+    MockChanges() : vtbl(&kVtbl) {}
+    void point(uint32_t id, Steinberg_int32 offset, double value)
+    {
+        MockQueue queue;
+        queue.id = id;
+        queue.points.push_back({ offset, value });
+        queues.push_back(queue);
+    }
+};
+
+struct MockHandler
+{
+    Steinberg_Vst_IComponentHandlerVtbl* vtbl;
+    std::thread::id ui = std::this_thread::get_id();
+    std::atomic<int> refs { 1 }, restarts { 0 }, offThread { 0 };
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void*, const Steinberg_TUID, void** o)
+    { *o = nullptr; return Steinberg_kNoInterface; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE addRef(void* s)
+    { return static_cast<Steinberg_uint32>(++static_cast<MockHandler*>(s)->refs); }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE release(void* s)
+    { return static_cast<Steinberg_uint32>(--static_cast<MockHandler*>(s)->refs); }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE edit(void*, Steinberg_Vst_ParamID)
+    { return Steinberg_kResultOk; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE perform(void*, Steinberg_Vst_ParamID,
+                                                            Steinberg_Vst_ParamValue)
+    { return Steinberg_kResultOk; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE restart(void* s, Steinberg_int32)
+    {
+        auto* h = static_cast<MockHandler*>(s);
+        ++h->restarts;
+        if (std::this_thread::get_id() != h->ui) ++h->offThread;
+        return Steinberg_kResultOk;
+    }
+    static inline Steinberg_Vst_IComponentHandlerVtbl kVtbl = { &q, &addRef, &release, &edit,
+                                                                &perform, &edit, &restart };
+    MockHandler() : vtbl(&kVtbl) {}
+};
+
+struct MockStream
+{
+    Steinberg_IBStreamVtbl* vtbl;
+    std::vector<uint8_t> bytes;
+    size_t pos = 0;
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void*, const Steinberg_TUID, void** o)
+    { *o = nullptr; return Steinberg_kNoInterface; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE ref(void*) { return 1; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE read(void* s_, void* dst, Steinberg_int32 n,
+                                                         Steinberg_int32* got)
+    {
+        auto* s = static_cast<MockStream*>(s_);
+        const size_t left = s->bytes.size() - s->pos;
+        const size_t take = left < static_cast<size_t>(n) ? left : static_cast<size_t>(n);
+        if (take > 0) std::memcpy(dst, s->bytes.data() + s->pos, take);
+        s->pos += take;
+        if (got) *got = static_cast<Steinberg_int32>(take);
+        return take > 0 ? Steinberg_kResultOk : Steinberg_kResultFalse;
+    }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE write(void* s_, void* src, Steinberg_int32 n,
+                                                          Steinberg_int32* put)
+    {
+        auto* s = static_cast<MockStream*>(s_);
+        const auto* p = static_cast<const uint8_t*>(src);
+        s->bytes.insert(s->bytes.end(), p, p + n);
+        if (put) *put = n;
+        return Steinberg_kResultOk;
+    }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE seek(void* s_, Steinberg_int64 p, Steinberg_int32,
+                                                         Steinberg_int64* out)
+    {
+        static_cast<MockStream*>(s_)->pos = static_cast<size_t>(p);
+        if (out) *out = p;
+        return Steinberg_kResultOk;
+    }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE tell(void* s_, Steinberg_int64* out)
+    {
+        *out = static_cast<Steinberg_int64>(static_cast<MockStream*>(s_)->pos);
+        return Steinberg_kResultOk;
+    }
+    static inline Steinberg_IBStreamVtbl kVtbl = { &q, &ref, &ref, &read, &write, &seek, &tell };
+    MockStream() : vtbl(&kVtbl) {}
+};
+
+Vst3Wrap* makeActiveVst3()
+{
+    auto* p = new Vst3Wrap();
+    Steinberg_Vst_ProcessSetup setup { 0, Steinberg_Vst_SymbolicSampleSizes_kSample32, 256, 48000.0 };
+    p->kProcessorVtbl.setupProcessing(p->lensPtr(1), &setup);
+    p->kComponentVtbl.setActive(p->lensPtr(0), 1);
+    p->kProcessorVtbl.setProcessing(p->lensPtr(1), 1);
+    return p;
+}
+
+Steinberg_tresult processVst3(Vst3Wrap* p, float** out, Steinberg_int32 frames, MockChanges* changes)
+{
+    Steinberg_Vst_AudioBusBuffers outBus {};
+    outBus.numChannels = 2;
+    outBus.Steinberg_Vst_AudioBusBuffers_channelBuffers32 = out;
+    Steinberg_Vst_ProcessData data {};
+    data.symbolicSampleSize = Steinberg_Vst_SymbolicSampleSizes_kSample32;
+    data.numSamples = frames;
+    data.numOutputs = 1;
+    data.outputs = &outBus;
+    data.inputParameterChanges = reinterpret_cast<Steinberg_Vst_IParameterChanges*>(changes);
+    return p->kProcessorVtbl.process(p->lensPtr(1), &data);
+}
+
+} // namespace
+
+DSPARK_TEST(PluginVst3_ui_edits_reach_setParameter_on_the_audio_thread)
+{
+    // While the host processes, the user's setParameter must have ONE caller:
+    // DSPark setters such as Equalizer::setBand are single-writer seqlocks,
+    // and two concurrent writers tear a band (measured: 14386 torn band
+    // readouts in 3 s). The old wrapper called it from setParamNormalized on
+    // the UI thread while process() called it on the audio thread.
+    auto* p = makeActiveVst3();
+    p->user.lastSetter.store(std::thread::id {});
+    p->kControllerVtbl.setParamNormalized(p->lensPtr(2), dspark::plugin::hash32("size"), 0.8);
+    EXPECT_TRUE(p->user.lastSetter.load() != std::this_thread::get_id());
+    std::thread::id audioThread;
+    std::thread audio([&] {
+        audioThread = std::this_thread::get_id();
+        std::vector<float> l(256), r(256);
+        float* out[2] = { l.data(), r.data() };
+        processVst3(p, out, 256, nullptr);
+    });
+    audio.join();
+    EXPECT_TRUE(p->user.lastSetter.load() == audioThread);
+    EXPECT_NEAR(p->kControllerVtbl.getParamNormalized(p->lensPtr(2),
+                                                      dspark::plugin::hash32("size")), 0.8, 1e-12);
+    p->releaseImpl();
+}
+
+DSPARK_TEST(PluginVst3_restart_is_never_requested_off_the_UI_thread)
+{
+    // A latency change found in process() must reach restartComponent on the
+    // UI thread only. With no UI tick (a Linux host whose initialize()
+    // context has no IRunLoop - here: no initialize at all) the old wrapper
+    // called the host straight from the audio thread.
+    auto* p = makeActiveVst3();
+    MockHandler handler;
+    p->kControllerVtbl.setComponentHandler(p->lensPtr(2),
+        reinterpret_cast<Steinberg_Vst_IComponentHandler*>(&handler));
+    std::thread audio([&] {
+        std::vector<float> l(256), r(256);
+        float* out[2] = { l.data(), r.data() };
+        MockChanges changes;
+        changes.point(dspark::plugin::hash32("look"), 0, 1.0);
+        processVst3(p, out, 256, &changes);
+    });
+    audio.join();
+    EXPECT_EQ(handler.offThread.load(), 0);
+    (void) p->kControllerVtbl.getParamNormalized(p->lensPtr(2), dspark::plugin::hash32("look"));
+    EXPECT_EQ(handler.restarts.load(), 1);   // delivered by the UI-thread call
+    EXPECT_EQ(static_cast<int>(p->kProcessorVtbl.getLatencySamples(p->lensPtr(1))), 64);
+    p->kControllerVtbl.setComponentHandler(p->lensPtr(2), nullptr);
+    p->releaseImpl();
+}
+
+DSPARK_TEST(PluginVst3_terminate_releases_the_component_handler)
+{
+    // Steinberg's EditController::terminate releases the handler; the old
+    // wrapper kept its reference until the plugin's last release, after the
+    // host had torn the handler down.
+    auto* p = new Vst3Wrap();
+    MockHandler handler;
+    p->kControllerVtbl.initialize(p->lensPtr(2), nullptr);
+    p->kControllerVtbl.setComponentHandler(p->lensPtr(2),
+        reinterpret_cast<Steinberg_Vst_IComponentHandler*>(&handler));
+    EXPECT_EQ(handler.refs.load(), 2);
+    p->kControllerVtbl.terminate(p->lensPtr(2));
+    EXPECT_EQ(handler.refs.load(), 1);
+    p->releaseImpl();
+    EXPECT_EQ(handler.refs.load(), 1);
+}
+
+DSPARK_TEST(PluginVst3_utf8_strings_become_utf16)
+{
+    // Names and units are UTF-8; VST3 strings are UTF-16. The old wrapper
+    // widened byte by byte: "Gr\xC3\xB6\xC3\x9F" "e" became 7 units of mojibake.
+    auto* p = new Vst3Wrap();
+    Steinberg_Vst_ParameterInfo info {};
+    p->kControllerVtbl.getParameterInfo(p->lensPtr(2), 0, &info);
+    int len = 0;
+    while (info.title[len] != 0) ++len;
+    EXPECT_EQ(len, 5);
+    EXPECT_EQ(static_cast<int>(info.title[2]), 0x00F6);
+    EXPECT_EQ(static_cast<int>(info.title[3]), 0x00DF);
+    EXPECT_EQ(static_cast<int>(info.units[0]), 0x00B5);
+    EXPECT_EQ(static_cast<int>(info.units[1]), 's');
+    // A host typing the displayed text back gets the same value.
+    Steinberg_Vst_String128 text {};
+    p->kControllerVtbl.getParamStringByValue(p->lensPtr(2), dspark::plugin::hash32("size"), 0.25, text);
+    Steinberg_Vst_ParamValue back = -1.0;
+    EXPECT_EQ(p->kControllerVtbl.getParamValueByString(p->lensPtr(2), dspark::plugin::hash32("size"),
+                                                      text, &back), Steinberg_kResultOk);
+    EXPECT_NEAR(back, 0.25, 1e-9);
+    p->releaseImpl();
+}
+
+DSPARK_TEST(PluginVst3_midi_mapping_covers_every_controller)
+{
+    // Every CC, channel pressure and pitch bend maps through IMidiMapping
+    // and reaches handleMidiEvent. The old table mapped only CC1, CC64,
+    // pressure and bend; CC74 here was refused.
+    auto* p = makeActiveVst3();
+    Steinberg_Vst_ParamID cc74 = 0;
+    EXPECT_EQ(p->kMidiMapVtbl.getMidiControllerAssignment(p->lensPtr(5), 0, 3, 74, &cc74),
+              Steinberg_kResultTrue);
+    MockChanges changes;
+    changes.point(cc74, 0, 0.5);
+    std::vector<float> l(256), r(256);
+    float* out[2] = { l.data(), r.data() };
+    processVst3(p, out, 256, &changes);
+    EXPECT_EQ(p->user.lastCc.load(), 74);
+    EXPECT_NEAR(p->user.lastCcValue.load(), 0.5f, 1e-6f);
+    // The pitch-bend proxy rests at its declared centre (the old shadow
+    // started at 0.0 = full bend down while the info said 0.5).
+    EXPECT_NEAR(p->kControllerVtbl.getParamNormalized(p->lensPtr(2),
+                                                      dspark::plugin::vst3::midiProxyId(0, 129)),
+                0.5, 1e-12);
+    p->releaseImpl();
+}
+
+DSPARK_TEST(PluginVst3_stop_resets_and_large_states_round_trip)
+{
+    // setProcessing(false) reaches the plugin's reset() (the old no-op never
+    // did, so tails rang on across a transport stop), and a user state over
+    // the old 16 MiB read cap - one getState() itself wrote - loads back.
+    auto* p = makeActiveVst3();
+    p->kProcessorVtbl.setProcessing(p->lensPtr(1), 0);
+    EXPECT_EQ(p->user.resets.load(), 1);
+    p->user.userStateBytes = size_t { 17 } << 20;
+    MockStream saved;
+    EXPECT_EQ(p->kComponentVtbl.getState(p->lensPtr(0), reinterpret_cast<Steinberg_IBStream*>(&saved)),
+              Steinberg_kResultOk);
+    auto* q = new Vst3Wrap();
+    q->user.userStateBytes = p->user.userStateBytes;
+    saved.pos = 0;
+    EXPECT_EQ(q->kComponentVtbl.setState(q->lensPtr(0), reinterpret_cast<Steinberg_IBStream*>(&saved)),
+              Steinberg_kResultOk);
+    EXPECT_TRUE(q->user.userStateRestored);
+    q->releaseImpl();
+    p->releaseImpl();
+}
+
+DSPARK_TEST(PluginVst3_null_left_output_channel_is_not_written)
+{
+    // A host handing a null left channel next to a valid right one: the old
+    // trim looked only at the last pointer and wrote through the null one.
+    auto* p = makeActiveVst3();
+    std::vector<float> r(256, 0.25f);
+    float* out[2] = { nullptr, r.data() };
+    EXPECT_EQ(processVst3(p, out, 256, nullptr), Steinberg_kResultOk);
+    EXPECT_NEAR(r[100], 0.25f, 0.0f);
+    p->releaseImpl();
+}
+
+DSPARK_TEST(PluginClap_stepped_flag_only_for_integer_grids)
+{
+    // CLAP_PARAM_IS_STEPPED means integer values only. A five-position 0..1
+    // control flagged stepped (the old behaviour) offers two positions in a
+    // host; whole-number grids (toggle, choice) keep the flag.
+    using Wrap = dspark::plugin::clap_backend::Plugin<WrapPlug>;
+    clap_param_info_t info {};
+    EXPECT_TRUE(Wrap::kParams.get_info(nullptr, 2, &info));
+    EXPECT_EQ(info.flags & CLAP_PARAM_IS_STEPPED, 0u);
+    EXPECT_TRUE(Wrap::kParams.get_info(nullptr, 1, &info));
+    EXPECT_NE(info.flags & CLAP_PARAM_IS_STEPPED, 0u);
+    EXPECT_TRUE(Wrap::kParams.get_info(nullptr, 3, &info));
+    EXPECT_NE(info.flags & CLAP_PARAM_IS_STEPPED, 0u);
+    EXPECT_NE(info.flags & CLAP_PARAM_IS_ENUM, 0u);
 }

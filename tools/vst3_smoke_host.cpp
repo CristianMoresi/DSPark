@@ -426,6 +426,15 @@ struct EventList
         e.Steinberg_Vst_Event_noteOff.pitch = pitch;
         events.push_back(e);
     }
+    void polyPressure(Steinberg_int16 pitch, float pressure, Steinberg_int32 offset)
+    {
+        Steinberg_Vst_Event e {};
+        e.type = Steinberg_Vst_Event_EventTypes_kPolyPressureEvent;
+        e.sampleOffset = offset;
+        e.Steinberg_Vst_Event_polyPressure.pitch = pitch;
+        e.Steinberg_Vst_Event_polyPressure.pressure = pressure;
+        events.push_back(e);
+    }
 };
 
 /// Zero-crossing pitch estimate over a mono buffer (clean tones only).
@@ -883,6 +892,7 @@ int main(int argc, char** argv)
         expect(proc->lpVtbl->getLatencySamples(proc) == 0, "initial latency is 0");
         handler.restartFlags = 0;
         ctrl->lpVtbl->setParamNormalized(ctrl, lookaheadId, 1.0);
+        processOnce();   // while processing, the audio thread applies UI edits
         expect((handler.restartFlags
                 & Steinberg_Vst_RestartFlags_kLatencyChanged) != 0,
                "latency change notifies restartComponent(kLatencyChanged)");
@@ -1067,6 +1077,122 @@ int main(int argc, char** argv)
                    "deferred latency is reported");
             ctrl->lpVtbl->setParamNormalized(ctrl, lookaheadId, 0.0);   // UI thread
         }
+        // 13) More than 256 events in one block (300 gain points, a note-off
+        //     and a poly-pressure event): every parameter's final value and
+        //     every note event must survive. The old list overwrote its last
+        //     slot on overflow, so the gain stayed at its 255th point (0.25)
+        //     and the note-off was replaced by the event after it - the
+        //     voice rang on.
+        {
+            fillInput(1.0f);
+            changes.add(gainId).points.push_back({ 0, 1.0 });
+            events.noteOn(60, 1.0f, 0);
+            processOnce();
+            ParamQueue& points = changes.add(gainId);
+            for (Steinberg_int32 i = 0; i < 300; ++i)
+                points.points.push_back({ i, i == 299 ? 0.75 : 0.25 });
+            events.noteOff(60, 400);
+            events.polyPressure(60, 0.5f, 401);
+            processOnce();
+            processOnce();
+            double worst = 0.0;
+            for (int i = 0; i < 512; ++i)
+                worst = std::fmax(worst, std::fabs(outL[static_cast<size_t>(i)] - 0.75));
+            std::printf("      overflow block: mean %.4f (expected 0.75), worst deviation %.3g\n",
+                        outMean(), worst);
+            expect(std::fabs(outMean() - 0.75) < 1e-3,
+                   "event overflow keeps every parameter's final value");
+            expect(worst < 1e-3, "event overflow keeps the note-off (no stuck voice)");
+        }
+
+        // 14) An effect given no input bus processes silence. The old code
+        //     fell back to the output buffer and processed the host's stale
+        //     output (0.7 here) as if it were input.
+        {
+            data.numInputs = 0;
+            data.inputs = nullptr;
+            for (int i = 0; i < 512; ++i)
+            {
+                outL[static_cast<size_t>(i)] = 0.7f;
+                outR[static_cast<size_t>(i)] = 0.7f;
+            }
+            processOnce();
+            std::printf("      no input bus: output mean %.4f (expected 0)\n", outMean());
+            expect(std::fabs(outMean()) < 1e-6, "missing input bus processes silence");
+            data.numInputs = expectedInBuses;
+            data.inputs = inputBuses;
+        }
+
+        // 15) Sample-accurate bypass: with the wet path silent (gain 0) a
+        //     bypass point at offset 384 must start the crossfade there. The
+        //     old blend ran once per block and began it at sample 0.
+        {
+            fillInput(1.0f);
+            changes.add(gainId).points.push_back({ 0, 0.0 });
+            processOnce();
+            changes.add(bypassId).points.push_back({ 384, 1.0 });
+            processOnce();
+            int first = -1;
+            for (int i = 0; i < 512; ++i)
+                if (outL[static_cast<size_t>(i)] != 0.0f)
+                {
+                    first = i;
+                    break;
+                }
+            std::printf("      bypass at 384: crossfade starts at sample %d\n", first);
+            expect(first >= 352 && outL[511] > 0.0f, "bypass crossfade starts at its point");
+            changes.add(bypassId).points.push_back({ 0, 0.0 });
+            changes.add(gainId).points.push_back({ 0, 1.0 });
+            for (int block = 0; block < 2; ++block) processOnce();
+        }
+
+        // 16) A state without some parameter (saved before it existed) must
+        //     restore that parameter's DEFAULT. The old code kept whatever
+        //     value the instance held (0.3 here).
+        {
+            changes.add(gainId).points.push_back({ 0, 0.3 });
+            processOnce();
+            std::vector<uint8_t> blob;
+            auto put32 = [&](uint32_t v) {
+                for (int b = 0; b < 4; ++b) blob.push_back(static_cast<uint8_t>(v >> (8 * b)));
+            };
+            put32(0x4453504Bu);              // "DSPK"
+            put32(1u);                       // version
+            put32(1u);                       // one entry: the lookahead only
+            put32(lookaheadId);
+            put32(0u);                       // 0.0 as a double, low then high
+            put32(0u);
+            put32(0u);                       // no user section
+            MemoryStream older;
+            older.bytes = blob;
+            expect(comp->lpVtbl->setState(comp, reinterpret_cast<Steinberg_IBStream*>(&older))
+                       == Steinberg_kResultOk,
+                   "setState accepts a state from an older version");
+            expect(std::fabs(ctrl->lpVtbl->getParamNormalized(ctrl, gainId) - 1.0) < 1e-9,
+                   "a parameter missing from the state takes its default");
+            processOnce();
+        }
+
+        // 17) IMidiMapping maps every controller. The old table mapped only
+        //     CC1, CC64, channel pressure and pitch bend.
+        {
+            void* rawMapAll = nullptr;
+            ctrl->lpVtbl->queryInterface(ctrl, Steinberg_Vst_IMidiMapping_iid, &rawMapAll);
+            bool all = rawMapAll != nullptr;
+            if (rawMapAll != nullptr)
+            {
+                auto* map = static_cast<Steinberg_Vst_IMidiMapping*>(rawMapAll);
+                for (Steinberg_int16 cc = 0; cc < 130; ++cc)
+                {
+                    Steinberg_Vst_ParamID mapped = 0;
+                    all = all && map->lpVtbl->getMidiControllerAssignment(map, 0, 15, cc, &mapped)
+                                     == Steinberg_kResultTrue;
+                }
+                map->lpVtbl->release(map);
+            }
+            expect(all, "every MIDI controller (CC 0-127, pressure, bend) is mapped");
+        }
+
         data.processContext = nullptr;
         context.state = 0;
     }

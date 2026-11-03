@@ -46,6 +46,11 @@
  *   after parameter motion notifies kAudioUnitProperty_Latency listeners.
  * - Host bypass maps to kAudioUnitProperty_BypassEffect with the same
  *   crossfade as the other backends.
+ * - Threading: while initialized, the render thread is the only caller of
+ *   the user's setParameter; AudioUnitSetParameter from another thread, the
+ *   editor, ClassInfo and preset loads update the shadow and are applied at
+ *   the next render (DSPark setters such as Equalizer::setBand allow one
+ *   writer). State and preset loads notify AU parameter listeners.
  * - Input arrives by pulling the host's render callback (or connection),
  *   the universal aufx pattern auval exercises. render() runs under a
  *   DenormalGuard (FTZ/DAZ).
@@ -65,8 +70,11 @@
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreFoundation/CoreFoundation.h>
 
+// AUParameterListenerNotify (state / preset loads), AUParameterSet and
+// AUEventListenerNotify (editor gestures): all in AudioToolbox.framework.
+#include <AudioToolbox/AudioUnitUtilities.h>
+
 #if defined(DSPARK_PLUGIN_WEBVIEW)
-#include <AudioToolbox/AudioUnitUtilities.h>   // AUParameterSet, AUEventListenerNotify
 #include <dlfcn.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -78,7 +86,14 @@
 #include <atomic>
 #include <cstring>
 #include <new>
+#include <thread>
 #include <vector>
+
+// Survive a <windows.h>-style min/max macro (restored at the end).
+#pragma push_macro("min")
+#pragma push_macro("max")
+#undef min
+#undef max
 
 namespace dspark::plugin::au {
 
@@ -133,12 +148,14 @@ struct EditorViewSink
     void* context = nullptr;
 };
 
+inline Class editorContainerClass() noexcept;
+
 inline void editorContainerDealloc(void* self, SEL) noexcept
 {
     // Instances exist only after the class registered, so the lookup cannot
     // miss; the superclass is resolved from the registered class (NOT from
     // object_getClass) so a future subclass would not recurse.
-    Class cls = objc_getClass("DSParkAUEditorContainer");
+    Class cls = editorContainerClass();
     if (cls == nullptr) return;
     if (Ivar ivar = class_getInstanceVariable(cls, "dsparkSink"))
     {
@@ -156,12 +173,19 @@ inline void editorContainerDealloc(void* self, SEL) noexcept
  *  not loaded (a faceless host like auval - which never asks for views). */
 inline Class editorContainerClass() noexcept
 {
+    // The class name carries this binary's own suffix: a process-wide name
+    // let the first DSPark plugin loaded register it, and every later plugin
+    // binary then ran THAT binary's dealloc code (another DSPark version, or
+    // an image the host may since have unloaded).
     static Class registered = []() -> Class {
         Class viewCls = objc_getClass("NSView");
         if (viewCls == nullptr) return nullptr;
-        Class c = objc_allocateClassPair(viewCls, "DSParkAUEditorContainer", 0);
-        if (c == nullptr)   // another DSPark plugin in this process won the race
-            return objc_getClass("DSParkAUEditorContainer");
+        static char name[96];
+        webview_ui::objc_glue::imageUniqueClassName("DSParkAUEditorContainer",
+                                                    name, sizeof(name));
+        Class c = objc_allocateClassPair(viewCls, name, 0);
+        if (c == nullptr)   // this image registered it already
+            return objc_getClass(name);
         class_addIvar(c, "dsparkSink", sizeof(void*), alignof(void*) == 8 ? 3 : 2, "^v");
         class_addMethod(c, sel_registerName("dealloc"),
                         reinterpret_cast<IMP>(&editorContainerDealloc), "v@:");
@@ -193,10 +217,12 @@ inline void* editorFactoryUiView(void*, SEL, void* audioUnit, ViewSize size) noe
 inline Class editorFactoryClass() noexcept
 {
     static Class registered = []() -> Class {
-        Class c = objc_allocateClassPair(objc_getClass("NSObject"),
-                                         "DSParkAUCocoaViewFactory", 0);
+        static char name[96];   // per-binary name, see editorContainerClass()
+        webview_ui::objc_glue::imageUniqueClassName("DSParkAUCocoaViewFactory",
+                                                    name, sizeof(name));
+        Class c = objc_allocateClassPair(objc_getClass("NSObject"), name, 0);
         if (c == nullptr)
-            return objc_getClass("DSParkAUCocoaViewFactory");
+            return objc_getClass(name);
         class_addMethod(c, sel_registerName("interfaceVersion"),
                         reinterpret_cast<IMP>(&editorFactoryInterfaceVersion), "I@:");
         class_addMethod(c, sel_registerName("uiViewForAudioUnit:withSize:"),
@@ -268,7 +294,9 @@ struct Plugin
 
     double sampleRate = 44100.0;
     UInt32 maxFrames = 1156;            // CoreAudio's historical default
-    bool initialized = false;
+    /// Written on the host's main thread, read on the render thread and by
+    /// parameter calls from any thread.
+    std::atomic<bool> initialized { false };
     int currentChannels = defaultChannelCount<P>();   // negotiated width
     UInt32 offlineRender = 0;
 
@@ -305,8 +333,26 @@ struct Plugin
 
     // Sample-accurate parameter events (kAudioUnitScheduleParametersSelect
     // arrives on the render thread, right before the matching render call).
-    BlockEvent scheduled[kMaxBlockEvents];
-    int scheduledCount = 0;
+    // Immediate events and bypass points go straight into the block list
+    // (merging past its capacity instead of dropping the newest); ramps are
+    // kept whole and evaluated against the slice length inside render().
+    BlockEventList blockEvents;
+    struct Ramp
+    {
+        uint32_t paramId;
+        SInt32 startOffset;          // may be negative: began in an earlier slice
+        UInt32 duration;
+        float startValue, endValue;  // plain
+    };
+    static constexpr int kMaxRamps = 64;
+    Ramp ramps[kMaxRamps] {};
+    int rampCount = 0;
+
+    // One writer for the user's setParameter: the render thread while the
+    // unit is initialized; edits from any other thread are handed over.
+    PendingParams<kNumParams> pending;
+    std::atomic<std::thread::id> renderThread {};
+    UInt32 sidechainChannels = 0;    // input element 1 width (0: follow main)
 
     // Factory presets: AUPreset records plus the lazily built CFArray the
     // property hands out (retained per get; the strings live here).
@@ -351,7 +397,7 @@ struct Plugin
         {
             if (idx < 0 || idx >= kNumPresets) return;
             for (size_t i = 0; i < kNumParams; ++i)
-                applyNormalized(static_cast<int>(i), presetNormalized<P>(idx, i));
+                applyFromAnyThread(static_cast<int>(i), presetNormalized<P>(idx, i));
             currentPresetNumber = idx;
         }
         else
@@ -442,9 +488,7 @@ struct Plugin
 
     static int indexOfParamId(AudioUnitParameterID id) noexcept
     {
-        for (size_t i = 0; i < kNumParams; ++i)
-            if (hash32(P::parameters[i].id) == id) return static_cast<int>(i);
-        return -1;
+        return paramIndexOf<P>(id);
     }
 
     void applyNormalized(int index, double normalized) noexcept
@@ -457,8 +501,53 @@ struct Plugin
         user.setParameter(index, static_cast<float>(toPlain(spec, normalized)));
     }
 
+    /**
+     * A change arriving on any thread. While initialized, a thread other
+     * than the render thread only writes the shadow and marks the parameter;
+     * render() calls the user's setParameter at its next slice. Calling it
+     * directly (the old behaviour) made the host's UI thread a second
+     * concurrent writer of DSPark setters that allow one. Returns true when
+     * the change reached the DSP immediately.
+     */
+    bool applyFromAnyThread(int index, double normalized) noexcept
+    {
+        if (normalized != normalized) return false;
+        if (initialized
+            && std::this_thread::get_id() != renderThread.load(std::memory_order_relaxed))
+        {
+            shadow[static_cast<size_t>(index)].store(normalized, std::memory_order_relaxed);
+            pending.mark(static_cast<size_t>(index));
+            return false;
+        }
+        applyNormalized(index, normalized);
+        return true;
+    }
+
+    bool drainPending() noexcept
+    {
+        return pending.drain([this](int i) {
+            user.setParameter(i, static_cast<float>(toPlain(
+                P::parameters[static_cast<size_t>(i)],
+                shadow[static_cast<size_t>(i)].load(std::memory_order_relaxed))));
+        });
+    }
+
+    /** Tells AU parameter listeners (host automation lanes, generic views)
+     *  that every parameter may have moved - the AUBase convention after a
+     *  state or preset load, which the old code never followed. */
+    void notifyAllParameters() noexcept
+    {
+        AudioUnitParameter any {};
+        any.mAudioUnit = instance;
+        any.mParameterID = kAUParameterListener_AnyParameter;
+        any.mScope = kAudioUnitScope_Global;
+        any.mElement = 0;
+        AUParameterListenerNotify(nullptr, nullptr, &any);
+    }
+
     void applyAllShadows() noexcept
     {
+        pending.drain([](int) {});   // every value is re-applied right below
         for (size_t i = 0; i < kNumParams; ++i)
             user.setParameter(static_cast<int>(i),
                 static_cast<float>(toPlain(P::parameters[i],
@@ -607,7 +696,9 @@ struct Plugin
             dryDelay.prepare(std::max(2 * latency, kDryDelayMinCapacity),
                              static_cast<int>(maxFrames));
         }
-        scheduledCount = 0;
+        blockEvents.clear();
+        rampCount = 0;
+        renderThread.store(std::thread::id {}, std::memory_order_relaxed);
         startLatencyTick();
         initialized = true;
         return noErr;
@@ -616,6 +707,7 @@ struct Plugin
     OSStatus uninitialize() noexcept
     {
         initialized = false;
+        drainPending();   // no render can run now: hand edits over directly
         stopLatencyTick();
         return noErr;
     }
@@ -782,7 +874,10 @@ struct Plugin
         {
             if (*ioSize < sizeof(AudioStreamBasicDescription))
                 return kAudioUnitErr_InvalidPropertyValue;
-            fillStreamFormat(*static_cast<AudioStreamBasicDescription*>(outData));
+            auto& f = *static_cast<AudioStreamBasicDescription*>(outData);
+            fillStreamFormat(f);
+            if (scope == kAudioUnitScope_Input && element == 1 && sidechainChannels != 0)
+                f.mChannelsPerFrame = sidechainChannels;
             *ioSize = sizeof(AudioStreamBasicDescription);
             return noErr;
         }
@@ -1101,9 +1196,18 @@ struct Plugin
                 return kAudioUnitErr_InvalidPropertyValue;
             const auto* f = static_cast<const AudioStreamBasicDescription*>(inData);
             if (!acceptableFormat(*f)) return kAudioUnitErr_FormatNotSupported;
+            if (HasSidechain<P> && scope == kAudioUnitScope_Input && element == 1)
+            {
+                // The sidechain's own width: a mono key on a stereo main is
+                // pulled mono and fed to both detector ears. It never sets
+                // the main width - the old code let this element switch the
+                // whole unit, and a stereo track then rendered one channel.
+                sidechainChannels = f->mChannelsPerFrame;
+                return noErr;
+            }
             sampleRate = f->mSampleRate;
-            // The negotiated width: every element of the instance follows
-            // (initialize() prepares the plugin at this count).
+            // The negotiated width: the main elements follow it (initialize()
+            // prepares the plugin at this count).
             currentChannels = static_cast<int>(f->mChannelsPerFrame);
             return noErr;
         }
@@ -1115,6 +1219,11 @@ struct Plugin
         case kAudioUnitProperty_MaximumFramesPerSlice:
             if (inData == nullptr || inSize < sizeof(UInt32))
                 return kAudioUnitErr_InvalidPropertyValue;
+            // Takes effect at the next initialize(), which sizes the
+            // buffers. render() refuses a slice longer than what was
+            // allocated: the old code compared against this new value and
+            // overran its 512-frame buffers when a host raised it while
+            // initialized.
             maxFrames = *static_cast<const UInt32*>(inData);
             notifyProperty(id, scope, element);
             return noErr;
@@ -1131,6 +1240,7 @@ struct Plugin
                     return kAudioUnitErr_InvalidPropertyValue;
                 applyFactoryPresetIdx(preset->presetNumber);
                 refreshLatency();
+                notifyAllParameters();
                 if (presetName != nullptr) CFRelease(presetName);
                 presetName = preset->presetName != nullptr
                     ? static_cast<CFStringRef>(CFRetain(preset->presetName))
@@ -1216,9 +1326,10 @@ struct Plugin
                 CFDictionaryGetValue(dict, CFSTR("dspark-state")));
             if (data == nullptr || CFGetTypeID(data) != CFDataGetTypeID())
                 return noErr;   // foreign preset: keep current state
+            // Parameters the blob does not carry take their DEFAULTS (the old
+            // code kept whatever value the instance happened to hold).
             double norm[kNumParams == 0 ? 1 : kNumParams];
-            for (size_t i = 0; i < kNumParams; ++i)
-                norm[i] = shadow[i].load(std::memory_order_relaxed);
+            loadDefaultNormalized<P>(norm);
             int program = -1;
             int bypassState = -1;
             if (applyState(user,
@@ -1227,12 +1338,13 @@ struct Plugin
                            &program, &bypassState))
             {
                 for (size_t i = 0; i < kNumParams; ++i)
-                    applyNormalized(static_cast<int>(i), norm[i]);
+                    applyFromAnyThread(static_cast<int>(i), norm[i]);
                 if (kNumPresets > 0 && program >= 0 && program < kNumPresets)
                     currentPresetNumber = program;
                 if (bypassState >= 0)
                     bypass.store(bypassState != 0, std::memory_order_relaxed);
                 refreshLatency();   // restored state may imply a new lookahead
+                notifyAllParameters();
             }
             return noErr;
         }
@@ -1272,9 +1384,9 @@ struct Plugin
         }
         const int idx = indexOfParamId(id);
         if (idx < 0) return kAudioUnitErr_InvalidParameter;
-        applyNormalized(idx,
-            toNormalized(P::parameters[static_cast<size_t>(idx)], value));
-        refreshLatency();
+        if (applyFromAnyThread(idx,
+                toNormalized(P::parameters[static_cast<size_t>(idx)], value)))
+            refreshLatency();
         return noErr;
     }
 
@@ -1429,8 +1541,11 @@ struct Plugin
             UInt32 mNumberBuffers;
             ::AudioBuffer mBuffers[2];   // CoreAudio's, not dspark::AudioBuffer
         } list {};
-        const UInt32 width = static_cast<UInt32>(currentChannels) < 2u
-                           ? static_cast<UInt32>(currentChannels) : 2u;
+        // The sidechain element pulls at its own negotiated width.
+        const UInt32 elementWidth = element == 1 && sidechainChannels != 0
+                                  ? sidechainChannels
+                                  : static_cast<UInt32>(currentChannels);
+        const UInt32 width = elementWidth < 2u ? elementWidth : 2u;
         list.mNumberBuffers = width;
         for (UInt32 ch = 0; ch < width; ++ch)
         {
@@ -1455,7 +1570,72 @@ struct Plugin
         for (UInt32 ch = 0; ch < width && ch < list.mNumberBuffers; ++ch)
             if (list.mBuffers[ch].mData != nullptr)
                 dst[ch] = static_cast<float*>(list.mBuffers[ch].mData);
+        if (width == 1 && currentChannels > 1)
+            dst[1] = dst[0];   // a mono key feeds both detector ears
         return noErr;
+    }
+
+    /** Expands the slice's scheduled ramps into parameter points at the
+     *  slice start, at every automation-quantum boundary the ramp crosses
+     *  and at its end, each carrying the ramp's linear value at that offset
+     *  (AUBase semantics: startBufferOffset may be negative for a ramp that
+     *  began in an earlier slice). The old code pushed the start value at
+     *  the start offset and the END value at start+duration clamped into
+     *  the slice, so a one-second ramp jumped to its final value within the
+     *  first slice, and a re-issued ramp swung start->end in every slice. */
+    void expandRamps(int frames) noexcept
+    {
+        for (int r = 0; r < rampCount; ++r)
+        {
+            const Ramp& ramp = ramps[r];
+            const int idx = indexOfParamId(ramp.paramId);
+            if (idx < 0) continue;
+            const long long start = ramp.startOffset;
+            const long long end = start + static_cast<long long>(ramp.duration);
+            auto valueAt = [&](long long offset) {
+                if (ramp.duration == 0 || offset >= end) return static_cast<double>(ramp.endValue);
+                const double t = static_cast<double>(offset - start)
+                               / static_cast<double>(ramp.duration);
+                const double u = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+                return ramp.startValue + (static_cast<double>(ramp.endValue) - ramp.startValue) * u;
+            };
+            auto push = [&](long long offset) {
+                BlockEvent ev {};
+                ev.offset = static_cast<int32_t>(offset);
+                ev.kind = BlockEvent::Kind::Param;
+                ev.paramId = ramp.paramId;
+                ev.value = toNormalized(P::parameters[static_cast<size_t>(idx)], valueAt(offset));
+                blockEvents.add(ev);
+            };
+            long long first = start > 0 ? start : 0;
+            if (first >= frames) continue;
+            push(first);
+            for (long long q = (first / kAutomationQuantum + 1) * kAutomationQuantum;
+                 q < frames && q < end; q += kAutomationQuantum)
+                push(q);
+            if (end > first && end < frames && end % kAutomationQuantum != 0)
+                push(end);
+        }
+        rampCount = 0;
+    }
+
+    /** Crossfades @p length output frames from @p start toward the dry copy
+     *  at the current bypass target. */
+    void blendBypass(float* const* out, float* const* dry, UInt32 outCh, int start,
+                     int length) noexcept
+    {
+        const float target = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        if (bypassMix == target && target == 0.0f) return;
+        const float step = 1.0f / static_cast<float>(kBypassRampSamples);
+        float mix = bypassMix;
+        for (int i = 0; i < length; ++i)
+        {
+            mix += (target > mix) ? step : ((target < mix) ? -step : 0.0f);
+            mix = mix < 0.0f ? 0.0f : (mix > 1.0f ? 1.0f : mix);
+            for (UInt32 ch = 0; ch < outCh; ++ch)
+                out[ch][start + i] += (dry[ch][start + i] - out[ch][start + i]) * mix;
+        }
+        bypassMix = mix;
     }
 
     OSStatus render(AudioUnitRenderActionFlags* ioFlags,
@@ -1465,27 +1645,26 @@ struct Plugin
         (void) busNumber;
         if (ioData == nullptr || frames == 0) return noErr;
         if (!initialized) return kAudioUnitErr_Uninitialized;
-        if (frames > maxFrames) return kAudioUnitErr_TooManyFramesToProcess;
+        // Bound by what initialize() allocated, not by the property: a host
+        // may raise MaximumFramesPerSlice while the unit stays initialized.
+        if (frames > maxFrames || frames > pullL.size())
+            return kAudioUnitErr_TooManyFramesToProcess;
 
         // FTZ/DAZ for the whole callback: DSPark processors guard their own
         // hot loops, this covers user DSP in hosts that do not set it.
         dspark::DenormalGuard denormalGuard;
 
+        // This thread now owns setParameter; first apply what other threads
+        // handed over, so the slice's scheduled events below still win.
+        renderThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        bool paramsChanged = drainPending();
+
         forwardTransport();
 
-        // One timestamped stream: scheduled parameter events (already on
-        // this thread) plus the queued MIDI from the MusicDevice selectors.
-        BlockEvent events[kMaxBlockEvents];
-        int eventCount = 0;
-        for (int i = 0; i < scheduledCount; ++i)
-        {
-            BlockEvent ev = scheduled[i];
-            if (ev.offset >= static_cast<int32_t>(frames))
-                ev.offset = static_cast<int32_t>(frames) - 1;
-            if (ev.offset < 0) ev.offset = 0;
-            events[eventCount++] = ev;
-        }
-        scheduledCount = 0;
+        // One timestamped stream: scheduled parameter events and ramps
+        // (already on this thread) plus the queued MIDI from the MusicDevice
+        // selectors.
+        expandRamps(static_cast<int>(frames));
         if constexpr (HasMidi<P>)
         {
             uint32_t head = midiHead.load(std::memory_order_relaxed);
@@ -1496,21 +1675,61 @@ struct Plugin
                 ev.kind = BlockEvent::Kind::Midi;
                 ev.midi = midiRing[head];
                 ev.offset = ev.midi.sampleOffset;
-                if (ev.offset >= static_cast<int32_t>(frames))
-                    ev.offset = static_cast<int32_t>(frames) - 1;
-                if (ev.offset < 0) ev.offset = 0;
-                if (eventCount < kMaxBlockEvents) events[eventCount++] = ev;
-                else events[kMaxBlockEvents - 1] = ev;
+                blockEvents.add(ev);
                 head = (head + 1) & (kMidiRingSize - 1);
             }
             midiHead.store(head, std::memory_order_release);
         }
-        sortBlockEvents(events, eventCount);
+        BlockEventList& events = blockEvents;
+        for (int i = 0; i < events.size(); ++i)
+        {
+            if (events[i].offset >= static_cast<int32_t>(frames))
+                events[i].offset = static_cast<int32_t>(frames) - 1;
+            if (events[i].offset < 0) events[i].offset = 0;
+        }
+        events.sort();
+        const int eventCount = events.size();
+
+        auto applyEvent = [&](const BlockEvent& ev, int blockStart) noexcept -> bool {
+            switch (ev.kind)
+            {
+            case BlockEvent::Kind::Bypass:
+                bypass.store(ev.value >= 0.5, std::memory_order_relaxed);
+                return false;
+            case BlockEvent::Kind::Midi:
+                if constexpr (HasMidi<P>)
+                {
+                    MidiEvent midi = ev.midi;
+                    midi.sampleOffset = ev.offset - blockStart;
+                    if (midi.sampleOffset < 0) midi.sampleOffset = 0;
+                    user.handleMidiEvent(midi);
+                }
+                return false;
+            case BlockEvent::Kind::Param:
+            default:
+                if (const int idx = indexOfParamId(ev.paramId); idx >= 0)
+                {
+                    applyNormalized(idx, ev.value);
+                    return true;
+                }
+                return false;
+            }
+        };
+        auto finish = [&]() noexcept {
+            events.clear();
+            if (paramsChanged) refreshLatency();
+        };
 
         const UInt32 width = static_cast<UInt32>(currentChannels);
         const UInt32 outCh = ioData->mNumberBuffers < width
                            ? ioData->mNumberBuffers : width;
-        if (outCh < 1) return noErr;
+        if (outCh < 1)
+        {
+            for (int i = 0; i < eventCount; ++i)
+                paramsChanged |= applyEvent(events[i], events[i].offset);
+            finish();
+            return noErr;
+        }
 
         // Pull the main input through the registered callback or connection
         // into our own buffers (instruments have no input: silence), then
@@ -1519,7 +1738,13 @@ struct Plugin
         if constexpr (!kIsInstrument)
         {
             const OSStatus pullStatus = pullInput(0, pull, timeStamp, frames);
-            if (pullStatus != noErr) return pullStatus;
+            if (pullStatus != noErr)
+            {
+                for (int i = 0; i < eventCount; ++i)   // never lose the slice's events
+                    paramsChanged |= applyEvent(events[i], events[i].offset);
+                finish();
+                return pullStatus;
+            }
         }
 
         float* out[2] = { nullptr, nullptr };
@@ -1567,28 +1792,6 @@ struct Plugin
 
         // Sub-block processing at quantum-aligned event positions (the
         // sample-accurate default); opted out, everything applies up front.
-        auto applyEvent = [&](const BlockEvent& ev, int blockStart) noexcept -> bool {
-            switch (ev.kind)
-            {
-            case BlockEvent::Kind::Midi:
-                if constexpr (HasMidi<P>)
-                {
-                    MidiEvent midi = ev.midi;
-                    midi.sampleOffset = ev.offset - blockStart;
-                    if (midi.sampleOffset < 0) midi.sampleOffset = 0;
-                    user.handleMidiEvent(midi);
-                }
-                return false;
-            case BlockEvent::Kind::Param:
-            default:
-                if (const int idx = indexOfParamId(ev.paramId); idx >= 0)
-                {
-                    applyNormalized(idx, ev.value);
-                    return true;
-                }
-                return false;
-            }
-        };
         auto processSegment = [&](int start, int length) noexcept {
             float* sub[2] = { out[0] + start,
                               outCh > 1 ? out[1] + start : out[0] + start };
@@ -1604,9 +1807,12 @@ struct Plugin
             }
             else
                 user.processBlock(view);
+            // Soft bypass per segment: a scheduled bypass point starts its
+            // crossfade where it lands (the old once-per-slice blend began
+            // it at frame 0).
+            blendBypass(out, dry, outCh, start, length);
         };
 
-        bool paramsChanged = false;
         const int total = static_cast<int>(frames);
         int evIdx = 0;
         if (!sampleAccurateOf<P>())
@@ -1640,23 +1846,7 @@ struct Plugin
                 paramsChanged |= applyEvent(events[evIdx], total);
         }
 
-        const float target = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
-        if (bypassMix != target || target > 0.0f)
-        {
-            const float step = 1.0f / static_cast<float>(kBypassRampSamples);
-            float mix = bypassMix;
-            for (UInt32 i = 0; i < frames; ++i)
-            {
-                mix += (target > mix) ? step : ((target < mix) ? -step : 0.0f);
-                mix = mix < 0.0f ? 0.0f : (mix > 1.0f ? 1.0f : mix);
-                for (UInt32 ch = 0; ch < outCh; ++ch)
-                    out[ch][i] += (dry[ch][i] - out[ch][i]) * mix;
-            }
-            bypassMix = mix;
-        }
-
-        if (paramsChanged) refreshLatency();
-
+        finish();
         (void) ioFlags;
         return noErr;
     }
@@ -1787,42 +1977,55 @@ struct Component
     /** Scheduled parameter events keep their buffer offsets: AUv2 calls
      *  this on the render thread right before the matching render, so the
      *  events ride the same timestamped stream as MIDI and split processing
-     *  sample-accurately. A ramp contributes its two endpoints. */
+     *  sample-accurately. A ramp is evaluated along its line at the slice
+     *  start, at every automation quantum it crosses and at its end. */
     static OSStatus sScheduleParameters(void* self,
                                         const AudioUnitParameterEvent* events,
                                         UInt32 numEvents) noexcept
     {
         auto* state = fromSelf(self)->state;
-        auto push = [&](AudioUnitParameterID id, AudioUnitScope scope,
-                        float plain, SInt32 offset) {
-            if (scope != kAudioUnitScope_Global) return;
-            if (id == kBypassParamId)
-            {
-                state->bypass.store(plain >= 0.5f, std::memory_order_relaxed);
-                return;
-            }
-            const int idx = Plugin<P>::indexOfParamId(id);
-            if (idx < 0 || state->scheduledCount >= kMaxBlockEvents) return;
+        // Immediate points (bypass included, as a timestamped event so its
+        // crossfade starts where it lands) go into the block list; the list
+        // merges past its capacity instead of dropping the newest points
+        // (the old fixed array ignored every event after the 256th).
+        auto push = [&](AudioUnitParameterID id, float plain, SInt32 offset) {
             BlockEvent ev {};
             ev.offset = offset < 0 ? 0 : offset;
-            ev.kind = BlockEvent::Kind::Param;
-            ev.paramId = id;
-            ev.value = toNormalized(P::parameters[static_cast<size_t>(idx)], plain);
-            state->scheduled[state->scheduledCount++] = ev;
+            if (id == kBypassParamId)
+            {
+                ev.kind = BlockEvent::Kind::Bypass;
+                ev.paramId = kBypassParamId;
+                ev.value = plain >= 0.5f ? 1.0 : 0.0;
+            }
+            else
+            {
+                const int idx = Plugin<P>::indexOfParamId(id);
+                if (idx < 0) return;
+                ev.kind = BlockEvent::Kind::Param;
+                ev.paramId = id;
+                ev.value = toNormalized(P::parameters[static_cast<size_t>(idx)], plain);
+            }
+            state->blockEvents.add(ev);
         };
         for (UInt32 i = 0; events != nullptr && i < numEvents; ++i)
         {
             const auto& ev = events[i];
+            if (ev.scope != kAudioUnitScope_Global) continue;
             if (ev.eventType == kParameterEvent_Immediate)
-                push(ev.parameter, ev.scope, ev.eventValues.immediate.value,
+                push(ev.parameter, ev.eventValues.immediate.value,
                      static_cast<SInt32>(ev.eventValues.immediate.bufferOffset));
             else if (ev.eventType == kParameterEvent_Ramped)
             {
-                push(ev.parameter, ev.scope, ev.eventValues.ramp.startValue,
-                     ev.eventValues.ramp.startBufferOffset);
-                push(ev.parameter, ev.scope, ev.eventValues.ramp.endValue,
-                     ev.eventValues.ramp.startBufferOffset
-                         + static_cast<SInt32>(ev.eventValues.ramp.durationInFrames));
+                // Kept whole: render() evaluates it against the slice length.
+                if (ev.parameter != kBypassParamId && state->rampCount < Plugin<P>::kMaxRamps)
+                    state->ramps[state->rampCount++] = typename Plugin<P>::Ramp {
+                        ev.parameter, ev.eventValues.ramp.startBufferOffset,
+                        ev.eventValues.ramp.durationInFrames,
+                        ev.eventValues.ramp.startValue, ev.eventValues.ramp.endValue };
+                else
+                    push(ev.parameter, ev.eventValues.ramp.endValue,
+                         ev.eventValues.ramp.startBufferOffset
+                             + static_cast<SInt32>(ev.eventValues.ramp.durationInFrames));
             }
         }
         return noErr;
@@ -1925,6 +2128,9 @@ struct Component
         Comp::gManufacturer = dspark::plugin::au::fourCC(manufacturer4);              \
         return Comp::factory(desc);                                                   \
     }
+
+#pragma pop_macro("max")
+#pragma pop_macro("min")
 
 #else // !__APPLE__
 

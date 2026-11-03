@@ -38,8 +38,8 @@
  * - **Buses**: mono and stereo are negotiated through setBusArrangements
  *   per the declared ChannelSupport; a sidechain aux input follows the main
  *   width. Category::Instrument drops the audio inputs entirely and
- *   HasMidi adds an event input bus (notes natively; pitch bend / mod /
- *   sustain / channel pressure through IMidiMapping proxy parameters, the
+ *   HasMidi adds an event input bus (notes natively; every CC, channel
+ *   pressure and pitch bend through IMidiMapping proxy parameters, the
  *   VST3 scheme for MIDI controllers).
  * - **Transport**: when the class implements setTransport, the wrapper
  *   declares its needs through IProcessContextRequirements and forwards the
@@ -49,9 +49,12 @@
  * - **State** uses the format-agnostic container of DSParkPlugin.h, so
  *   presets are byte-identical across the VST3/CLAP/AU backends. Factory
  *   presets publish as a program list with a program-change parameter.
- * - **Threading**: setParamNormalized arrives from the UI thread and
- *   process() from the audio thread; both funnel into the user's
- *   setParameter, which DSPark's contract requires to be atomic-based.
+ * - **Threading**: the user's setParameter has one caller at a time. While
+ *   the host processes it is the audio thread: setParamNormalized, editor
+ *   edits, state loads and program changes from the UI thread update the
+ *   parameter shadow and are applied at the start of the next process()
+ *   (DSPark setters such as Equalizer::setBand allow a single writer).
+ *   Outside processing the UI thread calls it directly.
  *   process() runs under a DenormalGuard (FTZ/DAZ) so user DSP outside
  *   DSPark's own classes is covered in hosts that do not set it.
  * - **Editor**: when plugin/webview/DSParkWebViewEditor.h is included before
@@ -63,6 +66,12 @@
 #define DSPARK_PLUGIN_VST3_INCLUDED 1
 
 #include "../DSParkPlugin.h"
+
+// Survive a <windows.h> included earlier without NOMINMAX (restored at the end).
+#pragma push_macro("min")
+#pragma push_macro("max")
+#undef min
+#undef max
 
 #include "vst3_c_api.h"
 
@@ -274,13 +283,105 @@ inline bool tuidEqual(const Steinberg_TUID a, const Steinberg_TUID b) noexcept
     return std::memcmp(a, b, sizeof(Steinberg_TUID)) == 0;
 }
 
+/**
+ * @brief UTF-8 -> the UTF-16 String128 every VST3 name/unit/text field uses.
+ *
+ * Parameter names, units, labels and preset names are UTF-8 in the plugin
+ * class. Copying them byte by byte (the old behaviour) turned a two-byte
+ * character such as U+00F6 into two mojibake units. Malformed input decodes
+ * to U+FFFD, characters outside the BMP become surrogate pairs, and
+ * truncation at 127 units never splits a pair.
+ */
+inline void utf8ToString128(const char* src, Steinberg_Vst_String128 dst) noexcept
+{
+    int n = 0;
+    const auto* s = reinterpret_cast<const unsigned char*>(src != nullptr ? src : "");
+    while (*s != 0)
+    {
+        const unsigned char lead = *s++;
+        uint32_t cp = lead;
+        int extra = 0;
+        if (lead >= 0x80u)
+        {
+            if ((lead & 0xE0u) == 0xC0u)      { cp = lead & 0x1Fu; extra = 1; }
+            else if ((lead & 0xF0u) == 0xE0u) { cp = lead & 0x0Fu; extra = 2; }
+            else if ((lead & 0xF8u) == 0xF0u) { cp = lead & 0x07u; extra = 3; }
+            else                              { cp = 0xFFFDu; }
+            for (int k = 0; k < extra; ++k)
+            {
+                if ((*s & 0xC0u) != 0x80u) { cp = 0xFFFDu; extra = 0; break; }
+                cp = (cp << 6) | (*s++ & 0x3Fu);
+            }
+            const bool overlong = (extra == 1 && cp < 0x80u) || (extra == 2 && cp < 0x800u)
+                               || (extra == 3 && cp < 0x10000u);
+            if (overlong || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu))
+                cp = 0xFFFDu;
+        }
+        if (cp >= 0x10000u)
+        {
+            if (n + 2 > 127) break;
+            cp -= 0x10000u;
+            dst[n++] = static_cast<Steinberg_char16>(0xD800u + (cp >> 10));
+            dst[n++] = static_cast<Steinberg_char16>(0xDC00u + (cp & 0x3FFu));
+        }
+        else
+        {
+            if (n + 1 > 127) break;
+            dst[n++] = static_cast<Steinberg_char16>(cp);
+        }
+    }
+    dst[n] = 0;
+}
+
+/// Kept for source compatibility: every String128 is filled from UTF-8.
 inline void asciiToString128(const char* src, Steinberg_Vst_String128 dst) noexcept
 {
-    int i = 0;
-    if (src != nullptr)
-        for (; i < 127 && src[i] != '\0'; ++i)
-            dst[i] = static_cast<Steinberg_char16>(static_cast<unsigned char>(src[i]));
-    dst[i] = 0;
+    utf8ToString128(src, dst);
+}
+
+/** @brief The inverse, for host text (getParamValueByString): UTF-16 ->
+ *  UTF-8 into @p dst, always terminated; unpaired surrogates -> U+FFFD. */
+inline void string128ToUtf8(const Steinberg_char16* src, char* dst, size_t cap) noexcept
+{
+    if (dst == nullptr || cap == 0) return;
+    size_t n = 0;
+    for (int i = 0; src != nullptr && i < 128 && src[i] != 0; ++i)
+    {
+        uint32_t cp = src[i];
+        if (cp >= 0xD800u && cp <= 0xDBFFu && i + 1 < 128
+            && src[i + 1] >= 0xDC00u && src[i + 1] <= 0xDFFFu)
+        {
+            cp = 0x10000u + ((cp - 0xD800u) << 10) + (static_cast<uint32_t>(src[i + 1]) - 0xDC00u);
+            ++i;
+        }
+        else if (cp >= 0xD800u && cp <= 0xDFFFu)
+            cp = 0xFFFDu;
+        char buf[4];
+        size_t len = 0;
+        if (cp < 0x80u)
+            buf[len++] = static_cast<char>(cp);
+        else if (cp < 0x800u)
+        {
+            buf[len++] = static_cast<char>(0xC0u | (cp >> 6));
+            buf[len++] = static_cast<char>(0x80u | (cp & 0x3Fu));
+        }
+        else if (cp < 0x10000u)
+        {
+            buf[len++] = static_cast<char>(0xE0u | (cp >> 12));
+            buf[len++] = static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+            buf[len++] = static_cast<char>(0x80u | (cp & 0x3Fu));
+        }
+        else
+        {
+            buf[len++] = static_cast<char>(0xF0u | (cp >> 18));
+            buf[len++] = static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu));
+            buf[len++] = static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+            buf[len++] = static_cast<char>(0x80u | (cp & 0x3Fu));
+        }
+        if (n + len + 1 > cap) break;
+        for (size_t k = 0; k < len; ++k) dst[n++] = buf[k];
+    }
+    dst[n] = '\0';
 }
 
 inline void copyAscii(const char* src, char* dst, size_t cap) noexcept
@@ -326,19 +427,20 @@ inline constexpr int      kBypassRampSamples = 256;
 inline constexpr Steinberg_int32 kPresetProgramListId = 1;
 
 // MIDI controllers travel as proxy parameters in VST3 (the IMidiMapping
-// scheme): one hidden ParamID per (channel, controller). Four controllers
-// cover playable MIDI: mod wheel, sustain, channel pressure, pitch bend.
+// scheme): one hidden ParamID per (channel, controller). Every controller
+// the VST3 numbering defines is mapped - CC 0..127, channel pressure (128)
+// and pitch bend (129) - so a plugin sees the same controllers through VST3
+// as through the raw MIDI of CLAP and AU.
 inline constexpr uint32_t kMidiProxyBase = 0x4D440000u;    // 'MD' marker
-inline constexpr int      kMidiProxyControllers[4] = { 1, 64, 128, 129 };
-inline constexpr int      kNumMidiProxies = 16 * 4;        // channels x controllers
+inline constexpr int      kNumMidiControllers = 130;       // VST3 kCountCtrlNumber
+inline constexpr int      kNumMidiProxies = 16 * kNumMidiControllers;
 
 inline constexpr bool isMidiProxyId(uint32_t id) noexcept
 {
     if ((id & 0xFFFF0000u) != kMidiProxyBase) return false;
     const uint32_t ctrl = id & 0xFFu;
     const uint32_t channel = (id >> 8) & 0xFFu;
-    return channel < 16
-        && (ctrl == 1 || ctrl == 64 || ctrl == 128 || ctrl == 129);
+    return channel < 16 && ctrl < static_cast<uint32_t>(kNumMidiControllers);
 }
 
 inline constexpr uint32_t midiProxyId(int channel, int controller) noexcept
@@ -438,6 +540,13 @@ struct Plugin
     std::atomic<Steinberg_int32> pendingRestart { 0 };
     UiTicker uiTicker;
 
+    /// True while the host processes (setProcessing(true) .. (false), and any
+    /// process() call). While it is set, UI-thread edits go through `pending`
+    /// so the user's setParameter has exactly one caller: the audio thread.
+    std::atomic<bool> processing { false };
+    PendingParams<kNumParams> pending;
+    BlockEventList blockEvents;   // one block of host events (audio thread)
+
     Plugin() noexcept
     {
         componentVtbl  = &kComponentVtbl;
@@ -449,6 +558,10 @@ struct Plugin
         for (size_t i = 0; i < kNumParams; ++i)
             shadow[i].store(toNormalized(P::parameters[i], P::parameters[i].defValue),
                             std::memory_order_relaxed);
+        if constexpr (HasMidi<P>)
+            for (int ch = 0; ch < 16; ++ch)   // pitch bend rests at the centre
+                midiProxyShadow[static_cast<size_t>(ch * kNumMidiControllers + 129)].store(
+                    0.5, std::memory_order_relaxed);
     }
 
     // --- lens recovery ---------------------------------------------------------
@@ -519,11 +632,10 @@ struct Plugin
 
     static int indexOfParamId(Steinberg_Vst_ParamID id) noexcept
     {
-        for (size_t i = 0; i < kNumParams; ++i)
-            if (hash32(P::parameters[i].id) == id) return static_cast<int>(i);
-        return -1;
+        return paramIndexOf<P>(id);
     }
 
+    /** Audio thread (or no processing at all): shadow + user setter. */
     void applyNormalized(int index, double normalized) noexcept
     {
         // Host values are untrusted doubles: a NaN would pass both range
@@ -534,26 +646,68 @@ struct Plugin
         user.setParameter(index, static_cast<float>(toPlain(spec, normalized)));
     }
 
+    /**
+     * A change made on the UI thread (controller setParamNormalized, editor,
+     * state, program change). While the host processes, only the shadow is
+     * written and the parameter is marked; the audio thread calls the user's
+     * setParameter at its next block. Calling it here instead (the old
+     * behaviour) made the UI thread a second concurrent writer of DSPark
+     * setters that allow one - an Equalizer band could end up torn.
+     * Returns true when the change reached the DSP immediately.
+     */
+    bool applyFromUi(int index, double normalized) noexcept
+    {
+        if (normalized != normalized) return false;
+        if (processing.load(std::memory_order_acquire))
+        {
+            shadow[static_cast<size_t>(index)].store(normalized, std::memory_order_relaxed);
+            pending.mark(static_cast<size_t>(index));
+            return false;
+        }
+        applyNormalized(index, normalized);
+        return true;
+    }
+
+    /** Hands the UI-side changes to the DSP (on whichever thread may call
+     *  setParameter now); true when any parameter was applied. */
+    bool drainPending() noexcept
+    {
+        return pending.drain([this](int i) {
+            user.setParameter(i, static_cast<float>(toPlain(
+                P::parameters[static_cast<size_t>(i)],
+                shadow[static_cast<size_t>(i)].load(std::memory_order_relaxed))));
+        });
+    }
+
     void applyAllShadows() noexcept
     {
+        pending.drain([](int) {});   // every value is re-applied right below
         for (size_t i = 0; i < kNumParams; ++i)
             user.setParameter(static_cast<int>(i),
                 static_cast<float>(toPlain(P::parameters[i],
                                            shadow[i].load(std::memory_order_relaxed))));
     }
 
-    /** Applies one factory preset: every parameter, by normalized value. */
-    void applyFactoryPresetIdx(int idx) noexcept
+    /** Applies one factory preset: every parameter, by normalized value -
+     *  from the audio thread (a program-change automation point) or from the
+     *  UI thread (@p fromUi). */
+    void applyFactoryPresetIdx(int idx, bool fromUi = false) noexcept
     {
         if constexpr (kNumPresets > 0)
         {
             if (idx < 0 || idx >= kNumPresets) return;
             for (size_t i = 0; i < kNumParams; ++i)
-                applyNormalized(static_cast<int>(i), presetNormalized<P>(idx, i));
+            {
+                if (fromUi) applyFromUi(static_cast<int>(i), presetNormalized<P>(idx, i));
+                else applyNormalized(static_cast<int>(i), presetNormalized<P>(idx, i));
+            }
             currentProgram.store(idx, std::memory_order_relaxed);
         }
         else
+        {
             (void) idx;
+            (void) fromUi;
+        }
     }
 
     /** The preset index a host-supplied normalized value selects.
@@ -603,12 +757,16 @@ struct Plugin
     }
 
     /** Hands @p flags to the host on the UI thread: at once when called
-     *  there, otherwise through the UI tick. Without a tick (a Linux host
-     *  whose context offers no IRunLoop) the request goes out directly - the
-     *  behaviour those hosts accept. Audio-thread safe: an atomic OR only. */
+     *  there, otherwise queued for the UI tick or the next UI-thread entry
+     *  point (getParamNormalized, setParamNormalized, get/setState,
+     *  setActive, the editor's run-loop timer). The host is never called
+     *  from another thread: without a tick (a Linux host whose initialize()
+     *  context offers no IRunLoop - the spec puts it on IPlugFrame) the old
+     *  code called restartComponent straight from process(). Audio-thread
+     *  safe: an atomic OR only. */
     void requestRestart(Steinberg_int32 flags) noexcept
     {
-        if (onUiThread() || !uiTicker.running())
+        if (onUiThread())
         {
             flags |= pendingRestart.exchange(0, std::memory_order_acq_rel);
             if (auto* h = handler.load(std::memory_order_relaxed); h != nullptr)
@@ -644,10 +802,16 @@ struct Plugin
             (void) context;
     }
 
+    /** terminate() of either interface: deliver what is queued, stop the
+     *  tick and release the host's IComponentHandler, as Steinberg's own
+     *  EditController::terminate does (the old code held it until the last
+     *  release of the plugin, after the host had already torn down). */
     void detachFromHost() noexcept
     {
         deliverPendingRestart();
         uiTicker.stop();
+        if (auto* h = handler.exchange(nullptr, std::memory_order_acq_rel); h != nullptr)
+            reinterpret_cast<Steinberg_FUnknown*>(h)->lpVtbl->release(h);
     }
 
     // --- block event plumbing -------------------------------------------------------
@@ -660,7 +824,7 @@ struct Plugin
      *  is kept with its offset; otherwise only the last point per queue. */
     void collectParameterChanges(Steinberg_Vst_IParameterChanges* changes,
                                  Steinberg_int32 numSamples,
-                                 BlockEvent* events, int& count) noexcept
+                                 BlockEventList& events) noexcept
     {
         if (changes == nullptr) return;
         const Steinberg_int32 queues = changes->lpVtbl->getParameterCount(changes);
@@ -688,8 +852,10 @@ struct Plugin
                                                : BlockEvent::Kind::Param;
                 ev.paramId = id;
                 ev.value = value;
-                if (count < kMaxBlockEvents) events[count++] = ev;
-                else events[kMaxBlockEvents - 1] = ev;   // overflow: keep the latest
+                // Past the capacity an intermediate point gives way; the old
+                // code overwrote the last slot, losing every point but the
+                // final one - final parameter values and note-offs included.
+                events.add(ev);
             }
         }
     }
@@ -697,7 +863,7 @@ struct Plugin
     /** Collects the VST3 note events (HasMidi plugins only). */
     void collectInputEvents(Steinberg_Vst_IEventList* list,
                             Steinberg_int32 numSamples,
-                            BlockEvent* events, int& count) noexcept
+                            BlockEventList& events) noexcept
     {
         if constexpr (HasMidi<P>)
         {
@@ -745,8 +911,7 @@ struct Plugin
                 ev.offset = offset;
                 ev.kind = BlockEvent::Kind::Midi;
                 ev.midi = midi;
-                if (count < kMaxBlockEvents) events[count++] = ev;
-                else events[kMaxBlockEvents - 1] = ev;
+                events.add(ev);
             }
         }
         else
@@ -754,7 +919,6 @@ struct Plugin
             (void) list;
             (void) numSamples;
             (void) events;
-            (void) count;
         }
     }
 
@@ -813,13 +977,13 @@ struct Plugin
         }
     }
 
-    /** Table slot of a proxy id: channel * 4 + controller slot. */
+    /** Table slot of a proxy id: channel * kNumMidiControllers + controller. */
     static int midiProxySlot(uint32_t id) noexcept
     {
         const int channel = static_cast<int>((id >> 8) & 0x0Fu);
-        const uint32_t ctrl = id & 0xFFu;
-        const int slot = ctrl == 1 ? 0 : (ctrl == 64 ? 1 : (ctrl == 128 ? 2 : 3));
-        return channel * 4 + slot;
+        const int ctrl = static_cast<int>(id & 0xFFu);
+        return channel * kNumMidiControllers
+             + (ctrl < kNumMidiControllers ? ctrl : kNumMidiControllers - 1);
     }
 
     // ==========================================================================
@@ -933,6 +1097,13 @@ struct Plugin
             }
             p->prepared = true;
         }
+        else
+        {
+            // Processing is over: UI-side changes may reach the DSP directly.
+            p->processing.store(false, std::memory_order_release);
+            p->drainPending();
+        }
+        p->deliverPendingRestart();
         return Steinberg_kResultOk;
     }
 
@@ -941,7 +1112,9 @@ struct Plugin
     {
         auto* p = fromLens(self_, 0);
         if (state == nullptr) return Steinberg_kInvalidArgument;
-        // Read whatever the host hands us (chunked); cap defensively at 16 MB.
+        // Read whatever the host hands us (chunked). The cap only stops a
+        // hostile endless stream: getState() has no size limit, so the old
+        // 16 MiB cap refused states this plugin had itself written.
         std::vector<uint8_t> blob;
         char chunk[4096];
         for (;;)
@@ -951,18 +1124,19 @@ struct Plugin
                                     &got) != Steinberg_kResultOk || got <= 0)
                 break;
             blob.insert(blob.end(), chunk, chunk + got);
-            if (blob.size() > (16u << 20)) return Steinberg_kResultFalse;
+            if (blob.size() > kMaxStateBytes) return Steinberg_kResultFalse;
         }
+        // Parameters the blob does not carry take their DEFAULTS (the old
+        // code kept whatever value the instance happened to hold).
         double norm[kNumParams == 0 ? 1 : kNumParams];
-        for (size_t i = 0; i < kNumParams; ++i)
-            norm[i] = p->shadow[i].load(std::memory_order_relaxed);
+        loadDefaultNormalized<P>(norm);
         int program = -1;
         int bypassState = -1;
         if (!applyState(p->user, blob.data(), blob.size(), norm, &program,
                         &bypassState))
             return Steinberg_kResultFalse;
         for (size_t i = 0; i < kNumParams; ++i)
-            p->applyNormalized(static_cast<int>(i), norm[i]);
+            p->applyFromUi(static_cast<int>(i), norm[i]);
         if (kNumPresets > 0 && program >= 0 && program < kNumPresets)
             p->currentProgram.store(program, std::memory_order_relaxed);
         if (bypassState >= 0)
@@ -976,6 +1150,7 @@ struct Plugin
     {
         auto* p = fromLens(self_, 0);
         if (state == nullptr) return Steinberg_kInvalidArgument;
+        p->deliverPendingRestart();   // hosts autosave from the UI thread
         double norm[kNumParams == 0 ? 1 : kNumParams];
         for (size_t i = 0; i < kNumParams; ++i)
             norm[i] = p->shadow[i].load(std::memory_order_relaxed);
@@ -1055,8 +1230,48 @@ struct Plugin
         return Steinberg_kResultOk;
     }
 
-    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sSetProcessing(void*, Steinberg_TBool)
-    { return Steinberg_kResultOk; }
+    /** setProcessing(true) starts the audio-thread ownership of setParameter;
+     *  setProcessing(false) - a transport stop, a suspend - ends it and
+     *  clears the processing history through the plugin's reset(), as the
+     *  CLAP and AU wrappers do on their reset calls. The old no-op never
+     *  reached reset() in VST3, so delay lines and reverb tails played on
+     *  across a stop. */
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sSetProcessing(void* self_,
+                                                                   Steinberg_TBool state)
+    {
+        auto* p = fromLens(self_, 1);
+        if (state)
+        {
+            p->processing.store(true, std::memory_order_release);
+            return Steinberg_kResultOk;
+        }
+        p->processing.store(false, std::memory_order_release);
+        p->drainPending();
+        if constexpr (HasReset<P>)
+            p->user.reset();
+        p->dryDelay.reset();
+        p->bypassMix = p->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        return Steinberg_kResultOk;
+    }
+
+    /** Crossfades @p length frames of the output (from @p outStart) toward
+     *  the dry copy (from @p dryStart) at the current bypass target. */
+    void blendBypass(float* const* out, float* const* dry, int nCh, int outStart,
+                     int dryStart, int length) noexcept
+    {
+        const float target = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        if (bypassMix == target && target == 0.0f) return;
+        const float step = 1.0f / static_cast<float>(kBypassRampSamples);
+        float mix = bypassMix;
+        for (int i = 0; i < length; ++i)
+        {
+            mix += (target > mix) ? step : ((target < mix) ? -step : 0.0f);
+            mix = mix < 0.0f ? 0.0f : (mix > 1.0f ? 1.0f : mix);
+            for (int ch = 0; ch < nCh; ++ch)
+                out[ch][outStart + i] += (dry[ch][dryStart + i] - out[ch][outStart + i]) * mix;
+        }
+        bypassMix = mix;
+    }
 
     /** Forwards the host ProcessContext as a TransportInfo (HasTransport). */
     void forwardTransport(const Steinberg_Vst_ProcessContext* ctx) noexcept
@@ -1111,15 +1326,21 @@ struct Plugin
 
         const Steinberg_int32 n = data->numSamples;
 
-        // One timestamped stream for everything the host handed us.
-        BlockEvent events[kMaxBlockEvents];
-        int eventCount = 0;
-        p->collectParameterChanges(data->inputParameterChanges, n, events, eventCount);
-        p->collectInputEvents(data->inputEvents, n, events, eventCount);
-        sortBlockEvents(events, eventCount);
-
-        bool paramsChanged = false;
+        // From here on the audio thread owns setParameter (a host that never
+        // calls setProcessing(true) still gets the single-writer rule), and
+        // it first applies what the UI thread handed over since the last
+        // block, so the host's own queue points below still win.
+        p->processing.store(true, std::memory_order_relaxed);
+        bool paramsChanged = p->drainPending();
         bool programChanged = false;
+
+        // One timestamped stream for everything the host handed us.
+        BlockEventList& events = p->blockEvents;
+        events.clear();
+        p->collectParameterChanges(data->inputParameterChanges, n, events);
+        p->collectInputEvents(data->inputEvents, n, events);
+        events.sort();
+        const int eventCount = events.size();
 
         const bool canRender = n > 0
             && data->symbolicSampleSize == Steinberg_Vst_SymbolicSampleSizes_kSample32
@@ -1144,11 +1365,29 @@ struct Plugin
 
         auto& outBus = data->outputs[0];
         float** out = outBus.Steinberg_Vst_AudioBusBuffers_channelBuffers32;
-        if (out == nullptr || outBus.numChannels < 1) return Steinberg_kResultOk;
         const int width = p->currentChannels;
-        int nCh = outBus.numChannels < width ? outBus.numChannels : width;
-        while (nCh > 0 && out[nCh - 1] == nullptr) --nCh;   // degenerate hosts
-        if (nCh < 1) return Steinberg_kResultOk;
+        int nCh = out == nullptr ? 0 : (outBus.numChannels < width ? outBus.numChannels : width);
+        // Degenerate hosts: stop at the first missing channel pointer. The old
+        // trim only looked at the last one, so a null left channel next to a
+        // valid right one was written through.
+        for (int ch = 0; ch < nCh; ++ch)
+            if (out[ch] == nullptr)
+            {
+                nCh = ch;
+                break;
+            }
+        if (nCh < 1)
+        {
+            // Nothing to render into: still apply the block's events, so
+            // automation, notes and state never desynchronise.
+            for (int i = 0; i < eventCount; ++i)
+                paramsChanged |= p->applyBlockEvent(events[i], events[i].offset,
+                                                    programChanged);
+            if (paramsChanged || programChanged)
+                p->refreshLatency(programChanged
+                    ? Steinberg_Vst_RestartFlags_kParamValuesChanged : 0);
+            return Steinberg_kResultOk;
+        }
 
         const bool haveIn = !kIsInstrument
             && data->numInputs >= 1 && data->inputs != nullptr
@@ -1196,19 +1435,21 @@ struct Plugin
             // cleared (voices ADD) and its bypass blends toward silence (the
             // dry vectors stay zero). Output channels past a narrower input
             // bus (a host that ignored the arrangement) repeat its last one.
+            // An effect whose input is missing (no bus, a deactivated bus, a
+            // null channel pointer) processes silence: the old code fell back
+            // to the output buffer, feeding the host's stale output - often
+            // the previous block - back in as input.
             const size_t bytes = sizeof(float) * static_cast<size_t>(len);
             for (int ch = 0; ch < nCh; ++ch)
             {
-                if (kIsInstrument)
+                const float* src = nullptr;
+                if (!kIsInstrument && haveIn)
+                    src = in[ch < inCh ? ch : inCh - 1];
+                if (src == nullptr)
                 {
                     std::memset(out[ch] + c0, 0, bytes);
+                    if (!kIsInstrument) std::memset(dry[ch], 0, bytes);
                     continue;
-                }
-                const float* src = out[ch];
-                if (haveIn)
-                {
-                    const float* s = in[ch < inCh ? ch : inCh - 1];
-                    if (s != nullptr) src = s;
                 }
                 std::memcpy(dry[ch], src + c0, bytes);
                 if (out[ch] != src)
@@ -1241,6 +1482,12 @@ struct Plugin
                 }
                 else
                     p->user.processBlock(view);
+                // Soft bypass, per segment: a bypass point starts its short
+                // linear crossfade toward the (latency-aligned) dry signal at
+                // the segment where it lands. The old blend ran once per
+                // block with the final target, so the fade began at sample 0
+                // whatever the point's offset.
+                p->blendBypass(out, dry, nCh, start, start - c0, length);
             };
 
             if (!sampleAccurateOf<P>())
@@ -1271,23 +1518,6 @@ struct Plugin
                     processSegment(pos, next - pos);
                     pos = next;
                 }
-            }
-
-            // Soft bypass: short linear crossfade toward the (latency-
-            // aligned) dry signal.
-            const float target = p->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
-            if (p->bypassMix != target || target > 0.0f)
-            {
-                const float step = 1.0f / static_cast<float>(kBypassRampSamples);
-                float mix = p->bypassMix;
-                for (int i = 0; i < len; ++i)
-                {
-                    mix += (target > mix) ? step : ((target < mix) ? -step : 0.0f);
-                    mix = mix < 0.0f ? 0.0f : (mix > 1.0f ? 1.0f : mix);
-                    for (int ch = 0; ch < nCh; ++ch)
-                        out[ch][c0 + i] += (dry[ch][i] - out[ch][c0 + i]) * mix;
-                }
-                p->bypassMix = mix;
             }
         }
         for (; evIdx < eventCount; ++evIdx)   // safety: events at block end
@@ -1409,8 +1639,8 @@ struct Plugin
             // Hidden conduits for IMidiMapping: hosts write MIDI controller
             // motion into them; they never show in generic UIs.
             const int slot = index - kFirstProxyIndex;
-            const int channel = slot / 4;
-            const int ctrl = kMidiProxyControllers[slot % 4];
+            const int channel = slot / kNumMidiControllers;
+            const int ctrl = slot % kNumMidiControllers;
             info->id = midiProxyId(channel, ctrl);
             asciiToString128("MIDI", info->title);
             asciiToString128("MIDI", info->shortTitle);
@@ -1469,11 +1699,8 @@ struct Plugin
     {
         (void) self_;
         if (string == nullptr || normalized == nullptr) return Steinberg_kInvalidArgument;
-        char ascii[64];
-        int i = 0;
-        for (; i < 63 && string[i] != 0; ++i)
-            ascii[i] = static_cast<char>(string[i]);
-        ascii[i] = '\0';
+        char ascii[512];   // UTF-8: a choice label may be non-ASCII
+        string128ToUtf8(string, ascii, sizeof(ascii));
         const int toggle = parseToggleText(ascii);
         if (id == kBypassParamId)
         {
@@ -1573,7 +1800,7 @@ struct Plugin
         {
             // A program change from the host UI: apply the preset and tell
             // the host every other parameter moved (main-thread call).
-            p->applyFactoryPresetIdx(programIndexOf(value));
+            p->applyFactoryPresetIdx(programIndexOf(value), true);
             p->refreshLatency(Steinberg_Vst_RestartFlags_kParamValuesChanged);
             return Steinberg_kResultOk;
         }
@@ -1590,8 +1817,11 @@ struct Plugin
         }
         const int idx = indexOfParamId(id);
         if (idx < 0) return Steinberg_kInvalidArgument;
-        p->applyNormalized(idx, value);   // user setters are atomic by contract
-        p->refreshLatency();
+        // While processing, the host also delivers this value through
+        // process(); the audio thread applies it either way (see applyFromUi).
+        if (p->applyFromUi(idx, value))
+            p->refreshLatency();
+        p->deliverPendingRestart();
         return Steinberg_kResultOk;
     }
 
@@ -1749,7 +1979,7 @@ struct Plugin
     };
 
     // ==========================================================================
-    // Lens 5 - IMidiMapping (pitch bend / mod / sustain / channel pressure
+    // Lens 5 - IMidiMapping (every CC, channel pressure and pitch bend
     // arrive as proxy-parameter automation; surfaced only for HasMidi)
     // ==========================================================================
 
@@ -1760,8 +1990,11 @@ struct Plugin
         if (!HasMidi<P> || id == nullptr || busIndex != 0
             || channel < 0 || channel >= 16)
             return Steinberg_kResultFalse;
+        // Every controller: CC 0..127, channel pressure 128, pitch bend 129
+        // (the old table mapped only 1, 64, 128 and 129, so expression,
+        // breath, filter and every other CC never reached a VST3 plugin).
         const int ctrl = midiControllerNumber;
-        if (ctrl != 1 && ctrl != 64 && ctrl != 128 && ctrl != 129)
+        if (ctrl < 0 || ctrl >= kNumMidiControllers)
             return Steinberg_kResultFalse;
         *id = midiProxyId(channel, ctrl);
         return Steinberg_kResultTrue;
@@ -1915,7 +2148,8 @@ struct View
         auto* view = static_cast<View*>(context);
         const Param& spec = P::parameters[static_cast<size_t>(index)];
         const double normalized = toNormalized(spec, plain);
-        view->owner->applyNormalized(index, normalized);
+        if (view->owner->applyFromUi(index, normalized))
+            view->owner->refreshLatency();
         if (auto* handler = view->owner->handler.load(std::memory_order_relaxed))
         {
             const Steinberg_Vst_ParamID id = hash32(spec.id);
@@ -2388,3 +2622,6 @@ struct Factory
     DSPARK_VST3_EXPORT bool bundleEntry(void*) { return true; }                    \
     DSPARK_VST3_EXPORT bool bundleExit() { return true; }                          \
     }
+
+#pragma pop_macro("max")
+#pragma pop_macro("min")

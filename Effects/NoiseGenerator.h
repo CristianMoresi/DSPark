@@ -7,7 +7,10 @@
  * @file NoiseGenerator.h
  * @brief Audio noise generator conforming to the AudioProcessor contract.
  *
- * Generates white, pink, or brown noise using AnalogRandom internally.
+ * Generates white, pink, or brown noise using AnalogRandom internally. Brown
+ * noise is a leaky integration of the white sequence with its corner fixed at
+ * 38.3 Hz and its level fixed, at any sample rate (the corner of a per-step
+ * leak would scale with the rate: 76.6 Hz at 96 kHz).
  * Follows the standard prepare/processBlock/reset pattern. This acts as a
  * signal generator, completely overwriting the input buffer (channels beyond
  * the prepared count are left untouched).
@@ -86,6 +89,17 @@ public:
 
         generators_.clear();
         generators_.reserve(static_cast<size_t>(targetChannels));
+        brownState_.assign(static_cast<size_t>(targetChannels), T(0));
+
+        // Brown: y = (y + c * w) * a per sample. At 48 kHz a = 0.995 and
+        // c = 0.02 (the reference voicing: corner -ln(a) * fs / (2 pi) =
+        // 38.3 Hz); at other rates a keeps that corner in Hz and c keeps the
+        // output variance c^2 a^2 / (1 - a^2) unchanged.
+        constexpr double kLeak48k = 0.995;
+        const double a = std::pow(kLeak48k, 48000.0 / sampleRate_);
+        brownLeak_ = static_cast<T>(a);
+        brownGain_ = static_cast<T>(0.02 * (kLeak48k / a)
+                     * std::sqrt((1.0 - a * a) / (1.0 - kLeak48k * kLeak48k)));
 
         for (int ch = 0; ch < targetChannels; ++ch)
         {
@@ -132,6 +146,8 @@ public:
         if (numSamples <= 0 || numCh <= 0)
             return;
 
+        const bool brown = type_.load(std::memory_order_relaxed) == Type::Brown;
+
         // Block-level gain smoothing setup
         const T targetGain = gain_.load(std::memory_order_relaxed);
         const T startGain = currentGain_;
@@ -142,6 +158,20 @@ public:
         {
             T* data = buffer.getChannel(ch);
             auto& gen = generators_[static_cast<size_t>(ch)];
+
+            if (brown)
+            {
+                T y = brownState_[static_cast<size_t>(ch)];
+                T g = startGain;
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    y = std::clamp((y + gen.getNextSample() * brownGain_) * brownLeak_, T(-1), T(1));
+                    g = needsSmoothing ? g + gainStep : targetGain;
+                    data[i] = y * g;
+                }
+                brownState_[static_cast<size_t>(ch)] = y;
+                continue;
+            }
 
             if (needsSmoothing)
             {
@@ -181,6 +211,7 @@ public:
             gen.reset();
             gen.reseed(static_cast<uint64_t>(++ch) * 0x9E3779B97F4A7C15ULL);
         }
+        std::fill(brownState_.begin(), brownState_.end(), T(0));
 
         currentGain_ = gain_.load(std::memory_order_relaxed);
     }
@@ -247,7 +278,8 @@ public:
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
         StateWriter w(stateId("NOIS"), 1);
-        w.write("gain", gain_.load(std::memory_order_relaxed));
+        // The blob stores float: the cast keeps NoiseGenerator<double> compiling.
+        w.write("gain", static_cast<float>(gain_.load(std::memory_order_relaxed)));
         w.write("type", static_cast<int32_t>(type_.load(std::memory_order_relaxed)));
         return w.blob();
     }
@@ -274,7 +306,8 @@ private:
                 gen.setNoiseType(AnalogRandom::NoiseType::Pink);
                 break;
             case Type::Brown:
-                gen.setNoiseType(AnalogRandom::NoiseType::Brown);
+                // The integration runs here, at a rate-independent corner.
+                gen.setNoiseType(AnalogRandom::NoiseType::White);
                 break;
         }
     }
@@ -291,6 +324,9 @@ private:
 
     // Value semantics for memory locality. Avoids pointer chasing.
     std::vector<AnalogRandom::Generator<T>> generators_;
+    std::vector<T> brownState_;     ///< Brown integrator per channel (audio thread).
+    T brownLeak_ = T(0.995);
+    T brownGain_ = T(0.02);
 };
 
 } // namespace dspark

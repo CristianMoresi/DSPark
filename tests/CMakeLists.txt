@@ -63,7 +63,9 @@ add_executable(dspark_tests
     TestLoopFinder.cpp
     TestPitchCorrector.cpp
     TestQualityAudit.cpp
-    TestState.cpp)
+    TestState.cpp
+    TestToneDoubleState.cpp
+    TestToneRegressions.cpp)
 
 add_executable(dspark_standalone standalone_compile_test.cpp)
 add_executable(dspark_smoke      functional_smoke_test.cpp)

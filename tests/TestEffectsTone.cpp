@@ -282,12 +282,15 @@ DSPARK_TEST(Equalizer_mode_switch_after_prepare_works)
     eq.prepare(spec(48000.0, 512, 1));
     eq.setBand(0, 2000.0f, 6.0f);
     eq.setFilterMode(Equalizer<float>::FilterMode::LinearPhase);
-    EXPECT_EQ(eq.getLatency(), 512);
+    // Fixed kernel (32768 taps at 48 kHz): latency kernel/2 + kernel/16,
+    // independent of the host block (it used to equal maxBlockSize).
+    EXPECT_EQ(eq.getLatency(), 16384 + 2048);
 
     auto tb = makeBuffer(1, 512);
     int argmax = -1;
     float best = 0.0f;
-    for (int blk = 0; blk < 4; ++blk)
+    const int blocks = (eq.getLatency() + 2048) / 512;
+    for (int blk = 0; blk < blocks; ++blk)
     {
         for (int i = 0; i < 512; ++i) tb.ch(0)[i] = 0.0f;
         if (blk == 0) tb.ch(0)[0] = 1.0f;
@@ -295,7 +298,7 @@ DSPARK_TEST(Equalizer_mode_switch_after_prepare_works)
         for (int i = 0; i < 512; ++i)
             if (std::abs(tb.ch(0)[i]) > best) { best = std::abs(tb.ch(0)[i]); argmax = blk * 512 + i; }
     }
-    EXPECT_EQ(argmax, 512); // the reported latency is the real one
+    EXPECT_EQ(argmax, eq.getLatency()); // the reported latency is the real one
 
     eq.setFilterMode(Equalizer<float>::FilterMode::MinimumPhase);
     EXPECT_EQ(eq.getLatency(), 0);
@@ -336,18 +339,20 @@ DSPARK_TEST(Equalizer_invalid_inputs_are_ignored)
     StateReader r(blob.data(), blob.size());
     EXPECT_NEAR(r.read("b0.freq", 999.0f), 1000.0f, 1e-3f);
 
-    EXPECT_EQ(subject.getLatency(), 512);
+    EXPECT_EQ(subject.getLatency(), 16384 + 2048); // fixed linear-phase kernel
 
-    auto ta = makeBuffer(2, 4096);
-    auto tb = makeBuffer(2, 4096);
+    // Long enough to get past the linear-phase latency into real output.
+    const int kLen = 4096 + 16384 + 2048;
+    auto ta = makeBuffer(2, kLen);
+    auto tb = makeBuffer(2, kLen);
     for (int ch = 0; ch < 2; ++ch)
-        for (int i = 0; i < 4096; ++i)
+        for (int i = 0; i < kLen; ++i)
         {
             const float v = 0.4f * std::sin(6.2831853f * (ch == 0 ? 440.0f : 620.0f) * i / 48000.0f);
             ta.ch(ch)[i] = v; tb.ch(ch)[i] = v;
         }
     // Process per 512-sample block (the LP engine's prepared block size).
-    for (int off = 0; off < 4096; off += 512)
+    for (int off = 0; off < kLen; off += 512)
     {
         float* pa[2] = { ta.ch(0) + off, ta.ch(1) + off };
         float* pb[2] = { tb.ch(0) + off, tb.ch(1) + off };
@@ -355,10 +360,10 @@ DSPARK_TEST(Equalizer_invalid_inputs_are_ignored)
         twin.processBlock(AudioBufferView<float>(pb, 2, 512));
     }
 
-    EXPECT_NO_NAN(ta.ch(0), 4096);
+    EXPECT_NO_NAN(ta.ch(0), kLen);
     float maxDiff = 0.0f;
     for (int ch = 0; ch < 2; ++ch)
-        for (int i = 0; i < 4096; ++i)
+        for (int i = 0; i < kLen; ++i)
             maxDiff = std::max(maxDiff, std::abs(ta.ch(ch)[i] - tb.ch(ch)[i]));
     EXPECT_TRUE(maxDiff == 0.0f); // fully inert: bit-identical to the twin
 }

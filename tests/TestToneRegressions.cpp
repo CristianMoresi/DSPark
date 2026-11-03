@@ -481,30 +481,22 @@ DSPARK_TEST(Tone_delay_smoother_changes_keep_the_echo)
 DSPARK_TEST(Tone_delay_optional_sinc_read_is_transparent)
 {
     const double fs = 48000.0, f = 12000.0, delay = 100.37;
-    auto run = [&](auto& d) -> double {
-        using D = std::remove_cvref_t<decltype(d)>;
-        if constexpr (requires { d.setInterpolation(D::Interpolation::Sinc); })
-        {
-            d.setInterpolation(D::Interpolation::Sinc);
-            d.prepare(spec(fs, 512, 1));
-            d.setDelaySamples(static_cast<float>(delay));
-            d.setMix(1.0f);
-            Planar x(1, 8192);
-            fillSine(x, f, fs, 0.5f);
-            runBlocks(d, x, 512);
-            double err = 0, ref = 0;
-            for (int i = 2048; i < 8192; ++i)
-            {
-                const double want = 0.5 * std::sin(2.0 * kPiT * f * (i - delay) / fs);
-                err += (x.d[0][static_cast<size_t>(i)] - want) * (x.d[0][static_cast<size_t>(i)] - want);
-                ref += want * want;
-            }
-            return 10.0 * std::log10(err / ref);
-        }
-        else { return 0.0; }
-    };
     Delay<float> d;
-    EXPECT_LT(run(d), -80.0);
+    d.setInterpolation(Delay<float>::Interpolation::Sinc);
+    d.prepare(spec(fs, 512, 1));
+    d.setDelaySamples(static_cast<float>(delay));
+    d.setMix(1.0f);
+    Planar x(1, 8192);
+    fillSine(x, f, fs, 0.5f);
+    runBlocks(d, x, 512);
+    double err = 0, ref = 0;
+    for (int i = 2048; i < 8192; ++i)
+    {
+        const double want = 0.5 * std::sin(2.0 * kPiT * f * (i - delay) / fs);
+        err += (x.d[0][static_cast<size_t>(i)] - want) * (x.d[0][static_cast<size_t>(i)] - want);
+        ref += want * want;
+    }
+    EXPECT_LT(10.0 * std::log10(err / ref), -80.0);
 }
 
 // ============================================================================

@@ -24,6 +24,15 @@ All notable user-facing changes to DSPark are documented here.
 - `Convolver::Partitioning::NonUniform`: the latency stays one block, while
   a long IR's tail runs in larger partitions whose work is spread over the
   samples. `getTailBlockSize()` reports the tail partition.
+- `Equalizer::setLinearPhaseKernelLength()` and `getLinearPhaseKernelLength()`:
+  the linear-phase FIR length, applied at `prepare()`. The default is 32768
+  taps at 44.1 and 48 kHz, scaled with the rate to the nearest power of two.
+- `Delay`, `Chorus` and `Vibrato` take `setInterpolation(Interpolation::Sinc)`:
+  the framework's 32-tap sinc reader for modulated reads, with error below
+  -80 dB at 12 kHz where Hermite reaches -21 dB, at about 5x the read cost.
+  Hermite stays the default.
+- `Delay::getDelayMs()`, and `Panner::getLatency()`: 4 samples for Binaural
+  and Haas, 0 for the other algorithms.
 
 ### Changed
 
@@ -387,6 +396,63 @@ All notable user-facing changes to DSPark are documented here.
 - The `TapeMachine` documentation no longer claims that bias-carrier
   products always stay out of band. At the default 4x and 48 kHz, a
   19.25 kHz tone at -6 dBFS leaves a 255 Hz product at -46 dBc.
+
+- `Equalizer` LinearPhase runs one fixed kernel through a partitioned
+  convolution, so the response no longer depends on the host block. A 100 Hz,
+  Q 2, +12 dB bell gave +0.69 dB at 64-sample blocks; it is now within 0.1 dB.
+  The latency is kernel/2 + kernel/16: 18432 samples at 48 kHz, instead of
+  `maxBlockSize`. A band change is designed in slices and crossfaded, where
+  the kernel swap stepped by 5x the steady change. Default audio changes in
+  LinearPhase mode.
+- `Equalizer` MinimumPhase fades a band switched on or off over 20 ms. It
+  stepped by 4.2x the steady sample-to-sample change.
+- `FilterEngine`, and so `Equalizer`: the first block after `prepare()` or
+  `reset()` starts on the set parameters instead of gliding from 1 kHz and
+  0 dB for about 150 ms. The cutoff glides in log frequency, critically damped:
+  a 10 kHz to 500 Hz jump dipped a 150 Hz tone by 8.4 dB. The 16-sample
+  refresh grid follows the stream, so nonlinearity and drift no longer depend
+  on block sizes. `setState()` restores the resonance of the shelf and tilt
+  shapes, audio passes through before `prepare()` (it was NaN), and the
+  audio thread writes coefficients directly. Default audio changes in the
+  first 150 ms and during cutoff glides.
+- `Delay` stores its time in milliseconds. A time set before `prepare()` (it
+  was stored as 0), a re-prepare at another rate (the echo fell to +3 samples),
+  a state blob from another rate (100 ms became 50 ms at 96 kHz) and the
+  feedback filter corners (a 2 kHz low-pass read -0.96 dB instead of -3 dB)
+  now hold. The first block starts on the set delay; the start-up glide
+  played an early copy of the input. Default audio changes in the first 13 ms
+  after `prepare()` or `reset()`, in `Delay` and in the Binaural and Haas
+  paths of `Panner`, which use it.
+- `Delay` runs its feedback filters through silence and zero feedback. A
+  frozen state played back as a peak of 0.15 to 0.32 when the feedback
+  returned, and gated tails were cut short. Switching the smoother from None,
+  or `reset()` followed by `setSmoothingTime()`, keeps the echo time; it fell
+  to +3 samples.
+- `getState()` compiles for `Delay<double>`, `Chorus<double>`,
+  `Phaser<double>`, `Tremolo<double>`, `StereoWidth<double>`,
+  `Panner<double>` and `NoiseGenerator<double>`.
+- `FrequencyShifter` uses the allpass-pair Hilbert network. The image stays
+  below -50 dB down to 60 Hz; it was -12 dB at 200 Hz. The latency is 0
+  instead of 95 samples. Default audio changes.
+- `Chorus`: a stereo spread of 1.0 puts the outer channels 180 degrees apart;
+  it was 11.25 degrees. Spread and voice-count changes glide instead of
+  resetting the LFO phases, which stepped by 5.6x the steady change. Blocks
+  longer than `maxBlockSize` are mixed in full, and denormals are flushed.
+  Default audio changes: the default spread of 0.5 is now 90 degrees.
+- `Phaser` mixes blocks longer than `maxBlockSize` in full and flushes
+  denormals.
+- `Vibrato<float>` tracks the LFO phase and read position in double. A
+  4-semitone sweep at 0.1 Hz strayed -54 dB from the double instance. Default
+  audio changes at rounding level.
+- `StereoWidth` and `DCBlocker` no longer latch to NaN after one NaN or Inf
+  input sample.
+- `NoiseGenerator` keeps the brown-noise corner at 38 Hz at every rate; it was
+  77 Hz at 96 kHz. Default audio changes for brown noise away from 48 kHz.
+- `Goertzel` runs its resonator in double. In float, a 27.5 Hz tone over
+  65536 samples at 192 kHz read 3.96 dB low.
+- `LevelFollower`: the float anti-denormal offset no longer lifts a long RMS
+  window above the -100 dB floor in silence. A 3 s window at 192 kHz read
+  -92.5 dB.
 
 ## [1.8.1] - 2026-10-13
 

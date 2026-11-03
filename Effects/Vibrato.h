@@ -9,7 +9,11 @@
  *
  * Modulates pitch by varying a short delay line with a primary LFO. Features
  * FM modulation on the primary LFO for complex, non-static pitch variations,
- * and parameter smoothing to prevent zipper noise during automation.
+ * and parameter smoothing to prevent zipper noise during automation. The LFO
+ * phase and the read position are computed in double whatever T is (in float
+ * a 4-semitone sweep at 0.1 Hz misplaced the read point by about 0.01 sample).
+ * Reads use 4-point Hermite interpolation by default, or optionally the
+ * framework's 32-tap Kaiser sinc reader (setInterpolation()).
  *
  * Threading: prepare() belongs to the setup thread; processBlock() and reset()
  * belong to the audio thread. Setters are lock-free atomic publications, safe
@@ -17,7 +21,7 @@
  * arguments are ignored.
  *
  * Dependencies: Phasor.h, RingBuffer.h, DspMath.h, AudioSpec.h, AudioBuffer.h,
- *               StateBlob.h.
+ *               Interpolation.h, StateBlob.h.
  *
  * @code
  *   dspark::Vibrato<float> vibrato;
@@ -31,6 +35,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/DspMath.h"
+#include "../Core/Interpolation.h"
 #include "../Core/Phasor.h"
 #include "../Core/RingBuffer.h"
 #include "../Core/StateBlob.h"
@@ -63,6 +68,15 @@ template <FloatType T>
 class Vibrato
 {
 public:
+    /** @brief Fractional read kernel of the modulated delay line. */
+    enum class Interpolation
+    {
+        Hermite,  ///< 4-point cubic (default).
+        Sinc      ///< 32-tap Kaiser sinc: transparent to 15 kHz at 44.1/48 kHz,
+                  ///< about 5x the read cost; the sweep trough sits 16 samples
+                  ///< (0.33 ms at 48 kHz) behind the input instead of 4.
+    };
+
     /**
      * @brief Allocates delay lines and settles the parameter smoothing state.
      *
@@ -105,7 +119,8 @@ public:
         delays_.resize(numChannels_);
         phasors_.resize(numChannels_);
         modPhasors_.resize(numChannels_);
-        readPos_.assign(static_cast<size_t>(numChannels_), T(-1));
+        readPos_.assign(static_cast<size_t>(numChannels_), -1.0);
+        sinc_ = &sincTable();   // built on this setup thread, once per process
 
         for (int ch = 0; ch < numChannels_; ++ch)
         {
@@ -151,9 +166,15 @@ public:
         // mid-ramp. With FM fully off the oscillator holds its phase.
         const bool fmActive = (targetModDepth > T(0)) || (currentModDepth_ > T(0));
 
-        constexpr T kLn2 = static_cast<T>(std::numbers::ln2_v<double>);
-        constexpr T kTwoPi = static_cast<T>(2.0 * std::numbers::pi);
-        const T deviationScaler = (kLn2 * static_cast<T>(sampleRate_)) / (kTwoPi * T(12));
+        constexpr double kTwoPi = 2.0 * std::numbers::pi;
+        const double deviationScaler = (std::numbers::ln2 * sampleRate_) / (kTwoPi * 12.0);
+        const bool sinc = sinc_ && interpolation_.load(std::memory_order_relaxed) == Interpolation::Sinc;
+        // Trough headroom and read window: Hermite reads 1 sample later and 2
+        // earlier; the sinc reader needs 16 later and 16 earlier.
+        const double centreOffset = sinc ? static_cast<double>(SincInterpolator<T>::kAfter)
+                                         : static_cast<double>(kCentreOffset);
+        const double maxRead = static_cast<double>(delays_[0].getCapacity()
+                             - (sinc ? SincInterpolator<T>::kAfter + 1 : 4));
 
         for (int ch = 0; ch < numCh; ++ch)
         {
@@ -186,24 +207,23 @@ public:
                 // centre (D ~ rate^-1.5): at deep or fast FM the rate neared
                 // the floor and the read point leapt by hundreds of samples
                 // per sample (noise, not vibrato).
-                const T baseRate = std::max(smoothRate, T(0.1));
-                const T deviation = (smoothDepth * deviationScaler) / baseRate;
-                const T centre = deviation + kCentreOffset;
+                const double baseRate = std::max(static_cast<double>(smoothRate), 0.1);
+                const double deviation = (static_cast<double>(smoothDepth) * deviationScaler) / baseRate;
+                const double centre = deviation + centreOffset;
 
                 // FM varies only the speed of the LFO, between (1 - modDepth)
                 // and (1 + modDepth) times the rate, so the pitch excursion
                 // follows the instantaneous speed: up to twice the depth at
                 // full FM, and never a jump.
-                T speed = T(1);
+                double speed = 1.0;
                 if (fmActive)
-                    speed += fastSin(modPhasor.advance() * kTwoPi) * smoothModDepth;
-                phasor.setFrequency(baseRate * std::max(speed, T(0)));
-                const T lfo = fastSin(phasor.advance() * kTwoPi);
+                    speed += fastSin(modPhasor.advance() * kTwoPi) * static_cast<double>(smoothModDepth);
+                phasor.setFrequency(baseRate * std::max(speed, 0.0));
+                const double lfo = fastSin(phasor.advance() * kTwoPi);
 
-                // Safety clamp: the 4-point interpolator reads one sample
-                // earlier and two later, hence [1, cap - 4].
-                const T delaySamples = std::clamp(centre + lfo * deviation, T(1.0),
-                                                  static_cast<T>(delay.getCapacity() - 4));
+                // Safety clamp to the interpolator's read window.
+                const double delaySamples = std::clamp(centre + lfo * deviation,
+                                                       sinc ? centreOffset : 1.0, maxRead);
 
                 // Read-position slew limit. Depth and rate scale the deviation
                 // and centre, so a parameter change moves the read point;
@@ -213,11 +233,11 @@ public:
                 // to a brief pitch glide, and never touches the vibrato itself
                 // (its steepest motion, 4 semitones at full FM, is
                 // 2 * 4 * ln2 / 12 = 0.46 samples per sample).
-                T& pos = readPos_[static_cast<size_t>(ch)];
-                pos = (pos < T(0)) ? delaySamples
-                                   : pos + std::clamp(delaySamples - pos, -kMaxReadSlope, kMaxReadSlope);
+                double& pos = readPos_[static_cast<size_t>(ch)];
+                pos = (pos < 0.0) ? delaySamples
+                                  : pos + std::clamp(delaySamples - pos, -kMaxReadSlope, kMaxReadSlope);
 
-                data[i] = delay.readInterpolated(pos);
+                data[i] = sinc ? readSinc(delay, pos) : readHermite(delay, pos);
             }
         }
 
@@ -240,7 +260,7 @@ public:
             phasors_[ch].reset();
             modPhasors_[ch].reset();
         }
-        std::fill(readPos_.begin(), readPos_.end(), T(-1)); // re-seed on the next sample
+        std::fill(readPos_.begin(), readPos_.end(), -1.0); // re-seed on the next sample
     }
 
     /**
@@ -306,6 +326,21 @@ public:
     [[nodiscard]] T getModRate() const noexcept { return modRate_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getModDepth() const noexcept { return modDepth_.load(std::memory_order_relaxed); }
 
+    /** @brief Selects the fractional read kernel. Thread-safe; a switch moves
+     *  the sweep trough (see Interpolation), which the read-position slew
+     *  turns into a glide of a few samples. */
+    void setInterpolation(Interpolation mode) noexcept
+    {
+        interpolation_.store(mode == Interpolation::Sinc ? Interpolation::Sinc : Interpolation::Hermite,
+                             std::memory_order_relaxed);
+    }
+
+    /** @brief Returns the fractional read kernel. */
+    [[nodiscard]] Interpolation getInterpolation() const noexcept
+    {
+        return interpolation_.load(std::memory_order_relaxed);
+    }
+
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
@@ -316,6 +351,7 @@ public:
         w.write("depth", static_cast<float>(depthSemitones_.load(std::memory_order_relaxed)));
         w.write("modRate", static_cast<float>(modRate_.load(std::memory_order_relaxed)));
         w.write("modDepth", static_cast<float>(modDepth_.load(std::memory_order_relaxed)));
+        w.write("interp", static_cast<int32_t>(interpolation_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -328,6 +364,7 @@ public:
         setDepth(static_cast<T>(r.read("depth", 0.5f)));
         setModRate(static_cast<T>(r.read("modRate", 0.0f)));
         setModDepth(static_cast<T>(r.read("modDepth", 0.0f)));
+        setInterpolation(r.read("interp", 0) == 1 ? Interpolation::Sinc : Interpolation::Hermite);
         return true;
     }
 
@@ -336,7 +373,35 @@ private:
     /// tap always reads a written sample.
     static constexpr T kCentreOffset = T(4);
     /// Largest read-position change per sample (see processBlock()).
-    static constexpr T kMaxReadSlope = T(0.5);
+    static constexpr double kMaxReadSlope = 0.5;
+
+    /** @brief The shared sinc table (built on first use: prepare() calls it). */
+    static const SincInterpolator<T>& sincTable()
+    {
+        static const SincInterpolator<T> table;
+        return table;
+    }
+
+    /** @brief Hermite read `delay` samples behind the newest sample, with the
+     *  position split in double (RingBuffer::readInterpolated() semantics). */
+    [[nodiscard]] static T readHermite(const RingBuffer<T>& ring, double delay) noexcept
+    {
+        const int d = static_cast<int>(delay);
+        const T frac = static_cast<T>(delay - static_cast<double>(d));
+        return interpolateHermite(ring.read(d - 1), ring.read(d), ring.read(d + 1), ring.read(d + 2), frac);
+    }
+
+    /** @brief Sinc read `delay` samples behind the newest sample (needs
+     *  delay >= 16 and 16 samples of history beyond it). */
+    [[nodiscard]] T readSinc(const RingBuffer<T>& ring, double delay) const noexcept
+    {
+        const int d = static_cast<int>(delay);
+        const double frac = delay - static_cast<double>(d);
+        const int64_t newest = static_cast<int64_t>(ring.getWritePosition()) - 1;
+        const int64_t intPos = newest - d - (frac > 0.0 ? 1 : 0);
+        return sinc_->readRing(ring.data(), static_cast<int64_t>(ring.getCapacity() - 1), intPos,
+                               frac > 0.0 ? 1.0 - frac : 0.0);
+    }
 
     double sampleRate_ = 44100.0;
     int numChannels_ = 0;
@@ -354,9 +419,11 @@ private:
 
     // Dynamic allocation via STL, safe because it only happens in prepare()
     std::vector<RingBuffer<T>> delays_;
-    std::vector<Phasor<T>> phasors_;
-    std::vector<Phasor<T>> modPhasors_;
-    std::vector<T> readPos_;   ///< Slew-limited read position per channel (-1 = unseeded).
+    std::vector<Phasor<double>> phasors_;      ///< Double phase: see the file comment.
+    std::vector<Phasor<double>> modPhasors_;
+    std::vector<double> readPos_;   ///< Slew-limited read position per channel (-1 = unseeded).
+    std::atomic<Interpolation> interpolation_ { Interpolation::Hermite };
+    const SincInterpolator<T>* sinc_ = nullptr;   ///< Set by prepare().
 };
 
 } // namespace dspark

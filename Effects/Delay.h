@@ -9,14 +9,21 @@
  *
  * Features:
  * - Power-of-two circular buffer with bitmask wrapping.
- * - 3rd-order Hermite interpolation for artifact-free fractional delays.
+ * - 3rd-order Hermite interpolation for fractional delays, or optionally the
+ *   framework's 32-tap Kaiser sinc reader (setInterpolation()) for modulated
+ *   reads that must stay transparent up to 15 kHz.
  * - Analog-modeled feedback loop with soft clipping and one-pole filtering.
  * - Multiple smoother choices for glitch-free parameter modulation.
  * - Fully independent channel write indices for safe interleaved or sequential processing.
  * - Zero-allocation, lock-free, cache-friendly architecture.
  *
+ * The delay time is kept in milliseconds: prepare() at a new rate, or a state
+ * blob from another rate, keeps the echo time. A time set in samples before
+ * prepare() is read at the prepared rate. The first block after prepare() or
+ * reset() starts on the set time (no glide from zero).
+ *
  * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/DspMath.h,
- * Core/Smoothers.h, Core/StateBlob.h.
+ * Core/Interpolation.h, Core/Smoothers.h, Core/StateBlob.h.
  *
  * Two ways to use it:
  * - As an insert, like every other effect: prepare(spec), set the delay,
@@ -26,10 +33,11 @@
  *   and the wet-buffer helpers return the delayed signal only, with the
  *   per-call parameters published to the stored state.
  *
- * Threading: prepare() belongs to the setup thread. The processing calls and
- * reset() belong to the audio thread. Parameter setters are safe from any
- * thread (atomics with a publish/apply handoff consumed at the top of the
- * next processing call); non-finite setter values are ignored.
+ * Threading: prepare(), getState() and setState() belong to the setup thread.
+ * The processing calls and reset() belong to the audio thread. Parameter
+ * setters (setInterpolation() among them) are safe from any thread (atomics
+ * with a publish/apply handoff consumed at the top of the next processing
+ * call); non-finite setter values are ignored.
  *
  * @tparam SampleType float or double.
  */
@@ -37,6 +45,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/DspMath.h"
+#include "../Core/Interpolation.h"
 #include "../Core/Smoothers.h"
 #include "../Core/StateBlob.h"
 
@@ -83,6 +92,28 @@ public:
         return feedbackMode_.load(std::memory_order_relaxed);
     }
 
+    /** @brief Fractional read kernel. */
+    enum class Interpolation
+    {
+        Hermite,  ///< 4-point cubic (default). Error -24 dB at 10 kHz on a moving read.
+        Sinc      ///< 32-tap Kaiser sinc: below -96 dB to 15 kHz at 44.1/48 kHz,
+                  ///< about 5x the cost of a Hermite read; the shortest delay
+                  ///< becomes 17 samples instead of 3.
+    };
+
+    /** @brief Selects the fractional read kernel. Thread-safe. */
+    void setInterpolation(Interpolation mode) noexcept
+    {
+        interpolation_.store(mode == Interpolation::Sinc ? Interpolation::Sinc : Interpolation::Hermite,
+                             std::memory_order_relaxed);
+    }
+
+    /** @brief Returns the fractional read kernel. */
+    [[nodiscard]] Interpolation getInterpolation() const noexcept
+    {
+        return interpolation_.load(std::memory_order_relaxed);
+    }
+
     // -- Lifecycle -----------------------------------------------------------
 
     /**
@@ -124,6 +155,17 @@ public:
         delayBuffer_.resize(numChannels_, maxDelaySamples_);
         wetBuffer_.resize(numChannels_, blockSize_);
         lastWetSamples_ = blockSize_; // full capacity until the first push
+        sinc_ = &sincTable();   // built here, on the setup thread, once per process
+
+        // The delay time and the feedback filter corners are kept in time and
+        // Hz: re-derive the sample-domain values for this rate.
+        if (const SampleType pending = pendingDelaySamples_.exchange(SampleType(-1), std::memory_order_relaxed);
+            pending >= SampleType(0))
+            delayMs_.store(pending * SampleType(1000) / sampleRate_, std::memory_order_relaxed);
+        globalDelay_.store(clampToCapacity(delayMs_.load(std::memory_order_relaxed) * sampleRate_ / SampleType(1000)),
+                           std::memory_order_relaxed);
+        setFeedbackLpHz(fbLpHzShadow_.load(std::memory_order_relaxed));
+        setFeedbackHpHz(fbHpHzShadow_.load(std::memory_order_relaxed));
 
         float timeMs = smoothingTimeMs_.load(std::memory_order_relaxed);
         for (int ch = 0; ch < std::min(numChannels_, kMaxChannels); ++ch)
@@ -163,6 +205,7 @@ public:
         }
         mixSmoother_.skip();
         insertMix_ = mix_.load(std::memory_order_relaxed); // no fade-in on start
+        snapNext_ = true;   // the next call starts on the set delay, no glide
     }
 
     // -- Configuration -------------------------------------------------------
@@ -199,9 +242,18 @@ public:
     void setDelaySamples(SampleType samples) noexcept
     {
         if (!std::isfinite(samples)) return;
-        samples = std::clamp(samples, SampleType(0),
-                             static_cast<SampleType>(std::max(0, maxDelaySamples_ - 1)));
-        globalDelay_.store(samples, std::memory_order_relaxed);
+        samples = std::max(samples, SampleType(0));
+        if (prepared_.load(std::memory_order_acquire))
+        {
+            delayMs_.store(samples * SampleType(1000) / sampleRate_, std::memory_order_relaxed);
+            pendingDelaySamples_.store(SampleType(-1), std::memory_order_relaxed);
+        }
+        else
+        {
+            // No rate yet: prepare() reads the count at the rate it is given.
+            pendingDelaySamples_.store(samples, std::memory_order_relaxed);
+        }
+        globalDelay_.store(clampToCapacity(samples), std::memory_order_relaxed);
         // Publish/apply pattern: the smoothers are NOT touched here (they are
         // non-atomic audio-thread state - mutating them from a control thread
         // raced against advanceSmoother). The audio thread applies the new
@@ -209,11 +261,28 @@ public:
         delayTargetDirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Sets the delay time in milliseconds. */
-    void setDelayMs(SampleType ms) noexcept { setDelaySamples(ms * sampleRate_ / SampleType(1000)); }
+    /** @brief Sets the delay time in milliseconds (the stored form). Non-finite
+     *  values are ignored. */
+    void setDelayMs(SampleType ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        ms = std::max(ms, SampleType(0));
+        delayMs_.store(ms, std::memory_order_relaxed);
+        pendingDelaySamples_.store(SampleType(-1), std::memory_order_relaxed);
+        globalDelay_.store(clampToCapacity(ms * sampleRate_ / SampleType(1000)), std::memory_order_relaxed);
+        delayTargetDirty_.store(true, std::memory_order_release);
+    }
 
     /** @brief Sets the delay time in seconds. */
-    void setDelaySeconds(SampleType secs) noexcept { setDelaySamples(secs * sampleRate_); }
+    void setDelaySeconds(SampleType secs) noexcept { setDelayMs(secs * SampleType(1000)); }
+
+    /** @brief Returns the delay time in milliseconds. */
+    [[nodiscard]] SampleType getDelayMs() const noexcept
+    {
+        const SampleType pending = pendingDelaySamples_.load(std::memory_order_relaxed);
+        return pending >= SampleType(0) ? pending * SampleType(1000) / sampleRate_
+                                        : delayMs_.load(std::memory_order_relaxed);
+    }
 
     /** @brief Returns the current target delay time in samples. */
     [[nodiscard]] SampleType getCurrentDelaySamples() const noexcept { return globalDelay_.load(std::memory_order_relaxed); }
@@ -316,8 +385,8 @@ public:
                                               ? targetDelay : advanceSmoother(sL, smoothType);
                 advanceSmoother(sR, smoothType);   // kept in step, as in processPingPong()
                 const SampleType dryL = L[i], dryR = R[i];
-                const SampleType outL = processSampleInternal(0, dryL + sL.pingPongFb, currentDelay, sL, SampleType(0), lpC, hpC);
-                const SampleType outR = processSampleInternal(1, dryR + sR.pingPongFb, currentDelay, sR, SampleType(0), lpC, hpC);
+                const SampleType outL = processSampleInternal(0, dryL + sL.pingPongFb, currentDelay, sL, SampleType(0), lpC, hpC, false);
+                const SampleType outR = processSampleInternal(1, dryR + sR.pingPongFb, currentDelay, sR, SampleType(0), lpC, hpC, false);
                 sR.pingPongFb = saturateFeedback(processFbFilters(1, outL * fb, lpC, hpC), analogFb);
                 sL.pingPongFb = saturateFeedback(processFbFilters(0, outR * fb, lpC, hpC), analogFb);
                 advanceWriteIndexUnchecked(0);
@@ -528,8 +597,8 @@ public:
             SampleType inL = L[i] + sL.pingPongFb;
             SampleType inR = R[i] + sR.pingPongFb;
 
-            SampleType outL = processSampleInternal(0, inL, currentDelay, sL, SampleType(0), lpC, hpC);
-            SampleType outR = processSampleInternal(1, inR, currentDelay, sR, SampleType(0), lpC, hpC);
+            SampleType outL = processSampleInternal(0, inL, currentDelay, sL, SampleType(0), lpC, hpC, false);
+            SampleType outR = processSampleInternal(1, inR, currentDelay, sR, SampleType(0), lpC, hpC, false);
 
             sR.pingPongFb = saturateFeedback(processFbFilters(1, outL * fb, lpC, hpC), analogFb); // L crosses to R
             sL.pingPongFb = saturateFeedback(processFbFilters(0, outR * fb, lpC, hpC), analogFb); // R crosses to L
@@ -589,16 +658,20 @@ public:
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
+        // The blob stores float: explicit casts, or Delay<double> would hand
+        // the writer a double that matches no overload unambiguously.
         StateWriter w(stateId("DLAY"), 1);
-        w.write("delaySamples", globalDelay_.load(std::memory_order_relaxed));
-        w.write("feedback", feedbackGain_.load(std::memory_order_relaxed));
-        w.write("fbLpHz", fbLpHzShadow_.load(std::memory_order_relaxed));
-        w.write("fbHpHz", fbHpHzShadow_.load(std::memory_order_relaxed));
+        w.write("delaySamples", static_cast<float>(globalDelay_.load(std::memory_order_relaxed)));
+        w.write("delayMs", static_cast<float>(getDelayMs()));
+        w.write("feedback", static_cast<float>(feedbackGain_.load(std::memory_order_relaxed)));
+        w.write("fbLpHz", static_cast<float>(fbLpHzShadow_.load(std::memory_order_relaxed)));
+        w.write("fbHpHz", static_cast<float>(fbHpHzShadow_.load(std::memory_order_relaxed)));
         w.write("smoother", static_cast<int32_t>(smootherType_.load(std::memory_order_relaxed)));
         w.write("smoothingMs", smoothingTimeMs_.load(std::memory_order_relaxed));
         w.write("fbMode", static_cast<int32_t>(feedbackMode_.load(std::memory_order_relaxed)));
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("pingPong", static_cast<int32_t>(pingPong_.load(std::memory_order_relaxed) ? 1 : 0));
+        w.write("interp", static_cast<int32_t>(interpolation_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -607,7 +680,12 @@ public:
     {
         StateReader r(data, size);
         if (!r.isValid() || r.processorId() != stateId("DLAY")) return false;
-        setDelaySamples(static_cast<SampleType>(r.read("delaySamples", 0.0f)));
+        // Prefer the time: a blob saved at another rate keeps its echo time.
+        // Older blobs carry only the sample count.
+        if (const float ms = r.read("delayMs", -1.0f); ms >= 0.0f)
+            setDelayMs(static_cast<SampleType>(ms));
+        else
+            setDelaySamples(static_cast<SampleType>(r.read("delaySamples", 0.0f)));
         setFeedback(static_cast<SampleType>(r.read("feedback", 0.0f)));
         setFeedbackLpHz(static_cast<SampleType>(r.read("fbLpHz", 0.0f)));
         setFeedbackHpHz(static_cast<SampleType>(r.read("fbHpHz", 0.0f)));
@@ -620,6 +698,7 @@ public:
                         static_cast<int>(FeedbackMode::Analog))));
         setMix(static_cast<SampleType>(r.read("mix", 0.3f)));
         setPingPong(r.read("pingPong", 0) != 0);
+        setInterpolation(r.read("interp", 0) == 1 ? Interpolation::Sinc : Interpolation::Hermite);
         return true;
     }
 
@@ -703,31 +782,83 @@ private:
 
     void maybeUpdateSmoothers() noexcept
     {
+        // First call after prepare()/reset(): every channel starts ON the set
+        // delay, so nothing glides in from zero (that glide swept the read
+        // point across the new input and played early copies of it).
+        if (snapNext_)
+        {
+            snapNext_ = false;
+            delayTargetDirty_.store(false, std::memory_order_relaxed);
+            smootherDirty_.store(false, std::memory_order_relaxed);
+            const SampleType target = globalDelay_.load(std::memory_order_acquire);
+            const float timeMs = smoothingTimeMs_.load(std::memory_order_relaxed);
+            for (int ch = 0; ch < numChannels_; ++ch)
+            {
+                auto& s = states_[ch];
+                resetChannelSmoothers(s, timeMs, static_cast<float>(target));
+                s.currentDelay = target;
+                setSmootherTarget(s, target);
+            }
+            mixSmoother_.reset(static_cast<double>(sampleRate_), timeMs, mixSmoother_.getCurrentValue());
+            return;
+        }
+
         // Audio-thread application point for control-thread publications.
-        if (delayTargetDirty_.exchange(false, std::memory_order_acquire))
+        // A plain load first: the RMW is paid only when something is pending.
+        if (delayTargetDirty_.load(std::memory_order_relaxed)
+            && delayTargetDirty_.exchange(false, std::memory_order_acquire))
             updateSmootherTargets(globalDelay_.load(std::memory_order_relaxed));
 
         // exchange (not load+store: a publication between the two would be
         // lost) with acquire, pairing with the setters' release stores so the
         // freshly written type/time values are visible here.
-        if (!smootherDirty_.exchange(false, std::memory_order_acquire)) return;
-        float timeMs = smoothingTimeMs_.load(std::memory_order_relaxed);
+        if (!smootherDirty_.load(std::memory_order_relaxed)
+            || !smootherDirty_.exchange(false, std::memory_order_acquire)) return;
+        const float timeMs = smoothingTimeMs_.load(std::memory_order_relaxed);
+        const SampleType target = globalDelay_.load(std::memory_order_relaxed);
         for (int ch = 0; ch < numChannels_; ++ch)
         {
+            // Restart from where the read point is now, toward the set delay
+            // (currentDelay tracks the target under SmootherType::None too).
             auto& s = states_[ch];
-            float cur = static_cast<float>(s.currentDelay);
-            float tgt = static_cast<float>(s.targetDelay);
-            resetChannelSmoothers(s, timeMs, cur);
-            setSmootherTarget(s, static_cast<SampleType>(tgt));
+            resetChannelSmoothers(s, timeMs, static_cast<float>(s.currentDelay));
+            setSmootherTarget(s, target);
         }
         mixSmoother_.reset(static_cast<double>(sampleRate_), timeMs, mixSmoother_.getCurrentValue());
     }
 
     void updateSmootherTargets(SampleType target) noexcept
     {
-        if (smootherType_.load(std::memory_order_relaxed) == SmootherType::None) return;
+        const bool none = smootherType_.load(std::memory_order_relaxed) == SmootherType::None;
         for (int ch = 0; ch < numChannels_; ++ch)
-            setSmootherTarget(states_[ch], target);
+        {
+            if (none)
+            {
+                // No smoother runs: keep the read point on record, so a
+                // later switch to a smoother starts from it.
+                states_[ch].targetDelay = target;
+                states_[ch].currentDelay = target;
+            }
+            else
+            {
+                setSmootherTarget(states_[ch], target);
+            }
+        }
+    }
+
+    /** @brief Clamps a sample-domain delay to the prepared capacity. */
+    [[nodiscard]] SampleType clampToCapacity(SampleType samples) const noexcept
+    {
+        samples = std::max(samples, SampleType(0));
+        return maxDelaySamples_ > 0 ? std::min(samples, static_cast<SampleType>(maxDelaySamples_ - 1))
+                                    : samples;
+    }
+
+    /** @brief The shared sinc table (built on first use: prepare() calls it). */
+    static const SincInterpolator<SampleType>& sincTable()
+    {
+        static const SincInterpolator<SampleType> table;
+        return table;
     }
 
     void setSmootherTarget(ChannelState& s, SampleType target) noexcept
@@ -771,7 +902,8 @@ private:
 
     inline SampleType processSampleInternal(int ch, SampleType input, SampleType delaySamples,
                                             ChannelState& s, SampleType fbMult,
-                                            SampleType lpC, SampleType hpC) noexcept
+                                            SampleType lpC, SampleType hpC,
+                                            bool straightFeedback = true) noexcept
     {
         // Front-door non-finite guard: a NaN/Inf input, once written to the
         // ring and recirculated through the recursive feedback filters
@@ -791,8 +923,13 @@ private:
         // panner crosses the centre). 3 samples ~ 62 us at 48 kHz -
         // imperceptible and the same on both channels, so spatial cues
         // (centre image, ITD ratios) are preserved.
+        // The sinc reader needs SincInterpolator::kAfter + 1 = 17 written
+        // samples after the read point by the same argument.
         constexpr SampleType kMinHermiteDelay = SampleType(3);
-        delaySamples = std::clamp(delaySamples, kMinHermiteDelay,
+        const bool sinc = sinc_ && interpolation_.load(std::memory_order_relaxed) == Interpolation::Sinc;
+        const SampleType minDelay = sinc ? SampleType(SincInterpolator<SampleType>::kAfter + 1)
+                                         : kMinHermiteDelay;
+        delaySamples = std::clamp(delaySamples, minDelay,
                                   static_cast<SampleType>(maxDelaySamples_ - 1));
 
         SampleType* data = delayBuffer_.getChannel(ch);
@@ -819,6 +956,14 @@ private:
             frac = SampleType(0);
         }
 
+        SampleType delayed;
+        if (sinc)
+        {
+            delayed = sinc_->readRing(data, static_cast<int64_t>(bufferMask_),
+                                      static_cast<int64_t>(idx0), static_cast<double>(frac));
+        }
+        else
+        {
         // 3rd-order Hermite Interpolation (4-point)
 
         int idxM1 = (idx0 - 1 + maxDelaySamples_) & bufferMask_;
@@ -836,15 +981,21 @@ private:
         SampleType w = c + v;
         SampleType a = w + v + (y2 - y0) * SampleType(0.5);
         SampleType b = w + a;
-        SampleType delayed = ((((a * frac) - b) * frac + c) * frac + y0);
+        delayed = ((((a * frac) - b) * frac + c) * frac + y0);
+        }
 
-        // Feedback processing
-        SampleType fbInput = delayed * fbMult;
-        if (fbInput != SampleType(0))
+        // Feedback processing. The filters run on every sample of the straight
+        // path, silence and zero feedback included: skipping them froze their
+        // state, which then played back as a step when the feedback (or the
+        // signal) returned, and cut the filters' own decay short. The ping-pong
+        // paths filter their cross-feed themselves (straightFeedback false).
+        SampleType fbInput = SampleType(0);
+        if (straightFeedback)
         {
-            fbInput = processFbFilters(ch, fbInput, lpC, hpC);
-            fbInput = saturateFeedback(fbInput,
-                feedbackMode_.load(std::memory_order_relaxed) == FeedbackMode::Analog);
+            fbInput = processFbFilters(ch, delayed * fbMult, lpC, hpC);
+            if (fbInput != SampleType(0))
+                fbInput = saturateFeedback(fbInput,
+                    feedbackMode_.load(std::memory_order_relaxed) == FeedbackMode::Analog);
         }
         s.lastFeedback = fbInput;
 
@@ -899,6 +1050,11 @@ private:
     SampleType sampleRate_ = SampleType(48000);
     
     std::atomic<SampleType> globalDelay_ { SampleType(0) };
+    std::atomic<SampleType> delayMs_ { SampleType(0) };              ///< The stored delay time.
+    std::atomic<SampleType> pendingDelaySamples_ { SampleType(-1) }; ///< Set in samples before prepare().
+    std::atomic<Interpolation> interpolation_ { Interpolation::Hermite };
+    const SincInterpolator<SampleType>* sinc_ = nullptr;             ///< Set by prepare().
+    bool snapNext_ = true;                                           ///< Audio thread.
     std::atomic<SampleType> feedbackGain_ { SampleType(0) };
     std::atomic<SampleType> fbLpCoef_ { SampleType(0) };
     std::atomic<SampleType> fbLpHzShadow_ { SampleType(0) };  ///< Hz mirror for getState.

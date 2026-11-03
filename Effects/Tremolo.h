@@ -186,9 +186,11 @@ public:
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
+        // The blob stores float: the casts keep the double instantiation
+        // compiling (a double matches no StateWriter overload unambiguously).
         StateWriter w(stateId("TREM"), 1);
-        w.write("rate", rate_.load(std::memory_order_relaxed));
-        w.write("depth", depth_.load(std::memory_order_relaxed));
+        w.write("rate", static_cast<float>(rate_.load(std::memory_order_relaxed)));
+        w.write("depth", static_cast<float>(depth_.load(std::memory_order_relaxed)));
         w.write("shape", static_cast<int32_t>(shape_.load(std::memory_order_relaxed)));
         w.write("stereo", stereo_.load(std::memory_order_relaxed));
         return w.blob();

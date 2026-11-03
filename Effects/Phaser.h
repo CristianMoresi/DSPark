@@ -24,6 +24,7 @@
  * setter arguments are ignored.
  *
  * Dependencies: Oscillator.h, DryWetMixer.h, AudioSpec.h, AudioBuffer.h,
+ *               DenormalGuard.h,
  *               DspMath.h, StateBlob.h.
  *
  * @code
@@ -39,6 +40,7 @@
 #include "../Core/DryWetMixer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
+#include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h" // fastExp, fastTan, fastTanh
 #include "../Core/StateBlob.h"
 
@@ -107,11 +109,28 @@ public:
 
     /**
      * @brief Processes an audio block in-place.
+     *
+     * Any length works: a block longer than the prepared maximum runs in
+     * prepared-size slices (the dry/wet mixer holds one prepared block).
+     *
      * @param buffer The AudioBufferView containing channels to process.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
         if (!prepared_) return; // without prepare(), fsInv below would be 1/0 -> NaN chain
+        // The allpass chain's decaying tails reach denormals within seconds
+        // of silence: flush them in hardware for the whole callback.
+        DenormalGuard denormalGuard;
+        const int total = buffer.getNumSamples();
+        const int slice = std::max(1, spec_.maxBlockSize);
+        for (int offset = 0; offset < total; offset += slice)
+            processChunk(buffer.getSubView(offset, std::min(slice, total - offset)));
+    }
+
+protected:
+    /** @brief One block of at most the prepared size. */
+    void processChunk(AudioBufferView<T> buffer) noexcept
+    {
 
         const int nCh = std::min(buffer.getNumChannels(), kMaxChannels);
         const int nS  = buffer.getNumSamples();
@@ -226,6 +245,8 @@ public:
         // DryWetMixer smooths the mix parameter internally.
         mixer_.mixWet(buffer, targetMix);
     }
+
+public:
 
     /** 
      * @brief Clears internal DSP state and history buffers. 
@@ -385,15 +406,17 @@ public:
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
+        // The blob stores float: the casts keep the double instantiation
+        // compiling (a double matches no StateWriter overload unambiguously).
         StateWriter w(stateId("PHSR"), 1);
-        w.write("rate", rate_.load(std::memory_order_relaxed));
-        w.write("depth", depth_.load(std::memory_order_relaxed));
-        w.write("mix", mix_.load(std::memory_order_relaxed));
-        w.write("feedback", feedback_.load(std::memory_order_relaxed));
-        w.write("minFreq", minFreq_.load(std::memory_order_relaxed));
-        w.write("maxFreq", maxFreq_.load(std::memory_order_relaxed));
+        w.write("rate", static_cast<float>(rate_.load(std::memory_order_relaxed)));
+        w.write("depth", static_cast<float>(depth_.load(std::memory_order_relaxed)));
+        w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
+        w.write("feedback", static_cast<float>(feedback_.load(std::memory_order_relaxed)));
+        w.write("minFreq", static_cast<float>(minFreq_.load(std::memory_order_relaxed)));
+        w.write("maxFreq", static_cast<float>(maxFreq_.load(std::memory_order_relaxed)));
         w.write("stages", numStages_.load(std::memory_order_relaxed));
-        w.write("spread", stereoSpread_.load(std::memory_order_relaxed));
+        w.write("spread", static_cast<float>(stereoSpread_.load(std::memory_order_relaxed)));
         w.write("waveform",
                 static_cast<int32_t>(lfoWaveform_.load(std::memory_order_relaxed)));
         return w.blob();

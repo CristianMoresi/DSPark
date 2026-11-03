@@ -13,7 +13,8 @@
  * VU-style exponential window whose time constant equals the configured
  * window time - not a rectangular moving average). A small constant offset
  * keeps both recursions out of the subnormal range on decay tails; its
- * equilibrium floor sits far below the -100 dB readout floor.
+ * equilibrium floor, offset / (1 - coefficient), stays below -120 dB for any
+ * time constant up to 60 s at 384 kHz, under the -100 dB readout floor.
  *
  * Threading:
  * - prepare() / reset(): setup thread (not concurrent with process()).
@@ -182,8 +183,11 @@ public:
 
         // Constant offset that keeps the decay recursions out of the
         // subnormal range (CPU spikes). Its equilibrium floor is
-        // kAntiDenormal / (1 - coeff), far below the -100 dB readout floor.
-        static constexpr T kAntiDenormal = std::is_same_v<T, float> ? T(1e-15) : T(1e-30);
+        // kAntiDenormal / (1 - coeff): with the float offset at 1e-15 a 3 s
+        // RMS window at 192 kHz settled at -92.5 dB in silence, above the
+        // -100 dB readout floor. 1e-20 is still 18 decades above the float
+        // subnormal range.
+        static constexpr T kAntiDenormal = std::is_same_v<T, float> ? T(1e-20) : T(1e-30);
 
         // One relaxed load per block; the per-sample loop runs on locals.
         const T attackCoeff  = attackCoeff_.load(std::memory_order_relaxed);

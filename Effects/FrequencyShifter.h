@@ -12,18 +12,22 @@
  * harmonic relationships.
  *
  * Implementation:
- * Applies a Hilbert transform to extract the analytic signal (I + jQ).
- * The complex signal is modulated by a quadrature oscillator e^(j*2*pi*f*t).
- * To ensure phase coherency when mixing Dry/Wet, the "Dry" signal is taken
- * directly from the real branch of the Hilbert transformer, avoiding
- * comb-filtering.
+ * A zero-latency allpass-pair Hilbert network (HilbertIIR) extracts the
+ * analytic signal (I + jQ), held within 0.065 degrees of quadrature from
+ * 20 Hz to 20 kHz, so the unwanted sideband stays below -55 dB down to the low
+ * bass (the earlier FIR transformer lost it below about 500 Hz: -12 dB at
+ * 200 Hz). The complex signal is modulated by a quadrature oscillator
+ * e^(j*2*pi*f*t). To keep the dry/wet blend phase coherent, the "Dry" signal
+ * is the real branch of the network (the input through a flat-magnitude
+ * allpass), avoiding comb-filtering. No latency.
  *
  * Threading: prepare() belongs to the setup thread; processBlock() and reset()
  * belong to the audio thread. Setters are lock-free atomic publications, safe
  * from any thread, consumed at the next processBlock(). Non-finite setter
  * arguments are ignored.
  *
- * Dependencies: Hilbert.h, DspMath.h, AudioSpec.h, AudioBuffer.h, StateBlob.h.
+ * Dependencies: Hilbert.h, DenormalGuard.h, DspMath.h, AudioSpec.h,
+ *               AudioBuffer.h, StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -79,10 +83,8 @@ public:
         numChannels_ = spec.numChannels;
 
         // Zero-allocations on audio thread: allocate all Hilberts during prepare.
+        // The network is rate independent (designed in normalised frequency).
         hilberts_.resize(numChannels_);
-        for (auto& h : hilberts_) {
-            h.prepare(spec.sampleRate);
-        }
 
         currentMix_ = mix_.load(std::memory_order_relaxed);
         reset();
@@ -98,10 +100,10 @@ public:
         const int numSamples = buffer.getNumSamples();
         if (numSamples == 0 || numCh == 0) return;
 
-        // The Hilbert transformer runs per-sample over a 191-tap FIR; denormal
-        // input samples would drop every tap into the x86 slow path. The
-        // framework convention is that per-sample Hilbert callers install their
-        // own guard (see Hilbert.h and Compressor.h).
+        // The Hilbert network is a cascade of recursive allpass sections with
+        // poles near the unit circle: its decaying state reaches denormals in
+        // silence, and the framework convention is that per-sample Hilbert
+        // callers install their own guard (see Hilbert.h and Compressor.h).
         DenormalGuard guard;
 
         const T targetMix = mix_.load(std::memory_order_relaxed);
@@ -209,14 +211,15 @@ public:
     [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
 
     /**
-     * @brief Reports the processing latency in samples.
+     * @brief Reports the processing latency in samples: none.
      *
-     * The Hilbert transformer delays BOTH the dry (real branch) and shifted
-     * paths by its FIR group delay; report this for plugin delay compensation.
+     * The allpass-pair network has no bulk delay (the FIR transformer it
+     * replaced cost 95 samples). Its frequency-dependent phase is common to
+     * the dry (real branch) and shifted paths.
      */
     [[nodiscard]] static constexpr int getLatency() noexcept
     {
-        return Hilbert<T>::getLatencySamples();
+        return 0;
     }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
@@ -254,7 +257,7 @@ private:
     T currentMix_{ T(1) };
     T mixMaxStep_{ T(1.0 / 960.0) };   ///< Mix ramp rate: full scale per 20 ms.
 
-    std::vector<Hilbert<T>> hilberts_;
+    std::vector<HilbertIIR<T>> hilberts_;
 };
 
 } // namespace dspark

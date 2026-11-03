@@ -255,7 +255,7 @@ public:
         if (channel < 0 || channel >= kMaxChannels) return input;
         updateCoefficientsIfNeeded();
         const auto ch = static_cast<size_t>(channel);
-        const double x = static_cast<double>(input);
+        const double x = std::isfinite(input) ? static_cast<double>(input) : 0.0;
 
         if (lastOrder_ <= 1)
             return static_cast<T>(stepOnePole(onePoleR_, onePole_[ch], x));
@@ -420,8 +420,10 @@ protected:
     {
         const double r = onePoleR_;
         OnePoleState z = onePole_[static_cast<size_t>(channel)];
+        // A non-finite sample enters as 0: the recursion would otherwise latch
+        // it forever (no-op on finite input).
         for (int i = 0; i < numSamples; ++i)
-            data[i] = static_cast<T>(stepOnePole(r, z, static_cast<double>(data[i])));
+            data[i] = static_cast<T>(stepOnePole(r, z, std::isfinite(data[i]) ? static_cast<double>(data[i]) : 0.0));
         flushDenormals(z);
         onePole_[static_cast<size_t>(channel)] = z;
     }
@@ -444,7 +446,7 @@ protected:
 
         for (int i = 0; i < numSamples; ++i)
         {
-            double v = static_cast<double>(data[i]);
+            double v = std::isfinite(data[i]) ? static_cast<double>(data[i]) : 0.0;
             for (int s = 0; s < numStages; ++s)
                 v = stepSection(b0[s], a1[s], a2[s], z[s], v);
             data[i] = static_cast<T>(v);

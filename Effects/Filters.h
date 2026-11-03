@@ -9,7 +9,11 @@
  *
  * Supports all standard filter shapes (LP, HP, BP, Peak, Shelves, Notch, Tilt,
  * AllPass) with configurable slopes from 6 to 48 dB/oct via cascaded biquad stages.
- * Parameters are smoothed per-sample to prevent zipper noise.
+ * Parameters are smoothed per-sample to prevent zipper noise. The cutoff glides
+ * on a log-frequency scale with a critically damped smoother (monotonic, no
+ * overshoot, about 0.1 s for a large jump). The first block after prepare()
+ * or reset() starts settled on the current parameters. Before prepare() the
+ * engine passes audio through unchanged.
  *
  * @warning Biquad filters are not suited for audio-rate cutoff modulation.
  * Nonlinearity and analog drift update the coefficients at chunk rate
@@ -95,7 +99,9 @@ public:
     {
         if (!spec.isValid()) return;
         spec_ = spec;
-        freqSmoother_.reset(spec.sampleRate, 30.0f, 0.707f, 1000.0f);
+        // The cutoff is smoothed as log2(Hz): equal steps per octave, and
+        // critically damped (Q 0.5) so a jump never overshoots the target.
+        freqSmoother_.reset(spec.sampleRate, 30.0f, 0.5f, std::log2(1000.0f));
         resSmoother_.reset(spec.sampleRate, 20.0f, 0.707f);
         gainSmoother_.reset(spec.sampleRate, 20.0f, 0.0f);
         // Coefficients depend on the sample rate: force a rebuild on the next
@@ -121,6 +127,9 @@ public:
         freqSmoother_.skip();
         resSmoother_.skip();
         gainSmoother_.skip();
+        // The next block starts on its targets: no glide from stale values.
+        snapNext_ = true;
+        chunkPhase_ = 0;
     }
 
     // -- Configuration -------------------------------------------------------
@@ -477,6 +486,9 @@ public:
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
+        // Before prepare() there is no rate to design for: pass through.
+        if (!(spec_.sampleRate > 0.0)) return;
+
         DenormalGuard guard;
         const int nCh = std::min(buffer.getNumChannels(), MaxChannels);
         const int nS  = buffer.getNumSamples();
@@ -492,9 +504,17 @@ public:
         }
 
         // Update smoothers with latest atomic targets
-        freqSmoother_.setTargetValue(targetFreq_.load(std::memory_order_relaxed));
+        const float rawFreq = targetFreq_.load(std::memory_order_relaxed);
+        freqSmoother_.setTargetValue(std::log2(std::max(rawFreq, 1.0f)));
         resSmoother_.setTargetValue(targetRes_.load(std::memory_order_relaxed));
         gainSmoother_.setTargetValue(targetGain_.load(std::memory_order_relaxed));
+        if (snapNext_)
+        {
+            snapNext_ = false;
+            freqSmoother_.skip();
+            resSmoother_.skip();
+            gainSmoother_.skip();
+        }
         T nonLin = static_cast<T>(targetNonlinearity_.load(std::memory_order_relaxed));
         const bool  drift    = driftEnabled_.load(std::memory_order_relaxed);
         const float driftInt = driftIntensity_.load(std::memory_order_relaxed);
@@ -509,7 +529,9 @@ public:
             // -- Fast Path: SIMD Friendly, Outer Channel Loop --
             if (nS > 0)
             {
-                float f = freqSmoother_.getCurrentValue(); // Value is static
+                // Settled: design from the exact target, not exp2(log2(f)),
+                // so static coefficients never move by a rounding step.
+                float f = rawFreq;
                 float q = resSmoother_.getCurrentValue();
                 float g = gainSmoother_.getCurrentValue();
 
@@ -556,12 +578,18 @@ public:
             // Processes audio in small chunks to avoid per-sample trigonometric calculations.
             for (int i = 0; i < nS; ++i)
             {
-                float freq = freqSmoother_.getNextValue();
+                const bool gliding = freqSmoother_.isSmoothing();
+                const float logFreq = freqSmoother_.getNextValue();
+                float freq = gliding ? std::exp2(logFreq) : rawFreq;
                 float res  = resSmoother_.getNextValue();
                 float gain = gainSmoother_.getNextValue();
 
-                // Only calculate trig/coefficients every kChunkSize samples to save CPU
-                if (i % kChunkSize == 0)
+                // Only calculate trig/coefficients every kChunkSize samples to
+                // save CPU. The grid runs on a stream counter, so the refresh
+                // points (and the output) do not depend on the host's blocks.
+                const bool refresh = chunkPhase_ == 0;
+                chunkPhase_ = (chunkPhase_ + 1) & (kChunkSize - 1);
+                if (refresh)
                 {
                     float driftValue = drift ? (driftGen_.getNextSample() * driftInt) : 0.0f;
                     freq *= (1.0f + driftValue);
@@ -636,14 +664,17 @@ public:
      */
     void applyParametersNow() noexcept
     {
-        freqSmoother_.setTargetValue(targetFreq_.load(std::memory_order_relaxed));
+        if (!(spec_.sampleRate > 0.0)) return;   // nothing to design for yet
+        const float rawFreq = targetFreq_.load(std::memory_order_relaxed);
+        freqSmoother_.setTargetValue(std::log2(std::max(rawFreq, 1.0f)));
         resSmoother_.setTargetValue(targetRes_.load(std::memory_order_relaxed));
         gainSmoother_.setTargetValue(targetGain_.load(std::memory_order_relaxed));
         freqSmoother_.skip();
         resSmoother_.skip();
         gainSmoother_.skip();
+        snapNext_ = false;
 
-        float f = freqSmoother_.getCurrentValue();
+        float f = rawFreq;
         float q = resSmoother_.getCurrentValue();
         float g = gainSmoother_.getCurrentValue();
         const float nyquist = static_cast<float>(spec_.sampleRate) * 0.499f;
@@ -703,6 +734,11 @@ public:
                 setGain(gain);
                 break;
         }
+        // Every parameter round-trips, whatever the shape (the shelf and
+        // tilt helpers above do not take the resonance).
+        setResonance(res);
+        setShelfSlope(r.read("shelfSlope", getShelfSlope()));
+        setGain(gain);
         setNonlinearity(static_cast<T>(r.read("nonlin", 0.0f)));
         return true;
     }
@@ -769,7 +805,9 @@ protected:
                 case Shape::HighPass:  c = BiquadCoeffs::makeFirstOrderHighPass(sr, f); break;
                 default:               c = BiquadCoeffs::makeFirstOrderLowPass(sr, f); break;
             }
-            stages_[stageIdx++].setCoeffs(c);
+            // Audio thread is the origin here: the direct write, not the
+            // control-thread seqlock (docs/threading.md, origin rule).
+            stages_[stageIdx++].setCoeffsNow(c);
         }
 
         for (int s = 0; s < cascade.numSecondOrder; ++s)
@@ -809,7 +847,7 @@ protected:
                 case Shape::AllPass:   c = BiquadCoeffs::makeAllPass(sr, f, stageQ); break;
                 case Shape::Tilt:      c = BiquadCoeffs::makeTilt(sr, f, gainDb); break;
             }
-            stages_[stageIdx++].setCoeffs(c);
+            stages_[stageIdx++].setCoeffsNow(c);
         }
 
         numStages_ = stageIdx;
@@ -852,6 +890,8 @@ protected:
     int lastSlopeDb_ = -1;
     bool lastMatched_ = false;
     float lastShelfSlope_ = -1.0f;   ///< Shelf S: a slope-only change must rebuild coeffs.
+    bool snapNext_ = true;           ///< Next block skips the smoothers to their targets.
+    unsigned chunkPhase_ = 0;        ///< Stream position in the 16-sample refresh grid.
 };
 
 } // namespace dspark

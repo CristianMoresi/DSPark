@@ -22,9 +22,14 @@
  * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/Biquad.h,
  * Core/DspMath.h, Core/Smoothers.h, Core/StateBlob.h, Effects/Delay.h.
  *
+ * Latency: Binaural and Haas delay both ears by a common 4 samples (the
+ * interpolators' read floor), reported by getLatency(); the other algorithms
+ * have none. Switching to or from them changes getLatency(): notify the host.
+ *
  * Threading: prepare() belongs to the setup thread; processBlock()/reset() to
  * the audio thread. All parameter setters are safe from any thread (atomics
  * applied at the top of the next processBlock); non-finite values are ignored.
+ * getLatency() is safe from any thread.
  *
  * @tparam T Floating-point precision type (float or double).
  */
@@ -181,6 +186,16 @@ public:
         panSmoother_.skip();
     }
 
+    /**
+     * @brief Latency in samples: the 4-sample common base delay of the
+     *        Binaural and Haas paths (centred image), 0 for the others.
+     */
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        const Algorithm a = algorithm_.load(std::memory_order_relaxed);
+        return (a == Algorithm::Binaural || a == Algorithm::Haas) ? kBaseDelaySamples : 0;
+    }
+
     // -- Configuration -------------------------------------------------------
     // All thread-safe; non-finite values are ignored. The ITD / Haas maxima
     // size the delay lines in prepare(): raising them beyond the prepared
@@ -223,8 +238,9 @@ public:
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
+        // The blob stores float: the cast keeps Panner<double> compiling.
         StateWriter w(stateId("PANR"), 1);
-        w.write("pan", pan_.load(std::memory_order_relaxed));
+        w.write("pan", static_cast<float>(pan_.load(std::memory_order_relaxed)));
         w.write("algorithm", static_cast<int32_t>(algorithm_.load(std::memory_order_relaxed)));
         w.write("smoothing", smoothingTime_.load(std::memory_order_relaxed));
         w.write("binauralITD", binauralMaxITD_.load(std::memory_order_relaxed));
@@ -296,7 +312,7 @@ protected:
         // used to clamp both ears to 3 for |pan| < ~0.1, killing the ITD cue near
         // centre (a localization dead-zone). With the base offset the ITD difference
         // is linear from the centre, and the shared delay is inaudible.
-        const T baseMs = T(4000) / static_cast<T>(sampleRate_); // ~4 samples
+        const T baseMs = T(1000 * kBaseDelaySamples) / static_cast<T>(sampleRate_); // 4 samples
         delayL_.setDelayMs(baseMs + itdMax * std::max(T(0), targetP));   // pan>0 => L delayed
         delayR_.setDelayMs(baseMs + itdMax * std::max(T(0), -targetP));  // pan<0 => R delayed
 
@@ -399,7 +415,7 @@ protected:
         // Smoothed inside Delay - no abrupt pointer jumps even on fast moves.
         // Common base delay keeps both ears above the 3-sample interpolation floor
         // so the inter-channel delay is linear from centre (no dead-zone).
-        const T baseMs = T(4000) / static_cast<T>(sampleRate_); // ~4 samples
+        const T baseMs = T(1000 * kBaseDelaySamples) / static_cast<T>(sampleRate_); // 4 samples
         delayL_.setDelayMs(baseMs + haasMax * std::max(T(0), pT));
         delayR_.setDelayMs(baseMs + haasMax * std::max(T(0), -pT));
 
@@ -470,6 +486,7 @@ protected:
 
     double sampleRate_ = 48000.0;
     std::atomic<Algorithm> algorithm_ { Algorithm::EqualPower };
+    static constexpr int kBaseDelaySamples = 4;   ///< Binaural/Haas common delay.
     std::atomic<T> pan_ { T(0) };
 
     Delay<T> delayL_, delayR_;

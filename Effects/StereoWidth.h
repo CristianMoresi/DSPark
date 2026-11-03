@@ -123,6 +123,15 @@ public:
     {
         if (numSamples <= 0) return;
 
+        // Front-door non-finite guard: the bass-mono side filter is recursive,
+        // so one NaN/Inf sample would latch it (and both outputs) forever.
+        // No-op on finite input.
+        for (int i = 0; i < numSamples; ++i)
+        {
+            if (!std::isfinite(left[i]))  left[i]  = T(0);
+            if (!std::isfinite(right[i])) right[i] = T(0);
+        }
+
         // Load atomics once per block to allow tight loop vectorization. The
         // width ramp is closed form per sample (moveTowards), so the pure-width
         // loop still vectorizes; settled, it reduces to the constant exactly.
@@ -192,8 +201,10 @@ public:
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
+        // The blob stores float: the casts keep the double instantiation
+        // compiling (a double matches no StateWriter overload unambiguously).
         StateWriter w(stateId("WIDE"), 1);
-        w.write("width", width_.load(std::memory_order_relaxed));
+        w.write("width", static_cast<float>(width_.load(std::memory_order_relaxed)));
         w.write("bassMono", bassMonoEnabled_.load(std::memory_order_relaxed));
         w.write("bassCutoff", static_cast<float>(bassMonoCutoff_.load(std::memory_order_relaxed)));
         return w.blob();

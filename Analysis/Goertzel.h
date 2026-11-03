@@ -57,6 +57,10 @@ namespace dspark {
  * State is unified: you can mix `processBlock` and `pushSample` safely.
  * Before prepare() the detector is inert and reports zero magnitude.
  *
+ * The resonator runs in double whatever T is: near DC its pole pair sits on
+ * the unit circle and a float state misreads low tones over long windows
+ * (-3.96 dB at 27.5 Hz with a 65536-sample window at 192 kHz).
+ *
  * @tparam T Sample type (float or double). Requires dspark::FloatType concept.
  */
 template <FloatType T>
@@ -78,13 +82,9 @@ public:
      *                  is the bin width fs/blockSize, so the count that meets
      *                  a requirement at one sample rate does not meet it at
      *                  another (see the selectivity note in the file header).
-     *                  With float precision, very long windows (hundreds of
-     *                  thousands of samples) accumulate rounding error in the
-     *                  resonator; prefer double for extreme block sizes.
      *                  At exact DC and Nyquist the recursion sits on a double
-     *                  pole and its state grows O(N^2), so float precision
-     *                  degrades much sooner there: use double (or a short
-     *                  window) when measuring those two edge frequencies.
+     *                  pole and its state grows O(N^2); the double core keeps
+     *                  that exact for any practical window.
      */
     void prepare(double sampleRate, double targetFreqHz, int blockSize) noexcept
     {
@@ -103,18 +103,16 @@ public:
         // Exact target frequency omega calculation (Generalized Goertzel)
         double omega = 2.0 * std::numbers::pi * targetFreq_ / sampleRate_;
 
-        coeff_ = static_cast<T>(2.0 * std::cos(omega));
-        cosOmega_ = static_cast<T>(std::cos(omega));
-        sinOmega_ = static_cast<T>(std::sin(omega));
+        coeff_ = 2.0 * std::cos(omega);
+        cosOmega_ = std::cos(omega);
+        sinOmega_ = std::sin(omega);
 
         // Magnitude normalization: 2/N for interior bins, 1/N for DC and for
         // exact Nyquist (neither has a mirrored bin; the old 2/N at Nyquist
         // read a full-scale alternating signal 2x / +6 dB high).
         const bool isDc      = targetFreq_ <= 0.001;
         const bool isNyquist = targetFreq_ >= sampleRate_ * 0.5 * (1.0 - 1e-12);
-        normalisationFactor_ = (isDc || isNyquist)
-                                ? static_cast<T>(1.0 / blockSize_)
-                                : static_cast<T>(2.0 / blockSize_);
+        normalisationFactor_ = (isDc || isNyquist) ? 1.0 / blockSize_ : 2.0 / blockSize_;
 
         reset();
     }
@@ -133,21 +131,21 @@ public:
         if (data == nullptr || numSamples <= 0) return;
 
         // Bring state to local variables for compiler optimization (register allocation)
-        T s1 = s1_;
-        T s2 = s2_;
-        const T coeff = coeff_;
+        double s1 = s1_;
+        double s2 = s2_;
+        const double coeff = coeff_;
 
         for (int i = 0; i < numSamples; ++i)
         {
-            T s0 = data[i] + coeff * s1 - s2;
+            double s0 = static_cast<double>(data[i]) + coeff * s1 - s2;
             s2 = s1;
             s1 = s0;
 
             if (++sampleCount_ >= blockSize_)
             {
                 computeResult(s1, s2);
-                s1 = T(0);
-                s2 = T(0);
+                s1 = 0.0;
+                s2 = 0.0;
                 sampleCount_ = 0;
             }
         }
@@ -165,15 +163,15 @@ public:
      */
     bool pushSample(T sample) noexcept
     {
-        T s0 = sample + coeff_ * s1_ - s2_;
+        double s0 = static_cast<double>(sample) + coeff_ * s1_ - s2_;
         s2_ = s1_;
         s1_ = s0;
 
         if (++sampleCount_ >= blockSize_)
         {
             computeResult(s1_, s2_);
-            s1_ = T(0);
-            s2_ = T(0);
+            s1_ = 0.0;
+            s2_ = 0.0;
             sampleCount_ = 0;
             return true;
         }
@@ -189,8 +187,8 @@ public:
     void forceCompute() noexcept
     {
         computeResult(s1_, s2_);
-        s1_ = T(0);
-        s2_ = T(0);
+        s1_ = 0.0;
+        s2_ = 0.0;
         sampleCount_ = 0;
     }
 
@@ -275,8 +273,8 @@ public:
      */
     void reset() noexcept
     {
-        s1_ = T(0);
-        s2_ = T(0);
+        s1_ = 0.0;
+        s2_ = 0.0;
         sampleCount_ = 0;
         real_ = T(0);
         imag_ = T(0);
@@ -287,10 +285,10 @@ private:
     /**
      * @brief Computes real and imaginary parts and applies correct normalization.
      */
-    void computeResult(T s1, T s2) noexcept
+    void computeResult(double s1, double s2) noexcept
     {
-        real_ = (s1 - s2 * cosOmega_) * normalisationFactor_;
-        imag_ = (s2 * sinOmega_) * normalisationFactor_;
+        real_ = static_cast<T>((s1 - s2 * cosOmega_) * normalisationFactor_);
+        imag_ = static_cast<T>((s2 * sinOmega_) * normalisationFactor_);
         hasNewResult_ = true;
     }
 
@@ -298,14 +296,15 @@ private:
     double targetFreq_ = 440.0;
     int blockSize_ = 2048;
 
-    T coeff_ = T(0);
-    T cosOmega_ = T(0);
-    T sinOmega_ = T(0);
-    T normalisationFactor_ = T(0);
+    // Coefficients and resonator state in double (see the class comment).
+    double coeff_ = 0.0;
+    double cosOmega_ = 0.0;
+    double sinOmega_ = 0.0;
+    double normalisationFactor_ = 0.0;
 
     // Streaming state
-    T s1_ = T(0);
-    T s2_ = T(0);
+    double s1_ = 0.0;
+    double s2_ = 0.0;
     int sampleCount_ = 0;
 
     // Results

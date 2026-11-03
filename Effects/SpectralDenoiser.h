@@ -20,6 +20,9 @@
  *    the residual noise stays a smooth, attenuated copy of the noise instead
  *    of the "musical noise" (isolated tones) a hard per-bin gate leaves.
  *
+ * A non-finite input reaches neither the profile nor the gain memory: the
+ * frames that contain it come out silent and the next clean frame continues.
+ *
  * Latency is the STFT's (fftSize samples). All per-bin state is per channel;
  * the profile is shared. The decision-directed weight is per STFT hop, so its
  * memory in milliseconds scales with fftSize/sampleRate.
@@ -138,8 +141,12 @@ public:
     [[nodiscard]] T getReduction() const noexcept { return reduction_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getThreshold() const noexcept { return threshold_.load(std::memory_order_relaxed); }
 
-    /** @brief Latency in samples (the STFT pipeline's). */
-    [[nodiscard]] int getLatency() const noexcept { return stft_.getLatency(); }
+    /** @brief Latency in samples (the STFT pipeline's); 0 before prepare()
+     *  succeeds, while the instance passes audio through. */
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        return prepared_.load(std::memory_order_relaxed) ? stft_.getLatency() : 0;
+    }
 
     /** @brief Serializes the parameter state (the learned profile is material-
      *  dependent content, not a preset, and is intentionally not included). */
@@ -208,6 +215,16 @@ public:
                 const float re = static_cast<float>(bins[2 * k]);
                 const float im = static_cast<float>(bins[2 * k + 1]);
                 const float power = re * re + im * im;
+
+                // The gain memory is recursive and the profile is a running
+                // mean: one NaN in either would stay for the whole stream.
+                if (!std::isfinite(power))
+                {
+                    clean[static_cast<size_t>(k)] = 0.0f;
+                    bins[2 * k] = T(0);
+                    bins[2 * k + 1] = T(0);
+                    continue;
+                }
 
                 auto& noise = profile_[static_cast<size_t>(k)];
                 if (learning)

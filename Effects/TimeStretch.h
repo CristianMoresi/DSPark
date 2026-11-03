@@ -125,16 +125,16 @@
  * aliases and nothing is borrowed. There is no compensation latency to
  * subtract: output sample `k` is sample `k` of the stretched signal. What
  * there is instead is a priming requirement: `pullOutput()` returns 0 until
- * the overlap-add's first complete sample exists, which takes 1024 to 3072
+ * the overlap-add's first complete sample exists, which takes 1280 to 3072
  * input samples for Standard at its default 2048-sample frame and 4608 to
  * 6656 for Studio at its default 4096 frame (the frame plus the detector's
  * lookahead), over ratios 0.5 to 2. After that, cumulative output is
  * `ratio *` cumulative input fed, less an offset that has two parts. One is
  * the overlap-add's own incomplete tail, which nothing the caller does can
- * remove: once a stream has been fed to its end and drained it measures 1152
- * to 2091 samples for Standard and 2944 to 8704 for Studio at their default
+ * remove: once a stream has been fed to its end and drained it measures 1192
+ * to 2968 samples for Standard and 2944 to 8704 for Studio at their default
  * frames over ratios 0.5 to 2 - Studio's grows with the ratio, its lookahead
- * being stretched with everything else - and for Standard up to 3840
+ * being stretched with everything else - and for Standard up to 4608
  * mid-stream on percussive material, where the transient-locked hop varies
  * how much of a frame stands incomplete. The other
  * is whatever has been fed and not yet pulled back. That part is the caller's
@@ -415,12 +415,13 @@ public:
         studioActive_ = quality_.load(std::memory_order_relaxed) == Quality::Studio;
         engine_.reset();
         studio_.reset();
+        int latency = fftStandard_;
         if (studioActive_)
         {
             fftSize_ = fftStudio_;
             // One frame of analysis-synthesis delay plus the onset
             // detector's lookahead.
-            latency_ = fftStudio_ + studio_.lookahead();
+            latency = fftStudio_ + studio_.lookahead();
             accumMask_ = studio_.olaMask();
         }
         else
@@ -431,9 +432,9 @@ public:
             // itself accounts for fftSize - synthHop samples of delay, so
             // that trailing distance puts the reported latency at exactly
             // one frame.
-            latency_ = fftStandard_;
             accumMask_ = engine_.olaMask();
         }
+        latency_.store(latency, std::memory_order_relaxed);
         synthHop_ = fftSize_ / 4;
         for (auto& q : queue_) std::fill(q.begin(), q.end(), T(0));
 
@@ -445,7 +446,7 @@ public:
         // Start one synthesis hop behind the write head: those cells are
         // still silent, which is the latency the class reports, and from
         // there the reader stays exactly that far behind.
-        readPos_ = eWriteHead() - static_cast<int64_t>(latency_ - fftSize_ + synthHop_);
+        readPos_ = eWriteHead() - static_cast<int64_t>(latency - fftSize_ + synthHop_);
         openIntake();
     }
 
@@ -493,7 +494,9 @@ public:
     }
 
     /**
-     * @brief Enables identity phase locking (default on).
+     * @brief Enables identity phase locking in the Standard engine (default
+     *        on). Studio has no such switch: its phase propagation is always
+     *        on, and this setting does not change its output.
      *
      * Off leaves the plain phase vocoder, where every bin advances on its own
      * instantaneous frequency and the bins of one partial lose their relative
@@ -524,14 +527,30 @@ public:
         return phaseLock_.load(std::memory_order_relaxed);
     }
 
-    /** @brief Latency of the fixed-rate processBlock() path in samples: one
-     *  frame (42.7 ms at the default 2048 frame and 48 kHz), 0 before
-     *  prepare() succeeds. The rate-changing feedInput()/pullOutput() pair
-     *  carries no compensation latency - its output is the stretched timeline
-     *  itself - and the offline process() removes its own delay. */
+    /** @brief Latency of the fixed-rate processBlock() path in samples for
+     *  the engine in force: one frame for Standard (2048 by default, 42.7 ms
+     *  at 48 kHz), one frame plus the onset lookahead for Studio (5632 by
+     *  default, 117 ms), 0 before prepare() succeeds. The rate-changing
+     *  feedInput()/pullOutput() pair carries no compensation latency - its
+     *  output is the stretched timeline itself - and the offline process()
+     *  removes its own delay. */
     [[nodiscard]] int getLatency() const noexcept
     {
-        return prepared_.load(std::memory_order_relaxed) ? latency_ : 0;
+        return prepared_.load(std::memory_order_relaxed)
+            ? latency_.load(std::memory_order_relaxed)
+            : 0;
+    }
+
+    /**
+     * @brief Length in samples of `inputSamples` stretched by `ratio`, which is
+     *        what process() and an offline session return.
+     *
+     * 64-bit on every target. A session may be longer than `long` holds on a
+     * target where that is 32 bits, such as 64-bit Windows and WebAssembly.
+     */
+    [[nodiscard]] static int64_t stretchedLength(int64_t inputSamples, double ratio) noexcept
+    {
+        return std::llround(static_cast<double>(inputSamples) * ratio);
     }
 
     /** @brief Input samples accepted but not yet consumed by the stretch. */
@@ -841,7 +860,7 @@ public:
         // plus half a stretched frame into the synthesis stream.
         offlineSkip_ = studioActive_
             ? std::llround(studio_.streamPositionOf(0.0)) - readPos_
-            : std::lround(0.5 * static_cast<double>(fftSize_) * (1.0 + offlineRatio_));
+            : std::llround(0.5 * static_cast<double>(fftSize_) * (1.0 + offlineRatio_));
         offlineStreamPos_ = 0;
         offlineReceived_ = 0;
         offlineStop_ = offlineSkip_;
@@ -877,8 +896,7 @@ public:
     {
         if (!offlineOpen_ || offlineFinished_) return;
         offlineFinished_ = true;
-        offlineStop_ = offlineSkip_ + static_cast<int64_t>(
-            std::lround(static_cast<double>(offlineReceived_) * offlineRatio_));
+        offlineStop_ = offlineSkip_ + stretchedLength(offlineReceived_, offlineRatio_);
         runOffline();
     }
 
@@ -961,8 +979,7 @@ private:
 
             const int64_t limit = offlineFinished_
                 ? offlineStop_
-                : offlineSkip_ + static_cast<int64_t>(
-                      std::lround(static_cast<double>(offlineReceived_) * offlineRatio_));
+                : offlineSkip_ + stretchedLength(offlineReceived_, offlineRatio_);
             const int64_t take = std::min(avail, limit - offlineStreamPos_);
             if (take <= 0) break;
             const int64_t from = std::max(offlineStreamPos_, offlineSkip_);
@@ -1093,13 +1110,13 @@ private:
         if (path_ != Path::None) return false;
         path_ = Path::Pull;
         // This path's output is the stretched timeline itself, so it starts
-        // at the first synthesis sample whose overlap-add is complete: one
-        // frame past the write head, less the analysis hop the first frame
-        // consumes. Nothing has been fed yet, so that hop is the one the
-        // engine reports now.
+        // where input sample 0 lands: a frame carries its content at its
+        // centre, half an input frame plus half a stretched frame past the
+        // adaptor's reader, the same place the offline path skips to.
         readPos_ = studioActive_
             ? static_cast<int64_t>(std::llround(studio_.streamPositionOf(0.0)))
-            : eWriteHead() + static_cast<int64_t>(fftSize_ - eSamplesToNextHop());
+            : eWriteHead() - static_cast<int64_t>(synthHop_) + std::llround(
+                  0.5 * static_cast<double>(fftSize_) * (1.0 + engine_.activeRatio()));
         return true;
     }
 
@@ -1194,7 +1211,7 @@ private:
 
     int fftSize_ = 2048;
     int synthHop_ = 512;
-    int latency_ = 2048;
+    std::atomic<int> latency_ { 2048 };   ///< Written by reset(), read by any thread.
     int64_t accumMask_ = 8191;     ///< Cached engine OLA ring mask.
 
     detail::PhaseVocoderEngine<T> engine_;   ///< Standard engine (the earlier rendering).

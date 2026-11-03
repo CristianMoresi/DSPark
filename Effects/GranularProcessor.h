@@ -25,6 +25,9 @@
  * same test). That kernel grows with the rate, about 32 * rate taps (128 at
  * +24 semitones), so dense clouds of high grains cost more CPU.
  *
+ * A non-finite input sample reads as silence: the ring would otherwise hold it
+ * for every grain that reaches it until the write head comes round again.
+ *
  * Threading model: parameter setters/getters are std::atomic based and safe
  * from any thread (non-finite values are ignored). prepare() is setup-thread
  * only (allocates; invalid specs are ignored and an unprepared instance
@@ -174,8 +177,8 @@ public:
         freeze_.store(frozen, std::memory_order_relaxed);
     }
 
-    /** @brief Dry/wet mix [0, 1] (default 1); smoothed linearly over one
-     *  block. Non-finite values are ignored. */
+    /** @brief Dry/wet mix [0, 1] (default 1); ramped at no more than full
+     *  scale per 20 ms. Non-finite values are ignored. */
     void setMix(T mix) noexcept
     {
         if (!std::isfinite(mix)) return;
@@ -253,12 +256,16 @@ public:
 
         for (int i = 0; i < nS; ++i)
         {
+            const T rawL = buffer.getChannel(0)[i];
+            const T rawR = buffer.getChannel(nCh > 1 ? 1 : 0)[i];
+            const T dryL = std::isfinite(rawL) ? rawL : T(0);
+            const T dryR = std::isfinite(rawR) ? rawR : T(0);
+
             // Capture (continues the moment freeze releases).
             if (!frozen)
             {
-                ring_[0][static_cast<size_t>(writePos_)] = buffer.getChannel(0)[i];
-                ring_[1][static_cast<size_t>(writePos_)] =
-                    buffer.getChannel(nCh > 1 ? 1 : 0)[i];
+                ring_[0][static_cast<size_t>(writePos_)] = dryL;
+                ring_[1][static_cast<size_t>(writePos_)] = dryR;
                 writePos_ = (writePos_ + 1) & ringMask_;
             }
 
@@ -299,13 +306,9 @@ public:
             }
 
             const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + 1));
-            const T dryL = buffer.getChannel(0)[i];
             buffer.getChannel(0)[i] = dryL + (outL - dryL) * mixVal;
             if (nCh > 1)
-            {
-                const T dryR = buffer.getChannel(1)[i];
                 buffer.getChannel(1)[i] = dryR + (outR - dryR) * mixVal;
-            }
         }
         currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS));
     }
@@ -356,18 +359,28 @@ private:
             if (g.active) continue;
 
             const double sizeMs = static_cast<double>(grainMs_.load(std::memory_order_relaxed));
-            const double lenSamples = sizeMs * 0.001 * sampleRate_;
+            double lenSamples = sizeMs * 0.001 * sampleRate_;
             const double jit = static_cast<double>(jitter_.load(std::memory_order_relaxed));
             const double st = static_cast<double>(pitchSt_.load(std::memory_order_relaxed))
                             + (frand() * 2.0 - 1.0)
                               * static_cast<double>(pitchJitterSt_.load(std::memory_order_relaxed));
             const double rate = std::exp2(st / 12.0);
 
+            // A grain has to fit between the two sides of the write head: a
+            // fast one starts length * rate behind it, a slow one starts
+            // length behind it and falls back length * (1 - rate) further.
+            // Long grains on a short ring are cut to what fits.
+            const double ringLength = static_cast<double>(ringMask_ + 1);
+            lenSamples = std::min(lenSamples, (ringLength - 2.0 * kReadMargin)
+                                              / (rate >= 1.0 ? rate : 2.0 - rate));
+
             // Start far enough back that the grain never overtakes the write
             // head even when pitched up: lead = length * max(rate, 1) + margin,
             // the margin covering the read kernel's reach on both ends.
             const double maxSpan = lenSamples * std::max(rate, 1.0) + kReadMargin;
-            const double jitterSpan = jit * 0.5 * static_cast<double>(ringMask_ + 1 - maxSpan - kReadMargin);
+            const double jitterSpan = std::min(
+                jit * 0.5 * (ringLength - maxSpan - kReadMargin),
+                ringLength - kReadMargin - maxSpan - lenSamples * std::max(1.0 - rate, 0.0));
             const double back = maxSpan + frand() * std::max(jitterSpan, 0.0);
             g.pos = static_cast<double>(writePos_) - back;
             while (g.pos < 0.0) g.pos += static_cast<double>(ringMask_ + 1);

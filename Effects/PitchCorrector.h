@@ -51,12 +51,11 @@
  * holds a value must be careful about which value it holds:
  *
  * - Warm-up. Reports are ignored until one full analysis window has been fed
- *   since prepare() or reset(). The detector's first window is three quarters
- *   zeros, and on any non-silent input it yields the shortest lag its search
- *   allows - half the sample rate, at full confidence. Held, that would
- *   transpose a track that never contains a note at all, which is the opposite
- *   of what the hold is for. One window is 43 ms at 44.1/48 kHz, well inside
- *   the signal latency, so nothing audible waits for it.
+ *   since prepare() or reset(). The detector's first windows are mostly zeros,
+ *   so any period it reads there rests on a fraction of a window. Held, such a
+ *   reading would stay for the whole track, which is the opposite of what the
+ *   hold is for. One window is 43 ms at 44.1/48 kHz, well inside the signal
+ *   latency, so nothing audible waits for it.
  * - Register. A reported fundamental above a quarter of the sample rate is
  *   refused: not even its second harmonic fits below Nyquist, so it is not a
  *   pitch this effect could act on, and every musical fundamental is far below
@@ -587,9 +586,9 @@ private:
         else if (warmupRemaining_ == 0)
         {
             // Two gates before a report may establish a held correction: the
-            // analysis window must be full (its first, mostly-zero window
-            // reports the shortest lag the search allows, at full confidence),
-            // and the fundamental must be one this effect could act on - above
+            // analysis window must be full (a mostly-zero window is too little
+            // evidence for a value that will be held), and the fundamental
+            // must be one this effect could act on - above
             // a quarter of the sample rate not even its second harmonic fits
             // below Nyquist. Unvoiced, or refused: keep the previous target.
             const double frequency = static_cast<double>(detector_.getFrequencyHz());

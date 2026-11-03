@@ -63,6 +63,10 @@
  * an upward shift would fold above Nyquist, and share one rotation across
  * channels, which keeps the stereo image from wandering.
  *
+ * A non-finite input sample reads as silence in the Studio engine and in the
+ * dry path; the Standard/High engine holds no phase across one, so it clears
+ * by itself once the sample has left the frame.
+ *
  * Threading model: parameter setters/getters are std::atomic based and safe
  * from any thread (non-finite values are ignored); prepare() is setup-thread
  * only (allocates; invalid specs are ignored); reset() belongs to the owner
@@ -145,7 +149,7 @@ public:
         // comb-filter.
         const int synthHop = fftSize / 4;
         readOffset_ = fftSize + synthHop;
-        latency_    = readOffset_ + fftSize - synthHop;
+        latencyLegacy_ = readOffset_ + fftSize - synthHop;
         // Studio: the resample reader runs at the pitch ratio behind the
         // completed stream. At ratio a an input sample reaches the completed
         // stream after half a frame, a frame of analysis, the onset
@@ -159,7 +163,6 @@ public:
         studio_.prepare(spec.sampleRate, numChannels_, fftStudio, true);
         studio_.setAnchorLeadLimit(static_cast<double>(fftStudio / 4));
         latencyStudio_ = fftStudio + fftStudio / 2 + studio_.lookahead() + fftStudio / 4 + 64;
-        latencyLegacy_ = latency_;
         drySize_ = 1;
         while (drySize_ < std::max(latencyLegacy_, latencyStudio_) + 1) drySize_ <<= 1;
         dryMask_ = drySize_ - 1;
@@ -200,7 +203,8 @@ public:
     {
         if (!prepared_.load(std::memory_order_relaxed)) return;
         studioActive_ = quality_.load(std::memory_order_relaxed) == Quality::Studio;
-        latency_ = studioActive_ ? latencyStudio_ : latencyLegacy_;
+        latency_.store(studioActive_ ? latencyStudio_ : latencyLegacy_,
+                       std::memory_order_relaxed);
         engine_.reset();
         studio_.reset();
         for (auto& r : dryRing_) std::fill(r.begin(), r.end(), T(0));
@@ -332,8 +336,14 @@ public:
     /** @brief Reports total latency in samples. Studio: 1.5 * fftSize +
      *  lookahead + fftSize / 4 + 64 (5184, 108 ms, at the default frame and
      *  48 kHz), held at every pitch. Standard and High: 2 * fftSize, exact at
-     *  unity only (their real delay drifts with the pitch; file overview). */
-    [[nodiscard]] int getLatency() const noexcept { return latency_; }
+     *  unity only (their real delay drifts with the pitch; file overview).
+     *  0 before prepare() succeeds, while the instance passes audio through. */
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        return prepared_.load(std::memory_order_relaxed)
+            ? latency_.load(std::memory_order_relaxed)
+            : 0;
+    }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
@@ -387,6 +397,8 @@ public:
             return;
         }
 
+        const int latency = latency_.load(std::memory_order_relaxed);
+
         // Rate-limited mix ramp (moveTowards, exact landing; settled it
         // reduces to the constant, bit-identically). A per-block ramp landed
         // in 0.7 ms with 32-sample blocks.
@@ -416,7 +428,7 @@ public:
                 int dp = dryPos_;
                 for (int k = 0; k < chunk; ++k)
                 {
-                    dry[static_cast<size_t>(dp)] = in[k];
+                    dry[static_cast<size_t>(dp)] = std::isfinite(in[k]) ? in[k] : T(0);
                     dp = (dp + 1) & dryMask_;
                 }
             }
@@ -446,7 +458,7 @@ public:
                         wet += (old - wet) * w;
                         --fadeLeft;
                     }
-                    const int dryIdx = (dp - latency_) & dryMask_;
+                    const int dryIdx = (dp - latency) & dryMask_;
                     const T drySample = dry[static_cast<size_t>(dryIdx)];
                     const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + k + 1));
                     // Two-product blend: exact at both ends (mix 1 emits the
@@ -509,6 +521,7 @@ private:
      */
     void processStudio(AudioBufferView<T> buffer, int nCh, int nS) noexcept
     {
+        const int latency = latency_.load(std::memory_order_relaxed);
         const T mixTarget = mix_.load(std::memory_order_relaxed);
         const T mixStart  = currentMix_;
         const int64_t mask = studio_.olaMask();
@@ -530,7 +543,7 @@ private:
                 int dp = dryPos_;
                 for (int k = 0; k < chunk; ++k)
                 {
-                    dry[static_cast<size_t>(dp)] = in[k];
+                    dry[static_cast<size_t>(dp)] = std::isfinite(in[k]) ? in[k] : T(0);
                     dp = (dp + 1) & dryMask_;
                 }
             }
@@ -549,7 +562,7 @@ private:
                 for (int k = 0; k < chunk; ++k)
                 {
                     const T wet = reader_.readRing(acc, mask, rp, rf);
-                    const T drySample = dry[static_cast<size_t>((dp - latency_) & dryMask_)];
+                    const T drySample = dry[static_cast<size_t>((dp - latency) & dryMask_)];
                     const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + k + 1));
                     out[k] = drySample * (T(1) - mixVal) + wet * mixVal;
                     rf += ratio;
@@ -637,7 +650,8 @@ private:
     std::atomic<bool> prepared_ { false };
 
     int readOffset_ = 2560;   ///< Reader distance behind the write head.
-    int latency_ = 4096;      ///< Measured wet latency (= readOffset_ + N - Rs).
+    std::atomic<int> latency_ { 4096 };   ///< Latency of the engine in force; reset()
+                                          ///< writes it on the stream owner's thread.
     int drySize_ = 8192;
     int dryMask_ = 8191;
     int64_t accumMask_ = 8191;   ///< Cached engine OLA ring mask.

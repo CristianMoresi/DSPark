@@ -96,10 +96,16 @@ public:
     /** @brief Longest kernel, in input samples (see the class note). */
     static constexpr int kMaxTaps = 8192;
 
+    /** @brief Largest target/source ratio prepare() accepts. Output per input
+     *  sample follows the ratio, so past this no caller's buffer holds it. */
+    static constexpr double kMaxRatio = 16777216.0;
+
     /**
      * @brief Prepares the resampler for a given rate conversion.
      *
      * Allocates internal buffers. MUST be called outside the audio thread.
+     * A non-finite rate, or a ratio above kMaxRatio, is ignored and the
+     * current conversion stays in force. Rates below 1 Hz are raised to 1 Hz.
      *
      * @param sourceRate      Source sample rate in Hz.
      * @param targetRate      Target sample rate in Hz.
@@ -514,12 +520,15 @@ private:
     void prepareTransactional(double sourceRate, double targetRate,
                               Quality quality, size_t channelCount)
     {
+        if (!std::isfinite(sourceRate) || !std::isfinite(targetRate)) return;
+
         // Derive the complete candidate configuration without touching the
         // live object. The std::max behavior intentionally preserves the
         // established treatment of non-positive rates.
         const double stagedSourceRate = std::max(sourceRate, 1.0);
         const double stagedTargetRate = std::max(targetRate, 1.0);
         const double stagedRatio = stagedTargetRate / stagedSourceRate;
+        if (stagedRatio > kMaxRatio) return;
         const Design d = design(stagedRatio, quality);
 
         auto [l, m] = rationalRatio(stagedSourceRate, stagedTargetRate);

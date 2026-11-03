@@ -27,7 +27,11 @@
  *
  * - **Phase-gradient heap integration** (Prusa & Holighaus, "Phase Vocoder
  *   Done Right", EUSIPCO 2017). Bins are visited in decreasing order of
- *   magnitude across the previous and the current frame. A bin reached from
+ *   magnitude across the previous and the current frame, kept by a bucket
+ *   queue at an eighth of an octave rather than a binary heap: the order only
+ *   has to be right to within a fraction of a decibel, and on the stretch
+ *   scenes the two score the same (LSD 2.203 against 2.211 dB) at 12 to 44
+ *   percent less CPU for the whole engine. A bin reached from
  *   the previous frame is advanced along time by its instantaneous
  *   frequency; a bin reached from a louder neighbour in the current frame
  *   inherits that neighbour's rotation, which keeps the analysis frame's
@@ -61,6 +65,10 @@
  *   The heap would give them one rigid but non-zero rotation, which adds
  *   the strike's Hilbert transform and its 1/t tail ahead of it.
  *
+ * A non-finite input sample is read as silence, and a frame whose spectrum
+ * overflowed anyway restarts the phase of the bins it touched: the phases are
+ * recursive state, so one NaN would otherwise stay in them for good.
+ *
  * Coordinates. Input samples are counted from reset() (the first pushed
  * sample is input 0). The synthesis stream is indexed by writeHead(), which
  * advances Rs per frame and marks the end of the completed overlap-add. On the
@@ -79,6 +87,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -188,8 +197,7 @@ public:
         done_.resize(nb);
         rotRe_.resize(nb); rotIm_.resize(nb);
         gain_.resize(nb);
-        heapKey_.resize(2 * nb + 2);
-        heapCode_.resize(2 * nb + 2);
+        bucketNext_.resize(2 * nb + 2);
         cepsTime_.resize(static_cast<size_t>(N_));
         cepsSpec_.resize(spec);
         envLog_.resize(nb);
@@ -216,6 +224,7 @@ public:
         for (auto& a : accum_) std::fill(a.begin(), a.end(), T(0));
         for (auto& s : prevSpec_) std::fill(s.begin(), s.end(), T(0));
         std::fill(prevMag_.begin(), prevMag_.end(), T(0));
+        prevMaxMag_ = T(0);
         std::fill(theta_.begin(), theta_.end(), 0.0);
         for (int k = 0; k < bins_; ++k)
             omPrev_[static_cast<size_t>(k)] = kTwoPi * k / N_;
@@ -285,7 +294,7 @@ public:
         auto& r = ring_[static_cast<size_t>(ch)];
         int64_t p = inCount_;
         for (int k = 0; k < count; ++k, ++p)
-            r[static_cast<size_t>(p & ringMask_)] = src[k];
+            r[static_cast<size_t>(p & ringMask_)] = std::isfinite(src[k]) ? src[k] : T(0);
     }
 
     /**
@@ -356,6 +365,9 @@ private:
     static constexpr double kTwoPi = 2.0 * std::numbers::pi;
     static constexpr int kSeqlockMaxAttempts = 3;
     static constexpr int kMaxLocks = 32;
+    /// Buckets of the propagation queue: 32 octaves at eight per octave, which
+    /// reaches past kHeapFloorDb. Anything lower shares the last bucket.
+    static constexpr int kBuckets = 256;
     /// Bins further than this below the frame's loudest are left on their own
     /// time propagation; nothing audible depends on how they are ordered.
     static constexpr double kHeapFloorDb = 100.0;
@@ -475,7 +487,9 @@ private:
                 const double om = Ra >= 1.0 ? prior + princArg(dphi - prior * Ra) / Ra : prior;
                 inc = princArg(theta_[static_cast<size_t>(k)] + Rs * om - dphi);
             }
-            tinc_[static_cast<size_t>(k)] = inc;
+            // A spectrum that overflowed must not enter the phase recursion,
+            // which would hold the NaN for the rest of the stream.
+            tinc_[static_cast<size_t>(k)] = std::isfinite(inc) ? inc : 0.0;
             omPrev_[static_cast<size_t>(k)] = omNow;
         }
 
@@ -565,6 +579,7 @@ private:
             std::fill(prevSpec_[static_cast<size_t>(ch)].begin(),
                       prevSpec_[static_cast<size_t>(ch)].end(), T(0));
         std::copy(mag_.begin(), mag_.end(), prevMag_.begin());
+        prevMaxMag_ = maxMag;
 
         prevAnalysisStart_ = A;
         firstFrame_ = false;
@@ -578,6 +593,7 @@ private:
      * @brief Heap integration over the previous and current frame.
      *
      * Codes: 2k = bin k of the previous frame, 2k+1 = bin k of this frame.
+     * Pending codes wait in a bucket queue (see queuePush()).
      */
     void propagate(T maxMag) noexcept
     {
@@ -590,31 +606,37 @@ private:
             theta_[static_cast<size_t>(k)] = tinc_[static_cast<size_t>(k)];
             if (!quiet) ++todo;
         }
-        heapSize_ = 0;
+        queueSize_ = 0;
+        queueTop_ = bucketBits(std::max(maxMag, prevMaxMag_));
+        queueCursor_ = kBuckets - 1;
+        bucketHead_.fill(-1);
         for (int k = 0; k < bins_; ++k)
             if (prevMag_[static_cast<size_t>(k)] > tol)
-                heapPush(prevMag_[static_cast<size_t>(k)], 2 * k);
+                queuePush(prevMag_[static_cast<size_t>(k)], 2 * k);
 
         while (todo > 0)
         {
-            if (heapSize_ == 0)
+            if (queueSize_ == 0)
             {
                 int best = -1; T bm = T(-1);
                 for (int k = 0; k < bins_; ++k)
                     if (!done_[static_cast<size_t>(k)] && mag_[static_cast<size_t>(k)] > bm)
                     { bm = mag_[static_cast<size_t>(k)]; best = k; }
+                // Only NaN magnitudes are left: they cannot be ordered, and
+                // their bins keep the time direction's candidate.
+                if (best < 0) break;
                 done_[static_cast<size_t>(best)] = 1; --todo;
-                heapPush(mag_[static_cast<size_t>(best)], 2 * best + 1);
+                queuePush(mag_[static_cast<size_t>(best)], 2 * best + 1);
                 continue;
             }
-            const int code = heapPop();
+            const int code = queuePop();
             const int k = code >> 1;
             if ((code & 1) == 0)
             {
                 if (!done_[static_cast<size_t>(k)])
                 {
                     done_[static_cast<size_t>(k)] = 1; --todo;   // theta = tinc already
-                    heapPush(mag_[static_cast<size_t>(k)], 2 * k + 1);
+                    queuePush(mag_[static_cast<size_t>(k)], 2 * k + 1);
                 }
             }
             else
@@ -624,56 +646,45 @@ private:
                 {
                     done_[static_cast<size_t>(k + 1)] = 1; --todo;
                     theta_[static_cast<size_t>(k + 1)] = th;
-                    heapPush(mag_[static_cast<size_t>(k + 1)], 2 * (k + 1) + 1);
+                    queuePush(mag_[static_cast<size_t>(k + 1)], 2 * (k + 1) + 1);
                 }
                 if (k > 0 && !done_[static_cast<size_t>(k - 1)])
                 {
                     done_[static_cast<size_t>(k - 1)] = 1; --todo;
                     theta_[static_cast<size_t>(k - 1)] = th;
-                    heapPush(mag_[static_cast<size_t>(k - 1)], 2 * (k - 1) + 1);
+                    queuePush(mag_[static_cast<size_t>(k - 1)], 2 * (k - 1) + 1);
                 }
             }
         }
     }
 
-    void heapPush(T key, int code) noexcept
+    /** @brief Exponent and top three mantissa bits of a magnitude: a key that
+     *  rises by eight per octave. Infinities order above everything. */
+    [[nodiscard]] static int bucketBits(T magnitude) noexcept
     {
-        int i = heapSize_++;
-        while (i > 0)
-        {
-            const int p = (i - 1) >> 1;
-            if (heapKey_[static_cast<size_t>(p)] >= key) break;
-            heapKey_[static_cast<size_t>(i)] = heapKey_[static_cast<size_t>(p)];
-            heapCode_[static_cast<size_t>(i)] = heapCode_[static_cast<size_t>(p)];
-            i = p;
-        }
-        heapKey_[static_cast<size_t>(i)] = key;
-        heapCode_[static_cast<size_t>(i)] = code;
+        return static_cast<int>(std::bit_cast<std::uint32_t>(static_cast<float>(magnitude)) >> 20);
     }
 
-    int heapPop() noexcept
+    /** @brief Queues a code in the bucket of its magnitude; bucket 0 is the
+     *  frame's loudest. Pushing and popping are O(1), with an order that is
+     *  exact to an eighth of an octave and last-in-first-out inside a bucket. */
+    void queuePush(T key, int code) noexcept
     {
-        const int top = heapCode_[0];
-        const T key = heapKey_[static_cast<size_t>(heapSize_ - 1)];
-        const int code = heapCode_[static_cast<size_t>(heapSize_ - 1)];
-        --heapSize_;
-        int i = 0;
-        for (;;)
-        {
-            int c = 2 * i + 1;
-            if (c >= heapSize_) break;
-            if (c + 1 < heapSize_ && heapKey_[static_cast<size_t>(c + 1)] > heapKey_[static_cast<size_t>(c)]) ++c;
-            if (heapKey_[static_cast<size_t>(c)] <= key) break;
-            heapKey_[static_cast<size_t>(i)] = heapKey_[static_cast<size_t>(c)];
-            heapCode_[static_cast<size_t>(i)] = heapCode_[static_cast<size_t>(c)];
-            i = c;
-        }
-        if (heapSize_ > 0)
-        {
-            heapKey_[static_cast<size_t>(i)] = key;
-            heapCode_[static_cast<size_t>(i)] = code;
-        }
-        return top;
+        const int b = std::clamp(queueTop_ - bucketBits(key), 0, kBuckets - 1);
+        bucketNext_[static_cast<size_t>(code)] = bucketHead_[static_cast<size_t>(b)];
+        bucketHead_[static_cast<size_t>(b)] = code;
+        queueCursor_ = std::min(queueCursor_, b);
+        ++queueSize_;
+    }
+
+    /** @brief Takes a code from the loudest occupied bucket (queueSize_ > 0). */
+    int queuePop() noexcept
+    {
+        while (bucketHead_[static_cast<size_t>(queueCursor_)] < 0) ++queueCursor_;
+        const int code = bucketHead_[static_cast<size_t>(queueCursor_)];
+        bucketHead_[static_cast<size_t>(queueCursor_)] = bucketNext_[static_cast<size_t>(code)];
+        --queueSize_;
+        return code;
     }
 
     /** @brief Cepstral envelope of the reference magnitude and the
@@ -970,9 +981,12 @@ private:
     std::vector<T> specD_, frame_, mag_, prevMag_, rotRe_, rotIm_, gain_;
     std::vector<double> crossRe_, crossIm_, dRe_, dIm_, theta_, tinc_, omPrev_;
     std::vector<unsigned char> done_;
-    std::vector<T> heapKey_;
-    std::vector<int> heapCode_;
-    int heapSize_ = 0;
+    std::array<int, kBuckets> bucketHead_ {};
+    std::vector<int> bucketNext_;
+    int queueSize_ = 0;
+    int queueTop_ = 0;
+    int queueCursor_ = 0;
+    T prevMaxMag_ = T(0);
     std::vector<T> cepsTime_, cepsSpec_, envLog_;
 
     // Stream state.

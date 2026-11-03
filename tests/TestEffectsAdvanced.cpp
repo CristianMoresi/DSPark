@@ -6849,3 +6849,314 @@ DSPARK_TEST(TimeStretch_state_round_trips)
     EXPECT_FALSE(b.setState(other.data(), other.size()));
     EXPECT_FALSE(b.setState(nullptr, 0));
 }
+
+// ============================================================================
+// Non-finite input, stream alignment and latency readouts
+// ============================================================================
+
+namespace {
+
+/// Runs one channel through `fx` in place, in blocks of `block` samples.
+template <typename Fx>
+void renderMonoBlocks(Fx& fx, std::vector<float>& x, int block)
+{
+    const int total = static_cast<int>(x.size());
+    for (int at = 0; at < total; at += block)
+    {
+        float* channels[1] = { x.data() + at };
+        fx.processBlock(AudioBufferView<float>(channels, 1, std::min(block, total - at)));
+    }
+}
+
+int countNonFinite(const std::vector<float>& x, size_t from)
+{
+    int bad = 0;
+    for (size_t i = from; i < x.size(); ++i)
+        if (!std::isfinite(x[i])) ++bad;
+    return bad;
+}
+
+double rmsFrom(const std::vector<float>& x, size_t from)
+{
+    double sum = 0.0;
+    for (size_t i = from; i < x.size(); ++i)
+        sum += static_cast<double>(x[i]) * static_cast<double>(x[i]);
+    return std::sqrt(sum / static_cast<double>(x.size() - from));
+}
+
+std::vector<float> steadyTone(double hz, int samples, double amplitude)
+{
+    std::vector<float> x(static_cast<size_t>(samples));
+    for (int i = 0; i < samples; ++i)
+        x[static_cast<size_t>(i)] = static_cast<float>(
+            amplitude * std::sin(2.0 * pi<double> * hz * i / 48000.0));
+    return x;
+}
+
+/// White noise from a fixed linear congruential sequence.
+std::vector<float> fixedNoise(int samples, float amplitude)
+{
+    std::vector<float> x(static_cast<size_t>(samples));
+    std::uint32_t state = 0x2545F491u;
+    for (auto& v : x)
+    {
+        state = state * 1664525u + 1013904223u;
+        v = amplitude * (static_cast<float>(state >> 8) / 8388608.0f - 1.0f);
+    }
+    return x;
+}
+
+AudioSpec monoSpec(int block)
+{
+    AudioSpec sp;
+    sp.sampleRate = 48000.0;
+    sp.maxBlockSize = block;
+    sp.numChannels = 1;
+    return sp;
+}
+
+} // namespace
+
+// One NaN or Inf sample left the Studio engine's propagation with nothing to
+// order, it wrote done_[-1], a byte before the heap block, and the phase
+// recursion then held the NaN for good: 3788800 of 3788800 samples over the
+// next 79 s read NaN.
+DSPARK_TEST(TimeStretch_studio_recovers_from_non_finite_input)
+{
+    for (const float value : { std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::infinity() })
+    {
+        auto ts = std::make_unique<TimeStretch<float>>();
+        ts->prepare(monoSpec(512));
+        auto x = steadyTone(300.0, 96000, 0.3);
+        x[24000] = value;
+        renderMonoBlocks(*ts, x, 512);
+        EXPECT_EQ(countNonFinite(x, 0), 0);
+        EXPECT_NEAR(rmsFrom(x, 72000), 0.2121, 0.01);
+    }
+}
+
+// The same engine behind PitchShifter, whose dry path added one NaN of its own
+// at mix 1, since NaN * 0 is NaN. A finite spike near FLT_MAX passes any input
+// test and overflows the transform instead: that one left 191744 non-finite
+// samples in the last 4 s of a 6 s stream.
+DSPARK_TEST(PitchShifter_studio_recovers_from_non_finite_input)
+{
+    {
+        auto shifter = std::make_unique<PitchShifter<float>>();
+        shifter->prepare(monoSpec(512));
+        shifter->setSemitones(3.0f);
+        shifter->reset();
+        auto x = steadyTone(300.0, 96000, 0.3);
+        x[24000] = std::numeric_limits<float>::quiet_NaN();
+        renderMonoBlocks(*shifter, x, 512);
+        EXPECT_EQ(countNonFinite(x, 0), 0);
+        EXPECT_NEAR(rmsFrom(x, 72000), 0.2121, 0.01);
+    }
+    {
+        auto shifter = std::make_unique<PitchShifter<float>>();
+        shifter->prepare(monoSpec(512));
+        shifter->setSemitones(3.0f);
+        shifter->reset();
+        auto x = steadyTone(300.0, 96000, 0.3);
+        x[24000] = 3.0e38f;
+        x[24001] = -3.0e38f;
+        x[24002] = 3.0e38f;
+        renderMonoBlocks(*shifter, x, 512);
+        EXPECT_EQ(countNonFinite(x, 48000), 0);
+        EXPECT_NEAR(rmsFrom(x, 72000), 0.2121, 0.01);
+    }
+}
+
+// The Standard engine's pull path started one frame past the write head less
+// the first hop, which only agrees with the stretched timeline at ratios 0.5
+// and 1: a burst landed 768 samples late at ratio 2 and 153.5 late at 1.25,
+// and 85.5 early at 0.75, where the start of the stream was lost.
+DSPARK_TEST(TimeStretch_standard_pull_stream_is_the_stretched_timeline)
+{
+    const int total = 96000;
+    const int centre = 48000;
+    std::vector<float> in(static_cast<size_t>(total));
+    for (int i = 0; i < total; ++i)
+    {
+        const double u = (i - centre) / 2400.0;
+        in[static_cast<size_t>(i)] = static_cast<float>(
+            0.5 * std::exp(-0.5 * u * u) * std::sin(2.0 * pi<double> * 1000.0 * i / 48000.0));
+    }
+
+    for (const double ratio : { 0.75, 1.25, 2.0 })
+    {
+        auto ts = std::make_unique<TimeStretch<float>>();
+        ts->setQuality(TimeStretch<float>::Quality::Standard);
+        ts->prepare(monoSpec(512));
+        ts->setTimeRatio(static_cast<float>(ratio));
+        ts->reset();
+
+        std::vector<float> out;
+        std::vector<float> scratch(512);
+        int position = 0;
+        for (;;)
+        {
+            const int have = std::min(512, total - position);
+            int took = 0;
+            if (have > 0)
+            {
+                const float* source[1] = { in.data() + position };
+                took = ts->feedInput(AudioBufferView<const float>(source, 1, have));
+                position += took;
+            }
+            float* target[1] = { scratch.data() };
+            const int got = ts->pullOutput(AudioBufferView<float>(target, 1, 512));
+            out.insert(out.end(), scratch.begin(), scratch.begin() + got);
+            if (took == 0 && got == 0) break;
+        }
+
+        double energy = 0.0, moment = 0.0;
+        for (size_t i = 0; i < out.size(); ++i)
+        {
+            const double p = static_cast<double>(out[i]) * static_cast<double>(out[i]);
+            energy += p;
+            moment += p * static_cast<double>(i);
+        }
+        EXPECT_NEAR(moment / energy, ratio * centre, 8.0);
+    }
+}
+
+// The offline session rounded its length with std::lround, whose long is 32
+// bits on 64-bit Windows and WebAssembly: lround(3e9) returned 0, so a session
+// of 3e9 samples stopped where it started and produced nothing.
+DSPARK_TEST(TimeStretch_stretched_length_is_64_bit)
+{
+    EXPECT_EQ(TimeStretch<float>::stretchedLength(96000, 0.5), int64_t(48000));
+    EXPECT_EQ(TimeStretch<float>::stretchedLength(3000000000LL, 1.0), int64_t(3000000000LL));
+    EXPECT_EQ(TimeStretch<float>::stretchedLength(3000000000LL, 2.0), int64_t(6000000000LL));
+}
+
+// One NaN entered the decision-directed memory, which recirculates: with a
+// learned profile 870400 of 870400 later samples read NaN. Met while learning,
+// it entered the running mean and turned the denoiser off for good.
+DSPARK_TEST(SpectralDenoiser_recovers_from_non_finite_input)
+{
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    {
+        auto denoiser = std::make_unique<SpectralDenoiser<float>>();
+        denoiser->prepare(monoSpec(512));
+        denoiser->setLearning(true);
+        auto bed = fixedNoise(48000, 0.003f);
+        renderMonoBlocks(*denoiser, bed, 512);
+        denoiser->setLearning(false);
+
+        auto x = steadyTone(1000.0, 96000, 0.3);
+        x[24000] = nan;
+        renderMonoBlocks(*denoiser, x, 512);
+        EXPECT_EQ(countNonFinite(x, 0), 0);
+        EXPECT_NEAR(rmsFrom(x, 72000), 0.2121, 0.01);
+    }
+    {
+        auto denoiser = std::make_unique<SpectralDenoiser<float>>();
+        denoiser->prepare(monoSpec(512));
+        denoiser->setLearning(true);
+        auto bed = fixedNoise(48000, 0.003f);
+        bed[24000] = nan;
+        renderMonoBlocks(*denoiser, bed, 512);
+        denoiser->setLearning(false);
+
+        auto x = fixedNoise(48000, 0.003f);
+        const double before = rmsFrom(x, 24000);
+        renderMonoBlocks(*denoiser, x, 512);
+        EXPECT_EQ(countNonFinite(x, 0), 0);
+        EXPECT_LT(rmsFrom(x, 24000), 0.5 * before);
+    }
+}
+
+// A 500 ms grain two octaves up spans 2 s of ring, and one two octaves down
+// falls 375 ms behind its start. On a 0.5 s buffer (0.68 s of ring) both
+// crossed the write head and the read jumped: a pure tone's second difference
+// peaked at 0.15 and 0.19, against 0.0057 and 0.00002 for a clean tone.
+DSPARK_TEST(Granular_long_grains_fit_a_short_buffer)
+{
+    for (const double semitones : { 24.0, -24.0 })
+    {
+        auto granular = std::make_unique<GranularProcessor<float>>();
+        granular->prepare(monoSpec(512), 0.5);
+        granular->setDensity(4.0f);
+        granular->setGrainSize(500.0f);
+        granular->setPitch(static_cast<float>(semitones));
+        granular->setSpread(0.0f);
+        granular->reset();
+
+        auto x = steadyTone(220.7, 144000, 0.3);
+        renderMonoBlocks(*granular, x, 512);
+
+        double peak = 0.0;
+        for (size_t i = 72000; i < x.size(); ++i)
+            peak = std::max(peak, std::abs(static_cast<double>(x[i]) - 2.0 * x[i - 1] + x[i - 2]));
+        const double omega = 2.0 * std::sin(pi<double> * 220.7 * std::pow(2.0, semitones / 12.0) / 48000.0);
+        EXPECT_LT(peak, 3.0 * std::sqrt(2.0) * rmsFrom(x, 72000) * omega * omega);
+    }
+}
+
+// One NaN stayed in the capture ring and every grain that reached it replayed
+// it: 129 NaN outputs, the last 0.66 s after the sample itself. The output of
+// that very sample was NaN as well, through the dry term of the mix.
+DSPARK_TEST(Granular_does_not_replay_a_non_finite_sample)
+{
+    auto granular = std::make_unique<GranularProcessor<float>>();
+    granular->prepare(monoSpec(512));
+    auto x = steadyTone(300.0, 144000, 0.3);
+    x[48000] = std::numeric_limits<float>::quiet_NaN();
+    renderMonoBlocks(*granular, x, 512);
+    EXPECT_EQ(countNonFinite(x, 0), 0);
+}
+
+// An instance that was never prepared passes audio straight through, but these
+// two reported 4096 and 2048 samples of latency for it, which a host would
+// compensate.
+DSPARK_TEST(Spectral_effects_report_no_latency_until_prepared)
+{
+    auto shifter = std::make_unique<PitchShifter<float>>();
+    EXPECT_EQ(shifter->getLatency(), 0);
+    auto denoiser = std::make_unique<SpectralDenoiser<float>>();
+    EXPECT_EQ(denoiser->getLatency(), 0);
+}
+
+// reset() rewrites the latency on the stream owner's thread, and PitchShifter
+// does so inside processBlock() when a quality change restarts the stream,
+// while both classes document getLatency() as safe from any thread. It read a
+// plain int: ThreadSanitizer reports the data race (this case passes without
+// it).
+DSPARK_TEST(Pitch_effects_latency_readout_is_race_free)
+{
+    auto shifter = std::make_unique<PitchShifter<float>>();
+    auto stretch = std::make_unique<TimeStretch<float>>();
+    shifter->prepare(monoSpec(64));
+    stretch->prepare(monoSpec(64));
+
+    std::atomic<bool> running { true };
+    std::atomic<int> foreign { 0 };
+    std::thread reader([&] {
+        while (running.load(std::memory_order_relaxed))
+        {
+            const int a = shifter->getLatency();
+            const int b = stretch->getLatency();
+            if ((a != 5184 && a != 4096) || (b != 5632 && b != 2048))
+                foreign.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    std::vector<float> block(64, 0.0f);
+    for (int i = 0; i < 32; ++i)
+    {
+        const bool studio = (i & 1) != 0;
+        shifter->setQuality(studio ? PitchShifter<float>::Quality::Studio
+                                   : PitchShifter<float>::Quality::Standard);
+        float* channels[1] = { block.data() };
+        shifter->processBlock(AudioBufferView<float>(channels, 1, 64));
+        stretch->setQuality(studio ? TimeStretch<float>::Quality::Studio
+                                   : TimeStretch<float>::Quality::Standard);
+        stretch->reset();
+    }
+    running.store(false, std::memory_order_relaxed);
+    reader.join();
+    EXPECT_EQ(foreign.load(std::memory_order_relaxed), 0);
+}

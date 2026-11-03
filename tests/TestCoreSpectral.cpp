@@ -1363,3 +1363,29 @@ DSPARK_TEST(ZeroLatencyConvolver_cpu_is_flat)
     EXPECT_LT(mx / mean, 2.0);
 #endif
 }
+
+// prepare() took a non-finite rate at face value. With an infinite target the
+// step between outputs was 0, so the output loop never left the first input
+// sample and ran off the caller's buffer (a segmentation fault), and a NaN
+// source made process() ask for size_t(INT_MIN) samples.
+DSPARK_TEST(Resampler_ignores_unusable_rates)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+
+    Resampler<float> resampler;
+    resampler.prepare(48000.0, 96000.0);
+    resampler.prepare(48000.0, inf);
+    EXPECT_EQ(resampler.getRatio(), 2.0);
+    resampler.prepare(nan, 48000.0);
+    EXPECT_EQ(resampler.getRatio(), 2.0);
+    resampler.prepare(inf, 48000.0);
+    EXPECT_EQ(resampler.getRatio(), 2.0);
+    resampler.prepare(1.0, 1.0e300);
+    EXPECT_EQ(resampler.getRatio(), 2.0);
+
+    std::vector<float> in(16, 0.25f);
+    std::vector<float> out(static_cast<size_t>(resampler.getMaxOutputSamples(16)));
+    EXPECT_EQ(resampler.processBlock(in.data(), 16, out.data()), 32);
+    EXPECT_EQ(resampler.process(in.data(), 16).size(), size_t(32));
+}

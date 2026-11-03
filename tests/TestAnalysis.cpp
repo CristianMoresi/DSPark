@@ -2347,3 +2347,116 @@ DSPARK_TEST(DelayEstimator_block_feeding_matches_the_whole_signal_call)
     idle.prepare(48000.0, 100);
     EXPECT_FALSE(idle.estimate().valid);
 }
+
+// While the first half of the window is still digital silence, the difference
+// function is exactly zero at the small lags, and the CMND read that 0/0 as a
+// perfect dip: a note after silence reported 24000 Hz at confidence 1.0 for
+// 16 polls of 64 samples, 21 ms.
+DSPARK_TEST(PitchDetector_note_after_silence_is_not_a_confident_nyquist)
+{
+    PitchDetector<float> detector;
+    detector.prepare(48000.0);
+
+    std::vector<float> x(96000, 0.0f);
+    for (int i = 48000; i < 96000; ++i)
+        x[static_cast<size_t>(i)] = 0.5f * static_cast<float>(
+            std::sin(2.0 * pi<double> * 440.0 * i / 48000.0));
+
+    int wrong = 0;
+    for (int at = 0; at + 64 <= 96000; at += 64)
+    {
+        detector.pushSamples(std::span<const float>(x.data() + at, 64));
+        const float hz = detector.getFrequencyHz();
+        if (hz > 0.0f && std::abs(std::log2(hz / 440.0f)) > 1.0f / 12.0f) ++wrong;
+    }
+    EXPECT_EQ(wrong, 0);
+}
+
+namespace {
+
+/// The largest distance in cents of the follower's output from `heldHz`, with
+/// a stretch of `spellHz` over [48000, 48000 + spell) in a note of `heldHz`.
+double worstDeviationCents(double heldHz, double spellHz, int spell, int block)
+{
+    PitchFollower<float> follower;
+    AudioSpec spec;
+    spec.sampleRate = 48000.0;
+    spec.maxBlockSize = 8192;
+    spec.numChannels = 1;
+    follower.prepare(spec);
+    follower.setGlide(0.0f);
+
+    const int total = 72000;
+    std::vector<float> x(static_cast<size_t>(total));
+    double phase = 0.0;
+    for (int i = 0; i < total; ++i)
+    {
+        const double hz = (i >= 48000 && i < 48000 + spell) ? spellHz : heldHz;
+        phase += 2.0 * pi<double> * hz / 48000.0;
+        x[static_cast<size_t>(i)] = 0.4f * static_cast<float>(std::sin(phase));
+    }
+
+    double worst = 0.0;
+    for (int at = 0; at < total; at += block)
+    {
+        follower.pushSamples(std::span<const float>(
+            x.data() + at, static_cast<size_t>(std::min(block, total - at))));
+        const double hz = static_cast<double>(follower.getSmoothedHz());
+        if (at > 40000 && hz > 0.0)
+            worst = std::max(worst, std::abs(1200.0 * std::log2(hz / heldHz)));
+    }
+    return worst;
+}
+
+/// Samples after the change until the follower stands on the new note.
+int intervalArrival(int block)
+{
+    PitchFollower<float> follower;
+    AudioSpec spec;
+    spec.sampleRate = 48000.0;
+    spec.maxBlockSize = 8192;
+    spec.numChannels = 1;
+    follower.prepare(spec);
+    follower.setGlide(0.0f);
+
+    const int total = 96000;
+    std::vector<float> x(static_cast<size_t>(total));
+    double phase = 0.0;
+    for (int i = 0; i < total; ++i)
+    {
+        phase += 2.0 * pi<double> * (i < 48000 ? 220.0 : 660.0) / 48000.0;
+        x[static_cast<size_t>(i)] = 0.4f * static_cast<float>(std::sin(phase));
+    }
+
+    for (int at = 0; at < total; at += block)
+    {
+        const int n = std::min(block, total - at);
+        follower.pushSamples(std::span<const float>(x.data() + at, static_cast<size_t>(n)));
+        const double hz = static_cast<double>(follower.getSmoothedHz());
+        if (at >= 48000 && std::abs(1200.0 * std::log2(hz / 660.0)) < 50.0)
+            return at + n - 48000;
+    }
+    return total;
+}
+
+} // namespace
+
+// The follower judged the detector once per pushSamples() call, not once per
+// detection. At blocks of 170 samples or less one reading was counted three
+// times and confirmed itself, and a single bad detection moved a held 220 Hz
+// note by 2614 cents; at the 512-sample hop the same reading was rejected.
+DSPARK_TEST(PitchFollower_one_bad_reading_is_rejected_at_every_block_size)
+{
+    for (const int block : { 32, 64, 170, 512, 1024 })
+        EXPECT_LT(worstDeviationCents(220.0, 996.0, 1200, block), 50.0);
+}
+
+// The same cause from the other side: above the hop it saw one detection in
+// several, and a real 220 to 660 Hz interval needed three blocks instead of
+// three hops, 48 ms at block 64 and 536 ms at block 8192.
+DSPARK_TEST(PitchFollower_interval_latency_does_not_depend_on_block_size)
+{
+    const int reference = intervalArrival(64);
+    for (const int block : { 512, 4096, 8192 })
+        EXPECT_LT(intervalArrival(block), reference + block + 64);
+}

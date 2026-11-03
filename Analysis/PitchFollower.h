@@ -21,7 +21,9 @@
  *   being considered (the classic YIN 2x/0.5x failure on transients).
  * - **Jump confirmation** - a genuinely large interval must persist for three
  *   consecutive readings before the target moves (one bad frame never jerks
- *   the output).
+ *   the output). A reading is one detector detection, whatever the host's
+ *   block size, so the block size changes neither what is rejected nor how
+ *   long a real interval takes to arrive.
  * - **Glide in semitone domain** - the public value slews toward the target
  *   at a constant rate expressed in milliseconds per octave, so the movement
  *   is musically uniform across the whole range (Hz-domain smoothing is
@@ -107,6 +109,7 @@ public:
         detector_.prepare(spec.sampleRate, windowSize,
                           (windowSize > 0) ? windowSize / 4 : 0);
         monoScratch_.assign(static_cast<size_t>(std::max(spec.maxBlockSize, 1)), T(0));
+        hopPhase_ = 0;
         prepared_.store(true, std::memory_order_relaxed);
         reset();
     }
@@ -245,13 +248,28 @@ public:
     void pushSamples(std::span<const T> samples) noexcept
     {
         if (!prepared_.load(std::memory_order_relaxed) || samples.empty()) return;
-        detector_.pushSamples(samples);
-        update(static_cast<int>(samples.size()));
+        // Stop at every detection, so each one is judged exactly once: called
+        // per block instead, a small block judged one reading several times
+        // and a large one skipped readings.
+        const int hop = detector_.getHopSize();
+        std::size_t done = 0;
+        while (done < samples.size())
+        {
+            const auto chunk = std::min(samples.size() - done,
+                                        static_cast<std::size_t>(hop - hopPhase_));
+            detector_.pushSamples(samples.subspan(done, chunk));
+            done += chunk;
+            hopPhase_ += static_cast<int>(chunk);
+            const bool freshReading = hopPhase_ >= hop;
+            if (freshReading) hopPhase_ = 0;
+            update(static_cast<int>(chunk), freshReading);
+        }
     }
 
 private:
-    /** @brief Gating, octave correction, jump confirmation and glide. */
-    void update(int numSamples) noexcept
+    /** @brief Gating, octave correction and jump confirmation on a fresh
+     *  detection; the glide and the tracking state on every call. */
+    void update(int numSamples, bool freshReading) noexcept
     {
         const T raw  = detector_.getFrequencyHz();
         const T conf = detector_.getConfidence();
@@ -259,7 +277,11 @@ private:
                         && raw >= minHz_.load(std::memory_order_relaxed)
                         && raw <= maxHz_.load(std::memory_order_relaxed);
 
-        if (valid)
+        if (!freshReading)
+        {
+            samplesSinceValid_ += numSamples;
+        }
+        else if (valid)
         {
             double st = 12.0 * std::log2(static_cast<double>(raw) / 440.0);
 
@@ -351,6 +373,7 @@ private:
     double currentSt_ = 0.0;    ///< Glided value, semitones relative to A440.
     double pendingSt_ = 0.0;
     int pendingCount_ = 0;
+    int hopPhase_ = 0;          ///< Samples since the detector's last detection.
     int64_t samplesSinceValid_ = 0;
 
     std::atomic<T> minHz_ { T(60) };

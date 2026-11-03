@@ -17,6 +17,34 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `TimeStretch` and `PitchShifter`, Studio engine: one NaN or Inf input sample
+  wrote a byte before a heap block and left the output NaN until `reset()`.
+  Non-finite samples now read as silence, and a spectrum that overflowed
+  restarts the phase of its bins.
+- `SpectralDenoiser`: one NaN no longer stays in the gain memory or the learned
+  profile. The frames holding it come out silent.
+- `PitchFollower` judges each detection exactly once. At blocks of 170 samples
+  or less one bad reading could confirm itself and move a note by 2614 cents,
+  and above the hop a real interval took up to 536 ms instead of 48 ms.
+- `PitchDetector`: a note after digital silence no longer reports half the
+  sample rate at confidence 1.0.
+- `SpectralFreeze`: a Diffuse hold keeps the input level; it dropped 3, 6 or
+  9 dB at hops N/2, N/4 and N/8.
+- `TimeStretch`, Standard engine: the `feedInput()`/`pullOutput()` stream now
+  starts on the stretched timeline, up to 768 samples off before. Priming and
+  tail figures moved with it.
+- `TimeStretch`: offline sessions over 2^31 output samples no longer come out
+  empty on targets with a 32-bit `long`. `stretchedLength()` is new.
+- `Resampler::prepare()` ignores non-finite rates and ratios above `kMaxRatio`
+  instead of overrunning the output buffer.
+- `GranularProcessor`: long grains are cut to what a short capture ring holds
+  instead of crossing the write head, and a non-finite input sample reads as
+  silence instead of being replayed by the grains.
+- `PitchShifter` and `SpectralDenoiser` report 0 latency until prepared, and
+  `PitchShifter` and `TimeStretch` publish it through a relaxed atomic.
+- The Studio engine queues bins in buckets instead of a binary heap, 12 to 44
+  percent less CPU at equal measured fidelity, and `PitchDetector` halves its
+  correlation transform: about 45 percent less CPU, 40 percent less memory.
 - Looped zones no longer tick at the loop rate at or below the recording's
   rate. After a wrap the kernel read the audio before the loop, or zeros for a
   loop from sample 0, instead of the loop's end: -77 dB and -45 dB, now below

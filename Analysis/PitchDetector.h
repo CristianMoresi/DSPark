@@ -136,8 +136,11 @@ public:
         // YIN-FFT resources: the difference function is computed via one
         // cross-correlation in the frequency domain (3 FFTs) instead of the
         // O(windowSize^2) direct form - ~20x faster at the default window.
+        // A frame of windowSize is enough: the first half against the whole
+        // window at lags below windowSize/2 reaches at most sample
+        // windowSize - 2, so nothing wraps around.
         fftSize_ = 1;
-        while (fftSize_ < windowSize_ * 2) fftSize_ <<= 1;
+        while (fftSize_ < windowSize_) fftSize_ <<= 1;
         fftTime_.assign(static_cast<size_t>(fftSize_), T(0));
         specHalf_.assign(static_cast<size_t>(fftSize_) + 2, T(0));
         specFull_.assign(static_cast<size_t>(fftSize_) + 2, T(0));
@@ -166,15 +169,14 @@ public:
      * audio thread. Under the automatic policy the detection RATE is
      * rate-invariant (hop = window/4, about one detection per 10.7 ms), but
      * CPU per second of audio is NOT: each detection costs O(N log N) and N
-     * follows the rate, so the per-second cost grows by a measured ~2.0x at
-     * 96 kHz and ~4.6x at 192 kHz relative to 48 kHz (35.6 / 71.2 / 162.4 ms
+     * follows the rate, so the per-second cost grows by a measured ~2.1x at
+     * 96 kHz and ~4.3x at 192 kHz relative to 48 kHz (7.1 / 14.9 / 30.5 ms
      * of CPU per 10 s of audio at 48/96/192 kHz; float, automatic window,
-     * g++ 13 -O2, min of 15 runs pinned to six cores with taskset -c 0-5 on
-     * an otherwise idle host, per-point spread under 4% -- absolute numbers
-     * vary by machine, the growth tracks N log N). Against the old fixed-2048
-     * default at the SAME rate the automatic window costs roughly 15% more
-     * (162.4 vs 142.0 ms at 192 kHz). prepare()-time heap grows
-     * the same way: ~160 KB at 44.1/48 kHz, ~320 KB at 88.2/96 kHz, ~640 KB
+     * g++ 13 -O2, min of 15 runs pinned to six cores with taskset -c 0-5 --
+     * absolute numbers vary by machine, the growth tracks N log N). Against
+     * the old fixed-2048 default at the SAME rate the automatic window costs
+     * roughly 5% more (30.5 vs 28.9 ms at 192 kHz). prepare()-time heap grows
+     * the same way: ~100 KB at 44.1/48 kHz, ~190 KB at 88.2/96 kHz, ~390 KB
      * at 176.4/192 kHz (float); the audio path stays allocation-free. Budget
      * from these figures, not from the rate alone. For very low-latency
      * callbacks you can still feed an SPSC queue (Core/SpscQueue.h) and
@@ -337,7 +339,9 @@ private:
         }
         fft_->inverse(specFull_.data(), corrTime_.data());
 
-        // (c) CMND from the closed-form difference function
+        // (c) CMND from the closed-form difference function. While the
+        // running sum is zero the window has no energy at those lags, which
+        // is 0/0 and no evidence of a period, so it is the neutral 1.
         const T threshold = threshold_.load(std::memory_order_relaxed);
         yinBuffer_[0] = T(1);
         T runningSum = T(0);
@@ -351,7 +355,7 @@ private:
             rawDiff_[static_cast<size_t>(tau)] = d;
             runningSum += d;
             yinBuffer_[static_cast<size_t>(tau)] =
-                (runningSum > T(0)) ? d * static_cast<T>(tau) / runningSum : T(0);
+                (runningSum > T(0)) ? d * static_cast<T>(tau) / runningSum : T(1);
         }
 
         // Search for dip below threshold
@@ -396,7 +400,8 @@ private:
      * cosine, 1 - cos(w (tau - tau0)) with w = 2 pi / tau0, and a three-point
      * parabola on it returns tan(w delta) / (2 tan(w / 2)) instead of the
      * offset delta, so that bias is inverted exactly. What remains comes from
-     * harmonics sharpening the dip (0.5 cent for a rich tone at 1760 Hz).
+     * harmonics sharpening the dip: 2.6 cents at worst over the starting phase
+     * for a 1/h harmonic tone at 1760 Hz, against 0.01 cent for a pure one.
      */
     [[nodiscard]] T parabolicInterp(int tau) const noexcept
     {
@@ -451,7 +456,7 @@ private:
     std::vector<T> rawDiff_;    // Size: halfWindow_ (difference function d(tau))
 
     // YIN-FFT resources (cross-correlation difference function)
-    int fftSize_ = 4096;
+    int fftSize_ = 2048;
     std::unique_ptr<FFTReal<T>> fft_; // doubles as the "prepared" gate
     std::vector<T> fftTime_;    // Size: fftSize_
     std::vector<T> specHalf_;   // Size: fftSize_ + 2

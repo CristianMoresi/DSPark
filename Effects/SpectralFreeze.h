@@ -12,7 +12,9 @@
  * and advances its phases either by identity peak locking or by a deterministic
  * channel-shared diffuse sequence. Entry and exit use one N-sample polar
  * transition; the live path therefore retains the primitive's exact N-sample
- * signal latency without a parallel dry path.
+ * signal latency without a parallel dry path. Frames with independent phases
+ * overlap-add in power rather than in amplitude, so a Diffuse hold carries
+ * sqrt(N / hop) on the captured magnitudes and sits at the level of the input.
  *
  * Threading: prepare(), reset(), the integer queries and processBlock() belong
  * to the stream owner. setFrozen(), isFrozen(), setPhaseMode() and
@@ -868,6 +870,9 @@ private:
         const int transitionSteps = fftSize_ / hopSize_;
         const std::size_t base = channelBinOffset(channel);
         const int nyquist = numBins_ - 1;
+        const T heldGain = capturedMode_ == PhaseMode::Diffuse
+            ? std::sqrt(static_cast<T>(transitionSteps))
+            : T(1);
 
         if (frameQ_ == transitionSteps)
         {
@@ -881,9 +886,9 @@ private:
                 const std::size_t index = base + static_cast<std::size_t>(k);
                 const T liveMagnitude = safeMagnitude(spectrum[2 * k],
                                                        spectrum[2 * k + 1]);
-                const T frozenMagnitude = capturedMagnitude_[index];
+                const T frozenMagnitude = capturedMagnitude_[index] * heldGain;
                 const bool liveActive = liveMagnitude >= magnitudeFloor_;
-                const bool frozenActive = frozenMagnitude >= magnitudeFloor_;
+                const bool frozenActive = capturedMagnitude_[index] >= magnitudeFloor_;
                 if (!liveActive && !frozenActive)
                 {
                     spectrum[2 * k] = T(0);
@@ -922,9 +927,9 @@ private:
             const std::size_t index = base + static_cast<std::size_t>(k);
             const T liveMagnitude = safeMagnitude(spectrum[2 * k],
                                                   spectrum[2 * k + 1]);
-            const T frozenMagnitude = capturedMagnitude_[index];
+            const T frozenMagnitude = capturedMagnitude_[index] * heldGain;
             const bool liveActive = liveMagnitude >= magnitudeFloor_;
-            const bool frozenActive = frozenMagnitude >= magnitudeFloor_;
+            const bool frozenActive = capturedMagnitude_[index] >= magnitudeFloor_;
             if (!liveActive && !frozenActive)
             {
                 spectrum[2 * k] = T(0);

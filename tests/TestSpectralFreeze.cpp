@@ -1119,3 +1119,49 @@ DSPARK_TEST(SpectralFreeze_sound_gate_mode_change_deferred_to_recapture)
     EXPECT_GT(tonalWorst, 0.80L);
     EXPECT_LT(diffuseSum / partials, 0.35L);
 }
+
+// Frames with independent phases overlap-add in power, not in amplitude, so
+// entering a Diffuse hold dropped the level by sqrt(N / hop): -3.0, -6.0 and
+// -9.0 dB on noise at hops N/2, N/4 and N/8. The stability law above compares
+// the hold with itself, so nothing saw it.
+DSPARK_TEST(SpectralFreeze_diffuse_hold_keeps_the_input_level)
+{
+    constexpr int n = 1024;
+    constexpr int total = 48000;
+    constexpr int freezeAt = 16000;
+
+    std::vector<float> source(static_cast<std::size_t>(total));
+    std::uint32_t state = 0x2545F491u;
+    for (auto& v : source)
+    {
+        state = state * 1664525u + 1013904223u;
+        v = 0.2f * (static_cast<float>(state >> 8) / 8388608.0f - 1.0f);
+    }
+
+    for (const int hop : { n / 2, n / 4, n / 8 })
+    {
+        AudioSpec spec { 48000.0, 512, 1 };
+        SpectralFreeze<float> freeze;
+        freeze.setPhaseMode(SpectralFreeze<float>::PhaseMode::Diffuse);
+        freeze.prepare(spec, n, hop);
+
+        auto out = source;
+        for (int at = 0; at < total; at += 512)
+        {
+            if (at >= freezeAt) freeze.setFrozen(true);
+            float* channels[1] = { out.data() + at };
+            freeze.processBlock(AudioBufferView<float>(channels, 1, std::min(512, total - at)));
+        }
+
+        auto power = [&](int from, int to) {
+            double sum = 0.0;
+            for (int i = from; i < to; ++i)
+                sum += static_cast<double>(out[static_cast<std::size_t>(i)])
+                     * static_cast<double>(out[static_cast<std::size_t>(i)]);
+            return sum / (to - from);
+        };
+        const double changeDb = 10.0 * std::log10(power(freezeAt + 4 * n, total)
+                                                  / power(4 * n, freezeAt));
+        EXPECT_NEAR(changeDb, 0.0, 0.5);
+    }
+}

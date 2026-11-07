@@ -1114,6 +1114,63 @@ DSPARK_TEST(Beat_causal_lock_in_and_beat_placement)
     EXPECT_LT(worstMax, 50.0);
 }
 
+// A regular off-beat inside every beat -- swung, dotted or syncopated, at
+// up to 0.7 of the beat's level -- must not drag the causal beats off the
+// beat. The resonator's phase is the circular mean of the onset mass, so as a
+// beat position it is pulled towards the off-beat by the off-beat's share of
+// that mass; the cumulative beat score follows the stronger pulse train
+// instead. An off-beat at the beat's own level is excluded on purpose: the
+// two trains are then the same pulse at two phases and no reading of the
+// envelope can say which one a listener calls the beat.
+DSPARK_TEST(Beat_causal_beats_stay_on_the_beat_against_a_strong_off_beat)
+{
+    int cases = 0, held = 0;
+    double worstShare = 1.0, worstBias = 0.0;
+    for (double ratio : { 2.0 / 3.0, 0.6, 0.75 })
+        for (float off : { 0.3f, 0.5f, 0.7f })
+            for (double bpm : { 96.0, 120.0 })
+            {
+                Corpus c;
+                c.bpm = bpm;
+                const int64_t n = static_cast<int64_t>((24.0 + kLeadSeconds + 1.0) * kFs);
+                c.x.assign(static_cast<size_t>(n), 0.0f);
+                const double period = 60.0 / bpm * kFs;
+                for (int k = 0;; ++k)
+                {
+                    const double q = kLeadSeconds * kFs + k * period;
+                    if (q > static_cast<double>(n) - kFs * 0.3) break;
+                    addClick(c.x, static_cast<int64_t>(q), kFs, 1.0f, 13u);
+                    c.beats.push_back(static_cast<int64_t>(q));
+                    addClick(c.x, static_cast<int64_t>(q + ratio * period), kFs, off, 14u);
+                }
+                const CausalTrace tr = runCausal(c, 512);
+                int count = 0, within = 0;
+                double sum = 0.0;
+                for (const int64_t beat : tr.beatSamples)
+                {
+                    if (beat < static_cast<int64_t>(10.0 * kFs)) continue;
+                    double nearest = 1e18;
+                    for (const int64_t t : c.beats)
+                        if (std::abs(static_cast<double>(beat - t)) < std::abs(nearest))
+                            nearest = static_cast<double>(beat - t);
+                    sum += nearest / kFs * 1000.0;
+                    ++count;
+                    within += std::abs(nearest / kFs) <= 0.07 ? 1 : 0;
+                }
+                const double share = count ? static_cast<double>(within) / count : 0.0;
+                const double bias = count ? sum / count : 1e9;
+                ++cases;
+                held += share >= 0.9 ? 1 : 0;
+                worstShare = std::min(worstShare, share);
+                if (std::abs(bias) > std::abs(worstBias)) worstBias = bias;
+                EXPECT_GT(share, 0.89);
+            }
+    std::cout << "  off-beat sweep: " << held << " of " << cases
+              << " cases with 90% of beats within 70 ms; worst share " << worstShare
+              << ", worst mean error " << worstBias << " ms\n";
+    EXPECT_EQ(held, cases);
+}
+
 // The causal readouts must not depend on how the host happens to cut the
 // stream into blocks. What is asserted is the ATTRIBUTED SAMPLE -- where the
 // tracker says the beat was, in the caller's timeline -- because that is the

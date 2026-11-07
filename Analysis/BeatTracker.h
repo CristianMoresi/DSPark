@@ -97,8 +97,37 @@
  * local-pulse phase estimate are the same object read two ways. lambda gives
  * every resonator the same memory in BEATS (kIntegrationBeats of its own
  * period), so slow and fast candidates are compared over equal musical spans
- * rather than equal wall-clock spans. Beats are emitted where the winning
- * resonator's phase completes a turn. No backtracking, no future context.
+ * rather than equal wall-clock spans. The bank chooses the period; the beats
+ * are placed by a cumulative beat score after Stark, Davies and Plumbley,
+ * "Real-time beat-synchronous analysis of musical audio", DAFx 2009,
+ *
+ *     C[n] = (1 - a) * o[n] + a * max_d { W(d / tau) * C[n - d] },
+ *
+ * with a = 0.9 and W a log-Gaussian over [tau / 2, 2 tau], and the next beat is
+ * the strongest point of C continued one period ahead with no further onsets.
+ * No backtracking, no future context.
+ *
+ * Why the beats are not read from the resonator's phase, which would be free:
+ * that phase is the circular mean of the onset mass, which is what the
+ * coherence below needs, but as a beat position it is pulled towards any
+ * regular off-beat by the off-beat's share of the mass. On swung, dotted and
+ * syncopated clicks (off-beat at 0.6, 2/3 and 3/4 of the beat, 0.15 to 0.7 of
+ * its level, 96 and 120 BPM) the phase turn put the beats a mean 11 to 105 ms
+ * early and 374 of 672 within 70 ms; with the beat score 659 of 660 are
+ * within 70 ms, at a mean of 2.6 to 4.0 ms late in all but one case. Where
+ * two pulse trains of the same period
+ * score within 5% of each other the score cannot say which is the beat, and
+ * the beat falls back to the phase turn: at 0.7 of the beat's level, 3/4
+ * through it, 120 BPM (the one case), that keeps 30 of 31 beats within 70
+ * ms, as the phase turn alone did. An off-beat at the beat's own level is the same pulse at two
+ * phases, and neither placement finds the annotated one. A different metrical
+ * level must also keep outscoring the one in force for four of its beats
+ * before the beat clock follows it, so a level that flickers for a frame does
+ * not restart the interval the clock is continuing. On the ISMIR 2004 ballroom
+ * collection plus its additional excerpts (698 recordings) the causal beat
+ * F-measure (+/-70 ms, beats after the first 5 s) goes from 0.611 to 0.625 on
+ * one half of the recording groups and from 0.629 to 0.647 on the other, and
+ * on the first 30 s of the Salsa Dataset (122) from 0.257 to 0.286.
  *
  * COHERENCE, and what the confidence number means. For a candidate period tau
  * the tracker measures
@@ -328,7 +357,8 @@ public:
                              &bankPrior_, &zRe_, &zIm_, &zMass_, &bankCoherence_,
                              &bankLevelRatio_, &env_, &envBal_, &local_, &cumScore_,
                              &acf_, &scratchA_, &kernel_, &localPeriod_, &sweepA_,
-                             &sweepB_, &candScore_, &candExplains_})
+                             &sweepB_, &candScore_, &candExplains_, &beatScore_,
+                             &beatScratch_, &beatAhead_, &beatLogLag_, &beatWeightTable_})
             *values = WorkVector<double>(doubles);
         for (auto& values : envReg_) values = WorkVector<double>(doubles);
         envRef_ = WorkVector<int64_t>(detail::AccountedAllocator<int64_t>(&allocationAccount_));
@@ -782,7 +812,8 @@ public:
      * @brief Delay between a beat and the call in which it is announced.
      *
      * Half the analysis frame less the front end's group-delay compensation,
-     * plus one hop for the frame the phase turn is observed on. Fixed for a
+     * plus one hop: a beat is announced on the frame after the one it is
+     * placed on. Fixed for a
      * given sample rate and independent of block size.
      */
     [[nodiscard]] int getLatencySamples() const noexcept
@@ -1298,6 +1329,7 @@ private:
                 bankLevelRatio_[static_cast<size_t>(k) * static_cast<size_t>(bankSize_)
                                 + static_cast<size_t>(i)]
                     = levelRatio(bankPeriod_[static_cast<size_t>(i)], kHarmonicDivisors[k]);
+        buildBeatScore();
     }
 
     // -- Causal path ---------------------------------------------------------
@@ -1349,6 +1381,10 @@ private:
                                     : 0.0;
         }
 
+        // The beat score is recursive over the envelope itself, so it is
+        // updated on every frame, before the period that steers it is chosen.
+        updateBeatScore(o);
+
         int iLo = 0, iHi = 0;
         unpackRange(activeRange_.load(std::memory_order_relaxed), iLo, iHi);
         iLo = std::clamp(iLo, 0, bankSize_ - 1);
@@ -1367,9 +1403,13 @@ private:
             // Nothing in the searched range explains the envelope yet. Keep
             // the previous published pair rather than publishing a tempo of
             // zero and a confidence of zero, which a caller cannot tell from
-            // a real reading of silence.
-            return false;
+            // a real reading of silence. The beat clock keeps running on the
+            // period it already has.
+            return advanceBeatClock();
         }
+        // The beat clock follows a held level; the published reading stays
+        // the frame's own winner.
+        const int follow = holdMetricalLevel(best, bestScore, iLo, iHi);
 
         // The runner-up at a different metrical level, and how nearly it
         // explained the envelope as well as the winner did. Same discount the
@@ -1396,15 +1436,8 @@ private:
         // are enough, because the two functions never differ by more than the
         // preference's slope over one bin, and it costs -0.27% -> -0.14% on
         // the worst reported tempo at the top of the default range.
-        for (int guard = 0; guard < 2; ++guard)
-        {
-            if (best > 0 && bankCoherence_[static_cast<size_t>(best - 1)]
-                            > bankCoherence_[static_cast<size_t>(best)]) --best;
-            else if (best + 1 < bankSize_
-                     && bankCoherence_[static_cast<size_t>(best + 1)]
-                        > bankCoherence_[static_cast<size_t>(best)]) ++best;
-            else break;
-        }
+        const int searched = best;
+        best = walkToCoherencePeak(best);
 
         const size_t ub = static_cast<size_t>(best);
         const double period = refinePeriod(best);
@@ -1420,35 +1453,281 @@ private:
                                             static_cast<float>(conf)),
                                   std::memory_order_relaxed);
 
-        // Phase. arg(z) advances by one turn per period, so the frames since
-        // the last pulse are arg(z) scaled by the period; the turn completing
-        // -- that quantity falling back through zero -- is the beat.
-        const double w = 2.0 * static_cast<double>(pi<double>) / bankPeriod_[ub];
-        double sinceBeat = std::atan2(zIm_[ub], zRe_[ub]) / w;
-        const double p = bankPeriod_[ub];
+        // The held level's refined period steers the beat clock. The
+        // resonator's own phase is kept as the fallback for an ambiguous beat
+        // score: arg(z) advances one turn per period, so the frames since the
+        // resonator's last pulse are arg(z) scaled by the period, and its next
+        // pulse is the rest of the turn away.
+        const int held = (follow == searched) ? best : walkToCoherencePeak(follow);
+        const size_t uh = static_cast<size_t>(held);
+        const double p = bankPeriod_[uh];
+        const double w = 2.0 * static_cast<double>(pi<double>) / p;
+        double sinceBeat = std::atan2(zIm_[uh], zRe_[uh]) / w;
         while (sinceBeat < 0.0) sinceBeat += p;
         while (sinceBeat >= p) sinceBeat -= p;
+        resonatorLead_ = p - sinceBeat;
+        beatPeriod_ = (held == best) ? period : refinePeriod(held);
+        haveBeatPeriod_ = true;
+        return advanceBeatClock();
+    }
 
-        ++framesSinceBeat_;
-        bool beat = false;
-        // The turn completes when the frames-since-pulse quantity falls back
-        // through zero. The refractory is not a smoother: the winning bin can
-        // step between neighbours from one frame to the next, and the two
-        // neighbours do not carry exactly the same phase, so without it a
-        // one-bin step near a turn reports the same beat twice.
-        if (havePhase_ && (prevSinceBeat_ - sinceBeat) > 0.5 * p
-            && static_cast<double>(framesSinceBeat_) >= kBeatRefractory * p)
+    /// Steps from a bank index onto the coherence peak of its own level, at
+    /// most two bins (see advanceFrame()).
+    [[nodiscard]] int walkToCoherencePeak(int i) const noexcept
+    {
+        for (int guard = 0; guard < 2; ++guard)
         {
-            const int64_t backFrames = static_cast<int64_t>(std::lround(sinceBeat));
-            const int64_t ref = lastFrameRef_ - backFrames * static_cast<int64_t>(hop_);
-            lastBeatSample_.store(std::max<int64_t>(0, ref), std::memory_order_relaxed);
-            framesSinceBeat_ = 0;
+            if (i > 0 && bankCoherence_[static_cast<size_t>(i - 1)]
+                         > bankCoherence_[static_cast<size_t>(i)]) --i;
+            else if (i + 1 < bankSize_
+                     && bankCoherence_[static_cast<size_t>(i + 1)]
+                        > bankCoherence_[static_cast<size_t>(i)]) ++i;
+            else break;
+        }
+        return i;
+    }
+
+    /**
+     * @brief Holds the metrical level the beat clock follows.
+     * @param best      Winner of this frame's level search.
+     * @param bestScore Its score.
+     * @param iLo       First bank index searched.
+     * @param iHi       Last bank index searched.
+     * @return The bank index to follow on this frame.
+     *
+     * A candidate at a different level (a quarter of an octave or more away)
+     * takes over only after it has outscored the level in force on every frame
+     * for kLevelHoldBeats of its own periods; within the level in force the
+     * winner is followed as it is, so the held level still tracks a tempo that
+     * moves. The beat clock continues the interval this choice gives it, and a
+     * level that flickers for a frame or two to a different candidate restarts
+     * that continuation from the wrong interval.
+     */
+    [[nodiscard]] int holdMetricalLevel(int best, double bestScore, int iLo, int iHi) noexcept
+    {
+        const int apart = std::max(1, static_cast<int>(kCandidateSeparationOctaves
+                                                       * kBinsPerOctave));
+        if (heldLevel_ < iLo || heldLevel_ > iHi) { heldLevel_ = -1; levelChallengeFrames_ = 0; }
+        if (heldLevel_ < 0 || std::abs(best - heldLevel_) < apart)
+        {
+            heldLevel_ = best;
+            levelChallengeFrames_ = 0;
+            return best;
+        }
+        // Best candidate within the level in force.
+        const int half = apart / 2;
+        int held = -1;
+        double heldScore = 0.0;
+        for (int i = std::max(iLo, heldLevel_ - half); i <= std::min(iHi, heldLevel_ + half); ++i)
+        {
+            const double sc = scoreAt(i);
+            if (held < 0 || sc > heldScore) { heldScore = sc; held = i; }
+        }
+        if (bestScore > heldScore) ++levelChallengeFrames_;
+        else levelChallengeFrames_ = 0;
+        if (static_cast<double>(levelChallengeFrames_)
+            >= kLevelHoldBeats * bankPeriod_[static_cast<size_t>(best)])
+        {
+            heldLevel_ = best;
+            levelChallengeFrames_ = 0;
+        }
+        else if (held >= 0)
+        {
+            heldLevel_ = held;
+        }
+        return heldLevel_;
+    }
+
+    // -- Causal beat placement -------------------------------------------------
+
+    /// Interval weight of the beat score, W(d / tau), read from a table over
+    /// ln(d / tau). Zero outside [tau / 2, 2 tau].
+    [[nodiscard]] double beatIntervalWeight(int d, double lnTau) const noexcept
+    {
+        const double u = beatLogLag_[static_cast<size_t>(d)] - lnTau;
+        const double x = (u + kBeatTableSpan) * (static_cast<double>(kBeatTableSize - 1)
+                                                 / (2.0 * kBeatTableSpan));
+        const int k = static_cast<int>(x + 0.5);
+        if (k < 0 || k >= kBeatTableSize) return 0.0;
+        return beatWeightTable_[static_cast<size_t>(k)];
+    }
+
+    /// Sizes the beat score for the longest period the bank can deliver.
+    void buildBeatScore()
+    {
+        const double pMax = bpmToPeriod(kBankMinBpm);
+        int len = 64;
+        while (static_cast<double>(len) < 3.0 * pMax + 8.0) len <<= 1;
+        beatScoreLen_ = len;
+        beatScore_.assign(static_cast<size_t>(len), 0.0);
+        beatScratch_.assign(static_cast<size_t>(2 * len), 0.0);
+        beatAhead_.assign(static_cast<size_t>(len) + 2, 0.0);
+        beatLogLag_.assign(static_cast<size_t>(len) + 1, 0.0);
+        for (int d = 1; d <= len; ++d)
+            beatLogLag_[static_cast<size_t>(d)] = std::log(static_cast<double>(d));
+        beatWeightTable_.assign(static_cast<size_t>(kBeatTableSize), 0.0);
+        constexpr double ln2 = 0.6931471805599453;
+        for (int k = 0; k < kBeatTableSize; ++k)
+        {
+            const double u = -kBeatTableSpan + 2.0 * kBeatTableSpan * static_cast<double>(k)
+                                                   / static_cast<double>(kBeatTableSize - 1);
+            const double e = kBeatIntervalSharpness * u;
+            beatWeightTable_[static_cast<size_t>(k)]
+                = (std::abs(u) <= ln2 + 1e-9) ? std::exp(-0.5 * e * e) : 0.0;
+        }
+    }
+
+    /**
+     * @brief One frame of the cumulative beat score,
+     *        C[n] = (1 - a) o[n] + a max_d W(d / tau) C[n - d].
+     * @param o Conditioned envelope value of this frame.
+     *
+     * Stark, Davies and Plumbley, "Real-time beat-synchronous analysis of
+     * musical audio", DAFx 2009, with their a = 0.9 and their log-Gaussian
+     * interval weight of sharpness 5 over [tau / 2, 2 tau].
+     */
+    void updateBeatScore(double o) noexcept
+    {
+        const int mask = beatScoreLen_ - 1;
+        double best = 0.0;
+        if (haveBeatPeriod_)
+        {
+            const double tau = beatPeriod_;
+            const double lnTau = std::log(tau);
+            const int lo = std::max(1, static_cast<int>(std::lround(0.5 * tau)));
+            const int hi = std::min(static_cast<int>(std::lround(2.0 * tau)),
+                                    static_cast<int>(std::min<int64_t>(beatScoreFrames_,
+                                                                       beatScoreLen_ - 1)));
+            for (int d = lo; d <= hi; ++d)
+            {
+                const double v = beatIntervalWeight(d, lnTau)
+                               * beatScore_[static_cast<size_t>((beatScoreWrite_ - d) & mask)];
+                if (v > best) best = v;
+            }
+        }
+        beatScore_[static_cast<size_t>(beatScoreWrite_ & mask)]
+            = (1.0 - kBeatScoreFeedback) * o + kBeatScoreFeedback * best;
+        ++beatScoreWrite_;
+        ++beatScoreFrames_;
+    }
+
+    /**
+     * @brief Chooses the next beat from the beat score continued one period
+     *        into the future with no further onsets.
+     *
+     * The continuation is evaluated over one period starting half a period
+     * after the beat just placed, and its strongest point is the next beat.
+     * The preference for continuing the beat already in force is very slight
+     * (a Gaussian kPredictionSpread periods wide): a narrower one keeps
+     * whichever of two equal-period pulse trains the clock happened to start
+     * on, and the clock must be free to move to the stronger one.
+     *
+     * Where a pulse train at another phase scores within kAmbiguousScore of
+     * the strongest, the score cannot tell which train is the beat, and the
+     * beat is placed where the resonator's phase turn falls instead. That
+     * phase is the circular mean of the onset mass, so it sits between the
+     * two trains, nearer the stronger one.
+     */
+    void predictNextBeat() noexcept
+    {
+        const double tau = beatPeriod_;
+        const double lnTau = std::log(tau);
+        const int span = std::max(2, static_cast<int>(std::lround(tau)));
+        const int lo = std::max(1, static_cast<int>(std::lround(0.5 * tau)));
+        const int hi = static_cast<int>(std::lround(2.0 * tau));
+        const int past = std::min(hi + 1, static_cast<int>(std::min<int64_t>(beatScoreFrames_,
+                                                                              beatScoreLen_ - 1)));
+        const int mask = beatScoreLen_ - 1;
+        for (int i = 0; i < past; ++i)
+            beatScratch_[static_cast<size_t>(i)]
+                = beatScore_[static_cast<size_t>((beatScoreWrite_ - past + i) & mask)];
+
+        int bestK = span / 2;
+        double bestV = -1.0;
+        const double centre = 0.5 * tau;
+        const double spread = kPredictionSpread * tau;
+        for (int k = 1; k <= span; ++k)
+        {
+            const int at = past - 1 + k;
+            double b = 0.0;
+            for (int d = lo; d <= hi; ++d)
+            {
+                const int j = at - d;
+                if (j < 0) break;
+                const double v = beatIntervalWeight(d, lnTau) * beatScratch_[static_cast<size_t>(j)];
+                if (v > b) b = v;
+            }
+            beatScratch_[static_cast<size_t>(at)] = kBeatScoreFeedback * b;
+            const double u = (static_cast<double>(k) - centre) / spread;
+            const double q = b * std::exp(-0.5 * u * u);
+            beatAhead_[static_cast<size_t>(k)] = q;
+            if (q > bestV) { bestV = q; bestK = k; }
+        }
+
+        if (bestV > 0.0)
+        {
+            double rival = 0.0;
+            for (int k = 1; k <= span; ++k)
+            {
+                const double v = beatAhead_[static_cast<size_t>(k)];
+                if (k > 1 && v < beatAhead_[static_cast<size_t>(k - 1)]) continue;
+                if (k < span && v < beatAhead_[static_cast<size_t>(k + 1)]) continue;
+                if (std::abs(wrapToPeriod(static_cast<double>(k - bestK), tau))
+                    > kRivalSeparation * tau)
+                    rival = std::max(rival, v);
+            }
+            if (rival >= (1.0 - kAmbiguousScore) * bestV)
+            {
+                double lead = resonatorLead_;
+                while (lead < 0.5) lead += tau;
+                int k = static_cast<int>(std::lround(lead));
+                const int step = std::max(1, static_cast<int>(std::lround(tau)));
+                while (k > span) k -= step;
+                bestK = std::max(1, k);
+            }
+        }
+        beatCountdown_ = bestK;
+        framesToPrediction_ = bestK + static_cast<int>(std::lround(0.5 * tau));
+    }
+
+    /// x folded into [-period / 2, period / 2].
+    [[nodiscard]] static double wrapToPeriod(double x, double period) noexcept
+    {
+        double d = std::fmod(x, period);
+        if (d > 0.5 * period) d -= period;
+        if (d < -0.5 * period) d += period;
+        return d;
+    }
+
+    /**
+     * @brief Advances the beat clock one frame.
+     * @return true if a beat was reported on this frame.
+     *
+     * A beat is announced on the frame after the one it is placed on and is
+     * attributed to that frame's position: the one hop of getLatencySamples()
+     * that follows the analysis frame.
+     */
+    bool advanceBeatClock() noexcept
+    {
+        bool beat = false;
+        if (beatPending_)
+        {
+            lastBeatSample_.store(std::max<int64_t>(0, pendingBeatRef_), std::memory_order_relaxed);
+            beatPending_ = false;
             beat = true;
         }
-        prevSinceBeat_ = sinceBeat;
-        lastBestIndex_ = best;
-        havePhase_ = true;
-
+        if (!haveBeatPeriod_) return beat;
+        if (framesToPrediction_ < 0)
+        {
+            if (static_cast<double>(beatScoreFrames_) >= beatPeriod_) predictNextBeat();
+            return beat;
+        }
+        if (beatCountdown_ > 0 && --beatCountdown_ == 0)
+        {
+            beatPending_ = true;
+            pendingBeatRef_ = lastFrameRef_;
+        }
+        if (--framesToPrediction_ <= 0) predictNextBeat();
         return beat;
     }
 
@@ -2673,19 +2952,44 @@ private:
         frameIndex_ = 0;
         lastFrameRef_ = 0;
         baseline_ = 0.0;
-        prevSinceBeat_ = 0.0;
-        framesSinceBeat_ = 0;
-        lastBestIndex_ = -1;
-        havePhase_ = false;
+        std::fill(beatScore_.begin(), beatScore_.end(), 0.0);
+        beatScoreWrite_ = 0;
+        beatScoreFrames_ = 0;
+        beatPeriod_ = 0.0;
+        haveBeatPeriod_ = false;
+        resonatorLead_ = 0.0;
+        framesToPrediction_ = -1;
+        beatCountdown_ = 0;
+        beatPending_ = false;
+        pendingBeatRef_ = 0;
+        heldLevel_ = -1;
+        levelChallengeFrames_ = 0;
 
         tempoAndConfidence_.store(packTempo(0.0f, 0.0f), std::memory_order_relaxed);
         beatLatched_.store(false, std::memory_order_relaxed);
         lastBeatSample_.store(-1, std::memory_order_relaxed);
     }
 
-    /// Shortest gap between two reported causal beats, as a fraction of the
-    /// period in force.
-    static constexpr double kBeatRefractory = 0.5;
+    /// Feedback of the cumulative beat score (the paper's alpha).
+    static constexpr double kBeatScoreFeedback = 0.9;
+    /// Sharpness of the beat score's log-Gaussian interval weight (the
+    /// paper's eta).
+    static constexpr double kBeatIntervalSharpness = 5.0;
+    /// Width, in periods, of the preference for continuing the beat in force.
+    static constexpr double kPredictionSpread = 4.0;
+    /// Relative score below the strongest at which a rival pulse train makes
+    /// the beat score ambiguous.
+    static constexpr double kAmbiguousScore = 0.05;
+    /// Phase distance, in periods, beyond which a peak of the continued score
+    /// is a different pulse train rather than the same one.
+    static constexpr double kRivalSeparation = 0.15;
+    /// Beats, of its own period, that a different metrical level must keep
+    /// outscoring the one in force before the beat clock follows it.
+    static constexpr double kLevelHoldBeats = 4.0;
+    /// Entries of the interval weight's table.
+    static constexpr int kBeatTableSize = 2048;
+    /// ln 2 plus rounding room: the interval weight's table span on ln(d / tau).
+    static constexpr double kBeatTableSpan = 0.6931471805599453 + 0.05;
 
     /// Below this the exponentially-windowed onset mass is numerically nothing
     /// and the coherence ratio would be a quotient of two rounding errors.
@@ -2720,10 +3024,20 @@ private:
     int64_t lastFrameRef_ = 0;
     double baseline_ = 0.0;
     double baselineCoef_ = 0.005;
-    double prevSinceBeat_ = 0.0;
-    int64_t framesSinceBeat_ = 0;
-    int lastBestIndex_ = -1;
-    bool havePhase_ = false;
+    // Causal beat clock (audio thread only; sized at prepare).
+    int beatScoreLen_ = 64;
+    WorkVector<double> beatScore_, beatScratch_, beatAhead_, beatLogLag_, beatWeightTable_;
+    int64_t beatScoreWrite_ = 0;
+    int64_t beatScoreFrames_ = 0;
+    double beatPeriod_ = 0.0;
+    bool haveBeatPeriod_ = false;
+    double resonatorLead_ = 0.0;
+    int framesToPrediction_ = -1;
+    int beatCountdown_ = 0;
+    bool beatPending_ = false;
+    int64_t pendingBeatRef_ = 0;
+    int heldLevel_ = -1;
+    int levelChallengeFrames_ = 0;
 
     // Offline scratch (analyze() and the offline session only).
     int64_t offlinePushed_ = 0;

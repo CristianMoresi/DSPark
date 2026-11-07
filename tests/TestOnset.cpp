@@ -304,6 +304,52 @@ DSPARK_TEST(Onset_OA4_soft_onsets_over_bed)
 }
 
 // ===========================================================================
+// Default sensitivity: 30 ms attacks across six octaves and 24 dB of level,
+// with releases slow enough to be no transient at all. The default delta must
+// recall most of them without a single false positive (17 of 22); the former
+// default of 0.03 recalled 10 of 22.
+// ===========================================================================
+DSPARK_TEST(Onset_default_delta_recalls_soft_attacks)
+{
+    const double fs = 44100.0;
+    const int n = static_cast<int>(fs * 12.0);
+    std::vector<float> sig(static_cast<size_t>(n), 0.0f);
+    std::vector<int64_t> truth;
+    uint32_t state = 12345u;
+    auto uniform = [&]() {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<double>(state >> 8) / 16777216.0;
+    };
+    for (int k = 0; k < 22; ++k)
+    {
+        const int64_t at = static_cast<int64_t>(fs * (0.3 + 0.5 * k));
+        const double f0 = 440.0 * std::exp2((36.0 + 48.0 * uniform() - 69.0) / 12.0);
+        const double amp = std::pow(10.0, (-30.0 + 24.0 * uniform()) / 20.0);
+        const int att = static_cast<int>(0.030 * fs);
+        const int dur = static_cast<int>(0.45 * fs);
+        const int rel = static_cast<int>(0.040 * fs);
+        for (int i = 0; i < dur; ++i)
+        {
+            const int64_t j = at + i;
+            if (j >= n) break;
+            const double t = static_cast<double>(i) / fs;
+            double env = std::min(1.0, static_cast<double>(i) / att) * std::exp(-3.0 * t);
+            if (i > dur - rel) env *= static_cast<double>(dur - i) / rel;
+            double s = 0.0;
+            for (int h = 1; h <= 6; ++h) s += std::sin(dspark::twoPi<double> * f0 * h * t) / h;
+            sig[static_cast<size_t>(j)] += static_cast<float>(amp * env * s);
+        }
+        truth.push_back(at);
+    }
+    auto det = runOffline(sig, fs, OnsetDetector<float>::Method::SuperFlux);
+    PRF s = scoreOnsets(det, truth, fs, 50.0);
+    std::cout << "  [sensitivity] 30 ms attacks: F=" << s.f << " (tp=" << s.tp
+              << " fp=" << s.fp << " fn=" << s.fn << ")\n";
+    EXPECT_EQ(s.fp, 0);
+    EXPECT_GT(s.r, 0.6);
+}
+
+// ===========================================================================
 // OA-5: FM/AM sustained tone, no true onsets -> 0 SuperFlux false onsets, and
 // SuperFlux FP <= plain SpectralFlux FP (vibrato suppression).
 // ===========================================================================
@@ -834,7 +880,7 @@ DSPARK_TEST(Onset_shared_complex_flux_rejects_missing_phase_history)
 }
 
 // prepare() reinstated the defaults, so anything configured before it, or before
-// a re-prepare at a new rate, was lost: the old code reads threshold 0.03 here.
+// a re-prepare at a new rate, was lost: the old code reads the default threshold here.
 DSPARK_TEST(Onset_configuration_survives_prepare)
 {
     using Method = OnsetDetector<float>::Method;

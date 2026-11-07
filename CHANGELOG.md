@@ -212,6 +212,28 @@ All notable user-facing changes to DSPark are documented here.
   change differs. CPU: 6% less on clean tones (a redundant energy pass is
   removed and the candidate scan stops once the choice is settled), 1% to 3%
   more on noise.
+- `ChordDetector` evaluates its note bank on a cascade of half-band
+  decimators, one octave per rate: 304 to 2.1 us per frame (float, 44.1 kHz,
+  4096), 614 to 2.9 us at 96 kHz, 1214 to 5.7 us with 16384. Chroma within
+  0.008 dB of the direct evaluation on pitch classes within 30 dB of the
+  loudest; held chord unchanged on every frame measured. The analysed span
+  now ends `getAnalysisDelaySamples()` before the frame boundary (770 samples
+  at 44.1 kHz). `KeyDetector`, which reads the same front end, drops from 6.65
+  to 0.06 ms per second of audio with unchanged estimates at its default.
+- `BeatTracker` causal beats are placed by a cumulative beat score instead of
+  the resonator's phase turn, and a different metrical level must outscore
+  the one in force for four of its beats before the beats follow it. On
+  swung and dotted clicks with off-beats up to 0.7 of the beat, 659 of 660
+  beats land within 70 ms (374 of 672 before) at a mean 3 ms late (11 to 105
+  ms early before). Causal beat F-measure: 0.611 to 0.625 and 0.629 to 0.647
+  on the two halves of 698 ballroom recordings, 0.257 to 0.286 on Salsa.
+  Tempo and confidence readings are unchanged.
+- `OnsetDetector` default peak-pick delta 0.03 to 0.015. On a held-out
+  synthetic note set the mean F-measure over six kinds goes from 0.625 to
+  0.767 (30 ms attacks 0.428 to 0.788, 60 ms 0.214 to 0.603) with no false
+  positive added on five of them; sustained notes under +/-3 dB tremolo gain
+  false onsets (0.21 to 1.85 per second). `setThreshold(0.03f)` restores the
+  former sensitivity.
 
 ### Fixed
 

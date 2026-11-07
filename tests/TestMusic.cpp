@@ -6,9 +6,14 @@
 #include "../Music/HarmonyConstants.h"
 #include "../Music/ChordDetector.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <span>
 #include <string_view>
+#include <vector>
 
 using namespace dspark;
 using namespace dspark::harmony;
@@ -770,4 +775,95 @@ DSPARK_TEST(ChordDetector_names_follow_the_key_spelling)
     r.type = CT::Minor7;
     ChordDetector<float>::getChordName(r, name, 8);
     EXPECT_TRUE(std::string_view(name) == "F#m7");
+}
+
+namespace {
+// Analysis delay of the note bank where the detector reports one, else zero.
+template <typename Detector>
+int chordAnalysisDelay(const Detector& detector)
+{
+    if constexpr (requires { detector.getAnalysisDelaySamples(); })
+        return detector.getAnalysisDelaySamples();
+    else
+        return 0;
+}
+} // namespace
+
+// The chroma is the Hann-windowed DTFT of the analysed span at every tempered
+// note, energy normalised by 2 over the window, folded by pitch class. That
+// definition does not depend on how it is computed, so it is checked against
+// the direct full-rate evaluation of the span the detector reports, on a
+// chord with a bass note, its harmonics and a noise floor, at three rates.
+DSPARK_TEST(ChordDetector_chroma_matches_the_direct_note_dtft)
+{
+    double worstDb = 0.0;
+    int compared = 0;
+    for (double fs : { 44100.0, 48000.0, 96000.0 })
+    {
+        const int n = static_cast<int>(fs * 1.6);
+        std::vector<double> x(static_cast<size_t>(n), 0.0);
+        uint32_t state = 99u;
+        auto noise = [&]() {
+            state = state * 1664525u + 1013904223u;
+            return static_cast<double>(state >> 8) / 16777216.0 - 0.5;
+        };
+        for (int i = 0; i < n; ++i)
+        {
+            const double t = static_cast<double>(i) / fs;
+            double v = 0.0;
+            for (double midi : { 48.0, 60.0, 64.0, 67.0, 71.5 })
+                for (int h = 1; h <= 4; ++h)
+                    v += 0.08 / h * std::sin(twoPi<double> * h * 440.0
+                                             * std::exp2((midi - 69.0) / 12.0) * t);
+            x[static_cast<size_t>(i)] = v + 0.002 * noise();
+        }
+        ChordDetector<float> cd;
+        cd.prepare(AudioSpec{ fs, 512, 1 });
+        const int win = cd.getWindowSize();
+        const int hop = cd.getHopSize();
+        const int delay = chordAnalysisDelay(cd);
+        std::vector<float> xf(x.size());
+        for (size_t i = 0; i < x.size(); ++i) xf[i] = static_cast<float>(x[i]);
+        std::uint64_t seen = 0;
+        int frames = 0;
+        for (int pos = 0; pos + hop <= n; pos += hop)
+        {
+            cd.pushSamples(std::span<const float>(xf.data() + pos, static_cast<size_t>(hop)));
+            if (cd.getFrameCount() == seen) continue;
+            seen = cd.getFrameCount();
+            const int end = pos + hop - delay;
+            const int start = end - win;
+            if (start < 0 || ++frames > 4) continue;
+            std::array<double, 12> direct {};
+            for (int m = 36; m <= 83; ++m)
+            {
+                const double w = twoPi<double> * 440.0 * std::exp2((m - 69.0) / 12.0) / fs;
+                double re = 0.0, im = 0.0;
+                for (int i = 0; i < win; ++i)
+                {
+                    const double hann = 0.5 - 0.5 * std::cos(twoPi<double> * i / win);
+                    const double v = hann * x[static_cast<size_t>(start + i)];
+                    re += v * std::cos(w * i);
+                    im -= v * std::sin(w * i);
+                }
+                const double a = 2.0 / win;
+                direct[static_cast<size_t>(m % 12)] += (re * re + im * im) * a * a;
+            }
+            const auto& c = cd.getChroma();
+            const double top = *std::max_element(direct.begin(), direct.end());
+            for (int p = 0; p < 12; ++p)
+            {
+                const double d = direct[static_cast<size_t>(p)];
+                if (!(d > top * 1e-3)) continue;
+                const double got = static_cast<double>(c[static_cast<size_t>(p)]);
+                const double err = std::abs(10.0 * std::log10((got + 1e-30) / d));
+                worstDb = std::max(worstDb, err);
+                ++compared;
+            }
+        }
+    }
+    std::cout << "  [chroma] " << compared << " pitch classes within 30 dB of the frame's"
+              << " loudest, worst |error| " << worstDb << " dB against the direct DTFT\n";
+    EXPECT_GT(compared, 60);
+    EXPECT_LT(worstDb, 0.02);
 }

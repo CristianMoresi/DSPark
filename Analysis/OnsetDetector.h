@@ -34,10 +34,27 @@
  * magnitudes are scaled by 2048/fftSize before the log compression), so the
  * peak-pick delta selects the same sensitivity at every rate -- neither the
  * resolution nor the threshold's meaning moves with the session rate. Recall
- * on that corpus under the defaults is 7 of 8 at EVERY rate: one soft F#1
- * stays below the default delta everywhere. That is the detector's soft-bass
- * sensitivity limit, the same at all rates -- raise it with setThreshold()
- * (smaller delta), at the usual false-positive cost.
+ * on that corpus under the defaults is 8 of 8 at EVERY rate (7 of 8 at the
+ * former default delta of 0.03, where one soft F#1 stayed below it).
+ *
+ * Default sensitivity. The default delta is 0.015 on the band-averaged ODF.
+ * It was chosen on a synthetic note corpus (six kinds: 1 ms, 30 ms and 60 ms
+ * attacks, sharp attacks under vibrato, sharp attacks over a noise bed, and
+ * 20 ms attacks on sustained notes with +/-3 dB 5 Hz tremolo and vibrato;
+ * F-measure at +/-50 ms, offline picker), as the value with the best mean
+ * F-measure over the six kinds on six files per kind among the values
+ * that keep this file's acceptance beds free of false positives; on 24
+ * further files per kind it gives a mean of 0.767, against 0.625 at the
+ * former 0.03, and 0.798 against 0.698 pooled over all onsets. Per kind
+ * (held-out): 1 ms attacks 0.978 (0.936 before), 30 ms 0.788 (0.428),
+ * 60 ms 0.603 (0.214), vibrato 0.968 (0.894), over a bed 0.930 (0.813), with
+ * no false positive on any of the five. The cost is the tremolo kind: 1.85
+ * false onsets per second against 0.21 (F 0.337 against 0.463), because a
+ * maximum filter across frequency suppresses vibrato and not amplitude
+ * modulation. Raise the delta for heavily amplitude-modulated sustained
+ * material. A smaller delta recalls slower attacks still (0.004: 30 ms
+ * attacks 0.977, 60 ms 0.934) but also reports the 10 ms releases of
+ * full-level bass notes in this file's acceptance beds.
  *
  * Latency (ONE definition). Frame N (Hann; automatic by default), hop =
  * round(fs/200) (221 samples at 44.1 kHz, 240 at 48 kHz; ~5 ms). The detector
@@ -171,8 +188,9 @@ public:
      * With a CONSTANT sample count the low register therefore degrades as the
      * rate rises: measured on soft bass onsets (E1..B2, 10 ms attacks) the
      * fixed 2048 frame recalls 7/8 at 44.1/48 kHz but 5/8 at 96 kHz, while
-     * the automatic frame holds the 7/8 reference recall there (the missed
-     * F#1 sits below the default delta at every rate; see the file header).
+     * the automatic frame holds the 7/8 reference recall there (measured at
+     * the former default delta of 0.03, below which the missed F#1 sat at
+     * every rate; see the file header).
      * Percussive clicks, mid-register notes
      * and the vibrato/tremolo false-positive guard were measured unaffected at
      * every rate from 44.1 to 192 kHz, so this is a low-register loss, not a
@@ -187,9 +205,8 @@ public:
      * frame. Without this, |X| grows linearly with the frame and quiet-onset
      * sensitivity roughly doubles per rate-family doubling against a fixed
      * delta. The factor is exactly 1 at the 2048-sample reference where the
-     * default delta was tuned, so 44.1/48 kHz default behaviour (and any
-     * explicit-2048 caller at any rate) is bit-identical to previous
-     * releases. Explicit frames OTHER than 2048 now read the ODF on the
+     * default delta was tuned, so 44.1/48 kHz behaviour at a given delta (and
+     * any explicit-2048 caller at any rate) is unchanged by the scaling. Explicit frames OTHER than 2048 now read the ODF on the
      * reference scale too -- an intentional behaviour change: one delta means
      * one sensitivity, at every frame length. Under adaptive whitening the
      * per-bin peak division removes the growth wherever the running peak
@@ -298,7 +315,8 @@ public:
      * Non-finite values are ignored; negative values are clamped to 0.
      * The delta is read against the frame-invariant ODF scale (see
      * prepare()), so one value selects the same sensitivity at every rate
-     * and frame length.
+     * and frame length. Default 0.015; see the file header for how it was
+     * chosen and what a smaller or larger value trades.
      */
     void setThreshold(T deltaAboveMean) noexcept
     {
@@ -689,7 +707,7 @@ private:
     /// Automatic-frame policy: the span 2048 samples cover at 48 kHz, resolved
     /// inside [512, 16384] (covers 8 kHz .. 384 kHz without hitting a clamp).
     static constexpr int64_t kBig = int64_t(1) << 60;
-    static constexpr T kDefaultDelta = T(0.03);
+    static constexpr T kDefaultDelta = T(0.015);
     static constexpr double kLocalizationLead = 0.34; ///< Flux-to-energy lead (fraction of N).
     static constexpr int kPhaseRestartFrames = 3; ///< Frames phase prediction needs after a restart.
 

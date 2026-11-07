@@ -381,7 +381,7 @@
  * | `SpectralFreeze<T>`      | Effects/SpectralFreeze.h | Tonal or diffuse STFT magnitude hold with deterministic transitions |
  * | `SpectralDenoiser<T>`    | Effects/SpectralDenoiser.h | Learnable-profile spectral noise reduction (Wiener, decision-directed) |
  * | `PitchCorrector<T>`      | Effects/PitchCorrector.h | Monophonic scale-aware retune: detect, quantize, shift, with formant preservation |
- * | `ChordDetector<T>`       | Music/ChordDetector.h     | Goertzel chroma + template chord recognition with confidence |
+ * | `ChordDetector<T>`       | Music/ChordDetector.h     | Multirate note chroma + template chord recognition with confidence |
  * | `KeyDetector<T>`         | Music/KeyDetector.h       | Musical key estimation: accumulated chroma against published key profiles |
  * | `DeEsser<T>`             | Effects/DeEsser.h     | Split-band de-esser with dynamic sibilance detection                |
  * | `AutoGain<T>`            | Effects/AutoGain.h    | Automatic gain compensation for honest A/B comparison               |

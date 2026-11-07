@@ -31,7 +31,7 @@
  * semitones are simply no longer distinguishable above 48 kHz. Scaling N with
  * the rate instead (2048 at 48 kHz, 4096 at 96 kHz, 8192 at 192 kHz) holds the
  * rejection at 7.5-9.4 dB across that whole range. ChordDetector applies
- * exactly this rule when it sizes its per-note Goertzel bank.
+ * exactly this rule when it sizes the window of its note bank.
  *
  * Threading: owner-managed. All methods (prepare, push/process, readouts,
  * reset) are meant to be called from the thread that owns the stream; no

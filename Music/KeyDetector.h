@@ -12,9 +12,10 @@
  * rotated to all 12 tonics in both modes; the best of those 24 correlations
  * names the key.
  *
- * The chroma comes from `ChordDetector`, which owns the framework's Goertzel
- * chroma front end: one exact Goertzel per note over MIDI 36..83, folded by
- * pitch class. This class holds one and consumes its frames rather than
+ * The chroma comes from `ChordDetector`, which owns the framework's note
+ * chroma front end: the Hann-windowed DTFT at each tempered note over MIDI
+ * 36..83 (the value an exact Goertzel over the window would return), folded
+ * by pitch class. This class holds one and consumes its frames rather than
  * running a second bank, so the analysis window, the automatic window law and
  * the measured register bounds are the same numbers in both places and cannot
  * drift apart. Everything prepare() documents about the reliable register

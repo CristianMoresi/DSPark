@@ -234,8 +234,19 @@
  * and the jumps use that value.
  * A correction change takes effect at the next fragment, with no slew: a 1 to
  * 4 semitone hard snap lands within 10 cents in 4 to 5 ms (the vocoder table
- * above does not apply). Formant preservation does not apply in this mode:
- * the formants move with the pitch, as they do in the vocoder without it.
+ * above does not apply). The read head plays the input back at the correction
+ * ratio, so the formants move with the pitch, as they do in the vocoder
+ * without formant preservation.
+ *
+ * With setFormantPreserve(true) the low-latency engine renders by
+ * pitch-synchronous overlap-add instead: grains of the input, one input
+ * period apart at their source, are placed one corrected period apart and
+ * crossfaded with a raised cosine between their centres, so each output
+ * period is one input period at its own rate and the spectral envelope stays
+ * in place. Same latency, the same exact delay at zero correction and in
+ * silence. A G3 vowel corrected five semitones up keeps its envelope centroid
+ * within 8 percent and its spectral centroid within 1 percent (the read head:
+ * +20 and +25 percent; the vocoder with its envelope pre-warp: +7.5 and 0).
  *
  * Measured at 48 kHz on synthetic voices (the file's instruments, see the
  * tests), against the default engine and a reference time-domain corrector
@@ -245,10 +256,13 @@
  *                               low-latency   default   reference
  *   latency, samples                1024        4096       1024 (1055)
  *   +-40 cent vibrato on A3, rms     1.3         36.2        5.5  cents
+ *     with formant preservation      4.0
  *   natural voice (jitter, breath)   2.3          4.5        3.2  cents
  *   stepped melody, worst error     0.00         0.14       0.09  cents
  *   harmonic/residual, F2..A4      87-90        39-57      32-35  dB
+ *     with formant preservation     59-69
  *   CPU, mono                         42           47         54  ns/sample
+ *     with formant preservation       49
  *   (the last column is an unoptimized port, so its CPU is indicative)
  *
  * (Harmonic/residual: a sustained vowel 30 cents sharp corrected onto its
@@ -384,6 +398,7 @@ public:
         // The engine is chosen here, so a mode change takes effect as a
         // restart of the stream (the two latencies differ).
         lowActive_ = lowLatency_.load(std::memory_order_relaxed);
+        lowFormant_ = lowActive_ && formantPreserve_.load(std::memory_order_relaxed);
         latency_.store(lowActive_ ? spliceDelay_ : spectralLatency_,
                        std::memory_order_relaxed);
         resetSplice();
@@ -429,8 +444,10 @@ public:
                              std::memory_order_relaxed);
     }
 
-    /** @brief Enables the shifter's cepstral formant preservation (the
-     *  anti-chipmunk envelope pre-warp). Default off. */
+    /** @brief Enables formant preservation (default off): the shifter's
+     *  cepstral envelope pre-warp in the default engine, pitch-synchronous
+     *  overlap-add in the low-latency one. In the low-latency engine a change
+     *  restarts the stream at the next processBlock(), as reset() does. */
     void setFormantPreserve(bool on) noexcept
     {
         formantPreserve_.store(on, std::memory_order_relaxed);
@@ -442,7 +459,8 @@ public:
      * On: the pitch-synchronous splice engine described in the file overview,
      * with a latency of half the detector's analysis window (1024 samples at
      * 44.1/48 kHz, 21.3 ms at 48 kHz) instead of the phase vocoder's twice the
-     * frame. Formant preservation does not apply in this mode. A change takes
+     * frame. Formant preservation selects its pitch-synchronous overlap-add
+     * rendering (see the file overview). A change of either flag takes
      * effect at the next processBlock() as a restart of the stream, as reset()
      * does: re-read getLatency() after it.
      */
@@ -549,6 +567,9 @@ public:
         // A change of engine restarts the stream: the latencies differ, so no
         // crossfade can join the two.
         if (lowLatency_.load(std::memory_order_relaxed) != lowActive_) reset();
+        // So does a change of the low-latency engine's formant mode: its grain
+        // engine and the read head keep different state.
+        if (lowActive_ && formantPreserve_.load(std::memory_order_relaxed) != lowFormant_) reset();
 
         // One load per block for each independent word. The scale word is
         // internally consistent by packing; the retune speed and the formant
@@ -593,7 +614,7 @@ public:
                 // Splice decisions sit on the same absolute grid and read the
                 // detector BEFORE this interval is pushed, so the host's block
                 // size cannot move them.
-                if (lowActive_ && splicePhase_ == 0) decideSplice();
+                if (lowActive_ && !lowFormant_ && splicePhase_ == 0) decideSplice();
             }
 
             const int chunk =
@@ -607,7 +628,10 @@ public:
                 warmupRemaining_ = std::max(0, warmupRemaining_ - chunk);
 
             if (lowActive_)
-                spliceChunk(buffer, offset, chunk);
+            {
+                if (lowFormant_) grainChunk(buffer, offset, chunk);
+                else spliceChunk(buffer, offset, chunk);
+            }
             else
                 shifter_.processBlock(buffer.getSubView(offset, chunk));
 
@@ -943,6 +967,8 @@ private:
         spliceStep_ = -1;
         localHz_ = 0.0;
         lastLoud_ = std::numeric_limits<std::int64_t>::min() / 2;
+        markPrev_ = markNext_ = -static_cast<double>(spliceDelay_);
+        offsetCur_ = offsetNext_ = 0.0;
     }
 
     /**
@@ -1022,6 +1048,125 @@ private:
         }
     }
 
+    /** @brief Writes a chunk of input into the rings; a non-finite sample
+     *  reads as silence (audio thread). */
+    void writeRings(AudioBufferView<T> buffer, int offset, int chunk, int nCh) noexcept
+    {
+        for (int ch = 0; ch < spliceChannels_; ++ch)
+        {
+            T* ring = ring_[static_cast<std::size_t>(ch)].data();
+            const T* in = ch < nCh ? buffer.getChannel(ch) + offset : nullptr;
+            for (int k = 0; k < chunk; ++k)
+            {
+                T x = in != nullptr ? in[k] : T(0);
+                if (!std::isfinite(x)) x = T(0);
+                ring[static_cast<std::size_t>((writeCount_ + k) & ringMask_)] = x;
+                if (std::abs(static_cast<double>(x)) > kSilence) lastLoud_ = writeCount_ + k;
+            }
+        }
+    }
+
+    /**
+     * @brief Chooses the next grain when the output reaches a grain centre
+     *        (grain mode, audio thread).
+     *
+     * The next mark lies one corrected period on, the input period divided
+     * by the correction ratio. Its source centre is the current one moved by
+     * the whole number of input periods that brings it closest to the mark,
+     * so the two grains hold the same waveform and the source never drifts
+     * more than half a period from the output. Without a period (unvoiced,
+     * silent, warming up) the next grain sits a fragment on at offset 0: the
+     * exact delay, reached through one fade.
+     */
+    void advanceGrain() noexcept
+    {
+        markPrev_ = markNext_;
+        offsetCur_ = offsetNext_;
+        const double frequency = localHz_;
+        const bool voiced = !holdUnity_ && warmupRemaining_ == 0 && frequency > 0.0
+                         && frequency <= 0.25 * sampleRate_;
+        if (!voiced)
+        {
+            markNext_ = markPrev_ + static_cast<double>(spliceFragment_);
+            offsetNext_ = 0.0;
+            return;
+        }
+        const double period = sampleRate_ / frequency;
+        markNext_ = markPrev_ + period / spliceRatio_;
+        const double source = markPrev_ + offsetCur_;
+        const double periods = std::round((markNext_ - source) / period);
+        offsetNext_ = source + periods * period - markNext_;
+    }
+
+    /**
+     * @brief Renders one chunk of the low-latency engine's formant-preserving
+     *        mode in place (audio thread): pitch-synchronous overlap-add.
+     *
+     * The output is a chain of grains, each a stretch of the input around a
+     * source centre, placed with its centre on an output mark (see
+     * advanceGrain()). Between two marks the output fades from the first
+     * grain to the second with a raised cosine, which makes every grain a
+     * raised-cosine-windowed stretch of two corrected periods and their sum
+     * exact. Every output period is then one period of the input at its
+     * original rate: the pitch follows the marks and the spectral envelope,
+     * the formants, stays where it was. Reads are 32-tap sinc at the grains'
+     * fractional offsets; the reported latency and the free re-centre in
+     * silence are those of the read-head engine.
+     */
+    void grainChunk(AudioBufferView<T> buffer, int offset, int chunk) noexcept
+    {
+        const int nCh = std::min(buffer.getNumChannels(), spliceChannels_);
+        writeRings(buffer, offset, chunk, nCh);
+
+        // Everything a grain could read is silence (offsets stay within half
+        // a period, under half the delay): re-centre for free.
+        const auto now = writeCount_;
+        holdUnity_ = lastLoud_ < now - static_cast<std::int64_t>(spliceDelay_ + spliceDelay_ / 2)
+                               - static_cast<std::int64_t>(minReadDelay_);
+        if (holdUnity_) { offsetCur_ = 0.0; offsetNext_ = 0.0; }
+
+        std::int64_t pos1[kControlInterval], pos2[kControlInterval];
+        double frac1[kControlInterval], frac2[kControlInterval];
+        T fade[kControlInterval];
+        bool cross = false;
+        for (int k = 0; k < chunk; ++k)
+        {
+            const double t = static_cast<double>(now + k - spliceDelay_);
+            while (t >= markNext_) advanceGrain();
+            const double span = markNext_ - markPrev_;
+            const double u = span > 0.0 ? std::clamp((t - markPrev_) / span, 0.0, 1.0) : 1.0;
+            fade[k] = static_cast<T>(0.5 - 0.5 * fastCos(pi<double> * u));
+            const double p1 = t + offsetCur_, p2 = t + offsetNext_;
+            const double f1 = std::floor(p1), f2 = std::floor(p2);
+            pos1[k] = static_cast<std::int64_t>(f1); frac1[k] = p1 - f1;
+            pos2[k] = static_cast<std::int64_t>(f2); frac2[k] = p2 - f2;
+            cross = cross || offsetCur_ != offsetNext_;
+        }
+        headInt_ = now + chunk - static_cast<std::int64_t>(spliceDelay_)
+                 + static_cast<std::int64_t>(std::lround(offsetCur_));
+
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            const T* ring = ring_[static_cast<std::size_t>(ch)].data();
+            T* out = buffer.getChannel(ch) + offset;
+            for (int k = 0; k < chunk; ++k)
+            {
+                const T a = sinc_->readRing(ring, ringMask_, pos1[k], frac1[k]);
+                if (!cross || (pos1[k] == pos2[k] && frac1[k] == frac2[k]))
+                {
+                    out[k] = a;
+                    continue;
+                }
+                const T b = sinc_->readRing(ring, ringMask_, pos2[k], frac2[k]);
+                out[k] = a + (b - a) * fade[k];
+            }
+        }
+
+        writeCount_ += chunk;
+        splicePhase_ += chunk;
+        if (splicePhase_ >= spliceFragment_) splicePhase_ = 0;
+    }
+
     /** @brief One read of a ring at an integer position plus a fraction. */
     T readRing(const T* ring, std::int64_t pos, double frac) const noexcept
     {
@@ -1039,19 +1184,8 @@ private:
     {
         const int nCh = std::min(buffer.getNumChannels(), spliceChannels_);
 
-        // 1. Write the input. A non-finite sample reads as silence.
-        for (int ch = 0; ch < spliceChannels_; ++ch)
-        {
-            T* ring = ring_[static_cast<std::size_t>(ch)].data();
-            const T* in = ch < nCh ? buffer.getChannel(ch) + offset : nullptr;
-            for (int k = 0; k < chunk; ++k)
-            {
-                T x = in != nullptr ? in[k] : T(0);
-                if (!std::isfinite(x)) x = T(0);
-                ring[static_cast<std::size_t>((writeCount_ + k) & ringMask_)] = x;
-                if (std::abs(static_cast<double>(x)) > kSilence) lastLoud_ = writeCount_ + k;
-            }
-        }
+        // 1. Write the input.
+        writeRings(buffer, offset, chunk, nCh);
 
         // 2. The head trajectories, shared by every channel (stereo-linked).
         const double ratio = holdUnity_ ? 1.0 : spliceRatio_;
@@ -1138,6 +1272,11 @@ private:
     bool fadeEqualPower_ = false;
     bool holdUnity_ = false;               ///< Silent fragment: read at unity.
     bool lowActive_ = false;               ///< Engine in use (stream owner).
+    bool lowFormant_ = false;              ///< Its formant-preserving grain mode in use.
+    double markPrev_ = 0.0;                ///< Grain mode: output time of the current grain centre.
+    double markNext_ = 0.0;                ///< Output time of the next grain centre.
+    double offsetCur_ = 0.0;               ///< Source minus output time, current grain.
+    double offsetNext_ = 0.0;              ///< The same for the next grain.
     std::atomic<bool> lowLatency_ { false };
 
     // Stream-owner state (audio thread only).

@@ -2547,7 +2547,7 @@ double wavetableBlockError(const WavetableBank& bank)
 } // namespace
 
 // readBlock() interpolates four or eight samples at a time instead of one call
-// per sample: 2.4 instead of 14 ns per float sample on AVX2 (3.5 on SSE2),
+// per sample: 2.3 instead of 14 ns per float sample on AVX2 (3.0 on SSE2),
 // operation for operation the same arithmetic. It matches read() exactly
 // where the compiler does not fuse the scalar multiply-adds; a contracting
 // build moves the last bit (1.8e-7 float, 3.3e-16 double measured).
@@ -2578,6 +2578,54 @@ DSPARK_TEST(WavetableBank_readBlock_matches_read)
     out.assign(5, 9.0f);
     basic.readBlock<float>(ph.data(), 0.0, basic.selectMip(440.0, 48000.0), out.data(), 0);
     for (float v : out) EXPECT_EQ(v, 9.0f);
+}
+
+// The block kernels hand a group holding an out-of-range phase to read() and
+// carry on with the vector kernels after it, on long blocks, wide and narrow,
+// with per-sample positions that land on whole frames (a frame blend of 0)
+// and run past both ends.
+DSPARK_TEST(WavetableBank_readBlock_resumes_after_out_of_range_phases)
+{
+    const auto& bank = WavetableBank::builtin(WavetableBank::Builtin::Harmonic);
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    std::vector<double> phases(300), positions(300);
+    std::vector<float> outF(300);
+    std::vector<double> outD(300);
+    uint32_t s = 3u;
+    for (const bool vectorWide : { true, false })
+    {
+        simd::setRuntimeDispatch(vectorWide && dispatch);
+        double worst = 0.0;
+        for (int rep = 0; rep < 200; ++rep)
+        {
+            const double hz = 30.0 + 25.0 * rep;
+            const auto mip = bank.selectMip(hz, 48000.0);
+            double ph = 0.37;
+            for (size_t j = 0; j < phases.size(); ++j)
+            {
+                phases[j] = ph;
+                ph += hz / 48000.0;
+                if (ph >= 1.0) ph -= 1.0;
+                s = s * 1664525u + 1013904223u;
+                positions[j] = (s >> 29) == 0 ? std::floor(static_cast<double>(s >> 20) / 4096.0 * 9.0) - 1.0
+                                              : static_cast<double>(s >> 8) / 16777216.0 * 7.0;
+                if ((s & 63u) == 5u) phases[j] = (s & 64u) ? 1.0 : -0.25;
+            }
+            const int n = 1 + rep % 300;
+            bank.readBlock<float>(phases.data(), positions.data(), mip, outF.data(), n);
+            bank.readBlock<double>(phases.data(), 3.0, mip, outD.data(), n);
+            for (int j = 0; j < n; ++j)
+            {
+                const auto i = static_cast<size_t>(j);
+                const double a = bank.read<float>(phases[i], positions[i], mip);
+                const double b = bank.read<double>(phases[i], 3.0, mip);
+                worst = std::max({ worst, std::abs(outF[i] - a) / std::max(1.0, std::abs(a)),
+                                   1e7 * std::abs(outD[i] - b) / std::max(1.0, std::abs(b)) });
+            }
+        }
+        EXPECT_LT(worst, 1e-6);
+    }
+    simd::setRuntimeDispatch(dispatch);
 }
 
 namespace {

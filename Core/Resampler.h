@@ -41,8 +41,9 @@
  * rate (or at twice it) does the sharp band-limiting, after which the
  * signal is oversampled enough for a short interpolation kernel (22 to 34
  * taps at High and Ultra) to change the rate. Its arithmetic is double for
- * both instantiations. At 96 to 44.1 kHz, Ultra, it runs 6.5x faster than
- * Direct (see setOfflineEngine()).
+ * both instantiations. At 96 to 44.1 kHz, Ultra, it runs 8x faster than
+ * Direct (see setOfflineEngine()). process() also writes into caller
+ * storage, which allocates nothing once the engine is designed.
  *
  * Threading: prepare() allocates and must run on a setup thread. After
  * prepare(), processBlock() and reset() are allocation-free and belong to
@@ -57,6 +58,7 @@
 #include "SimdOps.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -142,12 +144,14 @@ public:
      * its own rounding only.
      *
      * Measured against Direct (MSVC x64, AVX2 dispatch, double, ns per
-     * input sample once prepared) at 96 -> 44.1 / 48 -> 44.1 / 44.1 -> 48 /
-     * 44.1 -> 96 kHz: High 3.8 / 6.7 / 7.5 / 11.4 instead of 16.4 / 16.6 /
-     * 20.4 / 42.1; Ultra 4.0 / 7.0 / 8.0 / 12.8 instead of 26.2 / 26.9 /
-     * 27.7 / 60.3. Passband edge, image and alias rejection and the residual
-     * of in-band tones are those of Direct or better; on in-band material the
-     * two engines agree to -152 dB at High and -222 dB at Ultra.
+     * input sample once prepared, into caller storage) at 96 -> 44.1 /
+     * 48 -> 44.1 / 44.1 -> 48 / 44.1 -> 96 kHz: High 3.0 / 5.0 / 5.4 / 7.9
+     * instead of 16.4 / 16.6 / 20.4 / 42.1; Ultra 3.3 / 5.5 / 6.2 / 9.3
+     * instead of 26.2 / 26.9 / 27.7 / 60.3. The vector-returning process()
+     * adds the vector: Ultra 3.6 / 6.1 / 7.0 / 10.8. Passband edge, image
+     * and alias rejection and the residual of in-band tones are those of
+     * Direct or better; on in-band material the two engines agree to -152 dB
+     * at High and -222 dB at Ultra.
      *
      * The transforms sit on a fixed grid, so processRange() spans agree with
      * one another and with process() bit for bit; getReach() follows the
@@ -220,31 +224,51 @@ public:
      *
      * Stateless and time-aligned: output sample k interpolates the input at
      * position k / getRatio() exactly (no latency; the buffer edges are
-     * zero-padded). Allocates the output vector -- offline use only.
+     * zero-padded). Allocates the output vector -- offline use only; the
+     * overload that writes into caller storage does not.
      *
      * @param input       Source audio samples.
      * @param inputLength Number of input samples.
-     * @return Vector of resampled output samples (ceil(inputLength * ratio)).
+     * @return Vector of resampled output samples (ceil(inputLength * ratio));
+     *         empty when not prepared, for a null input or a length below 1.
      */
     [[nodiscard]] std::vector<T> process(const T* input, int inputLength)
     {
-        if (table_.empty()) return {}; // not prepared
+        if (table_.empty() || input == nullptr || inputLength <= 0) return {};
+        std::vector<T> output(static_cast<size_t>(outputLengthFor(inputLength)));
+        (void)process(input, inputLength, output.data(), static_cast<int64_t>(output.size()));
+        return output;
+    }
 
-        // Clamp through double before the int cast: huge ratios could
-        // otherwise overflow the cast itself (undefined behaviour).
-        const double outLenD =
-            std::ceil(static_cast<double>(inputLength) * ratio_);
-        const int outputLength = static_cast<int>(
-            std::min(outLenD, static_cast<double>(std::numeric_limits<int>::max())));
-
-        std::vector<T> output(static_cast<size_t>(outputLength));
+    /**
+     * @brief process() into caller storage.
+     *
+     * Writes the first min(outputCapacity, ceil(inputLength * getRatio()))
+     * samples of process()'s result, bit for bit. It allocates nothing once
+     * the offline engine is designed (the first offline call after prepare()
+     * or setOfflineEngine() designs it), so a converter that reuses its
+     * output buffer pays no allocation per call.
+     *
+     * @param input          Source audio samples.
+     * @param inputLength    Number of input samples.
+     * @param output         Destination for the converted samples.
+     * @param outputCapacity Samples the destination holds.
+     * @return Samples written: 0 when not prepared, for a null pointer, or
+     *         for a length or capacity below 1.
+     */
+    int64_t process(const T* input, int inputLength, T* output, int64_t outputCapacity)
+    {
+        if (table_.empty() || input == nullptr || inputLength <= 0
+            || output == nullptr || outputCapacity <= 0)
+            return 0;
+        const int64_t outputLength = std::min<int64_t>(outputLengthFor(inputLength), outputCapacity);
         if (useTwoStage())
         {
-            if (input != nullptr && inputLength > 0)
-                runTwoStage(input, inputLength, 0, outputLength, output.data());
-            return output;
+            runTwoStage(input, inputLength, 0, outputLength, output);
+            return outputLength;
         }
-        for (int outIdx = 0; outIdx < outputLength; ++outIdx)
+        int64_t outIdx = 0;
+        for (; outIdx < outputLength; ++outIdx)
         {
             int64_t intPos;
             int64_t phase = 0;
@@ -252,7 +276,7 @@ public:
             if (exact_)
             {
                 // Integer position arithmetic: output k reads input k*M/L.
-                const int64_t num = static_cast<int64_t>(outIdx) * stepM_;
+                const int64_t num = outIdx * stepM_;
                 intPos = num / phasesL_;
                 phase = num % phasesL_;
             }
@@ -263,10 +287,10 @@ public:
                 frac = srcPos - static_cast<double>(intPos);
             }
             if (intPos >= inputLength) break;
-            output[static_cast<size_t>(outIdx)] =
-                interpolateOffline(input, inputLength, static_cast<int>(intPos), phase, frac);
+            output[outIdx] = interpolateOffline(input, inputLength, static_cast<int>(intPos), phase, frac);
         }
-        return output;
+        std::fill(output + outIdx, output + outputLength, T(0));
+        return outputLength;
     }
 
     /**
@@ -419,6 +443,14 @@ public:
     }
 
 private:
+    /** @brief ceil(inputLength * ratio), clamped through double before the int
+     *  cast (a huge ratio would otherwise overflow the cast itself). */
+    [[nodiscard]] int outputLengthFor(int inputLength) const noexcept
+    {
+        const double n = std::ceil(static_cast<double>(inputLength) * ratio_);
+        return static_cast<int>(std::min(n, static_cast<double>(std::numeric_limits<int>::max())));
+    }
+
     /// Phases of the table read with cubic interpolation (non-rational ratios).
     static constexpr int kTablePhases = 512;
     /// Most exact phases, and most exact-table coefficients, before a ratio
@@ -468,11 +500,19 @@ private:
     /** @brief Modified Bessel I0 for the continuous Kaiser window. */
     [[nodiscard]] static double besselI0(double x) noexcept
     {
+        // sum_k (x^2 / 4)^k / (k!)^2: each term is the previous one times
+        // (x^2 / 4) / k^2, the reciprocal squares coming from a table, so the
+        // series has no division in its loop.
+        static constexpr std::array<double, 201> kInvSquares = [] {
+            std::array<double, 201> a {};
+            for (int k = 1; k <= 200; ++k) a[static_cast<size_t>(k)] = 1.0 / (static_cast<double>(k) * static_cast<double>(k));
+            return a;
+        }();
+        const double y = 0.25 * x * x;
         double sum = 1.0, term = 1.0;
         for (int k = 1; k <= 200; ++k)
         {
-            const double half = x / (2.0 * k);
-            term *= half * half;
+            term *= y * kInvSquares[static_cast<size_t>(k)];
             sum += term;
             if (term < 1e-17 * sum) break;
         }
@@ -557,6 +597,62 @@ private:
     }
 
     /**
+     * @brief numPhases kernels, phase p being buildPhase() at fractional
+     * position (p + offset) / L, normalised the same way.
+     *
+     * Every tap of every phase then sits at t = k / L for an integer k, and
+     * the windowed sinc is even, so it is evaluated once per |k| on that grid
+     * and shared: half the Bessel and sine evaluations of a phase-by-phase
+     * build, and none repeated.
+     */
+    template <typename D>
+    static void buildTable(D* dst, const Design& d, int64_t L, int64_t offset, int64_t numPhases)
+    {
+        const auto taps = static_cast<size_t>(d.taps);
+        if (d.identity)
+        {
+            for (int64_t p = 0; p < numPhases; ++p)
+                buildPhase(dst + static_cast<size_t>(p) * taps, d,
+                           static_cast<double>(p + offset) / static_cast<double>(L));
+            return;
+        }
+        constexpr double kPi = std::numbers::pi;
+        const int half = d.taps / 2;
+        const double i0Beta = besselI0(d.beta);
+        const double scale = 1.0 / static_cast<double>(L);
+        // |k| = |(j - half + 1) L - (p + offset)| stays below this bound.
+        const int64_t kMax = static_cast<int64_t>(half + 1) * L + numPhases + 2;
+        std::vector<double> grid(static_cast<size_t>(kMax) + 1, 0.0);
+        const int64_t kWindow = static_cast<int64_t>(half) * L;   // the window is 0 from here
+        for (int64_t k = 0; k < std::min(kWindow, kMax + 1); ++k)
+        {
+            const double t = static_cast<double>(k) * scale;
+            const double x = t * d.cutoff;
+            const double sincVal = (x < 1e-12) ? d.cutoff : d.cutoff * std::sin(kPi * x) / (kPi * x);
+            const double wx = t / static_cast<double>(half);
+            grid[static_cast<size_t>(k)] = sincVal * besselI0(d.beta * std::sqrt(1.0 - wx * wx)) / i0Beta;
+        }
+        for (int64_t p = 0; p < numPhases; ++p)
+        {
+            D* row = dst + static_cast<size_t>(p) * taps;
+            double sum = 0.0;
+            int64_t k = static_cast<int64_t>(1 - half) * L - (p + offset);
+            for (size_t j = 0; j < taps; ++j, k += L)
+            {
+                const double v = grid[static_cast<size_t>(k < 0 ? -k : k)];
+                row[j] = static_cast<D>(v);
+                sum += v;
+            }
+            if (std::abs(sum) > 1e-12)
+            {
+                const double inv = 1.0 / sum;
+                for (size_t j = 0; j < taps; ++j)
+                    row[j] = static_cast<D>(static_cast<double>(row[j]) * inv);
+            }
+        }
+    }
+
+    /**
      * @brief The rate ratio as L / M in lowest terms, when both are small
      * enough for an exact phase table; {0, 0} otherwise.
      */
@@ -631,9 +727,7 @@ private:
         {
             // Phase p is the kernel for fractional position p / L.
             stagedTable.resize(static_cast<size_t>(l * d.taps));
-            for (int64_t p = 0; p < l; ++p)
-                buildPhase(stagedTable.data() + p * d.taps, d,
-                           static_cast<double>(p) / static_cast<double>(l));
+            buildTable(stagedTable.data(), d, l, 0, l);
         }
         else
         {
@@ -641,9 +735,7 @@ private:
             // two after the last, so cubic interpolation across phases never
             // reads outside the table.
             stagedTable.resize(static_cast<size_t>((kTablePhases + 3) * d.taps));
-            for (int p = 0; p < kTablePhases + 3; ++p)
-                buildPhase(stagedTable.data() + static_cast<size_t>(p) * static_cast<size_t>(d.taps), d,
-                           static_cast<double>(p - 1) / static_cast<double>(kTablePhases));
+            buildTable(stagedTable.data(), d, kTablePhases, -1, kTablePhases + 3);
         }
         ChannelState stagedMono;
         initialiseChannelState(stagedMono, d.taps);
@@ -791,16 +883,18 @@ private:
         Quality quality = Quality::Normal;
         TwoStageShape shape;
         int fftSize = 0;              ///< Stage 1 overlap-save transform length.
-        int block = 0;                ///< Mid samples each transform yields.
+        int block = 0;                ///< Mid samples each frame yields (a transform packs two).
         bool exact2 = true;           ///< Stage 2 phases exact (rational ratio).
         int64_t phases2 = 1;          ///< Exact: fs_out / fs_mid = phases2 / step2.
         int64_t step2 = 1;
         double midStep = 1.0;         ///< Mid samples per output (table mode).
-        std::vector<double> spectrum1;   ///< Stage 1 kernel spectrum, fftSize + 2.
-        std::vector<double> table2;      ///< Stage 2 kernels, one row per phase.
-        std::optional<FFTReal<double>> fft;       ///< fftSize.
-        std::optional<FFTReal<double>> fftHalf;   ///< fftSize / 2 (zero-stuffed input).
-        std::vector<double> frame, spec, specHalf, mid;
+        std::vector<double> gain1;       ///< Stage 1 kernel spectrum (real), fftSize bins, 1/fftSize folded in.
+        std::vector<double> table2;      ///< Stage 2 kernels: in output order when exact, else by phase.
+        std::vector<int64_t> advance2;   ///< Exact: mid samples between output k and k + 1 of a cycle.
+        std::vector<int32_t> cycleOf2;   ///< Exact: cycle position of each phase.
+        std::optional<detail::fft::SplitFFT<double>> engine;       ///< fftSize complex points.
+        std::optional<detail::fft::SplitFFT<double>> engineHalf;   ///< fftSize / 2 (zero-stuffed input).
+        std::vector<double> mid;
     };
 
     /** @brief True when the offline call runs the two-stage engine (designs it if stale). */
@@ -854,19 +948,26 @@ private:
             h[static_cast<size_t>(t >= 0 ? t : n + t)] = sincVal * win;
             sum += sincVal * win;
         }
-        // The 1/n of the inverse transform is applied by FFTReal itself.
-        const double gain = static_cast<double>(s.up) / sum;
+        // The inverse transform's 1/n is folded into the gain.
+        const double gain = static_cast<double>(s.up) / (sum * static_cast<double>(n));
         for (auto& v : h) v *= gain;
-        p.fft.emplace(static_cast<size_t>(n));
-        p.spectrum1.assign(static_cast<size_t>(n) + 2, 0.0);
-        p.fft->forward(h.data(), p.spectrum1.data());
-        for (int k = 0; k <= n / 2; ++k)   // the imaginary parts are rounding
-            p.spectrum1[static_cast<size_t>(2 * k + 1)] = p.spectrum1[static_cast<size_t>(2 * k)];
-        if (s.up == 2)
         {
-            p.fftHalf.emplace(static_cast<size_t>(n / 2));
-            p.specHalf.assign(static_cast<size_t>(n / 2) + 2, 0.0);
+            FFTReal<double> fft(static_cast<size_t>(n));
+            std::vector<double> spec(static_cast<size_t>(n) + 2, 0.0);
+            fft.forward(h.data(), spec.data());
+            // The imaginary parts are rounding; the spectrum is even.
+            p.gain1.assign(static_cast<size_t>(n), 0.0);
+            for (int k = 0; k <= n / 2; ++k)
+            {
+                p.gain1[static_cast<size_t>(k)] = spec[static_cast<size_t>(2 * k)];
+                p.gain1[static_cast<size_t>((n - k) % n)] = spec[static_cast<size_t>(2 * k)];
+            }
         }
+        // Two frames per transform: one as the real part, the next as the
+        // imaginary part. The kernel is real, so the filtered frames come
+        // back as the real and imaginary parts of one inverse.
+        p.engine.emplace(static_cast<size_t>(n));
+        if (s.up == 2) p.engineHalf.emplace(static_cast<size_t>(n / 2));
 
         // Stage 2: exact phases when fs_out / fs_mid is a manageable fraction.
         const int64_t l = s.phases2, m = s.step2;
@@ -883,10 +984,21 @@ private:
         {
             p.phases2 = l;
             p.step2 = m;
+            // The rows follow the outputs: output k of a cycle of l outputs has
+            // phase (k * m) mod l, so the stage-2 loop reads the table front to
+            // back and steps its window by a precomputed advance (no division
+            // and no data-dependent branch per output).
             p.table2.resize(static_cast<size_t>(l * taps2));
-            for (int64_t ph = 0; ph < l; ++ph)
-                buildPhase(p.table2.data() + ph * taps2, s.stage2,
+            p.advance2.resize(static_cast<size_t>(l));
+            p.cycleOf2.resize(static_cast<size_t>(l));
+            for (int64_t k = 0; k < l; ++k)
+            {
+                const int64_t ph = (k * (m % l)) % l;
+                buildPhase(p.table2.data() + k * taps2, s.stage2,
                            static_cast<double>(ph) / static_cast<double>(l));
+                p.advance2[static_cast<size_t>(k)] = m / l + (ph + m % l >= l ? 1 : 0);
+                p.cycleOf2[static_cast<size_t>(ph)] = static_cast<int32_t>(k);
+            }
         }
         else
         {
@@ -896,61 +1008,70 @@ private:
                 buildPhase(p.table2.data() + static_cast<size_t>(ph) * static_cast<size_t>(taps2), s.stage2,
                            static_cast<double>(ph - 1) / static_cast<double>(kTwoStagePhases));
         }
-        p.frame.assign(static_cast<size_t>(n) + 2, 0.0);
-        p.spec.assign(static_cast<size_t>(n) + 2, 0.0);
-        // Room for the carried window, then one transform (see runTwoStage()).
-        p.mid.assign(static_cast<size_t>(taps2 + s.up + n), 0.0);
+        // Room for the carried window, then the two frames of one transform
+        // (see runTwoStage()).
+        p.mid.assign(static_cast<size_t>(taps2 + s.up + 2 * p.block), 0.0);
         p.ready = true;
         return p;
     }
 
     /**
-     * @brief Stage 1 for mid samples [s, s + block): the zero-stuffed input
-     * convolved with the centred stage-1 kernel (m[k] is the filtered signal
-     * at mid sample k). The transform's n samples go to `dst`; m[s + i] is
-     * dst[half1 + i] (the half1 samples on each side are circular wrap).
-     * `s - half1` is a multiple of `up`.
+     * @brief Stage 1 for mid samples [s, s + 2 * block): two frames of the
+     * zero-stuffed input convolved with the centred stage-1 kernel (m[k] is
+     * the filtered signal at mid sample k), m[s + i] written to dst[i].
+     *
+     * One complex transform carries both frames, the first as its real part
+     * and the second as its imaginary part. The kernel is real, so the
+     * product with its (real, even) spectrum keeps them apart and the inverse
+     * returns the two filtered frames as its real and imaginary parts. The
+     * inverse runs as the forward transform of the product with re and im
+     * swapped, and swaps them back on the way out. `s - half1` is a multiple
+     * of `up`.
      */
-    void twoStageBlock(const T* input, int inputLength, int64_t s, double* dst) noexcept
+    void twoStagePair(const T* input, int inputLength, int64_t s, double* dst) noexcept
     {
         TwoStagePlan& p = plan_;
-        const int n = p.fftSize, up = p.shape.up, half1 = p.shape.half1;
-        const int64_t q0 = (s - half1) / up;   // input sample on the frame's first slot (exact)
+        const int n = p.fftSize, up = p.shape.up, half1 = p.shape.half1, block = p.block;
         const int frameInputs = n / up;
-        const int64_t a = std::max<int64_t>(q0, 0);
-        const int64_t b = std::min<int64_t>(q0 + frameInputs, inputLength);
-        if (a >= b)
+        const int64_t q0 = (s - half1) / up;   // the first frame's first input (exact)
+        const int64_t q1 = q0 + block / up;    // and the second frame's
+        if (std::max<int64_t>(q0, 0) >= std::min<int64_t>(q1 + frameInputs, inputLength))
         {
-            std::fill(dst + half1, dst + half1 + p.block, 0.0);
+            std::fill(dst, dst + 2 * block, 0.0);
             return;
         }
-        double* fr = p.frame.data();
-        double* sp = p.spec.data();
-        const double* h = p.spectrum1.data();
-        std::fill(fr, fr + frameInputs, 0.0);
-        for (int64_t q = a; q < b; ++q)
-            fr[q - q0] = static_cast<double>(input[q]);
-        if (up == 1)
+        detail::fft::SplitFFT<double>& first = (up == 1) ? *p.engine : *p.engineHalf;
+        const auto load = [&](double* frame, int64_t q) noexcept {
+            const int64_t a = std::clamp<int64_t>(-q, 0, frameInputs);
+            const int64_t b = std::clamp<int64_t>(inputLength - q, a, frameInputs);
+            std::fill(frame, frame + a, 0.0);
+            for (int64_t t = a; t < b; ++t) frame[t] = static_cast<double>(input[q + t]);
+            std::fill(frame + b, frame + frameInputs, 0.0);
+        };
+        load(first.inRe(), q0);
+        load(first.inIm(), q1);
+        const double* zr = nullptr;
+        const double* zi = nullptr;
+        first.run(zr, zi);
+
+        // The zero-stuffed frames' spectrum is the half-length one repeated,
+        // Z[k] = Zh[k mod n/2]. Each bin is read before it is written, so the
+        // engine may hand back its own input buffers.
+        const double* g = p.gain1.data();
+        double* ir = p.engine->inRe();
+        double* ii = p.engine->inIm();
+        const int mask = n / up - 1;
+        for (int k = 0; k < n; ++k)
         {
-            p.fft->forward(fr, sp);
-            for (int i = 0; i < n + 2; ++i) sp[i] *= h[i];
+            const double re = zr[k & mask], im = zi[k & mask];
+            ir[k] = im * g[k];
+            ii[k] = re * g[k];
         }
-        else
-        {
-            // The zero-stuffed frame's spectrum is the half-length one
-            // repeated, X[k] = H[k mod n/2], with H[n/2 - k] = conj(H[k]).
-            const double* hs = p.specHalf.data();
-            p.fftHalf->forward(fr, p.specHalf.data());
-            const int half = n / 2, quarter = n / 4;
-            for (int i = 0; i < 2 * quarter + 2; ++i) sp[i] = hs[i] * h[i];
-            for (int k = quarter + 1; k <= half; ++k)
-            {
-                const int m = half - k;   // the mirror bin; k = half reads the DC
-                sp[2 * k] = hs[2 * m] * h[2 * k];
-                sp[2 * k + 1] = -hs[2 * m + 1] * h[2 * k];
-            }
-        }
-        p.fft->inverse(sp, dst);
+        const double* wr = nullptr;
+        const double* wi = nullptr;
+        p.engine->run(wr, wi);
+        std::copy(wi + half1, wi + half1 + block, dst);
+        std::copy(wr + half1, wr + half1 + block, dst + block);
     }
 
     /** @brief Stage 2, table mode: cubic interpolation across four phases. */
@@ -976,9 +1097,9 @@ private:
     /**
      * @brief Outputs firstOutput .. firstOutput + count of the two-stage
      * engine. Outputs whose combined window misses the input are exactly 0.
-     * Stage 1 runs one transform at a time into a rolling mid buffer: the
-     * stage-2 window carried over from the previous transform, then the new
-     * transform's samples (mid sample k at mid[k - origin]).
+     * Stage 1 runs one transform (two frames) at a time into a rolling mid
+     * buffer: the stage-2 window carried over from the previous transform,
+     * then the new transform's samples (mid sample k at mid[k - origin]).
      */
     void runTwoStage(const T* input, int inputLength, int64_t firstOutput, int64_t count, T* out)
     {
@@ -996,13 +1117,13 @@ private:
         const int up = p.shape.up, half1 = p.shape.half1, block = p.block;
         const int taps2 = p.shape.stage2.taps, half2 = taps2 / 2;
         const int carry = taps2 + up;          // room before the transform
+        const int64_t pairBlock = 2 * static_cast<int64_t>(block);   // mid samples per transform
         const int64_t l = p.phases2;
         const double midStep = p.midStep;
         // Mid samples that can differ from zero.
         const int64_t nzLo = -static_cast<int64_t>(half1);
         const int64_t nzHi = static_cast<int64_t>(up) * (inputLength - 1) + half1;
         double* const mid = p.mid.data();
-        const double* const table = p.table2.data();
         int64_t origin = 0, bufStart = 0, bufEnd = 0;
         bool haveBuf = false;
 
@@ -1048,47 +1169,64 @@ private:
             }
             if (!haveBuf || w0 >= bufEnd)
             {
-                // (Re)start on the fixed grid of transforms, half1 + j * block
-                // for any integer j: every call computes a mid sample with
-                // the same transform, so spans agree bit for bit. The grid
-                // puts an input sample on each frame's first slot (block is
-                // even).
+                // (Re)start on the fixed grid of transforms, half1 + j * 2 *
+                // block for any integer j: every call computes a mid sample
+                // with the same transform, so spans agree bit for bit. The
+                // grid puts an input sample on each frame's first slot (block
+                // is even).
                 const int64_t d = w0 - half1;
-                const int64_t j = d / block - ((d % block) < 0 ? 1 : 0);
-                bufStart = bufEnd = half1 + j * block;
+                const int64_t j = d / pairBlock - ((d % pairBlock) < 0 ? 1 : 0);
+                bufStart = bufEnd = half1 + j * pairBlock;
                 haveBuf = true;
             }
             while (bufEnd < w0 + taps2)
             {
-                // Park the part of the window already computed (fewer than
-                // taps2 samples), transform, put it back in front.
+                // Move the part of the window already computed (fewer than
+                // taps2 samples) in front of the new transform's samples.
                 const int64_t keep = std::max(w0, bufStart);
                 const int r = static_cast<int>(bufEnd - keep);
-                if (r > 0) std::copy(mid + (keep - origin), mid + (bufEnd - origin), mid);
-                twoStageBlock(input, inputLength, bufEnd, mid + carry);
-                if (r > 0) std::copy_backward(mid, mid + r, mid + carry + half1);
-                origin = bufEnd - (carry + half1);
+                if (r > 0) std::copy(mid + (keep - origin), mid + (bufEnd - origin), mid + (carry - r));
+                twoStagePair(input, inputLength, bufEnd, mid + carry);
+                origin = bufEnd - carry;
                 bufStart = keep;
-                bufEnd += block;
+                bufEnd += pairBlock;
             }
             // Every output whose window is now in the buffer.
             const int64_t last = std::min(bufEnd - taps2, nzHi);   // largest w0 served here
             if constexpr (Exact)
             {
-                const double* row = table + phase * taps2;
                 const double* src = mid + (w0 - origin);
-                const int64_t rowStep = remStep * taps2;
-                const int64_t rowWrap = l * taps2;
-                do
+                if constexpr (Pick)
                 {
-                    if constexpr (Pick) out[i++] = static_cast<T>(*src);
-                    else out[i++] = static_cast<T>(simd::dotProduct(row, src, taps2));
-                    src += wholeStep;
-                    w0 += wholeStep;
-                    row += rowStep;
-                    phase += remStep;
-                    if (phase >= l) { phase -= l; row -= rowWrap; ++src; ++w0; }
-                } while (i < count && w0 <= last);
+                    do
+                    {
+                        out[i++] = static_cast<T>(*src);
+                        src += wholeStep;
+                        w0 += wholeStep;
+                        phase += remStep;
+                        if (phase >= l) { phase -= l; ++src; ++w0; }
+                    } while (i < count && w0 <= last);
+                }
+                else
+                {
+                    // The table rows follow the outputs (see buildTwoStagePlan()),
+                    // so the loop walks them in order and steps the window by the
+                    // cycle's precomputed advances.
+                    const double* const rows = p.table2.data();
+                    const int64_t* const advance = p.advance2.data();
+                    int64_t k = p.cycleOf2[static_cast<size_t>(phase)];
+                    const double* row = rows + k * taps2;
+                    do
+                    {
+                        out[i++] = static_cast<T>(simd::dotProduct(row, src, taps2));
+                        const int64_t a = advance[k];
+                        src += a;
+                        w0 += a;
+                        row += taps2;
+                        if (++k == l) { k = 0; row = rows; }
+                    } while (i < count && w0 <= last);
+                    phase = (k * remStep) % l;
+                }
                 anchor = w0 + half2 - 1;
             }
             else

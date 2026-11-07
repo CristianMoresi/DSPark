@@ -1689,3 +1689,98 @@ DSPARK_TEST(PitchCorrector_low_latency_is_block_and_channel_exact)
     for (int i = 0; i < n; ++i)
         EXPECT_EQ(right[static_cast<std::size_t>(i)], 0.5f * left[static_cast<std::size_t>(i)]);
 }
+
+// The low-latency engine plays its input back at the correction ratio, so the
+// formants move with the pitch, and setFormantPreserve() used to change
+// nothing in it. With formants on it places one input period per corrected
+// period instead (pitch-synchronous overlap-add): G3 corrected five
+// semitones up keeps its envelope, and lands on C4.
+DSPARK_TEST(PitchCorrector_low_latency_formant_preserve_holds_the_envelope)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 0.9);
+    const auto input = vowelTone(midiToHz(55.0), fs, n);
+    const int from = 1024 + static_cast<int>(fs * 0.15);
+    const int count = 16384;
+    const auto reference = spectralCentroids(slice(input, from - 1024, count),
+                                             fs, 4096, 50.0, 8000.0);
+    Run run;
+    run.lowLatency = true;
+    run.mask = static_cast<std::uint16_t>(1u << 0);
+    const auto free = spectralCentroids(slice(render(input, run), from, count),
+                                        fs, 4096, 50.0, 8000.0);
+    run.formant = true;
+    const auto output = render(input, run);
+    const auto held = spectralCentroids(slice(output, from, count), fs, 4096, 50.0, 8000.0);
+    const double freeDrift = 100.0 * std::abs(free.envelope - reference.envelope) / reference.envelope;
+    const double heldDrift = 100.0 * std::abs(held.envelope - reference.envelope) / reference.envelope;
+    std::cout << "  [corrector formant] low latency: envelope drift " << freeDrift
+              << "% free, " << heldDrift << "% held\n";
+    EXPECT_GT(freeDrift, 20.0);
+    EXPECT_LT(heldDrift, 0.5 * freeDrift);
+    EXPECT_LT(100.0 * std::abs(held.raw - reference.raw) / reference.raw, 5.0);
+    EXPECT_LT(std::abs(centsBetween(estimateF0(slice(output, from, count), fs, 60.0, 1400.0),
+                                    midiToHz(60.0))), 1.0);
+}
+
+// The grain mode keeps the engine's other properties: the reported latency,
+// an exact delay at zero correction, a clean harmonic structure (60 to 69 dB
+// measured against the read head's 88 to 90 and the vocoder's 39 to 57), an
+// output that does not depend on the host's block size, and a restart on a
+// change of mode.
+DSPARK_TEST(PitchCorrector_low_latency_formant_mode_is_exact_and_clean)
+{
+    const double fs = 48000.0;
+    {
+        AudioSpec spec;
+        spec.sampleRate = fs;
+        spec.maxBlockSize = 256;
+        spec.numChannels = 1;
+        PitchCorrector<float> corrector;
+        corrector.setLowLatency(true);
+        corrector.setFormantPreserve(true);
+        corrector.prepare(spec);
+        EXPECT_EQ(corrector.getLatency(), 1024);
+        const int n = 3 * 1024 + 4096;
+        std::vector<float> x(static_cast<std::size_t>(n), 0.0f);
+        x[3000] = 1.0f;
+        for (int position = 0; position < n; position += 256)
+        {
+            float* pointer = x.data() + position;
+            corrector.processBlock(AudioBufferView<float>(&pointer, 1, std::min(256, n - position)));
+        }
+        for (int i = 0; i < n; ++i)
+            EXPECT_EQ(x[static_cast<std::size_t>(i)], i == 3000 + 1024 ? 1.0f : 0.0f);
+    }
+
+    const int segment = analysisSegment(fs);
+    const int offset = static_cast<int>(0.6 * fs);
+    for (int midi : { 41, 45, 57, 69 })
+    {
+        const auto input = vowelStimulus(midiToHz(midi + 0.30), fs, offset + segment + 2048);
+        Run run;
+        run.lowLatency = true;
+        run.formant = true;
+        const auto tail = slice(render(input, run), offset + 1024, segment);
+        const double measured = estimateF0(tail, fs, 40.0, 1400.0);
+        EXPECT_LT(std::abs(centsBetween(measured, midiToHz(midi))), 1.0);
+        EXPECT_GT(harmonicResidualDb(tail, fs, measured), 50.0);
+    }
+
+    const int n = 40000;
+    const auto input = harmonicTone(midiToHz(62.0 + 0.35), fs, n);
+    Run run;
+    run.lowLatency = true;
+    run.formant = true;
+    run.mask = kMajor;
+    run.retuneMs = 20.0;
+    run.block = 512;
+    const auto reference = render(input, run);
+    for (int block : { 1, 7, 100, 1024 })
+    {
+        run.block = block;
+        const auto other = render(input, run);
+        for (int i = 0; i < n; ++i)
+            EXPECT_EQ(other[static_cast<std::size_t>(i)], reference[static_cast<std::size_t>(i)]);
+    }
+}

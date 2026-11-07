@@ -27,12 +27,16 @@
  * unvoiced, and 92.0% of 400 at 10 dB (88.5% before), with octave errors
  * down from 6.8% to 0; a clean-room port of the method's frame stage scores
  * 87.3% and 92.0% on the same tones. At 0 dB SNR the detector reads
- * unvoiced rather than guess (that frame stage is right 30% of the time
- * there and wrong 70%). Noisy readings report their honest confidence, about
+ * unvoiced rather than guess (that frame stage is right 29% of the time
+ * there and wrong 71%); setNoiseSuppression() (opt-in) reads those tones 77%
+ * right and 9% wrong. Noisy readings report their honest confidence, about
  * 0.76 at 5 dB, so a confidence gate keeps ignoring them. Steady clean tones
- * read exactly as before; on clean material the changes are fewer octave
- * errors and a few windows across a legato note change that now read the
- * period they share, at reduced confidence.
+ * read exactly as before; on clean material the change is fewer octave
+ * errors. Across a legato note change two notes can share a longer period
+ * (four periods of one, five of the other); a window whose dip lies there
+ * reads unvoiced, not that period: on clean tones, sweeps and stepped
+ * melodies at three rates the wrong readings fall from 184 to 52 of 66090,
+ * with every correct reading kept.
  *
  * Threading:
  * - prepare(): setup thread (allocates; not concurrent with pushSamples()).
@@ -43,7 +47,8 @@
  *   independent atomics, so a reader may pair a fresh frequency with the
  *   previous confidence for one detection (benign for tracking/metering).
  * - setThreshold(): control thread (single-word relaxed atomic; non-finite
- *   values are ignored).
+ *   values are ignored). setNoiseSuppression(): control thread (relaxed
+ *   atomic, read once per detection).
  *
  * Dependencies: DspMath.h, FFT.h.
  */
@@ -169,6 +174,17 @@ public:
         corrTime_.assign(static_cast<size_t>(fftSize_), T(0));
         prefixSq_.assign(static_cast<size_t>(windowSize_) + 1, T(0));
 
+        // Noise floor suppression (setNoiseSuppression()): allocated whether
+        // or not it is on, so switching it is real-time safe.
+        cleanTime_.assign(static_cast<size_t>(windowSize_) * 2, T(0));
+        cleanSpec_.assign(static_cast<size_t>(windowSize_) * 2 + 2, T(0));
+        cleanPower_.assign(static_cast<size_t>(windowSize_) + 1, T(0));
+        cleanFloor_.assign(static_cast<size_t>((windowSize_ + kFloorBins) / kFloorBins), T(0));
+        cleanScratch_.assign(static_cast<size_t>(kFloorBins), T(0));
+        yinClean_.assign(static_cast<size_t>(halfWindow_), T(0));
+        rawClean_.assign(static_cast<size_t>(halfWindow_), T(0));
+        fftClean_ = std::make_unique<FFTReal<T>>(static_cast<size_t>(windowSize_) * 2);
+
         writePos_ = 0;
         samplesSinceLastDetect_ = 0;
 
@@ -292,6 +308,40 @@ public:
     }
 
     /**
+     * @brief Reads a tone through broadband noise (opt-in, default off).
+     *
+     * On: a steady window that reads unvoiced is read a second time with its
+     * noise floor removed by spectral subtraction (the floor estimated per
+     * band from the window itself, so white, pink and other smooth noises
+     * alike), and its period is kept when the cleaned window dips below the
+     * threshold. The reading's confidence stays the input's own dip at that
+     * period, about 0.5 at 0 dB SNR, so a confidence gate keeps ignoring it.
+     *
+     * Measured at 48 kHz on harmonic tones of 70 to 1000 Hz (random spectral
+     * tilt), readings within 50 cents, 400 tones: in white noise at 0 dB
+     * SNR 77% right and 9% wrong (off: unvoiced; the frame stage of the
+     * probabilistic-threshold method 29% and 71%), in pink noise 75% and 3%;
+     * 5 and 10 dB readings are those of the first reading or better.
+     *
+     * Noise alone: white and pink still read unvoiced, but band-limited noise
+     * reads voiced more often (a Q 2 band at 300 Hz 0% to 11% of windows, at
+     * confidence up to 0.61; a Q 5 band at 1 kHz 8% to 35%). The second read
+     * costs more than a detection: 20 to 91 ns per sample on white noise, the
+     * worst case; voiced windows are not read twice. Off, the output is
+     * unchanged. Control thread; relaxed atomic.
+     */
+    void setNoiseSuppression(bool on) noexcept
+    {
+        noiseSuppression_.store(on, std::memory_order_relaxed);
+    }
+
+    /** @brief Whether noise floor suppression is on (setNoiseSuppression()). */
+    [[nodiscard]] bool getNoiseSuppression() const noexcept
+    {
+        return noiseSuppression_.load(std::memory_order_relaxed);
+    }
+
+    /**
      * @return The analysis window (samples) in effect: the automatic choice if
      *         prepare() was called with windowSize <= 0, the clamped explicit
      *         request otherwise (member default 2048 before the first
@@ -321,40 +371,126 @@ private:
         // writePos_ points to the oldest sample in the mirrored buffer.
         const T* currentWindow = &buffer_[static_cast<size_t>(writePos_)];
 
-        // YIN-FFT difference function:
-        //   d(tau) = E1 + E2(tau) - 2*r(tau)
-        // with E1 = sum of x[0..W)^2 (constant), E2(tau) the energy of the
-        // shifted window (prefix sums), and r(tau) the cross-correlation of
-        // the first half against the full window - computed with 3 FFTs.
+        T energy = T(0), e1 = T(0);
+        if (!differenceFunction(currentWindow, yinBuffer_.data(), rawDiff_.data(), energy, e1))
+        {
+            publishUnvoiced();
+            return;
+        }
+
+        const T threshold = threshold_.load(std::memory_order_relaxed);
+        if (threshold != cachedThreshold_) updatePrior(threshold);
+        int partial[kMaxPartials];
+        int numPartial = 0;
+        const int tauEstimate = chooseDip(yinBuffer_.data(), partial, numPartial);
+
+        // Voicing: the chosen dip must be one the threshold prior accepts
+        // with probability at least kVoicedSurvival, a ceiling on its CMND
+        // value (0.30 at the default prior mean of 0.1). A periodic signal in
+        // white noise dips to about the noise share of the power (0.24 at
+        // 5 dB SNR); noise without a period has no dip near the ceiling
+        // (white noise bottoms out near 0.85). A dip above the threshold
+        // itself also needs a steady window, its two halves within
+        // kMinHalfEnergyRatio of each other in energy: across a note's start
+        // or end the dip is shallow for another reason, and the period read
+        // there is biased (measured 9 cents high a hop after a 220 Hz note
+        // stopped), so those windows stay unvoiced as under the single
+        // threshold. Nor may it be a period two notes of the window share
+        // (sharesItsPeriod()).
+        const double dip = (tauEstimate < 0) ? 1.0
+                         : static_cast<double>(yinBuffer_[static_cast<size_t>(tauEstimate)]);
+        const double firstHalf = static_cast<double>(e1);
+        const double secondHalf = static_cast<double>(energy) - firstHalf;
+        const bool steady = std::min(firstHalf, secondHalf)
+                          >= kMinHalfEnergyRatio * std::max(firstHalf, secondHalf);
+        const bool voiced = tauEstimate >= 0 && dip < voicingCeiling_
+            && (dip < static_cast<double>(threshold)
+                || (steady && !sharesItsPeriod(currentWindow, tauEstimate, partial, numPartial)));
+        if (voiced)
+        {
+            // Sub-sample precision from the raw difference function (see
+            // parabolicInterp()); the CMND only selects the dip.
+            publish(parabolicInterp(rawDiff_.data(), tauEstimate),
+                    std::clamp(T(1) - yinBuffer_[static_cast<size_t>(tauEstimate)], T(0), T(1)));
+            return;
+        }
+
+        // Noise floor suppression (opt-in): a steady window that reads
+        // unvoiced is read again with its broadband noise removed, and kept
+        // only for a dip below the threshold there.
+        if (noiseSuppression_.load(std::memory_order_relaxed) && steady)
+        {
+            const T* clean = suppressNoise(currentWindow);
+            T cleanEnergy = T(0), cleanFirst = T(0);
+            if (differenceFunction(clean, yinClean_.data(), rawClean_.data(), cleanEnergy, cleanFirst))
+            {
+                int unused[kMaxPartials];
+                int numUnused = 0;
+                const int tau = chooseDip(yinClean_.data(), unused, numUnused);
+                if (tau >= 0 && yinClean_[static_cast<size_t>(tau)] < threshold)
+                {
+                    // The confidence is the input's own dip at that period:
+                    // a reading taken through the noise stays a low-confidence
+                    // one (about 0.5 at 0 dB SNR).
+                    publish(parabolicInterp(rawClean_.data(), tau),
+                            std::clamp(T(1) - yinBuffer_[static_cast<size_t>(tau)], T(0), T(1)));
+                    return;
+                }
+            }
+        }
+        publishUnvoiced();
+    }
+
+    void publish(T period, T confidence) noexcept
+    {
+        frequency_.store(static_cast<T>(sampleRate_) / period, std::memory_order_relaxed);
+        confidence_.store(confidence, std::memory_order_relaxed);
+    }
+
+    void publishUnvoiced() noexcept
+    {
+        frequency_.store(T(0), std::memory_order_relaxed);
+        confidence_.store(T(0), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief YIN's difference function and its cumulative mean normalised
+     *        form (CMND) for one window, by FFT cross-correlation.
+     *
+     *   d(tau) = E1 + E2(tau) - 2 r(tau)
+     *
+     * with E1 the energy of x[0..W) (constant), E2(tau) that of the shifted
+     * window (prefix sums), and r(tau) the cross-correlation of the first half
+     * against the full window, computed with 3 FFTs.
+     *
+     * @return False for a silent or non-finite window (nothing to read).
+     */
+    bool differenceFunction(const T* window, T* yin, T* raw, T& energy, T& e1) noexcept
+    {
         const int W = halfWindow_;
 
         // (a) prefix sums of squared samples over the full window
         prefixSq_[0] = T(0);
         for (int i = 0; i < windowSize_; ++i)
             prefixSq_[static_cast<size_t>(i + 1)] =
-                prefixSq_[static_cast<size_t>(i)] + currentWindow[i] * currentWindow[i];
+                prefixSq_[static_cast<size_t>(i)] + window[i] * window[i];
 
         // Silence check on the window energy, the last prefix sum. It spans
         // the whole window, so it doubles as the non-finite gate: with any
-        // NaN/Inf sample present the old code filled the CMND with zeros
-        // ((NaN > 0) is false) and published fs/2 at confidence 1.0 - a fake
-        // detection with maximum confidence. Report unvoiced instead; the
-        // bad samples flush out of the window on their own.
-        const T energy = prefixSq_[static_cast<size_t>(windowSize_)];
-        if (energy < T(1e-10) || !std::isfinite(energy))
-        {
-            frequency_.store(T(0), std::memory_order_relaxed);
-            confidence_.store(T(0), std::memory_order_relaxed);
-            return;
-        }
-        const T e1 = prefixSq_[static_cast<size_t>(W)];
+        // NaN/Inf sample present the CMND would be all zeros ((NaN > 0) is
+        // false) and read fs/2 at confidence 1.0 - a fake detection with
+        // maximum confidence. Report unvoiced instead; the bad samples flush
+        // out of the window on their own.
+        energy = prefixSq_[static_cast<size_t>(windowSize_)];
+        if (energy < T(1e-10) || !std::isfinite(energy)) return false;
+        e1 = prefixSq_[static_cast<size_t>(W)];
 
         // (b) r(tau) via FFT cross-correlation: IFFT(conj(FFT(first half)) * FFT(window))
-        std::copy(currentWindow, currentWindow + W, fftTime_.begin());
+        std::copy(window, window + W, fftTime_.begin());
         std::fill(fftTime_.begin() + W, fftTime_.end(), T(0));
         fft_->forward(fftTime_.data(), specHalf_.data());
 
-        std::copy(currentWindow, currentWindow + windowSize_, fftTime_.begin());
+        std::copy(window, window + windowSize_, fftTime_.begin());
         fft_->forward(fftTime_.data(), specFull_.data());   // tail beyond the window is still zero
 
         const int numBins = fftSize_ / 2 + 1;
@@ -373,48 +509,53 @@ private:
         // (c) CMND from the closed-form difference function. While the
         // running sum is zero the window has no energy at those lags, which
         // is 0/0 and no evidence of a period, so it is the neutral 1.
-        const T threshold = threshold_.load(std::memory_order_relaxed);
-        yinBuffer_[0] = T(1);
+        yin[0] = T(1);
         T runningSum = T(0);
-
         for (int tau = 1; tau < W; ++tau)
         {
             const T e2 = prefixSq_[static_cast<size_t>(tau + W)] - prefixSq_[static_cast<size_t>(tau)];
             T d = e1 + e2 - T(2) * corrTime_[static_cast<size_t>(tau)];
             if (d < T(0)) d = T(0); // guard tiny negative round-off
 
-            rawDiff_[static_cast<size_t>(tau)] = d;
+            raw[tau] = d;
             runningSum += d;
-            yinBuffer_[static_cast<size_t>(tau)] =
-                (runningSum > T(0)) ? d * static_cast<T>(tau) / runningSum : T(1);
+            yin[tau] = (runningSum > T(0)) ? d * static_cast<T>(tau) / runningSum : T(1);
         }
+        return true;
+    }
 
-        // (d) Candidate selection over a distribution of thresholds (the
-        // frame stage of Mauch & Dixon 2014). A threshold s picks the first
-        // local minimum of the CMND below s, so scanning the minima in lag
-        // order, a minimum that is lower than every earlier one is picked by
-        // exactly the thresholds in (its value, the previous record]: its
-        // probability is the prior mass of that interval. Thresholds below
-        // the deepest minimum pick nothing and hand kAbsoluteMinWeight of
-        // their mass to the deepest minimum. The most probable candidate
-        // wins; ties go to the shorter lag, as the first-dip rule does.
-        //
-        // A dip is valued at the vertex of the parabola through its three
-        // samples: a period that falls between two lags (a high note, a
-        // sweep) has a shallow sample at its true minimum, and valued at the
-        // samples an exact-integer multiple of it outvoted it (measured: a
-        // 3.3 kHz sawtooth at 44.1 kHz read an octave low at confidence
-        // 0.997). At a strict minimum the vertex lies within half a lag and
-        // its value is at least c1 - |c0 - c2| / 8; that bound, in the sample
-        // type and loosened by kScreenSlack (far above its rounding error),
-        // rejects nearly every lag before the exact test in double. The
-        // screen is branch-free on purpose: on noise the minima fall at
-        // random lags.
-        if (threshold != cachedThreshold_) updatePrior(threshold);
+    /**
+     * @brief Candidate selection over a distribution of thresholds (the frame
+     *        stage of Mauch & Dixon 2014); returns the chosen lag, or -1.
+     *
+     * A threshold s picks the first local minimum of the CMND below s, so
+     * scanning the minima in lag order, a minimum that is lower than every
+     * earlier one is picked by exactly the thresholds in (its value, the
+     * previous record]: its probability is the prior mass of that interval.
+     * Thresholds below the deepest minimum pick nothing and hand
+     * kAbsoluteMinWeight of their mass to the deepest minimum. The most
+     * probable candidate wins; ties go to the shorter lag, as the first-dip
+     * rule does. The records below kPartialLevel go to `partial` (at most
+     * kMaxPartials), for sharesItsPeriod().
+     *
+     * A dip is valued at the vertex of the parabola through its three
+     * samples: a period that falls between two lags (a high note, a sweep)
+     * has a shallow sample at its true minimum, and valued at the samples an
+     * exact-integer multiple of it outvoted it (measured: a 3.3 kHz sawtooth
+     * at 44.1 kHz read an octave low at confidence 0.997). At a strict
+     * minimum the vertex lies within half a lag and its value is at least
+     * c1 - |c0 - c2| / 8; that bound, in the sample type and loosened by
+     * kScreenSlack (far above its rounding error), rejects nearly every lag
+     * before the exact test in double. The screen is branch-free on purpose:
+     * on noise the minima fall at random lags.
+     */
+    [[nodiscard]] int chooseDip(const T* c, int* partial, int& numPartial) const noexcept
+    {
+        const int W = halfWindow_;
         int bestTau = -1, lastTau = -1;
         double bestMass = -1.0, lastMass = 0.0, recordValue = 1.0, recordSurvival = 0.0;
         T screen = T(1) + kScreenSlack;
-        const T* c = yinBuffer_.data();
+        numPartial = 0;
         for (int tau = 2; tau + 1 < W; ++tau)
         {
             const T c0 = c[tau - 1], c1 = c[tau], c2 = c[tau + 1];
@@ -430,6 +571,7 @@ private:
             lastTau = tau;
             recordValue = v;
             recordSurvival = s;
+            if (v < kPartialLevel && numPartial < kMaxPartials) partial[numPartial++] = tau;
             screen = static_cast<T>(v) + kScreenSlack;
 
             // Every later candidate shares at most the prior mass below this
@@ -449,41 +591,105 @@ private:
             lastMass += kAbsoluteMinWeight * (1.0 - recordSurvival);
             if (lastMass > bestMass) { bestMass = lastMass; bestTau = lastTau; }
         }
+        return bestTau;
+    }
 
-        // Voicing: the chosen dip must be one the threshold prior accepts
-        // with probability at least kVoicedSurvival, a ceiling on its CMND
-        // value (0.30 at the default prior mean of 0.1). A periodic signal in
-        // white noise dips to about the noise share of the power (0.24 at
-        // 5 dB SNR); noise without a period has no dip near the ceiling
-        // (white noise bottoms out near 0.85). A dip above the threshold
-        // itself also needs a steady window, its two halves within
-        // kMinHalfEnergyRatio of each other in energy: across a note's start
-        // or end the dip is shallow for another reason, and the period read
-        // there is biased (measured 9 cents high a hop after a 220 Hz note
-        // stopped), so those windows stay unvoiced as under the single
-        // threshold.
-        const int tauEstimate = bestTau;
-        const double dip = (tauEstimate < 0) ? 1.0
-                         : static_cast<double>(yinBuffer_[static_cast<size_t>(tauEstimate)]);
-        const double firstHalf = static_cast<double>(e1);
-        const double secondHalf = static_cast<double>(energy) - firstHalf;
-        const bool steady = std::min(firstHalf, secondHalf)
-                          >= kMinHalfEnergyRatio * std::max(firstHalf, secondHalf);
-        if (tauEstimate < 0 || !(dip < voicingCeiling_)
-            || (!(dip < static_cast<double>(threshold)) && !steady))
+    /**
+     * @brief The window with its broadband noise floor removed (spectral
+     *        subtraction), for the opt-in second reading.
+     *
+     * The window, zero-padded to twice its length, is transformed; the noise
+     * floor of each band of kFloorBins bins is the median power there over
+     * ln 2 (the median of a noise bin's exponential power distribution),
+     * interpolated across bands, so it follows coloured noise; each bin keeps
+     * max(0, 1 - kOverSubtraction * floor / power) of itself. A harmonic's
+     * bins stand far above the floor (its power is concentrated, the noise's
+     * spread over the band) and pass almost untouched; noise-only bins go to
+     * zero. Model-free: no training, no assumption on the source beyond a
+     * floor that is smooth across a band.
+     */
+    const T* suppressNoise(const T* window) noexcept
+    {
+        const int n = windowSize_;
+        std::copy(window, window + n, cleanTime_.begin());
+        std::fill(cleanTime_.begin() + n, cleanTime_.end(), T(0));
+        fftClean_->forward(cleanTime_.data(), cleanSpec_.data());
+        const int bins = n + 1;
+        for (int k = 0; k < bins; ++k)
         {
-            frequency_.store(T(0), std::memory_order_relaxed);
-            confidence_.store(T(0), std::memory_order_relaxed);
-            return;
+            const T re = cleanSpec_[static_cast<size_t>(2 * k)], im = cleanSpec_[static_cast<size_t>(2 * k + 1)];
+            cleanPower_[static_cast<size_t>(k)] = re * re + im * im;
         }
+        const int bands = (bins + kFloorBins - 1) / kFloorBins;
+        for (int b = 0; b < bands; ++b)
+        {
+            const int lo = b * kFloorBins, hi = std::min(bins, lo + kFloorBins);
+            std::copy(cleanPower_.begin() + lo, cleanPower_.begin() + hi, cleanScratch_.begin());
+            const auto mid = cleanScratch_.begin() + (hi - lo) / 2;
+            std::nth_element(cleanScratch_.begin(), mid, cleanScratch_.begin() + (hi - lo));
+            cleanFloor_[static_cast<size_t>(b)] = *mid * T(1.4426950408889634);   // / ln 2
+        }
+        for (int k = 0; k < bins; ++k)
+        {
+            // The band floors sit at the band centres; linear in between.
+            const double u = (static_cast<double>(k) + 0.5) / kFloorBins - 0.5;
+            const int b0 = std::clamp(static_cast<int>(std::floor(u)), 0, bands - 1);
+            const int b1 = std::min(b0 + 1, bands - 1);
+            const T frac = static_cast<T>(std::clamp(u - static_cast<double>(b0), 0.0, 1.0));
+            const T floorK = cleanFloor_[static_cast<size_t>(b0)]
+                           + frac * (cleanFloor_[static_cast<size_t>(b1)] - cleanFloor_[static_cast<size_t>(b0)]);
+            const T power = cleanPower_[static_cast<size_t>(k)];
+            const T gain = power > T(0) ? std::max(T(0), T(1) - T(kOverSubtraction) * floorK / power) : T(0);
+            cleanSpec_[static_cast<size_t>(2 * k)] *= gain;
+            cleanSpec_[static_cast<size_t>(2 * k + 1)] *= gain;
+        }
+        fftClean_->inverse(cleanSpec_.data(), cleanTime_.data());
+        return cleanTime_.data();
+    }
 
-        // Sub-sample precision from the raw difference function (see
-        // parabolicInterp()); the CMND only selects the dip.
-        T betterTau = parabolicInterp(tauEstimate);
-        T finalConfidence = std::clamp(T(1) - yinBuffer_[static_cast<size_t>(tauEstimate)], T(0), T(1));
-
-        frequency_.store(static_cast<T>(sampleRate_) / betterTau, std::memory_order_relaxed);
-        confidence_.store(finalConfidence, std::memory_order_relaxed);
+    /**
+     * @brief True when the dip at `tau` is a period two different signals in
+     *        the window share rather than the period of one.
+     *
+     * Across a note change the two notes can share a longer period (4 periods
+     * of one, 5 of the other, a major third apart): both halves of the window
+     * repeat at that lag, so its dip is moderately deep, while each note's
+     * own period, a divisor of it, repeats in one half only. A steady tone
+     * whose period is `tau` repeats the same way in both halves at every lag,
+     * so a divisor's difference is about equal in them. The test looks at the
+     * earlier minima deep enough to be a partial period (kPartialLevel) that
+     * divide `tau`, and compares the normalised difference of the two halves
+     * of the window at each: one half repeating where the other does not
+     * (kStationaryRatio) marks the shared period. Direct sums over the
+     * window, a few per detection, only for dips above the threshold.
+     */
+    [[nodiscard]] bool sharesItsPeriod(const T* x, int tau, const int* partial, int count) const noexcept
+    {
+        const int W = halfWindow_;
+        const int H = W / 2;
+        for (int r = 0; r < count; ++r)
+        {
+            const int lag = partial[r];
+            if (lag >= tau) break;
+            const int k = static_cast<int>(std::lround(static_cast<double>(tau) / static_cast<double>(lag)));
+            if (k < 2 || std::abs(static_cast<double>(tau - k * lag)) > 0.02 * static_cast<double>(k * lag) + 1.0)
+                continue;
+            double part[2] = { 0.0, 0.0 };
+            for (int h = 0; h < 2; ++h)
+            {
+                double diff = 0.0, power = 0.0;
+                for (int j = h * H; j < (h + 1) * H; ++j)
+                {
+                    const double a = static_cast<double>(x[j]), b = static_cast<double>(x[j + lag]);
+                    diff += (a - b) * (a - b);
+                    power += a * a + b * b;
+                }
+                part[h] = power > 0.0 ? diff / power : 1.0;
+            }
+            if (std::min(part[0], part[1]) < kStationaryRatio * std::max(part[0], part[1]))
+                return true;
+        }
+        return false;
     }
 
     /**
@@ -499,21 +705,21 @@ private:
      * harmonics sharpening the dip: 2.6 cents at worst over the starting phase
      * for a 1/h harmonic tone at 1760 Hz, against 0.01 cent for a pure one.
      */
-    [[nodiscard]] T parabolicInterp(int tau) const noexcept
+    [[nodiscard]] T parabolicInterp(const T* raw, int tau) const noexcept
     {
         if (tau < 2 || tau >= halfWindow_ - 1)
             return static_cast<T>(tau);
 
         // Centre on the raw function's own lowest sample next to the CMND dip.
         const int centre = tau;
-        if (rawDiff_[static_cast<size_t>(centre - 1)] < rawDiff_[static_cast<size_t>(tau)]) tau = centre - 1;
-        if (rawDiff_[static_cast<size_t>(centre + 1)] < rawDiff_[static_cast<size_t>(tau)]) tau = centre + 1;
+        if (raw[centre - 1] < raw[tau]) tau = centre - 1;
+        if (raw[centre + 1] < raw[tau]) tau = centre + 1;
         if (tau < 2 || tau >= halfWindow_ - 1)
             return static_cast<T>(tau);
 
-        const double s0 = static_cast<double>(rawDiff_[static_cast<size_t>(tau - 1)]);
-        const double s1 = static_cast<double>(rawDiff_[static_cast<size_t>(tau)]);
-        const double s2 = static_cast<double>(rawDiff_[static_cast<size_t>(tau + 1)]);
+        const double s0 = static_cast<double>(raw[tau - 1]);
+        const double s1 = static_cast<double>(raw[tau]);
+        const double s2 = static_cast<double>(raw[tau + 1]);
 
         const double denom = s0 - 2.0 * s1 + s2;
 
@@ -574,6 +780,18 @@ private:
     /// Highest voicing ceiling: a dip at half the mean difference or above
     /// (noise power equal to the signal's) never reads voiced.
     static constexpr double kMaxVoicingCeiling = 0.5;
+    /// Deepest normalised difference of an earlier minimum that the
+    /// shared-period test (sharesItsPeriod()) considers a partial period.
+    static constexpr double kPartialLevel = 0.75;
+    /// Ratio of the window halves' differences at a partial period below
+    /// which one half repeats there and the other does not.
+    static constexpr double kStationaryRatio = 0.25;
+    /// Partial periods a detection keeps for that test.
+    static constexpr int kMaxPartials = 16;
+    /// Bins per band of the noise floor estimate (375 Hz at the automatic window).
+    static constexpr int kFloorBins = 32;
+    /// Over-subtraction of the noise floor: bins below twice the floor go to zero.
+    static constexpr double kOverSubtraction = 2.0;
 
     /// Automatic-window policy: the span 2048 samples cover at 48 kHz,
     /// resolved inside [512, 16384] (covers 8 kHz .. 384 kHz without clamping).
@@ -612,6 +830,17 @@ private:
     std::vector<T> specFull_;   // Size: fftSize_ + 2
     std::vector<T> corrTime_;   // Size: fftSize_
     std::vector<T> prefixSq_;   // Size: windowSize_ + 1
+
+    // Noise floor suppression (see suppressNoise())
+    std::atomic<bool> noiseSuppression_{ false };
+    std::unique_ptr<FFTReal<T>> fftClean_;   // 2 * windowSize_
+    std::vector<T> cleanTime_;    // Size: 2 * windowSize_ (the cleaned window first)
+    std::vector<T> cleanSpec_;    // Size: 2 * windowSize_ + 2
+    std::vector<T> cleanPower_;   // Size: windowSize_ + 1
+    std::vector<T> cleanFloor_;   // One floor per band of kFloorBins bins
+    std::vector<T> cleanScratch_; // Size: kFloorBins
+    std::vector<T> yinClean_;     // Size: halfWindow_
+    std::vector<T> rawClean_;     // Size: halfWindow_
 };
 
 } // namespace dspark

@@ -1191,7 +1191,7 @@ struct NoiseSource
 /// more.
 struct NoisyToneScore { int correct = 0, octave = 0, confidentWrong = 0, voiced = 0; };
 
-NoisyToneScore scoreNoisyTones(double snrDb)
+NoisyToneScore scoreNoisyTones(double snrDb, bool suppression = false)
 {
     NoisyToneScore score;
     NoiseSource rng { 2024u };
@@ -1218,6 +1218,7 @@ NoisyToneScore scoreNoisyTones(double snrDb)
 
         PitchDetector<float> pd;
         pd.prepare(48000.0);
+        pd.setNoiseSuppression(suppression);
         pd.pushSamples(std::span<const float>(x.data(), x.size()));
         const double hz = static_cast<double>(pd.getFrequencyHz());
         if (hz <= 0.0) continue;
@@ -1322,6 +1323,96 @@ DSPARK_TEST(PitchDetector_noise_alone_reads_unvoiced)
         }
         PitchDetector<float> pd;
         pd.prepare(48000.0);
+        int voiced = 0;
+        for (size_t at = 0; at + 512 <= x.size(); at += 512)
+        {
+            pd.pushSamples(std::span<const float>(x.data() + at, 512));
+            if (pd.getFrequencyHz() > 0.0f) ++voiced;
+        }
+        EXPECT_EQ(voiced, 0);
+    }
+}
+
+// Across a legato step the window can hold two notes whose periods share a
+// longer one (4 periods of B5 are 5 of D#6): the dip there was moderately
+// deep in both halves and read at confidence 0.75 to 0.89, two octaves or
+// more below both notes. Each note's own period repeats in one half only,
+// which marks the shared period; no reading lands outside the window's notes.
+DSPARK_TEST(PitchDetector_legato_change_reads_no_shared_period)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 3.0);
+    for (const double base : { 987.8, 1760.0 })
+    {
+        std::vector<float> x(static_cast<size_t>(n));
+        std::vector<double> inst(static_cast<size_t>(n));
+        double phase = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double f = base * std::pow(2.0, ((i / 6000) % 5) / 12.0);
+            inst[static_cast<size_t>(i)] = f;
+            phase += 2.0 * pi<double> * f / fs;
+            double s = 0.0;
+            for (int k = 1; k <= 30 && k * f < 0.45 * fs; ++k) s += std::sin(k * phase) / k;
+            x[static_cast<size_t>(i)] = static_cast<float>(0.3 * s);
+        }
+        PitchDetector<float> pd;
+        pd.prepare(fs);
+        const int window = pd.getWindowSize();
+        int voiced = 0, wrong = 0;
+        for (int at = 0; at + 256 <= n; at += 256)
+        {
+            pd.pushSamples(std::span<const float>(x.data() + at, 256));
+            const double hz = static_cast<double>(pd.getFrequencyHz());
+            if (hz <= 0.0) continue;
+            ++voiced;
+            const int p = ((at + 256) / pd.getHopSize()) * pd.getHopSize();
+            bool held = false;
+            for (int i = std::max(0, p - window); i < p && !held; i += 4)
+                held = std::abs(1200.0 * std::log2(hz / inst[static_cast<size_t>(i)])) < 50.0;
+            if (!held) ++wrong;
+        }
+        std::cout << "  [pitch legato] " << base << " Hz steps: " << voiced << " voiced, " << wrong << " off\n";
+        EXPECT_GT(voiced, 450);
+        EXPECT_EQ(wrong, 0);
+    }
+}
+
+// At 0 dB SNR the dip at the period sits at about half the mean difference,
+// above any voicing ceiling: the detector reads unvoiced, and a frame stage
+// that always reads is wrong two times in three there. With noise floor
+// suppression a steady window that reads unvoiced is read again with its
+// noise removed: 31 of these 40 tones read right (76% of 400 measured, 10%
+// wrong), at the input's own confidence, about 0.5. Off, nothing changes.
+DSPARK_TEST(PitchDetector_noise_suppression_reads_through_0_db_noise)
+{
+    const NoisyToneScore off = scoreNoisyTones(0.0, false);
+    const NoisyToneScore on = scoreNoisyTones(0.0, true);
+    std::cout << "  [pitch noise] 0 dB SNR: off " << off.voiced << " voiced, on "
+              << on.correct << "/40 correct, " << on.voiced - on.correct << " wrong\n";
+    EXPECT_EQ(off.voiced, 0);
+    EXPECT_GT(on.correct, 24);
+    EXPECT_LT(on.voiced - on.correct, 7);
+    EXPECT_EQ(on.confidentWrong, 0);
+    // 5 dB readings stay those of the first reading or better.
+    EXPECT_TRUE(scoreNoisyTones(5.0, true).correct >= scoreNoisyTones(5.0, false).correct);
+
+    // White and pink noise alone stay unvoiced.
+    PitchDetector<float> pd;
+    pd.prepare(48000.0);
+    pd.setNoiseSuppression(true);
+    EXPECT_TRUE(pd.getNoiseSuppression());
+    for (const double pole : { 0.0, 0.9 })
+    {
+        NoiseSource rng { 91u };
+        std::vector<float> x(96000);
+        double state = 0.0;
+        for (auto& v : x)
+        {
+            state = pole * state + rng.gauss();
+            v = static_cast<float>(0.05 * state);
+        }
+        pd.reset();
         int voiced = 0;
         for (size_t at = 0; at + 512 <= x.size(); at += 512)
         {

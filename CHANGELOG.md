@@ -157,11 +157,14 @@ All notable user-facing changes to DSPark are documented here.
   four with AVX2 (chosen at run time on x86-64). It returns `read()`'s values,
   operation for operation (bit for bit where the compiler does not contract
   multiply-adds). At 440 Hz with the level crossfade active, float, phase
-  accumulation included: 2.4 ns per sample with AVX2 and 3.5 ns with SSE2,
+  accumulation included: 2.3 ns per sample with AVX2 and 3.0 ns with SSE2,
   against 14 ns for `read()`; 4.1 ns with AVX2 when the frame position moves
-  every sample. `Synthesizer`'s wavetable engine reads through it: 28.7 to
-  14.7 ns per voice and frame (one oscillator), 153 to 52 (two oscillators,
-  unison 4), output unchanged.
+  every sample. On one level (no crossfade) 1.9 and 2.4 ns, against 2.5 ns
+  for a 4-point cubic reader of one table. The SSE2, NEON and AVX2 kernels
+  share one source over each instruction set's lane operations.
+  `Synthesizer`'s wavetable engine reads through it: 28.7 to 14.7 ns per voice
+  and frame (one oscillator), 153 to 52 (two oscillators, unison 4), output
+  unchanged.
 - `PitchCorrector::setLowLatency()` (opt-in, default off; state key
   `lowLatency`): a pitch-synchronous splice engine instead of the phase
   vocoder. Latency 1024 samples at 44.1/48 kHz (21.3 ms at 48 kHz, the same
@@ -169,9 +172,13 @@ All notable user-facing changes to DSPark are documented here.
   plays, so a hard snap holds a +-40 cent vibrato on its note at 1.3 cents rms
   (the default engine 36 cents, a reference time-domain corrector 5.5), and a
   corrected sustained vowel keeps an 87-90 dB harmonic-to-residual ratio
-  (vocoder 39-57 dB). At zero correction it is an exact delay. Formant
-  preservation does not apply in this mode. The default engine and its output
-  are unchanged (bit-identical).
+  (vocoder 39-57 dB). At zero correction it is an exact delay. With
+  `setFormantPreserve(true)` it renders by pitch-synchronous overlap-add and
+  keeps the spectral envelope: a G3 vowel corrected five semitones up keeps
+  its envelope centroid within 8% and its spectral centroid within 1% (the
+  read head +20% and +25%), at a 59-69 dB harmonic-to-residual ratio and 49
+  ns per sample. The default engine and its output are unchanged
+  (bit-identical).
 - `Resampler::setOfflineEngine(OfflineEngine::TwoStage)` (opt-in; `Direct`
   stays the default, so default audio is unchanged): `process()` and
   `processRange()` band-limit the input by FFT convolution (at the input rate,
@@ -179,16 +186,31 @@ All notable user-facing changes to DSPark are documented here.
   and change the rate with a 22-34 tap kernel. Every tier keeps Direct's
   passband edge, image and alias rejection and in-band tone residual, or
   improves them (Ultra, 96 to 44.1 kHz: alias of stopband tones -218 dB
-  instead of -209). Double, ns per input sample once prepared, Direct to
-  TwoStage: Ultra 26.2 to 4.0 (96 to 44.1 kHz), 26.9 to 7.0 (48 to 44.1),
-  27.7 to 8.0 (44.1 to 48), 60.3 to 12.8 (44.1 to 96); High 16.4 to 3.8,
-  16.6 to 6.7, 20.4 to 7.5, 42.1 to 11.4. Both instantiations compute in
-  double, so float output is limited by its own rounding (48 to 96 kHz High,
-  20 kHz tone: image residual -162.9 dB instead of -141.0). On in-band
-  material the two engines agree to -152 dB (High) and -222 dB (Ultra);
-  `processRange()` spans agree with each other and with `process()` bit for
-  bit; `getReach()` follows the engine in force. New constant
+  instead of -209). Double, ns per input sample once prepared, into caller
+  storage, Direct to TwoStage: Ultra 26.2 to 3.3 (96 to 44.1 kHz), 26.9 to
+  5.5 (48 to 44.1), 27.7 to 6.2 (44.1 to 48), 60.3 to 9.3 (44.1 to 96); High
+  16.4 to 3.0, 16.6 to 5.0, 20.4 to 5.4, 42.1 to 7.9. Both instantiations
+  compute in double, so float output is limited by its own rounding (48 to 96
+  kHz High, 20 kHz tone: image residual -162.9 dB instead of -141.0). On
+  in-band material the two engines agree to -152 dB (High) and -222 dB
+  (Ultra); `processRange()` spans agree with each other and with `process()`
+  bit for bit; `getReach()` follows the engine in force. New constant
   `Resampler::kMaxTwoStageOrder`.
+- `Resampler::process(input, inputLength, output, outputCapacity)`: the
+  offline conversion into caller storage, the vector form's samples bit for
+  bit (truncated to the capacity). It allocates nothing once the offline
+  engine is designed.
+- `PitchDetector::setNoiseSuppression()` (opt-in, default off; the output is
+  unchanged off): a steady window that reads unvoiced is read again with its
+  noise floor removed by spectral subtraction (the floor estimated per band
+  from the window itself). Harmonic tones of 70 to 1000 Hz at 0 dB SNR, 400
+  tones, readings within 50 cents: white noise 77% right and 9% wrong (off:
+  unvoiced; the frame stage of the probabilistic-threshold method 29% and
+  71%), pink noise 75% and 3%; 5 and 10 dB unchanged or better. The reading
+  keeps the input's own confidence (about 0.5 at 0 dB), so a confidence gate
+  still ignores it. Band-limited noise alone reads voiced more often (a Q 2
+  band at 300 Hz 0% to 11% of windows, at confidence up to 0.61). CPU on
+  white noise 20 to 91 ns per sample; voiced windows are not read twice.
 - `MidiFile::read(path, MidiReadOptions)`: opt-in, per-defect recovery of
   malformed files (`MidiReadRecovery`: redundant VLQ bytes, data after the
   end-of-track event, a wrong track length or count, a missing end-of-track
@@ -396,16 +418,19 @@ All notable user-facing changes to DSPark are documented here.
   noise, readings within 50 cents: 87.4% at 5 dB SNR (0% before: every frame
   read unvoiced) and 92.0% at 10 dB (88.5%), with octave errors at 10 dB down
   from 6.8% to 0; a clean-room port of the method's frame stage scores 87.3%
-  and 92.0%. At 0 dB SNR the detector still reads unvoiced. White and pink
-  noise stay unvoiced; resonant noise (Q 5 to 10 band-pass) now reads its
-  centre in 2% to 73% of frames, at confidence 0.94 or less.
+  and 92.0%. At 0 dB SNR the detector still reads unvoiced by default (see
+  `setNoiseSuppression()`). White and pink noise stay unvoiced; resonant
+  noise (Q 5 to 10 band-pass) now reads its centre in 2% to 73% of frames,
+  at confidence 0.94 or less.
   Default output change: steady clean tones read bit-identically; on clean
   material with sweeps and legato note changes 98% of readings are
-  unchanged, confidently wrong readings fall from 127 to 78 of 66090 (an
+  unchanged, confidently wrong readings fall from 127 to 34 of 66090 (an
   octave error at a high note whose period falls between lags is gone), and
-  some windows across a legato note change now read the period both notes
-  share, at confidence 0.75 to 0.89. A fundamental below the register no
-  longer reads as the lowest lag (46.9 Hz at 48 kHz, 25 cents above F#1).
+  a window across a legato note change whose dip lies at a longer period the
+  two notes share (four periods of one, five of the other) reads unvoiced
+  rather than that period: wrong readings 184 to 52, every correct reading
+  kept. A fundamental below the register no longer reads as the lowest lag
+  (46.9 Hz at 48 kHz, 25 cents above F#1).
   Noisy readings carry their own confidence (about 0.76 at 5 dB SNR), so
   `PitchFollower` at its default gate of 0.85 keeps ignoring a noisy tone; a
   gate of 0.7 tracks a 220 Hz tone at 5 dB SNR within 15 cents.
@@ -415,6 +440,10 @@ All notable user-facing changes to DSPark are documented here.
   change differs. CPU: 6% less on clean tones (a redundant energy pass is
   removed and the candidate scan stops once the choice is settled), 1% to 3%
   more on noise.
+- `Resampler::prepare()` designs its kernel tables 2.6x faster (Ultra, 96 to
+  44.1 kHz: 4.1 to 1.6 ms; High 2.2 to 0.8 ms) from one symmetric
+  fine-grid evaluation per table. `Resampler<float>` output is bit-identical;
+  `Resampler<double>` moves at rounding level (-295 dB re peak at most).
 - `ChordDetector` evaluates its note bank on a cascade of half-band
   decimators, one octave per rate: 304 to 2.1 us per frame (float, 44.1 kHz,
   4096), 614 to 2.9 us at 96 kHz, 1214 to 5.7 us with 16384. Chroma within
@@ -652,6 +681,10 @@ All notable user-facing changes to DSPark are documented here.
   empty on targets with a 32-bit `long`. `stretchedLength()` is new.
 - `Resampler::prepare()` ignores non-finite rates and ratios above `kMaxRatio`
   instead of overrunning the output buffer.
+- `Resampler::process()` returns an empty vector for a negative input length
+  (and for a null input) instead of sizing its output from it as a huge
+  unsigned count: -5 at 48 to 44.1 kHz threw `std::length_error` or
+  `std::bad_alloc`, or aborted with exceptions off.
 - `GranularProcessor`: long grains are cut to what a short capture ring holds
   instead of crossing the write head, and a non-finite input sample reads as
   silence instead of being replayed by the grains.

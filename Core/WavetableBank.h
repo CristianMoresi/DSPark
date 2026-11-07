@@ -42,9 +42,12 @@
  * double samples at a time on SSE2 and NEON and eight or four with AVX2
  * (chosen at run time on x86-64). It returns read()'s values, operation for
  * operation. Measured on x86-64 at 440 Hz with the level crossfade active,
- * float: read() 14 ns per sample, readBlock() 2.4 ns with AVX2 and 3.5 ns
+ * float: read() 14 ns per sample, readBlock() 2.3 ns with AVX2 and 3.0 ns
  * with SSE2, phase accumulation included; 4.1 ns with AVX2 when the frame
- * position moves every sample.
+ * position moves every sample. On one level (no crossfade) 1.9 and 2.4 ns,
+ * against 2.5 ns for a 4-point cubic reader of one table in the same loop.
+ * The SSE2, NEON and AVX2 kernels are one source, detail/WavetableKernels.inl,
+ * over each instruction set's lane operations.
  *
  * Storage is float whatever the reader's sample type, with guard samples
  * around every table so a read never wraps. A bank costs 229 KB per frame.
@@ -57,7 +60,7 @@
  * builtin() is safe to call from several threads (function-local statics),
  * but its first call per bank builds it; call it during setup.
  *
- * Dependencies: DspMath.h, FFT.h, SimdOps.h.
+ * Dependencies: DspMath.h, FFT.h, SimdOps.h, detail/WavetableKernels.inl.
  */
 
 #include "DspMath.h"
@@ -125,518 +128,711 @@ inline constexpr int kWavetableOneLevel = 0, kWavetableSameGrid = 1, kWavetableT
 
 } // namespace detail
 
-// Narrow block kernels: four float or two double lanes, on SSE2 and NEON.
-// Every operation is the one read() performs on the same values, in the
-// same order, so the block reader returns read()'s results.
+// Lane operations for the block kernels of detail/WavetableKernels.inl, one
+// pair of structs per instruction set: four float or two double lanes on SSE2
+// and NEON, eight or four with AVX2. The kernels are included once per set.
 #if defined(DSPARK_SIMD_SSE2) || defined(DSPARK_SIMD_NEON)
     #define DSPARK_WAVETABLE_NARROW 1
 namespace detail {
 namespace wavetable_narrow {
 
 #if defined(DSPARK_SIMD_SSE2)
-using F4 = __m128;
-using D2 = __m128d;
-
-inline F4 add(F4 a, F4 b) noexcept { return _mm_add_ps(a, b); }
-inline F4 sub(F4 a, F4 b) noexcept { return _mm_sub_ps(a, b); }
-inline F4 mul(F4 a, F4 b) noexcept { return _mm_mul_ps(a, b); }
-inline F4 set1(float x) noexcept { return _mm_set1_ps(x); }
-inline F4 load(const float* p) noexcept { return _mm_loadu_ps(p); }
-inline void store(float* p, F4 v) noexcept { _mm_storeu_ps(p, v); }
-inline D2 add(D2 a, D2 b) noexcept { return _mm_add_pd(a, b); }
-inline D2 sub(D2 a, D2 b) noexcept { return _mm_sub_pd(a, b); }
-inline D2 mul(D2 a, D2 b) noexcept { return _mm_mul_pd(a, b); }
-inline D2 set1(double x) noexcept { return _mm_set1_pd(x); }
-inline void store(double* p, D2 v) noexcept { _mm_storeu_pd(p, v); }
-
-/// Two floats widened to doubles.
-inline D2 pair(const float* p) noexcept
+/// Four float lanes on SSE2.
+struct FloatLanes
 {
-    return _mm_cvtps_pd(_mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p))));
-}
+    using S = float;
+    using V = __m128;
+    static constexpr int N = 4;
 
-/// True when both phases lie in [0, 1) (NaN fails).
-inline bool inRange2(const double* ph) noexcept
-{
-    const __m128d v = _mm_loadu_pd(ph);
-    const __m128d ok = _mm_and_pd(_mm_cmpge_pd(v, _mm_setzero_pd()), _mm_cmplt_pd(v, _mm_set1_pd(1.0)));
-    return _mm_movemask_pd(ok) == 3;
-}
-
-/// Index (truncated) and fraction of two phases on a grid of `size`.
-/// phase * size is exact (sizes are powers of two), so the index stays
-/// below the size, as read()'s min() guarantees.
-inline D2 grid2(const double* ph, double size, int32_t* idx) noexcept
-{
-    const __m128d p = _mm_mul_pd(_mm_loadu_pd(ph), _mm_set1_pd(size));
-    const __m128i i = _mm_cvttpd_epi32(p);
-    idx[0] = _mm_cvtsi128_si32(i);
-    idx[1] = _mm_cvtsi128_si32(_mm_srli_si128(i, 4));
-    return _mm_sub_pd(p, _mm_cvtepi32_pd(i));
-}
-
-/// Two fractions narrowed to float, as two lanes of a float vector's half.
-inline F4 narrow4(D2 lo, D2 hi) noexcept
-{
-    return _mm_movelh_ps(_mm_cvtpd_ps(lo), _mm_cvtpd_ps(hi));
-}
-
-/// Frame index and blend of two positions, clamped as read() clamps them.
-inline D2 frames2(const double* pos, double maxPos, int32_t* f0) noexcept
-{
-    const __m128d p = _mm_loadu_pd(pos);
-    const __m128d c = _mm_and_pd(_mm_cmpgt_pd(p, _mm_setzero_pd()), _mm_min_pd(p, _mm_set1_pd(maxPos)));
-    const __m128i i = _mm_cvttpd_epi32(c);
-    f0[0] = _mm_cvtsi128_si32(i);
-    f0[1] = _mm_cvtsi128_si32(_mm_srli_si128(i, 4));
-    return _mm_sub_pd(c, _mm_cvtepi32_pd(i));
-}
-
-/// Four lanes' rows (lo: offsets -2..+1, hi: +2..+5) into six columns.
-inline void columns4(const F4* lo, const F4* hi, F4* y) noexcept
-{
-    __m128 a = lo[0], b = lo[1], c = lo[2], d = lo[3];
-    _MM_TRANSPOSE4_PS(a, b, c, d);
-    y[0] = a;
-    y[1] = b;
-    y[2] = c;
-    y[3] = d;
-    const __m128 u = _mm_unpacklo_ps(hi[0], hi[1]);   // h0[0] h1[0] h0[1] h1[1]
-    const __m128 v = _mm_unpacklo_ps(hi[2], hi[3]);   // h2[0] h3[0] h2[1] h3[1]
-    y[4] = _mm_movelh_ps(u, v);
-    y[5] = _mm_movehl_ps(v, u);
-}
-
-/// Two lanes' double rows (three pairs each) into six columns.
-inline void columns2(const D2* r0, const D2* r1, D2* y) noexcept
-{
-    for (int k = 0; k < 3; ++k)
+    struct Rows
     {
-        y[2 * k]     = _mm_unpacklo_pd(r0[k], r1[k]);
-        y[2 * k + 1] = _mm_unpackhi_pd(r0[k], r1[k]);
-    }
-}
-#else // NEON
-using F4 = float32x4_t;
-#if defined(_MSC_VER) && !defined(__clang__)
-// MSVC declares float32x4_t and float64x2_t as one type (__n128), so the
-// double lanes get a type of their own to keep the overloads apart.
-struct D2 { float64x2_t v; };
-inline D2 d2(float64x2_t x) noexcept { return D2{ x }; }
-inline float64x2_t raw(D2 x) noexcept { return x.v; }
-#else
-using D2 = float64x2_t;
-inline D2 d2(float64x2_t x) noexcept { return x; }
-inline float64x2_t raw(D2 x) noexcept { return x; }
-#endif
-
-inline F4 add(F4 a, F4 b) noexcept { return vaddq_f32(a, b); }
-inline F4 sub(F4 a, F4 b) noexcept { return vsubq_f32(a, b); }
-inline F4 mul(F4 a, F4 b) noexcept { return vmulq_f32(a, b); }
-inline F4 set1(float x) noexcept { return vdupq_n_f32(x); }
-inline F4 load(const float* p) noexcept { return vld1q_f32(p); }
-inline void store(float* p, F4 v) noexcept { vst1q_f32(p, v); }
-inline D2 add(D2 a, D2 b) noexcept { return d2(vaddq_f64(raw(a), raw(b))); }
-inline D2 sub(D2 a, D2 b) noexcept { return d2(vsubq_f64(raw(a), raw(b))); }
-inline D2 mul(D2 a, D2 b) noexcept { return d2(vmulq_f64(raw(a), raw(b))); }
-inline D2 set1(double x) noexcept { return d2(vdupq_n_f64(x)); }
-inline void store(double* p, D2 v) noexcept { vst1q_f64(p, raw(v)); }
-
-inline D2 pair(const float* p) noexcept { return d2(vcvt_f64_f32(vld1_f32(p))); }
-
-inline bool inRange2(const double* ph) noexcept
-{
-    const float64x2_t v = vld1q_f64(ph);
-    const uint64x2_t ok = vandq_u64(vcgeq_f64(v, vdupq_n_f64(0.0)), vcltq_f64(v, vdupq_n_f64(1.0)));
-    return vgetq_lane_u64(ok, 0) != 0 && vgetq_lane_u64(ok, 1) != 0;
-}
-
-inline D2 grid2(const double* ph, double size, int32_t* idx) noexcept
-{
-    const float64x2_t p = vmulq_f64(vld1q_f64(ph), vdupq_n_f64(size));
-    const int64x2_t i = vcvtq_s64_f64(p);   // rounds toward zero, as the cast
-    idx[0] = static_cast<int32_t>(vgetq_lane_s64(i, 0));
-    idx[1] = static_cast<int32_t>(vgetq_lane_s64(i, 1));
-    return d2(vsubq_f64(p, vcvtq_f64_s64(i)));
-}
-
-inline F4 narrow4(D2 lo, D2 hi) noexcept
-{
-    return vcombine_f32(vcvt_f32_f64(raw(lo)), vcvt_f32_f64(raw(hi)));
-}
-
-inline D2 frames2(const double* pos, double maxPos, int32_t* f0) noexcept
-{
-    const float64x2_t p = vld1q_f64(pos);
-    // FMIN returns NaN for a NaN input; the mask clears it to 0, as read().
-    const uint64x2_t c = vandq_u64(vcgtq_f64(p, vdupq_n_f64(0.0)),
-                                   vreinterpretq_u64_f64(vminq_f64(p, vdupq_n_f64(maxPos))));
-    const float64x2_t cd = vreinterpretq_f64_u64(c);
-    const int64x2_t i = vcvtq_s64_f64(cd);
-    f0[0] = static_cast<int32_t>(vgetq_lane_s64(i, 0));
-    f0[1] = static_cast<int32_t>(vgetq_lane_s64(i, 1));
-    return d2(vsubq_f64(cd, vcvtq_f64_s64(i)));
-}
-
-inline void columns4(const F4* lo, const F4* hi, F4* y) noexcept
-{
-    const float32x4x2_t t01 = vtrnq_f32(lo[0], lo[1]);   // a0 b0 a2 b2 | a1 b1 a3 b3
-    const float32x4x2_t t23 = vtrnq_f32(lo[2], lo[3]);   // c0 d0 c2 d2 | c1 d1 c3 d3
-    y[0] = vcombine_f32(vget_low_f32(t01.val[0]), vget_low_f32(t23.val[0]));
-    y[1] = vcombine_f32(vget_low_f32(t01.val[1]), vget_low_f32(t23.val[1]));
-    y[2] = vcombine_f32(vget_high_f32(t01.val[0]), vget_high_f32(t23.val[0]));
-    y[3] = vcombine_f32(vget_high_f32(t01.val[1]), vget_high_f32(t23.val[1]));
-    const float32x4x2_t h01 = vtrnq_f32(hi[0], hi[1]);
-    const float32x4x2_t h23 = vtrnq_f32(hi[2], hi[3]);
-    y[4] = vcombine_f32(vget_low_f32(h01.val[0]), vget_low_f32(h23.val[0]));
-    y[5] = vcombine_f32(vget_low_f32(h01.val[1]), vget_low_f32(h23.val[1]));
-}
-
-inline void columns2(const D2* r0, const D2* r1, D2* y) noexcept
-{
-    for (int k = 0; k < 3; ++k)
-    {
-        y[2 * k]     = d2(vzip1q_f64(raw(r0[k]), raw(r1[k])));
-        y[2 * k + 1] = d2(vzip2q_f64(raw(r0[k]), raw(r1[k])));
-    }
-}
-#endif
-
-/// Index and fraction (narrowed to float) of four phases on a grid.
-inline F4 grid4(const double* ph, double size, int32_t* idx) noexcept
-{
-    const D2 lo = grid2(ph, size, idx);
-    const D2 hi = grid2(ph + 2, size, idx + 2);
-    return narrow4(lo, hi);
-}
-
-/// WavetableBank's interpolator on vector lanes of S, operation for operation.
-template <typename S, typename V>
-inline V interpolateLanes(const V* y, V x) noexcept
-{
-    const auto& k = kWavetableNiemitalo;
-    const auto c = [&](size_t i) { return set1(static_cast<S>(k[i])); };
-    const V z = sub(x, set1(S(0.5)));
-    const V even1 = add(y[3], y[2]), odd1 = sub(y[3], y[2]);
-    const V even2 = add(y[4], y[1]), odd2 = sub(y[4], y[1]);
-    const V even3 = add(y[5], y[0]), odd3 = sub(y[5], y[0]);
-    const auto sum3 = [&](V p, V q, V r, size_t i) {
-        return add(add(mul(p, c(i)), mul(q, c(i + 1))), mul(r, c(i + 2)));
+        V lo[4];   ///< Lane l: offsets -2..+1.
+        V hi[2];   ///< Lanes 2k and 2k + 1: offsets +2, +3 of each.
     };
-    const V c0 = sum3(even1, even2, even3, 0), c1 = sum3(odd1, odd2, odd3, 3);
-    const V c2 = sum3(even1, even2, even3, 6), c3 = sum3(odd1, odd2, odd3, 9);
-    const V c4 = sum3(even1, even2, even3, 12), c5 = sum3(odd1, odd2, odd3, 15);
-    V r = add(mul(c5, z), c4);
-    r = add(mul(r, z), c3);
-    r = add(mul(r, z), c2);
-    r = add(mul(r, z), c1);
-    return add(mul(r, z), c0);
-}
 
-/// read()'s frame blend a + t (b - a), per lane.
-template <typename V, typename S>
-inline V lerp(V a, V b, S t) noexcept
+    static V add(V a, V b) noexcept { return _mm_add_ps(a, b); }
+    static V sub(V a, V b) noexcept { return _mm_sub_ps(a, b); }
+    static V mul(V a, V b) noexcept { return _mm_mul_ps(a, b); }
+    static V set1(float x) noexcept { return _mm_set1_ps(x); }
+    static void store(float* p, V v) noexcept { _mm_storeu_ps(p, v); }
+
+    /// [0, 1) holds exactly the doubles whose high word, as an unsigned
+    /// number, lies below that of 1.0 (sign clear; NaN and infinities fail).
+    static bool inRange(const double* ph) noexcept
+    {
+        const __m128 a = _mm_castpd_ps(_mm_loadu_pd(ph));
+        const __m128 b = _mm_castpd_ps(_mm_loadu_pd(ph + 2));
+        const __m128i hi = _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1)));
+        const __m128i flip = _mm_set1_epi32(static_cast<int>(0x80000000u));
+        const __m128i bad = _mm_cmpgt_epi32(_mm_xor_si128(hi, flip),
+                                            _mm_set1_epi32(static_cast<int>(0x3FEFFFFFu ^ 0x80000000u)));
+        return _mm_movemask_epi8(bad) == 0;
+    }
+
+    /// phase * size is exact (sizes are powers of two), so the truncated
+    /// index stays below the size, as read()'s min() guarantees.
+    static V grid(const double* ph, double size, uint32_t* idx) noexcept
+    {
+        const __m128d sz = _mm_set1_pd(size);
+        const __m128d p0 = _mm_mul_pd(_mm_loadu_pd(ph), sz);
+        const __m128d p1 = _mm_mul_pd(_mm_loadu_pd(ph + 2), sz);
+        const __m128i i0 = _mm_cvttpd_epi32(p0), i1 = _mm_cvttpd_epi32(p1);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(idx), _mm_unpacklo_epi64(i0, i1));
+        return _mm_movelh_ps(_mm_cvtpd_ps(_mm_sub_pd(p0, _mm_cvtepi32_pd(i0))),
+                             _mm_cvtpd_ps(_mm_sub_pd(p1, _mm_cvtepi32_pd(i1))));
+    }
+
+    static void frames(const double* pos, double maxPos, int32_t* f0, float* t) noexcept
+    {
+        const __m128d mx = _mm_set1_pd(maxPos), zero = _mm_setzero_pd();
+        __m128 frac[2];
+        for (int h = 0; h < 2; ++h)
+        {
+            const __m128d p = _mm_loadu_pd(pos + 2 * h);
+            const __m128d c = _mm_and_pd(_mm_cmpgt_pd(p, zero), _mm_min_pd(p, mx));
+            const __m128i i = _mm_cvttpd_epi32(c);
+            f0[2 * h] = _mm_cvtsi128_si32(i);
+            f0[2 * h + 1] = _mm_cvtsi128_si32(_mm_srli_si128(i, 4));
+            frac[h] = _mm_cvtpd_ps(_mm_sub_pd(c, _mm_cvtepi32_pd(i)));
+        }
+        _mm_storeu_ps(t, _mm_movelh_ps(frac[0], frac[1]));
+    }
+
+    /// Offsets +2, +3 of two lanes in one vector.
+    static V pair(const float* a, const float* b) noexcept
+    {
+        return _mm_castsi128_ps(_mm_unpacklo_epi64(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(a)),
+                                                   _mm_loadl_epi64(reinterpret_cast<const __m128i*>(b))));
+    }
+
+    static V lerp(V a, V b, V t) noexcept { return add(a, mul(t, sub(b, a))); }
+
+    // Each pair of lanes reads its row pointers and blends before its first
+    // store, so the stores cannot force them to be recomputed.
+    template <bool Blend, class At, class Step, class Tl>
+    static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
+    {
+        for (int k = 0; k < 2; ++k)
+        {
+            const int l = 2 * k;
+            const float* const p0 = at(l);
+            const float* const p1 = at(l + 1);
+            if constexpr (Blend)
+            {
+                const float* const q0 = p0 + step(l);
+                const float* const q1 = p1 + step(l + 1);
+                const float t0 = t(l), t1 = t(l + 1);
+                r.lo[l] = lerp(_mm_loadu_ps(p0), _mm_loadu_ps(q0), _mm_set1_ps(t0));
+                r.lo[l + 1] = lerp(_mm_loadu_ps(p1), _mm_loadu_ps(q1), _mm_set1_ps(t1));
+                r.hi[k] = lerp(pair(p0 + 4, p1 + 4), pair(q0 + 4, q1 + 4), _mm_setr_ps(t0, t0, t1, t1));
+            }
+            else
+            {
+                r.lo[l] = _mm_loadu_ps(p0);
+                r.lo[l + 1] = _mm_loadu_ps(p1);
+                r.hi[k] = pair(p0 + 4, p1 + 4);
+            }
+        }
+    }
+
+    template <bool Blend, class AtA, class StepA, class AtB, class StepB, class Tl>
+    static void gatherMix(Rows& r, const AtA& atA, const StepA& stepA, const AtB& atB, const StepB& stepB,
+                          const Tl& t, V w) noexcept
+    {
+        for (int k = 0; k < 2; ++k)
+        {
+            const int l = 2 * k;
+            const float* const pa0 = atA(l);
+            const float* const pa1 = atA(l + 1);
+            const float* const pb0 = atB(l);
+            const float* const pb1 = atB(l + 1);
+            V a0 = _mm_loadu_ps(pa0), a1 = _mm_loadu_ps(pa1), ah = pair(pa0 + 4, pa1 + 4);
+            V b0 = _mm_loadu_ps(pb0), b1 = _mm_loadu_ps(pb1), bh = pair(pb0 + 4, pb1 + 4);
+            if constexpr (Blend)
+            {
+                const float* const qa0 = pa0 + stepA(l);
+                const float* const qa1 = pa1 + stepA(l + 1);
+                const float* const qb0 = pb0 + stepB(l);
+                const float* const qb1 = pb1 + stepB(l + 1);
+                const float s0 = t(l), s1 = t(l + 1);
+                const V t0 = _mm_set1_ps(s0), t1 = _mm_set1_ps(s1);
+                const V th = _mm_setr_ps(s0, s0, s1, s1);
+                a0 = lerp(a0, _mm_loadu_ps(qa0), t0);
+                a1 = lerp(a1, _mm_loadu_ps(qa1), t1);
+                ah = lerp(ah, pair(qa0 + 4, qa1 + 4), th);
+                b0 = lerp(b0, _mm_loadu_ps(qb0), t0);
+                b1 = lerp(b1, _mm_loadu_ps(qb1), t1);
+                bh = lerp(bh, pair(qb0 + 4, qb1 + 4), th);
+            }
+            r.lo[l] = lerp(b0, a0, w);
+            r.lo[l + 1] = lerp(b1, a1, w);
+            r.hi[k] = lerp(bh, ah, w);
+        }
+    }
+
+    static void columns(const Rows& r, V* y) noexcept
+    {
+        __m128 a = r.lo[0], b = r.lo[1], c = r.lo[2], d = r.lo[3];
+        _MM_TRANSPOSE4_PS(a, b, c, d);
+        y[0] = a;
+        y[1] = b;
+        y[2] = c;
+        y[3] = d;
+        y[4] = _mm_shuffle_ps(r.hi[0], r.hi[1], _MM_SHUFFLE(2, 0, 2, 0));
+        y[5] = _mm_shuffle_ps(r.hi[0], r.hi[1], _MM_SHUFFLE(3, 1, 3, 1));
+    }
+};
+
+/// Two double lanes on SSE2.
+struct DoubleLanes
 {
-    return add(a, mul(set1(t), sub(b, a)));
-}
+    using S = double;
+    using V = __m128d;
+    static constexpr int N = 2;
+
+    struct Rows
+    {
+        V r[2][3];   ///< Lane l: offsets -2..+3 as three pairs.
+    };
+
+    static V add(V a, V b) noexcept { return _mm_add_pd(a, b); }
+    static V sub(V a, V b) noexcept { return _mm_sub_pd(a, b); }
+    static V mul(V a, V b) noexcept { return _mm_mul_pd(a, b); }
+    static V set1(double x) noexcept { return _mm_set1_pd(x); }
+    static void store(double* p, V v) noexcept { _mm_storeu_pd(p, v); }
+
+    static bool inRange(const double* ph) noexcept
+    {
+        const __m128d v = _mm_loadu_pd(ph);
+        const __m128d ok = _mm_and_pd(_mm_cmpge_pd(v, _mm_setzero_pd()), _mm_cmplt_pd(v, _mm_set1_pd(1.0)));
+        return _mm_movemask_pd(ok) == 3;
+    }
+
+    static V grid(const double* ph, double size, uint32_t* idx) noexcept
+    {
+        const __m128d p = _mm_mul_pd(_mm_loadu_pd(ph), _mm_set1_pd(size));
+        const __m128i i = _mm_cvttpd_epi32(p);
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(idx), i);
+        return _mm_sub_pd(p, _mm_cvtepi32_pd(i));
+    }
+
+    static void frames(const double* pos, double maxPos, int32_t* f0, double* t) noexcept
+    {
+        const __m128d p = _mm_loadu_pd(pos);
+        const __m128d c = _mm_and_pd(_mm_cmpgt_pd(p, _mm_setzero_pd()), _mm_min_pd(p, _mm_set1_pd(maxPos)));
+        const __m128i i = _mm_cvttpd_epi32(c);
+        f0[0] = _mm_cvtsi128_si32(i);
+        f0[1] = _mm_cvtsi128_si32(_mm_srli_si128(i, 4));
+        _mm_storeu_pd(t, _mm_sub_pd(c, _mm_cvtepi32_pd(i)));
+    }
+
+    /// Two floats widened to doubles.
+    static V pair(const float* p) noexcept
+    {
+        return _mm_cvtps_pd(_mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p))));
+    }
+
+    static V lerp(V a, V b, V t) noexcept { return add(a, mul(t, sub(b, a))); }
+
+    // Each lane's row pointers and blend are read before its first store, so
+    // the stores cannot force them to be recomputed.
+    template <bool Blend, class At, class Step, class Tl>
+    static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
+    {
+        for (int l = 0; l < 2; ++l)
+        {
+            const float* const p = at(l);
+            if constexpr (Blend)
+            {
+                const float* const q = p + step(l);
+                const V tl = _mm_set1_pd(t(l));
+                for (int k = 0; k < 3; ++k) r.r[l][k] = lerp(pair(p + 2 * k), pair(q + 2 * k), tl);
+            }
+            else
+            {
+                for (int k = 0; k < 3; ++k) r.r[l][k] = pair(p + 2 * k);
+            }
+        }
+    }
+
+    template <bool Blend, class AtA, class StepA, class AtB, class StepB, class Tl>
+    static void gatherMix(Rows& r, const AtA& atA, const StepA& stepA, const AtB& atB, const StepB& stepB,
+                          const Tl& t, V w) noexcept
+    {
+        for (int l = 0; l < 2; ++l)
+        {
+            const float* const pa = atA(l);
+            const float* const pb = atB(l);
+            if constexpr (Blend)
+            {
+                const float* const qa = pa + stepA(l);
+                const float* const qb = pb + stepB(l);
+                const V tl = _mm_set1_pd(t(l));
+                for (int k = 0; k < 3; ++k)
+                {
+                    const V a = lerp(pair(pa + 2 * k), pair(qa + 2 * k), tl);
+                    const V b = lerp(pair(pb + 2 * k), pair(qb + 2 * k), tl);
+                    r.r[l][k] = lerp(b, a, w);
+                }
+            }
+            else
+            {
+                for (int k = 0; k < 3; ++k) r.r[l][k] = lerp(pair(pb + 2 * k), pair(pa + 2 * k), w);
+            }
+        }
+    }
+
+    static void columns(const Rows& r, V* y) noexcept
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            y[2 * k]     = _mm_unpacklo_pd(r.r[0][k], r.r[1][k]);
+            y[2 * k + 1] = _mm_unpackhi_pd(r.r[0][k], r.r[1][k]);
+        }
+    }
+};
+#else // NEON
+/// Four float lanes on NEON.
+struct FloatLanes
+{
+    using S = float;
+    using V = float32x4_t;
+    static constexpr int N = 4;
+
+    struct Rows
+    {
+        V lo[4];   ///< Lane l: offsets -2..+1.
+        V hi[2];   ///< Lanes 2k and 2k + 1: offsets +2, +3 of each.
+    };
+
+    static V add(V a, V b) noexcept { return vaddq_f32(a, b); }
+    static V sub(V a, V b) noexcept { return vsubq_f32(a, b); }
+    static V mul(V a, V b) noexcept { return vmulq_f32(a, b); }
+    static V set1(float x) noexcept { return vdupq_n_f32(x); }
+    static void store(float* p, V v) noexcept { vst1q_f32(p, v); }
+
+    static bool inRange(const double* ph) noexcept
+    {
+        const float64x2_t one = vdupq_n_f64(1.0), zero = vdupq_n_f64(0.0);
+        const float64x2_t a = vld1q_f64(ph), b = vld1q_f64(ph + 2);
+        const uint64x2_t ok = vandq_u64(vandq_u64(vcgeq_f64(a, zero), vcltq_f64(a, one)),
+                                        vandq_u64(vcgeq_f64(b, zero), vcltq_f64(b, one)));
+        return vgetq_lane_u64(ok, 0) != 0 && vgetq_lane_u64(ok, 1) != 0;
+    }
+
+    static V grid(const double* ph, double size, uint32_t* idx) noexcept
+    {
+        const float64x2_t sz = vdupq_n_f64(size);
+        const float64x2_t p0 = vmulq_f64(vld1q_f64(ph), sz), p1 = vmulq_f64(vld1q_f64(ph + 2), sz);
+        const int64x2_t i0 = vcvtq_s64_f64(p0), i1 = vcvtq_s64_f64(p1);   // toward zero, as the cast
+        idx[0] = static_cast<uint32_t>(vgetq_lane_s64(i0, 0));
+        idx[1] = static_cast<uint32_t>(vgetq_lane_s64(i0, 1));
+        idx[2] = static_cast<uint32_t>(vgetq_lane_s64(i1, 0));
+        idx[3] = static_cast<uint32_t>(vgetq_lane_s64(i1, 1));
+        return vcombine_f32(vcvt_f32_f64(vsubq_f64(p0, vcvtq_f64_s64(i0))),
+                            vcvt_f32_f64(vsubq_f64(p1, vcvtq_f64_s64(i1))));
+    }
+
+    static void frames(const double* pos, double maxPos, int32_t* f0, float* t) noexcept
+    {
+        float32x2_t frac[2];
+        for (int h = 0; h < 2; ++h)
+        {
+            const float64x2_t p = vld1q_f64(pos + 2 * h);
+            // FMIN returns NaN for a NaN input; the mask clears it to 0, as read().
+            const uint64x2_t c = vandq_u64(vcgtq_f64(p, vdupq_n_f64(0.0)),
+                                           vreinterpretq_u64_f64(vminq_f64(p, vdupq_n_f64(maxPos))));
+            const float64x2_t cd = vreinterpretq_f64_u64(c);
+            const int64x2_t i = vcvtq_s64_f64(cd);
+            f0[2 * h] = static_cast<int32_t>(vgetq_lane_s64(i, 0));
+            f0[2 * h + 1] = static_cast<int32_t>(vgetq_lane_s64(i, 1));
+            frac[h] = vcvt_f32_f64(vsubq_f64(cd, vcvtq_f64_s64(i)));
+        }
+        vst1q_f32(t, vcombine_f32(frac[0], frac[1]));
+    }
+
+    static V pair(const float* a, const float* b) noexcept { return vcombine_f32(vld1_f32(a), vld1_f32(b)); }
+
+    static V lerp(V a, V b, V t) noexcept { return add(a, mul(t, sub(b, a))); }
+
+    template <bool Blend, class At, class Step, class Tl>
+    static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
+    {
+        for (int k = 0; k < 2; ++k)
+        {
+            const int l = 2 * k;
+            r.lo[l] = vld1q_f32(at(l));
+            r.lo[l + 1] = vld1q_f32(at(l + 1));
+            r.hi[k] = pair(at(l) + 4, at(l + 1) + 4);
+            if constexpr (Blend)
+            {
+                r.lo[l] = lerp(r.lo[l], vld1q_f32((at(l) + step(l))), vdupq_n_f32(t(l)));
+                r.lo[l + 1] = lerp(r.lo[l + 1], vld1q_f32((at(l + 1) + step(l + 1))), vdupq_n_f32(t(l + 1)));
+                r.hi[k] = lerp(r.hi[k], pair((at(l) + step(l)) + 4, (at(l + 1) + step(l + 1)) + 4),
+                               vcombine_f32(vdup_n_f32(t(l)), vdup_n_f32(t(l + 1))));
+            }
+        }
+    }
+
+    template <bool Blend, class AtA, class StepA, class AtB, class StepB, class Tl>
+    static void gatherMix(Rows& r, const AtA& atA, const StepA& stepA, const AtB& atB, const StepB& stepB,
+                          const Tl& t, V w) noexcept
+    {
+        for (int k = 0; k < 2; ++k)
+        {
+            const int l = 2 * k;
+            V a0 = vld1q_f32(atA(l)), a1 = vld1q_f32(atA(l + 1)), ah = pair(atA(l) + 4, atA(l + 1) + 4);
+            V b0 = vld1q_f32(atB(l)), b1 = vld1q_f32(atB(l + 1)), bh = pair(atB(l) + 4, atB(l + 1) + 4);
+            if constexpr (Blend)
+            {
+                const V t0 = vdupq_n_f32(t(l)), t1 = vdupq_n_f32(t(l + 1));
+                const V th = vcombine_f32(vdup_n_f32(t(l)), vdup_n_f32(t(l + 1)));
+                a0 = lerp(a0, vld1q_f32((atA(l) + stepA(l))), t0);
+                a1 = lerp(a1, vld1q_f32((atA(l + 1) + stepA(l + 1))), t1);
+                ah = lerp(ah, pair((atA(l) + stepA(l)) + 4, (atA(l + 1) + stepA(l + 1)) + 4), th);
+                b0 = lerp(b0, vld1q_f32((atB(l) + stepB(l))), t0);
+                b1 = lerp(b1, vld1q_f32((atB(l + 1) + stepB(l + 1))), t1);
+                bh = lerp(bh, pair((atB(l) + stepB(l)) + 4, (atB(l + 1) + stepB(l + 1)) + 4), th);
+            }
+            r.lo[l] = lerp(b0, a0, w);
+            r.lo[l + 1] = lerp(b1, a1, w);
+            r.hi[k] = lerp(bh, ah, w);
+        }
+    }
+
+    static void columns(const Rows& r, V* y) noexcept
+    {
+        const float32x4x2_t t01 = vtrnq_f32(r.lo[0], r.lo[1]);   // a0 b0 a2 b2 | a1 b1 a3 b3
+        const float32x4x2_t t23 = vtrnq_f32(r.lo[2], r.lo[3]);   // c0 d0 c2 d2 | c1 d1 c3 d3
+        y[0] = vcombine_f32(vget_low_f32(t01.val[0]), vget_low_f32(t23.val[0]));
+        y[1] = vcombine_f32(vget_low_f32(t01.val[1]), vget_low_f32(t23.val[1]));
+        y[2] = vcombine_f32(vget_high_f32(t01.val[0]), vget_high_f32(t23.val[0]));
+        y[3] = vcombine_f32(vget_high_f32(t01.val[1]), vget_high_f32(t23.val[1]));
+        const float32x4x2_t h = vuzpq_f32(r.hi[0], r.hi[1]);    // even | odd elements
+        y[4] = h.val[0];
+        y[5] = h.val[1];
+    }
+};
+
+/// Two double lanes on NEON. The struct keeps the double lanes' operations
+/// apart from the float ones: MSVC declares float32x4_t and float64x2_t as
+/// one type, so they could not be overloads of one name.
+struct DoubleLanes
+{
+    using S = double;
+    using V = float64x2_t;
+    static constexpr int N = 2;
+
+    struct Rows
+    {
+        V r[2][3];   ///< Lane l: offsets -2..+3 as three pairs.
+    };
+
+    static V add(V a, V b) noexcept { return vaddq_f64(a, b); }
+    static V sub(V a, V b) noexcept { return vsubq_f64(a, b); }
+    static V mul(V a, V b) noexcept { return vmulq_f64(a, b); }
+    static V set1(double x) noexcept { return vdupq_n_f64(x); }
+    static void store(double* p, V v) noexcept { vst1q_f64(p, v); }
+
+    static bool inRange(const double* ph) noexcept
+    {
+        const float64x2_t v = vld1q_f64(ph);
+        const uint64x2_t ok = vandq_u64(vcgeq_f64(v, vdupq_n_f64(0.0)), vcltq_f64(v, vdupq_n_f64(1.0)));
+        return vgetq_lane_u64(ok, 0) != 0 && vgetq_lane_u64(ok, 1) != 0;
+    }
+
+    static V grid(const double* ph, double size, uint32_t* idx) noexcept
+    {
+        const float64x2_t p = vmulq_f64(vld1q_f64(ph), vdupq_n_f64(size));
+        const int64x2_t i = vcvtq_s64_f64(p);
+        idx[0] = static_cast<uint32_t>(vgetq_lane_s64(i, 0));
+        idx[1] = static_cast<uint32_t>(vgetq_lane_s64(i, 1));
+        return vsubq_f64(p, vcvtq_f64_s64(i));
+    }
+
+    static void frames(const double* pos, double maxPos, int32_t* f0, double* t) noexcept
+    {
+        const float64x2_t p = vld1q_f64(pos);
+        const uint64x2_t c = vandq_u64(vcgtq_f64(p, vdupq_n_f64(0.0)),
+                                       vreinterpretq_u64_f64(vminq_f64(p, vdupq_n_f64(maxPos))));
+        const float64x2_t cd = vreinterpretq_f64_u64(c);
+        const int64x2_t i = vcvtq_s64_f64(cd);
+        f0[0] = static_cast<int32_t>(vgetq_lane_s64(i, 0));
+        f0[1] = static_cast<int32_t>(vgetq_lane_s64(i, 1));
+        vst1q_f64(t, vsubq_f64(cd, vcvtq_f64_s64(i)));
+    }
+
+    static V pair(const float* p) noexcept { return vcvt_f64_f32(vld1_f32(p)); }
+
+    static V lerp(V a, V b, V t) noexcept { return add(a, mul(t, sub(b, a))); }
+
+    template <bool Blend, class At, class Step, class Tl>
+    static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
+    {
+        for (int l = 0; l < 2; ++l)
+            for (int k = 0; k < 3; ++k)
+            {
+                r.r[l][k] = pair(at(l) + 2 * k);
+                if constexpr (Blend) r.r[l][k] = lerp(r.r[l][k], pair((at(l) + step(l)) + 2 * k), vdupq_n_f64(t(l)));
+            }
+    }
+
+    template <bool Blend, class AtA, class StepA, class AtB, class StepB, class Tl>
+    static void gatherMix(Rows& r, const AtA& atA, const StepA& stepA, const AtB& atB, const StepB& stepB,
+                          const Tl& t, V w) noexcept
+    {
+        for (int l = 0; l < 2; ++l)
+            for (int k = 0; k < 3; ++k)
+            {
+                V a = pair(atA(l) + 2 * k), b = pair(atB(l) + 2 * k);
+                if constexpr (Blend)
+                {
+                    const V tl = vdupq_n_f64(t(l));
+                    a = lerp(a, pair((atA(l) + stepA(l)) + 2 * k), tl);
+                    b = lerp(b, pair((atB(l) + stepB(l)) + 2 * k), tl);
+                }
+                r.r[l][k] = lerp(b, a, w);
+            }
+    }
+
+    static void columns(const Rows& r, V* y) noexcept
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            y[2 * k]     = vzip1q_f64(r.r[0][k], r.r[1][k]);
+            y[2 * k + 1] = vzip2q_f64(r.r[0][k], r.r[1][k]);
+        }
+    }
+};
+#endif
+
+#include "detail/WavetableKernels.inl"
 
 } // namespace wavetable_narrow
 } // namespace detail
 #endif
 
-// AVX2 block kernels, used when the CPU has AVX2 (selected at run time in
-// x86-64 baseline builds; always in AVX2 builds). They are built in
-// SimdOps.h's exact AVX2 region, without FMA, so they compute what read()
-// computes, operation for operation.
+// AVX2 lanes, used when the CPU has AVX2 (selected at run time in x86-64
+// baseline builds; always in AVX2 builds). They are built in SimdOps.h's
+// exact AVX2 region, without FMA, so they compute what read() computes,
+// operation for operation.
 #if defined(DSPARK_SIMD_EXACT_AVX2)
 DSPARK_SIMD_EXACT_AVX2_BEGIN
 namespace detail {
 namespace wavetable_avx2 {
 
-/// WavetableBank's interpolator on eight float lanes, operation for operation.
-inline __m256 interpolate8(const __m256* y, __m256 x) noexcept
+/// Eight float lanes on AVX2.
+struct FloatLanes
 {
-    const auto& k = kWavetableNiemitalo;
-    const __m256 z = _mm256_sub_ps(x, _mm256_set1_ps(0.5f));
-    const __m256 even1 = _mm256_add_ps(y[3], y[2]), odd1 = _mm256_sub_ps(y[3], y[2]);
-    const __m256 even2 = _mm256_add_ps(y[4], y[1]), odd2 = _mm256_sub_ps(y[4], y[1]);
-    const __m256 even3 = _mm256_add_ps(y[5], y[0]), odd3 = _mm256_sub_ps(y[5], y[0]);
-    __m256 c[6];
-    for (int i = 0; i < 6; ++i)
+    using S = float;
+    using V = __m256;
+    static constexpr int N = 8;
+
+    struct Rows
     {
-        const __m256 p = (i % 2 == 0) ? even1 : odd1;
-        const __m256 q = (i % 2 == 0) ? even2 : odd2;
-        const __m256 r = (i % 2 == 0) ? even3 : odd3;
-        const auto b = static_cast<size_t>(3 * i);
-        c[i] = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(p, _mm256_set1_ps(static_cast<float>(k[b]))),
-                                           _mm256_mul_ps(q, _mm256_set1_ps(static_cast<float>(k[b + 1])))),
-                             _mm256_mul_ps(r, _mm256_set1_ps(static_cast<float>(k[b + 2]))));
+        V r[8];   ///< Lane l: offsets -2..+5 (the kernel uses -2..+3).
+    };
+
+    static V add(V a, V b) noexcept { return _mm256_add_ps(a, b); }
+    static V sub(V a, V b) noexcept { return _mm256_sub_ps(a, b); }
+    static V mul(V a, V b) noexcept { return _mm256_mul_ps(a, b); }
+    static V set1(float x) noexcept { return _mm256_set1_ps(x); }
+    static void store(float* p, V v) noexcept { _mm256_storeu_ps(p, v); }
+
+    static bool inRange(const double* ph) noexcept
+    {
+        const __m256d zero = _mm256_setzero_pd(), one = _mm256_set1_pd(1.0);
+        const __m256d a = _mm256_loadu_pd(ph), b = _mm256_loadu_pd(ph + 4);
+        const __m256d ok = _mm256_and_pd(_mm256_and_pd(_mm256_cmp_pd(a, zero, _CMP_GE_OQ), _mm256_cmp_pd(a, one, _CMP_LT_OQ)),
+                                         _mm256_and_pd(_mm256_cmp_pd(b, zero, _CMP_GE_OQ), _mm256_cmp_pd(b, one, _CMP_LT_OQ)));
+        return _mm256_movemask_pd(ok) == 0xF;
     }
-    __m256 v = _mm256_add_ps(_mm256_mul_ps(c[5], z), c[4]);
-    v = _mm256_add_ps(_mm256_mul_ps(v, z), c[3]);
-    v = _mm256_add_ps(_mm256_mul_ps(v, z), c[2]);
-    v = _mm256_add_ps(_mm256_mul_ps(v, z), c[1]);
-    return _mm256_add_ps(_mm256_mul_ps(v, z), c[0]);
-}
 
-/// The same on four double lanes.
-inline __m256d interpolate4d(const __m256d* y, __m256d x) noexcept
-{
-    const auto& k = kWavetableNiemitalo;
-    const __m256d z = _mm256_sub_pd(x, _mm256_set1_pd(0.5));
-    const __m256d even1 = _mm256_add_pd(y[3], y[2]), odd1 = _mm256_sub_pd(y[3], y[2]);
-    const __m256d even2 = _mm256_add_pd(y[4], y[1]), odd2 = _mm256_sub_pd(y[4], y[1]);
-    const __m256d even3 = _mm256_add_pd(y[5], y[0]), odd3 = _mm256_sub_pd(y[5], y[0]);
-    __m256d c[6];
-    for (int i = 0; i < 6; ++i)
+    static V grid(const double* ph, double size, uint32_t* idx) noexcept
     {
-        const __m256d p = (i % 2 == 0) ? even1 : odd1;
-        const __m256d q = (i % 2 == 0) ? even2 : odd2;
-        const __m256d r = (i % 2 == 0) ? even3 : odd3;
-        const auto b = static_cast<size_t>(3 * i);
-        c[i] = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(p, _mm256_set1_pd(k[b])),
-                                           _mm256_mul_pd(q, _mm256_set1_pd(k[b + 1]))),
-                             _mm256_mul_pd(r, _mm256_set1_pd(k[b + 2])));
+        const __m256d sz = _mm256_set1_pd(size);
+        const __m256d p0 = _mm256_mul_pd(_mm256_loadu_pd(ph), sz);
+        const __m256d p1 = _mm256_mul_pd(_mm256_loadu_pd(ph + 4), sz);
+        const __m128i i0 = _mm256_cvttpd_epi32(p0), i1 = _mm256_cvttpd_epi32(p1);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(idx), i0);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(idx + 4), i1);
+        const __m128 x0 = _mm256_cvtpd_ps(_mm256_sub_pd(p0, _mm256_cvtepi32_pd(i0)));
+        const __m128 x1 = _mm256_cvtpd_ps(_mm256_sub_pd(p1, _mm256_cvtepi32_pd(i1)));
+        return _mm256_insertf128_ps(_mm256_castps128_ps256(x0), x1, 1);
     }
-    __m256d v = _mm256_add_pd(_mm256_mul_pd(c[5], z), c[4]);
-    v = _mm256_add_pd(_mm256_mul_pd(v, z), c[3]);
-    v = _mm256_add_pd(_mm256_mul_pd(v, z), c[2]);
-    v = _mm256_add_pd(_mm256_mul_pd(v, z), c[1]);
-    return _mm256_add_pd(_mm256_mul_pd(v, z), c[0]);
-}
 
-/// Eight lanes' rows (offsets -2..+5 of each interval) into six columns.
-inline void columns8(const __m256* r, __m256* y) noexcept
-{
-    const __m256 t0 = _mm256_unpacklo_ps(r[0], r[1]), t1 = _mm256_unpackhi_ps(r[0], r[1]);
-    const __m256 t2 = _mm256_unpacklo_ps(r[2], r[3]), t3 = _mm256_unpackhi_ps(r[2], r[3]);
-    const __m256 t4 = _mm256_unpacklo_ps(r[4], r[5]), t5 = _mm256_unpackhi_ps(r[4], r[5]);
-    const __m256 t6 = _mm256_unpacklo_ps(r[6], r[7]), t7 = _mm256_unpackhi_ps(r[6], r[7]);
-    const __m256 s0 = _mm256_shuffle_ps(t0, t2, 0x44), s1 = _mm256_shuffle_ps(t0, t2, 0xEE);
-    const __m256 s2 = _mm256_shuffle_ps(t1, t3, 0x44), s3 = _mm256_shuffle_ps(t1, t3, 0xEE);
-    const __m256 s4 = _mm256_shuffle_ps(t4, t6, 0x44), s5 = _mm256_shuffle_ps(t4, t6, 0xEE);
-    const __m256 s6 = _mm256_shuffle_ps(t5, t7, 0x44), s7 = _mm256_shuffle_ps(t5, t7, 0xEE);
-    y[0] = _mm256_permute2f128_ps(s0, s4, 0x20);
-    y[1] = _mm256_permute2f128_ps(s1, s5, 0x20);
-    y[2] = _mm256_permute2f128_ps(s2, s6, 0x20);
-    y[3] = _mm256_permute2f128_ps(s3, s7, 0x20);
-    y[4] = _mm256_permute2f128_ps(s0, s4, 0x31);
-    y[5] = _mm256_permute2f128_ps(s1, s5, 0x31);
-}
-
-/// Indices and fractions of eight phases on a grid of `size` samples.
-inline __m256 grid8(const double* phases, __m256d size, int32_t* idx) noexcept
-{
-    const __m256d p0 = _mm256_mul_pd(_mm256_loadu_pd(phases), size);
-    const __m256d p1 = _mm256_mul_pd(_mm256_loadu_pd(phases + 4), size);
-    const __m128i i0 = _mm256_cvttpd_epi32(p0), i1 = _mm256_cvttpd_epi32(p1);
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(idx), i0);
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(idx + 4), i1);
-    const __m128 x0 = _mm256_cvtpd_ps(_mm256_sub_pd(p0, _mm256_cvtepi32_pd(i0)));
-    const __m128 x1 = _mm256_cvtpd_ps(_mm256_sub_pd(p1, _mm256_cvtepi32_pd(i1)));
-    return _mm256_insertf128_ps(_mm256_castps128_ps256(x0), x1, 1);
-}
-
-/// Frame rows and blends of eight positions, as wavetableFrame() derives them.
-inline void frames8(const double* positions, int numFrames, int32_t* f0, float* t) noexcept
-{
-    const __m256d zero = _mm256_setzero_pd(), maxPos = _mm256_set1_pd(static_cast<double>(numFrames - 1));
-    for (int h = 0; h < 2; ++h)
+    static void frames(const double* pos, double maxPos, int32_t* f0, float* t) noexcept
     {
-        const __m256d p = _mm256_loadu_pd(positions + 4 * h);
-        const __m256d c = _mm256_and_pd(_mm256_cmp_pd(p, zero, _CMP_GT_OQ), _mm256_min_pd(p, maxPos));
-        const __m128i i = _mm256_cvttpd_epi32(c);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(f0 + 4 * h), i);
-        _mm_storeu_ps(t + 4 * h, _mm256_cvtpd_ps(_mm256_sub_pd(c, _mm256_cvtepi32_pd(i))));
+        const __m256d zero = _mm256_setzero_pd(), mx = _mm256_set1_pd(maxPos);
+        for (int h = 0; h < 2; ++h)
+        {
+            const __m256d p = _mm256_loadu_pd(pos + 4 * h);
+            const __m256d c = _mm256_and_pd(_mm256_cmp_pd(p, zero, _CMP_GT_OQ), _mm256_min_pd(p, mx));
+            const __m128i i = _mm256_cvttpd_epi32(c);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(f0 + 4 * h), i);
+            _mm_storeu_ps(t + 4 * h, _mm256_cvtpd_ps(_mm256_sub_pd(c, _mm256_cvtepi32_pd(i))));
+        }
     }
-}
 
-/// The same for four positions, with the blends in double.
-inline void frames4d(const double* positions, int numFrames, int32_t* f0, double* t) noexcept
-{
-    const __m256d zero = _mm256_setzero_pd(), maxPos = _mm256_set1_pd(static_cast<double>(numFrames - 1));
-    const __m256d p = _mm256_loadu_pd(positions);
-    const __m256d c = _mm256_and_pd(_mm256_cmp_pd(p, zero, _CMP_GT_OQ), _mm256_min_pd(p, maxPos));
-    const __m128i i = _mm256_cvttpd_epi32(c);
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(f0), i);
-    _mm256_storeu_pd(t, _mm256_sub_pd(c, _mm256_cvtepi32_pd(i)));
-}
+    static V lerp(V a, V b, V t) noexcept { return add(a, mul(t, sub(b, a))); }
 
-/// One lane's eight table samples, blended toward the next frame by t.
-inline __m256 row8(const float* p, size_t step, float t, bool blend) noexcept
-{
-    const __m256 a = _mm256_loadu_ps(p);
-    if (!blend) return a;
-    return _mm256_add_ps(a, _mm256_mul_ps(_mm256_set1_ps(t), _mm256_sub_ps(_mm256_loadu_ps(p + step), a)));
-}
-
-/**
- * @brief Float samples, eight at a time; every phase must lie in [0, 1).
- * @return Samples written (a multiple of eight).
- */
-template <int Layout, bool PerSample, bool Blend>
-int read8(const WavetableRows& s, const double* phases, const double* positions,
-          const WavetableFrame& fixed, float w, float* out, int n) noexcept
-{
-    const __m256 wv = _mm256_set1_ps(w);
-    const __m256d sizeA = _mm256_set1_pd(s.sizeA), sizeB = _mm256_set1_pd(s.sizeB);
-    const float* fixedA = s.baseA + fixed.f0 * s.strideA;
-    const float* fixedB = s.baseB + fixed.f0 * s.strideB;
-    const auto fixedT = static_cast<float>(fixed.t);
-    int j = 0;
-    for (; j + 8 <= n; j += 8)
+    template <bool Blend, class At, class Step, class Tl>
+    static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
     {
-        alignas(32) int32_t ia[8], ib[8], fa[8];
-        alignas(32) float ta[8];
-        if constexpr (PerSample) frames8(positions + j, s.numFrames, fa, ta);
-        const __m256 xa = grid8(phases + j, sizeA, ia);
-        __m256 xb = xa;
-        if constexpr (Layout == kWavetableTwoGrids) xb = grid8(phases + j, sizeB, ib);
-        __m256 ra[8], rb[8];
         for (int l = 0; l < 8; ++l)
         {
-            const float* rowA = fixedA;
-            const float* rowB = fixedB;
-            size_t stepA = fixed.step * s.strideA, stepB = fixed.step * s.strideB;
-            float t = fixedT;
-            bool blend = Blend;
-            if constexpr (PerSample)
-            {
-                const auto f0 = static_cast<size_t>(fa[l]);
-                const bool upper = fa[l] < s.numFrames - 1;
-                rowA = s.baseA + f0 * s.strideA;
-                rowB = s.baseB + f0 * s.strideB;
-                stepA = upper ? s.strideA : 0;
-                stepB = upper ? s.strideB : 0;
-                t = ta[l];
-                blend = t != 0.0f;
-            }
-            ra[l] = row8(rowA + static_cast<size_t>(ia[l]), stepA, t, blend);
-            if constexpr (Layout != kWavetableOneLevel)
-            {
-                const auto offB = static_cast<size_t>(Layout == kWavetableSameGrid ? ia[l] : ib[l]);
-                rb[l] = row8(rowB + offB, stepB, t, blend);
-            }
-            if constexpr (Layout == kWavetableSameGrid)
-                ra[l] = _mm256_add_ps(rb[l], _mm256_mul_ps(wv, _mm256_sub_ps(ra[l], rb[l])));
+            r.r[l] = _mm256_loadu_ps(at(l));
+            if constexpr (Blend) r.r[l] = lerp(r.r[l], _mm256_loadu_ps((at(l) + step(l))), _mm256_set1_ps(t(l)));
         }
-        __m256 y[6];
-        columns8(ra, y);
-        __m256 r = interpolate8(y, xa);
-        if constexpr (Layout == kWavetableTwoGrids)
-        {
-            columns8(rb, y);
-            const __m256 sb = interpolate8(y, xb);
-            r = _mm256_add_ps(sb, _mm256_mul_ps(wv, _mm256_sub_ps(r, sb)));
-        }
-        _mm256_storeu_ps(out + j, r);
     }
-    return j;
-}
 
-/// One lane's six samples as doubles: y0..y3 and the pair y4, y5.
-inline void row6d(const float* p, size_t step, double t, bool blend, __m256d& lo, __m128d& hi) noexcept
-{
-    lo = _mm256_cvtps_pd(_mm_loadu_ps(p));
-    hi = _mm_cvtps_pd(_mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p + 4))));
-    if (!blend) return;
-    const __m256d lo1 = _mm256_cvtps_pd(_mm_loadu_ps(p + step));
-    const __m128d hi1 = _mm_cvtps_pd(_mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p + step + 4))));
-    lo = _mm256_add_pd(lo, _mm256_mul_pd(_mm256_set1_pd(t), _mm256_sub_pd(lo1, lo)));
-    hi = _mm_add_pd(hi, _mm_mul_pd(_mm_set1_pd(t), _mm_sub_pd(hi1, hi)));
-}
-
-/// Four lanes' double rows into six columns.
-inline void columns4d(const __m256d* lo, const __m128d* hi, __m256d* y) noexcept
-{
-    const __m256d t0 = _mm256_unpacklo_pd(lo[0], lo[1]), t1 = _mm256_unpackhi_pd(lo[0], lo[1]);
-    const __m256d t2 = _mm256_unpacklo_pd(lo[2], lo[3]), t3 = _mm256_unpackhi_pd(lo[2], lo[3]);
-    y[0] = _mm256_permute2f128_pd(t0, t2, 0x20);
-    y[1] = _mm256_permute2f128_pd(t1, t3, 0x20);
-    y[2] = _mm256_permute2f128_pd(t0, t2, 0x31);
-    y[3] = _mm256_permute2f128_pd(t1, t3, 0x31);
-    const __m128d u0 = _mm_unpacklo_pd(hi[0], hi[1]), v0 = _mm_unpacklo_pd(hi[2], hi[3]);
-    const __m128d u1 = _mm_unpackhi_pd(hi[0], hi[1]), v1 = _mm_unpackhi_pd(hi[2], hi[3]);
-    y[4] = _mm256_insertf128_pd(_mm256_castpd128_pd256(u0), v0, 1);
-    y[5] = _mm256_insertf128_pd(_mm256_castpd128_pd256(u1), v1, 1);
-}
-
-/// Indices and fractions of four phases on a grid of `size` samples.
-inline __m256d grid4d(const double* phases, __m256d size, int32_t* idx) noexcept
-{
-    const __m256d p = _mm256_mul_pd(_mm256_loadu_pd(phases), size);
-    const __m128i i = _mm256_cvttpd_epi32(p);
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(idx), i);
-    return _mm256_sub_pd(p, _mm256_cvtepi32_pd(i));
-}
-
-/**
- * @brief Double samples, four at a time; every phase must lie in [0, 1).
- * @return Samples written (a multiple of four).
- */
-template <int Layout, bool PerSample, bool Blend>
-int read4d(const WavetableRows& s, const double* phases, const double* positions,
-           const WavetableFrame& fixed, double w, double* out, int n) noexcept
-{
-    const __m256d wv = _mm256_set1_pd(w);
-    const __m128d wv2 = _mm_set1_pd(w);
-    const __m256d sizeA = _mm256_set1_pd(s.sizeA), sizeB = _mm256_set1_pd(s.sizeB);
-    const float* fixedA = s.baseA + fixed.f0 * s.strideA;
-    const float* fixedB = s.baseB + fixed.f0 * s.strideB;
-    int j = 0;
-    for (; j + 4 <= n; j += 4)
+    template <bool Blend, class AtA, class StepA, class AtB, class StepB, class Tl>
+    static void gatherMix(Rows& r, const AtA& atA, const StepA& stepA, const AtB& atB, const StepB& stepB,
+                          const Tl& t, V w) noexcept
     {
-        alignas(16) int32_t ia[4], ib[4], fa[4];
-        alignas(32) double ta[4];
-        if constexpr (PerSample) frames4d(positions + j, s.numFrames, fa, ta);
-        const __m256d xa = grid4d(phases + j, sizeA, ia);
-        __m256d xb = xa;
-        if constexpr (Layout == kWavetableTwoGrids) xb = grid4d(phases + j, sizeB, ib);
-        __m256d loA[4], loB[4];
-        __m128d hiA[4], hiB[4];
+        for (int l = 0; l < 8; ++l)
+        {
+            V a = _mm256_loadu_ps(atA(l)), b = _mm256_loadu_ps(atB(l));
+            if constexpr (Blend)
+            {
+                const V tl = _mm256_set1_ps(t(l));
+                a = lerp(a, _mm256_loadu_ps((atA(l) + stepA(l))), tl);
+                b = lerp(b, _mm256_loadu_ps((atB(l) + stepB(l))), tl);
+            }
+            r.r[l] = lerp(b, a, w);
+        }
+    }
+
+    static void columns(const Rows& rows, V* y) noexcept
+    {
+        const V* r = rows.r;
+        const V t0 = _mm256_unpacklo_ps(r[0], r[1]), t1 = _mm256_unpackhi_ps(r[0], r[1]);
+        const V t2 = _mm256_unpacklo_ps(r[2], r[3]), t3 = _mm256_unpackhi_ps(r[2], r[3]);
+        const V t4 = _mm256_unpacklo_ps(r[4], r[5]), t5 = _mm256_unpackhi_ps(r[4], r[5]);
+        const V t6 = _mm256_unpacklo_ps(r[6], r[7]), t7 = _mm256_unpackhi_ps(r[6], r[7]);
+        const V s0 = _mm256_shuffle_ps(t0, t2, 0x44), s1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+        const V s2 = _mm256_shuffle_ps(t1, t3, 0x44), s3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+        const V s4 = _mm256_shuffle_ps(t4, t6, 0x44), s5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+        const V s6 = _mm256_shuffle_ps(t5, t7, 0x44), s7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+        y[0] = _mm256_permute2f128_ps(s0, s4, 0x20);
+        y[1] = _mm256_permute2f128_ps(s1, s5, 0x20);
+        y[2] = _mm256_permute2f128_ps(s2, s6, 0x20);
+        y[3] = _mm256_permute2f128_ps(s3, s7, 0x20);
+        y[4] = _mm256_permute2f128_ps(s0, s4, 0x31);
+        y[5] = _mm256_permute2f128_ps(s1, s5, 0x31);
+    }
+};
+
+/// Four double lanes on AVX2.
+struct DoubleLanes
+{
+    using S = double;
+    using V = __m256d;
+    static constexpr int N = 4;
+
+    struct Rows
+    {
+        V lo[4];        ///< Lane l: offsets -2..+1.
+        __m128d hi[4];  ///< Lane l: offsets +2, +3.
+    };
+
+    static V add(V a, V b) noexcept { return _mm256_add_pd(a, b); }
+    static V sub(V a, V b) noexcept { return _mm256_sub_pd(a, b); }
+    static V mul(V a, V b) noexcept { return _mm256_mul_pd(a, b); }
+    static V set1(double x) noexcept { return _mm256_set1_pd(x); }
+    static void store(double* p, V v) noexcept { _mm256_storeu_pd(p, v); }
+
+    static bool inRange(const double* ph) noexcept
+    {
+        const __m256d a = _mm256_loadu_pd(ph);
+        const __m256d ok = _mm256_and_pd(_mm256_cmp_pd(a, _mm256_setzero_pd(), _CMP_GE_OQ),
+                                         _mm256_cmp_pd(a, _mm256_set1_pd(1.0), _CMP_LT_OQ));
+        return _mm256_movemask_pd(ok) == 0xF;
+    }
+
+    static V grid(const double* ph, double size, uint32_t* idx) noexcept
+    {
+        const __m256d p = _mm256_mul_pd(_mm256_loadu_pd(ph), _mm256_set1_pd(size));
+        const __m128i i = _mm256_cvttpd_epi32(p);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(idx), i);
+        return _mm256_sub_pd(p, _mm256_cvtepi32_pd(i));
+    }
+
+    static void frames(const double* pos, double maxPos, int32_t* f0, double* t) noexcept
+    {
+        const __m256d p = _mm256_loadu_pd(pos);
+        const __m256d c = _mm256_and_pd(_mm256_cmp_pd(p, _mm256_setzero_pd(), _CMP_GT_OQ),
+                                        _mm256_min_pd(p, _mm256_set1_pd(maxPos)));
+        const __m128i i = _mm256_cvttpd_epi32(c);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(f0), i);
+        _mm256_storeu_pd(t, _mm256_sub_pd(c, _mm256_cvtepi32_pd(i)));
+    }
+
+    static V lo4(const float* p) noexcept { return _mm256_cvtps_pd(_mm_loadu_ps(p)); }
+    static __m128d hi2(const float* p) noexcept
+    {
+        return _mm_cvtps_pd(_mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p + 4))));
+    }
+    static V lerp(V a, V b, V t) noexcept { return add(a, mul(t, sub(b, a))); }
+    static __m128d lerp(__m128d a, __m128d b, __m128d t) noexcept
+    {
+        return _mm_add_pd(a, _mm_mul_pd(t, _mm_sub_pd(b, a)));
+    }
+
+    template <bool Blend, class At, class Step, class Tl>
+    static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
+    {
         for (int l = 0; l < 4; ++l)
         {
-            const float* rowA = fixedA;
-            const float* rowB = fixedB;
-            size_t stepA = fixed.step * s.strideA, stepB = fixed.step * s.strideB;
-            double t = fixed.t;
-            bool blend = Blend;
-            if constexpr (PerSample)
+            r.lo[l] = lo4(at(l));
+            r.hi[l] = hi2(at(l));
+            if constexpr (Blend)
             {
-                const auto f0 = static_cast<size_t>(fa[l]);
-                const bool upper = fa[l] < s.numFrames - 1;
-                rowA = s.baseA + f0 * s.strideA;
-                rowB = s.baseB + f0 * s.strideB;
-                stepA = upper ? s.strideA : 0;
-                stepB = upper ? s.strideB : 0;
-                t = ta[l];
-                blend = t != 0.0;
-            }
-            row6d(rowA + static_cast<size_t>(ia[l]), stepA, t, blend, loA[l], hiA[l]);
-            if constexpr (Layout != kWavetableOneLevel)
-            {
-                const auto offB = static_cast<size_t>(Layout == kWavetableSameGrid ? ia[l] : ib[l]);
-                row6d(rowB + offB, stepB, t, blend, loB[l], hiB[l]);
-            }
-            if constexpr (Layout == kWavetableSameGrid)
-            {
-                loA[l] = _mm256_add_pd(loB[l], _mm256_mul_pd(wv, _mm256_sub_pd(loA[l], loB[l])));
-                hiA[l] = _mm_add_pd(hiB[l], _mm_mul_pd(wv2, _mm_sub_pd(hiA[l], hiB[l])));
+                r.lo[l] = lerp(r.lo[l], lo4((at(l) + step(l))), _mm256_set1_pd(t(l)));
+                r.hi[l] = lerp(r.hi[l], hi2((at(l) + step(l))), _mm_set1_pd(t(l)));
             }
         }
-        __m256d y[6];
-        columns4d(loA, hiA, y);
-        __m256d r = interpolate4d(y, xa);
-        if constexpr (Layout == kWavetableTwoGrids)
-        {
-            columns4d(loB, hiB, y);
-            const __m256d sb = interpolate4d(y, xb);
-            r = _mm256_add_pd(sb, _mm256_mul_pd(wv, _mm256_sub_pd(r, sb)));
-        }
-        _mm256_storeu_pd(out + j, r);
     }
-    return j;
-}
+
+    template <bool Blend, class AtA, class StepA, class AtB, class StepB, class Tl>
+    static void gatherMix(Rows& r, const AtA& atA, const StepA& stepA, const AtB& atB, const StepB& stepB,
+                          const Tl& t, V w) noexcept
+    {
+        const __m128d w2 = _mm256_castpd256_pd128(w);
+        for (int l = 0; l < 4; ++l)
+        {
+            V a = lo4(atA(l)), b = lo4(atB(l));
+            __m128d ah = hi2(atA(l)), bh = hi2(atB(l));
+            if constexpr (Blend)
+            {
+                const V tl = _mm256_set1_pd(t(l));
+                const __m128d th = _mm_set1_pd(t(l));
+                a = lerp(a, lo4((atA(l) + stepA(l))), tl);
+                ah = lerp(ah, hi2((atA(l) + stepA(l))), th);
+                b = lerp(b, lo4((atB(l) + stepB(l))), tl);
+                bh = lerp(bh, hi2((atB(l) + stepB(l))), th);
+            }
+            r.lo[l] = lerp(b, a, w);
+            r.hi[l] = lerp(bh, ah, w2);
+        }
+    }
+
+    static void columns(const Rows& r, V* y) noexcept
+    {
+        const V t0 = _mm256_unpacklo_pd(r.lo[0], r.lo[1]), t1 = _mm256_unpackhi_pd(r.lo[0], r.lo[1]);
+        const V t2 = _mm256_unpacklo_pd(r.lo[2], r.lo[3]), t3 = _mm256_unpackhi_pd(r.lo[2], r.lo[3]);
+        y[0] = _mm256_permute2f128_pd(t0, t2, 0x20);
+        y[1] = _mm256_permute2f128_pd(t1, t3, 0x20);
+        y[2] = _mm256_permute2f128_pd(t0, t2, 0x31);
+        y[3] = _mm256_permute2f128_pd(t1, t3, 0x31);
+        const __m128d u0 = _mm_unpacklo_pd(r.hi[0], r.hi[1]), v0 = _mm_unpacklo_pd(r.hi[2], r.hi[3]);
+        const __m128d u1 = _mm_unpackhi_pd(r.hi[0], r.hi[1]), v1 = _mm_unpackhi_pd(r.hi[2], r.hi[3]);
+        y[4] = _mm256_insertf128_pd(_mm256_castpd128_pd256(u0), v0, 1);
+        y[5] = _mm256_insertf128_pd(_mm256_castpd128_pd256(u1), v1, 1);
+    }
+};
+
+#include "detail/WavetableKernels.inl"
 
 } // namespace wavetable_avx2
 } // namespace detail
@@ -1020,13 +1216,17 @@ private:
     /// Niemitalo's coefficients in the order interpolate() uses them.
     static constexpr const std::array<double, 18>& kNiemitalo = detail::kWavetableNiemitalo;
 
-    /// Floats past the last table that the block reader may load: its float
-    /// path reads eight samples per interval (offsets -2..+5; interpolation
-    /// uses -2..+3), which reaches into the next row's guard, and past the end
-    /// of the storage for the very last row.
+    /// Floats past the last table that the block reader may load: its AVX2
+    /// float lanes read eight samples per interval (offsets -2..+5;
+    /// interpolation uses -2..+3), which reaches into the next row's guard,
+    /// and past the end of the storage for the very last row.
     static constexpr size_t kTailPad = 2;
 
-    /** Block reader: setup once, then vector or scalar samples. */
+    /**
+     * Block reader: the level and frame setup once, then the widest kernels
+     * the CPU runs, the narrow ones for what they leave, and read() for a
+     * group holding an out-of-range phase and for the tail.
+     */
     template <FloatType T>
     void readBlockImpl(const double* phases, const double* positions, double position,
                        const Mip& mip, T* out, int n) const noexcept
@@ -1037,32 +1237,46 @@ private:
             std::fill_n(out, n, T(0));
             return;
         }
-        int done = 0;
-#if defined(DSPARK_SIMD_EXACT_AVX2)
-    #if defined(DSPARK_SIMD_EXACT_AVX2_DISPATCHED)
-        if (simd::isRuntimeDispatchActive())
-    #endif
-            done = readBlockAvx2(phases, positions, position, mip, out, n);
-#endif
 #if defined(DSPARK_WAVETABLE_NARROW)
-        done += readBlockNarrow(phases + done, positions != nullptr ? positions + done : nullptr,
-                                position, mip, out + done, n - done);
-#endif
-        for (int j = done; j < n; ++j)
+        const auto w = static_cast<T>(std::clamp(mip.weight, 0.0f, 1.0f));
+        const detail::WavetableRows s = blockSetup<T>(mip, w);
+        const int layout = !s.two ? detail::kWavetableOneLevel
+                         : (s.same ? detail::kWavetableSameGrid : detail::kWavetableTwoGrids);
+        const detail::WavetableFrame f = detail::wavetableFrame(position, numFrames_);
+    #if defined(DSPARK_SIMD_EXACT_AVX2) && defined(DSPARK_SIMD_EXACT_AVX2_DISPATCHED)
+        const bool wide = simd::isRuntimeDispatchActive();
+    #elif defined(DSPARK_SIMD_EXACT_AVX2)
+        constexpr bool wide = true;
+    #endif
+        // One narrow group: the most read() may have to take over at once.
+        constexpr int kGroup = std::is_same_v<T, float> ? 4 : 2;
+        int j = 0;
+        while (j < n)
+        {
+            const double* pos = positions != nullptr ? positions + j : nullptr;
+    #if defined(DSPARK_SIMD_EXACT_AVX2)
+            if (wide)
+            {
+                j += detail::wavetable_avx2::readBlockKernel(s, layout, phases + j, pos, f, w, out + j, n - j);
+                pos = positions != nullptr ? positions + j : nullptr;
+            }
+    #endif
+            j += detail::wavetable_narrow::readBlockKernel(s, layout, phases + j, pos, f, w, out + j, n - j);
+            for (const int stop = std::min(n, j + kGroup); j < stop; ++j)
+                out[j] = read<T>(phases[j], positions != nullptr ? positions[j] : position, mip);
+        }
+#else
+        for (int j = 0; j < n; ++j)
             out[j] = read<T>(phases[j], positions != nullptr ? positions[j] : position, mip);
+#endif
     }
 
 #if defined(DSPARK_WAVETABLE_NARROW)
-    using BlockSetup = detail::WavetableRows;
-    using FramePick = detail::WavetableFrame;
-    static constexpr int kOneLevel = detail::kWavetableOneLevel;
-    static constexpr int kSameGrid = detail::kWavetableSameGrid;
-    static constexpr int kTwoGrids = detail::kWavetableTwoGrids;
-
+    /** @brief The block's level pair as the kernels see it. */
     template <FloatType T>
-    [[nodiscard]] BlockSetup blockSetup(const Mip& mip, T w) const noexcept
+    [[nodiscard]] detail::WavetableRows blockSetup(const Mip& mip, T w) const noexcept
     {
-        BlockSetup s;
+        detail::WavetableRows s;
         s.numFrames = numFrames_;
         const int a = std::clamp(mip.level, 0, kMipLevels - 1);
         const int b = std::clamp(mip.next, 0, kMipLevels - 1);
@@ -1076,291 +1290,6 @@ private:
         s.baseA = data_.data() + levelOffset_[la] + static_cast<size_t>(kGuard - 2);
         s.baseB = data_.data() + levelOffset_[lb] + static_cast<size_t>(kGuard - 2);
         return s;
-    }
-
-    [[nodiscard]] FramePick framePick(double position) const noexcept
-    {
-        return detail::wavetableFrame(position, numFrames_);
-    }
-
-#if defined(DSPARK_SIMD_EXACT_AVX2)
-    /// True when every phase lies in [0, 1) (NaN fails).
-    [[nodiscard]] static bool allPhasesInRange(const double* phases, int n) noexcept
-    {
-        __m128d ok = _mm_castsi128_pd(_mm_set1_epi32(-1));
-        const __m128d zero = _mm_setzero_pd(), one = _mm_set1_pd(1.0);
-        int j = 0;
-        for (; j + 2 <= n; j += 2)
-        {
-            const __m128d ph = _mm_loadu_pd(phases + j);
-            ok = _mm_and_pd(ok, _mm_and_pd(_mm_cmpge_pd(ph, zero), _mm_cmplt_pd(ph, one)));
-        }
-        bool inRange = _mm_movemask_pd(ok) == 3;
-        for (; j < n; ++j) inRange = inRange && phases[j] >= 0.0 && phases[j] < 1.0;
-        return inRange;
-    }
-
-    /// The AVX2 kernels over the block's whole multiple of their width, when
-    /// every phase is in range (else 0: the SSE2 path handles the block).
-    template <FloatType T>
-    int readBlockAvx2(const double* phases, const double* positions, double position,
-                      const Mip& mip, T* out, int n) const noexcept
-    {
-        namespace k = detail::wavetable_avx2;
-        if (!allPhasesInRange(phases, n)) return 0;
-        const float wf = std::clamp(mip.weight, 0.0f, 1.0f);
-        const auto w = static_cast<T>(wf);
-        const BlockSetup s = blockSetup<T>(mip, w);
-        const int layout = !s.two ? kOneLevel : (s.same ? kSameGrid : kTwoGrids);
-        const FramePick f = framePick(position);
-        const bool blend = static_cast<T>(f.t) != T(0);
-        const auto run = [&](auto layoutTag, auto perSampleTag, auto blendTag) {
-            constexpr int L = decltype(layoutTag)::value;
-            constexpr bool P = decltype(perSampleTag)::value;
-            constexpr bool B = decltype(blendTag)::value;
-            if constexpr (std::is_same_v<T, float>)
-                return k::read8<L, P, B>(s, phases, positions, f, w, out, n);
-            else
-                return k::read4d<L, P, B>(s, phases, positions, f, w, out, n);
-        };
-        using One = std::integral_constant<int, kOneLevel>;
-        using Same = std::integral_constant<int, kSameGrid>;
-        using Two = std::integral_constant<int, kTwoGrids>;
-        using Yes = std::true_type;
-        using No = std::false_type;
-        if (positions != nullptr)
-        {
-            if (layout == kOneLevel) return run(One {}, Yes {}, Yes {});
-            if (layout == kSameGrid) return run(Same {}, Yes {}, Yes {});
-            return run(Two {}, Yes {}, Yes {});
-        }
-        if (blend)
-        {
-            if (layout == kOneLevel) return run(One {}, No {}, Yes {});
-            if (layout == kSameGrid) return run(Same {}, No {}, Yes {});
-            return run(Two {}, No {}, Yes {});
-        }
-        if (layout == kOneLevel) return run(One {}, No {}, No {});
-        if (layout == kSameGrid) return run(Same {}, No {}, No {});
-        return run(Two {}, No {}, No {});
-    }
-#endif
-
-    /**
-     * @brief The narrow kernels for one block: picks the loop specialised for
-     *        the level layout, per-sample positions and the frame blend.
-     * @return Samples written (a multiple of the lane count).
-     */
-    template <FloatType T>
-    int readBlockNarrow(const double* phases, const double* positions, double position,
-                        const Mip& mip, T* out, int n) const noexcept
-    {
-        const auto w = static_cast<T>(std::clamp(mip.weight, 0.0f, 1.0f));
-        const BlockSetup s = blockSetup<T>(mip, w);
-        const int layout = !s.two ? kOneLevel : (s.same ? kSameGrid : kTwoGrids);
-        const FramePick f = framePick(position);
-        const auto run = [&](auto layoutTag, auto perSampleTag, auto blendTag) {
-            constexpr int L = decltype(layoutTag)::value;
-            constexpr bool P = decltype(perSampleTag)::value;
-            constexpr bool B = decltype(blendTag)::value;
-            if constexpr (std::is_same_v<T, float>)
-                return this->template readFloat4<L, P, B>(phases, positions, position, s, f, w, mip, out, n);
-            else
-                return this->template readDouble2<L, P, B>(phases, positions, position, s, f, w, mip, out, n);
-        };
-        using One = std::integral_constant<int, kOneLevel>;
-        using Same = std::integral_constant<int, kSameGrid>;
-        using Two = std::integral_constant<int, kTwoGrids>;
-        using Yes = std::true_type;
-        using No = std::false_type;
-        if (positions != nullptr)
-        {
-            if (layout == kOneLevel) return run(One {}, Yes {}, Yes {});
-            if (layout == kSameGrid) return run(Same {}, Yes {}, Yes {});
-            return run(Two {}, Yes {}, Yes {});
-        }
-        if (static_cast<T>(f.t) != T(0))
-        {
-            if (layout == kOneLevel) return run(One {}, No {}, Yes {});
-            if (layout == kSameGrid) return run(Same {}, No {}, Yes {});
-            return run(Two {}, No {}, Yes {});
-        }
-        if (layout == kOneLevel) return run(One {}, No {}, No {});
-        if (layout == kSameGrid) return run(Same {}, No {}, No {});
-        return run(Two {}, No {}, No {});
-    }
-
-    /**
-     * @brief Four float samples per step for one level layout.
-     * @tparam Layout    kOneLevel, kSameGrid or kTwoGrids.
-     * @tparam PerSample Positions per sample (else `fixed` for the block).
-     * @tparam Blend     Frame blend of the fixed position (t not 0).
-     */
-    template <int Layout, bool PerSample, bool Blend>
-    int readFloat4(const double* phases, const double* positions, double position,
-                   const BlockSetup& s, const FramePick& fixed, float w, const Mip& mip,
-                   float* out, int n) const noexcept
-    {
-        namespace v = detail::wavetable_narrow;
-        const v::F4 wv = v::set1(w);
-        const double maxPos = static_cast<double>(numFrames_ - 1);
-        const float* fixedA = s.baseA + fixed.f0 * s.strideA;
-        const float* fixedB = s.baseB + fixed.f0 * s.strideB;
-        const auto fixedT = static_cast<float>(fixed.t);
-        int j = 0;
-        for (; j + 4 <= n; j += 4)
-        {
-            if (!v::inRange2(phases + j) || !v::inRange2(phases + j + 2))
-            {
-                for (int l = 0; l < 4; ++l)
-                    out[j + l] = read<float>(phases[j + l], PerSample ? positions[j + l] : position, mip);
-                continue;
-            }
-            alignas(16) int32_t ia[4], ib[4], fa[4];
-            alignas(16) float ta[4];
-            const v::F4 xa = v::grid4(phases + j, s.sizeA, ia);
-            v::F4 xb = xa;
-            if constexpr (Layout == kTwoGrids) xb = v::grid4(phases + j, s.sizeB, ib);
-            if constexpr (PerSample)
-                v::store(ta, v::narrow4(v::frames2(positions + j, maxPos, fa),
-                                        v::frames2(positions + j + 2, maxPos, fa + 2)));
-
-            v::F4 loA[4], hiA[4], loB[4], hiB[4];
-            for (int l = 0; l < 4; ++l)
-            {
-                const float* rowA = fixedA;
-                const float* rowB = fixedB;
-                size_t stepA = fixed.step * s.strideA, stepB = fixed.step * s.strideB;
-                float t = fixedT;
-                bool blend = Blend;
-                if constexpr (PerSample)
-                {
-                    const auto f0 = static_cast<size_t>(fa[l]);
-                    const bool upper = fa[l] < numFrames_ - 1;
-                    rowA = s.baseA + f0 * s.strideA;
-                    rowB = s.baseB + f0 * s.strideB;
-                    stepA = upper ? s.strideA : 0;
-                    stepB = upper ? s.strideB : 0;
-                    t = ta[l];
-                    blend = t != 0.0f;
-                }
-                const float* pa = rowA + static_cast<size_t>(ia[l]);
-                loA[l] = v::load(pa);
-                hiA[l] = v::load(pa + 4);
-                if (blend)
-                {
-                    loA[l] = v::lerp(loA[l], v::load(pa + stepA), t);
-                    hiA[l] = v::lerp(hiA[l], v::load(pa + stepA + 4), t);
-                }
-                if constexpr (Layout != kOneLevel)
-                {
-                    const float* pb = rowB + static_cast<size_t>(Layout == kSameGrid ? ia[l] : ib[l]);
-                    loB[l] = v::load(pb);
-                    hiB[l] = v::load(pb + 4);
-                    if (blend)
-                    {
-                        loB[l] = v::lerp(loB[l], v::load(pb + stepB), t);
-                        hiB[l] = v::lerp(hiB[l], v::load(pb + stepB + 4), t);
-                    }
-                }
-                if constexpr (Layout == kSameGrid)
-                {
-                    // Same grid: blend the samples, interpolate once.
-                    loA[l] = v::add(loB[l], v::mul(wv, v::sub(loA[l], loB[l])));
-                    hiA[l] = v::add(hiB[l], v::mul(wv, v::sub(hiA[l], hiB[l])));
-                }
-            }
-            v::F4 y[6];
-            v::columns4(loA, hiA, y);
-            v::F4 r = v::interpolateLanes<float>(y, xa);
-            if constexpr (Layout == kTwoGrids)
-            {
-                v::columns4(loB, hiB, y);
-                const v::F4 rb = v::interpolateLanes<float>(y, xb);
-                r = v::add(rb, v::mul(wv, v::sub(r, rb)));
-            }
-            v::store(out + j, r);
-        }
-        return j;
-    }
-
-    /** Two double samples per step for one level layout (see readFloat4()). */
-    template <int Layout, bool PerSample, bool Blend>
-    int readDouble2(const double* phases, const double* positions, double position,
-                    const BlockSetup& s, const FramePick& fixed, double w, const Mip& mip,
-                    double* out, int n) const noexcept
-    {
-        namespace v = detail::wavetable_narrow;
-        const v::D2 wv = v::set1(w);
-        const double maxPos = static_cast<double>(numFrames_ - 1);
-        const float* fixedA = s.baseA + fixed.f0 * s.strideA;
-        const float* fixedB = s.baseB + fixed.f0 * s.strideB;
-        int j = 0;
-        for (; j + 2 <= n; j += 2)
-        {
-            if (!v::inRange2(phases + j))
-            {
-                for (int l = 0; l < 2; ++l)
-                    out[j + l] = read<double>(phases[j + l], PerSample ? positions[j + l] : position, mip);
-                continue;
-            }
-            alignas(16) int32_t ia[2], ib[2], fa[2];
-            alignas(16) double ta[2];
-            const v::D2 xa = v::grid2(phases + j, s.sizeA, ia);
-            v::D2 xb = xa;
-            if constexpr (Layout == kTwoGrids) xb = v::grid2(phases + j, s.sizeB, ib);
-            if constexpr (PerSample) v::store(ta, v::frames2(positions + j, maxPos, fa));
-
-            v::D2 rowA[2][3], rowB[2][3];
-            for (int l = 0; l < 2; ++l)
-            {
-                const float* baseRowA = fixedA;
-                const float* baseRowB = fixedB;
-                size_t stepA = fixed.step * s.strideA, stepB = fixed.step * s.strideB;
-                double t = fixed.t;
-                bool blend = Blend;
-                if constexpr (PerSample)
-                {
-                    const auto f0 = static_cast<size_t>(fa[l]);
-                    const bool upper = fa[l] < numFrames_ - 1;
-                    baseRowA = s.baseA + f0 * s.strideA;
-                    baseRowB = s.baseB + f0 * s.strideB;
-                    stepA = upper ? s.strideA : 0;
-                    stepB = upper ? s.strideB : 0;
-                    t = ta[l];
-                    blend = t != 0.0;
-                }
-                const float* pa = baseRowA + static_cast<size_t>(ia[l]);
-                for (int k = 0; k < 3; ++k)
-                {
-                    rowA[l][k] = v::pair(pa + 2 * k);
-                    if (blend) rowA[l][k] = v::lerp(rowA[l][k], v::pair(pa + stepA + 2 * k), t);
-                }
-                if constexpr (Layout != kOneLevel)
-                {
-                    const float* pb = baseRowB + static_cast<size_t>(Layout == kSameGrid ? ia[l] : ib[l]);
-                    for (int k = 0; k < 3; ++k)
-                    {
-                        rowB[l][k] = v::pair(pb + 2 * k);
-                        if (blend) rowB[l][k] = v::lerp(rowB[l][k], v::pair(pb + stepB + 2 * k), t);
-                    }
-                }
-                if constexpr (Layout == kSameGrid)
-                    for (int k = 0; k < 3; ++k)
-                        rowA[l][k] = v::add(rowB[l][k], v::mul(wv, v::sub(rowA[l][k], rowB[l][k])));
-            }
-            v::D2 y[6];
-            v::columns2(rowA[0], rowA[1], y);
-            v::D2 r = v::interpolateLanes<double>(y, xa);
-            if constexpr (Layout == kTwoGrids)
-            {
-                v::columns2(rowB[0], rowB[1], y);
-                const v::D2 rb = v::interpolateLanes<double>(y, xb);
-                r = v::add(rb, v::mul(wv, v::sub(r, rb)));
-            }
-            v::store(out + j, r);
-        }
-        return j;
     }
 #endif
 
@@ -1484,7 +1413,12 @@ private:
                 float* dst = data.data() + offsets[l]
                            + static_cast<size_t>(f) * static_cast<size_t>(size + 2 * kGuard);
                 for (int i = 0; i < size; ++i)
-                    dst[kGuard + i] = static_cast<float>(cycle[static_cast<size_t>(i)] * gain);
+                {
+                    // No negative zeros: the block kernels blend frames with t = 0
+                    // arithmetically, and -0 + 0 would read back as +0.
+                    const float v = static_cast<float>(cycle[static_cast<size_t>(i)] * gain);
+                    dst[kGuard + i] = (v == 0.0f) ? 0.0f : v;
+                }
                 for (int g = 0; g < kGuard; ++g)
                 {
                     dst[g] = dst[size + g];                     // wraps of the cycle's end

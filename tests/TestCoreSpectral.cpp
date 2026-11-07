@@ -1358,6 +1358,65 @@ DSPARK_TEST(Resampler_two_stage_spans_agree_and_vanish_outside_reach)
     }
 }
 
+// A negative length used to size the output vector as a huge unsigned count
+// (std::length_error or bad_alloc, or a crash where exceptions are off); an
+// empty or null input converts to nothing, on both engines.
+DSPARK_TEST(Resampler_process_rejects_negative_and_null_input)
+{
+    for (const auto engine : { Resampler<float>::OfflineEngine::Direct, Resampler<float>::OfflineEngine::TwoStage })
+    {
+        Resampler<float> r;
+        r.prepare(48000.0, 44100.0, Resampler<float>::Quality::High);
+        r.setOfflineEngine(engine);
+        const float x[8] = { 0.5f, -0.25f, 0.125f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        EXPECT_TRUE(r.process(x, -5).empty());
+        EXPECT_TRUE(r.process(x, std::numeric_limits<int>::min()).empty());
+        EXPECT_TRUE(r.process(x, 0).empty());
+        EXPECT_EQ(r.process(x, 8).size(), static_cast<size_t>(std::ceil(8 * 44100.0 / 48000.0)));
+    }
+    Resampler<double> r;
+    r.prepare(96000.0, 44100.0, Resampler<double>::Quality::Ultra);
+    r.setOfflineEngine(Resampler<double>::OfflineEngine::TwoStage);
+    EXPECT_TRUE(r.process(nullptr, 100).empty());
+}
+
+// The overload into caller storage writes process()'s samples bit for bit,
+// whole or truncated to its capacity, and nothing for unusable arguments.
+DSPARK_TEST(Resampler_process_into_caller_storage_matches_process)
+{
+    using RD = Resampler<double>;
+    uint32_t s = 5u;
+    std::vector<double> x(30000);
+    for (auto& v : x) { s = s * 1664525u + 1013904223u; v = static_cast<double>(s >> 8) / 16777216.0 - 0.5; }
+    for (const auto engine : { RD::OfflineEngine::Direct, RD::OfflineEngine::TwoStage })
+        for (const auto& [src, dst] : { std::pair<double, double>{ 96000.0, 44100.0 }, { 44100.0, 48000.0 },
+                                        { 48000.0, 96000.0 }, { 44100.0, 48000.0 * 1.0000371 } })
+        {
+            RD r;
+            r.prepare(src, dst, RD::Quality::High);
+            r.setOfflineEngine(engine);
+            const auto whole = r.process(x.data(), static_cast<int>(x.size()));
+            std::vector<double> into(whole.size() + 5, 7.0);
+            EXPECT_EQ(r.process(x.data(), static_cast<int>(x.size()), into.data(), static_cast<int64_t>(into.size())),
+                      static_cast<int64_t>(whole.size()));
+            bool same = true;
+            for (size_t k = 0; k < whole.size(); ++k) same = same && into[k] == whole[k];
+            EXPECT_TRUE(same);
+            EXPECT_EQ(into[whole.size()], 7.0);
+            std::vector<double> part(1000, 7.0);
+            EXPECT_EQ(r.process(x.data(), static_cast<int>(x.size()), part.data(), 1000), 1000);
+            for (size_t k = 0; k < part.size(); ++k) same = same && part[k] == whole[k];
+            EXPECT_TRUE(same);
+            EXPECT_EQ(r.process(x.data(), -3, part.data(), 1000), 0);
+            EXPECT_EQ(r.process(nullptr, 100, part.data(), 1000), 0);
+            EXPECT_EQ(r.process(x.data(), 100, nullptr, 1000), 0);
+            EXPECT_EQ(r.process(x.data(), 100, part.data(), 0), 0);
+        }
+    RD unprepared;
+    double out[4] = {};
+    EXPECT_EQ(unprepared.process(x.data(), 100, out, 4), 0);
+}
+
 // ============================================================================
 // ZeroLatencyConvolver (Gardner non-uniform partitioning)
 // ============================================================================

@@ -30,6 +30,15 @@
  *   way.
  * - The wrapper-owned Bypass uses CLAP_PARAM_IS_BYPASS and the same short
  *   crossfade against the kept dry signal.
+ * - Every parameter is CLAP_PARAM_IS_MODULATABLE: a host's global
+ *   modulation (CLAP_EVENT_PARAM_MOD, plain units) is added to the value
+ *   the plugin's setParameter receives, clamped and snapped like any other
+ *   value, sample-accurately like automation. The parameter's own value
+ *   (get_value, state, the editor) stays unmodulated, as CLAP requires.
+ *   Per-note, key, channel and port modulation is not offered.
+ * - start_processing() clears the processing history through the plugin's
+ *   reset(), so a host that stops and restarts processing (a sleeping
+ *   device waking up, a transport restart) never hears a stale tail.
  * - Buses follow the declared ChannelSupport through audio-ports-config
  *   (Mono / Stereo configurations); Category::Instrument drops the audio
  *   inputs and HasMidi adds a note port accepting both CLAP note events
@@ -134,6 +143,8 @@ struct Plugin
     ActiveNotes sounding;                // for CLAP's wildcard note-off / choke
 
     std::atomic<double> shadow[kNumParams == 0 ? 1 : kNumParams] {};
+    /// Host modulation amount per parameter, plain units (audio thread).
+    double modulation[kNumParams == 0 ? 1 : kNumParams] {};
     std::atomic<bool>   bypass { false };
     std::atomic<int>    currentProgram { 0 };   // last factory preset loaded
     float bypassMix = 0.0f;
@@ -179,14 +190,24 @@ struct Plugin
         return static_cast<Plugin*>(p->plugin_data);
     }
 
+    /** The plain value the DSP hears for a parameter at @p normalized: the
+     *  value plus the host's modulation amount, clamped to the range and
+     *  snapped like any other value (CLAP: value heard = value + mod). */
+    double heardPlain(int index, double normalized) const noexcept
+    {
+        const auto& spec = P::parameters[static_cast<size_t>(index)];
+        const double value = toPlain(spec, normalized);
+        const double mod = modulation[static_cast<size_t>(index)];
+        return (mod == 0.0) ? value : toPlain(spec, toNormalized(spec, value + mod));
+    }
+
     void applyNormalized(int index, double normalized) noexcept
     {
         // Host values are untrusted doubles: a NaN would pass both range
         // clamps, poison the shadow and reach the user's setter. Ignore it.
         if (normalized != normalized) return;
-        const auto& spec = P::parameters[static_cast<size_t>(index)];
         shadow[static_cast<size_t>(index)].store(normalized, std::memory_order_relaxed);
-        user.setParameter(index, static_cast<float>(toPlain(spec, normalized)));
+        user.setParameter(index, static_cast<float>(heardPlain(index, normalized)));
     }
 
     static int indexOfParamId(uint32_t id) noexcept
@@ -217,9 +238,8 @@ struct Plugin
     bool drainPending() noexcept
     {
         return pending.drain([this](int i) {
-            user.setParameter(i, static_cast<float>(toPlain(
-                P::parameters[static_cast<size_t>(i)],
-                shadow[static_cast<size_t>(i)].load(std::memory_order_relaxed))));
+            user.setParameter(i, static_cast<float>(heardPlain(
+                i, shadow[static_cast<size_t>(i)].load(std::memory_order_relaxed))));
         });
     }
 
@@ -297,6 +317,20 @@ struct Plugin
                 out.value = toNormalized(P::parameters[static_cast<size_t>(idx)],
                                          pv->value);
             }
+        }
+        else if (ev->type == CLAP_EVENT_PARAM_MOD)
+        {
+            // The global (monophonic) signal only: no parameter declares
+            // per-note, key, channel or port modulation. A NaN amount from
+            // the host is ignored like a NaN value.
+            const auto* pm = reinterpret_cast<const clap_event_param_mod_t*>(ev);
+            if (pm->note_id >= 0 || pm->key >= 0 || pm->channel >= 0 || pm->port_index >= 0)
+                return;
+            if (pm->amount != pm->amount) return;
+            if (indexOfParamId(pm->param_id) < 0) return;
+            out.kind = BlockEvent::Kind::ParamMod;
+            out.paramId = pm->param_id;
+            out.value = pm->amount;
         }
         else if constexpr (HasMidi<P>)
         {
@@ -440,6 +474,15 @@ struct Plugin
                 user.handleMidiEvent(midi);
             }
             return false;
+        case BlockEvent::Kind::ParamMod:
+            if (const int idx = indexOfParamId(ev.paramId); idx >= 0)
+            {
+                modulation[static_cast<size_t>(idx)] = ev.value;
+                user.setParameter(idx, static_cast<float>(heardPlain(
+                    idx, shadow[static_cast<size_t>(idx)].load(std::memory_order_relaxed))));
+                return true;
+            }
+            return false;
         case BlockEvent::Kind::Param:
         default:
             if (const int idx = indexOfParamId(ev.paramId); idx >= 0)
@@ -580,8 +623,8 @@ struct Plugin
         s->pending.drain([](int) {});   // every value is re-applied right below
         for (size_t i = 0; i < kNumParams; ++i)
             s->user.setParameter(static_cast<int>(i),
-                static_cast<float>(toPlain(P::parameters[i],
-                                           s->shadow[i].load(std::memory_order_relaxed))));
+                static_cast<float>(s->heardPlain(static_cast<int>(i),
+                                                 s->shadow[i].load(std::memory_order_relaxed))));
         s->dryL.assign(maxFrames, 0.0f);
         s->dryR.assign(maxFrames, 0.0f);
         if constexpr (HasSidechain<P>)
@@ -614,7 +657,14 @@ struct Plugin
         s->drainPending();   // no process()/flush() can run now (main thread)
     }
 
-    static bool sStartProcessing(const clap_plugin_t*) noexcept { return true; }
+    /** [audio-thread & active]: processing (re)starts from a clean history,
+     *  as after reset(). The old no-op kept whatever a stopped processing
+     *  run left in delay lines and tails. */
+    static bool sStartProcessing(const clap_plugin_t* p) noexcept
+    {
+        sReset(p);
+        return true;
+    }
     static void sStopProcessing(const clap_plugin_t*) noexcept {}
 
     static void sReset(const clap_plugin_t* p) noexcept
@@ -1121,7 +1171,7 @@ struct Plugin
         const auto& spec = P::parameters[index];
         info->id = hash32(spec.id);
         std::snprintf(info->name, sizeof(info->name), "%s", spec.name);
-        info->flags = CLAP_PARAM_IS_AUTOMATABLE;
+        info->flags = CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_MODULATABLE;
         // CLAP_PARAM_IS_STEPPED means "integer values only": hosts truncate.
         // Only a grid of whole numbers one apart qualifies (toggles, choices,
         // stepped 1..8). A finer or coarser grid stays continuous for the

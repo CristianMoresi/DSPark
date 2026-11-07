@@ -54,11 +54,17 @@
  *   which this decoder uses to return exactly the samples written
  * - Produces standard-compliant MP3 playable by any decoder
  *
- * @warning DECODE-ALL ARCHITECTURE: Because MP3 uses a backward-referencing
- * Bit Reservoir, random-access streaming is non-trivial. openRead() decodes
- * the ENTIRE FILE into RAM (input capped at kMaxInputBytes, decoded PCM at
- * kMaxDecodedPcmBytes). This operation takes time and blocks the thread.
- * NEVER call openRead() from the real-time audio thread.
+ * **Streaming reads**: openRead() loads the compressed file into RAM (capped
+ * at kMaxInputBytes) and indexes its frames; it decodes nothing.
+ * readSamples() decodes the frames its range covers, so a file is never held
+ * as decoded PCM and reading it in chunks costs no more than one pass. A
+ * read that starts where the previous one ended continues the decoder; any
+ * other range restarts it two frames earlier, with the bit reservoir rebuilt
+ * from the main data of the frames before them, so every range returns
+ * exactly the samples a decode from the start of the file gives.
+ *
+ * @warning openRead() and readSamples() read and decode on the calling
+ * thread and block it. NEVER call them from the real-time audio thread.
  *
  * Threading: owner-managed. One instance serves one file from one thread at
  * a time; no internal synchronization (see AudioFile.h).
@@ -125,7 +131,8 @@ class Mp3File : public AudioFile
 public:
     /** @brief Largest input file openRead() accepts. */
     static constexpr uint64_t kMaxInputBytes = 256ull * 1024 * 1024;
-    /** @brief Largest decoded float PCM openRead() allocates (all channels). */
+    /** @brief Largest decoded length, as float PCM bytes over all channels,
+     *         of a file openRead() accepts. */
     static constexpr uint64_t kMaxDecodedPcmBytes = 8ull << 30;
 
     ~Mp3File() override { close(); }
@@ -157,23 +164,14 @@ public:
         filePos_ = 0;
         skipID3v2();
 
-        if (!scanFrames())
+        if (!scanFrames() || !prepareDecoder())
         {
             fileData_.clear();
+            frameOffsets_.clear();
             info_ = {};
             return false;
         }
 
-        if (!decodeAll())
-        {
-            fileData_.clear();
-            decodedSamplesFlat_.clear();
-            info_ = {};
-            return false;
-        }
-        applyGaplessTrim();
-
-        fileData_.clear(); // Free raw memory after full planar extraction
         isOpen_ = true;
         return true;
     }
@@ -253,17 +251,30 @@ public:
         const int nCh = std::min(dest.getNumChannels(), static_cast<int>(info_.numChannels));
         const int64_t toCopy = std::min(numFrames, static_cast<int64_t>(dest.getNumSamples()));
         if (toCopy <= 0) return true;
-        const size_t bytesToCopy = static_cast<size_t>(toCopy) * sizeof(float);
 
-        for (int ch = 0; ch < nCh; ++ch)
+        // The range in the decoded stream (before the gapless trim), copied
+        // frame by frame from the decoded-frame buffer.
+        const int64_t spf = samplesPerFrame_;
+        int64_t pos = trimStart_ + startFrame;
+        int64_t done = 0;
+        while (done < toCopy)
         {
-            float* dst = dest.getChannel(ch);
-            const float* src = decodedSamplesFlat_.data()
-                             + static_cast<size_t>(ch) * static_cast<size_t>(info_.numSamples)
-                             + static_cast<size_t>(startFrame);
-            std::memcpy(dst, src, bytesToCopy);
+            const auto frame = static_cast<size_t>(pos / spf);
+            const int64_t within = pos - static_cast<int64_t>(frame) * spf;
+            if (cachedFrame_ != frame)
+            {
+                if (nextFrame_ != frame) seekDecoder(frame);
+                decodeFrame(frame);
+            }
+            const int64_t n = std::min(spf - within, toCopy - done);
+            for (int ch = 0; ch < nCh; ++ch)
+                std::memcpy(dest.getChannel(ch) + done,
+                            frameCache_.data() + static_cast<size_t>(ch) * kSamplesPerFrame
+                                + static_cast<size_t>(within),
+                            static_cast<size_t>(n) * sizeof(float));
+            pos += n;
+            done += n;
         }
-
         return true;
     }
 
@@ -331,8 +342,11 @@ public:
         isWriting_ = false;
 
         fileData_.clear();
-        decodedSamplesFlat_.clear();
         frameOffsets_.clear();
+        frameCache_.clear();
+        cachedFrame_ = kNoFrame;
+        nextFrame_ = 0;
+        trimStart_ = 0;
         info_ = {};
         isOpen_ = false;
         filePos_ = 0;
@@ -375,6 +389,15 @@ private:
     /// frame can make (four part2_3_lengths, each overrun by at most one
     /// pair or quad) stays inside the buffer.
     static constexpr size_t kMainDataPad = 4 * ((kMaxPart23Bits + 64) / 8) + 16;
+    /// Frames decoded ahead of a frame that readSamples() reaches by a seek.
+    /// Output becomes exact two granules after a restart in Layer III (one to
+    /// fill the IMDCT overlap, one more for the 16-slot synthesis window to
+    /// hold only exact slots) and after 16 slots in Layer I/II; two frames
+    /// cover both in every layer and version.
+    static constexpr size_t kPrerollFrames = 2;
+    /// Largest main_data_begin (9 bits): the reservoir bytes a seek restores.
+    static constexpr size_t kMaxMainDataBegin = 511;
+    static constexpr size_t kNoFrame = std::numeric_limits<size_t>::max();
 
     // ========================================================================
     // Frame header & Side Info Structs
@@ -1253,7 +1276,7 @@ private:
     struct ChannelState
     {
         double prevBlock[576]    = {};
-        double synthBuf[1024]    = {};
+        double synthBuf[detail::mp3::kSynthRing] = {};
         int    synthOffset       = 0;
     };
 
@@ -1264,8 +1287,16 @@ private:
     bool writeError_ = false;
 
     std::vector<size_t> frameOffsets_;
-    std::vector<float> decodedSamplesFlat_; // Planar contiguous buffer [channel][sample]
     std::vector<uint8_t> mainData_;         // Reservoir + frame main data, reused per frame
+    /// The last decoded frame, planar: channel ch at ch * kSamplesPerFrame.
+    std::vector<float> frameCache_;
+    /// Frame held in frameCache_ (kNoFrame = none).
+    size_t cachedFrame_ = kNoFrame;
+    /// Frame the decoder state is ready for: decoding it continues the stream.
+    size_t nextFrame_ = 0;
+    /// Decoded samples ahead of the first sample readSamples() returns (the
+    /// gapless trim).
+    int64_t trimStart_ = 0;
 
     // Gapless information from a Xing/Info tag frame (decoder).
     bool gapless_ = false;
@@ -1503,9 +1534,12 @@ private:
      * A tag that counts fewer frames than the stream holds is stale (the file
      * was concatenated or re-muxed after tagging). Its end position would cut
      * off every frame it does not know about, so only the start is trimmed.
+     * The trim is applied by readSamples(), which maps its range past
+     * trimStart_; nothing is decoded or moved here.
      */
     void applyGaplessTrim()
     {
+        trimStart_ = 0;
         if (!gapless_) return;
         const int64_t spf = samplesPerFrame_;
         const int64_t decoded = info_.numSamples;
@@ -1517,19 +1551,8 @@ private:
                            : std::min(decoded, frames * spf - gaplessPadding_ + kDecoderDelay);
         if (start > stop) return;   // implausible values: keep the raw stream
 
-        const int64_t kept = stop - start;
-        const size_t nch = info_.numChannels;
-        // In place: channel ch moves from ch * decoded + start back to
-        // ch * kept, so moving the channels in order never overwrites a
-        // channel not yet moved (a second full-size buffer used to be
-        // allocated and filled).
-        float* pcm = decodedSamplesFlat_.data();
-        for (size_t ch = 0; ch < nch; ++ch)
-            std::memmove(pcm + ch * static_cast<size_t>(kept),
-                         pcm + ch * static_cast<size_t>(decoded) + static_cast<size_t>(start),
-                         static_cast<size_t>(kept) * sizeof(float));
-        decodedSamplesFlat_.resize(nch * static_cast<size_t>(kept));
-        info_.numSamples = kept;
+        trimStart_ = start;
+        info_.numSamples = stop - start;
     }
 
     /// Frame header at pos, its size included; a free-format header needs
@@ -3511,12 +3534,11 @@ private:
         }
     }
 
-    /// Decodes one Layer I or Layer II frame into the output at sampleIdx.
-    /// A frame cut short by the end of the file reads zeros past its last
-    /// byte; one that uses a forbidden code is silent. Either way the
-    /// synthesis runs, so the filterbank state stays continuous.
-    void decodeLayer12Frame(const FrameHeader& hdr, size_t frameStart, int64_t sampleIdx,
-                            int64_t totalSamples)
+    /// Decodes one Layer I or Layer II frame into frameCache_. A frame cut
+    /// short by the end of the file reads zeros past its last byte; one that
+    /// uses a forbidden code is silent. Either way the synthesis runs, so the
+    /// filterbank state stays continuous.
+    void decodeLayer12Frame(const FrameHeader& hdr, size_t frameStart)
     {
         const size_t headerSize = 4 + (hdr.crcProtect ? 2 : 0);
         const size_t begin = frameStart + headerSize;
@@ -3533,216 +3555,274 @@ private:
         else
             readLayer2(br, hdr, layer12Sub_);
 
-        float pcm[32 * 36];
         for (int ch = 0; ch < hdr.channels; ++ch)
-        {
-            synthesize(layer12Sub_[ch], slots, slots, ch, pcm);
-            const int64_t room = totalSamples - sampleIdx;
-            if (room > 0)
-                std::memcpy(decodedSamplesFlat_.data()
-                                + static_cast<size_t>(ch) * static_cast<size_t>(totalSamples)
-                                + static_cast<size_t>(sampleIdx),
-                            pcm, static_cast<size_t>(std::min<int64_t>(room, 32 * slots)) * sizeof(float));
-        }
+            synthesize(layer12Sub_[ch], slots, slots, ch,
+                       frameCache_.data() + static_cast<size_t>(ch) * kSamplesPerFrame);
     }
 
-    bool decodeAll()
+    /**
+     * @brief Bounds the decoded size, allocates the decoder's buffers and
+     *        positions it at the first frame.
+     *
+     * Nothing is decoded here: readSamples() decodes the frames a range
+     * covers, so openRead() costs one scan of the file and the decoded PCM
+     * is never held for the whole file.
+     */
+    bool prepareDecoder()
     {
-        const int nch = static_cast<int>(info_.numChannels);
-        const int64_t totalSamples = info_.numSamples;
-
         // The decoded size follows from the frame count alone, so a small
-        // file of tiny frames can ask for a hundred times its own size. Bound
-        // it, and compute it in 64 bits: nch * totalSamples used to wrap a
-        // 32-bit size_t (WASM, x86) into a short buffer that the decode loop
-        // then wrote past.
-        const uint64_t floats = static_cast<uint64_t>(nch) * static_cast<uint64_t>(totalSamples);
-        if (floats > kMaxDecodedPcmBytes / sizeof(float)
-            || floats > std::numeric_limits<size_t>::max() / sizeof(float))
-            return false;
+        // file of tiny frames can claim a hundred times its own size; such
+        // a file is rejected. nch * numSamples is computed in 64 bits.
+        const uint64_t floats = static_cast<uint64_t>(info_.numChannels)
+                              * static_cast<uint64_t>(info_.numSamples);
+        if (floats > kMaxDecodedPcmBytes / sizeof(float)) return false;
         try
         {
-            decodedSamplesFlat_.assign(static_cast<size_t>(floats), 0.0f);
             reservoir_.assign(kMaxReservoir, 0);
-            mainData_.reserve(kMaxReservoir + 2048 + kMainDataPad);
+            mainData_.reserve(kMaxReservoir + kMaxFreeFormatBytes + kMainDataPad);
+            frameCache_.assign(static_cast<size_t>(kChannelsMax) * kSamplesPerFrame, 0.0f);
         }
         catch (const std::bad_alloc&)
         {
-            decodedSamplesFlat_.clear();
             return false;
         }
+        wideKernels_ = simd::isRuntimeDispatchActive();
+        applyGaplessTrim();
+        resetDecoder();
+        return true;
+    }
 
+    /// The decoder state at the start of the stream.
+    void resetDecoder() noexcept
+    {
         for (int ch = 0; ch < kChannelsMax; ++ch) channelState_[ch] = {};
         reservoirSize_ = 0;
-        wideKernels_ = simd::isRuntimeDispatchActive();
+        nextFrame_ = 0;
+        cachedFrame_ = kNoFrame;
+    }
 
-        int prevScalefac[2][39] = {};
-        int64_t sampleIdx = 0;
-
-        const size_t totalFrames = frameOffsets_.size();
-        for (size_t frameIdx = 0; frameIdx < totalFrames; ++frameIdx)
+    /**
+     * @brief Positions the decoder so that decoding @p frame gives exactly
+     *        the samples a decode from the first frame gives.
+     *
+     * The decoder restarts kPrerollFrames earlier and discards those frames.
+     * Layer III frames also read the bit reservoir: the main data of the
+     * frames before the restart is appended to it, without decoding, until
+     * it holds kMaxMainDataBegin bytes or the stream start is reached. That
+     * is every byte a main_data_begin can point back to, so the reservoir
+     * ends with the same bytes, and accepts or mutes the same frames, as
+     * after a decode from the start.
+     */
+    void seekDecoder(size_t frame)
+    {
+        resetDecoder();
+        const size_t first = (frame > kPrerollFrames) ? frame - kPrerollFrames : 0;
+        if (first > 0 && layerOf(frameOffsets_[first]) == 3)
         {
-            size_t frameStart = frameOffsets_[frameIdx];
-
-            // A frame that fails to parse leaves its slot silent instead of
-            // shifting the rest of the file earlier in time.
-            FrameHeader hdr {};
-            if (!parseFrameHeader(frameStart, hdr)) { sampleIdx += samplesPerFrame_; continue; }
-
-            if (hdr.layerNumber != 3)
+            size_t from = first;
+            size_t bytes = 0;
+            while (from > 0 && bytes < kMaxMainDataBegin)
             {
-                decodeLayer12Frame(hdr, frameStart, sampleIdx, totalSamples);
-                sampleIdx += samplesPerFrame_;
-                continue;
+                size_t start = 0, size = 0;
+                --from;
+                if (frameMainData(from, start, size)) bytes += size;
             }
-
-            size_t headerSize = 4 + (hdr.crcProtect ? 2 : 0);
-
-            // The frame scan only proves that the 4 sync bytes are inside the
-            // file, so a stream truncated inside a frame reaches here with a
-            // side-info block that runs past the end of the buffer. Reading it
-            // is a heap over-read on attacker-supplied input; a frame whose
-            // side info is not fully present is skipped and leaves its slot
-            // silent, exactly like a frame whose header fails to parse.
-            if (frameStart + headerSize + static_cast<size_t>(hdr.sideInfoSize) > fileData_.size())
+            for (size_t k = from; k < first; ++k)
             {
-                sampleIdx += samplesPerFrame_;
-                continue;
-            }
-
-            BitReader siBr;
-            siBr.init(fileData_.data() + frameStart + headerSize, static_cast<size_t>(hdr.sideInfoSize));
-
-            SideInfo si {};
-            if (!parseSideInfo(siBr, hdr, si)) { sampleIdx += samplesPerFrame_; continue; }
-
-            size_t mainDataStart = frameStart + headerSize + static_cast<size_t>(hdr.sideInfoSize);
-            size_t mainDataSize  = static_cast<size_t>(hdr.frameSize) - headerSize - static_cast<size_t>(hdr.sideInfoSize);
-
-            size_t mainDataBegin = static_cast<size_t>(si.main_data_begin);
-            mainData_.clear();
-
-            if (mainDataBegin > reservoirSize_)
-            {
-                // The bytes this frame's main data starts in are not here (a
-                // stream cut in the middle, or a lost frame). Decoding from
-                // the start of the available bytes instead read every field
-                // from the wrong position and produced a burst of noise at
-                // program level; the frame is muted as the reference decoders
-                // do, while its main data still feeds the reservoir and its
-                // block types keep the overlap consistent.
-                for (int gr = 0; gr < hdr.granules; ++gr)
-                    for (int ch = 0; ch < hdr.channels; ++ch)
-                    {
-                        si.gr[gr][ch].part2_3_length = 0;
-                        si.gr[gr][ch].big_values = 0;
-                        si.gr[gr][ch].scalefac_compress = 0;
-                    }
-                mainDataBegin = 0;
-            }
-
-            if (mainDataBegin > 0)
-            {
-                size_t resStart = reservoirSize_ - mainDataBegin;
-                mainData_.insert(mainData_.end(),
-                    reservoir_.begin() + static_cast<ptrdiff_t>(resStart),
-                    reservoir_.begin() + static_cast<ptrdiff_t>(reservoirSize_));
-            }
-
-            if (mainDataStart + mainDataSize <= fileData_.size())
-            {
-                mainData_.insert(mainData_.end(),
-                    fileData_.begin() + static_cast<ptrdiff_t>(mainDataStart),
-                    fileData_.begin() + static_cast<ptrdiff_t>(mainDataStart + mainDataSize));
-            }
-
-            if (mainDataSize > 0 && mainDataStart + mainDataSize <= fileData_.size())
-            {
-                size_t newTotal = reservoirSize_ + mainDataSize;
-                if (newTotal > kMaxReservoir)
-                {
-                    size_t shift = newTotal - kMaxReservoir;
-                    if (shift < reservoirSize_)
-                    {
-                        std::memmove(reservoir_.data(), reservoir_.data() + shift, reservoirSize_ - shift);
-                        reservoirSize_ -= shift;
-                    }
-                    else reservoirSize_ = 0;
-                }
-                size_t canCopy = std::min(mainDataSize, kMaxReservoir - reservoirSize_);
-                std::memcpy(reservoir_.data() + reservoirSize_, fileData_.data() + mainDataStart, canCopy);
-                reservoirSize_ += canCopy;
-            }
-
-            // Zero padding past the main data keeps every Huffman read on the
-            // reader's 8-byte fast path; the padding reads as the zero bits
-            // the reader returns past the end of its buffer anyway.
-            mainData_.resize(mainData_.size() + kMainDataPad, 0);
-            BitReader mainBr;
-            mainBr.init(mainData_.data(), mainData_.size());
-
-            int scalefac[2][39] = {};
-            int isIllegal[2][39] = {};
-
-            for (int gr = 0; gr < hdr.granules; ++gr)
-            {
-                double xr[2][576];   // requantize() writes all 576 lines
-
-                for (int ch = 0; ch < nch; ++ch)
-                {
-                    const auto& gc = si.gr[gr][ch];
-
-                    if (gr == 1)
-                    {
-                        for (int i = 0; i < 39; ++i) scalefac[ch][i] = prevScalefac[ch][i];
-                    }
-
-                    size_t posBeforeSf = mainBr.getPos();
-                    decodeScalefactors(mainBr, gc, hdr, gr, ch, si.scfsi[ch], scalefac[ch], isIllegal[ch]);
-
-                    // part2_3_length spans scalefactors + Huffman data, so the
-                    // end position anchors at posBeforeSf. huffmanDecode also
-                    // leaves the reader exactly there (resync).
-                    int is[576];   // valid up to the returned line count
-                    const int lines = huffmanDecode(mainBr, gc, hdr, is,
-                                  posBeforeSf + static_cast<size_t>(gc.part2_3_length));
-
-                    requantize(is, lines, scalefac[ch], gc, hdr, xr[ch]);
-
-                    if (gr == 0)
-                    {
-                        for (int i = 0; i < 39; ++i) prevScalefac[ch][i] = scalefac[ch][i];
-                    }
-                }
-
-                if (nch == 2) stereoProcess(xr, si.gr[gr], hdr, scalefac, isIllegal[1]);
-
-                for (int ch = 0; ch < nch; ++ch)
-                {
-                    reorder(xr[ch], si.gr[gr][ch], hdr);
-                    aliasReduction(xr[ch], si.gr[gr][ch], hdr);
-
-                    double imdctOut[576];
-                    imdct(xr[ch], si.gr[gr][ch], hdr, ch, imdctOut);
-                    frequencyInversion(imdctOut);
-
-                    float pcm[576];
-                    synthesize(imdctOut, 18, 18, ch, pcm);
-
-                    const int64_t room = totalSamples - sampleIdx;
-                    if (room > 0)
-                        std::memcpy(decodedSamplesFlat_.data()
-                                        + static_cast<size_t>(ch) * static_cast<size_t>(totalSamples)
-                                        + static_cast<size_t>(sampleIdx),
-                                    pcm, static_cast<size_t>(std::min<int64_t>(room, kSamplesPerGranule))
-                                             * sizeof(float));
-                }
-
-                sampleIdx += kSamplesPerGranule;
+                size_t start = 0, size = 0;
+                if (frameMainData(k, start, size)) appendReservoir(start, size);
             }
         }
+        for (size_t k = first; k < frame; ++k) decodeFrame(k);
+    }
 
-        return true;
+    /// Layer number (1..3) of the frame header at pos, 0 if it does not parse.
+    int layerOf(size_t pos) const
+    {
+        FrameHeader hdr {};
+        return parseFrameHeader(pos, hdr) ? hdr.layerNumber : 0;
+    }
+
+    /// The main data of Layer III frame @p frameIdx as it feeds the
+    /// reservoir: false for a frame decodeFrame() skips, or whose main data
+    /// runs past the end of the file (neither is appended).
+    bool frameMainData(size_t frameIdx, size_t& start, size_t& size) const
+    {
+        const size_t frameStart = frameOffsets_[frameIdx];
+        FrameHeader hdr {};
+        if (!parseFrameHeader(frameStart, hdr) || hdr.layerNumber != 3) return false;
+        const size_t headerSize = 4 + (hdr.crcProtect ? 2 : 0);
+        if (frameStart + headerSize + static_cast<size_t>(hdr.sideInfoSize) > fileData_.size())
+            return false;
+        start = frameStart + headerSize + static_cast<size_t>(hdr.sideInfoSize);
+        size = static_cast<size_t>(hdr.frameSize) - headerSize - static_cast<size_t>(hdr.sideInfoSize);
+        return size > 0 && start + size <= fileData_.size();
+    }
+
+    /// Appends a frame's main data to the bit reservoir, keeping its last
+    /// kMaxReservoir bytes.
+    void appendReservoir(size_t start, size_t size) noexcept
+    {
+        const size_t newTotal = reservoirSize_ + size;
+        if (newTotal > kMaxReservoir)
+        {
+            const size_t shift = newTotal - kMaxReservoir;
+            if (shift < reservoirSize_)
+            {
+                std::memmove(reservoir_.data(), reservoir_.data() + shift, reservoirSize_ - shift);
+                reservoirSize_ -= shift;
+            }
+            else reservoirSize_ = 0;
+        }
+        const size_t canCopy = std::min(size, kMaxReservoir - reservoirSize_);
+        std::memcpy(reservoir_.data() + reservoirSize_, fileData_.data() + start, canCopy);
+        reservoirSize_ += canCopy;
+    }
+
+    /// Decodes frame @p frameIdx into frameCache_ (samplesPerFrame_ samples
+    /// per channel) and advances the decoder state past it.
+    void decodeFrame(size_t frameIdx)
+    {
+        cachedFrame_ = frameIdx;
+        nextFrame_ = frameIdx + 1;
+        const int nch = static_cast<int>(info_.numChannels);
+        const size_t frameStart = frameOffsets_[frameIdx];
+        auto silence = [&] {
+            for (int ch = 0; ch < nch; ++ch)
+                std::fill_n(frameCache_.data() + static_cast<size_t>(ch) * kSamplesPerFrame,
+                            samplesPerFrame_, 0.0f);
+        };
+
+        // A frame that fails to parse is silent instead of shifting the rest
+        // of the file earlier in time.
+        FrameHeader hdr {};
+        if (!parseFrameHeader(frameStart, hdr)) { silence(); return; }
+
+        if (hdr.layerNumber != 3)
+        {
+            decodeLayer12Frame(hdr, frameStart);
+            return;
+        }
+
+        const size_t headerSize = 4 + (hdr.crcProtect ? 2 : 0);
+
+        // The frame scan only proves that the 4 sync bytes are inside the
+        // file, so a stream truncated inside a frame reaches here with a
+        // side-info block that runs past the end of the buffer. Reading it
+        // is a heap over-read on attacker-supplied input; a frame whose
+        // side info is not fully present is skipped and left silent,
+        // exactly like a frame whose header fails to parse.
+        if (frameStart + headerSize + static_cast<size_t>(hdr.sideInfoSize) > fileData_.size())
+        {
+            silence();
+            return;
+        }
+
+        BitReader siBr;
+        siBr.init(fileData_.data() + frameStart + headerSize, static_cast<size_t>(hdr.sideInfoSize));
+
+        SideInfo si {};
+        if (!parseSideInfo(siBr, hdr, si)) { silence(); return; }
+
+        const size_t mainDataStart = frameStart + headerSize + static_cast<size_t>(hdr.sideInfoSize);
+        const size_t mainDataSize  = static_cast<size_t>(hdr.frameSize) - headerSize - static_cast<size_t>(hdr.sideInfoSize);
+
+        size_t mainDataBegin = static_cast<size_t>(si.main_data_begin);
+        mainData_.clear();
+
+        if (mainDataBegin > reservoirSize_)
+        {
+            // The bytes this frame's main data starts in are not here (a
+            // stream cut in the middle, or a lost frame). Decoding from
+            // the start of the available bytes instead read every field
+            // from the wrong position and produced a burst of noise at
+            // program level; the frame is muted as the reference decoders
+            // do, while its main data still feeds the reservoir and its
+            // block types keep the overlap consistent.
+            for (int gr = 0; gr < hdr.granules; ++gr)
+                for (int ch = 0; ch < hdr.channels; ++ch)
+                {
+                    si.gr[gr][ch].part2_3_length = 0;
+                    si.gr[gr][ch].big_values = 0;
+                    si.gr[gr][ch].scalefac_compress = 0;
+                }
+            mainDataBegin = 0;
+        }
+
+        if (mainDataBegin > 0)
+        {
+            const size_t resStart = reservoirSize_ - mainDataBegin;
+            mainData_.insert(mainData_.end(),
+                reservoir_.begin() + static_cast<ptrdiff_t>(resStart),
+                reservoir_.begin() + static_cast<ptrdiff_t>(reservoirSize_));
+        }
+
+        if (mainDataStart + mainDataSize <= fileData_.size())
+        {
+            mainData_.insert(mainData_.end(),
+                fileData_.begin() + static_cast<ptrdiff_t>(mainDataStart),
+                fileData_.begin() + static_cast<ptrdiff_t>(mainDataStart + mainDataSize));
+            if (mainDataSize > 0) appendReservoir(mainDataStart, mainDataSize);
+        }
+
+        // Zero padding past the main data keeps every Huffman read on the
+        // reader's 8-byte fast path; the padding reads as the zero bits
+        // the reader returns past the end of its buffer anyway.
+        mainData_.resize(mainData_.size() + kMainDataPad, 0);
+        BitReader mainBr;
+        mainBr.init(mainData_.data(), mainData_.size());
+
+        int scalefac[2][39] = {};
+        int prevScalefac[2][39] = {};
+        int isIllegal[2][39] = {};
+
+        for (int gr = 0; gr < hdr.granules; ++gr)
+        {
+            double xr[2][576];   // requantize() writes all 576 lines
+
+            for (int ch = 0; ch < nch; ++ch)
+            {
+                const auto& gc = si.gr[gr][ch];
+
+                if (gr == 1)
+                {
+                    for (int i = 0; i < 39; ++i) scalefac[ch][i] = prevScalefac[ch][i];
+                }
+
+                size_t posBeforeSf = mainBr.getPos();
+                decodeScalefactors(mainBr, gc, hdr, gr, ch, si.scfsi[ch], scalefac[ch], isIllegal[ch]);
+
+                // part2_3_length spans scalefactors + Huffman data, so the
+                // end position anchors at posBeforeSf. huffmanDecode also
+                // leaves the reader exactly there (resync).
+                int is[576];   // valid up to the returned line count
+                const int lines = huffmanDecode(mainBr, gc, hdr, is,
+                              posBeforeSf + static_cast<size_t>(gc.part2_3_length));
+
+                requantize(is, lines, scalefac[ch], gc, hdr, xr[ch]);
+
+                if (gr == 0)
+                {
+                    for (int i = 0; i < 39; ++i) prevScalefac[ch][i] = scalefac[ch][i];
+                }
+            }
+
+            if (nch == 2) stereoProcess(xr, si.gr[gr], hdr, scalefac, isIllegal[1]);
+
+            for (int ch = 0; ch < nch; ++ch)
+            {
+                reorder(xr[ch], si.gr[gr][ch], hdr);
+                aliasReduction(xr[ch], si.gr[gr][ch], hdr);
+
+                double imdctOut[576];
+                imdct(xr[ch], si.gr[gr][ch], hdr, ch, imdctOut);
+                frequencyInversion(imdctOut);
+
+                synthesize(imdctOut, 18, 18, ch,
+                           frameCache_.data() + static_cast<size_t>(ch) * kSamplesPerFrame
+                               + static_cast<size_t>(gr) * kSamplesPerGranule);
+            }
+        }
     }
 };
 

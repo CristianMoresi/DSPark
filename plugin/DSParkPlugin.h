@@ -780,11 +780,13 @@ inline constexpr int kMaxBlockEvents = 256;
  */
 struct BlockEvent
 {
-    enum class Kind : uint8_t { Param, Bypass, Midi };
+    /// Param: a new normalized value. ParamMod: a host modulation amount, in
+    /// plain units, added to the value the DSP hears (CLAP).
+    enum class Kind : uint8_t { Param, Bypass, Midi, ParamMod };
     int32_t  offset = 0;        ///< Frame position within the block.
     Kind     kind = Kind::Param;
-    uint32_t paramId = 0;       ///< hash32 id (Kind::Param), bypass id (Kind::Bypass).
-    double   value = 0.0;       ///< Normalized value / bypass >= 0.5.
+    uint32_t paramId = 0;       ///< hash32 id (Param, ParamMod), bypass id (Bypass).
+    double   value = 0.0;       ///< Normalized value / modulation amount / bypass >= 0.5.
     MidiEvent midi {};          ///< Kind::Midi payload.
     uint32_t order = 0;         ///< Arrival order: the tie-break of the sort.
 };
@@ -849,7 +851,9 @@ public:
         BlockEvent ev = event;
         ev.order = nextOrder_++;
         const bool isPoint = ev.kind != BlockEvent::Kind::Midi;
-        TableSlot* entry = isPoint ? find(ev.paramId) : nullptr;
+        // A modulation amount and a value of one parameter are separate
+        // points: neither supersedes the other.
+        TableSlot* entry = isPoint ? find(ev.paramId, ev.kind) : nullptr;
         const bool known = entry != nullptr && entry->generation == generation_;
         if (count_ < kMaxBlockEvents)
         {
@@ -858,7 +862,7 @@ public:
             if (isPoint)
             {
                 if (known) freeList_[freeCount_++] = static_cast<int16_t>(entry->index);
-                remember(entry, ev.paramId, index);
+                remember(entry, ev.paramId, ev.kind, index);
             }
             return;
         }
@@ -871,7 +875,7 @@ public:
         {
             const int index = freeList_[--freeCount_];
             events_[index] = ev;
-            if (isPoint) remember(entry, ev.paramId, index);
+            if (isPoint) remember(entry, ev.paramId, ev.kind, index);
             return;
         }
         ++dropped_;
@@ -891,25 +895,28 @@ private:
         uint32_t key = 0;
         uint32_t generation = 0;
         int      index = 0;
+        BlockEvent::Kind kind = BlockEvent::Kind::Param;
     };
     static constexpr int kTableSize = 2 * kMaxBlockEvents;   // power of two, load <= 1/2
 
-    /** The live entry for @p key, or the empty slot it would occupy. */
-    TableSlot* find(uint32_t key) noexcept
+    /** The live entry for (@p key, @p kind), or the empty slot it would occupy. */
+    TableSlot* find(uint32_t key, BlockEvent::Kind kind) noexcept
     {
-        uint32_t h = key * 2654435761u;
+        uint32_t h = (key + static_cast<uint32_t>(kind)) * 2654435761u;
         for (int probe = 0; probe < kTableSize; ++probe)
         {
             TableSlot& slot = table_[(h + static_cast<uint32_t>(probe)) & (kTableSize - 1)];
-            if (slot.generation != generation_ || slot.key == key) return &slot;
+            if (slot.generation != generation_ || (slot.key == key && slot.kind == kind))
+                return &slot;
         }
         return nullptr;   // unreachable: the table never fills past one half
     }
 
-    void remember(TableSlot* entry, uint32_t key, int index) noexcept
+    void remember(TableSlot* entry, uint32_t key, BlockEvent::Kind kind, int index) noexcept
     {
         if (entry == nullptr) return;
         entry->key = key;
+        entry->kind = kind;
         entry->generation = generation_;
         entry->index = index;
     }
@@ -1324,9 +1331,10 @@ struct PluginBase
 {
     /**
      * Clears processing history (delay lines, envelopes, reverb tails) on
-     * transport jumps. CLAP and AU hosts call this directly; the VST3
-     * wrapper calls it when the host stops processing (setProcessing(false)),
-     * and re-activation runs your `prepare()` again.
+     * transport jumps. CLAP and AU hosts call this directly, and the CLAP
+     * wrapper also calls it when processing starts (start_processing); the
+     * VST3 wrapper calls it when the host starts or stops processing
+     * (setProcessing), and re-activation runs your `prepare()` again.
      * Default: nothing to clear.
      */
     void reset() noexcept {}

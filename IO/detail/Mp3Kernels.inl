@@ -18,31 +18,46 @@
 // Polyphase synthesis (ISO 11172-3 Annex A.2)
 // ============================================================================
 
-/// One level of the 32-point DCT-II split of B. G. Lee (IEEE Trans. ASSP
-/// 32(6), 1984) on W independent lanes, unrolled at compile time.
+/// N vectors of W lanes held by value. A struct of its own rather than a
+/// standard array, so that no vector type becomes a template argument (GCC
+/// drops a vector type's attributes there and warns).
 template <int N, int W>
-inline void dctLevel(typename Vec<double, W>::V* x, typename Vec<double, W>::V* t,
-                     const double* twiddle) noexcept
+struct DctBlock
+{
+    typename Vec<double, W>::V v[N];
+};
+
+/// One level of the 32-point DCT-II split of B. G. Lee (IEEE Trans. ASSP
+/// 32(6), 1984) on W independent lanes, unrolled at compile time. Each level
+/// takes and returns its values by value: with no aliasing between the
+/// levels the compiler keeps the small ones in registers instead of storing
+/// every butterfly to memory and reading it back.
+template <int N, int W>
+inline DctBlock<N, W> dctValues(const DctBlock<N, W>& x, const double* twiddle) noexcept
 {
     using VD = Vec<double, W>;
-    if constexpr (N > 1)
+    if constexpr (N == 1) return x;
+    else
     {
         constexpr int h = N / 2;
+        DctBlock<h, W> lo, hi;
         for (int i = 0; i < h; ++i)
         {
-            const typename VD::V a = x[i], b = x[N - 1 - i];
-            t[i] = VD::add(a, b);
-            t[h + i] = VD::mul(VD::sub(a, b), VD::set1(twiddle[h + i]));
+            const typename VD::V a = x.v[i], b = x.v[N - 1 - i];
+            lo.v[i] = VD::add(a, b);
+            hi.v[i] = VD::mul(VD::sub(a, b), VD::set1(twiddle[h + i]));
         }
-        dctLevel<h, W>(t, x, twiddle);
-        dctLevel<h, W>(t + h, x + h, twiddle);
+        const DctBlock<h, W> L = dctValues<h, W>(lo, twiddle);
+        const DctBlock<h, W> H = dctValues<h, W>(hi, twiddle);
+        DctBlock<N, W> y;
         for (int i = 0; i < h - 1; ++i)
         {
-            x[2 * i] = t[i];
-            x[2 * i + 1] = VD::add(t[h + i], t[h + i + 1]);
+            y.v[2 * i] = L.v[i];
+            y.v[2 * i + 1] = VD::add(H.v[i], H.v[i + 1]);
         }
-        x[2 * h - 2] = t[h - 1];
-        x[2 * h - 1] = t[2 * h - 1];
+        y.v[2 * h - 2] = L.v[h - 1];
+        y.v[2 * h - 1] = H.v[h - 1];
+        return y;
     }
 }
 
@@ -60,36 +75,108 @@ inline const double* dctTwiddles() noexcept
     return table.data();
 }
 
-/// The windowing of one slot: pcm[j] = sum_{i<16} U[32 i + j] D[32 i + j],
-/// with U taken from the 16 stored vectors (U[64 i + j] = V_i[j] and
-/// U[64 i + 32 + j] = V_i[96 + j]). Both pieces are 32 contiguous values that
-/// never wrap (offsets are multiples of 32), so each term is one contiguous
-/// multiply-add over the outputs, summed in the order i = 0..15. Several
-/// vectors of outputs are held in accumulators across all sixteen terms, as
-/// many independent chains as the register file holds (eight with four-lane
-/// vectors, four with two).
-inline void windowSlot(const double* buf, int offset, const double* window, double acc[32]) noexcept
+/// Values in the ring of matrixed slots: 32 vectors of 64, the 16 the window
+/// reads plus room to store a whole group of new slots before windowing it.
+inline constexpr int kSynthRing = 2048;
+
+/// The windowing of S slots that are already in the ring at offsets[s]:
+/// pcm[32 s + j] = sum_{i<16} U_s[32 i + j] D[32 i + j], with U_s taken from
+/// the 16 stored vectors (U[64 i + j] = V_i[j] and U[64 i + 32 + j] =
+/// V_i[96 + j]). Both pieces are 32 contiguous values that never wrap
+/// (offsets are multiples of 64), so each term is one contiguous multiply-add
+/// over the outputs, summed in the order i = 0..15. The S slots share every
+/// load of the window, which is what bounds the cost of a single slot; eight
+/// accumulators in all cover the multiply-add latency. Outputs are clamped
+/// to [-1, 1] and converted to float.
+template <int S>
+inline void windowSlots(const double* buf, const int* offsets, const double* window, float* pcm) noexcept
 {
     using VD = Vec<double, kWide>;
-    constexpr int kVecs = (kWide >= 4) ? 8 : 4;
+    constexpr int kAcc = (S == 1 && kWide < 4) ? 4 : 8;
+    constexpr int kVecs = (kAcc / S > 0) ? kAcc / S : 1;
     constexpr int kChunk = kVecs * kWide;
+    constexpr int kMask = kSynthRing - 1;
     static_assert(32 % kChunk == 0, "the outputs must fill whole chunks");
     for (int jb = 0; jb < 32; jb += kChunk)
     {
-        typename VD::V a[kVecs];
-        for (int v = 0; v < kVecs; ++v) a[v] = VD::set1(0.0);
+        typename VD::V a[S][kVecs];
+        for (int s = 0; s < S; ++s)
+            for (int v = 0; v < kVecs; ++v) a[s][v] = VD::set1(0.0);
         for (int i = 0; i < 8; ++i)
         {
-            const double* va = buf + ((offset + i * 128) & 1023) + jb;
-            const double* vb = buf + ((offset + i * 128 + 96) & 1023) + jb;
             const double* da = window + i * 64 + jb;
             const double* db = da + 32;
             for (int v = 0; v < kVecs; ++v)
-                a[v] = VD::madd(VD::load(va + v * kWide), VD::load(da + v * kWide), a[v]);
+            {
+                const typename VD::V w = VD::load(da + v * kWide);
+                for (int s = 0; s < S; ++s)
+                    a[s][v] = VD::madd(VD::load(buf + ((offsets[s] + i * 128) & kMask) + jb + v * kWide),
+                                       w, a[s][v]);
+            }
             for (int v = 0; v < kVecs; ++v)
-                a[v] = VD::madd(VD::load(vb + v * kWide), VD::load(db + v * kWide), a[v]);
+            {
+                const typename VD::V w = VD::load(db + v * kWide);
+                for (int s = 0; s < S; ++s)
+                    a[s][v] = VD::madd(VD::load(buf + ((offsets[s] + i * 128 + 96) & kMask) + jb + v * kWide),
+                                       w, a[s][v]);
+            }
         }
-        for (int v = 0; v < kVecs; ++v) VD::store(acc + jb + v * kWide, a[v]);
+        for (int s = 0; s < S; ++s)
+        {
+            double acc[kChunk];
+            for (int v = 0; v < kVecs; ++v) VD::store(acc + v * kWide, a[s][v]);
+            float* out = pcm + 32 * s + jb;
+            for (int j = 0; j < kChunk; ++j)
+            {
+                // [-1, 1] in the form min/max instructions take (a NaN would
+                // pass through, as from the comparisons it replaces).
+                double x = acc[j];
+                x = (-1.0 > x) ? -1.0 : x;
+                x = (1.0 < x) ? 1.0 : x;
+                out[j] = static_cast<float>(x);
+            }
+        }
+    }
+}
+
+/// Stores the quad q[0..3] at dst, optionally reversed and negated, with
+/// W-lane vectors. The negation is a multiplication by -1, which gives -x
+/// bit for bit for every finite x, zeros included.
+template <int W, bool kReverse, bool kNegate>
+inline void putQuad(double* dst, const double* q) noexcept
+{
+    using VD = Vec<double, W>;
+    if constexpr (W == 4)
+    {
+        typename VD::V v = VD::load(q);
+        if constexpr (kReverse) v = VD::reverse(v);
+        if constexpr (kNegate) v = VD::mul(v, VD::set1(-1.0));
+        VD::store(dst, v);
+    }
+    else if constexpr (W == 2)
+    {
+        typename VD::V lo = VD::load(q), hi = VD::load(q + 2);
+        if constexpr (kReverse)
+        {
+            const typename VD::V t = VD::reverse(hi);
+            hi = VD::reverse(lo);
+            lo = t;
+        }
+        if constexpr (kNegate)
+        {
+            lo = VD::mul(lo, VD::set1(-1.0));
+            hi = VD::mul(hi, VD::set1(-1.0));
+        }
+        VD::store(dst, lo);
+        VD::store(dst + 2, hi);
+    }
+    else
+    {
+        for (int m = 0; m < 4; ++m)
+        {
+            const double x = q[kReverse ? 3 - m : m];
+            dst[m] = kNegate ? -x : x;
+        }
     }
 }
 
@@ -98,43 +185,44 @@ inline void windowSlot(const double* buf, int offset, const double* window, doub
  * samples stored subband by subband (input[sb * stride + slot]): the samples
  * of neighbouring slots are adjacent in memory, so the W slots go through the
  * DCT together, one per lane; then each slot's vector is stored in the
- * 1024-value ring buf (offset steps back by 64 per slot) and windowed into 32
- * samples of pcm.
+ * kSynthRing-value ring buf (offset steps back by 64 per slot), and the W
+ * slots are windowed together into W * 32 samples of pcm.
  */
 template <int W>
 inline void synthesizeSlots(const double* input, int stride, int ss, double* buf, int& offset,
                             const double* window, float* pcm) noexcept
 {
     using VD = Vec<double, W>;
-    typename VD::V S[32];
-    for (int sb = 0; sb < 32; ++sb) S[sb] = VD::load(input + sb * stride + ss);
-    typename VD::V scratch[32];
-    dctLevel<32, W>(S, scratch, dctTwiddles());
-    double C[32][W];
-    for (int k = 0; k < 32; ++k) VD::store(C[k], S[k]);
+    DctBlock<32, W> X;
+    for (int sb = 0; sb < 32; ++sb) X.v[sb] = VD::load(input + sb * stride + ss);
+    const DctBlock<32, W> S = dctValues<32, W>(X, dctTwiddles());
+    // The DCT outputs C[k] of each lane, four at a time: T[4 W b + 4 lane + m]
+    // = C[4 b + m] of that lane.
+    double T[32 * W];
+    for (int b = 0; b < 8; ++b)
+        VD::storeInterleave4(T + 4 * W * b, S.v[4 * b], S.v[4 * b + 1], S.v[4 * b + 2], S.v[4 * b + 3]);
 
+    int offsets[W];
     for (int lane = 0; lane < W; ++lane)
     {
         // Matrixing V[i] = sum_k S[k] cos((16 + i)(2k + 1) pi / 64) needs only
         // the 32 DCT-II outputs C[m]: V[i] = C[16 + i] for i < 16, V[16] = 0,
-        // V[16 + i] = -C[32 - i], V[48 - i] = -C[i] and V[48 + i] = V[48 - i].
-        offset = (offset - 64) & 1023;
+        // V[16 + i] = -C[32 - i], V[48 - i] = -C[i] and V[48 + i] = V[48 - i]
+        // (so V[48 + i] = -C[i] for i = 0..15).
+        offset = (offset - 64) & (kSynthRing - 1);
+        offsets[lane] = offset;
         double* V = buf + offset;   // a multiple of 64: no wrap
-        for (int i = 0; i < 16; ++i) V[i] = C[16 + i][lane];
-        V[16] = 0.0;
-        for (int i = 1; i <= 16; ++i) V[16 + i] = -C[32 - i][lane];
-        for (int i = 0; i < 16; ++i) V[48 - i] = -C[i][lane];
-        for (int i = 1; i < 16; ++i) V[48 + i] = V[48 - i];
-
-        double acc[32];
-        windowSlot(buf, offset, window, acc);
-        float* out = pcm + (ss + lane) * 32;
-        for (int j = 0; j < 32; ++j)
+        const double* q = T + 4 * lane;   // quad b at q + 4 W b
+        for (int b = 0; b < 4; ++b)
         {
-            const double s = acc[j] < -1.0 ? -1.0 : (acc[j] > 1.0 ? 1.0 : acc[j]);
-            out[j] = static_cast<float>(s);
+            putQuad<W, false, false>(V + 4 * b, q + 4 * W * (4 + b));
+            putQuad<W, true, true>(V + 17 + 4 * b, q + 4 * W * (7 - b));
+            putQuad<W, true, true>(V + 33 + 4 * b, q + 4 * W * (3 - b));
         }
+        for (int b = 0; b < 4; ++b) putQuad<W, false, true>(V + 48 + 4 * b, q + 4 * W * b);
+        V[16] = 0.0;
     }
+    windowSlots<W>(buf, offsets, window, pcm + ss * 32);
 }
 
 // ============================================================================

@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -858,8 +859,9 @@ DSPARK_TEST(PluginVst3_stop_resets_and_large_states_round_trip)
     // did, so tails rang on across a transport stop), and a user state over
     // the old 16 MiB read cap - one getState() itself wrote - loads back.
     auto* p = makeActiveVst3();
+    const int resetsBefore = p->user.resets.load();
     p->kProcessorVtbl.setProcessing(p->lensPtr(1), 0);
-    EXPECT_EQ(p->user.resets.load(), 1);
+    EXPECT_EQ(p->user.resets.load(), resetsBefore + 1);
     p->user.userStateBytes = size_t { 17 } << 20;
     MockStream saved;
     EXPECT_EQ(p->kComponentVtbl.getState(p->lensPtr(0), reinterpret_cast<Steinberg_IBStream*>(&saved)),
@@ -871,6 +873,23 @@ DSPARK_TEST(PluginVst3_stop_resets_and_large_states_round_trip)
               Steinberg_kResultOk);
     EXPECT_TRUE(q->user.userStateRestored);
     q->releaseImpl();
+    p->releaseImpl();
+}
+
+DSPARK_TEST(PluginVst3_processing_start_resets_the_history)
+{
+    // setProcessing(true) clears the processing history too, so a host that
+    // starts processing again without a stop in between (or that never
+    // sends the stop) does not resume the tails of the previous run. The old
+    // wrapper reset only on setProcessing(false).
+    auto* p = makeActiveVst3();   // setActive(true), setProcessing(true)
+    const int afterFirstStart = p->user.resets.load();
+    EXPECT_EQ(afterFirstStart, 1);
+    std::vector<float> l(256), r(256);
+    float* out[2] = { l.data(), r.data() };
+    EXPECT_EQ(processVst3(p, out, 256, nullptr), Steinberg_kResultOk);
+    p->kProcessorVtbl.setProcessing(p->lensPtr(1), 1);   // restart, no stop
+    EXPECT_EQ(p->user.resets.load(), afterFirstStart + 1);
     p->releaseImpl();
 }
 
@@ -935,6 +954,8 @@ struct ClapEvents
     clap_input_events_t iface {};
     std::vector<clap_event_note_t> notes;
     std::vector<clap_event_midi_t> midi;
+    std::vector<clap_event_param_value_t> values;
+    std::vector<clap_event_param_mod_t> mods;
     std::vector<const clap_event_header_t*> order;
     static uint32_t size(const clap_input_events_t* l)
     { return static_cast<uint32_t>(static_cast<const ClapEvents*>(l->ctx)->order.size()); }
@@ -947,6 +968,8 @@ struct ClapEvents
         iface.get = &get;
         notes.reserve(16);
         midi.reserve(16);
+        values.reserve(512);
+        mods.reserve(16);
     }
     void note(uint16_t type, int16_t channel, int16_t key, uint32_t time)
     {
@@ -976,10 +999,38 @@ struct ClapEvents
         midi.push_back(ev);
         order.push_back(&midi.back().header);
     }
+    void value(clap_id id, double plain, uint32_t time)
+    {
+        clap_event_param_value_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_PARAM_VALUE;
+        ev.param_id = id;
+        ev.note_id = -1; ev.port_index = -1; ev.channel = -1; ev.key = -1;
+        ev.value = plain;
+        values.push_back(ev);
+        order.push_back(&values.back().header);
+    }
+    void mod(clap_id id, double amount, uint32_t time, int32_t noteId = -1)
+    {
+        clap_event_param_mod_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_PARAM_MOD;
+        ev.param_id = id;
+        ev.note_id = noteId; ev.port_index = -1; ev.channel = -1; ev.key = -1;
+        ev.amount = amount;
+        mods.push_back(ev);
+        order.push_back(&mods.back().header);
+    }
     void clear()
     {
         notes.clear();
         midi.clear();
+        values.clear();
+        mods.clear();
         order.clear();
     }
 };
@@ -1108,6 +1159,129 @@ DSPARK_TEST(PluginClap_choke_arrives_as_a_noteoff_with_the_choke_flag)
         EXPECT_EQ(static_cast<int>(s->user.log[0].note), 67);
         EXPECT_TRUE(s->user.log[0].choke);
     }
+    cp->deactivate(cp);
+    cp->destroy(cp);
+}
+
+namespace {
+
+// Logs the plain value setParameter receives and, per processBlock call, the
+// block length and the value in force.
+struct ModLogPlug
+{
+    static constexpr auto descriptor = dspark::plugin::Descriptor {
+        .name = "ModLog", .vendor = "T", .url = "", .email = "",
+        .productId = "com.dspark.test.modlog", .version = "1.0.0",
+    };
+    static constexpr auto parameters = dspark::plugin::params(
+        dspark::plugin::param("gain", "Gain", 0.0f, 10.0f, 5.0f, ""),
+        dspark::plugin::stepped("taps", "Taps", 0.0f, 4.0f, 2.0f, 4),
+        dspark::plugin::param("other", "Other", 0.0f, 1.0f, 0.0f, ""));
+
+    float heard[3] = { 5.0f, 2.0f, 0.0f };
+    std::vector<std::pair<int, float>> blocks;
+    int resets = 0;
+
+    ModLogPlug() { blocks.reserve(64); }
+    void prepare(const dspark::AudioSpec&) {}
+    void setParameter(int index, float plain) noexcept { heard[index] = plain; }
+    void processBlock(dspark::AudioBufferView<float> io) noexcept
+    {
+        if (blocks.size() < blocks.capacity()) blocks.push_back({ io.getNumSamples(), heard[0] });
+    }
+    void reset() noexcept { ++resets; }
+};
+
+} // namespace
+
+DSPARK_TEST(PluginClap_start_processing_resets_the_history)
+{
+    // start_processing clears the processing history like reset(): a device
+    // the host stops and starts again (a sleeping one waking up) used to
+    // resume its old tails, the CLAP call being a no-op.
+    using Wrap = dspark::plugin::clap_backend::Plugin<ModLogPlug>;
+    const clap_plugin_t* cp = Wrap::create(nullptr);
+    auto* s = static_cast<Wrap*>(cp->plugin_data);
+    cp->init(cp);
+    cp->activate(cp, 48000.0, 32, 256);
+    EXPECT_TRUE(cp->start_processing(cp));
+    EXPECT_EQ(s->user.resets, 1);
+    cp->stop_processing(cp);
+    EXPECT_TRUE(cp->start_processing(cp));
+    EXPECT_EQ(s->user.resets, 2);
+    cp->stop_processing(cp);
+    cp->deactivate(cp);
+    cp->destroy(cp);
+}
+
+DSPARK_TEST(PluginClap_modulation_adds_to_the_heard_value)
+{
+    // Every parameter is CLAP_PARAM_IS_MODULATABLE and a global
+    // CLAP_EVENT_PARAM_MOD amount (plain units) adds to the value the plugin
+    // hears, clamped and snapped, sample-accurately, while the parameter's
+    // own value stays unmodulated. The old wrapper declared no parameter
+    // modulatable and ignored the event, so host modulators had no effect.
+    using Wrap = dspark::plugin::clap_backend::Plugin<ModLogPlug>;
+    clap_param_info_t info {};
+    EXPECT_TRUE(Wrap::kParams.get_info(nullptr, 0, &info));
+    EXPECT_NE(info.flags & CLAP_PARAM_IS_MODULATABLE, 0u);
+    EXPECT_EQ(info.flags & CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID, 0u);
+    EXPECT_TRUE(Wrap::kParams.get_info(nullptr, 3, &info));   // the wrapper's Bypass
+    EXPECT_EQ(info.flags & CLAP_PARAM_IS_MODULATABLE, 0u);
+
+    const clap_plugin_t* cp = Wrap::create(nullptr);
+    auto* s = static_cast<Wrap*>(cp->plugin_data);
+    cp->init(cp);
+    cp->activate(cp, 48000.0, 32, 256);
+    const clap_id gain = dspark::plugin::hash32("gain");
+    const clap_id taps = dspark::plugin::hash32("taps");
+    const clap_id other = dspark::plugin::hash32("other");
+    auto value = [&](clap_id id) { double v = -1.0; Wrap::kParams.get_value(cp, id, &v); return v; };
+    ClapEvents events;
+
+    // Placed like automation: the block splits at the quantum before t = 100.
+    s->user.blocks.clear();
+    events.mod(gain, 2.0, 100);
+    processClap(s, events, 256);
+    EXPECT_NEAR(s->user.heard[0], 7.0f, 1e-6f);
+    EXPECT_NEAR(value(gain), 5.0, 1e-9);
+    EXPECT_EQ(static_cast<int>(s->user.blocks.size()), 2);
+    if (s->user.blocks.size() == 2)
+    {
+        EXPECT_EQ(s->user.blocks[0].first, 96);
+        EXPECT_NEAR(s->user.blocks[0].second, 5.0f, 1e-6f);
+        EXPECT_NEAR(s->user.blocks[1].second, 7.0f, 1e-6f);
+    }
+
+    events.value(gain, 6.0, 0);                    // value + modulation
+    processClap(s, events, 64);
+    EXPECT_NEAR(s->user.heard[0], 8.0f, 1e-6f);
+    EXPECT_NEAR(value(gain), 6.0, 1e-9);
+    events.mod(gain, 10.0, 0);                     // clamped to the range
+    processClap(s, events, 64);
+    EXPECT_NEAR(s->user.heard[0], 10.0f, 1e-6f);
+    events.mod(gain, std::numeric_limits<double>::quiet_NaN(), 0);   // ignored
+    events.mod(gain, -1.0, 0, 7);                  // per-note: not offered, ignored
+    processClap(s, events, 64);
+    EXPECT_NEAR(s->user.heard[0], 10.0f, 1e-6f);
+    events.mod(gain, 0.0, 0);                      // modulation off
+    processClap(s, events, 64);
+    EXPECT_NEAR(s->user.heard[0], 6.0f, 1e-6f);
+    events.mod(taps, 1.4, 0);                      // 2 + 1.4 snaps to 3
+    processClap(s, events, 64);
+    EXPECT_NEAR(s->user.heard[1], 3.0f, 1e-6f);
+    EXPECT_NEAR(value(taps), 2.0, 1e-9);
+
+    // A full block: a value and a modulation amount of one parameter are
+    // separate points, so neither displaces the other when the event list
+    // merges (both used to share one slot key).
+    for (uint32_t i = 0; i < 300; ++i) events.value(other, (i % 10) / 10.0, i % 256);
+    events.value(gain, 4.0, 255);
+    events.mod(gain, 1.0, 255);
+    processClap(s, events, 256);
+    EXPECT_NEAR(value(gain), 4.0, 1e-9);
+    EXPECT_NEAR(s->user.heard[0], 5.0f, 1e-6f);
+
     cp->deactivate(cp);
     cp->destroy(cp);
 }

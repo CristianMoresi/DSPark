@@ -1236,11 +1236,12 @@ struct Plugin
     }
 
     /** setProcessing(true) starts the audio-thread ownership of setParameter;
-     *  setProcessing(false) - a transport stop, a suspend - ends it and
-     *  clears the processing history through the plugin's reset(), as the
-     *  CLAP and AU wrappers do on their reset calls. The old no-op never
-     *  reached reset() in VST3, so delay lines and reverb tails played on
-     *  across a stop. */
+     *  setProcessing(false) - a transport stop, a suspend - ends it. Both
+     *  clear the processing history through the plugin's reset(), as the
+     *  CLAP and AU wrappers do on their reset calls: a stop leaves no tail
+     *  behind, and a start is clean even from a host that never sends the
+     *  false (processing started again with no stop in between used to
+     *  resume the tails and delay lines of the previous run). */
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sSetProcessing(void* self_,
                                                                    Steinberg_TBool state)
     {
@@ -1248,15 +1249,23 @@ struct Plugin
         if (state)
         {
             p->processing.store(true, std::memory_order_release);
+            p->clearHistory();
             return Steinberg_kResultOk;
         }
         p->processing.store(false, std::memory_order_release);
         p->drainPending();
-        if constexpr (HasReset<P>)
-            p->user.reset();
-        p->dryDelay.reset();
-        p->bypassMix = p->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        p->clearHistory();
         return Steinberg_kResultOk;
+    }
+
+    /** The plugin's reset() plus the wrapper's own processing state (the
+     *  dry delay of the bypass and its crossfade). */
+    void clearHistory() noexcept
+    {
+        if constexpr (HasReset<P>)
+            user.reset();
+        dryDelay.reset();
+        bypassMix = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
     }
 
     /** Crossfades @p length frames of the output (from @p outStart) toward

@@ -189,6 +189,13 @@ All notable user-facing changes to DSPark are documented here.
   affect timing. Off by default, so a default read still guarantees
   `ticksPerQuarter() > 0`.
 
+- Plugin layer, CLAP: every parameter is modulatable
+  (`CLAP_PARAM_IS_MODULATABLE`). A host modulator's global
+  `CLAP_EVENT_PARAM_MOD` amount, in plain units, adds to the value
+  `setParameter()` receives, clamped and snapped, at its position in the
+  block like automation; the parameter's own value (host display, state,
+  editor) stays unmodulated. Host modulation used to have no effect.
+
 ### Changed
 
 - `CrossoverFilter` linear phase (default audio moves within rounding: at most
@@ -370,6 +377,31 @@ All notable user-facing changes to DSPark are documented here.
   bit-identical to before; the AVX2+FMA copy differs by at most one rounding
   of the last double bit (float output identical on encoder-produced files,
   within 6e-11 elsewhere).
+
+- `Mp3File` reads stream: `openRead()` loads and indexes the compressed
+  file and decodes nothing, and `readSamples()` decodes only the frames its
+  range covers, so the decoded PCM of a whole file is never held (a 30 s
+  stereo file needed 10.6 MB of it, five minutes 106 MB). A read that does
+  not continue the previous one restarts two frames earlier with the bit
+  reservoir rebuilt from the frames before, and returns exactly the samples
+  of a decode from the start: output is bit-identical to before for every
+  range, sequential, reversed or random, on a 90-file corpus of all three
+  layers, both MPEG versions and both kernel copies. The synthesis windows
+  a whole group of slots per load of the window and keeps the DCT in
+  registers (25% less time per slot with AVX2, 27% on the SSE2 baseline).
+  Opening a 30 s 128 kbps stereo file and reading it in 4096-frame chunks
+  takes 14.2 ms instead of 17.2 ms (320 kbps: 17.5-17.7 ms instead of
+  20.8-20.9 ms), 0.91-0.98 times a frame-by-frame float decode loop of a
+  reference decoder over the same bytes in memory (stereo 128, 320 and
+  VBR, 22.05 kHz; 0.63 mono, 0.67 Layer II), where it was 1.09-1.26 times;
+  reading it whole into a new buffer takes 15.6 ms instead of 18.3 ms. No
+  audio change.
+- Plugin layer: processing start clears the processing history. VST3
+  `setProcessing(true)` and CLAP `start_processing()` now call the
+  plugin's `reset()`, as VST3 `setProcessing(false)` and CLAP `reset()`
+  already did, so processing that starts again without a stop in between
+  (or a CLAP device that sleeps and wakes) no longer resumes the tails and
+  delay lines of the previous run.
 
 ### Fixed
 

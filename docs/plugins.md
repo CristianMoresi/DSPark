@@ -171,7 +171,7 @@ virtual; nothing else is required.**
 |---|---|---|
 | `int getLatency() const` | VST3 `getLatencySamples`, CLAP `clap.latency`, AU `Latency` | your chain introduces delay: lookahead limiters, linear-phase EQ, oversampling, FFT processors. Sum your DSPark effects' `getLatency()`/`getLatencySamples()`. The host shifts everything to compensate - report it accurately or your users get phasing. Read after `prepare()` **and re-read after parameter changes**: when the value moves at runtime, the wrapper notifies the host on its own (`restartComponent(kLatencyChanged)` / `clap_host_latency` / the AU property listeners). |
 | `double getTailSeconds() const` | VST3 `getTailSamples`, CLAP `clap.tail`, AU `TailTime` | sound continues after input stops: reverbs, delays. Hosts keep processing your plugin that long after audio ends instead of cutting the tail. |
-| `void reset() noexcept` | CLAP `reset`, AU `Reset`, VST3 `setProcessing(false)` | you keep history that should clear on transport jumps (delay lines, envelopes). VST3 hosts stop processing on a transport stop or suspend, and re-activation re-runs `prepare()`. |
+| `void reset() noexcept` | CLAP `reset` and `start_processing`, AU `Reset`, VST3 `setProcessing` (true and false) | you keep history that should clear on transport jumps (delay lines, envelopes). VST3 hosts stop processing on a transport stop or suspend and start it again on play, and re-activation re-runs `prepare()`. |
 | `std::vector<uint8_t> getState() const` + `bool setState(const uint8_t*, size_t)` | VST3 `IComponent::get/setState`, CLAP `clap.state`, AU `ClassInfo` (extra section) | you have state **beyond the parameters**: learned noise profiles, loaded IRs, editor layout. The wrapper *always* saves/restores your parameter values by itself - most plugins need neither method. DSPark's `StateBlob` is the natural serializer here. |
 | `void processBlock(AudioBufferView<float> io, AudioBufferView<float> sidechain) noexcept` - *instead of* the single-buffer form | a second input named "Sidechain": VST3 **aux bus**, CLAP **non-main port**, AU **input element** | the detector should follow a host-routed key signal: duckers, externally-keyed gates and de-essers. The shape matches DSPark's own dynamics, so `comp_.processBlock(io, sidechain)` forwards 1:1. The key view always mirrors the main width (mono main, mono key) and the wrapper hands you frame-aligned **silence when nothing is routed** - never branch on availability, and treat the sidechain as read-only. Reference plugin: `examples/plugin_ducker/`. |
 | `void setTransport(const TransportInfo&) noexcept` | VST3 `ProcessContext`, CLAP transport event, AU host callbacks | anything in your plugin follows the song: tempo-synced delays, LFOs, gates, arpeggiators. Delivered on the audio thread before each `processBlock` whenever the host supplied timeline data - check the `*Valid` flags. `TransportInfo::samplesPerBeat(sampleRate)` is the conversion you usually want. |
@@ -196,6 +196,12 @@ virtual; nothing else is required.**
   no longer than the size your `prepare()` saw (AU reports
   `TooManyFramesToProcess`, per its contract). An input bus narrower than
   the output (a host ignoring the arrangement) is read within its bounds.
+- **CLAP modulation**: every parameter is offered as modulatable. A host
+  modulator's amount (plain units) is added to the value `setParameter`
+  receives, clamped and snapped like any value and placed as accurately
+  as automation; the parameter's own value - what the host displays,
+  automates and saves - stays unmodulated. Only the global signal is
+  offered, not per-note modulation.
 - **Sample-accurate automation**: every timestamped event the host sends -
   parameter points, bypass, MIDI - lands in one time-ordered stream and
   processing splits at 32-frame quantum boundaries, so fast automation

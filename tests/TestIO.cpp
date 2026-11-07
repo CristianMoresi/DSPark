@@ -4393,6 +4393,120 @@ DSPARK_TEST(Mp3File_vector_kernels_agree_with_the_baseline_copy)
     EXPECT_TRUE(worst <= 1e-6);
     if (!simd::runtimeDispatchSupported()) EXPECT_NEAR(worst, 0.0, 0.0);
 }
+
+// readSamples() decodes only the frames a range covers: a read that does not
+// continue the previous one restarts the decoder two frames early and
+// rebuilds the bit reservoir from the frames before them. Every range must
+// still return exactly the samples of the whole-file read. The crafted
+// Layer III stream makes every frame start its main data 300 bytes back
+// (four frames of 75 bytes), deeper than the restart, so it fails if the
+// reservoir is not rebuilt; the Layer II stream has no reservoir and needs
+// the restart to refill the synthesis window only, and the 12 slots of a
+// Layer I frame are fewer than the window spans, so it fails with a restart
+// of one frame.
+DSPARK_TEST(Mp3File_any_range_reads_the_samples_of_the_whole_file)
+{
+    midi_test::TempDirectory temp("mp3-ranges");
+    const auto deep = temp.file("deep_reservoir.mp3");
+    {
+        constexpr int kFrames = 40, kSlot = 75, kBack = 300, kSilent = 4;
+        std::vector<uint8_t> stream(size_t(kFrames) * kSlot, 0);
+        std::vector<std::array<int, 4>> sides(kFrames, std::array<int, 4> {});   // part23, bigValues x2
+        std::vector<int> gains(kFrames, 210);
+        uint32_t lcg = 12345u;
+        for (int i = kSilent; i < kFrames; ++i)
+        {
+            Mp3TestBits g;
+            for (int gr = 0; gr < 2; ++gr)
+            {
+                std::vector<int> lines(96);
+                for (int& v : lines) { lcg = lcg * 1664525u + 1013904223u; v = int(lcg >> 30) - 1; if (v > 1) v = 0; }
+                sides[size_t(i)][size_t(2 * gr)] = io_audit::table1Pairs(g, lines);
+                sides[size_t(i)][size_t(2 * gr + 1)] = 48;
+            }
+            gains[size_t(i)] = 190 + (i % 7) * 2;
+            const size_t at = size_t(i) * kSlot - kBack;
+            std::copy(g.bytes.begin(), g.bytes.end(), stream.begin() + std::ptrdiff_t(at));
+        }
+        std::vector<std::vector<uint8_t>> frames;
+        for (int i = 0; i < kFrames; ++i)
+            frames.push_back(io_audit::craftFrame(3, 1, 1, 3, 0,       // 32 kbps 48 kHz mono
+                [&](Mp3TestBits& b) {
+                    b.put(i >= kSilent ? uint32_t(kBack) : 0u, 9); b.put(0, 5); b.put(0, 4);
+                    for (int gr = 0; gr < 2; ++gr)
+                        io_audit::longGranule(b, false, sides[size_t(i)][size_t(2 * gr)],
+                                              sides[size_t(i)][size_t(2 * gr + 1)], gains[size_t(i)], 0);
+                },
+                [&](Mp3TestBits& b) {
+                    for (int k = 0; k < kSlot; ++k) b.put(stream[size_t(i) * kSlot + size_t(k)], 8);
+                }));
+        io_audit::writeFrames(deep, frames);
+    }
+    auto repeated = [&](const char* name, const char* hex) {
+        const std::vector<uint8_t> three = mp3R2_fromHex(hex);
+        std::vector<uint8_t> bytes;
+        for (int k = 0; k < 8; ++k) bytes.insert(bytes.end(), three.begin(), three.end());
+        const auto p = temp.file(name);
+        mp3R2_write(p.string().c_str(), bytes);
+        return p;
+    };
+    const auto layer1 = repeated("layer1.mp1", mp3R2_kLayer1Hex);
+    const auto layer2 = repeated("layer2.mp2", mp3R2_kLayer2Hex);
+    const auto layer3 = temp.file("tone.mp3");
+    io_audit::encodeTone(layer3, 2, 30000);
+
+    for (const auto& path : { deep, layer1, layer2, layer3 })
+    {
+        Mp3File whole;
+        EXPECT_TRUE(whole.openRead(path));
+        const auto info = whole.getInfo();
+        const int ch = int(info.numChannels);
+        const int64_t n = info.numSamples;
+        EXPECT_TRUE(n > 4000);
+        AudioBuffer<float> all;
+        all.resize(ch, int(n));
+        EXPECT_TRUE(whole.readSamples(all.toView()));
+        double e = 0.0;
+        for (int c = 0; c < ch; ++c)
+            for (int64_t i = 0; i < n; ++i) e += double(all.getChannel(c)[i]) * all.getChannel(c)[i];
+        EXPECT_TRUE(e > 1.0);
+
+        int mismatches = 0;
+        AudioBuffer<float> part;
+        part.resize(ch, 5000);
+        auto same = [&](Mp3File& f, int64_t start, int64_t count) {
+            if (!f.readSamples(part.toView(), start, count)) { ++mismatches; return; }
+            for (int c = 0; c < ch; ++c)
+                if (std::memcmp(part.getChannel(c), all.getChannel(c) + start, size_t(count) * sizeof(float)) != 0)
+                    ++mismatches;
+        };
+        {
+            Mp3File f;
+            EXPECT_TRUE(f.openRead(path));
+            for (int64_t s = 0; s < n; s += 1000) same(f, s, std::min<int64_t>(1000, n - s));
+        }
+        {
+            Mp3File f;
+            EXPECT_TRUE(f.openRead(path));
+            for (int64_t s = ((n - 1) / 777) * 777; s >= 0; s -= 777) same(f, s, std::min<int64_t>(777, n - s));
+        }
+        {
+            Mp3File f;
+            EXPECT_TRUE(f.openRead(path));
+            uint32_t lcg = 99u;
+            for (int k = 0; k < 60; ++k)
+            {
+                lcg = lcg * 1664525u + 1013904223u;
+                const int64_t s = int64_t(lcg % uint32_t(n));
+                lcg = lcg * 1664525u + 1013904223u;
+                same(f, s, 1 + int64_t(lcg % uint32_t(std::min<int64_t>(5000, n - s))));
+            }
+            same(f, n - 1, 1);
+            same(f, 0, 1);
+        }
+        EXPECT_EQ(mismatches, 0);
+    }
+}
 // ---------------------------------------------------------------------------
 // WAV: G.711, IMA/Microsoft ADPCM and 12/20-bit PCM reading
 // ---------------------------------------------------------------------------

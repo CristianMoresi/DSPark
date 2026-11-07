@@ -179,7 +179,7 @@ virtual; nothing else is required.**
 | `void setOfflineRendering(bool) noexcept` | VST3 `kOffline` process mode, CLAP `clap.render`, AU `OfflineRender` | quality should rise when there is no realtime pressure: switch to higher oversampling or longer lookahead during bounces. Called outside the audio thread, before processing (re)starts. |
 | `static constexpr auto channels` (`ChannelSupport`) | VST3 `setBusArrangements`, CLAP `audio-ports-config`, AU `SupportedNumChannels` | **the default is already mono+stereo** - declare it only to restrict: `StereoOnly` for inherently stereo DSP (M/S wideners), `MonoOnly` for metering utilities. All buses of an instance run the same width. |
 | `static constexpr auto factoryPresets` | VST3 program list, CLAP preset-load + preset-discovery, AU factory presets | you ship starting points. Built with `presets(preset("Name", v0, v1, ...))` - one PLAIN value per parameter, in table order, checked at compile time. The host's own preset browser offers them in every format. |
-| `static constexpr bool sampleAccurateAutomation = false` | - | you want to OPT OUT of sub-block automation: by default the wrappers split processing at automation points (32-frame grain) so fast curves land where the host drew them. Opt out only when a high fixed cost per `processBlock` call matters more. |
+| `static constexpr bool sampleAccurateAutomation = false` | - | you want to OPT OUT of sub-block automation: by default the wrappers split processing at automation points (32-frame grain) so fast curves land where the host drew them. Opt out only when a high fixed cost per `processBlock` call matters more. MIDI events (notes and controllers) keep their `sampleOffset` either way. |
 | `static constexpr bool hasEditor` | VST3 `createView`, CLAP `clap.gui`, AU `CocoaUI` | a custom GUI written in HTML/CSS/JS: pair it with `editorHtml()` (+ optional `editorSize`, `editorResize`, `editorDebug`) and include the WebView editor layer first. While false/absent, hosts show their generic parameter UI - fully usable. See "Custom UIs" below. |
 
 ### What the wrappers handle so you don't have to
@@ -259,7 +259,8 @@ void handleMidiEvent(const dspark::plugin::MidiEvent& ev) noexcept
     {
     case Type::NoteOn:    /* ev.note, ev.value = velocity 0..1,
                              ev.sampleOffset = frames into the next block */
-    case Type::NoteOff:   /* release the matching voice */
+    case Type::NoteOff:   /* release the matching voice; ev.choke = stop it
+                             at once, without its release phase */
     case Type::PitchBend: /* ev.value = -1..+1 */
     default: break;
     }
@@ -269,10 +270,15 @@ void handleMidiEvent(const dspark::plugin::MidiEvent& ev) noexcept
 The wrapper translates every format's native scheme into that one struct:
 VST3 delivers notes as events and every controller - CC 0-127, channel
 pressure and pitch bend - through its `IMidiMapping` scheme (handled
-internally with hidden proxy parameters - you never see them); CLAP
+internally with hidden proxy parameters - you never see them; every
+controller value arrives as its own event with its offset, also when the
+plugin opts out of sample-accurate automation); CLAP
 delivers note events plus raw MIDI (a note-off or choke addressed with
 wildcards becomes one `NoteOff` per matching note you were told is
-sounding); AU delivers raw MIDI bytes through the MusicDevice selectors. Events always arrive **time-ordered, right before
+sounding; a choke - a host choke group cutting a voice - is a `NoteOff`
+with `choke` set: end the voice now, without its release phase, or ignore
+the flag and release it as usual); AU delivers raw MIDI bytes through the
+MusicDevice selectors. Events always arrive **time-ordered, right before
 the `processBlock` call that contains them**; `sampleOffset` says how many
 frames into that block the event belongs, so a synth can start its voice
 sample-accurately (or ignore the offset and be at most one automation
@@ -284,8 +290,8 @@ delay). On macOS that maps to the `aumf` music-effect type: declare `aumf`
 in the AU Info.plist for MIDI effects, `aumu` for instruments.
 
 Reference instrument: `examples/plugin_synth/` - eight voices of
-`Oscillator` + `ADSREnvelope`, voice stealing, pitch bend, factory presets
-and sample-accurate note starts, validated by `auval -v aumu` and both
+`Oscillator` + `ADSREnvelope`, voice stealing, pitch bend, factory presets,
+sample-accurate note starts and 1 ms choke fades, validated by `auval -v aumu` and both
 smoke hosts in CI.
 
 ## Host transport

@@ -3,9 +3,10 @@
 // The canonical Category::Instrument reference: no audio input in any
 // format (VST3 instrument class, CLAP "instrument" feature, AU `aumu`
 // music device), MIDI in through handleMidiEvent, eight voices built from
-// DSPark's Oscillator + EnvelopeGenerator, factory presets, and host
-// transport received per block (printed nowhere - wired so the pattern is
-// on display; a tempo-synced LFO would read it the same way).
+// DSPark's Oscillator + EnvelopeGenerator, factory presets, host chokes
+// (MidiEvent::choke: the voice ends in 1 ms instead of its release), and
+// host transport received per block (printed nowhere - wired so the pattern
+// is on display; a tempo-synced LFO would read it the same way).
 //
 // Voices ADD into `io`: the wrapper hands an instrument a cleared buffer.
 //
@@ -60,12 +61,14 @@ struct SynthPlugin : dspark::plugin::PluginBase<SynthPlugin>
     void prepare(const dspark::AudioSpec& spec)
     {
         scratch_.assign(static_cast<size_t>(spec.maxBlockSize), 0.0f);
+        chokeFrames_ = static_cast<int>(spec.sampleRate * kChokeFadeSeconds) + 1;
         for (auto& voice : voices_)
         {
             voice.osc.prepare(spec.sampleRate);
             voice.env.prepare(spec.sampleRate);
             voice.note = -1;
             voice.delay = 0;
+            voice.chokeLeft = 0;
         }
         applyEnvelope();
     }
@@ -104,14 +107,22 @@ struct SynthPlugin : dspark::plugin::PluginBase<SynthPlugin>
                 wave_.load(std::memory_order_relaxed)));
             voice.osc.setFrequency(noteFrequency(ev.note));
             voice.osc.reset();
+            voice.chokeLeft = 0;
             applyEnvelopeTo(voice);
             voice.env.noteOn();
             break;
         }
         case Type::NoteOff:
+            // A choke (a host choke group) ends the voice now: a 1 ms fade
+            // instead of the release phase, so it stops without a click.
             for (auto& voice : voices_)
                 if (voice.note == ev.note && voice.env.isActive())
-                    voice.env.noteOff();
+                {
+                    if (ev.choke)
+                        voice.chokeLeft = chokeFrames_;
+                    else
+                        voice.env.noteOff();
+                }
             break;
         case Type::PitchBend:
             bendSemis_ = ev.value * 2.0f;
@@ -174,9 +185,19 @@ struct SynthPlugin : dspark::plugin::PluginBase<SynthPlugin>
                     --voice.delay;
                     continue;
                 }
+                float level = voice.env.getNextValue();
+                if (voice.chokeLeft > 0)
+                {
+                    level *= static_cast<float>(voice.chokeLeft)
+                           / static_cast<float>(chokeFrames_);
+                    if (--voice.chokeLeft == 0)
+                    {
+                        voice.env.reset();   // choked: the voice is free now
+                        voice.note = -1;
+                    }
+                }
                 const float sample = scratch_[static_cast<size_t>(i)]
-                                   * voice.env.getNextValue()
-                                   * voice.velocity * gain;
+                                   * level * voice.velocity * gain;
                 left[i] += sample;
                 if (right != left) right[i] += sample;
             }
@@ -191,8 +212,11 @@ private:
         int   note = -1;
         float velocity = 0.0f;
         int   delay = 0;       // frames until the voice starts (sample offset)
+        int   chokeLeft = 0;   // frames left of a choke fade (0: not choking)
         uint32_t age = 0;      // allocation order for voice stealing
     };
+
+    static constexpr double kChokeFadeSeconds = 0.001;
 
     static dspark::Oscillator<float>::Waveform waveformOf(int index) noexcept
     {
@@ -243,6 +267,7 @@ private:
     dspark::plugin::TransportInfo transport_ {};
     float bendSemis_ = 0.0f;
     uint32_t ageCounter_ = 0;
+    int chokeFrames_ = 49;   // 1 ms at 48 kHz; set from the rate in prepare()
 
     std::atomic<int>   wave_ { 1 };
     std::atomic<float> attackMs_ { 5.0f };

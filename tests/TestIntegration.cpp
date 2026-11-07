@@ -901,3 +901,213 @@ DSPARK_TEST(PluginClap_stepped_flag_only_for_integer_grids)
     EXPECT_NE(info.flags & CLAP_PARAM_IS_STEPPED, 0u);
     EXPECT_NE(info.flags & CLAP_PARAM_IS_ENUM, 0u);
 }
+
+namespace {
+
+// Records every MIDI event it receives; opts out of sample-accurate
+// automation, so parameter queues collapse to their last point per block.
+struct MidiLogPlug
+{
+    static constexpr auto descriptor = dspark::plugin::Descriptor {
+        .name = "MidiLog", .vendor = "T", .url = "", .email = "",
+        .productId = "com.dspark.test.midilog", .version = "1.0.0",
+    };
+    static constexpr auto parameters = dspark::plugin::params(
+        dspark::plugin::param("gain", "Gain", 0.0f, 1.0f, 1.0f, ""));
+    static constexpr bool sampleAccurateAutomation = false;
+
+    std::vector<dspark::plugin::MidiEvent> log;
+
+    MidiLogPlug() { log.reserve(64); }
+    void prepare(const dspark::AudioSpec&) {}
+    void setParameter(int, float) noexcept {}
+    void processBlock(dspark::AudioBufferView<float>) noexcept {}
+    void handleMidiEvent(const dspark::plugin::MidiEvent& e) noexcept
+    {
+        if (log.size() < log.capacity()) log.push_back(e);
+    }
+};
+
+/** A minimal CLAP input-event list (storage reserved up front, so the
+ *  header pointers stay valid). */
+struct ClapEvents
+{
+    clap_input_events_t iface {};
+    std::vector<clap_event_note_t> notes;
+    std::vector<clap_event_midi_t> midi;
+    std::vector<const clap_event_header_t*> order;
+    static uint32_t size(const clap_input_events_t* l)
+    { return static_cast<uint32_t>(static_cast<const ClapEvents*>(l->ctx)->order.size()); }
+    static const clap_event_header_t* get(const clap_input_events_t* l, uint32_t i)
+    { return static_cast<const ClapEvents*>(l->ctx)->order[i]; }
+    ClapEvents()
+    {
+        iface.ctx = this;
+        iface.size = &size;
+        iface.get = &get;
+        notes.reserve(16);
+        midi.reserve(16);
+    }
+    void note(uint16_t type, int16_t channel, int16_t key, uint32_t time)
+    {
+        clap_event_note_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = type;
+        ev.note_id = -1;
+        ev.port_index = 0;
+        ev.channel = channel;
+        ev.key = key;
+        ev.velocity = 1.0;
+        notes.push_back(ev);
+        order.push_back(&notes.back().header);
+    }
+    void cc(uint8_t controller, uint8_t value, uint32_t time)
+    {
+        clap_event_midi_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_MIDI;
+        ev.data[0] = 0xB2;   // CC on channel 3
+        ev.data[1] = controller;
+        ev.data[2] = value;
+        midi.push_back(ev);
+        order.push_back(&midi.back().header);
+    }
+    void clear()
+    {
+        notes.clear();
+        midi.clear();
+        order.clear();
+    }
+};
+
+template <typename Wrap>
+void processClap(Wrap* s, ClapEvents& events, uint32_t frames)
+{
+    std::vector<float> l(frames), r(frames);
+    float* out[2] = { l.data(), r.data() };
+    clap_audio_buffer_t outBuf {};
+    outBuf.data32 = out;
+    outBuf.channel_count = 2;
+    clap_process_t proc {};
+    proc.steady_time = -1;
+    proc.frames_count = frames;
+    proc.audio_outputs = &outBuf;
+    proc.audio_outputs_count = 1;
+    proc.in_events = &events.iface;
+    s->plugin.process(&s->plugin, &proc);
+    events.clear();
+}
+
+} // namespace
+
+DSPARK_TEST(PluginVst3_controller_points_survive_block_rate_automation)
+{
+    // A MIDI controller proxy carries MIDI events, not automation: a plugin
+    // that opts out of sample-accurate automation must still receive every
+    // controller value with its offset, as the CLAP and AU backends deliver
+    // raw MIDI. The old wrapper kept only the last point of each proxy
+    // queue: 1 of these 4 CC11 events reached handleMidiEvent.
+    using Wrap = dspark::plugin::vst3::Plugin<MidiLogPlug>;
+    auto* p = new Wrap();
+    Steinberg_Vst_ProcessSetup setup { 0, Steinberg_Vst_SymbolicSampleSizes_kSample32, 512, 48000.0 };
+    p->kProcessorVtbl.setupProcessing(p->lensPtr(1), &setup);
+    p->kComponentVtbl.setActive(p->lensPtr(0), 1);
+    p->kProcessorVtbl.setProcessing(p->lensPtr(1), 1);
+    MockChanges changes;
+    MockQueue queue;
+    queue.id = dspark::plugin::vst3::midiProxyId(2, 11);
+    for (int k = 0; k < 4; ++k)
+        queue.points.push_back({ 100 * k, 0.25 * (k + 1) });
+    changes.queues.push_back(queue);
+    std::vector<float> l(512), r(512);
+    float* out[2] = { l.data(), r.data() };
+    Steinberg_Vst_AudioBusBuffers outBus {};
+    outBus.numChannels = 2;
+    outBus.Steinberg_Vst_AudioBusBuffers_channelBuffers32 = out;
+    Steinberg_Vst_ProcessData data {};
+    data.symbolicSampleSize = Steinberg_Vst_SymbolicSampleSizes_kSample32;
+    data.numSamples = 512;
+    data.numOutputs = 1;
+    data.outputs = &outBus;
+    data.inputParameterChanges = reinterpret_cast<Steinberg_Vst_IParameterChanges*>(&changes);
+    EXPECT_EQ(p->kProcessorVtbl.process(p->lensPtr(1), &data), Steinberg_kResultOk);
+    const auto& log = p->user.log;
+    EXPECT_EQ(static_cast<int>(log.size()), 4);
+    for (size_t k = 0; k < log.size() && k < 4; ++k)
+    {
+        EXPECT_TRUE(log[k].type == dspark::plugin::MidiEvent::Type::ControlChange);
+        EXPECT_EQ(static_cast<int>(log[k].channel), 2);
+        EXPECT_EQ(static_cast<int>(log[k].note), 11);
+        EXPECT_EQ(log[k].sampleOffset, 100 * static_cast<int>(k));
+        EXPECT_NEAR(log[k].value, 0.25f * static_cast<float>(k + 1), 1e-6f);
+    }
+    p->releaseImpl();
+
+    // The same plugin through CLAP raw MIDI: every point, with its offset.
+    using ClapWrap = dspark::plugin::clap_backend::Plugin<MidiLogPlug>;
+    const clap_plugin_t* cp = ClapWrap::create(nullptr);
+    auto* c = static_cast<ClapWrap*>(cp->plugin_data);
+    cp->init(cp);
+    cp->activate(cp, 48000.0, 32, 512);
+    ClapEvents events;
+    for (uint32_t k = 0; k < 4; ++k)
+        events.cc(11, static_cast<uint8_t>(32 * (k + 1) - 1), 100 * k);
+    processClap(c, events, 512);
+    EXPECT_EQ(static_cast<int>(c->user.log.size()), 4);
+    if (c->user.log.size() == 4)
+    {
+        EXPECT_EQ(static_cast<int>(c->user.log[3].channel), 2);
+        EXPECT_EQ(c->user.log[3].sampleOffset, 300);
+    }
+    cp->deactivate(cp);
+    cp->destroy(cp);
+}
+
+DSPARK_TEST(PluginClap_choke_arrives_as_a_noteoff_with_the_choke_flag)
+{
+    // NOTE_CHOKE means "end the voice now, without its release". It arrives
+    // as a NoteOff (a plugin that ignores the flag still releases the voice)
+    // with MidiEvent::choke set; a NOTE_OFF leaves it clear. The old wrapper
+    // delivered a choke as a plain NoteOff, so a choked voice rang through
+    // its whole release.
+    using Wrap = dspark::plugin::clap_backend::Plugin<MidiLogPlug>;
+    const clap_plugin_t* cp = Wrap::create(nullptr);
+    auto* s = static_cast<Wrap*>(cp->plugin_data);
+    cp->init(cp);
+    cp->activate(cp, 48000.0, 32, 256);
+    using Type = dspark::plugin::MidiEvent::Type;
+    ClapEvents events;
+    events.note(CLAP_EVENT_NOTE_ON, 0, 60, 0);
+    events.note(CLAP_EVENT_NOTE_ON, 0, 64, 0);
+    events.note(CLAP_EVENT_NOTE_ON, 0, 67, 0);
+    processClap(s, events, 256);
+    s->user.log.clear();
+    events.note(CLAP_EVENT_NOTE_CHOKE, 0, 60, 10);   // exact address
+    events.note(CLAP_EVENT_NOTE_OFF, 0, 64, 20);     // an ordinary release
+    processClap(s, events, 256);
+    EXPECT_EQ(static_cast<int>(s->user.log.size()), 2);
+    if (s->user.log.size() == 2)
+    {
+        EXPECT_TRUE(s->user.log[0].type == Type::NoteOff);
+        EXPECT_EQ(static_cast<int>(s->user.log[0].note), 60);
+        EXPECT_TRUE(s->user.log[0].choke);
+        EXPECT_TRUE(s->user.log[1].type == Type::NoteOff);
+        EXPECT_EQ(static_cast<int>(s->user.log[1].note), 64);
+        EXPECT_TRUE(!s->user.log[1].choke);
+    }
+    s->user.log.clear();
+    events.note(CLAP_EVENT_NOTE_CHOKE, -1, -1, 0);   // wildcard: every sounding note
+    processClap(s, events, 256);
+    EXPECT_EQ(static_cast<int>(s->user.log.size()), 1);
+    if (s->user.log.size() == 1)
+    {
+        EXPECT_EQ(static_cast<int>(s->user.log[0].note), 67);
+        EXPECT_TRUE(s->user.log[0].choke);
+    }
+    cp->deactivate(cp);
+    cp->destroy(cp);
+}

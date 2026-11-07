@@ -10,7 +10,9 @@
 //   - MIDI          one monophonic sine voice: note on/off (honouring the
 //                   sample offset; a note off releases only the sounding
 //                   key, so a wrongly addressed off is audible), pitch
-//                   bend (+/-2 st), CC1 adds 0.1 DC
+//                   bend (+/-2 st), CC1 adds 0.1 DC, CC74 adds 0.2 DC
+//                   from its sample offset on (the in-block position of a
+//                   controller event shows up as an exact step)
 //   - lookahead     a toggle that flips getLatency() 0 <-> 64 and delays the
 //                   input by exactly those 64 samples, so the smokes can
 //                   watch the latency-changed notification and check that
@@ -86,6 +88,11 @@ struct ProbePlugin
             break;
         case Type::ControlChange:
             if (ev.note == 1) mod_ = ev.value;
+            if (ev.note == 74)
+            {
+                brightPending_ = ev.value;
+                brightDelay_ = ev.sampleOffset;
+            }
             break;
         default:
             break;
@@ -114,6 +121,8 @@ struct ProbePlugin
         const int channels = io.getNumChannels() < 2 ? io.getNumChannels() : 2;
         for (int i = 0; i < n; ++i)
         {
+            if (brightDelay_ >= 0 && brightDelay_-- == 0)
+                bright_ = brightPending_;   // CC74 lands at its sample offset
             float voice = 0.0f;
             if (noteDelay_ > 0)
                 --noteDelay_;
@@ -131,7 +140,7 @@ struct ProbePlugin
                 const float late = line[static_cast<size_t>(delayPos_)];
                 line[static_cast<size_t>(delayPos_)] = data[i];
                 const float x = delayed ? late : data[i];
-                data[i] = x * gain + dc + voice;
+                data[i] = x * gain + dc + 0.2f * bright_ + voice;
             }
             delayPos_ = (delayPos_ + 1) % kLookahead;
         }
@@ -153,6 +162,9 @@ private:
     int    noteKey_ = -1;
     float  bendSemis_ = 0.0f;
     float  mod_ = 0.0f;
+    float  bright_ = 0.0f;          // CC74, applied from its sample offset
+    float  brightPending_ = 0.0f;
+    int    brightDelay_ = -1;       // frames until brightPending_ applies
     double phase_ = 0.0;
     double sampleRate_ = 48000.0;
     std::array<std::array<float, kLookahead>, 2> delay_ {};

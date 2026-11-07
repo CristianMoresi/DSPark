@@ -5,7 +5,8 @@
 // asks it for the editor NSView, verifies the embedded WKWebView completes
 // the JS bridge handshake (through the DSPARK_WEBVIEW_LOG diagnostic trace),
 // then tears down in BOTH orders - view before AudioUnit and AudioUnit
-// before view. Plugins without an editor are checked to NOT announce one.
+// before view. Plugins without an editor are checked to NOT announce one,
+// and to keep their slice size and stream format fixed while initialized.
 // Exit code 0 means every step behaved. Companion to vst3/clap_smoke_host;
 // auval remains the format-conformance gate.
 //
@@ -191,6 +192,50 @@ int main(int argc, char** argv)
     if (!expectEditor)
     {
         expect(infoStatus != noErr, "CocoaUI property absent (host generic UI)");
+
+        // While initialized the slice size and the stream format are fixed:
+        // a different value is refused, so the host uninitializes, sets it
+        // and initializes again; the same value stays accepted. The wrapper
+        // used to answer noErr and then fail every longer slice with
+        // kAudioUnitErr_TooManyFramesToProcess (and render a new rate or
+        // width it was never prepared for).
+        UInt32 frames = 512;
+        expect(AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice,
+                                    kAudioUnitScope_Global, 0, &frames, sizeof(frames))
+                   == noErr,
+               "slice size set before initialize");
+        AudioStreamBasicDescription format {};
+        UInt32 formatSize = sizeof(format);
+        expect(AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat,
+                                    kAudioUnitScope_Output, 0, &format, &formatSize)
+                   == noErr,
+               "output stream format readable");
+        expect(AudioUnitInitialize(au) == noErr, "initialize");
+        expect(AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice,
+                                    kAudioUnitScope_Global, 0, &frames, sizeof(frames))
+                   == noErr,
+               "same slice size accepted while initialized");
+        UInt32 larger = 4096;
+        expect(AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice,
+                                    kAudioUnitScope_Global, 0, &larger, sizeof(larger))
+                   == kAudioUnitErr_Initialized,
+               "slice size change refused while initialized");
+        AudioStreamBasicDescription otherRate = format;
+        otherRate.mSampleRate = format.mSampleRate == 96000.0 ? 48000.0 : 96000.0;
+        expect(AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat,
+                                    kAudioUnitScope_Output, 0, &otherRate, sizeof(otherRate))
+                   == kAudioUnitErr_PropertyNotWritable,
+               "stream format change refused while initialized");
+        expect(AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat,
+                                    kAudioUnitScope_Output, 0, &format, sizeof(format))
+                   == noErr,
+               "same stream format accepted while initialized");
+        expect(AudioUnitUninitialize(au) == noErr, "uninitialize");
+        expect(AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice,
+                                    kAudioUnitScope_Global, 0, &larger, sizeof(larger))
+                   == noErr,
+               "slice size change accepted once uninitialized");
+
         expect(AudioComponentInstanceDispose(au) == noErr, "instance disposed");
         std::printf("au_editor_smoke: %s\n", g_failures == 0 ? "ALL PASS" : "FAILURES");
         return g_failures == 0 ? 0 : 1;

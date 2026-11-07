@@ -555,6 +555,11 @@ concept HasTransport = requires(P p, const TransportInfo& t) {
  * before the block that contains them. A simple plugin may ignore the
  * offset (worst error: one automation quantum); a sample-accurate synth
  * starts its voice exactly `sampleOffset` frames into the block.
+ *
+ * A NoteOff with `choke` set asks for the voice to stop at once, with no
+ * release phase (a CLAP NOTE_CHOKE, sent by hosts for choke groups such as
+ * an open hi-hat cut by a closed one). It is still a NoteOff, so a plugin
+ * that never reads the flag releases the voice exactly as before.
  */
 struct MidiEvent
 {
@@ -573,6 +578,7 @@ struct MidiEvent
     uint8_t note = 0;         ///< Key 0..127, or controller number for CC.
     float   value = 0.0f;     ///< Velocity / CC / pressure 0..1; bend -1..+1.
     int     sampleOffset = 0; ///< Frames into the NEXT processBlock call.
+    bool    choke = false;    ///< NoteOff only: end the voice now, no release.
 };
 
 /**

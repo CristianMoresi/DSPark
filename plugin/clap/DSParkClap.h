@@ -44,7 +44,8 @@
  *   are handed to the audio thread, which calls the user's setParameter at
  *   its next process()/flush() - one writer, as DSPark setters require.
  * - Notes: a NOTE_OFF/NOTE_CHOKE addressed with wildcards (-1) becomes one
- *   NoteOff per matching note the plugin was told is sounding.
+ *   NoteOff per matching note the plugin was told is sounding; a choke
+ *   arrives as a NoteOff with MidiEvent::choke set (end the voice now).
  * - Factory presets publish through preset-load + preset-discovery (the
  *   plugin DSO itself is the preset container; load keys are indices).
  * - process() runs under a DenormalGuard (FTZ/DAZ) so user DSP outside
@@ -318,13 +319,15 @@ struct Plugin
                 {
                     // NOTE_OFF and NOTE_CHOKE address notes by (channel, key,
                     // note id), each part possibly the wildcard -1. Every
-                    // sounding note the address matches gets its NoteOff (a
-                    // choke too: the closest MidiEvent says "stop this
-                    // voice"). The old code read -1 as channel 0 / key 0 and
-                    // dropped chokes, so a wildcard note-off released nothing
-                    // and choked voices rang on.
-                    const float velocity = ev->type == CLAP_EVENT_NOTE_OFF
-                                         ? static_cast<float>(note->velocity) : 0.0f;
+                    // sounding note the address matches gets its NoteOff. A
+                    // choke is a NoteOff with `choke` set: the voice must end
+                    // now, without its release phase. Delivered as a plain
+                    // NoteOff (the previous behaviour), a choked voice rang
+                    // out its whole release; a plugin that ignores the flag
+                    // still releases it.
+                    const bool choke = ev->type == CLAP_EVENT_NOTE_CHOKE;
+                    const float velocity = choke ? 0.0f : static_cast<float>(note->velocity);
+                    out.midi.choke = choke;
                     const bool exact = note->channel >= 0 && note->key >= 0;
                     if (exact)
                     {

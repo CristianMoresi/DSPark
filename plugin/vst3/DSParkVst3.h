@@ -821,7 +821,11 @@ struct Plugin
     // boundaries (sample-accurate, the default) or all up front.
 
     /** Collects parameter queue points. In sample-accurate mode every point
-     *  is kept with its offset; otherwise only the last point per queue. */
+     *  is kept with its offset; otherwise only the last point per queue -
+     *  except on a MIDI controller proxy, whose points are MIDI events, not
+     *  automation: each one reaches handleMidiEvent with its offset in both
+     *  modes, as the raw MIDI of the CLAP and AU backends does. (Opted-out
+     *  plugins used to receive one controller event per queue and block.) */
     void collectParameterChanges(Steinberg_Vst_IParameterChanges* changes,
                                  Steinberg_int32 numSamples,
                                  BlockEventList& events) noexcept
@@ -836,7 +840,8 @@ struct Plugin
             const Steinberg_int32 points = queue->lpVtbl->getPointCount(queue);
             if (points <= 0) continue;
             const Steinberg_Vst_ParamID id = queue->lpVtbl->getParameterId(queue);
-            const Steinberg_int32 first = sampleAccurateOf<P>() ? 0 : points - 1;
+            const bool everyPoint = sampleAccurateOf<P>() || (HasMidi<P> && isMidiProxyId(id));
+            const Steinberg_int32 first = everyPoint ? 0 : points - 1;
             for (Steinberg_int32 i = first; i < points; ++i)
             {
                 Steinberg_int32 offset = 0;

@@ -11,11 +11,12 @@
 //
 //   --expect-sidechain   sidechain port present + the key ducks the output
 //   --expect-instrument  no audio inputs, a note port; a note must sound at
-//                        the right pitch and decay
+//                        the right pitch, decay, and stop at once on a choke
 //   --probe              full host-contract battery against the DSPark probe
 //                        plugin: transport DC, the render extension's offline
-//                        sign flip, sample-accurate automation, note events
-//                        and raw-MIDI pitch bend, the latency-changed
+//                        sign flip, sample-accurate automation, note events,
+//                        raw-MIDI pitch bend and a CC at its sample offset,
+//                        the latency-changed
 //                        notification, the mono ports configuration and
 //                        preset-load + preset-discovery
 
@@ -593,6 +594,27 @@ int main(int argc, char** argv)
             tailEnergy += static_cast<double>(outL[static_cast<size_t>(i)])
                         * outL[static_cast<size_t>(i)];
         expect(tailEnergy < noteEnergy / 100.0, "note decays after note off");
+
+        // A NOTE_CHOKE (a host choke group) must end the voice at once,
+        // without its release phase: the plugin gets a NoteOff with
+        // MidiEvent::choke set. Delivered as a plain NoteOff (the old
+        // behaviour), the voice rang on through its whole release.
+        events.noteOn(69, 1.0, 0);
+        for (int block = 0; block < 4; ++block) processOnce();
+        double held = 0.0;
+        for (int i = 0; i < 512; ++i)
+            held += static_cast<double>(outL[static_cast<size_t>(i)])
+                  * outL[static_cast<size_t>(i)];
+        events.note(CLAP_EVENT_NOTE_CHOKE, 0, 69, 0);
+        processOnce();
+        double choked = 0.0;   // after the first 128 frames of the choke block
+        for (int i = 128; i < 512; ++i)
+            choked += static_cast<double>(outL[static_cast<size_t>(i)])
+                    * outL[static_cast<size_t>(i)];
+        std::printf("      choke: held block energy %.3g -> %.3g after 128 frames\n",
+                    held, choked);
+        expect(held > 1e-3 && choked < held * 1e-6,
+               "NOTE_CHOKE ends the voice without its release");
         (void) paramsExt;
     }
 
@@ -966,6 +988,28 @@ int main(int argc, char** argv)
             params->get_value(plugin, gainId, &gainNow);
             expect(std::fabs(gainNow - 1.0) < 1e-9,
                    "a parameter missing from the state takes its default");
+            processOnce();
+        }
+
+        // 17) A raw MIDI controller lands at its sample offset: CC74 on
+        //     channel 4 at frame 300 (off the 32-frame grid, 12 frames into
+        //     its sub-block) raises the probe's DC by 0.2 from that frame.
+        {
+            fillInput(0.0f);
+            processOnce();
+            events.midi(0xB3, 74, 127, 300);
+            processOnce();
+            int ccAt = -1;
+            for (int i = 0; i < 512; ++i)
+                if (outL[static_cast<size_t>(i)] > 0.1f)
+                {
+                    ccAt = i;
+                    break;
+                }
+            std::printf("      CC74 at frame 300 lands at sample %d\n", ccAt);
+            expect(ccAt == 300 && std::fabs(outL[511] - 0.2f) < 1e-6f,
+                   "a MIDI controller lands at its sample offset");
+            events.midi(0xB3, 74, 0, 0);
             processOnce();
         }
         proc.transport = nullptr;

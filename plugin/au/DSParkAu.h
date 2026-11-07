@@ -39,6 +39,11 @@
  * - Mono and stereo follow the declared ChannelSupport through
  *   SupportedNumChannels and the stream format; all elements run the same
  *   width. kAudioUnitProperty_OfflineRender feeds setOfflineRendering.
+ *   While initialized the stream format, sample rate and
+ *   MaximumFramesPerSlice are fixed: a different value is refused
+ *   (kAudioUnitErr_PropertyNotWritable / kAudioUnitErr_Initialized) so the
+ *   host uninitializes, sets it and initializes again; re-applying the
+ *   current value is accepted.
  * - State (kAudioUnitProperty_ClassInfo) wraps the shared format-agnostic
  *   container in the standard aupreset dictionary, so presets remain
  *   portable across all three backends. factoryPresets publish through
@@ -785,10 +790,11 @@ struct Plugin
         Boolean writable = false;
         switch (id)
         {
+        // Formats are fixed while initialized (see setProperty).
         case kAudioUnitProperty_StreamFormat:
-            size = sizeof(AudioStreamBasicDescription); writable = true; break;
+            size = sizeof(AudioStreamBasicDescription); writable = !initialized; break;
         case kAudioUnitProperty_SampleRate:
-            size = sizeof(Float64); writable = true; break;
+            size = sizeof(Float64); writable = !initialized; break;
         case kAudioUnitProperty_MaximumFramesPerSlice:
             size = sizeof(UInt32); writable = true; break;
         case kAudioUnitProperty_ElementCount:
@@ -1196,15 +1202,29 @@ struct Plugin
                 return kAudioUnitErr_InvalidPropertyValue;
             const auto* f = static_cast<const AudioStreamBasicDescription*>(inData);
             if (!acceptableFormat(*f)) return kAudioUnitErr_FormatNotSupported;
+            // While initialized the format is fixed: the plugin was prepared
+            // for this rate and width. Re-applying the same format is fine;
+            // a different one is refused, and the host uninitializes, sets
+            // it and initializes again. Accepting it (the old behaviour) let
+            // processBlock see a width it was never prepared for and made
+            // kAudioUnitProperty_Latency divide by a rate the DSP never ran.
             if (HasSidechain<P> && scope == kAudioUnitScope_Input && element == 1)
             {
                 // The sidechain's own width: a mono key on a stereo main is
                 // pulled mono and fed to both detector ears. It never sets
                 // the main width - the old code let this element switch the
                 // whole unit, and a stereo track then rendered one channel.
+                const UInt32 current = sidechainChannels != 0
+                    ? sidechainChannels : static_cast<UInt32>(currentChannels);
+                if (initialized && f->mChannelsPerFrame != current)
+                    return kAudioUnitErr_PropertyNotWritable;
                 sidechainChannels = f->mChannelsPerFrame;
                 return noErr;
             }
+            if (initialized
+                && (f->mSampleRate != sampleRate
+                    || static_cast<int>(f->mChannelsPerFrame) != currentChannels))
+                return kAudioUnitErr_PropertyNotWritable;
             sampleRate = f->mSampleRate;
             // The negotiated width: the main elements follow it (initialize()
             // prepares the plugin at this count).
@@ -1212,21 +1232,34 @@ struct Plugin
             return noErr;
         }
         case kAudioUnitProperty_SampleRate:
+        {
             if (inData == nullptr || inSize < sizeof(Float64))
                 return kAudioUnitErr_InvalidPropertyValue;
-            sampleRate = *static_cast<const Float64*>(inData);
+            const Float64 rate = *static_cast<const Float64*>(inData);
+            if (!(rate > 0.0)) return kAudioUnitErr_FormatNotSupported;   // NaN too
+            if (initialized && rate != sampleRate)
+                return kAudioUnitErr_PropertyNotWritable;   // see StreamFormat
+            sampleRate = rate;
             return noErr;
+        }
         case kAudioUnitProperty_MaximumFramesPerSlice:
+        {
             if (inData == nullptr || inSize < sizeof(UInt32))
                 return kAudioUnitErr_InvalidPropertyValue;
-            // Takes effect at the next initialize(), which sizes the
-            // buffers. render() refuses a slice longer than what was
-            // allocated: the old code compared against this new value and
-            // overran its 512-frame buffers when a host raised it while
-            // initialized.
-            maxFrames = *static_cast<const UInt32*>(inData);
+            const UInt32 frames = *static_cast<const UInt32*>(inData);
+            if (frames == maxFrames) return noErr;
+            // initialize() sizes the buffers for this value, so a change
+            // while initialized is refused (kAudioUnitErr_Initialized tells
+            // the host to uninitialize, set it and initialize again).
+            // Accepting it (the old behaviour) answered noErr and then
+            // failed every slice longer than the allocation with
+            // kAudioUnitErr_TooManyFramesToProcess: silence. render() still
+            // refuses such a slice as a last guard.
+            if (initialized) return kAudioUnitErr_Initialized;
+            maxFrames = frames;
             notifyProperty(id, scope, element);
             return noErr;
+        }
         case kAudioUnitProperty_PresentPreset:
         case kAudioUnitProperty_CurrentPreset:
         {
@@ -1645,8 +1678,9 @@ struct Plugin
         (void) busNumber;
         if (ioData == nullptr || frames == 0) return noErr;
         if (!initialized) return kAudioUnitErr_Uninitialized;
-        // Bound by what initialize() allocated, not by the property: a host
-        // may raise MaximumFramesPerSlice while the unit stays initialized.
+        // Bound by the property and by what initialize() allocated (the
+        // property cannot change while initialized; the second test is a
+        // last guard for the buffers).
         if (frames > maxFrames || frames > pullL.size())
             return kAudioUnitErr_TooManyFramesToProcess;
 

@@ -15,7 +15,8 @@
 //   --probe              full host-contract battery against the DSPark probe
 //                        plugin (tools/plugin_probe.cpp): transport DC,
 //                        offline sign flip, sample-accurate automation step,
-//                        note events + IMidiMapping pitch bend, the
+//                        note events + IMidiMapping pitch bend and a
+//                        mapped CC at its sample offset, the
 //                        latency-changed notification, mono negotiation and
 //                        the factory-preset program list
 //
@@ -1191,6 +1192,40 @@ int main(int argc, char** argv)
                 map->lpVtbl->release(map);
             }
             expect(all, "every MIDI controller (CC 0-127, pressure, bend) is mapped");
+        }
+
+        // 18) A mapped controller reaches the plugin as a MIDI event at its
+        //     sample offset: CC74 on channel 4 at frame 300 (off the 32-frame
+        //     grid, 12 frames into its sub-block) raises the probe's DC by
+        //     0.2 from exactly that frame.
+        {
+            void* rawCcMap = nullptr;
+            ctrl->lpVtbl->queryInterface(ctrl, Steinberg_Vst_IMidiMapping_iid, &rawCcMap);
+            Steinberg_Vst_ParamID ccId = 0;
+            bool ccMapped = false;
+            if (rawCcMap != nullptr)
+            {
+                auto* map = static_cast<Steinberg_Vst_IMidiMapping*>(rawCcMap);
+                ccMapped = map->lpVtbl->getMidiControllerAssignment(map, 0, 3, 74, &ccId)
+                        == Steinberg_kResultTrue;
+                map->lpVtbl->release(map);
+            }
+            fillInput(0.0f);
+            processOnce();
+            if (ccMapped) changes.add(ccId).points.push_back({ 300, 1.0 });
+            processOnce();
+            int ccAt = -1;
+            for (int i = 0; i < 512; ++i)
+                if (outL[static_cast<size_t>(i)] > 0.1f)
+                {
+                    ccAt = i;
+                    break;
+                }
+            std::printf("      CC74 at frame 300 lands at sample %d\n", ccAt);
+            expect(ccMapped && ccAt == 300 && std::fabs(outL[511] - 0.2f) < 1e-6f,
+                   "a mapped MIDI controller lands at its sample offset");
+            if (ccMapped) changes.add(ccId).points.push_back({ 0, 0.0 });
+            processOnce();
         }
 
         data.processContext = nullptr;

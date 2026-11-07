@@ -6,6 +6,12 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- Plugin layer: `MidiEvent::choke`. A CLAP NOTE_CHOKE (a host choke group
+  cutting a voice) arrives as a `NoteOff` with `choke` set, so a plugin can
+  end the voice at once instead of running its release; a plugin that
+  ignores the flag releases the voice as before. The synth example fades a
+  choked voice in 1 ms: frames 128-511 of the choke block carried 53% of a
+  held block's energy (its 150 ms release) and now carry none.
 - Run-time AVX2 dispatch: x86-64 builds for the generic baseline also compile
   AVX2+FMA copies of the vector kernels (the FFT passes, `firCorrelate`,
   `dotProduct`, `complexMulAccum`) and select them on CPUs that support them.
@@ -80,6 +86,17 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- VST3: a plugin that opts out of sample-accurate automation receives every
+  MIDI controller value through `IMidiMapping`, each with its sample
+  offset (1 of 4 CC points in a block reached it before; CLAP and AU raw
+  MIDI delivered all 4).
+- AU: while initialized, a different `MaximumFramesPerSlice` is refused
+  with `kAudioUnitErr_Initialized` and a different stream format or sample
+  rate with `kAudioUnitErr_PropertyNotWritable`, so the host re-initializes.
+  The unit accepted them: a raised slice size then failed every longer
+  slice (silence), a new rate halved the reported latency (64 samples
+  reported as 0.67 ms instead of 1.33 ms) and a new width reached
+  `processBlock` unprepared. Re-applying the current value still succeeds.
 - `StereoGenerator`: a silent tail reaches exact zero. The band, color and
   DC recursions settled into a subnormal limit cycle near 1e-321 after the
   input stopped, so the output never returned to digital silence and the

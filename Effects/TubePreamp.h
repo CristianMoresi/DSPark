@@ -16,10 +16,11 @@
  *   KVB=300) in a classic common-cathode stage: 300 V supply, 100 k ohm plate
  *   load, 1.5 k ohm cathode resistor with its 22 uF bypass capacitor. Grid
  *   conduction is approximated by a soft clamp toward +0.7 V by default;
- *   setGridModel(GridModel::Conduction) instead drives the grid through a
- *   68 k ohm source against a grid current referenced to the cathode (full
- *   blocking distortion needs the input-coupling state and is left for a
- *   later pass).
+ *   setGridModel(GridModel::Conduction) instead feeds each grid through a
+ *   22 nF coupling capacitor with a 1 M ohm grid leak and a 68 k ohm source,
+ *   against a grid current referenced to the cathode: grid current charges
+ *   the coupling capacitor and biases the stage colder (blocking
+ *   distortion).
  * - **Supply sag**: the effective B+ droops with smoothed plate current
  *   (one-pole, ~70 ms) times a sag resistance - drive into the stage and
  *   the headroom breathes back, the classic touch response.
@@ -198,9 +199,10 @@ namespace detail {
      * "A physically-motivated triode model for circuit simulations" (DAFx-11):
      * Ig(v) = Gg * (softplus(Cg * v) / Cg)^xi of the grid-to-cathode voltage
      * v, with Gg = 6.177e-4, xi = 1.314, Cg = 9.901. Its constant 8e-8 A
-     * leakage term is left out: the stage has no grid-leak resistor to carry
-     * it, so it would only offset the bias. The grid is driven through a
-     * fixed 68 k ohm source; for a source-minus-cathode voltage d the
+     * leakage term is left out: through the 1 M ohm grid leak it would only
+     * shift the rest bias by 80 mV. The grid is driven through a fixed
+     * 68 k ohm source behind the input coupling network (see
+     * TubePreamp::GridModel); for a source-minus-cathode voltage d the
      * grid-to-cathode voltage w solves w + Rs * Ig(w) = d. The left side
      * increases with w, so the root is unique and lies in
      * [d - Rs * Ig(d), d].
@@ -209,6 +211,8 @@ namespace detail {
     {
         static constexpr double kGg = 6.177e-4, kXi = 1.314, kCg = 9.901;
         static constexpr double kRs = 68e3;   ///< Source resistance (ohm).
+        static constexpr double kCc = 22e-9;  ///< Grid coupling capacitor (F).
+        static constexpr double kRg = 1e6;    ///< Grid leak resistor (ohm).
 
         /** Grid current (A) and its derivative at grid-to-cathode voltage v. */
         static double current(double v, double& slope) noexcept
@@ -229,21 +233,21 @@ namespace detail {
             return kGg * pm1 * base;
         }
 
-        /** Root of w + Rs * Ig(w) = d: Newton inside the bracket, bisection
+        /** Root of w + rs * Ig(w) = d: Newton inside the bracket, bisection
          *  when a step leaves it. */
-        static double solve(double d) noexcept
+        static double solve(double d, double rs = kRs) noexcept
         {
             if (!std::isfinite(d)) return 0.0;
             double slope = 0.0;
-            double lo = d - kRs * current(d, slope), hi = d;
-            double w = d > 0.0 ? std::min(hi, std::max(lo, std::pow(d / (kRs * kGg), 1.0 / kXi)))
+            double lo = d - rs * current(d, slope), hi = d;
+            double w = d > 0.0 ? std::min(hi, std::max(lo, std::pow(d / (rs * kGg), 1.0 / kXi)))
                                : d;
             for (int it = 0; it < 100; ++it)
             {
-                const double f = w + kRs * current(w, slope) - d;
+                const double f = w + rs * current(w, slope) - d;
                 if (f > 0.0) hi = w;
                 else lo = w;
-                const double next = w - f / (1.0 + kRs * slope);
+                const double next = w - f / (1.0 + rs * slope);
                 const double step = next > lo && next < hi ? next : 0.5 * (lo + hi);
                 if (std::abs(step - w) <= 1e-15 * std::max(1.0, std::abs(w)) || hi - lo <= 1e-15)
                 {
@@ -257,11 +261,12 @@ namespace detail {
     };
 
     /**
-     * Cubic Hermite table of the TubePreampGridConduction root w(d): steps of
-     * 1/64 V on [-1.5, 8) and 1/8 V on [8, 72] V, value and exact slope
-     * dw/dd = 1 / (1 + Rs * Ig'(w)) per node (17.9 kB). Largest error
-     * against solve() on a 1/4096 V sweep is 1.5e-8 V. Below -1.5 V
-     * the source drop is under 1e-8 V and w = d; above 72 V solve() runs.
+     * Cubic Hermite table of the TubePreampGridConduction root w(d) for one
+     * source resistance rs: steps of 1/64 V on [-1.5, 8) and 1/8 V on [8, 72] V,
+     * value and exact slope dw/dd = 1 / (1 + rs * dIg/dw) per node (17.9 kB).
+     * Largest error against solve() on a 1/4096 V sweep is 1.5e-8 V. Below
+     * -1.5 V the source drop is under 1e-8 V and w = d; above 72 V solve()
+     * runs.
      */
     struct TubePreampGridTable
     {
@@ -270,18 +275,20 @@ namespace detail {
         static constexpr int kFineCells = static_cast<int>((kMid - kLo) * kFine);
         static constexpr int kCells = kFineCells + static_cast<int>((kHi - kMid) * kCoarse);
         std::vector<double> w, dw;
+        double rs = TubePreampGridConduction::kRs;   ///< Source resistance the table solves for.
 
-        TubePreampGridTable() : w(static_cast<size_t>(kCells + 1)), dw(static_cast<size_t>(kCells + 1))
+        explicit TubePreampGridTable(double sourceResistance = TubePreampGridConduction::kRs)
+            : w(static_cast<size_t>(kCells + 1)), dw(static_cast<size_t>(kCells + 1)), rs(sourceResistance)
         {
             for (int i = 0; i <= kCells; ++i)
             {
                 const double d = i <= kFineCells ? kLo + double(i) / kFine
                                                  : kMid + double(i - kFineCells) / kCoarse;
-                const double root = TubePreampGridConduction::solve(d);
+                const double root = TubePreampGridConduction::solve(d, rs);
                 double slope = 0.0;
                 (void)TubePreampGridConduction::current(root, slope);
                 w[static_cast<size_t>(i)] = root;
-                dw[static_cast<size_t>(i)] = 1.0 / (1.0 + TubePreampGridConduction::kRs * slope);
+                dw[static_cast<size_t>(i)] = 1.0 / (1.0 + rs * slope);
             }
         }
 
@@ -289,7 +296,7 @@ namespace detail {
         [[nodiscard]] double eval(double d) const noexcept
         {
             if (d <= kLo) return d;
-            if (!(d < kHi)) return TubePreampGridConduction::solve(d);
+            if (!(d < kHi)) return TubePreampGridConduction::solve(d, rs);
             double pos = 0.0, h = 0.0;
             if (d < kMid) { pos = (d - kLo) * kFine; h = 1.0 / kFine; }
             else { pos = kFineCells + (d - kMid) * kCoarse; h = 1.0 / kCoarse; }
@@ -874,7 +881,11 @@ public:
             design_ ? std::numeric_limits<double>::infinity() : fs2_);
         if (gridModel_ == GridModel::Conduction)
         {
-            if (!gridTable_) gridTable_ = std::make_unique<detail::TubePreampGridTable>();
+            // The 1x point circuit solves the coupling capacitor implicitly:
+            // its trapezoid adds a series resistance to the grid source.
+            const double rs = design_ ? Conduction::kRs : Conduction::kRs + couplingSeries(fs2_);
+            if (!gridTable_ || gridTable_->rs != rs)
+                gridTable_ = std::make_unique<detail::TubePreampGridTable>(rs);
         }
         else
             gridTable_.reset();
@@ -1013,11 +1024,17 @@ public:
      *   +1.2 V, so it compresses from about -1.2 V grid-to-cathode and the
      *   grid never reaches the cathode.
      * - Conduction: grid current of the grid-to-cathode voltage (12AX7 fit
-     *   of Dempwolf and Zoelzer, DAFx-11) through a fixed 68 k ohm source,
-     *   added to the cathode current. 0.25 mA at +0.5 V, 0.62 mA at +1 V.
-     *   With the cathode at rest, a 1 V source drives the grid to 0.936 V
-     *   (Clamp: 0.624 V) and 20 V to 1.730 V (Clamp: 0.700 V); see
-     *   setGridModel() for the effect on the output.
+     *   of Dempwolf and Zoelzer, DAFx-11), added to the cathode current.
+     *   0.25 mA at +0.5 V, 0.62 mA at +1 V. Each grid is fed from its source
+     *   (the drive-scaled input, or the interstage signal) through a 22 nF
+     *   coupling capacitor, a 1 M ohm grid leak to ground and a 68 k ohm
+     *   series resistance. Grid current charges the coupling capacitor, so
+     *   a loud passage leaves the stage biased colder until the capacitor
+     *   discharges through the grid leak (22 ms): blocking distortion. At
+     *   rest a 1 V step drives the grid to 0.936 V (Clamp: 0.624 V) and 20 V
+     *   to 1.730 V (Clamp: 0.700 V) before the capacitor charges; see
+     *   setGridModel() for the effect on the output. The coupling network is
+     *   also a 7.2 Hz high-pass on each grid.
      */
     enum class GridModel { Clamp, Conduction };
 
@@ -1028,17 +1045,23 @@ public:
      *
      * Conduction is a change of character, so it is opt-in. Against Clamp at
      * 2x, one stage, 1 kHz at -6 dBFS: the output differs by -21.9 dB at
-     * 0 dB drive and -10.4 dB at +12 dB, where the second harmonic falls
-     * from -15.0 to -33.9 dBc, the third moves from -15.4 to -17.3 dBc and
-     * the level rises 1.7 dB (the positive half no longer compresses from
-     * 0 V; it limits where the grid meets the cathode). Against the point
-     * circuit at 32x the core error stays within 0.2 dB of the Clamp figure
-     * or better (worst -59.5 dB, Clamp -58.4). Worst alias over the documented sweep at
-     * 2x: -101.8 against -87.7 dBc at one stage, +12 dB, and better or
-     * equal in six of eight settings; two stages at +12/+24 dB reach -79.7
-     * against -83.0 dBc (the stronger even-order curvature lifts the input
-     * reconstruction floor; equal at 4x, -91.7 against -91.4). CPU rises
-     * 1-18 %, most at +24..+36 dB drive.
+     * 0 dB drive and -7.7 dB at +12 dB, where the second harmonic moves from
+     * -15.0 to -16.5 dBc, the third from -15.4 to -21.1 dBc and the level
+     * rises 1.6 dB. From +24 dB the charged coupling capacitor holds the
+     * stage near cutoff for most of the cycle: the second harmonic rises from
+     * -21.2 to -3.9 dBc and the level falls 1.3 dB (two stages, +36 dB:
+     * 5.3 dB). Blocking: after a 300 ms burst at +24 dB (1 kHz, -6 dBFS) a
+     * 0.01 tone comes out 15.6 dB below its settled level 2 ms later,
+     * 10.8 dB at 10 ms and 1.8 dB at 20 ms, recovered by 40 ms; during the
+     * burst the supply reads 277.4 V against 264.4 V without the coupling
+     * network (less plate current). Against the point circuit at 32x the
+     * core error stays within 1.9 dB of the Clamp figure (worst -56.7 dB,
+     * Clamp -58.4). Worst alias over the documented sweep at 2x (after 2 s
+     * of settling): -83.4/-72.7/-68.3 dBc at one stage, +12/+24/+36 dB
+     * (Clamp -87.7/-80.6/-80.6) and -77.1/-68.2/-65.5 at two stages (Clamp
+     * -83.0/-83.0/-84.8): the stronger harmonics fold more at 2x; at 4x the
+     * worst is -84.9 (one stage, +36 dB) and -84.0 dBc (two stages, +24 dB).
+     * CPU rises 3-23 %, most at +24..+36 dB drive.
      */
     void setGridModel(GridModel model)
     {
@@ -1347,6 +1370,15 @@ private:
 
     using LoadTable = detail::TubePreampCurrentTable;
     using Clamp = detail::TubePreampGridClamp;
+    using Conduction = detail::TubePreampGridConduction;
+
+    /** Series resistance the trapezoidal coupling capacitor adds to the grid
+     *  source at an internal rate (its h / (2 Cc) against the grid leak). */
+    static double couplingSeries(double rate) noexcept
+    {
+        const double h = 0.5 / (rate * Conduction::kCc);
+        return h / (1.0 + h / Conduction::kRg);
+    }
 
     static void koren(double vpk, double vgk, double& ip,
                       double& dIpdVpk, double& dIpdVgk) noexcept
@@ -1381,6 +1413,8 @@ private:
         const LoadTable* table = nullptr;
         const detail::TubePreampGridTable* grid = nullptr;   ///< Conduction model when set.
         double ig = 0.0;           ///< Grid current state (conduction model).
+        double vc = 0.0;           ///< Coupling capacitor voltage (conduction model).
+        double icPrev = 0.0;       ///< Previous coupling capacitor current (A).
         double fs2 = 96000.0;
         double ip = 8e-4;          ///< Plate current state / NR seed.
         double vk = 1.2;           ///< Cathode voltage (bypass cap state).
@@ -1394,6 +1428,8 @@ private:
             fPrev = 0.0;
             vpDC = bplus - ip * kRL;
             ig = 0.0;
+            vc = 0.0;
+            icPrev = 0.0;
         }
 
         /** @brief Processes one grid-volt sample, returns AC plate voltage. */
@@ -1449,9 +1485,18 @@ private:
             const double kA = (vk + h2c * fPrev) / denom;
             const double kB = h2c / denom;
             const double vkEst = kA + kB * (ip + ig);
-            const double w = grid->eval(vs - vkEst);
+            // Trapezoidal coupling capacitor: vc = cA + cB * Ig with the grid
+            // leak current (vs - vc) / Rg; cB joins the grid source resistance
+            // (the table is built for Rs + cB at this rate).
+            const double hc = 0.5 / (fs2 * Conduction::kCc);
+            const double cDen = 1.0 + hc / Conduction::kRg;
+            const double cA = (vc + hc * (vs / Conduction::kRg + icPrev)) / cDen;
+            const double drive = vs - cA - vkEst;
+            const double w = grid->eval(drive);
             const double vg = vkEst + w;
-            const double igN = (vs - vg) * (1.0 / detail::TubePreampGridConduction::kRs);
+            const double igN = (drive - w) / grid->rs;
+            vc = cA + (hc / cDen) * igN;
+            icPrev = (vs - vc) / Conduction::kRg + igN;
 
             const double iMax = bplusEff / kRL + 1e-3;
             double i = std::clamp(ip, 0.0, iMax);
@@ -1509,6 +1554,9 @@ private:
         double g1Prev = 0.0, g2Prev = 0.0;      ///< Interval-average grid currents.
         static constexpr double kConductionKnees[4] = {-0.6, -0.3, 0.1, 1.0};
         double gridIntegral1 = 0.0, gridIntegral2 = 0.0;
+        /// Coupling capacitor voltages and interval-average grid sources (conduction).
+        double vc1 = 0.0, vc2 = 0.0, x1Prev = 0.0, x2Prev = 0.0, x2Integral = 0.0;
+        double couplingDecay = 1.0;
         detail::TubePreampToneModes modes;
         std::array<double, 16> ring {};
         int ringPos = 0;
@@ -1519,7 +1567,7 @@ private:
         double cutSupply[2] = {-1.0, -1.0}, cutVgk[2] {};
         // Interval scratch
         typename LoadTable::Slice slice1, slice2;
-        double supply = 0.0, a1 = 0.0, a2 = 0.0, s1 = 0.0, s2 = 0.0;
+        double supply = 0.0, a1 = 0.0, a2 = 0.0, s1 = 0.0, s2 = 0.0, ref1 = 0.0, ref2 = 0.0;
         double lev1[kMaxLevels] {}, lev2[kMaxLevels] {};
         int levels = 5;                         ///< Levels in use (5 Clamp, 7 Conduction).
         double integral1 = 0.0, integral2 = 0.0, moments[kOrder] {};
@@ -1544,6 +1592,7 @@ private:
             period = 1.0 / sampleRate;
             cathodeDecay = std::exp(-period / (kRk * kCk));
             sagDecay = std::exp(-period / 0.07);
+            couplingDecay = std::exp(-period / (Conduction::kRg * Conduction::kCc));
             for (int k = 0; k < 4; ++k)
             {
                 double poly[4] = {1.0, 0.0, 0.0, 0.0};
@@ -1613,6 +1662,7 @@ private:
             ipLP = i1 * numStages;
             i1Prev = i2Prev = i1;
             g1Prev = g2Prev = 0.0;
+            vc1 = vc2 = x1Prev = x2Prev = x2Integral = 0.0;
             q[0] = q[1] = q[2] = 0.0;
             ring.fill(0.0);
             ringPos = 0;
@@ -1883,6 +1933,9 @@ private:
                 lo = std::min(lo, sv[k]);
                 hi = std::max(hi, sv[k]);
             }
+            if (grid)   // Simpson average of the stage-2 source on this piece
+                x2Integral += h * (samples == 4 ? (sv[0] + 4.0 * sv[1] + 2.0 * sv[2] + 4.0 * sv[3] + sv[4]) / 12.0
+                                                : (sv[0] + 4.0 * sv[1] + sv[2]) / 6.0);
             const bool edges = hi - lo < (grid ? kConductionKneeRange : kKneeRange);
             const auto cls = [&](double v) { return edges ? classifyEdges(lev2, v) : classify(lev2, v); };
             double pt = 0.0, pv = sv[0];
@@ -1944,7 +1997,7 @@ private:
                     // near 0.8 cycles/sample from leaking past the kernel.
                     double xs[4], is[4], gs[4], y[4], poly[4];
                     for (int j = 0; j < 4; ++j) xs[j] = kInterstage * tr(xa + len * kG4x[j]);
-                    currents<4>(slice2, a2, xs, is, gs);
+                    currents<4>(slice2, ref2, xs, is, gs);
                     for (int j = 0; j < 4; ++j)
                     {
                         integral2 += h * len * kG4w[j] * is[j];
@@ -1964,7 +2017,7 @@ private:
                     // linear interpolant.
                     constexpr double g0 = 0.21132486540518713, g1 = 0.78867513459481287;
                     double xs[2] = {kInterstage * tr(xa + len * g0), kInterstage * tr(xa + len * g1)}, is[2], gs[2];
-                    currents<2>(slice2, a2, xs, is, gs);
+                    currents<2>(slice2, ref2, xs, is, gs);
                     integral2 += h * len * 0.5 * (is[0] + is[1]);
                     if (grid) gridIntegral2 += h * len * 0.5 * (gs[0] + gs[1]);
                     const double y0 = supply - kRL * is[0] - vp2, y1 = supply - kRL * is[1] - vp2;
@@ -1976,7 +2029,7 @@ private:
                 }
                 double xs[3], is[3], gs[3];
                 for (int j = 0; j < 3; ++j) xs[j] = kInterstage * tr(xa + len * kG3x[j]);
-                currents<3>(slice2, a2, xs, is, gs);
+                currents<3>(slice2, ref2, xs, is, gs);
                 if (grid)
                     for (int j = 0; j < 3; ++j) gridIntegral2 += h * len * kG3w[j] * gs[j];
                 // Exact moments of the plate interpolant through the three
@@ -2056,8 +2109,20 @@ private:
             slice2.set(*table, s2);
             if (std::abs(s1 - cutSupply[0]) > 0.05) { cutSupply[0] = s1; cutVgk[0] = cutoffVgk(s1); }
             if (std::abs(s2 - cutSupply[1]) > 0.05) { cutSupply[1] = s2; cutVgk[1] = cutoffVgk(s2); }
-            lev1[0] = a1 + cutVgk[0]; lev1[1] = a1 - 3.0; lev1[2] = a1 - 1.0; lev1[3] = 1.0; lev1[4] = 6.0;
-            lev2[0] = a2 + cutVgk[1]; lev2[1] = a2 - 3.0; lev2[2] = a2 - 1.0; lev2[3] = 1.0; lev2[4] = 6.0;
+            // Grid references: the cathode, plus the coupling capacitor voltage
+            // (conduction model), held at its predicted interval midpoint like
+            // the cathode and advanced exactly below with the interval-average
+            // source and grid current.
+            ref1 = a1;
+            ref2 = a2;
+            if (grid)
+            {
+                const double half = 0.5 * (1.0 - couplingDecay);
+                ref1 += vc1 + half * ((x1Prev + Conduction::kRg * g1Prev) - vc1);
+                ref2 += vc2 + half * ((x2Prev + Conduction::kRg * g2Prev) - vc2);
+            }
+            lev1[0] = ref1 + cutVgk[0]; lev1[1] = ref1 - 3.0; lev1[2] = ref1 - 1.0; lev1[3] = 1.0; lev1[4] = 6.0;
+            lev2[0] = ref2 + cutVgk[1]; lev2[1] = ref2 - 3.0; lev2[2] = ref2 - 1.0; lev2[3] = 1.0; lev2[4] = 6.0;
             if (grid)
             {
                 // Conduction knee relative to the cathode, where the grid
@@ -2067,8 +2132,8 @@ private:
                 levels = kMaxLevels;
                 for (int k = 0; k < 4; ++k)
                 {
-                    lev1[3 + k] = a1 + kConductionKnees[k];
-                    lev2[3 + k] = a2 + kConductionKnees[k];
+                    lev1[3 + k] = ref1 + kConductionKnees[k];
+                    lev2[3 + k] = ref2 + kConductionKnees[k];
                 }
             }
             for (int j = 1; j < levels; ++j)
@@ -2129,6 +2194,7 @@ private:
             cuts[count++] = 1.0;
             integral1 = integral2 = 0.0;
             gridIntegral1 = gridIntegral2 = 0.0;
+            x2Integral = 0.0;
             for (double& m : moments) m = 0.0;
             haveHi1 = haveHi2 = false;
             for (int k = 0; k + 1 < count; ++k)
@@ -2165,7 +2231,7 @@ private:
                     xs[0] = v0; xs[1] = v1; xs[2] = v2; xs[3] = v3;
                 }
                 double gs[4];
-                currents<4>(slice1, a1, xs, is, gs);
+                currents<4>(slice1, ref1, xs, is, gs);
                 double y[4];
                 for (int j = 0; j < 4; ++j)
                 {
@@ -2189,6 +2255,20 @@ private:
                 vk2 = vk2 * cathodeDecay + (1.0 - cathodeDecay) * kRk * (integral2 + gridIntegral2);
                 i2Prev = integral2;
                 g2Prev = gridIntegral2;
+            }
+            if (grid)
+            {
+                // Coupling capacitors: Cc dvc/dt = (x - vc) / Rg + Ig, exact for
+                // the interval-average source x and grid current Ig.
+                double x1Avg = 0.0;
+                for (int p = 0; p <= deg; ++p) x1Avg += c[p] / (p + 1);
+                vc1 = vc1 * couplingDecay + (1.0 - couplingDecay) * (x1Avg + Conduction::kRg * gridIntegral1);
+                x1Prev = x1Avg;
+                if (stages > 1)
+                {
+                    vc2 = vc2 * couplingDecay + (1.0 - couplingDecay) * (x2Integral + Conduction::kRg * gridIntegral2);
+                    x2Prev = x2Integral;
+                }
             }
             ipLP = ipLP * sagDecay + (1.0 - sagDecay) * (integral1 + (stages > 1 ? integral2 : 0.0));
             i1Prev = integral1;
@@ -2298,12 +2378,14 @@ private:
             stage2.vk = kRk * after[2];
             stage2.vpDC = after[0] - kRL * after[2];
             stage2.fPrev = 0.0;
+            stage2.ig = stage2.vc = stage2.icPrev = 0.0;
             ipLP = source.ipLP + dTotal;
             if (!design) fmv.copyStateFrom(source.fmv, inputOffset);
             core = source.core;
             core.vk1 += kRk * di;
             core.i1Prev += di;
             core.vp1 = reference;
+            core.vc2 = core.x2Prev = core.g2Prev = 0.0;
             if (design)
                 for (int mode = 0; mode < 3; ++mode)
                     for (int capacitor = 0; capacitor < 3; ++capacitor)

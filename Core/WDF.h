@@ -13,7 +13,9 @@
  * roots -- an ideal voltage source for linear networks and nonlinear roots
  * (Shockley diode, antiparallel diode pair) solved in closed form: a Wright
  * omega estimate plus one exact correction step reaches full double
- * precision at a fixed cost per sample.
+ * precision at a fixed cost per sample, and at low drive an exact series
+ * reversion of the diode equation does so without any transcendental
+ * function.
  *
  * Wave convention: voltage waves with a = v + R*i (incident) and
  * b = v - R*i (reflected), so v = (a+b)/2 and i = (a-b)/(2R). Reactances
@@ -589,6 +591,140 @@ private:
     std::array<std::array<double, 6>, kUpperCells> upper_ {};   ///< Taylor terms + midpoint.
 };
 
+/**
+ * @brief Exact low-drive roots of the normalised diode equations by series
+ *        reversion (no transcendental function and no division per sample).
+ *
+ * With the drive normalised by the linear slope, the antiparallel pair reads
+ * y = s + kappa (sinh s - s) (y = x / (1 + 2c), kappa = 2c / (1 + 2c)) and the
+ * single diode y = s + kappa (e^s - 1 - s) (y = x / (1 + c), kappa = c / (1 + c)).
+ * Lagrange inversion gives s = y + sum_k b_k y^k, where every b_k is a
+ * polynomial in kappa with rational coefficients (exact for any kappa; printed
+ * here to double precision). The roots keep the terms through y^15 and use
+ * them while |y| < Y, with Y set so that each of the two first omitted terms
+ * stays below 1e-17 relative to y (Y <= 6). Verified against 50-digit roots
+ * for kappa from 1e-30 to 0.04: worst truncation error 2e-17 relative; above
+ * kappa = 0.04 the series is not used. For the default 1N4148 constants
+ * behind 707 ohm Y is 1.17 (pair) and 1.09 (single), incident waves up to
+ * 53 and 49 mV: the low-level region where the omega estimate and its
+ * correction step cost the most relative to the signal.
+ */
+struct DiodeSeries
+{
+    /// Coefficients of y^3, y^5, ..., y^19 (pair), each a polynomial
+    /// c1 kappa + c2 kappa^2 + ... of degree (k - 1) / 2, lowest power first.
+    static constexpr double kPairCoefficients[45] = {
+        -0.16666666666666666, -0.008333333333333333, 0.08333333333333333,
+        -0.0001984126984126984, 0.011111111111111112, -0.05555555555555555,
+        -2.7557319223985893e-06, 0.000677910052910053, -0.01273148148148148,
+        0.04243827160493827, -2.505210838544172e-08, 2.535273368606702e-05,
+        -0.0013326719576719577, 0.01404320987654321, -0.03510802469135803,
+        -1.6059043836821613e-10, 6.555301694190583e-07, -8.616255144032922e-05,
+        0.0021347736625514403, -0.015303497942386831, 0.030606995884773662,
+        -7.647163731819816e-13, 1.2516877596242676e-08, -3.901925528909656e-06,
+        0.00020154810895551636, -0.003085684891240447, 0.01661522633744856,
+        -0.0276920438957476, -2.8114572543455206e-15, 1.8420105639020982e-10,
+        -1.3265171685310574e-07, 1.3412058788629556e-05, -0.00038840127743484227,
+        0.004199620627572016, -0.01803037122770919, 0.025757673182441702,
+        -8.22063524662433e-18, 2.154825793386156e-12, -3.537694774007972e-09,
+        6.748958893377618e-07, -3.461694730904479e-05, 0.0006657831313824112,
+    /// Coefficients of y^2, y^3, ..., y^17 (single), degree k - 1 in kappa.
+        -0.005497982872275568, 0.019581856805365037, -0.024477321006706295
+    };
+    static constexpr double kSingleCoefficients[136] = {
+        -0.5, -0.16666666666666666, 0.5, -0.041666666666666664, 0.4166666666666667, -0.625,
+        -0.008333333333333333, 0.20833333333333334, -0.875, 0.875, -0.001388888888888889,
+        0.07777777777777778, -0.6805555555555556, 1.75, -1.3125, -0.0001984126984126984,
+        0.02361111111111111, -0.38055555555555554, 1.875, -3.4375, 2.0625,
+        -2.48015873015873e-05, 0.006101190476190476, -0.16927083333333334, 1.4131944444444444,
+        -4.7265625, 6.703125, -3.3515625, -2.7557319223985893e-06, 0.0013806216931216931,
+        -0.06320271164021164, 0.8349729938271605, -4.510127314814815, 11.296006944444445,
+        -13.033854166666666, 5.5859375, -2.755731922398589e-07, 0.0002788800705467372,
+        -0.020479497354497354, 0.4098324514991182, -3.340528549382716, 13.091782407407408,
+        -26.067708333333332, 25.322916666666668, -9.49609375, -2.505210838544172e-08,
+        5.09810405643739e-05, -0.005889550264550265, 0.173233024691358, -2.0400270061728394,
+        11.696238425925927, -35.63113425925926, 58.703125, -49.20703125, 16.40234375,
+        -2.08767569878681e-09, 8.521892202447758e-06, -0.001527617026748971,
+        0.06461548353909465, -1.066552533436214, 8.568155221193416, -37.354499421296296,
+        92.58211805555555, -129.85188802083334, 95.68033854166667, -28.7041015625,
+        -1.6059043836821613e-10, 1.3131480145369033e-06, -0.0003617044285447063,
+        0.02164432227366255, -0.4897392618312757, 5.3492557227366255, -31.97756076388889,
+        111.56864872685185, -232.33148871527777, 283.3610026041667, -186.20865885416666,
+        50.7841796875, -1.1470745597729725e-11, 1.8775316394364013e-07, -7.891503613229804e-05,
+        0.006597468567954679, -0.20118927055776015, 2.9222029320987652, -23.24848457708701,
+        109.43574322089947, -316.70893012152777, 567.4930555555555, -611.8284505208334,
+        362.744140625, -90.68603515625, -7.647163731819816e-13, 2.5045225938083082e-08,
+        -1.598327726799949e-05, 0.0018487619924045188, -0.07498005246746567,
+        1.4237209155460024, -14.74556337877229, 90.91360812573487, -350.53111479690256,
+        863.9490632233797, -1356.6630859375, 1309.909396701389, -707.35107421875,
+        163.23486328125, -4.779477332387385e-14, 3.131417958633567e-09,
+        -3.0234750403091175e-06, 0.0004801716850276291, -0.025626671262063385,
+        0.627620408914083, -8.319817679867006, 65.73195370867933, -327.86206375400155,
+        1065.7648367099662, -2282.6262828685617, 3187.009562174479, -2785.194854736328,
+        1380.6948852539062, -295.8631896972656, -2.8114572543455206e-15,
+        3.6844990755374353e-10, -5.368700378931033e-07, 0.00011636075093390529,
+        -0.008102164118286442, 0.2531695617639899, -4.238021926775227, 42.188908018022104,
+        -266.3720860467246, 1109.0705859382176, -3106.9867568243117, 5875.001434326172,
+        -7379.047108968099, 5888.257598876953, -2697.576141357422, 539.5152282714844
+    };
+
+    static constexpr double kTolerance = 1e-17;   ///< Relative size of the first omitted terms.
+    static constexpr double kMaxKappa = 0.04;
+    static constexpr double kMaxY = 6.0;
+
+    /** Fills b[0..6] (y^3 .. y^15) and returns the series limit Y (0 = unused). */
+    static double pair(double kappa, double* b) noexcept
+    {
+        if (!(kappa > 0.0 && kappa <= kMaxKappa)) return 0.0;
+        double tail[2] {};
+        int offset = 0;
+        for (int i = 0; i < 9; ++i)
+        {
+            const int degree = i + 1;
+            double v = 0.0;
+            for (int j = degree - 1; j >= 0; --j) v = v * kappa + kPairCoefficients[offset + j];
+            offset += degree;
+            if (i < 7) b[i] = v * kappa;
+            else tail[i - 7] = v * kappa;
+        }
+        return limit(tail, 17);
+    }
+
+    /** Fills d[0..13] (y^2 .. y^15) and returns the series limit Y (0 = unused). */
+    static double single(double kappa, double* d) noexcept
+    {
+        if (!(kappa > 0.0 && kappa <= kMaxKappa)) return 0.0;
+        double tail[2] {};
+        int offset = 0;
+        for (int i = 0; i < 16; ++i)
+        {
+            const int degree = i + 1;
+            double v = 0.0;
+            for (int j = degree - 1; j >= 0; --j) v = v * kappa + kSingleCoefficients[offset + j];
+            offset += degree;
+            if (i < 14) d[i] = v * kappa;
+            else tail[i - 14] = v * kappa;
+        }
+        return limit(tail, 16);
+    }
+
+private:
+    /** Largest |y| at which both omitted terms (powers p, p + step) stay
+     *  below kTolerance relative to y. */
+    static double limit(const double* tail, int firstPower) noexcept
+    {
+        const int step = firstPower == 17 ? 2 : 1;
+        double y = kMaxY;
+        for (int i = 0; i < 2; ++i)
+        {
+            const double t = std::abs(tail[i]);
+            if (t > 0.0)
+                y = std::min(y, std::pow(kTolerance / t, 1.0 / (firstPower + step * i - 1)));
+        }
+        return y;
+    }
+};
+
 } // namespace detail
 
 /**
@@ -608,10 +744,16 @@ private:
  * Halley steps, until one is below 1e-6 relative, for larger c (germanium,
  * very large resistances). Measured worst relative error over drives from
  * 1e-9 to 1e4 nVt: 1.1e-15 for c from 1e-15 to 1e5. The result does not
- * depend on the previous sample, so the cost is flat: about 33 ns per
- * sample for an RC clipper on the development machine, against 66-150 ns
- * for the former seeded, bracketed Newton iteration, whose 1e-10 V stop
- * also left relative errors up to 2c at low drive.
+ * depend on the previous sample. For incident waves below about 46-53 mV
+ * (default constants behind 0.7-2.2 k ohm; 23 mV at 0.35 M ohm, any c up
+ * to 0.02) the exact reversion series of
+ * detail::DiodeSeries replaces the estimate and its correction step: no
+ * transcendental function and no division, 2.2e-16 worst relative error
+ * against 50-digit roots. Cost for an RC clipper on the development machine
+ * (MSVC x64): 14.7 ns per sample at low drive (0.01-0.05 V peak) and about
+ * 29-31 ns above, against 29-31 ns everywhere with the estimate alone and
+ * 20.9-27.8 ns for the single-omega approximation that ignores the reverse
+ * diode (-56 to -82 dB error).
  */
 template <FloatType T, typename Tree>
 class DiodePairRoot
@@ -651,6 +793,17 @@ public:
             updateConstants(k, nvt);
 
         const double x = std::abs(a) * invNvt_;
+        if (x < seriesLimit_)
+        {
+            // Low drive: the exact reversion series (detail::DiodeSeries).
+            const double y = x * invBeta_, u = y * y, u2 = u * u, u4 = u2 * u2;
+            const double p = ((series_[0] + series_[1] * u) + u2 * (series_[2] + series_[3] * u))
+                           + u4 * ((series_[4] + series_[5] * u) + u2 * series_[6]);
+            const double s = y + (y * u) * p;
+            tree_.incident(static_cast<T>(std::copysign(s * (2.0 * nvt), a) - a));
+            v_ = std::copysign(s * nvt, a);
+            return;
+        }
         if (x < kClosedFormLimit) [[likely]]
         {
             const double s = solveNormalised(x);
@@ -682,6 +835,8 @@ private:
         bound_ = 1.0 / (1.0 + 2.0 * c_);
         cPlus_ = 1.0 + 2.0 * c_;
         mode_ = c_ <= 1e-4 ? Mode::Newton : (c_ <= 0.02 ? Mode::Halley : Mode::Iterate);
+        invBeta_ = bound_;
+        seriesLimit_ = cPlus_ * detail::DiodeSeries::pair(2.0 * c_ * bound_, series_);
     }
 
     /** Root s >= 0 of s + c (e^s - e^-s) = x for x >= 0. */
@@ -744,6 +899,8 @@ private:
     double kCached_ = -1.0, nvtCached_ = -1.0;
     enum class Mode { Newton, Halley, Iterate };
     double invNvt_ = 1.0, c_ = 1.0, logC_ = 0.0, bound_ = 1.0, cPlus_ = 3.0;
+    double invBeta_ = 1.0, seriesLimit_ = -1.0;   ///< Series path below |a| / nVt = seriesLimit_.
+    double series_[7] {};                         ///< y^3 .. y^15 coefficients.
     Mode mode_ = Mode::Iterate;
 };
 
@@ -758,6 +915,12 @@ private:
  * to full double precision: Newton while c <= 1e-4, Halley up to c = 10,
  * repeated Halley steps beyond. Measured worst relative error over drives
  * of +-1e-9 to 1e4 nVt: 9e-16 for c from 1e-15 to 10, 1.1e-14 up to 1e5.
+ * For incident waves below about 42-49 mV of either sign (default
+ * constants behind 0.7-2.2 k ohm; any c up to 0.04)
+ * the exact reversion series of detail::DiodeSeries is used instead (4e-16
+ * worst relative error against 50-digit roots): 11.9 against 26.6 ns per
+ * sample for an RC circuit at low drive on the development machine, where
+ * the closed form with a cubic omega estimate takes 18.4 ns.
  */
 template <FloatType T, typename Tree>
 class DiodeRoot
@@ -799,10 +962,23 @@ public:
             c_ = k * invNvt_;
             logC_ = std::log(c_);
             steps_ = c_ <= 1e-4 ? 0 : (c_ <= 10.0 ? 1 : 32);
+            invBeta_ = 1.0 / (1.0 + c_);
+            seriesLimit_ = (1.0 + c_) * detail::DiodeSeries::single(c_ * invBeta_, series_);
         }
 
         const double x = a * invNvt_;
-        if (std::abs(x) < 1e12) [[likely]]
+        if (std::abs(x) < seriesLimit_)
+        {
+            // Low drive: the exact reversion series (detail::DiodeSeries).
+            const double y = x * invBeta_, y2 = y * y, y4 = y2 * y2, y8 = y4 * y4;
+            const double* d = series_;
+            const double q = (((d[0] + d[1] * y) + y2 * (d[2] + d[3] * y))
+                              + y4 * ((d[4] + d[5] * y) + y2 * (d[6] + d[7] * y)))
+                           + y8 * (((d[8] + d[9] * y) + y2 * (d[10] + d[11] * y))
+                                   + y4 * (d[12] + d[13] * y));
+            v_ = (y + y2 * q) * nvt;
+        }
+        else if (std::abs(x) < 1e12) [[likely]]
         {
             double s = x + c_ - (*omega_)(logC_ + x + c_);
             for (int it = 0; it <= steps_; ++it)
@@ -848,6 +1024,8 @@ private:
     double v_ = 0.0;
     double kCached_ = -1.0, nvtCached_ = -1.0;
     double invNvt_ = 1.0, c_ = 1.0, logC_ = 0.0;
+    double invBeta_ = 1.0, seriesLimit_ = -1.0;   ///< Series path below |a| / nVt = seriesLimit_.
+    double series_[14] {};                        ///< y^2 .. y^15 coefficients.
     int steps_ = 1;   ///< 0: one Newton step, 1: one Halley step, else Halley until converged.
 };
 

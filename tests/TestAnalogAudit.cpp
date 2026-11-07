@@ -716,6 +716,107 @@ DSPARK_TEST(AnalogAudit_saturation_second_order_antialiasing)
                 0.5 * (1.0 + toneGain(make(Sat::Antialiasing::SecondOrder, 0.0, 1.0), 15000.0)), 1e-3);
 }
 
+// SecondOrder had no kernel for the Exciter (a clamped cubic) or the Tape
+// curve (anhysteretic magnetisation, whose second antiderivative is not
+// elementary), and only the MultiStage tube stage had one: at 2x and +24 dB
+// they aliased at -9.8, -7.7 and -6.8 dBc (worst over 1-19.25 kHz tones at
+// -6/-18 dBFS). The Exciter kernel is exact per piece, the Tape kernel uses
+// tabulated antiderivatives, and MultiStage antialiases every stage within
+// the common second-order delay; the latency stays one base sample.
+DSPARK_TEST(AnalogAudit_saturation_exciter_tape_multistage_second_order)
+{
+    using Sat = Saturation<double>;
+    const auto make = [](Sat::Algorithm algo, int factor, Sat::Antialiasing order) {
+        return [algo, factor, order] {
+            auto s = std::make_unique<Sat>();
+            s->setAlgorithm(algo);
+            s->setOversampling(factor);
+            s->setDrive(24.0);
+            s->setDcBlocking(false);
+            s->setAntialiasing(order);
+            s->prepare(spec(48000.0, 512, 1));
+            return s;
+        };
+    };
+    EXPECT_LT(worstToneSpurDbc(make(Sat::Algorithm::Exciter, 2, Sat::Antialiasing::SecondOrder)), -25.0);
+    EXPECT_LT(worstToneSpurDbc(make(Sat::Algorithm::Tape, 2, Sat::Antialiasing::SecondOrder)), -35.0);
+    EXPECT_LT(worstToneSpurDbc(make(Sat::Algorithm::MultiStage, 2, Sat::Antialiasing::SecondOrder)), -25.0);
+    EXPECT_LT(worstToneSpurDbc(make(Sat::Algorithm::MultiStage, 4, Sat::Antialiasing::SecondOrder)), -45.0);
+    for (int factor : { 1, 2, 4, 8 })
+        EXPECT_EQ(make(Sat::Algorithm::MultiStage, factor, Sat::Antialiasing::SecondOrder)()->getLatency(),
+                  make(Sat::Algorithm::MultiStage, factor, Sat::Antialiasing::Off)()->getLatency() + 1);
+
+    // The common delay keeps every algorithm aligned: at a low level, where
+    // the kernels are transparent at 200 Hz, the SecondOrder output is the
+    // Off output one base sample later (a slip of one processing sample
+    // would leave a -37 dB residual at 2x).
+    const auto quiet = [](Sat::Algorithm algo, int factor, Sat::Antialiasing order) {
+        auto s = std::make_unique<Sat>();
+        s->setAlgorithm(algo);
+        s->setOversampling(factor);
+        s->setDcBlocking(false);
+        s->setAntialiasing(order);
+        s->prepare(spec(48000.0, 512, 1));
+        return runSineDouble(*s, 48000.0, 512, 24000, 200.0, 0.01);
+    };
+    for (int factor : { 1, 2, 4, 8 })
+        for (auto algo : { Sat::Algorithm::MultiStage, Sat::Algorithm::Tape, Sat::Algorithm::Exciter,
+                           Sat::Algorithm::SoftClip })
+        {
+            const auto off = quiet(algo, factor, Sat::Antialiasing::Off);
+            const auto second = quiet(algo, factor, Sat::Antialiasing::SecondOrder);
+            double err = 0.0, ref = 0.0;
+            for (size_t i = 12000; i < off.size(); ++i)
+            {
+                err += (second[i] - off[i - 1]) * (second[i] - off[i - 1]);
+                ref += off[i] * off[i];
+            }
+            EXPECT_LT(10.0 * std::log10(err / ref), -55.0);
+        }
+}
+
+// The Exciter kernel is the exact average of its clamped cubic over the
+// linear B-spline of three inputs: against an 8192-cell quadrature of the same
+// curve on random knots (in and across the clamp and fold regions, with
+// character) it agrees to rounding.
+DSPARK_TEST(AnalogAudit_saturation_exciter_kernel_is_exact)
+{
+    detail::AdaaExciter curve;
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<double> centre(-4.0, 4.0), unit(-1.0, 1.0), logSpan(-6.0, 1.0);
+    double worst = 0.0;
+    for (int trial = 0; trial < 400; ++trial)
+    {
+        curve.setCharacter(0.5 * unit(rng));
+        const double c = centre(rng), span = std::pow(10.0, logSpan(rng));
+        double u[3] = { c + span * unit(rng), c + span * unit(rng), c + span * unit(rng) };
+        const double y = curve.average(u[0], u[1], u[2]);
+        std::sort(u, u + 3);
+        double ref = 0.0;
+        if (u[2] - u[0] < 1e-9)
+            ref = curve.f(u[1]);
+        else
+        {
+            const int n = 8192;
+            for (int side = 0; side < 2; ++side)
+            {
+                const double lo = side == 0 ? u[0] : u[1], hi = side == 0 ? u[1] : u[2];
+                if (!(hi > lo)) continue;
+                for (int k = 0; k < n; ++k)
+                {
+                    // Midpoint rule on n cells plus the exact weight.
+                    const double t = lo + (hi - lo) * (k + 0.5) / n;
+                    const double w = side == 0 ? 2.0 * (t - u[0]) / ((u[2] - u[0]) * (u[1] - u[0]))
+                                               : 2.0 * (u[2] - t) / ((u[2] - u[0]) * (u[2] - u[1]));
+                    ref += curve.f(t) * w * (hi - lo) / n;
+                }
+            }
+        }
+        worst = std::max(worst, std::abs(y - ref));
+    }
+    EXPECT_LT(worst, 1e-6);
+}
+
 // The diode-pair and single-diode roots stopped Newton at an absolute 1e-10 V
 // residual, so small signals came back with a large relative error: with a
 // 2.2 k ohm source and the default 1N4148 constants 2.4e-4 (pair) and 1.2e-4
@@ -757,6 +858,93 @@ DSPARK_TEST(AnalogAudit_wdf_diode_roots_are_exact_at_every_drive)
         }
     EXPECT_LT(worstPair, 1e-12);
     EXPECT_LT(worstSingle, 1e-12);
+}
+
+// Speed-up pin: at low drive the diode roots now evaluate an exact series
+// reversion of the node equation instead of the omega estimate and its
+// correction step (pair 30 -> 14.7 ns, single 26.6 -> 11.9 ns per sample in
+// an RC circuit). The output must stay the root to rounding: these are
+// 50-digit roots of s + 2c sinh(s) = x (pair) and s + c (e^s - 1) = x
+// (single), with nVt = 1 and R = 1 so that c = Is and x is the source.
+DSPARK_TEST(AnalogAudit_wdf_low_drive_series_roots_are_exact)
+{
+    using namespace dspark::wdf;
+    struct Point { int pair; double c, x, s; };
+    static constexpr Point kPoints[] = {
+        { 1, 3.93e-05, 1e-07, 9.999214061774745e-08 },
+        { 1, 3.93e-05, 0.001, 0.0009999214061643786 },
+        { 1, 3.93e-05, 0.05, 0.04999606867168401 },
+        { 1, 3.93e-05, 0.3, 0.2999760666713768 },
+        { 1, 3.93e-05, 0.4, 0.3999677176102836 },
+        { 1, 3.93e-05, 1.0, 0.9999076403877263 },
+        { 1, 0.000122, 1e-07, 9.997560595214768e-08 },
+        { 1, 0.000122, 0.001, 0.0009997560594808498 },
+        { 1, 0.000122, 0.05, 0.04998779789706584 },
+        { 1, 0.000122, 0.3, 0.2999257159952651 },
+        { 1, 0.000122, 0.4, 0.3998998028621683 },
+        { 1, 0.0195, 1e-07, 9.624639076034648e-08 },
+        { 1, 0.0195, 0.001, 0.0009624639020258159 },
+        { 1, 0.0195, 0.05, 0.048122498123646704 },
+        { 1, 0.0195, 0.3, 0.28858818452243246 },
+        { 1, 0.0195, 0.4, 0.3846269477553365 },
+        { 0, 3.93e-05, 1e-07, 9.999607015424645e-08 },
+        { 0, 3.93e-05, -1e-07, -9.99960701546394e-08 },
+        { 0, 3.93e-05, 0.001, 0.000999960681890196 },
+        { 0, 3.93e-05, -0.001, -0.0009999607211855662 },
+        { 0, 3.93e-05, 0.05, 0.04999798512915664 },
+        { 0, 3.93e-05, -0.05, -0.04999808338803226 },
+        { 0, 3.93e-05, 0.3, 0.2999862512782194 },
+        { 0, 3.93e-05, -0.3, -0.2999898144526179 },
+        { 0, 3.93e-05, 0.4, 0.3999806724225227 },
+        { 0, 3.93e-05, -0.4, -0.39998704391912093 },
+        { 0, 3.93e-05, 1.0, 0.9999324787370917 },
+        { 0, 3.93e-05, -1.0, -0.9999751580211994 },
+        { 0, 0.000122, 1e-07, 9.998780148760865e-08 },
+        { 0, 0.000122, -1e-07, -9.998780148882821e-08 },
+        { 0, 0.000122, 0.001, 0.0009998779538841838 },
+        { 0, 0.000122, -0.001, -0.000999878075839553 },
+        { 0, 0.000122, 0.05, 0.04999374572838169 },
+        { 0, 0.000122, -0.05, -0.049994050680209644 },
+        { 0, 0.000122, 0.3, 0.29995732425328614 },
+        { 0, 0.000122, -0.3, -0.29996838268053605 },
+        { 0, 0.000122, 0.4, 0.3999400083052055 },
+        { 0, 0.000122, -0.4, -0.3999597823346448 },
+        { 0, 0.0195, 1e-07, 9.808729760293682e-08 },
+        { 0, 0.0195, -1e-07, -9.808729778696017e-08 },
+        { 0, 0.0195, 0.001, 0.0009808637729458586 },
+        { 0, 0.0195, -0.001, -0.0009808821752815766 },
+        { 0, 0.0195, 0.05, 0.04902028767895538 },
+        { 0, 0.0195, -0.05, -0.04906630102355141 },
+        { 0, 0.0195, 0.3, 0.29335215900997086 },
+        { 0, 0.0195, -0.3, -0.2950181031300965 },
+        { 0, 0.0195, 0.4, 0.39067930317657545 },
+        { 0, 0.0195, -0.4, -0.3936544488463956 }
+
+    };
+    double worst = 0.0;
+    for (const auto& p : kPoints)
+    {
+        ResistiveVoltageSource<double> source { 1.0 };
+        double v = 0.0;
+        if (p.pair)
+        {
+            DiodePairRoot<double, decltype(source)> root { source, p.c, 1.0 };
+            root.prepare(48000.0);
+            source.setVoltage(p.x);
+            root.process();
+            v = root.getVoltage();
+        }
+        else
+        {
+            DiodeRoot<double, decltype(source)> root { source, p.c, 1.0 };
+            root.prepare(48000.0);
+            source.setVoltage(p.x);
+            root.process();
+            v = root.getVoltage();
+        }
+        worst = std::max(worst, std::abs(v - p.s) / std::abs(p.s));
+    }
+    EXPECT_LT(worst, 4.5e-16);
 }
 
 // The grid clamp is referenced to ground: it compresses from 0 V although the
@@ -842,4 +1030,46 @@ DSPARK_TEST(AnalogAudit_tube_grid_conduction_is_cathode_referenced)
     EXPECT_TRUE(restored.getGridModel() == TubePreamp<double>::GridModel::Clamp);
     EXPECT_TRUE(restored.setState(blob.data(), blob.size()));
     EXPECT_TRUE(restored.getGridModel() == TubePreamp<double>::GridModel::Conduction);
+}
+
+// GridModel::Conduction drove each grid straight from its source, so grid
+// current left no trace: after a loud passage the stage recovered at once.
+// The grids are now fed through a coupling capacitor and grid leak: grid
+// current charges the capacitor and biases the stage colder (blocking
+// distortion). After a 300 ms burst at +24 dB a quiet tone 2 ms later comes
+// out 15.6 dB below its settled level (0.4 dB without the coupling network)
+// and recovers with the 22 ms coupling time constant; the Clamp model has no
+// such memory.
+DSPARK_TEST(AnalogAudit_tube_conduction_models_blocking_distortion)
+{
+    const auto probe = [](TubePreamp<double>::GridModel model, int factor) {
+        TubePreamp<double> amp;
+        amp.setGridModel(model);
+        amp.setOversampling(factor);
+        amp.setDrive(24.0);
+        amp.prepare(spec(48000.0, 512, 1));
+        const size_t latency = static_cast<size_t>(amp.getLatency());
+        const size_t burst = 14400, total = 14400 + 19200 + latency;
+        std::vector<double> y(total);
+        for (size_t i = 0; i < total; ++i)
+            y[i] = (i < burst ? 0.5 : 0.01) * std::sin(kTwoPi * 1000.0 * static_cast<double>(i) / 48000.0);
+        for (size_t pos = 0; pos < total; pos += 512)
+        {
+            double* ch[] = { y.data() + pos };
+            amp.processBlock({ ch, 1, static_cast<int>(std::min<size_t>(512, total - pos)) });
+        }
+        // 1 kHz level over 10 ms windows starting 2 ms and 300 ms after the burst.
+        const auto level = [&](double ms) {
+            const size_t from = burst + static_cast<size_t>(ms * 48.0) + latency;
+            std::vector<double> window(y.begin() + static_cast<std::ptrdiff_t>(from),
+                                       y.begin() + static_cast<std::ptrdiff_t>(from + 480));
+            return toneAmplitude(window, 0, 480, 1000.0, 48000.0);
+        };
+        return toDb(level(2.0) / level(300.0));
+    };
+    for (int factor : { 2, 1 })
+    {
+        EXPECT_LT(probe(TubePreamp<double>::GridModel::Conduction, factor), -10.0);
+        EXPECT_GT(probe(TubePreamp<double>::GridModel::Clamp, factor), -3.0);
+    }
 }

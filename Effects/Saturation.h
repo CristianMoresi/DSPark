@@ -55,6 +55,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include "../Core/detail/Adaa.h"
 #include "../Core/detail/LogCosh.h"
 
@@ -63,6 +64,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <numbers>
 #include <type_traits>
 #include <vector>
 
@@ -95,44 +97,51 @@ public:
     /**
      * @brief Antiderivative antialiasing order on the memoryless curves:
      * 0 off, 1 first order (SoftClip/Tube/HardClip), 2 second order
-     * (SoftClip/Tube/HardClip/Wavefolder/Transformer, Bilbao et al. 2017).
-     * Order 2 delays every algorithm by exactly one sample: those without a
-     * second-order kernel are delayed to match, so a crossfade between any
-     * two stays aligned. Default 0.
+     * (SoftClip/Tube/HardClip/Wavefolder/Transformer/Exciter/Tape and every
+     * MultiStage stage from 2x, Bilbao et al. 2017). Order 2 delays every
+     * algorithm by the same number of processing samples (latchOrder()):
+     * the kernels delay by one and are padded to it, the others are delayed
+     * by all of it, so a crossfade between any two stays aligned. Default 0.
      */
     void setAntialias(int order) noexcept { antialias_.store(std::clamp(order, 0, 2), std::memory_order_relaxed); }
 
     /**
      * @brief Latches the order for the coming block (audio thread, before
-     * update()). Entering order 2 arms every channel: its first sample seeds
-     * the kernel history with the current input, so the one-sample delay is
-     * inserted as a held sample instead of a step from stale history. The
-     * off and first-order paths keep no second-order history at all.
+     * update()) and the common second-order delay in processing samples
+     * (1 to kMaxDelay; Saturation passes min(factor, 3)). Entering order 2
+     * arms every channel: its first sample seeds the kernel history and the
+     * delay line with the current input, so the delay is inserted as held
+     * samples instead of a step from stale history. The off and first-order
+     * paths keep no second-order history at all.
      */
-    void latchOrder() noexcept
+    void latchOrder(int commonDelay = 1) noexcept
     {
         const int o = antialias_.load(std::memory_order_relaxed);
-        if (o == 2 && order_ != 2) armMask_ = ~0u;
+        if (o == 2 && order_ != 2) { armMask_ = ~0u; delayArm_ = ~0u; }
         order_ = o;
+        delay_ = std::clamp(commonDelay, 1, kMaxDelay);
     }
 
     /** @brief The latched order (audio thread). */
     [[nodiscard]] int order() const noexcept { return order_; }
 
-    /** One-sample delay for algorithms without a second-order kernel. */
-    T align(T y, int ch) noexcept
-    {
-        T& slot = alignHold_[static_cast<size_t>(ch & (kAaCh - 1))];
-        if (takeArm(ch)) [[unlikely]] slot = y;
-        const T out = slot;
-        slot = y;
-        return out;
-    }
+    /** @brief The latched common second-order delay (processing samples). */
+    [[nodiscard]] int commonDelay() const noexcept { return delay_; }
+
+    /** Full common delay, for algorithms without a second-order kernel. */
+    T align(T y, int ch) noexcept { return delayBy(y, ch, delay_); }
+
+    /** The common delay less the one sample of a second-order kernel. */
+    T padKernel(T y, int ch) noexcept { return delay_ > 1 ? delayBy(y, ch, delay_ - 1) : y; }
+
+    static constexpr int kMaxDelay = 3;
 
 protected:
     std::atomic<int> antialias_ { 0 };
     int order_ = 0;            ///< Latched order (audio thread).
+    int delay_ = 1;            ///< Latched common second-order delay.
     unsigned armMask_ = ~0u;   ///< Channels whose order-2 history must be seeded.
+    unsigned delayArm_ = ~0u;  ///< Channels whose delay line must be seeded.
 
     /** True once per channel after entering order 2 (or a reset). */
     bool takeArm(int c) noexcept
@@ -143,8 +152,30 @@ protected:
         return true;
     }
 
-    void resetAlign() noexcept { alignHold_.fill(T(0)); armMask_ = ~0u; }
-    std::array<T, kAaCh> alignHold_ {};
+    /** Delays y by n (1 to kMaxDelay) samples on channel ch. */
+    T delayBy(T y, int ch, int n) noexcept
+    {
+        const auto c = static_cast<size_t>(ch & (kAaCh - 1));
+        auto& line = alignHold_[c];
+        const unsigned bit = 1u << c;
+        if (delayArm_ & bit) [[unlikely]]
+        {
+            delayArm_ &= ~bit;
+            line.fill(y);
+        }
+        const T out = line[static_cast<size_t>(n - 1)];
+        for (int k = kMaxDelay - 1; k > 0; --k) line[static_cast<size_t>(k)] = line[static_cast<size_t>(k - 1)];
+        line[0] = y;
+        return out;
+    }
+
+    void resetAlign() noexcept
+    {
+        for (auto& line : alignHold_) line.fill(T(0));
+        armMask_ = ~0u;
+        delayArm_ = ~0u;
+    }
+    std::array<std::array<T, kMaxDelay>, kAaCh> alignHold_ {};
 };
 
 // -- SoftClip (tanh) ---------------------------------------------------------
@@ -368,14 +399,184 @@ public:
 };
 
 // -- Exciter (polynomial waveshaper) -----------------------------------------
+
+/**
+ * Exact second-order kernel of the Exciter curve f(u) = clamp(p(u), -1, 1),
+ * p(u) = u + A u^2 - B u^3 on |u| <= 10 and constant beyond (the plain path
+ * clamps u to +-10 first). f is piecewise polynomial, so the average over the
+ * linear B-spline with knots at three inputs (Bilbao et al. 2017) has a
+ * closed form: the interval between the outer knots is split at the middle
+ * knot, at +-10 and where p crosses +-1 (bracketed Newton on the monotone
+ * pieces of p between its two critical points), and each piece contributes
+ * its exact moment against the linear weight, written about the piece centre
+ * so that no difference of large terms appears. When no crossing can lie
+ * between the knots (the extremes of p over the interval stay inside
+ * [-1, 1]) the average is the closed form of the cubic in the complete
+ * symmetric polynomials of the knots.
+ */
+struct AdaaExciter
+{
+    static constexpr double kB = 0.15, kLimit = 10.0;
+
+    double A = 0.0;                          ///< Quadratic coefficient (0.25 character).
+    double crit[2] = { 0.0, 0.0 };           ///< Critical points of p, ascending.
+    double critValue[2] = { 0.0, 0.0 };
+
+    void setCharacter(double a) noexcept
+    {
+        if (a == A && critValue[1] != 0.0) return;
+        A = a;
+        const double r = std::sqrt(A * A + 3.0 * kB);
+        crit[0] = (A - r) / (3.0 * kB);
+        crit[1] = (A + r) / (3.0 * kB);
+        critValue[0] = p(crit[0]);
+        critValue[1] = p(crit[1]);
+    }
+
+    [[nodiscard]] double p(double u) const noexcept { return u * (1.0 + u * (A - kB * u)); }
+    [[nodiscard]] double f(double u) const noexcept
+    {
+        return std::clamp(p(std::clamp(u, -kLimit, kLimit)), -1.0, 1.0);
+    }
+
+    /** Average of f over the linear B-spline with knots u0, u1, u2. */
+    [[nodiscard]] double average(double u0, double u1, double u2) const noexcept
+    {
+        double lo = u0, mid = u1, hi = u2;
+        if (lo > mid) std::swap(lo, mid);
+        if (mid > hi) std::swap(mid, hi);
+        if (lo > mid) std::swap(lo, mid);
+        const double span = hi - lo;
+        if (!(span > 1e-9)) return f((u0 + u1 + u2) * (1.0 / 3.0));
+        if (lo >= -kLimit && hi <= kLimit)
+        {
+            double top = std::max(p(lo), p(hi)), bottom = std::min(p(lo), p(hi));
+            for (int k = 0; k < 2; ++k)
+                if (crit[k] > lo && crit[k] < hi)
+                {
+                    top = std::max(top, critValue[k]);
+                    bottom = std::min(bottom, critValue[k]);
+                }
+            if (top <= 1.0 && bottom >= -1.0)
+            {
+                // E[u^k] = 2 h_k / ((k + 1)(k + 2)) for the complete symmetric h_k.
+                const double h1 = u0 + u1 + u2;
+                const double h2 = u0 * u0 + u1 * u1 + u2 * u2 + u0 * u1 + u1 * u2 + u0 * u2;
+                const double h3 = u0 * u0 * u0 + u1 * u1 * u1 + u2 * u2 * u2
+                                + u0 * u0 * (u1 + u2) + u1 * u1 * (u0 + u2) + u2 * u2 * (u0 + u1)
+                                + u0 * u1 * u2;
+                return h1 * (1.0 / 3.0) + A * h2 * (1.0 / 6.0) - kB * h3 * (1.0 / 10.0);
+            }
+            if (bottom >= 1.0) return 1.0;
+            if (top <= -1.0) return -1.0;
+        }
+
+        // General case: break points inside (lo, hi), at most 1 + 2 + 6.
+        double cuts[12];
+        int n = 0;
+        cuts[n++] = lo;
+        cuts[n++] = mid;
+        for (const double edge : { -kLimit, kLimit })
+            if (edge > lo && edge < hi) cuts[n++] = edge;
+        const double a = std::max(lo, -kLimit), b = std::min(hi, kLimit);
+        if (a < b)
+        {
+            double piece[4] = { a, 0.0, 0.0, 0.0 };
+            int pieces = 1;
+            for (int k = 0; k < 2; ++k)
+                if (crit[k] > a && crit[k] < b) piece[pieces++] = crit[k];
+            piece[pieces] = b;
+            for (int k = 0; k < pieces; ++k)
+                for (const double level : { -1.0, 1.0 })
+                {
+                    double s = piece[k], e = piece[k + 1];
+                    double fs = p(s) - level, fe = p(e) - level;
+                    if (!(fs * fe < 0.0)) continue;
+                    double t = s + (e - s) * fs / (fs - fe);
+                    for (int it = 0; it < 60; ++it)
+                    {
+                        const double ft = p(t) - level;
+                        if (ft == 0.0) break;
+                        if ((ft < 0.0) == (fs < 0.0)) { s = t; fs = ft; } else { e = t; fe = ft; }
+                        const double slope = 1.0 + t * (2.0 * A - 3.0 * kB * t);
+                        double next = t - ft / slope;
+                        if (!(next > s && next < e)) next = 0.5 * (s + e);
+                        if (std::abs(next - t) <= 1e-15 * (1.0 + std::abs(t))) { t = next; break; }
+                        t = next;
+                    }
+                    if (t > lo && t < hi) cuts[n++] = t;
+                }
+        }
+        cuts[n++] = hi;
+        for (int k = 1; k < n; ++k)   // insertion sort: at most 11 points
+            for (int j = k; j > 0 && cuts[j - 1] > cuts[j]; --j) std::swap(cuts[j - 1], cuts[j]);
+
+        // Linear weight: rising on [lo, mid], falling on [mid, hi]; a side
+        // narrower than 1e-12 of the span carries no measurable mass.
+        const bool rising = mid - lo > 1e-12 * span, falling = hi - mid > 1e-12 * span;
+        const double riseSlope = rising ? 2.0 / (span * (mid - lo)) : 0.0;
+        const double fallSlope = falling ? -2.0 / (span * (hi - mid)) : 0.0;
+        double sum = 0.0;
+        for (int k = 0; k + 1 < n; ++k)
+        {
+            const double s = cuts[k], e = cuts[k + 1];
+            if (!(e > s)) continue;
+            const double c = 0.5 * (s + e), hh = 0.5 * (e - s);
+            const bool up = c < mid;
+            if ((up && !rising) || (!up && !falling)) continue;
+            const double w0 = up ? riseSlope * (c - lo) : -fallSlope * (hi - c);
+            const double w1 = up ? riseSlope : fallSlope;
+            double g0, g1 = 0.0, g2 = 0.0, g3 = 0.0;
+            if (std::abs(c) > kLimit) g0 = f(c);
+            else
+            {
+                g0 = p(c);
+                if (g0 > 1.0 || g0 < -1.0) g0 = g0 > 1.0 ? 1.0 : -1.0;
+                else
+                {
+                    g1 = 1.0 + c * (2.0 * A - 3.0 * kB * c);
+                    g2 = A - 3.0 * kB * c;
+                    g3 = -kB;
+                }
+            }
+            const double h3 = hh * hh * hh;
+            sum += 2.0 * hh * g0 * w0 + (2.0 / 3.0) * h3 * (g2 * w0 + g1 * w1)
+                 + 0.4 * h3 * hh * hh * g3 * w1;
+        }
+        return sum;
+    }
+};
+
 template <typename T>
 class ExciterAlgorithm final : public SaturationAlgorithm<T>
 {
+    std::array<double, SaturationAlgorithm<T>::kAaCh> u1_ {}, u2_ {};
+    AdaaExciter curve_;
+
 public:
     void prepare(const AudioSpec&) noexcept override { reset(); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Exciter; }
 
-    void reset() noexcept override { this->resetAlign(); }
+    void reset() noexcept override
+    {
+        u1_.fill(0.0);
+        u2_.fill(0.0);
+        this->resetAlign();
+    }
+
+    /** Second-order sample: the exact kernel of AdaaExciter on u = in * drive
+     *  (one sample of delay; the curve has no resting offset). */
+    inline T processSecond(T sample, T drive, T character, int ch) noexcept
+    {
+        const double u = static_cast<double>(sample) * static_cast<double>(drive);
+        const auto c = static_cast<size_t>(ch & (SaturationAlgorithm<T>::kAaCh - 1));
+        if (this->takeArm(static_cast<int>(c))) [[unlikely]] u1_[c] = u2_[c] = u;
+        curve_.setCharacter(0.25 * static_cast<double>(character));
+        const double y = curve_.average(u, u1_[c], u2_[c]);
+        u2_[c] = u1_[c];
+        u1_[c] = u;
+        return static_cast<T>(y);
+    }
 
     inline T processSample(T sample, T drive, T character, int) noexcept
     {
@@ -504,6 +705,306 @@ public:
     }
 };
 
+// -- Tape second-order kernel -------------------------------------------------
+
+/**
+ * Antiderivatives of the anhysteretic tape curve, for its second-order
+ * kernel. With x the solution of H = a x - rho L(x) (a = 1/(3(1 - alpha)),
+ * rho = alpha/(1 - alpha); see TapeAlgorithm) the curve output is L(x), and
+ * with G = ln(sinh x / x) (dG/dx = L), P = int_0^x G and Q = int_0^x L^2,
+ *
+ *   F1(H) = a G - rho L^2 / 2,
+ *   F2(H) = a^2 P - a rho G L + (a rho / 2) Q + rho^2 L^3 / 6,
+ *
+ * found by integrating in x (dH = (a - rho dL/dx) dx) and by parts. F2 is not
+ * elementary: P(x) = x (1 + G) - x^2/2 - pi^2/12 + A(x) and
+ * Q(x) = x - L - 2 R(x), R(x) = int_0^x L(t)/t dt = (x - G) - ln 2 + 1/x
+ * + C + B(x), where A = Li2(e)/2 - x ln(1 - e) and B = ln(1 - e)
+ * - 2 sum_k E1(2 k x) (e = exp(-2x)) are smooth and exponentially small. A and
+ * B are tabulated once per process as degree-11 Chebyshev pieces, eight per
+ * octave on [0.5, 32), from their series (dilogarithm, exponential integral
+ * by its continued fraction) and are zero beyond 32 (below 1e-26); below 0.5
+ * P, Q, L, its slope and G come from their Taylor series. P and Q stay
+ * within 5e-15 (relative, floor 1) of a compensated Gauss quadrature of their
+ * integrands.
+ */
+class AdaaTapeTable
+{
+public:
+    /** Shared instance, built on first use (setup thread: TapeAlgorithm::prepare()). */
+    static const AdaaTapeTable& instance()
+    {
+        static const AdaaTapeTable table;
+        return table;
+    }
+
+    /** L and its slope for x >= 0. */
+    static void langevin(double x, double& L, double& Lp) noexcept
+    {
+        if (x < kStart)
+        {
+            const double u = x * x;
+            double l = kL[12], lp = kLp[12];
+            for (int n = 11; n >= 0; --n) { l = l * u + kL[n]; lp = lp * u + kLp[n]; }
+            L = x * l;
+            Lp = lp;
+            return;
+        }
+        const double e = std::exp(-2.0 * x), om = 1.0 - e;
+        L = (1.0 + e) / om - 1.0 / x;
+        Lp = 1.0 / (x * x) - 4.0 * e / (om * om);
+    }
+
+    /** G = ln(sinh x / x), P and Q for x >= 0, given L(x). */
+    void antiderivatives(double x, double L, double& G, double& P, double& Q) const noexcept
+    {
+        if (x < kStart)
+        {
+            const double u = x * x, x3 = u * x;
+            double g = kG[12], pp = kP[12], q = kQ[12];
+            for (int n = 11; n >= 0; --n) { g = g * u + kG[n]; pp = pp * u + kP[n]; q = q * u + kQ[n]; }
+            G = u * g;
+            P = x3 * pp;
+            Q = x3 * q;
+            return;
+        }
+        G = x + std::log((1.0 - std::exp(-2.0 * x)) / (2.0 * x));
+        double a = 0.0, b = 0.0;
+        if (x < kEnd)
+        {
+            // Eight cells per octave: exponent and top three mantissa bits.
+            const auto k = static_cast<size_t>((std::bit_cast<std::uint64_t>(x) >> 49) - kFirstCell);
+            const double t = (x - mid_[k]) * invHalf_[k];
+            a = clenshaw(a_[k], t);
+            b = clenshaw(b_[k], t);
+        }
+        P = x * (1.0 + G) - 0.5 * x * x - kPiSquaredOver12 + a;
+        Q = x - L - 2.0 * ((x - G) - kLn2 + 1.0 / x + cR_ + b);
+    }
+
+private:
+    static constexpr int kDeg = 11, kCells = 48;
+    static constexpr double kStart = 0.5, kEnd = 32.0;
+    static constexpr std::uint64_t kFirstCell = 0x1FF0u;   // bits(0.5) >> 49
+    static constexpr double kPiSquaredOver12 = 0.82246703342411321824;
+    static constexpr double kLn2 = 0.69314718055994530942;
+    // Taylor coefficients in u = x^2 (from the Bernoulli numbers): L = x sum
+    // kL u^n, its slope sum kLp u^n, G = u sum kG u^n, P = x^3 sum kP u^n,
+    // Q = x^3 sum kQ u^n. Thirteen terms reach rounding below x = 0.5.
+    static constexpr double kL[13] = { 0.3333333333333333, -0.022222222222222223, 0.0021164021164021165,
+        -0.00021164021164021165, 2.1377799155576935e-05, -2.1644042808063972e-06, 2.1925947851873778e-07,
+        -2.2214608789979678e-08, 2.2507846516808994e-09, -2.2805151204592183e-10, 2.3106432599002624e-11,
+        -2.3411706819824882e-12, 2.3721017400233653e-13 };
+    static constexpr double kLp[13] = { 0.3333333333333333, -0.06666666666666667, 0.010582010582010581,
+        -0.0014814814814814814, 0.0001924001924001924, -2.380844708887037e-05, 2.8503732207435913e-06,
+        -3.332191318496952e-07, 3.8263339078575285e-08, -4.332978728872515e-09, 4.852350845790551e-10,
+        -5.3846925685597234e-11, 5.930254350058414e-12 };
+    static constexpr double kG[13] = { 0.16666666666666666, -0.005555555555555556, 0.0003527336860670194,
+        -2.6455026455026456e-05, 2.1377799155576935e-06, -1.803670234005331e-07, 1.5661391322766983e-08,
+        -1.3884130493737299e-09, 1.2504359176004997e-10, -1.1402575602296091e-11, 1.0502923908637557e-12,
+        -9.754877841593701e-14, 9.123468230859098e-15 };
+    static constexpr double kP[13] = { 0.05555555555555555, -0.0011111111111111111, 5.039052658100277e-05,
+        -2.9394473838918285e-06, 1.9434362868706303e-07, -1.3874386415425623e-08, 1.0440927548511323e-09,
+        -8.167135584551352e-11, 6.581241671581577e-12, -5.429797905855281e-13, 4.5664886559293725e-14,
+        -3.9019511366374804e-15, 3.379062307725592e-16 };
+    static constexpr double kQ[13] = { 0.037037037037037035, -0.002962962962962963, 0.00027210884353741496,
+        -2.6128421190149586e-05, 2.5579323318621057e-06, -2.5299170598315896e-07, 2.5176556628643635e-08,
+        -2.5155828459962992e-09, 2.520569343665452e-10, -2.5307045227479064e-11, 2.5447507412853134e-12,
+        -2.5618698792252346e-13, 2.5814742395034203e-14 };
+
+    using Row = std::array<double, kDeg + 1>;
+
+    static double clenshaw(const Row& c, double t) noexcept
+    {
+        double b1 = 0.0, b2 = 0.0;
+        const double t2 = 2.0 * t;
+        for (int n = kDeg; n >= 1; --n)
+        {
+            const double b0 = c[static_cast<size_t>(n)] + t2 * b1 - b2;
+            b2 = b1;
+            b1 = b0;
+        }
+        return c[0] + t * b1 - b2;
+    }
+
+    /** E1(z) for z >= 1: modified Lentz evaluation of its continued fraction. */
+    static double e1(double z) noexcept
+    {
+        double b = z + 1.0, c = 1e300, d = 1.0 / b, h = d;
+        for (int i = 1; i < 300; ++i)
+        {
+            const double an = -static_cast<double>(i) * i;
+            b += 2.0;
+            d = 1.0 / (an * d + b);
+            c = b + an / c;
+            const double del = c * d;
+            h *= del;
+            if (std::abs(del - 1.0) < 4e-16) break;
+        }
+        return h * std::exp(-z);
+    }
+
+    /** T(x) = int_x^inf 2 / (t (e^2t - 1)) dt = 2 sum_k E1(2 k x), x >= 0.5. */
+    static double tail(double x) noexcept
+    {
+        double t = 0.0;
+        for (int k = 1; k < 400; ++k)
+        {
+            const double v = e1(2.0 * k * x);
+            t += v;
+            if (v < 1e-25) break;
+        }
+        return 2.0 * t;
+    }
+
+    AdaaTapeTable()
+    {
+        for (int k = 0; k < kCells; ++k)
+        {
+            const double lo = std::ldexp(1.0 + (k % 8) / 8.0, k / 8 - 1);
+            const double hi = lo + std::ldexp(1.0 / 8.0, k / 8 - 1);
+            mid_[static_cast<size_t>(k)] = 0.5 * (lo + hi);
+            invHalf_[static_cast<size_t>(k)] = 2.0 / (hi - lo);
+            double av[kDeg + 1], bv[kDeg + 1];
+            for (int j = 0; j <= kDeg; ++j)
+            {
+                const double x = 0.5 * (lo + hi)
+                               + 0.5 * (hi - lo) * std::cos(std::numbers::pi * (j + 0.5) / (kDeg + 1));
+                const double e = std::exp(-2.0 * x);
+                double li = 0.0, ek = e;
+                for (int m = 1; m < 400 && ek > 1e-26; ++m, ek *= e)
+                    li += ek / (static_cast<double>(m) * m);
+                av[j] = 0.5 * li - x * std::log1p(-e);
+                bv[j] = std::log1p(-e) - tail(x);
+            }
+            for (int n = 0; n <= kDeg; ++n)
+            {
+                double sa = 0.0, sb = 0.0;
+                for (int j = 0; j <= kDeg; ++j)
+                {
+                    const double w = std::cos(std::numbers::pi * n * (j + 0.5) / (kDeg + 1));
+                    sa += av[j] * w;
+                    sb += bv[j] * w;
+                }
+                a_[static_cast<size_t>(k)][static_cast<size_t>(n)] = (n == 0 ? 1.0 : 2.0) * sa / (kDeg + 1);
+                b_[static_cast<size_t>(k)][static_cast<size_t>(n)] = (n == 0 ? 1.0 : 2.0) * sb / (kDeg + 1);
+            }
+        }
+        // C = R(0.5) - ln 0.5 - 2 + T(0.5), R(0.5) = sum kL[n] 0.5^(2n+1) / (2n+1).
+        double r = 0.0;
+        for (int n = 12; n >= 0; --n) r = r * 0.25 + kL[n] / (2 * n + 1);
+        cR_ = 0.5 * r + kLn2 - 2.0 + tail(0.5);
+    }
+
+    std::array<Row, kCells> a_ {}, b_ {};
+    std::array<double, kCells> mid_ {}, invHalf_ {};
+    double cR_ = 0.0;
+};
+
+/**
+ * Second-order kernel of the tape curve (one stream): the curve's average
+ * over the linear B-spline with knots at the last three inputs, from F2
+ * differences. Close inputs use the Euler-Maclaurin form of the divided
+ * difference, (F1(a) + F1(b))/2 - (a - b)(f(a) - f(b))/12, and the confluent
+ * and coincident forms of Core/detail/Adaa.h written with the same
+ * per-sample data, so no solve is needed between samples. Within 1e-7 of a
+ * brute-force Gauss quadrature of the curve over the same B-spline, for
+ * random knots from 1e-7 to 50 apart. A change of the curve (character)
+ * re-evaluates the two held inputs on the new curve.
+ */
+struct AdaaTape
+{
+    struct Point { double H = 0.0, x = 0.0, f = 0.0, fp = 0.0, F1 = 0.0, F2 = 0.0; };
+
+    const AdaaTapeTable* table = nullptr;
+    double alpha = -1.0, a = 1.0, rho = 0.0;   ///< Curve of the points held.
+    double h1 = 0.0, h2 = 0.0;                 ///< Inputs one and two samples ago.
+    Point p1, p2;
+
+    /** Holds u as the whole history (arming). */
+    void reset(double u, double alphaIn) noexcept
+    {
+        h1 = h2 = u;
+        setCurve(alphaIn);
+        p1 = point(u, 3.0 * u);
+        p2 = p1;
+    }
+
+    /** The antialiased output for input H, centred one sample back. */
+    double process(double H, double alphaIn) noexcept
+    {
+        if (alphaIn != alpha)
+        {
+            setCurve(alphaIn);
+            p1 = point(h1, p1.x);
+            p2 = point(h2, p2.x);
+        }
+        const Point p0 = point(H, p1.x);
+        const double y = average(p0, p1, p2);
+        p2 = p1;
+        p1 = p0;
+        h2 = h1;
+        h1 = H;
+        return y;
+    }
+
+    void setCurve(double alphaIn) noexcept
+    {
+        alpha = alphaIn;
+        a = 1.0 / (3.0 * (1.0 - alpha));
+        rho = alpha / (1.0 - alpha);
+    }
+
+    /** Solves H = a x - rho L(x) by Newton from the seed (slope in [1/3, a]). */
+    [[nodiscard]] Point point(double H, double seed) const noexcept
+    {
+        const double s = H < 0.0 ? -1.0 : 1.0, h = std::abs(H);
+        double x = std::max(0.0, s * seed), L = 0.0, Lp = 0.0;
+        for (int it = 0; it < 40; ++it)
+        {
+            AdaaTapeTable::langevin(x, L, Lp);
+            const double step = (a * x - rho * L - h) / (a - rho * Lp);
+            x = std::max(0.0, x - step);
+            if (!(std::abs(step) > 1e-15 * (1.0 + x))) break;
+        }
+        AdaaTapeTable::langevin(x, L, Lp);
+        double G = 0.0, P = 0.0, Q = 0.0;
+        table->antiderivatives(x, L, G, P, Q);
+        Point p;
+        p.H = H;
+        p.x = s * x;
+        p.f = s * L;
+        p.fp = Lp / (a - rho * Lp);
+        p.F1 = a * G - 0.5 * rho * L * L;
+        p.F2 = s * (a * a * P - a * rho * G * L + 0.5 * a * rho * Q + rho * rho * L * L * L * (1.0 / 6.0));
+        return p;
+    }
+
+    [[nodiscard]] static double div(const Point& p, const Point& q) noexcept
+    {
+        const double d = p.H - q.H;
+        if (std::abs(d) > 3e-3) return (p.F2 - q.F2) / d;
+        return 0.5 * (p.F1 + q.F1) - d * (p.f - q.f) * (1.0 / 12.0);
+    }
+
+    [[nodiscard]] static double average(const Point& p0, const Point& p1, const Point& p2) noexcept
+    {
+        const double d02 = p0.H - p2.H;
+        if (std::abs(d02) > 1e-3) return 2.0 * (div(p0, p1) - div(p1, p2)) / d02;
+        // p0 and p2 merge into their mean b: F1, F2 and f at b from both sides.
+        const double dd = 0.125 * d02 * d02;
+        Point b;
+        b.H = 0.5 * (p0.H + p2.H);
+        b.fp = 0.5 * (p0.fp + p2.fp);
+        b.f = 0.5 * (p0.f + p2.f);
+        b.F1 = 0.5 * (p0.F1 + p2.F1) - dd * b.fp;
+        b.F2 = 0.5 * (p0.F2 + p2.F2) - dd * b.f;
+        const double e = b.H - p1.H;
+        if (std::abs(e) > 1e-4) return 2.0 * (b.F1 - div(b, p1)) / e;
+        return p1.f + p1.fp * ((p0.H + p1.H + p2.H) * (1.0 / 3.0) - p1.H);
+    }
+};
+
 // -- Tape (anhysteretic Langevin magnetisation + head bump + HF rolloff) -----
 template <typename T>
 class TapeAlgorithm final : public SaturationAlgorithm<T>
@@ -512,6 +1013,7 @@ class TapeAlgorithm final : public SaturationAlgorithm<T>
     std::array<Biquad<T, 1>, kMaxCh> preFilters_;
     std::array<Biquad<T, 1>, kMaxCh> postFilters_;
     std::array<T, kMaxCh>            M_ {};   ///< Per-channel NR warm start.
+    std::array<AdaaTape, kMaxCh>     kernel_ {};   ///< Second-order kernels (setup in prepare()).
     int numChannels_ = 0;
     T lastDrive_ = T(-1);
     double lastSampleRate_ = 0.0;
@@ -549,6 +1051,7 @@ public:
     void prepare(const AudioSpec& spec) noexcept override
     {
         numChannels_ = std::min(spec.numChannels, kMaxCh); // clamp per-channel state
+        for (auto& k : kernel_) k.table = &AdaaTapeTable::instance();
         // Invalidate the filter-design cache: a re-prepare can widen the
         // channel count at an unchanged rate/drive, and the new channels'
         // filters must still receive coefficients on the next update().
@@ -625,6 +1128,21 @@ public:
 
         return postFilters_[ch].processSample((T(1) - alpha) * M, 0);
     }
+
+    /** Second-order sample: the AdaaTape kernel on the magnetisation curve
+     *  between the same head-bump and roll-off filters (one sample of delay).
+     *  The plain path's warm start follows, so switching back is seamless. */
+    inline T processSecond(T sample, T drive, T character, int ch) noexcept
+    {
+        const T filtered = preFilters_[ch].processSample(sample, 0);
+        const double H = static_cast<double>(filtered) * static_cast<double>(drive);
+        const T alpha = T(0.35) + T(0.15) * character;
+        auto& k = kernel_[static_cast<size_t>(ch)];
+        if (this->takeArm(ch)) [[unlikely]] k.reset(H, static_cast<double>(alpha));
+        const double y = k.process(H, static_cast<double>(alpha));
+        M_[ch] = static_cast<T>(k.p1.f / (1.0 - k.alpha));   // M = Ms L, Ms = 1 / (1 - alpha)
+        return postFilters_[ch].processSample(static_cast<T>(y), 0);
+    }
 };
 
 // -- Transformer (frequency-dependent: heavy LF, light HF) ------------------
@@ -635,6 +1153,7 @@ class TransformerAlgorithm final : public SaturationAlgorithm<T>
     std::array<Biquad<T, 1>, kMaxCh> lpFilters_;
     std::array<detail::Adaa2, kMaxCh> adaaLow_ {}, adaaHigh_ {};
     std::array<double, kMaxCh> prevRestLow_ {}, prevRestHigh_ {};
+    std::array<double, kMaxCh> firstLow_ {}, firstHigh_ {};   ///< First-order history (MultiStage).
     int numChannels_ = 0;
     double lastSampleRate_ = 0.0;
 
@@ -652,6 +1171,8 @@ public:
         for (auto& a : adaaHigh_) a.reset();
         prevRestLow_.fill(0.0);
         prevRestHigh_.fill(0.0);
+        firstLow_.fill(0.0);
+        firstHigh_.fill(0.0);
         this->resetAlign();
     }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Transformer; }
@@ -703,6 +1224,36 @@ public:
         const double yHi = adaaHigh_[c].template process<detail::AdaaTanh>(uHi) - std::tanh(prevRestHigh_[c]);
         prevRestLow_[c] = static_cast<double>(bias * kLo);
         prevRestHigh_[c] = static_cast<double>(bias * kHi);
+        return static_cast<T>(yLo / 1.4 + yHi / 0.85);
+    }
+
+    /** First-order sample (first-order antiderivative of each band's tanh,
+     *  half a sample of delay), for the MultiStage cascade at 2x: with the
+     *  tube stage at first order and the tape kernel it keeps the cascade at
+     *  two processing samples. The history is seeded when order 2 is armed. */
+    inline T processFirst(T sample, T drive, T character, int ch) noexcept
+    {
+        const T low  = lpFilters_[ch].processSample(sample, 0);
+        const T high = sample - low;
+        const T bias = character * T(0.2);
+        const T kLo  = drive * T(1.4);
+        const T kHi  = drive * T(0.85);
+        const auto c = static_cast<size_t>(ch & (kMaxCh - 1));
+        const double uLo = static_cast<double>((low + bias) * kLo);
+        const double uHi = static_cast<double>((high + bias) * kHi);
+        if (this->takeArm(static_cast<int>(c))) [[unlikely]]
+        {
+            firstLow_[c] = uLo;
+            firstHigh_[c] = uHi;
+        }
+        const auto mean = [](double u, double u0) noexcept {
+            const double d = u - u0;
+            return std::abs(d) > 1e-7 ? (logCosh(u) - logCosh(u0)) / d : std::tanh(0.5 * (u + u0));
+        };
+        const double yLo = mean(uLo, firstLow_[c]) - std::tanh(static_cast<double>(bias * kLo));
+        const double yHi = mean(uHi, firstHigh_[c]) - std::tanh(static_cast<double>(bias * kHi));
+        firstLow_[c] = uLo;
+        firstHigh_[c] = uHi;
         return static_cast<T>(yLo / 1.4 + yHi / 0.85);
     }
 
@@ -785,14 +1336,22 @@ public:
     void reset() noexcept override { tube_.reset(); tape_.reset(); xfmr_.reset(); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::MultiStage; }
 
+    /// processSecond() delays by exactly the common delay (no padding).
+    static constexpr bool kSelfAligned = true;
+
     void update(T drive, T character, const AudioSpec& spec) noexcept override
     {
         // The stages are private instances (not the pool's), so the owner's
-        // setAntialiasing() never reaches them directly: forward the order to
-        // the tube stage only. Its one-sample second-order delay is then the
-        // cascade's delay, the same as every other algorithm's.
-        tube_.setAntialias(this->order_);
+        // setAntialiasing() never reaches them directly: forward the orders
+        // that processSecond() needs for the common delay (see there).
+        const bool second = this->order_ == 2;
+        const int delay = this->delay_;
+        tube_.setAntialias(second ? (delay == 2 ? 1 : 2) : this->order_);
         tube_.latchOrder();
+        tape_.setAntialias(second && delay >= 2 ? 2 : 0);
+        tape_.latchOrder();
+        xfmr_.setAntialias(second && delay >= 2 ? 2 : 0);
+        xfmr_.latchOrder();
         tape_.update(drive * T(0.6), character, spec);
         xfmr_.update(drive * T(0.8), character, spec);
     }
@@ -810,13 +1369,37 @@ public:
         return       xfmr_.processSample(tapeOut, drive * T(0.8), character, ch) * (T(1) / T(0.8));
     }
 
-    /** Second order: the tube stage runs its kernel (one sample of delay for
-     *  the whole cascade); tape and transformer stages stay as they are. */
+    /**
+     * Second order. Each stage regenerates the harmonics the previous one's
+     * kernel removed, and the transformer's low band amplifies whatever
+     * aliasing reaches it (a stage's fold-back lands near DC), so every stage
+     * needs a kernel; the cascade's delay must equal the common delay:
+     * - 1 (1x): the tube kernel only (one sample);
+     * - 2 (2x): first-order tube, tape kernel, first-order transformer
+     *   (0.5 + 1 + 0.5 samples);
+     * - 3 (4x and above): second-order kernels on all three stages.
+     * Worst alias over 1-19.25 kHz tones at -6/-18 dBFS, +12/+24 dB:
+     * -37.1/-28.0 dBc at 2x and -70.6/-49.7 dBc at 4x, against
+     * -16.0/-6.8 and -32.4/-6.0 with the tube kernel alone.
+     */
     inline T processSecond(T sample, T drive, T character, int ch) noexcept
     {
+        const int delay = this->delay_;
+        if (delay == 1)
+        {
+            T tubeOut  = tube_.processSecond(sample, drive * T(0.5), character, ch) * T(2);
+            T tapeOut  = tape_.processSample(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
+            return       xfmr_.processSample(tapeOut, drive * T(0.8), character, ch) * (T(1) / T(0.8));
+        }
+        if (delay == 2)
+        {
+            T tubeOut  = tube_.processSample(sample, drive * T(0.5), character, ch) * T(2);
+            T tapeOut  = tape_.processSecond(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
+            return       xfmr_.processFirst(tapeOut, drive * T(0.8), character, ch) * (T(1) / T(0.8));
+        }
         T tubeOut  = tube_.processSecond(sample, drive * T(0.5), character, ch) * T(2);
-        T tapeOut  = tape_.processSample(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
-        return       xfmr_.processSample(tapeOut, drive * T(0.8), character, ch) * (T(1) / T(0.8));
+        T tapeOut  = tape_.processSecond(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
+        return       xfmr_.processSecond(tapeOut, drive * T(0.8), character, ch) * (T(1) / T(0.8));
     }
 };
 
@@ -880,17 +1463,24 @@ public:
      * - Off: plain curves (the Wavefolder keeps its built-in first-order form).
      * - FirstOrder: SoftClip/Tube/HardClip, half a processing sample of
      *   uncompensated delay, -2.0 dB at 20 kHz at the default 2x.
-     * - SecondOrder (Bilbao, Esqueda, Parker and Valimaki 2017):
-     *   SoftClip/Tube/HardClip/Wavefolder/Transformer and the MultiStage tube
-     *   stage. Every algorithm then delays by one processing sample and the
-     *   wet path is padded to one base sample, which getLatency() reports and
-     *   the dry path matches. -1.3 dB at 10 kHz and -5.9 dB at 20 kHz at 2x
-     *   (-1.3 dB at 20 kHz at 4x). Worst alias over 1-19.25 kHz tones at
-     *   -6/-18 dBFS, 2x: SoftClip at +24 dB drive -42.1 dBc against -29.7 for
-     *   FirstOrder and -15.2 off; Transformer -43.2 against -15.7. Meant for
-     *   oversampled use: at 1x the kernel's -12 dB at 20 kHz lowers high
-     *   fundamentals more than it removes alias (SoftClip +24 dB: -2.1 dBc
-     *   against -10.0 off over the same tones).
+     * - SecondOrder (Bilbao, Esqueda, Parker and Valimaki 2017): a kernel on
+     *   every curve except the Bitcrusher and Downsample
+     *   (SoftClip/Tube/HardClip/Wavefolder/Transformer/Exciter/Tape), and on
+     *   all three MultiStage stages from 2x (the tube stage only at 1x).
+     *   Every algorithm is delayed by the same min(factor, 3) processing
+     *   samples and the wet path is padded to one base sample, which
+     *   getLatency() reports and the dry path matches. -1.3 dB at 10 kHz and
+     *   -5.9 dB at 20 kHz at 2x (-1.3 dB at 20 kHz at 4x); MultiStage -2.3
+     *   and -9.9 dB at 2x, -3.9 dB at 20 kHz at 4x. Worst alias over
+     *   1-19.25 kHz tones at -6/-18 dBFS, 2x, +24 dB drive: SoftClip
+     *   -42.1 dBc against -29.7 for FirstOrder and -15.2 off; Transformer
+     *   -43.2 against -15.7; Tape -38.0 against -7.7; Exciter -27.5 against
+     *   -9.8; MultiStage -28.0 against -5.5 (at 4x -49.7 against -5.7).
+     *   Meant for oversampled use: at 1x the kernel's -12 dB at 20 kHz lowers
+     *   high fundamentals more than it removes alias (SoftClip +24 dB:
+     *   -2.1 dBc against -10.0 off over the same tones). Cost at 2x, stereo
+     *   float, ns per frame: Tape 510 against 300 plain, MultiStage 820
+     *   against 260 plain, Exciter 150 against 35.
      */
     enum class Antialiasing { Off, FirstOrder, SecondOrder };
 
@@ -1710,6 +2300,10 @@ protected:
         }
     }
 
+    /** Processing samples of second-order delay inside the algorithms:
+     *  min(factor, 3), padded to one base sample by alignSecondOrder(). */
+    [[nodiscard]] int secondOrderDelay() const noexcept { return std::clamp(oversamplingFactor_, 1, 3); }
+
     // Data-Oriented Pipeline to eliminate per-sample virtual dispatch
     void processSaturationPipeline(AudioBufferView<SampleType> buffer) noexcept
     {
@@ -1733,8 +2327,9 @@ protected:
         AudioSpec updateSpec = spec_;
         if (oversamplingFactor_ > 1) updateSpec.sampleRate *= oversamplingFactor_;
 
-        if (primary)   { primary->latchOrder();   primary->update(driveGainTarget, characterTarget, updateSpec); }
-        if (secondary) { secondary->latchOrder(); secondary->update(driveGainTarget, characterTarget, updateSpec); }
+        const int commonDelay = secondOrderDelay();
+        if (primary)   { primary->latchOrder(commonDelay);   primary->update(driveGainTarget, characterTarget, updateSpec); }
+        if (secondary) { secondary->latchOrder(commonDelay); secondary->update(driveGainTarget, characterTarget, updateSpec); }
 
         SampleType peakInOriginal = SampleType(0);
         for (int ch = 0; ch < nCh; ++ch) {
@@ -1851,9 +2446,10 @@ protected:
     /**
      * @brief Completes the second-order delay to one base sample.
      *
-     * The algorithms delay by one processing sample, so a factor-N stage
-     * adds N - 1 more to every saturated channel; the M/S snapshot that is
-     * restored unprocessed is delayed by the full N. Rings hold 16 samples;
+     * The algorithms delay by min(N, 3) processing samples
+     * (secondOrderDelay()), so a factor-N stage adds the rest of N to every
+     * saturated channel; the M/S snapshot that is restored unprocessed is
+     * delayed by the full N. Rings hold 16 samples;
      * @p seed fills them with each channel's first sample (no step from
      * stale or zero history when the order is switched on).
      */
@@ -1862,7 +2458,7 @@ protected:
     {
         const int nCh = std::min({view.getNumChannels(), kMaxCh, spec_.numChannels});
         const int nS = view.getNumSamples();
-        const int pad = std::clamp(factor, 1, kAlignRing) - 1;
+        const int pad = std::clamp(factor, 1, kAlignRing) - std::clamp(factor, 1, 3);
         int pos = alignPos_;
         if (pad > 0)
             for (int ch = 0; ch < nCh; ++ch)
@@ -1962,8 +2558,10 @@ protected:
                 {
                     SampleType drift = useDrift ? driftView.getChannel(ch)[i] : SampleType(1);
                     SampleType* data = buffer.getChannel(ch);
-                    if constexpr (requires { algo->processSecond(data[i], driveGainS, charS, ch); })
+                    if constexpr (requires { ExactAlgo::kSelfAligned; })
                         data[i] = algo->processSecond(data[i], driveGainS * drift, charS * drift, ch);
+                    else if constexpr (requires { algo->processSecond(data[i], driveGainS, charS, ch); })
+                        data[i] = algo->padKernel(algo->processSecond(data[i], driveGainS * drift, charS * drift, ch), ch);
                     else
                         data[i] = algo->align(algo->processSample(data[i], driveGainS * drift, charS * drift, ch), ch);
                 }

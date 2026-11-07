@@ -10,6 +10,16 @@ All notable user-facing changes to DSPark are documented here.
   split into its passes (step 0 packs the spectrum), for real-time callers
   that spread a long transform over several callbacks. All steps in order
   write exactly what `inverse()` writes.
+- `Saturation` `Antialiasing::SecondOrder` now has kernels for the Exciter
+  (exact for its clamped cubic) and the Tape curve (the anhysteretic
+  magnetisation, from tabulated antiderivatives; its second antiderivative
+  is not elementary), and covers every MultiStage stage from 2x. Worst alias
+  over 1-19.25 kHz tones at -6/-18 dBFS, 2x, +24 dB drive: Exciter -27.5 dBc
+  against -9.8, Tape -38.0 against -7.7, MultiStage -28.0 against -6.8
+  (4x: -49.7 against -6.0; +12 dB at 2x: -37.1 against -16.0). Off and
+  FirstOrder are bit-identical; the latency is still one base sample. Cost
+  at 2x, stereo float: Tape 510 against 300 ns per frame, MultiStage 820
+  against 410, Exciter 150 against 37.
 - `LadderFilter::setSaturation(Saturation::Stages)` (opt-in, default
   `Feedback` unchanged and bit-identical): every stage saturates and the
   delay-free loop is solved implicitly (clipped Newton in double, 1.8 steps
@@ -220,6 +230,27 @@ All notable user-facing changes to DSPark are documented here.
   85 ms at 512, 149 ms in mono at 512). In linear-phase mode the IIR
   coefficients are no longer rebuilt on every change (they are rebuilt when
   the mode switches back).
+- `TubePreamp` `GridModel::Conduction` (opt-in) now models blocking
+  distortion: each grid is fed through a 22 nF coupling capacitor and a
+  1 M ohm grid leak, so grid current charges the capacitor and biases the
+  stage colder after loud passages. After a 300 ms burst at +24 dB a quiet
+  tone comes out 15.6 dB below its settled level 2 ms later and recovers
+  within about 40 ms (before: 0.4 dB). At +24 dB and above the stage spends
+  most of the cycle near cutoff: one stage, 1 kHz at -6 dBFS, the second
+  harmonic rises to -3.9 dBc (previous Conduction model -26.8, Clamp -21.2)
+  and the level falls 1.7 dB against the previous Conduction model. The
+  default Clamp model is bit-identical.
+- `Saturation` `Antialiasing::SecondOrder`: every algorithm is delayed by the
+  same min(factor, 3) processing samples inside the pipeline (previously
+  one, padded after the algorithms). The output of the algorithms whose
+  kernel did not change is bit-identical except during an algorithm
+  crossfade, where the fade now meets the delayed outputs.
+- `wdf::DiodePairRoot` and `wdf::DiodeRoot`: at low drive (incident waves up
+  to about 45-55 mV with the default 1N4148 constants) the root is an exact
+  series reversion of the diode equation, without transcendental functions:
+  14.7 against 30 ns per sample for the pair in an RC clipper, 11.9 against
+  26.6 ns for the single diode. The output moves by rounding only (at most
+  4e-16 relative against 50-digit roots).
 - `FilterEngine` glides (default audio changes while a cutoff, Q or gain
   moves; settled output is bit-identical): the cutoff follows a monotonic
   cubic in log frequency that arrives exactly 165 ms after a change (10-90%

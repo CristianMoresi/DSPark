@@ -33,18 +33,9 @@ class SincPhase
     std::optional<OfflineConvolutionWindow> near_;
 
   public:
-    SincPhase(OfflineProductWorkspace &work, double shift) : work_(work), shift_(shift)
+    SincPhase(OfflineProductWorkspace &work, double shift)
+        : work_(work), shift_(checkedShift(shift)), sine_(sineOf(shift_)), near_(makeNear(work, *this))
     {
-        if (!std::isfinite(shift) || std::abs(shift) >= 1)
-            offlineFail(OfflineStatus::InvalidInput);
-        if (shift == 0)
-            return;
-        // Preserve a shift one ulp from an integer: multiplying that shift by
-        // pi first loses relative accuracy at the nearest sinc numerator zero.
-        const double reduced = shift > .5 ? 1 - shift : shift < -.5 ? -1 - shift : shift;
-        sine_ = std::sin(std::numbers::pi * reduced);
-        near_.emplace(work.job(), work.block(), [this](int lag)
-                      { return (lag % 2 ? -sine_ : sine_) / (std::numbers::pi * (lag + shift_)); });
     }
     SincPhase(const SincPhase &) = delete;
     SincPhase &operator=(const SincPhase &) = delete;
@@ -65,6 +56,32 @@ class SincPhase
         const auto *close = near_->process();
         for (int i = 0; i < b; ++i)
             out[i] = close[i] + (i % 2 ? -sine_ : sine_) * out[i];
+    }
+
+  private:
+    static double checkedShift(double shift)
+    {
+        if (!std::isfinite(shift) || std::abs(shift) >= 1)
+            offlineFail(OfflineStatus::InvalidInput);
+        return shift;
+    }
+    // Preserve a shift one ulp from an integer: multiplying that shift by pi
+    // first loses relative accuracy at the nearest sinc numerator zero.
+    static double sineOf(double shift)
+    {
+        if (shift == 0)
+            return 0;
+        const double reduced = shift > .5 ? 1 - shift : shift < -.5 ? -1 - shift : shift;
+        return std::sin(std::numbers::pi * reduced);
+    }
+    // Built in place in the member initializer (the window is not movable).
+    static std::optional<OfflineConvolutionWindow> makeNear(OfflineProductWorkspace &work, const SincPhase &self)
+    {
+        if (self.shift_ == 0)
+            return std::nullopt;
+        return std::optional<OfflineConvolutionWindow>(
+            std::in_place, work.job(), work.block(), [&self](int lag)
+            { return (lag % 2 ? -self.sine_ : self.sine_) / (std::numbers::pi * (lag + self.shift_)); });
     }
 };
 

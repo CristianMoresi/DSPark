@@ -218,7 +218,17 @@ inline void columns2(const D2* r0, const D2* r1, D2* y) noexcept
 }
 #else // NEON
 using F4 = float32x4_t;
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC declares float32x4_t and float64x2_t as one type (__n128), so the
+// double lanes get a type of their own to keep the overloads apart.
+struct D2 { float64x2_t v; };
+inline D2 d2(float64x2_t x) noexcept { return D2{ x }; }
+inline float64x2_t raw(D2 x) noexcept { return x.v; }
+#else
 using D2 = float64x2_t;
+inline D2 d2(float64x2_t x) noexcept { return x; }
+inline float64x2_t raw(D2 x) noexcept { return x; }
+#endif
 
 inline F4 add(F4 a, F4 b) noexcept { return vaddq_f32(a, b); }
 inline F4 sub(F4 a, F4 b) noexcept { return vsubq_f32(a, b); }
@@ -226,13 +236,13 @@ inline F4 mul(F4 a, F4 b) noexcept { return vmulq_f32(a, b); }
 inline F4 set1(float x) noexcept { return vdupq_n_f32(x); }
 inline F4 load(const float* p) noexcept { return vld1q_f32(p); }
 inline void store(float* p, F4 v) noexcept { vst1q_f32(p, v); }
-inline D2 add(D2 a, D2 b) noexcept { return vaddq_f64(a, b); }
-inline D2 sub(D2 a, D2 b) noexcept { return vsubq_f64(a, b); }
-inline D2 mul(D2 a, D2 b) noexcept { return vmulq_f64(a, b); }
-inline D2 set1(double x) noexcept { return vdupq_n_f64(x); }
-inline void store(double* p, D2 v) noexcept { vst1q_f64(p, v); }
+inline D2 add(D2 a, D2 b) noexcept { return d2(vaddq_f64(raw(a), raw(b))); }
+inline D2 sub(D2 a, D2 b) noexcept { return d2(vsubq_f64(raw(a), raw(b))); }
+inline D2 mul(D2 a, D2 b) noexcept { return d2(vmulq_f64(raw(a), raw(b))); }
+inline D2 set1(double x) noexcept { return d2(vdupq_n_f64(x)); }
+inline void store(double* p, D2 v) noexcept { vst1q_f64(p, raw(v)); }
 
-inline D2 pair(const float* p) noexcept { return vcvt_f64_f32(vld1_f32(p)); }
+inline D2 pair(const float* p) noexcept { return d2(vcvt_f64_f32(vld1_f32(p))); }
 
 inline bool inRange2(const double* ph) noexcept
 {
@@ -247,12 +257,12 @@ inline D2 grid2(const double* ph, double size, int32_t* idx) noexcept
     const int64x2_t i = vcvtq_s64_f64(p);   // rounds toward zero, as the cast
     idx[0] = static_cast<int32_t>(vgetq_lane_s64(i, 0));
     idx[1] = static_cast<int32_t>(vgetq_lane_s64(i, 1));
-    return vsubq_f64(p, vcvtq_f64_s64(i));
+    return d2(vsubq_f64(p, vcvtq_f64_s64(i)));
 }
 
 inline F4 narrow4(D2 lo, D2 hi) noexcept
 {
-    return vcombine_f32(vcvt_f32_f64(lo), vcvt_f32_f64(hi));
+    return vcombine_f32(vcvt_f32_f64(raw(lo)), vcvt_f32_f64(raw(hi)));
 }
 
 inline D2 frames2(const double* pos, double maxPos, int32_t* f0) noexcept
@@ -265,7 +275,7 @@ inline D2 frames2(const double* pos, double maxPos, int32_t* f0) noexcept
     const int64x2_t i = vcvtq_s64_f64(cd);
     f0[0] = static_cast<int32_t>(vgetq_lane_s64(i, 0));
     f0[1] = static_cast<int32_t>(vgetq_lane_s64(i, 1));
-    return vsubq_f64(cd, vcvtq_f64_s64(i));
+    return d2(vsubq_f64(cd, vcvtq_f64_s64(i)));
 }
 
 inline void columns4(const F4* lo, const F4* hi, F4* y) noexcept
@@ -286,8 +296,8 @@ inline void columns2(const D2* r0, const D2* r1, D2* y) noexcept
 {
     for (int k = 0; k < 3; ++k)
     {
-        y[2 * k]     = vzip1q_f64(r0[k], r1[k]);
-        y[2 * k + 1] = vzip2q_f64(r0[k], r1[k]);
+        y[2 * k]     = d2(vzip1q_f64(raw(r0[k]), raw(r1[k])));
+        y[2 * k + 1] = d2(vzip2q_f64(raw(r0[k]), raw(r1[k])));
     }
 }
 #endif

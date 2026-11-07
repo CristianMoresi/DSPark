@@ -513,16 +513,18 @@ private:
     template <int C>
     static void gatherRows(const T* r0, T g, const T* x0, const T* x1, T* out) noexcept
     {
-#if defined(DSPARK_SIMD_EXACT_AVX2)
+#if defined(DSPARK_SIMD_EXACT_AVX2) && !defined(DSPARK_SIMD_EXACT_AVX2_DISPATCHED)
+        sampleGatherAvx2<C>(r0, r0 + kTaps, g, x0, x1, kTaps, out);
+#else
     #if defined(DSPARK_SIMD_EXACT_AVX2_DISPATCHED)
         if (simd::isRuntimeDispatchActive())
-    #endif
         {
             sampleGatherAvx2<C>(r0, r0 + kTaps, g, x0, x1, kTaps, out);
             return;
         }
-#endif
+    #endif
         sampleGatherNarrow<C, T>(r0, r0 + kTaps, g, x0, x1, kTaps, out);
+#endif
     }
 
     /**

@@ -588,12 +588,18 @@ namespace harmony
         {
             char buf[24]{}; // Match DiatonicChord::name capacity (fits longest symbol)
             std::size_t pos = 0;
-            detail::copy(buf + pos, baseName, sizeof(buf) - pos);
-            pos += baseName.size();
+            // pos stays at most sizeof(buf) - 1, so the room left is never
+            // negative and a name that does not fit is truncated, not overrun.
+            auto append = [&](std::string_view part)
+            {
+                detail::copy(buf + pos, part, sizeof(buf) - pos);
+                pos = std::min(pos + part.size(), sizeof(buf) - 1u);
+            };
+            append(baseName);
 
-            if (lvl >= ChordLevel::Triads79)     { detail::copy(buf + pos, "(9)",  sizeof(buf) - pos);  pos += 3; }
-            if (lvl >= ChordLevel::Triads7911)   { detail::copy(buf + pos, "(11)", sizeof(buf) - pos);  pos += 4; }
-            if (lvl >= ChordLevel::Triads791113) { detail::copy(buf + pos, "(13)", sizeof(buf) - pos);  pos += 4; }
+            if (lvl >= ChordLevel::Triads79)     append("(9)");
+            if (lvl >= ChordLevel::Triads7911)   append("(11)");
+            if (lvl >= ChordLevel::Triads791113) append("(13)");
 
             detail::copy(c.name.data(), std::string_view(buf, pos), c.name.size());
         };

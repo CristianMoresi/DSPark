@@ -6,6 +6,10 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `FFTReal::inverseStep()` and `getInverseStepCount()`: the inverse transform
+  split into its passes (step 0 packs the spectrum), for real-time callers
+  that spread a long transform over several callbacks. All steps in order
+  write exactly what `inverse()` writes.
 - `LadderFilter::setSaturation(Saturation::Stages)` (opt-in, default
   `Feedback` unchanged and bit-identical): every stage saturates and the
   delay-free loop is solved implicitly (clipped Newton in double, 1.8 steps
@@ -187,6 +191,28 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `CrossoverFilter` linear phase (default audio moves within rounding: at most
+  2.7e-7, -128.6 dB, on noise): the 4096-tap FIR runs in eight partitions of
+  512 instead of four of 1024, and the engine delays its output by two
+  partitions, so the work for each output partition is spread over the
+  partition before it. The latency is unchanged (3072 samples at 48 kHz).
+  The last band is the delayed input minus the other bands (no convolution),
+  and kernel partitions whose taps sum below 1e-6 (-120 dB) are not
+  convolved: at the default splits two to four of eight remain per band. The
+  bands match the ideal Linkwitz-Riley magnitudes within 7.2e-7 (2.0e-7
+  before). Measured at 48 kHz stereo, default splits, LR24, median of nine
+  heap layouts, us per block (mean / worst steady / worst with a move every
+  37 blocks; two runs): 12 bands at 64 samples 2.8 / 75-89 / 47-52 became
+  2.3 / 6 / 9-12, at 512 samples 22 / 46 / 55 became 18 / 20-22 / 36-38; 4
+  bands at 64 samples 1.06 / 17.6 / 17.9 became 0.76 / 2.6-3.3 / 3.9-4.6,
+  at 512 samples 8.3 / 18 / 18.6 became 5.6 / 6.3-7.5 / 12. A redesign is
+  paced at a fixed share of the stereo work per sample (its long inverse
+  transform split into passes), so a change is heard 85 ms later at 64 and
+  512-sample blocks in mono, stereo or six channels (before: 21 ms at
+  64-sample blocks, where the design rode on the blocks between partitions,
+  85 ms at 512, 149 ms in mono at 512). In linear-phase mode the IIR
+  coefficients are no longer rebuilt on every change (they are rebuilt when
+  the mode switches back).
 - `FilterEngine` glides (default audio changes while a cutoff, Q or gain
   moves; settled output is bit-identical): the cutoff follows a monotonic
   cubic in log frequency that arrives exactly 165 ms after a change (10-90%
@@ -374,30 +400,23 @@ All notable user-facing changes to DSPark are documented here.
   maxBlockSize, so the low-frequency response did too (band 0 of a 200 Hz
   LR24 split read -12.6 dB at 100 Hz with 64-sample blocks, -1.7 dB at 512,
   against the ideal -0.527). The FIR now spans about 85 ms (4096 taps at
-  48 kHz, scaled with the rate) at every block size and runs in four
-  partitions: the response is the ideal one, the bands sum to the delayed
+  48 kHz, scaled with the rate) at every block size as a partitioned
+  convolution: the response is the ideal one, the bands sum to the delayed
   input within 3e-8 (was 1e-3 at 64-sample blocks; close splits at
   100/150/225 Hz summed with 0.87 dB of ripple, now flat), and the output no
   longer depends on how the host slices the stream. The latency is fixed at
   3072 samples at 48 kHz (was maxBlockSize / 2): re-read `getLatency()`,
-  also for `MultibandCompressor` in linear-phase mode. CPU at 48 kHz stereo,
-  12 bands: the steady mean is unchanged (2.4 us per 64-sample block, 18.5 us
-  per 512), but the work now comes once per 1024-sample partition, so with
-  64-sample blocks the block that completes a partition costs 40 us (was
-  7 us, when the FIR was one block long).
+  also for `MultibandCompressor` in linear-phase mode. CPU: see the
+  `CrossoverFilter` entry under Changed.
 - `CrossoverFilter` linear phase: a change rebuilt every kernel inside one
   block (150 us for that block at 12 bands, 512-sample blocks, against 21 us
   for a steady block). A change is now designed over the following blocks
-  into a second kernel set and swapped in whole: the worst block during a
-  redesign stays within 1.5x of the worst steady block, and the new response
-  is heard 9-30 ms after a change with 64-sample blocks, 75-85 ms with 512
-  (stereo; about twice as long in mono; it used to be heard from the next
-  block). Moving a split every 37 blocks raises the 64-sample mean to 6.5 us
-  (3.2 us when the FIR was one block long). A live band-count change also
-  left the bands it added without output for a partition, so the bands
-  stopped summing to the delayed input (0.155 of error on random live
-  changes): it now lands as one complete design, and the sum stays exact
-  (3e-7).
+  into a second kernel set and swapped in whole (it used to be heard from
+  the next block; pacing and landing time: see the `CrossoverFilter` entry
+  under Changed). A live band-count change also left the bands it added
+  without output for a partition, so the bands stopped summing to the
+  delayed input (0.155 of error on random live changes): it now lands as
+  one complete design, and the sum stays exact (3e-7).
 - `CrossoverFilter` IIR: a frequency glide updated its coefficients every 32
   samples of each block, so the glide depended on the host's block size (up to
   0.14 difference against 512-sample blocks). The update grid now runs across

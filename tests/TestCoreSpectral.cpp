@@ -16,6 +16,7 @@
 #include <thread>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -299,6 +300,42 @@ DSPARK_TEST(FFT_matches_the_direct_dft_at_every_size)
 {
     checkFftAgainstDft<float>(1e-6);
     checkFftAgainstDft<double>(1e-14);
+}
+
+// FFTReal::inverseStep() splits inverse() into its passes for callers that
+// spread a long transform over several callbacks: the steps in order must
+// write exactly what inverse() writes, at every size (both pass parities),
+// in float and double, also when another instance runs in between.
+template <typename T>
+static void checkSteppedInverse()
+{
+    unsigned int rng = 777u;
+    for (size_t n = 4; n <= 16384; n *= 2)
+    {
+        std::vector<T> spec(n + 2);
+        for (auto& v : spec)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            v = static_cast<T>(static_cast<double>(rng >> 8) / 8388608.0 - 1.0);
+        }
+        FFTReal<T> whole(n), stepped(n), other(n);
+        std::vector<T> a(n), b(n, T(-7)), scratch(n);
+        whole.inverse(spec.data(), a.data());
+        const int steps = stepped.getInverseStepCount();
+        EXPECT_GT(steps, 1);
+        for (int s = 0; s < steps; ++s)
+        {
+            stepped.inverseStep(s, spec.data(), b.data());
+            other.inverse(spec.data(), scratch.data()); // an unrelated transform between steps
+        }
+        EXPECT_EQ(std::memcmp(a.data(), b.data(), n * sizeof(T)), 0);
+    }
+}
+
+DSPARK_TEST(FFTReal_inverse_in_steps_matches_inverse)
+{
+    checkSteppedInverse<float>();
+    checkSteppedInverse<double>();
 }
 
 // ============================================================================

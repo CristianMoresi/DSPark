@@ -3436,10 +3436,8 @@ DSPARK_TEST(CrossoverFilter_linear_phase_bands_sum_through_live_changes)
 // A linear-phase change is designed over a few blocks into the kernel set
 // that is not playing, then swapped in whole: no block pays for the whole
 // design. Pinned: after a move the bands become bit-identical to those of a
-// crossover prepared with the new frequency, and stay so, within eight
-// partitions (8192 samples) at small and large blocks. Mono is the slow
-// case: the design budget follows the steady work, which halves with one
-// channel (7168 samples at 512-sample blocks, 1792 at 64).
+// crossover prepared with the new frequency, and stay so, within 8192
+// samples at small and large blocks (mono; about 3600 samples measured).
 DSPARK_TEST(CrossoverFilter_linear_phase_change_lands_on_the_new_design)
 {
     for (int block : { 64, 512 })
@@ -3485,5 +3483,115 @@ DSPARK_TEST(CrossoverFilter_linear_phase_change_lands_on_the_new_design)
         std::cout << "  block " << block << ": new design heard after " << landed << " blocks\n";
         EXPECT_GT(landed, -1);
         EXPECT_LT(landed * block, 8193);
+    }
+}
+
+// Defect: the linear-phase design budget followed the steady work, which
+// scales with the channel count, so a change took about twice as long to be
+// heard in mono (14 against 8 blocks of 512 samples, 149 against 85 ms). The
+// design now runs at a fixed share of the stereo work per sample: the same
+// landing in blocks for one, two and six channels, at small and large blocks.
+DSPARK_TEST(CrossoverFilter_linear_phase_landing_is_channel_independent)
+{
+    auto landing = [](int block, int chans) {
+        auto a = std::make_unique<CrossoverFilter<float>>();
+        auto b = std::make_unique<CrossoverFilter<float>>();
+        for (auto* x : { a.get(), b.get() })
+        {
+            x->setFilterMode(CrossoverFilter<float>::FilterMode::LinearPhase);
+            x->setNumBands(4);
+        }
+        b->setCrossoverFrequency(0, 230.0f);
+        for (auto* x : { a.get(), b.get() }) x->prepare(AudioSpec{ 48000.0, block, chans });
+        const int warm = 16384 / block, total = warm + 2 * 48000 / block;
+        const size_t len = static_cast<size_t>(block) * static_cast<size_t>(chans);
+        std::vector<Vec> oa(4, Vec(len)), ob(4, Vec(len));
+        Vec in(len);
+        int landed = -1;
+        uint32_t s = 3u;
+        for (int k = 0; k < total; ++k)
+        {
+            if (k == warm) a->setCrossoverFrequency(0, 230.0f);
+            for (auto& v : in) { s = s * 1664525u + 1013904223u; v = static_cast<float>(s >> 8) / 16777216.0f - 0.5f; }
+            std::vector<float*> ip(static_cast<size_t>(chans));
+            for (int c = 0; c < chans; ++c) ip[static_cast<size_t>(c)] = in.data() + c * block;
+            for (int t = 0; t < 2; ++t)
+            {
+                auto& o = t == 0 ? oa : ob;
+                std::vector<std::vector<float*>> p(4, std::vector<float*>(static_cast<size_t>(chans)));
+                std::vector<AudioBufferView<float>> views;
+                for (int band = 0; band < 4; ++band)
+                {
+                    for (int c = 0; c < chans; ++c)
+                        p[static_cast<size_t>(band)][static_cast<size_t>(c)] = o[static_cast<size_t>(band)].data() + c * block;
+                    views.emplace_back(p[static_cast<size_t>(band)].data(), chans, block);
+                }
+                (t == 0 ? *a : *b).processBlock(AudioBufferView<float>(ip.data(), chans, block), views.data(), 4);
+            }
+            bool same = true;
+            for (int band = 0; band < 4; ++band)
+                same = same && std::memcmp(oa[static_cast<size_t>(band)].data(), ob[static_cast<size_t>(band)].data(),
+                                           sizeof(float) * len) == 0;
+            if (k >= warm && same && landed < 0) landed = k - warm;
+            if (k >= warm && !same) landed = -1;
+        }
+        return landed;
+    };
+    for (int block : { 64, 512 })
+    {
+        const int mono = landing(block, 1), stereo = landing(block, 2), six = landing(block, 6);
+        std::cout << "  block " << block << ": heard after " << mono << " / " << stereo << " / " << six
+                  << " blocks (1 / 2 / 6 channels)\n";
+        EXPECT_GT(mono, -1);
+        EXPECT_EQ(mono, stereo); // 14 against 8 at 512-sample blocks before
+        EXPECT_EQ(six, stereo);
+        EXPECT_LT(mono * block, 8193);
+    }
+}
+
+// The linear-phase bands against the ideal Linkwitz-Riley magnitudes
+// |LP| = 1/(1 + (f/fc)^N), each band carrying the high-pass of every split
+// below it: 12 bands at the default splits (LR24) and 3 bands at 50 Hz and
+// 5 kHz (LR12), 120 frequencies from 20 Hz to 20 kHz. Pins the partition plan,
+// the residual last band and the dropped negligible partitions: the
+// worst error is 7.2e-7 (2.0e-7 with every partition convolved) and 7.9e-5
+// (the 50 Hz LR12 skirt the FIR length allows).
+DSPARK_TEST(CrossoverFilter_linear_phase_bands_match_the_ideal_response)
+{
+    struct Cfg { int bands; int order; float f0, f1; double tol; };
+    for (const Cfg c : { Cfg{ 12, 24, 0.0f, 0.0f, 2e-6 }, Cfg{ 3, 12, 50.0f, 5000.0f, 1.5e-4 } })
+    {
+        CrossoverFilter<float> x;
+        x.setFilterMode(CrossoverFilter<float>::FilterMode::LinearPhase);
+        x.setNumBands(c.bands);
+        x.setOrder(c.order);
+        if (c.f0 > 0.0f) { x.setCrossoverFrequency(0, c.f0); x.setCrossoverFrequency(1, c.f1); }
+        x.prepare(AudioSpec{ 48000.0, 512, 1 });
+        const int n = 1 << 15, t0 = 4096, half = 2048;
+        Vec in(static_cast<size_t>(n), 0.0f);
+        in[static_cast<size_t>(t0)] = 1.0f;
+        const auto out = crossoverSplit(x, in, c.bands, 512);
+        const int centre = t0 + x.getLatency();
+        const int expo = c.order / 6;
+        double worst = 0.0;
+        for (int fi = 0; fi < 120; ++fi)
+        {
+            const double f = 20.0 * std::pow(1000.0, fi / 119.0);
+            double carry = 1.0;
+            for (int b = 0; b < c.bands; ++b)
+            {
+                double ideal = carry;
+                if (b < c.bands - 1)
+                {
+                    const double r = std::pow(f / static_cast<double>(x.getCrossoverFrequency(b)), expo);
+                    ideal = carry / (1.0 + r);
+                    carry *= r / (1.0 + r);
+                }
+                const double mag = std::pow(10.0, kernelResponseDb(out[static_cast<size_t>(b)], centre, half, f, 48000.0) / 20.0);
+                worst = std::max(worst, std::abs(mag - ideal));
+            }
+        }
+        std::cout << "  " << c.bands << " bands LR" << c.order << ": worst |H - ideal| " << worst << "\n";
+        EXPECT_LT(worst, c.tol);
     }
 }

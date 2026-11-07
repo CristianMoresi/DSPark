@@ -250,6 +250,35 @@ public:
         close(b, out, scaleRe, scaleIm);
     }
 
+    /// Steps of runTo() as runToStep() splits it: one per pass before the
+    /// closing one, then the closing pass.
+    [[nodiscard]] size_t runToStepCount() const noexcept { return passes_.size(); }
+
+    /**
+     * @brief Runs one step of runTo(): step s below runToStepCount() - 1 is
+     *        pass s, the last step the closing pass into `out`. All steps in
+     *        order, with nothing else run in between, equal runTo() bit for
+     *        bit (the passes alternate between the two work buffers, so the
+     *        buffer a step reads follows from its index).
+     * @param step    Step index, 0 .. runToStepCount() - 1.
+     * @param out     Receives N interleaved complex values (last step only).
+     * @param scaleRe Factor applied to the real parts (last step only).
+     * @param scaleIm Factor applied to the imaginary parts (last step only).
+     */
+    void runToStep(size_t step, T* out, T scaleRe, T scaleIm) noexcept
+    {
+        Buffers<T> b = buffers();
+        if ((step & 1u) != 0)
+        {
+            std::swap(b.xr, b.yr);
+            std::swap(b.xi, b.yi);
+        }
+        if (step + 1 < passes_.size())
+            passes(b, step, step + 1);
+        else
+            close(b, out, scaleRe, scaleIm);
+    }
+
 private:
     [[nodiscard]] Buffers<T> buffers() noexcept
     {
@@ -451,6 +480,37 @@ public:
         packInverseConj(freqData, engine_.inRe(), engine_.inIm());
         const T scale = T(1) / static_cast<T>(halfSize_);
         engine_.runTo(timeData, scale, -scale);
+    }
+
+    /** @brief Returns the number of steps inverseStep() splits inverse() into. */
+    [[nodiscard]] int getInverseStepCount() const noexcept
+    {
+        return static_cast<int>(engine_.runToStepCount()) + 1;
+    }
+
+    /**
+     * @brief Runs one step of inverse(), for callers that spread a large
+     *        transform over several calls (a real-time thread that must not
+     *        spend the whole transform in one callback).
+     *
+     * Step 0 packs the spectrum, each later step is one pass over the data.
+     * Running steps 0 .. getInverseStepCount() - 1 in order, with no other
+     * transform on this instance in between, writes exactly what inverse()
+     * writes, bit for bit.
+     *
+     * @param step     Step index, 0 .. getInverseStepCount() - 1.
+     * @param freqData Input spectrum, N+2 elements (read by step 0 only).
+     * @param timeData Output: N real samples (written by the last step only).
+     */
+    void inverseStep(int step, const T* freqData, T* timeData) noexcept
+    {
+        if (step <= 0)
+        {
+            packInverseConj(freqData, engine_.inRe(), engine_.inIm());
+            return;
+        }
+        const T scale = T(1) / static_cast<T>(halfSize_);
+        engine_.runToStep(static_cast<size_t>(step - 1), timeData, scale, -scale);
     }
 
     /**

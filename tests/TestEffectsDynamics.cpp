@@ -420,12 +420,17 @@ DSPARK_TEST(Limiter_block_matches_per_sample)
     // reached the delayed output after the envelope had already released and
     // was hard-clipped at the ceiling instead of smoothly limited (measured:
     // maxDiff 0.01 vs the block path on an impulse train). The paths are now
-    // bit-identical for mono, with every feature branch enabled.
+    // bit-identical for mono, with every feature branch enabled, in both hold
+    // modes (the true-peak estimator runs the same block FIRs one sample at a
+    // time on the per-sample path).
+  for (bool everyPeak : { false, true })
+  {
     Limiter<float> lb, ls;
-    auto setup = [](Limiter<float>& l) {
+    auto setup = [everyPeak](Limiter<float>& l) {
         // Ceiling before prepare(): the smoother starts settled at -6 dB, so
         // the brickwall bound below holds from sample 0 (no 30 ms glide).
         l.setCeiling(-6.0f);
+        if (everyPeak) l.setHoldMode(Limiter<float>::HoldMode::EveryPeak);
         l.prepare(48000.0, 1);
         l.setTruePeak(true);
         l.setAdaptiveRelease(true);
@@ -463,6 +468,7 @@ DSPARK_TEST(Limiter_block_matches_per_sample)
     const float ceiling = decibelsToGain(-6.0f);
     for (int i = 0; i < n; ++i)
         EXPECT_TRUE(std::abs(blockOut.ch(0)[i]) <= ceiling + 1e-6f);
+  }
 }
 
 DSPARK_TEST(Limiter_prepare_preserves_lookahead)
@@ -600,6 +606,235 @@ DSPARK_TEST(Limiter_dense_material_is_never_hard_clipped)
         for (bool truePeak : { false, true })
             EXPECT_EQ(limiterClampHits(x, releaseMs, truePeak), 0);
 }
+
+namespace {
+
+// Independent true-peak meter for the Limiter tests: an 8x reconstruction
+// with a Kaiser-windowed sinc of 128 taps per phase (beta 14, cut at
+// Nyquist), in double. The first and last 256 samples are faded so the edges
+// of the excerpt do not ring.
+double reconstructionPeak(const std::vector<float>& y, size_t from, size_t to)
+{
+    constexpr int kHalf = 64, kOver = 8;
+    const double pi = 3.14159265358979323846;
+    const auto i0 = [](double x) {
+        double s = 1.0, t = 1.0;
+        for (int k = 1; k < 80; ++k) { t *= (x / (2.0 * k)) * (x / (2.0 * k)); s += t; }
+        return s;
+    };
+    std::vector<double> h(static_cast<size_t>(kOver * 2 * kHalf));
+    for (int p = 0; p < kOver; ++p)
+        for (int k = 0; k < 2 * kHalf; ++k)
+        {
+            const double d = (k - kHalf + 1) - static_cast<double>(p) / kOver;
+            const double s = std::abs(d) < 1e-12 ? 1.0 : std::sin(pi * d) / (pi * d);
+            const double u = d / kHalf;
+            const double w = std::abs(u) < 1.0 ? i0(14.0 * std::sqrt(1.0 - u * u)) / i0(14.0) : 0.0;
+            h[static_cast<size_t>(p * 2 * kHalf + k)] = s * w;
+        }
+    const size_t len = to - from;
+    std::vector<double> z(len + 4 * kHalf, 0.0);
+    for (size_t i = 0; i < len; ++i)
+    {
+        double g = 1.0;
+        constexpr size_t kFade = 256;
+        if (i < kFade) g = 0.5 - 0.5 * std::cos(pi * (static_cast<double>(i) + 0.5) / kFade);
+        if (len - 1 - i < kFade) g = std::min(g, 0.5 - 0.5 * std::cos(pi * (static_cast<double>(len - 1 - i) + 0.5) / kFade));
+        z[i + 2 * kHalf] = y[from + i] * g;
+    }
+    double peak = 0.0;
+    for (size_t i = 0; i + 2 * kHalf <= z.size() - 2 * kHalf; ++i)
+        for (int p = 0; p < kOver; ++p)
+        {
+            double v = 0.0;
+            const double* c = &h[static_cast<size_t>(p * 2 * kHalf)];
+            for (int k = 0; k < 2 * kHalf; ++k) v += c[k] * z[i + kHalf + static_cast<size_t>(k)];
+            peak = std::max(peak, std::abs(v));
+        }
+    return peak;
+}
+
+// Stereo float Limiter at its defaults with true-peak detection and a -1 dB
+// ceiling; returns the left output.
+std::vector<float> limitTruePeak(const std::vector<float>& x, float lookaheadMs = 2.0f)
+{
+    auto lim = std::make_unique<Limiter<float>>();
+    lim->setCeiling(-1.0f);
+    lim->setTruePeak(true);
+    lim->setLookahead(lookaheadMs);
+    lim->prepare(48000.0, 2);
+    std::vector<float> l = x, r = x;
+    for (size_t o = 0; o < x.size(); o += 512)
+    {
+        const int m = static_cast<int>(std::min<size_t>(512, x.size() - o));
+        float* ch[2] = { l.data() + o, r.data() + o };
+        lim->processBlock(AudioBufferView<float>(ch, 2, m));
+    }
+    return l;
+}
+
+} // namespace
+
+DSPARK_TEST(Limiter_true_peak_follows_the_reconstruction)
+{
+    // The BS.1770 Annex 2 estimate the sidechain used alone has 12 taps per
+    // phase and under-reads peaks built from content near the top of the
+    // band: on an independent 8x reconstruction the limited output read
+    // +0.77 dB over the ceiling on a hard-clipped 5 kHz tone and +1.26 dB on
+    // differentiated white noise. With the 64-tap estimate and vertex
+    // refinement: +0.13 and +0.27 dB. An Annex 2 meter still reads the
+    // output at or below the ceiling.
+    const size_t n = 48000;
+    const double ceiling = std::pow(10.0, -1.0 / 20.0);
+    std::vector<float> clipped(n), hfNoise(n);
+    for (size_t i = 0; i < n; ++i)
+        clipped[i] = static_cast<float>(std::clamp(8.0 * std::sin(2.0 * 3.14159265358979 * 5003.0 * static_cast<double>(i) / 48000.0), -1.0, 1.0));
+    uint32_t state = 0x2468ace1u;
+    double prev = 0.0, peakIn = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        const double w = static_cast<double>(state) / 2147483648.0 - 1.0;
+        hfNoise[i] = static_cast<float>(w - prev);
+        prev = w;
+        peakIn = std::max(peakIn, std::abs(static_cast<double>(hfNoise[i])));
+    }
+    for (auto& v : hfNoise) v = static_cast<float>(v * 1.6 / peakIn); // about 5 dB over the ceiling
+
+    const struct { const std::vector<float>* x; double maxOverDb; } cases[] = {
+        { &clipped, 0.3 }, { &hfNoise, 0.45 },
+    };
+    for (const auto& c : cases)
+    {
+        const std::vector<float> y = limitTruePeak(*c.x);
+        const double overDb = 20.0 * std::log10(reconstructionPeak(y, 4800, n) / ceiling);
+        EXPECT_LT(overDb, c.maxOverDb);
+
+        TruePeakDetector<float, 1> annex;
+        double annexPeak = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double v = annex.processSample(y[i], 0);
+            if (i > 4800) annexPeak = std::max(annexPeak, v);
+        }
+        EXPECT_LT(20.0 * std::log10(annexPeak / ceiling), 0.01);
+    }
+}
+
+DSPARK_TEST(Limiter_true_peak_raises_short_lookahead)
+{
+    // A reading reaches 33 samples back, so true-peak mode needs at least 49
+    // samples of lookahead (a 16-sample ramp); getLatency() reports it at
+    // once. The sample-domain contract still holds at that setting.
+    Limiter<float> lim;
+    lim.prepare(48000.0, 2);
+    lim.setLookahead(0.5f);
+    EXPECT_EQ(lim.getLatency(), 24);
+    lim.setTruePeak(true);
+    EXPECT_EQ(lim.getLatency(), 49);
+    lim.setTruePeak(false);
+    EXPECT_EQ(lim.getLatency(), 24);
+
+    std::vector<double> x(4000);
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = 0.5 * std::sin(2.0 * 3.14159265358979 * 1000.0 * static_cast<double>(i) / 48000.0);
+    x[1000] = 2.0;
+    x[1090] = 1.6;
+    Limiter<double> dl;
+    dl.setCeiling(-1.0);
+    dl.prepare(48000.0, 1);
+    dl.setLookahead(0.5);
+    dl.setTruePeak(true);
+    const double ceil = decibelsToGain(-1.0);
+    const size_t latency = static_cast<size_t>(dl.getLatency());
+    EXPECT_EQ(latency, size_t(49));
+    int hits = 0;
+    for (size_t i = 0; i < x.size(); ++i)
+    {
+        double s = x[i];
+        double* p[1] = { &s };
+        dl.processBlock(AudioBufferView<double>(p, 1, 1));
+        const double gain = decibelsToGain(dl.getGainReductionDb());
+        if (i >= latency && std::abs(x[i - latency]) * gain > ceil * (1.0 + 1e-9)) ++hits;
+    }
+    EXPECT_EQ(hits, 0);
+}
+
+DSPARK_TEST(Limiter_every_peak_hold_holds_each_peak)
+{
+    // Deepest mode restarts the hold only when a peak pushes the reduction
+    // down, so a shallower peak 5 ms after a deeper one is released with the
+    // deeper one. EveryPeak holds it for the full hold after it has passed.
+    auto gainBeforeSecondHoldEnds = [](bool everyPeak) {
+        Limiter<double> lim;
+        lim.setCeiling(-1.0);
+        lim.prepare(48000.0, 1);          // 2 ms lookahead = 96 samples
+        lim.setHold(10.0);                // 480 samples
+        lim.setRelease(5.0);
+        if (everyPeak) lim.setHoldMode(Limiter<double>::HoldMode::EveryPeak);
+        const size_t p1 = 1000, p2 = p1 + 240, probe = p2 + 96 + 480 - 20;
+        double gain = 1.0;
+        for (size_t i = 0; i <= probe; ++i)
+        {
+            double s = (i == p1) ? 2.0 : (i == p2 ? 1.4 : 0.0);
+            double* p[1] = { &s };
+            lim.processBlock(AudioBufferView<double>(p, 1, 1));
+            gain = decibelsToGain(lim.getGainReductionDb());
+        }
+        return gain;
+    };
+    const double r2 = decibelsToGain(-1.0) / 1.4;
+    EXPECT_LT(gainBeforeSecondHoldEnds(true), r2 + 1e-9);
+    EXPECT_GT(gainBeforeSecondHoldEnds(false), r2 + 0.05);   // control: Deepest
+    EXPECT_TRUE(Limiter<double>().getHoldMode() == Limiter<double>::HoldMode::Deepest);
+}
+
+DSPARK_TEST(Limiter_every_peak_hold_removes_intermodulation)
+{
+    // A 60 Hz + 7 kHz two-tone driven 6 dB over the ceiling: in Deepest mode
+    // the gain rises and falls between crests of unequal height and
+    // modulates the 7 kHz tone (sidebands -61.7 dBc at the defaults);
+    // EveryPeak keeps the gain flat across them (-87.1 dBc).
+    auto worstSidebandDbc = [](bool everyPeak) {
+        Limiter<double> lim;
+        lim.setCeiling(-6.0);
+        lim.prepare(48000.0, 1);
+        if (everyPeak) lim.setHoldMode(Limiter<double>::HoldMode::EveryPeak);
+        const double amp = std::pow(10.0, 0.0 / 20.0);
+        const size_t n = 96000;
+        std::vector<double> y(n);
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double t = static_cast<double>(i) / 48000.0;
+            y[i] = amp * (0.8 * std::sin(2.0 * 3.14159265358979 * 60.0 * t) + 0.2 * std::sin(2.0 * 3.14159265358979 * 7000.0 * t));
+        }
+        for (size_t o = 0; o < n; o += 512)
+        {
+            double* ch[1] = { y.data() + o };
+            lim.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(512, n - o))));
+        }
+        // Every product of the 50 ms modulation pattern falls on an exact bin
+        // of the last second, so single-bin projections do not leak.
+        auto amplitude = [&](double hz) {
+            double c = 0.0, s = 0.0;
+            for (size_t i = n - 48000; i < n; ++i)
+            {
+                const double ph = 2.0 * 3.14159265358979 * hz * static_cast<double>(i) / 48000.0;
+                c += y[i] * std::cos(ph);
+                s += y[i] * std::sin(ph);
+            }
+            return std::sqrt(c * c + s * s);
+        };
+        const double carrier = amplitude(7000.0);
+        double worst = 0.0;
+        for (int k = 1; k <= 6; ++k)
+            worst = std::max({ worst, amplitude(7000.0 - 60.0 * k), amplitude(7000.0 + 60.0 * k) });
+        return 20.0 * std::log10(worst / carrier);
+    };
+    EXPECT_LT(worstSidebandDbc(true), -80.0);
+    EXPECT_GT(worstSidebandDbc(false), -70.0);   // control: Deepest
+}
+
 
 // ============================================================================
 // NoiseGate

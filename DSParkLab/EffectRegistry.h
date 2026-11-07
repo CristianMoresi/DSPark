@@ -333,6 +333,8 @@ inline EffectSlot makeLimiter()
     s.addToggle("Safety Clip", true);
     s.addToggle("Adaptive Release", true);
     s.addSlider("Hold", 0, 50, 10, "ms");
+    s.addToggle("True Peak", false);
+    s.addToggle("Hold Every Peak", false);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p, inputGainDb](auto b) {
         // Input Gain MUST be applied BEFORE the limiter - otherwise
@@ -357,6 +359,9 @@ inline EffectSlot makeLimiter()
             case 4: p->setSafetyClip(v > 0.5f); break;
             case 5: p->setAdaptiveRelease(v > 0.5f); break;
             case 6: p->setHold(v); break;
+            case 7: p->setTruePeak(v > 0.5f); break;
+            case 8: p->setHoldMode(v > 0.5f ? dspark::Limiter<float>::HoldMode::EveryPeak
+                                            : dspark::Limiter<float>::HoldMode::Deepest); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

@@ -108,6 +108,25 @@ public:
      */
     [[nodiscard]] static constexpr int getTaps() noexcept { return kTaps; }
 
+    /** @brief Number of interpolation phases (4x over-sampling). */
+    [[nodiscard]] static constexpr int getPhases() noexcept { return kPhases; }
+
+    /**
+     * @brief One official interpolation phase, row reversed, for callers that
+     *        run the interpolator as a block FIR.
+     *
+     * Element j multiplies x[n - getTaps() + 1 + j] (the window oldest first).
+     * The maximum of the absolute values of the four phases and of |x[n]| is
+     * the reading processSample() returns, up to summation rounding.
+     *
+     * @param phase Phase index, clamped to [0, getPhases() - 1].
+     * @return getTaps() coefficients in read-only storage.
+     */
+    [[nodiscard]] static constexpr const T* getReversedPhase(int phase) noexcept
+    {
+        return kReversedCoeffs[static_cast<size_t>(std::clamp(phase, 0, kPhases - 1))].data();
+    }
+
 private:
     static constexpr int kTaps     = 12;  ///< Taps per polyphase branch.
     static constexpr int kPhases   = 4;   ///< Interpolation phases (4x oversampling).

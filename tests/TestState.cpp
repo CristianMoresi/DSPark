@@ -80,6 +80,7 @@ DSPARK_TEST(State_roundtrip_dynamics)
     EXPECT_TRUE((roundTrip<Limiter<float>>([](auto& l) {
         l.setCeiling(-1.2f); l.setRelease(60.0f); l.setTruePeak(true);
         l.setAdaptiveRelease(true); l.setLookahead(7.5f);
+        l.setHold(25.0f); l.setHoldMode(Limiter<float>::HoldMode::EveryPeak);
     })));
     EXPECT_TRUE((roundTrip<NoiseGate<float>>([](auto& g) {
         g.setThreshold(-52.0f); g.setHold(80.0f); g.setDuckMode(true);

@@ -14,18 +14,26 @@
  * The gain computer is the modern lookahead design: the gain each sample
  * requires (ceiling / peak) enters an exact sliding-window minimum spanning
  * the lookahead, a hold keeps the reduction for setHold() milliseconds after
- * the last peak asked for it, a one-pole release then lets the gain recover,
- * and two cascaded
+ * the last peak asked for it (setHoldMode() chooses whether a shallower peak
+ * inside the hold is held too), a one-pole release then lets the gain
+ * recover, and two cascaded
  * moving averages turn every reduction into an S-shaped ramp that completes
  * exactly when the peak reaches the (delayed) output. Because the averaged
  * window only ever contains gains at or below each peak's requirement, the
  * ceiling is met by construction: transients are turned down smoothly
  * instead of being clipped. Optional ISP (Inter-Sample Peak) detection feeds
- * the sidechain with the ITU-R BS.1770 4x oversampled true-peak estimate and
- * shortens the ramp so the reduction covers every sample that estimate is
- * formed from. A final clamp at the ceiling remains as a rounding backstop
- * (and covers live ceiling or lookahead changes); true-peak levels are
- * reduced but not mathematically bounded.
+ * the sidechain with the larger of two true-peak estimates of every sample
+ * interval: a 64-tap-per-phase 4x reconstruction refined to its local
+ * maxima (accurate up to the top of the band), and the ITU-R BS.1770 Annex 2
+ * estimate (so a BS.1770 meter also reads the output at or below the
+ * ceiling). The ramp shortens by the 33 samples a reading reaches back. On
+ * an independent 8x, 128-tap reconstruction the output reaches at most
+ * +0.14 dB over the ceiling on dense mixes driven 6 to 12 dB over it,
+ * +0.13 dB on a hard-clipped 5 kHz tone and +0.27 dB on differentiated
+ * white noise (the BS.1770 estimate alone: +0.93, +0.77 and +1.26 dB). A
+ * final clamp at the ceiling remains as a rounding backstop (and covers live
+ * ceiling or lookahead changes); true-peak levels are reduced but not
+ * mathematically bounded.
  *
  * @note This class is strictly real-time safe. It performs zero allocations
  *       in the audio thread. The maximum lookahead time dictates the memory
@@ -33,7 +41,8 @@
  *
  * Features:
  * - Brickwall limiting (sample peaks never exceed the ceiling)
- * - ISP true-peak detection (4x oversampled FIR sidechain)
+ * - ISP true-peak detection (4x reconstruction with vertex refinement, plus
+ *   the BS.1770 Annex 2 estimate)
  * - Sliding-minimum gain hold + S-curve attack (artifact-free transients)
  * - CPU-optimized adaptive release (avoids std::exp in hot paths)
  * - Real-time safe parameter updates (lock-free atomics)
@@ -43,13 +52,14 @@
  * belong to the audio thread. All setters are lock-free atomic publications,
  * safe from any thread; changes are consumed at the next block (or the next
  * channel-0 sample). Non-finite setter arguments are ignored. getLatency()
- * derives from the published lookahead parameter, so a host reads the correct
- * value immediately after setLookahead(). getGainReductionDb() is metering:
+ * derives from the published lookahead and true-peak parameters, so a host
+ * reads the correct value immediately after setLookahead() or setTruePeak().
+ * getGainReductionDb() is metering:
  * a cross-thread read of a published atomic word (up to one block behind).
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, RingBuffer.h,
  *               SmoothedValue.h, DenormalGuard.h, TruePeakDetector.h,
- *               StateBlob.h.
+ *               SimdOps.h, StateBlob.h.
  */
 
 #include "../Core/DspMath.h"
@@ -59,6 +69,7 @@
 #include "../Core/SmoothedValue.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/TruePeakDetector.h"
+#include "../Core/SimdOps.h"
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
@@ -66,6 +77,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <numbers>
 #include <vector>
 
 // Keeps the gain computer's rare paths (once per hold block, once per 2^16
@@ -130,7 +142,9 @@ public:
         // later. The sample count is capped in double before the cast (a cast
         // of an out-of-int-range double is undefined behaviour).
         const double maxLaExact = sampleRate_ * kMaxLookaheadMs / 1000.0;
-        const int maxLookaheadSamples = static_cast<int>(std::min(maxLaExact, 1.0e7)) + 1;
+        // True-peak mode raises the lookahead to at least kTpMinLookahead.
+        const int maxLookaheadSamples = std::max(static_cast<int>(std::min(maxLaExact, 1.0e7)) + 1,
+                                                 kTpMinLookahead + 1);
 
         // Use the clamped count: a degenerate numChannels (<= 0, or negative cast
         // to size_t, or > kMaxChannels) must neither under-allocate (which would
@@ -139,21 +153,36 @@ public:
         for (auto& dl : delayLines_)
             dl.prepare(maxLookaheadSamples * 2 + kChunk); // lookahead glide + one processBlock() chunk
 
-        // Gain-computer histories: power-of-two rings covering the longest
-        // hold window (L + 1) plus the moving-average lookback.
+        // Gain-computer histories: power-of-two rings. The moving averages
+        // look back at most the lookahead; the sliding minimum covers the
+        // lookahead plus the longest hold.
         int hist = 4;
         while (hist < maxLookaheadSamples + 4) hist <<= 1;
         histSize_ = hist;
         histMask_ = hist - 1;
+        maxHoldSamples_ = static_cast<int>(std::min(std::ceil(sampleRate_ * kMaxHoldMs / 1000.0), 1.0e7));
+        int holdHist = 4;
+        while (holdHist < maxLookaheadSamples + maxHoldSamples_ + 4) holdHist <<= 1;
+        holdHistSize_ = holdHist;
+        holdMask_ = holdHist - 1;
         eHist_.assign(static_cast<size_t>(hist), 1.0);
         avgHist_.assign(static_cast<size_t>(hist), 1.0);
-        rHist_.assign(static_cast<size_t>(hist), 1.0);
-        sufMin_.assign(static_cast<size_t>(hist) + 1, 1.0);
+        rHist_.assign(static_cast<size_t>(holdHist), 1.0);
+        sufMin_.assign(static_cast<size_t>(holdHist) + 1, 1.0);
+
+        // Long-kernel true-peak estimator: kernel and per-channel histories.
+        designTruePeakKernel();
+        tpHist_.assign(static_cast<size_t>(numChannels_) * kTpStride, T(0));
 
         if (std::isfinite(initialLookaheadMs) && initialLookaheadMs > 0.0)
             lookaheadMs_.store(std::clamp(static_cast<T>(initialLookaheadMs),
                                           T(0.5), static_cast<T>(kMaxLookaheadMs)),
                                std::memory_order_relaxed);
+        // The hold length is part of the sliding-minimum window that
+        // applyLookaheadTarget() sizes, so it is consumed first.
+        lastHoldMs_ = holdMs_.load(std::memory_order_relaxed);
+        lastHoldMode_ = holdMode_.load(std::memory_order_relaxed);
+        updateHoldSamples();
         (void)lookaheadDirty_.exchange(false, std::memory_order_acquire);
         applyLookaheadTarget();
         lookaheadCurrent_ = static_cast<T>(lookaheadSamples_);
@@ -170,8 +199,6 @@ public:
 
         lastReleaseMs_ = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
         updateReleaseCoefficient();
-        lastHoldMs_ = holdMs_.load(std::memory_order_relaxed);
-        updateHoldSamples();
 
         reset();
         prepared_ = true;
@@ -212,7 +239,7 @@ public:
             applyLookaheadTarget();
         syncParameters();
 
-        const bool isp          = truePeakEnabled_.load(std::memory_order_relaxed);
+        const bool isp          = ispApplied_;
         const bool adaptive     = adaptiveRelease_.load(std::memory_order_relaxed);
         const bool safetyClip   = safetyClipEnabled_.load(std::memory_order_relaxed);
         const T relMs           = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
@@ -237,10 +264,9 @@ public:
             {
                 const T* x = chData[ch] + start;
                 for (int i = 0; i < n; ++i)
-                {
-                    const T chPeak = isp ? truePeak_.processSample(x[i], ch) : std::abs(x[i]);
-                    chunkPeak_[i] = std::max(chunkPeak_[i], chPeak); // NaN is ignored
-                }
+                    chunkPeak_[i] = std::max(chunkPeak_[i], std::abs(x[i])); // NaN is ignored
+                if (isp)
+                    detectTruePeak(x, n, ch, chunkPeak_);
             }
 
             // Pass 2: ceiling smoother, lookahead glide and gain computer.
@@ -312,7 +338,6 @@ public:
         // out-of-range channels are an exact pass-through, no state touched.
         if (channel < 0 || channel >= numChannels_) return input;
 
-        const bool isp        = truePeakEnabled_.load(std::memory_order_relaxed);
         const bool adaptive   = adaptiveRelease_.load(std::memory_order_relaxed);
         const bool safetyClip = safetyClipEnabled_.load(std::memory_order_relaxed);
 
@@ -328,10 +353,13 @@ public:
             else if (lookaheadCurrent_ > lookTarget) lookaheadCurrent_ -= T(1);
             sampleLookNow_ = static_cast<int>(lookaheadCurrent_);
         }
+        const bool isp = ispApplied_;
         const T ceiling = sampleCeiling_;
 
         delayLines_[channel].push(input);
-        const T chPeak = isp ? truePeak_.processSample(input, channel) : std::abs(input);
+        T chPeak = std::abs(input);
+        if (isp)
+            detectTruePeak(&input, 1, channel, &chPeak);
 
         // The gain computer advances on channel 0. Peaks of the other channels
         // reach it on the next frame (they are processed after channel 0), so
@@ -365,7 +393,9 @@ public:
     void reset() noexcept
     {
         for (auto& dl : delayLines_) dl.reset();
-        truePeak_.reset();
+        std::fill(tpHist_.begin(), tpHist_.end(), T(0));
+        std::fill(tpFill_, tpFill_ + kMaxChannels, 0);
+        std::fill(tpLast_, tpLast_ + kMaxChannels, T(0));
         currentGain_ = T(1);
         publishedGain_.store(T(1), std::memory_order_relaxed);
         limitingDuration_ = 0;
@@ -410,6 +440,7 @@ public:
      *       pointers up to the max memory allocated during prepare(); the read
      *       offset glides to the new value at one sample per sample. Non-finite
      *       values are ignored. getLatency() reflects the new value immediately.
+     *       In true-peak mode the lookahead is at least 49 samples.
      *
      * @param ms Lookahead in milliseconds (clamped to 0.5 to 10.0 ms).
      */
@@ -423,9 +454,22 @@ public:
 
     // -- Level 3: Expert API ----------------------------------------------------
 
-    /** @brief Enables 4x oversampled ISP true-peak detection. RT-Safe.
-     *  The attack ramp shortens by the estimator's support (11 samples) so the
-     *  reduction covers every sample a true-peak reading is formed from. */
+    /**
+     * @brief Enables ISP true-peak detection. RT-Safe.
+     *
+     * The sidechain reads the larger of a 64-tap 4x reconstruction refined
+     * to its local maxima and the ITU-R BS.1770 Annex 2 estimate (see the
+     * file description for the measured overshoot). A reading reaches 33
+     * samples back, so the attack ramp shortens by 33 samples and the
+     * lookahead is raised to at least 49 samples (about 1 ms at 48 kHz);
+     * getLatency() reports it. At the 2 ms default the shorter ramp moves the
+     * 60 Hz + 7 kHz intermodulation from -61.6 to -58.9 dBc (HoldMode
+     * EveryPeak: -99.7 dBc). Detection costs about 12 ns per sample per
+     * channel more than sample-peak mode; processSample() runs it one sample
+     * at a time and is several times slower per sample than processBlock().
+     *
+     * @param enabled true to limit inter-sample peaks.
+     */
     void setTruePeak(bool enabled) noexcept
     {
         truePeakEnabled_.store(enabled, std::memory_order_relaxed);
@@ -463,6 +507,41 @@ public:
     /** @return The hold time in milliseconds. */
     [[nodiscard]] T getHold() const noexcept { return holdMs_.load(std::memory_order_relaxed); }
 
+    /** How the hold treats a peak that asks for less reduction than the one
+     *  being held. */
+    enum class HoldMode
+    {
+        /// The hold restarts only when a peak pushes the reduction down (or
+        /// keeps it down); a shallower peak inside the hold is not held after
+        /// the deeper one expires, so the gain can rise between peaks of
+        /// unequal height. The default.
+        Deepest,
+        /// Every peak's reduction is held for the hold time after it has
+        /// passed (an exact sliding minimum over lookahead plus hold). The
+        /// gain stops rising and falling between unequal peaks: the 60 Hz +
+        /// 7 kHz intermodulation of a two-tone driven 6 dB over the ceiling
+        /// falls from -61.7 to -87.1 dBc at the defaults (from -69.4 to
+        /// -84.3 dBc at 5 ms lookahead, 15 ms hold, 40 ms release). The price
+        /// is loudness: dense material driven 12 dB over the ceiling comes
+        /// out 0.45 dB lower at those settings, 0.10 dB at 6 dB over. The
+        /// required-gain history prepare() allocates spans the lookahead plus
+        /// the 50 ms maximum hold in either mode (64 KB at 48 kHz).
+        EveryPeak
+    };
+
+    /** @brief Selects the hold behaviour (see HoldMode). RT-Safe.
+     *  @param mode Hold mode; out-of-range values fall back to Deepest. */
+    void setHoldMode(HoldMode mode) noexcept
+    {
+        holdMode_.store(mode == HoldMode::EveryPeak ? 1 : 0, std::memory_order_relaxed);
+    }
+
+    /** @return The hold mode. */
+    [[nodiscard]] HoldMode getHoldMode() const noexcept
+    {
+        return holdMode_.load(std::memory_order_relaxed) == 1 ? HoldMode::EveryPeak : HoldMode::Deepest;
+    }
+
     /**
      * @brief Enables the post-limiter soft-knee safety clipper. RT-Safe.
      *
@@ -481,13 +560,16 @@ public:
     /**
      * @brief Reports the processing latency (the lookahead) in samples.
      *
-     * Derived from the published lookahead parameter, so it is correct
-     * immediately after setLookahead() from any thread (the audio thread may
-     * consume the change one block later; the glide covers the transition).
+     * Derived from the published lookahead and true-peak parameters, so it
+     * is correct immediately after setLookahead() or setTruePeak() from any
+     * thread (the audio thread may consume the change one block later; the
+     * glide covers the transition). In true-peak mode the lookahead is at
+     * least 49 samples (about 1 ms at 48 kHz).
      */
     [[nodiscard]] int getLatency() const noexcept
     {
-        return lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
+        return lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed),
+                                   truePeakEnabled_.load(std::memory_order_relaxed));
     }
 
     /** @brief Current gain reduction in dB (metering).
@@ -514,6 +596,7 @@ public:
         w.write("adaptive", adaptiveRelease_.load(std::memory_order_relaxed));
         w.write("safetyClip", safetyClipEnabled_.load(std::memory_order_relaxed));
         w.write("hold", static_cast<float>(holdMs_.load(std::memory_order_relaxed)));
+        w.write("holdMode", static_cast<int32_t>(holdMode_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -530,31 +613,192 @@ public:
         setSafetyClip(r.read("safetyClip", false));
         // A blob written before the hold existed was rendered without one.
         setHold(static_cast<T>(r.read("hold", 0.0f)));
+        setHoldMode(r.read("holdMode", int32_t(0)) == 1 ? HoldMode::EveryPeak : HoldMode::Deepest);
         return true;
     }
 
 protected:
     static constexpr int kMaxChannels = 16;
     static constexpr double kMaxLookaheadMs = 10.0;
+    static constexpr double kMaxHoldMs = 50.0;
     static constexpr T kSafetyClipCeiling = T(0.96605); ///< -0.3 dBFS
 
-    // Shared ITU-R BS.1770-4 true-peak detector (Core/TruePeakDetector.h).
-    TruePeakDetector<T, kMaxChannels> truePeak_;
+    // processBlock() chunk length (see its three passes).
+    static constexpr int kChunk = 128;
 
-    /** Lookahead in samples for a given ms parameter (shared by the audio-side
-     *  recompute and getLatency() so both always agree exactly). The product is
-     *  capped in double before the int cast (out-of-range casts are UB). */
-    [[nodiscard]] int lookaheadSamplesFor(T ms) const noexcept
+    // ---- Long-kernel true-peak estimator ------------------------------------
+    //
+    // The BS.1770 interpolator has 12 taps per phase; its pass band ends well
+    // below Nyquist, so it under-reads peaks formed by content near the top
+    // of the band (measured up to 0.8 dB on a hard-clipped 5 kHz tone and on
+    // dense mixes once the limiter has flattened the low end). This estimator
+    // evaluates the reconstruction at the quarter, half and three-quarter
+    // points of every sample interval with a 64-tap Kaiser-windowed sinc per
+    // phase (beta 8, cut at Nyquist, each phase normalised to unity at DC),
+    // and refines every local maximum of that 4x grid with the vertex of the
+    // parabola through it and its neighbours, which removes the grid error
+    // (up to 0.7 dB at 24 kHz on a 4x grid alone). The phases run as block
+    // FIRs over a per-channel history; the reading at sample n describes the
+    // interval x[n - 32] .. x[n - 31] and the half grid step before it.
+    static constexpr int kTpTaps = 64;                    ///< Taps per interpolation phase.
+    static constexpr int kTpPhases = 3;                   ///< Quarter, half and three-quarter points.
+    static constexpr int kTpDelay = kTpTaps / 2 + 1;      ///< Samples a reading reaches back.
+    static constexpr int kTpMinLookahead = kTpDelay + 16; ///< Leaves at least a 16-sample ramp.
+    static constexpr int kTpStride = kTpTaps - 1 + kChunk;
+
+    /** Designs the three interpolation phases (setup thread). */
+    void designTruePeakKernel() noexcept
+    {
+        constexpr double kBeta = 8.0;
+        constexpr double tpPi = std::numbers::pi_v<double>;
+        const auto besselI0 = [](double x) noexcept {
+            double sum = 1.0, term = 1.0;
+            for (int k = 1; k < 64; ++k)
+            {
+                const double h = x / (2.0 * k);
+                term *= h * h;
+                sum += term;
+                if (term < 1e-17 * sum) break;
+            }
+            return sum;
+        };
+        const double norm = besselI0(kBeta);
+        constexpr double halfTaps = kTpTaps / 2;
+        for (int p = 0; p < kTpPhases; ++p)
+        {
+            const double frac = static_cast<double>(p + 1) / 4.0;
+            double taps[kTpTaps];
+            double sum = 0.0;
+            for (int j = 0; j < kTpTaps; ++j)
+            {
+                // Distance from tap j to the interpolation point, which sits
+                // frac past the window's sample halfTaps - 1.
+                const double d = static_cast<double>(j) - (halfTaps - 1.0) - frac;
+                const double sinc = std::sin(tpPi * d) / (tpPi * d);
+                const double u = d / halfTaps;
+                const double w = besselI0(kBeta * std::sqrt(std::max(0.0, 1.0 - u * u))) / norm;
+                taps[j] = sinc * w;
+                sum += taps[j];
+            }
+            for (int j = 0; j < kTpTaps; ++j)
+                tpCoeffs_[p][j] = static_cast<T>(taps[j] / sum);
+        }
+    }
+
+    /** Raises m to the vertex of the parabola through (a, b, c) when b is a
+     *  local maximum of the magnitude there. No multiply feeds an add, so the
+     *  result does not depend on floating-point contraction. */
+    [[nodiscard]] static inline T refineVertex(T a, T b, T c, T m) noexcept
+    {
+        const T ab = std::abs(b);
+        const T d = (a + c) - (b + b);
+        if (ab >= std::abs(a) && ab >= std::abs(c) && b * d < T(0))
+        {
+            const T q = c - a;
+            const T v = std::abs(b - (q * q) / (T(8) * d));
+            if (v > m) m = v;
+        }
+        return m;
+    }
+
+    /** Appends n (<= kChunk) samples of channel ch to its estimator history
+     *  and raises peak[i] to the true-peak reading of each: the long-kernel
+     *  estimate and the ITU-R BS.1770 Annex 2 one (so an Annex 2 meter also
+     *  reads the output at or below the ceiling; the shared coefficients come
+     *  from Core/TruePeakDetector.h). The per-sample path calls it with
+     *  n == 1; every output runs the same arithmetic either way. */
+    void detectTruePeak(const T* x, int n, int ch, T* peak) noexcept
+    {
+        T* h = tpHist_.data() + static_cast<size_t>(ch) * kTpStride;
+        int& fill = tpFill_[ch];
+        if (fill + n > kChunk)
+        {
+            std::copy(h + fill, h + fill + (kTpTaps - 1), h); // keep the last kTpTaps - 1 samples
+            fill = 0;
+        }
+        std::copy(x, x + n, h + (kTpTaps - 1) + fill);
+        const T* base = h + fill;
+        for (int p = 0; p < kTpPhases; ++p)
+            simd::firCorrelate(base, tpCoeffs_[p], kTpTaps, tpPhase_[p], n, T(1));
+
+        // BS.1770 Annex 2 phases over the newest kAnnexTaps samples.
+        const T* annexBase = base + (kTpTaps - kAnnexTaps);
+        for (int p = 0; p < kAnnexPhases; ++p)
+        {
+            simd::firCorrelate(annexBase, Annex::getReversedPhase(p), kAnnexTaps, tpPhase_[kTpPhases], n, T(1));
+            for (int i = 0; i < n; ++i)
+                peak[i] = std::max(peak[i], std::abs(tpPhase_[kTpPhases][i])); // NaN is ignored
+        }
+        T last = tpLast_[ch];
+        for (int i = 0; i < n; ++i)
+        {
+            const T a0 = base[i + kTpTaps / 2 - 1];
+            const T a4 = base[i + kTpTaps / 2];
+            const T y1 = tpPhase_[0][i], y2 = tpPhase_[1][i], y3 = tpPhase_[2][i];
+            T m = std::max(std::max(std::abs(a0), std::abs(a4)),
+                           std::max(std::abs(y2), std::max(std::abs(y1), std::abs(y3))));
+            m = refineVertex(last, a0, y1, m);
+            m = refineVertex(a0, y1, y2, m);
+            m = refineVertex(y1, y2, y3, m);
+            m = refineVertex(y2, y3, a4, m);
+            last = y3;
+            peak[i] = std::max(peak[i], m); // NaN is ignored
+        }
+        tpLast_[ch] = last;
+        fill += n;
+    }
+
+    using Annex = TruePeakDetector<T, 1>;
+    static constexpr int kAnnexTaps = Annex::getTaps();
+    static constexpr int kAnnexPhases = Annex::getPhases();
+    static_assert(kAnnexTaps <= kTpTaps, "the BS.1770 window must fit the estimator history");
+
+    /** Refills the estimator histories from the delay lines when true-peak
+     *  detection is switched on mid-stream (they hold every recent input
+     *  sample), so the first readings are not formed from stale history. */
+    void seedTruePeakHistory() noexcept
+    {
+        const int nCh = std::min(numChannels_, static_cast<int>(delayLines_.size()));
+        if (tpHist_.size() < static_cast<size_t>(nCh) * kTpStride) return;
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* h = tpHist_.data() + static_cast<size_t>(ch) * kTpStride;
+            for (int k = 0; k < kTpTaps - 1; ++k)
+                h[kTpTaps - 2 - k] = delayLines_[static_cast<size_t>(ch)].read(k);
+            tpFill_[ch] = 0;
+            tpLast_[ch] = T(0);
+        }
+    }
+
+    T tpCoeffs_[kTpPhases][kTpTaps] = {};
+    T tpPhase_[kTpPhases + 1][kChunk] = {};  ///< Phase outputs (+ one Annex 2 phase).
+    std::vector<T> tpHist_;          ///< Per channel: kTpTaps - 1 history + one chunk.
+    int tpFill_[kMaxChannels] = {};  ///< Samples past the history prefix, per channel.
+    T tpLast_[kMaxChannels] = {};    ///< Last three-quarter point, per channel.
+
+    /** Lookahead in samples for a given ms parameter and detection mode
+     *  (shared by the audio-side recompute and getLatency() so both always
+     *  agree exactly). The product is capped in double before the int cast
+     *  (out-of-range casts are UB). True-peak mode needs the estimator's
+     *  kTpDelay samples plus a ramp of at least 16 samples. */
+    [[nodiscard]] int lookaheadSamplesFor(T ms, bool truePeak) const noexcept
     {
         const double clampedMs = std::clamp(static_cast<double>(ms), 0.5, kMaxLookaheadMs);
         const double exact = sampleRate_ * clampedMs / 1000.0;
-        return std::max(1, static_cast<int>(std::min(exact, 1.0e7)));
+        const int samples = std::max(1, static_cast<int>(std::min(exact, 1.0e7)));
+        return truePeak ? std::max(samples, kTpMinLookahead) : samples;
     }
 
-    /** Consumes the published lookahead parameter (audio/setup thread). */
+    /** Consumes the published lookahead and true-peak parameters (audio/setup
+     *  thread). Processing uses the detection mode applied here, so the
+     *  detector and the ramp sized for it always match. */
     inline void applyLookaheadTarget() noexcept
     {
-        lookaheadSamples_ = lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
+        const bool isp = truePeakEnabled_.load(std::memory_order_relaxed);
+        if (isp && !ispApplied_)
+            seedTruePeakHistory();
+        ispApplied_ = isp;
+        lookaheadSamples_ = lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed), ispApplied_);
         configureGainComputer();
     }
 
@@ -564,10 +808,13 @@ protected:
     // lookahead of L samples the audio sample x[p] leaves the delay line at
     // p + L, and the applied gain there is the double moving average of the
     // released envelope e over [p + L - span, p + L]. e never exceeds the
-    // sliding minimum h[n] = min(r[n - L .. n]), so every e in that window is
-    // at or below r[p] whenever span <= L: the ceiling holds by construction.
-    // In ISP mode a true-peak reading at n is formed from x[n - 11 .. n], so
-    // the span shrinks by 11 samples to cover the earliest of them.
+    // sliding minimum h[n] = min(r[n - W + 1 .. n]) with W = L + 1 + hold,
+    // so every e in that window is at or below r[p] whenever span <= L: the
+    // ceiling holds by construction, and each peak's reduction is held for
+    // the hold time after it has passed. In ISP mode a reading at n covers
+    // x[n - kTpDelay .. n] (the long estimator's interval sits kTpDelay - 1
+    // samples back, the BS.1770 estimate inside that range), so the span
+    // shrinks by kTpDelay to cover the earliest of them.
 
     /** Sizes the hold window and the two moving averages for the current
      *  lookahead / ISP mode and rebuilds their running sums from history. */
@@ -575,10 +822,13 @@ protected:
     {
         if (histSize_ == 0) return;
         const int L = std::clamp(lookaheadSamples_, 1, histSize_ - 3);
-        const int isp = truePeakEnabled_.load(std::memory_order_relaxed)
-                      ? TruePeakDetector<T, kMaxChannels>::getTaps() - 1 : 0;
+        const int isp = ispApplied_ ? kTpDelay : 0;
         const int span = std::max(0, L - isp);          // (a - 1) + (b - 1)
-        holdLen_ = L + 1;
+        // EveryPeak: the hold is part of the sliding minimum. Deepest: the
+        // minimum spans the lookahead and the hold counter does the rest.
+        const bool everyPeak = lastHoldMode_ == 1;
+        holdLen_ = std::min(L + 1 + (everyPeak ? holdSamples_ : 0), holdHistSize_ - 1);
+        counterHold_ = everyPeak ? 0 : holdSamples_;
         boxA_ = span / 2 + 1;
         boxB_ = span - (boxA_ - 1) + 1;
         invBoxA_ = 1.0 / static_cast<double>(boxA_);
@@ -615,7 +865,7 @@ protected:
         sufMin_[static_cast<size_t>(holdLen_)] = 1.0; // empty suffix
         for (int j = holdLen_ - 1; j >= 0; --j)
         {
-            m = std::min(m, rHist_[static_cast<size_t>((firstFrame + j) & histMask_)]);
+            m = std::min(m, rHist_[static_cast<size_t>((firstFrame + j) & holdMask_)]);
             sufMin_[static_cast<size_t>(j)] = m;
         }
         blockPos_ = 0;
@@ -648,7 +898,7 @@ protected:
         const double required = std::min(1.0, static_cast<double>(ceiling / peak));
 
         // Exact minimum of r over the last holdLen_ frames (see restartHoldBlock()).
-        rHist_[static_cast<size_t>(frame_ & histMask_)] = required;
+        rHist_[static_cast<size_t>(frame_ & holdMask_)] = required;
         prefixMin_ = std::min(prefixMin_, required);
         const double held = std::min(sufMin_[static_cast<size_t>(blockPos_ + 1)], prefixMin_);
         if (++blockPos_ == holdLen_)
@@ -670,9 +920,11 @@ protected:
             }
             coeff = 1.0 / (1.0 + sampleRate_ * static_cast<double>(relMs * baseFactor) / 1000.0);
         }
-        // Hold: a frame that pushes the envelope down (or keeps it down)
-        // restarts the count; until it runs out the envelope does not rise.
-        if (held <= envelope_) holdLeft_ = holdSamples_;
+        // Hold (Deepest mode): a frame that pushes the envelope down (or keeps
+        // it down) restarts the count; until it runs out the envelope does not
+        // rise. In EveryPeak mode counterHold_ is 0 and the sliding minimum
+        // above already holds every peak.
+        if (held <= envelope_) holdLeft_ = counterHold_;
         else if (holdLeft_ > 0) { --holdLeft_; coeff = 0.0; }
         envelope_ = std::min(held, envelope_ + coeff * (held - envelope_));
         // Program memory: count every frame on which a peak in the hold
@@ -722,16 +974,22 @@ protected:
         }
 
         const T holdMs = holdMs_.load(std::memory_order_relaxed);
-        if (holdMs != lastHoldMs_)
+        const int holdMode = holdMode_.load(std::memory_order_relaxed);
+        if (holdMs != lastHoldMs_ || holdMode != lastHoldMode_)
         {
+            const bool resize = holdMode != lastHoldMode_ || holdMode == 1;
             lastHoldMs_ = holdMs;
+            lastHoldMode_ = holdMode;
             updateHoldSamples();
+            if (resize) configureGainComputer(); // the window holds the hold (EveryPeak)
+            else counterHold_ = holdSamples_;
         }
     }
 
     inline void updateHoldSamples() noexcept
     {
-        holdSamples_ = static_cast<int>(std::lround(std::min(sampleRate_ * static_cast<double>(lastHoldMs_) / 1000.0, 1.0e8)));
+        holdSamples_ = std::clamp(static_cast<int>(std::lround(std::min(sampleRate_ * static_cast<double>(lastHoldMs_) / 1000.0, 1.0e8))),
+                                  0, maxHoldSamples_);
     }
 
     inline void updateReleaseCoefficient() noexcept
@@ -779,7 +1037,12 @@ protected:
     T lastReleaseMs_ = T(-1);
     T lastHoldMs_ = T(-1);
     int holdSamples_ = 0;            ///< Hold length in samples.
+    int maxHoldSamples_ = 2400;      ///< Hold length of kMaxHoldMs.
+    int counterHold_ = 0;            ///< Hold-counter restart value (Deepest mode).
     int holdLeft_ = 0;               ///< Hold samples left before the release may act.
+    int lastHoldMode_ = 0;           ///< Applied HoldMode (0 Deepest, 1 EveryPeak).
+    std::atomic<int> holdMode_ { 0 };
+    bool ispApplied_ = false;        ///< Detection mode the gain computer is sized for.
 
     T currentGain_ = T(1);
     /// Cross-thread metering readout of currentGain_: published once per
@@ -794,7 +1057,9 @@ protected:
     // and the two moving averages, all in double (recursive state).
     static constexpr int kResumPeriod = 1 << 16;
     int histSize_ = 0;
-    int histMask_ = 0;
+    int histMask_ = 0;               ///< Moving-average histories (lookahead).
+    int holdHistSize_ = 0;
+    int holdMask_ = 0;               ///< Required-gain history (lookahead + hold).
     std::vector<double> eHist_;      ///< Released envelope history.
     std::vector<double> avgHist_;    ///< First moving-average output history.
     std::vector<double> rHist_;      ///< Required-gain history.
@@ -814,7 +1079,6 @@ protected:
     T pendingPeak_ = T(0);           ///< Other channels' peaks for the next processSample() frame.
 
     // processBlock() chunk scratch (see its three passes).
-    static constexpr int kChunk = 128;
     T chunkPeak_[kChunk] = {};
     T chunkCeiling_[kChunk] = {};
     T chunkGain_[kChunk] = {};

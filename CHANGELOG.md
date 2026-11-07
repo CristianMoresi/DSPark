@@ -6,6 +6,19 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Limiter::setHoldMode(HoldMode::EveryPeak)` (opt-in, default `Deepest`
+  unchanged and bit-identical): every peak's reduction is held for the hold
+  time after it has passed (an exact sliding minimum over lookahead plus
+  hold), so the gain no longer rises and falls between peaks of unequal
+  height. A 60 Hz + 7 kHz two-tone driven 6 dB over the ceiling: worst
+  sideband -87.1 dBc against -61.7 at the defaults, -84.3 against -69.4 at
+  5 ms lookahead, 15 ms hold and 40 ms release; low-tone THD+N improves too
+  (30 Hz at the defaults: -66.6 against -52.4 dB). The cost is loudness on
+  dense material: 0.45 dB lower driven 12 dB over the ceiling at 5 ms / 15 ms
+  / 40 ms, 0.10 dB at 6 dB over. Saved in the state (`holdMode`; blobs
+  without it load `Deepest`); exposed in DSParkLab.
+- `TruePeakDetector::getPhases()` and `getReversedPhase()`: the official
+  Annex 2 phases for callers that run the interpolator as block FIRs.
 - `FFTReal::inverseStep()` and `getInverseStepCount()`: the inverse transform
   split into its passes (step 0 packs the spectrum), for real-time callers
   that spread a long transform over several callbacks. All steps in order
@@ -234,6 +247,20 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `Limiter` true-peak mode reads every sample interval with a 64-tap 4x
+  reconstruction refined to its local maxima, maxed with the BS.1770 Annex 2
+  estimate it used alone before (which under-reads peaks built from content
+  near the top of the band). On an independent 8x, 128-tap reconstruction
+  at the defaults the output now reaches +0.06 / +0.14 dB over the ceiling on
+  dense mixes driven 12 / 6 dB over it (was +0.93 / +0.57), +0.13 dB on a
+  hard-clipped 5 kHz tone (was +0.77), +0.27 dB on differentiated white noise
+  (was +1.26); an Annex 2 meter still reads at or below the ceiling. True-peak
+  output changes accordingly (the clipped 5 kHz tone comes out 0.64 dB lower,
+  dense mixes 0.07 to 0.11 dB); sample-peak mode is bit-identical. A reading
+  reaches 33 samples back instead of 11, so the attack ramp is 22 samples
+  shorter (60 Hz + 7 kHz intermodulation at the 2 ms default: -58.9 against
+  -61.6 dBc) and the lookahead is at least 49 samples in true-peak mode
+  (`getLatency()` reports it). Cost: 35 against 18 ns per stereo frame.
 - `CrossoverFilter` linear phase (default audio moves within rounding: at most
   2.7e-7, -128.6 dB, on noise): the 4096-tap FIR runs in eight partitions of
   512 instead of four of 1024, and the engine delays its output by two

@@ -1343,6 +1343,35 @@ DSPARK_TEST(Oscillator_setPhase_seeds_triangle_integrator)
     EXPECT_LT(osc.getNextSample(), -0.9f);
 }
 
+DSPARK_TEST(Oscillator_polyblep_rephase_continues_the_free_run)
+{
+    // PolyBLEP (the LFO duty) seeds a re-phased triangle on the leaky
+    // integrator's own steady cycle, so an owner that re-phases a running
+    // LFO every sample (as the Phaser spread glide does) continues the
+    // free-running waveform. The piecewise-linear seed sat up to 12% of full
+    // scale off it mid-slope.
+    for (float rate : { 0.5f, 1.7f, 7.0f, 30.0f })
+    {
+        Oscillator<float> freeRun, rephased;
+        for (auto* o : { &freeRun, &rephased })
+        {
+            o->prepare(48000.0);
+            o->setAntiAliasing(Oscillator<float>::AntiAliasing::PolyBLEP);
+            o->setWaveform(Oscillator<float>::Waveform::Triangle);
+            o->setFrequency(rate);
+            o->reset();   // seeds the free run on its steady cycle
+        }
+        float worst = 0.0f;
+        for (int n = 0; n < 96000; ++n)
+        {
+            rephased.setPhase(freeRun.getPhase());
+            const float a = freeRun.getNextSample(), b = rephased.getNextSample();
+            worst = std::max(worst, std::abs(a - b));
+        }
+        EXPECT_LT(worst, 5e-4f);
+    }
+}
+
 DSPARK_TEST(Oscillator_triangle_free_run_amplitude)
 {
     // The leaky-integrator triangle is normalised to +-1 by the analytic

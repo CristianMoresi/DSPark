@@ -128,6 +128,7 @@
 #endif
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -1352,6 +1353,73 @@ void firCorrelate(const T* x, const T* h, int taps, T* DSPARK_RESTRICT y, int n,
     }
 #endif
     firCorrelateKernel(x, h, taps, y, n, gain);
+}
+
+/**
+ * @brief A bank of block FIRs sharing one input, as valid correlations:
+ *        y[k][i] = sum_j h[j * Banks + k] * x[i + j] for i in [0, n) and each
+ *        bank k, reading x[0 .. n + taps - 1).
+ *
+ * The coefficients are interleaved by tap, so each input sample is loaded
+ * once for all banks. Every output is the multiply-add chain that
+ * firCorrelate() with unit gain computes for that bank alone, in the same
+ * order, so the results are identical to Banks separate firCorrelate() calls
+ * on any target. Outputs must not overlap x or h. Runs on the AVX2+FMA copy
+ * when isRuntimeDispatchActive(), like firCorrelate().
+ *
+ * @tparam Banks Number of banks (a multiple of the vector width, or any count).
+ * @param x    Input, n + taps - 1 samples.
+ * @param h    Interleaved kernels, taps * Banks coefficients.
+ * @param taps Kernel length.
+ * @param y    Banks output pointers, n samples each.
+ * @param n    Number of outputs per bank.
+ */
+template <typename T, int Banks>
+void firCorrelateBank(const T* x, const T* h, int taps, T* const* y, int n) noexcept
+{
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
+    static_assert(Banks >= 1);
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (isRuntimeDispatchActive())
+    {
+        avx2::firCorrelateBankKernel<T, Banks>(x, h, taps, y, n);
+        return;
+    }
+#endif
+    firCorrelateBankKernel<T, Banks>(x, h, taps, y, n);
+}
+
+/**
+ * @brief Sum of a bank of block FIRs over interleaved inputs:
+ *        y[i] = sum_k (sum_j h[j * Banks + k] * m[(i + j) * Banks + k]),
+ *        the outer sum taken in bank order, reading m[0 .. (n + taps - 1) *
+ *        Banks).
+ *
+ * Each bank's inner sum is one multiply-add chain over the taps, as in
+ * firCorrelate(). Inputs and coefficients are both interleaved by bank, so
+ * every load is a contiguous vector. y must not overlap m or h. Runs on the
+ * AVX2+FMA copy when isRuntimeDispatchActive().
+ *
+ * @tparam Banks Number of banks.
+ * @param m    Interleaved inputs, (n + taps - 1) * Banks samples.
+ * @param h    Interleaved kernels, taps * Banks coefficients.
+ * @param taps Kernel length.
+ * @param y    Output, n samples.
+ * @param n    Number of outputs.
+ */
+template <typename T, int Banks>
+void firCorrelateBankSum(const T* m, const T* h, int taps, T* DSPARK_RESTRICT y, int n) noexcept
+{
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
+    static_assert(Banks >= 1);
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (isRuntimeDispatchActive())
+    {
+        avx2::firCorrelateBankSumKernel<T, Banks>(m, h, taps, y, n);
+        return;
+    }
+#endif
+    firCorrelateBankSumKernel<T, Banks>(m, h, taps, y, n);
 }
 
 } // namespace simd

@@ -37,35 +37,91 @@ enum class Exterior
     Matched
 };
 
+// Native-rate band of the clipping correction. At factor 1 the cubic B-spline
+// average is the only anti-alias kernel, and its compensation restores the
+// correction right up to Nyquist, where distortion folded from just above
+// Nyquist lands; near Nyquist the compensated linear branch also departs from
+// unity and leaks the per-sample residual. A symmetric Kaiser low-pass (flat
+// within 0.01 dB to 0.40 fs, -6 dB at 0.43 fs, below -65 dB from 0.46 fs)
+// bands the whole correction instead: the residual branch is filtered by it
+// and the linear branch becomes (1 - band) + band * linear, so the correction
+// fades to none, not to the naive residual. Measured on a sine clipped by
+// 6 dB at 48 kHz, the full-band alias floor goes from -54.2 / -26.6 dB to
+// -64.6 / -62.1 dB at 1 / 5 kHz, with the harmonic error below 20 kHz
+// unchanged; distortion above 0.40 fs, which the native rate cannot tell
+// from its aliases, is attenuated with them. The source itself is never
+// filtered: unclipped PCM stays exact, and so does its own content near
+// Nyquist. The matched exterior, which integrates the complete shaped signal,
+// keeps the unbanded compensation for the same reason.
+struct NativeResidualBand
+{
+    static constexpr int half = 32;          ///< One-sided length in native samples.
+    static constexpr double cutoff = 0.43;   ///< -6 dB point, fraction of the native rate.
+    static constexpr double beta = 6.0;      ///< Kaiser shape.
+    [[nodiscard]] static std::vector<double> taps()
+    {
+        return FIRDesign<double>::lowPass(1., cutoff, 2 * half + 1, beta);
+    }
+    [[nodiscard]] static std::vector<double> convolve(const std::vector<double> &a,
+                                                      const std::vector<double> &b)
+    {
+        std::vector<double> out(a.size() + b.size() - 1);
+        for (std::size_t i = 0; i < a.size(); ++i)
+            for (std::size_t j = 0; j < b.size(); ++j)
+                out[i + j] += a[i] * b[j];
+        return out;
+    }
+};
+
 // Shared reconstructed clipping stage. Both branches use the same interpolation,
-// B-spline moments and compensation. The source/projection boundary policy is
-// supplied by BoundedClip; this stage alone does not perform sample-rate conversion.
+// B-spline moments and compensation (banded at factor 1, see
+// NativeResidualBand). The source/projection boundary policy is supplied by
+// BoundedClip; this stage alone does not perform sample-rate conversion.
 template <ClipperCurve C> class ReconstructedStage final
 {
     static constexpr int degree = 11;
     continuous_clip::Residual<C, degree, true> residual_;
     continuous_clip::Residual<C, degree, false, false> direct_;
-    FIRFilter<double> eq_, linear_;
-    int order_, filterSize_;
+    FIRFilter<double> eq_, linear_, bandEq_, bandLinear_;
+    int order_, pad_, filterSize_;
 
   public:
     ReconstructedStage(OfflineSession &job, int factor)
-        : order_(factor <= 2 ? 18 : 10), filterSize_(2 * order_ + degree + 4)
+        : order_(factor <= 2 ? 18 : 10), pad_(factor == 1 ? NativeResidualBand::half : 0),
+          filterSize_(2 * (order_ + pad_) + degree + 4)
     {
-        const int tapsSize = 2 * order_ + 1, linearSize = degree + 4;
-        job.charge(static_cast<std::size_t>(6 * (order_ + 1) + (order_ + 2) * tapsSize +
-                                            linearSize + filterSize_) *
+        const int tapsSize = 2 * (order_ + pad_) + 1, linearSize = degree + 4;
+        const int filters = pad_ ? 2 : 1;
+        const int bandTemporaries = pad_ ? (2 * pad_ + 1) + tapsSize + 2 * filterSize_ : 0;
+        job.charge(static_cast<std::size_t>(6 * (order_ + 1) + (order_ + 2) * (2 * order_ + 1) +
+                                            linearSize + filterSize_ + bandTemporaries) *
                        sizeof(double) +
                    static_cast<std::size_t>(order_ + 24) * 64 +
-                   static_cast<std::size_t>(tapsSize + filterSize_) *
+                   static_cast<std::size_t>(filters * (tapsSize + filterSize_)) *
                        (sizeof(std::atomic<double>) + 4 * sizeof(double)) +
-                   2 * sizeof(int));
-        const auto taps = continuous_clip::inverseBoxPower(order_),
-                   linear = residual_.linearKernel();
-        std::vector<double> h(taps.size() + linear.size() - 1);
-        for (std::size_t i = 0; i < taps.size(); ++i)
-            for (std::size_t j = 0; j < linear.size(); ++j)
-                h[i + j] += taps[i] * linear[j];
+                   3 * sizeof(int));
+        auto taps = continuous_clip::inverseBoxPower(order_);
+        const auto linear = residual_.linearKernel();
+        if (pad_)
+        {
+            const auto band = NativeResidualBand::taps();
+            const auto bandTaps = NativeResidualBand::convolve(band, taps);
+            auto bandLinear = NativeResidualBand::convolve(bandTaps, linear);
+            // (1 - band) around the linear branch's unit delay.
+            const int centre = delay();
+            bandLinear[static_cast<std::size_t>(centre)] += 1;
+            for (std::size_t j = 0; j < band.size(); ++j)
+                bandLinear[static_cast<std::size_t>(centre - pad_) + j] -= band[j];
+            bandEq_.prepare(tapsSize, 1);
+            bandEq_.setCoefficients(bandTaps);
+            bandLinear_.prepare(filterSize_, 1);
+            bandLinear_.setCoefficients(bandLinear);
+            // The matched branches keep the unbanded compensation, delayed to
+            // the banded branches' centre.
+            taps.insert(taps.begin(), static_cast<std::size_t>(pad_), 0.);
+            taps.insert(taps.end(), static_cast<std::size_t>(pad_), 0.);
+        }
+        const auto h = NativeResidualBand::convolve(taps, linear);
         eq_.prepare(tapsSize, 1);
         eq_.setCoefficients(taps);
         linear_.prepare(filterSize_, 1);
@@ -77,6 +133,11 @@ template <ClipperCurve C> class ReconstructedStage final
         direct_.reset(ceiling);
         eq_.reset();
         linear_.reset();
+        if (pad_)
+        {
+            bandEq_.reset();
+            bandLinear_.reset();
+        }
     }
     [[nodiscard]] int filterSize() const noexcept
     {
@@ -84,7 +145,7 @@ template <ClipperCurve C> class ReconstructedStage final
     }
     [[nodiscard]] int delay() const noexcept
     {
-        return (degree + 1) / 2 + 1 + order_;
+        return (degree + 1) / 2 + 1 + order_ + pad_;
     }
     void process(double *nonlinear, double *reference, int count, Exterior exterior)
     {
@@ -96,8 +157,9 @@ template <ClipperCurve C> class ReconstructedStage final
                 offlineFail(OfflineStatus::NumericalFailure);
         }
         double *a[]{nonlinear}, *b[]{reference};
-        eq_.processBlock({a, 1, count});
-        linear_.processBlock({b, 1, count});
+        const bool banded = pad_ && exterior == Exterior::Linear;
+        (banded ? bandEq_ : eq_).processBlock({a, 1, count});
+        (banded ? bandLinear_ : linear_).processBlock({b, 1, count});
     }
 };
 
@@ -423,7 +485,8 @@ struct TailPlan
 
 template <ClipperCurve C> class TailPolicy
 {
-    double l_ = 0, e_ = 0, radius_ = 0, cubic_ = 0, shapeMaximum_ = 1, shapeGain_ = 1;
+    double l_ = 0, e_ = 0, eLinear_ = 0, radius_ = 0, cubic_ = 0, shapeMaximum_ = 1,
+           shapeGain_ = 1;
     static constexpr int degree = 11;
 
   public:
@@ -435,9 +498,18 @@ template <ClipperCurve C> class TailPolicy
         continuous_clip::Interval<C, degree, true> interval(1.);
         l_ = upper(interval.reconstructionBound() *
                    (1 + 256 * std::numeric_limits<double>::epsilon()));
-        for (double v : continuous_clip::inverseBoxPower(order))
+        const auto compensation = continuous_clip::inverseBoxPower(order);
+        for (double v : compensation)
             e_ = upper(e_ + std::abs(v));
-        radius_ = double(degree + 4 + 2 * order + 2) / factor + 2;
+        // The linear exterior integrates the residual through the banded
+        // compensation at factor 1 (NativeResidualBand), the matched one does not.
+        const int pad = factor == 1 ? NativeResidualBand::half : 0;
+        if (pad)
+            for (double v : NativeResidualBand::convolve(NativeResidualBand::taps(), compensation))
+                eLinear_ = upper(eLinear_ + std::abs(v));
+        else
+            eLinear_ = e_;
+        radius_ = double(degree + 4 + 2 * (order + pad) + 2) / factor + 2;
         if constexpr (C == ClipperCurve::Tanh)
             cubic_ = upper(1. / 3);
         if constexpr (C == ClipperCurve::Sine)
@@ -500,9 +572,9 @@ template <ClipperCurve C> class TailPolicy
                     const double ratio = upper(amplitude / c);
                     // Integral of d^-4; factor4 includes both ends and the
                     // altered boundary strip of the finite evaluation domain.
-                    bound =
-                        upper(upper(upper(4 * e_ * cubic_ / (3 * std::numbers::pi)) * amplitude) *
-                              upper(ratio * ratio));
+                    bound = upper(
+                        upper(upper(4 * eLinear_ * cubic_ / (3 * std::numbers::pi)) * amplitude) *
+                        upper(ratio * ratio));
                 }
             }
             if (bound <= tolerance)

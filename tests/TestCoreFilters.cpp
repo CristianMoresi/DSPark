@@ -12,6 +12,7 @@
 #include "../Analysis/EnvelopeFollower.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -583,6 +584,186 @@ DSPARK_TEST(Ladder_block_matches_per_sample)
         }
         EXPECT_EQ(mismatches, 0);
     }
+}
+
+// ============================================================================
+// LadderFilter - per-stage saturation (Saturation::Stages)
+// ============================================================================
+
+namespace
+{
+// Oversampled RK4 of the per-stage tanh ladder ODE the Stages model solves:
+// dy_i/dt = wc (phi(y_{i-1}) - phi(y_i)), stage-0 input x - k y_4,
+// phi(v) = tanh(d v) / d.
+struct LadderOdeReference
+{
+    double wc, k, d;
+    std::array<double, 4> y{};
+    void deriv(const std::array<double, 4>& v, double x, std::array<double, 4>& dv) const
+    {
+        double prev = std::tanh(d * (x - k * v[3])) / d;
+        for (size_t i = 0; i < 4; ++i)
+        {
+            const double ph = std::tanh(d * v[i]) / d;
+            dv[i] = wc * (prev - ph);
+            prev = ph;
+        }
+    }
+    template <class X> void step(double t, double h, X xin)
+    {
+        std::array<double, 4> k1{}, k2{}, k3{}, k4{}, tmp{};
+        const double x0 = xin(t), xm = xin(t + 0.5 * h), x1 = xin(t + h);
+        deriv(y, x0, k1);
+        for (size_t i = 0; i < 4; ++i) tmp[i] = y[i] + 0.5 * h * k1[i];
+        deriv(tmp, xm, k2);
+        for (size_t i = 0; i < 4; ++i) tmp[i] = y[i] + 0.5 * h * k2[i];
+        deriv(tmp, xm, k3);
+        for (size_t i = 0; i < 4; ++i) tmp[i] = y[i] + h * k3[i];
+        deriv(tmp, x1, k4);
+        for (size_t i = 0; i < 4; ++i) y[i] += h / 6.0 * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
+    }
+};
+
+double ladderHarmonic(const std::vector<double>& s, int perPeriod, int periods, int m)
+{
+    const int n0 = static_cast<int>(s.size()) - perPeriod * periods, n = perPeriod * periods;
+    std::complex<double> acc(0, 0);
+    for (int i = 0; i < n; ++i)
+        acc += s[static_cast<size_t>(n0 + i)] * std::polar(1.0, -twoPi<double> * m * i / perPeriod);
+    return 2.0 * std::abs(acc) / n;
+}
+
+template <class F, class S>
+std::vector<double> ladderRender(F& filter, S, double fs, double fc, double res, double drive, bool stages,
+                                 int total, double f0)
+{
+    filter.prepare(AudioSpec{ fs, 512, 1 });
+    filter.setCutoff(static_cast<S>(fc));
+    filter.setResonance(static_cast<S>(res));
+    filter.setDrive(static_cast<S>(drive));
+    filter.setMode(F::Mode::LP24);
+    filter.setSaturation(stages ? F::Saturation::Stages : F::Saturation::Feedback);
+    std::vector<double> out(static_cast<size_t>(total));
+    for (int n = 0; n < total; ++n)
+        out[static_cast<size_t>(n)] =
+            filter.processSample(static_cast<S>(std::sin(twoPi<double> * f0 * (n + 1) / fs)), 0);
+    return out;
+}
+} // namespace
+
+DSPARK_TEST(Ladder_stages_mode_matches_the_ladder_ode)
+{
+    // Per-stage saturation against a 32x oversampled RK4 of the same ODE,
+    // 110 Hz sine through fc 2 kHz, resonance 0.5, drive 3. The Stages model
+    // tracks the fundamental and third harmonic to a fraction of a dB, in
+    // float and double; the feedback-only model misses the third harmonic by
+    // several dB, the stage distortion it does not model.
+    constexpr double fs = 48000.0, fc = 2000.0, res = 0.5, drive = 3.0;
+    constexpr int perPeriod = 436, periods = 70, measured = 10, os = 32;
+    const int total = perPeriod * periods;
+    const double f0 = fs / perPeriod;
+    auto xin = [&](double t) { return std::sin(twoPi<double> * f0 * t); };
+    LadderOdeReference ode{ twoPi<double> * fc, 4.0 * res, drive };
+    std::vector<double> ref(static_cast<size_t>(total));
+    const double h = 1.0 / (fs * os);
+    for (int n = 0; n < total; ++n)
+    {
+        for (int j = 0; j < os; ++j) ode.step((n * os + j) * h, h, xin);
+        ref[static_cast<size_t>(n)] = ode.y[3];
+    }
+    LadderFilter<double> sd, fd;
+    LadderFilter<float> sf;
+    const auto stagesD = ladderRender(sd, 0.0, fs, fc, res, drive, true, total, f0);
+    const auto stagesF = ladderRender(sf, 0.0f, fs, fc, res, drive, true, total, f0);
+    const auto feedback = ladderRender(fd, 0.0, fs, fc, res, drive, false, total, f0);
+    for (int m : { 1, 3 })
+    {
+        const double r = ladderHarmonic(ref, perPeriod, measured, m);
+        EXPECT_NEAR(20 * std::log10(ladderHarmonic(stagesD, perPeriod, measured, m) / r), 0.0, 0.3);
+        EXPECT_NEAR(20 * std::log10(ladderHarmonic(stagesF, perPeriod, measured, m) / r), 0.0, 0.3);
+    }
+    const double r3 = ladderHarmonic(ref, perPeriod, measured, 3);
+    EXPECT_GT(std::abs(20 * std::log10(ladderHarmonic(feedback, perPeriod, measured, 3) / r3)), 3.0);
+}
+
+DSPARK_TEST(Ladder_stages_self_oscillation_pitch_and_level)
+{
+    // Resonance 1.1 at fc 1 kHz, drive 1, kicked by 1 ms of 0.1: a 128x RK4
+    // of the ladder ODE settles at 979.54 Hz with a 0.1497 peak. The Stages
+    // model lands within a cent and 0.2 dB of that limit cycle.
+    constexpr double fs = 48000.0;
+    LadderFilter<float> f;
+    f.prepare(AudioSpec{ fs, 512, 1 });
+    f.setCutoff(1000.0f);
+    f.setResonance(1.1f);
+    f.setDrive(1.0f);
+    f.setMode(LadderFilter<float>::Mode::LP24);
+    f.setSaturation(LadderFilter<float>::Saturation::Stages);
+    const int total = static_cast<int>(fs * 3), n0 = total - static_cast<int>(fs);
+    std::vector<double> y(static_cast<size_t>(total));
+    for (int n = 0; n < total; ++n)
+        y[static_cast<size_t>(n)] = f.processSample((n + 1) / fs < 1e-3 ? 0.1f : 0.0f, 0);
+    double first = -1, last = -1, peak = 0;
+    int crossings = 0;
+    for (int i = n0; i < total - 1; ++i)
+    {
+        const double a = y[static_cast<size_t>(i)], b = y[static_cast<size_t>(i + 1)];
+        peak = std::max(peak, std::abs(a));
+        if (a <= 0 && b > 0)
+        {
+            const double t = i + a / (a - b);
+            if (first < 0) first = t;
+            last = t;
+            ++crossings;
+        }
+    }
+    EXPECT_TRUE(crossings > 100);
+    if (crossings < 2) return;
+    const double freq = fs * (crossings - 1) / (last - first);
+    EXPECT_NEAR(1200.0 * std::log2(freq / 979.54), 0.0, 1.0);
+    EXPECT_NEAR(20 * std::log10(peak / 0.1497), 0.0, 0.2);
+}
+
+DSPARK_TEST(Ladder_stages_block_matches_per_sample_and_state_round_trips)
+{
+    using L = LadderFilter<double>;
+    L blockF, sampleF;
+    for (auto* f : { &blockF, &sampleF })
+    {
+        f->prepare(AudioSpec{ 48000.0, 512, 1 });
+        f->setCutoff(1500.0);
+        f->setResonance(0.9);
+        f->setDrive(4.0);
+        f->setSaturation(L::Saturation::Stages);
+    }
+    std::vector<double> x(700);
+    uint32_t rng = 0xBEEFu;
+    for (auto& v : x)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        v = ((rng >> 8) * (1.0 / 16777216.0)) - 0.5;
+    }
+    std::vector<double> blockOut = x;
+    for (int at = 0; at < 700; at += 175)
+    {
+        double* part[1]{ blockOut.data() + at };
+        blockF.processBlock(AudioBufferView<double>(part, 1, 175));
+    }
+    double worst = 0;
+    for (size_t i = 0; i < x.size(); ++i)
+        worst = std::max(worst, std::abs(blockOut[i] - sampleF.processSample(x[i], 0)));
+    EXPECT_LT(worst, 1e-12);
+
+    const auto blob = blockF.getState();
+    L restored;
+    restored.prepare(AudioSpec{ 48000.0, 512, 1 });
+    EXPECT_TRUE(restored.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(restored.getSaturation() == L::Saturation::Stages);
+    EXPECT_NEAR(restored.getCutoff(), 1500.0, 1e-9);
+    EXPECT_NEAR(restored.getResonance(), 0.9, 1e-6);
+    EXPECT_NEAR(restored.getDrive(), 4.0, 1e-6);
+    restored.setSaturation(static_cast<L::Saturation>(7));   // wild value
+    EXPECT_TRUE(restored.getSaturation() == L::Saturation::Feedback);
 }
 
 // ============================================================================

@@ -1,8 +1,11 @@
 // DSPark Tests - Stereo generator lifecycle and signal contracts
 #include "../Core/DenormalGuard.h"
+#include "../Core/FIRFilter.h"
 #include "../Core/ProcessorTraits.h"
+#include "../Core/detail/ContinuousStereoColor.h"
 #include "../Effects/StereoGenerator.h"
 #include "dspark_test.h"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -587,4 +590,94 @@ DSPARK_TEST(StereoGenerator_silent_tail_settles_to_exact_zero)
     {
         EXPECT_TRUE(std::isfinite(deltaPeak) && std::isfinite(tailPeak));
     }
+}
+
+namespace
+{
+// The 1x color written as sixteen separate FIRs, the formulation the bank
+// kernels replace: it pins the faster path to the same output.
+template <detail::ClipperCurve C> struct SeparateFirColor
+{
+    static constexpr int powers = detail::stereo_color_coefficients::powers;
+    static constexpr int count = detail::stereo_color_coefficients::moments;
+    std::array<FIRFilter<double>, powers> input;
+    std::array<FIRFilter<double>, count> output;
+    detail::continuous_clip::Interval<C, powers - 1, false, false, count> integral{ .08 };
+    detail::DcBlockState dc{};
+    double pole = 0.9995;
+    SeparateFirColor()
+    {
+        for (int k = 0; k < powers; ++k)
+        {
+            input[size_t(k)].prepare(257, 1);
+            input[size_t(k)].setCoefficients(detail::stereo_color_coefficients::reconstruction[size_t(k)]);
+        }
+        for (int k = 0; k < count; ++k)
+        {
+            output[size_t(k)].prepare(258, 1);
+            output[size_t(k)].setCoefficients(detail::stereo_color_coefficients::projection[0][size_t(k)]);
+        }
+    }
+    void process(double* samples, int size)
+    {
+        std::array<std::vector<double>, powers> scratch;
+        for (int k = 0; k < powers; ++k)
+        {
+            scratch[size_t(k)].assign(samples, samples + size);
+            double* ch = scratch[size_t(k)].data();
+            input[size_t(k)].processBlock({ &ch, 1, size });
+        }
+        for (int i = 0; i < size; ++i)
+        {
+            std::array<double, powers> power{};
+            for (int k = 0; k < powers; ++k) power[size_t(k)] = scratch[size_t(k)][size_t(i)];
+            const auto moments = integral.polynomial(power);
+            for (int k = 0; k < count; ++k) scratch[size_t(k)][size_t(i)] = moments[size_t(k)];
+        }
+        for (int k = 0; k < count; ++k)
+        {
+            double* ch = scratch[size_t(k)].data();
+            output[size_t(k)].processBlock({ &ch, 1, size });
+        }
+        for (int i = 0; i < size; ++i)
+        {
+            double r = 0;
+            for (int k = 0; k < count; ++k) r += scratch[size_t(k)][size_t(i)];
+            samples[i] = detail::dcBlockStep(pole, dc, r);
+        }
+    }
+};
+} // namespace
+
+DSPARK_TEST(StereoGenerator_source_rate_color_matches_separate_fir_formulation)
+{
+    // The 1x color runs both FIR banks as single tap-interleaved passes. The
+    // reconstruction is the same arithmetic as eight separate filters, and
+    // the projection differs from per-sample dot products only in summation
+    // order: within 1e-13 of full scale on loud noise that crosses both knees.
+    DenormalGuard guard;
+    detail::ContinuousStereoColor<detail::ClipperCurve::AsymmetricKnee> color(1);
+    SeparateFirColor<detail::ClipperCurve::AsymmetricKnee> reference;
+    uint32_t rng = 0xC0102u;
+    double worst = 0, peak = 0;
+    for (int size : { 256, 100, 31, 256, 1, 200 })
+    {
+        std::vector<double> a(static_cast<size_t>(size));
+        for (auto& v : a)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            v = 0.6 * (((rng >> 8) * (1.0 / 16777216.0)) - 0.5);
+        }
+        std::vector<double> b = a;
+        double* ch = a.data();
+        color.process({ &ch, 1, size });
+        reference.process(b.data(), size);
+        for (int i = 0; i < size; ++i)
+        {
+            worst = std::max(worst, std::abs(a[size_t(i)] - b[size_t(i)]));
+            peak = std::max(peak, std::abs(b[size_t(i)]));
+        }
+    }
+    EXPECT_GT(peak, 1e-3);
+    EXPECT_LT(worst, 1e-13);
 }

@@ -6,6 +6,26 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `LadderFilter::setSaturation(Saturation::Stages)` (opt-in, default
+  `Feedback` unchanged and bit-identical): every stage saturates and the
+  delay-free loop is solved implicitly (clipped Newton in double, 1.8 steps
+  on average). Against a 128x oversampled RK4 of the same ladder equations
+  the harmonics land within 0.23 dB up to a 2 kHz cutoff (1.6 dB at 8 kHz),
+  in float and double; self-oscillation at resonance 1.1 is within 0.1 cent
+  and 0.07 dB at 1 kHz. Resonance accepts up to 1.2 (Feedback still uses at
+  most 1). Costs 52-103 ns per sample and channel against 10-19 ns. The
+  filter gains `getState()`/`setState()` with the model in its state.
+- `Smoothers::HermiteSmoother`: a cubic glide that lands exactly after the
+  ramp time with a continuous slope, also when retargeted. At equal ramp
+  time its zipper on a filter sweep is -68.3 dB against -53.8 dB for the
+  linear ramp; about 1 ns per sample.
+- `Biquad::processRampCore()`: filters a run while its coefficients move
+  linearly per sample between two designs.
+- `simd::firCorrelateBank()` and `simd::firCorrelateBankSum()`: banks of
+  FIRs over one shared input, or summed over interleaved inputs, in one
+  pass over tap-interleaved coefficients. The bank is bit-identical to
+  separate `firCorrelate()` calls; both run on the AVX2 copy when the
+  run-time dispatch is active.
 - Plugin layer: `MidiEvent::choke`. A CLAP NOTE_CHOKE (a host choke group
   cutting a voice) arrives as a `NoteOff` with `choke` set, so a plugin can
   end the voice at once instead of running its release; a plugin that
@@ -99,6 +119,33 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `FilterEngine` glides (default audio changes while a cutoff, Q or gain
+  moves; settled output is bit-identical): the cutoff follows a monotonic
+  cubic in log frequency that arrives exactly 165 ms after a change (10-90%
+  in 100 ms) instead of a critically damped glide that took 331 ms to come
+  within 1 cent, and the chunk-rate coefficient designs are interpolated
+  sample by sample. On a 10 kHz to 500 Hz glide over noise the output is
+  -94.5 dB from a per-sample design (-39.1 dB before); a tone under a glide
+  carries chunk-rate sidebands of -120 dB at most (-55.7 dB before). The
+  gliding path costs 6.2 instead of 9.4 ns per sample.
+- `OfflineHardClipper`/`OfflineSoftClipper` at oversampling factor 1 (not the
+  default 4; factors 2 and above are bit-identical): the clipping correction
+  is band-limited, flat to 0.40 fs and below -65 dB from 0.46 fs. A 5 kHz
+  sine clipped by 6 dB at 48 kHz has a full-band alias floor of -62.1 dB
+  (-26.6 dB before; -64.6 against -54.2 dB at 1 kHz; Sine curve -79 against
+  -32 dB), with the harmonics below 20 kHz unchanged. Distortion above 0.40
+  fs is attenuated with the aliases it cannot be told apart from at the
+  native rate.
+- `StereoGenerator` at its default factor 1 runs its two FIR banks as single
+  interleaved passes: 375 instead of 590 ns per stereo frame at low level
+  with the AVX2 dispatch (728 instead of 1004 on SSE2). Float output is
+  bit-identical over 10.75 M measured samples; double output differs by at
+  most 4.4e-16.
+- `SmoothedValue` Chase: 99% of a step now arrives at the ramp time at every
+  sample rate (it took about 171 ms whatever the ramp time). No built-in
+  effect uses Chase.
+- `DspMath`: each fast approximation documents its measured error bound,
+  range and speed; no code change.
 - `OfflineSoftClipper<float>`: the analysis padding is sized for a 1e-9
   omitted tail instead of 1e-10 (`kTailTolerance`). The output differs by at
   most 3 ulp, at -149 dB re peak, and Sine/Tanh renders run 2.2x faster on
@@ -168,6 +215,16 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `Phaser`: a stereo spread change jumped the right LFO phase in one sample;
+  its second difference reached 1311 times the effect's steady value. The
+  offset now glides over 0.1 s (1.25 times at most). Default audio changes
+  only while the spread moves.
+- `Oscillator` with PolyBLEP (the LFO duty of `Phaser` and `Chorus`): a reset
+  or re-phased triangle was seeded on straight lines, up to 0.12 of full
+  scale off the leaky integrator's real cycle, and eased back over seconds
+  at LFO rates. It is now seeded on that cycle (within 1.1e-4 at 0.5-30 Hz).
+  Triangle LFO output changes after a reset or re-phase; sine and minBLEP
+  oscillators are unchanged.
 - VST3: a plugin that opts out of sample-accurate automation receives every
   MIDI controller value through `IMidiMapping`, each with its sample
   offset (1 of 4 CC points in a block reached it before; CLAP and AU raw

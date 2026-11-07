@@ -72,6 +72,9 @@ public:
 
     static constexpr int kMaxStages = 12;
 
+    /** @brief Duration of the right-LFO phase glide after a spread change. */
+    static constexpr double kSpreadGlideSeconds = 0.1;
+
     // -- Lifecycle --------------------------------------------------------------
 
     /**
@@ -163,16 +166,33 @@ protected:
         lfoR_.setFrequency(rate_.load(std::memory_order_relaxed));
         lfoR_.setWaveform(lfoWaveform_.load(std::memory_order_relaxed));
 
-        // Re-phase the right-channel LFO when the spread changes (audio thread
-        // only; Oscillator state is not thread-safe).
+        // A spread change moves the right-channel LFO's phase offset on the
+        // audio thread (Oscillator state is not thread-safe). The first block
+        // after prepare()/reset() starts on the spread; later changes glide
+        // the offset linearly over kSpreadGlideSeconds, sample by sample, so
+        // the right channel's allpass coefficients never step. (Re-phasing in
+        // one go stepped them: a second difference up to 455 times the
+        // effect's own on a 60 Hz tone.)
         if (std::abs(spreadVal - lastSpread_) > T(0.0001))
         {
+            spreadTarget_ = 0.5 * static_cast<double>(spreadVal);
+            if (lastSpread_ < T(0))
+            {
+                spreadOffset_ = spreadTarget_;
+                spreadGlideLeft_ = 0;
+                T ph = lfo_.getPhase() + static_cast<T>(spreadOffset_);
+                ph -= std::floor(ph);
+                lfoR_.setPhase(ph);
+            }
+            else
+            {
+                spreadGlideLeft_ = std::max(1, static_cast<int>(kSpreadGlideSeconds * spec_.sampleRate + 0.5));
+                spreadStep_ = (spreadTarget_ - spreadOffset_) / spreadGlideLeft_;
+            }
             lastSpread_ = spreadVal;
-            T ph = lfo_.getPhase() + spreadVal * T(0.5);
-            ph -= std::floor(ph);
-            lfoR_.setPhase(ph);
         }
-        const bool useSpread = (spreadVal > T(0.0001)) && (nCh >= 2);
+        const bool useSpread = (spreadVal > T(0.0001) || spreadGlideLeft_ > 0 || spreadOffset_ > 0.0)
+                            && (nCh >= 2);
 
         // Stages activated by a live increase start from cleared state: their
         // history is from whenever they were last active (arbitrarily old),
@@ -210,6 +230,15 @@ protected:
             // Parameter smoothing (1-pole lowpass) to prevent zipper noise
             currentDepth_ += smoothCoef_ * (targetDepth - currentDepth_);
             currentFb_    += smoothCoef_ * (targetFb - currentFb_);
+
+            if (spreadGlideLeft_ > 0)
+            {
+                // Lands exactly on the target on the glide's last sample.
+                spreadOffset_ = (--spreadGlideLeft_ == 0) ? spreadTarget_ : spreadOffset_ + spreadStep_;
+                double ph = static_cast<double>(lfo_.getPhase()) + spreadOffset_;
+                ph -= std::floor(ph);
+                lfoR_.setPhase(static_cast<T>(ph));
+            }
 
             const T cL = coeffFromLfo(lfo_.getNextSample());
             const T lfoRVal = lfoR_.getNextSample(); // keep phase advancing always
@@ -266,7 +295,9 @@ public:
 
         lfo_.reset();
         lfoR_.reset();
-        lastSpread_ = T(-1); // force re-phase of the spread LFO on next block
+        lastSpread_ = T(-1); // the next block starts on the spread (no glide)
+        spreadOffset_ = 0.0;
+        spreadGlideLeft_ = 0;
         mixer_.reset();
     }
 
@@ -332,7 +363,10 @@ public:
      *
      * Offsets the right channel's LFO phase against the left, like classic
      * hardware stereo phasers. 0 = mono-coherent sweep (both channels move
-     * together), 1 = fully opposed (180-degree) sweep.
+     * together), 1 = fully opposed (180-degree) sweep. A change while
+     * running glides the offset over kSpreadGlideSeconds (0.1 s), so the
+     * sweep never jumps; after prepare() or reset() the first block starts
+     * on the set spread.
      *
      * @param amount Spread amount [0.0, 1.0]. Applied on the audio thread.
      *               Non-finite values are ignored.
@@ -462,6 +496,10 @@ protected:
     T currentFb_    { T(0) };
     T smoothCoef_   { T(0.01) };
     T lastSpread_   { T(-1) };
+    double spreadOffset_ { 0.0 };   ///< Current right-LFO phase offset (cycles).
+    double spreadTarget_ { 0.0 };   ///< Offset the glide lands on (cycles).
+    double spreadStep_   { 0.0 };   ///< Per-sample offset increment of the glide.
+    int spreadGlideLeft_ { 0 };     ///< Samples left in the glide (0 = settled).
     int lastStages_ { kMaxStages }; // audio-thread: clears newly activated stages
 
     struct FirstOrderAllpass

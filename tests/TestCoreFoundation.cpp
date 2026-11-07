@@ -218,6 +218,45 @@ DSPARK_TEST(DspMath_fastSin_is_minimax_accurate)
     EXPECT_NEAR(fastCos(0.0), 1.0, 1e-15);
 }
 
+// Pins the error bounds documented on each fast approximation in DspMath.h,
+// with a small margin over the measured worst case.
+DSPARK_TEST(DspMath_fast_approximations_meet_documented_bounds)
+{
+    double tanhErr = 0.0, tanhPeak = 0.0, tanErr = 0.0, tanEdgeErr = 0.0;
+    for (int i = -60000; i <= 60000; ++i)
+    {
+        const double x = i * 5e-5;   // |x| <= 3
+        tanhErr = std::max(tanhErr, std::abs(double(fastTanh(float(x))) - std::tanh(double(float(x)))));
+        tanhErr = std::max(tanhErr, std::abs(fastTanh(x) - std::tanh(x)));
+        tanhPeak = std::max(tanhPeak, std::abs(fastTanh(x * 7.0)));   // clamp region
+        const double t = i * (1.45 / 60000.0);
+        tanErr = std::max(tanErr, std::abs(fastTan(t) / std::tan(t) - 1.0) * (t != 0.0));
+        const double te = 1.45 + std::abs(i) * (0.07 / 60000.0);    // 1.45 .. 1.52
+        tanEdgeErr = std::max(tanEdgeErr, std::abs(fastTan(te) / std::tan(te) - 1.0));
+    }
+    EXPECT_LT(tanhErr, 4.1e-4);
+    EXPECT_LT(tanhPeak, 0.99546);
+    EXPECT_LT(tanErr, 4.3e-5);
+    EXPECT_LT(tanEdgeErr, 1.7e-4);
+
+    double expF = 0.0, expD = 0.0, cosF = 0.0, logF = 0.0;
+    for (int i = -40000; i <= 40000; ++i)
+    {
+        const float xf = static_cast<float>(i * 2e-3);              // |x| <= 80
+        expF = std::max(expF, std::abs(double(fastExp(xf)) / std::exp(double(xf)) - 1.0));
+        const double xd = i * 1.75e-2;                              // |x| <= 700
+        expD = std::max(expD, std::abs(fastExp(xd) / std::exp(xd) - 1.0));
+        const float c = static_cast<float>(i * (3.14159 / 40000.0)); // |x| <= pi
+        cosF = std::max(cosF, std::abs(double(fastCos(c)) - std::cos(double(c))));
+        const float l = static_cast<float>(std::pow(10.0, i * (30.0 / 40000.0)));  // 1e-30..1e30
+        logF = std::max(logF, std::abs(double(fastLog(l)) / std::log(double(l)) - 1.0) * (l != 1.0f));
+    }
+    EXPECT_LT(expF, 4.0e-6);
+    EXPECT_LT(expD, 6.0e-14);
+    EXPECT_LT(cosF, 3.5e-7);
+    EXPECT_LT(logF, 2.7e-7);
+}
+
 DSPARK_TEST(DspMath_wrapPhase_stays_in_range_for_large_phases)
 {
     // Regression: for large phases the k * twoPi product can overshoot the
@@ -1354,4 +1393,59 @@ DSPARK_TEST(SimdOps_runtime_dispatch_matches_the_baseline)
                   }),
                   1e-6);
     }
+}
+
+namespace
+{
+template <typename T> void checkFirBanks()
+{
+    constexpr int banks = 8, taps = 257;
+    uint32_t rng = 0x5EEDu;
+    const auto next = [&] {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<T>(((rng >> 8) * (1.0 / 16777216.0)) - 0.5);
+    };
+    std::vector<T> x(taps - 1 + 256), h(static_cast<size_t>(taps) * banks), m((taps - 1 + 256) * banks);
+    for (auto& v : x) v = next();
+    for (auto& v : h) v = next();
+    for (auto& v : m) v = next();
+    for (int n : { 1, 7, 37, 256 })
+    {
+        // Bank of FIRs over one input == separate firCorrelate() calls, bit for bit.
+        std::vector<std::vector<T>> bank(banks, std::vector<T>(static_cast<size_t>(n)));
+        std::array<T*, banks> out{};
+        for (int k = 0; k < banks; ++k) out[static_cast<size_t>(k)] = bank[static_cast<size_t>(k)].data();
+        simd::firCorrelateBank<T, banks>(x.data(), h.data(), taps, out.data(), n);
+        std::vector<T> one(taps), single(static_cast<size_t>(n)), sum(static_cast<size_t>(n), T(0));
+        std::vector<T> lane(static_cast<size_t>(taps - 1 + n));
+        bool same = true;
+        for (int k = 0; k < banks; ++k)
+        {
+            for (int j = 0; j < taps; ++j) one[static_cast<size_t>(j)] = h[static_cast<size_t>(j * banks + k)];
+            simd::firCorrelate(x.data(), one.data(), taps, single.data(), n, T(1));
+            for (int i = 0; i < n; ++i) same = same && single[static_cast<size_t>(i)] == bank[static_cast<size_t>(k)][static_cast<size_t>(i)];
+            // Bank sum over interleaved inputs == the per-bank FIRs summed in bank order.
+            for (int i = 0; i < taps - 1 + n; ++i) lane[static_cast<size_t>(i)] = m[static_cast<size_t>(i * banks + k)];
+            simd::firCorrelate(lane.data(), one.data(), taps, single.data(), n, T(1));
+            for (int i = 0; i < n; ++i) sum[static_cast<size_t>(i)] += single[static_cast<size_t>(i)];
+        }
+        std::vector<T> fused(static_cast<size_t>(n));
+        simd::firCorrelateBankSum<T, banks>(m.data(), h.data(), taps, fused.data(), n);
+        for (int i = 0; i < n; ++i) same = same && fused[static_cast<size_t>(i)] == sum[static_cast<size_t>(i)];
+        EXPECT_TRUE(same);
+    }
+}
+} // namespace
+
+DSPARK_TEST(SimdOps_fir_banks_match_separate_firs_exactly)
+{
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    for (bool active : { false, true })
+    {
+        if (active && !simd::runtimeDispatchSupported()) continue;
+        simd::setRuntimeDispatch(active);
+        checkFirBanks<float>();
+        checkFirBanks<double>();
+    }
+    simd::setRuntimeDispatch(dispatch);
 }

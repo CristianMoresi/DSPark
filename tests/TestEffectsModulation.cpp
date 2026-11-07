@@ -752,6 +752,50 @@ DSPARK_TEST(Phaser_silence)
     EXPECT_SILENT(tb.ch(0), 512, 1e-6f);
 }
 
+DSPARK_TEST(Phaser_stereo_spread_change_is_click_free)
+{
+    // A spread change used to jump the right LFO phase in one sample: the
+    // largest second difference of the right output around the change was
+    // hundreds of times the effect's own steady value. The offset now glides
+    // over 0.1 s, so the change stays within the steady-state curvature.
+    for (int wave : { 0, 3 })
+    {
+        constexpr double fs = 48000.0;
+        constexpr int block = 256, changeBlock = 100 + int(1.2 * fs / 0.5 / block);
+        Phaser<float> p;
+        p.prepare(AudioSpec{ fs, block, 2 });
+        p.setRate(0.5f);
+        p.setDepth(1.0f);
+        p.setFeedback(0.7f);
+        p.setMix(1.0f);
+        p.setStages(6);
+        p.setLfoWaveform(static_cast<Oscillator<float>::Waveform>(wave));
+        p.setStereoSpread(0.0f);
+        std::vector<float> l(block), r(block);
+        float* ch[2] = { l.data(), r.data() };
+        double steady = 0, change = 0;
+        float p1 = 0, p2 = 0;
+        long n = 0;
+        for (int b = 0; b < changeBlock + 40; ++b)
+        {
+            if (b == changeBlock) p.setStereoSpread(1.0f);
+            for (int i = 0; i < block; ++i, ++n)
+                l[size_t(i)] = r[size_t(i)] = 0.5f * float(std::sin(twoPi<double> * 60.0 * double(n) / fs));
+            p.processBlock(AudioBufferView<float>(ch, 2, block));
+            for (int i = 0; i < block; ++i)
+            {
+                const double d2 = std::abs(r[size_t(i)] - 2 * p1 + p2);
+                p2 = p1;
+                p1 = r[size_t(i)];
+                if (b >= 100 && b < changeBlock) steady = std::max(steady, d2);
+                if (b >= changeBlock) change = std::max(change, d2);
+            }
+        }
+        EXPECT_GT(steady, 0.0);
+        EXPECT_LT(change, 1.5 * steady);
+    }
+}
+
 // ============================================================================
 // AlgorithmicReverb
 // ============================================================================

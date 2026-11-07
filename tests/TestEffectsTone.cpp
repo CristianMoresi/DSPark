@@ -211,6 +211,85 @@ DSPARK_TEST(FilterEngine_no_NaN)
     EXPECT_NO_NAN(tb.ch(0), 4096);
 }
 
+namespace
+{
+// Hann-windowed DFT energy of x[first, first + n) summed over [lo, hi] Hz.
+double glideBandEnergy(const std::vector<float>& x, int first, int n, double lo, double hi, double fs)
+{
+    double sum = 0.0;
+    const double step = fs / n;
+    for (double f = lo; f <= hi; f += step)
+    {
+        std::complex<double> a = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double w = 0.5 - 0.5 * std::cos(twoPi<double> * i / (n - 1));
+            a += w * static_cast<double>(x[static_cast<size_t>(first + i)]) *
+                 std::polar(1.0, -twoPi<double> * f * i / fs);
+        }
+        sum += std::norm(a);
+    }
+    return sum;
+}
+} // namespace
+
+DSPARK_TEST(FilterEngine_cutoff_glide_has_no_chunk_rate_sidebands)
+{
+    // Glides design coefficients every 16 samples. Stepping them there put
+    // chunk-rate sidebands on a tone at -55 dB; interpolating them sample by
+    // sample between the designs leaves no sideband above -90 dB.
+    const double fs = 48000.0;
+    for (float target : { 1500.0f, 8000.0f })
+    {
+        FilterEngine<float> fe;
+        fe.prepare(AudioSpec{ fs, 512, 1 });
+        fe.setLowPass(target == 1500.0f ? 8000.0f : 1500.0f, 0.707f, 24);
+        fe.applyParametersNow();
+        std::vector<float> x(8192);
+        for (size_t n = 0; n < x.size(); ++n)
+            x[n] = 0.5f * static_cast<float>(std::sin(twoPi<double> * 300.0 * static_cast<double>(n) / fs));
+        fe.setFrequency(target);
+        for (int o = 0; o < 8192; o += 512)
+        {
+            float* ch[1] = { x.data() + o };
+            fe.processBlock(AudioBufferView<float>(ch, 1, 512));
+        }
+        const double side = glideBandEnergy(x, 0, 4096, 2000.0, 4000.0, fs);
+        const double tone = glideBandEnergy(x, 0, 4096, 250.0, 350.0, fs);
+        EXPECT_LT(10.0 * std::log10(side / tone), -90.0);
+    }
+}
+
+DSPARK_TEST(FilterEngine_cutoff_glide_lands_in_its_ramp_time)
+{
+    // The cutoff glide is a cubic that arrives exactly 165 ms after the
+    // change; the critically damped glide it replaced was still tens of
+    // cents away then (1 cent at 331 ms). A 500 Hz tone at the new low-pass
+    // cutoff reads its settled level from 170 ms on.
+    const double fs = 48000.0;
+    FilterEngine<float> fe;
+    fe.prepare(AudioSpec{ fs, 480, 1 });
+    fe.setLowPass(10000.0f, 0.707f, 12);
+    fe.applyParametersNow();
+    std::vector<float> x(48000);
+    for (size_t n = 0; n < x.size(); ++n)
+        x[n] = 0.25f * static_cast<float>(std::sin(twoPi<double> * 500.0 * static_cast<double>(n) / fs));
+    fe.setFrequency(500.0f);
+    for (int o = 0; o < 48000; o += 480)
+    {
+        float* ch[1] = { x.data() + o };
+        fe.processBlock(AudioBufferView<float>(ch, 1, 480));
+    }
+    auto rms = [&](int first, int n) {
+        double s = 0.0;
+        for (int i = first; i < first + n; ++i) s += double(x[size_t(i)]) * double(x[size_t(i)]);
+        return std::sqrt(s / n);
+    };
+    // 960 samples = ten periods of 500 Hz.
+    const double early = rms(8160, 960), settled = rms(40000, 960);
+    EXPECT_NEAR(20.0 * std::log10(early / settled), 0.0, 0.02);
+}
+
 // ============================================================================
 // Equalizer
 // ============================================================================

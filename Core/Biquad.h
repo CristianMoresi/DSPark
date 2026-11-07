@@ -1045,6 +1045,55 @@ public:
     }
 
     /**
+     * @brief Runs n samples of one channel through the filter while the
+     *        coefficients move linearly, in the core's own precision (double).
+     *
+     * Sample k (0-based) of @p data uses c0 + (k + 1) * step (accumulated, so
+     * within a few ulps of the product over a short run): the coefficient
+     * path of a glide interpolated between two designs, held in registers
+     * instead of being written to the active set every sample. With a zero
+     * step this is processSampleCore() on each sample with c0 as the active
+     * set. On return the active set is the last coefficients used.
+     *
+     * Caller: the stream owner, as for setCoeffsNow(); an owner that ramps
+     * is the audio-modulated master of the instance, and pending setCoeffs()
+     * publications are not adopted here.
+     *
+     * @pre channel must be in [0, MaxChannels); data holds n samples.
+     *
+     * @param data    Samples, filtered in place.
+     * @param n       Number of samples.
+     * @param channel Channel index (0-based).
+     * @param c0      Coefficients one step before the first sample.
+     * @param step    Per-sample coefficient increment.
+     */
+    void processRampCore(double* data, int n, int channel, const BiquadCoeffs& c0,
+                         const BiquadCoeffs& step) noexcept
+    {
+        assert(channel >= 0 && channel < MaxChannels && "Channel index out of bounds");
+        if (n <= 0) return;
+        auto& s = state_[channel];
+        double z1 = s.z1, z2 = s.z2;
+        double b0 = c0.b0, b1 = c0.b1, b2 = c0.b2, a1 = c0.a1, a2 = c0.a2;
+        for (int k = 0; k < n; ++k)
+        {
+            b0 += step.b0; b1 += step.b1; b2 += step.b2; a1 += step.a1; a2 += step.a2;
+            const double input = data[k];
+            const double output = b0 * input + z1;
+            z1 = b1 * input - a1 * output + z2;
+            z2 = b2 * input - a2 * output;
+            data[k] = output;
+        }
+        s.z1 = z1;
+        s.z2 = z2;
+        activeCoeffs_.b0 = b0;
+        activeCoeffs_.b1 = b1;
+        activeCoeffs_.b2 = b2;
+        activeCoeffs_.a1 = a1;
+        activeCoeffs_.a2 = a2;
+    }
+
+    /**
      * @brief Processes a full audio buffer in-place.
      *
      * Thread-safe block processing. Absorbs asynchronous coefficient updates

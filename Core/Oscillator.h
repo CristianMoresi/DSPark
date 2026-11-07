@@ -443,25 +443,50 @@ private:
     /**
      * @brief Seeds the triangle integrator at its steady-state value.
      *
-     * Piecewise-linear ideal at the current phase (the leaky integrator's
-     * true cycle deviates by O(increment), so any remaining transient is
-     * negligible). Phase 0 drives the underlying square positive, so the
-     * triangle rises from -peak over [0, 0.5). The free-running minBLEP square
-     * lags the naive one by MinBlepTable::dcDelay() samples, so its triangle
-     * is seeded that much earlier in phase: seeding at the naive phase opened
-     * a 5 kHz / 44.1 kHz triangle at 1.62x full scale.
+     * Phase 0 drives the underlying square positive, so the triangle rises
+     * from -peak over [0, 0.5).
+     *
+     * PolyBLEP (the LFO duty): the free-running triangle is a leaky
+     * integrator of the +-1 square (leak = increment), so its steady cycle is
+     * two exponential arcs, not straight lines: over [0, 0.5) the state is
+     * 1 - (1 + peak) * (1 - inc)^(phase / inc), mirrored over [0.5, 1), and
+     * the per-sample recursion runs half a sample behind the phase. The seed
+     * is that value, so a re-phased oscillator continues the free-running
+     * waveform: re-phasing every sample from getPhase() stays within 1.1e-4
+     * of it at 0.5 to 30 Hz and 3.7e-3 at 3 kHz / 48 kHz. (The
+     * piecewise-linear seed sat 0.12 of full scale off it mid-slope and eased
+     * back over about 1/increment samples: two seconds of modulation error at
+     * a 0.5 Hz rate, and a jump wherever an owner re-phases while running.)
+     *
+     * MinBLEP: the free-running minBLEP square lags the naive one by
+     * MinBlepTable::dcDelay() samples, so its triangle is seeded that much
+     * earlier in phase on the piecewise-linear shape: seeding at the naive
+     * phase opened a 5 kHz / 44.1 kHz triangle at 1.62x full scale. Under hard
+     * sync the slave restarts every master cycle and the same linear seed is
+     * used.
      */
     void seedTriangle() noexcept
     {
         updateTriNorm();   // the seed needs the peak of the current increment
         Phase ph = syncOn_ ? slavePhase_ : phase_;
+        const Phase peak = static_cast<Phase>(triExpectedPeak_);
+        if (!syncOn_ && antiAliasing_ == AntiAliasing::PolyBLEP && phaseInc_ > 0.0 && phaseInc_ < 1.0)
+        {
+            ph -= 0.5 * phaseInc_;
+            ph -= std::floor(ph);
+            // Offsets from -peak and +peak keep the ends of each arc exact.
+            const Phase decay = std::log1p(-phaseInc_) / phaseInc_;   // ln of the leak per unit phase
+            triState_ = (ph < 0.5) ? -peak - (1.0 + peak) * std::expm1(ph * decay)
+                                   :  peak + (1.0 + peak) * std::expm1((ph - 0.5) * decay);
+            return;
+        }
         if (!syncOn_ && antiAliasing_ == AntiAliasing::MinBLEP)
         {
             ph -= phaseInc_ * blepDelay_;
             ph -= std::floor(ph);
         }
         const Phase ideal = (ph < 0.5) ? (4.0 * ph - 1.0) : (3.0 - 4.0 * ph);
-        triState_ = ideal * static_cast<Phase>(triExpectedPeak_);
+        triState_ = ideal * peak;
     }
 
     /**

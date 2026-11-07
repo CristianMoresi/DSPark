@@ -330,6 +330,48 @@ public:
     void reset(double sampleRate, float timeConstantMilliseconds, float initialValue = 0.0f) noexcept;
 };
 
+/**
+ * @class HermiteSmoother
+ * @brief Cubic glide that lands exactly on the target after a fixed time,
+ *        with a continuous slope.
+ *
+ * Each new target starts a cubic Hermite segment from the current value and
+ * velocity to the target, arriving with zero velocity after exactly the ramp
+ * time: like LinearSmoother it settles in a known number of samples (and
+ * isSmoothing() then turns off exactly), but the value never has a corner,
+ * at the start, at the end, or when retargeted mid-glide. From rest the path
+ * is the smoothstep 3u^2 - 2u^3: monotonic, with its 10-90% rise at 0.61 of
+ * the ramp time. A retarget mid-glide keeps the current velocity, clipped
+ * to the monotone limit (three times the remaining distance per ramp) so the
+ * glide never passes the new target.
+ *
+ * Use for: filter cutoffs (in log frequency), any parameter whose glide
+ * should end at a known time without the long exponential tail.
+ *
+ * Internal state is double precision; the public API stays float.
+ */
+struct HermiteSmoother
+{
+public:
+    void reset(double sampleRate, float rampTimeMilliseconds, float initialValue = 0.0f) noexcept;
+    void setTargetValue(float newTarget) noexcept;
+    float getNextValue() noexcept;
+
+    [[nodiscard]] float getCurrentValue() const noexcept { return static_cast<float>(current); }
+    [[nodiscard]] float getTargetValue() const noexcept { return static_cast<float>(target); }
+    [[nodiscard]] bool isSmoothing() const noexcept { return stepsDone < totalSteps; }
+    void skip() noexcept;
+
+private:
+    double current = 0.0, target = 0.0;
+    double start = 0.0;      ///< Segment start value.
+    double slope0 = 0.0;     ///< Segment start velocity, in value per segment.
+    double invSteps = 1.0;
+    int totalSteps = 0;      ///< Segment length in samples (0 = jump at once).
+    int stepsDone = 0;       ///< Samples into the segment; == totalSteps when settled.
+    int rampSteps = 0;       ///< Configured ramp length in samples.
+};
+
 }  // namespace Smoothers
 
 //==============================================================================
@@ -791,6 +833,78 @@ inline void Smoothers::ButterworthSmoother::skip() noexcept
     s1 = (b1 - a1) * target + s2;
     lastOut = target;
     prevOut = target;
+}
+
+// --- HermiteSmoother ---
+
+inline void Smoothers::HermiteSmoother::reset(double sampleRate, float rampTimeMilliseconds, float initialValue) noexcept
+{
+    // A NaN or negative ramp is no ramp; the cap keeps the cast defined.
+    const double steps = sampleRate * static_cast<double>(rampTimeMilliseconds) / 1000.0;
+    rampSteps = steps > 0.0 ? static_cast<int>(std::min(steps + 0.5, 1.0e9)) : 0;
+    current = target = start = initialValue;
+    slope0 = 0.0;
+    totalSteps = stepsDone = 0;
+    invSteps = 1.0;
+}
+
+inline void Smoothers::HermiteSmoother::setTargetValue(float newTarget) noexcept
+{
+    // NaN/Inf would leave the segment unable to land.
+    if (!std::isfinite(newTarget) || static_cast<double>(newTarget) == target) return;
+    // Velocity of the segment in flight at its current position, in value
+    // per sample: d/du of the cubic, divided by the segment length.
+    double velocity = 0.0;
+    if (stepsDone < totalSteps)
+    {
+        const double u = stepsDone * invSteps;
+        const double d = target - start;
+        velocity = ((6.0 * u - 6.0 * u * u) * d + (3.0 * u * u - 4.0 * u + 1.0) * slope0) * invSteps;
+    }
+    target = newTarget;
+    start = current;
+    if (rampSteps <= 0)
+    {
+        current = start = target;
+        slope0 = 0.0;
+        totalSteps = stepsDone = 0;
+        return;
+    }
+    totalSteps = rampSteps;
+    stepsDone = 0;
+    invSteps = 1.0 / totalSteps;
+    // Start velocity in value per segment; past three times the distance a
+    // cubic overshoots, so clip there (Fritsch-Carlson limit). Opposite
+    // velocity turns the glide around without passing the target.
+    const double d = target - start;
+    double m = velocity * totalSteps;
+    if (d > 0.0) m = std::min(m, 3.0 * d);
+    else if (d < 0.0) m = std::max(m, 3.0 * d);
+    else m = 0.0;
+    slope0 = m;
+}
+
+inline float Smoothers::HermiteSmoother::getNextValue() noexcept
+{
+    if (stepsDone >= totalSteps) return static_cast<float>(current);
+    if (++stepsDone == totalSteps)
+    {
+        current = target;   // exact arrival
+        return static_cast<float>(current);
+    }
+    const double u = stepsDone * invSteps;
+    const double u2 = u * u;
+    const double d = target - start;
+    // Hermite basis with p(0) = start, p'(0) = slope0, p(1) = target, p'(1) = 0.
+    current = start + d * (3.0 * u2 - 2.0 * u2 * u) + slope0 * (u2 * u - 2.0 * u2 + u);
+    return static_cast<float>(current);
+}
+
+inline void Smoothers::HermiteSmoother::skip() noexcept
+{
+    current = start = target;
+    slope0 = 0.0;
+    totalSteps = stepsDone = 0;
 }
 
 // --- CriticallyDampedSmoother ---

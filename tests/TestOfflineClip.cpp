@@ -6,6 +6,7 @@
 #include "../Effects/OfflineHardClipper.h"
 #include "../Effects/OfflineSoftClipper.h"
 #include "dspark_test.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -1088,4 +1089,51 @@ DSPARK_TEST(OfflineClip_float_tail_tolerance_shortens_padding)
     const auto tight = policy.choose(ceiling, source, shape, DoubleProcessor::kTailTolerance);
     EXPECT_LT(loose.padding, tight.padding);
     EXPECT_TRUE(loose.bound <= FloatProcessor::kTailTolerance);
+}
+
+DSPARK_TEST(OfflineClip_native_rate_keeps_aliases_out_of_the_top_band)
+{
+    // At factor 1 the compensated correction reached Nyquist, where
+    // distortion folded from just above Nyquist lands: a 5 kHz sine clipped
+    // by 6 dB at 48 kHz left a -26.6 dB alias floor, almost all of it at
+    // 23 kHz. The correction is now band-limited (flat to 0.40 fs), which
+    // puts the floor near -62 dB; the harmonics below 20 kHz are unchanged.
+    constexpr double fs = 48000.0;
+    constexpr int n = 1 << 14;
+    const int k0 = static_cast<int>(std::llround(5000.0 * n / fs)) | 1;
+    AudioBuffer<double> source, out;
+    source.resize(1, 3 * n);
+    for (int i = 0; i < 3 * n; ++i)
+        source.getChannel(0)[i] = std::sin(twoPi<double> * k0 * (i % n) / n);
+    OfflineHardClipper<double> clipper;
+    OfflineHardClipper<double>::Options options;
+    options.reductionDb = 6;
+    options.oversamplingFactor = 1;
+    const auto result = clipper.run(source, out, fs, options);
+    EXPECT_TRUE(result.succeeded());
+    if (!result.succeeded()) return;
+    const double c = result.report.normalizedCeiling;
+    FFTReal<double> fft(n);
+    std::vector<double> window(out.getChannel(0) + n, out.getChannel(0) + 2 * n), X(n + 2);
+    fft.forward(window.data(), X.data());
+    const auto power = [&](int k) { return X[size_t(2 * k)] * X[size_t(2 * k)] + X[size_t(2 * k + 1)] * X[size_t(2 * k + 1)]; };
+    double alias = 0.0;
+    for (int k = 1; k < n / 2; ++k)
+        if (k % k0 != 0) alias += power(k);
+    EXPECT_LT(10.0 * std::log10(alias / power(k0)), -50.0);
+    // Harmonics below 20 kHz against the analytic clipped-sine coefficients.
+    double error = 0.0;
+    for (int h = 1; h * k0 * fs / n <= 20000.0; h += 2)
+    {
+        double b = 0.0;
+        for (int i = 0; i < 4096; ++i)
+        {
+            const double t = twoPi<double> * (i + 0.5) / 4096;
+            b += std::clamp(std::sin(t), -c, c) * std::sin(h * t);
+        }
+        b *= 2.0 / 4096;
+        const double re = X[size_t(2 * h * k0)], im = X[size_t(2 * h * k0 + 1)] + b * n / 2;
+        error += re * re + im * im;
+    }
+    EXPECT_LT(10.0 * std::log10(error / power(k0)), -40.0);
 }

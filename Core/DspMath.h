@@ -147,11 +147,16 @@ template <FloatType T>
 // ============================================================================
 
 /**
- * @brief Fast tanh approximation using Pade rational function.
+ * @brief Fast tanh approximation using a Pade [5,4] rational function.
  *
- * About 4x faster than std::tanh (MSVC x64, float, measured).
- * Input is clamped to [-3, 3] maintaining C0 continuity to prevent aliasing.
- * Max output amplitude is ~0.9954.
+ * Input is clamped to [-3, 3] maintaining C0 continuity to prevent aliasing,
+ * so the output is bounded by +-0.99545.
+ *
+ * Measured against std::tanh on a dense sweep (the error is the approximant's,
+ * so float and double agree): at most 4.0e-4 absolute and 4.0e-4 relative for
+ * |x| <= 3, and 4.5e-3 absolute beyond, where the clamp holds 0.99545 while
+ * tanh tends to 1. Speed on MSVC x64: 4.0x std::tanh in throughput (1.0 vs
+ * 4.1 ns float, 1.1 vs 3.7 ns double) and 1.6-1.9x in a dependent chain.
  *
  * @note The clamp at |x| = 3 is C0 but not C1: the derivative has a small
  * discontinuity there (output is already ~0.9954, so the resulting kink is
@@ -169,7 +174,7 @@ template <FloatType T>
     
     const auto x2 = x * x;
     const auto x4 = x2 * x2;
-    // Pade [5,4] approximant: max error < 0.05% for |x| <= 3
+    // Pade [5,4] approximant: max error 0.04% for |x| <= 3 (measured)
     return x * (T(945) + T(105) * x2 + x4) / (T(945) + T(420) * x2 + T(15) * x4);
 }
 
@@ -178,6 +183,12 @@ template <FloatType T>
  *
  * Uses the identity 10^x = 2^(x * log2(10)).
  * Useful in dB conversions where exact precision is not critical.
+ *
+ * Accuracy is that of exp2 plus one rounding of the scaled argument, so the
+ * relative error grows with |x| (about |x| * 1.4e-7 in float). Measured: at
+ * most 4.1e-6 relative in float for |x| <= 30 (a gain of +-600 dB, where it
+ * is 3.6e-5 dB) and 9.7e-14 in double for |x| <= 300. Speed on MSVC x64:
+ * 3.1x (float) and 4.1x (double) std::pow(10, x) in throughput.
  *
  * @param x Exponent.
  * @return Approximation of 10^x.
@@ -196,9 +207,11 @@ template <FloatType T>
 /**
  * @brief e^x via std::exp2, using the identity e^x = 2^(x * log2(e)).
  *
- * Not faster than std::exp everywhere: measured on MSVC x64 it is 0.76x the
- * speed of std::exp in float and 1.2x in double. Accuracy is that of exp2
- * plus one rounding of the scaled argument.
+ * Not faster than std::exp everywhere: measured on MSVC x64 its throughput
+ * is 0.8x std::exp in float and 1.1x in double. Accuracy is that of exp2
+ * plus one rounding of the scaled argument, so the relative error grows with
+ * |x| (about |x| * 5e-8 in float): measured at most 3.8e-6 in float for
+ * |x| <= 80 and 4.9e-14 in double for |x| <= 700.
  *
  * @param x Exponent. No range clamping is applied.
  * @return Approximation of e^x.
@@ -212,13 +225,15 @@ template <FloatType T>
 /**
  * @brief Fast approximation of tan(x) using a Pade [5,4] rational approximant.
  *
- * Accurate to better than 0.01% for |x| <= 1.45 and ~0.1% up to the 1.52
+ * Measured relative error against std::tan (the approximant's, so float and
+ * double agree): at most 4.2e-5 for |x| <= 1.45 and 1.6e-4 at the 1.52
  * fallback limit. Outside that range, falls back to std::tan to avoid the
  * singularities at +-pi/2 producing absurd results.
  *
- * Useful for the bilinear-transform `tan(pi*f/Fs)` term: with this accuracy a
- * 20 kHz cutoff at 44.1 kHz lands within a fraction of a cent of the target.
- * About 2x (float) and 3.5x (double) faster than std::tan on MSVC x64.
+ * Useful for the bilinear-transform `tan(pi*f/Fs)` term: the 1.52 limit is
+ * f = 0.484 Fs, and a 20 kHz cutoff at 44.1 kHz lands within 0.01 cent of
+ * the target. Speed on MSVC x64: 2.3x (float) and 3.6x (double) std::tan in
+ * throughput.
  *
  * @param x Argument in radians.
  * @return Approximation of tan(x).
@@ -239,13 +254,16 @@ template <FloatType T>
  *
  * The coefficients are a Remez minimax fit of sin on [-pi/2, pi/2] under the
  * constraint that the polynomial is exactly 1 at pi/2, so the output never
- * overshoots the unit circle in double. Maximum absolute error is ~3.7e-9 in
- * double (about -168 dB) and float-rounding-limited (~1.8e-7, about -135 dB)
+ * overshoots the unit circle in double. Maximum absolute error is 3.73e-9 in
+ * double (about -168 dB) and float-rounding-limited (1.8e-7, about -135 dB)
  * in float: a pure sine rendered with it is cleaner than a 24-bit converter.
- * Speed is close to the platform libm: 1.0-1.4x std::sin on MSVC x64; its
- * value is the bounded, reproducible error on every platform. The input is
- * range-reduced internally (two-term Cody-Waite), so any finite argument
- * within a few thousand periods of zero stays accurate.
+ * Speed is close to the platform libm: 0.9-1.2x std::sin/std::cos in
+ * throughput on MSVC x64; its value is the bounded, reproducible error on
+ * every platform. The input is range-reduced internally (two-term
+ * Cody-Waite). Measured error by argument range: double stays at 3.73e-9 up
+ * to |x| = 1e5; float is 2.4e-7 at |x| <= 1e3 and 1.2e-6 at |x| <= 1e5,
+ * because a float argument that large is itself quantised (wrap phase
+ * accumulators instead of letting them grow).
  *
  * @param x Argument in radians.
  * @return Approximation of sin(x).
@@ -274,7 +292,8 @@ template <FloatType T>
 
 /**
  * @brief Fast cosine approximation. See fastSin() for accuracy notes
- * (the pi/2 offset costs float about half an ulp more).
+ * (the pi/2 offset costs float about one ulp more: 3.3e-7 measured for
+ * |x| <= pi; double stays at 3.73e-9).
  * @param x Argument in radians.
  * @return Approximation of cos(x).
  */
@@ -290,10 +309,14 @@ template <FloatType T>
  * Splits the input into exponent and mantissa (read from the IEEE bit
  * pattern for normal float/double inputs, std::frexp otherwise), then
  * evaluates the classic 4-term atanh series (Cephes style) for ln of the
- * mantissa, centred on [sqrt(0.5), sqrt(2)). Relative error is below 2e-7:
- * ample for envelope/dB work. Measured on MSVC x64 in a dependent sum: float
- * 1.6 ns (std::log 1.3 ns), double 1.7 ns (std::log 2.4 ns). The bit split
- * replaced a frexp call that cost 2.9 ns in float, with identical results.
+ * mantissa, centred on [sqrt(0.5), sqrt(2)). Measured over 1e-30..1e30: at
+ * most 2.6e-7 relative in float (worst next to the sqrt(2) fold) and 9.5e-8
+ * absolute on [0.5, 2]; ample for envelope/dB work. The series truncation
+ * (2.9e-8 absolute) is the limit, so double reaches only 8.5e-8 relative:
+ * use std::log where double precision matters. Throughput on MSVC x64:
+ * float 1.7 ns (std::log 1.4 ns), double 1.8 ns (std::log 2.6 ns). The bit
+ * split replaced a frexp call that cost 2.9 ns in float, with identical
+ * results.
  *
  * @param x Input value. Must be > 0 (no guard: matches std::log contract).
  * @return Approximation of ln(x).
@@ -351,6 +374,12 @@ template <FloatType T>
  *
  * Optimized for hot paths: avoids std::fmod (slow, hostile to vectorisation)
  * in favour of inverse multiplication and flooring.
+ *
+ * The result is always inside [0, 2*pi) and as exact as the input allows:
+ * measured over |phase| <= 1e6, double stays within 5.9e-11 rad of the exact
+ * wrap, while float is off by up to 0.059 rad there, because a float phase
+ * of 1e6 rad is itself quantised to 0.0625 rad before the call. Keep long
+ * phase accumulators in double, or wrap them on every step.
  *
  * @param phase Phase in radians.
  * @return Phase wrapped safely to [0, 2*pi).

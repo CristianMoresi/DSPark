@@ -10,7 +10,9 @@
  * Four cascaded TPT one-pole stages (Zavalishin) with the global feedback
  * loop resolved analytically per sample - no unit delay in the loop, so
  * cutoff and resonance match the analog prototype at the prewarped
- * frequency.
+ * frequency. An opt-in saturation model (setSaturation(Saturation::Stages))
+ * saturates every stage as well and solves the resulting nonlinear
+ * zero-delay loop implicitly each sample.
  *
  * Threading (SPSC model, see docs/threading.md): parameter setters belong to
  * the control thread (ONE non-audio writer; independent single-word relaxed
@@ -22,20 +24,24 @@
  * convention) - resonant tails decay through the denormal range otherwise.
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h,
- * detail/LadderZdf.h (the per-sample arithmetic, shared with owners that
- * modulate the cutoff every sample).
+ * StateBlob.h, detail/LadderZdf.h (the per-sample arithmetic, shared with
+ * owners that modulate the cutoff every sample).
  */
 
 #include "DspMath.h"
 #include "AudioSpec.h"
 #include "AudioBuffer.h"
 #include "DenormalGuard.h"
+#include "StateBlob.h"
 #include "detail/LadderZdf.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
 
 namespace dspark {
 
@@ -49,18 +55,38 @@ namespace dspark {
  * the parameters once per block and dispatches to a per-mode template
  * instantiation, so the sample loop carries no branches.
  *
+ * Two saturation models (setSaturation()):
+ * - **Feedback** (default): linear stages, with drive > 1 shaping only the
+ *   resonance feedback through a bounded tanh. Cheapest (no iteration).
+ * - **Stages**: the transistor-ladder model in which every stage saturates,
+ *   dy_i/dt = wc [phi(y_{i-1}) - phi(y_i)], phi(v) = tanh(drive v) / drive,
+ *   solved implicitly per sample (detail::ladderStepStages()). Against a
+ *   128x oversampled reference of the same equations (48 kHz, 110 Hz
+ *   full-scale sine, drive 1 and 3, resonance 0 to 0.9) every harmonic above
+ *   -80 dBc lands within 0.23 dB up to a 2 kHz cutoff and within 1.7 dB at
+ *   8 kHz (the frequency-warping limit of any trapezoidal solve at the base
+ *   rate). It self-oscillates above resonance 1 at a level the stages set:
+ *   at resonance 1.1 the pitch is within 0.1 cents of the reference up to a
+ *   1 kHz cutoff, 1.5 cents at 4 kHz and 7.9 cents at 10 kHz, and the level
+ *   within 0.07 dB. It changes the character, so it is opt-in. It costs
+ *   several times the Feedback model (see setSaturation()).
+ *
  * Contract notes:
  * - Like the analog original, the passband gain drops by 1/(1 + 4*resonance)
  *   as resonance rises (about -14 dB at resonance 1). Compensate externally
  *   if loudness-matched sweeps are needed.
- * - Drive saturates the resonance feedback path only: with resonance at 0 it
- *   has no effect on the signal. With drive > 1 the bounded tanh stage keeps
- *   self-oscillation (resonance = 1) at a finite level; at drive <= 1 the
- *   loop is exactly marginal at resonance = 1, so sustained input at the
- *   cutoff accumulates without decay - back off resonance slightly or engage
- *   drive for stable self-oscillation.
+ * - Feedback model: drive saturates the resonance feedback path only: with
+ *   resonance at 0 it has no effect on the signal. With drive > 1 the
+ *   bounded tanh stage keeps self-oscillation (resonance = 1) at a finite
+ *   level; at drive <= 1 the loop is exactly marginal at resonance = 1, so
+ *   sustained input at the cutoff accumulates without decay - back off
+ *   resonance slightly or engage drive for stable self-oscillation.
+ * - Stages model: drive is the level at which the stages saturate (a
+ *   full-scale signal at drive 1 sits at the tanh(1) knee), at any drive.
+ *   Its cutoff is limited to 0.45 * fs (detail::kLadderStagesMaxGain).
  * - Channels beyond kMaxChannels (16) pass through unprocessed.
- * - Mode can be switched while running; the integrator state is continuous.
+ * - Mode and saturation model can be switched while running; the integrator
+ *   state is continuous.
  *
  * @tparam T Sample type (float or double). Must satisfy FloatType concept.
  */
@@ -78,6 +104,16 @@ public:
         BP12,   ///< Bandpass (6 dB/oct per side).
         HP24    ///< 4-pole highpass (24 dB/oct).
     };
+
+    /** @brief Where the filter saturates (see the class notes). */
+    enum class Saturation
+    {
+        Feedback,   ///< Linear stages, tanh on the resonance feedback (default).
+        Stages      ///< Every stage saturates; implicit per-sample solve.
+    };
+
+    /** @brief Highest resonance setResonance() accepts (only Stages uses > 1). */
+    static constexpr double kMaxResonance = 1.2;
 
     ~LadderFilter() = default;
 
@@ -117,9 +153,20 @@ public:
 
         // Local snapshot to guarantee thread-safety and avoid mid-block changes
         const T currentG = g_.load(std::memory_order_relaxed);
-        const T currentRes = resonance_.load(std::memory_order_relaxed);
+        const T storedRes = resonance_.load(std::memory_order_relaxed);
         const T currentDrive = drive_.load(std::memory_order_relaxed);
         const Mode currentMode = mode_.load(std::memory_order_relaxed);
+
+        if (saturation_.load(std::memory_order_relaxed) == Saturation::Stages)
+        {
+            processBlockStages(buffer, nCh, nS,
+                               detail::makeLadderStageCoeffs(currentG, storedRes, currentDrive),
+                               currentMode);
+            return;
+        }
+
+        // The Feedback model stops at the self-oscillation boundary.
+        const T currentRes = std::min(storedRes, T(1));
 
         // Template dispatch to eliminate per-sample branching
         switch (currentMode)
@@ -156,8 +203,24 @@ public:
         const T g     = g_.load(std::memory_order_relaxed);
         const T res   = resonance_.load(std::memory_order_relaxed);
         const T drive = drive_.load(std::memory_order_relaxed);
-        const BlockCoeffs c = makeBlockCoeffs(g, res);
         ChannelState& s = state_[channel];
+
+        if (saturation_.load(std::memory_order_relaxed) == Saturation::Stages)
+        {
+            const auto sc = detail::makeLadderStageCoeffs(g, res, drive);
+            switch (mode_.load(std::memory_order_relaxed))
+            {
+                case Mode::LP6:  return detail::ladderStepStages<detail::LadderTap::LP6>(input, s.z, sc);
+                case Mode::LP12: return detail::ladderStepStages<detail::LadderTap::LP12>(input, s.z, sc);
+                case Mode::LP18: return detail::ladderStepStages<detail::LadderTap::LP18>(input, s.z, sc);
+                case Mode::LP24: return detail::ladderStepStages<detail::LadderTap::LP24>(input, s.z, sc);
+                case Mode::BP12: return detail::ladderStepStages<detail::LadderTap::BP12>(input, s.z, sc);
+                case Mode::HP24: return detail::ladderStepStages<detail::LadderTap::HP24>(input, s.z, sc);
+            }
+            return input;
+        }
+
+        const BlockCoeffs c = makeBlockCoeffs(g, std::min(res, T(1)));
 
         switch (mode_.load(std::memory_order_relaxed))
         {
@@ -205,21 +268,28 @@ public:
 
     /**
      * @brief Sets resonance amount (thread-safe, lock-free).
-     * @param amount Range [0.0, 1.0]. Values near 1.0 induce self-oscillation
-     *               (see the class notes on drive for loop stability).
-     *               Non-finite values are ignored.
+     * @param amount Range [0.0, 1.0] for the Feedback model; values near 1.0
+     *               induce self-oscillation (see the class notes on drive
+     *               for loop stability). The Stages model also takes values
+     *               up to kMaxResonance (1.2), where it self-oscillates at a
+     *               level its saturating stages set; the Feedback model
+     *               treats them as 1. Clamped to [0, kMaxResonance];
+     *               non-finite values are ignored.
      */
     void setResonance(T amount) noexcept
     {
         if (!std::isfinite(amount)) return;  // NaN would poison the loop via k
-        resonance_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+        resonance_.store(std::clamp(amount, T(0), static_cast<T>(kMaxResonance)),
+                         std::memory_order_relaxed);
     }
 
     /**
      * @brief Sets the nonlinear drive amount (thread-safe, lock-free).
-     * @param amount Drive multiplier, floored at 0.1. Values <= 1.0 keep the
-     *               feedback path linear; > 1.0 saturates it (analog-style
-     *               resonance compression). Non-finite values are ignored.
+     * @param amount Drive multiplier, floored at 0.1. Feedback model: values
+     *               <= 1.0 keep the feedback path linear; > 1.0 saturates it
+     *               (analog-style resonance compression). Stages model: the
+     *               level scale of every stage, tanh(drive * v) / drive.
+     *               Non-finite values are ignored.
      */
     void setDrive(T amount) noexcept
     {
@@ -236,10 +306,66 @@ public:
         mode_.store(mode, std::memory_order_relaxed);
     }
 
+    /**
+     * @brief Selects the saturation model (thread-safe, lock-free).
+     *
+     * Feedback (the default) keeps the stages linear. Stages saturates every
+     * stage and solves the loop implicitly: a clipped Newton iteration in
+     * double, 1.8 steps on average and at most 10 measured (cap 16). It costs
+     * 52 to 103 ns per sample and channel against 10 to 19 ns for Feedback
+     * (MSVC x64, float), rising with cutoff and drive. The integrator state
+     * carries over a switch. Out-of-range values (a wild
+     * cast or a corrupt state blob) select Feedback.
+     *
+     * @param model Saturation model.
+     */
+    void setSaturation(Saturation model) noexcept
+    {
+        saturation_.store(model == Saturation::Stages ? Saturation::Stages : Saturation::Feedback,
+                          std::memory_order_relaxed);
+    }
+
+    // -- State (setup/UI thread) ------------------------------------------------
+
+    /** @brief Serializes the parameters (setup/UI threads; allocates). */
+    [[nodiscard]] std::vector<uint8_t> getState() const
+    {
+        // The blob stores float: the casts keep the double instantiation
+        // compiling (a double matches no StateWriter overload unambiguously).
+        StateWriter w(stateId("LADR"), 1);
+        w.write("cutoff", static_cast<float>(cutoff_.load(std::memory_order_relaxed)));
+        w.write("resonance", static_cast<float>(resonance_.load(std::memory_order_relaxed)));
+        w.write("drive", static_cast<float>(drive_.load(std::memory_order_relaxed)));
+        w.write("mode", static_cast<int32_t>(mode_.load(std::memory_order_relaxed)));
+        w.write("saturation", static_cast<int32_t>(saturation_.load(std::memory_order_relaxed)));
+        return w.blob();
+    }
+
+    /**
+     * @brief Restores parameters from a blob (tolerant; rejects foreign ids).
+     *
+     * Missing keys keep their defaults: a blob without "saturation" selects
+     * the Feedback model.
+     */
+    bool setState(const uint8_t* data, size_t size)
+    {
+        StateReader r(data, size);
+        if (!r.isValid() || r.processorId() != stateId("LADR")) return false;
+        setCutoff(static_cast<T>(r.read("cutoff", 1000.0f)));
+        setResonance(static_cast<T>(r.read("resonance", 0.0f)));
+        setDrive(static_cast<T>(r.read("drive", 1.0f)));
+        const int mode = std::clamp(r.read("mode", static_cast<int32_t>(Mode::LP24)),
+                                    0, static_cast<int32_t>(Mode::HP24));
+        setMode(static_cast<Mode>(mode));
+        setSaturation(static_cast<Saturation>(r.read("saturation", 0)));
+        return true;
+    }
+
     [[nodiscard]] T getCutoff() const noexcept { return cutoff_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getResonance() const noexcept { return resonance_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getDrive() const noexcept { return drive_.load(std::memory_order_relaxed); }
     [[nodiscard]] Mode getMode() const noexcept { return mode_.load(std::memory_order_relaxed); }
+    [[nodiscard]] Saturation getSaturation() const noexcept { return saturation_.load(std::memory_order_relaxed); }
 
 protected:
     static constexpr int kMaxChannels = 16;
@@ -263,6 +389,7 @@ protected:
     std::atomic<T> drive_ {T(1)};
     std::atomic<T> g_ {T(0)};
     std::atomic<Mode> mode_ {Mode::LP24};
+    std::atomic<Saturation> saturation_ {Saturation::Feedback};
 
 private:
     /**
@@ -310,6 +437,36 @@ private:
 
             // A NaN or Inf sample that reached the recursion is cleared once
             // per block, so the channel recovers instead of staying NaN.
+            if (!std::isfinite(z[0] + z[1] + z[2] + z[3])) z.fill(T(0));
+            state_[ch].z = z;
+        }
+    }
+
+    /** @brief Block loop of the Stages model, one mode instantiation each. */
+    void processBlockStages(AudioBufferView<T> buffer, int nCh, int nS,
+                            const detail::LadderStageCoeffs& c, Mode mode) noexcept
+    {
+        switch (mode)
+        {
+            case Mode::LP6:  stagesLoop<detail::LadderTap::LP6>(buffer, nCh, nS, c); break;
+            case Mode::LP12: stagesLoop<detail::LadderTap::LP12>(buffer, nCh, nS, c); break;
+            case Mode::LP18: stagesLoop<detail::LadderTap::LP18>(buffer, nCh, nS, c); break;
+            case Mode::LP24: stagesLoop<detail::LadderTap::LP24>(buffer, nCh, nS, c); break;
+            case Mode::BP12: stagesLoop<detail::LadderTap::BP12>(buffer, nCh, nS, c); break;
+            case Mode::HP24: stagesLoop<detail::LadderTap::HP24>(buffer, nCh, nS, c); break;
+        }
+    }
+
+    template <detail::LadderTap Tap>
+    void stagesLoop(AudioBufferView<T> buffer, int nCh, int nS, const detail::LadderStageCoeffs& c) noexcept
+    {
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            auto* channelData = buffer.getChannel(ch);
+            std::array<T, 4> z = state_[ch].z;
+            for (int i = 0; i < nS; ++i)
+                channelData[i] = detail::ladderStepStages<Tap>(channelData[i], z, c);
+            // Same per-block NaN recovery as the Feedback loop.
             if (!std::isfinite(z[0] + z[1] + z[2] + z[3])) z.fill(T(0));
             state_[ch].z = z;
         }

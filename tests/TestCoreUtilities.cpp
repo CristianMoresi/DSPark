@@ -92,6 +92,47 @@ DSPARK_TEST(OnePoleSmoother_converges)
     EXPECT_NEAR(s.getNextValue(), 0.5f, 0.05f);
 }
 
+DSPARK_TEST(Smoothers_hermite_glide_lands_exactly_without_a_corner)
+{
+    // HermiteSmoother: from rest the path is the smoothstep, monotone, and it
+    // lands exactly on the target after the ramp; a retarget mid-glide keeps
+    // the velocity (no corner) and never passes the new target.
+    Smoothers::HermiteSmoother h;
+    h.reset(48000.0, 10.0f, 0.0f);   // 480 samples
+    h.setTargetValue(1.0f);
+    float previous = 0.0f;
+    bool monotone = true;
+    for (int n = 1; n <= 480; ++n)
+    {
+        const float v = h.getNextValue();
+        monotone = monotone && v >= previous && v <= 1.0f;
+        if (n == 240) EXPECT_NEAR(v, 0.5f, 1e-6);   // smoothstep midpoint
+        previous = v;
+    }
+    EXPECT_TRUE(monotone);
+    EXPECT_EQ(h.getCurrentValue(), 1.0f);
+    EXPECT_FALSE(h.isSmoothing());
+
+    // Retarget at the fastest point of a glide: the slope carries over and
+    // the new glide lands exactly, without overshooting the new target.
+    h.reset(48000.0, 10.0f, 0.0f);
+    h.setTargetValue(1.0f);
+    float a = 0.0f, b = 0.0f;
+    for (int n = 0; n < 240; ++n) { a = b; b = h.getNextValue(); }
+    h.setTargetValue(1.5f);
+    const float c = h.getNextValue();
+    EXPECT_LT(std::abs((c - b) - (b - a)), 2e-5f);   // continuous slope
+    float peak = c;
+    for (int n = 1; n < 480; ++n) peak = std::max(peak, h.getNextValue());
+    EXPECT_LT(peak, 1.5f + 1e-6f);
+    EXPECT_EQ(h.getCurrentValue(), 1.5f);
+    EXPECT_FALSE(h.isSmoothing());
+
+    // A non-finite target is ignored.
+    h.setTargetValue(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(h.getTargetValue(), 1.5f);
+}
+
 DSPARK_TEST(Smoothers_isSmoothing)
 {
     Smoothers::LinearSmoother s;
@@ -338,6 +379,27 @@ DSPARK_TEST(SmoothedValue_nan_target_is_ignored)
     for (int i = 0; i < 10000; ++i) v = sv.getNextValue(); // past the ~16 tau snap
     EXPECT_FALSE(std::isnan(v));
     EXPECT_NEAR(v, 0.5f, 1e-6f);
+}
+
+DSPARK_TEST(SmoothedValue_chase_reaches_99_percent_at_the_ramp_time)
+{
+    // Chase used to ignore the ramp time and the sample rate's scale of its
+    // speed curve: every ramp reached 99% of a step after about 171 ms. The
+    // curve is now an exact time-stretch, so 99% lands at the ramp time.
+    using SV = SmoothedValue<float>;
+    for (double fs : { 48000.0, 192000.0 })
+        for (double ms : { 20.0, 171.0, 600.0 })
+        {
+            SV sv;
+            sv.prepare(fs, ms);
+            sv.setSmoothingType(SV::SmoothingType::Chase);
+            sv.reset(0.0f);
+            sv.setTargetValue(1.0f);
+            int n99 = -1;
+            for (int n = 1; n < static_cast<int>(fs * 5) && n99 < 0; ++n)
+                if (sv.getNextValue() >= 0.99f) n99 = n;
+            EXPECT_NEAR(n99 * 1000.0 / fs, ms, 0.05 * ms + 0.5);
+        }
 }
 
 // processBlock is the same arithmetic as getNextValue, sample-exact,

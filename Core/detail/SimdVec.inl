@@ -368,6 +368,84 @@ void firCorrelateKernel(const T* x, const T* h, int taps, T* DSPARK_RESTRICT y, 
     }
 }
 
+/// firCorrelateBank() at this copy's widest vector (see SimdOps.h). The lanes
+/// hold banks, so each output of each bank is the same multiply-add chain over
+/// the taps as in firCorrelateKernel() with unit gain.
+template <typename T, int Banks>
+void firCorrelateBankKernel(const T* x, const T* h, int taps, T* const* y, int n) noexcept
+{
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
+    constexpr int W = Banks % kVecWidth<T> == 0 ? kVecWidth<T> : 1;
+    constexpr int Vecs = Banks / W;
+    constexpr int Outputs = Vecs >= 8 ? 1 : 8 / Vecs;   // keep eight accumulators live
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    alignas(64) T lanes[Banks];
+    int i = 0;
+    const auto block = [&](auto outputs) {
+        constexpr int P = decltype(outputs)::value;
+        V acc[P][Vecs];
+        for (int p = 0; p < P; ++p)
+            for (int v = 0; v < Vecs; ++v) acc[p][v] = O::set1(T(0));
+        const T* xp = x + i;
+        for (int j = 0; j < taps; ++j)
+        {
+            V c[Vecs];
+            for (int v = 0; v < Vecs; ++v) c[v] = O::load(h + j * Banks + v * W);
+            for (int p = 0; p < P; ++p)
+            {
+                const V s = O::set1(xp[p + j]);
+                for (int v = 0; v < Vecs; ++v) acc[p][v] = O::madd(c[v], s, acc[p][v]);
+            }
+        }
+        for (int p = 0; p < P; ++p)
+        {
+            for (int v = 0; v < Vecs; ++v) O::store(lanes + v * W, acc[p][v]);
+            for (int k = 0; k < Banks; ++k) y[k][i + p] = lanes[k];
+        }
+    };
+    for (; i + Outputs <= n; i += Outputs) block(std::integral_constant<int, Outputs>{});
+    for (; i < n; ++i) block(std::integral_constant<int, 1>{});
+}
+
+/// firCorrelateBankSum() at this copy's widest vector (see SimdOps.h).
+template <typename T, int Banks>
+void firCorrelateBankSumKernel(const T* m, const T* h, int taps, T* DSPARK_RESTRICT y, int n) noexcept
+{
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "SimdOps: only float and double are supported");
+    constexpr int W = Banks % kVecWidth<T> == 0 ? kVecWidth<T> : 1;
+    constexpr int Vecs = Banks / W;
+    constexpr int Outputs = Vecs >= 8 ? 1 : 8 / Vecs;
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    alignas(64) T lanes[Banks];
+    int i = 0;
+    const auto block = [&](auto outputs) {
+        constexpr int P = decltype(outputs)::value;
+        V acc[P][Vecs];
+        for (int p = 0; p < P; ++p)
+            for (int v = 0; v < Vecs; ++v) acc[p][v] = O::set1(T(0));
+        const T* mp = m + static_cast<std::ptrdiff_t>(i) * Banks;
+        for (int j = 0; j < taps; ++j)
+        {
+            V c[Vecs];
+            for (int v = 0; v < Vecs; ++v) c[v] = O::load(h + j * Banks + v * W);
+            for (int p = 0; p < P; ++p)
+                for (int v = 0; v < Vecs; ++v)
+                    acc[p][v] = O::madd(c[v], O::load(mp + (p + j) * Banks + v * W), acc[p][v]);
+        }
+        for (int p = 0; p < P; ++p)
+        {
+            for (int v = 0; v < Vecs; ++v) O::store(lanes + v * W, acc[p][v]);
+            T sum = T(0);
+            for (int k = 0; k < Banks; ++k) sum += lanes[k];
+            y[i + p] = sum;
+        }
+    };
+    for (; i + Outputs <= n; i += Outputs) block(std::integral_constant<int, Outputs>{});
+    for (; i < n; ++i) block(std::integral_constant<int, 1>{});
+}
+
 #if defined(DSPARK_VEC_AVX)
 /// dotProduct() at 8 float lanes.
 inline float dotProductWide(const float* DSPARK_RESTRICT a, const float* DSPARK_RESTRICT b, int count) noexcept

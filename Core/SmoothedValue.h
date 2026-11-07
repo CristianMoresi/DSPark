@@ -40,9 +40,11 @@ namespace dspark {
  *   whatever its size or unit (a gain, a frequency in Hz), arrives exactly on
  *   target after rampTimeMs.
  * - **Chase**: adaptive (not clocked): gentle right after a target change,
- *   accelerating as it settles. Its speed is defined in seconds, so it
- *   settles in the same time at every sample rate; rampTimeMs only switches
- *   it off (<= 0 snaps like the other curves).
+ *   accelerating as it settles. rampTimeMs is the time to cover 99% of any
+ *   step (measured within 0.2% at 44.1 to 192 kHz and 5 ms to 1 s); the
+ *   value then snaps onto the target after about 2.06 times that. The curve
+ *   is the same at every sample rate. (It used to ignore rampTimeMs and
+ *   always take 171 ms to 99%.)
  *
  * The recursion state is double regardless of T (the framework rule for
  * recursive state): in float the one-pole stalls hundreds of epsilons short
@@ -101,14 +103,34 @@ public:
         rampSamples_ = std::max(1.0, rampTimeMs_ * sampleRate_ / 1000.0);
         updateLinearRate();
 
-        // Chase: the speed constants are tuned at 44.1 kHz in samples. The
-        // decay of the speed and the speed itself both scale with the rate,
-        // so the curve takes the same time at any rate (unscaled, 0 -> 0.99
-        // took 171 ms at 44.1 kHz but 53 ms at 192 kHz).
+        // Chase: the speed constants are tuned at 44.1 kHz in samples, where
+        // they cover 99% of a step in kChaseNaturalMs. The decay of the speed
+        // and the speed itself both scale with the rate, so the curve takes
+        // the same time at any rate (unscaled, 0 -> 0.99 took 171 ms at
+        // 44.1 kHz but 53 ms at 192 kHz), and with the ramp time: the whole
+        // curve is stretched by stretch = rampTimeMs / kChaseNaturalMs. The
+        // speed recursion v <- m v - a is affine, so its exact stretched step
+        // is v <- m^(1/stretch) v - a stretch (1 - m^(1/stretch)) / (1 - m)
+        // with the speed itself (a time constant in samples) and its bounds
+        // scaled by stretch.
         const double srRatio = 44100.0 / sampleRate_;
-        chaseMultDecay_ = std::pow(0.9999, srRatio);
-        chaseAddDecay_ = 0.01 * srRatio;
+        const double m = std::pow(0.9999, srRatio);
+        const double stretch = std::max(rampTimeMs_, 1e-3) / kChaseNaturalMs;
+        if (stretch == 1.0)
+        {
+            chaseMultDecay_ = m;
+            chaseAddDecay_ = 0.01 * srRatio;
+        }
+        else
+        {
+            const double ms = std::pow(m, 1.0 / stretch);
+            chaseMultDecay_ = ms;
+            chaseAddDecay_ = 0.01 * srRatio * stretch * (1.0 - ms) / (1.0 - m);
+        }
+        chaseMinSpeed_ = kChaseMinSpeed * stretch;
+        chaseMaxSpeed_ = kChaseMaxSpeed * stretch;
         chaseRateScale_ = 1.0 / srRatio;
+        if (chaseSpeed_ < chaseMinSpeed_ || chaseSpeed_ > chaseMaxSpeed_) chaseSpeed_ = chaseMinSpeed_;
     }
 
     /** @brief Sets the smoothing algorithm. */
@@ -133,9 +155,10 @@ public:
         if (newTarget != target_)
         {
             target_ = newTarget;
+            snapEps_ = snapEpsilonFor(newTarget);
             updateLinearRate();
             if (type_ == SmoothingType::Chase)
-                chaseSpeed_ = 2500.0; // Reset chase velocity on target change
+                chaseSpeed_ = chaseMaxSpeed_; // Reset chase velocity on target change
         }
     }
 
@@ -171,7 +194,9 @@ public:
             case SmoothingType::Chase:
             {
                 if (rampTimeMs_ <= 0.0) { current_ = target; break; }
-                chaseSpeed_ = std::max(350.0, std::min(2500.0, chaseSpeed_ * chaseMultDecay_ - chaseAddDecay_));
+                // The speed only falls after its reset to the maximum, so the
+                // upper bound never binds: only the floor is applied.
+                chaseSpeed_ = std::max(chaseMinSpeed_, chaseSpeed_ * chaseMultDecay_ - chaseAddDecay_);
                 const double speed = chaseSpeed_ * chaseRateScale_;
                 current_ = (current_ * speed + target) / (speed + 1.0);
                 break;
@@ -181,8 +206,7 @@ public:
         // Exact arrival: snap once within a relative epsilon of the target.
         // Relative because with large magnitudes (e.g. a frequency of 10000)
         // a purely absolute threshold would be finer than the float ulp.
-        const double eps = kEpsilon * std::max(1.0, std::abs(target));
-        if (std::abs(current_ - target) < eps)
+        if (std::abs(current_ - target) < snapEps_)
             current_ = target;
 
         return static_cast<T>(current_);
@@ -214,7 +238,7 @@ public:
         // The per-sample arrival snap matches getNextValue(); once settled,
         // the rest of the block is a plain fill.
         double current = current_;
-        const double eps = kEpsilon * std::max(1.0, std::abs(target));
+        const double eps = snapEps_;
         size_t i = 0;
 
         switch (type_)
@@ -255,9 +279,10 @@ public:
                 const double multDecay = chaseMultDecay_;
                 const double addDecay  = chaseAddDecay_;
                 const double rateScale = chaseRateScale_;
+                const double lo = chaseMinSpeed_;
                 for (; i < n; ++i)
                 {
-                    speed = std::max(350.0, std::min(2500.0, speed * multDecay - addDecay));
+                    speed = std::max(lo, speed * multDecay - addDecay);   // falls only: no ceiling needed
                     const double scaled = speed * rateScale;
                     current = (current * scaled + target) / (scaled + 1.0);
                     if (std::abs(current - target) < eps) { current = target; break; }
@@ -285,14 +310,15 @@ public:
     [[nodiscard]] bool isSmoothing() const noexcept { return current_ != static_cast<double>(target_); }
 
     /** @brief Forces the current value to instantly match the target, bypassing time. */
-    void skip() noexcept { current_ = static_cast<double>(target_); chaseSpeed_ = 350.0; }
+    void skip() noexcept { current_ = static_cast<double>(target_); chaseSpeed_ = chaseMinSpeed_; }
 
     /** @brief Hard-resets both current and target states to a specific value. */
     void reset(T value = T(0)) noexcept
     {
         target_ = value;
+        snapEps_ = snapEpsilonFor(value);
         current_ = static_cast<double>(value);
-        chaseSpeed_ = 350.0;
+        chaseSpeed_ = chaseMinSpeed_;
     }
 
     /** @brief Updates sample rate and/or ramp time, recalculating internal steps. */
@@ -302,6 +328,12 @@ public:
     }
 
 private:
+    /** @brief The arrival threshold for a target (cached: it only moves with it). */
+    [[nodiscard]] static double snapEpsilonFor(T target) noexcept
+    {
+        return kEpsilon * std::max(1.0, std::abs(static_cast<double>(target)));
+    }
+
     void updateLinearRate() noexcept
     {
         linearRate_ = std::abs(static_cast<double>(target_) - current_) / rampSamples_;
@@ -317,15 +349,21 @@ private:
     double rampSamples_{ 882.0 };
 
     // Chase state & coefficients
+    static constexpr double kChaseNaturalMs = 171.0;  ///< 99% time of the unstretched curve.
+    static constexpr double kChaseMinSpeed = 350.0;   ///< Speed bounds of the unstretched curve
+    static constexpr double kChaseMaxSpeed = 2500.0;  ///< (time constants in samples at 44.1 kHz).
     double chaseSpeed_{ 350.0 };
     double chaseMultDecay_{ 0.9999 };
     double chaseAddDecay_{ 0.01 };
     double chaseRateScale_{ 1.0 };    ///< sampleRate / 44100: the speed in samples at this rate.
+    double chaseMinSpeed_{ 350.0 };   ///< Bounds scaled by the ramp-time stretch.
+    double chaseMaxSpeed_{ 2500.0 };
 
     double sampleRate_{ 44100.0 };
     double rampTimeMs_{ 20.0 };
 
     static constexpr double kEpsilon = 1e-7; ///< Relative arrival threshold
+    double snapEps_ { kEpsilon };            ///< kEpsilon * max(1, |target|), set with the target
 };
 
 } // namespace dspark

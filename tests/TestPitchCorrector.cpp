@@ -516,6 +516,7 @@ struct Run
     bool formant = false;
     int channels = 1;
     int frame = 0;                    ///< 0 = the rate's automatic analysis frame
+    bool lowLatency = false;          ///< the splice engine instead of the vocoder
     int scaleAt = -1;                 ///< absolute sample of a second setScale
     std::uint16_t secondMask = 0;
     int secondRoot = 0;
@@ -541,6 +542,7 @@ std::vector<std::vector<T>> renderAll(const std::vector<double>& mono, const Run
     corrector.setScale(run.mask, run.root);
     corrector.setRetuneSpeedMs(static_cast<T>(run.retuneMs));
     corrector.setFormantPreserve(run.formant);
+    corrector.setLowLatency(run.lowLatency);
     corrector.prepare(spec, run.frame);
 
     int position = 0;
@@ -1509,4 +1511,181 @@ DSPARK_TEST(PitchCorrector_double_precision_tracks_the_same_note)
                                n - 9600, 9600);
     EXPECT_LT(std::abs(centsBetween(estimateF0(segment, fs, 60.0, 1400.0),
                                     midiToHz(69.0))), 10.0);
+}
+
+// ============================================================================
+// Low-latency engine
+// ============================================================================
+
+namespace {
+
+// Additive harmonic source whose fundamental follows `f0` sample by sample
+// (continuous phases), each harmonic at 1/k.
+std::vector<double> glidingTone(const std::vector<double>& f0, double sampleRate,
+                                double amplitude = 0.3)
+{
+    const int n = static_cast<int>(f0.size());
+    double lowest = 1.0e9;
+    for (double v : f0) lowest = std::min(lowest, v);
+    const int harmonics = static_cast<int>(std::floor(0.4 * sampleRate / lowest));
+    std::vector<double> out(static_cast<std::size_t>(n), 0.0);
+    std::vector<double> phase(static_cast<std::size_t>(harmonics) + 1, 0.0);
+    for (int i = 0; i < n; ++i)
+    {
+        double y = 0.0;
+        for (int k = 1; k <= harmonics; ++k)
+        {
+            const double f = static_cast<double>(k) * f0[static_cast<std::size_t>(i)];
+            if (f < 0.45 * sampleRate)
+                y += std::sin(phase[static_cast<std::size_t>(k)]) / static_cast<double>(k);
+            phase[static_cast<std::size_t>(k)] += twoPi<double> * f / sampleRate;
+        }
+        out[static_cast<std::size_t>(i)] = amplitude * y;
+    }
+    return out;
+}
+
+} // namespace
+
+DSPARK_TEST(PitchCorrector_low_latency_mode_delays_by_half_the_detector_window)
+{
+    // The splice engine's latency is half the detector's window: 1024 samples
+    // at 44.1 and 48 kHz, the same 21.3 ms span at 96 kHz. At zero correction it
+    // is a pure delay, so an impulse after silence lands exactly there, at full
+    // height.
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+    {
+        AudioSpec spec;
+        spec.sampleRate = rate;
+        spec.maxBlockSize = 256;
+        spec.numChannels = 1;
+        PitchCorrector<float> corrector;
+        corrector.setLowLatency(true);
+        corrector.prepare(spec);
+        const int expected = rate > 64000.0 ? 2048 : 1024;
+        EXPECT_EQ(corrector.getLatency(), expected);
+
+        const int n = 3 * expected + 4096;
+        std::vector<float> x(static_cast<std::size_t>(n), 0.0f);
+        x[3000] = 1.0f;
+        for (int position = 0; position < n; position += 256)
+        {
+            float* pointer = x.data() + position;
+            corrector.processBlock(AudioBufferView<float>(&pointer, 1, std::min(256, n - position)));
+        }
+        for (int i = 0; i < n; ++i)
+            EXPECT_EQ(x[static_cast<std::size_t>(i)], i == 3000 + expected ? 1.0f : 0.0f);
+
+        // And it corrects: E2 45 cents flat lands on E2.
+        const int length = static_cast<int>(rate * 0.6);
+        const int measured = static_cast<int>(rate * 0.25);
+        Run run;
+        run.sampleRate = rate;
+        run.lowLatency = true;
+        const auto corrected = render(harmonicTone(midiToHz(40.0 - 0.45), rate, length), run);
+        EXPECT_LT(std::abs(centsBetween(
+                      estimateF0(slice(corrected, length - measured, measured), rate,
+                                 60.0, 1400.0), midiToHz(40.0))), 2.0);
+    }
+}
+
+DSPARK_TEST(PitchCorrector_low_latency_holds_a_vibrato_on_its_note)
+{
+    // A 5.5 Hz vibrato of +-40 cents around A3 stays inside A3's cell, so a hard
+    // snap should hold the output on A3. The default engine decides from a
+    // window that trails what it renders and exaggerates the wobble (file
+    // overview); the low-latency engine refines the pitch at its read head and
+    // must flatten it to a few cents.
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 3.0);
+    std::vector<double> f0(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        f0[static_cast<std::size_t>(i)] = midiToHz(57.0 + 0.40 * std::sin(
+            twoPi<double> * 5.5 * static_cast<double>(i) / fs));
+    const auto input = glidingTone(f0, fs);
+    Run run;
+    run.lowLatency = true;
+    const auto output = render(input, run);
+    const auto hz = trackFundamental(output, fs, midiToHz(57.0));
+    double sumSquares = 0.0, worst = 0.0;
+    int count = 0;
+    for (int i = static_cast<int>(fs * 0.6); i < static_cast<int>(fs * 2.6); ++i)
+    {
+        const double cents = centsBetween(hz[static_cast<std::size_t>(i)], midiToHz(57.0));
+        sumSquares += cents * cents;
+        worst = std::max(worst, std::abs(cents));
+        ++count;
+    }
+    EXPECT_LT(std::sqrt(sumSquares / static_cast<double>(count)), 5.0);   // input: 28.3
+    EXPECT_LT(worst, 15.0);
+}
+
+DSPARK_TEST(PitchCorrector_low_latency_keeps_the_harmonic_structure)
+{
+    // A sustained vowel 30 cents sharp, corrected onto its note: the reader
+    // jumps by whole measured periods, so the corrected tone stays a clean sum
+    // of harmonics from F2 to A4. Read by the file's harmonic-to-residual
+    // instrument (floor about 89 dB); the vocoder reads 39 to 57 dB here.
+    const double fs = 48000.0;
+    const int segment = analysisSegment(fs);
+    const int offset = static_cast<int>(0.6 * fs);
+    for (int midi : { 41, 45, 57, 69 })
+    {
+        const auto input = vowelStimulus(midiToHz(midi + 0.30), fs, offset + segment + 2048);
+        Run run;
+        run.lowLatency = true;
+        const auto tail = slice(render(input, run), offset + 1024, segment);
+        const double measured = estimateF0(tail, fs, 40.0, 1400.0);
+        EXPECT_LT(std::abs(centsBetween(measured, midiToHz(midi))), 1.0);
+        EXPECT_GT(harmonicResidualDb(tail, fs, measured), 60.0);
+    }
+}
+
+DSPARK_TEST(PitchCorrector_low_latency_is_block_and_channel_exact)
+{
+    // Decisions sit on the absolute control grid and read the detector before
+    // each interval is pushed, so the rendering cannot depend on the host's
+    // block size; every channel shares one read trajectory, and the reader is
+    // linear, so a channel at half level comes out at exactly half level.
+    const double fs = 48000.0;
+    const int n = 40000;
+    const auto input = harmonicTone(midiToHz(62.0 + 0.35), fs, n);
+    Run run;
+    run.lowLatency = true;
+    run.mask = kMajor;
+    run.retuneMs = 20.0;
+    run.block = 512;
+    const auto reference = render(input, run);
+    for (int block : { 1, 7, 64, 100, 333, 1024 })
+    {
+        run.block = block;
+        const auto other = render(input, run);
+        for (int i = 0; i < n; ++i)
+            EXPECT_EQ(other[static_cast<std::size_t>(i)],
+                      reference[static_cast<std::size_t>(i)]);
+    }
+
+    AudioSpec spec;
+    spec.sampleRate = fs;
+    spec.maxBlockSize = 256;
+    spec.numChannels = 2;
+    PitchCorrector<float> corrector;
+    corrector.prepare(spec);
+    EXPECT_EQ(corrector.getLatency(), 4096);
+    std::vector<float> left(static_cast<std::size_t>(n)), right(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        left[static_cast<std::size_t>(i)] = static_cast<float>(input[static_cast<std::size_t>(i)]);
+        right[static_cast<std::size_t>(i)] = 0.5f * left[static_cast<std::size_t>(i)];
+    }
+    // Switched on mid-stream: the next block restarts on the splice engine.
+    corrector.setLowLatency(true);
+    for (int position = 0; position < n; position += 256)
+    {
+        float* pointers[2] = { left.data() + position, right.data() + position };
+        corrector.processBlock(AudioBufferView<float>(pointers, 2, std::min(256, n - position)));
+        EXPECT_EQ(corrector.getLatency(), 1024);
+    }
+    for (int i = 0; i < n; ++i)
+        EXPECT_EQ(right[static_cast<std::size_t>(i)], 0.5f * left[static_cast<std::size_t>(i)]);
 }

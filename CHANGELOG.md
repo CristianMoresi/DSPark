@@ -58,6 +58,44 @@ All notable user-facing changes to DSPark are documented here.
   a 15 kHz low-pass deviates 0.58 dB from the analog prototype (9.4 dB bilinear).
 - `Dither::setShaper(Shaper::Lipshitz5)`: a five-tap noise shaper, 4.9 dB less
   noise than the first-order shaper in 1-5 kHz. The default is unchanged.
+- `WavetableBank::readBlock()`: the block form of `read()` (an array of
+  phases, one frame position for the block or one per sample), interpolating
+  four float or two double samples at a time on SSE2 and NEON and eight or
+  four with AVX2 (chosen at run time on x86-64). It returns `read()`'s values,
+  operation for operation (bit for bit where the compiler does not contract
+  multiply-adds). At 440 Hz with the level crossfade active, float, phase
+  accumulation included: 2.4 ns per sample with AVX2 and 3.5 ns with SSE2,
+  against 14 ns for `read()`; 4.1 ns with AVX2 when the frame position moves
+  every sample. `Synthesizer`'s wavetable engine reads through it: 28.7 to
+  14.7 ns per voice and frame (one oscillator), 153 to 52 (two oscillators,
+  unison 4), output unchanged.
+- `PitchCorrector::setLowLatency()` (opt-in, default off; state key
+  `lowLatency`): a pitch-synchronous splice engine instead of the phase
+  vocoder. Latency 1024 samples at 44.1/48 kHz (21.3 ms at 48 kHz, the same
+  span at every rate) against 4096. The read head refines the pitch where it
+  plays, so a hard snap holds a +-40 cent vibrato on its note at 1.3 cents rms
+  (the default engine 36 cents, a reference time-domain corrector 5.5), and a
+  corrected sustained vowel keeps an 87-90 dB harmonic-to-residual ratio
+  (vocoder 39-57 dB). At zero correction it is an exact delay. Formant
+  preservation does not apply in this mode. The default engine and its output
+  are unchanged (bit-identical).
+- `Resampler::setOfflineEngine(OfflineEngine::TwoStage)` (opt-in; `Direct`
+  stays the default, so default audio is unchanged): `process()` and
+  `processRange()` band-limit the input by FFT convolution (at the input rate,
+  or at twice it when the lower Nyquist is above a quarter of the input rate)
+  and change the rate with a 22-34 tap kernel. Every tier keeps Direct's
+  passband edge, image and alias rejection and in-band tone residual, or
+  improves them (Ultra, 96 to 44.1 kHz: alias of stopband tones -218 dB
+  instead of -209). Double, ns per input sample once prepared, Direct to
+  TwoStage: Ultra 26.2 to 4.0 (96 to 44.1 kHz), 26.9 to 7.0 (48 to 44.1),
+  27.7 to 8.0 (44.1 to 48), 60.3 to 12.8 (44.1 to 96); High 16.4 to 3.8,
+  16.6 to 6.7, 20.4 to 7.5, 42.1 to 11.4. Both instantiations compute in
+  double, so float output is limited by its own rounding (48 to 96 kHz High,
+  20 kHz tone: image residual -162.9 dB instead of -141.0). On in-band
+  material the two engines agree to -152 dB (High) and -222 dB (Ultra);
+  `processRange()` spans agree with each other and with `process()` bit for
+  bit; `getReach()` follows the engine in force. New constant
+  `Resampler::kMaxTwoStageOrder`.
 
 ### Changed
 
@@ -83,6 +121,50 @@ All notable user-facing changes to DSPark are documented here.
   `processSample()`); `Hilbert` skips its zero taps (SSE2: 1.6x float, 2.7x
   double; AVX2: 2.2x double, float unchanged); `fastLog` reads the exponent
   bits (1.3x GCC, 1.75x MSVC, float).
+- `SampleReader` (the zone reader of `Sampler` and `Synthesizer`'s sample
+  source): at or below the recording's rate the two polyphase rows are
+  blended and both output channels' dot products taken in one vector pass
+  (AVX2 at run time on x86-64), with every sum formed in the order of the
+  scalar form, so the output is unchanged. Per stereo float frame, the reader
+  alone: 37.7 to 13.3 ns with AVX2, 17.4 ns with SSE2; double 41.8 to 17.7
+  (AVX2). A `Sampler` voice two octaves down: 39.6 to 26.5 ns per frame.
+- `GranularProcessor`: the grain cloud is loudness neutral at its defaults.
+  Each grain's gain now compensates the Hann envelope's mean square (3/8) and
+  the equal-power pan's (1/2), so the wet path is 7.27 dB louder than before
+  (the same factor, sqrt(16/3), at every setting), and the defaults measure
+  within 0.3 dB of the dry input on white and pink noise, a chord and a sine
+  (they measured -7.4 dB). The overlap behind the gain now counts a grain's
+  actual length and the 64-grain pool, so capped clouds also stay within
+  0.7 dB (a 500 ms, 200 grains/s cloud measured -9.5 dB). With jitter, pitch
+  and pitch jitter all at 0 the grains add in amplitude: +1.1 dB at the
+  default density.
+- `PitchDetector` reads pitch in noise. The period is chosen by a vote over a
+  Beta distribution of thresholds (the frame stage of Mauch and Dixon 2014;
+  `setThreshold()` sets its mean, default 0.1 as before), and a dip up to the
+  voicing ceiling (0.30 at the default) reads voiced when the window is
+  steady. Measured at 48 kHz on harmonic tones of 70 to 1000 Hz in white
+  noise, readings within 50 cents: 87.4% at 5 dB SNR (0% before: every frame
+  read unvoiced) and 92.0% at 10 dB (88.5%), with octave errors at 10 dB down
+  from 6.8% to 0; a clean-room port of the method's frame stage scores 87.3%
+  and 92.0%. At 0 dB SNR the detector still reads unvoiced. White and pink
+  noise stay unvoiced; resonant noise (Q 5 to 10 band-pass) now reads its
+  centre in 2% to 73% of frames, at confidence 0.94 or less.
+  Default output change: steady clean tones read bit-identically; on clean
+  material with sweeps and legato note changes 98% of readings are
+  unchanged, confidently wrong readings fall from 127 to 78 of 66090 (an
+  octave error at a high note whose period falls between lags is gone), and
+  some windows across a legato note change now read the period both notes
+  share, at confidence 0.75 to 0.89. A fundamental below the register no
+  longer reads as the lowest lag (46.9 Hz at 48 kHz, 25 cents above F#1).
+  Noisy readings carry their own confidence (about 0.76 at 5 dB SNR), so
+  `PitchFollower` at its default gate of 0.85 keeps ignoring a noisy tone; a
+  gate of 0.7 tracks a 220 Hz tone at 5 dB SNR within 15 cents.
+  `PitchCorrector`, which acts on any voiced reading, now corrects a tone at
+  5 dB SNR (in tune 98% of the time, against 0% before); on clean notes its
+  steady stretches stay in tune as before and one frame of 180 at a note
+  change differs. CPU: 6% less on clean tones (a redundant energy pass is
+  removed and the candidate scan stops once the choice is settled), 1% to 3%
+  more on noise.
 
 ### Fixed
 

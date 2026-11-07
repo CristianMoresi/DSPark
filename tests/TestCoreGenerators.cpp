@@ -14,6 +14,7 @@
 #include "../Core/AnalogRandom.h"
 #include "../Core/FFT.h"
 #include "../Core/WindowFunctions.h"
+#include "../Core/SimdOps.h"
 
 #include <algorithm>
 #include <array>
@@ -2456,6 +2457,183 @@ DSPARK_TEST(WavetableBank_morph_is_continuous)
         if (ph >= 1.0) ph -= 1.0;
     }
     EXPECT_LT(sweepStep, staticStep * 1.01);
+}
+
+namespace {
+
+/// readBlock() against read() sample by sample, over random pitches, frame
+/// positions (fixed and per sample, in and out of range) and phases (a few
+/// outside [0, 1) and NaN), with both level layouts and the weight extremes.
+/// Returns the largest difference relative to max(1, |read()|).
+template <typename T>
+double wavetableBlockError(const WavetableBank& bank)
+{
+    uint64_t state = 0x9E3779B97F4A7C15ull;
+    const auto uniform = [&state] {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return static_cast<double>(state >> 11) * 0x1.0p-53;
+    };
+    std::vector<double> phases(67), positions(67);
+    std::vector<T> fixedOut(67), movingOut(67);
+    const double frames = static_cast<double>(bank.getNumFrames() - 1);
+    double worst = 0.0;
+    for (int rep = 0; rep < 600; ++rep)
+    {
+        const double hz = 20.0 * std::pow(1000.0, uniform());
+        WavetableBank::Mip mip = bank.selectMip(hz, 48000.0);
+        if (rep % 11 == 0) mip.weight = 1.0f;
+        if (rep % 13 == 0) mip.weight = 0.0f;
+        const int n = 1 + static_cast<int>(uniform() * 66.0);
+        const double fixedPos = (rep % 3 == 0) ? std::floor(uniform() * (frames + 1.0)) : uniform() * frames;
+        const double p0 = uniform() * frames * 1.4 - 0.2, step = (uniform() - 0.5) * 0.3;
+        double ph = uniform();
+        for (int j = 0; j < n; ++j)
+        {
+            phases[static_cast<size_t>(j)] = ph;
+            ph += hz / 48000.0;
+            if (ph >= 1.0) ph -= 1.0;
+            positions[static_cast<size_t>(j)] = p0 + step * j;
+        }
+        if (rep % 7 == 0 && n > 3) phases[3] = 1.25;
+        if (rep % 9 == 0 && n > 2) phases[2] = std::numeric_limits<double>::quiet_NaN();
+        if (rep % 17 == 0) positions[0] = std::numeric_limits<double>::quiet_NaN();
+        bank.readBlock<T>(phases.data(), fixedPos, mip, fixedOut.data(), n);
+        bank.readBlock<T>(phases.data(), positions.data(), mip, movingOut.data(), n);
+        for (int j = 0; j < n; ++j)
+        {
+            const auto i = static_cast<size_t>(j);
+            const T a = bank.read<T>(phases[i], fixedPos, mip);
+            const T b = bank.read<T>(phases[i], positions[i], mip);
+            worst = std::max(worst, std::abs(static_cast<double>(fixedOut[i] - a)) / std::max(1.0, std::abs(static_cast<double>(a))));
+            worst = std::max(worst, std::abs(static_cast<double>(movingOut[i] - b)) / std::max(1.0, std::abs(static_cast<double>(b))));
+            if (!std::isfinite(static_cast<double>(fixedOut[i])) || !std::isfinite(static_cast<double>(movingOut[i])))
+                worst = 1e9;
+        }
+    }
+    return worst;
+}
+
+} // namespace
+
+// readBlock() interpolates four or eight samples at a time instead of one call
+// per sample: 2.4 instead of 14 ns per float sample on AVX2 (3.5 on SSE2),
+// operation for operation the same arithmetic. It matches read() exactly
+// where the compiler does not fuse the scalar multiply-adds; a contracting
+// build moves the last bit (1.8e-7 float, 3.3e-16 double measured).
+DSPARK_TEST(WavetableBank_readBlock_matches_read)
+{
+    const auto& basic = WavetableBank::builtin(WavetableBank::Builtin::Basic);
+    WavetableBank one;   // a single frame, few harmonics: the one-level layout
+    EXPECT_TRUE(one.buildFromHarmonics(1, 40, [](int, int h) {
+        return WavetableBank::Harmonic { 0.0, 1.0 / h };
+    }));
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    for (const bool vectorWide : { true, false })
+    {
+        simd::setRuntimeDispatch(vectorWide && dispatch);
+        EXPECT_LT(wavetableBlockError<float>(basic), 1e-6);
+        EXPECT_LT(wavetableBlockError<float>(one), 1e-6);
+        EXPECT_LT(wavetableBlockError<double>(basic), 1e-13);
+        EXPECT_LT(wavetableBlockError<double>(one), 1e-13);
+    }
+    simd::setRuntimeDispatch(dispatch);
+
+    // An empty bank writes zeros; n <= 0 writes nothing.
+    WavetableBank empty;
+    std::vector<double> ph(5, 0.25);
+    std::vector<float> out(5, 9.0f);
+    empty.readBlock<float>(ph.data(), 0.0, WavetableBank::Mip {}, out.data(), 5);
+    for (float v : out) EXPECT_EQ(v, 0.0f);
+    out.assign(5, 9.0f);
+    basic.readBlock<float>(ph.data(), 0.0, basic.selectMip(440.0, 48000.0), out.data(), 0);
+    for (float v : out) EXPECT_EQ(v, 9.0f);
+}
+
+namespace {
+
+/// The unit-scale gather from its definition: the two polyphase rows blended
+/// at the read fraction, and eight partial sums of weight times sample, met
+/// as ((s0 + s4) + (s1 + s5)) + ((s2 + s6) + (s3 + s7)).
+template <typename T>
+double gatherReference(const T* chan, double pos)
+{
+    using R = detail::SampleReader<T>;
+    const auto& rows = R::polyphaseTable();
+    const double fl = std::floor(pos);
+    const double qf = (pos - fl) * R::kPhases;
+    const int q = std::min(static_cast<int>(qf), R::kPhases - 1);
+    const T g = static_cast<T>(qf - q);
+    const T* r0 = rows.data() + static_cast<size_t>(q) * R::kTaps;
+    const T* x = chan + static_cast<int64_t>(fl) - R::kHalfTaps + 1;
+    T lane[8] = {};
+    for (int t = 0; t < R::kTaps; ++t)
+        lane[t % 8] += (r0[t] + g * (r0[t + R::kTaps] - r0[t])) * x[t];
+    return static_cast<double>(((lane[0] + lane[4]) + (lane[1] + lane[5]))
+                             + ((lane[2] + lane[6]) + (lane[3] + lane[7])));
+}
+
+template <typename T>
+double gatherError(int channels, int outChannels, double ratio)
+{
+    const int length = 20000;
+    std::vector<T> audio(static_cast<size_t>(2 * length));
+    uint32_t state = 1234567u;
+    for (auto& v : audio)
+    {
+        state = state * 1664525u + 1013904223u;
+        v = static_cast<T>(static_cast<double>(state >> 8) / 16777216.0 - 0.5);
+    }
+    const T* ch[2] = { audio.data(), audio.data() + length };
+    SampleZoneSpec<T> spec;
+    spec.audio = AudioBufferView<const T>(ch, channels, length);
+    spec.startOffset = 100;
+    detail::SampleZoneData<T> zone;
+    if (!detail::buildSampleZone(spec, zone)) return 1e9;
+    using R = detail::SampleReader<T>;
+    R reader;
+    reader.allocate();
+    reader.start(zone, ratio);
+    std::vector<T> weights(R::kWeightsLength);
+    double pos = 100.0, worst = 0.0;
+    for (int i = 0; i < 4000; ++i, pos += ratio)
+    {
+        double a0 = 0.0, a1 = 0.0;
+        if (reader.next(ratio, outChannels, weights.data(), a0, a1) != R::Frame::Produced) return 1e9;
+        const double s0 = gatherReference(zone.audio.data(), pos);
+        const double s1 = channels > 1 ? gatherReference(zone.audio.data() + length, pos) : s0;
+        const double e0 = outChannels == 1 ? (channels > 1 ? s0 / 2 + s1 / 2 : s0) : s0;
+        worst = std::max(worst, std::abs(a0 - e0) / std::max(1.0, std::abs(e0)));
+        if (outChannels > 1 && channels > 1)
+            worst = std::max(worst, std::abs(a1 - s1) / std::max(1.0, std::abs(s1)));
+    }
+    return worst;
+}
+
+} // namespace
+
+// At or below the recording's rate the reader blends two polyphase rows and
+// takes the dot product with both channels in one vector pass: 13.3 instead
+// of 37.7 ns per stereo float frame on AVX2 (17.4 on SSE2), the same sums
+// formed in the same order as the reference here (exact where the compiler
+// does not fuse multiply-adds).
+DSPARK_TEST(SampleReader_unit_gather_matches_its_kernel)
+{
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    for (const bool vectorWide : { true, false })
+    {
+        simd::setRuntimeDispatch(vectorWide && dispatch);
+        for (const double ratio : { 0.5, 0.7491535, 1.0 })
+        {
+            EXPECT_LT(gatherError<float>(2, 2, ratio), 1e-6);
+            EXPECT_LT(gatherError<float>(1, 2, ratio), 1e-6);
+            EXPECT_LT(gatherError<float>(2, 1, ratio), 1e-6);
+            EXPECT_LT(gatherError<double>(2, 2, ratio), 1e-13);
+            EXPECT_LT(gatherError<double>(1, 1, ratio), 1e-13);
+        }
+    }
+    simd::setRuntimeDispatch(dispatch);
 }
 
 DSPARK_TEST(WavetableOsc_low_pitch_floor_and_external_bank_morph)

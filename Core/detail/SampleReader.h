@@ -21,17 +21,25 @@
  * change on every call. Allocation happens in allocate() and when a zone is
  * built; reading is allocation free. One reader belongs to one thread.
  *
- * Dependencies: ../DspMath.h, ../SampleZone.h.
+ * The gather at unit kernel scale blends the two polyphase rows and takes the
+ * dot product with both output channels in one vector pass (four or eight
+ * lanes, AVX2 chosen at run time on x86-64), forming every sum exactly as the
+ * scalar form does: the output is the same, bit for bit, unless the compiler
+ * contracts the scalar arithmetic into fused multiply-adds.
+ *
+ * Dependencies: ../DspMath.h, ../SampleZone.h, ../SimdOps.h.
  */
 
 #include "../DspMath.h"
 #include "../SampleZone.h"
+#include "../SimdOps.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <type_traits>
 #include <vector>
 
 namespace dspark::detail
@@ -149,6 +157,119 @@ inline void sampleZonePanGains(double pan, int channels, double gain,
         right = gain * std::min(1.0, 1.0 + pan);
     }
 }
+
+/// Lanes of the unit-scale gather's partial sums: tap t adds into sum t % 8,
+/// and the eight sums meet as ((s0 + s4) + (s1 + s5)) + ((s2 + s6) + (s3 + s7)).
+inline constexpr int kSampleGatherLanes = 8;
+
+/// The final reduction of the eight partial sums.
+template <FloatType T>
+inline T sampleGatherReduce(const T* lane) noexcept
+{
+    return ((lane[0] + lane[4]) + (lane[1] + lane[5])) + ((lane[2] + lane[6]) + (lane[3] + lane[7]));
+}
+
+/**
+ * @brief Unit-scale gather of C (1 or 2) channels: the weights are the rows r0
+ *        and r1 blended by g, tap by tap, and each channel's sum is formed in
+ *        the order of kSampleGatherLanes.
+ * @param x0, x1 The channels' samples, `taps` each (x1 unused for C = 1).
+ * @param out    One sum per channel.
+ */
+template <int C, FloatType T>
+inline void sampleGatherNarrow(const T* r0, const T* r1, T g, const T* x0, const T* x1,
+                               int taps, T* out) noexcept
+{
+    constexpr int W = std::is_same_v<T, float> ? simd::kVecFloatNarrow : simd::kVecDoubleNarrow;
+    using V = simd::Vec<T, W>;
+    using R = typename V::V;
+    constexpr int K = kSampleGatherLanes / W;
+    R acc0[K], acc1[K];
+    for (int k = 0; k < K; ++k) acc0[k] = acc1[k] = V::set1(T(0));
+    const R gv = V::set1(g);
+    for (int t = 0; t < taps; t += kSampleGatherLanes)
+        for (int k = 0; k < K; ++k)
+        {
+            const int o = t + k * W;
+            const R a = V::load(r0 + o);
+            const R w = V::add(a, V::mul(gv, V::sub(V::load(r1 + o), a)));
+            acc0[k] = V::add(acc0[k], V::mul(w, V::load(x0 + o)));
+            if constexpr (C == 2) acc1[k] = V::add(acc1[k], V::mul(w, V::load(x1 + o)));
+        }
+    T lane[kSampleGatherLanes];
+    for (int k = 0; k < K; ++k) V::store(lane + k * W, acc0[k]);
+    out[0] = sampleGatherReduce(lane);
+    if constexpr (C == 2)
+    {
+        for (int k = 0; k < K; ++k) V::store(lane + k * W, acc1[k]);
+        out[1] = sampleGatherReduce(lane);
+    }
+}
+
+#if defined(DSPARK_SIMD_EXACT_AVX2)
+DSPARK_SIMD_EXACT_AVX2_BEGIN
+/// sampleGatherReduce() of eight float lanes: (lo + hi) gives s0 + s4 .. s3 + s7.
+inline float sampleGatherReduceAvx2(__m256 v) noexcept
+{
+    const __m128 q = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    const __m128 pairs = _mm_add_ps(q, _mm_shuffle_ps(q, q, _MM_SHUFFLE(2, 3, 0, 1)));   // q0 + q1, q2 + q3
+    return _mm_cvtss_f32(_mm_add_ss(pairs, _mm_movehl_ps(pairs, pairs)));
+}
+
+/// sampleGatherReduce() of lanes 0..3 in `l` and 4..7 in `h`.
+inline double sampleGatherReduceAvx2(__m256d l, __m256d h) noexcept
+{
+    const __m256d q = _mm256_add_pd(l, h);
+    const __m128d q01 = _mm256_castpd256_pd128(q), q23 = _mm256_extractf128_pd(q, 1);
+    const double s01 = _mm_cvtsd_f64(_mm_add_sd(q01, _mm_unpackhi_pd(q01, q01)));
+    const double s23 = _mm_cvtsd_f64(_mm_add_sd(q23, _mm_unpackhi_pd(q23, q23)));
+    return s01 + s23;
+}
+
+/// sampleGatherNarrow() on eight float lanes (one register per channel).
+template <int C>
+inline void sampleGatherAvx2(const float* r0, const float* r1, float g, const float* x0,
+                             const float* x1, int taps, float* out) noexcept
+{
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    const __m256 gv = _mm256_set1_ps(g);
+    for (int t = 0; t < taps; t += kSampleGatherLanes)
+    {
+        const __m256 a = _mm256_loadu_ps(r0 + t);
+        const __m256 w = _mm256_add_ps(a, _mm256_mul_ps(gv, _mm256_sub_ps(_mm256_loadu_ps(r1 + t), a)));
+        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(w, _mm256_loadu_ps(x0 + t)));
+        if constexpr (C == 2) acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(w, _mm256_loadu_ps(x1 + t)));
+    }
+    out[0] = sampleGatherReduceAvx2(acc0);
+    if constexpr (C == 2) out[1] = sampleGatherReduceAvx2(acc1);
+}
+
+/// sampleGatherNarrow() on four double lanes (two registers per channel).
+template <int C>
+inline void sampleGatherAvx2(const double* r0, const double* r1, double g, const double* x0,
+                             const double* x1, int taps, double* out) noexcept
+{
+    __m256d a00 = _mm256_setzero_pd(), a01 = _mm256_setzero_pd();
+    __m256d a10 = _mm256_setzero_pd(), a11 = _mm256_setzero_pd();
+    const __m256d gv = _mm256_set1_pd(g);
+    for (int t = 0; t < taps; t += kSampleGatherLanes)
+    {
+        const __m256d lo = _mm256_loadu_pd(r0 + t), hi = _mm256_loadu_pd(r0 + t + 4);
+        const __m256d wl = _mm256_add_pd(lo, _mm256_mul_pd(gv, _mm256_sub_pd(_mm256_loadu_pd(r1 + t), lo)));
+        const __m256d wh = _mm256_add_pd(hi, _mm256_mul_pd(gv, _mm256_sub_pd(_mm256_loadu_pd(r1 + t + 4), hi)));
+        a00 = _mm256_add_pd(a00, _mm256_mul_pd(wl, _mm256_loadu_pd(x0 + t)));
+        a01 = _mm256_add_pd(a01, _mm256_mul_pd(wh, _mm256_loadu_pd(x0 + t + 4)));
+        if constexpr (C == 2)
+        {
+            a10 = _mm256_add_pd(a10, _mm256_mul_pd(wl, _mm256_loadu_pd(x1 + t)));
+            a11 = _mm256_add_pd(a11, _mm256_mul_pd(wh, _mm256_loadu_pd(x1 + t + 4)));
+        }
+    }
+    out[0] = sampleGatherReduceAvx2(a00, a01);
+    if constexpr (C == 2) out[1] = sampleGatherReduceAvx2(a10, a11);
+}
+DSPARK_SIMD_EXACT_AVX2_END
+#endif
 
 /**
  * @class SampleReader
@@ -308,8 +429,9 @@ public:
     }
 
 private:
-    /** Dot product over eight independent partial sums: a single running sum
-     *  is one long dependency chain the compiler may not reorder. */
+    /** Dot product over eight independent partial sums (kSampleGatherLanes):
+     *  a single running sum is one long dependency chain the compiler may not
+     *  reorder. */
     [[nodiscard]] static double dot(const T* w, const T* x, int n) noexcept
     {
         T a[8] = { T(0), T(0), T(0), T(0), T(0), T(0), T(0), T(0) };
@@ -373,6 +495,31 @@ private:
         return 2 * half;
     }
 
+    /** The two polyphase rows and blend kernelWeights() uses at fraction frac. */
+    static const T* unitRows(double frac, T& g) noexcept
+    {
+        const double qf = frac * kPhases;
+        const int q = std::min(static_cast<int>(qf), kPhases - 1);
+        g = static_cast<T>(qf - static_cast<double>(q));
+        return polyphaseTable().data() + static_cast<size_t>(q) * kTaps;
+    }
+
+    /** Unit-scale gather of one or two channels (see sampleGatherNarrow()). */
+    template <int C>
+    static void gatherRows(const T* r0, T g, const T* x0, const T* x1, T* out) noexcept
+    {
+#if defined(DSPARK_SIMD_EXACT_AVX2)
+    #if defined(DSPARK_SIMD_EXACT_AVX2_DISPATCHED)
+        if (simd::isRuntimeDispatchActive())
+    #endif
+        {
+            sampleGatherAvx2<C>(r0, r0 + kTaps, g, x0, x1, kTaps, out);
+            return;
+        }
+#endif
+        sampleGatherNarrow<C, T>(r0, r0 + kTaps, g, x0, x1, kTaps, out);
+    }
+
     /**
      * Gather form, for readers that start at or below the recording's rate:
      * each output sample is a dot product of the recording with the kernel
@@ -403,13 +550,41 @@ private:
 
         const double fl = std::floor(pos_);
         const int64_t ip = static_cast<int64_t>(fl);
-        const int taps = kernelWeights(weights, pos_ - fl, fc, half);
+        const int taps = (fc >= 1.0) ? kTaps : 2 * half;
 
         const int64_t first = ip - half + 1;
         const bool direct = first >= 0 && first + taps <= z.length
                          && (!loopEngaged_ || (first + taps <= z.loopEnd - z.xfade
                                                && (!wrapped_ || first >= z.loopStart)));
         double acc[2] = { 0.0, 0.0 };
+        if (direct && fc >= 1.0)
+        {
+            // The blended weights and both channels' dot products in one pass.
+            T g = T(0);
+            const T* rows = unitRows(pos_ - fl, g);
+            for (int c0 = 0; c0 < used; c0 += 2)
+            {
+                const int pair = std::min(2, used - c0);
+                const T* x0 = z.audio.data() + static_cast<size_t>(c0) * static_cast<size_t>(z.length)
+                            + static_cast<size_t>(first);
+                T sums[2] = { T(0), T(0) };
+                if (pair == 2)
+                    gatherRows<2>(rows, g, x0, x0 + static_cast<size_t>(z.length), sums);
+                else
+                    gatherRows<1>(rows, g, x0, nullptr, sums);
+                for (int c = 0; c < pair; ++c)
+                {
+                    const auto sum = static_cast<double>(sums[c]);
+                    if (nCh == 1) acc[0] += sum / zc;
+                    else acc[c0 + c] = sum;
+                }
+            }
+            a0 = acc[0];
+            a1 = acc[1];
+            advanceGather(ratio, half, loopLen);
+            return Frame::Produced;
+        }
+        kernelWeights(weights, pos_ - fl, fc, half);
         for (int c = 0; c < used; ++c)
         {
             const T* chan = z.audio.data() + static_cast<size_t>(c) * static_cast<size_t>(z.length);
@@ -427,7 +602,14 @@ private:
         }
         a0 = acc[0];
         a1 = acc[1];
+        advanceGather(ratio, half, loopLen);
+        return Frame::Produced;
+    }
 
+    /** Moves the gather read position on by one output sample. */
+    void advanceGather(double ratio, int half, double loopLen) noexcept
+    {
+        const SampleZoneData<T>& z = *zone_;
         pos_ += ratio;
         if (loopEngaged_ && pos_ >= static_cast<double>(z.loopEnd))
         {
@@ -435,7 +617,6 @@ private:
             wrapped_ = true;
             justWrapped_ = z.loopEnd - z.xfade - half <= z.loopStart;
         }
-        return Frame::Produced;
     }
 
     /**

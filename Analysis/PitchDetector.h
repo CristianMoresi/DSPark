@@ -12,6 +12,28 @@
  * cross-correlation (YIN-FFT, 3 FFTs per detection). A mirrored input
  * buffer keeps every analysis window fully contiguous in memory.
  *
+ * The period is chosen as in the frame stage of the probabilistic-threshold
+ * method of Mauch & Dixon (2014): instead of one fixed threshold, a Beta
+ * distribution of thresholds votes, each picking the first dip of the
+ * normalised difference function below it, and the most probable dip wins.
+ * A dip is reported when the prior accepts it with probability 1% or more,
+ * which at the default setting voices dips up to 0.30 where the single
+ * threshold stopped at 0.10; above 0.10 the window must also be steady (its
+ * halves within a 0.6 energy ratio), so note starts and ends read as before.
+ *
+ * Measured at 48 kHz on harmonic tones of 70 to 1000 Hz (random spectral
+ * tilt) in white noise, readings within 50 cents of the fundamental: 87.4%
+ * of 2000 tones at 5 dB SNR, where the single threshold read every frame
+ * unvoiced, and 92.0% of 400 at 10 dB (88.5% before), with octave errors
+ * down from 6.8% to 0; a clean-room port of the method's frame stage scores
+ * 87.3% and 92.0% on the same tones. At 0 dB SNR the detector reads
+ * unvoiced rather than guess (that frame stage is right 30% of the time
+ * there and wrong 70%). Noisy readings report their honest confidence, about
+ * 0.76 at 5 dB, so a confidence gate keeps ignoring them. Steady clean tones
+ * read exactly as before; on clean material the changes are fewer octave
+ * errors and a few windows across a legato note change that now read the
+ * period they share, at reduced confidence.
+ *
  * Threading:
  * - prepare(): setup thread (allocates; not concurrent with pushSamples()).
  * - pushSamples() / reset(): audio thread (stream owner); reset() is not
@@ -216,7 +238,15 @@ public:
         return frequency_.load(std::memory_order_relaxed);
     }
 
-    /** @brief Returns the detection confidence [0.0 - 1.0] safely from any thread. */
+    /**
+     * @brief Returns the detection confidence [0.0 - 1.0] safely from any thread.
+     *
+     * One minus the normalised difference at the chosen dip: above
+     * 1 - getThreshold() (0.9 by default) for the readings single-threshold
+     * YIN also made, lower for noisier ones down to 1 - the voicing ceiling
+     * (0.70 by default; about 0.76 for a tone at 5 dB SNR). Gate on it when
+     * only clean readings should count (PitchFollower does, at 0.85).
+     */
     [[nodiscard]] T getConfidence() const noexcept
     {
         return confidence_.load(std::memory_order_relaxed);
@@ -240,8 +270,14 @@ public:
     }
 
     /**
-     * @brief Sets the sensitivity threshold (clamped to 0.01 - 0.5).
-     * Lower is stricter. Non-finite values are ignored.
+     * @brief Sets the sensitivity threshold (clamped to 0.01 - 0.5; default 0.1).
+     *
+     * The mean of the Beta(2, b) threshold distribution (Mauch & Dixon's
+     * prior; the default is their Beta(2, 18)). Lower is stricter: the voicing ceiling,
+     * the deepest normalised difference that still reads voiced, follows it
+     * at about three times the mean (0.033 at 0.01, 0.16 at 0.05, 0.30 at
+     * 0.1, 0.43 at 0.15) and is capped at 0.5 from a mean of 0.2 up.
+     * Non-finite values are ignored.
      */
     void setThreshold(T threshold) noexcept
     {
@@ -285,24 +321,6 @@ private:
         // writePos_ points to the oldest sample in the mirrored buffer.
         const T* currentWindow = &buffer_[static_cast<size_t>(writePos_)];
 
-        // Silence check / Energy calculation on contiguous memory. The sum
-        // spans the whole window, so it doubles as the non-finite gate: with
-        // any NaN/Inf sample present the old code filled the CMND with zeros
-        // ((NaN > 0) is false) and published fs/2 at confidence 1.0 - a fake
-        // detection with maximum confidence. Report unvoiced instead; the
-        // bad samples flush out of the window on their own.
-        T energy = T(0);
-        for (int i = 0; i < windowSize_; ++i) {
-            energy += currentWindow[i] * currentWindow[i];
-        }
-
-        if (energy < T(1e-10) || !std::isfinite(energy))
-        {
-            frequency_.store(T(0), std::memory_order_relaxed);
-            confidence_.store(T(0), std::memory_order_relaxed);
-            return;
-        }
-
         // YIN-FFT difference function:
         //   d(tau) = E1 + E2(tau) - 2*r(tau)
         // with E1 = sum of x[0..W)^2 (constant), E2(tau) the energy of the
@@ -315,16 +333,29 @@ private:
         for (int i = 0; i < windowSize_; ++i)
             prefixSq_[static_cast<size_t>(i + 1)] =
                 prefixSq_[static_cast<size_t>(i)] + currentWindow[i] * currentWindow[i];
+
+        // Silence check on the window energy, the last prefix sum. It spans
+        // the whole window, so it doubles as the non-finite gate: with any
+        // NaN/Inf sample present the old code filled the CMND with zeros
+        // ((NaN > 0) is false) and published fs/2 at confidence 1.0 - a fake
+        // detection with maximum confidence. Report unvoiced instead; the
+        // bad samples flush out of the window on their own.
+        const T energy = prefixSq_[static_cast<size_t>(windowSize_)];
+        if (energy < T(1e-10) || !std::isfinite(energy))
+        {
+            frequency_.store(T(0), std::memory_order_relaxed);
+            confidence_.store(T(0), std::memory_order_relaxed);
+            return;
+        }
         const T e1 = prefixSq_[static_cast<size_t>(W)];
 
         // (b) r(tau) via FFT cross-correlation: IFFT(conj(FFT(first half)) * FFT(window))
-        std::fill(fftTime_.begin(), fftTime_.end(), T(0));
         std::copy(currentWindow, currentWindow + W, fftTime_.begin());
+        std::fill(fftTime_.begin() + W, fftTime_.end(), T(0));
         fft_->forward(fftTime_.data(), specHalf_.data());
 
-        std::fill(fftTime_.begin(), fftTime_.end(), T(0));
         std::copy(currentWindow, currentWindow + windowSize_, fftTime_.begin());
-        fft_->forward(fftTime_.data(), specFull_.data());
+        fft_->forward(fftTime_.data(), specFull_.data());   // tail beyond the window is still zero
 
         const int numBins = fftSize_ / 2 + 1;
         for (int k = 0; k < numBins; ++k)
@@ -358,23 +389,88 @@ private:
                 (runningSum > T(0)) ? d * static_cast<T>(tau) / runningSum : T(1);
         }
 
-        // Search for dip below threshold
-        int tauEstimate = -1;
-        for (int tau = 2; tau < halfWindow_; ++tau)
+        // (d) Candidate selection over a distribution of thresholds (the
+        // frame stage of Mauch & Dixon 2014). A threshold s picks the first
+        // local minimum of the CMND below s, so scanning the minima in lag
+        // order, a minimum that is lower than every earlier one is picked by
+        // exactly the thresholds in (its value, the previous record]: its
+        // probability is the prior mass of that interval. Thresholds below
+        // the deepest minimum pick nothing and hand kAbsoluteMinWeight of
+        // their mass to the deepest minimum. The most probable candidate
+        // wins; ties go to the shorter lag, as the first-dip rule does.
+        //
+        // A dip is valued at the vertex of the parabola through its three
+        // samples: a period that falls between two lags (a high note, a
+        // sweep) has a shallow sample at its true minimum, and valued at the
+        // samples an exact-integer multiple of it outvoted it (measured: a
+        // 3.3 kHz sawtooth at 44.1 kHz read an octave low at confidence
+        // 0.997). At a strict minimum the vertex lies within half a lag and
+        // its value is at least c1 - |c0 - c2| / 8; that bound, in the sample
+        // type and loosened by kScreenSlack (far above its rounding error),
+        // rejects nearly every lag before the exact test in double. The
+        // screen is branch-free on purpose: on noise the minima fall at
+        // random lags.
+        if (threshold != cachedThreshold_) updatePrior(threshold);
+        int bestTau = -1, lastTau = -1;
+        double bestMass = -1.0, lastMass = 0.0, recordValue = 1.0, recordSurvival = 0.0;
+        T screen = T(1) + kScreenSlack;
+        const T* c = yinBuffer_.data();
+        for (int tau = 2; tau + 1 < W; ++tau)
         {
-            if (yinBuffer_[static_cast<size_t>(tau)] < threshold)
-            {
-                while (tau + 1 < halfWindow_ &&
-                       yinBuffer_[static_cast<size_t>(tau + 1)] < yinBuffer_[static_cast<size_t>(tau)])
-                {
-                    ++tau;
-                }
-                tauEstimate = tau;
+            const T c0 = c[tau - 1], c1 = c[tau], c2 = c[tau + 1];
+            if (!((c1 < c0) & (c1 <= c2) & (c1 - std::abs(c0 - c2) * T(0.125) < screen)))
+                continue;
+            const double d0 = static_cast<double>(c0), d1 = static_cast<double>(c1),
+                         d2 = static_cast<double>(c2);
+            const double v = std::max(0.0, d1 - (d0 - d2) * (d0 - d2) / (8.0 * (d0 - 2.0 * d1 + d2)));
+            if (!(v < recordValue)) continue;
+            if (lastTau >= 0 && lastMass > bestMass) { bestMass = lastMass; bestTau = lastTau; }
+            const double s = priorSurvival(v);
+            lastMass = s - recordSurvival;
+            lastTau = tau;
+            recordValue = v;
+            recordSurvival = s;
+            screen = static_cast<T>(v) + kScreenSlack;
+
+            // Every later candidate shares at most the prior mass below this
+            // record, plus the absolute-minimum share of it. Once the leader
+            // holds more, and the share that goes to the deepest minimum
+            // cannot swap this record with the earlier best, no later lag
+            // changes the choice: stop (a clean dip near 0 ends the scan at
+            // once, as the first-dip rule did). The result is the full scan's.
+            const double below = 1.0 - s;
+            const bool settled = (lastMass > bestMass)
+                              || (bestMass > lastMass + kAbsoluteMinWeight * below);
+            if (settled && std::max(bestMass, lastMass) > (1.0 + kAbsoluteMinWeight) * below)
                 break;
-            }
+        }
+        if (lastTau >= 0)
+        {
+            lastMass += kAbsoluteMinWeight * (1.0 - recordSurvival);
+            if (lastMass > bestMass) { bestMass = lastMass; bestTau = lastTau; }
         }
 
-        if (tauEstimate < 0)
+        // Voicing: the chosen dip must be one the threshold prior accepts
+        // with probability at least kVoicedSurvival, a ceiling on its CMND
+        // value (0.30 at the default prior mean of 0.1). A periodic signal in
+        // white noise dips to about the noise share of the power (0.24 at
+        // 5 dB SNR); noise without a period has no dip near the ceiling
+        // (white noise bottoms out near 0.85). A dip above the threshold
+        // itself also needs a steady window, its two halves within
+        // kMinHalfEnergyRatio of each other in energy: across a note's start
+        // or end the dip is shallow for another reason, and the period read
+        // there is biased (measured 9 cents high a hop after a 220 Hz note
+        // stopped), so those windows stay unvoiced as under the single
+        // threshold.
+        const int tauEstimate = bestTau;
+        const double dip = (tauEstimate < 0) ? 1.0
+                         : static_cast<double>(yinBuffer_[static_cast<size_t>(tauEstimate)]);
+        const double firstHalf = static_cast<double>(e1);
+        const double secondHalf = static_cast<double>(energy) - firstHalf;
+        const bool steady = std::min(firstHalf, secondHalf)
+                          >= kMinHalfEnergyRatio * std::max(firstHalf, secondHalf);
+        if (tauEstimate < 0 || !(dip < voicingCeiling_)
+            || (!(dip < static_cast<double>(threshold)) && !steady))
         {
             frequency_.store(T(0), std::memory_order_relaxed);
             confidence_.store(T(0), std::memory_order_relaxed);
@@ -431,6 +527,54 @@ private:
         return static_cast<T>(static_cast<double>(tau) + offset);
     }
 
+    /**
+     * @brief Probability that a threshold drawn from the prior exceeds x.
+     *
+     * The prior is Beta(2, b) on [0, 1], whose survival function has the
+     * closed form (1 - x)^b (1 + b x) for any real b > 0.
+     */
+    [[nodiscard]] double priorSurvival(double x) const noexcept
+    {
+        if (!(x > 0.0)) return 1.0;
+        if (!(x < 1.0)) return 0.0;
+        return std::pow(1.0 - x, priorB_) * (1.0 + priorB_ * x);
+    }
+
+    /**
+     * @brief Rebuilds the threshold prior for a new mean (audio thread, on a
+     *        threshold change only): Beta(2, b) with mean 2 / (2 + b), and the
+     *        CMND ceiling x where its survival falls to kVoicedSurvival, never
+     *        above kMaxVoicingCeiling.
+     */
+    void updatePrior(T threshold) noexcept
+    {
+        cachedThreshold_ = threshold;
+        const double mean = static_cast<double>(threshold);
+        priorB_ = 2.0 * (1.0 - mean) / mean;
+        double lo = 0.0, hi = 1.0;   // survival falls monotonically from 1 to 0
+        for (int i = 0; i < 48; ++i)
+        {
+            const double mid = 0.5 * (lo + hi);
+            if (priorSurvival(mid) > kVoicedSurvival) lo = mid; else hi = mid;
+        }
+        voicingCeiling_ = std::min(lo, kMaxVoicingCeiling);
+    }
+
+    /// Margin of the sample-type screen over the exact record (CMND units).
+    static constexpr T kScreenSlack = T(1.0e-4);
+    /// Weight of the deepest minimum when a threshold picks nothing (Mauch &
+    /// Dixon's 0.01).
+    static constexpr double kAbsoluteMinWeight = 0.01;
+    /// Prior probability of acceptance below which the chosen dip reads
+    /// unvoiced: the voicing ceiling (0.30 at the default prior mean 0.1).
+    static constexpr double kVoicedSurvival = 1.0e-2;
+    /// Least energy ratio of the window halves for a dip above the threshold
+    /// to read voiced (a steady tone measures 0.72 or more, clean or noisy).
+    static constexpr double kMinHalfEnergyRatio = 0.6;
+    /// Highest voicing ceiling: a dip at half the mean difference or above
+    /// (noise power equal to the signal's) never reads voiced.
+    static constexpr double kMaxVoicingCeiling = 0.5;
+
     /// Automatic-window policy: the span 2048 samples cover at 48 kHz,
     /// resolved inside [512, 16384] (covers 8 kHz .. 384 kHz without clamping).
     static constexpr double kAutoSpanRef = 2048.0;
@@ -445,6 +589,11 @@ private:
     int writePos_ = 0;
     int samplesSinceLastDetect_ = 0;
     std::atomic<T> threshold_{ T(0.10) };
+
+    // Threshold prior as last built by updatePrior() (audio thread only).
+    T cachedThreshold_ = T(-1);
+    double priorB_ = 18.0;
+    double voicingCeiling_ = 0.0;
 
     // Thread-safe outputs
     std::atomic<T> frequency_{T(0)};

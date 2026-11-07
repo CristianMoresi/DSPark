@@ -239,12 +239,14 @@ DSPARK_TEST(State_roundtrip_pitch_corrector_and_spectral_freeze)
         a->setScale(0x0AB5, 9);   // major mask rooted at A
         a->setRetuneSpeedMs(60.0f);
         a->setFormantPreserve(true);
+        a->setLowLatency(true);
         const auto blob = a->getState();
         EXPECT_TRUE(b->setState(blob.data(), blob.size()));
         EXPECT_EQ(static_cast<int>(b->getScaleMask()), 0x0AB5);
         EXPECT_EQ(b->getRootPitchClass(), 9);
         EXPECT_NEAR(b->getRetuneSpeedMs(), 60.0f, 1e-6f);
         EXPECT_TRUE(b->getFormantPreserve());
+        EXPECT_TRUE(b->getLowLatency());
         EXPECT_TRUE(blobsEqual(blob, b->getState()));
 
         Chorus<float> other;

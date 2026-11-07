@@ -2311,20 +2311,43 @@ private:
             const WavetableBank& bank = bankFor(v, k);
             const double frames = static_cast<double>(std::max(bank.getNumFrames() - 1, 0));
             const auto& wp = v.wtPosition[static_cast<size_t>(k)];
-            for (int u = 0; u < v.unison; ++u)
+            // The bank reads a block per unison copy: the phases are
+            // accumulated first (the same recursion as a per-sample loop),
+            // then interpolated together, which the bank vectorises.
+            constexpr int kWaveChunk = kControlPeriod * 4;
+            for (int c0 = 0; c0 < m; c0 += kWaveChunk)
             {
-                auto& uv = v.uni[static_cast<size_t>(u)];
-                const auto& fr = uv.freq[static_cast<size_t>(k)];
-                double& phase = uv.wtPhase[static_cast<size_t>(k)];
-                const auto mip = uv.mip[static_cast<size_t>(k)];
-                for (int j = 0; j < m; ++j)
+                const int mc = std::min(kWaveChunk, m - c0);
+                const bool morphing = wp.step != 0.0;
+                std::array<double, kWaveChunk> positions;   // written below when morphing
+                if (morphing)
+                    for (int j = 0; j < mc; ++j)
+                        positions[static_cast<size_t>(j)] = wp.at(pos0 + c0 + j) * frames;
+                const double still = wp.at(pos0 + c0) * frames;
+                for (int u = 0; u < v.unison; ++u)
                 {
-                    const int pos = pos0 + j;
-                    const double s = static_cast<double>(bank.read<T>(phase, wp.at(pos) * frames, mip)) * lv.at(pos);
-                    phase += fr.at(pos) / internalRate_;
-                    if (phase >= 1.0) phase -= 1.0;
-                    L[j] += s * uv.gainL;
-                    R[j] += s * uv.gainR;
+                    auto& uv = v.uni[static_cast<size_t>(u)];
+                    const auto& fr = uv.freq[static_cast<size_t>(k)];
+                    double& phase = uv.wtPhase[static_cast<size_t>(k)];
+                    const auto mip = uv.mip[static_cast<size_t>(k)];
+                    std::array<double, kWaveChunk> phases;   // the first mc entries are written
+                    std::array<T, kWaveChunk> wave;
+                    for (int j = 0; j < mc; ++j)
+                    {
+                        phases[static_cast<size_t>(j)] = phase;
+                        phase += fr.at(pos0 + c0 + j) / internalRate_;
+                        if (phase >= 1.0) phase -= 1.0;
+                    }
+                    if (morphing)
+                        bank.readBlock<T>(phases.data(), positions.data(), mip, wave.data(), mc);
+                    else
+                        bank.readBlock<T>(phases.data(), still, mip, wave.data(), mc);
+                    for (int j = 0; j < mc; ++j)
+                    {
+                        const double s = static_cast<double>(wave[static_cast<size_t>(j)]) * lv.at(pos0 + c0 + j);
+                        L[c0 + j] += s * uv.gainL;
+                        R[c0 + j] += s * uv.gainR;
+                    }
                 }
             }
         }

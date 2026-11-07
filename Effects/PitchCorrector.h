@@ -158,7 +158,8 @@
  *
  * Latency: exactly the internal shifter's twice the frame - 4096 samples at
  * 44.1/48 kHz (85.3 ms at 48 kHz, 92.9 ms at 44.1 kHz), and about the same
- * time at every other rate - reported by getLatency(). The correction
+ * time at every other rate - reported by getLatency(); the low-latency engine
+ * (below) runs at a quarter of that. The correction
  * DECISION additionally trails the input by the detector's analysis span (about
  * 43 ms plus one hop). Because that is shorter than the signal latency, a
  * freshly attacked note leaves the corrector already corrected; the decision
@@ -205,13 +206,62 @@
  * moves (the anti-chipmunk correction). It costs two extra FFTs per analysis
  * frame and is off by default.
  *
- * Threading: setScale(), setRetuneSpeedMs(), setFormantPreserve() and their
- * getters are lock-free single-word atomics and may be called from any thread,
- * with one non-audio writer as everywhere in DSPark; the scale mask and its
- * root travel packed in one word, so a torn mask/root pair cannot exist.
- * prepare() belongs to the setup thread (it allocates), and so do
- * getState()/setState(), which allocate. processBlock(),
- * reset() and getLatency() belong to the stream owner. The inner detector and
+ * Low-latency engine: setLowLatency(true) replaces the phase vocoder with a
+ * pitch-synchronous splice in the time domain. A read head trails the input
+ * by half the detector's window (1024 samples at 44.1/48 kHz, 21.3 ms at
+ * 48 kHz; the same span at every rate) and
+ * advances at the correction ratio through the input history (32-tap sinc;
+ * the stretched kernel of Core/Interpolation.h above 2^(1/8)). Every fragment
+ * (a sixteenth of the detector window, 128 samples at 48 kHz) the head may
+ * jump by a whole number of periods, at least a fragment, under a
+ * raised-cosine crossfade over the next fragment: the two reads are then the
+ * same waveform, so the splice is inaudible on voiced sound. The jumps keep
+ * the head within half a jump of the centre, so the mean delay is the
+ * reported latency; while a correction is applied the instantaneous delay
+ * wanders within that band: half a period either way for voices below the
+ * fragment rate (375 Hz at 48 kHz), less than a fragment above it. At zero
+ * correction, and at the first sound after silence (where the head
+ * re-centres for free), the engine is an exact delay of getLatency() samples.
+ * Unvoiced sound has no period to align on: the head returns to the centre
+ * with a power-complementary fade once it strays a fragment from it.
+ *
+ * The detector's estimate describes its own integration window, which trails
+ * the read head by several hundred samples (and up to a hop more), so on its
+ * own it would make the correction chase a vibrato about 13 ms late. Once per
+ * fragment the engine therefore refines the period AT the read head, by
+ * normalized correlation of two windows placed symmetrically about it, over
+ * lags within 3 percent of the detector's period, and both the correction
+ * and the jumps use that value.
+ * A correction change takes effect at the next fragment, with no slew: a 1 to
+ * 4 semitone hard snap lands within 10 cents in 4 to 5 ms (the vocoder table
+ * above does not apply). Formant preservation does not apply in this mode:
+ * the formants move with the pitch, as they do in the vocoder without it.
+ *
+ * Measured at 48 kHz on synthetic voices (the file's instruments, see the
+ * tests), against the default engine and a reference time-domain corrector
+ * (2x upsampling, cubic reader, autocorrelation periods, latency 1024
+ * reported, 1055 measured):
+ *
+ *                               low-latency   default   reference
+ *   latency, samples                1024        4096       1024 (1055)
+ *   +-40 cent vibrato on A3, rms     1.3         36.2        5.5  cents
+ *   natural voice (jitter, breath)   2.3          4.5        3.2  cents
+ *   stepped melody, worst error     0.00         0.14       0.09  cents
+ *   harmonic/residual, F2..A4      87-90        39-57      32-35  dB
+ *   CPU, mono                         42           47         54  ns/sample
+ *   (the last column is an unoptimized port, so its CPU is indicative)
+ *
+ * (Harmonic/residual: a sustained vowel 30 cents sharp corrected onto its
+ * note; the instrument's own floor is 89 dB.)
+ *
+ * Threading: setScale(), setRetuneSpeedMs(), setFormantPreserve(),
+ * setLowLatency() and their getters are lock-free single-word atomics and may
+ * be called from any thread, with one non-audio writer as everywhere in
+ * DSPark; the scale mask and its root travel packed in one word, so a torn
+ * mask/root pair cannot exist. prepare() belongs to the setup thread (it
+ * allocates), and so do getState()/setState(), which allocate.
+ * processBlock(), reset() and getLatency() belong to the stream owner (the
+ * latency is a relaxed word, so a host may poll it). The inner detector and
  * shifter are private members whose control entry points are driven only by
  * the stream owner inside processBlock() and reset(); their own control-to-
  * audio hand-offs therefore collapse to same-thread sequential code, with this
@@ -219,7 +269,8 @@
  *
  * Dependencies: Analysis/PitchDetector.h, Effects/PitchShifter.h,
  * Music/HarmonyConstants.h, Core/AudioBuffer.h, Core/AudioSpec.h,
- * Core/DenormalGuard.h, Core/DspMath.h, Core/StateBlob.h.
+ * Core/DenormalGuard.h, Core/DspMath.h, Core/Interpolation.h,
+ * Core/StateBlob.h.
  */
 
 #include "../Analysis/PitchDetector.h"
@@ -227,6 +278,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
+#include "../Core/Interpolation.h"
 #include "../Core/StateBlob.h"
 #include "../Music/HarmonyConstants.h"
 #include "PitchShifter.h"
@@ -234,7 +286,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -279,6 +333,8 @@ public:
      *                power of two and clamped to [256, 1 << 20]; going below
      *                the automatic value buys settling time and costs the low
      *                register, in the proportions the frame note above states.
+     *                The low-latency engine sizes itself from the detector's
+     *                window instead, so this frame does not change its latency.
      */
     void prepare(const AudioSpec& spec, int fftSize = 0)
     {
@@ -298,7 +354,8 @@ public:
 
         sampleRate_ = spec.sampleRate;
         frameSize_ = frame;
-        latency_ = shifter_.getLatency();
+        spectralLatency_ = shifter_.getLatency();
+        prepareSplice(spec);
 
         prepared_ = true;
         reset();
@@ -323,6 +380,13 @@ public:
         controlPhase_ = 0;
         smoothingForMs_ = -1.0;   // rebuild the glide coefficient on next block
         warmupRemaining_ = detector_.getWindowSize();
+
+        // The engine is chosen here, so a mode change takes effect as a
+        // restart of the stream (the two latencies differ).
+        lowActive_ = lowLatency_.load(std::memory_order_relaxed);
+        latency_.store(lowActive_ ? spliceDelay_ : spectralLatency_,
+                       std::memory_order_relaxed);
+        resetSplice();
     }
 
     // -- Parameters (any thread) -------------------------------------------------
@@ -372,6 +436,27 @@ public:
         formantPreserve_.store(on, std::memory_order_relaxed);
     }
 
+    /**
+     * @brief Selects the low-latency engine (default off).
+     *
+     * On: the pitch-synchronous splice engine described in the file overview,
+     * with a latency of half the detector's analysis window (1024 samples at
+     * 44.1/48 kHz, 21.3 ms at 48 kHz) instead of the phase vocoder's twice the
+     * frame. Formant preservation does not apply in this mode. A change takes
+     * effect at the next processBlock() as a restart of the stream, as reset()
+     * does: re-read getLatency() after it.
+     */
+    void setLowLatency(bool on) noexcept
+    {
+        lowLatency_.store(on, std::memory_order_relaxed);
+    }
+
+    /** @return Whether the low-latency engine is requested. */
+    [[nodiscard]] bool getLowLatency() const noexcept
+    {
+        return lowLatency_.load(std::memory_order_relaxed);
+    }
+
     /** @return The scale mask as passed to setScale() (root-relative). */
     [[nodiscard]] std::uint16_t getScaleMask() const noexcept
     {
@@ -406,12 +491,13 @@ public:
         w.write("root", static_cast<int32_t>(getRootPitchClass()));
         w.write("retuneMs", static_cast<float>(getRetuneSpeedMs()));
         w.write("formant", getFormantPreserve());
+        w.write("lowLatency", getLowLatency());
         return w.blob();
     }
 
     /** @brief Restores parameters from a blob (tolerant; rejects foreign ids).
      *  A missing field restores its default: chromatic from C, hard snap,
-     *  formants off. */
+     *  formants off, low latency off. */
     bool setState(const uint8_t* data, size_t size)
     {
         StateReader r(data, size);
@@ -420,15 +506,18 @@ public:
                  r.read("root", int32_t(0)));
         setRetuneSpeedMs(static_cast<T>(r.read("retuneMs", 0.0f)));
         setFormantPreserve(r.read("formant", false));
+        setLowLatency(r.read("lowLatency", false));
         return true;
     }
 
-    /** @brief Reports the signal latency in samples: twice the analysis frame,
-     *  which is 4096 samples at 44.1/48 kHz and about 85 ms at every supported
-     *  rate, since the frame follows the rate. Zero before prepare(). */
+    /** @brief Reports the signal latency in samples. Default engine: twice the
+     *  analysis frame, which is 4096 samples at 44.1/48 kHz and about 85 ms at
+     *  every supported rate, since the frame follows the rate. Low-latency
+     *  engine: half the detector's window, 1024 samples at 44.1/48 kHz (about
+     *  21 ms at every rate). Zero before prepare(). */
     [[nodiscard]] int getLatency() const noexcept
     {
-        return prepared_ ? latency_ : 0;
+        return prepared_ ? latency_.load(std::memory_order_relaxed) : 0;
     }
 
     /** @brief The analysis frame in effect, in samples: the automatic choice
@@ -456,6 +545,10 @@ public:
         if (numSamples <= 0) return;
 
         DenormalGuard guard;
+
+        // A change of engine restarts the stream: the latencies differ, so no
+        // crossfade can join the two.
+        if (lowLatency_.load(std::memory_order_relaxed) != lowActive_) reset();
 
         // One load per block for each independent word. The scale word is
         // internally consistent by packing; the retune speed and the formant
@@ -491,7 +584,17 @@ public:
             // contains a hop - rather than at whichever chunk boundary the
             // host block size happens to create - is what makes the rendered
             // output identical however the stream is chopped into blocks.
-            if (controlPhase_ == 0) advanceCorrection(absoluteMask);
+            if (controlPhase_ == 0)
+            {
+                // The low-latency engine refines the pitch at its read head
+                // once per fragment, before the correction is taken from it.
+                if (lowActive_ && splicePhase_ == 0) updateLocalPitch();
+                advanceCorrection(absoluteMask);
+                // Splice decisions sit on the same absolute grid and read the
+                // detector BEFORE this interval is pushed, so the host's block
+                // size cannot move them.
+                if (lowActive_ && splicePhase_ == 0) decideSplice();
+            }
 
             const int chunk =
                 std::min(numSamples - offset, kControlInterval - controlPhase_);
@@ -503,7 +606,10 @@ public:
             if (warmupRemaining_ > 0)
                 warmupRemaining_ = std::max(0, warmupRemaining_ - chunk);
 
-            shifter_.processBlock(buffer.getSubView(offset, chunk));
+            if (lowActive_)
+                spliceChunk(buffer, offset, chunk);
+            else
+                shifter_.processBlock(buffer.getSubView(offset, chunk));
 
             controlPhase_ += chunk;
             if (controlPhase_ >= kControlInterval) controlPhase_ = 0;
@@ -591,7 +697,8 @@ private:
             // must be one this effect could act on - above
             // a quarter of the sample rate not even its second harmonic fits
             // below Nyquist. Unvoiced, or refused: keep the previous target.
-            const double frequency = static_cast<double>(detector_.getFrequencyHz());
+            const double frequency = lowActive_
+                ? localHz_ : static_cast<double>(detector_.getFrequencyHz());
             if (frequency > 0.0 && frequency <= 0.25 * sampleRate_)
             {
                 const double midi = 69.0 + 12.0 * std::log2(frequency / 440.0);
@@ -614,7 +721,19 @@ private:
 
         if (correction_ != publishedCorrection_)
         {
-            shifter_.setSemitones(static_cast<T>(correction_));
+            if (lowActive_)
+            {
+                spliceRatio_ = std::exp2(correction_ / 12.0);
+                // Rates above 2^(1/8) decimate enough to need the stretched
+                // kernel; below it the full-band sinc folds only content above
+                // 20 kHz back (at 44.1 kHz and up).
+                spliceStep_ = spliceRatio_ > kStretchedFrom
+                    ? StretchedSincReader<T>::stepFor(spliceRatio_) : -1;
+            }
+            else
+            {
+                shifter_.setSemitones(static_cast<T>(correction_));
+            }
             publishedCorrection_ = correction_;
         }
     }
@@ -647,6 +766,341 @@ private:
         return static_cast<double>(bestNote);
     }
 
+    // -- Low-latency engine (pitch-synchronous splice) ---------------------------
+
+    /// Rate above which the stretched (decimating) kernel replaces the sinc.
+    static constexpr double kStretchedFrom = 1.0905077326652577;   // 2^(1/8)
+    /// Below this magnitude a sample counts as silence for the free re-centre
+    /// (-120 dBFS: a jump across it cannot be heard).
+    static constexpr double kSilence = 1.0e-6;
+
+    /** @brief The shared readers (built on first use: prepare() calls them). */
+    static const SincInterpolator<T>& sincTable()
+    {
+        static const SincInterpolator<T> table;
+        return table;
+    }
+    static const StretchedSincReader<T>& stretchedTable()
+    {
+        static const StretchedSincReader<T> table;
+        return table;
+    }
+
+    /** @brief Sizes the splice engine from the detector's window (setup thread). */
+    void prepareSplice(const AudioSpec& spec)
+    {
+        sinc_ = &sincTable();
+        stretched_ = &stretchedTable();
+
+        // The detector's window ends at the write head, so its centre is half
+        // a window back: a read head at that delay plays exactly the audio the
+        // current estimate describes. The delay must also hold a jump of one
+        // full period either way of it, and the detector reports periods up to
+        // half its window, so half a window is both the alignment and the
+        // room the jumps need.
+        const int window = detector_.getWindowSize();
+        spliceDelay_ = window / 2;
+        spliceFragment_ = std::max(kControlInterval, window / 16);
+        // The head never trails by more than the centre, half the longest
+        // jump, two fragments of drift and a kernel's reach: under a window.
+        int size = 1;
+        while (size < 2 * window) size <<= 1;
+        ringMask_ = static_cast<std::int64_t>(size - 1);
+        spliceChannels_ = std::max(1, spec.numChannels);
+        ring_.assign(static_cast<std::size_t>(spliceChannels_),
+                     std::vector<T>(static_cast<std::size_t>(size), T(0)));
+
+        // Crossfade laws over one fragment, sampled at the midpoints so the
+        // two halves of a fade are mirror images: raised cosine (amplitude
+        // complementary) for period-aligned jumps, whose two reads are the same
+        // waveform, and sine/cosine (power complementary) for jumps through
+        // unvoiced sound, whose two reads are uncorrelated.
+        const auto f = static_cast<std::size_t>(spliceFragment_);
+        fadeAmp_.assign(f, T(0));
+        fadeOldPow_.assign(f, T(0));
+        fadeNewPow_.assign(f, T(0));
+        for (std::size_t k = 0; k < f; ++k)
+        {
+            const double x = (static_cast<double>(k) + 0.5) / static_cast<double>(f);
+            fadeAmp_[k] = static_cast<T>(0.5 - 0.5 * std::cos(pi<double> * x));
+            fadeOldPow_[k] = static_cast<T>(std::cos(0.5 * pi<double> * x));
+            fadeNewPow_[k] = static_cast<T>(std::sin(0.5 * pi<double> * x));
+        }
+        // Closest a read may come to the write head: the widest kernel's reach
+        // (the stretched kernel at the +12 semitone clamp) plus one sample.
+        minReadDelay_ = static_cast<double>(stretched_->reach(
+            StretchedSincReader<T>::stepFor(2.0)) + 2);
+
+        // Local period search: two windows of at most kLocalSpan around the
+        // longest lag the detector reports, plus the search margin.
+        const int longest = window / 2 + localMargin(static_cast<double>(window / 2)) + 2;
+        localScratch_.assign(static_cast<std::size_t>(2 * longest + kLocalSpan + 8), T(0));
+        localEnergy_.assign(localScratch_.size() + 1, 0.0);
+    }
+
+    /// Longest window of the local period search, in samples.
+    static constexpr int kLocalSpan = 256;
+
+    /// Lags searched either side of the detector's period: 3 percent (half
+    /// a semitone) plus one sample, enough for a vibrato's excursion between
+    /// two detector reports.
+    [[nodiscard]] static int localMargin(double period) noexcept
+    {
+        return static_cast<int>(std::ceil(0.03 * period)) + 1;
+    }
+
+    /**
+     * @brief The period AT the read head (audio thread, once per fragment).
+     *
+     * The detector's estimate describes its own integration window, which
+     * trails the head by about 400 samples plus up to a hop at 48 kHz, so on
+     * its own it would make the correction chase a vibrato about 13 ms late.
+     * This refines it where the output is: the normalized correlation of two
+     * windows placed symmetrically about the head, `lag` apart, over lags
+     * within localMargin() of the detector's period, peak refined by a
+     * parabola. Channel 0, as the detector. Returns `coarse` when the search
+     * finds no clear peak.
+     */
+    [[nodiscard]] double localPeriod(double coarse) noexcept
+    {
+        const int margin = localMargin(coarse);
+        const int lagLo = std::max(2, static_cast<int>(std::floor(coarse)) - margin);
+        const int lagHi = static_cast<int>(std::ceil(coarse)) + margin;
+        const int span = std::clamp(static_cast<int>(coarse), 64, kLocalSpan);
+        // Centre on the head, but never so close to the write head that the
+        // later window would need samples not yet written.
+        std::int64_t centre = headInt_;
+        const std::int64_t newest = writeCount_ - 1;
+        const std::int64_t reachAhead = lagHi / 2 + span / 2 + 2;
+        if (centre + reachAhead > newest) centre = newest - reachAhead;
+        const std::int64_t first = centre - lagHi / 2 - span / 2 - 1;
+        const int count = static_cast<int>(std::min<std::int64_t>(
+            { newest - first + 1, static_cast<std::int64_t>(lagHi + span + 4),
+              static_cast<std::int64_t>(localScratch_.size()) }));
+        const T* ring = ring_.front().data();
+        for (int i = 0; i < count; ++i)
+            localScratch_[static_cast<std::size_t>(i)] =
+                ring[static_cast<std::size_t>((first + i) & ringMask_)];
+        localEnergy_[0] = 0.0;
+        for (int i = 0; i < count; ++i)
+        {
+            const double v = static_cast<double>(localScratch_[static_cast<std::size_t>(i)]);
+            localEnergy_[static_cast<std::size_t>(i) + 1] = localEnergy_[static_cast<std::size_t>(i)] + v * v;
+        }
+
+        auto ncc = [&](int lag) noexcept {
+            const std::int64_t a = centre - (lag + 1) / 2 - span / 2 - first;
+            const std::int64_t b = a + lag;
+            if (a < 0 || b + span > count) return -2.0;
+            const double ab = static_cast<double>(simd::dotProductT(
+                localScratch_.data() + a, localScratch_.data() + b, span));
+            const double ea = localEnergy_[static_cast<std::size_t>(a + span)] - localEnergy_[static_cast<std::size_t>(a)];
+            const double eb = localEnergy_[static_cast<std::size_t>(b + span)] - localEnergy_[static_cast<std::size_t>(b)];
+            const double den = std::sqrt(ea * eb);
+            return den > 1e-20 ? ab / den : -2.0;
+        };
+
+        int best = -1;
+        double bestValue = 0.5;   // below this there is no clear periodicity
+        for (int lag = lagLo; lag <= lagHi; ++lag)
+        {
+            const double v = ncc(lag);
+            if (v > bestValue) { bestValue = v; best = lag; }
+        }
+        if (best <= lagLo || best >= lagHi) return coarse;   // edge: not a peak
+        const double ym = ncc(best - 1), yp = ncc(best + 1);
+        const double den = ym - 2.0 * bestValue + yp;
+        const double shift = den < 0.0 ? 0.5 * (ym - yp) / den : 0.0;
+        return static_cast<double>(best) + std::clamp(shift, -0.5, 0.5);
+    }
+
+    /** @brief Refreshes localHz_ at a fragment boundary (audio thread). */
+    void updateLocalPitch() noexcept
+    {
+        const double frequency = static_cast<double>(detector_.getFrequencyHz());
+        if (!(frequency > 0.0 && frequency <= 0.25 * sampleRate_) || warmupRemaining_ > 0)
+        {
+            localHz_ = frequency;   // unvoiced, refused or warming up: as reported
+            return;
+        }
+        localHz_ = sampleRate_ / localPeriod(sampleRate_ / frequency);
+    }
+
+    /** @brief Clears the splice engine's signal state (stream owner). */
+    void resetSplice() noexcept
+    {
+        for (auto& r : ring_) std::fill(r.begin(), r.end(), T(0));
+        writeCount_ = 0;
+        headInt_ = -static_cast<std::int64_t>(spliceDelay_);
+        headFrac_ = 0.0;
+        nextInt_ = headInt_;
+        nextFrac_ = 0.0;
+        fading_ = false;
+        fadeEqualPower_ = false;
+        holdUnity_ = false;
+        splicePhase_ = 0;
+        spliceRatio_ = 1.0;
+        spliceStep_ = -1;
+        localHz_ = 0.0;
+        lastLoud_ = std::numeric_limits<std::int64_t>::min() / 2;
+    }
+
+    /**
+     * @brief The decision at a fragment boundary (audio thread): whether the
+     *        read head jumps for the next fragment, and where to.
+     *
+     * Runs before the fragment's first sample is written, so it sees exactly
+     * the input before the boundary whatever the host's block size.
+     */
+    void decideSplice() noexcept
+    {
+        if (fading_)
+        {
+            headInt_ = nextInt_;   // the faded-in head is now the only one
+            headFrac_ = nextFrac_;
+            fading_ = false;
+        }
+        holdUnity_ = false;
+
+        const auto now = writeCount_;
+        const double delay = static_cast<double>(now - headInt_) - headFrac_;
+        const double centre = static_cast<double>(spliceDelay_);
+        const auto centreInt = now - static_cast<std::int64_t>(spliceDelay_);
+        const auto reach = static_cast<std::int64_t>(minReadDelay_);
+
+        // Everything both heads could read is silence: re-centre for free, and
+        // read this fragment at unity so the next sound starts exactly at the
+        // reported latency.
+        if (lastLoud_ < std::min(headInt_, centreInt) - reach)
+        {
+            headInt_ = centreInt;
+            headFrac_ = 0.0;
+            holdUnity_ = true;
+            return;
+        }
+
+        double jump = 0.0;
+        bool equalPower = false;
+        const double frequency = localHz_;
+        const bool voiced = warmupRemaining_ == 0 && frequency > 0.0
+                         && frequency <= 0.25 * sampleRate_;
+        if (voiced)
+        {
+            // A jump of whole periods splices the waveform onto itself; it must
+            // span at least a fragment, so it outruns the drift of a fragment
+            // at any rate up to the +12 semitone clamp. The head is kept within
+            // half a jump of the centre, so the mean delay is the latency.
+            const double period = sampleRate_ / frequency;
+            const double span = period * std::ceil(static_cast<double>(spliceFragment_) / period);
+            if (delay < centre - 0.5 * span)      jump = -span;   // back: more delay
+            else if (delay > centre + 0.5 * span) jump = span;    // forward
+        }
+        else if (std::abs(delay - centre) > static_cast<double>(spliceFragment_))
+        {
+            // No period to align on: return to the centre with a
+            // power-complementary fade.
+            jump = delay - centre;
+            equalPower = true;
+        }
+
+        // Safety net for geometry the band rule cannot hold (a fragment
+        // drifting further than a jump): never let a read reach the write head.
+        const double drift = static_cast<double>(spliceFragment_) * std::max(0.0, spliceRatio_ - 1.0);
+        if (jump == 0.0 && delay - 2.0 * drift < minReadDelay_)
+        {
+            jump = delay - centre;
+            equalPower = true;
+        }
+
+        if (jump != 0.0)
+        {
+            const double target = static_cast<double>(headInt_) + headFrac_ + jump;
+            nextInt_ = static_cast<std::int64_t>(std::floor(target));
+            nextFrac_ = target - static_cast<double>(nextInt_);
+            fading_ = true;
+            fadeEqualPower_ = equalPower;
+        }
+    }
+
+    /** @brief One read of a ring at an integer position plus a fraction. */
+    T readRing(const T* ring, std::int64_t pos, double frac) const noexcept
+    {
+        return spliceStep_ < 0
+            ? sinc_->readRing(ring, ringMask_, pos, frac)
+            : stretched_->readRing(ring, ringMask_, pos, frac, spliceStep_);
+    }
+
+    /**
+     * @brief Renders one chunk of the low-latency engine in place (audio
+     *        thread). A chunk never crosses a control interval, and so never a
+     *        fragment.
+     */
+    void spliceChunk(AudioBufferView<T> buffer, int offset, int chunk) noexcept
+    {
+        const int nCh = std::min(buffer.getNumChannels(), spliceChannels_);
+
+        // 1. Write the input. A non-finite sample reads as silence.
+        for (int ch = 0; ch < spliceChannels_; ++ch)
+        {
+            T* ring = ring_[static_cast<std::size_t>(ch)].data();
+            const T* in = ch < nCh ? buffer.getChannel(ch) + offset : nullptr;
+            for (int k = 0; k < chunk; ++k)
+            {
+                T x = in != nullptr ? in[k] : T(0);
+                if (!std::isfinite(x)) x = T(0);
+                ring[static_cast<std::size_t>((writeCount_ + k) & ringMask_)] = x;
+                if (std::abs(static_cast<double>(x)) > kSilence) lastLoud_ = writeCount_ + k;
+            }
+        }
+
+        // 2. The head trajectories, shared by every channel (stereo-linked).
+        const double ratio = holdUnity_ ? 1.0 : spliceRatio_;
+        std::int64_t pos1[kControlInterval], pos2[kControlInterval];
+        double frac1[kControlInterval], frac2[kControlInterval];
+        {
+            std::int64_t i1 = headInt_, i2 = nextInt_;
+            double f1 = headFrac_, f2 = nextFrac_;
+            for (int k = 0; k < chunk; ++k)
+            {
+                pos1[k] = i1; frac1[k] = f1;
+                pos2[k] = i2; frac2[k] = f2;
+                f1 += ratio;
+                f2 += ratio;
+                const double c1 = std::floor(f1);
+                const double c2 = std::floor(f2);
+                i1 += static_cast<std::int64_t>(c1); f1 -= c1;
+                i2 += static_cast<std::int64_t>(c2); f2 -= c2;
+            }
+            headInt_ = i1; headFrac_ = f1;
+            if (fading_) { nextInt_ = i2; nextFrac_ = f2; }
+        }
+
+        // 3. Read every channel.
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            const T* ring = ring_[static_cast<std::size_t>(ch)].data();
+            T* out = buffer.getChannel(ch) + offset;
+            if (!fading_)
+            {
+                for (int k = 0; k < chunk; ++k) out[k] = readRing(ring, pos1[k], frac1[k]);
+                continue;
+            }
+            const auto at = static_cast<std::size_t>(splicePhase_);
+            for (int k = 0; k < chunk; ++k)
+            {
+                const T a = readRing(ring, pos1[k], frac1[k]);
+                const T b = readRing(ring, pos2[k], frac2[k]);
+                const std::size_t j = at + static_cast<std::size_t>(k);
+                out[k] = fadeEqualPower_ ? a * fadeOldPow_[j] + b * fadeNewPow_[j]
+                                         : a + (b - a) * fadeAmp_[j];
+            }
+        }
+
+        writeCount_ += chunk;
+        splicePhase_ += chunk;
+        if (splicePhase_ >= spliceFragment_) splicePhase_ = 0;
+    }
+
     // -- Members -----------------------------------------------------------------
 
     PitchDetector<T> detector_;   ///< YIN front-end (reused unchanged).
@@ -654,8 +1108,37 @@ private:
 
     double sampleRate_ = 48000.0;
     int frameSize_ = 0;
-    int latency_ = 0;
+    int spectralLatency_ = 0;              ///< The phase vocoder's latency.
+    std::atomic<int> latency_ { 0 };       ///< Latency of the running engine.
     bool prepared_ = false;
+
+    // Low-latency engine (stream owner, sized by prepare()).
+    const SincInterpolator<T>* sinc_ = nullptr;
+    const StretchedSincReader<T>* stretched_ = nullptr;
+    std::vector<std::vector<T>> ring_;     ///< Input history per channel.
+    std::vector<T> fadeAmp_, fadeOldPow_, fadeNewPow_;
+    std::int64_t ringMask_ = 0;
+    int spliceChannels_ = 1;
+    int spliceDelay_ = 0;                  ///< Centre delay = reported latency.
+    int spliceFragment_ = 64;              ///< Decision and crossfade length.
+    double minReadDelay_ = 34.0;
+    std::int64_t writeCount_ = 0;          ///< Samples written since reset().
+    std::int64_t headInt_ = 0;             ///< Read head, integer part.
+    double headFrac_ = 0.0;
+    std::int64_t nextInt_ = 0;             ///< Head faded in during a jump.
+    double nextFrac_ = 0.0;
+    std::int64_t lastLoud_ = 0;            ///< Last sample above kSilence.
+    std::vector<T> localScratch_;          ///< Contiguous copy for the search.
+    std::vector<double> localEnergy_;      ///< Its prefix sums of squares.
+    double localHz_ = 0.0;                 ///< Pitch at the head (0: unvoiced).
+    double spliceRatio_ = 1.0;             ///< Read rate from the correction.
+    int spliceStep_ = -1;                  ///< Stretched kernel step, -1 = sinc.
+    int splicePhase_ = 0;                  ///< Position inside the fragment.
+    bool fading_ = false;
+    bool fadeEqualPower_ = false;
+    bool holdUnity_ = false;               ///< Silent fragment: read at unity.
+    bool lowActive_ = false;               ///< Engine in use (stream owner).
+    std::atomic<bool> lowLatency_ { false };
 
     // Stream-owner state (audio thread only).
     double target_ = 0.0;                ///< Correction the scale asks for.

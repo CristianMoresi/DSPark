@@ -7098,6 +7098,48 @@ DSPARK_TEST(Granular_long_grains_fit_a_short_buffer)
     }
 }
 
+// The cloud's grains read unrelated parts of the history and add in power, and
+// the per-grain gain left the Hann envelope's 3/8 mean square and the
+// equal-power pan's 1/2 uncompensated: at its defaults the wet output sat
+// 7.4 dB below the dry input on noise, tones and a sine alike. Now the cloud's
+// mean square is the input's, in stereo and in mono.
+DSPARK_TEST(Granular_cloud_is_loudness_neutral_at_defaults)
+{
+    for (const int channels : { 2, 1 })
+    {
+        auto granular = std::make_unique<GranularProcessor<float>>();
+        granular->prepare(spec(48000.0, 512, channels));
+        const int warm = 96000, total = warm + 192000;
+        std::vector<float> in[2], out[2];
+        uint32_t state = 12345u;
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            in[ch].resize(static_cast<size_t>(total));
+            for (auto& v : in[ch])
+            {
+                state = state * 1664525u + 1013904223u;
+                v = 0.2f * (static_cast<float>(state >> 8) / 16777216.0f - 0.5f);
+            }
+            out[ch] = in[ch];
+        }
+        for (int off = 0; off < total; off += 512)
+        {
+            float* p[2] = { out[0].data() + off, out[1].data() + off };
+            granular->processBlock(AudioBufferView<float>(p, channels, std::min(512, total - off)));
+        }
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            double eIn = 0.0, eOut = 0.0;
+            for (int i = warm; i < total; ++i)
+            {
+                eIn += static_cast<double>(in[ch][static_cast<size_t>(i)]) * in[ch][static_cast<size_t>(i)];
+                eOut += static_cast<double>(out[ch][static_cast<size_t>(i)]) * out[ch][static_cast<size_t>(i)];
+            }
+            EXPECT_NEAR(10.0 * std::log10(eOut / eIn), 0.0, 1.0);
+        }
+    }
+}
+
 // One NaN stayed in the capture ring and every grain that reached it replayed
 // it: 129 NaN outputs, the last 0.66 s after the sample itself. The output of
 // that very sample was NaN as well, through the dry term of the mix.

@@ -81,6 +81,35 @@
     #endif
 #endif
 
+// --- AVX2 without FMA --------------------------------------------------------
+// For kernels that must round exactly as the baseline code does (the block
+// forms of a scalar reader, bit for bit): a region that enables AVX2 only, so
+// the compiler has no fused multiply-add to contract the arithmetic into.
+// DSPARK_SIMD_EXACT_AVX2 is defined when such kernels can be built: always in
+// AVX2 builds, and in x86-64 baseline builds that dispatch at run time
+// (DSPARK_SIMD_EXACT_AVX2_DISPATCHED), where callers check
+// simd::isRuntimeDispatchActive() before using them.
+#if defined(DSPARK_SIMD_SSE2) && defined(__AVX2__)
+    #define DSPARK_SIMD_EXACT_AVX2 1
+    #define DSPARK_SIMD_EXACT_AVX2_BEGIN
+    #define DSPARK_SIMD_EXACT_AVX2_END
+#elif defined(DSPARK_SIMD_DISPATCH_AVX2)
+    #define DSPARK_SIMD_EXACT_AVX2 1
+    #define DSPARK_SIMD_EXACT_AVX2_DISPATCHED 1
+    #if defined(__clang__)
+        #define DSPARK_SIMD_EXACT_AVX2_BEGIN \
+            _Pragma("clang attribute push (__attribute__((target(\"avx2\"))), apply_to = function)")
+        #define DSPARK_SIMD_EXACT_AVX2_END _Pragma("clang attribute pop")
+    #elif defined(__GNUC__)
+        #define DSPARK_SIMD_EXACT_AVX2_BEGIN _Pragma("GCC push_options") _Pragma("GCC target(\"avx2\")")
+        #define DSPARK_SIMD_EXACT_AVX2_END _Pragma("GCC pop_options")
+    #else
+        // MSVC accepts AVX2 intrinsics in any function and never contracts.
+        #define DSPARK_SIMD_EXACT_AVX2_BEGIN
+        #define DSPARK_SIMD_EXACT_AVX2_END
+    #endif
+#endif
+
 // --- Restrict Macro for Pointer Aliasing Optimization -----------------------
 // NOTE: restrict constrains WRITTEN ranges only. A range written through one
 // DSPARK_RESTRICT pointer must not overlap any other range accessed in the

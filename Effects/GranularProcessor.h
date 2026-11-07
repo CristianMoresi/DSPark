@@ -21,9 +21,20 @@
  * (linear interpolation used to err by -4 dB at 10 kHz, and pitched-up
  * grains aliased: a 15 kHz tone an octave up came back at -10 dB). A grain
  * pitched up reads with a sinc stretched by its rate (StretchedSincReader),
- * whose cutoff sits at Nyquist / rate, so nothing folds back (-51 dB in the
- * same test). That kernel grows with the rate, about 32 * rate taps (128 at
- * +24 semitones), so dense clouds of high grains cost more CPU.
+ * whose cutoff sits at Nyquist / rate, so nothing folds back (-52 dB re the
+ * input level in the same test). That kernel grows with the rate, about
+ * 32 * rate taps (128 at +24 semitones), so dense clouds of high grains cost
+ * more CPU.
+ *
+ * Gain staging: jittered grains read unrelated parts of the history and add
+ * in power, and each grain is scaled so that the cloud's mean square equals
+ * the input's. At the defaults the wet output measures within 0.3 dB of the
+ * dry input on white and pink noise, a chord and a sine, in stereo and mono.
+ * A sparse cloud (density times grain size below 1) keeps every grain at the
+ * input's loudness, so its gaps lower the average (-7 dB at 5 grains/s of
+ * 40 ms). With jitter, pitch and pitch jitter all at 0 every grain reads the
+ * same delayed signal and the cloud adds in amplitude instead: +1.1 dB at the
+ * default density, +10 dB at 200 grains/s.
  *
  * A non-finite input sample reads as silence: the ring would otherwise hold it
  * for every grain that reaches it until the write head comes round again.
@@ -393,11 +404,20 @@ private:
             const double spreadAmt = static_cast<double>(spread_.load(std::memory_order_relaxed));
             const double pan = 0.5 + (frand() - 0.5) * spreadAmt;          // [0,1]
             const double a = pan * 1.5707963267948966;                      // pi/2
-            // 1/sqrt(density*overlap) keeps the cloud near unity loudness.
-            const double overlap = std::max(1.0,
+            // Gain staging. Jittered grains read unrelated parts of the
+            // history, so the cloud adds in power: per channel, a grain's
+            // mean square is the Hann envelope's 3/8 times the equal-power
+            // pan gain's 1/2 (exactly, for any spread centred on the middle)
+            // times norm^2, and about `overlap` grains sound at once. With
+            // norm^2 = 16 / (3 overlap) the cloud's mean square equals the
+            // input's; below an overlap of 1 every grain is as loud as the
+            // input over its envelope and the gaps stay silent. The overlap
+            // counts the grain's actual length and the pool's capacity.
+            const double overlap = std::clamp(
                 static_cast<double>(density_.load(std::memory_order_relaxed))
-                * sizeMs * 0.001);
-            const auto norm = static_cast<T>(1.0 / std::sqrt(overlap));
+                    * lenSamples / sampleRate_,
+                1.0, static_cast<double>(kMaxGrains));
+            const auto norm = static_cast<T>(std::sqrt(16.0 / (3.0 * overlap)));
             g.gainL = static_cast<T>(std::cos(a)) * norm;
             g.gainR = static_cast<T>(std::sin(a)) * norm;
             g.active = true;

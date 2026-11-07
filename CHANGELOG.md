@@ -81,6 +81,25 @@ All notable user-facing changes to DSPark are documented here.
   better.
 - `WavFile` reads RF64 and BW64. `setRf64Mode()` writes RF64 always, or
   promotes the file only when it outgrows 4 GiB.
+- `WavFile` reads G.711 A-law and mu-law (also inside WAVE_FORMAT_EXTENSIBLE),
+  IMA/DVI ADPCM and Microsoft ADPCM (mono and stereo), and PCM whose depth is
+  not a whole number of bytes (12-bit, 20-bit) in the container nBlockAlign
+  defines. Every coding decodes bit for bit against a reference decoder on
+  encoder-produced files. Microsoft ADPCM uses the fmt chunk's coefficient
+  table and truncating prediction, the common decoder convention (flooring
+  it moves predictors 3 to 6 by a few LSB). A fact chunk ending inside the
+  last ADPCM block trims its padding. These codings report `bitsPerSample`
+  16; `getEncoding()` tells them apart. A 5-minute stereo file reads in
+  66 ms (IMA) and 115 ms (Microsoft ADPCM). Default audio of existing PCM
+  and float files is unchanged.
+- `Mp3File` decodes MPEG audio Layer I and Layer II (MPEG-1 and the MPEG-2
+  low sampling frequencies; mono, stereo, dual channel and joint stereo; CRC
+  protected or not) and free-format streams of all three layers. Encoder
+  output and random streams that use every allocation class, scalefactor
+  selection and joint-stereo bound decode at 130 dB or better against a
+  reference decoder. A free-format frame length is accepted only when a third
+  header confirms it and is never shorter than a frame at the lowest listed
+  bitrate, so header patterns in other data cannot inflate the decoded size.
 - `AudioFile::hasWriteError()` reports a failed write or header finalisation,
   including after `close()`.
 - `Sampler::noteOnTuned` and `Synthesizer::noteOnTuned`: sample-offset
@@ -152,6 +171,19 @@ All notable user-facing changes to DSPark are documented here.
   `processRange()` spans agree with each other and with `process()` bit for
   bit; `getReach()` follows the engine in force. New constant
   `Resampler::kMaxTwoStageOrder`.
+- `MidiFile::read(path, MidiReadOptions)`: opt-in, per-defect recovery of
+  malformed files (`MidiReadRecovery`: redundant VLQ bytes, data after the
+  end-of-track event, a wrong track length or count, a missing end-of-track
+  event, unterminated SysEx, trailing bytes), each reported by
+  `recoveries()`. Of 18 defect files it reads all 18, where a reference reader
+  reads 12 (one without its second track) and the strict reader none. The
+  default read stays strict and unchanged.
+- `MidiFile` SMPTE time division: `MidiReadOptions::acceptSmpteDivision`,
+  `createSmpte()`, `isSmpteDivision()`, `smpteFramesPerSecond()`,
+  `ticksPerFrame()` and `division()`. Ticks are exact fractions of a second
+  (30000/1001 frames per second for the 29 code) and tempo events do not
+  affect timing. Off by default, so a default read still guarantees
+  `ticksPerQuarter() > 0`.
 
 ### Changed
 
@@ -289,6 +321,29 @@ All notable user-facing changes to DSPark are documented here.
   positive added on five of them; sustained notes under +/-3 dB tremolo gain
   false onsets (0.21 to 1.85 per second). `setThreshold(0.03f)` restores the
   former sensitivity.
+- `MidiFile::read()` counts each track's events in an allocation-free pass
+  and then reserves exactly that many: a 1.9 M-event file parses in 33 ms
+  instead of 65, with peak memory 83 MB instead of 132 (commit 80 MB instead
+  of 160). No input needs more memory than before, and the parsed documents
+  are identical.
+- `FlacFile` decodes 2.7 to 3.1 times faster with bit-identical PCM and the
+  same validation: Rice codes are taken from a 64-bit register and each
+  sample is restored as its residual arrives, the frame CRC-16 runs eight
+  bytes per step, and channel decorrelation drops overflow checks that could
+  never fire. A 5-minute 16-bit stereo file reads in 93 ms (was 255 ms; a
+  reference decoder takes 129 ms from memory), and opens in 110 ms with a zero
+  MD5 (was 272 ms) or 191 ms when the MD5 is verified (was 395 ms). 24-bit,
+  48 kHz: 120 ms (was 375 ms).
+- `Mp3File` decodes Layer III 3.4 to 3.6 times faster: Huffman pairs and
+  quads come from a 64-bit bit register through two-level code tables with
+  branch-free signs, requantization stops at the last coded line, and the
+  IMDCT and polyphase synthesis run on vectors in double precision (two time
+  slots per DCT, or four in the AVX2+FMA copy selected at run time). A 30 s
+  128 kbps stereo file opens in 17.7 ms instead of 60.6 ms, 320 kbps in 21.5
+  ms instead of 76.0 ms. With the runtime dispatch off the output is
+  bit-identical to before; the AVX2+FMA copy differs by at most one rounding
+  of the last double bit (float output identical on encoder-produced files,
+  within 6e-11 elsewhere).
 
 ### Fixed
 

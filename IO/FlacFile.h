@@ -40,6 +40,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
+#include <intrin.h>
+#endif
+
 namespace dspark {
 
 /**
@@ -421,6 +425,37 @@ private:
             }
         }
 
+        /**
+         * Reads one Rice code of parameter `k` (< 31): a unary quotient of
+         * at most `unaryLimit` zeros, then `k` remainder bits. A folded
+         * value above 2^32 - 2 (a residual outside +-(2^31 - 1)) is
+         * rejected.
+         */
+        bool readRiceCode(unsigned k, uint64_t unaryLimit, int64_t& residual) noexcept
+        {
+            uint64_t quotient = 0, remainder = 0;
+            if (!readUnary(unaryLimit, quotient)
+                || !readBits(k, remainder)
+                || quotient > (std::numeric_limits<uint64_t>::max() >> k))
+                return false;
+            const uint64_t folded = (quotient << k) | remainder;
+            if (folded > 4294967294ull)
+                return false;
+            residual = static_cast<int64_t>(folded >> 1)
+                     ^ -static_cast<int64_t>(folded & 1u);
+            return true;
+        }
+
+        // Raw access for decoders that take the bits in larger steps: the
+        // buffer, the end of the bytes that may be loaded, and the bit
+        // position to resume from.
+        [[nodiscard]] const uint8_t* data() const noexcept { return bytes_.data(); }
+        [[nodiscard]] size_t loadEnd() const noexcept
+        {
+            return std::min(endBit_ >> 3, bytes_.size());
+        }
+        void setBitPosition(size_t position) noexcept { bitPos_ = position; }
+
         bool alignWithZeroPadding() noexcept
         {
             while ((bitPos_ & 7u) != 0)
@@ -431,10 +466,20 @@ private:
             return true;
         }
 
-    private:
-        const std::vector<uint8_t>& bytes_;
-        size_t bitPos_ = 0;
-        size_t endBit_ = 0;
+        // Leading zero count of a nonzero word. Where LZCNT is not assumed,
+        // the standard library may check the CPU on every std::countl_zero
+        // call (a load and a branch in the Rice loop); BSR needs no check
+        // once the word cannot be zero.
+        static unsigned leadingZeros(uint64_t nonZero) noexcept
+        {
+#if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
+            unsigned long index = 0;
+            _BitScanReverse64(&index, nonZero);
+            return 63u - static_cast<unsigned>(index);
+#else
+            return static_cast<unsigned>(std::countl_zero(nonZero));
+#endif
+        }
 
         static uint64_t loadBigEndian64(const uint8_t* p) noexcept
         {
@@ -450,6 +495,11 @@ private:
             }
             return word;
         }
+
+    private:
+        const std::vector<uint8_t>& bytes_;
+        size_t bitPos_ = 0;
+        size_t endBit_ = 0;
     };
 
     class Md5
@@ -462,6 +512,13 @@ private:
             totalBytes_ += data.size();
             while (!data.empty())
             {
+                // Whole blocks are hashed straight from the input.
+                if (bufferSize_ == 0 && data.size() >= buffer_.size())
+                {
+                    transform(data.data());
+                    data = data.subspan(buffer_.size());
+                    continue;
+                }
                 const size_t take = std::min(data.size(), buffer_.size() - bufferSize_);
                 std::memcpy(buffer_.data() + bufferSize_, data.data(), take);
                 bufferSize_ += take;
@@ -589,11 +646,15 @@ private:
 
     static uint16_t crc16(std::span<const uint8_t> data) noexcept
     {
-        // Byte-wise table of the same polynomial (x^16 + x^15 + x^2 + 1, MSB
-        // first, initial value 0): the frame CRC covers every byte of the
-        // file, and the bitwise form spent eight iterations on each.
-        static constexpr auto kTable = [] {
-            std::array<uint16_t, 256> table {};
+        // Slice-by-8 tables of the same polynomial (x^16 + x^15 + x^2 + 1,
+        // MSB first, initial value 0). kTables[0] is the byte-wise table;
+        // kTables[k][v] is the CRC of byte v followed by k zero bytes, so by
+        // linearity eight bytes fold into one XOR of eight lookups, the
+        // register entering through the first two. The frame CRC covers
+        // every byte of the file, and the byte-wise form was a serial chain
+        // of about 7 cycles per byte.
+        static constexpr auto kTables = [] {
+            std::array<std::array<uint16_t, 256>, 8> tables {};
             for (unsigned i = 0; i < 256; ++i)
             {
                 uint16_t crc = static_cast<uint16_t>(i << 8);
@@ -601,63 +662,28 @@ private:
                     crc = static_cast<uint16_t>((crc & 0x8000u) != 0
                         ? static_cast<uint16_t>((crc << 1) ^ 0x8005u)
                         : static_cast<uint16_t>(crc << 1));
-                table[i] = crc;
+                tables[0][i] = crc;
             }
-            return table;
+            for (unsigned k = 1; k < 8; ++k)
+                for (unsigned i = 0; i < 256; ++i)
+                    tables[k][i] = static_cast<uint16_t>(
+                        (tables[k - 1][i] << 8)
+                        ^ tables[0][tables[k - 1][i] >> 8]);
+            return tables;
         }();
-        uint16_t crc = 0;
-        for (uint8_t byte : data)
-            crc = static_cast<uint16_t>((crc << 8) ^ kTable[(crc >> 8) ^ byte]);
-        return crc;
-    }
-
-    static bool checkedAdd(int64_t a, int64_t b, int64_t& result) noexcept
-    {
-        if ((b > 0 && a > std::numeric_limits<int64_t>::max() - b)
-            || (b < 0 && a < std::numeric_limits<int64_t>::min() - b))
-            return false;
-        result = a + b;
-        return true;
-    }
-
-    static bool checkedSubtract(int64_t a, int64_t b, int64_t& result) noexcept
-    {
-        if (b == std::numeric_limits<int64_t>::min())
-            return false;
-        return checkedAdd(a, -b, result);
-    }
-
-    static bool checkedMultiply(int64_t a, int64_t b, int64_t& result) noexcept
-    {
-        if (a == 0 || b == 0) { result = 0; return true; }
-        if (a == -1 && b == std::numeric_limits<int64_t>::min()) return false;
-        if (b == -1 && a == std::numeric_limits<int64_t>::min()) return false;
-        if (a > 0)
-        {
-            if ((b > 0 && a > std::numeric_limits<int64_t>::max() / b)
-                || (b < 0 && b < std::numeric_limits<int64_t>::min() / a))
-                return false;
-        }
-        else
-        {
-            if ((b > 0 && a < std::numeric_limits<int64_t>::min() / b)
-                || (b < 0 && a < std::numeric_limits<int64_t>::max() / b))
-                return false;
-        }
-        result = a * b;
-        return true;
-    }
-
-    static bool floorDividePowerOfTwo(int64_t value, unsigned shift,
-                                      int64_t& result) noexcept
-    {
-        if (shift > 62) return false;
-        if (shift == 0) { result = value; return true; }
-        const int64_t divisor = int64_t { 1 } << shift;
-        result = value / divisor;
-        if (value < 0 && value % divisor != 0)
-            --result;
-        return true;
+        const uint8_t* p = data.data();
+        size_t n = data.size();
+        uint32_t crc = 0;
+        for (; n >= 8; n -= 8, p += 8)
+            crc = static_cast<uint32_t>(kTables[7][p[0] ^ (crc >> 8)]
+                                      ^ kTables[6][p[1] ^ (crc & 0xffu)]
+                                      ^ kTables[5][p[2]] ^ kTables[4][p[3]]
+                                      ^ kTables[3][p[4]] ^ kTables[2][p[5]]
+                                      ^ kTables[1][p[6]] ^ kTables[0][p[7]]);
+        for (; n > 0; --n, ++p)
+            crc = static_cast<uint32_t>(((crc << 8) & 0xff00u)
+                                      ^ kTables[0][(crc >> 8) ^ *p]);
+        return static_cast<uint16_t>(crc);
     }
 
     static bool sampleInDepth(int64_t value, unsigned depth) noexcept
@@ -791,10 +817,207 @@ private:
         return sampleRate != 0 && sampleRate == stream.sampleRate;
     }
 
+    // A subframe predictor: `order` warm-up samples, then each sample is its
+    // residual plus a prediction from the samples before it. Fixed
+    // predictors use the RFC 9639 polynomials; LPC ones `coefficients`,
+    // with the sum shifted right by `shift`. Every restored sample must lie
+    // within the subframe depth, checked before the next prediction reads
+    // it: that bound keeps the arithmetic inside int64 (fixed: |prediction|
+    // < 2^37; LPC: |coefficient| < 2^14 and order <= 32, so |sum| < 2^52).
+    // An arithmetic right shift is the floor division RFC 9639 asks for
+    // (C++20 defines >> on negative values as arithmetic).
+    struct Predictor
+    {
+        unsigned order = 0;
+        bool fixed = true;
+        unsigned shift = 0;
+        std::array<int64_t, 32> coefficients {};
+        int64_t low = 0;      ///< -2^(depth - 1)
+        uint64_t span = 0;    ///< 2^depth: v is valid when v - low < span
+    };
+
+    // Prediction for x[i]. `newest` is x[i-1], carried in a register and
+    // added last, so it ends the dependency chain; `c` holds the LPC
+    // coefficients. Generic serves LPC orders above 12 (runtime order).
+    template <unsigned Order, bool Fixed, bool Generic>
+    static int64_t predict([[maybe_unused]] const Predictor& p,
+                           [[maybe_unused]] const int64_t* c,
+                           [[maybe_unused]] const int64_t* x,
+                           [[maybe_unused]] size_t i,
+                           [[maybe_unused]] int64_t newest) noexcept
+    {
+        if constexpr (Fixed)
+        {
+            if constexpr (Order == 0) return 0;
+            else if constexpr (Order == 1) return newest;
+            else if constexpr (Order == 2) return 2 * newest - x[i - 2];
+            else if constexpr (Order == 3) return 3 * (newest - x[i - 2]) + x[i - 3];
+            else return 4 * (newest + x[i - 3]) - 6 * x[i - 2] - x[i - 4];
+        }
+        else
+        {
+            const unsigned order = Generic ? p.order : Order;
+            int64_t sum = 0;
+            for (unsigned j = order - 1; j > 0; --j)
+                sum += c[j] * x[i - 1 - j];
+            sum += c[0] * newest;
+            return sum >> p.shift;
+        }
+    }
+
+    // Decodes one Rice partition, x[begin, end), restoring each sample as
+    // its residual arrives, so the bit decoding overlaps the predictor's
+    // multiplies. The codes are taken from a 64-bit register refilled whole
+    // bytes at a time; one longer than the bits in hand, or near the end of
+    // the buffer, goes through BitCursor::readRiceCode(). Results,
+    // rejections and the final bit position are those of that code-by-code
+    // reader.
+    template <unsigned Order, bool Fixed, bool Generic>
+    static bool decodeRicePartitionWith(BitCursor& bits, unsigned k,
+                                        const Predictor& p, int64_t* x,
+                                        size_t begin, size_t end) noexcept
+    {
+        static_assert(kMaxRiceUnaryZeros >= 64);
+        int64_t c[Fixed ? 1 : (Generic ? 32 : Order)] = {};
+        if constexpr (!Fixed)
+            for (unsigned j = 0; j < (Generic ? 32u : Order); ++j)
+                c[j] = p.coefficients[j];
+        const int64_t low = p.low;
+        const uint64_t span = p.span;
+        const unsigned tail = k + 1u;    // stop bit + remainder
+        const uint8_t* data = bits.data();
+        const size_t loadEnd = bits.loadEnd();
+        int64_t newest = begin > 0 ? x[begin - 1] : 0;
+        size_t i = begin;
+        while (i < end)
+        {
+            const size_t position = bits.bitPosition();
+            const size_t byte = position >> 3;
+            if (byte + 8 <= loadEnd)
+            {
+                // The top `avail` bits of `cache` are the stream from
+                // `position` on, and `next` * 8 == position + avail. Bits
+                // below them are zero or the correct following bits, so
+                // OR-ing the next word in at `avail` keeps it exact.
+                const unsigned skip = static_cast<unsigned>(position & 7u);
+                uint64_t cache = BitCursor::loadBigEndian64(data + byte) << skip;
+                unsigned avail = 64u - skip;
+                size_t next = byte + 8;
+                for (; i < end; ++i)
+                {
+                    if (avail < 56u)
+                    {
+                        if (next + 8 > loadEnd) break;
+                        cache |= BitCursor::loadBigEndian64(data + next) >> avail;
+                        const unsigned take = (63u - avail) >> 3;
+                        next += take;
+                        avail += take * 8u;
+                    }
+                    // The low sentinel bit keeps the count defined; a run
+                    // that reaches it is longer than `avail` and takes the
+                    // code-by-code path. Runs of 63 zeros or fewer are far
+                    // below kMaxRiceUnaryZeros.
+                    const unsigned zeros = BitCursor::leadingZeros(cache | 1u);
+                    if (zeros + tail > avail) break;
+                    // `top` starts with the stop bit, so its first k + 1
+                    // bits read 2^k + remainder.
+                    const uint64_t top = cache << zeros;
+                    cache = top << tail;
+                    avail -= zeros + tail;
+                    const uint64_t folded = (top >> (63u - k))
+                                          + ((static_cast<uint64_t>(zeros) - 1u) << k);
+                    // At most 2^32 - 2 unfolds within +-(2^31 - 1), the
+                    // RFC 9639 residual bound.
+                    if (folded > 4294967294ull)
+                        return false;
+                    const int64_t value = (static_cast<int64_t>(folded >> 1)
+                                           ^ -static_cast<int64_t>(folded & 1u))
+                        + predict<Order, Fixed, Generic>(p, c, x, i, newest);
+                    if (static_cast<uint64_t>(value - low) >= span)
+                        return false;
+                    x[i] = value;
+                    newest = value;
+                }
+                bits.setBitPosition(next * 8 - avail);
+                if (i == end) break;
+            }
+            int64_t residual = 0;
+            if (!bits.readRiceCode(k, kMaxRiceUnaryZeros, residual))
+                return false;
+            const int64_t value = residual
+                + predict<Order, Fixed, Generic>(p, c, x, i, newest);
+            if (static_cast<uint64_t>(value - low) >= span)
+                return false;
+            x[i++] = value;
+            newest = value;
+        }
+        return true;
+    }
+
+    static bool decodeRicePartition(BitCursor& bits, unsigned k,
+                                    const Predictor& p, int64_t* x,
+                                    size_t begin, size_t end) noexcept
+    {
+        if (p.fixed)
+        {
+            switch (p.order)
+            {
+                case 0: return decodeRicePartitionWith<0, true, false>(bits, k, p, x, begin, end);
+                case 1: return decodeRicePartitionWith<1, true, false>(bits, k, p, x, begin, end);
+                case 2: return decodeRicePartitionWith<2, true, false>(bits, k, p, x, begin, end);
+                case 3: return decodeRicePartitionWith<3, true, false>(bits, k, p, x, begin, end);
+                default: return decodeRicePartitionWith<4, true, false>(bits, k, p, x, begin, end);
+            }
+        }
+        switch (p.order)
+        {
+            case 1: return decodeRicePartitionWith<1, false, false>(bits, k, p, x, begin, end);
+            case 2: return decodeRicePartitionWith<2, false, false>(bits, k, p, x, begin, end);
+            case 3: return decodeRicePartitionWith<3, false, false>(bits, k, p, x, begin, end);
+            case 4: return decodeRicePartitionWith<4, false, false>(bits, k, p, x, begin, end);
+            case 5: return decodeRicePartitionWith<5, false, false>(bits, k, p, x, begin, end);
+            case 6: return decodeRicePartitionWith<6, false, false>(bits, k, p, x, begin, end);
+            case 7: return decodeRicePartitionWith<7, false, false>(bits, k, p, x, begin, end);
+            case 8: return decodeRicePartitionWith<8, false, false>(bits, k, p, x, begin, end);
+            case 9: return decodeRicePartitionWith<9, false, false>(bits, k, p, x, begin, end);
+            case 10: return decodeRicePartitionWith<10, false, false>(bits, k, p, x, begin, end);
+            case 11: return decodeRicePartitionWith<11, false, false>(bits, k, p, x, begin, end);
+            case 12: return decodeRicePartitionWith<12, false, false>(bits, k, p, x, begin, end);
+            default: return decodeRicePartitionWith<0, false, true>(bits, k, p, x, begin, end);
+        }
+    }
+
+    // Restores x[begin, end) in place after an escaped (verbatim residual)
+    // partition, with the same arithmetic and checks as the Rice path.
+    static bool restorePartition(const Predictor& p, int64_t* x,
+                                 size_t begin, size_t end) noexcept
+    {
+        static constexpr int64_t kFixed[5][4] = {
+            { 0, 0, 0, 0 }, { 1, 0, 0, 0 }, { 2, -1, 0, 0 },
+            { 3, -3, 1, 0 }, { 4, -6, 4, -1 }
+        };
+        const int64_t* c = p.fixed ? kFixed[p.order] : p.coefficients.data();
+        const unsigned shift = p.fixed ? 0u : p.shift;
+        for (size_t i = begin; i < end; ++i)
+        {
+            int64_t sum = 0;
+            for (unsigned j = p.order; j-- > 0;)
+                sum += c[j] * x[i - 1 - j];
+            const int64_t value = x[i] + (sum >> shift);
+            if (static_cast<uint64_t>(value - p.low) >= p.span)
+                return false;
+            x[i] = value;
+        }
+        return true;
+    }
+
+    // Reads the residual partitions of a predicted subframe whose warm-up
+    // samples are already in `output`, restoring the samples as it goes.
     static bool decodeResidual(BitCursor& bits, uint32_t blockSize,
-                               unsigned predictorOrder,
+                               const Predictor& predictor,
                                std::span<int64_t> output) noexcept
     {
+        const unsigned predictorOrder = predictor.order;
         uint64_t method = 0, partitionOrder = 0;
         if (!bits.readBits(2, method) || method > 1
             || !bits.readBits(4, partitionOrder))
@@ -815,41 +1038,27 @@ private:
             if (!bits.readBits(parameterBits, parameter)) return false;
             const uint32_t count = partitionSize
                 - (partition == 0 ? static_cast<uint32_t>(predictorOrder) : 0u);
+            const size_t begin = outputIndex;
+            outputIndex += count;
             if (parameter == escape)
             {
                 uint64_t width = 0;
                 if (!bits.readBits(5, width) || width > 31) return false;
-                for (uint32_t i = 0; i < count; ++i)
+                for (size_t i = begin; i < outputIndex; ++i)
                 {
                     int64_t residual = 0;
                     if (!bits.readSigned(static_cast<unsigned>(width), residual)
                         || residual < -2147483647ll || residual > 2147483647ll)
                         return false;
-                    output[outputIndex++] = residual;
+                    output[i] = residual;
                 }
+                if (!restorePartition(predictor, output.data(), begin, outputIndex))
+                    return false;
             }
-            else
-            {
-                for (uint32_t i = 0; i < count; ++i)
-                {
-                    uint64_t quotient = 0, remainder = 0;
-                    if (!bits.readUnary(kMaxRiceUnaryZeros, quotient)
-                        || !bits.readBits(static_cast<unsigned>(parameter), remainder)
-                        || quotient > (std::numeric_limits<uint64_t>::max()
-                                       >> static_cast<unsigned>(parameter)))
-                        return false;
-                    const uint64_t folded = (quotient << static_cast<unsigned>(parameter))
-                                          | remainder;
-                    if (folded > 4294967294ull)
-                        return false;
-                    const int64_t residual = (folded & 1u) == 0
-                        ? static_cast<int64_t>(folded / 2u)
-                        : -static_cast<int64_t>(folded / 2u) - 1;
-                    if (residual < -2147483647ll || residual > 2147483647ll)
-                        return false;
-                    output[outputIndex++] = residual;
-                }
-            }
+            else if (!decodeRicePartition(bits, static_cast<unsigned>(parameter),
+                                          predictor, output.data(), begin,
+                                          outputIndex))
+                return false;
         }
         return outputIndex == output.size();
     }
@@ -877,6 +1086,9 @@ private:
         const unsigned depth = storedDepth - wasted;
 
         unsigned predictorOrder = 0;
+        Predictor predictor;
+        predictor.low = -(int64_t { 1 } << (depth - 1));
+        predictor.span = uint64_t { 1 } << depth;
         if (type == 0)
         {
             int64_t value = 0;
@@ -894,25 +1106,9 @@ private:
             if (predictorOrder > blockSize) return false;
             for (unsigned i = 0; i < predictorOrder; ++i)
                 if (!bits.readSigned(depth, output[i])) return false;
-            if (!decodeResidual(bits, blockSize, predictorOrder, output))
+            predictor.order = predictorOrder;
+            if (!decodeResidual(bits, blockSize, predictor, output))
                 return false;
-            static constexpr int coefficients[5][4] = {
-                { 0, 0, 0, 0 }, { 1, 0, 0, 0 }, { 2, -1, 0, 0 },
-                { 3, -3, 1, 0 }, { 4, -6, 4, -1 }
-            };
-            // Every earlier sample is within `depth` <= 33 bits (checked as
-            // it is produced) and the coefficients are at most 6 in magnitude,
-            // so the prediction stays below 2^37 and the residual below 2^31:
-            // plain int64 arithmetic cannot overflow here.
-            for (size_t i = predictorOrder; i < output.size(); ++i)
-            {
-                int64_t prediction = 0;
-                for (unsigned j = 0; j < predictorOrder; ++j)
-                    prediction += output[i - j - 1] * coefficients[predictorOrder][j];
-                output[i] += prediction;
-                if (!sampleInDepth(output[i], depth))
-                    return false;
-            }
         }
         else if (type >= 32 && type <= 63)
         {
@@ -926,25 +1122,13 @@ private:
                 || !bits.readSigned(5, shift) || shift < 0)
                 return false;
             const unsigned precision = static_cast<unsigned>(precisionMinusOne + 1);
-            std::array<int64_t, 32> coefficients {};
+            predictor.order = predictorOrder;
+            predictor.fixed = false;
+            predictor.shift = static_cast<unsigned>(shift);
             for (unsigned i = 0; i < predictorOrder; ++i)
-                if (!bits.readSigned(precision, coefficients[i])) return false;
-            if (!decodeResidual(bits, blockSize, predictorOrder, output))
+                if (!bits.readSigned(precision, predictor.coefficients[i])) return false;
+            if (!decodeResidual(bits, blockSize, predictor, output))
                 return false;
-            // |coefficient| < 2^14, every earlier sample is within `depth`
-            // <= 33 bits (checked as it is produced) and the order is at most
-            // 32, so the sum stays below 2^52 and cannot overflow int64. An
-            // arithmetic right shift is the floor division RFC 9639 asks for
-            // (C++20 defines >> on negative values as arithmetic).
-            for (size_t i = predictorOrder; i < output.size(); ++i)
-            {
-                int64_t sum = 0;
-                for (unsigned j = 0; j < predictorOrder; ++j)
-                    sum += coefficients[j] * output[i - j - 1];
-                output[i] += sum >> static_cast<unsigned>(shift);
-                if (!sampleInDepth(output[i], depth))
-                    return false;
-            }
         }
         else
             return false;
@@ -955,11 +1139,15 @@ private:
 
         if (wasted != 0)
         {
+            // |value| <= 2^(depth - 1), so value * 2^wasted stays within
+            // storedDepth <= 33 bits: no overflow is possible.
             const int64_t factor = int64_t { 1 } << wasted;
             for (int64_t& value : output)
-                if (!checkedMultiply(value, factor, value)
-                    || !sampleInDepth(value, storedDepth))
+            {
+                value *= factor;
+                if (!sampleInDepth(value, storedDepth))
                     return false;
+            }
         }
         return true;
     }
@@ -968,48 +1156,54 @@ private:
                                 uint32_t blockSize,
                                 std::vector<int64_t>& pcm) noexcept
     {
+        // Independent channels were decoded at the stream depth, every
+        // sample checked against it as it was produced (decodeSubframe), so
+        // they need no second pass.
         if (channelCode < 8)
-        {
-            for (int64_t value : pcm)
-                if (!sampleInDepth(value, bitsPerSample)) return false;
             return true;
-        }
 
+        // Both inputs are within 33 bits (the side channel's depth + 1), so
+        // none of the sums below can overflow int64; only the restored
+        // samples need their range checked. An arithmetic right shift is
+        // the floor division by two that RFC 9639 specifies.
         int64_t* first = pcm.data();
         int64_t* second = pcm.data() + blockSize;
-        for (uint32_t i = 0; i < blockSize; ++i)
+        const int64_t low = -(int64_t { 1 } << (bitsPerSample - 1));
+        const uint64_t span = uint64_t { 1 } << bitsPerSample;
+        uint64_t outside = 0;
+        if (channelCode == 8)
         {
-            int64_t left = 0, right = 0;
-            if (channelCode == 8)
+            for (uint32_t i = 0; i < blockSize; ++i)
             {
-                left = first[i];
-                if (!checkedSubtract(left, second[i], right)) return false;
+                const int64_t right = first[i] - second[i];
+                outside |= static_cast<uint64_t>(static_cast<uint64_t>(right - low) >= span);
+                second[i] = right;
             }
-            else if (channelCode == 9)
-            {
-                right = second[i];
-                if (!checkedAdd(first[i], right, left)) return false;
-            }
-            else
-            {
-                int64_t doubledMid = 0, adjustedMid = 0;
-                if (!checkedMultiply(first[i], 2, doubledMid)
-                    || !checkedAdd(doubledMid, second[i] % 2 != 0 ? 1 : 0, adjustedMid))
-                    return false;
-                int64_t leftNumerator = 0, rightNumerator = 0;
-                if (!checkedAdd(adjustedMid, second[i], leftNumerator)
-                    || !checkedSubtract(adjustedMid, second[i], rightNumerator)
-                    || !floorDividePowerOfTwo(leftNumerator, 1, left)
-                    || !floorDividePowerOfTwo(rightNumerator, 1, right))
-                    return false;
-            }
-            if (!sampleInDepth(left, bitsPerSample)
-                || !sampleInDepth(right, bitsPerSample))
-                return false;
-            first[i] = left;
-            second[i] = right;
         }
-        return true;
+        else if (channelCode == 9)
+        {
+            for (uint32_t i = 0; i < blockSize; ++i)
+            {
+                const int64_t left = first[i] + second[i];
+                outside |= static_cast<uint64_t>(static_cast<uint64_t>(left - low) >= span);
+                first[i] = left;
+            }
+        }
+        else
+        {
+            for (uint32_t i = 0; i < blockSize; ++i)
+            {
+                const int64_t side = second[i];
+                const int64_t mid = first[i] * 2 + (side & 1);
+                const int64_t left = (mid + side) >> 1;
+                const int64_t right = (mid - side) >> 1;
+                outside |= static_cast<uint64_t>(static_cast<uint64_t>(left - low) >= span)
+                         | static_cast<uint64_t>(static_cast<uint64_t>(right - low) >= span);
+                first[i] = left;
+                second[i] = right;
+            }
+        }
+        return outside == 0;
     }
 
     static bool decodeFrame(const std::vector<uint8_t>& bytes, size_t offset,
@@ -1118,21 +1312,34 @@ private:
         const unsigned bytesPerSample = (bitsPerSample + 7u) / 8u;
         if (bytesPerSample < 1 || bytesPerSample > 4)
             return false;
-        const size_t stride = static_cast<size_t>(channels) * bytesPerSample;
-        scratch.resize(static_cast<size_t>(blockSize) * stride);
-        for (uint8_t channel = 0; channel < channels; ++channel)
+        scratch.resize(static_cast<size_t>(blockSize) * channels * bytesPerSample);
+        switch (bytesPerSample)
         {
-            const int64_t* source = pcm.data() + static_cast<size_t>(channel) * blockSize;
-            uint8_t* out = scratch.data() + static_cast<size_t>(channel) * bytesPerSample;
-            for (uint32_t sample = 0; sample < blockSize; ++sample, out += stride)
-            {
-                const auto value = static_cast<uint32_t>(static_cast<uint64_t>(source[sample]));
-                for (unsigned k = 0; k < bytesPerSample; ++k)
-                    out[k] = static_cast<uint8_t>(value >> (8 * k));
-            }
+            case 1: interleaveLittleEndian<1>(pcm.data(), channels, blockSize, scratch.data()); break;
+            case 2: interleaveLittleEndian<2>(pcm.data(), channels, blockSize, scratch.data()); break;
+            case 3: interleaveLittleEndian<3>(pcm.data(), channels, blockSize, scratch.data()); break;
+            default: interleaveLittleEndian<4>(pcm.data(), channels, blockSize, scratch.data()); break;
         }
         md5.update(std::span<const uint8_t>(scratch.data(), scratch.size()));
         return true;
+    }
+
+    template <unsigned Bytes>
+    static void interleaveLittleEndian(const int64_t* pcm, uint8_t channels,
+                                       uint32_t blockSize, uint8_t* scratch) noexcept
+    {
+        const size_t stride = static_cast<size_t>(channels) * Bytes;
+        for (uint8_t channel = 0; channel < channels; ++channel)
+        {
+            const int64_t* source = pcm + static_cast<size_t>(channel) * blockSize;
+            uint8_t* out = scratch + static_cast<size_t>(channel) * Bytes;
+            for (uint32_t sample = 0; sample < blockSize; ++sample, out += stride)
+            {
+                const auto value = static_cast<uint32_t>(static_cast<uint64_t>(source[sample]));
+                for (unsigned k = 0; k < Bytes; ++k)
+                    out[k] = static_cast<uint8_t>(value >> (8 * k));
+            }
+        }
     }
 
     static bool allZero(const std::array<uint8_t, 16>& value) noexcept

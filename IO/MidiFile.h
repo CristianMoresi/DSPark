@@ -11,7 +11,18 @@
  * represented semantically: channel running status is accepted on input but
  * output always carries explicit status bytes, while SysEx packet boundaries,
  * velocity-zero note-ons, and opaque meta payloads are retained exactly.
- * Timing uses PPQN division only; SMPTE division is rejected.
+ *
+ * The default read is strict: every structural defect is fatal. A caller can
+ * opt in, per read, to named recoveries for defects common in real files
+ * (padding, redundant VLQ bytes, wrong track lengths or counts, missing
+ * end-of-track events, unterminated SysEx) through MidiReadOptions; the
+ * recoveries actually applied are reported by recoveries(). Resource limits
+ * and every other malformation stay fatal in all modes.
+ *
+ * Timing uses PPQN division by default. SMPTE division (24, 25, 29.97 drop
+ * frame or 30 frames per second) is read when MidiReadOptions allows it, and
+ * can be authored with createSmpte(); its ticks are fixed fractions of a
+ * second and tempo events do not affect timing.
  *
  * File operations allocate and block. They are intended for offline or worker
  * threads, never the real-time audio thread. The header is omitted from the
@@ -31,6 +42,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -80,6 +92,98 @@ struct MidiTempoChange
 };
 
 /**
+ * @brief Recoveries a tolerant MidiFile::read() may apply, as bit flags.
+ *
+ * Each flag names one class of defect found in real files that the strict
+ * reader rejects. A read applies a recovery only when MidiReadOptions allows
+ * it, and MidiFile::recoveries() reports every recovery the last read applied.
+ * Resource limits, illegal status bytes, out-of-range data bytes, a zero
+ * tempo, unknown formats and every other malformation stay fatal.
+ */
+enum class MidiReadRecovery : uint32_t
+{
+    None = 0,
+    /** A variable-length quantity carried redundant leading 0x80 bytes. The
+        value is kept; its significant part must still fit four bytes. */
+    NoncanonicalVlq = 1u << 0,
+    /** Bytes followed the end-of-track event inside its chunk (padding). They
+        are ignored. */
+    DataAfterEndOfTrack = 1u << 1,
+    /** A track chunk length disagreed with its events: the events continued
+        past the declared end, the next track chunk started before it, or it
+        ran past the end of the file. The events up to the end-of-track event
+        are used and chunk parsing resumes after them. */
+    TrackLengthMismatch = 1u << 2,
+    /** A track ended without an end-of-track event, possibly inside an
+        incomplete final event, which is dropped. An end-of-track event with
+        delta zero is appended. */
+    MissingEndOfTrack = 1u << 3,
+    /** A SysEx packet chain was interrupted by another event, or by the end of
+        the track, without its closing 0xF7. 0xF7 is appended to the last
+        packet of the chain. */
+    UnterminatedSysEx = 1u << 4,
+    /** The header track count disagreed with the track chunks present, or a
+        format 0 file did not hold exactly one track. Formats 1 and 2 keep
+        every track chunk present; format 0 keeps the first one. */
+    TrackCountMismatch = 1u << 5,
+    /** Bytes after the last chunk did not form a complete chunk (zero or 0x1A
+        padding, a truncated or overlong non-track chunk). They are ignored. */
+    TrailingBytes = 1u << 6,
+    /** Every recovery above. */
+    All = (1u << 7) - 1u
+};
+
+/** @brief Union of two recovery sets. */
+[[nodiscard]] constexpr MidiReadRecovery operator|(MidiReadRecovery a,
+                                                   MidiReadRecovery b) noexcept
+{
+    return static_cast<MidiReadRecovery>(static_cast<uint32_t>(a)
+                                         | static_cast<uint32_t>(b));
+}
+
+/** @brief Intersection of two recovery sets. */
+[[nodiscard]] constexpr MidiReadRecovery operator&(MidiReadRecovery a,
+                                                   MidiReadRecovery b) noexcept
+{
+    return static_cast<MidiReadRecovery>(static_cast<uint32_t>(a)
+                                         & static_cast<uint32_t>(b));
+}
+
+/** @brief True when @p set contains every flag of @p flags (and flags != None). */
+[[nodiscard]] constexpr bool hasRecovery(MidiReadRecovery set,
+                                         MidiReadRecovery flags) noexcept
+{
+    return flags != MidiReadRecovery::None && (set & flags) == flags;
+}
+
+/**
+ * @brief Options for one MidiFile::read() call.
+ *
+ * The default is the strict contract: no recovery and PPQN division only, so
+ * a successful default read always reports ticksPerQuarter() > 0.
+ */
+struct MidiReadOptions
+{
+    /** Recoveries the read may apply; None keeps every defect fatal. */
+    MidiReadRecovery tolerate = MidiReadRecovery::None;
+    /** Accept SMPTE time division. A file read with it reports
+        ticksPerQuarter() == 0 and isSmpteDivision() == true. */
+    bool acceptSmpteDivision = false;
+
+    /** @brief The default strict options. */
+    [[nodiscard]] static constexpr MidiReadOptions strict() noexcept
+    {
+        return {};
+    }
+
+    /** @brief Every recovery and SMPTE division allowed. */
+    [[nodiscard]] static constexpr MidiReadOptions tolerant() noexcept
+    {
+        return { MidiReadRecovery::All, true };
+    }
+};
+
+/**
  * @class MidiFile
  * @brief Transactional, resource-bounded SMF parser and authoring API.
  *
@@ -115,21 +219,32 @@ public:
     [[nodiscard]] bool create(uint16_t format, uint16_t ppqn,
                               size_t trackCount = 1)
     {
-        if ((format != 0 && format != 1) || ppqn == 0 || ppqn > 0x7fffu)
+        if (ppqn == 0 || ppqn > 0x7fffu)
             return false;
-        if (trackCount == 0 || trackCount > kMaxTracks)
-            return false;
-        if (format == 0 && trackCount != 1)
-            return false;
+        return replaceWithEmpty(format, ppqn, trackCount);
+    }
 
-        std::vector<MidiTrack> replacement(trackCount);
-        std::vector<TrackAuthoringState> replacementStates(trackCount);
-        format_ = static_cast<int>(format);
-        ppqn_ = ppqn;
-        tracks_ = std::move(replacement);
-        validationTotals_ = {};
-        trackAuthoringStates_ = std::move(replacementStates);
-        return true;
+    /**
+     * @brief Replaces the document with an empty format 0 or 1 file that uses
+     *        SMPTE time division.
+     * @param format SMF format, either 0 or 1.
+     * @param framesPerSecond 24, 25, 29 (30 drop frame, 29.97 frames per
+     *        second) or 30.
+     * @param ticksPerFrame Ticks per frame in the range 1..255.
+     * @param trackCount Initial track count. Format 0 requires exactly one.
+     * @return True on success; false leaves the current document unchanged.
+     */
+    [[nodiscard]] bool createSmpte(uint16_t format, int framesPerSecond,
+                                   uint8_t ticksPerFrame, size_t trackCount = 1)
+    {
+        if (framesPerSecond != 24 && framesPerSecond != 25
+            && framesPerSecond != 29 && framesPerSecond != 30)
+            return false;
+        const auto division = static_cast<uint16_t>(
+            (static_cast<unsigned>(256 - framesPerSecond) << 8) | ticksPerFrame);
+        if (!validDivision(division))
+            return false;
+        return replaceWithEmpty(format, division, trackCount);
     }
 
     /**
@@ -212,17 +327,28 @@ public:
     void clear() noexcept
     {
         format_ = -1;
-        ppqn_ = 0;
+        division_ = 0;
         tracks_.clear();
         validationTotals_ = {};
         trackAuthoringStates_.clear();
+        recoveries_ = MidiReadRecovery::None;
     }
 
     /**
      * @brief Reads and validates an SMF format 0, 1, or 2 file.
+     *
+     * With the default options every structural defect is fatal and only PPQN
+     * division is accepted. Recoveries allowed in @p options are applied only
+     * when needed and reported by recoveries(); a recovered document always
+     * satisfies the strict model (each track ends with one end-of-track event
+     * and no SysEx chain is left open), so it can be written back unchanged.
+     *
+     * @param path File to read.
+     * @param options Allowed recoveries and division kinds.
      * @return True on success. Any failure leaves this object empty.
      */
-    [[nodiscard]] bool read(const std::filesystem::path& path)
+    [[nodiscard]] bool read(const std::filesystem::path& path,
+                            const MidiReadOptions& options = {})
     {
         clear();
 
@@ -245,7 +371,7 @@ public:
             return false;
 
         MidiFile parsed;
-        if (!parseFile(bytes, parsed))
+        if (!parseFile(bytes, options, parsed))
             return false;
         *this = std::move(parsed);
         return true;
@@ -263,7 +389,7 @@ public:
         ValidationTotals totals;
         if (format_ != 0 && format_ != 1)
             return false;
-        if (!validateDocument(format_, ppqn_, tracks_, false, false, totals))
+        if (!validateDocument(format_, division_, tracks_, false, false, totals))
             return false;
 
         uint64_t implicitEotCount = 0;
@@ -279,7 +405,7 @@ public:
         appendBE32(output, 6);
         appendBE16(output, static_cast<uint16_t>(format_));
         appendBE16(output, static_cast<uint16_t>(tracks_.size()));
-        appendBE16(output, ppqn_);
+        appendBE16(output, division_);
 
         for (const MidiTrack& track : tracks_)
         {
@@ -348,8 +474,50 @@ public:
     /** @brief Returns 0, 1, or 2; returns -1 for an empty object. */
     [[nodiscard]] int format() const noexcept { return format_; }
 
-    /** @brief Returns PPQN, or zero for an empty object. */
-    [[nodiscard]] uint16_t ticksPerQuarter() const noexcept { return ppqn_; }
+    /** @brief Returns PPQN, or zero for an empty object or SMPTE division. */
+    [[nodiscard]] uint16_t ticksPerQuarter() const noexcept
+    {
+        return isSmpteDivision() ? uint16_t { 0 } : division_;
+    }
+
+    /** @brief Returns the raw header division word, or zero for an empty object. */
+    [[nodiscard]] uint16_t division() const noexcept { return division_; }
+
+    /** @brief True when the document uses SMPTE time division. */
+    [[nodiscard]] bool isSmpteDivision() const noexcept
+    {
+        return (division_ & 0x8000u) != 0;
+    }
+
+    /**
+     * @brief Returns the SMPTE frame-rate code: 24, 25, 29 or 30.
+     *
+     * 29 is the SMF code for 30 drop frame, whose real rate is 30000/1001
+     * (29.97) frames per second; timing uses that exact rate. Returns 0 for
+     * PPQN division or an empty object.
+     */
+    [[nodiscard]] int smpteFramesPerSecond() const noexcept
+    {
+        return isSmpteDivision() ? 256 - static_cast<int>(division_ >> 8) : 0;
+    }
+
+    /** @brief Returns SMPTE ticks per frame, or 0 for PPQN division. */
+    [[nodiscard]] uint8_t ticksPerFrame() const noexcept
+    {
+        return isSmpteDivision() ? static_cast<uint8_t>(division_ & 0xffu)
+                                 : uint8_t { 0 };
+    }
+
+    /**
+     * @brief Returns the recoveries the last successful read applied.
+     *
+     * None after a strict read, a failed read, create(), createSmpte() or
+     * clear().
+     */
+    [[nodiscard]] MidiReadRecovery recoveries() const noexcept
+    {
+        return recoveries_;
+    }
 
     /**
      * @brief Returns immutable semantic tracks as an owner-thread reference view.
@@ -369,13 +537,15 @@ public:
      *
      * Formats 0 and 1 always use track zero. Format 2 uses the requested
      * independent track. The returned map always starts at tick zero with the
-     * default 500000 us/qn unless a tick-zero tempo replaces it.
+     * default 500000 us/qn unless a tick-zero tempo replaces it. Returns
+     * nullopt for an SMPTE-division document: tempo events do not affect its
+     * timing.
      */
     [[nodiscard]] std::optional<std::vector<MidiTempoChange>>
     tempoMap(size_t track = 0) const
     {
         const std::optional<size_t> source = tempoTrack(track);
-        if (!source)
+        if (!source || isSmpteDivision())
             return std::nullopt;
 
         std::vector<MidiTempoChange> result;
@@ -399,6 +569,11 @@ public:
 
     /**
      * @brief Converts an absolute tick to floor(exact elapsed microseconds).
+     *
+     * PPQN documents integrate the tempo map. SMPTE documents ignore tempo
+     * events: a tick is 1 / (framesPerSecond * ticksPerFrame) seconds, with
+     * 30000/1001 frames per second for the 29 (30 drop frame) code.
+     *
      * @return nullopt for an empty/invalid track or uint64 overflow.
      */
     [[nodiscard]] std::optional<uint64_t>
@@ -406,13 +581,17 @@ public:
     {
         uint64_t whole = 0;
         uint64_t remainder = 0;
-        if (!integrateTicks(tick, track, whole, remainder))
+        uint16_t denominator = 0;
+        if (!integrateTicks(tick, track, whole, remainder, denominator))
             return std::nullopt;
         return whole;
     }
 
     /**
      * @brief Converts an absolute tick directly from the shared rational sum.
+     *
+     * Same time base as tickToMicroseconds(), rounded once to double.
+     *
      * @return nullopt for an empty/invalid track or elapsed-time overflow.
      */
     [[nodiscard]] std::optional<double>
@@ -420,9 +599,10 @@ public:
     {
         uint64_t whole = 0;
         uint64_t remainder = 0;
-        if (!integrateTicks(tick, track, whole, remainder))
+        uint16_t denominator = 0;
+        if (!integrateTicks(tick, track, whole, remainder, denominator))
             return std::nullopt;
-        return secondsFromRationalMicroseconds(whole, remainder, ppqn_);
+        return secondsFromRationalMicroseconds(whole, remainder, denominator);
     }
 
 private:
@@ -500,6 +680,19 @@ private:
             return readSpan(length, ignored);
         }
 
+        /** Moves to an absolute position, clamped to the end. */
+        void seek(size_t position) noexcept
+        {
+            pos_ = std::min(position, end_);
+        }
+
+        /** Moves the end bound; the caller keeps it inside the byte vector. */
+        void setEnd(size_t end) noexcept
+        {
+            end_ = end;
+            pos_ = std::min(pos_, end_);
+        }
+
     private:
         const std::vector<uint8_t>& bytes_;
         size_t pos_ = 0;
@@ -507,10 +700,42 @@ private:
     };
 
     int format_ = -1;
-    uint16_t ppqn_ = 0;
+    uint16_t division_ = 0;
     std::vector<MidiTrack> tracks_;
     ValidationTotals validationTotals_;
     std::vector<TrackAuthoringState> trackAuthoringStates_;
+    MidiReadRecovery recoveries_ = MidiReadRecovery::None;
+
+    [[nodiscard]] bool replaceWithEmpty(uint16_t format, uint16_t division,
+                                        size_t trackCount)
+    {
+        if (format != 0 && format != 1)
+            return false;
+        if (trackCount == 0 || trackCount > kMaxTracks)
+            return false;
+        if (format == 0 && trackCount != 1)
+            return false;
+
+        std::vector<MidiTrack> replacement(trackCount);
+        std::vector<TrackAuthoringState> replacementStates(trackCount);
+        format_ = static_cast<int>(format);
+        division_ = division;
+        tracks_ = std::move(replacement);
+        validationTotals_ = {};
+        trackAuthoringStates_ = std::move(replacementStates);
+        recoveries_ = MidiReadRecovery::None;
+        return true;
+    }
+
+    /** PPQN 1..32767, or SMPTE -24/-25/-29/-30 with 1..255 ticks per frame. */
+    static bool validDivision(uint16_t division) noexcept
+    {
+        if ((division & 0x8000u) == 0)
+            return division != 0;
+        const unsigned rate = 256u - (static_cast<unsigned>(division) >> 8);
+        return (rate == 24 || rate == 25 || rate == 29 || rate == 30)
+            && (division & 0xffu) != 0;
+    }
 
     static bool sameTag(const char tag[4], const char (&expected)[5]) noexcept
     {
@@ -632,14 +857,14 @@ private:
         return true;
     }
 
-    static bool validateDocument(int format, uint16_t ppqn,
+    static bool validateDocument(int format, uint16_t division,
                                  const std::vector<MidiTrack>& tracks,
                                  bool requireEot,
                                  bool allowOpenSysEx,
                                  ValidationTotals& totals,
                                  std::span<TrackAuthoringState> authoringStates = {}) noexcept
     {
-        if (format < 0 || format > 2 || ppqn == 0 || ppqn > 0x7fff)
+        if (format < 0 || format > 2 || !validDivision(division))
             return false;
         if (tracks.empty() || tracks.size() > kMaxTracks)
             return false;
@@ -721,15 +946,41 @@ private:
         return !state.sysexOpen;
     }
 
-    static bool readVlq(ByteCursor& cursor, uint32_t& value) noexcept
+    /**
+     * Reads one variable-length quantity of at most four significant bytes.
+     * The strict form rejects a redundant leading 0x80 byte; the tolerant form
+     * skips such bytes and reports them through @p overlong. Templated so the
+     * strict per-event path carries no tolerance test.
+     */
+    template <bool Tolerant>
+    static bool readVlq(ByteCursor& cursor, uint32_t& value,
+                        bool& overlong) noexcept
     {
-        value = 0;
-        for (unsigned count = 0; count < 4; ++count)
+        uint8_t byte = 0;
+        if (!cursor.readU8(byte))
+            return false;
+        if (byte == 0x80u)
         {
-            uint8_t byte = 0;
-            if (!cursor.readU8(byte))
+            if constexpr (Tolerant)
+            {
+                do
+                {
+                    overlong = true;
+                    if (!cursor.readU8(byte))
+                        return false;
+                } while (byte == 0x80u);
+            }
+            else
+            {
                 return false;
-            if (count == 0 && (byte & 0x80u) != 0 && (byte & 0x7fu) == 0)
+            }
+        }
+        value = byte & 0x7fu;
+        if ((byte & 0x80u) == 0)
+            return true;
+        for (unsigned count = 1; count < 4; ++count)
+        {
+            if (!cursor.readU8(byte))
                 return false;
             value = static_cast<uint32_t>((value << 7) | (byte & 0x7fu));
             if ((byte & 0x80u) == 0)
@@ -738,128 +989,297 @@ private:
         return false;
     }
 
-    static bool copyPayload(ByteCursor& cursor, uint32_t length,
-                            ValidationTotals& totals,
-                            std::vector<uint8_t>& payload)
+    /** Ok, ran out of chunk bytes inside the event, or malformed. */
+    enum class EventParse : uint8_t
     {
-        if (length > cursor.remaining()
-            || totals.payloadBytes > kMaxAggregatePayloadBytes - length)
-            return false;
-        const uint8_t* data = nullptr;
-        if (!cursor.readSpan(length, data))
-            return false;
-        payload.assign(data, data + length);
-        totals.payloadBytes += length;
-        return true;
-    }
+        Ok,
+        Truncated,
+        Invalid
+    };
 
-    static bool parseTrack(const std::vector<uint8_t>& bytes, size_t begin,
-                           size_t end, ValidationTotals& totals,
-                           MidiTrack& result)
+    /**
+     * Parses one event. SysEx continuation rules are applied by the caller;
+     * running status is updated only by a status byte. Payloads are checked
+     * in place and copied only when Store is set; @p endsF7 reports whether a
+     * SysEx payload ends with 0xF7.
+     */
+    template <bool TolerantVlq, bool Store>
+    static EventParse parseEvent(ByteCursor& cursor,
+                                 bool& overlong, uint8_t& runningStatus,
+                                 ValidationTotals& totals, MidiEvent& event,
+                                 bool& endsF7)
     {
-        ByteCursor cursor(bytes, begin, end);
-        uint8_t runningStatus = 0;
-        bool sysexOpen = false;
-        bool sawEot = false;
-        uint64_t absoluteTick = 0;
+        const auto vlqFailure = [&cursor]() noexcept {
+            return cursor.remaining() == 0 ? EventParse::Truncated
+                                           : EventParse::Invalid;
+        };
+        if (!readVlq<TolerantVlq>(cursor, event.deltaTicks, overlong))
+            return vlqFailure();
 
-        while (cursor.remaining() > 0)
+        uint8_t first = 0;
+        if (!cursor.readU8(first))
+            return EventParse::Truncated;
+        if (first < 0x80)
         {
-            if (sawEot || totals.events >= kMaxEvents)
-                return false;
-            MidiEvent event;
-            if (!readVlq(cursor, event.deltaTicks))
-                return false;
-            if (absoluteTick > std::numeric_limits<uint64_t>::max() - event.deltaTicks)
-                return false;
-            absoluteTick += event.deltaTicks;
-
-            uint8_t first = 0;
-            if (!cursor.readU8(first))
-                return false;
-            if (first < 0x80)
+            if (runningStatus == 0)
+                return EventParse::Invalid;
+            event.kind = MidiEventKind::Channel;
+            event.status = runningStatus;
+            event.data1 = first;
+            if (channelDataCount(runningStatus) == 2)
             {
-                if (runningStatus == 0 || sysexOpen)
-                    return false;
-                event.kind = MidiEventKind::Channel;
-                event.status = runningStatus;
-                event.data1 = first;
-                if (channelDataCount(runningStatus) == 2)
-                {
-                    if (!cursor.readU8(event.data2) || event.data2 >= 0x80)
-                        return false;
-                }
+                if (!cursor.readU8(event.data2))
+                    return EventParse::Truncated;
+                if (event.data2 >= 0x80)
+                    return EventParse::Invalid;
             }
-            else if (first >= 0x80 && first <= 0xef)
+        }
+        else if (first <= 0xef)
+        {
+            event.kind = MidiEventKind::Channel;
+            event.status = first;
+            runningStatus = first;
+            if (!cursor.readU8(event.data1))
+                return EventParse::Truncated;
+            if (event.data1 >= 0x80)
+                return EventParse::Invalid;
+            if (channelDataCount(first) == 2)
             {
-                if (sysexOpen)
-                    return false;
-                event.kind = MidiEventKind::Channel;
-                event.status = first;
-                runningStatus = first;
-                if (!cursor.readU8(event.data1) || event.data1 >= 0x80)
-                    return false;
-                if (channelDataCount(first) == 2)
-                {
-                    if (!cursor.readU8(event.data2) || event.data2 >= 0x80)
-                        return false;
-                }
+                if (!cursor.readU8(event.data2))
+                    return EventParse::Truncated;
+                if (event.data2 >= 0x80)
+                    return EventParse::Invalid;
             }
-            else if (first == 0xf0 || first == 0xf7)
+        }
+        else if (first == 0xf0 || first == 0xf7 || first == 0xff)
+        {
+            runningStatus = 0;
+            if (first == 0xff)
             {
-                runningStatus = 0;
-                event.kind = first == 0xf0 ? MidiEventKind::SysExF0
-                                           : MidiEventKind::SysExF7;
-                uint32_t length = 0;
-                if (!readVlq(cursor, length)
-                    || !copyPayload(cursor, length, totals, event.payload))
-                    return false;
-                if (event.kind == MidiEventKind::SysExF0)
-                {
-                    if (sysexOpen) return false;
-                    sysexOpen = !payloadEndsF7(event);
-                }
-                else if (sysexOpen)
-                {
-                    sysexOpen = !payloadEndsF7(event);
-                }
-            }
-            else if (first == 0xff)
-            {
-                runningStatus = 0;
-                if (sysexOpen)
-                    return false;
                 event.kind = MidiEventKind::Meta;
-                if (!cursor.readU8(event.metaType) || event.metaType >= 0x80)
-                    return false;
-                uint32_t length = 0;
-                if (!readVlq(cursor, length)
-                    || !copyPayload(cursor, length, totals, event.payload)
-                    || !validTempoPayload(event))
-                    return false;
-                if (event.metaType == 0x2f)
-                {
-                    if (!event.payload.empty()) return false;
-                    sawEot = true;
-                }
+                if (!cursor.readU8(event.metaType))
+                    return EventParse::Truncated;
+                if (event.metaType >= 0x80)
+                    return EventParse::Invalid;
             }
             else
             {
-                return false;
+                event.kind = first == 0xf0 ? MidiEventKind::SysExF0
+                                           : MidiEventKind::SysExF7;
             }
-
-            if (!validateEventShape(event))
-                return false;
-            ++totals.events;
-            result.events.push_back(std::move(event));
+            uint32_t length = 0;
+            if (!readVlq<TolerantVlq>(cursor, length, overlong))
+                return vlqFailure();
+            if (length > cursor.remaining())
+                return EventParse::Truncated;
+            const uint8_t* data = nullptr;
+            if (totals.payloadBytes > kMaxAggregatePayloadBytes - length
+                || !cursor.readSpan(length, data))
+                return EventParse::Invalid;
+            totals.payloadBytes += length;
+            endsF7 = length != 0 && data[length - 1] == 0xf7;
+            if (event.kind == MidiEventKind::Meta
+                && ((event.metaType == 0x51 && length == 3
+                     && data[0] == 0 && data[1] == 0 && data[2] == 0)
+                    || (event.metaType == 0x2f && length != 0)))
+                return EventParse::Invalid;
+            if constexpr (Store)
+                event.payload.assign(data, data + length);
         }
-        return sawEot && !sysexOpen;
+        else
+        {
+            return EventParse::Invalid;
+        }
+        return validateEventShape(event) ? EventParse::Ok : EventParse::Invalid;
     }
 
-    static bool parseFile(const std::vector<uint8_t>& bytes, MidiFile& result)
+    /** At least 8 bytes at @p pos holding a printable tag and a length that fits. */
+    static bool looksLikeChunkHeader(const std::vector<uint8_t>& bytes,
+                                     size_t pos, size_t end) noexcept
+    {
+        if (pos > end || end - pos < 8)
+            return false;
+        for (size_t i = 0; i < 4; ++i)
+            if (bytes[pos + i] < 0x20 || bytes[pos + i] > 0x7e)
+                return false;
+        const uint32_t length = (static_cast<uint32_t>(bytes[pos + 4]) << 24)
+                              | (static_cast<uint32_t>(bytes[pos + 5]) << 16)
+                              | (static_cast<uint32_t>(bytes[pos + 6]) << 8)
+                              | static_cast<uint32_t>(bytes[pos + 7]);
+        return length <= end - pos - 8;
+    }
+
+    static bool startsTrackChunk(const std::vector<uint8_t>& bytes,
+                                 size_t pos, size_t end) noexcept
+    {
+        return pos <= end && end - pos >= 8
+            && std::memcmp(bytes.data() + pos, "MTrk", 4) == 0;
+    }
+
+    enum class TrackParse : uint8_t
+    {
+        Ok,
+        Failed,
+        RetryWithoutExtension
+    };
+
+    /**
+     * Parses one track chunk [begin, declaredEnd). @p resumeAt receives the
+     * file position where chunk parsing continues. With TrackLengthMismatch
+     * allowed and @p allowExtension set, a chunk that ends without its
+     * end-of-track event and is not followed by a chunk header is parsed on
+     * past its declared end; RetryWithoutExtension asks the caller to parse
+     * it again without that when no end-of-track event is found there either.
+     * TolerantVlq selects the VLQ reader at compile time, so the strict event
+     * loop carries no tolerance test. Without Store nothing is allocated: the
+     * pass only counts in @p count the events a storing pass keeps, with the
+     * same checks and outcome, so the storing pass can reserve exactly.
+     */
+    template <bool TolerantVlq, bool Store>
+    static TrackParse parseTrack(const std::vector<uint8_t>& bytes, size_t begin,
+                                 size_t declaredEnd, size_t fileEnd,
+                                 MidiReadRecovery allowed, bool allowExtension,
+                                 MidiReadRecovery& applied,
+                                 ValidationTotals& totals, MidiTrack& result,
+                                 size_t& count, size_t& resumeAt)
+    {
+        const bool closeSysExAllowed =
+            hasRecovery(allowed, MidiReadRecovery::UnterminatedSysEx);
+        ByteCursor cursor(bytes, begin, declaredEnd);
+        uint8_t runningStatus = 0;
+        bool sysexOpen = false;
+        size_t openPacket = 0;
+        bool sawEot = false;
+        bool overlong = false;
+        bool extended = false;
+        uint64_t absoluteTick = 0;
+
+        const auto closeOpenSysEx = [&]() {
+            if (!closeSysExAllowed
+                || totals.payloadBytes >= kMaxAggregatePayloadBytes)
+                return false;
+            if constexpr (Store)
+                result.events[openPacket].payload.push_back(0xf7);
+            ++totals.payloadBytes;
+            sysexOpen = false;
+            applied = applied | MidiReadRecovery::UnterminatedSysEx;
+            return true;
+        };
+
+        for (;;)
+        {
+            while (cursor.remaining() > 0)
+            {
+                if (totals.events >= kMaxEvents)
+                    return TrackParse::Failed;
+                const size_t eventStart = cursor.position();
+                const uint8_t statusBefore = runningStatus;
+                MidiEvent event;
+                bool endsF7 = false;
+                const EventParse parsed = parseEvent<TolerantVlq, Store>(
+                    cursor, overlong, runningStatus, totals, event, endsF7);
+                if (parsed == EventParse::Invalid)
+                    return TrackParse::Failed;
+                if (parsed == EventParse::Truncated)
+                {
+                    cursor.seek(eventStart);
+                    runningStatus = statusBefore;
+                    break;
+                }
+                if (absoluteTick > std::numeric_limits<uint64_t>::max() - event.deltaTicks)
+                    return TrackParse::Failed;
+                absoluteTick += event.deltaTicks;
+
+                if (sysexOpen && event.kind != MidiEventKind::SysExF7
+                    && !closeOpenSysEx())
+                    return TrackParse::Failed;
+                if (event.kind == MidiEventKind::SysExF0
+                    || (event.kind == MidiEventKind::SysExF7 && sysexOpen))
+                {
+                    sysexOpen = !endsF7;
+                    openPacket = count;
+                }
+                const bool endOfTrack = isEot(event);
+                ++totals.events;
+                ++count;
+                if constexpr (Store)
+                    result.events.push_back(std::move(event));
+                if (endOfTrack)
+                {
+                    sawEot = true;
+                    break;
+                }
+            }
+            if (sawEot || extended || !allowExtension
+                || !hasRecovery(allowed, MidiReadRecovery::TrackLengthMismatch)
+                || declaredEnd >= fileEnd
+                || looksLikeChunkHeader(bytes, declaredEnd, fileEnd))
+                break;
+            // The chunk ended without its end-of-track event and no chunk
+            // header follows: its declared length understated the events.
+            cursor.setEnd(std::min(fileEnd, begin + static_cast<size_t>(kMaxTrackChunkBytes)));
+            extended = true;
+        }
+
+        if (overlong)
+            applied = applied | MidiReadRecovery::NoncanonicalVlq;
+
+        if (extended)
+        {
+            if (!sawEot)
+                return TrackParse::RetryWithoutExtension;
+            applied = applied | MidiReadRecovery::TrackLengthMismatch;
+            resumeAt = cursor.position();
+            return TrackParse::Ok;
+        }
+
+        resumeAt = declaredEnd;
+        if (sawEot)
+        {
+            if (cursor.remaining() == 0)
+                return TrackParse::Ok;
+            const size_t after = cursor.position();
+            if (hasRecovery(allowed, MidiReadRecovery::TrackLengthMismatch)
+                && startsTrackChunk(bytes, after, fileEnd))
+            {
+                // The next track chunk starts inside this one's declared length.
+                applied = applied | MidiReadRecovery::TrackLengthMismatch;
+                resumeAt = after;
+                return TrackParse::Ok;
+            }
+            if (!hasRecovery(allowed, MidiReadRecovery::DataAfterEndOfTrack))
+                return TrackParse::Failed;
+            applied = applied | MidiReadRecovery::DataAfterEndOfTrack;
+            return TrackParse::Ok;
+        }
+
+        // The track ended, cleanly or inside an incomplete event, without its
+        // end-of-track event.
+        if (!hasRecovery(allowed, MidiReadRecovery::MissingEndOfTrack)
+            || (sysexOpen && !closeOpenSysEx())
+            || totals.events >= kMaxEvents)
+            return TrackParse::Failed;
+        ++totals.events;
+        ++count;
+        if constexpr (Store)
+        {
+            MidiEvent endOfTrack;
+            endOfTrack.kind = MidiEventKind::Meta;
+            endOfTrack.metaType = 0x2f;
+            result.events.push_back(std::move(endOfTrack));
+        }
+        applied = applied | MidiReadRecovery::MissingEndOfTrack;
+        return TrackParse::Ok;
+    }
+
+    static bool parseFile(const std::vector<uint8_t>& bytes,
+                          const MidiReadOptions& options, MidiFile& result)
     {
         if (bytes.size() < 14 || bytes.size() > kMaxInputBytes)
             return false;
+        const MidiReadRecovery allowed = options.tolerate & MidiReadRecovery::All;
+        const bool tolerantVlq = hasRecovery(allowed, MidiReadRecovery::NoncanonicalVlq);
+        MidiReadRecovery applied = MidiReadRecovery::None;
         ByteCursor cursor(bytes, 0, bytes.size());
         char tag[4] = {};
         uint32_t headerLength = 0;
@@ -874,44 +1294,133 @@ private:
             return false;
         if (headerLength > 6 && !cursor.skip(headerLength - 6))
             return false;
-        if (format > 2 || trackCount == 0 || trackCount > kMaxTracks
-            || (format == 0 && trackCount != 1)
-            || division == 0 || (division & 0x8000u) != 0)
+        if (format > 2 || !validDivision(division)
+            || ((division & 0x8000u) != 0 && !options.acceptSmpteDivision))
             return false;
+        if (trackCount == 0 || trackCount > kMaxTracks
+            || (format == 0 && trackCount != 1))
+        {
+            if (!hasRecovery(allowed, MidiReadRecovery::TrackCountMismatch))
+                return false;
+            applied = applied | MidiReadRecovery::TrackCountMismatch;
+        }
 
         std::vector<MidiTrack> tracks;
-        tracks.reserve(trackCount);
+        tracks.reserve(std::min<size_t>(trackCount, kMaxTracks));
         ValidationTotals totals;
         while (cursor.remaining() > 0)
         {
             if (cursor.remaining() < 8)
-                return false;
-            uint32_t length = 0;
-            if (!cursor.readTag(tag) || !cursor.readBE32(length)
-                || length > cursor.remaining())
-                return false;
-            const size_t begin = cursor.position();
-            const size_t end = begin + static_cast<size_t>(length);
-
-            if (sameTag(tag, "MTrk"))
             {
-                if (tracks.size() >= trackCount || length > kMaxTrackChunkBytes)
+                if (!hasRecovery(allowed, MidiReadRecovery::TrailingBytes))
                     return false;
-                MidiTrack track;
-                if (!parseTrack(bytes, begin, end, totals, track))
+                applied = applied | MidiReadRecovery::TrailingBytes;
+                break;
+            }
+            uint32_t length = 0;
+            if (!cursor.readTag(tag) || !cursor.readBE32(length))
+                return false;
+            const bool isTrack = sameTag(tag, "MTrk");
+            size_t chunkLength = length;
+            if (length > cursor.remaining())
+            {
+                if (isTrack
+                    && hasRecovery(allowed, MidiReadRecovery::TrackLengthMismatch))
+                {
+                    chunkLength = cursor.remaining();
+                    applied = applied | MidiReadRecovery::TrackLengthMismatch;
+                }
+                else if (!isTrack && !sameTag(tag, "MThd")
+                         && hasRecovery(allowed, MidiReadRecovery::TrailingBytes))
+                {
+                    applied = applied | MidiReadRecovery::TrailingBytes;
+                    break;
+                }
+                else
+                {
                     return false;
-                tracks.push_back(std::move(track));
+                }
+            }
+            const size_t begin = cursor.position();
+            const size_t end = begin + chunkLength;
+            size_t resumeAt = end;
+
+            if (isTrack)
+            {
+                const bool extra = format == 0 ? !tracks.empty()
+                                               : tracks.size() >= trackCount;
+                if (extra)
+                {
+                    if (!hasRecovery(allowed, MidiReadRecovery::TrackCountMismatch))
+                        return false;
+                    applied = applied | MidiReadRecovery::TrackCountMismatch;
+                }
+                if (chunkLength > kMaxTrackChunkBytes)
+                    return false;
+                if (format != 0 || !extra)
+                {
+                    // A format 0 file keeps its first track chunk only.
+                    if (tracks.size() >= kMaxTracks)
+                        return false;
+                    // A counting pass runs the same checks without
+                    // allocating; the storing pass then reserves exactly the
+                    // events it keeps. That is faster than growing the vector
+                    // and never needs more memory, and a track the counting
+                    // pass rejects allocates nothing.
+                    MidiTrack track;
+                    const auto pass = [&](auto store, bool allowExtension,
+                                          ValidationTotals& passTotals,
+                                          MidiReadRecovery& passApplied,
+                                          size_t& passCount) {
+                        constexpr bool storing = decltype(store)::value;
+                        passCount = 0;
+                        return tolerantVlq
+                            ? parseTrack<true, storing>(
+                                  bytes, begin, end, bytes.size(), allowed, allowExtension,
+                                  passApplied, passTotals, track, passCount, resumeAt)
+                            : parseTrack<false, storing>(
+                                  bytes, begin, end, bytes.size(), allowed, allowExtension,
+                                  passApplied, passTotals, track, passCount, resumeAt);
+                    };
+                    ValidationTotals countTotals = totals;
+                    MidiReadRecovery countApplied = applied;
+                    size_t count = 0;
+                    bool allowExtension = true;
+                    TrackParse counted = pass(std::false_type {}, true, countTotals,
+                                              countApplied, count);
+                    if (counted == TrackParse::RetryWithoutExtension)
+                    {
+                        allowExtension = false;
+                        countTotals = totals;
+                        countApplied = applied;
+                        counted = pass(std::false_type {}, false, countTotals,
+                                       countApplied, count);
+                    }
+                    if (counted != TrackParse::Ok)
+                        return false;
+                    track.events.reserve(count);
+                    size_t stored = 0;
+                    if (pass(std::true_type {}, allowExtension, totals, applied, stored)
+                            != TrackParse::Ok
+                        || stored != count)
+                        return false;
+                    tracks.push_back(std::move(track));
+                }
             }
             else
             {
-                if (sameTag(tag, "MThd") || length > kMaxTrackChunkBytes)
+                if (sameTag(tag, "MThd") || chunkLength > kMaxTrackChunkBytes)
                     return false;
             }
-            if (!cursor.skip(length))
-                return false;
+            cursor.seek(resumeAt);
         }
         if (tracks.size() != trackCount)
-            return false;
+        {
+            if (!hasRecovery(allowed, MidiReadRecovery::TrackCountMismatch)
+                || tracks.empty())
+                return false;
+            applied = applied | MidiReadRecovery::TrackCountMismatch;
+        }
 
         ValidationTotals verified;
         std::vector<TrackAuthoringState> authoringStates(tracks.size());
@@ -919,10 +1428,11 @@ private:
                               authoringStates))
             return false;
         result.format_ = format;
-        result.ppqn_ = division;
+        result.division_ = division;
         result.tracks_ = std::move(tracks);
         result.validationTotals_ = verified;
         result.trackAuthoringStates_ = std::move(authoringStates);
+        result.recoveries_ = applied;
         return true;
     }
 
@@ -957,7 +1467,7 @@ private:
 
     [[nodiscard]] std::optional<size_t> tempoTrack(size_t track) const noexcept
     {
-        if (format_ < 0 || format_ > 2 || ppqn_ == 0 || track >= tracks_.size())
+        if (format_ < 0 || format_ > 2 || division_ == 0 || track >= tracks_.size())
             return std::nullopt;
         return format_ == 2 ? track : size_t { 0 };
     }
@@ -973,6 +1483,7 @@ private:
         return tempo != 0;
     }
 
+    /** Adds ticks * tempo / ppqn microseconds to the exact sum whole + remainder / ppqn. */
     static bool addInterval(uint64_t ticks, uint32_t tempo, uint16_t ppqn,
                             uint64_t& whole, uint64_t& remainder) noexcept
     {
@@ -1035,14 +1546,39 @@ private:
              + static_cast<double>(units) / static_cast<double>(scale);
     }
 
+    /**
+     * Microseconds per SMPTE tick as numerator / denominator: 10^6 divided by
+     * framesPerSecond * ticksPerFrame, with 30000/1001 frames per second for
+     * the 29 (30 drop frame) code. Every denominator is at most 3 * 255.
+     */
+    void smpteTickMicroseconds(uint32_t& numerator, uint16_t& denominator) const noexcept
+    {
+        const unsigned ticks = division_ & 0xffu;
+        switch (smpteFramesPerSecond())
+        {
+            case 24: numerator = 125000; denominator = static_cast<uint16_t>(3 * ticks); break;
+            case 25: numerator = 40000; denominator = static_cast<uint16_t>(ticks); break;
+            case 29: numerator = 100100; denominator = static_cast<uint16_t>(3 * ticks); break;
+            default: numerator = 100000; denominator = static_cast<uint16_t>(3 * ticks); break;
+        }
+    }
+
     bool integrateTicks(uint64_t targetTick, size_t track, uint64_t& whole,
-                        uint64_t& remainder) const noexcept
+                        uint64_t& remainder, uint16_t& denominator) const noexcept
     {
         const std::optional<size_t> source = tempoTrack(track);
         if (!source)
             return false;
         whole = 0;
         remainder = 0;
+        if (isSmpteDivision())
+        {
+            // SMPTE ticks are fixed fractions of a second; tempo is ignored.
+            uint32_t numerator = 0;
+            smpteTickMicroseconds(numerator, denominator);
+            return addInterval(targetTick, numerator, denominator, whole, remainder);
+        }
+        denominator = division_;
         uint64_t eventTick = 0;
         uint64_t integratedTick = 0;
         uint32_t tempo = 500000;
@@ -1057,12 +1593,12 @@ private:
                 continue;
             if (eventTick > targetTick)
                 break;
-            if (!addInterval(eventTick - integratedTick, tempo, ppqn_, whole, remainder))
+            if (!addInterval(eventTick - integratedTick, tempo, denominator, whole, remainder))
                 return false;
             integratedTick = eventTick;
             tempo = nextTempo;
         }
-        return addInterval(targetTick - integratedTick, tempo, ppqn_, whole, remainder);
+        return addInterval(targetTick - integratedTick, tempo, denominator, whole, remainder);
     }
 };
 

@@ -20,9 +20,9 @@
   },
   "counts": {
     "binary_exact": 184,
-    "first_party_ascii_text": 301,
+    "first_party_ascii_text": 302,
     "third_party_utf8_exact": 84,
-    "total": 569
+    "total": 570
   },
   "gitattributes_required_lines": [
     "* text=auto",
@@ -761,6 +761,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "IO/WavFile.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "IO/detail/Mp3Kernels.inl"
     },
     {
       "kind": "first_party_ascii_text",

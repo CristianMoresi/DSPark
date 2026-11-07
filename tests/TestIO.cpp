@@ -4024,3 +4024,1620 @@ DSPARK_TEST(FlacFile_legacy_variable_and_unequal_bound_fixed_streams_decode)
             EXPECT_NEAR(got.getChannel(0)[i], expected.getChannel(0)[i], 0.0f);
     }
 }
+
+// ============================================================================
+// Mp3File - Layer I, Layer II, free format and the vector transform kernels
+// ============================================================================
+
+namespace {
+
+struct mp3R2_Probe { int index; float value; };
+
+const char* const mp3R2_kLayer2Hex =
+    "fffd60406675b6cb642b023dfe56bb8f3d7459bf84d751cd395a0cf86938385959367158b859f7df7df7dfbf7ef7bdef"
+    "7bdef7bdeeeef7bdef7bbbbbbc0ec8fbefbf80f5ef8c1f07bdcf835dddf07bdf07777773bba1f6df80afa43d75f38e62"
+    "ea0733165b97d44ad0f1b1c105d659540414dbb28bcaedb9ef336e384dcb7b486c1ced8d32b7ea910c74bd086733c8a0"
+    "f0f881b8e544ccada75cd1a34e7d225cee3ded6bd948b565e316364587dd6549cb59a5d51f6115ef741efd6d716a6756"
+    "63442204ccd0f23346e36028f83bed17c00fbc18f985126107085e1a17828e6cd38d12e6f8dbb465c95a1968c947868c"
+    "704253b75388aa685b04e2511bd2b6423074291a4c73137b95946839521446fcc4248fa8a1b5680d47ed3c5af5ca4eac"
+    "f5a36591e7b78378e53a6f7a4cab28c070385a8f6099155dc0fffd600019c71c61851858aaaab8d44e3d2515556556aa"
+    "b1be9340bf829751c8e4ca2b49a3254574e45725252c7d14d43e0d00024c7e63249a30a9c5860b1c95963ae9b0ba18c1"
+    "0d400914471a2dd47142eb6a2999960a5b4e7663ac2f04b90927d42b1b02c97fd5537101c454d91e281982d19c113cb7"
+    "85ef6d76ff775a03e8f346e38b254913b28d4f61a5552d7bb1f6da68acdfab8a3a4bba115c999277e89517561cdee44a"
+    "a9446a91b31ff0ea877cd81c2534047e94a18e28b991d0b12950997d6406605ff7a6aaa4e31e1d93a6182b9546aa6e5d"
+    "6e11b150da54a107d05ca626d1f75d4e236625a6ee3774a96c9084399ff5344dd3c94c330de3343126a65659aeed4ad4"
+    "26f8405f8f8fcb87500cbe7ad33aba2d54fb1f186e8b352ac4bb0821219a8b7ce4dae6d986788317c7960bee7bd70c92"
+    "c9e8fffd600019c7186346145aaaeaae38f4d4536dd65565e45048ba892f9e2e35939c3723045335715e1d30bb28b59e"
+    "2a6d3edf60b0df9ff901dd1a1dbc969c6ab6d911812089eae2bcd60cf65b08dc1c95ac63d1503d71a92b7a944d770a49"
+    "8a1f31f89f098ee9fa77ae2909646ef3c8f7cb491c6b9237bdf47ad50bde66380074b9592c2ac8978c69d78e43c94f92"
+    "5b594b321f231f408bd61c4a7682b5664849709206dcdabd409633275a193dc2c817ab1b5859e9b0b38eeb250bd68422"
+    "19ae272eb205e2f37fa1654906a948dca1b24ead56e7bf0e4e8b49ac581dd00e2c829c15b82ef553004f5a0bc04552f4"
+    "4948c0db27bd7854261469b51b2baa661f89dec908b1358e6757cfb2178f02a9f01d735ad0046a7c1094d535f5cf1bd7"
+    "0985679cfcdbfeff12b1ba02a624b86959eed80315197e895b5c00";
+
+// 6912 interleaved samples; every 191th of the last two thirds, from a
+// reference decoder.
+const mp3R2_Probe mp3R2_kLayer2Probes[] = {
+    { 2304, 0.0548375025f },
+    { 2495, -0.0295396876f },
+    { 2686, 0.00436188839f },
+    { 2877, -0.0113057941f },
+    { 3068, -0.0586682856f },
+    { 3259, -0.0812272951f },
+    { 3450, 0.0439098999f },
+    { 3641, 0.0547870286f },
+    { 3832, 0.022255186f },
+    { 4023, 0.0370997153f },
+    { 4214, -0.062348038f },
+    { 4405, -0.0382896215f },
+    { 4596, 0.0295080952f },
+    { 4787, 0.0160588417f },
+    { 4978, 0.0379188955f },
+    { 5169, -0.0520958342f },
+    { 5360, -0.060896486f },
+    { 5551, -0.0129230088f },
+    { 5742, 0.0126423305f },
+    { 5933, 0.034145128f },
+    { 6124, 0.050426323f },
+    { 6315, 0.0234931298f },
+    { 6506, -0.0544773899f },
+    { 6697, 0.022095751f }
+};
+
+const char* const mp3R2_kLayer1Hex =
+    "fffe84748861080a04000060000000000000080000000000000000000003b348fbc66bdfa3c27746556442a04f126f9b"
+    "5df6345dd253fafd425f48676f11c595cbf5d19a7c0d32aae6010dba6905fda0f84b24e5730d80fdc23fed029ac76a1e"
+    "44286c440523dc0000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    "00000000000000000000000000000000fffe8454bb6f02001a00a226600070000563000c000c00bd0060e70babf26f59"
+    "5bc73a8fdfb666e6d7d7d57355e045c0125277c04c180683725d3a74dc6f5e3a835682a5f66bd07dc0019fdcb58bc2e8"
+    "4f742f025bbdf24fc51a8b630fb8914d489887040ed176adb2323f20092ba696403e640a3132588cbc33ec04eb815f28"
+    "f6e3b6a057c28bd4db2a5080bb09dd7b13ae7c280c4fd7671a11e3fb9f0fdc6709a8ee53194b4d47d4e12484ebd689e6"
+    "7c253a98b2426e075155ad38732952d8372677a35e191623898e2129aae4be8dceb5011895b721ce3cf4a807e0cafe31"
+    "6ec5279974d244023e08801cb2fd9ac522ec0000000000000000000000000000fffe8444c42000e60007100000270700"
+    "0000a4880013000c91cef6631f9e7b7c37df08d56efeab6da9775bcba76d84d8a6d8179ce800d2b09e674cd68c9d4d02"
+    "48c38f192768626739fa69e3d2b0a1093ebf64d27e18f6b0d0c8b7750d8dec11fe896b5822b89a281ba82179a12fdd04"
+    "b177f6f970ce2934d9f1a83353748e6bf9586b29bc0042bd61aaccdccf67024d2516d37521b392052b974cc157343d32"
+    "b9a516a334fec3e2129053fc0361e0cb38ba99d167c8e7f3db009f9e1d60b6a89652912e65531c000000000000000000"
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
+// 2304 interleaved samples; every 63th of the last two thirds, from a
+// reference decoder.
+const mp3R2_Probe mp3R2_kLayer1Probes[] = {
+    { 768, 0.00023808828f },
+    { 831, -0.000379322213f },
+    { 894, 0.000266827963f },
+    { 957, 0.000718105934f },
+    { 1020, 0.000108089822f },
+    { 1083, 0.00100534107f },
+    { 1146, -0.00159751938f },
+    { 1209, -0.00090863643f },
+    { 1272, 0.0154903978f },
+    { 1335, -0.00928503927f },
+    { 1398, -0.0134385554f },
+    { 1461, -0.00608294364f },
+    { 1524, -0.0296050161f },
+    { 1587, 0.00306604523f },
+    { 1650, 0.0212647226f },
+    { 1713, -0.00335809449f },
+    { 1776, 0.0162993073f },
+    { 1839, 0.000179787807f },
+    { 1902, -0.00811650045f },
+    { 1965, 0.00744489208f },
+    { 2028, 0.0122812157f },
+    { 2091, 0.011782839f },
+    { 2154, 0.00186728826f },
+    { 2217, -0.0179273803f }
+};
+
+const char* const mp3R2_kLayer2FreeHex =
+    "fffd046400000007000c000000000008800002018196057574516d93784d576ffbadf15b4e1397149e190fdfba52c226"
+    "5c21435b00c08b863cf9297eecbcfae6e848ca51e64da2314498c4c3ab12b43cd1feedba4c885a2f0d8dcd195c20dbec"
+    "a867e13f0ee9c7f738cde5de16ed4eed511964aa0959b302ce30779e232523163d4457acd126884b354e07b3dc4e5dfb"
+    "493403bc48e125d8638a21a9ba5fdac65486e94423cd6d64fa5c0b542df59b7c3119c03a716cbfff58f2dbb655fd1bd3"
+    "326f9080d36f0f3d335e6097461f6998bf4d4b7d472b97e11b5b66000000000000000000000000000000000000000000"
+    "fffd04540000090000040010006000030a0880b5aca5dae7082dbe8ad859ac96bb1931897f2fd7cdd93914a078031ba9"
+    "5d04be2d4ab026d292c1bf37138a72d58746cd25cd1937ce04ddadca275e8a93091a2bd99d80391464fa2a65231911b4"
+    "035e9dd3257c4e37a2306f94c22b737938b4bf63e9afbc53621acf9a57bcf7db772a489d4a48966ea2a447da5fc428c6"
+    "012a31d5b54eafdaf43425d4655ee9b85d2fc94ffe389e75514c2624d138e7880036091490488572e304118000000000"
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    "fffd046402000000000000800000a0000000000000c339b7f7b1b04591bf2386291670f105ff028984e76378aa88dc4a"
+    "0a66a1403f57a493da18113505c3610b605e2cffd6abddf5ac3caa0eb8f33408e55e1b66476aa220653d1105e5f97db4"
+    "657196ef136754fd855eea6758c338880000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
+// 6912 interleaved samples; every 191th of the last two thirds, from a
+// reference decoder.
+const mp3R2_Probe mp3R2_kLayer2FreeProbes[] = {
+    { 2304, -0.000197731963f },
+    { 2495, 1.32257428e-05f },
+    { 2686, -0.0015833003f },
+    { 2877, 0.00478105247f },
+    { 3068, 0.00453008944f },
+    { 3259, -0.015682023f },
+    { 3450, 0.00255409256f },
+    { 3641, -0.00338956341f },
+    { 3832, 0.00806494895f },
+    { 4023, -0.0104602128f },
+    { 4214, 0.001730402f },
+    { 4405, -0.00429509301f },
+    { 4596, -0.00095198839f },
+    { 4787, -0.00829491299f },
+    { 4978, -0.000775594788f },
+    { 5169, -0.00549798366f },
+    { 5360, 0.0016896677f },
+    { 5551, -0.0019900254f },
+    { 5742, 0.000376064796f },
+    { 5933, 0.00254127453f },
+    { 6124, -0.00178212626f },
+    { 6315, 0.00463826023f },
+    { 6506, 0.000188134494f },
+    { 6697, 0.000147649072f }
+};
+
+std::vector<uint8_t> mp3R2_fromHex(const char* hex)
+{
+    std::vector<uint8_t> out;
+    auto nibble = [](char c) { return (c <= '9') ? c - '0' : c - 'a' + 10; };
+    for (const char* p = hex; p[0] != '\0' && p[1] != '\0'; p += 2)
+        out.push_back(static_cast<uint8_t>((nibble(p[0]) << 4) | nibble(p[1])));
+    return out;
+}
+
+void mp3R2_write(const char* path, const std::vector<uint8_t>& bytes)
+{
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+/// Opens path and returns its interleaved samples (empty when rejected).
+std::vector<float> mp3R2_decode(const char* path, AudioFileInfo* infoOut = nullptr)
+{
+    Mp3File f;
+    if (!f.openRead(path)) return {};
+    const AudioFileInfo info = f.getInfo();
+    if (infoOut != nullptr) *infoOut = info;
+    const int nch = static_cast<int>(info.numChannels);
+    const int n = static_cast<int>(info.numSamples);
+    AudioBuffer<float> buf;
+    buf.resize(nch, n);
+    if (!f.readSamples(buf.toView())) return {};
+    std::vector<float> out(static_cast<size_t>(n) * static_cast<size_t>(nch));
+    for (int i = 0; i < n; ++i)
+        for (int ch = 0; ch < nch; ++ch)
+            out[static_cast<size_t>(i * nch + ch)] = buf.getChannel(ch)[i];
+    return out;
+}
+
+/// A 44.1 kHz stereo Layer III file written by Mp3File, with its bytes.
+std::vector<uint8_t> mp3R2_encodeLayer3(const char* path, int frames)
+{
+    Mp3File w;
+    AudioFileInfo info;
+    info.sampleRate = 44100.0;
+    info.numChannels = 2;
+    info.bitsPerSample = 128;
+    info.numSamples = frames;
+    if (!w.openWrite(path, info)) return {};
+    AudioBuffer<float> buf;
+    buf.resize(2, frames);
+    for (int i = 0; i < frames; ++i)
+    {
+        const double t = static_cast<double>(i) / 44100.0;
+        buf.getChannel(0)[i] = static_cast<float>(0.4 * std::sin(2.0 * pi<double> * 440.0 * t)
+                                                  + 0.1 * std::sin(2.0 * pi<double> * 6150.0 * t));
+        buf.getChannel(1)[i] = static_cast<float>(0.3 * std::sin(2.0 * pi<double> * 659.0 * t));
+    }
+    if (!w.writeSamples(std::as_const(buf).toView())) return {};
+    w.close();
+    std::ifstream f(path, std::ios::binary);
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), {});
+}
+
+} // namespace
+
+DSPARK_TEST(Mp3File_decodes_layer1_and_layer2_frames)
+{
+    // Three Layer II frames of a reference encoder (44.1 kHz joint stereo,
+    // 96 kbps) and three Layer I frames covering every allocation (48 kHz
+    // joint stereo, 256 kbps, CRC protected). The probes come from a
+    // reference decoder; the two agree to 3e-8 (139 and 132 dB).
+    struct Case { const char* path; const char* hex; const mp3R2_Probe* probes; int numProbes;
+                  double rate; int64_t frames; };
+    const Case cases[] = {
+        { "dspark_test_layer2.mp2", mp3R2_kLayer2Hex, mp3R2_kLayer2Probes,
+          static_cast<int>(std::size(mp3R2_kLayer2Probes)), 44100.0, 3 * 1152 },
+        { "dspark_test_layer1.mp1", mp3R2_kLayer1Hex, mp3R2_kLayer1Probes,
+          static_cast<int>(std::size(mp3R2_kLayer1Probes)), 48000.0, 3 * 384 },
+    };
+    for (const Case& c : cases)
+    {
+        FileCleanup cleanup { c.path };
+        mp3R2_write(c.path, mp3R2_fromHex(c.hex));
+        AudioFileInfo info;
+        const std::vector<float> pcm = mp3R2_decode(c.path, &info);
+        EXPECT_FALSE(pcm.empty());
+        EXPECT_EQ(info.numChannels, 2u);
+        EXPECT_NEAR(info.sampleRate, c.rate, 0.0);
+        EXPECT_EQ(info.numSamples, c.frames);
+        for (int k = 0; k < c.numProbes; ++k)
+            EXPECT_NEAR(pcm[static_cast<size_t>(c.probes[k].index)], c.probes[k].value, 2e-6f);
+    }
+}
+
+DSPARK_TEST(Mp3File_free_format_streams_decode)
+{
+    // (a) Three free-format Layer II frames (48 kHz joint stereo, 240 bytes):
+    // the frame length is in no header and is found from the next two.
+    {
+        FileCleanup cleanup { "dspark_test_free.mp2" };
+        mp3R2_write("dspark_test_free.mp2", mp3R2_fromHex(mp3R2_kLayer2FreeHex));
+        AudioFileInfo info;
+        const std::vector<float> pcm = mp3R2_decode("dspark_test_free.mp2", &info);
+        EXPECT_FALSE(pcm.empty());
+        EXPECT_EQ(info.numSamples, int64_t { 3 * 1152 });
+        for (const mp3R2_Probe& p : mp3R2_kLayer2FreeProbes)
+            EXPECT_NEAR(pcm[static_cast<size_t>(p.index)], p.value, 2e-6f);
+    }
+
+    // (b) A Layer III stream rewritten to free format (bitrate index 0 in
+    // every audio frame, the Info tag frame dropped) decodes to exactly the
+    // same audio; without the tag nothing is trimmed, so it is 529 + 528
+    // samples later.
+    FileCleanup cbrCleanup { "dspark_test_cbr.mp3" };
+    FileCleanup freeCleanup { "dspark_test_free.mp3" };
+    const std::vector<uint8_t> cbr = mp3R2_encodeLayer3("dspark_test_cbr.mp3", 20000);
+    EXPECT_FALSE(cbr.empty());
+    static constexpr int kKbps[16] = { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 };
+    std::vector<uint8_t> freeFormat;
+    bool tagFrame = true;
+    for (size_t p = 0; p + 4 <= cbr.size();)
+    {
+        EXPECT_TRUE(cbr[p] == 0xFF && (cbr[p + 1] & 0xE0) == 0xE0);
+        const int index = cbr[p + 2] >> 4;
+        const size_t bytes = static_cast<size_t>(144 * kKbps[index] * 1000 / 44100 + ((cbr[p + 2] >> 1) & 1));
+        EXPECT_TRUE(index > 0 && index < 15 && p + bytes <= cbr.size());
+        if (!tagFrame)
+        {
+            const size_t at = freeFormat.size();
+            freeFormat.insert(freeFormat.end(), cbr.begin() + static_cast<ptrdiff_t>(p),
+                              cbr.begin() + static_cast<ptrdiff_t>(p + bytes));
+            freeFormat[at + 2] = static_cast<uint8_t>(freeFormat[at + 2] & 0x0F);
+        }
+        tagFrame = false;
+        p += bytes;
+    }
+    mp3R2_write("dspark_test_free.mp3", freeFormat);
+    const std::vector<float> original = mp3R2_decode("dspark_test_cbr.mp3");
+    const std::vector<float> rewritten = mp3R2_decode("dspark_test_free.mp3");
+    EXPECT_EQ(original.size(), size_t { 2 * 20000 });
+    EXPECT_TRUE(rewritten.size() >= original.size() + 2 * 1057);
+    for (size_t i = 0; i < original.size(); ++i)
+        EXPECT_NEAR(rewritten[i + 2 * 1057], original[i], 0.0f);
+
+    // (c) A free-format length that no third header confirms is not
+    // guessed: two frames alone are rejected.
+    {
+        FileCleanup cleanup { "dspark_test_free2.mp2" };
+        std::vector<uint8_t> two = mp3R2_fromHex(mp3R2_kLayer2FreeHex);
+        two.resize(2 * 240 - 7);   // the second frame is cut short
+        mp3R2_write("dspark_test_free2.mp2", two);
+        Mp3File f;
+        EXPECT_FALSE(f.openRead("dspark_test_free2.mp2"));
+    }
+}
+
+DSPARK_TEST(Mp3File_layer12_damaged_frames_stay_bounded)
+{
+    // A forbidden Layer I allocation (15), a Layer II stream cut in the
+    // middle of its last frame and random byte damage: every file that opens
+    // gives finite samples within [-1, 1], with the frame count it declares.
+    const std::vector<uint8_t> layer1 = mp3R2_fromHex(mp3R2_kLayer1Hex);
+    const std::vector<uint8_t> layer2 = mp3R2_fromHex(mp3R2_kLayer2Hex);
+    auto check = [](const std::vector<float>& pcm) {
+        for (float v : pcm)
+            if (!(std::isfinite(v) && std::abs(v) <= 1.0f)) return false;
+        return true;
+    };
+    FileCleanup cleanup { "dspark_test_damaged.mp2" };
+    {
+        std::vector<uint8_t> b = layer1;
+        b[256 + 6] = static_cast<uint8_t>(0xF0 | (b[256 + 6] & 0x0F));   // frame 2, first allocation
+        mp3R2_write("dspark_test_damaged.mp2", b);
+        AudioFileInfo info;
+        const std::vector<float> pcm = mp3R2_decode("dspark_test_damaged.mp2", &info);
+        EXPECT_EQ(info.numSamples, int64_t { 3 * 384 });
+        EXPECT_TRUE(check(pcm));
+    }
+    {
+        std::vector<uint8_t> b = layer2;
+        b.resize(b.size() - 100);
+        mp3R2_write("dspark_test_damaged.mp2", b);
+        AudioFileInfo info;
+        const std::vector<float> pcm = mp3R2_decode("dspark_test_damaged.mp2", &info);
+        EXPECT_EQ(info.numSamples, int64_t { 3 * 1152 });
+        EXPECT_TRUE(check(pcm));
+    }
+    std::mt19937 rng(20261107u);
+    for (int round = 0; round < 200; ++round)
+    {
+        std::vector<uint8_t> b = (round & 1) ? layer1 : layer2;
+        for (int k = 0; k < 8; ++k)
+            b[rng() % b.size()] = static_cast<uint8_t>(rng());
+        mp3R2_write("dspark_test_damaged.mp2", b);
+        EXPECT_TRUE(check(mp3R2_decode("dspark_test_damaged.mp2")));
+    }
+}
+
+DSPARK_TEST(Mp3File_vector_kernels_agree_with_the_baseline_copy)
+{
+    // The transforms run on vectors, with an AVX2+FMA copy selected at run
+    // time where the build and the CPU allow it. Both copies must give the
+    // same audio to well below float resolution; where only one copy exists
+    // the two decodes are identical.
+    FileCleanup cleanup { "dspark_test_kernels.mp3" };
+    EXPECT_FALSE(mp3R2_encodeLayer3("dspark_test_kernels.mp3", 30000).empty());
+    const bool wasActive = simd::isRuntimeDispatchActive();
+    simd::setRuntimeDispatch(false);
+    const std::vector<float> baseline = mp3R2_decode("dspark_test_kernels.mp3");
+    simd::setRuntimeDispatch(true);
+    const std::vector<float> dispatched = mp3R2_decode("dspark_test_kernels.mp3");
+    simd::setRuntimeDispatch(wasActive);
+    EXPECT_EQ(baseline.size(), dispatched.size());
+    EXPECT_FALSE(baseline.empty());
+    double worst = 0.0;
+    for (size_t i = 0; i < baseline.size(); ++i)
+        worst = std::max(worst, static_cast<double>(std::abs(baseline[i] - dispatched[i])));
+    EXPECT_TRUE(worst <= 1e-6);
+    if (!simd::runtimeDispatchSupported()) EXPECT_NEAR(worst, 0.0, 0.0);
+}
+// ---------------------------------------------------------------------------
+// WAV: G.711, IMA/Microsoft ADPCM and 12/20-bit PCM reading
+// ---------------------------------------------------------------------------
+// Every stream below is built byte by byte and decoded again here with an
+// independent reference written from the specifications (ITU-T G.711, the
+// IMA ADPCM reference algorithm, Microsoft ADPCM with truncating division).
+
+namespace {
+
+void wavR2_put16(std::vector<uint8_t>& v, uint32_t x)
+{
+    v.push_back(uint8_t(x & 0xFF));
+    v.push_back(uint8_t((x >> 8) & 0xFF));
+}
+
+void wavR2_put32(std::vector<uint8_t>& v, uint32_t x)
+{
+    wavR2_put16(v, x & 0xFFFF);
+    wavR2_put16(v, x >> 16);
+}
+
+void wavR2_chunk(std::vector<uint8_t>& riff, const char* id, const std::vector<uint8_t>& body)
+{
+    riff.insert(riff.end(), id, id + 4);
+    wavR2_put32(riff, uint32_t(body.size()));
+    riff.insert(riff.end(), body.begin(), body.end());
+    if (body.size() & 1) riff.push_back(0);
+}
+
+std::vector<uint8_t> wavR2_fmt(uint16_t tag, uint16_t ch, uint32_t rate, uint16_t blockAlign,
+                               uint16_t bits, const std::vector<uint8_t>* ext = nullptr)
+{
+    std::vector<uint8_t> f;
+    wavR2_put16(f, tag); wavR2_put16(f, ch); wavR2_put32(f, rate);
+    wavR2_put32(f, rate * blockAlign); wavR2_put16(f, blockAlign); wavR2_put16(f, bits);
+    if (ext != nullptr)
+    {
+        wavR2_put16(f, uint32_t(ext->size()));
+        f.insert(f.end(), ext->begin(), ext->end());
+    }
+    return f;
+}
+
+// fmt, optional fact, an optional odd-sized foreign chunk, then data.
+void wavR2_writeWav(const char* path, const std::vector<uint8_t>& fmt,
+                    const std::vector<uint8_t>& data, const std::vector<uint8_t>* fact = nullptr,
+                    const char* extraChunkBeforeData = nullptr)
+{
+    std::vector<uint8_t> body { 'W', 'A', 'V', 'E' };
+    wavR2_chunk(body, "fmt ", fmt);
+    if (fact != nullptr) wavR2_chunk(body, "fact", *fact);
+    if (extraChunkBeforeData != nullptr) wavR2_chunk(body, extraChunkBeforeData, { 'x', 'y', 'z' });
+    wavR2_chunk(body, "data", data);
+    std::vector<uint8_t> riff { 'R', 'I', 'F', 'F' };
+    wavR2_put32(riff, uint32_t(body.size()));
+    riff.insert(riff.end(), body.begin(), body.end());
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(riff.data()), std::streamsize(riff.size()));
+}
+
+struct wavR2_Lcg
+{
+    uint32_t s;
+    uint32_t next() { s = s * 1664525u + 1013904223u; return s >> 8; }
+    uint8_t byte() { return uint8_t(next()); }
+};
+
+// ITU-T G.711 decoding through the segment/mantissa form of the tables.
+int wavR2_aLaw(uint8_t code)
+{
+    const int a = code ^ 0x55;
+    const int e = (a >> 4) & 7, m = a & 15;
+    const int mag = 8 * ((e == 0) ? (2 * m + 1) : ((2 * m + 33) << (e - 1)));
+    return (a & 0x80) ? mag : -mag;
+}
+
+int wavR2_muLaw(uint8_t code)
+{
+    const int u = ~code & 0xFF;
+    const int e = (u >> 4) & 7, m = u & 15;
+    const int mag = 4 * (((2 * m + 33) << e) - 33);
+    return (u & 0x80) ? -mag : mag;
+}
+
+// IMA ADPCM reference decoder of one channel's nibbles.
+struct wavR2_Ima
+{
+    int pred = 0, index = 0;
+    int decode(int code)
+    {
+        static const int steps[89] = {
+            7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+            50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230,
+            253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963,
+            1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327,
+            3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487,
+            12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767 };
+        static const int indexTable[16] = { -1, -1, -1, -1, 2, 4, 6, 8,
+                                            -1, -1, -1, -1, 2, 4, 6, 8 };
+        const int step = steps[index];
+        int vpdiff = step >> 3;
+        if (code & 4) vpdiff += step;
+        if (code & 2) vpdiff += step >> 1;
+        if (code & 1) vpdiff += step >> 2;
+        pred = (code & 8) ? pred - vpdiff : pred + vpdiff;
+        pred = std::max(-32768, std::min(32767, pred));
+        index = std::max(0, std::min(88, index + indexTable[code]));
+        return pred;
+    }
+};
+
+// Builds an IMA stream of whole blocks plus a short tail block of tailBytes,
+// decoding it with the reference. Returns interleaved 16-bit frames.
+std::vector<int> wavR2_buildIma(std::vector<uint8_t>& data, int ch, int blockAlign,
+                                int blocks, int tailBytes, uint32_t seed, int badIndexBlock = -1)
+{
+    wavR2_Lcg rng { seed };
+    std::vector<int> out;
+    for (int b = 0; b <= blocks; ++b)
+    {
+        const int bytes = (b < blocks) ? blockAlign : tailBytes;
+        if (bytes < 4 * ch) break;
+        std::vector<uint8_t> blk(static_cast<size_t>(bytes));
+        for (auto& x : blk) x = rng.byte();
+        std::vector<wavR2_Ima> st(static_cast<size_t>(ch));
+        for (int c = 0; c < ch; ++c)
+        {
+            const int pred = int(int16_t(uint16_t(rng.next())));
+            const int index = (b == badIndexBlock && c == ch - 1) ? 89 : int(rng.next() % 89);
+            blk[size_t(4 * c)] = uint8_t(pred & 0xFF);
+            blk[size_t(4 * c + 1)] = uint8_t((pred >> 8) & 0xFF);
+            blk[size_t(4 * c + 2)] = uint8_t(index);
+            blk[size_t(4 * c + 3)] = 0;
+            st[size_t(c)].pred = pred;
+            st[size_t(c)].index = std::min(index, 88);
+        }
+        const int words = (bytes - 4 * ch) / (4 * ch);
+        std::vector<int> frames(size_t(1 + 8 * words) * size_t(ch));
+        for (int c = 0; c < ch; ++c) frames[size_t(c)] = st[size_t(c)].pred;
+        for (int w = 0; w < words; ++w)
+            for (int c = 0; c < ch; ++c)
+                for (int k = 0; k < 8; ++k)
+                {
+                    const uint8_t byte = blk[size_t(4 * ch + w * 4 * ch + 4 * c + k / 2)];
+                    const int code = (k & 1) ? (byte >> 4) : (byte & 15);
+                    frames[size_t(1 + 8 * w + k) * size_t(ch) + size_t(c)] = st[size_t(c)].decode(code);
+                }
+        data.insert(data.end(), blk.begin(), blk.end());
+        out.insert(out.end(), frames.begin(), frames.end());
+    }
+    return out;
+}
+
+// Microsoft ADPCM reference decoder of one block.
+std::vector<int> wavR2_decodeMs(const uint8_t* blk, int bytes, int ch,
+                                const std::vector<std::pair<int, int>>& coefs)
+{
+    static const int adapt[16] = { 230, 230, 230, 230, 307, 409, 512, 614,
+                                   768, 614, 512, 409, 307, 230, 230, 230 };
+    auto s16 = [&](int off) { return int(int16_t(uint16_t(blk[off] | (blk[off + 1] << 8)))); };
+    std::vector<int64_t> c1(static_cast<size_t>(ch)), c2(c1), delta(c1), s1(c1), s2(c1);
+    std::vector<int> out;
+    for (int c = 0; c < ch; ++c)
+    {
+        c1[size_t(c)] = coefs[blk[c]].first;
+        c2[size_t(c)] = coefs[blk[c]].second;
+        delta[size_t(c)] = s16(ch + 2 * c);
+        s1[size_t(c)] = s16(3 * ch + 2 * c);
+        s2[size_t(c)] = s16(5 * ch + 2 * c);
+    }
+    for (int c = 0; c < ch; ++c) out.push_back(int(s2[size_t(c)]));
+    for (int c = 0; c < ch; ++c) out.push_back(int(s1[size_t(c)]));
+    const int nibbles = ((bytes - 7 * ch) * 2 / ch) * ch;
+    for (int i = 0; i < nibbles; ++i)
+    {
+        const size_t c = size_t(i % ch);
+        const int code = (i & 1) ? (blk[7 * ch + i / 2] & 15) : (blk[7 * ch + i / 2] >> 4);
+        const int64_t predicted = (s1[c] * c1[c] + s2[c] * c2[c]) / 256; // truncating
+        const int64_t v = std::max<int64_t>(-32768, std::min<int64_t>(32767,
+            predicted + int64_t(code >= 8 ? code - 16 : code) * delta[c]));
+        s2[c] = s1[c];
+        s1[c] = v;
+        delta[c] = std::max<int64_t>(16, adapt[code] * delta[c] / 256);
+        out.push_back(int(v));
+    }
+    return out;
+}
+
+std::vector<int> wavR2_buildMs(std::vector<uint8_t>& data, int ch, int blockAlign, int blocks,
+                               int tailBytes, const std::vector<std::pair<int, int>>& coefs,
+                               uint32_t seed, int badPredictorBlock = -1)
+{
+    wavR2_Lcg rng { seed };
+    static const int deltas[6] = { 16, 40, 300, 1500, 9000, -5 };
+    std::vector<int> out;
+    for (int b = 0; b <= blocks; ++b)
+    {
+        const int bytes = (b < blocks) ? blockAlign : tailBytes;
+        if (bytes < 7 * ch) break;
+        std::vector<uint8_t> blk(static_cast<size_t>(bytes));
+        for (auto& x : blk) x = rng.byte();
+        // Codes as an encoder emits them: mostly small steps (which shrink
+        // the step size), now and then a large one. Uniform random nibbles
+        // would grow the step size without bound.
+        static const int smallCodes[7] = { 0, 1, 2, 3, 13, 14, 15 };
+        for (size_t i = size_t(7 * ch); i < blk.size(); ++i)
+        {
+            int nib[2];
+            for (int& n : nib)
+            {
+                const uint32_t r = rng.next();
+                n = (r % 8 == 0) ? int(4 + (r / 8) % 9) : smallCodes[(r / 8) % 7];
+            }
+            blk[i] = uint8_t((nib[0] << 4) | nib[1]);
+        }
+        for (int c = 0; c < ch; ++c)
+        {
+            blk[size_t(c)] = (b == badPredictorBlock) ? uint8_t(coefs.size())
+                                                      : uint8_t(rng.next() % coefs.size());
+            const int d = deltas[rng.next() % 6];
+            blk[size_t(ch + 2 * c)] = uint8_t(d & 0xFF);
+            blk[size_t(ch + 2 * c + 1)] = uint8_t((d >> 8) & 0xFF);
+        }
+        const auto frames = (b != badPredictorBlock)
+            ? wavR2_decodeMs(blk.data(), bytes, ch, coefs)
+            : std::vector<int>(size_t(2 + ((bytes - 7 * ch) * 2) / ch) * size_t(ch), 0);
+        out.insert(out.end(), frames.begin(), frames.end());
+        data.insert(data.end(), blk.begin(), blk.end());
+    }
+    return out;
+}
+
+std::vector<uint8_t> wavR2_msExt(int ch, int blockAlign, const std::vector<std::pair<int, int>>& coefs)
+{
+    std::vector<uint8_t> ext;
+    wavR2_put16(ext, uint32_t(2 + ((blockAlign - 7 * ch) * 2) / ch));
+    wavR2_put16(ext, uint32_t(coefs.size()));
+    for (const auto& c : coefs)
+    {
+        wavR2_put16(ext, uint16_t(int16_t(c.first)));
+        wavR2_put16(ext, uint16_t(int16_t(c.second)));
+    }
+    return ext;
+}
+
+const std::vector<std::pair<int, int>>& wavR2_msCoefs()
+{
+    // The seven standard pairs plus two custom ones the streams also use.
+    static const std::vector<std::pair<int, int>> c = {
+        { 256, 0 }, { 512, -256 }, { 0, 0 }, { 192, 64 }, { 240, 0 }, { 460, -208 },
+        { 392, -232 }, { 300, -100 }, { -500, 700 } };
+    return c;
+}
+
+// Mismatches between decoded frames and expected interleaved 16-bit values.
+int wavR2_mismatches(const AudioBuffer<float>& got, const std::vector<int>& expected,
+                     int ch, int64_t firstFrame, int64_t frames)
+{
+    int bad = 0;
+    for (int64_t f = 0; f < frames; ++f)
+        for (int c = 0; c < ch; ++c)
+            if (got.getChannel(c)[f] != float(expected[size_t((firstFrame + f) * ch + c)]) / 32768.0f)
+                ++bad;
+    return bad;
+}
+
+bool wavR2_readAll(const char* path, AudioBuffer<float>& out, AudioFileInfo& info)
+{
+    WavFile r;
+    if (!r.openRead(path)) return false;
+    info = r.getInfo();
+    out.resize(int(info.numChannels), int(std::max<int64_t>(info.numSamples, 1)));
+    return r.readSamples(out.toView());
+}
+
+} // namespace
+
+DSPARK_TEST(WavFile_reads_g711_alaw_and_mulaw)
+{
+    // Every code of both laws, decoded to the exact 16-bit linear value of
+    // ITU-T G.711. The old reader rejected formats 6 and 7.
+    FileCleanup c1 { "dspark_r2_alaw.wav" };
+    FileCleanup c2 { "dspark_r2_mulaw.wav" };
+    FileCleanup c3 { "dspark_r2_alaw_ext.wav" };
+
+    std::vector<uint8_t> mono(256);
+    for (int i = 0; i < 256; ++i) mono[size_t(i)] = uint8_t(i);
+    wavR2_writeWav("dspark_r2_alaw.wav", wavR2_fmt(6, 1, 8000, 1, 8), mono);
+
+    // Stereo mu-law, odd number of bytes (a stray trailing byte and the pad
+    // byte), a fact chunk and an odd-sized foreign chunk before the data.
+    std::vector<uint8_t> stereo(2 * 129 + 1);
+    for (size_t i = 0; i < stereo.size(); ++i) stereo[i] = uint8_t(i * 7 + 3);
+    std::vector<uint8_t> fact; wavR2_put32(fact, 129);
+    wavR2_writeWav("dspark_r2_mulaw.wav", wavR2_fmt(7, 2, 8000, 2, 8), stereo, &fact, "odd ");
+
+    // A-law carried by WAVE_FORMAT_EXTENSIBLE.
+    std::vector<uint8_t> ext;
+    wavR2_put16(ext, 8); wavR2_put32(ext, 4); wavR2_put16(ext, 6);
+    const uint8_t guid[14] = { 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71 };
+    ext.insert(ext.end(), guid, guid + 14);
+    wavR2_writeWav("dspark_r2_alaw_ext.wav", wavR2_fmt(0xFFFE, 1, 8000, 1, 8, &ext), mono);
+
+    for (const char* path : { "dspark_r2_alaw.wav", "dspark_r2_alaw_ext.wav" })
+    {
+        AudioBuffer<float> got; AudioFileInfo info;
+        EXPECT_TRUE(wavR2_readAll(path, got, info));
+        EXPECT_EQ(int(info.numSamples), 256);
+        EXPECT_EQ(int(info.bitsPerSample), 16);
+        int bad = 0;
+        for (int i = 0; i < 256 && got.getNumSamples() >= 256; ++i)
+            if (got.getChannel(0)[i] != float(wavR2_aLaw(uint8_t(i))) / 32768.0f) ++bad;
+        EXPECT_EQ(bad, 0);
+    }
+    {
+        WavFile r;
+        EXPECT_TRUE(r.openRead("dspark_r2_alaw.wav"));
+        EXPECT_TRUE(r.getEncoding() == WavFile::Encoding::ALaw);
+    }
+    {
+        AudioBuffer<float> got; AudioFileInfo info;
+        EXPECT_TRUE(wavR2_readAll("dspark_r2_mulaw.wav", got, info));
+        EXPECT_EQ(int(info.numSamples), 129);   // the stray trailing byte is not a frame
+        int bad = 0;
+        for (int f = 0; f < 129 && got.getNumSamples() >= 129; ++f)
+            for (int c = 0; c < 2; ++c)
+                if (got.getChannel(c)[f] != float(wavR2_muLaw(stereo[size_t(2 * f + c)])) / 32768.0f) ++bad;
+        EXPECT_EQ(bad, 0);
+        EXPECT_EQ(wavR2_muLaw(0x00), -32124);   // full scale of the 14-bit law
+        EXPECT_EQ(wavR2_aLaw(0xAA), 32256);     // full scale of the 13-bit law
+    }
+}
+
+DSPARK_TEST(WavFile_reads_ima_adpcm_bit_exact)
+{
+    // IMA/DVI ADPCM (format 0x11) against the reference algorithm, with a
+    // short last block that ends half way through a data word (the half word
+    // holds no complete group and is ignored), and ranged reads that start
+    // inside a block. The old reader rejected the format.
+    FileCleanup c1 { "dspark_r2_ima1.wav" };
+    FileCleanup c2 { "dspark_r2_ima2.wav" };
+    FileCleanup c3 { "dspark_r2_ima_fact.wav" };
+
+    struct Case { const char* path; int ch; int blockAlign; int blocks; int tail; int frames; };
+    const Case cases[2] = {
+        { "dspark_r2_ima1.wav", 1, 256, 3, 4 + 4 * 5 + 2, 3 * 505 + 41 },
+        { "dspark_r2_ima2.wav", 2, 512, 2, 8 + 8 * 3, 2 * 505 + 25 } };
+    for (const auto& k : cases)
+    {
+        std::vector<uint8_t> data;
+        const auto expected = wavR2_buildIma(data, k.ch, k.blockAlign, k.blocks, k.tail,
+                                             0x1234u + uint32_t(k.ch));
+        std::vector<uint8_t> ext; wavR2_put16(ext, 505);
+        wavR2_writeWav(k.path, wavR2_fmt(0x11, uint16_t(k.ch), 22050, uint16_t(k.blockAlign), 4, &ext), data);
+
+        AudioBuffer<float> got; AudioFileInfo info;
+        EXPECT_TRUE(wavR2_readAll(k.path, got, info));
+        EXPECT_EQ(int(info.numSamples), k.frames);
+        EXPECT_EQ(int(info.bitsPerSample), 16);
+        EXPECT_EQ(int(expected.size()), k.frames * k.ch);
+        if (int(info.numSamples) == k.frames)
+            EXPECT_EQ(wavR2_mismatches(got, expected, k.ch, 0, k.frames), 0);
+
+        WavFile r;
+        EXPECT_TRUE(r.openRead(k.path));
+        EXPECT_TRUE(r.getEncoding() == WavFile::Encoding::ImaAdpcm);
+        AudioBuffer<float> part; part.resize(k.ch, 600);
+        EXPECT_TRUE(r.readSamples(part.toView(), 300, 600));   // crosses a block boundary
+        EXPECT_EQ(wavR2_mismatches(part, expected, k.ch, 300, 600), 0);
+    }
+
+    // Encoders pad the last block and store the true length in a fact
+    // chunk: it is trusted when it ends inside the last block, and ignored
+    // when it would cut whole blocks.
+    std::vector<uint8_t> data;
+    (void)wavR2_buildIma(data, 2, 512, 2, 0, 77u);
+    std::vector<uint8_t> ext; wavR2_put16(ext, 505);
+    for (uint32_t fact : { 910u, 100u })
+    {
+        std::vector<uint8_t> f; wavR2_put32(f, fact);
+        wavR2_writeWav("dspark_r2_ima_fact.wav", wavR2_fmt(0x11, 2, 22050, 512, 4, &ext), data, &f);
+        WavFile r;
+        EXPECT_TRUE(r.openRead("dspark_r2_ima_fact.wav"));
+        EXPECT_EQ(int(r.getInfo().numSamples), fact == 910u ? 910 : 1010);
+    }
+}
+
+DSPARK_TEST(WavFile_reads_ms_adpcm_bit_exact)
+{
+    // Microsoft ADPCM (format 2) with every predictor of a nine-pair table
+    // (the seven standard pairs and two custom ones, which only the table in
+    // the fmt chunk defines), random block headers including a negative
+    // delta, a short last block, and ranged reads. The prediction truncates
+    // toward zero; flooring it moves these blocks by a few LSB. The old
+    // reader rejected the format.
+    FileCleanup c1 { "dspark_r2_ms1.wav" };
+    FileCleanup c2 { "dspark_r2_ms2.wav" };
+
+    struct Case { const char* path; int ch; int blockAlign; int blocks; int tail; int frames; };
+    const Case cases[2] = {
+        { "dspark_r2_ms1.wav", 1, 128, 4, 7 + 30, 4 * 244 + 62 },
+        { "dspark_r2_ms2.wav", 2, 256, 3, 14 + 41, 3 * 244 + 43 } };
+    for (const auto& k : cases)
+    {
+        std::vector<uint8_t> data;
+        const auto expected = wavR2_buildMs(data, k.ch, k.blockAlign, k.blocks, k.tail,
+                                            wavR2_msCoefs(), 0xBEEFu + uint32_t(k.ch));
+        const auto ext = wavR2_msExt(k.ch, k.blockAlign, wavR2_msCoefs());
+        wavR2_writeWav(k.path, wavR2_fmt(2, uint16_t(k.ch), 22050, uint16_t(k.blockAlign), 4, &ext), data);
+
+        AudioBuffer<float> got; AudioFileInfo info;
+        EXPECT_TRUE(wavR2_readAll(k.path, got, info));
+        EXPECT_EQ(int(info.numSamples), k.frames);
+        EXPECT_EQ(int(expected.size()), k.frames * k.ch);
+        if (int(info.numSamples) == k.frames)
+            EXPECT_EQ(wavR2_mismatches(got, expected, k.ch, 0, k.frames), 0);
+
+        WavFile r;
+        EXPECT_TRUE(r.openRead(k.path));
+        EXPECT_TRUE(r.getEncoding() == WavFile::Encoding::MsAdpcm);
+        AudioBuffer<float> part; part.resize(k.ch, 300);
+        EXPECT_TRUE(r.readSamples(part.toView(), 200, 300));
+        EXPECT_EQ(wavR2_mismatches(part, expected, k.ch, 200, 300), 0);
+    }
+}
+
+DSPARK_TEST(WavFile_reads_12_and_20_bit_pcm_in_block_align_containers)
+{
+    // Bit depths that are not whole bytes sit left-justified in the
+    // container nBlockAlign defines. The old reader rejected them.
+    struct Case { const char* path; int ch; int bits; int container; };
+    const Case cases[4] = {
+        { "dspark_r2_pcm12m.wav", 1, 12, 2 }, { "dspark_r2_pcm12s.wav", 2, 12, 2 },
+        { "dspark_r2_pcm20s.wav", 2, 20, 3 }, { "dspark_r2_pcm20in32.wav", 2, 20, 4 } };
+    for (const auto& k : cases)
+    {
+        FileCleanup cleanup { k.path };
+        const int frames = 301;
+        const int full = 1 << (k.bits - 1);
+        std::vector<int> q(size_t(frames * k.ch));
+        wavR2_Lcg rng { uint32_t(k.bits * 31 + k.ch) };
+        std::vector<uint8_t> data;
+        for (size_t i = 0; i < q.size(); ++i)
+        {
+            q[i] = (i == 0) ? -full : (i == 1) ? full - 1 : int(rng.next() % uint32_t(2 * full)) - full;
+            const uint32_t word = uint32_t(q[i]) << (8 * k.container - k.bits);
+            for (int b = 0; b < k.container; ++b) data.push_back(uint8_t(word >> (8 * b)));
+        }
+        wavR2_writeWav(k.path, wavR2_fmt(1, uint16_t(k.ch), 44100, uint16_t(k.ch * k.container),
+                                         uint16_t(k.bits)), data);
+
+        AudioBuffer<float> got; AudioFileInfo info;
+        EXPECT_TRUE(wavR2_readAll(k.path, got, info));
+        EXPECT_EQ(int(info.numSamples), frames);
+        EXPECT_EQ(int(info.bitsPerSample), k.bits);
+        int bad = 0;
+        for (int f = 0; f < frames && got.getNumSamples() >= frames; ++f)
+            for (int c = 0; c < k.ch; ++c)
+                if (got.getChannel(c)[f] != float(q[size_t(f * k.ch + c)]) / float(full)) ++bad;
+        EXPECT_EQ(bad, 0);
+    }
+
+    // Containers the block alignment cannot describe stay rejected.
+    FileCleanup bad { "dspark_r2_pcm_bad.wav" };
+    const std::vector<uint8_t> some(12, 0);
+    for (const auto& f : { wavR2_fmt(1, 2, 44100, 3, 12),    // 1.5 bytes per sample
+                           wavR2_fmt(1, 1, 44100, 2, 20),    // 20 bits in 2 bytes
+                           wavR2_fmt(1, 1, 44100, 5, 20),    // 5-byte container
+                           wavR2_fmt(1, 1, 44100, 0, 12) })  // no alignment
+    {
+        wavR2_writeWav("dspark_r2_pcm_bad.wav", f, some);
+        WavFile r;
+        EXPECT_FALSE(r.openRead("dspark_r2_pcm_bad.wav"));
+    }
+}
+
+DSPARK_TEST(WavFile_malformed_adpcm_is_rejected_or_bounded)
+{
+    FileCleanup cleanup { "dspark_r2_bad.wav" };
+    const char* path = "dspark_r2_bad.wav";
+    const std::vector<uint8_t> payload(600, 0x5A);
+    auto opens = [&](const std::vector<uint8_t>& fmt, const std::vector<uint8_t>& data)
+    {
+        wavR2_writeWav(path, fmt, data);
+        WavFile r;
+        return r.openRead(path);
+    };
+    std::vector<uint8_t> imaExt; wavR2_put16(imaExt, 505);
+    std::vector<uint8_t> imaExtBig; wavR2_put16(imaExtBig, 506);   // above 505
+    std::vector<uint8_t> msExtSpb1; wavR2_put16(msExtSpb1, 1);     // below the header's 2
+    const auto msExt = wavR2_msExt(1, 256, wavR2_msCoefs());
+    std::vector<uint8_t> msNoCoef; wavR2_put16(msNoCoef, 500); wavR2_put16(msNoCoef, 0);
+    std::vector<uint8_t> msTooMany; wavR2_put16(msTooMany, 500); wavR2_put16(msTooMany, 300);
+    std::vector<uint8_t> msShortTable; wavR2_put16(msShortTable, 500); wavR2_put16(msShortTable, 7);
+    for (int i = 0; i < 10; ++i) msShortTable.push_back(0);        // 7 pairs need 28 bytes
+
+    EXPECT_FALSE(opens(wavR2_fmt(0x11, 1, 22050, 0, 4, &imaExt), payload));    // no block size
+    EXPECT_FALSE(opens(wavR2_fmt(0x11, 1, 22050, 254, 4, &imaExt), payload));  // not 4-byte words
+    EXPECT_FALSE(opens(wavR2_fmt(0x11, 1, 22050, 256, 3, &imaExt), payload));  // 3-bit IMA
+    EXPECT_FALSE(opens(wavR2_fmt(0x11, 3, 22050, 768, 4, &imaExt), payload));  // three channels
+    EXPECT_FALSE(opens(wavR2_fmt(0x11, 0, 22050, 256, 4, &imaExt), payload));  // no channel
+    EXPECT_FALSE(opens(wavR2_fmt(0x11, 1, 22050, 256, 4, &imaExtBig), payload));
+    EXPECT_FALSE(opens(wavR2_fmt(2, 1, 22050, 6, 4, &msExt), payload));        // under the header
+    EXPECT_FALSE(opens(wavR2_fmt(2, 1, 22050, 256, 4, &msExtSpb1), payload));
+    EXPECT_FALSE(opens(wavR2_fmt(2, 1, 22050, 256, 4, &msNoCoef), payload));
+    EXPECT_FALSE(opens(wavR2_fmt(2, 1, 22050, 256, 4, &msTooMany), payload));
+    EXPECT_FALSE(opens(wavR2_fmt(2, 1, 22050, 256, 4, &msShortTable), payload));
+    EXPECT_FALSE(opens(wavR2_fmt(2, 1, 22050, 256, 8, &msExt), payload));      // 8-bit MS ADPCM
+    EXPECT_FALSE(opens(wavR2_fmt(6, 1, 8000, 2, 16), payload));                // 16-bit A-law
+    {
+        // WAVE_FORMAT_EXTENSIBLE cannot carry the ADPCM parameters.
+        std::vector<uint8_t> ext;
+        wavR2_put16(ext, 4); wavR2_put32(ext, 4); wavR2_put16(ext, 0x11);
+        const uint8_t guid[14] = { 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71 };
+        ext.insert(ext.end(), guid, guid + 14);
+        EXPECT_FALSE(opens(wavR2_fmt(0xFFFE, 1, 22050, 256, 4, &ext), payload));
+    }
+
+    // A block header out of range fails the reads that touch that block
+    // only; the blocks before and after it still decode exactly.
+    {
+        std::vector<uint8_t> data;
+        const auto expected = wavR2_buildIma(data, 2, 512, 3, 0, 99u, 1);
+        std::vector<uint8_t> ext; wavR2_put16(ext, 505);
+        wavR2_writeWav(path, wavR2_fmt(0x11, 2, 22050, 512, 4, &ext), data);
+        WavFile r;
+        EXPECT_TRUE(r.openRead(path));
+        AudioBuffer<float> all; all.resize(2, 3 * 505);
+        EXPECT_FALSE(r.readSamples(all.toView()));
+        AudioBuffer<float> part; part.resize(2, 505);
+        EXPECT_TRUE(r.readSamples(part.toView(), 0, 505));
+        EXPECT_EQ(wavR2_mismatches(part, expected, 2, 0, 505), 0);
+        EXPECT_TRUE(r.readSamples(part.toView(), 1010, 505));
+        EXPECT_EQ(wavR2_mismatches(part, expected, 2, 1010, 505), 0);
+    }
+    {
+        std::vector<uint8_t> data;
+        const auto expected = wavR2_buildMs(data, 1, 128, 3, 0, wavR2_msCoefs(), 5u, 1);
+        const auto ext = wavR2_msExt(1, 128, wavR2_msCoefs());
+        wavR2_writeWav(path, wavR2_fmt(2, 1, 22050, 128, 4, &ext), data);
+        WavFile r;
+        EXPECT_TRUE(r.openRead(path));
+        EXPECT_EQ(int(r.getInfo().numSamples), 3 * 244);
+        AudioBuffer<float> all; all.resize(1, 3 * 244);
+        EXPECT_FALSE(r.readSamples(all.toView()));
+        AudioBuffer<float> part; part.resize(1, 244);
+        EXPECT_TRUE(r.readSamples(part.toView(), 0, 244));
+        EXPECT_EQ(wavR2_mismatches(part, expected, 1, 0, 244), 0);
+        EXPECT_TRUE(r.readSamples(part.toView(), 488, 244));
+        EXPECT_EQ(wavR2_mismatches(part, expected, 1, 488, 244), 0);
+    }
+
+    // The largest legal block (64 KiB) over a few bytes of data, a data
+    // chunk shorter than one block header, and a wSamplesPerBlock smaller
+    // than the block holds: all bounded and decoded as far as they go.
+    {
+        std::vector<uint8_t> data;
+        const auto expected = wavR2_buildMs(data, 1, 65535, 0, 100, wavR2_msCoefs(), 11u);
+        std::vector<uint8_t> ext; wavR2_put16(ext, 0);   // derived from nBlockAlign
+        wavR2_put16(ext, uint32_t(wavR2_msCoefs().size()));
+        for (const auto& c : wavR2_msCoefs())
+        {
+            wavR2_put16(ext, uint16_t(int16_t(c.first)));
+            wavR2_put16(ext, uint16_t(int16_t(c.second)));
+        }
+        wavR2_writeWav(path, wavR2_fmt(2, 1, 22050, 65535, 4, &ext), data);
+        AudioBuffer<float> got; AudioFileInfo info;
+        EXPECT_TRUE(wavR2_readAll(path, got, info));
+        EXPECT_EQ(int(info.numSamples), 2 + 93 * 2);
+        if (int(info.numSamples) == 2 + 93 * 2)
+            EXPECT_EQ(wavR2_mismatches(got, expected, 1, 0, 2 + 93 * 2), 0);
+    }
+    {
+        wavR2_writeWav(path, wavR2_fmt(2, 1, 22050, 256, 4, &msExt), std::vector<uint8_t>(5, 1));
+        WavFile r;
+        EXPECT_TRUE(r.openRead(path));
+        EXPECT_EQ(int(r.getInfo().numSamples), 0);
+        AudioBuffer<float> b; b.resize(1, 4);
+        EXPECT_TRUE(r.readSamples(b.toView()));
+    }
+    {
+        std::vector<uint8_t> data;
+        const auto expected = wavR2_buildIma(data, 1, 256, 2, 0, 3u);
+        std::vector<uint8_t> ext; wavR2_put16(ext, 100);
+        wavR2_writeWav(path, wavR2_fmt(0x11, 1, 22050, 256, 4, &ext), data);
+        AudioBuffer<float> got; AudioFileInfo info;
+        EXPECT_TRUE(wavR2_readAll(path, got, info));
+        EXPECT_EQ(int(info.numSamples), 200);
+        int bad = 0;
+        for (int b = 0; b < 2 && int(info.numSamples) == 200; ++b)
+            for (int f = 0; f < 100; ++f)
+                if (got.getChannel(0)[b * 100 + f] != float(expected[size_t(b * 505 + f)]) / 32768.0f) ++bad;
+        EXPECT_EQ(bad, 0);
+    }
+}
+
+// ============================================================================
+// MidiFile - opt-in tolerant reading and SMPTE time division
+// ============================================================================
+
+namespace {
+
+std::vector<uint8_t> midiR2_cat(std::initializer_list<std::vector<uint8_t>> parts)
+{
+    std::vector<uint8_t> out;
+    for (const auto& part : parts)
+        out.insert(out.end(), part.begin(), part.end());
+    return out;
+}
+
+std::vector<uint8_t> midiR2_header(uint16_t format, uint16_t count, uint16_t division)
+{
+    std::vector<uint8_t> out;
+    midi_test::tag(out, "MThd");
+    midi_test::be32(out, 6);
+    midi_test::be16(out, format);
+    midi_test::be16(out, count);
+    midi_test::be16(out, division);
+    return out;
+}
+
+// A track chunk whose length field may disagree with its data.
+std::vector<uint8_t> midiR2_chunk(const std::vector<uint8_t>& data, int64_t lengthDelta = 0)
+{
+    std::vector<uint8_t> out;
+    midi_test::tag(out, "MTrk");
+    midi_test::be32(out, static_cast<uint32_t>(static_cast<int64_t>(data.size()) + lengthDelta));
+    out.insert(out.end(), data.begin(), data.end());
+    return out;
+}
+
+// count note-on/note-off pairs, 120 ticks apart, explicit status bytes.
+std::vector<uint8_t> midiR2_notes(int count)
+{
+    std::vector<uint8_t> out;
+    for (int i = 0; i < count; ++i)
+    {
+        const auto key = static_cast<uint8_t>(60 + i % 12);
+        out.insert(out.end(), { uint8_t(0x78), uint8_t(0x90), key, uint8_t(100),
+                                uint8_t(0x78), uint8_t(0x80), key, uint8_t(0) });
+    }
+    return out;
+}
+
+const std::vector<uint8_t> midiR2_eot { 0x00, 0xff, 0x2f, 0x00 };
+const std::vector<uint8_t> midiR2_tempo { 0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20 };
+
+class midiR2_Reader
+{
+public:
+    explicit midiR2_Reader(const std::string& label) : dir_(label) {}
+
+    bool read(const std::vector<uint8_t>& bytes, const MidiReadOptions& options,
+              MidiFile& out)
+    {
+        const auto path = dir_.file("in-" + std::to_string(serial_++) + ".mid");
+        return midi_test::writeBytes(path, bytes) && out.read(path, options);
+    }
+
+    bool rejects(const std::vector<uint8_t>& bytes, const MidiReadOptions& options)
+    {
+        MidiFile file;
+        if (!file.create(1, 96, 1) || read(bytes, options, file))
+            return false;
+        return file.format() == -1 && file.tracks().empty()
+            && file.recoveries() == MidiReadRecovery::None;
+    }
+
+    [[nodiscard]] std::filesystem::path file(const std::string& name) const
+    {
+        return dir_.file(name);
+    }
+
+private:
+    midi_test::TempDirectory dir_;
+    int serial_ = 0;
+};
+
+MidiReadOptions midiR2_allow(MidiReadRecovery mask)
+{
+    MidiReadOptions options;
+    options.tolerate = mask;
+    return options;
+}
+
+} // namespace
+
+DSPARK_TEST(MidiFile_tolerant_read_recovers_each_named_defect)
+{
+    using R = MidiReadRecovery;
+    midiR2_Reader io("r2-recover");
+    const auto notes = midiR2_notes(20);
+    const auto t0 = midiR2_cat({ midiR2_tempo, notes, midiR2_eot });
+    const std::vector<uint8_t> name { 0x00, 0xff, 0x03, 0x04, 'b', 'a', 's', 's' };
+    const auto t1 = midiR2_cat({ name, notes, midiR2_eot });
+    const auto clean0 = midiR2_cat({ midiR2_header(0, 1, 480), midiR2_chunk(t0) });
+    const auto clean1 = midiR2_cat({ midiR2_header(1, 2, 480), midiR2_chunk(t0), midiR2_chunk(t1) });
+
+    // Overlong VLQs: a zero delta as 80 00, a 240-tick delta as 80 81 70, and
+    // a meta length as 80 03; the clean equivalent uses canonical forms.
+    const std::vector<uint8_t> noteAt240 { 0x81, 0x70, 0x90, 0x3c, 0x40 };
+    const auto overlongEvents = midiR2_cat({ { 0x80, 0x00, 0xff, 0x51, 0x80, 0x03, 0x07, 0xa1, 0x20,
+                                               0x80, 0x81, 0x70, 0x90, 0x3c, 0x40 },
+                                             notes, midiR2_eot });
+    const auto overlongClean = midiR2_cat({ midiR2_tempo, noteAt240, notes, midiR2_eot });
+
+    // F0 packet without its closing F7, followed by other events.
+    const std::vector<uint8_t> openSysEx { 0x00, 0xf0, 0x05, 0x7e, 0x7f, 0x09, 0x01, 0x00 };
+    const std::vector<uint8_t> closedSysEx { 0x00, 0xf0, 0x06, 0x7e, 0x7f, 0x09, 0x01, 0x00, 0xf7 };
+
+    // A file cut one byte into its last note-off: the incomplete event is dropped.
+    auto truncated = clean0;
+    truncated.resize(truncated.size() - 7);
+    const auto truncatedClean = midiR2_cat({ midiR2_header(0, 1, 480), midiR2_chunk(midiR2_cat({
+        midiR2_tempo, std::vector<uint8_t>(notes.begin(), notes.end() - 4), midiR2_eot })) });
+
+    struct Case
+    {
+        const char* name;
+        std::vector<uint8_t> bytes;
+        R expected;
+        std::vector<uint8_t> clean;
+    };
+    const std::vector<uint8_t> padding(3, 0);
+    const Case cases[] = {
+        { "trailing-zero-4", midiR2_cat({ clean0, std::vector<uint8_t>(4, 0) }), R::TrailingBytes, clean0 },
+        { "trailing-0x1a-60", midiR2_cat({ clean0, std::vector<uint8_t>(60, 0x1a) }), R::TrailingBytes, clean0 },
+        { "padding-after-eot-last",
+          midiR2_cat({ midiR2_header(0, 1, 480), midiR2_chunk(midiR2_cat({ t0, padding })) }),
+          R::DataAfterEndOfTrack, clean0 },
+        { "padding-after-eot-first-of-two",
+          midiR2_cat({ midiR2_header(1, 2, 480), midiR2_chunk(midiR2_cat({ t0, padding })), midiR2_chunk(t1) }),
+          R::DataAfterEndOfTrack, clean1 },
+        { "missing-eot-last",
+          midiR2_cat({ midiR2_header(0, 1, 480), midiR2_chunk(midiR2_cat({ midiR2_tempo, notes })) }),
+          R::MissingEndOfTrack, clean0 },
+        { "missing-eot-first-of-two",
+          midiR2_cat({ midiR2_header(1, 2, 480), midiR2_chunk(midiR2_cat({ midiR2_tempo, notes })), midiR2_chunk(t1) }),
+          R::MissingEndOfTrack, clean1 },
+        { "empty-track-chunk",
+          midiR2_cat({ midiR2_header(1, 2, 480), midiR2_chunk(t0), midiR2_chunk({}) }),
+          R::MissingEndOfTrack,
+          midiR2_cat({ midiR2_header(1, 2, 480), midiR2_chunk(t0), midiR2_chunk(midiR2_eot) }) },
+        { "overlong-vlq",
+          midiR2_cat({ midiR2_header(0, 1, 480), midiR2_chunk(overlongEvents) }),
+          R::NoncanonicalVlq, midiR2_cat({ midiR2_header(0, 1, 480), midiR2_chunk(overlongClean) }) },
+        { "length-understated-last",
+          midiR2_cat({ midiR2_header(0, 1, 480), midiR2_chunk(t0, -10) }), R::TrackLengthMismatch, clean0 },
+        { "length-understated-first-of-two",
+          midiR2_cat({ midiR2_header(1, 2, 480), midiR2_chunk(t0, -10), midiR2_chunk(t1) }),
+          R::TrackLengthMismatch, clean1 },
+        { "length-zero-last",
+          midiR2_cat({ midiR2_header(0, 1, 480), midiR2_chunk(t0, -static_cast<int64_t>(t0.size())) }),
+          R::TrackLengthMismatch, clean0 },
+        { "length-past-end-of-file",
+          midiR2_cat({ midiR2_header(0, 1, 480), midiR2_chunk(t0, 100) }), R::TrackLengthMismatch, clean0 },
+        { "length-overstated-into-next-track",
+          midiR2_cat({ midiR2_header(1, 2, 480), midiR2_chunk(t0, 5), midiR2_chunk(t1) }),
+          R::TrackLengthMismatch, clean1 },
+        { "track-count-too-small",
+          midiR2_cat({ midiR2_header(1, 1, 480), midiR2_chunk(t0), midiR2_chunk(t1) }),
+          R::TrackCountMismatch, clean1 },
+        { "track-count-too-large",
+          midiR2_cat({ midiR2_header(1, 3, 480), midiR2_chunk(t0), midiR2_chunk(t1) }),
+          R::TrackCountMismatch, clean1 },
+        { "format0-two-track-chunks",
+          midiR2_cat({ midiR2_header(0, 1, 480), midiR2_chunk(t0), midiR2_chunk(t1) }),
+          R::TrackCountMismatch, clean0 },
+        { "unterminated-sysex",
+          midiR2_cat({ midiR2_header(0, 1, 480),
+                       midiR2_chunk(midiR2_cat({ midiR2_tempo, openSysEx, notes, midiR2_eot })) }),
+          R::UnterminatedSysEx,
+          midiR2_cat({ midiR2_header(0, 1, 480),
+                       midiR2_chunk(midiR2_cat({ midiR2_tempo, closedSysEx, notes, midiR2_eot })) }) },
+        { "unterminated-sysex-at-missing-eot",
+          midiR2_cat({ midiR2_header(0, 1, 480), midiR2_chunk(midiR2_cat({ midiR2_tempo, notes, openSysEx })) }),
+          R::UnterminatedSysEx | R::MissingEndOfTrack,
+          midiR2_cat({ midiR2_header(0, 1, 480),
+                       midiR2_chunk(midiR2_cat({ midiR2_tempo, notes, closedSysEx, midiR2_eot })) }) },
+        { "truncated-file", truncated, R::MissingEndOfTrack | R::TrackLengthMismatch, truncatedClean },
+    };
+
+    const R flags[] = { R::NoncanonicalVlq, R::DataAfterEndOfTrack, R::TrackLengthMismatch,
+                        R::MissingEndOfTrack, R::UnterminatedSysEx, R::TrackCountMismatch,
+                        R::TrailingBytes };
+    bool all = true;
+    for (const Case& test : cases)
+    {
+        const std::string label = test.name;
+        MidiFile reference;
+        bool ok = io.read(test.clean, {}, reference);
+        // The strict default contract is unchanged.
+        ok = midi_test::record(io.rejects(test.bytes, {}), label + "/strict-rejects") && ok;
+
+        // Exactly the case's recoveries suffice, are reported, and give the
+        // clean document.
+        MidiFile tolerant;
+        ok = ok && io.read(test.bytes, midiR2_allow(test.expected), tolerant)
+            && tolerant.recoveries() == test.expected
+            && tolerant.tracks() == reference.tracks()
+            && tolerant.format() == reference.format();
+        // Allowing everything applies no further recovery.
+        MidiFile lenient;
+        ok = ok && io.read(test.bytes, MidiReadOptions::tolerant(), lenient)
+            && lenient.recoveries() == test.expected
+            && lenient.tracks() == reference.tracks();
+        // Each of the case's recoveries is needed on its own.
+        for (const R flag : flags)
+        {
+            if (!hasRecovery(test.expected, flag))
+                continue;
+            const R without = static_cast<R>(static_cast<uint32_t>(test.expected)
+                                             & ~static_cast<uint32_t>(flag));
+            ok = midi_test::record(io.rejects(test.bytes, midiR2_allow(without)),
+                                   label + "/needs-flag") && ok;
+        }
+        all = midi_test::record(ok, label) && all;
+    }
+    EXPECT_TRUE(all);
+    EXPECT_FALSE(hasRecovery(R::All, R::None));
+    EXPECT_TRUE(hasRecovery(R::All, R::TrailingBytes | R::NoncanonicalVlq));
+}
+
+DSPARK_TEST(MidiFile_tolerant_document_writes_back_and_rereads_strictly)
+{
+    using R = MidiReadRecovery;
+    midiR2_Reader io("r2-writeback");
+    const auto notes = midiR2_notes(8);
+    // One file with six defects: header count 3 for 2 tracks, an overlong VLQ,
+    // an open SysEx, a missing EOT, padding after an EOT and 0x1A padding.
+    const auto track0 = midiR2_cat({ midiR2_tempo, { 0x80, 0x00, 0xf0, 0x02, 0x43, 0x10 }, notes });
+    const auto track1 = midiR2_cat({ { 0x00, 0xc3, 0x05 }, notes, midiR2_eot, { 0, 0 } });
+    const auto bytes = midiR2_cat({ midiR2_header(1, 3, 960), midiR2_chunk(track0), midiR2_chunk(track1),
+                                    std::vector<uint8_t>(5, 0x1a) });
+    const R expected = R::TrackCountMismatch | R::NoncanonicalVlq | R::UnterminatedSysEx
+                     | R::MissingEndOfTrack | R::DataAfterEndOfTrack | R::TrailingBytes;
+
+    MidiFile recovered;
+    EXPECT_TRUE(io.read(bytes, MidiReadOptions::tolerant(), recovered));
+    EXPECT_TRUE(recovered.recoveries() == expected);
+    EXPECT_EQ(recovered.tracks().size(), size_t(2));
+    EXPECT_EQ(recovered.ticksPerQuarter(), uint16_t(960));
+    if (recovered.tracks().size() != 2)
+        return;
+    // The recovered track 0: tempo, SysEx closed by F7, 16 notes, appended EOT.
+    const auto& events0 = recovered.tracks()[0].events;
+    EXPECT_EQ(events0.size(), size_t(1 + 1 + 16 + 1));
+    EXPECT_TRUE(events0[1].kind == MidiEventKind::SysExF0
+                && events0[1].payload == std::vector<uint8_t>({ 0x43, 0x10, 0xf7 }));
+    EXPECT_TRUE(events0.back().kind == MidiEventKind::Meta && events0.back().metaType == 0x2f
+                && events0.back().deltaTicks == 0);
+
+    const auto path = io.file("recovered.mid");
+    EXPECT_TRUE(recovered.write(path));
+    MidiFile strict;
+    EXPECT_TRUE(strict.read(path));
+    EXPECT_TRUE(strict.recoveries() == R::None);
+    EXPECT_TRUE(strict.tracks() == recovered.tracks());
+    EXPECT_EQ(strict.format(), 1);
+    EXPECT_EQ(*strict.tickToMicroseconds(960), uint64_t(500000));
+}
+
+DSPARK_TEST(MidiFile_tolerant_read_keeps_malformed_input_fatal)
+{
+    using midi_test::smf;
+    using midi_test::withEot;
+    midiR2_Reader io("r2-fatal");
+    const auto tolerant = MidiReadOptions::tolerant();
+    const auto valid = smf(0, 96, { withEot({}) });
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> cases;
+    cases.push_back({ "zero-tempo", smf(0, 96, { withEot({ 0, 0xff, 0x51, 3, 0, 0, 0 }) }) });
+    cases.push_back({ "illegal-status-f1", smf(0, 96, { withEot({ 0x00, 0xf1, 0x10 }) }) });
+    cases.push_back({ "data-byte-high", smf(0, 96, { withEot({ 0x00, 0x90, 60, 0x80 }) }) });
+    cases.push_back({ "vlq-five-significant-bytes",
+                      smf(0, 96, { { 0x81, 0x80, 0x80, 0x80, 0x00, 0xff, 0x2f, 0 } }) });
+    cases.push_back({ "running-status-at-start", smf(0, 96, { withEot({ 0x00, 60, 64 }) }) });
+    cases.push_back({ "running-after-meta",
+                      smf(0, 96, { withEot({ 0x00, 0x90, 60, 64, 0x00, 0xff, 1, 0, 0x00, 61, 64 }) }) });
+    cases.push_back({ "meta-type-high", smf(0, 96, { withEot({ 0, 0xff, 0x80, 0 }) }) });
+    cases.push_back({ "nonempty-eot", smf(0, 96, { { 0x00, 0xff, 0x2f, 1, 0 } }) });
+    auto format3 = valid; format3[9] = 3; cases.push_back({ "format-3", format3 });
+    auto shortHeader = valid; shortHeader[7] = 5; cases.push_back({ "header-length-5", shortHeader });
+    auto duplicate = valid;
+    duplicate.insert(duplicate.end(), { 'M', 'T', 'h', 'd', 0, 0, 0, 6, 0, 0, 0, 1, 0, 96 });
+    cases.push_back({ "duplicate-mthd", duplicate });
+    auto zeroDivision = valid; zeroDivision[12] = 0; zeroDivision[13] = 0;
+    cases.push_back({ "zero-division", zeroDivision });
+    cases.push_back({ "smpte-rate-26", smf(0, uint16_t(((256 - 26) << 8) | 40), { withEot({}) }) });
+    cases.push_back({ "smpte-zero-ticks-per-frame", smf(0, uint16_t((256 - 25) << 8), { withEot({}) }) });
+    // An alien chunk whose length runs past the end of the file swallows it:
+    // the trailing bytes are dropped and no track chunk is left.
+    auto alienOverrun = smf(0, 96, { withEot({}) }, {}, { 0 });
+    alienOverrun[18] = 0x08; alienOverrun[19] = 0; alienOverrun[20] = 0; alienOverrun[21] = 1;
+    cases.push_back({ "alien-overrun-hides-every-track", alienOverrun });
+    cases.push_back({ "no-track-chunk", midiR2_header(1, 1, 96) });
+
+    bool all = true;
+    for (const auto& test : cases)
+        all = midi_test::record(io.rejects(test.second, tolerant), test.first) && all;
+    EXPECT_TRUE(all);
+
+    // Mutation campaign: tolerant reading accepts a strict superset, and every
+    // recovered document passes the strict model, writes and rereads strictly.
+    namespace fs = std::filesystem;
+    const fs::path root = fs::path(DSPARK_TEST_FIXTURE_DIR) / "midi";
+    const std::vector<uint8_t> corpus[] = {
+        midi_test::readBytes(root / "rp001-format0.mid"),
+        midi_test::readBytes(root / "rp001-format1.mid")
+    };
+    EXPECT_TRUE(!corpus[0].empty() && !corpus[1].empty());
+    if (corpus[0].empty() || corpus[1].empty())
+        return;
+    uint64_t state = 0x4d494449523254ull;
+    uint64_t strictAccepted = 0, tolerantAccepted = 0, rereadMismatch = 0, notSuperset = 0;
+    for (size_t index = 0; index < 1500; ++index)
+    {
+        auto next = [&]() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            return state;
+        };
+        std::vector<uint8_t> bytes = corpus[index & 1u];
+        const unsigned edits = 1u + static_cast<unsigned>(next() % 3u);
+        for (unsigned edit = 0; edit < edits; ++edit)
+        {
+            const size_t pos = static_cast<size_t>(next() % bytes.size());
+            switch (next() % 4u)
+            {
+                case 0: bytes[pos] ^= static_cast<uint8_t>(1u << (next() & 7u)); break;
+                case 1: bytes.insert(bytes.begin() + static_cast<std::ptrdiff_t>(pos), uint8_t(0x80)); break;
+                case 2: bytes.erase(bytes.begin() + static_cast<std::ptrdiff_t>(pos)); break;
+                default: bytes.resize(std::max<size_t>(pos, 14)); break;
+            }
+        }
+        MidiFile strict, lenient;
+        const bool strictOk = io.read(bytes, {}, strict);
+        const bool lenientOk = io.read(bytes, tolerant, lenient);
+        strictAccepted += strictOk ? 1u : 0u;
+        tolerantAccepted += lenientOk ? 1u : 0u;
+        if (strictOk && (!lenientOk || lenient.tracks() != strict.tracks()
+                         || lenient.recoveries() != MidiReadRecovery::None))
+            ++notSuperset;
+        if (lenientOk && lenient.format() != 2)
+        {
+            const auto path = io.file("rewrite.mid");
+            MidiFile reread;
+            if (!lenient.write(path) || !reread.read(path)
+                || reread.tracks() != lenient.tracks())
+                ++rereadMismatch;
+        }
+    }
+    EXPECT_EQ(notSuperset, uint64_t(0));
+    EXPECT_EQ(rereadMismatch, uint64_t(0));
+    EXPECT_GT(tolerantAccepted, strictAccepted + 100);
+    std::cout << "MIDI tolerant mutation cases=1500 strict-accepted=" << strictAccepted
+              << " tolerant-accepted=" << tolerantAccepted << "\n";
+}
+
+DSPARK_TEST(MidiFile_SMPTE_division_timing_is_exact_and_ignores_tempo)
+{
+    midiR2_Reader io("r2-smpte");
+    MidiReadOptions smpte;
+    smpte.acceptSmpteDivision = true;
+    const auto notes = midiR2_notes(20);                       // 4800 ticks
+    const std::vector<uint8_t> tempoAt960 { 0x87, 0x40, 0xff, 0x51, 0x03, 0x03, 0x0d, 0x40 };
+    const auto withTempo = midiR2_cat({ midiR2_tempo, tempoAt960, notes, midiR2_eot });
+    const auto withoutTempo = midiR2_cat({ { 0x87, 0x40, 0xff, 0x01, 0x00 }, notes, midiR2_eot });
+
+    struct Rate
+    {
+        int fps;
+        uint8_t ticksPerFrame;
+        double endSeconds;   // at tick 5760
+        uint64_t numerator;  // ticks per second = numerator / denominator
+        uint64_t denominator;
+    };
+    // 29 is 30 drop frame: 30000/1001 frames per second.
+    const Rate rates[] = {
+        { 24, 4, 60.0, 96, 1 },
+        { 25, 40, 5.76, 1000, 1 },
+        { 29, 80, 2.4024, 30000ull * 80, 1001 },
+        { 30, 100, 1.92, 3000, 1 },
+    };
+    bool all = true;
+    for (const Rate& rate : rates)
+    {
+        const std::string label = "smpte-" + std::to_string(rate.fps);
+        const auto division = static_cast<uint16_t>(((256 - rate.fps) << 8) | rate.ticksPerFrame);
+        for (const uint16_t format : { uint16_t(1), uint16_t(2) })
+        {
+            const auto bytes = midiR2_cat({ midiR2_header(format, 2, division), midiR2_chunk(withTempo),
+                                            midiR2_chunk(withoutTempo) });
+            bool ok = midi_test::record(io.rejects(bytes, {}), label + "/default-rejects");
+            MidiFile file;
+            ok = ok && io.read(bytes, smpte, file) && file.isSmpteDivision()
+                && file.division() == division && file.smpteFramesPerSecond() == rate.fps
+                && file.ticksPerFrame() == rate.ticksPerFrame && file.ticksPerQuarter() == 0
+                && !file.tempoMap(0).has_value() && file.recoveries() == MidiReadRecovery::None;
+            // Track 0 holds two tempo events, track 1 none: the time base is
+            // the same whichever track supplies it.
+            for (const size_t track : { size_t(0), size_t(1) })
+            {
+                ok = ok && file.tickToSeconds(5760, track) == rate.endSeconds;
+                for (const uint64_t tick : { uint64_t(0), uint64_t(1), uint64_t(7), uint64_t(960),
+                                             uint64_t(5760), uint64_t(24000), uint64_t(1000000007) })
+                {
+                    const uint64_t exact = tick * 1000000ull * rate.denominator / rate.numerator;
+                    ok = ok && file.tickToMicroseconds(tick, track) == exact;
+                }
+            }
+            all = midi_test::record(ok, label + "/format" + std::to_string(format)) && all;
+        }
+    }
+    EXPECT_TRUE(all);
+
+    // 30 drop frame runs at 29.97 frames per second, not 29 or 30.
+    const auto dropFrame = midiR2_cat({ midiR2_header(0, 1, 0xe350), midiR2_chunk(withTempo) });
+    MidiFile file;
+    EXPECT_TRUE(io.read(dropFrame, MidiReadOptions::tolerant(), file));
+    EXPECT_TRUE(file.tickToMicroseconds(24000) == uint64_t(10010000));
+    EXPECT_TRUE(file.tickToSeconds(24000) == 10.01);
+}
+
+DSPARK_TEST(MidiFile_SMPTE_authoring_round_trips)
+{
+    midiR2_Reader io("r2-smpte-write");
+    MidiFile midi;
+    EXPECT_TRUE(midi.createSmpte(1, 29, 80, 2));
+    EXPECT_EQ(midi.division(), uint16_t(0xe350));
+    EXPECT_TRUE(midi.isSmpteDivision());
+    EXPECT_EQ(midi.ticksPerQuarter(), uint16_t(0));
+    EXPECT_TRUE(midi.addMetaEvent(0, 0, 0x51, std::array<uint8_t, 3> { 0x07, 0xa1, 0x20 }));
+    EXPECT_TRUE(midi.addChannelEvent(1, 2400, 0x90, 60, 100));
+    EXPECT_TRUE(midi.addChannelEvent(1, 2400, 0x80, 60, 0));
+    EXPECT_TRUE(midi.tickToMicroseconds(4800, 1) == uint64_t(2002000));
+
+    const auto path = io.file("smpte.mid");
+    EXPECT_TRUE(midi.write(path));
+    MidiFile strict;
+    EXPECT_FALSE(strict.read(path));
+    MidiReadOptions smpte;
+    smpte.acceptSmpteDivision = true;
+    MidiFile decoded;
+    EXPECT_TRUE(decoded.read(path, smpte));
+    EXPECT_EQ(decoded.division(), uint16_t(0xe350));
+    EXPECT_EQ(decoded.format(), 1);
+    if (decoded.tracks().size() == 2 && decoded.tracks()[1].events.size() == 3)
+    {
+        // The writer appends the missing EOTs; the authored events match.
+        EXPECT_TRUE(decoded.tracks()[1].events[0] == midi.tracks()[1].events[0]);
+        EXPECT_TRUE(decoded.tracks()[1].events[1] == midi.tracks()[1].events[1]);
+        EXPECT_TRUE(decoded.tracks()[0].events[0] == midi.tracks()[0].events[0]);
+    }
+    else
+    {
+        EXPECT_TRUE(false);
+    }
+
+    const MidiTrack before = midi.tracks()[1];
+    EXPECT_FALSE(midi.createSmpte(1, 26, 80));
+    EXPECT_FALSE(midi.createSmpte(1, 25, 0));
+    EXPECT_FALSE(midi.createSmpte(2, 25, 40));
+    EXPECT_FALSE(midi.createSmpte(0, 25, 40, 2));
+    EXPECT_TRUE(midi.tracks()[1] == before);
+    EXPECT_EQ(midi.division(), uint16_t(0xe350));
+    EXPECT_TRUE(midi.create(0, 480));
+    EXPECT_FALSE(midi.isSmpteDivision());
+    EXPECT_EQ(midi.smpteFramesPerSecond(), 0);
+    EXPECT_EQ(midi.ticksPerQuarter(), uint16_t(480));
+}
+
+// ============================================================================
+// 2026-11 round 2: FLAC Rice decoding. The decoder takes Rice codes from a
+// 64-bit register, restoring each sample as its residual arrives, and falls
+// back to the code-by-code reader for codes longer than the bits in hand and
+// for the end of the buffer. This pins both paths, every Rice parameter and
+// every bit alignment against the values that were encoded, and the residual
+// bound on both sides of the fall-back.
+// ============================================================================
+
+namespace {
+
+class flacR2_BitWriter
+{
+public:
+    void bit(bool one)
+    {
+        if (used_ == 0) bytes_.push_back(0);
+        if (one) bytes_.back() = static_cast<uint8_t>(bytes_.back() | (0x80u >> used_));
+        used_ = (used_ + 1u) & 7u;
+    }
+    void put(uint64_t value, unsigned count)
+    {
+        for (unsigned i = count; i-- > 0;) bit(((value >> i) & 1u) != 0);
+    }
+    void unary(uint64_t zeros)
+    {
+        for (uint64_t i = 0; i < zeros; ++i) bit(false);
+        bit(true);
+    }
+    void align() { used_ = 0; }   // the rest of the last byte is already zero
+    [[nodiscard]] std::vector<uint8_t>& bytes() { return bytes_; }
+
+private:
+    std::vector<uint8_t> bytes_;
+    unsigned used_ = 0;
+};
+
+// A mono 32-bit stream with fixed blocking and STREAMINFO MD5 zero. Frame f is
+// one FIXED order-0 subframe (the prediction is zero, so the samples are the
+// residuals) with a single Rice partition of parameter parameters[f] that
+// codes the folded values folded[f].
+std::vector<uint8_t> flacR2_riceStream(const std::vector<unsigned>& parameters,
+                                       const std::vector<std::vector<uint64_t>>& folded,
+                                       uint32_t blockSize)
+{
+    const uint64_t total = static_cast<uint64_t>(blockSize) * parameters.size();
+    std::vector<uint8_t> out { 'f', 'L', 'a', 'C', 0x80, 0, 0, 34 };
+    flacR2_BitWriter info;
+    info.put(blockSize, 16);
+    info.put(blockSize, 16);
+    info.put(0, 24);
+    info.put(0, 24);
+    info.put(48000, 20);
+    info.put(0, 3);        // channels - 1
+    info.put(31, 5);       // bits per sample - 1
+    info.put(total, 36);
+    info.put(0, 64);       // MD5 not computed
+    info.put(0, 64);
+    out.insert(out.end(), info.bytes().begin(), info.bytes().end());
+
+    for (size_t f = 0; f < parameters.size(); ++f)
+    {
+        flacR2_BitWriter frame;
+        frame.put(0xfff8, 16);                 // sync, fixed blocking
+        frame.put(7, 4);                       // block size: 16-bit field
+        frame.put(0, 4);                       // rate from STREAMINFO
+        frame.put(0, 4);                       // mono
+        frame.put(7, 3);                       // 32 bits per sample
+        frame.put(0, 1);
+        frame.put(f, 8);                       // frame number (< 128)
+        frame.put(blockSize - 1u, 16);
+        frame.put(flac_test::crc8(frame.bytes()), 8);
+        frame.put(0, 1);
+        frame.put(8, 6);                       // FIXED, order 0
+        frame.put(0, 1);                       // no wasted bits
+        frame.put(1, 2);                       // 5-bit Rice parameters
+        frame.put(0, 4);                       // one partition
+        const unsigned k = parameters[f];
+        frame.put(k, 5);
+        for (uint64_t value : folded[f])
+        {
+            frame.unary(value >> k);
+            frame.put(value & ((uint64_t { 1 } << k) - 1u), k);
+        }
+        frame.align();
+        const uint16_t crc = flac_test::crc16(frame.bytes());
+        frame.put(crc, 16);
+        out.insert(out.end(), frame.bytes().begin(), frame.bytes().end());
+    }
+    return out;
+}
+
+int64_t flacR2_unfold(uint64_t folded)
+{
+    return (folded & 1u) == 0 ? static_cast<int64_t>(folded >> 1)
+                              : -static_cast<int64_t>(folded >> 1) - 1;
+}
+
+} // namespace
+
+DSPARK_TEST(FlacFile_rice_codes_decode_exactly_at_every_parameter_and_alignment)
+{
+    constexpr uint32_t kBlock = 1024;
+    constexpr uint64_t kMaxFolded = 4294967294ull;   // residual +-(2^31 - 1)
+    std::vector<unsigned> parameters;
+    std::vector<std::vector<uint64_t>> folded;
+    uint64_t state = 0x52494345u;
+    auto next = [&]() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    };
+    for (unsigned k = 0; k <= 30; ++k)
+    {
+        // Mostly short quotients (the register path), some of 40..100 zeros
+        // (beyond the 56 bits in hand for large k: the code-by-code path),
+        // and for large k the extreme residuals.
+        std::vector<uint64_t> values(kBlock);
+        for (uint64_t& value : values)
+        {
+            const uint64_t pick = next() % 10;
+            const uint64_t quotient = pick < 7 ? next() % 4
+                                    : pick < 9 ? next() % 41 : 40 + next() % 61;
+            value = std::min((quotient << k) | (next() & ((uint64_t { 1 } << k) - 1u)),
+                             kMaxFolded);
+        }
+        values[kBlock / 2] = std::min(kMaxFolded, (uint64_t { 100 } << k) | 1u);
+        if (k >= 26)
+        {
+            values[3] = kMaxFolded;
+            values[kBlock - 2] = kMaxFolded - 1;
+        }
+        parameters.push_back(k);
+        folded.push_back(std::move(values));
+    }
+
+    midi_test::TempDirectory temp("flac-r2-rice");
+    const auto path = temp.file("rice.flac");
+    EXPECT_TRUE(midi_test::writeBytes(path, flacR2_riceStream(parameters, folded, kBlock)));
+    FlacFile file;
+    EXPECT_TRUE(file.openRead(path));
+    EXPECT_EQ(file.getInfo().numSamples, int64_t(kBlock) * 31);
+    if (!file.isOpen()) return;
+    AudioBuffer<float> decoded;
+    decoded.resize(1, static_cast<int>(kBlock * 31));
+    EXPECT_TRUE(file.readSamples(decoded.toView()));
+    const float scale = std::ldexp(1.0f, -31);
+    size_t mismatches = 0;
+    for (size_t f = 0; f < folded.size(); ++f)
+        for (uint32_t i = 0; i < kBlock; ++i)
+        {
+            const float expected = static_cast<float>(
+                static_cast<int32_t>(flacR2_unfold(folded[f][i]))) * scale;
+            if (std::bit_cast<uint32_t>(decoded.getChannel(0)[f * kBlock + i])
+                != std::bit_cast<uint32_t>(expected))
+                ++mismatches;
+        }
+    EXPECT_EQ(mismatches, size_t(0));
+
+    // One folded value past the bound (residual -2^31) rejects the stream:
+    // with k = 30 the code is short (register path), with k = 20 its 4095
+    // zeros take the code-by-code path. 2^32 - 2 is still accepted.
+    for (const unsigned k : { 30u, 20u })
+        for (const uint64_t extreme : { kMaxFolded, kMaxFolded + 1 })
+        {
+            std::vector<uint64_t> values(64, 5);
+            values[17] = extreme;
+            const auto bytes = flacR2_riceStream({ k }, { values }, 64);
+            const auto bad = temp.file("bound-" + std::to_string(k) + "-"
+                                       + std::to_string(extreme) + ".flac");
+            EXPECT_TRUE(midi_test::writeBytes(bad, bytes));
+            FlacFile boundFile;
+            EXPECT_EQ(boundFile.openRead(bad), extreme == kMaxFolded);
+        }
+}

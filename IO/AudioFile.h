@@ -52,6 +52,10 @@ struct AudioFileInfo
      * @note Format-specific overload: when writing MP3 (Mp3File::openWrite),
      * this field carries the target bitrate in kbps instead (e.g., 320).
      * MP3 has no per-sample bit depth.
+     *
+     * @note A reader of a coding that has no linear bit depth reports the
+     * depth it decodes to: WavFile reports 16 for G.711 A-law/mu-law and
+     * IMA/Microsoft ADPCM (see WavFile::getEncoding()).
      */
     uint32_t bitsPerSample = 16;
 

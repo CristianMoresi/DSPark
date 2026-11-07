@@ -10,7 +10,9 @@
  * This class provides a high-quality saturation pipeline featuring 10 distinct
  * algorithms ranging from soft clipping to complex magnetic tape and
  * transformer modeling. It oversamples 2x by default, so its latency is the
- * oversampler's group delay (see getLatency()); at 1x it is zero.
+ * oversampler's group delay (see getLatency()); at 1x it is zero. Second-order
+ * antialiasing (setAntialiasing(Antialiasing::SecondOrder), opt-in) adds one
+ * sample, which the dry path matches.
  *
  * @details
  * **Architecture & Performance:**
@@ -26,7 +28,7 @@
  * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/Biquad.h,
  * Core/DryWetMixer.h, Core/DspMath.h, Core/Oversampling.h, Core/Smoothers.h,
  * Core/AnalogRandom.h, Core/SpscQueue.h, Core/SpinLock.h, Core/StateBlob.h,
- * Effects/DCBlocker.h, Effects/MidSide.h.
+ * Core/detail/Adaa.h, Core/detail/LogCosh.h, Effects/DCBlocker.h, Effects/MidSide.h.
  *
  * Threading: prepare(), setOversampling() and setState() belong to the setup
  * thread; processBlock()/process() and reset() to the audio thread. The
@@ -53,6 +55,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include "../Core/detail/Adaa.h"
 #include "../Core/detail/LogCosh.h"
 
 #include <cmath>
@@ -90,15 +93,58 @@ public:
     virtual typename Saturation<T>::Algorithm getType() const noexcept = 0;
 
     /**
-     * @brief Enables 1st-order antiderivative anti-aliasing (ADAA) on the
-     * memoryless curves (Tanh/Tube/HardClip). Combined with oversampling this is
-     * the cleanest known approach (Parker/Zavalishin DAFx-16, Bilbao et al. 2017).
-     * No-op for algorithms that do not implement it. Default off (transparent).
+     * @brief Antiderivative antialiasing order on the memoryless curves:
+     * 0 off, 1 first order (SoftClip/Tube/HardClip), 2 second order
+     * (SoftClip/Tube/HardClip/Wavefolder/Transformer, Bilbao et al. 2017).
+     * Order 2 delays every algorithm by exactly one sample: those without a
+     * second-order kernel are delayed to match, so a crossfade between any
+     * two stays aligned. Default 0.
      */
-    void setAntialias(bool on) noexcept { antialias_.store(on, std::memory_order_relaxed); }
+    void setAntialias(int order) noexcept { antialias_.store(std::clamp(order, 0, 2), std::memory_order_relaxed); }
+
+    /**
+     * @brief Latches the order for the coming block (audio thread, before
+     * update()). Entering order 2 arms every channel: its first sample seeds
+     * the kernel history with the current input, so the one-sample delay is
+     * inserted as a held sample instead of a step from stale history. The
+     * off and first-order paths keep no second-order history at all.
+     */
+    void latchOrder() noexcept
+    {
+        const int o = antialias_.load(std::memory_order_relaxed);
+        if (o == 2 && order_ != 2) armMask_ = ~0u;
+        order_ = o;
+    }
+
+    /** @brief The latched order (audio thread). */
+    [[nodiscard]] int order() const noexcept { return order_; }
+
+    /** One-sample delay for algorithms without a second-order kernel. */
+    T align(T y, int ch) noexcept
+    {
+        T& slot = alignHold_[static_cast<size_t>(ch & (kAaCh - 1))];
+        if (takeArm(ch)) [[unlikely]] slot = y;
+        const T out = slot;
+        slot = y;
+        return out;
+    }
 
 protected:
-    std::atomic<bool> antialias_ { false };
+    std::atomic<int> antialias_ { 0 };
+    int order_ = 0;            ///< Latched order (audio thread).
+    unsigned armMask_ = ~0u;   ///< Channels whose order-2 history must be seeded.
+
+    /** True once per channel after entering order 2 (or a reset). */
+    bool takeArm(int c) noexcept
+    {
+        const unsigned bit = 1u << (c & (kAaCh - 1));
+        if ((armMask_ & bit) == 0u) return false;
+        armMask_ &= ~bit;
+        return true;
+    }
+
+    void resetAlign() noexcept { alignHold_.fill(T(0)); armMask_ = ~0u; }
+    std::array<T, kAaCh> alignHold_ {};
 };
 
 // -- SoftClip (tanh) ---------------------------------------------------------
@@ -110,17 +156,48 @@ template <typename T>
 class TanhAlgorithm final : public SaturationAlgorithm<T>
 {
     std::array<double, SaturationAlgorithm<T>::kAaCh> prevX_ {};
+    std::array<detail::Adaa2, SaturationAlgorithm<T>::kAaCh> adaa2_ {};
+    std::array<double, SaturationAlgorithm<T>::kAaCh> prevBias_ {};
 public:
     void prepare(const AudioSpec&) noexcept override { reset(); }
-    void reset() noexcept override { prevX_.fill(0.0); }
+    void reset() noexcept override
+    {
+        prevX_.fill(0.0);
+        for (auto& a : adaa2_) a.reset();
+        prevBias_.fill(0.0);
+        this->resetAlign();
+    }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::SoftClip; }
+
+    /** Second-order sample (Saturation::processCore runs it in its own loop
+     *  when order() is 2, so the off and first-order loops are unchanged). */
+    inline T processSecond(T sample, T drive, T character, int ch) noexcept
+    {
+        const T x    = sample * drive;
+        const T bias = character * T(0.3);
+        const int c  = ch & (SaturationAlgorithm<T>::kAaCh - 1);
+        // Second order on u = x + bias; the resting offset tanh(bias)
+        // is taken one sample back, where the output is centred.
+        const double u = static_cast<double>(x) + static_cast<double>(bias);
+        if (this->takeArm(c)) [[unlikely]]
+        {
+            adaa2_[static_cast<size_t>(c)].reset(u);
+            prevBias_[static_cast<size_t>(c)] = static_cast<double>(bias);
+        }
+        const double y = adaa2_[static_cast<size_t>(c)].template process<detail::AdaaTanh>(u);
+        const double tb = std::tanh(prevBias_[static_cast<size_t>(c)]);
+        prevBias_[static_cast<size_t>(c)] = static_cast<double>(bias);
+        prevX_[static_cast<size_t>(c)] = static_cast<double>(x);
+        return static_cast<T>(y - tb);
+    }
 
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
         T x    = sample * drive;
         T bias = character * T(0.3);
         const int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
-        if (!this->antialias_.load(std::memory_order_relaxed))
+        const int order = this->order_;
+        if (order == 0)
         {
             // Keep the ADAA history current, so enabling ADAA mid-stream
             // starts from the real previous input (a stale one glitched).
@@ -154,18 +231,49 @@ template <typename T>
 class TubeAlgorithm final : public SaturationAlgorithm<T>
 {
     std::array<double, SaturationAlgorithm<T>::kAaCh> prevX_ {};
+    std::array<detail::Adaa2, SaturationAlgorithm<T>::kAaCh> adaa2_ {};
+    std::array<double, SaturationAlgorithm<T>::kAaCh> prevBias_ {};
 
 public:
     void prepare(const AudioSpec&) noexcept override { reset(); }
-    void reset() noexcept override { prevX_.fill(0.0); }
+    void reset() noexcept override
+    {
+        prevX_.fill(0.0);
+        for (auto& a : adaa2_) a.reset();
+        prevBias_.fill(0.0);
+        this->resetAlign();
+    }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Tube; }
+
+    /** Second-order sample (Saturation::processCore runs it in its own loop
+     *  when order() is 2, so the off and first-order loops are unchanged). */
+    inline T processSecond(T sample, T drive, T character, int ch) noexcept
+    {
+        const T x = sample * drive;
+        const T b = T(-0.7) * (T(0.15) + character * T(0.5));
+        const int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
+        // Second order on u = x + b; offset and slope normalisation use
+        // the bias one sample back, where the output is centred.
+        const double u = static_cast<double>(x) + static_cast<double>(b);
+        if (this->takeArm(c)) [[unlikely]]
+        {
+            adaa2_[static_cast<size_t>(c)].reset(u);
+            prevBias_[static_cast<size_t>(c)] = static_cast<double>(b);
+        }
+        const double y = adaa2_[static_cast<size_t>(c)].template process<detail::AdaaTanh>(u);
+        const double tb = std::tanh(prevBias_[static_cast<size_t>(c)]);
+        prevBias_[static_cast<size_t>(c)] = static_cast<double>(b);
+        prevX_[static_cast<size_t>(c)] = static_cast<double>(x);
+        return static_cast<T>((y - tb) / (1.0 - tb * tb));
+    }
 
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
         const T x = sample * drive;
         const T b = T(-0.7) * (T(0.15) + character * T(0.5));
         const int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
-        if (!this->antialias_.load(std::memory_order_relaxed))
+        const int order = this->order_;
+        if (order == 0)
         {
             prevX_[static_cast<size_t>(c)] = static_cast<double>(x);
             const T tb = fastTanh(b);
@@ -195,6 +303,8 @@ template <typename T>
 class HardClipAlgorithm final : public SaturationAlgorithm<T>
 {
     std::array<double, SaturationAlgorithm<T>::kAaCh> prevX_ {};
+    std::array<detail::Adaa2, SaturationAlgorithm<T>::kAaCh> adaa2_ {};
+    std::array<double, SaturationAlgorithm<T>::kAaCh> prevBias_ {};
 
     /** Antiderivative of clamp(u,-1,1): u^2/2 inside, |u|-1/2 outside. */
     static inline double g(double u) noexcept
@@ -204,8 +314,35 @@ class HardClipAlgorithm final : public SaturationAlgorithm<T>
     }
 public:
     void prepare(const AudioSpec&) noexcept override { reset(); }
-    void reset() noexcept override { prevX_.fill(0.0); }
+    void reset() noexcept override
+    {
+        prevX_.fill(0.0);
+        for (auto& a : adaa2_) a.reset();
+        prevBias_.fill(0.0);
+        this->resetAlign();
+    }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::HardClip; }
+
+    /** Second-order sample (Saturation::processCore runs it in its own loop
+     *  when order() is 2, so the off and first-order loops are unchanged). */
+    inline T processSecond(T sample, T drive, T character, int ch) noexcept
+    {
+        const T bias = character * T(0.3);
+        const T d = sample * drive;
+        const int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
+        // Exact second-order kernel (Core/detail/Adaa.h) on u = d + bias.
+        const double u = static_cast<double>(d) + static_cast<double>(bias);
+        if (this->takeArm(c)) [[unlikely]]
+        {
+            adaa2_[static_cast<size_t>(c)].reset(u);
+            prevBias_[static_cast<size_t>(c)] = static_cast<double>(bias);
+        }
+        const double y = adaa2_[static_cast<size_t>(c)].template process<detail::AdaaHardClip>(u);
+        const double cbPrev = std::clamp(prevBias_[static_cast<size_t>(c)], -1.0, 1.0);
+        prevBias_[static_cast<size_t>(c)] = static_cast<double>(bias);
+        prevX_[static_cast<size_t>(c)] = static_cast<double>(d);
+        return static_cast<T>(y - cbPrev);
+    }
 
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
@@ -213,7 +350,8 @@ public:
         const T cb = std::clamp(bias, T(-1), T(1));
         const T d = sample * drive;
         const int c = ch & (SaturationAlgorithm<T>::kAaCh - 1);
-        if (!this->antialias_.load(std::memory_order_relaxed))
+        const int order = this->order_;
+        if (order == 0)
         {
             prevX_[static_cast<size_t>(c)] = static_cast<double>(d);
             return std::clamp(d + bias, T(-1), T(1)) - cb;
@@ -234,9 +372,10 @@ template <typename T>
 class ExciterAlgorithm final : public SaturationAlgorithm<T>
 {
 public:
-    void prepare(const AudioSpec&) noexcept override {}
-    void reset() noexcept override {}
+    void prepare(const AudioSpec&) noexcept override { reset(); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Exciter; }
+
+    void reset() noexcept override { this->resetAlign(); }
 
     inline T processSample(T sample, T drive, T character, int) noexcept
     {
@@ -254,10 +393,18 @@ class WavefolderAlgorithm final : public SaturationAlgorithm<T>
 {
     static constexpr int kMaxCh = 16;
     std::array<T, kMaxCh> lastX_ {};
+    std::array<detail::Adaa2, kMaxCh> adaa2_ {};
+    std::array<double, kMaxCh> prevBias_ {};
 
 public:
     void prepare(const AudioSpec&) noexcept override { reset(); }
-    void reset() noexcept override { lastX_.fill(T(0)); }
+    void reset() noexcept override
+    {
+        lastX_.fill(T(0));
+        for (auto& a : adaa2_) a.reset();
+        prevBias_.fill(0.0);
+        this->resetAlign();
+    }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Wavefolder; }
 
     /**
@@ -271,12 +418,33 @@ public:
      * drive. character biases the fold point (asymmetry / even harmonics);
      * subtracting sin(bias) keeps the resting output DC-free.
      */
+    /** Second-order sample (Saturation::processCore runs it in its own loop
+     *  when order() is 2, so the off and first-order loops are unchanged). */
+    inline T processSecond(T sample, T drive, T character, int ch) noexcept
+    {
+        const T bias = character * (pi<T> / T(4));
+        const T x    = sample * drive + bias;
+        const int c  = ch & (kMaxCh - 1);
+        // Second order on sin (antiderivatives -cos, -sin); the resting
+        // offset sin(bias) is taken one sample back, at the centre.
+        if (this->takeArm(c)) [[unlikely]]
+        {
+            adaa2_[static_cast<size_t>(c)].reset(static_cast<double>(x));
+            prevBias_[static_cast<size_t>(c)] = static_cast<double>(bias);
+        }
+        const double y = adaa2_[static_cast<size_t>(c)].template process<detail::AdaaSine>(static_cast<double>(x));
+        const double sbPrev = std::sin(prevBias_[static_cast<size_t>(c)]);
+        prevBias_[static_cast<size_t>(c)] = static_cast<double>(bias);
+        lastX_[static_cast<size_t>(c)] = x;
+        return static_cast<T>(y - sbPrev);
+    }
+
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
         const T bias = character * (pi<T> / T(4));
         const T x    = sample * drive + bias;
-        const T sb   = std::sin(bias);
         const int c  = ch & (kMaxCh - 1);
+        const T sb   = std::sin(bias);
 
         // Mean of sin over [x0, x], (cos x0 - cos x) / (x - x0), written as
         // sin(mid) * sinc(half) via the sum-to-product identity: exact, with
@@ -317,7 +485,7 @@ public:
     {
         if (rngState_ == 0) rngState_ = 1; // xorshift fixed point guard
     }
-    void reset() noexcept override {}
+    void reset() noexcept override { this->resetAlign(); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Bitcrusher; }
 
     void update(T drive, T /*character*/, const AudioSpec&) noexcept override
@@ -393,6 +561,7 @@ public:
         for (auto& f : preFilters_)  f.reset();
         for (auto& f : postFilters_) f.reset();
         M_.fill(T(0));
+        this->resetAlign();
     }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Tape; }
 
@@ -464,6 +633,8 @@ class TransformerAlgorithm final : public SaturationAlgorithm<T>
 {
     static constexpr int kMaxCh = 16;
     std::array<Biquad<T, 1>, kMaxCh> lpFilters_;
+    std::array<detail::Adaa2, kMaxCh> adaaLow_ {}, adaaHigh_ {};
+    std::array<double, kMaxCh> prevRestLow_ {}, prevRestHigh_ {};
     int numChannels_ = 0;
     double lastSampleRate_ = 0.0;
 
@@ -477,6 +648,11 @@ public:
     void reset() noexcept override
     {
         for (auto& f : lpFilters_) f.reset();
+        for (auto& a : adaaLow_) a.reset();
+        for (auto& a : adaaHigh_) a.reset();
+        prevRestLow_.fill(0.0);
+        prevRestHigh_.fill(0.0);
+        this->resetAlign();
     }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Transformer; }
 
@@ -502,6 +678,34 @@ public:
      * the MultiStage cascade), and its resting-bias subtraction ignored the
      * drive scaling, leaking drive-dependent DC.
      */
+    /** Second-order sample (Saturation::processCore runs it in its own loop
+     *  when order() is 2, so the off and first-order loops are unchanged). */
+    inline T processSecond(T sample, T drive, T character, int ch) noexcept
+    {
+        const T low  = lpFilters_[ch].processSample(sample, 0);
+        const T high = sample - low;
+        const T bias = character * T(0.2);
+        const T kLo  = drive * T(1.4);
+        const T kHi  = drive * T(0.85);
+        const auto c = static_cast<size_t>(ch & (kMaxCh - 1));
+        // Second order on each band's tanh input; resting offsets one
+        // sample back, where the outputs are centred.
+        const double uLo = static_cast<double>((low + bias) * kLo);
+        const double uHi = static_cast<double>((high + bias) * kHi);
+        if (this->takeArm(static_cast<int>(c))) [[unlikely]]
+        {
+            adaaLow_[c].reset(uLo);
+            adaaHigh_[c].reset(uHi);
+            prevRestLow_[c] = static_cast<double>(bias * kLo);
+            prevRestHigh_[c] = static_cast<double>(bias * kHi);
+        }
+        const double yLo = adaaLow_[c].template process<detail::AdaaTanh>(uLo) - std::tanh(prevRestLow_[c]);
+        const double yHi = adaaHigh_[c].template process<detail::AdaaTanh>(uHi) - std::tanh(prevRestHigh_[c]);
+        prevRestLow_[c] = static_cast<double>(bias * kLo);
+        prevRestHigh_[c] = static_cast<double>(bias * kHi);
+        return static_cast<T>(yLo / 1.4 + yHi / 0.85);
+    }
+
     inline T processSample(T sample, T drive, T character, int ch) noexcept
     {
         const T low  = lpFilters_[ch].processSample(sample, 0);
@@ -537,6 +741,7 @@ public:
         for (auto& f : aaFilters_) f.reset();
         lastSample_.fill(T(0));
         counter_.fill(0);
+        this->resetAlign();
     }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Downsample; }
 
@@ -583,9 +788,11 @@ public:
     void update(T drive, T character, const AudioSpec& spec) noexcept override
     {
         // The stages are private instances (not the pool's), so the owner's
-        // setAntialiasing() never reaches them directly: forward the flag to
-        // the one memoryless stage that implements ADAA.
-        tube_.setAntialias(this->antialias_.load(std::memory_order_relaxed));
+        // setAntialiasing() never reaches them directly: forward the order to
+        // the tube stage only. Its one-sample second-order delay is then the
+        // cascade's delay, the same as every other algorithm's.
+        tube_.setAntialias(this->order_);
+        tube_.latchOrder();
         tape_.update(drive * T(0.6), character, spec);
         xfmr_.update(drive * T(0.8), character, spec);
     }
@@ -599,6 +806,15 @@ public:
         // left in, a -1.9 dB loss that the old Tube curve's +0.6 dB kink gain
         // partly hid.)
         T tubeOut  = tube_.processSample(sample,  drive * T(0.5), character, ch) * T(2);
+        T tapeOut  = tape_.processSample(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
+        return       xfmr_.processSample(tapeOut, drive * T(0.8), character, ch) * (T(1) / T(0.8));
+    }
+
+    /** Second order: the tube stage runs its kernel (one sample of delay for
+     *  the whole cascade); tape and transformer stages stay as they are. */
+    inline T processSecond(T sample, T drive, T character, int ch) noexcept
+    {
+        T tubeOut  = tube_.processSecond(sample, drive * T(0.5), character, ch) * T(2);
         T tapeOut  = tape_.processSample(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
         return       xfmr_.processSample(tapeOut, drive * T(0.8), character, ch) * (T(1) / T(0.8));
     }
@@ -617,7 +833,8 @@ public:
  * This class provides a high-quality saturation pipeline featuring 10 distinct
  * algorithms ranging from soft clipping to complex magnetic tape and
  * transformer modeling. Zero latency at 1x; with oversampling enabled the
- * latency equals the oversampler group delay (see getLatency()).
+ * latency equals the oversampler group delay, plus one sample with
+ * second-order antialiasing (see getLatency()).
  *
  * Channel handling: the saturation stage processes up to 16 channels and no
  * more than the prepared spec's channel count; any further channels in the
@@ -656,6 +873,26 @@ public:
 
     /** @brief Determines the final output signal routing. */
     enum class OutputMode { Normal, WetOnly, Delta };
+
+    /**
+     * @brief Antiderivative antialiasing order (see setAntialiasing()).
+     *
+     * - Off: plain curves (the Wavefolder keeps its built-in first-order form).
+     * - FirstOrder: SoftClip/Tube/HardClip, half a processing sample of
+     *   uncompensated delay, -2.0 dB at 20 kHz at the default 2x.
+     * - SecondOrder (Bilbao, Esqueda, Parker and Valimaki 2017):
+     *   SoftClip/Tube/HardClip/Wavefolder/Transformer and the MultiStage tube
+     *   stage. Every algorithm then delays by one processing sample and the
+     *   wet path is padded to one base sample, which getLatency() reports and
+     *   the dry path matches. -1.3 dB at 10 kHz and -5.9 dB at 20 kHz at 2x
+     *   (-1.3 dB at 20 kHz at 4x). Worst alias over 1-19.25 kHz tones at
+     *   -6/-18 dBFS, 2x: SoftClip at +24 dB drive -42.1 dBc against -29.7 for
+     *   FirstOrder and -15.2 off; Transformer -43.2 against -15.7. Meant for
+     *   oversampled use: at 1x the kernel's -12 dB at 20 kHz lowers high
+     *   fundamentals more than it removes alias (SoftClip +24 dB: -2.1 dBc
+     *   against -10.0 off over the same tones).
+     */
+    enum class Antialiasing { Off, FirstOrder, SecondOrder };
 
     // -- Lifecycle -----------------------------------------------------------
 
@@ -719,6 +956,7 @@ public:
         tempBuffer_.resize(spec.numChannels, spec.maxBlockSize * std::max(1, oversamplingFactor_));
         driftBuffer_.resize(spec.numChannels, spec.maxBlockSize * std::max(1, oversamplingFactor_));
         msKeepBuffer_.resize(1, spec.maxBlockSize * std::max(1, oversamplingFactor_));
+        dryAligned_.resize(spec.numChannels, spec.maxBlockSize);
         driveRamp_.assign(static_cast<size_t>(spec.maxBlockSize * std::max(1, oversamplingFactor_)), SampleType(1));
         charRamp_.assign(static_cast<size_t>(spec.maxBlockSize * std::max(1, oversamplingFactor_)), SampleType(0));
 
@@ -796,6 +1034,7 @@ public:
 
         prevBlendSample_.fill(SampleType(0));
         prevSlewSample_.fill(SampleType(0));
+        alignFresh_ = true;
     }
 
     // -- Audio Processing ----------------------------------------------------
@@ -835,7 +1074,39 @@ public:
 private:
     void processChunk(AudioBufferView<SampleType> buffer) noexcept
     {
-        dryWetMixer_.pushDry(buffer);
+        // Second-order antialiasing delays the wet path by one base sample
+        // (one processing sample inside the algorithms, the rest padded
+        // below); the dry capture and the untouched M/S channel follow.
+        const bool second = antialiasOrder_.load(std::memory_order_relaxed) == 2;
+        if (second != secondActive_)
+        {
+            secondActive_ = second;
+            alignFresh_ = true;   // hold the first sample in the delay lines
+        }
+        const bool seed = second && alignFresh_;
+        if (second) alignFresh_ = false;
+        if (second)
+        {
+            const int nCh = std::min({buffer.getNumChannels(), dryAligned_.getNumChannels(), kMaxCh});
+            const int nS = std::min(buffer.getNumSamples(), dryAligned_.getNumSamples());
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                const SampleType* in = buffer.getChannel(ch);
+                SampleType* out = dryAligned_.getChannel(ch);
+                SampleType& hold = dryHold_[static_cast<size_t>(ch)];
+                if (seed && nS > 0) hold = in[0];
+                for (int i = 0; i < nS; ++i)
+                {
+                    out[i] = hold;
+                    hold = in[i];
+                }
+            }
+            dryWetMixer_.pushDry(dryAligned_.toView().getSubView(0, nS));
+        }
+        else
+        {
+            dryWetMixer_.pushDry(buffer);
+        }
 
         // Pre-filter
         {
@@ -884,6 +1155,8 @@ private:
                             static_cast<std::size_t>(upSamples) * sizeof(SampleType));
 
             processSaturationPipeline(upView);
+            if (second)
+                alignSecondOrder(upView, keepChannel, upSamples, oversamplingFactor_, seed);
 
             if (keepChannel >= 0 && keepChannel < upView.getNumChannels() && upSamples > 0)
                 std::memcpy(upView.getChannel(keepChannel), msKeepBuffer_.getChannel(0),
@@ -899,6 +1172,8 @@ private:
                             static_cast<std::size_t>(baseSamples) * sizeof(SampleType));
 
             processSaturationPipeline(buffer);
+            if (second)
+                alignSecondOrder(buffer, keepChannel, baseSamples, 1, seed);
 
             if (keepChannel >= 0 && keepChannel < buffer.getNumChannels() && baseSamples > 0)
                 std::memcpy(buffer.getChannel(keepChannel), msKeepBuffer_.getChannel(0),
@@ -1051,10 +1326,10 @@ public:
     void setAdaptiveBlend(bool on) noexcept { adaptiveBlend_.store(on, std::memory_order_relaxed); }
 
     /**
-     * @brief Enables antiderivative anti-aliasing (ADAA) on the memoryless curves
-     * (SoftClip / Tube / HardClip), which suppresses the aliasing the nonlinearity
-     * generates. Best combined with oversampling (ADAA + OS is the cleanest, per
-     * Parker/Zavalishin DAFx-16 and Bilbao et al. 2017). Off by default.
+     * @brief Enables first-order antiderivative anti-aliasing (ADAA) on the
+     * memoryless curves (SoftClip / Tube / HardClip): true selects
+     * Antialiasing::FirstOrder, false Off. Best combined with oversampling
+     * (Parker/Zavalishin DAFx-16, Bilbao et al. 2017). Off by default.
      * @note Thread-Safe.
      * @note First-order ADAA shifts the wet signal by half a sample. With a
      * partial dry/wet mix this causes a very slight HF comb (< 0.2 dB below
@@ -1063,8 +1338,25 @@ public:
      */
     void setAntialiasing(bool on) noexcept
     {
-        antialiasShadow_.store(on, std::memory_order_relaxed);   // serialization readback
-        for (auto& a : pool_) if (a) a->setAntialias(on);
+        setAntialiasing(on ? Antialiasing::FirstOrder : Antialiasing::Off);
+    }
+
+    /**
+     * @brief Selects the antialiasing order (see Antialiasing). Any thread;
+     * SecondOrder changes getLatency() at once and the audio from the next
+     * block, so notify the host. Out-of-range values are clamped.
+     */
+    void setAntialiasing(Antialiasing mode) noexcept
+    {
+        const int order = std::clamp(static_cast<int>(mode), 0, 2);
+        antialiasOrder_.store(order, std::memory_order_relaxed);   // serialization readback
+        for (auto& a : pool_) if (a) a->setAntialias(order);
+    }
+
+    /** @brief The selected antialiasing order. */
+    [[nodiscard]] Antialiasing getAntialiasing() const noexcept
+    {
+        return static_cast<Antialiasing>(antialiasOrder_.load(std::memory_order_relaxed));
     }
 
     /**
@@ -1152,12 +1444,14 @@ public:
 
     /**
      * @brief Reports the processor's algorithmic latency in samples.
-     * @note Equals the oversampler group delay (0 when oversampling is off).
-     *       Report this to the host for plugin delay compensation (PDC).
+     * @note The oversampler group delay (0 when oversampling is off), plus
+     *       one sample with second-order antialiasing. Report this to the
+     *       host for plugin delay compensation (PDC).
      */
     [[nodiscard]] int getLatency() const noexcept
     {
-        return (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0;
+        return ((oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0)
+             + (antialiasOrder_.load(std::memory_order_relaxed) == 2 ? 1 : 0);
     }
 
     /** @brief Compatibility alias of getLatency(), in prepared-rate samples. */
@@ -1199,9 +1493,10 @@ public:
         w.write("tiltGain", static_cast<float>(p.postFilterTiltGain));
         w.write("outputGain", static_cast<float>(p.outputGain));
         w.write("dcBlocking", p.dcBlocking);
-        w.write("antialias", antialiasShadow_.load(std::memory_order_relaxed));
+        w.write("antialias", antialiasOrder_.load(std::memory_order_relaxed) != 0);
+        w.write("antialiasOrder", antialiasOrder_.load(std::memory_order_relaxed));
         w.write("adaptiveBlend", adaptiveBlend_.load(std::memory_order_relaxed));
-        w.write("slewSens", slewSensitivity_.load(std::memory_order_relaxed));
+        w.write("slewSens", static_cast<float>(slewSensitivity_.load(std::memory_order_relaxed)));
         w.write("oversampling", oversamplingFactor_);
         return w.blob();
     }
@@ -1225,7 +1520,10 @@ public:
                           static_cast<SampleType>(r.read("tiltGain", 0.0f)));
         setOutputGain(static_cast<SampleType>(r.read("outputGain", 0.0f)));
         setDcBlocking(r.read("dcBlocking", true));
-        setAntialiasing(r.read("antialias", false));
+        // "antialiasOrder" (0/1/2) supersedes the older boolean, which
+        // meant first order.
+        setAntialiasing(static_cast<Antialiasing>(
+            r.read("antialiasOrder", r.read("antialias", false) ? 1 : 0)));
         setAdaptiveBlend(r.read("adaptiveBlend", false));
         setSlewSensitivity(static_cast<SampleType>(r.read("slewSens", 0.0f)));
         setOversampling(r.read("oversampling", 1));
@@ -1435,8 +1733,8 @@ protected:
         AudioSpec updateSpec = spec_;
         if (oversamplingFactor_ > 1) updateSpec.sampleRate *= oversamplingFactor_;
 
-        if (primary)   primary->update(driveGainTarget, characterTarget, updateSpec);
-        if (secondary) secondary->update(driveGainTarget, characterTarget, updateSpec);
+        if (primary)   { primary->latchOrder();   primary->update(driveGainTarget, characterTarget, updateSpec); }
+        if (secondary) { secondary->latchOrder(); secondary->update(driveGainTarget, characterTarget, updateSpec); }
 
         SampleType peakInOriginal = SampleType(0);
         for (int ch = 0; ch < nCh; ++ch) {
@@ -1550,6 +1848,54 @@ protected:
         }
     }
 
+    /**
+     * @brief Completes the second-order delay to one base sample.
+     *
+     * The algorithms delay by one processing sample, so a factor-N stage
+     * adds N - 1 more to every saturated channel; the M/S snapshot that is
+     * restored unprocessed is delayed by the full N. Rings hold 16 samples;
+     * @p seed fills them with each channel's first sample (no step from
+     * stale or zero history when the order is switched on).
+     */
+    void alignSecondOrder(AudioBufferView<SampleType> view, int keepChannel, int keepSamples,
+                          int factor, bool seed) noexcept
+    {
+        const int nCh = std::min({view.getNumChannels(), kMaxCh, spec_.numChannels});
+        const int nS = view.getNumSamples();
+        const int pad = std::clamp(factor, 1, kAlignRing) - 1;
+        int pos = alignPos_;
+        if (pad > 0)
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                if (ch == keepChannel) continue;
+                SampleType* d = view.getChannel(ch);
+                auto& ring = alignRing_[static_cast<size_t>(ch)];
+                if (seed && nS > 0) ring.fill(d[0]);
+                pos = alignPos_;
+                for (int i = 0; i < nS; ++i)
+                {
+                    ring[static_cast<size_t>(pos)] = d[i];
+                    d[i] = ring[static_cast<size_t>((pos - pad) & (kAlignRing - 1))];
+                    pos = (pos + 1) & (kAlignRing - 1);
+                }
+            }
+        if (keepChannel >= 0 && keepSamples > 0)
+        {
+            SampleType* d = msKeepBuffer_.getChannel(0);
+            auto& ring = keepRing_;
+            if (seed) ring.fill(d[0]);
+            pos = alignPos_;
+            const int delay = std::clamp(factor, 1, kAlignRing - 1);
+            for (int i = 0; i < keepSamples; ++i)
+            {
+                ring[static_cast<size_t>(pos)] = d[i];
+                d[i] = ring[static_cast<size_t>((pos - delay) & (kAlignRing - 1))];
+                pos = (pos + 1) & (kAlignRing - 1);
+            }
+        }
+        alignPos_ = (alignPos_ + nS) & (kAlignRing - 1);
+    }
+
     /** @brief Program-dependent dry/wet density blend (base rate, L/R domain).
      *  The dry reference is the DryWetMixer capture, which carries the same
      *  latency compensation as the wet path - no comb filtering. */
@@ -1604,6 +1950,27 @@ protected:
         const int nS  = buffer.getNumSamples();
         auto driftView = driftBuffer_.toView();
 
+        if (algo->order() == 2)
+        {
+            // Second order: the curve's kernel where one exists, otherwise
+            // the plain curve delayed by one sample to the same alignment.
+            for (int i = 0; i < nS; ++i)
+            {
+                const SampleType driveGainS = driveRamp_[static_cast<size_t>(i)];
+                const SampleType charS      = charRamp_[static_cast<size_t>(i)];
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    SampleType drift = useDrift ? driftView.getChannel(ch)[i] : SampleType(1);
+                    SampleType* data = buffer.getChannel(ch);
+                    if constexpr (requires { algo->processSecond(data[i], driveGainS, charS, ch); })
+                        data[i] = algo->processSecond(data[i], driveGainS * drift, charS * drift, ch);
+                    else
+                        data[i] = algo->align(algo->processSample(data[i], driveGainS * drift, charS * drift, ch), ch);
+                }
+            }
+            return;
+        }
+
         for (int i = 0; i < nS; ++i)
         {
             const SampleType driveGainS = driveRamp_[static_cast<size_t>(i)];
@@ -1649,7 +2016,7 @@ protected:
     Params             lastParams_;
     mutable SpinLock   paramsLock_;
     std::atomic<bool>  paramsPending_ { false }; // set when a full queue dropped a snapshot
-    std::atomic<bool>  antialiasShadow_ { false };  ///< Mirror for getState.
+    std::atomic<int>   antialiasOrder_ { 0 };      ///< Antialiasing order, mirror for getState.
 
     ProcessingMode procMode_   = ProcessingMode::Stereo;
     OutputMode     outputMode_ = OutputMode::Normal;
@@ -1692,6 +2059,16 @@ protected:
     float lastPreHpFreq_    = -1.0f;
     float lastPostTiltFreq_ = -1.0f;
     float lastPostTiltGain_ = std::numeric_limits<float>::quiet_NaN();
+
+    // Second-order antialiasing alignment (audio thread).
+    static constexpr int kAlignRing = 32;   ///< > largest delay (16 processing samples).
+    bool secondActive_ = false;
+    bool alignFresh_ = true;
+    std::array<std::array<SampleType, kAlignRing>, kMaxCh> alignRing_ {};
+    std::array<SampleType, kAlignRing> keepRing_ {};
+    int alignPos_ = 0;
+    std::array<SampleType, kMaxCh> dryHold_ {};
+    AudioBuffer<SampleType> dryAligned_;
 };
 
 } // namespace dspark

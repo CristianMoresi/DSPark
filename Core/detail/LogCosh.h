@@ -28,6 +28,18 @@ inline double logCosh(double x) noexcept
     return a + std::log1p(std::exp(-2.0 * a)) - 0.6931471805599453;
 }
 
+/** For a >= 1: integralLogCosh(a) - (a^2/2 - a ln 2 + pi^2/24), the
+ *  exponentially small part 0.5 Li2(-e^{-2a}) (|value| < 0.07). The
+ *  dilogarithm series is cut after 16 terms, below 5e-18 at a >= 1. */
+inline double integralLogCoshTail(double a) noexcept
+{
+    const double z = std::exp(-2.0 * a);
+    double li = 1.0 / 256.0;
+    for (int k = 15; k >= 1; --k)
+        li = li * z + (k % 2 == 0 ? 1.0 : -1.0) / (k * k);
+    return 0.5 * (li * z);
+}
+
 /** Integral of log(cosh(x)), with value zero at the origin.
  *  A Chebyshev polynomial handles |x| < 1 without cancellation. The outer
  *  branch integrates the exponentially convergent log1p expansion; its
@@ -53,13 +65,9 @@ inline double integralLogCosh(double x) noexcept
         for (double c : coefficients) p = p * z + c;
         return x * z * p;
     }
-    const double z = std::exp(-2.0 * a);
-    double li = 1.0 / 256.0;
-    for (int k = 15; k >= 1; --k)
-        li = li * z + (k % 2 == 0 ? 1.0 : -1.0) / (k * k);
-    li *= z;
+    // Halving is exact, so this equals 0.5 * (li + pi^2 / 12) bit for bit.
     return std::copysign(0.5 * a * a - a * 0.6931471805599453
-        + 0.5 * (li + 0.8224670334241132), x);
+        + (integralLogCoshTail(a) + 0.4112335167120566), x);
 }
 
 } // namespace dspark::detail

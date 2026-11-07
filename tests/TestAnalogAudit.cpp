@@ -19,6 +19,8 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <complex>
+#include <cstddef>
 #include <limits>
 #include <memory>
 #include <numbers>
@@ -593,4 +595,251 @@ DSPARK_TEST(AnalogAudit_wdf_recovers_after_nonfinite_input)
     double y = 0.0;
     for (int i = 0; i < 1000; ++i) y = stack.processSample(0.1 * std::sin(0.05 * i));
     EXPECT_TRUE(std::isfinite(y));
+}
+
+namespace {
+
+// Runs a mono sine through a double-precision processor in blocks.
+template <class P>
+std::vector<double> runSineDouble(P& p, double fs, int block, size_t total, double f, double amp)
+{
+    std::vector<double> buf(static_cast<size_t>(block)), out;
+    out.reserve(total + static_cast<size_t>(block));
+    long long t = 0;
+    while (out.size() < total)
+    {
+        for (int i = 0; i < block; ++i)
+            buf[static_cast<size_t>(i)] = amp * std::sin(kTwoPi * f * static_cast<double>(t++) / fs);
+        double* ch[1] = { buf.data() };
+        p.processBlock(AudioBufferView<double>(ch, 1, block));
+        out.insert(out.end(), buf.begin(), buf.end());
+    }
+    out.resize(total);
+    return out;
+}
+
+// Worst spur over coherent -6 dBFS tones (7 / 12.75 / 15.25 / 19.25 kHz) after
+// a 0.2 s settle; make(f) builds a prepared processor.
+template <class Make>
+double worstToneSpurDbc(Make make)
+{
+    const double fs = 48000.0;
+    const int n = 16384;
+    double w = -400.0;
+    for (double f : { 7000.0, 12750.0, 15250.0, 19250.0 })
+    {
+        int b = static_cast<int>(std::lround(f / fs * n));
+        if ((b & 1) == 0) ++b;
+        auto p = make();
+        const auto y = runSineDouble(*p, fs, 512, 9600 + n, b * fs / n, 0.5);
+        w = std::max(w, worstSpurDbc(std::vector<double>(y.begin() + 9600, y.end()), b, fs));
+    }
+    return w;
+}
+
+// Gain of a 0.01 tone at f after 0.25 s; the dry and wet paths are aligned
+// exactly when gain(mix 0.5) = (1 + gain(mix 1)) / 2 (the kernels are zero
+// phase about their centre, so a slip would turn that into a comb).
+template <class Make>
+double toneGain(Make make, double f)
+{
+    const double fs = 48000.0;
+    auto p = make();
+    const auto y = runSineDouble(*p, fs, 512, 24000, f, 0.01);
+    return toneAmplitude(y, 12000, 12000, f, fs) / 0.01;
+}
+
+} // namespace
+
+// The Clipper had no antialiasing: hard clipping at 2x and +24 dB aliased at
+// -14.5 dBc (worst over 1-19.25 kHz tones at -6/-18 dBFS). Second-order
+// antiderivative antialiasing reaches -40.5 dBc there; its delay is padded to
+// whole base samples, reported by getLatency() and matched by the dry path.
+DSPARK_TEST(AnalogAudit_clipper_second_order_antialiasing)
+{
+    const auto make = [](bool aa, double mix) {
+        return [aa, mix] {
+            auto c = std::make_unique<Clipper<double>>();
+            c->setMode(Clipper<double>::Mode::Hard);
+            c->setOversampling(2);
+            c->setInputGain(24.0);
+            c->setMix(mix);
+            c->setAntialiasing(aa);
+            c->prepare(spec(48000.0, 512, 1));
+            return c;
+        };
+    };
+    const double off = worstToneSpurDbc(make(false, 1.0));
+    const double on = worstToneSpurDbc(make(true, 1.0));
+    EXPECT_LT(on, -38.0);
+    EXPECT_LT(on, off - 15.0);
+    EXPECT_EQ(make(true, 1.0)()->getLatency(), make(false, 1.0)()->getLatency() + 2);
+    const auto quiet = [](double mix) {
+        return [mix] {
+            auto c = std::make_unique<Clipper<double>>();
+            c->setMode(Clipper<double>::Mode::Hard);
+            c->setOversampling(2);
+            c->setMix(mix);
+            c->setAntialiasing(true);
+            c->prepare(spec(48000.0, 512, 1));
+            return c;
+        };
+    };
+    EXPECT_NEAR(toneGain(quiet(0.5), 15000.0), 0.5 * (1.0 + toneGain(quiet(1.0), 15000.0)), 1e-3);
+}
+
+// Saturation stopped at first-order antialiasing: SoftClip at 2x and +24 dB
+// aliased at -29.7 dBc (-15.2 off). SecondOrder reaches -42.1 dBc, adds one
+// sample that getLatency() reports and the dry path matches.
+DSPARK_TEST(AnalogAudit_saturation_second_order_antialiasing)
+{
+    using Sat = Saturation<double>;
+    const auto make = [](Sat::Antialiasing order, double drive, double mix) {
+        return [order, drive, mix] {
+            auto s = std::make_unique<Sat>();
+            s->setAlgorithm(Sat::Algorithm::SoftClip);
+            s->setDrive(drive);
+            s->setMix(mix);
+            s->setDcBlocking(false);
+            s->setAntialiasing(order);
+            s->prepare(spec(48000.0, 512, 1));
+            return s;
+        };
+    };
+    const double first = worstToneSpurDbc(make(Sat::Antialiasing::FirstOrder, 24.0, 1.0));
+    const double second = worstToneSpurDbc(make(Sat::Antialiasing::SecondOrder, 24.0, 1.0));
+    EXPECT_LT(second, -40.0);
+    EXPECT_LT(second, first - 8.0);
+    EXPECT_EQ(make(Sat::Antialiasing::SecondOrder, 0.0, 1.0)()->getLatency(),
+              make(Sat::Antialiasing::Off, 0.0, 1.0)()->getLatency() + 1);
+    EXPECT_NEAR(toneGain(make(Sat::Antialiasing::SecondOrder, 0.0, 0.5), 15000.0),
+                0.5 * (1.0 + toneGain(make(Sat::Antialiasing::SecondOrder, 0.0, 1.0), 15000.0)), 1e-3);
+}
+
+// The diode-pair and single-diode roots stopped Newton at an absolute 1e-10 V
+// residual, so small signals came back with a large relative error: with a
+// 2.2 k ohm source and the default 1N4148 constants 2.4e-4 (pair) and 1.2e-4
+// (single diode). Both now return the root of the node equation to rounding.
+DSPARK_TEST(AnalogAudit_wdf_diode_roots_are_exact_at_every_drive)
+{
+    using namespace dspark::wdf;
+    const double r = 2200.0, is = 2.52e-9, nvt = 1.752 * 0.02585;
+    const auto exact = [&](double vin, bool pair) {
+        double lo = std::min(0.0, vin), hi = std::max(0.0, vin);
+        const auto f = [&](double v) {
+            return (vin - v) / r - (pair ? 2.0 * is * std::sinh(v / nvt) : is * std::expm1(v / nvt));
+        };
+        for (int i = 0; i < 3000; ++i)
+        {
+            const double m = 0.5 * (lo + hi);
+            if (m <= lo || m >= hi) break;
+            (f(m) > 0.0 ? lo : hi) = m;
+        }
+        return std::abs(f(lo)) < std::abs(f(hi)) ? lo : hi;
+    };
+    ResistiveVoltageSource<double> sourcePair { r }, sourceSingle { r };
+    DiodePairRoot<double, decltype(sourcePair)> pair { sourcePair };
+    DiodeRoot<double, decltype(sourceSingle)> single { sourceSingle };
+    pair.prepare(48000.0);
+    single.prepare(48000.0);
+    double worstPair = 0.0, worstSingle = 0.0;
+    for (double decade = -10.0; decade <= 1.0; decade += 0.01)
+        for (double sign : { 1.0, -1.0 })
+        {
+            const double vin = sign * std::pow(10.0, decade);
+            sourcePair.setVoltage(vin);
+            sourceSingle.setVoltage(vin);
+            pair.process();
+            single.process();
+            const double ep = exact(vin, true), es = exact(vin, false);
+            worstPair = std::max(worstPair, std::abs(pair.getVoltage() - ep) / std::abs(ep));
+            worstSingle = std::max(worstSingle, std::abs(single.getVoltage() - es) / std::abs(es));
+        }
+    EXPECT_LT(worstPair, 1e-12);
+    EXPECT_LT(worstSingle, 1e-12);
+}
+
+// The grid clamp is referenced to ground: it compresses from 0 V although the
+// cathode sits near +1.2 V, so a 1 V source reaches the grid as 0.624 V.
+// GridModel::Conduction drives the grid through 68 k ohm against a grid
+// current of the grid-to-cathode voltage: 0.936 V, the root of the grid node
+// equation; the core keeps its accuracy against the point circuit at 32x.
+DSPARK_TEST(AnalogAudit_tube_grid_conduction_is_cathode_referenced)
+{
+    // Independent solve of w + Rs * Ig(w) = d with the published 12AX7 fit.
+    const auto ig = [](double v) {
+        const double z = 9.901 * v;
+        const double sp = z > 40.0 ? z : std::log1p(std::exp(z));
+        return 6.177e-4 * std::pow(sp / 9.901, 1.314);
+    };
+    const auto root = [&](double d) {
+        double lo = d - 68e3 * ig(d), hi = d;
+        for (int i = 0; i < 200; ++i)
+        {
+            const double m = 0.5 * (lo + hi);
+            (m + 68e3 * ig(m) - d > 0.0 ? hi : lo) = m;
+        }
+        return 0.5 * (lo + hi);
+    };
+    detail::TubePreampGridTable table;
+    double worst = 0.0;
+    for (double d = -3.0; d <= 90.0; d += 1.0 / 512.0)
+        worst = std::max(worst, std::abs(table.eval(d) - root(d)));
+    EXPECT_LT(worst, 1e-7);
+    EXPECT_NEAR(1.2 + table.eval(1.0 - 1.2), 0.9363, 5e-4);
+    EXPECT_NEAR(detail::TubePreampGridClamp::value(1.0), 0.624, 1e-3);
+
+    // Whole circuit: the 2x core against the point circuit at 32x, both with
+    // the conduction model (two stages, +24 dB, 1 kHz).
+    const auto render = [](int factor, double rate) {
+        TubePreamp<double> amp;
+        amp.setGridModel(TubePreamp<double>::GridModel::Conduction);
+        amp.setOversampling(factor);
+        amp.setStages(2);
+        amp.setDrive(24.0);
+        amp.setBass(0.0);
+        amp.setMiddle(1.0);
+        amp.prepare(spec(rate, 4096, 1));
+        const size_t latency = static_cast<size_t>(amp.getLatency());
+        const size_t total = static_cast<size_t>(0.15 * rate) + latency;
+        std::vector<double> y(total);
+        for (size_t i = 0; i < total; ++i)
+            y[i] = 0.25 * std::sin(kTwoPi * 1000.0 * static_cast<double>(i) / rate);
+        for (size_t pos = 0; pos < total; pos += 4096)
+        {
+            double* ch[] = { y.data() + pos };
+            amp.processBlock({ ch, 1, static_cast<int>(std::min<size_t>(4096, total - pos)) });
+        }
+        y.erase(y.begin(), y.begin() + static_cast<std::ptrdiff_t>(latency));
+        return y;
+    };
+    const auto harmonic = [](const std::vector<double>& y, double rate, int h) {
+        const size_t count = static_cast<size_t>(30.0 * rate / 1000.0 + 0.5), from = y.size() - count;
+        std::complex<double> sum = 0.0;
+        for (size_t i = from; i < y.size(); ++i)
+            sum += y[i] * std::polar(1.0, -kTwoPi * h * 1000.0 * static_cast<double>(i - from) / rate);
+        return 2.0 * sum / static_cast<double>(count);
+    };
+    const double referenceRate = 48000.0 * 32.0;
+    const auto reference = render(1, referenceRate);
+    const auto actual = render(2, 48000.0);
+    const auto r1 = harmonic(reference, referenceRate, 1), a1 = harmonic(actual, 48000.0, 1);
+    EXPECT_LT(std::abs(toDb(std::abs(a1) / std::abs(r1))), 0.05);
+    double err = 0.0;
+    for (int h = 2; h <= 20; ++h)
+    {
+        const auto r = harmonic(reference, referenceRate, h) / std::pow(r1 / std::abs(r1), h) / std::abs(r1);
+        const auto a = harmonic(actual, 48000.0, h) / std::pow(a1 / std::abs(a1), h) / std::abs(a1);
+        err = std::max(err, std::abs(a - r));
+    }
+    EXPECT_LT(toDb(err), -70.0);
+
+    // The model is part of the state; blobs without the key restore Clamp.
+    TubePreamp<double> amp;
+    amp.setGridModel(TubePreamp<double>::GridModel::Conduction);
+    const auto blob = amp.getState();
+    TubePreamp<double> restored;
+    EXPECT_TRUE(restored.getGridModel() == TubePreamp<double>::GridModel::Clamp);
+    EXPECT_TRUE(restored.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(restored.getGridModel() == TubePreamp<double>::GridModel::Conduction);
 }

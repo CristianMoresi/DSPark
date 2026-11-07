@@ -10,8 +10,10 @@
  * Implements the classical WDF toolkit (Fettweis 1986): one-port elements
  * (resistor, capacitor, inductor, resistive voltage source), adapted
  * three-port series/parallel connectors, a polarity inverter, and circuit
- * roots -- an ideal voltage source for linear networks and Newton-Raphson
- * nonlinear roots (Shockley diode, antiparallel diode pair).
+ * roots -- an ideal voltage source for linear networks and nonlinear roots
+ * (Shockley diode, antiparallel diode pair) solved in closed form: a Wright
+ * omega estimate plus one exact correction step reaches full double
+ * precision at a fixed cost per sample.
  *
  * Wave convention: voltage waves with a = v + R*i (incident) and
  * b = v - R*i (reflected), so v = (a+b)/2 and i = (a-b)/(2R). Reactances
@@ -69,10 +71,27 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <tuple>
 #include <utility>
+
+// Keeps the cold solver paths (large diode constants, extreme drive) out of
+// the per-sample root, so the hot path inlines into the caller's loop.
+// Locally defined and guarded, as in Core/Biquad.h.
+#ifndef DSPARK_NOINLINE
+  #if defined(_MSC_VER)
+    #define DSPARK_NOINLINE __declspec(noinline)
+  #elif defined(__GNUC__) || defined(__clang__)
+    #define DSPARK_NOINLINE __attribute__((noinline))
+  #else
+    #define DSPARK_NOINLINE
+  #endif
+#endif
 
 namespace dspark {
 namespace wdf {
@@ -451,6 +470,125 @@ template <typename F>
     return v;
 }
 
+/**
+ * @brief Wright omega function omega(z), the solution y of y + ln(y) = z
+ *        (y = W(e^z) with W the principal Lambert W branch).
+ *
+ * Werner et al., "An improved and generalized diode clipper model for wave
+ * digital filters" (AES 2015), write the single-diode root in terms of
+ * omega. This evaluation seeds one exact correction step, so it is tuned
+ * for latency rather than for the last bits:
+ * - z in (-32, 32): degree-4 Taylor expansion about the nearest of 257
+ *   nodes 0.25 apart (exact nodal derivatives), 1.1e-8 worst error relative
+ *   to 1 + omega. The node is found with a round-to-nearest add, without a
+ *   float-to-integer conversion on the critical path.
+ * - z in [32, 2^20): degree-4 Taylor expansion about the midpoint of one
+ *   of 16 cells per octave, indexed by the exponent and leading mantissa
+ *   bits of z, 1.1e-8 relative to 1 + omega.
+ * - beyond: two Newton steps from the asymptote z - ln z; at or below -32:
+ *   0 (omega < 1.3e-14).
+ * The 22 KB of coefficients are computed once per process on first use
+ * (instance()) by a full-precision Newton solve per node. Thread-safe and
+ * allocation free after construction; operator() is a pure function of z.
+ */
+class WrightOmega
+{
+public:
+    [[nodiscard]] static const WrightOmega& instance() noexcept
+    {
+        static const WrightOmega table;
+        return table;
+    }
+
+    [[nodiscard]] double operator()(double z) const noexcept
+    {
+        if (z < kUniformMax)
+        {
+            if (!(z > kUniformMin)) return 0.0;
+            // p + 1.5 * 2^52 rounds p to the nearest integer, which then
+            // sits in the low mantissa bits: no float-to-integer conversion.
+            constexpr double kRound = 6755399441055744.0;
+            const double p = (z - kUniformMin) * kInvStep;
+            const double rounded = p + kRound;
+            const double t = p - (rounded - kRound);        // [-0.5, 0.5]
+            const auto& k = taylor_[static_cast<size_t>(std::bit_cast<std::uint64_t>(rounded) & 0x1FFu)];
+            const double t2 = t * t;
+            return (k[0] + k[1] * t) + t2 * ((k[2] + k[3] * t) + t2 * k[4]);
+        }
+        if (z < kOctaveMax)
+        {
+            // Cell = exponent and top four mantissa bits: 16 equal cells per
+            // octave from 32 upward, each expanded about its midpoint. The
+            // inverse width 2^(4 - e) comes from the exponent bits.
+            const auto bits = std::bit_cast<std::uint64_t>(z);
+            const auto& k = upper_[static_cast<size_t>((bits >> 48) - kFirstCellBits)];
+            const double t = (z - k[5]) * std::bit_cast<double>(kInverseSixteenth - (bits & kExponentMask));
+            const double t2 = t * t;
+            return (k[0] + k[1] * t) + t2 * ((k[2] + k[3] * t) + t2 * k[4]);
+        }
+        return farField(z);
+    }
+
+private:
+    static constexpr double kUniformMin = -32.0, kUniformMax = 32.0, kStep = 0.25, kInvStep = 4.0;
+    static constexpr int kUniformNodes = 257;
+    static constexpr int kOctaves = 15;                           // 32 .. 2^20
+    static constexpr int kUpperCells = 16 * kOctaves;
+    static constexpr double kOctaveMax = 1048576.0;
+    static constexpr std::uint64_t kFirstCellBits = 0x4040u;      // bits(32.0) >> 48
+    static constexpr std::uint64_t kExponentMask = 0x7FF0000000000000ull;
+    static constexpr std::uint64_t kInverseSixteenth = std::uint64_t(2050) << 52; // 2^(4 - e)
+
+    /** Degree-4 Taylor coefficients of omega about z, scaled to a step h. */
+    static std::array<double, 5> expansion(double z, double h) noexcept
+    {
+        const double y = solve(z);
+        // omega' = w/(1+w), omega'' = w/(1+w)^3, omega''' = w(1-2w)/(1+w)^5,
+        // omega'''' = w(1-8w+6w^2)/(1+w)^7.
+        const double u = 1.0 / (1.0 + y), u2 = u * u;
+        const double d1 = y * u, d2 = d1 * u2, d3 = d2 * (1.0 - 2.0 * y) * u2;
+        const double d4 = d1 * (1.0 - 8.0 * y + 6.0 * y * y) * u2 * u2 * u2;
+        return { y, d1 * h, d2 * h * h / 2.0, d3 * h * h * h / 6.0, d4 * h * h * h * h / 24.0 };
+    }
+
+    /** Beyond the tables (z >= 2^20): two Newton steps from z - ln z. */
+    DSPARK_NOINLINE static double farField(double z) noexcept
+    {
+        double y = z - std::log(z);
+        for (int it = 0; it < 2; ++it)
+            y -= (y + std::log(y) - z) * y / (1.0 + y);
+        return y;
+    }
+
+    static double solve(double z) noexcept
+    {
+        double y = z < 1.0 ? std::exp(z) : z - std::log(z);
+        for (int it = 0; it < 64; ++it)
+        {
+            const double step = (y + std::log(y) - z) * y / (1.0 + y);
+            y -= step;
+            if (!(std::abs(step) > 1e-17 * y)) break;
+        }
+        return y;
+    }
+
+    WrightOmega() noexcept
+    {
+        for (int i = 0; i < kUniformNodes; ++i)
+            taylor_[static_cast<size_t>(i)] = expansion(kUniformMin + kStep * i, kStep);
+        for (int c = 0; c < kUpperCells; ++c)
+        {
+            const double width = std::ldexp(1.0, 1 + c / 16);     // 2^e / 16, e = 5 + c/16
+            const double mid = std::ldexp(1.0 + (c % 16) / 16.0, 5 + c / 16) + 0.5 * width;
+            const auto e = expansion(mid, width);
+            upper_[static_cast<size_t>(c)] = { e[0], e[1], e[2], e[3], e[4], mid };
+        }
+    }
+
+    std::array<std::array<double, 5>, kUniformNodes> taylor_ {};
+    std::array<std::array<double, 6>, kUpperCells> upper_ {};   ///< Taylor terms + midpoint.
+};
+
 } // namespace detail
 
 /**
@@ -458,6 +596,22 @@ template <typename F>
  *
  * Shockley model: i(v) = 2 Is sinh(v / (n Vt)). Defaults approximate a
  * 1N4148 (Is = 2.52 nA, n = 1.752, Vt = 25.85 mV).
+ *
+ * Solver: in the normalised form s + c (e^s - e^-s) = |a| / nVt (s = v/nVt,
+ * c = R Is / nVt) each diode alone has the closed-form root
+ * s = A - omega(ln c + A) (Wright omega, Werner et al. 2015). The estimate
+ * s0 = A - omega(ln c + A) + omega(ln c - A) keeps both diodes and is off
+ * by O(c^2) only. One correction step on the exact equation, with one
+ * expm1(), then lands on the root to full double precision: a Newton step
+ * while c <= 1e-4 (the estimate is within 1e-8), a Halley step up to
+ * c = 0.02 (silicon diodes behind up to about 0.35 M ohm), and repeated
+ * Halley steps, until one is below 1e-6 relative, for larger c (germanium,
+ * very large resistances). Measured worst relative error over drives from
+ * 1e-9 to 1e4 nVt: 1.1e-15 for c from 1e-15 to 1e5. The result does not
+ * depend on the previous sample, so the cost is flat: about 33 ns per
+ * sample for an RC clipper on the development machine, against 66-150 ns
+ * for the former seeded, bracketed Newton iteration, whose 1e-10 V stop
+ * also left relative errors up to 2c at low drive.
  */
 template <FloatType T, typename Tree>
 class DiodePairRoot
@@ -465,7 +619,8 @@ class DiodePairRoot
 public:
     explicit DiodePairRoot(Tree& tree, T saturationCurrent = T(2.52e-9),
                            T idealityTimesVt = T(1.752 * 0.02585)) noexcept
-        : tree_(tree), is_(saturationCurrent), nvt_(idealityTimesVt) {}
+        : tree_(tree), is_(saturationCurrent), nvt_(idealityTimesVt),
+          omega_(&detail::WrightOmega::instance()) {}
 
     void setSaturationCurrent(T amps) noexcept { is_ = std::max(amps, T(1e-15)); }
     void setIdealityTimesVt(T volts) noexcept { nvt_ = std::max(volts, T(1e-4)); }
@@ -484,7 +639,7 @@ public:
         const double a = static_cast<double>(tree_.reflected());
         // Non-finite wave (a NaN/Inf source): clear the tree rather than
         // leave it in the capacitor states forever.
-        if (!std::isfinite(a)) [[unlikely]]
+        if (!(std::abs(a) <= kMaxFinite)) [[unlikely]]
         {
             tree_.reset();
             v_ = 0.0;
@@ -492,22 +647,18 @@ public:
         }
         const double k = 2.0 * tree_.portResistance() * static_cast<double>(is_);
         const double nvt = static_cast<double>(nvt_);
+        if (k != kCached_ || nvt != nvtCached_) [[unlikely]]
+            updateConstants(k, nvt);
 
-        // Far-field analytic seed: neglecting the linear term in
-        // v + k sinh(v/nVt) = a gives v0 = nVt asinh(a/k), within ~nVt of the
-        // root at any drive level (deep in the exponential, plain Newton
-        // would crawl at ~nVt per iteration). Newton then converges in 1-3.
-        const double seed = nvt * std::asinh(a / k);
-
-        v_ = detail::solveMonotonic(a, seed, [k, nvt, a](double v, double& f, double& fp)
+        const double x = std::abs(a) * invNvt_;
+        if (x < kClosedFormLimit) [[likely]]
         {
-            // Guard the argument: cosh overflows around |x| > 710 in double,
-            // far outside any solution the bracket allows anyway.
-            const double x = std::clamp(v / nvt, -700.0, 700.0);
-            f  = v + k * std::sinh(x) - a;
-            fp = 1.0 + (k / nvt) * std::cosh(x);
-        });
-
+            const double s = solveNormalised(x);
+            tree_.incident(static_cast<T>(std::copysign(s * (2.0 * nvt), a) - a));
+            v_ = std::copysign(s * nvt, a);
+            return;
+        }
+        v_ = solveFarField(a, k, nvt);
         tree_.incident(static_cast<T>(2.0 * v_ - a));
     }
 
@@ -515,15 +666,98 @@ public:
     [[nodiscard]] T getVoltage() const noexcept { return static_cast<T>(v_); }
 
 private:
+    /// Drives beyond |a| = 1e12 nVt leave the double range of the estimate;
+    /// they take the bracketed Newton path instead.
+    static constexpr double kClosedFormLimit = 1e12;
+    /// NaN and +-Inf fail |a| <= max (a plain compare, cheaper than isfinite).
+    static constexpr double kMaxFinite = std::numeric_limits<double>::max();
+
+    DSPARK_NOINLINE void updateConstants(double k, double nvt) noexcept
+    {
+        kCached_ = k;
+        nvtCached_ = nvt;
+        invNvt_ = 1.0 / nvt;
+        c_ = 0.5 * k * invNvt_;
+        logC_ = std::log(c_);
+        bound_ = 1.0 / (1.0 + 2.0 * c_);
+        cPlus_ = 1.0 + 2.0 * c_;
+        mode_ = c_ <= 1e-4 ? Mode::Newton : (c_ <= 0.02 ? Mode::Halley : Mode::Iterate);
+    }
+
+    /** Root s >= 0 of s + c (e^s - e^-s) = x for x >= 0. */
+    [[nodiscard]] double solveNormalised(double x) const noexcept
+    {
+        const auto& omega = *omega_;
+        // Both diodes' closed forms.
+        const double s = (x + omega(logC_ - x)) - omega(logC_ + x);
+        if (mode_ == Mode::Newton) [[likely]]
+        {
+            // One expm1 and one division. With u = e^s, g and g' share the
+            // factor 1/u, which cancels in the step, and u^2 - 1 = m (2 + m)
+            // keeps small s free of cancellation.
+            const double m = std::expm1(s);
+            const double sh = c_ * (m * (2.0 + m));        // c (u^2 - 1)
+            const double g = (s - x) * (1.0 + m) + sh;     // u g
+            const double g1 = (cPlus_ + m) + sh;           // u g' = u + c (u^2 + 1)
+            return s - g / g1;
+        }
+        return refineHalley(s, x);
+    }
+
+    /** Halley steps (u g'' = c (u^2 - 1) as well), once for c <= 0.02, else
+     *  from inside the bracket [0, x / (1 + 2c)] until a step is below 1e-6
+     *  relative. sinh(s) >= s bounds the root by x / (1 + 2c). */
+    [[nodiscard]] DSPARK_NOINLINE double refineHalley(double s, double x) const noexcept
+    {
+        if (mode_ == Mode::Iterate) s = std::clamp(s, 0.0, x * bound_);
+        for (int it = 0; it < 32; ++it)
+        {
+            const double m = std::expm1(s);
+            const double sh = c_ * (m * (2.0 + m));
+            const double g = (s - x) * (1.0 + m) + sh;
+            const double g1 = (cPlus_ + m) + sh;
+            const double step = (2.0 * g) * g1 / ((2.0 * g1) * g1 - g * sh);
+            s -= step;
+            if (mode_ == Mode::Halley || !(std::abs(step) > 1e-6 * std::abs(s))) break;
+        }
+        return s;
+    }
+
+    /** Bracketed Newton in volts, for drives beyond kClosedFormLimit. */
+    [[nodiscard]] DSPARK_NOINLINE static double solveFarField(double a, double k, double nvt) noexcept
+    {
+        return detail::solveMonotonic(a, nvt * std::asinh(a / k),
+                                      [k, nvt, a](double v, double& f, double& fp)
+        {
+            // cosh overflows around |x| > 710 in double, far outside any
+            // solution the bracket allows anyway.
+            const double x = std::clamp(v / nvt, -700.0, 700.0);
+            f  = v + k * std::sinh(x) - a;
+            fp = 1.0 + (k / nvt) * std::cosh(x);
+        });
+    }
+
     Tree& tree_;
     T is_, nvt_;
+    const detail::WrightOmega* omega_;
     double v_ = 0.0;
+    double kCached_ = -1.0, nvtCached_ = -1.0;
+    enum class Mode { Newton, Halley, Iterate };
+    double invNvt_ = 1.0, c_ = 1.0, logC_ = 0.0, bound_ = 1.0, cPlus_ = 3.0;
+    Mode mode_ = Mode::Iterate;
 };
 
 /**
  * @brief Single Shockley diode root: i(v) = Is (e^{v/(n Vt)} - 1).
  *
  * Conducts for positive v, blocks (down to -Is) for negative v.
+ *
+ * Solver: s + c (e^s - 1) = a / nVt (s = v/nVt, c = R Is / nVt) has the
+ * exact root s = A + c - omega(ln c + A + c) (Werner et al. 2015). One
+ * correction step with one expm1() turns the tabulated omega into the root
+ * to full double precision: Newton while c <= 1e-4, Halley up to c = 10,
+ * repeated Halley steps beyond. Measured worst relative error over drives
+ * of +-1e-9 to 1e4 nVt: 9e-16 for c from 1e-15 to 10, 1.1e-14 up to 1e5.
  */
 template <FloatType T, typename Tree>
 class DiodeRoot
@@ -531,7 +765,8 @@ class DiodeRoot
 public:
     explicit DiodeRoot(Tree& tree, T saturationCurrent = T(2.52e-9),
                        T idealityTimesVt = T(1.752 * 0.02585)) noexcept
-        : tree_(tree), is_(saturationCurrent), nvt_(idealityTimesVt) {}
+        : tree_(tree), is_(saturationCurrent), nvt_(idealityTimesVt),
+          omega_(&detail::WrightOmega::instance()) {}
 
     void setSaturationCurrent(T amps) noexcept { is_ = std::max(amps, T(1e-15)); }
     void setIdealityTimesVt(T volts) noexcept { nvt_ = std::max(volts, T(1e-4)); }
@@ -556,17 +791,49 @@ public:
         }
         const double k = tree_.portResistance() * static_cast<double>(is_);
         const double nvt = static_cast<double>(nvt_);
-
-        // Far-field analytic seed: forward drive lands near
-        // nVt ln(1 + a/k); reverse drive blocks, so the root sits near a.
-        const double seed = (a > 0.0) ? nvt * std::log1p(a / k) : a;
-
-        v_ = detail::solveMonotonic(a, seed, [k, nvt, a](double v, double& f, double& fp)
+        if (k != kCached_ || nvt != nvtCached_) [[unlikely]]
         {
-            const double x = std::clamp(v / nvt, -700.0, 700.0);
-            f  = v + k * std::expm1(x) - a;
-            fp = 1.0 + (k / nvt) * std::exp(x);
-        });
+            kCached_ = k;
+            nvtCached_ = nvt;
+            invNvt_ = 1.0 / nvt;
+            c_ = k * invNvt_;
+            logC_ = std::log(c_);
+            steps_ = c_ <= 1e-4 ? 0 : (c_ <= 10.0 ? 1 : 32);
+        }
+
+        const double x = a * invNvt_;
+        if (std::abs(x) < 1e12) [[likely]]
+        {
+            double s = x + c_ - (*omega_)(logC_ + x + c_);
+            for (int it = 0; it <= steps_; ++it)
+            {
+                const double m = std::expm1(s);
+                const double e = c_ * (1.0 + m);        // c e^s = g' - 1 = g''
+                const double g = (s - x) + c_ * m;
+                const double g1 = 1.0 + e;
+                if (steps_ == 0)
+                {
+                    s -= g / g1;
+                    break;
+                }
+                const double step = (2.0 * g) * g1 / ((2.0 * g1) * g1 - g * e);
+                s -= step;
+                if (steps_ == 1 || !(std::abs(step) > 1e-6 * std::abs(s))) break;
+            }
+            v_ = s * nvt;
+        }
+        else
+        {
+            // Far-field analytic seed: forward drive lands near
+            // nVt ln(1 + a/k); reverse drive blocks, so the root sits near a.
+            const double seed = (a > 0.0) ? nvt * std::log1p(a / k) : a;
+            v_ = detail::solveMonotonic(a, seed, [k, nvt, a](double v, double& f, double& fp)
+            {
+                const double xx = std::clamp(v / nvt, -700.0, 700.0);
+                f  = v + k * std::expm1(xx) - a;
+                fp = 1.0 + (k / nvt) * std::exp(xx);
+            });
+        }
 
         tree_.incident(static_cast<T>(2.0 * v_ - a));
     }
@@ -577,7 +844,11 @@ public:
 private:
     Tree& tree_;
     T is_, nvt_;
+    const detail::WrightOmega* omega_;
     double v_ = 0.0;
+    double kCached_ = -1.0, nvtCached_ = -1.0;
+    double invNvt_ = 1.0, c_ = 1.0, logC_ = 0.0;
+    int steps_ = 1;   ///< 0: one Newton step, 1: one Halley step, else Halley until converged.
 };
 
 // ============================================================================

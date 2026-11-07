@@ -32,6 +32,30 @@ All notable user-facing changes to DSPark are documented here.
   ignores the flag releases the voice as before. The synth example fades a
   choked voice in 1 ms: frames 128-511 of the choke block carried 53% of a
   held block's energy (its 150 ms release) and now carry none.
+- `Clipper::setAntialiasing(bool)`: second-order antiderivative
+  antialiasing (Bilbao, Esqueda, Parker and Valimaki 2017) for every mode,
+  with exact closed forms where the curve has kinks. Hard clipping at 2x and
+  +24 dB drive: worst alias over 1-19.25 kHz tones at -6/-18 dBFS -40.5 dBc
+  against -14.5 off (4x: -60.6 against -21.0). The delay is padded to
+  ceil(4 / factor) base samples for any stage count; getLatency() reports it
+  and the dry path matches. Off by default; the default output is unchanged.
+- `Saturation::Antialiasing::SecondOrder` (`setAntialiasing(Antialiasing)`):
+  second-order kernels for SoftClip, Tube, HardClip, Wavefolder, Transformer
+  and the MultiStage tube stage; the other algorithms are delayed to the same
+  one-sample alignment. At the default 2x and +24 dB drive SoftClip reaches
+  -42.1 dBc against -29.7 for first order and -15.2 off, Transformer -43.2
+  against -15.7. Adds one sample of latency (reported, dry path aligned);
+  -1.3 dB at 10 kHz and -5.9 dB at 20 kHz at 2x. State key "antialiasOrder"
+  (the boolean "antialias" is still written and read). Off by default; the
+  Off and FirstOrder outputs are bit-identical to before.
+- `TubePreamp::setGridModel(GridModel::Conduction)`: grid current of the
+  grid-to-cathode voltage (12AX7 fit of Dempwolf and Zoelzer, DAFx-11)
+  through a 68 k ohm source, added to the cathode current. A 1 V source at
+  rest reaches the grid at 0.936 V instead of the 0.624 V of the
+  ground-referenced clamp. At 2x, one stage, 1 kHz at -6 dBFS and +12 dB
+  drive the output differs from the clamp by -10.4 dB (second harmonic
+  -33.9 against -15.0 dBc). Setup thread, re-runs the calibration; state key
+  "gridModel". The Clamp default is bit-identical to before.
 - Run-time AVX2 dispatch: x86-64 builds for the generic baseline also compile
   AVX2+FMA copies of the vector kernels (the FFT passes, `firCorrelate`,
   `dotProduct`, `complexMulAccum`) and select them on CPUs that support them.
@@ -146,6 +170,13 @@ All notable user-facing changes to DSPark are documented here.
   effect uses Chase.
 - `DspMath`: each fast approximation documents its measured error bound,
   range and speed; no code change.
+- `wdf::DiodePairRoot` and `wdf::DiodeRoot` return the root of the diode
+  node equation to rounding at every drive. Newton stopped at an absolute
+  residual of 1e-10 V, so small signals came back with up to 2.4e-4 relative
+  error (2.2 k ohm source, 1N4148). A table-seeded Wright-omega estimate,
+  corrected by a Newton or Halley step, replaces it: 31.6 ns per sample at
+  8 V peak (148 before), 29.7 ns at 0.01 V (64 before), error -313 dB re
+  peak (-191 to -216 before). Output moves by at most that former error.
 - `OfflineSoftClipper<float>`: the analysis padding is sized for a 1e-9
   omitted tail instead of 1e-10 (`kTailTolerance`). The output differs by at
   most 3 ulp, at -149 dB re peak, and Sine/Tanh renders run 2.2x faster on
@@ -258,6 +289,8 @@ All notable user-facing changes to DSPark are documented here.
   slice (silence), a new rate halved the reported latency (64 samples
   reported as 0.67 ms instead of 1.33 ms) and a new width reached
   `processBlock` unprepared. Re-applying the current value still succeeds.
+- `Saturation<double>::getState()` compiles: the slew sensitivity is written
+  as float like every other parameter (the double overload was ambiguous).
 - `StereoGenerator`: a silent tail reaches exact zero. The band, color and
   DC recursions settled into a subnormal limit cycle near 1e-321 after the
   input stopped, so the output never returned to digital silence and the

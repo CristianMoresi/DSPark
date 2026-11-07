@@ -202,6 +202,10 @@ inline EffectSlot makeLadderFilter()
     // Mode order MUST match dspark::LadderFilter<float>::Mode enum.
     // Enum: LP6=0, LP12=1, LP18=2, LP24=3, BP12=4, HP24=5
     s.addChoice("Mode", {"LP6","LP12","LP18","LP24","BP12","HP24"}, 3);  // Default LP24 (Moog-style)
+    // A/B: Feedback (default) saturates only the resonance loop; Stages
+    // saturates every stage (opt-in, solved per sample). Order MUST match
+    // dspark::LadderFilter<float>::Saturation (Feedback=0, Stages=1).
+    s.addChoice("Saturation", {"Feedback","Stages"}, 0);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -212,6 +216,7 @@ inline EffectSlot makeLadderFilter()
             // Slider is labelled in dB; the setter takes a linear multiplier.
             case 2: p->setDrive(std::pow(10.0f, v / 20.0f)); break;
             case 3: p->setMode(static_cast<typename dspark::LadderFilter<float>::Mode>(static_cast<int>(v))); break;
+            case 4: p->setSaturation(static_cast<typename dspark::LadderFilter<float>::Saturation>(static_cast<int>(v))); break;
         }
     };
     return s;
@@ -286,6 +291,11 @@ inline EffectSlot makeCompressor()
     s.addChoice("Character", {"Clean","Opto","FET","Varimu"}, 0);
     // Harmonic signature of the character (FET: 1176-calibrated 2nd order).
     s.addSlider("Color", 0, 1, 0, "");
+    // Order MUST match dspark::Compressor::Topology (FeedForward=0, FeedBack=1).
+    s.addChoice("Topology", {"FeedForward","FeedBack"}, 0);              // index 11
+    // A/B: Branching (default) or Decoupled (opt-in) clean ballistics. Order
+    // MUST match dspark::Compressor::CleanBallistics (Branching=0, Decoupled=1).
+    s.addChoice("Clean Ballistics", {"Branching","Decoupled"}, 0);       // index 12
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -302,6 +312,8 @@ inline EffectSlot makeCompressor()
             case 8: p->setDetector(static_cast<dspark::Compressor<float>::DetectorType>(static_cast<int>(v))); break;
             case 9: p->setCharacter(static_cast<dspark::Compressor<float>::Character>(static_cast<int>(v))); break;
             case 10: p->setCharacterColor(v); break;
+            case 11: p->setTopology(static_cast<dspark::Compressor<float>::Topology>(static_cast<int>(v))); break;
+            case 12: p->setCleanBallistics(static_cast<dspark::Compressor<float>::CleanBallistics>(static_cast<int>(v))); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -484,6 +496,9 @@ inline EffectSlot makeSaturation()
     s.addToggle("Adaptive Blend", false);
     s.addSlider("Slew Sensitivity", 0, 1, 0, "");
     s.addChoice("Oversampling", {"Off","2x","4x","8x","16x"}, 1);  // index 6
+    // A/B: antiderivative antialiasing. Order MUST match
+    // dspark::Saturation<float>::Antialiasing (Off=0, FirstOrder=1, SecondOrder=2).
+    s.addChoice("Antialiasing", {"Off","1st order","2nd order"}, 0); // index 7
     s.prepareFn = [p, osApplied](auto& sp) {
         p->setOversampling(osApplied->load(std::memory_order_relaxed));
         p->prepare(sp);
@@ -506,6 +521,7 @@ inline EffectSlot makeSaturation()
             case 4: p->setAdaptiveBlend(v > 0.5f); break;
             case 5: p->setSlewSensitivity(v); break;
             case 6: { static constexpr int f[] = {1,2,4,8,16}; osWanted->store(f[std::clamp(static_cast<int>(v),0,4)], std::memory_order_relaxed); break; }
+            case 7: p->setAntialiasing(static_cast<dspark::Saturation<float>::Antialiasing>(static_cast<int>(v))); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -530,6 +546,9 @@ inline EffectSlot makeClipper()
     s.addSlider("Mix", 0, 1, 1, "");
     s.addSlider("Slew Limit", 0, 1, 0, "");
     s.addChoice("Oversampling", {"Off","2x","4x","8x","16x"}, 0);
+    // A/B: second-order antiderivative antialiasing (opt-in; adds a few
+    // samples of latency, matched on the dry path).
+    s.addToggle("Antialiasing (2nd order)", false);                  // index 7
     s.prepareFn = [p, spec, osWanted, osApplied](auto& sp) {
         *spec = sp;
         p->setOversampling(osWanted->load(std::memory_order_relaxed));
@@ -555,6 +574,7 @@ inline EffectSlot makeClipper()
             case 4: p->setMix(v); break;
             case 5: p->setSlewLimit(v); break;
             case 6: { static constexpr int f[] = {1,2,4,8,16}; osWanted->store(f[std::clamp(static_cast<int>(v),0,4)], std::memory_order_relaxed); break; }
+            case 7: p->setAntialiasing(v > 0.5f); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -1044,6 +1064,8 @@ inline EffectSlot makeMultibandCompressor()
     s.addSlider("High Ratio", 1, 20, 3, ":1");             // 7
     s.addSlider("Attack", 0.1f, 100, 10, "ms");            // 8
     s.addSlider("Release", 10, 1000, 120, "ms");           // 9
+    // Order MUST match CrossoverFilter::FilterMode (MinimumPhase=0, LinearPhase=1).
+    s.addChoice("Crossover", {"Minimum phase","Linear phase"}, 0); // 10
     s.prepareFn = [p](auto& sp) {
         p->prepare(sp);
         p->setNumBands(3);
@@ -1064,6 +1086,7 @@ inline EffectSlot makeMultibandCompressor()
             case 7: p->setBandRatio(2, v); break;
             case 8: for (int b = 0; b < 3; ++b) p->setBandAttack(b, v); break;
             case 9: for (int b = 0; b < 3; ++b) p->setBandRelease(b, v); break;
+            case 10: p->setCrossoverMode(static_cast<typename dspark::CrossoverFilter<float, 12>::FilterMode>(static_cast<int>(v))); break;
         }
     };
     s.gainReductionDbFn = [p]() {
@@ -1195,7 +1218,13 @@ inline EffectSlot makeTapeMachine()
 
 inline EffectSlot makeTubePreamp()
 {
-    auto p = std::make_shared<dspark::TubePreamp<float>>();
+    using TP = dspark::TubePreamp<float>;
+    auto p = std::make_shared<TP>();
+    // setGridModel() is a setup call (it rebuilds the circuits and re-runs the
+    // calibration), so the UI only records the wish and the audio thread
+    // applies it between blocks, where nothing else touches the processor.
+    auto gridWanted  = std::make_shared<std::atomic<int>>(0);
+    auto gridApplied = std::make_shared<std::atomic<int>>(0);
     EffectSlot s;
     s.name = "Tube Preamp"; s.category = "Analog";
     s.addSlider("Drive", -12, 36, 0, "dB");
@@ -1206,10 +1235,25 @@ inline EffectSlot makeTubePreamp()
     s.addSlider("Sag", 0, 1, 0.3f, "");
     s.addSlider("Output", -24, 12, 0, "dB");
     s.addSlider("Mix", 0, 1, 1, "");
-    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
-    s.processFn = [p](auto b) { p->processBlock(b); };
+    // A/B: Clamp (default) or Conduction (opt-in) grid model. Order MUST
+    // match dspark::TubePreamp<float>::GridModel (Clamp=0, Conduction=1).
+    s.addChoice("Grid Model", {"Clamp","Conduction"}, 0);            // index 8
+    s.prepareFn = [p, gridWanted, gridApplied](auto& sp) {
+        const int want = gridWanted->load(std::memory_order_relaxed);
+        p->setGridModel(static_cast<TP::GridModel>(want));
+        gridApplied->store(want, std::memory_order_relaxed);
+        p->prepare(sp);
+    };
+    s.processFn = [p, gridWanted, gridApplied](auto b) {
+        const int want = gridWanted->load(std::memory_order_relaxed);
+        if (want != gridApplied->load(std::memory_order_relaxed)) {
+            p->setGridModel(static_cast<TP::GridModel>(want));   // setup call - safe here (audio thread)
+            gridApplied->store(want, std::memory_order_relaxed);
+        }
+        p->processBlock(b);
+    };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p](int i, float v) {
+    s.setParamFn = [p, gridWanted](int i, float v) {
         switch (i) {
             case 0: p->setDrive(v); break;
             case 1: p->setStages(static_cast<int>(v) + 1); break;
@@ -1219,6 +1263,7 @@ inline EffectSlot makeTubePreamp()
             case 5: p->setSag(v); break;
             case 6: p->setOutput(v); break;
             case 7: p->setMix(v); break;
+            case 8: gridWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
         }
     };
     return s;
@@ -1293,6 +1338,42 @@ inline EffectSlot makePitchShifter()
             case 2: p->setTransientPreserve(v > 0.5f); break;
             case 3: p->setFormantPreserve(v > 0.5f); break;
             case 4: p->setQuality(static_cast<PS::Quality>(static_cast<int>(v))); break;
+        }
+    };
+    return s;
+}
+
+inline EffectSlot makePitchCorrector()
+{
+    using PC = dspark::PitchCorrector<float>;
+    auto p = std::make_shared<PC>();
+    // Root and scale travel to setScale() together, so both are kept here.
+    auto root  = std::make_shared<std::atomic<int>>(0);
+    auto scale = std::make_shared<std::atomic<int>>(0);
+    EffectSlot s;
+    s.name = "Pitch Corrector"; s.category = "Pitch";
+    s.addChoice("Root", {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"}, 0); // 0
+    s.addChoice("Scale", {"Chromatic","Major","Natural minor"}, 0);                 // 1
+    s.addSlider("Retune Speed", 0, 400, 0, "ms");                                    // 2 (0 = hard snap)
+    s.addToggle("Formant Preserve", false);                                          // 3
+    // A/B: the low-latency engine (opt-in; 1024 samples instead of 4096 at
+    // 48 kHz, no formant preservation). A switch restarts the stream.
+    s.addToggle("Low Latency", false);                                               // 4
+    const auto applyScale = [p, root, scale]() {
+        static constexpr std::uint16_t masks[] = { 0x0FFF, 0x0AB5, 0x05AD };   // bit k = k semitones above the root
+        p->setScale(masks[std::clamp(scale->load(std::memory_order_relaxed), 0, 2)],
+                    root->load(std::memory_order_relaxed));
+    };
+    s.prepareFn = [p, applyScale](auto& sp) { p->prepare(sp); applyScale(); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p, root, scale, applyScale](int i, float v) {
+        switch (i) {
+            case 0: root->store(static_cast<int>(v), std::memory_order_relaxed); applyScale(); break;
+            case 1: scale->store(static_cast<int>(v), std::memory_order_relaxed); applyScale(); break;
+            case 2: p->setRetuneSpeedMs(v); break;
+            case 3: p->setFormantPreserve(v > 0.5f); break;
+            case 4: p->setLowLatency(v > 0.5f); break;
         }
     };
     return s;
@@ -1377,6 +1458,7 @@ inline std::vector<EffectSlot> createAllEffects()
         makeTransformerModel(),
         // Pitch and texture
         makePitchShifter(),
+        makePitchCorrector(),
         makeGranularProcessor(),
         // Modulation
         makeChorus(),

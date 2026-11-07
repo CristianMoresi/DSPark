@@ -573,8 +573,15 @@ DSPARK_TEST(CoreReg_biquad_channel_pair_runs_in_lock_step)
     std::vector<float> l(4096, 0.1f), r(4096, 0.1f);
     float* p2[2] = { l.data(), r.data() };
     float* p1[1] = { l.data() };
-    const double stereo = minNanoseconds([&] { for (int k = 0; k < 20; ++k) q.processBlock(AudioBufferView<float>(p2, 2, 4096)); });
-    const double mono = minNanoseconds([&] { for (int k = 0; k < 20; ++k) q.processBlock(AudioBufferView<float>(p1, 1, 4096)); });
+    // Rounds alternate, so a burst of load on a shared runner reaches both
+    // forms alike instead of one whole measurement (x86: 1.05x locally,
+    // 1.55x once on a busy runner when stereo ran before mono).
+    double stereo = 1e30, mono = 1e30;
+    for (int round = 0; round < 15; ++round)
+    {
+        stereo = std::min(stereo, minNanoseconds([&] { for (int k = 0; k < 20; ++k) q.processBlock(AudioBufferView<float>(p2, 2, 4096)); }, 1));
+        mono = std::min(mono, minNanoseconds([&] { for (int k = 0; k < 20; ++k) q.processBlock(AudioBufferView<float>(p1, 1, 4096)); }, 1));
+    }
     gRegSink = l[7];
     EXPECT_LT(stereo, 1.5 * mono);                // old: about 2.0x
     }

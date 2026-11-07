@@ -257,7 +257,7 @@ template <FloatType T>
  * overshoots the unit circle in double. Maximum absolute error is 3.73e-9 in
  * double (about -168 dB) and float-rounding-limited (1.8e-7, about -135 dB)
  * in float: a pure sine rendered with it is cleaner than a 24-bit converter.
- * Speed is close to the platform libm: 0.9-1.2x std::sin/std::cos in
+ * Speed is close to the platform libm: 0.9-1.2x `std::sin` or `std::cos` in
  * throughput on MSVC x64; its value is the bounded, reproducible error on
  * every platform. The input is range-reduced internally (two-term
  * Cody-Waite). Measured error by argument range: double stays at 3.73e-9 up

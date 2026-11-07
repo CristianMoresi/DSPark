@@ -173,8 +173,13 @@ inline T sampleGatherReduce(const T* lane) noexcept
  * @brief Unit-scale gather of C (1 or 2) channels: the weights are the rows r0
  *        and r1 blended by g, tap by tap, and each channel's sum is formed in
  *        the order of kSampleGatherLanes.
- * @param x0, x1 The channels' samples, `taps` each (x1 unused for C = 1).
- * @param out    One sum per channel.
+ * @param r0   First weight row, `taps` coefficients.
+ * @param r1   Second weight row, `taps` coefficients.
+ * @param g    Blend from r0 toward r1: the weight is r0 + g * (r1 - r0).
+ * @param x0   First channel's samples, `taps` of them.
+ * @param x1   Second channel's samples, `taps` of them (unused for C = 1).
+ * @param taps Kernel length, a multiple of kSampleGatherLanes.
+ * @param out  One sum per channel.
  */
 template <int C, FloatType T>
 inline void sampleGatherNarrow(const T* r0, const T* r1, T g, const T* x0, const T* x1,

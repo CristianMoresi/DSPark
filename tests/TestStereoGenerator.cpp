@@ -681,3 +681,127 @@ DSPARK_TEST(StereoGenerator_source_rate_color_matches_separate_fir_formulation)
     EXPECT_GT(peak, 1e-3);
     EXPECT_LT(worst, 1e-13);
 }
+
+namespace
+{
+// Independent moments of a knee curve over a reconstructed interval: the
+// interval is split at every knee crossing (dense scan plus bisection), and
+// each smooth piece is graded geometrically toward both ends (sub-pieces of
+// relative length 2^-k), with a 16-point Gauss rule on every sub-piece. No
+// adaptive error estimate and no closed-form pole term.
+template <detail::ClipperCurve C>
+std::array<double, 8> denseKneeMoments(const std::array<double, 8> &power, double ceiling)
+{
+    const auto value = [&](long double t) {
+        long double v = power[7];
+        for (int i = 6; i >= 0; --i) v = v * t + power[size_t(i)];
+        return static_cast<double>(v);
+    };
+    const auto limits = detail::clipperLinearLimits<C>(ceiling);
+    const auto region = [&](double x) { return x < limits[0] ? -1 : x > limits[1] ? 1 : 0; };
+    std::vector<double> edges{0.};
+    constexpr int scan = 4096;
+    for (int i = 0; i < scan; ++i)
+    {
+        double a = double(i) / scan, b = double(i + 1) / scan;
+        if (region(value(a)) == region(value(b))) continue;
+        const int left = region(value(a));
+        for (int it = 0; it < 80; ++it)
+        {
+            const double m = .5 * (a + b);
+            (region(value(m)) == left ? a : b) = m;
+        }
+        edges.push_back(.5 * (a + b));
+    }
+    edges.push_back(1.);
+    // 16-point Gauss-Legendre on [0, 1].
+    std::array<double, 16> nodes{}, weights{};
+    for (int i = 0; i < 8; ++i)
+    {
+        double x = std::cos(pi<double> * (i + .75) / 16.5), dp = 0;
+        for (int it = 0; it < 40; ++it)
+        {
+            double p0 = 1, p1 = x;
+            for (int j = 2; j <= 16; ++j) { const double p = ((2 * j - 1) * x * p1 - (j - 1) * p0) / j; p0 = p1; p1 = p; }
+            dp = 16 * (x * p1 - p0) / (x * x - 1);
+            x -= p1 / dp;
+        }
+        nodes[size_t(i)] = (1 - x) / 2; nodes[size_t(15 - i)] = (1 + x) / 2;
+        weights[size_t(i)] = weights[size_t(15 - i)] = 1 / ((1 - x * x) * dp * dp);
+    }
+    std::array<long double, 8> sum{};
+    const auto integrate = [&](double a, double b) {
+        for (int i = 0; i < 16; ++i)
+        {
+            const double t = a + (b - a) * nodes[size_t(i)];
+            long double v = (b - a) * weights[size_t(i)] * detail::clipperShape<C>(value(t), ceiling);
+            for (int j = 0; j < 8; ++j) { sum[size_t(j)] += v; v *= t; }
+        }
+    };
+    for (size_t e = 0; e + 1 < edges.size(); ++e)
+    {
+        const double a = edges[e], b = edges[e + 1], mid = .5 * (a + b);
+        for (int k = 1; k <= 48; ++k)
+        {
+            const double inner = std::ldexp(.5 * (b - a), -k), outer = std::ldexp(.5 * (b - a), 1 - k);
+            integrate(a + inner, a + outer);
+            integrate(b - outer, b - inner);
+        }
+        integrate(a, a + std::ldexp(.5 * (b - a), -48));
+        integrate(b - std::ldexp(.5 * (b - a), -48), b);
+        (void)mid;
+    }
+    std::array<double, 8> out{};
+    for (int j = 0; j < 8; ++j) out[size_t(j)] = static_cast<double>(sum[size_t(j)]);
+    return out;
+}
+} // namespace
+
+DSPARK_TEST(StereoGenerator_knee_moments_match_a_graded_dense_reference)
+{
+    // The 1x color integrates eight moments of both knee curves over each
+    // reconstructed interval. Beyond the knee the curve has a pole just
+    // outside a segment that starts at the knee crossing; its simple-pole part
+    // is integrated in closed form and the smooth remainder by the shared
+    // rules (3.2x less integration time at +6 dB, same tolerance). Loud
+    // reconstructed noise, both curves, against a geometrically graded
+    // 16-point reference: every moment within 2e-13.
+    namespace sc = detail::stereo_color_coefficients;
+    std::array<FIRFilter<double>, sc::powers> bank;
+    for (int k = 0; k < sc::powers; ++k)
+    {
+        bank[size_t(k)].prepare(257, 1);
+        bank[size_t(k)].setCoefficients(sc::reconstruction[size_t(k)]);
+    }
+    const detail::continuous_clip::Interval<detail::ClipperCurve::AsymmetricKnee, 7, false, false, 8> tube(.08);
+    const detail::continuous_clip::Interval<detail::ClipperCurve::SymmetricKnee, 7, false, false, 8> tape(.08);
+    uint32_t rng = 0x5eed1u;
+    std::array<std::vector<double>, sc::powers> power;
+    for (auto &p : power) p.assign(512, 0.);
+    std::vector<double> x(512);
+    for (auto &v : x)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        v = .8 * (((rng >> 8) * (1.0 / 16777216.0)) - .5);
+    }
+    for (int k = 0; k < sc::powers; ++k)
+    {
+        power[size_t(k)] = x;
+        double *ch[]{power[size_t(k)].data()};
+        bank[size_t(k)].processBlock({ch, 1, 512});
+    }
+    double worst = 0;
+    int beyond = 0;
+    for (int i = 300; i < 512; ++i)
+    {
+        std::array<double, 8> p{};
+        for (int k = 0; k < sc::powers; ++k) p[size_t(k)] = power[size_t(k)][size_t(i)];
+        const auto a = tube.polynomial(p), ra = denseKneeMoments<detail::ClipperCurve::AsymmetricKnee>(p, .08);
+        const auto b = tape.polynomial(p), rb = denseKneeMoments<detail::ClipperCurve::SymmetricKnee>(p, .08);
+        for (int j = 0; j < 8; ++j)
+            worst = std::max({worst, std::abs(a[size_t(j)] - ra[size_t(j)]), std::abs(b[size_t(j)] - rb[size_t(j)])});
+        beyond += std::abs(p[0]) > .08;
+    }
+    EXPECT_GT(beyond, 100);
+    EXPECT_LT(worst, 2e-13);
+}

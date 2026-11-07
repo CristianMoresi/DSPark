@@ -474,14 +474,8 @@ template <FloatType T, bool Soft> class OfflineClipProcessor
                 cached.emplace(source, spec, state.fingerprint, state.inputPeak, job, options,
                                UnityControl{});
                 const int order = report.oversamplingFactor <= 2 ? 18 : 10;
-                // All temporary inverseBoxPower vector requests, before construction,
-                // plus the banded factor-1 compensation (NativeResidualBand).
-                const int band = report.oversamplingFactor == 1
-                                     ? offline_clip::NativeResidualBand::half
-                                     : 0;
-                job.charge(static_cast<std::size_t>(
-                               6 * (order + 1) + (order + 3) * (2 * order + 1) +
-                               (band ? (2 * band + 1) + 2 * (order + band) + 1 : 0)) *
+                // All temporary inverseBoxPower vector requests, before construction.
+                job.charge(static_cast<std::size_t>(6 * (order + 1) + (order + 3) * (2 * order + 1)) *
                            sizeof(double));
                 policy.emplace(report.oversamplingFactor);
             }

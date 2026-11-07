@@ -766,6 +766,39 @@ DSPARK_TEST(Ladder_stages_block_matches_per_sample_and_state_round_trips)
     EXPECT_TRUE(restored.getSaturation() == L::Saturation::Feedback);
 }
 
+DSPARK_TEST(Ladder_stages_either_start_reaches_the_converged_solution)
+{
+    // Below kLadderStagesStateStartGain Newton starts at the integrator
+    // states (56 instead of 74 ns per sample at 1 kHz, drive 3), above it at
+    // the fixed-pivot solve. Either way the step lands on the solution a
+    // deeply converged solve (tolerance 1e-14 knee widths) reaches, here on
+    // loud noise on both sides of the switch, with and without resonance.
+    for (double fc : { 300.0, 2200.0, 2300.0, 9000.0 })
+        for (double res : { 0.0, 0.9, 1.1 })
+            for (double drive : { 1.0, 4.0 })
+            {
+                const double g = std::tan(pi<double> * fc / 48000.0);
+                const auto c = detail::makeLadderStageCoeffs(g, res, drive);
+                auto deep = c;
+                deep.tol = 1e-14;
+                std::array<double, 4> z{}, zDeep{};
+                uint32_t rng = 0xC0FFEEu;
+                double worst = 0;
+                for (int i = 0; i < 2000; ++i)
+                {
+                    rng = rng * 1664525u + 1013904223u;
+                    const double x = 1.6 * (((rng >> 8) * (1.0 / 16777216.0)) - 0.5);
+                    const double y = detail::ladderStepStages<detail::LadderTap::LP24>(x, z, c);
+                    const double yDeep = detail::ladderStepStages<detail::LadderTap::LP24>(x, zDeep, deep);
+                    worst = std::max(worst, std::abs(y - yDeep) * drive);
+                    zDeep = z;   // same states for the next sample
+                }
+                EXPECT_LT(worst, 1e-11);
+            }
+    EXPECT_GT(detail::kLadderStagesStateStartGain, std::tan(pi<double> * 2200.0 / 48000.0));
+    EXPECT_LT(detail::kLadderStagesStateStartGain, std::tan(pi<double> * 2300.0 / 48000.0));
+}
+
 // ============================================================================
 // StateVariableFilter - analytic exactness and robustness
 // ============================================================================

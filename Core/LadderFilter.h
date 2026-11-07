@@ -311,9 +311,10 @@ public:
      *
      * Feedback (the default) keeps the stages linear. Stages saturates every
      * stage and solves the loop implicitly: a clipped Newton iteration in
-     * double, 1.8 steps on average and at most 10 measured (cap 16). It costs
-     * 52 to 103 ns per sample and channel against 10 to 19 ns for Feedback
-     * (MSVC x64, float), rising with cutoff and drive. The integrator state
+     * double, 2.1 steps on average and at most 8 measured (cap 16). It costs
+     * 53 to 104 ns per sample and channel against 10 to 19 ns for Feedback
+     * (MSVC x64, float), rising with cutoff and drive: 56 ns at a 1 kHz
+     * cutoff with drive 3, 104 ns at 15 kHz. The integrator state
      * carries over a switch. Out-of-range values (a wild
      * cast or a corrupt state blob) select Feedback.
      *

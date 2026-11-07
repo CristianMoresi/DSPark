@@ -99,17 +99,26 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
         for (int i = 0; i < MomentCount; ++i)
             a[i] += b[i];
     }
+    // A simple real pole of the curve, at t = at outside the integration
+    // interval, with residue weight: weight / (t - at) is subtracted from the
+    // integrand (and integrated analytically by the caller). Weight 0: none.
+    struct Pole
+    {
+        double at = 0, weight = 0;
+    };
     template <int N>
     Moments quadrature(const Poly &p, double a, double b, const Gauss<N> &q, bool fixed = false,
-                       double fixedValue = 0) const
+                       double fixedValue = 0, Pole pole = {}) const
     {
         Moments out{};
         for (int i = 0; i < N; ++i)
         {
             const double t = a + (b - a) * q.nodes[i], x = value(p, t);
             const double reference = SubtractLinear ? referenceSlope * x : 0.;
-            double v = (b - a) * q.weights[i] *
-                       (fixed ? fixedValue - reference : clipperShape<C>(x, ceiling_) - reference);
+            double f = fixed ? fixedValue - reference : clipperShape<C>(x, ceiling_) - reference;
+            if (pole.weight != 0)
+                f -= pole.weight / (t - pole.at);
+            double v = (b - a) * q.weights[i] * f;
             for (int j = 0; j < MomentCount; ++j)
             {
                 out[j] += v;
@@ -157,12 +166,12 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
         }
         return result;
     }
-    Moments adaptive(const Poly &p, double a, double b, int depth = 0) const
+    Moments adaptive(const Poly &p, double a, double b, int depth = 0, Pole pole = {}) const
     {
         const auto estimates = [&] {
             if constexpr (C == Curve::Tanh) return tanhQuadrature(p, a, b);
-            else return std::array<Moments, 2>{quadrature(p, a, b, linearQuadrature_),
-                                             quadrature(p, a, b, nonlinearQuadrature_)};
+            else return std::array<Moments, 2>{quadrature(p, a, b, linearQuadrature_, false, 0, pole),
+                                             quadrature(p, a, b, nonlinearQuadrature_, false, 0, pole)};
         }();
         const auto &coarse = estimates[0], &fine = estimates[1];
         const double scale =
@@ -175,8 +184,8 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
             return fine;
         if (depth >= 24)
             return {std::numeric_limits<double>::quiet_NaN()};
-        auto out = adaptive(p, a, (a + b) / 2, depth + 1);
-        add(out, adaptive(p, (a + b) / 2, b, depth + 1));
+        auto out = adaptive(p, a, (a + b) / 2, depth + 1, pole);
+        add(out, adaptive(p, (a + b) / 2, b, depth + 1, pole));
         return out;
     }
     Moments linearMoments(const Poly &p, double a, double b) const
@@ -202,6 +211,73 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
             }
         }
         return quadrature(p, a, b, linearQuadrature_);
+    }
+    // A rational knee beyond its knee is sign (c - R^2 / q(t)), with R = c - k
+    // and q = sign p - (2k - c): the curve has a pole where q vanishes. A
+    // segment that starts at a knee crossing has a real root of q just
+    // outside it, about R / |p'| away, so the Gauss rules converge slowly and
+    // the bisection descends toward it; on loud material that was most of the
+    // integration cost. The root t* is located by Newton from the tangent
+    // estimate, its simple-pole part -sign R^2 / (q'(t*) (t - t*)) is
+    // integrated in closed form, and the same rules and tolerance integrate the
+    // smooth remainder, usually without bisection. Segments without a nearby
+    // real root keep the plain bisection.
+    Moments rationalSegment(const Poly &p, double a, double b, double x) const
+    {
+        const auto limits = clipperLinearLimits<C>(ceiling_);
+        const double sign = x >= 0 ? 1. : -1.;
+        const double knee = x >= 0 ? limits[1] : -limits[0];
+        const double level = 2 * knee - ceiling_, range = ceiling_ - knee, width = b - a;
+        const double ra = sign * slope(p, a), rb = -sign * slope(p, b);
+        const double da = ra > 0 ? (sign * value(p, a) - level) / ra : std::numeric_limits<double>::infinity();
+        const double db = rb > 0 ? (sign * value(p, b) - level) / rb : std::numeric_limits<double>::infinity();
+        const bool fromA = da <= db;
+        const double d = fromA ? da : db;
+        if (!(d > 0) || !(d < .25 * width))
+            return adaptive(p, a, b);
+        const double end = fromA ? a : b, outward = fromA ? -1. : 1.;
+        double root = end + outward * d, derivative = 0;
+        bool converged = false;
+        for (int it = 0; it < 16 && !converged; ++it)
+        {
+            const double f = sign * value(p, root) - level;
+            derivative = sign * slope(p, root);
+            if (!(derivative != 0) || !std::isfinite(f))
+                break;
+            const double step = f / derivative;
+            root -= step;
+            converged = std::abs(step) <= 4 * std::numeric_limits<double>::epsilon() * (1 + std::abs(root));
+        }
+        derivative = sign * slope(p, root);
+        if (!converged || !(outward * (root - end) > 0) || !(outward * (root - end) < width) ||
+            !(std::abs(derivative) > 0) || !std::isfinite(derivative))
+            return adaptive(p, a, b);
+        const Pole pole{root, -sign * range * range / derivative};
+        auto out = adaptive(p, a, b, 0, pole);
+        // integral(t^j / (t - t*)) = sum_m t*^(j-1-m) (b^(m+1) - a^(m+1)) / (m+1)
+        //                          + t*^j ln((b - t*) / (a - t*)).
+        const double logarithm = std::log((b - root) / (a - root));
+        double rootPower = 1;   // t*^j
+        std::array<double, MomentCount> powerSums{};   // (b^(m+1) - a^(m+1)) / (m+1)
+        double pa = a, pb = b;
+        for (int m = 0; m < MomentCount; ++m)
+        {
+            powerSums[m] = (pb - pa) / (m + 1);
+            pa *= a;
+            pb *= b;
+        }
+        for (int j = 0; j < MomentCount; ++j)
+        {
+            double polynomial = 0, rootFactor = 1;   // t*^(j-1-m), m from j-1 down to 0
+            for (int m = j - 1; m >= 0; --m)
+            {
+                polynomial += rootFactor * powerSums[m];
+                rootFactor *= root;
+            }
+            out[j] += pole.weight * (polynomial + rootPower * logarithm);
+            rootPower *= root;
+        }
+        return out;
     }
     Moments segment(const Poly &p, double a, double b) const
     {
@@ -234,7 +310,9 @@ template <Curve C, int Degree, bool NativeSlope = false, bool SubtractLinear = t
             if (std::abs(x) >= 24 * ceiling_)
                 return quadrature(p, a, b, linearQuadrature_, true, std::copysign(ceiling_, x));
         }
-        if constexpr (C == Curve::Tanh || rational)
+        if constexpr (rational)
+            return rationalSegment(p, a, b, x);
+        else if constexpr (C == Curve::Tanh)
             return adaptive(p, a, b);
         else
             return quadrature(p, a, b, nonlinearQuadrature_);

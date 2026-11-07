@@ -1096,8 +1096,8 @@ DSPARK_TEST(OfflineClip_native_rate_keeps_aliases_out_of_the_top_band)
     // At factor 1 the compensated correction reached Nyquist, where
     // distortion folded from just above Nyquist lands: a 5 kHz sine clipped
     // by 6 dB at 48 kHz left a -26.6 dB alias floor, almost all of it at
-    // 23 kHz. The correction is now band-limited (flat to 0.40 fs), which
-    // puts the floor near -62 dB; the harmonics below 20 kHz are unchanged.
+    // 23 kHz. The correction is now band-limited (flat to 0.40 fs): the
+    // floor measures -106 dB and the harmonics below 20 kHz are within -88 dB.
     constexpr double fs = 48000.0;
     constexpr int n = 1 << 14;
     const int k0 = static_cast<int>(std::llround(5000.0 * n / fs)) | 1;
@@ -1136,4 +1136,72 @@ DSPARK_TEST(OfflineClip_native_rate_keeps_aliases_out_of_the_top_band)
         error += re * re + im * im;
     }
     EXPECT_LT(10.0 * std::log10(error / power(k0)), -40.0);
+}
+
+namespace
+{
+// Factor-1 render of a coherent sine clipped by 6 dB: the energy of every
+// non-harmonic bin and the error of the harmonics up to 20 kHz against the
+// curve's own analytic Fourier coefficients, both relative to the fundamental.
+template <class Processor, detail::ClipperCurve Curve>
+std::array<double, 2> nativeRateSineScores(double fs, double frequency, typename Processor::Options options)
+{
+    constexpr int n = 1 << 14;
+    const int k0 = static_cast<int>(std::llround(frequency * n / fs)) | 1;
+    AudioBuffer<double> source, out;
+    source.resize(1, 3 * n);
+    for (int i = 0; i < 3 * n; ++i)
+        source.getChannel(0)[i] = std::sin(twoPi<double> * k0 * (i % n) / n);
+    options.reductionDb = 6;
+    options.oversamplingFactor = 1;
+    const auto result = Processor().run(source, out, fs, options);
+    if (!result.succeeded())
+        return {0., 0.}; // fails every score check of the caller
+    const double c = result.report.normalizedCeiling;
+    FFTReal<double> fft(n);
+    std::vector<double> window(out.getChannel(0) + n, out.getChannel(0) + 2 * n), X(n + 2);
+    fft.forward(window.data(), X.data());
+    const auto power = [&](int k) { return X[size_t(2 * k)] * X[size_t(2 * k)] + X[size_t(2 * k + 1)] * X[size_t(2 * k + 1)]; };
+    double alias = 0.0, error = 0.0;
+    for (int k = 1; k < n / 2; ++k)
+        if (k % k0 != 0) alias += power(k);
+    for (int h = 1; h * k0 * fs / n <= 20000.0 && h * k0 < n / 2; h += 2)
+    {
+        double b = 0.0;
+        for (int i = 0; i < 4096; ++i)
+        {
+            const double t = twoPi<double> * (i + 0.5) / 4096;
+            b += detail::clipperShape<Curve>(std::sin(t), c) * std::sin(h * t);
+        }
+        b *= 2.0 / 4096;
+        const double re = X[size_t(2 * h * k0)], im = X[size_t(2 * h * k0 + 1)] + b * n / 2;
+        error += re * re + im * im;
+    }
+    return {10.0 * std::log10(alias / power(k0)), 10.0 * std::log10(error / power(k0))};
+}
+} // namespace
+
+DSPARK_TEST(OfflineClip_native_rate_suppresses_aliases_inside_the_band)
+{
+    using detail::ClipperCurve;
+    // Distortion folded across Nyquist that lands below 0.40 fs. With a cubic
+    // B-spline average and inverse compensation the 10 kHz sine at 48 kHz
+    // kept its 30 kHz third harmonic at 18 kHz (-24.3 dB alias floor) and the
+    // 5 kHz sine at 44.1 kHz its 25 kHz fifth at 19.1 kHz (-37.3 dB); the
+    // harmonic error at 15 kHz / 44.1 kHz was -27.5 dB. The moment kernel
+    // with windowed-sinc reconstruction measures -95, -108 and -111 dB.
+    const auto hard10 = nativeRateSineScores<OfflineHardClipper<double>, ClipperCurve::Hard>(48000, 9973, {});
+    EXPECT_LT(hard10[0], -85.0);
+    EXPECT_LT(hard10[1], -80.0);
+    const auto hard5 = nativeRateSineScores<OfflineHardClipper<double>, ClipperCurve::Hard>(44100, 4999, {});
+    EXPECT_LT(hard5[0], -95.0);
+    EXPECT_LT(hard5[1], -80.0);
+    const auto hard15 = nativeRateSineScores<OfflineHardClipper<double>, ClipperCurve::Hard>(44100, 15013, {});
+    EXPECT_LT(hard15[0], -80.0);
+    EXPECT_LT(hard15[1], -90.0);
+    OfflineSoftClipper<double>::Options tanh;
+    tanh.curve = OfflineSoftClipCurve::Tanh;
+    const auto soft10 = nativeRateSineScores<OfflineSoftClipper<double>, ClipperCurve::Tanh>(48000, 9973, tanh);
+    EXPECT_LT(soft10[0], -85.0);
+    EXPECT_LT(soft10[1], -80.0);
 }

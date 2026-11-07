@@ -196,6 +196,20 @@ template <FloatType T>
 inline constexpr int kLadderStagesMaxIterations = 16;
 
 /**
+ * @brief Integrator gain below which ladderStepStages() starts Newton at the
+ *        integrator states instead of the fixed-pivot solve (cutoff about
+ *        0.047 * fs).
+ *
+ * At a low gain each stage moves little in one sample, so the states are
+ * already a close start and the fixed-pivot solve (five tanh ratios and five
+ * divisions, about one Newton step of work) does not pay for itself: with the
+ * float tolerance the states need at most 0.8 more Newton steps on average up
+ * to this gain, and none below 0.03. Above it the fixed-pivot start saves more
+ * than it costs.
+ */
+inline constexpr double kLadderStagesStateStartGain = 0.15;
+
+/**
  * @brief Advances the per-stage saturating ladder by one sample.
  *
  * Solves the trapezoidal (TPT) discretization of the transistor-ladder model
@@ -210,7 +224,8 @@ inline constexpr int kLadderStagesMaxIterations = 16;
  * loops:
  *
  * 1. A fixed-pivot linear solve (each phi replaced by v * phi(s)/s at the
- *    integrator states) gives a stable starting point at any gain.
+ *    integrator states) gives a stable starting point at any gain. Below
+ *    kLadderStagesStateStartGain the states themselves start Newton.
  * 2. Newton iterations on the four equations. The Jacobian is bidiagonal
  *    plus the feedback corner, so each step is an O(4) elimination, and the
  *    closing pivot is always >= 1 (no singularity at any setting). Each step
@@ -221,8 +236,9 @@ inline constexpr int kLadderStagesMaxIterations = 16;
  * falls below c.tol knee widths, after at most kLadderStagesMaxIterations
  * steps: measured with the float tolerance over noise, sine and saw inputs at
  * 44.1 to 96 kHz, cutoff 0.004 to 0.45 * fs, resonance 0 to 1.15 and drive
- * 0.3 to 10, a mean of 1.8 Newton steps after the start, 4.5 at the worst
- * setting, and at most 10 (the cap is never reached).
+ * 0.3 to 10, a mean of 2.1 Newton steps (1.7 with the fixed-pivot start at
+ * every gain, which costs about one step), 4.4 at the worst setting, and at
+ * most 8 (the cap is never reached).
  * In the linear limit (drive -> 0) it reduces to ladderStep() without
  * drive. Output taps are those of ladderStep().
  *
@@ -238,23 +254,28 @@ template <LadderTap Tap, FloatType T>
     const double s0 = static_cast<double>(z[0]), s1 = static_cast<double>(z[1]);
     const double s2 = static_cast<double>(z[2]), s3 = static_cast<double>(z[3]);
 
-    // 1) Fixed-pivot start: phi(v) ~ v * r_i with r_i = tanh(d s)/(d s) at
-    //    the states. Each stage is then linear, y_i = a_i * y_{i-1} + b_i,
-    //    and the loop closes in one division.
-    const double r0 = ladderTanhRatio(d * (x - k * s3));
-    const double r1 = ladderTanhRatio(d * s0), r2 = ladderTanhRatio(d * s1);
-    const double r3 = ladderTanhRatio(d * s2), r4 = ladderTanhRatio(d * s3);
-    const double i1 = 1.0 / (1.0 + g * r1), i2 = 1.0 / (1.0 + g * r2);
-    const double i3 = 1.0 / (1.0 + g * r3), i4 = 1.0 / (1.0 + g * r4);
-    const double a1 = g * r0 * i1, a2 = g * r1 * i2, a3 = g * r2 * i3, a4 = g * r3 * i4;
-    const double b1 = s0 * i1, b2 = s1 * i2, b3 = s2 * i3, b4 = s3 * i4;
-    const double A = a1 * a2 * a3 * a4;
-    const double B = ((b1 * a2 + b2) * a3 + b3) * a4 + b4;
-    double u = (x - k * B) / (1.0 + k * A);
-    double y0 = a1 * u + b1;
-    double y1 = a2 * y0 + b2;
-    double y2 = a3 * y1 + b3;
-    double y3 = a4 * y2 + b4;
+    // 1) Start. Below kLadderStagesStateStartGain Newton starts at the states.
+    //    Above it, a fixed-pivot solve: phi(v) ~ v * r_i with
+    //    r_i = tanh(d s)/(d s) at the states. Each stage is then linear,
+    //    y_i = a_i * y_{i-1} + b_i, and the loop closes in one division.
+    double u = 0, y0 = s0, y1 = s1, y2 = s2, y3 = s3;
+    if (g >= kLadderStagesStateStartGain)
+    {
+        const double r0 = ladderTanhRatio(d * (x - k * s3));
+        const double r1 = ladderTanhRatio(d * s0), r2 = ladderTanhRatio(d * s1);
+        const double r3 = ladderTanhRatio(d * s2), r4 = ladderTanhRatio(d * s3);
+        const double i1 = 1.0 / (1.0 + g * r1), i2 = 1.0 / (1.0 + g * r2);
+        const double i3 = 1.0 / (1.0 + g * r3), i4 = 1.0 / (1.0 + g * r4);
+        const double a1 = g * r0 * i1, a2 = g * r1 * i2, a3 = g * r2 * i3, a4 = g * r3 * i4;
+        const double b1 = s0 * i1, b2 = s1 * i2, b3 = s2 * i3, b4 = s3 * i4;
+        const double A = a1 * a2 * a3 * a4;
+        const double B = ((b1 * a2 + b2) * a3 + b3) * a4 + b4;
+        u = (x - k * B) / (1.0 + k * A);
+        y0 = a1 * u + b1;
+        y1 = a2 * y0 + b2;
+        y2 = a3 * y1 + b3;
+        y3 = a4 * y2 + b4;
+    }
 
     // 2) Clipped Newton steps on r_i = y_i - s_i - g (phi_{i-1} - phi_i).
     for (int it = 0; it < kLadderStagesMaxIterations; ++it)

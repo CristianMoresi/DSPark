@@ -22,12 +22,13 @@ All notable user-facing changes to DSPark are documented here.
   against 410, Exciter 150 against 37.
 - `LadderFilter::setSaturation(Saturation::Stages)` (opt-in, default
   `Feedback` unchanged and bit-identical): every stage saturates and the
-  delay-free loop is solved implicitly (clipped Newton in double, 1.8 steps
-  on average). Against a 128x oversampled RK4 of the same ladder equations
+  delay-free loop is solved implicitly (clipped Newton in double, 2.1 steps
+  on average; below a 0.047 fs cutoff it starts at the integrator states). Against a 128x oversampled RK4 of the same ladder equations
   the harmonics land within 0.23 dB up to a 2 kHz cutoff (1.6 dB at 8 kHz),
   in float and double; self-oscillation at resonance 1.1 is within 0.1 cent
   and 0.07 dB at 1 kHz. Resonance accepts up to 1.2 (Feedback still uses at
-  most 1). Costs 52-103 ns per sample and channel against 10-19 ns. The
+  most 1). Costs 53-104 ns per sample and channel against 10-19 ns (56 ns
+  at a 1 kHz cutoff with drive 3, where a fixed-pivot start costs 74). The
   filter gains `getState()`/`setState()` with the model in its state.
 - `Smoothers::HermiteSmoother`: a cubic glide that lands exactly after the
   ramp time with a continuous slope, also when retargeted. At equal ramp
@@ -261,13 +262,34 @@ All notable user-facing changes to DSPark are documented here.
   carries chunk-rate sidebands of -120 dB at most (-55.7 dB before). The
   gliding path costs 6.2 instead of 9.4 ns per sample.
 - `OfflineHardClipper`/`OfflineSoftClipper` at oversampling factor 1 (not the
-  default 4; factors 2 and above are bit-identical): the clipping correction
-  is band-limited, flat to 0.40 fs and below -65 dB from 0.46 fs. A 5 kHz
-  sine clipped by 6 dB at 48 kHz has a full-band alias floor of -62.1 dB
-  (-26.6 dB before; -64.6 against -54.2 dB at 1 kHz; Sine curve -79 against
-  -32 dB), with the harmonics below 20 kHz unchanged. Distortion above 0.40
-  fs is attenuated with the aliases it cannot be told apart from at the
-  native rate.
+  default 4; factors 2 and above are bit-identical): the clipping residual of
+  a 32-sample windowed-sinc reconstruction is integrated against five
+  moments per sample interval and band-limited by a continuous moment
+  kernel, flat to 0.40 fs and below -65 dB from 0.47 fs on all of its
+  images, so distortion folded across Nyquist is removed wherever it lands
+  (a cubic B-spline average with inverse compensation left the third
+  harmonic of a 10 kHz sine at 18 kHz). Sine clipped by 6 dB, full-band
+  alias floor: 10 kHz at 48 kHz -95.0 dB (-24.3 dB before), 5 kHz at
+  44.1 kHz -107.6 dB (-37.3), 5 kHz at 48 kHz -106.4 dB (-26.6 in 1.8.1),
+  15 kHz at 44.1 kHz -91.4 dB (-36.6); Sine and Tanh curves at 10 kHz
+  -97.0 and -99.0 dB (-25.3 and -26.9). Harmonic error below 20 kHz against
+  the exact clipped sine: -84 to -111 dB (-28 to -69 before). Distortion
+  above 0.40 fs is attenuated with the aliases it cannot be told apart from
+  at the native rate. Factor-1 renders take about half the time (3 s of
+  stereo drums, Hard: 0.23 instead of 0.43 s): the source-band projection,
+  an identity at factor 1, is no longer computed.
+- Rational-knee integration (the `StereoGenerator` color at every factor):
+  beyond the knee the curve has a pole just outside each segment that starts
+  at a knee crossing, and the bisection descended toward it. Its simple-pole
+  part is now integrated in closed form and the smooth remainder by the same
+  rules and tolerance. Color integration on +6 dB noise: 859 instead of
+  2878 ns per sample; `StereoGenerator` at 48 kHz, factor 1: 1267 instead of
+  2047 ns per stereo frame at +6 dB and 1456 instead of 3074 at +12 dB
+  (factor 2: 1537 and 1852 instead of 2028 and 3045). Output moves by at most
+  1.1e-15 (-282 dB re peak) on loud noise; moments match an independent
+  graded reference to 5e-16. The GoldenRatio offline curve, with its wide
+  knee, rarely meets the case: its default-factor renders of drums and noise
+  are bit-identical.
 - `StereoGenerator` at its default factor 1 runs its two FIR banks as single
   interleaved passes: 375 instead of 590 ns per stereo frame at low level
   with the AVX2 dispatch (728 instead of 1004 on SSE2). Float output is

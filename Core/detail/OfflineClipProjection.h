@@ -12,7 +12,9 @@
 #include "OfflineSinc.h"
 #if DSPARK_HAS_OFFLINE
 #include "../FIRFilter.h"
+#include "../SimdOps.h"
 #include "ContinuousClip.h"
+#include "NativeClipCoefficients.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -37,91 +39,238 @@ enum class Exterior
     Matched
 };
 
-// Native-rate band of the clipping correction. At factor 1 the cubic B-spline
-// average is the only anti-alias kernel, and its compensation restores the
-// correction right up to Nyquist, where distortion folded from just above
-// Nyquist lands; near Nyquist the compensated linear branch also departs from
-// unity and leaks the per-sample residual. A symmetric Kaiser low-pass (flat
-// within 0.01 dB to 0.40 fs, -6 dB at 0.43 fs, below -65 dB from 0.46 fs)
-// bands the whole correction instead: the residual branch is filtered by it
-// and the linear branch becomes (1 - band) + band * linear, so the correction
-// fades to none, not to the naive residual. Measured on a sine clipped by
-// 6 dB at 48 kHz, the full-band alias floor goes from -54.2 / -26.6 dB to
-// -64.6 / -62.1 dB at 1 / 5 kHz, with the harmonic error below 20 kHz
-// unchanged; distortion above 0.40 fs, which the native rate cannot tell
-// from its aliases, is attenuated with them. The source itself is never
-// filtered: unclipped PCM stays exact, and so does its own content near
-// Nyquist. The matched exterior, which integrates the complete shaped signal,
-// keeps the unbanded compensation for the same reason.
-struct NativeResidualBand
+// Source-rate (factor 1) clipping correction. A cubic B-spline average with
+// inverse compensation attenuates distortion above Nyquist by sinc^4 of its
+// frequency and restores the band by 1/sinc^4 of where it folds, so a
+// harmonic near fs folds back nearly intact: a 10 kHz sine clipped by 6 dB
+// at 48 kHz left its third harmonic at 18 kHz at -24 dB. Here the residual
+// shape(p) - slope * p of a windowed-sinc reconstruction p (32 samples, see
+// NativeClipCoefficients.h) is integrated against five polynomial moments
+// per sample interval, and five moment FIRs synthesize a continuous kernel
+// whose spectrum is flat within 0.01 dB to 0.40 fs, -54 dB at 0.46 fs and
+// below -65 dB from 0.47 fs across all of its images (to 12 fs). The output is slope * x plus that band-limited
+// residual: unclipped intervals contribute exactly zero (the Bernstein hull
+// test of the shared integral), so unclipped PCM stays exact, and so does the
+// source content near Nyquist. Distortion between 0.40 and 0.46 fs is
+// attenuated by the transition.
+template <ClipperCurve C> class NativeClipKernel final
 {
-    static constexpr int half = 32;          ///< One-sided length in native samples.
-    static constexpr double cutoff = 0.43;   ///< -6 dB point, fraction of the native rate.
-    static constexpr double beta = 6.0;      ///< Kaiser shape.
-    [[nodiscard]] static std::vector<double> taps()
+    static constexpr int degree = 11, block = 256;
+    static constexpr int inputHistory = native_clip_coefficients::reconstructionTaps - 1;
+    static constexpr int frameHistory = native_clip_coefficients::projectionTaps - 1;
+    static constexpr int powers = native_clip_coefficients::powers;
+    static constexpr int moments = native_clip_coefficients::moments;
+    static constexpr bool linearRegion =
+        C == ClipperCurve::Hard || C == ClipperCurve::GoldenRatio ||
+        C == ClipperCurve::SymmetricKnee || C == ClipperCurve::AsymmetricKnee;
+    static_assert(powers == degree + 1);
+    continuous_clip::Interval<C, degree, true, true, moments> integral_{1.};
+    // input_: history then one block; powers_: one block per coefficient;
+    // frames_: one row per moment, history then one block; scratch_: one block.
+    std::vector<double> input_, powers_, frames_, output_, scratch_, reference_;
+    std::array<double, 2> limits_{-1., 1.};
+
+  public:
+    static constexpr int delay = native_clip_coefficients::delay;
+    static constexpr int history = inputHistory + frameHistory;
+    /** @brief Heap payload of one kernel, in doubles. */
+    [[nodiscard]] static constexpr std::size_t storage() noexcept
     {
-        return FIRDesign<double>::lowPass(1., cutoff, 2 * half + 1, beta);
+        return static_cast<std::size_t>(inputHistory + block + powers * block +
+                                        (frameHistory + block) * moments + 2 * block + delay + block);
     }
-    [[nodiscard]] static std::vector<double> convolve(const std::vector<double> &a,
-                                                      const std::vector<double> &b)
+    NativeClipKernel()
+        : input_(inputHistory + block), powers_(static_cast<std::size_t>(powers) * block),
+          frames_(static_cast<std::size_t>(frameHistory + block) * moments), output_(block), scratch_(block),
+          reference_(delay + block)
     {
-        std::vector<double> out(a.size() + b.size() - 1);
-        for (std::size_t i = 0; i < a.size(); ++i)
-            for (std::size_t j = 0; j < b.size(); ++j)
-                out[i + j] += a[i] * b[j];
-        return out;
+    }
+    void reset(double ceiling) noexcept
+    {
+        integral_.setCeiling(ceiling);
+        if constexpr (C == ClipperCurve::Hard)
+            limits_ = {-ceiling, ceiling};
+        else if constexpr (linearRegion)
+            limits_ = clipperLinearLimits<C>(ceiling);
+        std::fill(input_.begin(), input_.end(), 0.);
+        std::fill(frames_.begin(), frames_.end(), 0.);
+        std::fill(reference_.begin(), reference_.end(), 0.);
+    }
+    // nonlinear: source samples in, band-limited residual out, delay samples
+    // later. reference: the per-sample correction in, delayed by delay.
+    void process(double *nonlinear, double *reference, int count)
+    {
+        namespace nc = native_clip_coefficients;
+        constexpr auto row = static_cast<std::size_t>(frameHistory + block);
+        for (int offset = 0; offset < count;)
+        {
+            const int size = std::min(block, count - offset);
+            std::copy_n(nonlinear + offset, size, input_.data() + inputHistory);
+            std::array<double *, powers> powerOut{};
+            for (int k = 0; k < powers; ++k)
+                powerOut[static_cast<std::size_t>(k)] = powers_.data() + static_cast<std::size_t>(k) * block;
+            simd::firCorrelateBank<double, powers>(input_.data(), nc::reconstruction.data(),
+                                                   nc::reconstructionTaps, powerOut.data(), size);
+            std::copy_n(input_.data() + size, inputHistory, input_.data());
+            for (int i = 0; i < size; ++i)
+            {
+                std::array<double, powers> power{};
+                double radius = 0;
+                for (int k = 0; k < powers; ++k)
+                {
+                    power[static_cast<std::size_t>(k)] = powerOut[static_cast<std::size_t>(k)][i];
+                    if (k)
+                        radius += std::abs(power[static_cast<std::size_t>(k)]);
+                }
+                std::array<double, moments> value{};
+                // |p(t) - p(0)| <= sum |p_k| on [0,1]: a polynomial inside the
+                // linear region has exactly zero residual; skip its integral.
+                const double margin = 64 * std::numeric_limits<double>::epsilon() *
+                                      (std::abs(power[0]) + radius);
+                if (!linearRegion || !(power[0] - radius - margin >= limits_[0] &&
+                                       power[0] + radius + margin <= limits_[1]))
+                    value = integral_.polynomial(power);
+                for (int q = 0; q < moments; ++q)
+                {
+                    if (!std::isfinite(value[static_cast<std::size_t>(q)]))
+                        offlineFail(OfflineStatus::NumericalFailure);
+                    frames_[static_cast<std::size_t>(q) * row + frameHistory + static_cast<std::size_t>(i)] =
+                        value[static_cast<std::size_t>(q)];
+                }
+            }
+            for (int q = 0; q < moments; ++q)
+            {
+                double *frames = frames_.data() + static_cast<std::size_t>(q) * row;
+                simd::firCorrelate(frames, nc::projection.data() + static_cast<std::size_t>(q) * nc::projectionTaps,
+                                   nc::projectionTaps, q ? scratch_.data() : output_.data(), size, 1.);
+                if (q)
+                    for (int i = 0; i < size; ++i)
+                        output_[static_cast<std::size_t>(i)] += scratch_[static_cast<std::size_t>(i)];
+                std::copy_n(frames + size, frameHistory, frames);
+            }
+            std::copy_n(output_.data(), size, nonlinear + offset);
+            std::copy_n(reference + offset, size, reference_.data() + delay);
+            std::copy_n(reference_.data(), size, reference + offset);
+            std::copy_n(reference_.data() + size, delay, reference_.data());
+            offset += size;
+        }
+    }
+    /** @brief Bound on |p(t)| / max|x| over the reconstruction window (Bernstein hull). */
+    [[nodiscard]] static double reconstructionBound()
+    {
+        namespace nc = native_clip_coefficients;
+        long double worst = 1;
+        for (int row = 0; row < powers; ++row)
+        {
+            long double norm = 0;
+            for (int tap = 0; tap < nc::reconstructionTaps; ++tap)
+            {
+                long double coefficient = 0;
+                for (int column = 0; column <= row; ++column)
+                    coefficient += static_cast<long double>(continuous_clip::choose(row, column) /
+                                                            continuous_clip::choose(degree, column)) *
+                                   nc::reconstruction[static_cast<std::size_t>(tap) * powers +
+                                                      static_cast<std::size_t>(column)];
+                norm += std::abs(coefficient);
+            }
+            worst = std::max(worst, norm);
+        }
+        return static_cast<double>(worst);
+    }
+    /** @brief Upper bound on the integral of |h| of the synthesized kernel. */
+    [[nodiscard]] static double kernelNorm()
+    {
+        namespace nc = native_clip_coefficients;
+        // Each tap is a quartic on its unit interval. On sixteen subintervals
+        // its Bernstein coefficients bound it, and every Bernstein basis
+        // polynomial integrates to width / moments.
+        constexpr int pieces = 16;
+        long double norm = 0;
+        for (int tap = 0; tap < nc::projectionTaps; ++tap)
+            for (int piece = 0; piece < pieces; ++piece)
+            {
+                const long double a = static_cast<long double>(piece) / pieces, w = 1.L / pieces;
+                std::array<long double, moments> shifted{};
+                for (int k = 0; k < moments; ++k)
+                    for (int j = k; j < moments; ++j)
+                        shifted[static_cast<std::size_t>(k)] +=
+                            static_cast<long double>(nc::projection[static_cast<std::size_t>(j) * nc::projectionTaps +
+                                                                    static_cast<std::size_t>(tap)]) *
+                            static_cast<long double>(continuous_clip::choose(j, k)) * std::pow(a, j - k) *
+                            std::pow(w, k);
+                for (int i = 0; i < moments; ++i)
+                {
+                    long double bernstein = 0;
+                    for (int j = 0; j <= i; ++j)
+                        bernstein += shifted[static_cast<std::size_t>(j)] *
+                                     static_cast<long double>(continuous_clip::choose(i, j) /
+                                                              continuous_clip::choose(moments - 1, j));
+                    norm += std::abs(bernstein) * w / moments;
+                }
+            }
+        return static_cast<double>(norm * (1 + 1e-9L));
     }
 };
 
 // Shared reconstructed clipping stage. Both branches use the same interpolation,
-// B-spline moments and compensation (banded at factor 1, see
-// NativeResidualBand). The source/projection boundary policy is supplied by
-// BoundedClip; this stage alone does not perform sample-rate conversion.
+// B-spline moments and compensation; at factor 1 the linear exterior uses
+// NativeClipKernel instead. The source/projection boundary policy is supplied
+// by BoundedClip; this stage alone does not perform sample-rate conversion.
 template <ClipperCurve C> class ReconstructedStage final
 {
     static constexpr int degree = 11;
     continuous_clip::Residual<C, degree, true> residual_;
     continuous_clip::Residual<C, degree, false, false> direct_;
-    FIRFilter<double> eq_, linear_, bandEq_, bandLinear_;
+    FIRFilter<double> eq_, linear_;
+    std::optional<NativeClipKernel<C>> native_;
     int order_, pad_, filterSize_;
 
   public:
+    /** @brief Compensation order at an oversampling factor. */
+    [[nodiscard]] static constexpr int orderFor(int factor) noexcept
+    {
+        return factor <= 2 ? 18 : 10;
+    }
+    /** @brief Zero padding that aligns the factor-1 matched branches with NativeClipKernel. */
+    [[nodiscard]] static constexpr int padFor(int factor) noexcept
+    {
+        return factor == 1 ? NativeClipKernel<C>::delay - ((degree + 1) / 2 + 1 + orderFor(1)) : 0;
+    }
+    /** @brief Input history plus one, in samples at the factor's rate. */
+    [[nodiscard]] static constexpr int filterSizeFor(int factor) noexcept
+    {
+        return 2 * (orderFor(factor) + padFor(factor)) + degree + 4;
+    }
+    static_assert(filterSizeFor(1) == NativeClipKernel<C>::history + 1);
     ReconstructedStage(OfflineSession &job, int factor)
-        : order_(factor <= 2 ? 18 : 10), pad_(factor == 1 ? NativeResidualBand::half : 0),
-          filterSize_(2 * (order_ + pad_) + degree + 4)
+        : order_(orderFor(factor)), pad_(padFor(factor)), filterSize_(filterSizeFor(factor))
     {
         const int tapsSize = 2 * (order_ + pad_) + 1, linearSize = degree + 4;
-        const int filters = pad_ ? 2 : 1;
-        const int bandTemporaries = pad_ ? (2 * pad_ + 1) + tapsSize + 2 * filterSize_ : 0;
+        // Padding the compensation reallocates it (at most twice its final
+        // size in total); the native kernel owns fixed-size histories.
+        const int padTemporaries = pad_ ? 2 * tapsSize : 0;
         job.charge(static_cast<std::size_t>(6 * (order_ + 1) + (order_ + 2) * (2 * order_ + 1) +
-                                            linearSize + filterSize_ + bandTemporaries) *
+                                            linearSize + filterSize_ + padTemporaries) *
                        sizeof(double) +
                    static_cast<std::size_t>(order_ + 24) * 64 +
-                   static_cast<std::size_t>(filters * (tapsSize + filterSize_)) *
+                   static_cast<std::size_t>(tapsSize + filterSize_) *
                        (sizeof(std::atomic<double>) + 4 * sizeof(double)) +
+                   (pad_ ? NativeClipKernel<C>::storage() * sizeof(double) + 5 * 64 : 0) +
                    3 * sizeof(int));
         auto taps = continuous_clip::inverseBoxPower(order_);
         const auto linear = residual_.linearKernel();
         if (pad_)
         {
-            const auto band = NativeResidualBand::taps();
-            const auto bandTaps = NativeResidualBand::convolve(band, taps);
-            auto bandLinear = NativeResidualBand::convolve(bandTaps, linear);
-            // (1 - band) around the linear branch's unit delay.
-            const int centre = delay();
-            bandLinear[static_cast<std::size_t>(centre)] += 1;
-            for (std::size_t j = 0; j < band.size(); ++j)
-                bandLinear[static_cast<std::size_t>(centre - pad_) + j] -= band[j];
-            bandEq_.prepare(tapsSize, 1);
-            bandEq_.setCoefficients(bandTaps);
-            bandLinear_.prepare(filterSize_, 1);
-            bandLinear_.setCoefficients(bandLinear);
-            // The matched branches keep the unbanded compensation, delayed to
-            // the banded branches' centre.
+            native_.emplace();
+            // The matched branches keep the cubic B-spline compensation,
+            // delayed to the native kernel's centre.
             taps.insert(taps.begin(), static_cast<std::size_t>(pad_), 0.);
             taps.insert(taps.end(), static_cast<std::size_t>(pad_), 0.);
         }
-        const auto h = NativeResidualBand::convolve(taps, linear);
+        std::vector<double> h(taps.size() + linear.size() - 1);
+        for (std::size_t i = 0; i < taps.size(); ++i)
+            for (std::size_t j = 0; j < linear.size(); ++j)
+                h[i + j] += taps[i] * linear[j];
         eq_.prepare(tapsSize, 1);
         eq_.setCoefficients(taps);
         linear_.prepare(filterSize_, 1);
@@ -133,11 +282,8 @@ template <ClipperCurve C> class ReconstructedStage final
         direct_.reset(ceiling);
         eq_.reset();
         linear_.reset();
-        if (pad_)
-        {
-            bandEq_.reset();
-            bandLinear_.reset();
-        }
+        if (native_)
+            native_->reset(ceiling);
     }
     [[nodiscard]] int filterSize() const noexcept
     {
@@ -149,6 +295,11 @@ template <ClipperCurve C> class ReconstructedStage final
     }
     void process(double *nonlinear, double *reference, int count, Exterior exterior)
     {
+        if (native_ && exterior == Exterior::Linear)
+        {
+            native_->process(nonlinear, reference, count);
+            return;
+        }
         for (int i = 0; i < count; ++i)
         {
             nonlinear[i] = exterior == Exterior::Matched ? direct_.process(nonlinear[i])
@@ -157,9 +308,8 @@ template <ClipperCurve C> class ReconstructedStage final
                 offlineFail(OfflineStatus::NumericalFailure);
         }
         double *a[]{nonlinear}, *b[]{reference};
-        const bool banded = pad_ && exterior == Exterior::Linear;
-        (banded ? bandEq_ : eq_).processBlock({a, 1, count});
-        (banded ? bandLinear_ : linear_).processBlock({b, 1, count});
+        eq_.processBlock({a, 1, count});
+        linear_.processBlock({b, 1, count});
     }
 };
 
@@ -392,9 +542,12 @@ template <ClipperCurve C, class Reader> class BoundedClip
     {
         return evaluations_;
     }
+    // At factor 1 the projection onto the source band is the identity (its
+    // modulation sin(pi * j) is zero), so get() reads the stage directly and
+    // no Cauchy map of the stage output is built.
     void prepareProjection()
     {
-        if (!projection_)
+        if (!projection_ && factor_ > 1)
             projection_.emplace(job_, extent_ * factor_, factor_, ProjectedReader{this},
                                 highBlock_);
     }
@@ -415,15 +568,22 @@ template <ClipperCurve C, class Reader> class BoundedClip
         if (leaf < firstLeaf() || leaf >= endLeaf())
             offlineFail(OfflineStatus::InvalidInput);
         prepareProjection();
-        const auto values = projection_->get(static_cast<std::size_t>(leaf));
-        const auto first = leaf * block_, begin = std::max(first, pad_),
-                   end = std::min(first + static_cast<int>(values.size()), pad_ + frames_);
+        const auto first = leaf * block_;
+        const auto values = projection_ ? projection_->get(static_cast<std::size_t>(leaf))
+                                        : std::span<const double>{};
+        const auto available =
+            projection_ ? static_cast<std::int64_t>(values.size())
+                        : std::min<std::int64_t>(block_, extent_ - first);
+        const auto begin = std::max(first, pad_), end = std::min(first + available, pad_ + frames_);
         const auto *filtered = stage(leaf), *raw = upsampled(leaf);
         const int offset = static_cast<int>(begin - first), length = static_cast<int>(end - begin);
         for (int i = 0; i < length; ++i)
         {
             const int at = offset + i;
-            output_[i] = clipperShape<C>(raw[at * factor_], ceiling_) + values[at] +
+            const double projected =
+                projection_ ? values[at]
+                            : filtered[at] + (exterior_ == Exterior::Matched ? filtered[highBlock_ + at] : 0.);
+            output_[i] = clipperShape<C>(raw[at * factor_], ceiling_) + projected +
                          (exterior_ == Exterior::Linear ? filtered[highBlock_ + at * factor_] : 0.);
             if (!std::isfinite(output_[i]))
                 offlineFail(OfflineStatus::NumericalFailure);
@@ -494,22 +654,25 @@ template <ClipperCurve C> class TailPolicy
     {
         if (factor < 1 || factor > 16 || (factor & (factor - 1)))
             offlineFail(OfflineStatus::InvalidInput);
-        const int order = factor <= 2 ? 18 : 10;
+        const int order = ReconstructedStage<C>::orderFor(factor);
         continuous_clip::Interval<C, degree, true> interval(1.);
-        l_ = upper(interval.reconstructionBound() *
-                   (1 + 256 * std::numeric_limits<double>::epsilon()));
+        double reconstruction = interval.reconstructionBound();
         const auto compensation = continuous_clip::inverseBoxPower(order);
         for (double v : compensation)
             e_ = upper(e_ + std::abs(v));
-        // The linear exterior integrates the residual through the banded
-        // compensation at factor 1 (NativeResidualBand), the matched one does not.
-        const int pad = factor == 1 ? NativeResidualBand::half : 0;
-        if (pad)
-            for (double v : NativeResidualBand::convolve(NativeResidualBand::taps(), compensation))
-                eLinear_ = upper(eLinear_ + std::abs(v));
+        // At factor 1 the linear exterior integrates the residual of the
+        // native reconstruction through the moment kernel (NativeClipKernel);
+        // the matched one keeps the cubic B-spline compensation.
+        if (factor == 1)
+        {
+            reconstruction = std::max(reconstruction, NativeClipKernel<C>::reconstructionBound());
+            eLinear_ = upper(NativeClipKernel<C>::kernelNorm() *
+                             (1 + 256 * std::numeric_limits<double>::epsilon()));
+        }
         else
             eLinear_ = e_;
-        radius_ = double(degree + 4 + 2 * (order + pad) + 2) / factor + 2;
+        l_ = upper(reconstruction * (1 + 256 * std::numeric_limits<double>::epsilon()));
+        radius_ = double(ReconstructedStage<C>::filterSizeFor(factor) + 2) / factor + 2;
         if constexpr (C == ClipperCurve::Tanh)
             cubic_ = upper(1. / 3);
         if constexpr (C == ClipperCurve::Sine)

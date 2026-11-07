@@ -16,11 +16,12 @@ namespace dspark
  * Options::reductionDb is positive 0..12 dB; zero preserves exact PCM. Sine is
  * the default curve; tanh and golden-ratio curves reuse Clipper's shared shapes.
  * Options::oversamplingFactor is explicitly selectable (1/2/4/8/16, default 4).
- * At factor 1 the clipping correction is band-limited: flat to 0.40 fs and
- * below -65 dB from 0.46 fs, so distortion folded from just above Nyquist is
- * removed; a 5 kHz sine clipped by 6 dB at 48 kHz measures a -79 dB alias
- * floor with the Sine curve (was -32 dB). Aliases landing below 0.40 fs
- * remain (a 10 kHz sine: -25 dB at factor 1); higher factors are unchanged.
+ * At factor 1 the clipping residual of a 32-sample windowed-sinc
+ * reconstruction is integrated over each sample interval and band-limited by
+ * a continuous kernel flat to 0.40 fs and below -65 dB from 0.47 fs on all of
+ * its images, so distortion folded across Nyquist is removed wherever it
+ * lands: a 10 kHz sine clipped by 6 dB at 48 kHz measures a -97 dB alias floor
+ * with the Sine curve and -99 dB with Tanh (both were -25 to -27 dB).
  * The continuous-interval correction uses Core filters and convolution. Its
  * internal delay is fully removed: the result has the source length and clock.
  * Mono/stereo channels share one ceiling. Exclusions preserve exact samples
